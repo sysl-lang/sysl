@@ -52,7 +52,17 @@ private struct BmState
     summary: bool
     aliases: Buf[string]
     kept: bool
+    params: Buf[string]
 end BmState
+
+private bm_params(f: TFunc) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for p in f.params
+        out.push(p.0)
+
+    out
+end bm_params
 
 // The generic walk's window: a node inside the span already handled is skipped.
 private struct BmSkip
@@ -74,7 +84,7 @@ check_buf_moves(a: &Analysis, funcs: Buf[TFunc])
     val cx: &BmCx = BmCx(a, funcs, index, map(), buf(), buf(), map())
 
     for f in funcs
-        val st: &BmState = BmState(cx, func_home(a, f.name), f.name, buf(), false, 0, false, buf(), false)
+        val st: &BmState = BmState(cx, func_home(a, f.name), f.name, buf(), false, 0, false, buf(), false, bm_params(f))
 
         bm_block(st, f.body, Some(BmDest("the function's result", None)))
 
@@ -106,6 +116,57 @@ private bm_line(st: &BmState, span: Span) -> usize = st.scope.src.locate(span.st
 private bm_text(st: &BmState, line: usize) -> string =
     from_utf8_unchecked(st.scope.src.line_text(line)).trim()
 
+// -- where a buffer is written ---------------------------------------------------------------------
+
+// Under copy-on-write every member that writes the storage, or hands out a way to, asks first
+// whether the storage is shared. Each such call is logged with what its receiver is rooted in.
+// A member of `Buf` is lowered as `sysl.buf$Buf.<member>.<element type>`.
+private bm_member(name: string) -> string = name.index_of("$Buf.") match
+    Some(at) ->
+        val rest = name[at + 5..<name.bytes.len]
+
+        rest.index_of(".") match
+            Some(dot) -> rest[0..<dot]
+            None -> rest
+    None -> ""
+
+private bm_writes(m: string) -> bool =
+    m == "push" || m == "extend" || m == "pop" || m == "truncate" || m == "clear" || m == "insert" ||
+    m == "reserve" || m == "remove" || m == "set" || m == "set_len" || m == "index_set" ||
+    m == "release" || m == "place" || m == "index_place" || m == "view" || m == "spare" || m == "elems"
+
+// What a receiver is rooted in: a local, a by-value parameter, something reached through a pointer,
+// a module variable, or anything else; and whether a field lies on the way.
+private bm_root(st: &BmState, e: TExpr, field: bool) -> string = *e.kind match
+    TLoad(n, ty) ->
+        val fx = if field then "-field" else ""
+
+        underlying(ty) match
+            Ptr(_) -> "pointer" + fx
+            _ -> if holds_string(st.params, n) then "param" + fx else "local" + fx
+    TField(recv, _, _) -> bm_root(st, recv, true)
+    TDeref(_, _) -> "pointer"
+    TGlobal(_, _, _) -> "global"
+    TCast(operand, _) -> bm_root(st, operand, field)
+    TAddrOf(place, _) -> bm_root(st, place, field)
+    _ -> "other"
+
+private bm_mutation(st: &BmState, span: Span, member: string, recv: TExpr)
+    if st.summary then return
+    if span.start == 0 && span.end == 0 then return
+
+    val key = s"M:${st.scope.src.name}:${span.start}"
+
+    if st.cx.said.has(key) then return
+
+    st.cx.said.put(key, true)
+
+    val line = bm_line(st, span)
+
+    st.cx.out.push(s"MUT\t${st.scope.src.name}\t$line\t$member\t${bm_root(st, recv, false)}\t" +
+                   s"${bm_text(st, line)}\t${st.fname}")
+end bm_mutation
+
 // -- what a callee keeps --------------------------------------------------------------------------
 
 // Whether the callee keeps what its `i`th parameter is handed: stores it, returns it, captures it,
@@ -129,7 +190,7 @@ private bm_keeps(cx: &BmCx, name: string, i: usize) -> bool
 
     cx.busy.push(key)
 
-    val st: &BmState = BmState(cx, func_home(cx.an, f.name), f.name, buf(), false, 0, true, buf(), false)
+    val st: &BmState = BmState(cx, func_home(cx.an, f.name), f.name, buf(), false, 0, true, buf(), false, bm_params(f))
 
     st.aliases.push(f.params.at(i).0)
     bm_block(st, f.body, Some(BmDest("the function's result", None)))
@@ -231,6 +292,10 @@ private bm_block(st: &BmState, b: TBlock, dest: Option[BmDest])
 end bm_block
 
 private bm_write(st: &BmState, place: TExpr, value: TExpr, op: string)
+    *place.kind match
+        TIndex(recv, _, _) -> if bm_is_buf(texpr_type(recv)) then bm_mutation(st, place.span, "index_set", recv)
+        _ -> ()
+
     if op != "="
         bm_expr(st, place, None)
         bm_expr(st, value, None)
@@ -345,6 +410,13 @@ private bm_expr(st: &BmState, e: TExpr, dest: Option[BmDest])
                 bm_expr(st, item, Some(BmDest("a literal's element", None)))
         TBox(value, _) -> bm_expr(st, value, Some(BmDest("a box", None)))
         TCall(name, args, _, _) ->
+            if !args.is_empty() && bm_is_buf(texpr_type(args.at(0)))
+                val member = bm_member(name)
+
+                if bm_writes(member) then bm_mutation(st, e.span, member, args.at(0))
+                else if env_var("SYSL_BUF_CALLS").is_some() then st.cx.out.push(s"CALL\t$name")
+            end if
+
             for i in 0..<args.len()
                 val arg = args.at(i)
                 val keeps = bm_moves_out(arg) && bm_keeps(st.cx, name, i)
