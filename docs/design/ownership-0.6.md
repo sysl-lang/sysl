@@ -186,7 +186,7 @@ rule 2 removes the need to annotate around raw pointers; neither touches what a 
 |---|---|
 | a `Drop` type made by value never drops (warning since 0.4) | gone: rule 3 |
 | `(self)` copies, so the address of `self` is not an answer | stays as a rule about addresses; rule 2 reports it at the call that keeps it |
-| a `Buf` assigned is a second name for one buffer; a captured `Buf` is a copy | **open — Q7** |
+| a `Buf` assigned or captured is a second name for one buffer, one length | **not a trap: kept (Q7)** |
 | a local named `str`/`print`/`format` takes the special form away, silently | ordinary shadowing: a user name wins, the form is the fallback, and interpolation always reaches the form |
 | a module `val` that does not fold shuts a package out of a bare target, and the host cannot see it | `sysl build`/`test` on the host checks folding for every target the manifest names (0.5.0 gives the manifest its targets) |
 | `Some(rvalue)` retain/release pair | gone: rule 1 |
@@ -250,12 +250,15 @@ One agent per item, in this order, each landing on dev with its tests and refere
   removed outright in 0.6.0** (an ordinary unknown attribute); the org sweep deletes the few uses.
 - **Q6. `@scoped` and boundary `@crossing` stay as library-author attributes.** **Decided: yes**; no
   user code in the org writes either.
-- **Q7. `Buf`'s aliasing copy.** Today `val b2 = b` makes a second name for one buffer, and pushing
-  through one leaves the other's length behind. Options: (a) leave it, documented; (b) make `Buf`
-  single-owner like a `Drop` type, so `val b2 = b` moves and a closure capture moves it in — which
-  would break code that copies `Buf` headers today, by an amount not yet measured; (c) make a `Buf`
-  copy a real copy (allocates). **Decided: measure (b)'s breakage across the org first**, and
-  decide then; (a) until.
+- **Q7. `Buf`'s aliasing copy.** **Decided: leave `Buf` as it is (a); no change in 0.6.0.** The
+  question's premise was wrong. Measured (branch `q7-buf`), `Buf` is a counted handle over one
+  `BufCore`, so `val b2 = b`, a capture, or a by-value argument is a second name for one buffer with
+  one length: a push through either is seen through both, as with Scala's `ArrayBuffer`. That is
+  what `library/buf.md` already documents. Copy-on-write was weighed and dropped. About 220 org sites
+  rely on the sharing, and every mutator would have to take `*self`, making each pushed-into `val` a
+  `var`. A single-owner `Buf` would refuse 267 move-then-use sites. The study found no real aliasing
+  bug. The one caveat is that a `[]T` view taken before a push that grows the buffer still reads the
+  old storage, which stays alive because it is counted.
 - **Q8. `Option[T]`'s zero value** (skiff's question (b)): a `var x: Option[T]` with no initializer is
   `None`. It touches value initialization rather than ownership, but it belongs to the same pass over
   what a value is. **Decided: yes, in 0.6.0, by a general rule.** An enum carrying data may write one
