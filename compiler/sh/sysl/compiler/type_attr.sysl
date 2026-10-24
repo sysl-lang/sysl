@@ -21,10 +21,10 @@ import sysl.math.decimal.{Decimal, rescale, Rounding}
 type_attr_expr(cx: &Analyzer, span: Span, receiver: Expr, attr: string) -> TExpr
     val name = attr_type_name(receiver)
 
-    // `Box[int]::Fields` -- the four that describe a type's make-up are asked of an instance written
-    // out in place, as a selection after `Box[int]` already is.
-    if name.is_none() && reflection_attr(attr)
-        val instance = reflect_on_written_instance(cx, span, receiver, attr)
+    // `Box[int]::Fields`, `Pair[u8]::Id` -- an attribute asked of an instance written out in place,
+    // as a selection after `Box[int]` already is.
+    if name.is_none()
+        val instance = type_attr_on_instance(cx, span, receiver, attr, buf())
 
         if instance.is_some() then return instance.unwrap()
     end if
@@ -83,8 +83,29 @@ type_attr_call(cx: &Analyzer, span: Span, written: string, attr: string, args: B
     if subject.is_none() then
         return cx.err(span, s"'$written' has no type attributes")
 
-    val ty = subject.unwrap()
+    attr_of_type(cx, span, written, attr, args, subject.unwrap(), true)
+end type_attr_call
 
+// `Pair[u8]::Bits(n)` -- an attribute asked of a generic type at the arguments written on it, which
+// is the type an alias of `Pair[u8]` would name, and answers as that alias does. `None` where the left
+// side is not a generic type's name with brackets after it.
+type_attr_on_instance(cx: &Analyzer, span: Span, receiver: Expr, attr: string,
+                      args: Buf[Expr]) -> Option[TExpr]
+    val found = written_instance(cx, span, receiver)
+
+    if found.is_none() then return None
+
+    val ty = found.unwrap()
+
+    if ty == Unknown then return Some(bad_expr(span))
+
+    Some(attr_of_type(cx, span, type_show(ty), attr, args, ty, false))
+end type_attr_on_instance
+
+// What the type `written` stands for answers to `::attr`. `named` is a left side written as a name,
+// which may be one of the body's type parameters.
+private attr_of_type(cx: &Analyzer, span: Span, written: string, attr: string, args: Buf[Expr],
+                     ty: Type, named: bool) -> TExpr
     // **`Id` is answered before the dispatch, because it is the one attribute EVERY type has.** The
     // arms below reach an enum, a constrained subtype and a built-in integer, and everything else
     // is told it has no type attributes -- which is right for `Max` and wrong for an identity.
@@ -107,7 +128,8 @@ type_attr_call(cx: &Analyzer, span: Span, written: string, attr: string, args: B
     // where it stands for itself and each instantiation alike -- so what it was bound to decides
     // the value and never which attributes may be asked. `Self`, and a `derive` body's name for the
     // deriving type, are read once per type and answer as that type does.
-    if written != "Self" && !names_deriving_type(cx, written) && bound_type(cx.subst, written).is_some() then
+    if named && written != "Self" && !names_deriving_type(cx, written) &&
+       bound_type(cx.subst, written).is_some() then
         return bound_parameter_attr(cx, span, written, attr, args, ty)
 
     ty match
@@ -128,7 +150,7 @@ type_attr_call(cx: &Analyzer, span: Span, written: string, attr: string, args: B
         // Named as the type it is rather than as written: through an alias, the type without
         // attributes is the one the alias names.
         _ -> cx.err(span, s"'${type_show(ty)}' has no type attributes")
-end type_attr_call
+end attr_of_type
 
 // The written name a type attribute is asked of, where the left side is one.
 attr_type_name(receiver: Expr) -> Option[string] = *receiver.kind match

@@ -3151,6 +3151,31 @@ print(Status(0x22, 0, 9).bits, sizeof(Status))
 A `@byte_order` struct's integer holds its fields' values, not the bytes of the wire: each field is
 reversed on the way in and out exactly as a field read and write reverses it.
 
+A generic struct converts at each instance, as wide as that instance's fields. The instance may be
+written out in place on the left of `::`, as an alias of it would be, and a generic body reads
+`.bits` at the width its instantiation has:
+
+```sysl
+@packed
+struct Pair[T]
+    lo: T
+    hi: T
+
+show[T](p: Pair[T]) = print(p.bits)
+
+val a = Pair[u8]::Bits(0x0201)
+
+print(a.lo, a.hi, Pair[u16]::Bits(0x00020001).hi)
+show(a)
+show(Pair[u16](1, 2))
+```
+
+```output
+1 2 2
+513
+131073
+```
+
 An ordinary struct, a union and a struct with C bitfields have no `::Bits`, and `P::Bits(n)` on one
 is refused saying which it is.
 
