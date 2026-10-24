@@ -432,8 +432,70 @@ back:
   one whose address is taken for a `*fn`. There is no sysl caller on the other side of those to make
   the guarantee, so the function makes it for itself.
 
-Storing a parameter is *not* one of them: an assignment takes a count for the value arriving, so
-`latest = h` above is where the new owner's share comes from, and the callee never held one.
+Storing a parameter is the third, and it goes the other way round: the callee does not take a count
+for it, it is **handed** one.
+
+### A parameter the function keeps arrives with its count
+
+A function that keeps a counted parameter — stores it in a field, a global, a box, a closure or a
+container's element, returns it, or hands it on to another function that keeps it — would otherwise
+take a count at the store for a value whose caller is, as often as not, about to give its own back.
+So **such a parameter is owned**: the compiler reads each function's body (and the answers of the
+functions it calls, to a fixed point over recursion) and decides which parameters it keeps, and
+those arrive with a count the callee is responsible for. The caller supplies it the cheap way:
+
+- an argument at its **last use** — a temporary, or a local the statement names for the last time —
+  hands over the count the frame already holds, so the call costs nothing at either end;
+- any other argument is retained before the call, which is the count the store would have taken.
+
+`b.push(x)` and `Label(x)` returned through a helper are therefore free at `x`'s last use, and a loop
+that builds a value and pushes it pays no reference traffic at all. A parameter only a part of which
+is kept, and every parameter of a function that does not keep it, stays borrowed as above.
+
+Nothing about it is spelled in a signature either. A call through a closure, a function value or a
+trait object, and a call from C, reaches a borrowing entry that takes the count itself and then runs
+the owned body, so the convention is a matter between a function and its direct callers. A function
+that is `@export`ed, `async`, `@scoped` or carries a contract keeps the borrowed convention
+throughout. A library and the program built against it read the same bodies, so they agree on which
+parameters are owned.
+
+**Behaviour change in 0.6.0: a value handed to a parameter at its last use may be released
+sooner.** The callee now holds the count, so where it does not keep the value after all (on some
+path), it gives the count back as it returns rather than when the caller's scope ends; and a local
+whose life ends in an `if` with an `else` is handed into each arm and given back at the end of the
+arm that does not use it. A count never reaches zero while anything can still read the value, but a
+destructor that prints shows the difference:
+
+```sysl
+struct Tag
+    id: int
+
+impl Drop for Tag
+    drop(self) = print("drop", self.id)
+
+struct Label
+    tag: &Tag
+
+label(t: &Tag) -> Label = Label(t)
+
+show()
+    val t: &Tag = Tag(1)
+
+    print("label", label(t).tag.id)
+    print("end of show")
+
+show()
+```
+
+```output
+label 1
+drop 1
+end of show
+```
+
+`t` is at its last use in `label(t)`, so the label the call returns holds the only count, and the tag
+goes when that temporary does, at the end of the statement — not at the end of `show`, where it would
+go if `t` were read again later.
 
 ### A count that would be taken and given straight back is not taken
 
@@ -463,8 +525,10 @@ is a count the frame was about to give back — a fresh box, a call's result, or
 names for the last time in its scope — the destination takes that count instead of a new one, and
 the give-back is never emitted. A struct or enum built on the spot is handed over field by field, so
 `Some(Node(n))` and `Pair(x, 1)` at `x`'s last use cost no count at all. A local still read later,
-named in a `defer`, used inside a loop or a branch it was declared outside of, or reached through an
-address or a `ref` is copied as before, so this too moves no destructor.
+named in a `defer`, used inside a loop it was declared outside of, or reached through an address or a
+`ref` is copied as before. One whose life ends in an `if` with an `else` is handed into each arm, so
+an arm that uses it last moves it and the others give it back where they end (see
+[owned parameters](#a-parameter-the-function-keeps-arrives-with-its-count)).
 
 ```sysl
 struct Tag

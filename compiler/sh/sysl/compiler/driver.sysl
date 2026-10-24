@@ -684,6 +684,11 @@ emit_llvm_text(path: string, named_target: Option[string],
     // (`image_storage_unfilled`).
     check_image_storage(done.an, pruned, program.own, image_entry_named(root, t))
 
+    // **And a hosted build of a package that may reach a bare machine warns about the storage a build
+    // there would refuse** (`check_bare_metal_storage`) -- asked of the unpruned tree, since the storage
+    // a package's consumer reaches is not the storage this build happens to.
+    if bare_metal_possible(root) then check_bare_metal_storage(done.an, strip_tests(whole), program.own, root, false)
+
     // **And an `extern` naming `main` is a start file's call, which only an image starting somewhere
     // else has** (`check_main_extern`).
     if links_an_image(t) then check_main_extern(done.an, pruned, image_entry_named(root, t))
@@ -743,6 +748,41 @@ emit_llvm_text(path: string, named_target: Option[string],
     Ok(Emitted(ir_print_module(lowered.0), report, lowered.1, link_required(program.units),
                roots.archives))
 end emit_llvm_text
+
+// **Whether a project could be built for a bare machine**, which is what a hosted build's warning
+// about computed module storage is for. The rule:
+//
+// - a build with no `package` block -- a loose file, a directory with no manifest -- is not a package
+//   anybody ships to a board, and is not warned;
+// - a manifest whose `requires` names `os` (or `posix`, which implies it) cannot be built for one;
+// - a manifest that names its targets -- `targets.default` and each `targets.<name>` block -- and
+//   names only hosted machines the registry knows has said where it runs;
+// - everything else may reach one: a manifest naming no target at all, one naming a freestanding
+//   target, and one naming a machine the registry does not know (its own triple), whose kind is not
+//   for this check to guess.
+private bare_metal_possible(root: string) -> bool
+    val m = manifest_at(root) match
+        Err(_) -> return false
+        Ok(found) -> found
+
+    if !m.has_package || holds_string(m.requires, CapOs) then return false
+
+    var named: Buf[string] = buf()
+
+    if m.default_target != "" then named.push(m.default_target)
+
+    for item in m.targets
+        named.push(item.0)
+
+    if named.is_empty() then return true
+
+    for item in named
+        target_named(item) match
+            Some(found) -> if !found.runs_initializers() then return true
+            None -> return true
+
+    false
+end bare_metal_possible
 
 // The warnings of a compilation that succeeded, each a note on its own, in source order.
 //
@@ -1557,6 +1597,10 @@ private lower_for_c(path: string, t: Target) -> Result[LoweredForC, Failure]
     check_main_extern(done.an, kept, entry)
     check_runtime_init_extern(done.an, kept, entry)
 
+    val root = if is_directory(path) then path else parent_of(path).unwrap_or(".")
+
+    if bare_metal_possible(root) then check_bare_metal_storage(done.an, strip_tests(whole), program.own, root, true)
+
     val lowered = codegen_with_gaps(kept, t, promotions)
 
     check_aligned_heap(done.an, kept)
@@ -1880,7 +1924,7 @@ test_build_of(path: string, named_target: Option[string],
 
     headers_refused(path)?
 
-    Ok(test_build_from(packaged_compilation_of(path, t)?, false, level, path)?)
+    Ok(test_build_from(packaged_compilation_of(path, t)?, false, level, path, true)?)
 end test_build_of
 
 // The same for a tree that **is** the standard module (`sysl test <root> --std`), which is how the
@@ -1926,8 +1970,13 @@ private test_target_of(path: string, named_target: Option[string]) -> Result[Tar
     Ok(t)
 end test_target_of
 
+//
+// **A package's own test build says its warnings, as every other build does** (`warns`): `sysl test .`
+// is the command most often run on a package, and the hosted warning about storage a bare-metal build
+// would refuse (`check_bare_metal_storage`) is worth nothing in a command that never shows it. A
+// `tests/refused/` program is compiled to be refused, and says nothing.
 private test_build_from(program: Compilation, standalone: bool, level: string,
-                        project: string = "") -> Result[TestBuild, Refusal]
+                        project: string = "", warns: bool = false) -> Result[TestBuild, Refusal]
     val t = program.target
 
     // A test binary links the roots' kept halves as a program does. A root whose own tests this build
@@ -1960,7 +2009,18 @@ private test_build_from(program: Compilation, standalone: bool, level: string,
 
     check_aligned_heap(done.an, kept)
 
-    val emitted = Emitted(ir_print_module(lowered.0), errors_of(done.an.diagnostics()), lowered.1,
+    if warns
+        val root = if is_directory(project) then project else parent_of(project).unwrap_or(".")
+
+        if bare_metal_possible(root)
+            check_bare_metal_storage(done.an, strip_tests(whole), program.own, root, false)
+    end if
+
+    val report = errors_of(done.an.diagnostics())
+
+    if warns then say_warnings(report, done.an)
+
+    val emitted = Emitted(ir_print_module(lowered.0), report, lowered.1,
                           link_required(program.units), roots.archives)
 
     Ok(TestBuild(emitted, kept.tests, t, standalone))
