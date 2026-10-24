@@ -461,25 +461,59 @@ end parse_enum_decl
 // variant rule has already turned away -- a result type, an `=` or a block after its brackets, a
 // receiver inside them -- is the misread, and is refused at the name. Annotations above the line are
 // read past first, in a reading taken back, so the fault lands on the name and not on the `@`.
+//
+// **A modifier before the name -- `private`, `static`, `const`, `async` -- is read past
+// the same way**, so `static Make() = 0` is refused at `Make` too. A variant carries no modifier, so
+// there the line was never a variant given a value, and the message says so.
 private refuse_capitalised_fn(p: *Parser) -> bool
     if p.at_kw("@")
-        if !annotations_then(p, at_capitalised_fn) then return false
+        if !annotations_then(p, at_capitalised_member) then return false
 
         while p.at_kw("@")
             p.bump()
             parse_expr_bp(p, PrefixPower)
             p.skip_newlines()
-    else if !at_capitalised_fn(p)
+    else if !at_capitalised_member(p)
         return false
     end if
+
+    val modified = skip_member_modifiers(p)
 
     val name = p.peek() match
         Ident(n) -> n
         _ -> ""
 
-    p.fault(p.here(), s"'${name}' is read as a function, but a function in an enum body is named in lowercase — a variant that carries data cannot be given a value")
+    val reason = if modified then "a variant carries no modifier" else "a variant that carries data cannot be given a value"
+
+    p.fault(p.here(), s"'${name}' is read as a function, but a function in an enum body is named in lowercase — ${reason}")
     true
 end refuse_capitalised_fn
+
+// Every modifier word a member's line may open with, taken; whether any was.
+private skip_member_modifiers(p: *Parser) -> bool
+    var any = false
+
+    while p.at_kw("private") || p.at_kw("static") || at_const_member(p) ||
+          at_async_word(p) || (p.at_word("async") && p.kw_at(1, "const"))
+        p.bump()
+        any = true
+
+    any
+end skip_member_modifiers
+
+// Whether the line is a capitalised function, after whatever modifiers it opens with, in a reading
+// taken back.
+private at_capitalised_member(p: *Parser) -> bool
+    val tokens_at = p.mark()
+    val errors_at = p.errors_at()
+
+    skip_member_modifiers(p)
+
+    val found = at_capitalised_fn(p)
+
+    p.rewind(tokens_at, errors_at)
+    found
+end at_capitalised_member
 
 // Whether the line is a capitalised name with a bracketed list the variant rule did not take.
 private at_capitalised_fn(p: *Parser) -> bool

@@ -63,6 +63,44 @@ ecfn_keyword_lookalike()
 ecfn_reserved_word_keeps_its_own()
     assert_eq(pf_err("enum E\n    type(r: int) = 0\n").contains("is read as a function"), false)
 
+private ecfn_modified(name: string, at: string) -> string =
+    s"'${name}' is read as a function, but a function in an enum body is named in lowercase — a variant carries no modifier @ t.sysl:${at}"
+
+@test("a modifier before the name does not hide it: static, private, const, async, each alone")
+ecfn_each_modifier()
+    assert_eq(ecfn_said("enum E\n    A\n    static Make() = 0\n"), ecfn_modified("Make", "3:12"))
+    assert_eq(ecfn_said("enum E\n    A\n    private Area(self) -> int = 1\n"), ecfn_modified("Area", "3:13"))
+    assert_eq(ecfn_said("enum E\n    A\n    const Make(r: int) -> int = r\n"), ecfn_modified("Make", "3:11"))
+    assert_eq(ecfn_said("enum E\n    A\n    async Make() -> int = 1\n"), ecfn_modified("Make", "3:11"))
+
+@test("modifiers combined are read past together")
+ecfn_combined_modifiers()
+    assert_eq(ecfn_said("enum E\n    A\n    private static Make() = 0\n"), ecfn_modified("Make", "3:20"))
+    assert_eq(ecfn_said("enum E\n    A\n    private const static Make() = 0\n"), ecfn_modified("Make", "3:26"))
+
+@test("a modifier plus annotations is refused at the name")
+ecfn_modifier_and_annotations()
+    assert_eq(ecfn_said("enum E\n    A\n    @inline\n    static Make() = 0\n"), ecfn_modified("Make", "4:12"))
+    assert_eq(ecfn_said("enum E\n    A\n    @inline\n    @deprecated\n    private Make(self) -> int = 0\n"), ecfn_modified("Make", "5:13"))
+
+@test("a modifier plus a lowercase name is accepted")
+ecfn_modifier_lowercase()
+    assert_eq(pf_err("enum E\n    A\n    static make -> int = 0\n"), "")
+    assert_eq(pf_err("enum E\n    A\n    private area(self) -> int = 1\n"), "")
+    assert_eq(pf_err("enum E\n    A\n    @inline\n    static make -> int = 0\n"), "")
+
+@test("a modified capitalised name with a block body is refused")
+ecfn_modifier_block_body()
+    assert_eq(ecfn_said("enum E\n    A\n    static Make(r: int)\n        r * 2\n"), ecfn_modified("Make", "3:12"))
+
+@test("override keeps its own refusal")
+ecfn_override_keeps_its_own()
+    assert_eq(pf_err("enum E\n    A\n    override Make() = 0\n").contains("is read as a function"), false)
+
+@test("a struct's capitalised static function stays accepted")
+ecfn_struct_static_untouched()
+    assert_eq(pf_err("struct S\n    x: int\n    static Make -> int = 0\n"), "")
+
 @test("a struct's capitalised function is not an enum's variant, so it stays accepted")
 ecfn_struct_is_untouched()
     assert_eq(pf_err("struct S\n    x: int\n    Make() = 0\n"), "")
