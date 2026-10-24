@@ -2,7 +2,6 @@ module sh.sysl.compiler
 @tests
 
 import sysl.buf.{Buf, buf}
-import sysl.time.{monotonic, whole_micros}
 
 // What gathering a program's tests costs as the program grows.
 //
@@ -12,7 +11,8 @@ import sysl.time.{monotonic, whole_micros}
 // most of what building the program cost.
 //
 // The claim is a ratio rather than a bound, so it holds on a slow machine as well as a fast one: a
-// program four times larger may cost four times as much and not sixteen times.
+// program eight times larger may cost eight times as much and not sixty-four times. How the two are
+// measured under a loaded suite is `tests_lgr_linear_growth.sysl`'s.
 
 // `n` tests, each calling a function of its own.
 private tested_program(n: usize) -> string
@@ -32,36 +32,19 @@ private tested_program(n: usize) -> string
     text
 end tested_program
 
-// The best of three gatherings of one program, in microseconds, and how many tests it found.
-private gather_cost(n: usize) -> (long, usize)
+// One gathering of a program of `n` tests, analysed once beforehand, as a run to measure: its
+// processor time, having checked it found every test.
+private gathering(n: usize) -> &Fn() -> long
     val done = typed_of(tested_program(n))
 
     assert(done.reported.is_empty(), "the generated program is sound")
 
-    var best: long = -1
-    var found: usize = 0
+    () -> processor_micros(() -> assert_eq(program_of(done, done.main_module).tests.len(), n))
+end gathering
 
-    for round in 0..<3
-        val started = monotonic()
-        val p = program_of(done, done.main_module)
-        val took = whole_micros(monotonic() - started)
-
-        found = p.tests.len()
-
-        if best < 0 || took < best then best = took
-
-    (best, found)
-end gather_cost
-
-@test("gathering the tests of a program four times larger costs about four times as much")
+@test("gathering the tests of a program eight times larger costs about eight times as much")
 gathering_tests_is_linear()
-    val small = gather_cost(1000)
-    val large = gather_cost(4000)
+    val g = growth_of(gathering(1000), gathering(1000 * GrowthFactor))
 
-    assert_eq(small.1, 1000)
-    assert_eq(large.1, 4000)
-
-    val ratio = large.0 / (if small.0 > 0 then small.0 else 1)
-
-    assert(ratio < 9, s"a 4x program took ${ratio}x as long to gather (${small.0} us, then ${large.0} us)")
+    assert(g.linear(), g.said("gathering tests"))
 end gathering_tests_is_linear

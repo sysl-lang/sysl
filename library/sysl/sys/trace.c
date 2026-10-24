@@ -5,9 +5,10 @@
  * on a board with nothing to symbolize against, and it is the same at every optimization level.
  *
  * **The ring is one per thread on a hosted target** (`_Thread_local`), so a failure on one thread
- * never lands in another's report, and **reached through a pointer on a freestanding one**, where
- * there is no thread to tell apart and often no thread-local storage to put it in: the pointer starts
- * at one static store, and a kernel points it at each task's own. It is fixed in size: thirty-two
+ * never lands in another's report, and **the store a weak hook answers on a freestanding one**, where
+ * there is no thread to tell apart and often no thread-local storage to put it in: the default hook
+ * answers a pointer that starts at one static store, and a kernel points it at each task's own or
+ * supplies a hook of its own. It is fixed in size: thirty-two
  * sites and a count, and nothing here allocates. The first thirty-two are kept -- the origin end is
  * where the bug is -- and the count goes on past them, so a report can say how many it dropped.
  *
@@ -45,14 +46,31 @@ static _Thread_local sysl_trace_store *sysl_trace_owner;
 static _Thread_local sysl_trace_store sysl_trace_own;
 #define SYSL_TRACE (sysl_trace)
 #else
-/* **Freestanding: the trace is reached through a pointer**, `sysl_error_trace_current`, which starts
- * at a static store, so an image with one flow of control behaves as though the store were the
- * trace. A kernel gives each task a store of its own and points this at it on a context switch --
- * through `sysl_error_trace_use`, or by writing the pointer from its switch code. Both are constant
- * data, laid down in the image with nothing to run at start-up. */
+/* **Freestanding: the trace is the store a hook answers**, `sysl_error_trace_here`, called on every
+ * failure path that records or prunes and by every read -- never by a `?` that succeeds.
+ *
+ * **The default hook answers `sysl_error_trace_current`**, a pointer that starts at a static store,
+ * so an image with one flow of control behaves as though the store were the trace. A kernel with one
+ * core gives each task a store of its own and points this at it on a context switch -- through
+ * `sysl_error_trace_use`, or by writing the pointer from its switch code. Both are constant data,
+ * laid down in the image with nothing to run at start-up.
+ *
+ * **The hook is weak, so a board or an OS supplies its own** wherever one image-wide word cannot
+ * say which store is current: one per core (each core's switch would overwrite the other's), or
+ * under an MPU, where unprivileged code cannot read a word in the kernel's data. Its own answers the
+ * store found its own way -- by the core's ID, or at the top of the running task's stack, inside
+ * the task's own map. It is called from wherever a failure is recorded (a task, an interrupt
+ * handler, unprivileged code), so it must not fail, allocate or record a failure itself, and it
+ * must answer a valid store, every time. With an override linked, `sysl_error_trace_use` still
+ * sets the default's pointer, which nothing then reads unless the override does. */
 static sysl_trace_store sysl_trace_default;
 sysl_trace_store *sysl_error_trace_current = &sysl_trace_default;
-#define SYSL_TRACE (*sysl_error_trace_current)
+
+__attribute__((weak)) sysl_trace_store *sysl_error_trace_here(void) {
+    return sysl_error_trace_current;
+}
+
+#define SYSL_TRACE (*sysl_error_trace_here())
 #endif
 
 void sysl_error_trace_push(const char *at) {
