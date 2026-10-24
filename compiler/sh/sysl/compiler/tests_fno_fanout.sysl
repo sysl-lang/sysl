@@ -1,0 +1,464 @@
+module sh.sysl.compiler
+@tests
+
+// A fan-out is joined by a loop that joins every element (`reference/memory.md § A thread holds what
+// it is handed until it is joined`): handles kept in a local array, a slice local, a `Buf` or a field
+// of a local -- at the counter of a counting loop, or pushed -- are let go of by a loop over the same
+// collection that joins each element on every turn (`keeps_join.sysl § a fan-out`). Each accepted cell
+// runs and prints what the threads did; each refused one is told at the argument why the loop it has
+// does not count.
+//
+// Skipped cells, and why: a join of the element inside the same turn of the loop that stored it is
+// refused (the loop that stores is not one that releases), not pinned as accepted; a two-dimensional
+// `grid[r][c]` names its element through an element, which is no frame place, so it is refused like
+// any other handle at a place the body cannot name again; a callee answering a collection whose
+// elements carry their handles in a field is released only by a join of the elements themselves, so
+// that shape is held for good; a trait object or a closure that starts threads into a collection sees
+// no `@joined` (`tests_jnd_*`).
+
+private fno_prelude() -> string =
+    "import sysl.threads.*\nimport sysl.buf.*\n\nstruct S\n    n: int\n\nwork(s: *S)\n    s.n = s.n + 1\n\n"
+
+private fno_prints(body: string, want: string)
+    if !azd_ready() then return
+
+    twp_prints(fno_prelude() + body, want)
+
+// Refused at the argument `at` (`line:col` of `main.sysl`), the refusal ending in `why`.
+private fno_refused(body: string, owner: string, why: string, at: string)
+    if !azd_ready() then return
+
+    val said = azd_err(fno_prelude() + body)
+
+    assert(said.contains(s"error: 'spawn' keeps its parameter 'arg' (the thread it starts holds it until that " +
+                         s"thread is joined), and '&s' is the address of a local of '$owner' — join that thread " +
+                         s"on every way out of '$owner', or hand it storage that lasts$why\n"), said)
+    assert(said.contains(s"main.sysl:$at"), said)
+end fno_refused
+
+// -- joined by a loop over every element: accepted -------------------------------------------------
+
+@test("raytrace's pool: a slice of Option handles filled by a counting loop and joined by a walk with a 'None' arm")
+fno_raytrace_shape()
+    fno_prints(raw"""
+        render(threads: int) -> int
+            var s = S(0)
+
+            if threads <= 1
+                work(&s)
+                return s.n
+
+            var pool: []Option[Thread] = [None; threads]
+
+            for i in 0..<threads
+                pool[i] = spawn(&work, &s)
+
+            for t in pool
+                t match
+                    Some(th) -> th.join()
+                    None -> ()
+
+            work(&s)
+            s.n
+
+        print(render(4))
+        print(render(1))
+        """, "5\n1\n")
+
+@test("an array filled and joined by counting loops over its length")
+fno_counted_by_length()
+    fno_prints(raw"""
+        go()
+            var s = S(0)
+            var pool: [3]Option[Thread] = [None; 3]
+
+            for i in 0..<pool.len
+                pool[i] = spawn(&work, &s)
+
+            for i in 0..<pool.len
+                pool[i].unwrap().join()
+
+            print(s.n)
+
+        go()
+        """, "3\n")
+
+@test("a joining loop over the same range as the storing loop, the bound a parameter")
+fno_same_bound()
+    fno_prints(raw"""
+        go(n: int)
+            var s = S(0)
+            var pool: []Option[Thread] = [None; n]
+
+            for i in 0..<n
+                pool[i] = spawn(&work, &s)
+
+            for i in 0..<n
+                pool[i] match
+                    Some(h) -> h.join()
+                    None -> ()
+
+            print(s.n)
+
+        go(3)
+        go(0)
+        """, "3\n0\n")
+
+@test("handles pushed into a Buf, in a loop and once more, joined by index and by a walk")
+fno_buf_pushed()
+    fno_prints(raw"""
+        by_index()
+            var s = S(0)
+            var b: Buf[Thread] = buf()
+
+            for _ in 0..<3
+                b.push(spawn(&work, &s).unwrap())
+
+            b.push(spawn(&work, &s).unwrap())
+
+            for i in 0..<b.len()
+                b[i].join()
+
+            print(s.n)
+
+        walked()
+            var s = S(0)
+            var b: Buf[Thread] = buf()
+
+            for _ in 0..<2
+                b.push(spawn(&work, &s).unwrap())
+
+            for h in b
+                assert(h.join())
+
+            print(s.n)
+
+        by_index()
+        walked()
+        """, "4\n2\n")
+
+@test("only some elements given a thread, the rest 'None', joined through an 'is' test")
+fno_some_elements()
+    fno_prints(raw"""
+        evens()
+            var s = S(0)
+            var pool: [4]Option[Thread] = [None; 4]
+
+            for i in 0..<4
+                if i % 2 == 0 then pool[i] = spawn(&work, &s)
+
+            for t in pool
+                if t is Some(h) then assert(h.join())
+
+            print(s.n)
+
+        chosen()
+            var s = S(0)
+            var pool: [4]Option[Thread] = [None; 4]
+
+            for i in 0..<4
+                pool[i] = if i == 1 then None else spawn(&work, &s)
+
+            for t in pool
+                if t is Some(h) then h.join()
+
+            print(s.n)
+
+        evens()
+        chosen()
+        """, "2\n3\n")
+
+@test("a fan-out in an element's field, beside a field that is no handle")
+fno_handle_in_a_field()
+    fno_prints(raw"""
+        struct W
+            t: Option[Thread]
+            k: int
+
+        go()
+            var s = S(0)
+            var ws: [3]W = [W(None, 0); 3]
+
+            for i in 0..<3
+                ws[i].t = spawn(&work, &s)
+                ws[i].k = i
+
+            for w in ws
+                w.t match
+                    Some(h) -> h.join()
+                    None -> ()
+
+            print(s.n + ws[2].k)
+
+        go()
+        """, "5\n")
+
+@test("nested fan-outs: one per turn of an outer loop, a collection declared inside it, and two in one loop")
+fno_nested()
+    fno_prints(raw"""
+        rounds()
+            var s = S(0)
+            var pool: [2]Option[Thread] = [None; 2]
+
+            for _ in 0..<3
+                for i in 0..<2
+                    pool[i] = spawn(&work, &s)
+
+                for t in pool
+                    if t is Some(h) then h.join()
+
+            print(s.n)
+
+        groups()
+            var s = S(0)
+
+            for _ in 0..<2
+                var pool: [2]Option[Thread] = [None; 2]
+
+                for i in 0..<2
+                    pool[i] = spawn(&work, &s)
+
+                for i in 0..<2
+                    pool[i].unwrap().join()
+
+            print(s.n)
+
+        pairs()
+            var s = S(0)
+            var a: [2]Option[Thread] = [None; 2]
+            var b: [2]Option[Thread] = [None; 2]
+
+            for i in 0..<2
+                a[i] = spawn(&work, &s)
+                b[i] = spawn(&work, &s)
+
+            for i in 0..<2
+                a[i].unwrap().join()
+                b[i].unwrap().join()
+
+            print(s.n)
+
+        rounds()
+        groups()
+        pairs()
+        """, "6\n4\n4\n")
+
+@test("a function that answers its fan-out passes the joins on to its caller, which joins every element")
+fno_answered()
+    fno_prints(raw"""
+        start_all(p: *S) -> [2]Option[Thread]
+            var pool: [2]Option[Thread] = [None; 2]
+
+            for i in 0..<2
+                pool[i] = spawn(&work, p)
+
+            pool
+
+        go()
+            var s = S(0)
+            val pool = start_all(&s)
+
+            for t in pool
+                if t is Some(h) then h.join()
+
+            print(s.n)
+
+        go()
+        """, "2\n")
+
+@test("a wrapper that answers one handle, stored into each element")
+fno_through_a_wrapper()
+    fno_prints(raw"""
+        start(p: *S) -> Option[Thread] = spawn(&work, p)
+
+        go()
+            var s = S(0)
+            var pool: [3]Option[Thread] = [None; 3]
+
+            for i in 0..<3
+                pool[i] = start(&s)
+
+            for t in pool
+                if t is Some(h) then h.join()
+
+            print(s.n)
+
+        go()
+        """, "3\n")
+
+// -- a loop that may skip an element: refused ------------------------------------------------------
+
+private val FnoLeaves = "; the loop over 'pool' that joins its elements may leave before it has joined them all"
+private val FnoSkips = "; the loop over 'pool' does not join each of its elements on every turn"
+private val FnoAgain = "; 'pool' is stored into again before the handles it holds are joined"
+
+// The storing loop every refused cell below opens with: its `&s` is at 15:32.
+private fno_filled(owner: string, ret: string) -> string =
+    s"$owner()$ret\n    var s = S(0)\n    var pool: [4]Option[Thread] = [None; 4]\n\n    for i in 0..<4\n" +
+    "        pool[i] = spawn(&work, &s)\n\n"
+
+@test("a 'break' in the joining loop")
+fno_break()
+    fno_refused(fno_filled("go", "") + "    for t in pool\n        if t.is_none() then break\n\n" +
+                "        t.unwrap().join()\n\ngo()\n", "go", FnoLeaves, "15:32")
+
+@test("a 'continue' before the join")
+fno_continue()
+    fno_refused(fno_filled("go", "") + "    for i in 0..<4\n        if i == 0 then continue\n\n" +
+                "        pool[i].unwrap().join()\n\ngo()\n", "go", FnoLeaves, "15:32")
+
+@test("a '?' in the joining loop")
+fno_question()
+    fno_refused(fno_filled("go", " -> Option[int]") + "    for t in pool\n        t?.join()\n\n    Some(1)\n\n" +
+                "print(go().is_some())\n", "go", FnoLeaves, "15:32")
+
+@test("a 'return' or a panic inside the joining loop")
+fno_return_or_panic()
+    fno_refused(fno_filled("go", "") + "    for t in pool\n        if t.is_none() then return\n\n" +
+                "        t.unwrap().join()\n\ngo()\n", "go", FnoLeaves, "15:32")
+    fno_refused(fno_filled("go", "") + "    for t in pool\n        if t.is_none() then panic(\"none\")\n\n" +
+                "        t.unwrap().join()\n\ngo()\n", "go", FnoLeaves, "15:32")
+
+@test("a join under a condition, a guarded arm, and a 'Some' arm that does not join")
+fno_conditional_join()
+    fno_refused(fno_filled("go", "") + "    for i in 0..<4\n        if i > 0 then pool[i].unwrap().join()\n\ngo()\n",
+                "go", FnoSkips, "15:32")
+    fno_refused(fno_filled("go", "") + "    for t in pool\n        t match\n            Some(h) if s.n > 0 -> h.join()\n" +
+                "            _ -> ()\n\ngo()\n", "go", FnoSkips, "15:32")
+    fno_refused(fno_filled("go", "") + "    for t in pool\n        t match\n            Some(h) -> print(\"on\")\n" +
+                "            None -> ()\n\ngo()\n", "go", "; no loop over 'pool' joins each of its elements", "15:32")
+
+@test("a joining loop over a narrower range")
+fno_narrower_range()
+    fno_refused(fno_filled("go", "") + "    for i in 0..<3\n        pool[i].unwrap().join()\n\ngo()\n", "go",
+                "; the loop over 'pool' that joins its elements does not reach every element they were stored in", "15:32")
+    fno_refused(fno_filled("go", "") + "    for i in 1..<4\n        pool[i].unwrap().join()\n\ngo()\n", "go",
+                "; the loop over 'pool' that joins its elements does not reach every element they were stored in", "15:32")
+
+@test("no loop joins the elements, or one joins a different collection")
+fno_no_joining_loop()
+    fno_refused(fno_filled("go", "") + "    print(s.n)\n\ngo()\n", "go", "; no loop over 'pool' joins each of its elements",
+                "15:32")
+    fno_refused(fno_filled("go", "") + "    var spare: [4]Option[Thread] = [None; 4]\n\n    for t in spare\n" +
+                "        if t is Some(h) then h.join()\n\ngo()\n", "go", "; no loop over 'pool' joins each of its elements",
+                "15:32")
+
+@test("a handle stored at an index other than its loop's counter")
+fno_computed_index()
+    fno_refused(raw"""
+        go()
+            var s = S(0)
+            var pool: [5]Option[Thread] = [None; 5]
+
+            for i in 0..<4
+                pool[i + 1] = spawn(&work, &s)
+
+            for t in pool
+                if t is Some(h) then h.join()
+
+        go()
+        """, "go", "; a handle kept in an element of 'pool' is matched to a loop that joins them only where it is " +
+        "stored at the counter of the counting loop it is in, or pushed", "15:36")
+    fno_refused(raw"""
+        go()
+            var s = S(0)
+            var pool: [2]Option[Thread] = [None; 2]
+
+            for i in 0..<2
+                for _ in 0..<2
+                    pool[i] = spawn(&work, &s)
+
+            for t in pool
+                if t is Some(h) then h.join()
+
+        go()
+        """, "go", "; a handle kept in an element of 'pool' is matched to a loop that joins them only where it is " +
+        "stored at the counter of the counting loop it is in, or pushed", "16:36")
+
+@test("the collection stored into again, by a second round or as a whole, before its handles are joined")
+fno_stored_again()
+    fno_refused(raw"""
+        go()
+            var s = S(0)
+            var pool: [4]Option[Thread] = [None; 4]
+
+            for _ in 0..<2
+                for i in 0..<4
+                    pool[i] = spawn(&work, &s)
+
+            for t in pool
+                if t is Some(h) then h.join()
+
+        go()
+        """, "go", FnoAgain, "16:36")
+    fno_refused(fno_filled("go", "") + "    pool = [None; 4]\n\n    for t in pool\n        if t is Some(h) then h.join()\n\n" +
+                "go()\n", "go", FnoAgain, "15:32")
+    fno_refused(fno_filled("go", "") + "    for i in 0..<4\n        pool[i] = spawn(&work, &s)\n\n    for t in pool\n" +
+                "        if t is Some(h) then h.join()\n\ngo()\n", "go", FnoAgain, "15:32")
+
+@test("handles thrown away in a loop, and a pushed handle set over by index")
+fno_discarded_and_set_over()
+    fno_refused(raw"""
+        go()
+            var s = S(0)
+
+            for _ in 0..<2
+                spawn(&work, &s)
+
+        go()
+        """, "go", "", "14:22")
+    fno_refused(raw"""
+        go()
+            var s = S(0)
+            var b: Buf[Thread] = buf()
+
+            b.push(spawn(&work, &s).unwrap())
+            b.index_set(0, spawn(&work, &s).unwrap())
+
+            for h in b
+                h.join()
+
+        go()
+        """, "go", "; a handle kept in an element of 'b' is matched to a loop that joins them only where it is " +
+        "stored at the counter of the counting loop it is in, or pushed", "15:33")
+
+@test("a function answering its fan-out may not hand it a local, and a caller that does not join is refused")
+fno_answered_refused()
+    fno_refused(raw"""
+        start_all() -> [2]Option[Thread]
+            var s = S(0)
+            var pool: [2]Option[Thread] = [None; 2]
+
+            for i in 0..<2
+                pool[i] = spawn(&work, &s)
+
+            pool
+
+        start_all()
+        """, "start_all", "", "15:32")
+
+    if !azd_ready() then return
+
+    val said = azd_err(fno_prelude() + raw"""
+        start_all(p: *S) -> [2]Option[Thread]
+            var pool: [2]Option[Thread] = [None; 2]
+
+            for i in 0..<2
+                pool[i] = spawn(&work, p)
+
+            pool
+
+        go()
+            var s = S(0)
+            val pool = start_all(&s)
+
+            for i in 0..<1
+                pool[i].unwrap().join()
+
+        go()
+        """)
+
+    assert(said.contains("error: 'start_all' keeps its parameter 'p' (it is passed to 'spawn', which keeps it), and " +
+                         "'&s' is the address of a local of 'go' — join that thread on every way out of 'go', " +
+                         "or hand it storage that lasts"), said)
+end fno_answered_refused

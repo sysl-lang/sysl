@@ -24,9 +24,15 @@ import sysl.buf.{Buf, buf}
 // A handle the body answers is held by whoever it answers it to: the location `j` again, which makes
 // a function that hands its own parameter to `spawn` and answers the handle `@joined` at that
 // parameter for its callers.
+//
+// **Handles kept in the elements of one collection are joined by a loop that joins every element**
+// (a fan-out): `pool[i] = spawn(...)` in a counting loop, or `pool.push(spawn(...))` anywhere, holds
+// at `j:pool[]` (or `j:pool[+]`, `j:pool[].t` for a field of the element), and a loop over the same
+// collection that joins each element on every turn takes all of them back at once.
 
 // Where the handles in one body are kept, and the statement being said: the place its handle goes
-// (`at`), `^` for one the body answers, or nothing.
+// (`at`), `^` for one the body answers, or nothing -- and, where a fan-out's handles cannot be matched
+// to a loop that joins them, why (`why`, said after the refusal's cure).
 struct Handles
     org: &Origins
     sources: Buf[(string, string)]
@@ -34,16 +40,28 @@ struct Handles
     answers: Buf[Span]
     scrutinized: Buf[Span]
     at: string
+    why: string
+
+    // Each statement storing a fan-out's handle, by its span: where it keeps it, and why that cannot
+    // be taken back, if a reason is known only at the store.
+    fan_at: Buf[(Span, string, string)]
+
+    // Why a fan-out's handles are not taken back by any loop, by where they are kept.
+    fan_whys: Buf[(string, string)]
+
+    // What a fan-out's loops and writes do, by the span of the piece the walk says them at.
+    fan_hooks: Buf[(Span, FlowEv)]
 end Handles
 
 // What one body binds a handle to, gathered once, before its ways are walked.
 handles_of(org: &Origins, f: TFunc) -> &Handles
-    val hs: &Handles = Handles(org, buf(), buf(), buf(), buf(), "")
+    val hs: &Handles = Handles(org, buf(), buf(), buf(), buf(), "", "", buf(), buf(), buf())
 
     walk_block_stmts(f.body, TWalk(false, e -> handle_expr(hs, e), w -> (), s -> handle_stmt(hs, s)))
 
     if f.body.result.is_some() then hs.answers.push(f.body.result.unwrap().span)
 
+    fan_out(hs, f)
     hs
 end handles_of
 
@@ -159,17 +177,27 @@ private frame_place_key(hs: &Handles, e: TExpr) -> string
 end frame_place_key
 
 // Where the statement being said keeps a handle: a local or a field of one it declares or assigns.
-stmt_handle(hs: &Handles, s: TStmt) -> string = s match
-    TVarDecl(n, _, _, _) -> n
-    TWriteStmt(w) -> frame_place_key(hs, w.place)
-    _ -> ""
+stmt_handle(hs: &Handles, s: TStmt) -> string
+    hs.why = ""
+
+    s match
+        TVarDecl(n, _, _, _) -> n
+        TWriteStmt(w) -> fan_handle(hs, w.value.span).unwrap_or(frame_place_key(hs, w.place))
+        _ -> ""
+end stmt_handle
 
 // An expression the body answers keeps its handle with whoever it is answered to, and a call a `match`
 // or an `is` test asks keeps it where the arms name it.
 // An assignment written as a statement is a store at the top of its expression, and keeps the
 // handle where it stores it.
 expr_handle(hs: &Handles, e: TExpr) -> string
+    hs.why = ""
+
     if has_span(hs.answers, e.span) then return "^"
+
+    val fan = fan_handle(hs, e.span)
+
+    if fan.is_some() then return fan.unwrap()
 
     *e.kind match
         TStore(place, _, _, _) -> frame_place_key(hs, place)
@@ -239,3 +267,609 @@ has_span(xs: Buf[Span], at: Span) -> bool
 
     false
 end has_span
+
+// -- a fan-out: handles kept in the elements of one collection --------------------------------------
+//
+// **A store of a handle into an element is matched to a loop only where each store names a fresh
+// element**: the element at the counter of the counting loop the store is directly in (`pool[]`), or
+// one pushed (`pool[+]`). A later turn of that loop storing again is another element, not a second
+// thread over the first (`fan_event`); the loop entered again with the last round still unjoined, or
+// the whole collection written over, leaves those handles with nobody to join them.
+//
+// **A loop releases them only if it joins every element they may be in**: it walks the whole
+// collection -- `for h in pool`, `for i in 0..<pool.len` -- or the same range as every loop that
+// stored them, it joins the element (or the same field of it) at the top of each turn -- directly, or
+// through a `match` or an `is` test whose `None` way holds no thread -- and nothing in it may leave
+// the loop or the turn early. Such a loop takes them back at its head, which comes to the same thing
+// as its end, since nothing can leave between the two.
+//
+// A collection is a local array, a slice local or a `Buf`, or a field of a local; one the body
+// answers is answered with its handles, which its caller joins (`^`).
+
+// The `how` of a walk event that says a collection's handles are about to be stored again: whatever is
+// still held there is held for good, since the next round overwrites it.
+val FAN_ROUND = "a fan-out stored again"
+
+// Every handle kept in one collection's elements the same way, the range of each counting loop that
+// stored them (`""` where a bound can change or is not one a join can name), and whether any was
+// pushed -- which only a loop over the whole collection reaches.
+struct Fan
+    loc: string
+    coll: string
+    suffix: string
+    ranges: Buf[string]
+    pushed: bool
+end Fan
+
+// One loop that joins elements of a collection: the paths from the element to each handle it joins on
+// every turn, what is wrong with it (`leaves`, `skips`, or nothing), whether it walks the whole
+// collection, its range said as the storing loops' are, and the piece its head is said at.
+struct FanLoop
+    coll: string
+    suffixes: Buf[string]
+    fault: string
+    whole: bool
+    range: string
+    hook: Span
+end FanLoop
+
+// The counting loop a statement is directly in: its counter, its range and its head; no counter in any
+// other loop or none.
+struct FanCtx
+    counter: string
+    range: string
+    hook: Span
+
+private struct FanScan
+    fans: Buf[&Fan]
+    loops: Buf[FanLoop]
+    writes: Buf[(Span, string)]
+    written: Buf[string]
+    answered: Buf[string]
+end FanScan
+
+private struct FanSeen
+    found: bool
+
+private no_fan_ctx() -> FanCtx = FanCtx("", "", span_zero())
+
+// Finds every fan-out in `f`'s body and says what its stores, loops and writes do, for the walk.
+private fan_out(hs: &Handles, f: TFunc)
+    val sc: &FanScan = FanScan(buf(), buf(), buf(), buf(), buf())
+
+    walk_block_stmts(f.body, TWalk(false, e -> fan_written_expr(sc, e), w -> fan_written(sc, w.place),
+                                   s -> fan_answered(sc, hs, s)))
+
+    if f.body.result.is_some() then sc.answered.push(coll_key(hs, f.body.result.unwrap()))
+
+    fan_scan_block(sc, hs, f.body, no_fan_ctx())
+    fan_settle(sc, hs)
+end fan_out
+
+private fan_written(sc: &FanScan, place: TExpr)
+    *place.kind match
+        TLoad(n, _) -> sc.written.push(n)
+        _ -> ()
+
+private fan_written_expr(sc: &FanScan, e: TExpr)
+    *e.kind match
+        TStore(place, _, _, _) -> fan_written(sc, place)
+        _ -> ()
+
+private fan_answered(sc: &FanScan, hs: &Handles, s: TStmt)
+    s match
+        TReturn(v) -> if v.is_some() then sc.answered.push(coll_key(hs, v.unwrap()))
+        _ -> ()
+
+private fan_scan_block(sc: &FanScan, hs: &Handles, b: TBlock, cx: FanCtx)
+    fan_scan_stmts(sc, hs, b.stmts, cx)
+
+    if b.result.is_some() then fan_scan_expr(sc, hs, b.result.unwrap(), cx)
+
+private fan_scan_stmts(sc: &FanScan, hs: &Handles, stmts: Buf[TStmt], cx: FanCtx)
+    for s in stmts
+        s match
+            TExprStmt(e) -> fan_scan_expr(sc, hs, e, cx)
+            TVarDecl(_, _, init, _) -> fan_scan_expr(sc, hs, init, cx)
+            TWriteStmt(w) -> fan_store(sc, hs, w.place, w.value, w.value.span, cx)
+            TDefer(inner, _) -> fan_scan_stmts(sc, hs, inner, no_fan_ctx())
+            _ -> ()
+end fan_scan_stmts
+
+private fan_scan_expr(sc: &FanScan, hs: &Handles, e: TExpr, cx: FanCtx)
+    *e.kind match
+        TFor(name, _, lo, hi, inclusive, body, _, _) ->
+            val l = bound_said(sc, hs, lo)
+            val h = bound_said(sc, hs, hi)
+            val range = if l == "" || h == "" then "" else s"$l..${if inclusive then "=" else "<"}$h"
+
+            fan_loop_for(sc, hs, name, range, l == "=0" && !inclusive, h, body, hi.span)
+            fan_scan_stmts(sc, hs, body, FanCtx(name, range, hi.span))
+        TForEach(name, _, seq, body, _, _) ->
+            val coll = seq_coll(hs, seq)
+
+            if coll != "" && joins_anything(body) then sc.loops.push(fan_loop(hs, coll, body, name, "", true, "", seq.span))
+
+            fan_scan_stmts(sc, hs, body, no_fan_ctx())
+        TWhile(_, body, _, _) -> fan_scan_stmts(sc, hs, body, no_fan_ctx())
+        TDoWhile(body, _, _, _) -> fan_scan_stmts(sc, hs, body, no_fan_ctx())
+        TLoop(body, _) -> fan_scan_stmts(sc, hs, body, no_fan_ctx())
+        TCFor(_, _, _, body, _, _) -> fan_scan_stmts(sc, hs, body, no_fan_ctx())
+        TIterate(_, _, _, _, _, body, _, _) -> fan_scan_stmts(sc, hs, body, no_fan_ctx())
+        TCheckedLoop(_, _, inner) -> fan_scan_expr(sc, hs, inner, cx)
+        TIf(_, then_block, else_block, _) ->
+            fan_scan_block(sc, hs, then_block, cx)
+
+            if else_block.is_some() then fan_scan_block(sc, hs, else_block.unwrap(), cx)
+        TMatch(_, arms, _) ->
+            for arm in arms
+                fan_scan_block(sc, hs, arm.body, cx)
+        TBlockExpr(b) -> fan_scan_block(sc, hs, b, cx)
+        TSeq(exprs) ->
+            for x in exprs
+                fan_scan_expr(sc, hs, x, cx)
+        TStore(place, v, _, _) -> fan_store(sc, hs, place, v, e.span, cx)
+        TCall(name, args, _, _) ->
+            if calls_member(name, "push") && args.len() == 2
+                fan_push(sc, hs, args.at(0), args.at(1), e.span)
+            else if calls_member(name, "index_set") && args.len() == 3 && starts_thread(hs, args.at(2))
+                fan_element(sc, hs, coll_key(hs, args.at(0)), args.at(1), "", e.span, cx)
+            end if
+        _ -> ()
+end fan_scan_expr
+
+// A store: of a handle into an element, a fan-out's; of anything into the whole collection, a write
+// that loses what the collection held.
+private fan_store(sc: &FanScan, hs: &Handles, place: TExpr, v: TExpr, at: Span, cx: FanCtx)
+    val path = element_path(hs, place)
+
+    if path.is_none()
+        val key = frame_place_key(hs, place)
+
+        if key != "" then sc.writes.push((at, key))
+
+        return
+    end if
+
+    // An element at a constant index is a place of its own (`pool[=0]`), which a join of it, or of
+    // every element, takes back.
+    if !starts_thread(hs, v) || frame_place_key(hs, place) != "" then return
+
+    val (coll, index, suffix) = path.unwrap()
+
+    fan_element(sc, hs, coll, index, suffix, at, cx)
+end fan_store
+
+private fan_element(sc: &FanScan, hs: &Handles, coll: string, index: TExpr, suffix: string, at: Span, cx: FanCtx)
+    if coll == "" then return
+
+    if holds_string(sc.answered, coll)
+        hs.fan_at.push((at, "^", ""))
+        return
+    end if
+
+    if cx.counter == "" || !is_counter(index, cx.counter)
+        hs.fan_at.push((at, "", s"; a handle kept in an element of '$coll' is matched to a loop that joins " +
+                       "them only where it is stored at the counter of the counting loop it is in, or pushed"))
+        return
+    end if
+
+    val loc = s"$coll[]$suffix"
+
+    fan_named(sc, loc, coll, suffix).ranges.push(cx.range)
+    hs.fan_hooks.push((cx.hook, FlowEv(false, s"j:$loc", FAN_ROUND, cx.hook)))
+    hs.fan_at.push((at, loc, ""))
+end fan_element
+
+private fan_push(sc: &FanScan, hs: &Handles, recv: TExpr, v: TExpr, at: Span)
+    val coll = coll_key(hs, recv)
+
+    if coll == "" || !starts_thread(hs, v) then return
+
+    if holds_string(sc.answered, coll)
+        hs.fan_at.push((at, "^", ""))
+        return
+    end if
+
+    val loc = s"$coll[+]"
+
+    fan_named(sc, loc, coll, "").pushed = true
+    hs.fan_at.push((at, loc, ""))
+end fan_push
+
+private fan_named(sc: &FanScan, loc: string, coll: string, suffix: string) -> &Fan
+    for f in sc.fans
+        if f.loc == loc then return f
+
+    val f: &Fan = Fan(loc, coll, suffix, buf(), false)
+
+    sc.fans.push(f)
+    f
+end fan_named
+
+// A counting loop joins elements of each collection its body indexes at its counter.
+private fan_loop_for(sc: &FanScan, hs: &Handles, counter: string, range: string, from_zero: bool, hi: string,
+                     body: Buf[TStmt], hook: Span)
+    if !joins_anything(body) then return
+
+    for item in indexed_colls(hs, body, counter)
+        val (coll, ty) = item
+        val len = ty match
+            Array(n, _) -> s"=$n"
+            _ -> "#"
+
+        sc.loops.push(fan_loop(hs, coll, body, "", counter, from_zero && (hi == s"#$coll" || hi == len), range, hook))
+end fan_loop_for
+
+private fan_loop(hs: &Handles, coll: string, body: Buf[TStmt], each: string, counter: string, whole: bool,
+                 range: string, hook: Span) -> FanLoop
+    var fault = ""
+    var suffixes: Buf[string] = buf()
+
+    for s in body
+        val j = stmt_jumps(s)
+
+        if j.exits || j.loops then fault = "leaves"
+
+        for p in stmt_joins(hs, s, coll, each, counter)
+            suffixes.push(p)
+
+    if fault == "" && suffixes.is_empty() then fault = "skips"
+
+    FanLoop(coll, suffixes, fault, whole, range, hook)
+end fan_loop
+
+// Which fan-outs each loop releases, and why the others are not released.
+private fan_settle(sc: &FanScan, hs: &Handles)
+    for f in sc.fans
+        var why = ""
+        var released = false
+
+        for l in sc.loops
+            if l.coll != f.coll then continue
+
+            if l.fault == "" && holds_string(l.suffixes, f.suffix) && fan_covers(l, f)
+                released = true
+                hs.fan_hooks.push((l.hook, FlowEv(true, s"j:${f.loc}", "", l.hook)))
+            else if why == ""
+                why = loop_why(l, f)
+            end if
+
+        if !released
+            if why == "" then why = s"; no loop over '${f.coll}' joins each of its elements"
+
+            hs.fan_whys.push((f.loc, why))
+        end if
+
+        for w in sc.writes
+            if w.1 == f.coll || f.coll.starts_with(w.1 + ".")
+                hs.fan_hooks.push((w.0, FlowEv(false, s"j:${f.loc}", FAN_ROUND, w.0)))
+            end if
+
+    // A loop joining every element itself releases whatever the collection holds -- a call that answered
+    // the whole collection among it -- unless a fan-out keeps handles in fields of the elements.
+    for l in sc.loops
+        if l.fault != "" || !l.whole || !holds_string(l.suffixes, "") then continue
+
+        var fields = false
+
+        for f in sc.fans
+            if f.coll == l.coll && f.suffix != "" then fields = true
+
+        if !fields then hs.fan_hooks.push((l.hook, FlowEv(true, s"j:${l.coll}", "", l.hook)))
+end fan_settle
+
+private fan_covers(l: FanLoop, f: &Fan) -> bool
+    if l.whole then return true
+    if f.pushed || f.ranges.is_empty() || l.range == "" then return false
+
+    for r in f.ranges
+        if r != l.range then return false
+
+    true
+end fan_covers
+
+private loop_why(l: FanLoop, f: &Fan) -> string
+    if l.fault == "leaves"
+        return s"; the loop over '${f.coll}' that joins its elements may leave before it has joined them all"
+    end if
+
+    if l.fault == "skips" || !holds_string(l.suffixes, f.suffix)
+        return s"; the loop over '${f.coll}' does not join each of its elements on every turn"
+    end if
+
+    s"; the loop over '${f.coll}' that joins its elements does not reach every element they were stored in"
+end loop_why
+
+// Where the statement at `at` keeps a fan-out's handle, setting why it cannot be released.
+private fan_handle(hs: &Handles, at: Span) -> Option[string]
+    for item in hs.fan_at
+        if item.0 != at then continue
+
+        hs.why = item.2
+
+        for w in hs.fan_whys
+            if hs.why == "" && w.0 == item.1 then hs.why = w.1
+
+        return Some(item.1)
+    end for
+
+    None
+end fan_handle
+
+// What a fan-out's loop or write does at the piece the walk is saying.
+fan_events(hs: &Handles, evs: &EvBuf, at: Span)
+    for item in hs.fan_hooks
+        if item.0 == at then evs.items.push(item.1)
+
+fan_stmt_events(hs: &Handles, evs: &EvBuf, s: TStmt)
+    s match
+        TWriteStmt(w) -> fan_events(hs, evs, w.value.span)
+        _ -> ()
+
+// **A fan-out's handle stored again is another element, not a second thread over the first**: the
+// same store in a later turn of its loop, or another push. A round marker holds whatever is still
+// there for good. Answers whether `ev` was one of these.
+fan_event(pending: *Buf[KeptAt], ev: FlowEv) -> bool
+    if ev.clear || !ev.loc.starts_with("j:") then return false
+
+    if ev.how == FAN_ROUND
+        var out: Buf[KeptAt] = buf()
+        val coll = ev.loc[2..<ev.loc.index_of("[").unwrap_or(ev.loc.bytes.len)]
+        val why = s"; '$coll' is stored into again before the handles it holds are joined"
+
+        for p in *pending
+            out.push(if p.loc == ev.loc then KeptAt("", p.how + why, p.at) else p)
+
+        *pending = out
+        return true
+    end if
+
+    if ev.loc.index_of("[+]").is_some()
+        add_kept(pending, KeptAt(ev.loc, ev.how, ev.at))
+        return true
+    end if
+
+    if ev.loc.index_of("[]").is_none() then return false
+
+    for p in *pending
+        if p.loc == ev.loc then return p.at == ev.at
+
+    false
+end fan_event
+
+// The collection an expression names, as the frame's own place: through `&` and a cast.
+private coll_key(hs: &Handles, e: TExpr) -> string = *e.kind match
+    TAddrOf(place, _) -> coll_key(hs, place)
+    TCast(v, _) -> coll_key(hs, v)
+    TLoad(_, _) -> frame_place_key(hs, e)
+    TField(_, _, _) -> frame_place_key(hs, e)
+    _ -> ""
+
+// What a `for` walks, through the cursor a `Walk` makes for it.
+private seq_coll(hs: &Handles, seq: TExpr) -> string = *seq.kind match
+    TCall(name, args, _, _) -> if calls_member(name, "walk") && args.len() == 1 then coll_key(hs, args.at(0)) else ""
+    TDeref(x, _) -> seq_coll(hs, x)
+    _ -> coll_key(hs, seq)
+
+// A place in an element of a collection: the collection, the index, and the fields below the element.
+private element_path(hs: &Handles, place: TExpr) -> Option[(string, TExpr, string)] = *place.kind match
+    TField(r, index, _) -> element_path(hs, r).map(p -> (p.0, p.1, s"${p.2}.${field_label(texpr_type(r), index)}"))
+    _ -> indexed_at(hs, place).map(p -> (p.0, p.1, ""))
+
+// An element named by its index: an array's or a slice's own, or a container's read through `Index`
+// or at the place `IndexPlace` answers -- the collection, the index, and the collection's type.
+private indexed_at(hs: &Handles, e: TExpr) -> Option[(string, TExpr, Type)] = *e.kind match
+    TIndex(r, i, _) -> Some((coll_key(hs, r), i, texpr_type(r)))
+    TDeref(x, _) -> *x.kind match
+        TCall(name, _, _, _) -> if calls_member(name, "index_place") then indexed_at(hs, x) else None
+        _ -> None
+    TCall(name, args, _, _) ->
+        val reads = calls_member(name, "index") || calls_member(name, "at") || calls_member(name, "index_place")
+
+        if reads && args.len() == 2 then Some((coll_key(hs, args.at(0)), args.at(1), texpr_type(args.at(0)))) else None
+    _ -> None
+
+private is_counter(e: TExpr, counter: string) -> bool = *e.kind match
+    TCast(v, _) -> is_counter(v, counter)
+    TLoad(n, _) -> n == counter
+    _ -> false
+
+// A bound a range is said by where the storing loop and the joining loop can be compared: a constant,
+// a local nothing writes again, or a collection's length.
+private bound_said(sc: &FanScan, hs: &Handles, e: TExpr) -> string = *e.kind match
+    TIntLit(v, _) -> s"=$v"
+    TCast(v, _) -> bound_said(sc, hs, v)
+    TLoad(n, _) -> if holds_string(sc.written, n) then "" else s"l:$n"
+    TLen(r, _) -> len_said(hs, r)
+    TCall(name, args, _, _) -> if calls_member(name, "len") && args.len() == 1 then len_said(hs, args.at(0)) else ""
+    _ -> ""
+
+private len_said(hs: &Handles, r: TExpr) -> string
+    val k = coll_key(hs, r)
+
+    if k == "" then "" else s"#$k"
+
+// Whether a value starts a thread: a call that keeps an argument until the handle it answers is joined.
+private starts_thread(hs: &Handles, v: TExpr) -> bool
+    val seen: &FanSeen = FanSeen(false)
+
+    walk_texpr(v, expr_walk(false, x -> *x.kind match
+        TCall(name, args, _, _) ->
+            for j in 0..<args.len()
+                for item in keeps_of(hs.org.cx, name, j).locs
+                    if item.loc == "j" then seen.found = true
+        _ -> ()))
+
+    seen.found
+end starts_thread
+
+private joins_anything(body: Buf[TStmt]) -> bool
+    val seen: &FanSeen = FanSeen(false)
+
+    for s in body
+        walk_stmt(s, expr_walk(false, x -> *x.kind match
+            TCall(name, _, _, _) -> if calls_member(name, "join") then seen.found = true
+            _ -> ()))
+
+    seen.found
+end joins_anything
+
+// The collections a counting loop's body indexes at its counter, each once, with its type.
+private indexed_colls(hs: &Handles, body: Buf[TStmt], counter: string) -> Buf[(string, Type)]
+    val out: &FanColls = FanColls(buf())
+
+    for s in body
+        walk_stmt(s, expr_walk(false, x -> indexed_at(hs, x) match
+            Some(p) -> if is_counter(p.1, counter) then fan_coll_seen(out, p.0, p.2)
+            None -> ()))
+
+    out.items
+end indexed_colls
+
+private struct FanColls
+    items: Buf[(string, Type)]
+
+private fan_coll_seen(out: &FanColls, key: string, ty: Type)
+    if key == "" then return
+
+    for item in out.items
+        if item.0 == key then return
+
+    out.items.push((key, ty))
+end fan_coll_seen
+
+// The paths from a loop's element to each handle one statement of its body joins on every way through
+// it: a `join` of it, a `match` whose arms join what `Some` binds and hold no thread otherwise, or an
+// `is Some(...)` test that joins on the way it matched.
+private stmt_joins(hs: &Handles, s: TStmt, coll: string, each: string, counter: string) -> Buf[string]
+    val out: &FanPaths = FanPaths(buf())
+
+    s match
+        TExprStmt(e) -> expr_joins(hs, out, e, coll, each, counter)
+        TVarDecl(_, _, init, _) -> expr_joins(hs, out, init, coll, each, counter)
+        _ -> ()
+
+    out.items
+end stmt_joins
+
+private struct FanPaths
+    items: Buf[string]
+
+private expr_joins(hs: &Handles, out: &FanPaths, e: TExpr, coll: string, each: string, counter: string)
+    *e.kind match
+        TCall(name, args, _, _) ->
+            if calls_member(name, "join") && !args.is_empty()
+                val p = elem_suffix(hs, args.at(0), coll, each, counter)
+
+                if p.is_some() then out.items.push(p.unwrap())
+            else
+                // An argument is evaluated whatever the callee does with it.
+                for a in args
+                    expr_joins(hs, out, a, coll, each, counter)
+            end if
+        TMatch(scrutinee, arms, _) ->
+            val p = elem_suffix(hs, scrutinee, coll, each, counter)
+
+            if p.is_some() && arms_join(arms) then out.items.push(p.unwrap())
+        TIf(cond, then_block, else_block, _) ->
+            if else_block.is_some() || cond.len() != 1 then return
+
+            cond.at(0) match
+                TCondIs(subject, patterns, negated) ->
+                    if negated || patterns.len() != 1 then return
+
+                    val bound = some_binding(patterns.at(0))
+                    val p = elem_suffix(hs, subject, coll, each, counter)
+
+                    if bound.is_some() && p.is_some() && block_joins(then_block, bound.unwrap()) then out.items.push(p.unwrap())
+                _ -> ()
+        _ -> ()
+end expr_joins
+
+// Whether a `match`'s arms join what `Some` binds and do nothing that needs a thread otherwise.
+private arms_join(arms: Buf[TArm]) -> bool
+    var joined = false
+
+    for arm in arms
+        if arm.guard.is_some() || arm.patterns.len() != 1 then return false
+
+        val p = arm.patterns.at(0)
+
+        some_binding(p) match
+            Some(n) ->
+                if !block_joins(arm.body, n) then return false
+
+                joined = true
+            None ->
+                val holds_none = p match
+                    TVariantPattern(_, v, _) -> v.name == "None"
+                    TWildPattern(_) -> true
+                    _ -> false
+
+                if !holds_none then return false
+    end for
+
+    joined
+end arms_join
+
+private some_binding(p: TPattern) -> Option[string] = p match
+    TVariantPattern(_, v, args) ->
+        if v.name != "Some" || args.len() != 1 then return None
+
+        args.at(0) match
+            TBindPattern(n, _) -> Some(n)
+            _ -> None
+    _ -> None
+
+private block_joins(b: TBlock, n: string) -> bool
+    for s in b.stmts
+        val joined = s match
+            TExprStmt(e) -> joins_local(e, n)
+            TVarDecl(_, _, init, _) -> joins_local(init, n)
+            _ -> false
+
+        if joined then return true
+    end for
+
+    b.result.is_some() && joins_local(b.result.unwrap(), n)
+end block_joins
+
+private joins_local(e: TExpr, n: string) -> bool = *e.kind match
+    TCall(name, args, _, _) ->
+        if calls_member(name, "join") && !args.is_empty() then return names_local(args.at(0), n)
+
+        for a in args
+            if joins_local(a, n) then return true
+
+        false
+    _ -> false
+
+private names_local(e: TExpr, n: string) -> bool = *e.kind match
+    TLoad(m, _) -> m == n
+    TAddrOf(place, _) -> names_local(place, n)
+    TCast(v, _) -> names_local(v, n)
+    TCall(name, args, _, _) -> unwraps(name) && !args.is_empty() && names_local(args.at(0), n)
+    _ -> false
+
+// The path from a loop's element to `e` -- `""` for the element, `.t` for its field `t` -- where `e` is
+// reached from it: the `for`'s own name, or the collection indexed at the counter.
+private elem_suffix(hs: &Handles, e: TExpr, coll: string, each: string, counter: string) -> Option[string] =
+    *e.kind match
+        TLoad(n, _) -> if each != "" && n == each then Some("") else None
+        TCall(name, args, _, _) ->
+            if unwraps(name) && !args.is_empty() then elem_suffix(hs, args.at(0), coll, each, counter)
+            else at_counter(hs, e, coll, counter)
+        TField(r, index, _) -> elem_suffix(hs, r, coll, each, counter).map(p -> s"$p.${field_label(texpr_type(r), index)}")
+        TAddrOf(place, _) -> elem_suffix(hs, place, coll, each, counter)
+        TCast(v, _) -> elem_suffix(hs, v, coll, each, counter)
+        _ -> at_counter(hs, e, coll, counter)
+
+// `""` where `e` is the collection's element at the loop's counter.
+private at_counter(hs: &Handles, e: TExpr, coll: string, counter: string) -> Option[string]
+    if counter == "" then return None
+
+    indexed_at(hs, e) match
+        Some(p) -> if p.0 == coll && is_counter(p.1, counter) then Some("") else None
+        None -> None
+end at_counter
