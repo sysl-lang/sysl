@@ -2339,6 +2339,33 @@ an ABI primitive that no sysl body could implement, so there is nothing to put i
 is the line the "no functions built into the compiler" rule actually draws — no program could write
 `va_arg`.
 
+**The four `va_` forms are imported, from `sysl.c`** — `import sysl.c.{va_start, va_arg, va_end}` —
+while `va_list` stays a predeclared type. The compiler answers them, but a file names the C variadic
+forms it uses, as it names anything else it did not declare; an alias, a wildcard (`import sysl.c.*`)
+and a path through the module reach them too. Written bare without one, the form is told where it
+lives:
+
+```sysl
+sum(n: int, ...) -> int
+    var ap: va_list
+
+    va_start(ap)
+
+    var total = 0
+
+    for i in 0..<n do total += va_arg(ap)
+
+    va_end(ap)
+
+    total
+
+print(sum(3, 10, 20, 30))
+```
+
+```error
+'va_start' is in sysl.c: add 'import sysl.c.va_start'
+```
+
 **The walk is the target's C walk, every class of argument included.** On most machines a `va_list`
 is one pointer bumped past each slot; on AArch64 outside Apple's platforms it is a five-field
 structure keeping the general registers, the vector registers and the stack apart, and on x86-64

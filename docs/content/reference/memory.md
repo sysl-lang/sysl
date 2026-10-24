@@ -2331,6 +2331,28 @@ to.
 | `ptr_cast(n)` | a number as a pointer | unsafe |
 | `ptr_cast(p)` | one pointee type as another | unsafe |
 
+**`ptr_cast` is imported, from `sysl.raw`** — `import sysl.raw.ptr_cast` — beside `str_cast` and
+`str_alias` (`strings.md`). The compiler still answers it, since its target comes from the position
+its value fills and no signature can say that, but its name is not in scope everywhere: a file names
+the raw-tier casts it makes, so every reinterpretation in a program is found by its imports. An
+alias (`import sysl.raw.ptr_cast as pc`), a wildcard (`import sysl.raw.*`) and a path through the
+module (`raw.ptr_cast(p)` after `import sysl.raw`) reach it as they reach anything else. Written bare
+without one, it is told where it lives:
+
+```sysl
+var arena: [8]u8 = [0u8; 8]
+val p: *u32 = ptr_cast(&arena[0])
+
+print(*p)
+```
+
+```error
+'ptr_cast' is in sysl.raw: add 'import sysl.raw.ptr_cast'
+```
+
+A function or a local the reader names `ptr_cast` is what a call reaches, imported or not; importing
+the form under the name of one is refused, since the name would mean two things.
+
 **A pointer becomes an integer through the ordinary conversion syntax**, because it is an ordinary
 conversion: `usize` is wide enough to hold any address by definition, so it is total and loses
 nothing, and the result is a number that cannot be dereferenced. `isize` takes one too, which is what
