@@ -1,0 +1,226 @@
+module sh.sysl.compiler
+@tests
+
+// **The module's own storage beats a library's function of the same spelling** wherever the name is
+// written: read, `&name`, `&name.f`, `&name[i]`, and called through. A program's `var cpu` beside the
+// prelude's `cpu() -> Cpu` is the program's variable; `&cpu` handed the prelude function's address to a
+// `*Box` parameter before, and `cpu()` through a `var cpu: &Fn() -> int` called the prelude.
+//
+// The harness is `tests_xvr_extern_var.sysl`'s: `xvr_ran` builds and runs a program of several files,
+// answering with the refusal where there is one, and `xvr_ir` answers with the analysis's report.
+
+private osn_main(text: string) -> []const (string, string) = [("main.sysl", text)]
+
+private osn_ran(text: string) -> string = xvr_ran(osn_main(text))
+
+// A refusal carries this message, anchored at this `file:line:column` of the built project.
+private osn_refused(said: string, message: string, at: string) =
+    assert(said.contains(s"error: $message\n") && said.contains(s"/$at\n"), said)
+
+private const osn_box: string = "struct Box\n    n: int\n\nbump(b: *Box)\n    b.n += 1\n\n"
+
+@test("the reduction: '&cpu' of a module var is the var, not the prelude's 'cpu()'")
+osn_the_reduction()
+    if xvr_no_library() then return
+
+    assert_eq(osn_ran(osn_box + raw"""
+        var cpu: Box
+
+        main()
+            bump(&cpu)
+            print(cpu.n)
+        """), "1\n")
+end osn_the_reduction
+
+@test("and the same file as a script, with no 'main'")
+osn_the_reduction_as_a_script()
+    if xvr_no_library() then return
+
+    assert_eq(osn_ran(osn_box + raw"""
+        var cpu: Box
+
+        bump(&cpu)
+        bump(&cpu)
+        print(cpu.n)
+        """), "2\n")
+end osn_the_reduction_as_a_script
+
+@test("'&cpu.n', '&cpu[1]', and an address kept in a 'val' all reach the var")
+osn_field_element_and_kept_address()
+    if xvr_no_library() then return
+
+    assert_eq(osn_ran(osn_box + raw"""
+        var cpu: Box
+        var os: [2]Box
+
+        bumpi(p: *int)
+            *p += 1
+
+        main()
+            bump(&cpu)
+            bumpi(&cpu.n)
+            val p = &cpu
+            p.n += 10
+            bump(&os[1])
+            print(cpu.n)
+            print(os[1].n)
+        """), "12\n1\n")
+end osn_field_element_and_kept_address
+
+@test("inside a closure and a nested function, '&cpu' is still the var")
+osn_in_a_closure_and_a_nested_function()
+    if xvr_no_library() then return
+
+    assert_eq(osn_ran(osn_box + raw"""
+        var cpu: Box
+
+        main()
+            val g = () -> bump(&cpu)
+            g()
+            inner()
+                bump(&cpu)
+            inner()
+            print(cpu.n)
+        """), "2\n")
+end osn_in_a_closure_and_a_nested_function
+
+@test("a std function a wildcard import offers yields to the module's var")
+osn_against_a_wildcard_std_function()
+    if xvr_no_library() then return
+
+    assert_eq(osn_ran("import sysl.process.*\n\n" + osn_box + raw"""
+        var pid: Box
+
+        main()
+            bump(&pid)
+            bump(&pid)
+            print(pid.n)
+        """), "2\n")
+end osn_against_a_wildcard_std_function
+
+@test("a std function imported by name is refused beside a var of its name, as before")
+osn_against_a_std_function_imported_by_name()
+    if xvr_no_library() then return
+
+    osn_refused(osn_ran("import sysl.process.pid\n\n" + osn_box + raw"""
+        var pid: Box
+
+        main()
+            bump(&pid)
+        """),
+                "'pid' is declared by this program, so importing 'sysl.process.pid' under that name " +
+                "would mean two things — import it as another name with 'as', or write its path",
+                "main.sysl:1:1")
+end osn_against_a_std_function_imported_by_name
+
+@test("a function of another module the program imports yields to the var, and is still its path")
+osn_against_a_function_of_another_module()
+    if xvr_no_library() then return
+
+    var files: [2](string, string) = [
+        ("main.sysl", "import dep.*\n\n" + osn_box + raw"""
+            var tick: Box
+
+            main()
+                bump(&tick)
+                print(tick.n)
+                print(dep.tick())
+            """),
+        ("dep/dep.sysl", "module dep\n\ntick() -> int = 42\n")
+    ]
+
+    assert_eq(xvr_ran(files[..]), "1\n42\n")
+end osn_against_a_function_of_another_module
+
+@test("a module 'val' of the name is the val, refused for '&' as a val is")
+osn_a_val()
+    if xvr_no_library() then return
+
+    val said = osn_ran(osn_box + raw"""
+        val cpu: Box = Box(4)
+
+        main()
+            bump(&cpu)
+        """)
+
+    osn_refused(said, "a 'val' is written once, so '&' has nothing to write through", "main.sysl:10:10")
+    assert(!said.contains("extern"), said)
+end osn_a_val
+
+@test("a module 'const' of the name is its value, which has no address")
+osn_a_const()
+    if xvr_no_library() then return
+
+    osn_refused(osn_ran(raw"""
+        const cpu: int = 3
+
+        see(p: *int) = print(*p)
+
+        main()
+            see(&cpu)
+        """),
+                "'&' needs a variable, a field, an element, or a dereference — something with an address",
+                "main.sysl:6:9")
+end osn_a_const
+
+@test("a nested function of the name is refused as a nested function, not taken for the prelude's")
+osn_a_nested_function()
+    if xvr_no_library() then return
+
+    osn_refused(osn_ran(raw"""
+        main()
+            cpu()
+                print(1)
+            val p = &cpu
+        """),
+                "'cpu' is a nested function, so it has no address to take — what would have to " +
+                "travel beside the address is the frame it reads, and a '*extern' is one word. A " +
+                "top-level function is what has an address",
+                "main.sysl:4:13")
+end osn_a_nested_function
+
+@test("the program's own function named like its var is refused as a duplicate")
+osn_own_function_of_the_name()
+    if xvr_no_library() then return
+
+    osn_refused(osn_ran(osn_box + raw"""
+        var cpu: Box
+
+        cpu() -> int = 1
+
+        main()
+            bump(&cpu)
+        """), "'cpu' is already declared as a 'val'", "main.sysl:9:1")
+end osn_own_function_of_the_name
+
+@test("with no var of the name, '&cpu' is still the prelude function's address")
+osn_the_prelude_address_without_a_var()
+    if xvr_no_library() then return
+
+    assert_eq(osn_ran(raw"""
+        main()
+            val f: *extern() -> Cpu = &cpu
+            print(f() == cpu())
+        """), "true\n")
+end osn_the_prelude_address_without_a_var
+
+@test("a module var holding a callable is called through, not the prelude function of its name")
+osn_a_callable_var_is_called_through()
+    if xvr_no_library() then return
+
+    assert_eq(osn_ran(raw"""
+        seven() -> int = 7
+        eight() -> int = 8
+
+        var cpu: &Fn() -> int = seven
+        var os: *extern() -> int = &eight
+
+        main()
+            print(cpu())
+            print(os())
+            val f: &Fn() -> int = cpu
+            print(f())
+            val g = () -> cpu() + os()
+            print(g())
+        """), "7\n8\n7\n15\n")
+end osn_a_callable_var_is_called_through
