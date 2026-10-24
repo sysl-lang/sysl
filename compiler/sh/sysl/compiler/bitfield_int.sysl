@@ -36,17 +36,27 @@ bitfield_storage(d: &StructType) -> Option[Type] = integer_ranges(d) match
 // Why a struct has no `::Bits`, naming the field that keeps it from one where that is the reason.
 private no_bits_reason(written: string, d: &StructType) -> string
     val head = s"'$written::Bits' has no integer to make it from"
-    val rule = "only a '@packed' struct whose every field is an integer, a simple enum or a bitfield " +
-               "struct converts to one"
+    val rule = "only a '@packed' struct whose every field is an integer, a simple enum, a bitfield " +
+               "struct or a '@packed' struct that converts itself converts to one"
 
     if d.union_layout then return s"'$written' is a union, so $head — $rule"
     if !d.c_bits.is_empty() then return s"'$written' holds C bitfields, so $head — $rule"
     if !d.packed then return s"'$written' is not '@packed', so $head — $rule"
 
     unconvertible_field(d) match
-        Some(field) -> s"$head: its field '${field.0}' is ${type_show(field.1)} — $rule"
+        Some(field) -> s"$head: its field '${field.0}' is ${type_show(field.1)}${why_not_chain(field.1)} — $rule"
         None -> s"'$written' has no fields, so $head — $rule"
 end no_bits_reason
+
+// Where a field is itself a `@packed` struct that does not convert, the field inside it that keeps
+// it from converting, and so on down: ", whose field 'f' is f32".
+private why_not_chain(t: Type) -> string = underlying(t) match
+    Struct(inner) ->
+        if !inner.packed || inner.union_layout || !inner.c_bits.is_empty() then ""
+        else unconvertible_field(inner) match
+            Some(f) -> s", whose field '${f.0}' is ${type_show(f.1)}${why_not_chain(f.1)}"
+            None -> ""
+    _ -> ""
 
 // `T::Attr(...)` on a struct: `Bits` for a `@packed` struct of integers, and a refusal saying why
 // otherwise.
