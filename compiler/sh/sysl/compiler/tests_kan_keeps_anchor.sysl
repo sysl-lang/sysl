@@ -1,0 +1,366 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// What the keeps-analysis (`keeps.sysl`) decides about a store whose keeper is the frame's own: a
+// pointer into a store's own bytes kept in the store, and a local holding the address of another
+// local of the same frame -- each accepted, beside the near misses that are refused with their text.
+// And a body that was refused where it was read: its refusal is the one told, not a keep worked out
+// from the expression the reading gave up on (bearssl's trust store, with `ptr_cast` unimported,
+// brought nine of them). `reference/memory.md § A borrowed pointer cannot escape` is the
+// specification.
+//
+// Skipped cells, and why: a closure body and an `@scoped` function refused where they are read are
+// held to their promise by the same two lines the trait method below reaches (`refuse_promised`,
+// `refuse_spread`), so the trait cell stands for them; a keeper that outlives its pointee through an
+// inner block is accepted, since a local's storage is the frame's until the function returns (no
+// rule here, nor anywhere else, refuses `p = &n` across a block), so it has no near miss to pin.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private kan_outcome(text: string) -> (string, int)
+    val root = make_temp_dir("sysl-kan").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (failure_text(why), -1)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> ("the program that was built could not be run", -1)
+        Ok(out) -> (out.text + out.err.unwrap_or(""), shell_status(out.status))
+end kan_outcome
+
+private kan_prints(text: string, want: string)
+    if xvr_no_library() then return
+
+    val out = kan_outcome(text)
+
+    assert_eq(out.0, want)
+    assert_eq(out.1, 0)
+
+// How many diagnostics a report carries.
+private kan_errors(said: string) -> int
+    var n = 0
+    var start: usize = 0
+
+    loop
+        val at = said.index_of_from("error: ", start)
+
+        if at.is_none() then return n
+
+        n += 1
+        start = at.unwrap() + 1
+end kan_errors
+
+// Refused with exactly these refusals, and nothing more.
+private kan_refused(text: string, parts: []string)
+    if xvr_no_library() then return
+
+    val out = kan_outcome(text)
+
+    assert_eq(out.1, -1, out.0)
+    assert_eq(kan_errors(out.0), int(parts.len), out.0)
+
+    for part in parts
+        assert(out.0.index_of(part).is_some(), out.0)
+
+// -- a body refused where it is read ----------------------------------------------------------------
+
+@test("a store through a refused cast is told once, not again at every call down the chain")
+kan_mistake_told_once()
+    kan_refused(raw"""
+        struct Pair
+            a: *int
+
+        struct Store
+            list: [1]Pair
+            bytes: [4]int
+
+            take(*self)
+                var t = Pair(&self.bytes[1])
+                var q: *Pair = ptr_cast(&t)
+                q.a = &self.bytes[0]
+                self.list[0] = t
+
+            add(*self) = self.take()
+
+        trust(s: *Store) = s.add()
+
+        main()
+            var s = Store([Pair(null)], [0; 4])
+            s.take()
+            s.add()
+            trust(&s)
+            print(s.list[0].a == &s.bytes[0])
+        """, ["'ptr_cast' is in sysl.raw: add 'import sysl.raw.ptr_cast'"])
+
+@test("a trait method refused where it is read is not told again that it breaks the trait's promise")
+kan_mistake_trait_promise()
+    kan_refused(raw"""
+        trait Sink
+            take(self, p: *int)
+
+        struct Slot
+            p: *int
+
+        var slot: Slot = Slot(null)
+
+        struct Keeper
+            n: int
+
+        impl Sink for Keeper
+            take(self, p: *int)
+                var s: *Slot = ptr_cast(&slot)
+                s.p = p
+
+        hand(s: &Sink, p: *int) = s.take(p)
+
+        main()
+            var n = 3
+            hand(Keeper(1), &n)
+        """, ["'ptr_cast' is in sysl.raw: add 'import sysl.raw.ptr_cast'"])
+
+@test("a generic method refused where it is read keeps nothing for its callers")
+kan_mistake_generic()
+    kan_refused(raw"""
+        struct Pair[T]
+            a: *T
+
+        struct Store[T]
+            list: [1]Pair[T]
+            items: [2]T
+
+            take(*self)
+                var t = Pair(&self.items[1])
+                var q: *Pair[T] = ptr_cast(&t)
+                q.a = &self.items[0]
+                self.list[0] = t
+
+        fill[T](s: *Store[T]) = s.take()
+
+        main()
+            var s: Store[int] = Store([Pair(null)], [0; 2])
+            fill(&s)
+            print(s.list[0].a == &s.items[0])
+        """, ["'ptr_cast' is in sysl.raw: add 'import sysl.raw.ptr_cast'"])
+
+@test("a real keep beside a body refused where it is read is still told")
+kan_mistake_beside_real()
+    kan_refused(raw"""
+        var held: *int = null
+
+        stash(p: *int)
+            held = p
+
+        broken(p: *int)
+            val q: *int = undefined_thing(p)
+            held = q
+
+        run()
+            var n = 3
+            var m = 4
+            broken(&m)
+            stash(&n)
+
+        main()
+            run()
+        """, ["undefined function 'undefined_thing'",
+              "'stash' keeps its parameter 'p' (it is stored in 'held'), and '&n' is the address of a local of 'run'"])
+
+@test("a body refused where it is read still has its own calls held to the rule")
+kan_mistaken_caller()
+    kan_refused(raw"""
+        var held: *int = null
+
+        stash(p: *int)
+            held = p
+
+        run()
+            var n = 3
+            val k: int = not_a_name
+            stash(&n)
+
+        main()
+            run()
+        """, ["undefined name 'not_a_name'",
+              "'stash' keeps its parameter 'p' (it is stored in 'held'), and '&n' is the address of a local of 'run'"])
+
+// -- the keeper is the frame's own ------------------------------------------------------------------
+
+@test("a pointer into a store's own bytes, kept in the store, is not a dangling keep")
+kan_self_anchor()
+    kan_prints(raw"""
+        import sysl.raw.ptr_cast
+
+        struct Pair
+            a: *int
+
+        struct Store
+            list: [2]Pair
+            bytes: [4]int
+            count: usize
+
+            take(*self, v: int)
+                var t = Pair(&self.bytes[3])
+                var q: *Pair = ptr_cast(&t)
+
+                self.bytes[self.count] = v
+                q.a = &self.bytes[self.count]
+                self.list[self.count] = t
+                self.count += 1
+
+        trust(s: *Store, v: int) = s.take(v)
+
+        run() -> int
+            var s = Store([Pair(null); 2], [0; 4], 0)
+
+            s.take(4)
+            trust(&s, 5)
+            *s.list[0].a + *s.list[1].a
+
+        main()
+            print(run())
+        """, "9\n")
+
+@test("a local holding another local's address is accepted in a loop, past an early return, ?, defer, a generic and a method")
+kan_local_keeper()
+    kan_prints(raw"""
+        struct Holder
+            p: *int
+
+            set(*self, p: *int)
+                self.p = p
+
+            get(*self) -> int = *self.p
+
+        struct Box[T]
+            p: *T
+
+            put(*self, p: *T)
+                self.p = p
+
+        hold(h: *Holder, p: *int)
+            h.p = p
+
+        parse(n: int) -> Result[int, string] = if n > 0 then Ok(n) else Err("no")
+
+        loops() -> int
+            var total = 0
+            for i in 0..<3
+                var n = i + 1
+                var h = Holder(null)
+                h.set(&n)
+                total += h.get()
+            total
+
+        early(stop: bool) -> int
+            var n = 7
+            var h = Holder(null)
+            hold(&h, &n)
+            if stop then return h.get()
+            h.get() + 1
+
+        tried(k: int) -> Result[int, string]
+            var n = parse(k)?
+            var h = Holder(null)
+            h.set(&n)
+            val m = parse(h.get())?
+            Ok(m + 1)
+
+        deferred() -> int
+            var n = 3
+            var h = Holder(null)
+            var out = 0
+            defer h.set(&n)
+            h.set(&n)
+            out = h.get()
+            out
+
+        generic() -> int
+            var n = 9
+            var b: Box[int] = Box(null)
+            b.put(&n)
+            *b.p
+
+        main()
+            print(loops(), early(true), early(false), tried(4).unwrap_or(0), deferred(), generic())
+        """, "6 7 8 5 3 9\n")
+
+@test("a local holding another local's address may not be returned")
+kan_keeper_returned()
+    kan_refused(raw"""
+        struct Holder
+            p: *int
+
+            set(*self, p: *int)
+                self.p = p
+
+        make() -> Holder
+            var n = 3
+            var h = Holder(null)
+            h.set(&n)
+            h
+
+        main()
+            print(*make().p)
+        """, ["'h' is returned, but it holds the address of a local of 'make', whose storage ends when 'make' returns"])
+
+@test("a local holding another local's address may not be stored in module storage")
+kan_keeper_global()
+    kan_refused(raw"""
+        struct Holder
+            p: *int
+
+            set(*self, p: *int)
+                self.p = p
+
+        var kept: Holder = Holder(null)
+
+        stash()
+            var n = 3
+            var h = Holder(null)
+            h.set(&n)
+            kept = h
+
+        main()
+            stash()
+            print(kept.p == null)
+        """, ["'h' holds the address of a local of 'stash', and it is stored in 'kept', which outlives 'stash'"])
+
+@test("a local holding another local's address may not be handed to a callee that keeps it")
+kan_keeper_handed_on()
+    kan_refused(raw"""
+        struct Holder
+            p: *int
+
+            set(*self, p: *int)
+                self.p = p
+
+        var kept: Holder = Holder(null)
+
+        keep(h: Holder)
+            kept = h
+
+        hand()
+            var n = 3
+            var h = Holder(null)
+            h.set(&n)
+            keep(h)
+
+        main()
+            hand()
+            print(kept.p == null)
+        """, ["'keep' keeps its parameter 'h' (it is stored in 'kept'), and 'h' holds the address of a local of 'hand'"])
