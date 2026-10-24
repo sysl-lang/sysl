@@ -1,0 +1,154 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_temp_dir, remove_dir_all, write_text}
+import sysl.process.{capture, Status}
+import sysl.text.Search
+
+// **A generic type with its arguments written on it is a type on the left of `::`** (`type_attr.sysl`'s
+// `type_attr_on_instance`): `Pair[u8]::Bits(n)` answers as `P8::Bits(n)` does through `type P8 =
+// Pair[u8]`. Only the four reflection attributes used to be asked of a written instance; every other
+// one was refused with "its left side must be a type name", and `Pair[u8]::Id` read `Pair` as a value.
+//
+// The axes crossed: the attribute (`Bits` with its operand, `Id` and `Name` without); one and two type
+// parameters; an argument that is itself an instance (`Outer[Pair[u8]]`); the left side written in a
+// generic body over its own parameter, block and expression bodied; against the alias it must agree
+// with; and the refusals, which name the instance. The associated-function form is `Pair[u8].zero()`
+// -- `::` is for type attributes only, on a plain name as on an instance -- and is checked here as the
+// neighbour. Skipped: a constant on the left of `::`, since a struct declares none (a built-in
+// integer's `u8::Max` is a plain name).
+
+private iab_ready() -> bool = std_root().is_ok() && clang_available()
+
+private iab_run(text: string, level: string) -> (Status, string, string)
+    val root = make_temp_dir("sysl-iab").unwrap()
+
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, level, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (Status.Exited(-1), "", failure_text(why))
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> (Status.Exited(-1), "", "the program that was built could not be run")
+        Ok(out) -> (out.status, out.text, out.err.unwrap_or(""))
+end iab_run
+
+// At both levels, the program exits cleanly having printed `printed` and nothing on standard error.
+private iab_prints(text: string, printed: string)
+    if !iab_ready() then return
+
+    for level in ["0", DefaultOptimization]
+        val (state, out, err) = iab_run(text, level)
+
+        assert_eq(err, "")
+        assert_eq(out, printed)
+        assert(state == Status.Exited(0), s"-O$level stopped with $state")
+end iab_prints
+
+// The program is refused with exactly one diagnostic, this message at this position.
+private iab_refused(text: string, message: string, line: int, col: int)
+    if !iab_ready() then return
+
+    val (_, _, err) = iab_run(text, "0")
+    val head = s"error: $message\n"
+    val at = s"/main.sysl:$line:$col\n"
+
+    assert(err.contains(head), s"expected\n$head\nin\n$err")
+    assert(err.contains(at), s"expected\n$at\nin\n$err")
+    assert_eq(err.count_of("error: "), 1)
+end iab_refused
+
+private val iab_pair: string = "@packed\nstruct Pair[T]\n    lo: T\n    hi: T\n\n"
+
+@test("iab: 'Pair[u8]::Bits(n)' makes the instance, as the alias of 'Pair[u8]' does")
+iab_the_reduction()
+    iab_prints(iab_pair + raw"""
+        type P8 = Pair[u8]
+
+        val a = Pair[u8]::Bits(0x0102)
+        val b = P8::Bits(0x0102)
+        val c = Pair[u16]::Bits(0x00030004)
+
+        print(a.lo, a.hi, a.bits, b.lo, b.hi, b.bits, c.lo, c.hi)
+        """, "2 1 258 2 1 258 4 3\n")
+end iab_the_reduction
+
+@test("iab: two type parameters, and an argument that is an instance itself")
+iab_two_and_nested()
+    iab_prints(iab_pair + raw"""
+        @packed
+        struct Two[A, B]
+            a: A
+            b: B
+
+        @packed
+        struct Outer[T]
+            x: T
+            y: u8
+
+        val t = Two[u8, u16]::Bits(0x000201)
+
+        print(t.a, t.b, Two[u16, u8]::Bits(0x030201).a)
+        print(Outer[u16]::Bits(0x030201).x, Outer[u16]::Bits(0x030201).y)
+        print(Outer[Pair[u8]]::Id == Outer[Pair[u8]]::Id, Outer[Pair[u8]]::Id == Outer[Pair[u16]]::Id)
+        print(Outer[Pair[u8]]::Name)
+        """, "1 2 513\n513 3\ntrue false\nOuter[Pair[byte]]\n")
+end iab_two_and_nested
+
+@test("iab: 'Id' and 'Name' on an instance agree with the alias")
+iab_id_and_name()
+    iab_prints(iab_pair + raw"""
+        type P8 = Pair[u8]
+
+        print(Pair[u8]::Id == P8::Id, Pair[u8]::Id == Pair[u16]::Id, Pair[u8]::Name, P8::Name)
+        """, "true false Pair[byte] Pair[byte]\n")
+end iab_id_and_name
+
+@test("iab: written over a generic body's own parameter, block and expression bodied")
+iab_in_generic_body()
+    iab_prints(iab_pair + raw"""
+        mk[T](n: u32) -> Pair[T]
+            Pair[T]::Bits(n)
+
+        mk2[T](n: u16) = Pair[T]::Bits(n)
+
+        print(mk[u16](0x00020001).hi, mk2[u8](0x0201).hi, mk2[u8](0x0201).bits)
+        """, "2 2 513\n")
+end iab_in_generic_body
+
+@test("iab: the associated-function neighbour, 'Pair[u8].zero()', is unchanged")
+iab_associated_neighbour()
+    iab_prints(raw"""
+        @packed
+        struct Pair[T]
+            lo: T
+            hi: T
+
+            zero() -> Pair[T] = Pair[T](0, 0)
+
+        print(Pair[u8].zero().bits, Pair[u16].zero().hi)
+        """, "0 0\n")
+end iab_associated_neighbour
+
+@test("iab: an instance with no integer is refused naming the instance and the field")
+iab_refused_no_integer()
+    iab_refused(iab_pair + "print(Pair[f32]::Bits(1).lo)\n",
+                "'Pair[f32]::Bits' has no integer to make it from: its field 'lo' is f32 — only a " +
+                "'@packed' struct whose every field is an integer, a simple enum or a bitfield " +
+                "struct converts to one", 6, 16)
+end iab_refused_no_integer
+
+@test("iab: an attribute the instance does not have is refused naming the one it does")
+iab_refused_unknown_attr()
+    iab_refused(iab_pair + "print(Pair[u8]::Nope(1).lo)\n",
+                "'Pair[byte]' has no attribute 'Nope' — its one attribute is 'Pair[byte]::Bits'", 6, 15)
+end iab_refused_unknown_attr

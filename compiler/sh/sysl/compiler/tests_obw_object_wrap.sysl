@@ -1,0 +1,381 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// A trait object standing in for a type parameter that a generic type is applied to: `Wrap[P]`, where
+// `Wrap` holds `p: *P`, is a pointer to the object and needs no layout of the trait, so a `*Port` may
+// stand in for `P` through it (`held_by_value.sysl`). A generic type that holds the parameter by value
+// anywhere along its fields is refused, naming the chain of fields that holds it. skiff's kernel needs
+// it: no `*Port` reached a queue, a channel or a pool through `KernelLock.on[P]`.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private obw_ready() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+    end if
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+    end if
+
+    true
+end obw_ready
+
+// What a one-file program prints, built fresh and run, or what refused it.
+private obw_ran(text: string) -> string
+    val root = make_temp_dir("sysl-obw").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end obw_ran
+
+// The program is refused with exactly this message, and nothing else, at this line and column.
+private obw_refused(text: string, message: string, at: string)
+    val root = make_temp_dir("sysl-obw-err").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    val out = emit_llvm_text(src, None) match
+        Err(why) -> why.message
+        Ok(made) -> if made.report.is_empty() then "" else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+
+    assert(out.starts_with(s"error: $message\n --> ") || out.starts_with(s"error: $message\n  --> "),
+           s"expected 'error: $message' first, got: $out")
+    assert(out.index_of(s"/main.sysl:$at\n").is_some(), s"expected it at main.sysl:$at, got: $out")
+    assert_eq(out.count_of("error: "), 1)
+end obw_refused
+
+// A trait, one implementation, a wrapper holding the parameter behind a pointer, and the object.
+// Eleven lines, so a program appended to it starts at line 12.
+private obw_port() -> string = raw"""
+    trait Port
+        mask(self) -> u32
+    struct Board
+        level: u32
+    impl Port for Board
+        mask(self) -> u32 = self.level
+    struct Wrap[P: Port]
+        p: *P
+    wrap[P: Port](p: *P) -> Wrap[P] = Wrap(p)
+    var b = Board(40)
+    val port: *Port = &b
+    """
+
+// -- accepted -------------------------------------------------------------------------------------
+
+@test("skiff's reduction: a generic returning Wrap[P] is called with the object from another generic")
+obw_the_reduction()
+    if !obw_ready() then return
+
+    assert_eq(obw_ran(raw"""
+        trait Port
+            mask(self) -> u32
+        struct Board
+            level: u32
+        impl Port for Board
+            mask(self) -> u32 = self.level
+        struct Wrap[P: Port]
+            p: *P
+        wrap[P: Port](p: *P) -> Wrap[P] = Wrap(p)
+        send[P: Port](p: *P, v: u32) -> u32
+            val w = wrap(p)
+            w.p.mask() + v
+        var b = Board(40)
+        val port: *Port = &b
+        print(send(port, 2))
+        """), "42\n")
+end obw_the_reduction
+
+@test("skiff's kernel: a lock's generic member returns Locking[P], called from a generic object's method")
+obw_the_kernel_shape()
+    if !obw_ready() then return
+
+    assert_eq(obw_ran(raw"""
+        trait Port
+            mask(*self) -> u32
+        struct Board
+            level: u32
+        impl Port for Board
+            mask(*self) -> u32 = self.level
+        struct Locking[P: Port]
+            p: *P
+            held: u32
+            release(self) -> u32 = self.p.mask() + self.held
+        struct KernelLock
+            depth: u32
+            on[P: Port](*self, p: *P) -> Locking[P]
+                self.depth += 1
+                Locking(p, self.depth)
+            end on
+        struct Queue[const N: usize]
+            slots: [N]u32
+            lock: KernelLock
+        impl[const N: usize] Queue[N]
+            send[P: Port](*self, p: *P, v: u32) -> u32
+                val held = self.lock.on(p)
+                self.slots[0] = v
+                held.release() + v + u32(N)
+            end send
+        trait Object
+            put(*self, p: *Port, v: u32) -> u32
+        impl[const N: usize] Object for Queue[N]
+            put(*self, p: *Port, v: u32) -> u32 = self.send(p, v)
+        var q: Queue[2] = Queue([0; 2], KernelLock(0))
+        var b = Board(40)
+        val o: *Object = &q
+        val port: *Port = &b
+        print(o.put(port, 1))
+        print(o.put(port, 1))
+        print(q.send(&b, 3))
+        """), "44\n45\n48\n")
+end obw_the_kernel_shape
+
+@test("Wrap[P] as a parameter's type, a result, a local's type, and written as a constructor")
+obw_every_place_it_is_written()
+    if !obw_ready() then return
+
+    assert_eq(obw_ran(obw_port() + raw"""
+        taking[P: Port](w: Wrap[P]) -> u32 = w.p.mask() + 1
+        local[P: Port](p: *P) -> u32
+            var w: Wrap[P] = Wrap(p)
+            val v: *Wrap[P] = &w
+            v.p.mask() + 2
+        end local
+        written[P: Port](p: *P) -> u32 = Wrap[P](p).p.mask() + 3
+        print(taking(wrap(port)), local(port), written(port), wrap(port).p.mask())
+        """), "41 42 43 40\n")
+end obw_every_place_it_is_written
+
+@test("a generic type holding Wrap[P] as a field, through a generic, and inferred at the object")
+obw_a_field_of_another_generic()
+    if !obw_ready() then return
+
+    assert_eq(obw_ran(obw_port() + raw"""
+        struct Outer[P: Port]
+            w: Wrap[P]
+            n: u32
+        outer[P: Port](p: *P) -> u32
+            var o: Outer[P] = Outer(wrap(p), 7)
+            o.w.p.mask() + o.n
+        end outer
+        val top = Outer(Wrap(port), 2)
+        print(outer(port), top.w.p.mask() + top.n)
+        """), "47 42\n")
+end obw_a_field_of_another_generic
+
+@test("a recursive generic type reaching the parameter behind a mode, and one behind &P")
+obw_recursive_and_counted()
+    if !obw_ready() then return
+
+    assert_eq(obw_ran(obw_port() + raw"""
+        struct Node[P: Port]
+            p: &P
+            next: *Node[P]
+        struct Ring[P: Port]
+            here: *P
+            next: *Ring[P]
+            back: &Ring[P]
+        noded[P: Port](p: &P) -> u32
+            var n: Node[P] = Node(p, null)
+            val m = Node(p, &n)
+            m.next.p.mask()
+        end noded
+        ringed[P: Port](p: *P) -> u32
+            val r: *Ring[P] = null
+            p.mask() + 1
+        end ringed
+        val counted: &Port = Board(9)
+        print(noded(counted), ringed(port))
+        """), "9 41\n")
+end obw_recursive_and_counted
+
+@test("two type parameters: the object stands in for the one held behind a pointer")
+obw_two_parameters()
+    if !obw_ready() then return
+
+    assert_eq(obw_ran(obw_port() + raw"""
+        struct Pair[A, B]
+            a: A
+            b: *B
+        pair[A, P: Port](a: A, p: *P) -> Pair[A, P] = Pair(a, p)
+        print(pair(5, port).b.mask(), pair(5, port).a)
+        """), "40 5\n")
+end obw_two_parameters
+
+@test("a generic method returning Wrap[P], on a plain struct and on a generic one")
+obw_a_generic_method()
+    if !obw_ready() then return
+
+    assert_eq(obw_ran(obw_port() + raw"""
+        struct K
+            n: u32
+            on[P: Port](self, p: *P) -> Wrap[P] = Wrap(p)
+        struct G[T]
+            t: T
+            on[P: Port](self, p: *P) -> Wrap[P] = wrap(p)
+        print(K(1).on(port).p.mask(), G(2).on(port).p.mask(), K(1).on[Port](port).p.mask())
+        """), "40 40 40\n")
+end obw_a_generic_method
+
+// -- refused --------------------------------------------------------------------------------------
+
+private obw_bad() -> string = obw_port() + raw"""
+    struct Bad[T]
+        v: T
+    struct Outer[P: Port]
+        b: Bad[P]
+    """
+
+@test("a generic type holding the parameter by value, named with its field")
+obw_refuses_a_held_field()
+    obw_refused(obw_bad() + "f[P: Port](p: *P) -> u32\n    val c: *Bad[P] = null\n    p.mask()\nend f\n" +
+                "print(f(port))\n",
+                "'f' uses 'P' in 'Bad[P]' (its field 'v' holds 'P') at line 17, so a trait object cannot " +
+                "stand in for it — only '*P' and '&P' can be written with one", "20:7")
+
+@test("nested: Outer[P] holding Bad[P] holding P, named with the chain")
+obw_refuses_a_nested_field()
+    obw_refused(obw_bad() + "f[P: Port](p: *P) -> u32\n    val c: *Outer[P] = null\n    p.mask()\nend f\n" +
+                "print(f(port))\n",
+                "'f' uses 'P' in 'Outer[P]' (its field 'b.v' holds 'P') at line 17, so a trait object " +
+                "cannot stand in for it — only '*P' and '&P' can be written with one", "20:7")
+
+@test("two mutually recursive types, one holding the parameter by value")
+obw_refuses_through_recursion()
+    obw_refused(obw_port() + raw"""
+        struct A[T]
+            b: *B[T]
+            v: T
+        struct B[T]
+            a: *A[T]
+        f[P: Port](p: *P) -> u32
+            val c: *B[P] = null
+            p.mask()
+        end f
+        print(f(port))
+        """, "'f' uses 'P' in 'B[P]' (its field 'a.v' holds 'P') at line 18, so a trait object " +
+             "cannot stand in for it — only '*P' and '&P' can be written with one", "21:7")
+
+@test("an enum whose variant holds the parameter")
+obw_refuses_an_enum_payload()
+    obw_refused(obw_port() + raw"""
+        enum Maybe[T]
+            Has(x: T)
+            Not
+        f[P: Port](p: *P) -> u32
+            val c: *Maybe[P] = null
+            p.mask()
+        end f
+        print(f(port))
+        """, "'f' uses 'P' in 'Maybe[P]' (its field 'Has.x' holds 'P') at line 16, so a trait object " +
+             "cannot stand in for it — only '*P' and '&P' can be written with one", "19:7")
+
+@test("of two parameters, the object standing in for the one held by value")
+obw_refuses_the_held_one_of_two()
+    obw_refused(obw_port() + raw"""
+        struct Pair[A, B]
+            a: A
+            b: *B
+        f[P: Port](p: *P) -> Pair[P, u32] = Pair(*p, null)
+        print(f(port).b)
+        """, "'f' uses 'P' in 'Pair[P, u32]' (its field 'a' holds 'P') at line 15, so a trait object " +
+             "cannot stand in for it — only '*P' and '&P' can be written with one", "16:7")
+
+@test("an array, a slice, a tuple and a function type along the fields hold it too")
+obw_refuses_other_holders()
+    val tail = "f[P: Port](p: *P) -> u32\n    val c: *H[P] = null\n    p.mask()\nend f\nprint(f(port))\n"
+    val message = "only '*P' and '&P' can be written with one"
+
+    obw_refused(obw_port() + "struct H[T]\n    xs: *[2]T\n" + tail,
+                s"'f' uses 'P' in 'H[P]' (its field 'xs' holds 'P') at line 15, so a trait object cannot " +
+                s"stand in for it — $message", "18:7")
+    obw_refused(obw_port() + "struct H[T]\n    xs: []T\n" + tail,
+                s"'f' uses 'P' in 'H[P]' (its field 'xs' holds 'P') at line 15, so a trait object cannot " +
+                s"stand in for it — $message", "18:7")
+    obw_refused(obw_port() + "struct H[T]\n    t: *(u32, T)\n" + tail,
+                s"'f' uses 'P' in 'H[P]' (its field 't' holds 'P') at line 15, so a trait object cannot " +
+                s"stand in for it — $message", "18:7")
+    obw_refused(obw_port() + "struct H[T]\n    f: &Fn(T) -> u32\n" + tail,
+                s"'f' uses 'P' in 'H[P]' (its field 'f' holds 'P') at line 15, so a trait object cannot " +
+                s"stand in for it — $message", "18:7")
+end obw_refuses_other_holders
+
+@test("a generic type written as a constructor over the object, holding it by value")
+obw_refuses_a_held_constructor()
+    obw_refused(obw_bad() + "f[P: Port](p: *P) -> u32\n    val c = Bad[P](*p)\n    p.mask()\nend f\n" +
+                "print(f(port))\n",
+                "'f' uses 'P' in 'Bad[P]' (its field 'v' holds 'P') at line 17, so a trait object cannot " +
+                "stand in for it — only '*P' and '&P' can be written with one", "20:7")
+
+@test("a generic type inferred at the object refuses a field whose generic type holds it by value")
+obw_refuses_an_inferred_held_field()
+    obw_refused(obw_bad() + "struct Hold[P: Port]\n    p: *P\n    c: *Bad[P]\n\nval h = Hold(port, null)\n",
+                "'P' stands for the trait 'Port' here, because a trait object was handed in its place — " +
+                "so it has no layout, and only '*P' and '&P' can be written with it", "18:13")
+
+// -- across a library -----------------------------------------------------------------------------
+
+private obw_library() -> string =
+    "module demo\n\ntrait Port\n    mask(*self) -> u32\n\nstruct Wrap[P: Port]\n    p: *P\n\n" +
+    "struct Bad[T]\n    v: T\n\n" +
+    "wrap[P: Port](p: *P) -> Wrap[P] = Wrap(p)\n\n" +
+    "send[P: Port](p: *P, v: u32) -> u32\n    val w = wrap(p)\n    w.p.mask() + v\nend send\n\n" +
+    "put(p: *Port) -> u32 = send(p, 1)\n\n" +
+    "held[P: Port](p: *P) -> u32\n    val c: *Bad[P] = null\n    p.mask()\nend held\n"
+
+@test("a library's own call through Wrap[P] at the object is compiled with the library")
+obw_the_library_compiles_it()
+    if !lbr_ready() then return
+
+    val root = lfa_root("demo", obw_library())
+    val half = lfa_half_here(root, [])
+
+    assert(holds_string(half.advertised, "demo$put"), half.text)
+    assert(half.text.contains("define i32 @demo$send.demo$Port("), half.text)
+    lbr_drop([root])
+end obw_the_library_compiles_it
+
+@test("and a program calls the library's generics at its own object, and is refused the held one")
+obw_a_program_over_the_library()
+    if !lbr_ready() then return
+
+    val root = lfa_root("demo", obw_library())
+    val head = "import demo.{Port, send, put, wrap, held}\n\nstruct Board\n    level: u32\n\n" +
+               "impl Port for Board\n    mask(*self) -> u32 = self.level\n\n" +
+               "var b = Board(5)\nval o: *Port = &b\n"
+    val prog = lbr_program(head + "print(put(o), send(o, 2), wrap(o).p.mask())\n")
+
+    assert_eq(lbr_run(prog, [root]), "6 7 5\n")
+
+    val bad = lbr_program(head + "print(held(o))\n")
+    val said = lbr_run(bad, [root])
+
+    assert(said.contains("'demo.held' uses 'P' in 'Bad[P]' (its field 'v' holds 'P') at "), said)
+    assert(said.contains("/demo/lib.sysl:22, so a trait object cannot stand in for it"), said)
+    lbr_drop([root, prog, bad])
+end obw_a_program_over_the_library
