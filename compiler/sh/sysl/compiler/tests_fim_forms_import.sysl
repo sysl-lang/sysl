@@ -1,0 +1,464 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{exists, make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.{join, replace_all}
+
+// The forms a file imports: `ptr_cast`, `str_cast` and `str_alias` from `sysl.raw`, and the four
+// `va_` forms from `sysl.c`. The compiler still answers each of them -- nothing in either module
+// declares one -- but the name is in scope only where the file imported it: by name, under another
+// name with `as`, through a wildcard over the module, or as a path through it. Written bare without
+// one it is told where it lives, and a name the reader declared still wins over the form
+// (`expr_call.sysl`'s `imported_form`; `analyze.sysl`'s `import_name`).
+
+// -- the harness ----------------------------------------------------------------------------------
+
+// **A program's text with the imports its forms need**, for the suites whose programs use the forms
+// in passing: a wildcard over `sysl.raw` where it names one of that module's, and one over `sysl.c`
+// where it names a `va_` form. They go LAST: an import holds for its whole file wherever it stands,
+// and at the end it moves no line a suite pins a position on, and comes after a `module` line and
+// the header attributes that have to follow it.
+forms_imported(text: string) -> string
+    var head = ""
+
+    // A text that already imports from one of the modules says for itself what it brings in, which is
+    // how a suite keeps a form unimported on purpose.
+    if (text.contains("ptr_cast") || text.contains("str_cast") || text.contains("str_alias")) &&
+       !text.contains("import sysl.raw") then
+        head = head + "import sysl.raw.*\n"
+
+    if (text.contains("va_start") || text.contains("va_arg") || text.contains("va_copy") ||
+        text.contains("va_end")) && !text.contains("import sysl.c.") && !text.contains("import sysl.c\n") then
+        head = head + "import sysl.c.*\n"
+
+    if head.is_empty() then return text
+
+    if text.is_empty() || text.ends_with("\n") then text + head else text + "\n" + head
+end forms_imported
+
+// The same for a file of a written tree, which is a sysl source only where its name says so.
+forms_imported_in(name: string, text: string) -> string =
+    if name.ends_with(".sysl") then forms_imported(text) else text
+
+private fim_ready() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+    end if
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+    end if
+
+    true
+end fim_ready
+
+// What a one-file program prints, built fresh and run, or what refused it.
+private fim_ran(text: string) -> string
+    val root = make_temp_dir("sysl-fim").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end fim_ran
+
+// What analysing a one-file program had to say, rendered as the command line renders it.
+private fim_said(text: string) -> string
+    val root = make_temp_dir("sysl-fim-err").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    val out = emit_llvm_text(src, None) match
+        Err(why) -> why.message
+        Ok(made) -> if made.report.is_empty() then "" else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end fim_said
+
+// The program is refused with exactly this message, and nothing else, at this line and column.
+private fim_refused(text: string, message: string, at: string)
+    val out = fim_said(text)
+
+    assert(out.starts_with(s"error: $message\n --> ") || out.starts_with(s"error: $message\n  --> "),
+           s"expected 'error: $message' first, got: $out")
+    assert(out.index_of(s"/main.sysl:$at\n").is_some(), s"expected it at main.sysl:$at, got: $out")
+    assert_eq(out.count_of("error: "), 1)
+end fim_refused
+
+private fim_cli(args: []string) -> (int, string)
+    var lines: Buf[string] = buf()
+    val sink = &lines
+    val code = run_cli(args, (line) -> sink.push(line))
+
+    (code, join(lines.view(), "\n"))
+end fim_cli
+
+// Four bytes read as one `u32` through a pointer, which is the same on every little-endian host.
+private val fim_word: string = "var a: [4]u8 = [1, 0, 0, 0]\nval p: *u32 = ptr_cast(&a[0])\nprint(*p)\n"
+
+// A tail of ints summed, read through all four `va_` forms.
+private val fim_sum: string =
+    "sum(n: int, ...) -> int\n    var ap: va_list\n    var again: va_list\n\n    va_start(ap)\n" +
+    "    va_copy(again, ap)\n\n    var total = 0\n\n    for i in 0..<n do total += va_arg(ap)\n" +
+    "    for i in 0..<n do total += va_arg(again)\n\n    va_end(again)\n    va_end(ap)\n    total\n" +
+    "end sum\n\nprint(sum(3, 1, 2, 3))\n"
+
+// -- each name, imported ----------------------------------------------------------------------------
+
+@test("ptr_cast imported from sysl.raw reads an address as a pointer")
+fim_ptr_cast_imported()
+    if !fim_ready() then return
+
+    assert_eq(fim_ran("import sysl.raw.ptr_cast\n\n" + fim_word), "1\n")
+
+@test("ptr_cast with its type written in brackets, imported")
+fim_ptr_cast_written_type_imported()
+    if !fim_ready() then return
+
+    assert_eq(fim_ran("import sysl.raw.ptr_cast\n\nvar a: [4]u8 = [7, 0, 0, 0]\n" +
+                      "print(*ptr_cast[*u8](&a[0]))\n"), "7\n")
+
+@test("str_cast imported from sysl.raw takes bytes as a string, sliced short of a NUL")
+fim_str_cast_imported()
+    if !fim_ready() then return
+
+    assert_eq(fim_ran("import sysl.raw.str_cast\n\nvar b: [5]u8 = [104, 105, 33, 33, 33]\n" +
+                      "print(str_cast(b[0..<3]))\n"), "hi!\n")
+
+@test("str_alias imported from sysl.raw lays a string over a buffer it does not own")
+fim_str_alias_imported()
+    if !fim_ready() then return
+
+    assert_eq(fim_ran("import sysl.raw.str_alias\n\nvar b: [3]u8 = [111, 107, 33]\n" +
+                      "val s = str_alias(b[0..<2])\nprint(s, s.len)\n"), "ok 2\n")
+
+@test("the four va_ forms imported from sysl.c walk a tail twice")
+fim_va_forms_imported()
+    if !fim_ready() then return
+
+    assert_eq(fim_ran("import sysl.c.{va_start, va_arg, va_copy, va_end}\n\n" + fim_sum), "12\n")
+
+// -- each name, not imported ------------------------------------------------------------------------
+
+@test("ptr_cast written without its import is told where it lives")
+fim_ptr_cast_unimported()
+    if !fim_ready() then return
+
+    fim_refused(fim_word, "'ptr_cast' is in sysl.raw: add 'import sysl.raw.ptr_cast'", "2:15")
+
+@test("ptr_cast with a written type and no import is told the same")
+fim_ptr_cast_written_type_unimported()
+    if !fim_ready() then return
+
+    fim_refused("var a: [4]u8 = [7, 0, 0, 0]\nprint(*ptr_cast[*u8](&a[0]))\n",
+                "'ptr_cast' is in sysl.raw: add 'import sysl.raw.ptr_cast'", "2:8")
+
+@test("str_cast written without its import is told where it lives")
+fim_str_cast_unimported()
+    if !fim_ready() then return
+
+    fim_refused("var b: [2]u8 = [104, 105]\nprint(str_cast(b[..]))\n",
+                "'str_cast' is in sysl.raw: add 'import sysl.raw.str_cast'", "2:7")
+
+@test("str_alias written without its import is told where it lives")
+fim_str_alias_unimported()
+    if !fim_ready() then return
+
+    fim_refused("var b: [2]u8 = [104, 105]\nprint(str_alias(b[..]))\n",
+                "'str_alias' is in sysl.raw: add 'import sysl.raw.str_alias'", "2:7")
+
+@test("each va_ form written without its import is told where it lives, the first one first")
+fim_va_forms_unimported()
+    if !fim_ready() then return
+
+    // Every one of the six uses is told, and the first of them is told first.
+    val none = fim_said(fim_sum)
+
+    assert(none.starts_with("error: 'va_start' is in sysl.c: add 'import sysl.c.va_start'\n --> "), none)
+    assert(none.index_of("/main.sysl:5:5\n").is_some(), none)
+    assert(none.count_of("error: ") >= 5, none)
+
+    val without_one = "import sysl.c.{va_start, va_arg, va_end}\n\n" + fim_sum
+
+    fim_refused(without_one, "'va_copy' is in sysl.c: add 'import sysl.c.va_copy'", "8:5")
+
+    val without_arg = "import sysl.c.{va_start, va_copy, va_end}\n\n" + fim_sum
+    val said = fim_said(without_arg)
+
+    assert(said.starts_with("error: 'va_arg' is in sysl.c: add 'import sysl.c.va_arg'"), said)
+
+    val without_end = "import sysl.c.{va_start, va_arg, va_copy}\n\n" + fim_sum
+    val ended = fim_said(without_end)
+
+    assert(ended.starts_with("error: 'va_end' is in sysl.c: add 'import sysl.c.va_end'"), ended)
+
+// -- the reader's own name still wins ---------------------------------------------------------------
+
+@test("a function the reader calls ptr_cast is called, with no import")
+fim_own_ptr_cast_wins()
+    if !fim_ready() then return
+
+    assert_eq(fim_ran("ptr_cast(n: int) -> int = n + 1\n\nprint(ptr_cast(41))\n"), "42\n")
+
+@test("a function the reader calls ptr_cast wins with a written type argument too")
+fim_own_generic_ptr_cast_wins()
+    if !fim_ready() then return
+
+    assert_eq(fim_ran("ptr_cast[T](n: T) -> T = n\n\nprint(ptr_cast[int](41))\n"), "41\n")
+
+@test("a local the reader calls str_cast is called, with no import")
+fim_own_str_cast_wins()
+    if !fim_ready() then return
+
+    assert_eq(fim_ran("val str_cast = (n: int) -> n * 2\nprint(str_cast(21))\n"), "42\n")
+
+@test("a function the reader calls str_alias or va_arg is called, with no import")
+fim_own_str_alias_and_va_arg_win()
+    if !fim_ready() then return
+
+    assert_eq(fim_ran("str_alias(s: string) -> string = s + s\nva_arg(n: int) -> int = n * 3\n\n" +
+                      "print(str_alias(\"ab\"), va_arg(2))\n"), "abab 6\n")
+
+@test("importing the form under the name of the reader's own function is refused as two meanings")
+fim_own_and_imported_refused()
+    if !fim_ready() then return
+
+    fim_refused("import sysl.raw.ptr_cast\n\nptr_cast(n: int) -> int = n + 1\n\nprint(ptr_cast(41))\n",
+                "'ptr_cast' is declared by this program, so importing 'sysl.raw.ptr_cast' under that " +
+                    "name would mean two things — import it as another name with 'as', or write its path",
+                "1:1")
+
+@test("a local named like an alias of the form is the local")
+fim_local_shadows_an_alias()
+    if !fim_ready() then return
+
+    assert_eq(fim_ran("import sysl.raw.ptr_cast as pc\n\nval pc = (n: int) -> n - 1\nprint(pc(43))\n"),
+              "42\n")
+
+// -- the spellings of the import --------------------------------------------------------------------
+
+@test("a wildcard over sysl.raw and over sysl.c brings every form in")
+fim_wildcards()
+    if !fim_ready() then return
+
+    assert_eq(fim_ran("import sysl.raw.*\nimport sysl.c.*\n\n" + fim_word +
+                      "var b: [2]u8 = [104, 105]\nprint(str_cast(b[..]), str_alias(b[..]))\n" + fim_sum),
+              "1\nhi hi\n12\n")
+
+@test("an aliased import calls the form by the alias, written type and all")
+fim_aliased()
+    if !fim_ready() then return
+
+    assert_eq(fim_ran("import sysl.raw.{ptr_cast as pc, str_cast as sc}\nimport sysl.c.va_arg as next\n" +
+                      "import sysl.c.{va_start, va_end}\n\n" +
+                      "first(n: int, ...) -> int\n    var ap: va_list\n\n    va_start(ap)\n\n" +
+                      "    val v: int = next(ap)\n\n    va_end(ap)\n    v + n\nend first\n\n" +
+                      "var a: [4]u8 = [104, 105, 0, 0]\nval p: *u32 = pc(&a[0])\n" +
+                      "print(*p, *pc[*u8](&a[1]), sc(a[0..<2]), first(1, 41))\n"), "26984 105 hi 42\n")
+
+private val fim_no_ref: string =
+    "'ptr_cast' never produces a reference: a '&T' is counted and non-null, and an address read out " +
+    "of bytes carries no count for anything to own — read it as a '*T'"
+
+@test("ptr_cast in a '&T' position is the form refusing it, imported under its own name")
+fim_ref_position_own_name()
+    if !fim_ready() then return
+
+    fim_refused("import sysl.raw.ptr_cast\n\nvar a: [4]u8 = [1, 0, 0, 0]\nval r: &u32 = ptr_cast(&a[0])\n",
+                fim_no_ref, "4:15")
+
+@test("ptr_cast in a '&T' position is the form refusing it under an alias, not a boxed value")
+fim_ref_position_aliased()
+    if !fim_ready() then return
+
+    fim_refused("import sysl.raw.ptr_cast as pc\n\nvar a: [4]u8 = [1, 0, 0, 0]\nval r: &u32 = pc(&a[0])\n",
+                fim_no_ref, "4:15")
+
+@test("ptr_cast in a '&T' position is the form refusing it through the module's path")
+fim_ref_position_through_the_module()
+    if !fim_ready() then return
+
+    fim_refused("import sysl.raw\n\nvar a: [4]u8 = [1, 0, 0, 0]\nval r: &u32 = raw.ptr_cast(&a[0])\n",
+                fim_no_ref, "4:19")
+
+@test("a function of the program's own called ptr_cast in a '&T' position is boxed like any value")
+fim_ref_position_own_function()
+    if !fim_ready() then return
+
+    assert_eq(fim_ran("ptr_cast(n: int) -> int = n + 1\n\nval r: &int = ptr_cast(1)\nprint(*r)\n"), "2\n")
+
+@test("an aliased import leaves the form's own spelling unimported")
+fim_aliased_leaves_the_name_out()
+    if !fim_ready() then return
+
+    fim_refused("import sysl.raw.ptr_cast as pc\n\nvar a: [4]u8 = [1, 0, 0, 0]\n" +
+                "val p: *u32 = ptr_cast(&a[0])\nprint(*p)\n",
+                "'ptr_cast' is in sysl.raw: add 'import sysl.raw.ptr_cast'", "4:15")
+
+@test("the module imported whole reaches the form through its name, and the whole path does too")
+fim_through_the_module()
+    if !fim_ready() then return
+
+    assert_eq(fim_ran("import sysl.raw\n\nvar a: [4]u8 = [1, 0, 0, 0]\nval p: *u32 = raw.ptr_cast(&a[0])\n" +
+                      "val q: *u32 = sysl.raw.ptr_cast(&a[0])\nprint(*p, *q, *raw.ptr_cast[*u8](&a[0]))\n"),
+              "1 1 1\n")
+
+@test("an import inside a body brings the form in for that body alone")
+fim_import_in_a_body()
+    if !fim_ready() then return
+
+    val text = "first(a: *[4]u8) -> u8\n    import sysl.raw.ptr_cast\n\n    val p: *u8 = ptr_cast(a)\n" +
+        "    *p\nend first\n\n"
+
+    assert_eq(fim_ran(text + "var a: [4]u8 = [9, 0, 0, 0]\nprint(first(&a))\n"), "9\n")
+    fim_refused(text + "second(a: *[4]u8) -> u8\n    val p: *u8 = ptr_cast(a)\n    *p\n\n" +
+                "var a: [4]u8 = [9, 0, 0, 0]\nprint(second(&a))\n",
+                "'ptr_cast' is in sysl.raw: add 'import sysl.raw.ptr_cast'", "9:18")
+
+@test("a form imported from a module that is not its own is told which module it is in")
+fim_the_wrong_module()
+    if !fim_ready() then return
+
+    fim_refused("import sysl.slices.ptr_cast\n\nprint(1)\n",
+                "'sysl.slices' declares no 'ptr_cast' — 'ptr_cast' is in sysl.raw: import sysl.raw.ptr_cast",
+                "1:1")
+    fim_refused("import sysl.raw.va_arg\n\nprint(1)\n",
+                "'sysl.raw' declares no 'va_arg' — 'va_arg' is in sysl.c: import sysl.c.va_arg", "1:1")
+
+@test("print and the other global forms still need no import, and an import of one says so")
+fim_print_stays_global()
+    if !fim_ready() then return
+
+    fim_refused("import sysl.raw.print\n\nprint(1)\n",
+                "'print' is a built-in form rather than a member of any module — it is in scope " +
+                    "everywhere and needs no import", "1:1")
+
+// -- a generic, and a module of two files -----------------------------------------------------------
+
+@test("a generic function and a generic type's member use the imported form at two instantiations")
+fim_a_generic()
+    if !fim_ready() then return
+
+    assert_eq(fim_ran("import sysl.raw.ptr_cast\n\nfirst_byte[T](p: *T) -> u8\n    val b: *u8 = ptr_cast(p)\n" +
+                      "    *b\nend first_byte\n\nstruct Cell[T]\n    v: T\n\n" +
+                      "    low(*self) -> u8 = *ptr_cast[*u8](&self.v)\n\n" +
+                      "var x: u32 = 258\nvar y: u16 = 3\nvar c = Cell(513u32)\n" +
+                      "print(first_byte(&x), first_byte(&y), c.low())\n"), "2 3 1\n")
+
+@test("a module's file that imports the form uses it, and the sibling file that does not is told")
+fim_one_file_of_a_module()
+    if !lbr_ready() then return
+
+    val ok = lbr_tree(lbr_two(
+        "demo/a.sysl", "module demo\n\nimport sysl.raw.ptr_cast\n\nlow(p: *u32) -> u8 = *ptr_cast[*u8](p)\n",
+        "demo/b.sysl", "module demo\n\ntwice(p: *u32) -> u32 = *p * 2\n"))
+    val prog = lbr_program("import demo.{low, twice}\n\nvar x: u32 = 260\nprint(low(&x), twice(&x))\n")
+
+    assert_eq(lbr_run(prog, [ok]), "4 520\n")
+
+    val bad = lbr_tree(lbr_two(
+        "demo/a.sysl", "module demo\n\nimport sysl.raw.ptr_cast\n\nlow(p: *u32) -> u8 = *ptr_cast[*u8](p)\n",
+        "demo/b.sysl", "module demo\n// without the 'import sysl.raw.ptr_cast' a.sysl has\n" +
+                       "high(p: *u32) -> u8\n    val b: *u8 = ptr_cast(p)\n    b[3]\n"))
+    val prog2 = lbr_program("import demo.{low, high}\n\nvar x: u32 = 260\nprint(low(&x), high(&x))\n")
+    val said = lbr_run(prog2, [bad])
+
+    assert(said.contains("'ptr_cast' is in sysl.raw: add 'import sysl.raw.ptr_cast'"), said)
+    assert(said.contains("/demo/b.sysl:4:18"), said)
+    lbr_drop([ok, prog, bad, prog2])
+end fim_one_file_of_a_module
+
+// -- across a library -------------------------------------------------------------------------------
+
+private val fim_library: string =
+    "module demo\n\nimport sysl.raw.{ptr_cast, str_cast}\n\n" +
+    "low[T](p: *T) -> u8 = *ptr_cast[*u8](p)\n\n" +
+    "text(b: []u8) -> string = str_cast(b)\n"
+
+@test("a library using imported forms in a generic and a plain function builds with build-lib")
+fim_a_library_builds()
+    if !fim_ready() then return
+
+    val root = lbr_temp("sysl-fim-lib-")
+
+    make_dir_all(s"$root/demo").unwrap()
+    write_text(s"$root/demo/demo.sysl", fim_library).unwrap()
+
+    val got = fim_cli(["sysl", "build-lib", root])
+
+    assert_eq(got.0, Fine, got.1)
+    assert_eq(got.1, s"checked $root")
+    remove_dir_all(root).unwrap_or(())
+end fim_a_library_builds
+
+@test("a program that imports no form instantiates the library's generic, which reads it in the library's terms")
+fim_a_program_over_the_library()
+    if !fim_ready() then return
+
+    val lib = lbr_tree(lbr_one("demo/demo.sysl", fim_library))
+    val prog = lbr_program("import demo.{low, text}\n\nvar x: u32 = 513\nvar y: u16 = 7\n" +
+                           "var b: [2]u8 = [104, 105]\nprint(low(&x), low(&y), text(b[..]))\n")
+
+    assert_eq(lbr_run(prog, [lib]), "1 7 hi\n")
+    lbr_drop([lib, prog])
+end fim_a_program_over_the_library
+
+// -- on a board -------------------------------------------------------------------------------------
+
+@test("a thumb build reaches a device register through ptr_cast, imported, and its address is constant data")
+fim_a_device_address_on_thumb()
+    if !fim_ready() then return
+
+    val root = replace_all(make_temp_dir("sysl-fim-thumb").unwrap(), "//", "/")
+    val program = "import sysl.raw.ptr_cast\n\nstruct Uart\n    data: u32\n    status: u32\n\n" +
+        "val UART: *Uart = ptr_cast(0x4000_4000)\n\n@export(\"main\")\nboard_main() -> i32\n" +
+        "    UART.data = 65\n    i32(UART.status)\nend board_main\n"
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", program).unwrap()
+    write_text(s"$root/sysl.hocon", "package { name = \"probe\", version = \"0.1.0\" }\n").unwrap()
+
+    val got = fim_cli(["sysl", "build-c", root, "--target", "thumb-freestanding-softfp", "-o",
+                       s"$root/app.a"])
+
+    assert_eq(got.0, Fine, got.1)
+
+    val tool = "/opt/homebrew/bin/arm-none-eabi-nm"
+
+    assert(exists(tool), "this test reads a board's archive and there is no arm-none-eabi-nm")
+
+    capture(tool, [s"$root/app.a"], "", [], true) match
+        Ok(out) -> assert(out.text.contains(" T main\n"), out.text)
+        Err(_) -> assert(false, "arm-none-eabi-nm could not be run")
+
+    // Unimported, the same board build is refused with the line that fixes it.
+    write_text(s"$root/main.sysl", program[25..<program.bytes.len]).unwrap()
+
+    val refused = fim_cli(["sysl", "build-c", root, "--target", "thumb-freestanding-softfp", "-o",
+                           s"$root/app.a"])
+
+    assert(refused.0 != Fine, refused.1)
+    assert(refused.1.contains("'ptr_cast' is in sysl.raw: add 'import sysl.raw.ptr_cast'"), refused.1)
+    remove_dir_all(root).unwrap_or(())
+end fim_a_device_address_on_thumb

@@ -908,6 +908,8 @@ traps on bits that match no variant; passed directly to `try`, the field's bits 
 and validated:
 
 ```sysl
+import sysl.raw.ptr_cast
+
 enum Ec: u6
     Unknown = 0x00
     Brk = 0x3c

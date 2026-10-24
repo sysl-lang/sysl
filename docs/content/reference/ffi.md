@@ -673,6 +673,8 @@ is what makes the boundary writable rather than merely restricted.
 ```sysl build=c
 module mylib
 
+import sysl.c.{va_arg, va_end, va_start}
+
 @export("mylib_sum")
 sum(n: i32, ...) -> i32
     var ap: va_list
@@ -700,6 +702,8 @@ and refuses a narrow one with the type to read instead:
 
 ```sysl
 module mylib
+
+import sysl.c.{va_arg, va_end, va_start}
 
 @export
 first(n: i32, ...) -> f32
@@ -746,6 +750,8 @@ and the header includes `<stdarg.h>` to spell it:
 
 ```sysl build=c
 module mylib
+
+import sysl.c.va_arg
 
 @export("mylib_vsum")
 vsum(n: i32, ap: va_list) -> i32
@@ -1179,6 +1185,8 @@ fixed-address hardware once and builds the rest from the name:
 
 ```sysl build=c target=thumbv7em-freestanding
 module mylib
+
+import sysl.raw.ptr_cast
 
 struct Ring
     head: u32
@@ -1881,6 +1889,8 @@ That matters for more than a corner: `qsort` and `bsearch` take a comparison, `s
 takes a filter, and every library with a `_set_callback` in it takes one of these.
 
 ```sysl
+import sysl.raw.ptr_cast
+
 extern qsort(base: *u8, n: usize, size: usize, cmp: *extern(*u8, *u8) -> i32)
 
 compare(a: *u8, b: *u8) -> i32
@@ -1957,6 +1967,8 @@ A generic function is a body per set of type arguments, so an address needs them
 expected type settles them**, by the same unification a call site uses on its arguments:
 
 ```sysl
+import sysl.raw.ptr_cast
+
 extern qsort(base: *u8, n: usize, size: usize, cmp: *extern(*u8, *u8) -> i32)
 
 ascending[T](a: *T, b: *T) -> i32
@@ -1986,6 +1998,8 @@ arguments are written where the address is taken, and **this is the one position
 takes them**:
 
 ```sysl
+import sysl.raw.ptr_cast
+
 extern qsort(base: *u8, n: usize, size: usize, cmp: *extern(*u8, *u8) -> i32)
 
 compare[T: Ord](a: *u8, b: *u8) -> i32
@@ -2219,6 +2233,8 @@ print(1)
 caller need not know whether the callee it is reaching is foreign:
 
 ```sysl
+import sysl.c.{va_arg, va_end, va_start}
+
 sum(n: int, ...) -> int
     var ap: va_list
 
@@ -2288,6 +2304,8 @@ C's own rules take it exactly as they take a `void *`:
 signature rather than reading an address and casting it:
 
 ```sysl
+import sysl.c.{va_arg, va_end, va_start}
+
 doubler(n: int) -> int = n * 2
 
 apply(x: int, ...) -> int
@@ -2356,6 +2374,33 @@ an ABI primitive that no sysl body could implement, so there is nothing to put i
 is the line the "no functions built into the compiler" rule actually draws — no program could write
 `va_arg`.
 
+**The four `va_` forms are imported, from `sysl.c`** — `import sysl.c.{va_start, va_arg, va_end}` —
+while `va_list` stays a predeclared type. The compiler answers them, but a file names the C variadic
+forms it uses, as it names anything else it did not declare; an alias, a wildcard (`import sysl.c.*`)
+and a path through the module reach them too. Written bare without one, the form is told where it
+lives:
+
+```sysl
+sum(n: int, ...) -> int
+    var ap: va_list
+
+    va_start(ap)
+
+    var total = 0
+
+    for i in 0..<n do total += va_arg(ap)
+
+    va_end(ap)
+
+    total
+
+print(sum(3, 10, 20, 30))
+```
+
+```error
+'va_start' is in sysl.c: add 'import sysl.c.va_start'
+```
+
 **The walk is the target's C walk, every class of argument included.** On most machines a `va_list`
 is one pointer bumped past each slot; on AArch64 outside Apple's platforms it is a five-field
 structure keeping the general registers, the vector registers and the stack apart, and on x86-64
@@ -2369,6 +2414,8 @@ an integer between the two is widened to it at the call — as a narrow one is w
 back as an `i128` or a `u128`:
 
 ```sysl
+import sysl.c.{va_arg, va_end, va_start}
+
 top(n: int, ...) -> long
     var ap: va_list
 
@@ -2392,6 +2439,8 @@ print(top(1, big))
 Reading it at its own width is refused, since that is not the width it arrived at:
 
 ```sysl
+import sysl.c.{va_arg, va_end, va_start}
+
 first(n: int, ...) -> long
     var ap: va_list
 
@@ -2429,6 +2478,8 @@ one, so `va_arg` into a `Long` reads whichever the target says, which is what a 
 
 ```sysl
 @include("<stddef.h>")
+
+import sysl.c.{va_arg, va_end, va_start}
 
 c type
     Long = "long"
@@ -2469,6 +2520,8 @@ read into — `var v: int = va_arg(ap)`, `total += va_arg(ap)`, `take(va_arg(ap)
 `print(va_arg[int](ap))` needs. Where neither says, the form is refused rather than guessed at:
 
 ```sysl
+import sysl.c.{va_arg, va_end, va_start}
+
 walk(n: int, ...) -> int
     var ap: va_list
 
@@ -2494,6 +2547,8 @@ passes it to somebody who does. The parameter is a **`va_list`**, as C's is, and
 `&ap`:
 
 ```sysl
+import sysl.c.{va_arg, va_end, va_start}
+
 total(n: int, ap: va_list) -> int
     var sum = 0
 
@@ -2536,6 +2591,8 @@ To read on after the callee, hand the walk over **by address** instead. The para
 **`*va_list`**, the call still writes `&ap`, and the borrower advances the lender's own list:
 
 ```sysl
+import sysl.c.{va_arg, va_end, va_start}
+
 report(n: int, ap: *va_list) -> int
     var total = 0
 
@@ -2568,6 +2625,8 @@ as in C.
 since the call has no address of its own to give:
 
 ```sysl
+import sysl.c.{va_end, va_start}
+
 total(ap: va_list) -> int = 0
 
 relay(n: int, ...) -> int
@@ -2612,6 +2671,8 @@ transcribes a C header, so `va_list` is C's by-value parameter, the one `vprintf
 `*va_list` is C's `va_list *`.
 
 ```sysl
+import sysl.c.{va_end, va_start}
+
 extern vprintf(fmt: *u8, ap: va_list) -> i32
 
 log(fmt: *u8, ...) -> i32

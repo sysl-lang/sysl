@@ -150,6 +150,7 @@ where assigning a fresh `map()` would make a table nobody will free.
 
 ```sysl
 import sysl.container.{Map, map, Deque, deque}
+import sysl.raw.ptr_cast
 
 extern "calloc" c_calloc(n: usize, size: usize) -> *u8
 
