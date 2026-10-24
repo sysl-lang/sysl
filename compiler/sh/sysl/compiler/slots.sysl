@@ -292,8 +292,8 @@ private gen_slot_place(e: *Emit, xs: TExpr, index: TExpr, value: TExpr, elem: Ty
     //
     // **The count the slot keeps is in hand before the test**: the value's own where it is a
     // temporary or a local at its last use -- an owned parameter handed to `push` among them
-    // (`emit_moves.sysl`) -- and one taken otherwise. The first free slot keeps it as it is; the rest
-    // takes its own and this one is given back.
+    // (`emit_moves.sysl`) -- and one taken otherwise. The first free slot keeps it as it is, and the
+    // rest hands it to `arc.slotplace.<T>`, which keeps it too.
     val buffer_l = fresh_label(e, "slot.buffer")
     val fresh_l = fresh_label(e, "slot.fresh")
     val rest_l = fresh_label(e, "slot.rest")
@@ -332,7 +332,6 @@ private gen_slot_place(e: *Emit, xs: TExpr, index: TExpr, value: TExpr, elem: Ty
     args.push(ir_arg(LPtr, p))
     args.push(ir_arg(lty(e, elem), v))
     emit(e, ir_call(None, LVoid, slot_place_fn(e, elem), args))
-    release_value(e, elem, v)
     emit_term(e, InBr(done_l))
     emit_label(e, done_l)
 end gen_slot_place
@@ -366,8 +365,21 @@ gen_slot_place_rest(e: *Emit, elem: Type)
     trap_unless(e, inside, "slot")
     emit_term(e, InBr(held_l))
 
+    // The value arrives with the count the slot keeps (`gen_slot_place` has it in hand before its
+    // test), so the slot's old value is given back and nothing is retained.
     emit_label(e, held_l)
-    store_into(e, elem, p, VReg("v"), AccPlain)
+
+    if e.layout.indirect(elem)
+        release_at(e, elem, p)
+        emit(e, InStore(lty(e, elem), VReg("v"), p, AccPlain, None))
+    else
+        val old = fresh_reg(e)
+
+        emit(e, InLoad(old, lty(e, elem), p, AccPlain, None))
+        emit(e, InStore(lty(e, elem), VReg("v"), p, AccPlain, None))
+        release_value(e, elem, old)
+    end if
+
     emit_term(e, InRet(None, None))
 end gen_slot_place_rest
 

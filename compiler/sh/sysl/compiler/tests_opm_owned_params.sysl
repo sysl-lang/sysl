@@ -82,10 +82,12 @@ opm_last_use_moves()
 @test("a string made by + or a format hole is a temporary, handed over to an owned parameter with no pair")
 opm_string_temp_moves()
     val src = "struct D\n    m: string\n\nmk(m: string) -> D = D(m)\n\n" +
-              "cat(a: string, b: string) -> usize = mk(a + b).m.len\n\nhole(v: int) -> usize = mk(f\"${v}%05d\").m.len\n"
+              "cat(a: string, b: string) -> usize = mk(a + b).m.len\n"
+    val hole = "\nhole(v: int) -> usize = mk(f\"${v}%05d\").m.len\n\nprint(cat(\"a\", \"b\"), hole(3))\n"
 
-    for symbol in ["cat", "hole"]
-        val ir = opm_ir(src, symbol)
+    // A formatted hole reaches the standard module's formatting, so that program is lowered beside it.
+    for ir in [opm_ir(src, "cat"), opm_program_ir(src + hole, "hole")]
+        if ir == "skipped" then return
 
         assert(ir.contains("@mk.owned("), ir)
         assert_eq(opm_takes(ir), 0)
@@ -274,6 +276,27 @@ opm_push_moves()
     assert(ir.contains("@sysl.buf$Buf.push.ref.Node.owned("), ir)
     assert_eq(opm_count(ir, "call void @arc.retain("), 0)
     assert_eq(opm_count(ir, "call void @arc.release("), 0)
+
+// The append's owned body hands its element on in both arms: to the growth (whose contract names only
+// `self`, so it owns the element too) and to `arc.slotplace`, which keeps the count it is handed. So
+// the body gives nothing back, and stays small enough for `@inline` to absorb.
+@test("the library's push body hands its element on in every arm and gives nothing back")
+opm_push_body_gives_nothing_back()
+    val ir = opm_program_ir(opm_bufs, "sysl.buf$BufCore.push.ref.Node.owned")
+
+    if ir == "skipped" then return
+
+    assert(ir.contains("@sysl.buf$BufCore.grow_store.ref.Node.owned("), ir)
+    assert(ir.contains("@arc.slotplace.ref.Node("), ir)
+    assert_eq(opm_count(ir, "call void @arc."), 1)
+
+@test("a contract that names a parameter keeps it borrowed; one that names only others leaves it owned")
+opm_contract_names()
+    val src = "kept(t: &Node, n: int) -> W\n    ensure n >= 0\n\n    W(t)\n\n" +
+              "named(t: &Node) -> W\n    ensure t.v >= 0\n\n    W(t)\n"
+
+    assert(opm_ir(src, "kept.owned").starts_with("define"), opm_ir(src, "kept.owned"))
+    opm_absent(opm_ir(src, "named.owned"))
 
 @test("a local declared in a for body and pushed at its last use moves every round")
 opm_loop_push_moves()

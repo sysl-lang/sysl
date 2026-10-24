@@ -35,8 +35,8 @@ import sysl.container.{Set, set}
 //
 // What never owns: a body something outside the program may call (`@export`, a `@section`, a foreign
 // convention), a variadic one, a task (whose frame outlives the call anyway), a body that jumps back
-// to its own entry, one with a contract (whose clauses read the parameters after the body is done with
-// them), a closure's body, a `@scoped` parameter, and a parameter that crosses as an address.
+// to its own entry, a closure's body, a parameter a contract names (its clauses read it after the body
+// is done with it), a `@scoped` parameter, and a parameter that crosses as an address.
 
 // Every parameter of the program a direct call hands a count to, as `<function>|<position>`.
 owned_params(e: *Emit, p: TProgram) -> Set[string]
@@ -85,15 +85,38 @@ end owning_funcs
 
 private may_own(f: TFunc) -> bool =
     !f.ghost && !f.variadic && f.exported.is_none() && f.section.is_none() && f.conv.is_none() &&
-        !f.marks.is_async() && f.requires.is_empty() && f.ensures.is_empty() && f.olds.is_empty() &&
-        f.variant.is_none() && !is_closure_body(f) && tail_calls_of(f).is_empty()
+        !f.marks.is_async() && f.variant.is_none() && !is_closure_body(f) && tail_calls_of(f).is_empty()
 
 private may_own_param(e: *Emit, f: TFunc, j: usize) -> bool
     val ty = f.params.at(j).1
 
     contains_counted(ty) && movable_type(ty) && !e.layout.indirect(ty) && underlying(ty) != VaList &&
-        !scoped_at(f, j)
+        !scoped_at(f, j) && !contract_reads(f, f.params.at(j).0)
 end may_own_param
+
+private struct Seen
+    yes: bool
+
+// Whether a contract clause or an `old` capture names the parameter. An `ensure` is checked after the
+// body, and a parameter the body has handed on is no longer the frame's to read there; a contract
+// that names only other things (`self`, the result) leaves the parameter free to own.
+private contract_reads(f: TFunc, name: string) -> bool
+    val seen: &Seen = Seen(false)
+    val walk = expr_walk(true, x -> *x.kind match
+        TLoad(n, _) -> if n == name then seen.yes = true
+        _ -> ())
+
+    for c in f.requires
+        walk_texpr(c.cond, walk)
+
+    for c in f.ensures
+        walk_texpr(c.cond, walk)
+
+    for x in f.olds
+        walk_texpr(x, walk)
+
+    seen.yes
+end contract_reads
 
 // One walk's state: the locals that may hold the parameter or something built around it, the refs
 // (whose writes land in somebody else's storage), and whether the body lets it outlive the call.
