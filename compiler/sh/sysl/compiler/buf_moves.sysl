@@ -99,6 +99,9 @@ private bm_origin(st: &BmState, e: TExpr) -> string = *e.kind match
         else "fresh"
     TBufLit(_, _) -> "fresh"
     TBufFill(_, _, _) -> "fresh"
+    TStructNew(_, _) -> "fresh"
+    TEnumNew(_, _, _) -> "fresh"
+    TBox(_, _) -> "fresh"
     TZero(_) -> "fresh"
     TGlobal(_, _, _) -> "a module variable"
     _ -> "other"
@@ -490,12 +493,12 @@ private bm_write(st: &BmState, place: TExpr, value: TExpr, op: string)
     end if
 
     *place.kind match
-        TLoad(n, ty) ->
+        TLoad(n, _) ->
             bm_drop_pairs(st, n)
             bm_expr(st, value, Some(BmDest(s"'${bm_shown(n)}'", Some(n))))
             bm_forget(st, n)
 
-            if !st.summary && bm_is_buf(ty) then st.origins.push((n, bm_origin(st, value)))
+            if !st.summary then st.origins.push((n, bm_origin(st, value)))
         _ ->
             bm_expr(st, place, None)
             bm_expr(st, value, Some(BmDest("a field or element written", None)))
@@ -503,13 +506,13 @@ end bm_write
 
 private bm_stmt(st: &BmState, s: TStmt)
     s match
-        TVarDecl(n, ty, init, _) ->
+        TVarDecl(n, _, init, _) ->
             // A declaration met again (the next turn of a loop) is a new local: it starts unmoved.
             bm_forget(st, n)
             bm_drop_pairs(st, n)
             bm_expr(st, init, Some(BmDest(s"'${bm_shown(n)}'", Some(n))))
 
-            if !st.summary && bm_is_buf(ty) then st.origins.push((n, bm_origin(st, init)))
+            if !st.summary then st.origins.push((n, bm_origin(st, init)))
         TExprStmt(e) -> bm_expr(st, e, None)
         TRefDecl(_, _, place) -> bm_expr(st, place, None)
         TWriteStmt(w) -> bm_write(st, w.place, w.value, w.op)
