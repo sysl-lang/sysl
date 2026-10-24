@@ -1,0 +1,170 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+
+// Whether a generic type lays one of its type parameters out by value.
+//
+// A trait object may stand in for a parameter written behind a mode (`stand_in.sysl`), because a
+// trait has no layout and `*P` is the object itself. A generic type applied to that parameter --
+// `Wrap[P]` -- is the same question one declaration further out: `Wrap[Port]` exists exactly when
+// every path from `Wrap`'s fields to its parameter crosses a `*` or a `&` first. A field of type `P`,
+// `[N]P`, `[]P`, a tuple holding one, or another generic type that itself lays `P` out by value all
+// need `P`'s layout, so they are where an object cannot stand. A pointer to anything other than the
+// parameter itself does not stop the walk: `*Cell[P]` still needs `Cell[P]`, which needs a `P`.
+//
+// The answer is a fact about the declarations alone, so it is worked out once per type and position
+// and kept (`Analysis.held_by_value`). A recursive type reaches itself again only behind a mode, and
+// is read as its least fixed point: a position in progress counts as not held, and only a settled
+// answer is kept.
+
+// The memo's mark for a position held only behind a mode. No field chain can be spelled with it.
+private val NotHeld = "!"
+
+// The field chain through which the type at `key` holds its parameter at `index` by value -- `v`,
+// `b.v`, `Has.v`, or empty for an alias whose right-hand side holds it -- or None where it holds it
+// only behind `*` or `&`, or not at all. A declaration that is not a struct, an enum or an alias (a
+// trait's arguments, a C type) answers that it holds it, which is the reading that refuses.
+held_by_value(a: &Analysis, key: string, index: usize) -> Option[string]
+    var visiting: Buf[string] = buf()
+    val found = held_at(a, key, index, &visiting)
+
+    a.held_by_value.put(s"$key#$index", found.unwrap_or(NotHeld))
+    found
+end held_by_value
+
+private held_at(a: &Analysis, key: string, index: usize, visiting: *Buf[string]) -> Option[string]
+    val memo = s"$key#$index"
+    val known = a.held_by_value.get(memo)
+
+    if known.is_some() then return if known.unwrap() == NotHeld then None else known
+    if holds_string(*visiting, memo) then return None
+
+    val decl = a.tables.types.get(key)
+
+    if decl.is_none() then return Some("")
+
+    val d = decl.unwrap()
+
+    visiting.push(memo)
+
+    val found = d.kind match
+        StructOf(s) -> if index < s.tparams.len() then struct_holds(a, d.scope, s, s.tparams.at(index), s.tparams, visiting)
+                       else None
+        EnumOf(e) -> if index < e.tparams.len() then enum_holds(a, d.scope, e, e.tparams.at(index), visiting)
+                     else None
+        TypeOf(t) -> if index < t.tp.names.len() then holds_in(a, d.scope, t.base, t.tp.names.at(index), t.tp.names, visiting)
+                     else None
+        _ -> Some("")
+
+    visiting.pop()
+
+    // Only a position held is settled while another is still in progress: one read as not held may
+    // yet be held through the position the walk assumed was not. The outermost question keeps both.
+    if found.is_some() then a.held_by_value.put(memo, found.unwrap())
+
+    found
+end held_at
+
+// A struct's fields, its anonymous members' among them, in the order written.
+private struct_holds(a: &Analysis, scope: Scope, s: StructDecl, tp: string, own: Buf[string],
+                     visiting: *Buf[string]) -> Option[string]
+    for f in s.fields
+        val sub = holds_in(a, scope, f.typ, tp, own, visiting)
+
+        if sub.is_some() then return Some(chained(f.name, sub.unwrap()))
+
+    for inner in s.anon
+        val sub = struct_holds(a, scope, inner, tp, own, visiting)
+
+        if sub.is_some() then return sub
+
+    None
+end struct_holds
+
+private enum_holds(a: &Analysis, scope: Scope, e: EnumDecl, tp: string, visiting: *Buf[string]) -> Option[string]
+    for v in e.variants
+        for f in v.fields
+            val sub = holds_in(a, scope, f.typ, tp, e.tparams, visiting)
+
+            if sub.is_some() then return Some(chained(s"${v.name}.${f.name}", sub.unwrap()))
+
+    None
+end enum_holds
+
+private chained(head: string, rest: string) -> string =
+    if rest == "" then head else if head == "" then rest else s"$head.$rest"
+
+// Whether a type written in a declaration whose parameters are `own` holds `tp` by value, and through
+// which fields of a generic type it reaches it: empty where it holds it itself.
+private holds_in(a: &Analysis, scope: Scope, t: TypeRef, tp: string, own: Buf[string],
+                 visiting: *Buf[string]) -> Option[string] = *t.kind match
+    NamedType(n, args) ->
+        if args.is_empty() then return if n == tp then Some("") else None
+        if holds_string(own, n) then return None
+
+        val key = lookup_type_key(a, scope, n)
+
+        for i in 0..<args.len()
+            val sub = holds_in(a, scope, args.at(i), tp, own, visiting)
+
+            if sub.is_some()
+                if key.is_none() then return sub
+
+                val through = held_at(a, key.unwrap(), i, visiting)
+
+                if through.is_some() then return Some(chained(through.unwrap(), sub.unwrap()))
+            end if
+
+        None
+    PtrType(inner) -> behind(a, scope, inner, tp, own, visiting)
+    RefType(inner, _) -> behind(a, scope, inner, tp, own, visiting)
+    WeakType(inner) -> behind(a, scope, inner, tp, own, visiting)
+    ArrayType(_, elem, _) -> holds_in(a, scope, elem, tp, own, visiting)
+    VectorType(_, elem) -> holds_in(a, scope, elem, tp, own, visiting)
+    VolatileType(inner) -> holds_in(a, scope, inner, tp, own, visiting)
+    TupleType(parts, _) -> first_held(a, scope, parts, tp, own, visiting)
+    // A function's parameters and result are read at the type each names, so a `Fn(P) -> u32` needs
+    // the layout too.
+    FnType(params, ret, _) ->
+        val p = first_held(a, scope, params, tp, own, visiting)
+
+        if p.is_some() then p else holds_in(a, scope, ret, tp, own, visiting)
+    CFnType(params, ret) ->
+        val p = first_held(a, scope, params, tp, own, visiting)
+
+        if p.is_some() then p else holds_in(a, scope, ret, tp, own, visiting)
+    AssocType(base, _) -> if mentions(base, tp) then Some("") else None
+    AssocArgType(_, typ) -> holds_in(a, scope, typ, tp, own, visiting)
+    _ -> None
+
+// The parameter itself directly behind a mode is the object; anything else behind one is still laid
+// out where it is built.
+private behind(a: &Analysis, scope: Scope, inner: TypeRef, tp: string, own: Buf[string],
+               visiting: *Buf[string]) -> Option[string] = *inner.kind match
+    NamedType(n, args) -> if args.is_empty() && n == tp then None else holds_in(a, scope, inner, tp, own, visiting)
+    _ -> holds_in(a, scope, inner, tp, own, visiting)
+
+private first_held(a: &Analysis, scope: Scope, ts: Buf[TypeRef], tp: string, own: Buf[string],
+                   visiting: *Buf[string]) -> Option[string]
+    for t in ts
+        val sub = holds_in(a, scope, t, tp, own, visiting)
+
+        if sub.is_some() then return sub
+
+    None
+end first_held
+
+// Whether `tp` is written anywhere in a type, by value or not.
+private mentions(t: TypeRef, tp: string) -> bool = *t.kind match
+    NamedType(n, args) ->
+        if args.is_empty() then return n == tp
+
+        for x in args
+            if mentions(x, tp) then return true
+
+        false
+    PtrType(inner) -> mentions(inner, tp)
+    RefType(inner, _) -> mentions(inner, tp)
+    AssocType(base, _) -> mentions(base, tp)
+    _ -> false

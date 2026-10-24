@@ -91,6 +91,7 @@ open_block_group(cx: &Analyzer, stmts: Buf[Stmt])
         *item.kind match
             FuncDecl(d) ->
                 refuse_nested_forgo(cx, item.span, d)
+                refuse_nested_placement(cx, item.span, d)
                 cx.pending_nested.push(with_call_bounds(d))
             _ -> ()
 
@@ -139,6 +140,49 @@ private refuse_nested_forgo(cx: &Analyzer, at: Span, d: FuncDecl)
              "another function, which makes it a closure — what it captures is boxed by the function " +
              s"around it, outside this body. Write '$word' above the function that declares it")
 end refuse_nested_forgo
+
+// **`@export` and `@section` say where a function's code lives, and a nested one's is not its own to
+// place.** It is lowered as a member of the environment its block shares, under a name that counts
+// environments rather than one a file wrote, and every call of it hands it the frame it reads -- so
+// there is no symbol a C caller could name and nothing it could pass for the frame.
+//
+// Each is a mistake about where the declaration was written, so each is told and none abandons the
+// rest: a function carrying two of them hears about both.
+private refuse_nested_placement(cx: &Analyzer, at: Span, d: FuncDecl)
+    if d.exported.is_some()
+        cx.an.fault_in_place(cx.scope, at, s"'@export' holds a top-level function, and '${d.name}' is declared inside another " +
+                 "function, so it has no symbol of its own — it is called with the frame of the function " +
+                 "around it, which no caller from C could hand it. Write '@export' above a top-level " +
+                 "function")
+
+    if d.section.is_some()
+        cx.an.fault_in_place(cx.scope, at, s"'@section' holds a top-level function, and '${d.name}' is declared inside another " +
+                 "function, so its code is lowered with the frame of the function around it rather than " +
+                 "placed on its own. Write '@section' above a top-level function")
+
+    // **What something other than the program calls has nothing to hand it the frame**, so a test, a
+    // test hook and an interrupt handler are refused here for `@export`'s reason. The entry file's own
+    // tests and hooks are told in their words already (`entry.sysl`'s `refuse_nested_tests`).
+    val entry = in_entry_body(cx)
+
+    if d.test.is_some() && !entry
+        cx.an.fault_in_place(cx.scope, at, s"'@test' holds a top-level function, and '${d.name}' is declared inside another " +
+                 "function — the runner calls a test on its own, and this one is called only with the " +
+                 "frame of the function around it. Write the test at the top level")
+
+    if d.hook.is_some() && !entry
+        val word = s"@${hook_word(d.hook.unwrap().kind)}"
+
+        cx.an.fault_in_place(cx.scope, at, s"'$word' holds a top-level function, and '${d.name}' is " +
+                 "declared inside another function — the runner calls a hook on its own, and this one is called only with the " +
+                 s"frame of the function around it. Write '$word' above a top-level function")
+    end if
+
+    if d.conv.is_some()
+        cx.an.fault_in_place(cx.scope, at, s"'interrupt' holds a top-level function, and '${d.name}' is declared inside another " +
+                 "function — the processor enters a handler on its own, and this one is called only with " +
+                 "the frame of the function around it. Write the handler at the top level")
+end refuse_nested_placement
 
 // Strikes off what a statement just bound, and lowers the pending group once it has them all.
 //

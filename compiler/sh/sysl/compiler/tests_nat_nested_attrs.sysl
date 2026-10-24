@@ -1,0 +1,397 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+
+// The annotations a function declared inside another carries beyond its marks
+// (`reference/attributes.md`, `reference/verification.md`): `@pure`, `@ghost`, `@tailrec`, `@reads`,
+// `@writes`, `@needs` and `@crossing` take effect on it exactly as on a top-level function, and
+// `@export`, `@section`, `@test`, a test hook and `interrupt` are refused, since each says something
+// about a function called on its own and a nested one is only ever called with its frame. Every one
+// of them used to be accepted and to do nothing.
+//
+// And a diagnostic naming a nested function or a closure says where it was written -- `'run.probe'`,
+// `the closure in 'run.with'` -- never the environment or closure it was lowered under.
+//
+// Every cell is asked in four places the nested function can stand: inside a function, inside a
+// nested function, inside a generic function, and inside a method.
+
+private nat_pad(n: int) -> string
+    var out = ""
+
+    for i in 0..<n
+        out = out + " "
+
+    out
+end nat_pad
+
+private nat_indent(text: string, ind: int) -> string
+    var out = ""
+
+    for item in lines_of(text)
+        out = out + nat_pad(ind) + item + "\n"
+
+    out
+end nat_indent
+
+// 0 a function, 1 a nested function, 2 a generic function, 3 a method.
+private nat_kinds() -> int = 4
+
+private nat_where(kind: int) -> string
+    if kind == 0 then return "a function"
+    if kind == 1 then return "a nested function"
+    if kind == 2 then return "a generic function"
+
+    "a method"
+end nat_where
+
+// The source path of the body the nested function is written in, as a diagnostic says it.
+private nat_path(kind: int) -> string
+    if kind == 1 then return "run.mid"
+    if kind == 3 then return "S.run"
+
+    "run"
+end nat_path
+
+// A program whose function `run` declares `fns` and then does `calls`, in the place `kind` names,
+// and calls `run`.
+private nat_program(kind: int, prelude: string, fns: string, calls: string) -> string
+    var out = prelude
+
+    if kind == 0
+        out = out + "run()\n" + nat_indent(fns, 4) + "\n" + nat_indent(calls, 4) + "\nrun()\n"
+    else if kind == 1
+        out = out + "run()\n    mid()\n" + nat_indent(fns, 8) + "\n" + nat_indent(calls, 8) +
+              "\n    mid()\n\nrun()\n"
+    else if kind == 2
+        out = out + "run[T](v: T)\n" + nat_indent(fns, 4) + "\n" + nat_indent(calls, 4) + "\nrun(1)\n"
+    else
+        out = out + "struct S\n    n: int\n\n    run(self)\n" + nat_indent(fns, 8) + "\n" +
+              nat_indent(calls, 8) + "\nvar s = S(1)\ns.run()\n"
+
+    out
+end nat_program
+
+// What the program is refused with, all of it, or its IR where it is accepted.
+private nat_said(kind: int, prelude: string, fns: string, calls: string) -> string =
+    xvr_ir([("main.sysl", nat_program(kind, prelude, fns, calls))])
+
+// What the program prints.
+private nat_ran(kind: int, prelude: string, fns: string, calls: string) -> string =
+    xvr_ran([("main.sysl", nat_program(kind, prelude, fns, calls))])
+
+private nat_refused(said: string) -> bool = said.starts_with("error")
+
+// -- @pure ---------------------------------------------------------------------------------------------
+
+@test("a nested '@pure' function writing a captured local writes storage it did not create")
+nat_pure_writes_a_capture()
+    if xvr_no_library() then return
+
+    val fns = "probe_fn(x: int) -> int\n    n = x\n    x"
+    val calls = "var n = 1\nprint(probe_fn(2))\nprint(n)"
+
+    for kind in 0..<nat_kinds()
+        val said = nat_said(kind, "", "@pure\n" + fns, calls)
+
+        assert(said.contains("error: a '@pure' function writes through a reference to storage it did not " +
+                             "create, and a caller of one may observe nothing about the call but its result"),
+               s"${nat_where(kind)}\n$said")
+
+        assert_eq(nat_ran(kind, "", fns, calls), "2\n2\n", nat_where(kind))
+
+@test("a nested '@pure' function may read a captured local, as a top-level one reads through a pointer")
+nat_pure_reads_a_capture()
+    if xvr_no_library() then return
+
+    for kind in 0..<nat_kinds()
+        val said = nat_ran(kind, "", "@pure\nprobe_fn(x: int) -> int = n + x",
+                           "var n = 40\nn += 1\nprint(probe_fn(1))")
+
+        assert_eq(said, "42\n", nat_where(kind))
+
+@test("a nested '@pure' function may call only what is pure, and the refusal names the sibling by its path")
+nat_pure_calls()
+    if xvr_no_library() then return
+
+    for kind in 0..<nat_kinds()
+        val said = nat_said(kind, "", "helper(x: int) -> int = x + 1\n\n@pure\nprobe_fn(x: int) -> int = helper(x)",
+                            "print(probe_fn(1))")
+
+        assert(said.contains(s"error: a '@pure' function calls '${nat_path(kind)}.helper', which is not " +
+                             "marked '@pure'"), s"${nat_where(kind)}\n$said")
+        assert(!said.contains("$"), s"${nat_where(kind)}\n$said")
+
+        val both = nat_ran(kind, "", "@pure\nhelper(x: int) -> int = x + 1\n\n@pure\nprobe_fn(x: int) -> int = helper(x)",
+                           "print(probe_fn(1))")
+
+        assert_eq(both, "2\n", nat_where(kind))
+
+// -- @ghost --------------------------------------------------------------------------------------------
+
+@test("a nested '@ghost' function may be called from a contract and from nowhere else")
+nat_ghost()
+    if xvr_no_library() then return
+
+    val spec = "@ghost\nspec(x: int) -> int = x + 1"
+
+    for kind in 0..<nat_kinds()
+        val said = nat_said(kind, "", spec, "print(spec(1))")
+
+        assert(said.contains(s"error: '${nat_path(kind)}.spec' is '@ghost', so it exists for the " +
+                             "specification and is not there when the program runs"), s"${nat_where(kind)}\n$said")
+
+        val ran = nat_ran(kind, "", spec + "\n\nprobe_fn(x: int) -> int\n    require spec(x) > 0\n    x",
+                          "print(probe_fn(1))")
+
+        assert_eq(ran, "1\n", nat_where(kind))
+
+// -- @tailrec ------------------------------------------------------------------------------------------
+
+@test("a nested '@tailrec' function is held to calling itself in tail position")
+nat_tailrec()
+    if xvr_no_library() then return
+
+    for kind in 0..<nat_kinds()
+        val said = nat_said(kind, "", "@tailrec\ncount(n: int) -> int\n    if n == 0 then 0 else 1 + count(n - 1)",
+                            "print(count(3))")
+
+        assert(said.contains(s"error: '${nat_path(kind)}.count' is marked '@tailrec' but calls itself nowhere " +
+                             "the jump can replace"), s"${nat_where(kind)}\n$said")
+
+        val ran = nat_ran(kind, "", "@tailrec\ncount(n: int, acc: int) -> int\n    if n == 0 then acc " +
+                          "else count(n - 1, acc + 1)", "print(count(1000000, 0))")
+
+        assert_eq(ran, "1000000\n", nat_where(kind))
+
+// -- @reads and @writes --------------------------------------------------------------------------------
+
+private val nat_statics: string = "static var limit: int = 100\nstatic var count: int = 0\n\n"
+
+private val nat_bump: string = "bump()\n    mine += 1\n    if count < limit then count += 1"
+
+@test("a nested function's frame covers module storage, and a captured local is nothing it names")
+nat_frames()
+    if xvr_no_library() then return
+
+    val calls = "var mine = 5\nbump()\nprint(mine, count)"
+
+    for kind in 0..<nat_kinds()
+        val said = nat_said(kind, nat_statics, "@writes(count)\n" + nat_bump, calls)
+
+        assert(said.contains("error: a function with a frame reads 'limit', which neither its '@reads' nor " +
+                             "its '@writes' names"), s"${nat_where(kind)}\n$said")
+
+        val ran = nat_ran(kind, nat_statics, "@reads(limit)\n@writes(count)\n" + nat_bump, calls)
+
+        assert_eq(ran, "6 1\n", nat_where(kind))
+
+        val local = nat_said(kind, nat_statics, "@reads(mine)\npeek() -> int = mine", "var mine = 5\nprint(peek())")
+
+        assert(local.contains("error: '@reads' names 'mine', which is not module-level storage"),
+               s"${nat_where(kind)}\n$local")
+
+        val empty = nat_ran(kind, nat_statics, "@reads()\n@writes()\npeek() -> int = mine",
+                            "var mine = 5\nprint(peek())")
+
+        assert_eq(empty, "5\n", nat_where(kind))
+
+@test("a nested function with a frame may call a sibling only where the sibling has one too")
+nat_frames_calls()
+    if xvr_no_library() then return
+
+    for kind in 0..<nat_kinds()
+        val said = nat_said(kind, nat_statics, "helper() -> int = 1\n\n@reads(limit)\npeek() -> int = helper()",
+                            "print(peek())")
+
+        assert(said.contains(s"'${nat_path(kind)}.helper'"), s"${nat_where(kind)}\n$said")
+        assert(nat_refused(said) && !said.contains("$"), s"${nat_where(kind)}\n$said")
+
+// -- @needs --------------------------------------------------------------------------------------------
+
+@test("a call of a nested '@needs(os)' function is refused in a module that gave 'os' up")
+nat_needs()
+    if xvr_no_library() then return
+
+    for kind in 0..<nat_kinds()
+        val said = nat_said(kind, "@no_os\n\n", "@needs(os)\nfetch(b: int) -> int = b", "print(fetch(1))")
+
+        // A generic's instantiation is answered for at the call that chose its types, as a top-level
+        // generic reaching a '@needs' declaration is: the refusal names what was reached through.
+        val wanted = if kind == 2 then "which needs 'os' through 'run.fetch', and this module declared '@no_os'"
+        else s"error: this reaches '${nat_path(kind)}.fetch', which needs 'os', and this module declared '@no_os'"
+
+        assert(said.contains(wanted), s"${nat_where(kind)}\n$said")
+
+        val bare = nat_ran(kind, "@no_os\n\n", "fetch(b: int) -> int = b", "print(fetch(1))")
+
+        assert_eq(bare, "1\n", nat_where(kind))
+
+@test("a nested '@needs(os)' function's own body is covered for what it names")
+nat_needs_covers_the_body()
+    if xvr_no_library() then return
+
+    val prelude = "@no_os\n\n@needs(os)\nraw(b: int) -> int = b\n\n"
+
+    for kind in 0..<nat_kinds()
+        val covered = nat_ran(kind, prelude, "@needs(os)\nfetch(b: int) -> int = raw(b)", "print(1)")
+
+        assert_eq(covered, "1\n", nat_where(kind))
+
+        val bare = nat_said(kind, prelude, "fetch(b: int) -> int = raw(b)", "print(1)")
+
+        assert(bare.contains("error: this reaches 'raw', which needs 'os'"), s"${nat_where(kind)}\n$bare")
+
+@test("a nested '@needs' naming no capability is refused as a top-level one is")
+nat_needs_names()
+    if xvr_no_library() then return
+
+    val top = xvr_ir([("main.sysl", "@needs(nope)\nfetch(b: int) -> int = b\n\nprint(fetch(1))\n")])
+
+    assert(nat_refused(top), top)
+
+    val message = lines_of(top).at(0)
+
+    for kind in 0..<nat_kinds()
+        val said = nat_said(kind, "", "@needs(nope)\nfetch(b: int) -> int = b", "print(fetch(1))")
+
+        assert(said.contains(message), s"${nat_where(kind)}: wanted\n$message\n$said")
+
+// -- @crossing -----------------------------------------------------------------------------------------
+
+private val nat_cells: string = "struct Cell\n    n: int\n\nstruct State\n    cell: &Cell\n\n"
+
+private val nat_start: string = "@crossing(s)\nstart(s: *State) -> int = s.cell.n"
+
+@test("a call of a nested '@crossing' function is held to what may cross, at the call")
+nat_crossing()
+    if xvr_no_library() then return
+
+    val calls = "var c: &Cell = Cell(1)\nvar st = State(c)\nprint(start(&st))"
+
+    for kind in 0..<nat_kinds()
+        val said = nat_said(kind, nat_cells, nat_start, calls)
+
+        assert(said.contains("error: what 's' of 'start' points at reaches another concurrency domain, so " +
+                             "every count inside it has to be atomic"), s"${nat_where(kind)}\n$said")
+
+        val bare = nat_ran(kind, nat_cells, "start(s: *State) -> int = s.cell.n", calls)
+
+        assert_eq(bare, "1\n", nat_where(kind))
+
+@test("a nested '@crossing' naming something that is not a parameter is refused")
+nat_crossing_names()
+    if xvr_no_library() then return
+
+    for kind in 0..<nat_kinds()
+        val said = nat_said(kind, "", "@crossing(nope)\nhand(x: int) -> int = x", "print(hand(1))")
+
+        assert(said.contains("error: '@crossing' names 'nope', which is not a parameter of 'hand' — its " +
+                             "parameters are 'x'"), s"${nat_where(kind)}\n$said")
+
+// -- what a nested function may not carry --------------------------------------------------------------
+
+private nat_refusal(word: string, name: string, tail: string) -> string =
+    s"error: '$word' holds a top-level function, and '$name' is declared inside another function$tail"
+
+@test("'@export' and '@section' above a nested function are refused, and both are told")
+nat_placement_is_refused()
+    if xvr_no_library() then return
+
+    for kind in 0..<nat_kinds()
+        val said = nat_said(kind, "", "@export(\"hook\")\n@section(\".fast\")\nhook(x: int) -> int = x",
+                            "print(hook(1))")
+
+        assert(said.contains(nat_refusal("@export", "hook", ", so it has no symbol of its own — it is called " +
+                                         "with the frame of the function around it, which no caller from C " +
+                                         "could hand it. Write '@export' above a top-level function")),
+               s"${nat_where(kind)}\n$said")
+        assert(said.contains(nat_refusal("@section", "hook", ", so its code is lowered with the frame of the " +
+                                         "function around it rather than placed on its own. Write '@section' " +
+                                         "above a top-level function")), s"${nat_where(kind)}\n$said")
+
+@test("'@test', a test hook and 'interrupt' on a nested function are refused")
+nat_called_on_its_own_is_refused()
+    if xvr_no_library() then return
+
+    for kind in 0..<nat_kinds()
+        val test = nat_said(kind, "", "@test(\"inner\")\nt() = assert(true)", "print(1)")
+
+        assert(test.contains(nat_refusal("@test", "t", " — the runner calls a test on its own, and this one " +
+                                         "is called only with the frame of the function around it. Write the " +
+                                         "test at the top level")), s"${nat_where(kind)}\n$test")
+
+        val hook = nat_said(kind, "", "@teardown\nt() = ()", "print(1)")
+
+        assert(hook.contains(nat_refusal("@teardown", "t", " — the runner calls a hook on its own, and this " +
+                                         "one is called only with the frame of the function around it. Write " +
+                                         "'@teardown' above a top-level function")), s"${nat_where(kind)}\n$hook")
+
+        val handler = nat_said(kind, "", "interrupt handler() = ()", "print(1)")
+
+        assert(handler.contains(nat_refusal("interrupt", "handler", " — the processor enters a handler on its " +
+                                            "own, and this one is called only with the frame of the function " +
+                                            "around it. Write the handler at the top level")),
+               s"${nat_where(kind)}\n$handler")
+
+// -- the names a diagnostic gives -----------------------------------------------------------------------
+
+@test("a nested function reaching what blocks is named by its path, and so is a closure written in one")
+nat_names_blocks()
+    if xvr_no_library() then return
+
+    val prelude = "@no_block\n\n@blocks\nsleepy() -> int = 1\n\n"
+
+    for kind in 0..<nat_kinds()
+        val said = nat_said(kind, prelude, "with() -> int\n    val f = () -> sleepy()\n    f()", "print(with())")
+
+        assert(said.contains(s"this reaches the closure in '${nat_path(kind)}.with', which blocks through " +
+                             "'sleepy'"), s"${nat_where(kind)}\n$said")
+        assert(!said.contains("$"), s"${nat_where(kind)}\n$said")
+
+@test("a nested '@pinned' function is named by its path where a call of it is refused")
+nat_names_pinned()
+    if xvr_no_library() then return
+
+    for kind in 0..<nat_kinds()
+        val said = nat_said(kind, "", "@pinned\nwork() = ()", "work()")
+
+        assert(said.contains(s"'${nat_path(kind)}.work' is '@pinned'"), s"${nat_where(kind)}\n$said")
+        assert(!said.contains("$"), s"${nat_where(kind)}\n$said")
+
+@test("a closure written in a top-level function, and one in the entry file's statements, say where they are")
+nat_names_closures()
+    if xvr_no_library() then return
+
+    val prelude = "@no_block\n\n@blocks\nsleepy() -> int = 1\n\n"
+    val inside = xvr_ir([("main.sysl", prelude + "with() -> int\n    val f = () -> sleepy()\n    f()\n\nprint(with())\n")])
+
+    assert(inside.contains("this reaches the closure in 'with', which blocks through 'sleepy'"), inside)
+    assert(!inside.contains("$"), inside)
+
+    val entry = xvr_ir([("main.sysl", prelude + "val f = () -> sleepy()\n\nprint(f())\n")])
+
+    assert(entry.contains("this reaches a closure the entry file's statements wrote, which blocks through " +
+                          "'sleepy'"), entry)
+    assert(!entry.contains("$"), entry)
+
+@test("a function at the top of the entry file that reads its bindings is named as it is written")
+nat_names_entry_nested()
+    if xvr_no_library() then return
+
+    val said = xvr_ir([("main.sysl", "var k = 1\n\n@ghost\nspec() -> int = k\n\nprint(spec())\n")])
+
+    assert(said.contains("error: 'spec' is '@ghost'"), said)
+    assert(!said.contains("$"), said)
+
+@test("an instantiation of a generic nested function is named by the path it was written at")
+nat_names_generic_nested()
+    if xvr_no_library() then return
+
+    for kind in 0..<nat_kinds()
+        val said = nat_said(kind, "", "helper[U](x: U) -> U = x\n\n@pure\nprobe_fn(x: int) -> int = helper(x)",
+                            "print(probe_fn(1))")
+
+        assert(said.contains(s"calls '${nat_path(kind)}.helper'"), s"${nat_where(kind)}\n$said")
+        assert(!said.contains("$"), s"${nat_where(kind)}\n$said")

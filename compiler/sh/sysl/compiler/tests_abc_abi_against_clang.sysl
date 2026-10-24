@@ -272,13 +272,40 @@ private abc_sysl_says(t: Target, library: Buf[Program], s: AbcShape) -> string
     ir_print_module(codegen_with_gaps(prune(strip_tests(whole), program_own(units)), t, promotions).0)
 end abc_sysl_says
 
-@test("every machine agrees with clang about every shape, returning it and passing it")
-abc_every_machine_agrees_with_clang()
+// **The machines are dealt into `AbcParts` tests, each asking every shape of three of them.** Each
+// question is a clang run and an analysis of the standard module with the shape beside it, about a
+// quarter of a second; a shape list over every machine is seven hundred of them, three minutes alone
+// and past the runner's five once the rest of the suite is running beside it. Dealt out, the parts
+// run side by side as any other tests do, and each is a few dozen seconds however loaded the machine.
+private const AbcParts: usize = 7
+
+private abc_shapes_in(part: usize)
     val shapes = abc_shapes()
 
     assert_eq(shapes.len(), 36)
-    abc_ask(shapes)
-end abc_every_machine_agrees_with_clang
+    abc_ask(shapes, part)
+end abc_shapes_in
+
+@test("every machine agrees with clang about every shape, returning it and passing it, part 1")
+abc_every_machine_agrees_with_clang_1() = abc_shapes_in(0)
+
+@test("every machine agrees with clang about every shape, returning it and passing it, part 2")
+abc_every_machine_agrees_with_clang_2() = abc_shapes_in(1)
+
+@test("every machine agrees with clang about every shape, returning it and passing it, part 3")
+abc_every_machine_agrees_with_clang_3() = abc_shapes_in(2)
+
+@test("every machine agrees with clang about every shape, returning it and passing it, part 4")
+abc_every_machine_agrees_with_clang_4() = abc_shapes_in(3)
+
+@test("every machine agrees with clang about every shape, returning it and passing it, part 5")
+abc_every_machine_agrees_with_clang_5() = abc_shapes_in(4)
+
+@test("every machine agrees with clang about every shape, returning it and passing it, part 6")
+abc_every_machine_agrees_with_clang_6() = abc_shapes_in(5)
+
+@test("every machine agrees with clang about every shape, returning it and passing it, part 7")
+abc_every_machine_agrees_with_clang_7() = abc_shapes_in(6)
 
 // **C bitfield structs by value** (`docs/design/bitfields.md` §6): the twelve shapes of
 // `bitfield-probes/abi.c`, then the ones that tell each convention's reading of a bitfield apart --
@@ -349,30 +376,63 @@ end abc_bit_shapes
 private abc_held(w: string, before: string, cbefore: string, s: string, c: string) -> AbcShape =
     AbcShape(w, s, c, false, "struct", before, cbefore)
 
-@test("every machine agrees with clang about a C bitfield struct, returning it and passing it")
-abc_bitfield_structs_agree_with_clang()
+private abc_bit_shapes_in(part: usize)
     val shapes = abc_bit_shapes()
 
     assert_eq(shapes.len(), 34)
-    abc_ask(shapes)
-end abc_bitfield_structs_agree_with_clang
+    abc_ask(shapes, part)
+end abc_bit_shapes_in
 
-// Each shape on each machine sysl builds for with clang, sysl's `declare`s against clang's.
-private abc_ask(shapes: Buf[AbcShape])
+@test("every machine agrees with clang about a C bitfield struct, returning it and passing it, part 1")
+abc_bitfield_structs_agree_with_clang_1() = abc_bit_shapes_in(0)
+
+@test("every machine agrees with clang about a C bitfield struct, returning it and passing it, part 2")
+abc_bitfield_structs_agree_with_clang_2() = abc_bit_shapes_in(1)
+
+@test("every machine agrees with clang about a C bitfield struct, returning it and passing it, part 3")
+abc_bitfield_structs_agree_with_clang_3() = abc_bit_shapes_in(2)
+
+@test("every machine agrees with clang about a C bitfield struct, returning it and passing it, part 4")
+abc_bitfield_structs_agree_with_clang_4() = abc_bit_shapes_in(3)
+
+@test("every machine agrees with clang about a C bitfield struct, returning it and passing it, part 5")
+abc_bitfield_structs_agree_with_clang_5() = abc_bit_shapes_in(4)
+
+@test("every machine agrees with clang about a C bitfield struct, returning it and passing it, part 6")
+abc_bitfield_structs_agree_with_clang_6() = abc_bit_shapes_in(5)
+
+@test("every machine agrees with clang about a C bitfield struct, returning it and passing it, part 7")
+abc_bitfield_structs_agree_with_clang_7() = abc_bit_shapes_in(6)
+
+// Each shape on each machine of this part that sysl builds for with clang, sysl's `declare`s against
+// clang's. The machines are counted out of all of them first, so every part answers for the roster
+// being twenty-one, and a machine added or lost fails each part rather than shifting the deal.
+private abc_ask(shapes: Buf[AbcShape], part: usize)
     val root = std_root() match
         Err(why) -> skip(s"the standard module's source is not on this machine: $why")
         Ok(r) -> r
 
+    var dealt: Buf[Target] = buf()
+
+    for t in all_targets()
+        if t.supported() && t.builds_with_clang() then dealt.push(t)
+
+    assert_eq(dealt.len(), 21)
+
     val cc = abc_oracle()
     val backends = clang_backends(cc)
-    val all = all_targets()
     val dir = make_temp_dir("sysl-abi-").unwrap()
     var asked: usize = 0
     var machines: usize = 0
     var passed_over: usize = 0
+    var mine: usize = 0
 
-    for t in all
-        if !t.supported() || !t.builds_with_clang() then continue
+    for i in 0..<dealt.len()
+        if i % AbcParts != part then continue
+
+        val t = dealt.at(i)
+
+        mine += 1
 
         if !abc_has(backends, cpu_backend(t.cpu))
             print(s"not asked: '$cc' has no '${cpu_backend(t.cpu)}' back end, which '${t.name}' needs")
@@ -408,10 +468,11 @@ private abc_ask(shapes: Buf[AbcShape])
 
     remove_dir_all(dir).unwrap_or(())
 
-    // Every shape on each of the twenty-one machines sysl builds for with clang. A machine whose back
-    // end this clang lacks was named above; where that is every one, nothing was measured at all.
+    // Every shape on each of this part's three machines. A machine whose back end this clang lacks was
+    // named above; where that is every one, nothing was measured at all.
     if machines == 0 then skip(s"'$cc' has none of the back ends these machines need")
 
-    assert_eq(machines + passed_over, 21)
+    assert_eq(mine, 21 / AbcParts)
+    assert_eq(machines + passed_over, mine)
     assert_eq(asked, machines * shapes.len())
 end abc_ask
