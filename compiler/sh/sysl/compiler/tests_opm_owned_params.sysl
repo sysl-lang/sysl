@@ -79,6 +79,18 @@ opm_last_use_moves()
     opm_no_traffic(ir)
     assert(ir.contains("@wrap.owned("), ir)
 
+@test("a string made by + or a format hole is a temporary, handed over to an owned parameter with no pair")
+opm_string_temp_moves()
+    val src = "struct D\n    m: string\n\nmk(m: string) -> D = D(m)\n\n" +
+              "cat(a: string, b: string) -> usize = mk(a + b).m.len\n\nhole(v: int) -> usize = mk(f\"${v}%05d\").m.len\n"
+
+    for symbol in ["cat", "hole"]
+        val ir = opm_ir(src, symbol)
+
+        assert(ir.contains("@mk.owned("), ir)
+        assert_eq(opm_takes(ir), 0)
+        assert_eq(opm_count(ir, "call void @arc.release_maybe("), 0)
+
 @test("a local used again after the call is retained for it, and released at the scope's end")
 opm_not_last_use_retains()
     val ir = opm_ir("again(v: int) -> int\n    val x: &Node = Node(v)\n    val w = wrap(x)\n    w.n.v + x.v\n",
@@ -241,9 +253,15 @@ private val opm_bufs: string = raw"""
             val x: &Node = Node(i)
             b.push(x)
 
+    cstyle(b: *Buf[&Node])
+        for var i = 0; i < 2; i += 1
+            val x: &Node = Node(i)
+            b.push(x)
+
     var b: Buf[&Node] = buf()
     fill(&b, 1)
     looped(&b)
+    cstyle(&b)
     print(b.len())
     """
 
@@ -259,13 +277,14 @@ opm_push_moves()
 
 @test("a local declared in a for body and pushed at its last use moves every round")
 opm_loop_push_moves()
-    val ir = opm_program_ir(opm_bufs, "looped")
+    for symbol in ["looped", "cstyle"]
+        val ir = opm_program_ir(opm_bufs, symbol)
 
-    if ir == "skipped" then return
+        if ir == "skipped" then return
 
-    assert(ir.contains("@sysl.buf$Buf.push.ref.Node.owned("), ir)
-    assert_eq(opm_count(ir, "call void @arc.retain("), 0)
-    assert_eq(opm_count(ir, "call void @arc.release("), 0)
+        assert(ir.contains("@sysl.buf$Buf.push.ref.Node.owned("), ir)
+        assert_eq(opm_count(ir, "call void @arc.retain("), 0)
+        assert_eq(opm_count(ir, "call void @arc.release("), 0)
 
 private val opm_indirect: string = raw"""
     struct Node
@@ -421,6 +440,25 @@ opm_counted_heap()
                 b.push(x)
             b.len()
 
+        each(from: Buf[&Tag]) -> usize
+            var b: Buf[&Tag] = buf()
+            for t in from
+                b.push(t)
+            b.len()
+
+        each_view(from: Buf[&Tag]) -> usize
+            var b: Buf[&Tag] = buf()
+            for t in from.view()
+                b.push(t)
+            b.len()
+
+        cstyle() -> usize
+            var b: Buf[&Tag] = buf()
+            for var i = 0; i < 2; i += 1
+                val x: &Tag = Tag(60 + i)
+                b.push(x)
+            b.len()
+
         async akeep(t: &Tag) -> Box2 = Box2(t)
 
         async adrive() -> int
@@ -450,6 +488,11 @@ opm_counted_heap()
             print("deferred", deferred())
             print("arm", arm(0), arm(1))
             print("looped", looped())
+            var src: Buf[&Tag] = buf()
+            src.push(Tag(70))
+            src.push(Tag(71))
+            print("each", each(src), each_view(src))
+            print("cstyle", cstyle())
             print("async", block_on(adrive()))
             print("end")
         """, [])
@@ -458,7 +501,8 @@ opm_counted_heap()
                      "drop 7\ndrop 6\ntwice 8 8\nopt 1\ndrop 9\ntup 10\ndrop 10\nboth 1\ndrop 12\ndrop 11\n" +
                      "early drop 30\ntrue true\ndrop 30\nfallible drop 31\ntrue drop 31\n31\n" +
                      "deferred deferred 32\ndrop 32\n32\narm drop 33\n33 drop 33\n0\n" +
-                     "looped drop 42\ndrop 41\ndrop 40\n3\nasync drop 50\n50\nend\ndrop 8\n")
+                     "looped drop 42\ndrop 41\ndrop 40\n3\neach 2 2\ncstyle drop 61\ndrop 60\n2\n" +
+                     "async drop 50\n50\nend\ndrop 71\ndrop 70\ndrop 8\n")
     assert(!ran.1.contains("still live"), ran.1)
 
 // -- across a separately compiled library ------------------------------------------------------------------
