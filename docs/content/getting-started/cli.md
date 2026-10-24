@@ -407,6 +407,13 @@ does not also run `clamps.sysl`. `--filter` and `--file` are independent: given 
 match each. A refused program under `tests/refused/` is a file of its own, so `--file` selects one
 the same way.
 
+**`--keep-binary <dir>` leaves a copy of the test binary in `<dir>`** as `<project>-tests` and prints
+`kept: <path>`. A binary replayed from the run cache is copied too; the cache entry stays. **A
+`-fsanitize=` in `SYSL_EXTRA_CFLAGS` is confirmed before any test runs**: the report starts with
+`instrumented: address (1 binary)`, and a binary holding none of the sanitizer's runtime references
+(`__asan_report`, `__tsan_func_entry`, `__msan_warning`, `__hwasan_`) is refused. `undefined` is
+reported when present and never refused, since sysl's own code is not instrumented by UBSan.
+
 **Tests run in parallel — one per processor, or `--jobs <n>`** — and the report is identical to a
 sequential run's: each row waits for every row above it, so rows appear in source order, and
 `--jobs 1` runs them sequentially. Each test already has its own process, so running them in

@@ -20,7 +20,7 @@ val Misused: int = 2
 
 // What `sysl --version` answers. Written here as well as in `package.hocon`, because a program is
 // handed nothing about its own manifest; the test beside this file keeps the two in step.
-const Version: string = "0.5.5"
+const Version: string = "0.5.6"
 
 // The answer to a command line: the lines to say, and the status to exit with. What
 // `--explain-escapes` reports is said on the same channel, in the order it was found.
@@ -967,6 +967,7 @@ private test_command(args: []string, say: string -> unit, note: string -> unit,
     var cc: Option[string] = None
     var filter: Option[string] = None
     var within: Option[string] = None
+    var keep: Option[string] = None
     var fail_fast = false
     var std = false
     var seconds: Option[int] = None
@@ -1019,7 +1020,8 @@ private test_command(args: []string, say: string -> unit, note: string -> unit,
                 None ->
                     mistakes.push(bad_jobs(args[i]))
                     break
-        else if args[i] == "--target" || args[i] == "--cc" || args[i] == "--filter" || args[i] == "--file"
+        else if args[i] == "--target" || args[i] == "--cc" || args[i] == "--filter" || args[i] == "--file" ||
+                args[i] == "--keep-binary"
             if i + 1 >= args.len
                 mistakes.push(missing_value(args[i]))
                 break
@@ -1032,6 +1034,7 @@ private test_command(args: []string, say: string -> unit, note: string -> unit,
             if flag == "--target" then named = Some(args[i])
             else if flag == "--cc" then cc = Some(args[i])
             else if flag == "--file" then within = Some(args[i])
+            else if flag == "--keep-binary" then keep = Some(args[i])
             else filter = Some(args[i])
         else if args[i] == "--fail-fast"
             fail_fast = true
@@ -1100,9 +1103,9 @@ private test_command(args: []string, say: string -> unit, note: string -> unit,
     val asked = TestAsked(jobs, seconds)
 
     projects match
-        None -> test_project(file, named, cc, opts, asked, std, named_level, note, report, within)
+        None -> test_project(file, named, cc, opts, asked, std, named_level, note, report, within, keep)
         Some(members) -> test_members(members, named, cc, opts, asked, std, named_level, say, note,
-                                      report, within)
+                                      report, within, keep)
 end test_command
 
 // `--timeout`'s value: a whole number of seconds, zero for no limit, up to the most a test's own
@@ -1166,7 +1169,7 @@ private bad_timeout(text: string) -> string =
 private test_members(members: Buf[WorkspaceMember], named: Option[string], cc: Option[string],
                      opts: TestOptions, asked: TestAsked, std: bool, named_level: Option[string],
                      say: string -> unit, note: string -> unit, report: string -> unit,
-                     within: Option[string]) -> int
+                     within: Option[string], keep: Option[string]) -> int
     var failed: Buf[string] = buf()
     var tested: usize = 0
 
@@ -1174,7 +1177,7 @@ private test_members(members: Buf[WorkspaceMember], named: Option[string], cc: O
         say(s"testing ${mb.name} (${mb.dir})")
         tested += 1
 
-        if test_project(mb.dir, named, cc, opts, asked, std, named_level, note, report, within) != Fine
+        if test_project(mb.dir, named, cc, opts, asked, std, named_level, note, report, within, keep) != Fine
             failed.push(mb.name)
 
             if opts.fail_fast then break
@@ -1192,7 +1195,7 @@ end test_members
 // One project's suite, once the command line has been read.
 private test_project(file: string, named: Option[string], cc: Option[string], given: TestOptions,
                      asked: TestAsked, std: bool, named_level: Option[string], note: string -> unit,
-                     report: string -> unit, within: Option[string]) -> int
+                     report: string -> unit, within: Option[string], keep: Option[string]) -> int
     // The package's own `test` block, under whatever the command line said.
     val settings = test_settings_of(file)
 
@@ -1233,7 +1236,7 @@ private test_project(file: string, named: Option[string], cc: Option[string], gi
     val run = RefusedRun(if std then buf() else refused_files(file), named, level)
 
     cached_test_build(key) match
-        Some(hit) -> return tests_run(file, hit.0, hit.1, opts, seconds, false, run, note, report, within)
+        Some(hit) -> return tests_run(file, hit.0, hit.1, opts, seconds, false, run, note, report, within, keep)
         None -> ()
 
     // What this build's C reads is gathered afresh: it is part of where the binary is kept.
@@ -1260,7 +1263,7 @@ private test_project(file: string, named: Option[string], cc: Option[string], gi
 
     // Refused programs and no `@test` function the filter keeps: there is no binary to link.
     if selected_in(build.tests, opts.filter, within).is_empty()
-        return tests_run(file, "", build.tests, opts, seconds, false, run, note, report, within)
+        return tests_run(file, "", build.tests, opts, seconds, false, run, note, report, within, keep)
 
     val made = build_test_binary_cached(file, build, cc, level, key) match
         Err(refusal) ->
@@ -1272,7 +1275,7 @@ private test_project(file: string, named: Option[string], cc: Option[string], gi
     // died between the two leaves a slot the next one rebuilds rather than one it half believes.
     if made.1 then write_test_list_at(made.0, build.tests)
 
-    tests_run(file, made.0, build.tests, opts, seconds, !made.1, run, note, report, within)
+    tests_run(file, made.0, build.tests, opts, seconds, !made.1, run, note, report, within, keep)
 end test_project
 
 // What a project's refused programs are compiled with: the files, and the run's own target and
@@ -1313,10 +1316,32 @@ end nothing_to_run
 // whole point of it being there. `exe` is empty where no `@test` function was chosen.
 private tests_run(file: string, exe: string, all: Buf[TTest], opts: TestOptions, seconds: int,
                   discard: bool, run: RefusedRun, note: string -> unit, report: string -> unit,
-                  within: Option[string]) -> int
+                  within: Option[string], keep: Option[string]) -> int
     nothing_to_run(file, all, run.files, opts.filter, within, note) match
         Some(code) -> return code
         None -> ()
+
+    // The binary the run uses -- fresh or replayed -- is confirmed to carry any sanitizer asked for, and
+    // copied where `--keep-binary` said, before a test runs or the binary is discarded.
+    if exe != ""
+        checked_instrumentation(exe, extra_cflags()) match
+            Err(why) ->
+                note(refused(why))
+                if discard then discard_test_binary(exe)
+                return Failed
+            Ok(line) -> line match
+                Some(text) -> report(text + "\n")
+                None -> ()
+
+        keep match
+            Some(dir) -> kept_binary(exe, dir, file) match
+                Err(why) ->
+                    note(refused(why))
+                    if discard then discard_test_binary(exe)
+                    return Failed
+                Ok(to) -> report(s"kept: $to\n")
+            None -> ()
+    end if
 
     val chosen = selected_in(all, opts.filter, within)
     val picked = selected_refused(run.files, opts.filter, within)
@@ -1338,7 +1363,7 @@ private tests_run(file: string, exe: string, all: Buf[TTest], opts: TestOptions,
     if failed == 0 then Fine else Failed
 end tests_run
 
-private test_usage() -> string = "usage: sysl test [--filter <text>] [--file <name>] [--fail-fast] [--jobs <n>] [--timeout <seconds>] [--std] " +
+private test_usage() -> string = "usage: sysl test [--filter <text>] [--file <name>] [--keep-binary <dir>] [--fail-fast] [--jobs <n>] [--timeout <seconds>] [--std] " +
     "[-p <member>] [--target <name>] [--cc <path>] [-O<level>] " + where_flags() + " " + feature_flags() + " " +
     "[--option <name=value>] " + pipeline_usage() + " [<path>]"
 
