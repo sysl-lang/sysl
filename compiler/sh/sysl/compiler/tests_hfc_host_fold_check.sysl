@@ -1,0 +1,548 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+import sysl.testing.skip
+import sysl.fs.write_text
+
+// **A hosted build warns exactly where a bare-metal build of the same package and entry refuses**
+// (`check_bare_metal_storage`): computed module storage reached from a way in that no `main` runs
+// before. Every cell builds the package twice -- once for the host, once for a freestanding machine --
+// and holds the two answers to each other, so the prediction cannot drift from the refusal.
+
+private val hfc_thumb: string = "thumb-freestanding-softfp"
+private val hfc_bare: string = "aarch64-freestanding"
+
+private val hfc_package: string = "package { name = \"hfc\", version = \"0.0.1\" }\n"
+
+// The declarations every storage fixture may use.
+private val hfc_prelude: string = raw"""
+    module k
+
+    struct Pair
+        a: int
+        b: int
+
+    impl Pair
+        sum(self) -> int = self.a + self.b
+
+    enum Ec: u6
+        Unknown = 0x00
+        Brk = 0x3c
+
+    @packed
+    struct Syndrome
+        low: u26
+        ec: Ec
+        high: u32
+
+    enum Mode
+        Off = 0
+        On
+
+    type Small = u8 within 0..10
+
+    const half(x: int) -> int = x / 2
+
+    var counter = 3
+
+    ticks() -> int
+        var n = 0
+
+        for i in 0..<counter
+            n += i
+
+        n
+
+    """
+
+// A library module `k` holding the prelude, `decl`, and an export reading it through `use`.
+private hfc_library(decl: string, use: string) -> string =
+    lbr_tree(lbr_two("k/k.sysl", hfc_prelude + decl + "\n\n@export(\"probe\")\nprobe() -> int = " + use + "\n",
+                     "sysl.hocon", hfc_package))
+
+private hfc_c(p: string, target: string) -> (int, string)
+    val out = s"${if p.ends_with(".sysl") then parent_of(p).unwrap_or(p) else p}/out.a"
+
+    if target == ""
+        var args: [5]string = ["sysl", "build-c", "-o", out, p]
+
+        return lbr_cli(args[..])
+    end if
+
+    var args: [7]string = ["sysl", "build-c", "--target", target, "-o", out, p]
+
+    lbr_cli(args[..])
+end hfc_c
+
+private hfc_llvm(p: string, target: string) -> (int, string)
+    if target == ""
+        var args: [3]string = ["sysl", "emit-llvm", p]
+
+        return lbr_cli(args[..])
+    end if
+
+    var args: [5]string = ["sysl", "emit-llvm", "--target", target, p]
+
+    lbr_cli(args[..])
+end hfc_llvm
+
+private hfc_warned(said: (int, string)) -> bool = said.0 == 0 && said.1.contains("warning: ")
+private hfc_refused(said: (int, string)) -> bool = said.0 != 0 && said.1.contains("error: ")
+
+// One storage fixture through both builds: the host's warning and the thumb archive's refusal agree,
+// and where storage is computed the host names the same reasons the refusal does.
+private hfc_kind(decl: string, use: string, folds: bool, reason: string)
+    if !lbr_ready() then return
+
+    val p = hfc_library(decl, use)
+    val host = hfc_c(p, "")
+    val thumb = hfc_c(p, hfc_thumb)
+
+    assert(host.0 == 0, host.1)
+
+    if folds
+        assert(!hfc_warned(host), host.1)
+        assert(thumb.0 == 0, thumb.1)
+    else
+        assert(hfc_warned(host), host.1)
+        assert(hfc_refused(thumb), thumb.1)
+
+        // The same reasons, whole, in both: after the refusal's advice, and before the warning's.
+        assert(thumb.1.contains(s"laid straight into the object file. $reason\n"), thumb.1)
+        assert(host.1.contains(s"statements run. $reason. A C archive"), host.1)
+    end if
+
+    lbr_drop([p])
+end hfc_kind
+
+// -- each initializer kind ------------------------------------------------------------------------
+
+@test("a literal folds on both")
+hfc_literal() = hfc_kind("val x = 5", "x", true, "")
+
+@test("a var over a literal folds on both")
+hfc_var_literal() = hfc_kind("var x = 5", "x", true, "")
+
+@test("a constrained conversion folds on both")
+hfc_conversion() = hfc_kind("val x: Small = Small(3)", "int(x)", true, "")
+
+@test("a ptr_cast to a device address folds on both")
+hfc_device() = hfc_kind("val x: *Pair = ptr_cast(0x4000_0000)", "x.a", true, "")
+
+@test("a const call folds on both")
+hfc_const_call() = hfc_kind("val x = half(10)", "x", true, "")
+
+@test("a member call on a constant construction folds on both")
+hfc_member_call() = hfc_kind("val x = Pair(1, 2).sum()", "x", true, "")
+
+@test("a field of a constant construction folds on both")
+hfc_field() = hfc_kind("val x = Pair(1, 2).a", "x", true, "")
+
+@test("a val over a slice literal folds on both")
+hfc_val_slice() = hfc_kind("val x: []int = [1, 2, 3]", "x[0]", true, "")
+
+@test("a val box folds on both")
+hfc_val_box() = hfc_kind("val x: &Pair = Pair(3, 4)", "x.a", true, "")
+
+@test("a c-string folds on both")
+hfc_c_string() = hfc_kind("val x = c\"probe\"", "int(x[0])", true, "")
+
+@test("T::Bits of a constant folds on both")
+hfc_bits() = hfc_kind("val x = Syndrome::Bits(u64(0x3c) << 26)", "int(x.high)", true, "")
+
+@test("an Option None folds on both")
+hfc_option() = hfc_kind("val x: Option[int] = None", "x.unwrap_or(0)", true, "")
+
+@test("an enum zero folds on both")
+hfc_enum() = hfc_kind("val x: Mode = Mode.Off", "if x == Mode.Off then 1 else 0", true, "")
+
+@test("a multi-name val over constants folds on both")
+hfc_multi_const() = hfc_kind("val (x, y) = (1, 2)", "x + y", true, "")
+
+@test("a var over a slice literal warns on the host and is refused on thumb, for the same reason")
+hfc_var_slice() =
+    hfc_kind("var x: []int = [1, 2, 3]", "x[0]", false,
+             "'x' is a 'var' over a slice literal, and a 'var' builds its view when the program starts, " +
+             "being storage the program reassigns — a 'val' over the same literal is laid down")
+
+@test("a var box warns on the host and is refused on thumb, for the same reason")
+hfc_var_box() =
+    hfc_kind("var x: &Pair = Pair(3, 4)", "x.a", false,
+             "'x' holds a reference, and a 'var' gives its share back when it is assigned, so its box is " +
+             "made when the program starts — a module 'val' holds one laid down")
+
+@test("a val reading a var warns on the host and is refused on thumb, for the same reason")
+hfc_reads_var() =
+    hfc_kind("val x = counter + 1", "x", false,
+             "'x' reads 'k.counter', a module 'var', whose value is whatever the program last wrote to it")
+
+@test("a var reading a var warns on the host and is refused on thumb, for the same reason")
+hfc_var_reads_var() =
+    hfc_kind("var x = counter + 2", "x", false,
+             "'x' reads 'k.counter', a module 'var', whose value is whatever the program last wrote to it")
+
+@test("a call to a function that is not const warns on the host and is refused on thumb")
+hfc_nonconst_call() =
+    hfc_kind("val x = ticks()", "x", false,
+             "'x' cannot be computed while compiling: 'k.counter' is filled when the program runs " +
+             "(k.sysl:33:18) — inside 'k.ticks()', called at k.sysl:38:9")
+
+@test("a multi-name val over a call names each name it binds")
+hfc_multi_call() =
+    hfc_kind("val (x, y) = (ticks(), 2)", "x + y", false,
+             "'x' cannot be computed while compiling: the value the binding takes apart is filled when " +
+             "the program runs (k.sysl:38:14). 'y' cannot be computed while compiling: the value the " +
+             "binding takes apart is filled when the program runs (k.sysl:38:14)")
+
+@test("a multi-name var reading a var names each name it binds")
+hfc_multi_var() =
+    hfc_kind("var (x, y) = (counter, 4)", "x + y", false,
+             "'x' cannot be computed while compiling: the value the binding takes apart is filled when " +
+             "the program runs (k.sysl:38:14). 'y' cannot be computed while compiling: the value the " +
+             "binding takes apart is filled when the program runs (k.sysl:38:14)")
+
+// -- the whole text, and the image -----------------------------------------------------------------
+
+private val hfc_storage: string = "module k\n" + hfc_storage_body
+
+private val hfc_storage_body: string = raw"""
+
+    var step = 1
+
+    private sum_to(n: int) -> int
+        var total = 0
+
+        for i in 0..<n
+            total += i * step
+
+        total
+
+    val base = sum_to(3)
+
+    """
+
+@test("the archive warning says the export, the storage, why it is computed, and the way out")
+hfc_archive_text()
+    if !lbr_ready() then return
+
+    val p = lbr_tree(lbr_two("k/k.sysl", hfc_storage + "@export(\"read_base\")\nread_base() -> int = base\n",
+                             "sysl.hocon", hfc_package))
+    val host = hfc_c(p, "")
+
+    assert(host.0 == 0, host.1)
+    assert(host.1.contains("warning: 'k.read_base' is exported and reaches 'k.base', which is module " +
+                           "storage an initializer fills before the program's own statements run. 'base' " +
+                           "cannot be computed while compiling: 'k.step' is filled when the program runs " +
+                           "(k.sysl:9:22) — inside 'k.sum_to(3)', called at k.sysl:13:12. A C archive of " +
+                           "this package for a freestanding target has no loader to run that initializer, " +
+                           "so a bare-metal build refuses this export. Make the initializer constant data, " +
+                           "which is laid straight into the object file, or, for a package that never runs " +
+                           "on a bare machine, say so with 'requires { os = true }' in sysl.hocon\n"), host.1)
+
+    // `sysl emit-llvm`, a hosted program build, warns about the same export: a library is a C archive
+    // on a bare machine.
+    val text = hfc_llvm(p, "")
+
+    assert(hfc_warned(text) && text.1.contains("'k.read_base' is exported and reaches 'k.base'"), text.1)
+    lbr_drop([p])
+end hfc_archive_text
+
+@test("sysl test says the warning")
+hfc_test_says_it()
+    if !lbr_ready() then return
+
+    val p = lbr_tree(lbr_two("k/k.sysl", hfc_storage + "@export(\"read_base\")\nread_base() -> int = base\n" +
+                             "\n@test(\"base\")\nbase_is_three()\n    assert(base == 3)\n",
+                             "sysl.hocon", hfc_package))
+    var args: [3]string = ["sysl", "test", p]
+    val tested = lbr_cli(args[..])
+
+    assert(tested.0 == 0, tested.1)
+    assert(tested.1.contains("warning: 'k.read_base' is exported and reaches 'k.base'"), tested.1)
+    lbr_drop([p])
+end hfc_test_says_it
+
+private hfc_image_manifest(entry: string) -> string =
+    hfc_package + "codegen {\n  general_regs_only = true\n  strict_align = true\n}\n" +
+    s"targets {\n  $hfc_bare {\n    entry = \"$entry\"\n  }\n}\n"
+
+@test("a library whose bare image starts at its own entry warns where the image build refuses")
+hfc_image_entry()
+    if !lbr_ready() then return
+
+    val p = lbr_tree(lbr_two("k/k.sysl", hfc_storage + "@export(\"reset\")\nreset() -> int = base + 1\n",
+                             "sysl.hocon", hfc_image_manifest("reset")))
+    val host = hfc_llvm(p, "")
+    val bare = hfc_llvm(p, hfc_bare)
+
+    assert(host.0 == 0, host.1)
+    assert(host.1.contains("warning: 'k.reset' starts the image and reaches 'k.base', which is module " +
+                           "storage an initializer fills before the program's own statements run. 'base' " +
+                           "cannot be computed while compiling: 'k.step' is filled when the program runs " +
+                           "(k.sysl:9:22) — inside 'k.sum_to(3)', called at k.sysl:13:12. A build for " +
+                           "'aarch64-freestanding' starts at 'reset' ('targets.aarch64-freestanding.entry'), " +
+                           "which never calls 'main', so it refuses this function. Make the initializer " +
+                           "constant data, or build the value where it is used\n"), host.1)
+    assert(hfc_refused(bare) && bare.1.contains("error: 'k.reset' starts the image and reaches 'k.base'"),
+           bare.1)
+
+    // Once, though an export is also what a C archive would refuse.
+    assert(!host.1[(host.1.index_of("warning: ").unwrap() + 1)..].contains("warning: "), host.1)
+    lbr_drop([p])
+end hfc_image_entry
+
+@test("a function the image places for something else to enter is a way in, warned as the image refuses it")
+hfc_image_section()
+    if !lbr_ready() then return
+
+    val p = lbr_tree(lbr_two("k/k.sysl", hfc_storage + "@export(\"reset\")\nreset() -> int = 1\n\n" +
+                             "@section(\".text.irq\")\nirq() -> int = base\n",
+                             "sysl.hocon", hfc_image_manifest("reset")))
+    val host = hfc_llvm(p, "")
+    val bare = hfc_llvm(p, hfc_bare)
+
+    assert(hfc_warned(host) && host.1.contains("'k.irq' is placed for code outside the program to enter " +
+                                               "and reaches 'k.base'"), host.1)
+    assert(hfc_refused(bare) && bare.1.contains("'k.irq' is placed for code outside the program to enter"),
+           bare.1)
+    assert(!host.1.contains("'k.reset'"), host.1)
+    lbr_drop([p])
+end hfc_image_section
+
+// -- a program with a main of its own --------------------------------------------------------------
+
+// The library above, and an entry file whose statement is the program's `main`.
+private hfc_program(manifest: string) -> string
+    var files = lbr_two("k/k.sysl", hfc_storage + "@export(\"read_base\")\nread_base() -> int = base\n",
+                        "sysl.hocon", manifest)
+
+    files.push(("main.sysl", "import k\n\nprint(k.read_base())\n"))
+    lbr_tree(files)
+end hfc_program
+
+@test("a program with a main warns about nothing its image builds, main filling the storage first")
+hfc_program_with_main()
+    if !lbr_ready() then return
+
+    val p = hfc_program(hfc_image_manifest("reset"))
+    val host = hfc_llvm(p, "")
+    val bare = hfc_llvm(p, hfc_bare)
+
+    assert(host.0 == 0 && !hfc_warned(host), host.1)
+    assert(bare.0 == 0, bare.1)
+    lbr_drop([p])
+end hfc_program_with_main
+
+@test("the same program built as a C archive warns, as the bare archive refuses it")
+hfc_program_as_archive()
+    if !lbr_ready() then return
+
+    val p = hfc_program(hfc_package)
+    val host = hfc_c(p, "")
+    val thumb = hfc_c(p, hfc_thumb)
+
+    assert(hfc_warned(host) && host.1.contains("'k.read_base' is exported and reaches 'k.base'"), host.1)
+    assert(hfc_refused(thumb) && thumb.1.contains("'k.read_base' is exported and reaches 'k.base'"), thumb.1)
+    lbr_drop([p])
+end hfc_program_as_archive
+
+@test("a library whose export reaches no computed storage warns about none, and neither build refuses")
+hfc_storage_unreached()
+    if !lbr_ready() then return
+
+    val p = lbr_tree(lbr_two("k/k.sysl", hfc_storage + "@export(\"one\")\none() -> int = 1\n",
+                             "sysl.hocon", hfc_package))
+    val host = hfc_c(p, "")
+    val thumb = hfc_c(p, hfc_thumb)
+
+    assert(host.0 == 0 && !hfc_warned(host), host.1)
+    assert(thumb.0 == 0, thumb.1)
+    lbr_drop([p])
+end hfc_storage_unreached
+
+// A start file branching to the initializer before anything reads the storage. (An `extern` naming it
+// is refused on a hosted target, whose archive's constructor fills the storage itself.)
+private val hfc_runtime_start: string = raw"""
+    asm
+        [aarch64]
+            ".globl crt_reset"
+            "crt_reset:"
+            "bl sysl_init_modules"
+            "b ."
+        [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "aarch64 only"
+
+    """
+
+@test("a C runtime whose start calls sysl_init_modules warns about nothing")
+hfc_runtime_fills_it()
+    if !lbr_ready() then return
+    if host_target().cpu != Aarch64 then skip("the start file is aarch64 assembly")
+
+    val p = lbr_tree(lbr_two("k/k.sysl", hfc_storage + hfc_runtime_start +
+                             "@export(\"crt_start\")\ncrt_start() -> int = base\n",
+                             "sysl.hocon", hfc_image_manifest("crt_reset")))
+    val host = hfc_c(p, "")
+    val bare = hfc_c(p, hfc_bare)
+
+    assert(host.0 == 0 && !hfc_warned(host), host.1)
+    assert(bare.0 == 0, bare.1)
+    lbr_drop([p])
+end hfc_runtime_fills_it
+
+// -- the opt-outs ----------------------------------------------------------------------------------
+
+private hfc_opted(manifest: string) -> (int, string)
+    val p = lbr_tree(lbr_two("k/k.sysl", hfc_storage + "@export(\"read_base\")\nread_base() -> int = base\n",
+                             "sysl.hocon", manifest))
+    val host = hfc_c(p, "")
+
+    lbr_drop([p])
+    host
+end hfc_opted
+
+@test("a package that requires an operating system is not warned")
+hfc_requires_os()
+    if !lbr_ready() then return
+
+    val host = hfc_opted(hfc_package + "requires { os = true }\n")
+
+    assert(host.0 == 0 && !hfc_warned(host), host.1)
+end hfc_requires_os
+
+@test("a package that requires posix is not warned")
+hfc_requires_posix()
+    if !lbr_ready() then return
+
+    val host = hfc_opted(hfc_package + "requires { posix = true }\n")
+
+    assert(host.0 == 0 && !hfc_warned(host), host.1)
+end hfc_requires_posix
+
+@test("a package naming only hosted targets is not warned")
+hfc_hosted_targets()
+    if !lbr_ready() then return
+
+    val host = hfc_opted(hfc_package + s"targets {\n  default = \"${host_target().name}\"\n" +
+                         "  x86_64-linux {}\n}\n")
+
+    assert(host.0 == 0 && !hfc_warned(host), host.1)
+end hfc_hosted_targets
+
+@test("a package naming a hosted target and a freestanding one is warned")
+hfc_mixed_targets()
+    if !lbr_ready() then return
+
+    val host = hfc_opted(hfc_package + s"targets {\n  default = \"${host_target().name}\"\n" +
+                         s"  $hfc_thumb {}\n}\n")
+
+    assert(hfc_warned(host) && host.1.contains("'k.read_base' is exported and reaches 'k.base'"), host.1)
+end hfc_mixed_targets
+
+@test("a loose file with no manifest is not warned")
+hfc_loose_file()
+    if !lbr_ready() then return
+
+    val loose = "var step = 1\n\nval base = step + 1\n\n@export(\"read_base\")\nread_base() -> int = base\n"
+    val p = lbr_tree(lbr_one("main.sysl", loose))
+    val host = hfc_c(s"$p/main.sysl", "")
+
+    assert(host.0 == 0 && !hfc_warned(host), host.1)
+
+    // The same file under a manifest is a package, and is warned.
+    write_text(s"$p/sysl.hocon", hfc_package).unwrap()
+
+    val packaged = hfc_c(p, "")
+
+    assert(hfc_warned(packaged) && packaged.1.contains("'read_base' is exported and reaches 'base'"),
+           packaged.1)
+    lbr_drop([p])
+end hfc_loose_file
+
+@test("an export in a module that requires an operating system is not warned")
+hfc_module_requires_os()
+    if !lbr_ready() then return
+
+    val p = lbr_tree(lbr_two("k/k.sysl", "module k\n@requires(os)\n" + hfc_storage_body +
+                             "@export(\"read_base\")\nread_base() -> int = base\n",
+                             "sysl.hocon", hfc_package))
+    val host = hfc_c(p, "")
+
+    assert(host.0 == 0 && !hfc_warned(host), host.1)
+    lbr_drop([p])
+end hfc_module_requires_os
+
+// -- a dependency's storage ------------------------------------------------------------------------
+
+private hfc_with_root(dep: string, p: string, target: string) -> (int, string)
+    if target == ""
+        var args: [7]string = ["sysl", "build-c", "--lib", dep, "-o", s"$p/out.a", p]
+
+        return lbr_cli(args[..])
+    end if
+
+    var args: [9]string = ["sysl", "build-c", "--lib", dep, "--target", target, "-o", s"$p/out.a", p]
+
+    lbr_cli(args[..])
+end hfc_with_root
+
+private val hfc_dep_export: string = "@export(\"read_base\")\nread_base() -> int = base\n"
+
+// A `--lib` root is handed over as a dependency is, and is passed over the same way (below).
+@test("a --lib root's export reaching its own storage is not warned, though the bare archive refuses it")
+hfc_root_export()
+    if !lbr_ready() then return
+
+    val dep = lbr_tree(lbr_one("k/k.sysl", hfc_storage + hfc_dep_export))
+    val p = lbr_tree(lbr_two("app/app.sysl", "module app\n\nimport k\n\n@export(\"one\")\none() -> int = 1\n",
+                             "sysl.hocon", hfc_package))
+    val host = hfc_with_root(dep, p, "")
+    val thumb = hfc_with_root(dep, p, hfc_thumb)
+
+    assert(host.0 == 0 && !hfc_warned(host), host.1)
+    assert(hfc_refused(thumb) && thumb.1.contains("'k.read_base' is exported and reaches 'k.base'"), thumb.1)
+    lbr_drop([dep, p])
+end hfc_root_export
+
+// A package depending on `k` by path, and `k` holding the storage.
+private hfc_depending(dep_extra: string, app: string) -> (string, string)
+    val dep = lbr_tree(lbr_two("sysl.hocon", "package { name = \"k\", version = \"1.0.0\" }\n",
+                               "k/k.sysl", hfc_storage + dep_extra))
+    val p = lbr_tree(lbr_two("app/app.sysl", "module app\n\nimport k\n\n" + app, "sysl.hocon",
+                             hfc_package + s"dependencies { k { path = \"$dep\" } }\n"))
+
+    (dep, p)
+end hfc_depending
+
+// The one place the warning is deliberately narrower than the refusal: the dependency's author is told
+// by the dependency's own build, and the package depending on it is not told about code it did not
+// write. The bare archive still refuses, naming the dependency's export.
+@test("a dependency's export reaching its own storage is not warned in the package depending on it")
+hfc_dependency_export()
+    if !lbr_ready() then return
+
+    val made = hfc_depending(hfc_dep_export, "@export(\"one\")\none() -> int = k.read_base()\n")
+    val host = hfc_c(made.1, "")
+    val thumb = hfc_c(made.1, hfc_thumb)
+
+    // The package's own export reaching the same storage is warned; the dependency's is not.
+    assert(host.0 == 0 && host.1.contains("warning: 'app.one' is exported and reaches 'k.k.base'"), host.1)
+    assert(!host.1.contains("'k.k.read_base' is exported"), host.1)
+    assert(hfc_refused(thumb) && thumb.1.contains("'k.k.read_base' is exported and reaches 'k.k.base'"),
+           thumb.1)
+    lbr_drop([made.0, made.1])
+end hfc_dependency_export
+
+@test("an export of the package reaching a dependency's storage warns, as the bare archive refuses it")
+hfc_reaches_dependency_storage()
+    if !lbr_ready() then return
+
+    val made = hfc_depending("", "@export(\"two\")\ntwo() -> int = k.base\n")
+    val host = hfc_c(made.1, "")
+    val thumb = hfc_c(made.1, hfc_thumb)
+
+    assert(hfc_warned(host) && host.1.contains("'app.two' is exported and reaches 'k.k.base'"), host.1)
+    assert(hfc_refused(thumb) && thumb.1.contains("'app.two' is exported and reaches 'k.k.base'"), thumb.1)
+    lbr_drop([made.0, made.1])
+end hfc_reaches_dependency_storage

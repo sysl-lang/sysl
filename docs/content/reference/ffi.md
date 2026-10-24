@@ -1293,7 +1293,24 @@ begin() -> i32 = start
 
 `build=c` on that block is not decoration: the refusal is a property of the artifact a **C project**
 links, and the same program built for the same machine as an ordinary program compiles, because a
-program has an entry point to fill the storage in.
+program has an entry point to fill the storage in. The refusal goes on to say why each piece of
+storage it names is not constant data — here, that `counter()` reads `seed`, a `var` whose value is
+whatever the program last wrote to it.
+
+**A hosted build says the same thing as a warning**, so that `sysl test .` on a laptop finds what only
+a board build would otherwise refuse. It warns exactly where a bare-metal build of the same package
+would refuse, at the same function and naming the same storage and reasons:
+
+- an export reaching computed storage, which a freestanding C archive of the package refuses — except
+  a C runtime whose start file calls `sysl_init_modules`;
+- each way into a bare image whose block names an entry other than `main` (`targets.<machine>.entry`),
+  which that image refuses;
+- nothing in a program with a `main` of its own, since a bare image runs `main` and `main` fills the
+  storage first.
+
+It is not said for a package that cannot reach a bare machine: a manifest whose `requires` names `os`
+or `posix`, one that names its targets (`default` and the blocks) and names only hosted ones, and a
+loose file with no `package` block. An export in a module marked `@requires(os)` is passed over too.
 
 ### What the compiler hands the C project
 

@@ -4,7 +4,7 @@ import sh.sysl.parsing.*
 import sysl.buf.{Buf, buf}
 import sysl.container.{Map, map}
 import sysl.math.bigint.from_int
-import sysl.text.Search
+import sysl.text.{Search, from_utf8_unchecked}
 
 // Typing the body a function's declaration is followed by, whatever the body is made of.
 //
@@ -1890,6 +1890,13 @@ private module_storage(a: &Analysis) -> Buf[TVal]
 
                 val computed = !imaged
 
+                // **Why it stayed code is said for every piece of storage that did**, not only one a
+                // `const` call stopped in: a freestanding artifact's refusal and a hosted build's
+                // warning (`emit_checks.sysl`'s `check_bare_metal_storage`) both read it from here,
+                // so the two are one decision told twice.
+                if computed && !cx.an.evaluation.val_stops.has(key) then
+                    cx.an.evaluation.val_stops.put(key, fold_stop(cx, key, d, init.unwrap(), writable))
+
                 if d.thread_local then check_per_thread(cx, d.span, key, ty, computed, init)
                 if d.per_cpu then check_per_core(cx, d.span, key, ty, computed, init)
                 if d.main_thread then check_main_thread(cx, d.span, key)
@@ -2668,6 +2675,106 @@ private written_images(cx: &Analyzer, name: string, xs: Buf[TExpr]) -> Option[Bu
 
     Some(out)
 end written_images
+
+// **Why a module initializer stays code**, as a sentence naming the storage and the part of the
+// initializer that kept it there: the read of a `var`, a call that cannot run while compiling, or
+// whatever else `static_image` gave up on. The part is found by asking `static_image` itself of each
+// piece in turn -- the same question that decided the storage is computed -- so the reason cannot name
+// a piece that would have folded.
+private fold_stop(cx: &Analyzer, key: string, d: ValueDecl, init: TExpr, writable: bool) -> string
+    // By the name the reader wrote, as the `const`-call stops beside it say theirs: the refusal it
+    // follows has already named the storage in full.
+    val shown = if is_held_whole(d.name) then "the parts of this binding" else s"'${d.name}'"
+
+    if writable && builds_view(init)
+        return s"$shown is a 'var' over a slice literal, and a 'var' builds its view when the program " +
+               "starts, being storage the program reassigns — a 'val' over the same literal is laid down"
+    end if
+
+    val part = unfolded_part(cx, d.name, init)
+    // A whole initializer is quoted as it was written: a typed node's span may be only its last part
+    // (a field's name, a path's separator).
+    val whole = part.span.start == init.span.start && part.span.end == init.span.end
+    val at = if whole && d.init.is_some() then d.init.unwrap().span else part.span
+    val written = from_utf8_unchecked(cx.scope.src.text(at))
+
+    first_runtime_read(part) match
+        Some(symbol) ->
+            s"$shown reads '${qualified_name(symbol)}', a module 'var', whose value is whatever the " +
+            "program last wrote to it"
+        None -> first_runtime_call(cx, part) match
+            Some(why) -> s"$shown $why"
+            None -> s"$shown is worked out by '$written', which is not a value the compiler can write down"
+end fold_stop
+
+// The innermost piece of an initializer that does not fold where everything around it would: the
+// shapes `static_image` lays down, followed into the first part it gives up on.
+private unfolded_part(cx: &Analyzer, name: string, t: TExpr) -> TExpr = *t.kind match
+    TArrayLit(elems, _) -> first_unfolded(cx, name, elems, t)
+    TArrayFill(value, _) -> part_within(cx, name, value, t)
+    TBufLit(elems, _) -> first_unfolded(cx, name, elems, t)
+    TStructNew(_, args) -> first_unfolded(cx, name, args, t)
+    TEnumNew(_, _, args) -> first_unfolded(cx, name, args, t)
+    TBox(value, _) -> part_within(cx, name, value, t)
+    TCast(inner, _) -> part_within(cx, name, inner, t)
+    TConstrainedCheck(value, _) -> part_within(cx, name, value, t)
+    TErase(operand, _, _) -> part_within(cx, name, operand, t)
+    _ -> t
+
+private first_unfolded(cx: &Analyzer, name: string, xs: Buf[TExpr], whole: TExpr) -> TExpr
+    for item in xs
+        *item.kind match
+            TUnitLit -> ()
+            _ -> if !images_quietly(cx, name, item) then return unfolded_part(cx, name, item)
+
+    whole
+end first_unfolded
+
+private part_within(cx: &Analyzer, name: string, part: TExpr, whole: TExpr) -> TExpr =
+    if images_quietly(cx, name, part) then whole else unfolded_part(cx, name, part)
+
+// Whether a piece images, asked as a trial: what imaging it says was said already, when the whole
+// initializer was imaged.
+private images_quietly(cx: &Analyzer, name: string, t: TExpr) -> bool
+    val mark = cx.an.complaints()
+    val image = static_image(cx, name, t)
+
+    cx.an.restore_complaints(mark)
+    image.is_some()
+end images_quietly
+
+// The first module `var` a piece reads, outermost first.
+private first_runtime_read(t: TExpr) -> Option[string]
+    var found: Buf[string] = buf()
+    val sink = &found
+
+    walk_texpr(t, expr_walk(true, x -> *x.kind match
+        TGlobal(symbol, _, writable) -> if writable then sink.push(symbol)
+        _ -> ()))
+
+    if found.is_empty() then None else Some(found.at(0))
+end first_runtime_read
+
+// The first call in a piece, as the rest of a sentence about the storage: a function by name, with
+// the reason the evaluator gave for not running it where it gave one, and a call through a value.
+private first_runtime_call(cx: &Analyzer, t: TExpr) -> Option[string]
+    var found: Buf[string] = buf()
+    val sink = &found
+    val a = cx.an
+
+    walk_texpr(t, expr_walk(true, x -> *x.kind match
+        TCall(callee, _, _, _) ->
+            val said = evaluable_refusal(a, callee) match
+                Some(why) -> chained_reason(why)
+                None -> "which cannot run while compiling"
+
+            sink.push(s"calls '${qualified_name(callee)}', $said")
+        TCallPtr(_, _, _, _) -> sink.push("calls through a function value, which is known only when the program runs")
+        TVCall(_, _, _, _, _) -> sink.push("calls through a trait object, which is known only when the program runs")
+        _ -> ()))
+
+    if found.is_empty() then None else Some(found.at(0))
+end first_runtime_call
 
 private static_images(cx: &Analyzer, name: string, xs: Buf[TExpr]) -> Option[Buf[TExpr]]
     var out: Buf[TExpr] = buf()
