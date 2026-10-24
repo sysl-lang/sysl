@@ -1,0 +1,409 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_temp_dir, remove_dir_all, write_text}
+import sysl.process.{capture, Status}
+import sysl.text.Search
+
+// **A field of a `@packed` struct may be any `@packed` struct that itself converts to an integer**
+// (`layout.sysl`'s `integer_ranges`), to any depth: its bits occupy the field's position, least
+// significant first, exactly as its own `.bits` gives them, and the storage stays its fields end to
+// end.
+//
+// The axes crossed: the depth (one, two); where the nested struct sits (first, middle, last); what
+// it holds (whole bytes, a bitfield struct); `.bits` and `::Bits` both ways; a generic struct and a
+// generic body; module storage folded to data on a bare Thumb machine; the layout against clang; and
+// each kind that does not convert, refused with the chain that says why. Skipped: `@byte_order` on a
+// nesting struct -- the wire order of a struct field is its own check (`check_byte_order`), and the
+// integer holds values whichever it is.
+
+private nbp_ready() -> bool = std_root().is_ok() && clang_available()
+
+private nbp_run(text: string, c: string, level: string) -> (Status, string, string)
+    val root = make_temp_dir("sysl-nbp").unwrap()
+
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    if !c.is_empty() then write_text(s"$root/probe.c", c).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, level, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (Status.Exited(-1), "", failure_text(why))
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> (Status.Exited(-1), "", "the program that was built could not be run")
+        Ok(out) -> (out.status, out.text, out.err.unwrap_or(""))
+end nbp_run
+
+// At both levels, the program exits cleanly having printed `printed` and nothing on standard error.
+private nbp_prints_with(text: string, c: string, printed: string)
+    if !nbp_ready() then return
+
+    for level in ["0", DefaultOptimization]
+        val (state, out, err) = nbp_run(text, c, level)
+
+        assert_eq(err, "")
+        assert_eq(out, printed)
+        assert(state == Status.Exited(0), s"-O$level stopped with $state")
+end nbp_prints_with
+
+private nbp_prints(text: string, printed: string) = nbp_prints_with(text, "", printed)
+
+private nbp_refused(text: string, message: string, line: int, col: int)
+    if !nbp_ready() then return
+
+    val (_, _, err) = nbp_run(text, "", "0")
+    val head = s"error: $message\n"
+    val at = s"/main.sysl:$line:$col\n"
+
+    assert(err.contains(head), s"expected\n$head\nin\n$err")
+    assert(err.contains(at), s"expected\n$at\nin\n$err")
+    assert_eq(err.count_of("error: "), 1)
+end nbp_refused
+
+private nbp_build_c(text: string, target: string) -> (int, string)
+    val root = make_temp_dir("sysl-nbp-c").unwrap()
+
+    write_text(s"$root/package.hocon", "package {\n  name = \"probe\"\n}\n").unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    var said: Buf[string] = buf()
+    val sink = &said
+    var args: [7]string = ["sysl", "build-c", "--target", target, "-o", s"$root/probe.a", root]
+    val code = run_cli(args[..], piece -> sink.push(piece))
+
+    reset_search_paths()
+    remove_dir_all(root).unwrap_or(())
+
+    var text_out = ""
+
+    for piece in said
+        text_out = text_out + piece
+
+    (code, text_out)
+end nbp_build_c
+
+private val nbp_rule: string = "only a '@packed' struct whose every field is an integer, a simple " +
+                               "enum, a bitfield struct or a '@packed' struct that converts itself converts to one"
+
+// -- the reduction ------------------------------------------------------------------------------------
+
+@test("a packed struct holding a packed struct of whole bytes converts, the nested one in its place")
+nbp_the_reduction()
+    nbp_prints(raw"""
+        @packed
+        struct Q
+            a: u8
+            b: u8
+
+        @packed
+        struct OQ
+            x: Q
+            y: u8
+
+        val m = OQ::Bits(0x123456)
+
+        print(m.x.a, m.x.b, m.y, m.bits, sizeof(OQ))
+        """, "86 52 18 1193046 3\n")
+end nbp_the_reduction
+
+@test("three deep: each level's bits sit at the position of the field that holds them")
+nbp_three_deep()
+    nbp_prints(raw"""
+        @packed
+        struct A
+            a: u8
+            b: u8
+
+        @packed
+        struct B
+            x: A
+            c: u8
+
+        @packed
+        struct C
+            y: B
+            d: u16
+
+        val c = C::Bits(0x1122334455)
+
+        print(c.y.x.a, c.y.x.b, c.y.c, c.d, c.bits, sizeof(C))
+        """, "85 68 51 4386 73588229205 5\n")
+end nbp_three_deep
+
+@test("a nested struct holding a bitfield struct takes its container's width")
+nbp_nested_holds_a_bitfield_struct()
+    nbp_prints(raw"""
+        @packed
+        struct M
+            a: u4
+            b: u4
+            c: u8
+
+        @packed
+        struct W
+            m: M
+            z: u8
+
+        @packed
+        struct O
+            w: W
+            t: u8
+
+        val o = O::Bits(0x11223344)
+
+        print(o.w.m.a, o.w.m.b, o.w.m.c, o.w.z, o.t, o.bits, sizeof(O))
+        """, "4 4 51 34 17 287454020 4\n")
+end nbp_nested_holds_a_bitfield_struct
+
+@test("the nested struct is first, in the middle or last, and '.bits' round-trips in each")
+nbp_position()
+    nbp_prints(raw"""
+        @packed
+        struct Q
+            a: u8
+            b: u8
+
+        @packed
+        struct First
+            x: Q
+            y: u8
+            z: u8
+
+        @packed
+        struct Middle
+            y: u8
+            x: Q
+            z: u8
+
+        @packed
+        struct Last
+            y: u8
+            z: u8
+            x: Q
+
+        val f = First::Bits(0x04030201)
+        val m = Middle::Bits(0x04030201)
+        val l = Last::Bits(0x04030201)
+
+        print(f.x.a, f.x.b, f.y, f.z)
+        print(m.x.a, m.x.b, m.y, m.z)
+        print(l.x.a, l.x.b, l.y, l.z)
+
+        val g = First(Q(9, 8), 7, 6)
+
+        print(g.bits, First::Bits(g.bits).x.b, Middle::Bits(Middle(1, Q(2, 3), 4).bits).x.b)
+        print(f.bits, m.bits, l.bits)
+        """, "1 2 3 4\n2 3 1 4\n3 4 1 2\n101124105 8 3\n67305985 67305985 67305985\n")
+end nbp_position
+
+@test("a nested struct is written through a pointer and read back through '.bits'")
+nbp_through_a_pointer()
+    nbp_prints(raw"""
+        @packed
+        struct Q
+            a: u8
+            b: u8
+
+        @packed
+        struct OQ
+            x: Q
+            y: u8
+
+        var bytes: [4]u8 = [0; 4]
+        val p: *OQ = ptr_cast(&bytes[0])
+
+        p.x = Q(0x56, 0x34)
+        p.y = 0x12
+
+        print(p.bits, bytes[0], bytes[1], bytes[2])
+        """, "1193046 86 52 18\n")
+end nbp_through_a_pointer
+
+// -- generics -------------------------------------------------------------------------------------------
+
+@test("'OQ::Bits' in a generic body, 'Pair[Q]::Bits' on an instance, and '.bits' of a Pair[Q]")
+nbp_generics()
+    nbp_prints(raw"""
+        @packed
+        struct Q
+            a: u8
+            b: u8
+
+        @packed
+        struct OQ
+            x: Q
+            y: u8
+
+        @packed
+        struct Pair[T]
+            lo: T
+            hi: T
+
+        build[T](n: u24, tag: T) -> OQ = OQ::Bits(n)
+
+        show[T](p: Pair[T])
+            print(p.bits)
+
+        val p = Pair[Q]::Bits(0x04030201)
+
+        print(build(0x123456, "x").y, build(0x123456, 1).x.b)
+        print(p.lo.a, p.lo.b, p.hi.a, p.hi.b)
+        show(p)
+        show(Pair[Q](Q(1, 2), Q(3, 4)))
+        """, "18 52\n1 2 3 4\n67305985\n67305985\n")
+end nbp_generics
+
+@test("a generic packed struct holding itself: Wrap[Wrap[Q]] converts through both levels")
+nbp_recursion_through_a_generic()
+    nbp_prints(raw"""
+        @packed
+        struct Q
+            a: u8
+            b: u8
+
+        @packed
+        struct Wrap[T]
+            inner: T
+            tag: u8
+
+        val w = Wrap[Wrap[Q]]::Bits(0x04030201)
+
+        print(w.inner.inner.a, w.inner.inner.b, w.inner.tag, w.tag, w.bits, sizeof(Wrap[Wrap[Q]]))
+        """, "1 2 3 4 67305985 4\n")
+end nbp_recursion_through_a_generic
+
+// -- module storage and the layout --------------------------------------------------------------------
+
+private val nbp_storage: string = raw"""
+    @packed
+    struct Q
+        a: u8
+        b: u8
+
+    @packed
+    struct OQ
+        x: Q
+        y: u8
+
+    const RAW: u24 = 0x123456
+
+    val M = OQ::Bits(RAW)
+
+    """
+
+@test("a module 'val' made with Bits from a 'const' holds the nested fields the integer does")
+nbp_module_val()
+    nbp_prints(nbp_storage + "print(M.x.a, M.x.b, M.y, M.bits)\n", "86 52 18 1193046\n")
+end nbp_module_val
+
+@test("on a bare Thumb machine that 'val' is constant data, with nothing to run to fill it")
+nbp_module_val_folds_on_thumb()
+    if !nbp_ready() then return
+
+    val (code, said) = nbp_build_c(nbp_storage + raw"""
+        @export("main")
+        probe() -> u32 = u32(M.x.b) + u32(M.y)
+        """, "thumb-freestanding-softfp")
+
+    assert(!said.contains("error"), said)
+    assert_eq(code, 0)
+end nbp_module_val_folds_on_thumb
+
+private val nbp_c: string = raw"""
+    #include <stddef.h>
+    #include <stdint.h>
+    #include <string.h>
+
+    struct __attribute__((packed)) Q { uint8_t a; uint16_t b; };
+    struct __attribute__((packed)) OQ { uint8_t t; struct Q x; uint32_t y; };
+
+    size_t c_size(void) { return sizeof(struct OQ); }
+    size_t c_align(void) { return _Alignof(struct OQ); }
+    size_t c_off_x(void) { return offsetof(struct OQ, x); }
+    size_t c_off_y(void) { return offsetof(struct OQ, y); }
+
+    /* The bytes of the struct read as one little-endian integer -- what '.bits' must be. */
+    uint64_t c_bytes(struct OQ w) {
+        uint64_t n = 0;
+        memcpy(&n, &w, sizeof w);
+        return n;
+    }
+    """
+
+@test("nested packed structs keep clang's size, alignment, offsets, and the integer is their bytes")
+nbp_layout_matches_clang()
+    nbp_prints_with(raw"""
+        @packed
+        struct Q
+            a: u8
+            b: u16
+
+        @packed
+        struct OQ
+            t: u8
+            x: Q
+            y: u32
+
+        extern c_size() -> usize
+        extern c_align() -> usize
+        extern c_off_x() -> usize
+        extern c_off_y() -> usize
+        extern c_bytes(w: OQ) -> u64
+
+        val o = OQ::Bits(0x0102030405060708)
+
+        print(sizeof(OQ) == c_size(), alignof(OQ) == c_align())
+        print(offsetof(OQ, x) == c_off_x(), offsetof(OQ, y) == c_off_y())
+        print(c_bytes(o) == u64(o.bits), o.t, o.x.a, o.x.b, o.y)
+        """, nbp_c, "true true\ntrue true\ntrue 8 7 1286 16909060\n")
+end nbp_layout_matches_clang
+
+// -- the refusals --------------------------------------------------------------------------------------
+
+@test("a nested packed struct that does not convert is refused, naming the chain down to the field")
+nbp_unconvertible_chain_refused()
+    nbp_refused("@packed\nstruct Q2\n    f: f32\n\n@packed\nstruct O2\n    x: Q2\n    y: u8\n\n" +
+                "print(O2::Bits(1).y)\n",
+                s"'O2::Bits' has no integer to make it from: its field 'x' is Q2, whose field 'f' is f32 — " +
+                nbp_rule, 10, 9)
+    nbp_refused("struct In\n    a: u8\n\n@packed\nstruct Q2\n    i: In\n\n@packed\nstruct O2\n    x: Q2\n\n" +
+                "print(O2::Bits(1).x.i.a)\n",
+                s"'O2::Bits' has no integer to make it from: its field 'x' is Q2, whose field 'i' is In — " +
+                nbp_rule, 12, 9)
+end nbp_unconvertible_chain_refused
+
+@test("a nested struct that is not '@packed' is refused as a field, as it was")
+nbp_nested_unpacked_refused()
+    nbp_refused("struct In\n    a: u8\n    b: u8\n\n@packed\nstruct O\n    i: In\n    y: u8\n\n" +
+                "print(O::Bits(1).y)\n",
+                s"'O::Bits' has no integer to make it from: its field 'i' is In — $nbp_rule", 10, 8)
+end nbp_nested_unpacked_refused
+
+@test("a generic packed struct whose argument does not convert is refused with the chain through it")
+nbp_generic_chain_refused()
+    nbp_refused("@packed\nstruct Q2\n    f: f32\n\n@packed\nstruct Wrap[T]\n    inner: T\n    tag: u8\n\n" +
+                "print(Wrap[Q2]::Bits(1).tag)\n",
+                s"'Wrap[Q2]::Bits' has no integer to make it from: its field 'inner' is Q2, whose field " +
+                s"'f' is f32 — $nbp_rule", 10, 15)
+end nbp_generic_chain_refused
+
+@test("a whole-byte struct beside a sub-byte field is not turned into a bitfield container: still refused")
+nbp_sub_byte_beside_nested_refused()
+    nbp_refused("@packed\nstruct Q\n    a: u8\n    b: u8\n\n@packed\nstruct O\n    x: Q\n    n: u3\n\n" +
+                "print(1)\n",
+                "'O.x' is Q, and 'O' is '@packed' with a field narrower than a byte — so it is one " +
+                "integer, and every field of it has to be one too: an integer, a simple enum, or a " +
+                "bitfield struct. Q is laid out as fields rather than as one integer — only a " +
+                "'@packed' struct with a field narrower than a byte nests in another, in its own " +
+                "fields' width", 6, 1)
+end nbp_sub_byte_beside_nested_refused

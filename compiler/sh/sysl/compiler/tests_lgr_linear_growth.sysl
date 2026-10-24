@@ -1,0 +1,130 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.container.{Set, set}
+import sysl.posix.time.cpu_time
+import sysl.time.whole_micros
+
+// How a test says that some part of the compiler is no worse than linear: it measures the work at
+// one size and at `GrowthFactor` times that size, and requires the larger to cost less than
+// `GrowthBound` times the smaller.
+//
+// **The measure is processor time, not the clock on the wall.** The suite runs a test per core and
+// often beside another suite, so a test may wait for a core for longer than its work takes; time spent
+// waiting is no part of the claim and processor time leaves it out. What load can still move is the
+// rate the work runs at -- a run on an efficiency core, or starved of cache by its neighbours, takes
+// two to three times the processor of one on a quiet performance core. So each size is run
+// `GrowthRounds` times, the two sizes taking turns, and the cheapest run of each is compared: one
+// quiet run of each is enough, and a burst of load lands on both sizes rather than on one.
+//
+// **The bound is half of what a quadratic cost would show, and four times what a linear one does.**
+// Eight times the size costs eight times as much when the work is linear and sixty-four times when it
+// is quadratic, so 32 leaves a linear cost a factor of four for the two runs having met different
+// machines, and still fails a cost that is quadratic in any part that is more than about two fifths of
+// it at the smaller size. A four-times step had only a factor of 2.25 between linear and its bound,
+// which an efficiency core spends on its own.
+
+const GrowthFactor: usize = 8
+const GrowthBound: long = 32
+const GrowthRounds: int = 5
+
+// The processor time `work` takes, in microseconds.
+processor_micros(work: () -> unit) -> long
+    val started = cpu_time()
+
+    work()
+    whole_micros(cpu_time() - started)
+end processor_micros
+
+// What a size and eight times it cost: the cheapest run of each, the two taking turns.
+struct Growth
+    small: long
+    large: long
+
+impl Growth
+    // How many times as much the larger size cost, a cost too small to read counting as one
+    // microsecond.
+    times(self) -> long = self.large / (if self.small > 0 then self.small else 1)
+
+    // Whether the larger cost stays inside the bound a linear cost meets.
+    linear(self) -> bool = self.times() < GrowthBound
+
+    // What a failed claim says about `what`: the two costs and how many times as much.
+    said(self, what: string) -> string =
+        s"$what: ${GrowthFactor}x the size took ${self.times()}x the processor " +
+        s"(${self.small} us, then ${self.large} us; linear is ${GrowthFactor}x, quadratic " +
+        s"${GrowthFactor * GrowthFactor}x, the bound ${GrowthBound}x)"
+
+// The cheapest of `GrowthRounds` runs of each of `small` and `large`, run in turn. Each run answers
+// what it cost, so that a run can leave its own setting up out of the measure; most are a
+// `processor_micros` of the work.
+growth_of(small: () -> long, large: () -> long) -> Growth
+    var best_small: long = -1
+    var best_large: long = -1
+
+    for round in 0..<GrowthRounds
+        val s = small()
+        val l = large()
+
+        if best_small < 0 || s < best_small then best_small = s
+        if best_large < 0 || l < best_large then best_large = l
+
+    Growth(best_small, best_large)
+end growth_of
+
+// -- the measure itself, against a cost known to be linear and one known to be quadratic --------------
+
+// Asks `n` distinct names, each checked against every name asked before it by a scan of the list:
+// the shape every one of the claims built on this measure was written against.
+private lgr_by_scan(n: usize)
+    var asked: Buf[string] = buf()
+
+    for i in 0..<n
+        val name = s"name$i"
+        var seen = false
+
+        for item in asked
+            if item == name then seen = true
+
+        if !seen then asked.push(name)
+
+    assert_eq(asked.len(), n)
+end lgr_by_scan
+
+// The same names, each checked by one set lookup.
+private lgr_by_set(n: usize)
+    var asked: Buf[string] = buf()
+    var seen: Set[string] = set()
+
+    for i in 0..<n
+        val name = s"name$i"
+
+        if seen.add(name) then asked.push(name)
+
+    assert_eq(asked.len(), n)
+end lgr_by_set
+
+@test("a cost quadratic in its size is more than the bound eight times the size allows")
+lgr_a_quadratic_cost_fails_the_bound()
+    val g = growth_of(() -> processor_micros(() -> lgr_by_scan(1500)),
+                      () -> processor_micros(() -> lgr_by_scan(1500 * GrowthFactor)))
+
+    assert(!g.linear(), g.said("a scan per name"))
+end lgr_a_quadratic_cost_fails_the_bound
+
+@test("a cost linear in its size is inside the bound")
+lgr_a_linear_cost_meets_the_bound()
+    val g = growth_of(() -> processor_micros(() -> lgr_by_set(4000)),
+                      () -> processor_micros(() -> lgr_by_set(4000 * GrowthFactor)))
+
+    assert(g.linear(), g.said("a set lookup per name"))
+end lgr_a_linear_cost_meets_the_bound
+
+@test("a cost too small to read is counted as one microsecond rather than divided by")
+lgr_a_cost_of_nothing_is_one_microsecond()
+    assert_eq(Growth(0, 5).times(), 5)
+    assert_eq(Growth(2, 10).times(), 5)
+    assert(Growth(1, 31).linear())
+    assert(!Growth(1, 32).linear())
+end lgr_a_cost_of_nothing_is_one_microsecond

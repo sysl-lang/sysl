@@ -1,0 +1,219 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_temp_dir, remove_dir_all, write_text}
+import sysl.process.{capture, Status}
+import sysl.text.Search
+
+// **A generic function whose result is read off its body takes the result its instantiation reads**
+// where its parameters, standing for themselves, could not read one (`inferred_results.sysl`'s
+// `instance_result`). `show[T](p: Pair[T]) = print(p.bits)` has no `.bits` until `T` is a type -- how
+// wide the integer is depends on it -- so that first reading came to `Unknown`, every instantiation
+// took it, and a call named the result of a function lowered as `void`, which clang refused.
+//
+// The axes crossed: the body (a unit call to `print`, to a `Buf`'s `push`, to a user function, and a
+// value: an integer whose width follows `T`, and a string); one and two type parameters; a free
+// function and a method of the generic type; the expression body against the same body as a block;
+// a non-generic twin; a body whose first reading was clean, kept as it was; and the error paths -- a
+// body that is wrong at its instantiation is told once, there, and one that reaches itself keeps the
+// refusal asking for its result to be written. Skipped: separate compilation -- the result is read
+// where an instantiation is made, the same reading whichever module asks.
+
+private gxb_ready() -> bool = std_root().is_ok() && clang_available()
+
+// The tree built at `level` and run: its status, what it printed, and what it wrote to standard error
+// -- the refusal, where the build was refused.
+private gxb_run(text: string, level: string) -> (Status, string, string)
+    val root = make_temp_dir("sysl-gxb").unwrap()
+
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, level, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (Status.Exited(-1), "", failure_text(why))
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> (Status.Exited(-1), "", "the program that was built could not be run")
+        Ok(out) -> (out.status, out.text, out.err.unwrap_or(""))
+end gxb_run
+
+// At both levels, the program exits cleanly having printed `printed` and nothing on standard error.
+private gxb_prints(text: string, printed: string)
+    if !gxb_ready() then return
+
+    for level in ["0", DefaultOptimization]
+        val (state, out, err) = gxb_run(text, level)
+
+        assert_eq(err, "")
+        assert_eq(out, printed)
+        assert(state == Status.Exited(0), s"-O$level stopped with $state")
+end gxb_prints
+
+// The program is refused with exactly one diagnostic, this message at this position.
+private gxb_refused(text: string, message: string, line: int, col: int)
+    if !gxb_ready() then return
+
+    val (_, _, err) = gxb_run(text, "0")
+    val head = s"error: $message\n"
+    val at = s"/main.sysl:$line:$col\n"
+
+    assert(err.contains(head), s"expected\n$head\nin\n$err")
+    assert(err.contains(at), s"expected\n$at\nin\n$err")
+    assert_eq(err.count_of("error: "), 1)
+end gxb_refused
+
+private val gxb_pair: string = "@packed\nstruct Pair[T]\n    lo: T\n    hi: T\n\n"
+
+// -- the reduction ----------------------------------------------------------------------------------
+
+@test("gxb: 'show[T](p: Pair[T]) = print(p.bits)' prints at every instantiation")
+gxb_the_reduction()
+    gxb_prints(gxb_pair + raw"""
+        show_bits[T](p: Pair[T]) = print(p.bits)
+
+        show_bits(Pair[u8](1, 2))
+        show_bits(Pair[u16](1, 2))
+        """, "513\n131073\n")
+end gxb_the_reduction
+
+@test("gxb: the same body as a block prints the same")
+gxb_block_twin()
+    gxb_prints(gxb_pair + raw"""
+        show_bits[T](p: Pair[T])
+            print(p.bits)
+
+        show_bits(Pair[u8](1, 2))
+        show_bits(Pair[u16](1, 2))
+        """, "513\n131073\n")
+end gxb_block_twin
+
+// -- every kind of body ---------------------------------------------------------------------------------
+
+@test("gxb: a 'Buf' push, a user function's unit, and a call through another such generic")
+gxb_other_unit_calls()
+    gxb_prints(raw"""
+        import sysl.buf.{Buf, buf}
+
+        @packed
+        struct Pair[T]
+            lo: T
+            hi: T
+
+        note(n: u32) = print(n + 1)
+
+        show_bits[T](p: Pair[T]) = print(p.bits)
+        keep[T](b: Buf[u32], p: Pair[T]) = b.push(u32(p.bits))
+        tell[T](p: Pair[T]) = note(u32(p.bits))
+        twice[T](p: Pair[T]) = show_bits(p)
+
+        var b: Buf[u32] = buf()
+
+        keep(b, Pair[u8](3, 4))
+        keep(b, Pair[u16](3, 4))
+        print(b[0], b[1])
+        tell(Pair[u8](1, 0))
+        twice(Pair[u8](5, 0))
+        twice(Pair[u16](0, 1))
+        """, "1027 262147\n2\n5\n65536\n")
+end gxb_other_unit_calls
+
+@test("gxb: a value result takes its instantiation's type -- an integer as wide as the struct, a string")
+gxb_value_results()
+    gxb_prints(gxb_pair + raw"""
+        get_bits[T](p: Pair[T]) = p.bits
+        said[T](p: Pair[T]) = s"<${p.bits}>"
+
+        // A `u16` holds the first only if it is no wider, and the second is all of 32 bits.
+        val a: u16 = get_bits(Pair[u8](1, 2))
+        val b = get_bits(Pair[u16](1, 2))
+
+        print(a, b, get_bits(Pair[u16](0xFFFF, 0xFFFF)))
+        print(said(Pair[u8](1, 1)), said(Pair[u16](0, 1)))
+        """, "513 131073 4294967295\n<257> <65536>\n")
+end gxb_value_results
+
+@test("gxb: two type parameters")
+gxb_two_params()
+    gxb_prints(raw"""
+        @packed
+        struct Two[A, B]
+            a: A
+            b: B
+
+        two_bits[A, B](t: Two[A, B]) = print(t.bits)
+        two_raw[A, B](t: Two[A, B]) = t.bits
+
+        two_bits(Two[u8, u16](1, 2))
+        two_bits(Two[u16, u8](1, 2))
+        val narrow: u16 = two_raw(Two[u8, u8](1, 2))
+
+        print(narrow, two_raw(Two[u8, u16](0xFF, 0xFFFF)))
+        """, "513\n131073\n513 16777215\n")
+end gxb_two_params
+
+@test("gxb: a method of the generic type, a unit one and a valued one")
+gxb_methods()
+    gxb_prints(raw"""
+        @packed
+        struct Pair[T]
+            lo: T
+            hi: T
+
+            show(self) = print(self.bits)
+            raw(self) = self.bits
+
+        Pair[u8](1, 2).show()
+        Pair[u16](1, 2).show()
+        print(Pair[u8](1, 2).raw(), Pair[u16](1, 2).raw())
+        """, "513\n131073\n513 131073\n")
+end gxb_methods
+
+@test("gxb: a non-generic twin, and generic bodies whose first reading was clean, are as they were")
+gxb_controls()
+    gxb_prints(raw"""
+        import sysl.buf.{Buf, buf}
+
+        @packed
+        struct Q
+            lo: u8
+            hi: u8
+
+        show_q(p: Q) = print(p.bits)
+        show[T: Display](x: T) = print(x)
+        push_it[T](b: Buf[T], x: T) = b.push(x)
+        same[T](x: T) = x
+
+        show_q(Q(1, 2))
+        show(3)
+        show("s")
+
+        var b: Buf[int] = buf()
+
+        push_it(b, 6)
+        print(b.len(), same(7), same("t"))
+        """, "513\n3\ns\n1 7 t\n")
+end gxb_controls
+
+// -- the error paths -------------------------------------------------------------------------------------
+
+@test("gxb: a body wrong at its instantiation is told once, there")
+gxb_wrong_at_instance()
+    gxb_refused(gxb_pair + "bad[T](p: Pair[T]) = print(p.bits + \"x\")\n\nbad(Pair[u8](1, 2))\n",
+                "'+' needs matching types, got ushort and string", 6, 37)
+end gxb_wrong_at_instance
+
+@test("gxb: a body that reaches itself is still asked for its result")
+gxb_loop_refused()
+    gxb_refused(gxb_pair + "down[T](p: Pair[T], n: int) = if n == 0 then print(p.bits) else " +
+                "down(p, n - 1)\n\ndown(Pair[u8](1, 2), 3)\n",
+                "'down' takes its result type from its body, and the body reaches 'down' again — " +
+                "write its result type, 'down(…) -> T'", 6, 1)
+end gxb_loop_refused

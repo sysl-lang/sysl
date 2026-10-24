@@ -1,0 +1,94 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.text.{Search, replace_all}
+
+// The keeps-analysis (`keeps.sysl`) over a chain of calls as long as a program: `f0` calls `f1`, which
+// calls `f2`, thirty-two thousand deep. Each body's answers are worked out callees first
+// (`warm_callees_first`), so no question nests a walk per call; asked only on demand from the top, the
+// chain overflowed the compiler's stack. A verdict still travels the whole chain: what the bottom does
+// with the pointer is what the top call is held to.
+//
+// The cells are the four questions a call asks of its callee -- what it overwrites (a chain of plain
+// integer calls), what it keeps (a pointer handed down to a body that stores it), what its answer is
+// made of (a pointer handed back up), and an assumption (a recursion at the bottom of the chain) --
+// each with its control where the bottom lets the pointer go. Every link states its result or has a
+// block body: a chain of results read off `= expr` bodies is the result reading's depth, not this one's.
+
+private val KdcDepth: usize = 32000
+
+private kdc_join(lines: Buf[string]) -> string
+    var text = ""
+
+    for item in lines
+        text = text + item
+
+    text
+end kdc_join
+
+private val kdc_store: string = "var spare = 0\nvar held: *int = &spare\n\nstore(p: *int)\n    held = p\n\nread(p: *int)\n    spare = *p\n\n"
+
+// `head`, then the chain `f0` .. `f<depth - 1>`: each link is `link(i, next)` and the last `last`.
+private kdc_chain(head: string, link: &Fn(usize, usize) -> string, last: string) -> string
+    var lines: Buf[string] = buf()
+
+    lines.push(head)
+
+    for i in 0..<KdcDepth
+        lines.push(if i + 1 < KdcDepth then link(i, i + 1) else s"f$i$last")
+
+    kdc_join(lines)
+end kdc_chain
+
+// What the analysis reports of `text`, the first message, or nothing.
+private kdc_said(text: string) -> string
+    val done = typed_of(text)
+
+    if done.reported.is_empty() then "" else done.reported.at(0).diag.message
+end kdc_said
+
+@test("a chain of thirty-two thousand integer calls is analysed, and nothing is refused")
+kdc_integer_chain()
+    val text = kdc_chain("main()\n    val n = f0(1)\n\n", (i, j) -> s"f$i(n: int) -> int = f$j(n + 1)\n\n",
+                         "(n: int) -> int = n\n\n")
+
+    assert_eq(kdc_said(text), "")
+
+@test("a local's address handed down thirty-two thousand calls to a body that stores it is refused at the top")
+kdc_kept_at_the_bottom()
+    val link = (i: usize, j: usize) -> s"f$i(p: *int)\n    f$j(p)\n\n"
+    val head = kdc_store + "main()\n    var n = 1\n    f0(&n)\n\n"
+    val kept = kdc_said(kdc_chain(head, link, "(p: *int)\n    store(p)\n\n"))
+
+    assert(kept.contains("'f0' keeps its parameter 'p' (it is passed to 'f1', which keeps it)"), kept)
+
+    val let_go = kdc_said(kdc_chain(head, link, "(p: *int)\n    spare = *p\n\n"))
+
+    assert_eq(let_go, "")
+
+@test("a pointer handed back up thirty-two thousand calls is followed to the body that keeps it")
+kdc_answered_from_the_bottom()
+    val link = (i: usize, j: usize) -> s"f$i(p: *int) -> *int = f$j(p)\n\n"
+    val head = kdc_store + "main()\n    var n = 1\n    store(f0(&n))\n\n"
+    val answered = kdc_said(kdc_chain(head, link, "(p: *int) -> *int = p\n\n"))
+
+    assert(answered.contains("'store' keeps its parameter 'p'"), answered)
+
+    val other = kdc_said(kdc_chain(head, link, "(p: *int) -> *int = &spare\n\n"))
+
+    assert_eq(other, "")
+
+@test("a recursion at the bottom of a thirty-two-thousand-call chain is worked out by assumption, and keeps")
+kdc_recursion_at_the_bottom()
+    val link = (i: usize, j: usize) -> s"f$i(p: *int, k: int)\n    f$j(p, k)\n\n"
+    val head = kdc_store + "main()\n    var n = 1\n    f0(&n, 3)\n\n"
+    val bottom = "(p: *int, k: int)\n    if k == 0 then store(p) else again(p, k - 1)\n\n" +
+                 s"again(p: *int, k: int)\n    f${KdcDepth - 1}(p, k)\n\n"
+    val kept = kdc_said(kdc_chain(head, link, bottom))
+
+    assert(kept.contains("'f0' keeps its parameter 'p'"), kept)
+
+    val let_go = kdc_said(kdc_chain(head, link, replace_all(bottom, "store(p)", "read(p)")))
+
+    assert_eq(let_go, "")

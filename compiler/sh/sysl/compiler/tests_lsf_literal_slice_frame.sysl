@@ -135,8 +135,8 @@ private lsf_no_heap() -> string =
 lsf_literal_allocates_nothing()
     if lsf_no_library() then return
 
-    assert_eq(lsf_calls(lsf_sum + "@export(\"probe_literal\")\nprobe_literal() -> usize = " +
-                        "sum([g, g + 1])\n\n@export(\"probe_named\")\nprobe_named() -> usize\n" +
+    assert_eq(lsf_calls(lsf_sum + "probe_literal() -> usize = " +
+                        "sum([g, g + 1])\n\nprobe_named() -> usize\n" +
                         "    val xs: [2]usize = [g, g + 1]\n    sum(xs)\n\n" +
                         "probe() -> usize = probe_literal() + probe_named()\n", true), "")
 
@@ -144,14 +144,14 @@ lsf_literal_allocates_nothing()
 lsf_computed_elements()
     if lsf_no_library() then return
 
-    assert_eq(lsf_calls(lsf_sum + "twice(n: usize) -> usize = n * 2\n\n@export(\"probe\")\n" +
+    assert_eq(lsf_calls(lsf_sum + "twice(n: usize) -> usize = n * 2\n\n" +
                         "probe() -> usize = sum([g, twice(g), g * g])\n", true), "")
 
 @test("a literal inside another literal's call is laid in the frame too")
 lsf_nested_call()
     if lsf_no_library() then return
 
-    assert_eq(lsf_calls(lsf_sum + "@export(\"probe\")\nprobe() -> usize = sum([g, sum([g, 1])])\n",
+    assert_eq(lsf_calls(lsf_sum + "probe() -> usize = sum([g, sum([g, 1])])\n",
                         true), "")
 
 @test("a method's literal argument is one too")
@@ -160,34 +160,34 @@ lsf_method_call()
 
     assert_eq(lsf_calls(lsf_sum + "struct Acc\n    base: usize\n\nimpl Acc\n" +
                         "    total(self, xs: []const usize) -> usize = self.base + sum(xs)\n\n" +
-                        "@export(\"probe\")\nprobe() -> usize\n    val a = Acc(g)\n" +
+                        "probe() -> usize\n    val a = Acc(g)\n" +
                         "    a.total([g, 5])\n", true), "")
 
 @test("a callee that keeps the slice still gets a buffer, where there is a heap")
 lsf_kept_still_promotes()
     if lsf_no_library() then return
 
-    lsf_allocates(lsf_sum + lsf_keep + "@export(\"probe\")\nprobe() -> usize\n" +
+    lsf_allocates(lsf_sum + lsf_keep + "probe() -> usize\n" +
                   "    var h = Held([])\n    keep(&h, [g, g + 1])\n")
 
 @test("a call whose answer may be a view of the literal still gets it a buffer")
 lsf_view_answer_keeps_a_buffer()
     if lsf_no_library() then return
 
-    lsf_allocates(lsf_sum + lsf_first + "@export(\"probe\")\nprobe() -> usize = first([g, 1]).len\n")
+    lsf_allocates(lsf_sum + lsf_first + "probe() -> usize = first([g, 1]).len\n")
 
 @test("a board with no heap builds a literal that stays put, and calls no allocator")
 lsf_heapless_board_frames()
     if lsf_no_library() then return
 
-    assert_eq(lsf_calls(lsf_sum + "@export(\"probe\")\nprobe() -> usize = sum([g, sum([g, 1])])\n",
+    assert_eq(lsf_calls(lsf_sum + "probe() -> usize = sum([g, sum([g, 1])])\n",
                         false), "")
 
 @test("a board with no heap refuses a literal the callee keeps, at the literal")
 lsf_heapless_kept_refused()
     if lsf_no_library() then return
 
-    lsf_refused(lsf_sum + lsf_keep + "@export(\"probe\")\nprobe() -> usize\n" +
+    lsf_refused(lsf_sum + lsf_keep + "probe() -> usize\n" +
                 "    var h = Held([])\n    keep(&h, [g, g + 1])\n",
                 "this view of an array literal is passed to 'keep', which holds on to it, so the " +
                 s"array would move to the heap to outlive the frame ${lsf_no_heap()}")
@@ -196,7 +196,7 @@ lsf_heapless_kept_refused()
 lsf_heapless_view_answer_refused()
     if lsf_no_library() then return
 
-    lsf_refused(lsf_sum + lsf_first + "@export(\"probe\")\nprobe() -> usize = first([g, 1]).len\n",
+    lsf_refused(lsf_sum + lsf_first + "probe() -> usize = first([g, 1]).len\n",
                 s"a slice with storage of its own needs an allocator, and '$lsf_board' provides " +
                 "no allocator")
 
@@ -206,7 +206,7 @@ lsf_heapless_promotion_refused()
 
     val src = "var g: usize = 3\n\nmake() -> []const usize = [g, g + 1][..]\n\n" +
               "make_named() -> []const usize\n    val xs: [2]usize = [g, g + 1]\n    xs[..]\n\n" +
-              "@export(\"probe\")\nprobe() -> usize = make().len + make_named().len\n"
+              "probe() -> usize = make().len + make_named().len\n"
 
     lsf_refused(src, s"this view of an array literal is returned, so the array would move to the " +
                 s"heap to outlive the frame ${lsf_no_heap()}")
@@ -219,9 +219,9 @@ lsf_no_alloc_clause()
 
     val head = "@no_alloc\n\n" + lsf_sum + lsf_keep
 
-    assert_eq(lsf_calls(head + "@export(\"probe\")\nprobe() -> usize = sum([g, 2])\n", true), "")
+    assert_eq(lsf_calls(head + "probe() -> usize = sum([g, 2])\n", true), "")
 
-    val said = lsf_ir(head + "@export(\"probe\")\nprobe() -> usize\n    var h = Held([])\n" +
+    val said = lsf_ir(head + "probe() -> usize\n    var h = Held([])\n" +
                       "    keep(&h, [g, 2])\n", true)
 
     assert(said.contains("this view of an array literal is passed to 'keep', which holds on to " +
