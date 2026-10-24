@@ -1,0 +1,293 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_temp_dir, remove_dir_all, write_text}
+
+// **An `elif const` arm that is taken is a statement where the `if` is one, and a value where the `if`
+// is one.** The chain is nested in the `else` of the arm before it, and the arm that is taken was read
+// as the value of its `if` even when that `if` stood alone as a statement, so a body ending in an
+// assignment was refused. Each claim is a whole program, built and run.
+
+@test("the reduction: the 'elif const' arm taken ends in an assignment")
+eic_the_reduction()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        struct S
+            a: u32
+
+        const f[T]() -> u32
+            var h: u32 = 1
+            if const T::Kind == Kind.Struct
+                h = 2
+            elif const T::Kind == Kind.Array
+                h = 3
+            h
+
+        main()
+            print(f[S]())
+            print(f[[2]u8]())
+            print(f[int]())
+        """), "2\n3\n1\n")
+end eic_the_reduction
+
+@test("each arm of an 'if' / 'elif' / 'else' chain, taken, in a const fn, a plain fn and a generic method")
+eic_each_arm_each_home()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        struct S
+            a: u32
+
+        const c[T]() -> u32
+            var h: u32 = 0
+            if const T::Kind == Kind.Struct
+                h = 1
+            elif const T::Kind == Kind.Array
+                h = 2
+            else
+                h = 3
+            h
+
+        p[T]() -> u32
+            var h: u32 = 0
+            if const T::Kind == Kind.Struct
+                h = 1
+            elif const T::Kind == Kind.Array
+                h = 2
+            else
+                h = 3
+            h
+
+        struct W
+            n: u32
+
+            m[T](self) -> u32
+                var h: u32 = self.n
+                if const T::Kind == Kind.Struct
+                    h += 10
+                elif const T::Kind == Kind.Array
+                    h += 20
+                else
+                    h += 30
+                h
+
+        main()
+            val w = W(5)
+            print(c[S](), c[[2]u8](), c[int]())
+            print(p[S](), p[[2]u8](), p[int]())
+            print(w.m[S](), w.m[[2]u8](), w.m[int]())
+        """), "1 2 3\n1 2 3\n15 25 35\n")
+end eic_each_arm_each_home
+
+@test("three 'elif const' arms, each taken in turn, then none and an 'else'")
+eic_three_arms()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        pick[const N: int]() -> int
+            var h = 0
+            if const N == 1
+                h = 10
+            elif const N == 2
+                h = 20
+            elif const N == 3
+                h = 30
+            elif const N == 4
+                h = 40
+            else
+                h = 99
+            h
+
+        main()
+            print(pick[1](), pick[2](), pick[3](), pick[4](), pick[5]())
+        """), "10 20 30 40 99\n")
+end eic_three_arms
+
+@test("a plain 'if' in the 'else' of an 'elif const' chain tests while running")
+eic_plain_if_in_the_else()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        pick[const N: int](x: int) -> int
+            var h = 0
+            if const N == 1
+                h = 10
+            elif const N == 2
+                h = 20
+            else
+                if x > 5
+                    h = 1
+                elif x > 2
+                    h = 2
+                else
+                    h = 3
+            h
+
+        main()
+            print(pick[1](9), pick[2](9), pick[3](9), pick[3](3), pick[3](0))
+        """), "10 20 1 2 3\n")
+end eic_plain_if_in_the_else
+
+@test("an 'if const' chain used as a value yields the arm it takes, whichever position it is in")
+eic_chain_as_a_value()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        pick[const N: int]() -> int
+            val v = if const N == 1 then 10 elif const N == 2 then 20 elif const N == 3 then 30 else 40
+            v
+
+        tail[const N: int]() -> int
+            if const N == 1
+                100
+            elif const N == 2
+                200
+            else
+                300
+
+        main()
+            print(pick[1](), pick[2](), pick[3](), pick[4]())
+            print(tail[1](), tail[2](), tail[3]())
+        """), "10 20 30 40\n100 200 300\n")
+end eic_chain_as_a_value
+
+@test("a statement 'if const' with an arm that yields a value discards it")
+eic_value_arm_discarded()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        step[const N: int](c: *int) -> int
+            if const N == 1
+                *c += 1
+            elif const N == 2
+                *c += 2
+            else
+                *c += 3
+            *c
+
+        main()
+            var n = 0
+            print(step[1](&n), step[2](&n), step[3](&n))
+        """), "1 3 6\n")
+end eic_value_arm_discarded
+
+@test("an 'if const' nested in an 'elif const' arm, in an 'else', and in both")
+eic_nested()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        pick[const A: int, const B: int]() -> int
+            var h = 0
+            if const A == 1
+                h = 1
+            elif const A == 2
+                if const B == 1
+                    h = 21
+                elif const B == 2
+                    h = 22
+                else
+                    h = 23
+            else
+                if const B == 1
+                    h = 31
+                elif const B == 2
+                    h = 32
+            h
+
+        main()
+            print(pick[1, 1](), pick[2, 1](), pick[2, 2](), pick[2, 3]())
+            print(pick[3, 1](), pick[3, 2](), pick[3, 3]())
+        """), "1 21 22 23\n31 32 0\n")
+end eic_nested
+
+@test("no arm taken and no 'else' leaves the statement empty")
+eic_no_arm_taken()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        pick[const N: int]() -> int
+            var h = 7
+            if const N == 1
+                h = 10
+            elif const N == 2
+                h = 20
+            h
+
+        main()
+            print(pick[1](), pick[2](), pick[3]())
+        """), "10 20 7\n")
+end eic_no_arm_taken
+
+@test("a chain ending a unit function is a statement whichever arm is taken")
+eic_unit_tail()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        var g = 0
+
+        note[const N: int]()
+            if const N == 1
+                g = 1
+            elif const N == 2
+                g = 2
+
+        main()
+            note[1]()
+            print(g)
+            note[2]()
+            print(g)
+            note[3]()
+            print(g)
+        """), "1\n2\n2\n")
+end eic_unit_tail
+
+private eic_build_c(text: string, target: string) -> (int, string)
+    val root = make_temp_dir("sysl-eic-c").unwrap()
+
+    write_text(s"$root/package.hocon", "package {\n  name = \"probe\"\n}\n").unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    var said: Buf[string] = buf()
+    val sink = &said
+    var args: [7]string = ["sysl", "build-c", "--target", target, "-o", s"$root/probe.a", root]
+    val code = run_cli(args[..], piece -> sink.push(piece))
+
+    reset_search_paths()
+    remove_dir_all(root).unwrap_or(())
+
+    var text_out = ""
+
+    for piece in said
+        text_out = text_out + piece
+
+    (code, text_out)
+end eic_build_c
+
+@test("a const call using an 'elif const' arm folds into a module 'val' on a bare Thumb machine")
+eic_folds_on_thumb()
+    if !enm_ready() then return
+
+    val (code, said) = eic_build_c(raw"""
+        struct S
+            a: u32
+
+        const f[T]() -> u32
+            var h: u32 = 1
+            if const T::Kind == Kind.Struct
+                h = 2
+            elif const T::Kind == Kind.Array
+                h = 3
+            h
+
+        val A: u32 = f[[2]u8]()
+        val B: u32 = f[S]()
+
+        @export("main")
+        probe() -> u32 = A + B
+        """, "thumb-freestanding-softfp")
+
+    assert(!said.contains("error"), said)
+    assert_eq(code, 0)
+end eic_folds_on_thumb
