@@ -16,8 +16,12 @@ module sh.sysl.compiler
 // that shape is held for good; a trait object or a closure that starts threads into a collection sees
 // no `@joined` (`tests_jnd_*`).
 
+// The threads of one fan-out run at once and all count into the same `S`, so the count is an atomic
+// add: a plain `s.n = s.n + 1` loses an update whenever two threads read before either writes, and
+// the cell then prints one short (`fnr_buf_counts_every_turn`).
 private fno_prelude() -> string =
-    "import sysl.threads.*\nimport sysl.buf.*\n\nstruct S\n    n: int\n\nwork(s: *S)\n    s.n = s.n + 1\n\n"
+    "import sysl.threads.*\nimport sysl.buf.*\nimport sysl.sync.*\n\nstruct S\n    n: int\n\n" +
+    "work(s: *S)\n    atomic_add(&s.n, 1, SeqCst)\n\n"
 
 private fno_prints(body: string, want: string)
     if !azd_ready() then return
@@ -300,48 +304,48 @@ private fno_filled(owner: string, ret: string) -> string =
 @test("a 'break' in the joining loop")
 fno_break()
     fno_refused(fno_filled("go", "") + "    for t in pool\n        if t.is_none() then break\n\n" +
-                "        t.unwrap().join()\n\ngo()\n", "go", FnoLeaves, "15:32")
+                "        t.unwrap().join()\n\ngo()\n", "go", FnoLeaves, "16:32")
 
 @test("a 'continue' before the join")
 fno_continue()
     fno_refused(fno_filled("go", "") + "    for i in 0..<4\n        if i == 0 then continue\n\n" +
-                "        pool[i].unwrap().join()\n\ngo()\n", "go", FnoLeaves, "15:32")
+                "        pool[i].unwrap().join()\n\ngo()\n", "go", FnoLeaves, "16:32")
 
 @test("a '?' in the joining loop")
 fno_question()
     fno_refused(fno_filled("go", " -> Option[int]") + "    for t in pool\n        t?.join()\n\n    Some(1)\n\n" +
-                "print(go().is_some())\n", "go", FnoLeaves, "15:32")
+                "print(go().is_some())\n", "go", FnoLeaves, "16:32")
 
 @test("a 'return' or a panic inside the joining loop")
 fno_return_or_panic()
     fno_refused(fno_filled("go", "") + "    for t in pool\n        if t.is_none() then return\n\n" +
-                "        t.unwrap().join()\n\ngo()\n", "go", FnoLeaves, "15:32")
+                "        t.unwrap().join()\n\ngo()\n", "go", FnoLeaves, "16:32")
     fno_refused(fno_filled("go", "") + "    for t in pool\n        if t.is_none() then panic(\"none\")\n\n" +
-                "        t.unwrap().join()\n\ngo()\n", "go", FnoLeaves, "15:32")
+                "        t.unwrap().join()\n\ngo()\n", "go", FnoLeaves, "16:32")
 
 @test("a join under a condition, a guarded arm, and a 'Some' arm that does not join")
 fno_conditional_join()
     fno_refused(fno_filled("go", "") + "    for i in 0..<4\n        if i > 0 then pool[i].unwrap().join()\n\ngo()\n",
-                "go", FnoSkips, "15:32")
+                "go", FnoSkips, "16:32")
     fno_refused(fno_filled("go", "") + "    for t in pool\n        t match\n            Some(h) if s.n > 0 -> h.join()\n" +
-                "            _ -> ()\n\ngo()\n", "go", FnoSkips, "15:32")
+                "            _ -> ()\n\ngo()\n", "go", FnoSkips, "16:32")
     fno_refused(fno_filled("go", "") + "    for t in pool\n        t match\n            Some(h) -> print(\"on\")\n" +
-                "            None -> ()\n\ngo()\n", "go", "; no loop over 'pool' joins each of its elements", "15:32")
+                "            None -> ()\n\ngo()\n", "go", "; no loop over 'pool' joins each of its elements", "16:32")
 
 @test("a joining loop over a narrower range")
 fno_narrower_range()
     fno_refused(fno_filled("go", "") + "    for i in 0..<3\n        pool[i].unwrap().join()\n\ngo()\n", "go",
-                "; the loop over 'pool' that joins its elements does not reach every element they were stored in", "15:32")
+                "; the loop over 'pool' that joins its elements does not reach every element they were stored in", "16:32")
     fno_refused(fno_filled("go", "") + "    for i in 1..<4\n        pool[i].unwrap().join()\n\ngo()\n", "go",
-                "; the loop over 'pool' that joins its elements does not reach every element they were stored in", "15:32")
+                "; the loop over 'pool' that joins its elements does not reach every element they were stored in", "16:32")
 
 @test("no loop joins the elements, or one joins a different collection")
 fno_no_joining_loop()
     fno_refused(fno_filled("go", "") + "    print(s.n)\n\ngo()\n", "go", "; no loop over 'pool' joins each of its elements",
-                "15:32")
+                "16:32")
     fno_refused(fno_filled("go", "") + "    var spare: [4]Option[Thread] = [None; 4]\n\n    for t in spare\n" +
                 "        if t is Some(h) then h.join()\n\ngo()\n", "go", "; no loop over 'pool' joins each of its elements",
-                "15:32")
+                "16:32")
 
 @test("a handle stored at an index other than its loop's counter")
 fno_computed_index()
@@ -358,7 +362,7 @@ fno_computed_index()
 
         go()
         """, "go", "; a handle kept in an element of 'pool' is matched to a loop that joins them only where it is " +
-        "stored at the counter of the counting loop it is in, or pushed", "15:36")
+        "stored at the counter of the counting loop it is in, or pushed", "16:36")
     fno_refused(raw"""
         go()
             var s = S(0)
@@ -373,7 +377,7 @@ fno_computed_index()
 
         go()
         """, "go", "; a handle kept in an element of 'pool' is matched to a loop that joins them only where it is " +
-        "stored at the counter of the counting loop it is in, or pushed", "16:36")
+        "stored at the counter of the counting loop it is in, or pushed", "17:36")
 
 @test("the collection stored into again, by a second round or as a whole, before its handles are joined")
 fno_stored_again()
@@ -390,11 +394,11 @@ fno_stored_again()
                 if t is Some(h) then h.join()
 
         go()
-        """, "go", FnoAgain, "16:36")
+        """, "go", FnoAgain, "17:36")
     fno_refused(fno_filled("go", "") + "    pool = [None; 4]\n\n    for t in pool\n        if t is Some(h) then h.join()\n\n" +
-                "go()\n", "go", FnoAgain, "15:32")
+                "go()\n", "go", FnoAgain, "16:32")
     fno_refused(fno_filled("go", "") + "    for i in 0..<4\n        pool[i] = spawn(&work, &s)\n\n    for t in pool\n" +
-                "        if t is Some(h) then h.join()\n\ngo()\n", "go", FnoAgain, "15:32")
+                "        if t is Some(h) then h.join()\n\ngo()\n", "go", FnoAgain, "16:32")
 
 @test("handles thrown away in a loop, and a pushed handle set over by index")
 fno_discarded_and_set_over()
@@ -406,7 +410,7 @@ fno_discarded_and_set_over()
                 spawn(&work, &s)
 
         go()
-        """, "go", "", "14:22")
+        """, "go", "", "15:22")
     fno_refused(raw"""
         go()
             var s = S(0)
@@ -420,7 +424,7 @@ fno_discarded_and_set_over()
 
         go()
         """, "go", "; a handle kept in an element of 'b' is matched to a loop that joins them only where it is " +
-        "stored at the counter of the counting loop it is in, or pushed", "15:33")
+        "stored at the counter of the counting loop it is in, or pushed", "16:33")
 
 @test("a function answering its fan-out may not hand it a local, and a caller that does not join is refused")
 fno_answered_refused()
@@ -435,7 +439,7 @@ fno_answered_refused()
             pool
 
         start_all()
-        """, "start_all", "", "15:32")
+        """, "start_all", "", "16:32")
 
     if !azd_ready() then return
 
@@ -462,3 +466,55 @@ fno_answered_refused()
                          "'&s' is the address of a local of 'go' — join that thread on every way out of 'go', " +
                          "or hand it storage that lasts"), said)
 end fno_answered_refused
+
+// -- the threads of a fan-out count into one S at once ---------------------------------------------
+//
+// Every accepted cell above runs its threads together into one `S`. These run enough turns, with a
+// yield between them, that a count which is not indivisible loses updates on every run rather than
+// once in a few hundred, so the prelude's `work` is pinned as atomic.
+
+@test("four threads pushed into a Buf and joined by a walk count every turn of every thread")
+fnr_buf_counts_every_turn()
+    fno_prints(raw"""
+        many(s: *S)
+            for _ in 0..<20000
+                work(s)
+                yield_now()
+
+        go()
+            var s = S(0)
+            var b: Buf[Thread] = buf()
+
+            for _ in 0..<4
+                b.push(spawn(&many, &s).unwrap())
+
+            for h in b
+                assert(h.join())
+
+            print(s.n)
+
+        go()
+        """, "80000\n")
+
+@test("four threads kept at a counting loop's counter and joined by index count every turn")
+fnr_array_counts_every_turn()
+    fno_prints(raw"""
+        many(s: *S)
+            for _ in 0..<20000
+                work(s)
+                yield_now()
+
+        go()
+            var s = S(0)
+            var pool: [4]Option[Thread] = [None; 4]
+
+            for i in 0..<pool.len
+                pool[i] = spawn(&many, &s)
+
+            for i in 0..<pool.len
+                pool[i].unwrap().join()
+
+            print(s.n)
+
+        go()
+        """, "80000\n")
