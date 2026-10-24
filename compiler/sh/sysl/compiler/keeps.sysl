@@ -4,7 +4,6 @@ import sh.sysl.parsing.Span
 import sysl.buf.{Buf, buf}
 import sysl.container.{Map, map}
 import sysl.text.from_utf8_unchecked
-
 // **A borrowed pointer cannot escape** (`reference/memory.md § A borrowed pointer cannot escape`).
 //
 // `&place` yields a `*T`, and a `*T` is an ordinary type: nothing in it says how long the storage it
@@ -14,11 +13,12 @@ import sysl.text.from_utf8_unchecked
 //
 // - it stores it somewhere the call does not own: a field reached through a pointer or a reference, a
 //   module's storage, a buffer's slot -- which is where a box, a closure and a `Buf` all end up;
-// - it passes it to another function's parameter that keeps it;
-// - it hands it back laundered into something that is not a pointer, an integer made of the address.
+// - it passes it to another function's parameter that keeps it.
 //
-// Handing it back AS a pointer is not keeping it: `field(s: *S) -> *int = &s.x` answers a pointer
-// lent for as long as the argument is, and the caller follows that answer as it follows the argument.
+// Handing it back is not keeping it: `field(s: *S) -> *int = &s.x` answers a pointer lent for as long
+// as the argument is, and the caller follows that answer as it follows the argument -- and so is
+// `address(p: *int) -> usize = usize(p)`, whose integer is the address itself. An integer COMPUTED
+// from an address (`usize(p) + 8`) is a number, and keeps nothing.
 // The answers are worked out to a fixed point, so a recursive function settles on what its body
 // does rather than on an assumption.
 //
@@ -116,6 +116,10 @@ struct KeepsCx
     // Every table the program reaches, which is every body a call through an object may land in.
     vtables: Buf[TVtable]
 
+    // Where the program's integers go, for an address as an integer leaving a frame
+    // (`keeps_cast.sysl`).
+    casts: &CastGraph
+
     find(self, name: string) -> Option[TFunc] = self.index.get(name) match
         Some(i) -> Some(self.funcs.at(i))
         None -> None
@@ -136,7 +140,7 @@ check_keeps(a: &Analysis, funcs: Buf[TFunc], vtables: Buf[TVtable])
         if !index.has(funcs.at(i).name) then index.put(funcs.at(i).name, i)
 
     val cx: &KeepsCx = KeepsCx(a, funcs, index, map(), map(), map(), buf(), buf(), false, map(), map(),
-                               buf(), map(), buf(), map(), map(), vtables)
+                               buf(), map(), buf(), map(), map(), vtables, CastGraph(buf(), false))
 
     for i in 0..<a.tables.extern_vars.len()
         cx.c_vars.push(extern_var_symbol(a.tables.extern_vars.at(i)))
@@ -178,6 +182,7 @@ check_keeps(a: &Analysis, funcs: Buf[TFunc], vtables: Buf[TVtable])
 
     loop
         faults = KeepFaults(buf())
+        cx.casts = CastGraph(buf(), false)
 
         warm_callees_first(cx)
 
@@ -764,15 +769,6 @@ private walk_kept_as(cx: &KeepsCx, f: TFunc, i: usize, promised: bool) -> KeptWh
 
     flow_body(w, f.body)
 
-    if f.body.result.is_some() && !promised
-        val evs: &EvBuf = EvBuf(buf())
-
-        laundered(t, evs, f.body.result.unwrap())
-
-        for ev in evs.items
-            add_kept(&w.out_pending, KeptAt(ev.loc, ev.how, ev.at))
-    end if
-
     var first: Option[KeptAt] = None
 
     for item in w.out_pending
@@ -821,8 +817,7 @@ private track_stmt_events(t: &Track, s: TStmt) -> Buf[FlowEv]
         TVarDecl(_, _, init, _) -> top_clears(t, evs, init)
         _ -> ()
 
-    walk_stmt(s, TWalk(false, e -> kept_at(t, evs, e), w -> stored(t, evs, w.place, w.value),
-                       x -> kept_stmt(t, evs, x)))
+    walk_stmt(s, TWalk(false, e -> kept_at(t, evs, e), w -> stored(t, evs, w.place, w.value), x -> ()))
     fan_stmt_events(t.hs, evs, s)
     t.hs.at = ""
     evs.items
@@ -834,8 +829,7 @@ private track_expr_events(t: &Track, e: TExpr) -> Buf[FlowEv]
     piece_moves(t.cx, evs, e)
     t.hs.at = expr_handle(t.hs, e)
     top_clears(t, evs, e)
-    walk_texpr(e, TWalk(false, x -> kept_at(t, evs, x), w -> stored(t, evs, w.place, w.value),
-                        s -> kept_stmt(t, evs, s)))
+    walk_texpr(e, TWalk(false, x -> kept_at(t, evs, x), w -> stored(t, evs, w.place, w.value), s -> ()))
     fan_events(t.hs, evs, e.span)
     t.hs.at = ""
     evs.items
@@ -932,30 +926,6 @@ end walk_answers
 private keep(t: &Track, how: string, at: Span)
     if !t.why.kept then t.why = KeptWhy(true, how, at, buf())
 
-// The function's own answer is handed back where the body ends as well as at each `return`.
-private kept_stmt(t: &Track, evs: &EvBuf, s: TStmt)
-    if t.promised then return
-
-    s match
-        TReturn(v) -> if v.is_some() then laundered(t, evs, v.unwrap())
-        _ -> ()
-end kept_stmt
-
-// A pointer handed back as something that is not a pointer -- the address as an integer -- is out
-// of every caller's sight from then on.
-private laundered(t: &Track, evs: &EvBuf, v: TExpr)
-    val cast = *v.kind match
-        TCast(x, ty) -> Some((x, ty))
-        TFloorCast(x, ty) -> Some((x, ty))
-        _ -> None
-
-    if cast.is_none() then return
-
-    val (x, ty) = cast.unwrap()
-
-    if is_integer_type(ty) && carries(t, x) then kept_hard(evs, s"it is returned as '${type_show(ty)}'", v.span)
-end laundered
-
 private kept_hard(evs: &EvBuf, how: string, at: Span) = evs.items.push(FlowEv(false, "", how, at))
 
 // Where a body lets what it tracks go: a store outside its own locals, a buffer's slot, an atomic
@@ -981,7 +951,7 @@ private kept_at(t: &Track, evs: &EvBuf, e: TExpr)
             join_clear(t.hs, evs, name, args, e.span)
 
             for j in 0..<args.len()
-                if !carries(t, args.at(j)) then continue
+                if !hands_on(t, args.at(j)) then continue
 
                 val how = s"it is passed to '${shown_name(t.cx.an, name)}', which keeps it"
 
@@ -996,7 +966,7 @@ private kept_at(t: &Track, evs: &EvBuf, e: TExpr)
             val all = with_receiver(recv, args)
 
             for j in 0..<args.len()
-                if !carries(t, args.at(j)) then continue
+                if !hands_on(t, args.at(j)) then continue
 
                 for item in vcall_keeps(t.cx, recv, slot, j)
                     val loc = translate_loc(t.org, all, item.1.loc)
@@ -1005,7 +975,7 @@ private kept_at(t: &Track, evs: &EvBuf, e: TExpr)
                     if !loc.starts_with("l:") then evs.items.push(FlowEv(false, loc, how, args.at(j).span))
         TCallPtr(callee, args, _, _) ->
             for j in 0..<args.len()
-                if !carries(t, args.at(j)) then continue
+                if !hands_on(t, args.at(j)) then continue
 
                 for item in pointer_keeps(t.cx, callee, j)
                     val loc = translate_loc(t.org, args, item.1.loc)
@@ -1037,15 +1007,10 @@ private stored(t: &Track, evs: &EvBuf, place: TExpr, v: TExpr)
         return
     end if
 
-    val cast = *v.kind match
-        TCast(x, ty) -> is_integer_type(ty) && carries(t, x)
-        TFloorCast(x, ty) -> is_integer_type(ty) && carries(t, x)
-        _ -> false
-
     // **An address stored as an integer is held where the integer is**, as the pointer would be: one
     // stored in the storage it points into ends with that storage, and one stored anywhere the call
     // does not own is kept.
-    if carries(t, v) || cast
+    if carries(t, v)
         evs.items.push(FlowEv(false, loc, s"it is stored in '${place_said(t.scope, place)}'", v.span))
     end if
 end stored
@@ -1054,8 +1019,25 @@ end stored
 // what it is a field of, a step through a pointer as the dot that wrote it.
 // A whole place written through a pointer is the pointer's target, `*out`.
 private place_said(scope: Scope, place: TExpr) -> string = *place.kind match
-    TDeref(x, _) -> s"*${place_path(scope, x)}"
+    // A nested function reaches its enclosing function's local through the address its environment
+    // holds, and the reader wrote the local's name.
+    TDeref(x, _) -> capture_name(x).unwrap_or(s"*${place_path(scope, x)}")
     _ -> place_path(scope, place)
+
+private capture_name(x: TExpr) -> Option[string] = *x.kind match
+    TField(r, index, _) ->
+        val env = pointee_or(texpr_type(r))
+
+        if is_environment(env) then Some(field_label(env, index)) else None
+    _ -> None
+
+private is_environment(t: Type) -> bool = t match
+    Struct(d) -> d.base.starts_with(s"${ModuleSep}env")
+    _ -> false
+
+private pointee_or(t: Type) -> Type = t match
+    Ptr(inner) -> *inner
+    _ -> t
 
 private place_path(scope: Scope, place: TExpr) -> string = *place.kind match
     TGlobal(symbol, _, _) -> bare_name(qualified_name(symbol))
@@ -1131,7 +1113,7 @@ end bind_store
 // argument points into this frame: the local holds it.
 private bind_call(t: &Track, name: string, args: Buf[TExpr])
     for j in 0..<args.len()
-        if !carries(t, args.at(j)) then continue
+        if !hands_on(t, args.at(j)) then continue
 
         for item in keeps_of(t.cx, name, j).locs
             val loc = translate_loc(t.org, args, item.loc)
@@ -1141,7 +1123,7 @@ end bind_call
 
 private bind_ptr_call(t: &Track, callee: TExpr, args: Buf[TExpr])
     for j in 0..<args.len()
-        if !carries(t, args.at(j)) then continue
+        if !hands_on(t, args.at(j)) then continue
 
         for item in pointer_keeps(t.cx, callee, j)
             val loc = translate_loc(t.org, args, item.1.loc)
@@ -1244,24 +1226,31 @@ private carries(t: &Track, e: TExpr) -> bool = *e.kind match
     // it is a pointer to it, one step further away.
     TAddrOf(place, _) -> into_pointee(t, place) || holds_local(t, place)
     TTempAddr(v, _) -> carries(t, v)
-    TStructNew(_, args) -> any_carries(t, args)
-    TEnumNew(_, _, args) -> any_carries(t, args)
-    TArrayLit(elems, _) -> any_carries(t, elems)
-    TArrayFill(v, _) -> carries(t, v)
-    TBufLit(elems, _) -> any_carries(t, elems)
-    TBufFill(v, _, _) -> carries(t, v)
+    TStructNew(_, args) -> holds_it(t, e) && any_carries(t, args)
+    TEnumNew(_, _, args) -> holds_it(t, e) && any_carries(t, args)
+    TArrayLit(elems, _) -> holds_it(t, e) && any_carries(t, elems)
+    TArrayFill(v, _) -> holds_it(t, e) && carries(t, v)
+    TBufLit(elems, _) -> holds_it(t, e) && any_carries(t, elems)
+    TBufFill(v, _, _) -> holds_it(t, e) && carries(t, v)
     TBox(v, _) -> carries(t, v)
     TErase(v, _, _) -> carries(t, v)
     TDowngrade(v, _) -> carries(t, v)
-    TCast(v, ty) -> (t.raw || may_hold_pointer(t.cx, ty)) && carries(t, v)
+
+    // **The address as an integer is the address**: `usize(p)` handed back or stored, or a call's
+    // answer that is one, is held as `p` would be. An integer anything is done with after that -- put
+    // in a local, converted again, `usize(p) + 8` -- is a number, which is the raw tier's.
+    TCast(v, ty) -> (t.raw || may_hold_pointer(t.cx, ty) || (is_integer_type(ty) && address_of_it(v))) && carries(t, v)
     TFloorCast(v, ty) -> (t.raw || may_hold_pointer(t.cx, ty)) && carries(t, v)
     TStore(_, v, _, _) -> carries(t, v)
     TBinary(_, left, right, ty) ->
         (t.raw || may_hold_pointer(t.cx, ty)) && (carries(t, left) || carries(t, right))
 
     // What a call answers may be made of what it was handed. A callee with a body here says which of
-    // its arguments its answer is made of; one through an object or a pointer may be made of any.
-    TCall(name, args, ty, _) -> may_hold_pointer(t.cx, ty) && call_carries(t, name, args, ty)
+    // its arguments its answer is made of; one through an object or a pointer may be made of any. An
+    // integer is followed only through a body: a C function's number is not made of an address.
+    TCall(name, args, ty, _) ->
+        (may_hold_pointer(t.cx, ty) || (is_integer_type(ty) && t.cx.find(name).is_some())) &&
+            call_carries(t, name, args, ty)
     TVCall(recv, _, args, ty, _) ->
         may_hold_pointer(t.cx, ty) && (carries(t, recv) || any_carries(t, args))
     TCallPtr(callee, args, _, ty) ->
@@ -1308,6 +1297,19 @@ private into_pointee(t: &Track, place: TExpr) -> bool = *place.kind match
         Ptr(_) -> carries(t, r)
         _ -> false
     _ -> false
+
+// Whether a value turned into an integer is an address, rather than a number already.
+private address_of_it(v: TExpr) -> bool = !is_integer_type(texpr_type(v))
+
+// Whether an argument hands what is tracked to the callee's keeps. **An integer parameter is not
+// asked what it keeps**: a number a callee stores is how nearly every integer is used, so a
+// parameter's address handed on as one is the raw tier's, and a frame's own is followed to a
+// `ptr_cast` instead (`image_passed`, `keeps_cast.sysl`).
+private hands_on(t: &Track, arg: TExpr) -> bool = !is_integer_type(texpr_type(arg)) && carries(t, arg)
+
+// Whether a value built around what is tracked can hold it: a struct with no pointer inside, built of
+// `usize(p)`, is a number like any other.
+private holds_it(t: &Track, e: TExpr) -> bool = t.raw || may_hold_pointer(t.cx, texpr_type(e))
 
 private holds_local(t: &Track, place: TExpr) -> bool = *place.kind match
     TLoad(n, _) -> t.holds(n)
@@ -1461,6 +1463,10 @@ struct FrameTrack
     changed: bool
     org: &Origins
     hs: &Handles
+    func: TFunc
+
+    // The locals bound once to a pointer, each with what it was bound to (`frame_lasting`).
+    inits: Buf[(string, TExpr)]
 
     core_of(self, name: string) -> Option[string]
         for item in self.held
@@ -1480,10 +1486,11 @@ private check_calls(cx: &KeepsCx, faults: &KeepFaults, f: TFunc)
 
     val org = origins_of(cx, f)
     val ft: &FrameTrack = FrameTrack(cx, faults, func_home(cx.an, f.name), shown_name(cx.an, f.name),
-                                     f.params, buf(), buf(), false, org, handles_of(org, f))
+                                     f.params, buf(), buf(), false, org, handles_of(org, f), f, buf())
 
     walk_block_stmts(f.body, stmt_walk(false, s -> s match
         TRefDecl(n, _, place) -> ft.refs.push((n, place))
+        TVarDecl(n, ty, init, _) -> if may_hold_pointer(cx, ty) && stable_name(org, n) != "" then ft.inits.push((n, init))
         _ -> ()))
 
     ft.changed = true
@@ -1506,8 +1513,9 @@ private check_calls(cx: &KeepsCx, faults: &KeepFaults, f: TFunc)
         ft.faults.items.push((ft.scope, item.at, item.how))
 
     // **Only an answer that can hold an address hands one back**: a body whose last expression is a
-    // call answering a pointer, in a function that answers nothing, throws the pointer away.
-    if !may_hold_pointer(cx, f.ret_ty) then return
+    // call answering a pointer, in a function that answers nothing, throws the pointer away. An
+    // integer answer may be an address as an integer (`returned_image`).
+    if !may_hold_pointer(cx, f.ret_ty) && !is_integer_type(f.ret_ty) then return
 
     walk_block_stmts(f.body, stmt_walk(false, s -> s match
         TReturn(v) -> if v.is_some() then returned_frame(ft, v.unwrap())
@@ -1521,10 +1529,14 @@ end check_calls
 // around it, or a call whose answer is made of it. The address written in place (`&n`) is the escape
 // check's (`escape.sysl`'s `refuse_dangling`), which this leaves to it.
 private returned_frame(ft: &FrameTrack, v: TExpr)
+    val image = is_integer_type(texpr_type(v))
+
     *v.kind match
         TAddrOf(_, _) -> ()
         TTempAddr(_, _) -> ()
-        TCast(x, _) -> returned_frame(ft, x)
+        TCast(x, _) ->
+            // A pointer made of an integer is a pointer, whatever the integer was made of.
+            if image || is_integer_type(texpr_type(x)) then returned_core(ft, v, image) else returned_frame(ft, x)
         TBlockExpr(b) -> returned_block(ft, b)
         TIf(_, then_block, else_block, _) ->
             returned_block(ft, then_block)
@@ -1533,15 +1545,35 @@ private returned_frame(ft: &FrameTrack, v: TExpr)
         TMatch(_, arms, _) ->
             for arm in arms
                 returned_block(ft, arm.body)
-        _ ->
-            frame_core(ft, v) match
-                Some(core) ->
-                    ft.faults.items.push((ft.scope, v.span,
-                        s"'${value_text(ft.scope, v)}' is returned, but it holds $core, whose " +
-                        s"storage ends when '${ft.owner}' returns — return the value itself, or take " +
-                        "the storage from the caller as a '*T' parameter"))
-                None -> ()
+        _ -> returned_core(ft, v, image)
 end returned_frame
+
+private returned_core(ft: &FrameTrack, v: TExpr, image: bool)
+    val core = frame_core(ft, v)
+
+    if core.is_none() then return
+
+    if !image
+        ft.faults.items.push((ft.scope, v.span,
+            s"'${value_text(ft.scope, v)}' is returned, but it holds ${core.unwrap()}, whose storage ends " +
+            s"when '${ft.owner}' returns — return the value itself, or take the storage from the caller " +
+            "as a '*T' parameter"))
+        return
+    end if
+
+    // **An address as an integer handed back is a number until something turns it back into a
+    // pointer**: measuring a stack by `usize(&marker)` is the integer's whole use. Only one a
+    // `ptr_cast` may make a pointer of again is refused, since that pointer is into a frame that is gone.
+    val cast = cast_reach(ft.cx, s"r:${ft.func.name}", false)
+
+    if cast.is_none() then return
+
+    ft.faults.items.push((ft.scope, v.span,
+        s"'${value_text(ft.scope, v)}' is returned, but it holds ${core.unwrap()} as an integer, which " +
+        s"'${shown_name(ft.cx.an, cast.unwrap())}' turns back into a pointer with 'ptr_cast' after the " +
+        s"storage has ended with '${ft.owner}' — return the value itself, or take the storage from the " +
+        "caller as a '*T' parameter"))
+end returned_core
 
 private returned_block(ft: &FrameTrack, b: TBlock) =
     if b.result.is_some() then returned_frame(ft, b.result.unwrap())
@@ -1681,7 +1713,9 @@ end frame_event_at
 // the frame**, unless it is overwritten before every way out. Anywhere else -- a heap object, a
 // pointer nobody here can name -- is the keeps of whoever owns that storage.
 private frame_stored(ft: &FrameTrack, evs: &EvBuf, place: TExpr, v: TExpr)
-    if !may_hold_pointer(ft.cx, texpr_type(v)) then return
+    val image = is_integer_type(texpr_type(v))
+
+    if !may_hold_pointer(ft.cx, texpr_type(v)) && !image then return
 
     val core = frame_core(ft, v)
 
@@ -1689,15 +1723,51 @@ private frame_stored(ft: &FrameTrack, evs: &EvBuf, place: TExpr, v: TExpr)
 
     val loc = place_loc(ft.org, place)
 
-    if !loc.starts_with("g:") && !loc.starts_with("p") then return
+    if !frame_lasting(ft, loc, 0) then return
 
+    // **An address as an integer stored where it outlives the frame is a number** -- a stack's top
+    // remembered to measure its depth by -- **until a `ptr_cast` may turn it back into a pointer**.
+    var turned = ""
+
+    if image
+        val keys = cast_keys_of(ft.cx, ft.func, place)
+
+        for k in keys
+            if turned == "" then turned = cast_reach(ft.cx, k, false).unwrap_or("")
+
+        if turned == "" then return
+    end if
+
+    val back = if image then s" and '${shown_name(ft.cx.an, turned)}' turns back into a pointer with 'ptr_cast'" else ""
     val said = s"${argument_said(ft, v, core.unwrap())}, and it is stored in " +
-        s"'${place_said(ft.scope, place)}', which outlives '${ft.owner}' — store the value itself, or " +
+        s"'${place_said(ft.scope, place)}', which outlives '${ft.owner}'$back — store the value itself, or " +
         "storage that lasts"
 
     if loc.index_of("?").is_some() then ft.faults.items.push((ft.scope, v.span, said))
     else evs.items.push(FlowEv(false, loc, said, v.span))
 end frame_stored
+
+// **Storage outlives the frame when it is module storage or reached through a parameter** -- by a
+// path the body names (`p0:.next`), or through a pointer read out of one (`d:p0:.vm>{*M}.con`), the
+// same storage whichever local the pointer was first read into (`d:@vm`, `frame_inits`).
+private frame_lasting(ft: &FrameTrack, loc: string, depth: int) -> bool
+    if loc.starts_with("g:") || loc.starts_with("p") || loc.starts_with("d:g:") || loc.starts_with("d:p") then return true
+    if !loc.starts_with("d:@") || depth > 8 then return false
+
+    val n = local_of(loc[1..<loc.bytes.len])
+
+    for item in ft.inits
+        if item.0 != n then continue
+
+        val at = *item.1.kind match
+            TLoad(m, _) -> stable_name(ft.org, m)
+            _ -> place_loc(ft.org, item.1)
+
+        return frame_lasting(ft, at, depth + 1)
+    end for
+
+    false
+end frame_lasting
 
 private frame_bind(ft: &FrameTrack, name: string, v: TExpr)
     if ft.core_of(name).is_some() then return
@@ -1719,6 +1789,11 @@ private call_at(ft: &FrameTrack, evs: &EvBuf, e: TExpr)
 
             for j in 0..<args.len()
                 val arg = args.at(j)
+
+                if is_integer_type(texpr_type(arg))
+                    image_passed(ft, name, j, arg)
+                    continue
+                end if
 
                 if !may_hold_pointer(ft.cx, texpr_type(arg)) then continue
 
@@ -1811,6 +1886,25 @@ private call_at(ft: &FrameTrack, evs: &EvBuf, e: TExpr)
         _ -> ()
 end call_at
 
+// **An address as an integer handed to a callee** is refused only where the callee may put it in
+// storage that outlives the call and something turns it back into a pointer from there; one the
+// callee turns back while it runs reaches a frame that is still there.
+private image_passed(ft: &FrameTrack, name: string, j: usize, arg: TExpr)
+    val core = frame_core(ft, arg)
+
+    if core.is_none() then return
+
+    val cast = cast_reach(ft.cx, s"a:$name|$j", true)
+
+    if cast.is_none() then return
+
+    ft.faults.items.push((ft.scope, arg.span,
+        s"'${shown_name(ft.cx.an, name)}' may store its parameter '${param_name(ft.cx, name, j)}' where it " +
+        s"outlives the call, and ${argument_said(ft, arg, core.unwrap())} as an integer, which " +
+        s"'${shown_name(ft.cx.an, cast.unwrap())}' turns back into a pointer with 'ptr_cast' — store the " +
+        "value itself, or hand it storage that lasts"))
+end image_passed
+
 // What an argument is, as the refusal says it: an address written `&n` IS the address of the storage,
 // a receiver a method was called on is the storage itself, and anything else HOLDS the address.
 private argument_said(ft: &FrameTrack, arg: TExpr, core: string) -> string
@@ -1832,13 +1926,17 @@ end argument_said
 private frame_core(ft: &FrameTrack, e: TExpr) -> Option[string] = *e.kind match
     TAddrOf(place, _) -> frame_place(ft, place)
     TTempAddr(_, _) -> Some(s"the address of a value made in place in '${ft.owner}'")
-    TLoad(n, ty) -> if may_hold_pointer(ft.cx, ty) then ft.core_of(n) else None
-    TStructNew(_, args) -> first_core(ft, args)
-    TEnumNew(_, _, args) -> first_core(ft, args)
-    TArrayLit(elems, _) -> first_core(ft, elems)
+    TLoad(n, ty) -> if may_hold_pointer(ft.cx, ty) || is_integer_type(ty) then ft.core_of(n) else None
+    TStructNew(_, args) -> if may_hold_pointer(ft.cx, texpr_type(e)) then first_core(ft, args) else None
+    TEnumNew(_, _, args) -> if may_hold_pointer(ft.cx, texpr_type(e)) then first_core(ft, args) else None
+    TArrayLit(elems, _) -> if may_hold_pointer(ft.cx, texpr_type(e)) then first_core(ft, elems) else None
     TBox(v, _) -> frame_core(ft, v)
     TErase(v, _, _) -> frame_core(ft, v)
-    TCast(v, ty) -> if may_hold_pointer(ft.cx, ty) then frame_core(ft, v) else None
+
+    // The address as an integer is still the address (`returned_image`); one computed from it is a
+    // number.
+    TCast(v, ty) -> if may_hold_pointer(ft.cx, ty) || is_integer_type(ty) then frame_core(ft, v) else None
+    TFloorCast(v, ty) -> if is_integer_type(ty) then frame_core(ft, v) else None
     TField(r, _, ty) -> if may_hold_pointer(ft.cx, ty) then frame_core(ft, r) else None
     TSeq(exprs) -> if exprs.is_empty() then None else frame_core(ft, exprs.at(exprs.len() - 1))
     TBlockExpr(b) -> block_core(ft, b)
@@ -1853,7 +1951,10 @@ private frame_core(ft: &FrameTrack, e: TExpr) -> Option[string] = *e.kind match
             if found.is_none() then found = block_core(ft, arm.body)
 
         found
-    TCall(name, args, ty, _) -> if may_hold_pointer(ft.cx, ty) then answer_core(ft, name, args, ty) else None
+    TCall(name, args, ty, _) ->
+        val image = is_integer_type(ty) && ft.cx.find(name).is_some()
+
+        if may_hold_pointer(ft.cx, ty) || image then answer_core(ft, name, args, ty) else None
     _ -> None
 
 // The frame storage a call's answer may be made of: an argument's, where the callee answers with it.
@@ -2041,6 +2142,8 @@ private value_text(scope: Scope, e: TExpr) -> string
         TCall(_, _, _, _) -> true
         TStructNew(_, _) -> true
         TEnumNew(_, _, _) -> true
+        TCast(_, _) -> true
+        TFloorCast(_, _) -> true
         _ -> false
 
     val at = e.span

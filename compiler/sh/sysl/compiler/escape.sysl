@@ -1169,7 +1169,8 @@ end ExprList
 // would leave nothing to let it go.
 //
 // What answers is every `return`'s value and the body's own value, followed through a conversion
-// (`ptr_cast` among them) and into the tail of a block, an `if` branch or a `match` arm. The place is
+// from one pointer type to another and into the tail of a block, an `if` branch or a `match` arm. The
+// address as an integer, and a pointer made of one, are the keeps-analysis's. The place is
 // walked through fields, through the elements of a fixed array and through a `ref`, and stops at a
 // pointer or a reference -- storage reached through either is wherever the address points, which is
 // the caller's to keep alive. Module storage is never the frame's. `&` of a value with no storage of
@@ -1203,7 +1204,12 @@ private dangling_tail(a: &Analysis, scope: Scope, refs: Buf[(string, TExpr)],
             "the address of a value made in place is returned, but the slot made to hold it is this " +
             "function's own, and its storage ends when the function returns — return the value " +
             "itself, or take the storage from the caller as a '*T' parameter")
-        TCast(operand, _) -> dangling_tail(a, scope, refs, params, operand)
+        // An address as an integer is a number until something turns it back into a pointer, which
+        // the keeps-analysis follows (`keeps.sysl`'s `returned_core`), and so is a pointer made of one.
+        TCast(operand, ty) ->
+            if !is_integer_type(ty) && !is_integer_type(texpr_type(operand))
+                dangling_tail(a, scope, refs, params, operand)
+            end if
         TBlockExpr(block) -> dangling_block(a, scope, refs, params, block)
         TIf(_, then_block, else_block, _) ->
             dangling_block(a, scope, refs, params, then_block)

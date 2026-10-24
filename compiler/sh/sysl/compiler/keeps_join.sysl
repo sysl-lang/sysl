@@ -326,6 +326,15 @@ private struct FanScan
     writes: Buf[(Span, string)]
     written: Buf[string]
     answered: Buf[string]
+
+    // Every store into an element of a collection, or over a whole array: where, the collection,
+    // whether it stores a fan-out's handle, and the head of the counting loop it is at the counter of
+    // (`span_zero()` where it is at no counter).
+    elems: Buf[(Span, string, bool, Span)]
+
+    // Which collections are names for one storage (`fan_shared`): a slice made of an array, a slice of
+    // a slice, a pointer to either, a reference copied.
+    shares: Buf[(string, string)]
 end FanScan
 
 private struct FanSeen
@@ -335,9 +344,13 @@ private no_fan_ctx() -> FanCtx = FanCtx("", "", span_zero())
 
 // Finds every fan-out in `f`'s body and says what its stores, loops and writes do, for the walk.
 private fan_out(hs: &Handles, f: TFunc)
-    val sc: &FanScan = FanScan(buf(), buf(), buf(), buf(), buf())
+    val sc: &FanScan = FanScan(buf(), buf(), buf(), buf(), buf(), buf(), buf())
 
-    walk_block_stmts(f.body, TWalk(false, e -> fan_written_expr(sc, e), w -> fan_written(sc, w.place),
+    // A parameter's storage is the caller's, and two of them may be one.
+    for p in f.params
+        if fan_view_type(p.1) then sc.shares.push((p.0, "?"))
+
+    walk_block_stmts(f.body, TWalk(false, e -> fan_written_expr(sc, hs, e), w -> fan_written(sc, hs, w.place, w.value),
                                    s -> fan_answered(sc, hs, s)))
 
     if f.body.result.is_some() then sc.answered.push(coll_key(hs, f.body.result.unwrap()))
@@ -346,20 +359,92 @@ private fan_out(hs: &Handles, f: TFunc)
     fan_settle(sc, hs)
 end fan_out
 
-private fan_written(sc: &FanScan, place: TExpr)
+private fan_written(sc: &FanScan, hs: &Handles, place: TExpr, v: TExpr)
     *place.kind match
         TLoad(n, _) -> sc.written.push(n)
         _ -> ()
 
-private fan_written_expr(sc: &FanScan, e: TExpr)
+    fan_shares(sc, hs, frame_place_key(hs, place), v)
+end fan_written
+
+private fan_written_expr(sc: &FanScan, hs: &Handles, e: TExpr)
     *e.kind match
-        TStore(place, _, _, _) -> fan_written(sc, place)
+        TStore(place, v, _, _) -> fan_written(sc, hs, place, v)
         _ -> ()
 
 private fan_answered(sc: &FanScan, hs: &Handles, s: TStmt)
     s match
         TReturn(v) -> if v.is_some() then sc.answered.push(coll_key(hs, v.unwrap()))
+        TVarDecl(n, _, init, _) -> fan_shares(sc, hs, n, init)
         _ -> ()
+
+// **A collection given a view of another's storage is a second name for it** -- `val a = pool[0..<n]`,
+// a slice of a slice, `&pool`, a reference copied -- so a store through either is a store into both.
+// A view out of storage nobody here can name (`?`) may be any other such view.
+private fan_shares(sc: &FanScan, hs: &Handles, name: string, v: TExpr)
+    if name == "" || !fan_view_type(texpr_type(v)) then return
+
+    val root = fan_root(hs, v)
+
+    if root != "" && root != name then sc.shares.push((name, root))
+end fan_shares
+
+private fan_view_type(ty: Type) -> bool = ty match
+    Slice(_, _) -> true
+    Ptr(_) -> true
+    Ref(_, _) -> true
+    _ -> false
+
+// The storage a view is made of, said as the collection it is a view of: nothing for storage made
+// afresh, `?` for storage nobody here can name.
+private fan_root(hs: &Handles, v: TExpr) -> string = *v.kind match
+    TSlice(base, _, _, _, _) -> fan_root_place(hs, base)
+    TAddrOf(place, _) -> fan_root_place(hs, place)
+    TCast(x, _) -> fan_root(hs, x)
+    TLoad(_, _) -> fan_root_place(hs, v)
+    TField(_, _, _) -> fan_root_place(hs, v)
+    TArrayLit(_, _) -> ""
+    TArrayFill(_, _) -> ""
+    TBufLit(_, _) -> ""
+    TBufFill(_, _, _) -> ""
+    // An object a call with nothing to make it of answers is a new one -- `buf()`.
+    TCall(_, args, ty, _) -> if args.is_empty() && fan_object(ty) then "" else "?"
+    _ -> "?"
+
+private fan_object(ty: Type) -> bool = ty match
+    Ref(_, _) -> true
+    _ -> false
+
+private fan_root_place(hs: &Handles, place: TExpr) -> string
+    val key = coll_key(hs, place)
+
+    if key == "" then "?" else key
+end fan_root_place
+
+// Whether two collections may be one storage.
+private fan_shared(sc: &FanScan, a: string, b: string) -> bool
+    var seen: Buf[string] = buf()
+    var todo: Buf[string] = buf()
+
+    todo.push(a)
+
+    while !todo.is_empty()
+        val n = todo.at(todo.len() - 1)
+
+        todo.truncate(todo.len() - 1)
+
+        if n == b then return true
+        if holds_string(seen, n) then continue
+
+        seen.push(n)
+
+        for e in sc.shares
+            if e.0 == n then todo.push(e.1)
+            if e.1 == n then todo.push(e.0)
+    end while
+
+    false
+end fan_shared
 
 private fan_scan_block(sc: &FanScan, hs: &Handles, b: TBlock, cx: FanCtx)
     fan_scan_stmts(sc, hs, b.stmts, cx)
@@ -412,8 +497,12 @@ private fan_scan_expr(sc: &FanScan, hs: &Handles, e: TExpr, cx: FanCtx)
         TCall(name, args, _, _) ->
             if calls_member(name, "push") && args.len() == 2
                 fan_push(sc, hs, args.at(0), args.at(1), e.span)
-            else if calls_member(name, "index_set") && args.len() == 3 && starts_thread(hs, args.at(2))
-                fan_element(sc, hs, coll_key(hs, args.at(0)), args.at(1), "", e.span, cx)
+            else if calls_member(name, "index_set") && args.len() == 3
+                val fan = starts_thread(hs, args.at(2))
+
+                fan_elem_store(sc, hs, coll_key(hs, args.at(0)), args.at(1), fan, e.span, cx)
+
+                if fan then fan_element(sc, hs, coll_key(hs, args.at(0)), args.at(1), "", e.span, cx)
             end if
         _ -> ()
 end fan_scan_expr
@@ -428,17 +517,30 @@ private fan_store(sc: &FanScan, hs: &Handles, place: TExpr, v: TExpr, at: Span, 
 
         if key != "" then sc.writes.push((at, key))
 
+        // An array written whole writes every element, of every view of it as well.
+        if key != "" && is_array_type(texpr_type(place)) then sc.elems.push((at, key, false, span_zero()))
+
         return
     end if
 
-    // An element at a constant index is a place of its own (`pool[=0]`), which a join of it, or of
-    // every element, takes back.
-    if !starts_thread(hs, v) || frame_place_key(hs, place) != "" then return
-
     val (coll, index, suffix) = path.unwrap()
 
-    fan_element(sc, hs, coll, index, suffix, at, cx)
+    // An element at a constant index is a place of its own (`pool[=0]`), which a join of it, or of
+    // every element, takes back.
+    val fan = starts_thread(hs, v) && frame_place_key(hs, place) == ""
+
+    fan_elem_store(sc, hs, coll, index, fan, at, cx)
+
+    if fan then fan_element(sc, hs, coll, index, suffix, at, cx)
 end fan_store
+
+private fan_elem_store(sc: &FanScan, hs: &Handles, coll: string, index: TExpr, fan: bool, at: Span, cx: FanCtx)
+    if coll == "" then return
+
+    val turn = if cx.counter != "" && is_counter(index, cx.counter) then cx.hook else span_zero()
+
+    sc.elems.push((at, coll, fan, turn))
+end fan_elem_store
 
 private fan_element(sc: &FanScan, hs: &Handles, coll: string, index: TExpr, suffix: string, at: Span, cx: FanCtx)
     if coll == "" then return
@@ -546,6 +648,18 @@ private fan_settle(sc: &FanScan, hs: &Handles)
                 hs.fan_hooks.push((w.0, FlowEv(false, s"j:${f.loc}", FAN_ROUND, w.0)))
             end if
 
+        // **An element stored over loses the handle it held**: anything stored into an element of the
+        // collection but the fan-out's own handles -- except the fresh element of a turn of a loop
+        // that stores them -- and anything at all stored through another name for its storage.
+        for e in sc.elems
+            if e.1 == f.coll
+                if e.2 || fan_turn(hs, f, e.3) then continue
+
+                hs.fan_hooks.push((e.0, FlowEv(false, s"j:${f.loc}", FAN_ROUND, e.0)))
+            else if fan_shared(sc, e.1, f.coll)
+                hs.fan_hooks.push((e.0, FlowEv(false, s"j:${f.loc}", s"$FAN_ROUND|${e.1}", e.0)))
+            end if
+
     // A loop joining every element itself releases whatever the collection holds -- a call that answered
     // the whole collection among it -- unless a fan-out keeps handles in fields of the elements.
     for l in sc.loops
@@ -558,6 +672,17 @@ private fan_settle(sc: &FanScan, hs: &Handles)
 
         if !fields then hs.fan_hooks.push((l.hook, FlowEv(true, s"j:${l.coll}", "", l.hook)))
 end fan_settle
+
+// Whether the counting loop whose head is at `hook` is one that stores the fan-out's handles, so that
+// its turn's own element is a fresh one.
+private fan_turn(hs: &Handles, f: &Fan, hook: Span) -> bool
+    if hook == span_zero() then return false
+
+    for item in hs.fan_hooks
+        if item.0 == hook && item.1.how == FAN_ROUND && item.1.loc == s"j:${f.loc}" then return true
+
+    false
+end fan_turn
 
 private fan_covers(l: FanLoop, f: &Fan) -> bool
     if l.whole then return true
@@ -613,10 +738,11 @@ fan_stmt_events(hs: &Handles, evs: &EvBuf, s: TStmt)
 fan_event(pending: *Buf[KeptAt], ev: FlowEv) -> bool
     if ev.clear || !ev.loc.starts_with("j:") then return false
 
-    if ev.how == FAN_ROUND
+    if ev.how.starts_with(FAN_ROUND)
         var out: Buf[KeptAt] = buf()
         val coll = ev.loc[2..<ev.loc.index_of("[").unwrap_or(ev.loc.bytes.len)]
-        val why = s"; '$coll' is stored into again before the handles it holds are joined"
+        val through = ev.how[FAN_ROUND.bytes.len..<ev.how.bytes.len]
+        val why = fan_round_why(coll, through)
 
         for p in *pending
             out.push(if p.loc == ev.loc then KeptAt("", p.how + why, p.at) else p)
@@ -638,10 +764,23 @@ fan_event(pending: *Buf[KeptAt], ev: FlowEv) -> bool
     false
 end fan_event
 
-// The collection an expression names, as the frame's own place: through `&` and a cast.
+private fan_round_why(coll: string, through: string) -> string
+    if !through.starts_with("|") then return s"; '$coll' is stored into again before the handles it holds are joined"
+
+    s"; '$coll' is stored into again through '${through[1..<through.bytes.len]}', which shares its storage, " +
+        "before the handles it holds are joined"
+end fan_round_why
+
+// The collection an expression names, as the frame's own place: through `&`, a cast and a local
+// pointer.
 private coll_key(hs: &Handles, e: TExpr) -> string = *e.kind match
     TAddrOf(place, _) -> coll_key(hs, place)
     TCast(v, _) -> coll_key(hs, v)
+
+    // An array reached through a local pointer to it is named by the pointer (`fan_shares`).
+    TDeref(x, _) -> *x.kind match
+        TLoad(_, _) -> coll_key(hs, x)
+        _ -> ""
     TLoad(_, _) -> frame_place_key(hs, e)
     TField(_, _, _) -> frame_place_key(hs, e)
     _ -> ""

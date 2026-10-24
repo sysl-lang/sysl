@@ -1,0 +1,200 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+
+// **An address as an integer is only a number until a `ptr_cast` makes it a pointer again** -- the
+// half of the keeps-analysis (`keeps.sysl`) that says whether the integer image of a frame's own
+// storage, once it has left the frame, can come back as an address.
+//
+// `usize(&marker)` stored in module storage or handed back is how a program measures its stack, and
+// as a number it outlives nothing. What would let a dead frame be reached is the number turned back
+// into a pointer. So every integer the program moves is followed through the storage it passes
+// through, as a graph over where an integer can be:
+//
+// - `g:<symbol>` -- a module variable;
+// - `f:<struct>.<field>` -- a field of any value of that struct, wherever it lives;
+// - `*<type>` and `[<type>` -- what any pointer to an integer of that type points at, and any element
+//   of one;
+// - `l:<function>|<local>`, `a:<function>|<position>` -- a function's local and its parameter;
+// - `r:<function>` -- what a function answers;
+// - `^<function>` -- a `ptr_cast` from an integer in that function's body.
+//
+// An edge says an integer at one may be stored at the other. A call's answer is taken to be made of
+// every integer handed to it, which is more than most calls do, and a field, a pointee or an element
+// is one place for every value of its type: a refusal it leads to names the `ptr_cast` it found.
+//
+// Not followed: an integer handed through a function pointer, a call through an object, or an enum's
+// payload -- what those reach is the raw tier's bargain, as arithmetic on an address is.
+
+// The program's integer moves, built when a frame's image is first seen leaving it, and again each
+// round, since a call's answers may still be growing.
+struct CastGraph
+    edges: Buf[(string, string)]
+    built: bool
+
+private struct CastScan
+    g: &CastGraph
+    cx: &KeepsCx
+    f: TFunc
+
+// The function whose `ptr_cast` an integer at `from` may reach, and nothing where none can. With
+// `lasting`, only a way through storage that outlives a call counts -- which is the question asked of
+// an integer handed to a callee, since one the callee turns back while the caller's frame is still
+// there reaches nothing dead.
+cast_reach(cx: &KeepsCx, from: string, lasting: bool) -> Option[string]
+    val g = cast_graph(cx)
+    var seen: Buf[string] = buf()
+    var todo: Buf[(string, bool)] = buf()
+
+    todo.push((from, !lasting))
+
+    while !todo.is_empty()
+        val (n, through) = todo.at(todo.len() - 1)
+
+        todo.truncate(todo.len() - 1)
+
+        if n.starts_with("^") && through then return Some(n[1..<n.bytes.len])
+
+        val key = if through then s"+$n" else n
+
+        if holds_string(seen, key) then continue
+
+        seen.push(key)
+
+        for e in g.edges
+            if e.0 == n then todo.push((e.1, through || cast_lasting(e.1)))
+    end while
+
+    None
+end cast_reach
+
+private cast_lasting(n: string) -> bool =
+    n.starts_with("g:") || n.starts_with("f:") || n.starts_with("*") || n.starts_with("[")
+
+private cast_graph(cx: &KeepsCx) -> &CastGraph
+    if cx.casts.built then return cx.casts
+
+    cx.casts.built = true
+
+    for f in cx.funcs
+        cast_func(cx, f)
+
+    cx.casts
+end cast_graph
+
+private cast_func(cx: &KeepsCx, f: TFunc)
+    val sc: &CastScan = CastScan(cx.casts, cx, f)
+
+    walk_block_stmts(f.body, TWalk(false, e -> cast_expr(sc, e), w -> cast_store(sc, w.place, w.value),
+                                   s -> cast_stmt(sc, s)))
+
+    if f.body.result.is_some() then cast_answer(sc, f.body.result.unwrap())
+end cast_func
+
+private cast_stmt(sc: &CastScan, s: TStmt)
+    s match
+        TVarDecl(n, _, init, _) -> cast_flow(sc, init, s"l:${sc.f.name}|$n")
+        TReturn(v) -> if v.is_some() then cast_answer(sc, v.unwrap())
+        _ -> ()
+end cast_stmt
+
+private cast_answer(sc: &CastScan, v: TExpr)
+    if is_integer_type(sc.f.ret_ty) then cast_flow(sc, v, s"r:${sc.f.name}")
+
+private cast_expr(sc: &CastScan, e: TExpr)
+    *e.kind match
+        TCast(v, ty) -> if cast_to_pointer(ty) then cast_flow(sc, v, s"^${sc.f.name}")
+        TStore(place, v, _, _) -> cast_store(sc, place, v)
+        TUpdate(place, _, v, _, _, _, _) ->cast_store(sc, place, v)
+        TCall(name, args, _, _) ->
+            for j in 0..<args.len()
+                cast_flow(sc, args.at(j), s"a:$name|$j")
+        TStructNew(_, args) ->
+            val ty = texpr_type(e)
+
+            for k in 0..<args.len()
+                cast_flow(sc, args.at(k), cast_field(ty, int(k)))
+        _ -> ()
+end cast_expr
+
+private cast_store(sc: &CastScan, place: TExpr, v: TExpr)
+    for k in cast_keys(sc, place)
+        cast_flow(sc, v, k)
+end cast_store
+
+private cast_flow(sc: &CastScan, v: TExpr, to: string)
+    if !is_integer_type(texpr_type(v)) then return
+
+    for k in cast_keys(sc, v)
+        sc.g.edges.push((k, to))
+end cast_flow
+
+private cast_to_pointer(ty: Type) -> bool = underlying(ty) match
+    Ptr(_) -> true
+    _ -> false
+
+// Where an integer value may have been read from.
+cast_keys_of(cx: &KeepsCx, f: TFunc, e: TExpr) -> Buf[string]
+    val sc: &CastScan = CastScan(cx.casts, cx, f)
+
+    cast_keys(sc, e)
+end cast_keys_of
+
+private cast_keys(sc: &CastScan, e: TExpr) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    cast_keys_into(sc, e, &out)
+    out
+end cast_keys
+
+private cast_keys_into(sc: &CastScan, e: TExpr, out: *Buf[string])
+    *e.kind match
+        TLoad(n, _) ->
+            for j in 0..<sc.f.params.len()
+                if sc.f.params.at(j).0 == n
+                    out.push(s"a:${sc.f.name}|$j")
+                    return
+                end if
+
+            out.push(s"l:${sc.f.name}|$n")
+        TGlobal(symbol, _, _) -> out.push(s"g:$symbol")
+        TField(r, index, _) -> out.push(cast_field(texpr_type(r), index))
+        TDeref(_, ty) -> out.push(s"*${type_show(ty)}")
+        TIndex(r, _, ty) ->
+            if is_array_type(texpr_type(r)) then cast_keys_into(sc, r, out) else out.push(s"[${type_show(ty)}")
+        TCast(v, _) -> cast_keys_into(sc, v, out)
+        TFloorCast(v, _) -> cast_keys_into(sc, v, out)
+        TUnary(_, v, _) -> cast_keys_into(sc, v, out)
+        TIntOp(_, v, amount, _, _) ->
+            cast_keys_into(sc, v, out)
+
+            if amount.is_some() then cast_keys_into(sc, amount.unwrap(), out)
+        TBinary(_, l, r, _) ->
+            cast_keys_into(sc, l, out)
+            cast_keys_into(sc, r, out)
+        TStore(_, v, _, _) -> cast_keys_into(sc, v, out)
+        TCall(name, args, _, _) ->
+            out.push(s"r:$name")
+
+            for a in args
+                if is_integer_type(texpr_type(a)) then cast_keys_into(sc, a, out)
+        TSeq(exprs) -> if !exprs.is_empty() then cast_keys_into(sc, exprs.at(exprs.len() - 1), out)
+        TBlockExpr(b) -> cast_block_keys(sc, b, out)
+        TIf(_, then_block, else_block, _) ->
+            cast_block_keys(sc, then_block, out)
+
+            if else_block.is_some() then cast_block_keys(sc, else_block.unwrap(), out)
+        TMatch(_, arms, _) ->
+            for arm in arms
+                cast_block_keys(sc, arm.body, out)
+        _ -> ()
+end cast_keys_into
+
+private cast_block_keys(sc: &CastScan, b: TBlock, out: *Buf[string]) =
+    if b.result.is_some() then cast_keys_into(sc, b.result.unwrap(), out)
+
+// A field of every value of a struct, through whatever pointer or reference it is reached by.
+private cast_field(ty: Type, index: int) -> string = underlying(ty) match
+    Ptr(inner) -> cast_field(*inner, index)
+    Ref(inner, _) -> cast_field(*inner, index)
+    _ -> s"f:${type_show(ty)}.${field_label(ty, index)}"

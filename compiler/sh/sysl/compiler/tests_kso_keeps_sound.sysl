@@ -1,0 +1,843 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// What the keeps-analysis (`keeps.sysl`, `keeps_cast.sysl`, `keeps_join.sysl`) decides about an
+// address as an integer, a store through a pointer read out of a parameter, a cast of a function
+// pointer, and a fan-out's collection reached by two names -- each accepted cell beside the near miss
+// that is refused, with its text. `reference/memory.md § A borrowed pointer cannot escape` is the
+// specification.
+//
+// Skipped cells, and why: an integer handed through a function pointer, a call through an object or
+// an enum's payload is not followed by the cast graph (the raw tier, said on the page), nor is a
+// parameter's address as an integer once it is in a local or handed to an integer parameter -- the
+// one shape pinned below is that these are accepted; a frame's address as an integer
+// handed to a callee that stores it and is then restored by the caller is refused at the call, since
+// the call is where it is seen (no restore is matched across a call for an integer); a fan-out's
+// collection emptied by a method (`clear`, `pop`) rather than a store is not seen as a store; a
+// nested function and a build-lib split change nothing these rules read, which are per body and per
+// program.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private kso_outcome(text: string) -> (string, int)
+    val root = make_temp_dir("sysl-kso").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (failure_text(why), -1)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> ("the program that was built could not be run", -1)
+        Ok(out) -> (out.text + out.err.unwrap_or(""), shell_status(out.status))
+end kso_outcome
+
+private kso_prints(text: string, want: string)
+    if xvr_no_library() then return
+
+    val out = kso_outcome(text)
+
+    assert_eq(out.0, want)
+    assert_eq(out.1, 0)
+end kso_prints
+
+private kso_refused(text: string, part: string)
+    if xvr_no_library() then return
+
+    val out = kso_outcome(text)
+
+    assert_eq(out.1, -1, out.0)
+    assert(out.0.index_of(part).is_some(), out.0)
+end kso_refused
+
+// -- the address as an integer is the address, handed back -----------------------------------------
+
+@test("an address handed back as an integer, by a function, a generic and a method, is the address")
+kso_image_answer_accepted()
+    kso_prints(raw"""
+        import sysl.raw.ptr_cast
+
+        struct Cell
+            v: int
+
+            addr(*self) -> usize = usize(self)
+
+        address(p: *int) -> usize = usize(p)
+
+        address_of[T](p: *T) -> usize = usize(p)
+
+        pick(p: *int, q: *int, first: bool) -> usize = if first then usize(p) else usize(q)
+
+        run() -> int
+            var n = 4
+            var m = 5
+            var c = Cell(6)
+            val a: *int = ptr_cast(address(&n))
+            val b: *int = ptr_cast(address_of(&m))
+            val d: *Cell = ptr_cast(c.addr())
+            val e: *int = ptr_cast(pick(&n, &m, false))
+
+            *a += 10
+            *b += *e
+            d.v += 1
+            n + m + c.v
+
+        main()
+            print(run())
+        """, "31\n")
+
+@test("an address answered as an integer and stored in module storage is kept; one done anything more with is not")
+kso_image_answer_kept()
+    kso_refused(raw"""
+        address(p: *int) -> usize = usize(p)
+
+        var held: usize = 0
+
+        stash(p: *int)
+            held = address(p)
+
+        run()
+            var n = 1
+
+            stash(&n)
+
+        main()
+            run()
+        """, "'stash' keeps its parameter 'p' (it is stored in 'held'), and '&n' is the address of a local of 'run'")
+    kso_prints(raw"""
+        address(p: *int) -> usize = usize(p)
+
+        var held: usize = 0
+
+        var signed: isize = 0
+
+        record(n: usize)
+            held = n
+
+        stash(p: *int)
+            val at = usize(p)
+
+            held = address(p) + 0
+            held = at
+            signed = isize(usize(p))
+            record(usize(p))
+
+        run()
+            var n = 1
+
+            stash(&n)
+
+        main()
+            run()
+            print(held > 0 && signed != 0)
+        """, "true\n")
+
+@test("a function handing on an element of what it was handed round a ring settles")
+kso_ring_of_elements_settles()
+    kso_prints(raw"""
+        step(p: *usize, sp: *usize, n: int)
+            sp[0] = usize(&p[1])
+
+            if n > 0 then hop(&p[1], &sp[1], n - 1)
+
+        hop(p: *usize, sp: *usize, n: int)
+            if n > 0 then step(&p[1], &sp[1], n - 1)
+
+        main()
+            var a: [8]usize = [0; 8]
+            var b: [8]usize = [0; 8]
+
+            step(&a[0], &b[0], 6)
+            print(b[0] == usize(&a[1]))
+        """, "true\n")
+
+@test("an address as an integer inside a struct with no pointer in it is a number")
+kso_image_in_pointerless_struct()
+    kso_prints(raw"""
+        struct Mark
+            at: usize
+
+        var last = Mark(0)
+
+        mark(p: *int) -> Mark = Mark(usize(p))
+
+        stash(p: *int)
+            last = mark(p)
+
+        run()
+            var n = 1
+
+            stash(&n)
+
+        main()
+            run()
+            print(last.at > 0)
+        """, "true\n")
+
+// -- a frame's address as an integer: a number until a `ptr_cast` -----------------------------------
+
+private kso_stack() -> string = raw"""
+    import sysl.raw.ptr_cast
+
+    var top: usize = 0
+
+    """
+
+private kso_peek() -> string = raw"""
+
+    peek() -> int
+        val p: *int = ptr_cast(top)
+
+        *p
+
+    """
+
+private kso_stored(owner: string, place: string) -> string =
+    s"holds the address of a local of '$owner', and it is stored in '$place', which outlives '$owner' and " +
+        "'peek' turns back into a pointer with 'ptr_cast' — store the value itself, or storage that lasts"
+
+@test("a stack's top remembered and a frame's address handed back, as numbers, are accepted")
+kso_stack_depth_accepted()
+    kso_prints(raw"""
+        var top: usize = 0
+
+        mark()
+            var marker = 0
+
+            top = usize(&marker)
+
+        here() -> usize
+            var marker = 0
+
+            usize(&marker)
+
+        depth() -> usize
+            val now = here()
+
+            if top > now then top - now else now - top
+
+        main()
+            mark()
+            print(depth() < 1000000)
+        """, "true\n")
+
+@test("a frame's address stored as an integer and turned back into a pointer in another function is refused")
+kso_stored_then_cast_refused()
+    kso_refused(kso_stack() + raw"""
+        mark()
+            var marker = 7
+
+            top = usize(&marker)
+        """ + kso_peek() + raw"""
+        main()
+            mark()
+            print(peek())
+        """, s"'usize(&marker)' ${kso_stored("mark", "top")}")
+
+@test("a frame's address handed back as an integer and turned back into a pointer by the caller is refused")
+kso_returned_then_cast_refused()
+    kso_refused(raw"""
+        import sysl.raw.ptr_cast
+
+        here() -> usize
+            var marker = 9
+
+            usize(&marker)
+
+        back() -> int
+            val p: *int = ptr_cast(here())
+
+            *p
+
+        main()
+            print(back())
+        """, "'usize(&marker)' is returned, but it holds the address of a local of 'here' as an integer, which " +
+             "'back' turns back into a pointer with 'ptr_cast' after the storage has ended with 'here'")
+
+@test("held in a local, answered by a call, chosen by an 'if', and returned by a second function")
+kso_returned_shapes_refused()
+    kso_refused(raw"""
+        import sysl.raw.ptr_cast
+
+        here() -> usize
+            var marker = 9
+            val at = usize(&marker)
+
+            at
+
+        back() -> int
+            val p: *int = ptr_cast(here())
+
+            *p
+
+        main()
+            print(back())
+        """, "'at' is returned, but it holds the address of a local of 'here' as an integer")
+    kso_refused(raw"""
+        import sysl.raw.ptr_cast
+
+        address(p: *int) -> usize = usize(p)
+
+        here(on: bool) -> usize
+            var marker = 9
+
+            if on then address(&marker) else 0
+
+        back() -> int
+            val p: *int = ptr_cast(here(true))
+
+            *p
+
+        main()
+            print(back())
+        """, "'address(&marker)' is returned, but it holds the address of a local of 'here' as an integer")
+    kso_refused(raw"""
+        import sysl.raw.ptr_cast
+
+        here() -> *int
+            var marker = 9
+
+            ptr_cast(usize(&marker))
+
+        main()
+            print(*here())
+        """, "'ptr_cast(usize(&marker))' is returned, but it holds the address of a local of 'here', whose storage " +
+             "ends when 'here' returns")
+
+@test("a frame's address handed to a callee that stores it where a 'ptr_cast' reads it is refused")
+kso_passed_then_cast_refused()
+    kso_refused(kso_stack() + raw"""
+        record(n: usize)
+            top = n
+
+        mark()
+            var marker = 7
+
+            record(usize(&marker))
+        """ + kso_peek() + raw"""
+        main()
+            mark()
+            print(peek())
+        """, "'record' may store its parameter 'n' where it outlives the call, and 'usize(&marker)' holds the " +
+             "address of a local of 'mark' as an integer, which 'peek' turns back into a pointer with 'ptr_cast'")
+
+@test("a frame's address handed to a callee that turns it back while the frame is there is accepted")
+kso_passed_cast_in_call_accepted()
+    kso_prints(raw"""
+        import sysl.raw.ptr_cast
+
+        bump(n: usize) -> int
+            val p: *int = ptr_cast(n)
+
+            *p += 1
+            *p
+
+        run() -> int
+            var v = 41
+
+            bump(usize(&v))
+
+        main()
+            print(run())
+        """, "42\n")
+
+@test("taken back on every way out by a 'defer' or before the end, a frame's address as an integer is accepted")
+kso_stored_restored_accepted()
+    kso_prints(kso_stack() + raw"""
+        mark() -> int
+            var marker = 7
+
+            top = usize(&marker)
+            defer top = 0
+
+            marker + 1
+
+        mark_again() -> int
+            var marker = 8
+
+            top = usize(&marker)
+
+            val p: *int = ptr_cast(top)
+            val v = *p
+
+            top = 0
+            v
+        """ + kso_peek() + raw"""
+        main()
+            print(mark())
+            print(mark_again())
+            print(top == 0)
+        """, "8\n8\ntrue\n")
+
+@test("taken back on one way out only -- an early return, a '?', a loop's turn -- is refused")
+kso_stored_escapes_refused()
+    kso_refused(kso_stack() + raw"""
+        mark(early: bool)
+            var marker = 7
+
+            top = usize(&marker)
+
+            if early then return
+
+            top = 0
+        """ + kso_peek() + raw"""
+        main()
+            mark(true)
+            print(peek())
+        """, s"'usize(&marker)' ${kso_stored("mark", "top")}")
+    kso_refused(kso_stack() + raw"""
+        maybe(n: int) -> Option[int] = if n > 0 then Some(n) else None
+
+        mark(n: int) -> Option[int]
+            var marker = 7
+
+            top = usize(&marker)
+
+            val v = maybe(n)?
+
+            top = 0
+            Some(v)
+        """ + kso_peek() + raw"""
+        main()
+            print(mark(0).is_none())
+            print(peek())
+        """, s"'usize(&marker)' ${kso_stored("mark", "top")}")
+    kso_refused(kso_stack() + raw"""
+        mark()
+            for i in 0..<3
+                var marker = i
+
+                top = usize(&marker)
+        """ + kso_peek() + raw"""
+        main()
+            mark()
+            print(peek())
+        """, s"'usize(&marker)' ${kso_stored("mark", "top")}")
+
+@test("stored through a parameter, from a method and from a generic, where a 'ptr_cast' reads the field")
+kso_stored_in_field_refused()
+    kso_refused(raw"""
+        import sysl.raw.ptr_cast
+
+        struct Ctx
+            top: usize
+
+            mark(*self)
+                var marker = 7
+
+                self.top = usize(&marker)
+
+        peek(c: *Ctx) -> int
+            val p: *int = ptr_cast(c.top)
+
+            *p
+
+        var ctx = Ctx(0)
+
+        main()
+            ctx.mark()
+            print(peek(&ctx))
+        """, "'usize(&marker)' holds the address of a local of 'mark', and it is stored in 'self.top', which " +
+             "outlives 'mark' and 'peek' turns back into a pointer with 'ptr_cast'")
+    kso_refused(raw"""
+        import sysl.raw.ptr_cast
+
+        struct Ctx
+            top: usize
+
+        mark[T](c: *Ctx, v: T)
+            var marker = v
+
+            c.top = usize(&marker)
+
+        peek(c: *Ctx) -> int
+            val p: *int = ptr_cast(c.top)
+
+            *p
+
+        var ctx = Ctx(0)
+
+        main()
+            mark(&ctx, 7)
+            print(peek(&ctx))
+        """, "'usize(&marker)' holds the address of a local of 'mark', and it is stored in 'c.top', which " +
+             "outlives 'mark' and 'peek' turns back into a pointer with 'ptr_cast'")
+    kso_prints(raw"""
+        struct Ctx
+            top: usize
+
+            mark(*self)
+                var marker = 7
+
+                self.top = usize(&marker)
+
+        var ctx = Ctx(0)
+
+        main()
+            ctx.mark()
+            print(ctx.top > 0)
+        """, "true\n")
+
+// -- a store through a pointer read out of a parameter ---------------------------------------------
+
+private kso_vm() -> string = raw"""
+    struct Con
+        n: int
+
+    struct VM
+        con: *Con
+
+    struct Session
+        vm: *VM
+
+    """
+
+private kso_vm_main(call: string) -> string = raw"""
+
+    main()
+        var c = Con(5)
+        var vm = VM(&c)
+        var s = Session(&vm)
+
+    """ + s"    $call\n    print(vm.con.n)\n"
+
+@test("a local's address stored through a pointer read out of a parameter, directly and through a local, is refused")
+kso_through_read_pointer_refused()
+    kso_refused(kso_vm() + raw"""
+        run(s: *Session)
+            var local = Con(1)
+
+            s.vm.con = &local
+        """ + kso_vm_main("run(&s)"),
+        "'&local' is the address of a local of 'run', and it is stored in 's.vm.con', which outlives 'run' — " +
+        "store the value itself, or storage that lasts")
+    kso_refused(kso_vm() + raw"""
+        run(s: *Session)
+            var local = Con(1)
+            val v = s.vm
+            val w = v
+
+            w.con = &local
+        """ + kso_vm_main("run(&s)"),
+        "'&local' is the address of a local of 'run', and it is stored in 'w.con', which outlives 'run'")
+    kso_refused(kso_vm() + raw"""
+        var cur: *VM = null
+        var spare = VM(null)
+
+        run()
+            var local = Con(1)
+
+            cur.con = &local
+        """ + kso_vm_main("cur = &spare\n    run()"),
+        "'&local' is the address of a local of 'run', and it is stored in 'cur.con', which outlives 'run'")
+
+@test("lent through a pointer read out of a parameter and taken back, around a call, is accepted")
+kso_through_read_pointer_restored()
+    kso_prints(kso_vm() + raw"""
+        show(vm: *VM) = print(vm.con.n)
+
+        run(s: *Session)
+            val vm = s.vm
+            val old = vm.con
+            var local = Con(1)
+
+            vm.con = &local
+            show(vm)
+            vm.con = old
+
+        run_direct(s: *Session) -> int
+            var local = Con(2)
+            val old = s.vm.con
+
+            s.vm.con = &local
+
+            val n = s.vm.con.n
+
+            s.vm.con = old
+            n
+        """ + kso_vm_main("run(&s)\n    print(run_direct(&s))"), "1\n2\n5\n")
+
+@test("taken back on one way out only, or in a loop, through a pointer read out of a parameter, is refused")
+kso_through_read_pointer_escapes()
+    kso_refused(kso_vm() + raw"""
+        run(s: *Session, early: bool)
+            val vm = s.vm
+            val old = vm.con
+            var local = Con(1)
+
+            vm.con = &local
+
+            if early then return
+
+            vm.con = old
+        """ + kso_vm_main("run(&s, false)"),
+        "'&local' is the address of a local of 'run', and it is stored in 'vm.con', which outlives 'run'")
+    kso_refused(kso_vm() + raw"""
+        run(s: *Session)
+            val vm = s.vm
+
+            for i in 0..<2
+                var local = Con(i)
+
+                vm.con = &local
+        """ + kso_vm_main("run(&s)"),
+        "'&local' is the address of a local of 'run', and it is stored in 'vm.con', which outlives 'run'")
+
+@test("an entry file's local, reached by a function nested in it, outlives that function")
+kso_entry_capture_refused()
+    kso_refused(raw"""
+        var keep: *int = null
+
+        f()
+            var x = 1
+
+            keep = &x
+
+        f()
+        """, "'&x' is the address of a local of 'f', and it is stored in 'keep', which outlives 'f'")
+
+// -- a cast is not an escape -------------------------------------------------------------------------
+
+private kso_machine() -> string = raw"""
+    import sysl.raw.ptr_cast
+
+    struct M
+        sp: *isize
+
+    type Code = *extern(*M, *isize) -> unit
+
+    halt(m: *M, sp: *isize)
+        m.sp = sp
+
+    """
+
+@test("a function pointer turned into an integer and back is still held to its keeps at every call")
+kso_cast_function_pointer()
+    kso_prints(kso_machine() + raw"""
+        var stack: [8]isize
+        var m: M
+
+        main()
+            val f: Code = &halt
+            val g: Code = ptr_cast(usize(f))
+
+            g(&m, &stack[1])
+            print(usize(m.sp) == usize(&stack[1]))
+        """, "true\n")
+    kso_refused(kso_machine() + raw"""
+        var m: M
+
+        run(f: Code)
+            var local: isize = 0
+            val g: Code = ptr_cast(usize(f))
+
+            g(&m, &local)
+
+        main()
+            run(&halt)
+        """, "a call through '*extern(*M, *isize) -> unit' may reach 'halt', which keeps its parameter 'sp' " +
+             "(it is stored in 'm.sp'), and '&local' is the address of a local of 'run'")
+
+// -- a fan-out's collection reached by two names -------------------------------------------------------
+
+private kso_threads() -> string =
+    "import sysl.threads.*\nimport sysl.buf.*\n\nstruct S\n    n: int\n\nwork(s: *S)\n    s.n = s.n + 1\n\n"
+
+private kso_fan_refused(body: string, why: string)
+    if !azd_ready() then return
+
+    val said = azd_err(kso_threads() + body)
+
+    assert(said.contains("error: 'spawn' keeps its parameter 'arg' (the thread it starts holds it until that " +
+                         "thread is joined), and '&s' is the address of a local of 'go' — join that thread " +
+                         s"on every way out of 'go', or hand it storage that lasts$why"), said)
+end kso_fan_refused
+
+@test("two slices of one array: handles stored through one and stored over through the other are refused")
+kso_fan_two_slices()
+    kso_fan_refused(raw"""
+        go()
+            var s = S(0)
+            var store: [4]Option[Thread] = [None; 4]
+            var a: []Option[Thread] = store[0..<4]
+            var b: []Option[Thread] = store[0..<4]
+
+            for i in 0..<4
+                a[i] = spawn(&work, &s)
+
+            for i in 0..<4
+                b[i] = spawn(&work, &s)
+
+            for t in a
+                if t is Some(h) then h.join()
+
+            for t in b
+                if t is Some(h) then h.join()
+
+        go()
+        """, "; 'a' is stored into again through 'b', which shares its storage, before the handles it holds are joined")
+
+@test("an element stored over before the join, at a constant index or by 'None', is refused")
+kso_fan_element_over()
+    kso_fan_refused(raw"""
+        go()
+            var s = S(0)
+            var pool: [4]Option[Thread] = [None; 4]
+
+            for i in 0..<4
+                pool[i] = spawn(&work, &s)
+
+            pool[0] = None
+
+            for t in pool
+                if t is Some(h) then h.join()
+
+        go()
+        """, "; 'pool' is stored into again before the handles it holds are joined")
+    kso_fan_refused(raw"""
+        go()
+            var s = S(0)
+            var pool: [4]Option[Thread] = [None; 4]
+
+            for i in 0..<4
+                pool[i] = spawn(&work, &s)
+
+            pool[1] = spawn(&work, &s)
+
+            for t in pool
+                if t is Some(h) then h.join()
+
+        go()
+        """, "; 'pool' is stored into again before the handles it holds are joined")
+
+@test("handles stored through a slice and joined through the array it views are not matched")
+kso_fan_joined_through_alias()
+    kso_fan_refused(raw"""
+        go()
+            var s = S(0)
+            var store: [4]Option[Thread] = [None; 4]
+            var a: []Option[Thread] = store[0..<4]
+
+            for i in 0..<4
+                a[i] = spawn(&work, &s)
+
+            for t in store
+                if t is Some(h) then h.join()
+
+        go()
+        """, "; no loop over 'a' joins each of its elements")
+
+@test("a second slice parameter, a slice field read into a local, a re-slice and a pointer to the array")
+kso_fan_alias_shapes()
+    kso_fan_refused(raw"""
+        go(a: []Option[Thread], b: []Option[Thread])
+            var s = S(0)
+
+            for i in 0..<a.len
+                a[i] = spawn(&work, &s)
+
+            b[0] = None
+
+            for t in a
+                if t is Some(h) then h.join()
+
+        var x: [2]Option[Thread] = [None; 2]
+
+        go(x[..], x[..])
+        """, "; 'a' is stored into again through 'b', which shares its storage, before the handles it holds are joined")
+    kso_fan_refused(raw"""
+        struct W
+            pool: []Option[Thread]
+
+        go()
+            var s = S(0)
+            var w = W([None; 4])
+            val a = w.pool
+
+            for i in 0..<4
+                w.pool[i] = spawn(&work, &s)
+
+            a[0] = None
+
+            for t in w.pool
+                if t is Some(h) then h.join()
+
+        go()
+        """, "; 'w.pool' is stored into again through 'a', which shares its storage, before the handles it holds are joined")
+    kso_fan_refused(raw"""
+        go()
+            var s = S(0)
+            var store: [4]Option[Thread] = [None; 4]
+            var a: []Option[Thread] = store[0..<4]
+            var b: []Option[Thread] = a[0..<2]
+
+            for i in 0..<4
+                a[i] = spawn(&work, &s)
+
+            b[0] = None
+
+            for t in a
+                if t is Some(h) then h.join()
+
+        go()
+        """, "; 'a' is stored into again through 'b', which shares its storage, before the handles it holds are joined")
+    kso_fan_refused(raw"""
+        go()
+            var s = S(0)
+            var store: [4]Option[Thread] = [None; 4]
+            val p = &store
+
+            for i in 0..<4
+                store[i] = spawn(&work, &s)
+
+            p[0] = None
+
+            for t in store
+                if t is Some(h) then h.join()
+
+        go()
+        """, "; 'store' is stored into again through 'p', which shares its storage, before the handles it holds are joined")
+
+@test("a fresh element set before its handle, one set after its join, and two collections of their own")
+kso_fan_own_storage_accepted()
+    if !azd_ready() then return
+
+    twp_prints(kso_threads() + raw"""
+        go() -> int
+            var s = S(0)
+            var t = S(0)
+            var pool: [4]Option[Thread] = [None; 4]
+            var other: []Option[Thread] = [None; 2]
+
+            for i in 0..<4
+                pool[i] = None
+                pool[i] = spawn(&work, &s)
+
+            for i in 0..<2
+                other[i] = spawn(&work, &t)
+
+            for i in 0..<4
+                if pool[i] is Some(h) then h.join()
+
+                pool[i] = None
+
+            for h in other
+                if h is Some(th) then th.join()
+
+            s.n + t.n
+
+        print(go())
+        """, "6\n")

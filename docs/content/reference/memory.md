@@ -3852,8 +3852,11 @@ each pointer it is handed, so it works that out, and nothing is written for it.
 
 - it stores it somewhere the call does not own — a field reached through a pointer, module storage, a
   buffer's slot, or a box or a closure that is stored there;
-- it passes it to another function's parameter that keeps it;
-- it hands it back as something that is not a pointer — the address as an integer.
+- it passes it to another function's parameter that keeps it.
+
+**The address as an integer is the address**: `usize(p)` stored or handed back, and a call's answer
+that is one, is followed as `p` would be. An integer anything more is done with — put in a local,
+converted again, handed to an integer parameter, `usize(p) + 8` — is a number, and keeps nothing.
 
 The answer is read out of the body, followed into every callee, and settled over recursion: a
 recursive function keeps a parameter when one of its paths does. Then **one rule, at the call**:
@@ -3966,7 +3969,8 @@ print(run())
 ```
 
 The same address written through an out-parameter that points into module storage is kept, and so
-is the address of a function's own local written through any out-parameter at all:
+is the address of a function's own local written through any out-parameter at all — or through a
+pointer read out of one, `s.vm.con = &local`, since that is the caller's storage, not the frame's:
 
 ```sysl
 leak(out: **int)
@@ -4102,18 +4106,6 @@ run()
 'relay' keeps its parameter 'p' (it is passed to 'collect', which keeps it), and '&n' is the address of a local of 'run'
 ```
 
-```sysl
-address(p: *int) -> usize = usize(p)
-
-run() -> usize
-    var n = 1
-    address(&n)
-```
-
-```error
-'address' keeps its parameter 'p' (it is returned as 'usize'), and '&n' is the address of a local of 'run'
-```
-
 Storage that outlives the call — module storage, a box's — is the program's to give away, and so is
 storage reached through a pointer the function was handed. **The entry file's own statements** are
 the one body passed over: their frame is the program's, laid down before anything else runs and given
@@ -4170,8 +4162,72 @@ C function filled `&n` is an ordinary value. A C function's pointer answer is ta
 pointer arguments that could hold what it points at — one to the same type or to a struct holding
 it, and bytes from bytes, as `strchr`'s is — and not of an out-parameter of another type, so a handle
 a C library allocated is not made of the `*i32` it reported an error code through, nor of a context
-it was handed as bytes. An address turned into an integer and back
-(`ptr_cast(usize(p))`) is not followed: that is the raw tier, and writing it takes a `ptr_cast`.
+it was handed as bytes. **An integer that is the address is made of it**: `address(p: *int) -> usize
+= usize(p)` answers its argument as an integer, and `ptr_cast(usize(p))` is still `p`. An integer
+computed from one (`ptr_cast(usize(p) + 8)`) is not followed: that is the raw tier, and writing it
+takes a `ptr_cast`.
+
+**A frame's own address as an integer is a number until it is turned back into a pointer.**
+`usize(&marker)` remembered in module storage, or handed back, is how a program measures its stack,
+and as a number it outlives nothing:
+
+```sysl
+var top: usize = 0
+
+mark()
+    var marker = 0
+
+    top = usize(&marker)
+
+here() -> usize
+    var marker = 0
+
+    usize(&marker)
+
+main()
+    mark()
+    print(here() > 0 && top > 0)
+```
+
+```output
+true
+```
+
+What would reach a frame that has ended is that number made a pointer again. So every integer the
+program moves is followed through the places it is stored — a module variable, a field of a struct of
+its type, what a pointer to its type points at, a local, a parameter, an answer — to every `ptr_cast`
+of an integer, and the frame's address leaving it is refused where a `ptr_cast` may turn it back.
+The refusal names that `ptr_cast`'s function; a store taken back on every way out is not kept, as
+for a pointer:
+
+```sysl
+import sysl.raw.ptr_cast
+
+var top: usize = 0
+
+mark()
+    var marker = 7
+
+    top = usize(&marker)
+
+peek() -> int
+    val p: *int = ptr_cast(top)
+
+    *p
+
+main()
+    mark()
+    print(peek())
+```
+
+```error
+'usize(&marker)' holds the address of a local of 'mark', and it is stored in 'top', which outlives 'mark' and 'peek' turns back into a pointer with 'ptr_cast' — store the value itself, or storage that lasts
+```
+
+Followed this far and no further: what a call answers is taken to be made of every integer it is
+handed, and a field, a pointee or an element is one place for every value of its type — both say
+more than most programs do, and the refusal names the `ptr_cast` it found. An integer handed through
+a function pointer, a call through an object, or an enum's payload is not followed.
 
 A pointer the callee **read out of** what it was handed is somebody else's address, and is the
 caller's to keep:
@@ -4311,9 +4367,10 @@ a call through '*extern(*M, *isize) -> unit' may reach 'halt', which keeps its p
 
 A pointer type handed to C — an argument to an `extern`, a field of a struct one is handed, a
 variable an `extern` declares, or a parameter or answer of an `@export` function — may be called with
-anything, so every function whose address is taken at that type is held to the default. A function
-pointer turned into an integer and back is the raw tier's bargain: it is called through the type its
-address was taken at.
+anything, so every function whose address is taken at that type is held to the default. **A cast is
+not handing it to C**: a function pointer turned into an integer and back, or into another pointer
+type, is the raw tier's bargain — it is called through the type its address was taken at, where every
+call is still in sight and held to what the function keeps.
 
 **A stored callback keeps what it captured, and nothing else.** A closure is an object, and storing
 one — in a field, module storage, a buffer, a trait's implementation — is refused only where the
@@ -4472,7 +4529,10 @@ function that answers the collection passes the joins on to its caller, as it do
 **A loop that may skip an element is not a release**, and the refusal says why: a `break`, a
 `continue`, a `return`, a `?` or a `panic` inside it, a join under a condition, a narrower range, no
 such loop at all, a handle stored at an index other than the counter of the loop it is in, or the
-collection stored into again before its handles are joined:
+collection stored into again before its handles are joined. **A store into an element loses the
+handle it held**, and so does one through another name for the same storage — a slice of the
+collection, a slice of that, `&pool`, a reference copied, or a second slice parameter that may be the
+first — so a join is matched only to the collection the handles were stored through:
 
 ```sysl
 import sysl.threads.*
