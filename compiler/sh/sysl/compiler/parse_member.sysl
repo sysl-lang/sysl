@@ -2,6 +2,7 @@ module sh.sysl.compiler
 
 import sh.sysl.parsing.*
 import sysl.buf.{Buf, buf}
+import sysl.unicode
 
 // The four declarations with a body of members: `struct`, `enum`, `trait` and `impl`.
 //
@@ -418,6 +419,7 @@ parse_enum_decl(p: *Parser, start: Span, vis: Visibility) -> Stmt
         if refuse_stray_member(p, first, InType) then ()
         elif refuse_reserved_variant(p) then ()
         elif refuse_positional_payload(p) then ()
+        elif refuse_capitalised_fn(p) then ()
         elif at_user_annotation(p) && annotations_then(p, at_enum_variant)
             val annots = parse_part_annotations(p, "a variant")
 
@@ -450,6 +452,56 @@ parse_enum_decl(p: *Parser, start: Span, vis: Visibility) -> Stmt
     accept_end_name(p, name)
     stmt(start.to(p.just_taken()), EnumDecl(decl))
 end parse_enum_decl
+
+// A function in an enum body named with a capital: `Circle(r: int) = 0`, which reads as a variant
+// given a value and is in fact an expression-bodied associated function, leaving an enum without the
+// variant it was written to declare.
+//
+// **A variant's name is capitalised and a function's is not**, so a capitalised name that the
+// variant rule has already turned away -- a result type, an `=` or a block after its brackets, a
+// receiver inside them -- is the misread, and is refused at the name. Annotations above the line are
+// read past first, in a reading taken back, so the fault lands on the name and not on the `@`.
+private refuse_capitalised_fn(p: *Parser) -> bool
+    if p.at_kw("@")
+        if !annotations_then(p, at_capitalised_fn) then return false
+
+        while p.at_kw("@")
+            p.bump()
+            parse_expr_bp(p, PrefixPower)
+            p.skip_newlines()
+    else if !at_capitalised_fn(p)
+        return false
+    end if
+
+    val name = p.peek() match
+        Ident(n) -> n
+        _ -> ""
+
+    p.fault(p.here(), s"'${name}' is read as a function, but a function in an enum body is named in lowercase — a variant that carries data cannot be given a value")
+    true
+end refuse_capitalised_fn
+
+// Whether the line is a capitalised name with a bracketed list the variant rule did not take.
+private at_capitalised_fn(p: *Parser) -> bool
+    if at_enum_variant(p) || !p.kw_at(1, "(") then return false
+
+    // Only a function whose brackets close: an unclosed one is a variant still being written, and is
+    // owed its bracket instead.
+    val after = past_parameters(p, 1)
+
+    if after == 1 then return false
+
+    p.peek() match
+        Ident(n) -> starts_upper(n)
+        _ -> false
+end at_capitalised_fn
+
+private starts_upper(name: string) -> bool
+    for c in name.chars
+        return unicode.is_upper(c)
+
+    false
+end starts_upper
 
 // A variant whose brackets hold a bare **type** rather than `name: type`, refused at the variant's
 // name with the line that should have been written.
