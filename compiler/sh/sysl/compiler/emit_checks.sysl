@@ -484,7 +484,8 @@ private export_storage(a: &Analysis, p: TProgram, exported: Buf[TFunc])
                     s"('targets.${t.name}.entry'), and '${runtime_init_symbol()}' is what fills it — " +
                     "but nothing here calls it, so the function would read whatever the image left. " +
                     "Call it from the start file before the C program's 'main' — a 'bl " +
-                    s"${runtime_init_symbol()}' in its 'asm', or a call through an 'extern' naming it")
+                    s"${runtime_init_symbol()}' in its 'asm', or a call through an 'extern' naming it" +
+                    stops_text(a, reached, computed))
         else if !named.is_empty()
             a.fault(func_home(a, f.name), f.span,
                     s"'${qualified_name(f.name)}' is exported and reaches " +
@@ -555,8 +556,62 @@ check_image_storage(a: &Analysis, p: TProgram, own: Buf[string], entry: string)
                 "whatever the image left. Build the value where it is used instead: a local, a " +
                 "struct built once and handed to what reads it, or, for a table of functions, a " +
                 "'match' that dispatches on the index; or make the initializer constant data, which " +
-                "is laid straight into the image")
+                "is laid straight into the image" + stops_text(a, reached, computed))
 end check_image_storage
+
+// **A hosted build warns about the storage a bare-metal build of the same package would refuse.** A
+// computed initializer is filled by code that runs before the program's own statements, which a
+// hosted target always runs and a bare one runs only from `main` -- so a C archive or an image that
+// starts elsewhere refuses whatever an export reaches of it (`export_storage`, `check_image_storage`),
+// and `sysl test .` on the host, where every such build is green, would otherwise never say so.
+//
+// **The decision is the one those refusals read**: `TVal.computed`, and the reason `module_storage`
+// filed for it beside the `const`-call stops. A warning here and a refusal there cannot disagree about
+// which storage folds.
+//
+// It is said once per piece of storage, at its declaration, for the project's own modules only --
+// never a dependency's or the library's, which their own builds report -- and not at all where
+// `bare_metal_possible` says the package cannot reach a bare machine.
+check_bare_metal_storage(a: &Analysis, p: TProgram)
+    if !a.tables.target.runs_initializers() then return
+
+    for i in 0..<p.vals.len()
+        val v = p.vals.at(i)
+
+        if !v.computed then continue
+
+        val d = a.tables.vals.get(v.symbol)
+
+        if d.is_none() then continue
+
+        // The value a module binding takes apart is no name the reader wrote: each name it binds is
+        // computed storage of its own, and is told about by that name.
+        if is_held_whole(d.unwrap().name) then continue
+
+        val module_name = d.unwrap().scope.module_name
+
+        if holds_string(a.tables.supplied_modules, module_name) || module_needs_os(a, module_name) then continue
+
+        val why = a.evaluation.val_stops.get(v.symbol).unwrap_or("")
+
+        a.caution(d.unwrap().scope, d.unwrap().span,
+                  s"'${qualified_name(v.symbol)}' is filled by code that runs before the program's own " +
+                  "statements, not laid down as constant data" + (if why == "" then "" else s". $why") +
+                  ". A bare-metal target runs that code only from 'main', so a C archive or an image " +
+                  "that starts elsewhere refuses whatever an export reaches of it. Make the initializer " +
+                  "constant data, or say the package needs an operating system with 'requires { os = " +
+                  "true }' in sysl.hocon")
+    end for
+end check_bare_metal_storage
+
+// Whether a module says it needs an operating system, which no bare machine has (`@requires(os)`, or a
+// capability implying it).
+private module_needs_os(a: &Analysis, module_name: string) -> bool
+    for pair in a.tables.module_requires
+        if pair.0 == module_name && pair.1 == CapOs then return true
+
+    false
+end module_needs_os
 
 // **An `extern` naming `main` is a start file's call into the program**, and a bare image whose entry
 // is a symbol of its own is one place that call has somebody to make it: the platform starts at the
