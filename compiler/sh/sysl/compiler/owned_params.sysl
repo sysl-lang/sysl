@@ -1,0 +1,279 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+import sysl.container.{Set, set}
+
+// **Owned parameters**: a counted parameter a function keeps is handed over with a count of its own
+// (`reference/memory.md § T — values`).
+//
+// A by-value argument is otherwise borrowed for the call (`borrowing.sysl`): the caller holds a count
+// for its length, and a callee that stores the value takes one of its own. Where the callee always
+// keeps what it is handed -- `push` putting it in a buffer, a constructor putting it in a box -- the
+// two counts are one too many: the caller lets go of its own as soon as the call returns. So such a
+// parameter is **owned**. The callee receives a count and is responsible for it, so it moves the value
+// into its destination at its last use instead of retaining it, and gives the count back at its exit
+// where it did not. The caller hands its own count over where the argument is at its last use -- a
+// temporary, a local named for the last time (`emit_moves.sysl`) -- and takes one for the callee
+// otherwise.
+//
+// **What "keeps" means here is what lets the callee move it**: the parameter, or a local or a value
+// built around it, lands somewhere that outlives the call -- a store outside the frame's own locals, a
+// box (a closure's environment among them), a buffer's slot, the function's result -- or is handed to
+// another function's owned parameter. The answer is a fixed point, so recursion settles on what the
+// body does. A wrong answer either way is still correct code, only slower, since both conventions are
+// complete; what has to hold is that caller and callee AGREE.
+//
+// **That agreement is why the answer reads nothing but the function's own body and its callees'
+// answers.** A library's functions are compiled once, into the artifact, and each program that calls
+// one works the answer out again from the same source: anything the program alone knows -- which
+// addresses it takes, which tables it builds -- would make the two disagree. So nothing reached any
+// way but a direct call relies on the convention at all: an owned function is emitted twice over, its
+// body under `<symbol>.owned` and, under its own symbol, an entry that takes the count a borrowing
+// caller did not hand over and then calls it (`owned_entry`). A table slot, a destructor hook, a
+// closure and every other call the compiler writes for itself reach that entry, so they go on
+// borrowing; only a call written in the program, to a function named directly, reaches the owned body.
+//
+// What never owns: a body something outside the program may call (`@export`, a `@section`, a foreign
+// convention), a variadic one, a task (whose frame outlives the call anyway), a body that jumps back
+// to its own entry, one with a contract (whose clauses read the parameters after the body is done with
+// them), a closure's body, a `@scoped` parameter, and a parameter that crosses as an address.
+
+// Every parameter of the program a direct call hands a count to, as `<function>|<position>`.
+owned_params(e: *Emit, p: TProgram) -> Set[string]
+    var owned: Set[string] = set()
+    var asks: Buf[(TFunc, usize)] = buf()
+
+    for i in 0..<p.funcs.len()
+        val f = p.funcs.at(i)
+
+        if !may_own(f) then continue
+
+        for j in 0..<f.params.len()
+            if may_own_param(e, f, j) then asks.push((f, j))
+
+    // Every answer only turns on as the answers it reads do, so the rounds settle.
+    var moved = true
+
+    while moved
+        moved = false
+
+        for item in asks
+            val key = owned_key(item.0.name, item.1)
+
+            if !owned.has(key) && keeps_counted(item.0, item.1, owned)
+                owned.add(key)
+                moved = true
+
+    owned
+end owned_params
+
+// The key an owned parameter is filed under.
+owned_key(name: string, i: usize) -> string = s"$name|$i"
+
+// The functions among `owned` that own at least one parameter.
+owning_funcs(p: TProgram, owned: Set[string]) -> Set[string]
+    var out: Set[string] = set()
+
+    for i in 0..<p.funcs.len()
+        val f = p.funcs.at(i)
+
+        for j in 0..<f.params.len()
+            if owned.has(owned_key(f.name, j)) then out.add(f.name)
+
+    out
+end owning_funcs
+
+private may_own(f: TFunc) -> bool =
+    !f.ghost && !f.variadic && f.exported.is_none() && f.section.is_none() && f.conv.is_none() &&
+        !f.marks.is_async() && f.requires.is_empty() && f.ensures.is_empty() && f.olds.is_empty() &&
+        f.variant.is_none() && !is_closure_body(f) && tail_calls_of(f).is_empty()
+
+private may_own_param(e: *Emit, f: TFunc, j: usize) -> bool
+    val ty = f.params.at(j).1
+
+    contains_counted(ty) && movable_type(ty) && !e.layout.indirect(ty) && underlying(ty) != VaList &&
+        !scoped_at(f, j)
+end may_own_param
+
+// One walk's state: the locals that may hold the parameter or something built around it, the refs
+// (whose writes land in somebody else's storage), and whether the body lets it outlive the call.
+private struct OwnTrack
+    held: Set[string]
+    refs: Set[string]
+    owned: Set[string]
+    kept: bool
+    changed: bool
+
+    hold(*self, name: string)
+        if !self.held.has(name)
+            self.held.add(name)
+            self.changed = true
+    end hold
+end OwnTrack
+
+// Whether `f` keeps its parameter at `j`, given the parameters already known to be owned.
+private keeps_counted(f: TFunc, j: usize, owned: Set[string]) -> bool
+    val t: &OwnTrack = OwnTrack(set(), set(), owned, false, true)
+
+    t.held.add(f.params.at(j).0)
+
+    walk_block_stmts(f.body, stmt_walk(false, s -> s match
+        TRefDecl(n, _, _) -> t.refs.add(n)
+        _ -> ()))
+
+    // A fixpoint over the locals, since a body may pass the value along a chain of them first.
+    while t.changed && !t.kept
+        t.changed = false
+
+        walk_block_stmts(f.body, TWalk(false, x -> own_expr(t, x), w -> own_write(t, w.place, w.value),
+                                       s -> own_stmt(t, s)))
+
+    if f.body.result.is_some() && carries_count(t, f.body.result.unwrap()) then t.kept = true
+
+    t.kept
+end keeps_counted
+
+private own_stmt(t: &OwnTrack, s: TStmt) = s match
+    TVarDecl(name, _, init, _) -> if carries_count(t, init) then t.hold(name)
+    TReturn(v) -> if v.is_some() && carries_count(t, v.unwrap()) then t.kept = true
+    _ -> ()
+
+private own_expr(t: &OwnTrack, x: TExpr) = *x.kind match
+    TStore(place, v, _, _) -> own_write(t, place, v)
+    TCall(name, args, _, _) ->
+        for k in 0..<args.len()
+            if t.owned.has(owned_key(name, k)) && carries_count(t, args.at(k)) then t.kept = true
+    TSlots(op, args, _, _) ->
+        if op == "slot_place" && args.len() == 3 && carries_count(t, args.at(2)) then t.kept = true
+        if op == "slot_put" && args.len() == 2 && carries_count(t, args.at(1)) then t.kept = true
+    TBox(v, _) -> if carries_count(t, v) then t.kept = true
+    TBufLit(elems, _) ->
+        for item in elems
+            if carries_count(t, item) then t.kept = true
+    _ -> ()
+
+// A write of what is tracked: into a local's own storage it binds the local; anywhere else it is kept.
+private own_write(t: &OwnTrack, place: TExpr, v: TExpr)
+    if !carries_count(t, v) then return
+
+    own_root(t, place) match
+        Some(n) -> t.hold(n)
+        None -> t.kept = true
+end own_write
+
+// The local a place is inside of by value, where it is one.
+private own_root(t: &OwnTrack, place: TExpr) -> Option[string] = *place.kind match
+    TLoad(n, _) -> if t.refs.has(n) then None else Some(n)
+    TField(r, _, _) -> underlying(texpr_type(r)) match
+        Struct(_) -> own_root(t, r)
+        _ -> None
+    TIndex(r, _, _) -> underlying(texpr_type(r)) match
+        Array(_, _) -> own_root(t, r)
+        _ -> None
+    _ -> None
+
+// Whether a value is what is tracked, whole, or built around it -- which is what a destination can take
+// over at its last use. A part of it (a field, an element) is not: taking a part out of a value the
+// frame still owns would be a partial move.
+private carries_count(t: &OwnTrack, x: TExpr) -> bool = *x.kind match
+    TLoad(n, _) -> t.held.has(n)
+    TStructNew(_, args) -> any_carries_count(t, args)
+    TEnumNew(_, _, args) -> any_carries_count(t, args)
+    TArrayLit(elems, _) -> any_carries_count(t, elems)
+    TErase(o, _, _) -> carries_count(t, o)
+    TCast(o, _) -> carries_count(t, o)
+    TViewAs(o, _) -> carries_count(t, o)
+    TBlockExpr(b) -> block_carries_count(t, b)
+    TIf(_, tb, eb, _) -> block_carries_count(t, tb) || eb.is_some() && block_carries_count(t, eb.unwrap())
+    TMatch(_, arms, _) ->
+        for arm in arms
+            if block_carries_count(t, arm.body) then return true
+
+        false
+    _ -> false
+
+private any_carries_count(t: &OwnTrack, xs: Buf[TExpr]) -> bool
+    for item in xs
+        if carries_count(t, item) then return true
+
+    false
+end any_carries_count
+
+private block_carries_count(t: &OwnTrack, b: TBlock) -> bool = b.result.is_some() && carries_count(t, b.result.unwrap())
+
+// -- emitting the convention ----------------------------------------------------------------------
+
+// The symbol an owning function's body is defined under; its own symbol is the borrowing entry.
+owned_symbol(symbol: string) -> string = s"$symbol.owned"
+
+// The caller's half, once every argument is in hand: each owned one handed over with a count, which is
+// the one this frame holds where the argument is a temporary or a local at its last use, and one taken
+// for the callee otherwise. Answers the symbol the call names.
+//
+// It runs after the last argument is worked out, so a later argument that leaves early -- a `?` --
+// finds every count still where the frame gives it back.
+hand_over_args(e: *Emit, name: string, args: Buf[TExpr], staged: Buf[(int, Val)]) -> string
+    if !e.owning_funcs.has(name) then return symbol_of(e, name)
+
+    for k in 0..<args.len()
+        if e.owned_params.has(owned_key(name, k)) && k < staged.len()
+            val a = args.at(k)
+
+            retain_moving(e, a, texpr_type(a), staged.at(k).1)
+
+    owned_symbol(symbol_of(e, name))
+end hand_over_args
+
+// A defined body as the functions it is emitted as: itself where it owns nothing, and otherwise the body
+// under `owned_symbol` beside the entry every other caller reaches under the function's own symbol.
+owned_split(e: *Emit, f: TFunc, built: IrFunc) -> Buf[IrFunc]
+    var out: Buf[IrFunc] = buf()
+
+    if !e.owning_funcs.has(f.name)
+        out.push(built)
+        return out
+    end if
+
+    val body = built with { sig = built.sig with { name = owned_symbol(built.sig.name) } }
+
+    out.push(owned_entry(e, f, built.sig))
+    out.push(body)
+    out
+end owned_split
+
+// The entry a borrowing caller reaches: a count taken for each owned parameter, then the owned body
+// called with everything exactly as it arrived.
+private owned_entry(e: *Emit, f: TFunc, sig: IrFuncSig) -> IrFunc
+    start_function(e)
+    push_temps(e)
+    push_owned(e)
+
+    for j in 0..<f.params.len()
+        val p = f.params.at(j)
+
+        if e.owned_params.has(owned_key(f.name, j)) then retain_value(e, p.1, VReg(s"${p.0}.param"))
+
+    var args: Buf[IrArg] = buf()
+
+    for p in sig.ty.params
+        args.push(IrArg(p.ty, p.name.unwrap_or(VUndef), p.attrs))
+
+    val callee = VGlobal(owned_symbol(sig.name))
+    val nothing = sig.ty.ret match
+        LVoid -> true
+        _ -> false
+
+    if nothing
+        emit(e, InCall(None, LVoid, callee, args, sig.ty.ret_attrs, None, no_fast_math(), false))
+        emit_term(e, InRet(None, None))
+    else
+        val r = fresh_reg(e)
+
+        emit(e, InCall(Some(r), sig.ty.ret, callee, args, sig.ty.ret_attrs, None, no_fast_math(), false))
+        emit_term(e, InRet(Some(sig.ty.ret), Some(r)))
+    end if
+
+    var bare: Buf[string] = buf()
+
+    finish_func(e, sig with { bare = bare })
+end owned_entry

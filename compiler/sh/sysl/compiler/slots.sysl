@@ -289,11 +289,17 @@ private gen_slot_place(e: *Emit, xs: TExpr, index: TExpr, value: TExpr, elem: Ty
     // and `cold`: written here they made every append carry a trap the optimizer cannot settle -- it
     // cannot see that a container's count never passes the live prefix -- and a body too large for
     // `@inline` to bring into its caller.
+    //
+    // **The count the slot keeps is in hand before the test**: the value's own where it is a
+    // temporary or a local at its last use -- an owned parameter handed to `push` among them
+    // (`emit_moves.sysl`) -- and one taken otherwise. The first free slot keeps it as it is; the rest
+    // takes its own and this one is given back.
     val buffer_l = fresh_label(e, "slot.buffer")
     val fresh_l = fresh_label(e, "slot.fresh")
     val rest_l = fresh_label(e, "slot.rest")
     val done_l = fresh_label(e, "slot.done")
 
+    retain_moving(e, value, elem, v)
     buffer_test(e, elem, view.0, buffer_l, rest_l)
     emit_label(e, buffer_l)
 
@@ -310,7 +316,6 @@ private gen_slot_place(e: *Emit, xs: TExpr, index: TExpr, value: TExpr, elem: Ty
 
     // The first free slot: nothing is there to give back, and the prefix now covers it.
     emit_label(e, fresh_l)
-    retain_value(e, elem, v)
     emit(e, InStore(lty(e, elem), v, p, AccPlain, None))
 
     val grown = fresh_reg(e)
@@ -327,6 +332,7 @@ private gen_slot_place(e: *Emit, xs: TExpr, index: TExpr, value: TExpr, elem: Ty
     args.push(ir_arg(LPtr, p))
     args.push(ir_arg(lty(e, elem), v))
     emit(e, ir_call(None, LVoid, slot_place_fn(e, elem), args))
+    release_value(e, elem, v)
     emit_term(e, InBr(done_l))
     emit_label(e, done_l)
 end gen_slot_place

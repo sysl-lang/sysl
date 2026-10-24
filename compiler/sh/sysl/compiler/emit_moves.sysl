@@ -41,15 +41,19 @@ import sysl.container.{Map, map, Set, set}
 
 // One function's state. `last_uses` is the statement being emitted's; `parts` the value each struct
 // or enum built in this function was made from, by the register it is in and the node that built it.
+//
+// `dying` is the locals the statement being emitted names for the last time however often it names
+// them, where that statement is a branch (`hand_in`).
 struct Moves
     ready: bool
     last_uses: Set[string]
     no_move: Set[string]
     parts: Map[string, (Span, Buf[Val])]
     source: Option[TExpr]
+    dying: Set[string]
 end Moves
 
-moves_none() -> Moves = Moves(false, set(), set(), map(), None)
+moves_none() -> Moves = Moves(false, set(), set(), map(), None, set())
 
 // The names a walk collected.
 private struct Names
@@ -96,31 +100,107 @@ private deferred_or_aliased(held: &Names, s: TStmt) = s match
     _ -> ()
 
 // For each statement of a block, the locals it uses for the last time; and the same for the block's
-// value. Read backwards, so each statement is walked once.
-last_uses_of(e: *Emit, xs: Buf[TStmt], tail: Option[TExpr]) -> (Buf[Set[string]], Set[string])
+// value. Read backwards, so each statement is walked once. The second pair is the same question
+// without "exactly once" -- the locals nothing after the statement names (`dying`).
+last_uses_of(e: *Emit, xs: Buf[TStmt], tail: Option[TExpr]) -> (Buf[Set[string]], Set[string], Buf[Set[string]], Set[string])
     var lasts: Buf[Set[string]] = buf()
+    var dying: Buf[Set[string]] = buf()
 
-    if !e.moves.ready then return (lasts, set())
+    if !e.moves.ready then return (lasts, set(), dying, set())
 
     val later = names_none()
     val at_tail = names_none()
 
     if tail.is_some() then walk_texpr(tail.unwrap(), loads_into(at_tail))
 
+    val tail_dying = named_last(e, at_tail, later)
     val tail_lasts = named_once(e, at_tail, later)
     var backwards: Buf[Set[string]] = buf()
+    var backwards_dying: Buf[Set[string]] = buf()
 
     for j in 0..<xs.len()
         val at = names_none()
 
         walk_stmt(xs.at(xs.len() - 1 - j), loads_into(at))
+        backwards_dying.push(named_last(e, at, later))
         backwards.push(named_once(e, at, later))
 
     for j in 0..<backwards.len()
         lasts.push(backwards.at(backwards.len() - 1 - j))
+        dying.push(backwards_dying.at(backwards.len() - 1 - j))
 
-    (lasts, tail_lasts)
+    (lasts, tail_lasts, dying, tail_dying)
 end last_uses_of
+
+// The names used here, however often, and never after. Asked before `named_once` adds them to what
+// comes after.
+private named_last(e: *Emit, here: &Names, later: &Names) -> Set[string]
+    var out: Set[string] = set()
+
+    for name in here.order
+        if !later.seen.has(name) && !e.moves.no_move.has(name) then out.add(name)
+
+    out
+end named_last
+
+// The dying set a statement or a block's value hands to the branch it is (`hand_in`): only a branch
+// takes one, and only as the whole of what is being emitted.
+dying_for(x: TExpr, dying: Set[string]) -> Set[string] = *x.kind match
+    TIf(_, _, _, _) -> dying
+    _ -> set()
+
+dying_for_stmt(s: TStmt, dying: Set[string]) -> Set[string] = s match
+    TExprStmt(x) -> dying_for(x, dying)
+    _ -> set()
+
+// **A local whose life ends inside a branch is handed into each of its arms.** Its slot leaves the
+// scope that declared it and joins the scope of every arm, so an arm that uses it last moves it, and
+// one that does not gives it back where that arm ends -- each path giving back exactly one count, as
+// the scope's end would have, only sooner. A local the condition names is not handed in: the condition
+// runs while the local is still the declaring scope's.
+//
+// It applies only where the branch is the whole statement (or the block's value), so nothing beside it
+// in the statement can still read the local; where every arm is there to take it (an `if` with an
+// `else`); and where the local's slot is the innermost scope's own, exactly as a move's must be.
+hand_in(e: *Emit, cond: Buf[TCondTerm]) -> Buf[(Val, Type)]
+    var out: Buf[(Val, Type)] = buf()
+    val dying = e.moves.dying
+
+    e.moves.dying = set()
+
+    if dying.is_empty() || e.owned_marks.is_empty() then return out
+
+    val named = names_none()
+
+    for term in cond
+        term match
+            TCondTest(c) -> walk_texpr(c, loads_into(named))
+            TCondIs(subject, _, _) -> walk_texpr(subject, loads_into(named))
+
+    for name in dying
+        if named.seen.has(name) then continue
+        if e.caller_exposed.has(OPAQUE) || e.caller_exposed.has(name) || is_promoted(e, name) then continue
+
+        val slot = reg_of(local_slot(e, name))
+        var found: Option[usize] = None
+
+        for j in e.owned_marks.at(e.owned_marks.len() - 1)..<e.owned_slots.len()
+            val s = e.owned_slots.at(j)
+
+            if reg_of(s.0) == slot && movable_type(s.1) then found = Some(j)
+
+        if found.is_some()
+            out.push(e.owned_slots.at(found.unwrap()))
+            forget_slot(e, found.unwrap())
+        end if
+
+    out
+end hand_in
+
+// An arm's scope, just opened, takes the slots handed into it.
+inherit_slots(e: *Emit, slots: Buf[(Val, Type)])
+    for s in slots
+        e.owned_slots.push(s)
 
 // The names used exactly once here and never after, which then join what comes after.
 private named_once(e: *Emit, here: &Names, later: &Names) -> Set[string]
@@ -312,7 +392,7 @@ end local_at
 
 // Whether a local of this type may hand its count over: anything but an array held by value, which a
 // view taken earlier may still be standing on.
-private movable_type(t: Type) -> bool = underlying(t) match
+movable_type(t: Type) -> bool = underlying(t) match
     Array(_, _) -> false
     Struct(d) -> fields_movable(d.fields)
     Enum(d) ->

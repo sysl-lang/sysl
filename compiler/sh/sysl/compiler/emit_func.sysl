@@ -61,10 +61,16 @@ gen_function(e: *Emit, f: TFunc) -> Option[IrFunc]
 
     // A zero-sized parameter is not an argument: there is nothing to receive and nothing to keep, so
     // it takes no slot and the emitted signature does not mention it.
-    for p in f.params
+    //
+    // **A parameter the function owns arrives with its count** (`owned_params.sysl`): its slot gives
+    // that count back like any local's, and nothing is taken for it here.
+    for j in 0..<f.params.len()
+        val p = f.params.at(j)
+
         if !zero_sized(p.1)
             val ty = p.1
-            val owned = owns.has(p.0)
+            val handed = e.owned_params.has(owned_key(f.name, j))
+            val owned = owns.has(p.0) || handed
 
             if underlying(ty) == VaList
                 receive_walk(e, p.0)
@@ -98,7 +104,7 @@ gen_function(e: *Emit, f: TFunc) -> Option[IrFunc]
                 emit(e, InStore(lty(e, ty), VReg(s"${p.0}.param"), VReg(s"${p.0}.addr"), AccPlain,
                                 None))
 
-                if owned then retain_value(e, ty, VReg(s"${p.0}.param"))
+                if owned && !handed then retain_value(e, ty, VReg(s"${p.0}.param"))
 
             if owned then own_slot(e, p.0, ty)
 
@@ -154,8 +160,9 @@ gen_function(e: *Emit, f: TFunc) -> Option[IrFunc]
 
     val lasts = last_uses_of(e, f.body.stmts, f.body.result)
 
-    gen_stmts_with(e, f.body.stmts, lasts.0)
+    gen_stmts_with(e, f.body.stmts, lasts.0, lasts.2)
     e.moves.last_uses = lasts.1
+    e.moves.dying = if f.body.result.is_some() then dying_for(f.body.result.unwrap(), lasts.3) else set()
 
     // A `never` result is `void` like `unit`: the body's trailing expression diverges, so it has
     // already terminated the block and the `ret` emitted here is dropped.

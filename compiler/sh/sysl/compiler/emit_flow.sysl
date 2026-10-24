@@ -22,12 +22,22 @@ gen_if(e: *Emit, cond: Buf[TCondTerm], then_block: TBlock, else_block: Option[TB
     val target = if else_block.is_some() then else_l else end_l
     val slot = merge_for(e, ty, into)
 
+    // A local this branch is the last of is handed into both arms (`emit_moves.sysl`'s `hand_in`),
+    // once the condition -- which may still leave by a `?` -- has run in the scope that declared it.
+    val dying = e.moves.dying
+
+    e.moves.dying = set()
+
     // The last term's success edge is the branch's entry, so a condition with nothing to bind emits
     // exactly the one test and the one `br` it always did.
     val paths = gen_cond(e, cond, then_l, target)
 
-    if no_value(ty) then gen_block_void(e, then_block)
-    else store_merged(e, then_block, ty, slot)
+    e.moves.dying = if else_block.is_some() then dying else set()
+
+    val handed = hand_in(e, cond)
+
+    if no_value(ty) then gen_block_void(e, then_block, handed)
+    else store_merged(e, then_block, ty, slot, handed)
 
     // The branch's value is computed before the condition's bindings are given back, so a `then`
     // that yields what it destructured has taken its own count by the time this runs.
@@ -39,7 +49,7 @@ gen_if(e: *Emit, cond: Buf[TCondTerm], then_block: TBlock, else_block: Option[TB
         Some(eb) ->
             emit_label(e, else_l)
 
-            if no_value(ty) then gen_block_void(e, eb) else store_merged(e, eb, ty, slot)
+            if no_value(ty) then gen_block_void(e, eb, handed) else store_merged(e, eb, ty, slot, handed)
 
             emit_term(e, InBr(end_l))
         None -> ()
@@ -64,10 +74,10 @@ merge_for(e: *Emit, ty: Type, into: Option[Val], in_place: bool = false) -> Merg
     None -> Merge(result_slot(e, ty), false, false)
 
 // One branch's value, left where the merge says.
-store_merged(e: *Emit, b: TBlock, ty: Type, m: Merge)
-    if b.ty == Never then gen_block_void(e, b)
-    else if m.into then gen_block_into(e, b, m.at)
-    else emit(e, InStore(lty(e, ty), gen_block_value(e, b), m.at, AccPlain, None))
+store_merged(e: *Emit, b: TBlock, ty: Type, m: Merge, inherit: Buf[(Val, Type)] = buf())
+    if b.ty == Never then gen_block_void(e, b, inherit)
+    else if m.into then gen_block_into(e, b, m.at, inherit)
+    else emit(e, InStore(lty(e, ty), gen_block_value(e, b, inherit), m.at, AccPlain, None))
 end store_merged
 
 // What the form yields where its branches meet: the slot's value, owned by the enclosing statement,
@@ -77,15 +87,18 @@ merged_value(e: *Emit, m: Merge, ty: Type) -> Val =
 
 // A branch's value built where it is going, and owned there -- `gen_block_value` for a destination.
 // The count is taken before the block's locals are given back, as the register form's is.
-private gen_block_into(e: *Emit, b: TBlock, dest: Val)
+private gen_block_into(e: *Emit, b: TBlock, dest: Val, inherit: Buf[(Val, Type)] = buf())
     val lasts = last_uses_of(e, b.stmts, b.result)
     val was = e.moves.last_uses
 
     push_temps(e)
     push_owned(e)
-    gen_stmts_with(e, b.stmts, lasts.0)
+    inherit_slots(e, inherit)
+    gen_stmts_with(e, b.stmts, lasts.0, lasts.2)
     e.moves.last_uses = lasts.1
+    e.moves.dying = dying_for(b.result.unwrap(), lasts.3)
     gen_into(e, dest, b.result.unwrap())
+    e.moves.dying = set()
     e.moves.last_uses = was
     pop_owned(e)
     pop_temps(e)
@@ -736,14 +749,27 @@ end gen_loop_result
 
 // -- blocks -----------------------------------------------------------------------------------------
 
-gen_block_void(e: *Emit, b: TBlock)
+//
+// `inherit` is the slots handed into the block from the scope around it (`hand_in`), which it owns as
+// its own from its first statement.
+gen_block_void(e: *Emit, b: TBlock, inherit: Buf[(Val, Type)] = buf())
+    val lasts = last_uses_of(e, b.stmts, b.result)
+    val was = e.moves.last_uses
+
     push_temps(e)
     push_owned(e)
-    gen_stmts(e, b.stmts)
+    inherit_slots(e, inherit)
+    gen_stmts_with(e, b.stmts, lasts.0, lasts.2)
+    e.moves.last_uses = lasts.1
 
     b.result match
-        Some(r) -> gen_expr(e, r)
+        Some(r) ->
+            e.moves.dying = dying_for(r, lasts.3)
+            gen_expr(e, r)
+            e.moves.dying = set()
         None -> ()
+
+    e.moves.last_uses = was
 
     pop_owned(e)
     pop_temps(e)
@@ -752,19 +778,23 @@ end gen_block_void
 // A branch's value, handed out with a count of its own. The block's locals and temporaries are
 // released before control leaves it -- that is what keeps every release site dominating the value
 // it releases -- so the result is retained first and becomes the caller's to let go.
-gen_block_value(e: *Emit, b: TBlock) -> Val
+gen_block_value(e: *Emit, b: TBlock, inherit: Buf[(Val, Type)] = buf()) -> Val
     val lasts = last_uses_of(e, b.stmts, b.result)
     val was = e.moves.last_uses
 
     push_temps(e)
     push_owned(e)
-    gen_stmts_with(e, b.stmts, lasts.0)
+    inherit_slots(e, inherit)
+    gen_stmts_with(e, b.stmts, lasts.0, lasts.2)
     e.moves.last_uses = lasts.1
 
     val v = b.result match
         Some(r) ->
+            e.moves.dying = dying_for(r, lasts.3)
+
             val got = gen_expr(e, r)
 
+            e.moves.dying = set()
             retain_moving(e, r, texpr_type(r), got)
             got
         None -> VNothing
@@ -782,7 +812,7 @@ gen_stmts(e: *Emit, xs: Buf[TStmt]) = gen_stmts_with(e, xs, buf())
 // The same, each statement told which locals it uses for the last time (`emit_moves.sysl`); a list
 // shorter than the block tells the rest that none are. Whatever the enclosing statement was told is
 // put back afterwards, since its own destination is reached only once this block is done.
-gen_stmts_with(e: *Emit, xs: Buf[TStmt], lasts: Buf[Set[string]])
+gen_stmts_with(e: *Emit, xs: Buf[TStmt], lasts: Buf[Set[string]], dying: Buf[Set[string]] = buf())
     val mark = nowrap_mark(e)
     val was = e.moves.last_uses
     val none: Set[string] = set()
@@ -792,7 +822,9 @@ gen_stmts_with(e: *Emit, xs: Buf[TStmt], lasts: Buf[Set[string]])
 
         nowrap_before(e, item)
         e.moves.last_uses = if i < lasts.len() then lasts.at(i) else none
+        e.moves.dying = if i < dying.len() then dying_for_stmt(item, dying.at(i)) else none
         gen_stmt(e, item)
+        e.moves.dying = none
         nowrap_after(e, item)
 
     e.moves.last_uses = was
@@ -800,4 +832,8 @@ gen_stmts_with(e: *Emit, xs: Buf[TStmt], lasts: Buf[Set[string]])
 end gen_stmts_with
 
 // A body whose scope was opened just for it -- a loop's -- with moves inferred over it.
-private gen_body(e: *Emit, body: Buf[TStmt]) = gen_stmts_with(e, body, last_uses_of(e, body, None).0)
+private gen_body(e: *Emit, body: Buf[TStmt])
+    val lasts = last_uses_of(e, body, None)
+
+    gen_stmts_with(e, body, lasts.0, lasts.2)
+end gen_body
