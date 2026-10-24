@@ -264,14 +264,29 @@ private bm_root(st: &BmState, e: TExpr, field: bool) -> string = *e.kind match
 
         underlying(ty) match
             Ptr(_) -> "pointer" + fx
+            Ref(_, _) -> "reference" + fx
             _ -> if holds_string(st.params, n) then "param" + fx
-                 else if field then "local-field" else s"local(${bm_origin_of(st, n)})"
-    TField(recv, _, _) -> bm_root(st, recv, true)
+                 else if field then s"local-field(${bm_origin_of(st, n)})" else s"local(${bm_origin_of(st, n)})"
+    TField(recv, _, _) ->
+        // A closure's own environment holds its captures by value; a field of an object reached
+        // through a reference or a pointer is that object's header, written in place.
+        if st.fname.starts_with("closure:") && !st.params.is_empty() && bm_names(recv, st.params.at(0))
+            "closure-capture"
+        else underlying(texpr_type(recv)) match
+            Ptr(_) -> "through-pointer"
+            Ref(_, _) -> "through-reference"
+            _ -> bm_root(st, recv, true)
     TDeref(_, _) -> "pointer"
     TGlobal(_, _, _) -> "global"
     TCast(operand, _) -> bm_root(st, operand, field)
     TAddrOf(place, _) -> bm_root(st, place, field)
     _ -> s"temporary(${bm_origin(st, e)})"
+
+// Whether `e` is the local `n`, or what it points at.
+private bm_names(e: TExpr, n: string) -> bool = *e.kind match
+    TLoad(m, _) -> m == n
+    TDeref(inner, _) -> bm_names(inner, n)
+    _ -> false
 
 // The local a receiver names, where it is one.
 private bm_recv_local(e: TExpr) -> Option[string] = *e.kind match
