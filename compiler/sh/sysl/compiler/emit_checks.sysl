@@ -460,15 +460,50 @@ private export_storage(a: &Analysis, p: TProgram, exported: Buf[TFunc])
     if !p.c_artifact || t.runs_initializers() || exported.is_empty() then return
     if p.c_runtime && runtime_init_called(p) then return
 
+    for r in storage_reads(a, p, exported)
+        val f = r.way
+
+        if p.c_runtime
+            a.fault(func_home(a, f.name), f.span,
+                    s"'${qualified_name(f.name)}' is exported and reaches ${r.named}, which is module " +
+                    "storage an initializer fills before the program's own statements run. This archive " +
+                    s"is a C runtime ('targets.${t.name}.entry'), and '${runtime_init_symbol()}' is what " +
+                    "fills it — but nothing here calls it, so the function would read whatever the image " +
+                    "left. Call it from the start file before the C program's 'main' — a 'bl " +
+                    s"${runtime_init_symbol()}' in its 'asm', or a call through an 'extern' naming it" +
+                    r.stops)
+        else
+            a.fault(func_home(a, f.name), f.span,
+                    s"'${qualified_name(f.name)}' is exported and reaches ${r.named}, which is module " +
+                    "storage an initializer fills before the program's own statements run. This artifact " +
+                    s"has no entry point to fill it in, and '${t.name}' is freestanding — there is no " +
+                    "loader to run a constructor either, so the function would read whatever the image " +
+                    "left. Build for a hosted target, where the storage is filled before any export can " +
+                    "run, or make the initializer constant data, which is laid straight into the object " +
+                    "file" + r.stops)
+    end for
+end export_storage
+
+// One way into a build's sysl code that reaches computed module storage: the function, the storage it
+// reaches as a refusal lists it, and why each piece is not constant data (`stops_text`).
+private struct StorageRead
+    way: TFunc
+    named: string
+    stops: string
+
+// **The one walk every storage refusal and the hosted warning read**: of the ways in given, each that
+// reaches computed storage, with what it reaches. `TVal.computed` decides what is computed, so a
+// refusal on a bare machine and the warning a hosted build gives about it cannot disagree.
+private storage_reads(a: &Analysis, p: TProgram, ways: Buf[TFunc]) -> Buf[StorageRead]
+    var out: Buf[StorageRead] = buf()
     var computed: Buf[string] = buf()
 
     for i in 0..<p.vals.len()
         if p.vals.at(i).computed then computed.push(p.vals.at(i).symbol)
 
-    if computed.is_empty() then return
+    if computed.is_empty() then return out
 
-    for i in 0..<exported.len()
-        val f = exported.at(i)
+    for f in ways
         val reached = vals_reached_from(p, f)
 
         var named: Buf[string] = buf()
@@ -476,27 +511,12 @@ private export_storage(a: &Analysis, p: TProgram, exported: Buf[TFunc])
         for item in reached
             if holds_string(computed, item) then named.push(s"'${qualified_name(item)}'")
 
-        if !named.is_empty() && p.c_runtime
-            a.fault(func_home(a, f.name), f.span,
-                    s"'${qualified_name(f.name)}' is exported and reaches " +
-                    s"${joined_list(sorted_names(named))}, which is module storage an initializer " +
-                    "fills before the program's own statements run. This archive is a C runtime " +
-                    s"('targets.${t.name}.entry'), and '${runtime_init_symbol()}' is what fills it — " +
-                    "but nothing here calls it, so the function would read whatever the image left. " +
-                    "Call it from the start file before the C program's 'main' — a 'bl " +
-                    s"${runtime_init_symbol()}' in its 'asm', or a call through an 'extern' naming it" +
-                    stops_text(a, reached, computed))
-        else if !named.is_empty()
-            a.fault(func_home(a, f.name), f.span,
-                    s"'${qualified_name(f.name)}' is exported and reaches " +
-                    s"${joined_list(sorted_names(named))}, which is module storage an initializer " +
-                    "fills before the program's own statements run. This artifact has no entry point " +
-                    s"to fill it in, and '${t.name}' is freestanding — there is no loader to run a " +
-                    "constructor either, so the function would read whatever the image left. Build " +
-                    "for a hosted target, where the storage is filled before any export can run, or " +
-                    "make the initializer constant data, which is laid straight into the object file" +
-                    stops_text(a, reached, computed))
-end export_storage
+        if !named.is_empty()
+            out.push(StorageRead(f, joined_list(sorted_names(named)), stops_text(a, reached, computed)))
+    end for
+
+    out
+end storage_reads
 
 // Why a `const` call in each piece of storage named was not run while compiling, where that is what
 // kept its initializer code: the reader's next step is in the reason, not in the refusal.
@@ -523,41 +543,27 @@ end stops_text
 check_image_storage(a: &Analysis, p: TProgram, own: Buf[string], entry: string)
     if p.c_artifact || !image_storage_unfilled(entry, p) then return
 
-    var computed: Buf[string] = buf()
-
-    for i in 0..<p.vals.len()
-        if p.vals.at(i).computed then computed.push(p.vals.at(i).symbol)
-
-    if computed.is_empty() then return
-
     val t = a.tables.target
-    val ways = image_ways_in(p, own, entry)
 
-    for f in ways
-        val reached = vals_reached_from(p, f)
-
-        var named: Buf[string] = buf()
-
-        for k in 0..<reached.len()
-            if holds_string(computed, reached.at(k)) then named.push(s"'${qualified_name(reached.at(k))}'")
-
-        if named.is_empty() then continue
-
-        var how = "is placed for code outside the program to enter"
-
-        if f.exported.is_some() then how = "is exported"
-        if f.name == entry || f.exported == Some(entry) then how = "starts the image"
-
-        a.fault(func_home(a, f.name), f.span,
-                s"'${qualified_name(f.name)}' $how and reaches ${joined_list(sorted_names(named))}, " +
+    for r in storage_reads(a, p, image_ways_in(p, own, entry))
+        a.fault(func_home(a, r.way.name), r.way.span,
+                s"'${qualified_name(r.way.name)}' ${way_in_how(r.way, entry)} and reaches ${r.named}, " +
                 "which is module storage an initializer fills before the program's own statements " +
                 s"run. 'main' is what fills it, and this image starts at '$entry' " +
                 s"('targets.${t.name}.entry'), which never calls 'main' — so the function would read " +
                 "whatever the image left. Build the value where it is used instead: a local, a " +
                 "struct built once and handed to what reads it, or, for a table of functions, a " +
                 "'match' that dispatches on the index; or make the initializer constant data, which " +
-                "is laid straight into the image" + stops_text(a, reached, computed))
+                "is laid straight into the image" + r.stops)
 end check_image_storage
+
+// How a way into an image is entered, as a refusal says it.
+private way_in_how(f: TFunc, entry: string) -> string
+    if f.name == entry || f.exported == Some(entry) then return "starts the image"
+    if f.exported.is_some() then return "is exported"
+
+    "is placed for code outside the program to enter"
+end way_in_how
 
 // **A hosted build warns about the storage a bare-metal build of the same package would refuse.** A
 // computed initializer is filled by code that runs before the program's own statements, which a
@@ -569,40 +575,83 @@ end check_image_storage
 // filed for it beside the `const`-call stops. A warning here and a refusal there cannot disagree about
 // which storage folds.
 //
-// It is said once per piece of storage, at its declaration, for the project's own modules only --
-// never a dependency's or the library's, which their own builds report -- and not at all where
-// `bare_metal_possible` says the package cannot reach a bare machine.
-check_bare_metal_storage(a: &Analysis, p: TProgram)
+// **It warns exactly where a bare-metal build of the same package and entry would refuse**, at the same
+// function the refusal names:
+//
+// - a C archive (`building_c`, a hosted `build-c`): each export reaching computed storage, as
+//   `export_storage` refuses it for a freestanding target -- unless the program calls
+//   `sysl_init_modules` and a freestanding block of the manifest names an entry of its own, which is a
+//   C runtime's archive filling its storage from its start file;
+// - a program with a `main` of its own (`image_storage_unfilled`): nothing, since a bare image runs
+//   `main`, and `main` fills the storage first;
+// - anything else -- a library: what a C archive of it would refuse, as above, and for each
+//   freestanding machine whose block names an entry that never runs `main`, every way into that image
+//   reaching computed storage, as `check_image_storage` refuses it.
+//
+// A way in from a module that says it needs an operating system (`@requires(os)`) is passed over, and
+// the whole check is skipped where `bare_metal_possible` says the package cannot reach a bare machine.
+check_bare_metal_storage(a: &Analysis, p: TProgram, own: Buf[string], root: string, building_c: bool)
     if !a.tables.target.runs_initializers() then return
 
-    for i in 0..<p.vals.len()
-        val v = p.vals.at(i)
+    val m = manifest_at(root) match
+        Err(_) -> return
+        Ok(found) -> found
 
-        if !v.computed then continue
+    var warned: Buf[string] = buf()
+    var runtime_entry = false
 
-        val d = a.tables.vals.get(v.symbol)
+    if !building_c
+        // A program `main` fills the storage of on every machine refuses nothing.
+        if !image_storage_unfilled("_start", p) then return
 
-        if d.is_none() then continue
+        for item in m.images
+            val machine = target_named(item.target)
 
-        // The value a module binding takes apart is no name the reader wrote: each name it binds is
-        // computed storage of its own, and is told about by that name.
-        if is_held_whole(d.unwrap().name) then continue
+            if machine.is_none() || !links_an_image(machine.unwrap()) then continue
 
-        val module_name = d.unwrap().scope.module_name
+            val entry = image_for(m, item.target).map(img -> img.entry).unwrap_or("")
 
-        if holds_string(a.tables.supplied_modules, module_name) || module_needs_os(a, module_name) then continue
+            if entry == "" || entry == "main" then continue
 
-        val why = a.evaluation.val_stops.get(v.symbol).unwrap_or("")
+            for r in storage_reads(a, p, image_ways_in(p, own, entry))
+                if holds_string(warned, r.way.name) || way_needs_os(a, r.way) then continue
 
-        a.caution(d.unwrap().scope, d.unwrap().span,
-                  s"'${qualified_name(v.symbol)}' is filled by code that runs before the program's own " +
-                  "statements, not laid down as constant data" + (if why == "" then "" else s". $why") +
-                  ". A bare-metal target runs that code only from 'main', so a C archive or an image " +
-                  "that starts elsewhere refuses whatever an export reaches of it. Make the initializer " +
-                  "constant data, or say the package needs an operating system with 'requires { os = " +
-                  "true }' in sysl.hocon")
-    end for
+                warned.push(r.way.name)
+                a.caution(func_home(a, r.way.name), r.way.span,
+                          s"'${qualified_name(r.way.name)}' ${way_in_how(r.way, entry)} and reaches " +
+                          s"${r.named}, which is module storage an initializer fills before the " +
+                          s"program's own statements run${r.stops}. A build for '${item.target}' starts " +
+                          s"at '$entry' ('targets.${item.target}.entry'), which never calls 'main', so it " +
+                          "refuses this function. Make the initializer constant data, or build the value " +
+                          "where it is used")
+        end for
+    end if
+
+    for item in m.images
+        val machine = target_named(item.target)
+
+        if machine.is_none() || !links_an_image(machine.unwrap()) then continue
+
+        val entry = image_for(m, item.target).map(img -> img.entry).unwrap_or("")
+
+        if entry != "" && entry != "main" then runtime_entry = true
+
+    if runtime_entry && runtime_init_called(p) then return
+
+    for r in storage_reads(a, p, exported_funcs(p, own))
+        if holds_string(warned, r.way.name) || way_needs_os(a, r.way) then continue
+
+        a.caution(func_home(a, r.way.name), r.way.span,
+                  s"'${qualified_name(r.way.name)}' is exported and reaches ${r.named}, which is module " +
+                  s"storage an initializer fills before the program's own statements run${r.stops}. A C " +
+                  "archive of this package for a freestanding target has no loader to run that " +
+                  "initializer, so a bare-metal build refuses this export. Make the initializer constant " +
+                  "data, which is laid straight into the object file, or, for a package that never runs " +
+                  "on a bare machine, say so with 'requires { os = true }' in sysl.hocon")
 end check_bare_metal_storage
+
+// Whether a way in lives in a module that says it needs an operating system.
+private way_needs_os(a: &Analysis, f: TFunc) -> bool = module_needs_os(a, func_home(a, f.name).module_name)
 
 // Whether a module says it needs an operating system, which no bare machine has (`@requires(os)`, or a
 // capability implying it).
