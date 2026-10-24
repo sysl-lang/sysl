@@ -247,9 +247,28 @@ hand_over_args(e: *Emit, name: string, args: Buf[TExpr], staged: Buf[(int, Val)]
     owned_symbol(symbol_of(e, name))
 end hand_over_args
 
+// An owning function's borrowing entry not yet emitted: the function, the signature its definition
+// was built with, and whether the module carries only an `available_externally` copy of it.
+struct PendingEntry
+    f: TFunc
+    sig: IrFuncSig
+    copy: bool
+end PendingEntry
+
 // A defined body as the functions it is emitted as: itself where it owns nothing, and otherwise the body
 // under `owned_symbol` beside the entry every other caller reaches under the function's own symbol.
-owned_split(e: *Emit, f: TFunc, built: IrFunc) -> Buf[IrFunc]
+//
+// **The body keeps the name `<symbol>.owned` whether or not an entry is emitted beside it.** A direct
+// call names the body from the analysis alone, and the analysis is the one thing a library and its
+// user agree on; whether an entry exists turns on what the whole module names, which a separately
+// compiled caller cannot know.
+//
+// **In a program the entry is only a candidate** (`lazy`): it is filed in `pending` and emitted by
+// `settle_entries` only where something in the finished module names the function's own symbol -- a
+// function value, a closure's thunk, a table slot, a hook the compiler calls, storage holding its
+// address. Only direct calls reach most owning functions, and those name the body. **An artifact
+// keeps every entry**, since the program that links it may take the address of any of its functions.
+owned_split(e: *Emit, f: TFunc, built: IrFunc, lazy: bool, copy: bool, pending: Buf[PendingEntry]) -> Buf[IrFunc]
     var out: Buf[IrFunc] = buf()
 
     if !e.owning_funcs.has(f.name)
@@ -259,10 +278,151 @@ owned_split(e: *Emit, f: TFunc, built: IrFunc) -> Buf[IrFunc]
 
     val body = built with { sig = built.sig with { name = owned_symbol(built.sig.name) } }
 
-    out.push(owned_entry(e, f, built.sig))
+    if lazy then pending.push(PendingEntry(f, built.sig, copy)) else out.push(owned_entry(e, f, built.sig))
+
     out.push(body)
     out
 end owned_split
+
+// The pending entries something in the module names, in the order they were filed, each taken out of
+// `pending`.
+named_entries(pending: Buf[PendingEntry], funcs: Buf[IrFunc], helpers: Buf[IrRuntime], globals: Buf[IrGlobal],
+              asm_lines: Buf[string]) -> Buf[PendingEntry]
+    var out: Buf[PendingEntry] = buf()
+
+    if pending.is_empty() then return out
+
+    var wanted: Set[string] = set()
+    var names: Buf[string] = buf()
+
+    for item in pending
+        wanted.add(item.sig.name)
+        names.push(item.sig.name)
+
+    var hits: Set[string] = set()
+
+    for f in funcs
+        func_names(f, wanted, names, &hits)
+
+    for h in helpers
+        h match
+            RtEmitted(f) -> func_names(f, wanted, names, &hits)
+            RtTemplate(_, llvm) -> text_names(llvm, names, &hits)
+
+    for g in globals
+        if g.value.is_some() then val_names(g.value.unwrap(), wanted, &hits)
+
+    for line in asm_lines
+        text_names(line, names, &hits)
+
+    var kept: Buf[PendingEntry] = buf()
+
+    for item in pending
+        if hits.has(item.sig.name) then out.push(item) else kept.push(item)
+
+    pending.clear()
+
+    for item in kept
+        pending.push(item)
+
+    out
+end named_entries
+
+// The entry a pending one is emitted as.
+pending_entry(e: *Emit, item: PendingEntry) -> IrFunc = owned_entry(e, item.f, item.sig)
+
+private func_names(f: IrFunc, wanted: Set[string], names: Buf[string], hits: *Set[string])
+    for b in f.blocks
+        for i in b.instrs
+            inst_names(i, wanted, names, hits)
+
+        if b.terminator.is_some() then inst_names(b.terminator.unwrap(), wanted, names, hits)
+end func_names
+
+private inst_names(i: Inst, wanted: Set[string], names: Buf[string], hits: *Set[string]) = i match
+    InBin(_, _, _, a, b) ->
+        val_names(a, wanted, hits)
+        val_names(b, wanted, hits)
+    InNeg(_, _, v) -> val_names(v, wanted, hits)
+    InIntCmp(_, _, _, a, b) ->
+        val_names(a, wanted, hits)
+        val_names(b, wanted, hits)
+    InFloatCmp(_, _, _, a, b) ->
+        val_names(a, wanted, hits)
+        val_names(b, wanted, hits)
+    InCast(_, _, _, v, _) -> val_names(v, wanted, hits)
+    InLoad(_, _, ptr, _, _) -> val_names(ptr, wanted, hits)
+    InStore(_, v, ptr, _, _) ->
+        val_names(v, wanted, hits)
+        val_names(ptr, wanted, hits)
+    InGep(_, _, ptr, idx) ->
+        val_names(ptr, wanted, hits)
+        arg_names(idx, wanted, hits)
+    InExtract(_, _, agg, _) -> val_names(agg, wanted, hits)
+    InInsert(_, _, agg, _, v, _) ->
+        val_names(agg, wanted, hits)
+        val_names(v, wanted, hits)
+    InSelect(_, c, _, a, b, _) ->
+        val_names(c, wanted, hits)
+        val_names(a, wanted, hits)
+        val_names(b, wanted, hits)
+    InInsertElement(_, _, vec, _, v, idx) ->
+        val_names(vec, wanted, hits)
+        val_names(v, wanted, hits)
+        val_names(idx.value, wanted, hits)
+    InExtractElement(_, _, vec, idx) ->
+        val_names(vec, wanted, hits)
+        val_names(idx.value, wanted, hits)
+    InShuffle(_, _, a, b, mask) ->
+        val_names(a, wanted, hits)
+        val_names(b, wanted, hits)
+        val_names(mask.value, wanted, hits)
+    InAsm(_, _, text, _, args) ->
+        text_names(text, names, hits)
+        arg_names(args, wanted, hits)
+    InCall(_, _, callee, args, _, _, _, _) ->
+        val_names(callee, wanted, hits)
+        arg_names(args, wanted, hits)
+    InVaArg(_, v, _) -> val_names(v, wanted, hits)
+    InAtomicRmw(_, _, ptr, _, v, _) ->
+        val_names(ptr, wanted, hits)
+        val_names(v, wanted, hits)
+    InCmpXchg(_, ptr, _, a, b, _) ->
+        val_names(ptr, wanted, hits)
+        val_names(a, wanted, hits)
+        val_names(b, wanted, hits)
+    InCondBr(c, _, _) -> val_names(c, wanted, hits)
+    InRet(_, v) -> if v.is_some() then val_names(v.unwrap(), wanted, hits)
+    InSwitch(_, v, _, _) -> val_names(v, wanted, hits)
+    _ -> ()
+
+private arg_names(args: Buf[IrArg], wanted: Set[string], hits: *Set[string])
+    for a in args
+        val_names(a.value, wanted, hits)
+end arg_names
+
+private val_names(v: Val, wanted: Set[string], hits: *Set[string])
+    v match
+        VGlobal(n) -> if wanted.has(n) then hits.add(n)
+        VSplat(_, x) -> val_names(*x, wanted, hits)
+        VAgg(fs) -> arg_names(fs, wanted, hits)
+        VPackedAgg(fs) -> arg_names(fs, wanted, hits)
+        VArray(fs) -> arg_names(fs, wanted, hits)
+        VVector(fs) -> arg_names(fs, wanted, hits)
+        VIntToPtr(_, x) -> val_names(*x, wanted, hits)
+        VPtrToInt(_, x) -> val_names(*x, wanted, hits)
+        VGep(_, b, idx) ->
+            val_names(*b, wanted, hits)
+            arg_names(idx, wanted, hits)
+        _ -> ()
+end val_names
+
+// A symbol written in text -- a hand-written runtime block, an `asm` -- is a name, and a name that
+// appears at all keeps its entry: an extra entry costs a few bytes, a missing one a link error.
+private text_names(text: string, names: Buf[string], hits: *Set[string])
+    for n in names
+        if !hits.has(n) && text.contains(n) then hits.add(n)
+end text_names
 
 // The entry a borrowing caller reaches: a count taken for each owned parameter, then the owned body
 // called with everything exactly as it arrived.

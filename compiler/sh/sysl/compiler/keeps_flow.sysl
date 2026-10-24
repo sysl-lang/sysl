@@ -130,7 +130,7 @@ private same_state(a: &PathState, b: &PathState) -> bool
     end if
 
     for p in a.pending
-        if !has_loc(b.pending, p.loc) then return false
+        if !has_site(b.pending, p) then return false
 
     for c in a.cleared
         if !holds_string(b.cleared, c) then return false
@@ -145,7 +145,18 @@ has_loc(xs: Buf[KeptAt], loc: string) -> bool
     false
 end has_loc
 
-add_kept(into: *Buf[KeptAt], k: KeptAt) = if !has_loc(*into, k.loc) then into.push(k)
+// Whether `xs` holds the same location kept at the same place in the source.
+private has_site(xs: Buf[KeptAt], k: KeptAt) -> bool
+    for x in xs
+        if x.loc == k.loc && x.at == k.at then return true
+
+    false
+end has_site
+
+// **Each place a pointer is let go is held on its own**, so that two stores of the frame's storage at
+// one location -- a call that hands a local to a function storing it in a global, and a store of
+// another local into the same global -- are each refused where they are written.
+add_kept(into: *Buf[KeptAt], k: KeptAt) = if !has_site(*into, k) then into.push(k)
 
 // What both lists overwrote. `*` is the assumption a recursive callee starts from -- it overwrites
 // everything -- so it gives way to whatever the other list says.
@@ -186,6 +197,11 @@ private apply_event(st: &PathState, ev: FlowEv)
     if st.dead then return
     if fan_event(&st.pending, ev) then return
 
+    if ev.clear && ev.loc.starts_with(">")
+        moved_pointer(st, ev.loc[1..<ev.loc.bytes.len])
+        return
+    end if
+
     // A second thread started into a handle whose first is still unjoined leaves the first with nobody
     // to join it.
     if !ev.clear && ev.loc.starts_with("j:") && has_loc(st.pending, ev.loc)
@@ -206,6 +222,38 @@ private apply_event(st: &PathState, ev: FlowEv)
         add_kept(&st.pending, KeptAt(ev.loc, ev.how, ev.at))
     end if
 end apply_event
+
+// **A location named through a pointer stops naming the same storage once that pointer may have
+// changed** (`deref_name`): what was stored there can no longer be taken back by a store through the
+// pointer, and what was overwritten there is no longer known to be. `what` is the pointer that may
+// have moved: `*` any read out of memory, `{T}` one of type `T` read out of memory, `@n` the local
+// `n` bound afresh.
+private moved_pointer(st: &PathState, what: string)
+    var pending: Buf[KeptAt] = buf()
+    var cleared: Buf[string] = buf()
+
+    for p in st.pending
+        pending.push(if moves(p.loc, what) then KeptAt(p.loc + "?", p.how, p.at) else p)
+
+    for c in st.cleared
+        if !moves(c, what) then cleared.push(c)
+
+    st.pending = pending
+    st.cleared = cleared
+end moved_pointer
+
+private moves(loc: string, what: string) -> bool
+    if !loc.starts_with("d:") then return false
+
+    if what.starts_with("@")
+        val root = "d:" + what
+
+        return loc == root || loc.starts_with(root + ".") || loc.starts_with(root + "[") ||
+            loc.starts_with(root + ">")
+    end if
+
+    if what == "*" then loc.index_of(">{").is_some() else loc.index_of(">" + what).is_some()
+end moves
 
 // A way out: what is held there, less what a `defer` overwrites on the way, is held past the call.
 private flow_exit(w: &FlowWalk, st: &PathState)
@@ -288,6 +336,10 @@ private flow_stmt(w: &FlowWalk, s: TStmt, st: &PathState, top: bool)
 
             for inner in stmts
                 for ev in w.stmt_events(inner)
+                    // A `defer` runs after whatever moved a pointer read out of memory, so a store
+                    // through one there names nothing that is known to be the storage stored at.
+                    if ev.clear && (ev.loc.starts_with(">") || ev.loc.index_of(">{").is_some()) then continue
+
                     if ev.clear
                         if every && top && !holds_string(w.deferred_clears, ev.loc)
                             w.deferred_clears.push(ev.loc)
@@ -586,6 +638,12 @@ struct Origins
     refs: Buf[(string, TExpr)]
     locals: Map[string, string]
     changed: bool
+
+    // How many times each name is bound in the body, and the names written, whose address is taken
+    // or that a `ref` aliases after they are bound -- which together say which locals hold one value
+    // from their binding on (`stable_name`).
+    binders: Map[string, int]
+    unstable: Map[string, bool]
 end Origins
 
 origins_of(cx: &KeepsCx, f: TFunc) -> &Origins
@@ -593,11 +651,14 @@ origins_of(cx: &KeepsCx, f: TFunc) -> &Origins
         Some(o) -> return o
         None -> ()
 
-    val o: &Origins = Origins(cx, f.params, buf(), map(), false)
+    val o: &Origins = Origins(cx, f.params, buf(), map(), false, map(), map())
 
     walk_block_stmts(f.body, stmt_walk(false, s -> s match
         TRefDecl(n, _, place) -> o.refs.push((n, place))
         _ -> ()))
+
+    walk_block_stmts(f.body, TWalk(false, e -> binding_expr(o, e), w -> written_name(o, w.place),
+                                   s -> binding_stmt(o, s)))
 
     var rounds = 0
 
@@ -632,6 +693,68 @@ private origin_bind_store(o: &Origins, place: TExpr, v: TExpr)
         TLoad(n, _) -> if !is_param(o, n) then origin_assign(o, n, origin_of(o, v))
         _ -> ()
 end origin_bind_store
+
+private binding_stmt(o: &Origins, s: TStmt)
+    s match
+        TVarDecl(n, _, _, _) -> bound(o, n)
+        TRefDecl(n, _, place) ->
+            o.unstable.put(n, true)
+
+            *place.kind match
+                TLoad(m, _) -> o.unstable.put(m, true)
+                _ -> ()
+        _ -> ()
+end binding_stmt
+
+private binding_expr(o: &Origins, e: TExpr)
+    *e.kind match
+        TStore(place, _, _, _) -> written_name(o, place)
+        TAddrOf(place, _) -> written_name(o, place)
+        TMatch(_, arms, _) ->
+            for arm in arms
+                bound_patterns(o, arm.patterns)
+        TIf(cond, _, _, _) -> bound_terms(o, cond)
+        TWhile(cond, _, _, _) -> bound_terms(o, cond)
+        TFor(n, _, _, _, _, _, _, _) -> o.unstable.put(n, true)
+        TForEach(n, _, _, _, _, _) -> o.unstable.put(n, true)
+        TQuantifier(_, n, _, _, _, _, _) -> o.unstable.put(n, true)
+        TCheckedLoop(n, _, _) -> o.unstable.put(n, true)
+        TIterate(cursor, _, _, _, p, _, _, _) ->
+            var names: Buf[string] = buf()
+
+            names.push(cursor)
+            pattern_names(p, &names)
+
+            for n in names
+                o.unstable.put(n, true)
+        _ -> ()
+end binding_expr
+
+private bound_terms(o: &Origins, cond: Buf[TCondTerm])
+    for term in cond
+        term match
+            TCondIs(_, patterns, _) -> bound_patterns(o, patterns)
+            _ -> ()
+end bound_terms
+
+private bound_patterns(o: &Origins, ps: Buf[TPattern])
+    var names: Buf[string] = buf()
+
+    for p in ps
+        pattern_names(p, &names)
+
+    for n in names
+        o.unstable.put(n, true)
+end bound_patterns
+
+private bound(o: &Origins, n: string) = o.binders.put(n, o.binders.get(n).unwrap_or(0) + 1)
+
+// A local written after it is bound, or whose address is taken -- through which anything may write it.
+private written_name(o: &Origins, place: TExpr)
+    *place.kind match
+        TLoad(n, _) -> o.unstable.put(n, true)
+        _ -> ()
+end written_name
 
 private origin_assign(o: &Origins, n: string, org: string)
     val now = o.locals.get(n)
@@ -763,9 +886,55 @@ place_loc(o: &Origins, place: TExpr) -> string
         TDeref(x, _) ->
             val b = origin_of(o, x)
 
-            if b == "-" then "" else b
+            if b == "-" then return ""
+
+            if b == "" then deref_name(o, x) else b
         _ -> ""
 end place_loc
+
+// **A store through a pointer the body did not make is named by where the pointer came from**, so
+// that a later store through the same pointer is seen to overwrite it. Two kinds of pointer qualify:
+//
+// - a local bound once and never written, whose address is never taken (`d:@vm`): it holds one value
+//   from its binding on, which nothing else can change -- until the binding runs again, in a loop
+//   (`>@vm`, `moved_pointer`);
+// - a pointer read out of a place this can name (`d:p0:.vm>{*M}`), marked with its type: a call, or a
+//   store of a value that could be such a pointer, may change it (`>*`, `>{*M}`).
+//
+// Neither is storage the caller can say anything about, so neither is the parameter's own pointee or
+// one held through another parameter: it is kept unless overwritten on every way out.
+private deref_name(o: &Origins, x: TExpr) -> string
+    *x.kind match
+        TLoad(n, _) ->
+            for item in o.refs
+                if item.0 == n then return read_name(o, x)
+
+            return stable_name(o, n)
+        _ -> read_name(o, x)
+end deref_name
+
+// The name of a local that holds one value for as long as it is bound, or nothing.
+stable_name(o: &Origins, n: string) -> string =
+    if o.binders.get(n).unwrap_or(0) == 1 && !o.unstable.has(n) && !is_param(o, n) then s"d:@$n" else ""
+
+private read_name(o: &Origins, x: TExpr) -> string
+    *x.kind match
+        TLoad(_, _) -> ()
+        TGlobal(_, _, _) -> ()
+        TField(_, _, _) -> ()
+        TIndex(_, _, _) -> ()
+        TDeref(_, _) -> ()
+        _ -> return ""
+
+    val at = place_loc(o, x)
+    val key = type_show(texpr_type(x))
+
+    if at == "" || at.index_of("?").is_some() || key.index_of("?").is_some() then return ""
+
+    val root = if at.starts_with("d:") then at else s"d:$at"
+
+    s"$root>{$key}"
+end read_name
 
 // Which element an index names, where a clear can be matched against it: a constant (`=3`), a
 // parameter (`#p1`) or a field of what a parameter points at (`#p0.drive`), each said again in the
@@ -845,15 +1014,38 @@ private[compiler] field_label(t: Type, index: int) -> string = t match
 translate_loc(o: &Origins, args: Buf[TExpr], callee_loc: string) -> string
     val loc = caller_index_keys(o, args, callee_loc)
 
-    if loc == "" || loc == "*" || loc.starts_with("g:") then return loc
+    if loc == "" || loc == "*" || loc.starts_with("g:") || loc.starts_with("d:g:") then return loc
+
+    // A pointer read out of what a parameter points at is read out of what the caller handed there;
+    // one the callee's own local held is nothing the caller can name.
+    if loc.starts_with("d:")
+        if loc.starts_with("d:@") then return ""
+
+        val inner = translate_loc(o, args, loc[2..<loc.bytes.len])
+
+        if inner == "" || inner.starts_with("d:") then return inner
+
+        return "d:" + inner
+    end if
 
     for j in 0..<args.len()
         val prefix = s"p$j:"
 
         if loc.starts_with(prefix)
-            val base = origin_of(o, args.at(j))
+            var base = origin_of(o, args.at(j))
 
-            if base == "" || base == "-" then return ""
+            if base == "-" then return ""
+
+            // **What the callee stores through its parameter, the caller stores through the pointer
+            // it handed** -- which it can name again only when that pointer is a local holding one
+            // value: one read out of memory may have moved inside the call.
+            if base == ""
+                base = *args.at(j).kind match
+                    TLoad(n, _) -> stable_name(o, n)
+                    _ -> ""
+            end if
+
+            if base == "" then return ""
 
             return base + loc[prefix.bytes.len..<loc.bytes.len]
         end if

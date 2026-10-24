@@ -98,6 +98,14 @@ struct KeepsCx
     dispatched: Map[string, string]
     addressed: Map[string, bool]
 
+    // Every function whose address is taken, by the pointer type it is taken at, and the pointer
+    // types C may call through or that are reinterpreted as something else (`note_escape`).
+    by_type: Buf[(string, string)]
+    escaped: Map[string, bool]
+
+    // The symbols of the variables `extern` declarations name.
+    c_vars: Buf[string]
+
     // Whether a struct or an enum may hold a raw pointer, by its name (`may_hold_pointer`).
     pointerish: Map[string, bool]
 
@@ -128,7 +136,10 @@ check_keeps(a: &Analysis, funcs: Buf[TFunc], vtables: Buf[TVtable])
         if !index.has(funcs.at(i).name) then index.put(funcs.at(i).name, i)
 
     val cx: &KeepsCx = KeepsCx(a, funcs, index, map(), map(), map(), buf(), buf(), false, map(), map(),
-                               map(), map(), vtables)
+                               buf(), map(), buf(), map(), map(), vtables)
+
+    for i in 0..<a.tables.extern_vars.len()
+        cx.c_vars.push(extern_var_symbol(a.tables.extern_vars.at(i)))
 
     // Every method an `impl` of a trait brought, by the function it was lowered to, and every slot of
     // every table -- an instance of a generic one among them.
@@ -150,7 +161,17 @@ check_keeps(a: &Analysis, funcs: Buf[TFunc], vtables: Buf[TVtable])
             if !cx.dispatched.has(slot.target) then cx.dispatched.put(slot.target, vt.trait_name)
 
     for f in funcs
-        walk_block_stmts(f.body, expr_walk(false, e -> note_addressed(cx, e)))
+        walk_block_stmts(f.body, TWalk(false, e -> note_addressed(cx, e),
+                                       w -> if in_c_storage(cx, w.place) then escape_types(cx, texpr_type(w.value), 0),
+                                       s -> ()))
+
+        // C calls an exported function with pointers of its own, and gets back what it answers.
+        if f.exported.is_some()
+            escape_types(cx, f.ret_ty, 0)
+
+            for p in f.params
+                escape_types(cx, p.1, 0)
+        end if
 
     var faults: &KeepFaults = KeepFaults(buf())
     var rounds = 0
@@ -189,9 +210,146 @@ end check_keeps
 
 private note_addressed(cx: &KeepsCx, e: TExpr)
     *e.kind match
-        TFuncAddr(name, _, _) -> cx.addressed.put(name, true)
+        TFuncAddr(name, _, ty) ->
+            cx.addressed.put(name, true)
+
+            val key = fn_key(ty)
+            var seen = false
+
+            for item in cx.by_type
+                if item.0 == key && item.1 == name then seen = true
+
+            if !seen then cx.by_type.push((key, name))
         _ -> ()
+
+    note_escape(cx, e)
 end note_addressed
+
+// The type of a function pointer, as the calls through it are matched with the functions it may
+// reach, or nothing for any other type.
+private fn_key(t: Type) -> string = t match
+    CFn(_, _) -> type_show(t)
+    _ -> ""
+
+// **A function pointer C can reach may be called with anything**: one handed to a call with no body
+// here -- C's, or a form the compiler supplies -- or answered by one, which is storage C made, or
+// stored in a variable C declares. A pointer turned into an integer and back is the raw tier's
+// bargain, as it is for data: a function is called through the type its address was taken at, and
+// calling it through another is undefined in C as it is here.
+private note_escape(cx: &KeepsCx, e: TExpr)
+    *e.kind match
+        TCall(name, args, ty, _) ->
+            if cx.find(name).is_none()
+                escape_types(cx, ty, 0)
+
+                for a in args
+                    escape_types(cx, texpr_type(a), 0)
+            end if
+        TStore(place, v, _, _) -> if in_c_storage(cx, place) then escape_types(cx, texpr_type(v), 0)
+        _ -> ()
+end note_escape
+
+// Whether a place is, or is reached through, a variable an `extern` declares.
+private in_c_storage(cx: &KeepsCx, place: TExpr) -> bool = *place.kind match
+    TGlobal(symbol, _, _) -> holds_string(cx.c_vars, symbol)
+    TField(r, _, _) -> in_c_storage(cx, r)
+    TIndex(r, _, _) -> in_c_storage(cx, r)
+    TDeref(x, _) -> in_c_storage(cx, x)
+    TCast(x, _) -> in_c_storage(cx, x)
+    _ -> false
+
+// Every function pointer type a value of `t` holds, in place or behind a pointer.
+private escape_types(cx: &KeepsCx, t: Type, depth: int)
+    if depth > 6 then return
+
+    t match
+        CFn(params, ret) ->
+            cx.escaped.put(type_show(t), true)
+
+            for p in params
+                escape_types(cx, p, depth + 1)
+
+            escape_types(cx, *ret, depth + 1)
+        Ptr(inner) -> escape_types(cx, *inner, depth + 1)
+        Ref(inner, _) -> escape_types(cx, *inner, depth + 1)
+        Volatile(inner) -> escape_types(cx, *inner, depth + 1)
+        Array(_, elem) -> escape_types(cx, *elem, depth + 1)
+        Slice(elem, _) -> escape_types(cx, *elem, depth + 1)
+        Struct(d) ->
+            for item in d.fields
+                escape_types(cx, item.1, depth + 1)
+        Enum(d) ->
+            for v in d.variants
+                for item in v.fields
+                    escape_types(cx, item.1, depth + 1)
+        _ -> ()
+end escape_types
+
+// **A function whose address is taken only at pointer types C cannot reach answers through its
+// body**: every call through such a pointer is in this program, and is held to what each function it
+// may reach keeps (`pointer_keeps`). The one thing such a function may keep a pointer it is handed in
+// is what another of its parameters points at -- which the call says what it is.
+private relays(cx: &KeepsCx, name: string) -> bool
+    var any = false
+
+    for item in cx.by_type
+        if item.1 != name then continue
+        if item.0 == "" || cx.escaped.has(item.0) then return false
+
+        any = true
+
+    any
+end relays
+
+// Whether a location is one held through a parameter of the function it is said in.
+private through_param(loc: string) -> bool
+    val b = loc.bytes
+
+    if b.len < 3 || b[0] != u8('p') then return false
+
+    var i: usize = 1
+
+    while i < b.len && b[i] >= u8('0') && b[i] <= u8('9')
+        i += 1
+
+    i > 1 && i < b.len && b[i] == u8(':')
+end through_param
+
+// What a function reached through a pointer keeps, said to a call: only what it holds through its
+// parameters, since anywhere else is refused where its body is written.
+private held_through_params(w: KeptWhy, i: usize) -> KeptWhy
+    var locs: Buf[KeptAt] = buf()
+    var first: Option[KeptAt] = None
+
+    for item in w.locs
+        if !through_param(item.loc) then continue
+
+        locs.push(item)
+
+        if first.is_none() && !item.loc.starts_with(s"p$i:") then first = Some(item)
+
+    if first.is_none() then return KeptWhy(false, "", span_zero(), locs)
+
+    KeptWhy(true, first.unwrap().how, first.unwrap().at, locs)
+end held_through_params
+
+// **A call through a function pointer may land in any function whose address was taken at that
+// pointer's type**, and keeps what any of them keeps -- each location with the function that keeps
+// it there. A type C may call through reaches bodies held to the default instead (`refuse_promised`).
+private pointer_keeps(cx: &KeepsCx, callee: TExpr, j: usize) -> Buf[(string, KeptAt)]
+    var out: Buf[(string, KeptAt)] = buf()
+    val key = fn_key(texpr_type(callee))
+
+    if key == "" || cx.escaped.has(key) then return out
+
+    for item in cx.by_type
+        if item.0 != key then continue
+
+        for k in keeps_of(cx, item.1, j).locs
+            out.push((item.1, k))
+
+    out
+end pointer_keeps
 
 // Whether the round just made is the last: every answer that leaned on an assumption came out as it
 // was assumed. Otherwise the next round assumes what this one found.
@@ -364,7 +522,8 @@ private summary(cx: &KeepsCx, name: string, i: usize, q: string) -> KeptWhy
 
     cx.taint = false
 
-    val out = if keeping then walk_kept(cx, f, i)
+    val out = if keeping && pointer_reached(cx, f, i) then held_through_params(walk_kept(cx, f, i), i)
+    else if keeping then walk_kept(cx, f, i)
     else if q == ClearsQ then walk_clears(cx, f)
     else walk_answers(cx, f, i, q == RawAnswersQ)
 
@@ -479,8 +638,14 @@ private lent_by_rule(cx: &KeepsCx, f: TFunc, i: usize) -> bool
     // says so to a call that sees it, whatever reaches it besides.
     if !holds_raw_pointer(f.params.at(i).1, 0) then return false
 
-    trait_of(cx, f.name).is_some() || cx.addressed.has(f.name)
+    trait_of(cx, f.name).is_some() || (cx.addressed.has(f.name) && !relays(cx, f.name))
 end lent_by_rule
+
+// Whether `f` is reached through a function pointer whose calls are all in sight, so what it keeps
+// at `i` is held to each of them (`relays`).
+private pointer_reached(cx: &KeepsCx, f: TFunc, i: usize) -> bool =
+    !is_closure_body(f) && trait_of(cx, f.name).is_none() && holds_raw_pointer(f.params.at(i).1, 0) &&
+        relays(cx, f.name)
 
 // The trait a function implements a method of, whether it is that method's own lowering or an
 // instance of a generic one.
@@ -644,6 +809,7 @@ end walk_clears
 private track_stmt_events(t: &Track, s: TStmt) -> Buf[FlowEv]
     val evs: &EvBuf = EvBuf(buf())
 
+    stmt_moves(t.cx, evs, s)
     t.hs.at = stmt_handle(t.hs, s)
 
     s match
@@ -665,6 +831,7 @@ end track_stmt_events
 private track_expr_events(t: &Track, e: TExpr) -> Buf[FlowEv]
     val evs: &EvBuf = EvBuf(buf())
 
+    piece_moves(t.cx, evs, e)
     t.hs.at = expr_handle(t.hs, e)
     top_clears(t, evs, e)
     walk_texpr(e, TWalk(false, x -> kept_at(t, evs, x), w -> stored(t, evs, w.place, w.value),
@@ -676,6 +843,57 @@ end track_expr_events
 
 struct EvBuf
     items: Buf[FlowEv]
+
+// **What a piece may do to a pointer a location is named through, said before anything it stores or
+// overwrites** (`keeps_flow.sysl`'s `deref_name`): a call or an atomic may write any pointer held in
+// memory, a store one of its value's type, and a declaration binds its local afresh.
+private stmt_moves(cx: &KeepsCx, evs: &EvBuf, s: TStmt)
+    stmt_decl_moves(cx, evs, s)
+    walk_stmt(s, TWalk(false, x -> expr_moves(cx, evs, x), w -> value_moves(cx, evs, texpr_type(w.value)),
+                       x -> stmt_decl_moves(cx, evs, x)))
+end stmt_moves
+
+private piece_moves(cx: &KeepsCx, evs: &EvBuf, e: TExpr)
+    expr_moves(cx, evs, e)
+    walk_texpr(e, TWalk(false, x -> expr_moves(cx, evs, x), w -> value_moves(cx, evs, texpr_type(w.value)),
+                        x -> stmt_decl_moves(cx, evs, x)))
+end piece_moves
+
+private stmt_decl_moves(cx: &KeepsCx, evs: &EvBuf, s: TStmt)
+    s match
+        TVarDecl(n, ty, _, _) ->
+            moved(evs, s"@$n")
+            value_moves(cx, evs, ty)
+        _ -> ()
+end stmt_decl_moves
+
+private expr_moves(cx: &KeepsCx, evs: &EvBuf, e: TExpr)
+    *e.kind match
+        TCall(_, _, _, _) -> moved(evs, "*")
+        TVCall(_, _, _, _, _) -> moved(evs, "*")
+        TCallPtr(_, _, _, _) -> moved(evs, "*")
+        TAtomic(_, _, _, _, _, _) -> moved(evs, "*")
+        TSlots(_, _, _, _) -> moved(evs, "*")
+        TStore(_, v, _, _) -> value_moves(cx, evs, texpr_type(v))
+        _ -> ()
+end expr_moves
+
+private value_moves(cx: &KeepsCx, evs: &EvBuf, t: Type)
+    if !may_hold_pointer(cx, t) then return
+
+    t match
+        Ptr(_) -> moved(evs, s"{${type_show(t)}}")
+        _ -> moved(evs, "*")
+end value_moves
+
+private moved(evs: &EvBuf, what: string)
+    val loc = ">" + what
+
+    for ev in evs.items
+        if ev.clear && ev.loc == loc then return
+
+    evs.items.push(FlowEv(true, loc, "", span_zero()))
+end moved
 
 private top_clears(t: &Track, evs: &EvBuf, e: TExpr)
     *e.kind match
@@ -785,6 +1003,16 @@ private kept_at(t: &Track, evs: &EvBuf, e: TExpr)
                     val how = s"it is passed to '${shown_name(t.cx.an, item.0)}', which keeps it"
 
                     if !loc.starts_with("l:") then evs.items.push(FlowEv(false, loc, how, args.at(j).span))
+        TCallPtr(callee, args, _, _) ->
+            for j in 0..<args.len()
+                if !carries(t, args.at(j)) then continue
+
+                for item in pointer_keeps(t.cx, callee, j)
+                    val loc = translate_loc(t.org, args, item.1.loc)
+                    val how = s"it is passed through a function pointer to '${shown_name(t.cx.an, item.0)}', " +
+                        "which keeps it"
+
+                    if !loc.starts_with("l:") then evs.items.push(FlowEv(false, loc, how, args.at(j).span))
         _ -> ()
 end kept_at
 
@@ -814,9 +1042,11 @@ private stored(t: &Track, evs: &EvBuf, place: TExpr, v: TExpr)
         TFloorCast(x, ty) -> is_integer_type(ty) && carries(t, x)
         _ -> false
 
+    // **An address stored as an integer is held where the integer is**, as the pointer would be: one
+    // stored in the storage it points into ends with that storage, and one stored anywhere the call
+    // does not own is kept.
     if carries(t, v) || cast
-        evs.items.push(FlowEv(false, if cast then "" else loc, s"it is stored in '${place_said(t.scope, place)}'",
-                              v.span))
+        evs.items.push(FlowEv(false, loc, s"it is stored in '${place_said(t.scope, place)}'", v.span))
     end if
 end stored
 
@@ -909,12 +1139,23 @@ private bind_call(t: &Track, name: string, args: Buf[TExpr])
             if loc.starts_with("l:") then bind_name(t, local_of(loc))
 end bind_call
 
+private bind_ptr_call(t: &Track, callee: TExpr, args: Buf[TExpr])
+    for j in 0..<args.len()
+        if !carries(t, args.at(j)) then continue
+
+        for item in pointer_keeps(t.cx, callee, j)
+            val loc = translate_loc(t.org, args, item.1.loc)
+
+            if loc.starts_with("l:") then bind_name(t, local_of(loc))
+end bind_ptr_call
+
 // The forms that bind names from a value: a store, a `match`'s arms, an `is` test, a `for` over a
 // sequence and an iteration's cursor.
 private bind_expr(t: &Track, e: TExpr)
     *e.kind match
         TStore(place, v, _, _) -> bind_store(t, place, v)
         TCall(name, args, _, _) -> bind_call(t, name, args)
+        TCallPtr(callee, args, _, _) -> bind_ptr_call(t, callee, args)
         TMatch(scrutinee, arms, _) ->
             if carries(t, scrutinee)
                 for arm in arms
@@ -1315,8 +1556,29 @@ private frame_bind_expr(ft: &FrameTrack, e: TExpr)
     *e.kind match
         TStore(place, v, _, _) -> frame_bind_store(ft, place, v)
         TCall(name, args, _, _) -> frame_bind_call(ft, name, args)
+        TCallPtr(callee, args, _, _) -> frame_bind_ptr_call(ft, callee, args)
         _ -> ()
 end frame_bind_expr
+
+private frame_bind_ptr_call(ft: &FrameTrack, callee: TExpr, args: Buf[TExpr])
+    for j in 0..<args.len()
+        val arg = args.at(j)
+
+        if !may_hold_pointer(ft.cx, texpr_type(arg)) then continue
+
+        val core = frame_core(ft, arg)
+
+        if core.is_none() then continue
+
+        for item in pointer_keeps(ft.cx, callee, j)
+            val loc = translate_loc(ft.org, args, item.1.loc)
+            val local = if loc.starts_with("l:") then local_of(loc) else ""
+
+            if local != "" && ft.core_of(local).is_none()
+                ft.held.push((local, core.unwrap()))
+                ft.changed = true
+            end if
+end frame_bind_ptr_call
 
 // A store into this frame's own storage -- by name, or through a pointer that points into it.
 private frame_bind_store(ft: &FrameTrack, place: TExpr, v: TExpr)
@@ -1355,6 +1617,7 @@ end frame_bind_call
 private frame_stmt_events(ft: &FrameTrack, s: TStmt) -> Buf[FlowEv]
     val evs: &EvBuf = EvBuf(buf())
 
+    stmt_moves(ft.cx, evs, s)
     ft.hs.at = stmt_handle(ft.hs, s)
 
     s match
@@ -1376,6 +1639,7 @@ end frame_stmt_events
 private frame_expr_events(ft: &FrameTrack, e: TExpr) -> Buf[FlowEv]
     val evs: &EvBuf = EvBuf(buf())
 
+    piece_moves(ft.cx, evs, e)
     ft.hs.at = expr_handle(ft.hs, e)
     frame_top_clears(ft, evs, e)
     walk_texpr(e, TWalk(false, x -> frame_event_at(ft, evs, x), w -> frame_stored(ft, evs, w.place, w.value),
@@ -1409,6 +1673,7 @@ private frame_event_at(ft: &FrameTrack, evs: &EvBuf, e: TExpr)
         TStore(place, v, _, _) -> frame_stored(ft, evs, place, v)
         TCall(_, _, _, _) -> call_at(ft, evs, e)
         TVCall(_, _, _, _, _) -> call_at(ft, evs, e)
+        TCallPtr(_, _, _, _) -> call_at(ft, evs, e)
         _ -> ()
 end frame_event_at
 
@@ -1511,6 +1776,31 @@ private call_at(ft: &FrameTrack, evs: &EvBuf, e: TExpr)
                     val said = s"'${shown_name(ft.cx.an, item.0)}' keeps its parameter " +
                         s"'${param_name(ft.cx, item.0, j + 1)}' (${item.1.how}), and " +
                         argument_said(ft, arg, core.unwrap())
+
+                    if loc == "" || loc.index_of("?").is_some()
+                        ft.faults.items.push((ft.scope, arg.span, said))
+                        break
+                    end if
+
+                    evs.items.push(FlowEv(false, loc, said, arg.span))
+        TCallPtr(callee, args, _, _) ->
+            for j in 0..<args.len()
+                val arg = args.at(j)
+
+                if !may_hold_pointer(ft.cx, texpr_type(arg)) then continue
+
+                val core = frame_core(ft, arg)
+
+                if core.is_none() then continue
+
+                for item in pointer_keeps(ft.cx, callee, j)
+                    val loc = translate_loc(ft.org, args, item.1.loc)
+
+                    if loc.starts_with("l:") then continue
+
+                    val said = s"a call through '${type_show(texpr_type(callee))}' may reach " +
+                        s"'${shown_name(ft.cx.an, item.0)}', which keeps its parameter " +
+                        s"'${param_name(ft.cx, item.0, j)}' (${item.1.how}), and " + argument_said(ft, arg, core.unwrap())
 
                     if loc == "" || loc.index_of("?").is_some()
                         ft.faults.items.push((ft.scope, arg.span, said))
@@ -1654,6 +1944,18 @@ private refuse_promised(cx: &KeepsCx, faults: &KeepFaults, f: TFunc)
         val w = walk_kept(cx, f, i)
 
         if !w.kept then continue
+
+        // A function every call through a pointer to is in sight may hold what it is handed in what
+        // another parameter points at, which each of those calls is held to (`pointer_keeps`).
+        if !closure && trait_name.is_none() && relays(cx, f.name)
+            for item in w.locs
+                if through_param(item.loc) then continue
+
+                faults.items.push((scope, item.at, promise_broken(cx, f, f.params.at(i).0, item.how, false, None)))
+                break
+
+            continue
+        end if
 
         faults.items.push((scope, w.at, promise_broken(cx, f, f.params.at(i).0, w.how, closure, trait_name)))
 end refuse_promised
