@@ -62,15 +62,38 @@ end check_lends_names
 // receiver is `*self` -- the pointer a `@lends` call lent the body that calls it -- and, once each, a
 // parameter that is a call. The call is usually a `&sync Fn`, since what is named crosses into another
 // domain; a bare arrow and a type parameter bounded by a call trait are calls too, and the crossing
-// rule `@scoped` implies decides what may be passed there. A free function and a field are refused
-// by the parser, before a declaration exists.
-check_scoped_names(a: &Analysis, scope: Scope, span: Span, d: FuncDecl, shown: string)
+// rule `@scoped` implies decides what may be passed there. A field is refused by the parser, before a
+// declaration exists.
+//
+// **A `*T` parameter it may name above any function** (`marks.scoped_pointers`, which the parser
+// keeps apart): the promise that the body holds the pointer only while its caller waits is checked
+// from 0.6.0, and here only its names are -- they are parameters by construction, so what is left to
+// tell is a name written twice.
+check_scoped_names(a: &Analysis, scope: Scope, span: Span, d: FuncDecl, shown: string, method: bool)
+    val pointers = d.marks.scoped_pointers
+
+    for i in 0..<pointers.len()
+        for j in 0..<i
+            if pointers.at(j) == pointers.at(i) then
+                a.fault(scope, span, s"'@scoped' names '${pointers.at(i)}' twice, and a parameter is " +
+                        "waited for or it is not — the second says nothing the first does not")
+
     val ss = d.marks.scoped
 
     if ss.is_empty() then return
 
     val ps = d.params
-    val receiver = scoped_receiver(ps)
+    var calls = false
+
+    for item in ps
+        if holds_string(ss, item.name) && (callable_param(d, item) || erased_call(item)) then calls = true
+
+    if calls && !method
+        a.fault(scope, span, scoped_on_free_function())
+        return
+    end if
+
+    val receiver = if calls then scoped_receiver(ps) else ""
 
     if receiver != ""
         a.fault(scope, span, s"'@scoped' promises that what '$shown' runs finishes before the " +
@@ -102,11 +125,40 @@ check_scoped_names(a: &Analysis, scope: Scope, span: Span, d: FuncDecl, shown: s
             a.fault(scope, span, s"'@scoped' names '${ss.at(i)}' twice, and a parameter is waited " +
                     "for or it is not — the second says nothing the first does not")
         else if !callable_param(d, found.unwrap()) && !erased_call(found.unwrap())
-            a.fault(scope, span, s"'@scoped' names '${ss.at(i)}', which is not a call — what a " +
-                    "scoped member promises is that a body it runs in another domain finishes " +
-                    "before the scope does, so the parameter is written as one, " +
-                    s"'${ss.at(i)}: &sync Fn() -> R'")
+            a.fault(scope, span, s"'@scoped' names '${ss.at(i)}', which is neither a call nor a " +
+                    "pointer — what it promises is that a body a member runs in another domain " +
+                    "finishes before the scope does, written '" + ss.at(i) + ": &sync Fn() -> R', " +
+                    "or that a pointer the function holds is let go of before its caller's scope " +
+                    s"ends, written '${ss.at(i)}: *T'")
 end check_scoped_names
+
+// `@joined` names parameters the function also says cross, each once: what it promises is about how
+// long another thread holds the pointer, so a parameter that reaches no other thread has nothing for
+// a join to end. Only the names are checked on the 0.5 line; the promise is checked from 0.6.0.
+check_joined_names(a: &Analysis, scope: Scope, span: Span, d: FuncDecl, shown: string)
+    val ns = d.marks.joined
+
+    for i in 0..<ns.len()
+        var declared = false
+
+        for item in d.params
+            if item.name == ns.at(i) then declared = true
+
+        var twice = false
+
+        for j in 0..<i
+            if ns.at(j) == ns.at(i) then twice = true
+
+        if !declared
+            a.fault(scope, span, s"'@joined' names '${ns.at(i)}', which is not a parameter of '$shown'")
+        else if twice
+            a.fault(scope, span, s"'@joined' names '${ns.at(i)}' twice — the second says nothing the first does not")
+        else if !holds_string(d.crossing, ns.at(i))
+            a.fault(scope, span, s"'@joined' names '${ns.at(i)}', which '@crossing' does not — a parameter " +
+                    "is held until a join only by the thread it reaches, so one that is joined also crosses: " +
+                    s"'@crossing(${ns.at(i)})'")
+    end for
+end check_joined_names
 
 // What is wrong with a scoped member's receiver, as the end of a sentence, or nothing where it is the
 // `*self` the promise is about.

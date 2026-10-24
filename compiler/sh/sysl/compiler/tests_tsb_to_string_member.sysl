@@ -1,0 +1,284 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.Search
+
+// `x.to_string()` and `x.debug_string()` on the 0.5 line: every value answers both, by the compiler,
+// wherever its type has no member of that name -- the string `str(x)` and `debug(x)` give, through
+// the same code (`member_call.sysl`'s `rendered_member`, `expr_call.sysl`'s `str_of`,
+// `special.sysl`'s `debug_of`). A type's own `to_string` wins. `str(x)`, `debug(x)` and the free
+// `to_string` functions of the library's number types are unchanged.
+
+private var tsb_library_cache: Buf[Program] = buf()
+private var tsb_library_read: bool = false
+
+private tsb_library() -> Buf[Program]
+    if tsb_library_read then return tsb_library_cache
+
+    tsb_library_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> tsb_library_cache = units
+
+    tsb_library_cache
+end tsb_library
+
+private tsb_ready() -> bool
+    if tsb_library().is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+
+    true
+end tsb_ready
+
+// What a program prints, or what building it was refused with.
+private tsb_ran(text: string) -> string
+    val root = make_temp_dir("sysl-tsb").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text + out.err.unwrap_or("")
+end tsb_ran
+
+// The program analyzed beside the library: its first refusal, or its warnings joined by newlines.
+private tsb_analyzed(text: string) -> (string, string)
+    var units: Buf[Program] = buf()
+
+    for item in tsb_library()
+        units.push(item)
+
+    units.push(parse(source_of("main.sysl", text)).program)
+
+    val done = analyze_bodies(units, host_target())
+
+    if !done.reported.is_empty() then return (done.reported.at(0).diag.message, "")
+
+    var warned = ""
+
+    for item in done.an.warnings()
+        warned = if warned == "" then item.diag.message else warned + "\n" + item.diag.message
+
+    ("", warned)
+end tsb_analyzed
+
+// The LLVM text of one function, lowered the way the driver lowers it -- beside the library, checked
+// and pruned.
+private tsb_lowered(text: string, symbol: string) -> string
+    val parsed = parse(source_of("test.sysl", text))
+
+    if !parsed.ok() then return parsed.report.at(0).message
+
+    var units: Buf[Program] = buf()
+
+    for item in tsb_library()
+        units.push(item)
+
+    units.push(parsed.program)
+
+    val done = analyze_bodies(units, host_target())
+
+    if !done.reported.is_empty() then return done.reported.at(0).diag.message
+
+    val whole = program_of(done, done.main_module)
+    var own: Buf[string] = buf()
+
+    own.push(module_written(parsed.program))
+
+    val promotions = post_analysis_checks(done.an, whole, own)
+    val lowered = codegen_with_gaps(prune(strip_tests(whole), own), host_target(), promotions)
+
+    for item in func_texts(ir_print_module(lowered.0))
+        if item.0 == symbol then return item.1
+
+    s"no definition of '$symbol'"
+end tsb_lowered
+
+private tsb_types() -> string =
+    "struct P\n    x: int\n    y: int\n\n" +
+    "impl Display for P\n    display(self, out: *Writer, fmt: FormatSpec) = " +
+    "display_str(s\"<${self.x},${self.y}>\", out, fmt)\n\n" +
+    "struct Q\n    a: int\n\n" +
+    "opaque struct H\n    x: int\n\n" +
+    "enum Color\n    Red\n    Green\n\n" +
+    "enum Shape\n    Circle(r: int)\n    Square(s: int)\n\n"
+
+@test("a number, a bool, a character, a string and a fixed-point value each render as str does")
+tsb_scalars()
+    if !tsb_ready() then return
+
+    val text = "val a: u8 = 255\nval b: i16 = -300\nval c = 42\nval d: u128 = 1 << 100\n" +
+               "val e: i3 = -4\nval f = 1.5\nval g: f32 = 0.1\nval q: q15 = 0.25\n" +
+               "print(a.to_string(), b.to_string(), c.to_string(), d.to_string(), e.to_string())\n" +
+               "print(f.to_string(), g.to_string(), true.to_string(), 'x'.to_string(), \"s\".to_string())\n" +
+               "print(q.to_string(), 1.5i32q16.to_string(), 7.to_string(), (-7).to_string())\n" +
+               "print(c.to_string() == str(c), g.to_string() == str(g), q.to_string() == str(q), " +
+               "f.to_string() == str(f))\n"
+
+    assert_eq(tsb_ran(text),
+              "255 -300 42 1267650600228229401496703205376 -4\n1.5 0.1 true x s\n0.25 1.5 7 -7\n" +
+              "true true true true\n")
+end tsb_scalars
+
+@test("a struct renders through its Display, else its Debug, and an opaque one as its placeholder")
+tsb_structs()
+    if !tsb_ready() then return
+
+    val text = tsb_types() +
+               "type Percent = int within 0..100\n\n" +
+               "val p = P(1, 2)\nval r: &P = P(3, 4)\nval pc: Percent = 7\n" +
+               "print(p.to_string(), r.to_string(), Q(3).to_string(), H(1).to_string(), pc.to_string())\n" +
+               "print(p.to_string() == str(p), Q(3).to_string() == str(Q(3)), H(1).to_string() == str(H(1)))\n"
+
+    assert_eq(tsb_ran(text), "<1,2> <3,4> Q(a: 3) <H> 7\ntrue true true\n")
+end tsb_structs
+
+@test("an enum, a payload variant, an Option and a tuple render as str does")
+tsb_enums_and_options()
+    if !tsb_ready() then return
+
+    val text = tsb_types() +
+               "val c = Color.Green\nval s = Shape.Square(4)\nval some: Option[int] = Some(3)\n" +
+               "val none: Option[int] = None\nval t = (1, \"a\")\n" +
+               "print(c.to_string(), s.to_string(), some.to_string(), none.to_string(), t.to_string())\n" +
+               "print(c.to_string() == str(c), s.to_string() == str(s), some.to_string() == str(some), " +
+               "none.to_string() == str(none), t.to_string() == str(t))\n" +
+               "print(some.debug_string() == debug(some), s.debug_string() == debug(s))\n"
+    val form = tsb_types() +
+               "val c = Color.Green\nval s = Shape.Square(4)\nval some: Option[int] = Some(3)\n" +
+               "val none: Option[int] = None\nval t = (1, \"a\")\n" +
+               "print(str(c), str(s), str(some), str(none), str(t))\n"
+    val first = tsb_ran(form)
+
+    assert(!first.contains("error"), first)
+    assert_eq(tsb_ran(text), first + "true true true true true\ntrue true\n")
+end tsb_enums_and_options
+
+@test("a pointer, a closure, a weak reference, a generic T and a trait object render as str does")
+tsb_by_rule()
+    if !tsb_ready() then return
+
+    val text = tsb_types() +
+               "trait Area\n    area(self) -> int\n\n" +
+               "impl Area for P\n    area(self) -> int = self.x * self.y\n\n" +
+               "shown[T: Display](t: T) -> string = t.to_string()\n\n" +
+               "same[T: Display](t: T) -> bool = t.to_string() == str(t)\n\n" +
+               "var q = Q(4)\nval pq: *Q = &q\nval n: &Q = Q(5)\nval w: weak Q = n\n" +
+               "val g = (x: int) -> x + 1\nval sh: &Area = P(2, 3)\n" +
+               "print(pq.to_string() == str(pq), pq.to_string().starts_with(\"0x\"))\n" +
+               "print(g.to_string(), w.to_string(), shown(P(5, 6)), shown(8), shown(\"t\"), sh.to_string() == str(sh))\n" +
+               "print(same(P(1, 1)), same(2.5), same('c'))\n"
+
+    assert_eq(tsb_ran(text), "true true\n<fn> weak(…) <5,6> 8 t true\ntrue true true\n")
+end tsb_by_rule
+
+@test("debug_string is debug(x): a string is quoted, a struct shows its fields, Display is not asked")
+tsb_debug_string()
+    if !tsb_ready() then return
+
+    val text = tsb_types() +
+               "val n: &Q = Q(5)\nval w: weak Q = n\n" +
+               "print(\"s\".debug_string(), 'c'.debug_string(), P(1, 2).debug_string(), n.debug_string())\n" +
+               "print(H(1).debug_string(), w.debug_string(), 42.debug_string())\n" +
+               "print(P(1, 2).debug_string() == debug(P(1, 2)), \"s\".debug_string() == debug(\"s\"))\n"
+
+    assert_eq(tsb_ran(text),
+              "\"s\" 'c' P(x: 1, y: 2) Q(a: 5)\n<H> weak(…) 42\ntrue true\n")
+end tsb_debug_string
+
+@test("a type's own to_string and debug_string win over the ones every value has")
+tsb_own_member_wins()
+    if !tsb_ready() then return
+
+    val text = "struct Own\n    n: int\n\n    to_string(self) -> string = \"mine\"\n\n" +
+               "    debug_string(self) -> string = \"my debug\"\n\n" +
+               "impl Display for Own\n    display(self, out: *Writer, fmt: FormatSpec) = display_str(\"shown\", out, fmt)\n\n" +
+               "trait Named\n    to_string(self) -> string\n\n" +
+               "impl Named for int\n    to_string(self) -> string = \"named\"\n\n" +
+               "via[T: Named](t: T) -> string = t.to_string()\n\n" +
+               "print(Own(1).to_string(), Own(1).debug_string(), str(Own(1)), via(3))\n"
+
+    assert_eq(tsb_ran(text), "mine my debug shown named\n")
+end tsb_own_member_wins
+
+@test("str, debug and the library's free to_string keep working beside the members")
+tsb_str_still_works()
+    if !tsb_ready() then return
+
+    assert_eq(tsb_ran(tsb_types() + "print(str(P(1, 2)), str(7), debug(\"x\"), s\"${P(3, 4)}\")\n"),
+              "<1,2> 7 \"x\" <3,4>\n")
+    assert_eq(tsb_ran("import sysl.math.bigint.{from_int, to_string}\n\nval b = from_int(-12345)\n" +
+                      "print(to_string(b), b.to_string(), to_string(b) == b.to_string())\n"),
+              "-12345 -12345 true\n")
+
+@test("x.to_string() lowers to exactly the code str(x) does")
+tsb_same_code()
+    if !tsb_ready() then return
+
+    val member = tsb_lowered(tsb_types() +
+                             "f(i: int, r: real, p: P, q: Q, c: Color, o: Option[int]) -> string = " +
+                             "i.to_string() + r.to_string() + p.to_string() + q.to_string() + " +
+                             "q.debug_string() + c.to_string() + o.to_string()\n" +
+                             "main() = prints(f(1, 1.5, P(1, 2), Q(3), Color.Red, Some(2)))\n", "f")
+    val form = tsb_lowered(tsb_types() +
+                           "f(i: int, r: real, p: P, q: Q, c: Color, o: Option[int]) -> string = " +
+                           "str(i) + str(r) + str(p) + str(q) + debug(q) + str(c) + str(o)\n" +
+                           "main() = prints(f(1, 1.5, P(1, 2), Q(3), Color.Red, Some(2)))\n", "f")
+
+    assert(member.starts_with("define "), member)
+    assert_eq(member, form)
+end tsb_same_code
+
+@test("to_string on a parameter with no bound is refused as str is, naming the bound it needs")
+tsb_unbound_parameter()
+    if !tsb_ready() then return
+
+    assert_eq(tsb_analyzed("f[T](t: T) -> string = t.to_string()\n").0, "'str' needs 'T: sysl.Display'")
+    assert_eq(tsb_analyzed("f[T](t: T) -> string = str(t)\n").0, "'str' needs 'T: sysl.Display'")
+    assert_eq(tsb_analyzed("f[T](t: T) -> string = t.debug_string()\n").0,
+              "'debug' needs 'T: sysl.Debug'")
+
+@test("to_string and debug_string take no arguments and no type arguments")
+tsb_takes_nothing()
+    if !tsb_ready() then return
+
+    assert_eq(tsb_analyzed("val s = 1.to_string(2)\n").0,
+              "'to_string' takes no arguments — it renders the value it is called on")
+    assert_eq(tsb_analyzed("val s = 1.debug_string(2)\n").0,
+              "'debug_string' takes no arguments — it renders the value it is called on")
+
+@test("to_string on a value that renders only as a placeholder warns, as str does")
+tsb_placeholder_warns()
+    if !tsb_ready() then return
+
+    assert_eq(tsb_analyzed("f()\n    val g = (x: int) -> x + 1\n    print(g.to_string())\n\nf()\n").1,
+              "printing this value shows only '<fn>': a callable carries nothing to show; print what " +
+              "calling it answers")
+    assert_eq(tsb_analyzed("f()\n    val g = (x: int) -> x + 1\n    print(str(g))\n\nf()\n").1,
+              "printing 'g' shows only '<fn>': a callable carries nothing to show; print what " +
+              "calling it answers")

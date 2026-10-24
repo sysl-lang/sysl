@@ -107,6 +107,22 @@ hi!
 The primitive underneath it is deliberately in the same category as a raw pointer, because breaking
 the UTF-8 invariant breaks `char`'s invariant downstream.
 
+**`str_cast` and `str_alias` may also be imported from `sysl.raw`**, by name, under another name with
+`as`, or through `import sysl.raw.*`. Accepted from 0.5.6, the import is what 0.6.0 requires, so a
+program that writes it builds on both; here the bare spellings answer everywhere as well.
+
+```sysl
+import sysl.raw.{str_cast, str_alias as alias}
+
+var b: [3]u8 = [104, 105, 33]
+
+print(str_cast(b[0..<2]), alias(b[..]))
+```
+
+```output
+hi hi!
+```
+
 ### A string that shares a buffer
 
 **`str_view(b: []u8) -> string` is the one conversion that does not copy.** The string is the slice's
@@ -425,6 +441,26 @@ print(str(42), str(true), str('é'), str(2.5), str("already"))
 
 ```output
 42 true é 2.5 already
+```
+
+**Every value also answers `x.to_string()` and `x.debug_string()`**, the spellings 0.6.0 uses:
+accepted from 0.5.6, they are the very code `str(x)` and `debug(x)` become, so a program that writes
+them builds on both. A type with a member of either name of its own calls that one instead.
+
+```sysl
+struct Point
+    x: int
+    y: int
+
+val o: Option[int] = Some(3)
+
+print(42.to_string(), 2.5.to_string(), Point(1, 2).to_string(), o.to_string(), "q".debug_string())
+print(Point(1, 2).to_string() == str(Point(1, 2)))
+```
+
+```output
+42 2.5 Point(x: 1, y: 2) Some(3) "q"
+true
 ```
 
 | type | result |

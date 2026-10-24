@@ -282,18 +282,19 @@ first(ws: []string) -> int
 but the 'ws' it captures reaches a '[]string', which owns its elements through a count that is not atomic
 ```
 
-**What it names is a call, once**, and the receiver is the `*self` a `@lends` call lent:
+**What it names is a call, once**, and the receiver is the `*self` a `@lends` call lent (a `*T` it
+may name too, as the next section says):
 
 ```sysl
 struct Chan
     open: bool
 
     @scoped(v)
-    run(*self, v: *int) -> int = v[0]
+    run(*self, v: int) -> int = v
 ```
 
 ```error
-'@scoped' names 'v', which is not a call
+'@scoped' names 'v', which is neither a call nor a pointer
 ```
 
 ```sysl
@@ -344,8 +345,8 @@ struct Chan
 There is no empty form
 ```
 
-**It stands above a method and nowhere else.** A free function has no receiver for a `@lends` call to
-have lent, and a field is never called:
+**Naming a call, it stands above a method and nowhere else.** A free function has no receiver for a
+`@lends` call to have lent, and a field is never called:
 
 ```sysl
 @scoped(f)
@@ -365,6 +366,89 @@ struct Chan
 ```error
 a field and a variant are never called, and have no parameter to run
 ```
+
+### `@scoped(p)` and `@joined(p)` — accepted from 0.5.6, checked from 0.6.0
+
+**Two spellings of 0.6.0's are accepted here so that a program written for 0.6.0 builds on the 0.5
+line too.** `@scoped(p)` may name a `*T` parameter, above any function or method: in 0.6.0 it
+promises that the body holds the pointer only while its caller waits and lets go of it before the
+caller's scope ends. `@joined(p)` names a `*T` parameter the function also says is `@crossing`: in
+0.6.0 it promises that the thread the call starts holds the pointer until the handle the call
+answers is joined. Both are promises the keeps-analysis of 0.6.0 trusts, and the 0.5 line has no
+such analysis, so **here only their names are checked** and nothing else changes. A `*T` named by
+`@scoped` is not a call the member runs, so it needs no `*self` receiver and implies no `@crossing`.
+
+```sysl
+static var idle = 0
+static var waiter: *int = &idle
+
+@scoped(slot)
+block(slot: *int)
+    waiter = slot
+
+wake(v: int)
+    *waiter = v
+    waiter = &idle
+
+struct Handle
+    k: int
+
+    join(self) -> bool = true
+
+@crossing(p)
+@joined(p)
+begin(p: *int) -> Handle = Handle(*p)
+
+run() -> int
+    var got = 0
+
+    block(&got)
+    wake(42)
+
+    val h = begin(&got)
+
+    h.join()
+    got + h.k
+
+print(run())
+```
+
+```output
+84
+```
+
+A name that is not a parameter is refused, as is one written twice, and `@joined` names a parameter
+`@crossing` names too, since a pointer is held until a join only by the thread it reached:
+
+```sysl
+@scoped(q)
+block(slot: *int) = ()
+```
+
+```error
+'@scoped' names 'q', which is not a parameter of 'block' — its parameters are 'slot'
+```
+
+```sysl
+@joined(p)
+f(p: *int) = ()
+```
+
+```error
+'@joined' names 'p', which '@crossing' does not
+```
+
+```sysl
+@crossing(p)
+@joined(q)
+f(p: *int) = ()
+```
+
+```error
+'@joined' names 'q', which is not a parameter of 'f'
+```
+
+Neither stands above an `extern`, whose body is C.
 
 ## `::` — what a type's own name answers
 

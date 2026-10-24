@@ -2321,6 +2321,25 @@ to.
 | `ptr_cast(n)` | a number as a pointer | unsafe |
 | `ptr_cast(p)` | one pointee type as another | unsafe |
 
+**`ptr_cast` may also be imported from `sysl.raw`** — `import sysl.raw.ptr_cast`, under another name
+with `as`, through `import sysl.raw.*`, or reached as `raw.ptr_cast` after `import sysl.raw`.
+Accepted from 0.5.6, the import is what 0.6.0 requires, so a program that writes it builds on both;
+here the bare spelling answers everywhere as well. Imported under any name it is still the form, and
+still refuses a `&T` position:
+
+```sysl
+import sysl.raw.ptr_cast as pc
+
+var a: [4]u8 = [1, 0, 0, 0]
+val p: *u32 = pc(&a[0])
+
+print(*p, *ptr_cast[*u8](&a[0]))
+```
+
+```output
+1 1
+```
+
 **A pointer becomes an integer through the ordinary conversion syntax**, because it is an ordinary
 conversion: `usize` is wide enough to hold any address by definition, so it is total and loses
 nothing, and the result is a number that cannot be dereferenced. `isize` takes one too, which is what

@@ -293,8 +293,18 @@ private import_name(a: &Analysis, scope: Scope, at: Span, bound: string, home: s
     if !import_name_free(a, scope, at, bound, taken, out) then return
 
     val key = module_qualify(home, name)
+    val form_home = imported_form_home(name)
 
-    if !declares(a, key) && imports_a_form(name)
+    // **A form a file may import is imported from its own module and from no other**, and nothing
+    // there declares it: the binding is the whole of what the clause does. A name the importing
+    // module declares itself would mean two things, as it would for any import.
+    if !declares(a, key) && form_home.is_some() && form_home.unwrap() == home
+        if own_declaration(a, scope, bound).is_some() then
+            out.push((at, two_meanings(scope, bound, home, name)))
+    elif !declares(a, key) && form_home.is_some()
+        out.push((at, s"'$home' declares no '$name' — '$name' is in ${form_home.unwrap()}: import " +
+                      s"${form_home.unwrap()}.$name"))
+    elif !declares(a, key) && imports_a_form(name)
         out.push((at, s"'$name' is a built-in form rather than a member of any module — it is in scope " +
                       "everywhere and needs no import"))
     elif !declares(a, key)
@@ -305,16 +315,21 @@ private import_name(a: &Analysis, scope: Scope, at: Span, bound: string, home: s
     else
         val own = own_declaration(a, scope, bound)
 
-        if own.is_some() && reexported(a, own.unwrap()) != reexported(a, key)
-            var mine = "this program"
-
-            if scope.module_name != ""
-                mine = s"this module as '${module_qualify(scope.module_name, bound)}'"
-
-            out.push((at, s"'$bound' is declared by $mine, so importing '$home.$name' under that name " +
-                          "would mean two things — import it as another name with 'as', or write its path"))
+        if own.is_some() && reexported(a, own.unwrap()) != reexported(a, key) then
+            out.push((at, two_meanings(scope, bound, home, name)))
     end if
 end import_name
+
+// What an import is refused with where the importing module declares the bound name itself.
+private two_meanings(scope: Scope, bound: string, home: string, name: string) -> string
+    var mine = "this program"
+
+    if scope.module_name != ""
+        mine = s"this module as '${module_qualify(scope.module_name, bound)}'"
+
+    s"'$bound' is declared by $mine, so importing '$home.$name' under that name would mean two " +
+        "things — import it as another name with 'as', or write its path"
+end two_meanings
 
 // The requirement a module's emptied file wrote, where `c_probe_lower` withheld one of its files.
 private withheld_for(a: &Analysis, home: string) -> Option[string]
@@ -832,6 +847,8 @@ private resolve_signatures(a: &Analysis)
         check_bound_names(a, f.scope, f.decl.name, f.decl.bounds)
         check_crossing_names(a, f.scope, f.span, f.decl, qualified_name(a.tables.funcs.key_at(i)))
         check_lends_names(a, f.scope, f.span, f.decl, qualified_name(a.tables.funcs.key_at(i)))
+        check_scoped_names(a, f.scope, f.span, f.decl, qualified_name(a.tables.funcs.key_at(i)), false)
+        check_joined_names(a, f.scope, f.span, f.decl, qualified_name(a.tables.funcs.key_at(i)))
         check_disjoint_names(a, f.scope, f.span, f.decl, qualified_name(a.tables.funcs.key_at(i)))
 
         // **A GENERIC SIGNATURE IS READ AT STAND-INS, AND WHAT THAT READING BUILDS IS NOT A TYPE THE

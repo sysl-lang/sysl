@@ -1,0 +1,311 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.join
+
+// The forms a file may import on the 0.5 line, so a program written for 0.6.0 -- where it must --
+// builds here too: `ptr_cast`, `str_cast` and `str_alias` from `sysl.raw`, and the four `va_` forms
+// from `sysl.c`. The compiler answers each; nothing in either module declares one. Imported by name,
+// under another name with `as`, through a wildcard, or as a path through the module, the form
+// answers; written bare without an import it still does, as it always has on this line
+// (`expr_call.sysl`'s `imported_form`, `analyze.sysl`'s `import_name`).
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private rfi_ready() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+    end if
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+    end if
+
+    true
+end rfi_ready
+
+// What a one-file program prints, built fresh and run, or what refused it.
+private rfi_ran(text: string) -> string
+    val root = make_temp_dir("sysl-rfi").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end rfi_ran
+
+// What analysing a one-file program had to say, rendered as the command line renders it.
+private rfi_said(text: string) -> string
+    val root = make_temp_dir("sysl-rfi-err").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    val out = emit_llvm_text(src, None) match
+        Err(why) -> why.message
+        Ok(made) -> if made.report.is_empty() then "" else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end rfi_said
+
+// The program is refused with exactly this message, and nothing else, at this line and column.
+private rfi_refused(text: string, message: string, at: string)
+    val out = rfi_said(text)
+
+    assert(out.starts_with(s"error: $message\n --> ") || out.starts_with(s"error: $message\n  --> "),
+           s"expected 'error: $message' first, got: $out")
+    assert(out.index_of(s"/main.sysl:$at\n").is_some(), s"expected it at main.sysl:$at, got: $out")
+    assert_eq(out.count_of("error: "), 1)
+end rfi_refused
+
+private rfi_cli(args: []string) -> (int, string)
+    var lines: Buf[string] = buf()
+    val sink = &lines
+    val code = run_cli(args, (line) -> sink.push(line))
+
+    (code, join(lines.view(), "\n"))
+end rfi_cli
+
+// Four bytes read as one `u32` through a pointer, which is the same on every little-endian host.
+private val rfi_word: string = "var a: [4]u8 = [1, 0, 0, 0]\nval p: *u32 = ptr_cast(&a[0])\nprint(*p)\n"
+
+// A tail of ints summed, read through all four `va_` forms.
+private val rfi_sum: string =
+    "sum(n: int, ...) -> int\n    var ap: va_list\n    var again: va_list\n\n    va_start(ap)\n" +
+    "    va_copy(again, ap)\n\n    var total = 0\n\n    for i in 0..<n do total += va_arg(ap)\n" +
+    "    for i in 0..<n do total += va_arg(again)\n\n    va_end(again)\n    va_end(ap)\n    total\n" +
+    "end sum\n\nprint(sum(3, 1, 2, 3))\n"
+
+// -- each name, imported and not ------------------------------------------------------------------
+
+@test("ptr_cast imported from sysl.raw reads an address as a pointer, as it does unimported")
+rfi_ptr_cast()
+    if !rfi_ready() then return
+
+    assert_eq(rfi_ran("import sysl.raw.ptr_cast\n\n" + rfi_word), "1\n")
+    assert_eq(rfi_ran(rfi_word), "1\n")
+
+@test("ptr_cast with its type written in brackets, imported and not")
+rfi_ptr_cast_written_type()
+    if !rfi_ready() then return
+
+    val body = "var a: [4]u8 = [7, 0, 0, 0]\nprint(*ptr_cast[*u8](&a[0]))\n"
+
+    assert_eq(rfi_ran("import sysl.raw.ptr_cast\n\n" + body), "7\n")
+    assert_eq(rfi_ran(body), "7\n")
+
+@test("str_cast imported from sysl.raw takes bytes as a string, sliced short of a NUL, imported and not")
+rfi_str_cast()
+    if !rfi_ready() then return
+
+    val body = "var b: [5]u8 = [104, 105, 33, 33, 33]\nprint(str_cast(b[0..<3]))\n"
+
+    assert_eq(rfi_ran("import sysl.raw.str_cast\n\n" + body), "hi!\n")
+    assert_eq(rfi_ran(body), "hi!\n")
+
+@test("str_alias imported from sysl.raw lays a string over a buffer, imported and not")
+rfi_str_alias()
+    if !rfi_ready() then return
+
+    val body = "var b: [3]u8 = [111, 107, 33]\nval s = str_alias(b[0..<2])\nprint(s, s.len)\n"
+
+    assert_eq(rfi_ran("import sysl.raw.str_alias\n\n" + body), "ok 2\n")
+    assert_eq(rfi_ran(body), "ok 2\n")
+
+@test("the four va_ forms imported from sysl.c walk a tail twice, imported, partly imported and not")
+rfi_va_forms()
+    if !rfi_ready() then return
+
+    assert_eq(rfi_ran("import sysl.c.{va_start, va_arg, va_copy, va_end}\n\n" + rfi_sum), "12\n")
+    assert_eq(rfi_ran("import sysl.c.{va_start, va_end}\n\n" + rfi_sum), "12\n")
+    assert_eq(rfi_ran(rfi_sum), "12\n")
+
+// -- the spellings of the import ------------------------------------------------------------------
+
+@test("a wildcard over sysl.raw and over sysl.c brings every form in")
+rfi_wildcards()
+    if !rfi_ready() then return
+
+    assert_eq(rfi_ran("import sysl.raw.*\nimport sysl.c.*\n\n" + rfi_word +
+                      "var b: [2]u8 = [104, 105]\nprint(str_cast(b[..]), str_alias(b[..]))\n" + rfi_sum),
+              "1\nhi hi\n12\n")
+
+@test("an aliased import calls the form by the alias, written type and all")
+rfi_aliased()
+    if !rfi_ready() then return
+
+    assert_eq(rfi_ran("import sysl.raw.{ptr_cast as pc, str_cast as sc, str_alias as sa}\n" +
+                      "import sysl.c.va_arg as next\nimport sysl.c.{va_start as begin, va_end as finish}\n\n" +
+                      "first(n: int, ...) -> int\n    var ap: va_list\n\n    begin(ap)\n\n" +
+                      "    val v: int = next(ap)\n\n    finish(ap)\n    v + n\nend first\n\n" +
+                      "var a: [4]u8 = [104, 105, 0, 0]\nval p: *u32 = pc(&a[0])\n" +
+                      "print(*p, *pc[*u8](&a[1]), sc(a[0..<2]), sa(a[0..<1]), first(1, 41))\n"),
+              "26984 105 hi h 42\n")
+
+@test("an aliased import leaves the form's own spelling answering too")
+rfi_alias_beside_the_name()
+    if !rfi_ready() then return
+
+    assert_eq(rfi_ran("import sysl.raw.ptr_cast as pc\n\nvar a: [4]u8 = [1, 0, 0, 0]\n" +
+                      "val p: *u32 = ptr_cast(&a[0])\nval q: *u32 = pc(&a[0])\nprint(*p, *q)\n"), "1 1\n")
+
+@test("the module imported whole reaches the form through its name, and the whole path does too")
+rfi_through_the_module()
+    if !rfi_ready() then return
+
+    assert_eq(rfi_ran("import sysl.raw\n\nvar a: [4]u8 = [1, 0, 0, 0]\nval p: *u32 = raw.ptr_cast(&a[0])\n" +
+                      "val q: *u32 = sysl.raw.ptr_cast(&a[0])\nvar b: [2]u8 = [104, 105]\n" +
+                      "print(*p, *q, *raw.ptr_cast[*u8](&a[0]), raw.str_cast(b[..]))\n"),
+              "1 1 1 hi\n")
+
+@test("an import inside a body brings the form in for that body")
+rfi_import_in_a_body()
+    if !rfi_ready() then return
+
+    assert_eq(rfi_ran("first(a: *[4]u8) -> u8\n    import sysl.raw.ptr_cast as pc\n\n" +
+                      "    val p: *u8 = pc(a)\n    *p\nend first\n\nvar a: [4]u8 = [9, 0, 0, 0]\n" +
+                      "print(first(&a))\n"), "9\n")
+
+// -- what an import does not do -------------------------------------------------------------------
+
+@test("a local named like an alias of the form is the local")
+rfi_local_shadows_an_alias()
+    if !rfi_ready() then return
+
+    assert_eq(rfi_ran("import sysl.raw.ptr_cast as pc\n\nval pc = (n: int) -> n - 1\nprint(pc(43))\n"),
+              "42\n")
+
+@test("importing the form under the name of the reader's own function is refused as two meanings")
+rfi_own_and_imported_refused()
+    if !rfi_ready() then return
+
+    rfi_refused("import sysl.raw.ptr_cast as pc\n\npc(n: int) -> int = n + 1\n\nprint(pc(41))\n",
+                "'pc' is declared by this program, so importing 'sysl.raw.ptr_cast' under that " +
+                    "name would mean two things — import it as another name with 'as', or write its path",
+                "1:1")
+
+@test("a form imported from a module that is not its own is told which module it is in")
+rfi_the_wrong_module()
+    if !rfi_ready() then return
+
+    rfi_refused("import sysl.slices.ptr_cast\n\nprint(1)\n",
+                "'sysl.slices' declares no 'ptr_cast' — 'ptr_cast' is in sysl.raw: import sysl.raw.ptr_cast",
+                "1:1")
+    rfi_refused("import sysl.raw.va_arg\n\nprint(1)\n",
+                "'sysl.raw' declares no 'va_arg' — 'va_arg' is in sysl.c: import sysl.c.va_arg", "1:1")
+
+@test("a name sysl.raw does not hold is told so, and print still needs no import")
+rfi_other_names()
+    if !rfi_ready() then return
+
+    rfi_refused("import sysl.raw.cast\n\nprint(1)\n", "'sysl.raw' declares no 'cast' — there is no 'sysl.raw.cast'",
+                "1:1")
+    rfi_refused("import sysl.raw.print\n\nprint(1)\n",
+                "'print' is a built-in form rather than a member of any module — it is in scope " +
+                    "everywhere and needs no import", "1:1")
+
+private val rfi_no_ref: string =
+    "'ptr_cast' never produces a reference: a '&T' is counted and non-null, and an address read out " +
+    "of bytes carries no count for anything to own — read it as a '*T'"
+
+@test("ptr_cast in a '&T' position is the form refusing it under its own name, an alias and a path")
+rfi_ref_position()
+    if !rfi_ready() then return
+
+    rfi_refused("import sysl.raw.ptr_cast\n\nvar a: [4]u8 = [1, 0, 0, 0]\nval r: &u32 = ptr_cast(&a[0])\n",
+                rfi_no_ref, "4:15")
+    rfi_refused("import sysl.raw.ptr_cast as pc\n\nvar a: [4]u8 = [1, 0, 0, 0]\nval r: &u32 = pc(&a[0])\n",
+                rfi_no_ref, "4:15")
+    rfi_refused("import sysl.raw\n\nvar a: [4]u8 = [1, 0, 0, 0]\nval r: &u32 = raw.ptr_cast(&a[0])\n",
+                rfi_no_ref, "4:19")
+
+// -- a generic, a module of two files, a library, a board -----------------------------------------
+
+@test("a generic function and a generic type's member use the imported form at two instantiations")
+rfi_a_generic()
+    if !rfi_ready() then return
+
+    assert_eq(rfi_ran("import sysl.raw.ptr_cast as pc\n\nfirst_byte[T](p: *T) -> u8\n    val b: *u8 = pc(p)\n" +
+                      "    *b\nend first_byte\n\nstruct Cell[T]\n    v: T\n\n" +
+                      "    low(*self) -> u8 = *pc[*u8](&self.v)\n\n" +
+                      "var x: u32 = 258\nvar y: u16 = 3\nvar c = Cell(513u32)\n" +
+                      "print(first_byte(&x), first_byte(&y), c.low())\n"), "2 3 1\n")
+
+@test("a module's file that imports the form under an alias uses it; its sibling uses the bare form")
+rfi_one_file_of_a_module()
+    if !lbr_ready() then return
+
+    val lib = lbr_tree(lbr_two(
+        "demo/a.sysl", "module demo\n\nimport sysl.raw.ptr_cast as pc\n\nlow(p: *u32) -> u8 = *pc[*u8](p)\n",
+        "demo/b.sysl", "module demo\n\nhigh(p: *u32) -> u8\n    val b: *u8 = ptr_cast(p)\n    b[1]\n"))
+    val prog = lbr_program("import demo.{low, high}\n\nvar x: u32 = 260\nprint(low(&x), high(&x))\n")
+
+    assert_eq(lbr_run(prog, [lib]), "4 1\n")
+    lbr_drop([lib, prog])
+end rfi_one_file_of_a_module
+
+@test("a library using imported forms in a generic builds with build-lib, and a program instantiates it")
+rfi_a_library()
+    if !rfi_ready() then return
+
+    val text = "module demo\n\nimport sysl.raw.{ptr_cast, str_cast}\n\n" +
+        "low[T](p: *T) -> u8 = *ptr_cast[*u8](p)\n\ntext(b: []u8) -> string = str_cast(b)\n"
+    val root = lbr_temp("sysl-rfi-lib-")
+
+    make_dir_all(s"$root/demo").unwrap()
+    write_text(s"$root/demo/demo.sysl", text).unwrap()
+
+    val got = rfi_cli(["sysl", "build-lib", root])
+
+    assert_eq(got.0, Fine, got.1)
+    assert_eq(got.1, s"checked $root")
+    remove_dir_all(root).unwrap_or(())
+
+    val lib = lbr_tree(lbr_one("demo/demo.sysl", text))
+    val prog = lbr_program("import demo.{low, text}\n\nvar x: u32 = 513\nvar y: u16 = 7\n" +
+                           "var b: [2]u8 = [104, 105]\nprint(low(&x), low(&y), text(b[..]))\n")
+
+    assert_eq(lbr_run(prog, [lib]), "1 7 hi\n")
+    lbr_drop([lib, prog])
+end rfi_a_library
+
+@test("a thumb build reaches a device register through ptr_cast imported, as module storage")
+rfi_a_device_address_on_thumb()
+    if !rfi_ready() then return
+
+    val root = make_temp_dir("sysl-rfi-thumb").unwrap()
+    val program = "import sysl.raw.ptr_cast\n\nstruct Uart\n    data: u32\n    status: u32\n\n" +
+        "val UART: *Uart = ptr_cast(0x4000_4000)\n\n@export(\"main\")\nboard_main() -> i32\n" +
+        "    UART.data = 65\n    i32(UART.status)\nend board_main\n"
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", program).unwrap()
+    write_text(s"$root/sysl.hocon", "package { name = \"probe\", version = \"0.1.0\" }\n").unwrap()
+
+    val got = rfi_cli(["sysl", "build-c", root, "--target", "thumb-freestanding-softfp", "-o",
+                       s"$root/app.a"])
+
+    assert_eq(got.0, Fine, got.1)
+    remove_dir_all(root).unwrap_or(())
+end rfi_a_device_address_on_thumb

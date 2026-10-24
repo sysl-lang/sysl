@@ -126,18 +126,21 @@ private call_read(cx: &Analyzer, span: Span, callee: Expr, args: Buf[Expr],
             // The rest take none, for the reason a non-generic function takes none -- there is
             // nothing for an argument to be an argument *of* -- and are told so rather than being
             // reported as uncallable.
-            if name.is_some() && cx.lookup(name.unwrap()).is_none() &&
-               special_form_name(cx, name.unwrap())
+            val unbound = name.is_some() && cx.lookup(name.unwrap()).is_none()
+            val imported = if unbound then imported_form(cx, name.unwrap()) else None
+
+            if unbound && (special_form_name(cx, name.unwrap()) || imported.is_some())
                 val written = name.unwrap()
+                val form = imported.unwrap_or(written)
                 val targ = Some(written_type_arg(cx, one))
 
-                if written == "va_arg"
-                    val va = va_form(cx, span, written, args, targ)
+                if form == "va_arg"
+                    val va = va_form(cx, span, form, args, targ)
 
                     if va.is_some() then return va.unwrap()
                 end if
 
-                if written == "ptr_cast" then return ptr_cast_call(cx, span, args, targ)
+                if form == "ptr_cast" then return ptr_cast_call(cx, span, args, targ)
 
                 // `slot_storage[T](n)` names the ELEMENT; the position the form fills is a view.
                 if written == "slot_storage" then
@@ -209,7 +212,8 @@ private call_read(cx: &Analyzer, span: Span, callee: Expr, args: Buf[Expr],
 
             val dotted = module_path_of(cx, receiver, member)
 
-            if dotted.is_some() && names_a_function(cx, dotted.unwrap()) then
+            if dotted.is_some() && (names_a_function(cx, dotted.unwrap()) ||
+                                    imported_form(cx, dotted.unwrap()).is_some()) then
                 return named_call(cx, span, callee, dotted.unwrap(), args, expected)
 
             // `T.f(x)` -- a member called off a TRAIT's name, which is no value and no type of its
@@ -731,6 +735,10 @@ end named_call
 // asks about only where nothing claims the name.
 private special_form(cx: &Analyzer, span: Span, name: string, args: Buf[Expr],
                      expected: Option[Type]) -> Option[TExpr]
+    // A form a file imported from `sysl.raw` or `sysl.c` answers under whatever name the import gave
+    // it; its own spelling answers everywhere, imported or not.
+    val form = if cx.lookup(name).is_some() then name else imported_form(cx, name).unwrap_or(name)
+
     // `old(e)` is the value an argument had on entry, and it means something only inside an
     // `ensure` -- so it is a form there and an ordinary name everywhere else.
     if name == "old" && cx.olds.is_some() then return Some(old_call(cx, span, args))
@@ -756,17 +764,15 @@ private special_form(cx: &Analyzer, span: Span, name: string, args: Buf[Expr],
     if debug_form(cx, name) then return Some(debug_string(cx, span, args))
     if name == DebugPart then return Some(debug_part(cx, span, args))
 
-    if name == "str_cast" then return Some(str_cast_call(cx, span, args))
-    if name == "str_alias" then return Some(str_alias_call(cx, span, args))
+    if form == "str_cast" then return Some(str_cast_call(cx, span, args))
+    if form == "str_alias" then return Some(str_alias_call(cx, span, args))
 
-    if name == "va_start" || name == "va_end" || name == "va_copy" || name == "va_arg"
-        val va = va_form(cx, span, name, args, expected)
+    if form == "va_start" || form == "va_end" || form == "va_copy" || form == "va_arg"
+        val va = va_form(cx, span, form, args, expected)
 
         if va.is_some() then return va
 
-    // **`str` splits on whether the value is a scalar.** A number, a bool, a character and a
-    // `string` each go out directly; everything else writes itself into a buffer through its
-    // `Display`, and the bytes that land there become the string.
+    // `str(x)`, which `x.to_string()` also spells (`str_of`).
     if name == "str" then
         if args.len() != 1 then return Some(cx.err(span, "str takes exactly one value"))
 
@@ -774,15 +780,7 @@ private special_form(cx: &Analyzer, span: Span, name: string, args: Buf[Expr],
 
         warn_placeholder(cx, args.at(0).span, args.at(0), v)
 
-        // A float is written as Rust's `{}` writes it, at its own width: the fewest digits that read
-        // back as a value of that type, set out positionally (`sysl.fmt.format_real_plain`).
-        val plain = plain_float_call(cx, span, v)
-
-        if plain.is_some() then return plain
-
-        if scalar_render(texpr_type(v)) then return Some(TExpr(span, TStr(v)))
-
-        return Some(str_render(cx, span, v))
+        return Some(str_of(cx, span, v))
 
     // A count read at run time is a `*` in the specifier with its hole after it, so a call carrying
     // any other number of trailing values is not this form and resolves as an ordinary call.
@@ -798,7 +796,7 @@ private special_form(cx: &Analyzer, span: Span, name: string, args: Buf[Expr],
                     return Some(format_call(cx, span, args.at(0), spec, counts))
             _ -> ()
 
-    if name == "ptr_cast" then return Some(ptr_cast_call(cx, span, args, expected))
+    if form == "ptr_cast" then return Some(ptr_cast_call(cx, span, args, expected))
 
     if null_test_form(cx, name) then return Some(null_test_call(cx, span, args))
 
@@ -1012,6 +1010,64 @@ special_form_word(name: string) -> bool =
     name == "print" || name == "str" || name == "format" || name == "str_cast" ||
     name == "str_alias" || name == "va_start" || name == "va_end" || name == "va_arg" ||
     name == "va_copy" || name == "ptr_cast"
+
+// **The forms a file may also import**, and the module each one is imported from: the reinterpreting
+// casts from `sysl.raw` and the C variadic forms from `sysl.c`. The compiler answers them -- nothing
+// in either module declares one -- and each is still in scope everywhere under its own spelling; an
+// import adds a spelling (`as`), a wildcard, or a path through the module.
+imported_form_home(name: string) -> Option[string] =
+    if name == "ptr_cast" || name == "str_cast" || name == "str_alias" then Some("sysl.raw")
+    else if name == "va_start" || name == "va_end" || name == "va_arg" || name == "va_copy" then
+        Some("sysl.c")
+    else None
+
+// The form a written name stands for through this file's imports, if it stands for one: a name
+// imported from the form's module (under its own spelling or another, with `as`), a bare name a
+// wildcard over that module offers, or a path through the module -- `raw.ptr_cast` after
+// `import sysl.raw`, or the whole `sysl.raw.ptr_cast`.
+private imported_form(cx: &Analyzer, written: string) -> Option[string]
+    // A function the program declares under the alias is its own, and the import that would make the
+    // name mean two things is refused where it is written (`analyze.sysl`'s `import_name`).
+    if names_a_function(cx, written) then return None
+
+    val cut = last_dot_in(written)
+
+    if cut.is_some()
+        val whole = module_qualify(written[0..<cut.unwrap()], written[cut.unwrap() + 1..<written.bytes.len])
+
+        return form_at_key(module_bound_key(cx, written).unwrap_or(whole))
+    end if
+
+    val bound = cx.scope.imports.name_key(written)
+
+    if bound.is_some() then return form_at_key(bound.unwrap())
+
+    val home = imported_form_home(written)
+
+    if home.is_some() && holds_string(cx.scope.imports.wildcards, home.unwrap()) then
+        return Some(written)
+
+    None
+end imported_form
+
+// Whether a callee stands for the `ptr_cast` form: its own spelling, or an alias or a path through
+// `sysl.raw` this file's imports give it.
+calls_ptr_cast(cx: &Analyzer, callee: Expr) -> bool = *callee.kind match
+    Ident(name) ->
+        name == "ptr_cast" ||
+            (cx.lookup(name).is_none() && imported_form(cx, name).unwrap_or("") == "ptr_cast")
+    Field(receiver, member, _) ->
+        val dotted = module_path_of(cx, receiver, member)
+
+        dotted.is_some() && imported_form(cx, dotted.unwrap()).unwrap_or("") == "ptr_cast"
+    _ -> false
+
+// The form a key names, where the key is a form's own module and its name.
+private form_at_key(key: string) -> Option[string]
+    val split = module_split(key)
+    val home = imported_form_home(split.1)
+
+    if home.is_some() && home.unwrap() == split.0 then Some(split.1) else None
 
 // An explicit scalar conversion. Every pair that has a meaning is listed; nothing widens, narrows,
 // or changes representation without being written.
@@ -2030,6 +2086,24 @@ private one_arg(v: TExpr) -> Buf[TExpr]
     out.push(v)
     out
 end one_arg
+
+// The string of a value already read -- what `str(x)` and `x.to_string()` both become, so the two
+// spellings lower to the same code.
+//
+// **`str` splits on whether the value is a scalar.** A float is written as Rust's `{}` writes it, at
+// its own width: the fewest digits that read back as a value of that type, set out positionally
+// (`sysl.fmt.format_real_plain`). A number, a bool, a character and a `string` each go out directly;
+// everything else writes itself into a buffer through its `Display`, and the bytes that land there
+// become the string.
+str_of(cx: &Analyzer, span: Span, v: TExpr) -> TExpr
+    val plain = plain_float_call(cx, span, v)
+
+    if plain.is_some() then return plain.unwrap()
+
+    if scalar_render(texpr_type(v)) then return TExpr(span, TStr(v))
+
+    str_render(cx, span, v)
+end str_of
 
 // `str` of a float: the library's plain renderer for its width, the value crossing at that width so
 // that its digits are the ones the width needs. None where the value is not a float.

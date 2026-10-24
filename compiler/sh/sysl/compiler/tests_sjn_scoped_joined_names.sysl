@@ -1,0 +1,153 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.Search
+
+// 0.6.0's spellings of `@scoped` and `@joined`, accepted on the 0.5 line so a program written for
+// 0.6.0 builds here too: `@scoped(p)` naming a `*T` parameter, above any function, and `@joined(arg)`
+// naming a `*T` parameter the function also says is `@crossing`. Here only their names are checked
+// (`lends.sysl`'s `check_scoped_names` and `check_joined_names`, `parse_attr.sysl`'s
+// `pointer_names`); what they promise is checked from 0.6.0.
+
+private sjn_outcome(text: string) -> (string, int)
+    val root = make_temp_dir("sysl-sjn").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (failure_text(why), -1)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> ("the program that was built could not be run", -1)
+        Ok(out) -> (out.text + out.err.unwrap_or(""), shell_status(out.status))
+end sjn_outcome
+
+private sjn_prints(text: string, want: string)
+    if xvr_no_library() then return
+
+    val out = sjn_outcome(text)
+
+    assert_eq(out.0, want)
+    assert_eq(out.1, 0)
+end sjn_prints
+
+private sjn_refused(text: string, part: string)
+    if xvr_no_library() then return
+
+    val out = sjn_outcome(text)
+
+    assert_eq(out.1, -1, out.0)
+    assert(out.0.index_of(part).is_some(), out.0)
+end sjn_refused
+
+private val sjn_block: string =
+    "static var idle = 0\nstatic var waiter: *int = &idle\n\n" +
+    "@scoped(slot)\nblock(slot: *int)\n    waiter = slot\n\n" +
+    "wake(v: int)\n    *waiter = v\n    waiter = &idle\n\n"
+
+// -- @scoped naming a pointer ---------------------------------------------------------------------
+
+@test("@scoped naming a *T parameter of a free function is accepted, and the program runs")
+sjn_scoped_pointer_free_function()
+    sjn_prints(sjn_block + "read_sensor() -> int\n    var got = 0\n\n    block(&got)\n    wake(42)\n    got\n" +
+               "end read_sensor\n\nprint(read_sensor())\n", "42\n")
+
+@test("@scoped naming a *T parameter of a generic function is accepted at two instantiations")
+sjn_scoped_pointer_generic()
+    sjn_prints("@scoped(p)\nfirst[T](p: *T) -> T = *p\n\nvar a = 3\nvar b = 2.5\nprint(first(&a), first(&b))\n",
+               "3 2.5\n")
+
+@test("@scoped naming a *T parameter of a method needs no '*self' receiver")
+sjn_scoped_pointer_method()
+    sjn_prints("struct Cell\n    k: int\n\n    @scoped(p)\n    add(self, p: *int) -> int = self.k + *p\n\n" +
+               "    @scoped(p)\n    put(*self, p: *int)\n        self.k = *p\n\n" +
+               "var c = Cell(1)\nvar n = 4\n\nc.put(&n)\nprint(c.add(&n))\n", "8\n")
+
+@test("@scoped naming a call and a *T on one method is accepted, the call still asking for '*self'")
+sjn_scoped_pointer_and_call()
+    sjn_prints("struct Chan\n    open: bool\n\n    @scoped(f, p)\n    run(*self, f: &sync Fn() -> int, p: *int) -> int = f() + *p\n\n" +
+               "var c = Chan(true)\nvar n = 2\n\nprint(c.run(() -> 1, &n))\n", "3\n")
+    sjn_refused("struct Chan\n    open: bool\n\n    @scoped(f, p)\n    run(self, f: &sync Fn() -> int, p: *int) -> int = f() + *p\n\nprint(1)\n",
+                "'@scoped' promises that what 'Chan.run' runs finishes before the '@lends' call that " +
+                "lent its receiver returns, so the receiver is the pointer that call lent, written " +
+                "'*self' — this one takes 'self' by value")
+
+@test("@scoped naming something that is not a parameter is refused, above a function and a method")
+sjn_scoped_bad_name()
+    sjn_refused("@scoped(q)\nblock(slot: *int) = ()\n\nprint(1)\n",
+                "'@scoped' names 'q', which is not a parameter of 'block' — its parameters are 'slot'")
+    sjn_refused("@scoped(q)\nnone() = ()\n\nprint(1)\n",
+                "'@scoped' names 'q', which is not a parameter of 'none' — it takes none")
+    sjn_refused("struct Cell\n    k: int\n\n    @scoped(q)\n    put(*self, p: *int)\n        self.k = *p\n\nprint(1)\n",
+                "'@scoped' names 'q', which is not a parameter of 'Cell.put' — its parameters are 'self', 'p'")
+
+@test("@scoped naming a parameter that is neither a pointer nor a call is refused")
+sjn_scoped_not_a_pointer()
+    val said = "'@scoped' names 'n', which is neither a call nor a pointer — what it promises is that a " +
+        "body a member runs in another domain finishes before the scope does, written " +
+        "'n: &sync Fn() -> R', or that a pointer the function holds is let go of before its caller's " +
+        "scope ends, written 'n: *T'"
+
+    sjn_refused("@scoped(n)\nf(n: int) = ()\n\nprint(1)\n", said)
+    sjn_refused("@scoped(n)\nf(n: &int) = ()\n\nprint(1)\n", said)
+
+@test("@scoped naming a pointer twice is refused")
+sjn_scoped_pointer_twice()
+    sjn_refused("@scoped(p, p)\nf(p: *int) = ()\n\nprint(1)\n",
+                "'@scoped' names 'p' twice, and a parameter is waited for or it is not — the second " +
+                "says nothing the first does not")
+
+@test("@scoped naming a call above a free function is refused, there being no receiver")
+sjn_scoped_call_free_function()
+    sjn_refused("@scoped(f, p)\nrun(f: &sync Fn() -> int, p: *int) -> int = f()\n\nprint(1)\n",
+                "Above a free function '@scoped' names '*T' parameters only, the pointers it lets go " +
+                "of before its caller's scope ends")
+
+@test("@scoped and @joined above an extern are refused")
+sjn_on_an_extern()
+    sjn_refused("@scoped(p)\nextern \"free\" c_free(p: *u8)\n\nprint(1)\n",
+                "'@scoped' promises that a body lets go of a parameter before its caller's scope ends, so " +
+                "it marks a function or a method, whose body is sysl")
+    sjn_refused("@crossing(p)\n@joined(p)\nextern \"free\" c_free(p: *u8)\n\nprint(1)\n",
+                "'@joined' says how long the thread a sysl function starts holds a pointer")
+
+// -- @joined --------------------------------------------------------------------------------------
+
+private val sjn_handle: string = "struct Handle\n    k: int\n\n    join(self) -> bool = true\n\n"
+
+@test("@joined naming a @crossing *T parameter is accepted, above a function and a method")
+sjn_joined_accepted()
+    sjn_prints(sjn_handle + "@crossing(p)\n@joined(p)\nbegin(p: *int) -> Handle = Handle(*p)\n\n" +
+               "struct Pool\n    n: int\n\n    @crossing(p)\n    @joined(p)\n    start(*self, p: *int) -> Handle = Handle(*p + self.n)\n\n" +
+               "run() -> int\n    var n = 5\n    var pool = Pool(1)\n    val h = begin(&n)\n    val g = pool.start(&n)\n\n" +
+               "    h.join()\n    g.join()\n    n + g.k\nend run\n\nprint(run())\n", "11\n")
+
+@test("@joined naming something that is not a parameter is refused")
+sjn_joined_bad_name()
+    sjn_refused(sjn_handle + "@crossing(p)\n@joined(q)\nbegin(p: *int) -> Handle = Handle(*p)\n\nprint(1)\n",
+                "'@joined' names 'q', which is not a parameter of 'begin'")
+
+@test("@joined naming a parameter @crossing does not name is refused")
+sjn_joined_not_crossing()
+    sjn_refused("@joined(p)\nf(p: *int) = ()\n\nprint(1)\n",
+                "'@joined' names 'p', which '@crossing' does not — a parameter is held until a join only " +
+                "by the thread it reaches, so one that is joined also crosses: '@crossing(p)'")
+
+@test("@joined naming a parameter twice is refused, and it takes at least one name")
+sjn_joined_twice_and_empty()
+    sjn_refused("@crossing(p)\n@joined(p, p)\nf(p: *int) = ()\n\nprint(1)\n",
+                "'@joined' names 'p' twice — the second says nothing the first does not")
+    sjn_refused("@joined()\nf(p: *int) = ()\n\nprint(1)\n",
+                "'@joined' names the '*T' parameters a call hands to the thread it starts")

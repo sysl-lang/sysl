@@ -97,17 +97,6 @@ parse_attr_list(p: *Parser) -> Buf[Attr]
             break
         end if
 
-        // **`@scoped` is about a member's receiver**: the promise is that what the member runs
-        // finishes before the `@lends` call that lent its `*self` returns, and a free function has no
-        // receiver for that call to have lent. Refused at the argument list, as `@borrows` is.
-        if p.at_kw("@") && attr_name(p) == "scoped"
-            p.bump()
-            p.bump()
-            p.fault(p.here(), scoped_on_free_function())
-            skip_line(p)
-            break
-        end if
-
         parse_attribute(p) match
             Some(a) -> out.push(a)
             None -> break
@@ -175,10 +164,10 @@ parse_member_attrs(p: *Parser, in_trait: bool) -> Buf[Attr]
     out
 end parse_member_attrs
 
-// `@scoped` anywhere but above a method: the promise is about the method's receiver and a callable
-// parameter, so a declaration without the two has nothing for it to be about.
+// `@scoped(f)` naming a call above a function with no receiver: what the promise is about is the
+// method's receiver and the callable it runs. A `*T` it may name above any function.
 scoped_on_free_function() -> string =
-    "'@scoped' says a method runs a callable parameter in another concurrency domain and finishes it before the '@lends' call that lent the method's '*self' returns, so it stands above a method — a free function has no receiver for a '@lends' call to have lent"
+    "'@scoped' naming a callable parameter says a method runs it in another concurrency domain and finishes it before the '@lends' call that lent the method's '*self' returns, so it stands above a method — a free function has no receiver for a '@lends' call to have lent. Above a free function '@scoped' names '*T' parameters only, the pointers it lets go of before its caller's scope ends"
 
 scoped_on_field() -> string =
     "'@scoped' says a method runs a callable parameter in another concurrency domain and finishes it before the '@lends' call that lent the method's '*self' returns, so it stands above a method — a field and a variant are never called, and have no parameter to run"
@@ -204,7 +193,7 @@ private member_attr_word(w: string) -> bool
     if fn_forgo_word(w) then return true
 
     for word in ["crossing", "borrows", "lends", "reads", "writes", "noinline", "inline", "cold", "blocks",
-                 "relocates", "views", "consumes", "disjoint", "scoped"]
+                 "relocates", "views", "consumes", "disjoint", "scoped", "joined"]
         if word == w then return true
 
     false
@@ -254,7 +243,7 @@ builtin_attr_word(w: string) -> bool
                  "tailrec", "pure", "ghost", "packed", "reads", "writes", "align", "byte_order", "export",
                  "section", "crossing", "domain", "borrows", "lends", "disjoint", "guards", "needs",
                  "noinline", "inline", "cold", "thread_local", "abandons", "per_cpu", "main_thread",
-                 "pinned", "pins", "relocates", "views", "consumes", "blocks", "scoped"]
+                 "pinned", "pins", "relocates", "views", "consumes", "blocks", "scoped", "joined"]
         if word == w then return true
 
     false
@@ -393,6 +382,7 @@ parse_attribute(p: *Parser) -> Option[Attr]
     if word == "borrows" then return Some(Borrows(parse_named_list(p, "borrows")))
     if word == "lends" then return Some(Lends(parse_named_list(p, "lends")))
     if word == "scoped" then return Some(Scoped(parse_named_list(p, "scoped")))
+    if word == "joined" then return Some(Joined(parse_named_list(p, "joined")))
     if word == "disjoint" then return Some(Disjoint(parse_named_list(p, "disjoint")))
     if word == "guards" then return Some(Guards(parse_named_list(p, "guards")))
     if word == "needs" then return Some(Needs(parse_named_list(p, "needs")))
@@ -712,6 +702,8 @@ private named_list_refusal(word: string) -> string
 
     if word == "scoped" then return "'@scoped' names the callable parameters a member runs in another concurrency domain and finishes before the '@lends' call that lent its receiver returns, in parentheses — '@scoped(f)'. There is no empty form: a member that waits for nothing it starts says so by not writing the annotation"
 
+    if word == "joined" then return "'@joined' names the '*T' parameters a call hands to the thread it starts, which holds each until the handle the call answers is joined, in parentheses — '@joined(arg)'. There is no empty form: a function whose thread holds nothing it was handed says so by not writing the annotation"
+
     if word == "guards" then return "'@guards' names the fields a struct's own members are the only way into, in parentheses — '@guards(value)'. There is no empty form: a struct that guards nothing says so by not writing the annotation"
 
     if word == "borrows" then return "'@borrows' names the parameters a trait's method promises not to keep past the call, in parentheses — '@borrows(bytes)'. There is no empty form: a method that may keep what it is handed says so by not writing the annotation"
@@ -996,8 +988,43 @@ apply_func_attrs(f: *FuncDecl, attrs: Buf[Attr])
             Pins -> f.marks.pins = true
             Forgoes(cap) -> f.marks.forgoes.push(cap)
             Blocks -> f.marks.blocks = true
+            Scoped(ns) ->
+                f.marks.scoped = not_pointer_names(f.params, ns)
+                f.marks.scoped_pointers = pointer_names(f.params, ns)
+            Joined(ns) -> f.marks.joined = ns
             _ -> ()
 end apply_func_attrs
+
+// Whether the parameter of this name is written as a raw pointer, `*T`.
+private names_pointer_param(ps: Buf[Param], name: string) -> bool
+    for item in ps
+        if item.name == name
+            *item.typ.kind match
+                PtrType(_) -> return true
+                _ -> return false
+
+    false
+end names_pointer_param
+
+// The names `@scoped` gives that are `*T` parameters, and the rest: a pointer held while the caller
+// waits is accepted and checked from 0.6.0, and the rest are what the lent rule reads.
+private pointer_names(ps: Buf[Param], ns: Buf[string]) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for name in ns
+        if names_pointer_param(ps, name) then out.push(name)
+
+    out
+end pointer_names
+
+private not_pointer_names(ps: Buf[Param], ns: Buf[string]) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for name in ns
+        if !names_pointer_param(ps, name) then out.push(name)
+
+    out
+end not_pointer_names
 
 apply_member_attrs(m: *MethodDecl, attrs: Buf[Attr])
     for attr in attrs
@@ -1007,7 +1034,10 @@ apply_member_attrs(m: *MethodDecl, attrs: Buf[Attr])
                 m.marks.copies = cs
             Borrows(ns) -> m.borrows = ns
             Lends(ns) -> m.marks.lends = ns
-            Scoped(ns) -> m.marks.scoped = ns
+            Scoped(ns) ->
+                m.marks.scoped = not_pointer_names(m.params, ns)
+                m.marks.scoped_pointers = pointer_names(m.params, ns)
+            Joined(ns) -> m.marks.joined = ns
             Disjoint(ns) -> m.marks.disjoint = ns
             Reads(ns) -> m.reads = Some(ns)
             Writes(ns) -> m.writes = Some(ns)
@@ -1259,6 +1289,13 @@ private attributed_refusal(attrs: Buf[Attr]) -> string
     // could not reach the code it is about; the C declaration's `restrict` is where it is made.
     if any_is(attrs, "disjoint")
         return "'@disjoint(...)' promises that a body reaches no memory through one named parameter that it also reaches another way, so it marks a function or a method, whose body is sysl — an 'extern''s body is C, which never reads the sysl declaration, so the promise belongs on the C declaration as 'restrict'"
+
+    // An `extern`'s body is C: nothing it promises reaches a body the compiler reads.
+    if any_is(attrs, "scoped")
+        return "'@scoped' promises that a body lets go of a parameter before its caller's scope ends, so it marks a function or a method, whose body is sysl — an 'extern' borrows what it is handed for the call"
+
+    if any_is(attrs, "joined")
+        return "'@joined' says how long the thread a sysl function starts holds a pointer, so it marks a function or a method, whose body is sysl — a sysl wrapper around an 'extern' that starts the thread says '@joined'"
 
     if any_is(attrs, "guards")
         return "'@guards(...)' names the fields a struct's own members are the only way into, so it can only mark a struct — and this declares none"

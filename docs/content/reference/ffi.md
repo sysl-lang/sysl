@@ -2160,6 +2160,30 @@ print(sum(3, 10, 20, 30))
 60
 ```
 
+**The four `va_` forms may also be imported from `sysl.c`** — by name, under another name with `as`,
+or through `import sysl.c.*`. Accepted from 0.5.6, the import is what 0.6.0 requires, so a program
+that writes it builds on both; here the bare spellings answer everywhere as well.
+
+```sysl
+import sysl.c.{va_start, va_arg as next, va_end}
+
+first(n: int, ...) -> int
+    var ap: va_list
+
+    va_start(ap)
+
+    val v: int = next(ap)
+
+    va_end(ap)
+    v + n
+
+print(first(1, 41))
+```
+
+```output
+42
+```
+
 **Why it is here at all.** C can do this, so sysl must: a capability C has and sysl lacks is a place
 sysl cannot be used, and sysl exists to be used where C is. The concrete cases are the ones every C
 codebase has — a logging or formatting function whose arity is the caller's business, and a function

@@ -819,6 +819,12 @@ call_member(cx: &Analyzer, span: Span, receiver: TExpr, name: string, args: Buf[
 
     if rty == Unknown then return bad_expr(span)
 
+    // **Every value answers `to_string()` and `debug_string()`**, by the compiler, where its type has
+    // no member of that name: the string its `Display` writes (its `Debug`, else `<T>`, where it has
+    // none) and the string its `Debug` writes -- the same code `str(x)` and `debug(x)` become.
+    if (name == "to_string" || name == "debug_string") && !owns_member(cx, rty, name) then
+        return rendered_member(cx, span, receiver, name, args, targs)
+
     // A value that is `Debug` by the compiler's rule has no block to call, so its `debug` is the
     // rule's (`reference/traits.md § What is shown by rule`).
     if name == "debug" && debug_by_rule(rty) then return rule_debug(cx, span, receiver, args)
@@ -873,6 +879,32 @@ call_member(cx: &Analyzer, span: Span, receiver: TExpr, name: string, args: Buf[
                        "first, with 'p[0..<n]'")
             else call_declared(cx, span, receiver, rty, name, args, expected, via, targs)
 end call_member
+
+// Whether a member of that name is the type's own -- declared for it, supplied by a trait it
+// implements, or promised by a bound -- which then wins over the one every value has.
+private owns_member(cx: &Analyzer, rty: Type, name: string) -> bool = rty match
+    Abstract(_, bounds) -> bound_member(cx.an, rty, bounds, name).is_some()
+    Trait(_, _, _) -> unslotted_member(cx, rty, name)
+    Weak(_) -> false
+    _ -> has_method_named(cx, rty, name)
+
+// `x.to_string()` / `x.debug_string()` where the type has none of its own: the value, read through a
+// reference as every rendering form reads it, rendered as `str(x)` / `debug(x)` render it.
+private rendered_member(cx: &Analyzer, span: Span, receiver: TExpr, name: string, args: Buf[Expr],
+                        targs: Buf[Expr]) -> TExpr
+    if !targs.is_empty() then
+        return cx.err(span, s"'$name' is not generic, so it has no type arguments to write — the " +
+                      s"call is '$name()'")
+
+    if !args.is_empty() then
+        return cx.err(span, s"'$name' takes no arguments — it renders the value it is called on")
+
+    val v = through_ref(cx, receiver)
+
+    warn_placeholder_named(cx, span, "this value", v)
+
+    if name == "to_string" then str_of(cx, span, v) else debug_of(cx, span, v)
+end rendered_member
 
 // A member the tables hold, called.
 private call_declared(cx: &Analyzer, span: Span, receiver: TExpr, rty: Type, name: string,
