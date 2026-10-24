@@ -103,6 +103,11 @@ private codegen_into(e: *Emit, p: TProgram, t: Target, pr: Promotions,
     var gaps: Buf[(string, string)] = buf()
     var imported: Set[string] = set()
 
+    // An owning function's borrowing entry, in a program, waits for something to name it
+    // (`owned_params.sysl`); an artifact emits every one.
+    val lazy = p.entry_point
+    var pending: Buf[PendingEntry] = buf()
+
     // A `@ghost` function is not emitted at all: nothing executable may call one, and the clauses
     // that may are the ones a body never reaches.
     for i in 0..<p.funcs.len()
@@ -117,7 +122,7 @@ private codegen_into(e: *Emit, p: TProgram, t: Target, pr: Promotions,
 
             gen_function(e, f) match
                 Some(built) ->
-                    for whole in owned_split(e, f, built)
+                    for whole in owned_split(e, f, built, lazy, false, pending)
                         for item in split_disjoint(f, whole)
                             funcs.push(item)
                 None -> gaps.push((f.name, gap_text(e)))
@@ -131,15 +136,8 @@ private codegen_into(e: *Emit, p: TProgram, t: Target, pr: Promotions,
                     if keeps_import(f, built)
                         // An owning function's entry and body are both copies of what the artifact
                         // defines (`owned_params.sysl`).
-                        for whole in owned_split(e, f, built)
-                            val parts = split_disjoint(f, whole)
-
-                            funcs.push(parts.at(0) with { sig = parts.at(0).sig with { linkage = LinkAvailableExternally } })
-
-                            // A view's body half is this unit's own `internal` copy, which is inlined
-                            // into the copy above and never linked against.
-                            for i in 1..<parts.len()
-                                funcs.push(parts.at(i))
+                        for whole in owned_split(e, f, built, lazy, true, pending)
+                            push_copy(funcs, split_disjoint(f, whole))
 
                         imported.add(f.name)
                 None -> ()
@@ -252,24 +250,58 @@ private codegen_into(e: *Emit, p: TProgram, t: Target, pr: Promotions,
     // And where a block on a boundary beyond the pair's comes from (`emit_box.sysl`).
     request_aligned_heap(e, p)
 
-    while made < e.queue.len()
-        val what = e.queue.at(made)
-        val name = e.requested.at(made)
+    made = drain_helpers(e, made, built_helpers, gaps)
 
-        made += 1
+    // The two words a `bool` renders as are asked for by what the bodies and helpers wrote, so they
+    // are settled here, before the storage below is.
+    val bools = e.bool_strs
 
-        what match
-            HrText(llvm) ->
-                if text_allocates(llvm, malloc_symbol()) then plain_drop_fn(e)
+    // **Module storage is laid down after every body, the entry point and the drain**: a `val`'s
+    // initializer interns its strings as it is written, and the reference writes it once the helpers
+    // are finished, so a string a `val` holds is numbered after every string any body or helper
+    // uses. Built earlier, the entry point's strings are numbered past them instead.
+    val vals = gen_vals(e, p.vals, p.precompiled)
 
-                built_helpers.push(RtTemplate(name, llvm))
-            _ ->
-                gen_helper(e, what, name) match
-                    Some(built) ->
-                        if allocates(built, malloc_symbol()) then plain_drop_fn(e)
+    // **The borrowing entries something names, now that everything that could name one is written**:
+    // the bodies, the thunks, the entry point, the tables, the helpers and the storage. An entry
+    // names only its owned body and the helpers that retain, so the helpers it asks for are drained
+    // after it and nothing new can name another entry.
+    if !pending.is_empty()
+        var everything: Buf[IrFunc] = buf()
 
-                        built_helpers.push(RtEmitted(built))
-                    None -> gaps.push((name, gap_text(e)))
+        for item in funcs
+            everything.push(item)
+
+        for item in thunks
+            everything.push(item)
+
+        if entry.is_some() then everything.push(entry.unwrap())
+        if init.is_some() then everything.push(init.unwrap().func)
+
+        var stored: Buf[IrGlobal] = buf()
+
+        for item in vtables
+            stored.push(item)
+
+        for item in vals
+            stored.push(item)
+
+        for item in e.globals
+            stored.push(item)
+
+        for item in named_entries(pending, everything, built_helpers, stored, module_asm_lines(p.module_asm))
+            set_promoted(e, pr, item.f.name)
+
+            val parts = split_disjoint(item.f, pending_entry(e, item))
+
+            if item.copy
+                push_copy(funcs, parts)
+            else
+                for part in parts
+                    funcs.push(part)
+
+        made = drain_helpers(e, made, built_helpers, gaps)
+    end if
 
     // The hand-written blocks go in front of the generated ones, and which of them the module needs
     // is settled only once every helper has been written -- a helper is as much a reason to hold the
@@ -281,16 +313,8 @@ private codegen_into(e: *Emit, p: TProgram, t: Target, pr: Promotions,
         helpers.push(built_helper)
 
     // The two words a `bool` renders as, laid down once for the whole module and in front of
-    // everything else it stores -- asked for by what the bodies and helpers wrote, so settled before
-    // the storage below is.
+    // everything else it stores.
     var globals: Buf[IrGlobal] = buf()
-    val bools = e.bool_strs
-
-    // **Module storage is laid down LAST, after every body, the entry point and the drain**: a
-    // `val`'s initializer interns its strings as it is written, and the reference writes it once the
-    // helpers are finished, so a string a `val` holds is numbered after every string any body or
-    // helper uses. Built earlier, the entry point's strings are numbered past them instead.
-    val vals = gen_vals(e, p.vals, p.precompiled)
 
     for i in 0..<vals.len()
         declared_globals.push(vals.at(i))
@@ -323,6 +347,43 @@ private codegen_into(e: *Emit, p: TProgram, t: Target, pr: Promotions,
 
     (if bf16_as_bits(t) then soft_bf16_lower(m) else m, gaps)
 end codegen_into
+
+// Every helper requested from `made` on, each of which may request another, until nothing new is.
+// Answers how far the queue has been built.
+private drain_helpers(e: *Emit, from: usize, built_helpers: Buf[IrRuntime], gaps: Buf[(string, string)]) -> usize
+    var made = from
+
+    while made < e.queue.len()
+        val what = e.queue.at(made)
+        val name = e.requested.at(made)
+
+        made += 1
+
+        what match
+            HrText(llvm) ->
+                if text_allocates(llvm, malloc_symbol()) then plain_drop_fn(e)
+
+                built_helpers.push(RtTemplate(name, llvm))
+            _ ->
+                gen_helper(e, what, name) match
+                    Some(built) ->
+                        if allocates(built, malloc_symbol()) then plain_drop_fn(e)
+
+                        built_helpers.push(RtEmitted(built))
+                    None -> gaps.push((name, gap_text(e)))
+
+    made
+end drain_helpers
+
+// A precompiled function's copy, as this module carries it: the first part `available_externally`,
+// and a view's body half this unit's own `internal` copy, which is inlined into the first and never
+// linked against.
+private push_copy(funcs: Buf[IrFunc], parts: Buf[IrFunc])
+    funcs.push(parts.at(0) with { sig = parts.at(0).sig with { linkage = LinkAvailableExternally } })
+
+    for i in 1..<parts.len()
+        funcs.push(parts.at(i))
+end push_copy
 
 // Whether any of a program's storage is filled at run time rather than laid into the object file.
 has_computed_val(vals: Buf[TVal]) -> bool
