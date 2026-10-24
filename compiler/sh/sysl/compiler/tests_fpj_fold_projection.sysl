@@ -1,0 +1,242 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.source_of
+import sysl.buf.{Buf, buf}
+import sysl.fs.{is_file, make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.testing.skip
+import sysl.text.Search
+
+// **A projection of constant data is constant data**: a field of a constructed struct, a nested
+// field, a tuple's part, an element at a constant index, an element or a field of another module
+// `val`, a payload a `match` binds, a slice of a string literal -- each is laid down in the object
+// file as the value it comes to, on a freestanding target as on the host, and nothing runs before
+// `main` to fill it in. An index past the end of a constant array is refused where it is written, as
+// a constant divided by zero is. A projection of storage filled at run time stays code, and a bare
+// archive reaching it is refused with the words it always was.
+
+private fpj_library_for(t: Target) -> Buf[Program]
+    var out: Buf[Program] = buf()
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, t) match
+            Err(_) -> ()
+            Ok(units) -> out = units
+
+    out
+end fpj_library_for
+
+private fpj_first_of(said: Buf[Placed]) -> string
+    for item in said
+        if !item.src.name.starts_with("library/") then return item.diag.message
+
+    ""
+end fpj_first_of
+
+// A C archive for `t`, as `build-c` makes one: the first thing the compilation had to say, or the
+// LLVM text it lowered to.
+private fpj_archive(t: Target, text: string) -> string
+    var units = fpj_library_for(t)
+    val parsed = parse(source_of("main.sysl", text), t)
+
+    if !parsed.ok() then return parsed.report.at(0).message
+
+    units.push(parsed.program)
+
+    val done = analyze_produced(units, t, buf(), false)
+    val early = fpj_first_of(done.reported)
+
+    if early != "" then return early
+
+    val whole = program_of(done, done.main_module) with { entry_point = false, c_artifact = true }
+    var own: Buf[string] = buf()
+
+    own.push("")
+
+    val pr = post_analysis_checks(done.an, whole, own)
+    val late = fpj_first_of(done.an.diagnostics())
+
+    if late != "" then return late
+
+    ir_print_module(codegen_with_gaps(prune(strip_tests(whole), own), t, pr).0)
+end fpj_archive
+
+private fpj_thumb() -> Target = target_named("thumb-freestanding-softfp").unwrap()
+
+private fpj_skip() -> bool
+    if fpj_library_for(fpj_thumb()).is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return true
+
+    false
+end fpj_skip
+
+// Every global is laid down as the constant the object file carries, and nothing runs to fill one.
+private fpj_laid_down(out: string, globals: []const string)
+    for g in globals
+        assert(out.contains(g), out)
+
+    assert(!out.contains("module_init"), out)
+    assert(!out.contains("llvm.global_ctors"), out)
+end fpj_laid_down
+
+private val fpj_types: string =
+    "struct Pair\n    a: u32\n    b: u32\n\nstruct Inner\n    c: u32\n\nstruct Mid\n    b: Inner\n\n" +
+    "struct Outer\n    a: Mid\n\nenum Shape\n    Circle(r: u32)\n    Square(s: u32)\n\n" +
+    "struct Box[T]\n    v: T\n\nconst pick(p: Pair) -> u32 = p.b\n\n"
+
+// One `val` per cell, read by an export so that none of them is pruned.
+private val fpj_vals: string =
+    "val f1 = Pair(1, 2).a\n" +
+    "val f2 = Outer(Mid(Inner(7))).a.b.c\n" +
+    "val f3 = (3, 4).1\n" +
+    "val f4 = [10, 20, 30][2]\n" +
+    "val arr: [3]u32 = [5, 6, 7]\n" +
+    "val f5 = arr[1]\n" +
+    "val px = Pair(8, 9)\n" +
+    "val f6 = px.b\n" +
+    "val f7 = Shape.Square(11) match\n    Circle(r) -> r\n    Square(s) -> s\n" +
+    "val f8 = pick(Pair(12, Pair(13, 14).a))\n" +
+    "val f9 = Box(Pair(15, 16)).v.b\n" +
+    "val f10 = \"hello\"[1..<3]\n" +
+    "val f11 = [1, 2, 3][1..<3][0]\n\n"
+
+private val fpj_sum: string =
+    "i32(f1 + f2 + u32(f3) + u32(f4) + f5 + f6 + f7 + f8 + f9 + u32(f10.len) + u32(f11))"
+
+private val fpj_globals: []const string = ["@f1 = private constant i32 1\n",
+                                           "@f2 = private constant i32 7\n",
+                                           "@f3 = private constant i32 4\n",
+                                           "@f4 = private constant i32 30\n",
+                                           "@f5 = private constant i32 6\n",
+                                           "@f6 = private constant i32 9\n",
+                                           "@f7 = private constant i32 11\n",
+                                           "@f8 = private constant i32 13\n",
+                                           "@f9 = private constant i32 16\n",
+                                           "@f10 = private constant { ptr, ptr, i",
+                                           "@f11 = private constant i32 2\n"]
+
+@test("a field, a nested field, a tuple's part, an element and a payload of constant data are data on a bare target")
+fpj_projections_fold_on_thumb()
+    if fpj_skip() then return
+
+    val out = fpj_archive(fpj_thumb(), fpj_types + fpj_vals + s"@export(\"main\")\nprobe() -> i32 = $fpj_sum\n")
+
+    fpj_laid_down(out, fpj_globals)
+    // The slice of the literal is the two bytes it names, and its length is two.
+    assert(out.contains("{ ptr null, ptr @.str1, i32 2 }\n"), out)
+    assert(out.contains("@.str1 = private constant [3 x i8] c\"el\\00\"\n"), out)
+end fpj_projections_fold_on_thumb
+
+@test("and the same storage is constant data on the host")
+fpj_projections_fold_on_the_host()
+    if fpj_skip() then return
+
+    fpj_laid_down(fpj_archive(host_target(), fpj_types + fpj_vals +
+                              s"@export(\"main\")\nprobe() -> i32 = $fpj_sum\n"), fpj_globals)
+end fpj_projections_fold_on_the_host
+
+@test("an index past the end of a constant array is refused at the 'val', whether the array is a literal or a 'val'")
+fpj_an_index_out_of_range_is_refused()
+    if fpj_skip() then return
+
+    assert_eq(fpj_archive(fpj_thumb(), "val bad = [1, 2, 3][5]\n\n@export(\"main\")\nprobe() -> i32 = i32(bad)\n"),
+              "'bad' traps while it is being compiled: index 5 is out of bounds for an array of 3 elements " +
+              "(main.sysl:1:21)")
+    assert_eq(fpj_archive(host_target(), "val arr: [3]u32 = [5, 6, 7]\nval bad = arr[3]\n\n" +
+                                         "@export(\"main\")\nprobe() -> i32 = i32(bad)\n"),
+              "'bad' traps while it is being compiled: index 3 is out of bounds for an array of 3 elements " +
+              "(main.sysl:2:15)")
+end fpj_an_index_out_of_range_is_refused
+
+@test("a projection of storage filled at run time stays code, and a bare archive is refused as it always was")
+fpj_a_projection_of_a_var_stays_code()
+    if fpj_skip() then return
+
+    val text = "struct Pair\n    a: u32\n    b: u32\n\nvar v = Pair(1, 2)\nval y = v.a\n\n" +
+               "@export(\"main\")\nprobe() -> i32 = i32(y)\n"
+
+    assert_eq(fpj_archive(fpj_thumb(), text),
+              "'probe' is exported and reaches 'y', which is module storage an initializer fills " +
+              "before the program's own statements run. This artifact has no entry point to fill it in, and " +
+              "'thumb-freestanding-softfp' is freestanding — there is no loader to run a constructor either, so " +
+              "the function would read whatever the image left. Build for a hosted target, where the storage " +
+              "is filled before any export can run, or make the initializer constant data, which is laid " +
+              "straight into the object file")
+
+    // On the host it is filled before the program's statements, from the 'var' as it then stands.
+    val out = fpj_archive(host_target(), text)
+
+    assert(!out.contains("@y = private constant"), out)
+    assert(out.contains("module_init") || out.contains("llvm.global_ctors"), out)
+end fpj_a_projection_of_a_var_stays_code
+
+// -- through the command line -------------------------------------------------------------------------
+
+private fpj_ready() -> bool = std_root().is_ok() && clang_available()
+
+private fpj_cli(args: []string) -> (int, string)
+    var said: Buf[string] = buf()
+    val sink = &said
+    val code = run_cli(args, piece -> sink.push(piece))
+    var text = ""
+
+    for item in said
+        text = text + item + "\n"
+
+    reset_search_paths()
+    (code, text)
+end fpj_cli
+
+// A project whose library module `mylib` holds the cells, with `main` as its entry file -- or none.
+private fpj_project(main: string) -> string
+    val root = make_temp_dir("sysl-fpj").unwrap()
+
+    write_text(s"$root/package.hocon", "package {\n  name = \"probe\"\n}\n").unwrap()
+
+    if main != "" then write_text(s"$root/main.sysl", main).unwrap()
+
+    make_dir_all(s"$root/mylib").unwrap()
+    write_text(s"$root/mylib/mylib.sysl", s"module mylib\n\n$fpj_types$fpj_vals" +
+                                          s"@export(\"probe\")\nprobe() -> i32 = $fpj_sum\n").unwrap()
+    root
+end fpj_project
+
+@test("a bare archive of the projections links with no constructor, and the host program prints their sum")
+fpj_through_the_command_line()
+    if !fpj_ready() then return
+
+    val objdump = ["/opt/homebrew/opt/llvm/bin/llvm-objdump", "/usr/local/opt/llvm/bin/llvm-objdump"]
+    var tool = ""
+
+    for item in objdump
+        if tool == "" && is_file(item) then tool = item
+
+    if tool == "" then skip("there is no llvm-objdump to read the archive")
+
+    val bare = fpj_project("")
+    var args: [7]string = ["sysl", "build-c", "--target", "thumb-freestanding-softfp", "-o", s"$bare/probe.a", bare]
+    val built = fpj_cli(args[..])
+
+    assert_eq(built.0, 0, built.1)
+
+    val dump = capture(tool, ["-h", s"$bare/probe.a"], "", [], true).unwrap()
+
+    remove_dir_all(bare).unwrap_or(())
+    assert(dump.status.ok(), dump.text)
+    assert(!dump.text.contains("init_array") && !dump.text.contains(".ctors"), dump.text)
+
+    val hosted = fpj_project("print(mylib.probe())\n")
+    var host_args: [5]string = ["sysl", "build", hosted, "-o", s"$hosted/exe"]
+    val linked = fpj_cli(host_args[..])
+
+    assert_eq(linked.0, 0, linked.1)
+
+    val ran = capture(s"$hosted/exe", [], "", [], true).unwrap()
+
+    remove_dir_all(hosted).unwrap_or(())
+    // 1 + 7 + 4 + 30 + 6 + 9 + 11 + 13 + 16 + 2 + 2
+    assert_eq(ran.text, "101\n")
+end fpj_through_the_command_line
