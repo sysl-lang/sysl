@@ -68,12 +68,53 @@ ixc_nested()
     ixc_refused(body, ixc_bad("'p' of 'outer'"))
     ixc_refused(body, ixc_bad("'q' of 'outer.inner'"))
 
-@test("a pointer captured by a closure stored as a '&sync Fn' crosses")
+// The capture rule lets a raw pointer cross as itself, without looking through it, and a closure
+// stored where another domain reaches it -- or handed to a crossing callable parameter -- is held to
+// that rule capture by capture; its pointer parameter is not made to cross more strictly than that.
+@test("a pointer captured by a closure stored as a '&sync Fn' crosses as the capture rule says: as itself")
 ixc_closure_in_a_sync_place()
-    ixc_refused("struct Cell\n    f: Option[&sync Fn() -> unit]\n\n" +
-                "stash(c: *Cell, p: *Bad)\n    c.f = Some(() -> look(p))\n\n" +
-                "go()\n    var n = 1\n    var b = Bad(n)\n    var c = Cell(None)\n\n    stash(&c, &b)\n\ngo()\n",
-                ixc_bad("'p' of 'stash'"))
+    if !azd_ready() then return
+
+    assert_eq(azd_err(ixc_prelude() + "struct Cell\n    f: Option[&sync Fn() -> unit]\n\n" +
+                      "stash(c: *Cell, p: *Bad)\n    c.f = Some(() -> look(p))\n\n" +
+                      "go()\n    var n = 1\n    var b = Bad(n)\n    var c = Cell(None)\n\n    stash(&c, &b)\n\ngo()\n"), "")
+
+@test("and so does one captured by a closure handed to a crossing callable parameter")
+ixc_closure_to_a_crossing_callable()
+    if !azd_ready() then return
+
+    assert_eq(azd_err(ixc_prelude() + "@crossing(f)\nrun_there(f: &sync Fn() -> unit) = f()\n\n" +
+                      "go_with(p: *Bad) = run_there(() -> look(p))\n\n" +
+                      "go()\n    var n = 1\n    var b = Bad(n)\n\n    go_with(&b)\n\ngo()\n"), "")
+
+@test("a field read out of the pointee and captured into a '&sync Fn' is that field's value, not the pointer")
+ixc_field_value_is_not_the_parameter()
+    ixc_prints("import sysl.sync.Atomic\n\nstruct Rung\n    set: Atomic[u32]\n\nstruct Host\n    rung: &sync Rung\n" +
+               "    mine: &int\n\n    waker(*self) -> &sync Fn() -> unit\n        val r = self.rung\n\n" +
+               "        () -> r.set.store(1)\n\ngo()\n    var h = Host(Rung(Atomic(0)), 5)\n    val w = h.waker()\n\n" +
+               "    w()\n    print(h.rung.set.load())\n\ngo()\n", "1\n")
+
+@test("the address of a field hands over the field, whose own type the inner call asks, and not the rest")
+ixc_field_address_is_the_field()
+    if !azd_ready() then return
+
+    val body = "struct Two\n    b: Bad\n    k: int\n\nhand(p: *Two) -> Option[Thread] = spawn(&look, &p.b)\n\n" +
+        "go()\n    var n = 1\n    var t = Two(Bad(n), 0)\n\n    hand(&t).unwrap().join()\n\ngo()\n"
+    val said = azd_err(ixc_prelude() + body)
+
+    assert(said.contains(ixc_bad("'arg' of 'sysl.threads.spawn'")), said)
+    assert(!said.contains("of 'hand'"), said)
+
+    // A field that holds nothing a count could race on crosses, with a plain '&int' beside it.
+    ixc_prints("struct Mixed\n    n: int\n    r: &int\n\nhand(p: *Mixed) -> Option[Thread] = spawn(&look, &p.n)\n\n" +
+               "go()\n    var m = Mixed(1, 2)\n\n    hand(&m).unwrap().join()\n\ngo()\n", "seen\n")
+
+@test("but the address of the whole pointee, or of one of its elements, is the parameter")
+ixc_whole_address_is_the_parameter()
+    ixc_refused("hand(p: *Bad) -> Option[Thread] = spawn(&look, &*p)\n\n" + ixc_call("hand"), ixc_bad("'p' of 'hand'"))
+    ixc_refused("hand(p: *[2]Bad) -> Option[Thread] = spawn(&look, &p[0])\n\n" +
+                "go()\n    var n = 1\n    var bs: [2]Bad = [Bad(n), Bad(n)]\n\n    hand(&bs).unwrap().join()\n\ngo()\n",
+                ixc_bad("'p' of 'hand'"))
 
 @test("a trait's default body that starts a thread with its parameter crosses it too")
 ixc_trait_default()

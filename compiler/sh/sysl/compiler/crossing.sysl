@@ -56,6 +56,9 @@ private struct Carry
     params: Buf[string]
     aliases: &Table[Buf[string]]
     hit: Buf[string]
+
+    // The `*T` parameters among them, which a `&sync` place may hold without crossing.
+    pointers: Buf[string]
 end Carry
 
 // Finds every parameter a visible body hands to another domain, then holds every call of such a
@@ -142,10 +145,17 @@ private infer_body(cx: &CrossCx, f: TFunc)
     // **A `@scoped` pointer is the scope's own to share**: a member that scopes a call lends its
     // receiver to the children it runs, and they reach it only while the caller waits inside the
     // scope -- the promise `docs/design/scope.md` makes and the keeps-analysis trusts (`scoped_at`).
-    for i in 0..<f.params.len()
-        if !scoped_at(f, i) then params.push(f.params.at(i).0)
+    var pointers: Buf[string] = buf()
 
-    val t: &Carry = Carry(params, table(), buf())
+    for i in 0..<f.params.len()
+        if scoped_at(f, i) then continue
+
+        params.push(f.params.at(i).0)
+
+        if is_raw_pointer_type(f.params.at(i).1) then pointers.push(f.params.at(i).0)
+    end for
+
+    val t: &Carry = Carry(params, table(), buf(), pointers)
 
     // A local bound to something made of a parameter carries it; twice over, so a local bound to
     // another such local is found whichever was walked first.
@@ -181,13 +191,20 @@ private sink_expr(cx: &CrossCx, t: &Carry, e: TExpr)
         TVCall(recv, slot, args, _, _) ->
             for target in slot_targets(cx, recv, slot)
                 call_sink(cx, t, target, with_recv(recv, args))
-        TErase(operand, _, ty) -> if is_sync_ref(ty) then sink(t, operand)
-        TBox(value, ty) -> if is_sync_ref(ty) then sink(t, value)
-        TStore(place, value, _, _) -> if sync_place(place) then sink(t, value)
+        TErase(operand, _, ty) -> if is_sync_ref(ty) then sink_value(t, operand)
+        TBox(value, ty) -> if is_sync_ref(ty) then sink_value(t, value)
+        TStore(place, value, _, _) -> if sync_place(place) then sink_value(t, value)
         _ -> ()
 end sink_expr
 
-private sink_write(t: &Carry, w: TWrite) = if sync_place(w.place) then sink(t, w.value)
+private sink_write(t: &Carry, w: TWrite) = if sync_place(w.place) then sink_value(t, w.value)
+
+// **A `&sync` place holds a `*T` as a closure captures one: as itself**, which the rule lets cross
+// without looking through it (`sharing.sysl`'s capture check). So a raw pointer stored or captured
+// there does not make its parameter cross; a value -- a task, a generic's `T` -- does.
+private sink_value(t: &Carry, e: TExpr)
+    for name in roots(t, e)
+        if !holds_string(t.pointers, name) && !holds_string(t.hit, name) then t.hit.push(name)
 
 private call_sink(cx: &CrossCx, t: &Carry, name: string, args: Buf[TExpr])
     val ps = cx.crossing.get(name) match
@@ -199,8 +216,22 @@ private call_sink(cx: &CrossCx, t: &Carry, name: string, args: Buf[TExpr])
         None -> return
 
     for j in 0..<args.len()
-        if j < callee.params.len() && holds_string(ps, callee.params.at(j).0) then sink(t, args.at(j))
+        if j >= callee.params.len() || !holds_string(ps, callee.params.at(j).0) then continue
+
+        // A callable crosses with its captures, each held to the capture rule, which lets a `*T`
+        // cross as itself.
+        if callable_type(texpr_type(args.at(j))) then sink_value(t, args.at(j)) else sink(t, args.at(j))
+    end for
 end call_sink
+
+private callable_type(t: Type) -> bool = t match
+    Trait(_, _, _) -> true
+    Ref(inner, _) -> callable_type(*inner)
+    _ -> is_closure_literal(t)
+
+private is_raw_pointer_type(t: Type) -> bool = t match
+    Ptr(_) -> true
+    _ -> false
 
 private sink(t: &Carry, e: TExpr)
     for name in roots(t, e)
@@ -248,7 +279,7 @@ private sync_place(place: TExpr) -> bool = *place.kind match
 
 // The parameters a value may be made of.
 private roots(t: &Carry, e: TExpr) -> Buf[string]
-    val out: &Carry = Carry(buf(), t.aliases, buf())
+    val out: &Carry = Carry(buf(), t.aliases, buf(), buf())
 
     roots_into(t, e, out)
     out.hit
@@ -266,12 +297,9 @@ private roots_into(t: &Carry, e: TExpr, out: &Carry)
                             if !holds_string(out.hit, p) then out.hit.push(p)
                     None -> ()
             end if
-        TAddrOf(place, _) -> roots_into(t, place, out)
+        TAddrOf(place, _) -> place_roots_into(t, place, out)
         TTempAddr(value, _) -> roots_into(t, value, out)
-        TDeref(operand, _) -> roots_into(t, operand, out)
-        TField(recv, _, _) -> roots_into(t, recv, out)
-        TIndex(recv, _, _) -> roots_into(t, recv, out)
-        TSlice(base, _, _, _, _) -> roots_into(t, base, out)
+        TSlice(base, _, _, _, _) -> place_roots_into(t, base, out)
         TCast(operand, _) -> roots_into(t, operand, out)
         TBox(value, _) -> roots_into(t, value, out)
         TErase(operand, _, _) -> roots_into(t, operand, out)
@@ -285,6 +313,21 @@ private roots_into(t: &Carry, e: TExpr, out: &Carry)
         TBlockExpr(b) -> if b.result.is_some() then roots_into(t, b.result.unwrap(), out)
         _ -> ()
 end roots_into
+
+// **A place is the parameter's storage only where its address is taken or a view is cut of it, and
+// all of it only where the place is all of it or one of its elements**: `&p`, `&*p`, `&p[i]` and
+// `p[..]` hand over storage of the parameter's own type, so asking the parameter is asking what
+// crossed. A field is not: `&self.watch` hands over a `Watch`, whose type the call that takes it
+// asks, and the rest of `self` stays on this side. A field, an element or a pointee *read* out of the
+// parameter is a value of its own, which the call that takes it asks the same way -- so `val r =
+// self.rung` captured into a `&sync Fn` hands over the `&sync Rung`, not `self`.
+private place_roots_into(t: &Carry, place: TExpr, out: &Carry)
+    *place.kind match
+        TField(_, _, _) -> ()
+        TIndex(recv, _, _) -> place_roots_into(t, recv, out)
+        TDeref(operand, _) -> roots_into(t, operand, out)
+        _ -> roots_into(t, place, out)
+end place_roots_into
 
 private all_into(t: &Carry, es: Buf[TExpr], out: &Carry)
     for e in es

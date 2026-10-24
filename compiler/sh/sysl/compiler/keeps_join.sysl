@@ -166,8 +166,15 @@ stmt_handle(hs: &Handles, s: TStmt) -> string = s match
 
 // An expression the body answers keeps its handle with whoever it is answered to, and a call a `match`
 // or an `is` test asks keeps it where the arms name it.
-expr_handle(hs: &Handles, e: TExpr) -> string =
-    if has_span(hs.answers, e.span) then "^" else scrutinized_key(hs, e.span)
+// An assignment written as a statement is a store at the top of its expression, and keeps the
+// handle where it stores it.
+expr_handle(hs: &Handles, e: TExpr) -> string
+    if has_span(hs.answers, e.span) then return "^"
+
+    *e.kind match
+        TStore(place, _, _, _) -> frame_place_key(hs, place)
+        _ -> scrutinized_key(hs, e.span)
+end expr_handle
 
 // The location a thread started by the statement being said holds its pointer at. `answered` is
 // whether a handle the body answers keeps it on for the caller (`j`) -- which a frame's own storage
@@ -217,6 +224,14 @@ calls_member(name: string, word: string) -> bool
 end calls_member
 
 private unwraps(name: string) -> bool = calls_member(name, "unwrap") || calls_member(name, "expect")
+
+// Whether a statement's events already hold this keep, at this argument.
+said_already(evs: &EvBuf, loc: string, at: Span) -> bool
+    for ev in evs.items
+        if !ev.clear && ev.loc == loc && ev.at == at then return true
+
+    false
+end said_already
 
 has_span(xs: Buf[Span], at: Span) -> bool
     for x in xs

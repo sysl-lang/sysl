@@ -3529,8 +3529,11 @@ so a generic facility is asked afresh for every set of type arguments, exactly a
 
 **Where a body shows the boundary, nobody writes the annotation.** A parameter whose function hands
 it to another one that crosses — `spawn`'s `arg`, a channel's `send`, a `@scoped` member's callable —
-or stores it in a `&sync` place crosses too, and every call of that function is held to the rule
-exactly as a written `@crossing` holds it, however many functions deep the boundary is:
+crosses too, and so does a value (not a `*T`, which a `&sync` place holds as itself) it stores in a
+`&sync` place. Every call of that function is held to the rule exactly as a written `@crossing`
+holds it, however many functions deep the boundary is. What crosses is the parameter itself, its
+address, an element or a view of it — the address of one of its *fields* hands over that field, whose
+own type the inner call asks:
 
 ```sysl
 import sysl.threads.*
