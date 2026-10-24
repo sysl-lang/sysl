@@ -7,7 +7,7 @@ import sysl.text.Search
 
 // The marks written above a function declared inside another (`reference/attributes.md`): `@noinline`,
 // `@cold`, `@inline`, `@inline(always)`, `@disjoint`, `@abandons`, `@blocks`, `@pinned`, `@pins`,
-// `@domain` and `@lends` all take effect on it exactly as they do on a top-level function. A nested
+// `@domain` and `@scoped` all take effect on it exactly as they do on a top-level function. A nested
 // function is lowered to a function of its own, and that function used to carry none of them, so the
 // attribute was accepted and did nothing.
 //
@@ -181,8 +181,8 @@ nmk_disjoint()
 
         assert(bare != "" && !bare.contains("noalias"), s"${nmk_where(kind)}\n$bare")
 
-// What `@disjoint` and `@lends` may name is settled at a nested function as at a top-level one.
-@test("'@disjoint' and '@lends' naming something that is not a parameter of a nested function are refused")
+// What `@disjoint` and `@scoped` may name is settled at a nested function as at a top-level one.
+@test("'@disjoint' and '@scoped' naming something that is not a parameter of a nested function are refused")
 nmk_names_are_checked()
     if xvr_no_library() then return
 
@@ -192,10 +192,10 @@ nmk_names_are_checked()
         assert(disjoint.contains("error: '@disjoint' names 'nope', which is not a parameter of"),
                s"${nmk_where(kind)}\n$disjoint")
 
-        val lends = nmk_probe_with(kind, "@lends(nope)")
+        val scoped = nmk_probe_with(kind, "@scoped(nope)")
 
-        assert(lends.contains("error: '@lends' names 'nope', which is not a parameter of"),
-               s"${nmk_where(kind)}\n$lends")
+        assert(scoped.contains("error: '@scoped' names 'nope', which is not a parameter of"),
+               s"${nmk_where(kind)}\n$scoped")
 
 // -- @abandons ----------------------------------------------------------------------------------------
 
@@ -287,26 +287,25 @@ nmk_domain()
 
         assert_eq(bare, "", nmk_where(kind))
 
-// -- @lends -------------------------------------------------------------------------------------------
+// -- @scoped ------------------------------------------------------------------------------------------
 
-private val nmk_lender: string = "with(p: *int, body: *int -> int) -> int = body(p)"
+private val nmk_held: string = "static var spot = 0\nstatic var held: *int = &spot\n\n"
+private val nmk_keeper: string = "keep(p: *int)\n    held = p"
 
-private val nmk_keeps: string =
-    "var n = 1\nvar held: *int = &n\nwith(&n, (v) ->\n    held = v\n    0)"
-
-@test("a nested '@lends' function lends the pointer only for the call, so a body keeping it is refused")
-nmk_lends()
+// The promise is what lets a caller hand the function a local's address: without it, a body that
+// stores its parameter keeps it, and the local is refused.
+@test("a nested '@scoped' function may be handed a local it stores, and without the mark the local is refused")
+nmk_scoped()
     if xvr_no_library() then return
 
     for kind in 0..<nmk_kinds()
-        val said = nmk_ir(nmk_program(kind, "", "@lends(body)\n" + nmk_lender, nmk_keeps, true))
+        val said = nmk_ir(nmk_program(kind, nmk_held, "@scoped(p)\n" + nmk_keeper, "var n = 1\nkeep(&n)", true))
 
-        assert(said.contains("lends this body a pointer that is valid only until the call returns, and " +
-                             "this one is stored somewhere the call does not own"), s"${nmk_where(kind)}\n$said")
+        assert(!said.starts_with("error"), s"${nmk_where(kind)}\n$said")
 
-        val bare = nmk_ir(nmk_program(kind, "", "\n" + nmk_lender, nmk_keeps, true))
+        val bare = nmk_ir(nmk_program(kind, nmk_held, "\n" + nmk_keeper, "var n = 1\nkeep(&n)", true))
 
-        assert(!bare.starts_with("error"), s"${nmk_where(kind)}\n$bare")
+        assert(bare.contains("keeps its parameter 'p' (it is stored in 'held')"), s"${nmk_where(kind)}\n$bare")
 
 // -- what a nested function may not carry -------------------------------------------------------------
 
