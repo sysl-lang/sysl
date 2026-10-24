@@ -1,12 +1,14 @@
 module sh.sysl.compiler
 @tests
 
+import sh.sysl.hocon.Value
 import sysl.buf.{Buf, buf}
 import sysl.text.Search
 
-// The manifest's notation, read far enough to answer what a build asks of it.
+// The manifest's notation, read through `sh.sysl.hocon` far enough to answer what a build asks of it:
+// the tree, and the one line a refusal is.
 
-private at(text: string, key: string) -> string = conf_text(read_conf(text).unwrap(), key)
+private at(text: string, key: string) -> string = scalar_text(read_conf(text).unwrap(), key)
 
 private refused(text: string) -> string = read_conf(text) match
     Err(why) -> why
@@ -30,16 +32,16 @@ a_block_nests_either_way()
     val with_it = read_conf("package = { name = \"a\" }").unwrap()
     val without = read_conf("package { name = \"a\" }").unwrap()
 
-    assert_eq(conf_text(conf_at(with_it, "package").unwrap(), "name"), "a")
-    assert_eq(conf_text(conf_at(without, "package").unwrap(), "name"), "a")
+    assert_eq(scalar_text(with_it.get("package").unwrap(), "name"), "a")
+    assert_eq(scalar_text(without.get("package").unwrap(), "name"), "a")
 
 @test("entries are separated by a newline or a comma, and either may be doubled")
 entries_separate_two_ways()
-    val c = read_conf("package { name = \"a\", version = \"1.0.0\" }").unwrap()
-    val pkg = conf_at(c, "package").unwrap()
+    val c = read_conf("package { name = \"a\",, version = \"1.0.0\"\n\n }").unwrap()
+    val pkg = c.get("package").unwrap()
 
-    assert_eq(conf_text(pkg, "name"), "a")
-    assert_eq(conf_text(pkg, "version"), "1.0.0")
+    assert_eq(scalar_text(pkg, "name"), "a")
+    assert_eq(scalar_text(pkg, "version"), "1.0.0")
 
 @test("both comment spellings run to the end of their line")
 comments_run_to_the_line_end()
@@ -48,10 +50,10 @@ comments_run_to_the_line_end()
 @test("'true' and 'false' are flags rather than words, which is what a requires block reads")
 flags_are_read_as_flags()
     val c = read_conf("requires { heap = true\n os = false }").unwrap()
-    val set = conf_flags_set(conf_at(c, "requires").unwrap())
+    val flags = c.get("requires").unwrap().flags()
 
-    assert_eq(set.len(), 1)
-    assert_eq(set.at(0), "heap")
+    assert_eq(flags.len(), 2)
+    assert_eq(s"${flags.at(0).0} ${flags.at(0).1} ${flags.at(1).0} ${flags.at(1).1}", "heap true os false")
 
 @test("a quoted key holds what a bare one may not")
 a_quoted_key_holds_anything()
@@ -60,7 +62,7 @@ a_quoted_key_holds_anything()
 @test("the names a block wrote, in the order it wrote them")
 keys_come_back_in_order()
     val c = read_conf("b = \"1\"\na = \"2\"\nc = \"3\"").unwrap()
-    val keys = conf_keys(c)
+    val keys = c.keys()
 
     assert_eq(keys.len(), 3)
     assert_eq(keys.at(0), "b")
@@ -71,9 +73,9 @@ keys_come_back_in_order()
 a_list_is_read()
     val c = read_conf("keywords = [\"a\", b\n c]\nname = \"geom\"").unwrap()
 
-    assert_eq(conf_text(c, "name"), "geom")
+    assert_eq(scalar_text(c, "name"), "geom")
 
-    val items = conf_list(conf_at(c, "keywords").unwrap()).unwrap()
+    val items = c.get("keywords").unwrap().as_text_list().unwrap()
 
     assert_eq(items.len(), 3)
     assert_eq(items.at(0), "a")
@@ -86,20 +88,84 @@ an_unclosed_block_is_refused()
 
 @test("and so is a brace that closes nothing")
 a_stray_close_is_refused()
-    assert(refused("}").index_of("closes a block that was never opened").is_some(), "said so")
+    assert_eq(refused("}"), "a '}' closes a block that was never opened (line 1, column 1)")
 
 @test("a quoted string opened and never closed says so rather than running to the end")
 an_unclosed_string_is_refused()
-    assert(refused("name = \"a").index_of("never closed").is_some(), "said so")
+    assert_eq(refused("name = \"a"), "a quoted string was opened and never closed (line 1, column 10)")
 
 @test("a key followed by neither an equals nor a block names nothing")
 a_key_with_no_value_names_nothing()
-    assert(refused("name \"a\"").index_of("rather than '=' or a block").is_some(), "said so")
+    assert_eq(refused("name \"a\""), "'name' is followed by '\"' rather than '=' or a block (line 1, column 6)")
+    assert_eq(refused("a {\n  name"), "'name' names nothing (line 2, column 7)")
 
 @test("a name a block does not hold answers with nothing, and asking a value for a key answers so too")
 a_missing_key_answers_nothing()
     val c = read_conf("name = \"a\"").unwrap()
 
-    assert(conf_at(c, "version").is_none(), "no such key")
-    assert_eq(conf_text(c, "version"), "")
-    assert(conf_at(conf_at(c, "name").unwrap(), "x").is_none(), "a string holds no keys")
+    assert(c.get("version").is_none(), "no such key")
+    assert_eq(scalar_text(c, "version"), "")
+    assert(c.get("name").unwrap().get("x").is_none(), "a string holds no keys")
+
+// -- the reading the manifests have always had, through the package ---------------------------------
+
+@test("a refusal's column counts bytes, as the reader always has, and its line counts new lines")
+hcm_refusal_columns_count_bytes()
+    assert_eq(refused("a = \"é\" }"), "a '}' closes a block that was never opened (line 1, column 10)")
+    assert_eq(refused("x = 1\n\n  a = [1, 2"), "a '[' was opened and never closed (line 3, column 12)")
+    assert_eq(refused("targets { default = \n"), "unclosed object — expected '}' (line 2, column 1)")
+
+@test("the separators a list holds unquoted are refused at the separator")
+hcm_list_separator_refused()
+    assert_eq(refused("\n features { server = [dep:lmdb] }"), "unexpected token in value (line 2, column 26)")
+
+@test("a manifest that is a list rather than a block is refused as a key that cannot begin one")
+hcm_root_list_refused()
+    assert_eq(refused("[1, 2]"), "'[' cannot begin a key (line 1, column 1)")
+    assert_eq(refused("\n  [a]"), "'[' cannot begin a key (line 2, column 3)")
+
+    // An empty file, and one of comments only, is an empty block.
+    assert_eq(read_conf("").unwrap().keys().len(), 0)
+    assert_eq(read_conf("# nothing\n").unwrap().keys().len(), 0)
+
+@test("a number is the word it was written as, so a version, a level and a wide integer read as typed")
+hcm_numbers_are_words_as_written()
+    val c = read_conf("v = 0.10\nn = 3\nwide = 340282366920938463463374607431768211455\nneg = -1\nhex = 0x10\nz = null").unwrap()
+
+    assert_eq(scalar_text(c, "v"), "0.10")
+    assert_eq(scalar_text(c, "n"), "3")
+    assert_eq(scalar_text(c, "wide"), "340282366920938463463374607431768211455")
+    assert_eq(scalar_text(c, "neg"), "-1")
+    assert_eq(scalar_text(c, "hex"), "0x10")
+    assert_eq(scalar_text(c, "z"), "null")
+    assert_eq(text_of(c.get("v").unwrap()), Some("0.10"))
+    assert_eq(text_of(c.get("z").unwrap()), Some("null"))
+
+@test("prose is a quoted string or a bare word not starting like a number, and never a flag or a block")
+hcm_prose()
+    val c = read_conf("q = \"3\"\nw = hello\nn = 3\nm = -x\nv = 1.0.0\nt = true\nb { }\nl = [x]").unwrap()
+
+    assert(is_prose(c.get("q").unwrap()), "a quoted number is prose")
+    assert(is_prose(c.get("w").unwrap()), "a bare word")
+    assert(!is_prose(c.get("n").unwrap()), "a number")
+    assert(!is_prose(c.get("m").unwrap()), "a word starting with a minus")
+    assert(!is_prose(c.get("v").unwrap()), "a word starting with a digit")
+    assert(!is_prose(c.get("t").unwrap()), "a flag")
+    assert(!is_prose(c.get("b").unwrap()), "a block")
+    assert(!is_prose(c.get("l").unwrap()), "a list")
+
+@test("text_of is a string either way, and nothing for a flag, a list or a block")
+hcm_text_of()
+    val c = read_conf("q = \"a b\"\nw = a b\nt = false\nl = [x]\nb { }").unwrap()
+
+    assert_eq(text_of(c.get("q").unwrap()), Some("a b"))
+    assert_eq(text_of(c.get("w").unwrap()), Some("a b"))
+    assert_eq(text_of(c.get("t").unwrap()), None)
+    assert_eq(text_of(c.get("l").unwrap()), None)
+    assert_eq(text_of(c.get("b").unwrap()), None)
+
+@test("the canonical tree tags a quoted string, a word and a flag apart, with numbers as written")
+hcm_canonical_tags()
+    val c = read_conf("b = \"3\"\na = 3\nd = 0.10\nc = true\nl = [x, \"y\"]").unwrap()
+
+    assert_eq(canonical_tree(c), "{5k1:a=w1:3k1:b=t1:3k1:c=f1k1:d=w4:0.10k1:l=[2w1:xt1:y]}")

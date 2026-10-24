@@ -1,5 +1,6 @@
 module sh.sysl.compiler
 
+import sh.sysl.hocon.Value
 import sysl.buf.{Buf, buf}
 import sysl.text.{join, Search}
 
@@ -63,7 +64,7 @@ struct Dependency
 
     // The options of the dependency this entry sets, each by name with the value as written
     // (`options.sysl`). Held to the dependency's own declarations once its manifest is read.
-    options: Buf[(string, &Conf)]
+    options: Buf[(string, Value)]
 end Dependency
 
 // An entry that says nothing about features, which is what every entry before them said.
@@ -276,16 +277,16 @@ private last_slash(text: string) -> usize
 end last_slash
 
 // The `dependencies` or `dev_dependencies` block, read.
-read_dependencies(root: &Conf, block: string) -> Result[Buf[Dependency], string]
+read_dependencies(root: Value, block: string) -> Result[Buf[Dependency], string]
     var out: Buf[Dependency] = buf()
 
-    conf_at(root, block) match
+    root.get(block) match
         None -> return Ok(out)
         Some(deps) ->
-            val labels = sorted_labels(conf_keys(deps))
+            val labels = sorted_labels(deps.keys())
 
             for item in labels
-                val sub = conf_at(deps, item).unwrap()
+                val sub = deps.get(item).unwrap()
 
                 out.push(read_dependency(item, sub, block)?)
 
@@ -322,14 +323,14 @@ end not_in_both
 // `versoin = "1.0.0"` was written by somebody who believes they have pinned a version, and ignoring
 // the key would resolve whatever the repository's default branch happens to be while they went on
 // believing it.
-private read_dependency(label: string, sub: &Conf, block: string) -> Result[Dependency, string]
+private read_dependency(label: string, sub: Value, block: string) -> Result[Dependency, string]
     val where = s"$block.$label"
 
-    if !conf_is_block(sub)
+    if !sub.is_obj()
         return Err(s"'$where' is not a block — a dependency is a git coordinate and a version, or a " +
             "path")
 
-    val keys = sorted_labels(conf_keys(sub))
+    val keys = sorted_labels(sub.keys())
 
     for i in 0..<keys.len()
         if !known_dependency_key(keys.at(i))
@@ -343,17 +344,17 @@ private read_dependency(label: string, sub: &Conf, block: string) -> Result[Depe
     val defaults = read_yes_no(sub, where, "default_features", true)?
     val condition = read_condition_key(sub, where)?
 
-    val features = conf_at(sub, "features") match
+    val features = sub.get("features") match
         None -> buf()
-        Some(v) -> conf_list(v) match
+        Some(v) -> v.as_text_list() match
             None -> return Err(not_a_feature_list(s"$where.features"))
             Some(names) -> names
 
     var c_include: Buf[string] = buf()
 
-    conf_at(sub, "c_include") match
+    sub.get("c_include") match
         None -> ()
-        Some(v) -> conf_list(v) match
+        Some(v) -> v.as_text_list() match
             None -> return Err(s"'$where.c_include' must be a list of directories, relative to this " +
                                "manifest")
             Some(dirs) ->
@@ -362,15 +363,15 @@ private read_dependency(label: string, sub: &Conf, block: string) -> Result[Depe
 
     var c_defines: Buf[string] = buf()
 
-    conf_at(sub, "c_defines") match
+    sub.get("c_defines") match
         None -> ()
         Some(v) ->
-            if !conf_is_block(v)
+            if !v.is_obj()
                 return Err(s"'$where.c_defines' is not a block of macros — each line is one macro " +
                            "every C file of the package is compiled with, as 'c_defines = { STM32H743xx = true }'")
 
-            for name in sort_names(conf_keys(v))
-                c_defines.push(macro_of(s"$where.c_defines", name, conf_at(v, name).unwrap())?)
+            for name in sort_names(v.keys())
+                c_defines.push(macro_of(s"$where.c_defines", name, v.get(name).unwrap())?)
 
     val options = read_option_settings(sub, where)?
 
@@ -380,13 +381,12 @@ end read_dependency
 // An entry's `if`: a string holding a condition, checked here -- every symbol, whichever machine
 // the build turns out to be for -- so a misspelling is refused when the file is read rather than
 // leaving the dependency out of every build with nothing said.
-read_condition_key(sub: &Conf, where: string) -> Result[string, string]
-    val text = conf_at(sub, "if") match
+read_condition_key(sub: Value, where: string) -> Result[string, string]
+    val text = sub.get("if") match
         None -> return Ok("")
-        Some(v) -> *v match
-            Text(s) -> s
-            Word(s) -> s
-            _ -> return Err(s"'$where.if' is not a string — it is a condition, as '#if' writes " +
+        Some(v) -> text_of(v) match
+            Some(s) -> s
+            None -> return Err(s"'$where.if' is not a string — it is a condition, as '#if' writes " +
                 "one, in quotes: if = \"freestanding\"")
 
     dependency_condition(text, buf()) match
@@ -412,14 +412,14 @@ end holds_key
 // An entry's `options`: each option of the dependency this consumer sets, by name, with the value as
 // written. What the value may be is the dependency's manifest's to say, so it is held to that once the
 // manifest is read (`settle_options`); here only the shape is.
-private read_option_settings(sub: &Conf, where: string) -> Result[Buf[(string, &Conf)], string]
-    var out: Buf[(string, &Conf)] = buf()
+private read_option_settings(sub: Value, where: string) -> Result[Buf[(string, Value)], string]
+    var out: Buf[(string, Value)] = buf()
 
-    val block = conf_at(sub, "options") match
+    val block = sub.get("options") match
         None -> return Ok(out)
         Some(b) -> b
 
-    if !conf_is_block(block)
+    if !block.is_obj()
         return Err(s"'$where.options' is not a block — it sets the package's options by name, as " +
             "'options = { slots = 8 }'")
 
@@ -429,12 +429,12 @@ end read_option_settings
 
 // A yes-or-no field of an entry, which is a flag and nothing else: `"yes"` is a string, and a
 // string here was written by somebody who believes they said something the reader cannot see.
-private read_yes_no(sub: &Conf, where: string, key: string, otherwise: bool) -> Result[bool, string]
-    conf_at(sub, key) match
+private read_yes_no(sub: Value, where: string, key: string, otherwise: bool) -> Result[bool, string]
+    sub.get(key) match
         None -> Ok(otherwise)
-        Some(v) -> *v match
-            Flag(on) -> Ok(on)
-            _ -> Err(s"'$where.$key' is not 'true' or 'false' — it is a yes or no question, " +
+        Some(v) -> v.as_bool() match
+            Some(on) -> Ok(on)
+            None -> Err(s"'$where.$key' is not 'true' or 'false' — it is a yes or no question, " +
                      "written without quotes")
 end read_yes_no
 
@@ -446,10 +446,10 @@ not_a_feature_list(where: string) -> string =
 
 // The root name a consumer may put a dependency under, which has to be a name a module could have:
 // it becomes the first segment of every import line that reaches the package.
-private read_mount(sub: &Conf, where: string) -> Result[Option[string], string]
-    if conf_at(sub, "mount").is_none() then return Ok(None)
+private read_mount(sub: Value, where: string) -> Result[Option[string], string]
+    if sub.get("mount").is_none() then return Ok(None)
 
-    val name = conf_text(sub, "mount")
+    val name = scalar_text(sub, "mount")
 
     if is_module_segment(name) then return Ok(Some(name))
 
@@ -475,19 +475,19 @@ end is_module_segment
 private letter_byte(c: u8) -> bool =
     (c >= u8('a') && c <= u8('z')) || (c >= u8('A') && c <= u8('Z')) || c >= 128
 
-private read_origin(sub: &Conf, where: string) -> Result[Origin, string]
-    val has_git = conf_at(sub, "git").is_some()
-    val has_path = conf_at(sub, "path").is_some()
+private read_origin(sub: Value, where: string) -> Result[Origin, string]
+    val has_git = sub.get("git").is_some()
+    val has_path = sub.get("path").is_some()
 
     // **A workspace member is named by the workspace, and by nothing else**: it is the directory the
     // root's list names, at whatever is on disk, so a coordinate, a path or a version beside it is a
     // second answer to a question the workspace already settled.
-    if conf_at(sub, "workspace").is_some()
+    if sub.get("workspace").is_some()
         if !read_yes_no(sub, where, "workspace", false)?
             return Err(s"'$where.workspace' is only ever 'true' — leave it out and name a 'git' " +
                 "coordinate or a 'path' instead")
 
-        if has_git || has_path || conf_at(sub, "version").is_some() || conf_at(sub, "rev").is_some()
+        if has_git || has_path || sub.get("version").is_some() || sub.get("rev").is_some()
             return Err(s"'$where' names 'workspace = true' and a 'git', 'path' or 'version' as well " +
                 "— a workspace member is the directory the workspace lists, at no version, so it " +
                 "is named by the workspace alone")
@@ -505,24 +505,24 @@ private read_origin(sub: &Conf, where: string) -> Result[Origin, string]
     if has_path
         // A path dependency is whatever is in that directory right now, so a version beside one is
         // not a weaker promise than it looks -- it is a promise nothing could keep.
-        if conf_at(sub, "version").is_some()
+        if sub.get("version").is_some()
             return Err(s"'$where' names a 'path' and a 'version' — a path dependency is the " +
                 "directory as it is now, and there is nothing to resolve a version against")
 
-        if conf_at(sub, "rev").is_some()
+        if sub.get("rev").is_some()
             return Err(s"'$where' names a 'path' and a 'rev' — a path dependency is the " +
                 "directory as it is now, and there is no repository to pin a commit of")
 
-        val dir = conf_text(sub, "path")
+        val dir = scalar_text(sub, "path")
 
         if dir.is_empty() then return Err(s"'$where.path' is empty")
 
         return Ok(Local(dir))
 
-    val coordinate = conf_text(sub, "git")
-    val has_rev = conf_at(sub, "rev").is_some()
+    val coordinate = scalar_text(sub, "git")
+    val has_rev = sub.get("rev").is_some()
 
-    if has_rev && conf_at(sub, "version").is_some()
+    if has_rev && sub.get("version").is_some()
         return Err(s"'$where' names a 'version' and a 'rev' — a dependency is read at a release or " +
             "at a pinned commit, and exactly one of the two says which")
 
@@ -530,7 +530,7 @@ private read_origin(sub: &Conf, where: string) -> Result[Origin, string]
     // moves and a tag already has `version`. It is lowercase hex since that is what git prints and
     // what `sysl.sum` records, so one commit is never two spellings.
     if has_rev
-        val sha = conf_text(sub, "rev")
+        val sha = scalar_text(sub, "rev")
 
         if !is_commit_sha(sha)
             return Err(s"'$where.rev' is '$sha', which is not a commit — a pin is a commit's sha, " +
@@ -540,11 +540,11 @@ private read_origin(sub: &Conf, where: string) -> Result[Origin, string]
         return Ok(Git(coordinate, release_at_rev(sha)))
     end if
 
-    if conf_at(sub, "version").is_none()
+    if sub.get("version").is_none()
         return Err(s"'$where' names a 'git' coordinate and neither a 'version' nor a 'rev' — a " +
             "coordinate says which repository, and a version or a pinned commit says which of it")
 
-    val version = release_of(conf_text(sub, "version")) match
+    val version = release_of(scalar_text(sub, "version")) match
         Err(why) -> return Err(s"'$where.version': $why")
         Ok(v) -> v
 
