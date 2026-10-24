@@ -70,6 +70,72 @@ val held = cheapest_capture(40)
 print(s"$bare $held ${hold.len()}")
 """
 
+// The same two measures of a child started by `fork` itself, from the same two heaps: what the
+// measure above would see if `sysl.process` went back to it.
+private psp_forking() -> string = """
+import sysl.posix.time.cpu_time
+import sysl.time.whole_micros
+import sysl.buf.{Buf, buf}
+
+extern fork() -> i32
+extern waitpid(pid: i32, code: *i32, options: i32) -> i32
+extern _exit(code: i32)
+
+// The cheapest of `n` children forked, each leaving at once and reaped, in microseconds of this
+// process's processor.
+cheapest_fork(n: long) -> long
+    var best: long = -1
+
+    for i in 0..<n
+        val t0 = cpu_time()
+        val pid = fork()
+
+        if pid == 0 then _exit(0)
+
+        var code: i32 = 0
+        val reaped = waitpid(pid, &code, 0)
+        val took = whole_micros(cpu_time() - t0)
+
+        if best < 0 || took < best then best = took
+
+    best
+end cheapest_fork
+
+val bare = cheapest_fork(40)
+var hold: Buf[string] = buf()
+
+for i in 0..<6000000
+    hold.push(s"object number $i, padded out a little further")
+
+val held = cheapest_fork(40)
+
+print(s"$bare $held ${hold.len()}")
+"""
+
+// The two cheapest children the program `src` reports, from an empty heap and from a large one.
+private psp_costs(src: string) -> Option[(long, long)]
+    val built = psp_built(src) match
+        None -> return None
+        Some(b) -> b
+
+    val said = capture(built.1, [], "", [], true)
+
+    remove_dir_all(built.0).unwrap_or(())
+
+    val out = said match
+        Err(_) ->
+            assert(false, "the program that was built could not be run")
+            return None
+        Ok(o) -> o
+
+    assert(out.status.ok(), out.text + out.err.unwrap_or(""))
+
+    val parts = fields(out.text)
+
+    assert(parts.len == 3 && parts[2] == "6000000", out.text)
+    Some((parse_long(parts[0].bytes).unwrap_or(0), parse_long(parts[1].bytes).unwrap_or(0)))
+end psp_costs
+
 @test("a child is started by posix_spawnp, which copies nothing of the parent")
 psp_a_child_is_spawned()
     val built = psp_built(psp_capturing()) match
@@ -90,28 +156,20 @@ end psp_a_child_is_spawned
 // spawn takes the same either way (about 1 ms).
 @test("a parent holding a large heap of small objects starts a child as fast as an empty one")
 psp_a_large_heap_costs_a_child_nothing()
-    val built = psp_built(psp_capturing()) match
+    val (bare, held) = psp_costs(psp_capturing()) match
         None -> return
-        Some(b) -> b
-
-    val said = capture(built.1, [], "", [], true)
-
-    remove_dir_all(built.0).unwrap_or(())
-
-    val out = said match
-        Err(_) ->
-            assert(false, "the program that was built could not be run")
-            return
-        Ok(o) -> o
-
-    assert(out.status.ok(), out.text + out.err.unwrap_or(""))
-
-    val parts = fields(out.text)
-
-    assert(parts.len == 3 && parts[2] == "6000000", out.text)
-
-    val bare = parse_long(parts[0].bytes).unwrap_or(0)
-    val held = parse_long(parts[1].bytes).unwrap_or(0)
+        Some(c) -> c
 
     assert(bare > 0 && held < 2 * bare, s"bare ${bare}us of processor, holding the heap ${held}us")
 end psp_a_large_heap_costs_a_child_nothing
+
+// The measure above can fail: a `fork` from under the same heap costs the parent well over twice what
+// it does from an empty one.
+@test("a fork from under the same heap costs more than twice as much, so the measure can tell")
+psp_a_fork_fails_the_measure()
+    val (bare, held) = psp_costs(psp_forking()) match
+        None -> return
+        Some(c) -> c
+
+    assert(bare > 0 && held >= 2 * bare, s"bare ${bare}us of processor, holding the heap ${held}us")
+end psp_a_fork_fails_the_measure
