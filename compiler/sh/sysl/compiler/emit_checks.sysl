@@ -588,8 +588,10 @@ end way_in_how
 //   freestanding machine whose block names an entry that never runs `main`, every way into that image
 //   reaching computed storage, as `check_image_storage` refuses it.
 //
-// A way in from a module that says it needs an operating system (`@requires(os)`) is passed over, and
-// the whole check is skipped where `bare_metal_possible` says the package cannot reach a bare machine.
+// Two kinds of way in are passed over though the refusal would name them (`way_passed_over`): one in
+// a dependency, whose own build is where its author is told, and one in a module that says it needs
+// an operating system (`@requires(os)`), which no bare build compiles at all. The whole check is
+// skipped where `bare_metal_possible` says the package cannot reach a bare machine.
 check_bare_metal_storage(a: &Analysis, p: TProgram, own: Buf[string], root: string, building_c: bool)
     if !a.tables.target.runs_initializers() then return
 
@@ -614,7 +616,7 @@ check_bare_metal_storage(a: &Analysis, p: TProgram, own: Buf[string], root: stri
             if entry == "" || entry == "main" then continue
 
             for r in storage_reads(a, p, image_ways_in(p, own, entry))
-                if holds_string(warned, r.way.name) || way_needs_os(a, r.way) then continue
+                if holds_string(warned, r.way.name) || way_passed_over(a, r.way) then continue
 
                 warned.push(r.way.name)
                 a.caution(func_home(a, r.way.name), r.way.span,
@@ -639,7 +641,7 @@ check_bare_metal_storage(a: &Analysis, p: TProgram, own: Buf[string], root: stri
     if runtime_entry && runtime_init_called(p) then return
 
     for r in storage_reads(a, p, exported_funcs(p, own))
-        if holds_string(warned, r.way.name) || way_needs_os(a, r.way) then continue
+        if holds_string(warned, r.way.name) || way_passed_over(a, r.way) then continue
 
         a.caution(func_home(a, r.way.name), r.way.span,
                   s"'${qualified_name(r.way.name)}' is exported and reaches ${r.named}, which is module " +
@@ -650,8 +652,13 @@ check_bare_metal_storage(a: &Analysis, p: TProgram, own: Buf[string], root: stri
                   "on a bare machine, say so with 'requires { os = true }' in sysl.hocon")
 end check_bare_metal_storage
 
-// Whether a way in lives in a module that says it needs an operating system.
-private way_needs_os(a: &Analysis, f: TFunc) -> bool = module_needs_os(a, func_home(a, f.name).module_name)
+// Whether a way in is not this package's to be told about: it lives in a dependency or the library,
+// whose own builds report it, or in a module that says it needs an operating system.
+private way_passed_over(a: &Analysis, f: TFunc) -> bool
+    val module_name = func_home(a, f.name).module_name
+
+    holds_string(a.tables.supplied_modules, module_name) || module_needs_os(a, module_name)
+end way_passed_over
 
 // Whether a module says it needs an operating system, which no bare machine has (`@requires(os)`, or a
 // capability implying it).
