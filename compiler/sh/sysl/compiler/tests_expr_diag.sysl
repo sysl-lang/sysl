@@ -20,6 +20,10 @@ end only
 
 private count(text: string) -> usize = expr_diagnostics(text).len()
 
+// A program that imports a form from the standard module, analysed with that module beside it: its
+// refusals rendered as the command line renders them, or its IR where there are none.
+private raw_said(text: string) -> string = xvr_ir([("main.sysl", text)])
+
 @test("a body whose expression is sound says nothing")
 a_sound_body_says_nothing()
     assert_eq(count("f(a: int, b: int) -> int = a + b\n"), 0)
@@ -273,11 +277,12 @@ a_member_default_reads_its_own_module()
 // what a build reported was an undefined symbol at the C link rather than a diagnostic.
 @test("'ptr_cast' takes the type it is given in brackets")
 ptr_cast_with_a_written_type()
-    assert_eq(count("struct Obj\n    tag: int\n\nf(p: *u8) -> int = ptr_cast[*Obj](p).tag\n"), 0)
+    assert(!raw_said("struct Obj\n    tag: int\n\nf(p: *u8) -> int = ptr_cast[*Obj](p).tag\n")
+           .contains("error: "))
 
 @test("and a pointer to a pointer nests, since '*' is one spelling in both grammars")
 ptr_cast_to_a_pointer_to_a_pointer()
-    assert_eq(count("f(p: *u8) -> *u8 = ptr_cast[**u8](p)[0]\n"), 0)
+    assert(!raw_said("f(p: *u8) -> *u8 = ptr_cast[**u8](p)[0]\n").contains("error: "))
 
 @test("a form that takes no type argument is told so, rather than reported as uncallable")
 a_special_form_with_no_type_arguments()
@@ -293,11 +298,12 @@ a_local_shadows_a_special_form()
 // parse. What reaches the refusal is something that parses as an expression and is not a type.
 @test("a type argument has to be one the expression grammar can spell")
 a_type_argument_with_no_spelling()
-    assert_eq(only("g(n: int) -> int = n\n\nf(p: *u8)\n    val q = ptr_cast[g(1)](p)\n"),
-              "this is not a type — what is written in the brackets is a type argument, and they " +
-              "read it out of the expression grammar, so a slice, a 'weak', a 'volatile', a " +
-              "vector and a callable have no spelling here. Annotate what receives the result and " +
-              "let the call infer it instead")
+    val said = raw_said("g(n: int) -> int = n\n\nf(p: *u8)\n    val q = ptr_cast[g(1)](p)\n")
+
+    assert(said.starts_with("error: this is not a type — what is written in the brackets is a type " +
+                            "argument, and they read it out of the expression grammar, so a slice, a " +
+                            "'weak', a 'volatile', a vector and a callable have no spelling here. Annotate " +
+                            "what receives the result and let the call infer it instead\n"), said)
 
 // -- an associated function reached through a generic type's name ---------------------------------
 //
@@ -371,7 +377,7 @@ private beside_library(text: string) -> string
     for item in library
         units.push(item)
 
-    units.push(parse(source_of("test.sysl", text)).program)
+    units.push(parse(source_of("test.sysl", forms_imported(text))).program)
 
     val done = analyze_bodies(units, host_target())
 

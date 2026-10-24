@@ -126,18 +126,27 @@ private call_read(cx: &Analyzer, span: Span, callee: Expr, args: Buf[Expr],
             // The rest take none, for the reason a non-generic function takes none -- there is
             // nothing for an argument to be an argument *of* -- and are told so rather than being
             // reported as uncallable.
+            val unbound = name.is_some() && cx.lookup(name.unwrap()).is_none()
+            val imported = if unbound then imported_form(cx, name.unwrap()) else None
+
             if name.is_some() && cx.lookup(name.unwrap()).is_none() &&
-               special_form_name(cx, name.unwrap())
+               (special_form_name(cx, name.unwrap()) || imported.is_some())
                 val written = name.unwrap()
+                val home = imported_form_home(written)
+
+                if imported.is_none() && home.is_some() then
+                    return form_not_imported(cx, head.span, written, home.unwrap())
+
+                val form = imported.unwrap_or(written)
                 val targ = Some(written_type_arg(cx, one))
 
-                if written == "va_arg"
-                    val va = va_form(cx, span, written, args, targ)
+                if form == "va_arg"
+                    val va = va_form(cx, span, form, args, targ)
 
                     if va.is_some() then return va.unwrap()
                 end if
 
-                if written == "ptr_cast" then return ptr_cast_call(cx, span, args, targ)
+                if form == "ptr_cast" then return ptr_cast_call(cx, span, args, targ)
 
                 // `slot_storage[T](n)` names the ELEMENT; the position the form fills is a view.
                 if written == "slot_storage" then
@@ -179,6 +188,13 @@ private call_read(cx: &Analyzer, span: Span, callee: Expr, args: Buf[Expr],
         TypeAttr(subject, attr, _, _) ->
             val name = attr_type_name(subject)
 
+            // `Pair[u8]::Bits(n)` -- the left side an instantiation written out in place.
+            if name.is_none()
+                val instance = type_attr_on_instance(cx, span, subject, attr, args)
+
+                if instance.is_some() then return instance.unwrap()
+            end if
+
             if name.is_none() || cx.lookup(name.unwrap()).is_some() then
                 return cx.err(span, s"'::$attr' is a type attribute, so its left side must be a " +
                               "type name")
@@ -202,7 +218,8 @@ private call_read(cx: &Analyzer, span: Span, callee: Expr, args: Buf[Expr],
 
             val dotted = module_path_of(cx, receiver, member)
 
-            if dotted.is_some() && names_a_function(cx, dotted.unwrap()) then
+            if dotted.is_some() && (names_a_function(cx, dotted.unwrap()) ||
+                                    imported_form(cx, dotted.unwrap()).is_some()) then
                 return named_call(cx, span, callee, dotted.unwrap(), args, expected)
 
             // `T.f(x)` -- a member called off a TRAIT's name, which is no value and no type of its
@@ -744,6 +761,16 @@ private special_form(cx: &Analyzer, span: Span, written: string, args: Buf[Expr]
     if name == written && special_form_word(name) && (cx.lookup(name).is_some() || names_a_reachable_function(cx, name))
         return None
 
+    // A form behind an import answers only where the file imported it, under whatever name the import
+    // gave it; written bare without one, it is told where it lives.
+    val imported = if cx.lookup(name).is_some() then None else imported_form(cx, name)
+    val home = imported_form_home(name)
+
+    if imported.is_none() && home.is_some() then
+        return Some(form_not_imported(cx, span, name, home.unwrap()))
+
+    val form = imported.unwrap_or(name)
+
     // `old(e)` is the value an argument had on entry, and it means something only inside an
     // `ensure` -- so it is a form there and an ordinary name everywhere else.
     if name == "old" && cx.olds.is_some() then return Some(old_call(cx, span, args))
@@ -769,11 +796,11 @@ private special_form(cx: &Analyzer, span: Span, written: string, args: Buf[Expr]
     if debug_form(cx, name) then return Some(debug_string(cx, span, args))
     if name == DebugPart then return Some(debug_part(cx, span, args))
 
-    if name == "str_cast" then return Some(str_cast_call(cx, span, args))
-    if name == "str_alias" then return Some(str_alias_call(cx, span, args))
+    if form == "str_cast" then return Some(str_cast_call(cx, span, args))
+    if form == "str_alias" then return Some(str_alias_call(cx, span, args))
 
-    if name == "va_start" || name == "va_end" || name == "va_copy" || name == "va_arg"
-        val va = va_form(cx, span, name, args, expected)
+    if form == "va_start" || form == "va_end" || form == "va_copy" || form == "va_arg"
+        val va = va_form(cx, span, form, args, expected)
 
         if va.is_some() then return va
 
@@ -801,7 +828,7 @@ private special_form(cx: &Analyzer, span: Span, written: string, args: Buf[Expr]
                     return Some(format_call(cx, span, args.at(0), spec, counts))
             _ -> ()
 
-    if name == "ptr_cast" then return Some(ptr_cast_call(cx, span, args, expected))
+    if form == "ptr_cast" then return Some(ptr_cast_call(cx, span, args, expected))
 
     if null_test_form(cx, name) then return Some(null_test_call(cx, span, args))
 
@@ -1020,6 +1047,65 @@ special_form_word(name: string) -> bool =
     name == "print" || name == "str" || name == "str_cast" ||
     name == "str_alias" || name == "va_start" || name == "va_end" || name == "va_arg" ||
     name == "va_copy" || name == "ptr_cast"
+
+// **The forms a file has to import**, and the module each one is imported from. They are still
+// answered by the compiler -- nothing in `sysl.raw` or `sysl.c` declares them -- but their names are
+// not in scope everywhere: a file names the reinterpreting casts and the C variadic forms it uses, so
+// a reader finds them by its imports.
+imported_form_home(name: string) -> Option[string] =
+    if name == "ptr_cast" || name == "str_cast" || name == "str_alias" then Some("sysl.raw")
+    else if name == "va_start" || name == "va_end" || name == "va_arg" || name == "va_copy" then
+        Some("sysl.c")
+    else None
+
+// The form a written name stands for through this file's imports, if it stands for one: a name
+// imported from the form's module (under its own spelling or another, with `as`), a bare name a
+// wildcard over that module offers, or a path through the module -- `raw.ptr_cast` after
+// `import sysl.raw`, or the whole `sysl.raw.ptr_cast`.
+private imported_form(cx: &Analyzer, written: string) -> Option[string]
+    val cut = last_dot_in(written)
+
+    if cut.is_some()
+        val whole = module_qualify(written[0..<cut.unwrap()], written[cut.unwrap() + 1..<written.bytes.len])
+
+        return form_at_key(module_bound_key(cx, written).unwrap_or(whole))
+    end if
+
+    val bound = cx.scope.imports.name_key(written)
+
+    if bound.is_some() then return form_at_key(bound.unwrap())
+
+    val home = imported_form_home(written)
+
+    if home.is_some() && holds_string(cx.scope.imports.wildcards, home.unwrap()) then
+        return Some(written)
+
+    None
+end imported_form
+
+// Whether a callee stands for the `ptr_cast` form, under whatever name this file's imports give it:
+// an alias, a path through `sysl.raw`, or the bare spelling (which, unimported, is then told where the
+// form lives). A name of the program's own is never the form.
+calls_ptr_cast(cx: &Analyzer, callee: Expr) -> bool = *callee.kind match
+    Ident(name) ->
+        if cx.lookup(name).is_some() || names_a_reachable_function(cx, name) then false
+        else name == "ptr_cast" || imported_form(cx, name).unwrap_or("") == "ptr_cast"
+    Field(receiver, member, _) ->
+        val dotted = module_path_of(cx, receiver, member)
+
+        dotted.is_some() && imported_form(cx, dotted.unwrap()).unwrap_or("") == "ptr_cast"
+    _ -> false
+
+// The form a key names, where the key is a form's own module and its name.
+private form_at_key(key: string) -> Option[string]
+    val split = module_split(key)
+    val home = imported_form_home(split.1)
+
+    if home.is_some() && home.unwrap() == split.0 then Some(split.1) else None
+
+// What an unimported use of a form is told: where it lives and the line that brings it in.
+private form_not_imported(cx: &Analyzer, span: Span, name: string, home: string) -> TExpr =
+    cx.err(span, s"'$name' is in $home: add 'import $home.$name'")
 
 // An explicit scalar conversion. Every pair that has a meaning is listed; nothing widens, narrows,
 // or changes representation without being written.

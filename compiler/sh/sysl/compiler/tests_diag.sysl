@@ -4,7 +4,6 @@ module sh.sysl.compiler
 import sh.sysl.parsing.*
 import sysl.buf.{Buf, buf}
 import sysl.text.Search
-import sysl.time.{monotonic, whole_micros}
 
 // What a compilation's worth of diagnostics looks like, and the undo log a speculative walk rewinds
 // through.
@@ -247,36 +246,27 @@ a_rewound_trial_reaches_nothing()
     a.uses_extern("tried_extern")
     assert_eq(a.externs_used().len(), 2)
 
-// The best of three: reaching `n` distinct names and then asking about each, in microseconds.
+// Reaching `n` distinct names and then asking about each, in microseconds of processor, a fresh
+// analysis made outside the measure.
 private reach_cost(n: usize) -> long
-    var best: long = -1
+    val a = analysis_for(host_target())
 
-    for round in 0..<3
-        val a = analysis_for(host_target())
-        val started = monotonic()
-
+    val took = processor_micros(() ->
         for i in 0..<n
             a.uses(s"f$i")
 
         for i in 0..<n
-            assert(a.used(s"f$i"))
+            assert(a.used(s"f$i")))
 
-        val took = whole_micros(monotonic() - started)
-
-        assert_eq(a.funcs_used().len(), n)
-
-        if best < 0 || took < best then best = took
-
-    best
+    assert_eq(a.funcs_used().len(), n)
+    took
 end reach_cost
 
-@test("reaching four times as many names costs about four times as much, not sixteen")
+@test("reaching eight times as many names costs about eight times as much, not sixty-four")
 reaching_is_linear()
-    val small = reach_cost(2000)
-    val large = reach_cost(8000)
-    val ratio = large / (if small > 0 then small else 1)
+    val g = growth_of(() -> reach_cost(4000), () -> reach_cost(4000 * GrowthFactor))
 
-    assert(ratio < 9, s"4x the names took ${ratio}x as long to reach (${small} us, then ${large} us)")
+    assert(g.linear(), g.said("reaching names"))
 
 private one_complaint(d: Placed) -> Buf[Placed]
     var out: Buf[Placed] = buf()

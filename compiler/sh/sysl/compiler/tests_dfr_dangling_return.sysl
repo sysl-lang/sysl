@@ -18,6 +18,10 @@ private dfr_said(src: string) -> string
     all
 end dfr_said
 
+// The same with the standard module beside the program, for a body that imports a form from it:
+// the refusals rendered as the command line renders them, or the module's IR where there are none.
+private dfr_with_std(src: string) -> string = xvr_ir([("main.sysl", src)])
+
 private dfr_refused(src: string, name: string)
     val said = dfr_said(src)
 
@@ -57,11 +61,12 @@ end dfr_a_by_value_parameter
 
 @test("dfr: a field of '(self)', through ptr_cast, is refused and pointed at '*self'")
 dfr_a_field_of_self_through_ptr_cast()
-    val said = dfr_said(dfr_pair() + "struct Ev\n    rec: Pair\n\n    key(self) -> *u8 = ptr_cast(&self.rec)\n")
+    val said = dfr_with_std(dfr_pair() + "struct Ev\n    rec: Pair\n\n    key(self) -> *u8 = ptr_cast(&self.rec)\n")
 
-    assert_eq(said, "the address of 'self' is returned, but '(self)' is a copy of the receiver in this " +
-              "frame, and its storage ends when the function returns — return the value itself, or " +
-              "take '*self', so the address is of the caller's value\n")
+    assert(said.starts_with("error: the address of 'self' is returned, but '(self)' is a copy of the receiver " +
+                            "in this frame, and its storage ends when the function returns — return the value " +
+                            "itself, or take '*self', so the address is of the caller's value\n"), said)
+    assert_eq(said.count_of("error: "), 1)
 end dfr_a_field_of_self_through_ptr_cast
 
 @test("dfr: a field of a local struct")
@@ -97,7 +102,8 @@ end dfr_a_value_made_in_place
 
 @test("dfr: a field reached through '*self' is the caller's storage")
 dfr_through_a_pointer_receiver() =
-    dfr_allowed(dfr_pair() + "struct Ev\n    rec: Pair\n\n    key(*self) -> *u8 = ptr_cast(&self.rec)\n")
+    assert(!dfr_with_std(dfr_pair() + "struct Ev\n    rec: Pair\n\n    key(*self) -> *u8 = ptr_cast(&self.rec)\n")
+           .contains("error: "))
 
 @test("dfr: a field reached through a '*T' parameter, and an element of a '[]T' parameter")
 dfr_through_a_pointer_parameter()

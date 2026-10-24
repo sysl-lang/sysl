@@ -4,22 +4,29 @@ module sh.sysl.compiler
 import sysl.buf.{Buf, buf}
 import sysl.fs.{exists, make_dir_all, make_temp_dir, remove_dir_all, write_text}
 import sysl.process.{capture, Status}
+import sysl.testing.skip
 import sysl.text.{join, replace_all, Search}
 
 // **A trace per task** (`library/sysl/sys/trace.c`, `sysl.debug.ErrorTraceStore` and
-// `use_error_trace`): on a freestanding target the error return trace is reached through a pointer,
-// `sysl_error_trace_current`, that starts at one static store, and a kernel points it at each task's
-// own; on a hosted one the trace stays the thread's own object and a switch copies it out and in.
+// `use_error_trace`): on a freestanding target the error return trace is the store a weak hook,
+// `sysl_error_trace_here`, answers. The default answers a pointer, `sysl_error_trace_current`, that
+// starts at one static store, and a kernel points it at each task's own -- or supplies a hook of its
+// own, per core or inside the task's MPU map. On a hosted target the trace stays the thread's own
+// object and a switch copies it out and in.
 //
 // The cells: the default with no switch, on the host and on every QEMU board; two stores switched
 // with a failure in hand; a switch in the middle of a deep chain and back; a switch inside a closure,
 // under a `defer`, in a loop, in a match arm and across two instantiations of a generic; a library
 // built apart; a `@no_alloc` module; an exported handler that fails while another store is current;
-// traces off; and the archive a board links, its undefined symbols and its storage.
+// traces off; and the archive a board links, its undefined symbols and its storage. With a hook of the
+// program's own: one store per core, and one at the top of a task's stack, an exported handler failing
+// on each; a `@no_alloc` module declaring the hook; `use_error_trace` beside it and beside the default;
+// the host, where it is not asked; and the archive and image a library's hook links into.
 //
 // Skipped: async tasks, which record into the trace of the thread running them and are a scheduler's
-// business rather than the switch's; and a store switched by a kernel's assembly, which writes the
-// same pointer `use_error_trace` does.
+// business rather than the switch's; a store switched by a kernel's assembly, which writes the same
+// pointer `use_error_trace` does; a hook written in a board's C, which the link treats as it does the
+// library's strong definition; and two real cores, which QEMU's boards here do not start.
 
 private etp_ready() -> bool = std_root().is_ok() && clang_available()
 
@@ -105,7 +112,7 @@ private etp_run_at(files: []const (string, string), level: string) -> (Status, s
         val at = s"$root/${files[i].0}"
 
         make_dir_all(parent_of(at).unwrap()).unwrap()
-        write_text(at, files[i].1).unwrap()
+        write_text(at, forms_imported_in(at, files[i].1)).unwrap()
 
     val exe = s"$root/built"
 
@@ -137,9 +144,9 @@ end etp_prints
 
 private etp_host(body: string) -> []const (string, string) = [("p.sysl", EtpHostHead + EtpChain + body)]
 
-// The same body on every QEMU board: a complaint per board that did not exit cleanly having printed
-// `want`.
-private etp_on_boards(body: string, want: string)
+// The same body on every QEMU board, beside a module `hook` holding `hook` where it is not empty: a
+// complaint per board that did not exit cleanly having printed `want`.
+private etp_on_boards(body: string, want: string, hook: string = "")
     var bad: Buf[string] = buf()
     var ran: usize = 0
 
@@ -148,6 +155,9 @@ private etp_on_boards(body: string, want: string)
 
         files.push(("p.sysl", EtpBoardHead + EtpChain + body))
         files.push(("board/board.sysl", qemu_board_module(b)))
+
+        if !hook.is_empty() then files.push(("hook/hook.sysl", hook))
+
         ran += 1
 
         qemu_boot(b, files) match
@@ -484,7 +494,11 @@ private val EtpKernel: string = raw"""
 
 // The kernel built as a thumb archive, with traces on or `off`: what `nm`, `nm -u`, `objdump -t` and
 // `objdump -h` say of it, or None where the tools are missing.
-private etp_thumb(off: bool) -> Option[(string, string, string, string)]
+private etp_thumb(off: bool) -> Option[(string, string, string, string, string)] = etp_thumb_with(off, "")
+
+// The same, with a library root holding a module `hook` -- `hook` its text -- handed to the build with
+// `--lib` and called from the entry, where `hook` is not empty.
+private etp_thumb_with(off: bool, hook: string) -> Option[(string, string, string, string, string)]
     val nm = "/opt/homebrew/bin/arm-none-eabi-nm"
     val objdump = "/opt/homebrew/bin/arm-none-eabi-objdump"
 
@@ -494,11 +508,13 @@ private etp_thumb(off: bool) -> Option[(string, string, string, string)]
     end if
 
     val root = replace_all(make_temp_dir("sysl-etp").unwrap(), "//", "/")
+    val lib = s"$root-lib"
+    val calls = if hook.is_empty() then "" else "hook.switch_to(1)\n    "
 
     make_dir_all(s"$root/kernel").unwrap()
     write_text(s"$root/kernel/kernel.sysl", EtpKernel).unwrap()
-    write_text(s"$root/main.sysl", "import kernel.fail_in\n\n@export(\"main\")\n" +
-                                   "entry() -> int = int(fail_in(0, 1) + fail_in(1, 2))\n").unwrap()
+    write_text(s"$root/main.sysl", "import kernel.fail_in\n\n@export(\"main\")\nentry() -> int\n    " +
+                                   calls + "int(fail_in(0, 1) + fail_in(1, 2))\n").unwrap()
 
     var args: Buf[string] = buf()
 
@@ -506,6 +522,13 @@ private etp_thumb(off: bool) -> Option[(string, string, string, string)]
         args.push(a)
 
     if off then args.push("--no-error-traces")
+
+    if !hook.is_empty()
+        make_dir_all(s"$lib/hook").unwrap()
+        write_text(s"$lib/hook/hook.sysl", hook).unwrap()
+        args.push("--lib")
+        args.push(lib)
+    end if
 
     var lines: Buf[string] = buf()
     val sink = &lines
@@ -518,9 +541,20 @@ private etp_thumb(off: bool) -> Option[(string, string, string, string)]
     val symbols = capture(objdump, ["-t", s"$root/app.a"], "", [], true).unwrap().text
     val headers = capture(objdump, ["-h", s"$root/app.a"], "", [], true).unwrap().text
 
+    // The archive linked into an image from `main`, the board's `memcpy` and `memset` left open: which
+    // definition of each symbol the link kept, read from the image's own symbol table.
+    var linked = ""
+    val image = s"$root/app.elf"
+    val made = capture("ld.lld", ["-e", "main", "-u", "main", "--unresolved-symbols=ignore-all",
+                                  s"$root/app.a", "-o", image], "", [], true)
+
+    if made.is_ok() && made.unwrap().status.ok()
+        linked = capture(nm, [image], "", [], true).unwrap().text
+
     remove_dir_all(root).unwrap_or(())
-    Some((all, undefined, symbols, headers))
-end etp_thumb
+    remove_dir_all(lib).unwrap_or(())
+    Some((all, undefined, symbols, headers, linked))
+end etp_thumb_with
 
 // The names `nm -u` lists that no member of the archive defines.
 private etp_unresolved(all: string, undefined: string) -> Buf[string]
@@ -595,3 +629,220 @@ etp_thumb_off_names_nothing()
     assert(!got.0.contains("sysl_error_trace") && !got.0.contains("sysl_trace"), got.0)
     assert(!got.1.contains("sysl_error_trace"), got.1)
 end etp_thumb_off_names_nothing
+
+// -- a hook of the program's own -------------------------------------------------------------------------
+
+// A hook answering one store per "core", the core being a variable the program flips -- what a CPU-ID
+// read is on a real part. `answer` makes it answer another store outright, which is how a test sees
+// what `use_error_trace` did to one. The module gave the allocator up and uses `?` itself.
+private val EtpPerCore: string = raw"""
+    module hook
+    @no_alloc
+
+    import sysl.debug.{error_trace, ErrorTraceStore}
+
+    var stores: [2]ErrorTraceStore = [ErrorTraceStore.new(), ErrorTraceStore.new()]
+    var core = 0
+    var forced: *ErrorTraceStore = null
+
+    @export("sysl_error_trace_here")
+    here() -> *ErrorTraceStore = if forced != null then forced else &stores[core]
+
+    switch_to(i: int)
+        core = i
+
+    answer(s: *ErrorTraceStore)
+        forced = s
+
+    open(n: int) -> Result[int, int] = if n > 0 then Err(n) else Ok(n)
+
+    load(n: int) -> Result[int, int]
+        val v = open(n)?
+        Ok(v)
+
+    held(n: int) -> usize
+        var got: usize = 0
+
+        load(n) match
+            Ok(_) -> ()
+            Err(_) ->
+                got = error_trace().len()
+
+        got
+    end held
+    """
+
+// A hook answering the store at the top of the running task's stack, which is where an OS behind an
+// MPU keeps it: inside the region the task may touch.
+private val EtpOnTheStack: string = raw"""
+    module hook
+
+    import sysl.debug.ErrorTraceStore
+
+    struct Stack
+        words: [48]u32
+        trace: ErrorTraceStore
+
+    var stacks: [2]Stack = [Stack([0; 48], ErrorTraceStore.new()), Stack([0; 48], ErrorTraceStore.new())]
+    var running = 0
+
+    @export("sysl_error_trace_here")
+    here() -> *ErrorTraceStore = &stacks[running].trace
+
+    switch_to(i: int)
+        running = i
+    """
+
+// Core 0 fails three frames deep and, with that in hand, core 1 fails and reports, and an exported
+// handler fails on each core; then core 0 reports its own chain, whole. Each handled failure leaves its
+// core's store as it found it.
+private val EtpCores: string = raw"""
+    @export("etp_hook_isr")
+    isr() -> usize
+        var n: usize = 0
+
+        load(3) match
+            Ok(_) -> ()
+            Err(_) ->
+                n = error_trace().len()
+
+        n
+    end isr
+
+    run(1) match
+        Ok(_) -> ()
+        Err(_) ->
+            hook.switch_to(1)
+
+            load(2) match
+                Ok(_) -> ()
+                Err(_) -> show("1", w)
+
+            w.write(s"isr on 1 holds ${isr()}\n".bytes)
+            hook.switch_to(0)
+            w.write(s"isr on 0 holds ${isr()}\n".bytes)
+            show("0", w)
+
+    hook.switch_to(1)
+    w.write(s"1 holds ${error_trace().len()}\n".bytes)
+    hook.switch_to(0)
+    w.write(s"0 holds ${error_trace().len()}\n".bytes)
+    """
+
+private etp_cores_said() -> string =
+    "1\n" + EtpTraceHead + EtpOpen + EtpLoad + "isr on 1 holds 2\nisr on 0 holds 5\n" +
+    "0\n" + EtpTraceHead + EtpOpen + EtpLoad + EtpRun + "1 holds 0\n0 holds 0\n"
+
+@test("a hook of the program's own keeps one trace per core apart, an exported handler's included")
+etp_hook_per_core()
+    etp_on_boards(EtpCores, etp_cores_said(), EtpPerCore)
+
+@test("a hook answering a store at the top of the task's stack keeps each task's trace there")
+etp_hook_on_the_stack()
+    etp_on_boards(EtpCores, etp_cores_said(), EtpOnTheStack)
+
+// A module that gave the allocator up records through the hook it declares, on either core.
+@test("a @no_alloc module declaring the hook uses '?' and records into the hook's store")
+etp_hook_no_alloc()
+    etp_on_boards(raw"""
+        run(1) match
+            Ok(_) -> ()
+            Err(_) ->
+                hook.switch_to(1)
+                w.write(s"no_alloc holds ${hook.held(1)}\n".bytes)
+                hook.switch_to(0)
+                w.write(s"0 holds ${error_trace().len()}\n".bytes)
+        """, "no_alloc holds 2\n0 holds 3\n", EtpPerCore)
+
+// With a hook of the program's own, `use_error_trace` still sets the default's pointer and answers
+// what it held -- and nothing records into the store it was handed, since the hook never answers it.
+private val EtpUseBesideAHook: string = raw"""
+    var x = ErrorTraceStore.new()
+
+    val own = use_error_trace(&x)
+
+    run(1) match
+        Ok(_) -> ()
+        Err(_) ->
+            w.write(s"the hook's store holds ${error_trace().len()}\n".bytes)
+            hook.answer(&x)
+            w.write(s"x holds ${error_trace().len()}\n".bytes)
+            hook.answer(null)
+
+    val back = use_error_trace(own)
+
+    w.write(if back == &x then "x was the default's\n".bytes else "x was not\n".bytes)
+    """
+
+@test("beside a hook of the program's own, use_error_trace sets the default's pointer, which is unread")
+etp_hook_use_error_trace()
+    etp_on_boards(EtpUseBesideAHook, "the hook's store holds 3\nx holds 0\nx was the default's\n",
+                  EtpPerCore)
+
+@test("with the default hook, use_error_trace makes the store current, as it always did")
+etp_default_hook_use_error_trace()
+    etp_on_boards(raw"""
+        var x = ErrorTraceStore.new()
+
+        val own = use_error_trace(&x)
+
+        run(1) match
+            Ok(_) -> ()
+            Err(_) -> show("x", w)
+
+        w.write(if use_error_trace(own) == &x then "x was current\n".bytes else "x was not\n".bytes)
+        """, "x\n" + EtpTraceHead + EtpOpen + EtpLoad + EtpRun + "x was current\n")
+
+// A hosted target keeps the trace as the thread's own object, so a program's hook is never asked:
+// flipping its core with a failure in hand leaves that failure where it was.
+@test("on a hosted target a hook of the program's own is not consulted: the thread's trace is kept")
+etp_hook_not_asked_on_the_host()
+    etp_prints([("p.sysl", EtpHostHead + EtpChain + EtpDefault + raw"""
+                    run(1) match
+                        Ok(_) -> ()
+                        Err(_) ->
+                            hook.switch_to(1)
+                            print("own", error_trace().len(), hook.held(1))
+                            hook.switch_to(0)
+                    """),
+                ("hook/hook.sysl", EtpPerCore)],
+               etp_default_said() + "own 3 5\n")
+
+@test("a thumb archive defines the default hook weakly beside the pointer it answers")
+etp_thumb_default_hook()
+    if !etp_ready() then return
+
+    val got = etp_thumb(false) match
+        Some(g) -> g
+        None -> return
+
+    assert(got.0.contains(" W sysl_error_trace_here"), got.0)
+    assert(!got.0.contains(" T sysl_error_trace_here"), got.0)
+    assert(got.4.is_empty() || got.4.contains(" W sysl_error_trace_here"), got.4)
+end etp_thumb_default_hook
+
+// A library built apart supplies the hook: its strong definition sits in the archive beside the
+// default, every symbol still resolves, and the image keeps the library's.
+@test("a hook from a library built apart is the definition a thumb image keeps")
+etp_thumb_hook_from_a_library()
+    if !etp_ready() then return
+
+    val got = etp_thumb_with(false, EtpPerCore) match
+        Some(g) -> g
+        None -> return
+
+    reset_search_paths()
+
+    val left = etp_unresolved(got.0, got.1)
+
+    for name in left
+        assert(name == "memcpy" || name == "memset", s"'$name' is left for the board:\n${got.1}")
+
+    assert(got.0.contains(" T sysl_error_trace_here"), got.0)
+    assert(got.0.contains(" W sysl_error_trace_here"), got.0)
+
+    if got.4.is_empty() then skip("ld.lld could not link the archive into an image")
+
+    assert(got.4.contains(" T sysl_error_trace_here"), got.4)
+    assert(!got.4.contains(" W sysl_error_trace_here"), got.4)
+end etp_thumb_hook_from_a_library

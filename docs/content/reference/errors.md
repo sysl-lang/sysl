@@ -525,9 +525,10 @@ and counts the rest:
 ```
 
 A task records into the trace of the thread running it, and an `await t?` that fails is a hop at the
-`await`. On a freestanding target there is no thread-local storage under it: the trace is reached
-through a pointer, `sysl_error_trace_current`, which starts at one static store laid down in the
-image, so a program with one flow of control has one trace and nothing to set up.
+`await`. On a freestanding target there is no thread-local storage under it: the trace is the store
+a hook answers, and the default hook answers a pointer, `sysl_error_trace_current`, which starts at
+one static store laid down in the image, so a program with one flow of control has one trace and
+nothing to set up.
 
 ### A trace per task
 
@@ -593,7 +594,8 @@ reports its whole chain when it is switched back in.
   before a store is made current, never to the current one. What a store holds is read only through
   `sysl.debug` while it is current.
 - **On a freestanding target the switch is one store of a pointer**, and recording or pruning pays
-  one load more than a plain object would. A kernel's switch code written in assembly may write
+  one call to the [hook](#a-trace-per-core-or-inside-the-task-s-own-map) that answers it — never a
+  `?` that succeeds. A kernel's switch code written in assembly may write
   `sysl_error_trace_current` itself. On a hosted target the trace stays the thread's own object, so
   recording pays nothing for the switch: `use_error_trace` copies the live trace out to the store
   that was current and the new one in.
@@ -602,6 +604,42 @@ reports its whole chain when it is switched back in.
   its own current on entry and puts the previous one back on the way out.
 - With [traces off](#switching-it-off) none of this exists: `use_error_trace` does nothing and
   answers `null`, and no symbol of the trace is linked.
+
+### A trace per core, or inside the task's own map
+
+**On a freestanding target the trace is the store `sysl_error_trace_here()` answers**, a weak hook
+called on every failure path that records or prunes and by every read of the trace. The default
+answers `sysl_error_trace_current`, the pointer `use_error_trace` sets, which is all a kernel with one
+core and no memory protection needs. One image-wide word is not enough everywhere: on two cores each
+core's context switch overwrites the other's choice, and behind an MPU unprivileged code cannot read
+a word in the kernel's data — nor can the word be mapped read-only to the task, since the kernel's
+own write on the switch then faults. **A board or an OS supplies its own hook** under the same
+symbol, exported from sysl or written in its C, and the link keeps it in place of the default:
+
+```sysl build=c target=thumbv7em-freestanding
+import sysl.debug.ErrorTraceStore
+
+var traces: [2]ErrorTraceStore = [ErrorTraceStore.new(), ErrorTraceStore.new()]
+
+// The board's own: which core is running (on an RP2350, a read of SIO's CPUID register).
+extern "board_core_id" core_id() -> u32
+
+@export("sysl_error_trace_here")
+trace_here() -> *ErrorTraceStore = &traces[core_id() & 1]
+```
+
+An OS behind an MPU answers instead the store it keeps at the top of the running task's stack,
+inside the region the task may touch.
+
+- **The hook is called from anywhere a `?` runs** — a task, an interrupt handler, unprivileged code —
+  and may be called often: once per failure recorded, and twice per statement that handles one.
+- **It must not fail, allocate, or use `?`**, and it must answer a valid store every time, never
+  `null`. It runs inside the recording, so a failure of its own would record through itself.
+- **`use_error_trace` is the default hook's setter.** Beside a hook of the program's own it still
+  sets `sysl_error_trace_current` and answers what it held, and nothing records into that store unless
+  the hook reads the pointer: which store is current is the OS's to decide.
+- **On a hosted target the hook is never asked**: the trace is the thread's own object, as above.
+- With [traces off](#switching-it-off) the default hook is not linked, and nothing calls one.
 
 ### `unwrap` and `expect` show the error, then the trace
 
@@ -870,6 +908,8 @@ traps on bits that match no variant; passed directly to `try`, the field's bits 
 and validated:
 
 ```sysl
+import sysl.raw.ptr_cast
+
 enum Ec: u6
     Unknown = 0x00
     Brk = 0x3c
