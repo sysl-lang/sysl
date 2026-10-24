@@ -3199,12 +3199,40 @@ hold(Thing(1))
 this makes a '&Thing' out of a copy of a 'Thing' value, and 'Thing' has a 'Drop' — the copy would be a second owner of the resource, and its destructor would run once for each. Only building one makes a '&Thing': hand over the reference that already holds it
 ```
 
-**A generic is asked at the instantiation.** `id[T](x: T) -> T` called with `*r` binds `T` to the
-type by value, and the call is refused naming the parameter — `'id' binds its 'T' to 'Thing' by
-value…` — rather than anything inside `id`, which the caller did not write. Called with the
-reference, `T` is `&Thing` and nothing is asked; and a signature that reaches `T` only through a
+**A generic's signature is asked at the instantiation.** `id[T](x: T) -> T` called with `*r` binds
+`T` to the type by value, and the call is refused naming the parameter — `'id' binds its 'T' to
+'Thing' by value…` — rather than anything inside `id`, which the caller did not write. Called with
+the reference, `T` is `&Thing` and nothing is asked; and a signature that reaches `T` only through a
 reference — `keep[T](x: &T) -> &T` — may bind it to `Thing` itself, since nothing it declares holds
 one by value.
+
+**Its body is asked too, once per instance, at the types it was made at** — a library's generic
+bodies and a trait's default read at the implementing type among them. A signature that reaches `T`
+only through a reference still lets the body copy one out, and at `T = Thing` that copy is a second
+owner of the handle. The line the refusal points at is the same for every instance, so the message
+says which instance it is and the call that asked for it, one link per generic in between:
+
+```sysl
+struct Thing
+    n: int
+
+impl Drop for Thing
+    drop(self) = print("drop", self.n)
+
+peek[T](r: &T) -> int
+    val copy = *r
+    0
+
+print(peek(&int(1)))
+print(peek(Thing(2)))
+```
+
+```error
+'copy' holds 'Thing' by value and 'Thing' has a 'Drop' — a type with a destructor is a reference type, and building one makes a '&Thing'. Write '&Thing' in its place (in 'peek[Thing]', called from
+```
+
+At `T = int` the same body is fine. An instance whose own signature was refused at its call says
+nothing more: everything inside it follows from that one complaint.
 
 **`@consumes` is unchanged**, and there is no use-after-move: a `&T` is shared and counted exactly as
 every other reference is.

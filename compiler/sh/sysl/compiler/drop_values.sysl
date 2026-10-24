@@ -16,12 +16,18 @@ import sysl.container.{Set, set}
 // reference hands the method a copy, and the reference keeps owning the resource. `drop(self)` is one
 // such method.
 //
-// **A generic is refused at the instantiation, never inside its body**: a call whose type argument
-// holds a `Drop` type by value is refused at the call, naming the parameter and the argument
-// (`expr_generic.sysl`), and a generic type written at one is refused where it is written, as any
-// other spelling is. A body read at type arguments is not asked again, so the complaint is always
-// about something the caller wrote. Binding a parameter to one needs a by-value value of the type in
-// the first place, and the only ones a program has are `self` and a `*r` read out of a reference.
+// **A generic's signature is refused at the instantiation**: a call whose type argument holds a
+// `Drop` type by value in a parameter or the result is refused at the call, naming the parameter and
+// the argument (`expr_generic.sysl`), and a generic type written at one is refused where it is
+// written, as any other spelling is.
+//
+// **A generic's BODY is asked too, once per instance, at the types it was made at**, and so is a body
+// the library wrote (a trait's default read at the implementing type among them). A signature that
+// reaches `T` only through a `&T` still lets a body write `val x = *r`, which at `T = Value` is a
+// second owner of the one handle -- the double free nothing in the signature shows. The line such a
+// refusal points at is the same for every instance, so it says which instance it is and the chain of
+// calls that asked for it (`refused_in`). An instance whose own signature was refused at its call
+// says nothing more: everything in it is a consequence of that one complaint.
 
 // Whether a type is a struct or an enum whose family has an `impl Drop`.
 has_drop(a: &Analysis, t: Type) -> bool
@@ -134,14 +140,15 @@ end held_by_reference
 // **A copy is a second owner of the same resource**: a `val r: &Encoder = *other` or a `&Encoder`
 // made from a method's `self` would put the one handle in two boxes, and its destructor would run
 // once for each. Only a construction makes a new resource, so it is the only value that may be
-// boxed. Within a body read at type arguments the question is answered where they were chosen.
+// boxed. Within a body read at type arguments it is asked at the types the instance was made at.
 boxes_a_copy(cx: &Analyzer, t: TExpr) -> bool =
-    !passes_on(cx.an, cx.scope, cx.subst) && !constructs(t) && has_drop(cx.an, texpr_type(t)) && !failed(t)
+    !told_at_the_call(cx.an, cx.scope, cx.subst, cx.func_name) && !constructs(t) &&
+        has_drop(cx.an, texpr_type(t)) && !failed(t)
 
-// Whether the body being read **passes on** types somebody else chose, so that a `Drop` type held
-// by value in it was asked about where it was chosen: a body read at type arguments, and anything the
-// library wrote (a trait's default read at the implementing type among them). A method's own `Self`
-// is not such an argument -- the method was written about that one type.
+// Whether the body being read **passes on** types somebody else chose, so that a refusal inside it
+// has to say which instance it is about: a body read at type arguments, and anything the library
+// wrote (a trait's default read at the implementing type among them). A method's own `Self` is not
+// such an argument -- the method was written about that one type.
 passes_on(a: &Analysis, scope: Scope, subst: Buf[Binding]) -> bool
     if from_library(a, scope) then return true
 
@@ -153,13 +160,112 @@ end passes_on
 
 private failed(t: TExpr) -> bool = texpr_type(t) == Unknown
 
-copy_box_refusal(t: Type) -> string
+copy_box_refusal(cx: &Analyzer, t: Type) -> string
     val name = type_show(t)
 
-    s"this makes a '&$name' out of a copy of a '$name' value, and '$name' has a 'Drop' — the copy would " +
-        s"be a second owner of the resource, and its destructor would run once for each. Only " +
-        s"building one makes a '&$name': hand over the reference that already holds it"
+    refused_in(cx.an, cx.scope, cx.subst, cx.func_name,
+               s"this makes a '&$name' out of a copy of a '$name' value, and '$name' has a 'Drop' — the " +
+                   s"copy would be a second owner of the resource, and its destructor would run once " +
+                   s"for each. Only building one makes a '&$name': hand over the reference that already " +
+                   "holds it")
 end copy_box_refusal
+
+// -- inside a body read at type arguments --------------------------------------------------------
+
+// Where an instance was first asked for: the body that asked, and the file and line of the call.
+struct AskedFrom
+    by: string
+    file: string
+    line: usize
+end AskedFrom
+
+// Records the call at `at`, in the body `cx` reads, as where the instance `name` was asked for, and
+// hands the name back. **The first asker is the one kept**: every later call reaches the same body,
+// which is read once, so the chain a refusal in it names is the first one that led there.
+asked(cx: &Analyzer, at: Span, name: string) -> string
+    if name == "" then return name
+
+    val table = cx.an.tables.members.asked_from
+
+    if !table.has(name) then
+        table.put(name, AskedFrom(cx.func_name, cx.scope.src.name, cx.scope.src.locate(at.start).line))
+
+    name
+end asked
+
+// Whether the instance being read was refused at the call that asked for it -- its own signature
+// holds a `Drop` type by value, past `self` -- so that nothing its body does is said again.
+told_at_the_call(a: &Analysis, scope: Scope, subst: Buf[Binding], func_name: string) -> bool
+    if !passes_on(a, scope, subst) then return false
+
+    val sig = a.tables.members.func_insts.get(func_name)
+
+    if sig.is_none() then return false
+    if drop_held(a, sig.unwrap().ret).is_some() then return true
+
+    for p in sig.unwrap().params
+        if p.0 != "self" && drop_held(a, p.1).is_some() then return true
+
+    false
+end told_at_the_call
+
+// Whether a generic call in the body being read is asked whether it binds a type parameter to a
+// `Drop` type by value: in a body written about its own types, and in an instance of a generic the
+// program wrote -- one generic handing a copy to another is the same mistake one call further in.
+// **Never in a body the library or the compiler wrote around a method's `self`** (a trait's default,
+// a supplied `Debug`), which hands its copy on as any method may, and whose callee is asked about
+// what it does with it.
+calls_are_asked(cx: &Analyzer) -> bool
+    if !passes_on(cx.an, cx.scope, cx.subst) then return true
+
+    !from_library(cx.an, cx.scope) && cx.an.tables.members.func_origin.has(cx.func_name) &&
+        !told_at_the_call(cx.an, cx.scope, cx.subst, cx.func_name)
+
+// A refusal told inside the body being read. **One read at type arguments says which instance it
+// is, and the calls that asked for it**, since the line it points at is the same line for every
+// instance: `(in 'keep[Value]', called from main.sysl:12)`, each further link of a chain of instances
+// adding `in '…', called from …`.
+refused_in(a: &Analysis, scope: Scope, subst: Buf[Binding], func_name: string, message: string) -> string
+    if !passes_on(a, scope, subst) then return message
+
+    s"$message (${instance_chain(a, func_name, subst)})"
+
+private instance_chain(a: &Analysis, name: string, subst: Buf[Binding]) -> string
+    val table = a.tables.members.asked_from
+    var out = s"in '${instance_shown(a, name, subst)}'"
+    var at = name
+    var depth = 0
+
+    // Bounded, because a recursive generic asks for itself.
+    while depth < 8
+        val from = table.get(at)
+
+        if from.is_none() then break
+
+        out = out + s", called from ${from.unwrap().file}:${from.unwrap().line}"
+
+        val by = from.unwrap().by
+
+        if !table.has(by) || by == at then break
+
+        out = out + s" in '${instance_shown(a, by, a.tables.members.func_substs.get(by).unwrap_or(buf()))}'"
+        at = by
+        depth += 1
+    end while
+
+    out
+end instance_chain
+
+// An instance as a reader writes it: the declaration's name with the types it was made at.
+private instance_shown(a: &Analysis, name: string, subst: Buf[Binding]) -> string
+    val base = qualified_name(a.tables.members.func_origin.get(name).unwrap_or(name))
+    var shown: Buf[string] = buf()
+
+    for b in subst
+        if b.name != "Self" then shown.push(type_show(b.ty))
+
+    if shown.is_empty() then base else s"$base[${joined(shown, ", ")}]"
+end instance_shown
 
 private constructs(t: TExpr) -> bool = *t.kind match
     TStructNew(_, _) -> true

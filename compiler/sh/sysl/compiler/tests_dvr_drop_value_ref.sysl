@@ -16,7 +16,14 @@ import sysl.process.capture
 // method's `self`, a generic call) × **where a construction lands** (an inferred local, a temporary,
 // a branch, a field, a container, an `Option`, a trait object, a `&sync`, a generic, a call at its
 // last use) × **the build** (one file, a library root's compiled artifact, a bare Thumb archive,
-// `@no_alloc`).
+// `@no_alloc`) × **the body it is in** (written once; a generic's instance, at a `Drop` type and at
+// `int`; one reached through another generic; a generic method; a method of a generic type; a
+// library root's generic).
+//
+// Inside a body read at type arguments, also skipped: a trait's default read at the implementing
+// type (read through the same `Analyzer.bind` and `boxes_a_copy` an instance is, at `Self`); the
+// standard library's own generics (the same path as a library root's, and `--std` with the census
+// asks them of every program that reaches them).
 //
 // Skipped, with the reason: a nested function's parameter (bound through the same `Analyzer.bind` a
 // closure's is, which is asked); a codegen-unit split (the refusal is analysis, and the boxing is the
@@ -186,6 +193,96 @@ dvr_erase_a_copy()
     dvr_refused(text, dvr_copy("Enc"))
 end dvr_erase_a_copy
 
+// -- inside a body read at type arguments --------------------------------------------------------
+
+// The line of the program `text` makes (behind `dvr_enc`) that the first `needle` is on.
+private dvr_line(text: string, needle: string) -> usize
+    val full = dvr_enc + text
+
+    full.slice(0, full.index_of(needle).unwrap()).count_of("\n") + 1
+
+// Asserts the program is refused exactly once with `message`, said inside the instances `chain`
+// names innermost first, each with the text of the call that asked for it.
+private dvr_refused_in(text: string, message: string, chain: [](string, string))
+    if !lbr_ready() then return
+
+    val prog = lbr_program(dvr_enc + text)
+    val out = lbr_run(prog, [])
+    var links: Buf[string] = buf()
+
+    for link in chain
+        links.push(s"in '${link.0}', called from $prog:${dvr_line(text, link.1)}")
+
+    lbr_drop([prog])
+
+    val said = s"$message (${joined(links, " ")})"
+
+    assert(out.starts_with("refused: "), out)
+    assert_eq(out.count_of(said), usize(1), out)
+    assert_eq(out.count_of("error:"), usize(1), out)
+end dvr_refused_in
+
+// Asserts the program builds and prints `want`.
+private dvr_runs(text: string, want: string)
+    if !lbr_ready() then return
+
+    assert_eq(dvr_run(text), want)
+
+private val dvr_keep: string = "keep[T](r: &T) -> int\n    val x = *r\n    0\n\n"
+
+@test("a generic body binding a copy is refused at a Drop type, naming the instance and its call")
+dvr_generic_body_binding()
+    dvr_refused_in(dvr_keep + "print(keep(Enc(1)))\n", dvr_said("'x' holds", "Enc"),
+                   [("keep[Enc]", "print(keep(Enc")])
+
+@test("the same generic body is accepted at int")
+dvr_generic_body_int()
+    dvr_runs(dvr_keep + "print(keep(&int(3)))\n", "0\n")
+
+@test("a generic body boxing a copy is refused at a Drop type, naming the instance")
+dvr_generic_body_copy_box()
+    dvr_refused_in("wrap[T](r: &T) -> &T\n    val c: &T = *r\n    c\n\nprint(wrap(Enc(1)).id)\n",
+                   dvr_copy("Enc"), [("wrap[Enc]", "print(wrap(")])
+
+@test("a generic body boxing a copy is accepted at int")
+dvr_generic_body_copy_box_int()
+    dvr_runs("wrap[T](r: &T) -> &T\n    val c: &T = *r\n    c\n\nval n: &int = 4\nprint(*wrap(n))\n", "4\n")
+
+@test("a generic reached through another names every link of the chain")
+dvr_generic_nested()
+    dvr_refused_in(dvr_keep + "outer[T](r: &T) -> int = keep(r)\n\nprint(outer(Enc(1)))\n",
+                   dvr_said("'x' holds", "Enc"),
+                   [("keep[Enc]", "= keep(r)"), ("outer[Enc]", "print(outer(")])
+
+@test("a call inside a generic body binding its callee to one by value is refused there, naming the instance")
+dvr_generic_nested_call()
+    dvr_refused_in("id[T](x: T) -> T = x\n\npass[T](r: &T) -> int\n    val got = id(*r)\n    0\n\n" +
+                   "print(pass(Enc(1)))\n",
+                   dvr_said("'id' binds its 'T' to", "Enc"), [("pass[Enc]", "print(pass(")])
+
+@test("an instance refused at its own call says nothing more from its body")
+dvr_generic_told_once()
+    dvr_refused("id[T](x: T) -> T\n    val y = x\n    y\n\nhold(r: &Enc)\n    print(id(*r).id)\n\n" +
+                "hold(Enc(1))\n", dvr_said("'id' binds its 'T' to", "Enc"))
+
+@test("a generic method's body is asked at its own type argument")
+dvr_generic_method()
+    dvr_refused_in("struct Holder\n    n: int\n\nimpl Holder\n    look[T](self, r: &T) -> int\n" +
+                   "        val z = *r\n        self.n\n\nprint(Holder(1).look(Enc(2)))\n",
+                   dvr_said("'z' holds", "Enc"), [("Holder.look[Enc]", "print(Holder(")])
+
+// The type is never bound by value -- `Box[Enc]` is only a temporary -- since a binding of one is
+// refused for holding the argument, whatever the fields hold.
+@test("a method of a generic type keeps self exempt and is asked about what its body copies")
+dvr_generic_type_self()
+    val decl = "struct Box[T]\n    v: &T\n\nimpl[T] Box[T]\n    me(self) -> int = 7\n\n" +
+               "    peek(self) -> int\n        val y = *self.v\n        0\n\n"
+
+    dvr_runs(decl + "print(Box(Enc(1)).me())\n", "7\ndrop 1\n")
+    dvr_refused_in(decl + "print(Box(Enc(1)).peek())\n", dvr_said("'y' holds", "Enc"),
+                   [("Box.peek[Enc]", "print(Box(")])
+end dvr_generic_type_self
+
 @test("@consumes on a member of a Drop type still refuses the read after it")
 dvr_consumes_refused()
     val text = "impl Enc\n    @consumes\n    finish(self) -> int = self.id\n\n" +
@@ -343,6 +440,33 @@ dvr_library_refused()
     assert(out.starts_with("refused: "), out)
     assert_eq(out.count_of(dvr_said("'a' holds", "demo.Enc")), usize(1), out)
 end dvr_library_refused
+
+private val dvr_peek: string = raw"""
+    module peeks
+
+    peek[T](r: &T) -> int
+        val copy = *r
+        0
+    """
+
+@test("a library root's generic body is asked at the program's Drop type, and fine at int")
+dvr_library_generic_body()
+    if !lbr_ready() then return
+
+    val lib = lbr_tree(lbr_one("peeks/peeks.sysl", dvr_peek))
+    val text = "import peeks.peek\n\nprint(peek(&int(1)))\nprint(peek(Enc(2)))\n"
+    val prog = lbr_program(dvr_enc + text)
+    val out = lbr_run(prog, [lib])
+    val fine = lbr_program("import peeks.peek\n\nprint(peek(&int(1)))\n")
+    val ran = lbr_run(fine, [lib])
+
+    lbr_drop([lib, prog, fine])
+    assert(out.starts_with("refused: "), out)
+    assert_eq(out.count_of(dvr_said("'copy' holds", "Enc") +
+                           s" (in 'peeks.peek[Enc]', called from $prog:${dvr_line(text, "print(peek(Enc")})"),
+              usize(1), out)
+    assert_eq(ran, "0\n")
+end dvr_library_generic_body
 
 // -- a bare Thumb archive ------------------------------------------------------------------------
 

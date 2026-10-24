@@ -550,19 +550,21 @@ struct Analyzer
     // once** (`drop_values.sysl`). A method's `self` is the one exception: it is the copy a call
     // through the reference hands the method, and the reference still owns the resource. A name no
     // program can write is the compiler's own temporary, and the value it holds was refused, or
-    // allowed, where it was written. A body read at type arguments is not asked: an argument that
-    // holds one by value is refused at the call or the spelling that chose it.
+    // allowed, where it was written. A body read at type arguments is asked at those types, and says
+    // which instance it is -- unless the call that asked for the instance was refused already.
     private refuse_drop_binding(*self, name: string, ty: Type, named: Option[Span])
         if name == "self" || name.starts_with("$") then return
 
-        if passes_on(self.an, self.scope, self.subst) then return
+        if told_at_the_call(self.an, self.scope, self.subst, self.func_name) then return
 
         val at = self.declared_at(named)
 
         if at.is_none() then return
 
         drop_held(self.an, ty) match
-            Some(held) -> self.fault(at.unwrap(), drop_value_refusal(s"'$name' holds", ty, held))
+            Some(held) ->
+                self.fault(at.unwrap(), refused_in(self.an, self.scope, self.subst, self.func_name,
+                                                   drop_value_refusal(s"'$name' holds", ty, held)))
             None -> ()
     end refuse_drop_binding
 

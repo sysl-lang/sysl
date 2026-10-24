@@ -101,7 +101,7 @@ written_generic_call(cx: &Analyzer, span: Span, written: string, targ_exprs: Buf
     if !stand_ins_hold(cx.an, f.scope, cx.scope, span, key, decl, decl.tparams, targs) then
         return bad_expr(span)
 
-    val name = instantiate_func(cx.an, f.scope, decl, targs, false)
+    val name = asked(cx, span, instantiate_func(cx.an, f.scope, decl, targs, false))
     val sig = cx.an.tables.members.func_insts.get(name)
 
     if sig.is_none() then return bad_expr(span)
@@ -497,7 +497,7 @@ generic_call_with(cx: &Analyzer, span: Span, written: string, key: string, f: Fu
                               s"'${found.unwrap().0}': ${found.unwrap().1}")
         end if
 
-    val name = instantiated(cx, f, targs, nested)
+    val name = asked(cx, span, instantiated(cx, f, targs, nested))
     val sig = cx.an.tables.members.func_insts.get(name)
 
     if sig.is_none() then return bad_expr(span)
@@ -508,18 +508,20 @@ generic_call_with(cx: &Analyzer, span: Span, written: string, key: string, f: Fu
     // **A type with a `Drop` is a reference type, and an instantiation whose signature holds one by
     // value is refused here, at the call that asked for it** -- never inside the generic body, whose
     // bindings would name a declaration the caller did not write (`drop_values.sysl`). `T` bound to
-    // the type is fine where the signature only reaches it through a `&T`. A body that is itself read
-    // at type arguments -- an instance, a trait's default at its implementing type -- passes on what
-    // it was given, and was asked where that was chosen.
-    if !passes_on(cx.an, cx.scope, cx.subst) && signature_holds_drop(cx.an, sig.unwrap(), skip)
+    // the type is fine where the signature only reaches it through a `&T`. A call inside a body that
+    // is a generic's instance is asked at its types and says which instance it is in
+    // (`calls_are_asked`).
+    if calls_are_asked(cx) && signature_holds_drop(cx.an, sig.unwrap(), skip)
         for i in 0..<targs.len()
             if i >= decl.tparams.len() then break
 
             val held = drop_held(cx.an, targs.at(i))
 
             if held.is_some() then
-                return cx.err(span, drop_value_refusal(s"'$written' binds its '${decl.tparams.at(i)}' to",
-                                                       targs.at(i), held.unwrap()))
+                return cx.err(span, refused_in(cx.an, cx.scope, cx.subst, cx.func_name,
+                                               drop_value_refusal(s"'$written' binds its " +
+                                                                  s"'${decl.tparams.at(i)}' to",
+                                                                  targs.at(i), held.unwrap())))
         end for
     end if
 
