@@ -2402,18 +2402,25 @@ to.
 its value fills and no signature can say that, but its name is not in scope everywhere: a file names
 the raw-tier casts it makes, so every reinterpretation in a program is found by its imports. An
 alias (`import sysl.raw.ptr_cast as pc`), a wildcard (`import sysl.raw.*`) and a path through the
-module (`raw.ptr_cast(p)` after `import sysl.raw`) reach it as they reach anything else. Written bare
-without one, it is told where it lives:
+module (`raw.ptr_cast(p)` after `import sysl.raw`) reach it as they reach anything else. **The
+import is required.** Written bare without one, the form still answers in 0.6.x, with a warning
+naming the line to add — once per file per form, however many casts the file makes — and from 0.7.0
+it is refused:
 
 ```sysl
 var arena: [8]u8 = [0u8; 8]
 val p: *u32 = ptr_cast(&arena[0])
+val q: *u8 = ptr_cast(&arena[4])
 
-print(*p)
+print(*p, *q)
 ```
 
-```error
-'ptr_cast' is in sysl.raw: add 'import sysl.raw.ptr_cast'
+```output
+0 0
+```
+
+```
+warning: 'ptr_cast' is in sysl.raw: add 'import sysl.raw.ptr_cast' (this is refused from 0.7.0)
 ```
 
 A function or a local the reader names `ptr_cast` is what a call reaches, imported or not; importing

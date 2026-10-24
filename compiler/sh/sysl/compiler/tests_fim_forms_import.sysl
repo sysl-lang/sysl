@@ -10,7 +10,8 @@ import sysl.text.{join, replace_all}
 // `va_` forms from `sysl.c`. The compiler still answers each of them -- nothing in either module
 // declares one -- but the name is in scope only where the file imported it: by name, under another
 // name with `as`, through a wildcard over the module, or as a path through it. Written bare without
-// one it is told where it lives, and a name the reader declared still wins over the form
+// one it is warned where it lives -- and still answers, in 0.6.x -- and a name the reader declared
+// still wins over the form
 // (`expr_call.sysl`'s `imported_form`; `analyze.sysl`'s `import_name`).
 
 // -- the harness ----------------------------------------------------------------------------------
@@ -106,6 +107,18 @@ private fim_refused(text: string, message: string, at: string)
     assert_eq(out.count_of("error: "), 1)
 end fim_refused
 
+// The program builds, is warned once that this form was left out, at this line and column, and
+// prints this: an unimported form still answers in 0.6.x (`tests_rwn_raw_warns.sysl`).
+private fim_warned(text: string, form: string, home: string, at: string, prints: string)
+    val got = rwn_main(text)
+
+    assert_eq(got.0, Fine, got.1)
+    assert_eq(got.2, prints)
+    assert(got.1.contains(rwn_line(form, home)), got.1)
+    assert(got.1.contains(s"/main.sysl:$at\n"), got.1)
+    assert_eq(got.1.count_of("warning: "), 1)
+end fim_warned
+
 private fim_cli(args: []string) -> (int, string)
     var lines: Buf[string] = buf()
     val sink = &lines
@@ -161,57 +174,49 @@ fim_va_forms_imported()
 
 // -- each name, not imported ------------------------------------------------------------------------
 
-@test("ptr_cast written without its import is told where it lives")
+@test("ptr_cast written without its import is warned where it lives, and answers")
 fim_ptr_cast_unimported()
     if !fim_ready() then return
 
-    fim_refused(fim_word, "'ptr_cast' is in sysl.raw: add 'import sysl.raw.ptr_cast'", "2:15")
+    fim_warned(fim_word, "ptr_cast", "sysl.raw", "2:15", "1\n")
 
-@test("ptr_cast with a written type and no import is told the same")
+@test("ptr_cast with a written type and no import is warned the same")
 fim_ptr_cast_written_type_unimported()
     if !fim_ready() then return
 
-    fim_refused("var a: [4]u8 = [7, 0, 0, 0]\nprint(*ptr_cast[*u8](&a[0]))\n",
-                "'ptr_cast' is in sysl.raw: add 'import sysl.raw.ptr_cast'", "2:8")
+    fim_warned("var a: [4]u8 = [7, 0, 0, 0]\nprint(*ptr_cast[*u8](&a[0]))\n", "ptr_cast", "sysl.raw", "2:8",
+               "7\n")
 
-@test("str_cast written without its import is told where it lives")
+@test("str_cast written without its import is warned where it lives, and answers")
 fim_str_cast_unimported()
     if !fim_ready() then return
 
-    fim_refused("var b: [2]u8 = [104, 105]\nprint(str_cast(b[..]))\n",
-                "'str_cast' is in sysl.raw: add 'import sysl.raw.str_cast'", "2:7")
+    fim_warned("var b: [2]u8 = [104, 105]\nprint(str_cast(b[..]))\n", "str_cast", "sysl.raw", "2:7", "hi\n")
 
-@test("str_alias written without its import is told where it lives")
+@test("str_alias written without its import is warned where it lives, and answers")
 fim_str_alias_unimported()
     if !fim_ready() then return
 
-    fim_refused("var b: [2]u8 = [104, 105]\nprint(str_alias(b[..]))\n",
-                "'str_alias' is in sysl.raw: add 'import sysl.raw.str_alias'", "2:7")
+    fim_warned("var b: [2]u8 = [104, 105]\nprint(str_alias(b[..]))\n", "str_alias", "sysl.raw", "2:7",
+               "hi\n")
 
-@test("each va_ form written without its import is told where it lives, the first one first")
+@test("each va_ form written without its import is warned once, at its first use, and the tail is walked")
 fim_va_forms_unimported()
     if !fim_ready() then return
 
-    // Every one of the six uses is told, and the first of them is told first.
-    val none = fim_said(fim_sum)
+    // Four forms over six uses: four warnings, the first at the first use.
+    val none = rwn_main(fim_sum)
 
-    assert(none.starts_with("error: 'va_start' is in sysl.c: add 'import sysl.c.va_start'\n --> "), none)
-    assert(none.index_of("/main.sysl:5:5\n").is_some(), none)
-    assert(none.count_of("error: ") >= 5, none)
+    assert_eq(none.0, Fine, none.1)
+    assert_eq(none.2, "12\n")
+    assert_eq(none.1.count_of("warning: "), 4)
+    assert(none.1.index_of(rwn_line("va_start", "sysl.c")).unwrap_or(9999) <
+           none.1.index_of(rwn_line("va_copy", "sysl.c")).unwrap_or(0), none.1)
+    assert(none.1.contains("/main.sysl:5:5\n"), none.1)
 
-    val without_one = "import sysl.c.{va_start, va_arg, va_end}\n\n" + fim_sum
-
-    fim_refused(without_one, "'va_copy' is in sysl.c: add 'import sysl.c.va_copy'", "8:5")
-
-    val without_arg = "import sysl.c.{va_start, va_copy, va_end}\n\n" + fim_sum
-    val said = fim_said(without_arg)
-
-    assert(said.starts_with("error: 'va_arg' is in sysl.c: add 'import sysl.c.va_arg'"), said)
-
-    val without_end = "import sysl.c.{va_start, va_arg, va_copy}\n\n" + fim_sum
-    val ended = fim_said(without_end)
-
-    assert(ended.starts_with("error: 'va_end' is in sysl.c: add 'import sysl.c.va_end'"), ended)
+    fim_warned("import sysl.c.{va_start, va_arg, va_end}\n\n" + fim_sum, "va_copy", "sysl.c", "8:5", "12\n")
+    fim_warned("import sysl.c.{va_start, va_copy, va_end}\n\n" + fim_sum, "va_arg", "sysl.c", "12:32", "12\n")
+    fim_warned("import sysl.c.{va_start, va_arg, va_copy}\n\n" + fim_sum, "va_end", "sysl.c", "15:5", "12\n")
 
 // -- the reader's own name still wins ---------------------------------------------------------------
 
@@ -308,13 +313,12 @@ fim_ref_position_own_function()
 
     assert_eq(fim_ran("ptr_cast(n: int) -> int = n + 1\n\nval r: &int = ptr_cast(1)\nprint(*r)\n"), "2\n")
 
-@test("an aliased import leaves the form's own spelling unimported")
+@test("an aliased import leaves the form's own spelling unimported, so it is warned about")
 fim_aliased_leaves_the_name_out()
     if !fim_ready() then return
 
-    fim_refused("import sysl.raw.ptr_cast as pc\n\nvar a: [4]u8 = [1, 0, 0, 0]\n" +
-                "val p: *u32 = ptr_cast(&a[0])\nprint(*p)\n",
-                "'ptr_cast' is in sysl.raw: add 'import sysl.raw.ptr_cast'", "4:15")
+    fim_warned("import sysl.raw.ptr_cast as pc\n\nvar a: [4]u8 = [1, 0, 0, 0]\n" +
+               "val p: *u32 = ptr_cast(&a[0])\nprint(*p)\n", "ptr_cast", "sysl.raw", "4:15", "1\n")
 
 @test("the module imported whole reaches the form through its name, and the whole path does too")
 fim_through_the_module()
@@ -332,9 +336,8 @@ fim_import_in_a_body()
         "    *p\nend first\n\n"
 
     assert_eq(fim_ran(text + "var a: [4]u8 = [9, 0, 0, 0]\nprint(first(&a))\n"), "9\n")
-    fim_refused(text + "second(a: *[4]u8) -> u8\n    val p: *u8 = ptr_cast(a)\n    *p\n\n" +
-                "var a: [4]u8 = [9, 0, 0, 0]\nprint(second(&a))\n",
-                "'ptr_cast' is in sysl.raw: add 'import sysl.raw.ptr_cast'", "9:18")
+    fim_warned(text + "second(a: *[4]u8) -> u8\n    val p: *u8 = ptr_cast(a)\n    *p\n\n" +
+               "var a: [4]u8 = [9, 0, 0, 0]\nprint(second(&a))\n", "ptr_cast", "sysl.raw", "9:18", "9\n")
 
 @test("a form imported from a module that is not its own is told which module it is in")
 fim_the_wrong_module()
@@ -366,7 +369,7 @@ fim_a_generic()
                       "var x: u32 = 258\nvar y: u16 = 3\nvar c = Cell(513u32)\n" +
                       "print(first_byte(&x), first_byte(&y), c.low())\n"), "2 3 1\n")
 
-@test("a module's file that imports the form uses it, and the sibling file that does not is told")
+@test("a module's file that imports the form uses it, and the sibling file that does not is warned")
 fim_one_file_of_a_module()
     if !lbr_ready() then return
 
@@ -376,17 +379,21 @@ fim_one_file_of_a_module()
     val prog = lbr_program("import demo.{low, twice}\n\nvar x: u32 = 260\nprint(low(&x), twice(&x))\n")
 
     assert_eq(lbr_run(prog, [ok]), "4 520\n")
+    lbr_drop([ok, prog])
 
-    val bad = lbr_tree(lbr_two(
+    var files = lbr_two(
         "demo/a.sysl", "module demo\n\nimport sysl.raw.ptr_cast\n\nlow(p: *u32) -> u8 = *ptr_cast[*u8](p)\n",
-        "demo/b.sysl", "module demo\n// without the 'import sysl.raw.ptr_cast' a.sysl has\n" +
-                       "high(p: *u32) -> u8\n    val b: *u8 = ptr_cast(p)\n    b[3]\n"))
-    val prog2 = lbr_program("import demo.{low, high}\n\nvar x: u32 = 260\nprint(low(&x), high(&x))\n")
-    val said = lbr_run(prog2, [bad])
+        "demo/b.sysl", "module demo\n\nhigh(p: *u32) -> u8\n    val b: *u8 = ptr_cast(p)\n    b[3]\n")
 
-    assert(said.contains("'ptr_cast' is in sysl.raw: add 'import sysl.raw.ptr_cast'"), said)
-    assert(said.contains("/demo/b.sysl:4:18"), said)
-    lbr_drop([ok, prog, bad, prog2])
+    files.push(("main.sysl", "import demo.{low, high}\n\nvar x: u32 = 260\nprint(low(&x), high(&x))\n"))
+
+    val got = rwn_built(files)
+
+    assert_eq(got.0, Fine, got.1)
+    assert_eq(got.2, "4 0\n")
+    assert(got.1.contains(rwn_line("ptr_cast", "sysl.raw")), got.1)
+    assert(got.1.contains("/demo/b.sysl:4:18"), got.1)
+    assert(!got.1.contains("/demo/a.sysl"), got.1)
 end fim_one_file_of_a_module
 
 // -- across a library -------------------------------------------------------------------------------
@@ -452,13 +459,14 @@ fim_a_device_address_on_thumb()
         Ok(out) -> assert(out.text.contains(" T main\n"), out.text)
         Err(_) -> assert(false, "arm-none-eabi-nm could not be run")
 
-    // Unimported, the same board build is refused with the line that fixes it.
+    // Unimported, the same board build still builds, warned with the line that fixes it.
     write_text(s"$root/main.sysl", program[25..<program.bytes.len]).unwrap()
 
-    val refused = fim_cli(["sysl", "build-c", root, "--target", "thumb-freestanding-softfp", "-o",
-                           s"$root/app.a"])
+    val warned = fim_cli(["sysl", "build-c", root, "--target", "thumb-freestanding-softfp", "-o",
+                          s"$root/app.a"])
 
-    assert(refused.0 != Fine, refused.1)
-    assert(refused.1.contains("'ptr_cast' is in sysl.raw: add 'import sysl.raw.ptr_cast'"), refused.1)
+    assert_eq(warned.0, Fine, warned.1)
+    assert(warned.1.contains(rwn_line("ptr_cast", "sysl.raw")), warned.1)
+    assert_eq(warned.1.count_of("warning: "), 1)
     remove_dir_all(root).unwrap_or(())
 end fim_a_device_address_on_thumb
