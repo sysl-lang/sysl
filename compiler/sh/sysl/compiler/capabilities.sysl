@@ -543,6 +543,11 @@ private declared_needs(a: &Analysis, cap: string) -> Buf[string]
         if !holds_string(out, key) && needs_capability(a.tables.externs.at(i).needs, cap) then
             out.push(key)
 
+    // A nested function is no declaration of the module's, so its `@needs` is filed by the name its
+    // body was lowered under -- one per instantiation of a generic one.
+    for i in 0..<a.tables.nested_needs.len()
+        if needs_capability(a.tables.nested_needs.at(i), cap) then out.push(a.tables.nested_needs.key_at(i))
+
     // **An `extern` variable is seeded by its C symbol**, which is the name a read of it carries in
     // the typed tree. Two declarations of one symbol are one piece of storage, so a `@needs` on
     // either is a statement about that storage.
@@ -628,6 +633,28 @@ signature_result(a: &Analysis, needs: Buf[string], scope: Scope, written: TypeRe
     leave_reaching(a, saved)
     ty
 end signature_result
+
+// Says that the body about to be read is a nested function's needing `needs`: what it covers is its
+// own annotation's on top of what the reading around it covers, since the body is reached only
+// through the function that declares it. `leave_reaching` puts back what was there.
+enter_nested_reaching(a: &Analysis, needs: Buf[string]) -> (Buf[string], bool)
+    val saved = (a.tables.reaching_needs, a.tables.reaching_test)
+    var covered: Buf[string] = buf()
+
+    for item in saved.0
+        covered.push(item)
+
+    for item in covered_by(needs)
+        if !holds_string(covered, item) then covered.push(item)
+
+    a.tables.reaching_needs = covered
+    saved
+end enter_nested_reaching
+
+// Refuses a nested function's `@needs` naming something that is not a capability, in the words a
+// top-level declaration's is refused in.
+check_nested_needs_names(a: &Analysis, scope: Scope, span: Span, needs: Buf[string]) =
+    check_need_names(a, scope, span, needs)
 
 leave_reaching(a: &Analysis, saved: (Buf[string], bool))
     a.tables.reaching_needs = saved.0
