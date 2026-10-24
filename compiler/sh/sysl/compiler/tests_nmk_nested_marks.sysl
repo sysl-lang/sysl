@@ -1,0 +1,323 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.source_of
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+
+// The marks written above a function declared inside another (`reference/attributes.md`): `@noinline`,
+// `@cold`, `@inline`, `@inline(always)`, `@disjoint`, `@abandons`, `@blocks`, `@pinned`, `@pins`,
+// `@domain` and `@lends` all take effect on it exactly as they do on a top-level function. A nested
+// function is lowered to a function of its own, and that function used to carry none of them, so the
+// attribute was accepted and did nothing.
+//
+// Every cell is asked in four places the nested function can stand: inside a function, inside a
+// nested function, inside a generic function, and inside a method.
+
+private var nmk_library_units: Buf[Program] = buf()
+private var nmk_library_read: bool = false
+
+private nmk_library() -> Buf[Program]
+    if nmk_library_read then return nmk_library_units
+
+    nmk_library_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> nmk_library_units = units
+
+    nmk_library_units
+end nmk_library
+
+// The first thing a program in module `demo` is refused with, or nothing where it is accepted.
+private nmk_diag(text: string) -> string
+    val t = host_target()
+    var units: Buf[Program] = buf()
+
+    for item in nmk_library()
+        units.push(item)
+
+    val parsed = parse(source_of("test.sysl", "module demo\n\n" + text), t)
+
+    if !parsed.ok() then return parsed.report.at(0).message
+
+    units.push(parsed.program)
+
+    val done = analyze_produced(units, t, buf(), true)
+
+    for item in done.reported
+        if !item.src.name.starts_with("library/") then return item.diag.message
+
+    var own: Buf[string] = buf()
+
+    own.push("")
+    own.push("demo")
+
+    post_analysis_checks(done.an, program_of(done, done.main_module), own)
+
+    for item in done.an.diagnostics()
+        if !item.src.name.starts_with("library/") then return item.diag.message
+
+    ""
+end nmk_diag
+
+private nmk_pad(n: int) -> string
+    var out = ""
+
+    for i in 0..<n
+        out = out + " "
+
+    out
+end nmk_pad
+
+// `text`, every line indented by `ind`, and a newline after the last.
+private nmk_indent(text: string, ind: int) -> string
+    var out = ""
+
+    for item in lines_of(text)
+        out = out + nmk_pad(ind) + item + "\n"
+
+    out
+end nmk_indent
+
+// 0 a function, 1 a nested function, 2 a generic function, 3 a method.
+private nmk_kinds() -> int = 4
+
+private nmk_where(kind: int) -> string
+    if kind == 0 then return "a function"
+    if kind == 1 then return "a nested function"
+    if kind == 2 then return "a generic function"
+
+    "a method"
+end nmk_where
+
+// A program whose function `run` declares `fns` and then does `calls`, in the place `kind` names.
+// With `entry` it also calls `run`; a module has no statements to do that with.
+private nmk_program(kind: int, prelude: string, fns: string, calls: string, entry: bool) -> string
+    var out = prelude
+
+    if kind == 0
+        out = out + "run()\n" + nmk_indent(fns, 4) + "\n" + nmk_indent(calls, 4)
+
+        if entry then out = out + "\nrun()\n"
+    else if kind == 1
+        out = out + "run()\n    mid()\n" + nmk_indent(fns, 8) + "\n" + nmk_indent(calls, 8) + "\n    mid()\n"
+
+        if entry then out = out + "\nrun()\n"
+    else if kind == 2
+        out = out + "run[T](v: T)\n" + nmk_indent(fns, 4) + "\n" + nmk_indent(calls, 4)
+
+        out = out + (if entry then "\nrun(1)\n" else "\ngo() = run(1)\n")
+    else
+        out = out + "struct S\n    n: int\n\n    run(self)\n" + nmk_indent(fns, 8) + "\n" +
+              nmk_indent(calls, 8)
+
+        if entry then out = out + "\nvar s = S(1)\ns.run()\n"
+
+    out
+end nmk_program
+
+private nmk_ir(text: string) -> string = xvr_ir([("main.sysl", text)])
+
+// The `define` line of the function called `probe_fn`.
+private nmk_define(ir: string) -> string
+    for item in lines_of(ir)
+        if item.starts_with("define") && item.contains("probe_fn(") then return item
+
+    ""
+end nmk_define
+
+private val nmk_probe: string = "probe_fn(x: *int, y: *int) -> int = *x + *y"
+private val nmk_probe_calls: string = "var a = 1\nvar b = 2\nprint(probe_fn(&a, &b))"
+
+// `attr` written above the probe function: a blank line where there is none.
+private nmk_probe_with(kind: int, attr: string) -> string =
+    nmk_ir(nmk_program(kind, "", attr + "\n" + nmk_probe, nmk_probe_calls, true))
+
+// The mark `attr` puts `marker` on the `define` line of the nested function, in every place.
+private nmk_marked(attr: string, marker: string)
+    if xvr_no_library() then return
+
+    for kind in 0..<nmk_kinds()
+        val ir = nmk_probe_with(kind, attr)
+        val said = nmk_define(ir)
+
+        assert(said != "", s"${nmk_where(kind)}: no definition of the nested function in\n$ir")
+        assert(said.contains(marker), s"${nmk_where(kind)}: '$attr' left '$marker' off\n$said")
+
+        val bare = nmk_define(nmk_probe_with(kind, ""))
+
+        assert(bare != "" && !bare.contains(marker), s"${nmk_where(kind)}: '$marker' without '$attr'\n$bare")
+end nmk_marked
+
+@test("'@noinline' on a nested function keeps it out of line, in every place it can stand")
+nmk_noinline()
+    nmk_marked("@noinline", " noinline ")
+
+@test("'@cold' on a nested function marks it cold, in every place it can stand")
+nmk_cold()
+    nmk_marked("@cold", " cold ")
+
+@test("'@inline' on a nested function asks for it to be absorbed, in every place it can stand")
+nmk_inline()
+    nmk_marked("@inline", " inlinehint ")
+
+@test("'@inline(always)' on a nested function makes the request an instruction, in every place it can stand")
+nmk_inline_always()
+    nmk_marked("@inline(always)", " alwaysinline ")
+
+@test("'@disjoint' on a nested function makes the named pointers noalias, in every place it can stand")
+nmk_disjoint()
+    if xvr_no_library() then return
+
+    for kind in 0..<nmk_kinds()
+        val said = nmk_define(nmk_probe_with(kind, "@disjoint(x, y)"))
+
+        assert(said.contains("ptr noalias %x.param, ptr noalias %y.param"), s"${nmk_where(kind)}\n$said")
+
+        val bare = nmk_define(nmk_probe_with(kind, ""))
+
+        assert(bare != "" && !bare.contains("noalias"), s"${nmk_where(kind)}\n$bare")
+
+// What `@disjoint` and `@lends` may name is settled at a nested function as at a top-level one.
+@test("'@disjoint' and '@lends' naming something that is not a parameter of a nested function are refused")
+nmk_names_are_checked()
+    if xvr_no_library() then return
+
+    for kind in 0..<nmk_kinds()
+        val disjoint = nmk_probe_with(kind, "@disjoint(nope)")
+
+        assert(disjoint.contains("error: '@disjoint' names 'nope', which is not a parameter of"),
+               s"${nmk_where(kind)}\n$disjoint")
+
+        val lends = nmk_probe_with(kind, "@lends(nope)")
+
+        assert(lends.contains("error: '@lends' names 'nope', which is not a parameter of"),
+               s"${nmk_where(kind)}\n$lends")
+
+// -- @abandons ----------------------------------------------------------------------------------------
+
+private val nmk_node: string =
+    "struct Node\n    v: int\n\nimpl Drop for Node\n    drop(self)\n        print(\"dropped\", self.v)\n\n"
+
+private nmk_frame(kind: int, attr: string) -> string =
+    nmk_program(kind, nmk_node, attr + "\nfinish() -> never\n    exit(0)",
+                "val n: &Node = Node(7)\ndefer print(\"deferred\", n.v)\nprint(\"working\")\nfinish()", true)
+
+@test("a call of a nested '@abandons' function runs the frame's deferred statements and drops first")
+nmk_abandons()
+    if xvr_no_library() then return
+
+    for kind in 0..<nmk_kinds()
+        val said = xvr_ran([("main.sysl", nmk_frame(kind, "@abandons"))])
+
+        assert_eq(said, "working\ndeferred 7\ndropped 7\n", nmk_where(kind))
+
+        val bare = xvr_ran([("main.sysl", nmk_frame(kind, ""))])
+
+        assert_eq(bare, "working\n", nmk_where(kind))
+
+// -- @blocks ------------------------------------------------------------------------------------------
+
+@test("a nested '@blocks' function is one a '@no_block' module may not reach")
+nmk_blocks()
+    if xvr_no_library() then return
+
+    for kind in 0..<nmk_kinds()
+        val said = nmk_ir(nmk_program(kind, "@no_block\n\n", "@blocks\nsleepy() -> int = 1",
+                                      "print(sleepy())", true))
+
+        assert(said.contains("which blocks") && said.contains("'@no_block' — a module that may not " +
+                                                              "block may only call what never does"),
+               s"${nmk_where(kind)}\n$said")
+
+        val bare = nmk_ir(nmk_program(kind, "@no_block\n\n", "\nsleepy() -> int = 1", "print(sleepy())", true))
+
+        assert(!bare.starts_with("error"), s"${nmk_where(kind)}\n$bare")
+
+// -- @pinned and @pins --------------------------------------------------------------------------------
+
+@test("a call of a nested '@pinned' function is a reach of its own, from a body that said neither")
+nmk_pinned()
+    if xvr_no_library() then return
+
+    for kind in 0..<nmk_kinds()
+        val said = nmk_ir(nmk_program(kind, "", "@pinned\nwork() = ()", "work()", true))
+
+        assert(said.contains("is '@pinned', so every call of it has to be made where the core cannot change"),
+               s"${nmk_where(kind)}\n$said")
+
+        val bare = nmk_ir(nmk_program(kind, "", "\nwork() = ()", "work()", true))
+
+        assert(!bare.starts_with("error"), s"${nmk_where(kind)}\n$bare")
+
+@test("a nested '@pins' function answers for its own body, which calls a '@pinned' one")
+nmk_pins()
+    if xvr_no_library() then return
+
+    val prelude = "@pinned\nwork() = ()\n\n"
+
+    for kind in 0..<nmk_kinds()
+        val said = nmk_ir(nmk_program(kind, prelude, "@pins\ninner() = work()", "inner()", true))
+
+        assert(!said.starts_with("error"), s"${nmk_where(kind)}\n$said")
+
+        val bare = nmk_ir(nmk_program(kind, prelude, "\ninner() = work()", "inner()", true))
+
+        assert(bare.contains("neither '@pinned' nor '@pins'"), s"${nmk_where(kind)}\n$bare")
+
+// -- @domain ------------------------------------------------------------------------------------------
+
+@test("a nested '@domain(interrupt)' function is held to the storage it reaches")
+nmk_domain()
+    if nmk_library().is_empty() then return
+
+    val prelude = "struct Cell\n    n: u64\n\nvar direct: &Cell = Cell(0)\n\n"
+
+    for kind in 0..<nmk_kinds()
+        val said = nmk_diag(nmk_program(kind, prelude, "@domain(interrupt)\nisr()\n    direct.n += 1",
+                                        "isr()", false))
+
+        assert(said.contains("is entered in the 'interrupt' domain, on top of whatever was running, so " +
+                             "every count it reaches has to be atomic"), s"${nmk_where(kind)}\n$said")
+
+        val bare = nmk_diag(nmk_program(kind, prelude, "\nisr()\n    direct.n += 1", "isr()", false))
+
+        assert_eq(bare, "", nmk_where(kind))
+
+// -- @lends -------------------------------------------------------------------------------------------
+
+private val nmk_lender: string = "with(p: *int, body: *int -> int) -> int = body(p)"
+
+private val nmk_keeps: string =
+    "var n = 1\nvar held: *int = &n\nwith(&n, (v) ->\n    held = v\n    0)"
+
+@test("a nested '@lends' function lends the pointer only for the call, so a body keeping it is refused")
+nmk_lends()
+    if xvr_no_library() then return
+
+    for kind in 0..<nmk_kinds()
+        val said = nmk_ir(nmk_program(kind, "", "@lends(body)\n" + nmk_lender, nmk_keeps, true))
+
+        assert(said.contains("lends this body a pointer that is valid only until the call returns, and " +
+                             "this one is stored somewhere the call does not own"), s"${nmk_where(kind)}\n$said")
+
+        val bare = nmk_ir(nmk_program(kind, "", "\n" + nmk_lender, nmk_keeps, true))
+
+        assert(!bare.starts_with("error"), s"${nmk_where(kind)}\n$bare")
+
+// -- what a nested function may not carry -------------------------------------------------------------
+
+@test("'@no_alloc' above a nested function is refused in the words that say where to write it")
+nmk_no_alloc_is_refused()
+    if xvr_no_library() then return
+
+    for kind in 0..<nmk_kinds()
+        val said = nmk_probe_with(kind, "@no_alloc")
+
+        assert(said.contains("error: '@no_alloc' holds a top-level function or a method, and 'probe_fn' is " +
+                             "declared inside another function, which makes it a closure — what it captures " +
+                             "is boxed by the function around it, outside this body. Write '@no_alloc' above " +
+                             "the function that declares it"), s"${nmk_where(kind)}\n$said")
