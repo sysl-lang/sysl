@@ -1,0 +1,208 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.text.Search
+
+// The address of a function whose result is read off its body. The result is asked for on demand,
+// as a call asks for it, so where the declaration sits does not matter; what does is a body that
+// could not be read, whose result is no type at all. That refusal is told at the body, once -- the
+// address and a `main` that takes it are not told a second time about a type nobody had (the
+// census found the address calling `?` an aggregate, and `main` refusing to result in `?`).
+
+private fiv_ir(text: string) -> string = xvr_ir([("main.sysl", text)])
+
+private fiv_ran(text: string) -> string = xvr_ran([("main.sysl", text)])
+
+// How many diagnostics a report carries.
+private fiv_errors(said: string) -> int
+    var n = 0
+    var start: usize = 0
+
+    loop
+        val at = said.index_of_from("error: ", start)
+
+        if at.is_none() then return n
+
+        n = n + 1
+        start = at.unwrap() + 1
+end fiv_errors
+
+// The two refusals a body nobody could read used to bring with it.
+private fiv_no_cascade(said: string)
+    assert(!said.contains("an aggregate"), said)
+    assert(!said.contains("'main' yields nothing"), said)
+
+// The census's shape: `main` takes the address of a function declared after it whose body is
+// refused, and the body's own refusal is the only one.
+@test("a body that is refused is told once, not again at its address or at 'main'")
+fiv_refused_body_after()
+    if xvr_no_library() then return
+
+    val said = fiv_ir(raw"""
+        extern sink_push(ctx: *u8, src: *u8, len: usize)
+
+        run(dest: *extern(*u8, *u8, usize) -> unit) = ()
+
+        main() =
+            run(&feed_sink)
+
+        feed_sink(ctx: *u8, src: *u8, len: usize) = sink_push(nope, src, len)
+        """)
+
+    assert(said.contains("error: undefined name 'nope'\n --> main.sysl:8:55\n"), said)
+    fiv_no_cascade(said)
+    assert(fiv_errors(said) == 1, said)
+end fiv_refused_body_after
+
+@test("and the same declared before its use")
+fiv_refused_body_before()
+    if xvr_no_library() then return
+
+    val said = fiv_ir(raw"""
+        extern sink_push(ctx: *u8, src: *u8, len: usize)
+
+        feed_sink(ctx: *u8, src: *u8, len: usize) = sink_push(nope, src, len)
+
+        run(dest: *extern(*u8, *u8, usize) -> unit) = ()
+
+        main() =
+            run(&feed_sink)
+        """)
+
+    assert(said.contains("error: undefined name 'nope'\n --> main.sysl:3:55\n"), said)
+    fiv_no_cascade(said)
+    assert(fiv_errors(said) == 1, said)
+end fiv_refused_body_before
+
+// The address in a module `var`'s initializer rather than inside `main`.
+@test("and at a module var's initializer")
+fiv_refused_body_module_var()
+    if xvr_no_library() then return
+
+    val said = fiv_ir("var f: *extern(i32) -> i32 = &g\n\ng(x: i32) = x + nope\n")
+
+    assert(said.contains("error: undefined name 'nope'\n --> main.sysl:3:17\n"), said)
+    fiv_no_cascade(said)
+    assert(fiv_errors(said) == 1, said)
+end fiv_refused_body_module_var
+
+// The body is in another module's file, which is where the census met it (bearssl's keys.sysl).
+@test("and with the refused body in another module")
+fiv_refused_body_other_module()
+    if xvr_no_library() then return
+
+    val said = xvr_ir([("lib/lib.sysl", "module lib\n\ng(x: i32) = x + nope\n"),
+                       ("main.sysl", "import lib\n\nmain() =\n    var f: *extern(i32) -> i32 = &lib.g\n")])
+
+    assert(said.contains("error: undefined name 'lib.nope'\n --> lib/lib.sysl:3:17\n"), said)
+    fiv_no_cascade(said)
+    assert(fiv_errors(said) == 1, said)
+end fiv_refused_body_other_module
+
+// A loop between two inferred results is refused at the declaration, and that is the whole of it.
+@test("mutual recursion between two inferred results, one addressed, is refused once")
+fiv_mutual_recursion_both_inferred()
+    if xvr_no_library() then return
+
+    val said = fiv_ir(raw"""
+        var e: *extern(i32) -> bool = &even
+
+        even(n: i32) = if n == 0 then true else odd(n - 1)
+
+        odd(n: i32) = if n == 0 then false else even(n - 1)
+        """)
+
+    assert(said.contains("error: 'even' takes its result type from its body, and the body " +
+                         "reaches 'even' again through 'odd' — write its result type, " +
+                         "'even(…) -> T'\n --> main.sysl:3:1\n"), said)
+    fiv_no_cascade(said)
+    assert(fiv_errors(said) == 1, said)
+end fiv_mutual_recursion_both_inferred
+
+// What the address really refuses is still refused when the result is inferred and declared after.
+@test("an inferred struct result declared after its address is still an aggregate")
+fiv_inferred_struct_refused()
+    if xvr_no_library() then return
+
+    val said = fiv_ir(raw"""
+        struct Point
+            x: i32
+            y: i32
+
+        var p: *extern() -> Point = &origin
+
+        origin() = Point(0i32, 0i32)
+        """)
+
+    assert(said.contains("error: the result of 'origin' is Point, an aggregate, and an aggregate " +
+                         "crosses to C in whichever registers that machine's convention names " +
+                         "rather than the ones a sysl call uses — so this address would be of a " +
+                         "function C cannot call correctly. A wrapper taking the parts behind a " +
+                         "'*T', or '@export' on this one, is what has an address\n" +
+                         " --> main.sysl:5:29\n"), said)
+    assert(fiv_errors(said) == 1, said)
+end fiv_inferred_struct_refused
+
+@test("and so is an inferred Result, which '?' would carry")
+fiv_inferred_result_refused()
+    if xvr_no_library() then return
+
+    val said = fiv_ir(raw"""
+        var r: *extern(i32) -> Result[i32, string] = &checked
+
+        checked(x: i32) = if x > 0 then Ok(x) else Err("negative")
+        """)
+
+    assert(said.contains("error: the result of 'checked' is sysl.Result[int, string], an " +
+                         "aggregate, and an aggregate crosses to C"), said)
+    assert(said.contains(" --> main.sysl:1:46\n"), said)
+    assert(fiv_errors(said) == 1, said)
+end fiv_inferred_result_refused
+
+// Everything that should be accepted, every function declared after `main`: a scalar result, a
+// unit one (the census's shape, with `ptr_cast` in the body), a generic, mutual recursion with one
+// result written, and a bare name handed to a closure parameter rather than an address.
+@test("an inferred scalar, unit, generic or recursive result declared after its address runs")
+fiv_inferred_after_runs()
+    if xvr_no_library() then return
+
+    val out = fiv_ran(raw"""
+        call(f: *extern(i32) -> i32, x: i32) -> i32 = f(x)
+
+        apply(f: &Fn(i32) -> i32, x: i32) -> i32 = f(x)
+
+        poke(f: *extern(*u8, i32) -> unit) = f(null, 5)
+
+        main() =
+            print(call(&twice, 3))
+            print(call(&ident, 4))
+            print(apply(twice, 6))
+            poke(&shout)
+            print(call(&even, 4))
+
+        twice(x: i32) = x * 2
+
+        ident[T](x: T) = x
+
+        shout(ctx: *u8, x: i32) = show(ptr_cast(ctx), x)
+
+        show(ctx: *i32, x: i32) = print(x)
+
+        even(n: i32) -> i32 = if n == 0 then 1 else odd(n - 1)
+
+        odd(n: i32) = if n == 0 then 0i32 else even(n - 1)
+        """)
+
+    assert(out == "6\n4\n12\n5\n1\n", out)
+end fiv_inferred_after_runs
+
+@test("and an inferred result in another module, addressed through the module, runs")
+fiv_inferred_other_module_runs()
+    if xvr_no_library() then return
+
+    val out = xvr_ran([("lib/lib.sysl", "module lib\n\ntwice(x: i32) = x * 2\n"),
+                       ("main.sysl", "import lib\n\ncall(f: *extern(i32) -> i32, x: i32) -> i32 = f(x)\n\n" +
+                        "main() =\n    print(call(&lib.twice, 21))\n")])
+
+    assert(out == "42\n", out)
+end fiv_inferred_other_module_runs
