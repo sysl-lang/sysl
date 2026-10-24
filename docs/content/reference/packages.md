@@ -136,6 +136,51 @@ temporary file — is absent, and the build goes on with what is there. A direct
 and cannot be read is still refused, naming it, since the modules below it would otherwise drop out
 of the build unannounced.
 
+## Directories a walk leaves out: `testdata/` and `exclude`
+
+**`testdata/` at a project root is left out of the tree by convention**, on the same terms as
+`examples/`: nothing in it is a module, nothing in it is compiled, and a `.c` file there draws no
+warning. It is where a package keeps what its tests read — sample inputs, fixtures, C programs a
+script builds into test binaries — and a test finds those files at run time exactly as before. As
+with `examples/`, the exclusion is at the root only; a `testdata/` further down is an ordinary
+directory.
+
+**Any other directory is left out by naming it**, with the package-level `exclude` key:
+
+```hocon
+exclude = ["fixtures", "tools/gen"]
+```
+
+Each entry is a path from the package root, naming a directory; that directory and everything under
+it is left out of the sysl walk, the C the package carries, `sysl doc`, and what the run cache keys a
+program on, so an edit there rebuilds nothing. It is what ends the warning a directory of C with no
+sysl draws when that C is built by a script of the package's own rather than by sysl.
+
+- **Entries are plain paths, not patterns.** `*`, `?` and `[` are refused, so a later release can give
+  them a meaning without changing what a manifest already written does. A leading `./` and a trailing
+  `/` are ignored.
+- **A directory that is not there is warned of, by name** — a misspelling would otherwise leave out
+  nothing and say nothing:
+
+  ```text
+  sysl: warning: 'exclude' names 'fixtuers', which is not a directory under '/…/mypkg', so it leaves nothing out
+  ```
+
+- **The package itself cannot be left out**:
+
+  ```text
+  sysl.hocon: 'exclude' names '.', which is the package itself — an entry is a directory below the root, and the root's own module cannot be left out of it
+  ```
+
+  and an absolute path, or one with `..` in it, is refused as not below the manifest.
+- **The key is the package's own.** A workspace member's list applies to that member and the root's
+  does not reach into it; a dependency's list is respected when the dependency is built; and inside a
+  `test` block or a feature the word is an unknown key, with no effect.
+- **A compiler before 0.5.7 does not know the key**, warns that it is ignored, and walks the
+  directory as before.
+- A package's `sysl.sum` tree hash still covers every file, excluded or not: it answers whether a
+  fetched tree is the one that was published, which is not a question about what compiles.
+
 ## A package may test what it refuses
 
 **`tests/refused/` at a project root holds programs that `sysl test` requires the compiler to

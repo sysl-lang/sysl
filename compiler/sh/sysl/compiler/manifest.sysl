@@ -204,6 +204,10 @@ struct Manifest
     // force for a machine and a set of enabled features can be merged (`c_layers.sysl`). The fields
     // above hold the package's own layer until that merge replaces them.
     layers: Buf[CLayer]
+
+    // The `exclude` list: directories below the package root that are no part of the tree, each
+    // normalized to its `/`-separated path from the root (`read_exclude`). Package-level only.
+    exclude: Buf[string]
 end Manifest
 
 // What a package's `test` block says about running its suite (`read_test_settings`). Each is a
@@ -236,7 +240,7 @@ no_test_settings() -> TestSettings = TestSettings(None, None, buf(), None, buf()
 empty_manifest() -> Manifest =
     Manifest("", "", "", "", buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), None,
              buf(), None, None, None, buf(), None, false, "", None, buf(), buf(), buf(), None, buf(),
-             buf(), buf(), no_test_settings(), None, buf(), buf(), buf(), buf(), buf())
+             buf(), buf(), no_test_settings(), None, buf(), buf(), buf(), buf(), buf(), buf())
 
 // The manifest a directory carries, or the empty one where it carries none -- with the `c`, `defines`
 // and `requires` the layers in force write (`c_layers.sysl`): those of the machine being built and of
@@ -749,6 +753,7 @@ read_manifest(text: string) -> Result[Manifest, string]
 
     val has_package = root.get("package").is_some()
     val workspace = read_workspace(root)?
+    val exclude = read_exclude(root)?
 
     // **A workspace root with no `package` block compiles nothing of its own**, so a dependency
     // named there would reach no code -- and a reader would believe every member had it.
@@ -766,7 +771,7 @@ read_manifest(text: string) -> Result[Manifest, string]
                 optimization, link, lto, warnings, bounds_locations, has_package, repository, workspace,
                 images, codegen_read.0, target_codegen, codegen_read.2, target_extensions,
                 codegen_read.1, target_codegen_registers, tests, error_traces, options, feature_targets,
-                read.info, choices, layers)
+                read.info, choices, layers, exclude)
 
     if read.long_form
         needs_floor_refusal(floor, "a feature block") match
@@ -995,6 +1000,60 @@ private read_workspace(root: Value) -> Result[Option[Buf[string]], string]
         Some(out) -> Ok(Some(out))
         None -> Err(bad)
 end read_workspace
+
+// The `exclude` list: directories below the package root that hold no module of this package and are
+// left out of every walk of it -- the sysl, the C, `sysl doc` and what the caches key a build on.
+// **Plain paths from the root, never patterns**: `*` is refused, so a later release can give it a
+// meaning without changing what a written manifest does. A leading `./` and a trailing `/` are
+// ignored, and each entry is kept in that normal form.
+//
+// **Package-level only.** A `test` block or a feature that says `exclude` draws the ordinary
+// unknown-key warning and has no effect: what a tree is does not change with what is enabled.
+private read_exclude(root: &Conf) -> Result[Buf[string], string]
+    val written = conf_at(root, "exclude") match
+        None -> return Ok(buf())
+        Some(v) -> v
+
+    val given = conf_list(written) match
+        Some(texts) -> texts
+        None -> return Err("'exclude' is not a list of directories — it is written " +
+                           "'exclude = [\"fixtures\", \"tools/gen\"]', each entry a directory below this file")
+
+    var out: Buf[string] = buf()
+
+    for text in given
+        var entry = text
+
+        while entry.starts_with("./")
+            entry = entry[2..]
+
+        while entry.ends_with("/")
+            entry = entry[0..<entry.len - 1]
+
+        if entry == "" || entry == "."
+            return Err(s"'exclude' names '$text', which is the package itself — an entry is a directory " +
+                       "below the root, and the root's own module cannot be left out of it")
+
+        if entry.starts_with("/") || holds_dotdot(entry)
+            return Err(s"'exclude' names '$text', which is not below this file — an entry is a path " +
+                       "from the package root, with no '..' and not absolute")
+
+        if entry.contains("*") || entry.contains("?") || entry.contains("[")
+            return Err(s"'exclude' names '$text', and an entry is a plain path, not a pattern — list " +
+                       "each directory")
+
+        if !holds_string(out, entry) then out.push(entry)
+
+    Ok(out)
+end read_exclude
+
+// Whether a path has a `..` segment.
+private holds_dotdot(entry: string) -> bool
+    for segment in split(entry, "/")
+        if segment == ".." then return true
+
+    false
+end holds_dotdot
 
 // The warning a key this compiler does not know draws. **Said and then ignored, not refused**: a
 // manifest written for a newer compiler must still build with this one wherever the parts it uses
@@ -1993,7 +2052,7 @@ val TargetKeys: []const string = ["triple", "linker", "linker_script", "entry", 
 val TopKeys: []const string = ["package", "dependencies", "dev_dependencies", "requires", "capabilities",
                                "targets", "allocator", "defines", "links", "features", "optimization",
                                "link", "lto", "bounds_locations", "error_traces", "workspace", "codegen",
-                               "c", "test", "options", "choices", "config"]
+                               "c", "test", "options", "choices", "config", "exclude"]
 
 private known_package_key(key: string) -> bool = holds_key(PackageKeys, key)
 

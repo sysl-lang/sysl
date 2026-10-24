@@ -1,0 +1,264 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{read_text, remove_dir_all}
+import sysl.text.{join, Search}
+
+// `testdata/` at a root is left out of the tree by convention, and a manifest's `exclude` list leaves
+// out any other directory (`reference/packages.md § Directories a walk leaves out`). Both reach every
+// walk: the sysl, the C, the stray-C warning, and what the run cache keys a program on.
+
+private const TxdMod: string = "module geom\n\ndouble(n: int) -> int = n * 2\n"
+private const TxdC: string = "int fixture(void) { return 1; }\n"
+
+// A package with a module, a manifest saying `extra` after its package block, and the files given.
+private txd_package(extra: string, files: []string) -> string
+    var all: Buf[string] = buf()
+
+    all.push("sysl.hocon")
+    all.push("package { name = \"geom-lib\", version = \"1.0.0\" }\n" + extra)
+    all.push("geom/geom.sysl")
+    all.push(TxdMod)
+
+    for i in 0..<files.len
+        all.push(files[i])
+
+    pkc_tree("sysl-txd", all.view())
+end txd_package
+
+// The module directories `collect` found, one per file.
+private txd_dirs(root: string) -> string
+    var out: Buf[string] = buf()
+
+    collect(root, Some(host_target().os)) match
+        Err(e) -> out.push(e.message)
+        Ok(found) ->
+            for item in found
+                out.push(join(item.dir.view(), "/"))
+
+    join(out.view(), " ")
+end txd_dirs
+
+// The `.c` files `c_sources` would compile, shown from the root.
+private txd_c(root: string) -> string
+    var out: Buf[string] = buf()
+
+    c_sources(root, Some(host_target().os)) match
+        Err(e) -> out.push(e.message)
+        Ok(found) ->
+            for item in found
+                out.push(relative_to(absolute_path(root), item))
+
+    join(out.view(), " ")
+end txd_c
+
+private txd_manifest(text: string) -> string
+    read_manifest(text) match
+        Ok(m) -> join(m.exclude.view(), ",")
+        Err(why) -> why
+end txd_manifest
+
+private txd_drop(root: string) = remove_dir_all(root).unwrap_or(())
+
+// -- the shape elf has: C a script builds, in a directory no module owns -------------------------------
+
+@test("C in an unexcluded directory with no sysl still draws the warning")
+txd_the_warning_still_appears_without_exclude()
+    val root = txd_package("", ["fixtures/src/a.c", TxdC])
+    val said = stray_c_warnings(root)
+
+    txd_drop(root)
+    assert_eq(said.len(), 1)
+    assert(said.at(0).contains("holds C and no sysl"), said.at(0))
+end txd_the_warning_still_appears_without_exclude
+
+@test("and 'exclude' on its directory silences it")
+txd_exclude_silences_the_warning()
+    val root = txd_package("exclude = [\"fixtures\"]\n", ["fixtures/src/a.c", TxdC])
+    val said = stray_c_warnings(root)
+    val named = exclude_warnings(root)
+    val carried = txd_c(root)
+
+    txd_drop(root)
+    assert_eq(said.len(), 0)
+    assert_eq(named.len(), 0)
+    assert_eq(carried, "")
+
+// -- testdata/ ---------------------------------------------------------------------------------------
+
+@test("a root testdata directory holding C, sysl and other files is compiled by nothing and warns of nothing")
+txd_testdata_is_left_out()
+    val root = txd_package("", ["testdata/a.c", TxdC,
+                                "testdata/loose.sysl", "this is not sysl at all (\n",
+                                "testdata/sub/deeper.c", TxdC,
+                                "testdata/input.txt", "text\n"])
+    val said = stray_c_warnings(root)
+    val dirs = txd_dirs(root)
+    val carried = txd_c(root)
+
+    txd_drop(root)
+    assert_eq(said.len(), 0)
+    assert_eq(dirs, "geom")
+    assert_eq(carried, "")
+
+@test("testdata is left out at the root only; a nested one is an ordinary directory")
+txd_a_nested_testdata_is_ordinary()
+    val root = txd_package("", ["geom/testdata/a.c", TxdC])
+    val said = stray_c_warnings(root)
+
+    txd_drop(root)
+    assert_eq(said.len(), 1)
+
+@test("a file under testdata is where a test finds it at run time")
+txd_testdata_files_stay_readable()
+    val root = txd_package("", ["testdata/input.txt", "kept\n"])
+    val text = read_text(s"$root/testdata/input.txt").unwrap_or("")
+
+    txd_drop(root)
+    assert_eq(text, "kept\n")
+
+// -- exclude -----------------------------------------------------------------------------------------
+
+@test("a nested path leaves out that directory and not its siblings")
+txd_nested_exclude_paths()
+    val root = txd_package("exclude = [\"tools/gen\", \"fixtures\"]\n",
+                           ["tools/gen/a.c", TxdC, "tools/other/b.c", TxdC, "fixtures/c.c", TxdC])
+    val said = stray_c_warnings(root)
+
+    txd_drop(root)
+    assert_eq(said.len(), 1)
+    assert(said.at(0).contains("tools/other"), said.at(0))
+
+@test("what is under an excluded directory is excluded with it")
+txd_everything_below_is_left_out()
+    val root = txd_package("exclude = [\"fixtures\"]\n",
+                           ["fixtures/a/b/c/deep.c", TxdC, "fixtures/stray.sysl", "not sysl (\n"])
+    val said = stray_c_warnings(root)
+    val dirs = txd_dirs(root)
+
+    txd_drop(root)
+    assert_eq(said.len(), 0)
+    assert_eq(dirs, "geom")
+
+@test("an entry may be spelled with a leading ./ and a trailing /")
+txd_entries_are_normalized()
+    assert_eq(txd_manifest("exclude = [\"./fixtures/\", \"fixtures\", \"tools/gen\"]"), "fixtures,tools/gen")
+
+@test("an entry naming no directory is warned of, by name")
+txd_a_missing_entry_is_warned_of()
+    val root = txd_package("exclude = [\"fixtuers\"]\n", ["fixtures/a.c", TxdC])
+    val named = exclude_warnings(root)
+
+    txd_drop(root)
+    assert_eq(named.len(), 1)
+    assert(named.at(0).contains("'exclude' names 'fixtuers'"), named.at(0))
+
+// -- refusals ------------------------------------------------------------------------------------------
+
+@test("excluding the package itself is refused")
+txd_excluding_the_package_is_refused()
+    assert_eq(txd_manifest("exclude = [\".\"]"),
+              "'exclude' names '.', which is the package itself — an entry is a directory below the " +
+              "root, and the root's own module cannot be left out of it")
+    assert(txd_manifest("exclude = [\"./\"]").contains("which is the package itself"), "./")
+    assert(txd_manifest("exclude = [\"\"]").contains("which is the package itself"), "empty")
+
+@test("a path above the root, an absolute one and a pattern are refused")
+txd_bad_paths_are_refused()
+    assert(txd_manifest("exclude = [\"../x\"]").contains("which is not below this file"), "..")
+    assert(txd_manifest("exclude = [\"a/../b\"]").contains("which is not below this file"), "a/../b")
+    assert(txd_manifest("exclude = [\"/tmp\"]").contains("which is not below this file"), "absolute")
+    assert(txd_manifest("exclude = [\"fix*\"]").contains("a plain path, not a pattern"), "glob")
+
+@test("a string or a block in place of the list is refused")
+txd_not_a_list_is_refused()
+    assert(txd_manifest("exclude = \"fixtures\"").contains("'exclude' is not a list of directories"), "string")
+    assert(txd_manifest("exclude { a = 1 }").contains("'exclude' is not a list of directories"), "block")
+
+@test("'exclude' inside a test block is an unknown key with no effect")
+txd_exclude_in_a_test_block_is_unknown()
+    val text = "test { exclude = [\"fixtures\"] }"
+    val made = read_manifest(text)
+
+    assert(made.is_ok(), "refused")
+    assert_eq(made.unwrap().exclude.len(), 0)
+    assert(join(made.unwrap().warnings.view(), "|").contains("test.exclude"), "no warning")
+
+// -- the caches --------------------------------------------------------------------------------------
+
+@test("the headers a program is keyed on leave out testdata and excluded directories")
+txd_the_cache_key_does_not_see_excluded_files()
+    val root = txd_package("exclude = [\"fixtures\"]\n",
+                           ["geom/kept.h", "int k;\n", "testdata/t.h", "int t;\n", "fixtures/f.h", "int f;\n"])
+    var seen: Buf[string] = buf()
+
+    for item in carried_headers(root)
+        seen.push(item.0)
+
+    txd_drop(root)
+    assert_eq(join(seen.view(), " "), "geom/kept.h")
+
+@test("so a header under one is not what a build is keyed on, and a kept one still is")
+txd_an_unexcluded_header_is_keyed()
+    val root = txd_package("", ["fixtures/f.h", "int f;\n"])
+    var seen: Buf[string] = buf()
+
+    for item in carried_headers(root)
+        seen.push(item.0)
+
+    txd_drop(root)
+    assert_eq(join(seen.view(), " "), "fixtures/f.h")
+
+@test("the list is part of the manifest the key covers")
+txd_exclude_is_in_the_cache_key()
+    val a = read_conf("exclude = [\"x\"]").unwrap()
+    val b = read_conf("exclude = [\"y\"]").unwrap()
+
+    assert(conf_canonical(a) != conf_canonical(b), "same key")
+
+// -- workspaces and dependencies -------------------------------------------------------------------------
+
+@test("a workspace member's own list applies to the member, and the root's does not reach into it")
+txd_a_member_has_its_own_list()
+    val root = pkc_tree("sysl-txd-ws", ["sysl.hocon", "workspace = [\"one\", \"two\"]\nexclude = [\"fixtures\"]\n",
+                                         "one/sysl.hocon", "package { name = \"one\", version = \"1.0.0\" }\nexclude = [\"fixtures\"]\n",
+                                         "one/one/one.sysl", "module one\n\nf() -> int = 1\n",
+                                         "one/fixtures/a.c", TxdC,
+                                         "two/sysl.hocon", "package { name = \"two\", version = \"1.0.0\" }\n",
+                                         "two/two/two.sysl", "module two\n\nf() -> int = 2\n",
+                                         "two/fixtures/a.c", TxdC])
+    val one = stray_c_warnings(s"$root/one")
+    val two = stray_c_warnings(s"$root/two")
+
+    txd_drop(root)
+    assert_eq(one.len(), 0)
+    assert_eq(two.len(), 1)
+
+@test("a dependency's list is respected when the dependency is built")
+txd_a_dependencys_list_is_respected()
+    if !pkc_ready() then return
+
+    val dep = txd_package("exclude = [\"fixtures\"]\n", ["fixtures/loose.sysl", "not a module (\n"])
+    val app = pkc_tree("sysl-txd-app", ["sysl.hocon",
+                                         s"package { name = \"app\", version = \"0.1.0\" }\ndependencies { g { path = \"$dep\" } }\n",
+                                         "main.sysl", "print(geom.double(21))\n"])
+    val said = pkc_ran(app)
+
+    txd_drop(app)
+    txd_drop(dep)
+    assert_eq(said, "42\n")
+
+@test("and without the list the same dependency is refused")
+txd_without_the_list_the_dependency_is_refused()
+    if !pkc_ready() then return
+
+    val dep = txd_package("", ["fixtures/loose.sysl", "not a module (\n"])
+    val app = pkc_tree("sysl-txd-app", ["sysl.hocon",
+                                         s"package { name = \"app\", version = \"0.1.0\" }\ndependencies { g { path = \"$dep\" } }\n",
+                                         "main.sysl", "print(geom.double(21))\n"])
+    val said = pkc_ran(app)
+
+    txd_drop(app)
+    txd_drop(dep)
+    assert(said.starts_with("build failed"), said)

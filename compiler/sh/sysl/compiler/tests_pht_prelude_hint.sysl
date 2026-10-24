@@ -1,0 +1,143 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.remove_dir_all
+
+// **A name a file forgot to import falls through to the auto-imported standard module**, and a
+// refusal about the library type it then meant says which declaration of the program shares its
+// spelling, and what to import. Imports are per file, so a sibling of the same module can import the
+// program's `Cpu` while this file silently gets the library's enum.
+
+private pht_chip() -> string = "module chip\nstruct Cpu\n    id: int\n"
+
+private pht_run(fs: Buf[(string, string, string)], libs: []string) -> string
+    fs.push(("", "main.sysl", "print(0)\n"))
+
+    val root = im_write(fs)
+    val said = lbr_run(root, libs)
+
+    remove_dir_all(root).unwrap_or(())
+    said
+end pht_run
+
+private pht_files(chip: bool, a: string, b: string) -> Buf[(string, string, string)]
+    var fs = im_files()
+
+    if chip then fs.push(("chip", "c.sysl", pht_chip()))
+
+    fs.push(("virt", "a.sysl", "module virt\n" + a))
+    fs.push(("virt", "b.sysl", "module virt\n" + b))
+    fs
+end pht_files
+
+@test("a sibling file's import of the program's own type is named, with the line to add")
+pht_a_sibling_import()
+    if im_can_run() then return
+
+    val said = pht_run(pht_files(true, "import chip.Cpu\nmake() -> Cpu = Cpu(id = 7)\n",
+                                 "read(c: Cpu) -> int = c.id\n"), [])
+
+    assert(said.contains("'Cpu' here is sysl.Cpu; did you mean chip.Cpu (imported in a.sysl)? " +
+                         "Add 'import chip.Cpu'"), said)
+end pht_a_sibling_import
+
+@test("a declaration of the program in another module is named when no sibling imported it")
+pht_a_same_package_declaration()
+    if im_can_run() then return
+
+    val said = pht_run(pht_files(true, "one() -> int = 1\n", "read(c: Cpu) -> int = c.id\n"), [])
+
+    assert(said.contains("'Cpu' here is sysl.Cpu; did you mean chip.Cpu? Add 'import chip.Cpu'"),
+           said)
+    assert(!said.contains("imported in"), said)
+end pht_a_same_package_declaration
+
+@test("no hint when the program has nothing of that name")
+pht_no_namesake()
+    if im_can_run() then return
+
+    val said = pht_run(pht_files(false, "one() -> int = 1\n", "read(c: Cpu) -> int = c.id\n"), [])
+
+    assert(said.contains("has no property 'id'"), said)
+    assert(!said.contains("did you mean"), said)
+end pht_no_namesake
+
+@test("no hint on a use that works, even beside another refusal and a namesake")
+pht_no_hint_on_success()
+    if im_can_run() then return
+
+    val said = pht_run(pht_files(true, "one() -> int = 1\n",
+                                 "read(c: Cpu) -> int = 1\nbad() -> int = \"text\"\n"), [])
+
+    assert(said.contains("refused"), said)
+    assert(!said.contains("did you mean"), said)
+end pht_no_hint_on_success
+
+@test("a type mismatch naming the library type carries the hint at a call and at a binding")
+pht_mismatch_sites()
+    if im_can_run() then return
+
+    val a = "import chip.Cpu\nmake() -> Cpu = Cpu(id = 7)\n"
+    val call = pht_run(pht_files(true, a, "take(c: Cpu) -> int = 1\nuse() -> int = take(make())\n"), [])
+    val bind = pht_run(pht_files(true, a, "use() -> int\n    val c: Cpu = make()\n    1\n"), [])
+    val hint = "did you mean chip.Cpu (imported in a.sysl)? Add 'import chip.Cpu'"
+
+    assert(call.contains(hint), call)
+    assert(bind.contains(hint), bind)
+end pht_mismatch_sites
+
+@test("a method missing from the library type carries the hint")
+pht_missing_method()
+    if im_can_run() then return
+
+    val said = pht_run(pht_files(true, "one() -> int = 1\n", "read(c: Cpu) -> int = c.id_of()\n"), [])
+
+    assert(said.contains("did you mean chip.Cpu? Add 'import chip.Cpu'"), said)
+end pht_missing_method
+
+@test("several candidates are listed nearest first, the sibling's import before the declarations")
+pht_several_candidates()
+    if im_can_run() then return
+
+    var fs = pht_files(true, "import rig.Cpu\none() -> int = 1\n", "read(c: Cpu) -> int = c.id\n")
+
+    fs.push(("rig", "r.sysl", "module rig\nstruct Cpu\n    id: int\n"))
+
+    val said = pht_run(fs, [])
+
+    assert(said.contains("did you mean rig.Cpu (imported in a.sysl) or chip.Cpu? Add 'import rig.Cpu'"), said)
+end pht_several_candidates
+
+@test("no more than three candidates are listed")
+pht_at_most_three()
+    if im_can_run() then return
+
+    var fs = pht_files(true, "one() -> int = 1\n", "read(c: Cpu) -> int = c.id\n")
+
+    for m in ["rig", "dia", "ort"]
+        fs.push((m, "x.sysl", s"module $m\nstruct Cpu\n    id: int\n"))
+
+    val said = pht_run(fs, [])
+    var shown = 0
+
+    for m in ["chip", "rig", "dia", "ort"]
+        if said.contains(s"$m.Cpu") then shown += 1
+
+    assert_eq(shown, 3)
+end pht_at_most_three
+
+@test("a dependency's exported type is a candidate too")
+pht_a_dependency_item()
+    if im_can_run() then return
+
+    var lib: Buf[(string, string)] = buf()
+
+    lib.push(("devs/lib.sysl", "module devs\nstruct Cpu\n    id: int\n"))
+
+    val root = lbr_tree(lib)
+    val said = pht_run(pht_files(false, "one() -> int = 1\n", "read(c: Cpu) -> int = c.id\n"), [root])
+
+    remove_dir_all(root).unwrap_or(())
+    assert(said.contains("did you mean devs.Cpu? Add 'import devs.Cpu'"), said)
+end pht_a_dependency_item
