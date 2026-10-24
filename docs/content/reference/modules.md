@@ -915,7 +915,10 @@ reaches a dependency's `@requires(posix)` module, naming that module by its pack
 **What the machine lacks is asked of a dependency's module only where the program reaches it.** On a
 target whose `sysl.hocon` says `heap = false`, or one with no thread-local storage, a fetched
 package's or a `--lib` root's module that boxes a value or declares a `@thread_local` is refused —
-at the construct, in its own file — when the program names that module or names one that does. A
+at the construct, in its own file — when the program names that module or names one that does. An
+atomic wider than the processor has one for is the same: a module's `Atomic[i64]` on a Cortex-M4 is
+refused, at the standard module's form and once for each instance, only where a module the program
+reaches arrives at it. A
 package is a set of modules, and the program uses the ones it names: a board program that imports
 only a package's fixed-capacity queue builds, although the thread pool beside the queue in the same
 package boxes its tasks and keeps per-thread storage, and none of the pool's code — its closures'

@@ -1209,6 +1209,26 @@ end slashed
 module_overlap(a: string, b: string) -> bool =
     starts_with_module(a, b) || starts_with_module(b, a)
 
+// What a package's manifest has already said on standard error in this command line.
+//
+// **A manifest is read once per lookup, and a build looks a package up many times** -- once for its
+// requirements, once per module it resolves, once per C file it compiles -- so a warning printed at
+// each reading was printed ten times for one `package.hocon`. It is a statement about the file, said
+// once per command line; a test answering several command lines in one process hears it in each.
+private var manifest_warned: Buf[string] = buf()
+
+reset_manifest_warnings()
+    manifest_warned = buf()
+
+// Every line said so far in this command line, in the order it was said.
+manifest_warnings_told() -> Buf[string] = manifest_warned
+
+private warn_once(line: string)
+    if holds_string(manifest_warned, line) then return
+
+    manifest_warned.push(line)
+    eprints(s"$line\n")
+
 // A package's manifest, where it has one. A package with no file is a package that said nothing,
 // exactly as a project with none is.
 //
@@ -1225,7 +1245,7 @@ manifest_of_package(root: string) -> Result[Manifest, string]
 
     if !is_file(file) then return Ok(empty_manifest())
 
-    if has_legacy_manifest(root) then eprints(s"${legacy_manifest_warning(root)}\n")
+    if has_legacy_manifest(root) then warn_once(legacy_manifest_warning(root))
 
     val text = read_text(file) match
         Err(_) -> return Err(s"cannot read $file")
@@ -1236,7 +1256,7 @@ manifest_of_package(root: string) -> Result[Manifest, string]
         Ok(got) -> got
 
     for warning in m.warnings
-        eprints(s"$root: ${warning}\n")
+        warn_once(s"$root: $warning")
 
     bind_members(resolving_local_paths(m, root), root)
 end manifest_of_package

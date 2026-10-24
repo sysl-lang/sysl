@@ -1,0 +1,256 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{exists, remove_dir_all}
+import sysl.process.capture
+import sysl.text.Search
+
+// **What the machine lacks of the atomic tier is asked of a dependency's module only where the
+// program reaches it** (`reference/modules.md § The target's half needs no clause at all`), as a heap
+// or thread-local storage is. A board program importing a package's fixed-capacity deque builds
+// although the thread pool beside it counts in an `Atomic[i64]` a Cortex-M4 has no instruction for:
+// the instance `sysl.sync.Atomic[long].load` is chosen by the pool alone, and the pool is not in the
+// image. A module the program does reach is refused exactly as before -- at the standard module's
+// form, once per instance -- and so is every module of a library built on its own.
+
+private dmw_wide_text() -> string =
+    "module sh.dmw.wide\n" +
+    "\n" +
+    "import sysl.sync.*\n" +
+    "\n" +
+    "private var queued: Atomic[i64] = Atomic(0)\n" +
+    "\n" +
+    "// A generic of the module's own, instantiated at the wide type only here.\n" +
+    "private count[T: Integer](a: *Atomic[T]) -> T = a.load(Relaxed)\n" +
+    "\n" +
+    "enqueue() -> i64 = queued.add(1, Relaxed) + count(&queued)\n"
+
+// A source root shaped like `sysl-lang/pool`: one module a board can use, and beside it modules that
+// count wider than a 32-bit core can, keep per-thread storage, box a `&sync` value, and run a raw
+// atomic form at 64 bits.
+private dmw_root() -> string
+    var files: Buf[(string, string)] = buf()
+
+    files.push(("sh/dmw/deque/deque.sysl",
+        "module sh.dmw.deque\n\nimport sysl.sync.*\n\nprivate var top: Atomic[usize] = Atomic(0)\n\n" +
+        "bump() -> usize = top.add(1, Relaxed)\n"))
+    files.push(("sh/dmw/wide/wide.sysl", dmw_wide_text()))
+    files.push(("sh/dmw/via/via.sysl",
+        "module sh.dmw.via\n\nimport sh.dmw.wide.enqueue\n\nkick() -> i64 = enqueue()\n"))
+    files.push(("sh/dmw/hosted/hosted.sysl",
+        "module sh.dmw.hosted\n\nimport sysl.sync.*\n\n@thread_local var slot: int = 0\n\n" +
+        "share() -> u32\n    val shared: &sync Atomic[u32] = Atomic(0)\n\n" +
+        "    shared.store(1, Relaxed)\n    shared.load(Relaxed)\n"))
+    files.push(("sh/dmw/raw/raw.sysl",
+        "module sh.dmw.raw\n\nimport sysl.sync.*\n\nprivate var cell: i64 = 0\n\n" +
+        "peek() -> i64 = atomic_load(&cell, Relaxed)\n"))
+    files.push(("sh/dmw/gen/gen.sysl",
+        "module sh.dmw.gen\n\nimport sysl.sync.*\n\nread[T: Integer](a: *Atomic[T]) -> T = a.load(Relaxed)\n"))
+    files.push(("sh/dmw/free/free.sysl", "module sh.dmw.free\n\ntwice(x: u32) -> u32 = x * 2\n"))
+    files.push(("sh/dmw/spin/spin.sysl",
+        "module sh.dmw.spin\n\nimport sysl.sync.*\n\nprivate var hits: Atomic[u32] = Atomic(0)\n" +
+        "private var lock: SpinLock = SpinLock(0)\n\n" +
+        "hit() -> u32\n    lock.lock()\n    lock.unlock()\n    hits.add(1, Relaxed)\n"))
+
+    lbr_tree(files)
+end dmw_root
+
+// A heap-less board program whose `main` calls `call`, a function of the module `import` names.
+private dmw_board(import_line: string, call: string) -> string
+    lbr_tree(lbr_two("sysl.hocon",
+                     "package {\n  name = \"dmw-board\"\n  version = \"0.1.0\"\n}\n\n" +
+                     "capabilities { heap = false }\n",
+                     "main.sysl", s"$import_line\n\n@export(\"main\")\nmain()\n" +
+                                  s"    if $call != 0 then loop do ()\n"))
+end dmw_board
+
+private dmw_build_c(program: string, lib: string, target: string) -> (int, string) =
+    lbr_cli(["sysl", "build-c", program, "--target", target, "--lib", lib, "-o", s"$program/out.a"])
+
+private dmw_wide(form: string) -> string =
+    s"error: '$form' is one machine instruction, and 'thumbv7em-freestanding' has one for 32 bits " +
+    "at most — long is 64, so there is nothing to emit. Count at a width the machine has where the " +
+    "value fits one, or hold it in a 'Guarded[SpinLock, T]'"
+
+// The symbols a board archive leaves for somebody else to define.
+private dmw_undefined(archive: string) -> string
+    val tool = "/opt/homebrew/bin/arm-none-eabi-nm"
+
+    assert(exists(tool), "this test reads a board's archive and there is no arm-none-eabi-nm")
+
+    capture(tool, ["-u", archive], "", [], true) match
+        Ok(out) -> out.text
+        Err(_) -> "arm-none-eabi-nm could not be run"
+
+@test("a board program naming a package's deque builds although a sibling module counts in an Atomic[i64]")
+dmw_unnamed_wide_module_is_not_asked()
+    if !lbr_ready() then return
+
+    val lib = dmw_root()
+    val program = dmw_board("import sh.dmw.deque.bump", "bump()")
+
+    for target in ["thumbv7em-freestanding", "aarch64-freestanding"]
+        val got = dmw_build_c(program, lib, target)
+
+        assert(got.0 == 0, s"$target: ${got.1}")
+        assert(got.1.index_of("error").is_none(), s"$target: ${got.1}")
+
+        // None of the wide module's code is in the image, so nothing is left to a `libatomic`.
+        if target == "thumbv7em-freestanding"
+            val undefined = dmw_undefined(s"$program/out.a")
+
+            assert(undefined.index_of("__atomic").is_none(), undefined)
+            assert(undefined.index_of("__sync").is_none(), undefined)
+
+    remove_dir_all(program).unwrap_or(())
+    remove_dir_all(lib).unwrap_or(())
+end dmw_unnamed_wide_module_is_not_asked
+
+@test("a dependency's module the program names is refused for its Atomic[i64], once per instance")
+dmw_named_wide_module_is_refused()
+    if !lbr_ready() then return
+
+    val lib = dmw_root()
+    val program = dmw_board("import sh.dmw.wide.enqueue", "enqueue()")
+    val got = dmw_build_c(program, lib, "thumbv7em-freestanding")
+
+    assert(got.0 != 0, got.1)
+    assert(got.1.index_of(s"${dmw_wide("atomic_load")}\n  --> library/sysl/sync/atomic.sysl:49:24")
+           .is_some(), got.1)
+    assert(got.1.index_of(s"${dmw_wide("atomic_add")}\n  --> library/sysl/sync/atomic.sysl:93:20")
+           .is_some(), got.1)
+    assert(got.1.count_of("error: ") == 2, got.1)
+
+    // The same module on a machine with 64-bit atomics builds.
+    val wide64 = dmw_build_c(program, lib, "aarch64-freestanding")
+
+    assert(wide64.0 == 0, wide64.1)
+
+    remove_dir_all(program).unwrap_or(())
+    remove_dir_all(lib).unwrap_or(())
+end dmw_named_wide_module_is_refused
+
+@test("a wide module reached only through another module's import is refused too")
+dmw_wide_module_reached_through_an_import()
+    if !lbr_ready() then return
+
+    val lib = dmw_root()
+    val program = dmw_board("import sh.dmw.via.kick", "kick()")
+    val got = dmw_build_c(program, lib, "thumbv7em-freestanding")
+
+    assert(got.0 != 0, got.1)
+    assert(got.1.index_of(dmw_wide("atomic_load")).is_some(), got.1)
+    assert(got.1.index_of(dmw_wide("atomic_add")).is_some(), got.1)
+    assert(got.1.count_of("error: ") == 2, got.1)
+
+    remove_dir_all(program).unwrap_or(())
+    remove_dir_all(lib).unwrap_or(())
+end dmw_wide_module_reached_through_an_import
+
+@test("a raw 64-bit atomic form in a dependency's module is refused where it is written, once named")
+dmw_raw_form_is_refused_once_named()
+    if !lbr_ready() then return
+
+    val lib = dmw_root()
+    val program = dmw_board("import sh.dmw.raw.peek", "peek()")
+    val got = dmw_build_c(program, lib, "thumbv7em-freestanding")
+
+    assert(got.0 != 0, got.1)
+    assert(got.1.index_of(s"${dmw_wide("atomic_load")}\n --> $lib/sh/dmw/raw/raw.sysl:7:17")
+           .is_some(), got.1)
+    assert(got.1.count_of("error: ") == 1, got.1)
+
+    remove_dir_all(program).unwrap_or(())
+    remove_dir_all(lib).unwrap_or(())
+end dmw_raw_form_is_refused_once_named
+
+@test("a dependency's generic the program instantiates is asked at the type the program chose")
+dmw_program_chooses_a_dependency_generic()
+    if !lbr_ready() then return
+
+    val lib = dmw_root()
+
+    for ty in ["u32", "i64"]
+        val program = dmw_board(s"import sysl.sync.*\nimport sh.dmw.gen.read\n\n" +
+                                s"private var c: Atomic[$ty] = Atomic(0)", "read(&c)")
+        val got = dmw_build_c(program, lib, "thumbv7em-freestanding")
+
+        if ty == "u32"
+            assert(got.0 == 0, got.1)
+        else
+            assert(got.0 != 0, got.1)
+            assert(got.1.index_of(s"${dmw_wide("atomic_load")}\n  --> library/sysl/sync/atomic.sysl:49:24")
+                   .is_some(), got.1)
+            assert(got.1.count_of("error: ") == 1, got.1)
+        end if
+
+        remove_dir_all(program).unwrap_or(())
+
+    remove_dir_all(lib).unwrap_or(())
+end dmw_program_chooses_a_dependency_generic
+
+@test("a module storage initializer that reads an Atomic[i64] is refused for the instance it reaches")
+dmw_module_storage_reaches_the_instance()
+    if !lbr_ready() then return
+
+    val lib = dmw_root()
+    val program = dmw_board("import sysl.sync.*\n\nprivate var c: Atomic[i64] = Atomic(0)\n" +
+                            "private val first: i64 = c.load(Relaxed)", "first")
+    val got = dmw_build_c(program, lib, "thumbv7em-freestanding")
+
+    assert(got.0 != 0, got.1)
+    assert(got.1.index_of(s"${dmw_wide("atomic_load")}\n  --> library/sysl/sync/atomic.sysl:49:24")
+           .is_some(), got.1)
+    assert(got.1.count_of(dmw_wide("atomic_load")) == 1, got.1)
+
+    remove_dir_all(program).unwrap_or(())
+    remove_dir_all(lib).unwrap_or(())
+end dmw_module_storage_reaches_the_instance
+
+@test("on an M0+ a dependency's read-modify-writes are asked only of the modules the program names")
+dmw_m0_asks_only_named_modules()
+    if !lbr_ready() then return
+
+    val lib = dmw_root()
+    val free = dmw_board("import sh.dmw.free.twice", "twice(2) - 4")
+    val fine = dmw_build_c(free, lib, "thumbv6m-freestanding")
+
+    assert(fine.0 == 0, fine.1)
+    assert(fine.1.index_of("error").is_none(), fine.1)
+
+    val spin = dmw_board("import sh.dmw.spin.hit", "hit()")
+    val got = dmw_build_c(spin, lib, "thumbv6m-freestanding")
+    val file = s"$lib/sh/dmw/spin/spin.sysl"
+
+    assert(got.0 != 0, got.1)
+    assert(got.1.index_of("error: 'SpinLock' takes its flag with an atomic exchange, and " +
+                          s"'thumbv6m-freestanding' has no instruction for one").is_some(), got.1)
+    assert(got.1.index_of(s"--> $file:9:10").is_some(), got.1)
+    assert(got.1.index_of(s"--> $file:11:10").is_some(), got.1)
+
+    // Nothing is said about the deque, which the program never names, though its `add` is one.
+    assert(got.1.index_of("deque.sysl").is_none(), got.1)
+
+    remove_dir_all(free).unwrap_or(())
+    remove_dir_all(spin).unwrap_or(())
+    remove_dir_all(lib).unwrap_or(())
+end dmw_m0_asks_only_named_modules
+
+@test("a library built on its own for an M4 is asked about every module, the wide ones included")
+dmw_a_library_build_asks_every_module()
+    if !lbr_ready() then return
+
+    val lib = dmw_root()
+    val got = lbr_cli(["sysl", "build-lib", lib, "--target", "thumbv7em-freestanding"])
+
+    assert(got.0 != 0, got.1)
+    assert(got.1.index_of(s"${dmw_wide("atomic_load")}\n --> $lib/sh/dmw/raw/raw.sysl:7:17")
+           .is_some(), got.1)
+    assert(got.1.index_of(s"${dmw_wide("atomic_load")}\n  --> library/sysl/sync/atomic.sysl:49:24")
+           .is_some(), got.1)
+    assert(got.1.index_of(s"${dmw_wide("atomic_add")}\n  --> library/sysl/sync/atomic.sysl:93:20")
+           .is_some(), got.1)
+
+    remove_dir_all(lib).unwrap_or(())
+end dmw_a_library_build_asks_every_module
