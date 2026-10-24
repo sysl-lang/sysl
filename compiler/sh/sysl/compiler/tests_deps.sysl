@@ -951,3 +951,47 @@ the_census_preflights_both_compilers()
             assert(answer.status.ok(), said)
             assert(said.contains("preflight: both compilers build a program"), said)
 end the_census_preflights_both_compilers
+
+// **A failed row quotes its first failure, not the first line of its output.** The first line of a
+// run is nearly always the warning a `package.hocon` manifest draws, so a test that failed under load
+// read as a repository refused for its manifest. The reason is one line whatever the failure held.
+@test("a census row quotes the failure, not the legacy manifest warning above it")
+the_census_quotes_the_failure()
+    val dir = make_temp_dir("sysl-census-why").unwrap()
+    val warning = "'.' names its manifest package.hocon — rename it to sysl.hocon, or run 'sysl config fix'"
+    val failing = s"$warning\nrunning 2 tests\n  ok    one   3ms\n  FAIL  two   4ms\n        did not return\n" +
+                  "        at /x/tests.sysl:9\n        > panic: nothing listened\n"
+
+    write_text(join_path(dir, "failing.out"), failing).unwrap()
+    write_text(join_path(dir, "warned.out"), s"$warning\nerror: no such module\n").unwrap()
+    write_text(join_path(dir, "bare.out"), s"$warning\nsomething else happened\n").unwrap()
+
+    for (file, wants) in [("failing.out", "FAIL two"), ("warned.out", "error: no such module"),
+                          ("bare.out", "something else happened")]
+        capture("env", [s"SYSL_CENSUS_WHY=$dir/$file", "sh", "../scripts/org_build_census.sh", "/bin/echo", "/bin/echo"], "", [], true) match
+            Err(_) -> assert(false, "the build census script could not be run")
+            Ok(answer) ->
+                val said = answer.text + answer.err.unwrap_or("")
+
+                assert(said.contains(wants), said)
+                assert(!said.contains("names its manifest"), said)
+                assert(file != "failing.out" || said.contains("FAIL two 4ms did not return > panic: nothing listened"), said)
+
+    remove_dir_all(dir)
+end the_census_quotes_the_failure
+
+// **Two censuses share nothing**: each makes its own work directory, so one run's trees, rows and
+// pinned compiler cannot reach the other's, whatever compiler either is.
+@test("two census runs at once each work in a directory of their own")
+two_censuses_do_not_share_a_work_directory()
+    val args = ["SYSL_CENSUS_PIN_ONLY=1", "sh", "../scripts/org_build_census.sh", "/bin/echo"]
+
+    capture("env", args, "", [], true) match
+        Err(_) -> assert(false, "the build census script could not be run")
+        Ok(first) ->
+            capture("env", args, "", [], true) match
+                Err(_) -> assert(false, "the build census script could not be run")
+                Ok(second) ->
+                    assert(first.text.contains("/pin-ours/sysl runs /bin/echo"), first.text)
+                    assert(first.text != second.text, "both runs named one work directory: " + first.text)
+end two_censuses_do_not_share_a_work_directory

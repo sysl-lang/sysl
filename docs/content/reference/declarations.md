@@ -3523,6 +3523,22 @@ print(Circle(1.0).area(), Rect(2.0, 3.0).area())
 A member is told from a variant by what follows it: a member needs a body after its header, so
 `Circle(r: real)` — a header with nothing after it — is a variant.
 
+**A function in an enum body is named in lowercase.** `Circle(r: real) = 0` reads as a variant given
+a value, and it is a function: it would leave the enum without the variant it was written to declare.
+A capitalised name with a body after its brackets is refused rather than read that way:
+
+```sysl
+enum Shape
+    Circle(r: int) = 0
+    Square(side: int)
+
+print(1)
+```
+
+```error
+'Circle' is read as a function, but a function in an enum body is named in lowercase — a variant that carries data cannot be given a value
+```
+
 **An underlying type belongs to a simple enum alone.** `: u8` pins the storage of a set of
 discriminants; a data enum has a payload beside its tag, so there is no single integer for the
 annotation to be about and the tag's width is the compiler's to choose:

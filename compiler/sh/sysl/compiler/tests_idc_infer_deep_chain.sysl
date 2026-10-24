@@ -1,0 +1,204 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.fs.{make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.{replace_all, str_builder}
+
+// A result read off an `= value` body is read callees first (`inferred_results.sysl`'s
+// `settle_callees_first`), so a chain of declarations each taking its result from the next one's is
+// as deep as the program and no deeper on the compiler's stack. Read on demand from the top, each
+// reading nested the next one's, and thousands of them overflowed the stack (exit 139). A loop is
+// still refused at the declaration it was entered by, through the same ones.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private idc_ready() -> bool = std_root().is_ok() && clang_available()
+
+private idc_root(text: string) -> string
+    val root = replace_all(make_temp_dir("sysl-idc").unwrap(), "//", "/")
+
+    write_text(s"$root/package.hocon", "").unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+    root
+end idc_root
+
+// What the program prints, or the report it was refused with.
+private idc_ran(text: string) -> string
+    val root = idc_root(text)
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            val said = replace_all(failure_text(why), s"$root/", "")
+
+            remove_dir_all(root).unwrap_or(())
+            return said
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end idc_ran
+
+// The report a program was refused with, empty where it was not.
+private idc_report(text: string) -> string
+    val root = idc_root(text)
+
+    val out = emit_llvm_text(root, None) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> if made.report.is_empty() then "" else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    replace_all(out, s"$root/", "")
+end idc_report
+
+// Refused with exactly `message`, first, at `at` (`line:col` of `main.sysl`).
+private idc_refused(text: string, message: string, at: string)
+    val said = idc_report(text)
+    val head = s"error: $message"
+    val place = s"--> main.sysl:$at\n"
+
+    assert(said.starts_with(head) && said.contains(place),
+           s"expected a report starting\n$head\nlocated at $place\ngot\n$said")
+end idc_refused
+
+// `main` calling `f0(&n)` and printing it, then `count` declarations each handing on to the next,
+// `written` among them stating its result, the last ending in `last`.
+private idc_chain(count: int, written: int, last: string, head: string = "    print(f0(&n))\n") -> string
+    var b = str_builder()
+
+    b.push("main()\n    var n = 1\n")
+    b.push(head)
+
+    for i in 0..<count
+        val ret = if i == written then " -> int" else ""
+        val body = if i + 1 < count then s"f${i + 1}(p)" else last
+
+        b.push(s"f${i}(p: *int)$ret = $body\n")
+
+    b.finish()
+end idc_chain
+
+// -- the chains -----------------------------------------------------------------------------------
+
+@test("idc: thirty-two thousand results each read off the next one's body build, and hand back an int")
+idc_a_deep_chain_builds() =
+    if idc_ready() then assert_eq(idc_ran(idc_chain(32000, -1, "*p + 1")), "2\n")
+
+@test("idc: the result the deep chain reads is the int, as a declaration that wants a bool is told")
+idc_the_deep_chain_reads_int()
+    if !idc_ready() then return
+
+    idc_refused(idc_chain(32000, -1, "*p + 1", "    val wrong: bool = f0(&n)\n    print(wrong)\n"),
+                "cannot initialize 'wrong': declared bool but the value is int", "3:5")
+
+@test("idc: a chain with a written result type half-way builds, two inferred runs either side of it")
+idc_a_chain_with_a_written_link() =
+    if idc_ready() then assert_eq(idc_ran(idc_chain(32000, 16000, "*p + 1")), "2\n")
+
+@test("idc: a chain of generic functions, each reading its result off the next one's, builds")
+idc_a_generic_chain()
+    if !idc_ready() then return
+
+    var b = str_builder()
+
+    b.push("main()\n    print(g0(41) + 1)\n")
+
+    for i in 0..<8000
+        val body = if i + 1 < 8000 then s"g${i + 1}(x)" else "x"
+
+        b.push(s"g${i}[T](x: T) = $body\n")
+
+    assert_eq(idc_ran(b.finish()), "42\n")
+end idc_a_generic_chain
+
+@test("idc: a chain of methods, each reading its result off the next one's, builds")
+idc_a_method_chain()
+    if !idc_ready() then return
+
+    var b = str_builder()
+
+    b.push("main()\n    print(S(41).m0() + 1)\nstruct S\n    v: int\n")
+
+    for i in 0..<8000
+        val body = if i + 1 < 8000 then s"self.m${i + 1}()" else "self.v"
+
+        b.push(s"    m${i}(self) = $body\n")
+
+    assert_eq(idc_ran(b.finish()), "42\n")
+end idc_a_method_chain
+
+// -- the loops ------------------------------------------------------------------------------------
+
+@test("idc: a loop is refused at the declaration it is entered by, through the others, with callers ahead")
+idc_a_loop_is_refused()
+    if !idc_ready() then return
+
+    idc_refused(raw"""
+        main()
+            print(top(1))
+
+        top(n: int) = mid(n)
+        mid(n: int) = a(n)
+        a(n: int) = if n > 0 then b(n - 1) else 0
+        b(n: int) = c(n)
+        c(n: int) = a(n)
+        """,
+        "'a' takes its result type from its body, and the body reaches 'a' again through 'b', 'c' — " +
+        "write its result type, 'a(…) -> T'", "6:1")
+end idc_a_loop_is_refused
+
+@test("idc: a loop at the far end of a deep chain is refused, and the chain into it does not overflow")
+idc_a_loop_at_the_end_of_a_deep_chain()
+    if !idc_ready() then return
+
+    idc_refused(idc_chain(8000, -1, "a(*p)") + "a(n: int) = if n > 0 then b(n - 1) else 0\nb(n: int) = a(n)\n",
+                "'a' takes its result type from its body, and the body reaches 'a' again through 'b' — " +
+                "write its result type, 'a(…) -> T'", "8004:1")
+
+@test("idc: a function whose body names itself is refused as before, beside a chain read early")
+idc_a_self_call_is_refused()
+    if !idc_ready() then return
+
+    idc_refused(idc_chain(4, -1, "*p + down(3)") + "down(n: int) = if n > 0 then down(n - 1) else 0\n",
+                "'down' takes its result type from its body, and the body reaches 'down' again — " +
+                "write its result type, 'down(…) -> T'", "8:1")
+
+// -- the walk over a body whose result is left to it -----------------------------------------------
+
+@test("idc: an editor's walk over a function whose result is left to its body finds what is in it")
+idc_locate_in_an_inferred_function()
+    val p = parse(source_of("t.sysl", "twice(x: int) = x * 2\n"))
+
+    assert(!p.report.has_errors(), "the fixture does not parse")
+
+    val c = innermost(p.program, 1, 17).unwrap()
+
+    assert_eq(c.name, "Ident")
+end idc_locate_in_an_inferred_function
+
+@test("idc: a trait object handed to a generic function whose result is left to its body is read through")
+idc_a_trait_object_into_an_inferred_generic()
+    if !idc_ready() then return
+
+    assert_eq(idc_ran(raw"""
+        trait Port
+            mask(self) -> u32
+        struct Board
+            level: u32
+        impl Port for Board
+            mask(self) -> u32 = self.level
+        send[P: Port](p: *P, v: u32) = p.mask() + v
+
+        main()
+            var b = Board(40)
+            val port: *Port = &b
+            print(send(port, 2))
+        """), "42\n")
+end idc_a_trait_object_into_an_inferred_generic
