@@ -104,6 +104,7 @@ inside:
 
 ```sysl
 import sysl.dma
+import sysl.raw.ptr_cast
 import sysl.slices.as_mut_ptr
 
 struct Request

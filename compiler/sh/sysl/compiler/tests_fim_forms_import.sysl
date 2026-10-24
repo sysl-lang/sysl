@@ -15,6 +15,33 @@ import sysl.text.{join, replace_all}
 
 // -- the harness ----------------------------------------------------------------------------------
 
+// **A program's text with the imports its forms need**, for the suites whose programs use the forms
+// in passing: a wildcard over `sysl.raw` where it names one of that module's, and one over `sysl.c`
+// where it names a `va_` form. They go LAST: an import holds for its whole file wherever it stands,
+// and at the end it moves no line a suite pins a position on, and comes after a `module` line and
+// the header attributes that have to follow it.
+forms_imported(text: string) -> string
+    var head = ""
+
+    // A text that already imports from one of the modules says for itself what it brings in, which is
+    // how a suite keeps a form unimported on purpose.
+    if (text.contains("ptr_cast") || text.contains("str_cast") || text.contains("str_alias")) &&
+       !text.contains("import sysl.raw") then
+        head = head + "import sysl.raw.*\n"
+
+    if (text.contains("va_start") || text.contains("va_arg") || text.contains("va_copy") ||
+        text.contains("va_end")) && !text.contains("import sysl.c.") && !text.contains("import sysl.c\n") then
+        head = head + "import sysl.c.*\n"
+
+    if head.is_empty() then return text
+
+    if text.is_empty() || text.ends_with("\n") then text + head else text + "\n" + head
+end forms_imported
+
+// The same for a file of a written tree, which is a sysl source only where its name says so.
+forms_imported_in(name: string, text: string) -> string =
+    if name.ends_with(".sysl") then forms_imported(text) else text
+
 private fim_ready() -> bool
     if std_root().is_err()
         print("skipped: the standard module's source is not on this machine")
@@ -165,7 +192,12 @@ fim_str_alias_unimported()
 fim_va_forms_unimported()
     if !fim_ready() then return
 
-    fim_refused(fim_sum, "'va_start' is in sysl.c: add 'import sysl.c.va_start'", "5:5")
+    // Every one of the six uses is told, and the first of them is told first.
+    val none = fim_said(fim_sum)
+
+    assert(none.starts_with("error: 'va_start' is in sysl.c: add 'import sysl.c.va_start'\n --> "), none)
+    assert(none.index_of("/main.sysl:5:5\n").is_some(), none)
+    assert(none.count_of("error: ") >= 5, none)
 
     val without_one = "import sysl.c.{va_start, va_arg, va_end}\n\n" + fim_sum
 
@@ -245,6 +277,37 @@ fim_aliased()
                       "var a: [4]u8 = [104, 105, 0, 0]\nval p: *u32 = pc(&a[0])\n" +
                       "print(*p, *pc[*u8](&a[1]), sc(a[0..<2]), first(1, 41))\n"), "26984 105 hi 42\n")
 
+private val fim_no_ref: string =
+    "'ptr_cast' never produces a reference: a '&T' is counted and non-null, and an address read out " +
+    "of bytes carries no count for anything to own — read it as a '*T'"
+
+@test("ptr_cast in a '&T' position is the form refusing it, imported under its own name")
+fim_ref_position_own_name()
+    if !fim_ready() then return
+
+    fim_refused("import sysl.raw.ptr_cast\n\nvar a: [4]u8 = [1, 0, 0, 0]\nval r: &u32 = ptr_cast(&a[0])\n",
+                fim_no_ref, "4:15")
+
+@test("ptr_cast in a '&T' position is the form refusing it under an alias, not a boxed value")
+fim_ref_position_aliased()
+    if !fim_ready() then return
+
+    fim_refused("import sysl.raw.ptr_cast as pc\n\nvar a: [4]u8 = [1, 0, 0, 0]\nval r: &u32 = pc(&a[0])\n",
+                fim_no_ref, "4:15")
+
+@test("ptr_cast in a '&T' position is the form refusing it through the module's path")
+fim_ref_position_through_the_module()
+    if !fim_ready() then return
+
+    fim_refused("import sysl.raw\n\nvar a: [4]u8 = [1, 0, 0, 0]\nval r: &u32 = raw.ptr_cast(&a[0])\n",
+                fim_no_ref, "4:19")
+
+@test("a function of the program's own called ptr_cast in a '&T' position is boxed like any value")
+fim_ref_position_own_function()
+    if !fim_ready() then return
+
+    assert_eq(fim_ran("ptr_cast(n: int) -> int = n + 1\n\nval r: &int = ptr_cast(1)\nprint(*r)\n"), "2\n")
+
 @test("an aliased import leaves the form's own spelling unimported")
 fim_aliased_leaves_the_name_out()
     if !fim_ready() then return
@@ -316,7 +379,8 @@ fim_one_file_of_a_module()
 
     val bad = lbr_tree(lbr_two(
         "demo/a.sysl", "module demo\n\nimport sysl.raw.ptr_cast\n\nlow(p: *u32) -> u8 = *ptr_cast[*u8](p)\n",
-        "demo/b.sysl", "module demo\n\nhigh(p: *u32) -> u8\n    val b: *u8 = ptr_cast(p)\n    b[3]\n"))
+        "demo/b.sysl", "module demo\n// without the 'import sysl.raw.ptr_cast' a.sysl has\n" +
+                       "high(p: *u32) -> u8\n    val b: *u8 = ptr_cast(p)\n    b[3]\n"))
     val prog2 = lbr_program("import demo.{low, high}\n\nvar x: u32 = 260\nprint(low(&x), high(&x))\n")
     val said = lbr_run(prog2, [bad])
 

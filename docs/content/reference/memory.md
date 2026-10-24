@@ -1122,6 +1122,8 @@ the tail of an `if` or `match` arm, or wrapped in `ptr_cast`. A `(self)` method 
 the usual way to write it by accident, since `self` reads like the caller's value and is a copy:
 
 ```sysl
+import sysl.raw.ptr_cast
+
 struct Rec
     a: int
     b: int
@@ -2359,6 +2361,8 @@ nothing, and the result is a number that cannot be dereferenced. `isize` takes o
 a program comparing addresses against a signed offset wants.
 
 ```sysl
+import sysl.raw.ptr_cast
+
 struct Node
     value: int
 
@@ -2387,6 +2391,8 @@ literals, is a `usize` at the target's width. So the address a datasheet gives i
 printed there, and so is a base plus an offset or a bit shifted into place:
 
 ```sysl
+import sysl.raw.ptr_cast
+
 struct Uart
     data: u32
     status: u32
@@ -2410,6 +2416,8 @@ value that already has a type keeps it, so an `int`, a suffixed literal such as 
 expression with either inside it is still refused, and is converted where it is meant as an address:
 
 ```sysl
+import sysl.raw.ptr_cast
+
 var base = 0x4000_4000
 val uart: *u32 = ptr_cast(base)
 
@@ -2427,6 +2435,8 @@ written on the form: `ptr_cast[*Node](&arena[0])` is
 pointer is wanted, the program is told to annotate what receives it:
 
 ```sysl
+import sysl.raw.ptr_cast
+
 var arena: [64]u8 = [0u8; 64]
 var p = ptr_cast(&arena[0])
 
@@ -2442,6 +2452,8 @@ relied on by everything the safe subset promises — and an address invented fro
 ARC to own and no object to be non-null about:
 
 ```sysl
+import sysl.raw.ptr_cast
+
 struct Node
     value: int
 
@@ -2485,6 +2497,8 @@ answers `false` for it; a trait object and a `weak T` are refused, the latter an
 `.get()`, and anything that is not a reference is refused naming its type.
 
 ```sysl
+import sysl.raw.ptr_cast
+
 extern "calloc" c_calloc(n: usize, size: usize) -> *u8
 extern "free" c_free(p: *u8)
 

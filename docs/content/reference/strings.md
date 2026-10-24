@@ -614,6 +614,8 @@ it, and otherwise through the `Debug` every table carries. A callable prints as 
 directly builds, with a warning that names the value and what to print instead.
 
 ```sysl
+import sysl.raw.ptr_cast
+
 trait Area
     area(self) -> int
 

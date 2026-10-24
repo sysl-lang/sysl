@@ -3072,6 +3072,8 @@ by hand. **The bits fill from the least significant upward in declaration order*
 straddles a byte boundary** rather than moving off it. Both are visible in the storage:
 
 ```sysl
+import sysl.raw.ptr_cast
+
 @packed
 struct Ctrl
     enable: u1
@@ -3340,6 +3342,8 @@ what C does with `volatile unsigned x : 3`, and what lets a `@packed` struct des
 register rather than only a data layout:
 
 ```sysl
+import sysl.raw.ptr_cast
+
 @packed
 struct Reg
     enable: volatile u1
@@ -3366,6 +3370,8 @@ is no shadow field here to stay ordinary — which is the thing per-field qualif
 ordinary register block. The struct itself still may not carry the qualifier, and does not need to:
 
 ```sysl
+import sysl.raw.ptr_cast
+
 @packed
 struct Ctrl
     a: u3
@@ -3411,6 +3417,8 @@ how a kernel asks for "the exception class, if it is one I know" without declari
 `u6`:
 
 ```sysl
+import sysl.raw.ptr_cast
+
 enum Ec: u6
     Unknown = 0x00
     Brk = 0x3c
@@ -3821,6 +3829,8 @@ reads them. `@byte_order` says so once, above the struct, and every integer fiel
 **stored** in that order and **read and written** as an ordinary integer.
 
 ```sysl
+import sysl.raw.ptr_cast
+
 @packed
 @byte_order(big)
 struct Udp
@@ -3956,6 +3966,8 @@ integer, so the integer is what is stored in the stated order — IPv4's sixteen
 fragment offset are exactly this:
 
 ```sysl
+import sysl.raw.ptr_cast
+
 @packed
 @byte_order(big)
 struct Frag

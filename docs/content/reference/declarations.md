@@ -341,6 +341,8 @@ device register block named at file scope, reached by every function in the driv
 re-materialised in each:
 
 ```
+import sysl.raw.ptr_cast
+
 const UART: usize = 0x1000_0000
 val regs: *Uart = ptr_cast(UART)
 ```

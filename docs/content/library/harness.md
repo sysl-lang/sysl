@@ -184,6 +184,8 @@ library:
 ```sysl
 module board
 
+import sysl.raw.ptr_cast
+
 struct Uart
     data: volatile u8
 
