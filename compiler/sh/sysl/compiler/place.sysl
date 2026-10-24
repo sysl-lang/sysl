@@ -115,6 +115,7 @@ require_place(cx: &Analyzer, t: TExpr, target: Expr, what: string, writes: bool,
     // Only a write is asked about: `&` produces a pointer and takes nothing away, so the storage a
     // `ref` found is exactly where it was.
     if writes && !check_view_guards(cx, at, t) then check_ref_guards(cx, at, t)
+    if writes then note_pointer_move(cx, t.span, t, 2, "")
 
     t
 end require_place
@@ -713,6 +714,8 @@ private indirect_step(cx: &Analyzer, s: TExpr) -> bool = *s.kind match
 // `Buf` handle on the same buffer -- moves the same storage, so a receiver of a type the ref's
 // storage is held in is refused the same way off the ref's own path.
 check_ref_call(cx: &Analyzer, at: Span, place: TExpr, relocating: string = "")
+    note_pointer_move(cx, at, place, if relocating != "" then 0 else 1, relocating)
+
     if check_view_call(cx, at, place) then return
 
     val key = place_key(cx, place)
@@ -756,6 +759,56 @@ check_ref_call(cx: &Analyzer, at: Span, place: TExpr, relocating: string = "")
             return
         end if
 end check_ref_call
+
+// -- a `*T` held to the same rule, for as long as it is live -----------------------------------------
+//
+// `&b[i]` stands on the element a `ref r = b[i]` would, so what holds the one still has to hold the
+// other. A pointer has no scope, so what is noted here is only the `&` and the moves; which uses come
+// after which is asked once the body is typed (`counted_pointers.sysl`).
+
+// Files an `&` whose path goes through an owning step: the steps a call on which may move it, and the
+// places whose overwriting or release lets go of what it points into. An `&` reaching nothing that
+// moves -- a frame local, a field of one, an element of a fixed array -- is not filed at all.
+note_counted_address(cx: &Analyzer, span: Span, place: TExpr)
+    val hazards = ref_hazards(cx, place)
+
+    if hazards.is_empty() then return
+
+    var strands = hazards.copy()
+    var below = false
+    var at = step_before(cx, place)
+    var through_call = false
+
+    // Replacing a step lets go of everything below it down to the first pointer: a `*T` owns
+    // nothing, so above one the storage is somewhere else.
+    while at.is_some()
+        val step = at.unwrap()
+        val ty = texpr_type(step)
+        val pointer = repr(ty) match
+            Ptr(_) -> true
+            _ -> false
+
+        if pointer
+            below = false
+        else
+            val k = place_key(cx, step)
+
+            if below && k.is_some() && !holds_string(strands, k.unwrap()) then strands.push(k.unwrap())
+            if owning_step(ty) || (through_call && holds_storage(ty)) then below = true
+        end if
+
+        through_call = placed_by(cx, step).is_some()
+        at = step_before(cx, step)
+
+    cx.ptr_addrs.push(PtrAddr(span, hazards, strands))
+end note_counted_address
+
+// Files a call on a receiver (`kind` 0 for a `@relocates` member, 1 for a `*self` one) or an
+// assignment (2), by the place it acts on.
+note_pointer_move(cx: &Analyzer, span: Span, place: TExpr, kind: int, member: string)
+    val key = place_key(cx, place)
+
+    if key.is_some() then cx.ptr_moves.push(PtrMove(span, kind, member, key.unwrap()))
 
 // How a diagnostic names an assignment target.
 describe_target(target: Expr) -> string = *target.kind match

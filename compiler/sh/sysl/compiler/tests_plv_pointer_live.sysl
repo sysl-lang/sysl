@@ -1,0 +1,400 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.text.Search
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// A `*T` taken by `&` into counted storage is held to the rule a `ref` is held to, for as long as
+// the pointer is live (`counted_pointers.sysl`, `reference/memory.md § The one rule: what may move
+// underneath it`): a `@relocates` member, a `*self` call on the owner, an assignment replacing the
+// owner, and the end of the block that declared it each strand the pointer, and a use after any of
+// them is refused. A pointer whose last use comes first, one into a frame local, and one into a view
+// are accepted.
+
+private plv_ready() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+
+    true
+end plv_ready
+
+private plv_root(text: string) -> string
+    val root = make_temp_dir("sysl-pointer-live").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+    root
+
+private plv_ran(text: string) -> string
+    val root = plv_root(text)
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> if out.status.ok() then out.text else s"it did not exit zero: ${out.text}"
+end plv_ran
+
+private plv_report(text: string) -> string
+    val root = plv_root(text)
+
+    val out = emit_llvm_text(s"$root/main.sysl", None) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> if made.report.is_empty() then "accepted" else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+
+private plv_refused(text: string, part: string)
+    val out = plv_report(text)
+
+    assert(out.contains(part), s"expected '$part' in: $out")
+
+private plv_head() -> string = "import sysl.buf.*\n\n"
+
+// The refusal a `@relocates` member's call is given while `name` is live.
+private plv_moves(name: string, member: string) -> string =
+    s"'$name' is a pointer to an element whose storage '$member' could move or give up, since it is " +
+    "'@relocates', and it is used after this call — so it could be left pointing at freed memory. " +
+    "Make the call before taking the address, or after the pointer's last use"
+
+private plv_self_call(name: string) -> string =
+    s"'$name' is a pointer into storage this call could release, since a '*self' method may write " +
+    "its receiver, and it is used after this call — so it could be left pointing at freed memory. " +
+    "Make the call before taking the address, or after the pointer's last use"
+
+private plv_assigned(name: string) -> string =
+    s"'$name' is a pointer into storage this assignment would release, and it is used after it — so " +
+    "it would be left pointing at freed memory. Write the assignment before taking the address, or " +
+    "after the pointer's last use"
+
+private plv_block(name: string, owner: string) -> string =
+    s"'$name' points into storage '$owner' holds, and '$owner' was let go of where its block ended — " +
+    s"so this would read freed memory. Use the pointer inside that block, or declare '$owner' in a " +
+    "block that holds the pointer's uses too"
+
+// One function taking the address, calling `call` on the owner, and reading the pointer after.
+private plv_member(call: string) -> string =
+    plv_head() + "run(b: Buf[int]) -> int\n    val p = &b[0]\n    " + call + "\n    *p\n\n" +
+    "val b: Buf[int] = buf()\nb.push(1)\nprint(run(b))\n"
+
+// -- the two programs that read freed memory at run time ---------------------------------------------
+
+@test("a pointer to an element read after the buffer grew is refused at the push")
+plv_grown_buffer_refused()
+    if !plv_ready() then return
+
+    plv_refused(plv_head() + "run() -> int\n    val b: Buf[int] = buf()\n    b.push(41)\n" +
+                "    val p = &b[0]\n    for i in 0..<100 do b.push(i)\n    *p + 1\n\nprint(run())\n",
+                plv_moves("p", "push"))
+
+@test("a pointer into a block-local buffer read after the block is refused at the read")
+plv_block_local_buffer_refused()
+    if !plv_ready() then return
+
+    plv_refused(plv_head() + "run(c: bool) -> int\n    var n = 0\n    var p = &n\n    if c\n" +
+                "        val b: Buf[int] = buf()\n        b.push(41)\n        p = &b[0]\n" +
+                "    val q: Buf[int] = buf()\n    q.push(7)\n    *p + 1\n\nprint(run(true))\n",
+                plv_block("p", "b"))
+
+@test("the entry file's own statements are a body held to the same rule")
+plv_entry_file_refused()
+    if !plv_ready() then return
+
+    plv_refused(plv_head() + "var b: Buf[int] = buf()\n\nb.push(1)\n\nval p = &b[0]\n\nb.push(2)\nprint(*p)\n",
+                plv_moves("p", "push"))
+
+@test("a closure's body is held to the same rule")
+plv_closure_refused()
+    if !plv_ready() then return
+
+    plv_refused(plv_head() + "val f = (b: Buf[int]) ->\n    val p = &b[0]\n    b.push(2)\n    *p\n\n" +
+                "val b: Buf[int] = buf()\nb.push(1)\nprint(f(b))\n", plv_moves("p", "push"))
+
+// -- every '@relocates' member of 'Buf' ----------------------------------------------------------------
+
+@test("each '@relocates' member of 'Buf' is refused while a pointer to an element is live")
+plv_every_member_refused()
+    if !plv_ready() then return
+
+    val calls = ["b.push(2)", "b.extend([1, 2])", "b.insert(0, 3)", "b.pop()", "b.truncate(0)",
+                 "b.clear()", "b.remove(0)", "b.reserve(100)"]
+    val members = ["push", "extend", "insert", "pop", "truncate", "clear", "remove", "reserve"]
+
+    for i in 0..<calls.len
+        plv_refused(plv_member(calls[i]), plv_moves("p", members[i]))
+
+@test("'release' and 'set_len' are refused while a pointer to an element is live")
+plv_release_and_set_len_refused()
+    if !plv_ready() then return
+
+    plv_refused(plv_head() + "run(b: Buf[int]) -> int\n    var c = b\n    val p = &c[0]\n" +
+                "    c.release()\n    *p\n\nprint(run(buf()))\n", plv_moves("p", "release"))
+    plv_refused(plv_member("b.set_len(0)"), plv_moves("p", "set_len"))
+
+@test("a program's own '@relocates' '*self' member is refused under its own name")
+plv_user_relocates_refused()
+    if !plv_ready() then return
+
+    plv_refused(plv_head() + "struct Pool\n    cells: Buf[int]\n\n    @relocates\n" +
+                "    grow(*self) = self.cells.push(0)\n\nrun() -> int\n    var s = Pool(buf())\n" +
+                "    s.cells.push(4)\n    val p = &s.cells[0]\n    s.grow()\n    *p\n\nprint(run())\n",
+                plv_moves("p", "grow"))
+
+// -- liveness ------------------------------------------------------------------------------------------
+
+@test("a copy of the pointer in another local keeps it live")
+plv_copy_refused()
+    if !plv_ready() then return
+
+    plv_refused(plv_head() + "run() -> int\n    val b: Buf[int] = buf()\n    b.push(41)\n" +
+                "    val p = &b[0]\n    var q = p\n    b.clear()\n    *q\n\nprint(run())\n",
+                plv_moves("q", "clear"))
+
+@test("an offset made from the pointer keeps it live")
+plv_offset_refused()
+    if !plv_ready() then return
+
+    plv_refused(plv_head() + "run() -> int\n    val b: Buf[int] = buf()\n    b.push(41)\n" +
+                "    b.push(42)\n    val p = &b[0]\n    val q = &p[1]\n    b.push(43)\n    *q\n\n" +
+                "print(run())\n", plv_moves("q", "push"))
+
+@test("a pointer handed to a callee that does not keep it is dead after the call, so a push is accepted")
+plv_last_use_then_push_accepted()
+    if !plv_ready() then return
+
+    val src = plv_head() + "show(p: *int) -> int = *p\n\nrun() -> int\n    val b: Buf[int] = buf()\n" +
+              "    b.push(41)\n    val p = &b[0]\n    val q = p\n    val got = show(q)\n    b.push(2)\n" +
+              "    got + b[1]\n\nprint(run())\n"
+
+    assert_eq(plv_ran(src), "43\n")
+
+@test("the pointer read as an argument of the push itself is read before the push")
+plv_read_in_the_push_accepted()
+    if !plv_ready() then return
+
+    val src = plv_head() + "run() -> int\n    val b: Buf[int] = buf()\n    b.push(41)\n" +
+              "    val p = &b[0]\n    b.push(*p + 1)\n    b[1]\n\nprint(run())\n"
+
+    assert_eq(plv_ran(src), "42\n")
+
+@test("a pointer assigned something else before its next use is not stranded")
+plv_reassigned_pointer_accepted()
+    if !plv_ready() then return
+
+    val src = plv_head() + "run() -> int\n    val b: Buf[int] = buf()\n    b.push(41)\n    var n = 1\n" +
+              "    var p = &b[0]\n    val first = *p\n    b.push(2)\n    p = &n\n    *p + first\n\n" +
+              "print(run())\n"
+
+    assert_eq(plv_ran(src), "42\n")
+
+@test("a push on only one branch strands the pointer after the join")
+plv_one_branch_refused()
+    if !plv_ready() then return
+
+    plv_refused(plv_head() + "run(c: bool) -> int\n    val b: Buf[int] = buf()\n    b.push(41)\n" +
+                "    val p = &b[0]\n    if c\n        b.push(2)\n    *p\n\nprint(run(true))\n",
+                plv_moves("p", "push"))
+
+@test("a push at the end of a loop's turn strands a pointer read at the start of the next")
+plv_loop_carried_refused()
+    if !plv_ready() then return
+
+    plv_refused(plv_head() + "run() -> int\n    val b: Buf[int] = buf()\n    b.push(41)\n" +
+                "    val p = &b[0]\n    var total = 0\n    for i in 0..<10\n        total += *p\n" +
+                "        b.push(i)\n    total\n\nprint(run())\n", plv_moves("p", "push"))
+
+@test("a pointer taken afresh on every turn of the loop is accepted")
+plv_fresh_each_turn_accepted()
+    if !plv_ready() then return
+
+    val src = plv_head() + "run() -> int\n    val b: Buf[int] = buf()\n    b.push(41)\n" +
+              "    var total = 0\n    for i in 0..<10\n        val p = &b[0]\n        total += *p\n" +
+              "        b.push(i)\n    total\n\nprint(run())\n"
+
+    assert_eq(plv_ran(src), "410\n")
+
+@test("a copy carried across turns from an earlier '&' is still stranded when the '&' runs again")
+plv_earlier_turn_copy_refused()
+    if !plv_ready() then return
+
+    plv_refused(plv_head() + "run() -> int\n    val b: Buf[int] = buf()\n    b.push(41)\n" +
+                "    var n = 0\n    var q = &n\n    var total = 0\n    for i in 0..<10\n" +
+                "        val p = &b[0]\n        total += *q\n        q = p\n        b.push(i)\n" +
+                "    total\n\nprint(run())\n", plv_moves("q", "push"))
+
+// -- control flow -------------------------------------------------------------------------------------
+
+@test("an early return reading the pointer before the push is accepted; one after it is refused")
+plv_early_return()
+    if !plv_ready() then return
+
+    val before = plv_head() + "run(c: bool) -> int\n    val b: Buf[int] = buf()\n    b.push(41)\n" +
+                 "    val p = &b[0]\n    if c then return *p\n    b.push(2)\n    b[1]\n\n" +
+                 "print(run(true), run(false))\n"
+
+    assert_eq(plv_ran(before), "41 2\n")
+
+    plv_refused(plv_head() + "run(c: bool) -> int\n    val b: Buf[int] = buf()\n    b.push(41)\n" +
+                "    val p = &b[0]\n    b.push(2)\n    if c then return *p\n    b[1]\n\n" +
+                "print(run(true))\n", plv_moves("p", "push"))
+
+@test("a '?' between the push and the read does not end the pointer's life")
+plv_try_between()
+    if !plv_ready() then return
+
+    val half = "half(n: usize) -> Result[usize, string] = if n % 2 == 0 then Ok(n / 2) else Err(\"odd\")\n\n"
+
+    plv_refused(plv_head() + half + "run() -> Result[int, string]\n    val b: Buf[int] = buf()\n" +
+                "    b.push(42)\n    val p = &b[0]\n    b.push(2)\n    val h = half(b.len())?\n" +
+                "    Ok(*p + int(h))\n\nprint(run().unwrap_or(0))\n", plv_moves("p", "push"))
+
+    val read_first = plv_head() + half + "run() -> Result[int, string]\n    val b: Buf[int] = buf()\n" +
+                     "    b.push(42)\n    val p = &b[0]\n    val h = half(usize(*p))?\n    b.push(2)\n" +
+                     "    Ok(b[1] + int(h))\n\nprint(run().unwrap_or(0))\n"
+
+    assert_eq(plv_ran(read_first), "23\n")
+
+@test("a 'defer' reading the pointer runs after the push, so the push is refused")
+plv_defer_refused()
+    if !plv_ready() then return
+
+    plv_refused(plv_head() + "run() -> usize\n    val b: Buf[int] = buf()\n    b.push(41)\n" +
+                "    val p = &b[0]\n    defer print(*p)\n    b.push(2)\n    b.len()\n\nprint(run())\n",
+                plv_moves("p", "push"))
+
+// -- places -------------------------------------------------------------------------------------------
+
+@test("'&b[i].field' on a 'Buf' of structs is held to the rule")
+plv_field_of_element_refused()
+    if !plv_ready() then return
+
+    plv_refused(plv_head() + "struct Pair\n    a: int\n    b: int\n\nrun() -> int\n" +
+                "    val xs: Buf[Pair] = buf()\n    xs.push(Pair(1, 2))\n    val p = &xs[0].b\n" +
+                "    xs.insert(0, Pair(3, 4))\n    *p\n\nprint(run())\n", plv_moves("p", "insert"))
+
+@test("a pointer into a 'Buf' of structs is accepted when its last use comes before the push")
+plv_struct_elements_accepted()
+    if !plv_ready() then return
+
+    val src = plv_head() + "struct Pair\n    a: int\n    b: int\n\nrun() -> int\n" +
+              "    val xs: Buf[Pair] = buf()\n    xs.push(Pair(1, 2))\n    val p = &xs[0]\n" +
+              "    p.b = 40\n    val got = p.a + p.b\n    xs.push(Pair(3, 4))\n    got + xs[1].a\n\n" +
+              "print(run())\n"
+
+    assert_eq(plv_ran(src), "44\n")
+
+@test("a generic 'Buf[T]' is held to the rule in its instantiation")
+plv_generic_refused()
+    if !plv_ready() then return
+
+    plv_refused(plv_head() + "first_after[T](b: Buf[T], v: T) -> T\n    val p = &b[0]\n    b.push(v)\n" +
+                "    *p\n\nval b: Buf[int] = buf()\nb.push(41)\nprint(first_after(b, 2))\n",
+                plv_moves("p", "push"))
+
+@test("a method on a struct holding the 'Buf', and a '*self' call on the struct, are held to the rule")
+plv_method_holder_refused()
+    if !plv_ready() then return
+
+    val src = plv_head() + "struct Stack\n    items: Buf[int]\n\n    add(*self, v: int) = self.items.push(v)\n\n" +
+              "    top_after(*self) -> int\n        val p = &self.items[0]\n        self.items.push(9)\n" +
+              "        *p\nend Stack\n\nrun() -> int\n    var s = Stack(buf())\n    s.add(41)\n" +
+              "    val p = &s.items[0]\n    s.add(1)\n    *p + s.top_after()\n\nprint(run())\n"
+
+    plv_refused(src, plv_moves("p", "push"))
+    plv_refused(src, plv_self_call("p"))
+
+@test("replacing the buffer's owner while a pointer into it is live is refused at the assignment")
+plv_owner_reassigned_refused()
+    if !plv_ready() then return
+
+    plv_refused(plv_head() + "run() -> int\n    var b: Buf[int] = buf()\n    b.push(41)\n" +
+                "    val p = &b[0]\n    b = buf()\n    *p\n\nprint(run())\n", plv_assigned("p"))
+
+@test("replacing the struct that holds the buffer by value is refused the same way")
+plv_enclosing_struct_reassigned_refused()
+    if !plv_ready() then return
+
+    plv_refused(plv_head() + "struct Holder\n    items: Buf[int]\n\nrun() -> int\n" +
+                "    var h = Holder(buf())\n    h.items.push(41)\n    val p = &h.items[0]\n" +
+                "    h = Holder(buf())\n    *p\n\nprint(run())\n", plv_assigned("p"))
+
+@test("writing an element's value through the buffer leaves the storage where it is")
+plv_element_write_accepted()
+    if !plv_ready() then return
+
+    val src = plv_head() + "run() -> int\n    val b: Buf[int] = buf()\n    b.push(41)\n" +
+              "    val p = &b[0]\n    b[0] = 40\n    *p + 2\n\nprint(run())\n"
+
+    assert_eq(plv_ran(src), "42\n")
+
+// -- what a block lets go of --------------------------------------------------------------------------
+
+@test("a pointer into a block-local '&T' read after the block is refused")
+plv_block_local_ref_refused()
+    if !plv_ready() then return
+
+    plv_refused("struct Cell\n    v: int\n\nrun() -> int\n    var n = 0\n    var p = &n\n    if true\n" +
+                "        val c: &Cell = Cell(41)\n        p = &c.v\n    *p + 1\n\nprint(run())\n",
+                plv_block("p", "c"))
+
+@test("a pointer into a block-local Drop type read after the block is refused")
+plv_block_local_drop_refused()
+    if !plv_ready() then return
+
+    plv_refused("struct Handle\n    v: int\n\nimpl Drop for Handle\n    drop(self) = print(\"dropped\")\n\n" +
+                "run() -> int\n    var n = 0\n    var p = &n\n    if true\n        val h = Handle(41)\n" +
+                "        p = &h.v\n    *p + 1\n\nprint(run())\n", plv_block("p", "h"))
+
+@test("a pointer out of a block-local buffer through 'break' is refused at the read")
+plv_break_out_of_block_refused()
+    if !plv_ready() then return
+
+    plv_refused(plv_head() + "run() -> int\n    var n = 0\n    var p = &n\n    loop\n" +
+                "        val b: Buf[int] = buf()\n        b.push(41)\n        p = &b[0]\n        break\n" +
+                "    *p\n\nprint(run())\n", plv_block("p", "b"))
+
+@test("a pointer to a plain local of an inner block lasts the whole frame, so it is accepted")
+plv_plain_local_accepted()
+    if !plv_ready() then return
+
+    val src = "run(c: bool) -> int\n    var m = 1\n    var p = &m\n    if c\n        var n = 41\n" +
+              "        p = &n\n    *p + 1\n\nprint(run(true))\n"
+
+    assert_eq(plv_ran(src), "42\n")
+
+@test("a pointer into a block-local buffer used only inside the block is accepted")
+plv_inside_block_accepted()
+    if !plv_ready() then return
+
+    val src = plv_head() + "run() -> int\n    var got = 0\n    if true\n        val b: Buf[int] = buf()\n" +
+              "        b.push(41)\n        val p = &b[0]\n        got = *p + 1\n    got\n\nprint(run())\n"
+
+    assert_eq(plv_ran(src), "42\n")
+
+// -- a view keeps its storage -------------------------------------------------------------------------
+
+@test("a pointer into a view of the buffer outlives a push, since the view keeps the old storage")
+plv_view_accepted()
+    if !plv_ready() then return
+
+    val src = plv_head() + "run() -> int\n    val b: Buf[int] = buf()\n    b.push(41)\n    val v = b.view()\n" +
+              "    val p = &v[0]\n    for i in 0..<100 do b.push(i)\n    v[0] + *p\n\nprint(run())\n"
+
+    assert_eq(plv_ran(src), "82\n")

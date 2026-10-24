@@ -1231,6 +1231,54 @@ print(e.rec.b)
 What is checked is the result only: a pointer to a local stored into module storage or into a struct
 somewhere else is still the raw tier's bargain.
 
+**Inside the function, a local's own slot lasts the whole frame**, not only its block, so a pointer
+to a plain local of an inner block may be read after the block closes:
+
+```sysl
+run(c: bool) -> int
+    var m = 1
+    var p = &m
+
+    if c
+        var n = 41
+
+        p = &n
+
+    *p + 1
+
+print(run(true))
+```
+
+```output
+42
+```
+
+**What a block lets go of when it closes is what its locals hold**: a `Buf`'s elements, the object a
+`&T` names, a value with a `Drop`. A pointer into that storage is refused where it is read after the
+block, since the storage may be freed by then:
+
+```sysl
+import sysl.buf.{Buf, buf}
+
+run() -> int
+    var n = 0
+    var p = &n
+
+    if true
+        val b: Buf[int] = buf()
+
+        b.push(41)
+        p = &b[0]
+
+    *p + 1
+
+print(run())
+```
+
+```error
+'p' points into storage 'b' holds, and 'b' was let go of where its block ended — so this would read freed memory
+```
+
 **The `&` in a type is a different thing, and neither is a way of writing the other.** `&T` is a
 counted box, which owns what is in it; the operator takes an address, which owns nothing. So a box
 is not made by writing the operator in front of a value — it is made by the value arriving where a
@@ -1514,8 +1562,63 @@ first = 5
 'first' is a 'ref' standing on an element whose storage 'push' could move or give up, since it is '@relocates'
 ```
 
-**What this does not do is make a `*T` safe**, and it does not try. A ref's place may be rooted at a
-pointer, and whether *that* points anywhere is the raw tier's ordinary bargain.
+**A `*T` taken by `&` into the same storage is held to the same rule, for as long as it is live.**
+`&b[0]` is the address `ref first = b[0]` stands on, so a `@relocates` member, a `*self` call on the
+owner, and an assignment that replaces the owner are refused while the pointer — or a copy of it, or
+an address computed from it — is still to be used. A pointer has no block of its own, so what counts
+is its **last use** on any path the body can take, a later turn of a loop and a `defer` included:
+
+```sysl
+import sysl.buf.{Buf, buf}
+
+run() -> int
+    val b: Buf[int] = buf()
+
+    b.push(41)
+
+    val p = &b[0]
+
+    for i in 0..<100 do b.push(i)
+
+    *p + 1
+
+print(run())
+```
+
+```error
+'p' is a pointer to an element whose storage 'push' could move or give up, since it is '@relocates', and it is used after this call
+```
+
+Once the last use is behind it, the storage may move freely:
+
+```sysl
+import sysl.buf.{Buf, buf}
+
+run() -> int
+    val b: Buf[int] = buf()
+
+    b.push(41)
+
+    val p = &b[0]
+    val first = *p
+
+    b.push(first + 1)
+    b[1]
+
+print(run())
+```
+
+```output
+42
+```
+
+**The check is local, for a pointer as for a ref's path**: it sees the `&`, the path written after
+it, and the calls and assignments on that path in the same body. A second name for the buffer (`val
+b2 = b`, then `b2.push(…)`), a function handed both the pointer and the buffer that pushes inside, and
+a pointer stored into a field, an element or an aggregate and read back later are not followed. A
+view of the buffer is not a pointer into it: the view keeps the storage it was made from, so a `*T`
+into `b.view()` outlives a push. A ref's place may also be rooted at a pointer, and whether *that*
+points anywhere is the raw tier's ordinary bargain.
 
 **Writing a value that holds an owning step by value writes the step too.** With `h` a local `H`,
 `h = H(…)` replaces `h.node` as surely as `h.node = …` does, so it is refused on the same terms.
