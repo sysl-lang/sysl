@@ -61,12 +61,9 @@ private opm_absent(ir: string) = assert_eq(ir, "")
 opm_owned_body()
     opm_no_traffic(opm_ir("", "wrap.owned"))
 
-@test("and its plain symbol is a borrowing entry: one retain, then the owned body")
+@test("and its plain symbol, which only a borrowing caller would name, is not emitted where nothing names it")
 opm_borrowing_entry()
-    val ir = opm_ir("", "wrap")
-
-    assert_eq(opm_takes(ir), 1)
-    assert(ir.contains("call %struct.W @wrap.owned("), ir)
+    opm_absent(opm_ir("", "wrap"))
 
 @test("a parameter the function only reads stays borrowed, with no owned body")
 opm_read_only_borrowed()
@@ -589,3 +586,151 @@ opm_library_counted()
     assert(!ran.1.contains("still live"), ran.1)
     assert_eq(counts.1, 1)
     assert_eq(counts.2, 0)
+
+// -- the borrowing entry, only where something names it --------------------------------------------------
+
+// Every route by which a program reaches an owning function: a direct call, a function value, a trait
+// object over a plain type and over a generic one, a body exported to C, and a deferred call.
+private val opm_routes: string = raw"""
+    struct Tag
+        id: int
+
+    impl Drop for Tag
+        drop(self) = print("drop", self.id)
+
+    struct Box2
+        t: &Tag
+
+    trait Keeper
+        keep(self, t: &Tag) -> Box2
+
+    struct K
+        n: int
+
+    impl Keeper for K
+        keep(self, t: &Tag) -> Box2 = Box2(t)
+
+    struct G[T]
+        x: T
+
+    impl[T] Keeper for G[T]
+        keep(self, t: &Tag) -> Box2 = Box2(t)
+
+    direct(t: &Tag) -> Box2 = Box2(t)
+
+    valued(t: &Tag) -> Box2 = Box2(t)
+
+    apply(f: &Tag -> Box2, t: &Tag) -> Box2 = f(t)
+
+    @export("opm_made")
+    made(v: int) -> int = direct(Tag(v)).t.id
+
+    val k: &Keeper = K(0)
+    val g: &Keeper = G(0)
+    print("direct", direct(Tag(1)).t.id)
+    print("value", apply(valued, Tag(2)).t.id)
+    print("object", k.keep(Tag(3)).t.id)
+    print("generic", g.keep(Tag(4)).t.id)
+    print("export", made(5))
+    print("end")
+    """
+
+@test("a program emits no borrowing entry for a function only called directly or through a function value")
+opm_entry_absent_when_direct()
+    for symbol in ["direct", "valued"]
+        val ir = opm_program_ir(opm_routes, symbol)
+
+        if ir == "skipped" then return
+
+        assert_eq(ir, s"no function '$symbol'")
+        assert(opm_program_ir(opm_routes, s"$symbol.owned").starts_with("define"), symbol)
+
+@test("a trait object's table keeps the borrowing entry, over a plain type and over a generic instantiation")
+opm_entry_present_for_tables()
+    val ir = opm_program_ir(opm_routes, "K.keep")
+
+    if ir == "skipped" then return
+
+    assert_eq(opm_takes(ir), 1)
+    assert(ir.contains("@K.keep.owned("), ir)
+
+    // The generic one's entry is its instantiation's, which only the table names.
+    val generic = opm_program_ir(opm_routes, "G.keep.int")
+
+    assert_eq(opm_takes(generic), 1)
+    assert(generic.contains("@G.keep.int.owned("), generic)
+
+@test("an exported body keeps the plain convention, and its direct call needs no entry")
+opm_entry_export_direct()
+    val ir = opm_program_ir(opm_routes, "made")
+
+    if ir == "skipped" then return
+
+    assert(ir.contains("@direct.owned("), ir)
+    assert(opm_program_ir(opm_routes, "made.owned").starts_with("no function"), ir)
+
+@test("every route with and without an entry ends the counted heap at nothing live")
+opm_entry_routes_counted()
+    if !lbr_ready() then return
+
+    val ran = opm_counted(opm_routes, [])
+
+    assert_eq(ran.0, "direct 1\ndrop 1\nvalue 2\ndrop 2\nobject 3\ndrop 3\ngeneric 4\ndrop 4\n" +
+                     "export drop 5\n5\nend\n")
+    assert(!ran.1.contains("still live"), ran.1)
+
+private val opm_lib_routes: string = raw"""
+    module demo
+
+    struct Tag
+        id: int
+
+    impl Drop for Tag
+        drop(self) = print("drop", self.id)
+
+    struct Box2
+        t: &Tag
+
+    trait Keeper
+        keep(self, t: &Tag) -> Box2
+
+    struct K
+        n: int
+
+    impl Keeper for K
+        keep(self, t: &Tag) -> Box2 = Box2(t)
+
+    wrap(t: &Tag) -> Box2 = Box2(t)
+    """
+
+// Nothing in the library names `K.keep` or `wrap`, and the artifact is compiled before any program is:
+// the program's table and function value reach them anyway, so the artifact keeps every entry.
+@test("a program reaching a compiled library's owned functions through a table and a value links and ends at nothing live")
+opm_entry_library_routes()
+    if !lbr_ready() then return
+
+    val lib = lbr_tree(lbr_one("demo/demo.sysl", opm_lib_routes))
+    val cache = lbr_temp("sysl-opm-cache")
+
+    use_root_cache_dir(Some(cache))
+    use_c_object_cache_dir(Some(cache))
+    clear_root_artifact_counts()
+
+    val ran = opm_counted(raw"""
+        import demo.*
+
+        apply(f: &Tag -> Box2, t: &Tag) -> Box2 = f(t)
+
+        val k: &Keeper = K(0)
+        print("object", k.keep(Tag(1)).t.id)
+        print("value", apply(wrap, Tag(2)).t.id)
+        print("direct", wrap(Tag(3)).t.id)
+        """, [lib])
+    val counts = root_artifact_counts()
+
+    use_root_cache_dir(None)
+    use_c_object_cache_dir(None)
+    lbr_drop([lib, cache])
+    assert_eq(ran.0, "object 1\ndrop 1\nvalue 2\ndrop 2\ndirect 3\ndrop 3\n")
+    assert(!ran.1.contains("still live"), ran.1)
+    assert_eq(counts.1, 1)
