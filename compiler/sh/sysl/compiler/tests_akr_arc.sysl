@@ -166,17 +166,30 @@ akr_assignment_retains_before_it_releases()
                  "  call void @arc.release(ptr %t19)\n")
     akr_lacks(out, "@arc.retain(ptr %t14)")
 
-// A by-value parameter is read through the count its caller holds for the length of the call, so
-// nothing is taken at entry; what comes back is the caller's to hold, so it arrives with a count.
-@test("a parameter costs nothing to hand over, and a result still comes back with a count taken")
+// A by-value parameter the function only reads is read through the count its caller holds for the
+// length of the call, so nothing is taken at entry. One it returns is kept, so it is owned
+// (`owned_params.sysl`): the owned body hands back the count it was handed, and only the borrowing
+// entry, which an indirect caller reaches, takes one.
+@test("a parameter costs nothing to hand over, and a returned one comes back with the count it was handed")
 akr_a_parameter_is_free_and_a_result_is_counted()
     if akr_no_library() then return
 
-    val out = akr_ir(akr_point() + "keep(p: &Point) -> &Point\n    print(p.x)\n    p\n" +
-                     "var q: &Point = Point(1, 2)\nvar r = keep(q)")
+    val out = akr_ir(akr_point() + "look(p: &Point) -> int = p.x\n\n" +
+                     "keep(p: &Point) -> &Point\n    print(p.x)\n    p\n" +
+                     "var q: &Point = Point(1, 2)\nvar r = keep(q)\nvar s = look(q)")
+    var look = ""
+    var owned = ""
+    var entry = ""
 
-    akr_lacks(out, "call void @arc.retain(ptr %p.param)")
-    akr_has(out, "  call void @arc.retain(ptr %t6)\n  ret ptr %t6\n")
+    for item in func_texts(out)
+        if item.0 == "look" then look = item.1
+        if item.0 == "keep.owned" then owned = item.1
+        if item.0 == "keep" then entry = item.1
+
+    akr_lacks(look, "call void @arc.retain(")
+    akr_lacks(owned, "call void @arc.retain(")
+    akr_has(owned, "ret ptr %t6\n")
+    akr_has(entry, "call void @arc.retain(ptr %p.param)")
 
 // The hook is asked which of its two jobs is wanted: walking the payload and giving the storage back
 // happen at different moments, so the walk ends in `ret void` and the free is the other arm.

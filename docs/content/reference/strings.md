@@ -90,6 +90,36 @@ top of it is ordinary sysl in [`sysl.text`](/library/text/), `from_utf8_unchecke
 primitive is the one step no sysl body could write, because every safe route to a `string` already
 carries the guarantee.
 
+**`str_cast` and its in-place counterpart `str_alias` are imported, from `sysl.raw`**, beside
+`ptr_cast` (`memory.md § Reinterpreting storage`): the compiler answers them, but a file names the
+raw-tier forms it uses, the way it names anything else it did not declare. `str_cast(b)` copies the
+bytes into a new string; `str_alias(b)` lays the string over `b` itself, which the caller keeps
+unchanged and alive for as long as the string is read.
+
+```sysl
+import sysl.raw.{str_alias, str_cast}
+
+var bytes: [5]u8 = [104, 105, 33, 33, 33]
+
+print(str_cast(bytes[0..<3]), str_alias(bytes[0..<2]))
+```
+
+```output
+hi! hi
+```
+
+Written without the import, the form is told where it lives:
+
+```sysl
+var bytes: [3]u8 = [104, 105, 33]
+
+print(str_cast(bytes[..]))
+```
+
+```error
+'str_cast' is in sysl.raw: add 'import sysl.raw.str_cast'
+```
+
 **The unchecked conversion is imported like any other function:**
 
 ```sysl
@@ -445,6 +475,7 @@ same code.
 `to_string` (or `debug_string`) member — in its body, an `impl` block, or a trait it implements —
 has that one called; the compiler's is what a call reaches only where nothing else claims the name.
 So do the forms: `str`, `print`, `format`, `str_cast`, `str_alias`, `ptr_cast` and the `va_` forms
+(the casts imported from `sysl.raw` and the `va_` forms from `sysl.c`, the rest in scope everywhere)
 yield to a local, a parameter or a function of the same name, which is ordinary shadowing, and a
 call through it means that name, which is an error at the call if it cannot be called. An
 interpolation hole is the one call that always reaches the rendering, so a parameter called `str`
@@ -583,6 +614,8 @@ it, and otherwise through the `Debug` every table carries. A callable prints as 
 directly builds, with a warning that names the value and what to print instead.
 
 ```sysl
+import sysl.raw.ptr_cast
+
 trait Area
     area(self) -> int
 

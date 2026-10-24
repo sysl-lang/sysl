@@ -432,8 +432,70 @@ back:
   one whose address is taken for a `*fn`. There is no sysl caller on the other side of those to make
   the guarantee, so the function makes it for itself.
 
-Storing a parameter is *not* one of them: an assignment takes a count for the value arriving, so
-`latest = h` above is where the new owner's share comes from, and the callee never held one.
+Storing a parameter is the third, and it goes the other way round: the callee does not take a count
+for it, it is **handed** one.
+
+### A parameter the function keeps arrives with its count
+
+A function that keeps a counted parameter — stores it in a field, a global, a box, a closure or a
+container's element, returns it, or hands it on to another function that keeps it — would otherwise
+take a count at the store for a value whose caller is, as often as not, about to give its own back.
+So **such a parameter is owned**: the compiler reads each function's body (and the answers of the
+functions it calls, to a fixed point over recursion) and decides which parameters it keeps, and
+those arrive with a count the callee is responsible for. The caller supplies it the cheap way:
+
+- an argument at its **last use** — a temporary, or a local the statement names for the last time —
+  hands over the count the frame already holds, so the call costs nothing at either end;
+- any other argument is retained before the call, which is the count the store would have taken.
+
+`b.push(x)` and `Label(x)` returned through a helper are therefore free at `x`'s last use, and a loop
+that builds a value and pushes it pays no reference traffic at all. A parameter only a part of which
+is kept, and every parameter of a function that does not keep it, stays borrowed as above.
+
+Nothing about it is spelled in a signature either. A call through a closure, a function value or a
+trait object, and a call from C, reaches a borrowing entry that takes the count itself and then runs
+the owned body, so the convention is a matter between a function and its direct callers. A function
+that is `@export`ed, `async`, `@scoped` or carries a contract keeps the borrowed convention
+throughout. A library and the program built against it read the same bodies, so they agree on which
+parameters are owned.
+
+**Behaviour change in 0.6.0: a value handed to a parameter at its last use may be released
+sooner.** The callee now holds the count, so where it does not keep the value after all (on some
+path), it gives the count back as it returns rather than when the caller's scope ends; and a local
+whose life ends in an `if` with an `else` is handed into each arm and given back at the end of the
+arm that does not use it. A count never reaches zero while anything can still read the value, but a
+destructor that prints shows the difference:
+
+```sysl
+struct Tag
+    id: int
+
+impl Drop for Tag
+    drop(self) = print("drop", self.id)
+
+struct Label
+    tag: &Tag
+
+label(t: &Tag) -> Label = Label(t)
+
+show()
+    val t: &Tag = Tag(1)
+
+    print("label", label(t).tag.id)
+    print("end of show")
+
+show()
+```
+
+```output
+label 1
+drop 1
+end of show
+```
+
+`t` is at its last use in `label(t)`, so the label the call returns holds the only count, and the tag
+goes when that temporary does, at the end of the statement — not at the end of `show`, where it would
+go if `t` were read again later.
 
 ### A count that would be taken and given straight back is not taken
 
@@ -463,8 +525,10 @@ is a count the frame was about to give back — a fresh box, a call's result, or
 names for the last time in its scope — the destination takes that count instead of a new one, and
 the give-back is never emitted. A struct or enum built on the spot is handed over field by field, so
 `Some(Node(n))` and `Pair(x, 1)` at `x`'s last use cost no count at all. A local still read later,
-named in a `defer`, used inside a loop or a branch it was declared outside of, or reached through an
-address or a `ref` is copied as before, so this too moves no destructor.
+named in a `defer`, used inside a loop it was declared outside of, or reached through an address or a
+`ref` is copied as before. One whose life ends in an `if` with an `else` is handed into each arm, so
+an arm that uses it last moves it and the others give it back where they end (see
+[owned parameters](#a-parameter-the-function-keeps-arrives-with-its-count)).
 
 ```sysl
 struct Tag
@@ -1122,6 +1186,8 @@ the tail of an `if` or `match` arm, or wrapped in `ptr_cast`. A `(self)` method 
 the usual way to write it by accident, since `self` reads like the caller's value and is a copy:
 
 ```sysl
+import sysl.raw.ptr_cast
+
 struct Rec
     a: int
     b: int
@@ -2331,12 +2397,36 @@ to.
 | `ptr_cast(n)` | a number as a pointer | unsafe |
 | `ptr_cast(p)` | one pointee type as another | unsafe |
 
+**`ptr_cast` is imported, from `sysl.raw`** — `import sysl.raw.ptr_cast` — beside `str_cast` and
+`str_alias` (`strings.md`). The compiler still answers it, since its target comes from the position
+its value fills and no signature can say that, but its name is not in scope everywhere: a file names
+the raw-tier casts it makes, so every reinterpretation in a program is found by its imports. An
+alias (`import sysl.raw.ptr_cast as pc`), a wildcard (`import sysl.raw.*`) and a path through the
+module (`raw.ptr_cast(p)` after `import sysl.raw`) reach it as they reach anything else. Written bare
+without one, it is told where it lives:
+
+```sysl
+var arena: [8]u8 = [0u8; 8]
+val p: *u32 = ptr_cast(&arena[0])
+
+print(*p)
+```
+
+```error
+'ptr_cast' is in sysl.raw: add 'import sysl.raw.ptr_cast'
+```
+
+A function or a local the reader names `ptr_cast` is what a call reaches, imported or not; importing
+the form under the name of one is refused, since the name would mean two things.
+
 **A pointer becomes an integer through the ordinary conversion syntax**, because it is an ordinary
 conversion: `usize` is wide enough to hold any address by definition, so it is total and loses
 nothing, and the result is a number that cannot be dereferenced. `isize` takes one too, which is what
 a program comparing addresses against a signed offset wants.
 
 ```sysl
+import sysl.raw.ptr_cast
+
 struct Node
     value: int
 
@@ -2365,6 +2455,8 @@ literals, is a `usize` at the target's width. So the address a datasheet gives i
 printed there, and so is a base plus an offset or a bit shifted into place:
 
 ```sysl
+import sysl.raw.ptr_cast
+
 struct Uart
     data: u32
     status: u32
@@ -2388,6 +2480,8 @@ value that already has a type keeps it, so an `int`, a suffixed literal such as 
 expression with either inside it is still refused, and is converted where it is meant as an address:
 
 ```sysl
+import sysl.raw.ptr_cast
+
 var base = 0x4000_4000
 val uart: *u32 = ptr_cast(base)
 
@@ -2405,6 +2499,8 @@ written on the form: `ptr_cast[*Node](&arena[0])` is
 pointer is wanted, the program is told to annotate what receives it:
 
 ```sysl
+import sysl.raw.ptr_cast
+
 var arena: [64]u8 = [0u8; 64]
 var p = ptr_cast(&arena[0])
 
@@ -2420,6 +2516,8 @@ relied on by everything the safe subset promises — and an address invented fro
 ARC to own and no object to be non-null about:
 
 ```sysl
+import sysl.raw.ptr_cast
+
 struct Node
     value: int
 
@@ -2463,6 +2561,8 @@ answers `false` for it; a trait object and a `weak T` are refused, the latter an
 `.get()`, and anything that is not a reference is refused naming its type.
 
 ```sysl
+import sysl.raw.ptr_cast
+
 extern "calloc" c_calloc(n: usize, size: usize) -> *u8
 extern "free" c_free(p: *u8)
 

@@ -1,0 +1,591 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.Search
+
+// Owned counted parameters (`owned_params.sysl`): a parameter of a counted type that its function
+// keeps -- stores beyond the call, returns, or hands on to another owned parameter -- arrives with a
+// count of its own, which the callee is responsible for. A direct call hands the caller's count over
+// when the argument is at its last use and retains first otherwise; every other route in (a closure,
+// a function value, a trait object, C) goes through the borrowing entry, which retains and then
+// calls the owned body. Three kinds of claim: the emitted text of each side of the convention, the
+// same for every shape that must still copy, and programs whose destructors print run on the counted
+// heap, ending at nothing live.
+
+private opm_types() -> string = raw"""
+    struct Node
+        v: int
+
+    struct W
+        n: &Node
+
+    struct Bag
+        n: &Node
+        w: W
+
+    enum Maybe[T]
+        No
+        Yes(v: T)
+
+    touch(v: int) = ()
+
+    wrap(n: &Node) -> W = W(n)
+
+    """
+
+private opm_ir(body: string, symbol: string) -> string = emit_func_text(opm_types() + body, symbol)
+
+private opm_count(text: string, needle: string) -> int = int(text.count_of(needle))
+
+// How many counts a body takes: a reference's retain, or an aggregate's copy helper.
+private opm_takes(ir: string) -> int
+    assert(ir.starts_with("define"), ir)
+    opm_count(ir, "call void @arc.retain(") + opm_count(ir, "call void @arc.copy.")
+end opm_takes
+
+// Neither half of a count: no call of a retain, release, copy or dispose helper of any kind.
+private opm_no_traffic(ir: string)
+    assert(ir.starts_with("define"), ir)
+    assert_eq(opm_count(ir, "call void @arc."), 0)
+end opm_no_traffic
+
+// No body of that name was lowered (`emit_func_text` answers nothing for a symbol it did not find).
+private opm_absent(ir: string) = assert_eq(ir, "")
+
+// -- the two sides of the convention --------------------------------------------------------------------
+
+@test("a function that keeps its counted parameter has an owned body that takes no count of its own")
+opm_owned_body()
+    opm_no_traffic(opm_ir("", "wrap.owned"))
+
+@test("and its plain symbol is a borrowing entry: one retain, then the owned body")
+opm_borrowing_entry()
+    val ir = opm_ir("", "wrap")
+
+    assert_eq(opm_takes(ir), 1)
+    assert(ir.contains("call %struct.W @wrap.owned("), ir)
+
+@test("a parameter the function only reads stays borrowed, with no owned body")
+opm_read_only_borrowed()
+    opm_absent(opm_ir("peek(n: &Node) -> int = n.v\n", "peek.owned"))
+
+@test("a local handed to an owned parameter at its last use moves: no retain, no release")
+opm_last_use_moves()
+    val ir = opm_ir("mk(v: int) -> W\n    val x: &Node = Node(v)\n    wrap(x)\n", "mk")
+
+    opm_no_traffic(ir)
+    assert(ir.contains("@wrap.owned("), ir)
+
+@test("a string made by + or a format hole is a temporary, handed over to an owned parameter with no pair")
+opm_string_temp_moves()
+    val src = "struct D\n    m: string\n\nmk(m: string) -> D = D(m)\n\n" +
+              "cat(a: string, b: string) -> usize = mk(a + b).m.len\n"
+    val hole = "\nhole(v: int) -> usize = mk(f\"${v}%05d\").m.len\n\nprint(cat(\"a\", \"b\"), hole(3))\n"
+
+    // A formatted hole reaches the standard module's formatting, so that program is lowered beside it.
+    for ir in [opm_ir(src, "cat"), opm_program_ir(src + hole, "hole")]
+        if ir == "skipped" then return
+
+        assert(ir.contains("@mk.owned("), ir)
+        assert_eq(opm_takes(ir), 0)
+        assert_eq(opm_count(ir, "call void @arc.release_maybe("), 0)
+
+@test("a local used again after the call is retained for it, and released at the scope's end")
+opm_not_last_use_retains()
+    val ir = opm_ir("again(v: int) -> int\n    val x: &Node = Node(v)\n    val w = wrap(x)\n    w.n.v + x.v\n",
+                    "again")
+
+    assert_eq(opm_count(ir, "call void @arc.retain("), 1)
+    assert_eq(opm_count(ir, "call void @arc.release("), 1)
+
+// A local named twice in one statement is not at its last use at either argument, so neither hands
+// it over: each argument is retained, and the scope's end gives the local's own count back.
+@test("a local passed twice to one call is never moved twice: both arguments are retained")
+opm_passed_twice()
+    val ir = opm_ir("two(a: &Node, b: &Node) -> (W, W) = (W(a), W(b))\n\n" +
+                    "both(v: int) -> (W, W)\n    val x: &Node = Node(v)\n    two(x, x)\n", "both")
+
+    assert_eq(opm_count(ir, "call void @arc.retain("), 2)
+    assert_eq(opm_count(ir, "call void @arc.release("), 1)
+
+@test("a parameter handed on to another owned parameter is owned, and the hand-on moves it")
+opm_handed_on()
+    val ir = opm_ir("outer(n: &Node) -> W = wrap(n)\n", "outer.owned")
+
+    opm_no_traffic(ir)
+    assert(ir.contains("@wrap.owned("), ir)
+
+// -- shapes of argument ----------------------------------------------------------------------------------
+
+@test("a struct, an enum and a tuple holding counts are owned whole when kept, and move at their last use")
+opm_aggregates_move()
+    val src = "keep_bag(b: Bag) -> Bag = b\n\nkeep_opt(o: Maybe[&Node]) -> Maybe[&Node] = o\n\n" +
+              "keep_tup(p: (&Node, int)) -> (&Node, int) = p\n\n"
+
+    opm_no_traffic(opm_ir(src, "keep_bag.owned"))
+    opm_no_traffic(opm_ir(src, "keep_opt.owned"))
+    opm_no_traffic(opm_ir(src, "keep_tup.owned"))
+
+    // The only count traffic left in each caller is the call's result going at the statement's end.
+    val bag = opm_ir(src + "go(v: int) -> int\n    val x: &Node = Node(v)\n    val b = Bag(x, W(Node(1)))\n" +
+                     "    keep_bag(b).n.v\n", "go")
+    val opt = opm_ir(src + "go(v: int) -> int\n    val x: &Node = Node(v)\n    val o: Maybe[&Node] = Yes(x)\n" +
+                     "    keep_opt(o) match\n        Yes(n) -> n.v\n        No -> 0\n", "go")
+    val tup = opm_ir(src + "go(v: int) -> int\n    val x: &Node = Node(v)\n    val p = (x, 2)\n    keep_tup(p).1\n",
+                     "go")
+
+    for ir in [bag, opt, tup]
+        assert_eq(opm_takes(ir), 0)
+        assert_eq(opm_count(ir, "call void @arc.release("), 0)
+        assert_eq(opm_count(ir, "call void @arc.dispose."), 1)
+
+@test("a struct argument whose field is read after the call is not at its last use, so it is copied")
+opm_partial_use_copies()
+    val ir = opm_ir("keep_bag(b: Bag) -> Bag = b\n\ngo(v: int) -> int\n    val b = Bag(Node(v), W(Node(1)))\n" +
+                    "    val k = keep_bag(b)\n    k.n.v + b.n.v\n", "go")
+
+    assert_eq(opm_count(ir, "call void @arc.copy.Bag("), 1)
+
+@test("a parameter only a projection of which is kept stays borrowed")
+opm_projection_borrowed()
+    opm_absent(opm_ir("part(p: (&Node, int)) -> W = W(p.0)\n", "part.owned"))
+
+// -- control flow ----------------------------------------------------------------------------------------
+
+@test("a local a defer names is retained for the call, since the deferred statement reads it at the exit")
+opm_defer_retains()
+    val ir = opm_ir("go(v: int) -> int\n    val x: &Node = Node(v)\n    defer touch(x.v)\n    wrap(x).n.v\n", "go")
+
+    assert_eq(opm_count(ir, "call void @arc.retain("), 1)
+
+@test("a last use in one arm of a match is retained there, the scope's end giving the local back")
+opm_match_arm_retains()
+    val ir = opm_ir("go(c: int) -> int\n    val x: &Node = Node(c)\n    c match\n        0 -> wrap(x).n.v\n" +
+                    "        _ -> 0\n", "go")
+
+    assert_eq(opm_count(ir, "call void @arc.retain("), 1)
+
+@test("a local whose life ends in an if with an else is handed into each arm, so the call there moves it")
+opm_branch_hand_in()
+    val ir = opm_ir("go(c: bool, v: int) -> W\n    val x: &Node = Node(v)\n    if c\n        wrap(x)\n" +
+                    "    else\n        W(Node(0))\n", "go")
+
+    assert_eq(opm_takes(ir), 0)
+    assert_eq(opm_count(ir, "call void @arc.release("), 1)
+
+@test("a call that is not a last use inside a loop body retains every round")
+opm_loop_outer_local_retains()
+    val ir = opm_ir("go(v: int) -> int\n    val x: &Node = Node(v)\n    var t = 0\n    for i in 0..<3\n" +
+                    "        t += wrap(x).n.v\n    t\n", "go")
+
+    assert_eq(opm_count(ir, "call void @arc.retain("), 1)
+
+// -- recursion and generics -------------------------------------------------------------------------------
+
+@test("mutually recursive functions that keep their parameter are both owned, and hand it over to each other")
+opm_mutual_recursion()
+    val src = "ping(t: &Node, n: int) -> W = if n == 0 then W(t) else pong(t, n - 1)\n\n" +
+              "pong(t: &Node, n: int) -> W = ping(t, n)\n\n"
+
+    opm_no_traffic(opm_ir(src, "ping.owned"))
+    opm_no_traffic(opm_ir(src, "pong.owned"))
+
+@test("a self-recursive function that keeps its parameter through a non-tail call is owned")
+opm_self_recursion()
+    val ir = opm_ir("deep(t: &Node, n: int) -> W\n    if n == 0 then return W(t)\n    val w = deep(t, n - 1)\n" +
+                    "    touch(w.n.v)\n    w\n", "deep.owned")
+
+    // The recursive call is `t`'s last use and hands it over. The `return` inside the one-armed `if`
+    // is in a scope of its own, so it copies there and gives the parameter back, as any local would.
+    assert_eq(opm_count(ir, "call void @arc.retain("), 0)
+    assert_eq(opm_count(ir, "call void @arc.copy.W("), 1)
+    assert(ir.contains("@deep.owned("), ir)
+
+@test("a generic keeps per instantiation: owned where the argument is counted, not where it is a scalar")
+opm_generic_per_type()
+    val src = "hold[T](x: T) -> Maybe[T] = Yes(x)\n\ngo(v: int) -> int\n    val x: &Node = Node(v)\n" +
+              "    val a = hold(x)\n    val b = hold(v)\n    0\n"
+
+    opm_no_traffic(opm_ir(src, "hold.ref.Node.owned"))
+    opm_absent(opm_ir(src, "hold.int.owned"))
+    assert_eq(opm_takes(opm_ir(src, "go")), 0)
+
+@test("an exported function and an async one keep the plain convention, with no owned body")
+opm_export_async_plain()
+    val src = "@export(\"made\")\nmade(v: int) -> int\n    val x: &Node = Node(v)\n    wrap(x).n.v\n\n" +
+              "async akeep(t: &Node) -> W = W(t)\n"
+
+    opm_absent(opm_ir(src, "made.owned"))
+    opm_absent(opm_ir(src, "akeep.owned"))
+
+    // Its body is an ordinary caller: the local it hands to an owned parameter moves.
+    assert_eq(opm_takes(opm_ir(src, "made$$sysl")), 0)
+
+// -- with the standard module: push, and the indirect routes ---------------------------------------------
+
+private opm_program_ir(text: string, symbol: string) -> string
+    if !lbr_ready() then return "skipped"
+
+    val prog = lbr_program(text)
+    val ir = lbr_text(prog, [])
+
+    lbr_drop([prog])
+
+    for item in func_texts(ir)
+        if item.0 == symbol then return item.1
+
+    s"no function '$symbol'"
+end opm_program_ir
+
+private val opm_bufs: string = raw"""
+    import sysl.buf.{Buf, buf}
+
+    struct Node
+        v: int
+
+    fill(b: *Buf[&Node], v: int)
+        val x: &Node = Node(v)
+        b.push(x)
+
+    looped(b: *Buf[&Node])
+        for i in 0..<3
+            val x: &Node = Node(i)
+            b.push(x)
+
+    cstyle(b: *Buf[&Node])
+        for var i = 0; i < 2; i += 1
+            val x: &Node = Node(i)
+            b.push(x)
+
+    var b: Buf[&Node] = buf()
+    fill(&b, 1)
+    looped(&b)
+    cstyle(&b)
+    print(b.len())
+    """
+
+@test("the library's push is owned, and a local pushed at its last use takes no count and gives none back")
+opm_push_moves()
+    val ir = opm_program_ir(opm_bufs, "fill")
+
+    if ir == "skipped" then return
+
+    assert(ir.contains("@sysl.buf$Buf.push.ref.Node.owned("), ir)
+    assert_eq(opm_count(ir, "call void @arc.retain("), 0)
+    assert_eq(opm_count(ir, "call void @arc.release("), 0)
+
+// The append's owned body hands its element on in both arms: to the growth (whose contract names only
+// `self`, so it owns the element too) and to `arc.slotplace`, which keeps the count it is handed. So
+// the body gives nothing back, and stays small enough for `@inline` to absorb.
+@test("the library's push body hands its element on in every arm and gives nothing back")
+opm_push_body_gives_nothing_back()
+    val ir = opm_program_ir(opm_bufs, "sysl.buf$BufCore.push.ref.Node.owned")
+
+    if ir == "skipped" then return
+
+    assert(ir.contains("@sysl.buf$BufCore.grow_store.ref.Node.owned("), ir)
+    assert(ir.contains("@arc.slotplace.ref.Node("), ir)
+    assert_eq(opm_count(ir, "call void @arc."), 1)
+
+@test("a contract that names a parameter keeps it borrowed; one that names only others leaves it owned")
+opm_contract_names()
+    val src = "kept(t: &Node, n: int) -> W\n    ensure n >= 0\n\n    W(t)\n\n" +
+              "named(t: &Node) -> W\n    ensure t.v >= 0\n\n    W(t)\n"
+
+    assert(opm_ir(src, "kept.owned").starts_with("define"), opm_ir(src, "kept.owned"))
+    opm_absent(opm_ir(src, "named.owned"))
+
+@test("a local declared in a for body and pushed at its last use moves every round")
+opm_loop_push_moves()
+    for symbol in ["looped", "cstyle"]
+        val ir = opm_program_ir(opm_bufs, symbol)
+
+        if ir == "skipped" then return
+
+        assert(ir.contains("@sysl.buf$Buf.push.ref.Node.owned("), ir)
+        assert_eq(opm_count(ir, "call void @arc.retain("), 0)
+        assert_eq(opm_count(ir, "call void @arc.release("), 0)
+
+private val opm_indirect: string = raw"""
+    struct Node
+        v: int
+
+    struct W
+        n: &Node
+
+    trait Keeper
+        keep(self, t: &Node) -> W
+
+    struct K
+        n: int
+
+    impl Keeper for K
+        keep(self, t: &Node) -> W = W(t)
+
+    wrap(t: &Node) -> W = W(t)
+
+    apply(f: &Node -> W, t: &Node) -> W = f(t)
+
+    val k: &Keeper = K(0)
+    print(apply(wrap, Node(1)).n.v, k.keep(Node(2)).n.v)
+    """
+
+@test("a trait object's table reaches an owned method through its borrowing entry")
+opm_vtable_borrows()
+    val ir = opm_program_ir(opm_indirect, "vt.adapt.ref.K.keep")
+
+    if ir == "skipped" then return
+
+    assert(ir.contains("call %struct.W @K.keep("), ir)
+    assert(!ir.contains(".owned"), ir)
+
+@test("a function value's thunk is a borrowed body: it retains, then calls the owned body")
+opm_function_value_retains()
+    val ir = opm_program_ir(opm_indirect, "$closure0.call")
+
+    if ir == "skipped" then return
+
+    assert_eq(opm_count(ir, "call void @arc.retain("), 1)
+    assert(ir.contains("@wrap.owned("), ir)
+
+// -- the counted heap ---------------------------------------------------------------------------------------
+
+// The program built with counting on against these roots and run: what it printed, and what the heap
+// said at exit.
+private opm_counted(text: string, libs: []string) -> (string, string)
+    val prog = lbr_program(text)
+    val out_dir = lbr_temp("sysl-opm-exe")
+
+    lbr_hand(libs)
+    force_alloc_counting(true)
+
+    val built = build_native_program(prog, None, None, DefaultOptimization, Some(s"$out_dir/program"))
+
+    force_alloc_counting(false)
+    reset_search_paths()
+
+    val said = built match
+        Err(why) -> (failure_text(why), "")
+        Ok(made) ->
+            capture(made, [], "", [], true) match
+                Err(_) -> ("could not be started", "")
+                Ok(o) -> (o.text, o.err.unwrap_or(""))
+
+    lbr_drop([prog, out_dir])
+    said
+end opm_counted
+
+private val opm_tag: string = raw"""
+    import sysl.buf.{Buf, buf}
+
+    struct Tag
+        id: int
+
+    impl Drop for Tag
+        drop(self) = print("drop", self.id)
+
+    struct Box2
+        t: &Tag
+
+    struct Both
+        t: &Tag
+        b: Buf[&Tag]
+
+    """
+
+@test("every route into an owned parameter ends the counted heap at nothing live, each tag dropped once")
+opm_counted_heap()
+    if !lbr_ready() then return
+
+    val ran = opm_counted(opm_tag + raw"""
+        trait Keeper
+            keep(self, t: &Tag) -> Box2
+
+        struct K
+            n: int
+
+        impl Keeper for K
+            keep(self, t: &Tag) -> Box2 = Box2(t)
+
+        wrap(t: &Tag) -> Box2 = Box2(t)
+
+        apply(f: &Tag -> Box2, t: &Tag) -> Box2 = f(t)
+
+        hold[T](x: T) -> Option[T] = Some(x)
+
+        down(t: &Tag, n: int) -> Box2 = if n == 0 then Box2(t) else down(t, n - 1)
+
+        ping(t: &Tag, n: int) -> Box2 = if n == 0 then Box2(t) else pong(t, n - 1)
+
+        pong(t: &Tag, n: int) -> Box2 = ping(t, n)
+
+        two(a: &Tag, b: &Tag) -> (Box2, Box2) = (Box2(a), Box2(b))
+
+        opt(o: Option[&Tag]) -> Buf[Option[&Tag]]
+            var b: Buf[Option[&Tag]] = buf()
+            b.push(o)
+            b
+
+        tup(p: (&Tag, int)) -> Box2 = Box2(p.0)
+
+        both(x: Both) -> Both = x
+
+        early(c: bool) -> Option[Box2]
+            val x: &Tag = Tag(30)
+            if c then return None
+            Some(wrap(x))
+
+        fallible(c: bool) -> Result[int, string]
+            val x: &Tag = Tag(31)
+            val w = wrap(x)
+            val r: Result[int, string] = if c then Err("no") else Ok(0)
+            r?
+            Ok(w.t.id)
+
+        deferred() -> int
+            val x: &Tag = Tag(32)
+            defer print("deferred", x.id)
+            wrap(x).t.id
+
+        arm(c: int) -> int
+            val x: &Tag = Tag(33)
+            c match
+                0 -> wrap(x).t.id
+                _ -> 0
+
+        looped() -> usize
+            var b: Buf[&Tag] = buf()
+            for i in 0..<3
+                val x: &Tag = Tag(40 + i)
+                b.push(x)
+            b.len()
+
+        each(from: Buf[&Tag]) -> usize
+            var b: Buf[&Tag] = buf()
+            for t in from
+                b.push(t)
+            b.len()
+
+        each_view(from: Buf[&Tag]) -> usize
+            var b: Buf[&Tag] = buf()
+            for t in from.view()
+                b.push(t)
+            b.len()
+
+        cstyle() -> usize
+            var b: Buf[&Tag] = buf()
+            for var i = 0; i < 2; i += 1
+                val x: &Tag = Tag(60 + i)
+                b.push(x)
+            b.len()
+
+        async akeep(t: &Tag) -> Box2 = Box2(t)
+
+        async adrive() -> int
+            val x: &Tag = Tag(50)
+            val w = await akeep(x)
+            w.t.id
+
+        main()
+            print("fnptr", apply(wrap, Tag(1)).t.id)
+            val c = (t: &Tag) -> wrap(t)
+            print("closure", c(Tag(2)).t.id)
+            val k: &Keeper = K(0)
+            print("object", k.keep(Tag(3)).t.id)
+            val g: &Tag = Tag(4)
+            print("generic", hold(g).unwrap().id)
+            print("rec", down(Tag(6), 3).t.id, ping(Tag(7), 3).t.id)
+            val x: &Tag = Tag(8)
+            val p = two(x, x)
+            print("twice", p.0.t.id, p.1.t.id)
+            print("opt", opt(Some(Tag(9))).len())
+            print("tup", tup((Tag(10), 1)).t.id)
+            var bb: Buf[&Tag] = buf()
+            bb.push(Tag(11))
+            print("both", both(Both(Tag(12), bb)).b.len())
+            print("early", early(true).is_none(), early(false).is_some())
+            print("fallible", fallible(true).is_err(), fallible(false).unwrap())
+            print("deferred", deferred())
+            print("arm", arm(0), arm(1))
+            print("looped", looped())
+            var src: Buf[&Tag] = buf()
+            src.push(Tag(70))
+            src.push(Tag(71))
+            print("each", each(src), each_view(src))
+            print("cstyle", cstyle())
+            print("async", block_on(adrive()))
+            print("end")
+        """, [])
+
+    assert_eq(ran.0, "fnptr 1\ndrop 1\nclosure 2\ndrop 2\nobject 3\ndrop 3\ngeneric 4\ndrop 4\nrec 6 7\n" +
+                     "drop 7\ndrop 6\ntwice 8 8\nopt 1\ndrop 9\ntup 10\ndrop 10\nboth 1\ndrop 12\ndrop 11\n" +
+                     "early drop 30\ntrue true\ndrop 30\nfallible drop 31\ntrue drop 31\n31\n" +
+                     "deferred deferred 32\ndrop 32\n32\narm drop 33\n33 drop 33\n0\n" +
+                     "looped drop 42\ndrop 41\ndrop 40\n3\neach 2 2\ncstyle drop 61\ndrop 60\n2\n" +
+                     "async drop 50\n50\nend\ndrop 71\ndrop 70\ndrop 8\n")
+    assert(!ran.1.contains("still live"), ran.1)
+
+// -- across a separately compiled library ------------------------------------------------------------------
+
+private val opm_demo: string = raw"""
+    module demo
+
+    import sysl.buf.{Buf, buf}
+
+    struct Tag
+        id: int
+
+    impl Drop for Tag
+        drop(self) = print("drop", self.id)
+
+    struct Box2
+        t: &Tag
+
+    wrap(t: &Tag) -> Box2 = Box2(t)
+
+    stash(b: *Buf[&Tag], t: &Tag) = b.push(t)
+
+    peek(t: &Tag) -> int = t.id
+    """
+
+private val opm_demo_main: string = raw"""
+    import demo.*
+    import sysl.buf.{Buf, buf}
+
+    main()
+        val x: &Tag = Tag(1)
+        val w = wrap(x)
+        var b: Buf[&Tag] = buf()
+        val y: &Tag = Tag(2)
+        stash(&b, y)
+        val z: &Tag = Tag(3)
+        print(w.t.id, b.len(), peek(z))
+    """
+
+// The program declares the root's functions and links their bodies from the root's kept artifact, so
+// it calls `wrap.owned` and `stash.owned` by name in an archive compiled without it: a disagreement
+// about which parameters are owned is a link error, or a count off by one that the heap reports.
+@test("a program built against a library root's compiled artifact calls its owned bodies and ends at nothing live")
+opm_library_counted()
+    if !lbr_ready() then return
+
+    val lib = lbr_tree(lbr_one("demo/demo.sysl", opm_demo))
+    val cache = lbr_temp("sysl-opm-cache")
+
+    use_root_cache_dir(Some(cache))
+    use_c_object_cache_dir(Some(cache))
+    clear_root_artifact_counts()
+
+    val ran = opm_counted(opm_demo_main, [lib])
+    val counts = root_artifact_counts()
+
+    use_root_cache_dir(None)
+    use_c_object_cache_dir(None)
+    lbr_drop([lib, cache])
+    assert_eq(ran.0, "1 1 3\ndrop 3\ndrop 2\ndrop 1\n")
+    assert(!ran.1.contains("still live"), ran.1)
+    assert_eq(counts.1, 1)
+    assert_eq(counts.2, 0)

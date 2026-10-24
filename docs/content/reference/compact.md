@@ -237,7 +237,8 @@ enclosing module and everything under it. The bracket takes a **simple name, not
   (traps), `string(c)`, `usize(p)`. There is **no** conversion to or from `bool`, and none between a
   number and a `string` — `x.to_string()` renders (every value has it; `str(x)` is the older
   spelling), `sysl.text` parses. `ptr_cast` makes a pointer from an
-  address.
+  address; it, `str_cast` and `str_alias` are imported from `sysl.raw`, and the `va_` forms from
+  `sysl.c`.
 - **Comparison chains**: `0 <= i < n` is one expression, each operand evaluated once.
 - **`x is Pat`** and `x is not Pat` test against the full pattern grammar, alternatives included, and
   stand **in the condition of an `if` or a `while` and nowhere else** — chain them with `&&`, or use a

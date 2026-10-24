@@ -84,7 +84,11 @@ end Verdict
 // itself declared qualifies -- a parameter's slot holds the caller's count under this very borrow,
 // and a `ref` names storage somebody else owns -- and only its own bytes: an element of a SLICE it
 // holds belongs to whoever owns the elements.
-inert_callees(p: TProgram) -> Set[string]
+//
+// **A function owning a parameter gives back the count it was handed** wherever it does not keep it
+// (`owned_params.sysl`), so it is never one of these, and nor is anything that calls it. `owning` is
+// those functions.
+inert_callees(p: TProgram, owning: Set[string] = set()) -> Set[string]
     var calls: Buf[Buf[string]] = buf()
     var alive: Buf[bool] = buf()
     var out: Set[string] = set()
@@ -93,7 +97,7 @@ inert_callees(p: TProgram) -> Set[string]
         val f = p.funcs.at(i)
         val sink: &CallSink = CallSink(buf())
         val v: &Verdict = Verdict(f.requires.is_empty() && f.ensures.is_empty() && f.olds.is_empty() &&
-                                  f.variant.is_none())
+                                  f.variant.is_none() && !owning.has(f.name))
 
         if v.ok
             val locals = own_locals(f)
@@ -308,8 +312,9 @@ end Untouched
 // An empty summary, for an emitter that has not read a program yet.
 untouched_none() -> Untouched = Untouched(buf(), buf(), buf(), buf(), buf(), map())
 
-// Every body of `p` summarised for `untouched_by`. `dropping` is the program's types with a destructor.
-untouched_summary(p: TProgram, dropping: Buf[Type]) -> Untouched
+// Every body of `p` summarised for `untouched_by`. `dropping` is the program's types with a destructor,
+// and `owning` the functions that give back a count they were handed (`inert_callees`).
+untouched_summary(p: TProgram, dropping: Buf[Type], owning: Set[string] = set()) -> Untouched
     var u = untouched_none()
     val laundered = type_sink()
 
@@ -328,7 +333,7 @@ untouched_summary(p: TProgram, dropping: Buf[Type]) -> Untouched
         u.names.push(f.name)
         u.calls.push(calls.names)
         u.roots.push(roots.types)
-        u.open.push(!v.ok)
+        u.open.push(!v.ok || owning.has(f.name))
 
     u.laundered = laundered.types
     u
@@ -832,6 +837,10 @@ held(e: *Emit, a: TExpr) -> bool = *a.kind match
     TIf(_, _, _, _) -> true
     TMatch(_, _, _) -> true
     TBlockExpr(_) -> true
+
+    // A string `+` and a formatted hole each make a new string, registered the same way.
+    TBinary(_, _, _, ty) -> underlying(ty) == Str
+    TFormat(_, _, _) -> true
 
     // Building a value takes no count of its own, so what it stands on is what has to be held.
     TStructNew(_, args) -> all_held(e, args)

@@ -289,11 +289,17 @@ private gen_slot_place(e: *Emit, xs: TExpr, index: TExpr, value: TExpr, elem: Ty
     // and `cold`: written here they made every append carry a trap the optimizer cannot settle -- it
     // cannot see that a container's count never passes the live prefix -- and a body too large for
     // `@inline` to bring into its caller.
+    //
+    // **The count the slot keeps is in hand before the test**: the value's own where it is a
+    // temporary or a local at its last use -- an owned parameter handed to `push` among them
+    // (`emit_moves.sysl`) -- and one taken otherwise. The first free slot keeps it as it is, and the
+    // rest hands it to `arc.slotplace.<T>`, which keeps it too.
     val buffer_l = fresh_label(e, "slot.buffer")
     val fresh_l = fresh_label(e, "slot.fresh")
     val rest_l = fresh_label(e, "slot.rest")
     val done_l = fresh_label(e, "slot.done")
 
+    retain_moving(e, value, elem, v)
     buffer_test(e, elem, view.0, buffer_l, rest_l)
     emit_label(e, buffer_l)
 
@@ -310,7 +316,6 @@ private gen_slot_place(e: *Emit, xs: TExpr, index: TExpr, value: TExpr, elem: Ty
 
     // The first free slot: nothing is there to give back, and the prefix now covers it.
     emit_label(e, fresh_l)
-    retain_value(e, elem, v)
     emit(e, InStore(lty(e, elem), v, p, AccPlain, None))
 
     val grown = fresh_reg(e)
@@ -360,8 +365,21 @@ gen_slot_place_rest(e: *Emit, elem: Type)
     trap_unless(e, inside, "slot")
     emit_term(e, InBr(held_l))
 
+    // The value arrives with the count the slot keeps (`gen_slot_place` has it in hand before its
+    // test), so the slot's old value is given back and nothing is retained.
     emit_label(e, held_l)
-    store_into(e, elem, p, VReg("v"), AccPlain)
+
+    if e.layout.indirect(elem)
+        release_at(e, elem, p)
+        emit(e, InStore(lty(e, elem), VReg("v"), p, AccPlain, None))
+    else
+        val old = fresh_reg(e)
+
+        emit(e, InLoad(old, lty(e, elem), p, AccPlain, None))
+        emit(e, InStore(lty(e, elem), VReg("v"), p, AccPlain, None))
+        release_value(e, elem, old)
+    end if
+
     emit_term(e, InRet(None, None))
 end gen_slot_place_rest
 

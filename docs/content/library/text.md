@@ -208,7 +208,8 @@ struct Utf8Error
 **The compiler supplies exactly one primitive here — `str_cast`, which takes a `[]u8` as a `string`
 with nothing looked at — and everything on top of it is ordinary sysl.** Nothing in a byte-by-byte
 scan needs anything the language does not already offer. What no sysl body can write is the last
-line, because every *safe* route to a `string` already carries the guarantee.
+line, because every *safe* route to a `string` already carries the guarantee. The primitive itself
+is imported from `sysl.raw` (`import sysl.raw.str_cast`), with the raw tier's other casts.
 
 `from_utf8_unchecked` is that primitive's public name and is an ordinary function of this module —
 one line, `str_cast(b)` — so the pair a caller chooses between sits together here. It was a compiler
