@@ -255,10 +255,35 @@ header_flags() {
 # printed: a row asked in the background cannot add to a variable here. `row <counter> <line>`.
 mkdir -p "$work/rows"
 
+#
+# **The line is written in ONE `printf` of ONE line.** Rows are asked in parallel and share the
+# terminal, so a reason holding a newline (a panic message quoting a document) or built from several
+# `echo`s came out interleaved with the next row's.
 row() {
-    printf '%s\n' "$1" > "$work/rows/$name"
-    echo "$2"
+    printf '%s\n' "$1" > "$work/rows/$name.tmp" && mv "$work/rows/$name.tmp" "$work/rows/$name"
+    printf '%s\n' "$(printf '%s' "$2" | tr '\n\t' '  ' | cut -c1-400)"
 }
+
+# **Why a run failed: its first failure, not its first line.** The first line of a run is nearly always
+# the warning a `package.hocon` manifest draws ("names its manifest package.hocon"), so a row quoting
+# it read as though the manifest were the refusal, and a test that failed under load looked like a
+# repository the compiler refused. The reason is the first `FAIL`, with the panic under it, else the
+# first `error`, else the first line that is not that warning.
+why() {
+    # Each lookup may find nothing, which must not end a script running under `set -e`.
+    why_line=$(grep -m1 -A3 '^  FAIL ' "$1" | grep -v '^  *at ' | tr -s ' \n' ' ' || true)
+    [ -n "$why_line" ] || why_line=$(grep -m1 'error' "$1" || true)
+    [ -n "$why_line" ] || why_line=$(grep -v 'names its manifest' "$1" | grep -m1 . || true)
+    [ -n "$why_line" ] || why_line=$(head -1 "$1")
+    printf '%s' "$why_line"
+}
+
+# `SYSL_CENSUS_WHY=<file>` prints what a row would quote for that output and stops.
+if [ -n "$SYSL_CENSUS_WHY" ]; then
+    why "$SYSL_CENSUS_WHY"
+    echo
+    exit 0
+fi
 
 dispatched=0
 census_jobs=${SYSL_CENSUS_JOBS:-$(( $(sysctl -n hw.ncpu 2> /dev/null || nproc) / 3 ))}
@@ -337,9 +362,9 @@ census_row() {
     fi
 
     if [ $theirs_ok -ne 0 ]; then
-        row both_refused "refused by both     $name ($shown) -- $(grep -m1 'error' "$work/$name.out" || head -1 "$work/$name.out")"
+        row both_refused "refused by both     $name ($shown) -- $(why "$work/$name.out")"
     else
-        row failed "FAILED              $name ($shown) -- $(grep -m1 'error' "$work/$name.out" || head -1 "$work/$name.out")"
+        row failed "FAILED              $name ($shown) -- $(why "$work/$name.out")"
     fi
 }
 
