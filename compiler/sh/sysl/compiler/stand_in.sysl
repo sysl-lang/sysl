@@ -69,15 +69,17 @@ private by_value_use(a: &Analysis, home: Scope, found: Buf[Construct], i: usize,
                      objects: Buf[string]) -> Option[(string, string)] = found.at(i).node match
     AtType(t) -> *t.kind match
         NamedType(n, args) ->
-            if args.is_empty() && holds_string(objects, n) then type_use(found, i, n) else None
+            if args.is_empty() && holds_string(objects, n) then type_use(a, home, found, i, n) else None
         _ -> None
     AtExpr(e) -> *e.kind match
         Ident(n) -> if holds_string(objects, n) then expr_use(a, home, found, i, n) else None
         _ -> None
     _ -> None
 
-// A parameter written as a type: fine directly behind `*` or `&`, a use of its layout anywhere else.
-private type_use(found: Buf[Construct], i: usize, n: string) -> Option[(string, string)]
+// A parameter written as a type: fine directly behind `*` or `&`, and as the argument of a generic
+// type that reaches it only behind one; a use of its layout anywhere else.
+private type_use(a: &Analysis, home: Scope, found: Buf[Construct], i: usize,
+                 n: string) -> Option[(string, string)]
     val p = parent_of(found, i)
 
     if p.is_none() then return Some((n, "by value"))
@@ -91,6 +93,13 @@ private type_use(found: Buf[Construct], i: usize, n: string) -> Option[(string, 
             // type is fixed by the object's type rather than by any one value, which a body written
             // against `P::Item` cannot tell from the implementation's own.
             AssocType(_, member) -> Some((n, s"for its associated type '$n::$member'"))
+            NamedType(g, args) ->
+                var at: Option[usize] = None
+
+                for j in 0..<args.len()
+                    if same_span(args.at(j).span, found.at(i).span) then at = Some(j)
+
+                applied_use(a, home, g, at, s"in '${type_text(t)}'", n)
             _ -> Some((n, s"in '${type_text(t)}'"))
         AtExpr(e) -> *e.kind match
             LayoutOf(op, _) -> Some((n, s"in '$op($n)'"))
@@ -114,8 +123,14 @@ private expr_use(a: &Analysis, home: Scope, found: Buf[Construct], i: usize,
             // `*P` and `&P` among a call's type arguments, which the expression grammar spells as
             // the operators.
             Unary(op, _) -> if op == "*" || op == "&" then None else Some((n, "as a value"))
-            Index(recv, _, _) -> argument_use(a, home, recv, me, n)
-            TypeArgs(recv, _, _) -> argument_use(a, home, recv, me, n)
+            Index(recv, _, _) -> argument_use(a, home, recv, me, Some(0), n)
+            TypeArgs(recv, args, _) ->
+                var at: Option[usize] = None
+
+                for j in 0..<args.len()
+                    if same_span(args.at(j).span, me) then at = Some(j)
+
+                argument_use(a, home, recv, me, at, n)
             Call(callee, _) ->
                 if same_span(callee.span, me) then Some((n, "to construct a value"))
                 else Some((n, "as a value"))
@@ -126,15 +141,36 @@ private expr_use(a: &Analysis, home: Scope, found: Buf[Construct], i: usize,
 end expr_use
 
 // `f[P]` hands the parameter on to another generic function, whose own call asks this again; `Buf[P]`
-// applies a type to it, which lays it out.
-private argument_use(a: &Analysis, home: Scope, recv: Expr, me: Span,
+// applies a type to it, which lays it out where that type does. `at` is the argument's position.
+private argument_use(a: &Analysis, home: Scope, recv: Expr, me: Span, at: Option[usize],
                      n: string) -> Option[(string, string)]
     if same_span(recv.span, me) then return Some((n, "as a value"))
 
     *recv.kind match
-        Ident(m) -> if lookup_type_key(a, home, m).is_some() then Some((n, s"in '$m[$n]'")) else None
+        Ident(m) -> if lookup_type_key(a, home, m).is_some() then applied_use(a, home, m, at, s"in '$m[$n]'", n)
+                    else None
         _ -> None
 end argument_use
+
+// The parameter as argument `at` of the generic type `g`: fine where `g` reaches that parameter only
+// behind a mode (`held_by_value.sysl`), and refused naming the field that holds it where not. A
+// standard type's fields are its own business, so it is named without them.
+private applied_use(a: &Analysis, home: Scope, g: string, at: Option[usize], shown: string,
+                    n: string) -> Option[(string, string)]
+    val key = lookup_type_key(a, home, g)
+
+    if key.is_none() || at.is_none() then return Some((n, shown))
+
+    val held = held_by_value(a, key.unwrap(), at.unwrap())
+
+    if held.is_none() then return None
+
+    val decl = a.tables.types.get(key.unwrap())
+
+    if held.unwrap() == "" || decl.is_none() || from_library(a, decl.unwrap().scope) then return Some((n, shown))
+
+    Some((n, s"$shown (its field '${held.unwrap()}' holds '$n')"))
+end applied_use
 
 // The nearest construct before `i` whose extent holds it, which the walk's order makes its parent.
 // A construct of the same extent is the node wrapping it -- a statement of one expression -- and is

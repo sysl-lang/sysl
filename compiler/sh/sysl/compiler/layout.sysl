@@ -102,8 +102,8 @@ end bitfield_bits
 // the integer is as wide as the struct. The storage of such a struct is untouched -- it stays its
 // fields end to end, with its C layout -- and on a little-endian machine the integer is its bytes.
 //
-// The fields a range may be are exactly a bitfield struct's: an integer, a simple enum, and a
-// bitfield struct, which here is a field of its container's size. `None` where any other is present
+// The fields a range may be: an integer, a simple enum, a bitfield struct (a field of its
+// container's size here), and a `@packed` struct that converts to an integer itself, recursively. `None` where any other is present
 // (`unconvertible_field` names it), and for a struct with no fields.
 integer_ranges(s: &StructType) -> Option[Buf[BitRange]]
     val own = bitfield_ranges(s)
@@ -121,7 +121,7 @@ integer_ranges(s: &StructType) -> Option[Buf[BitRange]]
     for item in fields
         val w = whole_range_width(item.1)
 
-        if w.is_none() then return None
+        if w.is_none() || w.unwrap() % 8 != 0 then return None
 
         out.push(BitRange(item.0, item.1, offset, w.unwrap()))
         offset += w.unwrap()
@@ -132,19 +132,24 @@ end integer_ranges
 // The first stored field of a `@packed` struct that keeps it from converting to an integer.
 unconvertible_field(s: &StructType) -> Option[(string, Type)]
     for item in s.stored()
-        if whole_range_width(item.1).is_none() then return Some(item)
+        val w = whole_range_width(item.1)
+
+        if w.is_none() || w.unwrap() % 8 != 0 then return Some(item)
 
     None
 end unconvertible_field
 
 // How wide a field of a whole-byte `@packed` struct reads as a range: an integer's or a simple enum's
-// own bits, and a bitfield struct's whole container.
+// own bits, a bitfield struct's whole container, and a `@packed` struct that itself converts to an
+// integer, as wide as that integer -- so the rule holds at every depth.
 private whole_range_width(t: Type) -> Option[int] = bitfield_width(t) match
     Some(w) -> Some(w)
     None -> underlying(t) match
         Struct(d) -> bitfield_ranges(d) match
             Some(ranges) -> Some(bitfield_bits(ranges))
-            None -> None
+            None -> integer_ranges(d) match
+                Some(ranges) -> Some(bitfield_used(ranges))
+                None -> None
         _ -> None
 
 // The most bytes a value may be handed to a function in before it goes by address instead.

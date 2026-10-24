@@ -9,10 +9,12 @@ module sh.sysl.compiler
 // requested, once per ask, is quadratic in the number of distinct types a large program declares.
 //
 // The claim is a ratio rather than a bound, so it holds on a slow machine as well as a fast one: a
-// program four times larger may cost four times as much to emit and not sixteen times.
+// program eight times larger may cost eight times as much to emit and not sixty-four times. How the
+// two are measured under a loaded suite is `tests_lgr_linear_growth.sysl`'s.
 
 import sysl.buf.{Buf, buf}
-import sysl.time.{monotonic, whole_micros}
+import sysl.posix.time.cpu_time
+import sysl.time.whole_micros
 
 // `n` distinct struct types, each with a counted field, each walked through a function that forces
 // a retain at its one call site -- so a distinct helper is requested once per type, and the program
@@ -38,34 +40,55 @@ private helper_program(n: usize) -> string
     text
 end helper_program
 
-// The best of three lowerings of one program, in microseconds.
-private helper_emit_cost(n: usize) -> long
+// One lowering of a program of `n` types, analysed once beforehand, as work to measure.
+private helper_lowering(n: usize) -> &Fn() -> long
     val done = typed_of(helper_program(n))
 
     assert(done.reported.is_empty(), "the generated program is sound")
 
     val p = strip_tests(program_of(done, done.main_module))
     val promotions = check_escapes(done.an, p)
+    val target = done.an.tables.target
 
-    var best: long = -1
+    () -> processor_micros(() -> codegen_with_gaps(p, target, promotions))
+end helper_lowering
 
-    for round in 0..<3
-        val started = monotonic()
-        codegen_with_gaps(p, done.an.tables.target, promotions)
-        val took = whole_micros(monotonic() - started)
+// `n` distinct helpers asked of a fresh emitter, one after another, as a run to measure: the
+// processor time of the asking alone, having checked each was queued once.
+//
+// **This is the claim at its own size**, and the whole lowering below is the claim where a program
+// meets it. A lowering does far more per type than ask for its helper, so a scan of the names asked so
+// far stays a small part of it until a program has tens of thousands of types; asked directly, the scan
+// is the whole of the cost, and a scan put back fails here at a few thousand.
+private asking(n: usize) -> &Fn() -> long
+    var names: Buf[string] = buf()
 
-        if best < 0 || took < best then best = took
+    for i in 0..<n
+        names.push(s"arc.retain.helper_type_number_$i")
 
-    best
-end helper_emit_cost
+    () ->
+        var e = emitter(host_target())
+        val started = cpu_time()
 
-@test("emitting a program with four times as many distinct counted types costs about four times as much, not sixteen")
+        for name in names
+            request_helper(&e, name, HrPlainDrop)
+
+        val took = whole_micros(cpu_time() - started)
+
+        assert_eq(e.requested.len(), n)
+        took
+end asking
+
+@test("asking for eight times as many distinct helpers costs about eight times as much, not sixty-four")
+asking_for_a_helper_is_one_lookup()
+    val g = growth_of(asking(4000), asking(4000 * GrowthFactor))
+
+    assert(g.linear(), g.said("asking for distinct helpers"))
+end asking_for_a_helper_is_one_lookup
+
+@test("emitting a program with eight times as many distinct counted types costs about eight times as much, not sixty-four")
 requesting_a_helper_is_not_quadratic()
-    val small = helper_emit_cost(300)
-    val large = helper_emit_cost(1200)
+    val g = growth_of(helper_lowering(300), helper_lowering(300 * GrowthFactor))
 
-    val ratio = large / (if small > 0 then small else 1)
-
-    assert(ratio < 9,
-           s"a 4x program took ${ratio}x as long to emit its helpers (${small} us, then ${large} us)")
+    assert(g.linear(), g.said("emitting the helpers of distinct counted types"))
 end requesting_a_helper_is_not_quadratic

@@ -68,9 +68,14 @@ struct ResultSites
     held: &Table[Type]
     // The nested function whose body `nested_body_in` is reading for that function's own result.
     for_body: string
+    // A generic declaration's result read at one instantiation, where its own parameters standing for
+    // themselves could not read it (`instance_result`), by site key and arguments; and the readings
+    // of that kind under way.
+    instances: &Table[Type]
+    instance_reading: Buf[string]
 end ResultSites
 
-result_sites() -> &ResultSites = ResultSites(false, table(), buf(), table(), "")
+result_sites() -> &ResultSites = ResultSites(false, table(), buf(), table(), "", table(), buf())
 
 // A declaration filed: its slot is pointed at it, and it waits to be asked -- or, where the result is
 // settled already (`held`), it is that.
@@ -113,8 +118,53 @@ inferred_result(a: &Analysis, slot: &ResultSlot, subst: Buf[Binding]) -> Type
     if s.state != 2 && !a.results.open then return Unknown
 
     settle_result(a, s)
+
+    if s.ty == Unknown && !s.looped && !s.tainted && !s.closure then return instance_result(a, s, subst)
+
     subst_params(a, s.ty, subst)
 end inferred_result
+
+// **A generic body that its parameters, standing for themselves, cannot read is read at the
+// instantiation that asks** -- `show[T](p: Pair[T]) = print(p.bits)` has no `.bits` until `T` is a
+// type, since how wide the integer is depends on it, yet at `Pair[u8]` the body is an ordinary call
+// handing back `unit`. Taking the first reading's `Unknown` instead gave every instantiation a result
+// nobody had, and a call to it a value that its `void` function never produced.
+//
+// It is read once per site and arguments, everything the reading registered taken back as the first
+// reading's was. Arguments that still name a parameter, or a reading of the same instantiation from
+// inside itself, keep `Unknown`; so does a body that does not read cleanly here either, which is then
+// told where the instantiation is typed for real.
+private instance_result(a: &Analysis, s: &ResultSite, subst: Buf[Binding]) -> Type
+    val generic = !s.decl.tparams.is_empty() ||
+                  (s.member && !a.tables.members.selves.get(s.key).unwrap_or(buf()).is_empty())
+
+    if subst.is_empty() || !generic || s.frame.is_some() then return Unknown
+
+    var key = s.key
+
+    for item in subst
+        if mentions_abstract(item.ty) || mentions_unknown(item.ty) then return Unknown
+
+        key = s"$key|${item.name}=${mangle(item.ty)}"
+
+    val known = a.results.instances.get(key)
+
+    if known.is_some() then return known.unwrap()
+
+    for item in a.results.instance_reading
+        if item == key then return Unknown
+
+    a.results.instance_reading.push(key)
+
+    val got = body_result_type(a, s.scope, s.decl, Some(subst))
+
+    a.results.instance_reading.truncate(a.results.instance_reading.len() - 1)
+
+    val ty = if is_closure_literal(got) then Unknown else got
+
+    a.results.instances.put(key, ty)
+    ty
+end instance_result
 
 // The result of the function filed under `key`, settled if it has not been yet -- for a reader that
 // holds the function's name rather than its declaration.
@@ -227,7 +277,11 @@ end read_result
 // rewound**: the body is read again, for real, wherever it is typed, and a mistake inside it would
 // otherwise be reported twice. A body that did not read cleanly answers `Unknown`, which nothing
 // downstream complains about a second time.
-private body_result_type(a: &Analysis, scope: Scope, written: FuncDecl) -> Type
+//
+// `given` reads it at one instantiation instead: its bindings are the ones the instantiation's body
+// is typed under, so the answer is in its terms.
+private body_result_type(a: &Analysis, scope: Scope, written: FuncDecl,
+                         given: Option[Buf[Binding]] = None) -> Type
     val d = with_call_bounds(written)
 
     if d.body.is_empty() then return Unknown
@@ -245,15 +299,8 @@ private body_result_type(a: &Analysis, scope: Scope, written: FuncDecl) -> Type
     val constrained = a.tables.constrained_insts.len()
     val closures = a.closure_funcs.len()
     val counted = a.closure_count
-    val outer = a.tables.members.selves.get(d.name).unwrap_or(buf())
-    var subst = joined_bindings(outer, abstract_subst(a, scope, d.tparams, d.bounds, d.tvalues,
-                                                      d.tpacks, outer))
-    val written_self = a.tables.members.generic_self.get(d.name)
-
-    if written_self.is_some() then
-        subst.push(Binding("Self", resolve_type(a, scope, written_self.unwrap(), subst)))
-
-    subst = with_derive_param(a, d.name, subst)
+    val subst = with_derive_param(a, d.name, if given.is_some() then given.unwrap()
+                                             else abstract_terms(a, scope, d))
 
     val cx = analyzer_for(a, scope)
 
@@ -289,6 +336,19 @@ private body_result_type(a: &Analysis, scope: Scope, written: FuncDecl) -> Type
 
     if clean then body.ty else Unknown
 end body_result_type
+
+// Each of a declaration's parameters standing for itself, and its type's where it is a member.
+private abstract_terms(a: &Analysis, scope: Scope, d: FuncDecl) -> Buf[Binding]
+    val outer = a.tables.members.selves.get(d.name).unwrap_or(buf())
+    var subst = joined_bindings(outer, abstract_subst(a, scope, d.tparams, d.bounds, d.tvalues,
+                                                      d.tpacks, outer))
+    val written_self = a.tables.members.generic_self.get(d.name)
+
+    if written_self.is_some() then
+        subst.push(Binding("Self", resolve_type(a, scope, written_self.unwrap(), subst)))
+
+    subst
+end abstract_terms
 
 // A body read for the type it produces: its trailing expression with nothing expected, as a `val`'s
 // initializer is read. A body that gave up comes to `Unknown`. A body that is an assignment written

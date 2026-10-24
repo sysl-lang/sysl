@@ -983,6 +983,73 @@ handed an object is refused rather than bound to a trait it asks nothing of. A g
 at an object, such as `Wrap(port)` for a `struct Wrap[P: Port]` holding `p: *P`, follows the same rule,
 and a field holding `P` by value is refused where it is declared.
 
+**A generic type applied to the parameter is a use behind a mode exactly when the type reaches it only
+behind one.** `Wrap[P]` lays out a pointer to the object, so it may be a parameter's type, a result, a
+local or another generic type's field:
+
+```sysl
+trait Port
+    mask(self) -> u32
+
+struct Board
+    level: u32
+
+impl Port for Board
+    mask(self) -> u32 = self.level
+
+struct Wrap[P: Port]
+    p: *P
+
+wrap[P: Port](p: *P) -> Wrap[P] = Wrap(p)
+
+send[P: Port](p: *P, v: u32) -> u32
+    val w = wrap(p)
+    w.p.mask() + v
+
+var b = Board(40)
+val port: *Port = &b
+
+print(send(port, 2))
+```
+
+```output
+42
+```
+
+A type that holds the parameter by value somewhere along its fields — directly, in an array, or in
+another generic type that does — needs its layout even behind a pointer, and the refusal names the
+fields that hold it:
+
+```sysl
+trait Port
+    mask(self) -> u32
+
+struct Board
+    level: u32
+
+impl Port for Board
+    mask(self) -> u32 = self.level
+
+struct Cell[T]
+    v: T
+
+struct Shelf[P: Port]
+    cell: Cell[P]
+
+peek[P: Port](p: *P) -> u32
+    val s: *Shelf[P] = null
+    p.mask()
+
+var b = Board(40)
+val port: *Port = &b
+
+print(peek(port))
+```
+
+```error
+'peek' uses 'P' in 'Shelf[P]' (its field 'cell.v' holds 'P') at line 17
+```
+
 ### A type's own parameters carry bounds too
 
 The same bracketed list means the same thing on a struct or an enum, and it is where the type states

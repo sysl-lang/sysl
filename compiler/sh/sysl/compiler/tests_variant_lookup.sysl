@@ -3,7 +3,6 @@ module sh.sysl.compiler
 
 import sysl.buf.{Buf, buf}
 import sysl.text.Search
-import sysl.time.{monotonic, whole_micros}
 
 // What resolving a bare name costs as a program grows in both calls and types.
 //
@@ -12,8 +11,8 @@ import sysl.time.{monotonic, whole_micros}
 // so a program with twice the functions and twice the types cost four times as much to type. Nearly
 // no name is a variant, and a set of every variant name registered answers that in one lookup.
 //
-// The claim is a ratio rather than a bound, as `tests_reachability.sysl`'s is: a program four times
-// larger may cost four times as much to type and not sixteen.
+// The claim is a ratio rather than a bound, as `tests_reachability.sysl`'s is: a program eight times
+// larger may cost eight times as much to type and not sixty-four.
 
 // `n` structs nothing uses, which is what makes the type table large, and a chain of `n` functions
 // each calling the next and reading its parameter as an operand. One generic enum is used a fixed
@@ -39,37 +38,26 @@ private many_types_program(n: usize) -> string
     text
 end many_types_program
 
-// The best of three analyses of one program, in microseconds, and how many bodies were typed.
-private typing_cost(n: usize) -> (long, usize)
+// That an analysis of the program of `n` typed it: no complaint, and a body for each of its `n`
+// functions as well as `pick` and `main`.
+private typed_all(done: TypedBodies, n: usize)
+    if !done.reported.is_empty() then panic(done.reported.at(0).diag.message)
+
+    assert(done.funcs.len() >= n + 2, s"${done.funcs.len()} bodies typed of ${n + 2}")
+end typed_all
+
+// One analysis of the program of `n`, written out beforehand, as a run to measure.
+private typing(n: usize) -> &Fn() -> long
     val text = many_types_program(n)
 
-    var best: long = -1
-    var typed: usize = 0
+    () -> processor_micros(() -> typed_all(typed_of(text), n))
+end typing
 
-    for round in 0..<3
-        val started = monotonic()
-        val done = typed_of(text)
-        val took = whole_micros(monotonic() - started)
-
-        if !done.reported.is_empty() then panic(done.reported.at(0).diag.message)
-
-        typed = done.funcs.len()
-
-        if best < 0 || took < best then best = took
-
-    (best, typed)
-end typing_cost
-
-@test("typing a program with four times the calls and four times the types costs about four times as much")
+@test("typing a program with eight times the calls and eight times the types costs about eight times as much")
 name_resolution_is_linear_in_types()
-    val small = typing_cost(300)
-    val large = typing_cost(1200)
+    val g = growth_of(typing(300), typing(300 * GrowthFactor))
 
-    assert(large.1 > small.1, "the larger program types more bodies")
-
-    val ratio = large.0 / (if small.0 > 0 then small.0 else 1)
-
-    assert(ratio < 9, s"a 4x program took ${ratio}x as long to type (${small.0} us, then ${large.0} us)")
+    assert(g.linear(), g.said("typing calls among many types"))
 end name_resolution_is_linear_in_types
 
 @test("a bare variant still resolves, and a name no enum declares is still undefined")
