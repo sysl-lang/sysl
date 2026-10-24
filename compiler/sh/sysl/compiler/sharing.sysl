@@ -35,7 +35,7 @@ end Unshareable
 // The part of a type that may not be shared, or nothing where every count it reaches is atomic.
 unshareable(t: Type) -> Option[Unshareable] = share_walk(t, buf(), None, false, false)
 
-// The same question of a value **handed over as a copy** (`@crossing(copy value)`): every view in it,
+// The same question of a value **handed over as a copy** (a `@crossing` parameter taken by value): every view in it,
 // at any depth, is copied into storage with a count of its own, so a view and a string are not in the
 // way -- what their elements hold still is. A guarded field and a frozen buffer's elements are not
 // copied, so they are asked as they always are.
@@ -340,6 +340,10 @@ end settle_shared_checks
 crossing_complaint(subject: string, crossed: Type, a: &Analysis, scope: Scope) -> Option[string] =
     complaint_about(subject, crossed, unshareable(crossed), a, scope)
 
+// The same question of a value handed over by value, whose every view is copied on the way.
+copied_crossing_complaint(subject: string, crossed: Type, a: &Analysis, scope: Scope) -> Option[string] =
+    complaint_about(subject, crossed, copied_unshareable(crossed), a, scope)
+
 private complaint_about(subject: string, crossed: Type, part: Option[Unshareable], a: &Analysis,
                         scope: Scope) -> Option[string]
     if part.is_none() then return None
@@ -382,15 +386,16 @@ private share_view_remedy(what: string) -> string =
 //
 // **A `*T` parameter is looked *through*, and that is the whole of what the annotation buys.** A raw
 // pointer is shareable because it carries no count of its own -- which says nothing about the object
-// at the far end, and the object at the far end is what crossed. Everything else is asked about the
-// parameter's own type, a parameter copying no buffer and sharing whatever it names.
+// at the far end, and the object at the far end is what crossed.
 //
 // Reported at the **argument**, that being the thing that could have been written differently. A
 // receiver among the parameters is skipped by construction: `@crossing` names a member's own
 // parameters and `self` is not one of them.
 //
-// **A parameter written `copy` is handed a copy of every view it holds** (`copies`), so a view
-// crosses there: what the rule asks of it is what is left once the views are copied.
+// **A value crossing by value is handed a copy of every view it holds** (`copies`, which is every
+// parameter `@crossing` names), so a view crosses there: what the rule asks of it is what is left
+// once the views are copied. A `@scoped` member's callable, added to the list beside them, holds no
+// view and is asked as it is.
 check_crossings(cx: &Analyzer, crossing: Buf[string], copies: Buf[string], shown: string,
                 params: Buf[(string, Type)], args: Buf[TExpr])
     if crossing.is_empty() then return
@@ -416,7 +421,7 @@ end check_crossings
 // The callee as a sentence names it. A free function arrives as its bare name and is quoted here; a
 // member or a generic arrives already said -- `method 'Channel[int].send'` -- and quoting it again
 // would put a quote inside a quote.
-private callee_said(shown: string) -> string = if shown.contains("'") then shown else s"'$shown'"
+callee_said(shown: string) -> string = if shown.contains("'") then shown else s"'$shown'"
 
 private is_pointer(t: Type) -> bool = t match
     Ptr(_) -> true
@@ -430,7 +435,7 @@ private is_pointer(t: Type) -> bool = t match
 // (`TCrossCopy` at the call) that makes nothing and is where an allocator-free module is told.
 private check_copied_crossing(cx: &Analyzer, arg: TExpr, pname: string, shown: string, pty: Type) -> bool
     val subject = s"'$pname' of ${callee_said(shown)}"
-    val why = complaint_about(subject, pty, copied_unshareable(pty), cx.an, cx.scope)
+    val why = copied_crossing_complaint(subject, pty, cx.an, cx.scope)
 
     if why.is_some()
         cx.fault(arg.span, why.unwrap())
