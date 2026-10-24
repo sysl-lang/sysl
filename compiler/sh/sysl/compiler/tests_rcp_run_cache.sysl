@@ -560,26 +560,28 @@ private rcp_mint(m: *RcpMint)
     for i in 0..<m.count
         m.digests[i] = rcp_digest(pending_name("/rcp/slot"))
 
+// The threads are joined out of a buffer, which no single way through the test can be seen to do for
+// each of them, so what they write lives in module storage rather than in the test's frame.
+private var rcp_digests: [2000]u64 = [0; 2000]
+private var rcp_shares: [8]RcpMint = [RcpMint(null, 0); 8]
+
 @test("and none shared between threads either")
 rcp_no_pending_name_is_shared_between_threads()
-    var digests: [2000]u64 = [0; 2000]
-    var shares: [8]RcpMint = [RcpMint(null, 0); 8]
-
-    for k in 0..<shares.len
-        shares[k] = RcpMint(as_mut_ptr(digests[(k * 250)..<((k + 1) * 250)]), 250)
+    for k in 0..<rcp_shares.len
+        rcp_shares[k] = RcpMint(as_mut_ptr(rcp_digests[(k * 250)..<((k + 1) * 250)]), 250)
 
     var threads: Buf[Thread] = buf()
 
-    for k in 0..<shares.len
-        threads.push(spawn(&rcp_mint, &shares[k]).unwrap())
+    for k in 0..<rcp_shares.len
+        threads.push(spawn(&rcp_mint, &rcp_shares[k]).unwrap())
 
     for item in threads
         assert(item.join(), "a thread did not join")
 
-    sort(digests[..])
+    sort(rcp_digests[..])
 
     for i in 1..<2000
-        assert(digests[i] != digests[i - 1], "two threads were handed one name")
+        assert(rcp_digests[i] != rcp_digests[i - 1], "two threads were handed one name")
 end rcp_no_pending_name_is_shared_between_threads
 
 @test("a published file is exactly what was written, and nothing is left beside it")

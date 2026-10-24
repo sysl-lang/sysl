@@ -1,5 +1,6 @@
 module sh.sysl.compiler
 
+import sh.sysl.hocon.Value
 import sysl.buf.{Buf, buf}
 import sysl.text.{join, Search}
 
@@ -39,44 +40,44 @@ end FeatureTarget
 
 // The `targets` block of one feature block, each target's keys read exactly as the top-level target
 // block's own are. A key a target block does not know is warned about as one there is.
-read_feature_targets(feature: string, entry: &Conf,
+read_feature_targets(feature: string, entry: Value,
                      warnings: *Buf[string]) -> Result[Buf[FeatureTarget], string]
     var out: Buf[FeatureTarget] = buf()
 
-    val block = conf_at(entry, "targets") match
+    val block = entry.get("targets") match
         None -> return Ok(out)
         Some(b) -> b
 
     val where = s"features.$feature.targets"
 
-    if !conf_is_block(block)
+    if !block.is_obj()
         return Err(s"'$where' is not a block — it names targets, each with the keys this feature sets " +
             s"while it is on, as '$where { thumb-freestanding { linker_script = \"m4.ld\" } }'")
 
-    for target in conf_keys(block)
-        val sub = conf_at(block, target).unwrap()
+    for target in block.keys()
+        val sub = block.get(target).unwrap()
         val at = s"$where.$target"
 
-        if !conf_is_block(sub)
+        if !sub.is_obj()
             return Err(s"'$at' is not a block — it sets the keys of 'targets.$target' this feature " +
                 "changes, as 'linker_script = \"m4.ld\"'")
 
-        for key in conf_keys(sub)
+        for key in sub.keys()
             if !feature_target_key(key) then warnings.push(unknown_key(s"$at.$key"))
 
         val image = read_image(sub, target, at)? match
             Some(i) -> i with { target = target }
             None -> ImageLink(target, "", "", "")
 
-        val capabilities = conf_at(sub, "capabilities") match
+        val capabilities = sub.get("capabilities") match
             None -> buf()
             Some(caps) -> read_capabilities(caps, s"$at.capabilities")?
 
-        val settings = conf_at(sub, "codegen") match
+        val settings = sub.get("codegen") match
             None -> (buf(), buf(), None)
             Some(cg) -> read_codegen(cg, s"$at.codegen")?
 
-        out.push(FeatureTarget(target, feature, conf_text(sub, "triple"), image, capabilities, settings.0,
+        out.push(FeatureTarget(target, feature, scalar_text(sub, "triple"), image, capabilities, settings.0,
                                settings.1, settings.2))
 
     Ok(out)
@@ -93,13 +94,11 @@ private feature_target_key(key: string) -> bool =
 // The refusal for the 0.4.0 spelling, `targets.<t>.features.<f> { k = v }`, which says the same thing
 // from the other side: the target block is now inside the feature. The fix-it is the rewritten block,
 // built from what the old one held.
-old_target_features_refusal(target: string, old: &Conf) -> string
+old_target_features_refusal(target: string, old: Value) -> string
     var shown = ""
 
-    for feature in conf_keys(old)
-        val sub = conf_at(old, feature).unwrap()
-
-        shown = shown + s" features.$feature.targets.$target ${conf_shown(sub)}"
+    for f in old.fields()
+        shown = shown + s" features.${f.key}.targets.$target ${shown_on_one_line(f.value)}"
 
     s"'targets.$target.features' is the spelling of 0.4.0, where a target block listed the features that " +
         "changed it — a feature is now one block saying everything it does, so the target block goes " +
@@ -107,26 +106,29 @@ old_target_features_refusal(target: string, old: &Conf) -> string
 end old_target_features_refusal
 
 // A value written the way a manifest writes it, on one line, for a fix-it to quote.
-conf_shown(c: &Conf) -> string
-    *c match
-        Text(s) -> s"\"$s\""
-        Word(s) -> s
-        Flag(on) -> if on then "true" else "false"
-        Items(values) ->
-            var parts: Buf[string] = buf()
+shown_on_one_line(c: Value) -> string
+    if c.is_arr()
+        var parts: Buf[string] = buf()
 
-            for v in values
-                parts.push(conf_shown(v))
+        for v in c.items()
+            parts.push(shown_on_one_line(v))
 
-            "[" + join(parts.view(), ", ") + "]"
-        Block(pairs) ->
-            var parts: Buf[string] = buf()
+        return "[" + join(parts.view(), ", ") + "]"
+    end if
 
-            for pair in pairs
-                parts.push(s"${pair.0} = ${conf_shown(pair.1)}")
+    if c.is_obj()
+        var parts: Buf[string] = buf()
 
-            "{ " + join(parts.view(), ", ") + " }"
-end conf_shown
+        for f in c.fields()
+            parts.push(s"${f.key} = ${shown_on_one_line(f.value)}")
+
+        return "{ " + join(parts.view(), ", ") + " }"
+    end if
+
+    c.as_quoted() match
+        Some(s) -> s"\"$s\""
+        None -> c.as_scalar().unwrap_or("")
+end shown_on_one_line
 
 // The feature blocks of one target block whose feature this build has on, in the order the file
 // wrote them. **The root's request decides**, as it decides what the root's own source compiles.

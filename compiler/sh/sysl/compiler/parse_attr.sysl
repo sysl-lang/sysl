@@ -180,7 +180,7 @@ private member_attr_word(w: string) -> bool
     if fn_forgo_word(w) then return true
 
     for word in ["crossing", "reads", "writes", "noinline", "inline", "cold", "blocks",
-                 "relocates", "views", "consumes", "disjoint", "scoped"]
+                 "relocates", "views", "consumes", "disjoint", "scoped", "joined"]
         if word == w then return true
 
     false
@@ -230,7 +230,7 @@ builtin_attr_word(w: string) -> bool
                  "tailrec", "pure", "ghost", "packed", "reads", "writes", "align", "byte_order", "export",
                  "section", "crossing", "domain", "keeps", "disjoint", "guards", "needs",
                  "noinline", "inline", "cold", "thread_local", "abandons", "per_cpu", "main_thread",
-                 "pinned", "pins", "relocates", "views", "consumes", "blocks", "scoped"]
+                 "pinned", "pins", "relocates", "views", "consumes", "blocks", "scoped", "joined"]
         if word == w then return true
 
     false
@@ -368,6 +368,7 @@ parse_attribute(p: *Parser) -> Option[Attr]
     if word == "domain" then return parse_domain_attr(p)
     if word == "keeps" then return Some(Keeps(parse_named_list(p, "keeps")))
     if word == "scoped" then return Some(Scoped(parse_named_list(p, "scoped")))
+    if word == "joined" then return Some(Joined(parse_named_list(p, "joined")))
     if word == "disjoint" then return Some(Disjoint(parse_named_list(p, "disjoint")))
     if word == "guards" then return Some(Guards(parse_named_list(p, "guards")))
     if word == "needs" then return Some(Needs(parse_named_list(p, "needs")))
@@ -509,15 +510,6 @@ private parse_named_list(p: *Parser, word: string) -> Buf[string]
         p.peek() match
             // `@disjoint` may also name a part of the function's result, by position as a tuple's
             // part is selected and by the name an `ensure` gives the result: `result.0`.
-            // `@crossing(copy value)`: the word in front of a name says the call copies what that
-            // parameter holds. It is a word only there -- a parameter may itself be called `copy`.
-            Ident(n) if word == "crossing" && n == "copy" && names_at(p, 1) ->
-                p.bump()
-                p.peek() match
-                    Ident(m) -> out.push(s"copy $m")
-                    QuotedIdent(m) -> out.push(s"copy $m")
-                    _ -> ()
-                p.bump()
             Ident(n) if word == "disjoint" && n == "result" && p.kw_at(1, ".") ->
                 p.bump()
                 p.bump()
@@ -548,29 +540,8 @@ private parse_named_list(p: *Parser, word: string) -> Buf[string]
     out
 end parse_named_list
 
-// Whether the token `n` ahead is a name.
-private names_at(p: *Parser, n: usize) -> bool = p.peek_at(n) match
-    Ident(_) -> true
-    QuotedIdent(_) -> true
-    _ -> false
-
-// `@crossing(state)` and `@crossing(copy value)`: every name is a parameter that reaches another
-// domain, and one written after `copy` is also one the call copies.
-private parse_crossing_attr(p: *Parser) -> Attr
-    var names: Buf[string] = buf()
-    var copies: Buf[string] = buf()
-
-    for item in parse_named_list(p, "crossing")
-        if item.starts_with("copy ")
-            val name = item[5..]
-
-            names.push(name)
-            copies.push(name)
-        else
-            names.push(item)
-
-    Crossing(names, copies)
-end parse_crossing_attr
+// `@crossing(state)`: every name is a parameter that reaches another domain.
+private parse_crossing_attr(p: *Parser) -> Attr = Crossing(parse_named_list(p, "crossing"))
 
 // `@views(self)`: what a member's returned view is borrowed from. **Only the receiver may be named**
 // -- a view borrowed from another parameter would need the caller to know which argument it was,
@@ -686,6 +657,8 @@ private named_list_refusal(word: string) -> string
     if word == "keeps" then return "'@keeps' names the parameters a C function holds on to past the call, in parentheses — '@keeps(context)'. There is no empty form: an 'extern' that keeps nothing it is handed says so by not writing the annotation"
 
     if word == "scoped" then return "'@scoped' names the parameters a function lets go of before its caller's scope ends — a callable a member runs in another concurrency domain, or a '*T' it holds while its caller waits — in parentheses: '@scoped(f)'. There is no empty form: a function that holds nothing past its call says so by not writing the annotation"
+
+    if word == "joined" then return "'@joined' names the '*T' parameters a call hands to the thread it starts, which holds each until the handle the call answers is joined, in parentheses — '@joined(arg)'. There is no empty form: a function whose thread holds nothing it was handed says so by not writing the annotation"
 
     if word == "guards" then return "'@guards' names the fields a struct's own members are the only way into, in parentheses — '@guards(value)'. There is no empty form: a struct that guards nothing says so by not writing the annotation"
 
@@ -952,9 +925,9 @@ apply_func_attrs(f: *FuncDecl, attrs: Buf[Attr])
                 f.exported = Some(e)
                 f.marks.weak_export = e.weakly
             Section(s) -> f.section = Some(s)
-            Crossing(ns, cs) ->
+            Crossing(ns) ->
                 f.crossing = ns
-                f.marks.copies = cs
+                f.marks.copies = ns
             Domain(d) -> f.marks.domain = Some(d)
             Needs(cs) -> f.needs = cs
             Disjoint(ns) -> f.marks.disjoint = ns
@@ -969,16 +942,18 @@ apply_func_attrs(f: *FuncDecl, attrs: Buf[Attr])
             Forgoes(cap) -> f.marks.forgoes.push(cap)
             Blocks -> f.marks.blocks = true
             Scoped(ns) -> f.marks.scoped = ns
+            Joined(ns) -> f.marks.joined = ns
             _ -> ()
 end apply_func_attrs
 
 apply_member_attrs(m: *MethodDecl, attrs: Buf[Attr])
     for attr in attrs
         attr match
-            Crossing(ns, cs) ->
+            Crossing(ns) ->
                 m.crossing = ns
-                m.marks.copies = cs
+                m.marks.copies = ns
             Scoped(ns) -> m.marks.scoped = ns
+            Joined(ns) -> m.marks.joined = ns
             Disjoint(ns) -> m.marks.disjoint = ns
             Reads(ns) -> m.reads = Some(ns)
             Writes(ns) -> m.writes = Some(ns)
@@ -1249,6 +1224,9 @@ private attributed_refusal(attrs: Buf[Attr]) -> string
     // holds past the call is what `@keeps(...)` says.
     if any_is(attrs, "scoped")
         return "'@scoped' promises that a body lets go of a parameter before its caller's scope ends, so it marks a function or a method, whose body is sysl — an 'extern' borrows what it is handed for the call, and one that holds a pointer past it says '@keeps(...)'"
+
+    if any_is(attrs, "joined")
+        return "'@joined' says how long the thread a sysl function starts holds a pointer, so it marks a function or a method, whose body is sysl — an 'extern' that holds a pointer past the call says '@keeps(...)', and a sysl wrapper around it says '@joined'"
 
     if any_is(attrs, "guards")
         return "'@guards(...)' names the fields a struct's own members are the only way into, so it can only mark a struct — and this declares none"

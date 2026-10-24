@@ -1,5 +1,6 @@
 module sh.sysl.compiler
 
+import sh.sysl.hocon.Value
 import sysl.buf.{Buf, buf}
 import sysl.text.{join, Search}
 
@@ -96,38 +97,38 @@ end holds_name
 plain_feature_info(name: string) -> FeatureInfo = FeatureInfo(name, "", "", false, buf(), "")
 
 // One feature block: the members it enables, what else it says, and the target keys it sets.
-read_feature_block(name: string, entry: &Conf, warnings: *Buf[string]) -> Result[FeatureBlock, string]
+read_feature_block(name: string, entry: Value, warnings: *Buf[string]) -> Result[FeatureBlock, string]
     val where = s"features.$name"
 
-    for key in conf_keys(entry)
+    for key in entry.keys()
         if !holds_name(FeatureKeys, key)
             warnings.push(unknown_key(s"$where.$key"))
         else if holds_name(FeatureKeysNotYetRead, key)
             warnings.push(not_yet_read(s"$where.$key"))
 
-    val enables = conf_at(entry, "enables") match
+    val enables = entry.get("enables") match
         None -> buf()
-        Some(v) -> conf_list(v) match
+        Some(v) -> v.as_text_list() match
             None -> return Err(not_a_feature_list(s"$where.enables"))
             Some(names) -> names
 
     var requires: Buf[string] = buf()
 
-    conf_at(entry, "requires") match
+    entry.get("requires") match
         None -> ()
         Some(v) ->
-            if !conf_is_block(v)
-                requires = conf_list(v) match
+            if !v.is_obj()
+                requires = v.as_text_list() match
                     None -> return Err(s"'$where.requires' is a list of the features that have to be " +
                         "on whenever this one is, as 'requires = [device]' — or a block, 'requires { " +
                         "headers { … } }', naming what the build needs from the machine")
                     Some(names) -> names
 
-    val is_default = conf_at(entry, "default") match
+    val is_default = entry.get("default") match
         None -> false
-        Some(v) -> *v match
-            Flag(on) -> on
-            _ -> return Err(s"'$where.default' is true or false — a feature says whether it is on by " +
+        Some(v) -> v.as_bool() match
+            Some(on) -> on
+            None -> return Err(s"'$where.default' is true or false — a feature says whether it is on by " +
                 "default, as 'default = true'; a list of the features on by default is the spelling " +
                 "of 0.4.0, which a feature block no longer takes")
 
@@ -136,13 +137,12 @@ read_feature_block(name: string, entry: &Conf, warnings: *Buf[string]) -> Result
 
     var macro = ""
 
-    conf_at(entry, "macro") match
+    entry.get("macro") match
         None -> ()
         Some(v) ->
-            macro = *v match
-                Text(s) -> s
-                Word(s) -> s
-                _ -> return Err(s"'$where.macro' is not a name — it is the C macro the config header " +
+            macro = text_of(v) match
+                Some(s) -> s
+                None -> return Err(s"'$where.macro' is not a name — it is the C macro the config header " +
                                 "defines as 1 while the feature is on and 0 while it is off, as " +
                                 "'macro = \"CFG_TUD_ENABLED\"'")
 
@@ -150,14 +150,14 @@ read_feature_block(name: string, entry: &Conf, warnings: *Buf[string]) -> Result
                 return Err(s"'$where.macro' is '$macro', which is not a name a C macro can have — " +
                            "letters, digits and '_', not starting with a digit")
 
-    Ok(FeatureBlock(enables, FeatureInfo(name, conf_text(entry, "doc"), condition, is_default, requires,
+    Ok(FeatureBlock(enables, FeatureInfo(name, scalar_text(entry, "doc"), condition, is_default, requires,
                                          macro), targets))
 end read_feature_block
 
 // The refusal for a feature named `default`, whichever way it is written. A list is the 0.4.0 way
 // to say which features are on by default, and the fix-it shows the same thing in the new place.
-default_spelling_refusal(entry: &Conf) -> string
-    val members = conf_list(entry)
+default_spelling_refusal(entry: Value) -> string
+    val members = entry.as_text_list()
     val lead = "'features.default' is the spelling of 0.4.0, which listed the features on by default " +
         "in a feature of that name — a feature now says so itself, and no feature is named 'default'. "
 
@@ -174,14 +174,14 @@ default_spelling_refusal(entry: &Conf) -> string
 end default_spelling_refusal
 
 // The `choices` block, held to the features that were declared.
-read_choices(root: &Conf, info: &Buf[FeatureInfo], warnings: *Buf[string]) -> Result[Buf[Choice], string]
+read_choices(root: Value, info: &Buf[FeatureInfo], warnings: *Buf[string]) -> Result[Buf[Choice], string]
     var out: Buf[Choice] = buf()
 
-    val block = conf_at(root, "choices") match
+    val block = root.get("choices") match
         None -> return Ok(out)
         Some(b) -> b
 
-    if !conf_is_block(block)
+    if !block.is_obj()
         return Err("'choices' is not a block — it names each group of features of which exactly one is " +
             "on, as 'choices { core { of = [m7, m4], default = m7 } }'")
 
@@ -192,21 +192,21 @@ read_choices(root: &Conf, info: &Buf[FeatureInfo], warnings: *Buf[string]) -> Re
 
     var grouped: Buf[(string, string)] = buf()
 
-    for name in conf_keys(block)
-        val entry = conf_at(block, name).unwrap()
+    for name in block.keys()
+        val entry = block.get(name).unwrap()
         val where = s"choices.$name"
 
-        if !conf_is_block(entry)
+        if !entry.is_obj()
             return Err(s"'$where' is not a block — a choice names the features it groups, as " +
                 s"'$where { of = [a, b], default = a }'")
 
-        for key in conf_keys(entry)
+        for key in entry.keys()
             if !holds_name(ChoiceKeys, key) then warnings.push(unknown_key(s"$where.$key"))
 
-        val of = conf_at(entry, "of") match
+        val of = entry.get("of") match
             None -> return Err(s"'$where' groups no features — it needs 'of = [a, b]', the features " +
                 "of which exactly one is on")
-            Some(v) -> conf_list(v) match
+            Some(v) -> v.as_text_list() match
                 None -> return Err(s"'$where.of' is a list of feature names, as 'of = [a, b]'")
                 Some(names) -> names
 
@@ -233,7 +233,7 @@ read_choices(root: &Conf, info: &Buf[FeatureInfo], warnings: *Buf[string]) -> Re
 
             grouped.push((member, name))
 
-        val default_member = conf_text(entry, "default")
+        val default_member = scalar_text(entry, "default")
 
         if default_member != "" && !holds_string(of, default_member)
             return Err(s"'$where.default' is '$default_member', which is not one of the choice's " +
@@ -250,7 +250,7 @@ read_choices(root: &Conf, info: &Buf[FeatureInfo], warnings: *Buf[string]) -> Re
                 s"and in the choice '$name' — exactly one of a choice is on, so only one may be on by " +
                 "default; keep 'default = true' on one of them, or use the choice's own 'default'")
 
-        out.push(Choice(name, conf_text(entry, "doc"), of, default_member))
+        out.push(Choice(name, scalar_text(entry, "doc"), of, default_member))
 
     Ok(out)
 end read_choices

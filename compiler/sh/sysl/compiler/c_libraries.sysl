@@ -1,5 +1,6 @@
 module sh.sysl.compiler
 
+import sh.sysl.hocon.Value
 import sysl.buf.{Buf, buf}
 import sysl.fs.{entries, is_file, read_text}
 import sysl.text.{join, split, Search}
@@ -64,21 +65,21 @@ end CLibrary
 
 // The `c` block. Each key is one library, and each library says at least one of what it compiles,
 // what it reads or what it publishes.
-read_c_libraries(root: &Conf) -> Result[Buf[CLibrary], string]
+read_c_libraries(root: Value) -> Result[Buf[CLibrary], string]
     var out: Buf[CLibrary] = buf()
 
-    val block = conf_at(root, "c") match
+    val block = root.get("c") match
         None -> return Ok(out)
         Some(found) -> found
 
-    if !conf_is_block(block)
+    if !block.is_obj()
         return Err("'c' is not a block of libraries — each key names one vendored C library and " +
                    "what follows it says how that library is compiled")
 
-    val names = conf_keys(block)
+    val names = block.keys()
 
     for name in names
-        val lib = read_c_library(name, conf_at(block, name).unwrap())?
+        val lib = read_c_library(name, block.get(name).unwrap())?
 
         library_disjoint(out, lib)?
 
@@ -126,13 +127,13 @@ end library_shape
 // One library's block. `forced` is the root a layered library has already settled on (every layer of
 // one library resolves its relative paths against the same root), and a layer read `loose` leaves the
 // checks that need the whole library to `library_shape`.
-read_c_library(name: string, sub: &Conf, forced: Option[string] = None,
+read_c_library(name: string, sub: Value, forced: Option[string] = None,
                loose: bool = false) -> Result[CLibrary, string]
-    if !conf_is_block(sub)
+    if !sub.is_obj()
         return Err(s"'c.$name' is not a block — a library says its 'root', 'include', " +
                    "'sources', 'defines' and 'export' in one")
 
-    val keys = conf_keys(sub)
+    val keys = sub.keys()
 
     // **An unknown key is refused here, not warned about** as one at the top of the file is: a
     // misspelt `source` would otherwise compile nothing, and the first anybody heard of it would
@@ -152,26 +153,26 @@ read_c_library(name: string, sub: &Conf, forced: Option[string] = None,
 
     // **`export = true` publishes the library's `include` roots**, which is what a library's public
     // headers usually are; a list says otherwise where they differ.
-    val exports = conf_at(sub, "export") match
-        Some(v) -> *v match
-            Flag(true) ->
+    val exports = sub.get("export") match
+        Some(v) -> v.as_bool() match
+            Some(true) ->
                 if include.is_empty()
                     return Err(s"'c.$name.export' is true and the library has no 'include' roots " +
                                "to publish — name the directories instead")
 
                 include.copy()
-            Flag(false) ->
+            Some(false) ->
                 return Err(s"'c.$name.export' is false, which publishes nothing — leave the key " +
                            "out to publish nothing")
-            _ -> path_list(sub, name, "export", root)?
+            None -> path_list(sub, name, "export", root)?
         None -> buf()
 
     var sources: Buf[string] = buf()
     var patterns: Buf[string] = buf()
 
-    val listed = conf_at(sub, "sources") match
+    val listed = sub.get("sources") match
         None -> buf()
-        Some(v) -> conf_list(v) match
+        Some(v) -> v.as_text_list() match
             None -> return Err(s"'c.$name.sources' must be a list of paths — the C files the " +
                                "library compiles, relative to its root")
             Some(items) -> items
@@ -203,9 +204,9 @@ read_c_library(name: string, sub: &Conf, forced: Option[string] = None,
 
     var exclude: Buf[string] = buf()
 
-    val excluded = conf_at(sub, "exclude") match
+    val excluded = sub.get("exclude") match
         None -> buf()
-        Some(v) -> conf_list(v) match
+        Some(v) -> v.as_text_list() match
             None -> return Err(s"'c.$name.exclude' must be a list of paths or patterns, relative " +
                                "to the library's root")
             Some(items) -> items
@@ -219,25 +220,25 @@ read_c_library(name: string, sub: &Conf, forced: Option[string] = None,
 
     var macros: Buf[string] = buf()
 
-    conf_at(sub, "defines") match
+    sub.get("defines") match
         None -> ()
         Some(v) ->
-            if !conf_is_block(v)
+            if !v.is_obj()
                 return Err(s"'c.$name.defines' is not a block of macros — each line is one " +
                            "macro the library's files are compiled with")
 
             // Sorted, as a `defines` block's are, so the command line is what the block says
             // rather than the order it was written in.
-            val ordered = sort_names(conf_keys(v))
+            val ordered = sort_names(v.keys())
 
             for j in 0..<ordered.len()
-                macros.push(macro_of(s"c.$name.defines", ordered.at(j), conf_at(v, ordered.at(j)).unwrap())?)
+                macros.push(macro_of(s"c.$name.defines", ordered.at(j), v.get(ordered.at(j)).unwrap())?)
 
-    val libc = conf_at(sub, "libc") match
+    val libc = sub.get("libc") match
         None -> false
-        Some(v) -> *v match
-            Flag(b) -> b
-            _ -> return Err(s"'c.$name.libc' must be true or false — whether the roots it " +
+        Some(v) -> v.as_bool() match
+            Some(b) -> b
+            None -> return Err(s"'c.$name.libc' must be true or false — whether the roots it " +
                             "exports are the C standard library's headers")
 
     val lib = CLibrary(name, root, include, private_include, sources, patterns, exclude, macros, exports, libc)
@@ -248,13 +249,12 @@ read_c_library(name: string, sub: &Conf, forced: Option[string] = None,
 end read_c_library
 
 // The root a library block sets, normalized, or `None` where it sets none.
-library_root(name: string, sub: &Conf) -> Result[Option[string], string]
-    conf_at(sub, "root") match
+library_root(name: string, sub: Value) -> Result[Option[string], string]
+    sub.get("root") match
         None -> Ok(None)
-        Some(v) -> *v match
-            Text(s) -> Ok(Some(inside_package(s"c.$name.root", "", s)?))
-            Word(s) -> Ok(Some(inside_package(s"c.$name.root", "", s)?))
-            _ -> Err(s"'c.$name.root' must be a path — the directory the library's tree " +
+        Some(v) -> text_of(v) match
+            Some(s) -> Ok(Some(inside_package(s"c.$name.root", "", s)?))
+            None -> Err(s"'c.$name.root' must be a path — the directory the library's tree " +
                      "is in, relative to the package root")
 end library_root
 
@@ -281,12 +281,12 @@ private pattern_shape(key: string, item: string) -> Result[unit, string]
 end pattern_shape
 
 // One of the lists of directories, each joined to the library's root.
-private path_list(sub: &Conf, name: string, key: string, root: string) -> Result[Buf[string], string]
+private path_list(sub: Value, name: string, key: string, root: string) -> Result[Buf[string], string]
     var out: Buf[string] = buf()
 
-    val items = conf_at(sub, key) match
+    val items = sub.get(key) match
         None -> return Ok(out)
-        Some(v) -> conf_list(v) match
+        Some(v) -> v.as_text_list() match
             None -> return Err(s"'c.$name.$key' must be a list of directories, relative to the " +
                                "library's root")
             Some(found) -> found

@@ -1,0 +1,395 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.Span
+import sysl.buf.{Buf, buf}
+import sysl.container.{Map, map}
+
+// **Where a parameter reaches another concurrency domain inside a body the compiler can see, the
+// parameter crosses, and nobody has to say so** (`reference/memory.md § @crossing`).
+//
+// A function's parameter crosses when its body hands what the parameter holds to:
+//
+// - a parameter of another call that crosses -- `spawn`'s `arg`, a channel's `send`, a `@scoped`
+//   member's callable, or one this pass found -- by a direct call, or through a trait object to every
+//   body its trait's tables hold;
+// - a `&sync` place: a field or an element written through a `&sync T`, a value boxed as a `&sync T`,
+//   or a closure that captures it erased into a `&sync Fn`, each of which another domain may reach.
+//
+// "What the parameter holds" is the parameter itself, its address, a field, element or view of it, a
+// cast of it, a struct, enum or array built around it, and a local bound to any of those. The answers
+// are worked out to a fixed point, so a recursive function settles on what its body does.
+//
+// **A crossing found here is held to exactly the rule a written `@crossing` is**, at every call of the
+// function: a `*T` is looked through and its pointee asked strictly, and a value is asked what is left
+// once every view in it is copied -- since the boundary it finally reaches by value copies its views
+// (`sharing.sysl`'s `check_crossings`) and one it reaches by address or through a `&sync` place is held
+// to the strict rule in this body already. A task in what crosses is noted as a written `@crossing`
+// notes one, and the parameter is vouched for in its own body (`task_domains.sysl`).
+//
+// **A written `@crossing` stays for the boundaries no body shows**: an `extern`, a function pointer, a
+// closure called through its type, and a trait's requirement. Those calls cross nothing here, so a
+// sysl function wrapping one says `@crossing` itself, as `sysl.threads.spawn` does. The ones written
+// were asked while the bodies were typed; this pass asks only the ones it found.
+
+private struct CrossCx
+    an: &Analysis
+    funcs: Buf[TFunc]
+    index: Map[string, usize]
+    vtables: Buf[TVtable]
+
+    // Every crossing parameter, written or found, by the body's key.
+    crossing: Map[string, Buf[string]]
+    changed: bool
+
+    find(self, name: string) -> Option[TFunc] = self.index.get(name) match
+        Some(i) -> Some(self.funcs.at(i))
+        None -> None
+
+    crosses(self, name: string, param: string) -> bool = self.crossing.get(name) match
+        Some(ps) -> holds_string(ps, param)
+        None -> false
+end CrossCx
+
+// What one body's parameters are, which locals were bound to something made of them, and which of
+// them its body was found to hand across.
+private struct Carry
+    params: Buf[string]
+    aliases: &Table[Buf[string]]
+    hit: Buf[string]
+
+    // The `*T` parameters among them, which a `&sync` place may hold without crossing.
+    pointers: Buf[string]
+end Carry
+
+// Finds every parameter a visible body hands to another domain, then holds every call of such a
+// function to the crossing rule at that parameter.
+check_inferred_crossings(a: &Analysis, funcs: Buf[TFunc], vtables: Buf[TVtable])
+    var index: Map[string, usize] = map()
+    var crossing: Map[string, Buf[string]] = map()
+
+    for i in 0..<funcs.len()
+        val name = funcs.at(i).name
+
+        if index.has(name) then continue
+
+        index.put(name, i)
+        a.crossing_params.get(name) match
+            Some(ps) -> crossing.put(name, copied(ps))
+            None -> ()
+    end for
+
+    val cx: &CrossCx = CrossCx(a, funcs, index, vtables, crossing, false)
+    var rounds = 0
+
+    loop
+        cx.changed = false
+
+        // **A closure's body is not asked**: what it captured crosses where the closure does -- erased
+        // into a `&sync Fn` or handed to a crossing parameter -- and that is where its captures are
+        // held to the rule, each as the closure's own (`sharing.sysl`). Its environment, followed
+        // into a call made inside it, would be asked a second time and without that rule's view of a
+        // `@scoped` child's borrowed captures.
+        for f in funcs
+            if !f.params.is_empty() && !is_closure_body(f) then infer_body(cx, f)
+
+        rounds += 1
+
+        // Every round only turns more answers on, and there are as many as there are parameters.
+        if !cx.changed || rounds >= 64 then break
+
+    var inferred: Map[string, Buf[string]] = map()
+
+    for f in funcs
+        val now = cx.crossing.get(f.name).unwrap_or(buf())
+        val written = a.crossing_params.get(f.name).unwrap_or(buf())
+        var found: Buf[string] = buf()
+
+        for name in now
+            if !holds_string(written, name) then found.push(name)
+
+        if found.is_empty() || inferred.has(f.name) then continue
+
+        inferred.put(f.name, found)
+        a.crossing_params.put(f.name, copied(now))
+    end for
+
+    if inferred.is_empty() then return
+
+    val said: &Said = Said(buf())
+
+    for f in funcs
+        val scope = func_home(a, f.name)
+
+        walk_block_stmts(f.body, expr_walk(false, e -> check_call(cx, inferred, said, scope, e)))
+end check_inferred_crossings
+
+// The arguments already asked, so an argument a call through an object hands to several bodies is
+// told once.
+private struct Said
+    spans: Buf[Span]
+
+private copied(xs: Buf[string]) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for x in xs
+        out.push(x)
+
+    out
+end copied
+
+// -- what one body hands across ------------------------------------------------------------------
+
+private infer_body(cx: &CrossCx, f: TFunc)
+    var params: Buf[string] = buf()
+
+    // **A `@scoped` pointer is the scope's own to share**: a member that scopes a call lends its
+    // receiver to the children it runs, and they reach it only while the caller waits inside the
+    // scope -- the promise `docs/design/scope.md` makes and the keeps-analysis trusts (`scoped_at`).
+    var pointers: Buf[string] = buf()
+
+    for i in 0..<f.params.len()
+        if scoped_at(f, i) then continue
+
+        params.push(f.params.at(i).0)
+
+        if is_raw_pointer_type(f.params.at(i).1) then pointers.push(f.params.at(i).0)
+    end for
+
+    val t: &Carry = Carry(params, table(), buf(), pointers)
+
+    // A local bound to something made of a parameter carries it; twice over, so a local bound to
+    // another such local is found whichever was walked first.
+    walk_block_stmts(f.body, stmt_walk(false, s -> bind_local(t, s)))
+    walk_block_stmts(f.body, stmt_walk(false, s -> bind_local(t, s)))
+
+    walk_block_stmts(f.body, TWalk(false, e -> sink_expr(cx, t, e), w -> sink_write(t, w),
+                                   s -> ()))
+
+    for name in t.hit
+        if cx.crosses(f.name, name) then continue
+
+        var now = copied(cx.crossing.get(f.name).unwrap_or(buf()))
+
+        now.push(name)
+        cx.crossing.put(f.name, now)
+        cx.changed = true
+    end for
+end infer_body
+
+private bind_local(t: &Carry, s: TStmt)
+    s match
+        TVarDecl(name, _, init, _) ->
+            val found = roots(t, init)
+
+            if !found.is_empty() then t.aliases.put(name, found)
+        _ -> ()
+end bind_local
+
+private sink_expr(cx: &CrossCx, t: &Carry, e: TExpr)
+    *e.kind match
+        TCall(name, args, _, _) -> call_sink(cx, t, name, args)
+        TVCall(recv, slot, args, _, _) ->
+            for target in slot_targets(cx, recv, slot)
+                call_sink(cx, t, target, with_recv(recv, args))
+        TErase(operand, _, ty) -> if is_sync_ref(ty) then sink_value(t, operand)
+        TBox(value, ty) -> if is_sync_ref(ty) then sink_value(t, value)
+        TStore(place, value, _, _) -> if sync_place(place) then sink_value(t, value)
+        _ -> ()
+end sink_expr
+
+private sink_write(t: &Carry, w: TWrite) = if sync_place(w.place) then sink_value(t, w.value)
+
+// **A `&sync` place holds a `*T` as a closure captures one: as itself**, which the rule lets cross
+// without looking through it (`sharing.sysl`'s capture check). So a raw pointer stored or captured
+// there does not make its parameter cross; a value -- a task, a generic's `T` -- does.
+private sink_value(t: &Carry, e: TExpr)
+    for name in roots(t, e)
+        if !holds_string(t.pointers, name) && !holds_string(t.hit, name) then t.hit.push(name)
+
+private call_sink(cx: &CrossCx, t: &Carry, name: string, args: Buf[TExpr])
+    val ps = cx.crossing.get(name) match
+        Some(v) -> v
+        None -> return
+
+    val callee = cx.find(name) match
+        Some(g) -> g
+        None -> return
+
+    for j in 0..<args.len()
+        if j >= callee.params.len() || !holds_string(ps, callee.params.at(j).0) then continue
+
+        // A callable crosses with its captures, each held to the capture rule, which lets a `*T`
+        // cross as itself.
+        if callable_type(texpr_type(args.at(j))) then sink_value(t, args.at(j)) else sink(t, args.at(j))
+    end for
+end call_sink
+
+private callable_type(t: Type) -> bool = t match
+    Trait(_, _, _) -> true
+    Ref(inner, _) -> callable_type(*inner)
+    _ -> is_closure_literal(t)
+
+private is_raw_pointer_type(t: Type) -> bool = t match
+    Ptr(_) -> true
+    _ -> false
+
+private sink(t: &Carry, e: TExpr)
+    for name in roots(t, e)
+        if !holds_string(t.hit, name) then t.hit.push(name)
+
+// Every body a call through an object may land in: the slot of every table made against its trait.
+private slot_targets(cx: &CrossCx, recv: TExpr, slot: int) -> Buf[string]
+    var out: Buf[string] = buf()
+    val tr = erased_trait(texpr_type(recv))
+
+    if tr.is_none() || slot < 0 then return out
+
+    val name = tr.unwrap() match
+        Trait(n, _, _) -> n
+        _ -> ""
+
+    for vt in cx.vtables
+        if vt.trait_name == name && usize(slot) < vt.slots.len() then out.push(vt.slots.at(usize(slot)).target)
+
+    out
+end slot_targets
+
+// A method call's arguments as its body numbers its parameters: the receiver first.
+private with_recv(recv: TExpr, args: Buf[TExpr]) -> Buf[TExpr]
+    var out: Buf[TExpr] = buf()
+
+    out.push(recv)
+
+    for a in args
+        out.push(a)
+
+    out
+end with_recv
+
+private is_sync_ref(t: Type) -> bool = t match
+    Ref(_, sync) -> sync
+    _ -> false
+
+// Whether a place is storage reached through a `&sync T`, which another domain may hold too.
+private sync_place(place: TExpr) -> bool = *place.kind match
+    TField(recv, _, _) -> is_sync_ref(texpr_type(recv)) || sync_place(recv)
+    TIndex(recv, _, _) -> is_sync_ref(texpr_type(recv)) || sync_place(recv)
+    TDeref(operand, _) -> is_sync_ref(texpr_type(operand)) || sync_place(operand)
+    _ -> false
+
+// The parameters a value may be made of.
+private roots(t: &Carry, e: TExpr) -> Buf[string]
+    val out: &Carry = Carry(buf(), t.aliases, buf(), buf())
+
+    roots_into(t, e, out)
+    out.hit
+end roots
+
+private roots_into(t: &Carry, e: TExpr, out: &Carry)
+    *e.kind match
+        TLoad(name, _) ->
+            if holds_string(t.params, name)
+                if !holds_string(out.hit, name) then out.hit.push(name)
+            else
+                t.aliases.get(name) match
+                    Some(ps) ->
+                        for p in ps
+                            if !holds_string(out.hit, p) then out.hit.push(p)
+                    None -> ()
+            end if
+        TAddrOf(place, _) -> place_roots_into(t, place, out)
+        TTempAddr(value, _) -> roots_into(t, value, out)
+        TSlice(base, _, _, _, _) -> place_roots_into(t, base, out)
+        TCast(operand, _) -> roots_into(t, operand, out)
+        TBox(value, _) -> roots_into(t, value, out)
+        TErase(operand, _, _) -> roots_into(t, operand, out)
+        TCrossCopy(value, _, _, _) -> roots_into(t, value, out)
+        TStrView(arg) -> roots_into(t, arg, out)
+        TConstView(arg) -> roots_into(t, arg, out)
+        TViewAs(arg, _) -> roots_into(t, arg, out)
+        TStructNew(_, args) -> all_into(t, args, out)
+        TEnumNew(_, _, args) -> all_into(t, args, out)
+        TArrayLit(elems, _) -> all_into(t, elems, out)
+        TBlockExpr(b) -> if b.result.is_some() then roots_into(t, b.result.unwrap(), out)
+        _ -> ()
+end roots_into
+
+// **A place is the parameter's storage only where its address is taken or a view is cut of it, and
+// all of it only where the place is all of it or one of its elements**: `&p`, `&*p`, `&p[i]` and
+// `p[..]` hand over storage of the parameter's own type, so asking the parameter is asking what
+// crossed. A field is not: `&self.watch` hands over a `Watch`, whose type the call that takes it
+// asks, and the rest of `self` stays on this side. A field, an element or a pointee *read* out of the
+// parameter is a value of its own, which the call that takes it asks the same way -- so `val r =
+// self.rung` captured into a `&sync Fn` hands over the `&sync Rung`, not `self`.
+private place_roots_into(t: &Carry, place: TExpr, out: &Carry)
+    *place.kind match
+        TField(_, _, _) -> ()
+        TIndex(recv, _, _) -> place_roots_into(t, recv, out)
+        TDeref(operand, _) -> roots_into(t, operand, out)
+        _ -> roots_into(t, place, out)
+end place_roots_into
+
+private all_into(t: &Carry, es: Buf[TExpr], out: &Carry)
+    for e in es
+        roots_into(t, e, out)
+
+// -- the calls held to it -------------------------------------------------------------------------
+
+private check_call(cx: &CrossCx, inferred: Map[string, Buf[string]], said: &Said, scope: Scope, e: TExpr)
+    *e.kind match
+        TCall(name, args, _, _) -> check_args(cx, inferred, said, scope, name, args)
+        TVCall(recv, slot, args, _, _) ->
+            for target in slot_targets(cx, recv, slot)
+                check_args(cx, inferred, said, scope, target, with_recv(recv, args))
+        _ -> ()
+end check_call
+
+private check_args(cx: &CrossCx, inferred: Map[string, Buf[string]], said: &Said, scope: Scope,
+                   name: string, args: Buf[TExpr])
+    val ps = inferred.get(name) match
+        Some(v) -> v
+        None -> return
+
+    val callee = cx.find(name) match
+        Some(g) -> g
+        None -> return
+
+    for j in 0..<args.len()
+        if j >= callee.params.len() || !holds_string(ps, callee.params.at(j).0) then continue
+
+        val arg = args.at(j)
+        var again = false
+
+        for s in said.spans
+            if s == arg.span then again = true
+
+        if again then continue
+
+        said.spans.push(arg.span)
+        check_arg(cx.an, scope, arg, callee.params.at(j).0, crossing_shown(cx.an, name), callee.params.at(j).1)
+    end for
+end check_args
+
+private check_arg(a: &Analysis, scope: Scope, arg: TExpr, pname: string, shown: string, pty: Type)
+    val subject = pty match
+        Ptr(_) -> s"what '$pname' of ${callee_said(shown)} points at"
+        _ -> s"'$pname' of ${callee_said(shown)}"
+
+    val why = pty match
+        Ptr(inner) -> crossing_complaint(subject, *inner, a, scope)
+        _ -> copied_crossing_complaint(subject, pty, a, scope)
+
+    if why.is_some() then a.fault(scope, arg.span, why.unwrap())
+    else note_task_crossing_in(a, scope, arg.span, CrossArg(subject), arg)
+end check_arg
+
+// The callee as the refusal names it: a member as the method it is, anything else by its qualified
+// name, as a written `@crossing`'s refusal names them.
+private crossing_shown(a: &Analysis, name: string) -> string
+    val origin = a.tables.members.func_origin.get(name).unwrap_or(name)
+    val scopes = a.tables.members.decl_scope
+
+    if scopes.get(origin).is_some() || scopes.get(name).is_some() then return s"method '${qualified_name(origin)}'"
+
+    qualified_name(origin)
+end crossing_shown

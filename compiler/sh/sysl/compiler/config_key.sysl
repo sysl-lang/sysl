@@ -1,5 +1,6 @@
 module sh.sysl.compiler
 
+import sh.sysl.hocon.Value
 import sysl.buf.{Buf, buf}
 import sysl.fs.read_text
 import sysl.slices.sort_by
@@ -52,47 +53,55 @@ manifest_config_part(dir: string) -> string
 
     read_conf(text) match
         Err(_) -> s"unread:$text"
-        Ok(c) -> conf_canonical(c)
+        Ok(c) -> canonical_tree(c)
 end manifest_config_part
 
 // A manifest's tree in one spelling: a block's keys sorted, every value tagged with its kind and
 // prefixed with its length. **Sorted**, because the order a file writes its keys in is not part of what
 // it says -- a reordered `capabilities` block is the same program. **Tagged**, because `3` and `"3"`
-// are different answers to some keys. **Length-prefixed**, so no value can spell the join of two.
+// are different answers to some keys: a quoted string is `t`, a word -- a number or `null` as it was
+// written included -- is `w`, a flag `f`. **Length-prefixed**, so no value can spell the join of two.
 // A list keeps its order, which is part of what it says.
-conf_canonical(c: &Conf) -> string
+canonical_tree(c: Value) -> string
     var out = str_builder()
 
     canonical_into(&out, c, "")
     out.finish()
-end conf_canonical
+end canonical_tree
 
-private canonical_into(out: *StrBuilder, c: &Conf, place: string)
-    *c match
-        Block(pairs) ->
-            var kept: Buf[(string, &Conf)] = buf()
+private canonical_into(out: *StrBuilder, c: Value, place: string)
+    if c.is_obj()
+        var kept: Buf[(string, Value)] = buf()
 
-            for pair in pairs
-                if manifest_exemption(joined_place(place, pair.0)).is_none() then kept.push(pair)
+        for f in c.fields()
+            if manifest_exemption(joined_place(place, f.key)).is_none() then kept.push((f.key, f.value))
 
-            sort_by(kept.view(), (a, b) -> a.0 < b.0)
-            out.push(s"{${kept.len()}")
+        sort_by(kept.view(), (a, b) -> a.0 < b.0)
+        out.push(s"{${kept.len()}")
 
-            for pair in kept
-                out.push(s"k${pair.0.len}:${pair.0}=")
-                canonical_into(out, pair.1, joined_place(place, pair.0))
+        for pair in kept
+            out.push(s"k${pair.0.len}:${pair.0}=")
+            canonical_into(out, pair.1, joined_place(place, pair.0))
 
-            out.push("}")
-        Text(s) -> out.push(s"t${s.len}:$s")
-        Word(s) -> out.push(s"w${s.len}:$s")
-        Flag(b) -> out.push(if b then "f1" else "f0")
-        Items(values) ->
-            out.push(s"[${values.len()}")
+        out.push("}")
+    else if c.is_arr()
+        val items = c.items()
 
-            for item in values
-                canonical_into(out, item, place)
+        out.push(s"[${items.len()}")
 
-            out.push("]")
+        for item in items
+            canonical_into(out, item, place)
+
+        out.push("]")
+    else
+        c.as_bool() match
+            Some(b) -> out.push(if b then "f1" else "f0")
+            None -> c.as_quoted() match
+                Some(s) -> out.push(s"t${s.len}:$s")
+                None ->
+                    val w = c.as_word().unwrap_or("")
+
+                    out.push(s"w${w.len}:$w")
 end canonical_into
 
 private joined_place(place: string, key: string) -> string = if place.is_empty() then key else s"$place.$key"

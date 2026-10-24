@@ -33,7 +33,8 @@ import sysl.container.ring.{Ring, ring}
  * **A waiter sleeps**: a full `send` waits on one `Condvar` and an empty `receive` on the other, each
  * woken by the transfer that makes room or brings a value, and both woken by `close`.
  *
- * **A view goes in as a copy.** `send` and `try_send` are `@crossing(copy value)`, so a `[]u8`, a
+ * **A view goes in as a copy.** `send` and `try_send` are `@crossing(value)`, and a value crossing by
+ * value is a copy, so a `[]u8`, a
  * `string`, a `[][]u8` or a struct holding views is copied at the call into storage of its own, at
  * every depth, and the receiver is handed bytes nothing on the sending side still reaches
  * (`reference/memory.md § Crossing a concurrency domain`). The sender may go on writing to what it
@@ -92,19 +93,20 @@ struct Channel[T]
         self.has_value.notify_all()
     end close
 
-    // **`@crossing(copy value)` is what holds a caller to the rule about what may reach another
-    // domain**, written above `send` and `try_send` -- the two operations that put a value in. Marking
-    // the way *in* is the whole of the check: nothing can be taken out that was not put in, so a
-    // channel whose sends are held to the rule can hold nothing that breaks it. `copy` is the half of
-    // the rule a value crossing has and an address does not: every view in the value is copied at the
-    // call, so the slot holds the only share of the copy.
+    // **`@crossing(value)` is what holds a caller to the rule about what may reach another domain**,
+    // written above `send` and `try_send` -- the two operations that put a value in. Marking the way
+    // *in* is the whole of the check: nothing can be taken out that was not put in, so a channel whose
+    // sends are held to the rule can hold nothing that breaks it. The annotation is written here
+    // because no body shows the domain: the ring is storage behind a pointer, which only a `spawn`
+    // elsewhere hands to another thread. A value crossing by value has the half of the rule an address
+    // does not: every view in it is copied at the call, so the slot holds the only share of the copy.
 
     /** Puts a value in, waiting while the channel is full, and answers whether it went in.
      *
      * `false` is a closed channel and nothing else: the wait is unbounded, so the only thing that
      * ends it other than a free slot is somebody closing.
      */
-    @crossing(copy value)
+    @crossing(value)
     @blocks
     send(*self, value: T) -> bool
         self.lock.lock()
@@ -127,7 +129,7 @@ struct Channel[T]
     end send
 
     /** Puts a value in if there is room, and answers whether it went. Never waits. */
-    @crossing(copy value)
+    @crossing(value)
     try_send(*self, value: T) -> bool
         self.lock.lock()
 

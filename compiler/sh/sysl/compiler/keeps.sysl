@@ -352,6 +352,12 @@ private summary(cx: &KeepsCx, name: string, i: usize, q: string) -> KeptWhy
     if q != ClearsQ && i >= f.params.len() then return not_kept()
     if keeping && lent_by_rule(cx, f, i) then return not_kept()
 
+    if keeping
+        val crossed = crossing_kept(f, i)
+
+        if crossed.is_some() then return crossed.unwrap()
+    end if
+
     cx.busy.push(key)
 
     val outer = cx.taint
@@ -428,6 +434,30 @@ private extern_kept(cx: &KeepsCx, name: string, i: usize) -> KeptWhy
 
     not_kept()
 end extern_kept
+
+// **A `*T` a written `@crossing` names is kept: it reaches another concurrency domain, which may go on
+// reading it after the call returns.** A body is no evidence here, since a written `@crossing` is a
+// boundary the body does not show -- `spawn` hands its argument to C. `@joined` says how long: the
+// thread the call starts holds the pointer until the handle the call answers is joined, the location
+// `j` (`joined_loc`), which a join of that handle takes back. A crossing a body was found to make
+// (`crossing.sysl`) is the body's own to answer for, through the call that makes it.
+private crossing_kept(f: TFunc, i: usize) -> Option[KeptWhy]
+    val name = f.params.at(i).0
+
+    if !is_raw_pointer(f.params.at(i).1) then return None
+
+    if holds_string(f.marks.joined, name)
+        val how = "the thread it starts holds it until that thread is joined"
+        var locs: Buf[KeptAt] = buf()
+
+        locs.push(KeptAt("j", how, span_zero()))
+        return Some(KeptWhy(true, how, span_zero(), locs))
+    end if
+
+    if holds_string(f.marks.copies, name) then return Some(anywhere("it reaches another concurrency domain", span_zero()))
+
+    None
+end crossing_kept
 
 // Kept somewhere nothing can name, so nothing can take it back.
 private anywhere(how: string, at: Span) -> KeptWhy
@@ -537,14 +567,17 @@ struct Track
     // pointer handed to a callee that keeps it, or captured by an object that is stored.
     promised: bool
 
+    hs: &Handles
+
     holds(self, name: string) -> bool = holds_string(self.held, name)
 end Track
 
 // A walk following the parameter at `i`, or nothing at all where `i` is past the parameters -- which
 // is how what a body overwrites is asked.
 private track(cx: &KeepsCx, f: TFunc, i: usize, raw: bool) -> &Track
-    val t: &Track = Track(cx, func_home(cx.an, f.name), buf(), buf(), false, not_kept(), origins_of(cx, f),
-                          raw, false)
+    val org = origins_of(cx, f)
+    val t: &Track = Track(cx, func_home(cx.an, f.name), buf(), buf(), false, not_kept(), org, raw, false,
+                          handles_of(org, f))
 
     if i < f.params.len() then t.held.push(f.params.at(i).0)
 
@@ -561,7 +594,8 @@ private walk_kept_as(cx: &KeepsCx, f: TFunc, i: usize, promised: bool) -> KeptWh
 
     t.promised = promised
 
-    val w = flow_walk(t.org, s -> track_stmt_events(t, s), e -> track_expr_events(t, e))
+    val w = flow_walk(t.org, s -> track_stmt_events(t, s), e -> track_expr_events(t, e),
+                      (x, p, matched) -> arm_clears(t.hs, x, p, matched))
 
     flow_body(w, f.body)
 
@@ -587,7 +621,8 @@ end walk_kept_as
 // The locations `f` overwrites on every way out.
 private walk_clears(cx: &KeepsCx, f: TFunc) -> KeptWhy
     val t = track(cx, f, f.params.len(), false)
-    val w = flow_walk(t.org, s -> track_stmt_events(t, s), e -> track_expr_events(t, e))
+    val w = flow_walk(t.org, s -> track_stmt_events(t, s), e -> track_expr_events(t, e),
+                      (x, p, matched) -> arm_clears(t.hs, x, p, matched))
 
     flow_body(w, f.body)
 
@@ -609,6 +644,8 @@ end walk_clears
 private track_stmt_events(t: &Track, s: TStmt) -> Buf[FlowEv]
     val evs: &EvBuf = EvBuf(buf())
 
+    t.hs.at = stmt_handle(t.hs, s)
+
     s match
         TWriteStmt(w) -> clear_store(t, evs, w.place, w.value)
         TMultiAssign(writes) ->
@@ -620,15 +657,18 @@ private track_stmt_events(t: &Track, s: TStmt) -> Buf[FlowEv]
 
     walk_stmt(s, TWalk(false, e -> kept_at(t, evs, e), w -> stored(t, evs, w.place, w.value),
                        x -> kept_stmt(t, evs, x)))
+    t.hs.at = ""
     evs.items
 end track_stmt_events
 
 private track_expr_events(t: &Track, e: TExpr) -> Buf[FlowEv]
     val evs: &EvBuf = EvBuf(buf())
 
+    t.hs.at = expr_handle(t.hs, e)
     top_clears(t, evs, e)
     walk_texpr(e, TWalk(false, x -> kept_at(t, evs, x), w -> stored(t, evs, w.place, w.value),
                         s -> kept_stmt(t, evs, s)))
+    t.hs.at = ""
     evs.items
 end track_expr_events
 
@@ -718,14 +758,19 @@ private kept_at(t: &Track, evs: &EvBuf, e: TExpr)
             for op in ops
                 if carries(t, op) then kept_hard(evs, "it is stored through a pointer by an atomic", op.span)
         TCall(name, args, _, _) ->
+            join_clear(t.hs, evs, name, args, e.span)
+
             for j in 0..<args.len()
                 if !carries(t, args.at(j)) then continue
 
                 val how = s"it is passed to '${shown_name(t.cx.an, name)}', which keeps it"
 
                 for item in keeps_of(t.cx, name, j).locs
-                    val loc = translate_loc(t.org, args, item.loc)
+                    if item.loc == "j" && has_span(t.hs.chained, e.span) then continue
 
+                    val loc = if item.loc == "j" then joined_loc(t.hs, true) else translate_loc(t.org, args, item.loc)
+
+                    if loc.starts_with("j:") && said_already(evs, loc, args.at(j).span) then continue
                     if !loc.starts_with("l:") then evs.items.push(FlowEv(false, loc, how, args.at(j).span))
         TVCall(recv, slot, args, _, _) ->
             val all = with_receiver(recv, args)
@@ -1172,6 +1217,7 @@ struct FrameTrack
     refs: Buf[(string, TExpr)]
     changed: bool
     org: &Origins
+    hs: &Handles
 
     core_of(self, name: string) -> Option[string]
         for item in self.held
@@ -1189,8 +1235,9 @@ end FrameTrack
 private check_calls(cx: &KeepsCx, faults: &KeepFaults, f: TFunc)
     if module_bare(f.name) == "entry file" then return
 
+    val org = origins_of(cx, f)
     val ft: &FrameTrack = FrameTrack(cx, faults, func_home(cx.an, f.name), shown_name(cx.an, f.name),
-                                     f.params, buf(), buf(), false, origins_of(cx, f))
+                                     f.params, buf(), buf(), false, org, handles_of(org, f))
 
     walk_block_stmts(f.body, stmt_walk(false, s -> s match
         TRefDecl(n, _, place) -> ft.refs.push((n, place))
@@ -1207,7 +1254,8 @@ private check_calls(cx: &KeepsCx, faults: &KeepFaults, f: TFunc)
 
     // What is handed somewhere that a clear may yet take back is refused only if it is still there
     // at a way out.
-    val w = flow_walk(ft.org, s -> frame_stmt_events(ft, s), e -> frame_expr_events(ft, e))
+    val w = flow_walk(ft.org, s -> frame_stmt_events(ft, s), e -> frame_expr_events(ft, e),
+                      (x, p, matched) -> arm_clears(ft.hs, x, p, matched))
 
     flow_body(w, f.body)
 
@@ -1305,6 +1353,8 @@ end frame_bind_call
 private frame_stmt_events(ft: &FrameTrack, s: TStmt) -> Buf[FlowEv]
     val evs: &EvBuf = EvBuf(buf())
 
+    ft.hs.at = stmt_handle(ft.hs, s)
+
     s match
         TWriteStmt(w) -> frame_clear_store(ft, evs, w.place, w.value)
         TMultiAssign(writes) ->
@@ -1316,15 +1366,18 @@ private frame_stmt_events(ft: &FrameTrack, s: TStmt) -> Buf[FlowEv]
 
     walk_stmt(s, TWalk(false, e -> frame_event_at(ft, evs, e), w -> frame_stored(ft, evs, w.place, w.value),
                        x -> ()))
+    ft.hs.at = ""
     evs.items
 end frame_stmt_events
 
 private frame_expr_events(ft: &FrameTrack, e: TExpr) -> Buf[FlowEv]
     val evs: &EvBuf = EvBuf(buf())
 
+    ft.hs.at = expr_handle(ft.hs, e)
     frame_top_clears(ft, evs, e)
     walk_texpr(e, TWalk(false, x -> frame_event_at(ft, evs, x), w -> frame_stored(ft, evs, w.place, w.value),
                         s -> ()))
+    ft.hs.at = ""
     evs.items
 end frame_expr_events
 
@@ -1393,6 +1446,8 @@ end frame_bind
 private call_at(ft: &FrameTrack, evs: &EvBuf, e: TExpr)
     *e.kind match
         TCall(name, args, _, _) ->
+            join_clear(ft.hs, evs, name, args, e.span)
+
             for j in 0..<args.len()
                 val arg = args.at(j)
 
@@ -1403,18 +1458,33 @@ private call_at(ft: &FrameTrack, evs: &EvBuf, e: TExpr)
                 if core.is_none() then continue
 
                 for item in keeps_of(ft.cx, name, j).locs
-                    val loc = translate_loc(ft.org, args, item.loc)
+                    if item.loc == "j" && has_span(ft.hs.chained, e.span) then continue
+
+                    var loc = if item.loc == "j" then joined_loc(ft.hs, false) else translate_loc(ft.org, args, item.loc)
 
                     if loc.starts_with("l:") then continue
 
+                    // **A thread whose handle no place names is held for good -- but only once the
+                    // function returns**: one that never does (`-> never`, a kernel's loop) leaves its
+                    // frame to every thread it started. So it is held along the ways as a location no
+                    // clear can name (`?`), one per argument, and refused at a way out.
+                    if item.loc == "j" && loc == "" then loc = s"j?${arg.span.start}"
+
+                    // A thread holds it until it is joined, so the cure is a join on every way out.
+                    val cure = if item.loc == "j" then s" — join that thread on every way out of '${ft.owner}', " +
+                        "or hand it storage that lasts" else ""
                     val said = s"'${shown_name(ft.cx.an, name)}' keeps its parameter " +
                         s"'${param_name(ft.cx, name, j)}' (${item.how}), and " +
-                        argument_said(ft, arg, core.unwrap())
+                        argument_said(ft, arg, core.unwrap()) + cure
 
-                    if loc == "" || loc.index_of("?").is_some()
+                    if loc == "" || (loc.index_of("?").is_some() && !loc.starts_with("j?"))
                         ft.faults.items.push((ft.scope, arg.span, said))
                         break
                     end if
+
+                    // A statement that writes its value walks that value twice -- as an expression
+                    // and as what it writes -- and one call starts one thread.
+                    if loc.starts_with("j:") && said_already(evs, loc, arg.span) then continue
 
                     evs.items.push(FlowEv(false, loc, said, arg.span))
         TVCall(recv, slot, args, _, _) ->

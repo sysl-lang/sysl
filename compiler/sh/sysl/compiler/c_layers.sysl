@@ -1,5 +1,6 @@
 module sh.sysl.compiler
 
+import sh.sysl.hocon.{object_of, Value}
 import sysl.buf.{Buf, buf}
 
 // **The C a package compiles, written in layers** (`reference/packages.md § C under targets and
@@ -37,12 +38,12 @@ struct CLayer
     // The machine it is for, or `""` for every machine.
     target: string
 
-    c: Option[&Conf]
-    defines: Option[&Conf]
-    requires: Option[&Conf]
+    c: Option[Value]
+    defines: Option[Value]
+    requires: Option[Value]
 
     // The macros this layer writes into the package's generated config header (`config_header.sysl`).
-    config: Option[&Conf]
+    config: Option[Value]
 end CLayer
 
 // The keys a layer carries.
@@ -61,65 +62,65 @@ struct LayeredC
 end LayeredC
 
 // A block holding one entry, so the readers that look a key up in a whole manifest can read a layer's.
-wrap_conf(key: string, value: &Conf) -> &Conf
-    var pairs: Buf[(string, &Conf)] = buf()
+wrap_conf(key: string, value: Value) -> Value
+    var pairs: Buf[(string, Value)] = buf()
 
     pairs.push((key, value))
-    Block(pairs)
+    object_of(pairs)
 end wrap_conf
 
 // A feature's `requires` is also the list of features that have to be on with it, so only a block is a
 // layer's.
-private requires_block(entry: &Conf) -> Option[&Conf] = conf_at(entry, "requires") match
-    Some(v) -> if conf_is_block(v) then Some(v) else None
+private requires_block(entry: Value) -> Option[Value] = entry.get("requires") match
+    Some(v) -> if v.is_obj() then Some(v) else None
     None -> None
 
-private layer_in(entry: &Conf, feature: string, target: string) -> CLayer =
-    CLayer(feature, target, conf_at(entry, "c"), conf_at(entry, "defines"), requires_block(entry),
-           conf_at(entry, "config"))
+private layer_in(entry: Value, feature: string, target: string) -> CLayer =
+    CLayer(feature, target, entry.get("c"), entry.get("defines"), requires_block(entry),
+           entry.get("config"))
 
-private says_a_layer(entry: &Conf) -> bool =
-    conf_at(entry, "c").is_some() || conf_at(entry, "defines").is_some() || requires_block(entry).is_some() ||
-    conf_at(entry, "config").is_some()
+private says_a_layer(entry: Value) -> bool =
+    entry.get("c").is_some() || entry.get("defines").is_some() || requires_block(entry).is_some() ||
+    entry.get("config").is_some()
 
 // The layers a manifest writes, the package's own first, each checked as far as reading it can: a
 // refusal names the layer it came from. What cannot be checked until a machine and a set of features
 // are chosen is checked by `layered_c`.
-read_c_layers(root: &Conf) -> Result[Buf[CLayer], string]
+read_c_layers(root: Value) -> Result[Buf[CLayer], string]
     var out: Buf[CLayer] = buf()
 
     out.push(layer_in(root, "", ""))
 
-    conf_at(root, "targets") match
+    root.get("targets") match
         None -> ()
         Some(block) ->
-            if conf_is_block(block)
-                for name in conf_keys(block)
+            if block.is_obj()
+                for name in block.keys()
                     if name == "default" then continue
 
-                    val entry = conf_at(block, name).unwrap()
+                    val entry = block.get(name).unwrap()
 
-                    if conf_is_block(entry) && says_a_layer(entry) then out.push(layer_in(entry, "", name))
+                    if entry.is_obj() && says_a_layer(entry) then out.push(layer_in(entry, "", name))
 
-    conf_at(root, "features") match
+    root.get("features") match
         None -> ()
         Some(block) ->
-            if conf_is_block(block)
-                for name in conf_keys(block)
-                    val entry = conf_at(block, name).unwrap()
+            if block.is_obj()
+                for name in block.keys()
+                    val entry = block.get(name).unwrap()
 
-                    if !conf_is_block(entry) then continue
+                    if !entry.is_obj() then continue
 
                     if says_a_layer(entry) then out.push(layer_in(entry, name, ""))
 
-                    conf_at(entry, "targets") match
+                    entry.get("targets") match
                         None -> ()
                         Some(targets) ->
-                            if conf_is_block(targets)
-                                for target in conf_keys(targets)
-                                    val sub = conf_at(targets, target).unwrap()
+                            if targets.is_obj()
+                                for target in targets.keys()
+                                    val sub = targets.get(target).unwrap()
 
-                                    if conf_is_block(sub) && says_a_layer(sub)
+                                    if sub.is_obj() && says_a_layer(sub)
                                         out.push(layer_in(sub, name, target))
 
     check_layers(out)?
@@ -160,11 +161,11 @@ private check_layers(layers: &Buf[CLayer]) -> Result[unit, string]
         l.requires match
             None -> ()
             Some(rq) ->
-                if conf_is_block(rq)
-                    conf_at(rq, "headers") match
+                if rq.is_obj()
+                    rq.get("headers") match
                         None -> ()
                         Some(h) ->
-                            for name in conf_keys(h)
+                            for name in h.keys()
                                 declared.push(name)
 
     for l in layers
@@ -172,11 +173,11 @@ private check_layers(layers: &Buf[CLayer]) -> Result[unit, string]
             None -> ()
             Some(rq) ->
                 if !is_package_layer(l)
-                    if !conf_is_block(rq)
+                    if !rq.is_obj()
                         return Err(s"'${layer_path(l, "requires")}' is not a block — a layer needs " +
                                    "'headers' and 'pkg_config', as 'requires { headers { sdk = \"…\" } }'")
 
-                    for key in conf_keys(rq)
+                    for key in rq.keys()
                         if !holds_key(LayerRequiresKeys, key)
                             return Err(s"'${layer_path(l, "requires")}.$key' is not something a " +
                                        "target or a feature needs — it names 'headers' and " +
@@ -210,13 +211,13 @@ private check_layers(layers: &Buf[CLayer]) -> Result[unit, string]
         l.c match
             None -> ()
             Some(cb) ->
-                if !conf_is_block(cb)
+                if !cb.is_obj()
                     return Err(in_layer(l, "c", "'c' is not a block of libraries — each key names one " +
                                                  "vendored C library and what follows it says how that library is compiled"))
 
-                for name in conf_keys(cb)
-                    val sub = conf_at(cb, name).unwrap()
-                    val forced = if conf_is_block(sub) && conf_at(sub, "root").is_some() then None
+                for name in cb.keys()
+                    val sub = cb.get(name).unwrap()
+                    val forced = if sub.is_obj() && sub.get("root").is_some() then None
                     else Some(LooseBase)
 
                     read_c_library(name, sub, forced, true) match
@@ -228,8 +229,8 @@ private check_layers(layers: &Buf[CLayer]) -> Result[unit, string]
         l.c match
             None -> ()
             Some(cb) ->
-                for name in conf_keys(cb)
-                    val sub = conf_at(cb, name).unwrap()
+                for name in cb.keys()
+                    val sub = cb.get(name).unwrap()
 
                     for key in LibraryPathKeys
                         for path in paths_at(sub, key)
@@ -260,19 +261,19 @@ private undeclared_tree(where: string, lib: string, key: string, path: string, n
 val LibraryPathKeys: []const string = ["root", "include", "include_private", "sources", "exclude", "export"]
 
 // The strings a key holds, whether it is a list or one scalar.
-private paths_at(sub: &Conf, key: string) -> Buf[string]
-    if !conf_is_block(sub) then return buf()
+private paths_at(sub: Value, key: string) -> Buf[string]
+    if !sub.is_obj() then return buf()
 
-    val v = conf_at(sub, key) match
+    val v = sub.get(key) match
         None -> return buf()
         Some(found) -> found
 
-    conf_list(v) match
+    v.as_text_list() match
         Some(items) -> return items
         None -> ()
 
     var out: Buf[string] = buf()
-    val one = conf_text(sub, key)
+    val one = scalar_text(sub, key)
 
     if one != "" then out.push(one)
 
@@ -280,9 +281,9 @@ private paths_at(sub: &Conf, key: string) -> Buf[string]
 end paths_at
 
 // The block a layer writes for a library, where it writes one.
-private lib_block(l: &CLayer, name: string) -> Option[&Conf] = l.c match
+private lib_block(l: &CLayer, name: string) -> Option[Value] = l.c match
     None -> None
-    Some(cb) -> conf_at(cb, name)
+    Some(cb) -> cb.get(name)
 
 // -- which layers are in force ---------------------------------------------------------------------
 
@@ -366,11 +367,11 @@ private merge_libraries(layers: &Buf[CLayer], setters: *Buf[(string, string, str
         l.c match
             None -> ()
             Some(cb) ->
-                if !conf_is_block(cb)
+                if !cb.is_obj()
                     return Err(in_layer(l, "c", "'c' is not a block of libraries — each key names one " +
                                                  "vendored C library and what follows it says how that library is compiled"))
 
-                for name in conf_keys(cb)
+                for name in cb.keys()
                     if !holds_string(names, name) then names.push(name)
 
     var out: Buf[CLibrary] = buf()
@@ -382,7 +383,7 @@ private merge_libraries(layers: &Buf[CLayer], setters: *Buf[(string, string, str
         for l in layers
             val found = lib_block(l, name)
 
-            if found.is_none() || !conf_is_block(found.unwrap()) then continue
+            if found.is_none() || !found.unwrap().is_obj() then continue
 
             val set = library_root(name, found.unwrap()) match
                 Err(why) -> return Err(in_layer(l, "c", why))
@@ -492,15 +493,15 @@ end merge_defines
 // A `config` block as the `NAME=value` macros it writes, in the order they are written -- the header
 // is read by people, so its lines stay where the author put them. A value is a C token sequence, read as
 // a `defines` block's is.
-read_config(block: &Conf, owner: string) -> Result[Buf[string], string]
+read_config(block: Value, owner: string) -> Result[Buf[string], string]
     var out: Buf[string] = buf()
 
-    if !conf_is_block(block)
+    if !block.is_obj()
         return Err(s"'$owner' is not a block of macros — each key is a macro name and its value is what " +
                    s"the C preprocessor substitutes, as '$owner { CFG_SIZE = 4 }'")
 
-    for name in conf_keys(block)
-        out.push(macro_of(owner, name, conf_at(block, name).unwrap())?)
+    for f in block.fields()
+        out.push(macro_of(owner, f.key, f.value)?)
 
     Ok(out)
 end read_config

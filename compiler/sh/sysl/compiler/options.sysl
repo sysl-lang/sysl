@@ -1,5 +1,7 @@
 module sh.sysl.compiler
 
+import sh.sysl.hocon.{Kind, Value}
+import sh.sysl.parsing.point
 import sysl.buf.{Buf, buf}
 import sysl.text.{join, replace_all, str_builder, Search}
 
@@ -81,23 +83,23 @@ option_constant(name: string) -> string = "option_" + replace_all(name, ".", "_"
 // **A feature's `options` block declares options that exist only while the feature is on**: they are
 // read after the package's own, in the order the features are written, and each is named
 // `<feature>.<option>` wherever a consumer or a suite sets it.
-read_options(root: &Conf) -> Result[Buf[PackageOption], string]
+read_options(root: Value) -> Result[Buf[PackageOption], string]
     var out: Buf[PackageOption] = buf()
 
-    conf_at(root, "options") match
+    root.get("options") match
         None -> ()
         Some(block) -> read_options_block(block, "", "options", &out)?
 
-    conf_at(root, "features") match
+    root.get("features") match
         None -> ()
         Some(features) ->
-            if conf_is_block(features)
-                for feature in conf_keys(features)
-                    val entry = conf_at(features, feature).unwrap()
+            if features.is_obj()
+                for feature in features.keys()
+                    val entry = features.get(feature).unwrap()
 
-                    if !conf_is_block(entry) then continue
+                    if !entry.is_obj() then continue
 
-                    conf_at(entry, "options") match
+                    entry.get("options") match
                         None -> ()
                         Some(block) -> read_options_block(block, feature, s"features.$feature.options", &out)?
 
@@ -115,9 +117,9 @@ read_options(root: &Conf) -> Result[Buf[PackageOption], string]
 end read_options
 
 // One `options` block, at the package level (`feature` empty) or inside a feature.
-private read_options_block(block: &Conf, feature: string, where: string,
+private read_options_block(block: Value, feature: string, where: string,
                            out: *Buf[PackageOption]) -> Result[unit, string]
-    if !conf_is_block(block)
+    if !block.is_obj()
         return Err(s"'$where' is not a block — it names each option and what it is, as " +
             s"'$where { slots { type = usize, default = 16 } }'")
 
@@ -126,13 +128,13 @@ private read_options_block(block: &Conf, feature: string, where: string,
             "option's name can be built from — the source reads an option as 'option_<feature>_<option>', " +
             "so a feature that has options is a letter or '_' followed by letters, digits and '_'")
 
-    for name in conf_keys(block)
-        out.push(read_option(name, conf_at(block, name).unwrap(), feature, where)?)
+    for name in block.keys()
+        out.push(read_option(name, block.get(name).unwrap(), feature, where)?)
 
     Ok(())
 end read_options_block
 
-private read_option(name: string, entry: &Conf, feature: string, owner: string) -> Result[PackageOption, string]
+private read_option(name: string, entry: Value, feature: string, owner: string) -> Result[PackageOption, string]
     val where = s"$owner.$name"
     val full = if feature == "" then name else s"$feature.$name"
 
@@ -140,42 +142,39 @@ private read_option(name: string, entry: &Conf, feature: string, owner: string) 
         return Err(s"'$where' is not a name an option can have — the package's source reads it as " +
             s"'${option_constant(full)}', so it is a letter or '_' followed by letters, digits and '_'")
 
-    if !conf_is_block(entry)
+    if !entry.is_obj()
         return Err(s"'$where' is not a block — an option names its 'type' and its 'default', and may " +
             "name a 'range' or 'values', a 'macro' and a 'doc'")
 
-    for key in sorted_labels(conf_keys(entry))
+    for key in sorted_labels(entry.keys())
         if key != "type" && key != "default" && key != "range" && key != "doc" && key != "values" &&
            key != "macro"
             return Err(s"'$where.$key' is not something an option says — the keys are 'default', " +
                 "'doc', 'macro', 'range', 'type', 'values'")
 
-    val type_name = conf_at(entry, "type") match
+    val type_name = entry.get("type") match
         None -> return Err(s"'$where' names no 'type' — an option is an integer type, 'bool' or " +
             "'string'")
-        Some(v) -> *v match
-            Word(s) -> s
-            Text(s) -> s
-            _ -> ""
+        Some(v) -> text_of(v).unwrap_or("")
 
     val kind = option_kind(type_name) match
         None -> return Err(s"'$where.type' is '$type_name', which an option cannot be — an option " +
             "is an integer type ('usize', 'u8', 'int', 'i64', …), 'bool' or 'string'")
         Some(k) -> k
 
-    val doc = conf_at(entry, "doc") match
+    val doc = entry.get("doc") match
         None -> ""
-        Some(v) -> *v match
-            Text(s) -> s
-            Word(s) -> if conf_is_prose(v) then s
-            else return Err(s"'$where.doc' is not a string — it says what the option is for, in quotes")
-            _ -> return Err(s"'$where.doc' is not a string — it says what the option is for, in quotes")
+        Some(v) ->
+            if !is_prose(v)
+                return Err(s"'$where.doc' is not a string — it says what the option is for, in quotes")
 
-    val range = conf_at(entry, "range") match
+            text_of(v).unwrap()
+
+    val range = entry.get("range") match
         None -> None
         Some(v) -> Some(read_range(where, type_name, kind, v)?)
 
-    val values = conf_at(entry, "values") match
+    val values = entry.get("values") match
         None -> buf()
         Some(v) ->
             if range.is_some()
@@ -184,7 +183,7 @@ private read_option(name: string, entry: &Conf, feature: string, owner: string) 
 
             read_values(where, type_name, kind, v)?
 
-    val given = conf_at(entry, "default") match
+    val given = entry.get("default") match
         None -> return Err(s"'$where' names no 'default' — an option has the value its package is " +
             "built with where no consumer sets one")
         Some(v) -> v
@@ -192,13 +191,12 @@ private read_option(name: string, entry: &Conf, feature: string, owner: string) 
     val default = option_literal(kind, type_name, range, values, given).map_err((why) ->
         s"'$where.default' is $why")?
 
-    val macro = conf_at(entry, "macro") match
+    val macro = entry.get("macro") match
         None -> ""
         Some(v) ->
-            val text = *v match
-                Text(s) -> s
-                Word(s) -> s
-                _ -> return Err(s"'$where.macro' is not a name — it is the C macro the config header " +
+            val text = text_of(v) match
+                Some(s) -> s
+                None -> return Err(s"'$where.macro' is not a name — it is the C macro the config header " +
                                 "gives the option's value, as 'macro = \"CFG_TUD_CDC\"'")
 
             if !macro_name(text)
@@ -212,17 +210,18 @@ end read_option
 
 // An option's `values`: the only ones it may have, each a value of its type. A bool has two values
 // already, so a list on one was written by somebody who believes it narrows something.
-private read_values(where: string, type_name: string, kind: OptionKind, v: &Conf) -> Result[Buf[string], string]
+private read_values(where: string, type_name: string, kind: OptionKind, v: Value) -> Result[Buf[string], string]
     kind match
         OptBool ->
             return Err(s"'$where.values' lists the values of a 'bool' option, which has two already — " +
                        "'values' belongs on an integer or a string option")
         _ -> ()
 
-    val items = *v match
-        Items(list) -> list
-        _ -> return Err(s"'$where.values' is not a list — it is written '[8, 16, 32]', the values the " +
-                        "option may have")
+    if !v.is_arr()
+        return Err(s"'$where.values' is not a list — it is written '[8, 16, 32]', the values the " +
+                   "option may have")
+
+    val items = v.items()
 
     if items.is_empty()
         return Err(s"'$where.values' is empty — an option that may have no value cannot be built")
@@ -243,7 +242,7 @@ end read_values
 
 // An integer option's `[low, high]`, both ends included and both within the type.
 private read_range(where: string, type_name: string, kind: OptionKind,
-                   v: &Conf) -> Result[(WrittenInteger, WrittenInteger), string]
+                   v: Value) -> Result[(WrittenInteger, WrittenInteger), string]
     val (bits, signed) = kind match
         OptInteger(b, s) -> (b, s)
         _ -> return Err(s"'$where.range' bounds a '$type_name' option, and only an integer option " +
@@ -252,20 +251,20 @@ private read_range(where: string, type_name: string, kind: OptionKind,
     val shape = s"'$where.range' is not a list of two integers — it is written '[low, high]', both " +
         "ends included"
 
-    val items = *v match
-        Items(values) -> values
-        _ -> return Err(shape)
+    if !v.is_arr() then return Err(shape)
+
+    val items = v.items()
 
     if items.len() != 2 then return Err(shape)
 
     var ends: Buf[WrittenInteger] = buf()
 
     for item in items
-        val d = *item match
-            Word(s) -> written_integer(s) match
+        val d = item.as_word() match
+            Some(s) -> written_integer(s) match
                 None -> return Err(shape)
                 Some(got) -> got
-            _ -> return Err(shape)
+            None -> return Err(shape)
 
         if !fits_integer(d, bits, signed)
             return Err(s"'$where.range' reaches ${decimal_text(d)}, which no '$type_name' holds")
@@ -324,7 +323,7 @@ end option_kind
 // The literal a value is as a constant of the option's type, or why it is not one -- the value and
 // what is wrong with it, said as the end of a sentence that names where it was written.
 option_literal(kind: OptionKind, type_name: string, range: Option[(WrittenInteger, WrittenInteger)],
-               values: Buf[string], v: &Conf) -> Result[string, string]
+               values: Buf[string], v: Value) -> Result[string, string]
     val literal = typed_literal(kind, type_name, range, v)?
 
     if !values.is_empty() && !holds_string(values, literal)
@@ -335,22 +334,19 @@ end option_literal
 
 // A value as a constant of the option's type and within its range.
 private typed_literal(kind: OptionKind, type_name: string, range: Option[(WrittenInteger, WrittenInteger)],
-                      v: &Conf) -> Result[string, string]
-    val shown = conf_shown(v)
+                      v: Value) -> Result[string, string]
+    val shown = shown_for_refusal(v)
     val not_string = s"$shown, which is not a 'string' — a string option's value is written in quotes"
 
     kind match
-        OptBool -> *v match
-            Flag(on) -> Ok(if on then "true" else "false")
-            _ -> Err(s"$shown, which is not a 'bool' — it is 'true' or 'false', without quotes")
-        OptString -> *v match
-            Text(s) -> Ok(string_literal(s))
-            Word(s) -> if conf_is_prose(v) then Ok(string_literal(s)) else Err(not_string)
-            _ -> Err(not_string)
+        OptBool -> v.as_bool() match
+            Some(on) -> Ok(if on then "true" else "false")
+            None -> Err(s"$shown, which is not a 'bool' — it is 'true' or 'false', without quotes")
+        OptString -> if is_prose(v) then Ok(string_literal(text_of(v).unwrap())) else Err(not_string)
         OptInteger(bits, signed) ->
-            val d = *v match
-                Word(s) -> written_integer(s)
-                _ -> None
+            val d = v.as_word() match
+                Some(s) -> written_integer(s)
+                None -> None
 
             if d.is_none()
                 return Err(s"$shown, which is not a '$type_name' — an integer option's value is a " +
@@ -372,12 +368,14 @@ private typed_literal(kind: OptionKind, type_name: string, range: Option[(Writte
 end typed_literal
 
 // A value as a refusal quotes it: a string in double quotes, anything else as written.
-private conf_shown(v: &Conf) -> string = *v match
-    Text(s) -> s"\"$s\""
-    Word(s) -> s
-    Flag(on) -> if on then "true" else "false"
-    Items(_) -> "a list"
-    Block(_) -> "a block"
+private shown_for_refusal(v: Value) -> string
+    if v.is_arr() then return "a list"
+    if v.is_obj() then return "a block"
+
+    v.as_quoted() match
+        Some(s) -> s"\"$s\""
+        None -> v.as_scalar().unwrap_or("")
+end shown_for_refusal
 
 // A string as a sysl literal spells it.
 private string_literal(s: string) -> string
@@ -667,7 +665,7 @@ default_settled_options(m: &Manifest, enabled: &Buf[string]) -> Buf[SettledOptio
 // **The options a package's own suite is built with**, as literals: the `test` block's, and over them
 // each `--option name=value` of the command line. Each is held to the declaration it names, as a
 // consumer's entry is (`gather_settings`), and the refusal says which of the two wrote it.
-test_option_literals(declared: &Buf[PackageOption], block: &Buf[(string, &Conf)],
+test_option_literals(declared: &Buf[PackageOption], block: &Buf[(string, Value)],
                      given: &Buf[string]) -> Result[Buf[(string, string)], string]
     var out: Buf[(string, string)] = buf()
     val from_block = s"the 'test' block of $ManifestName"
@@ -698,19 +696,19 @@ end test_option_literals
 
 // What a command line's text is as a manifest would have written it: quoted where the option is a
 // string, a flag where it is a bool and the text says so, a bare word otherwise.
-private typed_by_declaration(declared: &Buf[PackageOption], name: string, value: string) -> Conf
+private typed_by_declaration(declared: &Buf[PackageOption], name: string, value: string) -> Value
     val opt = declared_option(declared, name) match
         Some(o) -> o
-        None -> return Word(value)
+        None -> return Value(point(0), Kind.Word(value))
 
     opt.kind match
-        OptString -> Text(value)
+        OptString -> Value(point(0), Kind.Str(value))
         OptBool ->
-            if value == "true" then return Flag(true)
-            if value == "false" then return Flag(false)
+            if value == "true" then return Value(point(0), Kind.Bool(true))
+            if value == "false" then return Value(point(0), Kind.Bool(false))
 
-            Word(value)
-        OptInteger(_, _) -> Word(value)
+            Value(point(0), Kind.Word(value))
+        OptInteger(_, _) -> Value(point(0), Kind.Word(value))
 end typed_by_declaration
 
 private replace_setting(out: *Buf[(string, string)], name: string, literal: string)
@@ -722,7 +720,7 @@ private replace_setting(out: *Buf[(string, string)], name: string, literal: stri
     out.push((name, literal))
 end replace_setting
 
-private test_option_literal(declared: &Buf[PackageOption], name: string, value: &Conf,
+private test_option_literal(declared: &Buf[PackageOption], name: string, value: Value,
                             who: string) -> Result[string, string]
     val opt = declared_option(declared, name) match
         Some(o) -> o
@@ -937,10 +935,9 @@ end agreed
 // A block of option settings as `(name, value)` pairs, a feature's options nested under the feature's
 // name as the reader nests a dotted key (`cdc.rx_buffer = 512` is `cdc { rx_buffer = 512 }`), and read
 // back as the option's own name, `cdc.rx_buffer`.
-flat_settings(block: &Conf, prefix: string, out: *Buf[(string, &Conf)])
-    for name in conf_keys(block)
-        val v = conf_at(block, name).unwrap()
-        val full = if prefix == "" then name else s"$prefix.$name"
+flat_settings(block: Value, prefix: string, out: *Buf[(string, Value)])
+    for f in block.fields()
+        val full = if prefix == "" then f.key else s"$prefix.${f.key}"
 
-        if conf_is_block(v) then flat_settings(v, full, out) else out.push((full, v))
+        if f.value.is_obj() then flat_settings(f.value, full, out) else out.push((full, f.value))
 end flat_settings

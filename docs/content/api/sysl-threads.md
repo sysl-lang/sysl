@@ -110,6 +110,12 @@ the far end -- and the object at the far end is what the new thread gets. The an
 asks the compiler to look through it, so a state holding a plain `&T` is refused here rather than
 racing later.
 
+**`@joined(arg)` says how long the new thread holds `arg`: until the handle answered here is
+joined.** So the address of a caller's local may be handed over only where the caller joins that
+handle on every way out before it returns -- a way that skips the join would leave the thread
+reading storage that is gone, and is refused (`reference/memory.md § A thread holds what it is
+handed until it is joined`).
+
 ### `spawn_on`
 
 ```sysl
@@ -212,7 +218,8 @@ loop
 **A waiter sleeps**: a full `send` waits on one `Condvar` and an empty `receive` on the other, each
 woken by the transfer that makes room or brings a value, and both woken by `close`.
 
-**A view goes in as a copy.** `send` and `try_send` are `@crossing(copy value)`, so a `[]u8`, a
+**A view goes in as a copy.** `send` and `try_send` are `@crossing(value)`, and a value crossing by
+value is a copy, so a `[]u8`, a
 `string`, a `[][]u8` or a struct holding views is copied at the call into storage of its own, at
 every depth, and the receiver is handed bytes nothing on the sending side still reaches
 (`reference/memory.md § Crossing a concurrency domain`). The sender may go on writing to what it
@@ -280,9 +287,9 @@ holds the `T`, and both of its fields are private -- so there is no way to reach
 does not go through the lock, and no way to build one that skips the free state.
 
 **`with` is the way in**: it takes the lock, hands a closure the address of the value, and releases
-the lock when the closure returns. The address is lent (`@lends`), so the compiler holds the closure
-to letting it go -- returning it, storing it, or passing it to something that keeps it is refused,
-which is the one mistake a returned address could not prevent: using it after the release.
+the lock when the closure returns. A closure borrows what it is handed for the call, so the compiler
+holds it to letting the address go -- storing it, or passing it to something that keeps it, is
+refused, which is the one mistake a returned address could not prevent: using it after the release.
 
 ```
 m.with((n) -> *n += 1)

@@ -1,5 +1,7 @@
 module sh.sysl.compiler
 
+import sh.sysl.hocon.{parse as parse_hocon, Value}
+import sh.sysl.parsing.source_of
 import sysl.buf.{Buf, buf}
 import sysl.fs.{cache_dir, is_file, read_text}
 import sysl.text.{join, split, Search}
@@ -224,7 +226,7 @@ struct TestSettings
 
     // The options the package's own suite is built with, by name and as written; what a value may be
     // is the package's `options` block's to say (`apply_test_block`).
-    options: Buf[(string, &Conf)]
+    options: Buf[(string, Value)]
 end TestSettings
 
 // A package that said nothing about its suite.
@@ -539,6 +541,66 @@ private numbers_of(text: string) -> Buf[usize]
     out
 end numbers_of
 
+// A manifest's text read into its tree (`sh.sysl.hocon`), or the one line that says where it
+// stopped.
+//
+// **A manifest is configuration and not a program**, so this answers a tree of objects, strings and
+// flags, and everything about what a key *means* is read off it here, where a test can ask it
+// directly. A key this compiler does not understand is carried through and reported by the caller
+// rather than refused, because a manifest written for a newer compiler must still build with an older
+// one wherever the parts it uses are understood.
+//
+// **A refusal says where it stopped**, as a line and a column counted in bytes from one -- a manifest
+// is edited by hand, and a message with no position leaves the reader to find the one brace that is
+// missing. A root that is not an object is refused the way a key that cannot begin one is.
+read_conf(text: string) -> Result[Value, string]
+    val root = parse_hocon(source_of(ManifestName, text)) match
+        Err(d) -> return Err(s"${d.message} ${position_of(text, d.span.start)}")
+        Ok(doc) -> doc.root
+
+    if !root.is_obj()
+        return Err(s"'${text[root.span.start..<(root.span.start + 1)]}' cannot begin a key " +
+                   position_of(text, root.span.start))
+
+    Ok(root)
+end read_conf
+
+// Where an offset sits, as `(line L, column C)`, counting bytes.
+private position_of(text: string, at: usize) -> string
+    var line: usize = 1
+    var column: usize = 1
+
+    for i in 0..<text.bytes.len
+        if i >= at then break
+
+        if text.bytes[i] == u8('\n')
+            line += 1
+            column = 1
+        else
+            column += 1
+
+    s"(line $line, column $column)"
+end position_of
+
+// A string, quoted or not -- a number or `null` as it was written -- and nothing for a flag, a list
+// or a block. **The two spellings are one answer here**: where a key wants a name or a path, `x` and
+// `"x"` both give it.
+text_of(v: Value) -> Option[string] = v.as_quoted().or_else(() -> v.as_word())
+
+// Whether a value is prose a person wrote: a quoted string, or a bare word that is not a number.
+// **A quoted string and a bare one are different answers where a key wants prose**: `sdl3 = 3` is a
+// version where a reason belonged, while `optimization = 2` is the level it spells.
+is_prose(v: Value) -> bool
+    if v.as_quoted().is_some() then return true
+
+    v.as_word() match
+        Some(s) -> s.is_empty() || !((s.bytes[0] >= u8('0') && s.bytes[0] <= u8('9')) || s.bytes[0] == u8('-'))
+        None -> false
+end is_prose
+
+// The scalar an object holds under a name as text, or the empty string where it holds none.
+scalar_text(v: Value, key: string) -> string = v.scalar_at(key).unwrap_or("")
+
 // The manifest itself, read out of the notation.
 //
 // **Read off the parsed tree rather than through dotted-path getters**, which split on `.` without
@@ -555,15 +617,15 @@ read_manifest(text: string) -> Result[Manifest, string]
     var repository = ""
     var warnings: Buf[string] = buf()
 
-    conf_at(root, "package") match
+    root.get("package") match
         None -> ()
         Some(pkg) ->
-            name = conf_text(pkg, "name")
-            version = conf_text(pkg, "version")
-            floor = conf_text(pkg, "sysl")
-            repository = conf_text(pkg, "repository")
+            name = scalar_text(pkg, "name")
+            version = scalar_text(pkg, "version")
+            floor = scalar_text(pkg, "sysl")
+            repository = scalar_text(pkg, "repository")
 
-            val keys = conf_keys(pkg)
+            val keys = pkg.keys()
 
             for i in 0..<keys.len()
                 if !known_package_key(keys.at(i))
@@ -579,9 +641,9 @@ read_manifest(text: string) -> Result[Manifest, string]
                 s"with, and $why")
             Ok(_) -> ()
 
-    val default_target = conf_at(root, "targets") match
+    val default_target = root.get("targets") match
         None -> ""
-        Some(block) -> conf_text(block, "default")
+        Some(block) -> scalar_text(block, "default")
 
     val requires = read_requires(root)?
     val pkg_config = read_pkg_config(root)?
@@ -589,7 +651,7 @@ read_manifest(text: string) -> Result[Manifest, string]
     val defines = read_defines(root)?
     val c_libraries = read_c_libraries(root)?
 
-    val capabilities = conf_at(root, "capabilities") match
+    val capabilities = root.get("capabilities") match
         None -> buf()
         Some(block) -> read_capabilities(block, "capabilities")?
 
@@ -599,39 +661,39 @@ read_manifest(text: string) -> Result[Manifest, string]
     var target_codegen_registers: Buf[(string, string, string)] = buf()
     var targets: Buf[(string, string)] = buf()
     var images: Buf[ImageLink] = buf()
-    conf_at(root, "targets") match
+    root.get("targets") match
         None -> ()
         Some(block) ->
-            val named = conf_keys(block)
+            val named = block.keys()
 
             for i in 0..<named.len()
                 if named.at(i) == "default" then continue
 
-                val entry = conf_at(block, named.at(i)).unwrap()
+                val entry = block.get(named.at(i)).unwrap()
 
-                if !conf_is_block(entry)
+                if !entry.is_obj()
                     return Err(s"'targets.${named.at(i)}' is not a block describing a target")
 
-                targets.push((named.at(i), conf_text(entry, "triple")))
+                targets.push((named.at(i), scalar_text(entry, "triple")))
 
                 // The 0.4.0 spelling, a target block listing the features that change it, is refused
                 // with the block rewritten the new way round.
-                conf_at(entry, "features") match
+                entry.get("features") match
                     None -> ()
                     Some(old) ->
-                        if conf_is_block(old)
+                        if old.is_obj()
                             return Err(old_target_features_refusal(named.at(i), old))
 
                 // A key the block does not know is said and skipped, as a top-level one is -- a block
                 // nested under a name this compiler has never heard of included.
-                for key in conf_keys(entry)
+                for key in entry.keys()
                     if !known_target_key(key) then warnings.push(unknown_key(s"targets.${named.at(i)}.$key"))
 
                 val image = read_image(entry, named.at(i))?
 
                 if image.is_some() then images.push(image.unwrap())
 
-                conf_at(entry, "capabilities") match
+                entry.get("capabilities") match
                     None -> ()
                     Some(caps) ->
                         val flags = read_capabilities(caps, s"targets.${named.at(i)}.capabilities")?
@@ -639,7 +701,7 @@ read_manifest(text: string) -> Result[Manifest, string]
                         for j in 0..<flags.len()
                             target_capabilities.push((named.at(i), flags.at(j).0, flags.at(j).1))
 
-                conf_at(entry, "codegen") match
+                entry.get("codegen") match
                     None -> ()
                     Some(block) ->
                         val settings = read_codegen(block, s"targets.${named.at(i)}.codegen")?
@@ -681,11 +743,11 @@ read_manifest(text: string) -> Result[Manifest, string]
 
     check_header_macros(options, read.info)?
 
-    val codegen_read = conf_at(root, "codegen") match
+    val codegen_read = root.get("codegen") match
         None -> (buf(), buf(), None)
         Some(block) -> read_codegen(block, "codegen")?
 
-    val has_package = conf_at(root, "package").is_some()
+    val has_package = root.get("package").is_some()
     val workspace = read_workspace(root)?
 
     // **A workspace root with no `package` block compiles nothing of its own**, so a dependency
@@ -694,7 +756,7 @@ read_manifest(text: string) -> Result[Manifest, string]
         return Err("'dependencies' in a workspace with no 'package' block reaches nothing — the " +
             "root compiles nothing of its own, so name each dependency in the member that imports it")
 
-    val keys = conf_keys(root)
+    val keys = root.keys()
 
     for i in 0..<keys.len()
         if !known_top_key(keys.at(i)) then warnings.push(unknown_key(keys.at(i)))
@@ -724,35 +786,35 @@ end read_manifest
 //
 // A key the block does not know is warned about and ignored, as a top-level one is: a manifest is
 // read by compilers older than the one it was written for.
-private read_test_settings(root: &Conf, warnings: *Buf[string]) -> Result[TestSettings, string]
-    val block = conf_at(root, "test") match
+private read_test_settings(root: Value, warnings: *Buf[string]) -> Result[TestSettings, string]
+    val block = root.get("test") match
         None -> return Ok(no_test_settings())
         Some(b) -> b
 
-    if !conf_is_block(block)
+    if !block.is_obj()
         return Err("'test' says how this package's suite is run, so it is a block — " +
                    "test { jobs = 4, timeout = 60, alone = [\"port\"] }")
 
     var settings = no_test_settings()
-    val keys = conf_keys(block)
+    val keys = block.keys()
 
     for i in 0..<keys.len()
         val key = keys.at(i)
-        val value = conf_at(block, key).unwrap()
+        val value = block.get(key).unwrap()
 
         if key == "jobs"
-            val given = *value match
-                Word(w) -> test_jobs(w)
-                _ -> None
+            val given = value.as_word() match
+                Some(w) -> test_jobs(w)
+                None -> None
 
             if given.is_none()
                 return Err("'test.jobs' is how many tests may run at once, a whole number from 1 up")
 
             settings.jobs = given
         else if key == "timeout"
-            val given = *value match
-                Word(w) -> timeout_seconds(w)
-                _ -> None
+            val given = value.as_word() match
+                Some(w) -> timeout_seconds(w)
+                None -> None
 
             if given.is_none()
                 return Err(s"'test.timeout' is the seconds each test may run, a whole number from 0 to " +
@@ -760,16 +822,16 @@ private read_test_settings(root: &Conf, warnings: *Buf[string]) -> Result[TestSe
 
             settings.timeout = given
         else if key == "alone"
-            settings.alone = conf_list(value) match
+            settings.alone = value.as_text_list() match
                 Some(texts) -> texts
                 None -> return Err("'test.alone' is a list of texts a test's name holds — " +
                                    "alone = [\"port\"], and not a single string")
         else if key == "features"
-            settings.features = Some(conf_list(value) match
+            settings.features = Some(value.as_text_list() match
                 Some(names) -> names
                 None -> return Err(not_a_feature_list("test.features")))
         else if key == "options"
-            if !conf_is_block(value)
+            if !value.is_obj()
                 return Err("'test.options' is not a block — it sets this package's own options for its " +
                            "suite by name, as 'options { cores = 2 }'")
 
@@ -782,28 +844,24 @@ end read_test_settings
 
 // The `bounds_locations` key: `true`, the default, or `false` to leave every failed bounds check's
 // `file:line:column` out of the image.
-private read_bounds_locations(root: &Conf) -> Result[Option[bool], string]
-    val value = conf_at(root, "bounds_locations") match
+private read_bounds_locations(root: Value) -> Result[Option[bool], string]
+    val value = root.get("bounds_locations") match
         None -> return Ok(None)
         Some(v) -> v
 
-    *value match
-        Flag(on) -> return Ok(Some(on))
-        _ -> ()
+    if value.as_bool().is_some() then return Ok(value.as_bool())
 
     Err("'bounds_locations' says whether a failed bounds check names the file, line and column it " +
         "was written at, so it is true or false")
 end read_bounds_locations
 
 // The `error_traces` key: `true`, the default, or `false` to record no error return trace at all.
-private read_error_traces(root: &Conf) -> Result[Option[bool], string]
-    val value = conf_at(root, "error_traces") match
+private read_error_traces(root: Value) -> Result[Option[bool], string]
+    val value = root.get("error_traces") match
         None -> return Ok(None)
         Some(v) -> v
 
-    *value match
-        Flag(on) -> return Ok(Some(on))
-        _ -> ()
+    if value.as_bool().is_some() then return Ok(value.as_bool())
 
     Err("'error_traces' says whether a failure records where it was made and each '?' that handed " +
         "it on, so it is true or false")
@@ -817,30 +875,29 @@ end read_error_traces
 // **A register setting names its register as text** (`thread_pointer = "tpidr_el1"`), checked here
 // against the registers there are; whether the machine has them is the driver's question. Beside the
 // settings and the registers, the `extensions` list, or `None` where the block names none.
-read_codegen(block: &Conf,
+read_codegen(block: Value,
                      where: string) -> Result[(Buf[(string, bool)], Buf[(string, string)],
                                                Option[Buf[string]]), string]
-    if !conf_is_block(block)
+    if !block.is_obj()
         return Err(s"'$where' is not a block — it is written 'codegen { general_regs_only = true }'")
 
     var out: Buf[(string, bool)] = buf()
     var registers: Buf[(string, string)] = buf()
     var extensions: Option[Buf[string]] = None
-    val keys = conf_keys(block)
+    val keys = block.keys()
 
     for i in 0..<keys.len()
         val key = keys.at(i)
 
         if key == "extensions"
-            extensions = Some(read_extensions(conf_at(block, "extensions").unwrap(), s"$where.extensions")?)
+            extensions = Some(read_extensions(block.get("extensions").unwrap(), s"$where.extensions")?)
             continue
         end if
 
         if is_register_setting(key)
-            val named = *conf_at(block, key).unwrap() match
-                Text(t) -> t
-                Word(w) -> w
-                _ -> return Err(s"'$where.$key' names a register, as 'tpidr_el1'")
+            val named = text_of(block.get(key).unwrap()) match
+                Some(t) -> t
+                None -> return Err(s"'$where.$key' names a register, as 'tpidr_el1'")
 
             register_name_refusal(s"$where.$key", named) match
                 Some(why) -> return Err(why)
@@ -854,9 +911,9 @@ read_codegen(block: &Conf,
             return Err(s"'$where.$key' is not a code generation setting — the settings are " +
                 "'general_regs_only', 'strict_align', 'extensions', 'thread_pointer' and 'per_cpu_offset'")
 
-        *conf_at(block, key).unwrap() match
-            Flag(on) -> out.push((key, on))
-            _ -> return Err(s"'$where.$key' must be true or false")
+        block.get(key).unwrap().as_bool() match
+            Some(on) -> out.push((key, on))
+            None -> return Err(s"'$where.$key' must be true or false")
     end for
 
     Ok((out, registers, extensions))
@@ -867,11 +924,11 @@ end read_codegen
 // which is what `general_regs_only` is for. Whether the back end knows the name is asked when a
 // build is made for a machine (`codegen_features.sysl`'s `extension_refusal`), since the answer is
 // that machine's.
-private read_extensions(value: &Conf, where: string) -> Result[Buf[string], string]
+private read_extensions(value: Value, where: string) -> Result[Buf[string], string]
     val bad = s"'$where' is a list of the processor's extensions, as LLVM names them — " +
         "'extensions = [\"lse\"]'"
 
-    val names = conf_list(value) match
+    val names = value.as_text_list() match
         None -> return Err(bad)
         Some(xs) -> xs
 
@@ -925,8 +982,8 @@ end codegen_register_given
 // The `workspace` list: the members' directories, relative to the file. **A list and nothing else**
 // -- the members are the whole of what a workspace says, and a value of any other shape was written
 // by somebody who believes they declared members the reader cannot see.
-private read_workspace(root: &Conf) -> Result[Option[Buf[string]], string]
-    val written = conf_at(root, "workspace") match
+private read_workspace(root: Value) -> Result[Option[Buf[string]], string]
+    val written = root.get("workspace") match
         None -> return Ok(None)
         Some(v) -> v
 
@@ -934,18 +991,9 @@ private read_workspace(root: &Conf) -> Result[Option[Buf[string]], string]
         "'workspace = [\"compiler\", \"tools/*\"]', each entry a member's directory relative to " +
         "this file"
 
-    *written match
-        Items(values) ->
-            var out: Buf[string] = buf()
-
-            for i in 0..<values.len()
-                *values.at(i) match
-                    Text(s) -> out.push(s)
-                    Word(s) -> out.push(s)
-                    _ -> return Err(bad)
-
-            Ok(Some(out))
-        _ -> Err(bad)
+    written.as_text_list() match
+        Some(out) -> Ok(Some(out))
+        None -> Err(bad)
 end read_workspace
 
 // The warning a key this compiler does not know draws. **Said and then ignored, not refused**: a
@@ -976,18 +1024,18 @@ private not_a_capability(written: string, where: string) -> string =
 // A `capabilities` block, the project's or one target's: each name one of the three, and each value
 // a flag. **A misspelled name is refused rather than ignored**, since a `treads = false` that did
 // nothing would leave the writer believing the machine had been described.
-read_capabilities(block: &Conf, where: string) -> Result[Buf[(string, bool)], string]
+read_capabilities(block: Value, where: string) -> Result[Buf[(string, bool)], string]
     var out: Buf[(string, bool)] = buf()
-    val keys = conf_keys(block)
+    val keys = block.keys()
 
     for i in 0..<keys.len()
         val cap = capability_word(keys.at(i))
 
         if !is_core_capability(cap) then return Err(not_a_capability(keys.at(i), where))
 
-        *conf_at(block, keys.at(i)).unwrap() match
-            Flag(on) -> out.push((cap, on))
-            _ -> return Err(s"'$where.${keys.at(i)}' must be true or false")
+        block.get(keys.at(i)).unwrap().as_bool() match
+            Some(on) -> out.push((cap, on))
+            None -> return Err(s"'$where.${keys.at(i)}' must be true or false")
 
     Ok(out)
 end read_capabilities
@@ -998,14 +1046,14 @@ end read_capabilities
 // **A `false` is refused**: a package cannot need a facility *not* to exist, so the entry has nothing
 // to mean, and dropping it silently would let the file read as though the project had said something.
 // The two sub-blocks beside the capabilities are read by their own readers.
-private read_requires(root: &Conf) -> Result[Buf[string], string]
+private read_requires(root: Value) -> Result[Buf[string], string]
     var named: Buf[string] = buf()
 
-    val block = conf_at(root, "requires") match
+    val block = root.get("requires") match
         None -> return Ok(named)
         Some(b) -> b
 
-    val keys = conf_keys(block)
+    val keys = block.keys()
 
     for written in keys
         if written == "headers" || written == "pkg_config" then continue
@@ -1014,13 +1062,13 @@ private read_requires(root: &Conf) -> Result[Buf[string], string]
 
         if !is_core_capability(cap) then return Err(not_a_capability(written, "requires"))
 
-        *conf_at(block, written).unwrap() match
-            Flag(true) -> named.push(cap)
-            Flag(false) -> return Err(
+        block.get(written).unwrap().as_bool() match
+            Some(true) -> named.push(cap)
+            Some(false) -> return Err(
                 s"'requires { $cap = false }' says nothing — 'requires' is what this package needs " +
                 s"its host to have. To say the machine has no $cap, write it in the project's own " +
                 s"'capabilities { $cap = false }'" + module_mark_advice(cap))
-            _ -> return Err(s"'requires.$written' must be true or false")
+            None -> return Err(s"'requires.$written' must be true or false")
 
     var out: Buf[string] = buf()
 
@@ -1051,14 +1099,14 @@ end module_mark_advice
 //
 // **Both halves or neither**: storage taken from one allocator and handed back to another is the
 // defect this exists to prevent, so half a pair is refused rather than completed from libc.
-private read_allocator(root: &Conf) -> Result[Option[(string, string)], string]
-    val block = conf_at(root, "allocator") match
+private read_allocator(root: Value) -> Result[Option[(string, string)], string]
+    val block = root.get("allocator") match
         None -> return Ok(None)
         Some(b) -> b
 
-    if !conf_is_block(block) then return Err("'allocator' is not a block")
+    if !block.is_obj() then return Err("'allocator' is not a block")
 
-    val keys = conf_keys(block)
+    val keys = block.keys()
 
     for i in 0..<keys.len()
         if keys.at(i) != "alloc" && keys.at(i) != "free"
@@ -1068,19 +1116,19 @@ private read_allocator(root: &Conf) -> Result[Option[(string, string)], string]
     val halves: []const string = ["alloc", "free"]
 
     for i in 0..<halves.len
-        if conf_at(block, halves[i]).is_none()
+        if block.get(halves[i]).is_none()
             return Err(s"'allocator' names no '${halves[i]}' — a program takes its storage from one " +
                 "pair and gives it back to the same one, so both halves are said or neither is")
 
     for i in 0..<halves.len
-        val symbol = conf_text(block, halves[i])
+        val symbol = scalar_text(block, halves[i])
 
         if !is_symbol(symbol)
             return Err(s"'allocator.${halves[i]}' is '$symbol', which is not a name a C function " +
                 "can have")
 
-    val alloc = conf_text(block, "alloc")
-    val free = conf_text(block, "free")
+    val alloc = scalar_text(block, "alloc")
+    val free = scalar_text(block, "free")
 
     if alloc == free then return Err(s"'allocator' names '$alloc' for both halves")
 
@@ -1171,15 +1219,14 @@ val ManifestLevels: []const string = ["0", "1", "2", "3", "s", "z"]
 
 // The `optimization` key. **A level clang has no answer for is refused here** rather than left to
 // clang: a manifest is read by every later build and by consumers who did not write it.
-private read_optimization(root: &Conf) -> Result[Option[string], string]
-    val value = conf_at(root, "optimization") match
+private read_optimization(root: Value) -> Result[Option[string], string]
+    val value = root.get("optimization") match
         None -> return Ok(None)
         Some(v) -> v
 
-    val level = *value match
-        Text(s) -> s
-        Word(s) -> s
-        _ -> return Err("'optimization' names the level this project is built at, so it is one of " +
+    val level = text_of(value) match
+        Some(s) -> s
+        None -> return Err("'optimization' names the level this project is built at, so it is one of " +
                         "0, 1, 2, 3, s, z — written as a string, and not a block or a list")
 
     for i in 0..<ManifestLevels.len
@@ -1193,16 +1240,16 @@ end read_optimization
 // ordinary link's cost for most of the benefit. `lto = false` means the same as saying nothing, so a
 // fork of a manifest can turn it off without deleting the line. Anything else is refused here rather
 // than left to arrive from inside clang with nothing naming the manifest.
-private read_lto(root: &Conf) -> Result[Option[string], string]
-    val value = conf_at(root, "lto") match
+private read_lto(root: Value) -> Result[Option[string], string]
+    val value = root.get("lto") match
         None -> return Ok(None)
         Some(v) -> v
 
-    val mode = *value match
-        Flag(on) -> return Ok(if on then Some("thin") else None)
-        Text(s) -> s
-        Word(s) -> if conf_is_prose(value) then s else ""
-        _ -> ""
+    value.as_bool() match
+        Some(on) -> return Ok(if on then Some("thin") else None)
+        None -> ()
+
+    val mode = if is_prose(value) then text_of(value).unwrap() else ""
 
     if mode == ""
         return Err("'lto' says whether this project is linked with link-time optimization, so it " +
@@ -1217,40 +1264,34 @@ end read_lto
 // The `link` key: `"static"`, `"dynamic"`, or a list of the `pkg_config` names to link statically.
 // **An empty list is dynamic**, naming nothing to link statically. A single name written as a string
 // is the likeliest slip, so its refusal writes the list it meant.
-private read_link(root: &Conf) -> Result[Option[LinkMode], string]
-    val value = conf_at(root, "link") match
+private read_link(root: Value) -> Result[Option[LinkMode], string]
+    val value = root.get("link") match
         None -> return Ok(None)
         Some(v) -> v
 
     val what = "'link' says which libraries are linked from their static archives, so it is " +
         "\"static\", \"dynamic\", or a list of the pkg_config names to link statically"
 
-    *value match
-        Text(s) -> return link_word(s)
-        Word(s) -> if conf_is_prose(value) then return link_word(s)
-        Items(values) ->
-            var names: Buf[string] = buf()
+    if is_prose(value) then return link_word(text_of(value).unwrap())
 
-            for i in 0..<values.len()
-                val item = values.at(i)
+    if value.is_arr()
+        var names: Buf[string] = buf()
 
-                val name = *item match
-                    Text(s) -> s
-                    Word(s) -> s
-                    _ -> ""
+        for item in value.items()
+            val name = text_of(item).unwrap_or("")
 
-                if name.is_empty() || !conf_is_prose(item)
-                    return Err(s"$what — each one a name, written as a string")
+            if name.is_empty() || !is_prose(item)
+                return Err(s"$what — each one a name, written as a string")
 
-                var seen = false
+            var seen = false
 
-                for j in 0..<names.len()
-                    if names.at(j) == name then seen = true
+            for j in 0..<names.len()
+                if names.at(j) == name then seen = true
 
-                if !seen then names.push(name)
+            if !seen then names.push(name)
 
-            return Ok(Some(if names.is_empty() then LinkDynamic else LinkOnly(names)))
-        _ -> ()
+        return Ok(Some(if names.is_empty() then LinkDynamic else LinkOnly(names)))
+    end if
 
     Err(what)
 end read_link
@@ -1274,28 +1315,28 @@ end link_word
 //
 // A `<dependency>/<feature>` member is checked here only for its first half: whether the dependency's
 // manifest declares the feature is answered once that manifest is read, during resolution.
-private read_features(root: &Conf, deps: &Buf[Dependency], dev: &Buf[Dependency],
+private read_features(root: Value, deps: &Buf[Dependency], dev: &Buf[Dependency],
                       warnings: *Buf[string]) -> Result[FeaturesRead, string]
     var out: Buf[(string, Buf[string])] = buf()
     var info: Buf[FeatureInfo] = buf()
     var targets: Buf[FeatureTarget] = buf()
     var long_form = false
 
-    conf_at(root, "features") match
+    root.get("features") match
         None -> ()
         Some(block) ->
-            if !conf_is_block(block)
+            if !block.is_obj()
                 return Err("'features' is not a block — it names each feature and the things that " +
                     "feature turns on, as 'features { server = [llhttp] }'")
 
-            val names = conf_keys(block)
+            val names = block.keys()
 
             for i in 0..<names.len()
-                val entry = conf_at(block, names.at(i)).unwrap()
+                val entry = block.get(names.at(i)).unwrap()
 
                 if names.at(i) == "default" then return Err(default_spelling_refusal(entry))
 
-                if conf_is_block(entry)
+                if entry.is_obj()
                     val one = read_feature_block(names.at(i), entry, warnings)?
 
                     long_form = true
@@ -1305,7 +1346,7 @@ private read_features(root: &Conf, deps: &Buf[Dependency], dev: &Buf[Dependency]
                     for ft in one.targets
                         targets.push(ft)
                 else
-                    conf_list(entry) match
+                    entry.as_text_list() match
                         None -> return Err(not_a_feature_list(s"features.${names.at(i)}"))
                         Some(members) ->
                             out.push((names.at(i), members))
@@ -1508,29 +1549,29 @@ end cycle_from
 // **A key is a path this package's own tree holds**, written with `/` and relative to the package
 // root. It is not a general flags channel — it cannot reach an installed library's headers, add an
 // include path, or pass anything that is not a macro.
-read_defines(root: &Conf) -> Result[Buf[(string, Buf[string])], string]
+read_defines(root: Value) -> Result[Buf[(string, Buf[string])], string]
     var out: Buf[(string, Buf[string])] = buf()
 
-    val block = conf_at(root, "defines") match
+    val block = root.get("defines") match
         None -> return Ok(out)
         Some(found) -> found
 
-    val keys = conf_keys(block)
+    val keys = block.keys()
 
     for key in keys
-        val sub = conf_at(block, key).unwrap()
-        val named = *sub match
-            Block(_) -> conf_keys(sub)
-            _ -> return Err(s"'defines.\"$key\"' is not a block of macros — a key is the C this " +
-                     "package carries and what follows it is what that C is compiled with")
+        val sub = block.get(key).unwrap()
+
+        if !sub.is_obj()
+            return Err(s"'defines.\"$key\"' is not a block of macros — a key is the C this " +
+                       "package carries and what follows it is what that C is compiled with")
 
         var macros: Buf[string] = buf()
-        val ordered = sort_names(named)
+        val ordered = sort_names(sub.keys())
 
         // **Sorted by name**, so the command line a file is compiled with is a function of what the
         // block says rather than of the order somebody happened to write it in.
         for j in 0..<ordered.len()
-            macros.push(macro_of(s"defines.\"$key\"", ordered.at(j), conf_at(sub, ordered.at(j)).unwrap())?)
+            macros.push(macro_of(s"defines.\"$key\"", ordered.at(j), sub.get(ordered.at(j)).unwrap())?)
 
         val paths = expand_alternatives(key)?
 
@@ -1625,20 +1666,22 @@ end split_alternatives
 //
 // `owner` is the block the line sits in as a refusal names it: `defines."c/miniz.c"`, or
 // `c.tinyusb.defines`.
-macro_of(owner: string, name: string, value: &Conf) -> Result[string, string]
+macro_of(owner: string, name: string, value: Value) -> Result[string, string]
     if !macro_name(name) then
         return Err(s"'$owner.$name' is not a name a C macro can have — letters, digits " +
                    "and '_', not starting with a digit")
 
-    *value match
-        Flag(true) -> Ok(name)
-        Flag(false) -> Err(s"'$owner.$name' is false, which does not say which of two " +
-                           "things is meant — leave the line out to not define it, or write '0' " +
-                           "to define it as zero, which '#ifdef' still sees")
-        Text(v) -> Ok(s"$name=$v")
-        Word(v) -> Ok(s"$name=$v")
-        _ -> Err(s"'$owner.$name' must be true or a scalar — a macro is text the C " +
-                 "preprocessor substitutes, so there is nothing a block or a list could mean")
+    value.as_bool() match
+        Some(true) -> return Ok(name)
+        Some(false) -> return Err(s"'$owner.$name' is false, which does not say which of two " +
+                                  "things is meant — leave the line out to not define it, or write '0' " +
+                                  "to define it as zero, which '#ifdef' still sees")
+        None -> ()
+
+    text_of(value) match
+        Some(v) -> Ok(s"$name=$v")
+        None -> Err(s"'$owner.$name' must be true or a scalar — a macro is text the C " +
+                    "preprocessor substitutes, so there is nothing a block or a list could mean")
 end macro_of
 
 // Whether a name is one the C preprocessor could carry.
@@ -1730,18 +1773,18 @@ end defines_for
 // conventionally lives in. **`note` is required and `env` is optional**, which is the way round that
 // keeps the refusal worth reading: a consumer with neither the variable set nor a flag to hand is
 // shown the prose, and a block supplying only a variable name would leave them nothing to look for.
-read_headers(root: &Conf) -> Result[Buf[(string, string, string)], string]
+read_headers(root: Value) -> Result[Buf[(string, string, string)], string]
     var out: Buf[(string, string, string)] = buf()
 
-    val requires = conf_at(root, "requires") match
+    val requires = root.get("requires") match
         None -> return Ok(out)
         Some(block) -> block
 
-    val declared = conf_at(requires, "headers") match
+    val declared = requires.get("headers") match
         None -> return Ok(out)
         Some(block) -> block
 
-    val names = sort_names(conf_keys(declared))
+    val names = sort_names(declared.keys())
 
     for name in names
         if !header_name(name)
@@ -1749,29 +1792,29 @@ read_headers(root: &Conf) -> Result[Buf[(string, string, string)], string]
                 "command line as '--include-path <name>=<dir>', so it must be letters, digits, '_' " +
                 "and '-', starting with a letter")
 
-        val entry = conf_at(declared, name).unwrap()
+        val entry = declared.get(name).unwrap()
         var why = ""
         var env = ""
 
-        if conf_is_block(entry)
-            val keys = conf_keys(entry)
+        if entry.is_obj()
+            val keys = entry.keys()
 
             for j in 0..<keys.len()
                 if keys.at(j) != "note" && keys.at(j) != "env"
                     return Err(s"'requires.headers.$name' has no '${keys.at(j)}' — a headers block " +
                         "takes 'note' and 'env'")
 
-            if conf_at(entry, "note").is_none()
+            if entry.get("note").is_none()
                 return Err(s"'requires.headers.$name' needs a 'note' saying what these headers are " +
                     "and where they come from — it is what a consumer without the variable set is " +
                     "shown")
 
-            why = conf_text(entry, "note")
-            env = conf_text(entry, "env")
-        else if conf_is_prose(entry)
+            why = scalar_text(entry, "note")
+            env = scalar_text(entry, "env")
+        else if is_prose(entry)
             // The short form: the prose written straight against the name, which is what every
             // manifest in the org writes today.
-            why = conf_text(declared, name)
+            why = scalar_text(declared, name)
         else
             return Err(s"'requires.headers.$name' must be a string saying what these headers are " +
                 "and where they come from, or a block with a 'note' and the 'env' the path " +
@@ -1831,18 +1874,18 @@ private is_name_digit(b: u8) -> bool = b >= u8('0') && b <= u8('9')
 // `headers` name is invented by whoever writes the manifest, where a `.pc` name is what the world
 // already files the library under -- `yaml-0.1`, `glib-2.0`, `gtk+-3.0`. What still bounds it is the
 // flag a consumer overrides with, so a name may hold neither a separator nor an `=`.
-read_pkg_config(root: &Conf) -> Result[Buf[(string, string)], string]
+read_pkg_config(root: Value) -> Result[Buf[(string, string)], string]
     var out: Buf[(string, string)] = buf()
 
-    val requires = conf_at(root, "requires") match
+    val requires = root.get("requires") match
         None -> return Ok(out)
         Some(block) -> block
 
-    val mods = conf_at(requires, "pkg_config") match
+    val mods = requires.get("pkg_config") match
         None -> return Ok(out)
         Some(block) -> block
 
-    val names = conf_keys(mods)
+    val names = mods.keys()
 
     for name in names
         if !pkg_config_name(name)
@@ -1850,13 +1893,13 @@ read_pkg_config(root: &Conf) -> Result[Buf[(string, string)], string]
                 "command line as '--include-path <name>=<dir>', so it must be letters, digits, " +
                 "'_', '-', '.' and '+', starting with a letter")
 
-        if !conf_is_prose(conf_at(mods, name).unwrap())
+        if !is_prose(mods.get(name).unwrap())
             return Err(s"'requires.pkg_config.$name' must be a string saying what this library is " +
                 "and how it is installed")
 
         // **The prose is the only part of a refusal nothing in the compiler could have written**,
         // since it is what is quoted back at whoever has to install the library.
-        val why = conf_text(mods, name)
+        val why = scalar_text(mods, name)
 
         if why.trim() == ""
             return Err(s"'requires.pkg_config.$name' says nothing about what it needs — the text " +
@@ -1892,12 +1935,12 @@ private is_letter_byte(b: u8) -> bool =
 // these is refused rather than repaired: a file that names its output was written by somebody
 // expecting an answer, and both silent repairs -- falling back to the directory name, and
 // flattening the separator -- write a different executable and say nothing.
-name_refusal(root: &Conf, name: string) -> string
-    if conf_at(root, "package").is_none() then return ""
+name_refusal(root: Value, name: string) -> string
+    if root.get("package").is_none() then return ""
 
-    val pkg = conf_at(root, "package").unwrap()
+    val pkg = root.get("package").unwrap()
 
-    if conf_at(pkg, "name").is_none() then return ""
+    if pkg.get("name").is_none() then return ""
 
     if name == "" then return "'package.name' is empty"
 
