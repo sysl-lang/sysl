@@ -3536,7 +3536,7 @@ print(1)
 ```
 
 ```error
-'Circle' is read as a function, but a function in an enum body is named in lowercase — a variant that carries data cannot be given a value
+'Circle' is read as a function, but a function in an enum body is named in lowercase — only a payload-free variant may be given a value
 ```
 
 **An underlying type belongs to a simple enum alone.** `: u8` pins the storage of a set of
@@ -3608,7 +3608,8 @@ true idle
 ```
 
 No other variant of a data enum may have a value. A variant that carries data cannot even be
-written with one: `Up(peer: int) = 0` is a header with a body, which makes it a member.
+written with one: `Up(peer: int) = 0` is a capitalised header with a body, and it is refused at its
+name, as a function in an enum body is above.
 
 ```sysl
 enum Link
