@@ -1,0 +1,326 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.Span
+import sysl.buf.{Buf, buf}
+import sysl.container.{Set, set}
+
+// A type with a `Drop` is a reference type.
+//
+// **A destructor runs when a box's count reaches zero**, and a value that is copied has no single
+// point of death to hook. So a type that declares a destructor is held through a `&T` and only so:
+// building one makes the `&T` (`held_by_reference`), and every spelling that would hold one by value
+// -- a binding, a parameter, a result, a field, a payload, module storage, or any of those holding it
+// inside a container, an array, a slice or a tuple -- is refused, with the `&T` to write instead.
+//
+// **A method's `self` is the one value of the type a program still sees**: a call through the
+// reference hands the method a copy, and the reference keeps owning the resource. `drop(self)` is one
+// such method.
+//
+// **A generic is refused at the instantiation, never inside its body**: a call whose type argument
+// holds a `Drop` type by value is refused at the call, naming the parameter and the argument
+// (`expr_generic.sysl`), and a generic type written at one is refused where it is written, as any
+// other spelling is. A body read at type arguments is not asked again, so the complaint is always
+// about something the caller wrote. Binding a parameter to one needs a by-value value of the type in
+// the first place, and the only ones a program has are `self` and a `*r` read out of a reference.
+
+// Whether a type is a struct or an enum whose family has an `impl Drop`.
+has_drop(a: &Analysis, t: Type) -> bool
+    t match
+        Struct(_) -> ()
+        Enum(_) -> ()
+        _ -> return false
+
+    val drop_trait = catalog_key(a, "Drop")
+
+    if drop_trait.is_none() then return false
+
+    !impls_of(a, drop_trait.unwrap(), owner_key(t)).is_empty()
+end has_drop
+
+// The first type with a `Drop` this one holds **by value**, at any depth a value is stored at.
+//
+// **`&T`, `weak T` and `*T` stop the walk**: the first two are the counted form the rule asks for,
+// and a raw pointer owns nothing. Everything else that stores its parts inline -- a struct's or an
+// enum's arguments, an array, a slice's elements, a vector, a tuple, a result list -- is walked
+// through, so `Buf[Encoder]` and `Option[Encoder]` are found as surely as `Encoder` is.
+drop_held(a: &Analysis, t: Type) -> Option[Type] = t match
+    Ref(_, _) -> None
+    Weak(_) -> None
+    Ptr(_) -> None
+    Struct(d) ->
+        if has_drop(a, t) then return Some(t)
+        if is_anonymous_type(d) then return held_in_fields(a, d.fields)
+
+        held_in(a, d.targs)
+    Enum(d) -> if has_drop(a, t) then Some(t) else held_in(a, d.targs)
+    Array(_, e) -> drop_held(a, *e)
+    Slice(e, _) -> drop_held(a, *e)
+    Vector(_, e) -> drop_held(a, *e)
+    Volatile(inner) -> drop_held(a, *inner)
+    Results(parts) -> held_in(a, parts.targs)
+    Pack(elems) -> held_in(a, elems)
+    _ -> None
+
+private held_in(a: &Analysis, ts: Buf[Type]) -> Option[Type]
+    for t in ts
+        val held = drop_held(a, t)
+
+        if held.is_some() then return held
+
+    None
+end held_in
+
+private held_in_fields(a: &Analysis, fields: Buf[(string, Type)]) -> Option[Type]
+    for f in fields
+        val held = drop_held(a, f.1)
+
+        if held.is_some() then return held
+
+    None
+end held_in_fields
+
+// The refusal for one by-value position. `what` says which position and what it does with the
+// value -- `'e' holds`, `'open' hands back` -- and `whole` is the type written there, which is named
+// too where the `Drop` type is inside it.
+drop_value_refusal(what: string, whole: Type, held: Type) -> string
+    val name = type_show(held)
+    val inside = if type_eq(whole, held) then "" else s", inside '${type_show(whole)}',"
+
+    s"$what '$name' by value$inside and '$name' has a 'Drop' — a type with a destructor is a " +
+        s"reference type, and building one makes a '&$name'. Write '&$name' in its place"
+end drop_value_refusal
+
+// A construction of a type with a `Drop`, put behind the counted reference that is the only way to
+// hold one -- `Encoder(…)` is a `&Encoder` wherever it stands.
+//
+// **A position that converts already does it its own way**, and is left to: a `&T` or `&sync T`
+// context boxes at the count it names, a `weak T` one downgrades, and a trait object boxes on its way
+// into the table. **A position that asked for the type by value is left alone as well**, so that the
+// one complaint is the refusal of the spelling that asked, not a mismatch beside it.
+held_by_reference(cx: &Analyzer, t: TExpr, expected: Option[Type]) -> TExpr
+    if !constructs(t) then return t
+
+    val ty = texpr_type(t)
+
+    if !has_drop(cx.an, ty) then return t
+
+    if expected.is_some()
+        val want = expected.unwrap()
+
+        if type_eq(want, ty) || erased(want) then return t
+
+        want match
+            Ref(_, _) -> return t
+            Weak(_) -> return t
+            _ -> ()
+    end if
+
+    TExpr(t.span, TBox(t, Ref(ty, false)))
+end held_by_reference
+
+// Whether boxing this value would box a **copy** of a type with a `Drop` rather than one just built.
+//
+// **A copy is a second owner of the same resource**: a `val r: &Encoder = *other` or a `&Encoder`
+// made from a method's `self` would put the one handle in two boxes, and its destructor would run
+// once for each. Only a construction makes a new resource, so it is the only value that may be
+// boxed. Within a body read at type arguments the question is answered where they were chosen.
+boxes_a_copy(cx: &Analyzer, t: TExpr) -> bool =
+    !passes_on(cx.an, cx.scope, cx.subst) && !constructs(t) && has_drop(cx.an, texpr_type(t)) && !failed(t)
+
+// Whether the body being read **passes on** types somebody else chose, so that a `Drop` type held
+// by value in it was asked about where it was chosen: a body read at type arguments, and anything the
+// library wrote (a trait's default read at the implementing type among them). A method's own `Self`
+// is not such an argument -- the method was written about that one type.
+passes_on(a: &Analysis, scope: Scope, subst: Buf[Binding]) -> bool
+    if from_library(a, scope) then return true
+
+    for b in subst
+        if b.name != "Self" then return true
+
+    false
+end passes_on
+
+private failed(t: TExpr) -> bool = texpr_type(t) == Unknown
+
+copy_box_refusal(t: Type) -> string
+    val name = type_show(t)
+
+    s"this makes a '&$name' out of a copy of a '$name' value, and '$name' has a 'Drop' — the copy would " +
+        s"be a second owner of the resource, and its destructor would run once for each. Only " +
+        s"building one makes a '&$name': hand over the reference that already holds it"
+end copy_box_refusal
+
+private constructs(t: TExpr) -> bool = *t.kind match
+    TStructNew(_, _) -> true
+    TStructInvCheck(_, _, _) -> true
+    TEnumNew(_, _, _) -> true
+    _ -> false
+
+// -- the positions no binding covers -------------------------------------------------------------
+
+// Refuses every by-value position a binding does not reach: a declared result, a field, a payload,
+// module storage, and the parameters of a function no body reached.
+//
+// **A binding is refused where it is bound** (`Analyzer.refuse_drop_binding`), which covers every
+// local, parameter, element and capture of a body that was read -- an instance of a generic body
+// among them, at its own arguments. What is left is declared rather than bound, and it is asked of
+// the declarations, so that a constructor nobody has called yet is still the one told.
+check_drop_values(a: &Analysis, funcs: Buf[TFunc])
+    if catalog_key(a, "Drop").is_none() || drops_declared(a).is_empty() then return
+
+    var told: Set[string] = set()
+    var reached: Set[string] = set()
+
+    for f in funcs
+        reached.add(f.name)
+
+    // **READING A DECLARATION IS NOT MAKING ONE REAL**: resolving a written type registers whatever
+    // named types it names, so the registrations this makes are put back at the end, as the
+    // complaints are put back per declaration.
+    val structs = a.tables.struct_insts.len()
+    val enums = a.tables.enum_insts.len()
+    val constrained = a.tables.constrained_insts.len()
+
+    drop_signatures(a, reached, &told)
+    drop_fields(a, &told)
+    drop_storage(a, &told)
+
+    rewind_registered(a.tables.struct_insts, structs)
+    rewind_registered(a.tables.enum_insts, enums)
+    rewind_registered(a.tables.constrained_insts, constrained)
+end check_drop_values
+
+private told_once(a: &Analysis, told: *Set[string], scope: Scope, at: Span, message: string)
+    val key = s"${at.start}:${at.end}:$message"
+
+    if told.has(key) then return
+
+    told.add(key)
+    a.fault(scope, at, message)
+end told_once
+
+// The result of every declared function, and the parameters of one no body reached. A generic one is
+// asked at each instance instead, where its parameters are types.
+private drop_signatures(a: &Analysis, reached: Set[string], told: *Set[string])
+    val funcs = a.tables.funcs
+
+    for i in 0..<funcs.len()
+        val key = funcs.key_at(i)
+        val f = funcs.at(i)
+
+        if !f.decl.tparams.is_empty() then continue
+
+        if f.decl.ret_type.is_some()
+            val saved = a.complaints()
+            val ty = signature_result(a, f.decl.needs, f.scope, f.decl.ret_type.unwrap(), no_bindings())
+
+            a.restore_complaints(saved)
+
+            drop_held(a, ty) match
+                Some(held) ->
+                    told_once(a, told, f.scope, f.span,
+                              drop_value_refusal(s"'${qualified_name(key)}' hands back", ty, held))
+                None -> ()
+        end if
+
+        if reached.has(key) then continue
+
+        for p in f.decl.params
+            if p.name == "self" then continue
+
+            val saved = a.complaints()
+            val ty = signature_type(a, f.decl.needs, f.scope, p.typ, no_bindings())
+
+            a.restore_complaints(saved)
+
+            drop_held(a, ty) match
+                Some(held) -> told_once(a, told, f.scope, p.span,
+                                        drop_value_refusal(s"'${p.name}' holds", ty, held))
+                None -> ()
+    end for
+end drop_signatures
+
+// Every field of a declared struct and every payload of a declared enum, told at the field. An
+// instance of a generic one is not asked: what it holds by value was written as an argument
+// somewhere a binding, a result or another field spells it, and that is where it is told.
+private drop_fields(a: &Analysis, told: *Set[string])
+    for i in 0..<a.tables.struct_insts.len()
+        a.tables.struct_insts.at(i) match
+            Struct(d) ->
+                // A union's fields are held to the union rule, which refuses a `Drop` type for a
+                // reason of its own (`union_fields.sysl`).
+                if !d.targs.is_empty() || is_anonymous_type(d) || d.union_layout then continue
+
+                val decl = a.tables.types.get(d.base)
+
+                if decl.is_none() then continue
+
+                decl.unwrap().kind match
+                    StructOf(sd) ->
+                        for j in 0..<d.fields.len()
+                            if j >= sd.fields.len() then break
+
+                            val f = d.fields.at(j)
+
+                            drop_held(a, f.1) match
+                                Some(held) ->
+                                    told_once(a, told, decl.unwrap().scope, sd.fields.at(j).span,
+                                              drop_value_refusal(s"field '${f.0}' of " +
+                                                                 s"'${type_show(Struct(d))}' holds", f.1, held))
+                                None -> ()
+                        end for
+                    _ -> ()
+            _ -> ()
+    end for
+
+    for i in 0..<a.tables.enum_insts.len()
+        a.tables.enum_insts.at(i) match
+            Enum(d) ->
+                if !d.targs.is_empty() then continue
+
+                val decl = a.tables.types.get(d.base)
+
+                if decl.is_none() then continue
+
+                decl.unwrap().kind match
+                    EnumOf(ed) ->
+                        for j in 0..<d.variants.len()
+                            if j >= ed.variants.len() then break
+
+                            val v = d.variants.at(j)
+
+                            for k in 0..<v.fields.len()
+                                val f = v.fields.at(k)
+                                val at = if k < ed.variants.at(j).fields.len() then ed.variants.at(j).fields.at(k).span
+                                         else ed.variants.at(j).span
+
+                                drop_held(a, f.1) match
+                                    Some(held) ->
+                                        told_once(a, told, decl.unwrap().scope, at,
+                                                  drop_value_refusal(s"variant '${v.name}' of " +
+                                                                     s"'${type_show(Enum(d))}' carries", f.1, held))
+                                    None -> ()
+                        end for
+                    _ -> ()
+            _ -> ()
+    end for
+end drop_fields
+
+// Module storage whose declared type holds one by value.
+private drop_storage(a: &Analysis, told: *Set[string])
+    for i in 0..<a.tables.vals.len()
+        val v = a.tables.vals.at(i)
+
+        if v.typ.is_none() then continue
+
+        val saved = a.complaints()
+        val ty = resolve_type(a, v.scope, v.typ.unwrap(), no_bindings())
+
+        a.restore_complaints(saved)
+
+        drop_held(a, ty) match
+            Some(held) ->
+                told_once(a, told, v.scope, v.span,
+                          drop_value_refusal(s"'${qualified_name(a.tables.vals.key_at(i))}' holds", ty, held))
+            None -> ()
+end drop_storage

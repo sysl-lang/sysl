@@ -169,16 +169,25 @@ end listed_of
 private a_handle() -> string =
     "struct Handle\n    fd: int\n\nimpl Drop for Handle\n    drop(self) = ()\n\n"
 
-@test("handing back a value whose type has a 'Drop' is warned about")
+@test("handing back a value whose type has a 'Drop' is refused")
 a_drop_type_returned_by_value()
     if checks_no_library() then return
 
-    val w = warned(a_handle() + "open(n: int) -> Handle = Handle(n)\n")
+    val parsed = parse(source_of("test.sysl", a_handle() + "open(n: int) -> Handle = Handle(n)\n"))
+    var units: Buf[Program] = buf()
 
-    assert_eq(w.len(), usize(1), s"warned ${w.len()}")
-    assert_eq(w.at(0), "'open' hands back 'Handle' by value, and 'Handle' has a 'Drop' — a " +
-              "destructor runs when a box's count reaches zero, so nothing here will ever call " +
-              "it. Return '&Handle' instead, or take the resource apart before returning it")
+    for item in checks_library()
+        units.push(item)
+
+    units.push(parsed.program)
+
+    val said = analysis_report(analyze_bodies(units, host_target()).reported)
+
+    assert(said.starts_with("error: 'open' hands back 'Handle' by value and 'Handle' has a 'Drop' — a " +
+                            "type with a destructor is a reference type, and building one makes a " +
+                            "'&Handle'. Write '&Handle' in its place\n"), said)
+    assert_eq(said.count_of("error: "), usize(1), said)
+end a_drop_type_returned_by_value
 
 @test("handing back the boxed form is what the warning asks for, so it says nothing")
 a_drop_type_returned_boxed()

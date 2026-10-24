@@ -2650,6 +2650,71 @@ a bound is a list; a trait-object type names one because it is a type. So a valu
 (`&(Shape + Display)`) would be a second, worse way to say the same thing, since it repeats at every
 use a fact that belongs on the trait.
 
+### An object of a type with a destructor
+
+**A type with a `Drop` is a reference type** ([memory](/reference/memory/#a-type-with-a-destructor-is-a-reference-type)),
+so building one where an object is expected boxes it once, into the object, and the destructor runs
+when the last object goes — exactly once, however it was reached:
+
+```sysl
+trait Shape
+    area(self) -> int
+
+struct Lamp
+    n: int
+
+impl Drop for Lamp
+    drop(self) = print("off", self.n)
+
+impl Shape for Lamp
+    area(self) -> int = self.n * 10
+
+measure(s: &Shape) -> int = s.area()
+
+show()
+    val s: &Shape = Lamp(1)
+
+    print("area", s.area(), measure(Lamp(2)))
+
+show()
+print("done")
+```
+
+```output
+area 10 20
+off 2
+off 1
+done
+```
+
+**What may not go into one is a copy.** `*r` read out of a `&Lamp` is a second value standing for the
+same lamp, and an object made from it would be a second owner, so it is refused as boxing it into a
+`&Lamp` is — hand over the reference itself, which erases without a copy:
+
+```sysl
+trait Shape
+    area(self) -> int
+
+struct Lamp
+    n: int
+
+impl Drop for Lamp
+    drop(self) = print("off", self.n)
+
+impl Shape for Lamp
+    area(self) -> int = self.n * 10
+
+show(r: &Lamp)
+    val s: &Shape = *r
+    print(s.area())
+
+show(Lamp(1))
+```
+
+```error
+this makes a '&Lamp' out of a copy of a 'Lamp' value, and 'Lamp' has a 'Drop'
+```
+
 ### The two sigils do not convert
 
 `*Trait` and `&Trait` are two types, and neither is accepted for the other.

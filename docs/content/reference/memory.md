@@ -3022,7 +3022,7 @@ impl Drop for Handle
     drop(self) = print("closing", self.id)
 
 hold()
-    var h: &Handle = Handle(7)
+    val h = Handle(7)
     print("working")
 
 hold()
@@ -3084,16 +3084,61 @@ a bare-metal target is not asked to answer the hooks that destructor would call.
 may be read to close what it names. It borrows rather than taking a count — the count is already
 zero, and taking one would resurrect the object into a second teardown.
 
-**It is not called for a value that never reached the heap.** A value type is copied, and a copy is
-not a second resource: there is no single point of death to hook, and running it per copy would close
-one descriptor several times. So a destructor is for a type held behind a `&T`, and a program that
-puts one on a type it then passes by value gets no destructor rather than a wrong one.
+**It runs only for a value on the heap, so a type with a destructor is a reference type.** A value
+type is copied, and a copy is not a second resource: there is no single point of death to hook, and
+running it per copy would close one descriptor several times. So the language never lets a program
+hold one by value — the next section is what that means to write.
 
-### A constructor for a type with a destructor returns `&T`
+### A type with a destructor is a reference type
 
-The paragraph above is a rule about where a destructor runs. This is the same rule said as the
-consequence somebody writing a binding actually meets, because that is the form of it that is worth
-having:
+**Building one makes a `&T`, with nothing written.** `Thing(1)` is a `&Thing` wherever it stands — an
+inferred local, a temporary, a branch, a field, a container's element, an `Ok` — so the destructor
+always has a count to hang off:
+
+```sysl
+import sysl.buf.{Buf, buf}
+
+struct Thing
+    n: int
+
+impl Drop for Thing
+    drop(self) = print("drop", self.n)
+
+struct Holder
+    inner: &Thing
+
+open(n: int) -> Result[&Thing, string] = Ok(Thing(n))
+
+hold()
+    val a = Thing(1)
+    val h = Holder(Thing(2))
+    var all: Buf[&Thing] = buf()
+
+    all.push(Thing(3))
+    all.push(open(4).unwrap())
+    print("holding", a.n, h.inner.n, all.len())
+
+hold()
+print("done")
+```
+
+```output
+holding 1 2 2
+drop 4
+drop 3
+drop 2
+drop 1
+done
+```
+
+A position that names the count keeps it: `val t: &sync Thing = Thing(1)` builds an atomically counted
+one, and a trait object — `val s: &Shape = Thing(1)` — boxes on its way into the table, as it does for
+any value.
+
+**Every spelling that would hold one by value is refused**, with the `&T` to write in its place: a
+binding, a parameter, a result, a field, an enum payload, module storage, and any of those holding it
+inside a `Buf`, an `Option`, an array, a slice or a tuple. The constructor that hands one back is the
+case that looks most innocent, and is told even when nothing calls it yet:
 
 ```sysl
 struct Encoder
@@ -3102,35 +3147,17 @@ struct Encoder
 impl Drop for Encoder
     drop(self) = print("closing")
 
-open_bad() -> Result[Encoder, string] = Ok(Encoder(null))    // the destructor never runs
-open_good() -> Result[&Encoder, string] = Ok(Encoder(null))  // it does
+open() -> Result[Encoder, string] = Ok(Encoder(null))
+
+print("ready")
 ```
 
-**Nothing about the first line looks wrong**, which is why this is stated rather than left to be
-derived. The `impl Drop` is right there, the resource is handled as far as any reader can see, and
-the program is correct in every respect but the one nobody checks. A binding shipped that way
-compresses, parses and queries perfectly while leaking a handle per call.
-
-**The compiler says so now**, which is its only warning that carries a position:
-
-```
-warning: 'open_bad' hands back 'Encoder' by value, and 'Encoder' has a 'Drop' — a destructor runs
-when a box's count reaches zero, so nothing here will ever call it. Return '&Encoder' instead, or
-take the resource apart before returning it
+```error
+'open' hands back 'Encoder' by value, inside 'sysl.Result[Encoder, string]', and 'Encoder' has a 'Drop' — a type with a destructor is a reference type, and building one makes a '&Encoder'. Write '&Encoder' in its place
 ```
 
-**A type annotation at the call site is not a fix**, and it looks like one. `val e: &Encoder =
-open_bad()?` compiles whichever way the constructor is declared, because reading a value into a `&T`
-binding boxes a *copy* — so the defensive move leaks exactly as much as no move at all. The
-declaration is what has to change.
-
-**And an error path needs closing by hand.** Where a C call hands back a handle *and* fails — a
-refused connection whose connection object still has to be freed — the `Result` is an `Err`, no value
-ever owns the handle, and no box is ever made for a destructor to hang off. Read what you need from
-it and close it where it stands.
-
-**Boxing the *holder* does not save a field held by value**, which is the same mistake one level in
-and reads more convincingly than the last one:
+**The rule is the type at every level that owns a resource, not the outermost one**, so a field is
+asked as surely as a result is:
 
 ```sysl
 struct Thing
@@ -3140,35 +3167,59 @@ impl Drop for Thing
     drop(self) = print("drop", self.n)
 
 struct ByValue
-    inner: Thing        // no destructor ever runs
+    inner: Thing
 
-struct Boxed
-    inner: &Thing       // it runs when the holder dies
-
-hold()
-    val a: &ByValue = ByValue(Thing(1))
-    val b: &Boxed = Boxed(Thing(2))
-
-hold()
+print("ready")
 ```
 
-```output
-drop 2
+```error
+field 'inner' of 'ByValue' holds 'Thing' by value and 'Thing' has a 'Drop' — a type with a destructor is a reference type, and building one makes a '&Thing'. Write '&Thing' in its place
 ```
 
-The `ByValue` holder really is on the heap and its count really does reach zero — and the `Thing`
-inside it is a copy in that box, not a box of its own, so there is nothing whose count could reach
-zero for it. **The rule is the type at every level that owns a resource, not the outermost one**, and
-*"I boxed it"* settles the question for the holder alone.
+**A copy is never made into a second owner.** The one by-value value of the type a program still
+sees is a copy — a method's `self`, or `*r` read out of a reference. It may be read, and a method may
+take it, but it may not be boxed: a `&Thing` made from it would put the one resource in two boxes,
+and its destructor would run once for each:
 
-**A container is the same shape.** A `Buf[Thing]` destructs nothing whatever happens to it; a
-`Buf[&Thing]` destructs each element when the buffer dies. The compiler's warning sees none of these
-— it reads declared return types — so a field and a container are the two places to check by hand.
+```sysl
+struct Thing
+    n: int
+
+impl Drop for Thing
+    drop(self) = print("drop", self.n)
+
+hold(r: &Thing)
+    val c: &Thing = *r
+    print(c.n)
+
+hold(Thing(1))
+```
+
+```error
+this makes a '&Thing' out of a copy of a 'Thing' value, and 'Thing' has a 'Drop' — the copy would be a second owner of the resource, and its destructor would run once for each. Only building one makes a '&Thing': hand over the reference that already holds it
+```
+
+**A generic is asked at the instantiation.** `id[T](x: T) -> T` called with `*r` binds `T` to the
+type by value, and the call is refused naming the parameter — `'id' binds its 'T' to 'Thing' by
+value…` — rather than anything inside `id`, which the caller did not write. Called with the
+reference, `T` is `&Thing` and nothing is asked.
+
+**`@consumes` is unchanged**, and there is no use-after-move: a `&T` is shared and counted exactly as
+every other reference is.
+
+**A destructor needs an allocator**, since building one is an allocation: a `@no_alloc` module that
+builds one is refused with `a reference needs an allocator`, and on a bare-metal target the box comes
+from the target's `malloc` like any other. Where there is no allocator, `defer` is the tool.
+
+**An error path needs closing by hand.** Where a C call hands back a handle *and* fails — a refused
+connection whose connection object still has to be freed — the `Result` is an `Err`, no value ever
+owns the handle, and no box is ever made for a destructor to hang off. Read what you need from it and
+close it where it stands.
 
 **A handle that hands out a second value does NOT need a second type, and reaching for one is the
 mistake this paragraph exists to head off.** A method taking `self` has a copy and cannot name the box
 it was called through, so building a value around the same resource there would hand out a second
-*owner* and the destructor would run twice. The obvious escape is to split the type — a private
+*owner* and the destructor would run twice — boxing `self` itself is refused for that reason. The obvious escape is to split the type — a private
 handle carrying the `Drop`, and a copyable value holding a `&` to it — and it works, and it is
 unnecessary: [a `&self` method](/reference/declarations/#a-self-method-may-keep-what-it-was-called-on)
 is handed the box itself, so the value it constructs takes a share rather than a second owner. One

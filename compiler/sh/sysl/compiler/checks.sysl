@@ -19,7 +19,7 @@ whole_program_checks(a: &Analysis, units: Buf[Program], funcs: Buf[TFunc], vals:
     check_conventions(a)
     check_exports(a)
     check_doc_comments(a, units)
-    check_drop_returns(a)
+    check_drop_values(a, funcs)
     check_ghost(a, funcs)
     check_module_graph(a)
     check_target_refusals(a, funcs)
@@ -418,7 +418,7 @@ walk_block_stmts(b: TBlock, v: &TWalk)
     if b.result.is_some() then walk_texpr(b.result.unwrap(), v)
 end walk_block_stmts
 
-// -- a value with a destructor, handed back by value ---------------------------------------------
+// -- the types with a destructor -----------------------------------------------------------------
 
 // The types this compilation declared a destructor for, by the key their members are filed under.
 //
@@ -454,93 +454,6 @@ end member_split
 
 private member_owner_of(key: string) -> string = member_split(key).0
 private member_filed_as(key: string) -> string = member_split(key).1
-
-// Warns about every declaration that hands back a value whose type has a destructor.
-//
-// **A destructor runs when a box's count reaches zero**, so a value handed back by value has nothing
-// that will ever call it. Returning one stays legal -- a caller may take the value apart, or hand it
-// straight into something that boxes it -- which is why this is a warning: what the compiler can see
-// is that the usual reading of the declaration is wrong.
-//
-// The check is over what a program **declared** rather than over what it instantiated, so that a
-// constructor nobody has called yet is exactly the one told.
-private check_drop_returns(a: &Analysis)
-    val drops = drops_declared(a)
-
-    if drops.is_empty() then return
-
-    val funcs = a.tables.funcs
-
-    // **READING A DECLARATION IS NOT MAKING ONE REAL, AND THIS READS EVERY DECLARATION THERE IS.**
-    // Resolving a written type registers whatever named types it names, so asking this question of
-    // `spawn[T](…) -> Option[Thread]` recorded an `Option[Thread]` in a program that never starts a
-    // thread — and only in a program that declares a `Drop`, since that is what makes this check
-    // run at all. The complaints are already put back per declaration; the registrations are put
-    // back here, on the same terms.
-    val structs = a.tables.struct_insts.len()
-    val enums = a.tables.enum_insts.len()
-    val constrained = a.tables.constrained_insts.len()
-
-    for i in 0..<funcs.len()
-        val key = funcs.key_at(i)
-
-        // The `drop` a `Drop` block declares takes `self` by value and answers `unit`, so it never
-        // trips this; and the block itself is not the place to complain about a member of the
-        // dropping type that legitimately hands one back.
-        if module_bare(key) != "drop" && !key.ends_with(".drop")
-            val f = funcs.at(i)
-
-            if f.decl.ret_type.is_some()
-                val saved = a.complaints()
-                val ty = signature_result(a, f.decl.needs, f.scope, f.decl.ret_type.unwrap(),
-                                          no_bindings())
-
-                a.restore_complaints(saved)
-
-                val held = drop_by_value(drops, ty)
-
-                if held.is_some() then
-                    val name = module_bare(held.unwrap())
-
-                    a.caution(f.scope, f.span, s"'${qualified_name(key)}' hands back " +
-                              s"'${qualified_name(held.unwrap())}' by value, and " +
-                              s"'${qualified_name(held.unwrap())}' has a 'Drop' — a destructor runs " +
-                              "when a box's count reaches zero, so nothing here will ever call " +
-                              s"it. Return '&$name' instead, or take the resource apart before " +
-                              "returning it")
-
-    rewind_registered(a.tables.struct_insts, structs)
-    rewind_registered(a.tables.enum_insts, enums)
-    rewind_registered(a.tables.constrained_insts, constrained)
-end check_drop_returns
-
-// The first type carried **by value** in this one that declares a destructor.
-//
-// **`&T` and `*T` both stop the walk, for opposite reasons.** A `&T` is the boxed form, which is the
-// whole answer the warning asks for; a raw pointer owns nothing and never did, so a binding handing
-// one back is making no claim about who frees it. A slice and an array stop it too: their elements
-// are not destructed either, which is a real question and a different one.
-private drop_by_value(drops: Buf[string], t: Type) -> Option[string] = t match
-    Ref(_, _) -> None
-    Ptr(_) -> None
-    Weak(_) -> None
-    Slice(_, _) -> None
-    Array(_, _) -> None
-    Struct(d) -> drops_or_args(drops, d.base, d.targs)
-    Enum(d) -> drops_or_args(drops, d.base, d.targs)
-    Volatile(inner) -> drop_by_value(drops, *inner)
-    _ -> None
-
-private drops_or_args(drops: Buf[string], base: string, targs: Buf[Type]) -> Option[string]
-    if holds_string(drops, base) then return Some(base)
-
-    for targ in targs
-        val held = drop_by_value(drops, targ)
-
-        if held.is_some() then return held
-
-    None
-end drops_or_args
 
 // -- a calling convention, and what a processor makes of it ---------------------------------------
 

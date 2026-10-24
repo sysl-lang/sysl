@@ -1,0 +1,383 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+import sysl.fs.{is_file, remove_dir_all}
+import sysl.process.capture
+
+// A type with a `Drop` is a reference type (`reference/memory.md § A destructor`,
+// `drop_values.sysl`): building one makes a `&T` with nothing written, and every spelling that would
+// hold one by value is refused with the `&T` to write.
+//
+// The axes these cross: **the position** (a local, an inferred local, a parameter reached and not,
+// a result, a field, a payload, module storage, a closure's parameter) × **the depth** (the type
+// itself, inside `Buf`, `Option`, an array, a slice, a tuple) × **how a copy is made** (`*r`, a
+// method's `self`, a generic call) × **where a construction lands** (an inferred local, a temporary,
+// a branch, a field, a container, an `Option`, a trait object, a `&sync`, a generic, a call at its
+// last use) × **the build** (one file, a library root's compiled artifact, a bare Thumb archive,
+// `@no_alloc`).
+//
+// Skipped, with the reason: a nested function's parameter (bound through the same `Analyzer.bind` a
+// closure's is, which is asked); a codegen-unit split (the refusal is analysis, and the boxing is the
+// existing `TBox` every `&T` construction already lowers through); a field of a generic struct
+// declared at a concrete `Drop` type (`struct G[T]` holding an `Enc` by value) -- its instances are
+// not asked, and a non-generic declaration is.
+
+private val dvr_enc: string = raw"""
+    import sysl.buf.{Buf, buf}
+
+    struct Enc
+        id: int
+
+    impl Drop for Enc
+        drop(self) = print("drop", self.id)
+
+    """
+
+// The refusal for one position, as `drop_value_refusal` words it.
+private dvr_said(what: string, name: string) -> string =
+    s"$what '$name' by value and '$name' has a 'Drop' — a type with a destructor is a reference " +
+        s"type, and building one makes a '&$name'. Write '&$name' in its place"
+
+private dvr_said_in(what: string, name: string, whole: string) -> string =
+    s"$what '$name' by value, inside '$whole', and '$name' has a 'Drop' — a type with a destructor " +
+        s"is a reference type, and building one makes a '&$name'. Write '&$name' in its place"
+
+private dvr_copy(name: string) -> string =
+    s"this makes a '&$name' out of a copy of a '$name' value, and '$name' has a 'Drop' — the copy would " +
+        s"be a second owner of the resource, and its destructor would run once for each. Only " +
+        s"building one makes a '&$name': hand over the reference that already holds it"
+
+// What building `text` as one file says, or what the program it makes prints.
+private dvr_run(text: string) -> string
+    val prog = lbr_program(dvr_enc + text)
+    val out = lbr_run(prog, [])
+
+    lbr_drop([prog])
+    out
+end dvr_run
+
+// Asserts the program is refused, saying `message` exactly once.
+private dvr_refused(text: string, message: string)
+    if !lbr_ready() then return
+
+    val out = dvr_run(text)
+
+    assert(out.starts_with("refused: "), out)
+    assert_eq(out.count_of(message), usize(1), out)
+end dvr_refused
+
+// The program built with counting on and run: what it printed, and what the heap said at exit.
+private dvr_counted(text: string, libs: []string) -> (string, string)
+    val prog = lbr_program(text)
+    val out_dir = lbr_temp("sysl-dvr-exe")
+
+    lbr_hand(libs)
+    force_alloc_counting(true)
+
+    val built = build_native_program(prog, None, None, DefaultOptimization, Some(s"$out_dir/program"))
+
+    force_alloc_counting(false)
+    reset_search_paths()
+
+    val said = built match
+        Err(why) -> (failure_text(why), "")
+        Ok(made) ->
+            capture(made, [], "", [], true) match
+                Err(_) -> ("could not be started", "")
+                Ok(o) -> (o.text, o.err.unwrap_or(""))
+
+    lbr_drop([prog, out_dir])
+    said
+end dvr_counted
+
+// -- every by-value position, refused ------------------------------------------------------------
+
+@test("a local written at a Drop type by value is refused")
+dvr_local_written()
+    dvr_refused("hold()\n    val a: Enc = Enc(1)\n    print(a.id)\n\nhold()\n", dvr_said("'a' holds", "Enc"))
+
+@test("a local inferred from a dereference is refused, since it holds a copy")
+dvr_local_inferred()
+    dvr_refused("hold(r: &Enc)\n    val b = *r\n    print(b.id)\n\nhold(Enc(1))\n",
+                dvr_said("'b' holds", "Enc"))
+
+@test("a parameter of a reached function is refused, once")
+dvr_param_reached()
+    dvr_refused("take(e: Enc) = print(e.id)\n\ntake(Enc(1))\n", dvr_said("'e' holds", "Enc"))
+
+@test("a parameter of a function no body reaches is refused too")
+dvr_param_unreached()
+    dvr_refused("take(e: Enc, n: int) -> int = n\n\nprint(1)\n", dvr_said("'e' holds", "Enc"))
+
+@test("a result is refused, the constructor nobody called among them")
+dvr_result()
+    dvr_refused("make(n: int) -> Enc = Enc(n)\n\nprint(1)\n", dvr_said("'make' hands back", "Enc"))
+
+@test("a result holding one inside a tuple is refused, naming the tuple")
+dvr_result_tuple()
+    dvr_refused("pair(n: int) -> (int, Enc) = (n, Enc(n))\n\nprint(1)\n",
+                dvr_said_in("'pair' hands back", "Enc", "(int, Enc)"))
+
+@test("a field is refused at the field")
+dvr_field()
+    dvr_refused("struct ByValue\n    inner: Enc\n\nprint(1)\n",
+                dvr_said("field 'inner' of 'ByValue' holds", "Enc"))
+
+@test("an enum payload is refused at the payload")
+dvr_payload()
+    dvr_refused("enum Slot\n    Empty\n    Full(e: Enc)\n\nprint(1)\n",
+                dvr_said("variant 'Full' of 'Slot' carries", "Enc"))
+
+@test("module storage is refused")
+dvr_module_val()
+    dvr_refused("val g: Enc = Enc(0)\n\nprint(g.id)\n", dvr_said("'g' holds", "Enc"))
+
+@test("a buffer of them by value is refused, naming the buffer")
+dvr_buf_param()
+    dvr_refused("count(xs: Buf[Enc]) -> usize = xs.len()\n\nprint(1)\n",
+                dvr_said_in("'xs' holds", "Enc", "sysl.buf.Buf[Enc]"))
+
+@test("a generic call that would make a buffer of them by value is refused at the call")
+dvr_buf_call()
+    dvr_refused("hold()\n    var xs: Buf[Enc] = buf()\n    print(xs.len())\n\nhold()\n",
+                dvr_said("'sysl.buf.buf' binds its 'T' to", "Enc"))
+
+@test("an Option of one by value is refused")
+dvr_option()
+    dvr_refused("hold()\n    val o: Option[Enc] = None\n    print(o.is_none())\n\nhold()\n",
+                dvr_said_in("'o' holds", "Enc", "sysl.Option[Enc]"))
+
+@test("an array of them is refused")
+dvr_array()
+    dvr_refused("hold()\n    val arr: [2]Enc = [Enc(1), Enc(2)]\n    print(arr.len)\n\nhold()\n",
+                dvr_said_in("'arr' holds", "Enc", "[2]Enc"))
+
+@test("a slice of them is refused")
+dvr_slice()
+    dvr_refused("count(xs: []Enc) -> usize = xs.len\n\nprint(1)\n",
+                dvr_said_in("'xs' holds", "Enc", "[]Enc"))
+
+@test("a closure's parameter is refused")
+dvr_closure_param()
+    dvr_refused("hold()\n    val f = (e: Enc) -> e.id\n    print(1)\n\nhold()\n", dvr_said("'e' holds", "Enc"))
+
+@test("a generic function bound to one by value is refused at the call, naming the parameter")
+dvr_generic_call()
+    dvr_refused("id[T](x: T) -> T = x\n\nhold(r: &Enc)\n    print(id(*r).id)\n\nhold(Enc(1))\n",
+                dvr_said("'id' binds its 'T' to", "Enc"))
+
+@test("a reference made from a dereferenced copy is refused, since it would be a second owner")
+dvr_box_a_copy()
+    dvr_refused("hold(r: &Enc)\n    val c: &Enc = *r\n    print(c.id)\n\nhold(Enc(1))\n", dvr_copy("Enc"))
+
+@test("a reference made from a method's self is refused the same way")
+dvr_box_self()
+    dvr_refused("impl Enc\n    again(self) -> &Enc = self\n\nprint(Enc(1).again().id)\n", dvr_copy("Enc"))
+
+@test("a trait object made from a copy is refused the same way")
+dvr_erase_a_copy()
+    val text = "trait Shape\n    area(self) -> int\n\nimpl Shape for Enc\n    area(self) -> int = self.id\n\n" +
+               "hold(r: &Enc)\n    val s: &Shape = *r\n    print(s.area())\n\nhold(Enc(1))\n"
+
+    dvr_refused(text, dvr_copy("Enc"))
+end dvr_erase_a_copy
+
+@test("@consumes on a member of a Drop type still refuses the read after it")
+dvr_consumes_refused()
+    val text = "impl Enc\n    @consumes\n    finish(self) -> int = self.id\n\n" +
+               "hold()\n    val e = Enc(5)\n    print(e.finish())\n    print(e.id)\n\nhold()\n"
+
+    dvr_refused(text, "'e' is read here after 'e.finish()' took everything it held")
+end dvr_consumes_refused
+
+@test("a @no_alloc module may not build one, since building one makes a reference")
+dvr_no_alloc()
+    if !lbr_ready() then return
+
+    val prog = lbr_program("@no_alloc\n\nstruct Pin\n    n: int\n\nimpl Drop for Pin\n    drop(self) = ()\n\n" +
+                           "@export(\"probe_main\")\nprobe_main(n: int) -> int\n    val p = Pin(n)\n    p.n + 1\n")
+    val out = lbr_run(prog, [])
+
+    lbr_drop([prog])
+    assert(out.contains("a reference needs an allocator, and this module declared '@no_alloc'"), out)
+end dvr_no_alloc
+
+// -- a construction is a reference, and its destructor runs once ---------------------------------
+
+private val dvr_held: string = raw"""
+    trait Shape
+        area(self) -> int
+
+    impl Shape for Enc
+        area(self) -> int = self.id * 10
+
+    impl Enc
+        show(self) = print("enc", self.id)
+
+        @consumes
+        finish(self) -> int = self.id
+
+    struct Holder
+        inner: &Enc
+
+    open(n: int) -> &Enc = Enc(n)
+
+    first[T](xs: Buf[T]) -> T = xs.at(0)
+
+    area_of(s: &Shape) -> int = s.area()
+
+    pick(c: bool)
+        val e = if c then Enc(10) else Enc(11)
+        e.show()
+
+    hold()
+        val a = Enc(1)
+        a.show()
+        Enc(2).show()
+        pick(false)
+        var xs: Buf[&Enc] = buf()
+        xs.push(Enc(3))
+        xs.push(open(4))
+        print("first", first(xs).id)
+        val h = Holder(Enc(5))
+        val o: Option[&Enc] = Some(Enc(6))
+        val s: &Shape = Enc(7)
+        print("area", s.area(), area_of(Enc(8)))
+        val z: &sync Enc = Enc(9)
+        val e = Enc(12)
+        print("finish", e.finish(), h.inner.id, o.unwrap().id, z.id)
+        print("end of hold")
+
+    hold()
+    print("done")
+    """
+
+@test("every construction is a reference, each destructor runs once, and the counted heap ends at nothing live")
+dvr_constructions_counted()
+    if !lbr_ready() then return
+
+    val ran = dvr_counted(dvr_enc + dvr_held, [])
+
+    assert_eq(ran.0, "enc 1\nenc 2\ndrop 2\nenc 11\ndrop 11\nfirst 3\narea 70 80\ndrop 8\n" +
+              "finish 12 5 6 9\nend of hold\ndrop 12\ndrop 9\ndrop 7\ndrop 6\ndrop 5\ndrop 4\ndrop 3\n" +
+              "drop 1\ndone\n")
+    assert(!ran.1.contains("still live"), ran.1)
+end dvr_constructions_counted
+
+@test("an inferred construction handed to a keeping call at its last use drops when the result does")
+dvr_last_use()
+    if !lbr_ready() then return
+
+    val text = raw"""
+        struct Label
+            tag: &Enc
+
+        label(t: &Enc) -> Label = Label(t)
+
+        show()
+            val t = Enc(1)
+
+            print("label", label(t).tag.id)
+            print("end of show")
+
+        show()
+        """
+    val ran = dvr_counted(dvr_enc + text, [])
+
+    assert_eq(ran.0, "label 1\ndrop 1\nend of show\n")
+    assert(!ran.1.contains("still live"), ran.1)
+end dvr_last_use
+
+// -- across a separately compiled library --------------------------------------------------------
+
+private val dvr_demo: string = raw"""
+    module demo
+
+    struct Enc
+        id: int
+
+    impl Drop for Enc
+        drop(self) = print("drop", self.id)
+
+    open(n: int) -> &Enc = Enc(n)
+    """
+
+@test("a Drop type a library root declares is a reference when the program builds one, and drops once")
+dvr_library_counted()
+    if !lbr_ready() then return
+
+    val lib = lbr_tree(lbr_one("demo/demo.sysl", dvr_demo))
+    val cache = lbr_temp("sysl-dvr-cache")
+
+    use_root_cache_dir(Some(cache))
+    use_c_object_cache_dir(Some(cache))
+
+    val ran = dvr_counted("import demo.*\n\nhold()\n    val a = open(1)\n    val b = Enc(2)\n" +
+                          "    print(a.id, b.id)\n\nhold()\nprint(\"done\")\n", [lib])
+
+    use_root_cache_dir(None)
+    use_c_object_cache_dir(None)
+    lbr_drop([lib, cache])
+    assert_eq(ran.0, "1 2\ndrop 2\ndrop 1\ndone\n")
+    assert(!ran.1.contains("still live"), ran.1)
+end dvr_library_counted
+
+@test("a program built against a library root is refused for holding the library's Drop type by value")
+dvr_library_refused()
+    if !lbr_ready() then return
+
+    val lib = lbr_tree(lbr_one("demo/demo.sysl", dvr_demo))
+    val prog = lbr_program("import demo.*\n\nhold()\n    val a: Enc = Enc(1)\n    print(a.id)\n\nhold()\n")
+    val out = lbr_run(prog, [lib])
+
+    lbr_drop([lib, prog])
+    assert(out.starts_with("refused: "), out)
+    assert_eq(out.count_of(dvr_said("'a' holds", "demo.Enc")), usize(1), out)
+end dvr_library_refused
+
+// -- a bare Thumb archive ------------------------------------------------------------------------
+
+@test("a bare Thumb archive builds a Drop type through the allocator and calls its destructor")
+dvr_thumb()
+    if !lbr_ready() then return
+
+    val root = lbr_project(lbr_one("main.sysl", raw"""
+        struct Pin
+            n: int
+
+        extern release_pin(n: int)
+
+        impl Drop for Pin
+            drop(self) = release_pin(self.n)
+
+        @export("probe_main")
+        probe_main(n: int) -> int
+            val p = Pin(n)
+            p.n + 1
+        """))
+    val archive = s"$root/probe.a"
+    var said: Buf[string] = buf()
+    val sink = &said
+    var args: [7]string = ["sysl", "build-c", "--target", "thumb-freestanding-softfp", "-o", archive, root]
+    val code = run_cli(args[..], piece -> sink.push(piece))
+
+    assert_eq(code, 0, if said.is_empty() then "" else said.at(0))
+
+    val candidates: [2]string = ["/opt/homebrew/opt/llvm/bin/llvm-nm", "/usr/local/opt/llvm/bin/llvm-nm"]
+    var nm = ""
+
+    for i in 0..<candidates.len
+        if nm == "" && is_file(candidates[i]) then nm = candidates[i]
+
+    if nm != ""
+        val listed = capture(nm, ["--undefined-only", archive], "", [], true).unwrap()
+
+        assert(listed.text.contains("malloc"), listed.text)
+        assert(listed.text.contains("free"), listed.text)
+        assert(listed.text.contains("release_pin"), listed.text)
+    end if
+
+    remove_dir_all(root).unwrap_or(())
+end dvr_thumb

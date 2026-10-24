@@ -602,12 +602,11 @@ ceremony the language charges. A struct with no fields is the exception and **mu
 
 **Memory.**
 
-- **A constructor for a type with a destructor returns `&T`, or the destructor never runs.** A plain
-  value is copied rather than owned, so an `impl Drop` on a type nobody boxes is dead code that looks
-  exactly like resource management. It is the type at **each** level, not the outermost:
-  `Buf[&Thing]` and a `&Thing` field run one; `Buf[Thing]` and a `Thing` field do not, and boxing the
-  holder does not save a by-value field. On an **error** path no value owns the handle and no box is
-  made, so read what you need and close it where it stands.
+- **A type with a destructor is a reference type.** Building one makes a `&Thing` with nothing
+  written, and every by-value spelling — a binding, parameter, result, field, payload, module storage,
+  `Buf[Thing]`, `Option[Thing]`, `[N]Thing` — is refused with the `&Thing` to write. A copy (`self`,
+  `*r`) may be read but never boxed into a second owner. On an **error** path no value owns the handle
+  and no box is made, so read what you need and close it where it stands.
 - A method that hands C the address of caller-placed storage takes `*self`; one that must outlive
   the call in something it built takes `&self`; a read-only accessor may take `self`.
 - Use a `weak T` for the edge back to a parent, or counting cannot collect the cycle.

@@ -5,14 +5,9 @@ import sysl.buf.{Buf, buf}
 import sysl.text.Search
 import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
 
-// The warning about a declaration handing back a type with a `Drop` by value, said where somebody
-// can see it: on the command line (`reference/memory.md § A constructor for a type with a destructor
-// returns &T`). The analysis has raised it all along; these hold the commands to printing it.
-//
-// **Every rendering quoted was read out of the reference** (`sysl` 0.0.162) on the same programs:
-// `run`, `build` and `emit-llvm` print each warning on standard error, one under the next with no
-// blank line between, on every compilation that succeeds; a compilation that fails says only its
-// errors.
+// The refusal of a declaration handing back a type with a `Drop` by value, said where somebody can
+// see it: on the command line (`reference/memory.md § A type with a destructor is a reference
+// type`). `run`, `build` and `emit-llvm` print it on standard error, at the declaration, and fail.
 
 // What one command line came to: the status, each line said on the output channel, each note, and
 // the file the program was written to. The directory is removed. `None` without the library.
@@ -52,7 +47,7 @@ end drw_run
 private drw_encoder() -> string =
     "struct Encoder\n    state: *u8\n\nimpl Drop for Encoder\n    drop(self) = print(\"closing\")\n\n"
 
-private drw_bad() -> string = "open_bad() -> Result[Encoder, string] = Ok(Encoder(null))"
+private drw_bad() -> string = "open_bad() -> Encoder = Encoder(null)"
 
 private drw_good() -> string = "open_good() -> Result[&Encoder, string] = Ok(Encoder(null))"
 
@@ -65,40 +60,43 @@ private drw_carets(n: usize) -> string
     out
 end drw_carets
 
-// The whole report the reference prints for `open_bad` on line 7 of `file`.
+// The whole report for `open_bad` on line 7 of `file`.
 private drw_open_bad_report(file: string) -> string =
-    "warning: 'open_bad' hands back 'Encoder' by value, and 'Encoder' has a 'Drop' — a destructor " +
-    "runs when a box's count reaches zero, so nothing here will ever call it. Return '&Encoder' " +
-    "instead, or take the resource apart before returning it\n" +
-    s" --> $file:7:1\n  |\n7 | ${drw_bad()}\n  | ${drw_carets(drw_bad().bytes.len)}"
+    "error: 'open_bad' hands back 'Encoder' by value and 'Encoder' has a 'Drop' — a type with a " +
+    "destructor is a reference type, and building one makes a '&Encoder'. Write '&Encoder' in its " +
+    "place\n" + s" --> $file:7:1\n  |\n7 | ${drw_bad()}\n  | ${drw_carets(drw_bad().bytes.len)}"
 
-@test("emit-llvm prints the page's warning on standard error, and the text on standard output")
-drw_emit_llvm_says_the_pages_warning()
+// Every note joined, since a report may be said in more than one piece.
+private drw_said(notes: Buf[string]) -> string
+    var out = ""
+
+    for item in notes
+        out = out + item + "\n"
+
+    out
+end drw_said
+
+@test("emit-llvm refuses the program, saying the page's refusal at the declaration")
+drw_emit_llvm_says_the_refusal()
     drw_run("emit-llvm", drw_encoder() + drw_bad() + "\n" + drw_good() + "\nprint(1)\n") match
         None -> ()
-        Some((code, lines, notes, file)) ->
-            assert_eq(code, Fine)
-            assert_eq(notes.len(), usize(1), s"noted ${notes.len()}")
-            assert_eq(notes.at(0), drw_open_bad_report(file))
-            assert(lines.at(0).starts_with("target triple"), lines.at(0))
-end drw_emit_llvm_says_the_pages_warning
+        Some((code, _, notes, file)) ->
+            assert(code != Fine, "the program is refused")
 
-@test("a build that warns still builds, and says the warning")
-drw_build_says_the_warning()
+            val said = drw_said(notes)
+
+            assert(said.contains(drw_open_bad_report(file)), said)
+            assert_eq(said.count_of("error: "), usize(1), said)
+end drw_emit_llvm_says_the_refusal
+
+@test("a build refuses it and says the same")
+drw_build_says_the_refusal()
     drw_run("build", drw_encoder() + drw_bad() + "\n" + drw_good() + "\nprint(1)\n") match
         None -> ()
         Some((code, _, notes, file)) ->
-            assert_eq(code, Fine)
-
-            // A build may say other things on the same channel; the warning is said once.
-            var warned: Buf[string] = buf()
-
-            for item in notes
-                if item.starts_with("warning:") then warned.push(item)
-
-            assert_eq(warned.len(), usize(1), s"warned ${warned.len()} of ${notes.len()}")
-            assert_eq(warned.at(0), drw_open_bad_report(file))
-end drw_build_says_the_warning
+            assert(code != Fine, "the program is refused")
+            assert(drw_said(notes).contains(drw_open_bad_report(file)), drw_said(notes))
+end drw_build_says_the_refusal
 
 @test("a constructor handing back the box says nothing")
 drw_a_boxed_return_says_nothing()
@@ -109,8 +107,8 @@ drw_a_boxed_return_says_nothing()
             assert_eq(notes.len(), usize(0), s"noted ${notes.len()}")
 end drw_a_boxed_return_says_nothing
 
-@test("two warnings are two notes, in source order")
-drw_two_warnings_in_source_order()
+@test("two refusals are two errors, in source order")
+drw_two_refusals_in_source_order()
     val text = raw"""
         struct Thing
             n: int
@@ -128,19 +126,12 @@ drw_two_warnings_in_source_order()
     drw_run("emit-llvm", text) match
         None -> ()
         Some((code, _, notes, _)) ->
-            assert_eq(code, Fine)
-            assert_eq(notes.len(), usize(2), s"noted ${notes.len()}")
-            assert(notes.at(0).starts_with("warning: 'make' hands back 'Thing' by value"), notes.at(0))
-            assert(notes.at(1).starts_with("warning: 'pair' hands back 'Thing' by value"), notes.at(1))
-end drw_two_warnings_in_source_order
-
-@test("a compilation that fails says only its errors")
-drw_a_refused_program_says_no_warning()
-    drw_run("emit-llvm", drw_encoder() + drw_bad() + "\nval t: int = \"x\"\n") match
-        None -> ()
-        Some((code, _, notes, _)) ->
             assert(code != Fine, "the program is refused")
 
-            for item in notes
-                assert(!item.contains("hands back"), item)
-end drw_a_refused_program_says_no_warning
+            val said = drw_said(notes)
+            val first = said.index_of("error: 'make' hands back 'Thing' by value")
+            val second = said.index_of("error: 'pair' hands back 'Thing' by value, inside '(int, Thing)'")
+
+            assert(first.is_some() && second.is_some(), said)
+            assert(first.unwrap() < second.unwrap(), said)
+end drw_two_refusals_in_source_order

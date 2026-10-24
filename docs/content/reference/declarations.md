@@ -3246,6 +3246,59 @@ changed together.
 `invariant` is a contextual word — an ordinary identifier everywhere else. See
 [errors and contracts](/reference/errors/) for what happens when one is broken.
 
+### A struct with a destructor is built as a reference
+
+**A struct (or an enum) with an `impl Drop` is a reference type**: its constructor makes a `&T` with
+nothing written, and a declaration that would hold one by value — a parameter, a result, a field, a
+payload, a binding — is refused with the `&T` to write
+([memory](/reference/memory/#a-type-with-a-destructor-is-a-reference-type)):
+
+```sysl
+struct Conn
+    fd: int
+
+impl Drop for Conn
+    drop(self) = print("closed", self.fd)
+
+struct Pool
+    first: &Conn
+
+connect(fd: int) -> &Conn = Conn(fd)
+
+use_pool()
+    val p = Pool(connect(3))
+    val c = Conn(4)
+
+    print("using", p.first.fd, c.fd)
+
+use_pool()
+```
+
+```output
+using 3 4
+closed 4
+closed 3
+```
+
+```sysl
+struct Conn
+    fd: int
+
+impl Drop for Conn
+    drop(self) = print("closed", self.fd)
+
+connect(fd: int) -> Conn = Conn(fd)
+
+print("ready")
+```
+
+```error
+'connect' hands back 'Conn' by value and 'Conn' has a 'Drop' — a type with a destructor is a reference type, and building one makes a '&Conn'. Write '&Conn' in its place
+```
+
+A method still takes `self` — that is the copy a call through the reference hands it, and the
+reference keeps owning the resource.
+
 ### A struct with no fields
 
 A struct may declare no fields at all. Its emptiness has to be *written* — the `end` marker, optional

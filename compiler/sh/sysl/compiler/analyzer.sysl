@@ -546,6 +546,26 @@ struct Analyzer
             None -> ()
     end refuse_reserved_binding
 
+    // **A binding holding a type with a `Drop` by value is refused here, for every binding form at
+    // once** (`drop_values.sysl`). A method's `self` is the one exception: it is the copy a call
+    // through the reference hands the method, and the reference still owns the resource. A name no
+    // program can write is the compiler's own temporary, and the value it holds was refused, or
+    // allowed, where it was written. A body read at type arguments is not asked: an argument that
+    // holds one by value is refused at the call or the spelling that chose it.
+    private refuse_drop_binding(*self, name: string, ty: Type, named: Option[Span])
+        if name == "self" || name.starts_with("$") then return
+
+        if passes_on(self.an, self.scope, self.subst) then return
+
+        val at = self.declared_at(named)
+
+        if at.is_none() then return
+
+        drop_held(self.an, ty) match
+            Some(held) -> self.fault(at.unwrap(), drop_value_refusal(s"'$name' holds", ty, held))
+            None -> ()
+    end refuse_drop_binding
+
     // Where a binding is recorded as declared: the name's own place where the binding form says
     // where it wrote it (`named`), and the binding site where it does not.
     private declared_at(self, named: Option[Span]) -> Option[Span] =
@@ -555,6 +575,7 @@ struct Analyzer
     // name itself is written, where the caller knows it.
     bind(*self, name: string, ty: Type, named: Option[Span] = None) -> string
         self.refuse_reserved_binding(name)
+        self.refuse_drop_binding(name, ty, named)
 
         val unique = self.fresh_name(name)
 
@@ -565,6 +586,7 @@ struct Analyzer
     // Binds a name that may not be assigned to again -- what a local `val` declares.
     bind_read_only(*self, name: string, ty: Type, named: Option[Span] = None) -> string
         self.refuse_reserved_binding(name)
+        self.refuse_drop_binding(name, ty, named)
 
         val unique = self.fresh_name(name)
 

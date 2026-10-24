@@ -163,7 +163,7 @@ impl Drop for Handle
     drop(self) = print("closing", self.id)
 
 hold()
-    var h: &Handle = Handle(7)
+    val h = Handle(7)
     print("working")
 
 hold()
@@ -179,8 +179,8 @@ done
 `defer` (in [statements](/reference/statements/)) is the other mechanism, and the two complement
 each other. `defer` covers exits a program can *name* in its source; a destructor also covers those
 it cannot, such as an element of a container that is freed when the container goes out of scope. The
-[reference](/reference/memory/) lists the four limits; the first to know is that a destructor runs
-for a value held behind a `&T`.
+[reference](/reference/memory/) lists the four limits; the first to know is that a type with a
+destructor is a reference type — `Handle(7)` is a `&Handle`, and a `Handle` held by value is refused.
 
 ## `*T`, the raw pointer
 

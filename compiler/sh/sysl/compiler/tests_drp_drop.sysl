@@ -7,7 +7,7 @@ import sysl.text.Search
 import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
 import sysl.process.{Status, capture}
 
-// A type-bound destructor (`reference/memory.md § A destructor`), the warning about a declaration
+// A type-bound destructor (`reference/memory.md § A destructor`), the refusal of a declaration
 // that hands one back by value, and integer division by zero -- the reference's `DropTests`,
 // `DropReturnWarningTests` and `DivByZeroRunTests`.
 //
@@ -292,10 +292,10 @@ drp_answers_nothing()
     assert(said.starts_with("error: method 'drop' returns int, but trait 'sysl.Drop' declares unit"),
            said)
 
-// `reference/memory.md § A destructor` states this limit outright: a value type is copied, and a
-// copy is not a second resource.
-@test("a value that never reaches the heap has no single death, so no destructor runs")
-drp_a_value_never_on_the_heap()
+// `reference/memory.md § A type with a destructor is a reference type`: a construction with nothing
+// written is the `&T`, so the destructor has a count to hang off.
+@test("a construction with no type written is a reference, so its destructor runs")
+drp_a_construction_is_a_reference()
     if !drp_ready() then return
 
     assert_eq(drp_ran(drp_handle() + raw"""
@@ -305,7 +305,7 @@ drp_a_value_never_on_the_heap()
 
         hold()
         print("out")
-        """), "value 1\nout\n")
+        """), "value 1\ndrop 1\nout\n")
 
 // Storage that lasts the whole run has nothing to write a release on (`reference/modules.md § val —
 // a thing`), so the count never reaches zero.
@@ -333,7 +333,7 @@ drp_a_test_build_keeps_the_destructor()
 
     assert(ir.contains("define void @Handle.drop("), ir)
 
-// -- DropReturnWarningTests: a declaration handing back a Drop type by value ------------------------
+// -- a declaration handing back a Drop type by value is refused -------------------------------------
 
 private drp_thing() -> string = raw"""
     struct Thing
@@ -343,32 +343,42 @@ private drp_thing() -> string = raw"""
         drop(self) = print(s"drop ${self.n}")
     """
 
-private drp_hands_back() -> string =
-    "'make' hands back 'Thing' by value, and 'Thing' has a 'Drop' — a destructor runs when a box's " +
-    "count reaches zero, so nothing here will ever call it. Return '&Thing' instead, or take the " +
-    "resource apart before returning it"
+private drp_tail() -> string =
+    " and 'Thing' has a 'Drop' — a type with a destructor is a reference type, and building one makes " +
+    "a '&Thing'. Write '&Thing' in its place"
+
+private drp_hands_back() -> string = "'make' hands back 'Thing' by value" + drp_tail()
+
+private drp_hands_back_in(whole: string) -> string =
+    s"'make' hands back 'Thing' by value, inside '$whole',${drp_tail()}"
+
+// The one complaint a program that is refused makes about `make`, and how many it makes in all.
+private drp_refused(text: string, message: string)
+    val said = drp_err(text)
+
+    assert(said.starts_with("error: "), said)
+    assert_eq(said.count_of(message), usize(1), said)
+end drp_refused
 
 @test("a Drop type handed back through a Result, which is the shape a constructor actually has")
-drp_warned_through_a_result()
+drp_refused_through_a_result()
     if !drp_has_library() then return
 
-    val w = drp_warnings(drp_thing() + "make(n: int) -> Result[Thing, string] = Ok(Thing(n))\nprint(1)\n")
-
-    assert_eq(w.len(), 1)
-    assert_eq(w.at(0).diag.message, drp_hands_back())
-    assert(!w.at(0).is_error(), "a warning, not an error")
+    drp_refused(drp_thing() + "make(n: int) -> Result[Thing, string] = Ok(Thing(n))\nprint(1)\n",
+                drp_hands_back_in("sysl.Result[Thing, string]"))
 
 @test("and bare, which is the same claim with nothing wrapping it")
-drp_warned_bare()
+drp_refused_bare()
     if !drp_has_library() then return
 
-    assert_eq(drp_warnings(drp_thing() + "make(n: int) -> Thing = Thing(n)\nprint(1)\n").len(), 1)
+    drp_refused(drp_thing() + "make(n: int) -> Thing = Thing(n)\nprint(1)\n", drp_hands_back())
 
 @test("and through an Option")
-drp_warned_through_an_option()
+drp_refused_through_an_option()
     if !drp_has_library() then return
 
-    assert_eq(drp_warnings(drp_thing() + "make(n: int) -> Option[Thing] = Some(Thing(n))\nprint(1)\n").len(), 1)
+    drp_refused(drp_thing() + "make(n: int) -> Option[Thing] = Some(Thing(n))\nprint(1)\n",
+                drp_hands_back_in("sysl.Option[Thing]"))
 
 @test("a box handed back through a Result is not warned about, a '&T' being what a destructor is about")
 drp_a_box_through_a_result()
@@ -400,20 +410,18 @@ drp_a_raw_pointer()
 
     assert_eq(drp_warnings(drp_thing() + "make(p: *Thing) -> *Thing = p\nprint(1)\n").len(), 0)
 
-@test("a slice of them is left alone, which is a decision rather than an oversight")
+@test("a slice of them is refused, its elements being held by value")
 drp_a_slice_of_them()
     if !drp_has_library() then return
 
-    assert_eq(drp_warnings(drp_thing() + "first(xs: []Thing) -> []Thing = xs\nprint(1)\n").len(), 0)
+    drp_refused(drp_thing() + "make(xs: []Thing) -> []Thing = xs\nprint(1)\n", drp_hands_back_in("[]Thing"))
 
 @test("a tuple is looked inside, an element held by value being the same claim")
-drp_warned_through_a_tuple()
+drp_refused_through_a_tuple()
     if !drp_has_library() then return
 
-    val w = drp_warnings(drp_thing() + "make(n: int) -> (int, Thing) = (n, Thing(n))\nprint(1)\n")
-
-    assert_eq(w.len(), 1)
-    assert_eq(w.at(0).diag.message, drp_hands_back())
+    drp_refused(drp_thing() + "make(n: int) -> (int, Thing) = (n, Thing(n))\nprint(1)\n",
+                drp_hands_back_in("(int, Thing)"))
 
 @test("and a tuple whose element is boxed says nothing")
 drp_a_box_in_a_tuple()
@@ -422,14 +430,11 @@ drp_a_box_in_a_tuple()
     assert_eq(drp_warnings(drp_thing() + "make(n: int) -> (int, &Thing) = (n, Thing(n))\nprint(1)\n").len(), 0)
 
 @test("the walk goes through one container into the next")
-drp_warned_through_an_option_in_a_result()
+drp_refused_through_an_option_in_a_result()
     if !drp_has_library() then return
 
-    val w = drp_warnings(drp_thing() +
-                         "make(n: int) -> Result[Option[Thing], string] = Ok(Some(Thing(n)))\nprint(1)\n")
-
-    assert_eq(w.len(), 1)
-    assert_eq(w.at(0).diag.message, drp_hands_back())
+    drp_refused(drp_thing() + "make(n: int) -> Result[Option[Thing], string] = Ok(Some(Thing(n)))\nprint(1)\n",
+                drp_hands_back_in("sysl.Result[sysl.Option[Thing], string]"))
 
 @test("a weak reference is not warned about, never having owned the object")
 drp_a_weak_reference()
@@ -441,19 +446,18 @@ drp_a_weak_reference()
 drp_an_array_of_them()
     if !drp_has_library() then return
 
-    assert_eq(drp_warnings(drp_thing() + "make(xs: [2]Thing) -> [2]Thing = xs\nprint(1)\n").len(), 0)
+    drp_refused(drp_thing() + "make(n: int) -> [2]Thing = [Thing(n), Thing(n)]\nprint(1)\n", drp_hands_back_in("[2]Thing"))
 
-// **The boundary, asserted rather than described**: a Drop type in a struct field leaks exactly as a
-// by-value return does, and the check, keyed on declared return types, does not see it.
-@test("a Drop type held by a struct is not warned about, which is a limit rather than a decision")
+// A field is asked as a result is: the type at every level that owns a resource.
+@test("a Drop type held by value in a struct field is refused at the field")
 drp_held_by_a_struct()
     if !drp_has_library() then return
 
-    assert_eq(drp_warnings(drp_thing() + "struct Holder\n    it: Thing\nwrap(t: Thing) -> Holder = Holder(t)\nprint(1)\n").len(), 0)
+    drp_refused(drp_thing() + "struct Holder\n    it: Thing\n\nprint(1)\n",
+                "field 'it' of 'Holder' holds 'Thing' by value" + drp_tail())
 
-// **Boxing the HOLDER does not save a field held by value**: the `Thing` inside it is a copy in that
-// box rather than a box of its own, so nothing's count reaches zero for it.
-@test("boxing the holder does not run a by-value field's destructor")
+// A boxed holder with a boxed field runs the field's destructor when the holder goes.
+@test("a holder whose field is the reference runs the field's destructor")
 drp_boxing_the_holder()
     if !drp_ready() then return
 
@@ -464,14 +468,10 @@ drp_boxing_the_holder()
         impl Drop for Thing
             drop(self) = print("drop", self.n)
 
-        struct ByValue
-            inner: Thing
-
         struct Boxed
             inner: &Thing
 
         hold()
-            val a: &ByValue = ByValue(Thing(1))
             val b: &Boxed = Boxed(Thing(2))
 
         hold()
@@ -479,26 +479,26 @@ drp_boxing_the_holder()
 
 // The position names the declaration rather than the type, because the declaration is what has to
 // change.
-@test("the warning points at the declaration, which is what has to change")
-drp_the_warning_points_at_the_declaration()
+@test("the refusal points at the declaration, which is what has to change")
+drp_the_refusal_points_at_the_declaration()
     if !drp_has_library() then return
 
-    val w = drp_warnings(drp_thing() + "make(n: int) -> Thing = Thing(n)\nprint(1)\n")
+    val said = drp_err(drp_thing() + "make(n: int) -> Thing = Thing(n)\nprint(1)\n")
 
-    assert_eq(w.len(), 1)
-    assert_eq(w.at(0).render(), "warning: " + drp_hands_back() + "\n" + raw"""
-         --> test.sysl:6:1
-          |
-        6 | make(n: int) -> Thing = Thing(n)
-          | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-        """)
+    assert(said.starts_with("error: " + drp_hands_back() + "\n"), said)
+    assert(said.contains(":6:1\n"), said)
+    assert(said.contains("6 | make(n: int) -> Thing = Thing(n)\n"), said)
+    assert(said.contains("  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^"), said)
+end drp_the_refusal_points_at_the_declaration
 
-// A compilation that warns still succeeds -- the whole difference between the two severities.
-@test("a warning does not fail the compilation")
-drp_a_warning_does_not_fail()
+// What was a warning is an error: the compilation fails.
+@test("a by-value Drop result fails the compilation")
+drp_a_refusal_fails()
     if !drp_ready() then return
 
-    assert_eq(drp_ran(drp_thing() + "make(n: int) -> Thing = Thing(n)\nprint(1)\n"), "1\n")
+    val ran = drp_ran(drp_thing() + "make(n: int) -> Thing = Thing(n)\nprint(1)\n")
+
+    assert(ran.contains(drp_hands_back()), ran)
 
 // -- DivByZeroRunTests: a zero divisor traps rather than run an undefined `sdiv` --------------------
 
