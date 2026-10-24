@@ -33,6 +33,10 @@ struct Nested
 
     // Where the declaration was written, which only the definition index reads.
     declared: Span
+
+    // `@crossing(...)` and its `copy` names, which a call is held to as a top-level function's is.
+    crossing: Buf[string]
+    copies: Buf[string]
 end Nested
 
 // Whether a name is one of the nested functions this body may see -- one of the block's own, or one
@@ -45,6 +49,19 @@ names_a_nested(cx: &Analyzer, name: string) -> bool =
 nested_ident(e: Expr) -> Option[string] = *e.kind match
     Ident(n) -> Some(n)
     _ -> None
+
+// The source path of `name` written in the body `cx` reads: `outer.name` inside `outer`, and `name`
+// alone at the top of the entry file, where it is written beside the module's own declarations.
+private path_within(cx: &Analyzer, name: string) -> string
+    if in_entry_body(cx) then return qualified_name(module_qualify(cx.scope.module_name, name))
+
+    val around = body_path(cx.an.tables, cx.body)
+
+    if around == "" then name else s"$around.$name"
+end path_within
+
+// Whether `cx` reads the entry file's own statements rather than a function's body.
+in_entry_body(cx: &Analyzer) -> bool = cx.body == entry_check_name(cx.scope.module_name)
 
 // The nested functions of one block, lowered together.
 //
@@ -122,6 +139,9 @@ lower_nested_group(cx: &Analyzer, span: Span, group: Buf[FuncDecl]) -> Buf[TStmt
 
         lowered.push(fname)
 
+        // A diagnostic names it by where it was written, never by the environment it is a member of.
+        cx.an.tables.body_paths.put(fname, path_within(cx, d.name))
+
         // The environment takes the first slot, but the tail is anchored after what the program
         // wrote, so a nested `...` needs a named parameter of its own as a top-level one does.
         if d.variadic && d.params.is_empty() then
@@ -153,8 +173,15 @@ lower_nested_group(cx: &Analyzer, span: Span, group: Buf[FuncDecl]) -> Buf[TStmt
     for i in 0..<group.len()
         val d = group.at(i)
 
-        inside.push((d.name, Nested(lowered.at(i), inner_self, d.variadic, d.params, d.at)))
-        cx.nested.push((d.name, Nested(lowered.at(i), here, d.variadic, d.params, d.at)))
+        inside.push((d.name, Nested(lowered.at(i), inner_self, d.variadic, d.params, d.at, d.crossing,
+                                    d.marks.copies)))
+        cx.nested.push((d.name, Nested(lowered.at(i), here, d.variadic, d.params, d.at, d.crossing,
+                                       d.marks.copies)))
+
+        // What the declaration's annotations name is settled once, where it is written, however many
+        // times a generic one's body is read.
+        check_crossing_names(cx.an, cx.scope, decl_anchor(d), d, d.name)
+        check_nested_needs_names(cx.an, cx.scope, decl_anchor(d), d.needs)
 
     // **A generic one is kept as a template until a call asks for it**, which is the whole of how a
     // nested function comes to be generic: each instantiation is one more member of the same
@@ -351,7 +378,17 @@ private nested_body_in(a: &Analysis, f: &NestedFrame, fname: string, d: FuncDecl
     inner.body_called = Some(d.name)
     inner.in_variadic = d.variadic
     inner.bind_site = Some(span)
+
+    // **A nested function's `@needs(...)` covers its own body**, as a top-level function's does, on
+    // top of whatever the function around it already covers -- the body is reached only through it.
+    val reaching = enter_nested_reaching(a, d.needs)
+
+    defer leave_reaching(a, reaching)
+
     note_body_covers(a, fname)
+
+    if !d.needs.is_empty() then a.tables.nested_needs.put(fname, d.needs)
+    if !d.crossing.is_empty() then a.crossing_params.put(fname, d.crossing)
 
     inner.body = fname
     inner.owner = f.owner
@@ -383,7 +420,12 @@ private nested_body_in(a: &Analysis, f: &NestedFrame, fname: string, d: FuncDecl
     for param in d.params
         val ty = resolve_type(a, f.scope, param.typ, subst)
 
-        params.push((inner.bind(param.name, ty, written_name(inner, param.span.start, param.name)), ty))
+        val unique = inner.bind(param.name, ty, written_name(inner, param.span.start, param.name))
+
+        // A parameter `@crossing(copy …)` names is handed over as a copy, as a top-level one is.
+        if holds_string(d.marks.copies, param.name) then inner.copied.push(unique)
+
+        params.push((unique, ty))
 
     for i in 0..<f.captured.len()
         val stored = f.env.fields.at(i).1
@@ -448,16 +490,30 @@ private nested_body_in(a: &Analysis, f: &NestedFrame, fname: string, d: FuncDecl
 
     if d.const_fn then a.tables.const_fns.put(fname, true)
 
-    // **A nested function's `@scoped` is the promise its body keeps**, read by the keeps-analysis
-    // off the function it lowers to, and asked what it may name as a free function's is.
-    var marks = no_marks()
+    // **A nested function carries the marks written above it**, as a top-level function's marks
+    // are carried: the optimizer's three, `@abandons`, `@blocks`, `@pinned`, `@pins`, `@domain`,
+    // `@lends`, `@disjoint`, `@scoped` and `@crossing`'s copies. `@no_<cap>` was refused above the
+    // group, so the list is empty here either way. `@scoped` is the promise the body keeps, read by
+    // the keeps-analysis off the function it lowers to.
+    val marks = d.marks
 
-    marks.scoped = d.marks.scoped
+    // What `@lends`, `@disjoint` and `@scoped` may name is settled where the function is declared,
+    // nested or not.
+    check_lends_names(a, f.scope, decl_anchor(d), d, d.name)
+    check_disjoint_names(a, f.scope, decl_anchor(d), d, d.name)
     check_scoped_names(a, f.scope, decl_anchor(d), d, d.name, false)
 
+    // **`@pure`, `@ghost`, `@tailrec` and a frame are carried as a top-level function's are**, and
+    // the whole-program checks hold the body to them in the same words. What the body reaches of its
+    // frame it reaches through the environment's addresses, so a write to a captured local is a write
+    // through a reference to storage the call did not create -- refused under `@pure` -- while a read
+    // of one is a read through a pointer, as a top-level function's read through a `*T` parameter is.
+    // A frame covers module storage only, so a captured local is nothing a `@reads` or `@writes` names.
     TFunc(span, fname, params, ret, block, d.variadic, contract.0, contract.1, contract.2, true,
-          None, false, contract.3, false, false, None, None, None, None, marks, inner.owner,
-          d.const_fn, Some(f.scope.src), false)
+          None, d.tailrec, contract.3, d.pure, d.ghost,
+          frame_symbols(inner, decl_anchor(d), fname, d.reads, "reads"),
+          frame_symbols(inner, decl_anchor(d), fname, d.writes, "writes"), None, None, marks,
+          inner.owner, d.const_fn, Some(f.scope.src), false)
 end nested_body_in
 
 // What a nested function's body is read against, taken from the frame where its group is written.
@@ -715,8 +771,24 @@ call_nested(cx: &Analyzer, span: Span, n: &Nested, written: string, args: Buf[Ex
 
     if refused.is_some() then return refused.unwrap()
 
+    var handed: Buf[TExpr] = buf()
+
     for i in 0..<given.len()
-        supplied.push(handed_walk(n.params.at(i), slots.at(i), given.at(i)))
+        handed.push(handed_walk(n.params.at(i), slots.at(i), given.at(i)))
+
+    // **`@crossing` is asked at the call**, as it is of a top-level function's: the argument is what
+    // could have been written differently.
+    if !n.crossing.is_empty()
+        var pts: Buf[(string, Type)] = buf()
+
+        for i in 0..<n.params.len()
+            pts.push((n.params.at(i).name, params.at(i + 1).1))
+
+        check_crossings(cx, n.crossing, n.copies, written, pts, handed)
+    end if
+
+    for item in handed
+        supplied.push(item)
 
     for i in slots.len()..<args.len()
         supplied.push(type_expr(cx, args.at(i), None))

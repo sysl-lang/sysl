@@ -3208,6 +3208,31 @@ print(Status(0x22, 0, 9).bits, sizeof(Status))
 A `@byte_order` struct's integer holds its fields' values, not the bytes of the wire: each field is
 reversed on the way in and out exactly as a field read and write reverses it.
 
+A generic struct converts at each instance, as wide as that instance's fields. The instance may be
+written out in place on the left of `::`, as an alias of it would be, and a generic body reads
+`.bits` at the width its instantiation has:
+
+```sysl
+@packed
+struct Pair[T]
+    lo: T
+    hi: T
+
+show[T](p: Pair[T]) = print(p.bits)
+
+val a = Pair[u8]::Bits(0x0201)
+
+print(a.lo, a.hi, Pair[u16]::Bits(0x00020001).hi)
+show(a)
+show(Pair[u16](1, 2))
+```
+
+```output
+1 2 2
+513
+131073
+```
+
 An ordinary struct, a union and a struct with C bitfields have no `::Bits`, and `P::Bits(n)` on one
 is refused saying which it is.
 
@@ -3215,7 +3240,8 @@ is refused saying which it is.
 a value none of its variants has; the field is held to its variants where it is read, as one reached
 through a pointer the hardware filled is.
 
-**Every field has to be an integer** — or a simple enum, or another bitfield struct. A `bool` is not
+**Every field has to be an integer** — or a simple enum, another bitfield struct, or a `@packed`
+struct that converts itself. A `bool` is not
 one here — its storage is a byte and its representation a bit — and neither is a pointer, a float or
 an array:
 
@@ -3247,7 +3273,7 @@ print(Sample::Bits(1).id)
 ```
 
 ```error
-'Sample::Bits' has no integer to make it from: its field 'value' is f32 — only a '@packed' struct whose every field is an integer, a simple enum or a bitfield struct converts to one
+'Sample::Bits' has no integer to make it from: its field 'value' is f32 — only a '@packed' struct whose every field is an integer, a simple enum, a bitfield struct or a '@packed' struct that converts itself converts to one
 ```
 
 **A bitfield struct may be a field of another, and there it occupies its own fields' widths** — the
@@ -3332,6 +3358,29 @@ print(sizeof(Block), b.ctrl.enable, b.ctrl.mode, b.count)
 
 ```output
 5 1 2 3
+```
+
+**A whole-byte `@packed` struct that converts may itself be a field of another that does**, at every
+depth, and there it is as wide as its own integer. `Outer` below is a `u32`, `Header` in it a `u24`:
+
+```sysl
+@packed
+struct Header
+    a: u8
+    b: u16
+
+@packed
+struct Outer
+    h: Header
+    c: u8
+
+val o = Outer::Bits(0x04030201)
+
+print(o.h.a, o.h.b, o.c, o.bits == 0x04030201)
+```
+
+```output
+1 770 4 true
 ```
 
 **A bitfield may be `volatile`, and it means a volatile access of the container.** Reading a field is
