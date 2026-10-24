@@ -1,0 +1,449 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.Span
+import sysl.buf.{Buf, buf}
+import sysl.container.{map, Map}
+import sysl.env.{get as env_var}
+import sysl.fs.append_text
+import sysl.text.{Search, from_utf8_unchecked, str_builder}
+
+// A measurement, not a rule: what a single-owner `Buf` would refuse.
+//
+// Under single ownership `val b2 = b` moves the buffer, as does a field, an enum payload, a closure
+// capture, a literal's element, a result, or an argument to a callee that keeps it. This walk finds
+// every `Buf` local or parameter that is copied that way and then used again, and appends one line
+// per site to the file `SYSL_BUF_MOVES` names. Nothing is refused and nothing emitted changes; with
+// the variable unset the walk does not run.
+//
+// A copy whose source is never used again is not a site: it is already a move. Branches are taken
+// apart and joined, an arm that leaves (`return`, `break`, `continue`) does not reach the join, and
+// a loop body is walked twice so a move in one turn meets a use in the next.
+
+private struct BmDest
+    what: string
+    local: Option[string]
+end BmDest
+
+private struct BmMoved
+    name: string
+    into: string
+    line: usize
+    at: usize
+    pass: usize
+end BmMoved
+
+private struct BmCx
+    an: &Analysis
+    funcs: Buf[TFunc]
+    index: Map[string, usize]
+    kept: Map[string, bool]
+    busy: Buf[string]
+    out: Buf[string]
+    said: Map[string, bool]
+end BmCx
+
+private struct BmState
+    cx: &BmCx
+    scope: Scope
+    fname: string
+    moved: Buf[BmMoved]
+    dead: bool
+    pass: usize
+    summary: bool
+    aliases: Buf[string]
+    kept: bool
+end BmState
+
+// The generic walk's window: a node inside the span already handled is skipped.
+private struct BmSkip
+    lo: usize
+    hi: usize
+    first: bool
+end BmSkip
+
+check_buf_moves(a: &Analysis, funcs: Buf[TFunc])
+    val log = env_var("SYSL_BUF_MOVES") match
+        Some(file) -> file
+        None -> return
+
+    var index: Map[string, usize] = map()
+
+    for i in 0..<funcs.len()
+        if !index.has(funcs.at(i).name) then index.put(funcs.at(i).name, i)
+
+    val cx: &BmCx = BmCx(a, funcs, index, map(), buf(), buf(), map())
+
+    for f in funcs
+        val st: &BmState = BmState(cx, func_home(a, f.name), f.name, buf(), false, 0, false, buf(), false)
+
+        bm_block(st, f.body, Some(BmDest("the function's result", None)))
+
+    if cx.out.is_empty() then return
+
+    var text = str_builder()
+
+    for line in cx.out
+        text.push(line)
+        text.push("\n")
+
+    append_text(log, text.finish()) match
+        _ -> ()
+end check_buf_moves
+
+private bm_is_buf(t: Type) -> bool = underlying(t) match
+    Struct(d) ->
+        val q = qualified_name(d.base)
+
+        q == "sysl.buf.Buf" || q.starts_with("sysl.buf.Buf[")
+    _ -> false
+
+private bm_shown(n: string) -> string = n.last_index_of(".") match
+    Some(at) -> n[0..<at]
+    None -> n
+
+private bm_line(st: &BmState, span: Span) -> usize = st.scope.src.locate(span.start).line
+
+private bm_text(st: &BmState, line: usize) -> string =
+    from_utf8_unchecked(st.scope.src.line_text(line)).trim()
+
+// -- what a callee keeps --------------------------------------------------------------------------
+
+// Whether the callee keeps what its `i`th parameter is handed: stores it, returns it, captures it,
+// or hands it to a callee that keeps it -- directly or through locals it was copied into.
+private bm_keeps(cx: &BmCx, name: string, i: usize) -> bool
+    val key = s"$name|$i"
+
+    cx.kept.get(key) match
+        Some(k) -> return k
+        None -> ()
+
+    if holds_string(cx.busy, key) then return false
+
+    val f = cx.index.get(name) match
+        Some(at) -> cx.funcs.at(at)
+        None ->
+            cx.kept.put(key, false)
+            return false
+
+    if i >= f.params.len() then return false
+
+    cx.busy.push(key)
+
+    val st: &BmState = BmState(cx, func_home(cx.an, f.name), f.name, buf(), false, 0, true, buf(), false)
+
+    st.aliases.push(f.params.at(i).0)
+    bm_block(st, f.body, Some(BmDest("the function's result", None)))
+    cx.busy.pop()
+    cx.kept.put(key, st.kept)
+    st.kept
+end bm_keeps
+
+// -- the walk -------------------------------------------------------------------------------------
+
+private bm_use(st: &BmState, span: Span, n: string, ty: Type, dest: Option[BmDest])
+    if st.summary
+        if dest.is_some() && holds_string(st.aliases, n)
+            val d = dest.unwrap()
+
+            d.local match
+                Some(l) -> st.aliases.push(l)
+                None -> st.kept = true
+        end if
+
+        return
+    end if
+
+    if !bm_is_buf(ty) then return
+    if span.start == 0 && span.end == 0 then return
+
+    var already = false
+
+    for m in st.moved
+        if m.name != n then continue
+
+        already = true
+
+        if m.at == span.start && m.pass == st.pass then break
+
+        val key = s"${st.scope.src.name}:${span.start}:$n"
+
+        if !st.cx.said.has(key)
+            st.cx.said.put(key, true)
+
+            val line = bm_line(st, span)
+            val turn = if m.at == span.start then " (an earlier turn of the loop)" else ""
+
+            st.cx.out.push(s"Q7\t${st.scope.src.name}\t$line\t${bm_shown(n)}\t${m.into}\t${m.line}$turn\t" +
+                           s"${bm_text(st, line)}\t${bm_text(st, m.line)}\t${st.fname}")
+        end if
+
+        break
+
+    if already || dest.is_none() then return
+
+    val d = dest.unwrap()
+
+    // A local the compiler made for itself (`$`-named) is a second name the source never wrote.
+    d.local match
+        Some(l) -> if l.starts_with("$") then return
+        None -> ()
+
+    st.moved.push(BmMoved(n, d.what, bm_line(st, span), span.start, st.pass))
+end bm_use
+
+private bm_forget(st: &BmState, n: string)
+    var kept: Buf[BmMoved] = buf()
+
+    for m in st.moved
+        if m.name != n then kept.push(m)
+
+    st.moved = kept
+end bm_forget
+
+private bm_copy(xs: Buf[BmMoved]) -> Buf[BmMoved]
+    var out: Buf[BmMoved] = buf()
+
+    for m in xs
+        out.push(m)
+
+    out
+end bm_copy
+
+private bm_union(into: Buf[BmMoved], from: Buf[BmMoved])
+    for m in from
+        var seen = false
+
+        for k in into
+            if k.name == m.name then seen = true
+
+        if !seen then into.push(m)
+end bm_union
+
+private bm_block(st: &BmState, b: TBlock, dest: Option[BmDest])
+    for s in b.stmts
+        if st.dead then return
+
+        bm_stmt(st, s)
+
+    if st.dead then return
+
+    if b.result.is_some() then bm_expr(st, b.result.unwrap(), dest)
+end bm_block
+
+private bm_write(st: &BmState, place: TExpr, value: TExpr, op: string)
+    if op != "="
+        bm_expr(st, place, None)
+        bm_expr(st, value, None)
+        return
+    end if
+
+    *place.kind match
+        TLoad(n, ty) ->
+            bm_expr(st, value, Some(BmDest(s"'${bm_shown(n)}'", Some(n))))
+            bm_forget(st, n)
+        _ ->
+            bm_expr(st, place, None)
+            bm_expr(st, value, Some(BmDest("a field or element written", None)))
+end bm_write
+
+private bm_stmt(st: &BmState, s: TStmt)
+    s match
+        TVarDecl(n, _, init, _) -> bm_expr(st, init, Some(BmDest(s"'${bm_shown(n)}'", Some(n))))
+        TExprStmt(e) -> bm_expr(st, e, None)
+        TRefDecl(_, _, place) -> bm_expr(st, place, None)
+        TWriteStmt(w) -> bm_write(st, w.place, w.value, w.op)
+        TMultiAssign(writes) ->
+            for w in writes
+                bm_write(st, w.place, w.value, w.op)
+        TReturn(value) ->
+            if value.is_some() then bm_expr(st, value.unwrap(), Some(BmDest("the function's result", None)))
+
+            st.dead = true
+        TBecome(call) ->
+            bm_expr(st, call, None)
+            st.dead = true
+        TBreak(value, _) ->
+            if value.is_some() then bm_expr(st, value.unwrap(), Some(BmDest("the loop's result", None)))
+
+            st.dead = true
+        TContinue(_) -> st.dead = true
+        TDefer(stmts, _) ->
+            for item in stmts
+                bm_stmt(st, item)
+        _ -> ()
+end bm_stmt
+
+private bm_terms(st: &BmState, cond: Buf[TCondTerm])
+    for item in cond
+        item match
+            TCondTest(c) -> bm_expr(st, c, None)
+            TCondIs(subject, _, _) -> bm_expr(st, subject, None)
+end bm_terms
+
+private bm_expr(st: &BmState, e: TExpr, dest: Option[BmDest])
+    *e.kind match
+        TLoad(n, ty) -> bm_use(st, e.span, n, ty, dest)
+        TIf(cond, then_block, else_block, _) ->
+            bm_terms(st, cond)
+
+            val before = bm_copy(st.moved)
+
+            bm_block(st, then_block, dest)
+
+            val then_moved = st.moved
+            val then_dead = st.dead
+
+            st.moved = bm_copy(before)
+            st.dead = false
+
+            if else_block.is_some() then bm_block(st, else_block.unwrap(), dest)
+
+            if then_dead && st.dead then return
+            if st.dead
+                st.moved = then_moved
+                st.dead = false
+            else if !then_dead
+                bm_union(st.moved, then_moved)
+            end if
+        TMatch(scrutinee, arms, _) ->
+            bm_expr(st, scrutinee, None)
+
+            val before = bm_copy(st.moved)
+            var acc: Buf[BmMoved] = buf()
+            var live = false
+
+            for arm in arms
+                st.moved = bm_copy(before)
+                st.dead = false
+
+                if arm.guard.is_some() then bm_expr(st, arm.guard.unwrap(), None)
+
+                bm_block(st, arm.body, dest)
+
+                if !st.dead
+                    live = true
+                    bm_union(acc, st.moved)
+                end if
+
+            st.moved = acc
+            st.dead = !live && !arms.is_empty()
+        TBlockExpr(block) -> bm_block(st, block, dest)
+        TStructNew(d, args) ->
+            val into = if d.base.starts_with(s"${ModuleSep}closure") then "a closure's capture"
+            else s"a field of '${qualified_name(d.base)}'"
+
+            for item in args
+                bm_expr(st, item, Some(BmDest(into, None)))
+        TEnumNew(_, variant, args) ->
+            for item in args
+                bm_expr(st, item, Some(BmDest(s"'${variant.name}(...)'", None)))
+        TArrayLit(elems, _) ->
+            for item in elems
+                bm_expr(st, item, Some(BmDest("an array literal's element", None)))
+        TBufLit(elems, _) ->
+            for item in elems
+                bm_expr(st, item, Some(BmDest("a literal's element", None)))
+        TBox(value, _) -> bm_expr(st, value, Some(BmDest("a box", None)))
+        TCall(name, args, _, _) ->
+            for i in 0..<args.len()
+                val arg = args.at(i)
+                val keeps = bm_moves_out(arg) && bm_keeps(st.cx, name, i)
+
+                bm_expr(st, arg, if keeps then Some(BmDest(s"'${bm_shown(name)}', which keeps it", None)) else None)
+        TStore(place, value, _, _) -> bm_write(st, place, value, "=")
+        TCast(operand, _) -> bm_expr(st, operand, dest)
+        TCrossCopy(value, _, _, _) -> bm_expr(st, value, dest)
+        TWhile(_, _, _, _) -> bm_loop(st, e)
+        TDoWhile(_, _, _, _) -> bm_loop(st, e)
+        TLoop(_, _) -> bm_loop(st, e)
+        TFor(_, _, _, _, _, _, _, _) -> bm_loop(st, e)
+        TCFor(_, _, _, _, _, _) -> bm_loop(st, e)
+        TForEach(_, _, _, _, _, _) -> bm_loop(st, e)
+        TIterate(_, _, _, _, _, _, _, _) -> bm_loop(st, e)
+        _ -> bm_generic(st, e)
+end bm_expr
+
+// An argument worth asking the callee about: one that is a `Buf` local, or one in summary mode.
+private bm_moves_out(arg: TExpr) -> bool = *arg.kind match
+    TLoad(_, _) -> true
+    TCast(operand, _) -> bm_moves_out(operand)
+    _ -> false
+
+private bm_loop(st: &BmState, e: TExpr)
+    bm_generic(st, e)
+    st.dead = false
+    st.pass += 1
+    bm_generic(st, e)
+    st.dead = false
+end bm_loop
+
+// Any other node: every node under it, in the order written, each special one handled whole.
+private bm_generic(st: &BmState, e: TExpr)
+    val skip: &BmSkip = BmSkip(0, 0, true)
+
+    walk_texpr(e, TWalk(false, n -> bm_generic_expr(st, skip, n), w -> (), s -> bm_generic_stmt(st, skip, s)))
+end bm_generic
+
+private bm_inside(skip: &BmSkip, s: Span) -> bool =
+    (s.start == 0 && s.end == 0) || (skip.hi > skip.lo && s.start >= skip.lo && s.end <= skip.hi)
+
+private bm_generic_expr(st: &BmState, skip: &BmSkip, n: TExpr)
+    if skip.first
+        skip.first = false
+        return
+    end if
+
+    if bm_inside(skip, n.span) then return
+
+    val special = *n.kind match
+        TLoad(_, _) -> true
+        TIf(_, _, _, _) -> true
+        TMatch(_, _, _) -> true
+        TBlockExpr(_) -> true
+        TStructNew(_, _) -> true
+        TEnumNew(_, _, _) -> true
+        TArrayLit(_, _) -> true
+        TBufLit(_, _) -> true
+        TBox(_, _) -> true
+        TCall(_, _, _, _) -> true
+        TStore(_, _, _, _) -> true
+        TWhile(_, _, _, _) -> true
+        TDoWhile(_, _, _, _) -> true
+        TLoop(_, _) -> true
+        TFor(_, _, _, _, _, _, _, _) -> true
+        TCFor(_, _, _, _, _, _) -> true
+        TForEach(_, _, _, _, _, _) -> true
+        TIterate(_, _, _, _, _, _, _, _) -> true
+        _ -> false
+
+    if !special then return
+
+    bm_expr(st, n, None)
+    skip.lo = n.span.start
+    skip.hi = n.span.end
+end bm_generic_expr
+
+private bm_generic_stmt(st: &BmState, skip: &BmSkip, s: TStmt)
+    s match
+        TVarDecl(_, _, init, _) ->
+            if bm_inside(skip, init.span) then return
+
+            bm_stmt(st, s)
+            skip.lo = init.span.start
+            skip.hi = init.span.end
+        TWriteStmt(w) ->
+            if bm_inside(skip, w.place.span) then return
+
+            bm_stmt(st, s)
+            skip.lo = w.place.span.start
+            skip.hi = w.value.span.end
+        TReturn(value) ->
+            if value.is_none() then return
+            if bm_inside(skip, value.unwrap().span) then return
+
+            bm_stmt(st, s)
+            st.dead = false
+            skip.lo = value.unwrap().span.start
+            skip.hi = value.unwrap().span.end
+        _ -> ()
+end bm_generic_stmt
