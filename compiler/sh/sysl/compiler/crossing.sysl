@@ -81,8 +81,13 @@ check_inferred_crossings(a: &Analysis, funcs: Buf[TFunc], vtables: Buf[TVtable])
     loop
         cx.changed = false
 
+        // **A closure's body is not asked**: what it captured crosses where the closure does -- erased
+        // into a `&sync Fn` or handed to a crossing parameter -- and that is where its captures are
+        // held to the rule, each as the closure's own (`sharing.sysl`). Its environment, followed
+        // into a call made inside it, would be asked a second time and without that rule's view of a
+        // `@scoped` child's borrowed captures.
         for f in funcs
-            if !f.params.is_empty() then infer_body(cx, f)
+            if !f.params.is_empty() && !is_closure_body(f) then infer_body(cx, f)
 
         rounds += 1
 
@@ -134,8 +139,11 @@ end copied
 private infer_body(cx: &CrossCx, f: TFunc)
     var params: Buf[string] = buf()
 
-    for p in f.params
-        params.push(p.0)
+    // **A `@scoped` pointer is the scope's own to share**: a member that scopes a call lends its
+    // receiver to the children it runs, and they reach it only while the caller waits inside the
+    // scope -- the promise `docs/design/scope.md` makes and the keeps-analysis trusts (`scoped_at`).
+    for i in 0..<f.params.len()
+        if !scoped_at(f, i) then params.push(f.params.at(i).0)
 
     val t: &Carry = Carry(params, table(), buf())
 
@@ -334,6 +342,11 @@ end check_arg
 
 // The callee as the refusal names it: a member as the method it is, anything else by its qualified
 // name, as a written `@crossing`'s refusal names them.
-private crossing_shown(a: &Analysis, name: string) -> string = a.tables.members.func_origin.get(name) match
-    Some(origin) -> s"method '${qualified_name(origin)}'"
-    None -> qualified_name(name)
+private crossing_shown(a: &Analysis, name: string) -> string
+    val origin = a.tables.members.func_origin.get(name).unwrap_or(name)
+    val scopes = a.tables.members.decl_scope
+
+    if scopes.get(origin).is_some() || scopes.get(name).is_some() then return s"method '${qualified_name(origin)}'"
+
+    qualified_name(origin)
+end crossing_shown

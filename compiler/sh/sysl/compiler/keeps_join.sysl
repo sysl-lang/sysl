@@ -1,0 +1,226 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.Span
+import sysl.buf.{Buf, buf}
+
+// **A pointer a thread holds is let go of when the thread is joined** -- the half of the
+// keeps-analysis (`keeps.sysl`) that follows a thread's handle from the call that started it to the
+// `join` that ends it.
+//
+// A call of a function that says `@joined(arg)` -- `sysl.threads.spawn` -- hands `arg` to a thread
+// that may go on reading it until the handle the call answers is joined. So the pointer is held at a
+// location named after where the handle is kept, `j:<place>`: `j:t` for a local `t`, `j:w.thread`
+// for a field of a local. A `join` called on that handle -- or on a local bound to it, through
+// `unwrap()`, a `match` arm or an `is` test -- overwrites the location, and a way out that reaches the
+// end of the body still holding it holds the pointer past the call, which `keeps_flow.sysl` decides
+// way by way. Two more ways let go of it:
+//
+// - a handle found to be `None` -- a `None` arm, the `else` of `if t is Some(h)` -- holds no thread;
+// - a join written on the call itself, `spawn(&work, &s).unwrap().join()`, ends the thread before
+//   the statement does.
+//
+// A handle kept anywhere a place cannot name -- an element at a computed index, a heap object, a
+// statement that throws it away -- can never be matched to its join, so the pointer is held for good.
+// A handle the body answers is held by whoever it answers it to: the location `j` again, which makes
+// a function that hands its own parameter to `spawn` and answers the handle `@joined` at that
+// parameter for its callers.
+
+// Where the handles in one body are kept, and the statement being said: the place its handle goes
+// (`at`), `^` for one the body answers, or nothing.
+struct Handles
+    org: &Origins
+    sources: Buf[(string, string)]
+    chained: Buf[Span]
+    answers: Buf[Span]
+    scrutinized: Buf[Span]
+    at: string
+end Handles
+
+// What one body binds a handle to, gathered once, before its ways are walked.
+handles_of(org: &Origins, f: TFunc) -> &Handles
+    val hs: &Handles = Handles(org, buf(), buf(), buf(), buf(), "")
+
+    walk_block_stmts(f.body, TWalk(false, e -> handle_expr(hs, e), w -> (), s -> handle_stmt(hs, s)))
+
+    if f.body.result.is_some() then hs.answers.push(f.body.result.unwrap().span)
+
+    hs
+end handles_of
+
+private handle_stmt(hs: &Handles, s: TStmt)
+    s match
+        TVarDecl(n, _, init, _) ->
+            val k = handle_key(hs, init)
+
+            // A thread started in the initializer is kept in `n` itself (`stmt_handle`).
+            if k != "" && k != n && !k.starts_with("@") then hs.sources.push((n, k))
+        TReturn(v) -> if v.is_some() then hs.answers.push(v.unwrap().span)
+        _ -> ()
+end handle_stmt
+
+// A local a `match` arm or an `is` test binds out of a handle is that handle; a `join` written on the
+// call that starts a thread ends the thread there.
+private handle_expr(hs: &Handles, e: TExpr)
+    *e.kind match
+        TCall(name, args, _, _) ->
+            if calls_member(name, "join") && !args.is_empty()
+                val started = started_call(args.at(0))
+
+                if started.is_some() then hs.chained.push(started.unwrap())
+            end if
+        TMatch(scrutinee, arms, _) ->
+            scrutinized(hs, scrutinee)
+
+            val k = handle_key(hs, scrutinee)
+
+            if k != ""
+                for arm in arms
+                    for p in arm.patterns
+                        bind_handle(hs, p, k)
+            end if
+        TIf(cond, _, _, _) ->
+            for term in cond
+                term match
+                    TCondIs(subject, patterns, _) ->
+                        scrutinized(hs, subject)
+
+                        val k = handle_key(hs, subject)
+
+                        if k != ""
+                            for p in patterns
+                                bind_handle(hs, p, k)
+                        end if
+                    _ -> ()
+        _ -> ()
+end handle_expr
+
+private bind_handle(hs: &Handles, p: TPattern, k: string)
+    p match
+        TBindPattern(n, _) -> if n != k then hs.sources.push((n, k))
+        TAtPattern(n, inner) ->
+            if n != k then hs.sources.push((n, k))
+
+            bind_handle(hs, *inner, k)
+        TVariantPattern(_, _, args) ->
+            for a in args
+                bind_handle(hs, a, k)
+        TStructPattern(_, args) ->
+            for a in args
+                bind_handle(hs, a, k)
+        _ -> ()
+end bind_handle
+
+// A call a `match` or an `is` test asks directly keeps its answer where the arms can name it: `@<n>`,
+// by the order the calls were met in.
+private scrutinized(hs: &Handles, subject: TExpr)
+    *subject.kind match
+        TCall(name, _, _, _) -> if !unwraps(name) && !has_span(hs.scrutinized, subject.span) then hs.scrutinized.push(subject.span)
+        _ -> ()
+end scrutinized
+
+private scrutinized_key(hs: &Handles, at: Span) -> string
+    for i in 0..<hs.scrutinized.len()
+        if hs.scrutinized.at(i) == at then return s"@$i"
+
+    ""
+end scrutinized_key
+
+// The call a `join`'s receiver was answered by, looking through `unwrap()` and `expect(...)`.
+private started_call(e: TExpr) -> Option[Span] = *e.kind match
+    TCall(name, args, _, _) -> if unwraps(name) && !args.is_empty() then started_call(args.at(0)) else Some(e.span)
+    TAddrOf(place, _) -> started_call(place)
+    TCast(v, _) -> started_call(v)
+    _ -> None
+
+// The place a handle is kept in, said as the frame's own location with its `l:` taken off; nothing
+// where the value is not a place the body can name again. A local bound to a handle is that handle.
+handle_key(hs: &Handles, e: TExpr) -> string = *e.kind match
+    TCall(name, args, _, _) ->
+        if unwraps(name) && !args.is_empty() then handle_key(hs, args.at(0)) else scrutinized_key(hs, e.span)
+    TCast(v, _) -> handle_key(hs, v)
+    TAddrOf(place, _) -> handle_key(hs, place)
+    TMatch(scrutinee, _, _) -> handle_key(hs, scrutinee)
+    TLoad(n, _) ->
+        var found = ""
+
+        for item in hs.sources
+            if item.0 == n then found = item.1
+
+        if found != "" then found else frame_place_key(hs, e)
+    TField(_, _, _) -> frame_place_key(hs, e)
+    _ -> ""
+
+private frame_place_key(hs: &Handles, e: TExpr) -> string
+    val loc = place_loc(hs.org, e)
+
+    if !loc.starts_with("l:") || loc.index_of("?").is_some() then return ""
+
+    loc[2..<loc.bytes.len]
+end frame_place_key
+
+// Where the statement being said keeps a handle: a local or a field of one it declares or assigns.
+stmt_handle(hs: &Handles, s: TStmt) -> string = s match
+    TVarDecl(n, _, _, _) -> n
+    TWriteStmt(w) -> frame_place_key(hs, w.place)
+    _ -> ""
+
+// An expression the body answers keeps its handle with whoever it is answered to, and a call a `match`
+// or an `is` test asks keeps it where the arms name it.
+expr_handle(hs: &Handles, e: TExpr) -> string =
+    if has_span(hs.answers, e.span) then "^" else scrutinized_key(hs, e.span)
+
+// The location a thread started by the statement being said holds its pointer at. `answered` is
+// whether a handle the body answers keeps it on for the caller (`j`) -- which a frame's own storage
+// cannot be, since the frame is gone when the caller joins.
+joined_loc(hs: &Handles, answered: bool) -> string
+    if hs.at == "" then return ""
+    if hs.at == "^" then return if answered then "j" else ""
+
+    s"j:${hs.at}"
+end joined_loc
+
+// A `join` overwrites what its handle's thread held.
+join_clear(hs: &Handles, evs: &EvBuf, name: string, args: Buf[TExpr], at: Span)
+    if !calls_member(name, "join") || args.is_empty() then return
+
+    val k = handle_key(hs, args.at(0))
+
+    if k != "" then evs.items.push(FlowEv(true, s"j:$k", "", at))
+end join_clear
+
+// A way on which a handle is known to be `None` holds no thread: the arm `None` matches, or the way
+// `Some(...)` did not.
+arm_clears(hs: &Handles, subject: TExpr, p: TPattern, matched: bool) -> Buf[FlowEv]
+    var out: Buf[FlowEv] = buf()
+    val k = handle_key(hs, subject)
+
+    if k == "" then return out
+
+    val word = p match
+        TVariantPattern(_, v, _) -> v.name
+        _ -> ""
+
+    if (matched && word == "None") || (!matched && word == "Some") then out.push(FlowEv(true, s"j:$k", "", subject.span))
+
+    out
+end arm_clears
+
+// Whether a lowered name calls a member named `word`: `sysl.threads$Thread.join`, and an instance,
+// whose type arguments follow the member -- `sysl$Option.unwrap.sysl.threads$Thread`.
+calls_member(name: string, word: string) -> bool
+    // A program's own module has no name, so its members are filed with no `$` before the type.
+    val tail = name.index_of("$") match
+        Some(home) -> name[home..<name.bytes.len]
+        None -> name
+
+    tail.ends_with(s".$word") || tail.index_of(s".$word.").is_some()
+end calls_member
+
+private unwraps(name: string) -> bool = calls_member(name, "unwrap") || calls_member(name, "expect")
+
+has_span(xs: Buf[Span], at: Span) -> bool
+    for x in xs
+        if x == at then return true
+
+    false
+end has_span

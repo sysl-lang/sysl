@@ -1,0 +1,173 @@
+module sh.sysl.compiler
+@tests
+
+// `@crossing` inferred where a body shows the domain (`crossing.sysl`, `reference/memory.md §
+// @crossing — where the rule is asked`): a parameter whose body hands it to `spawn`'s `arg`, to
+// another crossing parameter, or into a `&sync` place crosses, and every call of the function is held
+// to exactly the rule a written `@crossing` holds it to. Each refused cell names the parameter and the
+// function as the written form does; each accepted one runs.
+//
+// Skipped cells, and why: a `@domain(interrupt)` root is `tdx_`'s and `sharing.sysl`'s, not this
+// inference's; a closure called through its type and a trait's requirement show no body, so they are
+// the written form's (`azb_`, `scn_`), pinned here only for an `extern` and a function pointer.
+
+private ixc_prelude() -> string =
+    "import sysl.threads.*\n\nstruct Bad\n    r: &int\n\nlook[T](x: *T)\n    print(\"seen\")\n\n"
+
+private ixc_refused(body: string, want: string)
+    if !azd_ready() then return
+
+    val said = azd_err(ixc_prelude() + body)
+
+    assert(said.contains(want), said)
+
+private ixc_prints(body: string, want: string)
+    if !azd_ready() then return
+
+    twp_prints(ixc_prelude() + body, want)
+
+private ixc_bad(subject: string) -> string =
+    s"error: what $subject points at reaches another concurrency domain, so every count inside it has to be " +
+    "atomic — but its 'r' reaches a '&int', whose count is not"
+
+private ixc_call(f: string) -> string =
+    s"go()\n    var n = 1\n    var b = Bad(n)\n\n    $f(&b).unwrap().join()\n\ngo()\n"
+
+// -- how deep, and through what -------------------------------------------------------------------------
+
+@test("a parameter handed to 'spawn' crosses, and its caller is told as a written '@crossing' tells it")
+ixc_one_level()
+    ixc_refused("one(p: *Bad) -> Option[Thread] = spawn(&look, p)\n\n" + ixc_call("one"), ixc_bad("'p' of 'one'"))
+
+@test("and through a second function that hands it to the first")
+ixc_two_levels()
+    ixc_refused("one(p: *Bad) -> Option[Thread] = spawn(&look, p)\n\ntwo(q: *Bad) -> Option[Thread] = one(q)\n\n" +
+                ixc_call("two"), ixc_bad("'q' of 'two'"))
+
+@test("a recursive function settles on what its body does")
+ixc_recursion()
+    ixc_refused("rec(p: *Bad, k: int) -> Option[Thread] = if k == 0 then spawn(&look, p) else rec(p, k - 1)\n\n" +
+                "go()\n    var n = 1\n    var b = Bad(n)\n\n    rec(&b, 2).unwrap().join()\n\ngo()\n",
+                ixc_bad("'p' of 'rec'"))
+
+@test("a generic is asked at each instantiation")
+ixc_generic()
+    ixc_refused("hand[T](p: *T) -> Option[Thread] = spawn(&look, p)\n\n" + ixc_call("hand"), ixc_bad("'p' of 'hand'"))
+
+@test("a method's parameter, named as the method")
+ixc_method()
+    ixc_refused("struct Pool\n    k: int\n\n    go(self, p: *Bad) -> Option[Thread] = spawn(&look, p)\n\n" +
+                "run()\n    var n = 1\n    var b = Bad(n)\n\n    Pool(0).go(&b).unwrap().join()\n\nrun()\n",
+                ixc_bad("'p' of method 'Pool.go'"))
+
+@test("a nested function's parameter")
+ixc_nested()
+    ixc_refused("outer(p: *Bad) -> Option[Thread]\n    inner(q: *Bad) -> Option[Thread] = spawn(&look, q)\n\n" +
+                "    inner(p)\n\n" + ixc_call("outer"), ixc_bad("'p' of 'outer'"))
+
+@test("a pointer captured by a closure stored as a '&sync Fn' crosses")
+ixc_closure_in_a_sync_place()
+    ixc_refused("struct Cell\n    f: Option[&sync Fn() -> unit]\n\n" +
+                "stash(c: *Cell, p: *Bad)\n    c.f = Some(() -> look(p))\n\n" +
+                "go()\n    var n = 1\n    var b = Bad(n)\n    var c = Cell(None)\n\n    stash(&c, &b)\n\ngo()\n",
+                ixc_bad("'p' of 'stash'"))
+
+@test("a trait's default body that starts a thread with its parameter crosses it too")
+ixc_trait_default()
+    ixc_refused("trait Starter\n    begin(self, p: *Bad) -> Option[Thread] = spawn(&look, p)\n\n" +
+                "struct Mine\n    k: int\n\nimpl Starter for Mine\n\n" +
+                "go()\n    var n = 1\n    var b = Bad(n)\n\n    Mine(0).begin(&b).unwrap().join()\n\ngo()\n",
+                "what 'arg' of 'sysl.threads.spawn' points at reaches another concurrency domain")
+
+@test("a function the library compiled ahead of time is inferred from its own body")
+ixc_across_the_library()
+    if !azd_ready() then return
+
+    val said = azd_err("import sysl.threads.Thread\nimport sysl.posix.threads.spawn\n\nstruct Bad\n    r: &int\n\n" +
+                       "look(x: *Bad)\n    print(\"seen\")\n\ngo()\n    var n = 1\n    var b = Bad(n)\n\n" +
+                       "    spawn(&look, &b).unwrap().join()\n\ngo()\n")
+
+    assert(said.contains(ixc_bad("'arg' of 'sysl.posix.threads.spawn'")), said)
+
+// -- what may cross, exactly as the written form says ----------------------------------------------------
+
+@test("a pointee of scalars, arrays, '&sync' references and raw pointers crosses")
+ixc_crossable_kinds()
+    ixc_prints("struct Ok\n    n: int\n    a: [2]int\n    s: &sync int\n    p: *int\n\n" +
+               "hand(p: *Ok) -> Option[Thread] = spawn(&look, p)\n\n" +
+               "go()\n    var m = 3\n    var o = Ok(1, [1, 2], 7, &m)\n\n    hand(&o).unwrap().join()\n\ngo()\n", "seen\n")
+
+@test("a pointee holding a string is refused")
+ixc_string_refused()
+    ixc_refused("struct Str\n    s: string\n\nhand(p: *Str) -> Option[Thread] = spawn(&look, p)\n\n" +
+                "go()\n    var v = Str(\"x\")\n\n    hand(&v).unwrap().join()\n\ngo()\n",
+                "error: what 'p' of 'hand' points at reaches another concurrency domain, so every count inside it has " +
+                "to be atomic — but its 's' reaches a 'string', which owns its bytes through a count that is not atomic")
+
+@test("a pointee holding a slice is refused")
+ixc_slice_refused()
+    ixc_refused("struct Sl\n    v: []int\n\nhand(p: *Sl) -> Option[Thread] = spawn(&look, p)\n\n" +
+                "go()\n    var v = Sl([1, 2][..])\n\n    hand(&v).unwrap().join()\n\ngo()\n",
+                "error: what 'p' of 'hand' points at reaches another concurrency domain, so every count inside it has " +
+                "to be atomic — but its 'v' reaches a '[]int', which owns its elements through a count that is not atomic")
+
+@test("a by-value parameter handed to a by-value crossing one copies its views, as the written form does")
+ixc_by_value_view_copied()
+    if !azd_ready() then return
+
+    twp_prints("import sysl.threads.*\n\nforward(ch: *Channel[[]u8], v: []u8) -> bool = ch.try_send(v)\n\n" +
+               "var slots: [2][]u8 = [[]; 2]\nvar ch = channel(slots[..])\nvar mine: [3]u8 = [1, 2, 3]\n\n" +
+               "print(forward(&ch, mine[..]))\nmine[0] = 9\n\nval got = ch.try_receive().unwrap()\n\n" +
+               "print(got[0], got[2])\n", "true\n1 3\n")
+
+@test("and a by-value '&T' handed on is refused as the written form refuses it")
+ixc_by_value_ref_refused()
+    if !azd_ready() then return
+
+    val said = azd_err("import sysl.threads.*\n\nstruct Node\n    v: int\n\n" +
+                       "forward(ch: *Channel[&Node], v: &Node) -> bool = ch.try_send(v)\n\n" +
+                       "var slots: [2]&Node = [Node(0); 2]\nvar ch = channel(slots[..])\n\nprint(forward(&ch, Node(1)))\n")
+
+    assert(said.contains("error: 'v' of 'forward' reaches another concurrency domain"), said)
+
+// -- what is not inferred --------------------------------------------------------------------------------
+
+@test("a function pointer called with the parameter shows no body, so nothing crosses")
+ixc_function_pointer_not_inferred()
+    ixc_prints("call(f: *extern(*Bad) -> unit, p: *Bad) = f(p)\n\nshow(b: *Bad)\n    print(*b.r)\n\n" +
+               "go()\n    var n = 4\n    var b = Bad(n)\n\n    call(&show, &b)\n\ngo()\n", "4\n")
+
+@test("an 'extern' crosses nothing unless a sysl wrapper says '@crossing'")
+ixc_extern_needs_the_written_form()
+    if !azd_ready() then return
+
+    val body = "struct Bad\n    r: &int\n\nextern \"free\" c_free(p: *u8)\n\n"
+    val plain = azd_err(body + "hand(p: *Bad) = ()\n\ngo()\n    var n = 1\n    var b = Bad(n)\n\n    hand(&b)\n\ngo()\n")
+
+    assert_eq(plain, "")
+
+    val said = azd_err(body + "@crossing(p)\n@joined(p)\nhand(p: *Bad) = ()\n\n" +
+                       "go()\n    var n = 1\n    var b = Bad(n)\n\n    hand(&b)\n\ngo()\n")
+
+    assert(said.contains(ixc_bad("'p' of 'hand'")), said)
+
+// -- channels --------------------------------------------------------------------------------------------
+
+@test("a channel of plain references is refused at the send")
+ixc_channel_of_refs()
+    if !azd_ready() then return
+
+    val said = azd_err("import sysl.threads.*\n\nstruct Node\n    v: int\n\n" +
+                       "var slots: [2]&Node = [Node(0); 2]\nvar ch = channel(slots[..])\n\nprint(ch.try_send(Node(1)))\n")
+
+    assert(said.contains("error: 'value' of method 'sysl.threads.Channel[&Node].try_send' reaches another concurrency domain"),
+           said)
+
+@test("a struct holding a slice crosses a channel as a copy of the slice")
+ixc_channel_of_struct_with_slice()
+    if !azd_ready() then return
+
+    twp_prints("import sysl.threads.*\n\nstruct Msg\n    k: int\n    v: []u8\n\n" +
+               "var slots: [2]Msg = [Msg(0, []); 2]\nvar ch = channel(slots[..])\nvar mine: [2]u8 = [5, 6]\n\n" +
+               "print(ch.try_send(Msg(1, mine[..])))\nmine[0] = 0\n\nval got = ch.try_receive().unwrap()\n\n" +
+               "print(got.k, got.v[0], got.v[1])\n", "true\n1 5 6\n")

@@ -180,7 +180,7 @@ private member_attr_word(w: string) -> bool
     if fn_forgo_word(w) then return true
 
     for word in ["crossing", "reads", "writes", "noinline", "inline", "cold", "blocks",
-                 "relocates", "views", "consumes", "disjoint", "scoped"]
+                 "relocates", "views", "consumes", "disjoint", "scoped", "joined"]
         if word == w then return true
 
     false
@@ -230,7 +230,7 @@ builtin_attr_word(w: string) -> bool
                  "tailrec", "pure", "ghost", "packed", "reads", "writes", "align", "byte_order", "export",
                  "section", "crossing", "domain", "keeps", "disjoint", "guards", "needs",
                  "noinline", "inline", "cold", "thread_local", "abandons", "per_cpu", "main_thread",
-                 "pinned", "pins", "relocates", "views", "consumes", "blocks", "scoped"]
+                 "pinned", "pins", "relocates", "views", "consumes", "blocks", "scoped", "joined"]
         if word == w then return true
 
     false
@@ -368,6 +368,7 @@ parse_attribute(p: *Parser) -> Option[Attr]
     if word == "domain" then return parse_domain_attr(p)
     if word == "keeps" then return Some(Keeps(parse_named_list(p, "keeps")))
     if word == "scoped" then return Some(Scoped(parse_named_list(p, "scoped")))
+    if word == "joined" then return Some(Joined(parse_named_list(p, "joined")))
     if word == "disjoint" then return Some(Disjoint(parse_named_list(p, "disjoint")))
     if word == "guards" then return Some(Guards(parse_named_list(p, "guards")))
     if word == "needs" then return Some(Needs(parse_named_list(p, "needs")))
@@ -657,6 +658,8 @@ private named_list_refusal(word: string) -> string
 
     if word == "scoped" then return "'@scoped' names the parameters a function lets go of before its caller's scope ends — a callable a member runs in another concurrency domain, or a '*T' it holds while its caller waits — in parentheses: '@scoped(f)'. There is no empty form: a function that holds nothing past its call says so by not writing the annotation"
 
+    if word == "joined" then return "'@joined' names the '*T' parameters a call hands to the thread it starts, which holds each until the handle the call answers is joined, in parentheses — '@joined(arg)'. There is no empty form: a function whose thread holds nothing it was handed says so by not writing the annotation"
+
     if word == "guards" then return "'@guards' names the fields a struct's own members are the only way into, in parentheses — '@guards(value)'. There is no empty form: a struct that guards nothing says so by not writing the annotation"
 
     if word == "disjoint" then return "'@disjoint' names the pointer and slice parameters whose memory nothing else reaches while a call runs, in parentheses — '@disjoint(y, x)'. There is no empty form: a function whose parameters may overlap says so by not writing the annotation"
@@ -939,6 +942,7 @@ apply_func_attrs(f: *FuncDecl, attrs: Buf[Attr])
             Forgoes(cap) -> f.marks.forgoes.push(cap)
             Blocks -> f.marks.blocks = true
             Scoped(ns) -> f.marks.scoped = ns
+            Joined(ns) -> f.marks.joined = ns
             _ -> ()
 end apply_func_attrs
 
@@ -949,6 +953,7 @@ apply_member_attrs(m: *MethodDecl, attrs: Buf[Attr])
                 m.crossing = ns
                 m.marks.copies = ns
             Scoped(ns) -> m.marks.scoped = ns
+            Joined(ns) -> m.marks.joined = ns
             Disjoint(ns) -> m.marks.disjoint = ns
             Reads(ns) -> m.reads = Some(ns)
             Writes(ns) -> m.writes = Some(ns)
@@ -1219,6 +1224,9 @@ private attributed_refusal(attrs: Buf[Attr]) -> string
     // holds past the call is what `@keeps(...)` says.
     if any_is(attrs, "scoped")
         return "'@scoped' promises that a body lets go of a parameter before its caller's scope ends, so it marks a function or a method, whose body is sysl — an 'extern' borrows what it is handed for the call, and one that holds a pointer past it says '@keeps(...)'"
+
+    if any_is(attrs, "joined")
+        return "'@joined' says how long the thread a sysl function starts holds a pointer, so it marks a function or a method, whose body is sysl — an 'extern' that holds a pointer past the call says '@keeps(...)', and a sysl wrapper around it says '@joined'"
 
     if any_is(attrs, "guards")
         return "'@guards(...)' names the fields a struct's own members are the only way into, so it can only mark a struct — and this declares none"

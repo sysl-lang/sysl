@@ -1126,8 +1126,9 @@ If the value is computed into a local in an earlier statement and consumed there
 it is not in the frame at the `await`.
 
 **The check is made where the call that creates the task is visible.** A task that arrives as a
-plain parameter could have been created by any async function, so passing it on is refused unless
-that parameter is itself marked `@crossing`, which moves the check to the callers. A task held in a
+plain parameter could have been created by any async function, so passing it on moves the check to
+the callers: the parameter crosses — inferred from the body that hands it on, or marked `@crossing`
+where no body shows it — and each call is asked about the task it hands over. A task held in a
 `&sync` structure is checked where the structure is boxed, and one captured by a closure shared as a
 `&sync Fn` is checked at the closure. Everything refused here is accepted when the task stays in its
 own domain.

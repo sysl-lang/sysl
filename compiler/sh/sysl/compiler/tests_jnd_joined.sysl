@@ -1,0 +1,252 @@
+module sh.sysl.compiler
+@tests
+
+// A thread holds what it is handed until it is joined (`reference/memory.md § A thread holds what it
+// is handed until it is joined`): `spawn`'s `arg` is `@crossing` and `@joined`, so the address of a
+// function's own local may be handed to it only where the handle `spawn` answers is joined on every
+// way out of that function. Each accepted cell runs and prints what the thread did; each refused one
+// is told at the argument, in the keeps-analysis' words (`keeps_join.sysl`).
+//
+// Skipped cells, and why: a handle built into a struct literal (`W(spawn(...), 0)`) or stored through
+// a parameter (`w.t = spawn(...)` with `w: *W`) is held for good, since no join is matched to a place
+// the body cannot name again -- pinned below as refusals rather than as accepted shapes; a call
+// through a trait object that starts a thread sees no `@joined` and is the trait's promise
+// (`tests_kps_*`).
+
+private jnd_prelude() -> string =
+    "import sysl.threads.*\n\nstruct S\n    n: int\n\nwork(s: *S)\n    s.n = s.n + 1\n\n"
+
+private jnd_prints(body: string, want: string)
+    if !azd_ready() then return
+
+    twp_prints(jnd_prelude() + body, want)
+
+private jnd_refused(body: string, owner: string, at: string)
+    if !azd_ready() then return
+
+    val said = azd_err(jnd_prelude() + body)
+
+    assert(said.contains(s"error: 'spawn' keeps its parameter 'arg' (the thread it starts holds it until that " +
+                         s"thread is joined), and '&s' is the address of a local of '$owner' — join that thread " +
+                         s"on every way out of '$owner', or hand it storage that lasts"), said)
+    assert(said.contains(s"main.sysl:$at"), said)
+end jnd_refused
+
+// -- joined on every way out: accepted ------------------------------------------------------------
+
+@test("a handle joined before the function returns lets the thread have the address of a local")
+jnd_joined_after_binding()
+    jnd_prints("go()\n    var s = S(0)\n    val t = spawn(&work, &s).unwrap()\n\n    t.join()\n    print(s.n)\n\ngo()\n",
+               "1\n")
+
+@test("a 'None' arm that returns leaves before there is a thread to hold anything")
+jnd_none_arm_returns()
+    jnd_prints("go()\n    var s = S(0)\n    val t = spawn(&work, &s) match\n        Some(h) -> h\n" +
+               "        None -> return\n\n    t.join()\n    print(s.n)\n\ngo()\n", "1\n")
+
+@test("an Option handle matched, joined in its 'Some' arm and holding no thread in its 'None' arm")
+jnd_option_matched()
+    jnd_prints("go()\n    var s = S(0)\n    val t = spawn(&work, &s)\n\n    t match\n        Some(h) -> h.join()\n" +
+               "        None -> print(\"none\")\n\n    print(s.n)\n\ngo()\n", "1\n")
+
+@test("an 'is' test joins on the way it matched, and the other way holds 'None'")
+jnd_is_test()
+    jnd_prints("go()\n    var s = S(0)\n    val t = spawn(&work, &s)\n\n    if t is Some(h) then h.join()\n\n" +
+               "    print(s.n)\n\ngo()\n", "1\n")
+
+@test("a join written on the call itself ends the thread in the same statement")
+jnd_chained()
+    jnd_prints("go()\n    var s = S(0)\n\n    spawn(&work, &s).unwrap().join()\n    print(s.n)\n\ngo()\n", "1\n")
+
+@test("the call matched directly, joined in one arm")
+jnd_call_matched()
+    jnd_prints("go()\n    var s = S(0)\n\n    spawn(&work, &s) match\n        Some(t) -> t.join()\n" +
+               "        None -> ()\n\n    print(s.n)\n\ngo()\n", "1\n")
+
+@test("the call asked by an 'is' test, joined on the way it matched")
+jnd_call_is_test()
+    jnd_prints("go()\n    var s = S(0)\n\n    if spawn(&work, &s) is Some(t) then t.join()\n\n    print(s.n)\n\ngo()\n",
+               "1\n")
+
+@test("a '?' on the call leaves before the handle exists")
+jnd_question_on_the_call()
+    jnd_prints("go() -> Option[int]\n    var s = S(0)\n    val t = spawn(&work, &s)?\n\n    t.join()\n    Some(s.n)\n\n" +
+               "print(go().unwrap())\n", "1\n")
+
+@test("a 'defer' that joins covers every way out")
+jnd_deferred_join()
+    jnd_prints("go(stop: bool)\n    var s = S(0)\n    val t = spawn(&work, &s).unwrap()\n\n    defer t.join()\n\n" +
+               "    if stop then return\n\n    print(\"on\")\n\ngo(true)\ngo(false)\n", "on\n")
+
+@test("a handle copied into another local is joined through the copy")
+jnd_joined_through_a_copy()
+    jnd_prints("go()\n    var s = S(0)\n    val t = spawn(&work, &s).unwrap()\n    val u = t\n\n    u.join()\n" +
+               "    print(s.n)\n\ngo()\n", "1\n")
+
+@test("a thread started and joined inside each turn of a loop")
+jnd_loop_turns()
+    jnd_prints("go()\n    var s = S(0)\n\n    for _ in 0..<3\n        val t = spawn(&work, &s).unwrap()\n\n" +
+               "        t.join()\n\n    print(s.n)\n\ngo()\n", "3\n")
+
+@test("a function that joins inside keeps nothing, so its caller may hand it a local")
+jnd_wrapper_joins_inside()
+    jnd_prints("run(p: *S)\n    val t = spawn(&work, p).unwrap()\n\n    t.join()\n\n" +
+               "go()\n    var s = S(0)\n\n    run(&s)\n    print(s.n)\n\ngo()\n", "1\n")
+
+@test("a function that answers the handle passes the join on to its caller, one level and two")
+jnd_wrapper_answers_the_handle()
+    jnd_prints("start(p: *S) -> Option[Thread] = spawn(&work, p)\n\nagain(p: *S) -> Option[Thread]\n    return start(p)\n\n" +
+               "go()\n    var s = S(0)\n\n    start(&s).unwrap().join()\n    again(&s).unwrap().join()\n    print(s.n)\n\ngo()\n",
+               "2\n")
+
+@test("storage that lasts may be handed over and never joined")
+jnd_lasting_storage()
+    jnd_prints("var kept = S(0)\n\ngo()\n    val b: &S = S(0)\n\n    spawn(&work, &kept)\n" +
+               "    spawn(&work, &*b).unwrap().join()\n    print(b.n)\n\ngo()\n", "1\n")
+
+@test("the program's own statements are the program's frame, which outlives every thread")
+jnd_entry_file_exempt()
+    jnd_prints("var s = S(0)\nval t = spawn(&work, &s)\n\nt.unwrap().join()\nprint(s.n)\n", "1\n")
+
+@test("'spawn_on' is held to the same rule")
+jnd_spawn_on()
+    jnd_prints("go()\n    var room: [262144]u8 = [0; 262144]\n    var s = S(0)\n\n" +
+               "    spawn_on(room[..], &work, &s).unwrap().join()\n    print(s.n)\n\ngo()\n", "1\n")
+
+// -- a way out that skips the join: refused --------------------------------------------------------
+
+@test("a handle never joined holds the local past the call")
+jnd_never_joined()
+    jnd_refused("go()\n    var s = S(0)\n    val t = spawn(&work, &s)\n\n    print(t.is_some())\n\ngo()\n", "go", "11:26")
+
+@test("an early return before the join")
+jnd_early_return()
+    jnd_refused("go(stop: bool)\n    var s = S(0)\n    val t = spawn(&work, &s).unwrap()\n\n    if stop then return\n\n" +
+                "    t.join()\n\ngo(false)\n", "go", "11:26")
+
+@test("a '?' after the thread started and before the join")
+jnd_question_after_start()
+    jnd_refused("maybe() -> Option[int] = None\n\ngo() -> Option[int]\n    var s = S(0)\n" +
+                "    val t = spawn(&work, &s).unwrap()\n    val n = maybe()?\n\n    t.join()\n    Some(n)\n\n" +
+                "print(go().is_none())\n", "go", "13:26")
+
+@test("a 'Some' arm that does not join")
+jnd_arm_without_join()
+    jnd_refused("go()\n    var s = S(0)\n    val t = spawn(&work, &s)\n\n    t match\n        Some(h) -> print(\"on\")\n" +
+                "        None -> ()\n\ngo()\n", "go", "11:26")
+
+@test("a panic before the join is a way out that skips it")
+jnd_panic_before_join()
+    jnd_refused("go(bad: bool)\n    var s = S(0)\n    val t = spawn(&work, &s).unwrap()\n\n    if bad then panic(\"no\")\n\n" +
+                "    t.join()\n\ngo(false)\n", "go", "11:26")
+
+@test("a 'break' past the join")
+jnd_break_past_join()
+    jnd_refused("go()\n    var s = S(0)\n\n    loop\n        val t = spawn(&work, &s).unwrap()\n\n" +
+                "        if s.n > 0 then break\n\n        t.join()\n\ngo()\n", "go", "13:30")
+
+@test("a 'continue' past the join")
+jnd_continue_past_join()
+    jnd_refused("go()\n    var s = S(0)\n\n    for i in 0..<2\n        val t = spawn(&work, &s).unwrap()\n\n" +
+                "        if i == 0 then continue\n\n        t.join()\n\ngo()\n", "go", "13:30")
+
+@test("a thread whose handle is thrown away")
+jnd_discarded()
+    jnd_refused("go()\n    var s = S(0)\n\n    spawn(&work, &s)\n\ngo()\n", "go", "12:18")
+
+@test("a second thread started into a handle whose first was never joined")
+jnd_reassigned()
+    jnd_refused("go()\n    var s = S(0)\n    var t = spawn(&work, &s).unwrap()\n\n    for _ in 0..<2\n" +
+                "        t = spawn(&work, &s).unwrap()\n\n    t.join()\n\ngo()\n", "go", "14:26")
+
+@test("handles kept at a computed index cannot be matched to their joins")
+jnd_handles_in_an_array()
+    jnd_refused("go()\n    var s = S(0)\n    var ts: [2]Option[Thread] = [None; 2]\n\n    for i in 0..<2\n" +
+                "        ts[i] = spawn(&work, &s)\n\n    for i in 0..<2\n        ts[i] match\n" +
+                "            Some(h) -> h.join()\n            None -> ()\n\ngo()\n", "go", "14:30")
+
+@test("a handle built into a struct literal is not matched to a join of its field")
+jnd_handle_in_a_struct_literal()
+    jnd_refused("struct W\n    t: Thread\n    k: int\n\ngo()\n    var s = S(0)\n    var w = W(spawn(&work, &s).unwrap(), 0)\n\n" +
+                "    w.t.join()\n\ngo()\n", "go", "15:28")
+
+@test("a handle answered to the caller leaves the local behind")
+jnd_answered_from_the_frame()
+    jnd_refused("go() -> Option[Thread]\n    var s = S(0)\n\n    spawn(&work, &s)\n\ngo().unwrap().join()\n", "go", "12:18")
+
+@test("a function that answers the handle is refused to a caller that does not join it")
+jnd_wrapper_not_joined()
+    if !azd_ready() then return
+
+    val said = azd_err(jnd_prelude() + "start(p: *S) -> Option[Thread] = spawn(&work, p)\n\n" +
+                       "go()\n    var s = S(0)\n    val t = start(&s)\n\n    print(t.is_some())\n\ngo()\n")
+
+    assert(said.contains("error: 'start' keeps its parameter 'p' (it is passed to 'spawn', which keeps it), and " +
+                         "'&s' is the address of a local of 'go' — join that thread on every way out of 'go', " +
+                         "or hand it storage that lasts"), said)
+
+@test("a function that starts a thread and does not join it keeps its parameter for good")
+jnd_wrapper_never_joins()
+    if !azd_ready() then return
+
+    val said = azd_err(jnd_prelude() + "fire(p: *S)\n    val t = spawn(&work, p)\n\n" +
+                       "go()\n    var s = S(0)\n\n    fire(&s)\n\ngo()\n")
+
+    assert(said.contains("error: 'fire' keeps its parameter 'p' (it is passed to 'spawn', which keeps it), and " +
+                         "'&s' is the address of a local of 'go'\n"), said)
+
+// -- the annotation ----------------------------------------------------------------------------------
+
+@test("'@joined' names a parameter the function has, once, and one it says crosses")
+jnd_names_checked()
+    if !azd_ready() then return
+
+    val missing = azd_err("@crossing(p)\n@joined(q)\nf(p: *int) = ()\n\nvar n = 1\n\nf(&n)\n")
+
+    assert(missing.contains("error: '@joined' names 'q', which is not a parameter of 'f'"), missing)
+
+    val twice = azd_err("@crossing(p)\n@joined(p, p)\nf(p: *int) = ()\n\nvar n = 1\n\nf(&n)\n")
+
+    assert(twice.contains("error: '@joined' names 'p' twice — the second says nothing the first does not"), twice)
+
+    val alone = azd_err("@joined(p)\nf(p: *int) = ()\n\nvar n = 1\n\nf(&n)\n")
+
+    assert(alone.contains("error: '@joined' names 'p', which '@crossing' does not — a parameter is held until a " +
+                          "join only by the thread it reaches, so one that is joined also crosses: '@crossing(p)'"),
+           alone)
+
+@test("'@joined' has no empty form, and an 'extern' cannot carry it")
+jnd_empty_and_extern()
+    if !azd_ready() then return
+
+    val empty = azd_err("@crossing(p)\n@joined\nf(p: *int) = ()\n")
+
+    assert(empty.contains("'@joined' names the '*T' parameters a call hands to the thread it starts"), empty)
+
+    val on_extern = azd_err("@joined(p)\nextern \"abs\" c_abs(p: *int) -> int\n")
+
+    assert(on_extern.contains("'@joined' says how long the thread a sysl function starts holds a pointer"), on_extern)
+
+@test("a library author's '@joined' function is held to the rule like 'spawn'")
+jnd_user_written()
+    if !azd_ready() then return
+
+    val body = "struct H\n    k: int\n\n    join(self) -> bool = true\n\n@crossing(p)\n@joined(p)\n" +
+               "begin(p: *int) -> H = H(*p)\n\n"
+    val ok = azd_err(body + "go()\n    var n = 1\n    val h = begin(&n)\n\n    h.join()\n\ngo()\n")
+
+    assert_eq(ok, "")
+
+    val said = azd_err(body + "go()\n    var n = 1\n    val h = begin(&n)\n\ngo()\n")
+
+    assert(said.contains("error: 'begin' keeps its parameter 'p' (the thread it starts holds it until that thread " +
+                         "is joined), and '&n' is the address of a local of 'go'"), said)
+
+@test("a written '@crossing' on a pointer with no '@joined' keeps it for good")
+jnd_crossing_pointer_keeps()
+    if !azd_ready() then return
+
+    val said = azd_err("@crossing(p)\nhand(p: *int) = ()\n\ngo()\n    var n = 1\n\n    hand(&n)\n\ngo()\n")
+
+    assert(said.contains("error: 'hand' keeps its parameter 'p' (it reaches another concurrency domain), and '&n' " +
+                         "is the address of a local of 'go'\n"), said)

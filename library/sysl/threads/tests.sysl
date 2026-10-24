@@ -141,11 +141,13 @@ private add_many(c: *Counter) -> unit
 // lost a wake never finishes.
 @test("eight threads adding under one Mutex lose nothing")
 mutex_under_contention() -> unit
-    var c = Counter(Mutex.new(0), 50000)
+    // Eight handles joined out of an array are more than any one way through the test can be seen to
+    // join, so the counter they share is a box's rather than the frame's.
+    val c: &Counter = Counter(Mutex.new(0), 50000)
     var threads: [8]Option[Thread] = [None; 8]
 
     for i in 0..<8
-        threads[i] = spawn(&add_many, &c)
+        threads[i] = spawn(&add_many, &*c)
 
     for i in 0..<8
         threads[i] match
@@ -278,7 +280,11 @@ spawn_on_too_small() -> unit
     var room: [8]u8 = [0; 8]
     var s = Seen(0, 0)
 
-    assert(spawn_on(room[..], &look, &s).is_none())
+    spawn_on(room[..], &look, &s) match
+        Some(t) ->
+            assert(t.join())
+            assert(false, "a thread was started on eight bytes")
+        None -> ()
 
 @test("a hosted target lays no thread-local block of its own")
 hosted_tls_is_the_c_library_s() -> unit
