@@ -1,0 +1,629 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// What the keeps-analysis (`keeps.sysl`) accepts because the storage a pointer is held in is still
+// nameable: a function reached through a pointer whose every call is in sight, an address stored as
+// an integer, and a place reached through a pointer the body does not change -- each beside the
+// near miss that is still refused. `reference/memory.md § A borrowed pointer cannot escape` is the
+// specification.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private kfp_outcome(text: string) -> (string, int)
+    val root = make_temp_dir("sysl-kfp").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (failure_text(why), -1)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> ("the program that was built could not be run", -1)
+        Ok(out) -> (out.text + out.err.unwrap_or(""), shell_status(out.status))
+end kfp_outcome
+
+private kfp_prints(text: string, want: string)
+    if xvr_no_library() then return
+
+    val out = kfp_outcome(text)
+
+    assert_eq(out.0, want)
+    assert_eq(out.1, 0)
+end kfp_prints
+
+private kfp_refused(text: string, part: string)
+    if xvr_no_library() then return
+
+    val out = kfp_outcome(text)
+
+    assert_eq(out.1, -1, out.0)
+    assert(out.0.index_of(part).is_some(), out.0)
+end kfp_refused
+
+// A machine whose stack pointer a primitive writes back, and the pointer type primitives are called
+// through.
+private kfp_machine() -> string = raw"""
+    struct M
+        sp: *isize
+
+    type Code = *extern(*M, *isize) -> unit
+
+    halt(m: *M, sp: *isize)
+        m.sp = sp
+
+    """
+
+private kfp_through() -> string =
+    "a call through '*extern(*M, *isize) -> unit' may reach 'halt', which keeps its parameter 'sp' " +
+        "(it is stored in 'm.sp'), and '&local' is the address of a local of 'run'"
+
+private kfp_promise() -> string =
+    "'halt' keeps its parameter 'sp' (it is stored in 'm.sp'), and its address is taken — a call " +
+        "through a function pointer sees no body"
+
+// -- a function reached through a pointer ---------------------------------------------------------
+
+@test("a primitive whose address is taken may write its stack pointer back into the machine")
+kfp_writeback_accepted()
+    kfp_prints(kfp_machine() + raw"""
+        var stack: [8]isize
+        var m: M
+
+        main()
+            m.sp = &stack[0]
+            val f: Code = &halt
+
+            f(&m, m.sp)
+            print(usize(m.sp) == usize(&stack[0]))
+        """, "true\n")
+
+@test("lent through a pointer and taken back, a frame's own machine, and a primitive relaying its own stack pointer")
+kfp_relayed_accepted()
+    kfp_prints(kfp_machine() + raw"""
+        step(m: *M, sp: *isize)
+            val f: Code = &halt
+
+            f(m, &sp[1])
+
+        var stack: [8]isize
+        var m: M
+
+        run(f: Code) -> bool
+            var local: [2]isize = [0, 0]
+            var own: M
+
+            f(&m, &local[0])
+            m.sp = &stack[0]
+            f(&own, &local[1])
+            usize(own.sp) >= usize(&local[1])
+
+        main()
+            m.sp = &stack[0]
+            print(run(&step))
+            print(run(&halt))
+            print(usize(m.sp) == usize(&stack[0]))
+        """, "true\ntrue\ntrue\n")
+
+@test("a call through the pointer handing a local to be held in a module machine is refused")
+kfp_local_through_pointer_refused()
+    kfp_refused(kfp_machine() + raw"""
+        var stack: [8]isize
+        var m: M
+
+        run(f: Code)
+            var local: isize = 0
+
+            f(&m, &local)
+
+        main()
+            m.sp = &stack[0]
+            run(&halt)
+        """, kfp_through())
+
+@test("taken back on one way out only is refused")
+kfp_early_return_refused()
+    kfp_refused(kfp_machine() + raw"""
+        var stack: [8]isize
+        var m: M
+
+        run(f: Code, early: bool)
+            var local: isize = 0
+
+            f(&m, &local)
+
+            if early then return
+
+            m.sp = &stack[0]
+
+        main()
+            m.sp = &stack[0]
+            run(&halt, false)
+        """, kfp_through())
+
+@test("a primitive relaying its parameter through a pointer is held to what the callee keeps")
+kfp_relay_chain_refused()
+    kfp_refused(kfp_machine() + raw"""
+        step(m: *M, sp: *isize)
+            val f: Code = &halt
+
+            f(m, sp)
+
+        var m: M
+
+        run(f: Code)
+            var local: isize = 0
+
+            f(&m, &local)
+
+        main()
+            run(&step)
+        """, kfp_through())
+
+@test("the function whose address is taken, called directly, is held to its body")
+kfp_direct_call_refused()
+    kfp_refused(kfp_machine() + raw"""
+        var m: M
+
+        run()
+            var local: isize = 0
+
+            halt(&m, &local)
+
+        main()
+            val f: Code = &halt
+
+            run()
+            f(&m, m.sp)
+        """, "'halt' keeps its parameter 'sp' (it is stored in 'm.sp'), and '&local' is the address of a local of 'run'")
+
+@test("a pointer type handed to C reaches bodies held to the default")
+kfp_handed_to_c_refused()
+    kfp_refused(kfp_machine() + raw"""
+        extern register_code(f: Code)
+
+        main()
+            register_code(&halt)
+        """, kfp_promise())
+
+@test("a pointer type in a struct C is handed reaches bodies held to the default")
+kfp_struct_to_c_refused()
+    kfp_refused(kfp_machine() + raw"""
+        struct Table
+            code: Code
+
+        extern install(t: *Table)
+
+        var table: Table
+
+        main()
+            table.code = &halt
+            install(&table)
+        """, kfp_promise())
+
+@test("a pointer type stored in a variable C declares reaches bodies held to the default")
+kfp_c_variable_refused()
+    kfp_refused(kfp_machine() + raw"""
+        extern hook: Code
+
+        main()
+            hook = &halt
+        """, kfp_promise())
+
+@test("a second function at the pointer type that keeps in module storage is refused where it is written")
+kfp_sibling_refused()
+    kfp_refused(kfp_machine() + raw"""
+        var last: *isize = null
+
+        stash(m: *M, sp: *isize)
+            last = sp
+
+        var m: M
+
+        main()
+            var f: Code = &halt
+
+            f = &stash
+            f(&m, m.sp)
+        """, "'stash' keeps its parameter 'sp' (it is stored in 'last'), and its address is taken")
+
+// -- an address stored as an integer ----------------------------------------------------------------
+
+@test("a struct's own address as an integer stored in it, from a function whose address is taken")
+kfp_integer_selfstore_accepted()
+    kfp_prints(raw"""
+        struct M
+            buf: [4]u8
+            src: usize
+
+        type Code = *extern(*M) -> unit
+
+        point(m: *M)
+            m.src = usize(&m.buf[0])
+
+        var m: M
+
+        main()
+            val f: Code = &point
+
+            f(&m)
+            print(m.src == usize(&m.buf[0]))
+        """, "true\n")
+
+@test("a local's own address as an integer stored in it, by a direct call")
+kfp_integer_selfstore_direct_accepted()
+    kfp_prints(raw"""
+        struct M
+            buf: [4]u8
+            src: usize
+
+        point(m: *M)
+            m.src = usize(&m.buf[0])
+
+        hold() -> usize
+            var m: M
+
+            point(&m)
+            m.src - usize(&m.buf[0])
+
+        main()
+            print(hold())
+        """, "0\n")
+
+@test("an address as an integer stored in module storage and overwritten, an offset one, and one turned back")
+kfp_integer_forms_accepted()
+    kfp_prints(raw"""
+        import sysl.raw.ptr_cast
+
+        struct M
+            buf: [4]u8
+            src: usize
+            back: *u8
+
+        type Code = *extern(*M) -> unit
+
+        var spare: usize = 0
+        var held: usize = 0
+
+        point(m: *M)
+            m.src = usize(&m.buf[0]) + 1
+            m.back = ptr_cast(usize(&m.buf[1]))
+
+        lend(m: *M)
+            held = usize(&m.buf[2])
+            m.buf[2] = 7
+            held = spare
+
+        var m: M
+
+        main()
+            val f: Code = &point
+            val g: Code = &lend
+
+            f(&m)
+            g(&m)
+            print(m.src == usize(&m.buf[0]) + 1)
+            print(usize(m.back) == usize(&m.buf[1]))
+            print(held == 0)
+        """, "true\ntrue\ntrue\n")
+
+@test("a local's address as an integer stored in module storage is refused")
+kfp_integer_in_module_storage_refused()
+    kfp_refused(raw"""
+        struct M
+            buf: [4]u8
+
+        var src: usize = 0
+
+        point(m: *M)
+            src = usize(&m.buf[0])
+
+        hold() -> bool
+            var m: M
+
+            point(&m)
+            src != 0
+
+        main()
+            print(hold())
+        """, "'point' keeps its parameter 'm' (it is stored in 'src'), and '&m' is the address of a local of 'hold'")
+
+// -- a place reached through a pointer the body does not change -----------------------------------
+
+// A console lent to a machine for the length of a call, and a closure that hands the call its sink.
+private kfp_session() -> string = raw"""
+    struct Out
+        n: int
+
+    struct Con
+        out: *Out
+
+    struct M
+        con: *Con
+
+    struct Session
+        vm: *M
+
+    var sink = Out(0)
+    var home = Con(&sink)
+    var m = M(&home)
+    var m2 = M(&home)
+
+    run(f: *Out -> unit)
+        var o = Out(0)
+
+        f(&o)
+        print(o.n)
+
+    """
+
+private kfp_closure() -> string =
+    "a closure borrows what it is handed for the call, and this one keeps its parameter 'out' (it is " +
+        "passed to 'eval', which keeps it)"
+
+@test("lent through a parameter's field spelled out, through an alias, and put back from a parameter")
+kfp_restored_paths_accepted()
+    kfp_prints(kfp_session() + raw"""
+        struct Back
+            vm: *M
+            home: *Con
+
+        spelled(s: *Session, out: *Out)
+            var con = Con(out)
+
+            s.vm.con = &con
+            s.vm.con.out.n += 1
+            s.vm.con = &home
+
+        aliased(s: *Session, out: *Out)
+            val vm = s.vm
+            var con = Con(out)
+
+            vm.con = &con
+            vm.con.out.n += 2
+            vm.con = &home
+
+        from_param(b: *Back, out: *Out)
+            val vm = b.vm
+            var con = Con(out)
+
+            vm.con = &con
+            vm.con.out.n += 3
+            vm.con = b.home
+
+        main()
+            var s = Session(&m)
+            var b = Back(&m, &home)
+
+            run((out) -> spelled(&s, out))
+            run((out) -> aliased(&s, out))
+            run((out) -> from_param(&b, out))
+        """, "1\n2\n3\n")
+
+@test("lent through module storage, through a callee holding it at the alias, and put back by a defer")
+kfp_restored_forms_accepted()
+    kfp_prints(kfp_session() + raw"""
+        var g = Session(&m)
+
+        set_con(vm: *M, c: *Con) = vm.con = c
+
+        through_global(out: *Out)
+            var con = Con(out)
+
+            g.vm.con = &con
+            g.vm.con.out.n += 1
+            g.vm.con = &home
+
+        through_callee(s: *Session, out: *Out)
+            val vm = s.vm
+            var con = Con(out)
+
+            set_con(vm, &con)
+            vm.con.out.n += 10
+            vm.con = &home
+
+        deferred(s: *Session, out: *Out)
+            val vm = s.vm
+            var con = Con(out)
+
+            defer vm.con = &home
+            vm.con = &con
+            vm.con.out.n += 100
+
+        main()
+            var s = Session(&m)
+
+            run((out) -> through_global(out))
+            run((out) -> through_callee(&s, out))
+            run((out) -> deferred(&s, out))
+            print(m.con.out.n)
+        """, "1\n10\n100\n0\n")
+
+@test("the pointer on the path changed between the store and the overwrite is refused")
+kfp_pointer_changed_refused()
+    kfp_refused(kfp_session() + raw"""
+        eval(s: *Session, out: *Out)
+            var con = Con(out)
+
+            s.vm.con = &con
+            s.vm = &m2
+            s.vm.con = &home
+
+        main()
+            var s = Session(&m)
+
+            run((out) -> eval(&s, out))
+        """, kfp_closure())
+
+@test("a call between the store and the overwrite of a pointer read out of memory is refused")
+kfp_call_between_refused()
+    kfp_refused(kfp_session() + raw"""
+        swap_machine(s: *Session) = s.vm = &m2
+
+        eval(s: *Session, out: *Out)
+            var con = Con(out)
+
+            s.vm.con = &con
+            swap_machine(s)
+            s.vm.con = &home
+
+        main()
+            var s = Session(&m)
+
+            run((out) -> eval(&s, out))
+        """, kfp_closure())
+
+@test("an alias bound afresh on each turn of a loop does not overwrite the last turn's store")
+kfp_rebound_alias_refused()
+    kfp_refused(kfp_session() + raw"""
+        struct Pair
+            vms: [2]*M
+
+        eval(s: *Pair, out: *Out)
+            var con = Con(out)
+
+            for i in 0..<2
+                val vm = s.vms[i]
+
+                vm.con = &home
+
+                if i == 1 then break
+
+                vm.con = &con
+
+        main()
+            var s = Pair([&m, &m2])
+
+            run((out) -> eval(&s, out))
+        """, kfp_closure())
+
+@test("an alias written between the store and the overwrite is refused")
+kfp_written_alias_refused()
+    kfp_refused(kfp_session() + raw"""
+        eval(s: *Session, out: *Out)
+            var vm = s.vm
+            var con = Con(out)
+
+            vm.con = &con
+            vm = &m2
+            vm.con = &home
+
+        main()
+            var s = Session(&m)
+
+            run((out) -> eval(&s, out))
+        """, kfp_closure())
+
+@test("an early way out between the store through an alias and its overwrite is refused")
+kfp_alias_early_return_refused()
+    kfp_refused(kfp_session() + raw"""
+        eval(s: *Session, out: *Out)
+            val vm = s.vm
+            var con = Con(out)
+
+            vm.con = &con
+
+            if out.n == 0 then return
+
+            vm.con = &home
+
+        main()
+            var s = Session(&m)
+
+            run((out) -> eval(&s, out))
+        """, kfp_closure())
+
+// -- every refusal in a function -------------------------------------------------------------------
+
+@test("a call storing a local and a store of another at the same location are both refused")
+kfp_two_refusals_one_location()
+    if xvr_no_library() then return
+
+    val out = kfp_outcome(raw"""
+        struct Con
+            n: int
+
+        struct M
+            con: *Con
+
+        var m: M
+
+        boot(vm: *M, con: *Con)
+            vm.con = con
+
+        run()
+            var con = Con(3)
+
+            boot(&m, &con)
+
+            var other = Con(4)
+
+            m.con = &other
+
+        main()
+            run()
+        """)
+
+    assert_eq(out.1, -1, out.0)
+
+    val first = out.0.index_of("'boot' keeps its parameter 'con' (it is stored in 'vm.con'), and '&con' is the " +
+        "address of a local of 'run'")
+    val second = out.0.index_of("'&other' is the address of a local of 'run', and it is stored in 'm.con', which " +
+        "outlives 'run'")
+
+    assert(first.is_some() && second.is_some(), out.0)
+    assert(first.unwrap() < second.unwrap(), out.0)
+end kfp_two_refusals_one_location
+
+@test("a local stored in a loop's match arm is refused beside an earlier call's refusal")
+kfp_two_refusals_in_an_arm()
+    if xvr_no_library() then return
+
+    val out = kfp_outcome(raw"""
+        struct Con
+            n: int
+
+        struct M
+            con: *Con
+
+        var home = Con(1)
+        var m = M(&home)
+
+        boot(vm: *M, con: *Con)
+            vm.con = con
+
+        pick(i: int) -> Option[int] = if i > 0 then Some(i) else None
+
+        run()
+            var con = Con(0)
+
+            boot(&m, &con)
+
+            for i in 0..<3
+                pick(i) match
+                    Some(k) ->
+                        var file = Con(k)
+
+                        m.con = &file
+                    None -> ()
+
+        main()
+            run()
+        """)
+
+    assert_eq(out.1, -1, out.0)
+    assert(out.0.index_of("'&con' is the address of a local of 'run'").is_some(), out.0)
+    assert(out.0.index_of("'&file' is the address of a local of 'run', and it is stored in 'm.con'").is_some(), out.0)
+end kfp_two_refusals_in_an_arm

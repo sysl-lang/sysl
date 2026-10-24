@@ -3903,7 +3903,8 @@ run()
 
 **Where it is stored decides, not only that it is.** A pointer stored into what it points at — a node
 linked to itself, a struct whose field points into its own buffer — ends exactly when that storage
-does, so it is not kept. One stored into what *another* parameter points at is the caller's to judge:
+does, so it is not kept — and so is the address stored as an integer, `m.src = usize(&m.buf[0])`,
+which is held exactly where the pointer would be. One stored into what *another* parameter points at is the caller's to judge:
 if that argument points into the caller's own frame, the pointer stays in the frame too. That is what
 makes an out-parameter, a pair of linked nodes or a list built in a local array work as written:
 
@@ -3976,6 +3977,53 @@ print(run())
 
 ```output
 42
+```
+
+**The place may be reached through a pointer**, spelled out (`s.vm.con`) or through a local that
+holds it (`val vm = s.vm`), so long as the store and the overwrite are known to reach the same
+storage: a local bound once and never written holds one pointer, and a pointer read out of memory is
+the same one until a call, or a store of a pointer of its type, may have changed it. A console lent
+to a machine for one evaluation is put back that way:
+
+```sysl
+struct Out
+    n: int
+
+struct Con
+    out: *Out
+
+struct M
+    con: *Con
+
+struct Session
+    vm: *M
+    home: *Con
+
+static var sink = Out(0)
+static var home = Con(&sink)
+static var m = M(&home)
+
+eval(s: *Session, out: *Out)
+    val vm = s.vm
+    var con = Con(out)
+
+    vm.con = &con
+    vm.con.out.n += 1
+    vm.con = s.home
+
+run(s: *Session) -> int
+    var o = Out(0)
+
+    eval(s, &o)
+    o.n
+
+var s = Session(&m, &home)
+
+print(run(&s))
+```
+
+```output
+1
 ```
 
 A way out that skips the clear leaves it held: an early `return`, a `?`, a call that never comes back
@@ -4134,7 +4182,8 @@ C programs already live by — **a pointer handed to a call is borrowed for the 
 |---|---|
 | a sysl function | what its body keeps |
 | a method through a trait object | no pointer it is handed — an implementation reached through an object that keeps one is refused where it is written; an object it is handed, a callback among them, is kept wherever any implementation keeps it |
-| a closure, or a function through a pointer | nothing — a closure, or a function whose address is taken, that keeps what it is handed is refused where it is written |
+| a closure | nothing — a closure that keeps what it is handed is refused where it is written |
+| a function through a pointer | what any function whose address is taken at that pointer's type holds in what another of its parameters points at — one that keeps a pointer anywhere else is refused where it is written, and so is every one whose pointer type C can reach |
 | an `extern` | nothing, unless its declaration says [`@keeps(p)`](/reference/ffi/#keeps-a-c-function-that-holds-on-to-a-pointer) |
 
 A default is a promise, so the body behind it is held to it. That is what makes a lock's `with`
@@ -4177,6 +4226,62 @@ impl Bump for Keeper
 ```error
 'bump' keeps its parameter 'n' (it is stored in 'self.held'), but a method of 'Bump' borrows its parameters for the call
 ```
+
+**Every call through a function pointer is in the program, unless C can reach the pointer.** So a
+function whose address is taken may hold what it is handed in what another of its parameters points
+at — an interpreter's primitive writing its stack pointer back into the machine — and each call
+through a pointer of that type is held to it, as a direct call is: the machine it hands over says
+what the stack pointer may point at.
+
+```sysl
+struct M
+    sp: *isize
+
+type Code = *extern(*M, *isize) -> unit
+
+halt(m: *M, sp: *isize)
+    m.sp = sp
+
+var stack: [8]isize
+var m: M
+
+m.sp = &stack[0]
+val f: Code = &halt
+
+f(&m, m.sp)
+print(usize(m.sp) == usize(&stack[0]))
+```
+
+```output
+true
+```
+
+```sysl
+struct M
+    sp: *isize
+
+type Code = *extern(*M, *isize) -> unit
+
+halt(m: *M, sp: *isize)
+    m.sp = sp
+
+var m: M
+
+run(f: Code)
+    var local: isize = 0
+
+    f(&m, &local)
+```
+
+```error
+a call through '*extern(*M, *isize) -> unit' may reach 'halt', which keeps its parameter 'sp' (it is stored in 'm.sp'), and '&local' is the address of a local of 'run'
+```
+
+A pointer type handed to C — an argument to an `extern`, a field of a struct one is handed, a
+variable an `extern` declares, or a parameter or answer of an `@export` function — may be called with
+anything, so every function whose address is taken at that type is held to the default. A function
+pointer turned into an integer and back is the raw tier's bargain: it is called through the type its
+address was taken at.
 
 **A stored callback keeps what it captured, and nothing else.** A closure is an object, and storing
 one — in a field, module storage, a buffer, a trait's implementation — is refused only where the
