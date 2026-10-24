@@ -158,6 +158,8 @@ check_keeps(a: &Analysis, funcs: Buf[TFunc], vtables: Buf[TVtable])
     loop
         faults = KeepFaults(buf())
 
+        warm_callees_first(cx)
+
         for f in funcs
             check_calls(cx, faults, f)
             refuse_promised(cx, faults, f)
@@ -210,6 +212,87 @@ private settled_round(cx: &KeepsCx) -> bool
     cx.origins = map()
     false
 end settled_round
+
+// **Every body's questions are asked callees first**, so that answering one never nests a walk per
+// call down a chain as long as the program: a body is asked after every body it calls has been, and
+// each call it reads is then answered from the memo. Asked only on demand from the top, a chain of
+// thirty-two thousand calls nested four frames of walking per call and overflowed the compiler's
+// stack. The order is a depth-first walk of the calls kept on a stack of its own; a call back into
+// a body still on that stack is the recursion `summary` already answers by assumption.
+private warm_callees_first(cx: &KeepsCx)
+    var done: Map[string, bool] = map()
+
+    for root in cx.funcs
+        if done.has(root.name) then continue
+
+        done.put(root.name, true)
+
+        var names: Buf[string] = buf()
+        var calls: Buf[Buf[string]] = buf()
+        var next: Buf[usize] = buf()
+
+        names.push(root.name)
+        calls.push(callees_of(root))
+        next.push(0)
+
+        while names.len() > 0
+            val top = names.len() - 1
+            val at = next.pop().unwrap_or(0)
+            val list = calls.at(top)
+
+            if at < list.len()
+                next.push(at + 1)
+
+                val callee = list.at(at)
+
+                if done.has(callee) then continue
+
+                done.put(callee, true)
+
+                cx.find(callee) match
+                    Some(g) ->
+                        names.push(callee)
+                        calls.push(callees_of(g))
+                        next.push(0)
+                    None -> ()
+            else
+                cx.find(names.at(top)) match
+                    Some(f) -> ask_every_question(cx, f)
+                    None -> ()
+
+                names.truncate(top)
+                calls.truncate(top)
+            end if
+        end while
+end warm_callees_first
+
+// Every question a call may ask of `f`, so that the answers are in the memo before a caller reads them.
+private ask_every_question(cx: &KeepsCx, f: TFunc)
+    clears_of(cx, f.name)
+
+    for i in 0..<f.params.len()
+        keeps_of(cx, f.name, i)
+        answers_of(cx, f.name, i)
+        raw_answers_of(cx, f.name, i)
+end ask_every_question
+
+// The functions `f`'s body calls by name, in the order they are written, a name once for each call.
+private struct Callees
+    names: Buf[string]
+end Callees
+
+private callees_of(f: TFunc) -> Buf[string]
+    val out: &Callees = Callees(buf())
+
+    walk_block_stmts(f.body, expr_walk(false, e -> note_callee(out, e)))
+    out.names
+end callees_of
+
+private note_callee(out: &Callees, e: TExpr)
+    *e.kind match
+        TCall(name, _, _, _) -> out.names.push(name)
+        _ -> ()
+end note_callee
 
 // What a question is answered with before any round has worked it out: nothing kept, nothing an
 // answer is made of -- and everything overwritten, which is the one that narrows.
