@@ -75,7 +75,7 @@ end lookup_trait_member
 //
 // Nothing where the name is not a type, which is what leaves an ordinary member read to answer.
 associated_call(cx: &Analyzer, span: Span, receiver: Expr, name: string, args: Buf[Expr],
-                expected: Option[Type]) -> Option[TExpr]
+                expected: Option[Type], targs: Buf[Expr] = no_written_members()) -> Option[TExpr]
     val subject = subject_named(cx, receiver) match
         Some(found) -> Some(found)
         // **A GENERIC type has no instance under its bare name**, so the walk above answers nothing
@@ -104,7 +104,7 @@ associated_call(cx: &Analyzer, span: Span, receiver: Expr, name: string, args: B
     // **The traits the WRITTEN name was bounded by.** `T.zero()` still has the `T` in it, so a body
     // whose signature asked `T` for a `Zero` reaches that trait's `zero` even where the file that
     // instantiated it imported another trait declaring one for the very same type.
-    associated_on(cx, span, subject.unwrap(), name, args, expected, written_bound(cx, receiver))
+    associated_on(cx, span, subject.unwrap(), name, args, expected, written_bound(cx, receiver), targs)
 end associated_call
 
 // The call `associated_call` makes once it knows which type the name in front of the dot stands for
@@ -112,7 +112,8 @@ end associated_call
 // anybody wrote (`reference/expressions.md § A leading dot`). The two spellings reach the member
 // through this one body, which is what makes them fail in the same words.
 associated_on(cx: &Analyzer, span: Span, ty: Type, name: string, args: Buf[Expr],
-              expected: Option[Type], via: Buf[string]) -> Option[TExpr]
+              expected: Option[Type], via: Buf[string],
+              targs: Buf[Expr] = no_written_members()) -> Option[TExpr]
     if ty == Unknown then return Some(bad_expr(span))
 
     // A parameter standing in for itself answers off the bounds it carries, exactly as a value of it
@@ -229,7 +230,12 @@ associated_on(cx: &Analyzer, span: Span, ty: Type, name: string, args: Buf[Expr]
         check_member_visible(cx, span, found.0, picked, decl, via)
 
         return Some(call_generic_member(cx, span, None, ty, found.0, decl, generic.unwrap(),
-                                        found.1, args, expected, name, no_written_members()))
+                                        found.1, args, expected, name, targs))
+    end if
+
+    if !targs.is_empty()
+        return Some(cx.err(span, s"'$picked' is not generic, so it has no type arguments to " +
+                           s"write — the call is '${qualified_name(found.0)}.$name(…)'"))
     end if
 
     val fname = member_func_name(cx, span, ty, picked)

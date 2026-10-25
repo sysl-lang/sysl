@@ -1541,6 +1541,24 @@ print(r.data.len)
 5
 ```
 
+An associated function's own parameters are written the same way, through the type:
+
+```sysl
+struct Sq
+    n: u32
+
+impl Sq
+    scaled[U: Integer, const K: u32](x: U) -> U = x * U(K)
+
+const Two: u32 = 2
+
+print(Sq.scaled[i64, Two](5))
+```
+
+```output
+10
+```
+
 An integer constant is read at the parameter's type wherever it is handed to the parameter itself,
 and refused only where its value does not fit, so `const Base = 2`, an `int`, still makes `Ring[Base]`
 and `Ring[Base + 1]`. Inside the expression the ordinary rules hold: a function's parameter takes
