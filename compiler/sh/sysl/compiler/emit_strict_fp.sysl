@@ -16,8 +16,9 @@ import sysl.math.bigint.{BigInt, from_int, negate, pow, sub}
 // becomes its `llvm.experimental.constrained.*` form, told `round.dynamic` where the operation rounds
 // and `fpexcept.strict` always; the definition carries `strictfp`, and so does every call in it,
 // which is what LLVM asks of a function holding constrained operations. `fneg`, `fabs` and
-// `copysign` are left as they are: they touch the sign bit and nothing else, round nothing and raise
-// nothing.
+// `copysign` touch the sign bit and nothing else, round nothing and raise nothing, so none becomes
+// an intrinsic; but a negation is fenced on both sides, since the back ends would otherwise fold it
+// into the operation beside it and flip a different operand's sign.
 //
 // - **An ordered comparison -- `<`, `<=`, `>`, `>=` -- signals** (`fcmps`), raising invalid on a quiet
 //   NaN as IEEE 754 says the relational predicates do; `==` and `!=` are quiet (`fcmp`).
@@ -142,6 +143,22 @@ private strict_inst(e: *Emit, i: Inst, out: Buf[Inst])
             args.push(ir_arg(ty, b))
             strict_op(e, d, if signals(p) then "fcmps" else "fcmp", compared_type(ty), [ty], args, false,
                       Some(fcmp_render(p)), out)
+        // **A negation is the sign bit flipped, where it is written.** Left bare, the back ends fold it
+        // into what is next to it -- `x + -y` becomes `x - y`, `fma(-a, b, c)` an `fmsub` whose
+        // multiplicands may be swapped, `-fma(a, b, c)` an `fnmadd` -- and each of those flips the
+        // sign of a different operand, which a NaN answer shows. So its operand and its answer each
+        // pass through a fence, and between them it is one `fneg`.
+        InNeg(d, ty, v) ->
+            if !fenced_float(ty)
+                out.push(i)
+                return
+            end if
+
+            val held = fenced_value(e, ty, v, out)
+            val raw = fresh_reg(e)
+
+            out.push(InNeg(raw, ty, held))
+            fence_into(e, d, ty, raw, out)
         // A literal of `f32` is a binary64 constant narrowed where it is written, which is a rounding
         // the compiler does -- to nearest, as the literal's value is defined -- and not an operation
         // the environment governs. So it is narrowed here and written as its bits.
@@ -192,6 +209,12 @@ private strict_inst(e: *Emit, i: Inst, out: Buf[Inst])
             _ -> out.push(InCall(d, ret, callee, args, ret_attrs, fnty, marked(fast), must))
         _ -> out.push(i)
 end strict_inst
+
+// A float, or a vector of them, that is not `bf16` -- a value a floating-point register holds.
+private fenced_float(t: LType) -> bool = t match
+    LFloat(_, brain) -> !brain
+    LVec(_, elem) -> fenced_float(*elem)
+    _ -> false
 
 private is_binary32(t: LType) -> bool = t match
     LFloat(bits, brain) -> bits == 32 && !brain
@@ -389,9 +412,9 @@ private fenced_value(e: *Emit, ty: LType, v: Val, out: Buf[Inst]) -> Val
     d
 end fenced_value
 
-// `d = v`, through an empty `asm` holding it in a register of its kind -- a single-precision register
-// for an `f32`, a double one for an `f64`, a core register otherwise, an `f16`'s bits among them --
-// and a vector a lane at a time,
+// `d = v`, through an empty `asm` holding it in a register of its kind -- a floating-point register
+// for an `f32` or `f64` (on a 32-bit Arm core a single-precision one for an `f32`, a double one for
+// an `f64`), a core register otherwise, an `f16`'s bits among them -- and a vector a lane at a time,
 // since a core without a vector unit computes it a lane at a time and every lane needs its fence.
 private fence_into(e: *Emit, d: Val, ty: LType, v: Val, out: Buf[Inst])
     ty match
@@ -420,7 +443,7 @@ private fence_into(e: *Emit, d: Val, ty: LType, v: Val, out: Buf[Inst])
             out.push(InCast(d, CastBitCast, LInt(16), held, ty))
         _ ->
             val register = ty match
-                LFloat(bits, _) -> if bits == 32 then "t" else "w"
+                LFloat(bits, _) -> float_register(e.target.cpu, bits)
                 _ -> "r"
 
             var held: Buf[IrArg] = buf()
@@ -428,6 +451,14 @@ private fence_into(e: *Emit, d: Val, ty: LType, v: Val, out: Buf[Inst])
             held.push(ir_arg(ty, v))
             out.push(InAsm(Some(d), ty, "", s"=$register,0", held))
 end fence_into
+
+// The `asm` constraint of a floating-point register holding a float of `bits` on `cpu`.
+private float_register(cpu: Cpu, bits: int) -> string = cpu match
+    Thumb -> if bits == 32 then "t" else "w"
+    X86_64 -> "x"
+    Riscv64 -> "f"
+    Riscv32 -> "f"
+    _ -> "w"
 
 // `d = fptosi.sat(v)` (or `fptoui`), strictly: the conversion, which raises what it raises, and the
 // answer it gives only where the input is in range.
