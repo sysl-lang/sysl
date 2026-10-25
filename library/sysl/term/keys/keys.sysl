@@ -1,0 +1,284 @@
+module sysl.term.keys
+@no_alloc
+
+/** Keystrokes out of the bytes a terminal sends: the decoder a full-screen program reads its keyboard
+ * through.
+ *
+ * A terminal in raw mode sends a byte for an ordinary key and a short **escape sequence** for the
+ * others -- `ESC [ A` for the up arrow, `ESC [ 5 ~` for Page Up -- and a program that compares bytes
+ * itself ends up with a left arrow inserting a stray `D`, Page Up read as three keys, and Escape that
+ * never arrives. `KeyDecoder` takes the bytes one at a time, as they come off any `Reader`, and hands
+ * back a `Key` whenever one is complete.
+ *
+ *     var keys = key_decoder()
+ *
+ *     for b in got
+ *         keys.push(b)
+ *
+ *         loop
+ *             keys.next() match
+ *                 None -> break
+ *                 Some(k) -> act(k)
+ *
+ * **It asks for nothing of the platform** -- no capability, no C, no allocation -- so the same
+ * decoder reads a hosted terminal and a serial console on a board.
+ *
+ * ## Escape, alone
+ *
+ * The Escape key sends the byte every sequence starts with, so a decoder that has just seen `ESC`
+ * cannot know which it was until the next byte arrives -- or until none does. **That is what `pause`
+ * is for**: a reader that waited and was given nothing (a terminal in raw mode with `time` set, a
+ * `poll` that timed out) calls it, and a lone `ESC` is answered as `Escape`. Without a pause, `Escape`
+ * arrives with the next keystroke, which is what every terminal program does when it cannot time out.
+ */
+
+/** One keystroke. */
+enum Key derives Eq
+    // A printable character, ASCII or not, as one `char`.
+    Char(c: char)
+
+    // A control key, as the letter it is typed with: `Ctrl-A` is `Ctrl('a')`. The four that have
+    // keys of their own -- Tab, Enter, Backspace and Escape -- are those keys instead.
+    Ctrl(c: char)
+
+    // A character typed with Alt (or Meta): an `ESC` and then the character, which is how a terminal
+    // sends one.
+    Alt(c: char)
+
+    Enter
+    Tab
+    BackTab
+    Backspace
+    Delete
+    Insert
+    Escape
+    Up
+    Down
+    Left
+    Right
+    Home
+    End
+    PageUp
+    PageDown
+
+    // A function key, `F(1)` to `F(12)`.
+    F(n: int)
+end Key
+
+/** A decoder between keys, with nothing held. */
+key_decoder() -> KeyDecoder = KeyDecoder(Ground, 0, 0, 0, 0, false, None, None)
+
+/** The replacement character a malformed byte becomes, as `sysl.term.edit` makes it. */
+private const replacement: char = '\u{fffd}'
+
+// What the decoder has read of a key that is not finished yet.
+private enum KeyState
+    // Between keys.
+    Ground
+
+    // An `ESC`, and nothing after it yet.
+    Esc
+
+    // `ESC [`, with the parameters read so far.
+    Csi
+
+    // `ESC O`.
+    Ss3
+
+    // The leading byte of a UTF-8 character, and `more` continuation bytes still to come.
+    Utf8
+end KeyState
+
+/** The decoder: bytes in with `push`, keys out with `next`. Holds at most two finished keys, which is
+ * as many as one byte can finish -- `ESC` then a byte that starts no sequence is an `Escape` and then
+ * that byte's own key.
+ */
+struct KeyDecoder
+    private state: KeyState
+
+    // The first parameter of a CSI sequence, and how many `;` have been read (the second parameter
+    // carries xterm's modifiers, which no key here reads).
+    private param: int
+    private params: int
+
+    // The character being assembled, and how many continuation bytes it still needs.
+    private cp: uint
+    private more: int
+
+    // Whether the last byte was a CR, so that the LF of a CRLF is not a second Enter.
+    private owed_lf: bool
+
+    private first: Option[Key]
+    private second: Option[Key]
+
+    /** One byte from the terminal. A key it finishes is waiting for `next`. */
+    push(*self, b: u8)
+        self.state match
+            Ground -> self.ground(b)
+            Esc -> self.after_escape(b)
+            Csi -> self.csi(b)
+            Ss3 -> self.ss3(b)
+            Utf8 -> self.continuation(b)
+    end push
+
+    /** The input went quiet: whatever is half read is answered as what it is so far. A lone `ESC` is
+     * `Escape`; a sequence cut short is dropped; a character missing its continuation bytes is the
+     * replacement character.
+     */
+    pause(*self)
+        val was = self.state
+
+        self.state = Ground
+
+        if was == Esc then self.emit(Escape)
+        elif was == Utf8 then self.emit(Char(replacement))
+    end pause
+
+    /** The next finished key, oldest first. */
+    next(*self) -> Option[Key]
+        val out = self.first
+
+        self.first = self.second
+        self.second = None
+        out
+    end next
+
+    /** Whether a key has been started and not finished, which is when a reader should wait a little
+     * before calling `pause`.
+     */
+    partial(self) -> bool = self.state != Ground
+
+    private emit(*self, k: Key)
+        if self.first.is_none() then self.first = Some(k) else self.second = Some(k)
+
+    private ground(*self, b: u8)
+        val lf_owed = self.owed_lf
+
+        self.owed_lf = false
+
+        if b == 27
+            self.state = Esc
+        elif b == 13
+            self.owed_lf = true
+            self.emit(Enter)
+        elif b == 10
+            if !lf_owed then self.emit(Enter)
+        elif b == 9 then self.emit(Tab)
+        elif b == 8 || b == 127 then self.emit(Backspace)
+        elif b >= 1 && b <= 26 then self.emit(Ctrl(char(uint(b) + 96)))
+        elif b < 32
+            // NUL and the four after Ctrl-Z have no letter, and no key a program reads.
+            ()
+        elif b < 128 then self.emit(Char(char(uint(b))))
+        else self.lead(b)
+    end ground
+
+    // The first byte of a multi-byte character.
+    private lead(*self, b: u8)
+        if b & 224 == 192
+            self.cp = uint(b & 31)
+            self.more = 1
+        elif b & 240 == 224
+            self.cp = uint(b & 15)
+            self.more = 2
+        elif b & 248 == 240
+            self.cp = uint(b & 7)
+            self.more = 3
+        else
+            // A continuation byte where a leading one belongs.
+            self.emit(Char(replacement))
+            return
+
+        self.state = Utf8
+    end lead
+
+    private continuation(*self, b: u8)
+        if b & 192 != 128
+            // The character ended early: it is a replacement, and this byte starts what comes next.
+            self.state = Ground
+            self.emit(Char(replacement))
+            self.ground(b)
+            return
+
+        self.cp = (self.cp << 6) | uint(b & 63)
+        self.more -= 1
+
+        if self.more == 0
+            self.state = Ground
+            self.emit(Char(char(self.cp)))
+    end continuation
+
+    // The byte after an `ESC`: a sequence's introducer, a second `ESC`, or a character typed with Alt.
+    private after_escape(*self, b: u8)
+        if b == u8('[')
+            self.state = Csi
+            self.param = 0
+            self.params = 0
+        elif b == u8('O')
+            self.state = Ss3
+        elif b == 27
+            // Escape pressed twice: the first is finished, and the second may still start a sequence.
+            self.emit(Escape)
+        elif b >= 32 && b < 127
+            self.state = Ground
+            self.emit(Alt(char(uint(b))))
+        else
+            self.state = Ground
+            self.emit(Escape)
+            self.ground(b)
+    end after_escape
+
+    // A CSI sequence is read to its final byte, `@` to `~`, whatever its parameters are -- which is
+    // what keeps a key nothing here names from leaving its tail behind as typed characters.
+    private csi(*self, b: u8)
+        if b >= u8('0') && b <= u8('9')
+            if self.params == 0 then self.param = self.param * 10 + int(b - u8('0'))
+            return
+        end if
+
+        if b == u8(';')
+            self.params += 1
+            return
+        end if
+
+        if b < 64 || b > 126
+            // An intermediate byte, or a private marker such as `?`: part of the sequence.
+            return
+
+        self.state = Ground
+        self.final_key(b, self.param)
+    end csi
+
+    private ss3(*self, b: u8)
+        self.state = Ground
+        self.final_key(b, 0)
+
+    // What a sequence's final byte -- and, for `~`, its number -- names.
+    private final_key(*self, b: u8, n: int)
+        if b == u8('A') then self.emit(Up)
+        elif b == u8('B') then self.emit(Down)
+        elif b == u8('C') then self.emit(Right)
+        elif b == u8('D') then self.emit(Left)
+        elif b == u8('H') then self.emit(Home)
+        elif b == u8('F') then self.emit(End)
+        elif b == u8('Z') then self.emit(BackTab)
+        elif b == u8('P') then self.emit(F(1))
+        elif b == u8('Q') then self.emit(F(2))
+        elif b == u8('R') then self.emit(F(3))
+        elif b == u8('S') then self.emit(F(4))
+        elif b == u8('~') then self.numbered(n)
+    end final_key
+
+    // `ESC [ n ~`: the keys a VT220 numbered.
+    private numbered(*self, n: int)
+        if n == 1 || n == 7 then self.emit(Home)
+        elif n == 4 || n == 8 then self.emit(End)
+        elif n == 2 then self.emit(Insert)
+        elif n == 3 then self.emit(Delete)
+        elif n == 5 then self.emit(PageUp)
+        elif n == 6 then self.emit(PageDown)
+        elif n >= 11 && n <= 15 then self.emit(F(n - 10))
+        elif n >= 17 && n <= 21 then self.emit(F(n - 11))
+        elif n >= 23 && n <= 24 then self.emit(F(n - 12))
+    end numbered
+end KeyDecoder
