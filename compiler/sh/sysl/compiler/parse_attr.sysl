@@ -115,6 +115,12 @@ parse_member_attrs(p: *Parser, in_trait: bool) -> Buf[Attr]
             break
         end if
 
+        if word == "answers" && !p.at_kw("#")
+            p.fault(at, answers_off_extern())
+            skip_line(p)
+            break
+        end if
+
         // An indented '#' never reaches the directive pass, so whatever word follows it, the member
         // rule answers -- and names the sigil, since '@' is what the reader writes in any case.
         if p.at_kw("#")
@@ -158,6 +164,11 @@ scoped_on_field() -> string =
 // `@keeps(...)` anywhere but above an `extern`: a body the compiler can read says what it keeps.
 keeps_off_extern() -> string =
     "'@keeps(...)' names the parameters a C function holds on to past the call, so it marks an 'extern' — a function's or a method's body is right here, and the compiler reads what it keeps out of it"
+
+// `@answers(...)` anywhere but above an `extern`: a body the compiler can read says what its answer
+// is made of.
+answers_off_extern() -> string =
+    "'@answers(...)' names the parameters the pointer a C function answers may point into, so it marks an 'extern' — a function's or a method's body is right here, and the compiler reads what its answer is made of out of it"
 
 private member_attr_refusal() -> string =
     "the only annotations a member may carry are the ones about a parameter — '@crossing', '@reads' and '@writes' — and the six about the function it lowers to, '@noinline', '@inline', '@cold', '@no_alloc', '@no_block' and '@blocks', and '@relocates', '@views(self)' and '@consumes' about its receiver's storage. What the rest say is about a free function or about a type: what 'sysl test' calls, what recurses, what a symbol names, how fields are laid out. A member is neither, so it goes above a free function instead ('06')"
@@ -228,7 +239,7 @@ builtin_attr_word(w: string) -> bool
 
     for word in ["assert", "annotation", "ignore", "test", "setup", "teardown", "setup_all", "teardown_all",
                  "tailrec", "pure", "ghost", "packed", "reads", "writes", "align", "byte_order", "export",
-                 "section", "crossing", "domain", "keeps", "disjoint", "guards", "needs",
+                 "section", "crossing", "domain", "keeps", "answers", "disjoint", "guards", "needs",
                  "noinline", "inline", "cold", "thread_local", "abandons", "per_cpu", "main_thread",
                  "pinned", "pins", "relocates", "views", "consumes", "blocks", "scoped", "joined"]
         if word == w then return true
@@ -367,6 +378,7 @@ parse_attribute(p: *Parser) -> Option[Attr]
     if word == "crossing" then return Some(parse_crossing_attr(p))
     if word == "domain" then return parse_domain_attr(p)
     if word == "keeps" then return Some(Keeps(parse_named_list(p, "keeps")))
+    if word == "answers" then return Some(Answers(parse_named_list(p, "answers")))
     if word == "scoped" then return Some(Scoped(parse_named_list(p, "scoped")))
     if word == "joined" then return Some(Joined(parse_named_list(p, "joined")))
     if word == "disjoint" then return Some(Disjoint(parse_named_list(p, "disjoint")))
@@ -655,6 +667,8 @@ private named_list_refusal(word: string) -> string
     if word == "domain" then return "'@domain' names the domain a function is entered in, in parentheses — '@domain(interrupt)' for a handler a vector table calls, on top of whatever was running. There is no empty form: a function in the program's own domain says so by not writing the annotation"
 
     if word == "keeps" then return "'@keeps' names the parameters a C function holds on to past the call, in parentheses — '@keeps(context)'. There is no empty form: an 'extern' that keeps nothing it is handed says so by not writing the annotation"
+
+    if word == "answers" then return "'@answers' names the parameters the pointer a C function answers may point into, in parentheses — '@answers(s)' for 'strchr'. There is no empty form: an 'extern' whose answer is fresh storage says so by not writing the annotation"
 
     if word == "scoped" then return "'@scoped' names the parameters a function lets go of before its caller's scope ends — a callable a member runs in another concurrency domain, or a '*T' it holds while its caller waits — in parentheses: '@scoped(f)'. There is no empty form: a function that holds nothing past its call says so by not writing the annotation"
 
@@ -1106,7 +1120,8 @@ private parse_attributed_decl(p: *Parser, start: Span) -> Stmt
         refuse_unless(p, at, attrs, "extern")
         return from_first(start, parse_extern_decl(p, at, vis, capabilities_of(attrs),
                                                    any_is(attrs, "blocks"),
-                                                   any_is(attrs, "abandons"), kept_names(attrs)))
+                                                   any_is(attrs, "abandons"), kept_names(attrs),
+                                                   answered_names(attrs)))
     end if
 
     // A `type` names a scalar or a pointer for a generated header, which is the struct's request made
@@ -1180,9 +1195,9 @@ private may_carry(form: string, a: Attr) -> bool
 
     if form == "binding" then return is_storage(a) || attr_word(a) == "export"
     if form == "extern" then return attr_word(a) == "needs" || attr_word(a) == "blocks" ||
-        attr_word(a) == "abandons" || attr_word(a) == "keeps"
+        attr_word(a) == "abandons" || attr_word(a) == "keeps" || attr_word(a) == "answers"
 
-    !is_layout(a) && attr_word(a) != "keeps" && attr_word(a) != "guards" &&
+    !is_layout(a) && attr_word(a) != "keeps" && attr_word(a) != "answers" && attr_word(a) != "guards" &&
         attr_word(a) != "relocates" && attr_word(a) != "views" && attr_word(a) != "consumes" &&
         !is_user(a) && !is_annotation_mark(a)
 end may_carry
@@ -1219,6 +1234,7 @@ private attributed_refusal(attrs: Buf[Attr]) -> string
         return "'@disjoint(...)' promises that a body reaches no memory through one named parameter that it also reaches another way, so it marks a function or a method, whose body is sysl — an 'extern''s body is C, which never reads the sysl declaration, so the promise belongs on the C declaration as 'restrict'"
 
     if any_is(attrs, "keeps") then return keeps_off_extern()
+    if any_is(attrs, "answers") then return answers_off_extern()
 
     // An `extern`'s body is C: nothing it promises reaches a body the compiler reads, and what it
     // holds past the call is what `@keeps(...)` says.
@@ -1590,6 +1606,16 @@ private kept_names(attrs: Buf[Attr]) -> Buf[string]
 
     buf()
 end kept_names
+
+// The parameters an `@answers(...)` named, in the order written.
+private answered_names(attrs: Buf[Attr]) -> Buf[string]
+    for attr in attrs
+        attr match
+            Answers(ns) -> return ns
+            _ -> ()
+
+    buf()
+end answered_names
 
 // The layout pair, the C name and the guarded fields, folded onto the struct they were written above.
 private laid_out(p: *Parser, at: Span, s: Stmt, attrs: Buf[Attr]) -> Stmt

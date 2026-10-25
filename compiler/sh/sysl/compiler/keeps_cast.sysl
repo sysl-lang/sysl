@@ -21,7 +21,9 @@ import sysl.buf.{Buf, buf}
 //
 // An edge says an integer at one may be stored at the other. A call's answer is taken to be made of
 // every integer handed to it, which is more than most calls do, and a field, a pointee or an element
-// is one place for every value of its type: a refusal it leads to names the `ptr_cast` it found.
+// is one place for every value of its type: a refusal it leads to names the `ptr_cast` it found. An
+// integer place whose address is taken is joined to its type's pointee, since that address is how a
+// callee's `*dir = …` reaches it.
 //
 // Not followed: an integer handed through a function pointer, a call through an object, or an enum's
 // payload -- what those reach is the raw tier's bargain, as arithmetic on an address is.
@@ -109,6 +111,7 @@ private cast_expr(sc: &CastScan, e: TExpr)
         TCall(name, args, _, _) ->
             for j in 0..<args.len()
                 cast_flow(sc, args.at(j), s"a:$name|$j")
+        TAddrOf(place, _) -> if is_integer_type(texpr_type(place)) then cast_aliased(sc, place)
         TStructNew(_, args) ->
             val ty = texpr_type(e)
 
@@ -116,6 +119,20 @@ private cast_expr(sc: &CastScan, e: TExpr)
                 cast_flow(sc, args.at(k), cast_field(ty, int(k)))
         _ -> ()
 end cast_expr
+
+// **An integer whose address is taken is what any pointer to its type may point at**: a store through
+// `*usize` -- an out-parameter -- lands in the caller's local, and a read through one reads it. So
+// the place and the pointee are one place, both ways, and an image written through `*dir` is followed
+// to the `ptr_cast` of the local the caller handed over.
+private cast_aliased(sc: &CastScan, place: TExpr)
+    val node = s"*${type_show(texpr_type(place))}"
+
+    for k in cast_keys(sc, place)
+        if k != node
+            sc.g.edges.push((k, node))
+            sc.g.edges.push((node, k))
+        end if
+end cast_aliased
 
 private cast_store(sc: &CastScan, place: TExpr, v: TExpr)
     for k in cast_keys(sc, place)

@@ -1,0 +1,461 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.Search
+
+// What an `extern` answers, to the keeps-analysis (`keeps.sysl`, `keeps_flow.sysl`'s `answers_arg`):
+// a pointer a C function hands back is FRESH -- storage the library made, made of no argument --
+// unless the declaration says `@answers(p)`, naming the parameters it may point into. That is the
+// default C gives a parameter too (`@keeps(p)`). `reference/ffi.md § @answers` and `reference/memory.md §
+// Where no body is in sight, the call borrows` are the specification.
+//
+// Cells: the reduction that found it (an `opendir` handle carried as an integer) accepted, and the
+// same shape through an `@answers` extern refused; a fresh answer stored where it outlives the frame;
+// `@answers` on two parameters, each of them reached; an unnamed parameter of an `@answers` extern;
+// a generic wrapper, a method wrapper and a wrapper in another module, each carrying the summary
+// through; `@keeps` and `@answers` on one extern, the same parameter and different ones; every
+// misuse of the annotation.
+//
+// Skipped: an `@answers` extern called through a function pointer -- a call through a pointer is not
+// followed by the analysis at all (`keeps_cast.sysl`'s note), so there is no summary to carry; a
+// variadic argument past the named ones -- no name can reach it, so it is fresh by construction.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+// Builds and runs a program whose beginning is `text`, with `lib/lib.sysl` beside it when `lib` is
+// not empty.
+private xan_outcome(lib: string, text: string) -> (string, int)
+    val root = make_temp_dir("sysl-xan").unwrap()
+
+    make_dir_all(root).unwrap()
+
+    if !lib.is_empty()
+        make_dir_all(s"$root/lib").unwrap()
+        write_text(s"$root/lib/lib.sysl", lib).unwrap()
+    end if
+
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (failure_text(why), -1)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> ("the program that was built could not be run", -1)
+        Ok(out) -> (out.text + out.err.unwrap_or(""), shell_status(out.status))
+end xan_outcome
+
+private xan_prints(text: string, want: string) = xan_prints_with("", text, want)
+
+private xan_prints_with(lib: string, text: string, want: string)
+    if xvr_no_library() then return
+
+    val out = xan_outcome(lib, text)
+
+    assert_eq(out.0, want)
+    assert_eq(out.1, 0)
+end xan_prints_with
+
+private xan_refused(text: string, part: string) = xan_refused_with("", text, part)
+
+private xan_refused_with(lib: string, text: string, part: string)
+    if xvr_no_library() then return
+
+    val out = xan_outcome(lib, text)
+
+    assert_eq(out.1, -1, out.0)
+    assert(out.0.index_of(part).is_some(), out.0)
+end xan_refused_with
+
+// Module storage to store an answer in, so that it outlives the frame that made it.
+private xan_held() -> string = raw"""
+    static var spare: u8 = 0
+    static var held: *u8 = &spare
+    """
+
+// -- a fresh answer -------------------------------------------------------------------------------
+
+@test("an extern's answer is fresh, so a handle carried as an integer is not a local's image")
+xan_reduction_accepted()
+    xan_prints(raw"""
+        import sysl.raw.ptr_cast
+
+        private extern "opendir" c_opendir(path: *u8) -> *u8
+        private extern "closedir" c_closedir(d: *u8) -> int
+
+        open(dir: *usize) -> int
+            var c: [2]u8 = [u8('.'), 0]
+            val d = c_opendir(&c[0])
+
+            if d == null then return 1
+
+            *dir = usize(d)
+            0
+
+        word(at: usize) -> *usize = ptr_cast(at)
+
+        main()
+            var h: usize = 0
+            if open(&h) != 0 then return
+            var cell: usize = 7
+            var link: usize = usize(&cell)
+            printi(long(*word(*word(usize(&link)))))
+            printi(c_closedir(ptr_cast(h)))
+        """, "70")
+
+@test("and the same shape through an '@answers' extern carries the local's image out")
+xan_reduction_answered_refused()
+    xan_refused(raw"""
+        import sysl.raw.ptr_cast
+
+        @answers(s)
+        private extern "strchr" c_strchr(s: *u8, c: int) -> *u8
+
+        open(dir: *usize) -> int
+            var c: [3]u8 = [u8('.'), u8('x'), 0]
+            val d = c_strchr(&c[0], 120)
+
+            *dir = usize(d)
+            0
+
+        word(at: usize) -> *usize = ptr_cast(at)
+
+        main()
+            var h: usize = 0
+            if open(&h) != 0 then return
+            printi(long(*word(h)))
+        """, "'usize(d)' holds the address of a field of 'c', a local of 'open', and it is stored in " +
+             "'*dir', which outlives 'open' and 'word' turns back into a pointer with 'ptr_cast'")
+
+// -- an out-parameter integer is the local it was handed ------------------------------------------
+
+@test("an image written through an integer out-parameter reaches the caller's local and its cast")
+xan_out_param_local()
+    xan_refused(raw"""
+        import sysl.raw.ptr_cast
+
+        id(s: *u8) -> *u8 = s
+
+        open(dir: *usize) -> int
+            var c: [3]u8 = [u8('.'), u8('x'), 0]
+
+            *dir = usize(id(&c[0]))
+            0
+
+        main()
+            var h: usize = 0
+            if open(&h) != 0 then return
+            val p: *u8 = ptr_cast(h)
+            printi(long(p[0]))
+        """, "and it is stored in '*dir', which outlives 'open' and 'main' turns back into a pointer " +
+             "with 'ptr_cast'")
+
+@test("and so does one written through a field's address or an array element's")
+xan_out_param_field()
+    val open = raw"""
+        import sysl.raw.ptr_cast
+
+        open(dir: *usize)
+            var c: [2]u8 = [u8('.'), 0]
+
+            *dir = usize(&c[0])
+
+        """
+
+    xan_refused(open + raw"""
+        struct Handle
+            at: usize
+
+        main()
+            var h = Handle(0)
+            open(&h.at)
+            val p: *u8 = ptr_cast(h.at)
+            printi(long(p[0]))
+        """, "and it is stored in '*dir', which outlives 'open' and 'main' turns back into a pointer")
+    xan_refused(open + raw"""
+        main()
+            var hs: [2]usize = [0, 0]
+            open(&hs[1])
+            val p: *u8 = ptr_cast(hs[1])
+            printi(long(p[0]))
+        """, "and it is stored in '*dir', which outlives 'open' and 'main' turns back into a pointer")
+
+@test("a number written through an out-parameter and cast back is not an image")
+xan_out_param_number()
+    xan_prints(raw"""
+        import sysl.raw.ptr_cast
+
+        var cell: u8 = 42
+
+        open(dir: *usize)
+            var c: [2]u8 = [u8('.'), 0]
+
+            *dir = usize(&cell)
+            c[0] = 1
+
+        main()
+            var h: usize = 0
+            open(&h)
+            val p: *u8 = ptr_cast(h)
+            printi(long(p[0]))
+        """, "42")
+
+@test("a fresh answer stored in module storage is accepted, whatever it was handed")
+xan_fresh_stored()
+    xan_prints(xan_held() + raw"""
+        extern "strdup" c_strdup(s: *u8) -> *u8
+
+        run()
+            var name: [3]u8 = [104, 105, 0]
+
+            held = c_strdup(&name[0])
+
+        run()
+        print(held[1])
+        """, "105\n")
+
+// -- what '@answers' names ------------------------------------------------------------------------
+
+@test("'@answers(s)' makes the answer the address of what 's' was handed")
+xan_answers_refused()
+    xan_refused(xan_held() + raw"""
+        @answers(s)
+        extern "strchr" c_strchr(s: *u8, c: int) -> *u8
+
+        run()
+            var bytes: [4]u8 = [104, 105, 33, 0]
+
+            held = c_strchr(&bytes[0], 105)
+
+        run()
+        print(1)
+        """, "'c_strchr(&bytes[0], 105)' holds the address of a field of 'bytes', a local of 'run', " +
+             "and it is stored in 'held', which outlives 'run'")
+
+@test("and an answer kept inside the frame is accepted")
+xan_answers_local_use()
+    xan_prints(raw"""
+        @answers(s)
+        extern "strchr" c_strchr(s: *u8, c: int) -> *u8
+
+        run() -> u8
+            var bytes: [4]u8 = [104, 105, 33, 0]
+            val at = c_strchr(&bytes[0], 105)
+
+            at[1]
+
+        print(run())
+        """, "33\n")
+
+@test("'@answers' on two parameters reaches through either of them")
+xan_answers_two()
+    val decl = "@answers(hay, needle)\nextern \"strstr\" c_strstr(hay: *u8, needle: *u8) -> *u8\n\n"
+
+    xan_refused(xan_held() + decl + raw"""
+        static var text: [3]u8 = [104, 105, 0]
+
+        run()
+            var probe: [2]u8 = [105, 0]
+
+            held = c_strstr(&text[0], &probe[0])
+
+        run()
+        print(1)
+        """, "a local of 'run', and it is stored in 'held'")
+    xan_refused(xan_held() + decl + raw"""
+        static var probe: [2]u8 = [105, 0]
+
+        run()
+            var text: [3]u8 = [104, 105, 0]
+
+            held = c_strstr(&text[0], &probe[0])
+
+        run()
+        print(1)
+        """, "a local of 'run', and it is stored in 'held'")
+
+@test("a parameter '@answers' does not name is not what the answer is made of")
+xan_answers_one_of_two()
+    xan_prints(xan_held() + raw"""
+        @answers(hay)
+        extern "strstr" c_strstr(hay: *u8, needle: *u8) -> *u8
+
+        static var text: [3]u8 = [104, 105, 0]
+
+        run()
+            var probe: [2]u8 = [105, 0]
+
+            held = c_strstr(&text[0], &probe[0])
+
+        run()
+        print(held[0])
+        """, "105\n")
+
+// -- wrappers carry the summary through ---------------------------------------------------------
+
+@test("a generic wrapper over an '@answers' extern answers what it was handed")
+xan_generic_wrapper()
+    val decl = "@answers(s)\nextern \"strchr\" c_strchr(s: *u8, c: int) -> *u8\n\n" +
+        "find[T](s: *u8, tag: T) -> *u8 = c_strchr(s, 105)\n\n"
+
+    xan_refused(xan_held() + decl + raw"""
+        run()
+            var bytes: [4]u8 = [104, 105, 33, 0]
+
+            held = find(&bytes[0], 1)
+
+        run()
+        print(1)
+        """, "a local of 'run', and it is stored in 'held'")
+    xan_prints(xan_held() + decl + raw"""
+        static var text: [4]u8 = [104, 105, 33, 0]
+
+        run()
+            held = find(&text[0], "one")
+            held = find(&text[0], 2)
+
+        run()
+        print(held[1])
+        """, "33\n")
+
+@test("a method wrapper over an '@answers' extern answers what it was handed")
+xan_method_wrapper()
+    xan_refused(xan_held() + raw"""
+        @answers(s)
+        extern "strchr" c_strchr(s: *u8, c: int) -> *u8
+
+        struct Finder
+            c: int
+
+            find(self, s: *u8) -> *u8 = c_strchr(s, self.c)
+
+        run()
+            var bytes: [4]u8 = [104, 105, 33, 0]
+
+            held = Finder(105).find(&bytes[0])
+
+        run()
+        print(1)
+        """, "a local of 'run', and it is stored in 'held'")
+
+@test("a wrapper in another module carries the summary across")
+xan_module_wrapper()
+    val lib = raw"""
+        module lib
+
+        @answers(s)
+        private extern "strchr" c_strchr(s: *u8, c: int) -> *u8
+
+        private extern "strdup" c_strdup(s: *u8) -> *u8
+
+        find(s: *u8) -> *u8 = c_strchr(s, 105)
+
+        copy(s: *u8) -> *u8 = c_strdup(s)
+        """
+
+    xan_refused_with(lib, xan_held() + raw"""
+        import lib.find
+
+        run()
+            var bytes: [4]u8 = [104, 105, 33, 0]
+
+            held = find(&bytes[0])
+
+        run()
+        print(1)
+        """, "a local of 'run', and it is stored in 'held'")
+    xan_prints_with(lib, xan_held() + raw"""
+        import lib.copy
+
+        run()
+            var name: [3]u8 = [104, 105, 0]
+
+            held = copy(&name[0])
+
+        run()
+        print(held[0])
+        """, "104\n")
+
+// -- '@keeps' beside it -------------------------------------------------------------------------
+
+@test("'@keeps' and '@answers' on one parameter: the keep is refused at the call")
+xan_keeps_and_answers_same()
+    xan_refused(raw"""
+        @keeps(ctx)
+        @answers(ctx)
+        extern "sysl_xan_hold" hold(ctx: *u8) -> *u8
+
+        run()
+            var b: u8 = 1
+            val back = hold(&b)
+
+        run()
+        """, "'hold' keeps its parameter 'ctx' (its declaration says '@keeps(ctx)'), and '&b' is the " +
+             "address of a local of 'run'")
+
+@test("'@keeps' on one parameter and '@answers' on another are each held to their own")
+xan_keeps_and_answers_apart()
+    val decl = "@keeps(ctx)\n@answers(into)\nextern \"sysl_xan_fill\" fill(ctx: *u8, into: *u8) -> *u8\n\n"
+
+    xan_refused(xan_held() + decl + raw"""
+        run()
+            var into: u8 = 0
+
+            held = fill(&spare, &into)
+
+        run()
+        """, "'fill(&spare, &into)' holds the address of a local of 'run', and it is stored in 'held'")
+    xan_refused(decl + raw"""
+        run()
+            var ctx: u8 = 0
+            var into: u8 = 0
+            val back = fill(&ctx, &into)
+
+        run()
+        """, "'fill' keeps its parameter 'ctx' (its declaration says '@keeps(ctx)')")
+
+// -- what is refused -----------------------------------------------------------------------------
+
+@test("'@answers' marks an extern function and nothing else")
+xan_answers_off_extern()
+    val why = "'@answers(...)' names the parameters the pointer a C function answers may point into, " +
+        "so it marks an 'extern'"
+
+    xan_refused("@answers(p)\nfind(p: *u8) -> *u8 = p\n\nprint(1)\n", why)
+    xan_refused("struct S\n    n: int\n\n    @answers(p)\n    find(self, p: *u8) -> *u8 = p\n\nprint(1)\n", why)
+    xan_refused("@answers(p)\nstruct S\n    n: int\n\nprint(1)\n", why)
+    xan_refused("@answers(p)\nextern var errno_like: int\n\nprint(1)\n",
+                "'@answers(...)' names the parameters the pointer a C function answers may point into, " +
+                "and an 'extern' variable is storage, which nothing calls — it marks an 'extern' function")
+
+@test("'@answers' names each of the extern's pointer parameters once, and the extern answers a pointer")
+xan_answers_names_refused()
+    xan_refused("@answers(q)\nextern \"sysl_xan_x\" x(p: *u8) -> *u8\n\nprint(1)\n",
+                "'@answers' names 'q', which is not a parameter of 'x' — its parameters are 'p'")
+    xan_refused("@answers(q)\nextern \"sysl_xan_x\" x() -> *u8\n\nprint(1)\n",
+                "'@answers' names 'q', which is not a parameter of 'x' — it takes none")
+    xan_refused("@answers(p, p)\nextern \"sysl_xan_x\" x(p: *u8) -> *u8\n\nprint(1)\n",
+                "'@answers' names 'p' twice — the second says nothing the first does not")
+    xan_refused("@answers(n)\nextern \"sysl_xan_x\" x(p: *u8, n: usize) -> *u8\n\nprint(1)\n",
+                "'@answers' names 'n', which is 'usize' — an answer points into only what a pointer " +
+                "parameter reaches, so a parameter it names is a pointer")
+    xan_refused("@answers(p)\nextern \"sysl_xan_x\" x(p: *u8) -> usize\n\nprint(1)\n",
+                "'@answers' says what the pointer an 'extern' answers may point into, and 'x' answers " +
+                "'usize' — only a pointer points into anything")
+    xan_refused("@answers(p)\nextern \"sysl_xan_x\" x(p: *u8)\n\nprint(1)\n",
+                "and 'x' answers nothing — only a pointer points into anything")
+    xan_refused("@answers()\nextern \"sysl_xan_x\" x(p: *u8) -> *u8\n\nprint(1)\n",
+                "'@answers' names the parameters the pointer a C function answers may point into, in " +
+                "parentheses — '@answers(s)' for 'strchr'. There is no empty form")
+    xan_refused("@answers(self)\nextern \"sysl_xan_x\" x(p: *u8) -> *u8\n\nprint(1)\n",
+                "'@answers' names parameters, and 'self' is the receiver, which it does not name")

@@ -4389,6 +4389,50 @@ C programs already live by — **a pointer handed to a call is borrowed for the 
 | a function through a pointer | what any function whose address is taken at that pointer's type holds in what another of its parameters points at — one that keeps a pointer anywhere else is refused where it is written, and so is every one whose pointer type C can reach |
 | an `extern` | nothing, unless its declaration says [`@keeps(p)`](/reference/ffi/#keeps-a-c-function-that-holds-on-to-a-pointer) |
 
+**What a call with no body answers is asked the same way.** An `extern`'s answer is fresh — storage
+the library made, which is made of none of its arguments — unless its declaration says
+[`@answers(p)`](/reference/ffi/#answers-a-c-function-whose-answer-points-into-an-argument), and then
+it is made of what `p` was handed, as a sysl function's answer is made of what it hands back. So an
+`opendir` handle may be carried out of the frame that passed it a path on its stack, and a `strchr`
+answer into a local's bytes may not:
+
+```sysl
+extern "opendir" c_opendir(dir: *u8) -> *u8
+extern "closedir" c_closedir(d: *u8) -> int
+
+static var spare: u8 = 0
+static var stream: *u8 = &spare
+
+open() -> bool
+    var dot: [2]u8 = [u8('.'), 0]
+
+    stream = c_opendir(&dot[0])
+    stream != null
+
+if open() then print(c_closedir(stream))
+```
+
+```output
+0
+```
+
+```sysl
+@answers(s)
+extern "strchr" c_strchr(s: *u8, c: int) -> *u8
+
+static var spare: u8 = 0
+static var held: *u8 = &spare
+
+find()
+    var text: [3]u8 = [104, 105, 0]
+
+    held = c_strchr(&text[0], 105)
+```
+
+```error
+'c_strchr(&text[0], 105)' holds the address of a field of 'text', a local of 'find', and it is stored in 'held', which outlives 'find'
+```
+
 A default is a promise, so the body behind it is held to it. That is what makes a lock's `with`
 safe without an annotation: the closure it calls borrows the address of the value for the call, and a
 closure that keeps it is refused where it keeps it, which is the one mistake a returned address could
