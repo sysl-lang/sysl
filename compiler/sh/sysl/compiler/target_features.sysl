@@ -36,6 +36,9 @@ struct FeatureTarget
     codegen: Buf[(string, bool)]
     registers: Buf[(string, string)]
     extensions: Option[Buf[string]]
+
+    // Whether it sets `layout`, which the manifest's memory map holds (`memory_map.sysl`).
+    layout: bool
 end FeatureTarget
 
 // The `targets` block of one feature block, each target's keys read exactly as the top-level target
@@ -78,7 +81,7 @@ read_feature_targets(feature: string, entry: Value,
             Some(cg) -> read_codegen(cg, s"$at.codegen")?
 
         out.push(FeatureTarget(target, feature, scalar_text(sub, "triple"), image, capabilities, settings.0,
-                               settings.1, settings.2))
+                               settings.1, settings.2, sub.get("layout").is_some()))
 
     Ok(out)
 end read_feature_targets
@@ -89,7 +92,7 @@ end read_feature_targets
 private feature_target_key(key: string) -> bool =
     key == "triple" || key == "linker" || key == "linker_script" || key == "entry" ||
     key == "capabilities" || key == "codegen" || key == "c" || key == "defines" || key == "requires" ||
-    key == "config"
+    key == "config" || key == "layout"
 
 // The refusal for the 0.4.0 spelling, `targets.<t>.features.<f> { k = v }`, which says the same thing
 // from the other side: the target block is now inside the feature. The fix-it is the rewritten block,
@@ -153,6 +156,7 @@ private keys_set(ft: &FeatureTarget) -> Buf[string]
     if ft.image.linker != "" then out.push("linker")
     if ft.image.script != "" then out.push("linker_script")
     if ft.image.entry != "" then out.push("entry")
+    if ft.layout then out.push("layout")
 
     for item in ft.capabilities
         out.push(s"capabilities.${item.0}")
@@ -210,6 +214,23 @@ featured_image(m: &Manifest, target: string, base: Option[ImageLink]) -> Option[
 
     if img.linker == "" && img.script == "" && img.entry == "" then None else Some(img)
 end featured_image
+
+// The `layout` of this machine: an enabled feature's block's, which replaces the target block's whole,
+// or the target block's own. Two enabled features both setting it are `feature_target_conflict`'s.
+featured_layout(m: &Manifest, target: string) -> Option[ImageLayout]
+    var out: Option[ImageLayout] = None
+
+    for l in m.memory.layouts
+        if l.target == target && l.feature == "" then out = Some(l)
+
+    for ft in enabled_feature_targets(m, target)
+        if !ft.layout then continue
+
+        for l in m.memory.layouts
+            if l.target == target && l.feature == ft.feature then out = Some(l)
+
+    out
+end featured_layout
 
 // What an enabled feature's block says about a capability of this machine, where one says anything.
 featured_capability(m: &Manifest, target: string, cap: string) -> Option[bool]

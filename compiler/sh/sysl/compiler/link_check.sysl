@@ -1,0 +1,415 @@
+module sh.sysl.compiler
+
+import sh.sysl.elf.{read as read_elf, Section}
+import sysl.buf.{Buf, buf}
+import sysl.fs.{read_bytes, remove_file}
+import sysl.text.{from_utf8_unchecked, join, Search}
+
+// **What a generated linker script holds the link to** (`reference/packages.md § Generated linker
+// scripts`), checked on both sides of it:
+//
+// - **before**, every `@section` the program writes is held to the rules of the script: a section no
+//   `sections` entry and no standard rule gathers is refused at the declaration that names it, which
+//   is how a refusal names the module that put it there;
+// - **after**, the ELF the linker wrote is read, and an allocated section the script never named --
+//   one a C `section` attribute or an assembler's `.section` made, which a linker would otherwise place
+//   wherever its orphan rules say -- is refused;
+// - **and where the link failed because a region overflowed**, it is linked again with every region
+//   widened, and the measured ELF says, in the manifest's terms, what each region was asked to hold.
+//   The ELF is the same whichever linker wrote it, so the report is too.
+
+// One piece of the program's module storage, as the report names it.
+struct PlacedStorage
+    // As the program spells it: `app.frame`.
+    name: string
+    bytes: u64
+
+    // The input section it is laid down in, explicit or the one its kind gets.
+    section: string
+
+    // Where it was declared: `app/display.sysl:12`.
+    place: string
+end PlacedStorage
+
+// The program's storage, from the last compilation that linked an image by a generated script.
+private var placed_storage: Buf[PlacedStorage] = buf()
+
+// **Every `@section` a program writes is one the script gathers**, refused at the declaration where it
+// is not, and every piece of module storage is noted for the overflow report. Asked of the pruned tree,
+// which is what the link is handed.
+check_placed_sections(a: &Analysis, p: TProgram, laid: &LaidOut)
+    placed_storage = buf()
+
+    for i in 0..<p.vals.len()
+        val v = p.vals.at(i)
+        val home = a.tables.vals.get(v.symbol)
+        val section = v.section.unwrap_or(default_section(v))
+        var place = ""
+
+        home match
+            Some(d) -> place = s"${d.scope.src.name}:${d.scope.src.locate(d.span.start).line}"
+            None -> ()
+
+        placed_storage.push(PlacedStorage(qualified_name(v.symbol), u64(a.tables.layout.size(v.ty)), section, place))
+
+        if v.section.is_none() || home_of(laid, section) != "" then continue
+
+        home match
+            Some(d) -> a.fault(d.scope, d.span, unclaimed(section, qualified_name(v.symbol), laid))
+            None -> ()
+
+    for f in p.funcs
+        val section = f.section match
+            None -> continue
+            Some(s) -> s
+
+        if home_of(laid, section) == ""
+            a.fault(func_home(a, f.name), f.span, unclaimed(section, qualified_name(f.name), laid))
+end check_placed_sections
+
+// The input section storage of each kind is laid down in where it names none.
+private default_section(v: &TVal) -> string
+    if v.per_cpu then return ".percpu"
+    if v.thread_local then return if v.init.is_some() then ".tdata" else ".tbss"
+    if v.computed || (v.writable && v.init.is_none()) then return ".bss"
+    if v.writable then return ".data"
+
+    ".rodata"
+end default_section
+
+private unclaimed(section: string, who: string, laid: &LaidOut) -> string
+    var named: Buf[string] = buf()
+
+    for item in laid.sections
+        named.push(item.name)
+
+    s"'$who' is placed in '$section' by '@section', and the generated linker script has no rule that " +
+        "gathers it — a section no 'sections' entry claims would be left to the linker's orphan placement. " +
+        s"Give it a 'sections' entry, as 'sections { x { contents = [\"$section\"], region = <region> } }', " +
+        s"or use one the script already has: ${quoted_names(named)}"
+end unclaimed
+
+// -- after the link --------------------------------------------------------------------------------
+
+private const ShfAlloc: u64 = 2
+private const ShtNobits: u32 = 8
+
+private section_name(s: &Section) -> string = from_utf8_unchecked(s.name)
+
+// **An allocated section the script never named**, in an image the link just wrote, or `None`. The
+// image is removed where there is one: it is laid out by the linker's guess.
+check_linked_sections(exe: string, laid: &LaidOut) -> Option[string]
+    val bytes = read_bytes(exe) match
+        Ok(b) -> b
+        Err(_) -> return None
+
+    val elf = read_elf(bytes) match
+        Ok(e) -> e
+        Err(_) -> return None
+
+    for s in elf.sections()
+        if (s.flags & ShfAlloc) == 0 || s.size == 0 then continue
+
+        val name = section_name(s)
+        var known = false
+
+        for item in laid.sections
+            if item.name == name then known = true
+
+        if known then continue
+
+        remove_file(exe).unwrap_or(())
+
+        return Some(s"the image holds the section '$name' (${grouped(s.size)} bytes), which no 'sections' " +
+                    "entry and no rule of the generated linker script gathers, so the linker placed it by its " +
+                    "own orphan rules — something the build compiled put it there, a C 'section' attribute or " +
+                    s"an assembler's '.section'. Give it a 'sections' entry saying where it goes, as " +
+                    s"'sections { x { contents = [\"$name\"], region = <region> } }'")
+
+    None
+end check_linked_sections
+
+// -- an overflowing region -------------------------------------------------------------------------
+
+// Whether a failed link is a region too small for what it was given, in either linker's words.
+is_overflow(why: string) -> bool = why.contains("will not fit in region") || why.contains("overflowed by")
+
+// **The script again, with every region widened** -- each moved to an address of its own and made
+// 256 MiB long, so nothing overflows and nothing overlaps. Only the sizes of what is measured mean
+// anything; the addresses are made up.
+widened_script(laid: &LaidOut) -> string
+    var out: Buf[string] = buf()
+    var in_memory = false
+    var n: u64 = 0
+
+    for line in split_lines(laid.text)
+        if line == "MEMORY" then in_memory = true
+        if line == "}" then in_memory = false
+
+        if in_memory && line.contains(" : ORIGIN = ")
+            val head = line.index_of(" : ORIGIN = ").unwrap()
+
+            out.push(line[0..<head] + s" : ORIGIN = 0x${hex_lower((n + 1) * WideRegion, 8)}, LENGTH = " +
+                     s"0x${hex_lower(WideRegion, 8)}")
+            n += 1
+            continue
+        end if
+
+        out.push(line)
+
+    join(out.view(), "\n") + "\n"
+end widened_script
+
+private const WideRegion: u64 = 0x1000_0000
+
+private split_lines(text: string) -> Buf[string]
+    var out: Buf[string] = buf()
+    var start: usize = 0
+    val b = text.bytes
+
+    for i in 0..<b.len
+        if b[i] == u8('\n')
+            out.push(text[start..<i])
+            start = i + 1
+
+    if start < b.len then out.push(text[start..])
+
+    out
+end split_lines
+
+// One thing the report says a region holds.
+private struct Held
+    bytes: u64
+    name: string
+    why: string
+end Held
+
+// **The overflow report**, from the ELF the widened link wrote: each region too small for what it was
+// given, by how much, the parts of the layout that put things there, and the largest of them.
+overflow_report(measured: string, laid: &LaidOut, inputs: &Buf[LinkInput], root: string) -> Option[string]
+    val bytes = read_bytes(measured) match
+        Ok(b) -> b
+        Err(_) -> return None
+
+    val elf = read_elf(bytes) match
+        Ok(e) -> e
+        Err(_) -> return None
+
+    val sections = elf.sections()
+    val symbols = elf.symbols().unwrap_or(buf())
+    var reports: Buf[string] = buf()
+
+    for ri in 0..<laid.regions.len()
+        val r = laid.regions.at(ri)
+        val lo = (u64(ri) + 1) * WideRegion
+        var end_at = lo
+        var stored: u64 = 0
+        var roles: Buf[string] = buf()
+
+        for s in sections
+            if (s.flags & ShfAlloc) == 0 then continue
+
+            val name = section_name(s)
+            val out = out_section_named(laid, name)
+
+            if out.is_none() then continue
+
+            val o = out.unwrap()
+
+            if o.region == r.name && s.addr + s.size > end_at then end_at = s.addr + s.size
+            if o.stored == r.name && s.kind != ShtNobits then stored += s.size
+
+            if (o.region == r.name || o.stored == r.name) && s.size > 0 && !holds_string(roles, o.why)
+                roles.push(o.why)
+
+        val used = end_at - lo + stored
+
+        if used <= r.length then continue
+
+        var held: Buf[Held] = buf()
+
+        // The symbols the ELF names in the region, with the option that sized one where one did.
+        for sym in symbols
+            if sym.size == 0 || sym.value < lo || sym.value >= lo + WideRegion then continue
+
+            val name = from_utf8_unchecked(sym.name)
+
+            // A private symbol of the program's is said below, by its name in sysl and its line.
+            if name.starts_with("__sysl_") || name.starts_with("$") || name.starts_with(".L") then continue
+            if stored_as(name) then continue
+
+            held.push(Held(sym.size, name, sized_by(sym.size, inputs)))
+
+        // The program's own storage, by the names the program gives it.
+        for item in placed_storage
+            val home = home_of(laid, item.section)
+            val o = out_section_named(laid, home)
+
+            if o.is_some() && o.unwrap().region == r.name && item.bytes > 0
+                held.push(Held(item.bytes, item.name, if item.place == "" then "" else s"(${shown_from(root, item.place)})"))
+
+        if laid.stack_region == r.name
+            for n in 0..<laid.cores
+                held.push(Held(laid.stack_bytes, s"stack, core $n", s"(${laid.stack_from})"))
+
+        if laid.heap_region == r.name && laid.heap_bytes > 0
+            held.push(Held(laid.heap_bytes, "heap", s"(${laid.heap_from})"))
+
+        reports.push(region_report(r, used - r.length, roles, held, laid))
+
+    if reports.is_empty() then return None
+
+    Some(join(reports.view(), "\n"))
+end overflow_report
+
+// Whether a symbol the ELF names is the program's own storage, said by the program's name for it.
+private stored_as(symbol: string) -> bool
+    for item in placed_storage
+        if item.name == symbol then return true
+
+    false
+end stored_as
+
+// A source's place as the reader knows it: relative to the project where it is inside it.
+private shown_from(root: string, place: string) -> string
+    val prefix = absolute_path(root) + "/"
+
+    if place.starts_with(prefix) then place[prefix.bytes.len..] else place
+end shown_from
+
+private out_section_named(laid: &LaidOut, name: string) -> Option[OutSection]
+    for item in laid.sections
+        if item.name == name then return Some(item)
+
+    None
+end out_section_named
+
+// What sized a symbol, where its size is the value of one integer option of the build and of only one:
+// `(freertos heap_bytes = 65536, set by this project)`.
+private sized_by(size: u64, inputs: &Buf[LinkInput]) -> string
+    var found: Buf[string] = buf()
+
+    for input in inputs
+        for opt in input.settled
+            opt.kind match
+                OptInteger(_, _) -> ()
+                _ -> continue
+
+            if parse_amount(opt.literal) != Some(size) then continue
+
+            val setter = option_setter(input, opt.name, inputs)
+            val tail = if setter == "" then "" else s", set by $setter"
+
+            found.push(s"(${input.name} ${opt.name} = $size$tail)")
+
+    if found.len() == 1 then found.at(0) else ""
+end sized_by
+
+// Which package's dependency entry set an option, or `""` where it has its default.
+private option_setter(target: &LinkInput, name: string, inputs: &Buf[LinkInput]) -> string
+    for consumer in inputs
+        for d in consumer.deps
+            if d.1 != target.key then continue
+
+            for dep in consumer.manifest.dependencies
+                if dep.label != d.0 then continue
+
+                for item in dep.options
+                    if item.0 == name then return consumer.who
+
+    ""
+end option_setter
+
+private region_report(r: &PlacedRegion, short: u64, roles: Buf[string], held: Buf[Held], laid: &LaidOut) -> string
+    var parts: Buf[string] = buf()
+    var whys: Buf[string] = buf()
+
+    for item in roles
+        if item.starts_with("layout.")
+            val word = item.index_of(":") match
+                Some(at) -> item[0..<at]
+                None -> item
+
+            val role = word[7..]
+
+            if !holds_string(parts, role) then parts.push(role)
+            if !holds_string(whys, word) then whys.push(word)
+        else if item.starts_with("the vector table")
+            if !holds_string(parts, "code") then parts.push("code")
+            if !holds_string(whys, "layout.code") then whys.push("layout.code")
+        else
+            parts.push(item)
+
+    var lines: Buf[string] = buf()
+
+    lines.push(s"the region '${r.name}' (${size_said(r.length)}, ${r.owner}) is ${grouped(short)} bytes too " +
+               s"small for what this build puts in it — ${and_list(parts)}, as ${and_list(whys)} say. The largest:")
+
+    val sorted = largest_first(held)
+
+    for i in 0..<sorted.len()
+        if i == 5 then break
+
+        val h = sorted.at(i)
+        val size = grouped(h.bytes)
+        val name = h.name + spaces(26, h.name.bytes.len)
+
+        lines.push(s"    ${spaces(10, size.bytes.len)}$size  $name ${h.why}".trim_end())
+
+    lines.push(s"  ${move_said(r, whys, laid)}")
+    join(lines.view(), "\n")
+end region_report
+
+private move_said(r: &PlacedRegion, whys: Buf[string], laid: &LaidOut) -> string
+    var other = ""
+    var room: u64 = 0
+
+    for item in laid.regions
+        if item.name != r.name && item.kind == RegionRam && item.length > room
+            other = item.name
+            room = item.length
+
+    if other == "" || whys.is_empty() then return "make one of them smaller, or place a section of your own with @section"
+
+    s"move one with ${whys.at(0)} = $other, or place a section of your own with @section"
+end move_said
+
+private and_list(items: Buf[string]) -> string
+    if items.len() == 1 then return items.at(0)
+    if items.is_empty() then return "nothing"
+
+    var head: Buf[string] = buf()
+
+    for i in 0..<(items.len() - 1)
+        head.push(items.at(i))
+
+    join(head.view(), ", ") + " and " + items.at(items.len() - 1)
+end and_list
+
+// The spaces that pad `used` characters out to `width`, or none where they already reach it.
+private spaces(width: usize, used: usize) -> string
+    var out = ""
+    var n = used
+
+    while n < width
+        out = out + " "
+        n += 1
+
+    out
+end spaces
+
+private largest_first(items: Buf[Held]) -> Buf[Held]
+    var out = items.copy()
+
+    for i in 1..<out.len()
+        var j = i
+
+        while j > 0 && out.at(j - 1).bytes < out.at(j).bytes
+            val held = out.at(j)
+
+            out.set(j, out.at(j - 1))
+            out.set(j - 1, held)
+            j -= 1
+
+    out
+end largest_first

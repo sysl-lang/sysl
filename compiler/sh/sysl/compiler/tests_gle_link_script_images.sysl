@@ -1,0 +1,1028 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{is_file, make_dir_all, read_text, write_text}
+import sysl.process.capture
+import sysl.text.{join, replace_all, split, Search}
+import sysl.testing.skip
+
+// **The worked examples of the generated linker script, built** (`reference/packages.md § Generated
+// linker scripts`): the STM32H743 with its DMA buffers kept out of DTCM, the RP2350's IMAGE_DEF, skiff's
+// stacks per core and its shared partition, and a heap of what is left. Each is a tree of packages; each
+// golden is the script the build wrote, exactly; each image is linked by `ld.lld` and by GNU ld and read
+// back with `llvm-objdump` and `llvm-nm`, and the two linkers' images agree.
+
+private val gle_llvm: string = "/opt/homebrew/opt/llvm/bin"
+
+private gle_tool_present(name: string) -> bool = capture(name, ["--version"], "", [], true) match
+    Ok(o) -> o.status.ok()
+    Err(_) -> false
+
+// Whether the images can be linked and read here; a test that cannot is skipped, saying why.
+private gle_ready() -> bool
+    if !lbr_ready() then return false
+    if !gle_tool_present("ld.lld") then skip("ld.lld is not installed, so no image can be linked")
+    if !is_file(s"$gle_llvm/llvm-nm") then skip(s"there is no llvm-nm in $gle_llvm to read the image")
+
+    true
+end gle_ready
+
+private gle_gnu_present() -> bool = gle_tool_present("arm-none-eabi-ld")
+
+// A build of `dir` for `target`, as `sysl build` runs it: its exit code and everything it said.
+private gle_build(dir: string, target: string, out: string, extra: []string = []) -> (int, string)
+    var args: Buf[string] = buf()
+
+    for a in ["sysl", "build", "--target", target, "-o", out]
+        args.push(a)
+
+    for i in 0..<extra.len
+        args.push(extra[i])
+
+    args.push(dir)
+    reset_feature_request()
+
+    val said = lbr_cli(args.view())
+
+    reset_feature_request()
+    said
+end gle_build
+
+// Every symbol of an image, `name=address`, one per line, sorted, as `llvm-nm` reads them.
+private gle_symbols(elf: string) -> Buf[string]
+    val read = capture(s"$gle_llvm/llvm-nm", [elf], "", [], true).unwrap()
+    var out: Buf[string] = buf()
+
+    for line in lines_of(read.text)
+        val parts = split(line, " ")
+
+        if parts.len == 3 then out.push(s"${parts[2]}=${parts[0]}")
+
+    out
+end gle_symbols
+
+// The address of one symbol, or `""`.
+private gle_at(elf: string, name: string) -> string
+    for item in gle_symbols(elf)
+        if item.starts_with(name + "=") then return item[(name.bytes.len + 1)..]
+
+    ""
+end gle_at
+
+// Each section `name address size type`, as `llvm-objdump -h` reads them -- which prints a load
+// address column only where some section has one, and a type only where the section has one.
+private gle_sections(elf: string) -> Buf[string]
+    val read = capture(s"$gle_llvm/llvm-objdump", ["-h", elf], "", [], true).unwrap()
+    var out: Buf[string] = buf()
+
+    for line in lines_of(read.text)
+        var words: Buf[string] = buf()
+
+        for w in split(line, " ")
+            if !w.is_empty() then words.push(w)
+
+        if words.len() < 4 || !words.at(1).starts_with(".") then continue
+
+        val last = words.at(words.len() - 1)
+        val kind = if last == "TEXT" || last == "DATA" || last == "BSS" then s" $last" else ""
+
+        out.push(s"${words.at(1)} ${words.at(3)} ${words.at(2)}$kind")
+
+    out
+end gle_sections
+
+private gle_section(elf: string, name: string) -> string
+    for item in gle_sections(elf)
+        if item.starts_with(name + " ") then return item
+
+    ""
+end gle_section
+
+private gle_script(app: string, target: string) -> string =
+    read_text(s"$app/.sysl/out/$target/link.ld").unwrap_or("no script was written")
+
+// The symbols of two images that a linker writes the same, the unwinding table aside: GNU ld merges
+// adjacent `.ARM.exidx` entries that lld keeps, so the end of that table is the one address that is the
+// linker's own.
+private gle_agreeing(elf: string) -> string
+    var out: Buf[string] = buf()
+
+    for item in gle_symbols(elf)
+        if !item.starts_with("__sysl_exidx_end=") && !item.starts_with("$") then out.push(item)
+
+    join(out.view(), "\n")
+end gle_agreeing
+
+// -- 8.2: STM32H743 --------------------------------------------------------------------------------
+
+private val gle_h7_target: string = "thumbv7em-freestanding-dp"
+
+private val gle_h7_board: string =
+    "package { name = \"stm32h7-board\", version = \"0.1.0\" }\n" +
+    "memory {\n" +
+    "  flash   { origin = 0x0800_0000, length = \"option:flash_bytes\", kind = rom }\n" +
+    "  itcm    { origin = 0x0000_0000, length = 64K,  kind = ram, tags = [fast, code] }\n" +
+    "  dtcm    { origin = 0x2000_0000, length = 128K, kind = ram, tags = [fast] }\n" +
+    "  ram_d1  { origin = 0x2400_0000, length = 512K, kind = ram, tags = [dma] }\n" +
+    "  ram_d2  { origin = 0x3000_0000, length = 288K, kind = ram, tags = [dma] }\n" +
+    "  ram_d3  { origin = 0x3800_0000, length = 64K,  kind = ram, tags = [dma, backup] }\n" +
+    "}\n" +
+    "options { flash_bytes { type = usize, values = [1048576, 2097152], default = 2097152 } }\n" +
+    "symbols { _estack = stack_top }\n"
+
+private val gle_usb: string =
+    "package { name = \"tinyusb\", version = \"0.1.0\" }\n" +
+    "c { tinyusb { root = \"c\", sources = [\"usb.c\"] } }\n" +
+    "features {\n  stm32h7 {\n" +
+    "    sections { tinyusb_dma { contents = [\".sysl.tinyusb.dma\"], wants = dma, zero = true, align = 32 } }\n" +
+    "  }\n}\n"
+
+private val gle_usb_c: string =
+    "__attribute__((section(\".sysl.tinyusb.dma\"), aligned(32))) unsigned char tud_buffer[512];\n\n" +
+    "unsigned char *tud_buffer_at(void) { return tud_buffer; }\n"
+
+private val gle_rtos: string =
+    "package { name = \"freertos\", version = \"0.1.0\" }\n" +
+    "c { kernel { root = \"c\", sources = [\"heap_4.c\"] } }\n" +
+    "options { heap_bytes { type = usize, default = 4096, macro = \"configTOTAL_HEAP_SIZE\" } }\n"
+
+private val gle_rtos_c: string =
+    "#include \"sysl/freertos.h\"\n\nstatic unsigned char ucHeap[configTOTAL_HEAP_SIZE];\n\n" +
+    "unsigned char *pvHeapAt(void) { return ucHeap; }\n"
+
+private gle_h7_app(deps: string, layout: string, extra: string) -> string =
+    "package { name = \"h7-bridge\", version = \"0.1.0\" }\n" +
+    s"dependencies {\n  board { path = \"../board\" }\n$deps}\n" +
+    s"targets {\n  $gle_h7_target {\n    layout { $layout }\n  }\n}\n" +
+    s"features { gnu { targets.$gle_h7_target.linker = \"arm-none-eabi-ld\" } }\n$extra"
+
+private val gle_h7_deps: string =
+    "  tinyusb { path = \"../usb\", features = [stm32h7] }\n" +
+    "  freertos { path = \"../rtos\", options = { heap_bytes = 65536 } }\n"
+
+private val gle_h7_layout: string = "code = flash, data = dtcm, stack { region = dtcm, bytes = 32768 }"
+
+private gle_h7_main(storage: string, used: string) -> string =
+    "@no_os\n\nimport h7board\nimport usb\nimport rtos\n\n@export(\"frame\")\nvar frame: [16384]u8\n" +
+    s"$storage\n@export(\"main\")\nprobe_main() -> int\n    frame[3] = 1\n" +
+    s"    int(h7board.stack_top() + usb.buffer() + rtos.heap() + usize(frame[3]) + $used)\n"
+
+// The four packages of § 8.2's application, the app's manifest, and its storage and what reads it.
+private gle_h7(app_manifest: string, storage: string = "", used: string = "0") -> string
+    var files: Buf[(string, string)] = buf()
+
+    files.push(("board/sysl.hocon", gle_h7_board))
+    files.push(("board/h7board/board.sysl",
+                "module h7board\n\nextern \"_estack\" estack: u8\n\nstack_top() -> usize = usize(&estack)\n"))
+    files.push(("usb/sysl.hocon", gle_usb))
+    files.push(("usb/c/usb.c", gle_usb_c))
+    files.push(("usb/usb/usb.sysl",
+                "module usb\n\nextern \"tud_buffer_at\" buffer_at() -> *u8\n\nbuffer() -> usize = usize(buffer_at())\n"))
+    files.push(("rtos/sysl.hocon", gle_rtos))
+    files.push(("rtos/c/heap_4.c", gle_rtos_c))
+    files.push(("rtos/rtos/rtos.sysl",
+                "module rtos\n\nextern \"pvHeapAt\" heap_at() -> *u8\n\nheap() -> usize = usize(heap_at())\n"))
+    files.push(("app/sysl.hocon", app_manifest))
+    files.push(("app/main.sysl", gle_h7_main(storage, used)))
+    lbr_tree(files)
+end gle_h7
+
+@test("8.2: the STM32H743's script is exactly the manifests', DMA buffers in ram_d1 and the stack in DTCM")
+gle_h7_golden()
+    if !gle_ready() then return
+
+    val root = gle_h7(gle_h7_app(gle_h7_deps, gle_h7_layout, ""))
+    val app = s"$root/app"
+    val said = gle_build(app, gle_h7_target, s"$root/h7.elf")
+
+    assert_eq(said.1, s"wrote $root/h7.elf")
+    assert_eq(gle_script(app, gle_h7_target), gle_h7_script)
+
+    val elf = s"$root/h7.elf"
+
+    assert_eq(gle_section(elf, ".tinyusb_dma"), ".tinyusb_dma 24000000 00000200 BSS")
+    assert_eq(gle_section(elf, ".stack"), ".stack 20014000 00008000 BSS")
+    assert_eq(gle_at(elf, "tud_buffer"), "24000000")
+    assert_eq(gle_at(elf, "_estack"), "2001c000")
+    assert_eq(gle_at(elf, "__sysl_stack_top"), "2001c000")
+    assert_eq(gle_at(elf, "ucHeap"), "20004000")
+    lbr_drop([root])
+end gle_h7_golden
+
+@test("8.2: the root's place moves TinyUSB's buffers to ram_d2, and GNU ld lays both out as lld does")
+gle_h7_place_and_both_linkers()
+    if !gle_ready() then return
+    if !gle_gnu_present() then skip("arm-none-eabi-ld is not installed, so GNU ld's image cannot be compared")
+
+    val root = gle_h7(gle_h7_app(gle_h7_deps, gle_h7_layout + ", place { tinyusb_dma = ram_d2 }", ""))
+    val app = s"$root/app"
+
+    assert_eq(gle_build(app, gle_h7_target, s"$root/lld.elf").0, 0)
+    assert_eq(gle_build(app, gle_h7_target, s"$root/gnu.elf", ["--features", "gnu"]).0, 0)
+    assert_eq(gle_at(s"$root/lld.elf", "tud_buffer"), "30000000")
+    assert_eq(gle_agreeing(s"$root/gnu.elf"), gle_agreeing(s"$root/lld.elf"))
+    lbr_drop([root])
+end gle_h7_place_and_both_linkers
+
+@test("8.2: an overflowing DTCM is reported in the manifest's terms, the same by both linkers")
+gle_h7_overflow()
+    if !gle_ready() then return
+
+    val root = gle_h7(gle_h7_app(gle_h7_deps, gle_h7_layout, ""), "var big: [24576]u8\n\n" +
+                      "touch(i: u8) -> u8\n    big[i] = i\n    big[i + 1]\n", "usize(touch(frame[3]))")
+    val app = s"$root/app"
+    val lld = gle_build(app, gle_h7_target, s"$root/h7.elf")
+    val report =
+        "sysl: error: the region 'dtcm' (128 KiB, stm32h7-board) is 8,192 bytes too small for what this build " +
+        "puts in it — data and stack, as layout.data and layout.stack say. The largest:\n" +
+        "        65,536  ucHeap                     (freertos heap_bytes = 65536, set by this project)\n" +
+        "        32,768  stack, core 0              (layout.stack)\n" +
+        "        24,576  big                        (main.sysl:9)\n" +
+        "        16,384  frame                      (main.sysl:7)\n"
+
+    assert_eq(lld.0, 1)
+    assert(lld.1.starts_with(report), lld.1)
+    assert(lld.1.contains("  move one with layout.data = ram_d1, or place a section of your own with @section\n"),
+           lld.1)
+    assert(lld.1.contains("ld.lld: error: section '.stack' will not fit in region 'dtcm': overflowed by 8192 bytes"),
+           "the linker's own words follow")
+    assert(!is_file(s"$app/.sysl/out/$gle_h7_target/measure.elf"), "the measured image is not left behind")
+
+    if gle_gnu_present()
+        val gnu = gle_build(app, gle_h7_target, s"$root/h7.elf", ["--features", "gnu"])
+
+        assert(gnu.1.starts_with(report), gnu.1)
+        assert(gnu.1.contains("region `dtcm' overflowed by 8192 bytes"), gnu.1)
+    end if
+
+    lbr_drop([root])
+end gle_h7_overflow
+
+@test("an option the board's script reads is in the run cache's key, and changing it changes the script")
+gle_h7_option_rekeys()
+    if !gle_ready() then return
+
+    val one = gle_h7_app(gle_h7_deps, gle_h7_layout, "")
+    val root = gle_h7(one)
+    val app = s"$root/app"
+    val t = target_named(gle_h7_target).unwrap()
+
+    assert_eq(gle_build(app, gle_h7_target, s"$root/a.elf").0, 0)
+
+    val first_key = run_cache_key_of("build", app, t, DefaultOptimization, None)
+    val first = gle_script(app, gle_h7_target)
+
+    write_text(s"$app/sysl.hocon", replace_all(one, "path = \"../board\"",
+                                                 "path = \"../board\", options = { flash_bytes = 1048576 }")).unwrap()
+    assert_eq(gle_build(app, gle_h7_target, s"$root/b.elf").0, 0)
+
+    val second = gle_script(app, gle_h7_target)
+
+    assert(first.contains("  flash  (rx)  : ORIGIN = 0x08000000, LENGTH = 0x00200000\n"), first)
+    assert(second.contains("  flash  (rx)  : ORIGIN = 0x08000000, LENGTH = 0x00100000\n"), second)
+    assert(run_cache_key_of("build", app, t, DefaultOptimization, None) != first_key, "the key moves with it")
+    lbr_drop([root])
+end gle_h7_option_rekeys
+
+@test("TinyUSB without its stm32h7 feature places nothing, so its C's buffer section is refused after the link")
+gle_h7_feature_off()
+    if !gle_ready() then return
+
+    val root = gle_h7(gle_h7_app("  tinyusb { path = \"../usb\" }\n  freertos { path = \"../rtos\" }\n",
+                                 gle_h7_layout, ""))
+    val said = gle_build(s"$root/app", gle_h7_target, s"$root/h7.elf")
+
+    assert_eq(said.0, 1)
+    assert_eq(said.1, "sysl: error: the image holds the section '.sysl.tinyusb.dma' (512 bytes), which no " +
+              "'sections' entry and no rule of the generated linker script gathers, so the linker placed it by " +
+              "its own orphan rules — something the build compiled put it there, a C 'section' attribute or an " +
+              "assembler's '.section'. Give it a 'sections' entry saying where it goes, as 'sections { x { " +
+              "contents = [\".sysl.tinyusb.dma\"], region = <region> } }'")
+    assert(!is_file(s"$root/h7.elf"), "an image laid out by the linker's guess is not left behind")
+    lbr_drop([root])
+end gle_h7_feature_off
+
+// -- 8.3: RP2350 -----------------------------------------------------------------------------------
+
+private val gle_pico2_board: string =
+    "package { name = \"pico2-board\", version = \"0.1.0\" }\n" +
+    "memory {\n" +
+    "  flash     { origin = 0x1000_0000, length = \"option:flash_bytes\", kind = rom }\n" +
+    "  sram      { origin = 0x2000_0000, length = 512K, kind = ram, tags = [dma] }\n" +
+    "  scratch_x { origin = 0x2008_0000, length = 4K,   kind = ram, tags = [core0] }\n" +
+    "  scratch_y { origin = 0x2008_1000, length = 4K,   kind = ram, tags = [core1] }\n" +
+    "}\n" +
+    "sections {\n" +
+    "  image_def { contents = [\".embedded_block\"], region = flash, first = true, keep = true }\n" +
+    "}\n" +
+    "options { flash_bytes { type = usize, default = 4194304 } }\n"
+
+// The board's IMAGE_DEF, in a module the application never imports, and its vector table.
+private val gle_pico2_block: string =
+    "module pico2\n\n// The minimal Arm secure executable IMAGE_DEF the datasheet gives (§ 5.9.5).\n" +
+    "@section(\".embedded_block\")\n" +
+    "val image_def: [5]u32 = [0xffffded3, 0x10210142, 0x000001ff, 0x00000000, 0xab123579]\n"
+
+private val gle_pico2_main: string =
+    "@no_os\n\n@section(\".vectors\")\n@export(\"vectors\")\nval vectors: [2]u32 = [0x2008_0000, 0]\n\n" +
+    "@export(\"ticks\")\nvar ticks: [4]u32 = [1, 2, 3, 4]\n\n@export(\"counts\")\nvar counts: [16]u32\n\n" +
+    "@export(\"main\")\nprobe_main() -> int\n    counts[1] = ticks[2]\n    int(counts[1])\n"
+
+private gle_pico2(app_manifest: string, board_as: string = "board") -> string
+    var files: Buf[(string, string)] = buf()
+
+    files.push((s"$board_as/sysl.hocon", gle_pico2_board))
+    files.push((s"$board_as/pico2/block.sysl", gle_pico2_block))
+    files.push(("app/sysl.hocon", app_manifest))
+    files.push(("app/main.sysl", gle_pico2_main))
+    lbr_tree(files)
+end gle_pico2
+
+private gle_pico2_app(extra: string) -> string =
+    "package { name = \"blink\", version = \"0.1.0\" }\ndependencies { board { path = \"../board\" } }\n" +
+    "targets { thumb-freestanding { layout { code = flash, data = sram } } }\n" +
+    "features { gnu { targets.thumb-freestanding.linker = \"arm-none-eabi-ld\" } }\n" + extra
+
+@test("8.3: the RP2350's IMAGE_DEF is first in flash and kept though nothing imports it, the vectors after it")
+gle_pico2_golden()
+    if !gle_ready() then return
+
+    val root = gle_pico2(gle_pico2_app(""))
+    val app = s"$root/app"
+    val elf = s"$root/blink.elf"
+
+    assert_eq(gle_build(app, "thumb-freestanding", elf).0, 0)
+    assert_eq(gle_script(app, "thumb-freestanding"), gle_pico2_script)
+    assert_eq(gle_section(elf, ".image_def"), ".image_def 10000000 00000014 DATA")
+    assert_eq(gle_section(elf, ".vectors"), ".vectors 10000014 00000008 DATA")
+    assert_eq(gle_at(elf, "__sysl_data_start"), "20000000")
+    assert_eq(gle_at(elf, "ticks"), "20000000")
+    assert_eq(gle_at(elf, "counts"), "20000010")
+    assert_eq(gle_at(elf, "__sysl_data_load"), gle_at(elf, "__sysl_rodata_end"))
+
+    if gle_gnu_present()
+        assert_eq(gle_build(app, "thumb-freestanding", s"$root/gnu.elf", ["--features", "gnu"]).0, 0)
+        assert_eq(gle_agreeing(s"$root/gnu.elf"), gle_agreeing(elf))
+    end if
+
+    lbr_drop([root])
+end gle_pico2_golden
+
+@test("--emit link writes the script where the build keeps it and prints its path, and --emit all adds the headers")
+gle_emit_link()
+    if !gle_ready() then return
+
+    val root = gle_pico2(gle_pico2_app(""))
+    val app = s"$root/app"
+    val script = s"$app/.sysl/out/thumb-freestanding/link.ld"
+
+    assert_eq(gle_build(app, "thumb-freestanding", s"$root/a.elf", ["--emit", "link"]).1,
+              s"wrote $root/a.elf\nwrote $script")
+    assert_eq(gle_build(app, "thumb-freestanding", s"$root/a.elf", ["--emit", "all"]).1,
+              s"wrote $root/a.elf\nwrote $script")
+    assert_eq(gle_build(app, "thumb-freestanding", s"$root/a.elf", ["--emit", "lnk"]).1,
+              "sysl: error: '--emit lnk' is not something a build can emit — it takes 'config' (every package's " +
+              "header), 'config:<package>' (one), 'link' (the generated linker script) or 'all', comma-separated")
+    lbr_drop([root])
+end gle_emit_link
+
+@test("a board as a --lib root declares the memory as a dependency's would")
+gle_pico2_lib_root()
+    if !gle_ready() then return
+
+    val root = gle_pico2("package { name = \"blink\" }\ntargets { thumb-freestanding { layout { code = flash } } }\n",
+                         "lib")
+    val said = gle_build(s"$root/app", "thumb-freestanding", s"$root/blink.elf", ["--lib", s"$root/lib"])
+
+    assert_eq(said.0, 0)
+    assert_eq(gle_section(s"$root/blink.elf", ".image_def"), ".image_def 10000000 00000014 DATA")
+    lbr_drop([root])
+end gle_pico2_lib_root
+
+// -- 8.4: skiff ------------------------------------------------------------------------------------
+
+private val gle_kernel: string =
+    "package { name = \"kernel\", version = \"0.1.0\" }\n" +
+    "options {\n" +
+    "  stack_bytes { type = usize, default = 2048, range = [512, 65536], doc = \"each core's boot stack\" }\n" +
+    "  cores { type = usize, default = 1, range = [1, 2] }\n" +
+    "}\n" +
+    "sections {\n  shared { contents = [\".shared\"], wants = shared, zero = true, align = 32 }\n}\n"
+
+private gle_skiff_board(entry_options: string) -> string =
+    "package { name = \"qemu-an521\", version = \"0.0.1\" }\n" +
+    s"dependencies { kernel { path = \"../kernel\", options = { $entry_options } } }\n" +
+    "memory {\n  ram { origin = 0x1000_0000, length = 4M, kind = ram, tags = [shared] }\n}\n" +
+    "targets {\n  thumb-freestanding-soft {\n    entry  = \"_start\"\n    layout {\n" +
+    "      code  = ram\n      data  = ram\n" +
+    "      stack { region = ram, bytes = \"option:kernel.stack_bytes\", per_core = \"option:kernel.cores\" }\n" +
+    "    }\n  }\n}\n" +
+    "symbols { _stack_top0 = stack_top_0, _stack_top1 = stack_top_1, __shared_start = shared_start, " +
+    "__shared_end = shared_end }\n" +
+    "features { gnu { targets.thumb-freestanding-soft.linker = \"arm-none-eabi-ld\" } }\n"
+
+private gle_skiff(entry_options: string) -> string
+    var files: Buf[(string, string)] = buf()
+
+    files.push(("kernel/sysl.hocon", gle_kernel))
+    files.push(("kernel/kernel/kernel.sysl",
+                "module kernel\n\n// Every core's view of the one Shared.\n@section(\".shared\")\nvar shared: [64]u32\n\n" +
+                "publish(core: usize, v: u32)\n    shared[core] = v\n"))
+    files.push(("board/sysl.hocon", gle_skiff_board(entry_options)))
+    files.push(("board/main.sysl",
+                "@no_os\n\nimport kernel\n\nextern \"_stack_top1\" top1: u8\nextern \"__shared_start\" shared_start: u8\n\n" +
+                "@export(\"_start\")\nstart() -> int\n    kernel.publish(1, u32(usize(&top1)))\n" +
+                "    int(usize(&shared_start))\n"))
+    lbr_tree(files)
+end gle_skiff
+
+@test("8.4: skiff's two stacks are sized by the kernel's options, and .shared is zeroed and never loaded")
+gle_skiff_golden()
+    if !gle_ready() then return
+
+    val root = gle_skiff("cores = 2")
+    val board = s"$root/board"
+    val elf = s"$root/skiff.elf"
+
+    assert_eq(gle_build(board, "thumb-freestanding-soft", elf).0, 0)
+    assert_eq(gle_script(board, "thumb-freestanding-soft"), gle_skiff_script)
+    assert_eq(gle_section(elf, ".shared"), ".shared 10000040 00000100 BSS")
+    assert_eq(gle_at(elf, "__shared_start"), "10000040")
+    assert_eq(gle_at(elf, "__sysl_stack_top_0"), "10000940")
+    assert_eq(gle_at(elf, "_stack_top1"), "10001140")
+
+    // An alias is PROVIDEd: defined where something names it, as `_stack_top0` is not here.
+    assert_eq(gle_at(elf, "_stack_top0"), "")
+
+    if gle_gnu_present()
+        assert_eq(gle_build(board, "thumb-freestanding-soft", s"$root/gnu.elf", ["--features", "gnu"]).0, 0)
+        assert_eq(gle_agreeing(s"$root/gnu.elf"), gle_agreeing(elf))
+    end if
+
+    lbr_drop([root])
+end gle_skiff_golden
+
+@test("8.4: one value sizes the stacks and the kernel, so three cores and a big stack follow the option")
+gle_skiff_options_follow()
+    if !gle_ready() then return
+
+    val root = gle_skiff("cores = 1, stack_bytes = 4096")
+    val board = s"$root/board"
+    val said = gle_build(board, "thumb-freestanding-soft", s"$root/skiff.elf")
+
+    // With one core the script has no second stack, so the board's alias names nothing.
+    assert(said.1.contains("'symbols._stack_top1' of this project names 'stack_top_1', which the generated script " +
+                           "does not define"), said.1)
+
+    write_text(s"$board/sysl.hocon", gle_skiff_board("cores = 2, stack_bytes = 4096")).unwrap()
+    assert_eq(gle_build(board, "thumb-freestanding-soft", s"$root/skiff.elf").0, 0)
+    assert_eq(gle_at(s"$root/skiff.elf", "_stack_top1"), "10002140")
+    lbr_drop([root])
+end gle_skiff_options_follow
+
+// -- 8.5: a heap of what is left -------------------------------------------------------------------
+
+@test("8.5: a heap of rest runs from the end of what the region holds to the region's end")
+gle_heap_rest()
+    if !gle_ready() then return
+
+    val root = gle_h7(gle_h7_app(gle_h7_deps, gle_h7_layout + ", heap { region = ram_d1, bytes = rest }", ""))
+    val elf = s"$root/h7.elf"
+
+    assert_eq(gle_build(s"$root/app", gle_h7_target, elf).0, 0)
+    assert_eq(gle_at(elf, "__sysl_heap_end"), "24080000")
+    assert_eq(gle_at(elf, "__sysl_heap_start"), "24000200")
+    lbr_drop([root])
+end gle_heap_rest
+
+// -- what a script may meet ------------------------------------------------------------------------
+
+@test("a @section the script does not gather is refused at the declaration, naming the module")
+gle_unclaimed_section()
+    if !gle_ready() then return
+
+    val root = gle_pico2(gle_pico2_app(""))
+    val app = s"$root/app"
+
+    make_dir_all(s"$app/extra").unwrap()
+    write_text(s"$app/extra/extra.sysl", "module extra\n\n@section(\".ramfunc\")\nfast() -> int = 1\n").unwrap()
+    write_text(s"$app/main.sysl", replace_all(gle_pico2_main, "@no_os\n", "@no_os\n\nimport extra\n") +
+               "\n@export(\"f\")\nf() -> int = extra.fast()\n").unwrap()
+
+    val said = gle_build(app, "thumb-freestanding", s"$root/blink.elf")
+
+    assert_eq(said.0, 1)
+    assert(said.1.contains("error: 'extra.fast' is placed in '.ramfunc' by '@section', and the generated linker " +
+                           "script has no rule that gathers it — a section no 'sections' entry claims would be left " +
+                           "to the linker's orphan placement. Give it a 'sections' entry, as 'sections { x { contents " +
+                           "= [\".ramfunc\"], region = <region> } }', or use one the script already has: "), said.1)
+    assert(said.1.contains("/app/extra/extra.sysl:3:1\n"), said.1)
+    lbr_drop([root])
+end gle_unclaimed_section
+
+@test("a hand-written linker_script wins over the memory map, in the target block and in an enabled feature")
+gle_hand_written_wins()
+    if !gle_ready() then return
+
+    val hand = "ENTRY(main)\nSECTIONS\n{\n    . = 0x08000000;\n    .text : { *(.text .text.*) }\n" +
+               "    .rodata : { *(.rodata .rodata.*) }\n    .data : { *(.data .data.*) }\n" +
+               "    .bss (NOLOAD) : { *(.bss .bss.*) *(COMMON) }\n}\n"
+    val root = gle_pico2(gle_pico2_app("") + "features { own { targets.thumb-freestanding.linker_script = \"own.ld\" } }\n")
+    val app = s"$root/app"
+
+    write_text(s"$app/own.ld", hand).unwrap()
+
+    val said = gle_build(app, "thumb-freestanding", s"$root/own.elf", ["--features", "own", "--emit", "link"])
+
+    assert(said.1.contains("'--emit link' has nothing to write — this build is laid out by no generated linker " +
+                           "script: its target is not a freestanding image, its root names a 'linker_script', or " +
+                           "no package of it declares 'memory'"), said.1)
+    assert(gle_at(s"$root/own.elf", "main").starts_with("0800"), gle_at(s"$root/own.elf", "main"))
+    lbr_drop([root])
+end gle_hand_written_wins
+
+@test("GNU ld links a hand-written script that lays out no thread-local template")
+gle_gnu_hand_written()
+    if !gle_ready() then return
+    if !gle_gnu_present() then skip("arm-none-eabi-ld is not installed")
+
+    val hand = "SECTIONS\n{\n    . = 0x08000000;\n    .text : { *(.text .text.*) }\n" +
+               "    .rodata : { *(.rodata .rodata.*) }\n    .data : { *(.data .data.*) }\n" +
+               "    .bss (NOLOAD) : { *(.bss .bss.*) *(COMMON) }\n}\n"
+    var files = lbr_two("main.sysl", "@no_os\n\n@export(\"main\")\nprobe_main() -> int = 7\n", "sysl.hocon",
+                        "package { name = \"g\" }\ntargets { thumb-freestanding { linker = \"arm-none-eabi-ld\", " +
+                        "linker_script = \"g.ld\", entry = \"main\" } }\n")
+
+    files.push(("g.ld", hand))
+
+    val root = lbr_tree(files)
+    val said = gle_build(root, "thumb-freestanding", s"$root/g.elf")
+
+    assert_eq(said.1, s"wrote $root/g.elf")
+    assert(gle_at(s"$root/g.elf", "main").starts_with("0800"), gle_at(s"$root/g.elf", "main"))
+    lbr_drop([root])
+end gle_gnu_hand_written
+
+@test("a hosted build of a project whose board declares memory generates nothing, and a hosted layout is refused")
+gle_hosted()
+    if !gle_ready() then return
+
+    val root = gle_pico2("package { name = \"blink\" }\ndependencies { board { path = \"../board\" } }\n")
+    val app = s"$root/app"
+
+    // The IMAGE_DEF's section is an ELF one, which a Mach-O build has no spelling for; the board's
+    // memory map is what this build is about.
+    write_text(s"$root/board/pico2/block.sysl", "module pico2\n\nanswer() -> int = 42\n").unwrap()
+    write_text(s"$app/main.sysl", "print(\"hosted\")\n").unwrap()
+    assert_eq(gle_build(app, host_target().name, s"$root/blink").0, 0)
+    assert(!is_file(s"$app/.sysl/out/${host_target().name}/link.ld"), "no script for a hosted program")
+
+    write_text(s"$app/sysl.hocon", "package { name = \"blink\" }\ndependencies { board { path = \"../board\" } }\n" +
+               s"targets { ${host_target().name} { layout { code = flash } } }\n").unwrap()
+
+    val said = gle_build(app, host_target().name, s"$root/blink")
+
+    assert(said.1.contains(s"'targets.${host_target().name}.layout' lays out a freestanding image's memory, and " +
+                           s"'${host_target().name}' is not a target this compiler links an image for"), said.1)
+    lbr_drop([root])
+end gle_hosted
+
+@test("a dependency's layout is refused, its memory and sections are not, and a layout needs some memory")
+gle_layout_is_the_roots()
+    if !gle_ready() then return
+
+    val root = gle_pico2(gle_pico2_app(""))
+
+    write_text(s"$root/board/sysl.hocon",
+               gle_pico2_board + "targets { thumb-freestanding { layout { data = sram } } }\n").unwrap()
+
+    val said = gle_build(s"$root/app", "thumb-freestanding", s"$root/blink.elf")
+
+    assert(said.1.contains("sets 'targets.thumb-freestanding.layout' in its sysl.hocon, and which regions a " +
+                           "program's code, data, stacks and heap go in is the program's own to say"), said.1)
+
+    write_text(s"$root/board/sysl.hocon", "package { name = \"pico2-board\", version = \"0.1.0\" }\n").unwrap()
+
+    val bare = gle_build(s"$root/app", "thumb-freestanding", s"$root/blink.elf")
+
+    assert(bare.1.contains("'targets.thumb-freestanding.layout' places the program in regions, and no package of " +
+                           "this build declares any 'memory'"), bare.1)
+    lbr_drop([root])
+end gle_layout_is_the_roots
+
+@test("a 64-bit image links by its generated script, tables of QUADs and all")
+gle_aarch64()
+    if !gle_ready() then return
+
+    var files = lbr_two("main.sysl", "@no_os\n\n@export(\"seen\")\nvar seen: [8]u64 = [1, 2, 3, 4, 5, 6, 7, 8]\n\n" +
+                        "@export(\"main\")\nprobe_main() -> int = int(seen[3])\n", "sysl.hocon",
+                        "package { name = \"k\" }\nmemory { ram { origin = 0x4008_0000, length = 64M, kind = ram } }\n" +
+                        "targets { aarch64-freestanding { layout { code = ram } } }\n")
+    val root = lbr_tree(files)
+    val elf = s"$root/k.elf"
+
+    assert_eq(gle_build(root, "aarch64-freestanding", elf).1, s"wrote $elf")
+    assert_eq(gle_at(elf, "seen"), gle_at(elf, "__sysl_data_start"))
+    assert(gle_at(elf, "seen").starts_with("00000000400"), gle_at(elf, "seen"))
+    assert(gle_script(root, "aarch64-freestanding").contains("    QUAD(ADDR(.bss)) QUAD(ADDR(.bss) + SIZEOF(.bss))\n"),
+           gle_script(root, "aarch64-freestanding"))
+    lbr_drop([root])
+end gle_aarch64
+
+// -- the goldens -----------------------------------------------------------------------------------
+
+// § 8.2's application: TinyUSB's buffers in the first region tagged `dma`, the stack in DTCM, and the
+// board's `_estack`.
+private val gle_h7_script: string = raw"""
+    /* The linker script sysl wrote for 'thumbv7em-freestanding-dp' from the manifests of this build. It is
+     * rewritten by every build; to lay the image out by hand, name a script of your own with
+     * 'targets.thumbv7em-freestanding-dp.linker_script'. */
+
+    MEMORY
+    {
+      flash  (rx)  : ORIGIN = 0x08000000, LENGTH = 0x00200000
+      itcm   (rwx) : ORIGIN = 0x00000000, LENGTH = 0x00010000
+      dtcm   (rwx) : ORIGIN = 0x20000000, LENGTH = 0x00020000
+      ram_d1 (rwx) : ORIGIN = 0x24000000, LENGTH = 0x00080000
+      ram_d2 (rwx) : ORIGIN = 0x30000000, LENGTH = 0x00048000
+      ram_d3 (rwx) : ORIGIN = 0x38000000, LENGTH = 0x00010000
+    }
+
+    SECTIONS
+    {
+      .vectors : ALIGN(4)
+      {
+        KEEP(*(.vectors .vectors.* .isr_vector .isr_vector.*))
+      } > flash
+
+      .text : ALIGN(4)
+      {
+        __sysl_text_start = .;
+        *(.text .text.*)
+        . = ALIGN(4);
+        __sysl_text_end = .;
+        __sysl_copy_table = .;
+        LONG(LOADADDR(.data)) LONG(ADDR(.data)) LONG(ADDR(.data) + SIZEOF(.data))
+        __sysl_copy_table_end = .;
+        __sysl_zero_table = .;
+        LONG(ADDR(.bss)) LONG(ADDR(.bss) + SIZEOF(.bss))
+        LONG(ADDR(.tinyusb_dma)) LONG(ADDR(.tinyusb_dma) + SIZEOF(.tinyusb_dma))
+        __sysl_zero_table_end = .;
+      } > flash
+
+      .rodata : ALIGN(4)
+      {
+        __sysl_rodata_start = .;
+        *(.rodata .rodata.* .srodata .srodata.*)
+        . = ALIGN(4);
+        __sysl_rodata_end = .;
+      } > flash
+
+      .tdata : ALIGN(4)
+      {
+        *(.tdata .tdata.*)
+      } > flash
+
+      .tbss : ALIGN(4)
+      {
+        *(.tbss .tbss.*)
+      } > flash
+
+      .percpu : ALIGN(4)
+      {
+        __sysl_percpu_start = .;
+        KEEP(*(.percpu))
+        . = ALIGN(4);
+        __sysl_percpu_end = .;
+      } > flash
+
+      .data : ALIGN(4)
+      {
+        __sysl_data_start = .;
+        *(.data .data.* .sdata .sdata.*)
+        . = ALIGN(4);
+        __sysl_data_end = .;
+      } > dtcm AT> flash
+
+      __sysl_data_load = LOADADDR(.data);
+
+      .bss (NOLOAD) : ALIGN(4)
+      {
+        __sysl_bss_start = .;
+        *(.bss .bss.* .sbss .sbss.*)
+        *(COMMON)
+        . = ALIGN(4);
+        __sysl_bss_end = .;
+      } > dtcm
+
+      .noinit (NOLOAD) : ALIGN(4)
+      {
+        __sysl_noinit_start = .;
+        *(.noinit .noinit.*)
+        . = ALIGN(4);
+        __sysl_noinit_end = .;
+      } > dtcm
+
+      .tinyusb_dma (NOLOAD) : ALIGN(32)
+      {
+        __sysl_tinyusb_dma_start = .;
+        *(.sysl.tinyusb.dma)
+        . = ALIGN(4);
+        __sysl_tinyusb_dma_end = .;
+      } > ram_d1
+
+      .stack (NOLOAD) : ALIGN(8)
+      {
+        __sysl_stack_start = .;
+        . = . + 32768;
+        __sysl_stack_top_0 = .;
+        __sysl_stack_end = .;
+      } > dtcm
+
+      __sysl_stack_top = __sysl_stack_top_0;
+
+      .ARM.extab : ALIGN(4)
+      {
+        __sysl_extab_start = .;
+        *(.ARM.extab .ARM.extab.*)
+        . = ALIGN(4);
+        __sysl_extab_end = .;
+      } > flash
+
+      .ARM.exidx : ALIGN(4)
+      {
+        __sysl_exidx_start = .;
+        *(.ARM.exidx .ARM.exidx.*)
+        . = ALIGN(4);
+        __sysl_exidx_end = .;
+      } > flash
+
+      __sysl_tls_data = ADDR(.tdata);
+      __sysl_tls_data_end = ADDR(.tdata) + SIZEOF(.tdata);
+      __sysl_tls_end = ADDR(.tbss) + SIZEOF(.tbss);
+      __sysl_tls_align = MAX(ALIGNOF(.tdata), ALIGNOF(.tbss));
+
+      PROVIDE(_estack = __sysl_stack_top);
+    }
+    """
+
+// § 8.3's: the IMAGE_DEF first in flash, `.data` stored in flash and run in SRAM.
+private val gle_pico2_script: string = raw"""
+    /* The linker script sysl wrote for 'thumb-freestanding' from the manifests of this build. It is
+     * rewritten by every build; to lay the image out by hand, name a script of your own with
+     * 'targets.thumb-freestanding.linker_script'. */
+
+    MEMORY
+    {
+      flash     (rx)  : ORIGIN = 0x10000000, LENGTH = 0x00400000
+      sram      (rwx) : ORIGIN = 0x20000000, LENGTH = 0x00080000
+      scratch_x (rwx) : ORIGIN = 0x20080000, LENGTH = 0x00001000
+      scratch_y (rwx) : ORIGIN = 0x20081000, LENGTH = 0x00001000
+    }
+
+    SECTIONS
+    {
+      .image_def : ALIGN(4)
+      {
+        __sysl_image_def_start = .;
+        KEEP(*(.embedded_block))
+        . = ALIGN(4);
+        __sysl_image_def_end = .;
+      } > flash
+
+      .vectors : ALIGN(4)
+      {
+        KEEP(*(.vectors .vectors.* .isr_vector .isr_vector.*))
+      } > flash
+
+      .text : ALIGN(4)
+      {
+        __sysl_text_start = .;
+        *(.text .text.*)
+        . = ALIGN(4);
+        __sysl_text_end = .;
+        __sysl_copy_table = .;
+        LONG(LOADADDR(.data)) LONG(ADDR(.data)) LONG(ADDR(.data) + SIZEOF(.data))
+        __sysl_copy_table_end = .;
+        __sysl_zero_table = .;
+        LONG(ADDR(.bss)) LONG(ADDR(.bss) + SIZEOF(.bss))
+        __sysl_zero_table_end = .;
+      } > flash
+
+      .rodata : ALIGN(4)
+      {
+        __sysl_rodata_start = .;
+        *(.rodata .rodata.* .srodata .srodata.*)
+        . = ALIGN(4);
+        __sysl_rodata_end = .;
+      } > flash
+
+      .tdata : ALIGN(4)
+      {
+        *(.tdata .tdata.*)
+      } > flash
+
+      .tbss : ALIGN(4)
+      {
+        *(.tbss .tbss.*)
+      } > flash
+
+      .percpu : ALIGN(4)
+      {
+        __sysl_percpu_start = .;
+        KEEP(*(.percpu))
+        . = ALIGN(4);
+        __sysl_percpu_end = .;
+      } > flash
+
+      .data : ALIGN(4)
+      {
+        __sysl_data_start = .;
+        *(.data .data.* .sdata .sdata.*)
+        . = ALIGN(4);
+        __sysl_data_end = .;
+      } > sram AT> flash
+
+      __sysl_data_load = LOADADDR(.data);
+
+      .bss (NOLOAD) : ALIGN(4)
+      {
+        __sysl_bss_start = .;
+        *(.bss .bss.* .sbss .sbss.*)
+        *(COMMON)
+        . = ALIGN(4);
+        __sysl_bss_end = .;
+      } > sram
+
+      .noinit (NOLOAD) : ALIGN(4)
+      {
+        __sysl_noinit_start = .;
+        *(.noinit .noinit.*)
+        . = ALIGN(4);
+        __sysl_noinit_end = .;
+      } > sram
+
+      .stack (NOLOAD) : ALIGN(8)
+      {
+        __sysl_stack_start = .;
+        . = . + 4096;
+        __sysl_stack_top_0 = .;
+        __sysl_stack_end = .;
+      } > sram
+
+      __sysl_stack_top = __sysl_stack_top_0;
+
+      .ARM.extab : ALIGN(4)
+      {
+        __sysl_extab_start = .;
+        *(.ARM.extab .ARM.extab.*)
+        . = ALIGN(4);
+        __sysl_extab_end = .;
+      } > flash
+
+      .ARM.exidx : ALIGN(4)
+      {
+        __sysl_exidx_start = .;
+        *(.ARM.exidx .ARM.exidx.*)
+        . = ALIGN(4);
+        __sysl_exidx_end = .;
+      } > flash
+
+      __sysl_tls_data = ADDR(.tdata);
+      __sysl_tls_data_end = ADDR(.tdata) + SIZEOF(.tdata);
+      __sysl_tls_end = ADDR(.tbss) + SIZEOF(.tbss);
+      __sysl_tls_align = MAX(ALIGNOF(.tdata), ALIGNOF(.tbss));
+    }
+    """
+
+// § 8.4's: everything in one RAM, so nothing is copied; `.shared` zeroed; a stack for each of two cores.
+private val gle_skiff_script: string = raw"""
+    /* The linker script sysl wrote for 'thumb-freestanding-soft' from the manifests of this build. It is
+     * rewritten by every build; to lay the image out by hand, name a script of your own with
+     * 'targets.thumb-freestanding-soft.linker_script'. */
+
+    MEMORY
+    {
+      ram (rwx) : ORIGIN = 0x10000000, LENGTH = 0x00400000
+    }
+
+    SECTIONS
+    {
+      .vectors : ALIGN(4)
+      {
+        KEEP(*(.vectors .vectors.* .isr_vector .isr_vector.*))
+      } > ram
+
+      .text : ALIGN(4)
+      {
+        __sysl_text_start = .;
+        *(.text .text.*)
+        . = ALIGN(4);
+        __sysl_text_end = .;
+        __sysl_copy_table = .;
+        __sysl_copy_table_end = .;
+        __sysl_zero_table = .;
+        LONG(ADDR(.bss)) LONG(ADDR(.bss) + SIZEOF(.bss))
+        LONG(ADDR(.shared)) LONG(ADDR(.shared) + SIZEOF(.shared))
+        __sysl_zero_table_end = .;
+      } > ram
+
+      .rodata : ALIGN(4)
+      {
+        __sysl_rodata_start = .;
+        *(.rodata .rodata.* .srodata .srodata.*)
+        . = ALIGN(4);
+        __sysl_rodata_end = .;
+      } > ram
+
+      .tdata : ALIGN(4)
+      {
+        *(.tdata .tdata.*)
+      } > ram
+
+      .tbss : ALIGN(4)
+      {
+        *(.tbss .tbss.*)
+      } > ram
+
+      .percpu : ALIGN(4)
+      {
+        __sysl_percpu_start = .;
+        KEEP(*(.percpu))
+        . = ALIGN(4);
+        __sysl_percpu_end = .;
+      } > ram
+
+      .data : ALIGN(4)
+      {
+        __sysl_data_start = .;
+        *(.data .data.* .sdata .sdata.*)
+        . = ALIGN(4);
+        __sysl_data_end = .;
+      } > ram
+
+      .bss (NOLOAD) : ALIGN(4)
+      {
+        __sysl_bss_start = .;
+        *(.bss .bss.* .sbss .sbss.*)
+        *(COMMON)
+        . = ALIGN(4);
+        __sysl_bss_end = .;
+      } > ram
+
+      .noinit (NOLOAD) : ALIGN(4)
+      {
+        __sysl_noinit_start = .;
+        *(.noinit .noinit.*)
+        . = ALIGN(4);
+        __sysl_noinit_end = .;
+      } > ram
+
+      .shared (NOLOAD) : ALIGN(32)
+      {
+        __sysl_shared_start = .;
+        *(.shared)
+        . = ALIGN(4);
+        __sysl_shared_end = .;
+      } > ram
+
+      .stack (NOLOAD) : ALIGN(8)
+      {
+        __sysl_stack_start = .;
+        . = . + 2048;
+        __sysl_stack_top_0 = .;
+        . = . + 2048;
+        __sysl_stack_top_1 = .;
+        __sysl_stack_end = .;
+      } > ram
+
+      __sysl_stack_top = __sysl_stack_top_0;
+
+      .ARM.extab : ALIGN(4)
+      {
+        __sysl_extab_start = .;
+        *(.ARM.extab .ARM.extab.*)
+        . = ALIGN(4);
+        __sysl_extab_end = .;
+      } > ram
+
+      .ARM.exidx : ALIGN(4)
+      {
+        __sysl_exidx_start = .;
+        *(.ARM.exidx .ARM.exidx.*)
+        . = ALIGN(4);
+        __sysl_exidx_end = .;
+      } > ram
+
+      __sysl_tls_data = ADDR(.tdata);
+      __sysl_tls_data_end = ADDR(.tdata) + SIZEOF(.tdata);
+      __sysl_tls_end = ADDR(.tbss) + SIZEOF(.tbss);
+      __sysl_tls_align = MAX(ALIGNOF(.tdata), ALIGNOF(.tbss));
+
+      PROVIDE(_stack_top0 = __sysl_stack_top_0);
+      PROVIDE(_stack_top1 = __sysl_stack_top_1);
+      PROVIDE(__shared_start = __sysl_shared_start);
+      PROVIDE(__shared_end = __sysl_shared_end);
+    }
+    """

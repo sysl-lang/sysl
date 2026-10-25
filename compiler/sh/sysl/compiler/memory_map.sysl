@@ -1,0 +1,595 @@
+module sh.sysl.compiler
+
+import sh.sysl.hocon.Value
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+
+// **What the manifests say about a chip's memory and where a program goes in it**
+// (`reference/packages.md § Generated linker scripts`), read here and laid out by `link_script.sysl`.
+//
+//     memory {                                        // a chip or board package's (or the root's)
+//       flash { origin = 0x1000_0000, length = "option:flash_bytes", kind = rom }
+//       sram  { origin = 0x2000_0000, length = 512K, kind = ram, tags = [dma] }
+//     }
+//     sections {                                      // any package's, or an enabled feature's
+//       image_def { contents = [".embedded_block"], region = flash, first = true, keep = true }
+//     }
+//     symbols { _estack = stack_top }                 // names a vendor's start-up expects
+//
+//     targets {
+//       thumb-freestanding {
+//         layout {                                    // the root's, or an enabled feature's
+//           code  = flash
+//           data  = sram
+//           stack { region = sram, bytes = "option:kernel.stack_bytes", per_core = "option:kernel.cores" }
+//           heap  { region = sram, bytes = rest }
+//           place { tinyusb_dma = sram }
+//         }
+//       }
+//     }
+//
+// **The memory map is a fact about the chip, and the layout a fact about the program.** So `memory`,
+// `sections` and `symbols` may come from any package of the build, and `layout` -- which regions the
+// program's own code, data, stacks and heap go in -- is the root's alone, as every image key is.
+//
+// **A size or an address is a number or one whole option.** A number takes `0x`, `0b` and `0o` and
+// underscores, as sysl's literals do, and a `K` or `M` suffix (binary). `"option:<name>"` is an option
+// of the package that wrote it and `"option:<dependency>.<name>"` an option of one of its dependencies,
+// at the value the build settled on. Never an expression.
+
+// What a region holds: what the image stores, or what it runs in.
+enum RegionKind
+    RegionRom
+    RegionRam
+end RegionKind
+
+// A size or an address as a manifest wrote it: a number, or an option to be read at the settled value.
+struct Amount
+    // The text as written, for a refusal to quote.
+    written: string
+
+    // The option it names after `option:`, or `""` for a number.
+    option: string
+
+    // The number, where it is one.
+    value: u64
+end Amount
+
+// A number known when the manifest is read.
+amount_of(n: u64) -> Amount = Amount(s"$n", "", n)
+
+// One `memory` entry.
+struct MemRegion
+    name: string
+    origin: Amount
+    length: Amount
+    kind: RegionKind
+    tags: Buf[string]
+end MemRegion
+
+// One `sections` entry: what goes in, where, and what start-up does with it.
+struct SectionRule
+    name: string
+
+    // The input sections it gathers, as `@section` and C's `section` attribute name them; a `*` in one
+    // matches any run of characters.
+    contents: Buf[string]
+
+    // The region it goes in, or `""` where it asks for a tag instead.
+    region: string
+
+    // The tag of the region it asks for, or `""`.
+    wants: string
+
+    zero: bool
+    load: bool
+    noload: bool
+    keep: bool
+    first: bool
+
+    // The boundary it starts on, or 0 for the one its contents need.
+    align: u64
+
+    // The feature whose block declares it, or `""` for the package's own.
+    feature: string
+end SectionRule
+
+// A stack per core, in one region.
+struct StackLayout
+    region: string
+    bytes: Amount
+    per_core: Amount
+end StackLayout
+
+// The heap: a size, or what is left of its region (`rest`).
+struct HeapLayout
+    region: string
+    bytes: Amount
+    rest: bool
+end HeapLayout
+
+// One `layout` block of the root's, in a target block or a feature's.
+struct ImageLayout
+    target: string
+
+    // The feature whose `targets` block it is in, or `""` for the target block's own.
+    feature: string
+
+    // Each region name is `""` where the block leaves it to the first region of a fitting kind.
+    code: string
+    data: string
+    stack: Option[StackLayout]
+    heap: Option[HeapLayout]
+
+    // A section entry's region, replacing where its `region` or `wants` put it.
+    place: Buf[(string, string)]
+end ImageLayout
+
+// Everything one manifest says about memory.
+struct MemoryMap
+    regions: Buf[MemRegion]
+    sections: Buf[SectionRule]
+    symbols: Buf[(string, string)]
+    layouts: Buf[ImageLayout]
+end MemoryMap
+
+no_memory_map() -> MemoryMap = MemoryMap(buf(), buf(), buf(), buf())
+
+// Whether a manifest declares any of it.
+says_memory(m: &MemoryMap) -> bool =
+    !m.regions.is_empty() || !m.sections.is_empty() || !m.symbols.is_empty() || !m.layouts.is_empty()
+
+// The largest size or address a manifest can write.
+const MaxAmount: u64 = 0xffff_ffff_ffff_ffff
+
+// The default size of a stack whose block names none.
+private const DefaultStackBytes: u64 = 4096
+
+val RegionKeys: []const string = ["origin", "length", "kind", "tags"]
+val SectionRuleKeys: []const string = ["contents", "region", "wants", "zero", "load", "noload", "keep", "first",
+                                       "align"]
+val LayoutKeys: []const string = ["code", "data", "stack", "heap", "place"]
+val StackKeys: []const string = ["region", "bytes", "per_core"]
+val HeapKeys: []const string = ["region", "bytes"]
+
+private keys_said(keys: []const string) -> string
+    var out: Buf[string] = buf()
+
+    for i in 0..<keys.len
+        out.push(keys[i])
+
+    quoted_and(out)
+end keys_said
+
+// Names quoted and listed as a sentence lists them: `'a'`, `'a' and 'b'`, `'a', 'b' and 'c'`.
+quoted_and(names: Buf[string]) -> string
+    var out = ""
+
+    for i in 0..<names.len()
+        if i > 0 then out = out + (if i + 1 == names.len() then " and " else ", ")
+
+        out = out + s"'${names.at(i)}'"
+
+    out
+end quoted_and
+
+// Every key of a block, each one the block takes.
+private only_keys(block: Value, at: string, keys: []const string, what: string) -> Result[unit, string]
+    for key in block.keys()
+        if !holds_key(keys, key)
+            return Err(s"'$at.$key' is not something $what says — it takes ${keys_said(keys)}")
+
+    Ok(())
+end only_keys
+
+// The memory map of one manifest: its `memory`, `sections` and `symbols`, each feature's `sections`,
+// and the `layout` of each target block and of each feature's.
+read_memory_map(root: Value) -> Result[MemoryMap, string]
+    var map = no_memory_map()
+
+    root.get("memory") match
+        None -> ()
+        Some(block) -> map.regions = read_regions(block)?
+
+    root.get("sections") match
+        None -> ()
+        Some(block) -> read_section_rules(block, "sections", "", &map.sections)?
+
+    root.get("symbols") match
+        None -> ()
+        Some(block) -> map.symbols = read_symbol_aliases(block)?
+
+    root.get("targets") match
+        None -> ()
+        Some(block) ->
+            if block.is_obj()
+                for target in block.keys()
+                    val entry = block.get(target).unwrap()
+
+                    if !entry.is_obj() then continue
+
+                    entry.get("layout") match
+                        None -> ()
+                        Some(l) -> map.layouts.push(read_layout(l, s"targets.$target.layout", target, "")?)
+
+    root.get("features") match
+        None -> ()
+        Some(features) ->
+            if features.is_obj()
+                for feature in features.keys()
+                    val entry = features.get(feature).unwrap()
+
+                    if !entry.is_obj() then continue
+
+                    entry.get("sections") match
+                        None -> ()
+                        Some(block) ->
+                            read_section_rules(block, s"features.$feature.sections", feature, &map.sections)?
+
+                    val targets = entry.get("targets") match
+                        None -> continue
+                        Some(t) -> t
+
+                    if !targets.is_obj() then continue
+
+                    for target in targets.keys()
+                        val sub = targets.get(target).unwrap()
+
+                        if !sub.is_obj() then continue
+
+                        sub.get("layout") match
+                            None -> ()
+                            Some(l) ->
+                                val at = s"features.$feature.targets.$target.layout"
+
+                                map.layouts.push(read_layout(l, at, target, feature)?)
+
+    Ok(map)
+end read_memory_map
+
+// -- memory ----------------------------------------------------------------------------------------
+
+private read_regions(block: Value) -> Result[Buf[MemRegion], string]
+    var out: Buf[MemRegion] = buf()
+
+    if !block.is_obj()
+        return Err("'memory' is not a block — it names each region of the chip, as 'memory { sram { " +
+                   "origin = 0x2000_0000, length = 512K, kind = ram } }'")
+
+    for name in block.keys()
+        val at = s"memory.$name"
+        val entry = block.get(name).unwrap()
+
+        if !is_symbol(name)
+            return Err(s"'$at' is not a name a region can have — the generated script names it as written, " +
+                       "so it is a letter or '_' followed by letters, digits and '_'")
+
+        if !entry.is_obj()
+            return Err(s"'$at' is not a block — a region names its 'origin', its 'length' and its 'kind', " +
+                       "and may carry 'tags'")
+
+        only_keys(entry, at, RegionKeys, "a memory region")?
+
+        val origin = required_amount(entry, at, "origin", "the address the region starts at")?
+        val length = required_amount(entry, at, "length", "how many bytes the region holds")?
+
+        if length.option == "" && length.value == 0
+            return Err(s"'$at.length' is 0, and a region holds at least one byte")
+
+        val kind = entry.get("kind") match
+            None -> return Err(s"'$at' names no 'kind' — a region is 'kind = rom', what the image is stored " +
+                               "in, or 'kind = ram', what it runs in")
+            Some(v) -> text_of(v).unwrap_or("") match
+                "rom" -> RegionRom
+                "ram" -> RegionRam
+                _ -> return Err(s"'$at.kind' is 'rom' or 'ram', not '${text_of(v).unwrap_or(v.kind_name())}'")
+
+        val tags = entry.get("tags") match
+            None -> buf()
+            Some(v) -> v.as_text_list() match
+                None -> return Err(s"'$at.tags' is a list of words, as 'tags = [dma, fast]'")
+                Some(names) -> names
+
+        out.push(MemRegion(name, origin, length, kind, tags))
+
+    Ok(out)
+end read_regions
+
+private required_amount(entry: Value, at: string, key: string, says: string) -> Result[Amount, string]
+    entry.get(key) match
+        None -> Err(s"'$at' names no '$key' — $says, as a number or \"option:<name>\"")
+        Some(v) -> read_amount(v, s"$at.$key")
+end required_amount
+
+// A size or an address: a number with an optional `K` or `M`, or `"option:<name>"`.
+read_amount(v: Value, at: string) -> Result[Amount, string]
+    val text = v.as_scalar() match
+        Some(t) -> t
+        None -> return Err(amount_refusal(at, v.kind_name()))
+
+    if text.starts_with("option:")
+        val named = text[7..]
+
+        if named.is_empty() || named.contains(" ")
+            return Err(s"'$at' is \"$text\", and \"option:<name>\" names one whole option, as " +
+                       "\"option:flash_bytes\" or \"option:kernel.stack_bytes\"")
+
+        return Ok(Amount(text, named, 0))
+    end if
+
+    parse_amount(text) match
+        Some(n) -> Ok(Amount(text, "", n))
+        None -> Err(amount_refusal(at, s"'$text'"))
+end read_amount
+
+private amount_refusal(at: string, was: string) -> string =
+    s"'$at' is $was, and it is a number — '0x2000_0000', '4096', '128K' or '2M' — or \"option:<name>\""
+
+// A number as a manifest writes a size or an address: decimal, `0x`, `0b` or `0o`, with underscores
+// between digits, and `K` (1024) or `M` (1024 * 1024) after it. `None` for anything else, or a value
+// past 64 bits.
+parse_amount(text: string) -> Option[u64]
+    val b = text.bytes
+    var end_at = b.len
+    var scale: u64 = 1
+
+    if end_at > 0 && (b[end_at - 1] == u8('K') || b[end_at - 1] == u8('k'))
+        scale = 1024
+        end_at -= 1
+    else if end_at > 0 && b[end_at - 1] == u8('M')
+        scale = 1024 * 1024
+        end_at -= 1
+
+    var base: u64 = 10
+    var at: usize = 0
+
+    if end_at > 2 && b[0] == u8('0')
+        val p = b[1]
+
+        if p == u8('x') || p == u8('X')
+            base = 16
+        else if p == u8('b') || p == u8('B')
+            base = 2
+        else if p == u8('o') || p == u8('O')
+            base = 8
+
+        if base != 10 then at = 2
+    end if
+
+    var value: u64 = 0
+    var digits = 0
+    var last_underscore = false
+
+    for i in at..<end_at
+        val c = b[i]
+
+        if c == u8('_')
+            if digits == 0 || last_underscore then return None
+
+            last_underscore = true
+            continue
+
+        val d = digit_value(c)
+
+        if d >= base then return None
+
+        if value > (MaxAmount - d) / base then return None
+
+        value = value * base + d
+        digits += 1
+        last_underscore = false
+
+    if digits == 0 || last_underscore then return None
+    if value > MaxAmount / scale then return None
+
+    Some(value * scale)
+end parse_amount
+
+// A digit's value in any base up to 16, or 99 for a byte that is no digit.
+private digit_value(c: u8) -> u64
+    if c >= u8('0') && c <= u8('9') then return u64(c - u8('0'))
+    if c >= u8('a') && c <= u8('f') then return u64(c - u8('a')) + 10
+    if c >= u8('A') && c <= u8('F') then return u64(c - u8('A')) + 10
+
+    99
+end digit_value
+
+// -- sections --------------------------------------------------------------------------------------
+
+// The output sections every generated script has, which no `sections` entry may be called.
+val StandardSections: []const string = ["vectors", "text", "rodata", "tables", "tdata", "tbss", "percpu",
+                                        "data", "exidx", "extab", "bss", "noinit", "stack", "heap"]
+
+private read_section_rules(block: Value, where: string, feature: string,
+                           out: *Buf[SectionRule]) -> Result[unit, string]
+    if !block.is_obj()
+        return Err(s"'$where' is not a block — it names each section the package places, as '$where { " +
+                   "dma { contents = [\".sysl.dma\"], wants = dma, zero = true } }'")
+
+    for name in block.keys()
+        val at = s"$where.$name"
+        val entry = block.get(name).unwrap()
+
+        if !is_symbol(name)
+            return Err(s"'$at' is not a name a section can have — the generated script names it '.$name' " +
+                       s"and its bounds '__sysl_${name}_start' and '__sysl_${name}_end', so it is a letter or " +
+                       "'_' followed by letters, digits and '_'")
+
+        if holds_key(StandardSections, name)
+            return Err(s"'$at' is named for the generated script's own '.$name' section — every script has " +
+                       "it, so a section of the package's own is called something else")
+
+        if !entry.is_obj()
+            return Err(s"'$at' is not a block — a section names its 'contents' and its 'region' or what it " +
+                       "'wants'")
+
+        only_keys(entry, at, SectionRuleKeys, "a section")?
+
+        val contents = entry.get("contents") match
+            None -> return Err(s"'$at' names no 'contents' — the input sections it gathers, as " +
+                               "'contents = [\".sysl.dma\"]', which '@section(\".sysl.dma\")' puts a declaration in")
+            Some(v) -> v.as_text_list() match
+                None -> return Err(s"'$at.contents' is a list of section names, as 'contents = [\".sysl.dma\"]'")
+                Some(names) -> names
+
+        if contents.is_empty()
+            return Err(s"'$at.contents' is empty, and a section gathers at least one input section")
+
+        for c in contents
+            if c.is_empty() || c.contains(" ")
+                return Err(s"'$at.contents' holds '$c', which is not a section name")
+
+        val region = word_at(entry, at, "region")?
+        val wants = word_at(entry, at, "wants")?
+
+        if region == "" && wants == ""
+            return Err(s"'$at' says neither the 'region' it goes in nor the tag it 'wants' — a section names " +
+                       "one of them")
+
+        if region != "" && wants != ""
+            return Err(s"'$at' names both a 'region' and a tag it 'wants' — a section names one of them, and " +
+                       "the root's 'layout.place' moves it")
+
+        val zero = flag_at(entry, at, "zero")?
+        val load = flag_at(entry, at, "load")?
+        val noload = flag_at(entry, at, "noload")?
+
+        if (zero && load) || (zero && noload) || (load && noload)
+            return Err(s"'$at' says more than one of 'zero', 'load' and 'noload' — a section is zeroed at " +
+                       "start-up, or copied from the image, or left as it was, and only one of them")
+
+        val align = entry.get("align") match
+            None -> u64(0)
+            Some(v) ->
+                val a = read_amount(v, s"$at.align")?
+
+                if a.option != "" || a.value == 0 || (a.value & (a.value - 1)) != 0
+                    return Err(s"'$at.align' is '${a.written}', and an alignment is a power of two")
+
+                a.value
+
+        out.push(SectionRule(name, contents, region, wants, zero, load, noload, flag_at(entry, at, "keep")?,
+                             flag_at(entry, at, "first")?, align, feature))
+
+    Ok(())
+end read_section_rules
+
+private word_at(entry: Value, at: string, key: string) -> Result[string, string]
+    entry.get(key) match
+        None -> Ok("")
+        Some(v) ->
+            val text = if is_prose(v) then text_of(v).unwrap_or("") else ""
+
+            if text == "" || !is_symbol(text)
+                return Err(s"'$at.$key' names a ${if key == "wants" then "tag" else "region"} by its name, " +
+                           s"as '$key = ${if key == "wants" then "dma" else "sram"}'")
+
+            Ok(text)
+end word_at
+
+private flag_at(entry: Value, at: string, key: string) -> Result[bool, string]
+    entry.get(key) match
+        None -> Ok(false)
+        Some(v) -> v.as_bool() match
+            Some(on) -> Ok(on)
+            None -> Err(s"'$at.$key' is 'true' or 'false'")
+end flag_at
+
+// -- symbols ---------------------------------------------------------------------------------------
+
+private read_symbol_aliases(block: Value) -> Result[Buf[(string, string)], string]
+    var out: Buf[(string, string)] = buf()
+
+    if !block.is_obj()
+        return Err("'symbols' is not a block — it names each symbol a vendor's start-up expects and the " +
+                   "generated one it is, as 'symbols { _estack = stack_top }'")
+
+    for name in block.keys()
+        val v = block.get(name).unwrap()
+        val is = if is_prose(v) then text_of(v).unwrap_or("") else ""
+
+        if !is_symbol(name)
+            return Err(s"'symbols.$name' is not a symbol a linker script can define")
+
+        if is == "" || !is_symbol(is)
+            return Err(s"'symbols.$name' names the generated symbol it is, as '$name = stack_top' for " +
+                       "'__sysl_stack_top'")
+
+        out.push((name, is))
+
+    Ok(out)
+end read_symbol_aliases
+
+// -- layout ----------------------------------------------------------------------------------------
+
+private read_layout(block: Value, at: string, target: string, feature: string) -> Result[ImageLayout, string]
+    if !block.is_obj()
+        return Err(s"'$at' is not a block — it names the region of each part of the program, as '$at { code " +
+                   "= flash, data = sram }'")
+
+    only_keys(block, at, LayoutKeys, "a layout")?
+
+    val code = word_at(block, at, "code")?
+    val data = word_at(block, at, "data")?
+
+    val stack = block.get("stack") match
+        None -> None
+        Some(v) ->
+            if v.is_obj()
+                only_keys(v, s"$at.stack", StackKeys, "a stack")?
+
+                val bytes = v.get("bytes") match
+                    None -> amount_of(DefaultStackBytes)
+                    Some(b) -> read_amount(b, s"$at.stack.bytes")?
+
+                val cores = v.get("per_core") match
+                    None -> amount_of(1)
+                    Some(c) -> read_amount(c, s"$at.stack.per_core")?
+
+                if bytes.option == "" && bytes.value == 0
+                    return Err(s"'$at.stack.bytes' is 0, and a stack holds at least one byte")
+
+                if cores.option == "" && cores.value == 0
+                    return Err(s"'$at.stack.per_core' is 0, and an image runs on at least one core")
+
+                Some(StackLayout(word_at(v, s"$at.stack", "region")?, bytes, cores))
+            else
+                Some(StackLayout(word_at(block, at, "stack")?, amount_of(DefaultStackBytes), amount_of(1)))
+
+    val heap = block.get("heap") match
+        None -> None
+        Some(v) ->
+            if v.is_obj()
+                only_keys(v, s"$at.heap", HeapKeys, "a heap")?
+
+                val region = word_at(v, s"$at.heap", "region")?
+                val written = v.get("bytes") match
+                    None -> "rest"
+                    Some(b) -> b.as_scalar().unwrap_or("")
+
+                if written == "rest"
+                    Some(HeapLayout(region, amount_of(0), true))
+                else
+                    val b = read_amount(v.get("bytes").unwrap(), s"$at.heap.bytes")?
+
+                    if b.option == "" && b.value == 0
+                        return Err(s"'$at.heap.bytes' is 0 — leave the heap out, or give it 'rest'")
+
+                    Some(HeapLayout(region, b, false))
+            else
+                Some(HeapLayout(word_at(block, at, "heap")?, amount_of(0), true))
+
+    var place: Buf[(string, string)] = buf()
+
+    block.get("place") match
+        None -> ()
+        Some(v) ->
+            if !v.is_obj()
+                return Err(s"'$at.place' is a block naming a section and the region it goes in, as " +
+                           s"'$at.place { tinyusb_dma = ram_d2 }'")
+
+            for name in v.keys()
+                place.push((name, word_at(v, s"$at.place", name)?))
+
+    Ok(ImageLayout(target, feature, code, data, stack, heap, place))
+end read_layout

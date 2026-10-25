@@ -208,6 +208,10 @@ struct Manifest
     // The `exclude` list: directories below the package root that are no part of the tree, each
     // normalized to its `/`-separated path from the root (`read_exclude`). Package-level only.
     exclude: Buf[string]
+
+    // The chip's memory, the sections a package places, the symbols a start-up expects, and the
+    // root's `layout` blocks: what a generated linker script is made from (`memory_map.sysl`).
+    memory: MemoryMap
 end Manifest
 
 // What a package's `test` block says about running its suite (`read_test_settings`). Each is a
@@ -240,7 +244,7 @@ no_test_settings() -> TestSettings = TestSettings(None, None, buf(), None, buf()
 empty_manifest() -> Manifest =
     Manifest("", "", "", "", buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf(), None,
              buf(), None, None, None, buf(), None, false, "", None, buf(), buf(), buf(), None, buf(),
-             buf(), buf(), no_test_settings(), None, buf(), buf(), buf(), buf(), buf(), buf())
+             buf(), buf(), no_test_settings(), None, buf(), buf(), buf(), buf(), buf(), buf(), no_memory_map())
 
 // The manifest a directory carries, or the empty one where it carries none -- with the `c`, `defines`
 // and `requires` the layers in force write (`c_layers.sysl`): those of the machine being built and of
@@ -754,6 +758,7 @@ read_manifest(text: string) -> Result[Manifest, string]
     val has_package = root.get("package").is_some()
     val workspace = read_workspace(root)?
     val exclude = read_exclude(root)?
+    val memory = read_memory_map(root)?
 
     // **A workspace root with no `package` block compiles nothing of its own**, so a dependency
     // named there would reach no code -- and a reader would believe every member had it.
@@ -771,7 +776,7 @@ read_manifest(text: string) -> Result[Manifest, string]
                 optimization, link, lto, warnings, bounds_locations, has_package, repository, workspace,
                 images, codegen_read.0, target_codegen, codegen_read.2, target_extensions,
                 codegen_read.1, target_codegen_registers, tests, error_traces, options, feature_targets,
-                read.info, choices, layers, exclude)
+                read.info, choices, layers, exclude, memory)
 
     if read.long_form
         needs_floor_refusal(floor, "a feature block") match
@@ -2047,12 +2052,13 @@ val PackageKeys: []const string = ["name", "version", "sysl", "description", "li
 // (`image_link.sysl`), and the `capabilities` and `codegen` blocks layered over the project's. A
 // feature sets any of those again from its own `targets` block (`target_features.sysl`).
 val TargetKeys: []const string = ["triple", "linker", "linker_script", "entry", "capabilities", "codegen",
-                                  "c", "defines", "requires", "config"]
+                                  "c", "defines", "requires", "config", "layout"]
 
 val TopKeys: []const string = ["package", "dependencies", "dev_dependencies", "requires", "capabilities",
                                "targets", "allocator", "defines", "links", "features", "optimization",
                                "link", "lto", "bounds_locations", "error_traces", "workspace", "codegen",
-                               "c", "test", "options", "choices", "config", "exclude"]
+                               "c", "test", "options", "choices", "config", "exclude", "memory", "sections",
+                               "symbols"]
 
 private known_package_key(key: string) -> bool = holds_key(PackageKeys, key)
 
