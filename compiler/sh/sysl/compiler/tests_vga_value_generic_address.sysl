@@ -10,9 +10,11 @@ private vga_ran(text: string) -> string = xvr_ran([("main.sysl", text)])
 
 private vga_ir(text: string) -> string = xvr_ir([("main.sysl", text)])
 
-// A refusal carries this message, anchored at this `file:line:column`.
+// A refusal carries this message, anchored at this `file:line:column` -- whose arrow is indented as
+// far as the gutter is wide, one more space from line 10 on.
 private vga_refused(said: string, message: string, at: string) =
-    assert(said.contains(s"error: $message\n --> $at\n"), said)
+    assert(said.contains(s"error: $message\n --> $at\n") ||
+           said.contains(s"error: $message\n  --> $at\n"), said)
 
 @test("a named constant as a value argument")
 vga_a_named_constant()
@@ -219,3 +221,86 @@ vga_a_constant_for_a_type_parameter()
 
     vga_refused(said, "unknown type 'TWO'", "main.sysl:4:37")
 end vga_a_constant_for_a_type_parameter
+
+// -- a member's own value parameter, at a call ------------------------------------------------------
+
+// A method's brackets are read the same way: `s.pick[TWO](…)` read `TWO` as a type too.
+@test("a method's own value parameter takes a named constant and arithmetic over one")
+vga_method_takes_a_constant()
+    if xvr_no_library() then return
+
+    assert_eq(xvr_ran([("main.sysl", raw"""
+        const TWO: u32 = 2
+
+        struct Sq
+            n: u32
+
+        impl Sq
+            pick[const K: u32](self, x: u32) -> u32 = self.n + x + K
+
+        val s = Sq(100)
+        print(s.pick[TWO](1), s.pick[TWO + 1](1), s.pick[m.TEN](1), s.pick[2](1))
+        """), ("m/a.sysl", "module m\nconst TEN: u32 = 10\n")]), "103 104 111 103\n")
+end vga_method_takes_a_constant
+
+// A generic type's method: the type's argument is the receiver's, the member's own a value.
+@test("a generic type's method with a type and a value parameter of its own")
+vga_generic_type_method()
+    if xvr_no_library() then return
+
+    assert_eq(vga_ran(raw"""
+        const TWO: u32 = 2
+
+        struct Box[T]
+            v: T
+
+        impl[T] Box[T]
+            scaled[U: Integer, const K: u32](self, x: U) -> U = x * U(K)
+
+        val b = Box(1.5)
+        print(b.scaled[u64, TWO](7), b.scaled[i16, TWO * TWO](7))
+        """), "14 28\n")
+end vga_generic_type_method
+
+@test("a method's value parameter refuses a variable, with no second error from its body")
+vga_method_refuses_a_variable()
+    if xvr_no_library() then return
+
+    val said = vga_ir(raw"""
+        var two: u32 = 2
+
+        struct Sq
+            n: u32
+
+        impl Sq
+            pick[const K: u32](self, x: u32) -> u32 = self.n + x + K
+
+        val s = Sq(100)
+        print(s.pick[two](1))
+        """)
+
+    vga_refused(said, "a value argument must be a constant — a literal, or a 'const' naming one",
+                "main.sysl:10:14")
+    assert(!said.contains("undefined name 'K'"), said)
+end vga_method_refuses_a_variable
+
+@test("a method's value parameter refuses a constant of the wrong type")
+vga_method_refuses_the_wrong_type()
+    if xvr_no_library() then return
+
+    val said = vga_ir(raw"""
+        const NAME: string = "two"
+
+        struct Sq
+            n: u32
+
+        impl Sq
+            pick[const K: u32](self, x: u32) -> u32 = self.n + x + K
+
+        val s = Sq(100)
+        print(s.pick[NAME](1))
+        """)
+
+    vga_refused(said, "'K' of 'pick' is uint, but string was given", "main.sysl:10:14")
+    assert(!said.contains("undefined name 'K'"), said)
+end vga_method_refuses_the_wrong_type
