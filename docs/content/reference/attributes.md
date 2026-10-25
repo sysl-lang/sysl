@@ -2758,7 +2758,10 @@ Inside a strict body, **every floating-point operation at `f32` and `f64`** foll
   declares with `extern "llvm.…"`.
 
 Negation, `abs` and `copysign` touch the sign bit alone, round nothing and raise nothing, so they are
-what they always are. **A literal is a value, not an operation**: `0.1f32` is the binary32 nearest a
+what they always are. **A negation is the sign bit flipped where it is written**: `x + -y` is never
+made `x - y`, nor `(-a).mul_add(b, c)` a fused multiply-subtract, so where the answer is a NaN its sign
+is the one the expression as written gives it — Arm, which hands a NaN operand back with the sign it
+has, shows the difference. **A literal is a value, not an operation**: `0.1f32` is the binary32 nearest a
 tenth whatever the mode, and so is a `const`, which is worked out while compiling. An expression of
 literals is an operation like any other:
 
