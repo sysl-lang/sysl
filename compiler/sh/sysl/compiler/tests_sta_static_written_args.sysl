@@ -199,6 +199,162 @@ sta_through_a_type_parameter()
         """), "9\n")
 end sta_through_a_type_parameter
 
+@test("a static call through a type parameter uses the argument written, not the one inferred")
+sta_bound_written_wins()
+    if xvr_no_library() then return
+
+    val said = sta_ir(raw"""
+        trait Make
+            make[U](x: U) -> U
+
+        struct Sq
+            n: u32
+
+        impl Make for Sq
+            make[U](x: U) -> U = x
+
+        run[T: Make]() -> u8 = T.make[u8](300)
+
+        print(run[Sq]())
+        """)
+
+    assert(said.contains("300"), said)
+    assert(said.contains("error"), said)
+end sta_bound_written_wins
+
+@test("a static call through a type parameter refuses the wrong number of type arguments")
+sta_bound_wrong_count()
+    if xvr_no_library() then return
+
+    val said = sta_ir(raw"""
+        trait Make
+            make[U](x: U) -> U
+
+        struct Sq
+            n: u32
+
+        impl Make for Sq
+            make[U](x: U) -> U = x
+
+        run[T: Make](n: u32) -> u32 = T.make[u32, u32](n)
+
+        print("never instantiated")
+        """)
+
+    assert(said.contains("'make' takes 1 type argument ('U'), and 2 were written"), said)
+end sta_bound_wrong_count
+
+@test("a static call through a type parameter refuses written arguments on a function that has none")
+sta_bound_not_generic()
+    if xvr_no_library() then return
+
+    val said = sta_ir(raw"""
+        trait Make
+            plain(x: u32) -> u32
+
+        struct Sq
+            n: u32
+
+        impl Make for Sq
+            plain(x: u32) -> u32 = x
+
+        run[T: Make](n: u32) -> u32 = T.plain[u32](n)
+
+        print(run[Sq](9))
+        """)
+
+    assert(said.contains("'plain' is not generic, so it has no type arguments to write"), said)
+end sta_bound_not_generic
+
+@test("a static call through a type parameter refuses a type that misses the member's bound")
+sta_bound_unmet_bound()
+    if xvr_no_library() then return
+
+    val said = sta_ir(raw"""
+        trait Make
+            twice[U: Integer](x: U) -> U
+
+        struct Sq
+            n: u32
+
+        impl Make for Sq
+            twice[U: Integer](x: U) -> U = x + x
+
+        run[T: Make]() -> string = T.twice[string]("a")
+
+        print("never instantiated")
+        """)
+
+    assert(said.contains("error"), said)
+    assert(said.contains("Integer"), said)
+end sta_bound_unmet_bound
+
+@test("a static call through a type parameter takes a constant for a value parameter")
+sta_bound_value_parameter()
+    if xvr_no_library() then return
+
+    assert_eq(sta_ran(raw"""
+        const TWO: u32 = 2
+
+        trait Scale
+            scale[const K: u32](x: u32) -> u32
+
+        struct Sq
+            n: u32
+
+        impl Scale for Sq
+            scale[const K: u32](x: u32) -> u32 = x * K
+
+        run[T: Scale](n: u32) -> u32 = T.scale[TWO](n) + T.scale[TWO + 1](n)
+
+        print(run[Sq](3))
+        """), "15\n")
+end sta_bound_value_parameter
+
+@test("a static call through a type parameter refuses a variable for a value parameter")
+sta_bound_refuses_a_variable()
+    if xvr_no_library() then return
+
+    val said = sta_ir(raw"""
+        var two: u32 = 2
+
+        trait Scale
+            scale[const K: u32](x: u32) -> u32
+
+        struct Sq
+            n: u32
+
+        impl Scale for Sq
+            scale[const K: u32](x: u32) -> u32 = x * K
+
+        run[T: Scale](n: u32) -> u32 = T.scale[two](n)
+
+        print(run[Sq](3))
+        """)
+
+    assert(said.contains("a value argument must be a constant — a literal, or a 'const' naming one"), said)
+end sta_bound_refuses_a_variable
+
+@test("a module-qualified static function takes written type arguments")
+sta_module_qualified()
+    if xvr_no_library() then return
+
+    val out = xvr_ran([("m/m.sysl", "module m\n\nstruct Sq\n    n: u32\n\nimpl Sq\n    ident[T](x: T) -> T = x\n"),
+                       ("main.sysl", "import m\n\nprint(m.Sq.ident[u32](4), m.Sq.ident[string](\"a\"))\n")])
+
+    assert_eq(out, "4 a\n")
+end sta_module_qualified
+
+@test("a module-qualified static function refuses the wrong number of type arguments")
+sta_module_qualified_wrong_count()
+    if xvr_no_library() then return
+
+    val said = xvr_ir([("m/m.sysl", "module m\n\nstruct Sq\n    n: u32\n\nimpl Sq\n    ident[T](x: T) -> T = x\n"),
+                       ("main.sysl", "import m\n\nprint(m.Sq.ident[u32, u32](4))\n")])
+
+    assert(said.contains("'ident' takes 1 type argument ('T'), and 2 were written"), said)
+end sta_module_qualified_wrong_count
+
 @test("an array field of callables is still indexed and called")
 sta_field_of_callables_unchanged()
     if xvr_no_library() then return

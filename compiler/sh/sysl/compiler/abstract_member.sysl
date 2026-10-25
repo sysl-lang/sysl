@@ -276,7 +276,7 @@ private stands_for_itself(t: Type) -> bool = t match
 // Checked against the trait's signature and discarded, exactly as a bound method call is: the name it
 // carries is the trait's, and which implementation runs is settled once a concrete type is known.
 call_bound_associated(cx: &Analyzer, span: Span, subject: Type, name: string, bounds: Buf[Bound],
-                      args: Buf[Expr]) -> TExpr
+                      args: Buf[Expr], targs: Buf[Expr] = no_written_members()) -> TExpr
     val found = bound_member(cx.an, subject, bounds, name)
 
     if found.is_none() then return unlicensed_associated(cx, span, subject, name)
@@ -305,11 +305,44 @@ call_bound_associated(cx: &Analyzer, span: Span, subject: Type, name: string, bo
     end if
 
     val scope = trait_scope_of(cx.an, tr.name)
+    // **A list written at the call settles the member's own parameters outright**, as it does on
+    // a concrete type: counted, each read against the parameter it fills, and held to that
+    // parameter's bounds.
+    val mine = authored_tparams(m.tparams)
+
+    if !targs.is_empty() && mine.is_empty() then
+        return kept_error(cx, span, s"'$name' is not generic, so it has no type arguments to write " +
+                          s"— the call is '$name(…)'")
+
+    if !targs.is_empty() && mine.len() != targs.len() then
+        return kept_error(cx, span, s"'$name' takes ${quantity(mine.len(), "type argument")} " +
+                          s"(${quoted_names(mine)}), and ${targs.len()} " +
+                          s"${if targs.len() == 1 then "was" else "were"} written")
+
+    var listed: Buf[Binding] = buf()
+
+    for i in 0..<targs.len()
+        listed.push(Binding(mine.at(i), member_arg_for(cx, m, scope, mine.at(i), targs.at(i), false)))
+
+    for item in listed
+        if item.ty == Unknown then return bad_expr(span)
+
+    if !targs.is_empty() && mine.len() == m.tparams.len()
+        var own: Buf[Type] = buf()
+
+        for item in listed
+            own.push(item.ty)
+
+        if !check_param_bounds(cx.an, scope, span, s"${tr.name}.$name", m.tparams, m.bounds, own, subst,
+                               "type parameter", cx.scope) then return bad_expr(span)
+    end if
+
     // **A member's own type parameters stand in for themselves, carrying what it asked of them.**
     // A bare arrow in the signature became one of them, so without this a closure standing at
     // `f: int -> int` is read against a name nothing here answers for and comes back unknown.
-    val terms = joined_bindings(subst, abstract_subst(cx.an, scope, m.tparams, m.bounds, m.tvalues,
-                                                      m.tpacks, subst))
+    val terms = joined_bindings(joined_bindings(listed, subst),
+                                abstract_subst(cx.an, scope, m.tparams, m.bounds, m.tvalues,
+                                               m.tpacks, joined_bindings(listed, subst)))
     var params: Buf[(string, Type)] = buf()
 
     for param in m.params
