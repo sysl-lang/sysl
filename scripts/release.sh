@@ -85,10 +85,11 @@ done
     die "'$version' is not a version -- three numbers, and an optional '-<pre-release>'"
 
 repo=$(cd "${repo:-${0:A:h}/..}" && git rev-parse --show-toplevel) || die "'${repo:-${0:A:h}/..}' is not inside a git checkout"
-# **Two layouts, told apart by one file.** Where `compiler/package.hocon` exists the compiler is a
-# project of its own under `compiler/`, beside `library/`, `docs/` and `scripts/`; otherwise the
-# repository root is the compiler project. Everything that builds, emits or stamps uses `proj`.
-if [[ -f $repo/compiler/package.hocon ]]; then
+# **Two layouts, told apart by one file.** Where `compiler/sysl.hocon` (or the older
+# `compiler/package.hocon`) exists the compiler is a project of its own under `compiler/`, beside
+# `library/`, `docs/` and `scripts/`; otherwise the repository root is the compiler project.
+# Everything that builds, emits or stamps uses `proj`.
+if [[ -f $repo/compiler/sysl.hocon || -f $repo/compiler/package.hocon ]]; then
     proj=$repo/compiler
 else
     proj=$repo
@@ -203,7 +204,9 @@ fi
 # --- 2. the version ------------------------------------------------------------------------------
 
 main_file=$proj/sh/sysl/compiler/main.sysl
-manifest=$proj/package.hocon
+manifestname=sysl.hocon
+[[ -f $proj/$manifestname ]] || manifestname=package.hocon
+manifest=$proj/$manifestname
 rel=${proj#$repo}
 rel=${rel#/}
 rel=${rel:+$rel/}
@@ -232,7 +235,7 @@ stamp() {
     git -C $repo diff --stat
     local changed
     changed=$(git -C $repo diff --name-only | sort | tr '\n' ' ')
-    [[ $changed == "${rel}package.hocon ${rel}sh/sysl/compiler/main.sysl " ]] || { print "the stamp touched $changed"; return 1 }
+    [[ $changed == "${rel}${manifestname} ${rel}sh/sysl/compiler/main.sysl " ]] || { print "the stamp touched $changed"; return 1 }
 
     git -C $repo commit -q -am "sysl $version" || return 1
     git -C $repo log -1 --oneline

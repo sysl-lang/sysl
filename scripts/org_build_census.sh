@@ -205,14 +205,25 @@ copy_tree() {
     ( cd "$1" && git ls-files -z -co --exclude-standard | tar cf - --null -T - ) | ( cd "$2" && tar xf - )
 }
 
+# **A project's manifest is `sysl.hocon`, or the older `package.hocon`**: this prints the path of the
+# one a directory carries, and nothing for a directory with neither.
+manifest_of() {
+    if [ -f "$1/sysl.hocon" ]; then
+        echo "$1/sysl.hocon"
+    elif [ -f "$1/package.hocon" ]; then
+        echo "$1/package.hocon"
+    fi
+}
+
 # **A path dependency is a sibling checkout, so the copy gets its siblings.** The names are read off
 # the manifest's own `path = "../<name>"` lines, and each is copied into `$2` -- the directory the
 # repository's copy sits in, which is where `../<name>` resolves to.
 copy_path_deps() {
     cpd_dir=$1
-    [ -f "$cpd_dir/package.hocon" ] || return 0
+    cpd_manifest=$(manifest_of "$cpd_dir")
+    [ -n "$cpd_manifest" ] || return 0
 
-    for cpd_name in $(sed -n 's/.*path *= *"\.\.\/\([^"\/]*\)".*/\1/p' "$cpd_dir/package.hocon"); do
+    for cpd_name in $(sed -n 's/.*path *= *"\.\.\/\([^"\/]*\)".*/\1/p' "$cpd_manifest"); do
         [ -d "$2/$cpd_name" ] && continue
         [ -d "$org/$cpd_name" ] || continue
         copy_tree "$org/$cpd_name" "$2/$cpd_name"
@@ -227,10 +238,10 @@ copy_path_deps() {
 header_flags() {
     hf_out=""
     hf_prefix=/opt/homebrew
-    hf_manifests="$1/package.hocon"
+    hf_manifests=$(manifest_of "$1")
 
-    for hf_dep in $(sed -n 's/.*path *= *"\.\.\/\([^"\/]*\)".*/\1/p' "$1/package.hocon" 2> /dev/null); do
-        hf_manifests="$hf_manifests $org/$hf_dep/package.hocon"
+    for hf_dep in $(sed -n 's/.*path *= *"\.\.\/\([^"\/]*\)".*/\1/p' $hf_manifests 2> /dev/null); do
+        hf_manifests="$hf_manifests $(manifest_of "$org/$hf_dep")"
     done
 
     for hf_file in $hf_manifests; do
@@ -428,7 +439,7 @@ for dir in "$org"/*/; do
     command=""
     label=""
 
-    if [ -f "$dir/package.hocon" ]; then
+    if [ -n "$(manifest_of "$dir")" ]; then
         entry=""
 
         for file in "$dir"*.sysl "$dir"*.lsysl; do
@@ -450,10 +461,10 @@ for dir in "$org"/*/; do
             label="build-lib"
         fi
     else
-        for manifest in "$dir"*/package.hocon; do
-            [ -f "$manifest" ] || continue
+        for subdir in "$dir"*/; do
+            [ -n "$(manifest_of "$subdir")" ] || continue
 
-            sub=$(basename "$(dirname "$manifest")")
+            sub=$(basename "$subdir")
             command="build-c $sub"
             label="build-c $sub"
         done

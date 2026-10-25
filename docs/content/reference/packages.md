@@ -9,7 +9,7 @@ project root**. It says who this package is, what machines it is built for, what
 provide, and what it depends on. `sysl init` writes a first one.
 
 **The file used to be called `package.hocon`.** A directory holding only that name still builds,
-with one warning saying to rename it to `sysl.hocon` (`sysl config fix` will do it); a directory
+with one warning saying to rename it to `sysl.hocon` (`git mv package.hocon sysl.hocon` does it); a directory
 holding both names is refused, since two manifests are ambiguous. A later release will stop reading
 the old name.
 
