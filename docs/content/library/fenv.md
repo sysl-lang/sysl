@@ -46,6 +46,12 @@ even `1.0`, upward to the float above, and down and toward zero to `1.0`.
 | `flush_to_zero()`, `set_flush_to_zero(on)` | a subnormal read as a zero of its sign |
 | `default_nan()`, `set_default_nan(on)` | a NaN result as the default NaN rather than an operand's |
 
+`RoundingMode` is the direction the unit rounds every operation in, and is not core's
+`Rounding`, which says how [a decimal](/library/decimal/) is rounded to a number of places when it
+is asked to be — `HalfUp` and `Up` among them, which no unit offers. The two answer different
+questions, so they have different names, and a file importing `sysl.fenv.*` names both without
+ambiguity.
+
 ## The flags are sticky
 
 An operation that meets an exception sets its flag, and nothing but `clear_flags` clears it, so a read

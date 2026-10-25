@@ -386,6 +386,41 @@ dropping it from the other is what C's `fmin` was criticised for — and the alt
 per argument on every call, to spare a case a caller can see coming. A program that must reject a NaN
 tests for one.
 
+## `mul_add` — a multiply and an add rounded once
+
+`x.mul_add(a, b)` is `x * a + b` with the product never rounded on its own: the exact product is
+added to `b` and only the sum is rounded. That is IEEE 754's fusedMultiplyAdd, and it can answer what
+the two-step form cannot — the rounding error of a product, which `x.mul_add(x, -(x * x))` gives
+exactly:
+
+```sysl
+val x = 1.0 + 2.0.pow(-27.0)
+val p = x * x
+
+print(f"${x.mul_add(x, -1.0).bits()}%016x")
+print(x.mul_add(x, -p) == 2.0.pow(-54.0))
+```
+
+```output
+3e50000001000000
+true
+```
+
+`(1 + 2^-27)^2 - 1` is `2^-26 + 2^-54` exactly. The product rounded first is `1 + 2^-26`, which has
+lost the `2^-54` before the subtraction can see it, and the one rounding keeps it.
+
+It is the machine's fused instruction where the unit has one at that width, and C's `fma` or `fmaf`
+where it does not — slower, still rounded once — so the answer is the same on every machine. That is
+the difference from [contraction](/reference/expressions/#a-multiply-feeding-an-add-is-fused-where-the-machine-fuses),
+which fuses `x * a + b` only where the machine fuses cheaply. In a
+[`@strict_fp`](/reference/attributes/#strict-fp-floating-point-that-follows-the-environment-it-runs-in)
+body it rounds in the mode in force and raises its flags: `infinity * 0 + b` raises invalid and
+answers a NaN, as the product alone would.
+
+**It is `f32`'s and `real`'s, through a trait of its own (`MulAdd`), and not `Float`'s.** Computing a
+half-width multiply-add at `f32` and narrowing rounds twice, and where `sqrt` at `f16` is an
+approximation either way, here the single rounding is the whole of what was asked for.
+
 ## `min`, `max` and `clamp` are not `Float`'s
 
 ```sysl

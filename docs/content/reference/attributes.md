@@ -2746,7 +2746,8 @@ Inside a strict body, **every floating-point operation at `f32` and `f64`** foll
 - `+`, `-`, `*`, `/`, and a compound assignment of one, on a float or lane by lane on a vector of
   them;
 - a multiply feeding an add, which is [one fused operation](/reference/expressions/#a-multiply-feeding-an-add-is-fused-where-the-machine-fuses)
-  rounded once, as it is everywhere;
+  rounded once, as it is everywhere, and [`x.mul_add(a, b)`](/library/math/#mul-add-a-multiply-and-an-add-rounded-once),
+  which asks for that operation by name;
 - the comparisons. `<`, `<=`, `>` and `>=` raise invalid when an operand is a NaN, as IEEE 754 says
   the relational predicates do; `==` and `!=` are quiet;
 - the conversions: an integer read as a float and a float narrowed round in the mode in force, a
@@ -2886,6 +2887,21 @@ twice(x: f32) -> f32 = x + x
 
 ```error
 '@strict_fp' asks the floating-point unit to follow its environment, and 'thumbv6m-freestanding' computes f32 in software, which has no environment to follow and raises nothing
+```
+
+So is a conversion whose integer is wider than the machine's word. A unit converts the integers its
+registers hold, so a 32-bit Arm core reads an `i64` as a float with a library call, and every machine
+does the same with an `i128`; the library rounds to nearest and raises nothing. An integer of the
+word's width or narrower is the unit's own instruction:
+
+```sysl target=thumbv7em-freestanding
+@strict_fp
+@export("widened")
+widened(n: i64) -> f32 = f32(n)
+```
+
+```error
+'@strict_fp' asks the floating-point unit to follow its environment, and on 'thumbv7em-freestanding' a conversion between long and f32 is a library call, since the unit converts integers of at most 32 bits
 ```
 
 WebAssembly's floating point always rounds to nearest and raises nothing, so a strict body's float

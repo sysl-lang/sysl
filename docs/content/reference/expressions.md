@@ -212,7 +212,8 @@ the add are two operations, each rounded.
 **A product is kept apart by anything written between it and the sum**: a `val` it is bound to, a
 call it is passed through (other than an [arithmetic operator](#an-arithmetic-operator-is-read-as-its-body)),
 an explicit conversion. That is how a program asks for two roundings, and
-`llvm.fma` ([ffi](/reference/ffi/)) is how it asks for one on every machine:
+[`x.mul_add(a, b)`](/library/math/#mul-add-a-multiply-and-an-add-rounded-once) — or `llvm.fma`
+([ffi](/reference/ffi/)) declared by hand — is how it asks for one on every machine:
 
 ```sysl
 val x = 1.0 + 1.0 / 1073741824.0
