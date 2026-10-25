@@ -1085,11 +1085,17 @@ symbols { _estack = stack_top, _sidata = data_load }     // aliases for a vendor
 layout {
   code  = flash
   data  = sram                 // .data and .bss
-  stack = sram  { bytes = "option:kernel.stack_bytes", per_core = "option:kernel.cores" }   // Q27
-  heap  = sram  { bytes = rest }                // optional; `rest` = what is left of the region
+  stack { region = sram, bytes = "option:kernel.stack_bytes", per_core = "option:kernel.cores" }   // Q27
+  heap  { region = sram, bytes = rest }         // optional; `rest` = what is left of the region
   place { tinyusb_dma = ram_d2 }                // override a library's tag-based placement
 }
 ```
+
+*(Built in 0.7.0. The stack and the heap were first spelt `stack = sram { … }`, which is not HOCON —
+a word cannot be concatenated with an object — so the region is a key of the block, and `stack = sram`
+alone is the short form. A section in a `ram` region says exactly one of `zero`, `load` and `noload`,
+and one in a `rom` region none of them. `reference/packages.md § A script made from the manifests` is
+the specification.)*
 
 - **Sizes** take `K` and `M` (binary). Underscores are allowed in numbers, as in sysl. A `stack`
   with no `bytes` is 4K. A `layout` key left out takes the first region of a fitting `kind`.
@@ -1204,7 +1210,7 @@ targets {
     layout {
       code  = ram
       data  = ram
-      stack = ram { bytes = "option:kernel.stack_bytes", per_core = "option:kernel.cores" }
+      stack { region = ram, bytes = "option:kernel.stack_bytes", per_core = "option:kernel.cores" }
     }
   }
 }
@@ -1221,7 +1227,7 @@ not about what the script said.
 FreeRTOS's heap is a C array (`ucHeap[configTOTAL_HEAP_SIZE]` in `heap_4.c`), so `heap_bytes`
 reaches the linker as `.bss` and its size is the option's. The overflow report above names it by
 the option that sized it. Only `heap_5` takes its regions at run time (`vPortDefineHeapRegions`).
-For it, a `layout.heap = ram_d1 { bytes = rest }` gives `__sysl_heap_start`/`_end`, and the
+For it, a `layout.heap { region = ram_d1, bytes = rest }` gives `__sysl_heap_start`/`_end`, and the
 package's `heap_5` glue passes them on. The interrupt stack on a Cortex-M is the main stack, which
 `layout.stack` sizes.
 
