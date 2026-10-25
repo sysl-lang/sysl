@@ -129,6 +129,7 @@ package {
 dependencies {
   fat { git = "github.com/sysl-lang/fat", version = "0.1.0", optional = true }
 }
+
 features {
   sd { doc = "log to an SD card", default = true, enables = [fat] }
 }
@@ -270,6 +271,7 @@ sysl config c add tinyusb --root c/tinyusb/src --include .,../../config --source
 
 ```hocon
 package { name = "usb", version = "0.1.0" }
+
 c {
   tinyusb { root = "c/tinyusb/src", include = [".", "../../config"], sources = ["tusb.c", "device/usbd.c"] }
 }
