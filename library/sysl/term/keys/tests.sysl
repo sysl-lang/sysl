@@ -1,0 +1,168 @@
+module sysl.term.keys
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.text.join
+
+// What the decoder promises, asserted against byte scripts rather than a keyboard: every spelling a
+// terminal sends for each key, and the cases a byte-comparing program gets wrong -- a sequence's tail
+// leaking out as characters, Escape that never arrives, a CRLF read as two Enters.
+
+// The keys a script decodes to, each written as `print` writes it, and `|` where the input paused.
+private keys_of(script: string) -> string = keys_of_bytes(script.bytes)
+
+private keys_of_bytes(script: []const u8) -> string
+    var keys = key_decoder()
+    var got: Buf[string] = buf()
+
+    for b in script
+        if b == u8('|')
+            keys.pause()
+        else
+            keys.push(b)
+
+        loop
+            keys.next() match
+                None -> break
+                Some(k) -> got.push(s"$k")
+
+    join(got.view(), " ")
+end keys_of_bytes
+
+// -- ordinary keys -----------------------------------------------------------------------------------
+
+@test("a printable byte is its character")
+printable()
+    assert_eq(keys_of("a Z~"), "Key.Char(c: 'a') Key.Char(c: ' ') Key.Char(c: 'Z') Key.Char(c: '~')")
+
+@test("a multi-byte character is one key, however many bytes it is")
+multi_byte()
+    assert_eq(keys_of("é€😀"), "Key.Char(c: 'é') Key.Char(c: '€') Key.Char(c: '😀')")
+
+@test("a continuation byte where a character should start is the replacement character")
+stray_continuation()
+    val stray: [2]u8 =[0x80, u8('a')]
+
+    assert_eq(keys_of_bytes(stray[..]), "Key.Char(c: '\u{fffd}') Key.Char(c: 'a')")
+
+// The character is cut short by an ASCII byte: the replacement, and then that byte as itself rather
+// than swallowed as a continuation. 0xC3 is the first byte of `é`.
+@test("a character cut short is the replacement, and the byte that cut it is its own key")
+cut_short()
+    val cut: [2]u8 = [0xc3, u8('x')]
+
+    assert_eq(keys_of_bytes(cut[..]), "Key.Char(c: '\u{fffd}') Key.Char(c: 'x')")
+
+@test("and a character the input paused inside is the replacement")
+paused_inside_a_character()
+    val cut: [2]u8 = [0xe2, u8('|')]
+
+    assert_eq(keys_of_bytes(cut[..]), "Key.Char(c: '\u{fffd}')")
+
+@test("a character cut short by an Escape is the replacement, and the Escape still begins a key")
+cut_by_escape()
+    val cut: [4]u8 =[0xf0, 0x9f, 27, u8('|')]
+
+    assert_eq(keys_of_bytes(cut[..]), "Key.Char(c: '\u{fffd}') Key.Escape")
+
+@test("Enter is CR or LF, and CRLF is one Enter")
+enter()
+    assert_eq(keys_of("\r"), "Key.Enter")
+    assert_eq(keys_of("\n"), "Key.Enter")
+    assert_eq(keys_of("\r\n"), "Key.Enter")
+    assert_eq(keys_of("\r\r"), "Key.Enter Key.Enter")
+    assert_eq(keys_of("\n\n"), "Key.Enter Key.Enter")
+    assert_eq(keys_of("\ra\n"), "Key.Enter Key.Char(c: 'a') Key.Enter")
+
+@test("Tab, and Backspace in both of its spellings")
+tab_and_backspace()
+    assert_eq(keys_of("\t\u{8}\u{7f}"), "Key.Tab Key.Backspace Key.Backspace")
+
+@test("a control key is the letter it is typed with")
+control_keys()
+    assert_eq(keys_of("\u{1}\u{3}\u{1a}"), "Key.Ctrl(c: 'a') Key.Ctrl(c: 'c') Key.Ctrl(c: 'z')")
+
+@test("and the control bytes with no letter are no key")
+letterless_controls()
+    assert_eq(keys_of("\u{0}\u{1c}\u{1f}a"), "Key.Char(c: 'a')")
+
+// -- sequences ---------------------------------------------------------------------------------------
+
+@test("the arrows, as CSI and as SS3")
+arrows()
+    assert_eq(keys_of("\u{1b}[A\u{1b}[B\u{1b}[C\u{1b}[D"), "Key.Up Key.Down Key.Right Key.Left")
+    assert_eq(keys_of("\u{1b}OA\u{1b}OB\u{1b}OC\u{1b}OD"), "Key.Up Key.Down Key.Right Key.Left")
+
+@test("Home and End in every spelling a terminal uses")
+home_and_end()
+    assert_eq(keys_of("\u{1b}[H\u{1b}[F\u{1b}OH\u{1b}OF"), "Key.Home Key.End Key.Home Key.End")
+    assert_eq(keys_of("\u{1b}[1~\u{1b}[4~\u{1b}[7~\u{1b}[8~"), "Key.Home Key.End Key.Home Key.End")
+
+@test("the numbered keys: Insert, Delete, Page Up and Page Down")
+numbered_keys()
+    assert_eq(keys_of("\u{1b}[2~\u{1b}[3~\u{1b}[5~\u{1b}[6~"), "Key.Insert Key.Delete Key.PageUp Key.PageDown")
+
+@test("the function keys, as SS3 for the first four and numbered for all twelve")
+function_keys()
+    assert_eq(keys_of("\u{1b}OP\u{1b}OQ\u{1b}OR\u{1b}OS"), "Key.F(n: 1) Key.F(n: 2) Key.F(n: 3) Key.F(n: 4)")
+    assert_eq(keys_of("\u{1b}[11~\u{1b}[15~\u{1b}[17~\u{1b}[21~\u{1b}[23~\u{1b}[24~"),
+              "Key.F(n: 1) Key.F(n: 5) Key.F(n: 6) Key.F(n: 10) Key.F(n: 11) Key.F(n: 12)")
+
+@test("Shift-Tab is BackTab")
+back_tab()
+    assert_eq(keys_of("\u{1b}[Z"), "Key.BackTab")
+
+// xterm puts the modifiers in a second parameter: the key is still the final byte, and the
+// parameter is read whole rather than left behind as typed characters.
+@test("a modified key is read to its final byte and is the key without its modifier")
+modified_keys()
+    assert_eq(keys_of("\u{1b}[1;5D\u{1b}[3;2~x"), "Key.Left Key.Delete Key.Char(c: 'x')")
+
+@test("a sequence no key here names leaves nothing of itself behind")
+unknown_sequence()
+    assert_eq(keys_of("\u{1b}[?25h\u{1b}[99~\u{1b}OXa"), "Key.Char(c: 'a')")
+
+// -- Escape ------------------------------------------------------------------------------------------
+
+@test("a lone Escape is Escape once the input pauses, and not before")
+lone_escape()
+    assert_eq(keys_of("\u{1b}"), "")
+    assert_eq(keys_of("\u{1b}|"), "Key.Escape")
+
+@test("Escape twice is two Escapes, and the second may still begin a sequence")
+double_escape()
+    assert_eq(keys_of("\u{1b}\u{1b}|"), "Key.Escape Key.Escape")
+    assert_eq(keys_of("\u{1b}\u{1b}[A"), "Key.Escape Key.Up")
+
+@test("an Escape and then a character is that character with Alt")
+alt_keys()
+    assert_eq(keys_of("\u{1b}x\u{1b}."), "Key.Alt(c: 'x') Key.Alt(c: '.')")
+
+// The one byte that finishes two keys: the Escape before it, and its own.
+@test("an Escape and then a control byte is Escape and then that key")
+escape_then_control()
+    assert_eq(keys_of("\u{1b}\r"), "Key.Escape Key.Enter")
+    assert_eq(keys_of("\u{1b}\u{7f}"), "Key.Escape Key.Backspace")
+
+@test("a pause in the middle of a sequence drops what was read of it")
+paused_sequence()
+    assert_eq(keys_of("\u{1b}[1|A"), "Key.Char(c: 'A')")
+
+@test("a pause between keys is nothing")
+pause_between_keys()
+    assert_eq(keys_of("a||b"), "Key.Char(c: 'a') Key.Char(c: 'b')")
+
+@test("partial() says whether a key is half read")
+partial_key()
+    var keys = key_decoder()
+
+    assert_eq(keys.partial(), false)
+    keys.push(27)
+    assert_eq(keys.partial(), true)
+    keys.push(u8('['))
+    assert_eq(keys.partial(), true)
+    keys.push(u8('A'))
+    assert_eq(keys.partial(), false)
+    assert_eq(keys.next(), Some(Up))
+    assert_eq(keys.next(), None)
+end partial_key

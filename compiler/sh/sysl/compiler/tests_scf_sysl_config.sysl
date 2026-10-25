@@ -137,7 +137,7 @@ scf_matrix_nested()
     scf_cell("nested", n, "option add slots --type u8 --default 4", scf_lines([
         "package {", "  name = \"app\"", "}", "", "dependencies {",
         "  usb { path = \"../usb\", optional = true }", "  log { path = \"../log\" }", "}", "",
-        "features {", "  cdc  = [usb]", "  fast = []", "}", "options {",
+        "features {", "  cdc  = [usb]", "  fast = []", "}", "", "options {",
         "  slots { type = u8, default = 4 }", "}"]))
     scf_cell("nested", n, "option add rx --type u16 --default 64 --feature cdc", scf_lines([
         "package {", "  name = \"app\"", "}", "", "dependencies {",
@@ -147,11 +147,11 @@ scf_matrix_nested()
     scf_cell("nested", n, "target add pico", scf_lines([
         "package {", "  name = \"app\"", "}", "", "dependencies {",
         "  usb { path = \"../usb\", optional = true }", "  log { path = \"../log\" }", "}", "",
-        "features {", "  cdc  = [usb]", "  fast = []", "}", "targets {", "  pico {}", "}"]))
+        "features {", "  cdc  = [usb]", "  fast = []", "}", "", "targets {", "  pico {}", "}"]))
     scf_cell("nested", n, "c add z --sources z.c", scf_lines([
         "package {", "  name = \"app\"", "}", "", "dependencies {",
         "  usb { path = \"../usb\", optional = true }", "  log { path = \"../log\" }", "}", "",
-        "features {", "  cdc  = [usb]", "  fast = []", "}", "c {", "  z { sources = [\"z.c\"] }", "}"]))
+        "features {", "  cdc  = [usb]", "  fast = []", "}", "", "c {", "  z { sources = [\"z.c\"] }", "}"]))
     scf_cell("nested", n, "set package.version '\"0.2.0\"'", scf_lines([
         "package {", "  name = \"app\"", "  version = \"0.2.0\"", "}", "", "dependencies {",
         "  usb { path = \"../usb\", optional = true }", "  log { path = \"../log\" }", "}", "",
@@ -209,10 +209,8 @@ end scf_matrix_dotted
 
 // -- the matrix: one-line blocks ---------------------------------------------------------------------------
 
-// **The one cell not asserted is `dep usb --set` here.** The new entry pushes the one-line
-// `dependencies` block past 100 columns, and hocon v0.3.0 reflows only the inner `usb` block, leaving
-// it opened mid-line with its entries indented from column 0 -- valid HOCON, but not the layout the
-// package's own design describes. It is reported to the hocon package rather than pinned here.
+// `dep usb --set` here pushes the one-line `dependencies` block past 100 columns, so the entry is
+// written out as a block at its own indent, the other entry of `dependencies` with it.
 @test("scf: every command on a manifest of one-line blocks, which a short entry joins in place")
 scf_matrix_inline()
     val i = scf_inline()
@@ -228,6 +226,9 @@ scf_matrix_inline()
     scf_cell("inline", i, "dep usb --features +hid", scf_lines([
         pkg, "dependencies { usb { path = \"../usb\", optional = true, features = [hid] }, log { path = \"../log\" } }",
         feats]))
+    scf_cell("inline", i, "dep usb --set ep0=64", scf_lines([
+        pkg, "dependencies {", "  usb {", "    path = \"../usb\"", "    optional = true", "    options {",
+        "      ep0 = 64", "    }", "  }", "  log { path = \"../log\" }", "}", feats]))
     scf_cell("inline", i, "feature add msc --enables usb", scf_lines([
         pkg, deps, "features { cdc = [usb], fast = [], msc = [usb] }"]))
     scf_cell("inline", i, "feature remove fast", scf_lines([pkg, deps, "features { cdc = [usb] }"]))
@@ -362,18 +363,18 @@ scf_feature_add_block_raises_floor()
     val before = scf_lines(["package {", "  name = \"logger\"", "  sysl = \"0.4.0\"", "}"])
 
     assert_eq(scf_ok(before, "feature add sd --doc 'log to a card' --default --if thumb"),
-              scf_lines(["package {", "  name = \"logger\"", "  sysl = \"0.5.0\"", "}",
+              scf_lines(["package {", "  name = \"logger\"", "  sysl = \"0.5.0\"", "}", "",
                          "features {", "  sd { doc = \"log to a card\", default = true, if = \"thumb\" }", "}"]))
 
     // The list form is read by every release, so it leaves the floor alone.
     assert_eq(scf_ok(before, "feature add sd"),
-              scf_lines(["package {", "  name = \"logger\"", "  sysl = \"0.4.0\"", "}", "features {", "  sd = []", "}"]))
+              scf_lines(["package {", "  name = \"logger\"", "  sysl = \"0.4.0\"", "}", "", "features {", "  sd = []", "}"]))
 
     // A floor already at 0.5.0 or with none is not touched.
     val none = scf_lines(["package {", "  name = \"logger\"", "}"])
 
     assert_eq(scf_ok(none, "feature add sd --default"),
-              scf_lines(["package {", "  name = \"logger\"", "}", "features {", "  sd { default = true }", "}"]))
+              scf_lines(["package {", "  name = \"logger\"", "}", "", "features {", "  sd { default = true }", "}"]))
 end scf_feature_add_block_raises_floor
 
 @test("scf: feature add refuses default, a name already there, and an option it does not take")
@@ -449,7 +450,7 @@ scf_target_add()
 
     assert_eq(scf_ok(before, "target add pico --triple thumbv8m.main-none-eabihf --linker lld " +
                              "--linker-script memmap.ld --entry reset"),
-              scf_lines(["package { name = \"usb\" }", "targets {",
+              scf_lines(["package { name = \"usb\" }", "", "targets {",
                          "  pico { triple = \"thumbv8m.main-none-eabihf\", linker = lld, linker_script = \"memmap.ld\", " +
                          "entry = \"reset\" }", "}"]))
     assert_eq(scf_refused(before, "target add default"),
@@ -465,7 +466,7 @@ scf_c_add_layers()
     val flags = "--root c/z --include . --sources z.c"
 
     assert_eq(scf_ok(before, s"c add z $flags --target pico"),
-              scf_lines(["features {", "  usb = []", "}", "targets {", "  pico {", "    c {",
+              scf_lines(["features {", "  usb = []", "}", "", "targets {", "  pico {", "    c {",
                          "      z { root = \"c/z\", include = [\".\"], sources = [\"z.c\"] }", "    }", "  }", "}"]))
     assert_eq(scf_ok(before, s"c add z $flags --feature usb"),
               scf_lines(["features {", "  usb = { c { z { root = \"c/z\", include = [\".\"], sources = [\"z.c\"] } } }", "}"]))
@@ -658,7 +659,7 @@ scf_cli_add_still_works()
     assert_eq(code, Fine, err)
     assert_eq(out, "added png github.com/sysl-lang/png 0.1.0")
     assert_eq(read_text(s"$root/sysl.hocon").unwrap(),
-              scf_lines(["package { name = \"a\" }", "dependencies {",
+              scf_lines(["package { name = \"a\" }", "", "dependencies {",
                          "  png { git = \"github.com/sysl-lang/png\", version = \"0.1.0\" }", "}"]))
 
     val (dup, _, dup_err) = clx_ran(["sysl", "config", "-C", root, "dep", "add", "github.com/sysl-lang/png@0.2.0"])

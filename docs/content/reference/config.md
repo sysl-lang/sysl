@@ -28,7 +28,8 @@ sysl config show [--target <t>] [--features <list>] [--no-default-features] [--a
 ```
 
 Every command works on the manifest of the current directory; `-C <dir>` names another project.
-`sysl config` with no command prints the list above.
+`sysl config` with no command opens [the menu](#the-menu-sysl-config-on-a-terminal) on a terminal,
+and prints the list above anywhere else.
 
 ## Every edit is read back before it is written
 
@@ -129,6 +130,7 @@ package {
 dependencies {
   fat { git = "github.com/sysl-lang/fat", version = "0.1.0", optional = true }
 }
+
 features {
   sd { doc = "log to an SD card", default = true, enables = [fat] }
 }
@@ -270,6 +272,7 @@ sysl config c add tinyusb --root c/tinyusb/src --include .,../../config --source
 
 ```hocon
 package { name = "usb", version = "0.1.0" }
+
 c {
   tinyusb { root = "c/tinyusb/src", include = [".", "../../config"], sources = ["tusb.c", "device/usbd.c"] }
 }
@@ -388,3 +391,59 @@ usb (/home/me/usb)
 
 It writes nothing. A fetched package is headed by its name, its version and its coordinate; one
 reached by a path, by its directory.
+
+## The menu: `sysl config` on a terminal
+
+With no command, and with both its input and its output a terminal, `sysl config` opens a
+full-screen tree over **this project's view** of its dependencies: what the graph turns on for each,
+and every choice, feature and option it declares.
+
+```text
+ app 0.1.0 — aarch64-macos                                      [ / ] search  [ ? ] doc  [ q ] quit
+ └─ usb 0.1.0
+    ├─ port   (•) rp2350  ( ) rp2040  ( ) stm32h7 — stm32h7 not this machine's
+    ├─ ports  3 (1..4) — set by this project, default 1
+    ├─ trace  false
+    ├─ [x] cdc
+    │   └─ rx_buffer  256 (64..4096)
+    └─ [ ] msc
+        └─ block  512 (512 | 4096) — off with 'msc'
+```
+
+- **A choice is a row of radio buttons.** Left and Right move along it, and Enter or Space picks the
+  member the cursor is on.
+- **A feature is a check box**, and its options are indented under it, greyed while it is off.
+- **An option shows its value and its range or its values**, and who set it where this project did.
+  Enter edits the value on the bottom line; Enter again sets it, and Escape leaves it as it was. A
+  `bool` is flipped by Enter alone.
+- **A member or a feature whose `if` fails on the machine is shown and greyed**, so the menu reads
+  the same everywhere, and choosing it is refused with the reason. `--target <t>` names the machine
+  the `if`s are read against; the default is the manifest's `targets.default`, then the host.
+- `/` searches the rows' names and `n` finds the next match; `?` shows the row's `doc`; `q`, Escape
+  or Ctrl-C closes the menu.
+
+**Every change the menu makes is one of the commands above**, carried out by the same code, so the
+two cannot drift — and when it closes it prints each command line it ran, which is what to put in a
+script to make the same change again:
+
+```text
+sysl config dep usb --set ports=3
+sysl config dep usb --features +msc
+```
+
+It writes **this project's entry** for a dependency — its `features`, its `default_features` and its
+`options` — and never the dependency's own manifest. Turning off a feature the entry asks for takes
+it out of the list; turning off one that is on by default turns the entry's `default_features` off
+and asks by name for the defaults that stay on. A feature that is on for a reason the entry cannot
+take back is refused with that reason: another feature enables it, or another package depending on
+the same one asks for it.
+
+**A change is written only once the graph still resolves**, and a value is held to the option's
+declaration first — its type, its range, its values — with the refusal a build would give:
+
+```text
+this project sets the option 'ports' of 'usb' to 9, outside the option's range [1, 4]
+```
+
+Each change is written as it is made, so closing the menu needs no saving and a change is never
+lost to one that came after it.

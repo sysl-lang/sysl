@@ -1,0 +1,749 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.env.{get as env_var}
+import sysl.fs.{make_dir_all, make_temp_dir, read_text, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.{join, replace_all, Search}
+
+// `sysl config`'s menu, without a terminal: the model takes keys and answers command lines, so each
+// cell drives it with keys and asserts what it drew, what it refused, and **the command lines it ran
+// and the bytes they left -- the same bytes the subcommand leaves when it is run itself.** The view
+// comes from a real resolution of a project on disk, so what is on is what a build turns on.
+//
+// The axes: the row (a choice, a feature, a feature's option, a package's option) x what the key
+// does to it (move, toggle on, toggle off, pick, set within and outside what the option allows) x why
+// a thing is on (the entry asks, it is a default, another feature enables it, it is a choice's
+// default) x the machine (the host, where a member's `if` fails, and a target where it holds). The
+// last section runs the binary on a pseudo-terminal.
+
+private mnu_lines(lines: []string) -> string = join(lines, "\n") + "\n"
+
+private mnu_usb() -> string = mnu_lines([
+    "package { name = \"usb\", version = \"0.1.0\", sysl = \"0.5.0\" }",
+    "choices {",
+    "  port { doc = \"which controller\", of = [rp2350, rp2040, stm32h7], default = rp2350 }",
+    "}",
+    "features {",
+    "  rp2350 { doc = \"the RP2350's controller\" }",
+    "  rp2040 = []",
+    "  stm32h7 { doc = \"an H7's controller\", if = \"thumb && freestanding\" }",
+    "  cdc {",
+    "    doc = \"a serial port\"",
+    "    default = true",
+    "    options {",
+    "      rx_buffer { type = u16, default = 256, range = [64, 4096], doc = \"bytes held for reading\" }",
+    "    }",
+    "  }",
+    "  msc { doc = \"a disk\", options { block { type = u32, default = 512, values = [512, 4096] } } }",
+    "  hid { enables = [report] }",
+    "  report = []",
+    "  wifi { if = \"freestanding\" }",
+    "}",
+    "options {",
+    "  ports { type = u8, default = 1, range = [1, 4] }",
+    "  trace { type = bool, default = false }",
+    "  greeting { type = string, default = \"hi\" }",
+    "}"])
+
+private mnu_app_text() -> string = mnu_lines([
+    "package { name = \"app\", version = \"0.1.0\" }",
+    "dependencies {",
+    "  // the USB stack",
+    "  usb { path = \"../usb\" }",
+    "}"])
+
+// A project `app` taking `usb` by path; answers the directory of `app`.
+private mnu_project(app_text: string) -> string
+    val root = absolute_path(make_temp_dir("sysl-mnu-").unwrap())
+
+    make_dir_all(s"$root/usb/usb").unwrap()
+    make_dir_all(s"$root/app").unwrap()
+    write_text(s"$root/usb/sysl.hocon", mnu_usb()).unwrap()
+    write_text(s"$root/usb/usb/usb.sysl", "module usb\n").unwrap()
+    write_text(s"$root/app/sysl.hocon", app_text).unwrap()
+    s"$root/app"
+end mnu_project
+
+private mnu_target(app: string, named: Option[string]) -> Target = target_for(app, named) match
+    Ok(t) -> t
+    Err(r) -> panic(r.message)
+
+private mnu_view(app: string, text: string, named: Option[string]) -> MenuView =
+    menu_view_of(app, text, mnu_target(app, named)) match
+        Ok(v) -> v
+        Err(why) -> panic(why)
+
+private mnu_open(app: string, named: Option[string]) -> Menu
+    val text = read_text(s"$app/sysl.hocon").unwrap()
+
+    menu_of(mnu_view(app, text, named), text)
+end mnu_open
+
+// The screen as plain text, 100 columns by 16 rows, with the blank rows dropped.
+private mnu_screen(m: *Menu) -> string
+    var kept: Buf[string] = buf()
+
+    for line in menu_lines(m, 100, 16, false)
+        if !line.is_empty() then kept.push(line)
+
+    join(kept.view(), "\n")
+end mnu_screen
+
+// The keys pressed in turn, and every command line they ran.
+private mnu_press(m: *Menu, keys: []const MenuKey) -> Buf[Buf[string]]
+    var out: Buf[Buf[string]] = buf()
+
+    for k in keys
+        val step = menu_key(m, k, 5)
+
+        for e in step.edits
+            out.push(e)
+
+    out
+end mnu_press
+
+// Typed characters, as keys.
+private mnu_typed(text: string) -> Buf[MenuKey]
+    var out: Buf[MenuKey] = buf()
+
+    for c in text.chars
+        out.push(if c == '\r' then MkEnter else MkChar(c))
+
+    out
+end mnu_typed
+
+// The cursor onto the first row whose words hold `what`, by the menu's own search.
+private mnu_find(m: *Menu, what: string)
+    mnu_press(m, mnu_typed("/" + what + "\r").view())
+    assert_eq(m.message, "", s"searching for $what")
+
+// The line the cursor is on, as drawn.
+private mnu_cursor(m: *Menu) -> string
+    val lines = menu_lines(m, 100, 16, false)
+
+    lines.at(m.at - m.top + 1).trim()
+end mnu_cursor
+
+// What `sysl config` leaves of the project's manifest when it is given the same command lines,
+// carried out by the command itself.
+private mnu_by_cli(app: string, edits: Buf[Buf[string]]) -> string
+    for words in edits
+        var args: Buf[string] = buf()
+
+        args.push("sysl")
+        args.push("config")
+        args.push("-C")
+        args.push(app)
+
+        for w in words
+            args.push(w)
+
+        val (code, _, err) = clx_ran(args.view())
+
+        assert_eq(code, Fine, err)
+
+    read_text(s"$app/sysl.hocon").unwrap()
+end mnu_by_cli
+
+// **The claim every change makes**: the lines the menu ran are `expected`, the text it holds is
+// `after`, and the subcommands run on the file leave exactly that text. The menu is then refreshed
+// from the file, as the terminal driver does.
+private mnu_changed(app: string, m: *Menu, edits: Buf[Buf[string]], expected: []const string, after: string)
+    var shown: Buf[string] = buf()
+
+    for e in edits
+        shown.push(join(e.view(), " "))
+
+    assert_eq(join(shown.view(), " | "), join(expected, " | "))
+    assert_eq(m.text, after)
+    assert_eq(mnu_by_cli(app, edits), after)
+
+    *m = menu_refreshed(*m, mnu_view(app, after, None), after)
+end mnu_changed
+
+private mnu_entry(entry: string) -> string = mnu_lines([
+    "package { name = \"app\", version = \"0.1.0\" }",
+    "dependencies {",
+    "  // the USB stack",
+    s"  usb { $entry }",
+    "}"])
+
+// -- what it draws --------------------------------------------------------------------------------------
+
+@test("mnu: the tree shows choices as radio buttons, features as check boxes, options under their feature")
+mnu_the_tree()
+    val app = mnu_project(mnu_app_text())
+    var m = mnu_open(app, None)
+    val host = mnu_target(app, None).name
+
+    assert(mnu_screen(&m).starts_with(s" app 0.1.0 — $host "), mnu_screen(&m))
+    assert(mnu_screen(&m).contains("[ / ] search  [ ? ] doc  [ q ] quit"), mnu_screen(&m))
+
+    val tree = mnu_lines([
+        " └─ usb 0.1.0",
+        "    ├─ port   (•) rp2350  ( ) rp2040  ( ) stm32h7 — stm32h7 not this machine's",
+        "    ├─ ports  1 (1..4)",
+        "    ├─ trace  false",
+        "    ├─ greeting  \"hi\"",
+        "    ├─ [x] cdc",
+        "    │   └─ rx_buffer  256 (64..4096)",
+        "    ├─ [ ] msc",
+        "    │   └─ block  512 (512 | 4096) — off with 'msc'",
+        "    ├─ [ ] hid",
+        "    ├─ [ ] report",
+        "    └─ [ ] wifi — not this machine's"])
+    val screen = mnu_screen(&m)
+    val body = screen[(screen.index_of("\n").unwrap() + 1)..<screen.bytes.len] + "\n"
+
+    assert_eq(body, tree)
+    remove_dir_all(absolute_path(s"$app/..")).unwrap_or(())
+end mnu_the_tree
+
+@test("mnu: a styled screen reverses the cursor's row and dims a greyed one, and fits the width it is given")
+mnu_styled_and_clipped()
+    val app = mnu_project(mnu_app_text())
+    var m = mnu_open(app, None)
+    val styled = menu_lines(&m, 100, 16, true)
+
+    assert_eq(styled.at(1), "\u{1b}[7m └─ usb 0.1.0\u{1b}[0m")
+    assert_eq(styled.at(9), "\u{1b}[2m    │   └─ block  512 (512 | 4096) — off with 'msc'\u{1b}[0m")
+
+    val narrow = menu_lines(&m, 20, 6, false)
+
+    assert_eq(narrow.len(), 6)
+    for line in narrow do assert(text_columns_of(line) <= 20, line)
+    assert_eq(narrow.at(2), "    ├─ port   (•) rp")
+    remove_dir_all(absolute_path(s"$app/..")).unwrap_or(())
+end mnu_styled_and_clipped
+
+private text_columns_of(text: string) -> usize
+    var n: usize = 0
+
+    for _ in text.chars do n += 1
+
+    n
+end text_columns_of
+
+// A screen shorter than the tree shows the rows around the cursor, and scrolls to keep it in view.
+@test("mnu: a short screen scrolls to keep the cursor's row in view")
+mnu_scrolls()
+    val app = mnu_project(mnu_app_text())
+    var m = mnu_open(app, None)
+
+    mnu_press(&m, [MkEnd])
+
+    val lines = menu_lines(&m, 100, 5, false)
+
+    assert_eq(lines.len(), 5)
+    assert_eq(lines.at(1), "    ├─ [ ] hid")
+    assert_eq(lines.at(3), "    └─ [ ] wifi — not this machine's")
+    mnu_press(&m, [MkHome])
+    assert_eq(menu_lines(&m, 100, 5, false).at(1), " └─ usb 0.1.0")
+    remove_dir_all(absolute_path(s"$app/..")).unwrap_or(())
+end mnu_scrolls
+
+// -- moving ----------------------------------------------------------------------------------------------
+
+@test("mnu: the arrows, j and k, Home, End and the page keys move the cursor and stop at the ends")
+mnu_moves()
+    val app = mnu_project(mnu_app_text())
+    var m = mnu_open(app, None)
+
+    mnu_press(&m, [MkUp])
+    assert_eq(m.at, 0)
+    mnu_press(&m, [MkDown, MkDown])
+    assert_eq(mnu_cursor(&m), "├─ ports  1 (1..4)")
+    mnu_press(&m, mnu_typed("jk").view())
+    assert_eq(mnu_cursor(&m), "├─ ports  1 (1..4)")
+    mnu_press(&m, [MkPageDown])
+    assert_eq(m.at, 7)
+    mnu_press(&m, [MkPageDown, MkPageDown, MkDown])
+    assert_eq(mnu_cursor(&m), "└─ [ ] wifi — not this machine's")
+    mnu_press(&m, [MkPageUp])
+    assert_eq(m.at, 6)
+    mnu_press(&m, [MkHome])
+    assert_eq(m.at, 0)
+    mnu_press(&m, [MkEnd])
+    assert_eq(m.at, m.rows.len() - 1)
+    remove_dir_all(absolute_path(s"$app/..")).unwrap_or(())
+end mnu_moves
+
+@test("mnu: on a choice the cursor starts on the member that is on, and Left and Right stop at the ends")
+mnu_choice_cursor()
+    val app = mnu_project(mnu_entry("path = \"../usb\", features = [rp2040]"))
+    var m = mnu_open(app, None)
+
+    mnu_press(&m, [MkDown])
+    assert_eq(m.member, 1)
+    assert_eq(mnu_cursor(&m), "├─ port   ( ) rp2350 >(•) rp2040  ( ) stm32h7 — stm32h7 not this machine's")
+    mnu_press(&m, [MkRight, MkRight, MkRight])
+    assert_eq(m.member, 2)
+    mnu_press(&m, [MkLeft, MkLeft, MkLeft])
+    assert_eq(m.member, 0)
+    mnu_press(&m, mnu_typed("l").view())
+    assert_eq(m.member, 1)
+    remove_dir_all(absolute_path(s"$app/..")).unwrap_or(())
+end mnu_choice_cursor
+
+@test("mnu: q, Escape and Ctrl-C close it, and change nothing")
+mnu_quits()
+    val app = mnu_project(mnu_app_text())
+
+    for k in [MkChar('q'), MkEscape, MkCtrl('c')]
+        var m = mnu_open(app, None)
+
+        assert_eq(mnu_press(&m, [k]).len(), 0)
+        assert(m.quit)
+        assert_eq(m.text, mnu_app_text())
+
+    remove_dir_all(absolute_path(s"$app/..")).unwrap_or(())
+end mnu_quits
+
+// -- features --------------------------------------------------------------------------------------------
+
+// Turning `msc` on ungreys its option; turning it off again takes it out of the entry, and the option
+// is greyed once more.
+@test("mnu: Space on a feature turns it on, with its options; again turns it off, and the list goes")
+mnu_toggles_a_feature()
+    val app = mnu_project(mnu_app_text())
+    var m = mnu_open(app, None)
+
+    mnu_find(&m, "msc")
+
+    var edits = mnu_press(&m, [MkChar(' ')])
+
+    mnu_changed(app, &m, edits, ["dep usb --features +msc"], mnu_entry("path = \"../usb\", features = [msc]"))
+    assert_eq(mnu_cursor(&m), "├─ [x] msc")
+    assert(mnu_screen(&m).contains("│   └─ block  512 (512 | 4096)\n"), mnu_screen(&m))
+    assert_eq(m.message, "'usb' now asks for 'msc'")
+
+    edits = mnu_press(&m, [MkEnter])
+    mnu_changed(app, &m, edits, ["dep usb --features -msc"], mnu_entry("path = \"../usb\""))
+    assert(mnu_screen(&m).contains("block  512 (512 | 4096) — off with 'msc'"), mnu_screen(&m))
+    remove_dir_all(absolute_path(s"$app/..")).unwrap_or(())
+end mnu_toggles_a_feature
+
+// `cdc` is on by default and not in the entry: off means the defaults off, and nothing else of them is on.
+@test("mnu: a default feature is turned off by turning the defaults off")
+mnu_default_off()
+    val app = mnu_project(mnu_app_text())
+    var m = mnu_open(app, None)
+
+    mnu_find(&m, "cdc")
+
+    val edits = mnu_press(&m, [MkChar(' ')])
+
+    mnu_changed(app, &m, edits, ["set dependencies.usb.default_features false"],
+                mnu_entry("path = \"../usb\", default_features = false"))
+    assert_eq(mnu_cursor(&m), "├─ [ ] cdc")
+    assert(mnu_screen(&m).contains("rx_buffer  256 (64..4096) — off with 'cdc'"), mnu_screen(&m))
+
+    // And on again is asked for by name, since the defaults stay off.
+    val again = mnu_press(&m, [MkChar(' ')])
+
+    mnu_changed(app, &m, again, ["dep usb --features +cdc"],
+                mnu_entry("path = \"../usb\", default_features = false, features = [cdc]"))
+    assert_eq(mnu_cursor(&m), "├─ [x] cdc")
+    remove_dir_all(absolute_path(s"$app/..")).unwrap_or(())
+end mnu_default_off
+
+// Turning the defaults off must not take the other defaults with it: a second default, on and not
+// asked for, is asked for by name in the same change.
+@test("mnu: turning one default off asks again for the defaults that stay on")
+mnu_default_off_keeps_the_rest()
+    val app = mnu_project(mnu_app_text())
+    val usb = absolute_path(s"$app/../usb/sysl.hocon")
+
+    write_text(usb, replace_all(read_text(usb).unwrap(), "  hid { enables = [report] }",
+                                "  hid { enables = [report], default = true }")).unwrap()
+
+    var m = mnu_open(app, None)
+
+    mnu_find(&m, "cdc")
+
+    val edits = mnu_press(&m, [MkChar(' ')])
+
+    mnu_changed(app, &m, edits, ["set dependencies.usb.default_features false", "dep usb --features +hid"],
+                mnu_entry("path = \"../usb\", default_features = false, features = [hid]"))
+    assert(mnu_screen(&m).contains("├─ [ ] cdc\n"), mnu_screen(&m))
+    assert(mnu_screen(&m).contains("├─ [x] hid\n"), mnu_screen(&m))
+    assert(mnu_screen(&m).contains("├─ [x] report\n"), mnu_screen(&m))
+    remove_dir_all(absolute_path(s"$app/..")).unwrap_or(())
+end mnu_default_off_keeps_the_rest
+
+@test("mnu: a feature another feature enables is refused with the reason, and nothing is written")
+mnu_enabled_by_another()
+    val app = mnu_project(mnu_entry("path = \"../usb\", features = [hid]"))
+    var m = mnu_open(app, None)
+    val before = m.text
+
+    mnu_find(&m, "report")
+    assert_eq(mnu_cursor(&m), "├─ [x] report")
+    assert_eq(mnu_press(&m, [MkChar(' ')]).len(), 0)
+    assert_eq(m.message, "'report' of 'usb' is on because 'hid' enables it — turn 'hid' off instead")
+    assert_eq(m.text, before)
+    remove_dir_all(absolute_path(s"$app/..")).unwrap_or(())
+end mnu_enabled_by_another
+
+@test("mnu: a feature whose 'if' fails on the machine is greyed, and turning it on is refused")
+mnu_unavailable_feature()
+    val app = mnu_project(mnu_app_text())
+    var m = mnu_open(app, None)
+    val host = mnu_target(app, None).name
+
+    mnu_find(&m, "wifi")
+    assert_eq(mnu_press(&m, [MkChar(' ')]).len(), 0)
+    assert_eq(m.message, s"'wifi' of 'usb' is not this machine's: its 'if' is 'freestanding', which does not hold on '$host'")
+    assert_eq(m.text, mnu_app_text())
+    remove_dir_all(absolute_path(s"$app/..")).unwrap_or(())
+end mnu_unavailable_feature
+
+// -- choices ---------------------------------------------------------------------------------------------
+
+// The choice's default is on because nothing picked another, so picking another needs no `-`; picking
+// the default back takes the other out of the list.
+@test("mnu: Enter on a choice's member picks it, and the member that was on goes")
+mnu_picks_a_member()
+    val app = mnu_project(mnu_app_text())
+    var m = mnu_open(app, None)
+
+    mnu_press(&m, [MkDown, MkRight])
+
+    var edits = mnu_press(&m, [MkEnter])
+
+    mnu_changed(app, &m, edits, ["dep usb --features +rp2040"], mnu_entry("path = \"../usb\", features = [rp2040]"))
+    assert_eq(mnu_cursor(&m), "├─ port   ( ) rp2350 >(•) rp2040  ( ) stm32h7 — stm32h7 not this machine's")
+
+    edits = mnu_press(&m, [MkLeft, MkChar(' ')])
+    mnu_changed(app, &m, edits, ["dep usb --features +rp2350,-rp2040"], mnu_entry("path = \"../usb\", features = [rp2350]"))
+    assert_eq(mnu_cursor(&m), "├─ port  >(•) rp2350  ( ) rp2040  ( ) stm32h7 — stm32h7 not this machine's")
+
+    // The member that is on already is said, and written nowhere.
+    assert_eq(mnu_press(&m, [MkEnter]).len(), 0)
+    assert_eq(m.message, "'rp2350' is already the 'port' of 'usb'")
+    remove_dir_all(absolute_path(s"$app/..")).unwrap_or(())
+end mnu_picks_a_member
+
+@test("mnu: a member whose 'if' fails on the machine is shown, greyed with the reason, and refused")
+mnu_unavailable_member()
+    val app = mnu_project(mnu_app_text())
+    var m = mnu_open(app, None)
+    val host = mnu_target(app, None).name
+
+    mnu_press(&m, [MkDown, MkRight, MkRight])
+    assert_eq(mnu_press(&m, [MkEnter]).len(), 0)
+    assert_eq(m.message, s"'stm32h7' of 'usb' is not this machine's: its 'if' is 'thumb && freestanding', " +
+              s"which does not hold on '$host'")
+    mnu_press(&m, mnu_typed("?").view())
+    assert(m.message.starts_with("port: which controller · stm32h7: an H7's controller · stm32h7 is not this machine's"), m.message)
+    assert_eq(m.text, mnu_app_text())
+    remove_dir_all(absolute_path(s"$app/..")).unwrap_or(())
+end mnu_unavailable_member
+
+// `--target` names the machine the `if`s are read against: on a bare Thumb machine the H7 member and
+// the feature that needs a freestanding machine are offered rather than greyed.
+@test("mnu: --target picks the machine, and a member the host greys is offered there")
+mnu_another_target()
+    val app = mnu_project(mnu_app_text())
+    var m = mnu_open(app, Some("thumb-freestanding"))
+    val screen = mnu_screen(&m)
+
+    assert(screen.starts_with(" app 0.1.0 — thumb-freestanding "), screen)
+    assert(screen.contains("├─ port   (•) rp2350  ( ) rp2040  ( ) stm32h7\n"), screen)
+    assert(screen.contains("└─ [ ] wifi\n") || screen.ends_with("└─ [ ] wifi"), screen)
+
+    mnu_press(&m, [MkDown, MkRight, MkRight])
+
+    val edits = mnu_press(&m, [MkEnter])
+
+    assert_eq(join(edits.at(0).view(), " "), "dep usb --features +stm32h7")
+    assert_eq(m.text, mnu_entry("path = \"../usb\", features = [stm32h7]"))
+    remove_dir_all(absolute_path(s"$app/..")).unwrap_or(())
+end mnu_another_target
+
+// -- options ---------------------------------------------------------------------------------------------
+
+@test("mnu: Enter on an option edits its value, and a value within its range is set")
+mnu_sets_an_option()
+    val app = mnu_project(mnu_app_text())
+    var m = mnu_open(app, None)
+
+    mnu_find(&m, "ports")
+    mnu_press(&m, [MkEnter])
+    assert_eq(menu_lines(&m, 100, 16, false).at(15), " ports = 1")
+
+    val edits = mnu_press(&m, [MkBackspace, MkChar('3'), MkEnter])
+
+    mnu_changed(app, &m, edits, ["dep usb --set ports=3"], mnu_entry("path = \"../usb\", options { ports = 3 }"))
+    assert_eq(mnu_cursor(&m), "├─ ports  3 (1..4) — set by this project, default 1")
+    assert_eq(m.message, "set the option 'ports' of 'usb' to 3")
+
+    // The value it has is said rather than written again.
+    assert_eq(mnu_press(&m, [MkEnter, MkEnter]).len(), 0)
+    assert_eq(m.message, "'ports' of 'usb' is already 3")
+    remove_dir_all(absolute_path(s"$app/..")).unwrap_or(())
+end mnu_sets_an_option
+
+// Each refusal is the build's own for the same entry, and leaves the text as it was.
+@test("mnu: a value outside the range, of the wrong type, or none of the values is refused with the text")
+mnu_refuses_a_value()
+    val app = mnu_project(mnu_entry("path = \"../usb\", features = [msc]"))
+    var m = mnu_open(app, None)
+    val before = m.text
+
+    mnu_find(&m, "ports")
+    assert_eq(mnu_press(&m, [MkEnter, MkBackspace, MkChar('9'), MkEnter]).len(), 0)
+    assert_eq(m.message, "this project sets the option 'ports' of 'usb' to 9, outside the option's range [1, 4]")
+    assert_eq(mnu_press(&m, [MkEnter, MkBackspace, MkChar('x'), MkEnter]).len(), 0)
+    assert(m.message.starts_with("this project sets the option 'ports' of 'usb' to x, which is not a 'u8'"), m.message)
+    assert_eq(mnu_press(&m, [MkEnter, MkBackspace, MkEnter]).len(), 0)
+    assert_eq(m.message, "the option 'ports' of 'usb' needs a value")
+
+    mnu_find(&m, "msc.block")
+    mnu_press(&m, [MkEnter])
+
+    for _ in 0..<3 do mnu_press(&m, [MkBackspace])
+
+    assert_eq(mnu_press(&m, mnu_typed("100\r").view()).len(), 0)
+    assert_eq(m.message, "this project sets the option 'msc.block' of 'usb' to 100, which is none of the option's values [512, 4096]")
+    assert_eq(m.text, before)
+
+    // And one of the values is taken, written nested under the feature as the subcommand writes it.
+    mnu_press(&m, [MkEnter])
+
+    for _ in 0..<3 do mnu_press(&m, [MkBackspace])
+
+    val edits = mnu_press(&m, mnu_typed("4096\r").view())
+
+    mnu_changed(app, &m, edits, ["dep usb --set msc.block=4096"],
+                mnu_entry("path = \"../usb\", features = [msc], options { msc { block = 4096 } }"))
+    remove_dir_all(absolute_path(s"$app/..")).unwrap_or(())
+end mnu_refuses_a_value
+
+@test("mnu: Enter on a flag flips it, and a string is written quoted")
+mnu_flag_and_string()
+    val app = mnu_project(mnu_app_text())
+    var m = mnu_open(app, None)
+
+    mnu_find(&m, "trace")
+
+    var edits = mnu_press(&m, [MkEnter])
+
+    mnu_changed(app, &m, edits, ["dep usb --set trace=true"], mnu_entry("path = \"../usb\", options { trace = true }"))
+    edits = mnu_press(&m, [MkChar(' ')])
+    mnu_changed(app, &m, edits, ["dep usb --set trace=false"], mnu_entry("path = \"../usb\", options { trace = false }"))
+
+    mnu_find(&m, "greeting")
+    mnu_press(&m, [MkEnter])
+
+    for _ in 0..<4 do mnu_press(&m, [MkBackspace])
+
+    edits = mnu_press(&m, mnu_typed("hello there\r").view())
+    mnu_changed(app, &m, edits, ["dep usb --set greeting=hello there"],
+                mnu_entry("path = \"../usb\", options { trace = false, greeting = \"hello there\" }"))
+    assert_eq(mnu_cursor(&m), "├─ greeting  \"hello there\" — set by this project, default \"hi\"")
+    remove_dir_all(absolute_path(s"$app/..")).unwrap_or(())
+end mnu_flag_and_string
+
+@test("mnu: an option of a feature that is off is refused, naming the feature")
+mnu_option_of_an_off_feature()
+    val app = mnu_project(mnu_app_text())
+    var m = mnu_open(app, None)
+
+    mnu_find(&m, "msc.block")
+    assert_eq(mnu_press(&m, [MkEnter]).len(), 0)
+    assert_eq(m.message, "the option 'msc.block' of 'usb' belongs to the feature 'msc', which is off — turn 'msc' on to set it")
+    assert_eq(m.mode, Browsing)
+    remove_dir_all(absolute_path(s"$app/..")).unwrap_or(())
+end mnu_option_of_an_off_feature
+
+@test("mnu: Escape leaves an edit unmade, and Backspace takes back what was typed")
+mnu_edit_cancelled()
+    val app = mnu_project(mnu_app_text())
+    var m = mnu_open(app, None)
+
+    mnu_find(&m, "rx_buffer")
+    mnu_press(&m, [MkEnter])
+    mnu_press(&m, mnu_typed("99").view())
+    assert_eq(menu_lines(&m, 100, 16, false).at(15), " cdc.rx_buffer = 25699")
+    mnu_press(&m, [MkBackspace])
+    assert_eq(menu_lines(&m, 100, 16, false).at(15), " cdc.rx_buffer = 2569")
+    assert_eq(mnu_press(&m, [MkEscape]).len(), 0)
+    assert_eq(m.mode, Browsing)
+    assert(!m.quit)
+    assert_eq(m.text, mnu_app_text())
+    remove_dir_all(absolute_path(s"$app/..")).unwrap_or(())
+end mnu_edit_cancelled
+
+// -- search and doc --------------------------------------------------------------------------------------
+
+@test("mnu: / finds the next row that matches, n finds the one after, round to the top")
+mnu_searches()
+    val app = mnu_project(mnu_app_text())
+    var m = mnu_open(app, None)
+
+    mnu_press(&m, mnu_typed("/r").view())
+    assert_eq(menu_lines(&m, 100, 16, false).at(15), " /r")
+    mnu_press(&m, [MkEnter])
+    assert_eq(mnu_cursor(&m), "├─ port  >(•) rp2350  ( ) rp2040  ( ) stm32h7 — stm32h7 not this machine's")
+    mnu_press(&m, mnu_typed("n").view())
+    assert_eq(mnu_cursor(&m), "├─ ports  1 (1..4)")
+    mnu_press(&m, mnu_typed("nnnn").view())
+    assert_eq(mnu_cursor(&m), "├─ [ ] report")
+    mnu_press(&m, mnu_typed("n").view())
+    assert_eq(mnu_cursor(&m), "├─ port  >(•) rp2350  ( ) rp2040  ( ) stm32h7 — stm32h7 not this machine's")
+
+    mnu_press(&m, mnu_typed("/nothing\r").view())
+    assert_eq(m.message, "nothing matches 'nothing'")
+
+    // Escape leaves a search, and the cursor where it was.
+    val at = m.at
+
+    mnu_press(&m, mnu_typed("/wif").view())
+    mnu_press(&m, [MkBackspace, MkEscape])
+    assert_eq(m.at, at)
+    assert_eq(m.mode, Browsing)
+    assert(!m.quit)
+    remove_dir_all(absolute_path(s"$app/..")).unwrap_or(())
+end mnu_searches
+
+@test("mnu: ? shows the doc of the row, and a row with none says so")
+mnu_docs()
+    val app = mnu_project(mnu_app_text())
+    var m = mnu_open(app, None)
+
+    mnu_find(&m, "rx_buffer")
+    mnu_press(&m, mnu_typed("?").view())
+    assert_eq(m.message, "cdc.rx_buffer: bytes held for reading · u16, default 256 (64..4096)")
+    mnu_find(&m, "cdc")
+    mnu_press(&m, mnu_typed("?").view())
+    assert_eq(m.message, "cdc: a serial port")
+    mnu_find(&m, "report")
+    mnu_press(&m, mnu_typed("?").view())
+    assert_eq(m.message, "report: no doc")
+
+    // The message goes with the next key.
+    mnu_press(&m, [MkDown])
+    assert_eq(m.message, "")
+    remove_dir_all(absolute_path(s"$app/..")).unwrap_or(())
+end mnu_docs
+
+// A project with no dependencies has nothing to configure but its own title.
+@test("mnu: a project with no dependencies shows its title and an empty tree")
+mnu_no_dependencies()
+    val app = mnu_project(mnu_lines(["package { name = \"app\", version = \"0.1.0\" }"]))
+    var m = mnu_open(app, None)
+
+    assert_eq(m.rows.len(), 0)
+    assert_eq(mnu_press(&m, [MkDown, MkEnter, MkChar(' '), MkEnd]).len(), 0)
+    assert(mnu_screen(&m).starts_with(" app 0.1.0 — "), mnu_screen(&m))
+    remove_dir_all(absolute_path(s"$app/..")).unwrap_or(())
+end mnu_no_dependencies
+
+// -- the keyboard -----------------------------------------------------------------------------------------
+
+private mnu_decoded(bytes: string, pause: bool) -> string
+    var keys = menu_keys()
+    var got: Buf[string] = buf()
+
+    for b in bytes.bytes
+        keys.push(b)
+
+        loop
+            keys.next() match
+                None -> break
+                Some(k) -> got.push(s"$k")
+
+    if pause
+        keys.pause()
+
+        keys.next() match
+            None -> ()
+            Some(k) -> got.push(s"$k")
+
+    join(got.view(), " ")
+end mnu_decoded
+
+@test("mnu: the keyboard's bytes are the menu's keys, every key of a read in turn")
+mnu_keyboard()
+    assert_eq(mnu_decoded("\u{1b}[A\u{1b}OB\u{1b}[C\u{1b}OD", false), "MenuKey.MkUp MenuKey.MkDown MenuKey.MkRight MenuKey.MkLeft")
+    assert_eq(mnu_decoded("\u{1b}[5~\u{1b}[6~\u{1b}[H\u{1b}[4~", false), "MenuKey.MkPageUp MenuKey.MkPageDown MenuKey.MkHome MenuKey.MkEnd")
+    assert_eq(mnu_decoded("\r\n\u{7f}9\r", false), "MenuKey.MkEnter MenuKey.MkBackspace MenuKey.MkChar(c: '9') MenuKey.MkEnter")
+    assert_eq(mnu_decoded("/é\t\u{3}", false), "MenuKey.MkChar(c: '/') MenuKey.MkChar(c: 'é') MenuKey.MkTab MenuKey.MkCtrl(c: 'c')")
+    assert_eq(mnu_decoded("\u{1b}[1;5D\u{1b}[?1hq", false), "MenuKey.MkLeft MenuKey.MkChar(c: 'q')")
+    assert_eq(mnu_decoded("\u{1b}", false), "")
+    assert_eq(mnu_decoded("\u{1b}", true), "MenuKey.MkEscape")
+    assert_eq(mnu_decoded("\u{1b}x", false), "MenuKey.MkEscape MenuKey.MkChar(c: 'x')")
+    assert_eq(mnu_decoded("\u{1b}\u{1b}[B", false), "MenuKey.MkEscape MenuKey.MkDown")
+end mnu_keyboard
+
+// -- off a terminal ----------------------------------------------------------------------------------------
+
+@test("mnu: off a terminal, bare sysl config prints the commands, with or without --target")
+mnu_off_a_terminal()
+    val app = mnu_project(mnu_app_text())
+
+    mnu_usage(["sysl", "config"])
+    mnu_usage(["sysl", "config", "-C", app])
+    mnu_usage(["sysl", "config", "-C", app, "--target", "thumb-freestanding"])
+    assert_eq(read_text(s"$app/sysl.hocon").unwrap(), mnu_app_text())
+    remove_dir_all(absolute_path(s"$app/..")).unwrap_or(())
+end mnu_off_a_terminal
+
+private mnu_usage(args: []string)
+    val (code, out, err) = clx_ran(args)
+
+    assert_eq(code, Misused, out + err)
+    assert_eq(err, config_usage())
+    assert(err.ends_with("  (no command, on a terminal) the menu [--target <t>]"), err)
+end mnu_usage
+
+// -- on a terminal ----------------------------------------------------------------------------------------
+
+// **The driver, through a pseudo-terminal**: the binary `SYSL_STAGE2` names is run by the system's
+// `script`, sized by `stty`, and typed at -- a search, a toggle, a quit. What is asserted is the file
+// it wrote, the command line it said, the screen it entered and left, and the terminal's mode after.
+@test("mnu: on a terminal, sysl config opens the menu, writes the change, and puts the terminal back")
+mnu_on_a_terminal()
+    val binary = env_var("SYSL_STAGE2") match
+        Some(b) -> b
+        None ->
+            print("skipped: SYSL_STAGE2 names no sysl binary on this machine")
+            return
+
+    val script = capture("sh", ["-c", "command -v script"]).map((o) -> o.text.len > 0).unwrap_or(false)
+
+    if !script
+        print("skipped: there is no 'script' on this machine to make a terminal with")
+        return
+    end if
+
+    val app = mnu_project(mnu_app_text())
+    val root = absolute_path(s"$app/..")
+    val lib = env_var("SYSL_LIB").unwrap_or("")
+
+    write_text(s"$root/session.sh", s"stty rows 20 cols 100\nSYSL_LIB='$lib' '$binary' config -C '$app'\n" +
+               "echo \"status: $?\"\nstty -a | tr ' ' '\\n' | grep -c '^-echo$'\n").unwrap()
+    write_text(s"$root/feed.sh", "sleep 2\nprintf '/msc\\r'\nsleep 1\nprintf ' '\nsleep 2\nprintf 'q'\nsleep 1\n").unwrap()
+
+    val bsd = capture("uname", []).map((o) -> o.text.starts_with("Darwin")).unwrap_or(false)
+    val under = if bsd then s"script -q /dev/null sh $root/session.sh" else s"script -qc 'sh $root/session.sh' /dev/null"
+    val shown = capture("sh", ["-c", s"sh $root/feed.sh | $under"], "", [], true, 60000) match
+        Err(_) -> "script could not be run"
+        Ok(o) -> o.text
+
+    assert_eq(read_text(s"$app/sysl.hocon").unwrap(), mnu_entry("path = \"../usb\", features = [msc]"), shown)
+    assert(shown.contains("\u{1b}[?1049h"), shown)
+    assert(shown.contains("[x] msc"), shown)
+    assert(shown.contains("\u{1b}[?25h\u{1b}[?1049l"), shown)
+    assert(shown.contains("sysl config dep usb --features +msc"), shown)
+    assert(shown.contains("status: 0"), shown)
+
+    // No `-echo` after it: the terminal's mode was put back.
+    val tail = shown[shown.index_of("status: 0").unwrap()..<shown.bytes.len]
+
+    assert(tail.contains("\n0") || tail.contains("\r\n0"), tail)
+    remove_dir_all(root).unwrap_or(())
+end mnu_on_a_terminal

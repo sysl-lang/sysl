@@ -118,3 +118,38 @@ color() -> bool = color_on(stdout_fd())
  * genuinely differ, since `prog > file` leaves one a file and the other a terminal.
  */
 color_err() -> bool = color_on(stderr_fd())
+
+// -- The size of the window ---------------------------------------------------------------------------
+
+// `ioctl(TIOCGWINSZ)`, in the C beside this file: the request's number and `struct winsize` are each
+// platform's own, and `ioctl` is variadic, so all three stay on the C side and one packed integer
+// crosses -- the rows above bit 16, the columns below -- or `-1` where there is no size to give.
+private[sysl] extern "sysl_tty_window_size" c_window_size(fd: int) -> int
+
+/** A terminal's size in character cells. */
+struct WindowSize derives Eq
+    rows: int
+    cols: int
+end WindowSize
+
+/** The size of the terminal at a descriptor, or `None` where it is not a terminal -- or is one that
+ * reports no size, as a pseudo-terminal nobody has sized does (zero rows and zero columns, which no
+ * program could draw into).
+ *
+ * **The size changes while a program runs**, whenever the window is resized, and the kernel says so
+ * with `WINCH`: a full-screen program watches it (`sysl.signal.watch(WINCH)`) and asks again before
+ * its next redraw, rather than asking once at the start.
+ */
+window_size(fd: int) -> Option[WindowSize]
+    val packed = c_window_size(fd)
+
+    if packed <= 0 then return None
+
+    val rows = packed >> 16
+    val cols = packed & 65535
+
+    if rows == 0 || cols == 0 then None else Some(WindowSize(rows, cols))
+end window_size
+
+/** The size of the terminal standard output is drawn on. */
+size() -> Option[WindowSize] = window_size(stdout_fd())
