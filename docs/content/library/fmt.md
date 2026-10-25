@@ -227,7 +227,7 @@ short: 41 bytes would do
 **`float_scratch_len` bytes are always enough** — the longest exact `real` runs to 767 significant
 digits — and most requests need far fewer: `%.17g` needs seventeen, and `%a`, an infinity, a NaN and
 a zero need none. A scratch too short is refused with `Short` **before anything is written**, naming a
-length that would do; a specifier that is not one float conversion is `BadSpec`. `%a` writes a first
+length that would do; a specifier that is not one float conversion is `BadSpec` (`FormatError` has `==`). `%a` writes a first
 digit of 1 for every value but zero, a subnormal included (`0x1p-1074`), and rounds a fraction half to
 even, as glibc and musl do. `write_f32` and `write_f128` are the same at the other widths, and an
 `f128`'s scratch is `f128_scratch_len`.

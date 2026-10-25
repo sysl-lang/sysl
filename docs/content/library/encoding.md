@@ -93,7 +93,7 @@ forgiving about what cannot be ambiguous.
 ## What a refusal says
 
 `DecodeError` has five cases, separated by what a caller would **do** about each rather than by
-taxonomy.
+taxonomy. It has `==`, variant by variant and payload by payload.
 
 | | |
 |---|---|
