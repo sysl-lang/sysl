@@ -1,0 +1,400 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// What a call's integer answer is made of, for the keeps-analysis's cast graph (`keeps_cast.sysl`):
+// the arguments its body answers, and nothing else it is handed, worked out to a fixed point; an
+// inline assembly output is a fresh number; arithmetic makes a number. Each accepted cell sits beside
+// the near miss that is refused, with its text. `reference/memory.md § A borrowed pointer cannot
+// escape` and `reference/inline-assembly.md § What the compiler owns` are the specification.
+//
+// Skipped cells, and why: a call through a function pointer or an object, and an enum's payload, are
+// not followed by the graph at all (the raw tier, pinned in `tests_kso_keeps_sound.sysl`); a nested
+// function and a build-lib split change nothing these rules read, which are per body and per program;
+// a bare-metal build is the cstd shape itself, gated by cstd's own suite.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private cfl_outcome(text: string) -> (string, int)
+    val root = make_temp_dir("sysl-cfl").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (failure_text(why), -1)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> ("the program that was built could not be run", -1)
+        Ok(out) -> (out.text + out.err.unwrap_or(""), shell_status(out.status))
+end cfl_outcome
+
+private cfl_prints(text: string, want: string)
+    if xvr_no_library() then return
+
+    val out = cfl_outcome(text)
+
+    assert_eq(out.0, want)
+    assert_eq(out.1, 0)
+end cfl_prints
+
+private cfl_refused(text: string, part: string)
+    if xvr_no_library() then return
+
+    val out = cfl_outcome(text)
+
+    assert_eq(out.1, -1, out.0)
+    assert(out.0.index_of(part).is_some(), out.0)
+end cfl_refused
+
+// A module variable an address may be kept in, and the `ptr_cast` that turns it back.
+private cfl_stack() -> string = raw"""
+    import sysl.raw.ptr_cast
+
+    var top: usize = 0
+
+    peek() -> int
+        val p: *int = ptr_cast(top)
+
+        *p
+
+    """
+
+private cfl_passed(callee: string, param: string) -> string =
+    s"'$callee' may store its parameter '$param' where it outlives the call, and 'usize(&marker)' holds " +
+        "the address of a local of 'mark' as an integer, which 'peek' turns back into a pointer with 'ptr_cast'"
+
+// An inline assembly arm that copies `n` into `r`, on every host this suite runs on.
+private cfl_copy() -> string = raw"""
+        asm
+            [x86_64]
+                "movq {n}, {r}"
+                in n : reg
+                out r : reg
+            [aarch64]
+                "mov {r}, {n}"
+                in n : reg
+                out r : reg
+            [thumb, riscv64, riscv32, craft, wasm32] unavailable "a host test"
+    """
+
+// -- the system-call wrapper ----------------------------------------------------------------------
+
+@test("a frame's address handed to a system-call wrapper whose answer another caller turns back is accepted")
+cfl_svc_wrapper_accepted()
+    cfl_prints(raw"""
+        import sysl.raw.ptr_cast
+
+        var store: u64 = 41
+        var current: usize = 0
+
+        svc(nr: u64, a0: u64, n: u64) -> u64
+            var r: u64 = 0
+        """ + cfl_copy() + raw"""
+            r
+
+        call(nr: u64, a0: u64 = 0, a1: u64 = 0) -> u64 = svc(nr, a0, a1)
+
+        brk(to: usize) -> usize = usize(call(214, 0, u64(to)))
+
+        peek() -> u64
+            val p: *u64 = ptr_cast(current)
+
+            *p
+
+        mask()
+            var bits: u64 = 1
+
+            call(135, u64(usize(&bits)))
+
+        main()
+            mask()
+            current = brk(usize(&store))
+            print(peek())
+        """, "41\n")
+
+@test("an inline assembly output is a fresh number, even where the instructions copy an input into it")
+cfl_asm_output_fresh()
+    cfl_prints(cfl_stack() + raw"""
+        launder(n: usize) -> usize
+            var r: usize = 0
+        """ + cfl_copy() + raw"""
+            r
+
+        record(n: usize)
+            top = launder(n)
+
+        mark()
+            var marker = 7
+
+            top = launder(usize(&marker))
+            record(usize(&marker))
+
+        main()
+            mark()
+            print(top > 0)
+            if top == 0 then print(peek())
+        """, "true\n")
+
+// -- a body that answers its parameter ------------------------------------------------------------
+
+@test("a body that answers its integer parameter is followed, stored by the caller, by a callee, or through a local")
+cfl_answered_parameter_refused()
+    val pass = "pass(n: usize) -> usize = n\n\n"
+
+    cfl_refused(cfl_stack() + pass + raw"""
+        record(n: usize)
+            top = pass(n)
+
+        mark()
+            var marker = 7
+
+            record(usize(&marker))
+
+        main()
+            mark()
+            print(peek())
+        """, cfl_passed("record", "n"))
+    cfl_refused(cfl_stack() + pass + raw"""
+        mark()
+            var marker = 7
+            val here = pass(usize(&marker))
+
+            top = here
+
+        main()
+            mark()
+            print(peek())
+        """, cfl_passed("pass", "n"))
+    cfl_refused(cfl_stack() + raw"""
+        pick(a: usize, b: usize, first: bool) -> usize
+            val kept = if first then a else b
+
+            kept
+
+        mark()
+            var marker = 7
+            val here = pick(0, usize(&marker), false)
+
+            top = here
+
+        main()
+            mark()
+            print(peek())
+        """, cfl_passed("pick", "b"))
+
+@test("a parameter a body does not answer is not its answer, and one call's answer is not another's")
+cfl_unanswered_parameter_accepted()
+    cfl_prints(cfl_stack() + raw"""
+        var store = 41
+
+        pick(a: usize, b: usize) -> usize = a
+
+        pass(n: usize) -> usize = n
+
+        mark()
+            var marker = 7
+
+            top = pick(usize(&store), usize(&marker))
+
+            val here = pass(usize(&marker))
+
+            print(here > 0)
+
+        main()
+            mark()
+            top = pass(usize(&store))
+            print(peek())
+        """, "true\n41\n")
+
+@test("arithmetic on an address as an integer makes a number, in a body that answers it or stores it")
+cfl_arithmetic_is_a_number()
+    cfl_prints(cfl_stack() + raw"""
+        var low: usize = 0
+
+        offset(n: usize) -> usize = n + 8
+
+        record(n: usize)
+            low = n - 8
+
+        mark()
+            var marker = 7
+
+            top = offset(usize(&marker))
+            record(usize(&marker))
+
+        main()
+            mark()
+            print(top > low)
+            if top == 0 then print(peek())
+        """, "true\n")
+
+// -- recursion, a generic, a method, an extern ----------------------------------------------------
+
+@test("a recursive body answers its parameter where one way out does, and not where none does")
+cfl_recursion()
+    cfl_refused(cfl_stack() + raw"""
+        deep(n: usize, k: int) -> usize = if k == 0 then n else deep(n, k - 1)
+
+        record(n: usize)
+            top = deep(n, 3)
+
+        mark()
+            var marker = 7
+
+            record(usize(&marker))
+
+        main()
+            mark()
+            print(peek())
+        """, cfl_passed("record", "n"))
+    cfl_refused(cfl_stack() + raw"""
+        ping(n: usize, k: int) -> usize = if k == 0 then n else pong(n, k - 1)
+
+        pong(n: usize, k: int) -> usize = ping(n, k)
+
+        record(n: usize)
+            top = pong(n, 3)
+
+        mark()
+            var marker = 7
+
+            record(usize(&marker))
+
+        main()
+            mark()
+            print(peek())
+        """, cfl_passed("record", "n"))
+    cfl_prints(cfl_stack() + raw"""
+        count(n: usize, k: int) -> usize = if k == 0 then 0 else count(n, k - 1)
+
+        record(n: usize)
+            top = count(n, 3)
+
+        mark()
+            var marker = 7
+
+            record(usize(&marker))
+
+        main()
+            mark()
+            print(top)
+            if top != 0 then print(peek())
+        """, "0\n")
+
+@test("a generic and a method answer what their bodies answer, at every instantiation")
+cfl_generic_and_method()
+    cfl_refused(cfl_stack() + raw"""
+        same[T](v: T) -> T = v
+
+        record(n: usize)
+            top = same(n)
+
+        mark()
+            var marker = 7
+
+            record(usize(&marker))
+
+        main()
+            mark()
+            print(peek())
+        """, cfl_passed("record", "n"))
+    cfl_prints(cfl_stack() + raw"""
+        size_of_it[T](v: T, d: usize) -> usize = d
+
+        record(n: usize)
+            top = size_of_it(n, 8)
+
+        mark()
+            var marker = 7
+
+            record(usize(&marker))
+
+        main()
+            mark()
+            print(top)
+            if top != 8 then print(peek())
+        """, "8\n")
+    cfl_refused(cfl_stack() + raw"""
+        struct Slot
+            v: int
+
+            hold(self, n: usize) -> usize = n
+
+        record(n: usize)
+            top = Slot(0).hold(n)
+
+        mark()
+            var marker = 7
+
+            record(usize(&marker))
+
+        main()
+            mark()
+            print(peek())
+        """, cfl_passed("record", "n"))
+    cfl_prints(cfl_stack() + raw"""
+        struct Slot
+            v: int
+
+            width(self, n: usize) -> usize = usize(self.v)
+
+        record(n: usize)
+            top = Slot(4).width(n)
+
+        mark()
+            var marker = 7
+
+            record(usize(&marker))
+
+        main()
+            mark()
+            print(top)
+            if top != 4 then print(peek())
+        """, "4\n")
+
+@test("an extern's integer answer is fresh unless its declaration says '@answers'")
+cfl_extern_answer()
+    cfl_prints(cfl_stack() + raw"""
+        extern "llabs" c_llabs(n: i64) -> i64
+
+        record(n: usize)
+            top = usize(c_llabs(i64(n)))
+
+        mark()
+            var marker = 7
+
+            record(usize(&marker))
+
+        main()
+            mark()
+            print(top > 0)
+            if top == 0 then print(peek())
+        """, "true\n")
+    cfl_refused(cfl_stack() + raw"""
+        @answers(n)
+        extern "llabs" c_llabs(n: i64) -> i64
+
+        record(n: usize)
+            top = usize(c_llabs(i64(n)))
+
+        mark()
+            var marker = 7
+
+            record(usize(&marker))
+
+        main()
+            mark()
+            print(peek())
+        """, cfl_passed("record", "n"))

@@ -401,6 +401,14 @@ print(seven_plus(1))
 The one exception is an output bound to the same machine register as an input, as in
 `in n : "eax"` and `out v : "eax"`, which states that the two share it.
 
+**An output is a fresh value, made of none of the inputs.** For the same reason — the compiler does
+not read the instructions — it does not guess that an output is an input copied through, and so the
+check that keeps a frame's address from being turned back into a pointer after the frame has ended
+([memory](/reference/memory/#where-no-body-is-in-sight-the-call-borrows)) takes a system call's
+answer as the kernel's own number, not as the arguments handed in. An arm that does copy an address
+from an input to an output takes that address out of the check's sight, as `ptr_cast` arithmetic
+does.
+
 ## The words this construct uses
 
 None of them is reserved. `asm`, `unavailable`, `out`, `reg` and `clobbers` are contextual: each is

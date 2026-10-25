@@ -4373,10 +4373,50 @@ main()
 'usize(&marker)' holds the address of a local of 'mark', and it is stored in 'top', which outlives 'mark' and 'peek' turns back into a pointer with 'ptr_cast' — store the value itself, or storage that lasts
 ```
 
-Followed this far and no further: what a call answers is taken to be made of every integer it is
-handed, and a field, a pointee or an element is one place for every value of its type — both say
-more than most programs do, and the refusal names the `ptr_cast` it found. An integer handed through
-a function pointer, a call through an object, or an enum's payload is not followed.
+**What a call answers is made of the integers its body answers, and of nothing else it was handed.**
+`pass(n: usize) -> usize = n` answers its argument, so the caller's address comes back out of the
+call and is followed on from there — to that caller, not to every caller of `pass`. A parameter the
+body never answers stays inside the call, and arithmetic makes a number: `n + 8` is not the address,
+as `usize(&marker) + 8` is not. Recursion is followed to where it settles. An `extern`'s answer is
+made of only what its `@answers` names, and an inline-assembly output of
+[nothing it was handed](/reference/inline-assembly/#what-the-compiler-owns) — so a system call's
+answer is the kernel's number, even where another call to the same wrapper was handed a local's
+address:
+
+```sysl
+import sysl.raw.ptr_cast
+
+var store = 41
+var top: usize = 0
+
+pass(n: usize) -> usize = n
+
+mark()
+    var marker = 7
+    val here = pass(usize(&marker))
+
+    print(here > 0)
+
+peek() -> int
+    val p: *int = ptr_cast(top)
+
+    *p
+
+main()
+    mark()
+    top = pass(usize(&store))
+    print(peek())
+```
+
+```output
+true
+41
+```
+
+Followed this far and no further: a field, a pointee or an element is one place for every value of
+its type, which says more than most programs do, and the refusal names the `ptr_cast` it found. An
+integer handed through a function pointer, a call through an object, or an enum's payload is not
+followed.
 
 A pointer the callee **read out of** what it was handed is somebody else's address, and is the
 caller's to keep:
@@ -4424,7 +4464,9 @@ C programs already live by — **a pointer handed to a call is borrowed for the 
 **What a call with no body answers is asked the same way.** An `extern`'s answer is fresh — storage
 the library made, which is made of none of its arguments — unless its declaration says
 [`@answers(p)`](/reference/ffi/#answers-a-c-function-whose-answer-points-into-an-argument), and then
-it is made of what `p` was handed, as a sysl function's answer is made of what it hands back. So an
+it is made of what `p` was handed, as a sysl function's answer is made of what it hands back. An
+inline-assembly output is fresh the same way: the compiler does not read the instructions, so what
+they leave in a register is made of none of the operands handed in. So an
 `opendir` handle may be carried out of the frame that passed it a path on its stack, and a `strchr`
 answer into a local's bytes may not:
 

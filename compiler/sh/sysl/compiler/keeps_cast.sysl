@@ -1,6 +1,7 @@
 module sh.sysl.compiler
 
 import sysl.buf.{Buf, buf}
+import sysl.container.{Map, map}
 
 // **An address as an integer is only a number until a `ptr_cast` makes it a pointer again** -- the
 // half of the keeps-analysis (`keeps.sysl`) that says whether the integer image of a frame's own
@@ -17,22 +18,57 @@ import sysl.buf.{Buf, buf}
 //   of one;
 // - `l:<function>|<local>`, `a:<function>|<position>` -- a function's local and its parameter;
 // - `r:<function>` -- what a function answers;
+// - `p:<caller>|<offset>|<callee>|<position>` -- one call's answer, as made of its argument at that
+//   position;
 // - `^<function>` -- a `ptr_cast` from an integer in that function's body.
 //
-// An edge says an integer at one may be stored at the other. A call's answer is taken to be made of
-// every integer handed to it, which is more than most calls do, and a field, a pointee or an element
-// is one place for every value of its type: a refusal it leads to names the `ptr_cast` it found. An
+// An edge says an integer at one may be stored at the other, and a field, a pointee or an element is
+// one place for every value of its type: a refusal it leads to names the `ptr_cast` it found. An
 // integer place whose address is taken is joined to its type's pointee, since that address is how a
 // callee's `*dir = …` reaches it.
 //
-// Not followed: an integer handed through a function pointer, a call through an object, or an enum's
-// payload -- what those reach is the raw tier's bargain, as arithmetic on an address is.
+// **A call's answer is made of the arguments its callee answers, and of nothing else it is handed.**
+// Each call joins what it answers (`r:`) and, for each integer argument, a node of its own that the
+// search passes only where the callee's body answers that parameter -- worked out over the graph to
+// a fixed point, so recursion settles (`cast_settle`). An `extern` answers only what its `@answers`
+// names. A search that came into a body through a call does not leave it through the body's answer to
+// every caller: the call it came from carries that answer back, to that caller alone. **An inline
+// assembly output is a fresh number** -- what the instructions put in a register is not made of the
+// operands handed in -- so a system-call wrapper's answer is made of none of its arguments.
+//
+// Arithmetic makes a number: `n + 8`, `-n` and `n.wrapping_add(k)` are made of nothing followed,
+// as `usize(&local) + 8` is not the address -- that is the raw tier's bargain, and so is an integer
+// handed through a function pointer, a call through an object, or an enum's payload, none of which
+// is followed.
 
 // The program's integer moves, built when a frame's image is first seen leaving it, and again each
 // round, since a call's answers may still be growing.
 struct CastGraph
     edges: Buf[(string, string)]
+
+    // Whether each edge hands an argument to a callee's parameter, by the edge's position.
+    calls: Buf[bool]
     built: bool
+    building: bool
+
+    // The edges leaving each node, by position, for the edges indexed so far.
+    succ: Map[string, Buf[usize]]
+    indexed: usize
+
+    // Each call's argument node, and whether its callee answers that parameter (`<callee>|<j>`).
+    // Every body parameter some call asks about, once each.
+    sites: Map[string, CastSite]
+    answers: Map[string, bool]
+    asked: Buf[CastSite]
+    settled: bool
+end CastGraph
+
+struct CastSite
+    caller: string
+    callee: string
+    j: usize
+
+cast_graph_new() -> &CastGraph = CastGraph(buf(), buf(), false, false, map(), 0, map(), map(), buf(), false)
 
 private struct CastScan
     g: &CastGraph
@@ -44,45 +80,195 @@ private struct CastScan
 // an integer handed to a callee, since one the callee turns back while the caller's frame is still
 // there reaches nothing dead.
 cast_reach(cx: &KeepsCx, from: string, lasting: bool) -> Option[string]
-    val g = cast_graph(cx)
-    var seen: Buf[string] = buf()
-    var todo: Buf[(string, bool)] = buf()
+    var todo: Buf[(string, bool, bool)] = buf()
 
-    todo.push((from, !lasting))
+    todo.push((from, !lasting, false))
+    cast_search(cx, cast_graph(cx), todo)
+end cast_reach
+
+// The same for an integer `call` in `f` hands its callee at position `j`, asked of storage that
+// outlives the call: what the callee does with its parameter, and what the call's answer, made of
+// it, does in `f` afterwards -- this call's answer, not every caller's.
+cast_reach_arg(cx: &KeepsCx, f: TFunc, call: TExpr, name: string, j: usize) -> Option[string]
+    val g = cast_graph(cx)
+    val site = s"p:${f.name}|${call.span.start}|$name|$j"
+    var todo: Buf[(string, bool, bool)] = buf()
+
+    todo.push((s"a:$name|$j", false, true))
+
+    if g.sites.has(site) && cast_site_answers(cx, g, site) then todo.push((site, false, false))
+
+    cast_search(cx, g, todo)
+end cast_reach_arg
+
+private cast_search(cx: &KeepsCx, g: &CastGraph, todo: Buf[(string, bool, bool)]) -> Option[string]
+    var seen: Map[string, bool] = map()
+
+    // Each entry is where the search is, whether it has passed through lasting storage, and whether
+    // it came into the body it is in through a call and has stayed among that body's own locals since.
 
     while !todo.is_empty()
-        val (n, through) = todo.at(todo.len() - 1)
+        val (n, through, entered) = todo.at(todo.len() - 1)
 
         todo.truncate(todo.len() - 1)
 
         if n.starts_with("^") && through then return Some(n[1..<n.bytes.len])
 
-        val key = if through then s"+$n" else n
+        val key = s"${if through then "+" else "-"}${if entered then "#" else "-"}$n"
 
-        if holds_string(seen, key) then continue
+        if seen.has(key) then continue
 
-        seen.push(key)
+        seen.put(key, true)
 
-        for e in g.edges
-            if e.0 == n then todo.push((e.1, through || cast_lasting(e.1)))
+        val owner = cast_owner(g, n)
+
+        for i in cast_succ(g, n)
+            val m = g.edges.at(i).1
+
+            // The answer of a body the search came into through a call goes back through that call.
+            if entered && m == s"r:$owner" then continue
+            if m.starts_with("p:") && !cast_site_answers(cx, g, m) then continue
+
+            val inside = g.calls.at(i) || (entered && cast_owner(g, m) == owner)
+
+            todo.push((m, through || cast_lasting(m), inside))
     end while
 
     None
-end cast_reach
+end cast_search
 
 private cast_lasting(n: string) -> bool =
     n.starts_with("g:") || n.starts_with("f:") || n.starts_with("*") || n.starts_with("[")
+
+// The function whose own local, parameter or call a node is, and nothing for any other node.
+private cast_owner(g: &CastGraph, n: string) -> string
+    if n.starts_with("p:")
+        return g.sites.get(n) match
+            Some(s) -> s.caller
+            None -> ""
+    end if
+
+    if !n.starts_with("l:") && !n.starts_with("a:") then return ""
+
+    var k = n.bytes.len
+
+    while k > 2 && n.bytes[k - 1] != u8('|')
+        k -= 1
+
+    if k <= 2 then "" else n[2..<k - 1]
+end cast_owner
+
+// The edges leaving `n`, indexing any pushed since the last ask.
+private cast_succ(g: &CastGraph, n: string) -> Buf[usize]
+    while g.indexed < g.edges.len()
+        val from = g.edges.at(g.indexed).0
+
+        g.succ.get(from) match
+            Some(out) -> out.push(g.indexed)
+            None ->
+                var out: Buf[usize] = buf()
+
+                out.push(g.indexed)
+                g.succ.put(from, out)
+
+        g.indexed += 1
+    end while
+
+    g.succ.get(n).unwrap_or(buf())
+end cast_succ
+
+private cast_edge(g: &CastGraph, from: string, to: string, call: bool)
+    g.edges.push((from, to))
+    g.calls.push(call)
 
 private cast_graph(cx: &KeepsCx) -> &CastGraph
     if cx.casts.built then return cx.casts
 
     cx.casts.built = true
+    cx.casts.building = true
 
     for f in cx.funcs
         cast_func(cx, f)
 
+    cx.casts.building = false
     cx.casts
 end cast_graph
+
+// -- what a call answers --------------------------------------------------------------------------
+
+// Whether the call a site node stands for answers the argument it is made of.
+private cast_site_answers(cx: &KeepsCx, g: &CastGraph, node: string) -> bool = g.sites.get(node) match
+    Some(s) -> cast_answers(cx, g, s.callee, s.j)
+    None -> true
+
+private cast_answers(cx: &KeepsCx, g: &CastGraph, callee: string, j: usize) -> bool
+    if cx.find(callee).is_none() then return extern_answers(cx, callee, j).unwrap_or(true)
+
+    if !g.settled then cast_settle(cx, g)
+
+    g.answers.get(s"$callee|$j").unwrap_or(true)
+end cast_answers
+
+// **Which parameters each body answers, as a fixed point**: every one starts answered by nothing, and
+// a round turns on each whose parameter reaches the body's answer through the body's own locals and
+// the calls already known to answer what they are handed. A round that turns nothing on is the last.
+private cast_settle(cx: &KeepsCx, g: &CastGraph)
+    g.settled = true
+
+    loop
+        var grew = false
+
+        for s in g.asked
+            val key = s"${s.callee}|${s.j}"
+
+            if g.answers.get(key).unwrap_or(true) then continue
+
+            if cast_body_answers(cx, g, s.callee, s.j)
+                g.answers.put(key, true)
+                grew = true
+            end if
+
+        if !grew then break
+end cast_settle
+
+// Whether `f`'s parameter at `j` reaches its answer without leaving the body's own locals.
+private cast_body_answers(cx: &KeepsCx, g: &CastGraph, f: string, j: usize) -> bool
+    val answer = s"r:$f"
+    var seen: Map[string, bool] = map()
+    var todo: Buf[string] = buf()
+
+    todo.push(s"a:$f|$j")
+
+    while !todo.is_empty()
+        val n = todo.at(todo.len() - 1)
+
+        todo.truncate(todo.len() - 1)
+
+        if seen.has(n) then continue
+
+        seen.put(n, true)
+
+        for i in cast_succ(g, n)
+            val m = g.edges.at(i).1
+
+            if m == answer then return true
+            if cast_owner(g, m) != f then continue
+
+            if m.starts_with("p:")
+                val s = g.sites.get(m).unwrap()
+
+                if cx.find(s.callee).is_none()
+                    if !extern_answers(cx, s.callee, s.j).unwrap_or(true) then continue
+                else if !g.answers.get(s"${s.callee}|${s.j}").unwrap_or(false)
+                    continue
+                end if
+            end if
+
+            todo.push(m)
+    end while
+
+    false
+end cast_body_answers
 
 private cast_func(cx: &KeepsCx, f: TFunc)
     val sc: &CastScan = CastScan(cx.casts, cx, f)
@@ -107,10 +293,9 @@ private cast_expr(sc: &CastScan, e: TExpr)
     *e.kind match
         TCast(v, ty) -> if cast_to_pointer(ty) then cast_flow(sc, v, s"^${sc.f.name}")
         TStore(place, v, _, _) -> cast_store(sc, place, v)
-        TUpdate(place, _, v, _, _, _, _) ->cast_store(sc, place, v)
         TCall(name, args, _, _) ->
             for j in 0..<args.len()
-                cast_flow(sc, args.at(j), s"a:$name|$j")
+                cast_hand(sc, args.at(j), s"a:$name|$j")
         TAddrOf(place, _) -> if is_integer_type(texpr_type(place)) then cast_aliased(sc, place)
         TStructNew(_, args) ->
             val ty = texpr_type(e)
@@ -129,8 +314,8 @@ private cast_aliased(sc: &CastScan, place: TExpr)
 
     for k in cast_keys(sc, place)
         if k != node
-            sc.g.edges.push((k, node))
-            sc.g.edges.push((node, k))
+            cast_edge(sc.g, k, node, false)
+            cast_edge(sc.g, node, k, false)
         end if
 end cast_aliased
 
@@ -143,8 +328,16 @@ private cast_flow(sc: &CastScan, v: TExpr, to: string)
     if !is_integer_type(texpr_type(v)) then return
 
     for k in cast_keys(sc, v)
-        sc.g.edges.push((k, to))
+        cast_edge(sc.g, k, to, false)
 end cast_flow
+
+// An argument handed to a callee's parameter: the edge a search follows into the callee's body.
+private cast_hand(sc: &CastScan, v: TExpr, to: string)
+    if !is_integer_type(texpr_type(v)) then return
+
+    for k in cast_keys(sc, v)
+        cast_edge(sc.g, k, to, true)
+end cast_hand
 
 private cast_to_pointer(ty: Type) -> bool = underlying(ty) match
     Ptr(_) -> true
@@ -152,7 +345,7 @@ private cast_to_pointer(ty: Type) -> bool = underlying(ty) match
 
 // Where an integer value may have been read from.
 cast_keys_of(cx: &KeepsCx, f: TFunc, e: TExpr) -> Buf[string]
-    val sc: &CastScan = CastScan(cx.casts, cx, f)
+    val sc: &CastScan = CastScan(cast_graph(cx), cx, f)
 
     cast_keys(sc, e)
 end cast_keys_of
@@ -181,20 +374,40 @@ private cast_keys_into(sc: &CastScan, e: TExpr, out: *Buf[string])
             if is_array_type(texpr_type(r)) then cast_keys_into(sc, r, out) else out.push(s"[${type_show(ty)}")
         TCast(v, _) -> cast_keys_into(sc, v, out)
         TFloorCast(v, _) -> cast_keys_into(sc, v, out)
-        TUnary(_, v, _) -> cast_keys_into(sc, v, out)
-        TIntOp(_, v, amount, _, _) ->
-            cast_keys_into(sc, v, out)
-
-            if amount.is_some() then cast_keys_into(sc, amount.unwrap(), out)
-        TBinary(_, l, r, _) ->
-            cast_keys_into(sc, l, out)
-            cast_keys_into(sc, r, out)
         TStore(_, v, _, _) -> cast_keys_into(sc, v, out)
         TCall(name, args, _, _) ->
             out.push(s"r:$name")
 
-            for a in args
-                if is_integer_type(texpr_type(a)) then cast_keys_into(sc, a, out)
+            for j in 0..<args.len()
+                val a = args.at(j)
+
+                if !is_integer_type(texpr_type(a)) then continue
+
+                val node = s"p:${sc.f.name}|${e.span.start}|$name|$j"
+
+                if sc.g.building
+                    if !sc.g.sites.has(node)
+                        val site = CastSite(sc.f.name, name, j)
+                        val key = s"$name|$j"
+
+                        sc.g.sites.put(node, site)
+
+                        if sc.cx.find(name).is_some() && !sc.g.answers.has(key)
+                            sc.g.answers.put(key, false)
+                            sc.g.asked.push(site)
+                        end if
+                    end if
+
+                    for k in cast_keys(sc, a)
+                        cast_edge(sc.g, k, node, false)
+
+                    out.push(node)
+                else if sc.g.sites.has(node)
+                    out.push(node)
+                else
+                    // A call the graph was built without: what it was handed, as every call once was.
+                    cast_keys_into(sc, a, out)
+                end if
         TSeq(exprs) -> if !exprs.is_empty() then cast_keys_into(sc, exprs.at(exprs.len() - 1), out)
         TBlockExpr(b) -> cast_block_keys(sc, b, out)
         TIf(_, then_block, else_block, _) ->

@@ -143,7 +143,7 @@ check_keeps(a: &Analysis, funcs: Buf[TFunc], vtables: Buf[TVtable])
         if !index.has(funcs.at(i).name) then index.put(funcs.at(i).name, i)
 
     val cx: &KeepsCx = KeepsCx(a, funcs, index, map(), map(), map(), buf(), buf(), false, map(), map(),
-                               buf(), map(), buf(), map(), map(), vtables, CastGraph(buf(), false), map())
+                               buf(), map(), buf(), map(), map(), vtables, cast_graph_new(), map())
 
     for i in 0..<a.tables.extern_vars.len()
         cx.c_vars.push(extern_var_symbol(a.tables.extern_vars.at(i)))
@@ -187,7 +187,7 @@ check_keeps(a: &Analysis, funcs: Buf[TFunc], vtables: Buf[TVtable])
 
     loop
         faults = KeepFaults(buf())
-        cx.casts = CastGraph(buf(), false)
+        cx.casts = cast_graph_new()
 
         warm_callees_first(cx)
 
@@ -965,10 +965,10 @@ private kept_hard(evs: &EvBuf, how: string, at: Span) = evs.items.push(FlowEv(fa
 // **An address as an integer handed to a callee is kept only where the callee may put it in storage
 // that outlives the call and a `ptr_cast` may turn it back from there** (`image_passed` for a
 // frame's own). Whether the argument was one is the answer; one the cast cannot reach is a number.
-private image_kept(t: &Track, evs: &EvBuf, name: string, j: usize, arg: TExpr) -> bool
+private image_kept(t: &Track, evs: &EvBuf, call: TExpr, name: string, j: usize, arg: TExpr) -> bool
     if t.promised || !is_integer_type(texpr_type(arg)) || !carries(t, arg) then return false
 
-    cast_reach(t.cx, s"a:$name|$j", true) match
+    cast_reach_arg(t.cx, t.func, call, name, j) match
         Some(turned) ->
             kept_hard(evs, s"it is passed as an integer to '${shown_name(t.cx.an, name)}', which may store " +
                 s"it where '${shown_name(t.cx.an, turned)}' turns it back into a pointer with 'ptr_cast'",
@@ -1001,7 +1001,7 @@ private kept_at(t: &Track, evs: &EvBuf, e: TExpr)
             join_clear(t.hs, evs, name, args, e.span)
 
             for j in 0..<args.len()
-                if image_kept(t, evs, name, j, args.at(j)) then continue
+                if image_kept(t, evs, e, name, j, args.at(j)) then continue
                 if !hands_on(t, args.at(j)) then continue
 
                 val how = s"it is passed to '${shown_name(t.cx.an, name)}', which keeps it"
@@ -1856,7 +1856,7 @@ private call_at(ft: &FrameTrack, evs: &EvBuf, e: TExpr)
                 val arg = args.at(j)
 
                 if is_integer_type(texpr_type(arg))
-                    image_passed(ft, name, j, arg)
+                    image_passed(ft, e, name, j, arg)
                     continue
                 end if
 
@@ -1954,12 +1954,12 @@ end call_at
 // **An address as an integer handed to a callee** is refused only where the callee may put it in
 // storage that outlives the call and something turns it back into a pointer from there; one the
 // callee turns back while it runs reaches a frame that is still there.
-private image_passed(ft: &FrameTrack, name: string, j: usize, arg: TExpr)
+private image_passed(ft: &FrameTrack, call: TExpr, name: string, j: usize, arg: TExpr)
     val core = frame_core(ft, arg)
 
     if core.is_none() then return
 
-    val cast = cast_reach(ft.cx, s"a:$name|$j", true)
+    val cast = cast_reach_arg(ft.cx, ft.func, call, name, j)
 
     if cast.is_none() then return
 
