@@ -1093,16 +1093,32 @@ is_integer_type(t: Type) -> bool = underlying(t) match
 // -- what an extern's answer may be made of ----------------------------------------------------------------
 
 // Whether a call's answer may be made of its argument at `k`: a body's own answer where there is one,
-// and for an `extern` a pointer argument whose storage could hold what the answer points at -- the
-// same type, or one with a field or element of that type, with bytes standing for any bytes (which
-// is `strchr`'s family). An out-parameter `*i32` cannot be where a `*Code` points, and a context
-// handed over as bytes is not where a library's new object is, so the answer of a C function that
-// takes either is not made of it.
+// and for an `extern` exactly the parameters its `@answers(...)` names -- `strchr`'s answer points
+// into the string it is handed, and `opendir`'s is storage the library made, as is every answer
+// the declaration does not say otherwise of (`extern_answers`).
+//
+// A callee that is neither -- no body in sight and no declaration that says -- may be made of a
+// pointer argument whose storage could hold what the answer points at: the same type, or one with a
+// field or element of that type, with bytes standing for any bytes.
 answers_arg(cx: &KeepsCx, name: string, args: Buf[TExpr], k: usize, ty: Type, raw: bool) -> bool
-    if cx.find(name).is_none() then return extern_may_derive(ty, texpr_type(args.at(k)))
+    if cx.find(name).is_none()
+        val said = extern_answers(cx, name, k)
+
+        if said.is_some() then return said.unwrap()
+
+        return extern_may_derive(ty, texpr_type(args.at(k)))
+    end if
 
     if raw then raw_answers_of(cx, name, k) else answers_of(cx, name, k)
 end answers_arg
+
+// **An `extern`'s answer is fresh unless its declaration says `@answers(p)`**, the same default C
+// gives a parameter (`@keeps`): what a C function hands back is storage it made, or storage the caller
+// can name the parameter of. `None` where `name` is not an `extern`.
+extern_answers(cx: &KeepsCx, name: string, k: usize) -> Option[bool] =
+    cx.an.tables.externs.get(name) match
+        Some(d) -> Some(k < d.params.len() && holds_string(d.answers, d.params.at(k).name))
+        None -> None
 
 private extern_may_derive(answer: Type, arg: Type) -> bool
     val a = ptr_pointee(answer)
