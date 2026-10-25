@@ -765,6 +765,9 @@ struct Track
 
     hs: &Handles
 
+    // The body walked, whose integers `keeps_cast.sysl` follows to a `ptr_cast`.
+    func: TFunc
+
     holds(self, name: string) -> bool = holds_string(self.held, name)
 end Track
 
@@ -773,7 +776,7 @@ end Track
 private track(cx: &KeepsCx, f: TFunc, i: usize, raw: bool) -> &Track
     val org = origins_of(cx, f)
     val t: &Track = Track(cx, func_home(cx.an, f.name), buf(), buf(), false, not_kept(), org, raw, false,
-                          handles_of(org, f))
+                          handles_of(org, f), f)
 
     if i < f.params.len() then t.held.push(f.params.at(i).0)
 
@@ -954,6 +957,22 @@ private keep(t: &Track, how: string, at: Span)
 
 private kept_hard(evs: &EvBuf, how: string, at: Span) = evs.items.push(FlowEv(false, "", how, at))
 
+// **An address as an integer handed to a callee is kept only where the callee may put it in storage
+// that outlives the call and a `ptr_cast` may turn it back from there** (`image_passed` for a
+// frame's own). Whether the argument was one is the answer; one the cast cannot reach is a number.
+private image_kept(t: &Track, evs: &EvBuf, name: string, j: usize, arg: TExpr) -> bool
+    if t.promised || !is_integer_type(texpr_type(arg)) || !carries(t, arg) then return false
+
+    cast_reach(t.cx, s"a:$name|$j", true) match
+        Some(turned) ->
+            kept_hard(evs, s"it is passed as an integer to '${shown_name(t.cx.an, name)}', which may store " +
+                s"it where '${shown_name(t.cx.an, turned)}' turns it back into a pointer with 'ptr_cast'",
+                arg.span)
+        None -> ()
+
+    true
+end image_kept
+
 // Where a body lets what it tracks go: a store outside its own locals, a buffer's slot, an atomic
 // store, and an argument the callee keeps -- at each location the callee may hold it, said in this
 // body's terms. One the callee holds in what this frame's own local points at binds that local
@@ -977,6 +996,7 @@ private kept_at(t: &Track, evs: &EvBuf, e: TExpr)
             join_clear(t.hs, evs, name, args, e.span)
 
             for j in 0..<args.len()
+                if image_kept(t, evs, name, j, args.at(j)) then continue
                 if !hands_on(t, args.at(j)) then continue
 
                 val how = s"it is passed to '${shown_name(t.cx.an, name)}', which keeps it"
@@ -1033,12 +1053,26 @@ private stored(t: &Track, evs: &EvBuf, place: TExpr, v: TExpr)
         return
     end if
 
-    // **An address stored as an integer is held where the integer is**, as the pointer would be: one
-    // stored in the storage it points into ends with that storage, and one stored anywhere the call
-    // does not own is kept.
-    if carries(t, v)
-        evs.items.push(FlowEv(false, loc, s"it is stored in '${place_said(t.scope, place)}'", v.span))
+    if !carries(t, v) then return
+
+    // **An address stored as an integer is a number until a `ptr_cast` may turn it back into a
+    // pointer**, as a frame's own is (`frame_stored`). One that can be is held where the integer is,
+    // as the pointer would be: one stored in the storage it points into ends with that storage, and
+    // one stored anywhere the call does not own is kept.
+    var back = ""
+
+    if is_integer_type(texpr_type(v))
+        var turned = ""
+
+        for k in cast_keys_of(t.cx, t.func, place)
+            if turned == "" then turned = cast_reach(t.cx, k, false).unwrap_or("")
+
+        if turned == "" then return
+
+        back = s", which '${shown_name(t.cx.an, turned)}' turns back into a pointer with 'ptr_cast'"
     end if
+
+    evs.items.push(FlowEv(false, loc, s"it is stored in '${place_said(t.scope, place)}'$back", v.span))
 end stored
 
 // A place as the reader wrote it, rebuilt from the tree: module storage by its name, a field after
@@ -1328,9 +1362,9 @@ private into_pointee(t: &Track, place: TExpr) -> bool = *place.kind match
 private address_of_it(v: TExpr) -> bool = !is_integer_type(texpr_type(v))
 
 // Whether an argument hands what is tracked to the callee's keeps. **An integer parameter is not
-// asked what it keeps**: a number a callee stores is how nearly every integer is used, so a
-// parameter's address handed on as one is the raw tier's, and a frame's own is followed to a
-// `ptr_cast` instead (`image_passed`, `keeps_cast.sysl`).
+// asked what it keeps**: a number a callee stores is how nearly every integer is used, so an address
+// handed on as one is followed to a `ptr_cast` instead (`image_kept`, `image_passed`,
+// `keeps_cast.sysl`).
 private hands_on(t: &Track, arg: TExpr) -> bool = !is_integer_type(texpr_type(arg)) && carries(t, arg)
 
 // Whether a value built around what is tracked can hold it: a struct with no pointer inside, built of
