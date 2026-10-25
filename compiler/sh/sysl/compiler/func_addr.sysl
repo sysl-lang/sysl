@@ -178,8 +178,34 @@ end crosses_whole
 // **Nothing where the operand is not a member read off a type's name**, which leaves every other
 // `&a.b` -- a field of a value, a variant, a property -- to the reading it always had, and that
 // reading's refusals.
+//
+// **`&T.f[U]` says which copy of a generic member is meant**, the way `&f[U]` does for a module
+// function. Brackets over a member read are indexing as well, so the form is taken only where the
+// member turns out to have type parameters of its own, and every other `&a.b[i]` keeps its reading.
 associated_address(cx: &Analyzer, span: Span, operand: Expr,
                    expected: Option[Type]) -> Option[TExpr]
+    *operand.kind match
+        Index(head, one, _) ->
+            if is_member_read(head)
+                var written: Buf[Expr] = buf()
+
+                written.push(one)
+                return associated_address_at(cx, span, head, written, true, expected)
+            end if
+            return None
+        TypeArgs(head, inner, _) ->
+            if is_member_read(head) then return associated_address_at(cx, span, head, inner, true, expected)
+
+            return None
+        _ -> associated_address_at(cx, span, operand, buf(), false, expected)
+end associated_address
+
+private is_member_read(e: Expr) -> bool = *e.kind match
+    Field(_, _, _) -> true
+    _ -> false
+
+private associated_address_at(cx: &Analyzer, span: Span, operand: Expr, targ_exprs: Buf[Expr],
+                              bracketed: bool, expected: Option[Type]) -> Option[TExpr]
     val (receiver, name) = *operand.kind match
         Field(r, n, _) -> (r, n)
         _ -> return None
@@ -281,11 +307,10 @@ associated_address(cx: &Analyzer, span: Span, operand: Expr,
 
     val generic = cx.an.tables.members.generic.get(member_key_of(found.0, picked))
 
-    if generic.is_some() && generic.unwrap().tparams.len() > found.1.len() then
-        return Some(cx.err(span, s"'$name' has type parameters of its own, so '&$shown.$name' does " +
-                           "not say which copy of it is meant — and an address has no arguments " +
-                           "to settle them. A module function calling it at the types meant is " +
-                           "what has an address"))
+    val own_params = generic.is_some() && generic.unwrap().tparams.len() > found.1.len()
+
+    // Brackets after a member with none of its own are an index into whatever it is.
+    if bracketed && !own_params then return None
 
     if decl.variadic then
         return Some(cx.err(span, s"'$shown.$name' is variadic, and a '*extern' fixes the arguments " +
@@ -298,7 +323,12 @@ associated_address(cx: &Analyzer, span: Span, operand: Expr,
 
     if cx.an.complaints() != before then return Some(bad_expr(span))
 
-    val fname = member_func_name(cx, span, ty, picked)
+    var fname = ""
+
+    if own_params
+        fname = generic_member_instance(cx, span, shown, name, decl, generic.unwrap(), found, ty,
+                                        targ_exprs, expected)
+    else fname = member_func_name(cx, span, ty, picked)
 
     if fname == "" then return Some(bad_expr(span))
 
@@ -319,7 +349,124 @@ associated_address(cx: &Analyzer, span: Span, operand: Expr,
     cx.an.uses(fname)
 
     Some(TExpr(span, TFuncAddr(fname, fname, CFn(ptypes, ret))))
-end associated_address
+end associated_address_at
+
+// Which copy of a member with type parameters of its own an address names: the lowered function's
+// name, or nothing where it was refused.
+//
+// The type's arguments are the subject's, as they are for a call. The member's own are the written
+// ones outright, or else what the type the context wants settles by the signature as declared --
+// the two readings `&f[U]` and `&f` give a module function, with the same refusals.
+private generic_member_instance(cx: &Analyzer, span: Span, shown: string, name: string,
+                                m: MethodDecl, fd: FuncDecl, found: (string, Buf[Type]), ty: Type,
+                                targ_exprs: Buf[Expr], expected: Option[Type]) -> string
+    val home = instantiation_scope(cx, fd.name)
+    val mine = authored_tparams(m.tparams)
+    val written = s"$shown.$name"
+    val owner_args = found.1
+    var seed: Buf[Binding] = buf()
+
+    for i in 0..<owner_args.len()
+        if i < fd.tparams.len() then seed.push(Binding(fd.tparams.at(i), owner_args.at(i)))
+
+    // What `Self` is at those arguments, for a default body copied out of a trait.
+    val generic_self = cx.an.tables.members.generic_self.get(fd.name)
+
+    if generic_self.is_some() && bound_type(seed, "Self").is_none()
+        val at = cx.an.tables.members.generic_scope.get(fd.name).unwrap_or(home)
+
+        seed.push(Binding("Self", resolve_type(cx.an, at, generic_self.unwrap(), seed)))
+    end if
+
+    var own: Buf[Type] = buf()
+
+    if !targ_exprs.is_empty()
+        // A bare arrow's parameter has no written form, as it has none at a module function.
+        if mine.len() != m.tparams.len()
+            cx.fault(span, s"'$written' takes a bare arrow, so it is generic in the callable's own " +
+                     "type — and an address has no arguments to read that from, nor any way to " +
+                     "write it. Declare the parameter as a counted callable, '&Fn(…) -> …', to " +
+                     "give it a type that can be named")
+            return ""
+        end if
+
+        if mine.len() != targ_exprs.len()
+            val were = if targ_exprs.len() == 1 then "was" else "were"
+
+            cx.fault(span, s"'$written' takes ${quantity(mine.len(), "type argument")} " +
+                     s"(${quoted_names(mine)}), and ${targ_exprs.len()} $were written")
+            return ""
+        end if
+
+        for targ_expr in targ_exprs
+            own.push(address_type_arg(cx, targ_expr))
+    else
+        val want = if expected.is_none() then None else cfn_of(expected.unwrap())
+
+        if want.is_none()
+            cx.fault(span, s"'$name' has type parameters of its own, so '&$written' does not say " +
+                     "which copy of it is meant — write them, as " +
+                     s"'&$written[${joined(mine, ", ")}]', or write the type this is stored in, " +
+                     s"as 'var f: *extern(…) -> … = &$written'")
+            return ""
+        end if
+
+        val ps = want.unwrap().0
+
+        if ps.len() != fd.params.len()
+            cx.fault(span, s"'$written' takes ${quantity(fd.params.len(), "parameter")}, and the " +
+                     s"${type_show(expected.unwrap())} wanted here takes ${ps.len()}")
+            return ""
+        end if
+
+        var sub: Buf[Binding] = buf()
+
+        for item in seed
+            sub.push(item)
+
+        val covered = enter_signature(cx.an, fd.needs)
+
+        for i in 0..<fd.params.len()
+            unify(cx.an, home, fd.params.at(i).typ, ps.at(i), fd.tparams, &sub)
+
+        if fd.ret_type.is_some() then
+            unify(cx.an, home, fd.ret_type.unwrap(), want.unwrap().1, fd.tparams, &sub)
+
+        leave_reaching(cx.an, covered)
+
+        var unsolved: Buf[string] = buf()
+
+        for tparam in m.tparams
+            val got = bound_type(sub, tparam)
+
+            if got.is_none() then unsolved.push(s"'$tparam'")
+            else own.push(got.unwrap())
+
+        if !unsolved.is_empty()
+            cx.fault(span, s"'$written' has type parameters of its own, and the " +
+                     s"${type_show(expected.unwrap())} wanted here does not say what " +
+                     s"${joined(unsolved, " or ")} should be — a type parameter the signature " +
+                     "does not mention cannot be settled by the type of the address. Write it: " +
+                     s"'&$written[${joined(mine, ", ")}]'")
+            return ""
+        end if
+    end if
+
+    if !check_param_bounds(cx.an, home, span, fd.name, m.tparams, m.bounds, own, seed,
+                           "type parameter", cx.scope) then return ""
+
+    if !stand_ins_hold(cx.an, home, cx.scope, span, fd.name, fd, m.tparams, own) then return ""
+
+    var targs: Buf[Type] = buf()
+
+    for item in owner_args
+        targs.push(item)
+
+    for item in own
+        targs.push(item)
+
+    asked(cx, span, instantiate_func(cx.an, home, fd, targs, viewed_const(ty, found.0)))
+end generic_member_instance
 
 // Which of the members filed under one name an address is of -- a type's own overloads, or the
 // members several traits gave it -- chosen as a module function's overload is: by the parameter

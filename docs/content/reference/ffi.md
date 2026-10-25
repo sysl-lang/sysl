@@ -2120,8 +2120,47 @@ print(1)
 'Shape' is a trait, and '&Shape.area' would be the address of whichever 'area' a value's type implements
 ```
 
-**A member with type parameters of its own** has no address either: nothing in an address settles
-them, and a module function calling it at the types meant is what has one.
+**A member with type parameters of its own** is addressed at the arguments written, as a module
+function is: `&Sq.pick[int]`, and `&Box[int].mix[bool]` for a generic type's generic member. Where
+nothing is written, the type the address is wanted at settles them from the member's signature, as
+it does for `&pick`; the form is taken only where the member has parameters of its own, so
+`&p.xs[1]` stays an element's address. The instantiation is judged as any address is: its bounds,
+and whether its signature crosses as itself.
+
+```sysl
+struct Sq
+    s: int
+
+impl Sq
+    pick[U](u: U) -> U = u
+
+val a = &Sq.pick[int]
+val b: *extern(bool) -> bool = &Sq.pick
+
+print(a(7), b(true))
+```
+
+```output
+7 true
+```
+
+With neither, the address is refused in the written form:
+
+```sysl
+struct Sq
+    s: int
+
+impl Sq
+    pick[U](u: U) -> U = u
+
+val d = &Sq.pick
+
+print(1)
+```
+
+```error
+'pick' has type parameters of its own, so '&Sq.pick' does not say which copy of it is meant — write them, as '&Sq.pick[U]'
+```
 
 ### What has no address, and why
 
