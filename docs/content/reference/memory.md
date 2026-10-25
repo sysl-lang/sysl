@@ -459,12 +459,14 @@ that is `@export`ed, `async`, `@scoped` or carries a contract keeps the borrowed
 throughout. A library and the program built against it read the same bodies, so they agree on which
 parameters are owned.
 
-**Behaviour change in 0.6.0: a value handed to a parameter at its last use may be released
-sooner.** The callee now holds the count, so where it does not keep the value after all (on some
-path), it gives the count back as it returns rather than when the caller's scope ends; and a local
-whose life ends in an `if` with an `else` is handed into each arm and given back at the end of the
-arm that does not use it. A count never reaches zero while anything can still read the value, but a
-destructor that prints shows the difference:
+**A value whose release can run a destructor is destroyed where its scope ends**, exactly as before
+owned parameters existed. A local of a `Drop` type, or of anything holding one in a field, an element
+or a payload, is not handed to an owned parameter at its last use: the call might keep it only in its
+result, which goes at the end of the statement, while a view of what the value owns — a slice made
+through `ptr_cast` of storage a C library frees in the destructor — is still being read. Such a local
+is retained for the call instead, given back at its scope's end, and never handed into the arms of
+an `if`. Only a value nothing observable is released with — no destructor anywhere inside it — goes
+at its last use, which no program can tell apart:
 
 ```sysl
 struct Tag
@@ -489,13 +491,14 @@ show()
 
 ```output
 label 1
-drop 1
 end of show
+drop 1
 ```
 
-`t` is at its last use in `label(t)`, so the label the call returns holds the only count, and the tag
-goes when that temporary does, at the end of the statement — not at the end of `show`, where it would
-go if `t` were read again later.
+`t` is at its last use in `label(t)`, and `label` keeps it in the label it returns, which goes at the
+end of the statement. The tag still goes at the end of `show`, because `t` holds its own count to
+there. A value moved somewhere that lasts — bound to a `val`, stored in a field or a global, returned
+— is destroyed by its new owner.
 
 ### A count that would be taken and given straight back is not taken
 
@@ -527,7 +530,8 @@ the give-back is never emitted. A struct or enum built on the spot is handed ove
 `Some(Node(n))` and `Pair(x, 1)` at `x`'s last use cost no count at all. A local still read later,
 named in a `defer`, used inside a loop it was declared outside of, or reached through an address or a
 `ref` is copied as before. One whose life ends in an `if` with an `else` is handed into each arm, so
-an arm that uses it last moves it and the others give it back where they end (see
+an arm that uses it last moves it and the others give it back where they end — unless its release
+can run a destructor, which keeps it to its scope's end (see
 [owned parameters](#a-parameter-the-function-keeps-arrives-with-its-count)).
 
 ```sysl
