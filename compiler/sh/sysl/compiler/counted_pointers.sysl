@@ -1,0 +1,769 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.Span
+import sysl.buf.{Buf, buf}
+
+// A `*T` into counted storage, used after that storage could have moved or been let go of.
+//
+// **A `ref` standing on an element holds the storage still for as long as it is in scope**
+// (`place.sysl`'s `check_ref_call`), and `&b[i]` is the same address under another spelling: a
+// `@relocates` member, a `*self` call that may write the receiver, an assignment that replaces the
+// owner and the end of the block the owner was declared in can each leave it pointing at freed
+// memory (`reference/memory.md § The one rule: what may move underneath it`). A pointer is held to
+// the rule for as long as it is **live** rather than for as long as it is in scope, since a `*T`
+// has no scope of its own to speak of: it is live from the `&` to the last use of it or of anything
+// made from it -- a copy into another local, an offset from it, a branch that yields it.
+//
+// **Only what one body can see is followed.** The address is taken in this body, the storage is
+// reached by the path written after the `&`, and the call or assignment that moves it is written on
+// that same path. A second name for the owner -- a `Buf` copied, a function handed it -- may still
+// move the storage, and a pointer stored into a field, an element or an aggregate is no longer
+// followed. Those are the documented limits of a local check, the same ones a `ref` has.
+//
+// **The check follows every path**, as `consumes.sysl`'s does: a body is walked in the order it
+// runs, carrying which pointers each local may hold and which of those may since have been
+// stranded. A branch that stranded one on one side only leaves it stranded after the join, and a
+// loop is walked until what reaches its head stops changing, so a use on a later turn counts.
+
+// One `&place` whose path goes through storage that can move or be let go of: where it was written,
+// the steps a `@relocates` or `*self` call on which strands it (`hazards`), and the places whose
+// overwriting or release strands it (`strands`).
+struct PtrAddr
+    span: Span
+    hazards: Buf[string]
+    strands: Buf[string]
+end PtrAddr
+
+// Something that can strand a pointer: a call on a receiver (`kind` 0 for a `@relocates` member,
+// 1 for a `*self` one), an assignment (2), or the end of the block a local was declared in (3).
+// `key` is the place it acts on, spelled as `place_key` spells it.
+struct PtrMove
+    span: Span
+    kind: int
+    member: string
+    key: string
+end PtrMove
+
+// What may be true at one point of a body. A pointer is a number standing for the `&` that made it:
+// twice the index of its `PtrAddr`, or that plus one for an earlier turn's pointer from the same `&`
+// that some local still holds once the `&` has run again. **A state is never changed once made.**
+private struct PtrFlow
+    dead: bool
+    held: Buf[(string, Buf[usize])]
+    gone: Buf[(usize, PtrMove)]
+end PtrFlow
+
+private struct PtrLoop
+    breaks: PtrFlow
+    conts: PtrFlow
+    scopes: usize
+end PtrLoop
+
+private struct PtrWalk
+    addrs: Buf[PtrAddr]
+    moves: Buf[PtrMove]
+    loops: Buf[&PtrLoop]
+    scopes: Buf[Buf[string]]
+    told: Buf[Span]
+    cx: &Analyzer
+end PtrWalk
+
+// What an expression comes to: the state after it, and the pointers its value may be, each with the
+// local it was read through.
+private struct PtrVal
+    flow: PtrFlow
+    facts: Buf[(usize, string)]
+end PtrVal
+
+// Every use of a stranded pointer in one body, refused once each.
+check_counted_pointers(cx: &Analyzer, block: TBlock)
+    if cx.ptr_addrs.is_empty() then return
+
+    val w: &PtrWalk = PtrWalk(cx.ptr_addrs, cx.ptr_moves, buf(), buf(), buf(), cx)
+
+    seq_flow(w, block.stmts, block.result, live_flow())
+end check_counted_pointers
+
+// -- states -----------------------------------------------------------------------------------------
+
+private live_flow() -> PtrFlow = PtrFlow(false, buf(), buf())
+
+private dead_flow() -> PtrFlow = PtrFlow(true, buf(), buf())
+
+private just(f: PtrFlow) -> PtrVal = PtrVal(f, buf())
+
+private held_of(f: PtrFlow, unique: string) -> Buf[usize]
+    for item in f.held
+        if item.0 == unique then return item.1
+
+    buf()
+end held_of
+
+private gone_of(f: PtrFlow, fact: usize) -> Option[PtrMove]
+    for item in f.gone
+        if item.0 == fact then return Some(item.1)
+
+    None
+end gone_of
+
+private has_fact(xs: Buf[usize], x: usize) -> bool
+    for item in xs
+        if item == x then return true
+
+    false
+end has_fact
+
+private join_flow(a: PtrFlow, b: PtrFlow) -> PtrFlow
+    if a.dead then return b
+    if b.dead then return a
+
+    var held: Buf[(string, Buf[usize])] = buf()
+
+    for item in a.held
+        var facts = item.1.copy()
+
+        for x in held_of(b, item.0)
+            if !has_fact(facts, x) then facts.push(x)
+
+        held.push((item.0, facts))
+
+    for item in b.held
+        if held_of(a, item.0).is_empty() then held.push(item)
+
+    var gone = a.gone.copy()
+
+    for item in b.gone
+        if gone_of(a, item.0).is_none() then gone.push(item)
+
+    PtrFlow(false, held, gone)
+end join_flow
+
+private same_flow(a: PtrFlow, b: PtrFlow) -> bool
+    if a.dead != b.dead || a.gone.len() != b.gone.len() then return false
+
+    for item in a.gone
+        if gone_of(b, item.0).is_none() then return false
+
+    for item in a.held
+        val other = held_of(b, item.0)
+
+        if other.len() != item.1.len() then return false
+
+        for x in item.1
+            if !has_fact(other, x) then return false
+
+    for item in b.held
+        if held_of(a, item.0).len() != item.1.len() then return false
+
+    true
+end same_flow
+
+// A local given a new value holds exactly the pointers that value may be.
+private set_held(f: PtrFlow, unique: string, facts: Buf[(usize, string)]) -> PtrFlow
+    if f.dead then return f
+
+    var held: Buf[(string, Buf[usize])] = buf()
+
+    for item in f.held
+        if item.0 != unique then held.push(item)
+
+    var mine: Buf[usize] = buf()
+
+    for item in facts
+        if !has_fact(mine, item.0) then mine.push(item.0)
+
+    if !mine.is_empty() then held.push((unique, mine))
+
+    PtrFlow(false, held, f.gone)
+end set_held
+
+// The `&` numbered `i` runs again: what it answers now is a fresh pointer, and a local still holding
+// the one it answered before holds that earlier pointer, stranded or not.
+private refresh(f: PtrFlow, i: usize) -> PtrFlow
+    if f.dead then return f
+
+    val fresh = 2 * i
+    val old = fresh + 1
+    var held: Buf[(string, Buf[usize])] = buf()
+    var kept = false
+
+    for item in f.held
+        if has_fact(item.1, fresh)
+            var facts: Buf[usize] = buf()
+
+            for x in item.1
+                val y = if x == fresh then old else x
+
+                if !has_fact(facts, y) then facts.push(y)
+
+            held.push((item.0, facts))
+            kept = true
+        else
+            held.push(item)
+        end if
+
+    var gone: Buf[(usize, PtrMove)] = buf()
+    val was = gone_of(f, fresh)
+
+    for item in f.gone
+        if item.0 != fresh then gone.push(item)
+
+    if kept && was.is_some() && gone_of(f, old).is_none() then gone.push((old, was.unwrap()))
+
+    PtrFlow(false, held, gone)
+end refresh
+
+// Strands every pointer a local may hold that the move reaches.
+private apply_move(w: &PtrWalk, f: PtrFlow, m: PtrMove) -> PtrFlow
+    if f.dead then return f
+
+    var gone = f.gone.copy()
+    var changed = false
+
+    for item in f.held
+        for x in item.1
+            if gone_of(f, x).is_none() && !has_fact_gone(gone, x) && strands(w.addrs.at(x / 2), m)
+                gone.push((x, m))
+                changed = true
+            end if
+
+    if !changed then return f
+
+    PtrFlow(false, f.held, gone)
+end apply_move
+
+private has_fact_gone(gone: Buf[(usize, PtrMove)], x: usize) -> bool
+    for item in gone
+        if item.0 == x then return true
+
+    false
+end has_fact_gone
+
+// Whether the move reaches the storage an `&` pointed into. A call on a receiver moves what lies in
+// it, so a step at or inside the receiver is reached; an assignment and a release reach only what
+// replacing that one place lets go of.
+private strands(a: PtrAddr, m: PtrMove) -> bool
+    if m.kind <= 1
+        val inside = s"${m.key}/"
+
+        for h in a.hazards
+            if h == m.key || h.starts_with(inside) then return true
+
+        return false
+    end if
+
+    for s in a.strands
+        if s == m.key then return true
+
+    false
+end strands
+
+// -- uses -------------------------------------------------------------------------------------------
+
+// The value's pointers are read here rather than carried on: any that may be stranded is refused.
+private use_facts(w: &PtrWalk, at: Span, facts: Buf[(usize, string)], f: PtrFlow)
+    if f.dead then return
+
+    for item in facts
+        val g = gone_of(f, item.0)
+
+        if g.is_some() then tell(w, at, item.1, g.unwrap())
+end use_facts
+
+private tell(w: &PtrWalk, at: Span, via: string, m: PtrMove)
+    val where = if m.kind == 3 then at else m.span
+
+    for s in w.told
+        if s.start == where.start && s.end == where.end then return
+
+    w.told.push(where)
+
+    val name = if via == "" then "this pointer" else s"'${shown_local(via)}'"
+
+    m.kind match
+        0 -> w.cx.fault(where, s"$name is a pointer to an element whose storage '${m.member}' could " +
+                        "move or give up, since it is '@relocates', and it is used after this call " +
+                        "— so it could be left pointing at freed memory. Make the call before taking " +
+                        "the address, or after the pointer's last use")
+        1 -> w.cx.fault(where, s"$name is a pointer into storage this call could release, since a " +
+                        "'*self' method may write its receiver, and it is used after this call — so " +
+                        "it could be left pointing at freed memory. Make the call before taking the " +
+                        "address, or after the pointer's last use")
+        2 -> w.cx.fault(where, s"$name is a pointer into storage this assignment would release, and " +
+                        "it is used after it — so it would be left pointing at freed memory. Write " +
+                        "the assignment before taking the address, or after the pointer's last use")
+        _ -> w.cx.fault(where, s"$name points into storage '${shown_local(m.key)}' holds, and " +
+                        s"'${shown_local(m.key)}' was let go of where its block ended — so this " +
+                        "would read freed memory. Use the pointer inside that block, or declare " +
+                        s"'${shown_local(m.key)}' in a block that holds the pointer's uses too")
+end tell
+
+// A local's name as written: a unique name is the name, or the name and a `.` and a number.
+private shown_local(unique: string) -> string
+    val b = unique.bytes
+    var i = b.len
+
+    while i > 0 && b[i - 1] >= u8('0') && b[i - 1] <= u8('9')
+        i -= 1
+
+    if i == b.len || i < 2 || b[i - 1] != u8('.') then return unique
+
+    unique[0..<i - 1]
+end shown_local
+
+// -- statements -------------------------------------------------------------------------------------
+
+// A run of statements and what it comes to, with every `defer` among them run after both, last
+// first -- and then every local it declared let go of, which strands what pointed into it.
+private seq_flow(w: &PtrWalk, stmts: Buf[TStmt], result: Option[TExpr], entry: PtrFlow) -> PtrVal
+    var f = entry
+    var held: Buf[Buf[TStmt]] = buf()
+    val mine: Buf[string] = buf()
+
+    w.scopes.push(mine)
+
+    for s in stmts
+        s match
+            TDefer(body, _) -> held.push(body)
+            TVarDecl(name, _, _, _) ->
+                mine.push(name)
+                f = stmt_flow(w, s, f)
+            _ -> f = stmt_flow(w, s, f)
+
+    var facts: Buf[(usize, string)] = buf()
+
+    if result.is_some()
+        val v = expr_flow(w, result.unwrap(), f)
+
+        f = v.flow
+        facts = v.facts
+    end if
+
+    var i = held.len()
+
+    while i > 0
+        i -= 1
+        f = seq_flow(w, held.at(i), None, f).flow
+
+    w.scopes.pop()
+    PtrVal(release(w, f, mine), facts)
+end seq_flow
+
+private release(w: &PtrWalk, f: PtrFlow, names: Buf[string]) -> PtrFlow
+    var g = f
+
+    for item in names
+        g = apply_move(w, g, PtrMove(span_zero(), 3, "", item))
+
+    g
+end release
+
+// Leaving the scopes a `break` or `continue` jumps out of lets go of what they declared.
+private release_to(w: &PtrWalk, mark: usize, f: PtrFlow) -> PtrFlow
+    var g = f
+    var i = w.scopes.len()
+
+    while i > mark
+        i -= 1
+        g = release(w, g, w.scopes.at(i))
+
+    g
+end release_to
+
+private block_flow(w: &PtrWalk, b: TBlock, f: PtrFlow) -> PtrVal = seq_flow(w, b.stmts, b.result, f)
+
+private stmt_flow(w: &PtrWalk, s: TStmt, f: PtrFlow) -> PtrFlow = s match
+    TVarDecl(name, _, init, _) ->
+        val v = expr_flow(w, init, f)
+
+        set_held(v.flow, name, v.facts)
+    TExprStmt(e) -> expr_flow(w, e, f).flow
+    TRefDecl(_, _, place) -> expr_flow(w, place, f).flow
+    TWriteStmt(write) -> write_flow(w, write, f)
+    TMultiAssign(writes) ->
+        var g = f
+
+        for item in writes
+            g = write_flow(w, item, g)
+
+        g
+    TReturn(value) ->
+        if value.is_some() then use_value(w, value.unwrap(), f)
+
+        dead_flow()
+    TBecome(call) ->
+        use_value(w, call, f)
+        dead_flow()
+    TBreak(value, depth) ->
+        val g = if value.is_some() then use_value(w, value.unwrap(), f) else f
+        val frame = loop_at(w, depth)
+
+        if frame.is_some()
+            val fr = frame.unwrap()
+
+            fr.breaks = join_flow(fr.breaks, release_to(w, fr.scopes, g))
+        end if
+
+        dead_flow()
+    TContinue(depth) ->
+        val frame = loop_at(w, depth)
+
+        if frame.is_some()
+            val fr = frame.unwrap()
+
+            fr.conts = join_flow(fr.conts, release_to(w, fr.scopes, f))
+        end if
+
+        dead_flow()
+    _ -> f
+
+// A value that leaves where it was made, which reads every pointer it may be.
+private use_value(w: &PtrWalk, e: TExpr, f: PtrFlow) -> PtrFlow
+    val v = expr_flow(w, e, f)
+
+    use_facts(w, e.span, v.facts, v.flow)
+    v.flow
+end use_value
+
+private loop_at(w: &PtrWalk, depth: int) -> Option[&PtrLoop]
+    if depth < 0 || usize(depth) >= w.loops.len() then return None
+
+    Some(w.loops.at(w.loops.len() - 1 - usize(depth)))
+end loop_at
+
+private local_of(t: TExpr) -> string = *t.kind match
+    TLoad(unique, _) -> unique
+    _ -> ""
+
+// A plain assignment to a local gives it what the value may be; any other write stores the value
+// somewhere this walk does not follow, which reads it. Either may also replace storage a pointer
+// points into.
+private write_flow(w: &PtrWalk, write: TWrite, f: PtrFlow) -> PtrFlow
+    if write.op == "=" then return store_flow(w, write.place, write.value, f)
+
+    val p = expr_flow(w, write.place, f)
+
+    use_facts(w, write.place.span, p.facts, p.flow)
+
+    val v = expr_flow(w, write.value, p.flow)
+
+    use_facts(w, write.value.span, v.facts, v.flow)
+    written(w, write.place, v.flow)
+end write_flow
+
+private store_flow(w: &PtrWalk, place: TExpr, value: TExpr, f: PtrFlow) -> PtrFlow
+    val unique = local_of(place)
+
+    if unique != ""
+        val v = expr_flow(w, value, f)
+
+        return written(w, place, set_held(v.flow, unique, v.facts))
+    end if
+
+    val p = expr_flow(w, place, f)
+
+    use_facts(w, place.span, p.facts, p.flow)
+
+    val v = expr_flow(w, value, p.flow)
+
+    use_facts(w, value.span, v.facts, v.flow)
+    written(w, place, v.flow)
+end store_flow
+
+// An `&`: the pointer it makes, where it is one this walk follows, and whatever the place was
+// reached from when that is itself a pointer.
+private addr_flow(w: &PtrWalk, e: TExpr, place: TExpr, f: PtrFlow) -> PtrVal
+    var facts = root_facts(place, f)
+    val at = addr_at(w, e)
+
+    if at.is_none() then return PtrVal(f, facts)
+
+    facts.push((2 * at.unwrap(), ""))
+    PtrVal(refresh(f, at.unwrap()), facts)
+end addr_flow
+
+private written(w: &PtrWalk, place: TExpr, f: PtrFlow) -> PtrFlow
+    var g = f
+
+    for m in w.moves
+        if m.kind == 2 && m.span.start == place.span.start && m.span.end == place.span.end then
+            g = apply_move(w, g, m)
+
+    g
+end written
+
+// -- expressions ------------------------------------------------------------------------------------
+
+private is_pointer(t: Type) -> bool = repr(t) match
+    Ptr(_) -> true
+    _ -> false
+
+private addr_at(w: &PtrWalk, e: TExpr) -> Option[usize]
+    for i in 0..<w.addrs.len()
+        val a = w.addrs.at(i)
+
+        if a.span.start == e.span.start && a.span.end == e.span.end then return Some(i)
+
+    None
+end addr_at
+
+private call_moves(w: &PtrWalk, e: TExpr, f: PtrFlow) -> PtrFlow
+    val is_call = *e.kind match
+        TCall(_, _, _, _) -> true
+        TVCall(_, _, _, _, _) -> true
+        _ -> false
+
+    if !is_call then return f
+
+    var g = f
+
+    for m in w.moves
+        if m.kind <= 1 && m.span.start == e.span.start && m.span.end == e.span.end then
+            g = apply_move(w, g, m)
+
+    g
+end call_moves
+
+private expr_flow(w: &PtrWalk, e: TExpr, f: PtrFlow) -> PtrVal
+    val out = *e.kind match
+        TLoad(unique, _) ->
+            var facts: Buf[(usize, string)] = buf()
+
+            for x in held_of(f, unique)
+                facts.push((x, unique))
+
+            PtrVal(f, facts)
+        TAddrOf(place, _) ->
+            val v = expr_flow(w, place, f)
+
+            addr_flow(w, e, place, v.flow)
+        TStore(place, value, _, _) -> just(store_flow(w, place, value, f))
+        TRecheck(after, _, _, _) -> expr_flow(w, after, f)
+        TLogical(_, left, right) ->
+            val l = expr_flow(w, left, f)
+            val r = expr_flow(w, right, l.flow)
+
+            use_facts(w, left.span, l.facts, l.flow)
+            use_facts(w, right.span, r.facts, r.flow)
+            just(join_flow(l.flow, r.flow))
+        TIf(cond, then_block, else_block, _) -> if_flow(w, cond, then_block, else_block, f)
+        TMatch(scrutinee, arms, _) -> match_flow(w, scrutinee, arms, f)
+        TBlockExpr(block) -> block_flow(w, block, f)
+        TWhile(_, _, _, _) -> just(loop_flow(w, e, f))
+        TDoWhile(_, _, _, _) -> just(loop_flow(w, e, f))
+        TLoop(_, _) -> just(loop_flow(w, e, f))
+        TFor(_, _, _, _, _, _, _, _) -> just(loop_flow(w, e, f))
+        TCFor(_, _, _, _, _, _) -> just(loop_flow(w, e, f))
+        TForEach(_, _, _, _, _, _) -> just(loop_flow(w, e, f))
+        TIterate(_, _, _, _, _, _, _, _) -> just(loop_flow(w, e, f))
+        TCheckedLoop(_, _, loop_expr) -> expr_flow(w, loop_expr, f)
+        TQuantifier(_, _, _, _, _, _, _) -> just(f)
+        _ -> operands_flow(w, e, f)
+
+    if texpr_type(e) == Never then return just(dead_flow())
+
+    PtrVal(call_moves(w, e, out.flow), out.facts)
+end expr_flow
+
+// The pointers an address computed from another pointer's target may be: `&p[1]` and `&(*p).f` are
+// made from `p`.
+private root_facts(place: TExpr, f: PtrFlow) -> Buf[(usize, string)]
+    var facts: Buf[(usize, string)] = buf()
+    var at = place
+
+    loop
+        *at.kind match
+            TLoad(unique, ty) ->
+                if is_pointer(ty)
+                    for x in held_of(f, unique)
+                        facts.push((x, unique))
+                end if
+
+                return facts
+            TDeref(operand, _) -> at = operand
+            TField(receiver, _, _) -> at = receiver
+            TIndex(receiver, _, _) -> at = receiver
+            _ -> return facts
+end root_facts
+
+// Every operand, in the order it is read. A form that only moves an address along -- a cast, an
+// offset, a sequence's last value -- carries the operands' pointers on where its own value is a
+// pointer; every other form reads them.
+private operands_flow(w: &PtrWalk, e: TExpr, f: PtrFlow) -> PtrVal
+    var g = f
+    var facts: Buf[(usize, string)] = buf()
+    var spans: Buf[Span] = buf()
+
+    for item in texpr_children(e)
+        val v = expr_flow(w, item, g)
+
+        g = v.flow
+
+        for x in v.facts
+            facts.push(x)
+            spans.push(item.span)
+
+    val carries = *e.kind match
+        TCast(_, _) -> true
+        TBinary(_, _, _, _) -> true
+        TSeq(_) -> true
+        _ -> false
+
+    if !carries
+        for i in 0..<facts.len()
+            var one: Buf[(usize, string)] = buf()
+
+            one.push(facts.at(i))
+            use_facts(w, spans.at(i), one, g)
+    end if
+
+    if !is_pointer(texpr_type(e)) then return just(g)
+
+    PtrVal(g, facts)
+end operands_flow
+
+private term_flow(w: &PtrWalk, term: TCondTerm, f: PtrFlow) -> PtrFlow = term match
+    TCondTest(c) -> use_value(w, c, f)
+    TCondIs(subject, _, _) -> use_value(w, subject, f)
+
+// The branch not taken is left from wherever a condition failed, which is after any of its terms.
+private if_flow(w: &PtrWalk, cond: Buf[TCondTerm], then_block: TBlock, else_block: Option[TBlock],
+                f: PtrFlow) -> PtrVal
+    var g = f
+    var failed = dead_flow()
+
+    for term in cond
+        g = term_flow(w, term, g)
+        failed = join_flow(failed, g)
+
+    val t = block_flow(w, then_block, g)
+    val e = if else_block.is_some() then block_flow(w, else_block.unwrap(), failed) else just(failed)
+    var facts = t.facts.copy()
+
+    for x in e.facts
+        facts.push(x)
+
+    PtrVal(join_flow(t.flow, e.flow), facts)
+end if_flow
+
+private match_flow(w: &PtrWalk, scrutinee: TExpr, arms: Buf[TArm], f: PtrFlow) -> PtrVal
+    var into = use_value(w, scrutinee, f)
+    var out = dead_flow()
+    var facts: Buf[(usize, string)] = buf()
+
+    for arm in arms
+        var a = into
+
+        if arm.guard.is_some()
+            a = use_value(w, arm.guard.unwrap(), a)
+            into = join_flow(into, a)
+        end if
+
+        val v = block_flow(w, arm.body, a)
+
+        out = join_flow(out, v.flow)
+
+        for x in v.facts
+            facts.push(x)
+
+    PtrVal(out, facts)
+end match_flow
+
+// -- loops ------------------------------------------------------------------------------------------
+
+// A loop, walked turn by turn until the state reaching its head stops changing -- which it must, since
+// a turn can only add pointers the body's own `&`s make, and there are twice as many of those as `&`s.
+private loop_flow(w: &PtrWalk, e: TExpr, f: PtrFlow) -> PtrFlow
+    val entry = loop_entry(w, e, f)
+    var head = entry
+    var exits = dead_flow()
+    var turns = 0
+
+    loop
+        val frame: &PtrLoop = PtrLoop(dead_flow(), dead_flow(), w.scopes.len())
+
+        w.loops.push(frame)
+
+        val turn = loop_turn(w, e, head, frame)
+
+        w.loops.pop()
+
+        val ending = loop_else(e)
+        val ended = if ending.is_some() then block_flow(w, ending.unwrap(), turn.1).flow else turn.1
+
+        exits = join_flow(frame.breaks, ended)
+
+        val next = join_flow(entry, turn.0)
+
+        turns += 1
+
+        if same_flow(next, head) || turns > 32 then break
+
+        head = next
+
+    exits
+end loop_flow
+
+private loop_entry(w: &PtrWalk, e: TExpr, f: PtrFlow) -> PtrFlow = *e.kind match
+    TFor(_, _, lo, hi, _, _, _, _) -> use_value(w, hi, use_value(w, lo, f))
+    TCFor(init, _, _, _, _, _) -> seq_flow(w, init, None, f).flow
+    TForEach(_, _, seq, _, _, _) -> use_value(w, seq, f)
+    TIterate(cursor, _, init, _, _, _, _, _) ->
+        val v = expr_flow(w, init, f)
+
+        set_held(v.flow, cursor, v.facts)
+    _ -> f
+
+private loop_else(e: TExpr) -> Option[TBlock] = *e.kind match
+    TWhile(_, _, else_block, _) -> else_block
+    TDoWhile(_, _, else_block, _) -> else_block
+    TFor(_, _, _, _, _, _, else_block, _) -> else_block
+    TCFor(_, _, _, _, else_block, _) -> else_block
+    TForEach(_, _, _, _, else_block, _) -> else_block
+    TIterate(_, _, _, _, _, _, else_block, _) -> else_block
+    _ -> None
+
+// One turn from the head: the state it comes back to the head with, and the one it leaves the loop
+// with when it ends on its own.
+private loop_turn(w: &PtrWalk, e: TExpr, head: PtrFlow, frame: &PtrLoop) -> (PtrFlow, PtrFlow) =
+    *e.kind match
+        TWhile(cond, body, _, _) ->
+            var g = head
+            var failed = dead_flow()
+
+            for term in cond
+                g = term_flow(w, term, g)
+                failed = join_flow(failed, g)
+
+            val end_body = seq_flow(w, body, None, g).flow
+
+            (join_flow(end_body, frame.conts), failed)
+        TDoWhile(body, cond, _, _) ->
+            val end_body = seq_flow(w, body, None, head).flow
+            val c = use_value(w, cond, join_flow(end_body, frame.conts))
+
+            (c, c)
+        TLoop(body, _) ->
+            val end_body = seq_flow(w, body, None, head).flow
+
+            (join_flow(end_body, frame.conts), dead_flow())
+        TFor(_, _, _, _, _, body, _, _) ->
+            val end_body = seq_flow(w, body, None, head).flow
+
+            (join_flow(end_body, frame.conts), head)
+        TCFor(_, cond, step, body, _, _) ->
+            val c = if cond.is_some() then use_value(w, cond.unwrap(), head) else head
+            val end_body = seq_flow(w, body, None, c).flow
+            val stepped = seq_flow(w, step, None, join_flow(end_body, frame.conts)).flow
+
+            (stepped, if cond.is_some() then c else dead_flow())
+        TForEach(_, _, _, body, _, _) ->
+            val end_body = seq_flow(w, body, None, head).flow
+
+            (join_flow(end_body, frame.conts), head)
+        TIterate(_, _, _, next, _, body, _, _) ->
+            val n = use_value(w, next, head)
+            val end_body = seq_flow(w, body, None, n).flow
+
+            (join_flow(end_body, frame.conts), n)
+        _ -> (head, head)
