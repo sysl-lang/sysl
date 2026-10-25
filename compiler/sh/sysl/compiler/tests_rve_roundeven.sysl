@@ -1,0 +1,368 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.source_of
+import sysl.fs.{exists, make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.{replace_all, split}
+
+// `extern "llvm.roundeven"` (`reference/ffi.md`) and the float method `round_even()`: the nearest
+// integral value, a tie going to the even neighbour, in every rounding mode and without raising
+// inexact. It differs from `llvm.round`, which sends a tie away from zero, at exactly the ties.
+
+private rve_ready() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+    end if
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+    end if
+
+    true
+end rve_ready
+
+private rve_root(text: string) -> string
+    val root = replace_all(make_temp_dir("sysl-rve").unwrap(), "//", "/")
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+    root
+end rve_root
+
+// What a program prints, built at `level`, or why it did not build.
+private rve_ran(text: string, level: string) -> string
+    val root = rve_root(text)
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, level, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end rve_ran
+
+private rve_prints(text: string, expected: string)
+    for level in ["0", "2"]
+        assert_eq(rve_ran(text, level), expected)
+end rve_prints
+
+private rve_ir(text: string, target: Option[string] = None) -> string
+    val root = rve_root(text)
+
+    val out = emit_llvm_text(root, target) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> if made.report.is_empty() then made.text else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end rve_ir
+
+private rve_says(text: string, part: string) = assert(text.contains(part), s"expected '$part' in:\n$text")
+
+// -- an ordinary body -----------------------------------------------------------------------------------
+
+private val rve_ordinary: string = raw"""
+    private extern "llvm.roundeven" re(x: f64) -> f64
+    private extern "llvm.roundeven" re32(x: f32) -> f32
+
+    main(args: []string)
+        val one = real(args.len)
+        val one32 = f32(args.len)
+
+        print(re(0.5 * one), re(1.5 * one), re(2.5 * one), re(3.5 * one), re(-0.5 * one), re(-1.5 * one))
+        print(re(-2.5 * one), re(2.4 * one), re(2.6 * one), re(-0.0 * one), re(4503599627370497.0 * one))
+        print(re32(0.5f32 * one32), re32(1.5f32 * one32), re32(2.5f32 * one32), re32(-0.5f32 * one32), re32(-1.5f32 * one32))
+        print(re32(3.5f32 * one32), re32(-2.5f32 * one32), re32(2.6f32 * one32), re32(8388609.0f32 * one32))
+    """
+
+@test("roundeven sends a tie to the even neighbour, at both widths and at -O0 and -O2")
+rve_ties()
+    if !rve_ready() then return
+
+    rve_prints(rve_ordinary,
+               "0 2 2 4 -0 -2\n" +
+               "-2 2 3 -0 4503599627370497\n" +
+               "0 2 2 -0 -2\n" +
+               "4 -2 3 8388609\n")
+end rve_ties
+
+private val rve_method: string = raw"""
+    main(args: []string)
+        val one = real(args.len)
+        val one32 = f32(args.len)
+
+        print((2.5 * one).round_even(), (2.5 * one).round(), (3.5f32 * one32).round_even(), (-0.5f32 * one32).round_even())
+        print((2.5f16 * f16(args.len)).round_even(), (3.5bf16 * bf16(args.len)).round_even())
+    """
+
+@test("the float method round_even is ties-to-even where round is away from zero, at every float width")
+rve_method_form()
+    if !rve_ready() then return
+
+    rve_prints(rve_method, "2 3 4 -0\n2 4\n")
+end rve_method_form
+
+// -- NaN and infinity -----------------------------------------------------------------------------------
+
+private val rve_special: string = raw"""
+    private extern "llvm.roundeven" re(x: f64) -> f64
+    private extern "llvm.roundeven" re32(x: f32) -> f32
+
+    main(args: []string)
+        val one = real(args.len)
+        val one32 = f32(args.len)
+        val n = re(nan * one)
+        val n32 = re32(f32(nan) * one32)
+
+        print(re(infinity * one).bits(), re(-infinity * one).bits(), n != n, n32 != n32)
+        print(re32(f32(infinity) * one32).bits(), re32(f32(-infinity) * one32).bits())
+    """
+
+@test("roundeven leaves an infinity alone and answers a NaN with a NaN")
+rve_nan_and_infinity()
+    if !rve_ready() then return
+
+    rve_prints(rve_special, "9218868437227405312 18442240474082181120 true true\n2139095040 4286578688\n")
+end rve_nan_and_infinity
+
+// -- a strict body --------------------------------------------------------------------------------------
+
+private val rve_strict: string = raw"""
+    import sysl.fenv.*
+
+    private extern "llvm.roundeven" re(x: f64) -> f64
+    private extern "llvm.roundeven" re32(x: f32) -> f32
+
+    @strict_fp
+    each(one: f64) -> string
+        var out = ""
+
+        for r in [NearestEven, Upward, Downward, TowardZero]
+            set_rounding(r)
+            clear_flags()
+
+            val a = re(0.5 * one)
+            val b = re(1.5 * one)
+            val c = re(2.5 * one)
+            val d = re(-0.5 * one)
+            val e = re(-1.5 * one)
+            val f = (3.5 * one).round_even()
+            val hit = flags().inexact
+
+            out = out + f"$a $b $c $d $e $f $hit|"
+
+        set_rounding(NearestEven)
+        out
+    end each
+
+    @strict_fp
+    each32(one: f32) -> string
+        var out = ""
+
+        for r in [NearestEven, Upward, Downward, TowardZero]
+            set_rounding(r)
+            clear_flags()
+
+            val a = re32(0.5f32 * one)
+            val b = re32(1.5f32 * one)
+            val c = re32(2.5f32 * one)
+            val d = re32(-0.5f32 * one)
+            val e = re32(-1.5f32 * one)
+            val f = (3.5f32 * one).round_even()
+            val hit = flags().inexact
+
+            out = out + f"$a $b $c $d $e $f $hit|"
+
+        set_rounding(NearestEven)
+        out
+    end each32
+
+    main(args: []string)
+        print(each(real(args.len)))
+        print(each32(f32(args.len)))
+    """
+
+@test("in a strict body roundeven stays ties-to-even in every rounding mode and raises no inexact")
+rve_strict_every_mode()
+    if !rve_ready() then return
+
+    val row = "0 2 2 -0 -2 4 false|"
+
+    rve_prints(rve_strict, row + row + row + row + "\n" + row + row + row + row + "\n")
+end rve_strict_every_mode
+
+private val rve_inexact_contrast: string = raw"""
+    import sysl.fenv.*
+
+    private extern "llvm.rint" rint(x: f64) -> f64
+    private extern "llvm.roundeven" re(x: f64) -> f64
+
+    @strict_fp
+    each(one: f64) -> string
+        clear_flags()
+        val a = re(2.5 * one)
+        val first = flags().inexact
+
+        clear_flags()
+        val b = rint(2.5 * one)
+        val second = flags().inexact
+
+        f"$a $first $b $second"
+    end each
+
+    main(args: []string)
+        print(each(real(args.len)))
+    """
+
+@test("rint raises inexact on a tie and roundeven does not, which is what tells them apart")
+rve_inexact_contrast_with_rint()
+    if !rve_ready() then return
+
+    rve_prints(rve_inexact_contrast, "2 false 2 true\n")
+end rve_inexact_contrast_with_rint
+
+@test("a strict roundeven is the constrained intrinsic with fpexcept.strict and no rounding argument")
+rve_strict_ir()
+    if !rve_ready() then return
+
+    val ir = rve_ir(rve_strict)
+
+    rve_says(ir, "@llvm.experimental.constrained.roundeven.f64(double")
+    rve_says(ir, "@llvm.experimental.constrained.roundeven.f32(float")
+    rve_says(ir, "declare double @llvm.experimental.constrained.roundeven.f64(double, metadata)")
+    rve_says(ir, "declare float @llvm.experimental.constrained.roundeven.f32(float, metadata)")
+end rve_strict_ir
+
+@test("an ordinary roundeven is the plain intrinsic, declared at both widths")
+rve_ordinary_ir()
+    if !rve_ready() then return
+
+    val ir = rve_ir(rve_ordinary)
+
+    rve_says(ir, "declare double @llvm.roundeven.f64(double)")
+    rve_says(ir, "declare float @llvm.roundeven.f32(float)")
+    assert(!ir.contains("constrained.roundeven"), ir)
+end rve_ordinary_ir
+
+@test("roundeven declared with the wrong shape is refused as the other roundings are")
+rve_wrong_shape_refused()
+    if !rve_ready() then return
+
+    assert(rve_ir("private extern \"llvm.roundeven\" re(a: f64, b: f64) -> f64\n\nprint(re(1.0, 2.0))\n")
+           .contains("'llvm.roundeven' takes 1 argument, but 2 were declared"))
+    assert(rve_ir("private extern \"llvm.roundeven\" re(x: int) -> int\n\nprint(re(1))\n")
+           .contains("'llvm.roundeven' takes and returns one floating-point type"))
+end rve_wrong_shape_refused
+
+// -- AArch64 --------------------------------------------------------------------------------------------
+
+@test("on AArch64 roundeven is frintn, ordinary and strict")
+rve_aarch64_frintn()
+    if !rve_ready() then return
+
+    if host_target().cpu != Aarch64
+        print("skipped: what is asserted is AArch64's and this machine is not one")
+        return
+    end if
+
+    if !exists("/usr/bin/otool")
+        print("skipped: the disassembly is read with otool, which this machine does not have")
+        return
+    end if
+
+    for program in [rve_ordinary, rve_strict]
+        val root = rve_root(program)
+        val exe = s"$root/built"
+
+        build_native_program(root, None, None, "2", Some(exe)) match
+            Err(why) -> assert(false, failure_text(why))
+            Ok(_) -> ()
+
+        val dis = capture("/usr/bin/otool", ["-tvV", exe], "", [], true)
+
+        remove_dir_all(root).unwrap_or(())
+        rve_says(dis.unwrap().text, "\tfrintn\t")
+    end for
+end rve_aarch64_frintn
+
+// -- the boards -----------------------------------------------------------------------------------------
+
+private val rve_board_program: string = raw"""
+    private extern "llvm.roundeven" re(x: f64) -> f64
+    private extern "llvm.roundeven" re32(x: f32) -> f32
+
+    @export("plain32")
+    plain32(x: f32) -> f32 = re32(x)
+
+    @export("plain64")
+    plain64(x: f64) -> f64 = re(x)
+
+    @strict_fp
+    @export("strict32")
+    strict32(x: f32) -> f32 = re32(x)
+
+    @strict_fp
+    @export("strict64")
+    strict64(x: f64) -> f64 = re(x)
+
+    @export("main")
+    boot() -> i32 = 0
+    """
+
+@test("a Cortex-M7 with a double-precision unit rounds to even in one vrintn at both widths")
+rve_m7_dp()
+    for name in ["plain32", "strict32"]
+        val code = fx2_board_code(rve_board_program, "thumbv7em-freestanding-dp", name)
+
+        if code.is_none() then return
+
+        rve_says(code.unwrap(), "vrintn.f32")
+    end for
+
+    for name in ["plain64", "strict64"]
+        val code = fx2_board_code(rve_board_program, "thumbv7em-freestanding-dp", name)
+
+        if code.is_none() then return
+
+        rve_says(code.unwrap(), "vrintn.f64")
+    end for
+end rve_m7_dp
+
+@test("a Cortex-M33 rounds to even at f32 in one vrintn and calls for f64")
+rve_m33()
+    for name in ["plain32", "strict32"]
+        val code = fx2_board_code(rve_board_program, "thumb-freestanding", name)
+
+        if code.is_none() then return
+
+        rve_says(code.unwrap(), "vrintn.f32")
+    end for
+
+    val double = fx2_board_code(rve_board_program, "thumb-freestanding", "plain64")
+
+    if double.is_none() then return
+
+    assert(!double.unwrap().contains("vrintn.f64"), double.unwrap())
+    rve_says(double.unwrap(), "roundeven")
+end rve_m33
+
+@test("a Cortex-M4F has no vrintn and calls the library's roundeven")
+rve_m4()
+    val single = fx2_board_code(rve_board_program, "thumbv7em-freestanding", "plain32")
+
+    if single.is_none() then return
+
+    assert(!single.unwrap().contains("vrintn"), single.unwrap())
+    rve_says(single.unwrap(), "roundevenf")
+end rve_m4

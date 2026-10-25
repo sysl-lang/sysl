@@ -214,7 +214,7 @@ print(bogus(1.0))
 ```
 
 ```error
-'llvm.nosuchthing' is not an intrinsic sysl supports — it has llvm.ceil, llvm.copysign, llvm.fabs, llvm.floor, llvm.fma, llvm.maximum, llvm.maxnum, llvm.minimum, llvm.minnum, llvm.nearbyint, llvm.rint, llvm.round, llvm.sqrt, llvm.trunc
+'llvm.nosuchthing' is not an intrinsic sysl supports — it has llvm.ceil, llvm.copysign, llvm.fabs, llvm.floor, llvm.fma, llvm.maximum, llvm.maxnum, llvm.minimum, llvm.minnum, llvm.nearbyint, llvm.rint, llvm.round, llvm.roundeven, llvm.sqrt, llvm.trunc
 ```
 
 **`llvm.fma` is `a * b + c` rounded once.** The product is never rounded on its own, so the
@@ -263,6 +263,24 @@ print(minnum(1.0, nan), maximum(1.0, nan), minimum(0.0, -0.0))
 ```output
 2 -4 3
 1 NaN -0
+```
+
+**`llvm.roundeven` is `llvm.rint` that does not follow the rounding mode.** It rounds to the nearest
+integer with a tie to the even one in *every* mode, where `rint` and `nearbyint` use the mode in
+force, and it raises no inexact flag. Outside a `@strict_fp` body, which is the only place the mode
+changes, the values agree. The float types spell it `round_even()`:
+
+```sysl
+extern "llvm.roundeven" roundeven(x: f64) -> f64
+extern "llvm.round" round(x: f64) -> f64
+
+print(roundeven(0.5), roundeven(1.5), roundeven(2.5), roundeven(-0.5), round(2.5))
+print((3.5f32).round_even(), (2.5).round_even())
+```
+
+```output
+0 2 2 -0 3
+4 2
 ```
 
 **Where the machine has no fused instruction, `llvm.fma` is a call to C's `fma` or `fmaf`**, and a
