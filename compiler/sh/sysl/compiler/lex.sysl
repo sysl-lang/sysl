@@ -199,9 +199,17 @@ private lex_from(start: Scanner) -> Result[Lexed, Diagnostic]
 
             // An `else` or `elif` lined up under an `if` on the line above, deeper than that line,
             // goes on the line it continues: it opens no block, so the margins are left as they were.
-            if started && ind.columns > lay.margin() && continues_an_if(&s, &out, 0, ind.columns)
-                at_line_head = false
-                continue
+            if started && ind.columns > lay.margin()
+                if continues_an_if(&s, &out, 0, ind.columns)
+                    at_line_head = false
+                    continue
+
+                // A branch can open no block, so one deeper than the line above it and lined up
+                // with nothing it could continue is a layout mistake, named as one.
+                val branch = if word_ahead(&s, "else") then "else" else "elif"
+
+                if word_ahead(&s, "else") || word_ahead(&s, "elif")
+                    return Err(error(point(s.offset), misplaced_branch(branch, ind.columns)))
             end if
 
             val dent = lay.line(ind.columns)
@@ -283,8 +291,14 @@ private ragged_line(lay: Layout, column: usize) -> string
 
     s"a line indented ${column} columns lines up with no open block: it sits between the block indented ${lay.left_margin()} and ${outer} \u{2014} indent it to one of the two"
 
-// Whether a ragged line is an `else` or an `elif` lined up exactly under the `if` it continues --
-// the one ragged line that is not refused:
+// The refusal of an `else` or `elif` that begins a line deeper than the one above it and lines up with
+// neither the `if` nor a line-opening `then` of the statement it would continue.
+private misplaced_branch(branch: string, column: usize) -> string =
+    s"an '${branch}' indented ${column} columns lines up with no 'if' it could continue \u{2014} put it under its 'if', or under a 'then' that begins a line"
+
+// Whether a ragged line is an `else` or an `elif` lined up exactly under the `if` it continues, or
+// under a `then` of that `if` which began a line of its own -- the one ragged line that is not
+// refused:
 //
 //     val sign = if n < 0 then
 //                    "negative"
@@ -316,10 +330,23 @@ private continues_an_if(s: *Scanner, out: *Buf[Spanned[Tok]], levels: usize, col
                 if depth == 0 && crossed >= levels && statement_boundary(out, i) then return false
             Keyword(w) ->
                 if w == "if" && column_at(s.src, t.span.start) == column then return true
+                if w == "then" && column_at(s.src, t.span.start) == column &&
+                    first_on_its_line(s.src, t.span.start)
+                    return true
             _ -> ()
 
     false
 end continues_an_if
+
+// Whether only indentation stands before this offset on its line -- a `then` that began a line of
+// its own, which an `else` may line up under as it may under the `if`.
+private first_on_its_line(src: []const u8, offset: usize) -> bool
+    var k = offset
+
+    while k > 0 && (src[k - 1] == u8(' ') || src[k - 1] == u8('\t'))
+        k -= 1
+
+    k == 0 || src[k - 1] == u8('\n')
 
 // Whether the newline at `i` ends a statement rather than leading into a block or into another
 // branch of the same `if`.
@@ -376,7 +403,7 @@ end close_levels
 private ends_the_statement(s: *Scanner, lay: *Layout, out: *Buf[Spanned[Tok]]) -> bool
     val trigger = lay.brackets > 0 && opens_a_block(out)
     val suspended = !lay.significant()
-    val leading = continues_before_a_dot(s, out)
+    val leading = continues_before_a_dot(s, out) || continues_before_then(s, out)
     val trailing = !suspended && continues_after_an_operator(out)
 
     s.accept_newline()
@@ -467,6 +494,40 @@ private continues_before_a_dot(s: *Scanner, out: *Buf[Spanned[Tok]]) -> bool
     s.reset(m)
     joined
 end continues_before_a_dot
+
+// Whether the line under the cursor is continued by the line after it, which begins with `then`:
+//
+//     val n = if c
+//         then 1
+//         else 2
+//
+// **`then` can begin nothing else**, so a line starting with it belongs to the condition above it
+// and there is nothing to resolve; its indentation is discarded as a leading dot's is. Like a chain,
+// it continues only a line that could have ended an expression, which a condition is.
+private continues_before_then(s: *Scanner, out: *Buf[Spanned[Tok]]) -> bool
+    if !can_end_an_expression(out) then return false
+
+    val m = s.mark()
+    var joined = false
+
+    s.accept_newline()
+
+    loop
+        skip_trivia_quietly(s)
+
+        if s.at_end() then break
+
+        if s.at_line_end()
+            s.accept_newline()
+            continue
+
+        joined = word_ahead(s, "then")
+        break
+    end loop
+
+    s.reset(m)
+    joined
+end continues_before_then
 
 // Whether the token before a line ending could have been the end of an expression.
 //

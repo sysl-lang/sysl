@@ -1,0 +1,158 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+
+// A line that begins with `then` continues the condition above it (`reference/lexical.md § An
+// unbracketed line continues before 'then'`), and an `else` or `elif` may line up under such a
+// `then` as it may under the `if` itself.
+//
+// The strongest claim is the stream one: the broken text lexes to exactly the tokens of the same text
+// on one line. The run tests then say the forms mean what they look like, wherever an `if` stands.
+
+// -- the stream ------------------------------------------------------------------------------------
+
+@test("a 'then' and an 'else' indented under a 'val' lex as the one-line form")
+ltn_indented_under_a_val()
+    assert_eq(all("val n = if c\n    then 1\n    else 2\n"), all("val n = if c then 1 else 2\n"))
+
+@test("lined up under the 'if' word, they lex the same")
+ltn_under_the_if_word()
+    assert_eq(all("val n = if c\n        then 1\n        else 2\n"), all("val n = if c then 1 else 2\n"))
+
+@test("a statement 'if' broken the same way is the one-line statement")
+ltn_a_statement_if()
+    assert_eq(all("if c\n    then f()\n    else g()\nh()\n"), all("if c then f() else g()\nh()\n"))
+
+@test("an 'elif' chain takes a 'then' on a line of its own at every test")
+ltn_an_elif_chain()
+    assert_eq(all("val n = if a\n    then 1\n    elif b\n    then 2\n    else 3\n"),
+              all("val n = if a then 1 elif b then 2 else 3\n"))
+
+@test("a nested 'if' keeps its 'else' under its own 'then'")
+ltn_nested()
+    assert_eq(all("val n = if a\n    then if b\n        then 1\n        else 2\n    else 3\n"),
+              all("val n = if a then if b then 1 else 2 else 3\n"))
+
+@test("a comment line or a blank line between the condition and its 'then' does not end it")
+ltn_across_a_comment_and_a_blank()
+    assert_eq(all("val n = if c\n    // why\n    then 1\n\n    else 2\n"), all("val n = if c then 1 else 2\n"))
+
+@test("the 'then' line's own indentation carries no meaning, the margin included")
+ltn_at_the_margin()
+    // The `else` at the margin is the branch at the statement's margin, which it always could be.
+    assert_eq(pf("f()\n    val n = if c\n    then 1\n    else 2\n    g()\n"),
+              pf("f()\n    val n = if c then 1 else 2\n    g()\n"))
+
+@test("after an arm's arrow it continues the arm")
+ltn_after_an_arrow()
+    assert_eq(all("val g = o match\n    None -> if c\n        then 1\n        else 2\n    _ -> 3\n"),
+              all("val g = o match\n    None -> if c then 1 else 2\n    _ -> 3\n"))
+
+@test("it composes with a chain on the 'then' line")
+ltn_with_a_chain()
+    assert_eq(all("val n = if c\n    then s\n        .len\n    else 0\n"), all("val n = if c then s.len else 0\n"))
+
+@test("a name that merely begins with 'then' is a statement of its own")
+ltn_not_a_longer_name()
+    assert_eq(all("f(c)\nthence()\n"),
+              of([Ident("f"), Keyword("("), Ident("c"), Keyword(")"), Newline,
+                  Ident("thence"), Keyword("("), Keyword(")"), Newline]))
+
+@test("a 'then' opening a block, with the 'else' back under it, is the block form")
+ltn_a_block_under_the_then()
+    // The `else` is ragged -- between the block at 8 and the margin -- and lines up under the
+    // `then` that began its line, so it is not refused.
+    assert_eq(pf("val n = if c\n    then\n        f()\n        1\n    else 2\n"),
+              pf("val n = if c then\n        f()\n        1\nelse 2\n"))
+
+// -- what stays refused ----------------------------------------------------------------------------
+
+@test("an 'else' deeper than the line above and under nothing it continues is named as such")
+ltn_an_else_under_nothing()
+    val src = "val n = if c\n    then 1\n      else 2\n"
+
+    assert_eq(bad(src),
+              "an 'else' indented 6 columns lines up with no 'if' it could continue \u{2014} put it under its 'if', or under a 'then' that begins a line")
+    assert_eq(bad_at(src), 30)
+
+@test("so is an 'elif'")
+ltn_an_elif_under_nothing()
+    assert_eq(bad("val n = if a then 1\n      elif b then 2\n        else 3\n"),
+              "an 'elif' indented 6 columns lines up with no 'if' it could continue \u{2014} put it under its 'if', or under a 'then' that begins a line")
+
+@test("an 'else' on the line after a one-line 'if', deeper and not under it, is named the same way")
+ltn_after_a_one_line_if()
+    assert_eq(bad("val n = if c then 1\n    else 2\n"),
+              "an 'else' indented 4 columns lines up with no 'if' it could continue \u{2014} put it under its 'if', or under a 'then' that begins a line")
+
+@test("a 'then' of an earlier statement is no 'then' this 'else' continues")
+ltn_an_earlier_statement()
+    assert_eq(bad("val a = if p\n    then 1\n    else 2\nval b = f(c) match\n        1 -> 2\n    else 3\n"),
+              "a line indented 4 columns lines up with no open block: it sits between the block indented 8 and the left margin \u{2014} indent it to one of the two")
+
+@test("a 'then' joined to a line that is no condition is still refused by the parser")
+ltn_a_then_with_no_if()
+    assert_eq(pf_err("f()\n    val n = 1\n        then 2\n"), "newline expected")
+
+// -- what the forms mean ---------------------------------------------------------------------------
+
+@test("every place an 'if' stands, broken before 'then', runs as it reads")
+ltn_runs()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        pick(c: bool) -> int
+            val n = if c
+                then 1
+                else 2
+            n
+
+        word(n: int) -> string = if n < 0
+            then "negative"
+            elif n == 0
+            then "zero"
+            else "positive"
+
+        nested(a: bool, b: bool) -> int
+            val n = if a
+                then if b
+                    then 1
+                    else 2
+                else 3
+            n
+
+        blocks(c: bool) -> int
+            val n = if c
+                then
+                    val k = 5
+                    k * 2
+                else 7
+            n
+
+        twice(n: int) -> int = n * 2
+
+        say(c: bool)
+            if c
+                then print("yes")
+                else print("no")
+
+        arm(o: Option[int]) -> int = o match
+            Some(k) -> k
+            None -> if o.is_none()
+                then 40
+                else 41
+
+        val top = if false
+            then 1
+            else 30
+
+        print(pick(true), pick(false), word(-1), word(0), word(1))
+        print(nested(true, true), nested(true, false), nested(false, true), blocks(true), blocks(false))
+        print(twice(if true
+            then 10
+            else 20), arm(None), arm(Some(2)), top)
+        say(true)
+        say(false)
+        """), "1 2 negative zero positive\n1 2 3 10 7\n20 40 2 30\nyes\nno\n")
