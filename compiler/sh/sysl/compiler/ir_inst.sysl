@@ -184,13 +184,18 @@ enum IrAccess
     AccBufElement
 end IrAccess
 
-// The relaxations the back end is allowed on a floating-point operation.
+// What a call says about floating point: a relaxation the back end is allowed (`reassoc`, written
+// after `call`), or `strictfp`, which every call inside a `@strict_fp` body carries
+// (`emit_strict_fp.sysl`). LLVM takes the second as a call-site function attribute, so it is
+// written after the arguments.
 enum FastMath
     FmReassoc
+    FmStrict
 end FastMath
 
 fast_render(f: FastMath) -> string = f match
     FmReassoc -> "reassoc"
+    FmStrict -> ""
 
 // The read-modify-write operations an atomic may name.
 enum RmwOp
@@ -304,7 +309,7 @@ inst_render(i: Inst) -> string = i match
         s"${dest_text(d)}call ${l_render(ret)} asm sideeffect \"$text\", \"$cons\"(${arg_list(args)})"
     InCall(d, ret, callee, args, ret_attrs, fn, fast, must) ->
         s"${dest_text(d)}${if must then "musttail " else ""}call ${fast_text(fast)}" +
-            s"${call_kind(ret, ret_attrs, fn)} ${v_render(callee)}(${arg_list(args)})"
+            s"${call_kind(ret, ret_attrs, fn)} ${v_render(callee)}(${arg_list(args)})${strict_text(fast)}"
     InVaArg(d, list, ty) -> s"${v_render(d)} = va_arg ptr ${v_render(list)}, ${l_render(ty)}"
     InAtomicRmw(d, op, p, ty, v, ord) ->
         s"${v_render(d)} = atomicrmw ${rmw_render(op)} ptr ${v_render(p)}, ${l_render(ty)} " +
@@ -347,11 +352,21 @@ private fast_text(fast: Buf[FastMath]) -> string
     var b = str_builder()
 
     for item in fast
+        if item == FmStrict then continue
+
         b.push(fast_render(item))
         b.push_char(' ')
 
     b.finish()
 end fast_text
+
+// ` strictfp` where the call carries it, after the arguments.
+private strict_text(fast: Buf[FastMath]) -> string
+    for item in fast
+        if item == FmStrict then return " strictfp"
+
+    ""
+end strict_text
 
 private arg_list(args: Buf[IrArg]) -> string
     var b = str_builder()

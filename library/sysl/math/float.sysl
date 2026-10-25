@@ -295,6 +295,28 @@ impl Float for f32
     to_degrees(self) -> f32 = self * 57.295776f32
 end f32
 
+/** A multiply and an add rounded once, at the two widths that can promise it.
+ *
+ * `x.mul_add(a, b)` is `x * a + b` with the product never rounded on its own: the exact `x * a` is
+ * added to `b` and only the sum is rounded, so it can answer what the two-step form cannot -- the
+ * rounding error of a product, `x.mul_add(a, -(x * a))`, is exact. It is the machine's fused
+ * instruction where the unit has one at that width and C's `fma` or `fmaf` where it does not, which
+ * is slower but still rounded once. In a `@strict_fp` body it is the constrained multiply-add, rounded
+ * in the mode in force and raising its flags.
+ *
+ * **It is not one of `Float`'s, because the half widths cannot keep the promise.** Computing an `f16`
+ * multiply-add at `f32` and narrowing rounds twice, and unlike the methods above, whose libm answer is
+ * already an approximation, here the single rounding is the whole of what was asked for.
+ */
+trait MulAdd
+    mul_add(self, a: Self, b: Self) -> Self
+
+impl MulAdd for real
+    mul_add(self, a: real, b: real) -> real = sysl_fma(self, a, b)
+
+impl MulAdd for f32
+    mul_add(self, a: f32, b: f32) -> f32 = sysl_fmaf(self, a, b)
+
 /** Binary16, and the first width whose mathematics is not its own.
  *
  * **libm stops at `float`.** There is no half-width entry point to bind -- no `sqrth`, no `sinh` that

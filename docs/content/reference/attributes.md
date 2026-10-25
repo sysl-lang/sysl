@@ -2700,6 +2700,215 @@ They stand beside everything else. `@tailrec` is about this function's call to *
 jump and `@noinline` about the call into it from elsewhere staying a call — two different calls, so
 there is nothing for them to disagree about; and `@test` only says who calls the function.
 
+## `@strict_fp` — floating point that follows the environment it runs in
+
+An ordinary float operation is IEEE 754's answer for round-to-nearest, and nothing promises when it
+runs or which exceptions it raises: the compiler may work it out while compiling, merge two identical
+ones, or move one past a call. That is what lets `x * k` leave a loop. It is also what makes a
+rounding mode impossible to use, because `set_rounding` is a call like any other and the addition
+written after it may not be.
+
+`@strict_fp` on a function says its floating point follows the **environment** in force when each
+operation runs — the rounding mode, and on Arm the flush-to-zero and default-NaN controls — and raises
+its exceptions there. [`sysl.fenv`](/library/fenv/) is how a program sets the environment and reads
+the flags:
+
+```sysl
+import sysl.fenv.*
+
+@strict_fp
+thirds(x: f64) -> (u64, u64)
+    set_rounding(Upward)
+    val up = x / 3.0
+    set_rounding(Downward)
+    val down = x / 3.0
+    set_rounding(NearestEven)
+    (up.bits(), down.bits())
+
+val (up, down) = thirds(1.0)
+print(f"$up%016x")
+print(f"$down%016x")
+```
+
+```output
+3fd5555555555556
+3fd5555555555555
+```
+
+The two divisions are the same expression with the same operands, and they are two operations, each
+rounded in the mode written above it. Without the annotation the second is free to be the first one's
+answer.
+
+### What it covers
+
+Inside a strict body, **every floating-point operation at `f32` and `f64`** follows the environment:
+
+- `+`, `-`, `*`, `/`, and a compound assignment of one, on a float or lane by lane on a vector of
+  them;
+- a multiply feeding an add, which is [one fused operation](/reference/expressions/#a-multiply-feeding-an-add-is-fused-where-the-machine-fuses)
+  rounded once, as it is everywhere, and [`x.mul_add(a, b)`](/library/math/#mul-add-a-multiply-and-an-add-rounded-once),
+  which asks for that operation by name;
+- the comparisons. `<`, `<=`, `>` and `>=` raise invalid when an operand is a NaN, as IEEE 754 says
+  the relational predicates do; `==` and `!=` are quiet;
+- the conversions: an integer read as a float and a float narrowed round in the mode in force, a
+  float read as an integer raises inexact when it drops a fraction, and one the integer cannot hold —
+  or a NaN — raises invalid while it [saturates](/reference/expressions/#conversions-are-calls) as it
+  does everywhere;
+- `sqrt`, `floor`, `ceil`, `round` and `trunc` called on a float, and the intrinsics a program
+  declares with `extern "llvm.…"`.
+
+Negation, `abs` and `copysign` touch the sign bit alone, round nothing and raise nothing, so they are
+what they always are. **A literal is a value, not an operation**: `0.1f32` is the binary32 nearest a
+tenth whatever the mode, and so is a `const`, which is worked out while compiling. An expression of
+literals is an operation like any other:
+
+```sysl
+import sysl.fenv.*
+
+@strict_fp
+shown() -> string
+    set_rounding(Downward)
+    val third = 1.0f32 / 3.0f32
+    val tenth = 0.1f32
+    set_rounding(NearestEven)
+    f"${third.bits()}%08x ${tenth.bits()}%08x"
+
+print(shown())
+```
+
+```output
+3eaaaaaa 3dcccccd
+```
+
+The flags an operation raises are raised where it runs, so a read of them after it sees them:
+
+```sysl
+import sysl.fenv.*
+
+@strict_fp
+divided(x: f64, y: f64) -> string
+    clear_flags()
+    val q = x / y
+    val f = flags()
+    f"${q > 1.0} divide-by-zero ${f.divide_by_zero}, inexact ${f.inexact}"
+
+print(divided(1.0, 0.0))
+print(divided(1.0, 3.0))
+```
+
+```output
+true divide-by-zero true, inexact false
+false divide-by-zero false, inexact true
+```
+
+### Closures and nested functions are strict too
+
+A closure or a nested function written inside a strict body is part of its text, so it is strict
+too. That is what makes `with_rounding` useful — the closure it runs is the strict caller's:
+
+```sysl
+import sysl.fenv.*
+
+@strict_fp
+third_up(x: f32) -> u32 = with_rounding(Upward, () -> x / 3.0f32).bits()
+
+print(f"${third_up(1.0f32)}%08x")
+```
+
+```output
+3eaaaaab
+```
+
+**A closure takes no annotation of its own**, so the place to say it is the function it is written
+in:
+
+```sysl
+val f = @strict_fp (x: f32) -> x + x
+print(f(1.0f32))
+```
+
+```error
+a closure takes no annotations, and '@strict_fp' reaches one through the function it is written in — every closure written inside a '@strict_fp' function is strict too, so mark that function, or move the closure into one
+```
+
+### What a strict body calls is compiled as it was written
+
+A call from a strict body to an ordinary function runs that function's operations as ordinary ones:
+they are not strict, whether the optimizer inlines the function or not, and the strict operations
+around the call stay strict either way. A **generic** function is the same — a strict body that
+calls `plain[T]` calls an ordinary instance — and a generic marked `@strict_fp` is strict at every
+instance. A method takes the annotation as a function does.
+
+The other way round, a strict function called from an ordinary one is strict, and is never inlined
+into it: its operations would have to stay strict among ones that are not, so the call stays a call.
+That is why `@inline(always)` cannot stand beside it:
+
+```sysl
+@strict_fp
+@inline(always)
+twice(x: f32) -> f32 = x + x
+
+print(twice(1.0f32))
+```
+
+```error
+'@inline(always)' puts the body in place of every call, and a '@strict_fp' body is only ever put inside a caller that is '@strict_fp' too — anywhere else the call stays a call, so the promise could not be kept. Write '@inline' for the hint, which a strict caller takes
+```
+
+`@strict_fp` takes no argument — the mode is whatever the environment holds — and it marks a
+function or a method; above an `extern`, whose operations someone else compiled, it is refused.
+
+### Where there is no environment to follow
+
+A strict body computes at `f32` and `f64`. An operation at `f16`, `bf16` or `f128` is widened,
+emulated or called on most machines, and is refused where it is written:
+
+```sysl
+@strict_fp
+half(x: f16) -> f16 = x + x
+
+print(half(1.0f16))
+```
+
+```error
+a '@strict_fp' body computes at f32 and f64, the widths a floating-point unit performs under its environment, and this is f16
+```
+
+A float a machine computes in software — every float on a core with no floating-point unit, an `f64`
+on a Cortex-M4F, whose unit is single precision — has no environment to follow either, so it is
+refused for that machine. Fixed point is integer arithmetic and follows no floating-point
+environment, so a strict body neither changes it nor refuses it.
+
+```sysl target=thumbv6m-freestanding
+@strict_fp
+@export("twice")
+twice(x: f32) -> f32 = x + x
+```
+
+```error
+'@strict_fp' asks the floating-point unit to follow its environment, and 'thumbv6m-freestanding' computes f32 in software, which has no environment to follow and raises nothing
+```
+
+So is a conversion whose integer is wider than the machine's word. A unit converts the integers its
+registers hold, so a 32-bit Arm core reads an `i64` as a float with a library call, and every machine
+does the same with an `i128`; the library rounds to nearest and raises nothing. An integer of the
+word's width or narrower is the unit's own instruction:
+
+```sysl target=thumbv7em-freestanding
+@strict_fp
+@export("widened")
+widened(n: i64) -> f32 = f32(n)
+```
+
+```error
+'@strict_fp' asks the floating-point unit to follow its environment, and on 'thumbv7em-freestanding' a conversion between long and f32 is a library call, since the unit converts integers of at most 32 bits
+```
+
+WebAssembly's floating point always rounds to nearest and raises nothing, so a strict body's float
+operations are refused there. On a vector, lane-wise operations are strict, but a reduction —
+`v.sum()`, `v.min()` — combines the lanes in an order the target chooses and has no strict form, so
+inside a strict body it is refused, and the lanes are read and combined one by one instead.
+
 ## `@disjoint` — parameters whose memory nothing else reaches
 
 A kernel that writes through one view and reads through another is the loop a vectorizer exists

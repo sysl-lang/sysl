@@ -212,7 +212,8 @@ the add are two operations, each rounded.
 **A product is kept apart by anything written between it and the sum**: a `val` it is bound to, a
 call it is passed through (other than an [arithmetic operator](#an-arithmetic-operator-is-read-as-its-body)),
 an explicit conversion. That is how a program asks for two roundings, and
-`llvm.fma` ([ffi](/reference/ffi/)) is how it asks for one on every machine:
+[`x.mul_add(a, b)`](/library/math/#mul-add-a-multiply-and-an-add-rounded-once) — or `llvm.fma`
+([ffi](/reference/ffi/)) declared by hand — is how it asks for one on every machine:
 
 ```sysl
 val x = 1.0 + 1.0 / 1073741824.0
@@ -435,6 +436,16 @@ false false
 
 This is also why a float is not hashable: a table assumes a reflexive equality, and one `NaN` breaks
 it.
+
+### A float operation rounds to nearest unless its function says otherwise
+
+An operation's answer is IEEE 754's for round-to-nearest-even, and the exceptions it raises are not
+something a program observes: the compiler may work an operation out while compiling, merge two
+identical ones into one, or move one past a call. A function whose floating point has to follow the
+rounding mode, flush-to-zero and default-NaN controls in force when it runs, and raise its exceptions
+where it is written, is marked
+[`@strict_fp`](/reference/attributes/#strict-fp-floating-point-that-follows-the-environment-it-runs-in);
+[`sysl.fenv`](/library/fenv/) sets that environment and reads the flags.
 
 ## Logical operators
 

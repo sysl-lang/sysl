@@ -854,6 +854,13 @@ written after is moved before it, and a store is not dropped as dead because a s
 same word follows: each form is treated as touching all of memory. That is everything the compiler
 can promise, because it is everything the compiler controls.
 
+**A floating-point operation is not a memory access, so this order does not hold it.** An ordinary
+`x + y` may be computed while compiling, merged with an identical one, or moved past a
+`write_sysreg("fpcr", …)` that changes the rounding mode, and its flags read through
+`read_sysreg("fpsr")` may never be raised. A function whose floating point has to follow those
+writes is marked [`@strict_fp`](/reference/attributes/#strict-fp-floating-point-that-follows-the-environment-it-runs-in),
+and [`sysl.fenv`](/library/fenv/) reads and sets the environment on every machine that has one.
+
 **The processor is a separate matter.** An `msr` is not a memory access, so no
 [`Ordering`](/library/sync/#ordering) (`Release`, `SeqCst`, a fence) orders a store before it. The
 C11 orderings relate memory accesses to other memory accesses, and an AArch64 core may let the write

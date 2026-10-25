@@ -1,0 +1,309 @@
+module sysl.fenv
+@no_alloc
+
+/** The floating-point environment: the rounding mode, the five exception flags, and on Arm the
+ * flush-to-zero and default-NaN controls.
+ *
+ * **The environment belongs to the thread.** Each thread has its own control and status registers --
+ * AArch64's FPCR and FPSR, x86-64's MXCSR, an Armv7-M or Armv8-M core's FPSCR, RISC-V's `fcsr` -- so
+ * what one thread sets is never seen by another, and a thread starts with round-to-nearest and no
+ * flags raised.
+ *
+ * **Only a `@strict_fp` body promises to follow it** (`reference/attributes.md § @strict_fp`). An
+ * ordinary body's operations may be computed while compiling, merged with one another, or moved past
+ * a call of `set_rounding`, so what they round to and which flags they raise is not something a
+ * program can count on; inside a strict body every operation runs where it was written, in the
+ * environment that is in force there.
+ *
+ * A machine with no floating-point unit has no environment, and a program reaching this module there
+ * is refused at the call; so is one asking for a control its unit does not have.
+ */
+
+/** How a result that falls between two representable values is rounded: IEEE 754's four directions. */
+enum RoundingMode
+    // To the nearer of the two, and the one with an even last digit at a tie. What every thread starts
+    // with, and the only mode a constant is computed in.
+    NearestEven
+
+    // Toward positive infinity.
+    Upward
+
+    // Toward negative infinity.
+    Downward
+
+    // Toward zero, which drops the bits that do not fit.
+    TowardZero
+end RoundingMode
+
+/** The five exceptions IEEE 754 defines, each one raised -- set, and left set -- by an operation that
+ * meets it. Nothing clears a flag but `clear_flags`, so a flag read after a run of operations says
+ * whether any of them raised it.
+ */
+struct FpFlags
+    // An operation with no meaningful answer: `0.0 / 0.0`, `sqrt(-1.0)`, an ordered comparison with a
+    // NaN, a float too large for the integer it is converted to.
+    invalid: bool
+
+    // A finite non-zero number divided by zero.
+    divide_by_zero: bool
+
+    // A result too large in magnitude for the format, rounded to an infinity or the largest finite.
+    overflow: bool
+
+    // A result too small in magnitude to be normal, and not exact.
+    underflow: bool
+
+    // A result that had to be rounded.
+    inexact: bool
+
+    /** Whether any of the five is raised. */
+    any(self) -> bool = self.invalid || self.divide_by_zero || self.overflow || self.underflow || self.inexact
+end FpFlags
+
+/** The rounding mode in force on this thread. */
+rounding() -> RoundingMode = rounding_of((control() >> rounding_shift()) & rounding_mask())
+
+/** Makes `r` the rounding mode on this thread. */
+set_rounding(r: RoundingMode)
+    set_control((control() & ~(rounding_mask() << rounding_shift())) | (rounding_code(r) << rounding_shift()))
+
+/** The flags raised on this thread since they were last cleared. */
+flags() -> FpFlags
+    val s = status()
+
+    FpFlags(raised(s, invalid_bit()), raised(s, divide_bit()), raised(s, overflow_bit()),
+            raised(s, underflow_bit()), raised(s, inexact_bit()))
+end flags
+
+/** Clears the five flags on this thread, leaving the controls as they are. */
+clear_flags()
+    val all = (u64(1) << invalid_bit()) | (u64(1) << divide_bit()) | (u64(1) << overflow_bit()) |
+              (u64(1) << underflow_bit()) | (u64(1) << inexact_bit())
+
+    set_status(status() & ~all)
+end clear_flags
+
+/** Whether a subnormal result -- and, on x86-64, a subnormal operand -- is read as a zero of its sign. */
+flush_to_zero() -> bool = flush_bits() != 0 && (control() & flush_bits()) == flush_bits()
+
+/** Turns flush-to-zero on or off on this thread: AArch64's and Arm's FPCR.FZ, x86-64's MXCSR.FTZ with
+ * MXCSR.DAZ beside it, so that both machines flush what goes in as well as what comes out.
+ */
+set_flush_to_zero(on: bool)
+    val cleared = control() & ~flush_bits()
+
+    set_control(if on then cleared | flush_bits() else cleared)
+
+/** Whether an operation that answers a NaN answers the default one -- positive, quiet, no payload --
+ * rather than propagating the payload of a NaN operand.
+ */
+default_nan() -> bool = (control() & default_nan_bit()) != 0
+
+/** Turns default-NaN on or off on this thread: FPCR.DN on AArch64 and Arm. */
+set_default_nan(on: bool)
+    val cleared = control() & ~default_nan_bit()
+
+    set_control(if on then cleared | default_nan_bit() else cleared)
+
+/** Runs `body` with `r` the rounding mode, and puts the mode back on every way out of it.
+ *
+ * What `body` computes follows `r` where `body` is written in a `@strict_fp` function -- a closure
+ * written there is strict too. Elsewhere its operations are not held to the mode at all.
+ */
+with_rounding[R](r: RoundingMode, body: () -> R) -> R
+    val saved = rounding()
+
+    set_rounding(r)
+
+    defer set_rounding(saved)
+    body()
+end with_rounding
+
+private raised(s: u64, bit: u64) -> bool = ((s >> bit) & 1) != 0
+
+// -- the registers ----------------------------------------------------------------------------------
+//
+// Each machine is a control word, a status word -- on every machine but AArch64 the same register --
+// and where the fields sit in them.
+
+#if aarch64
+
+private control() -> u64 = read_sysreg("fpcr")
+private set_control(c: u64) = write_sysreg("fpcr", c)
+private status() -> u64 = read_sysreg("fpsr")
+private set_status(s: u64) = write_sysreg("fpsr", s)
+
+#elif x86_64
+
+// MXCSR is read and written through memory, as `stmxcsr` and `ldmxcsr` take it.
+private control() -> u64
+    var word: u32 = 0
+    val at = &word
+
+    asm
+        [x86_64]
+            "stmxcsr ({at})"
+            in at : reg
+        [x86, aarch64, riscv64, riscv32, thumb, craft, wasm32] unavailable "MXCSR is x86-64's"
+
+    word
+end control
+
+private set_control(c: u64)
+    var word = u32(c)
+    val at = &word
+
+    asm
+        [x86_64]
+            "ldmxcsr ({at})"
+            in at : reg
+        [x86, aarch64, riscv64, riscv32, thumb, craft, wasm32] unavailable "MXCSR is x86-64's"
+end set_control
+
+private status() -> u64 = control()
+private set_status(s: u64) = set_control(s)
+
+#elif thumb && fpu
+
+private control() -> u64
+    var word: u32 = 0
+
+    asm
+        [thumb]
+            "vmrs {word}, fpscr"
+            out word : reg
+        [x86_64, x86, aarch64, riscv64, riscv32, craft, wasm32] unavailable "FPSCR is an Arm core's"
+
+    word
+end control
+
+private set_control(c: u64)
+    val word = u32(c)
+
+    asm
+        [thumb]
+            "vmsr fpscr, {word}"
+            in word : reg
+        [x86_64, x86, aarch64, riscv64, riscv32, craft, wasm32] unavailable "FPSCR is an Arm core's"
+end set_control
+
+private status() -> u64 = control()
+private set_status(s: u64) = set_control(s)
+
+#elif (riscv64 || riscv32) && fpu
+
+private control() -> u64
+    var word: usize = 0
+
+    asm
+        [riscv64, riscv32]
+            "csrr {word}, fcsr"
+            out word : reg
+        [x86_64, x86, aarch64, thumb, craft, wasm32] unavailable "fcsr is a RISC-V core's"
+
+    word
+end control
+
+private set_control(c: u64)
+    val word = usize(c)
+
+    asm
+        [riscv64, riscv32]
+            "csrw fcsr, {word}"
+            in word : reg
+        [x86_64, x86, aarch64, thumb, craft, wasm32] unavailable "fcsr is a RISC-V core's"
+end set_control
+
+private status() -> u64 = control()
+private set_status(s: u64) = set_control(s)
+
+#else
+
+// No environment to reach: a program calling into this module on such a machine is refused where it
+// calls, so none of these runs.
+private control() -> u64 = 0
+private set_control(c: u64) = ()
+private status() -> u64 = 0
+private set_status(s: u64) = ()
+
+#endif
+
+#if x86_64
+
+private rounding_shift() -> u64 = 13
+private rounding_mask() -> u64 = 3
+
+private rounding_code(r: RoundingMode) -> u64 = r match
+    NearestEven -> 0
+    Downward -> 1
+    Upward -> 2
+    TowardZero -> 3
+
+private rounding_of(code: u64) -> RoundingMode = code match
+    1 -> Downward
+    2 -> Upward
+    3 -> TowardZero
+    _ -> NearestEven
+
+private invalid_bit() -> u64 = 0
+private divide_bit() -> u64 = 2
+private overflow_bit() -> u64 = 3
+private underflow_bit() -> u64 = 4
+private inexact_bit() -> u64 = 5
+private flush_bits() -> u64 = (u64(1) << 15) | (u64(1) << 6)
+private default_nan_bit() -> u64 = 0
+
+#elif riscv64 || riscv32
+
+// `frm` is bits 7:5 of `fcsr`; its fifth mode, to nearest with ties away from zero, is not one of
+// IEEE 754's required four and is read as nearest.
+private rounding_shift() -> u64 = 5
+private rounding_mask() -> u64 = 7
+
+private rounding_code(r: RoundingMode) -> u64 = r match
+    NearestEven -> 0
+    TowardZero -> 1
+    Downward -> 2
+    Upward -> 3
+
+private rounding_of(code: u64) -> RoundingMode = code match
+    1 -> TowardZero
+    2 -> Downward
+    3 -> Upward
+    _ -> NearestEven
+
+private invalid_bit() -> u64 = 4
+private divide_bit() -> u64 = 3
+private overflow_bit() -> u64 = 2
+private underflow_bit() -> u64 = 1
+private inexact_bit() -> u64 = 0
+private flush_bits() -> u64 = 0
+private default_nan_bit() -> u64 = 0
+
+#else
+
+// AArch64's FPCR and FPSR, and an Arm core's FPSCR, which holds both at the same positions.
+private rounding_shift() -> u64 = 22
+private rounding_mask() -> u64 = 3
+
+private rounding_code(r: RoundingMode) -> u64 = r match
+    NearestEven -> 0
+    Upward -> 1
+    Downward -> 2
+    TowardZero -> 3
+
+private rounding_of(code: u64) -> RoundingMode = code match
+    1 -> Upward
+    2 -> Downward
+    3 -> TowardZero
+    _ -> NearestEven
+
+private invalid_bit() -> u64 = 0
+private divide_bit() -> u64 = 1
+private overflow_bit() -> u64 = 2
+private underflow_bit() -> u64 = 3
+private inexact_bit() -> u64 = 4
+private flush_bits() -> u64 = u64(1) << 24
+private default_nan_bit() -> u64 = u64(1) << 25
+
+#endif
