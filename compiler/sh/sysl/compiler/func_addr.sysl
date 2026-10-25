@@ -131,25 +131,7 @@ function_address(cx: &Analyzer, span: Span, written: string, targ_exprs: Buf[Exp
     // exempted from it: neither is code this compiler laid out its own way.
     val c_convention = cx.an.tables.externs.has(inst) || decl.exported.is_some()
 
-    if !c_convention
-        for i in 0..<(ptypes.len() + 1)
-            val t = if i < ptypes.len() then ptypes.at(i) else ret
-
-            // A part nobody could type -- a result read off a body that was itself refused -- has
-            // been told where it was refused, and is no aggregate to name here.
-            if mentions_unknown(t) then return bad_expr(span)
-
-            if !crosses_as_itself(t)
-                var which = "the result"
-
-                if i < ptypes.len() then which = s"the ${ordinal(i + 1)} parameter"
-
-                return cx.err(span, s"$which of '$written' is ${type_show(t)}, an aggregate, and " +
-                              "an aggregate crosses to C in whichever registers that machine's " +
-                              "convention names rather than the ones a sysl call uses — so this " +
-                              "address would be of a function C cannot call correctly. A wrapper " +
-                              "taking the parts behind a '*T', or '@export' on this one, is what " +
-                              "has an address")
+    if !c_convention && !crosses_whole(cx, span, written, ptypes, ret) then return bad_expr(span)
 
     cx.an.uses(inst)
     note_func_reference(cx, span, key)
@@ -158,6 +140,268 @@ function_address(cx: &Analyzer, span: Span, written: string, targ_exprs: Buf[Exp
 
     TExpr(span, TFuncAddr(inst, inst, CFn(ptypes, ret)))
 end function_address
+
+// Whether every part of a signature crosses to C as itself, reporting the first that does not.
+//
+// The address is of **code**, and the code has to be the code C would call. Where every part crosses
+// as itself the two conventions agree and the function's own symbol is the answer; where one does
+// not, sysl emitted the aggregate its own way and C would read the wrong registers.
+private crosses_whole(cx: &Analyzer, span: Span, written: string, ptypes: Buf[Type],
+                      ret: Type) -> bool
+    for i in 0..<(ptypes.len() + 1)
+        val t = if i < ptypes.len() then ptypes.at(i) else ret
+
+        // A part nobody could type -- a result read off a body that was itself refused -- has been
+        // told where it was refused, and is no aggregate to name here.
+        if mentions_unknown(t) then return false
+
+        if !crosses_as_itself(t)
+            var which = "the result"
+
+            if i < ptypes.len() then which = s"the ${ordinal(i + 1)} parameter"
+
+            cx.fault(span, s"$which of '$written' is ${type_show(t)}, an aggregate, and an " +
+                     "aggregate crosses to C in whichever registers that machine's convention " +
+                     "names rather than the ones a sysl call uses — so this address would be of a " +
+                     "function C cannot call correctly. A wrapper taking the parts behind a '*T', " +
+                     "or '@export' on this one, is what has an address")
+            return false
+        end if
+
+    true
+end crosses_whole
+
+// `&T.f` -- the address of an associated function, which is the address of a module function one
+// name over: a method's receiver is its first parameter, as it is in the code the member compiled
+// to, so `&Counter.bump` over `bump(*self)` is a `*extern(*Counter) -> …`.
+//
+// **Nothing where the operand is not a member read off a type's name**, which leaves every other
+// `&a.b` -- a field of a value, a variant, a property -- to the reading it always had, and that
+// reading's refusals.
+associated_address(cx: &Analyzer, span: Span, operand: Expr,
+                   expected: Option[Type]) -> Option[TExpr]
+    val (receiver, name) = *operand.kind match
+        Field(r, n, _) -> (r, n)
+        _ -> return None
+
+    var ty = Unknown
+    var shown = ""
+    val applied = written_on_generic_type(cx, receiver)
+
+    if applied.is_some()
+        val head = applied.unwrap().0
+
+        shown = head.1
+
+        val targs = written_type_args_for(cx, head.0, applied.unwrap().1)
+
+        for t in targs
+            if t == Unknown then return Some(bad_expr(span))
+
+        ty = reinstantiate_at(cx.an, cx.scope, span, head.0, targs)
+
+        if ty == Unknown then return Some(bad_expr(span))
+    else
+        val written = written_type_name(cx, receiver)
+
+        if written.is_none() then return None
+
+        shown = written.unwrap()
+
+        val key = lookup_type_key(cx.an, cx.scope, shown)
+
+        var is_trait = false
+
+        if key.is_some()
+            cx.an.tables.types.get(key.unwrap()) match
+                Some(d) -> d.kind match
+                    TraitOf(_) -> is_trait = true
+                    _ -> ()
+                None -> ()
+        end if
+
+        if is_trait then
+            return Some(cx.err(span, s"'$shown' is a trait, and '&$shown.$name' would be the " +
+                               s"address of whichever '$name' a value's type implements — a trait's " +
+                               s"member has one body per type and none of its own. The address is " +
+                               s"of one type's: '&T.$name' with 'T' a type implementing '$shown'"))
+
+        val named = subject_named(cx, receiver)
+
+        if named.is_some()
+            ty = named.unwrap()
+        else
+            val generic = generic_type_head(cx, receiver)
+
+            if generic.is_none() then return None
+
+            val inferred = inferred_subject(cx, span, generic.unwrap().0, shown, name, expected)
+
+            if inferred.is_none() then return None
+
+            ty = inferred.unwrap()
+
+            if ty == Unknown then return Some(bad_expr(span))
+        end if
+    end if
+
+    // **A type parameter's member is addressed at each instantiation**, where the parameter is a
+    // concrete type and this is that type's `f` -- static, as the call `T.f()` there is. Read at the
+    // generic's definition there is no one type's code to name, only the bound's promise of one per
+    // type; that reading's complaints are the definition's own and are not kept, so this one stands
+    // only where a parameter would otherwise reach the member tables as itself.
+    ty match
+        Abstract(_, _) ->
+            return Some(cx.err(span, s"'$shown' is a type parameter, and '&$shown.$name' would be " +
+                               s"the address of whichever '$name' its type argument has — reached " +
+                               "through the bound, which is a trait, it has one body per type and " +
+                               "none of its own. A '*extern' parameter the caller fills with the " +
+                               "address at a concrete type is what has one"))
+        _ -> ()
+
+    val found = member_key(cx.an, ty, name)
+    var picked = name
+
+    if cx.an.tables.members.alts.has(member_key_of(found.0, name))
+        val chosen = addressed_member(cx, span, ty, found.0, s"$shown.$name", name, expected)
+
+        if chosen == "" then return Some(bad_expr(span))
+
+        picked = chosen
+    end if
+
+    val m = member_at(cx.an, found.0, picked)
+
+    if m.is_none() then return None
+
+    val decl = m.unwrap()
+
+    // A property is read rather than called, and the reading it always had says so.
+    if decl.is_property then return None
+
+    val generic = cx.an.tables.members.generic.get(member_key_of(found.0, picked))
+
+    if generic.is_some() && generic.unwrap().tparams.len() > found.1.len() then
+        return Some(cx.err(span, s"'$name' has type parameters of its own, so '&$shown.$name' does " +
+                           "not say which copy of it is meant — and an address has no arguments " +
+                           "to settle them. A module function calling it at the types meant is " +
+                           "what has an address"))
+
+    if decl.variadic then
+        return Some(cx.err(span, s"'$shown.$name' is variadic, and a '*extern' fixes the arguments " +
+                           "a call passes — a tail has no width a signature could state, so a " +
+                           "variadic function is reached by calling it"))
+
+    val before = cx.an.complaints()
+
+    check_member_visible(cx, span, found.0, picked, decl)
+
+    if cx.an.complaints() != before then return Some(bad_expr(span))
+
+    val fname = member_func_name(cx, span, ty, picked)
+
+    if fname == "" then return Some(bad_expr(span))
+
+    val sig = member_sig(cx.an, fname)
+
+    if sig.is_none() then return Some(bad_expr(span))
+
+    var ptypes: Buf[Type] = buf()
+
+    for i in 0..<sig.unwrap().params.len()
+        ptypes.push(sig.unwrap().params.at(i).1)
+
+    val ret = sig.unwrap().ret
+
+    if !crosses_whole(cx, span, s"$shown.$name", ptypes, ret) then return Some(bad_expr(span))
+
+    note_member_reference(cx, span, fname, decl)
+    cx.an.uses(fname)
+
+    Some(TExpr(span, TFuncAddr(fname, fname, CFn(ptypes, ret))))
+end associated_address
+
+// Which of the members filed under one name an address is of -- a type's own overloads, or the
+// members several traits gave it -- chosen as a module function's overload is: by the parameter
+// list the context's type states, among the ones this file may reach. A member with type parameters
+// of its own has no signature until a call settles them, and is no candidate.
+private addressed_member(cx: &Analyzer, span: Span, ty: Type, base: string, written: string,
+                         name: string, expected: Option[Type]) -> string
+    val alts = cx.an.tables.members.alts.get(member_key_of(base, name)).unwrap()
+    val wanted = if expected.is_none() then None else cfn_of(expected.unwrap())
+    var cands: Buf[string] = buf()
+
+    for item in alts
+        if member_reachable(cx, base, item, implicit = true) then cands.push(item)
+
+    // None in reach is told why by the visibility check the chosen member goes through anyway.
+    if cands.is_empty() then return alts.at(0)
+    if cands.len() == 1 then return cands.at(0)
+
+    var fits: Buf[string] = buf()
+    var declared = ""
+
+    for item in cands
+        val generic = cx.an.tables.members.generic.get(member_key_of(base, item))
+
+        if generic.is_some() && generic.unwrap().tparams.len() > member_key(cx.an, ty, name).1.len() then
+            continue
+
+        val mark = cx.an.complaints()
+        val fname = member_func_name(cx, span, ty, item)
+
+        cx.an.restore_complaints(mark)
+
+        val sig = if fname == "" then None else member_sig(cx.an, fname)
+
+        if sig.is_none() then continue
+
+        var ps: Buf[Type] = buf()
+
+        for j in 0..<sig.unwrap().params.len()
+            ps.push(sig.unwrap().params.at(j).1)
+
+        declared = declared + s"\n    $written: ${type_show(CFn(ps, sig.unwrap().ret))}"
+
+        if wanted.is_some() && types_eq(ps, wanted.unwrap().0) then fits.push(item)
+
+    the_one_addressed(cx, span, written, cands.len(), fits, declared, expected)
+end addressed_member
+
+// Which instantiation a generic type's bare name stands for in `&Box.get`, read off the address's
+// own type the way a call reads it off its result.
+//
+// **A method's receiver is the first parameter, so that is where its type's arguments are** --
+// `*extern(*Box[int]) -> int` says `Box[int]` outright. A member without one is settled the way the
+// call `Box.of(…)` is by what receives it: through a result that mentions every parameter. Anything
+// else has nothing to go on, and the refusal names the written form.
+private inferred_subject(cx: &Analyzer, span: Span, key: string, shown: string, name: string,
+                         expected: Option[Type]) -> Option[Type]
+    val m = member_at(cx.an, key, name)
+
+    if m.is_none() || m.unwrap().is_property then return None
+
+    val want = if expected.is_none() then None else cfn_of(expected.unwrap())
+
+    if want.is_some()
+        if m.unwrap().recv_mode().is_some() && !want.unwrap().0.is_empty()
+            val first = want.unwrap().0.at(0)
+            val subject = underlying(first) match
+                Ptr(inner) -> *inner
+                Ref(inner, _) -> *inner
+                _ -> first
+
+            if instantiation_of(subject, key) then return Some(repr(subject))
+        else if instantiation_of(want.unwrap().1, key) && result_settles_type(cx, key, m.unwrap())
+            return Some(repr(want.unwrap().1))
+        end if
+    end if
+
+    cx.fault(span, s"'$shown' is generic, so which copy of '$name' this addresses depends on its " +
+             s"type arguments, and nothing here says what they are — write them, as " +
+             s"'&$shown[…].$name', or write the type this is stored in")
+    Some(Unknown)
+end inferred_subject
 
 // A call through a C function pointer, which goes through the pointer rather than through a table.
 //

@@ -1,0 +1,313 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// A value whose release can run a destructor lives to the end of its scope, as it did in 0.5.x,
+// unless something that lasts as long takes it over (`emit_moves.sysl`). Its last use being a read,
+// or a hand-over to an owned parameter whose callee keeps it only in the call's result, or to a box
+// built for the statement, does not end it there. Each program's `Drop` prints, so the order is the
+// claim, and it runs on the counted heap, which must end at nothing live.
+
+private dse_prelude() -> string = raw"""
+    import sysl.raw.ptr_cast
+    import sysl.buf.{Buf, buf}
+
+    struct Tag
+        id: int
+
+    impl Drop for Tag
+        drop(self) = print("drop", self.id)
+
+    struct Plain
+        id: int
+
+    struct Wrap
+        t: &Tag
+        n: int
+
+    struct Holder
+        t: &Tag
+
+    read(t: &Tag) -> int = t.id
+    keep(t: &Tag) -> Option[&Tag] = Some(t)
+    pick(w: Wrap) -> Wrap = w
+    keep_opt(o: Option[&Tag]) -> Option[&Tag] = o
+    keep_buf(b: Buf[&Tag]) -> Buf[&Tag] = b
+    read_h(h: &Holder) -> int = h.t.id
+    keep_g[T](x: T) -> Option[T] = Some(x)
+
+    """
+
+// The program built with counting on and run: what it printed, and what the heap said at exit.
+private dse_counted(body: string) -> (string, string)
+    val root = make_temp_dir("sysl-dse").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", dse_prelude() + body).unwrap()
+    force_alloc_counting(true)
+
+    val built = build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(s"$root/built"))
+
+    force_alloc_counting(false)
+
+    built match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (failure_text(why), "")
+        Ok(_) -> ()
+
+    val said = capture(s"$root/built", [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> ("could not be started", "")
+        Ok(o) -> (o.text, o.err.unwrap_or(""))
+end dse_counted
+
+@test("a view made through ptr_cast from what a Drop value owns is read after that value's last use")
+dse_view_outlives_last_use()
+    if std_root().is_err() || !clang_available() then return
+
+    val ran = dse_counted(raw"""
+        var store: [4]int = [1, 2, 3, 4]
+
+        struct Chunk
+            id: int
+
+        impl Drop for Chunk
+            drop(self)
+                store[3] = 0
+                print("drop chunk", self.id)
+
+        struct Col
+            n: int
+            owner: Option[&Chunk]
+
+        impl Chunk
+            column(&self) -> Col = Col(4, Some(self))
+
+        impl Col
+            ints(self) -> []const int
+                val p: *int = ptr_cast(&store)
+                p[0..<self.n]
+
+        main()
+            val ch: &Chunk = Chunk(2)
+            val xs = ch.column().ints()
+            print("len", xs.len)
+            print("last", xs[3])
+        """)
+
+    assert_eq(ran.0, "len 4\nlast 4\ndrop chunk 2\n")
+    assert(!ran.1.contains("still live"), ran.1)
+end dse_view_outlives_last_use
+
+@test("a Drop value's last use as a read, an owned argument or a box's field leaves it to its scope's end")
+dse_last_use_is_not_the_end()
+    if std_root().is_err() || !clang_available() then return
+
+    val ran = dse_counted(raw"""
+        by_read()
+            val t: &Tag = Tag(1)
+            print("read", read(t))
+            print("after read")
+
+        by_owned()
+            val t: &Tag = Tag(3)
+            val n = keep(t).unwrap().id
+            print("after keep", n)
+
+        by_box()
+            val t: &Tag = Tag(4)
+            val n = read_h(Holder(t))
+            print("after box", n)
+
+        main()
+            by_read()
+            by_owned()
+            by_box()
+            print("end")
+        """)
+
+    assert_eq(ran.0, "read 1\nafter read\ndrop 1\nafter keep 3\ndrop 3\nafter box 4\ndrop 4\nend\n")
+    assert(!ran.1.contains("still live"), ran.1)
+end dse_last_use_is_not_the_end
+
+@test("a Drop value moved to a lasting owner is destroyed by that owner, and a temporary in the callee that keeps it")
+dse_moved_value_drops_at_its_owner()
+    if std_root().is_err() || !clang_available() then return
+
+    val ran = dse_counted(raw"""
+        var kept: Option[&Tag] = None
+
+        sink(t: &Tag) = kept = Some(t)
+
+        sink_local(t: &Tag)
+            val b: Buf[&Tag] = buf()
+            b.push(t)
+            print("in sink_local")
+
+        stored()
+            val t: &Tag = Tag(5)
+            sink(t)
+            print("after sink")
+
+        bound()
+            val t: &Tag = Tag(6)
+            val u = t
+            print("bound", u.id)
+            print("after bound")
+
+        main()
+            stored()
+            print("stored")
+            kept = None
+            print("cleared")
+            sink_local(Tag(7))
+            print("after sink_local")
+            bound()
+            print("end")
+        """)
+
+    assert_eq(ran.0, "after sink\nstored\ndrop 5\ncleared\nin sink_local\ndrop 7\nafter sink_local\n" +
+                     "bound 6\nafter bound\ndrop 6\nend\n")
+    assert(!ran.1.contains("still live"), ran.1)
+end dse_moved_value_drops_at_its_owner
+
+@test("a Drop value held in a struct, a Buf or an Option lives to its holder's scope's end")
+dse_held_in_a_value()
+    if std_root().is_err() || !clang_available() then return
+
+    val ran = dse_counted(raw"""
+        in_struct()
+            val w = Wrap(Tag(7), 1)
+            print("pick", pick(w).n)
+            print("after pick")
+
+        in_buf()
+            val b: Buf[&Tag] = buf()
+            b.push(Tag(8))
+            print("len", keep_buf(b).len())
+            print("after buf")
+
+        in_option()
+            val o: Option[&Tag] = Some(Tag(9))
+            print("some", keep_opt(o).is_some())
+            print("after option")
+
+        main()
+            in_struct()
+            in_buf()
+            in_option()
+            print("end")
+        """)
+
+    assert_eq(ran.0, "pick 1\nafter pick\ndrop 7\nlen 1\nafter buf\ndrop 8\nsome true\nafter option\ndrop 9\nend\n")
+    assert(!ran.1.contains("still live"), ran.1)
+end dse_held_in_a_value
+
+@test("a Drop value ends with its inner block, each loop turn, and its declaring scope rather than an arm")
+dse_scopes()
+    if std_root().is_err() || !clang_available() then return
+
+    val ran = dse_counted(raw"""
+        inner(c: bool)
+            if c
+                val t: &Tag = Tag(10)
+                print("inner", read(t))
+                print("inner end")
+            print("after inner")
+
+        arm(c: bool)
+            val t: &Tag = Tag(11)
+            if c
+                print("arm", read(t))
+            else
+                print("other arm")
+            print("after if")
+
+        turns()
+            for i in 0..<2
+                val t: &Tag = Tag(20 + i)
+                print("iter", keep(t).unwrap().id)
+                print("iter end", i)
+            print("after loop")
+
+        main()
+            inner(true)
+            arm(true)
+            arm(false)
+            turns()
+            print("end")
+        """)
+
+    assert_eq(ran.0, "inner 10\ninner end\ndrop 10\nafter inner\narm 11\nafter if\ndrop 11\nother arm\n" +
+                     "after if\ndrop 11\niter 20\niter end 0\ndrop 20\niter 21\niter end 1\ndrop 21\n" +
+                     "after loop\nend\n")
+    assert(!ran.1.contains("still live"), ran.1)
+end dse_scopes
+
+@test("a Drop value is destroyed on an early return, on a ? that leaves, and after the defers of its scope")
+dse_exits()
+    if std_root().is_err() || !clang_available() then return
+
+    val ran = dse_counted(raw"""
+        early(id: int, stop: bool) -> int
+            val t: &Tag = Tag(id)
+            val n = keep(t).unwrap().id
+            if stop then return n
+            print("not stopped")
+            n
+
+        check(fail: bool) -> Result[int, string] = if fail then Err("no") else Ok(1)
+
+        tried(id: int, fail: bool) -> Result[int, string]
+            val t: &Tag = Tag(id)
+            val n = keep(t).unwrap().id
+            val m = check(fail)?
+            print("tried", m)
+            Ok(n + m)
+
+        deferred()
+            val t: &Tag = Tag(50)
+            defer print("deferred")
+            print("read", keep(t).unwrap().id)
+            print("body end")
+
+        main()
+            print("early", early(30, true))
+            print("early", early(31, false))
+            print("try", tried(40, true).is_err())
+            print("try", tried(41, false).unwrap())
+            deferred()
+            print("end")
+        """)
+
+    assert_eq(ran.0, "early drop 30\n30\nearly not stopped\ndrop 31\n31\ntry drop 40\ntrue\ntry tried 1\n" +
+                     "drop 41\n42\nread 50\nbody end\ndeferred\ndrop 50\nend\n")
+    assert(!ran.1.contains("still live"), ran.1)
+end dse_exits
+
+@test("a generic body instantiated with a Drop type keeps its value to the end, and with a plain one is correct")
+dse_generic_twins()
+    if std_root().is_err() || !clang_available() then return
+
+    val ran = dse_counted(raw"""
+        gen[T](x: T, label: string)
+            keep_g(x)
+            print("gen after", label)
+
+        main()
+            gen(Tag(60), "tag")
+            val p: &Plain = Plain(61)
+            gen(p, "plain")
+            print("plain", p.id)
+            print("end")
+        """)
+
+    assert_eq(ran.0, "gen after tag\ndrop 60\ngen after plain\nplain 61\nend\n")
+    assert(!ran.1.contains("still live"), ran.1)
+end dse_generic_twins

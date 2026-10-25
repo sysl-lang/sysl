@@ -226,8 +226,9 @@ print(items[0].block, items[0].data.len())
 An index past the count panics, as `at` does — `panic: index 3 past the 1 elements of a Buf`.
 
 **A member that can move the storage is `@relocates`** — `push`, `extend`, `insert`, `pop`,
-`truncate`, `clear`, `remove` and `release` — and is refused on a buffer a live `ref` has an element
-of, since growing reallocates and shrinking gives the element up:
+`truncate`, `clear`, `remove`, `reserve`, `set_len` and `release` — and is refused on a buffer a live
+`ref` has an element of, since growing reallocates and shrinking gives the element up. A `*T` made by
+`&b[i]` is held to the same rule for as long as it is still to be used:
 
 ```sysl
 import sysl.buf.{Buf, buf}
@@ -246,8 +247,26 @@ first = 5
 'first' is a 'ref' standing on an element whose storage 'push' could move or give up, since it is '@relocates'
 ```
 
+```sysl
+import sysl.buf.{Buf, buf}
+
+var b: Buf[int] = buf()
+
+b.push(1)
+
+val p = &b[0]
+
+b.push(2)
+print(*p)
+```
+
+```error
+'p' is a pointer to an element whose storage 'push' could move or give up, since it is '@relocates', and it is used after this call
+```
+
 The check is local, as every `ref` check is ([memory](/reference/memory/#the-one-rule-what-may-move-underneath-it)):
-a second name for the same buffer, or a function handed it, can still push while the `ref` is live.
+a second name for the same buffer, or a function handed it, can still push while the `ref` or the
+pointer is live.
 
 **`index_place` takes `self`**: a `Buf` is a handle, so a copy of one writes the buffer the
 original names, and `b[i] = x` works on a `val` as `b(i) = x` does on a Scala `val ArrayBuffer`:

@@ -2036,6 +2036,93 @@ name, a name applied to arguments, `*T`, `&T`, a tuple, and an integer for a val
 slice, a `weak`, a `volatile` and a callable have no spelling there; the annotated `val` reaches
 every one of them, and the diagnostic says so.
 
+### An associated function's address — `&T.f`
+
+**A type's own functions have addresses too, written through the type**, exactly as a module's are
+written through the module. A method's receiver is its first parameter — which is what it is in the
+code the member compiled to — so `&Counter.bump` over `bump(*self, by: int)` is a
+`*extern(*Counter, int) -> int`, and a static function's address is an ordinary one:
+
+```sysl
+import sysl.raw.ptr_cast
+
+extern qsort(base: *u8, n: usize, size: usize, cmp: *extern(*u8, *u8) -> i32)
+
+struct Counter
+    n: int
+
+impl Counter
+    bump(*self, by: int) -> int
+        self.n += by
+        self.n
+
+    descending(a: *u8, b: *u8) -> i32
+        var pa: *i32 = ptr_cast(a)
+        var pb: *i32 = ptr_cast(b)
+        *pb - *pa
+
+struct Box[T]
+    v: T
+
+impl[T] Box[T]
+    get(*self) -> T = self.v
+
+var c = Counter(n = 1)
+val bump = &Counter.bump
+
+print(bump(&c, 4), c.n)
+
+var xs: [3]i32 = [10, 30, 20]
+
+qsort(ptr_cast(&xs[0]), 3, 4, &Counter.descending)
+print(xs[0], xs[1], xs[2])
+
+var b = Box(v = 7)
+val get: *extern(*Box[int]) -> int = &Box.get
+
+print((&Box[int].get)(&b), get(&b))
+```
+
+```output
+5 5
+30 20 10
+7 7
+```
+
+The rules are `&f`'s, member for member:
+
+- **A generic type's member is addressed at an instantiation** — written, `&Box[int].get`, or read off
+  the type the address is wanted at: a method's receiver names the type outright, and a static
+  member's result does where it mentions every parameter, as it does for the call `Box.of(…)`. With
+  neither, the refusal names the written form.
+- **An overloaded member** is chosen by the parameters the context's type states, and refused without
+  one.
+- **The same signature rule**: a `(self)` method of a struct takes an aggregate, and is refused as a
+  function taking one is. A `(*self)` one, or a simple enum's `(self)`, crosses as itself.
+- **A `private` member** has its address only where it could be called.
+- **A module function of the member's name is a different function**, so `&bump` and `&Counter.bump`
+  are two addresses.
+
+A trait's member **through the trait** has no address: what `&Shape.area` would have to name is a body
+per implementing type, and none of the trait's own. One type's is the address, and inside a generic
+body `&T.area` is that — read at each instantiation, as the call `T.area()` is:
+
+```sysl
+trait Shape
+    area(*self) -> int
+
+val a = &Shape.area
+
+print(1)
+```
+
+```error
+'Shape' is a trait, and '&Shape.area' would be the address of whichever 'area' a value's type implements
+```
+
+**A member with type parameters of its own** has no address either: nothing in an address settles
+them, and a module function calling it at the types meant is what has one.
+
 ### What has no address, and why
 
 Each of these is refused because the address would not be an address of what its type says, and

@@ -459,12 +459,14 @@ that is `@export`ed, `async`, `@scoped` or carries a contract keeps the borrowed
 throughout. A library and the program built against it read the same bodies, so they agree on which
 parameters are owned.
 
-**Behaviour change in 0.6.0: a value handed to a parameter at its last use may be released
-sooner.** The callee now holds the count, so where it does not keep the value after all (on some
-path), it gives the count back as it returns rather than when the caller's scope ends; and a local
-whose life ends in an `if` with an `else` is handed into each arm and given back at the end of the
-arm that does not use it. A count never reaches zero while anything can still read the value, but a
-destructor that prints shows the difference:
+**A value whose release can run a destructor is destroyed where its scope ends**, exactly as before
+owned parameters existed. A local of a `Drop` type, or of anything holding one in a field, an element
+or a payload, is not handed to an owned parameter at its last use: the call might keep it only in its
+result, which goes at the end of the statement, while a view of what the value owns — a slice made
+through `ptr_cast` of storage a C library frees in the destructor — is still being read. Such a local
+is retained for the call instead, given back at its scope's end, and never handed into the arms of
+an `if`. Only a value nothing observable is released with — no destructor anywhere inside it — goes
+at its last use, which no program can tell apart:
 
 ```sysl
 struct Tag
@@ -489,13 +491,14 @@ show()
 
 ```output
 label 1
-drop 1
 end of show
+drop 1
 ```
 
-`t` is at its last use in `label(t)`, so the label the call returns holds the only count, and the tag
-goes when that temporary does, at the end of the statement — not at the end of `show`, where it would
-go if `t` were read again later.
+`t` is at its last use in `label(t)`, and `label` keeps it in the label it returns, which goes at the
+end of the statement. The tag still goes at the end of `show`, because `t` holds its own count to
+there. A value moved somewhere that lasts — bound to a `val`, stored in a field or a global, returned
+— is destroyed by its new owner.
 
 ### A count that would be taken and given straight back is not taken
 
@@ -527,7 +530,8 @@ the give-back is never emitted. A struct or enum built on the spot is handed ove
 `Some(Node(n))` and `Pair(x, 1)` at `x`'s last use cost no count at all. A local still read later,
 named in a `defer`, used inside a loop it was declared outside of, or reached through an address or a
 `ref` is copied as before. One whose life ends in an `if` with an `else` is handed into each arm, so
-an arm that uses it last moves it and the others give it back where they end (see
+an arm that uses it last moves it and the others give it back where they end — unless its release
+can run a destructor, which keeps it to its scope's end (see
 [owned parameters](#a-parameter-the-function-keeps-arrives-with-its-count)).
 
 ```sysl
@@ -1231,6 +1235,54 @@ print(e.rec.b)
 What is checked is the result only: a pointer to a local stored into module storage or into a struct
 somewhere else is still the raw tier's bargain.
 
+**Inside the function, a local's own slot lasts the whole frame**, not only its block, so a pointer
+to a plain local of an inner block may be read after the block closes:
+
+```sysl
+run(c: bool) -> int
+    var m = 1
+    var p = &m
+
+    if c
+        var n = 41
+
+        p = &n
+
+    *p + 1
+
+print(run(true))
+```
+
+```output
+42
+```
+
+**What a block lets go of when it closes is what its locals hold**: a `Buf`'s elements, the object a
+`&T` names, a value with a `Drop`. A pointer into that storage is refused where it is read after the
+block, since the storage may be freed by then:
+
+```sysl
+import sysl.buf.{Buf, buf}
+
+run() -> int
+    var n = 0
+    var p = &n
+
+    if true
+        val b: Buf[int] = buf()
+
+        b.push(41)
+        p = &b[0]
+
+    *p + 1
+
+print(run())
+```
+
+```error
+'p' points into storage 'b' holds, and 'b' was let go of where its block ended — so this would read freed memory
+```
+
 **The `&` in a type is a different thing, and neither is a way of writing the other.** `&T` is a
 counted box, which owns what is in it; the operator takes an address, which owns nothing. So a box
 is not made by writing the operator in front of a value — it is made by the value arriving where a
@@ -1514,8 +1566,63 @@ first = 5
 'first' is a 'ref' standing on an element whose storage 'push' could move or give up, since it is '@relocates'
 ```
 
-**What this does not do is make a `*T` safe**, and it does not try. A ref's place may be rooted at a
-pointer, and whether *that* points anywhere is the raw tier's ordinary bargain.
+**A `*T` taken by `&` into the same storage is held to the same rule, for as long as it is live.**
+`&b[0]` is the address `ref first = b[0]` stands on, so a `@relocates` member, a `*self` call on the
+owner, and an assignment that replaces the owner are refused while the pointer — or a copy of it, or
+an address computed from it — is still to be used. A pointer has no block of its own, so what counts
+is its **last use** on any path the body can take, a later turn of a loop and a `defer` included:
+
+```sysl
+import sysl.buf.{Buf, buf}
+
+run() -> int
+    val b: Buf[int] = buf()
+
+    b.push(41)
+
+    val p = &b[0]
+
+    for i in 0..<100 do b.push(i)
+
+    *p + 1
+
+print(run())
+```
+
+```error
+'p' is a pointer to an element whose storage 'push' could move or give up, since it is '@relocates', and it is used after this call
+```
+
+Once the last use is behind it, the storage may move freely:
+
+```sysl
+import sysl.buf.{Buf, buf}
+
+run() -> int
+    val b: Buf[int] = buf()
+
+    b.push(41)
+
+    val p = &b[0]
+    val first = *p
+
+    b.push(first + 1)
+    b[1]
+
+print(run())
+```
+
+```output
+42
+```
+
+**The check is local, for a pointer as for a ref's path**: it sees the `&`, the path written after
+it, and the calls and assignments on that path in the same body. A second name for the buffer (`val
+b2 = b`, then `b2.push(…)`), a function handed both the pointer and the buffer that pushes inside, and
+a pointer stored into a field, an element or an aggregate and read back later are not followed. A
+view of the buffer is not a pointer into it: the view keeps the storage it was made from, so a `*T`
+into `b.view()` outlives a push. A ref's place may also be rooted at a pointer, and whether *that*
+points anywhere is the raw tier's ordinary bargain.
 
 **Writing a value that holds an owning step by value writes the step too.** With `h` a local `H`,
 `h = H(…)` replaces `h.node` as surely as `h.node = …` does, so it is refused on the same terms.
