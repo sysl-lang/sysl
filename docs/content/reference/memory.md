@@ -1616,13 +1616,45 @@ print(run())
 42
 ```
 
-**The check is local, for a pointer as for a ref's path**: it sees the `&`, the path written after
-it, and the calls and assignments on that path in the same body. A second name for the buffer (`val
-b2 = b`, then `b2.push(…)`), a function handed both the pointer and the buffer that pushes inside, and
-a pointer stored into a field, an element or an aggregate and read back later are not followed. A
-view of the buffer is not a pointer into it: the view keeps the storage it was made from, so a `*T`
-into `b.view()` outlives a push. A ref's place may also be rooted at a pointer, and whether *that*
-points anywhere is the raw tier's ordinary bargain.
+A `defer` that reads the pointer is a use on every way out of its block — the end, a `break`, a
+`continue`, a `return` and a `?`. A pointer kept in a local aggregate — a struct, a tuple, an
+`Option`, an array, a `Buf` of pointers — is followed through it and refused where it is taken out
+and used; so is one into what a match arm, an `is` test or a `for` loop bound out of a value made
+for it, which is let go of where the arm or the turn ends.
+
+**A function handed the buffer is asked what its body does with it.** One that calls a
+`@relocates` member on a parameter — or hands the parameter on to a function that does — may move
+what it is handed there, so a pointer into that argument may be neither handed to the same call
+nor used after it:
+
+```sysl
+import sysl.buf.{Buf, buf}
+
+grow_and_read(p: *int, b: Buf[int]) -> int
+    for i in 0..<100 do b.push(i)
+
+    *p
+
+run() -> int
+    val b: Buf[int] = buf()
+
+    b.push(41)
+    grow_and_read(&b[0], b)
+
+print(run())
+```
+
+```error
+this pointer is a pointer into storage this call also hands 'grow_and_read', which could move or give it up, since it calls '@relocates' 'push' on its parameter 'b'
+```
+
+**The check is otherwise local, for a pointer as for a ref's path**: it sees the `&`, the path
+written after it, and the calls and assignments on that path in the same body. A second name for
+the buffer (`val b2 = b`, then `b2.push(…)`, or a binding out of a place matched on), a callee
+reached through a trait object or a function pointer, and an aggregate handed to a call are not
+followed. A view of the buffer is not a pointer into it: the view keeps the storage it was made
+from, so a `*T` into `b.view()` outlives a push. A ref's place may also be rooted at a pointer, and
+whether *that* points anywhere is the raw tier's ordinary bargain.
 
 **Writing a value that holds an owning step by value writes the step too.** With `h` a local `H`,
 `h = H(…)` replaces `h.node` as surely as `h.node = …` does, so it is refused on the same terms.
