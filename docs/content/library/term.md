@@ -108,8 +108,16 @@ afterwards.
 | `home` | the top left corner |
 | `hide_cursor` / `show_cursor` | a program that hides it owns showing it again, including on the way out |
 | `save_cursor` / `restore_cursor` | one remembered position, the terminal's own — these do not nest |
+| `alt_screen` / `main_screen` | the alternate screen a full-screen program draws on, and back — leaving it restores what the shell showed |
+| `sync_begin` / `sync_end` | a redraw the terminal shows all at once; ignored by a terminal that does not know it |
 
 `clear_screen` is nearly always written with `home` after it, since clearing does not move anything.
+
+**A full-screen program draws without flicker by doing three things**: it enters `alt_screen` and
+hides the cursor once, at the start; it builds each whole frame as one string and writes it in one
+write, between `sync_begin` and `sync_end`; and it overwrites rather than clears — `home`, then each
+line followed by `clear_to_line_end`, then `clear_below` — so no moment shows a blank screen. On the
+way out it writes `show_cursor` and `main_screen`, and puts the terminal's mode back.
 
 ## Whether to write escapes at all — `sysl.posix.tty`
 
@@ -131,6 +139,7 @@ is now visible in the import line rather than only in the module's own header. W
 | `color_wanted()` | does the environment want colour — `NO_COLOR` unset or empty, `TERM` not `dumb`? |
 | `color_on(fd)` | both, for one descriptor |
 | `color()` / `color_err()` | both, for standard output and standard error |
+| `window_size(fd)` / `size()` | the terminal's rows and columns as a `WindowSize`, or `None` — for a descriptor, and for standard output |
 
 **Ask once and keep the answer.** Each of these is a system call or an environment scan, and nothing
 a running program does changes what they say.
@@ -162,6 +171,27 @@ overrides the descriptor without overriding the user's `NO_COLOR`, and that is e
 **`NO_COLOR` is about the variable being there rather than about its value.** Present and non-empty
 turns colour off whatever it contains, so `NO_COLOR=0` means no colour, while set-and-empty does not.
 A program reading it as a boolean and looking for `"1"` has misread the convention.
+
+**The size is the exception to asking once**, since a window is resized while the program runs. The
+kernel says so with `WINCH`, and `sysl.signal` turns that into a flag: a full-screen program watches
+it and asks `size()` again before the redraw that follows. A pipe has no size, and nor does a
+terminal reporting zero rows by zero columns, which is what a pseudo-terminal nobody sized says.
+
+```sysl
+import sysl.posix.tty.size
+import sysl.signal.{WINCH, watch}
+
+main()
+    val resized = watch(WINCH).unwrap()
+
+    print(size())
+    print(resized.take())
+```
+
+```output
+None
+false
+```
 
 ## Taking the terminal over — `sysl.tty`
 
@@ -257,6 +287,83 @@ else
 ```output
 no terminal: nothing to hide
 ```
+
+## Reading keys — `sysl.term.keys`
+
+A terminal in raw mode sends one byte for an ordinary key and a short **escape sequence** for the
+rest — `ESC [ A` for the up arrow, `ESC [ 5 ~` for Page Up, `ESC O P` for F1. A full-screen program
+wants keys rather than bytes, and `KeyDecoder` is the step between: bytes go in with `push`, as they
+come off any reader, and finished keys come out of `next`.
+
+```sysl
+import sysl.term.keys.{key_decoder, Key}
+
+main()
+    var keys = key_decoder()
+
+    for b in "q\u{1b}[A\u{1b}[5~\u{1b}OP\u{1b}x\r\u{3}".bytes
+        keys.push(b)
+
+        loop
+            keys.next() match
+                None -> break
+                Some(k) -> print(k)
+```
+
+```output
+Key.Char(c: 'q')
+Key.Up
+Key.PageUp
+Key.F(n: 1)
+Key.Alt(c: 'x')
+Key.Enter
+Key.Ctrl(c: 'c')
+```
+
+| key | what sends it |
+|---|---|
+| `Char(c)` | a printable character, ASCII or not — a multi-byte one is one key, and a malformed byte is U+FFFD |
+| `Ctrl(c)` | a control byte, as its letter: byte 3 is `Ctrl('c')`, because raw mode makes Ctrl-C a byte rather than a signal |
+| `Alt(c)` | `ESC` and then a character, which is how a terminal sends Alt (or Meta) |
+| `Enter`, `Tab`, `BackTab`, `Backspace`, `Escape` | CR or LF (a CRLF is one Enter), byte 9, `ESC [ Z`, byte 8 or 127, `ESC` alone |
+| `Up`, `Down`, `Left`, `Right`, `Home`, `End` | `ESC [` or `ESC O` and a letter; Home and End also as `ESC [ 1 ~` / `4 ~` / `7 ~` / `8 ~` |
+| `Insert`, `Delete`, `PageUp`, `PageDown` | `ESC [ 2 ~`, `3 ~`, `5 ~`, `6 ~` |
+| `F(n)` | F1 to F4 as `ESC O P` to `S`, and all twelve numbered |
+
+**Both spellings of each key are read**, for the reason the line editor below reads both: a
+terminal picks between `ESC [` and `ESC O` by a mode the program did not set. **A sequence is read to
+its final byte whatever its parameters**, so a key nothing here names — or xterm's Ctrl-Left,
+`ESC [ 1 ; 5 D`, which is read as `Left` — never leaves its tail behind as typed characters.
+
+### Escape, and `pause`
+
+The Escape key sends the byte every sequence starts with, so a decoder that has just seen `ESC`
+cannot tell which it was until the next byte arrives — or until none does. **`pause` is how a reader
+says none did**: a lone `ESC` becomes `Escape`, a sequence cut short is dropped, and half a character
+is U+FFFD. A hosted program gets the pause by setting `time` in its terminal `Mode` (a tenth of a
+second is usual), so a read that waits that long and gets nothing returns empty; `partial()` says
+whether there is anything for `pause` to finish.
+
+```sysl
+import sysl.term.keys.key_decoder
+
+main()
+    var keys = key_decoder()
+
+    keys.push(27)
+    print(keys.next(), keys.partial())
+    keys.pause()
+    print(keys.next(), keys.partial())
+```
+
+```output
+None true
+Some(Key.Escape) false
+```
+
+Without a pause the Escape arrives with the next keystroke, which is what every terminal program does
+when it cannot time out. Like the rest of this module it asks for nothing of the platform — no
+capability, no C, no allocation — so the same decoder reads a board's serial console.
 
 ## Reading a line — `sysl.term.edit`
 

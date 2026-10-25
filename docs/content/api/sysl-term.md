@@ -53,9 +53,19 @@ invisible in review.
 
 ## Index
 
-[`black`](#black) [`blink`](#blink) [`blue`](#blue) [`bold`](#bold) [`bright_black`](#bright_black) [`bright_blue`](#bright_blue) [`bright_cyan`](#bright_cyan) [`bright_green`](#bright_green) [`bright_magenta`](#bright_magenta) [`bright_red`](#bright_red) [`bright_white`](#bright_white) [`bright_yellow`](#bright_yellow) [`clear_below`](#clear_below) [`clear_line`](#clear_line) [`clear_screen`](#clear_screen) [`clear_to_line_end`](#clear_to_line_end) [`cyan`](#cyan) [`default_color`](#default_color) [`dim`](#dim) [`green`](#green) [`hidden`](#hidden) [`hide_cursor`](#hide_cursor) [`home`](#home) [`italic`](#italic) [`magenta`](#magenta) [`on_black`](#on_black) [`on_blue`](#on_blue) [`on_bright_black`](#on_bright_black) [`on_bright_blue`](#on_bright_blue) [`on_bright_cyan`](#on_bright_cyan) [`on_bright_green`](#on_bright_green) [`on_bright_magenta`](#on_bright_magenta) [`on_bright_red`](#on_bright_red) [`on_bright_white`](#on_bright_white) [`on_bright_yellow`](#on_bright_yellow) [`on_cyan`](#on_cyan) [`on_default`](#on_default) [`on_green`](#on_green) [`on_magenta`](#on_magenta) [`on_red`](#on_red) [`on_white`](#on_white) [`on_yellow`](#on_yellow) [`red`](#red) [`reset`](#reset) [`restore_cursor`](#restore_cursor) [`reverse`](#reverse) [`save_cursor`](#save_cursor) [`show_cursor`](#show_cursor) [`strike`](#strike) [`underline`](#underline) [`white`](#white) [`yellow`](#yellow)
+[`alt_screen`](#alt_screen) [`black`](#black) [`blink`](#blink) [`blue`](#blue) [`bold`](#bold) [`bright_black`](#bright_black) [`bright_blue`](#bright_blue) [`bright_cyan`](#bright_cyan) [`bright_green`](#bright_green) [`bright_magenta`](#bright_magenta) [`bright_red`](#bright_red) [`bright_white`](#bright_white) [`bright_yellow`](#bright_yellow) [`clear_below`](#clear_below) [`clear_line`](#clear_line) [`clear_screen`](#clear_screen) [`clear_to_line_end`](#clear_to_line_end) [`cyan`](#cyan) [`default_color`](#default_color) [`dim`](#dim) [`green`](#green) [`hidden`](#hidden) [`hide_cursor`](#hide_cursor) [`home`](#home) [`italic`](#italic) [`magenta`](#magenta) [`main_screen`](#main_screen) [`on_black`](#on_black) [`on_blue`](#on_blue) [`on_bright_black`](#on_bright_black) [`on_bright_blue`](#on_bright_blue) [`on_bright_cyan`](#on_bright_cyan) [`on_bright_green`](#on_bright_green) [`on_bright_magenta`](#on_bright_magenta) [`on_bright_red`](#on_bright_red) [`on_bright_white`](#on_bright_white) [`on_bright_yellow`](#on_bright_yellow) [`on_cyan`](#on_cyan) [`on_default`](#on_default) [`on_green`](#on_green) [`on_magenta`](#on_magenta) [`on_red`](#on_red) [`on_white`](#on_white) [`on_yellow`](#on_yellow) [`red`](#red) [`reset`](#reset) [`restore_cursor`](#restore_cursor) [`reverse`](#reverse) [`save_cursor`](#save_cursor) [`show_cursor`](#show_cursor) [`strike`](#strike) [`sync_begin`](#sync_begin) [`sync_end`](#sync_end) [`underline`](#underline) [`white`](#white) [`yellow`](#yellow)
 
 ## Constants
+
+### `alt_screen`
+
+```sysl
+const alt_screen: string = "\u{1b}[?1049h"
+```
+
+The alternate screen, which is the one a full-screen program draws on: entering it keeps what the
+shell had shown, and leaving it puts that back exactly, so the program leaves no trace in the
+scrollback. A program that enters it owns leaving it, including on the way out.
 
 ### `black`
 
@@ -220,6 +230,12 @@ const italic: string = "\u{1b}[3m"
 const magenta: string = "\u{1b}[35m"
 ```
 
+### `main_screen`
+
+```sysl
+const main_screen: string = "\u{1b}[?1049l"
+```
+
 ### `on_black`
 
 ```sysl
@@ -369,6 +385,22 @@ const show_cursor: string = "\u{1b}[?25h"
 
 ```sysl
 const strike: string = "\u{1b}[9m"
+```
+
+### `sync_begin`
+
+```sysl
+const sync_begin: string = "\u{1b}[?2026h"
+```
+
+A redraw the terminal shows all at once rather than as it arrives -- the other half of drawing
+without flicker, after writing the whole frame in one write. A terminal that does not know the
+sequence ignores it, so it costs nothing where it does not help.
+
+### `sync_end`
+
+```sysl
+const sync_end: string = "\u{1b}[?2026l"
 ```
 
 ### `underline`
