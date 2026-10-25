@@ -1154,3 +1154,342 @@ sfp_refuses_fenv_where_absent()
     assert(riscv.contains("'flush_to_zero' is the flush-to-zero control, and 'riscv64-linux' has none — a RISC-V unit computes every subnormal exactly"), riscv)
     assert_eq(riscv.count_of("error: "), 1)
 end sfp_refuses_fenv_where_absent
+
+// -- the input-denormal flag ------------------------------------------------------------------------
+
+// The operands are binary32's smallest subnormal, 2^-149, and its smallest normal, 2^-126. With
+// flush-to-zero off their sum is exact (0x00800001) and raises nothing; with it on the subnormal
+// operand is read as zero, the sum is 2^-126 itself, and IDC (bit 7) is raised -- not underflow, since
+// the result is normal. The square of 2^-126 is a subnormal RESULT, flushed: underflow, and no IDC.
+@test("the input-denormal flag is raised by a flushed subnormal operand, not without flush-to-zero, and cleared")
+sfp_input_denormal()
+    if !sfp_ready() || !sfp_on_aarch64() then return
+
+    sfp_prints(raw"""
+        import sysl.fenv.*
+
+        @strict_fp
+        probe(tiny: f32, small: f32)
+            clear_flags()
+            val exact = (tiny + small).bits()
+            print(f"off: $exact%08x idc ${input_denormal()} underflow ${flags().underflow}")
+            set_flush_to_zero(true)
+            clear_flags()
+            val flushed = (tiny + small).bits()
+            print(f"on:  $flushed%08x idc ${input_denormal()} underflow ${flags().underflow}")
+            clear_flags()
+            print(f"cleared: idc ${input_denormal()}")
+            val square = (small * small).bits()
+            print(f"result: $square%08x idc ${input_denormal()} underflow ${flags().underflow}")
+            set_flush_to_zero(false)
+            clear_flags()
+
+        main(args: []string)
+            val a: u32 = if args.len > 5 then 0 else 1
+            probe(f32.from_bits(a), f32.from_bits(0x00800000))
+        """, "off: 00800001 idc false underflow false\non:  00800000 idc true underflow false\n" +
+             "cleared: idc false\nresult: 00000000 idc false underflow true\n")
+end sfp_input_denormal
+
+@test("the input-denormal flag and the alternative half-precision control are refused off Arm, at the call")
+sfp_refuses_input_denormal_off_arm()
+    if !sfp_ready() then return
+
+    sfp_refused("import sysl.fenv.*\n\n@export(\"f\")\nf() -> bool = input_denormal()\n", Some("x86_64-freestanding"),
+                "'input_denormal' is the input-denormal flag of an Arm unit, raised when flush-to-zero replaces a subnormal operand, and 'x86_64-freestanding' has none — MXCSR's denormal-operand flag is raised by every subnormal operand, and by none that DAZ reads as zero, which is not what IDC says")
+    sfp_refused("import sysl.fenv.*\n\n@export(\"f\")\nf() = set_alternative_half_precision(true)\n", Some("x86_64-freestanding"),
+                "'set_alternative_half_precision' is the alternative half-precision control of an Arm unit, and 'x86_64-freestanding' has none — its f16 is IEEE 754's binary16 always")
+    sfp_refused("import sysl.fenv.*\n\n@export(\"f\")\nf() -> bool = alternative_half_precision()\n", Some("x86_64-freestanding"),
+                "'alternative_half_precision' is the alternative half-precision control of an Arm unit")
+    sfp_refused("import sysl.fenv.*\n\n@export(\"f\")\nf() -> bool = input_denormal()\n", Some("thumbv6m-freestanding"),
+                "'sysl.fenv' reads and writes the floating-point unit's control and status registers, and 'thumbv6m-freestanding' has no floating-point unit")
+
+    // clear_flags, which clears IDC on Arm, is there on x86-64 and leaves MXCSR's masks alone.
+    sfp_lacks(sfp_ir("import sysl.fenv.*\n\n@export(\"f\")\nf() = clear_flags()\n", Some("x86_64-freestanding")), "error:")
+
+    // Both are there on an Arm core.
+    sfp_lacks(sfp_ir("import sysl.fenv.*\n\n@export(\"f\")\nf() -> bool = input_denormal() || alternative_half_precision()\n",
+                     Some("thumbv7em-freestanding")), "error:")
+
+    val riscv = sfp_analysed("import sysl.fenv.*\n\nprint(input_denormal())\n", "riscv64-linux")
+
+    assert(riscv.contains("'input_denormal' is the input-denormal flag of an Arm unit, raised when flush-to-zero replaces a subnormal operand, and 'riscv64-linux' has none — a RISC-V unit computes every subnormal exactly, so none is replaced"), riscv)
+    assert_eq(riscv.count_of("error: "), 1)
+end sfp_refuses_input_denormal_off_arm
+
+// -- conversions to and from f16 ---------------------------------------------------------------------
+
+// Each line is one mode: NearestEven, Upward, Downward, TowardZero. The binary32 operands are
+// 1 + 2^-11 (halfway between binary16's 1.0, 0x3c00, and the value above it), its negative,
+// 1 + 3 * 2^-11 (halfway again, with an odd value below), 65520 (halfway between binary16's largest
+// finite, 0x7bff, and the overflow threshold) and 2^-25 (half binary16's smallest subnormal). The two
+// binary64 ones are 1 + 2^-11 and 1 + 2^-11 + 2^-40: just above halfway, so one rounding to nearest
+// goes up, where narrowing through binary32 first would land on the tie and go to the even 0x3c00.
+private val sfp_half_modes: string = raw"""
+    import sysl.fenv.*
+
+    @strict_fp
+    narrowed(xs: []u32, ds: []u64)
+        for r in [NearestEven, Upward, Downward, TowardZero]
+            set_rounding(r)
+            var line = ""
+            for x in xs
+                line = line + f"${f16(f32.from_bits(x)).bits()}%04x "
+            for d in ds
+                line = line + f"${f16(real.from_bits(d)).bits()}%04x "
+            set_rounding(NearestEven)
+            print(line)
+
+    main(args: []string)
+        val n: u32 = if args.len > 5 then 1 else 0
+        val xs: []u32 = [0x3f801000 + n, 0xbf801000, 0x3f803000, 0x477ff000, 0x33000000]
+        val ds: []u64 = [0x3ff0020000000000, 0x3ff0020000001000]
+        narrowed(xs, ds)
+    """
+
+@test("f32 and f64 narrowed to f16 follow each of the four modes, f64 rounded once")
+sfp_half_narrowing_in_each_mode()
+    if !sfp_ready() || !sfp_on_aarch64() then return
+
+    sfp_prints(sfp_half_modes, "3c00 bc00 3c02 7c00 0000 3c00 3c01 \n3c01 bc00 3c02 7c00 0001 3c01 3c01 \n" +
+                               "3c00 bc01 3c01 7bff 0000 3c00 3c00 \n3c00 bc00 3c01 7bff 0000 3c00 3c00 \n")
+end sfp_half_narrowing_in_each_mode
+
+// A narrowing raises inexact where it rounds, overflow past binary16's range and underflow below its
+// normals; a widening is exact and raises nothing, but for a signalling NaN (0x7d00), which raises
+// invalid and comes out quiet.
+@test("a narrowing to f16 raises inexact, overflow and underflow; a widening raises invalid only on a signalling NaN")
+sfp_half_flags()
+    if !sfp_ready() || !sfp_on_aarch64() then return
+
+    sfp_prints(raw"""
+        import sysl.fenv.*
+
+        @strict_fp
+        raised(x: u32) -> string
+            clear_flags()
+            val h = f16(f32.from_bits(x))
+            val f = flags()
+            clear_flags()
+            f"${h.bits()}%04x inexact ${f.inexact} overflow ${f.overflow} underflow ${f.underflow} invalid ${f.invalid}"
+
+        @strict_fp
+        widened(h: u16) -> string
+            clear_flags()
+            val a = f32(f16.from_bits(h)).bits()
+            val b = real(f16.from_bits(h)).bits()
+            val f = flags()
+            clear_flags()
+            f"$a%08x $b%016x invalid ${f.invalid} inexact ${f.inexact}"
+
+        main(args: []string)
+            val n: u32 = if args.len > 5 then 1 else 0
+            print(raised(0x3f801000 + n))
+            print(raised(0x477ff000))
+            print(raised(0x33000000))
+            print(raised(0x3fc00000))
+            print(widened(0x3c01 + u16(n)))
+            print(widened(0x0001))
+            print(widened(0x7d00))
+        """, "3c00 inexact true overflow false underflow false invalid false\n" +
+             "7c00 inexact true overflow true underflow false invalid false\n" +
+             "0000 inexact true overflow false underflow true invalid false\n" +
+             "3e00 inexact false overflow false underflow false invalid false\n" +
+             "3f802000 3ff0040000000000 invalid false inexact false\n" +
+             "33800000 3e70000000000000 invalid false inexact false\n" +
+             "7fe00000 7ffc000000000000 invalid true inexact false\n")
+end sfp_half_flags
+
+// Under Arm's alternative format 0x7c00 is 65536, not an infinity; 70000 is a number (0x7c46, inexact),
+// 140000 is past its largest and saturates to 0x7fff raising invalid, and a NaN becomes a zero raising
+// invalid. Each value is read at run time, so the unit's instruction converts it.
+@test("alternative half-precision is set and read back, and a strict conversion under it is the unit's")
+sfp_half_alternative()
+    if !sfp_ready() || !sfp_on_aarch64() then return
+
+    sfp_prints(raw"""
+        import sysl.fenv.*
+
+        @strict_fp
+        alternative(h: u16, x: u32) -> string
+            set_alternative_half_precision(true)
+            val on = alternative_half_precision()
+            clear_flags()
+            val wide = f32(f16.from_bits(h)).bits()
+            val f1 = flags()
+            clear_flags()
+            val narrow = f16(f32.from_bits(x)).bits()
+            val f2 = flags()
+            set_alternative_half_precision(false)
+            clear_flags()
+            f"$on $wide%08x invalid ${f1.invalid}; $narrow%04x invalid ${f2.invalid} inexact ${f2.inexact}"
+
+        main(args: []string)
+            val n: u32 = if args.len > 5 then 1 else 0
+            print(alternative(0x7c00, 0x4788b800 + n))
+            print(alternative(0x7c00, 0x4808b800))
+            print(alternative(0x3c00, 0x7fc00000))
+            print(alternative_half_precision(), f"${f32(f16.from_bits(0x7c00 + u16(n))).bits()}%08x")
+        """, "true 47800000 invalid false; 7c46 invalid false inexact true\n" +
+             "true 47800000 invalid false; 7fff invalid true inexact false\n" +
+             "true 3f800000 invalid false; 0000 invalid true inexact false\n" +
+             "false 7f800000\n")
+end sfp_half_alternative
+
+// A literal of f16 is a value: binary64's constant rounded once to nearest while compiling (0.1 is
+// 0x2e66; upward it would be 0x2e67), written as its bits, not a conversion the mode governs.
+@test("an f16 literal in a strict body is its nearest value in every mode, and the conversions are constrained")
+sfp_half_ir()
+    if !sfp_ready() then return
+
+    val program = raw"""
+        import sysl.fenv.*
+
+        @strict_fp
+        literal() -> u16
+            set_rounding(Upward)
+            val h = 0.1f16
+            set_rounding(NearestEven)
+            h.bits()
+
+        @strict_fp
+        converted(x: f32, y: f64, h: f16) -> real = real(f16(x)) + real(f16(y)) + real(f32(h)) + real(h)
+
+        print(literal(), converted(1.0f32, 2.0, 3.0f16))
+        """
+
+    val ir = sfp_ir(program, Some("aarch64-freestanding"))
+    val literal = sfp_body(ir, "literal")
+    val converted = sfp_body(ir, "converted")
+
+    sfp_says(literal, "bitcast i16 11878 to half")
+    sfp_lacks(literal, "constrained")
+    sfp_says(converted, "@llvm.experimental.constrained.fptrunc.f16.f32(float %")
+    sfp_says(converted, "@llvm.experimental.constrained.fptrunc.f16.f64(double %")
+    sfp_says(converted, "@llvm.experimental.constrained.fpext.f32.f16(half %")
+    sfp_says(converted, "@llvm.experimental.constrained.fpext.f64.f16(half %")
+    sfp_lacks(converted, "fptrunc double")
+    sfp_lacks(converted, "fpext half")
+
+    if !sfp_on_aarch64() then return
+
+    sfp_prints(program, "11878 9\n")
+end sfp_half_ir
+
+// On an Arm core the conversion is the plain `vcvtb` between fences -- the back end selects nothing for
+// the constrained one -- each in the mode written before it.
+private val sfp_board_half: string = raw"""
+    import sysl.fenv.*
+
+    @strict_fp
+    @export("narrow")
+    narrow(x: f32) -> u16
+        set_rounding(Upward)
+        val a = f16(x)
+        set_rounding(Downward)
+        val b = f16(x)
+        set_rounding(NearestEven)
+        a.bits() ^ b.bits()
+
+    @strict_fp
+    @export("widen")
+    widen(h: u16) -> u32
+        set_alternative_half_precision(true)
+        val a = f32(f16.from_bits(h))
+        set_alternative_half_precision(false)
+        a.bits()
+
+    @export("main")
+    boot() -> i32 = 0
+    """
+
+private sfp_board_half_checks(target: string)
+    val narrow = fx2_board_code(sfp_board_half, target, "narrow")
+
+    if narrow.is_none() then return
+
+    assert_eq(sfp_board_order(narrow.unwrap(), "vcvtb.f16.f32"), "CACAC", narrow.unwrap())
+    assert_eq(fx2_foreign_calls(narrow.unwrap(), "narrow"), 0, narrow.unwrap())
+
+    val widen = fx2_board_code(sfp_board_half, target, "widen").unwrap()
+
+    assert_eq(sfp_board_order(widen, "vcvtb.f32.f16"), "CAC", widen)
+    assert_eq(fx2_foreign_calls(widen, "widen"), 0, widen)
+end sfp_board_half_checks
+
+@test("on a Cortex-M4F a strict f32-f16 conversion is vcvtb, each after the vmsr fpscr before it")
+sfp_cortex_m4_half()
+    sfp_board_half_checks("thumbv7em-freestanding")
+
+@test("on a Cortex-M33 a strict f32-f16 conversion is vcvtb, each after the vmsr fpscr before it")
+sfp_cortex_m33_half()
+    sfp_board_half_checks("thumb-freestanding")
+
+@test("on a Cortex-M7 with a double-precision unit a strict f64-f16 conversion is one vcvtb each way")
+sfp_cortex_m7_half_double()
+    val program = raw"""
+        @strict_fp
+        @export("narrow")
+        narrow(x: f64) -> u16 = f16(x).bits()
+
+        @strict_fp
+        @export("widen")
+        widen(h: u16) -> u64 = real(f16.from_bits(h)).bits()
+
+        @export("main")
+        boot() -> i32 = 0
+        """
+
+    val narrow = fx2_board_code(program, "thumbv7em-freestanding-dp", "narrow")
+
+    if narrow.is_none() then return
+
+    sfp_says(narrow.unwrap(), "vcvtb.f16.f64")
+    assert_eq(fx2_foreign_calls(narrow.unwrap(), "narrow"), 0, narrow.unwrap())
+
+    val widen = fx2_board_code(program, "thumbv7em-freestanding-dp", "widen").unwrap()
+
+    sfp_says(widen, "vcvtb.f64.f16")
+    assert_eq(fx2_foreign_calls(widen, "widen"), 0, widen)
+end sfp_cortex_m7_half_double
+
+@test("an f64-f16 conversion is refused on a single-precision unit, both ways, and an f16 one where it is a call")
+sfp_refuses_half_conversions()
+    if !sfp_ready() then return
+
+    val single = "'@strict_fp' asks the floating-point unit to follow its environment, and 'thumbv7em-freestanding''s unit is single precision, so a conversion between "
+
+    sfp_refused("@strict_fp\n@export(\"f\")\nf(x: f64) -> u16 = f16(x).bits()\n", Some("thumbv7em-freestanding"),
+                single + "real and f16 is a library call, which has no environment to follow and raises nothing; narrowing through f32 instead would round twice, so convert an f32, or build for a target whose unit has double precision")
+    sfp_refused("@strict_fp\n@export(\"f\")\nf(h: u16) -> u64 = real(f16.from_bits(h)).bits()\n", Some("thumbv7em-freestanding"),
+                single + "f16 and real is a library call, which has no environment to follow and raises nothing; convert an f32, or build for a target whose unit has double precision")
+    sfp_refused("@strict_fp\n@export(\"f\")\nf(x: f64) -> u16 = f16(x).bits()\n", Some("thumb-freestanding"),
+                "'thumb-freestanding''s unit is single precision, so a conversion between real and f16 is a library call")
+    sfp_refused("@strict_fp\n@export(\"f\")\nf(x: f32) -> u16 = f16(x).bits()\n", Some("x86_64-freestanding"),
+                "'@strict_fp' asks the floating-point unit to follow its environment, and on 'x86_64-freestanding' a conversion between f32 and f16 is a library call, since the unit has no instruction converting f16 — and a library call has no environment to follow and raises nothing; compute this outside a '@strict_fp' body")
+    sfp_refused("@strict_fp\n@export(\"f\")\nf(h: u16) -> real = real(f16.from_bits(h))\n", Some("x86_64-freestanding"),
+                "on 'x86_64-freestanding' a conversion between f16 and real is a library call")
+    sfp_refused("@strict_fp\n@export(\"f\")\nf(h: u16) -> f32 = f32(f16.from_bits(h))\n", Some("thumbv6m-freestanding"),
+                "'thumbv6m-freestanding' computes f32 in software")
+    sfp_refused("@strict_fp\n@export(\"f\")\nf(h: u16) -> f32 = f32(f16.from_bits(h))\n", Some("wasm32-freestanding"),
+                "'wasm32-freestanding' is WebAssembly")
+
+    val riscv = sfp_analysed("@strict_fp\nf(x: f32) -> u16 = f16(x).bits()\nprint(f(1.0f32))\n", "riscv64-linux")
+
+    assert(riscv.contains("on 'riscv64-linux' a conversion between f32 and f16 is a library call"), riscv)
+end sfp_refuses_half_conversions
+
+// Only the conversions with f32 and f64 are let in: f16 arithmetic, comparison, a conversion with an
+// integer, and bf16 on either side are refused as before.
+@test("f16 arithmetic, comparison and integer conversion, and bf16 conversion, stay refused on AArch64")
+sfp_refuses_half_arithmetic()
+    if !sfp_ready() then return
+
+    val expected = "a '@strict_fp' body computes at f32 and f64, the widths a floating-point unit performs under its environment, and this is "
+    val aarch64 = Some("aarch64-freestanding")
+
+    sfp_refused("@strict_fp\n@export(\"f\")\nf(x: f32) -> u16 = (f16(x) * f16(x)).bits()\n", aarch64, expected + "f16")
+    sfp_refused("@strict_fp\n@export(\"f\")\nf(h: u16) -> bool = f16.from_bits(h) < f16.from_bits(h)\n", aarch64, expected + "f16")
+    sfp_refused("@strict_fp\n@export(\"f\")\nf(n: i32) -> u16 = f16(n).bits()\n", aarch64, expected + "f16")
+    sfp_refused("@strict_fp\n@export(\"f\")\nf(x: f32) -> bf16 = bf16(x)\n", aarch64, expected + "bf16")
+end sfp_refuses_half_arithmetic

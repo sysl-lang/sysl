@@ -151,12 +151,23 @@ private strict_inst(e: *Emit, i: Inst, out: Buf[Inst])
                 return
             end if
 
+            if op == CastFPTrunc && is_binary16(to) && is_float_constant(v)
+                out.push(InCast(d, CastBitCast, LInt(16), VInt(from_int(long(halved_bits(v)))), to))
+                return
+            end if
+
             // **An integer read as a float on a 32-bit Arm core is the plain conversion, fenced.** The
             // Arm back end has no instruction for the constrained one at binary32 and expands it
             // through binary64 in software, which rounds to nearest whatever FPSCR says. The plain
             // `vcvt` rounds in FPSCR's mode and raises inexact, and the fences of `strict_op` hold it
             // where it was written, so between them it is exactly the strict conversion.
-            if e.target.cpu == Thumb && (op == CastSIToFP || op == CastUIToFP)
+            //
+            // **So is a conversion to or from `f16` there.** The back end selects no instruction for the
+            // constrained one at all (`strict_fp_to_fp16`), and the plain one is `vcvtb`, which rounds
+            // in FPSCR's mode and raises what it raises.
+            val half = (op == CastFPTrunc || op == CastFPExt) && (half_lane(from) || half_lane(to))
+
+            if e.target.cpu == Thumb && (op == CastSIToFP || op == CastUIToFP || half)
                 val held = fenced_value(e, from, v, out)
                 val raw = fresh_reg(e)
 
@@ -190,9 +201,23 @@ private is_float_constant(v: Val) -> bool = v match
     VFloat(_) -> true
     _ -> false
 
+private is_binary16(t: LType) -> bool = t match
+    LFloat(bits, brain) -> bits == 16 && !brain
+    _ -> false
+
+// Whether `t` is binary16, or a vector of it.
+private half_lane(t: LType) -> bool = t match
+    LVec(_, elem) -> is_binary16(*elem)
+    other -> is_binary16(other)
+
 // A binary64 constant's value rounded to nearest at binary32, as binary32's bits.
 private narrowed_bits(v: Val) -> u32 = v match
     VFloat(bits) -> f32(real.from_bits(u64(bits))).bits()
+    _ -> 0
+
+// A binary64 constant's value rounded to nearest at binary16, once, as binary16's bits.
+private halved_bits(v: Val) -> u16 = v match
+    VFloat(bits) -> f16(real.from_bits(u64(bits))).bits()
     _ -> 0
 
 // A call's floating-point list with `strictfp` in it.
@@ -365,7 +390,8 @@ private fenced_value(e: *Emit, ty: LType, v: Val, out: Buf[Inst]) -> Val
 end fenced_value
 
 // `d = v`, through an empty `asm` holding it in a register of its kind -- a single-precision register
-// for an `f32`, a double one for an `f64`, a core register otherwise -- and a vector a lane at a time,
+// for an `f32`, a double one for an `f64`, a core register otherwise, an `f16`'s bits among them --
+// and a vector a lane at a time,
 // since a core without a vector unit computes it a lane at a time and every lane needs its fence.
 private fence_into(e: *Emit, d: Val, ty: LType, v: Val, out: Buf[Inst])
     ty match
@@ -383,6 +409,15 @@ private fence_into(e: *Emit, d: Val, ty: LType, v: Val, out: Buf[Inst])
 
                 out.push(InInsertElement(next, ty, acc, *elem, held, index))
                 acc = next
+        // A binary16 is held as its bits in a core register: a unit with no half-precision arithmetic
+        // has no register class for one.
+        LFloat(16, false) ->
+            val bits = fresh_reg(e)
+            val held = fresh_reg(e)
+
+            out.push(InCast(bits, CastBitCast, ty, v, LInt(16)))
+            fence_into(e, held, LInt(16), bits, out)
+            out.push(InCast(d, CastBitCast, LInt(16), held, ty))
         _ ->
             val register = ty match
                 LFloat(bits, _) -> if bits == 32 then "t" else "w"
