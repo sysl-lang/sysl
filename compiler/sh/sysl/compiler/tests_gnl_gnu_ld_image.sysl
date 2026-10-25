@@ -1,0 +1,65 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.is_file
+import sysl.process.capture
+import sysl.testing.skip
+
+// **A freestanding image linked by GNU ld.** The thread-local template's bounds are `--defsym`
+// expressions that ask `SIZEOF` of `.tdata`, which only lld evaluates for an image that has none; GNU
+// ld refused every such link. The command line carries them for lld alone, and a script written for
+// GNU ld lays the template out itself.
+
+private gnl_gnu_present() -> bool = capture("arm-none-eabi-ld", ["--version"], "", [], true) match
+    Ok(o) -> o.status.ok()
+    Err(_) -> false
+
+private gnl_has_template(flags: []string) -> bool
+    for f in flags
+        if f.contains("__sysl_tls_data=") then return true
+
+    false
+end gnl_has_template
+
+@test("only lld is handed the thread-local template's --defsym lines")
+gnl_template_for_lld_only()
+    assert(links_with_lld("ld.lld"))
+    assert(links_with_lld("/opt/homebrew/opt/llvm/bin/ld.lld"))
+    assert(links_with_lld("lld"))
+    assert(!links_with_lld("arm-none-eabi-ld"))
+    assert(!links_with_lld("/opt/homebrew/bin/arm-none-eabi-ld"))
+
+    settle_image("ld.lld", "", "")
+    assert(gnl_has_template(image_link_flags().view()))
+    settle_image("", "", "")
+    assert(gnl_has_template(image_link_flags().view()), "the default linker is lld")
+    settle_image("arm-none-eabi-ld", "g.ld", "main")
+    assert(!gnl_has_template(image_link_flags().view()))
+    settle_image("/opt/homebrew/bin/arm-none-eabi-ld", "", "")
+    assert(!gnl_has_template(image_link_flags().view()))
+    settle_image("", "", "")
+end gnl_template_for_lld_only
+
+@test("GNU ld links a freestanding image with no thread-local storage")
+gnl_gnu_links_an_image()
+    if !lbr_ready() then return
+    if !gnl_gnu_present() then skip("arm-none-eabi-ld is not installed")
+    if !is_file("/opt/homebrew/bin/ld.lld") then skip("ld.lld is not installed")
+
+    val hand = "SECTIONS\n{\n    . = 0x08000000;\n    .text : { *(.text .text.*) }\n" +
+               "    .rodata : { *(.rodata .rodata.*) }\n    .data : { *(.data .data.*) }\n" +
+               "    .bss (NOLOAD) : { *(.bss .bss.*) *(COMMON) }\n}\n"
+    var files = lbr_two("main.sysl", "@no_os\n\n@export(\"main\")\nprobe_main() -> int = 7\n", "package.hocon",
+                        "package { name = \"g\", version = \"0.1.0\" }\ntargets { thumb-freestanding { " +
+                        "linker = \"arm-none-eabi-ld\", linker_script = \"g.ld\", entry = \"main\" } }\n")
+
+    files.push(("g.ld", hand))
+
+    val root = lbr_tree(files)
+    val out = lbr_temp("sysl-gnl-elf")
+    val said = lbr_cli(["sysl", "build", "--target", "thumb-freestanding", "-o", s"$out/g.elf", root])
+
+    assert_eq(said.0, 0, said.1)
+    assert(is_file(s"$out/g.elf"), said.1)
+    lbr_drop([root, out])
+end gnl_gnu_links_an_image
