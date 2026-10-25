@@ -1,0 +1,90 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.Buf
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, rename, write_text}
+import sysl.text.split
+
+// The notice a `package.hocon` manifest draws suggests only what exists: a rename. `sysl config` is
+// not a command, so the notice must not send anyone to it, and the rename it suggests must work.
+
+private ncn_dir() -> string = absolute_path(make_temp_dir("sysl-ncn-").unwrap())
+
+private ncn_lines(lines: Buf[string]) -> string
+    var out = ""
+
+    for item in lines
+        out = out + item + "\n"
+
+    out
+
+private ncn_count(text: string, part: string) -> usize = split(text, part).len - 1
+
+// A program whose manifest, under `file`, depends on a package at `engine` whose manifest is `dep_file`.
+private ncn_project(file: string, dep_file: string) -> (string, string)
+    val root = ncn_dir()
+    val dep = ncn_dir()
+
+    make_dir_all(s"$dep/engine").unwrap()
+    write_text(s"$dep/$dep_file", "package { name = \"engine\", version = \"2.3.4\" }\n").unwrap()
+    write_text(s"$dep/engine/engine.sysl", "module engine\n\nversion() -> string = __VERSION__\n").unwrap()
+    write_text(s"$root/$file", "package { name = \"ncnuse\", version = \"0.1.0\" }\n" +
+               s"dependencies { engine { path = \"$dep\" } }\n").unwrap()
+    write_text(s"$root/main.sysl", "import engine\n\nmain()\n" +
+               "    if engine.version() != \"2.3.4\" then exit(5)\n").unwrap()
+    pkc_set_env("SYSL_LIB", absolute_path(std_root().unwrap()))
+    (root, dep)
+end ncn_project
+
+@test("the notice for a root package.hocon suggests a rename, not a sysl config command")
+ncn_root_notice_text()
+    if !clx_ready() then return
+
+    val (root, dep) = ncn_project("package.hocon", "sysl.hocon")
+    val (code, _, err) = clx_ran(["sysl", "build", root])
+
+    assert_eq(code, Fine, err)
+    assert(err.contains("rename it to sysl.hocon (git mv package.hocon sysl.hocon)"), err)
+    assert(!err.contains("sysl config"), err)
+    assert_eq(ncn_count(err, "rename it to"), 1)
+    remove_dir_all(root).unwrap_or(())
+    remove_dir_all(dep).unwrap_or(())
+end ncn_root_notice_text
+
+@test("a dependency's package.hocon draws the notice once, naming the dependency's directory")
+ncn_dependency_notice_once()
+    if !clx_ready() then return
+
+    val (root, dep) = ncn_project("sysl.hocon", "package.hocon")
+
+    reset_manifest_warnings()
+
+    val (code, _, err) = clx_ran(["sysl", "build", root])
+    val told = manifest_warnings_told()
+
+    assert_eq(code, Fine, err)
+    assert_eq(told.len(), 1, ncn_lines(told))
+    assert_eq(told.at(0), legacy_manifest_warning(dep))
+    assert(told.at(0).contains("(git mv package.hocon sysl.hocon)"), ncn_lines(told))
+    assert(!told.at(0).contains("sysl config"), ncn_lines(told))
+    remove_dir_all(root).unwrap_or(())
+    remove_dir_all(dep).unwrap_or(())
+end ncn_dependency_notice_once
+
+@test("doing what the notice says removes the notice")
+ncn_the_suggested_rename_works()
+    if !clx_ready() then return
+
+    val (root, dep) = ncn_project("package.hocon", "sysl.hocon")
+    val (_, _, before) = clx_ran(["sysl", "build", root])
+
+    assert(before.contains("names its manifest"), before)
+    rename(s"$root/package.hocon", s"$root/sysl.hocon").unwrap()
+
+    val (code, _, after) = clx_ran(["sysl", "build", root])
+
+    assert_eq(code, Fine, after)
+    assert(!after.contains("names its manifest"), after)
+    remove_dir_all(root).unwrap_or(())
+    remove_dir_all(dep).unwrap_or(())
+end ncn_the_suggested_rename_works
