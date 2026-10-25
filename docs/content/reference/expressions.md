@@ -436,6 +436,16 @@ false false
 This is also why a float is not hashable: a table assumes a reflexive equality, and one `NaN` breaks
 it.
 
+### A float operation rounds to nearest unless its function says otherwise
+
+An operation's answer is IEEE 754's for round-to-nearest-even, and the exceptions it raises are not
+something a program observes: the compiler may work an operation out while compiling, merge two
+identical ones into one, or move one past a call. A function whose floating point has to follow the
+rounding mode, flush-to-zero and default-NaN controls in force when it runs, and raise its exceptions
+where it is written, is marked
+[`@strict_fp`](/reference/attributes/#strict-fp-floating-point-that-follows-the-environment-it-runs-in);
+[`sysl.fenv`](/library/fenv/) sets that environment and reads the flags.
+
 ## Logical operators
 
 `&&` and `||` take `bool` and short-circuit; `!` is prefix on a `bool`. Nothing coerces to `bool`, so

@@ -1,0 +1,1038 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.source_of
+import sysl.buf.{Buf, buf}
+import sysl.fs.{exists, make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.{Search, join, replace_all, split}
+
+// `@strict_fp` and `sysl.fenv` (`reference/attributes.md § @strict_fp`, `library/fenv.md`): a strict
+// body's floating point follows the environment it runs in and raises its exceptions, in program
+// order, at every `-O`; `sysl.fenv` reads and sets that environment. The expected bits are IEEE
+// 754's for each rounding direction, worked out by hand beside each program, and the flags are the
+// standard's five. Every run is made at `-O0` and at `-O2`, which must agree.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private sfp_ready() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+    end if
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+    end if
+
+    true
+end sfp_ready
+
+// The expectations about FPCR and FPSR, default-NaN and the instructions are AArch64's.
+private sfp_on_aarch64() -> bool
+    if host_target().cpu != Aarch64
+        print("skipped: what is asserted is AArch64's and this machine is not one")
+        return false
+    end if
+
+    true
+end sfp_on_aarch64
+
+private sfp_root(text: string) -> string
+    val root = replace_all(make_temp_dir("sysl-sfp").unwrap(), "//", "/")
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+    root
+end sfp_root
+
+// What a program prints, built at `level`, or why it did not build.
+private sfp_ran(text: string, level: string) -> string
+    val root = sfp_root(text)
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, level, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end sfp_ran
+
+// That a program prints `expected` unoptimized and optimized alike.
+private sfp_prints(text: string, expected: string)
+    for level in ["0", "2"]
+        assert_eq(sfp_ran(text, level), expected)
+end sfp_prints
+
+// The LLVM text of a program for `target`, or what it had to say for itself.
+private sfp_ir(text: string, target: Option[string] = None) -> string
+    val root = sfp_root(text)
+
+    val out = emit_llvm_text(root, target) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> if made.report.is_empty() then made.text else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end sfp_ir
+
+// The body of the function `name` in `ir`.
+private sfp_body(ir: string, name: string) -> string
+    val parts = split(ir, "\n}\n")
+
+    for i in 0..<parts.len
+        val lines = split(parts[i], "\n")
+
+        for j in 0..<lines.len
+            if lines[j].starts_with("define") && lines[j].contains("@" + name + "(") then return parts[i]
+
+    assert(false, ir)
+    ""
+end sfp_body
+
+private sfp_count(hay: string, needle: string) -> usize = split(hay, needle).len - 1
+
+private sfp_says(text: string, part: string) = assert(text.contains(part), s"expected '$part' in:\n$text")
+
+private sfp_lacks(text: string, part: string) = assert(!text.contains(part), s"did not expect '$part' in:\n$text")
+
+// That a program is refused for `target` with exactly one diagnostic, holding `part`.
+private sfp_refused(text: string, target: Option[string], part: string)
+    val report = sfp_ir(text, target)
+
+    assert(report.contains(part), s"expected a refusal holding\n$part\nin\n$report")
+    assert_eq(report.count_of("error: "), 1)
+end sfp_refused
+
+// -- the library as a hosted machine other than this one reads it ----------------------------------
+//
+// A hosted target's standard module needs that machine's C headers to be built, so a program for one
+// is analysed here, in the process, against the library's source.
+
+private var sfp_library_names: Buf[string] = buf()
+private var sfp_library_units: Buf[Buf[Program]] = buf()
+
+private sfp_library(t: Target) -> Buf[Program]
+    for i in 0..<sfp_library_names.len()
+        if sfp_library_names.at(i) == t.name then return sfp_library_units.at(i)
+
+    var out: Buf[Program] = buf()
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, t) match
+            Err(_) -> ()
+            Ok(units) -> out = units
+
+    sfp_library_names.push(t.name)
+    sfp_library_units.push(out)
+    out
+end sfp_library
+
+// The program's own errors on `machine`, as one report.
+private sfp_analysed(text: string, machine: string) -> string
+    val t = target_named(machine).unwrap()
+    var units: Buf[Program] = buf()
+
+    for item in sfp_library(t)
+        units.push(item)
+
+    val parsed = parse(source_of("main.sysl", text), t)
+
+    if !parsed.ok() then return parsed.report.at(0).message
+
+    units.push(parsed.program)
+
+    val done = analyze_produced(units, t, buf(), true)
+    var own: Buf[Placed] = buf()
+
+    for err in errors_of(done.reported)
+        if !err.src.name.starts_with("library/") then own.push(err)
+
+    analysis_report(own)
+end sfp_analysed
+
+// -- cortical's probe: two additions either side of a rounding change ------------------------------
+
+// The operands are binary32 1.0 and 2^-24, exactly halfway between 1.0 and the next float: to nearest
+// the tie goes to the even 1.0, upward to 1.0000001, and both are inexact (FPSR.IXC, bit 4). Read
+// from the arguments, so nothing about them is known while compiling.
+private val sfp_probe: string = raw"""
+    import sysl.text.parse_uint
+
+    @strict_fp
+    probe(x: f32, y: f32)
+        val saved_control = read_sysreg("fpcr")
+        val saved_status = read_sysreg("fpsr")
+        val control = saved_control & ~(u64(3) << 22)
+
+        write_sysreg("fpcr", control)
+        write_sysreg("fpsr", 0)
+        isb()
+        val nearest = x + y
+        val nearest_flags = read_sysreg("fpsr")
+
+        write_sysreg("fpcr", control | (u64(1) << 22))
+        write_sysreg("fpsr", 0)
+        isb()
+        val upward = x + y
+        val upward_flags = read_sysreg("fpsr")
+
+        write_sysreg("fpcr", saved_control)
+        write_sysreg("fpsr", saved_status)
+        isb()
+
+        print(f"nearest: 0x${nearest.bits()}%08x, flags 0x$nearest_flags%x")
+        print(f"upward:  0x${upward.bits()}%08x, flags 0x$upward_flags%x")
+
+    main(args: []string)
+        val a = if args.len > 1 then parse_uint(args[1]).unwrap_or(1065353216) else 1065353216
+        val b = if args.len > 2 then parse_uint(args[2]).unwrap_or(864026624) else 864026624
+
+        probe(f32.from_bits(a), f32.from_bits(b))
+    """
+
+@test("cortical's probe: the second addition runs in the upward mode and raises its own inexact")
+sfp_cortical_probe()
+    if !sfp_ready() || !sfp_on_aarch64() then return
+
+    sfp_prints(sfp_probe, "nearest: 0x3f800000, flags 0x10\nupward:  0x3f800001, flags 0x10\n")
+end sfp_cortical_probe
+
+@test("the probe is two fadd instructions, each between the writes that bracket it")
+sfp_probe_is_two_fadds()
+    if !sfp_ready() || !sfp_on_aarch64() then return
+
+    if !exists("/usr/bin/otool")
+        print("skipped: the disassembly is read with otool, which this machine does not have")
+        return
+    end if
+
+    val root = sfp_root(sfp_probe)
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, "2", Some(exe)) match
+        Err(why) -> assert(false, failure_text(why))
+        Ok(_) -> ()
+
+    val dis = capture("/usr/bin/otool", ["-tvV", exe], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    val text = dis.unwrap().text
+    val body = text[text.index_of("_probe:").unwrap()..<text.len]
+    val code = body[0..<body.index_of("\tret").unwrap()]
+    val lines = split(code, "\n")
+    var order = ""
+
+    for i in 0..<lines.len
+        if lines[i].contains("\tfadd\t") then order = order + "A"
+        else if lines[i].contains("msr\tFPCR") then order = order + "C"
+
+    assert_eq(order, "CACAC")
+end sfp_probe_is_two_fadds
+
+@test("the probe's operations are constrained intrinsics and every call in the body is strictfp")
+sfp_probe_ir()
+    if !sfp_ready() then return
+
+    val ir = sfp_ir(sfp_probe, Some("aarch64-freestanding"))
+    val body = sfp_body(ir, "probe")
+
+    sfp_says(body, "strictfp #99 {")
+    assert_eq(sfp_count(body, "@llvm.experimental.constrained.fadd.f32(float "), 2)
+    sfp_says(body, "metadata !\"round.dynamic\", metadata !\"fpexcept.strict\") strictfp")
+    sfp_lacks(body, " fadd float")
+
+    // Every call in the body carries the attribute, the registers' and the printing's alike.
+    val lines = split(body, "\n")
+
+    for i in 0..<lines.len
+        if lines[i].contains(" call ") then assert(lines[i].ends_with(" strictfp"), lines[i])
+
+    sfp_says(ir, "declare float @llvm.experimental.constrained.fadd.f32(float, float, metadata, metadata)")
+end sfp_probe_ir
+
+// -- the four modes, both widths -------------------------------------------------------------------
+
+// At binary32, x = 1 and y = 2^-24: `x + y` is a tie above 1 (even 1.0, up 1.0000001), `x - y / 2`
+// a tie below it (even 1.0, down and toward zero 0.99999994), `x / 3` is 0x3eaaaaab to nearest and
+// upward and 0x3eaaaaaa down and toward zero, and that quotient times 3 is 1.0, 1.0000001, 0.99999994
+// and 0.99999994. Binary64 is the same at 2^-53. Each expression is written once and run under each
+// mode in turn, so four identical expressions in a row are four operations.
+private val sfp_modes: string = raw"""
+    import sysl.fenv.*
+
+    @strict_fp
+    modes32(x: f32, y: f32) -> string
+        var out = ""
+
+        for r in [NearestEven, Upward, Downward, TowardZero]
+            set_rounding(r)
+
+            val s = x + y
+            val d = x - y / (x + x)
+            val q = x / (x + x + x)
+            val p = q * (x + x + x)
+
+            out = out + f"${s.bits()}%08x ${d.bits()}%08x ${q.bits()}%08x ${p.bits()}%08x\n"
+
+        set_rounding(NearestEven)
+        out
+    end modes32
+
+    @strict_fp
+    modes64(x: f64, y: f64) -> string
+        var out = ""
+
+        for r in [NearestEven, Upward, Downward, TowardZero]
+            set_rounding(r)
+
+            val s = x + y
+            val d = x - y / (x + x)
+            val q = x / (x + x + x)
+            val p = q * (x + x + x)
+
+            out = out + f"${s.bits()}%016x ${d.bits()}%016x ${q.bits()}%016x ${p.bits()}%016x\n"
+
+        set_rounding(NearestEven)
+        out
+    end modes64
+
+    main(args: []string)
+        print(modes32(f32(args.len), f32.from_bits(0x33800000)))
+        print(modes64(real(args.len), real.from_bits(0x3CA0000000000000)))
+    """
+
+@test("+, -, * and / follow each of the four modes at f32 and f64")
+sfp_four_modes_both_widths()
+    if !sfp_ready() then return
+
+    sfp_prints(sfp_modes,
+               "3f800000 3f800000 3eaaaaab 3f800000\n" +
+               "3f800001 3f800000 3eaaaaab 3f800001\n" +
+               "3f800000 3f7fffff 3eaaaaaa 3f7fffff\n" +
+               "3f800000 3f7fffff 3eaaaaaa 3f7fffff\n\n" +
+               "3ff0000000000000 3ff0000000000000 3fd5555555555555 3ff0000000000000\n" +
+               "3ff0000000000001 3ff0000000000000 3fd5555555555556 3ff0000000000001\n" +
+               "3ff0000000000000 3fefffffffffffff 3fd5555555555555 3fefffffffffffff\n" +
+               "3ff0000000000000 3fefffffffffffff 3fd5555555555555 3fefffffffffffff\n\n")
+end sfp_four_modes_both_widths
+
+// -- the flags --------------------------------------------------------------------------------------
+
+private val sfp_flags_program: string = raw"""
+    import sysl.fenv.*
+
+    show(f: FpFlags) -> string =
+        f"${if f.invalid then "V" else "-"}${if f.divide_by_zero then "Z" else "-"}" +
+        f"${if f.overflow then "O" else "-"}${if f.underflow then "U" else "-"}${if f.inexact then "X" else "-"}"
+
+    @strict_fp
+    each(one: f64) -> string
+        var out = ""
+        val zero = one - one
+        val huge = one * 1.0e300
+        val tiny = one * 1.0e-300
+
+        clear_flags()
+        val a = one + one
+        out = out + show(flags()) + " "
+        clear_flags()
+        val b = one / zero
+        out = out + show(flags()) + " "
+        clear_flags()
+        val c = zero / zero
+        out = out + show(flags()) + " "
+        clear_flags()
+        val d = huge * huge
+        out = out + show(flags()) + " "
+        clear_flags()
+        val e = tiny * tiny
+        out = out + show(flags()) + " "
+        clear_flags()
+        val f = one / (one + one + one)
+        out = out + show(flags()) + " "
+        clear_flags()
+        out = out + show(flags()) + f" ${flags().any()}"
+        out + f" ${a + b + c + d + e + f > 0.0}"
+    end each
+
+    main(args: []string)
+        print(each(real(args.len)))
+    """
+
+// Each operation alone between a clear and a read: an exact sum raises nothing, 1/0 divide-by-zero,
+// 0/0 invalid, 1e600 overflow and inexact, 1e-600 underflow and inexact, 1/3 inexact; cleared, none.
+@test("each operation raises its own flags, read back after a clear, and a clear leaves none")
+sfp_flags_cleared_and_read()
+    if !sfp_ready() then return
+
+    sfp_prints(sfp_flags_program, "----- -Z--- V---- --O-X ---UX ----X ----- false false\n")
+end sfp_flags_cleared_and_read
+
+// -- fused multiply-add ------------------------------------------------------------------------------
+
+// `a * b + c` is one fused operation where the target fuses (`fp_contract.sysl`), and in a strict body
+// it is the constrained `fma`, rounded once in the mode in force: with a = b = 1 + 2^-52 and c = -1, the
+// exact answer is 2^-51 + 2^-104, a tie that the even 2^-51 (0x3cc0000000000000) takes in every mode
+// but upward, which takes 2^-51 + 2^-103. Rounded twice, upward would be 3 * 2^-52.
+private val sfp_fma_program: string = raw"""
+    import sysl.fenv.*
+
+    @strict_fp
+    fused(a: f64, b: f64, c: f64) -> string
+        var out = ""
+
+        for r in [NearestEven, Upward, Downward, TowardZero]
+            set_rounding(r)
+            out = out + f"${(a * b + c).bits()}%016x "
+
+        set_rounding(NearestEven)
+        out
+    end fused
+
+    main(args: []string)
+        val one = real(args.len)
+
+        val a = one + real.from_bits(0x3CB0000000000000)
+
+        print(fused(a, a, -one))
+    """
+
+@test("a contracted multiply-add is one strict fma, rounded once in each mode")
+sfp_fma_in_each_mode()
+    if !sfp_ready() then return
+
+    if !host_target().fused_double()
+        print("skipped: this machine does not fuse at binary64")
+        return
+    end if
+
+    sfp_prints(sfp_fma_program, "3cc0000000000000 3cc0000000000001 3cc0000000000000 3cc0000000000000 \n")
+
+    val ir = sfp_ir(sfp_fma_program, Some("aarch64-freestanding"))
+
+    sfp_says(sfp_body(ir, "fused"), "@llvm.experimental.constrained.fma.f64(")
+end sfp_fma_in_each_mode
+
+// -- conversions --------------------------------------------------------------------------------------
+
+// 2^24 + 1 is no binary32: an integer read as one rounds it, to 2^24 (0x4b800000) to nearest-even,
+// down and toward zero, and up to 2^24 + 2 (0x4b800001). Binary64's 1/3 narrowed to binary32 rounds as
+// a quotient does. A float read as an integer drops its fraction and raises inexact, raises invalid
+// and saturates where the integer cannot hold it, and answers zero for a NaN, raising invalid.
+private val sfp_conversion_program: string = raw"""
+    import sysl.fenv.*
+
+    @strict_fp
+    widths(n: i32, third: f64) -> string
+        var out = ""
+
+        for r in [NearestEven, Upward, Downward, TowardZero]
+            set_rounding(r)
+            out = out + f"${f32(n).bits()}%08x ${f32(third).bits()}%08x "
+
+        set_rounding(NearestEven)
+        out
+    end widths
+
+    @strict_fp
+    to_ints(half: f64, big: f64) -> string
+        var out = ""
+
+        clear_flags()
+        val a = i32(half * 5.0)
+        out = out + f"$a ${flags().inexact} ${flags().invalid} "
+        clear_flags()
+        val b = i32(big)
+        out = out + f"$b ${flags().invalid} "
+        clear_flags()
+        val c = i32(-big)
+        out = out + f"$c ${flags().invalid} "
+        clear_flags()
+        val d = i32((big - big) / (big - big))
+        out = out + f"$d ${flags().invalid} "
+        clear_flags()
+        val e = u8(-half)
+        out = out + f"$e ${flags().invalid} ${flags().inexact} "
+        clear_flags()
+        val f = u8(half * 600.0)
+        out = out + f"$f ${flags().invalid} "
+        clear_flags()
+        val g = i64(half * 4.0)
+        out + f"$g ${flags().any()}"
+    end to_ints
+
+    main(args: []string)
+        val one = real(args.len)
+
+        print(widths(16777217, one / 3.0))
+        print(to_ints(one / 2.0, one * 1.0e10))
+    """
+
+@test("an integer read as a float and a narrowing follow the mode; a float read as an integer raises")
+sfp_conversions()
+    if !sfp_ready() then return
+
+    sfp_prints(sfp_conversion_program,
+               "4b800000 3eaaaaab 4b800001 3eaaaaab 4b800000 3eaaaaaa 4b800000 3eaaaaaa \n" +
+               "2 true false 2147483647 true -2147483648 true 0 true 0 false true 255 true 2 false\n")
+end sfp_conversions
+
+// -- subnormals, signed zero, NaN ------------------------------------------------------------------
+
+// The smallest normal binary32 halved is the subnormal 2^-127 (0x00400000); with flush-to-zero it is
+// a zero. Under the downward mode `x - x` is -0.0, and +0.0 under the other three.
+private val sfp_edges_program: string = raw"""
+    import sysl.fenv.*
+
+    @strict_fp
+    edges(one: f32) -> string
+        val min_normal = f32.from_bits(0x00800000) * one
+        val half = one / (one + one)
+        var out = ""
+
+        out = out + f"${(min_normal * half).bits()}%08x "
+        set_flush_to_zero(true)
+        out = out + f"${(min_normal * half).bits()}%08x ${flush_to_zero()} "
+        set_flush_to_zero(false)
+        out = out + f"${(min_normal * half).bits()}%08x ${flush_to_zero()} "
+
+        for r in [NearestEven, Upward, Downward, TowardZero]
+            set_rounding(r)
+            out = out + f"${(one - one).bits()}%08x "
+
+        set_rounding(NearestEven)
+        out
+    end edges
+
+    main(args: []string)
+        print(edges(f32(args.len)))
+    """
+
+@test("a subnormal result is flushed only under flush-to-zero, and x - x is -0.0 only rounding down")
+sfp_subnormals_and_signed_zero()
+    if !sfp_ready() then return
+
+    sfp_prints(sfp_edges_program,
+               "00400000 00000000 true 00400000 false 00000000 00000000 80000000 00000000 \n")
+end sfp_subnormals_and_signed_zero
+
+// A quiet NaN with a payload added to 1.0 answers that NaN; under default-NaN it answers the default
+// one, 0x7fc00000. An Arm control, so AArch64 alone.
+private val sfp_nan_program: string = raw"""
+    import sysl.fenv.*
+
+    @strict_fp
+    nans(one: f32) -> string
+        val payload = f32.from_bits(0x7fc00123)
+        var out = f"${(payload + one).bits()}%08x "
+
+        set_default_nan(true)
+        out = out + f"${(payload + one).bits()}%08x ${default_nan()} "
+        set_default_nan(false)
+        out + f"${(payload + one).bits()}%08x ${default_nan()}"
+    end nans
+
+    main(args: []string)
+        print(nans(f32(args.len)))
+    """
+
+@test("a NaN's payload propagates, and under default-NaN the default NaN is answered")
+sfp_nan_propagation_and_default_nan()
+    if !sfp_ready() || !sfp_on_aarch64() then return
+
+    sfp_prints(sfp_nan_program, "7fc00123 7fc00000 true 7fc00123 false\n")
+end sfp_nan_propagation_and_default_nan
+
+// -- the environment is put back --------------------------------------------------------------------
+
+private val sfp_restore_program: string = raw"""
+    import sysl.fenv.*
+
+    @strict_fp
+    third(x: f64) -> u64 = with_rounding(Upward, () -> x / 3.0).bits()
+
+    @strict_fp
+    nested(x: f64) -> string =
+        with_rounding(Downward, () -> f"${with_rounding(Upward, () -> rounding() == Upward)} ${rounding() == Downward} ${(x / 3.0).bits()}%016x")
+
+    @strict_fp
+    early(x: f64) -> Result[f64, string]
+        val y = with_rounding(TowardZero, () -> if x > 0.0 then Err("positive") else Ok(x / 3.0))?
+        Ok(y)
+
+    main(args: []string)
+        val one = real(args.len)
+
+        print(f"${third(one)}%016x ${rounding() == NearestEven}")
+        print(nested(one), rounding() == NearestEven)
+        print(early(one).is_err(), rounding() == NearestEven)
+        set_rounding(Upward)
+        print(rounding() == Upward)
+        set_rounding(NearestEven)
+        print(rounding() == NearestEven)
+    """
+
+@test("with_rounding sets the mode for its body and puts the one it found back, nested and on '?'")
+sfp_with_rounding_restores()
+    if !sfp_ready() then return
+
+    sfp_prints(sfp_restore_program,
+               "3fd5555555555556 true\ntrue true 3fd5555555555555 true\ntrue true\ntrue\ntrue\n")
+end sfp_with_rounding_restores
+
+// -- two threads, two environments -------------------------------------------------------------------
+
+private val sfp_threads_program: string = raw"""
+    import sysl.fenv.*
+    import sysl.threads.*
+
+    struct Job
+        mode: Rounding
+        x: f64
+        bits: u64
+        kept: bool
+
+    @strict_fp
+    work(j: *Job)
+        set_rounding(j.mode)
+
+        var same = true
+        var last: u64 = 0
+
+        for i in 0..<20000
+            val q = (j.x / 3.0).bits()
+
+            if i > 0 && q != last then same = false
+
+            last = q
+
+        j.bits = last
+        j.kept = same && rounding() == j.mode
+
+    main(args: []string)
+        val one = real(args.len)
+        var up = Job(Upward, one, 0, false)
+        var down = Job(Downward, one, 0, false)
+        val a = spawn(&work, &up).unwrap()
+        val b = spawn(&work, &down).unwrap()
+
+        a.join()
+        b.join()
+        print(f"${up.bits}%016x ${up.kept} ${down.bits}%016x ${down.kept} ${rounding() == NearestEven}")
+    """
+
+@test("two threads each set their own mode and keep it, and the main thread's is untouched")
+sfp_two_threads()
+    if !sfp_ready() then return
+
+    sfp_prints(sfp_threads_program, "3fd5555555555556 true 3fd5555555555555 true true\n")
+end sfp_two_threads
+
+// -- strict and ordinary bodies calling each other --------------------------------------------------
+
+// `helper` is ordinary and one expression, so the optimizer inlines it into the strict caller; the
+// strict operations either side of it still run in the modes they were written under. The strict
+// `strict_third`, called from the ordinary `main` after `main` set the mode, follows that mode.
+private val sfp_calls_program: string = raw"""
+    import sysl.fenv.*
+
+    helper(x: f64) -> f64 = x + x
+
+    @strict_fp
+    around(x: f64) -> string
+        set_rounding(Upward)
+        val a = x / 3.0
+        val h = helper(x)
+        set_rounding(Downward)
+        val b = x / 3.0
+        set_rounding(NearestEven)
+        f"${a.bits()}%016x ${h == 2.0} ${b.bits()}%016x"
+
+    @strict_fp
+    strict_third(x: f64) -> u64 = (x / 3.0).bits()
+
+    main(args: []string)
+        val one = real(args.len)
+
+        print(around(one))
+        set_rounding(Upward)
+        val up = strict_third(one)
+        set_rounding(NearestEven)
+        print(f"$up%016x ${strict_third(one)}%016x")
+    """
+
+@test("a strict body calling an ordinary one, and an ordinary one calling a strict one")
+sfp_strict_and_ordinary_calls()
+    if !sfp_ready() then return
+
+    sfp_prints(sfp_calls_program,
+               "3fd5555555555556 true 3fd5555555555555\n3fd5555555555556 3fd5555555555555\n")
+
+    val ir = sfp_ir(sfp_calls_program, Some("aarch64-freestanding"))
+
+    // The ordinary callee is compiled as it was written; its caller's call of it is marked.
+    sfp_lacks(sfp_body(ir, "helper"), "strictfp")
+    sfp_says(sfp_body(ir, "helper"), "fadd double")
+    sfp_says(sfp_body(ir, "around"), "call double @helper(double ")
+    sfp_says(sfp_body(ir, "around"), ") strictfp")
+    sfp_lacks(sfp_body(ir, "main"), "strictfp")
+end sfp_strict_and_ordinary_calls
+
+// LLVM never puts a strict body inside an ordinary caller: the ordinary `main` keeps a call of the
+// strict `twice`, while the ordinary `helper` disappears into the strict `around` and its addition is
+// still there between the two strict ones.
+@test("at -O2 a strict body stays a call from an ordinary caller, and an ordinary one is inlined into it")
+sfp_inlining_rules()
+    if !sfp_ready() || !sfp_on_aarch64() then return
+
+    if !exists("/usr/bin/otool")
+        print("skipped: the disassembly is read with otool, which this machine does not have")
+        return
+    end if
+
+    val root = sfp_root(raw"""
+        @strict_fp
+        twice(x: f64) -> f64 = x + x
+
+        helper(x: f64) -> f64 = x * x
+
+        @strict_fp
+        around(x: f64) -> f64 = x / 3.0 + helper(x) + x / 3.0
+
+        main(args: []string)
+            print(twice(real(args.len)), around(real(args.len)))
+        """)
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, "2", Some(exe)) match
+        Err(why) -> assert(false, failure_text(why))
+        Ok(_) -> ()
+
+    val text = capture("/usr/bin/otool", ["-tvV", exe], "", [], true).unwrap().text
+
+    remove_dir_all(root).unwrap_or(())
+
+    val main_at = text.index_of("_$$main:").unwrap()
+    val main_code = text[main_at..<text.len]
+
+    sfp_says(main_code[0..<main_code.index_of("\tret").unwrap()], "bl\t_twice")
+
+    val around_at = text.index_of("_around:").unwrap()
+    val around_code = text[around_at..<text.len]
+    val code = around_code[0..<around_code.index_of("\tret").unwrap()]
+
+    assert_eq(sfp_count(code, "\tfdiv\t"), 2)
+    sfp_says(code, "\tfmul\t")
+    sfp_lacks(code, "bl\t_helper")
+end sfp_inlining_rules
+
+// -- generics, methods, closures, nested functions ---------------------------------------------------
+
+private val sfp_shapes_program: string = raw"""
+    import sysl.fenv.*
+    import sysl.math.Float
+
+    @strict_fp
+    thirds[T: Float](x: T, three: T) -> (T, T)
+        set_rounding(Upward)
+        val up = x / three
+        set_rounding(Downward)
+        val down = x / three
+        set_rounding(NearestEven)
+        (up, down)
+
+    plain[T: Float](x: T) -> T = x + x
+
+    struct Meter
+        v: f32
+
+        @strict_fp
+        third_up(self) -> u32 = with_rounding(Upward, () -> (self.v / 3.0f32).bits())
+
+    @strict_fp
+    roots(x: f32) -> string
+        val up = with_rounding(Upward, () -> x.sqrt().bits())
+        val down = with_rounding(Downward, () -> x.sqrt().bits())
+        f"$up%08x $down%08x ${plain(x) == 4.0f32}"
+
+    @strict_fp
+    inner(x: f64) -> u64
+        down_third(y: f64) -> f64
+            set_rounding(Downward)
+            val q = y / 3.0
+            set_rounding(NearestEven)
+            q
+
+        down_third(x).bits()
+
+    main(args: []string)
+        val (a, b) = thirds(f32(args.len), 3.0f32)
+        val (c, d) = thirds(real(args.len), 3.0)
+
+        print(f"${a.bits()}%08x ${b.bits()}%08x ${c.bits()}%016x ${d.bits()}%016x")
+        print(f"${Meter(f32(args.len)).third_up()}%08x")
+        print(roots(f32(args.len) + f32(args.len)))
+        print(f"${inner(real(args.len))}%016x")
+    """
+
+// sqrt(2) at binary32 is 0x3fb504f3 rounded down and toward zero and 0x3fb504f4 up -- `x.sqrt()` is
+// `llvm.sqrt` itself in a strict body, not a call of an ordinary `f32.sqrt`.
+@test("a strict generic at f32 and f64, a strict method, x.sqrt(), a closure and a nested function")
+sfp_generics_methods_closures()
+    if !sfp_ready() then return
+
+    sfp_prints(sfp_shapes_program,
+               "3eaaaaab 3eaaaaaa 3fd5555555555556 3fd5555555555555\n3eaaaaab\n3fb504f4 3fb504f3 true\n" +
+               "3fd5555555555555\n")
+
+    val ir = sfp_ir(sfp_shapes_program, Some("aarch64-freestanding"))
+
+    // Both instances are strict; the ordinary generic called from a strict body is not.
+    assert_eq(sfp_count(ir, "@llvm.experimental.constrained.fdiv.f32(float "), 3)
+    sfp_says(ir, "@llvm.experimental.constrained.sqrt.f32(float ")
+    sfp_lacks(ir, "call float @f32.sqrt(")
+
+    val lines = split(ir, "\n")
+    var strict_defines = 0
+
+    for i in 0..<lines.len
+        if lines[i].starts_with("define") && lines[i].contains(" strictfp ")
+            strict_defines += 1
+            sfp_lacks(lines[i], "@plain")
+
+    // The two instances, the method, `roots`, `inner`, its nested function and the three closures.
+    assert_eq(strict_defines, 9)
+end sfp_generics_methods_closures
+
+// -- vectors -------------------------------------------------------------------------------------------
+
+@test("a lane-wise vector operation is strict like a scalar one")
+sfp_vectors_lane_wise()
+    if !sfp_ready() then return
+
+    val program = raw"""
+        import sysl.fenv.*
+
+        @strict_fp
+        lanes(x: f32) -> string
+            val v: <4>f32 = [x, x, x, x]
+            val three: <4>f32 = [3.0, 3.0, 3.0, 3.0]
+            set_rounding(Upward)
+            val up = v / three
+            set_rounding(Downward)
+            val down = v / three
+            set_rounding(NearestEven)
+            f"${up[0].bits()}%08x ${down[3].bits()}%08x ${up[0] > down[0]}"
+
+        main(args: []string)
+            print(lanes(f32(args.len)))
+        """
+
+    sfp_prints(program, "3eaaaaab 3eaaaaaa true\n")
+    sfp_says(sfp_body(sfp_ir(program, Some("aarch64-freestanding")), "lanes"),
+             "@llvm.experimental.constrained.fdiv.v4f32(<4 x float> ")
+end sfp_vectors_lane_wise
+
+// -- what is computed while compiling ------------------------------------------------------------------
+
+// `1.0 / 3.0` in a strict body is an operation, worked out under the mode when it runs; a literal is
+// a value, rounded to nearest while compiling whatever the mode -- 0.1 at binary32 is 0x3dcccccd, and
+// a downward reading would have been 0x3dcccccc.
+@test("no operation of a strict body is folded, and a literal is its nearest value in every mode")
+sfp_folding_and_literals()
+    if !sfp_ready() then return
+
+    val program = raw"""
+        import sysl.fenv.*
+
+        @strict_fp
+        folds() -> string
+            set_rounding(Upward)
+            val up = 1.0 / 3.0
+            set_rounding(Downward)
+            val down = 1.0 / 3.0
+            val tenth = 0.1f32
+            set_rounding(NearestEven)
+            f"${up.bits()}%016x ${down.bits()}%016x ${tenth.bits()}%08x"
+
+        main(args: []string)
+            print(folds())
+        """
+
+    sfp_prints(program, "3fd5555555555556 3fd5555555555555 3dcccccd\n")
+
+    val body = sfp_body(sfp_ir(program, Some("aarch64-freestanding")), "folds")
+
+    assert_eq(sfp_count(body, "@llvm.experimental.constrained.fdiv.f64("), 2)
+    sfp_says(body, "bitcast i32 1036831949 to float")
+    sfp_lacks(body, "constrained.fptrunc")
+end sfp_folding_and_literals
+
+// -- ordinary code is untouched ----------------------------------------------------------------------
+
+// A function that is not strict lowers to the same text whether or not a strict one sits beside it.
+@test("an ordinary function's IR is the same with a strict function in the program and without one")
+sfp_ordinary_ir_unchanged()
+    if !sfp_ready() then return
+
+    val ordinary = "plain(x: f32, y: f32) -> f32 = (x + y).sqrt() * f32(i32(x)) + y.floor()\n"
+    val alone = sfp_ir(ordinary + "print(plain(1.0f32, 2.0f32))\n", Some("aarch64-freestanding"))
+    val beside = sfp_ir(ordinary + "@strict_fp\nstrict(x: f32) -> f32 = x + x\n" +
+                        "print(plain(1.0f32, 2.0f32), strict(1.0f32))\n", Some("aarch64-freestanding"))
+
+    assert_eq(sfp_body(alone, "plain"), sfp_body(beside, "plain"))
+    sfp_lacks(sfp_body(alone, "plain"), "strictfp")
+    sfp_lacks(alone, "constrained")
+end sfp_ordinary_ir_unchanged
+
+// -- boards -------------------------------------------------------------------------------------------
+
+// On a Cortex-M4F the strict additions either side of `set_rounding` are two `vadd.f32`, and the
+// environment is FPSCR, read and written with `vmrs` and `vmsr`.
+@test("on a Cortex-M4F a strict body is two vadd.f32 around vmsr fpscr")
+sfp_cortex_m4()
+    val program = raw"""
+        import sysl.fenv.*
+
+        @strict_fp
+        @export("bracket")
+        bracket(x: f32, y: f32) -> f32
+            set_rounding(Upward)
+            val a = x + y
+            set_rounding(Downward)
+            val b = x + y
+            clear_flags()
+            a - b
+
+        @export("main")
+        boot() -> i32 = 0
+        """
+
+    val code = fx2_board_code(program, "thumbv7em-freestanding", "bracket")
+
+    if code.is_none() then return
+
+    val text = code.unwrap()
+
+    assert_eq(sfp_count(text, "vadd.f32"), 2, text)
+    sfp_says(text, "vmsr\tfpscr")
+    sfp_says(text, "vmrs\t")
+end sfp_cortex_m4
+
+// On x86-64 the environment is MXCSR, through memory.
+@test("on x86-64 sysl.fenv is stmxcsr and ldmxcsr, and the strict additions stay two")
+sfp_x86_64_mxcsr()
+    if !sfp_ready() then return
+
+    val ir = sfp_ir(raw"""
+        import sysl.fenv.*
+
+        @strict_fp
+        bracket(x: f32, y: f32) -> f32
+            set_rounding(Upward)
+            val a = x + y
+            set_rounding(Downward)
+            val b = x + y
+            a - b
+
+        print(bracket(1.0f32, 2.0f32))
+        """, Some("x86_64-freestanding"))
+
+    sfp_says(ir, "stmxcsr (")
+    sfp_says(ir, "ldmxcsr (")
+    assert_eq(sfp_count(sfp_body(ir, "bracket"), "@llvm.experimental.constrained.fadd.f32("), 2)
+end sfp_x86_64_mxcsr
+
+// -- the refusals -------------------------------------------------------------------------------------
+
+@test("'@strict_fp' in front of a closure is refused, naming the function to mark")
+sfp_refuses_closure_attribute()
+    if !sfp_ready() then return
+
+    sfp_refused("main(args: []string)\n    val f = @strict_fp (x: f32) -> x + x\n    print(f(1.0f32))\n", None,
+                "a closure takes no annotations, and '@strict_fp' reaches one through the function it is written in — every closure written inside a '@strict_fp' function is strict too, so mark that function, or move the closure into one")
+end sfp_refuses_closure_attribute
+
+@test("'@strict_fp' above an extern, a struct, beside '@inline(always)' or with an argument is refused")
+sfp_refuses_misplaced()
+    if !sfp_ready() then return
+
+    sfp_refused("@strict_fp\nextern \"sqrtf\" c_sqrt(x: f32) -> f32\nprint(c_sqrt(4.0f32))\n", None,
+                "'@strict_fp' says how a body's floating-point operations are compiled, so it marks a function or a method, whose body is sysl — and this declares neither. An 'extern''s operations are compiled by whoever compiled it")
+    sfp_refused("@strict_fp\nstruct P\n    x: f32\nprint(P(1.0f32).x)\n", None,
+                "'@strict_fp' says how a body's floating-point operations are compiled, so it marks a function or a method")
+    sfp_refused("@strict_fp\n@inline(always)\nf(x: f32) -> f32 = x + x\nprint(f(1.0f32))\n", None,
+                "'@inline(always)' puts the body in place of every call, and a '@strict_fp' body is only ever put inside a caller that is '@strict_fp' too — anywhere else the call stays a call, so the promise could not be kept. Write '@inline' for the hint, which a strict caller takes")
+    sfp_refused("@strict_fp(upward)\nf(x: f32) -> f32 = x + x\nprint(f(1.0f32))\n", None,
+                "'@strict_fp' takes no arguments — the rounding mode and the exceptions are whatever the floating-point environment holds when the body runs")
+end sfp_refuses_misplaced
+
+@test("an f16, bf16 or f128 operation in a strict body is refused at the operation")
+sfp_refuses_other_widths()
+    if !sfp_ready() then return
+
+    val expected = "a '@strict_fp' body computes at f32 and f64, the widths a floating-point unit performs under its environment, and this is "
+
+    sfp_refused("@strict_fp\nf(x: f16) -> f16 = x + x\nprint(f(1.0f16))\n", None, expected + "f16")
+    sfp_refused("@strict_fp\nf(x: bf16) -> bool = x < x\nprint(f(bf16(1.0)))\n", None, expected + "bf16")
+    sfp_refused("@strict_fp\nf(x: f32) -> f128 = f128(x)\nprint(f(1.0f32) > 0.0)\n", None, expected + "f128")
+end sfp_refuses_other_widths
+
+@test("a strict body is refused where the float is software, and on WebAssembly")
+sfp_refuses_soft_targets()
+    if !sfp_ready() then return
+
+    val program = "@strict_fp\n@export(\"f\")\nf(x: f32, y: f64) -> f64 = real(x + x) + y\n"
+
+    sfp_refused("@strict_fp\n@export(\"f\")\nf(x: f32) -> f32 = x + x\n", Some("thumbv6m-freestanding"),
+                "'@strict_fp' asks the floating-point unit to follow its environment, and 'thumbv6m-freestanding' computes f32 in software, which has no environment to follow and raises nothing — compute this outside a '@strict_fp' body, or build for a target whose unit has single precision")
+    sfp_refused(program, Some("thumbv7em-freestanding"),
+                "'@strict_fp' asks the floating-point unit to follow its environment, and 'thumbv7em-freestanding' computes real in software, which has no environment to follow and raises nothing — compute this outside a '@strict_fp' body, or build for a target whose unit has double precision")
+    sfp_refused(program, Some("wasm32-freestanding"),
+                "'@strict_fp' asks for floating point that follows the environment it runs in, and 'wasm32-freestanding' is WebAssembly, whose floating point always rounds to nearest and raises nothing — compute this outside a '@strict_fp' body")
+
+    // A strict body with no floating point in it asks nothing of the unit.
+    val none = sfp_ir("@strict_fp\n@export(\"g\")\ng(n: i32) -> i32 = n + 1\n", Some("thumbv6m-freestanding"))
+
+    sfp_lacks(none, "error:")
+end sfp_refuses_soft_targets
+
+@test("a reduction of a float vector in a strict body is refused")
+sfp_refuses_reduction()
+    if !sfp_ready() then return
+
+    sfp_refused("@strict_fp\nf(v: <4>f32) -> f32 = v.sum()\nval v: <4>f32 = [1.0, 2.0, 3.0, 4.0]\nprint(f(v))\n", None,
+                "a reduction of a float vector combines its lanes in an order the target chooses, and has no strict form — inside a '@strict_fp' body, read the lanes and add them one by one, which fixes the order and makes each sum strict")
+end sfp_refuses_reduction
+
+@test("sysl.fenv is refused at the call on a machine with no unit, and a control the unit lacks too")
+sfp_refuses_fenv_where_absent()
+    if !sfp_ready() then return
+
+    sfp_refused("import sysl.fenv.*\n\n@export(\"f\")\nf() -> bool = rounding() == Upward\n", Some("thumbv6m-freestanding"),
+                "'sysl.fenv' reads and writes the floating-point unit's control and status registers, and 'thumbv6m-freestanding' has no floating-point unit — a float there is computed by a library routine, which has no environment")
+    sfp_refused("import sysl.fenv.*\n\n@export(\"f\")\nf() = set_default_nan(true)\n", Some("x86_64-freestanding"),
+                "'set_default_nan' is the default-NaN control of an Arm unit, and 'x86_64-freestanding' has none — an SSE operation that answers a NaN always answers its NaN operand's, made quiet")
+
+    // On x86-64 the rest of the module is there.
+    sfp_lacks(sfp_ir("import sysl.fenv.*\n\n@export(\"f\")\nf() -> bool = flush_to_zero() && rounding() == Upward\n",
+                     Some("x86_64-freestanding")), "error:")
+
+    // RISC-V, hosted, so analysed here against the library's source.
+    val riscv = sfp_analysed("import sysl.fenv.*\n\nprint(flush_to_zero(), rounding() == Upward)\n", "riscv64-linux")
+
+    assert(riscv.contains("'flush_to_zero' is the flush-to-zero control, and 'riscv64-linux' has none — a RISC-V unit computes every subnormal exactly"), riscv)
+    assert_eq(riscv.count_of("error: "), 1)
+end sfp_refuses_fenv_where_absent

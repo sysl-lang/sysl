@@ -180,7 +180,7 @@ private member_attr_word(w: string) -> bool
     if fn_forgo_word(w) then return true
 
     for word in ["crossing", "reads", "writes", "noinline", "inline", "cold", "blocks",
-                 "relocates", "views", "consumes", "disjoint", "scoped", "joined"]
+                 "relocates", "views", "consumes", "disjoint", "scoped", "joined", "strict_fp"]
         if word == w then return true
 
     false
@@ -230,7 +230,8 @@ builtin_attr_word(w: string) -> bool
                  "tailrec", "pure", "ghost", "packed", "reads", "writes", "align", "byte_order", "export",
                  "section", "crossing", "domain", "keeps", "disjoint", "guards", "needs",
                  "noinline", "inline", "cold", "thread_local", "abandons", "per_cpu", "main_thread",
-                 "pinned", "pins", "relocates", "views", "consumes", "blocks", "scoped", "joined"]
+                 "pinned", "pins", "relocates", "views", "consumes", "blocks", "scoped", "joined",
+                 "strict_fp"]
         if word == w then return true
 
     false
@@ -398,6 +399,10 @@ parse_attribute(p: *Parser) -> Option[Attr]
     if word == "views" then return Some(parse_views_attr(p))
     if word == "consumes" then return no_inlining_args(p, Consumes, "what a call takes is everything its receiver holds")
     if word == "blocks" then return no_inlining_args(p, Blocks, "how long a call may wait is not a number a declaration has")
+
+    // `@strict_fp` takes none: which rounding mode and which exceptions are the ones in force when
+    // the code runs, and naming one here would be the static environment this exists to give up.
+    if word == "strict_fp" then return no_inlining_args(p, StrictFp, "the rounding mode and the exceptions are whatever the floating-point environment holds when the body runs, which is what the annotation says to follow")
     if word == "annotation" then return no_inlining_args(p, AnnotationMark, "what a use of the annotation says is written where it is used, as the values of the struct's fields")
 
     // `@ignore` is the spelling other test frameworks use, answered with this one's: ignoring is
@@ -941,6 +946,7 @@ apply_func_attrs(f: *FuncDecl, attrs: Buf[Attr])
             Pins -> f.marks.pins = true
             Forgoes(cap) -> f.marks.forgoes.push(cap)
             Blocks -> f.marks.blocks = true
+            StrictFp -> f.marks.strict_fp = true
             Scoped(ns) -> f.marks.scoped = ns
             Joined(ns) -> f.marks.joined = ns
             _ -> ()
@@ -966,6 +972,7 @@ apply_member_attrs(m: *MethodDecl, attrs: Buf[Attr])
             Pins -> m.marks.pins = true
             Forgoes(cap) -> m.marks.forgoes.push(cap)
             Blocks -> m.marks.blocks = true
+            StrictFp -> m.marks.strict_fp = true
             Relocates -> m.marks.relocates = true
             Views(_) -> m.marks.views = true
             Consumes -> m.marks.consumes = true
@@ -1210,6 +1217,9 @@ private attributed_refusal(attrs: Buf[Attr]) -> string
 
     // An `extern` is where this is most often tried, and it has no body here to put in place of a
     // call: the definition is the linked object's, and only its own compiler can inline it.
+    if any_is(attrs, "strict_fp")
+        return "'@strict_fp' says how a body's floating-point operations are compiled, so it marks a function or a method, whose body is sysl — and this declares neither. An 'extern''s operations are compiled by whoever compiled it"
+
     if any_is(attrs, "inline(always)")
         return "'@inline(always)' puts a function's body in place of every call to it, so it marks a function or a method — and this declares neither. An 'extern' has no body in this program to put anywhere: its definition is in the object it is linked from"
 
@@ -1360,6 +1370,14 @@ private refuse_impossible_pairs(p: *Parser, attrs: Buf[Attr])
     // one thing twice -- and the weaker word would leave a reader wondering which was meant.
     if hinted && always
         p.fault(p.here(), "'@inline(always)' already asks for everything '@inline' does, so the two together say one thing twice — write '@inline(always)' alone where every call is to be replaced by the body, and '@inline' alone where it is a hint")
+        return
+    end if
+
+    // A strict body is never put inside a caller that is not strict -- its operations would have to
+    // stay strict among ones that are not, which LLVM does not do -- so `always` is a promise the
+    // back end would break at every such call.
+    if always && any_is(attrs, "strict_fp")
+        p.fault(p.here(), "'@inline(always)' puts the body in place of every call, and a '@strict_fp' body is only ever put inside a caller that is '@strict_fp' too — anywhere else the call stays a call, so the promise could not be kept. Write '@inline' for the hint, which a strict caller takes")
         return
     end if
 
