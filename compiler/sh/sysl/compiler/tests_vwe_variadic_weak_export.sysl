@@ -1,0 +1,208 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.is_file
+import sysl.process.capture
+import sysl.testing.skip
+
+// **A variadic `@export` beside a weak one of the same symbol, across a package boundary.**
+//
+// cstd's portable half exports `open` and `openat` weakly, as ENOSYS defaults, and its Linux half
+// exports both strongly over the system call. A variadic export is declared and defined under its
+// exported symbol itself, with no thunk (`codegen.sysl`'s `record_symbols`), so the one module
+// `build-lib` compiles for the Linux half -- where the strong one is only declared, left to the program
+// because it writes the portable half's `errno`, and the weak one is declared as precompiled -- held
+// two `declare`s of `@openat`, which LLVM refuses as an invalid redefinition. `build-c` compiles the
+// whole program, both definitions in hand, and never met it. `overridden_weak` now counts a strong
+// variadic export this module only declares, so the weak one drops its symbol there too.
+
+private val vwe_nm: string = "/opt/homebrew/opt/llvm/bin/llvm-nm"
+
+// A two-package tree: `base` at `<root>/base`, and `top` at `<root>/top` depending on it by path.
+// Answers the root; `top` is `<root>/top`.
+private vwe_pair(base: string, top: string) -> string
+    var files: Buf[(string, string)] = buf()
+
+    files.push(("base/sysl.hocon", "package {\n  name = \"vbase\"\n  version = \"0.1.0\"\n}\n"))
+    files.push(("base/vbase/stubs.sysl", base))
+    files.push(("top/sysl.hocon",
+        "package {\n  name = \"vtop\"\n  version = \"0.1.0\"\n}\n\ndependencies {\n  vbase { path = \"../base\" }\n}\n"))
+    files.push(("top/vtop/calls.sysl", top))
+
+    lbr_tree(files)
+end vwe_pair
+
+// What `sysl build-lib <root>/top` answers, for `target` (`""` the host).
+private vwe_check(root: string, target: string) -> (int, string)
+    var args: Buf[string] = buf()
+
+    for word in ["sysl", "build-lib", s"$root/top"]
+        args.push(word)
+
+    if !target.is_empty()
+        args.push("--target")
+        args.push(target)
+    end if
+
+    lbr_cli(args.view())
+end vwe_check
+
+// What `sysl build-c <root>/top -o <root>/out.a` answers, for `target` (`""` the host).
+private vwe_archive(root: string, target: string) -> (int, string)
+    var args: Buf[string] = buf()
+
+    for word in ["sysl", "build-c", s"$root/top", "-o", s"$root/out.a"]
+        args.push(word)
+
+    if !target.is_empty()
+        args.push("--target")
+        args.push(target)
+    end if
+
+    lbr_cli(args.view())
+end vwe_archive
+
+private vwe_checked(root: string, target: string)
+    val got = vwe_check(root, target)
+
+    assert_eq(got.1, s"checked $root/top")
+    assert_eq(got.0, 0)
+end vwe_checked
+
+// cstd's shape: the weak variadic default sets the base's storage, and the strong variadic
+// replacement writes that same storage, which keeps it out of `top`'s precompiled half.
+private val vwe_weak_base: string = raw"""
+    module vbase
+
+    var errno: i32 = 0
+
+    @export("vwe_opn", weak)
+    nosys_opn(dirfd: i32, flags: i32, ...) -> i32
+        errno = 38
+        -1
+    """
+
+private val vwe_strong_top: string = raw"""
+    module vtop
+
+    import vbase.errno
+
+    @export("vwe_opn")
+    opn(dirfd: i32, flags: i32, ...) -> i32
+        errno = flags
+        dirfd
+    """
+
+@test("build-lib checks a strong variadic export beside a dependency's weak one, as build-c builds it")
+vwe_the_reported_case()
+    if !lbr_ready() then return
+
+    val root = vwe_pair(vwe_weak_base, vwe_strong_top)
+
+    vwe_checked(root, "aarch64-freestanding")
+
+    val built = vwe_archive(root, "aarch64-freestanding")
+
+    assert_eq(built.0, 0)
+    assert(built.1.contains(s"wrote $root/out.a"), built.1)
+    lbr_drop([root])
+end vwe_the_reported_case
+
+@test("the same pair is checked on thumbv7em and on the host")
+vwe_other_targets()
+    if !lbr_ready() then return
+
+    val root = vwe_pair(vwe_weak_base, vwe_strong_top)
+
+    vwe_checked(root, "thumbv7em-freestanding")
+    vwe_checked(root, "")
+    lbr_drop([root])
+end vwe_other_targets
+
+@test("the archive keeps the strong variadic definition, and the weak one does not publish the symbol")
+vwe_the_strong_one_is_the_symbol()
+    if !lbr_ready() then return
+    if !is_file(vwe_nm) then skip(s"there is no llvm-nm at $vwe_nm to read the archive")
+
+    val root = vwe_pair(vwe_weak_base, vwe_strong_top)
+    val built = vwe_archive(root, "thumbv7em-freestanding")
+
+    assert_eq(built.0, 0)
+
+    val said = capture(vwe_nm, [s"$root/out.a"], "", [], true) match
+        Ok(o) -> o.text
+        Err(_) -> "llvm-nm could not be run"
+
+    assert(said.contains(" T vwe_opn"), said)
+    assert(!said.contains(" W vwe_opn"), said)
+    lbr_drop([root])
+end vwe_the_strong_one_is_the_symbol
+
+// The other way round: the strong variadic export is the dependency's, precompiled and so only
+// declared in `top`'s half, and the weak default is `top`'s own definition.
+@test("a weak variadic export beside a dependency's strong one is checked")
+vwe_the_strong_one_precompiled()
+    if !lbr_ready() then return
+
+    val base = "module vbase\n\n@export(\"vwe_opn\")\nopn(dirfd: i32, flags: i32, ...) -> i32 = dirfd + flags\n"
+    val top = "module vtop\n\nimport vbase.opn\n\n@export(\"vwe_opn\", weak)\nnosys_opn(dirfd: i32, flags: i32, ...) -> i32 = -1\n\n" +
+        "@export(\"vwe_use\")\nuse_it() -> i32 = opn(1, 2)\n"
+    val root = vwe_pair(base, top)
+
+    vwe_checked(root, "aarch64-freestanding")
+    vwe_checked(root, "")
+
+    assert_eq(vwe_archive(root, "aarch64-freestanding").0, 0)
+    lbr_drop([root])
+end vwe_the_strong_one_precompiled
+
+// A non-variadic pair is declared under its key and exported through a thunk, so it never met the
+// collision; this keeps it that way.
+@test("a non-variadic weak and strong export across the boundary are checked")
+vwe_non_variadic_pair()
+    if !lbr_ready() then return
+
+    val base = "module vbase\n\nvar errno: i32 = 0\n\n@export(\"vwe_rd\", weak)\nnosys_rd(fd: i32) -> i32\n    errno = 38\n    -1\n"
+    val top = "module vtop\n\nimport vbase.errno\n\n@export(\"vwe_rd\")\nrd(fd: i32) -> i32\n    errno = fd\n    fd\n"
+    val root = vwe_pair(base, top)
+
+    vwe_checked(root, "aarch64-freestanding")
+    vwe_checked(root, "")
+    lbr_drop([root])
+end vwe_non_variadic_pair
+
+// The libc's own names: a non-variadic `getpid` and a variadic `open`, each left to the program, and
+// a variadic export no C library declares. The IR names them and nothing else, so a C library's
+// declaration is never in the module clang reads.
+@test("exports of a libc's names, and a variadic one no libc declares, are checked")
+vwe_libc_names()
+    if !lbr_ready() then return
+
+    val top = raw"""
+        module vtop
+
+        import vbase.errno
+
+        @export("getpid")
+        my_pid() -> i32
+            errno = 0
+            7
+
+        @export("open")
+        my_open(path: *u8, flags: i32, ...) -> i32
+            errno = flags
+            -1
+
+        @export("vwe_only")
+        only(n: i32, ...) -> i32
+            errno = n
+            n
+        """
+    val root = vwe_pair("module vbase\n\nvar errno: i32 = 0\n", top)
+
+    vwe_checked(root, "aarch64-freestanding")
+    vwe_checked(root, "thumbv7em-freestanding")
+    vwe_checked(root, "")
+    lbr_drop([root])
+end vwe_libc_names

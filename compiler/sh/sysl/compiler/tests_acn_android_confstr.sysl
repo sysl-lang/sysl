@@ -1,0 +1,80 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.env.{get as env_var}
+import sysl.fs.{make_temp_dir, write_text}
+import sysl.text.join
+
+// `sysl.process` for `aarch64-android`. The spawn code looks for a program on the system's default
+// search path with `confstr(_CS_PATH)` when a child's environment is replaced without a `PATH`, and
+// Bionic declares neither `confstr` nor `_CS_PATH`: the C file did not compile, so no program that
+// started a child could be built for Android. These cases run the real `build-c` with the NDK's clang,
+// so they are skipped where there is no NDK; the host's answer to the same question is
+// `a_bare_name_uses_the_default_search_path` in `sysl/process/tests.sysl`.
+
+private acn_ready() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+    end if
+
+    android_clang_in(env_var("ANDROID_NDK_ROOT"), env_var("ANDROID_HOME")) match
+        Err(_) ->
+            print("skipped: there is no Android NDK on this machine")
+            return false
+        Ok(_) -> ()
+
+    true
+end acn_ready
+
+private acn_build(main: string) -> (int, string)
+    val root = make_temp_dir("sysl-acn-").unwrap()
+
+    write_text(s"$root/package.hocon", "package {\n  name = \"probe\"\n}\n").unwrap()
+    write_text(s"$root/main.sysl", main).unwrap()
+
+    var lines: Buf[string] = buf()
+    val sink = &lines
+    var args: [7]string = ["sysl", "build-c", "--target", "aarch64-android", "-o", s"$root/probe.a", root]
+    val code = run_cli(args[..], (line) -> sink.push(line))
+
+    reset_search_paths()
+    (code, join(lines.view(), "\n"))
+end acn_build
+
+private acn_replaced_env() -> string = raw"""
+    import sysl.process.{capture, Var}
+
+    @export("entry")
+    entry() -> i32
+        capture("printenv", ["X"], env = [Var("X", "1")], inherit_env = false) match
+            Ok(_) -> 0
+            Err(_) -> 1
+    """
+
+private acn_inherited_env() -> string = raw"""
+    import sysl.process.run
+
+    @export("entry")
+    entry() -> i32
+        run("true") match
+            Ok(_) -> 0
+            Err(_) -> 1
+    """
+
+@test("a program that starts a child with a replaced environment builds for aarch64-android")
+acn_replaced_environment_builds_for_android()
+    if !acn_ready() then return
+
+    val got = acn_build(acn_replaced_env())
+
+    assert_eq(got.0, 0, got.1)
+
+@test("and so does one that inherits the environment, which never reaches the default search path")
+acn_inherited_environment_builds_for_android()
+    if !acn_ready() then return
+
+    val got = acn_build(acn_inherited_env())
+
+    assert_eq(got.0, 0, got.1)
