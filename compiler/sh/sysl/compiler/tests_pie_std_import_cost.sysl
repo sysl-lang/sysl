@@ -1,0 +1,138 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// **A small standard function is copied into the program that calls it by what its body costs the
+// optimizer, not by how many instructions its unoptimized text has** (`codegen.sysl`'s
+// `keeps_import`, `body_cost`). Unoptimized text spells every local as a stack slot, so a PCG step
+// (`Rng.next_u32`, a dozen statements) is ~54 lines and costs 33 once the slots are registers:
+// past the limit a raw count gave, and a hot call the program could not inline. The copy is
+// `available_externally`, so the link still takes the one definition the standard module defines.
+
+private pie_lines(text: string, head: string, part: string) -> int
+    var n = 0
+
+    for line in lines_of(text)
+        if line.starts_with(head) && line.contains(part) then n += 1
+
+    n
+end pie_lines
+
+private pie_calls(text: string, part: string) -> bool
+    for line in lines_of(text)
+        if line.contains("call ") && line.contains(part) then return true
+
+    false
+end pie_calls
+
+private pie_text(path: string, level: string) -> string
+    lbr_hand([])
+
+    val text = emit_llvm_text(path, None, level, buf(), None, true) match
+        Err(why) -> s"refused: ${failure_text(why)}"
+        Ok(emitted) -> emitted.text
+
+    reset_search_paths()
+    text
+end pie_text
+
+private pie_optimized(text: string) -> string
+    val dir = make_temp_dir("sysl-pie-opt").unwrap()
+    val file = s"$dir/t.ll"
+
+    write_text(file, text).unwrap()
+
+    val got = capture("clang", ["-O2", "-S", "-emit-llvm", "-o", "-", file], "", [], true).unwrap()
+
+    remove_dir_all(dir).unwrap_or(())
+    assert(got.status.ok(), s"clang refused the text:\n${got.err.unwrap_or("")}")
+    got.text
+end pie_optimized
+
+private pie_program() -> string =
+    lbr_program("import sysl.rand.{rng, Rng}\n\n@noinline\nstep(g: *Rng) -> u32 = g.next_u32()\n\n" +
+                "var g = rng(42, 54)\n\nprint(step(&g))\nprint(step(&g))\n")
+
+@test("a PCG step is copied into the program at -O2, once, with no declaration beside it, and inlined")
+pie_pcg_step_copied()
+    if !lbr_ready() then return
+
+    val app = pie_program()
+    val text = pie_text(app, "2")
+
+    assert_eq(pie_lines(text, "define available_externally ", "Rng.next_u32("), 1)
+    assert_eq(pie_lines(text, "declare ", "Rng.next_u32("), 0)
+
+    // The real definition stays in the standard module: this text defines it nowhere.
+    assert_eq(pie_lines(text, "define i32 ", "Rng.next_u32("), 0)
+    assert_eq(pie_lines(text, "define dso_local ", "Rng.next_u32("), 0)
+    assert(!pie_calls(pie_optimized(text), "Rng.next_u32("), "the copy was inlined")
+    lbr_drop([app])
+end pie_pcg_step_copied
+
+@test("the program links to the one definition and prints the published vector's first two outputs")
+pie_pcg_step_links_and_runs()
+    if !lbr_ready() then return
+
+    val app = pie_program()
+    val dir = make_temp_dir("sysl-pie-exe").unwrap()
+    val exe = s"$dir/pie-exe"
+
+    lbr_hand([])
+
+    val said = build_native_program(app, None, None, "2", Some(exe)) match
+        Err(why) -> s"refused: ${failure_text(why)}"
+        Ok(made) ->
+            capture(made, [], "", [], true) match
+                Err(_) -> "the program that was built could not be run"
+                Ok(out) -> if out.status.ok() then out.text else s"exited badly: ${out.text}"
+
+    reset_search_paths()
+    remove_dir_all(dir).unwrap_or(())
+    assert_eq(said, "2707161783\n2068313097\n")
+    lbr_drop([app])
+end pie_pcg_step_links_and_runs
+
+@test("at -O0 the step is only declared: nothing would read a copy")
+pie_pcg_step_declared_at_o0()
+    if !lbr_ready() then return
+
+    val app = pie_program()
+    val text = pie_text(app, "0")
+
+    assert_eq(pie_lines(text, "define available_externally ", ""), 0)
+    assert_eq(pie_lines(text, "declare ", "Rng.next_u32("), 1)
+    lbr_drop([app])
+end pie_pcg_step_declared_at_o0
+
+@test("emit-llvm's own text, which links nothing, carries no copy")
+pie_emit_llvm_text_has_no_copy()
+    if !lbr_ready() then return
+
+    val app = pie_program()
+    lbr_hand([])
+
+    val text = emit_llvm_text(app, None, "2", buf(), None, false) match
+        Err(why) -> s"refused: ${failure_text(why)}"
+        Ok(emitted) -> emitted.text
+
+    reset_search_paths()
+
+    assert_eq(pie_lines(text, "define available_externally ", ""), 0)
+    lbr_drop([app])
+end pie_emit_llvm_text_has_no_copy
+
+@test("a standard function whose body costs more than the optimizer would take stays a declaration")
+pie_large_body_stays_declared()
+    if !lbr_ready() then return
+
+    val app = lbr_program("import sysl.text.replace_all\n\nprint(replace_all(\"a-b-c\", \"-\", \"+\"))\n")
+    val text = pie_text(app, "2")
+
+    assert_eq(pie_lines(text, "declare ", "replace_all("), 1)
+    assert_eq(pie_lines(text, "define available_externally ", "replace_all("), 0)
+    lbr_drop([app])
+end pie_large_body_stays_declared
