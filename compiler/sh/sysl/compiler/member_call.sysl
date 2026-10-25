@@ -1035,14 +1035,19 @@ private call_generic_member(cx: &Analyzer, span: Span, receiver: Option[TExpr], 
                       s"${quantity(mine.len(), "type argument")} (${quoted_names(mine)}), and " +
                       s"${targs.len()} ${if targs.len() == 1 then "was" else "were"} written")
 
+    val home = instantiation_scope(cx, fd.name)
     var written_args: Buf[Type] = buf()
 
-    for targ in targs
-        written_args.push(stand_in_arg(cx, targ) match
-            Some(t) -> t
-            None -> written_type_arg(cx, targ))
+    // Each is read against the member's own parameter it fills, as a module function's are: a
+    // `const` the declaration wrote takes a value -- a constant, or arithmetic over one.
+    for i in 0..<targs.len()
+        written_args.push(member_arg_for(cx, m, home, mine.at(i), targs.at(i), false))
 
-    val home = instantiation_scope(cx, fd.name)
+    // An argument already refused instantiates nothing, or the body would report every use of its
+    // parameter as a name nobody declared.
+    for t in written_args
+        if t == Unknown then return bad_expr(span)
+
     val slots = bind_member_args(cx, span, shown, m, args)
 
     if slots.is_none() then return bad_expr(span)

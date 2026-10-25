@@ -152,22 +152,30 @@ written_type_arg(cx: &Analyzer, e: Expr) -> Type = type_arg_read(cx, e, false)
 // declaration wrote `const` of a simple enum, the argument is one of its variants -- bare, the
 // parameter's type saying which enum, or qualified -- and otherwise it reads as any type argument.
 private written_arg_for(cx: &Analyzer, f: Func, name: string, e: Expr) -> Type =
-    arg_for(cx, f, name, e, false)
+    arg_for(cx, f.decl.tvalues, f.scope, f.decl.name, name, e, false)
 
 // The same at an address, `&f[K]`, which reads its brackets exactly as a call does: a `const`, or
 // arithmetic over one, where the declaration wrote `const`, and a type everywhere else -- whose
 // refusal advises writing the type on the binding instead, there being no call to infer it from.
-address_arg_for(cx: &Analyzer, f: Func, name: string, e: Expr) -> Type = arg_for(cx, f, name, e, true)
+address_arg_for(cx: &Analyzer, f: Func, name: string, e: Expr) -> Type =
+    arg_for(cx, f.decl.tvalues, f.scope, f.decl.name, name, e, true)
 
-private arg_for(cx: &Analyzer, f: Func, name: string, e: Expr, at_address: bool) -> Type
-    val declared = binding_named(f.decl.tvalues, name)
+// One written argument of a generic MEMBER's own parameter, `b.pick[TWO](…)` or `&Sq.pick[TWO]`,
+// read the same way against the member's own declaration, whose types resolve where it was written.
+member_arg_for(cx: &Analyzer, m: MethodDecl, home: Scope, name: string, e: Expr,
+               at_address: bool) -> Type =
+    arg_for(cx, m.tvalues, home, source_member_name(m.name), name, e, at_address)
+
+private arg_for(cx: &Analyzer, tvalues: Buf[TypeBinding], scope: Scope, owner: string, name: string,
+                e: Expr, at_address: bool) -> Type
+    val declared = binding_named(tvalues, name)
 
     if declared.is_some()
-        val ty = nameless(resolve_type(cx.an, f.scope, declared.unwrap(), no_bindings()))
+        val ty = nameless(resolve_type(cx.an, scope, declared.unwrap(), no_bindings()))
 
         // **Anything else written for a value parameter is a value**: a `const` it names, or an
         // expression run while compiling, `f[sq(3)]()` -- never a type, whatever its spelling.
-        return value_written(cx, e, ty, s"'$name' of '${f.decl.name}'")
+        return value_written(cx, e, ty, s"'$name' of '$owner'")
     end if
 
     stand_in_arg(cx, e) match
