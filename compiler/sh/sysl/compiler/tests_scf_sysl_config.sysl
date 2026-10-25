@@ -1,0 +1,889 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{is_file, make_dir_all, make_temp_dir, read_text, remove_dir_all, write_text}
+import sysl.text.{from_utf8_unchecked, join, split, Search}
+
+// `sysl config` -- every writing command as a whole manifest in and a whole manifest out, so a byte
+// that moved where it should not have fails the equality; every refusal by its exact text; and the
+// command line's own half (`--dry-run`, a refused edit leaving the file as it was, `fix` renaming
+// `package.hocon`, `show`) through `run_cli`.
+//
+// The axes: the command (each of section 5.1's but the menu) x the manifest's shape (nested blocks,
+// dotted keys, one-line blocks, an empty file) x whose key it is (the project's own declaration, or a
+// dependency entry the project configures). The matrix below is one row per cell; the one cell it
+// does not assert is named where it would be, with the reason.
+
+// A command line as a shell splits one: words on blanks, a run in single or double quotes one word
+// without its quotes.
+private scf_words(line: string) -> Buf[string]
+    var out: Buf[string] = buf()
+    var word: Buf[u8] = buf()
+    var quote: u8 = 0
+    var started = false
+
+    for b in line.bytes
+        if quote != 0
+            if b == quote then quote = 0 else word.push(b)
+        else if b == u8('"') || b == u8('\'')
+            quote = b
+            started = true
+        else if b == u8(' ')
+            if started || !word.is_empty() then out.push(scf_text(word))
+
+            word = buf()
+            started = false
+        else
+            word.push(b)
+
+    if started || !word.is_empty() then out.push(scf_text(word))
+
+    out
+end scf_words
+
+private scf_text(bytes: Buf[u8]) -> string = from_utf8_unchecked(bytes.view())
+
+// What a command line after `sysl config` leaves of a manifest's text, or its refusal.
+private scf_edit(text: string, line: string) -> Result[string, string]
+    val words = scf_words(line)
+    val c = read_config_command(words.view())?
+
+    config_edited(text, c) match
+        Ok(change) -> Ok(change.text)
+        Err(why) -> Err(why)
+end scf_edit
+
+private scf_ok(text: string, line: string) -> string = scf_edit(text, line) match
+    Ok(t) -> t
+    Err(why) -> s"refused: $why"
+
+private scf_refused(text: string, line: string) -> string = scf_edit(text, line) match
+    Ok(t) -> s"accepted:\n$t"
+    Err(why) -> why
+
+private scf_lines(lines: []string) -> string = join(lines, "\n") + "\n"
+
+// -- the shapes ---------------------------------------------------------------------------------------
+
+private scf_nested() -> string = scf_lines([
+    "package {",
+    "  name = \"app\"",
+    "}",
+    "",
+    "dependencies {",
+    "  usb { path = \"../usb\", optional = true }",
+    "  log { path = \"../log\" }",
+    "}",
+    "",
+    "features {",
+    "  cdc  = [usb]",
+    "  fast = []",
+    "}"])
+
+private scf_dotted() -> string = scf_lines([
+    "package.name = \"app\"",
+    "dependencies.usb.path = \"../usb\"",
+    "dependencies.usb.optional = true",
+    "dependencies.log.path = \"../log\"",
+    "features.cdc = [usb]",
+    "features.fast = []"])
+
+private scf_inline() -> string = scf_lines([
+    "package { name = \"app\" }",
+    "dependencies { usb { path = \"../usb\", optional = true }, log { path = \"../log\" } }",
+    "features { cdc = [usb], fast = [] }"])
+
+// One cell: the shape, the command, and what the manifest is afterwards (or the refusal).
+private scf_cell(shape: string, text: string, line: string, expected: string)
+    val got = scf_edit(text, line) match
+        Ok(t) -> t
+        Err(why) -> s"refused: $why"
+
+    assert_eq(got, expected, s"$shape × '$line'")
+end scf_cell
+
+// -- the matrix: nested blocks -------------------------------------------------------------------------
+
+@test("scf: every command on a manifest of nested blocks")
+scf_matrix_nested()
+    val n = scf_nested()
+
+    scf_cell("nested", n, "dep add github.com/sysl-lang/fat@0.1.0", scf_lines([
+        "package {", "  name = \"app\"", "}", "", "dependencies {",
+        "  usb { path = \"../usb\", optional = true }", "  log { path = \"../log\" }",
+        "  fat { git = \"github.com/sysl-lang/fat\", version = \"0.1.0\" }", "}", "",
+        "features {", "  cdc  = [usb]", "  fast = []", "}"]))
+    scf_cell("nested", n, "dep remove log", scf_lines([
+        "package {", "  name = \"app\"", "}", "", "dependencies {",
+        "  usb { path = \"../usb\", optional = true }", "}", "",
+        "features {", "  cdc  = [usb]", "  fast = []", "}"]))
+    scf_cell("nested", n, "dep usb --features +hid", scf_lines([
+        "package {", "  name = \"app\"", "}", "", "dependencies {",
+        "  usb { path = \"../usb\", optional = true, features = [hid] }", "  log { path = \"../log\" }", "}", "",
+        "features {", "  cdc  = [usb]", "  fast = []", "}"]))
+    scf_cell("nested", n, "dep usb --set ep0=64", scf_lines([
+        "package {", "  name = \"app\"", "}", "", "dependencies {",
+        "  usb { path = \"../usb\", optional = true, options { ep0 = 64 } }", "  log { path = \"../log\" }", "}", "",
+        "features {", "  cdc  = [usb]", "  fast = []", "}"]))
+    scf_cell("nested", n, "feature add msc --enables usb", scf_lines([
+        "package {", "  name = \"app\"", "}", "", "dependencies {",
+        "  usb { path = \"../usb\", optional = true }", "  log { path = \"../log\" }", "}", "",
+        "features {", "  cdc  = [usb]", "  fast = []", "  msc  = [usb]", "}"]))
+    scf_cell("nested", n, "feature remove fast", scf_lines([
+        "package {", "  name = \"app\"", "}", "", "dependencies {",
+        "  usb { path = \"../usb\", optional = true }", "  log { path = \"../log\" }", "}", "",
+        "features {", "  cdc  = [usb]", "}"]))
+    scf_cell("nested", n, "option add slots --type u8 --default 4", scf_lines([
+        "package {", "  name = \"app\"", "}", "", "dependencies {",
+        "  usb { path = \"../usb\", optional = true }", "  log { path = \"../log\" }", "}", "",
+        "features {", "  cdc  = [usb]", "  fast = []", "}", "options {",
+        "  slots { type = u8, default = 4 }", "}"]))
+    scf_cell("nested", n, "option add rx --type u16 --default 64 --feature cdc", scf_lines([
+        "package {", "  name = \"app\"", "}", "", "dependencies {",
+        "  usb { path = \"../usb\", optional = true }", "  log { path = \"../log\" }", "}", "",
+        "features {", "  cdc  = { enables = [usb], options { rx { type = u16, default = 64 } } }",
+        "  fast = []", "}"]))
+    scf_cell("nested", n, "target add pico", scf_lines([
+        "package {", "  name = \"app\"", "}", "", "dependencies {",
+        "  usb { path = \"../usb\", optional = true }", "  log { path = \"../log\" }", "}", "",
+        "features {", "  cdc  = [usb]", "  fast = []", "}", "targets {", "  pico {}", "}"]))
+    scf_cell("nested", n, "c add z --sources z.c", scf_lines([
+        "package {", "  name = \"app\"", "}", "", "dependencies {",
+        "  usb { path = \"../usb\", optional = true }", "  log { path = \"../log\" }", "}", "",
+        "features {", "  cdc  = [usb]", "  fast = []", "}", "c {", "  z { sources = [\"z.c\"] }", "}"]))
+    scf_cell("nested", n, "set package.version '\"0.2.0\"'", scf_lines([
+        "package {", "  name = \"app\"", "  version = \"0.2.0\"", "}", "", "dependencies {",
+        "  usb { path = \"../usb\", optional = true }", "  log { path = \"../log\" }", "}", "",
+        "features {", "  cdc  = [usb]", "  fast = []", "}"]))
+    scf_cell("nested", n, "unset dependencies.log", scf_lines([
+        "package {", "  name = \"app\"", "}", "", "dependencies {",
+        "  usb { path = \"../usb\", optional = true }", "}", "",
+        "features {", "  cdc  = [usb]", "  fast = []", "}"]))
+    scf_cell("nested", n, "fix", n)
+end scf_matrix_nested
+
+// -- the matrix: dotted keys -----------------------------------------------------------------------------
+
+@test("scf: every command on a manifest of dotted keys, which it keeps writing dotted")
+scf_matrix_dotted()
+    val d = scf_dotted()
+    val head = ["package.name = \"app\"", "dependencies.usb.path = \"../usb\"", "dependencies.usb.optional = true"]
+
+    scf_cell("dotted", d, "dep add github.com/sysl-lang/fat@0.1.0", scf_lines([
+        head[0], head[1], head[2], "dependencies.log.path = \"../log\"",
+        "dependencies.fat { git = \"github.com/sysl-lang/fat\", version = \"0.1.0\" }",
+        "features.cdc = [usb]", "features.fast = []"]))
+    scf_cell("dotted", d, "dep remove log", scf_lines([head[0], head[1], head[2], "features.cdc = [usb]",
+                                                      "features.fast = []"]))
+    scf_cell("dotted", d, "dep usb --features +hid", scf_lines([
+        head[0], head[1], head[2], "dependencies.usb.features = [hid]", "dependencies.log.path = \"../log\"",
+        "features.cdc = [usb]", "features.fast = []"]))
+    scf_cell("dotted", d, "dep usb --set ep0=64", scf_lines([
+        head[0], head[1], head[2], "dependencies.usb.options.ep0 = 64", "dependencies.log.path = \"../log\"",
+        "features.cdc = [usb]", "features.fast = []"]))
+    scf_cell("dotted", d, "feature add msc --enables usb", scf_lines([
+        head[0], head[1], head[2], "dependencies.log.path = \"../log\"", "features.cdc = [usb]",
+        "features.fast = []", "features.msc = [usb]"]))
+    scf_cell("dotted", d, "feature remove fast", scf_lines([
+        head[0], head[1], head[2], "dependencies.log.path = \"../log\"", "features.cdc = [usb]"]))
+    scf_cell("dotted", d, "option add slots --type u8 --default 4", scf_lines([
+        head[0], head[1], head[2], "dependencies.log.path = \"../log\"", "features.cdc = [usb]",
+        "features.fast = []", "options.slots { type = u8, default = 4 }"]))
+    scf_cell("dotted", d, "option add rx --type u16 --default 64 --feature cdc", scf_lines([
+        head[0], head[1], head[2], "dependencies.log.path = \"../log\"",
+        "features.cdc = { enables = [usb], options { rx { type = u16, default = 64 } } }", "features.fast = []"]))
+    scf_cell("dotted", d, "target add pico", scf_lines([
+        head[0], head[1], head[2], "dependencies.log.path = \"../log\"", "features.cdc = [usb]",
+        "features.fast = []", "targets.pico {}"]))
+    scf_cell("dotted", d, "c add z --sources z.c", scf_lines([
+        head[0], head[1], head[2], "dependencies.log.path = \"../log\"", "features.cdc = [usb]",
+        "features.fast = []", "c.z { sources = [\"z.c\"] }"]))
+    scf_cell("dotted", d, "set package.version '\"0.2.0\"'", scf_lines([
+        head[0], "package.version = \"0.2.0\"", head[1], head[2], "dependencies.log.path = \"../log\"",
+        "features.cdc = [usb]", "features.fast = []"]))
+    scf_cell("dotted", d, "unset dependencies.log", scf_lines([head[0], head[1], head[2], "features.cdc = [usb]",
+                                                              "features.fast = []"]))
+    scf_cell("dotted", d, "fix", d)
+end scf_matrix_dotted
+
+// -- the matrix: one-line blocks ---------------------------------------------------------------------------
+
+// **The one cell not asserted is `dep usb --set` here.** The new entry pushes the one-line
+// `dependencies` block past 100 columns, and hocon v0.3.0 reflows only the inner `usb` block, leaving
+// it opened mid-line with its entries indented from column 0 -- valid HOCON, but not the layout the
+// package's own design describes. It is reported to the hocon package rather than pinned here.
+@test("scf: every command on a manifest of one-line blocks, which a short entry joins in place")
+scf_matrix_inline()
+    val i = scf_inline()
+    val pkg = "package { name = \"app\" }"
+    val deps = "dependencies { usb { path = \"../usb\", optional = true }, log { path = \"../log\" } }"
+    val feats = "features { cdc = [usb], fast = [] }"
+
+    scf_cell("inline", i, "dep add github.com/sysl-lang/fat@0.1.0", scf_lines([
+        pkg, "dependencies {", "  usb { path = \"../usb\", optional = true }", "  log { path = \"../log\" }",
+        "  fat { git = \"github.com/sysl-lang/fat\", version = \"0.1.0\" }", "}", feats]))
+    scf_cell("inline", i, "dep remove log", scf_lines([
+        pkg, "dependencies { usb { path = \"../usb\", optional = true } }", feats]))
+    scf_cell("inline", i, "dep usb --features +hid", scf_lines([
+        pkg, "dependencies { usb { path = \"../usb\", optional = true, features = [hid] }, log { path = \"../log\" } }",
+        feats]))
+    scf_cell("inline", i, "feature add msc --enables usb", scf_lines([
+        pkg, deps, "features { cdc = [usb], fast = [], msc = [usb] }"]))
+    scf_cell("inline", i, "feature remove fast", scf_lines([pkg, deps, "features { cdc = [usb] }"]))
+    scf_cell("inline", i, "option add slots --type u8 --default 4", scf_lines([
+        pkg, deps, feats, "options {", "  slots { type = u8, default = 4 }", "}"]))
+    scf_cell("inline", i, "option add rx --type u16 --default 64 --feature cdc", scf_lines([
+        pkg, deps, "features { cdc = { enables = [usb], options { rx { type = u16, default = 64 } } }, fast = [] }"]))
+    scf_cell("inline", i, "target add pico", scf_lines([pkg, deps, feats, "targets {", "  pico {}", "}"]))
+    scf_cell("inline", i, "c add z --sources z.c", scf_lines([pkg, deps, feats, "c {", "  z { sources = [\"z.c\"] }", "}"]))
+    scf_cell("inline", i, "set package.version '\"0.2.0\"'", scf_lines([
+        "package { name = \"app\", version = \"0.2.0\" }", deps, feats]))
+    scf_cell("inline", i, "unset dependencies.log", scf_lines([
+        pkg, "dependencies { usb { path = \"../usb\", optional = true } }", feats]))
+    scf_cell("inline", i, "fix", i)
+end scf_matrix_inline
+
+// -- the matrix: an empty file -------------------------------------------------------------------------------
+
+@test("scf: every command on an empty manifest: the adds make their block, the rest have nothing to name")
+scf_matrix_empty()
+    scf_cell("empty", "", "dep add github.com/sysl-lang/fat@0.1.0", scf_lines([
+        "dependencies {", "  fat { git = \"github.com/sysl-lang/fat\", version = \"0.1.0\" }", "}"]))
+    scf_cell("empty", "", "dep remove log", "refused: there is no dependency 'log' in sysl.hocon — it has none")
+    scf_cell("empty", "", "dep usb --features +hid", "refused: there is no dependency 'usb' in sysl.hocon — it has none")
+    scf_cell("empty", "", "dep usb --set ep0=64", "refused: there is no dependency 'usb' in sysl.hocon — it has none")
+    scf_cell("empty", "", "feature add msc --enables usb",
+             "refused: adding 'msc' would have made sysl.hocon unreadable, so nothing was written:\n  " +
+             "'features.msc' names 'usb', which is neither a dependency of this package nor a feature of it — " +
+             "a feature turns on things this manifest declares, so 'usb' would select nothing")
+    scf_cell("empty", "", "feature add msc", scf_lines(["features {", "  msc = []", "}"]))
+    scf_cell("empty", "", "feature remove fast", "refused: there is no feature 'fast' in sysl.hocon — it declares none")
+    scf_cell("empty", "", "option add slots --type u8 --default 4", scf_lines([
+        "options {", "  slots { type = u8, default = 4 }", "}"]))
+    scf_cell("empty", "", "option add rx --type u16 --default 64 --feature cdc",
+             "refused: there is no feature 'cdc' in sysl.hocon — it declares none")
+    scf_cell("empty", "", "target add pico", scf_lines(["targets {", "  pico {}", "}"]))
+    scf_cell("empty", "", "c add z --sources z.c", scf_lines(["c {", "  z { sources = [\"z.c\"] }", "}"]))
+    scf_cell("empty", "", "set package.version '\"0.2.0\"'", scf_lines(["package {", "  version = \"0.2.0\"", "}"]))
+    scf_cell("empty", "", "unset dependencies.log", "refused: there is no `dependencies.log` to remove")
+    scf_cell("empty", "", "fix", "")
+end scf_matrix_empty
+
+// -- dependencies ----------------------------------------------------------------------------------------------
+
+@test("scf: dep add writes optional, if and a label, and the feature naming it keeps it readable")
+scf_dep_add_every_flag()
+    val before = scf_lines(["package { name = \"app\" }", "", "dependencies {",
+                            "  usb { path = \"../usb\" }", "}", "", "features {", "  sd = [card]", "}"])
+
+    assert_eq(scf_ok(before, "dep add github.com/sysl-lang/fat@0.1.0 --optional --if 'thumb && freestanding' --label card"),
+              scf_lines(["package { name = \"app\" }", "", "dependencies {", "  usb { path = \"../usb\" }",
+                         "  card { git = \"github.com/sysl-lang/fat\", version = \"0.1.0\", optional = true, " +
+                         "if = \"thumb && freestanding\" }", "}", "", "features {", "  sd = [card]", "}"]))
+end scf_dep_add_every_flag
+
+@test("scf: dep add refuses a label already there, and an optional dependency no feature names")
+scf_dep_add_refusals()
+    val before = scf_lines(["dependencies {", "  fat { git = \"github.com/sysl-lang/fat\", version = \"0.1.0\" }", "}"])
+
+    assert_eq(scf_refused(before, "dep add github.com/sysl-lang/fat@0.2.0"),
+              "'fat' is already a dependency of this project — change its version in sysl.hocon, or remove the " +
+              "entry and add it again")
+    assert_eq(scf_refused("", "dep add github.com/sysl-lang/png@0.1.0 --optional"),
+              "adding 'png' would have made sysl.hocon unreadable, so nothing was written:\n  'png' is an optional " +
+              "dependency no feature names — an optional dependency is reached only by the feature that turns it " +
+              "on, so nothing would ever build it. Name it in a 'features' entry, or drop its 'optional = true'")
+    assert_eq(scf_refused("", "dep add github.com/sysl-lang/png"),
+              "'github.com/sysl-lang/png' names no version — write it as 'github.com/sysl-lang/png@<version>'")
+end scf_dep_add_refusals
+
+@test("scf: dep remove takes the comment above the entry with it, and finds a dev dependency too")
+scf_dep_remove_comment_and_dev()
+    val before = scf_lines(["dependencies {", "  a { path = \"../a\" }", "  // why b.", "  b { path = \"../b\" }", "}",
+                            "", "dev_dependencies {", "  t { path = \"../t\" }", "}"])
+
+    assert_eq(scf_ok(before, "dep remove b"),
+              scf_lines(["dependencies {", "  a { path = \"../a\" }", "}", "", "dev_dependencies {",
+                         "  t { path = \"../t\" }", "}"]))
+    assert_eq(scf_ok(before, "dep remove t"),
+              scf_lines(["dependencies {", "  a { path = \"../a\" }", "  // why b.", "  b { path = \"../b\" }", "}",
+                         "", "dev_dependencies {", "}"]))
+    assert_eq(scf_refused(before, "dep remove c"),
+              "there is no dependency 'c' in sysl.hocon — its dependencies are 'a', 'b', 't'")
+end scf_dep_remove_comment_and_dev
+
+@test("scf: dep <label> --features adds, takes out, and drops a list left empty")
+scf_dep_features()
+    val before = scf_lines(["dependencies {", "  usb { path = \"../usb\", features = [msc] }", "}"])
+
+    assert_eq(scf_ok(before, "dep usb --features +cdc,-msc"),
+              scf_lines(["dependencies {", "  usb { path = \"../usb\", features = [cdc] }", "}"]))
+    assert_eq(scf_ok(before, "dep usb --features cdc"),
+              scf_lines(["dependencies {", "  usb { path = \"../usb\", features = [msc, cdc] }", "}"]))
+    assert_eq(scf_ok(before, "dep usb --features msc"), before)
+    assert_eq(scf_ok(before, "dep usb --features -msc"),
+              scf_lines(["dependencies {", "  usb { path = \"../usb\" }", "}"]))
+    assert_eq(scf_refused(before, "dep usb --features -cdc"),
+              "'usb' does not ask for the feature 'cdc', so there is nothing to take out — it asks for 'msc'")
+    assert_eq(scf_refused(before, "dep usb --features ,"),
+              "'--features' names no feature — it is written '--features +a,-b'")
+    assert_eq(scf_refused(before, "dep usb --features +"), "'--features' names an empty feature after '+'")
+end scf_dep_features
+
+@test("scf: dep <label> --set writes a feature's option nested, quotes a value that needs it, and repeats")
+scf_dep_set()
+    val before = scf_lines(["dependencies {", "  usb { path = \"../usb\" }", "}"])
+
+    assert_eq(scf_ok(before, "dep usb --set cdc.rx_buffer=512 --set name='a b' --set vid=0x2E8A"),
+              scf_lines(["dependencies {",
+                         "  usb { path = \"../usb\", options { cdc { rx_buffer = 512 }, name = \"a b\", vid = 0x2E8A } }",
+                         "}"]))
+
+    val set_already = scf_lines(["dependencies {", "  usb { path = \"../usb\", options = { depth = 4 } }", "}"])
+
+    assert_eq(scf_ok(set_already, "dep usb --set depth=8"),
+              scf_lines(["dependencies {", "  usb { path = \"../usb\", options = { depth = 8 } }", "}"]))
+    assert_eq(scf_refused(before, "dep usb --set depth"),
+              "'--set depth' names no value — it is written '--set <option>=<value>', as '--set rx_buffer=256'")
+    assert_eq(scf_refused(before, "dep usb --set =4"),
+              "'--set =4' names no option — it is written '--set <option>=<value>'")
+    assert_eq(scf_refused(before, "dep nope --set depth=1"),
+              "there is no dependency 'nope' in sysl.hocon — its dependencies are 'usb'")
+    assert_eq(scf_refused(before, "dep usb"), "usage: sysl config dep <label> [--features +a,-b] [--set <option>=<value>]...")
+    assert_eq(scf_refused(before, "dep usb --optional"),
+              "'--optional' is not an option of 'sysl config dep <label>' — it takes --features, --set")
+end scf_dep_set
+
+// -- features ----------------------------------------------------------------------------------------------------
+
+@test("scf: feature add writes a block where it says more than what it enables, and raises an old floor")
+scf_feature_add_block_raises_floor()
+    val before = scf_lines(["package {", "  name = \"logger\"", "  sysl = \"0.4.0\"", "}"])
+
+    assert_eq(scf_ok(before, "feature add sd --doc 'log to a card' --default --if thumb"),
+              scf_lines(["package {", "  name = \"logger\"", "  sysl = \"0.5.0\"", "}",
+                         "features {", "  sd { doc = \"log to a card\", default = true, if = \"thumb\" }", "}"]))
+
+    // The list form is read by every release, so it leaves the floor alone.
+    assert_eq(scf_ok(before, "feature add sd"),
+              scf_lines(["package {", "  name = \"logger\"", "  sysl = \"0.4.0\"", "}", "features {", "  sd = []", "}"]))
+
+    // A floor already at 0.5.0 or with none is not touched.
+    val none = scf_lines(["package {", "  name = \"logger\"", "}"])
+
+    assert_eq(scf_ok(none, "feature add sd --default"),
+              scf_lines(["package {", "  name = \"logger\"", "}", "features {", "  sd { default = true }", "}"]))
+end scf_feature_add_block_raises_floor
+
+@test("scf: feature add refuses default, a name already there, and an option it does not take")
+scf_feature_refusals()
+    val before = scf_lines(["features {", "  sd = []", "}"])
+
+    assert_eq(scf_refused(before, "feature add default"),
+              "a feature may not be named 'default' — a feature says itself that it is on by default: " +
+              "'sysl config feature add <f> --default'")
+    assert_eq(scf_refused(before, "feature add sd"),
+              "the feature 'sd' is already declared — change it with 'sysl config set features.sd.<key> <value>'")
+    assert_eq(scf_refused(before, "feature add tls --type u8"),
+              "'--type' is not an option of 'sysl config feature add' — it takes --doc, --default, --enables, --if")
+    assert_eq(scf_refused(before, "feature remove tls"), "there is no feature 'tls' in sysl.hocon — it declares 'sd'")
+    assert_eq(scf_refused(before, "feature rename sd"), "usage: sysl config feature add <f> [--doc <text>] [--default] " +
+              "[--enables a,b] [--if <cond>]")
+end scf_feature_refusals
+
+// The reader refuses a feature naming another that is gone, so a remove that would orphan a reference is
+// refused rather than written.
+@test("scf: feature remove of a feature another one enables is the reader's refusal")
+scf_feature_remove_still_named()
+    val before = scf_lines(["features {", "  sd = []", "  log = [sd]", "}"])
+
+    assert_eq(scf_refused(before, "feature remove sd"),
+              "removing 'sd' would have made sysl.hocon unreadable, so nothing was written:\n  'features.log' " +
+              "names 'sd', which is neither a dependency of this package nor a feature of it — a feature turns on " +
+              "things this manifest declares, so 'sd' would select nothing")
+end scf_feature_remove_still_named
+
+// -- options, targets, C -----------------------------------------------------------------------------------------
+
+@test("scf: option add writes every key it is given, in a feature written as a block")
+scf_option_add_every_flag()
+    val before = scf_lines(["features {", "  cdc { doc = \"serial\" }", "}"])
+
+    assert_eq(scf_ok(before, "option add ep0 --type u8 --default 64 --values 8,16,32,64 --macro CFG_EP0 " +
+                             "--doc 'endpoint zero' --feature cdc"),
+              scf_lines(["features {", "  cdc {", "    doc = \"serial\"", "    options {",
+                         "      ep0 { type = u8, default = 64, values = [8, 16, 32, 64], macro = \"CFG_EP0\", " +
+                         "doc = \"endpoint zero\" }", "    }", "  }", "}"]))
+end scf_option_add_every_flag
+
+@test("scf: option add refuses an unknown type, a missing default, a bad range, and a second declaration")
+scf_option_refusals()
+    val before = scf_lines(["options {", "  slots { type = u8, default = 4 }", "}"])
+
+    assert_eq(scf_refused(before, "option add q --type u7x --default 1"),
+              "adding the option 'q' would have made sysl.hocon unreadable, so nothing was written:\n  " +
+              "'options.q.type' is 'u7x', which an option cannot be — an option is an integer type ('usize', 'u8', " +
+              "'int', 'i64', …), 'bool' or 'string'")
+    assert_eq(scf_refused(before, "option add q --type u8"),
+              "'sysl config option add' needs --type and --default — an option is declared with both, as " +
+              "'sysl config option add q --type u32 --default 100'")
+    assert_eq(scf_refused(before, "option add q --type u8 --default 1 --range 4"),
+              "'--range 4' is not a range — it is written '--range <low>,<high>', both ends included")
+    assert_eq(scf_refused(before, "option add slots --type u8 --default 1"),
+              "the option 'slots' is already declared — change it with 'sysl config set options.slots.<key> <value>'")
+    assert_eq(scf_refused(before, "option add q --type u8 --default 300"),
+              "adding the option 'q' would have made sysl.hocon unreadable, so nothing was written:\n  " +
+              scf_reader_refusal(scf_lines(["options {", "  slots { type = u8, default = 4 }",
+                                            "  q { type = u8, default = 300 }", "}"])))
+end scf_option_refusals
+
+// What the manifest reader says of a text, for a refusal the command passes on as it was said.
+private scf_reader_refusal(text: string) -> string = read_manifest(text) match
+    Ok(_) -> "(it reads)"
+    Err(why) -> why
+
+@test("scf: target add writes every key it is given, and refuses default and a name already there")
+scf_target_add()
+    val before = scf_lines(["package { name = \"usb\" }"])
+
+    assert_eq(scf_ok(before, "target add pico --triple thumbv8m.main-none-eabihf --linker lld " +
+                             "--linker-script memmap.ld --entry reset"),
+              scf_lines(["package { name = \"usb\" }", "targets {",
+                         "  pico { triple = \"thumbv8m.main-none-eabihf\", linker = lld, linker_script = \"memmap.ld\", " +
+                         "entry = \"reset\" }", "}"]))
+    assert_eq(scf_refused(before, "target add default"),
+              "'targets.default' names the machine a build is for where the command line names none, and is not " +
+              "a target — set it with 'sysl config set targets.default <target>'")
+    assert_eq(scf_refused(scf_lines(["targets {", "  pico {}", "}"]), "target add pico"),
+              "the target 'pico' is already declared — change it with 'sysl config set targets.pico.<key> <value>'")
+end scf_target_add
+
+@test("scf: c add goes into the package, a target, a feature, or a feature's target")
+scf_c_add_layers()
+    val before = scf_lines(["features {", "  usb = []", "}"])
+    val flags = "--root c/z --include . --sources z.c"
+
+    assert_eq(scf_ok(before, s"c add z $flags --target pico"),
+              scf_lines(["features {", "  usb = []", "}", "targets {", "  pico {", "    c {",
+                         "      z { root = \"c/z\", include = [\".\"], sources = [\"z.c\"] }", "    }", "  }", "}"]))
+    assert_eq(scf_ok(before, s"c add z $flags --feature usb"),
+              scf_lines(["features {", "  usb = { c { z { root = \"c/z\", include = [\".\"], sources = [\"z.c\"] } } }", "}"]))
+    assert_eq(scf_ok(before, s"c add z $flags --feature usb --target pico"),
+              scf_lines(["features {",
+                         "  usb = { targets { pico { c { z { root = \"c/z\", include = [\".\"], sources = [\"z.c\"] } } } } }",
+                         "}"]))
+    assert_eq(scf_refused(before, "c add z --root c"),
+              "'sysl config c add z' says nothing the library compiles or reads — give it --sources, --include, or both")
+    assert_eq(scf_refused(before, "c add z --sources z.c --feature tls"),
+              "there is no feature 'tls' in sysl.hocon — it declares 'usb'")
+    assert_eq(scf_refused(scf_lines(["c {", "  z { sources = [\"z.c\"] }", "}"]), "c add z --sources y.c"),
+              "the C library 'z' is already declared at 'c.z' — change it with 'sysl config set c.z.<key> <value>'")
+end scf_c_add_layers
+
+// -- get, set, unset -------------------------------------------------------------------------------------------
+
+@test("scf: get prints a value as written, and a block written out; set and unset reach any path")
+scf_get_set_unset()
+    val text = scf_lines(["package {", "  name    = \"blink\"  // the name", "  version = \"0.1.0\"", "}", "",
+                          "targets.\"a.b\" { entry = reset }"])
+
+    assert_eq(config_get(text, "package.name").unwrap(), "\"blink\"")
+    assert_eq(config_get(text, "targets.\"a.b\".entry").unwrap(), "reset")
+    assert_eq(config_get(text, "package").unwrap(), "name = \"blink\"\nversion = \"0.1.0\"")
+    assert_eq(config_get(text, "package.license").unwrap_err(), "sysl.hocon sets nothing at 'package.license'")
+    assert_eq(scf_ok(text, "set package.version '\"0.2.0\"'"),
+              scf_lines(["package {", "  name    = \"blink\"  // the name", "  version = \"0.2.0\"", "}", "",
+                         "targets.\"a.b\" { entry = reset }"]))
+    assert_eq(scf_ok(text, "unset package.version"),
+              scf_lines(["package {", "  name    = \"blink\"  // the name", "}", "", "targets.\"a.b\" { entry = reset }"]))
+    assert_eq(scf_refused(text, "set package.version"), "usage: sysl config set <path> <value>")
+    assert_eq(scf_refused(text, "set optimization fast"),
+              scf_refused_reader("setting 'optimization'", scf_lines(["package {",
+                  "  name    = \"blink\"  // the name", "  version = \"0.1.0\"", "}", "",
+                  "targets.\"a.b\" { entry = reset }", "optimization = fast"])))
+end scf_get_set_unset
+
+private scf_refused_reader(doing: string, text: string) -> string =
+    s"$doing would have made sysl.hocon unreadable, so nothing was written:\n  ${scf_reader_refusal(text)}"
+
+@test("scf: a path written in two places is refused rather than guessed at")
+scf_two_places()
+    val text = scf_lines(["dependencies.usb.path = \"../usb\"", "", "dependencies {", "  usb { path = \"../usb2\" }", "}"])
+
+    assert_eq(scf_refused(text, "set dependencies.usb.path '\"../usb3\"'"),
+              "`dependencies.usb.path` is written in two places, lines 1 and 4, and an edit would have to guess " +
+              "which one is meant")
+end scf_two_places
+
+// -- fix ---------------------------------------------------------------------------------------------------------
+
+@test("scf: fix rewrites the 0.4.0 default list and target features, keeps comments, raises the floor")
+scf_fix_both_spellings()
+    val before = scf_lines(["// the app.", "package {", "  name = \"app\"", "  sysl = \"0.4.0\"", "}", "",
+                            "dependencies {", "  tls { path = \"../tls\", optional = true }", "}", "",
+                            "features {", "  default = [tls, fast, small]", "  // the fast path.",
+                            "  fast { doc = \"fast\" }", "  small = []", "}", "",
+                            "targets {", "  pico {", "    triple = \"thumbv8m.main-none-eabihf\"", "    features {",
+                            "      fast { linker_script = \"fast.ld\" }", "    }", "  }", "}"])
+
+    assert_eq(scf_ok(before, "fix"),
+              scf_lines(["// the app.", "package {", "  name = \"app\"", "  sysl = \"0.5.0\"", "}", "",
+                         "dependencies {", "  tls { path = \"../tls\", optional = true }", "}", "",
+                         "features {", "  // the fast path.",
+                         "  fast { doc = \"fast\", default = true, targets { pico { linker_script = \"fast.ld\" } } }",
+                         "  small = { default = true }", "  tls { default = true, enables = [tls] }", "}", "",
+                         "targets {", "  pico {", "    triple = \"thumbv8m.main-none-eabihf\"", "  }", "}"]))
+end scf_fix_both_spellings
+
+@test("scf: fix on a manifest it cannot make readable refuses with what is left")
+scf_fix_still_unreadable()
+    val before = scf_lines(["features {", "  default = [a]", "  a = [nothing]", "}"])
+
+    assert_eq(scf_refused(before, "fix"),
+              "sysl.hocon does not read even with every fix-it applied, so nothing was written:\n  " +
+              scf_reader_refusal(scf_lines(["features {", "  a = { default = true, enables = [nothing] }", "}"])))
+end scf_fix_still_unreadable
+
+// -- the command line ----------------------------------------------------------------------------------------------
+
+private scf_project(file: string, text: string) -> string
+    val root = absolute_path(make_temp_dir("sysl-scf-").unwrap())
+
+    write_text(s"$root/$file", text).unwrap()
+    root
+end scf_project
+
+@test("scf: sysl config with no command prints the commands, and a mistake its own usage")
+scf_cli_usage()
+    val (code, out, err) = clx_ran(["sysl", "config"])
+
+    assert_eq(code, Misused, out + err)
+    assert_eq(err, config_usage())
+
+    val root = scf_project("sysl.hocon", "")
+    val (dep_code, _, dep_err) = clx_ran(["sysl", "config", "-C", root, "dep"])
+
+    assert_eq(dep_code, Misused, dep_err)
+    assert_eq(dep_err, "usage: sysl config dep add <coordinate>[@<version>] [--optional] [--if <cond>] [--label <l>]")
+
+    val (flag_code, _, flag_err) = clx_ran(["sysl", "config", "-C"])
+
+    assert_eq(flag_code, Misused, flag_err)
+    assert(flag_err.starts_with("Error: '-C' needs the directory"), flag_err)
+
+    val (word_code, _, word_err) = clx_ran(["sysl", "config", "-C", root, "bogus"])
+
+    assert_eq(word_code, Failed, word_err)
+    assert_eq(word_err, "sysl: error: 'bogus' is not a 'sysl config' command — the commands are dep, feature, option, " +
+              "target, c, get, set, unset, fix and show")
+    remove_dir_all(root).unwrap_or(())
+end scf_cli_usage
+
+@test("scf: a directory with no manifest is refused, and so is one holding both names")
+scf_cli_no_manifest()
+    val root = absolute_path(make_temp_dir("sysl-scf-").unwrap())
+    val (code, _, err) = clx_ran(["sysl", "config", "-C", root, "get", "package.name"])
+
+    assert_eq(code, Failed, err)
+    assert_eq(err, s"sysl: error: there is no sysl.hocon in '$root' — 'sysl config' edits a project's manifest, " +
+              "and 'sysl init' writes one")
+
+    write_text(s"$root/sysl.hocon", "").unwrap()
+    write_text(s"$root/package.hocon", "").unwrap()
+
+    val (both, _, both_err) = clx_ran(["sysl", "config", "-C", root, "fix"])
+
+    assert_eq(both, Failed, both_err)
+    assert(both_err.contains("holds both sysl.hocon and package.hocon"), both_err)
+    remove_dir_all(root).unwrap_or(())
+end scf_cli_no_manifest
+
+@test("scf: --dry-run prints the diff and writes nothing")
+scf_cli_dry_run()
+    val text = scf_lines(["package { name = \"console\", version = \"0.1.0\" }", "", "dependencies {",
+                          "  usb { path = \"../usb\" }", "}"])
+    val root = scf_project("sysl.hocon", text)
+    val (code, out, err) = clx_ran(["sysl", "config", "-C", root, "dep", "usb", "--set", "depth=4", "--dry-run"])
+
+    assert_eq(code, Fine, err)
+    assert_eq(out, "--- sysl.hocon\n+++ sysl.hocon\n@@ -2,4 +2,4 @@\n \n dependencies {\n" +
+              "-  usb { path = \"../usb\" }\n+  usb { path = \"../usb\", options { depth = 4 } }\n }\n" +
+              "dry run: nothing was written")
+    assert_eq(read_text(s"$root/sysl.hocon").unwrap(), text)
+    remove_dir_all(root).unwrap_or(())
+end scf_cli_dry_run
+
+@test("scf: an edit the reader refuses leaves every byte of the file as it was")
+scf_cli_refused_untouched()
+    val text = scf_lines(["// keep me.", "package { name = \"logger\" }", "", "dependencies {",
+                          "  fat { path = \"../fat\" }", "}"])
+    val root = scf_project("sysl.hocon", text)
+    val (code, out, err) = clx_ran(["sysl", "config", "-C", root, "feature", "add", "sd", "--enables", "fat"])
+
+    assert_eq(code, Failed, out + err)
+    assert(err.starts_with("sysl: error: adding 'sd' would have made sysl.hocon unreadable, so nothing was written:"), err)
+    assert_eq(read_text(s"$root/sysl.hocon").unwrap(), text)
+    remove_dir_all(root).unwrap_or(())
+end scf_cli_refused_untouched
+
+@test("scf: a writing command says what it did; set to what is already there writes nothing")
+scf_cli_writes()
+    val root = scf_project("sysl.hocon", scf_lines(["package {", "  name = \"a\"", "}"]))
+    val (code, out, err) = clx_ran(["sysl", "config", "-C", root, "set", "package.version", "\"0.2.0\""])
+
+    assert_eq(code, Fine, err)
+    assert_eq(out, "set package.version = \"0.2.0\"")
+    assert_eq(read_text(s"$root/sysl.hocon").unwrap(),
+              scf_lines(["package {", "  name = \"a\"", "  version = \"0.2.0\"", "}"]))
+
+    val (again, again_out, again_err) = clx_ran(["sysl", "config", "-C", root, "set", "package.version", "\"0.2.0\""])
+
+    assert_eq(again, Fine, again_err)
+    assert_eq(again_out, "sysl.hocon already says so — nothing was written")
+
+    val (get, get_out, get_err) = clx_ran(["sysl", "config", "-C", root, "get", "package.version"])
+
+    assert_eq(get, Fine, get_err)
+    assert_eq(get_out, "\"0.2.0\"")
+    remove_dir_all(root).unwrap_or(())
+end scf_cli_writes
+
+// `sysl add` is `config dep add`: the pinned form needs no network, and lands the same entry.
+@test("scf: sysl add still adds, through the same editor")
+scf_cli_add_still_works()
+    val root = scf_project("sysl.hocon", scf_lines(["package { name = \"a\" }"]))
+    val (code, out, err) = clx_ran(["sysl", "add", "github.com/sysl-lang/png@v0.1.0", root])
+
+    assert_eq(code, Fine, err)
+    assert_eq(out, "added png github.com/sysl-lang/png 0.1.0")
+    assert_eq(read_text(s"$root/sysl.hocon").unwrap(),
+              scf_lines(["package { name = \"a\" }", "dependencies {",
+                         "  png { git = \"github.com/sysl-lang/png\", version = \"0.1.0\" }", "}"]))
+
+    val (dup, _, dup_err) = clx_ran(["sysl", "config", "-C", root, "dep", "add", "github.com/sysl-lang/png@0.2.0"])
+
+    assert_eq(dup, Failed, dup_err)
+    assert(dup_err.contains("'png' is already a dependency of this project"), dup_err)
+    remove_dir_all(root).unwrap_or(())
+end scf_cli_add_still_works
+
+@test("scf: a workspace root with no package block takes no dependency, by either name of the command")
+scf_cli_workspace_root()
+    val root = scf_project("sysl.hocon", scf_lines(["workspace = [\"a\"]"]))
+
+    make_dir_all(s"$root/a").unwrap()
+    write_text(s"$root/a/sysl.hocon", "package { name = \"a\" }\n").unwrap()
+
+    val (added, _, add_err) = clx_ran(["sysl", "add", "github.com/sysl-lang/png@0.1.0", root])
+
+    assert_eq(added, Failed, add_err)
+    assert(add_err.contains("is a workspace with no 'package' block, so it takes no dependencies"), add_err)
+
+    val (configured, _, config_err) = clx_ran(["sysl", "config", "-C", root, "dep", "add",
+                                               "github.com/sysl-lang/png@0.1.0"])
+
+    assert_eq(configured, Failed, config_err)
+    assert(config_err.contains("is a workspace with no 'package' block, so it takes no dependencies"), config_err)
+    assert_eq(read_text(s"$root/sysl.hocon").unwrap(), "workspace = [\"a\"]\n")
+    remove_dir_all(root).unwrap_or(())
+end scf_cli_workspace_root
+
+@test("scf: fix renames package.hocon, and the next build has no notice")
+scf_cli_fix_renames()
+    if !clx_ready() then return
+
+    val root = scf_project("package.hocon", scf_lines(["package {", "  name = \"scffix\"", "  version = \"0.1.0\"", "}"]))
+
+    write_text(s"$root/main.sysl", "main()\n    exit(0)\n").unwrap()
+    pkc_set_env("SYSL_LIB", absolute_path(std_root().unwrap()))
+
+    val (before, _, before_err) = clx_ran(["sysl", "build", root])
+
+    assert_eq(before, Fine, before_err)
+    assert(before_err.contains("rename it to sysl.hocon ('sysl config fix' does it, or git mv package.hocon " +
+                               "sysl.hocon)"), before_err)
+
+    val (dry, dry_out, dry_err) = clx_ran(["sysl", "config", "-C", root, "fix", "--dry-run"])
+
+    assert_eq(dry, Fine, dry_err)
+    assert_eq(dry_out, "would rename package.hocon to sysl.hocon\ndry run: nothing was written")
+    assert(is_file(s"$root/package.hocon"))
+
+    val (code, out, err) = clx_ran(["sysl", "config", "-C", root, "fix"])
+
+    assert_eq(code, Fine, err)
+    assert_eq(out, "renamed package.hocon to sysl.hocon")
+    assert(!is_file(s"$root/package.hocon"))
+    assert_eq(read_text(s"$root/sysl.hocon").unwrap(),
+              scf_lines(["package {", "  name = \"scffix\"", "  version = \"0.1.0\"", "}"]))
+
+    val (after, _, after_err) = clx_ran(["sysl", "build", root])
+
+    assert_eq(after, Fine, after_err)
+    assert(!after_err.contains("package.hocon"), after_err)
+
+    val (again, again_out, _) = clx_ran(["sysl", "config", "-C", root, "fix"])
+
+    assert_eq(again, Fine)
+    assert_eq(again_out, "sysl.hocon needs no fix")
+    remove_dir_all(root).unwrap_or(())
+end scf_cli_fix_renames
+
+// -- show ------------------------------------------------------------------------------------------------------------
+
+// A project taking `kern` directly and through `mid`: `mid` sets `slots`, the project sets `trace`, and
+// `depth` is left at its default -- the three answers the "who set it" column has. `kern` carries one C
+// library, so its roots and files are shown too.
+private scf_show_tree() -> string
+    val root = absolute_path(make_temp_dir("sysl-scf-show-").unwrap())
+
+    make_dir_all(s"$root/kern/c/inc").unwrap()
+    make_dir_all(s"$root/mid").unwrap()
+    make_dir_all(s"$root/app").unwrap()
+    write_text(s"$root/kern/sysl.hocon", scf_lines([
+        "package { name = \"kern\", version = \"0.3.0\" }",
+        "options {",
+        "  slots { type = u8, default = 2 }",
+        "  trace { type = bool, default = false }",
+        "  depth { type = u16, default = 8 }",
+        "}",
+        "features {",
+        "  fast = []",
+        "  big = []",
+        "}",
+        "choices {",
+        "  size { of = [fast, big], default = fast }",
+        "}",
+        "c {",
+        "  k { root = \"c\", include = [\"inc\"], include_private = [\".\"], sources = [\"k.c\"] }",
+        "}"])).unwrap()
+    write_text(s"$root/kern/c/k.c", "int k(void) { return 1; }\n").unwrap()
+    make_dir_all(s"$root/kern/kern").unwrap()
+    write_text(s"$root/kern/kern/kern.sysl", "module kern\n\nslots() -> u8 = option_slots\n").unwrap()
+    make_dir_all(s"$root/mid/mid").unwrap()
+    write_text(s"$root/mid/mid/mid.sysl", "module mid\n\nimport kern\n\nslots() -> u8 = kern.slots()\n").unwrap()
+    write_text(s"$root/mid/sysl.hocon", scf_lines([
+        "package { name = \"mid\", version = \"0.1.0\" }",
+        "dependencies {",
+        "  kern { path = \"../kern\", options = { slots = 4 } }",
+        "}"])).unwrap()
+    write_text(s"$root/app/sysl.hocon", scf_lines([
+        "package { name = \"app\", version = \"0.1.0\" }",
+        "dependencies {",
+        "  mid  { path = \"../mid\" }",
+        "  kern { path = \"../kern\", options = { trace = true } }",
+        "}"])).unwrap()
+    root
+end scf_show_tree
+
+@test("scf: show names each option's value and who set it: this project, a dependency, or the default")
+scf_cli_show()
+    val root = scf_show_tree()
+    val (code, out, err) = clx_ran(["sysl", "config", "-C", s"$root/app", "show"])
+
+    assert_eq(code, Fine, err)
+
+    val lines = split(out, "\n")
+
+    assert_eq(lines[0], "app 0.1.0 (this project)", out)
+    assert_eq(lines[1], "  features  none", out)
+    assert(out.contains(s"kern (${absolute_path(s"$root/kern")})\n  features  fast\n  choice    size = fast\n  options\n"), out)
+    assert(out.contains("    slots  4     '"), out)
+    assert(out.contains("    trace  true  this project\n"), out)
+    assert(out.contains("    depth  8     default\n"), out)
+    // The private roots are searched first, and every path is the package root's.
+    assert(out.contains("  c\n    k\n      include  c, c/inc\n      sources  c/k.c"), out)
+    assert(out.contains(s"mid (${absolute_path(s"$root/mid")})\n  features  none"), out)
+    assert_eq(read_text(s"$root/app/sysl.hocon").unwrap().contains("trace = true"), true)
+    remove_dir_all(root).unwrap_or(())
+end scf_cli_show
+
+@test("scf: show follows --features as a build does, and refuses a word or an option it does not take")
+scf_cli_show_flags()
+    val root = scf_show_tree()
+
+    write_text(s"$root/kern/main.sysl", "main()\n    exit(0)\n").unwrap()
+
+    val (code, out, err) = clx_ran(["sysl", "config", "-C", s"$root/kern", "show", "--features", "big",
+                                    "--no-default-features"])
+
+    assert_eq(code, Fine, err)
+    assert(out.starts_with("kern 0.3.0 (this project)\n  features  big\n  choice    size = big\n  options\n"), out)
+    assert(out.contains("    slots  2      default\n    trace  false  default\n"), out)
+
+    val (bad, _, bad_err) = clx_ran(["sysl", "config", "-C", s"$root/kern", "show", "--set", "a=1"])
+
+    assert_eq(bad, Misused, bad_err)
+    assert(bad_err.contains("'--set' is not an option of 'sysl config show'"), bad_err)
+    remove_dir_all(root).unwrap_or(())
+end scf_cli_show_flags
+
+// -- the reference page ------------------------------------------------------------------------------------------------
+
+// A fenced block of a page: its language and its body.
+private struct ScfFence
+    lang: string
+    body: string
+end ScfFence
+
+private scf_fences(text: string) -> Buf[ScfFence]
+    var out: Buf[ScfFence] = buf()
+    var inside = false
+    var lang = ""
+    var body: Buf[string] = buf()
+
+    for line in split(text, "\n")
+        if line.starts_with("```")
+            if inside
+                out.push(ScfFence(lang, join(body.view(), "\n")))
+                inside = false
+            else
+                inside = true
+                lang = line[3..<line.bytes.len].trim()
+                body = buf()
+        else if inside
+            body.push(line)
+
+    out
+end scf_fences
+
+// **Every example on the `sysl config` page is run**: a `hocon` block, the `bash` block of the command
+// under it, and the block after that -- the manifest the command leaves (`hocon`), or what it says
+// (`text`). The command is run on the first block, written to a project of its own.
+@test("scf: every example on the reference page of sysl config does what the page says")
+scf_the_page_runs()
+    val page = read_text("../docs/content/reference/config.md").unwrap()
+    val fences = scf_fences(page)
+    var ran: usize = 0
+
+    for i in 1..<fences.len()
+        val f = fences.at(i)
+
+        if f.lang != "bash" || !f.body.starts_with("sysl config ") || fences.at(i - 1).lang != "hocon" then continue
+        if i + 1 >= fences.len() then continue
+
+        val after = fences.at(i + 1)
+        val root = scf_project("sysl.hocon", fences.at(i - 1).body + "\n")
+        var command: Buf[string] = buf()
+
+        command.push("sysl")
+        command.push("config")
+        command.push("-C")
+        command.push(root)
+
+        for w in scf_words(f.body["sysl config ".bytes.len..<f.body.bytes.len])
+            command.push(w)
+
+        val (_, out, err) = clx_ran(command.view())
+
+        if after.lang == "hocon"
+            assert_eq(read_text(s"$root/sysl.hocon").unwrap(), after.body + "\n", s"${f.body}\n$err")
+        else
+            assert_eq(if err.is_empty() then out else err, after.body, f.body)
+
+        ran += 1
+        remove_dir_all(root).unwrap_or(())
+
+    assert(ran >= 10, s"only $ran examples ran")
+end scf_the_page_runs

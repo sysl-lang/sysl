@@ -1,0 +1,1149 @@
+module sh.sysl.compiler
+
+import sh.sysl.hocon.{path_of as hocon_path_of, path_text, render, Value}
+import sysl.buf.{Buf, buf}
+import sysl.fs.{is_file, read_text, rename, write_text}
+import sysl.text.{join, split, Search}
+
+// `sysl config` -- the commands that write a manifest, and the one that shows what the manifests of
+// a project resolve to.
+//
+// **Every writing command is the same three steps**: work out the new text with the one editor
+// (`manifest_edit.sysl`, a client of the hocon package's splice edits, so comments and layout survive
+// and nothing already in the file moves), read that text back through the manifest reader, and only
+// then write it. An edit the reader would refuse leaves the file untouched and says the reader's
+// refusal. `--dry-run` prints the change as a diff instead of writing it.
+//
+// **A command that writes a construct of 0.5.0 raises `package.sysl` to "0.5.0"** where the file
+// names an older floor, since a 0.4 compiler would mis-read a feature block as a malformed list. The
+// reader says which constructs those are, so the floor is raised exactly when the reader asks for it.
+//
+// What is decided here is text in and text out (`config_edited`), so every command's result can be
+// asserted as a whole manifest without a file; `config_command` is the part that reads and writes one.
+
+// A `sysl config` command line, read but not yet carried out.
+struct ConfigCommand
+    // The project whose manifest is edited (`-C <dir>`), `.` where the line names none.
+    dir: string
+
+    // Whether the change is printed as a diff instead of written.
+    dry_run: bool
+
+    // The words that are not options: `dep`, `add`, `github.com/…`.
+    words: Buf[string]
+
+    // Each option as written, in order, with its value -- `""` for a switch. Repeatable ones repeat.
+    flags: Buf[(string, string)]
+end ConfigCommand
+
+// What one writing command does to a manifest's text.
+struct ConfigChange
+    // The whole new text.
+    text: string
+
+    // What is said once it is written, one line each.
+    said: Buf[string]
+
+    // How the refusal starts where the reader will not take the result.
+    unreadable: string
+end ConfigChange
+
+private change_of(text: string, said: string, doing: string) -> ConfigChange
+    var lines: Buf[string] = buf()
+
+    lines.push(said)
+    ConfigChange(text, lines, s"$doing would have made $ManifestName unreadable, so nothing was written")
+end change_of
+
+// The commands, as `--help` and a mistake show them.
+config_usage() -> string =
+    "usage: sysl config <command> [--dry-run] [-C <dir>]\n" +
+    "  dep add <coordinate>[@<version>] [--optional] [--if <cond>] [--label <l>]\n" +
+    "  dep remove <label>\n" +
+    "  dep <label> [--features +a,-b] [--set <option>=<value>]...\n" +
+    "  feature add <f> [--doc <text>] [--default] [--enables a,b] [--if <cond>]\n" +
+    "  feature remove <f>\n" +
+    "  option add <o> --type <type> --default <value> [--range <low>,<high>] [--values a,b] " +
+    "[--macro <name>] [--doc <text>] [--feature <f>]\n" +
+    "  target add <t> [--triple <triple>] [--linker <linker>] [--linker-script <path>] [--entry <symbol>]\n" +
+    "  c add <lib> [--root <dir>] [--sources a,b] [--include a,b] [--feature <f>] [--target <t>]\n" +
+    "  get <path>\n" +
+    "  set <path> <value>\n" +
+    "  unset <path>\n" +
+    "  fix\n" +
+    "  show [--target <t>] " + feature_flags()
+
+// -- reading the command line ---------------------------------------------------------------------
+
+// The words and options after `sysl config`. An option takes the argument after it as its value,
+// but for the switches; a word starting with `-` and a digit is a value (`set options.x.default -5`).
+read_config_command(args: []string) -> Result[ConfigCommand, string]
+    var dir = "."
+    var dry_run = false
+    var words: Buf[string] = buf()
+    var flags: Buf[(string, string)] = buf()
+    var i: usize = 0
+
+    while i < args.len
+        val arg = args[i]
+
+        if arg == "--dry-run"
+            dry_run = true
+        else if arg == "-C"
+            if i + 1 >= args.len then return Err("'-C' needs the directory of the project whose manifest is edited")
+
+            dir = args[i + 1]
+            i += 1
+        else if is_option_word(arg)
+            if config_switch(words, arg)
+                flags.push((arg, ""))
+            else
+                if i + 1 >= args.len then return Err(s"'$arg' needs a value")
+
+                flags.push((arg, args[i + 1]))
+                i += 1
+        else
+            words.push(arg)
+
+        i += 1
+
+    Ok(ConfigCommand(dir, dry_run, words, flags))
+end read_config_command
+
+private is_option_word(arg: string) -> bool
+    if arg.bytes.len < 2 || arg.bytes[0] != u8('-') then return false
+
+    !(arg.bytes[1] >= u8('0') && arg.bytes[1] <= u8('9'))
+end is_option_word
+
+// The options that take no value. `--default` is one only for a feature, since an option's default
+// is a value.
+private config_switch(words: Buf[string], arg: string) -> bool
+    if arg == "--optional" || arg == "--no-default-features" || arg == "--all-features" then return true
+
+    arg == "--default" && words.len() > 0 && words.at(0) == "feature"
+end config_switch
+
+private flag_of(c: &ConfigCommand, name: string) -> Option[string]
+    var out: Option[string] = None
+
+    for f in c.flags
+        if f.0 == name then out = Some(f.1)
+
+    out
+end flag_of
+
+private has_flag(c: &ConfigCommand, name: string) -> bool = flag_of(c, name).is_some()
+
+// The options a command takes, and the refusal for one it does not.
+private only_flags(c: &ConfigCommand, allowed: string, command: string) -> Result[unit, string]
+    val names = if allowed.is_empty() then buf() else split_list(allowed)
+
+    for f in c.flags
+        if !holds_string(names, f.0)
+            val takes = if names.is_empty() then "it takes none" else s"it takes ${join(names.view(), ", ")}"
+
+            return Err(s"'${f.0}' is not an option of 'sysl config $command' — $takes")
+
+    Ok(())
+end only_flags
+
+// A comma-separated list, each item trimmed, empty items left out.
+private split_list(text: string) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for part in split(text, ",")
+        val one = part.trim()
+
+        if !one.is_empty() then out.push(one)
+
+    out
+end split_list
+
+private list_flag(c: &ConfigCommand, name: string) -> Buf[string] = flag_of(c, name) match
+    None -> buf()
+    Some(text) -> split_list(text)
+
+// The usage for one command, where its words are wrong. It starts with `usage:`, which is how the
+// command tells a mistake in the line from a refusal of the edit.
+private usage_of(command: string) -> string
+    for line in split(config_usage(), "\n")
+        if line.trim().starts_with(command) then return s"usage: sysl config ${line.trim()}"
+
+    config_usage()
+end usage_of
+
+// -- the edits ------------------------------------------------------------------------------------
+
+// The manifest text a writing command leaves, read back through the manifest reader -- with
+// `package.sysl` raised where what was written needs 0.5.0 -- or why it cannot be.
+config_edited(text: string, c: &ConfigCommand) -> Result[ConfigChange, string]
+    val change = config_planned(text, c)?
+
+    config_checked(change)
+end config_edited
+
+// The change, held to the reader. **The floor is the one refusal answered rather than passed on**:
+// it means the file now writes a construct a 0.4 compiler mis-reads, which is the one thing the
+// command can fix by itself.
+config_checked(change: ConfigChange) -> Result[ConfigChange, string]
+    var out = change
+
+    read_manifest(out.text) match
+        Ok(_) -> return Ok(out)
+        Err(why) ->
+            if !why.contains("which needs sysl 0.5.0") then return Err(s"${out.unreadable}:\n  $why")
+
+    out.text = manifest_set(out.text, "package.sysl", "\"0.5.0\"")?
+    out.said.push("raised package.sysl to \"0.5.0\", the first release that reads what was written")
+
+    read_manifest(out.text) match
+        Ok(_) -> Ok(out)
+        Err(why) -> Err(s"${out.unreadable}:\n  $why")
+end config_checked
+
+private config_planned(text: string, c: &ConfigCommand) -> Result[ConfigChange, string]
+    if c.words.is_empty() then return Err(config_usage())
+
+    val word = c.words.at(0)
+
+    word match
+        "dep" -> planned_dep(text, c)
+        "feature" -> planned_feature(text, c)
+        "option" -> planned_option(text, c)
+        "target" -> planned_target(text, c)
+        "c" -> planned_c(text, c)
+        "set" ->
+            only_flags(c, "", "set")?
+
+            if c.words.len() != 3 then return Err(usage_of("set"))
+
+            val at = c.words.at(1)
+            val value = c.words.at(2)
+
+            Ok(change_of(manifest_set(text, at, value)?, s"set $at = $value", s"setting '$at'"))
+        "unset" ->
+            only_flags(c, "", "unset")?
+
+            if c.words.len() != 2 then return Err(usage_of("unset"))
+
+            val at = c.words.at(1)
+
+            Ok(change_of(manifest_remove(text, at)?, s"removed $at", s"removing '$at'"))
+        "fix" ->
+            only_flags(c, "", "fix")?
+
+            if c.words.len() != 1 then return Err(usage_of("fix"))
+
+            planned_fix(text)
+        other -> Err(s"'$other' is not a 'sysl config' command — the commands are dep, feature, option, " +
+            "target, c, get, set, unset, fix and show")
+end config_planned
+
+// The value a manifest holds at a path, as written: a scalar as its own text, a list or a block
+// written out.
+config_get(text: string, at: string) -> Result[string, string]
+    val segments = hocon_path_of(at) match
+        Err(d) -> return Err(d.message)
+        Ok(s) -> s
+
+    val v = manifest_value_at(text, segments) match
+        None -> return Err(s"$ManifestName sets nothing at '$at'")
+        Some(found) -> found
+
+    if v.is_obj() || v.is_arr() then return Ok(render(v).trim())
+
+    Ok(text[v.span.start..<v.span.end])
+end config_get
+
+// -- dependencies ---------------------------------------------------------------------------------
+
+private planned_dep(text: string, c: &ConfigCommand) -> Result[ConfigChange, string]
+    if c.words.len() < 2 then return Err(usage_of("dep"))
+
+    val second = c.words.at(1)
+
+    if second == "add"
+        only_flags(c, "--optional,--if,--label", "dep add")?
+
+        if c.words.len() != 3 then return Err(usage_of("dep add"))
+
+        val asked = read_add_spec(c.words.at(2))?
+        val version = asked.version match
+            Some(v) -> v
+            None -> return Err(s"'${asked.coordinate}' names no version — write it as " +
+                s"'${asked.coordinate}@<version>'")
+
+        val label = flag_of(c, "--label").unwrap_or(asked.label)
+        var parts: Buf[string] = buf()
+
+        parts.push(s"git = ${manifest_quoted(asked.coordinate)}")
+        parts.push(s"version = ${manifest_quoted(version)}")
+
+        if has_flag(c, "--optional") then parts.push("optional = true")
+
+        flag_of(c, "--if") match
+            Some(cond) -> parts.push(s"if = ${manifest_quoted(cond)}")
+            None -> ()
+
+        val out = add_dependency_entry(text, label, "{ " + join(parts.view(), ", ") + " }")?
+
+        return Ok(change_of(out, s"added $label ${asked.coordinate} $version", s"adding '$label'"))
+    end if
+
+    if second == "remove"
+        only_flags(c, "", "dep remove")?
+
+        if c.words.len() != 3 then return Err(usage_of("dep remove"))
+
+        val label = c.words.at(2)
+        val block = dependency_block(text, label)?
+        val out = manifest_remove(text, path_text(segments_of([block, label])))?
+
+        return Ok(change_of(out, s"removed the dependency '$label'", s"removing '$label'"))
+    end if
+
+    only_flags(c, "--features,--set", "dep <label>")?
+
+    if c.words.len() != 2 || c.flags.is_empty() then return Err(usage_of("dep <label>"))
+
+    val label = second
+    val block = dependency_block(text, label)?
+    var now = text
+    var said: Buf[string] = buf()
+
+    for f in c.flags
+        if f.0 == "--features"
+            now = dependency_features(now, block, label, f.1)?
+            said.push(s"'$label' now asks for ${names_shown(asked_features(now, block, label))}")
+        else
+            val (name, value) = option_setting(f.1)?
+            var at = segments_of([block, label, "options"])
+
+            for s in split(name, ".")
+                at.push(s)
+
+            now = manifest_set(now, path_text(at), hocon_scalar(value))?
+            said.push(s"set the option '$name' of '$label' to $value")
+
+    Ok(ConfigChange(now, said, s"changing '$label' would have made $ManifestName unreadable, so nothing was written"))
+end planned_dep
+
+// Which block holds the dependency a label names, or the refusal listing the labels there are.
+private dependency_block(text: string, label: string) -> Result[string, string]
+    for block in ["dependencies", "dev_dependencies"]
+        if manifest_value_at(text, segments_of([block, label])).is_some() then return Ok(block)
+
+    var labels: Buf[string] = buf()
+
+    for block in ["dependencies", "dev_dependencies"]
+        manifest_value_at(text, segments_of([block])) match
+            None -> ()
+            Some(v) ->
+                if v.is_obj()
+                    for key in v.keys()
+                        labels.push(key)
+
+    val tail = if labels.is_empty() then "it has none" else s"its dependencies are ${names_shown(labels)}"
+
+    Err(s"there is no dependency '$label' in $ManifestName — $tail")
+end dependency_block
+
+// The features a dependency entry asks for, as written.
+private asked_features(text: string, block: string, label: string) -> Buf[string] =
+    manifest_value_at(text, segments_of([block, label, "features"])) match
+        None -> buf()
+        Some(v) -> v.as_text_list().unwrap_or(buf())
+
+// The entry's `features` list with `+a` (or a bare `a`) added and `-b` taken out. A list left empty
+// is taken out of the entry altogether.
+private dependency_features(text: string, block: string, label: string,
+                            change: string) -> Result[string, string]
+    val at = segments_of([block, label, "features"])
+    var now: Buf[string] = buf()
+    val written = manifest_value_at(text, at)
+
+    written match
+        None -> ()
+        Some(v) -> v.as_text_list() match
+            None -> return Err(s"'${path_text(at)}' is not a list of features — it is written " +
+                "'features = [a, b]'")
+            Some(names) ->
+                for n in names
+                    now.push(n)
+
+    val items = split_list(change)
+
+    if items.is_empty() then return Err("'--features' names no feature — it is written '--features +a,-b'")
+
+    for item in items
+        if item.starts_with("-")
+            val name = item[1..<item.bytes.len]
+
+            if !holds_string(now, name)
+                return Err(s"'$label' does not ask for the feature '$name', so there is nothing to " +
+                    s"take out — it asks for ${names_shown(now)}")
+
+            var kept: Buf[string] = buf()
+
+            for n in now
+                if n != name then kept.push(n)
+
+            now = kept
+        else
+            val name = if item.starts_with("+") then item[1..<item.bytes.len] else item
+
+            if name.is_empty() then return Err("'--features' names an empty feature after '+'")
+
+            if !holds_string(now, name) then now.push(name)
+
+    if now.is_empty()
+        return if written.is_some() then manifest_remove(text, path_text(at)) else Ok(text)
+
+    manifest_set(text, path_text(at), manifest_word_list(now))
+end dependency_features
+
+// `name=value`, as `--set` is written.
+private option_setting(text: string) -> Result[(string, string), string]
+    val at = text.index_of("=") match
+        None -> return Err(s"'--set $text' names no value — it is written '--set <option>=<value>', " +
+            "as '--set rx_buffer=256'")
+        Some(i) -> i
+
+    val name = text[0..<at].trim()
+
+    if name.is_empty() then return Err(s"'--set $text' names no option — it is written '--set <option>=<value>'")
+
+    Ok((name, text[(at + 1)..<text.bytes.len].trim()))
+end option_setting
+
+// A value typed on a command line, as the manifest writes it: a number, a flag or a bare word as it
+// is, anything else quoted.
+private hocon_scalar(text: string) -> string
+    if text.starts_with("\"") || text.is_empty() then return if text.is_empty() then "\"\"" else text
+
+    for b in text.bytes
+        val bare = (b >= u8('a') && b <= u8('z')) || (b >= u8('A') && b <= u8('Z')) ||
+            (b >= u8('0') && b <= u8('9')) || b == u8('_') || b == u8('-') || b == u8('.') || b == u8('+')
+
+        if !bare then return manifest_quoted(text)
+
+    text
+end hocon_scalar
+
+// Names as a refusal lists them: `'a', 'b'`, or `none`.
+private names_shown(names: Buf[string]) -> string
+    if names.is_empty() then return "none"
+
+    var parts: Buf[string] = buf()
+
+    for n in names
+        parts.push(s"'$n'")
+
+    join(parts.view(), ", ")
+end names_shown
+
+// -- features, options, targets, C ----------------------------------------------------------------
+
+private declared_features(text: string) -> Buf[string] = manifest_value_at(text, segments_of(["features"])) match
+    None -> buf()
+    Some(v) -> if v.is_obj() then v.keys() else buf()
+
+private no_feature(text: string, name: string) -> string =
+    s"there is no feature '$name' in $ManifestName — it declares ${names_shown(declared_features(text))}"
+
+private planned_feature(text: string, c: &ConfigCommand) -> Result[ConfigChange, string]
+    if c.words.len() != 3 then return Err(usage_of("feature"))
+
+    val name = c.words.at(2)
+    val at = segments_of(["features", name])
+
+    if c.words.at(1) == "remove"
+        only_flags(c, "", "feature remove")?
+
+        if manifest_value_at(text, at).is_none() then return Err(no_feature(text, name))
+
+        return Ok(change_of(manifest_remove(text, path_text(at))?, s"removed the feature '$name'",
+                            s"removing '$name'"))
+    end if
+
+    if c.words.at(1) != "add" then return Err(usage_of("feature"))
+
+    only_flags(c, "--doc,--default,--enables,--if", "feature add")?
+
+    if name == "default"
+        return Err("a feature may not be named 'default' — a feature says itself that it is on by " +
+            "default: 'sysl config feature add <f> --default'")
+
+    if manifest_value_at(text, at).is_some()
+        return Err(s"the feature '$name' is already declared — change it with " +
+            s"'sysl config set ${path_text(at)}.<key> <value>'")
+
+    val enables = list_flag(c, "--enables")
+    var parts: Buf[string] = buf()
+
+    flag_of(c, "--doc") match
+        Some(doc) -> parts.push(s"doc = ${manifest_quoted(doc)}")
+        None -> ()
+
+    if has_flag(c, "--default") then parts.push("default = true")
+
+    flag_of(c, "--if") match
+        Some(cond) -> parts.push(s"if = ${manifest_quoted(cond)}")
+        None -> ()
+
+    // The list form where the feature says nothing but what it enables, which is the form a 0.4
+    // compiler reads too.
+    var value = manifest_word_list(enables)
+
+    if !parts.is_empty()
+        if !enables.is_empty() then parts.push(s"enables = ${manifest_word_list(enables)}")
+
+        value = "{ " + join(parts.view(), ", ") + " }"
+
+    Ok(change_of(manifest_add(text, path_text(at), value)?, s"added the feature '$name'", s"adding '$name'"))
+end planned_feature
+
+// The text with the feature written as a block, so something can be added inside it: `f = [a]`
+// becomes `f { enables = [a] }`, and a block is left as it is.
+private as_feature_block(text: string, name: string) -> Result[string, string]
+    val at = segments_of(["features", name])
+
+    manifest_value_at(text, at) match
+        None -> Err(no_feature(text, name))
+        Some(v) ->
+            if v.is_obj() then return Ok(text)
+
+            if !v.is_arr() then return Err(s"'${path_text(at)}' is neither a list nor a block, so nothing can be added inside it")
+
+            if v.items().is_empty() then return manifest_replace(text, path_text(at), "{ }")
+
+            manifest_replace(text, path_text(at), s"{ enables = ${text[v.span.start..<v.span.end]} }")
+end as_feature_block
+
+private planned_option(text: string, c: &ConfigCommand) -> Result[ConfigChange, string]
+    if c.words.len() != 3 || c.words.at(1) != "add" then return Err(usage_of("option add"))
+
+    only_flags(c, "--type,--default,--range,--values,--macro,--doc,--feature", "option add")?
+
+    val name = c.words.at(2)
+    val type_name = flag_of(c, "--type")
+    val default = flag_of(c, "--default")
+
+    if type_name.is_none() || default.is_none()
+        return Err("'sysl config option add' needs --type and --default — an option is declared with both, " +
+            s"as 'sysl config option add $name --type u32 --default 100'")
+
+    var now = text
+    var at = segments_of(["options"])
+    var called = name
+
+    flag_of(c, "--feature") match
+        None -> ()
+        Some(f) ->
+            now = as_feature_block(now, f)?
+            at = segments_of(["features", f, "options"])
+            called = s"$f.$name"
+
+    at.push(name)
+
+    if manifest_value_at(now, at).is_some()
+        return Err(s"the option '$called' is already declared — change it with " +
+            s"'sysl config set ${path_text(at)}.<key> <value>'")
+
+    var parts: Buf[string] = buf()
+
+    parts.push(s"type = ${hocon_scalar(type_name.unwrap())}")
+    parts.push(s"default = ${hocon_scalar(default.unwrap())}")
+
+    flag_of(c, "--range") match
+        None -> ()
+        Some(r) ->
+            val ends = split_list(r)
+
+            if ends.len() != 2
+                return Err(s"'--range $r' is not a range — it is written '--range <low>,<high>', both ends included")
+
+            parts.push(s"range = [${hocon_scalar(ends.at(0))}, ${hocon_scalar(ends.at(1))}]")
+
+    flag_of(c, "--values") match
+        None -> ()
+        Some(list) ->
+            var each: Buf[string] = buf()
+
+            for v in split_list(list)
+                each.push(hocon_scalar(v))
+
+            parts.push("values = [" + join(each.view(), ", ") + "]")
+
+    flag_of(c, "--macro") match
+        Some(m) -> parts.push(s"macro = ${manifest_quoted(m)}")
+        None -> ()
+
+    flag_of(c, "--doc") match
+        Some(d) -> parts.push(s"doc = ${manifest_quoted(d)}")
+        None -> ()
+
+    val out = manifest_add(now, path_text(at), "{ " + join(parts.view(), ", ") + " }")?
+
+    Ok(change_of(out, s"added the option '$called'", s"adding the option '$called'"))
+end planned_option
+
+private planned_target(text: string, c: &ConfigCommand) -> Result[ConfigChange, string]
+    if c.words.len() != 3 || c.words.at(1) != "add" then return Err(usage_of("target add"))
+
+    only_flags(c, "--triple,--linker,--linker-script,--entry", "target add")?
+
+    val name = c.words.at(2)
+    val at = segments_of(["targets", name])
+
+    if name == "default"
+        return Err("'targets.default' names the machine a build is for where the command line names none, " +
+            "and is not a target — set it with 'sysl config set targets.default <target>'")
+
+    if manifest_value_at(text, at).is_some()
+        return Err(s"the target '$name' is already declared — change it with " +
+            s"'sysl config set ${path_text(at)}.<key> <value>'")
+
+    var parts: Buf[string] = buf()
+
+    flag_of(c, "--triple") match
+        Some(t) -> parts.push(s"triple = ${manifest_quoted(t)}")
+        None -> ()
+
+    flag_of(c, "--linker") match
+        Some(l) -> parts.push(s"linker = ${hocon_scalar(l)}")
+        None -> ()
+
+    flag_of(c, "--linker-script") match
+        Some(p) -> parts.push(s"linker_script = ${manifest_quoted(p)}")
+        None -> ()
+
+    flag_of(c, "--entry") match
+        Some(e) -> parts.push(s"entry = ${manifest_quoted(e)}")
+        None -> ()
+
+    val value = if parts.is_empty() then "{}" else "{ " + join(parts.view(), ", ") + " }"
+
+    Ok(change_of(manifest_add(text, path_text(at), value)?, s"added the target '$name'", s"adding '$name'"))
+end planned_target
+
+private planned_c(text: string, c: &ConfigCommand) -> Result[ConfigChange, string]
+    if c.words.len() != 3 || c.words.at(1) != "add" then return Err(usage_of("c add"))
+
+    only_flags(c, "--root,--sources,--include,--feature,--target", "c add")?
+
+    val name = c.words.at(2)
+    var now = text
+    var at: Buf[string] = buf()
+
+    flag_of(c, "--feature") match
+        None -> ()
+        Some(f) ->
+            now = as_feature_block(now, f)?
+            at.push("features")
+            at.push(f)
+
+    flag_of(c, "--target") match
+        None -> ()
+        Some(t) ->
+            at.push("targets")
+            at.push(t)
+
+    at.push("c")
+    at.push(name)
+
+    if manifest_value_at(now, at).is_some()
+        return Err(s"the C library '$name' is already declared at '${path_text(at)}' — change it with " +
+            s"'sysl config set ${path_text(at)}.<key> <value>'")
+
+    var parts: Buf[string] = buf()
+
+    flag_of(c, "--root") match
+        Some(r) -> parts.push(s"root = ${manifest_quoted(r)}")
+        None -> ()
+
+    val include = list_flag(c, "--include")
+    val sources = list_flag(c, "--sources")
+
+    if !include.is_empty() then parts.push(s"include = ${manifest_quoted_list(include)}")
+    if !sources.is_empty() then parts.push(s"sources = ${manifest_quoted_list(sources)}")
+
+    if include.is_empty() && sources.is_empty()
+        return Err(s"'sysl config c add $name' says nothing the library compiles or reads — give it " +
+            "--sources, --include, or both")
+
+    val out = manifest_add(now, path_text(at), "{ " + join(parts.view(), ", ") + " }")?
+
+    Ok(change_of(out, s"added the C library '$name'", s"adding the C library '$name'"))
+end planned_c
+
+// -- fix: the fix-its of the manifest reader, applied ------------------------------------------------
+
+// Every refusal of an old spelling that says how to rewrite it, rewritten: the 0.4.0 default list
+// (`features { default = [a, b] }`) as `default = true` inside each feature, the 0.4.0 target block
+// listing features (`targets.<t>.features.<f> { … }`) as the feature's own target block, and the
+// floor raised where either is now written. `config_command` renames `package.hocon` beside it.
+planned_fix(text: string) -> Result[ConfigChange, string]
+    var now = text
+    var said: Buf[string] = buf()
+
+    manifest_value_at(now, segments_of(["features", "default"])) match
+        None -> ()
+        Some(v) -> v.as_text_list() match
+            None -> ()
+            Some(members) ->
+                for m in members
+                    now = default_member_fixed(now, m)?
+
+                now = manifest_remove(now, "features.default")?
+                said.push(s"wrote 'default = true' into ${names_shown(members)} and dropped 'features.default'")
+
+    var moving: Buf[string] = buf()
+
+    manifest_value_at(now, segments_of(["targets"])) match
+        None -> ()
+        Some(block) ->
+            if block.is_obj()
+                for t in block.keys()
+                    manifest_value_at(now, segments_of(["targets", t, "features"])) match
+                        Some(old) -> if old.is_obj() then moving.push(t)
+                        None -> ()
+
+    for t in moving
+        now = target_features_fixed(now, t)?
+        said.push(s"moved 'targets.$t.features' into each feature's own 'targets.$t'")
+
+    Ok(ConfigChange(now, said, s"$ManifestName does not read even with every fix-it applied, so nothing was written"))
+end planned_fix
+
+// One member of the 0.4.0 default list, said inside its feature.
+private default_member_fixed(text: string, member: string) -> Result[string, string]
+    var at = segments_of(["features", member])
+
+    manifest_value_at(text, at) match
+        None ->
+            // A member that names no feature named the optional dependency of that name, and a
+            // feature of the same name enabling it is what says so now.
+            var enables = ""
+
+            if dependency_block(text, member).is_ok()
+                enables = s", enables = ${manifest_word_list(segments_of([member]))}"
+
+            manifest_add(text, path_text(at), s"{ default = true$enables }")
+        Some(v) ->
+            if v.is_arr()
+                val enables = if v.items().is_empty() then "" else s", enables = ${text[v.span.start..<v.span.end]}"
+
+                return manifest_replace(text, path_text(at), s"{ default = true$enables }")
+
+            if v.is_obj()
+                at.push("default")
+                return manifest_set(text, path_text(at), "true")
+
+            Err(s"'${path_text(at)}' is neither a list nor a block, so 'default = true' cannot be written into it")
+end default_member_fixed
+
+// One target block's 0.4.0 `features` block, moved into the features it names.
+private target_features_fixed(text: string, target: string) -> Result[string, string]
+    var now = text
+    val old = segments_of(["targets", target, "features"])
+
+    val names = manifest_value_at(now, old) match
+        None -> return Ok(now)
+        Some(v) -> v.keys()
+
+    for f in names
+        var from = old.copy()
+
+        from.push(f)
+
+        val found = manifest_value_at(now, from)
+
+        if found.is_none() then continue
+
+        val v = found.unwrap()
+        val written = now[v.span.start..<v.span.end]
+
+        if manifest_value_at(now, segments_of(["features", f])).is_some() then now = as_feature_block(now, f)?
+
+        now = manifest_add(now, path_text(segments_of(["features", f, "targets", target])), written)?
+
+    manifest_remove(now, path_text(old))
+end target_features_fixed
+
+// -- a diff, for --dry-run ----------------------------------------------------------------------------
+
+// The change from one text to another as a unified diff of lines, two lines of context around each
+// hunk. A manifest is a few hundred lines at most, so the whole table of common subsequences is cheap.
+manifest_diff(name: string, before: string, after: string) -> string
+    val a = diff_lines(before)
+    val b = diff_lines(after)
+    val n = a.len()
+    val m = b.len()
+    var table: Buf[usize] = buf()
+
+    for _ in 0..<((n + 1) * (m + 1))
+        table.push(0)
+
+    var i = n
+
+    while i > 0
+        i -= 1
+
+        var j = m
+
+        while j > 0
+            j -= 1
+
+            val down = table.at((i + 1) * (m + 1) + j)
+            val right = table.at(i * (m + 1) + j + 1)
+            var here = if down >= right then down else right
+
+            if a.at(i) == b.at(j) then here = table.at((i + 1) * (m + 1) + j + 1) + 1
+
+            table.set(i * (m + 1) + j, here)
+
+    // The walk: each line kept (' '), taken out ('-') or put in ('+'), with where it is in each text.
+    var ops: Buf[(u8, string, usize, usize)] = buf()
+    var x: usize = 0
+    var y: usize = 0
+
+    while x < n || y < m
+        if x < n && y < m && a.at(x) == b.at(y)
+            ops.push((u8(' '), a.at(x), x, y))
+            x += 1
+            y += 1
+        else if x < n && (y == m || table.at((x + 1) * (m + 1) + y) >= table.at(x * (m + 1) + y + 1))
+            ops.push((u8('-'), a.at(x), x, y))
+            x += 1
+        else
+            ops.push((u8('+'), b.at(y), x, y))
+            y += 1
+
+    var out = s"--- $name\n+++ $name\n"
+    var k: usize = 0
+
+    while k < ops.len()
+        if ops.at(k).0 == u8(' ')
+            k += 1
+            continue
+
+        // A hunk runs from two lines before this change to two lines after the last change closer
+        // than five lines to the one before it.
+        val start = if k >= 2 then k - 2 else 0
+        var last = k
+
+        var scan = k
+
+        while scan < ops.len() && scan <= last + 4
+            if ops.at(scan).0 != u8(' ') then last = scan
+
+            scan += 1
+
+        val stop = if last + 3 < ops.len() then last + 3 else ops.len()
+        var old_count: usize = 0
+        var new_count: usize = 0
+
+        for h in start..<stop
+            if ops.at(h).0 != u8('+') then old_count += 1
+            if ops.at(h).0 != u8('-') then new_count += 1
+
+        out = out + s"@@ -${ops.at(start).2 + 1},$old_count +${ops.at(start).3 + 1},$new_count @@\n"
+
+        for h in start..<stop
+            out = out + s"${str_of_byte(ops.at(h).0)}${ops.at(h).1}\n"
+
+        k = stop
+
+    out.trim()
+end manifest_diff
+
+private str_of_byte(b: u8) -> string = if b == u8('+') then "+" else if b == u8('-') then "-" else " "
+
+private diff_lines(text: string) -> Buf[string]
+    var out: Buf[string] = buf()
+    val parts = split(text, "\n")
+
+    for i in 0..<parts.len
+        if i + 1 == parts.len && parts[i].is_empty() then break
+
+        out.push(parts[i])
+
+    out
+end diff_lines
+
+// -- show -------------------------------------------------------------------------------------------
+
+// What a resolved graph settles, package by package: the features on and the member of each choice,
+// every option with its value and who chose it, and each C library's include roots and source list.
+config_shown(g: &Graph) -> Result[string, string]
+    var lines: Buf[string] = buf()
+
+    for p in g.packages
+        if is_root_package(p) then shown_package(&lines, p, g, shown_heading(p, g))?
+
+    for p in g.packages
+        if !is_root_package(p)
+            lines.push("")
+            shown_package(&lines, p, g, shown_heading(p, g))?
+
+    Ok(join(lines.view(), "\n"))
+end config_shown
+
+private shown_heading(p: &ResolvedPackage, g: &Graph) -> string
+    val name = if p.manifest.name.is_empty() then "this project" else p.manifest.name
+
+    if is_root_package(p)
+        return if p.manifest.version.is_empty() then s"$name (this project)" else s"$name ${p.manifest.version} (this project)"
+
+    p.version match
+        None -> s"$name (${p.root})"
+        Some(v) ->
+            var coordinate = p.canonical
+
+            for c in g.claims
+                if canonical_prefix(c.coordinate) == p.canonical then coordinate = c.coordinate
+
+            s"$name ${release_shown(v)} ($coordinate)"
+end shown_heading
+
+private shown_package(lines: *Buf[string], p: &ResolvedPackage, g: &Graph, heading: string) -> Result[unit, string]
+    val on = enabled_of(g.features, p.canonical)
+
+    // `default` is the name the defaults travel under, not a feature anybody declared.
+    var named: Buf[string] = buf()
+
+    for f in on
+        if f != "default" then named.push(f)
+
+    lines.push(heading)
+    lines.push(s"  features  ${if named.is_empty() then "none" else join(named.view(), ", ")}")
+
+    for ch in p.manifest.choices
+        var picked = "none"
+
+        for member in ch.of
+            if holds_string(on, member) then picked = member
+
+        lines.push(s"  choice    ${ch.name} = $picked")
+
+    val settled = settled_options_of(g.settled, p.canonical)
+
+    if !settled.is_empty()
+        lines.push("  options")
+
+        var width: usize = 0
+        var value_width: usize = 0
+
+        for opt in settled
+            if opt.name.bytes.len > width then width = opt.name.bytes.len
+            if opt.literal.bytes.len > value_width then value_width = opt.literal.bytes.len
+
+        for opt in settled
+            val who = if is_root_package(p) then "default" else option_setter(g.packages, p, opt.name)
+
+            lines.push(s"    ${padded(opt.name, width)}  ${padded(opt.literal, value_width)}  $who")
+
+    val layered = apply_c_layers(p.manifest, machine_name(), on)?
+
+    if !layered.c_libraries.is_empty()
+        lines.push("  c")
+
+        for lib in layered.c_libraries
+            var roots: Buf[string] = buf()
+
+            for r in lib.private_include
+                roots.push(r)
+
+            for r in lib.include
+                roots.push(r)
+
+            val files = library_files(p.root, lib)?
+
+            lines.push(s"    ${lib.name}")
+            lines.push(s"      include  ${if roots.is_empty() then "none" else join(roots.view(), ", ")}")
+            lines.push(s"      sources  ${if files.is_empty() then "none" else join(files.view(), ", ")}")
+
+    Ok(())
+end shown_package
+
+private padded(text: string, width: usize) -> string
+    var out = text
+
+    while out.bytes.len < width
+        out = out + " "
+
+    out
+end padded
+
+// -- the command ------------------------------------------------------------------------------------
+
+// `sysl config …`: the words after `config`, carried out against the project's manifest.
+config_command(args: []string, say: string -> unit, note: string -> unit) -> int
+    val c = read_config_command(args[2..<args.len]) match
+        Err(why) ->
+            note(OptionLead + why + "\n" + config_usage())
+            return Misused
+        Ok(got) -> got
+
+    if c.words.is_empty()
+        note(config_usage())
+        return Misused
+    end if
+
+    if c.words.at(0) == "show" then return config_show_command(c, say, note)
+
+    config_carried_out(c, say) match
+        Ok(_) -> Fine
+        Err(why) ->
+            if why.starts_with("usage: ")
+                note(why)
+                return Misused
+
+            note(refused(why))
+            Failed
+end config_command
+
+// A writing command (or `get`) carried out: the lines it says, or the refusal. `sysl add` comes
+// through here as `config dep add`.
+config_carried_out(given: ConfigCommand, say: string -> unit) -> Result[unit, string]
+    var c = given
+
+    two_manifests(c.dir) match
+        Some(why) -> return Err(why)
+        None -> ()
+
+    val file = manifest_path(c.dir)
+
+    if !is_file(file)
+        return Err(s"there is no $ManifestName in '${c.dir}' — 'sysl config' edits a project's manifest, " +
+            "and 'sysl init' writes one")
+
+    val text = read_text(file) match
+        Err(_) -> return Err(s"cannot read $file")
+        Ok(got) -> got
+
+    if c.words.at(0) == "get"
+        if c.words.len() != 2 || !c.flags.is_empty() then return Err(usage_of("get"))
+
+        say(config_get(text, c.words.at(1))?)
+        return Ok(())
+    end if
+
+    // **A dependency added without a version gets the newest release tag**, asked of git before the
+    // edit, so the edit itself is text in and text out.
+    if c.words.len() == 3 && c.words.at(0) == "dep" && c.words.at(1) == "add"
+        read_manifest(text) match
+            Ok(m) ->
+                if m.workspace.is_some() && !m.has_package
+                    return Err(s"'${absolute_path(c.dir)}' is a workspace with no 'package' block, so " +
+                        "it takes no dependencies — add it to the member that imports it, " +
+                        "'sysl add <coordinate> <member directory>'")
+            Err(_) -> ()
+
+        val asked = read_add_spec(c.words.at(2))?
+
+        if asked.version.is_none()
+            val pinned = newest_release(tags_of(asked.coordinate)?) match
+                None -> return Err(s"${asked.coordinate} has no version tag, so there is nothing " +
+                    "to pin — a package is published by tagging it 'v<major>.<minor>.<patch>'")
+                Some(v) -> release_shown(v)
+
+            c.words.set(2, s"${asked.coordinate}@$pinned")
+
+    val change = config_edited(text, c)?
+    val renaming = c.words.at(0) == "fix" && has_legacy_manifest(c.dir)
+
+    if change.text == text && !renaming
+        say(if c.words.at(0) == "fix" then s"$ManifestName needs no fix" else s"$ManifestName already says so — nothing was written")
+        return Ok(())
+    end if
+
+    if c.dry_run
+        if change.text != text then say(manifest_diff(basename(file), text, change.text))
+        if renaming then say(s"would rename $LegacyManifestName to $ManifestName")
+
+        say("dry run: nothing was written")
+        return Ok(())
+    end if
+
+    var written = file
+
+    if renaming
+        written = join_path(c.dir, ManifestName)
+
+        rename(file, written) match
+            Err(e) -> return Err(io_refusal(file, e))
+            Ok(_) -> ()
+
+    if change.text != text
+        write_text(written, change.text) match
+            Err(e) -> return Err(io_refusal(written, e))
+            Ok(_) -> ()
+
+    for line in change.said
+        say(line)
+
+    if renaming then say(s"renamed $LegacyManifestName to $ManifestName")
+
+    Ok(())
+end config_carried_out
+
+// `sysl config show`: the graph resolved for one machine and one feature set, and what it settles.
+private config_show_command(c: ConfigCommand, say: string -> unit, note: string -> unit) -> int
+    var named: Option[string] = None
+    var mistakes: Buf[string] = buf()
+
+    for f in c.flags
+        if f.0 == "--target"
+            named = Some(f.1)
+        else if f.0 == "--features" || f.0 == "--no-default-features" || f.0 == "--all-features"
+            // The flags a build takes, read by the build's own reader.
+            var one: Buf[string] = buf()
+
+            one.push(f.0)
+
+            if f.0 == "--features" then one.push(f.1)
+
+            took_feature_flag(one.view(), 0)
+        else
+            mistakes.push(OptionLead + s"'${f.0}' is not an option of 'sysl config show'")
+
+    if c.words.len() != 1 then mistakes.push(OptionLead + "'sysl config show' takes no words")
+
+    if !mistakes.is_empty()
+        note(misused(mistakes, usage_of("show")))
+        return Misused
+    end if
+
+    if refused_features(note) then return Failed
+
+    val m = manifest_of_package(c.dir) match
+        Err(why) ->
+            note(refused(why))
+            return Failed
+        Ok(got) -> got
+
+    val t = target_for(c.dir, named) match
+        Err(r) ->
+            note(refused(r.message))
+            return Failed
+        Ok(got) -> got
+
+    use_resolution_machine(Some(as_declared(m, t)))
+
+    val g = resolved_graph(c.dir, m) match
+        Err(r) ->
+            note(refused(r.message))
+            return Failed
+        Ok(got) -> got
+
+    config_shown(g) match
+        Err(why) ->
+            note(refused(why))
+            Failed
+        Ok(text) ->
+            say(text)
+            Fine
+end config_show_command

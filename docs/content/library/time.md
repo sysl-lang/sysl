@@ -550,6 +550,8 @@ enum TimeParseError
     Trailing(at: usize)
 ```
 
+`TimeParseError` has `==`, variant by variant and payload by payload.
+
 ```sysl
 import sysl.time.*
 
