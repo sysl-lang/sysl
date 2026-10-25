@@ -693,6 +693,13 @@ emit_llvm_text(path: string, named_target: Option[string],
     // else has** (`check_main_extern`).
     if links_an_image(t) then check_main_extern(done.an, pruned, image_entry_named(root, t))
 
+    // **And a link by a generated script gathers every section the program names**
+    // (`check_placed_sections`).
+    if linking
+        generated_layout() match
+            Some(laid) -> check_placed_sections(done.an, pruned, laid)
+            None -> ()
+
     // **And an `extern` naming a C runtime's initializer has nothing to name in a program**
     // (`check_runtime_init_extern`).
     check_runtime_init_extern(done.an, pruned, "")
@@ -1206,16 +1213,63 @@ build_native_program(path: string, named_target: Option[string], cc: Option[stri
     val linked = link_lowered_text(path, emitted.text, t, cc, level, exe, false, emitted.links,
                                    emitted.archives)
     val entry = settled_image_entry()
+    val linker = settled_image_linker()
+    val by_generated = settled_image_script() != "" && settled_image_script() == generated_script_path()
+    val laid = if by_generated then generated_layout() else None
 
     phase_done("link")
-    settle_image("", "", "")
 
     linked match
-        Err(why) -> return Err(said(Refusal(image_link_failure(why.message, t, entry))))
+        Err(why) ->
+            // **A region too small is reported in the manifest's terms**, from a second link with every
+            // region widened, where one is possible; the linker's own words follow it.
+            var message = image_link_failure(why.message, t, entry)
+
+            if laid.is_some() && is_overflow(why.message)
+                measured_overflow(path, emitted, t, cc, level, exe, laid.unwrap(), linker, entry) match
+                    Some(report) -> message = s"$report\n$message"
+                    None -> ()
+
+            settle_image("", "", "")
+
+            return Err(said(Refusal(message)))
         Ok(_) -> ()
+
+    settle_image("", "", "")
+
+    laid match
+        Some(l) -> check_linked_sections(exe, l) match
+            Some(why) -> return Err(said(Refusal(why)))
+            None -> ()
+        None -> ()
 
     Ok(exe)
 end build_native_program
+
+// The overflow report for a failed link by a generated script: the same program linked again by the
+// script with every region widened, into a scratch image beside the script, and measured.
+private measured_overflow(path: string, emitted: Emitted, t: Target, cc: Option[string], level: string,
+                          exe: string, laid: LaidOut, linker: string, entry: string) -> Option[string]
+    val dir = parent_of(generated_script_path()).unwrap_or(".")
+    val script = s"$dir/measure.ld"
+    val image = s"$dir/measure.elf"
+
+    if write_text(script, widened_script(laid)).is_err() then return None
+
+    settle_image(linker, script, entry)
+
+    val linked = link_lowered_text(path, emitted.text, t, cc, level, image, false, emitted.links,
+                                   emitted.archives)
+
+    settle_image("", "", "")
+
+    val root = if is_directory(path) then path else parent_of(path).unwrap_or(".")
+    val report = if linked.is_ok() then overflow_report(image, laid, generated_inputs(), root) else None
+
+    remove_file(image).unwrap_or(())
+    remove_file(script).unwrap_or(())
+    report
+end measured_overflow
 
 // **What the root manifest says about this machine's image, settled for the link `build` runs**:
 // the linker found (`find_image_linker`), the script and the entry. A target that is not a bare
@@ -1235,9 +1289,33 @@ private settle_image_link(path: string, t: Target, cc: Option[string]) -> Result
         Err(why) -> return Err(Refusal(why))
         Ok(found) -> found
 
+    // **A generated script starts the image where the manifest says, or at `main`**: it names no
+    // `ENTRY` of its own, and an image with no entry keeps nothing past `--gc-sections`.
+    val generated = generated_script_path()
+    val entry = img match
+        Some(i) -> i.entry
+        None -> ""
+
+    if generated != ""
+        trace(s"link script: $generated, generated from the manifests of this build")
+
+        // Where each section a package placed landed, which a tag leaves to the regions declared.
+        generated_layout() match
+            Some(laid) ->
+                for item in laid.sections
+                    if !item.why.starts_with("layout.") && !item.why.starts_with("the vector table")
+                        trace(s"link script: '${item.name}' goes in '${item.region}' (${item.why})")
+            None -> ()
+        settle_image(linker, generated, if entry == "" then "main" else entry)
+
+        return Ok(())
+    end if
+
     img match
         Some(i) ->
             val script = if i.script == "" then "" else image_path(root, i.script)
+
+            if script != "" then trace(s"link script: $script, named by 'targets.${t.name}.linker_script'")
 
             settle_image(linker, script, i.entry)
         None -> settle_image(linker, "", "")

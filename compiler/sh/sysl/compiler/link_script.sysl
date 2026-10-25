@@ -1,0 +1,913 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, read_text, write_text_atomic}
+import sysl.text.{join, Search}
+
+// **The linker script a build writes from its manifests** (`reference/packages.md § A script made
+// from the manifests`). A freestanding image whose root names no `linker_script`, in a build where some package
+// declares `memory`, is laid out by a script made here from the regions (`memory_map.sysl`), the
+// sections the packages place, and the root's `layout`. It is the same kind of output as the config
+// header: written at each build to `.sysl/out/<target>/link.ld`, read by the link, and keyed in the run
+// cache as every file the linker reads is.
+//
+// The script holds, in this order: each `first` section at the start of its region; the vector table
+// (`.vectors`, kept); `.text`, which ends with the copy table and the zero table; the sections the
+// packages place in read-only regions; `.rodata`; the thread-local template and the `@per_cpu` image;
+// `.data`, stored in `code` and run in `data`; the sections placed in RAM, copied, zeroed or left; the
+// stacks; the unwinding tables, whose size is the one thing the two linkers write differently; and the
+// heap, last in its region so a heap of `rest` takes what is left.
+//
+// **It uses only what GNU ld and lld both implement**: `MEMORY`, `SECTIONS`, `> region AT> region`,
+// `KEEP`, `ALIGN`, `NOLOAD`, `PROVIDE` and `LONG`/`QUAD` -- and the tables are words of the target's
+// pointer width, so a 64-bit image's addresses fit.
+//
+// **The start-up symbols are sysl's**: `__sysl_<section>_start`/`_end` around every section, and
+// `__sysl_<section>_load` where one is stored somewhere other than where it runs; `__sysl_stack_top`
+// (core 0's) and `__sysl_stack_top_<n>` for each core; `__sysl_heap_start`/`_end`; and the tables,
+// `__sysl_copy_table` (load, start, end per entry) and `__sysl_zero_table` (start, end), each ending
+// at its `_end`. A board's start-up is one loop over each table however many regions the program
+// uses, and `symbols {}` adds the names a vendor's start-up expects.
+
+// One package of a build as the script reads it.
+struct LinkInput
+    // The package's key in the graph (`""` for the root project).
+    key: string
+
+    // How a refusal names it: "this project", or the package's name quoted.
+    who: string
+
+    // How the overflow report names it.
+    name: string
+
+    manifest: Manifest
+    enabled: Buf[string]
+    settled: Buf[SettledOption]
+
+    // Each dependency it names, by the label its manifest gives it, and that package's key.
+    deps: Buf[(string, string)]
+end LinkInput
+
+// A region with its values settled.
+struct PlacedRegion
+    name: string
+    origin: u64
+    length: u64
+    kind: RegionKind
+    tags: Buf[string]
+
+    // The package that declared it, as the report names it.
+    owner: string
+end PlacedRegion
+
+// One output section of the script.
+struct OutSection
+    // As the script and the ELF name it: `.bss`.
+    name: string
+
+    // The region it runs in, and the one it is stored in where that is another (`""` otherwise).
+    region: string
+    stored: string
+
+    // What put it in its region, for the overflow report: `layout.data`, `sections.dma (tinyusb)`.
+    why: string
+end OutSection
+
+// A script and what it was made from.
+struct LaidOut
+    text: string
+    regions: Buf[PlacedRegion]
+    sections: Buf[OutSection]
+
+    // Each input-section pattern a rule of the script gathers, which `@section` may name, and the
+    // output section it goes in.
+    claims: Buf[(string, string)]
+
+    // The stacks: their region, each core's bytes, how many, and what sized them.
+    stack_region: string
+    stack_bytes: u64
+    cores: u64
+    stack_from: string
+
+    // The heap's region and its bytes, 0 for `rest`, or `""` where the layout has none.
+    heap_region: string
+    heap_bytes: u64
+    heap_from: string
+
+    // What the layout put in `code` and in `data`.
+    code_region: string
+    data_region: string
+end LaidOut
+
+// -- settling the values ---------------------------------------------------------------------------
+
+// A size or an address, at the value the build settled on, and what it came from for a report to say:
+// `""` for a number, `kernel.stack_bytes = 32768` for an option.
+private settled_amount(a: Amount, at: string, mine: &LinkInput,
+                       inputs: &Buf[LinkInput]) -> Result[(u64, string), string]
+    if a.option == "" then return Ok((a.value, ""))
+
+    var owner = *mine
+    var name = a.option
+
+    a.option.index_of(".") match
+        None -> ()
+        Some(dot) ->
+            val head = a.option[0..<dot]
+
+            for d in mine.deps
+                if d.0 != head then continue
+
+                for other in inputs
+                    if other.key == d.1
+                        owner = other
+                        name = a.option[(dot + 1)..]
+
+    val said = s"'$at' is \"${a.written}\""
+
+    for opt in owner.settled
+        if opt.name != name then continue
+
+        val literal = opt.kind match
+            OptInteger(_, _) -> opt.literal
+            _ -> return Err(s"$said, and the option '$name' of ${owner.who} is not an integer — a size or an " +
+                            "address is a number")
+
+        val n = parse_amount(literal) match
+            Some(v) -> v
+            None -> return Err(s"$said, and the option '$name' of ${owner.who} is $literal, which is no size " +
+                               "or address")
+
+        val qualified = if owner.key == mine.key then name else a.option
+
+        return Ok((n, s"$qualified = $n"))
+
+    for opt in owner.manifest.options
+        if opt.name == name && opt.feature != ""
+            return Err(s"$said, and the option '$name' of ${owner.who} belongs to the feature " +
+                       s"'${opt.feature}', which this build leaves off")
+
+    var names: Buf[string] = buf()
+
+    for opt in owner.settled
+        names.push(opt.name)
+
+    val tail = if names.is_empty() then ", and it has none" else s". It has ${quoted_names(names)}"
+
+    Err(s"$said, and ${owner.who} has no option '$name'$tail")
+end settled_amount
+
+// The sections of one package this build has: its own, and those of its features that are on.
+private sections_on(input: &LinkInput) -> Buf[SectionRule]
+    var out: Buf[SectionRule] = buf()
+
+    for s in input.manifest.memory.sections
+        if s.feature == "" || holds_string(input.enabled, s.feature) then out.push(s)
+
+    out
+end sections_on
+
+private where_section(s: &SectionRule) -> string =
+    if s.feature == "" then s"sections.${s.name}" else s"features.${s.feature}.sections.${s.name}"
+
+private kind_word(k: RegionKind) -> string = k match
+    RegionRom -> "rom"
+    RegionRam -> "ram"
+
+// -- laying it out ---------------------------------------------------------------------------------
+
+// **The script for one image**, or why the manifests cannot make one.
+lay_out(inputs: &Buf[LinkInput], t: Target, layout: Option[ImageLayout]) -> Result[LaidOut, string]
+    val regions = settled_regions(inputs)?
+    val plan = layout.unwrap_or(ImageLayout(t.name, "", "", "", None, None, buf()))
+    val at = if plan.feature == "" then s"targets.${t.name}.layout"
+    else s"features.${plan.feature}.targets.${t.name}.layout"
+
+    val code = chosen_region(regions, plan.code, s"$at.code", RegionRom, "the program's code")?
+    val data = chosen_region(regions, plan.data, s"$at.data", RegionRam, "the program's data")?
+
+    if region_named(regions, data).unwrap().kind == RegionRom
+        return Err(s"'$at.data' names '$data', a 'rom' region, and the program's data is written as it " +
+                   "runs — name a 'ram' region")
+
+    val root = inputs.at(0)
+
+    // The stacks.
+    val stack_plan = plan.stack.unwrap_or(StackLayout("", amount_of(4096), amount_of(1)))
+    val stack_region = chosen_region(regions, stack_plan.region, s"$at.stack", RegionRam, "the stack")?
+    val (stack_bytes, bytes_from) = settled_amount(stack_plan.bytes, s"$at.stack.bytes", root, inputs)?
+    val (cores, cores_from) = settled_amount(stack_plan.per_core, s"$at.stack.per_core", root, inputs)?
+
+    if stack_bytes == 0 then return Err(s"'$at.stack.bytes' comes to 0 (${bytes_from}), and a stack holds " +
+                                       "at least one byte")
+    if cores == 0 then return Err(s"'$at.stack.per_core' comes to 0 (${cores_from}), and an image runs on " +
+                                 "at least one core")
+
+    val sr = region_named(regions, stack_region).unwrap()
+
+    if stack_bytes > sr.length / cores
+        val each = if cores == 1 then "a stack" else s"$cores stacks"
+        val fit = if cores == 1 then "does not fit" else "do not fit"
+
+        return Err(s"$each of ${grouped(stack_bytes)} bytes $fit in the region '$stack_region' " +
+                   s"(${size_said(sr.length)}, ${sr.owner}), which holds ${grouped(sr.length)} — make " +
+                   s"'$at.stack.bytes' smaller, or put the stacks in a larger region")
+    end if
+
+    var stack_from = "layout.stack"
+    val origins = join_sources([bytes_from, cores_from])
+
+    if origins != "" then stack_from = s"layout.stack: $origins"
+
+    // The heap.
+    var heap_region = ""
+    var heap_bytes: u64 = 0
+    var heap_from = ""
+
+    plan.heap match
+        None -> ()
+        Some(h) ->
+            heap_region = chosen_region(regions, h.region, s"$at.heap", RegionRam, "the heap")?
+
+            if !h.rest
+                val (n, from) = settled_amount(h.bytes, s"$at.heap.bytes", root, inputs)?
+                val hr = region_named(regions, heap_region).unwrap()
+
+                if n > hr.length
+                    return Err(s"a heap of ${grouped(n)} bytes does not fit in the region '$heap_region' " +
+                               s"(${size_said(hr.length)}, ${hr.owner}) — make '$at.heap.bytes' smaller, or " +
+                               "give it 'rest'")
+
+                heap_bytes = n
+                heap_from = if from == "" then "layout.heap" else s"layout.heap: $from"
+            else
+                heap_from = "layout.heap: rest"
+
+    // The sections the packages place, each in its region.
+    var placed: Buf[(SectionRule, string, string)] = buf()
+
+    for input in inputs
+        for s in sections_on(input)
+            for had in placed
+                if had.0.name == s.name
+                    return Err(s"the section '${s.name}' is declared by both ${had.2} and ${input.who} — a " +
+                               "section is declared once, and a second one is called something else")
+
+            placed.push((s, "", input.who))
+
+    for item in plan.place
+        var known = false
+
+        for had in placed
+            if had.0.name == item.0 then known = true
+
+        if !known
+            var names: Buf[string] = buf()
+
+            for had in placed
+                names.push(had.0.name)
+
+            val tail = if names.is_empty() then ", and no package places any" else s". The sections are ${quoted_names(names)}"
+
+            return Err(s"'$at.place.${item.0}' moves a section no package of this build places$tail")
+        end if
+
+        if region_named(regions, item.1).is_none()
+            return Err(no_region(regions, s"$at.place.${item.0}", item.1))
+
+    var resolved: Buf[(SectionRule, string, string)] = buf()
+
+    for had in placed
+        val s = had.0
+        var region = s.region
+        var why = s"${where_section(s)} (${had.2})"
+
+        if s.wants != ""
+            region = ""
+
+            for r in regions
+                if region == "" && holds_string(r.tags, s.wants) then region = r.name
+
+            if region == "" && !placed_by(plan.place, s.name)
+                return Err(s"'${where_section(s)}' of ${had.2} wants a region tagged '${s.wants}', and no " +
+                           s"region of this build carries the tag — ${tags_said(regions)}")
+
+            why = s"${where_section(s)} (${had.2}) wants '${s.wants}'"
+        end if
+
+        for item in plan.place
+            if item.0 == s.name
+                region = item.1
+                why = s"$at.place.${s.name}"
+
+        val r = region_named(regions, region) match
+            Some(found) -> found
+            None -> return Err(no_region(regions, s"${where_section(s)}.region", region))
+
+        held_to_kind(s, r, had.2)?
+        resolved.push((s, region, why))
+
+    // One `first` section per region: two would each be at its start.
+    for i in 0..<resolved.len()
+        if !resolved.at(i).0.first then continue
+
+        for j in 0..<i
+            if resolved.at(j).0.first && resolved.at(j).1 == resolved.at(i).1
+                return Err(s"'${where_section(resolved.at(j).0)}' and '${where_section(resolved.at(i).0)}' are " +
+                           s"both 'first' in the region '${resolved.at(i).1}', and one section is at its start")
+
+    // Two rules gathering one input section would each claim it.
+    var claims: Buf[(string, string, string)] = buf()
+
+    for item in standard_claims()
+        claims.push((item.0, "the generated script's own sections", item.1))
+
+    for item in resolved
+        for c in item.0.contents
+            for had in claims
+                if had.0 == c || claims_section(had.0, c)
+                    return Err(s"'${where_section(item.0)}' gathers '$c', which ${had.1} already gather" +
+                               s"${if had.1.starts_with("'") then "s" else ""} as '${had.0}' — an input section " +
+                               "goes in one place, so a section of the package's own has a name of its own")
+
+            claims.push((c, s"'${where_section(item.0)}'", s".${item.0.name}"))
+
+    val symbols = aliases(inputs)?
+
+    val laid = LaidOut("", regions, buf(), buf(), stack_region, stack_bytes, cores, stack_from, heap_region,
+                       heap_bytes, heap_from, code, data)
+
+    write_script(laid, resolved, symbols, t, claims)
+end lay_out
+
+// Every region of the build, values settled, in declaration order -- the root's, then each package's.
+private settled_regions(inputs: &Buf[LinkInput]) -> Result[Buf[PlacedRegion], string]
+    var out: Buf[PlacedRegion] = buf()
+    var whose: Buf[string] = buf()
+
+    for input in inputs
+        for r in input.manifest.memory.regions
+            for i in 0..<out.len()
+                if out.at(i).name == r.name
+                    return Err(s"the region '${r.name}' is declared by both ${whose.at(i)} and ${input.who} — a " +
+                               "chip's memory is declared once, by the package that knows the chip")
+
+            val (origin, _) = settled_amount(r.origin, s"memory.${r.name}.origin", input, inputs)?
+            val (length, from) = settled_amount(r.length, s"memory.${r.name}.length", input, inputs)?
+
+            if length == 0
+                return Err(s"'memory.${r.name}.length' of ${input.who} comes to 0 ($from), and a region holds " +
+                           "at least one byte")
+
+            if origin > MaxAmount - length
+                return Err(s"'memory.${r.name}' of ${input.who} runs past the end of the address space")
+
+            out.push(PlacedRegion(r.name, origin, length, r.kind, r.tags, input.name))
+            whose.push(input.who)
+
+    for i in 0..<out.len()
+        for j in 0..<i
+            val a = out.at(j)
+            val b = out.at(i)
+
+            if a.origin < b.origin + b.length && b.origin < a.origin + a.length
+                return Err(s"the regions '${a.name}' (${span_said(a)}, ${whose.at(j)}) and '${b.name}' " +
+                           s"(${span_said(b)}, ${whose.at(i)}) overlap — two regions of one chip are two " +
+                           "ranges of addresses, and an image laid out in both would put two things in one place")
+
+    Ok(out)
+end settled_regions
+
+private span_said(r: &PlacedRegion) -> string =
+    s"${address(r.origin, 8)}..${address(r.origin + r.length, 8)}"
+
+private region_named(regions: &Buf[PlacedRegion], name: string) -> Option[PlacedRegion]
+    for r in regions
+        if r.name == name then return Some(r)
+
+    None
+end region_named
+
+// The region a layout key names, or the first of the kind it wants where it names none.
+private chosen_region(regions: &Buf[PlacedRegion], named: string, at: string, kind: RegionKind,
+                      what: string) -> Result[string, string]
+    if named != ""
+        if region_named(regions, named).is_none() then return Err(no_region(regions, at, named))
+
+        return Ok(named)
+
+    for r in regions
+        if r.kind == kind then return Ok(r.name)
+
+    Err(s"no region of this build is 'kind = ${kind_word(kind)}', so $what has nowhere to go — name a region " +
+        s"with '$at'")
+end chosen_region
+
+private no_region(regions: &Buf[PlacedRegion], at: string, named: string) -> string
+    var names: Buf[string] = buf()
+
+    for r in regions
+        names.push(r.name)
+
+    s"'$at' names the region '$named', which no package of this build declares — the regions are " +
+        quoted_and(names)
+end no_region
+
+private tags_said(regions: &Buf[PlacedRegion]) -> string
+    var parts: Buf[string] = buf()
+
+    for r in regions
+        if !r.tags.is_empty() then parts.push(s"'${r.name}' carries ${quoted_names(r.tags)}")
+
+    if parts.is_empty() then return "no region carries any tag"
+
+    join(parts.view(), ", ")
+end tags_said
+
+private placed_by(place: &Buf[(string, string)], name: string) -> bool
+    for item in place
+        if item.0 == name then return true
+
+    false
+end placed_by
+
+// What a section may say in the region it landed in.
+private held_to_kind(s: &SectionRule, r: &PlacedRegion, who: string) -> Result[unit, string]
+    val at = where_section(s)
+
+    if r.kind == RegionRom
+        if s.zero || s.load || s.noload
+            val said = if s.zero then "zero" else if s.load then "load" else "noload"
+
+            return Err(s"'$at' of $who says '$said = true', and its region '${r.name}' is 'kind = rom' — a " +
+                       "read-only region holds only what the image stores, so a section there says none of " +
+                       "'zero', 'load' and 'noload'")
+        end if
+
+        return Ok(())
+    end if
+
+    if !s.zero && !s.load && !s.noload
+        return Err(s"'$at' of $who goes in '${r.name}', a 'ram' region, and says nothing of what start-up does " +
+                   "with it — 'zero = true' to clear it, 'load = true' to copy its values from the image, or " +
+                   "'noload = true' to leave it as a warm reset found it")
+
+    Ok(())
+end held_to_kind
+
+// The names `symbols {}` gives, each refused where two packages give one name.
+private aliases(inputs: &Buf[LinkInput]) -> Result[Buf[(string, string, string)], string]
+    var out: Buf[(string, string, string)] = buf()
+
+    for input in inputs
+        for item in input.manifest.memory.symbols
+            for had in out
+                if had.0 == item.0
+                    return Err(s"the symbol '${item.0}' is given by both ${had.2} and ${input.who} — a symbol " +
+                               "has one value")
+
+            out.push((item.0, item.1, input.who))
+
+    Ok(out)
+end aliases
+
+// The input sections the standard rules gather, each with the output section it goes in.
+private standard_claims() -> Buf[(string, string)]
+    var out: Buf[(string, string)] = buf()
+
+    for item in [".vectors", ".vectors.*", ".isr_vector", ".isr_vector.*"]
+        out.push((item, ".vectors"))
+
+    for item in [".text", ".text.*"]
+        out.push((item, ".text"))
+
+    for item in [".rodata", ".rodata.*", ".srodata", ".srodata.*"]
+        out.push((item, ".rodata"))
+
+    for item in [".tdata", ".tdata.*", ".tbss", ".tbss.*", ".percpu", ".data", ".data.*", ".sdata", ".sdata.*",
+                 ".bss", ".bss.*", ".sbss", ".sbss.*", ".noinit", ".noinit.*", ".ARM.extab", ".ARM.extab.*",
+                 ".ARM.exidx", ".ARM.exidx.*"]
+        out.push((item, standard_home(item)))
+
+    out.push(("COMMON", ".bss"))
+    out
+end standard_claims
+
+// The output section a standard input section goes in: its own name without a suffix, the small
+// sections of RISC-V in their full-sized ones'.
+private standard_home(item: string) -> string
+    for home in [".tdata", ".tbss", ".percpu", ".noinit", ".ARM.extab", ".ARM.exidx"]
+        if item.starts_with(home) then return home
+
+    if item.starts_with(".data") || item.starts_with(".sdata") then return ".data"
+
+    ".bss"
+end standard_home
+
+// The output section an input section goes in, or `""` where no rule of the script gathers it.
+home_of(laid: &LaidOut, input: string) -> string
+    for item in laid.claims
+        if claims_section(item.0, input) then return item.1
+
+    ""
+end home_of
+
+// Whether a rule's pattern gathers an input section: the name itself, or a `*` matching any run.
+claims_section(pattern: string, name: string) -> bool
+    val p = pattern.bytes
+    val n = name.bytes
+
+    glob_at(p, 0, n, 0)
+end claims_section
+
+private glob_at(p: []const u8, i: usize, n: []const u8, j: usize) -> bool
+    if i == p.len then return j == n.len
+
+    if p[i] == u8('*')
+        for k in j..(n.len)
+            if glob_at(p, i + 1, n, k) then return true
+
+        return false
+    end if
+
+    if j == n.len || p[i] != n[j] then return false
+
+    glob_at(p, i + 1, n, j + 1)
+end glob_at
+
+// -- the text --------------------------------------------------------------------------------------
+
+private address(v: u64, digits: usize) -> string = "0x" + hex_lower(v, digits)
+
+// A size as the report says it: `128 KiB`, `2 MiB`, or the bytes.
+size_said(n: u64) -> string
+    if n >= 1024 * 1024 && n % (1024 * 1024) == 0 then return s"${n / (1024 * 1024)} MiB"
+    if n >= 1024 && n % 1024 == 0 then return s"${n / 1024} KiB"
+
+    s"$n bytes"
+end size_said
+
+// A number with a comma between each group of three digits.
+grouped(n: u64) -> string
+    val digits = s"$n"
+    val b = digits.bytes
+    var out = ""
+
+    for i in 0..<b.len
+        if i > 0 && (b.len - i) % 3 == 0 then out = out + ","
+
+        out = out + digits[i..<(i + 1)]
+
+    out
+end grouped
+
+private join_sources(parts: []string) -> string
+    var kept: Buf[string] = buf()
+
+    for i in 0..<parts.len
+        if parts[i] != "" then kept.push(parts[i])
+
+    join(kept.view(), ", ")
+end join_sources
+
+// The script itself, and what each of its sections is.
+private write_script(laid: LaidOut, resolved: Buf[(SectionRule, string, string)],
+                     symbols: Buf[(string, string, string)], t: Target,
+                     claims: Buf[(string, string, string)]) -> Result[LaidOut, string]
+    val wide = t.pointer_bits() == 64
+    val word: u64 = if wide then 8 else 4
+    val digits: usize = if wide then 16 else 8
+    val data_word = if wide then "QUAD" else "LONG"
+    val code = laid.code_region
+    val data = laid.data_region
+    var s = ScriptText(buf(), buf(), buf(), word)
+
+    s.lines.push(s"/* The linker script sysl wrote for '${t.name}' from the manifests of this build. It is")
+    s.lines.push(" * rewritten by every build; to lay the image out by hand, name a script of your own with")
+    s.lines.push(s" * 'targets.${t.name}.linker_script'. */")
+    s.lines.push("")
+    s.lines.push("MEMORY")
+    s.lines.push("{")
+
+    var widest: usize = 0
+
+    for r in laid.regions
+        if r.name.bytes.len > widest then widest = r.name.bytes.len
+
+    for r in laid.regions
+        val attrs = if r.kind == RegionRom then "(rx) " else "(rwx)"
+        var name = r.name
+
+        while name.bytes.len < widest
+            name = name + " "
+
+        s.lines.push(s"  $name $attrs : ORIGIN = ${address(r.origin, digits)}, LENGTH = " +
+                     address(r.length, digits))
+
+    s.lines.push("}")
+    s.lines.push("")
+    s.lines.push("SECTIONS")
+    s.lines.push("{")
+
+    // Each `first` section, at the start of its region.
+    for item in resolved
+        if item.0.first then placed_section(&s, item, code, word)
+
+    s.out_section(".vectors", code, "", "the vector table (layout.code)")
+    s.open(".vectors", "", word)
+    s.lines.push("    KEEP(*(.vectors .vectors.* .isr_vector .isr_vector.*))")
+    s.close(code, "")
+
+    // `.text`, ending with the tables, which a start-up reads before anything is copied or cleared.
+    s.out_section(".text", code, "", "layout.code")
+    s.open(".text", "", word)
+    s.lines.push("    __sysl_text_start = .;")
+    s.lines.push("    *(.text .text.*)")
+    s.lines.push(s"    . = ALIGN($word);")
+    s.lines.push("    __sysl_text_end = .;")
+    s.lines.push("    __sysl_copy_table = .;")
+
+    if data != code then s.lines.push(s"    $data_word(LOADADDR(.data)) $data_word(ADDR(.data)) " +
+                                      s"$data_word(ADDR(.data) + SIZEOF(.data))")
+
+    for item in resolved
+        if item.0.load && item.1 != code
+            val n = s".${item.0.name}"
+
+            s.lines.push(s"    $data_word(LOADADDR($n)) $data_word(ADDR($n)) $data_word(ADDR($n) + SIZEOF($n))")
+
+    s.lines.push("    __sysl_copy_table_end = .;")
+    s.lines.push("    __sysl_zero_table = .;")
+    s.lines.push(s"    $data_word(ADDR(.bss)) $data_word(ADDR(.bss) + SIZEOF(.bss))")
+
+    for item in resolved
+        if item.0.zero
+            val n = s".${item.0.name}"
+
+            s.lines.push(s"    $data_word(ADDR($n)) $data_word(ADDR($n) + SIZEOF($n))")
+
+    s.lines.push("    __sysl_zero_table_end = .;")
+    s.close(code, "")
+
+    // The sections placed in read-only regions.
+    for item in resolved
+        if !item.0.first && region_kind(laid.regions, item.1) == RegionRom then placed_section(&s, item, code, word)
+
+    s.standard(".rodata", "rodata", code, "", "*(.rodata .rodata.* .srodata .srodata.*)", word, "layout.code")
+
+    // The thread-local template and the `@per_cpu` image: read, never written, so they stay in `code`.
+    s.out_section(".tdata", code, "", "layout.code")
+    s.lines.push(s"  .tdata : ALIGN($word)")
+    s.lines.push("  {")
+    s.lines.push("    *(.tdata .tdata.*)")
+    s.close(code, "")
+    s.out_section(".tbss", code, "", "layout.code")
+    s.lines.push(s"  .tbss : ALIGN($word)")
+    s.lines.push("  {")
+    s.lines.push("    *(.tbss .tbss.*)")
+    s.close(code, "")
+    s.standard(".percpu", "percpu", code, "", "KEEP(*(.percpu))", word, "layout.code")
+
+    // `.data`, run in `data` and stored in `code` unless the two are one region.
+    val stored = if data == code then "" else code
+
+    s.standard(".data", "data", data, stored, "*(.data .data.* .sdata .sdata.*)", word, "layout.data")
+
+    // What the packages place in RAM: copied, zeroed or left.
+    for item in resolved
+        if !item.0.first && item.0.load then placed_section(&s, item, code, word)
+
+    s.noload(".bss", "bss", data, "*(.bss .bss.* .sbss .sbss.*)\n    *(COMMON)", word, "layout.data")
+    s.noload(".noinit", "noinit", data, "*(.noinit .noinit.*)", word, "layout.data")
+
+    for item in resolved
+        if !item.0.first && (item.0.zero || item.0.noload) then placed_section(&s, item, code, word)
+
+    // The stacks, one per core, core 0's lowest.
+    val stack_align: u64 = if wide then 16 else 8
+
+    s.out_section(".stack", laid.stack_region, "", laid.stack_from)
+    s.lines.push(s"  .stack (NOLOAD) : ALIGN($stack_align)")
+    s.lines.push("  {")
+    s.lines.push("    __sysl_stack_start = .;")
+
+    for n in 0..<laid.cores
+        s.lines.push(s"    . = . + ${laid.stack_bytes};")
+        s.lines.push(s"    __sysl_stack_top_$n = .;")
+        s.names.push(s"stack_top_$n")
+
+    s.lines.push("    __sysl_stack_end = .;")
+    s.close(laid.stack_region, "")
+    s.lines.push("  __sysl_stack_top = __sysl_stack_top_0;")
+    s.names.push("stack_start")
+    s.names.push("stack_end")
+    s.names.push("stack_top")
+    s.lines.push("")
+
+    // The unwinding tables, after everything else `code` holds but a heap: lld ends `.ARM.exidx` with
+    // an entry GNU ld does not write, so a table of two sizes moves nothing the two linkers lay out.
+    s.standard(".ARM.extab", "extab", code, "", "*(.ARM.extab .ARM.extab.*)", word, "layout.code")
+    s.standard(".ARM.exidx", "exidx", code, "", "*(.ARM.exidx .ARM.exidx.*)", word, "layout.code")
+
+    // The heap, last in its region.
+    if laid.heap_region != ""
+        s.out_section(".heap", laid.heap_region, "", laid.heap_from)
+        s.lines.push(s"  .heap (NOLOAD) : ALIGN($stack_align)")
+        s.lines.push("  {")
+        s.lines.push("    __sysl_heap_start = .;")
+
+        if laid.heap_bytes > 0
+            s.lines.push(s"    . = . + ${laid.heap_bytes};")
+            s.lines.push("    __sysl_heap_end = .;")
+
+        s.close(laid.heap_region, "")
+
+        if laid.heap_bytes == 0
+            val r = laid.heap_region
+
+            s.lines.push(s"  __sysl_heap_end = ORIGIN($r) + LENGTH($r);")
+            s.lines.push("")
+
+        s.names.push("heap_start")
+        s.names.push("heap_end")
+    end if
+
+    // The thread-local template's bounds, for `sysl.threads`.
+    s.lines.push("  __sysl_tls_data = ADDR(.tdata);")
+    s.lines.push("  __sysl_tls_data_end = ADDR(.tdata) + SIZEOF(.tdata);")
+    s.lines.push("  __sysl_tls_end = ADDR(.tbss) + SIZEOF(.tbss);")
+    s.lines.push("  __sysl_tls_align = MAX(ALIGNOF(.tdata), ALIGNOF(.tbss));")
+
+    for name in ["copy_table", "copy_table_end", "zero_table", "zero_table_end", "tls_data", "tls_data_end",
+                 "tls_end", "tls_align"]
+        s.names.push(name)
+
+    // The names a vendor's start-up expects.
+    if !symbols.is_empty()
+        s.lines.push("")
+
+        for item in symbols
+            if !holds_string(s.names, item.1)
+                return Err(s"'symbols.${item.0}' of ${item.2} names '${item.1}', which the generated script " +
+                           s"does not define — it defines ${quoted_names(s.names)}, each as '__sysl_<name>'")
+
+            s.lines.push(s"  PROVIDE(${item.0} = __sysl_${item.1});")
+    end if
+
+    s.lines.push("}")
+
+    var patterns: Buf[(string, string)] = buf()
+
+    for item in claims
+        patterns.push((item.0, item.2))
+
+    Ok(laid with { text = join(s.lines.view(), "\n") + "\n", sections = s.sections, claims = patterns })
+end write_script
+
+private region_kind(regions: &Buf[PlacedRegion], name: string) -> RegionKind =
+    region_named(regions, name).unwrap().kind
+
+// The script as it is written: its lines, every output section, and every symbol name it defines.
+private struct ScriptText
+    lines: Buf[string]
+    sections: Buf[OutSection]
+    names: Buf[string]
+
+    // The target's word, which every section ends on so a table's loop moves whole words.
+    word: u64
+
+    out_section(*self, name: string, region: string, stored: string, why: string)
+        self.sections.push(OutSection(name, region, stored, why))
+
+    // A section's head, with its alignment.
+    open(*self, name: string, kind: string, align: u64)
+        self.lines.push(s"  $name$kind : ALIGN($align)")
+        self.lines.push("  {")
+
+    // Its close: the region it runs in, and the one it is stored in.
+    close(*self, region: string, stored: string)
+        val at = if stored == "" then "" else s" AT> $stored"
+
+        self.lines.push(s"  } > $region$at")
+        self.lines.push("")
+
+    // A section with its bounds and, where it is stored elsewhere, its load address.
+    standard(*self, name: string, stem: string, region: string, stored: string, body: string, align: u64,
+             why: string)
+        self.out_section(name, region, stored, why)
+        self.open(name, "", align)
+        self.lines.push(s"    __sysl_${stem}_start = .;")
+        self.lines.push(s"    $body")
+        self.lines.push(s"    . = ALIGN(${self.word});")
+        self.lines.push(s"    __sysl_${stem}_end = .;")
+        self.close(region, stored)
+        self.names.push(s"${stem}_start")
+        self.names.push(s"${stem}_end")
+
+        if stored != ""
+            self.lines.push(s"  __sysl_${stem}_load = LOADADDR($name);")
+            self.lines.push("")
+            self.names.push(s"${stem}_load")
+    end standard
+
+    // A section of RAM nothing is stored for.
+    noload(*self, name: string, stem: string, region: string, body: string, align: u64, why: string)
+        self.out_section(name, region, "", why)
+        self.open(name, " (NOLOAD)", align)
+        self.lines.push(s"    __sysl_${stem}_start = .;")
+        self.lines.push(s"    $body")
+        self.lines.push(s"    . = ALIGN(${self.word});")
+        self.lines.push(s"    __sysl_${stem}_end = .;")
+        self.close(region, "")
+        self.names.push(s"${stem}_start")
+        self.names.push(s"${stem}_end")
+    end noload
+end ScriptText
+
+// One section a package places.
+private placed_section(s: *ScriptText, item: &(SectionRule, string, string), code: string, word: u64)
+    val rule = item.0
+    val region = item.1
+    val name = s".${rule.name}"
+    val align = if rule.align > word then rule.align else word
+    val gathered = join(rule.contents.view(), " ")
+    val body = if rule.keep then s"KEEP(*($gathered))" else s"*($gathered)"
+
+    if rule.zero || rule.noload
+        s.noload(name, rule.name, region, body, align, item.2)
+    else
+        val stored = if rule.load && region != code then code else ""
+
+        s.standard(name, rule.name, region, stored, body, align, item.2)
+end placed_section
+
+// The name a package is shown by: its manifest's, or what it is called where the manifest names none.
+package_shown(m: &Manifest, fallback: string) -> string = if m.name.is_empty() then fallback else m.name
+
+// -- the build's script ----------------------------------------------------------------------------
+
+// The script this build made, or `""` where it made none. **Module storage for the reason the config
+// headers are**: the link asks for it knowing only the project, and the answer is the resolution's.
+private var generated_path: string = ""
+private var generated: Option[LaidOut] = None
+private var generated_from: Buf[LinkInput] = buf()
+
+// Forget it, for a build that resolves none.
+forget_link_script()
+    generated_path = ""
+    generated = None
+    generated_from = buf()
+
+// The packages it was made from, for the overflow report to read their options.
+generated_inputs() -> Buf[LinkInput] = generated_from.copy()
+
+// The path of the script this build wrote, or `""`.
+generated_script_path() -> string = generated_path
+
+// What it was made from, for the checks of the link.
+generated_layout() -> Option[LaidOut] = generated
+
+// **Whether this build lays its image out by a generated script**: a bare image, whose root names no
+// `linker_script` -- in its target block or an enabled feature's -- and some package of which
+// declares `memory`. A `layout` with no `memory` anywhere is refused, since it would place the program
+// in regions nothing declared.
+publish_link_script(root: string, t: Target, inputs: &Buf[LinkInput]) -> Result[unit, string]
+    forget_link_script()
+
+    if !links_an_image(t) || inputs.is_empty() then return Ok(())
+
+    val m = inputs.at(0).manifest
+    val img = image_for(m, t.name)
+
+    if img.is_some() && img.unwrap().script != "" then return Ok(())
+
+    var declared = false
+
+    for input in inputs
+        if !input.manifest.memory.regions.is_empty() then declared = true
+
+    val layout = featured_layout(m, t.name)
+
+    if !declared
+        if layout.is_some()
+            return Err(s"'targets.${t.name}.layout' places the program in regions, and no package of this build " +
+                       "declares any 'memory' — a chip or board package declares the regions, or the project " +
+                       "does with a 'memory' block of its own")
+
+        return Ok(())
+    end if
+
+    val laid = lay_out(inputs, t, layout)?
+    val dir = s"${absolute_path(root)}/$LocalDir/out/${t.name}"
+    val path = s"$dir/link.ld"
+
+    make_dir_all(dir).map_err((e) -> s"cannot make the directory '$dir' for the generated linker script")?
+
+    if read_text(path).unwrap_or("") != laid.text
+        write_text_atomic(path, laid.text).map_err((e) -> s"cannot write the generated linker script '$path'")?
+
+    generated_path = path
+    generated = Some(laid)
+    generated_from = inputs.copy()
+    Ok(())
+end publish_link_script

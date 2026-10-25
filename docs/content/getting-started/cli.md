@@ -225,8 +225,9 @@ the result does not depend on the directory you run the command from.
 **`--emit config` and `--emit config:<package>`** report the generated C configuration headers
 (`sysl/<package>.h`, see [packages](/reference/packages/)) the build wrote: one `wrote <path>` line each,
 on stderr, after the build has run, so what is shown is what it used. They accept a comma-separated
-list. `--emit link` and `--emit all` name generated linker scripts, which arrive in 0.7.0 and are
-refused until then.
+list. `--emit link` reports the linker script a freestanding build generated from its manifests
+(`.sysl/out/<target>/link.ld`, see [packages](/reference/packages/#a-script-made-from-the-manifests)),
+and `--emit all` the headers and the script.
 
 **If the project's `sysl.hocon` names dependencies, `build` fetches any this machine does not
 have yet** — see [packages](/reference/packages/). `run` and `test` do the same, so there is no

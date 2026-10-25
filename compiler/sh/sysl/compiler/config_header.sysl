@@ -260,19 +260,16 @@ private var emit_kinds: Buf[string] = buf()
 reset_emit()
     emit_kinds = buf()
 
-// `--emit config,config:tinyusb`: the kinds, each checked. **`link` and `all` name the generated linker
-// scripts, which a later release brings**, so they are refused rather than ignored.
+// `--emit config,config:tinyusb,link`: the kinds, each checked. `link` is the generated linker script
+// (`link_script.sysl`), and `all` is every header and the script.
 took_emit(list: string) -> Result[unit, string]
     for part in split_commas(list)
-        if part == "config" || (part.starts_with("config:") && part.bytes.len > 7)
+        if part == "config" || part == "link" || part == "all" || (part.starts_with("config:") && part.bytes.len > 7)
             emit_kinds.push(part)
-        else if part == "link" || part == "all" || part.starts_with("link:")
-            return Err(s"'--emit $part' asks for a generated linker script, and linker-script generation " +
-                       "arrives in 0.7.0 — '--emit config' and '--emit config:<package>' write the config " +
-                       "headers now")
         else
             return Err(s"'--emit $part' is not something a build can emit — it takes 'config' (every " +
-                       "package's header) or 'config:<package>' (one), comma-separated")
+                       "package's header), 'config:<package>' (one), 'link' (the generated linker script) " +
+                       "or 'all', comma-separated")
 
     Ok(())
 end took_emit
@@ -297,7 +294,27 @@ emitted_paths() -> Result[Buf[string], string]
     var out: Buf[string] = buf()
 
     for kind in emit_kinds
-        if kind == "config"
+        if kind == "all"
+            for h in written_headers
+                if !holds_string(out, h.path) then out.push(h.path)
+
+            val script = generated_script_path()
+
+            if script != "" && !holds_string(out, script) then out.push(script)
+
+            if out.is_empty()
+                return Err("'--emit all' has nothing to write — no package in this build has a config header, " +
+                           "and the build is laid out by no generated linker script")
+        else if kind == "link"
+            val script = generated_script_path()
+
+            if script == ""
+                return Err("'--emit link' has nothing to write — this build is laid out by no generated " +
+                           "linker script: its target is not a freestanding image, its root names a " +
+                           "'linker_script', or no package of it declares 'memory'")
+
+            if !holds_string(out, script) then out.push(script)
+        else if kind == "config"
             if written_headers.is_empty()
                 return Err("'--emit config' has nothing to write — no package in this build names a " +
                            "'macro' or has a 'config' block, so none has a config header")

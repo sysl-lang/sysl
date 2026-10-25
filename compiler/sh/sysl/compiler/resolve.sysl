@@ -1441,6 +1441,19 @@ package_sources(root: string, m: &Manifest, t: Target) -> Result[PackageSources,
             Err(why) -> return Err(said(Refusal(why)))
             Ok(_) -> ()
 
+        var laid: Buf[LinkInput] = buf()
+        val nothing: Buf[ResolvedPackage] = buf()
+
+        for h in headed
+            val who = if h.key == "" then "this project" else s"the source root '${h.fallback}'"
+
+            laid.push(LinkInput(h.key, who, package_shown(h.manifest, h.fallback), h.manifest, h.enabled,
+                                h.settled, dependency_keys(h.manifest, nothing, roots)))
+
+        publish_link_script(root, t, laid) match
+            Err(why) -> return Err(said(Refusal(why)))
+            Ok(_) -> ()
+
         return Ok(none)
     end if
 
@@ -1483,6 +1496,34 @@ package_sources(root: string, m: &Manifest, t: Target) -> Result[PackageSources,
                                 settled_options_of(graph.settled, p.canonical)))
 
     publish_config_headers(root, t, headed) match
+        Err(why) -> return Err(said(Refusal(why)))
+        Ok(_) -> ()
+
+    // The root's memory map first, so its regions come first wherever declaration order decides.
+    var laid: Buf[LinkInput] = buf()
+
+    for p in graph.packages
+        if is_root_package(p)
+            laid.push(LinkInput("", "this project", package_shown(p.manifest, root_name(root)), p.manifest,
+                                enabled_of(graph.features, ""), settled_options_of(graph.settled, ""),
+                                dependency_keys(p.manifest, graph.packages, roots)))
+
+    for p in graph.packages
+        if !is_root_package(p)
+            val shown = package_shown(p.manifest, p.canonical)
+
+            laid.push(LinkInput(p.canonical, s"'$shown'", shown, p.manifest, enabled_of(graph.features, p.canonical),
+                                settled_options_of(graph.settled, p.canonical),
+                                dependency_keys(p.manifest, graph.packages, roots)))
+
+    for item in roots
+        val key = lib_root_key(item.0)
+
+        laid.push(LinkInput(key, s"the source root '${item.0}'", package_shown(item.1, root_name(item.0)), item.1,
+                            enabled_of(graph.features, key), settled_options_of(graph.settled, key),
+                            dependency_keys(item.1, graph.packages, roots)))
+
+    publish_link_script(root, t, laid) match
         Err(why) -> return Err(said(Refusal(why)))
         Ok(_) -> ()
 

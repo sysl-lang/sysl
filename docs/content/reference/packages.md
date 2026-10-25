@@ -769,8 +769,9 @@ to link by hand and no flags in the environment.
 | key | says | default |
 |---|---|---|
 | `linker` | the program that links the image: a name, looked for beside the clang the build drives and then on the `PATH`, or a path relative to `sysl.hocon` | `ld.lld` |
-| `linker_script` | the script the image is laid out by, relative to `sysl.hocon`; handed over as `-T <script>` | none — the linker's own layout |
-| `entry` | the symbol the image starts at; handed over as `--entry`, and required to be defined | the script's `ENTRY` where there is a script; `main` where there is none |
+| `linker_script` | the script the image is laid out by, relative to `sysl.hocon`; handed over as `-T <script>` | [one generated from the manifests](#a-script-made-from-the-manifests) where a package of the build declares `memory`; otherwise none — the linker's own layout |
+| `entry` | the symbol the image starts at; handed over as `--entry`, and required to be defined | the script's `ENTRY` where there is a hand-written script; `main` where there is none, or the script is generated |
+| `layout` | which regions of the chip's memory the program's code, data, stacks and heap go in | the first region of a fitting kind |
 
 **A freestanding target never reaches the host's linker, whether or not the block says anything.**
 Its image is linked with `-nostdlib` through `ld.lld` (or the `linker` named), so no start file, no
@@ -824,8 +825,9 @@ features {
 and the top-level `targets.<t>` block's own keys stand for every key no enabled feature sets.
 
 A feature's target block may set **every key a target block takes**: `triple`, `linker`,
-`linker_script`, `entry`, `capabilities` and `codegen` (a capability or a code generation setting each
-counting as one key). What it may not do is be ambiguous:
+`linker_script`, `entry`, `layout`, `capabilities` and `codegen` (a capability or a code generation
+setting each counting as one key, and a `layout` replacing the target block's whole). What it may not
+do is be ambiguous:
 
 - **two enabled features that set the same key are refused**, naming both, since the build would be
   told two things about one link:
@@ -843,11 +845,237 @@ counting as one key). What it may not do is be ambiguous:
   declaration: there is no target block that names a feature from outside.
 
 As with the top-level target block, **only the root project's feature blocks apply**, and a
-dependency whose feature sets a linker, script or entry is refused as its target block would be.
+dependency whose feature sets a linker, script, entry or layout is refused as its target block would be.
 
 **The 0.4.0 spelling, `targets.<t>.features.<f> { … }`, is refused** with the block rewritten the new
 way round. A key written in `features.<f>.targets.<t>` that this
 sysl does not know is warned about and ignored, as in a top-level target block.
+
+### A script made from the manifests
+
+A hand-written script restates the chip's memory map, which is a fact about the chip, and the stack
+sizes, which are facts about the program — and when the program's options change, the script does not
+follow. **Where a package of the build declares `memory` and the root names no `linker_script`, `sysl
+build` writes the script itself**, to `.sysl/out/<target>/link.ld`, at every build. It is a build
+output like the [config header](#the-config-header): never written beside the sources, and keyed in the
+run cache with the manifests and options it is made from.
+
+**The chip's memory comes from whichever package knows the chip**, and where the program goes in it is
+the root's:
+
+```hocon
+// pico2-board/sysl.hocon
+package { name = "pico2-board", version = "0.1.0" }
+
+memory {
+  flash     { origin = 0x1000_0000, length = "option:flash_bytes", kind = rom }
+  sram      { origin = 0x2000_0000, length = 512K, kind = ram, tags = [dma] }
+  scratch_x { origin = 0x2008_0000, length = 4K,   kind = ram, tags = [core0] }
+  scratch_y { origin = 0x2008_1000, length = 4K,   kind = ram, tags = [core1] }
+}
+sections {
+  image_def { contents = [".embedded_block"], region = flash, first = true, keep = true }
+}
+options { flash_bytes { type = usize, default = 4194304 } }
+```
+
+```hocon
+// the application's sysl.hocon
+package { name = "blink", version = "0.1.0" }
+dependencies { board { git = "github.com/sysl-lang/pico2-board", version = "0.1.0" } }
+
+targets {
+  thumb-freestanding {
+    layout { code = flash, data = sram }
+  }
+}
+```
+
+`sysl build --target thumb-freestanding -o blink.elf .` links by a script holding the four regions,
+the IMAGE_DEF at the start of flash, the vector table after it, `.data` stored in flash and run in
+SRAM, and a stack of 4K.
+
+| block | where | says |
+|---|---|---|
+| `memory { <region> { origin, length, kind, tags } }` | any package, or the root | the chip's regions: where each starts, how long it is, `kind = rom` (what the image is stored in) or `kind = ram` (what it runs in), and the tags a section may ask for |
+| `sections { <name> { contents, region \| wants, zero \| load \| noload, keep, first, align } }` | any package, or an enabled feature of one | a section of its own: the input sections it gathers, the region it goes in or the tag it wants, and what start-up does with it |
+| `symbols { <name> = <generated> }` | any package | the names a vendor's start-up expects, each one of the script's own |
+| `targets.<t>.layout { code, data, stack, heap, place }` | the root, or an enabled feature of it | which region the program's code, its data, its stacks and its heap go in, and where a section of a package's is moved to |
+
+**A size or an address is a number or one whole option.** A number is decimal, `0x`, `0b` or `0o`,
+with underscores between digits as in sysl, and a `K` or `M` after it (binary). `"option:flash_bytes"`
+is an option of the package that wrote it and `"option:kernel.stack_bytes"` one of its dependency
+`kernel`'s, at the value the build settled on — so a consumer's `options = { flash_bytes = 2097152 }`
+moves the end of flash, and `cores = 2` on a kernel sizes both the kernel's tables and its stacks from
+one value. There is no arithmetic in a manifest.
+
+**The layout.** Each key left out takes the first region of a fitting kind, in the order the manifests
+declare them (the root's, then each package's): `code` a `rom` region, `data`, `stack` and `heap` a
+`ram` one. A stack and a heap are written as a region, or as a block:
+
+```hocon
+layout {
+  code  = flash
+  data  = dtcm
+  stack { region = dtcm, bytes = "option:kernel.stack_bytes", per_core = "option:kernel.cores" }
+  heap  { region = ram_d1, bytes = rest }
+  place { tinyusb_dma = ram_d2 }
+}
+```
+
+A stack with no `bytes` is 4K, and one with no `per_core` is one core's. A heap is there only where
+the layout names one, and `bytes = rest` (or a heap written as its region alone) runs from what the
+region already holds to its end. A layout is the program's: a dependency that names one is refused,
+as one naming a `linker_script` is.
+
+**A section a package places** names the input sections it gathers — the ones `@section` and C's
+`section` attribute put things in — and either the `region` it goes in or the tag it `wants`, which
+takes the first region carrying the tag. In a `ram` region it says what start-up does with it, exactly
+one of `zero = true` (cleared), `load = true` (its values copied from the image) or `noload = true`
+(left as a warm reset found it); in a `rom` region it says none of them. `first = true` puts it at
+the start of its region, `keep = true` keeps it from the linker's collection, and `align` is the
+boundary it starts on. TinyUSB on an STM32H7 is the case tags exist for: the OTG controllers' DMA
+cannot reach DTCM, so the package's `stm32h7` feature asks for any region tagged `dma` without knowing
+which board it is on:
+
+```hocon
+features {
+  stm32h7 {
+    sections { tinyusb_dma { contents = [".sysl.tinyusb.dma"], wants = dma, zero = true, align = 32 } }
+  }
+}
+```
+
+**A declaration placed by `@section` and referenced by nothing is kept**, so the IMAGE_DEF the boot ROM
+looks for is a `val` of the board package, in a module nothing imports:
+
+```sysl build=c target=thumb-freestanding
+@no_os
+
+// The minimal Arm secure executable IMAGE_DEF the RP2350 datasheet gives (§ 5.9.5).
+@section(".embedded_block")
+val image_def: [5]u32 = [0xffffded3, 0x10210142, 0x000001ff, 0x00000000, 0xab123579]
+```
+
+#### What the script holds
+
+In this order: each `first` section at the start of its region; the vector table (`.vectors`,
+`.isr_vector`, kept) first in `code`; `.text`, ending with the copy table and the zero table;
+the sections placed in `rom` regions; `.rodata`; the thread-local template (`.tdata`, `.tbss`) and the
+[`@per_cpu`](/reference/attributes/#per-cpu-one-copy-per-processor-core) image (`.percpu`), which are read and never written, in `code`; `.data`,
+run in `data` and stored in `code` unless the two are one region; the sections placed in RAM; `.bss`
+and `.noinit`; the stacks, core 0's lowest; the unwinding tables; and the heap, last in its region.
+
+**The start-up symbols are sysl's**: `__sysl_<section>_start` and `_end` around every section, and
+`__sysl_<section>_load` where one is stored somewhere other than where it runs; `__sysl_stack_top`
+(core 0's) and `__sysl_stack_top_<n>` for each core; `__sysl_heap_start` and `_end`; and the two tables,
+`__sysl_copy_table` (a load address, a start and an end per section) and `__sysl_zero_table` (a start
+and an end), each ending at its `_end`, in words of the target's pointer width. A `symbols` entry
+names a vendor's symbol and the generated one it is — `_estack = stack_top` is `_estack` for
+`__sysl_stack_top` — and is defined where something refers to it. A board's start-up is then one loop
+over each table, however many regions the program uses:
+
+```sysl build=c target=thumb-freestanding
+@no_os
+
+import sysl.raw.ptr_cast
+
+// The two tables the generated script lays out, each ending at its `_end`.
+extern "__sysl_copy_table" copy_table: u32
+extern "__sysl_copy_table_end" copy_table_end: u32
+extern "__sysl_zero_table" zero_table: u32
+extern "__sysl_zero_table_end" zero_table_end: u32
+
+private word(at: usize) -> u32
+    val p: *u32 = ptr_cast(at)
+    *p
+
+private put(at: usize, v: u32)
+    val p: *u32 = ptr_cast(at)
+    *p = v
+
+// Copies every section stored somewhere other than where it runs, then clears every one start-up
+// zeroes.
+@export("sysl_start_up")
+start_up()
+    var row = usize(&copy_table)
+
+    while row < usize(&copy_table_end)
+        val (load, start, end_at) = (usize(word(row)), usize(word(row + 4)), usize(word(row + 8)))
+
+        for i in 0..<((end_at - start) / 4)
+            put(start + i * 4, word(load + i * 4))
+
+        row += 12
+
+    row = usize(&zero_table)
+
+    while row < usize(&zero_table_end)
+        val (start, end_at) = (usize(word(row)), usize(word(row + 4)))
+
+        for i in 0..<((end_at - start) / 4)
+            put(start + i * 4, 0)
+
+        row += 8
+end start_up
+```
+
+**The script uses only what GNU ld and lld both implement** — `MEMORY`, `SECTIONS`, `> region AT>
+region`, `KEEP`, `ALIGN`, `NOLOAD`, `PROVIDE` and `LONG` or `QUAD` — so `linker = "arm-none-eabi-ld"`
+links it as `ld.lld` does, every symbol at the same address but the end of `.ARM.exidx`, which lld
+writes one entry longer. The generated script starts the image at the target block's `entry`, or at
+`main`.
+
+#### What a script refuses
+
+Before anything is linked, a layout or a section naming a region nothing declares, two regions that
+overlap, one region or one section declared by two packages, a section wanting a tag no region carries,
+two `first` sections in one region, an input section two rules would gather (one the script's own
+rules already gather, `.text.boot` among them, included), stacks or a heap larger than their region,
+an option that does not exist, belongs to a feature that is off, or is not an integer, and a `symbols`
+entry naming a symbol the script does not define are each refused, naming the key. So is a key
+misspelled inside one of the blocks:
+
+```text
+'memory.ram.orgin' is not something a memory region says — it takes 'origin', 'length', 'kind' and 'tags'
+```
+
+**A section nothing gathers is refused at the link, never left to the linker's orphan placement.** A
+`@section` the program writes is refused at its declaration, naming the module that wrote it:
+
+```text
+error: 'extra.fast' is placed in '.ramfunc' by '@section', and the generated linker script has no rule
+that gathers it — a section no 'sections' entry claims would be left to the linker's orphan placement.
+Give it a 'sections' entry, as 'sections { x { contents = [".ramfunc"], region = <region> } }', or use
+one the script already has: '.vectors', '.text', '.rodata', …
+```
+
+and one that C or an assembler's `.section` made is refused once the image is read back, which is how
+TinyUSB's buffers are caught on a build that leaves its `stm32h7` feature off.
+
+**A region too small for what the build puts in it is reported in the manifest's terms.** The build
+links again with every region widened, reads the sections and symbols of the image that link wrote, and
+says what each overflowing region was asked to hold, with the option or the line that sized each piece;
+the linker's own words follow. The measured image is the same whichever linker wrote it, so the report
+is too:
+
+```text
+error: the region 'dtcm' (128 KiB, stm32h7-board) is 8,192 bytes too small for what this build puts in
+it — data and stack, as layout.data and layout.stack say. The largest:
+        65,536  ucHeap                     (freertos heap_bytes = 65536, set by this project)
+        32,768  stack, core 0              (layout.stack)
+        24,576  big                        (main.sysl:9)
+        16,384  frame                      (main.sysl:7)
+  move one with layout.data = ram_d1, or place a section of your own with @section
+```
+
+#### Seeing it, and writing your own
+
+`sysl build --emit link` writes the script and prints its path (`--emit all` adds every config header),
+and the build still runs, so what is shown is what was used; `-v` names the script every link uses.
+**A `linker_script` in the root's target block, or in an enabled feature's, means none is generated**:
+the memory a board package declares is then the hand-written script's business, which is the escape
+hatch for a layout the grammar cannot say. A hosted build and a WebAssembly one are never given one.
 
 ### When the image has a `main`
 
@@ -2534,8 +2762,8 @@ config {
 ```
 
 `sysl build --emit config` prints the path of every header the build wrote and `--emit
-config:<package>` one of them; the build still runs, so what is shown is what it used. The linker-script
-kinds (`link`, `all`) arrive in 0.7.0 and are refused until then.
+config:<package>` one of them; the build still runs, so what is shown is what it used. `--emit link`
+prints the [generated linker script](#a-script-made-from-the-manifests)'s, and `--emit all` both.
 
 ### What is refused
 
