@@ -36,8 +36,18 @@ import sysl.container.{Map, map, Set, set}
 // - A `@pinned` value is never read whole once it has landed (`pinned.sysl` refuses the copy), so it
 //   never reaches a destination this file is asked about.
 //
-// What a call is handed is not here: a by-value argument is borrowed (`borrowing.sysl`), so a call
-// takes no count at its edge to be taken over.
+// **A local whose release can run a destructor lives to its scope's end** (`return_slot.sysl`'s
+// `runs_code`: a `Drop` type, or anything holding one). A destination that lasts at least as long
+// -- a binding of the same scope, a store, the function's result, a branch's value -- may take it
+// over, since its life then ends where the destination's does. One that may be gone first may not:
+// an owned parameter (`owned_params.sysl`), whose callee may keep it only in the call's result, and a
+// box being built, which may be a temporary of the statement. `chunk.column(0).i64s()` hands a view
+// of what the chunk owns; the column holding the chunk is gone at the statement's end, and the chunk
+// must not go with it. Nor is such a local handed into a branch's arms (`hand_in`), which would end
+// it where the arm does. A plain counted value has no such reader, so its last use still ends it.
+//
+// What a borrowing call is handed is not here: a by-value argument is borrowed (`borrowing.sysl`),
+// so a call takes no count at its edge to be taken over.
 
 // One function's state. `last_uses` is the statement being emitted's; `parts` the value each struct
 // or enum built in this function was made from, by the register it is in and the node that built it.
@@ -187,7 +197,7 @@ hand_in(e: *Emit, cond: Buf[TCondTerm]) -> Buf[(Val, Type)]
         for j in e.owned_marks.at(e.owned_marks.len() - 1)..<e.owned_slots.len()
             val s = e.owned_slots.at(j)
 
-            if reg_of(s.0) == slot && movable_type(s.1) then found = Some(j)
+            if reg_of(s.0) == slot && movable_type(s.1) && !runs_code(e, s.1) then found = Some(j)
 
         if found.is_some()
             out.push(e.owned_slots.at(found.unwrap()))
@@ -221,9 +231,10 @@ note_parts(e: *Emit, at: Span, made: Val, vals: Buf[Val])
     if e.moves.ready && reg_of(made) != "" then e.moves.parts.put(reg_of(made), (at, vals))
 
 // The count a destination of type `ty` needs for `v`, the value of `x`: taken over where `x` is
-// something this frame was going to give back, and retained otherwise.
-retain_moving(e: *Emit, x: TExpr, ty: Type, v: Val)
-    if e.moves.ready && !e.layout.indirect(ty) && texpr_type(x) == ty then take_over(e, x, ty, v)
+// something this frame was going to give back, and retained otherwise. A destination that may be
+// gone before the scope ends is not `lasting`, and takes no local whose release runs a destructor.
+retain_moving(e: *Emit, x: TExpr, ty: Type, v: Val, lasting: bool = true)
+    if e.moves.ready && !e.layout.indirect(ty) && texpr_type(x) == ty then take_over(e, x, ty, v, lasting)
     else retain_value(e, ty, v)
 end retain_moving
 
@@ -241,18 +252,18 @@ end retain_stored
 // **Nothing at all to take over is one copy**, through the type's own helper, so a value built only
 // of things the frame does not hold costs exactly what it cost before; anything to take is taken,
 // and the rest of the value retained beside it.
-private take_over(e: *Emit, x: TExpr, ty: Type, v: Val)
+private take_over(e: *Emit, x: TExpr, ty: Type, v: Val, lasting: bool)
     if !contains_counted(ty) || holds_nothing(x, ty) then return
 
-    if !takes_any(e, x, ty, v)
+    if !takes_any(e, x, ty, v, lasting)
         retain_value(e, ty, v)
         return
     end if
 
     *x.kind match
-        TLoad(name, _) -> forget_slot(e, local_at(e, name, ty).unwrap())
-        TStructNew(_, args) -> take_fields(e, x, v, args, built_fields(x, ty).unwrap())
-        TEnumNew(_, _, args) -> take_fields(e, x, v, args, built_fields(x, ty).unwrap())
+        TLoad(name, _) -> forget_slot(e, local_at(e, name, ty, lasting).unwrap())
+        TStructNew(_, args) -> take_fields(e, x, v, args, built_fields(x, ty).unwrap(), lasting)
+        TEnumNew(_, _, args) -> take_fields(e, x, v, args, built_fields(x, ty).unwrap(), lasting)
         _ -> forget_temp(e, temp_at(e, v, ty).unwrap())
 end take_over
 
@@ -278,17 +289,17 @@ private holds_nothing(x: TExpr, ty: Type) -> bool
 end holds_nothing
 
 // Whether taking over `x` would take anything, asked before any of it is done.
-private takes_any(e: *Emit, x: TExpr, ty: Type, v: Val) -> bool
+private takes_any(e: *Emit, x: TExpr, ty: Type, v: Val, lasting: bool) -> bool
     if !contains_counted(ty) then return false
 
     *x.kind match
-        TLoad(name, _) -> local_at(e, name, ty).is_some()
-        TStructNew(_, args) -> parts_take_any(e, x, ty, v, args)
-        TEnumNew(_, _, args) -> parts_take_any(e, x, ty, v, args)
+        TLoad(name, _) -> local_at(e, name, ty, lasting).is_some()
+        TStructNew(_, args) -> parts_take_any(e, x, ty, v, args, lasting)
+        TEnumNew(_, _, args) -> parts_take_any(e, x, ty, v, args, lasting)
         _ -> temp_at(e, v, ty).is_some()
 end takes_any
 
-private parts_take_any(e: *Emit, x: TExpr, ty: Type, v: Val, args: Buf[TExpr]) -> bool
+private parts_take_any(e: *Emit, x: TExpr, ty: Type, v: Val, args: Buf[TExpr], lasting: bool) -> bool
     val fields = built_fields(x, ty)
     val parts = parts_of(e, x, v, args)
 
@@ -297,7 +308,7 @@ private parts_take_any(e: *Emit, x: TExpr, ty: Type, v: Val, args: Buf[TExpr]) -
     for i in 0..<args.len()
         val fty = fields.unwrap().fields.at(i).1
 
-        if walked_part(e, fields.unwrap(), args.at(i), fty) && takes_any(e, args.at(i), fty, parts.unwrap().at(i))
+        if walked_part(e, fields.unwrap(), args.at(i), fty) && takes_any(e, args.at(i), fty, parts.unwrap().at(i), lasting)
             return true
 
     false
@@ -348,7 +359,7 @@ end variant_fields
 
 // A value built on the spot, taken over part by part: each counted field its part's own question,
 // and one this frame cannot hand over retained as the type's copy helper would have retained it.
-private take_fields(e: *Emit, x: TExpr, v: Val, args: Buf[TExpr], b: Built)
+private take_fields(e: *Emit, x: TExpr, v: Val, args: Buf[TExpr], b: Built, lasting: bool)
     val parts = parts_of(e, x, v, args).unwrap()
 
     for i in 0..<args.len()
@@ -357,7 +368,7 @@ private take_fields(e: *Emit, x: TExpr, v: Val, args: Buf[TExpr], b: Built)
 
         if !walked then continue
 
-        if walked_part(e, b, args.at(i), fty) then take_over(e, args.at(i), fty, parts.at(i))
+        if walked_part(e, b, args.at(i), fty) then take_over(e, args.at(i), fty, parts.at(i), lasting)
         else retain_value(e, fty, parts.at(i))
 end take_fields
 
@@ -375,9 +386,12 @@ private temp_at(e: *Emit, v: Val, ty: Type) -> Option[usize]
     None
 end temp_at
 
-// Where a local at its last use sits among the slots the innermost scope owns.
-private local_at(e: *Emit, name: string, ty: Type) -> Option[usize]
+// Where a local at its last use sits among the slots the innermost scope owns. A destination that
+// is not `lasting` takes no local whose release can run a destructor: that one lives to its scope's
+// end.
+private local_at(e: *Emit, name: string, ty: Type, lasting: bool) -> Option[usize]
     if !e.moves.last_uses.has(name) || !movable_type(ty) || e.owned_marks.is_empty() then return None
+    if !lasting && runs_code(e, ty) then return None
     if e.caller_exposed.has(OPAQUE) || e.caller_exposed.has(name) || is_promoted(e, name) then return None
 
     val slot = reg_of(local_slot(e, name))
