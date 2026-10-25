@@ -461,9 +461,14 @@ static const char *search_dirs(const char *const *names, const char *const *valu
 
     if (named || inherit) return named;
 
+#ifdef _CS_PATH
     size_t need = confstr(_CS_PATH, buf, n);
 
     if (need == 0 || need > n) snprintf(buf, n, "%s", "/usr/bin:/bin");
+#else
+    /* Bionic (Android) declares neither `confstr` nor `_CS_PATH`; its `execvp` falls back to this. */
+    snprintf(buf, n, "%s", "/usr/bin:/bin");
+#endif
 
     return buf;
 }
