@@ -2754,11 +2754,15 @@ Inside a strict body, **every floating-point operation at `f32` and `f64`** foll
   float read as an integer raises inexact when it drops a fraction, and one the integer cannot hold —
   or a NaN — raises invalid while it [saturates](/reference/expressions/#conversions-are-calls) as it
   does everywhere;
+- a conversion between `f16` and `f32` or `f64`, [below](#f16-conversions-and-nothing-else-at-f16);
 - `sqrt`, `floor`, `ceil`, `round` and `trunc` called on a float, and the intrinsics a program
   declares with `extern "llvm.…"`.
 
 Negation, `abs` and `copysign` touch the sign bit alone, round nothing and raise nothing, so they are
-what they always are. **A literal is a value, not an operation**: `0.1f32` is the binary32 nearest a
+what they always are. **A negation is the sign bit flipped where it is written**: `x + -y` is never
+made `x - y`, nor `(-a).mul_add(b, c)` a fused multiply-subtract, so where the answer is a NaN its sign
+is the one the expression as written gives it — Arm, which hands a NaN operand back with the sign it
+has, shows the difference. **A literal is a value, not an operation**: `0.1f32` is the binary32 nearest a
 tenth whatever the mode, and so is a `const`, which is worked out while compiling. An expression of
 literals is an operation like any other:
 
@@ -2873,6 +2877,67 @@ print(half(1.0f16))
 ```error
 a '@strict_fp' body computes at f32 and f64, the widths a floating-point unit performs under its environment, and this is f16
 ```
+
+#### `f16` conversions, and nothing else at `f16`
+
+The one operation at `f16` a strict body computes is a **conversion between it and `f32` or `f64`**,
+because AArch64's `fcvt` and an Arm core's `vcvtb` convert binary16 in one instruction, rounding in
+the mode in force and raising inexact, overflow, underflow and — for a signalling NaN — invalid. A
+narrowing from `f64` is rounded once, never twice through `f32`:
+
+```sysl
+import sysl.fenv.*
+
+@strict_fp
+narrowed(x: f32, d: f64) -> string
+    set_rounding(Upward)
+    val up = f16(x).bits()
+    set_rounding(NearestEven)
+    clear_flags()
+    val near = f16(x).bits()
+    val once = f16(d).bits()
+    f"$up%04x $near%04x inexact ${flags().inexact}, $once%04x"
+
+print(narrowed(f32.from_bits(0x3f801000), real.from_bits(0x3ff0020000001000)))
+```
+
+```output
+3c01 3c00 inexact true, 3c01
+```
+
+`1 + 2^-11` is halfway between binary16's `1.0` and the value above it: upward it goes up, to
+nearest to the even `1.0`. The `f64` is a little above that halfway, which rounding it to `f32` first
+would lose. An `f16` literal is a value like any other literal, IEEE's binary16 nearest it whatever
+the mode; [Arm's alternative half-precision format](/library/fenv/#alternative-half-precision)
+changes what a conversion produces.
+
+Arithmetic and comparison at `f16`, and a conversion between `f16` and an integer, stay refused. So
+is the conversion where it is a library call — on x86-64 and RISC-V, whose units have no binary16
+instruction in the targets sysl builds for — and one between `f16` and `f64` on a single-precision
+unit, a Cortex-M4F or M33, where it would be a call too, or two roundings through `f32`:
+
+```sysl target=thumbv7em-freestanding
+@strict_fp
+@export("narrowed")
+narrowed(d: f64) -> u16 = f16(d).bits()
+```
+
+```error
+'@strict_fp' asks the floating-point unit to follow its environment, and 'thumbv7em-freestanding''s unit is single precision, so a conversion between real and f16 is a library call, which has no environment to follow and raises nothing; narrowing through f32 instead would round twice, so convert an f32, or build for a target whose unit has double precision
+```
+
+```sysl target=x86_64-freestanding
+@strict_fp
+@export("narrowed")
+narrowed(x: f32) -> u16 = f16(x).bits()
+```
+
+```error
+'@strict_fp' asks the floating-point unit to follow its environment, and on 'x86_64-freestanding' a conversion between f32 and f16 is a library call, since the unit has no instruction converting f16
+```
+
+A Cortex-M7 with a double-precision unit (`thumbv7em-freestanding-dp`) converts between `f16` and
+`f64` in one `vcvtb`, and a strict body may.
 
 A float a machine computes in software — every float on a core with no floating-point unit, an `f64`
 on a Cortex-M4F, whose unit is single precision — has no environment to follow either, so it is

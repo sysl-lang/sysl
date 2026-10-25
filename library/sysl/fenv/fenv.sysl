@@ -2,7 +2,7 @@ module sysl.fenv
 @no_alloc
 
 /** The floating-point environment: the rounding mode, the five exception flags, and on Arm the
- * flush-to-zero and default-NaN controls.
+ * flush-to-zero, default-NaN and alternative half-precision controls and the input-denormal flag.
  *
  * **The environment belongs to the thread.** Each thread has its own control and status registers --
  * AArch64's FPCR and FPSR, x86-64's MXCSR, an Armv7-M or Armv8-M core's FPSCR, RISC-V's `fcsr` -- so
@@ -75,13 +75,25 @@ flags() -> FpFlags
             raised(s, underflow_bit()), raised(s, inexact_bit()))
 end flags
 
-/** Clears the five flags on this thread, leaving the controls as they are. */
+/** Clears the five flags on this thread, and on Arm the input-denormal flag with them, leaving the
+ * controls as they are.
+ */
 clear_flags()
     val all = (u64(1) << invalid_bit()) | (u64(1) << divide_bit()) | (u64(1) << overflow_bit()) |
-              (u64(1) << underflow_bit()) | (u64(1) << inexact_bit())
+              (u64(1) << underflow_bit()) | (u64(1) << inexact_bit()) | input_denormal_bits()
 
     set_status(status() & ~all)
 end clear_flags
+
+/** Whether, since the flags were last cleared, flush-to-zero has replaced a subnormal OPERAND with a
+ * zero: Arm's input-denormal flag, FPSR.IDC on AArch64 and FPSCR.IDC on an Arm core. A subnormal
+ * result that is flushed raises underflow instead, and with flush-to-zero off nothing raises this.
+ * It is sticky like the five, and `clear_flags` clears it with them.
+ *
+ * It is not one of IEEE 754's exceptions, so it is not a field of `FpFlags`, which every machine
+ * answers; this is an Arm flag, and a program asking for it elsewhere is refused at the call.
+ */
+input_denormal() -> bool = (status() & input_denormal_bits()) != 0
 
 /** Whether a subnormal result -- and, on x86-64, a subnormal operand -- is read as a zero of its sign. */
 flush_to_zero() -> bool = flush_bits() != 0 && (control() & flush_bits()) == flush_bits()
@@ -104,6 +116,28 @@ set_default_nan(on: bool)
     val cleared = control() & ~default_nan_bit()
 
     set_control(if on then cleared | default_nan_bit() else cleared)
+
+/** Whether a conversion to or from `f16` reads binary16 as Arm's alternative half-precision format
+ * rather than IEEE 754's: FPCR.AHP on AArch64, FPSCR.AHP on an Arm core.
+ *
+ * The alternative format spends the top exponent on numbers, up to 131008, instead of on infinities
+ * and NaNs. So with it on a conversion to `f16` turns a NaN into a zero and an infinity -- or a
+ * number past 131008 -- into the largest magnitude, raising invalid for each, and a conversion from
+ * `f16` reads `0x7c00` as 65536 rather than an infinity.
+ *
+ * The compiler knows `f16` only as IEEE's binary16: a literal, a `const` and whatever the optimizer
+ * works out while compiling are IEEE's bits, and LLVM's strict conversions model the rounding mode
+ * and the exceptions but not this control. So with it on, a conversion is the unit's -- and follows
+ * it -- only where the instruction runs: in a `@strict_fp` body of a value read at run time. Of a value
+ * the compiler can see, what it answers is not something a program can count on.
+ */
+alternative_half_precision() -> bool = (control() & alternative_half_bit()) != 0
+
+/** Turns Arm's alternative half-precision format on or off on this thread. */
+set_alternative_half_precision(on: bool)
+    val cleared = control() & ~alternative_half_bit()
+
+    set_control(if on then cleared | alternative_half_bit() else cleared)
 
 /** Runs `body` with `r` the rounding mode, and puts the mode back on every way out of it.
  *
@@ -253,6 +287,11 @@ private inexact_bit() -> u64 = 5
 private flush_bits() -> u64 = (u64(1) << 15) | (u64(1) << 6)
 private default_nan_bit() -> u64 = 0
 
+// MXCSR's bit 1, DE, is raised by any subnormal operand -- and not by one DAZ reads as zero -- which is
+// not what Arm's IDC says, so it is not answered for it.
+private input_denormal_bits() -> u64 = 0
+private alternative_half_bit() -> u64 = 0
+
 #elif riscv64 || riscv32
 
 // `frm` is bits 7:5 of `fcsr`; its fifth mode, to nearest with ties away from zero, is not one of
@@ -279,6 +318,8 @@ private underflow_bit() -> u64 = 1
 private inexact_bit() -> u64 = 0
 private flush_bits() -> u64 = 0
 private default_nan_bit() -> u64 = 0
+private input_denormal_bits() -> u64 = 0
+private alternative_half_bit() -> u64 = 0
 
 #else
 
@@ -305,5 +346,7 @@ private underflow_bit() -> u64 = 3
 private inexact_bit() -> u64 = 4
 private flush_bits() -> u64 = u64(1) << 24
 private default_nan_bit() -> u64 = u64(1) << 25
+private input_denormal_bits() -> u64 = u64(1) << 7
+private alternative_half_bit() -> u64 = u64(1) << 26
 
 #endif

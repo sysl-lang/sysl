@@ -1,0 +1,410 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.{Search, replace_all, split}
+
+// A negation in a `@strict_fp` body (`reference/attributes.md § @strict_fp`) is IEEE 754's `negate`:
+// the sign bit flipped, where it is written. Left to the back ends it is folded into the operation
+// beside it -- `x + -y` into `x - y`, `fma(-a, b, c)` into an `fmsub` whose multiplicands may be
+// swapped, `-fma(a, b, c)` into an `fnmadd` -- and each flips a different operand's sign, which a NaN
+// answer shows: Arm's operations hand back their NaN operand's sign as it is. Every program here is
+// built at -O0 and at -O2, which must agree, and the bits are worked out by hand beside each.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private sfn_ready() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+    end if
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+    end if
+
+    true
+end sfn_ready
+
+// The NaN signs asserted are Arm's: an operation answers its NaN operand with the sign it has.
+private sfn_on_aarch64() -> bool
+    if host_target().cpu != Aarch64
+        print("skipped: what is asserted is AArch64's NaN rules and this machine is not one")
+        return false
+    end if
+
+    true
+end sfn_on_aarch64
+
+private sfn_root(text: string) -> string
+    val root = replace_all(make_temp_dir("sysl-sfn").unwrap(), "//", "/")
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+    root
+end sfn_root
+
+private sfn_ran(text: string, level: string) -> string
+    val root = sfn_root(text)
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, level, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end sfn_ran
+
+private sfn_prints(text: string, expected: string)
+    for level in ["0", "2"]
+        assert_eq(sfn_ran(text, level), expected)
+end sfn_prints
+
+private sfn_ir(text: string, target: string) -> string
+    val root = sfn_root(text)
+
+    val out = emit_llvm_text(root, Some(target)) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> if made.report.is_empty() then made.text else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end sfn_ir
+
+private sfn_body(ir: string, name: string) -> string
+    val parts = split(ir, "\n}\n")
+
+    for i in 0..<parts.len
+        val lines = split(parts[i], "\n")
+
+        for j in 0..<lines.len
+            if lines[j].starts_with("define") && lines[j].contains("@" + name + "(") then return parts[i]
+
+    assert(false, ir)
+    ""
+end sfn_body
+
+private sfn_count(hay: string, needle: string) -> usize = split(hay, needle).len - 1
+
+private sfn_says(text: string, part: string) = assert(text.contains(part), s"expected '$part' in:\n$text")
+
+private sfn_lacks(text: string, part: string) = assert(!text.contains(part), s"did not expect '$part' in:\n$text")
+
+// -- where the sign lands -------------------------------------------------------------------------
+
+// Each function reads its operands from memory and writes its answer's bits back. The quiet NaN
+// 7fc12345 (7ff8000000012345 at binary64) is the one NaN in each operation, so the answer is that
+// NaN with whatever sign the operation was handed it with; inf * 0 is the default NaN, 7fc00000.
+private val sfn_signs_program: string = raw"""
+    extern "llvm.fma" fma32(a: f32, b: f32, c: f32) -> f32
+
+    // inf + -(inf * 0): the product is +NaN, negated -NaN, and the sum is that -NaN.
+    @strict_fp
+    mls(s: *[4]u32)
+        val p = f32.from_bits(s[1]) * f32.from_bits(s[2])
+        val q = -p
+        s[0] = (f32.from_bits(s[0]) + q).bits()
+
+    // fma(-0, NaN, x): the negation is the zero's, so the NaN keeps its sign.
+    @strict_fp
+    fms(s: *[4]u32)
+        s[0] = fma32(-f32.from_bits(s[1]), f32.from_bits(s[2]), f32.from_bits(s[0])).bits()
+
+    @strict_fp
+    sub(s: *[4]u32)
+        s[0] = (f32.from_bits(s[0]) - f32.from_bits(s[1])).bits()
+
+    @strict_fp
+    add_neg(s: *[4]u32)
+        s[0] = (f32.from_bits(s[0]) + -f32.from_bits(s[1])).bits()
+
+    @strict_fp
+    neg_self(s: *[4]u32)
+        s[0] = (-f32.from_bits(s[0])).mul_add(f32.from_bits(s[1]), f32.from_bits(s[2])).bits()
+
+    @strict_fp
+    neg_factor(s: *[4]u32)
+        s[0] = f32.from_bits(s[0]).mul_add(-f32.from_bits(s[1]), f32.from_bits(s[2])).bits()
+
+    @strict_fp
+    neg_answer(s: *[4]u32)
+        s[0] = (-(f32.from_bits(s[0]).mul_add(f32.from_bits(s[1]), f32.from_bits(s[2])))).bits()
+
+    @strict_fp
+    neg_abs(s: *[4]u32)
+        s[0] = (f32.from_bits(s[0]) + -f32.from_bits(s[1]).abs()).bits()
+
+    @strict_fp
+    abs_neg(s: *[4]u32)
+        s[0] = (f32.from_bits(s[0]) + (-f32.from_bits(s[1])).abs()).bits()
+
+    @strict_fp
+    neg_abs_fma(s: *[4]u32)
+        s[0] = (-f32.from_bits(s[0]).abs()).mul_add(f32.from_bits(s[1]), f32.from_bits(s[2])).bits()
+
+    @strict_fp
+    signed(s: *[4]u32)
+        s[0] = (f32.from_bits(s[0]) + f32.from_bits(s[1]).copysign(-f32.from_bits(s[2]))).bits()
+
+    @strict_fp
+    mls64(s: *[4]u64)
+        val q = -(f64.from_bits(s[1]) * f64.from_bits(s[2]))
+        s[0] = (f64.from_bits(s[0]) + q).bits()
+
+    @strict_fp
+    neg_self64(s: *[4]u64)
+        s[0] = (-f64.from_bits(s[0])).mul_add(f64.from_bits(s[1]), f64.from_bits(s[2])).bits()
+
+    @strict_fp
+    neg_answer64(s: *[4]u64)
+        s[0] = (-(f64.from_bits(s[0]).mul_add(f64.from_bits(s[1]), f64.from_bits(s[2])))).bits()
+
+    @strict_fp
+    sub64(s: *[4]u64)
+        s[0] = (f64.from_bits(s[0]) - f64.from_bits(s[1])).bits()
+
+    @strict_fp
+    add_neg64(s: *[4]u64)
+        s[0] = (f64.from_bits(s[0]) + -f64.from_bits(s[1])).bits()
+
+    show(name: string, s: [4]u32) = print(f"$name ${s[0]}%08x")
+
+    show64(name: string, s: [4]u64) = print(f"$name ${s[0]}%016x")
+
+    main()
+        var a: [4]u32 = [0x7F800000, 0, 0x7F800000, 0]
+        mls(&a)
+        show("mls", a)
+        a = [0x4B800001, 0, 0x7FC12345, 0]
+        fms(&a)
+        show("fms", a)
+        a = [0x3F800000, 0x7FC12345, 0, 0]
+        sub(&a)
+        show("sub", a)
+        a = [0x3F800000, 0x7FC12345, 0, 0]
+        add_neg(&a)
+        show("add_neg", a)
+        a = [0x40000000, 0x7FC12345, 0x3F800000, 0]
+        neg_self(&a)
+        show("neg_self", a)
+        a = [0x40000000, 0x7FC12345, 0x3F800000, 0]
+        neg_factor(&a)
+        show("neg_factor", a)
+        a = [0x40000000, 0x7FC12345, 0x3F800000, 0]
+        neg_answer(&a)
+        show("neg_answer", a)
+        a = [0x3F800000, 0x7FC12345, 0, 0]
+        neg_abs(&a)
+        show("neg_abs", a)
+        a = [0x3F800000, 0x7FC12345, 0, 0]
+        abs_neg(&a)
+        show("abs_neg", a)
+        a = [0x40000000, 0x7FC12345, 0x3F800000, 0]
+        neg_abs_fma(&a)
+        show("neg_abs_fma", a)
+        a = [0x3F800000, 0x7FC12345, 0x3F800000, 0]
+        signed(&a)
+        show("signed", a)
+        var b: [4]u64 = [0x7FF0000000000000, 0, 0x7FF0000000000000, 0]
+        mls64(&b)
+        show64("mls64", b)
+        b = [0x4000000000000000, 0x7FF8000000012345, 0x3FF0000000000000, 0]
+        neg_self64(&b)
+        show64("neg_self64", b)
+        b = [0x4000000000000000, 0x7FF8000000012345, 0x3FF0000000000000, 0]
+        neg_answer64(&b)
+        show64("neg_answer64", b)
+        b = [0x3FF0000000000000, 0x7FF8000000012345, 0, 0]
+        sub64(&b)
+        show64("sub64", b)
+        b = [0x3FF0000000000000, 0x7FF8000000012345, 0, 0]
+        add_neg64(&b)
+        show64("add_neg64", b)
+    """
+
+// `x - y` hands back y's NaN as it is and `x + -y` the NaN negated; `(-a).mul_add(b, c)` negates a
+// and not the NaN b, where an `fmsub` with its multiplicands swapped would negate b;
+// `-(a.mul_add(b, c))` negates the answer, where an `fnmadd` would negate a and c and leave b's
+// NaN as it is. `abs` and `copysign` set the sign they are asked for, and a negation beside them is
+// still one flip where it is written.
+@test("a strict negation flips the sign where it is written, beside +, -, mul_add, abs and copysign")
+sfn_nan_signs()
+    if !sfn_ready() || !sfn_on_aarch64() then return
+
+    sfn_prints(sfn_signs_program,
+               "mls ffc00000\n" +
+               "fms 7fc12345\n" +
+               "sub 7fc12345\n" +
+               "add_neg ffc12345\n" +
+               "neg_self 7fc12345\n" +
+               "neg_factor ffc12345\n" +
+               "neg_answer ffc12345\n" +
+               "neg_abs ffc12345\n" +
+               "abs_neg 7fc12345\n" +
+               "neg_abs_fma 7fc12345\n" +
+               "signed ffc12345\n" +
+               "mls64 fff8000000000000\n" +
+               "neg_self64 7ff8000000012345\n" +
+               "neg_answer64 fff8000000012345\n" +
+               "sub64 7ff8000000012345\n" +
+               "add_neg64 fff8000000012345\n")
+end sfn_nan_signs
+
+// The operands come from the arguments' count, so nothing about them is known while compiling.
+private val sfn_shapes_program: string = raw"""
+    import sysl.math.Float
+
+    @strict_fp
+    add_neg[T: Float](x: T, y: T) -> T = x + -y
+
+    @strict_fp
+    lanes(x: f32, n: f32) -> string
+        val v: <4>f32 = [n, x, n, x]
+        val w: <4>f32 = [x, x, x, x]
+        val r = w + -v
+        f"${r[0].bits()}%08x ${r[1].bits()}%08x ${r[2].bits()}%08x"
+
+    @strict_fp
+    closed(x: f32, n: f32) -> u32
+        val f = (y: f32) -> x + -y
+        f(n).bits()
+
+    @strict_fp
+    nested(x: f64, n: f64) -> u64
+        inner(y: f64) -> f64 = x + -y
+
+        inner(n).bits()
+
+    // An f16 is negated as its bits, and then widened: -7e45 is fe45, ffc8a000 at binary32.
+    @strict_fp
+    widened16(x: f16, y: f32) -> u32 = (y + f32(-x)).bits()
+
+    main(args: []string)
+        val k = u32(args.len) - 1
+        val one = f32.from_bits(0x3F800000 + k)
+        val nan = f32.from_bits(0x7FC12345 + k)
+        val one64 = f64.from_bits(0x3FF0000000000000 + u64(k))
+        val nan64 = f64.from_bits(0x7FF8000000012345 + u64(k))
+
+        print(f"${add_neg(one, nan).bits()}%08x ${add_neg(one64, nan64).bits()}%016x")
+        print(lanes(one, nan))
+        print(f"${closed(one, nan)}%08x ${nested(one64, nan64)}%016x")
+        print(f"${widened16(f16.from_bits(0x7E45 + u16(k)), one)}%08x")
+    """
+
+@test("a strict negation stays a flip in a generic at f32 and f64, a vector, a closure, a nested function and an f16")
+sfn_shapes()
+    if !sfn_ready() || !sfn_on_aarch64() then return
+
+    sfn_prints(sfn_shapes_program,
+               "ffc12345 fff8000000012345\nffc12345 00000000 ffc12345\nffc12345 fff8000000012345\n" +
+               "ffc8a000\n")
+end sfn_shapes
+
+// -- the lowering ---------------------------------------------------------------------------------
+
+private val sfn_ir_program: string = raw"""
+    @strict_fp
+    add_neg(x: f32, y: f64) -> f64 = f64(-x) + -y
+
+    @strict_fp
+    lanes(v: <4>f32) -> <4>f32 = v + -v
+
+    print(add_neg(1.0f32, 2.0), lanes([1.0, 2.0, 3.0, 4.0])[0])
+    """
+
+// The operand and the answer each pass an empty `asm` in a floating-point register of the machine's
+// own kind, and between them is one `fneg`; a vector is fenced a lane at a time.
+@test("a strict negation is one fneg between two fences, in each machine's float register, lane by lane")
+sfn_fenced_in_ir()
+    if !sfn_ready() then return
+
+    for (target, f32_reg, f64_reg) in [("aarch64-freestanding", "w", "w"), ("x86_64-freestanding", "x", "x"),
+                                       ("thumbv7em-freestanding-dp", "t", "w")]
+        val ir = sfn_ir(sfn_ir_program, target)
+        val body = sfn_body(ir, "add_neg")
+        val f32_fence = s"call float asm sideeffect \"\", \"=$f32_reg,0\"(float "
+        val f64_fence = s"call double asm sideeffect \"\", \"=$f64_reg,0\"(double "
+
+        assert_eq(sfn_count(body, " = fneg float "), 1, body)
+        assert_eq(sfn_count(body, " = fneg double "), 1, body)
+        sfn_says(body, f32_fence)
+        sfn_says(body, f64_fence)
+
+        // A 32-bit Arm core fences the strict addition's operand and answer too, four lanes each.
+        val lanes = sfn_body(ir, "lanes")
+
+        assert_eq(sfn_count(lanes, " = fneg <4 x float> "), 1, lanes)
+        assert_eq(sfn_count(lanes, f32_fence), if target.starts_with("thumb") then 16 else 8, lanes)
+end sfn_fenced_in_ir
+
+// An ordinary function's negation is the bare `fneg`, with no fence, strict body beside it or not.
+@test("an ordinary function's negation is a bare fneg and its IR is the same beside a strict one")
+sfn_ordinary_unchanged()
+    if !sfn_ready() then return
+
+    val ordinary = "plain(x: f32, y: f32) -> f32 = x + -y\n"
+    val alone = sfn_ir(ordinary + "print(plain(1.0f32, 2.0f32))\n", "aarch64-freestanding")
+    val beside = sfn_ir(ordinary + "@strict_fp\nstrict(x: f32, y: f32) -> f32 = x + -y\n" +
+                        "print(plain(1.0f32, 2.0f32), strict(1.0f32, 2.0f32))\n", "aarch64-freestanding")
+
+    assert_eq(sfn_body(alone, "plain"), sfn_body(beside, "plain"))
+    sfn_says(sfn_body(alone, "plain"), " = fneg float ")
+    sfn_lacks(sfn_body(alone, "plain"), "asm")
+end sfn_ordinary_unchanged
+
+// -- a board ----------------------------------------------------------------------------------------
+
+private val sfn_board_program: string = raw"""
+    extern "llvm.fma" fma32(a: f32, b: f32, c: f32) -> f32
+
+    @strict_fp
+    @export("add_neg")
+    add_neg(x: f32, y: f32) -> f32 = x + -y
+
+    @strict_fp
+    @export("fms")
+    fms(a: f32, b: f32, c: f32) -> f32 = fma32(-a, b, c)
+
+    @strict_fp
+    @export("neg_fma")
+    neg_fma(a: f32, b: f32, c: f32) -> f32 = -fma32(a, b, c)
+
+    @export("main")
+    boot() -> i32 = 0
+    """
+
+// On a Cortex-M4F `x + -y` is a vneg.f32 and a vadd.f32, never a vsub.f32; `fma(-a, b, c)` is a
+// vneg.f32 and a vfma.f32, never a vfms.f32; and `-fma(a, b, c)` is the vfma.f32 and then the vneg.
+@test("on a Cortex-M4F a strict negation is a vneg.f32 where it is written, never folded into vsub or vfms")
+sfn_cortex_m4()
+    val add = fx2_board_code(sfn_board_program, "thumbv7em-freestanding", "add_neg")
+
+    if add.is_none() then return
+
+    sfn_says(add.unwrap(), "vneg.f32")
+    sfn_says(add.unwrap(), "vadd.f32")
+    sfn_lacks(add.unwrap(), "vsub.f32")
+
+    val fms = fx2_board_code(sfn_board_program, "thumbv7em-freestanding", "fms").unwrap()
+
+    sfn_says(fms, "vneg.f32")
+    sfn_says(fms, "vfma.f32")
+    sfn_lacks(fms, "vfms.f32")
+    sfn_lacks(fms, "vfnm")
+
+    val neg = fx2_board_code(sfn_board_program, "thumbv7em-freestanding", "neg_fma").unwrap()
+
+    assert(neg.index_of("vfma.f32").unwrap_or(9999) < neg.index_of("vneg.f32").unwrap_or(0), neg)
+    sfn_lacks(neg, "vfnm")
+end sfn_cortex_m4

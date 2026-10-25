@@ -1,11 +1,12 @@
 ---
 title: The fenv module
-summary: "`sysl.fenv` — the floating-point environment: the rounding mode, the five exception flags, flush-to-zero and default-NaN, `with_rounding`, and the `@strict_fp` bodies that follow them."
+summary: "`sysl.fenv` — the floating-point environment: the rounding mode, the five exception flags, flush-to-zero and default-NaN, Arm's input-denormal flag and alternative half-precision, `with_rounding`, and the `@strict_fp` bodies that follow them."
 weight: 76
 ---
 
 `sysl.fenv` reads and sets the **floating-point environment** of the thread it runs on: the
-rounding mode, the five IEEE 754 exception flags, and the flush-to-zero and default-NaN controls.
+rounding mode, the five IEEE 754 exception flags, the flush-to-zero and default-NaN controls, and on
+Arm the input-denormal flag and the alternative half-precision control.
 What follows the environment is a [`@strict_fp`](/reference/attributes/#strict-fp-floating-point-that-follows-the-environment-it-runs-in)
 body; an ordinary one's operations may be worked out while compiling or moved past a call, so the
 mode is no promise about them.
@@ -45,6 +46,8 @@ even `1.0`, upward to the float above, and down and toward zero to `1.0`.
 | `flags()`, `clear_flags()` | the flags raised since they were last cleared, and clearing them |
 | `flush_to_zero()`, `set_flush_to_zero(on)` | a subnormal read as a zero of its sign |
 | `default_nan()`, `set_default_nan(on)` | a NaN result as the default NaN rather than an operand's |
+| `input_denormal()` | Arm's flag for a subnormal operand flush-to-zero replaced; `clear_flags` clears it |
+| `alternative_half_precision()`, `set_alternative_half_precision(on)` | Arm's alternative `f16` format in conversions |
 
 `RoundingMode` is the direction the unit rounds every operation in, and is not core's
 `Rounding`, which says how [a decimal](/library/decimal/) is rounded to a number of places when it
@@ -146,6 +149,96 @@ on() = set_default_nan(true)
 ```
 
 A RISC-V unit computes every subnormal exactly, so flush-to-zero is refused there the same way.
+
+## The input-denormal flag
+
+Under flush-to-zero an Arm unit reads a subnormal **operand** as a zero of its sign, and says so by
+raising its input-denormal flag, IDC (bit 7 of AArch64's FPSR and of an Arm core's FPSCR).
+`input_denormal()` reads it. Like the five it is sticky, and `clear_flags` clears it with them:
+
+```sysl
+import sysl.fenv.*
+
+@strict_fp
+summed(tiny: f32, small: f32) -> string
+    set_flush_to_zero(true)
+    clear_flags()
+    val flushed = (tiny + small).bits()
+    val raised = input_denormal()
+    set_flush_to_zero(false)
+    clear_flags()
+    val exact = (tiny + small).bits()
+    f"$flushed%08x $raised, $exact%08x ${input_denormal()}"
+
+print(summed(f32.from_bits(1), f32.from_bits(0x00800000)))
+```
+
+```output
+00800000 true, 00800001 false
+```
+
+The smallest subnormal added to the smallest normal is exact, and raises nothing, until
+flush-to-zero reads the subnormal as zero. A subnormal *result* that is flushed raises underflow,
+not this. It is not one of IEEE 754's exceptions, so it is no field of `FpFlags`, which every machine
+answers. x86-64's MXCSR has a denormal-operand flag, DE, but it is raised by every subnormal operand
+and by none that DAZ reads as zero, which is close to the opposite; so off Arm the call is refused
+rather than answered with something else:
+
+```sysl target=x86_64-freestanding
+import sysl.fenv.*
+
+@export("flushed")
+flushed() -> bool = input_denormal()
+```
+
+```error
+'input_denormal' is the input-denormal flag of an Arm unit, raised when flush-to-zero replaces a subnormal operand, and 'x86_64-freestanding' has none — MXCSR's denormal-operand flag is raised by every subnormal operand, and by none that DAZ reads as zero, which is not what IDC says
+```
+
+## Alternative half-precision
+
+An Arm unit can read `f16` in a format of its own (AHP, bit 26 of FPCR and of FPSCR) that spends the
+top exponent on numbers up to 131008 instead of on infinities and NaNs. It changes what a conversion
+to or from `f16` produces: `0x7c00` widens to 65536 rather than an infinity, a narrowing past 131008
+saturates to `0x7fff`, and a NaN narrows to a zero, both raising invalid. Arithmetic at `f16` is
+IEEE's whatever it says.
+
+```sysl
+import sysl.fenv.*
+
+@strict_fp
+widened(h: f16) -> string
+    val ieee = f32(h).bits()
+    set_alternative_half_precision(true)
+    val alternative = f32(h).bits()
+    val on = alternative_half_precision()
+    set_alternative_half_precision(false)
+    f"$ieee%08x $alternative%08x $on"
+
+print(widened(f16.from_bits(0x7c00)))
+```
+
+```output
+7f800000 47800000 true
+```
+
+**The compiler knows `f16` only as IEEE's binary16.** A literal, a `const` and whatever the optimizer
+works out while compiling are IEEE's bits, and LLVM's strict conversions model the rounding mode and
+the exceptions, not this control. So with it on, a conversion follows it where the unit's instruction
+runs — in a [`@strict_fp`](/reference/attributes/#strict-fp-floating-point-that-follows-the-environment-it-runs-in)
+body, of a value read at run time — and what one the compiler can see answers is not something a
+program can count on. Off Arm, `f16` is IEEE's always, and the control is refused:
+
+```sysl target=x86_64-freestanding
+import sysl.fenv.*
+
+@export("alternative")
+alternative() = set_alternative_half_precision(true)
+```
+
+```error
+'set_alternative_half_precision' is the alternative half-precision control of an Arm unit, and 'x86_64-freestanding' has none — its f16 is IEEE 754's binary16 always
+```
 
 ## Where there is no environment
 

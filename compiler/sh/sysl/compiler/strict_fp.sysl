@@ -9,7 +9,9 @@ import sysl.buf.{Buf, buf}
 //
 // - **an operation at `f16`, `bf16` or `f128`.** A strict body computes at `f32` and `f64`, the two
 //   widths every unit sysl targets performs in hardware under its environment; the other three are
-//   widened, emulated or called on most of them, and are not made strict.
+//   widened, emulated or called on most of them, and are not made strict. The one exception is a
+//   conversion between `f16` and `f32` or `f64` on AArch64 and an Arm core, whose units convert
+//   binary16 in one instruction under the environment.
 // - **an operation the target does in software** -- every float on a core with no floating-point
 //   unit, an `f64` on one whose unit is single precision. A routine has no environment to follow and
 //   raises nothing.
@@ -63,14 +65,53 @@ private arithmetic_op(op: string) -> bool = op == "+" || op == "-" || op == "*" 
 
 // A conversion is a float operation where either side is a float, and its integer side is held to what
 // the unit converts.
-private conversion_refusal(t: Target, from: Type, to: Type) -> Option[string] = width_refusal(t, from) match
-    Some(m) -> Some(m)
-    None -> width_refusal(t, to) match
+private conversion_refusal(t: Target, from: Type, to: Type) -> Option[string]
+    if is_half(from) && binary_lane(to) then return half_conversion_refusal(t, to, from, to)
+    if is_half(to) && binary_lane(from) then return half_conversion_refusal(t, from, from, to)
+
+    width_refusal(t, from) match
         Some(m) -> Some(m)
-        None ->
-            if float_lane(from).is_some() then wide_integer_refusal(t, to, from)
-            else if float_lane(to).is_some() then wide_integer_refusal(t, from, to)
-            else None
+        None -> width_refusal(t, to) match
+            Some(m) -> Some(m)
+            None ->
+                if float_lane(from).is_some() then wide_integer_refusal(t, to, from)
+                else if float_lane(to).is_some() then wide_integer_refusal(t, from, to)
+                else None
+end conversion_refusal
+
+// **A conversion between `f16` and `f32` or `f64` is the one operation at `f16` a strict body
+// computes**, where the unit has the instruction: AArch64's `fcvt`, an Arm core's `vcvtb` -- between
+// `f16` and `f64` only on a unit with double precision, which the `f64` side asks already, so it is
+// never two roundings through `f32`. Elsewhere the conversion is a library call.
+private half_conversion_refusal(t: Target, wide: Type, from: Type, to: Type) -> Option[string]
+    val double = float_lane(wide) match
+        Some(Floating(bits, _)) -> bits == 64
+        _ -> false
+
+    if double && t.cpu == Thumb && t.fp_registers() && !t.fp_double_registers()
+        val twice = if is_half(to) then "; narrowing through f32 instead would round twice, so" else ";"
+
+        return Some(s"'@strict_fp' asks the floating-point unit to follow its environment, and '${t.name}''s unit is single precision, so a conversion between ${type_show(from)} and ${type_show(to)} is a library call, which has no environment to follow and raises nothing$twice convert an f32, or build for a target whose unit has double precision")
+    end if
+
+    width_refusal(t, wide) match
+        Some(m) -> return Some(m)
+        None -> ()
+
+    if t.cpu == Aarch64 || t.cpu == Thumb then return None
+
+    Some(s"'@strict_fp' asks the floating-point unit to follow its environment, and on '${t.name}' a conversion between ${type_show(from)} and ${type_show(to)} is a library call, since the unit has no instruction converting f16 — and a library call has no environment to follow and raises nothing; compute this outside a '@strict_fp' body")
+end half_conversion_refusal
+
+// Whether `ty` is IEEE's binary16, or a vector of it.
+private is_half(ty: Type) -> bool = float_lane(ty) match
+    Some(Floating(bits, brain)) -> bits == 16 && !brain
+    _ -> false
+
+// Whether `ty` is `f32` or `f64`, or a vector of one.
+private binary_lane(ty: Type) -> bool = float_lane(ty) match
+    Some(Floating(bits, brain)) -> !brain && (bits == 32 || bits == 64)
+    _ -> false
 
 // **An integer wider than the machine's word converts in software**: a 32-bit Arm core reads an `i64`
 // as a float with `__aeabi_l2f`, and every machine reads an `i128` with `__floattisf`. The library
@@ -131,7 +172,8 @@ end width_refusal
 
 // **`sysl.fenv` is built whole wherever the library is**, as `sysl.sync` is, and reaches registers a
 // machine may not have: no environment at all on a core with no floating-point unit, on x86's x87
-// and on WebAssembly; no default-NaN control on x86-64 and RISC-V, and no flush-to-zero on RISC-V. So
+// and on WebAssembly; no default-NaN control on x86-64 and RISC-V, no flush-to-zero on RISC-V, and
+// neither the input-denormal flag nor the alternative half-precision control off Arm. So
 // what is refused is the program's call that arrives there (`atomic_reach.sysl`'s way), with the
 // reason, and a program that never names the module hears nothing.
 check_fenv_reach(a: &Analysis, funcs: Buf[TFunc], vtables: Buf[TVtable])
@@ -139,8 +181,9 @@ check_fenv_reach(a: &Analysis, funcs: Buf[TFunc], vtables: Buf[TVtable])
     val none = fenv_absent(t)
     val no_dn = t.cpu == X86_64 || t.cpu == Riscv64 || t.cpu == Riscv32
     val no_fz = t.cpu == Riscv64 || t.cpu == Riscv32
+    val no_arm = t.cpu != Aarch64 && t.cpu != Thumb
 
-    if none.is_none() && !no_dn && !no_fz then return
+    if none.is_none() && !no_dn && !no_fz && !no_arm then return
 
     var seeds: Buf[string] = buf()
 
@@ -151,8 +194,10 @@ check_fenv_reach(a: &Analysis, funcs: Buf[TFunc], vtables: Buf[TVtable])
 
         val dn = n == "sysl.fenv.default_nan" || n == "sysl.fenv.set_default_nan"
         val fz = n == "sysl.fenv.flush_to_zero" || n == "sysl.fenv.set_flush_to_zero"
+        val arm = n == "sysl.fenv.input_denormal" || n == "sysl.fenv.alternative_half_precision" ||
+                  n == "sysl.fenv.set_alternative_half_precision"
 
-        if none.is_some() || (dn && no_dn) || (fz && no_fz) then seeds.push(f.name)
+        if none.is_some() || (dn && no_dn) || (fz && no_fz) || (arm && no_arm) then seeds.push(f.name)
 
     if seeds.is_empty() then return
 
@@ -194,7 +239,14 @@ private blame_fenv(a: &Analysis, t: Target, scope: Scope, walk: &Reaches, none: 
 
     val name = seed["sysl.fenv.".len..<seed.len]
 
-    if name.contains("default_nan")
+    if name == "input_denormal"
+        val why = if t.cpu == X86_64 then "MXCSR's denormal-operand flag is raised by every subnormal operand, and by none that DAZ reads as zero, which is not what IDC says"
+                  else "a RISC-V unit computes every subnormal exactly, so none is replaced"
+
+        a.fault(scope, e.span, s"'$name' is the input-denormal flag of an Arm unit, raised when flush-to-zero replaces a subnormal operand, and '${t.name}' has none — $why")
+    else if name.contains("alternative_half")
+        a.fault(scope, e.span, s"'$name' is the alternative half-precision control of an Arm unit, and '${t.name}' has none — its f16 is IEEE 754's binary16 always")
+    else if name.contains("default_nan")
         val why = if t.cpu == X86_64 then "an SSE operation that answers a NaN always answers its NaN operand's, made quiet"
                   else "a RISC-V operation that answers a NaN always answers the canonical one, so the mode is always on"
 
