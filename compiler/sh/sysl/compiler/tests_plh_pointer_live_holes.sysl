@@ -1,0 +1,337 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.text.Search
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// The counted-pointer rule (`counted_pointers.sysl`) on the paths it once lost the pointer on: a
+// function whose result is read off its body, a binding a match arm or a loop takes out of a value
+// made for it, a `defer` run by a `break`, `continue`, `return` or `?`, a pointer kept in a local
+// aggregate and read back out, and a callee handed the storage that moves it. Each refused program
+// read freed memory under ASan before the rule followed it; each accepted one is its near miss.
+
+private plh_ready() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+
+    true
+end plh_ready
+
+private plh_root(text: string) -> string
+    val root = make_temp_dir("sysl-pointer-holes").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+    root
+
+private plh_ran(text: string) -> string
+    val root = plh_root(text)
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> if out.status.ok() then out.text else s"it did not exit zero: ${out.text}"
+end plh_ran
+
+private plh_report(text: string) -> string
+    val root = plh_root(text)
+
+    val out = emit_llvm_text(s"$root/main.sysl", None) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> if made.report.is_empty() then "accepted" else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+
+private plh_refused(text: string, part: string)
+    val out = plh_report(text)
+
+    assert(out.contains(part), s"expected '$part' in: $out")
+
+private plh_head() -> string = "import sysl.buf.*\n\n"
+
+private plh_moves(name: string, member: string) -> string =
+    s"'$name' is a pointer to an element whose storage '$member' could move or give up, since it is " +
+    "'@relocates', and it is used after this call — so it could be left pointing at freed memory. " +
+    "Make the call before taking the address, or after the pointer's last use"
+
+private plh_holds(name: string, member: string) -> string =
+    s"'$name' holds a pointer to an element whose storage '$member' could move or give up, since it " +
+    "is '@relocates', and it is used after this call — so it could be left pointing at freed memory. " +
+    "Make the call before taking the address, or after the pointer's last use"
+
+private plh_block(name: string, owner: string) -> string =
+    s"'$name' points into storage '$owner' holds, and '$owner' was let go of where its block ended — " +
+    s"so this would read freed memory. Use the pointer inside that block, or declare '$owner' in a " +
+    "block that holds the pointer's uses too"
+
+private plh_after(name: string, callee: string, member: string, param: string) -> string =
+    s"'$name' is a pointer into storage '$callee' could move or give up, since it calls '@relocates' " +
+    s"'$member' on its parameter '$param', and it is used after this call — so it could be left " +
+    "pointing at freed memory. Make the call before taking the address, or after the pointer's last use"
+
+private plh_handed(callee: string, member: string, param: string) -> string =
+    s"this pointer is a pointer into storage this call also hands '$callee', which could move or give " +
+    s"it up, since it calls '@relocates' '$member' on its parameter '$param' — so it could read freed " +
+    "memory. Make the call before taking the address, or take the address inside the callee"
+
+private plh_consumed(name: string, member: string) -> string =
+    s"'$name' is read here after '$name.$member()' took everything it held — '$member' is " +
+    s"'@consumes', so '$name' has nothing in it on this path until it is assigned again. Read what " +
+    "the call answered instead"
+
+// The body every grown-buffer program shares: `b` holding 41, and the line that grows it.
+private plh_filled() -> string = "    val b: Buf[int] = buf()\n    b.push(41)\n"
+
+private plh_grow() -> string = "    for i in 0..<100 do b.push(i)\n"
+
+// -- a result read off the body ----------------------------------------------------------------------
+
+@test("a function whose result is read off its body is held to the rule, as a free function, a method, a generic and a recursive one")
+plh_inferred_results_refused()
+    if !plh_ready() then return
+
+    plh_refused(plh_head() + "run()\n" + plh_filled() + "    val p = &b[0]\n" + plh_grow() +
+                "    *p + 1\n\nprint(run())\n", plh_moves("p", "push"))
+    plh_refused(plh_head() + "struct S\n    n: int\n\n    run(self)\n        val b: Buf[int] = buf()\n" +
+                "        b.push(41)\n        val p = &b[0]\n        for i in 0..<100 do b.push(i)\n" +
+                "        *p + self.n\n\nprint(S(1).run())\n", plh_moves("p", "push"))
+    plh_refused(plh_head() + "run[T](x: T)\n    val b: Buf[T] = buf()\n    b.push(x)\n    val p = &b[0]\n" +
+                "    for i in 0..<100 do b.push(x)\n    *p\n\nprint(run(41))\n", plh_moves("p", "push"))
+    plh_refused(plh_head() + "run(n: int)\n    if n > 0 then return run(n - 1)\n" + plh_filled() +
+                "    val p = &b[0]\n" + plh_grow() + "    *p + 1\n\nprint(run(2))\n",
+                plh_moves("p", "push"))
+
+@test("a read after a '@consumes' call is refused in a function whose result is read off its body and in the entry file")
+plh_consumes_inferred_and_entry_refused()
+    if !plh_ready() then return
+
+    plh_refused(plh_head() + "count(b: Buf[int])\n    val f = b.freeze()\n\n    f.len() + b.len()\n\n" +
+                "print(count(buf()))\n", plh_consumed("b", "freeze"))
+    plh_refused(plh_head() + "var b: Buf[int] = buf()\n\nb.push(1)\nb.push(2)\n\nval f = b.freeze()\n\n" +
+                "print(f.len(), b.len())\n", plh_consumed("b", "freeze"))
+
+@test("an entry file that assigns a frozen buffer again before reading it runs")
+plh_entry_consumes_reassigned_runs()
+    if !plh_ready() then return
+
+    assert_eq(plh_ran(plh_head() + "var b: Buf[int] = buf()\n\nb.push(1)\nb.push(2)\n\n" +
+                      "val f = b.freeze()\n\nb = buf()\nb.push(7)\nprint(f.len(), b.len(), b[0])\n"),
+              "2 1 7\n")
+
+// -- what a pattern binds out of a value made for it -------------------------------------------------
+
+private plh_make_one() -> string =
+    plh_head() + "make() -> Option[Buf[int]]\n    val b: Buf[int] = buf()\n    b.push(41)\n    Some(b)\n\n"
+
+private plh_make_many() -> string =
+    plh_head() + "make() -> Buf[Buf[int]]\n    val bs: Buf[Buf[int]] = buf()\n" +
+    "    val b: Buf[int] = buf()\n    b.push(41)\n    bs.push(b)\n    bs\n\n"
+
+@test("a pointer into what a match arm bound out of a value made for the match is refused after the arm")
+plh_arm_binding_refused()
+    if !plh_ready() then return
+
+    plh_refused(plh_make_one() + "run() -> int\n    var x = 0\n    var p = &x\n    make() match\n" +
+                "        Some(v) -> p = &v[0]\n        None -> x = 1\n    *p + 1\n\nprint(run())\n",
+                plh_block("p", "v"))
+
+    // An arm left by a `break` lets its binding go just the same.
+    plh_refused(plh_make_one() + "run() -> int\n    var x = 0\n    var p = &x\n    loop\n" +
+                "        make() match\n            Some(v) ->\n                p = &v[0]\n" +
+                "                break\n            None -> break\n    *p + 1\n\nprint(run())\n",
+                plh_block("p", "v"))
+
+    // And so does one in a generic function.
+    plh_refused(plh_head() + "make[T](x: T) -> Option[Buf[T]]\n    val b: Buf[T] = buf()\n    b.push(x)\n" +
+                "    Some(b)\n\nrun[T](x: T) -> T\n    var y = x\n    var p = &y\n    make(x) match\n" +
+                "        Some(v) -> p = &v[0]\n        None -> y = x\n    *p\n\nprint(run(41))\n",
+                plh_block("p", "v"))
+
+@test("a pointer into what an 'is' test bound out of a value made for it is refused after the branch")
+plh_is_binding_refused()
+    if !plh_ready() then return
+
+    plh_refused(plh_make_one() + "run() -> int\n    var x = 0\n    var p = &x\n" +
+                "    if make() is Some(v) then p = &v[0]\n    *p + 1\n\nprint(run())\n", plh_block("p", "v"))
+
+@test("a pointer into a loop's element taken out of a sequence made for the loop is refused after the turn")
+plh_for_element_refused()
+    if !plh_ready() then return
+
+    plh_refused(plh_make_many() + "run() -> int\n    var x = 0\n    var p = &x\n    for v in make()\n" +
+                "        p = &v[0]\n    *p + 1\n\nprint(run())\n", plh_block("p", "v"))
+
+    // A method's loop is the same loop.
+    plh_refused(plh_make_many() + "struct S\n    n: int\n\n    run(self) -> int\n        var x = self.n\n" +
+                "        var p = &x\n        for v in make()\n            p = &v[0]\n        *p\n\n" +
+                "print(S(1).run())\n", plh_block("p", "v"))
+
+@test("a binding out of a place, and a pointer used inside the arm or the turn, are accepted and run")
+plh_bindings_accepted()
+    if !plh_ready() then return
+
+    // The local the arm matched on still holds the buffer after the arm.
+    assert_eq(plh_ran(plh_make_one() + "run() -> int\n    var x = 0\n    var p = &x\n    val o = make()\n" +
+                      "    o match\n        Some(v) -> p = &v[0]\n        None -> x = 1\n    *p + 1\n\n" +
+                      "print(run())\n"), "42\n")
+
+    // So does the local the loop walks, and a pointer read inside its own turn is read in time.
+    assert_eq(plh_ran(plh_make_many() + "run() -> int\n    var x = 0\n    var p = &x\n    var n = 0\n" +
+                      "    val bs = make()\n    for v in bs\n        p = &v[0]\n    for v in make()\n" +
+                      "        n += *&v[0]\n    *p + n - 40\n\nprint(run())\n"), "42\n")
+
+    // A pointer read inside the arm that bound its buffer is read in time.
+    assert_eq(plh_ran(plh_make_one() + "run() -> int\n    make() match\n        Some(v) -> *&v[0] + 1\n" +
+                      "        None -> 0\n\nprint(run())\n"), "42\n")
+
+// -- a `defer` run by a jump --------------------------------------------------------------------------
+
+@test("a 'defer' reading a stranded pointer is refused when a 'break', 'continue', 'return' or '?' runs it")
+plh_defer_on_jumps_refused()
+    if !plh_ready() then return
+
+    plh_refused(plh_head() + "run() -> int\n" + plh_filled() + "    val p = &b[0]\n    var n = 0\n" +
+                "    loop\n        defer n = *p\n        for i in 0..<100 do b.push(i)\n        break\n" +
+                "    n\n\nprint(run())\n", plh_moves("p", "push"))
+    plh_refused(plh_head() + "run() -> int\n" + plh_filled() + "    val p = &b[0]\n    var n = 0\n" +
+                "    for k in 0..<2\n        defer n += *p\n        for i in 0..<100 do b.push(i)\n" +
+                "        continue\n    n\n\nprint(run())\n", plh_moves("p", "push"))
+    plh_refused(plh_head() + "run(c: bool) -> int\n" + plh_filled() + "    val p = &b[0]\n    if c\n" +
+                "        defer print(*p)\n        for i in 0..<100 do b.push(i)\n        return 1\n" +
+                "    2\n\nprint(run(true))\n", plh_moves("p", "push"))
+    plh_refused(plh_head() + "half(n: usize) -> Result[usize, string] = if n % 2 == 0 then Ok(n / 2) " +
+                "else Err(\"odd\")\n\nrun() -> Result[int, string]\n" + plh_filled() +
+                "    var p = &b[0]\n    defer print(*p)\n" + plh_grow() + "    val h = half(b.len())?\n" +
+                "    p = &b[0]\n    Ok(int(h) + *p)\n\nprint(run().unwrap_or(0))\n", plh_moves("p", "push"))
+
+@test("a 'defer' a jump runs before the buffer grows is accepted and runs")
+plh_defer_before_growth_runs()
+    if !plh_ready() then return
+
+    assert_eq(plh_ran(plh_head() + "run() -> int\n" + plh_filled() + "    val p = &b[0]\n    var n = 0\n" +
+                      "    loop\n        defer n = *p\n        break\n" + plh_grow() + "    n + int(b.len())\n\n" +
+                      "print(run())\n"), "142\n")
+
+// -- a pointer kept in a local aggregate ----------------------------------------------------------------
+
+@test("a pointer kept in a struct, an Option, a tuple, an array or a Buf and read back after the buffer grew is refused")
+plh_aggregate_refused()
+    if !plh_ready() then return
+
+    val holder = plh_head() + "struct Holder\n    p: *int\n\n"
+
+    plh_refused(holder + "run() -> int\n" + plh_filled() + "    val h = Holder(&b[0])\n" + plh_grow() +
+                "    *h.p + 1\n\nprint(run())\n", plh_holds("h", "push"))
+    plh_refused(holder + "run() -> int\n" + plh_filled() + "    var x = 0\n    var h = Holder(&x)\n" +
+                "    h.p = &b[0]\n" + plh_grow() + "    *h.p + 1\n\nprint(run())\n", plh_holds("h", "push"))
+    plh_refused(plh_head() + "run() -> int\n" + plh_filled() + "    val o = Some(&b[0])\n" + plh_grow() +
+                "    *o.unwrap() + 1\n\nprint(run())\n", plh_holds("o", "push"))
+    plh_refused(plh_head() + "run() -> int\n" + plh_filled() + "    val o = Some(&b[0])\n" + plh_grow() +
+                "    o match\n        Some(q) -> *q\n        None -> 0\n\nprint(run())\n",
+                plh_moves("q", "push"))
+    plh_refused(plh_head() + "run() -> int\n" + plh_filled() + "    val t = (&b[0], 1)\n" + plh_grow() +
+                "    *t.0 + t.1\n\nprint(run())\n", plh_holds("t", "push"))
+    plh_refused(plh_head() + "run() -> int\n" + plh_filled() + "    val a = [&b[0], &b[0]]\n" + plh_grow() +
+                "    *a[1] + 1\n\nprint(run())\n", plh_holds("a", "push"))
+    plh_refused(plh_head() + "run() -> int\n" + plh_filled() + "    val ps: Buf[*int] = buf()\n" +
+                "    ps.push(&b[0])\n" + plh_grow() + "    *ps[0] + 1\n\nprint(run())\n",
+                plh_holds("ps", "push"))
+
+@test("a pointer through a generic wrapper, a loop and a block is followed the same way")
+plh_aggregate_interactions_refused()
+    if !plh_ready() then return
+
+    // What a call hands back is followed as what it was handed.
+    plh_refused(plh_head() + "wrap[T](x: T) -> Option[T] = Some(x)\n\nrun() -> int\n" + plh_filled() +
+                "    val o = wrap(&b[0])\n" + plh_grow() + "    *o.unwrap() + 1\n\nprint(run())\n",
+                plh_holds("o", "push"))
+
+    // A pointer stored on one turn is read on the next, after the push.
+    plh_refused(plh_head() + "run() -> int\n" + plh_filled() + "    val ps: Buf[*int] = buf()\n" +
+                "    var n = 0\n    for k in 0..<2\n        if ps.len() > 0 then n += *ps[0]\n" +
+                "        ps.push(&b[0])\n        b.push(k)\n    n\n\nprint(run())\n",
+                plh_holds("ps", "push"))
+
+    // An aggregate holding a pointer into a block's own buffer, read after the block.
+    plh_refused(plh_head() + "struct Holder\n    p: *int\n\nrun() -> int\n    var x = 0\n" +
+                "    var h = Holder(&x)\n    if x == 0\n        val b: Buf[int] = buf()\n        b.push(41)\n" +
+                "        h = Holder(&b[0])\n    *h.p + 1\n\nprint(run())\n",
+                "'h' holds a pointer into storage 'b' holds, and 'b' was let go of where its block ended")
+
+@test("an aggregate read before the buffer grows, a field beside the pointer, and a Buf of pointers cleared are accepted and run")
+plh_aggregate_accepted()
+    if !plh_ready() then return
+
+    assert_eq(plh_ran(plh_head() + "struct Holder\n    p: *int\n    n: int\n\nrun() -> int\n" + plh_filled() +
+                      "    val h = Holder(&b[0], 1)\n    val n = *h.p\n    val ps: Buf[*int] = buf()\n" +
+                      "    ps.push(&b[0])\n    val m = *ps[0]\n" + plh_grow() + "    ps.clear()\n" +
+                      "    n + m + h.n + int(ps.len())\n\nprint(run())\n"), "83\n")
+
+// -- a callee that moves what it is handed ---------------------------------------------------------------
+
+private plh_grower() -> string =
+    plh_head() + "grow_buf[T](b: Buf[T], x: T)\n    for i in 0..<100 do b.push(x)\n\n"
+
+@test("a pointer handed to a function beside the buffer the function grows is refused, directly and through a helper")
+plh_callee_handed_refused()
+    if !plh_ready() then return
+
+    plh_refused(plh_head() + "grow_and_read(p: *int, b: Buf[int]) -> int\n" + plh_grow() +
+                "    *p\n\nrun() -> int\n" + plh_filled() + "    grow_and_read(&b[0], b)\n\nprint(run())\n",
+                plh_handed("grow_and_read", "push", "b"))
+    plh_refused(plh_head() + "helper(b: Buf[int])\n" + plh_grow() + "\ngrow_via(p: *int, b: Buf[int]) -> int\n" +
+                "    helper(b)\n    *p\n\nrun() -> int\n" + plh_filled() + "    grow_via(&b[0], b)\n\n" +
+                "print(run())\n", plh_handed("grow_via", "push", "b"))
+
+    // A method handed the buffer as an argument, after its receiver.
+    plh_refused(plh_head() + "struct S\n    n: int\n\n    fill(self, p: *int, b: Buf[int]) -> int\n" +
+                "        for i in 0..<100 do b.push(i)\n        *p + self.n\n\nrun() -> int\n" + plh_filled() +
+                "    S(1).fill(&b[0], b)\n\nprint(run())\n", plh_handed("fill", "push", "b"))
+
+@test("a pointer used after a call that may move its buffer is refused: generic, through a pointer, recursive, in a loop and past a '?'")
+plh_callee_after_refused()
+    if !plh_ready() then return
+
+    plh_refused(plh_grower() + "run() -> int\n" + plh_filled() + "    val p = &b[0]\n    grow_buf(b, 1)\n" +
+                "    *p\n\nprint(run())\n", plh_after("p", "grow_buf", "push", "b"))
+    plh_refused(plh_head() + "struct S\n    items: Buf[int]\n\ngrow(s: *S)\n" +
+                "    for i in 0..<100 do s.items.push(i)\n\nrun() -> int\n    var h = S(buf())\n" +
+                "    h.items.push(1)\n    val q = &h.items[0]\n    grow(&h)\n    *q\n\nprint(run())\n",
+                plh_after("q", "grow", "push", "s"))
+    plh_refused(plh_head() + "ping(b: Buf[int], n: int)\n    if n > 0 then pong(b, n - 1)\n\n" +
+                "pong(b: Buf[int], n: int)\n    if n == 0 then b.push(1) else ping(b, n - 1)\n\n" +
+                "run() -> int\n" + plh_filled() + "    val p = &b[0]\n    ping(b, 3)\n    *p\n\n" +
+                "print(run())\n", plh_after("p", "ping", "push", "b"))
+    plh_refused(plh_grower() + "run() -> int\n" + plh_filled() + "    val p = &b[0]\n    var n = 0\n" +
+                "    for k in 0..<2\n        n += *p\n        grow_buf(b, k)\n    n\n\nprint(run())\n",
+                plh_after("p", "grow_buf", "push", "b"))
+    plh_refused(plh_head() + "grow_try(b: Buf[int]) -> Result[int, string]\n" + plh_grow() + "    Ok(1)\n\n" +
+                "run() -> Result[int, string]\n" + plh_filled() + "    val p = &b[0]\n" +
+                "    val n = grow_try(b)?\n    Ok(*p + n)\n\nprint(run().unwrap_or(0))\n",
+                plh_after("p", "grow_try", "push", "b"))
+
+@test("a callee that only reads what it is handed, and a pointer last used before the growing call, are accepted and run")
+plh_callee_accepted()
+    if !plh_ready() then return
+
+    assert_eq(plh_ran(plh_grower() + "read_both(p: *int, b: Buf[int]) -> int = *p + b[0]\n\nrun() -> int\n" +
+                      plh_filled() + "    val n = read_both(&b[0], b)\n    val p = &b[0]\n    val m = *p\n" +
+                      "    grow_buf(b, 1)\n    n + m + int(b.len())\n\nprint(run())\n"), "224\n")
