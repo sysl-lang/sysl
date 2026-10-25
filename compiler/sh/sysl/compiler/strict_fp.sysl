@@ -1,0 +1,205 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.Span
+import sysl.buf.{Buf, buf}
+
+// **What a `@strict_fp` body may compute** (`reference/attributes.md § @strict_fp`). The lowering
+// makes every floating-point operation in it strict (`emit_strict_fp.sysl`); this refuses, at the
+// operation, the ones nothing could make strict:
+//
+// - **an operation at `f16`, `bf16` or `f128`.** A strict body computes at `f32` and `f64`, the two
+//   widths every unit sysl targets performs in hardware under its environment; the other three are
+//   widened, emulated or called on most of them, and are not made strict.
+// - **an operation the target does in software** -- every float on a core with no floating-point
+//   unit, an `f64` on one whose unit is single precision. A routine has no environment to follow and
+//   raises nothing.
+// - **any operation on WebAssembly**, whose floating point always rounds to nearest and has no
+//   flags to raise.
+// - **a reduction of a float vector**, whose lanes are combined in an order the target picks and of
+//   which LLVM has no strict form. A lane-wise operation on a vector is strict like a scalar one.
+//
+// Fixed point is integer arithmetic and follows no floating-point environment, so it is neither
+// changed nor refused; a conversion between it and a float is a float operation, held to the above.
+// One refusal per body: the first operation it reaches, which is the one a reader can act on.
+check_strict_fp(a: &Analysis, funcs: Buf[TFunc])
+    val strict = strict_fp_names(funcs)
+
+    if strict.is_empty() then return
+
+    val t = a.tables.target
+
+    for f in funcs
+        if !strict.has(f.name) then continue
+
+        var found: Buf[(Span, string)] = buf()
+        val sink = found
+
+        walk_block_stmts(f.body, expr_walk(false, x -> note_refusal(t, x, sink)))
+
+        if !found.is_empty() then a.fault(func_home(a, f.name), found.at(0).0, found.at(0).1)
+end check_strict_fp
+
+private note_refusal(t: Target, x: TExpr, found: Buf[(Span, string)])
+    strict_refusal(t, x) match
+        Some(m) -> found.push((x.span, m))
+        None -> ()
+end note_refusal
+
+// What is wrong with `x` in a strict body, if anything.
+private strict_refusal(t: Target, x: TExpr) -> Option[string] = *x.kind match
+    TBinary(op, _, _, ty) -> if arithmetic_op(op) then width_refusal(t, ty) else None
+    TUpdate(_, op, _, ty, _, _, _) -> if arithmetic_op(op) then width_refusal(t, ty) else None
+    TCompare(operands, _) -> if operands.is_empty() then None else width_refusal(t, texpr_type(operands.at(0)))
+    TVecCompare(_, left, _, _) -> width_refusal(t, texpr_type(left))
+    TCast(operand, ty) -> conversion_refusal(t, texpr_type(operand), ty)
+    TFloorCast(operand, ty) -> conversion_refusal(t, texpr_type(operand), ty)
+    TReduce(_, receiver, _) ->
+        if float_lane(texpr_type(receiver)).is_some()
+            Some("a reduction of a float vector combines its lanes in an order the target chooses, and has no strict form — inside a '@strict_fp' body, read the lanes and add them one by one, which fixes the order and makes each sum strict")
+        else None
+    _ -> None
+
+private arithmetic_op(op: string) -> bool = op == "+" || op == "-" || op == "*" || op == "/" || op == "%"
+
+// A conversion is a float operation where either side is a float, and its integer side is held to what
+// the unit converts.
+private conversion_refusal(t: Target, from: Type, to: Type) -> Option[string] = width_refusal(t, from) match
+    Some(m) -> Some(m)
+    None -> width_refusal(t, to) match
+        Some(m) -> Some(m)
+        None ->
+            if float_lane(from).is_some() then wide_integer_refusal(t, to, from)
+            else if float_lane(to).is_some() then wide_integer_refusal(t, from, to)
+            else None
+
+// **An integer wider than the machine's word converts in software**: a 32-bit Arm core reads an `i64`
+// as a float with `__aeabi_l2f`, and every machine reads an `i128` with `__floattisf`. The library
+// rounds to nearest whatever the environment says and raises nothing, so such a conversion is refused
+// like any other float in software.
+private wide_integer_refusal(t: Target, integer: Type, float: Type) -> Option[string]
+    val lane = underlying(integer) match
+        Vector(_, elem) -> underlying(*elem)
+        other -> other
+
+    val word = int(t.pointer_bits())
+
+    val bits = lane match
+        Integer(b, _, pointer_width) -> if pointer_width then word else b
+        _ -> return None
+
+    if bits <= word then return None
+
+    Some(s"'@strict_fp' asks the floating-point unit to follow its environment, and on '${t.name}' a conversion between ${type_show(integer)} and ${type_show(float)} is a library call, since the unit converts integers of at most $word bits — and a library call has no environment to follow and raises nothing; convert through an integer of $word bits, or compute this outside a '@strict_fp' body")
+end wide_integer_refusal
+
+// The lane type of a float, or of a vector of floats.
+private float_lane(ty: Type) -> Option[Type]
+    val lane = underlying(ty) match
+        Vector(_, elem) -> underlying(*elem)
+        other -> other
+
+    lane match
+        Floating(_, _) -> Some(lane)
+        _ -> None
+end float_lane
+
+// Whether a float of `ty` can be computed strictly on `t`; nothing for a type that is no float.
+private width_refusal(t: Target, ty: Type) -> Option[string]
+    val lane = float_lane(ty)
+
+    if lane.is_none() then return None
+
+    val bits = lane.unwrap() match
+        Floating(b, brain) -> if brain then 0 else b
+        _ -> 0
+
+    if t.cpu == Wasm32
+        return Some(s"'@strict_fp' asks for floating point that follows the environment it runs in, and '${t.name}' is WebAssembly, whose floating point always rounds to nearest and raises nothing — compute this outside a '@strict_fp' body")
+
+    if bits != 32 && bits != 64
+        return Some(s"a '@strict_fp' body computes at f32 and f64, the widths a floating-point unit performs under its environment, and this is ${type_show(lane.unwrap())} — convert it to f32 or f64 inside the body, or compute it outside one")
+
+    val hardware = if bits == 32 then t.fp_registers() else t.fp_double_registers()
+
+    if !hardware
+        return Some(s"'@strict_fp' asks the floating-point unit to follow its environment, and '${t.name}' computes ${type_show(lane.unwrap())} in software, which has no environment to follow and raises nothing — compute this outside a '@strict_fp' body, or build for a target whose unit has ${if bits == 32 then "single" else "double"} precision")
+
+    None
+end width_refusal
+
+// -- what a program may reach of `sysl.fenv` --------------------------------------------------------
+
+// **`sysl.fenv` is built whole wherever the library is**, as `sysl.sync` is, and reaches registers a
+// machine may not have: no environment at all on a core with no floating-point unit, on x86's x87
+// and on WebAssembly; no default-NaN control on x86-64 and RISC-V, and no flush-to-zero on RISC-V. So
+// what is refused is the program's call that arrives there (`atomic_reach.sysl`'s way), with the
+// reason, and a program that never names the module hears nothing.
+check_fenv_reach(a: &Analysis, funcs: Buf[TFunc], vtables: Buf[TVtable])
+    val t = a.tables.target
+    val none = fenv_absent(t)
+    val no_dn = t.cpu == X86_64 || t.cpu == Riscv64 || t.cpu == Riscv32
+    val no_fz = t.cpu == Riscv64 || t.cpu == Riscv32
+
+    if none.is_none() && !no_dn && !no_fz then return
+
+    var seeds: Buf[string] = buf()
+
+    for f in funcs
+        val n = qualified_name(f.name)
+
+        if !n.starts_with("sysl.fenv.") then continue
+
+        val dn = n == "sysl.fenv.default_nan" || n == "sysl.fenv.set_default_nan"
+        val fz = n == "sysl.fenv.flush_to_zero" || n == "sysl.fenv.set_flush_to_zero"
+
+        if none.is_some() || (dn && no_dn) || (fz && no_fz) then seeds.push(f.name)
+
+    if seeds.is_empty() then return
+
+    val graph = with_abstract_callees(a, funcs)
+    val walk = reaches_over(graph, vtables, seeds)
+    val reach = program_reach(a, funcs)
+
+    for f in funcs
+        if a.tables.members.func_origin.has(f.name) then continue
+        if standard_body_module(module_of(f.name)) then continue
+
+        val scope = func_home(a, f.name)
+
+        if !reached_module(reach, scope.module_name) then continue
+
+        walk_block_stmts(f.body, expr_walk(false, e -> blame_fenv(a, t, scope, walk, none, e)))
+end check_fenv_reach
+
+// Why a machine has no environment for `sysl.fenv` to reach, or nothing where it has one.
+private fenv_absent(t: Target) -> Option[string]
+    if t.cpu == Wasm32 then return Some("is WebAssembly, whose floating point always rounds to nearest and keeps no flags")
+    if t.cpu == X86 then return Some("is 32-bit x86, whose floating point is the x87 unit's, and 'sysl.fenv' does not reach its control and status words")
+    if t.cpu == Craft || !t.fp_registers() then return Some("has no floating-point unit — a float there is computed by a library routine, which has no environment")
+
+    None
+end fenv_absent
+
+private blame_fenv(a: &Analysis, t: Target, scope: Scope, walk: &Reaches, none: Option[string], e: TExpr)
+    val hit = named_reach(walk, own_refs(e))
+
+    if hit.is_none() || reaches_a_seed(walk, strict_refs(e)) then return
+
+    val seed = qualified_name(hit.unwrap().1)
+
+    if none.is_some()
+        a.fault(scope, e.span, s"'sysl.fenv' reads and writes the floating-point unit's control and status registers, and '${t.name}' ${none.unwrap()}")
+        return
+    end if
+
+    val name = seed["sysl.fenv.".len..<seed.len]
+
+    if name.contains("default_nan")
+        val why = if t.cpu == X86_64 then "an SSE operation that answers a NaN always answers its NaN operand's, made quiet"
+                  else "a RISC-V operation that answers a NaN always answers the canonical one, so the mode is always on"
+
+        a.fault(scope, e.span, s"'$name' is the default-NaN control of an Arm unit, and '${t.name}' has none — $why")
+    else
+        a.fault(scope, e.span, s"'$name' is the flush-to-zero control, and '${t.name}' has none — a RISC-V unit computes every subnormal exactly")
+    end if
+end blame_fenv

@@ -20,7 +20,7 @@ name, and each says in its own header why it is not part of this one.
 
 ## Index
 
-[`e`](#e) [`ln10`](#ln10) [`ln2`](#ln2) [`pi`](#pi) [`sqrt2`](#sqrt2) [`tau`](#tau) [`approx_eq`](#approx_eq) [`approx_eq_rel`](#approx_eq_rel) [`assert_approx_eq`](#assert_approx_eq) [`assert_approx_eq_rel`](#assert_approx_eq_rel) [`checked_add`](#checked_add) [`checked_mul`](#checked_mul) [`checked_sub`](#checked_sub) [`clamp`](#clamp) [`div_floor`](#div_floor) [`divmod`](#divmod) [`gcd`](#gcd) [`infinity`](#infinity) [`is_power_of_two`](#is_power_of_two) [`lcm`](#lcm) [`max`](#max) [`min`](#min) [`mod_floor`](#mod_floor) [`nan`](#nan) [`next_power_of_two`](#next_power_of_two) [`nextafter`](#nextafter) [`nextafter`](#nextafter-1) [`overflowing_add`](#overflowing_add) [`overflowing_mul`](#overflowing_mul) [`overflowing_sub`](#overflowing_sub) [`pow`](#pow) [`ulp`](#ulp) [`ulp`](#ulp-1) [`Bits`](#bits) [`ByteOrder`](#byteorder) [`Float`](#float) [`Magnitude`](#magnitude) [`Signed`](#signed) [Float for bf16](#float-for-bf16) [Float for f16](#float-for-f16) [Float for f32](#float-for-f32) [Float for real](#float-for-real) [Magnitude for f32](#magnitude-for-f32) [Magnitude for real](#magnitude-for-real) [Magnitude for T](#magnitude-for-t)
+[`e`](#e) [`ln10`](#ln10) [`ln2`](#ln2) [`pi`](#pi) [`sqrt2`](#sqrt2) [`tau`](#tau) [`approx_eq`](#approx_eq) [`approx_eq_rel`](#approx_eq_rel) [`assert_approx_eq`](#assert_approx_eq) [`assert_approx_eq_rel`](#assert_approx_eq_rel) [`checked_add`](#checked_add) [`checked_mul`](#checked_mul) [`checked_sub`](#checked_sub) [`clamp`](#clamp) [`div_floor`](#div_floor) [`divmod`](#divmod) [`gcd`](#gcd) [`infinity`](#infinity) [`is_power_of_two`](#is_power_of_two) [`lcm`](#lcm) [`max`](#max) [`min`](#min) [`mod_floor`](#mod_floor) [`nan`](#nan) [`next_power_of_two`](#next_power_of_two) [`nextafter`](#nextafter) [`nextafter`](#nextafter-1) [`overflowing_add`](#overflowing_add) [`overflowing_mul`](#overflowing_mul) [`overflowing_sub`](#overflowing_sub) [`pow`](#pow) [`ulp`](#ulp) [`ulp`](#ulp-1) [`Bits`](#bits) [`ByteOrder`](#byteorder) [`Float`](#float) [`Magnitude`](#magnitude) [`MulAdd`](#muladd) [`Signed`](#signed) [Float for bf16](#float-for-bf16) [Float for f16](#float-for-f16) [Float for f32](#float-for-f32) [Float for real](#float-for-real) [Magnitude for f32](#magnitude-for-f32) [Magnitude for real](#magnitude-for-real) [Magnitude for T](#magnitude-for-t) [MulAdd for f32](#muladd-for-f32) [MulAdd for real](#muladd-for-real)
 
 ## Constants
 
@@ -705,6 +705,30 @@ already imports `sysl.math` to reach.
 |---|---|---|
 | `magnitude` | `magnitude(self) -> Self::Size` |  |
 
+### `MulAdd`
+
+```sysl
+trait MulAdd
+    mul_add(self, a: Self, b: Self) -> Self
+```
+
+A multiply and an add rounded once, at the two widths that can promise it.
+
+`x.mul_add(a, b)` is `x * a + b` with the product never rounded on its own: the exact `x * a` is
+added to `b` and only the sum is rounded, so it can answer what the two-step form cannot -- the
+rounding error of a product, `x.mul_add(a, -(x * a))`, is exact. It is the machine's fused
+instruction where the unit has one at that width and C's `fma` or `fmaf` where it does not, which
+is slower but still rounded once. In a `@strict_fp` body it is the constrained multiply-add, rounded
+in the mode in force and raising its flags.
+
+**It is not one of `Float`'s, because the half widths cannot keep the promise.** Computing an `f16`
+multiply-add at `f32` and narrowing rounds twice, and unlike the methods above, whose libm answer is
+already an approximation, here the single rounding is the whole of what was asked for.
+
+| Member | Signature | Description |
+|---|---|---|
+| `mul_add` | `mul_add(self, a: Self, b: Self) -> Self` |  |
+
 ### `Signed`
 
 ```sysl
@@ -844,3 +868,15 @@ performed. `gcd` in `integer.sysl` takes the same route for the same reason.
 **At the most negative value this answers that value again**, exactly as `Signed.abs` does: the
 magnitude is one larger than the width can hold, and two's-complement negation wraps. Answering
 anything else would need a wider type to answer in, which is a promise a size cannot make.
+
+### MulAdd for f32
+
+```sysl
+impl MulAdd for f32
+```
+
+### MulAdd for real
+
+```sysl
+impl MulAdd for real
+```

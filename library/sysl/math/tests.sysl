@@ -159,6 +159,67 @@ roots()
     assert_approx_eq(9.0.sqrt(), 3.0, 1.0e-12)
     assert_approx_eq(27.0.cbrt(), 3.0, 1.0e-12)
 
+// (1 + 2^-27)^2 - 1 is exactly 2^-26 + 2^-54, and the product rounded on its own loses the 2^-54, so
+// only an answer rounded once carries it. At binary32, (1 + 2^-12)^2 - 1 is 2^-11 + 2^-24 the same
+// way. Asserted twice: on values the compiler can see, which it computes while compiling, and on
+// values it cannot, which the machine computes.
+@test("mul_add rounds once, at both widths, while compiling and while running")
+mul_add_rounds_once()
+    assert_eq((1.0 + 2.0.pow(-27.0)).mul_add(1.0 + 2.0.pow(-27.0), -1.0).bits(), 0x3E50000001000000)
+    assert_eq((1.0f32 + 2.0f32.pow(-12.0f32)).mul_add(1.0f32 + 2.0f32.pow(-12.0f32), -1.0f32).bits(),
+              0x3A000400)
+
+    val x = opaque_real(1.0 + 2.0.pow(-27.0))
+    val y = opaque_f32(1.0f32 + 2.0f32.pow(-12.0f32))
+
+    assert_eq(x.mul_add(x, -1.0).bits(), 0x3E50000001000000)
+    assert_eq(y.mul_add(y, -1.0f32).bits(), 0x3A000400)
+
+    // The rounding error of a product, exactly, which `x * x - p` cannot see at all.
+    val p = x * x
+
+    assert_eq(x.mul_add(x, -p), 2.0.pow(-54.0))
+end mul_add_rounds_once
+
+@test("mul_add answers a NaN and the infinities as IEEE 754's fusedMultiplyAdd does")
+mul_add_nan_and_infinities()
+    val inf = opaque_real(real.infinity())
+    val finf = opaque_f32(f32.infinity())
+
+    assert(opaque_real(real.nan()).mul_add(1.0, 1.0).is_nan())
+    assert(1.0.mul_add(1.0, opaque_real(real.nan())).is_nan())
+    assert(inf.mul_add(0.0, 1.0).is_nan())
+    assert(inf.mul_add(1.0, -inf).is_nan())
+    assert_eq(inf.mul_add(2.0, 1.0), inf)
+    assert_eq(2.0.mul_add(3.0, -inf), -inf)
+
+    assert(opaque_f32(f32.nan()).mul_add(1.0f32, 1.0f32).is_nan())
+    assert(finf.mul_add(0.0f32, 1.0f32).is_nan())
+    assert(finf.mul_add(1.0f32, -finf).is_nan())
+    assert_eq(finf.mul_add(2.0f32, 1.0f32), finf)
+    assert_eq(2.0f32.mul_add(3.0f32, -finf), -finf)
+end mul_add_nan_and_infinities
+
+// A value the compiler is not allowed to see through -- it went through a volatile place -- so what is
+// computed from it is computed by the machine rather than while compiling.
+private struct Unseen
+    wide: volatile real
+    narrow: volatile f32
+
+private opaque_real(x: real) -> real
+    var u = Unseen(0.0, 0.0f32)
+
+    u.wide = x
+    u.wide
+end opaque_real
+
+private opaque_f32(x: f32) -> f32
+    var u = Unseen(0.0, 0.0f32)
+
+    u.narrow = x
+    u.narrow
+end opaque_f32
+
 // The exponent and the logarithm undo each other, which is worth asserting as a pair: either one
 // alone could be scaled by a constant and still look plausible.
 @test("the exponential and the logarithm undo each other")

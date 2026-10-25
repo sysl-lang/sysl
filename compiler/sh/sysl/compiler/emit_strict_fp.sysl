@@ -1,0 +1,505 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.Span
+import sysl.buf.{Buf, buf}
+import sysl.container.{Map, map, Set, set}
+import sysl.math.bigint.{BigInt, from_int, negate, pow, sub}
+
+// **A `@strict_fp` body, lowered** (`reference/attributes.md § @strict_fp`). Every floating-point
+// operation in it follows the floating-point environment the code runs in -- the rounding mode, and
+// on AArch64 flush-to-zero and default-NaN -- and raises the exceptions it raises, and none is
+// merged with another, hoisted, sunk or folded past anything that could read or write that
+// environment: a system register, an `asm` block, a call.
+//
+// **The body is lowered as any other, and then rewritten.** Each `fadd`, `fsub`, `fmul`, `fdiv`,
+// `fcmp`, each conversion with a float on either side, and each call of an LLVM float intrinsic
+// becomes its `llvm.experimental.constrained.*` form, told `round.dynamic` where the operation rounds
+// and `fpexcept.strict` always; the definition carries `strictfp`, and so does every call in it,
+// which is what LLVM asks of a function holding constrained operations. `fneg`, `fabs` and
+// `copysign` are left as they are: they touch the sign bit and nothing else, round nothing and raise
+// nothing.
+//
+// - **An ordered comparison -- `<`, `<=`, `>`, `>=` -- signals** (`fcmps`), raising invalid on a quiet
+//   NaN as IEEE 754 says the relational predicates do; `==` and `!=` are quiet (`fcmp`).
+// - **A float read as an integer saturates**, as it does everywhere (`emit_expr.sysl`'s
+//   `saturating_to_int`), but LLVM's `.sat` family has no constrained form. So it is the plain
+//   conversion, which raises inexact where it drops a fraction, with the answer chosen by quiet
+//   comparisons: the converted value where the input is in range, the nearer bound where it is not,
+//   zero for a NaN -- and invalid raised for both of those. The conversion's own answer out of
+//   range is poison, and a `select` that does not choose it is not.
+// - **A function whose whole body is an LLVM intrinsic over its parameters** -- `f32.sqrt`, which is
+//   `llvm.sqrt` -- is called as that intrinsic, so `x.sqrt()` in a strict body is the strict square
+//   root rather than a call of a body that is not strict.
+//
+// **What is not rewritten is not strict.** A call from a strict body to an ordinary function runs
+// that function's operations as it was compiled, inlined or not: LLVM's inliner reads an ordinary
+// body put inside a strict one as round-to-nearest with exceptions ignored, which leaves the strict
+// operations around it exactly as strict. The other way round, a strict body is never inlined into a
+// caller that is not strict.
+
+// -- which bodies -----------------------------------------------------------------------------------
+
+// The functions whose floating point is strict, by key: each one marked `@strict_fp`, and each one
+// written inside one -- a closure or a nested function, whose text is the marked body's -- in the
+// same file and strictly within its span. Two bodies with one span are one body lowered twice, an
+// instantiation each, and neither is inside the other.
+strict_fp_names(funcs: Buf[TFunc]) -> Set[string]
+    var out: Set[string] = set()
+    var marked: Buf[TFunc] = buf()
+
+    for f in funcs
+        if f.marks.strict_fp
+            out.add(f.name)
+            marked.push(f)
+
+    if marked.is_empty() then return out
+
+    for f in funcs
+        if f.marks.strict_fp || f.src.is_none() then continue
+
+        for g in marked
+            if g.src.is_some() && g.src.unwrap().name == f.src.unwrap().name && encloses(g.span, f.span)
+                out.add(f.name)
+                break
+
+    out
+end strict_fp_names
+
+private encloses(outer: Span, inner: Span) -> bool =
+    outer.start <= inner.start && inner.end <= outer.end &&
+        !(outer.start == inner.start && outer.end == inner.end)
+
+// The functions a strict body calls as an intrinsic, by symbol, with the intrinsic each one is: a
+// body that is one call of an `extern "llvm.*"`, handed every parameter in order, at `f32` or `f64`.
+intrinsic_forwarders(e: *Emit, p: TProgram) -> Map[string, string]
+    var out: Map[string, string] = map()
+
+    for f in p.funcs
+        forwarded(p, f) match
+            Some(sym) -> out.put(symbol_of(e, f.name), sym)
+            None -> ()
+
+    out
+end intrinsic_forwarders
+
+private forwarded(p: TProgram, f: TFunc) -> Option[string]
+    if !f.body.stmts.is_empty() || f.body.result.is_none() || !binary_float(f.ret_ty) then return None
+
+    *f.body.result.unwrap().kind match
+        TCall(name, args, _, _) ->
+            if args.len() != f.params.len() then return None
+
+            for i in 0..<args.len()
+                if !binary_float(f.params.at(i).1) then return None
+
+                *args.at(i).kind match
+                    TLoad(n, _) -> if n != f.params.at(i).0 then return None
+                    _ -> return None
+
+            for x in p.externs
+                if x.name == name && x.symbol.starts_with(LlvmPrefix) then return Some(x.symbol)
+
+            None
+        _ -> None
+end forwarded
+
+// `f32` or `f64` -- the widths a strict body computes at.
+private binary_float(t: Type) -> bool = underlying(t) match
+    Floating(bits, _) -> bits == 32 || bits == 64
+    _ -> false
+
+// -- the rewrite ------------------------------------------------------------------------------------
+
+// `f`'s blocks with every floating-point operation in its constrained form and every call marked.
+strict_fp_body(e: *Emit, f: IrFunc) -> IrFunc
+    var blocks: Buf[IrBlock] = buf()
+
+    for b in f.blocks
+        var instrs: Buf[Inst] = buf()
+
+        for i in b.instrs
+            strict_inst(e, i, instrs)
+
+        blocks.push(IrBlock(b.label, instrs, b.terminator))
+
+    IrFunc(f.sig, blocks)
+end strict_fp_body
+
+private strict_inst(e: *Emit, i: Inst, out: Buf[Inst])
+    i match
+        InBin(d, op, ty, a, b) -> float_op_name(op) match
+            Some(name) ->
+                var args: Buf[IrArg] = buf()
+
+                args.push(ir_arg(ty, a))
+                args.push(ir_arg(ty, b))
+                strict_op(e, d, name, ty, [ty], args, true, None, out)
+            None -> out.push(i)
+        InFloatCmp(d, p, ty, a, b) ->
+            var args: Buf[IrArg] = buf()
+
+            args.push(ir_arg(ty, a))
+            args.push(ir_arg(ty, b))
+            strict_op(e, d, if signals(p) then "fcmps" else "fcmp", compared_type(ty), [ty], args, false,
+                      Some(fcmp_render(p)), out)
+        // A literal of `f32` is a binary64 constant narrowed where it is written, which is a rounding
+        // the compiler does -- to nearest, as the literal's value is defined -- and not an operation
+        // the environment governs. So it is narrowed here and written as its bits.
+        InCast(d, op, from, v, to) ->
+            if op == CastFPTrunc && is_binary32(to) && is_float_constant(v)
+                out.push(InCast(d, CastBitCast, LInt(32), VInt(from_int(long(narrowed_bits(v)))), to))
+                return
+            end if
+
+            // **An integer read as a float on a 32-bit Arm core is the plain conversion, fenced.** The
+            // Arm back end has no instruction for the constrained one at binary32 and expands it
+            // through binary64 in software, which rounds to nearest whatever FPSCR says. The plain
+            // `vcvt` rounds in FPSCR's mode and raises inexact, and the fences of `strict_op` hold it
+            // where it was written, so between them it is exactly the strict conversion.
+            if e.target.cpu == Thumb && (op == CastSIToFP || op == CastUIToFP)
+                val held = fenced_value(e, from, v, out)
+                val raw = fresh_reg(e)
+
+                out.push(InCast(raw, op, from, held, to))
+                fence_into(e, d, to, raw, out)
+                return
+            end if
+
+            cast_op_name(op) match
+                Some(name) ->
+                    var args: Buf[IrArg] = buf()
+
+                    args.push(ir_arg(from, v))
+                    strict_op(e, d, name, to, [to, from], args, cast_rounds(op), None, out)
+                None -> out.push(i)
+        InCall(d, ret, callee, args, ret_attrs, fnty, fast, must) -> callee match
+            VGlobal(name) ->
+                val called = e.forwarders.get(name).unwrap_or(name)
+
+                if !strict_intrinsic(e, d, ret, called, args, out)
+                    out.push(InCall(d, ret, VGlobal(called), args, ret_attrs, fnty, marked(fast), must))
+            _ -> out.push(InCall(d, ret, callee, args, ret_attrs, fnty, marked(fast), must))
+        _ -> out.push(i)
+end strict_inst
+
+private is_binary32(t: LType) -> bool = t match
+    LFloat(bits, brain) -> bits == 32 && !brain
+    _ -> false
+
+private is_float_constant(v: Val) -> bool = v match
+    VFloat(_) -> true
+    _ -> false
+
+// A binary64 constant's value rounded to nearest at binary32, as binary32's bits.
+private narrowed_bits(v: Val) -> u32 = v match
+    VFloat(bits) -> f32(real.from_bits(u64(bits))).bits()
+    _ -> 0
+
+// A call's floating-point list with `strictfp` in it.
+private marked(fast: Buf[FastMath]) -> Buf[FastMath]
+    var out: Buf[FastMath] = buf()
+
+    for item in fast
+        if item != FmStrict then out.push(item)
+
+    out.push(FmStrict)
+    out
+end marked
+
+private float_op_name(op: BinOp) -> Option[string] = op match
+    OpFAdd -> Some("fadd")
+    OpFSub -> Some("fsub")
+    OpFMul -> Some("fmul")
+    OpFDiv -> Some("fdiv")
+    _ -> None
+
+private cast_op_name(op: CastOp) -> Option[string] = op match
+    CastFPTrunc -> Some("fptrunc")
+    CastFPExt -> Some("fpext")
+    CastFPToUI -> Some("fptoui")
+    CastFPToSI -> Some("fptosi")
+    CastUIToFP -> Some("uitofp")
+    CastSIToFP -> Some("sitofp")
+    _ -> None
+
+// Whether a conversion can round: narrowing a float, and an integer read as one. Widening a float
+// and reading one as an integer are exact or invalid, and take no rounding mode.
+private cast_rounds(op: CastOp) -> bool = op match
+    CastFPTrunc -> true
+    CastUIToFP -> true
+    CastSIToFP -> true
+    _ -> false
+
+// The relational predicates, which IEEE 754 makes signalling.
+private signals(p: FCmp) -> bool = p match
+    FOeq -> false
+    FOne -> false
+    FOrd -> false
+    FUeq -> false
+    FUne -> false
+    FUno -> false
+    _ -> true
+
+// What a comparison of `ty` answers: one bit, or one per lane.
+private compared_type(ty: LType) -> LType = ty match
+    LVec(n, _) -> LVec(n, LInt(1))
+    _ -> LInt(1)
+
+// The intrinsics a strict body rewrites, by base name, and whether each one rounds.
+private intrinsic_rounds(base: string) -> Option[bool]
+    for word in ["sqrt", "fma", "rint", "nearbyint"]
+        if base == word then return Some(true)
+
+    for word in ["floor", "ceil", "round", "trunc", "minnum", "maxnum", "minimum", "maximum"]
+        if base == word then return Some(false)
+
+    None
+end intrinsic_rounds
+
+// A call of an LLVM float intrinsic, in its strict form, where `called` is one: the constrained
+// twin of a rounding or a comparison, or the saturating conversion spelled out. Whether it was.
+private strict_intrinsic(e: *Emit, d: Option[Val], ret: LType, called: string, args: Buf[IrArg],
+                         out: Buf[Inst]) -> bool
+    if !called.starts_with(LlvmPrefix) || d.is_none() then return false
+
+    val sat_s = llvm_fptosi_sat_entry().base + "."
+    val sat_u = llvm_fptoui_sat_entry().base + "."
+
+    if called.starts_with(sat_s) || called.starts_with(sat_u)
+        saturating(e, d.unwrap(), ret, called.starts_with(sat_s), args.at(0), out)
+        return true
+    end if
+
+    val base = intrinsic_base(called)
+
+    intrinsic_rounds(base) match
+        Some(rounds) ->
+            strict_op(e, d.unwrap(), base, ret, [ret], args, rounds, None, out)
+            true
+        None -> false
+end strict_intrinsic
+
+// `sqrt` out of `llvm.sqrt.f32`: the word between the namespace and the overload suffix.
+private intrinsic_base(name: string) -> string
+    val rest = name[LlvmPrefix.len..<name.len]
+    var end_at = rest.len
+
+    for i in 0..<rest.bytes.len
+        if rest.bytes[i] == u8('.')
+            end_at = i
+            break
+
+    rest[0..<end_at]
+end intrinsic_base
+
+// One constrained operation: `op` overloaded at `types`, handed `args`, the rounding mode where it
+// rounds, a comparison's predicate where it is one, and the exception behaviour.
+private constrained(e: *Emit, d: Option[Val], op: string, ret: LType, types: []const LType, args: Buf[IrArg],
+                    rounds: bool, predicate: Option[string]) -> Inst
+    val name = llvm_constrained_entry(op).unwrap().at(types)
+    val meta = LNamed("metadata")
+    var params: Buf[IrParam] = buf()
+    var all: Buf[IrArg] = buf()
+
+    for a in args
+        params.push(ir_param(a.ty))
+        all.push(a)
+
+    predicate match
+        Some(p) ->
+            params.push(ir_param(meta))
+            all.push(ir_arg(meta, VMetaText(p)))
+        None -> ()
+
+    if rounds
+        params.push(ir_param(meta))
+        all.push(ir_arg(meta, VMetaText("round.dynamic")))
+    end if
+
+    params.push(ir_param(meta))
+    all.push(ir_arg(meta, VMetaText("fpexcept.strict")))
+    request_intrinsic(e, ir_sig(name, ir_fn_type(ret, params)))
+
+    var fast: Buf[FastMath] = buf()
+
+    fast.push(FmStrict)
+    InCall(d, ret, VGlobal(name), all, no_ir_attrs(), None, fast, false)
+end constrained
+
+// `d = op(args)`, strictly, pushed onto `out`.
+//
+// **On a 32-bit Arm core the operation is also fenced in by its own operands and its answer.** An Arm
+// back end that does not implement LLVM's strict nodes -- the one in the clang Xcode ships is one --
+// lowers a constrained operation to the ordinary one before it schedules, so two `x + y` either side
+// of a `vmsr fpscr` become one `vadd.f32`, placed after both writes. So the first operand, every lane
+// of it, is passed through an empty `asm` before the operation and the answer through another after
+// it. Each fence is ordered with every other `asm` and call, so the operation can neither leave the
+// stretch between the writes it was written between nor be merged with its twin, whose operand comes
+// out of a different fence. An empty `asm` is no instruction: the value stays in its register.
+private strict_op(e: *Emit, d: Val, op: string, ret: LType, types: []const LType, args: Buf[IrArg],
+                  rounds: bool, predicate: Option[string], out: Buf[Inst])
+    if e.target.cpu != Thumb || args.is_empty()
+        out.push(constrained(e, Some(d), op, ret, types, args, rounds, predicate))
+        return
+    end if
+
+    var fenced: Buf[IrArg] = buf()
+
+    for i in 0..<args.len()
+        val a = args.at(i)
+
+        fenced.push(if i == 0 then ir_arg(a.ty, fenced_value(e, a.ty, a.value, out)) else a)
+
+    val raw = fresh_reg(e)
+
+    out.push(constrained(e, Some(raw), op, ret, types, fenced, rounds, predicate))
+    fence_into(e, d, ret, raw, out)
+end strict_op
+
+// `v` passed through a fence, as a fresh value.
+private fenced_value(e: *Emit, ty: LType, v: Val, out: Buf[Inst]) -> Val
+    val d = fresh_reg(e)
+
+    fence_into(e, d, ty, v, out)
+    d
+end fenced_value
+
+// `d = v`, through an empty `asm` holding it in a register of its kind -- a single-precision register
+// for an `f32`, a double one for an `f64`, a core register otherwise -- and a vector a lane at a time,
+// since a core without a vector unit computes it a lane at a time and every lane needs its fence.
+private fence_into(e: *Emit, d: Val, ty: LType, v: Val, out: Buf[Inst])
+    ty match
+        LVec(n, elem) ->
+            var acc = VPoison
+
+            for lane in 0..<n
+                val index = ir_arg(l_i32(), VInt(from_int(long(lane))))
+                val got = fresh_reg(e)
+
+                out.push(InExtractElement(got, ty, v, index))
+
+                val held = fenced_value(e, *elem, got, out)
+                val next = if lane == n - 1 then d else fresh_reg(e)
+
+                out.push(InInsertElement(next, ty, acc, *elem, held, index))
+                acc = next
+        _ ->
+            val register = ty match
+                LFloat(bits, _) -> if bits == 32 then "t" else "w"
+                _ -> "r"
+
+            var held: Buf[IrArg] = buf()
+
+            held.push(ir_arg(ty, v))
+            out.push(InAsm(Some(d), ty, "", s"=$register,0", held))
+end fence_into
+
+// `d = fptosi.sat(v)` (or `fptoui`), strictly: the conversion, which raises what it raises, and the
+// answer it gives only where the input is in range.
+private saturating(e: *Emit, d: Val, it: LType, signed: bool, arg: IrArg, out: Buf[Inst])
+    val ft = arg.ty
+    val v = arg.value
+    val lane_bits = int_lane_bits(it)
+    val fbits = float_lane_bits(ft)
+    val cmp = compared_type(ft)
+    val raw = fresh_reg(e)
+    var conv: Buf[IrArg] = buf()
+
+    conv.push(arg)
+    strict_op(e, raw, if signed then "fptosi" else "fptoui", it, [it, ft], conv, false, None, out)
+
+    // In range: at or above the low bound (above -1 for an unsigned integer, which drops the fraction
+    // of anything between), and below the high one. A bound past the float's range is an infinity,
+    // which the input is compared with strictly so that an infinite input is out of range.
+    val top = if signed then lane_bits - 1 else lane_bits
+    val hi = fresh_reg(e)
+
+    quiet(e, hi, if top <= max_exponent(fbits) then FOlt else FOne, ft, cmp, v,
+          splat_of(ft, float_power(top, fbits, false)), out)
+
+    val lo = fresh_reg(e)
+
+    if signed
+        val finite = top <= max_exponent(fbits)
+
+        quiet(e, lo, if finite then FOge else FOne, ft, cmp, v, splat_of(ft, float_power(top, fbits, true)), out)
+    else
+        quiet(e, lo, FOgt, ft, cmp, v, splat_of(ft, VFloat(long(u64(0xBFF0000000000000)))), out)
+    end if
+
+    val inside = fresh_reg(e)
+
+    out.push(InBin(inside, OpAnd, cmp, hi, lo))
+
+    // **Out of range raises invalid whatever the integer's width.** A back end converts to a narrow
+    // integer through a 32-bit one, which holds 300 without complaint where a `u8` cannot, so the
+    // flag is raised here too: a signalling comparison of a NaN, which raises invalid, chosen only
+    // where the input is out of range -- a zero is compared everywhere else, which raises nothing.
+    val probe = fresh_reg(e)
+
+    out.push(InSelect(probe, inside, ft, splat_of(ft, VFloat(0)), splat_of(ft, VFloat(long(u64(0x7FF8000000000000)))), cmp))
+
+    var probed: Buf[IrArg] = buf()
+
+    probed.push(ir_arg(ft, probe))
+    probed.push(ir_arg(ft, probe))
+    strict_op(e, fresh_reg(e), "fcmps", cmp, [ft], probed, false, Some("oeq"), out)
+
+    // Out of range: zero for a NaN, the low bound below zero, the high one above.
+    val nan = fresh_reg(e)
+
+    quiet(e, nan, FUno, ft, cmp, v, v, out)
+
+    val negative = fresh_reg(e)
+
+    quiet(e, negative, FOlt, ft, cmp, v, splat_of(ft, VFloat(0)), out)
+
+    val low = if signed then negate(pow(from_int(2), usize(lane_bits - 1))) else from_int(0)
+    val high = if signed then sub(pow(from_int(2), usize(lane_bits - 1)), from_int(1))
+               else sub(pow(from_int(2), usize(lane_bits)), from_int(1))
+    val bound = fresh_reg(e)
+
+    out.push(InSelect(bound, negative, it, splat_of(it, VInt(low)), splat_of(it, VInt(high)), cmp))
+
+    val outside = fresh_reg(e)
+
+    out.push(InSelect(outside, nan, it, splat_of(it, VInt(from_int(0))), bound, cmp))
+    out.push(InSelect(d, inside, it, raw, outside, cmp))
+end saturating
+
+// A quiet comparison, strictly.
+private quiet(e: *Emit, d: Val, p: FCmp, ft: LType, cmp: LType, a: Val, b: Val, out: Buf[Inst])
+    var args: Buf[IrArg] = buf()
+
+    args.push(ir_arg(ft, a))
+    args.push(ir_arg(ft, b))
+    strict_op(e, d, "fcmp", cmp, [ft], args, false, Some(fcmp_render(p)), out)
+end quiet
+
+// A constant in every lane of `ty`, or the constant where `ty` is a scalar.
+private splat_of(ty: LType, v: Val) -> Val = ty match
+    LVec(_, elem) -> VSplat(*elem, v)
+    _ -> v
+
+private int_lane_bits(t: LType) -> int = t match
+    LInt(bits) -> bits
+    LVec(_, elem) -> int_lane_bits(*elem)
+    _ -> 0
+
+private float_lane_bits(t: LType) -> int = t match
+    LFloat(bits, _) -> bits
+    LVec(_, elem) -> float_lane_bits(*elem)
+    _ -> 0
+
+// The largest power of two a binary32 or binary64 holds.
+private max_exponent(fbits: int) -> int = if fbits == 32 then 127 else 1023
+
+// `2^k`, or `-2^k`, as LLVM writes a float constant -- the binary64 pattern whatever the width -- and
+// an infinity of that sign where the float cannot hold it.
+private float_power(k: int, fbits: int, negative: bool) -> Val
+    val sign: u64 = if negative then u64(1) << 63 else 0
+    val pattern = if k > max_exponent(fbits) then sign | u64(0x7FF0000000000000)
+                  else sign | (u64(k + 1023) << 52)
+
+    VFloat(long(pattern))
+end float_power

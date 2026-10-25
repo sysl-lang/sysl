@@ -27,6 +27,7 @@ These pages are generated from the library's own doc comments: every declaration
 | [`sysl.env`](sysl-env/) | Reading the environment a program was started with. |
 | [`sysl.env.hosted`](sysl-env-hosted/) |  |
 | [`sysl.env.sys`](sysl-env-sys/) |  |
+| [`sysl.fenv`](sysl-fenv/) | The floating-point environment: the rounding mode, the five exception flags, and on Arm the flush-to-zero and default-NaN controls. |
 | [`sysl.fmt`](sysl-fmt/) | What an `f"…"` hole's computed width or precision comes to — `${x}%.${n}f`, `${s}%${w}s` — and what an integer under a specifier renders as — `${n}%08x`. |
 | [`sysl.fs`](sysl-fs/) | What is at the end of a path: reading and writing whole files, metadata, directories, links, and the errors any of it can answer with. |
 | [`sysl.fs.errtext`](sysl-fs-errtext/) |  |
