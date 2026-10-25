@@ -133,15 +133,15 @@ private strict_inst(e: *Emit, i: Inst, out: Buf[Inst])
 
                 args.push(ir_arg(ty, a))
                 args.push(ir_arg(ty, b))
-                out.push(constrained(e, Some(d), name, ty, [ty], args, true, None))
+                strict_op(e, d, name, ty, [ty], args, true, None, out)
             None -> out.push(i)
         InFloatCmp(d, p, ty, a, b) ->
             var args: Buf[IrArg] = buf()
 
             args.push(ir_arg(ty, a))
             args.push(ir_arg(ty, b))
-            out.push(constrained(e, Some(d), if signals(p) then "fcmps" else "fcmp", compared_type(ty), [ty], args,
-                                 false, Some(fcmp_render(p))))
+            strict_op(e, d, if signals(p) then "fcmps" else "fcmp", compared_type(ty), [ty], args, false,
+                      Some(fcmp_render(p)), out)
         // A literal of `f32` is a binary64 constant narrowed where it is written, which is a rounding
         // the compiler does -- to nearest, as the literal's value is defined -- and not an operation
         // the environment governs. So it is narrowed here and written as its bits.
@@ -151,12 +151,26 @@ private strict_inst(e: *Emit, i: Inst, out: Buf[Inst])
                 return
             end if
 
+            // **An integer read as a float on a 32-bit Arm core is the plain conversion, fenced.** The
+            // Arm back end has no instruction for the constrained one at binary32 and expands it
+            // through binary64 in software, which rounds to nearest whatever FPSCR says. The plain
+            // `vcvt` rounds in FPSCR's mode and raises inexact, and the fences of `strict_op` hold it
+            // where it was written, so between them it is exactly the strict conversion.
+            if e.target.cpu == Thumb && (op == CastSIToFP || op == CastUIToFP)
+                val held = fenced_value(e, from, v, out)
+                val raw = fresh_reg(e)
+
+                out.push(InCast(raw, op, from, held, to))
+                fence_into(e, d, to, raw, out)
+                return
+            end if
+
             cast_op_name(op) match
                 Some(name) ->
                     var args: Buf[IrArg] = buf()
 
                     args.push(ir_arg(from, v))
-                    out.push(constrained(e, Some(d), name, to, [to, from], args, cast_rounds(op), None))
+                    strict_op(e, d, name, to, [to, from], args, cast_rounds(op), None, out)
                 None -> out.push(i)
         InCall(d, ret, callee, args, ret_attrs, fnty, fast, must) -> callee match
             VGlobal(name) ->
@@ -260,7 +274,7 @@ private strict_intrinsic(e: *Emit, d: Option[Val], ret: LType, called: string, a
 
     intrinsic_rounds(base) match
         Some(rounds) ->
-            out.push(constrained(e, d, base, ret, [ret], args, rounds, None))
+            strict_op(e, d.unwrap(), base, ret, [ret], args, rounds, None, out)
             true
         None -> false
 end strict_intrinsic
@@ -312,6 +326,74 @@ private constrained(e: *Emit, d: Option[Val], op: string, ret: LType, types: []c
     InCall(d, ret, VGlobal(name), all, no_ir_attrs(), None, fast, false)
 end constrained
 
+// `d = op(args)`, strictly, pushed onto `out`.
+//
+// **On a 32-bit Arm core the operation is also fenced in by its own operands and its answer.** An Arm
+// back end that does not implement LLVM's strict nodes -- the one in the clang Xcode ships is one --
+// lowers a constrained operation to the ordinary one before it schedules, so two `x + y` either side
+// of a `vmsr fpscr` become one `vadd.f32`, placed after both writes. So the first operand, every lane
+// of it, is passed through an empty `asm` before the operation and the answer through another after
+// it. Each fence is ordered with every other `asm` and call, so the operation can neither leave the
+// stretch between the writes it was written between nor be merged with its twin, whose operand comes
+// out of a different fence. An empty `asm` is no instruction: the value stays in its register.
+private strict_op(e: *Emit, d: Val, op: string, ret: LType, types: []const LType, args: Buf[IrArg],
+                  rounds: bool, predicate: Option[string], out: Buf[Inst])
+    if e.target.cpu != Thumb || args.is_empty()
+        out.push(constrained(e, Some(d), op, ret, types, args, rounds, predicate))
+        return
+    end if
+
+    var fenced: Buf[IrArg] = buf()
+
+    for i in 0..<args.len()
+        val a = args.at(i)
+
+        fenced.push(if i == 0 then ir_arg(a.ty, fenced_value(e, a.ty, a.value, out)) else a)
+
+    val raw = fresh_reg(e)
+
+    out.push(constrained(e, Some(raw), op, ret, types, fenced, rounds, predicate))
+    fence_into(e, d, ret, raw, out)
+end strict_op
+
+// `v` passed through a fence, as a fresh value.
+private fenced_value(e: *Emit, ty: LType, v: Val, out: Buf[Inst]) -> Val
+    val d = fresh_reg(e)
+
+    fence_into(e, d, ty, v, out)
+    d
+end fenced_value
+
+// `d = v`, through an empty `asm` holding it in a register of its kind -- a single-precision register
+// for an `f32`, a double one for an `f64`, a core register otherwise -- and a vector a lane at a time,
+// since a core without a vector unit computes it a lane at a time and every lane needs its fence.
+private fence_into(e: *Emit, d: Val, ty: LType, v: Val, out: Buf[Inst])
+    ty match
+        LVec(n, elem) ->
+            var acc = VPoison
+
+            for lane in 0..<n
+                val index = ir_arg(l_i32(), VInt(from_int(long(lane))))
+                val got = fresh_reg(e)
+
+                out.push(InExtractElement(got, ty, v, index))
+
+                val held = fenced_value(e, *elem, got, out)
+                val next = if lane == n - 1 then d else fresh_reg(e)
+
+                out.push(InInsertElement(next, ty, acc, *elem, held, index))
+                acc = next
+        _ ->
+            val register = ty match
+                LFloat(bits, _) -> if bits == 32 then "t" else "w"
+                _ -> "r"
+
+            var held: Buf[IrArg] = buf()
+
+            held.push(ir_arg(ty, v))
+            out.push(InAsm(Some(d), ty, "", s"=$register,0", held))
+end fence_into
+
 // `d = fptosi.sat(v)` (or `fptoui`), strictly: the conversion, which raises what it raises, and the
 // answer it gives only where the input is in range.
 private saturating(e: *Emit, d: Val, it: LType, signed: bool, arg: IrArg, out: Buf[Inst])
@@ -324,7 +406,7 @@ private saturating(e: *Emit, d: Val, it: LType, signed: bool, arg: IrArg, out: B
     var conv: Buf[IrArg] = buf()
 
     conv.push(arg)
-    out.push(constrained(e, Some(raw), if signed then "fptosi" else "fptoui", it, [it, ft], conv, false, None))
+    strict_op(e, raw, if signed then "fptosi" else "fptoui", it, [it, ft], conv, false, None, out)
 
     // In range: at or above the low bound (above -1 for an unsigned integer, which drops the fraction
     // of anything between), and below the high one. A bound past the float's range is an infinity,
@@ -332,17 +414,17 @@ private saturating(e: *Emit, d: Val, it: LType, signed: bool, arg: IrArg, out: B
     val top = if signed then lane_bits - 1 else lane_bits
     val hi = fresh_reg(e)
 
-    out.push(quiet(e, hi, if top <= max_exponent(fbits) then FOlt else FOne, ft, cmp, v,
-                   splat_of(ft, float_power(top, fbits, false))))
+    quiet(e, hi, if top <= max_exponent(fbits) then FOlt else FOne, ft, cmp, v,
+          splat_of(ft, float_power(top, fbits, false)), out)
 
     val lo = fresh_reg(e)
 
     if signed
         val finite = top <= max_exponent(fbits)
 
-        out.push(quiet(e, lo, if finite then FOge else FOne, ft, cmp, v, splat_of(ft, float_power(top, fbits, true))))
+        quiet(e, lo, if finite then FOge else FOne, ft, cmp, v, splat_of(ft, float_power(top, fbits, true)), out)
     else
-        out.push(quiet(e, lo, FOgt, ft, cmp, v, splat_of(ft, VFloat(long(u64(0xBFF0000000000000))))))
+        quiet(e, lo, FOgt, ft, cmp, v, splat_of(ft, VFloat(long(u64(0xBFF0000000000000)))), out)
     end if
 
     val inside = fresh_reg(e)
@@ -361,16 +443,16 @@ private saturating(e: *Emit, d: Val, it: LType, signed: bool, arg: IrArg, out: B
 
     probed.push(ir_arg(ft, probe))
     probed.push(ir_arg(ft, probe))
-    out.push(constrained(e, Some(fresh_reg(e)), "fcmps", cmp, [ft], probed, false, Some("oeq")))
+    strict_op(e, fresh_reg(e), "fcmps", cmp, [ft], probed, false, Some("oeq"), out)
 
     // Out of range: zero for a NaN, the low bound below zero, the high one above.
     val nan = fresh_reg(e)
 
-    out.push(quiet(e, nan, FUno, ft, cmp, v, v))
+    quiet(e, nan, FUno, ft, cmp, v, v, out)
 
     val negative = fresh_reg(e)
 
-    out.push(quiet(e, negative, FOlt, ft, cmp, v, splat_of(ft, VFloat(0))))
+    quiet(e, negative, FOlt, ft, cmp, v, splat_of(ft, VFloat(0)), out)
 
     val low = if signed then negate(pow(from_int(2), usize(lane_bits - 1))) else from_int(0)
     val high = if signed then sub(pow(from_int(2), usize(lane_bits - 1)), from_int(1))
@@ -386,12 +468,12 @@ private saturating(e: *Emit, d: Val, it: LType, signed: bool, arg: IrArg, out: B
 end saturating
 
 // A quiet comparison, strictly.
-private quiet(e: *Emit, d: Val, p: FCmp, ft: LType, cmp: LType, a: Val, b: Val) -> Inst
+private quiet(e: *Emit, d: Val, p: FCmp, ft: LType, cmp: LType, a: Val, b: Val, out: Buf[Inst])
     var args: Buf[IrArg] = buf()
 
     args.push(ir_arg(ft, a))
     args.push(ir_arg(ft, b))
-    constrained(e, Some(d), "fcmp", cmp, [ft], args, false, Some(fcmp_render(p)))
+    strict_op(e, d, "fcmp", cmp, [ft], args, false, Some(fcmp_render(p)), out)
 end quiet
 
 // A constant in every lane of `ty`, or the constant where `ty` is a scalar.

@@ -38,7 +38,7 @@ even `1.0`, upward to the float above, and down and toward zero to `1.0`.
 
 | | |
 |---|---|
-| `Rounding` | `NearestEven`, `Upward`, `Downward`, `TowardZero` — IEEE 754's four directions |
+| `RoundingMode` | `NearestEven`, `Upward`, `Downward`, `TowardZero` — IEEE 754's four directions |
 | `rounding()`, `set_rounding(r)` | the mode in force on this thread, and setting it |
 | `with_rounding(r, body)` | runs `body` with `r` in force and puts the mode it found back on every way out |
 | `FpFlags` | `invalid`, `divide_by_zero`, `overflow`, `underflow`, `inexact`, and `any()` |

@@ -61,10 +61,36 @@ private strict_refusal(t: Target, x: TExpr) -> Option[string] = *x.kind match
 
 private arithmetic_op(op: string) -> bool = op == "+" || op == "-" || op == "*" || op == "/" || op == "%"
 
-// A conversion is a float operation where either side is a float.
+// A conversion is a float operation where either side is a float, and its integer side is held to what
+// the unit converts.
 private conversion_refusal(t: Target, from: Type, to: Type) -> Option[string] = width_refusal(t, from) match
     Some(m) -> Some(m)
-    None -> width_refusal(t, to)
+    None -> width_refusal(t, to) match
+        Some(m) -> Some(m)
+        None ->
+            if float_lane(from).is_some() then wide_integer_refusal(t, to, from)
+            else if float_lane(to).is_some() then wide_integer_refusal(t, from, to)
+            else None
+
+// **An integer wider than the machine's word converts in software**: a 32-bit Arm core reads an `i64`
+// as a float with `__aeabi_l2f`, and every machine reads an `i128` with `__floattisf`. The library
+// rounds to nearest whatever the environment says and raises nothing, so such a conversion is refused
+// like any other float in software.
+private wide_integer_refusal(t: Target, integer: Type, float: Type) -> Option[string]
+    val lane = underlying(integer) match
+        Vector(_, elem) -> underlying(*elem)
+        other -> other
+
+    val word = int(t.pointer_bits())
+
+    val bits = lane match
+        Integer(b, _, pointer_width) -> if pointer_width then word else b
+        _ -> return None
+
+    if bits <= word then return None
+
+    Some(s"'@strict_fp' asks the floating-point unit to follow its environment, and on '${t.name}' a conversion between ${type_show(integer)} and ${type_show(float)} is a library call, since the unit converts integers of at most $word bits — and a library call has no environment to follow and raises nothing; convert through an integer of $word bits, or compute this outside a '@strict_fp' body")
+end wide_integer_refusal
 
 // The lane type of a float, or of a vector of floats.
 private float_lane(ty: Type) -> Option[Type]

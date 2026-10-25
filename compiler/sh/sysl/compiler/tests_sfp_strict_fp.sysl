@@ -248,10 +248,13 @@ sfp_probe_ir()
     val ir = sfp_ir(sfp_probe, Some("aarch64-freestanding"))
     val body = sfp_body(ir, "probe")
 
-    sfp_says(body, "strictfp #99 {")
+    // The definition itself is strictfp, whether or not it carries the `#99` group.
+    sfp_says(body, " @probe(float %x.param, float %y.param) strictfp")
     assert_eq(sfp_count(body, "@llvm.experimental.constrained.fadd.f32(float "), 2)
     sfp_says(body, "metadata !\"round.dynamic\", metadata !\"fpexcept.strict\") strictfp")
     sfp_lacks(body, " fadd float")
+    // The fences are a 32-bit Arm core's alone; AArch64's back end keeps the strict nodes in order.
+    sfp_lacks(body, "asm sideeffect \"\"")
 
     // Every call in the body carries the attribute, the registers' and the printing's alike.
     val lines = split(body, "\n")
@@ -424,6 +427,48 @@ sfp_fma_in_each_mode()
 
     sfp_says(sfp_body(ir, "fused"), "@llvm.experimental.constrained.fma.f64(")
 end sfp_fma_in_each_mode
+
+// `mul_add` is the same operation asked for by name, so it is fused on every machine and needs no
+// contraction: the same tie in the four modes at f64, and at f32 with a = b = 1 + 2^-23, whose exact
+// 2^-22 + 2^-46 against -1 is a tie again. inf * 0 + 1 is invalid and a NaN, raised by the one call.
+private val sfp_mul_add_program: string = raw"""
+    import sysl.fenv.*
+
+    @strict_fp
+    fused(a: f64, s: f32, zero: f64) -> string
+        var out = ""
+
+        for r in [NearestEven, Upward, Downward, TowardZero]
+            set_rounding(r)
+            out = out + f"${a.mul_add(a, -1.0).bits()}%016x ${s.mul_add(s, -1.0f32).bits()}%08x "
+
+        set_rounding(NearestEven)
+        clear_flags()
+
+        val bad = (1.0 / zero).mul_add(zero, 1.0)
+
+        out + f"${bad.is_nan()} ${flags().invalid}"
+    end fused
+
+    main(args: []string)
+        val one = real(args.len)
+
+        print(fused(one + real.from_bits(0x3CB0000000000000), f32(one) + f32.from_bits(0x34000000), one - 1.0))
+    """
+
+@test("mul_add in a strict body is one constrained fma, rounded once in each mode, at f32 and f64")
+sfp_mul_add_in_each_mode()
+    if !sfp_ready() then return
+
+    sfp_prints(sfp_mul_add_program, "3cc0000000000000 34800000 3cc0000000000001 34800001 " +
+               "3cc0000000000000 34800000 3cc0000000000000 34800000 true true\n")
+
+    val body = sfp_body(sfp_ir(sfp_mul_add_program, Some("aarch64-freestanding")), "fused")
+
+    sfp_says(body, "@llvm.experimental.constrained.fma.f64(")
+    sfp_says(body, "@llvm.experimental.constrained.fma.f32(")
+    sfp_lacks(body, "@llvm.fma.")
+end sfp_mul_add_in_each_mode
 
 // -- conversions --------------------------------------------------------------------------------------
 
@@ -599,7 +644,7 @@ private val sfp_threads_program: string = raw"""
     import sysl.threads.*
 
     struct Job
-        mode: Rounding
+        mode: RoundingMode
         x: f64
         bits: u64
         kept: bool
@@ -724,16 +769,19 @@ sfp_inlining_rules()
 
     remove_dir_all(root).unwrap_or(())
 
-    val main_at = text.index_of("_$$main:").unwrap()
+    val main_at = text.index_of("\n_main:").unwrap()
     val main_code = text[main_at..<text.len]
 
     sfp_says(main_code[0..<main_code.index_of("\tret").unwrap()], "bl\t_twice")
 
-    val around_at = text.index_of("_around:").unwrap()
+    val around_at = text.index_of("\n_around:").unwrap()
     val around_code = text[around_at..<text.len]
     val code = around_code[0..<around_code.index_of("\tret").unwrap()]
 
-    assert_eq(sfp_count(code, "\tfdiv\t"), 2)
+    // The two `x / 3.0` may be one `fdiv`: nothing between them reads or writes the environment, the
+    // flags are sticky, so the second division can change nothing the first did not. What may not
+    // happen is the helper's multiply staying a call, or a division vanishing into the constant.
+    sfp_says(code, "\tfdiv\t")
     sfp_says(code, "\tfmul\t")
     sfp_lacks(code, "bl\t_helper")
 end sfp_inlining_rules
@@ -899,37 +947,80 @@ end sfp_ordinary_ir_unchanged
 
 // -- boards -------------------------------------------------------------------------------------------
 
-// On a Cortex-M4F the strict additions either side of `set_rounding` are two `vadd.f32`, and the
-// environment is FPSCR, read and written with `vmrs` and `vmsr`.
-@test("on a Cortex-M4F a strict body is two vadd.f32 around vmsr fpscr")
+// On a Cortex-M4F the strict additions either side of `set_rounding` are two `vadd.f32`, each after
+// the `vmsr fpscr` written before it, and so are the two conversions of an integer. An Arm back end
+// that lowers a constrained operation to the plain one merges the twins into one, placed after every
+// write; the fences `strict_op` puts around each operation are what keeps them apart, whichever
+// clang builds it.
+private val sfp_board_program: string = raw"""
+    import sysl.fenv.*
+
+    @strict_fp
+    @export("bracket")
+    bracket(x: f32, y: f32) -> f32
+        set_rounding(Upward)
+        val a = x + y
+        set_rounding(Downward)
+        val b = x + y
+        clear_flags()
+        a - b
+
+    @strict_fp
+    @export("converted")
+    converted(n: i32) -> f32
+        set_rounding(Upward)
+        val a = f32(n)
+        set_rounding(Downward)
+        val b = f32(n)
+        set_rounding(NearestEven)
+        a - b
+
+    @export("main")
+    boot() -> i32 = 0
+    """
+
+// The order of the writes of FPSCR (`C`), the instruction `op` (`A`) and the subtraction (`S`) in `code`.
+private sfp_board_order(code: string, op: string) -> string
+    val lines = split(code, "\n")
+    var order = ""
+
+    for i in 0..<lines.len
+        if lines[i].contains("vmsr\tfpscr") then order = order + "C"
+        else if lines[i].contains(op) then order = order + "A"
+        else if lines[i].contains("vsub.f32") then order = order + "S"
+
+    order
+end sfp_board_order
+
+@test("on a Cortex-M4F a strict body is two vadd.f32, each after the vmsr fpscr before it")
 sfp_cortex_m4()
-    val program = raw"""
-        import sysl.fenv.*
-
-        @strict_fp
-        @export("bracket")
-        bracket(x: f32, y: f32) -> f32
-            set_rounding(Upward)
-            val a = x + y
-            set_rounding(Downward)
-            val b = x + y
-            clear_flags()
-            a - b
-
-        @export("main")
-        boot() -> i32 = 0
-        """
-
-    val code = fx2_board_code(program, "thumbv7em-freestanding", "bracket")
+    val code = fx2_board_code(sfp_board_program, "thumbv7em-freestanding", "bracket")
 
     if code.is_none() then return
 
     val text = code.unwrap()
 
-    assert_eq(sfp_count(text, "vadd.f32"), 2, text)
-    sfp_says(text, "vmsr\tfpscr")
+    assert_eq(sfp_board_order(text, "vadd.f32"), "CACACS", text)
     sfp_says(text, "vmrs\t")
 end sfp_cortex_m4
+
+@test("on a Cortex-M4F the two conversions of one integer are two vcvt, each in its own mode")
+sfp_cortex_m4_conversions()
+    val code = fx2_board_code(sfp_board_program, "thumbv7em-freestanding", "converted")
+
+    if code.is_none() then return
+
+    assert_eq(sfp_board_order(code.unwrap(), "vcvt.f32.s32"), "CACACS", code.unwrap())
+end sfp_cortex_m4_conversions
+
+@test("on a Cortex-M33 a strict body is two vadd.f32, each after the vmsr fpscr before it")
+sfp_cortex_m33()
+    val code = fx2_board_code(sfp_board_program, "thumb-freestanding", "bracket")
+
+    if code.is_none() then return
+
+    assert_eq(sfp_board_order(code.unwrap(), "vadd.f32"), "CACACS", code.unwrap())
+end sfp_cortex_m33
 
 // On x86-64 the environment is MXCSR, through memory.
 @test("on x86-64 sysl.fenv is stmxcsr and ldmxcsr, and the strict additions stay two")
@@ -1008,6 +1099,33 @@ sfp_refuses_soft_targets()
 
     sfp_lacks(none, "error:")
 end sfp_refuses_soft_targets
+
+// A conversion whose integer is wider than the machine's word is a library call, both ways, and an
+// integer of the word's width or narrower is the unit's own instruction and is not refused.
+@test("a conversion with an integer wider than the machine's word is refused, both ways, at the word not")
+sfp_refuses_wide_integer_conversions()
+    if !sfp_ready() then return
+
+    val word32 = "'@strict_fp' asks the floating-point unit to follow its environment, and on 'thumbv7em-freestanding' a conversion between "
+    val tail32 = " is a library call, since the unit converts integers of at most 32 bits — and a library call has no environment to follow and raises nothing; convert through an integer of 32 bits, or compute this outside a '@strict_fp' body"
+
+    sfp_refused("@strict_fp\n@export(\"f\")\nf(n: i64) -> f32 = f32(n)\n", Some("thumbv7em-freestanding"),
+                word32 + "i64 and f32" + tail32)
+    sfp_refused("@strict_fp\n@export(\"f\")\nf(x: f32) -> u64 = u64(x)\n", Some("thumbv7em-freestanding"),
+                word32 + "u64 and f32" + tail32)
+    sfp_refused("@strict_fp\n@export(\"f\")\nf(n: i128) -> f64 = real(n)\n", Some("aarch64-freestanding"),
+                "'@strict_fp' asks the floating-point unit to follow its environment, and on 'aarch64-freestanding' a conversion between i128 and real is a library call, since the unit converts integers of at most 64 bits — and a library call has no environment to follow and raises nothing; convert through an integer of 64 bits, or compute this outside a '@strict_fp' body")
+
+    val narrow = sfp_ir("@strict_fp\n@export(\"g\")\ng(n: i32, m: usize, b: u8) -> f32 = f32(n) + f32(m) + f32(b)\n",
+                        Some("thumbv7em-freestanding"))
+
+    sfp_lacks(narrow, "error:")
+
+    val wide = sfp_ir("@strict_fp\n@export(\"g\")\ng(n: i64, m: u64) -> f64 = real(n) + real(m)\n",
+                      Some("aarch64-freestanding"))
+
+    sfp_lacks(wide, "error:")
+end sfp_refuses_wide_integer_conversions
 
 @test("a reduction of a float vector in a strict body is refused")
 sfp_refuses_reduction()
