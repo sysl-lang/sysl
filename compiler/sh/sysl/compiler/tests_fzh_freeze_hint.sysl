@@ -1,0 +1,150 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.text.str_builder
+
+// The `&sync` refusal of a buffer says what WOULD cross: `Buf.freeze()` answers a `&sync Frozen[T]`
+// (`reference/memory.md § A frozen buffer crosses`), and any container crosses behind a `Mutex`. An
+// earlier wording said no spelling of a `Buf` could cross, which was false.
+
+private fzh_ready() -> bool
+    std_root() match
+        Ok(_) -> true
+        Err(_) ->
+            print("skipped: the standard module's source is not on this machine")
+            false
+
+// Every diagnostic a one-file program earns, one message to a line in source order.
+private fzh_diags(text: string) -> string
+    val root = make_temp_dir("sysl-fzh").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    var b = str_builder()
+
+    emit_llvm_text(src, None) match
+        Err(why) -> b.push(s"refused: ${why.message}")
+        Ok(made) ->
+            val ordered = in_source_order(made.report)
+
+            for i in 0..<ordered.len()
+                if i > 0 then b.push("\n")
+
+                b.push(ordered.at(i).diag.message)
+
+    remove_dir_all(root).unwrap_or(())
+    b.finish()
+end fzh_diags
+
+private fzh_buf_hint(elem: string) -> string =
+    s"which is shared through a count that is not atomic. Hold its elements as a '&sync Frozen[$elem]', " +
+    "built with '.freeze()' (reference: memory, 'A frozen buffer crosses'), or guard the buffer in a " +
+    "'Mutex' ('06')"
+
+@test("a Buf field of a '&sync' struct is told to hold a frozen buffer, built with 'freeze'")
+fzh_buf_field()
+    if !fzh_ready() then return
+
+    assert_eq(fzh_diags("import sysl.buf.{Buf, buf}\n\nstruct ImageTexture\n    rgb: Buf[byte]\n\n" +
+                        "val t: &sync ImageTexture = ImageTexture(buf())\n\nprint(t.rgb.len())\n"),
+              "'&sync ImageTexture' may be reached from two domains at once, so every count inside it " +
+              "has to be atomic — but its 'rgb' is a 'sysl.buf.Buf[byte]', " + fzh_buf_hint("byte"))
+end fzh_buf_field
+
+@test("a Buf two structs down names the Buf and the same way out")
+fzh_buf_nested()
+    if !fzh_ready() then return
+
+    val said = fzh_diags("import sysl.buf.{Buf, buf}\n\nstruct Pixels\n    rgb: Buf[u16]\n\n" +
+                         "struct Texture\n    pixels: Pixels\n\nval t: &sync Texture = Texture(Pixels(buf()))\n\n" +
+                         "print(t.pixels.rgb.len())\n")
+
+    assert(said.contains("its 'pixels.rgb' is a 'sysl.buf.Buf[ushort]', " + fzh_buf_hint("ushort")), said)
+end fzh_buf_nested
+
+@test("a generic holder instantiated at a Buf names the Buf's element")
+fzh_generic_holder()
+    if !fzh_ready() then return
+
+    val said = fzh_diags("import sysl.buf.{Buf, buf}\n\nstruct Holder[T]\n    v: T\n\n" +
+                         "val h: &sync Holder[Buf[byte]] = Holder(buf())\n\nprint(h.v.len())\n")
+
+    assert(said.contains("a 'sysl.buf.Buf[byte]', " + fzh_buf_hint("byte")), said)
+end fzh_generic_holder
+
+@test("a view field points at freezing the buffer it views")
+fzh_view_field()
+    if !fzh_ready() then return
+
+    val said = fzh_diags("struct Window\n    cells: []int\n\nval w: &sync Window = Window([])\n\nprint(w.cells.len)\n")
+
+    assert(said.contains("but its 'cells' reaches a '[]int', which owns its elements through a count that is " +
+                         "not atomic. A literal's elements are immortal and would be safe to share, but " +
+                         "nothing in the type says whether these are, so a shared object holds no view at " +
+                         "all. To share a buffer's elements, freeze the buffer and hold the " +
+                         "'&sync Frozen[T]' it answers, built with '.freeze()' (reference: memory, 'A " +
+                         "frozen buffer crosses') ('06')"), said)
+end fzh_view_field
+
+@test("a string field is not told about freezing, a string being no buffer")
+fzh_string_field()
+    if !fzh_ready() then return
+
+    val said = fzh_diags("struct Label\n    text: string\n\nval l: &sync Label = Label(\"a\")\n\nprint(l.text)\n")
+
+    assert(said.contains("holds no view at all ('06')"), said)
+    assert(!said.contains("freeze"), said)
+end fzh_string_field
+
+@test("a Deque is told to be guarded, since only a Buf freezes")
+fzh_deque_field()
+    if !fzh_ready() then return
+
+    val said = fzh_diags("import sysl.container.{Deque, deque}\n\nstruct Jobs\n    queue: Deque[int]\n\n" +
+                         "val j: &sync Jobs = Jobs(deque())\n\nprint(j.queue.len())\n")
+
+    assert(said.contains("so it crosses into a '&sync' only guarded by a 'Mutex' ('06')"), said)
+    assert(!said.contains("freeze"), said)
+end fzh_deque_field
+
+@test("the spelling the message suggests compiles: a frozen buffer in a '&sync' struct")
+fzh_frozen_spelling_compiles()
+    if !fzh_ready() then return
+
+    assert_eq(fzh_diags(raw"""
+        import sysl.buf.{Buf, buf, Frozen}
+
+        struct Texture
+            width: usize
+            pixels: &sync Frozen[u8]
+
+        var b: Buf[u8] = buf()
+
+        for i in 0..<6
+            b.push(u8(i * 40))
+
+        val tex: &sync Texture = Texture(3, b.freeze())
+
+        print(tex.pixels[4], tex.pixels.len())
+        """), "")
+end fzh_frozen_spelling_compiles
+
+@test("the other spelling it suggests compiles too: a Buf behind a Mutex in a '&sync' struct")
+fzh_mutex_spelling_compiles()
+    if !fzh_ready() then return
+
+    assert_eq(fzh_diags(raw"""
+        import sysl.buf.{Buf, buf}
+        import sysl.threads.Mutex
+
+        struct Texture
+            pixels: Mutex[Buf[u8]]
+
+        val tex: &sync Texture = Texture(Mutex.new(buf()))
+
+        print(tex.pixels.with((p) -> p.len()))
+        """), "")
+end fzh_mutex_spelling_compiles
