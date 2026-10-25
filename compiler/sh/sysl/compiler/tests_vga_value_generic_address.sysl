@@ -304,3 +304,71 @@ vga_method_refuses_the_wrong_type()
     vga_refused(said, "'K' of 'pick' is uint, but string was given", "main.sysl:10:14")
     assert(!said.contains("undefined name 'K'"), said)
 end vga_method_refuses_the_wrong_type
+
+// -- a member's own value parameter, at an address --------------------------------------------------
+
+@test("'&T.f[K]' takes a named constant, arithmetic over one, and another module's")
+vga_member_address_takes_a_constant()
+    if xvr_no_library() then return
+
+    assert_eq(xvr_ran([("main.sysl", raw"""
+        const TWO: u32 = 2
+
+        struct Sq
+            n: u32
+
+        impl Sq
+            pick[const K: u32](x: u32) -> u32 = x + K
+            scaled[const K: u32](*self, x: u32) -> u32 = self.n + x * K
+
+        var q = Sq(100)
+        val a: *extern(u32) -> u32 = &Sq.pick[TWO]
+        val b: *extern(u32) -> u32 = &Sq.pick[TWO + 1]
+        val c: *extern(u32) -> u32 = &Sq.pick[m.TEN]
+        val d: *extern(*Sq, u32) -> u32 = &Sq.scaled[TWO]
+
+        print(a(1), b(1), c(1), d(&q, 5))
+        """), ("m/a.sysl", "module m\nconst TEN: u32 = 10\n")]), "3 4 11 110\n")
+end vga_member_address_takes_a_constant
+
+// A generic type's generic member: the type's argument written as a type, the member's a value.
+@test("'&Box[T].f[U, K]' reads the type's and the member's type arguments as types, its value as a value")
+vga_generic_type_member_address()
+    if xvr_no_library() then return
+
+    assert_eq(vga_ran(raw"""
+        const TWO: u32 = 2
+
+        struct Box[T]
+            v: T
+
+        impl[T] Box[T]
+            scaled[U: Integer, const K: u32](x: U) -> U = x * U(K)
+
+        val f: *extern(u64) -> u64 = &Box[bool].scaled[u64, TWO]
+        val g: *extern(i16) -> i16 = &Box[int].scaled[i16, TWO * TWO]
+        print(f(7), g(7))
+        """), "14 28\n")
+end vga_generic_type_member_address
+
+@test("'&T.f[K]' refuses a variable, with no second error from the member's body")
+vga_member_address_refuses_a_variable()
+    if xvr_no_library() then return
+
+    val said = vga_ir(raw"""
+        var two: u32 = 2
+
+        struct Sq
+            n: u32
+
+        impl Sq
+            pick[const K: u32](x: u32) -> u32 = x + K
+
+        val f: *extern(u32) -> u32 = &Sq.pick[two]
+        print(f(1))
+        """)
+
+    vga_refused(said, "a value argument must be a constant — a literal, or a 'const' naming one",
+                "main.sysl:9:39")
+    assert(!said.contains("undefined name 'K'"), said)
+end vga_member_address_refuses_a_variable
