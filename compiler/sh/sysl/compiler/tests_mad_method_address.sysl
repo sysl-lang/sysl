@@ -1,0 +1,742 @@
+module sh.sysl.compiler
+@tests
+
+// `&T.f` -- the address of an associated function, which is `&f` one name over: a method's receiver
+// is its first parameter, a static function is a function, and a generic type's member is addressed
+// at an instantiation the brackets write or the address's own type says. Every refusal is the one
+// `&f` gives where the cause is the same, and the two new ones -- a trait's member, and a member
+// with type parameters of its own -- name what does have an address.
+//
+// The harness is `tests_xvr_extern_var.sysl`'s: `xvr_ran` for a program built and run, `xvr_ir`
+// for the analysis's report.
+
+private mad_ran(text: string) -> string = xvr_ran([("main.sysl", text)])
+
+private mad_ir(text: string) -> string = xvr_ir([("main.sysl", text)])
+
+// A refusal carries this message, anchored at this `file:line:column`.
+private mad_refused(said: string, message: string, at: string) =
+    assert(said.contains(s"error: $message\n --> $at\n"), said)
+
+// What an aggregate in an addressed signature is told, after the words naming which part it is.
+private mad_aggregate() -> string =
+    ", an aggregate, and an aggregate crosses to C in whichever registers that machine's " +
+    "convention names rather than the ones a sysl call uses — so this address would be of a " +
+    "function C cannot call correctly. A wrapper taking the parts behind a '*T', or '@export' on " +
+    "this one, is what has an address"
+
+// -- the three kinds of member ---------------------------------------------------------------------
+
+@test("a '*self' method's address takes the receiver first, and a call through it writes the value")
+mad_a_pointer_receiver()
+    if xvr_no_library() then return
+
+    assert_eq(mad_ran(raw"""
+        struct Counter
+            n: int
+
+        impl Counter
+            bump(*self, by: int) -> int
+                self.n += by
+                self.n
+
+        var c = Counter(n = 1)
+        val b = &Counter.bump
+
+        print(b(&c, 4), b(&c, 2), c.n)
+        """), "5 7 7\n")
+end mad_a_pointer_receiver
+
+@test("a static associated function's address is an ordinary one")
+mad_a_static_function()
+    if xvr_no_library() then return
+
+    assert_eq(mad_ran(raw"""
+        struct Scale
+            k: int
+
+        impl Scale
+            triple(n: int) -> int = n * 3
+
+        val t: *extern(int) -> int = &Scale.triple
+
+        print(t(4), (&Scale.triple)(5))
+        """), "12 15\n")
+end mad_a_static_function
+
+@test("a simple enum's 'self' method crosses as its integer, so it has an address")
+mad_an_enum_by_value_receiver()
+    if xvr_no_library() then return
+
+    assert_eq(mad_ran(raw"""
+        enum Colour
+            Red
+            Green
+
+        impl Colour
+            code(self) -> int = if self == Colour.Red then 1 else 2
+
+        val code = &Colour.code
+
+        print(code(Colour.Red), code(Colour.Green))
+        """), "1 2\n")
+end mad_an_enum_by_value_receiver
+
+@test("a struct's 'self' method is refused, the receiver being an aggregate C cannot be handed")
+mad_a_struct_by_value_receiver()
+    mad_refused(mad_ir(raw"""
+        struct Sq
+            s: int
+
+        impl Sq
+            side(self) -> int = self.s
+
+        val c = &Sq.side
+        """), s"the 1st parameter of 'Sq.side' is Sq${mad_aggregate()}", "main.sysl:7:9")
+end mad_a_struct_by_value_receiver
+
+@test("'Self.f' inside the type's own block is the same address")
+mad_self_inside_the_block()
+    if xvr_no_library() then return
+
+    assert_eq(mad_ran(raw"""
+        struct Order
+            x: int
+
+        impl Order
+            plus(n: int) -> int = n + 100
+
+            handed() -> *extern(int) -> int = &Self.plus
+
+        print(Order.handed()(2))
+        """), "102\n")
+end mad_self_inside_the_block
+
+// -- a generic type --------------------------------------------------------------------------------
+
+@test("a generic type's member is addressed at the arguments written, method and static alike")
+mad_generic_written()
+    if xvr_no_library() then return
+
+    assert_eq(mad_ran(raw"""
+        struct Box[T]
+            v: T
+
+        impl[T] Box[T]
+            get(*self) -> T = self.v
+
+            same(x: T) -> T = x
+
+        var bx = Box(v = 7)
+        var by = Box(v = 2u8)
+        val g = &Box[int].get
+        val h = &Box[u8].get
+
+        print(g(&bx), h(&by), (&Box[i32].same)(5))
+        """), "7 2 5\n")
+end mad_generic_written
+
+@test("and the receiver in the address's own type settles them where none are written")
+mad_generic_from_the_receiver()
+    if xvr_no_library() then return
+
+    assert_eq(mad_ran(raw"""
+        struct Box[T]
+            v: T
+
+        impl[T] Box[T]
+            get(*self) -> T = self.v
+
+        var bx = Box(v = 9)
+        val g: *extern(*Box[int]) -> int = &Box.get
+
+        print(g(&bx))
+        """), "9\n")
+end mad_generic_from_the_receiver
+
+@test("a static member's result settles them too, and the address is then judged as any other")
+mad_generic_from_the_result()
+    mad_refused(mad_ir(raw"""
+        struct Box[T]
+            v: T
+
+        impl[T] Box[T]
+            of(v: T) -> Box[T] = Box(v = v)
+
+        val mk: *extern(int) -> Box[int] = &Box.of
+        """), s"the result of 'Box.of' is Box[int]${mad_aggregate()}", "main.sysl:7:36")
+end mad_generic_from_the_result
+
+@test("and with nothing to go on, the refusal names the written form")
+mad_generic_nothing_to_go_on()
+    mad_refused(mad_ir(raw"""
+        struct Box[T]
+            v: T
+
+        impl[T] Box[T]
+            get(*self) -> T = self.v
+
+        val g = &Box.get
+        """), "'Box' is generic, so which copy of 'get' this addresses depends on its type " +
+              "arguments, and nothing here says what they are — write them, as '&Box[…].get', or " +
+              "write the type this is stored in", "main.sysl:7:9")
+end mad_generic_nothing_to_go_on
+
+@test("a type parameter's member, in a generic body, is the address at each instantiation")
+mad_through_a_type_parameter()
+    if xvr_no_library() then return
+
+    assert_eq(mad_ran(raw"""
+        trait Maker
+            make() -> int
+
+            twice() -> int
+                val p = &Self.make
+                p() * 2
+
+        struct A
+            n: int
+
+        struct B
+            n: int
+
+        impl Maker for A
+            make() -> int = 3
+
+        impl Maker for B
+            make() -> int = 4
+
+        made[T: Maker]() -> int
+            val p = &T.make
+            p()
+
+        loose[T](x: T) -> int
+            val p = &T.make
+            p() + 10
+
+        print(made[A](), made[B](), A.twice(), B.twice(), (&A.make)(), loose(B(n = 0)))
+        """), "3 4 6 8 3 14\n")
+end mad_through_a_type_parameter
+
+// -- where the address goes ------------------------------------------------------------------------
+
+@test("handed to C, which calls it back")
+mad_handed_to_c()
+    if xvr_no_library() then return
+
+    assert_eq(mad_ran(raw"""
+        import sysl.raw.ptr_cast
+
+        extern qsort(base: *u8, n: usize, size: usize, cmp: *extern(*u8, *u8) -> i32)
+
+        struct Order
+            x: int
+
+        impl Order
+            descending(a: *u8, b: *u8) -> i32
+                var pa: *i32 = ptr_cast(a)
+                var pb: *i32 = ptr_cast(b)
+                *pb - *pa
+
+        var xs: [4]i32 = [30, 10, 40, 20]
+
+        qsort(ptr_cast(&xs[0]), 4, 4, &Order.descending)
+        print(xs[0], xs[1], xs[2], xs[3])
+        """), "40 30 20 10\n")
+end mad_handed_to_c
+
+@test("handed to a sysl function's '*extern' parameter, and kept in a field")
+mad_handed_to_sysl()
+    if xvr_no_library() then return
+
+    assert_eq(mad_ran(raw"""
+        struct K
+            n: int
+
+        impl K
+            inc(n: int) -> int = n + 1
+
+        struct Hook
+            f: *extern(int) -> int
+
+        apply(f: *extern(int) -> int, n: int) -> int = f(n)
+
+        val h = Hook(f = &K.inc)
+
+        print(apply(&K.inc, 1), h.f(10))
+        """), "2 11\n")
+end mad_handed_to_sysl
+
+@test("and a counted '&Fn' parameter refuses it in the words it refuses '&f'")
+mad_not_a_counted_callable()
+    val said = mad_ir(raw"""
+        struct K
+            n: int
+
+        impl K
+            inc(n: int) -> int = n + 1
+
+        take(f: &Fn(int) -> int) -> int = f(1)
+
+        val x = take(&K.inc)
+        """)
+
+    mad_refused(said, "'f' of 'take' is &Fn(int) -> int, but *extern(int) -> int was given",
+                "main.sysl:9:14")
+end mad_not_a_counted_callable
+
+// -- the declaration ---------------------------------------------------------------------------------
+
+@test("a member whose result is inferred has its address at the inferred type")
+mad_an_inferred_result()
+    if xvr_no_library() then return
+
+    assert_eq(mad_ran(raw"""
+        struct Order
+            x: int
+
+        impl Order
+            plus(n: int) = n + 100
+
+        val p = &Order.plus
+
+        print(p(1))
+        """), "101\n")
+end mad_an_inferred_result
+
+@test("a type declared after the address is taken")
+mad_declared_after_use()
+    if xvr_no_library() then return
+
+    assert_eq(mad_ran(raw"""
+        use(f: *extern(int) -> int) -> int = f(8)
+
+        print(use(&Late.half))
+
+        struct Late
+            x: int
+
+        impl Late
+            half(n: int) -> int = n / 2
+        """), "4\n")
+end mad_declared_after_use
+
+private mad_shapes(body: string) -> (string, string) = ("shapes/shapes.sysl", s"module shapes\n$body\n")
+
+@test("across modules, through the module's name and through an imported type's")
+mad_across_modules()
+    if xvr_no_library() then return
+
+    assert_eq(xvr_ran([mad_shapes(raw"""
+        struct Gauge
+            n: int
+
+        impl Gauge
+            scale(n: int) -> int = n * 3
+
+            read(*self) -> int = self.n
+        """), ("main.sysl", raw"""
+        import shapes
+        import shapes.Gauge
+
+        var g = Gauge(n = 6)
+
+        print((&shapes.Gauge.scale)(4), (&Gauge.scale)(5), (&shapes.Gauge.read)(&g))
+        """)]), "12 15 6\n")
+end mad_across_modules
+
+@test("a private associated function is refused from outside its file")
+mad_private_outside_its_file()
+    val said = xvr_ir([mad_shapes(raw"""
+        struct Hidden
+            n: int
+
+        impl Hidden
+            private secret(n: int) -> int = n
+        """), ("main.sysl", raw"""
+        import shapes.Hidden
+
+        val e = &Hidden.secret
+        """)])
+
+    assert(said.contains("error: associated function 'secret' of 'shapes.Hidden' is private to " +
+                         "'shapes/shapes.sysl', the file that declares it\n --> main.sysl:3:9\n"), said)
+end mad_private_outside_its_file
+
+@test("and from inside its file it has its address")
+mad_private_inside_its_file()
+    if xvr_no_library() then return
+
+    assert_eq(mad_ran(raw"""
+        struct Hidden
+            n: int
+
+        impl Hidden
+            private secret(n: int) -> int = n * 7
+
+        print((&Hidden.secret)(2))
+        """), "14\n")
+end mad_private_inside_its_file
+
+// -- names that are also something else --------------------------------------------------------------
+
+@test("a module function of the member's name is a different address")
+mad_clash_with_a_module_function()
+    if xvr_no_library() then return
+
+    assert_eq(mad_ran(raw"""
+        bump(n: int) -> int = n + 1
+
+        struct Counter
+            n: int
+
+        impl Counter
+            bump(*self) -> int
+                self.n += 10
+                self.n
+
+        var c = Counter(n = 0)
+        val f = &bump
+        val g = &Counter.bump
+
+        print(f(1), g(&c), g(&c))
+        """), "2 10 20\n")
+end mad_clash_with_a_module_function
+
+@test("an overloaded member is chosen by the parameters the context's type states")
+mad_overload_chosen()
+    if xvr_no_library() then return
+
+    assert_eq(mad_ran(raw"""
+        struct W
+            n: int
+
+        impl W
+            put(n: int) -> int = n
+            put(n: int, m: int) -> int = n + m
+
+        val one: *extern(int) -> int = &W.put
+        val two: *extern(int, int) -> int = &W.put
+
+        print(one(1), two(1, 2))
+        """), "1 3\n")
+end mad_overload_chosen
+
+@test("and with no type to read the choice off, it is refused rather than guessed")
+mad_overload_unchosen()
+    mad_refused(mad_ir(raw"""
+        struct W
+            n: int
+
+        impl W
+            put(n: int) -> int = n
+            put(n: int, m: int) -> int = n + m
+
+        val z = &W.put
+        """), "'W.put' names 2 functions, and an address is of one of them — which is read off " +
+              "the type the context wants, and there is none here. Annotate what this address is " +
+              "being stored in or passed as", "main.sysl:8:9")
+end mad_overload_unchosen
+
+@test("and a type none of them has is told the declarations")
+mad_overload_none_fits()
+    mad_refused(mad_ir(raw"""
+        struct W
+            n: int
+
+        impl W
+            put(n: int) -> int = n
+            put(n: int, m: int) -> int = n + m
+
+        val z: *extern(bool) -> int = &W.put
+        """), "no 'W.put' has the parameters '*extern(bool) -> int' asks for — the declarations of " +
+              "that name are:\n    W.put: *extern(int) -> int\n    W.put: *extern(int, int) -> int",
+              "main.sysl:8:31")
+end mad_overload_none_fits
+
+// -- what has no address ---------------------------------------------------------------------------
+
+@test("a trait's member through the trait is refused: it has a body per type and none of its own")
+mad_a_trait_member()
+    mad_refused(mad_ir(raw"""
+        trait Shape
+            area(*self) -> int
+
+        val a = &Shape.area
+        """), "'Shape' is a trait, and '&Shape.area' would be the address of whichever 'area' a " +
+              "value's type implements — a trait's member has one body per type and none of its " +
+              "own. The address is of one type's: '&T.area' with 'T' a type implementing 'Shape'",
+              "main.sysl:4:9")
+end mad_a_trait_member
+
+@test("a member with type parameters of its own, with nothing to settle them, is refused in the written form")
+mad_a_generic_member()
+    mad_refused(mad_ir(raw"""
+        struct Sq
+            s: int
+
+        impl Sq
+            pick[U](u: U) -> U = u
+
+        val d = &Sq.pick
+        """), "'pick' has type parameters of its own, so '&Sq.pick' does not say which copy of it " +
+              "is meant — write them, as '&Sq.pick[U]', or write the type this is stored in, as " +
+              "'var f: *extern(…) -> … = &Sq.pick'", "main.sysl:7:9")
+end mad_a_generic_member
+
+// -- a generic member, at the arguments written ------------------------------------------------------
+
+@test("'&T.f[U]' says which copy of a member with parameters of its own, and a call goes through it")
+mad_generic_member_written()
+    if xvr_no_library() then return
+
+    assert_eq(mad_ran(raw"""
+        struct Sq
+            s: int
+
+        impl Sq
+            pick[U](u: U) -> U = u
+            scaled[U](*self, u: U) -> int = self.s * 2
+
+        var q = Sq(s = 4)
+        val a = &Sq.pick[int]
+        val b = &Sq.pick[bool]
+        val c = &Sq.scaled[bool]
+        val d = &Sq.pick[int]
+
+        print(a(7), b(true), c(&q, false), d(9))
+        """), "7 true 8 9\n")
+end mad_generic_member_written
+
+@test("a generic type's generic member: the type's arguments and the member's are both written")
+mad_generic_type_generic_member()
+    if xvr_no_library() then return
+
+    assert_eq(mad_ran(raw"""
+        struct Box[T]
+            v: T
+
+        impl[T] Box[T]
+            mix[U](*self, u: U) -> U = u
+            make[U](u: U) -> int = 3
+
+        var b = Box[int](v = 5)
+        val m = &Box[int].mix[int]
+        val n = &Box[bool].mix[bool]
+        val k = &Box[int].make[bool]
+
+        print(m(&b, 11), k(true), n != null)
+        """), "11 3 true\n")
+end mad_generic_type_generic_member
+
+@test("a bare generic type's name takes its arguments from the written ones' signature")
+mad_generic_type_bare_name()
+    if xvr_no_library() then return
+
+    assert_eq(mad_ran(raw"""
+        struct Box[T]
+            v: T
+
+        impl[T] Box[T]
+            mix[U](*self, u: U) -> U = u
+
+        var b = Box[int](v = 5)
+        val m:*extern(*Box[int], bool) -> bool = &Box.mix
+
+        print(m(&b, true))
+        """), "true\n")
+end mad_generic_type_bare_name
+
+@test("the type the context wants settles a generic member's arguments, as it does a module function's")
+mad_generic_member_from_the_expected_type()
+    if xvr_no_library() then return
+
+    assert_eq(mad_ran(raw"""
+        struct Sq
+            s: int
+
+        impl Sq
+            pick[U](u: U) -> U = u
+            scaled[U](*self, u: U) -> int = self.s * 2
+
+        pick_int(u: int) -> int = u
+
+        apply(f: *extern(int) -> int, n: int) -> int = f(n)
+
+        var q = Sq(s = 4)
+        val a: *extern(int) -> int = &Sq.pick
+        val c: *extern(*Sq, bool) -> int = &Sq.scaled
+        val m: *extern(int) -> int = &pick_int
+
+        print(a(7), c(&q, true), apply(&Sq.pick, 5), m(1))
+        """), "7 8 5 1\n")
+end mad_generic_member_from_the_expected_type
+
+@test("an expected type that does not mention a parameter leaves it to be written")
+mad_generic_member_expected_silent()
+    mad_refused(mad_ir(raw"""
+        struct Sq
+            s: int
+
+        impl Sq
+            make[U]() -> int = 3
+
+        val d: *extern() -> int = &Sq.make
+        """), "'Sq.make' has type parameters of its own, and the *extern() -> int wanted here does " +
+              "not say what 'U' should be — a type parameter the signature does not mention " +
+              "cannot be settled by the type of the address. Write it: '&Sq.make[U]'",
+              "main.sysl:7:27")
+end mad_generic_member_expected_silent
+
+@test("an expected type of the wrong arity is told the member's parameter count")
+mad_generic_member_expected_arity()
+    mad_refused(mad_ir(raw"""
+        struct Sq
+            s: int
+
+        impl Sq
+            pick[U](u: U) -> U = u
+
+        val d: *extern(int, int) -> int = &Sq.pick
+        """), "'Sq.pick' takes 1 parameter, and the *extern(int, int) -> int wanted here takes 2",
+              "main.sysl:7:35")
+end mad_generic_member_expected_arity
+
+@test("the wrong number of arguments is told the parameters, as it is for a module function")
+mad_generic_member_wrong_count()
+    mad_refused(mad_ir(raw"""
+        struct Sq
+            s: int
+
+        impl Sq
+            pick[U](u: U) -> U = u
+
+        val d = &Sq.pick[int, bool]
+        """), "'Sq.pick' takes 1 type argument ('U'), and 2 were written", "main.sysl:7:9")
+    mad_refused(mad_ir(raw"""
+        struct Sq
+            s: int
+
+        impl Sq
+            both[U, V](u: U, v: V) -> U = u
+
+        val d = &Sq.both[int]
+        """), "'Sq.both' takes 2 type arguments ('U', 'V'), and 1 was written", "main.sysl:7:9")
+end mad_generic_member_wrong_count
+
+@test("a bound the written argument does not meet is refused")
+mad_generic_member_bound_unmet()
+    mad_refused(mad_ir(raw"""
+        trait Named
+            name(self) -> int
+        struct Sq
+            s: int
+        impl Sq
+            pick[U: Named](u: *U) -> int = 1
+        val d = &Sq.pick[int]
+        """), "'Sq.pick' requires its type parameter 'U' to implement 'Named', but int does not",
+              "main.sysl:7:9")
+end mad_generic_member_bound_unmet
+
+@test("and one it does meet has its address")
+mad_generic_member_bound_met()
+    if xvr_no_library() then return
+
+    assert_eq(mad_ran(raw"""
+        trait Named
+            name(self) -> int
+
+        struct Tag
+            n: int
+
+        impl Named for Tag
+            name(self) -> int = self.n
+
+        struct Sq
+            s: int
+
+        impl Sq
+            pick[U: Named](u: *U) -> int = 1
+
+        var t = Tag(n = 3)
+        val d = &Sq.pick[Tag]
+
+        print(d(&t))
+        """), "1\n")
+end mad_generic_member_bound_met
+
+@test("a generic member's address handed to C, which calls it back")
+mad_generic_member_to_c()
+    if xvr_no_library() then return
+
+    assert_eq(mad_ran(raw"""
+        import sysl.raw.ptr_cast
+
+        extern qsort(base: *u8, n: usize, size: usize, cmp: *extern(*u8, *u8) -> i32)
+
+        struct Order
+            x: int
+
+        impl Order
+            descending[U](a: *u8, b: *u8) -> i32
+                var pa: *i32 = ptr_cast(a)
+                var pb: *i32 = ptr_cast(b)
+                *pb - *pa
+
+        var xs: [4]i32 = [30, 10, 40, 20]
+
+        qsort(ptr_cast(&xs[0]), 4, 4, &Order.descending[int])
+        print(xs[0], xs[1], xs[2], xs[3])
+        """), "40 30 20 10\n")
+end mad_generic_member_to_c
+
+@test("and an instantiation that is an aggregate is refused as any other address of one is")
+mad_generic_member_aggregate()
+    mad_refused(mad_ir(raw"""
+        struct Sq
+            s: int
+
+        impl Sq
+            pick[U](u: U) -> U = u
+
+        val d = &Sq.pick[string]
+        """), "the 1st parameter of 'Sq.pick' is string" + mad_aggregate(), "main.sysl:7:9")
+end mad_generic_member_aggregate
+
+@test("brackets after a field of a value are still an index, beside a generic member's")
+mad_generic_member_index_untouched()
+    if xvr_no_library() then return
+
+    assert_eq(mad_ran(raw"""
+        struct P
+            xs: [3]int
+
+        impl P
+            pick[U](u: U) -> U = u
+
+        var p = P(xs = [1, 2, 3])
+        val at = &p.xs[1]
+
+        *at = 9
+        print(p.xs[1], (&P.pick[int])(4))
+        """), "9 4\n")
+end mad_generic_member_index_untouched
+
+@test("a field of a value is still the field's address, beside its type's member's")
+mad_values_are_left_alone()
+    if xvr_no_library() then return
+
+    assert_eq(mad_ran(raw"""
+        struct P
+            x: int
+
+        impl P
+            x2(n: int) -> int = n * 2
+
+        var p = P(x = 5)
+        val at = &p.x
+
+        *at = 6
+        print(p.x, (&P.x2)(p.x))
+        """), "6 12\n")
+end mad_values_are_left_alone

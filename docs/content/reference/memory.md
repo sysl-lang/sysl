@@ -4000,9 +4000,12 @@ each pointer it is handed, so it works that out, and nothing is written for it.
   buffer's slot, or a box or a closure that is stored there;
 - it passes it to another function's parameter that keeps it.
 
-**The address as an integer is the address**: `usize(p)` stored or handed back, and a call's answer
-that is one, is followed as `p` would be. An integer anything more is done with — put in a local,
-converted again, handed to an integer parameter, `usize(p) + 8` — is a number, and keeps nothing.
+**The address as an integer is the address**: `usize(p)` handed back directly, and a call's answer
+that is one, is followed as `p` would be. `usize(p)` stored somewhere the call does not own, or
+handed to an integer parameter that may store it so, is a number **until a `ptr_cast` may turn it
+back into a pointer** — the rule a frame's own address as an integer is held to (below), and the
+refusal names the function holding that `ptr_cast`. An integer anything more is done with — put in a
+local, converted again, `usize(p) + 8` — is a number, and keeps nothing.
 
 The answer is read out of the body, followed into every callee, and settled over recursion: a
 recursive function keeps a parameter when one of its paths does. Then **one rule, at the call**:
