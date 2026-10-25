@@ -9,7 +9,7 @@ project root**. It says who this package is, what machines it is built for, what
 provide, and what it depends on. `sysl init` writes a first one.
 
 **The file used to be called `package.hocon`.** A directory holding only that name still builds,
-with one warning saying to rename it to `sysl.hocon` (`sysl config fix` will do it); a directory
+with one warning saying to rename it to `sysl.hocon` (`sysl config fix` does it); a directory
 holding both names is refused, since two manifests are ambiguous. A later release will stop reading
 the old name.
 
@@ -2853,7 +2853,9 @@ sysl add github.com/sysl-lang/sdl3@0.3.1
 The version comes from `git ls-remote --tags`, so it works for any host a build can clone from. The
 manifest is rewritten one run of bytes at a time, which is why your comments and layout survive it,
 and the result is read back before it is written — a rewrite that produced something unreadable
-leaves the file exactly as it was. Nothing is fetched; the next build does that.
+leaves the file exactly as it was. Nothing is fetched; the next build does that. `sysl add` is
+`sysl config dep add` under a shorter name; [`sysl config`](/reference/config/) edits the rest of the
+manifest the same way.
 
 `sysl vendor` puts everything the project resolves to into a `vendor/` directory beside the manifest:
 
