@@ -30,7 +30,7 @@ whole_program_checks(a: &Analysis, units: Buf[Program], funcs: Buf[TFunc], vals:
     check_done("ghost")
     check_module_graph(a)
     check_done("module_graph")
-    check_target_refusals(a, funcs)
+    check_target_refusals(a, funcs, vals, reached_vtables(a))
     check_done("target_refusals")
     check_gated_modules(a, funcs, vals, reached_vtables(a))
     check_done("gated_modules")
@@ -366,14 +366,68 @@ reached_module(reach: Option[Set[string]], module_name: string) -> bool = reach 
 
 // The refusals a declaration earned from the machine alone, kept until the program's reach is known
 // (`Analysis.target_refusals`) and made now for the modules it reaches.
-private check_target_refusals(a: &Analysis, funcs: Buf[TFunc])
+private check_target_refusals(a: &Analysis, funcs: Buf[TFunc], vals: Buf[TVal],
+                               vtables: Buf[TVtable])
     if a.target_refusals.is_empty() then return
 
     val reach = program_reach(a, funcs)
+    val chosen = chosen_instances(a, reach, funcs, vals, vtables)
+
+    // An instance is refused once, at its first form: one sentence per instance, as a program's own
+    // form is told.
+    var told: Set[string] = set()
 
     for item in a.target_refusals
-        if reached_module(reach, item.0.module_name) then a.fault(item.0, item.1, item.2)
+        val asked = if item.3 == "" then reached_module(reach, item.0.module_name)
+                    else chosen.has(item.3) && told.add(item.3)
+
+        if asked then a.fault(item.0, item.1, item.2)
 end check_target_refusals
+
+// The instances a refusal is waiting on that a module the program reaches arrives at, through any
+// chain of the standard module's bodies and other instances.
+//
+// **An instance belongs to whoever asked for it**, and the standard module's bodies to whoever calls
+// into them, so neither is a starting point: a body is one where it was written in a module of the
+// program's reach. Every waiting instance counts where every module does -- a build of a library.
+private chosen_instances(a: &Analysis, reach: Option[Set[string]], funcs: Buf[TFunc],
+                         vals: Buf[TVal], vtables: Buf[TVtable]) -> Set[string]
+    var seeds: Buf[string] = buf()
+    var chosen: Set[string] = set()
+
+    for item in a.target_refusals
+        if item.3 != "" && !holds_string(seeds, item.3) then seeds.push(item.3)
+
+    if seeds.is_empty() then return chosen
+
+    if reach.is_none()
+        for s in seeds
+            chosen.add(s)
+
+        return chosen
+    end if
+
+    val walk = reaches_over(with_abstract_callees(a, funcs), vtables, seeds)
+
+    for i in 0..<funcs.len()
+        val f = funcs.at(i)
+        val home = func_home(a, f.name).module_name
+
+        if a.tables.members.func_origin.has(f.name) || standard_body_module(home) then continue
+        if !reached_module(reach, home) then continue
+
+        for s in reached_seeds(walk, refs_of_block(f.body))
+            chosen.add(s)
+
+    // A module's storage runs its initializer in the module that wrote it.
+    for v in vals
+        if v.init.is_none() || !reached_module(reach, module_of(v.symbol)) then continue
+
+        for s in reached_seeds(walk, refs_of_expr(v.init.unwrap()))
+            chosen.add(s)
+
+    chosen
+end chosen_instances
 
 // -- doc comments ----------------------------------------------------------------------------
 

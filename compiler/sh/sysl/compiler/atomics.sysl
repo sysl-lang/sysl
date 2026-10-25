@@ -177,17 +177,30 @@ private atomic_pointee(cx: &Analyzer, span: Span, name: string, addr: TExpr) -> 
                     // **The standard module's own bodies are typed for every machine**, so a flag
                     // it keeps at a width some processor lacks (`SpinLock`'s `int` on a 16-bit
                     // CRAFT) is refused where a program reaches it (`atomic_reach.sysl`). An
-                    // instantiation is the program's choice of type, and is refused here: it binds
-                    // a type parameter, where a method of a plain type binds only `Self`.
+                    // instantiation is some module's choice of type, and is refused with this
+                    // message: it binds a type parameter, where a method of a plain type binds only
+                    // `Self`.
                     val deferred = standard_body_module(cx.scope.module_name) &&
                                    binds_only_self(cx.subst)
 
                     if machine_width && !pointer_width && bits > t.atomic_bits() && !deferred
-                        cx.fault(span, s"'$name' is one machine instruction, and '${t.name}' has " +
-                                 s"one for ${t.atomic_bits()} bits at most — " +
-                                 s"${type_show(*inner)} is $bits, so there is nothing to emit. " +
-                                 "Count at a width the machine has where the value fits one, or " +
-                                 "hold it in a 'Guarded[SpinLock, T]'")
+                        val message = s"'$name' is one machine instruction, and '${t.name}' has " +
+                                      s"one for ${t.atomic_bits()} bits at most — " +
+                                      s"${type_show(*inner)} is $bits, so there is nothing to " +
+                                      "emit. Count at a width the machine has where the value " +
+                                      "fits one, or hold it in a 'Guarded[SpinLock, T]'"
+
+                        // **Whoever chose the type is not known while the instance is typed**: it
+                        // is queued, and read once for every module that asks for it. So the
+                        // refusal waits until the program's reach is known, and is made where a
+                        // module the program reaches arrives at this instance
+                        // (`checks.sysl`'s `check_target_refusals`) -- a dependency's module the
+                        // program never names may instantiate one at a width this machine lacks.
+                        if !binds_only_self(cx.subst)
+                            cx.an.target_refusals.push((cx.scope, span, message, cx.func_name))
+                        else
+                            refuse_for_target(cx, span, message)
+
                         return Unknown
                     end if
 

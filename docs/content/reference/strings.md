@@ -108,7 +108,8 @@ print(str_cast(bytes[0..<3]), str_alias(bytes[0..<2]))
 hi! hi
 ```
 
-Written without the import, the form is told where it lives:
+**The import is required.** Written without it, the form still answers in 0.6.x, with a warning that
+names the line to add — once per file per form, at its first use — and from 0.7.0 it is refused:
 
 ```sysl
 var bytes: [3]u8 = [104, 105, 33]
@@ -116,8 +117,12 @@ var bytes: [3]u8 = [104, 105, 33]
 print(str_cast(bytes[..]))
 ```
 
-```error
-'str_cast' is in sysl.raw: add 'import sysl.raw.str_cast'
+```output
+hi!
+```
+
+```
+warning: 'str_cast' is in sysl.raw: add 'import sysl.raw.str_cast' (this is refused from 0.7.0)
 ```
 
 **The unchecked conversion is imported like any other function:**
