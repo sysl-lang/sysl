@@ -128,6 +128,7 @@ private run_cli_command(args: []string, say: string -> unit, note: string -> uni
         "run" -> run_command(args, note)
         "test" -> test_command(args, say, note, report)
         "add" -> add_command(args, say, note)
+        "config" -> config_command(args, say, note)
         "deps" -> deps_command(args, say, note)
         "tidy" -> tidy_command(args, say)
         "init" -> init_command(args, say)
@@ -1534,24 +1535,19 @@ private add_command(args: []string, say: string -> unit, note: string -> unit) -
         note(add_usage())
         return Misused
 
-    // A workspace root with no `package` block refuses a `dependencies` block, so writing one there
-    // would leave a manifest the next build refuses.
-    manifest_at(root) match
-        Ok(m) ->
-            if m.workspace.is_some() && !m.has_package
-                note(refused(s"'${absolute_path(root)}' is a workspace with no 'package' block, so " +
-                    "it takes no dependencies — add it to the member that imports it, " +
-                    "'sysl add <coordinate> <member directory>'"))
-                return Failed
-        Err(_) -> ()
+    // `sysl config dep add`, which refuses a workspace root with no `package` block: a
+    // `dependencies` block there would leave a manifest the next build refuses.
+    var words: Buf[string] = buf()
 
-    add_to_project(root, spec) match
+    words.push("dep")
+    words.push("add")
+    words.push(spec)
+
+    config_carried_out(ConfigCommand(root, false, words, buf()), say) match
         Err(why) ->
             note(refused(why))
             Failed
-        Ok(said) ->
-            say(said)
-            Fine
+        Ok(_) -> Fine
 end add_command
 
 private add_usage() -> string = "usage: sysl add <coordinate>[@<version>] [<path>]"
@@ -1648,7 +1644,7 @@ usage() -> string = "usage: sysl --version | --help | emit-ast [--no-spans] <fil
     "[--lto thin|full] <path> | emit-header [--target <name>] <path> | " +
     "run [--target <name>] [--cc <path>] [-O<level>] <path> [-- <args>] | " +
     "test [--filter <text>] [--file <name>] [--fail-fast] [--jobs <n>] [--timeout <seconds>] [--target <name>] [--cc <path>] [-O<level>] <path> | " +
-    "add <coordinate>[@<version>] [<path>] | deps <path> | vendor <path> | tidy [--check] [<path>] | init [<dir>] | " +
+    "add <coordinate>[@<version>] [<path>] | config <command> [--dry-run] [-C <dir>] | deps <path> | vendor <path> | tidy [--check] [<path>] | init [<dir>] | " +
     "weave [-o <path>] <path> | tangle [-o <path>] <path> | prove [--emit-whyml] [--overflow check|ignore] [--target <name>] <path> | " +
     "doc [-o <dir>] [-t <title>] [-n <note>] [-w <n>] [-V <version>] [--private] [--check] [<dir>] | " +
     "targets | lsp [--stdio]\n" +
@@ -1663,7 +1659,7 @@ builtin_commands() -> Buf[string]
 
     for c in ["run", "build", "build-lib", "build-c", "emit-header", "weave", "tangle", "test",
               "emit-llvm",
-              "emit-ast", "emit-typed", "prove", "deps", "add", "vendor", "tidy", "init", "doc", "import-c",
+              "emit-ast", "emit-typed", "prove", "deps", "add", "config", "vendor", "tidy", "init", "doc", "import-c",
               "targets", "lsp"]
         out.push(c)
 
@@ -1684,7 +1680,7 @@ help_text() -> string
     for u in [run_usage(), build_usage(), build_lib_usage(), build_c_usage(), emit_header_usage(),
               weave_usage(), tangle_usage(), test_usage(), emit_llvm_usage(), emit_ast_usage(),
               emit_typed_usage(), "usage: sysl prove [--emit-whyml] [--overflow check|ignore] <path>",
-              deps_usage(), add_usage(), "usage: sysl vendor <path>", "usage: sysl tidy [--check] [<path>]",
+              deps_usage(), add_usage(), config_usage(), "usage: sysl vendor <path>", "usage: sysl tidy [--check] [<path>]",
               "usage: sysl init [<dir>]",
               "usage: sysl doc [-o <dir>] [-t <title>] [-n <note>] [-w <n>] [-V <version>] [--private] " +
               "[--check] [<dir>]", import_c_usage(), "usage: sysl targets", lsp_usage()]

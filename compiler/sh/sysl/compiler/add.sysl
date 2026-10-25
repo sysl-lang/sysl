@@ -1,11 +1,11 @@
 module sh.sysl.compiler
 
 import sysl.buf.{Buf, buf}
-import sysl.fs.{is_file, read_text, write_text}
 import sysl.process.capture
 import sysl.text.{split, Search}
 
-// `sysl add` -- the write half of the package manager.
+// `sysl add` -- the write half of the package manager, and `sysl config dep add` under its other
+// name: both come through `config_carried_out` (`config.sysl`).
 //
 // A build could fetch a dependency graph and the only way to *add* an entry was to open
 // `package.hocon` and type it. That is the command a package manager is judged by, and its absence
@@ -18,9 +18,10 @@ import sysl.text.{split, Search}
 // internal GitLab. Reading tags through one forge's API would make `sysl add` work for one host and
 // fail for the rest, which is a worse command than none.
 //
-// **What is written**: the manifest is rewritten by changing the smallest run of bytes it can, and
-// the result is read back through the manifest reader *before* it is written to disk, so a rewrite
-// that produced something the compiler cannot read leaves the file exactly as it was.
+// **What is written**: the manifest is rewritten by changing the smallest run of bytes it can
+// (`manifest_edit.sysl`), and the result is read back through the manifest reader *before* it is
+// written to disk, so a rewrite that produced something the compiler cannot read leaves the file
+// exactly as it was.
 //
 // Nothing is fetched. `sysl add` records what a project takes; the next build is what goes and gets
 // it, and that is where a coordinate that does not exist is reported -- by the machinery that
@@ -137,42 +138,3 @@ tags_of(coordinate: string) -> Result[Buf[string], string]
 
     Ok(out)
 end tags_of
-
-// The whole command: work out the version, rewrite the manifest, check it still reads, write it.
-add_to_project(root: string, spec: string) -> Result[string, string]
-    val file = manifest_path(root)
-
-    if !is_file(file)
-        return Err(s"there is no $ManifestName here — 'sysl add' adds a dependency to a project, " +
-            "and a project is a directory with a manifest in it")
-
-    val asked = read_add_spec(spec)?
-
-    val pinned = asked.version match
-        Some(v) -> v
-        None ->
-            newest_release(tags_of(asked.coordinate)?) match
-                None -> return Err(s"${asked.coordinate} has no version tag, so there is nothing " +
-                    "to pin — a package is published by tagging it 'v<major>.<minor>.<patch>'")
-                Some(v) -> release_shown(v)
-
-    val text = read_text(file) match
-        Err(_) -> return Err(s"cannot read $file")
-        Ok(got) -> got
-
-    val edited = add_dependency(text, asked.label, asked.coordinate, pinned)?
-
-    // Read back before writing. The rewrite is textual, so the one thing it cannot know for itself
-    // is whether what came out is still a manifest -- and a project whose manifest a tool broke is a
-    // much worse outcome than a refusal.
-    read_manifest(edited) match
-        Err(why) -> return Err(s"adding '${asked.label}' would have made $ManifestName unreadable, " +
-            s"so nothing was written:\n  $why")
-        Ok(_) -> ()
-
-    write_text(file, edited) match
-        Err(e) -> return Err(io_refusal(file, e))
-        Ok(_) -> ()
-
-    Ok(s"added ${asked.label} ${asked.coordinate} $pinned")
-end add_to_project
