@@ -1,0 +1,237 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.str_builder
+
+// **A field of a struct held by value, handed to a call as a large argument.**
+//
+// A large argument crosses at the address of storage nothing can change for the length of the call
+// (`indirect_arg`). A local or a parameter nobody can reach already is that, and so is every field
+// inside one: `self.noise.turb(p)` on a `self` read where its caller put it hands `turb` the
+// caller's own bytes, where it used to stage a 9 KB copy on every call. A field reached through a
+// pointer is not -- someone else can write the object -- and neither is a field of a local whose
+// address got out, or one a later argument assigns.
+
+private spj_ready() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+
+    true
+end spj_ready
+
+// The LLVM text of the module a program lowers to, for `target` or this machine.
+private spj_ir(text: string, target: Option[string]) -> string
+    val root = make_temp_dir("sysl-spj").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, spj_prelude() + text).unwrap()
+
+    val out = emit_llvm_text(src, target) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> if made.report.is_empty() then made.text else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end spj_ir
+
+// One function's text, from its `define` to the brace that closes it.
+private spj_body(out: string, name: string) -> string
+    var b = str_builder()
+    var inside = false
+
+    for line in lines_of(out)
+        if !inside && line.starts_with("define ") && (line.contains("@" + name + "(") || line.contains("$" + name + "("))
+            inside = true
+
+        if inside
+            if line == "}" then return b.finish()
+
+            b.push(line)
+            b.push_char('\n')
+
+    s"no definition of '$name' in:\n$out"
+end spj_body
+
+private spj_prints(text: string, expected: string)
+    if !spj_ready() then return
+
+    val root = make_temp_dir("sysl-spj").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", spj_prelude() + text).unwrap()
+
+    val exe = s"$root/built"
+    val built = build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe))
+
+    if built.is_err()
+        remove_dir_all(root).unwrap_or(())
+        assert(false, failure_text(built.unwrap_err()))
+        return
+    end if
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> assert(false, "the program that was built could not be run")
+        Ok(out) ->
+            assert_eq(out.text, expected)
+            assert(out.status.ok(), "the program printed what was expected and did not exit cleanly")
+end spj_prints
+
+// `Noise` is 2056 bytes -- past the indirect boundary on every target -- and `Marble` holds one.
+private spj_prelude() -> string = raw"""
+    struct Noise
+        table: [256]i64
+        seed: i64
+
+    impl Noise
+        turb(self, k: i64) -> i64 = self.table[0] + self.seed + k
+
+    struct Marble
+        scale: i64
+        noise: Noise
+
+    impl Marble
+        value(self, k: i64) -> i64 = self.scale * self.noise.turb(k)
+
+    """
+
+private spj_size() -> string = "i64 2056"
+
+// -- the projection goes over at its own address --------------------------------------------------
+
+@test("a field of a large self read in place is handed on at its address, with no copy")
+spj_self_field_crosses_in_place()
+    if !spj_ready() then return
+
+    for target in [None, Some("x86_64-freestanding"), Some("thumb-freestanding")]
+        val body = spj_body(spj_ir("main()\n    val m = Marble(2, Noise([1; 256], 3))\n    val r = m.value(4)\n", target),
+                            "Marble.value")
+
+        assert(body.contains("call i64 @Noise.turb(ptr %t"), body)
+        assert(!body.contains(spj_size()), body)
+        assert(!body.contains("alloca %struct.Noise"), body)
+
+@test("a field of a large local is handed on at its address, with no copy")
+spj_local_field_crosses_in_place()
+    if !spj_ready() then return
+
+    val body = spj_body(spj_ir("main()\n    val m = Marble(2, Noise([1; 256], 3))\n    print(m.noise.turb(4))\n", None),
+                        "main")
+
+    assert(!body.contains(spj_size()), body)
+
+@test("a field of a field of a large self is handed on at its address too")
+spj_nested_field_crosses_in_place()
+    if !spj_ready() then return
+
+    val out = spj_ir(raw"""
+        struct Slab
+            pad: i64
+            marble: Marble
+        impl Slab
+            deep(self, k: i64) -> i64 = self.marble.noise.turb(k)
+        main()
+            val s = Slab(1, Marble(2, Noise([1; 256], 3)))
+            print(s.deep(4))
+        """, None)
+    val body = spj_body(out, "Slab.deep")
+
+    assert(!body.contains(spj_size()), body)
+
+// -- where a snapshot is still owed ---------------------------------------------------------------
+
+// A callee that reaches no `Noise` storage at all may be lent any place as it stands
+// (`lends_in_place`), so each of these hands the field to one that writes the very object it came
+// from. The snapshot is what keeps the by-value parameter what it was at the call.
+@test("a field reached through a reference is still staged into a snapshot")
+spj_field_through_a_reference_is_copied()
+    if !spj_ready() then return
+
+    val text = raw"""
+        twist(n: Noise, m: &Marble) -> i64
+            m.noise.seed = 9
+            n.seed
+        through(m: &Marble) -> i64 = twist(m.noise, m)
+        main()
+            val m: &Marble = Marble(2, Noise([1; 256], 3))
+            print(through(m), m.noise.seed)
+        """
+
+    assert(spj_body(spj_ir(text, None), "through").contains(spj_size()), spj_body(spj_ir(text, None), "through"))
+    spj_prints(text, "3 9\n")
+
+@test("a field of a local whose address got out is still staged into a snapshot")
+spj_field_of_an_exposed_local_is_copied()
+    if !spj_ready() then return
+
+    val text = raw"""
+        twist(n: Noise, p: *Marble) -> i64
+            (*p).noise.seed = 100
+            n.seed
+        main()
+            var m = Marble(2, Noise([1; 256], 3))
+            print(twist(m.noise, &m), m.noise.seed)
+        """
+
+    assert(spj_body(spj_ir(text, None), "main").contains(spj_size()), spj_body(spj_ir(text, None), "main"))
+    spj_prints(text, "3 100\n")
+
+// -- what the callee does with it -----------------------------------------------------------------
+
+@test("a callee that changes the field it was handed changes its own copy, not the caller's")
+spj_callee_write_stays_in_the_callee()
+    spj_prints(raw"""
+        spoil(n: Noise) -> i64
+            var c = n
+            c.seed = 99
+            c.table[0] = 99
+            c.seed + c.table[0]
+        impl Marble
+            spoiled(self) -> i64 = spoil(self.noise) + self.noise.seed + self.noise.table[0]
+        main()
+            val m = Marble(2, Noise([1; 256], 3))
+            print(m.spoiled(), m.noise.seed)
+        """, "202 3\n")
+
+@test("a callee that writes its parameter in place copies the field at entry, and the caller's is unchanged")
+spj_callee_rebinding_copies_at_entry()
+    spj_prints(raw"""
+        rebind(n: Noise) -> i64
+            n.seed = 50
+            n.seed
+        main()
+            val m = Marble(2, Noise([1; 256], 3))
+            print(rebind(m.noise), m.noise.seed, m.value(4))
+        """, "50 3 16\n")
+
+@test("a field handed on is read correctly at both ends")
+spj_projection_reads_the_right_bytes()
+    spj_prints("main()\n    val m = Marble(2, Noise([5; 256], 7))\n    print(m.value(4), m.noise.turb(1))\n", "32 13\n")
+
+@test("a counted field of a local handed to a call is alive for the call and given back once")
+spj_counted_field_of_a_local()
+    spj_prints(raw"""
+        struct Node
+            value: int
+        impl Drop for Node
+            drop(self) = print(s"drop ${self.value}")
+        struct Pair
+            node: &Node
+            n: int
+        peek(n: &Node) -> int = n.value
+        main()
+            val p = Pair(Node(9), 1)
+            print(peek(p.node))
+            print(peek(p.node) + p.n)
+        """, "9\n10\ndrop 9\n")

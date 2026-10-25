@@ -415,21 +415,47 @@ cc_a_local_argument_is_let_go_once()
     assert_eq(cc_run(cc_local_src()), "dropped 9\n1\nend\ndropped 1\ndropped 8\n")
 end cc_a_local_argument_is_let_go_once
 
-// The count is on the LOADED VALUE, not at the field, which is what makes it a snapshot: the call is
-// free to overwrite `p.h` and the release afterwards still reaches what was passed.
+// A field of a by-value parameter lies in the parameter's own storage, which nothing the call does
+// can reach: `take` writes `sink`, and `p` is `via`'s. So it is held exactly as `p` is, and costs
+// the call nothing (`held_unless`).
 private cc_field_src() -> string =
     cc_pair_node() + cc_sink() + "via(p: Pair) -> int = take(p.h)\nvar n: &Node = Node(1)\n" +
     "print(via(Pair(Holder(n))))\nprint(\"end\")\n"
 
-@test("exactly one retain and one release, both in the caller")
+@test("a field of a parameter costs nothing at the call either")
 cc_a_field_argument_costs_one_pair()
     if cc_no_library() then return
 
     val out = cc_body(cc_ir(cc_field_src()), "via")
 
+    assert_eq(cc_count(out, "@arc.copy.Holder("), 0)
+    assert_eq(cc_count(out, "@arc.dispose.Holder("), 0)
+end cc_a_field_argument_costs_one_pair
+
+// The count is on the LOADED VALUE where the place is one the call can reach -- a field of an object
+// behind a reference -- which is what makes it a snapshot: the call is free to overwrite the field
+// and the release afterwards still reaches what was passed.
+private cc_reached_field_src() -> string =
+    cc_node() + "var sink: &Pair = Pair(Holder(Node(9)))\nstruct Pair\n    h: Holder\n" +
+    "take(h: Holder) -> int\n    sink.h = Holder(Node(8))\n    h.r.v\n" +
+    "via(p: &Pair) -> int = take(p.h)\nprint(via(sink))\nprint(\"end\")\n"
+
+@test("exactly one retain and one release, both in the caller, for a field the call can reach")
+cc_a_reached_field_argument_costs_one_pair()
+    if cc_no_library() then return
+
+    val out = cc_body(cc_ir(cc_reached_field_src()), "via")
+
     assert_eq(cc_count(out, "@arc.copy.Holder("), 1)
     assert_eq(cc_count(out, "@arc.dispose.Holder("), 1)
-end cc_a_field_argument_costs_one_pair
+end cc_a_reached_field_argument_costs_one_pair
+
+@test("and the field the call overwrote is still what it read")
+cc_a_reached_field_argument_reads_what_was_passed()
+    if !cc_can_run() then return
+
+    assert_eq(cc_run(cc_reached_field_src()), "dropped 9\n9\nend\ndropped 8\n")
+end cc_a_reached_field_argument_reads_what_was_passed
 
 @test("and still nothing in the callee")
 cc_a_field_argument_costs_nothing_in_the_callee()
