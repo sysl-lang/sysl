@@ -1,0 +1,503 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.text.{join, replace_all, Search}
+
+// **The memory map a manifest declares and the script laid out from it** (`memory_map.sysl`,
+// `link_script.sysl`, `reference/packages.md § A script made from the manifests`), read and laid out without a
+// build: every refusal of the grammar and of the layout, each with its exact words. The images these
+// scripts link are `tests_gle_link_script_images.sysl`'s.
+
+private gls_read(text: string) -> Manifest = read_manifest(text).unwrap()
+
+private gls_refused(text: string) -> string = read_manifest(text) match
+    Ok(_) -> "accepted"
+    Err(why) -> why
+
+// One package of a build, with its options at their defaults (or `values`) and its features on.
+private gls_input(key: string, text: string, enabled: []string = [], deps: []string = [],
+                  values: []string = []) -> LinkInput
+    val m = gls_read(text)
+    var on: Buf[string] = buf()
+
+    for i in 0..<enabled.len
+        on.push(enabled[i])
+
+    var set: Buf[(string, string)] = buf()
+
+    for i in 0..<values.len
+        val at = values[i].index_of("=").unwrap()
+
+        set.push((values[i][0..<at], values[i][(at + 1)..]))
+
+    var named: Buf[(string, string)] = buf()
+
+    for i in 0..<deps.len
+        named.push((deps[i], deps[i]))
+
+    val who = if key == "" then "this project" else s"'$key'"
+    val shown = if key == "" then "app" else key
+
+    LinkInput(key, who, shown, m, on, settled_options(m.options, on, set), named)
+end gls_input
+
+private val gls_target: string = "thumb-freestanding"
+
+private gls_laid(inputs: Buf[LinkInput], target: string = gls_target) -> Result[LaidOut, string]
+    val t = target_named(target).unwrap()
+    val layout = featured_layout(inputs.at(0).manifest, target)
+
+    lay_out(inputs, t, layout)
+end gls_laid
+
+private gls_lay(inputs: Buf[LinkInput]) -> string = gls_laid(inputs) match
+    Ok(l) -> l.text
+    Err(why) -> s"refused: $why"
+
+private gls_one(input: LinkInput) -> Buf[LinkInput]
+    var out: Buf[LinkInput] = buf()
+
+    out.push(input)
+    out
+end gls_one
+
+private gls_two(a: LinkInput, b: LinkInput) -> Buf[LinkInput]
+    var out = gls_one(a)
+
+    out.push(b)
+    out
+end gls_two
+
+// A board: flash and RAM, the RAM tagged for DMA.
+private val gls_board: string =
+    "memory {\n  flash { origin = 0x1000_0000, length = 2M, kind = rom }\n" +
+    "  sram { origin = 0x2000_0000, length = 256K, kind = ram, tags = [dma] }\n}\n"
+
+private gls_app(layout: string) -> string =
+    s"package { name = \"app\" }\ntargets { $gls_target { layout { $layout } } }\n"
+
+// -- the grammar -----------------------------------------------------------------------------------
+
+@test("a size is decimal, hex, binary or octal, with underscores and a K or M, and nothing else")
+gls_amounts()
+    assert_eq(parse_amount("4096"), Some(4096u64))
+    assert_eq(parse_amount("0x2000_0000"), Some(0x2000_0000u64))
+    assert_eq(parse_amount("0b1010"), Some(10u64))
+    assert_eq(parse_amount("0o17"), Some(15u64))
+    assert_eq(parse_amount("128K"), Some(131072u64))
+    assert_eq(parse_amount("2M"), Some(2097152u64))
+    assert_eq(parse_amount("0xffff_ffff_ffff_ffff"), Some(0xffff_ffff_ffff_ffffu64))
+
+    for bad in ["", "K", "12Q", "0x", "1__0", "_1", "1_", "0x1g", "0b102", "-4", "0x1_0000_0000_0000_0000",
+                "17592186044416M"]
+        assert(parse_amount(bad).is_none(), bad)
+end gls_amounts
+
+@test("memory, sections, symbols and a layout are read with every value as written")
+gls_reads_the_grammar()
+    val m = gls_read(gls_board +
+        "sections {\n  dma { contents = [\".sysl.dma\", \".dma.*\"], wants = dma, zero = true, align = 32 }\n" +
+        "  boot { contents = [\".boot\"], region = flash, first = true, keep = true }\n}\n" +
+        "symbols { _estack = stack_top }\n" +
+        "options { cores { type = usize, default = 2 } }\n" +
+        s"targets { $gls_target { layout { code = flash, data = sram, " +
+        "stack { region = sram, bytes = 8K, per_core = \"option:cores\" }, heap = sram, " +
+        "place { dma = sram } } } }\n")
+    val map = m.memory
+
+    assert_eq(s"${map.regions.at(0).name} ${map.regions.at(0).origin.value} ${map.regions.at(0).length.value}",
+              "flash 268435456 2097152")
+    assert_eq(join(map.regions.at(1).tags.view(), ","), "dma")
+    assert_eq(s"${map.sections.at(0).name} ${map.sections.at(0).wants} ${map.sections.at(0).zero} " +
+              s"${map.sections.at(0).align} ${join(map.sections.at(0).contents.view(), ",")}",
+              "dma dma true 32 .sysl.dma,.dma.*")
+    assert(map.sections.at(1).first && map.sections.at(1).keep, "boot is first and kept")
+    assert_eq(s"${map.symbols.at(0).0}=${map.symbols.at(0).1}", "_estack=stack_top")
+
+    val l = map.layouts.at(0)
+    val stack = l.stack.unwrap()
+
+    assert_eq(s"${l.code} ${l.data} ${stack.region} ${stack.bytes.value} ${stack.per_core.option}",
+              "flash sram sram 8192 cores")
+    assert(l.heap.unwrap().rest, "a heap named by its region alone takes the rest of it")
+    assert_eq(s"${l.place.at(0).0}=${l.place.at(0).1}", "dma=sram")
+    assert(m.warnings.is_empty(), join(m.warnings.view(), "\n"))
+end gls_reads_the_grammar
+
+@test("a key misspelled inside memory, sections, layout, a stack or a heap is refused, naming what it takes")
+gls_misspelled_keys()
+    assert_eq(gls_refused("memory { ram { orgin = 0, length = 4K, kind = ram } }\n"),
+              "'memory.ram.orgin' is not something a memory region says — it takes 'origin', 'length', " +
+              "'kind' and 'tags'")
+    assert_eq(gls_refused("sections { s { contents = [\".s\"], regoin = ram } }\n"),
+              "'sections.s.regoin' is not something a section says — it takes 'contents', 'region', 'wants', " +
+              "'zero', 'load', 'noload', 'keep', 'first' and 'align'")
+    assert_eq(gls_refused(gls_app("stak = sram")),
+              s"'targets.$gls_target.layout.stak' is not something a layout says — it takes 'code', 'data', " +
+              "'stack', 'heap' and 'place'")
+    assert_eq(gls_refused(gls_app("stack { byte = 4K }")),
+              s"'targets.$gls_target.layout.stack.byte' is not something a stack says — it takes 'region', " +
+              "'bytes' and 'per_core'")
+    assert_eq(gls_refused(gls_app("heap { size = 4K }")),
+              s"'targets.$gls_target.layout.heap.size' is not something a heap says — it takes 'region' and " +
+              "'bytes'")
+end gls_misspelled_keys
+
+@test("a memory, section or symbol key outside its block is warned about as any unknown key is")
+gls_top_level_misspelling_warns()
+    val m = gls_read("memroy { ram { origin = 0, length = 4K, kind = ram } }\n")
+
+    assert(join(m.warnings.view(), "\n").contains("'memroy' is not something this sysl understands"),
+           join(m.warnings.view(), "\n"))
+    assert(m.memory.regions.is_empty(), "a misspelled block declares nothing")
+end gls_top_level_misspelling_warns
+
+@test("a region names an origin, a length that is not 0, and a kind of rom or ram")
+gls_region_refusals()
+    assert_eq(gls_refused("memory { ram { length = 4K, kind = ram } }\n"),
+              "'memory.ram' names no 'origin' — the address the region starts at, as a number or \"option:<name>\"")
+    assert_eq(gls_refused("memory { ram { origin = 0, length = 0, kind = ram } }\n"),
+              "'memory.ram.length' is 0, and a region holds at least one byte")
+    assert_eq(gls_refused("memory { ram { origin = 0, length = 4K } }\n"),
+              "'memory.ram' names no 'kind' — a region is 'kind = rom', what the image is stored in, or " +
+              "'kind = ram', what it runs in")
+    assert_eq(gls_refused("memory { ram { origin = 0, length = 4K, kind = flash } }\n"),
+              "'memory.ram.kind' is 'rom' or 'ram', not 'flash'")
+    assert_eq(gls_refused("memory { ram { origin = 0, length = 4Q, kind = ram } }\n"),
+              "'memory.ram.length' is '4Q', and it is a number — '0x2000_0000', '4096', '128K' or '2M' — or " +
+              "\"option:<name>\"")
+    assert_eq(gls_refused("memory { ram { origin = 0, length = \"option:\", kind = ram } }\n"),
+              "'memory.ram.length' is \"option:\", and \"option:<name>\" names one whole option, as " +
+              "\"option:flash_bytes\" or \"option:kernel.stack_bytes\"")
+end gls_region_refusals
+
+@test("a section names its contents and one of region or wants, says at most one of zero, load and noload")
+gls_section_refusals()
+    assert_eq(gls_refused("sections { s { region = ram } }\n"),
+              "'sections.s' names no 'contents' — the input sections it gathers, as 'contents = [\".sysl.dma\"]', " +
+              "which '@section(\".sysl.dma\")' puts a declaration in")
+    assert_eq(gls_refused("sections { s { contents = [\".s\"] } }\n"),
+              "'sections.s' says neither the 'region' it goes in nor the tag it 'wants' — a section names one " +
+              "of them")
+    assert_eq(gls_refused("sections { s { contents = [\".s\"], region = ram, wants = dma } }\n"),
+              "'sections.s' names both a 'region' and a tag it 'wants' — a section names one of them, and the " +
+              "root's 'layout.place' moves it")
+    assert_eq(gls_refused("sections { s { contents = [\".s\"], region = ram, zero = true, noload = true } }\n"),
+              "'sections.s' says more than one of 'zero', 'load' and 'noload' — a section is zeroed at start-up, " +
+              "or copied from the image, or left as it was, and only one of them")
+    assert_eq(gls_refused("sections { s { contents = [\".s\"], region = ram, zero = true, align = 24 } }\n"),
+              "'sections.s.align' is '24', and an alignment is a power of two")
+    assert_eq(gls_refused("sections { text { contents = [\".t\"], region = ram, zero = true } }\n"),
+              "'sections.text' is named for the generated script's own '.text' section — every script has it, " +
+              "so a section of the package's own is called something else")
+    assert_eq(gls_refused("features { f { sections { s { contents = [] , region = ram } } } }\n"),
+              "'features.f.sections.s.contents' is empty, and a section gathers at least one input section")
+end gls_section_refusals
+
+@test("a symbol alias names a symbol and the generated name it is")
+gls_symbol_refusals()
+    assert_eq(gls_refused("symbols { _estack = 4 }\n"),
+              "'symbols._estack' names the generated symbol it is, as '_estack = stack_top' for '__sysl_stack_top'")
+end gls_symbol_refusals
+
+// -- laying it out ---------------------------------------------------------------------------------
+
+@test("a layout key left out takes the first region of a fitting kind, and the stack defaults to 4K on one core")
+gls_defaults()
+    val laid = gls_laid(gls_one(gls_input("", gls_board))).unwrap()
+
+    assert_eq(s"${laid.code_region} ${laid.data_region} ${laid.stack_region} ${laid.stack_bytes} ${laid.cores}",
+              "flash sram sram 4096 1")
+    assert(laid.text.contains("  } > sram AT> flash\n"), laid.text)
+    assert(laid.text.contains("    . = . + 4096;\n    __sysl_stack_top_0 = .;\n"), laid.text)
+    assert(laid.heap_region == "" && !laid.text.contains(".heap"), "no heap unless the layout names one")
+end gls_defaults
+
+@test("data and code in one region store .data where it runs, and nothing is copied")
+gls_code_and_data_in_one_region()
+    val laid = gls_laid(gls_one(gls_input("", "memory { ram { origin = 0x1000_0000, length = 4M, kind = ram } }\n" +
+                                              gls_app("code = ram, data = ram")))).unwrap()
+
+    assert(!laid.text.contains("AT>"), laid.text)
+    assert(laid.text.contains("    __sysl_copy_table = .;\n    __sysl_copy_table_end = .;\n"), laid.text)
+end gls_code_and_data_in_one_region
+
+@test("a 64-bit image's tables are made of QUADs, and its stacks are on 16 bytes")
+gls_wide_tables()
+    val laid = gls_laid(gls_one(gls_input("", "memory { ram { origin = 0x4000_0000, length = 64M, kind = ram } }\n" +
+                                              "targets { aarch64-freestanding { layout { code = ram } } }\n")),
+                        "aarch64-freestanding").unwrap()
+
+    assert(laid.text.contains("    QUAD(ADDR(.bss)) QUAD(ADDR(.bss) + SIZEOF(.bss))\n"), laid.text)
+    assert(laid.text.contains("ORIGIN = 0x0000000040000000, LENGTH = 0x0000000004000000"), laid.text)
+    assert(laid.text.contains("  .stack (NOLOAD) : ALIGN(16)\n"), laid.text)
+end gls_wide_tables
+
+@test("two regions that overlap are refused, naming both and who declared them")
+gls_overlap()
+    val board = "memory {\n  a { origin = 0x2000_0000, length = 64K, kind = ram }\n" +
+                "  b { origin = 0x2000_8000, length = 64K, kind = ram }\n}\n"
+
+    assert_eq(gls_lay(gls_one(gls_input("", board))),
+              "refused: the regions 'a' (0x20000000..0x20010000, this project) and 'b' (0x20008000..0x20018000, " +
+              "this project) overlap — two regions of one chip are two ranges of addresses, and an image laid out " +
+              "in both would put two things in one place")
+
+    val touching = "memory {\n  a { origin = 0x2000_0000, length = 32K, kind = ram }\n" +
+                   "  b { origin = 0x2000_8000, length = 64K, kind = ram }\n}\n"
+
+    val laid = gls_lay(gls_one(gls_input("", touching + gls_app("code = a"))))
+
+    assert(!laid.starts_with("refused"), laid)
+end gls_overlap
+
+@test("one region declared by two packages is refused")
+gls_region_twice()
+    assert_eq(gls_lay(gls_two(gls_input("", gls_board), gls_input("chip", gls_board))),
+              "refused: the region 'flash' is declared by both this project and 'chip' — a chip's memory is " +
+              "declared once, by the package that knows the chip")
+end gls_region_twice
+
+@test("a layout, a section or a place naming a region that does not exist is refused, listing the regions")
+gls_no_such_region()
+    val regions = "the regions are 'flash' and 'sram'"
+
+    assert_eq(gls_lay(gls_one(gls_input("", gls_board + gls_app("data = dtcm")))),
+              s"refused: 'targets.$gls_target.layout.data' names the region 'dtcm', which no package of this build " +
+              s"declares — $regions")
+    assert_eq(gls_lay(gls_one(gls_input("", gls_board + "sections { s { contents = [\".s\"], region = itcm, " +
+                                            "zero = true } }\n"))),
+              s"refused: 'sections.s.region' names the region 'itcm', which no package of this build declares — $regions")
+    assert_eq(gls_lay(gls_one(gls_input("", gls_board + "sections { s { contents = [\".s\"], region = sram, " +
+                                            "zero = true } }\n" + gls_app("place { s = d2 }")))),
+              s"refused: 'targets.$gls_target.layout.place.s' names the region 'd2', which no package of this build " +
+              s"declares — $regions")
+    assert_eq(gls_lay(gls_one(gls_input("", gls_board + gls_app("place { nothing = sram }")))),
+              s"refused: 'targets.$gls_target.layout.place.nothing' moves a section no package of this build places, " +
+              "and no package places any")
+end gls_no_such_region
+
+@test("a section wanting a tag goes in the first region carrying it, and the root's place overrides it")
+gls_wants_and_place()
+    val board = "memory {\n  flash { origin = 0, length = 1M, kind = rom }\n" +
+                "  d1 { origin = 0x2400_0000, length = 512K, kind = ram, tags = [dma] }\n" +
+                "  d2 { origin = 0x3000_0000, length = 288K, kind = ram, tags = [dma] }\n}\n"
+    val usb = "sections { buf { contents = [\".usb\"], wants = dma, zero = true } }\n"
+    val first = gls_laid(gls_two(gls_input("", gls_app("data = d1")), gls_input("board", board + usb))).unwrap()
+
+    assert(first.text.contains("    *(.usb)\n    . = ALIGN(4);\n    __sysl_buf_end = .;\n  } > d1\n"), first.text)
+
+    val moved = gls_laid(gls_two(gls_input("", gls_app("data = d1, place { buf = d2 }")),
+                                 gls_input("board", board + usb))).unwrap()
+
+    assert(moved.text.contains("    __sysl_buf_end = .;\n  } > d2\n"), moved.text)
+
+    assert_eq(gls_lay(gls_two(gls_input("", gls_app("data = d1")),
+                              gls_input("board", board + "sections { buf { contents = [\".usb\"], wants = fast, " +
+                                                         "zero = true } }\n"))),
+              "refused: 'sections.buf' of 'board' wants a region tagged 'fast', and no region of this build carries " +
+              "the tag — 'd1' carries 'dma', 'd2' carries 'dma'")
+end gls_wants_and_place
+
+@test("a feature's sections are laid out only while the feature is on")
+gls_feature_sections()
+    val usb = "features { h7 { sections { buf { contents = [\".usb\"], wants = dma, zero = true } } } }\n"
+    val off = gls_laid(gls_two(gls_input("", gls_board), gls_input("usb", usb))).unwrap()
+    val on = gls_laid(gls_two(gls_input("", gls_board), gls_input("usb", usb, ["h7"]))).unwrap()
+
+    assert(!off.text.contains(".buf"), off.text)
+    assert(on.text.contains("  .buf (NOLOAD) : ALIGN(4)\n"), on.text)
+    assert(on.text.contains("    LONG(ADDR(.buf)) LONG(ADDR(.buf) + SIZEOF(.buf))\n"), on.text)
+end gls_feature_sections
+
+@test("what a section says is held to its region's kind")
+gls_kind_rules()
+    assert_eq(gls_lay(gls_one(gls_input("", gls_board + "sections { s { contents = [\".s\"], region = flash, " +
+                                            "zero = true } }\n"))),
+              "refused: 'sections.s' of this project says 'zero = true', and its region 'flash' is 'kind = rom' — " +
+              "a read-only region holds only what the image stores, so a section there says none of 'zero', " +
+              "'load' and 'noload'")
+    assert_eq(gls_lay(gls_one(gls_input("", gls_board + "sections { s { contents = [\".s\"], region = sram } }\n"))),
+              "refused: 'sections.s' of this project goes in 'sram', a 'ram' region, and says nothing of what " +
+              "start-up does with it — 'zero = true' to clear it, 'load = true' to copy its values from the image, " +
+              "or 'noload = true' to leave it as a warm reset found it")
+    assert_eq(gls_lay(gls_one(gls_input("", gls_board + gls_app("data = flash")))),
+              s"refused: 'targets.$gls_target.layout.data' names 'flash', a 'rom' region, and the program's data is " +
+              "written as it runs — name a 'ram' region")
+end gls_kind_rules
+
+@test("a loaded section is copied from code by the copy table, a noload one is in neither table")
+gls_tables()
+    val laid = gls_laid(gls_one(gls_input("", gls_board +
+        "sections {\n  fast { contents = [\".fast\"], region = sram, load = true }\n" +
+        "  keep { contents = [\".keep\"], region = sram, noload = true }\n}\n"))).unwrap()
+
+    assert(laid.text.contains("    LONG(LOADADDR(.fast)) LONG(ADDR(.fast)) LONG(ADDR(.fast) + SIZEOF(.fast))\n"),
+           laid.text)
+    assert(laid.text.contains("  } > sram AT> flash\n\n  __sysl_fast_load = LOADADDR(.fast);\n"), laid.text)
+    assert(laid.text.contains("  .keep (NOLOAD) : ALIGN(4)\n"), laid.text)
+    assert(!laid.text.contains("ADDR(.keep)"), laid.text)
+end gls_tables
+
+@test("two first sections in one region, one section declared twice, and one input section gathered twice are refused")
+gls_first_and_twice()
+    val board = gls_board + "sections {\n  a { contents = [\".a\"], region = flash, first = true }\n" +
+                "  b { contents = [\".b\"], region = flash, first = true }\n}\n"
+
+    assert_eq(gls_lay(gls_one(gls_input("", board))),
+              "refused: 'sections.a' and 'sections.b' are both 'first' in the region 'flash', and one section is " +
+              "at its start")
+
+    val s = "sections { a { contents = [\".a\"], region = flash } }\n"
+
+    assert_eq(gls_lay(gls_two(gls_input("", gls_board + s), gls_input("lib", s))),
+              "refused: the section 'a' is declared by both this project and 'lib' — a section is declared once, " +
+              "and a second one is called something else")
+
+    val twice = gls_board + "sections {\n  a { contents = [\".x\"], region = flash }\n" +
+                "  b { contents = [\".x\"], region = flash }\n}\n"
+
+    assert_eq(gls_lay(gls_one(gls_input("", twice))),
+              "refused: 'sections.b' gathers '.x', which 'sections.a' already gathers as '.x' — an input section " +
+              "goes in one place, so a section of the package's own has a name of its own")
+    assert_eq(gls_lay(gls_one(gls_input("", gls_board + "sections { a { contents = [\".text.boot\"], " +
+                                            "region = flash } }\n"))),
+              "refused: 'sections.a' gathers '.text.boot', which the generated script's own sections already " +
+              "gather as '.text.*' — an input section goes in one place, so a section of the package's own has a " +
+              "name of its own")
+end gls_first_and_twice
+
+@test("stacks that do not fit their region and a heap larger than its region are refused before the link")
+gls_stacks_that_do_not_fit()
+    val board = "memory { ram { origin = 0x2000_0000, length = 16K, kind = ram } }\n"
+
+    assert_eq(gls_lay(gls_one(gls_input("", board + gls_app("code = ram, stack { bytes = 12K, per_core = 2 }")))),
+              "refused: 2 stacks of 12,288 bytes do not fit in the region 'ram' (16 KiB, app), which holds 16,384 " +
+              s"— make 'targets.$gls_target.layout.stack.bytes' smaller, or put the stacks in a larger region")
+    assert_eq(gls_lay(gls_one(gls_input("", board + gls_app("code = ram, stack { bytes = 32K }")))),
+              "refused: a stack of 32,768 bytes does not fit in the region 'ram' (16 KiB, app), which holds 16,384 — " +
+              s"make 'targets.$gls_target.layout.stack.bytes' smaller, or put the stacks in a larger region")
+    val full = gls_lay(gls_one(gls_input("", board + gls_app("code = ram, stack { bytes = 8K, per_core = 2 }"))))
+
+    assert(!full.starts_with("refused"), full)
+    assert_eq(gls_lay(gls_one(gls_input("", board + gls_app("code = ram, heap { bytes = 20K }")))),
+              "refused: a heap of 20,480 bytes does not fit in the region 'ram' (16 KiB, app) — make " +
+              s"'targets.$gls_target.layout.heap.bytes' smaller, or give it 'rest'")
+end gls_stacks_that_do_not_fit
+
+@test("a heap of rest ends at its region's end, and one with bytes is that big")
+gls_heaps()
+    val rest = gls_laid(gls_one(gls_input("", gls_board + gls_app("heap { region = sram, bytes = rest }")))).unwrap()
+
+    assert(rest.text.contains("    __sysl_heap_start = .;\n  } > sram\n\n  __sysl_heap_end = ORIGIN(sram) + LENGTH(sram);\n"),
+           rest.text)
+
+    val sized = gls_laid(gls_one(gls_input("", gls_board + gls_app("heap { bytes = 16K }")))).unwrap()
+
+    assert(sized.text.contains("    __sysl_heap_start = .;\n    . = . + 16384;\n    __sysl_heap_end = .;\n"), sized.text)
+end gls_heaps
+
+@test("an option sizes a region and a stack, its own or a dependency's, at the value the build settled on")
+gls_options()
+    val board = "options { flash_bytes { type = usize, values = [1048576, 2097152], default = 2097152 } }\n" +
+                "memory {\n  flash { origin = 0x0800_0000, length = \"option:flash_bytes\", kind = rom }\n" +
+                "  ram { origin = 0x2000_0000, length = 128K, kind = ram }\n}\n"
+    val kernel = "options {\n  stack_bytes { type = usize, default = 2048 }\n  cores { type = usize, default = 1 }\n}\n"
+    val app = gls_app("stack { bytes = \"option:kernel.stack_bytes\", per_core = \"option:kernel.cores\" }")
+
+    var inputs = gls_two(gls_input("", app, [], ["kernel"]), gls_input("board", board))
+
+    inputs.push(gls_input("kernel", kernel, [], [], ["cores=2"]))
+
+    val laid = gls_laid(inputs).unwrap()
+
+    assert(laid.text.contains("LENGTH = 0x00200000"), laid.text)
+    assert_eq(s"${laid.stack_bytes} ${laid.cores} ${laid.stack_from}",
+              "2048 2 layout.stack: kernel.stack_bytes = 2048, kernel.cores = 2")
+
+    var small = gls_two(gls_input("", app, [], ["kernel"]), gls_input("board", board, [], [], ["flash_bytes=1048576"]))
+
+    small.push(gls_input("kernel", kernel))
+    assert(gls_laid(small).unwrap().text.contains("LENGTH = 0x00100000"), "the settled value, not the default")
+end gls_options
+
+@test("an option a value names must exist, be on and be an integer")
+gls_option_refusals()
+    val app = "options {\n  big { type = bool, default = true }\n}\n" +
+              "features { f { options { n { type = usize, default = 65536 } } } }\n" +
+              "memory { ram { origin = 0, length = \"option:%\", kind = ram } }\n" +
+              s"targets { $gls_target { layout { code = ram } } }\n"
+
+    assert_eq(gls_lay(gls_one(gls_input("", replace_all(app, "%", "nope")))),
+              "refused: 'memory.ram.length' is \"option:nope\", and this project has no option 'nope'. It has 'big'")
+    assert_eq(gls_lay(gls_one(gls_input("", replace_all(app, "%", "f.n")))),
+              "refused: 'memory.ram.length' is \"option:f.n\", and the option 'f.n' of this project belongs to the " +
+              "feature 'f', which this build leaves off")
+    assert(!gls_lay(gls_one(gls_input("", replace_all(app, "%", "f.n"), ["f"]))).starts_with("refused"),
+           "with the feature on its option is there")
+    assert_eq(gls_lay(gls_one(gls_input("", replace_all(app, "%", "big")))),
+              "refused: 'memory.ram.length' is \"option:big\", and the option 'big' of this project is not an " +
+              "integer — a size or an address is a number")
+end gls_option_refusals
+
+@test("symbols name what the script defines, once each")
+gls_symbols()
+    val laid = gls_laid(gls_one(gls_input("", gls_board + "symbols { _estack = stack_top, _sidata = data_load }\n"))).unwrap()
+
+    assert(laid.text.contains("  PROVIDE(_estack = __sysl_stack_top);\n  PROVIDE(_sidata = __sysl_data_load);\n"),
+           laid.text)
+
+    val said = gls_lay(gls_one(gls_input("", gls_board + "symbols { _estack = stack_top_1 }\n")))
+
+    assert(said.starts_with("refused: 'symbols._estack' of this project names 'stack_top_1', which the generated " +
+                            "script does not define — it defines "), said)
+    assert(said.contains("'stack_top_0'") && said.ends_with(", each as '__sysl_<name>'"), said)
+    assert_eq(gls_lay(gls_two(gls_input("", gls_board + "symbols { _estack = stack_top }\n"),
+                              gls_input("b", "symbols { _estack = stack_top }\n"))),
+              "refused: the symbol '_estack' is given by both this project and 'b' — a symbol has one value")
+end gls_symbols
+
+@test("a root naming a linker_script in its target block gets no generated script, memory or not")
+gls_hand_written_in_the_target_block()
+    val dir = lbr_temp("sysl-gls-hand")
+    val t = target_named(gls_target).unwrap()
+    val hand = gls_input("", gls_board + s"targets { $gls_target { linker_script = \"own.ld\", layout { data = sram } } }\n")
+
+    reset_feature_request()
+    assert(publish_link_script(dir, t, gls_one(hand)).is_ok(), "the script named is the layout")
+    assert_eq(generated_script_path(), "")
+
+    assert(publish_link_script(dir, t, gls_one(gls_input("", gls_board))).is_ok(), "memory and no script")
+    assert_eq(generated_script_path(), s"$dir/.sysl/out/$gls_target/link.ld")
+
+    assert(publish_link_script(dir, host_target(), gls_one(gls_input("", gls_board))).is_ok(), "a hosted build")
+    assert_eq(generated_script_path(), "")
+    forget_link_script()
+    lbr_drop([dir])
+end gls_hand_written_in_the_target_block
+
+@test("a feature's layout replaces the target block's whole, and two features setting it are refused")
+gls_feature_layouts()
+    val m = gls_read(gls_board + "sections {}\n" + s"targets { $gls_target { layout { data = sram } } }\n" +
+                     s"features {\n  a { targets.$gls_target.layout { stack { bytes = 8K } } }\n" +
+                     s"  b { targets.$gls_target.layout { stack { bytes = 2K } } }\n}\n")
+
+    reset_feature_request()
+    assert_eq(featured_layout(m, gls_target).unwrap().feature, "")
+
+    lbr_cli(["sysl", "build", "/does/not/exist", "--features", "a"])
+
+    val a = featured_layout(m, gls_target).unwrap()
+
+    reset_feature_request()
+    assert_eq(s"${a.feature} ${a.stack.unwrap().bytes.value} ${a.data}", "a 8192 ")
+
+    lbr_cli(["sysl", "build", "/does/not/exist", "--features", "a,b"])
+
+    val clash = feature_target_conflict(m, gls_target).unwrap_or("none")
+
+    reset_feature_request()
+    assert(clash.contains("the features 'a' and 'b' are both on, and both set " +
+                          s"'targets.$gls_target.layout'"), clash)
+end gls_feature_layouts

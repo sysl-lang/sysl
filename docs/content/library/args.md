@@ -149,6 +149,9 @@ main()
 
 ## Reading options: the scanner
 
+`ArgError`, which the scanner and the layer above report through, has `==`, variant by variant and
+payload by payload.
+
 `Scan` knows the *shape* of a command line and nothing about which options a program has. It knows
 that `--name=value` carries its value with it, that `-abc` is three options in one word, that `--`
 ends the options and everything after it is an operand. Deciding what each one means is the `match`.

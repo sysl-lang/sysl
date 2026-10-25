@@ -101,7 +101,7 @@ What is written reads back equal to what was held, for every value but a non-fin
 
 ## What a refusal says
 
-A malformed document is refused with a `JsonError`: the `line` and `col` (both from one; a column
+A malformed document is refused with a `JsonError` (which has `==`, as its `Fault` does): the `line` and `col` (both from one; a column
 counts characters, so it is what an editor shows), the byte `offset`, and the `fault`. It prints
 the way a compiler's diagnostic starts:
 

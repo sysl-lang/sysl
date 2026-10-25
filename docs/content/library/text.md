@@ -229,6 +229,10 @@ of the byte after it — `E0` demands `A0..BF`, `ED` only `80..9F`, `F0` demands
 `80..8F` — so an overlong encoding, a surrogate, and a value past `10FFFF` are all rejected at the
 second byte by the same test, before any code point is assembled.
 
+`Utf8Error` has `==` (two are equal when offset and `truncated` agree), so a decoder's result
+compares directly: `from_utf8(b) == Err(Utf8Error(0, false))`, or `Some(Ok("hi"))` for an
+`Option[Result[string, Utf8Error]]`.
+
 `Utf8Error` carries the offset and **one** distinction beyond it:
 
 ```sysl
@@ -858,6 +862,8 @@ print(b.len())
 ```
 
 ## Reading a value back: the parsers
+
+`ParseError` has `==`, variant by variant and payload by payload.
 
 ```sysl
 enum ParseError

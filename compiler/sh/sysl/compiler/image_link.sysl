@@ -164,6 +164,24 @@ image_refusal(root: string, m: Manifest, t: Target) -> Option[string]
                         "be laid over a program it never saw. Only the root project's sysl.hocon " +
                         "may name them")
 
+                // **A layout is an image key too**: the chip's memory may come from a dependency, and
+                // which of its regions the program goes in is the program's.
+                if !theirs.memory.layouts.is_empty()
+                    val l = theirs.memory.layouts.at(0)
+                    val at = if l.feature == "" then s"targets.${l.target}.layout"
+                    else s"features.${l.feature}.targets.${l.target}.layout"
+
+                    return Some(s"'${tree.who}' sets '$at' in its sysl.hocon, and which regions a " +
+                        "program's code, data, stacks and heap go in is the program's own to say — a " +
+                        "dependency may declare 'memory', 'sections' and 'symbols', and only the root " +
+                        "project's sysl.hocon may name a 'layout'")
+                end if
+
+    if featured_layout(m, t.name).is_some() && !links_an_image(t)
+        return Some(s"'targets.${t.name}.layout' lays out a freestanding image's memory, and '${t.name}' " +
+            "is not a target this compiler links an image for. Remove the key, or build for a freestanding " +
+            "target")
+
     val img = image_for(m, t.name) match
         None -> return None
         Some(found) -> found
@@ -277,11 +295,21 @@ image_link_flags() -> Buf[string]
         out.push(s"-Wl,--entry=$entry")
         out.push(s"-Wl,--defsym=__sysl_entry=$entry")
 
-    for line in tls_template_symbols()
-        out.push(s"-Wl,--defsym=$line")
+    // **The template's bounds are defined by the command line only where nothing else defines them,
+    // and only for lld.** A generated script defines them itself. GNU ld evaluates `SIZEOF` of a
+    // section the image does not have as an error, which is every image with no thread-local storage,
+    // so a script written by hand for it defines the four symbols where it lays the template out.
+    val generated = image_script != "" && image_script == generated_script_path()
+
+    if !generated && links_with_lld(linker)
+        for line in tls_template_symbols()
+            out.push(s"-Wl,--defsym=$line")
 
     out
 end image_link_flags
+
+// Whether a linker is lld: `ld.lld`, `lld`, or a path to one.
+links_with_lld(linker: string) -> bool = basename(linker).contains("lld")
 
 // **The thread-local template, named for `sysl.threads`** -- where the `.tdata` image starts, where
 // its initialized bytes end, where the zeroed `.tbss` after them ends, and the larger alignment of the
@@ -308,6 +336,10 @@ end tls_template_symbols
 
 // The entry the settled link names, which is what a failed link's refusal is read against.
 settled_image_entry() -> string = image_entry
+
+// The linker and the script the settled link uses.
+settled_image_linker() -> string = image_linker
+settled_image_script() -> string = image_script
 
 // **Whether a program for this machine gets a `main`.** It does -- the computed `val`s, the entry
 // file's statements and a declared `main` all run from it -- unless all three hold:
