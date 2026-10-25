@@ -1,0 +1,340 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.str_builder
+
+// **A part read from a local, and a later part of the same expression that assigns that local.**
+//
+// The parts of a call, a literal, a string `+` or a comparison are worked out left to right, and
+// each is the value it had when it was worked out. A part read from a local nobody else can reach is
+// read *borrowed* -- the local holds its count, and a large one crosses at the local's own address --
+// which is sound only while nothing writes the local before the call or the value is made. A later
+// part that assigns it does exactly that: the callee read the new value through the address, or the
+// count the old value was read under was given back and the object freed under the part.
+//
+// `Node` prints when it is freed, so a use after free shows as a `drop` line printed before the use,
+// and a value read twice or never given back as a missing or doubled `drop`.
+
+private lwa_ready() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+
+    true
+end lwa_ready
+
+// What a program prints and whether it came back cleanly.
+private lwa_ran(text: string) -> (string, bool)
+    val root = make_temp_dir("sysl-lwa").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (failure_text(why), false)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> ("the program that was built could not be run", false)
+        Ok(out) -> (out.text, out.status.ok())
+end lwa_ran
+
+private lwa_prints(text: string, expected: string)
+    if !lwa_ready() then return
+
+    val got = lwa_ran(lwa_prelude() + text)
+
+    assert_eq(got.0, expected)
+    assert(got.1, "the program printed what was expected and did not exit cleanly")
+end lwa_prints
+
+// The LLVM text of the program's entry point.
+private lwa_main_ir(text: string) -> string
+    val root = make_temp_dir("sysl-lwa").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, lwa_prelude() + text).unwrap()
+
+    val out = emit_llvm_text(src, None) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> if made.report.is_empty() then made.text else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+
+    var b = str_builder()
+    var inside = false
+
+    for line in lines_of(out)
+        if !inside && line.starts_with("define ") && line.contains("@main(") then inside = true
+
+        if inside
+            if line == "}" then return b.finish()
+
+            b.push(line)
+            b.push_char('\n')
+
+    s"no main in:\n$out"
+end lwa_main_ir
+
+// 520 bytes of `Big`, far over the indirect boundary, and a counted `Node` that says when it goes.
+private lwa_prelude() -> string = raw"""
+    struct Node
+        value: int
+
+    impl Drop for Node
+        drop(self) = print(s"drop ${self.value}")
+
+    struct Big
+        cells: [64]i64
+        tag: int
+
+    first(b: Big, k: int) -> i64 = b.cells[0] + i64(b.tag) + i64(k)
+
+    peek(n: &Node, k: int) -> int
+        print(s"peek ${n.value}")
+        n.value * 10 + k
+
+    """
+
+// -- a call's arguments -------------------------------------------------------------------------
+
+@test("a later argument that assigns a large local: the callee sees the value the argument had")
+lwa_large_local_then_assigned()
+    lwa_prints(raw"""
+        var k = 0
+        var b = Big([10; 64], 20)
+        print(first(b, k match
+            _ ->
+                b = Big([100; 64], 200)
+                1))
+        print(b.tag)
+        """, "31\n200\n")
+
+@test("a later argument that assigns a field of a large local: the callee sees the field as it was")
+lwa_large_field_then_assigned()
+    lwa_prints(raw"""
+        struct Outer
+            big: Big
+            n: int
+        var k = 0
+        var o = Outer(Big([1; 64], 2), 3)
+        print(first(o.big, k match
+            _ ->
+                o.big = Big([1000; 64], 2000)
+                1))
+        print(o.big.tag)
+        """, "4\n2000\n")
+
+@test("an earlier argument that assigns a large local: the later one reads the new value")
+lwa_large_local_assigned_first()
+    lwa_prints(raw"""
+        second(k: int, b: Big) -> i64 = b.cells[0] + i64(b.tag) + i64(k)
+        var k = 0
+        var b = Big([10; 64], 20)
+        print(second(k match
+            _ ->
+                b = Big([100; 64], 200)
+                1, b))
+        """, "301\n")
+
+@test("a later argument that assigns a counted local: the object is alive when the callee reads it")
+lwa_counted_local_then_assigned()
+    lwa_prints(raw"""
+        var k = 0
+        var n = Node(7)
+        print(peek(n, k match
+            _ ->
+                n = Node(8)
+                1))
+        """, "peek 7\n71\ndrop 7\ndrop 8\n")
+
+@test("a later argument that assigns the receiver's local: a method's self is alive when it runs")
+lwa_receiver_then_assigned()
+    lwa_prints(raw"""
+        struct Pairing
+            inner: &Node
+        impl Pairing
+            plus(self, k: int) -> int
+                print(s"plus ${self.inner.value}")
+                self.inner.value + k
+        var k = 0
+        var p = Pairing(Node(3))
+        print(p.plus(k match
+            _ ->
+                p = Pairing(Node(4))
+                10))
+        """, "plus 3\n13\ndrop 3\ndrop 4\n")
+
+// A `Drop` type's receiver is read out of its box, which is a copy: the object it was copied from
+// goes when its local is assigned, and the copy is what the method reads.
+@test("a later argument that assigns the box a Drop receiver was copied out of: the copy is what runs")
+lwa_drop_receiver_copied_out()
+    lwa_prints(raw"""
+        impl Node
+            plus(self, k: int) -> int
+                print(s"plus ${self.value}")
+                self.value + k
+        var k = 0
+        var n = Node(3)
+        print(n.plus(k match
+            _ ->
+                n = Node(4)
+                10))
+        """, "drop 3\nplus 3\n13\ndrop 4\n")
+
+@test("a later argument that assigns a trait object's local: the object is alive through the call")
+lwa_trait_receiver_then_assigned()
+    lwa_prints(raw"""
+        trait Shows
+            show(self, k: int) -> int
+        struct Thing
+            v: int
+        impl Drop for Thing
+            drop(self) = print(s"thing ${self.v}")
+        impl Shows for Thing
+            show(self, k: int) -> int = self.v * 10 + k
+        var k = 0
+        var t: &Shows = Thing(3)
+        print(t.show(k match
+            _ ->
+                t = Thing(4)
+                1))
+        """, "31\nthing 3\nthing 4\n")
+
+// -- the parts of a value -------------------------------------------------------------------------
+
+@test("a struct literal argument whose later field assigns an earlier field's local")
+lwa_small_literal_field_then_assigned()
+    lwa_prints(raw"""
+        struct Wrap
+            a: &Node
+            b: int
+        peek_wrap(w: Wrap) -> int
+            print(s"peek_wrap ${w.a.value}")
+            w.a.value * 10 + w.b
+        var k = 0
+        var m = Node(5)
+        print(peek_wrap(Wrap(m, k match
+            _ ->
+                m = Node(6)
+                2)))
+        """, "peek_wrap 5\n52\ndrop 5\ndrop 6\n")
+
+@test("a large struct literal built in place whose later field assigns an earlier field's local")
+lwa_large_literal_field_then_assigned()
+    lwa_prints(raw"""
+        struct Holder
+            pad: [32]i64
+            node: &Node
+            b: int
+        var k = 0
+        var q = Node(11)
+        val h = Holder([0; 32], q, k match
+            _ ->
+                q = Node(12)
+                3)
+        print(h.node.value * 10 + h.b)
+        """, "113\ndrop 11\ndrop 12\n")
+
+@test("an enum literal whose later payload field assigns an earlier one's local")
+lwa_enum_literal_field_then_assigned()
+    lwa_prints(raw"""
+        enum Pair
+            Two(a: &Node, b: int)
+            Zero
+        var k = 0
+        var q = Node(31)
+        val p = Pair.Two(q, k match
+            _ ->
+                q = Node(32)
+                3)
+        p match
+            Two(a, b) -> print(a.value * 10 + b)
+            Zero -> print("zero")
+        """, "313\ndrop 31\ndrop 32\n")
+
+@test("an array literal whose later element assigns an earlier element's local")
+lwa_array_literal_element_then_assigned()
+    lwa_prints(raw"""
+        var k = 0
+        var r = Node(21)
+        val arr = [r, k match
+            _ ->
+                r = Node(22)
+                r]
+        print(arr[0].value, arr[1].value)
+        """, "21 22\ndrop 21\ndrop 22\n")
+
+@test("a string + whose right side assigns the left side's local")
+lwa_concat_then_assigned()
+    lwa_prints(raw"""
+        var k = 0
+        var s = s"aaa${k}"
+        val joined = s + (k match
+            _ ->
+                s = s"bbb${k}"
+                "!")
+        print(joined, s)
+        """, "aaa0! bbb0\n")
+
+@test("a comparison whose right side assigns the left side's local")
+lwa_compare_then_assigned()
+    lwa_prints(raw"""
+        var k = 0
+        var s = s"ccc${k}"
+        print(s == (k match
+            _ ->
+                s = s"ddd${k}"
+                "ccc0"), s)
+        var t = s"eee${k}"
+        print("eee0" == t && t == (k match
+            _ ->
+                t = s"fff${k}"
+                "eee0"), t)
+        """, "true ddd0\ntrue fff0\n")
+
+// -- what stays as it was -------------------------------------------------------------------------
+
+@test("a later argument that assigns nothing leaves a large local crossing at its own address")
+lwa_quiet_argument_keeps_the_address()
+    if !lwa_ready() then return
+
+    val out = lwa_main_ir(raw"""
+        bump(x: int) -> int = x + 1
+        var b = Big([10; 64], 20)
+        print(first(b, bump(1)))
+        """)
+
+    assert(out.contains("@first(ptr %b.addr"), out)
+    assert(!out.contains("i64 520"), out)
+
+@test("a later argument that assigns a large local stages a snapshot of it")
+lwa_writing_argument_stages_a_copy()
+    if !lwa_ready() then return
+
+    val out = lwa_main_ir(raw"""
+        var k = 0
+        var b = Big([10; 64], 20)
+        print(first(b, k match
+            _ ->
+                b = Big([100; 64], 200)
+                1))
+        """)
+
+    assert(!out.contains("@first(ptr %b.addr"), out)
+    assert(out.contains("i64 520"), out)

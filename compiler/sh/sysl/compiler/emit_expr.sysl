@@ -2,6 +2,7 @@ module sh.sysl.compiler
 
 import sh.sysl.parsing.Span
 import sysl.buf.{Buf, buf}
+import sysl.container.Set
 import sysl.math.bigint.{BigInt, from_int, sub as big_sub}
 import sysl.math.decimal.{Decimal, rescale, Rounding}
 
@@ -282,11 +283,7 @@ gen_expr(e: *Emit, x: TExpr) -> Val = *x.kind match
         // **Every element is produced before any of them is laid in.** The two phases are what the
         // register numbering says: an element that emits anything of its own would otherwise have
         // its instructions interleaved with the chain that collects them.
-        var vals: Buf[Val] = buf()
-
-        for item in elems
-            vals.push(gen_expr(e, item))
-
+        val vals = gen_parts(e, elems)
         var acc: Val = VZero
 
         for i in 0..<vals.len()
@@ -655,8 +652,16 @@ end view_len
 // -- arithmetic ---------------------------------------------------------------------------------
 
 private gen_binary(e: *Emit, op: string, l: TExpr, r: TExpr, ty: Type) -> Val
-    if underlying(ty) == Str then
-        return own_temp(e, str_concat(e, gen_expr(e, l), gen_expr(e, r)), Str)
+    if underlying(ty) == Str
+        var both: Buf[TExpr] = buf()
+
+        both.push(l)
+        both.push(r)
+
+        val vs = gen_parts(e, both)
+
+        return own_temp(e, str_concat(e, vs.at(0), vs.at(1)), Str)
+    end if
 
     val lt = underlying(texpr_type(l))
 
@@ -896,10 +901,13 @@ end gen_logical
 // overwhelming majority of comparisons are. A **chain** stops at the first comparison that fails,
 // with each operand still evaluated exactly once.
 private gen_compare(e: *Emit, operands: Buf[TExpr], cmps: Buf[TCmp]) -> Val
-    if cmps.len() == 1
-        val lv = gen_expr(e, operands.at(0))
+    // An operand a later one assigns the local of is held by a count of its own (`gen_parts`).
+    val written = written_by(operands)
 
-        return comparison(e, cmps.at(0), texpr_type(operands.at(0)), lv, gen_expr(e, operands.at(1)))
+    if cmps.len() == 1
+        val lv = gen_part(e, operands.at(0), written)
+
+        return comparison(e, cmps.at(0), texpr_type(operands.at(0)), lv, gen_part(e, operands.at(1), written))
 
     val slot = alloca(e, fresh_reg(e), l_i1())
 
@@ -921,9 +929,9 @@ private gen_compare(e: *Emit, operands: Buf[TExpr], cmps: Buf[TCmp]) -> Val
         push_temps(e)
         push_owned(e)
 
-        if k == 0 then left = gen_expr(e, operands.at(0))
+        if k == 0 then left = gen_part(e, operands.at(0), written)
 
-        val right = gen_expr(e, operands.at(k + 1))
+        val right = gen_part(e, operands.at(k + 1), written)
         val c = comparison(e, cmps.at(k), texpr_type(operands.at(k)), left, right)
 
         emit(e, InStore(l_i1(), c, slot, AccPlain, None))
@@ -1261,11 +1269,7 @@ private gen_enum_new(e: *Emit, at: Span, enum_ty: Type, variant: EnumVariant, ar
         Some(decl) -> decl
         None -> return gap_at(e, "an enum construction of something that is not an enum")
 
-    var vals: Buf[Val] = buf()
-
-    for item in args
-        vals.push(gen_expr(e, item))
-
+    val vals = gen_parts(e, args)
     val made = enum_value(e, enum_ty, d, variant, vals)
 
     note_parts(e, at, made, vals)
@@ -1296,9 +1300,10 @@ private gen_struct_new(e: *Emit, at: Span, decl: &StructType, args: Buf[TExpr]) 
         None -> ()
 
     var vals: Buf[Val] = buf()
+    val parts = gen_parts(e, args)
 
     for i in 0..<args.len()
-        vals.push(captured_value(e, decl, i, gen_expr(e, args.at(i))))
+        vals.push(captured_value(e, decl, i, parts.at(i)))
 
     var acc: Val = VUndef
 
@@ -1315,6 +1320,38 @@ private gen_struct_new(e: *Emit, at: Span, decl: &StructType, args: Buf[TExpr]) 
     note_parts(e, at, acc, vals)
     acc
 end gen_struct_new
+
+// The parts of a value being built, worked out in order.
+//
+// A part is read borrowed from wherever it is held, and the value built from it takes its counts only
+// once every part is in hand. **A later part that assigns the local an earlier one was read from**
+// gives that local's count back in between -- `Wrap(m, k match _ -> (m = other; 2))` would build a
+// value around an object already freed -- so there the part is held by a count of the statement's
+// own, taken as it is read (`held_unless`), which the destination then takes over or the statement
+// gives back.
+gen_parts(e: *Emit, parts: Buf[TExpr]) -> Buf[Val]
+    var vals: Buf[Val] = buf()
+    val written = written_by(parts)
+
+    for item in parts
+        vals.push(gen_part(e, item, written))
+
+    vals
+end gen_parts
+
+// One of them, where `written` is what the whole list assigns.
+private gen_part(e: *Emit, item: TExpr, written: Set[string]) -> Val
+    val v = gen_expr(e, item)
+    val ty = texpr_type(item)
+
+    if !written.is_empty() && contains_counted(ty) && !e.layout.indirect(ty) && held(e, item) &&
+       !held_unless(e, item, written) then
+        retain_value(e, ty, v)
+        own_temp(e, v, ty)
+    end if
+
+    v
+end gen_part
 
 // -- calls ----------------------------------------------------------------------------------------
 
@@ -1467,11 +1504,12 @@ end gen_va_intrinsic
 // `callee` is the function being called, by name, or empty where none is known.
 staged_args(e: *Emit, args: Buf[TExpr], out: *Buf[IrArg], callee: string) -> Buf[(int, Val)]
     var staged: Buf[(int, Val)] = buf()
+    val written = written_by(args)
 
     for i in 0..<args.len()
         val a = args.at(i)
         val aty = texpr_type(a)
-        val v = guaranteed_arg(e, a, if quiet_after(args, i) then callee else "")
+        val v = guaranteed_arg(e, a, if quiet_after(args, i) then callee else "", written)
 
         if e.layout.indirect(aty)
             out.push(ir_arg(LPtr, v))
@@ -1485,10 +1523,11 @@ staged_args(e: *Emit, args: Buf[TExpr], out: *Buf[IrArg], callee: string) -> Buf
 end staged_args
 
 // One argument, in whatever form the boundary takes it: a large value crosses as the address of
-// storage the caller holds, and a zero-sized one is evaluated and not passed.
-arg_value(e: *Emit, a: TExpr, out: *Buf[IrArg])
+// storage the caller holds, and a zero-sized one is evaluated and not passed. `written` is what the
+// call's arguments assign (`written_by`).
+arg_value(e: *Emit, a: TExpr, out: *Buf[IrArg], written: Set[string])
     val ty = texpr_type(a)
-    val v = guaranteed_arg(e, a, "")
+    val v = guaranteed_arg(e, a, "", written)
 
     if e.layout.indirect(ty) then out.push(ir_arg(LPtr, v))
     else if !zero_sized(ty) then out.push(ir_arg(lty(e, ty), v))
@@ -1549,10 +1588,13 @@ end changes_nothing
 // value is already a snapshot, so the count goes on it and comes back with the statement's other
 // temporaries; a large one never becomes a register, so the snapshot is a slot of this frame's,
 // written with counts taken and released where the scope holding it ends.
-private guaranteed_arg(e: *Emit, a: TExpr, callee: string) -> Val
+//
+// A local a later argument assigns is held by neither: the write lands between this argument and the
+// call (`written`).
+private guaranteed_arg(e: *Emit, a: TExpr, callee: string, written: Set[string]) -> Val
     val ty = texpr_type(a)
     val big = e.layout.indirect(ty)
-    val still = held(e, a) || (big || contains_counted(ty)) && lends_in_place(e, callee, ty)
+    val still = held_unless(e, a, written) || (big || contains_counted(ty)) && lends_in_place(e, callee, ty)
     val guarantee = contains_counted(ty) && !still
 
     if big then return indirect_arg(e, a, still)

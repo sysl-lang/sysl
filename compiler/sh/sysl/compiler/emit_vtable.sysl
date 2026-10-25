@@ -213,8 +213,20 @@ end gen_erase
 
 // A call whose callee is a word in the object's table rather than a name. The data word goes in front
 // of the declared arguments, which is the shape every slot was built to.
+//
+// The receiver is borrowed from wherever it is held, which is sound while nothing lets go of it
+// before the call is made. An argument that assigns the receiver's local does exactly that, so there
+// the object is held by a count of the call's own (`held_unless`).
 gen_vcall(e: *Emit, receiver: TExpr, slot: int, args: Buf[TExpr], ty: Type) -> Val
+    val written = written_by(args)
     val obj = gen_expr(e, receiver)
+    val rty = texpr_type(receiver)
+
+    if contains_counted(rty) && held(e, receiver) && !held_unless(e, receiver, written)
+        retain_value(e, rty, obj)
+        own_temp(e, obj, rty)
+    end if
+
     val table = fresh_reg(e)
 
     emit(e, InExtract(table, l_fat(), obj, index_list(0)))
@@ -226,7 +238,7 @@ gen_vcall(e: *Emit, receiver: TExpr, slot: int, args: Buf[TExpr], ty: Type) -> V
     var arg_vals: Buf[IrArg] = buf()
 
     for arg in args
-        arg_value(e, arg, &arg_vals)
+        arg_value(e, arg, &arg_vals, written)
 
     val fn = vtable_entry(e, table, slot)
 
