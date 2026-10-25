@@ -526,6 +526,110 @@ extern "lib_register" register(ctx: *int, events: int)
 '@keeps' names 'context', which is not a parameter of 'register' — its parameters are 'ctx', 'events'
 ```
 
+### `@answers` — a C function whose answer points into an argument
+
+What a call answers is followed as well: a sysl function that hands back the address of something
+its argument points at is lent for as long as the argument is
+([memory.md § Handing it back is not keeping it](/reference/memory/#handing-it-back-is-not-keeping-it)).
+An `extern` again has no body to read, and the default is again C's: **a pointer a C function
+answers is fresh** — storage the library made, like `opendir`'s stream or `strdup`'s copy, and made
+of nothing it was handed. So it may be kept anywhere, whatever was passed to get it:
+
+```sysl
+extern "strdup" c_strdup(s: *u8) -> *u8
+
+static var spare: u8 = 0
+static var held: *u8 = &spare
+
+run()
+    var name: [3]u8 = [104, 105, 0]
+
+    held = c_strdup(&name[0])
+
+run()
+print(held[1])
+```
+
+```output
+105
+```
+
+The exception is the family that answers a pointer **into** what it was handed — `strchr`, `strstr`,
+`memchr`, `strtok_r`, `fgets`, `getcwd` with a buffer, `memcpy` and `strcpy` answering their
+destination — and the binding names the parameters the answer may point into. Its answer is then
+followed as the argument is, so keeping it is keeping the argument:
+
+```sysl
+@answers(s)
+extern "strchr" c_strchr(s: *u8, c: int) -> *u8
+
+static var spare: u8 = 0
+static var held: *u8 = &spare
+
+run()
+    var bytes: [4]u8 = [104, 105, 33, 0]
+
+    held = c_strchr(&bytes[0], 105)
+```
+
+```error
+'c_strchr(&bytes[0], 105)' holds the address of a field of 'bytes', a local of 'run', and it is stored in 'held', which outlives 'run'
+```
+
+Used inside the frame, the same answer is an ordinary pointer:
+
+```sysl
+@answers(s)
+extern "strchr" c_strchr(s: *u8, c: int) -> *u8
+
+run() -> u8
+    var bytes: [4]u8 = [104, 105, 33, 0]
+    val at = c_strchr(&bytes[0], 105)
+
+    at[1]
+
+print(run())
+```
+
+```output
+33
+```
+
+**It marks an `extern` function and nothing else**, as `@keeps` does, and the two may stand on one
+declaration: each is held to its own parameters. It names the function's own pointer parameters,
+each once, above a function that answers a pointer; there is no empty form:
+
+```sysl
+@answers(p)
+find(p: *u8) -> *u8 = p
+```
+
+```error
+'@answers(...)' names the parameters the pointer a C function answers may point into, so it marks an 'extern'
+```
+
+```sysl
+@answers(n)
+extern "memchr" c_memchr(p: *u8, c: int, n: usize) -> *u8
+```
+
+```error
+'@answers' names 'n', which is 'usize' — an answer points into only what a pointer parameter reaches, so a parameter it names is a pointer
+```
+
+```sysl
+@answers(s)
+extern "strlen" c_strlen(s: *u8) -> usize
+```
+
+```error
+'@answers' says what the pointer an 'extern' answers may point into, and 'c_strlen' answers 'usize' — only a pointer points into anything
+```
+
+**Leaving it off a function that does answer into an argument is the binding's mistake, and nothing
+catches it**: the answer is taken to be fresh, and the address of a local can leave its frame inside
+it unseen. The standard library's own `memchr`, `memmove`, `getcwd` and directory reading carry it.
+
 ## `@export` — a definition C can call
 
 `@export` is `extern` read the other way. An `extern` names a symbol the linker has and states the

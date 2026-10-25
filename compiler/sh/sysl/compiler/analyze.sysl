@@ -929,6 +929,11 @@ private resolve_signatures(a: &Analysis)
 
             check_keeps_names(a, home.scope, home.span, d)
 
+        if !d.answers.is_empty()
+            val home = a.tables.extern_scopes.get(key).unwrap()
+
+            check_answers_names(a, home.scope, home.span, d, resolved, answer)
+
     // **Module storage is deliberately absent from this, and its written type is resolved where the
     // storage itself is read.** Resolving it here would make every type a module's storage names
     // real ahead of every type its members name, and the record a compilation keeps of what it laid
@@ -1164,6 +1169,59 @@ private check_keeps_names(a: &Analysis, scope: Scope, span: Span, d: ExternDecl)
             a.fault(scope, span, s"'@keeps' names '${k.at(i)}' twice, and a parameter is kept or it " +
                     "is not — the second says nothing the first does not")
 end check_keeps_names
+
+// `@answers` names an `extern`'s own pointer parameters, each once, and the `extern` answers a
+// pointer. **A misspelling would otherwise make the answer fresh and say nothing**, and a `strchr`
+// whose answer is taken to be new storage lets the address of a local leave its frame unseen.
+private check_answers_names(a: &Analysis, scope: Scope, span: Span, d: ExternDecl,
+                            resolved: Buf[(string, Type)], answer: Type)
+    if !is_pointer_answer(answer)
+        val shown = if no_value(answer) then "nothing" else s"'${type_show(answer)}'"
+
+        a.fault(scope, span, s"'@answers' says what the pointer an 'extern' answers may point into, " +
+                s"and '${d.name}' answers $shown — only a pointer points into anything")
+        return
+    end if
+
+    val k = d.answers
+
+    for i in 0..<k.len()
+        var declared: Option[Type] = None
+
+        for p in resolved
+            if p.0 == k.at(i) then declared = Some(p.1)
+
+        var twice = false
+
+        for j in 0..<i
+            if k.at(j) == k.at(i) then twice = true
+
+        if declared.is_none()
+            var listed = ""
+
+            for j in 0..<d.params.len()
+                val p = d.params.at(j).name
+
+                listed = if j == 0 then s"'$p'" else s"$listed, '$p'"
+
+            val tail = if d.params.is_empty() then " — it takes none"
+            else s" — its parameters are $listed"
+
+            a.fault(scope, span, s"'@answers' names '${k.at(i)}', which is not a parameter of " +
+                    s"'${d.name}'$tail")
+        else if twice
+            a.fault(scope, span, s"'@answers' names '${k.at(i)}' twice — the second says nothing " +
+                    "the first does not")
+        else if !is_pointer_answer(declared.unwrap())
+            a.fault(scope, span, s"'@answers' names '${k.at(i)}', which is " +
+                    s"'${type_show(declared.unwrap())}' — an answer points into only what a pointer " +
+                    "parameter reaches, so a parameter it names is a pointer")
+    end for
+end check_answers_names
+
+private is_pointer_answer(t: Type) -> bool = underlying(t) match
+    Ptr(_) -> true
+    _ -> false
 
 // **A `@test` or a hook returns nothing**: the runner reads its verdict off whether it came back, so
 // a value returned beside that is one nothing is going to read. Asked of the RESOLVED result rather
