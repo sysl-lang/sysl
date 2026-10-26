@@ -1,0 +1,313 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.{Search, cstring, from_utf8_unchecked, join, split}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// `#if sanitize_address` and `#if sanitize_thread`: the two facts about **the build** a source
+// condition may ask, true exactly when every function is marked for that sanitizer.
+//
+// The axes: which flags (`address`, `thread`, a list naming several, a suppression, a sanitizer
+// with no attribute, none); the condition's shape (bare, `!`, `#elif`, `&&` with a machine symbol);
+// the target (hosted, a board); the route the flags take (a parameter, `SYSL_EXTRA_CFLAGS` read by
+// default, a whole build, a package's tests over its library module); the caches (a plain build and
+// an instrumented one of one tree in a row); and the refusals (a near spelling in a live branch and
+// in a skipped one, the two symbols in a dependency's `if`).
+//
+// Not covered: `sanitize_thread` through a whole build and run, because a TSan binary of the same
+// program is what `san_` already builds, and the gate is the shared seam both read; a bare-metal
+// build *under* the flags, because no board here carries a sanitizer runtime to link against.
+
+private extern "setenv" snc_c_setenv(name: *u8, value: *u8, overwrite: int) -> int
+private extern "unsetenv" snc_c_unsetenv(name: *u8) -> int
+
+private snc_flags(value: string)
+    val n = cstring("SYSL_EXTRA_CFLAGS")
+    val v = cstring(value)
+
+    snc_c_setenv(n.ptr, v.ptr, 1)
+end snc_flags
+
+private snc_no_flags()
+    val n = cstring("SYSL_EXTRA_CFLAGS")
+
+    snc_c_unsetenv(n.ptr)
+end snc_no_flags
+
+private snc_words(text: string) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for item in split(text, " ")
+        if item != "" then out.push(item)
+
+    out
+end snc_words
+
+private snc_host() -> Target = target_named("aarch64-macos").unwrap()
+
+private snc_board() -> Target = target_named("thumb-freestanding").unwrap()
+
+// The lines `t` keeps of `text` under the clang flags `flags`, blank ones dropped, or `!` and the
+// refusal.
+private snc_sees(t: Target, flags: string, text: string) -> string
+    gate(source_of("<input>", text), t, buf(), snc_words(flags)) match
+        Err(d) -> s"!${d.message}"
+        Ok(out) ->
+            var acc = ""
+
+            for line in split(from_utf8_unchecked(out.bytes), "\n")
+                val kept = line.trim()
+
+                if kept != ""
+                    if acc != "" then acc = acc + "|"
+
+                    acc = acc + kept
+
+            acc
+end snc_sees
+
+private snc_choice() -> string =
+    "#if sanitize_address\nasan\n#elif sanitize_thread\ntsan\n#else\nplain\n#endif\n"
+
+// -- the gate ---------------------------------------------------------------------------------------
+
+@test("snc: each symbol is true under its own sanitizer and false without one")
+snc_each_under_its_own()
+    assert_eq(snc_sees(snc_host(), "-fsanitize=address", snc_choice()), "asan")
+    assert_eq(snc_sees(snc_host(), "-fsanitize=thread", snc_choice()), "tsan")
+    assert_eq(snc_sees(snc_host(), "", snc_choice()), "plain")
+    assert_eq(snc_sees(snc_host(), "-O2 -g", snc_choice()), "plain")
+
+@test("snc: the flags are read as the instrumentation reads them")
+snc_flags_read_as_marking()
+    assert_eq(snc_sees(snc_host(), "-fsanitize=address,undefined", snc_choice()), "asan")
+    assert_eq(snc_sees(snc_host(), "-fsanitize=undefined,thread", snc_choice()), "tsan")
+    assert_eq(snc_sees(snc_host(), "-fno-sanitize=address", snc_choice()), "plain")
+    assert_eq(snc_sees(snc_host(), "-fsanitize=undefined", snc_choice()), "plain")
+    assert_eq(snc_sees(snc_host(), "-fsanitize=memory", snc_choice()), "plain")
+
+    val both = "#if sanitize_address && sanitize_thread\nboth\n#else\nnot\n#endif\n"
+
+    assert_eq(snc_sees(snc_host(), "-fsanitize=address -fsanitize=thread", both), "both")
+    assert_eq(snc_sees(snc_host(), "-fsanitize=address", both), "not")
+
+@test("snc: the condition and the marking cannot disagree, whatever the flags")
+snc_one_source_of_truth()
+    val cases: []const string = ["", "-fsanitize=address", "-fsanitize=thread", "-fsanitize=address,thread",
+        "-fno-sanitize=thread", "-fsanitize=hwaddress", "-fsanitize=", "-fsanitize=address -fno-sanitize=address"]
+
+    for i in 0..<cases.len
+        val flags = snc_words(cases[i])
+        val attrs = sanitizer_attrs(flags)
+        val on = instrumented(flags)
+
+        assert_eq(has(on, "sanitize_address"), has(attrs, "sanitize_address"))
+        assert_eq(has(on, "sanitize_thread"), has(attrs, "sanitize_thread"))
+
+@test("snc: '!' and '#elif' read the two as any other symbol")
+snc_negation_and_elif()
+    val negated = "#if !sanitize_address\nplain\n#else\nasan\n#endif\n"
+
+    assert_eq(snc_sees(snc_host(), "", negated), "plain")
+    assert_eq(snc_sees(snc_host(), "-fsanitize=address", negated), "asan")
+
+    val mixed = "#if sanitize_address && posix\nhosted_asan\n#elif !sanitize_thread\nquiet\n#endif\n"
+
+    assert_eq(snc_sees(snc_host(), "-fsanitize=address", mixed), "hosted_asan")
+    assert_eq(snc_sees(snc_host(), "", mixed), "quiet")
+    assert_eq(snc_sees(snc_host(), "-fsanitize=thread", mixed), "")
+
+@test("snc: on a board both are known and false, and the flags decide there as everywhere")
+snc_on_a_board()
+    assert_eq(snc_sees(snc_board(), "", snc_choice()), "plain")
+    assert_eq(snc_sees(target_named("riscv64-freestanding").unwrap(), "", snc_choice()), "plain")
+
+    // clang instruments a board's code under the flag as it does a host's, so the condition says so.
+    assert_eq(snc_sees(snc_board(), "-fsanitize=address", snc_choice()), "asan")
+
+@test("snc: with no flags passed, the gate reads SYSL_EXTRA_CFLAGS")
+snc_default_reads_the_environment()
+    val src = source_of("<input>", snc_choice())
+
+    snc_flags("-g -fsanitize=address")
+
+    val flagged = gate(src, snc_host())
+
+    snc_no_flags()
+
+    val plain = gate(src, snc_host())
+
+    assert_eq(from_utf8_unchecked(flagged.unwrap().bytes).contains("asan"), true)
+    assert_eq(from_utf8_unchecked(plain.unwrap().bytes).contains("asan"), false)
+
+@test("snc: the vocabulary has both, a directory's and a dependency's do not")
+snc_vocabularies()
+    assert(has(source_symbols(), "sanitize_address") && has(source_symbols(), "sanitize_thread"), "source")
+    assert(!has(symbols(), "sanitize_address"), "the machine's vocabulary")
+    assert(!has(directory_symbols(), "sanitize_thread"), "a directory")
+    assert(!has(dependency_symbols(), "sanitize_address"), "a dependency's if")
+    assert(symbols_listed().contains(", riscv64, sanitize_address, sanitize_thread, softfp, "), symbols_listed())
+
+// -- the refusals -----------------------------------------------------------------------------------
+
+private snc_refusal(word: string) -> string =
+    snc_sees(snc_host(), "-fsanitize=address", s"#if $word\nx\n#endif\n")
+
+@test("snc: a near spelling is refused, naming the two sysl answers")
+snc_near_spellings_refused()
+    val words: []const string = ["asan", "tsan", "msan", "ubsan", "sanitize_memory", "sanitize_hwaddress",
+        "sanitize_undefined", "sanitizer_address"]
+
+    for i in 0..<words.len
+        assert_eq(snc_refusal(words[i]),
+            s"!'${words[i]}' is not something a build says about itself — sysl answers sanitize_address (AddressSanitizer) and sanitize_thread (ThreadSanitizer)")
+
+    // A word that looks like nothing in particular keeps the ordinary refusal, which lists both too.
+    val other = snc_refusal("darwin")
+
+    assert(other.contains("'darwin' is not something a target says about itself"), other)
+    assert(other.contains("sanitize_address, sanitize_thread"), other)
+
+@test("snc: a near spelling in a branch nothing takes is refused too, and inside an expression")
+snc_refused_wherever_written()
+    val skipped = snc_sees(snc_host(), "", "#if linux\nx\n#elif asan\ny\n#endif\n")
+
+    assert(skipped.contains("'asan' is not something a build says about itself"), skipped)
+
+    val inner = snc_sees(snc_host(), "", "#if posix && !(sanitize_memory || macos)\nx\n#endif\n")
+
+    assert(inner.contains("'sanitize_memory' is not something a build says about itself"), inner)
+
+@test("snc: a dependency's condition cannot ask about the build")
+snc_dependency_refuses()
+    val on = dependency_defined(snc_host())
+
+    dependency_condition("sanitize_address", on) match
+        Ok(_) -> assert(false, "a dependency may not depend on how one build is compiled")
+        Err(why) -> assert(why.contains("'sanitize_address' is a fact of one build, not of the machine"), why)
+
+    dependency_condition("macos && !sanitize_thread", on) match
+        Ok(_) -> assert(false, "nor under a negation")
+        Err(why) -> assert(why.contains("'sanitize_thread' is a fact of one build"), why)
+
+    dependency_condition("asan", on) match
+        Ok(_) -> assert(false, "a near spelling is no better")
+        Err(why) -> assert(why.contains("'asan' is not something a dependency's condition can ask"), why)
+
+// -- whole builds -----------------------------------------------------------------------------------
+
+private snc_ready() -> bool
+    if std_root().is_err() || !clang_available()
+        print("skipped: the standard module's source or clang is not on this machine")
+        return false
+    end if
+
+    true
+end snc_ready
+
+private snc_program() -> string =
+    "#if sanitize_address\nsay() -> string = \"instrumented\"\n#else\nsay() -> string = \"plain\"\n#endif\n\n" +
+    "print(say())\n"
+
+// The program in `root` built under `flags` (none where empty) and run, as what it printed.
+private snc_built_says(root: string, flags: string, exe: string) -> string
+    if flags == "" then snc_no_flags() else snc_flags(flags)
+
+    var said: Buf[string] = buf()
+    val sink = &said
+    val code = run_cli(["sysl", "build", root, "-o", exe], piece -> sink.push(piece))
+
+    snc_no_flags()
+
+    if code != Fine then return s"unbuilt: ${join(said.view(), "\n")}"
+
+    capture(exe, [], "", [], true) match
+        Ok(out) -> out.text.trim()
+        Err(_) -> "unrun"
+end snc_built_says
+
+@test("snc: one tree built plain, then instrumented, then plain, answers each build's own way")
+snc_builds_do_not_share()
+    if !snc_ready() then return
+
+    val root = runner_project("main.sysl", snc_program())
+    val first = snc_built_says(root, "", s"$root/a")
+    val second = snc_built_says(root, "-fsanitize=address", s"$root/b")
+    val third = snc_built_says(root, "", s"$root/c")
+
+    remove_dir_all(root).unwrap_or(())
+
+    assert_eq(first, "plain")
+    assert_eq(second, "instrumented")
+    assert_eq(third, "plain")
+
+@test("snc: a board's archive builds with both symbols in it and takes the plain branch")
+snc_board_archive()
+    if !snc_ready() then return
+    if find_backend_clang(snc_board()).is_err() then return
+
+    val text = "#if sanitize_address || sanitize_thread\n@assert(false, \"instrumented on a board\")\n#endif\n\n" +
+        "@export(\"snc_one\")\nsnc_one() -> int = 1\n"
+    val root = runner_project("main.sysl", text)
+    var said: Buf[string] = buf()
+    val sink = &said
+
+    snc_no_flags()
+
+    val code = run_cli(["sysl", "build-c", root, "--target", "thumb-freestanding", "-o", s"$root/app.a"],
+                       piece -> sink.push(piece))
+
+    remove_dir_all(root).unwrap_or(())
+    assert_eq(code, Fine, join(said.view(), "\n"))
+
+// A package whose library module answers by the condition, and whose own test file pins the
+// plain answer: under ASan the test is built against the instrumented branch and fails, naming it.
+private snc_package() -> string
+    val root = make_temp_dir("sysl-snc-pkg").unwrap()
+
+    make_dir_all(s"$root/probe").unwrap()
+    write_text(s"$root/package.hocon", "package { name = \"probe\", version = \"0.1.0\" }\n").unwrap()
+    write_text(s"$root/probe/probe.sysl",
+               "module probe\n\n#if sanitize_address\nmode() -> string = \"instrumented\"\n#else\n" +
+               "mode() -> string = \"plain\"\n#endif\n").unwrap()
+    write_text(s"$root/probe/tests.sysl",
+               "module probe\n@tests\n\n@test\nplain_mode()\n    assert_eq(mode(), \"plain\")\n").unwrap()
+    root
+end snc_package
+
+private snc_tested(root: string, flags: string) -> (int, string)
+    if flags == "" then snc_no_flags() else snc_flags(flags)
+
+    var said: Buf[string] = buf()
+    val sink = &said
+    val code = run_cli(["sysl", "test", root], piece -> sink.push(piece))
+
+    snc_no_flags()
+
+    var text = ""
+
+    for item in said
+        text = text + item + "\n"
+
+    (code, text)
+end snc_tested
+
+@test("snc: a package's tests see the condition in its library module, built each way")
+snc_package_tests_see_it()
+    if !snc_ready() then return
+
+    val root = snc_package()
+    val plain = snc_tested(root, "")
+    val flagged = snc_tested(root, "-fsanitize=address -g")
+    val again = snc_tested(root, "")
+
+    remove_dir_all(root).unwrap_or(())
+
+    assert_eq(plain.0, Fine, plain.1)
+    assert(flagged.0 != Fine, flagged.1)
+    assert(flagged.1.contains("instrumented: address"), flagged.1)
+    assert(flagged.1.contains("plain_mode"), flagged.1)
+    assert_eq(again.0, Fine, again.1)

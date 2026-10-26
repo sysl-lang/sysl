@@ -2385,7 +2385,7 @@ something else. Writing the bare name says exactly that:
 ```
 'server' is not something a target says about itself — sysl knows aarch64, android, bsd, craft,
 fma, fma_dp, fpu, fpu_dp, freestanding, hardfloat, hosted, linux, macos, posix, ptr16, ptr32,
-ptr64, riscv32, riscv64, softfp, thread_local, thumb, wasi, wasm32, windows, x86, x86_64. A feature this package's manifest
+ptr64, riscv32, riscv64, sanitize_address, sanitize_thread, softfp, thread_local, thumb, wasi, wasm32, windows, x86, x86_64. A feature this package's manifest
 declares is named 'feature_server'
 ```
 
