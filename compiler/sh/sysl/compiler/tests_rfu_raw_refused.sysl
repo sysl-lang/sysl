@@ -1,0 +1,205 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, remove_dir_all, write_text}
+import sysl.process.capture
+
+// A raw form written without its import -- `ptr_cast`, `str_cast` or `str_alias` without
+// `import sysl.raw.…`, a `va_` form without `import sysl.c.…` -- is REFUSED, and each use is its own
+// error, at its own place (`expr_call.sysl`'s `form_not_imported`). These go through the command
+// line, as a user meets them, and run what it built where it was accepted.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+// The files are written exactly as given -- no import is added for a form -- beside an empty
+// manifest, so a directory build reads them as one project.
+private rfu_project(files: Buf[(string, string)]) -> string
+    val root = lbr_temp("sysl-rfu")
+
+    for item in files
+        val at = s"$root/${item.0}"
+
+        make_dir_all(parent_of(at).unwrap_or(root)).unwrap()
+        write_text(at, item.1).unwrap()
+
+    write_text(manifest_file(root), "").unwrap()
+    root
+end rfu_project
+
+// What `sysl build` of the project said, and what the program it made printed -- or, where it was
+// refused, the status and nothing run.
+rfu_built(files: Buf[(string, string)]) -> (int, string, string)
+    val root = rfu_project(files)
+    val exe = s"$root/built"
+    val got = lbr_cli(["sysl", "build", root, "-o", exe])
+    var ran = ""
+
+    if got.0 == Fine
+        capture(exe, [], "", [], true) match
+            Ok(out) -> ran = out.text
+            Err(_) -> ran = "the program that was built could not be run"
+    end if
+
+    remove_dir_all(root).unwrap_or(())
+    (got.0, got.1, ran)
+end rfu_built
+
+// A one-file program, built and run.
+rfu_main(text: string) -> (int, string, string) = rfu_built(lbr_one("main.sysl", text))
+
+// The line a file is told for a form left out.
+rfu_line(form: string, home: string) -> string = s"error: '$form' is in $home: add 'import $home.$form'"
+
+private val rfu_word: string = "var a: [4]u8 = [1, 0, 0, 0]\nval p: *u32 = ptr_cast(&a[0])\nprint(*p)\n"
+
+// -- each use is refused, at its place -------------------------------------------------------------
+
+@test("an unimported ptr_cast is refused at its use, and the line to add is named")
+rfu_one_use()
+    if !lbr_ready() then return
+
+    val got = rfu_main(rfu_word)
+
+    assert(got.0 != Fine, got.1)
+    assert(got.1.contains(rfu_line("ptr_cast", "sysl.raw")), got.1)
+    assert(got.1.contains("/main.sysl:2:15"), got.1)
+    assert(!got.1.contains("this is refused from"), got.1)
+    assert_eq(got.1.count_of("error: "), 1)
+
+@test("a file using ptr_cast many times, bare and with a written type, is refused at every use")
+rfu_many_uses_each_refused()
+    if !lbr_ready() then return
+
+    var text = "var a: [4]u8 = [3, 0, 0, 0]\nvar total: u32 = 0\n\n" +
+               "low(p: *u32) -> u8 = *ptr_cast[*u8](p)\n\n"
+
+    for i in 0..<6
+        text = text + s"val p$i: *u32 = ptr_cast(&a[0])\ntotal += *p$i\n"
+
+    val got = rfu_main(text + "print(total, low(p0))\n")
+
+    assert(got.0 != Fine, got.1)
+    assert_eq(got.1.count_of("error: "), 7)
+    assert(got.1.contains(rfu_line("ptr_cast", "sysl.raw")), got.1)
+    assert(got.1.contains("/main.sysl:4:23"), got.1)
+    assert(got.1.contains("/main.sysl:6:"), got.1)
+
+@test("two different forms left out are two errors, one each, in source order")
+rfu_two_forms_two_errors()
+    if !lbr_ready() then return
+
+    val got = rfu_main(rfu_word + "var b: [2]u8 = [104, 105]\nprint(str_cast(b[..]))\n")
+
+    assert(got.0 != Fine, got.1)
+    assert_eq(got.1.count_of("error: "), 2)
+
+    val first = got.1.index_of(rfu_line("ptr_cast", "sysl.raw"))
+    val second = got.1.index_of(rfu_line("str_cast", "sysl.raw"))
+
+    assert(first.is_some() && second.is_some() && first.unwrap() < second.unwrap(), got.1)
+
+@test("str_cast and str_alias left out are each refused")
+rfu_str_cast_and_str_alias()
+    if !lbr_ready() then return
+
+    val got = rfu_main("var b: [5]u8 = [104, 105, 33, 33, 33]\nprint(str_cast(b[0..<3]))\n" +
+                       "val s = str_alias(b[0..<2])\nprint(s)\n")
+
+    assert(got.0 != Fine, got.1)
+    assert_eq(got.1.count_of("error: "), 2)
+    assert(got.1.contains(rfu_line("str_cast", "sysl.raw")), got.1)
+    assert(got.1.contains(rfu_line("str_alias", "sysl.raw")), got.1)
+    assert(got.1.contains("/main.sysl:3:9"), got.1)
+
+@test("two files of one module that both leave the form out are each refused")
+rfu_each_file_refused()
+    if !lbr_ready() then return
+
+    var files = lbr_two(
+        "demo/a.sysl", "module demo\n\nlow(p: *u32) -> u8 = *ptr_cast[*u8](p)\nlow2(p: *u32) -> u8 = *ptr_cast[*u8](p)\n",
+        "demo/b.sysl", "module demo\n\nhigh(p: *u32) -> u8\n    val b: *u8 = ptr_cast(p)\n    b[1]\n")
+
+    files.push(("main.sysl", "import demo.{low, low2, high}\n\nvar x: u32 = 260\nprint(low(&x), low2(&x), high(&x))\n"))
+
+    val got = rfu_built(files)
+
+    assert(got.0 != Fine, got.1)
+    assert_eq(got.1.count_of("error: "), 3)
+    assert(got.1.contains("/demo/a.sysl:3:23"), got.1)
+    assert(got.1.contains("/demo/a.sysl:4:24"), got.1)
+    assert(got.1.contains("/demo/b.sysl:4:18"), got.1)
+
+// -- what is accepted ------------------------------------------------------------------------------
+
+@test("an imported form, by name, alias, wildcard or path, is accepted")
+rfu_imported_is_accepted()
+    if !lbr_ready() then return
+
+    val by_name = rfu_main("import sysl.raw.ptr_cast\n\n" + rfu_word)
+
+    assert_eq(by_name.0, Fine, by_name.1)
+    assert_eq(by_name.2, "1\n")
+
+    val others = rfu_main("import sysl.raw.{str_cast as sc}\nimport sysl.raw.*\nimport sysl.raw\n\n" +
+                          "var a: [4]u8 = [104, 105, 0, 0]\nval p: *u8 = raw.ptr_cast(&a[0])\n" +
+                          "print(*p, sc(a[0..<2]), str_alias(a[0..<1]))\n")
+
+    assert_eq(others.0, Fine, others.1)
+    assert_eq(others.2, "104 hi h\n")
+
+@test("an aliased import leaves the bare spelling refused, and the alias answers")
+rfu_alias_beside_the_bare_name()
+    if !lbr_ready() then return
+
+    val got = rfu_main("import sysl.raw.ptr_cast as pc\n\nvar a: [4]u8 = [1, 0, 0, 0]\n" +
+                       "val p: *u32 = ptr_cast(&a[0])\nval q: *u32 = pc(&a[0])\nprint(*p, *q)\n")
+
+    assert(got.0 != Fine, got.1)
+    assert_eq(got.1.count_of("error: "), 1)
+    assert(got.1.contains("/main.sysl:4:15"), got.1)
+
+@test("a function the reader calls ptr_cast or str_cast is called, imported form or not")
+rfu_own_function_is_accepted()
+    if !lbr_ready() then return
+
+    val got = rfu_main("ptr_cast(n: int) -> int = n + 1\nstr_cast[T](n: T) -> T = n\n\n" +
+                       "print(ptr_cast(41), str_cast[int](7))\n")
+
+    assert_eq(got.0, Fine, got.1)
+    assert_eq(got.2, "42 7\n")
+
+@test("a program over the standard library, which uses the forms with their imports, is accepted")
+rfu_std_is_accepted()
+    if !lbr_ready() then return
+
+    // `sysl.buf`, `sysl.print` and `sysl.text.utf8`, which these reach, use the forms inside, imported.
+    val got = rfu_main("import sysl.text.replace_all\n\n" +
+                       "print(replace_all(\"xyx\", \"y\", \"z\"), s\"${41 + 1}\")\n")
+
+    assert_eq(got.0, Fine, got.1)
+    assert_eq(got.2, "xzx 42\n")
+
+// -- the va_ forms ----------------------------------------------------------------------------------
+
+@test("the va_ forms unimported in a variadic @export are each refused; imported, the export walks the tail")
+rfu_va_in_an_export()
+    if !lbr_ready() then return
+
+    val text = "@export(\"rfu_sum\")\nsum(n: int, ...) -> int\n    var ap: va_list\n    var again: va_list\n\n" +
+        "    va_start(ap)\n    va_copy(again, ap)\n\n    var total = 0\n\n" +
+        "    for i in 0..<n do total += va_arg(ap)\n    for i in 0..<n do total += va_arg(again)\n\n" +
+        "    va_end(again)\n    va_end(ap)\n    total\nend sum\n\nprint(sum(3, 1, 2, 3))\n"
+    val got = rfu_main(text)
+
+    assert(got.0 != Fine, got.1)
+    assert_eq(got.1.count_of("error: "), 6)
+
+    for form in ["va_start", "va_copy", "va_arg", "va_end"]
+        assert(got.1.contains(rfu_line(form, "sysl.c")), got.1)
+
+    val quiet = rfu_main("import sysl.c.{va_start, va_arg, va_copy, va_end}\n\n" + text)
+
+    assert_eq(quiet.0, Fine, quiet.1)
+    assert_eq(quiet.2, "12\n")
+end rfu_va_in_an_export
