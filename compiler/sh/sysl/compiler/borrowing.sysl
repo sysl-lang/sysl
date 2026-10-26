@@ -595,7 +595,9 @@ end holds_dropping
 //   - **the body changes its own copy** -- assigns to it or a part of it, takes its address, binds a
 //     `ref` to it, or calls a `*self` method on it (`rebound`) -- or takes a writable view of an
 //     array inside it, since a write through the view would be a write to the caller's value;
-//   - **the function jumps back to its own entry**, which stores into the slots;
+//   - **the function jumps back to its own entry**, which stores into the slots, or **carries a
+//     `decreases` measure**, which a recursive call checks by laying its arguments in the slots for a
+//     moment (`gen_variant_at_call`);
 //   - **something outside the program may call it** -- `@export`, a `@section`, a foreign
 //     convention, an address taken for a `*fn` -- since nothing on that side promises a snapshot;
 //   - **the parameter is promoted**, its storage moving to the heap anyway.
@@ -603,7 +605,7 @@ reads_in_place(e: *Emit, f: TFunc, promoted: Buf[string]) -> Buf[string]
     var out: Buf[string] = buf()
 
     if e.address_taken.has(f.name) || f.exported.is_some() || f.section.is_some() ||
-       f.conv.is_some() || !tail_calls_of(f).is_empty() then
+       f.conv.is_some() || !tail_calls_of(f).is_empty() || f.variant.is_some() then
         return out
 
     val bound = rebound(f)
@@ -621,7 +623,7 @@ reads_in_place(e: *Emit, f: TFunc, promoted: Buf[string]) -> Buf[string]
     for param in f.params
         val n = param.0
 
-        if e.layout.indirect(param.1) && !bound.has(n) && !viewed.names.has(n) &&
+        if e.layout.by_address(param.1) && !bound.has(n) && !viewed.names.has(n) &&
            !moved.has(n) then
             out.push(n)
 

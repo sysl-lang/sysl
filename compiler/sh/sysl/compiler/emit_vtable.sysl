@@ -129,7 +129,7 @@ gen_adapter(e: *Emit, vt: TVtable, slot: TVSlot)
         // A large receiver is passed at its address like any other large argument.
         ByValue ->
             if zero_sized(vt.for_type) then None
-            else if e.layout.indirect(vt.for_type) then Some(ir_arg(LPtr, staged.unwrap_or(payload)))
+            else if e.layout.by_address(vt.for_type) then Some(ir_arg(LPtr, staged.unwrap_or(payload)))
             else
                 val v = fresh_reg(e)
 
@@ -160,7 +160,7 @@ gen_adapter(e: *Emit, vt: TVtable, slot: TVSlot)
     if no_value(slot.ret_ty) || e.layout.indirect(slot.ret_ty)
         emit(e, ir_call(None, LVoid, target, call))
 
-        if staged.is_some() then release_at(e, vt.for_type, staged.unwrap())
+        if staged.is_some() && e.layout.indirect(vt.for_type) then release_at(e, vt.for_type, staged.unwrap())
 
         emit_term(e, InRet(None, None))
         return
@@ -171,7 +171,7 @@ gen_adapter(e: *Emit, vt: TVtable, slot: TVSlot)
     emit(e, InCall(Some(r), lty(e, slot.ret_ty), target, call, c_extension(slot.ret_ty, e.target),
                    None, no_fast_math(), false))
 
-    if staged.is_some() then release_at(e, vt.for_type, staged.unwrap())
+    if staged.is_some() && e.layout.indirect(vt.for_type) then release_at(e, vt.for_type, staged.unwrap())
 
     emit_term(e, InRet(Some(sysl_result_lty(e, slot.ret_ty)), Some(r)))
 end gen_adapter
@@ -184,13 +184,19 @@ private adapter_snapshot(e: *Emit, vt: TVtable, slot: TVSlot, payload: Val) -> O
         ByValue -> true
         _ -> false
 
-    if !by_value || !e.layout.indirect(vt.for_type) || !e.in_place_receivers.has(slot.target) then
+    if !by_value || !e.layout.by_address(vt.for_type) || !e.in_place_receivers.has(slot.target) then
         return None
 
     val copy = alloca(e, fresh_reg(e), lty(e, vt.for_type))
 
     emit_memcpy(e, copy, payload, int(e.layout.size(vt.for_type)), int(e.layout.claim(vt.for_type)))
-    retain_at(e, vt.for_type, copy)
+
+    // A receiver passed by address only for its width (`by_address`, not `indirect`) was a value
+    // loaded out of the object before, a copy of the bytes holding no count of its own; the snapshot
+    // is that same copy, so it takes none either, and the implementation's own entry decides what to
+    // hold (`owning`).
+    if e.layout.indirect(vt.for_type) then retain_at(e, vt.for_type, copy)
+
     Some(copy)
 end adapter_snapshot
 
