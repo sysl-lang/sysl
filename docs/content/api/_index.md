@@ -71,6 +71,7 @@ These pages are generated from the library's own doc comments: every declaration
 | [`sysl.sys`](sysl-sys/) | The platform seam: everything the library asks of what it is hosted on, and nothing else. |
 | [`sysl.term`](sysl-term/) | What a terminal understands: the escape sequences that colour text, emphasise it, and move the cursor about. |
 | [`sysl.term.edit`](sysl-term-edit/) | Reading a line from a terminal that will not do it for you. |
+| [`sysl.term.keys`](sysl-term-keys/) | Keystrokes out of the bytes a terminal sends: the decoder a full-screen program reads its keyboard through. |
 | [`sysl.testing`](sysl-testing/) | What a test may say about itself while it runs, beyond passing or failing. |
 | [`sysl.text`](sysl-text/) | The whole text surface: what a `string` is made of, and every operation over one. |
 | [`sysl.threads`](sysl-threads/) | Threads of execution, and the two things a program does with one: start it, and wait for it -- with the lock, the condition variable and the channel threads share things through. |
