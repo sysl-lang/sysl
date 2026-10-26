@@ -273,7 +273,7 @@ sealed_where(p: Unshareable, holder: Type, whole: Type, captured: bool) -> strin
         steps.push(p.path.at(i))
 
     val shown = type_show(holder)
-    val rest = sealed_rest()
+    val rest = sealed_rest(holder)
 
     if steps.is_empty() && holder == whole then return s"but a '$shown' is $rest"
     if steps.is_empty() then return s"but it holds a '$shown', which is $rest"
@@ -284,8 +284,20 @@ end sealed_where
 
 // Why a container whose core the reader cannot name stops at a domain's edge -- the end of every
 // sentence `sealed_where` and the task-frame message say about one.
-sealed_rest() -> string =
-    "shared through a count that is not atomic, and no spelling of it can cross into a '&sync' ('06')"
+//
+// **There is a spelling that crosses, and the sentence says it.** Any such container crosses behind a
+// `Mutex`; a `Buf` that is only read crosses as a `&sync Frozen[T]`, which `.freeze()` builds.
+sealed_rest(holder: Type) -> string = holder match
+    Struct(d) ->
+        if d.base == module_qualify("sysl.buf", "Buf") && d.targs.len() == 1
+            s"shared through a count that is not atomic. Hold its elements as a '&sync Frozen[" +
+            s"${type_show(d.targs.at(0))}]', built with '.freeze()' (reference: memory, 'A frozen buffer " +
+            "crosses'), or guard the buffer in a 'Mutex' ('06')"
+        else sealed_guarded()
+    _ -> sealed_guarded()
+
+private sealed_guarded() -> string =
+    "shared through a count that is not atomic, so it crosses into a '&sync' only guarded by a 'Mutex' ('06')"
 
 // Holds a `&sync T` written at `span` to the rule about what `T` may contain -- now if every type's
 // fields are in, and once they are if not.
@@ -376,7 +388,12 @@ share_remedy(head: string, ty: Type) -> string = ty match
 private share_view_remedy(what: string) -> string =
     s"which owns its $what through a count that is not atomic. A literal's $what are immortal and " +
     s"would be safe to share, but nothing in the type says whether these are, so a shared object " +
-    "holds no view at all ('06')"
+    "holds no view at all" + (if what == "elements" then view_frozen_hint() else " ('06')")
+
+// What a view of a buffer's elements can be in its place: the buffer, frozen.
+private view_frozen_hint() -> string =
+    ". To share a buffer's elements, freeze the buffer and hold the '&sync Frozen[T]' it answers, built " +
+    "with '.freeze()' (reference: memory, 'A frozen buffer crosses') ('06')"
 
 // Holds each `@crossing` argument of one call to the rule about what may reach another domain.
 //
@@ -706,7 +723,7 @@ private storage_sealed(p: Unshareable, holder: Type, whole: Type) -> string
         steps.push(p.path.at(i))
 
     val shown = type_show(holder)
-    val rest = sealed_rest()
+    val rest = sealed_rest(holder)
 
     if steps.is_empty() && holder == whole then return s" is a '$shown', which is $rest"
     if steps.is_empty() then return s" holds a '$shown', which is $rest"
