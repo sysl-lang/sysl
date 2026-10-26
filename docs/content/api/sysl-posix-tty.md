@@ -46,7 +46,7 @@ the answer cannot change under a running program in any way that matters:
 
 ## Index
 
-[`tty_sink`](#tty_sink) [`color`](#color) [`color_err`](#color_err) [`color_on`](#color_on) [`color_wanted`](#color_wanted) [`cooked`](#cooked) [`flush`](#flush) [`hidden`](#hidden) [`is_tty`](#is_tty) [`raw`](#raw) [`tty_writer`](#tty_writer) [`TtyWriter`](#ttywriter) [Fallible for TtyWriter](#fallible-for-ttywriter) [Writer for TtyWriter](#writer-for-ttywriter)
+[`tty_sink`](#tty_sink) [`color`](#color) [`color_err`](#color_err) [`color_on`](#color_on) [`color_wanted`](#color_wanted) [`cooked`](#cooked) [`flush`](#flush) [`hidden`](#hidden) [`is_tty`](#is_tty) [`raw`](#raw) [`size`](#size) [`tty_writer`](#tty_writer) [`window_size`](#window_size) [`TtyWriter`](#ttywriter) [`WindowSize`](#windowsize) [Fallible for TtyWriter](#fallible-for-ttywriter) [Writer for TtyWriter](#writer-for-ttywriter)
 
 ## Values
 
@@ -151,11 +151,33 @@ Put the terminal into cbreak mode: keystrokes arrive as they are typed and nothi
         for line in ed do ...
         cooked()
 
+### `size`
+
+```sysl
+size() -> Option[WindowSize]
+```
+
+The size of the terminal standard output is drawn on.
+
 ### `tty_writer`
 
 ```sysl
 tty_writer() -> *Writer
 ```
+
+### `window_size`
+
+```sysl
+window_size(fd: int) -> Option[WindowSize]
+```
+
+The size of the terminal at a descriptor, or `None` where it is not a terminal -- or is one that
+reports no size, as a pseudo-terminal nobody has sized does (zero rows and zero columns, which no
+program could draw into).
+
+**The size changes while a program runs**, whenever the window is resized, and the kernel says so
+with `WINCH`: a full-screen program watches it (`sysl.signal.watch(WINCH)`) and asks again before
+its next redraw, rather than asking once at the start.
 
 ## Types
 
@@ -174,6 +196,16 @@ none, so the pointer the sink is built on addresses nothing and `write` never lo
 
 A program on a board passes its own port's writer and needs none of this. That asymmetry is real
 and is the only one in the whole facility: the board has no buffer to defeat.
+
+### `WindowSize`
+
+```sysl
+struct WindowSize
+    rows: int
+    cols: int
+```
+
+A terminal's size in character cells.
 
 ## Implementations
 
