@@ -1,0 +1,54 @@
+// P10: a derived-shape encoder writing into a fixed buffer on a bare-metal target, under @no_alloc.
+trait Encoder
+    key(*self, k: string)
+    uint(*self, v: u32)
+
+trait Encode
+    encode[E: Encoder](self, e: *E)
+
+struct Fixed
+    buf: [32]u8
+    n: usize
+    overflow: bool
+
+impl Encoder for Fixed
+    key(*self, k: string)
+        self.uint(u32(k.bytes.len))
+        for b in k.bytes
+            if self.n == self.buf.len then self.overflow = true else
+                self.buf[self.n] = b
+                self.n += 1
+    uint(*self, v: u32)
+        var x = v
+        loop
+            val low = u8(x & 0x7f)
+            x = x >> 7
+            val byte = if x == 0 then low else low | 0x80
+            if self.n == self.buf.len
+                self.overflow = true
+                return
+            self.buf[self.n] = byte
+            self.n += 1
+            if x == 0 then return
+
+impl Encode for u32
+    encode[E: Encoder](self, e: *E) = e.uint(self)
+
+encode_struct[T, E: Encoder](v: T, e: *E)
+    for const f in T::Fields
+        e.key(f.name)
+        v.(f).encode(e)
+
+struct Reading
+    id: u32
+    millivolts: u32
+
+impl Encode for Reading
+    encode[E: Encoder](self, e: *E) = encode_struct(self, e)
+
+@no_alloc
+@export("encode_reading")
+encode_reading() -> i32
+    var out = Fixed([0; 32], 0, false)
+    Reading(7, 3300).encode(&out)
+    if out.overflow then -1 else i32(out.n)
