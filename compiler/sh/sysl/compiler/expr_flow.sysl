@@ -340,6 +340,36 @@ private pattern_test(cx: &Analyzer, span: Span, subject: Expr, patterns: Buf[Pat
         TCondIs(ts, tpats, _) -> pattern_match(cx, span, ts, tpats, negated)
         _ -> bad_expr(span)
 
+// `x is P` anywhere an expression stands outside a condition's `&&` chain -- an operand of `!`, a
+// value bound or passed, a closure's body, a guard. A test that binds nothing is the `bool` it
+// answers. One that binds is refused, at its pattern: a name it bound would be live from here to
+// the end of the condition and through the branch the condition guards, and there is no branch.
+//
+// **The refusal takes back what the pattern bound and registers the names as refused** for the rest
+// of the statement, so a read of one later in it is not reported as undefined -- a second
+// diagnostic for the same mistake.
+is_value(cx: &Analyzer, span: Span, subject: Expr, patterns: Buf[Pattern], negated: bool) -> TExpr
+    val mark = cx.scope_mark()
+
+    cond_is(cx, span, subject, patterns, negated) match
+        TCondIs(ts, tpats, _) ->
+            if !any_pattern_binds(tpats) then return pattern_match(cx, span, ts, tpats, negated)
+
+            cx.rewind_scope(mark)
+
+            for item in patterns
+                pattern_binds_into(item, &cx.refused_is)
+
+            // `is not` and `|` with a binder were refused by `cond_is` already, with their own reason.
+            if negated || tpats.len() > 1 then return bad_expr(span)
+
+            cx.err(patterns.at(0).span, "this pattern binds a name, and an 'is' that binds stands " +
+                   "only in the condition of an 'if' or a 'while' — the name is live through the " +
+                   "branch that condition guards, and there is no such branch here. Take the value " +
+                   "apart with 'if' or 'match', or write '_' for the parts you are not naming")
+        _ -> bad_expr(span)
+end is_value
+
 private pattern_match(cx: &Analyzer, span: Span, ts: TExpr, tpats: Buf[TPattern],
                       negated: bool) -> TExpr
     // `is not` and `|` refuse a binder of their own, in `cond_is`; this is the one left.
