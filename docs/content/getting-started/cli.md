@@ -76,6 +76,14 @@ sysl run hello.sysl
 `run` parses and checks the source, emits textual LLVM IR, has `clang` assemble and link it, and
 runs the binary.
 
+**The program does not outlive `run`.** Ctrl-C at a terminal reaches both, as it reaches every
+process in the foreground job. A signal sent to the runner alone — `kill` of a `sysl run p &`, a
+job scheduler giving up on it, even `SIGKILL` — ends the program too: a binary built for `run`
+watches the runner that started it and, once the runner is gone, sends itself `SIGTERM`, so a
+program that watches that signal can clean up, and `SIGKILL` two seconds later if it is still there.
+Its exit status is still the runner's — a program that exits 3 makes `run` exit 3, and one that
+traps makes it exit 133. A binary built by `build` carries no such watch.
+
 **Running an unchanged program a second time builds nothing.** The executable is kept, keyed on
 everything that can affect its bytes:
 

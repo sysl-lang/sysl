@@ -37,12 +37,17 @@ end entry_sig
 // whole of the mechanism: the entry point is the one place that certainly runs first and it is
 // already written. Each one gets a region of its own, exactly as a statement does, so whatever its
 // initializer allocated on the way to the value is let go of before the next one starts.
-gen_main(e: *Emit, p: TProgram) -> Option[IrFunc]
+//
+// `watched` is set for a build `sysl run` is about to start (`gen_runner_watch`).
+gen_main(e: *Emit, p: TProgram, watched: bool = false) -> Option[IrFunc]
     start_function(e)
     e.caller_exposed = exposed_in(p.main, None, p.vals)
     push_temps(e)
     push_owned(e)
     gen_stack_guard(e)
+
+    if watched then gen_runner_watch(e)
+
     gen_computed_vals(e, p.vals, p.precompiled)
     gen_alloc_count_mark(e)
 
@@ -386,6 +391,28 @@ end gen_parent_watch
 
 // The C function a test build's entry calls first, where the machine has processes.
 test_process_symbol() -> string = "sysl_test_process_start"
+
+// **A program `sysl run` started does not outlive the runner either.** The runner and the program
+// share a process group, so what a terminal sends reaches both; what is sent to the runner alone --
+// `kill` of a `sysl run … &` -- used to leave the program running under `init`. The entry of a build
+// made for `run` therefore starts `testprocess.c`'s other watch, which ends the program once the
+// runner named in `SYSL_RUN_PARENT` is no longer its parent. Forwarding the signal from the runner
+// instead would take over the dispositions the program inherits (an ignored `INT` in a script's
+// background job, `nohup`'s ignored `HUP`) and deliver a terminal's Ctrl-C twice; a watch from the
+// program's side changes neither, and also covers a runner ended by `SIGKILL`, which nothing in the
+// runner could.
+private gen_runner_watch(e: *Emit)
+    if !posix_machine(e.target.os) then return
+
+    request_intrinsic(e, ir_sig(run_process_symbol(), ir_fn_type(LVoid, no_params())))
+    emit(e, ir_call(None, LVoid, VGlobal(run_process_symbol()), no_ir_args()))
+end gen_runner_watch
+
+// The C function a `sysl run` build's entry calls first, where the machine has processes.
+run_process_symbol() -> string = "sysl_run_process_start"
+
+// The variable `sysl run` names itself in for the program it starts (`gen_runner_watch`).
+run_parent_variable() -> string = "SYSL_RUN_PARENT"
 
 private dispatch_on(e: *Emit, want: Val, key: string, run: string, next: string)
     val named = request_text(e, test_named_symbol(), test_named_text(s"i${e.word_bits}"))
