@@ -1,6 +1,7 @@
 module sh.sysl.compiler
 
 import sysl.buf.{Buf, buf}
+import sysl.container.Set
 import sysl.math.bigint.from_int
 
 // **One statement, lowered for its effects.**
@@ -352,7 +353,7 @@ gen_borrowed_into(e: *Emit, dest: Val, x: TExpr)
                             else if borrowed_capture(decl, ft) then
                                 emit(e, InStore(lty(e, ft), captured_value(e, decl, i, gen_expr(e, args.at(i))),
                                                 p, AccPlain, None))
-                            else gen_borrowed_into(e, p, args.at(i))
+                            else part_into(e, p, args.at(i), written_by(args))
 
         TArrayLit(elems, array_ty) ->
             val elem = element(array_ty).unwrap_or(int_type())
@@ -362,6 +363,8 @@ gen_borrowed_into(e: *Emit, dest: Val, x: TExpr)
                             int(e.layout.claim(array_ty)))
                 return
 
+            val written = written_by(elems)
+
             for i in 0..<elems.len()
                 val p = fresh_reg(e)
 
@@ -369,7 +372,7 @@ gen_borrowed_into(e: *Emit, dest: Val, x: TExpr)
 
                 idx.push(ir_arg(word_lty(e), VInt(from_int(long(i)))))
                 emit(e, InGep(p, lty(e, elem), dest, idx))
-                gen_borrowed_into(e, p, elems.at(i))
+                part_into(e, p, elems.at(i), written)
 
         // The tag, and then the variant's own fields written into the region every variant shares.
         // Reaching the region by address is what the value form has to use a stack slot for anyway --
@@ -395,7 +398,7 @@ gen_borrowed_into(e: *Emit, dest: Val, x: TExpr)
                                                     VInt(from_int(long(variant_field_index(e.layout, variant,
                                                                                            variant.slot(i)))))))
                                     emit(e, InGep(p, variant_lty(d, variant), base, idx))
-                                    gen_borrowed_into(e, p, args.at(i))
+                                    part_into(e, p, args.at(i), written_by(args))
 
                         trace_origin(e, x)
                 None -> store_through_value(e, dest, x, ty)
@@ -416,6 +419,25 @@ gen_borrowed_into(e: *Emit, dest: Val, x: TExpr)
                             int(e.layout.claim(ty)))
             else store_through_value(e, dest, x, ty)
 end gen_borrowed_into
+
+// One part of a value being built in place, written borrowed -- except where a later part assigns the
+// local this one is read from (`written`, `gen_parts`): that write gives the local's count back before
+// the value is finished, so the part is held by a count of the statement's own, taken as it is read.
+private part_into(e: *Emit, p: Val, part: TExpr, written: Set[string])
+    val ty = texpr_type(part)
+
+    if !written.is_empty() && contains_counted(ty) && !e.layout.indirect(ty) && held(e, part) &&
+       !held_unless(e, part, written) then
+        val v = gen_expr(e, part)
+
+        retain_value(e, ty, v)
+        own_temp(e, v, ty)
+        emit(e, InStore(lty(e, ty), v, p, AccPlain, None))
+        return
+    end if
+
+    gen_borrowed_into(e, p, part)
+end part_into
 
 private store_through_value(e: *Emit, dest: Val, x: TExpr, ty: Type)
     val v = gen_expr(e, x)
@@ -673,18 +695,20 @@ private gen_become(e: *Emit, call: TExpr)
     *call.kind match
         TCall(name, args, cty, _) ->
             val form = call_form_of(e, name, cty)
+            val written = written_by(args)
 
             for arg in args
-                arg_value(e, arg, &arg_vals)
+                arg_value(e, arg, &arg_vals, written)
 
             what = form
             callee = VGlobal(symbol_of(e, name))
             found = true
         TCallPtr(fn, args, _, cty) ->
             val v = gen_expr(e, fn)
+            val written = written_by(args)
 
             for arg in args
-                arg_value(e, arg, &arg_vals)
+                arg_value(e, arg, &arg_vals, written)
 
             what = sysl_result_form(e, cty)
             callee = v

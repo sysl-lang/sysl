@@ -85,7 +85,7 @@ end sysl_sret
 sret_param() -> Val = VReg("sret.out")
 
 // How a parameter is declared. A **large** one arrives as the address of storage the caller holds;
-// the callee makes its own copy at entry.
+// the callee reads it there or makes its own copy at entry (`reads_in_place`).
 //
 // **A `va_list` parameter is one pointer**, whatever the target's `va_list` is: C passes the value in
 // the walk's storage, its address, or the address of a copy (`VaListAbi`), and all three are a
@@ -130,11 +130,11 @@ private c_extension_of_result(e: *Emit, ret_ty: Type) -> Buf[IrAttr] =
     if no_value(ret_ty) || e.layout.indirect(ret_ty) then no_ir_attrs()
     else c_extension(ret_ty, e.target)
 
-// The attributes a defined function's parameter carries: `noalias` on a pointer `@disjoint` names
-// (`disjoint.sysl`; a view it names is kept apart by `emit_disjoint.sysl` instead, being two
-// pointers and a count in one value), and `byval` on an x86-64 interrupt handler's frame parameter,
-// which the ABI requires. Nothing else carries one, so an ordinary parameter's answer is the empty
-// list.
+// The attributes a defined function's parameter carries: `noalias readonly` on one read in place,
+// `noalias` on a pointer `@disjoint` names (`disjoint.sysl`; a view it names is kept apart by
+// `emit_disjoint.sysl` instead, being two pointers and a count in one value), and `byval` on an
+// x86-64 interrupt handler's frame parameter, which the ABI requires. Nothing else carries one, so
+// an ordinary parameter's answer is the empty list.
 private frame_attrs(e: *Emit, f: TFunc, ty: Type, name: string) -> Buf[IrAttr]
     var out: Buf[IrAttr] = buf()
 
@@ -142,7 +142,13 @@ private frame_attrs(e: *Emit, f: TFunc, ty: Type, name: string) -> Buf[IrAttr]
         LPtr -> true
         _ -> false
 
-    if pointer && holds_string(f.marks.disjoint, name) then out.push(AttrNoAlias)
+    // A parameter read where its caller put it (`reads_in_place`) is storage every caller promises
+    // nothing changes for the length of the call (`indirect_arg`), and the body only reads it: the
+    // optimizer is told both, which is what lets it keep a field in a register across a call.
+    if pointer && underlying(ty) != VaList && e.in_place.has(f.name + "\n" + name)
+        out.push(AttrNoAlias)
+        out.push(AttrReadOnly)
+    else if pointer && holds_string(f.marks.disjoint, name) then out.push(AttrNoAlias)
 
     if f.conv.is_none() then return out
     if f.params.is_empty() || f.params.at(0).0 != name then return out
