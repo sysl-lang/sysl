@@ -465,8 +465,9 @@ print(n.to_string(), true.to_string(), 'é'.to_string(), 2.5.to_string(), "alrea
 42 true é 2.5 already
 ```
 
-`str(x)` is the older spelling of the same conversion, and is still accepted: the two produce the
-same code.
+`str(x)`, the older spelling of the same conversion, was removed in 0.7.0: a call of it is refused
+with `'str(x)' was removed in 0.7.0: write 'x.to_string()'`. A function, local or member of your own
+named `str` is an ordinary name and is unaffected.
 
 | type | result |
 |---|---|
@@ -511,6 +512,16 @@ print(double("ab"), str(21), width("four"))
 
 ```output
 abab 42 4
+```
+
+A call of `str` with no declaration of the name in scope is refused:
+
+```sysl
+print(str(21))
+```
+
+```error
+'str(x)' was removed in 0.7.0: write 'x.to_string()'
 ```
 
 A `string` is returned as it is, and a `bool` renders to one of two immortal literals, so neither

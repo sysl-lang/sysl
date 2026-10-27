@@ -235,8 +235,7 @@ enclosing module and everything under it. The bracket takes a **simple name, not
 
 - **Conversions are calls and none is inferred**: `u16(n)`, `real(n)`, `int(x)`, `u32(c)`, `char(u)`
   (traps), `string(c)`, `usize(p)`. There is **no** conversion to or from `bool`, and none between a
-  number and a `string` — `x.to_string()` renders (every value has it; `str(x)` is the older
-  spelling), `sysl.text` parses. `ptr_cast` makes a pointer from an
+  number and a `string` — `x.to_string()` renders (every value has it; `str(x)` was removed in 0.7.0), `sysl.text` parses. `ptr_cast` makes a pointer from an
   address; it, `str_cast` and `str_alias` are imported from `sysl.raw`, and the `va_` forms from
   `sysl.c`.
 - **Comparison chains**: `0 <= i < n` is one expression, each operand evaluated once.
