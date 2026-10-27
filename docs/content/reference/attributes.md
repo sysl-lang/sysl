@@ -5315,10 +5315,12 @@ disturbs nothing.
 | floating point | `fpu` (the machine has floating-point registers), `fpu_dp` (they hold a double), `hardfloat` / `softfp` (the float ABI), `fma` (a fused multiply-add is one instruction at `f32`), `fma_dp` (and at `f64`) |
 | storage | `thread_local` (a `@thread_local` is accepted on this build) |
 | address width | `ptr16` (an address is 16 bits), `ptr32` (it is 32 bits), `ptr64` (it is 64 bits) |
+| instrumentation | `sanitize_address` (the build is instrumented for AddressSanitizer), `sanitize_thread` (for ThreadSanitizer) |
 
 That is the whole vocabulary. There is **no `#define`** and nothing a project can add, and only one
 symbol depends on a project config: `thread_local`, which also reads the root manifest's
-`codegen.thread_pointer` (below). A condition is a symbol, `!`, `&&`, `||`, and parentheses; `&&` binds tighter
+`codegen.thread_pointer` (below). The two instrumentation symbols are facts of the build rather
+than of the machine, and read `SYSL_EXTRA_CFLAGS` (below). A condition is a symbol, `!`, `&&`, `||`, and parentheses; `&&` binds tighter
 than `||`.
 
 `posix` is a name for the commonest disjunction rather than a replacement for writing it — `#if linux
@@ -5465,6 +5467,45 @@ dcell_mul(a: isize, b: isize) -> DCell = DCell(a) * DCell(b)
 
 Like `fma`, the three are facts about the machine, so a directory cannot select on them.
 
+**`sanitize_address` and `sanitize_thread` say the build is instrumented** for AddressSanitizer or
+ThreadSanitizer. They are read from the same list the compiler marks every function with when
+`SYSL_EXTRA_CFLAGS` carries `-fsanitize=address` or `-fsanitize=thread` (one flag may name several,
+`-fsanitize=address,undefined`; `-fno-sanitize=` asks for nothing), so a condition and the
+instrumentation cannot disagree: on any target, the symbol is true exactly when the code under it is
+instrumented. They are for the code that has to behave differently under a sanitizer — a test that
+measures the allocator, which ASan replaces, or a lock-free path TSan cannot see the ordering of:
+
+```sysl
+#if sanitize_address
+say() -> string = "instrumented"
+#else
+say() -> string = "plain"
+#endif
+
+print(say())
+```
+
+```output
+plain
+```
+
+`#if !sanitize_address` and `#elif sanitize_thread` read as every other symbol does. Only those two
+are answered: `asan`, `tsan` and `sanitize_memory` are refused, naming them:
+
+```sysl
+#if asan
+say() -> string = "instrumented"
+#endif
+```
+
+```error
+'asan' is not something a build says about itself — sysl answers sanitize_address (AddressSanitizer) and sanitize_thread (ThreadSanitizer)
+```
+
+A dependency's `if` cannot name either, because which packages a resolution takes may not depend on
+how one build of them is compiled. Every cache the build keeps is keyed on `SYSL_EXTRA_CFLAGS`, so
+an instrumented build never reuses what a plain one gated.
+
 **A symbol nobody knows is an error, not false:**
 
 ```sysl
@@ -5478,7 +5519,7 @@ print(say())
 ```
 
 ```error
-'darwin' is not something a target says about itself — sysl knows aarch64, android, bsd, craft, fma, fma_dp, fpu, fpu_dp, freestanding, hardfloat, hosted, linux, macos, posix, ptr16, ptr32, ptr64, riscv32, riscv64, softfp, thread_local, thumb, wasi, wasm32, windows, x86, x86_64
+'darwin' is not something a target says about itself — sysl knows aarch64, android, bsd, craft, fma, fma_dp, fpu, fpu_dp, freestanding, hardfloat, hosted, linux, macos, posix, ptr16, ptr32, ptr64, riscv32, riscv64, sanitize_address, sanitize_thread, softfp, thread_local, thumb, wasi, wasm32, windows, x86, x86_64
 ```
 
 The set is closed, so a name outside it is a mistake rather than a fact this build happens not to
