@@ -1,0 +1,133 @@
+module sh.sysl.compiler
+@tests
+
+// `==` on an enum whose widest variant carries five to eight counted fields -- strings, a `&T`, an
+// `Option[string]`, a `Buf`, a nested enum -- derived and written by hand, equal and unequal, and
+// against a variant carrying none. Every string is built fresh, so two equal values share no
+// storage; a reference compares by address, so the one reference is shared.
+
+private wde_program() -> string = raw"""
+    import sysl.buf.{Buf, buf}
+
+    struct Inner derives Eq
+        s: string
+
+    enum D5 derives Eq
+        V(a: string, b: &Inner, c: string, d: Option[string], e: string)
+        W(n: int)
+
+    enum D6 derives Eq
+        V(a: string, b: &Inner, c: string, d: Option[string], e: string, f: &Inner)
+        W(n: int)
+
+    enum D7 derives Eq
+        V(a: string, b: &Inner, c: string, d: Option[string], e: string, f: &Inner, g: string)
+        W(n: int)
+
+    enum D8 derives Eq
+        V(a: string, b: &Inner, c: string, d: Option[string], e: string, f: &Inner, g: string, h: D5)
+        W(n: int)
+
+    enum H5
+        V(a: string, b: &Inner, c: string, d: Option[string], e: Buf[int])
+        W(n: int)
+
+    impl Eq for H5
+        eq(self, rhs: H5) -> bool = self match
+            V(a, b, c, d, e) -> rhs match
+                V(a2, b2, c2, d2, e2) -> a == a2 && b == b2 && c == c2 && d == d2 && same(e, e2)
+                _ -> false
+            W(n) -> rhs match
+                W(m) -> n == m
+                _ -> false
+
+    enum H6
+        V(a: string, b: &Inner, c: string, d: Option[string], e: Buf[int], f: string)
+        W(n: int)
+
+    impl Eq for H6
+        eq(self, rhs: H6) -> bool = self match
+            V(a, b, c, d, e, f) -> rhs match
+                V(a2, b2, c2, d2, e2, f2) -> a == a2 && b == b2 && c == c2 && d == d2 && same(e, e2) && f == f2
+                _ -> false
+            W(n) -> rhs match
+                W(m) -> n == m
+                _ -> false
+
+    enum H7
+        V(a: string, b: &Inner, c: string, d: Option[string], e: Buf[int], f: string, g: H6)
+        W(n: int)
+
+    impl Eq for H7
+        eq(self, rhs: H7) -> bool = self match
+            V(a, b, c, d, e, f, g) -> rhs match
+                V(a2, b2, c2, d2, e2, f2, g2) ->
+                    a == a2 && b == b2 && c == c2 && d == d2 && same(e, e2) && f == f2 && g == g2
+                _ -> false
+            W(n) -> rhs match
+                W(m) -> n == m
+                _ -> false
+
+    enum H8
+        V(a: string, b: &Inner, c: string, d: Option[string], e: Buf[int], f: string, g: H6, h: Buf[int])
+        W(n: int)
+
+    impl Eq for H8
+        eq(self, rhs: H8) -> bool = self match
+            V(a, b, c, d, e, f, g, h) -> rhs match
+                V(a2, b2, c2, d2, e2, f2, g2, h2) ->
+                    a == a2 && b == b2 && c == c2 && d == d2 && same(e, e2) && f == f2 && g == g2 &&
+                        same(h, h2)
+                _ -> false
+            W(n) -> rhs match
+                W(m) -> n == m
+                _ -> false
+
+    same(x: Buf[int], y: Buf[int]) -> bool
+        if x.len() != y.len() then return false
+
+        for i in 0..<x.len()
+            if x.at(i) != y.at(i) then return false
+
+        true
+
+    word(s: string) -> string = s"${s}!"
+    val the_inner: &Inner = Inner(word("b"))
+    nums(k: int) -> Buf[int]
+        val b: Buf[int] = buf()
+        b.push(k)
+        b.push(k + 1)
+        b
+
+    d5(k: string) -> D5 = V(word("a"), the_inner, word(k), Some(word("d")), word("e"))
+    d6(k: string) -> D6 = V(word("a"), the_inner, word(k), Some(word("d")), word("e"), the_inner)
+    d7(k: string) -> D7 = V(word("a"), the_inner, word(k), Some(word("d")), word("e"), the_inner, word("g"))
+    d8(k: string) -> D8 =
+        V(word("a"), the_inner, word(k), Some(word("d")), word("e"), the_inner, word("g"), d5(k))
+    h5(k: int) -> H5 = V(word("a"), the_inner, word("c"), None, nums(k))
+    h6(k: int) -> H6 = V(word("a"), the_inner, word("c"), None, nums(k), word("f"))
+    h7(k: int) -> H7 = V(word("a"), the_inner, word("c"), None, nums(k), word("f"), h6(k))
+    h8(k: int) -> H8 = V(word("a"), the_inner, word("c"), None, nums(k), word("f"), h6(k), nums(k))
+
+    var hits = 0
+
+    for _ in 0..<200
+        if d5("x") == d5("x") then hits += 1
+        if d6("x") == d6("x") then hits += 1
+        if d7("x") == d7("x") then hits += 1
+        if d8("x") == d8("x") then hits += 1
+        if h8(1) == h8(1) then hits += 1
+
+    print(hits)
+    print(d5("x") == d5("x"), d5("x") != d5("y"), d6("x") == d6("x"), d6("x") != d6("y"))
+    print(d7("x") == d7("x"), d7("x") != d7("y"), d8("x") == d8("x"), d8("x") != d8("y"), d8("x") != W(1))
+    print(h5(1) == h5(1), h5(1) != h5(2), h6(1) == h6(1), h6(1) != h6(2))
+    print(h7(1) == h7(1), h7(1) != h7(2), h8(1) == h8(1), h8(1) != h8(2), h8(1) != W(1))
+    """
+
+@test("'==' on an enum with five to eight counted fields, derived and by hand, answers right")
+wde_wide_enum_eq()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(wde_program()),
+              "1000\ntrue true true true\ntrue true true true true\ntrue true true true\ntrue true true true true\n")
