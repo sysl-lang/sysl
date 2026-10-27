@@ -434,6 +434,48 @@ that path goes on working exactly as it did.
 missing file answers `NotFound` rather than zero — the distinction a caller sizing a buffer needs and
 the one a bare number could not carry.
 
+### A file is a positioned store too
+
+A `File` implements [`ReadAt` and `WriteAt`](/library/io/),
+so a codec or a filesystem written against them reads and writes a file with no adapter. Its
+`Error` is `IoError`.
+
+```sysl
+import sysl.fs.{write_text, open_update, read_text, remove_file}
+import sysl.io.{Reader, ReadAt, WriteAt}
+
+var path = "/tmp/sysl-fs-doc-pio.txt"
+
+write_text(path, "0123456789").unwrap()
+
+var f = open_update(path).unwrap()
+var window: [3]u8
+
+print(f.read_at(4, window).unwrap()[0], f.tell().unwrap())
+print(f.write_at(8, "XY".bytes).unwrap(), f.tell().unwrap())
+f.write("A".bytes)
+f.sync().unwrap()
+print(read_text(path).unwrap(), f.extent().unwrap())
+
+f.close().unwrap()
+remove_file(path).unwrap()
+```
+
+```output
+52 0
+2 0
+A1234567XY 10
+```
+
+**Neither moves the position**: they are the platform's `pread` and `pwrite`, past the buffer, so they
+mix freely with `read` and `write`. What the buffer holds is settled first. A read at an offset sees
+every byte the program has written, because what is held back is handed over before it. A write at
+an offset gives up what was read ahead, since it may have changed those bytes. `sync` hands over what
+is held back and then asks the device to keep it (`fsync`). `extent` is `size` as the `u64` the traits
+speak in. An offset beyond what the platform's offset type holds is `Other(22)`, `EINVAL`, as the
+platform answers it. On Linux, a file opened with `append` puts a positioned write at the end
+whatever the offset; that is the platform's own `pwrite`, and it is left showing rather than hidden.
+
 ### Closing, and using a file after it
 
 ```sysl
@@ -1038,7 +1080,7 @@ way to get atomicity from a filesystem.
 ## Answering the filesystem on a freestanding target
 
 **Everything above reaches the filesystem through `sysl.fs.sys` and through nothing else**: one
-`extern` per call — `sysl_fs_open`, `_read`, `_write`, `_close`, `_seek`, `_fstat`, `_ftruncate`,
+`extern` per call — `sysl_fs_open`, `_read`, `_write`, `_pread`, `_pwrite`, `_sync`, `_close`, `_seek`, `_fstat`, `_ftruncate`,
 `_stat`, `_truncate`, `_mkdir`, `_rmdir`, `_unlink`, `_rename`, `_access`, `_chmod`, `_chown`, `_opendir`,
 `_readdir`, `_closedir`, `_getcwd`, `_chdir`, `_temp_dir`, `_symlink`, `_link`, `_readlink` and
 `_realpath`. Each answers an `int` by the contract every `*.sys` module has

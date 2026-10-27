@@ -1,0 +1,209 @@
+module sysl.io
+
+// Reading and writing a number of bytes at an offset -- the surface a binary format, a filesystem and
+// a block device share.
+//
+// **`Reader` is a stream and this is not.** A stream has one position and every read moves it; a
+// WAV header patched after the samples are written, a FAT read one cluster at a time and a littlefs
+// block written where the allocator put it all name *where*, every time. Each of those libraries
+// used to define its own pair of traits for it, and a program holding a file had to write an adapter
+// per library. These are the one pair, so a store written once -- a file, a flash partition, a slice
+// in memory -- serves all of them.
+//
+// **Nothing here allocates, and nothing needs an operating system**: the traits, the two helpers
+// and the two stores over memory build for a bare-metal target. A `sysl.fs.File` implements both
+// traits on a host.
+
+/** What every positioned store has, whichever direction it is used in: its own error, and how many
+ * bytes it holds.
+ *
+ * **It is a trait of its own, required by both `ReadAt` and `WriteAt`, for the reason `Fallible`
+ * is.** An associated type is named off the type (`S::Error`), never off the trait, so a type may
+ * implement only one trait declaring an `Error` (`reference/traits.md § One name per type`). A file
+ * is read and written at offsets alike, and the error both directions report is one type, so it is
+ * declared once, here, and the two traits reach it.
+ *
+ * **The error is the implementation's, not the library's.** A file reports an `IoError`, a codec's
+ * own store reports the codec's error, and a slice in memory reports `MemoryError` -- nothing is
+ * squeezed through a common enum that would have to name every way every store can fail. A generic
+ * function bounded on `ReadAt` hands `S::Error` back unchanged; one that wants its own error back
+ * through `?` takes a `*ReadAt[Error = E]` instead, which fixes the type.
+ *
+ * `extent` is "size" under another name because `File` already has an inherent `size` answering a
+ * `long`, and a trait member may not share a name with an inherent one.
+ */
+trait Positioned
+    type Error
+
+    /** How many bytes the store holds -- the offset a read reaches the end at. */
+    extent(*self) -> Result[u64, Self::Error]
+
+/** Reading at an offset, without a position to move.
+ *
+ * `read_at` fills a prefix of `into` with the bytes starting at `offset` and **hands that prefix
+ * back**, as `Reader.read` does, so the count and the bytes cannot disagree. It may answer short
+ * whenever it likes -- a device that reads a sector at a time, a store that hands over what one call
+ * reaches -- and an **empty** answer to a non-empty request means `offset` is at or past the end.
+ * Past the end is not an error: it is how a caller finds out where the end is.
+ *
+ * `read_exact_at` is the loop a caller would otherwise write round a short answer.
+ */
+trait ReadAt: Positioned
+    read_at(*self, offset: u64, into: []u8) -> Result[[]const u8, Self::Error]
+
+/** Writing at an offset, without a position to move.
+ *
+ * `write_at` writes a prefix of `bytes` at `offset` and answers how many it took. It may take fewer
+ * than it was given, but **a store that can take nothing answers an error** rather than `Ok(0)`, since
+ * a caller retrying a write that made no progress would retry for ever -- the contract
+ * `write_all_at` relies on. An empty `bytes` takes nothing and is `Ok(0)` anywhere.
+ *
+ * `sync` makes what was written durable -- a file's `fsync`, a flash controller's commit. Its default
+ * says there is nothing to do, which is true of memory and of any store whose writes land at once.
+ */
+trait WriteAt: Positioned
+    write_at(*self, offset: u64, bytes: []const u8) -> Result[usize, Self::Error]
+
+    sync(*self) -> Result[unit, Self::Error] = Ok(())
+
+/** Reads at `offset` until `into` is full or the store ends, and hands back the prefix that was
+ * filled.
+ *
+ * It is `read_exact` at an offset: a short `read_at` is not the end of anything, an empty one is,
+ * and what comes back is a prefix of `into` so a caller checks `got.len` against what it asked for.
+ * A failure stops the loop and is handed back as the store reported it; the bytes read before it are
+ * in `into` but not counted, since a caller that is told something went wrong should not have to
+ * decide which of the bytes to believe.
+ */
+read_exact_at[S: ReadAt](s: *S, offset: u64, into: []u8) -> Result[[]const u8, S::Error]
+    var at: usize = 0
+
+    while at < into.len
+        val got = s.read_at(offset + u64(at), into[at..])?
+
+        if got.len == 0 then break
+
+        // A store answering more than it was offered has broken the contract, and counting what it
+        // claimed would walk off the end of `into`.
+        at += if got.len > into.len - at then into.len - at else got.len
+    end while
+
+    Ok(into[0..<at])
+end read_exact_at
+
+/** Writes all of `bytes` at `offset`, across as many `write_at`s as it takes.
+ *
+ * **A store that answers `Ok(0)` to a non-empty write has broken `WriteAt`'s contract, and this
+ * stops the program saying so.** There is no error to hand back instead: the error type is the
+ * store's, and nothing here can make one of those. The alternative -- answering a count the caller
+ * then has to compare -- would put that comparison at every call site, for a case no correct store
+ * produces.
+ */
+write_all_at[S: WriteAt](s: *S, offset: u64, bytes: []const u8) -> Result[unit, S::Error]
+    var at: usize = 0
+
+    while at < bytes.len
+        val put = s.write_at(offset + u64(at), bytes[at..])?
+
+        if put == 0 then panic("sysl.io.write_all_at: a WriteAt took nothing and reported no error")
+
+        at += if put > bytes.len - at then bytes.len - at else put
+    end while
+
+    Ok(())
+end write_all_at
+
+/** Why a store over memory refused: a write starting at or past the end of its storage, which is
+ * fixed. Reading cannot fail at all, and past the end is an empty answer rather than this.
+ */
+enum MemoryError
+    NoRoom
+
+/** A read-only store over bytes already in hand -- a file's contents read whole, a table in flash, a
+ * literal in a test.
+ *
+ * It borrows, as `BytesReader` does, so it costs three words and the bytes must outlive it.
+ */
+struct BytesAt
+    bytes: []const u8
+    // The most one `read_at` hands back, which is what lets a caller's handling of a short answer be
+    // tested. See `bytes_at_most`.
+    most: usize
+
+/** A store over `b` that answers as much as it was offered room for. */
+bytes_at(b: []const u8) -> BytesAt = BytesAt(b, b.len)
+
+/** A store over `b` that hands back **at most `most` bytes per read**, which is what a device reading
+ * a sector at a time does and what a test of a caller's loop needs.
+ */
+bytes_at_most(b: []const u8, most: usize) -> BytesAt = BytesAt(b, most)
+
+impl Positioned for BytesAt
+    type Error = MemoryError
+
+    extent(*self) -> Result[u64, MemoryError] = Ok(u64(self.bytes.len))
+
+impl ReadAt for BytesAt
+    read_at(*self, offset: u64, into: []u8) -> Result[[]const u8, MemoryError] =
+        Ok(copied_at(self.bytes, offset, into, self.most))
+
+/** A store over storage the caller owns, read and written in place -- a sector buffer, a RAM disk, a
+ * flash image being built.
+ *
+ * Its size is the slice's: a write is cut short at the end, and one starting at or past it is
+ * `NoRoom`, since there is nowhere for it to go. Nothing is grown, which is what keeps it usable where
+ * nothing can be allocated.
+ */
+struct SliceAt
+    bytes: []u8
+    // The most one `read_at` or `write_at` handles, as for `BytesAt`.
+    most: usize
+
+slice_at(b: []u8) -> SliceAt = SliceAt(b, b.len)
+
+/** A store over `b` that reads and writes **at most `most` bytes per call**. */
+slice_at_most(b: []u8, most: usize) -> SliceAt = SliceAt(b, most)
+
+impl Positioned for SliceAt
+    type Error = MemoryError
+
+    extent(*self) -> Result[u64, MemoryError] = Ok(u64(self.bytes.len))
+
+impl ReadAt for SliceAt
+    read_at(*self, offset: u64, into: []u8) -> Result[[]const u8, MemoryError] =
+        Ok(copied_at(self.bytes, offset, into, self.most))
+
+impl WriteAt for SliceAt
+    write_at(*self, offset: u64, bytes: []const u8) -> Result[usize, MemoryError]
+        if bytes.len == 0 then return Ok(0)
+
+        if offset >= u64(self.bytes.len) then return Err(NoRoom)
+
+        val start = usize(offset)
+        var n = self.bytes.len - start
+
+        if n > bytes.len then n = bytes.len
+        if n > self.most then n = self.most
+
+        for i in 0..<n do self.bytes[start + i] = bytes[i]
+
+        Ok(n)
+    end write_at
+end SliceAt
+
+/** The bytes of `from` starting at `offset`, as many as fit in `into` and no more than `most`, copied
+ * there; the prefix of `into` they fill. Empty at or past the end.
+ */
+private copied_at(from: []const u8, offset: u64, into: []u8, most: usize) -> []const u8
+    if offset >= u64(from.len) then return into[0..<0]
+
+    val start = usize(offset)
+    var n = from.len - start
+
+    if n > into.len then n = into.len
+    if n > most then n = most
+
+    for i in 0..<n do into[i] = from[start + i]
+
+    into[0..<n]
+end copied_at
