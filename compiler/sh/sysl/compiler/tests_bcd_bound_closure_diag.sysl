@@ -1,0 +1,215 @@
+module sh.sysl.compiler
+@tests
+
+// A closure refused the callable a bare-arrow parameter asked for is told so at the parameter it
+// wrote a type for, in terms of what the callee passes there -- never by the name the sugar gave the
+// parameter (`f: (A, T) -> A` is `[$F1: Fn2[A, T, A]]` underneath, and `$F1` is nothing a reader
+// wrote). Through a bound it is said at the generic's definition, since the trait alone says what the
+// member passes; on a concrete receiver it is said at the call, in the same sentence.
+//
+// Each refusal is asserted as its message, its line and column, and that it is the only complaint;
+// and no message here holds a `$`. Building and running are `tests_rng_impl_composed_run.sysl`'s.
+
+private val bcd_source = raw"""
+    trait Source
+        pair[A, B](self, a: A, f: (A, int) -> B) -> B
+    struct Count
+        n: int
+    impl Source for Count
+        pair[A, B](self, a: A, f: (A, int) -> B) -> B = f(a, self.n)
+    """
+
+// What a refused program said, or nothing where it built.
+private bcd_refusal(text: string) -> string
+    rng_ran(text) match
+        Err(why) -> why
+        Ok(_) -> ""
+
+// How many complaints a report holds.
+private bcd_count(said: string) -> usize
+    var n: usize = 0
+    var rest = said
+
+    loop
+        rest.index_of("error: ") match
+            Some(at) ->
+                n += 1
+                rest = rest[at + 7..<rest.bytes.len]
+            None -> return n
+end bcd_count
+
+// `text` is refused with exactly one complaint, `message`, placed at `line`:`col` of the program,
+// and nothing it says names a synthetic `$` parameter.
+private bcd_refused(text: string, message: string, line: usize, col: usize)
+    if !rng_ready() then return
+
+    val said = bcd_refusal(text)
+    val head = s"error: $message\n"
+
+    assert(!said.contains("$"), said)
+    assert_eq(bcd_count(said), 1)
+
+    val found = said.index_of(head)
+
+    assert(found.is_some(), s"no '$message' in:\n$said")
+
+    val at = found.unwrap() + head.bytes.len
+    val rest = said[at..<said.bytes.len]
+    val where = rest.index_of("\n") match
+        Some(i) -> rest[0..<i]
+        None -> rest
+
+    assert(where.ends_with(s"main.sysl:$line:$col"), s"placed at '$where':\n$said")
+end bcd_refused
+
+@test("a closure through a Sequence bound is told at its wrong parameter, at the definition")
+bcd_bound_wrong_first_parameter() =
+    bcd_refused(raw"""
+        import sysl.seq.Sequence
+        total[S: Sequence[int]](s: S) -> int
+            s.fold(0, (a: string, n) -> 1)
+        val xs: []int = [1, 2, 3]
+        print(total(xs))
+        """, "this closure's 'a' is declared string, but 'sysl.seq.Sequence.fold' passes it int", 3, 16)
+
+@test("the same generic, never instantiated, is refused all the same")
+bcd_bound_never_instantiated() =
+    bcd_refused(raw"""
+        import sysl.seq.Sequence
+        total[S: Sequence[int]](s: S) -> int
+            s.fold(0, (a: string, n) -> 1)
+        """, "this closure's 'a' is declared string, but 'sysl.seq.Sequence.fold' passes it int", 3, 16)
+
+@test("the concrete receiver says the same sentence, naming the concrete member")
+bcd_concrete_twin() =
+    bcd_refused(raw"""
+        val xs: []int = [1, 2, 3]
+        print(xs[..].fold(0, (a: string, n) -> 1))
+        """, "this closure's 'a' is declared string, but 'slice.fold' passes it int", 2, 23)
+
+@test("the second of two parameters, and only the first of two wrong ones")
+bcd_two_parameters() =
+    bcd_refused(raw"""
+        import sysl.seq.Sequence
+        total[S: Sequence[int]](s: S) -> int
+            s.fold(0, (a, n: string) -> a)
+        """, "this closure's 'n' is declared string, but 'sysl.seq.Sequence.fold' passes it int", 3, 19)
+
+    bcd_refused(raw"""
+        import sysl.seq.Sequence
+        total[S: Sequence[int]](s: S) -> int = s.fold(0, (a: string, n: string) -> 1)
+        """, "this closure's 'a' is declared string, but 'sysl.seq.Sequence.fold' passes it int", 2, 51)
+
+@test("a parameter of the generic's own type, passed something else")
+bcd_own_type_parameter() =
+    bcd_refused(raw"""
+        import sysl.seq.Sequence
+        with_t[T, S: Sequence[T]](s: S, t: T) -> T = s.fold(t, (a: T, n: string) -> a)
+        """, "this closure's 'n' is declared string, but 'sysl.seq.Sequence.fold' passes it T", 2, 63)
+
+@test("a bound on a trait of the program's own, through it and on the concrete type")
+bcd_own_trait() =
+    bcd_refused(bcd_source + raw"""
+        paired[S: Source](s: S) -> string = s.pair(1, (x: bool, n) -> "y")
+        """, "this closure's 'x' is declared bool, but 'Source.pair' passes it int", 7, 48)
+
+    bcd_refused(bcd_source + raw"""
+        print(Count(4).pair(1, (x: bool, n) -> "y"))
+        """, "this closure's 'x' is declared bool, but 'Count.pair' passes it int", 7, 25)
+
+@test("a generic struct's method, with the wrong closure nested in a right one")
+bcd_nested_in_a_method() =
+    bcd_refused(raw"""
+        import sysl.seq.Sequence
+        struct Wrap[S: Sequence[int]]
+            s: S
+            sum(self) -> int = self.s.fold(0, (a, n) -> a + self.s.fold(0, (b: bool, m) -> 1))
+        """, "this closure's 'b' is declared bool, but 'sysl.seq.Sequence.fold' passes it int", 4, 69)
+
+@test("a function's bare arrow: positional, named, an explicit type argument, a closure held in a val")
+bcd_function_bare_arrow() =
+    bcd_refused(raw"""
+        apply(f: (int, int) -> int) -> int = f(1, 2)
+        print(apply((a: string, n) -> 1))
+        """, "this closure's 'a' is declared string, but 'apply' passes it int", 2, 14)
+
+    bcd_refused(raw"""
+        apply(f: int -> int) -> int = f(1)
+        print(apply(f = (x: bool) -> 1))
+        """, "this closure's 'x' is declared bool, but 'apply' passes it int", 2, 18)
+
+    bcd_refused(raw"""
+        apply[T](t: T, f: (T, int) -> int) -> int = f(t, 2)
+        print(apply[i64](1, (a: int, n) -> 1))
+        """, "this closure's 'a' is declared int, but 'apply' passes it long", 2, 22)
+
+    bcd_refused(raw"""
+        val xs: []int = [1, 2, 3]
+        val c = (a: string, n: int) -> 1
+        print(xs[..].fold(0, c))
+        """, "this closure's 'a' is declared string, but 'slice.fold' passes it int", 2, 10)
+
+@test("what is not a closure is told the callable that was asked for")
+bcd_not_a_closure() =
+    bcd_refused(raw"""
+        apply(f: int -> int) -> int = f(1)
+        print(apply(5))
+        """, "'apply' takes a callable int -> int here, but int is not one", 2, 7)
+
+    bcd_refused(raw"""
+        import sysl.seq.Sequence
+        total[S: Sequence[int]](s: S) -> int = s.fold(0, 5)
+        """, "'sysl.seq.Sequence.fold' takes a callable (int, int) -> int here, but int is not one", 2, 42)
+
+    bcd_refused(raw"""
+        struct Foo
+            k: int
+        impl Fn2[string, int, int] for Foo
+            call(*self, a: string, n: int) -> int = 1
+        apply(f: (int, int) -> int) -> int = f(1, 2)
+        print(apply(Foo(0)))
+        """, "'apply' takes a callable (int, int) -> int here, but Foo is not one — it implements " +
+             "'sysl.Fn2[string, int, int]'", 6, 7)
+
+    bcd_refused(raw"""
+        apply(f: (int, int) -> int) -> int = f(1, 2)
+        h[G](g: G) -> int = apply(g)
+        """, "'apply' takes a callable (int, int) -> int here, but 'G' is not bounded by " +
+             "'sysl.Fn2[int, int, int]'", 2, 21)
+
+@test("a wrong result, from the closure's body or from the generic's own annotation")
+bcd_wrong_result() =
+    bcd_refused(raw"""
+        import sysl.seq.Sequence
+        total[S: Sequence[int]](s: S) -> string = s.fold(0, (a, n) -> a + n)
+        val xs: []int = [1, 2, 3]
+        print(total(xs))
+        """, "'+' needs matching types, got string and int", 2, 67)
+
+    bcd_refused(raw"""
+        apply(f: (int, int) -> int) -> int = f(1, 2)
+        g(a: int, n: int) -> string = "x"
+        print(apply(g))
+        """, "this closure should yield int, but its body yields string", 3, 13)
+
+@test("an address of a function taking a bare arrow names no synthetic parameter")
+bcd_address_of_bare_arrow() =
+    bcd_refused(raw"""
+        apply(f: int -> int) -> int = f(1)
+        val h = &apply
+        """, "'apply' takes a bare arrow, so it is generic in the callable's own type — and an address " +
+             "has no arguments to read that from, nor any way to write it. Declare the parameter as a " +
+             "counted callable, '&Fn(…) -> …', to give it a type that can be named", 2, 9)
+
+@test("a written type the call agrees with is still accepted")
+bcd_agreeing_annotations_build() =
+    if !rng_ready() then return
+
+    rng_prints(raw"""
+        import sysl.seq.Sequence
+        wide[S: Sequence[int]](s: S) -> i64 = s.fold(0, (a: i64, n) -> a + i64(n))
+        same[T, S: Sequence[T]](s: S, t: T) -> T = s.fold(t, (a: T, n: T) -> a)
+        apply(f: (int, int) -> int) -> int = f(1, 2)
+        val xs: []int = [1, 2, 3]
+        print(wide(xs), same(xs, 0), apply((a: int, n) -> a + n))
+        """, "6 0 3\n")

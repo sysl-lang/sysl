@@ -171,6 +171,8 @@ call_bound_method(cx: &Analyzer, span: Span, receiver: TExpr, subject: Type, nam
         for i in 0..<m.tparams.len()
             if i < own.len() && own.at(i) != Unknown then
                 solved = joined_bindings(solved, one_binding(m.tparams.at(i), own.at(i)))
+
+        held_to_call_bounds(cx, scope, span, s"${tr.name}.$name", m, solved)
     end if
 
     // **Each argument is held to its parameter once the member's own parameters are solved**, and
@@ -262,6 +264,40 @@ private is_own_pack(t: TypeRef, tpacks: Buf[string]) -> bool = *t.kind match
     _ -> false
 
 // One binding, as a list of one.
+// **A callable at a bare-arrow parameter is held to what the parameter wrote at the definition**,
+// once the call has settled the member's own parameters: `s.fold(0, (a: string, n) -> 1)` through
+// `[S: Sequence[int]]` is wrong whatever `S` turns out to be, since the trait alone says `fold` passes
+// an `A` there and the `0` said `A` is an `int`. Left to the instantiation it was told against the
+// concrete member instead, or -- for a generic nothing instantiates -- never.
+//
+// A bound still naming something the call did not settle is passed over: the instantiation, which
+// knows it, is where that is asked.
+private held_to_call_bounds(cx: &Analyzer, scope: Scope, span: Span, what: string, m: MethodDecl,
+                            solved: Buf[Binding])
+    var terms = solved
+
+    for tparam in m.tparams
+        if bound_type(solved, tparam).is_none() then
+            terms = joined_bindings(terms, one_binding(tparam, Unknown))
+
+    for nb in m.bounds
+        if !is_call_bound(nb.name) then continue
+
+        val arg = bound_type(terms, nb.name)
+
+        if arg.is_none() || arg.unwrap() == Unknown || stands_for_itself(arg.unwrap()) then continue
+
+        for want in nb.bounds
+            val tr = resolve_bound(cx.an, scope, want.span, want, bound_terms(terms, nb.name, arg.unwrap()))
+            var open = false
+
+            for t in tr.args
+                if mentions_unknown(t) then open = true
+
+            if !open && !satisfies(cx.an, tr, arg.unwrap()) then
+                call_bound_unmet(cx.an, cx.scope, span, what, tr, arg.unwrap(), true)
+end held_to_call_bounds
+
 private one_binding(name: string, t: Type) -> Buf[Binding]
     var out: Buf[Binding] = buf()
 
