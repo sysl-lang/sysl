@@ -1,6 +1,7 @@
 module sh.sysl.compiler
 @tests
 
+import sysl.buf.{Buf, buf}
 import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
 import sysl.process.capture
 
@@ -153,7 +154,7 @@ ixn_index_then_argument()
             val z: int = w
         """)
 
-    assert(ixn_says(report, "cannot initialize 'z': declared int but the value is i64", "7:5"), report)
+    assert(ixn_says(report, "cannot initialize 'z': declared int but the value is long", "7:5"), report)
     assert_eq(ixn_count(report), 1)
 
 @test("an index and nothing else: the binding is the default int")
@@ -180,10 +181,11 @@ ixn_index_only()
             var i = 2
             print(xs[i])
             i -= 1
-            val z: usize = i
+            print(i + xs.len)
         """)
 
-    assert(ixn_says(report, "cannot initialize 'z': declared usize but the value is int", "6:5"), report)
+    // Arithmetic fixes nothing either, so the sum shows what the index left `i` at.
+    assert(ixn_says(report, "'+' needs matching types, got int and usize", "6:15"), report)
     assert_eq(ixn_count(report), 1)
 
 @test("an index then a comparison with a usize: the comparison decides")
@@ -212,6 +214,34 @@ ixn_index_then_compare()
 
     assert(ixn_says(report, "cannot initialize 'z': declared int but the value is usize", "6:5"), report)
     assert_eq(ixn_count(report), 1)
+
+@test("an index no longer fixes a binding that only arithmetic compares with a usize, so the comparison is refused")
+ixn_arithmetic_compare_is_refused()
+    if !ixn_ready() then return
+
+    // The comparison fixes from a neighbour that is a name, and `i + 1` is arithmetic, which fixes
+    // nothing; the index used to be what made `i` a usize here, and now nothing does.
+    val report = ixn_err(raw"""
+        main()
+            val set = ["a", "b", "c", "d"]
+            var i = 0
+            while i + 1 < set.len
+                print(set[i], set[i + 1])
+                i += 2
+        """)
+
+    assert(ixn_says(report, "cannot compare int with usize", "4:11"), report)
+    assert_eq(ixn_count(report), 1)
+
+    // Compared as a name, it is fixed as before.
+    assert_eq(ixn_ran(raw"""
+        main()
+            val set = ["a", "b", "c", "d"]
+            var i = 0
+            while i < set.len - 1
+                print(set[i], set[i + 1])
+                i += 2
+        """), "a b\nc d\n")
 
 @test("a literal no int holds, used only as an index, is told it does not fit; a later use decides")
 ixn_literal_above_int()
@@ -271,12 +301,12 @@ ixn_slices()
             val lo = 1
             val e = 0
             print(xs[lo..<4][e])
-            val a: usize = lo
-            val c: usize = e
+            print(lo + xs.len)
+            print(e + xs.len)
         """)
 
-    assert(ixn_says(report, "cannot initialize 'a': declared usize but the value is int", "6:5"), report)
-    assert(ixn_says(report, "cannot initialize 'c': declared usize but the value is int", "7:5"), report)
+    assert(ixn_says(report, "'+' needs matching types, got int and usize", "6:16"), report)
+    assert(ixn_says(report, "'+' needs matching types, got int and usize", "7:15"), report)
     assert_eq(ixn_count(report), 2)
 
 @test("a Buf's subscript and a type's own Index hand the index to a parameter, which fixes it")
@@ -339,14 +369,14 @@ ixn_generic_index()
         second[T](xs: []T) -> T
             val i = 1
             val r = xs[i]
-            val back: usize = i
+            print(i + xs.len)
             r
 
         main()
             print(second([1, 2, 3]))
         """)
 
-    assert(report.contains("error: cannot initialize 'back': declared usize but the value is int"), report)
+    assert(report.contains("error: '+' needs matching types, got int and usize"), report)
 
 @test("an index in a closure fixes nothing, and a later use outside it decides")
 ixn_closure_index()
