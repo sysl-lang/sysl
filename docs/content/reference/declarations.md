@@ -171,8 +171,8 @@ print(Limit)
 
 A local `var` or `val` with no type written whose value is a bare number — `0`, `-1`, `2.5` — takes
 its type from its **first use that fixes one**: a comparison with an operand that has a type of its
-own, an assignment of such a value or into a typed place, an argument, an index, a `return` or the
-body's result. A counter compared with a length is a `usize`, and an index read with it needs no
+own, an assignment of such a value or into a typed place, an argument, a `return` or the body's
+result. A counter compared with a length is a `usize`, and an index read with it needs no
 conversion:
 
 ```sysl
@@ -196,7 +196,10 @@ true 3
 
 **Arithmetic fixes nothing.** In `sum + b` the binding keeps its default and the typed operand widens
 to it, exactly as though the default had been written. Nor does a conversion: `u8(n)` converts `n`
-from what it is rather than deciding it. A binding no use fixes has the literal's
+from what it is rather than deciding it. **Nor does an index**, nor a slice's bounds: an array, a
+slice or a pointer is indexed by any integer, so `xs[i]` asks no type of `i` and the next use that
+does ask one decides. A subscript that a method answers — a `Buf`'s, or a type's own `Index` — hands
+the index to a parameter, and that is an argument like any other. A binding no use fixes has the literal's
 default: `int`, or `real` for a float literal. A use whose type cannot hold the literal — `300` handed
 to a `u8` — fixes nothing either, and is refused as it would be with `int` written. An integer
 literal is fixed at a float type where it holds the value exactly. A use inside a closure or a nested
@@ -214,6 +217,24 @@ print(sum + b, half(h), h / 2)
 
 ```output
 260 1.5 1.5
+```
+
+Here `n` indexes `firsts` first, but it is the result that decides, so `n` is the `int` the function
+returns:
+
+```sysl
+val firsts = [0, 1, 9, 22, 35, 48, 59, 64, 69]
+
+count_of(a: int) -> int
+    var n = 8
+    while firsts[n] > a do n -= 1
+    n
+
+print(count_of(30), count_of(70))
+```
+
+```output
+3 8
 ```
 
 **The first such use decides**, and a later use that disagrees is told exactly as it would be had the
