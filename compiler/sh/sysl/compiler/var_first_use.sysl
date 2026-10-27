@@ -9,10 +9,11 @@ import sysl.buf.{Buf, buf}
 //
 // **A use fixes a type where it stands at one**: compared with a typed operand, assigned a typed
 // value with `=`, handed to a parameter, returned -- every position that reads the name at a type it
-// expects. **Arithmetic carries the undecided type through**, as rustc's integer variables do: `i + 1`
-// is whatever `i` turns out to be, so a position that fixes it fixes `i`, and an operand of a type of
-// its own beside it -- `i + k` -- fixes `i` at that type. What the operator settles on otherwise is not
-// a type its operands were used at. Nor does a position that takes any integer at all -- an
+// expects. **Arithmetic carries the undecided type through**: `i + 1` is whatever `i` turns out to
+// be, so a comparison or a position that fixes it fixes `i`. **An operand of a type of its own beside
+// it in arithmetic does not**: `sum + b` keeps `sum` at its default and widens `b`, as it would with
+// the default written out, since sysl wraps on overflow and a narrow type the program never named
+// would wrap where the default does not. Nor does a position that takes any integer at all -- an
 // index of an array, a slice or a pointer, a slice's bounds, a vector run's start, a slot's index --
 // since no type is asked of it. A binding no use fixes has the literal's default, `int` or `real`.
 //
@@ -263,11 +264,10 @@ end reads_open
 private fixes_a_neighbour(cx: &Analyzer, e: Expr, t: TExpr) -> bool =
     texpr_type(t) != Unknown && !adaptable(e, t) && open_name(cx, e).is_none() && !reads_open(cx, t)
 
-// A comparison, or arithmetic other than a shift: an undecided operand beside an operand of a type of
-// its own is that type, so each open binding it waits on is fixed at it -- `i < xs.len`,
-// `i + 1 < xs.len` and `i + k` each fix `i`. `own` holds each operand's reading alone, before the
-// pair settles anything.
-neighbour_fixes(cx: &Analyzer, operands: Buf[Expr], own: Buf[Option[TExpr]])
+// A comparison: an undecided operand compared with an operand of a type of its own is that type, so
+// each open binding it waits on is fixed at it -- `i < xs.len` and `i + 1 < xs.len` each fix `i`.
+// `own` holds each operand's reading alone, before the pair settles anything.
+compare_fixes(cx: &Analyzer, operands: Buf[Expr], own: Buf[Option[TExpr]])
     for i in 0..<operands.len()
         val opens = opens_of(cx, operands.at(i))
 
@@ -285,7 +285,7 @@ neighbour_fixes(cx: &Analyzer, operands: Buf[Expr], own: Buf[Option[TExpr]])
                         break
                     end if
                 None -> ()
-end neighbour_fixes
+end compare_fixes
 
 // `n = v`: an open binding assigned a value of a type of its own is fixed at that type. The value is
 // read alone, in a trial, for the type it has; the assignment reads it again at the binding's.
