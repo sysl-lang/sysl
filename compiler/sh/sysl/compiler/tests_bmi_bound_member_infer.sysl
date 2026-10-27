@@ -1,0 +1,196 @@
+module sh.sysl.compiler
+@tests
+
+// A member with type parameters of its own, called through a BOUND rather than on a concrete
+// receiver (`reference/generics.md § Members and associated functions`). The member's own
+// parameters are solved from the call as they are on a concrete receiver, and a closure is read once
+// the other arguments have said what it takes: in `s.fold(0, (a, n) -> a + n)` through
+// `[S: Sequence[int]]` the `0` settles `A`, so `a` is an `int`. Read against the bare stand-in, `a`
+// was `A` and `+` on it was refused with "'+' needs 'A: sysl.Add[int]'". The building and running
+// are `tests_rng_impl_composed_run.sysl`'s.
+
+// `Source` is a bound that is not `Sequence`: one parameter settled by a literal, two parameters,
+// and a closure written BEFORE the argument that settles what it takes.
+private val bmi_source = raw"""
+    trait Source
+        pull[A](self, seed: A, step: (A, int) -> A) -> A
+        pair[A, B](self, a: A, f: (A, int) -> B) -> B
+        after[A](self, step: (A, int) -> A, seed: A) -> A
+
+    struct Count
+        n: int
+
+    impl Source for Count
+        pull[A](self, seed: A, step: (A, int) -> A) -> A
+            var acc = seed
+            for i in 0..<self.n do acc = step(acc, i)
+            acc
+        pair[A, B](self, a: A, f: (A, int) -> B) -> B = f(a, self.n)
+        after[A](self, step: (A, int) -> A, seed: A) -> A = step(seed, self.n)
+    """
+
+@test("a fold through a Sequence bound learns its accumulator from the literal")
+bmi_fold_through_a_sequence_bound()
+    if !rng_ready() then return
+
+    rng_prints(raw"""
+        import sysl.seq.Sequence
+        total[S: Sequence[int]](s: S) -> int
+            s.fold(0, (a, n) -> a + n)
+        val xs: []int = [1, 2, 3]
+        print(total(xs))
+        """, "6\n")
+
+@test("the same generic function instantiated at a slice and at a Buf")
+bmi_instantiated_twice()
+    if !rng_ready() then return
+
+    rng_prints(raw"""
+        import sysl.seq.Sequence
+        import sysl.buf.{Buf, buf}
+        total[S: Sequence[int]](s: S) -> int = s.fold(0, (a, n) -> a + n)
+        val xs: []int = [1, 2, 3]
+        var b: Buf[int] = buf()
+        b.push(5)
+        b.push(6)
+        print(total(xs), total(b))
+        """, "6 11\n")
+
+@test("an accumulator of another type than the element, settled by the literal")
+bmi_accumulator_of_another_type()
+    if !rng_ready() then return
+
+    rng_prints(raw"""
+        import sysl.seq.Sequence
+        mean[S: Sequence[int]](s: S) -> f64 = s.fold(0.0, (a, n) -> a + f64(n)) / 3.0
+        names[S: Sequence[int]](s: S) -> string = s.fold("", (a, n) -> a + s"<$n>")
+        val xs: []int = [1, 2, 3]
+        print(mean(xs), names(xs))
+        """, "2 <1><2><3>\n")
+
+@test("a written type argument settles the accumulator outright")
+bmi_written_type_argument()
+    if !rng_ready() then return
+
+    rng_prints(raw"""
+        import sysl.seq.Sequence
+        wide[S: Sequence[int]](s: S) -> i64 = s.fold[i64](0, (a, n) -> a + i64(n))
+        val xs: []int = [1, 2, 3]
+        print(wide(xs))
+        """, "6\n")
+
+@test("a map learns its result from the closure, whose parameter comes only from the bound")
+bmi_map_through_a_bound()
+    if !rng_ready() then return
+
+    rng_prints(raw"""
+        import sysl.seq.Sequence
+        doubled[S: Sequence[int]](s: S) -> []int = s.map(n -> n * 2)
+        labels[S: Sequence[int]](s: S) -> []string = s.map(n -> s"<$n>")
+        big[S: Sequence[int]](s: S) -> bool = s.any(n -> n > 2)
+        val xs: []int = [1, 2, 3]
+        print(doubled(xs)[2], labels(xs)[0], big(xs))
+        """, "6 <1> true\n")
+
+@test("a bound on a trait of the program's own, one parameter and two")
+bmi_own_trait_bound()
+    if !rng_ready() then return
+
+    rng_prints(bmi_source + raw"""
+        pulled[S: Source](s: S) -> int = s.pull(100, (a, i) -> a + i)
+        paired[S: Source](s: S) -> string = s.pair(1.5, (x, n) -> s"$x/$n")
+        print(pulled(Count(4)), paired(Count(4)))
+        """, "106 1.5/4\n")
+
+@test("a closure written before the argument that settles what it takes")
+bmi_closure_before_its_settler()
+    if !rng_ready() then return
+
+    rng_prints(bmi_source + raw"""
+        later[S: Source](s: S) -> int = s.after((a, i) -> a * i, 3)
+        print(later(Count(4)))
+        """, "12\n")
+
+@test("a generic trait implemented by a generic struct, bound at another argument")
+bmi_generic_trait_on_a_generic_struct()
+    if !rng_ready() then return
+
+    rng_prints(raw"""
+        trait Holds[T]
+            reduce[A](self, init: A, f: (A, T) -> A) -> A
+        struct Bag[T]
+            items: []T
+        impl[E] Holds[E] for Bag[E]
+            reduce[A](self, init: A, f: (A, E) -> A) -> A
+                var acc = init
+                for x in self.items do acc = f(acc, x)
+                acc
+        joined[H: Holds[string]](h: H) -> string = h.reduce("", (acc, w) -> acc + w)
+        print(joined(Bag(["a", "b", "c"])))
+        """, "abc\n")
+
+@test("a generic struct's method folds its bounded field, nested closures included")
+bmi_generic_struct_method()
+    if !rng_ready() then return
+
+    rng_prints(raw"""
+        import sysl.seq.Sequence
+        struct Wrap[S: Sequence[int]]
+            s: S
+            sum(self) -> int = self.s.fold(0, (a, n) -> a + n)
+            nested(self) -> int = self.s.fold(0, (a, n) -> a + self.s.fold(0, (b, m) -> b + m * n))
+        val xs: []int = [1, 2, 3]
+        val w = Wrap(xs)
+        print(w.sum(), w.nested())
+        """, "6 36\n")
+
+// What a refused program said, or nothing where it built.
+private bmi_refusal(text: string) -> string
+    rng_ran(text) match
+        Err(why) -> why
+        Ok(_) -> ""
+
+@test("a closure that is genuinely wrong is still told so")
+bmi_wrong_closures_are_refused()
+    if !rng_ready() then return
+
+    val head = raw"""
+        import sysl.seq.Sequence
+        """
+    val xs = raw"""
+        val xs: []int = [1, 2, 3]
+        """
+    val adds = bmi_refusal(head + raw"""
+        e[S: Sequence[int]](s: S) -> int = s.fold(0, (a, n) -> a + "x")
+        """ + xs + "print(e(xs))\n")
+
+    assert(adds.contains("'+' needs matching types, got int and string"), adds)
+
+    val element = bmi_refusal(head + raw"""
+        e[S: Sequence[int]](s: S) -> string = s.fold("", (a, n) -> a + n)
+        """ + xs + "print(e(xs))\n")
+
+    assert(element.contains("'+' needs matching types, got string and int"), element)
+
+    val yields = bmi_refusal(head + raw"""
+        e[S: Sequence[int]](s: S) -> int = s.fold(0, (a, n) -> "x")
+        """ + xs + "print(e(xs))\n")
+
+    assert(yields.contains("this closure should yield int, but its body yields string"), yields)
+
+@test("a closure whose parameter nothing settles is told to write it")
+bmi_nothing_settles_the_closure()
+    if !rng_ready() then return
+
+    val said = bmi_refusal(raw"""
+        trait Only
+            only[A](self, f: A -> int) -> int
+        struct K
+            k: int
+        impl Only for K
+            only[A](self, f: A -> int) -> int = 0
+        e[O: Only](o: O) -> int = o.only(x -> 1)
+        print(e(K(0)))
+        """)
+
+    assert(said.contains("'x' has no type here — nothing says what this closure takes, so write it"), said)

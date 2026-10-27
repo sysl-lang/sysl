@@ -508,8 +508,11 @@ held_queue[V]() -> HeldQueue[V] = HeldQueue(map(), 0, 0)
 // path it was read from, which is what makes the first half answerable wherever the library was
 // installed; the second half is what makes a build *of* the library compile all of it rather than
 // the fraction its own internal calls reach.
-from_library(a: &Analysis, scope: Scope) -> bool =
-    scope.src.name.starts_with(s"$StdPrefix/") && !holds_string(a.producing, scope.src.name)
+from_library(a: &Analysis, scope: Scope) -> bool = library_source(a, scope.src)
+
+// The same, of a file.
+library_source(a: &Analysis, src: Source) -> bool =
+    src.name.starts_with(s"$StdPrefix/") && !holds_string(a.producing, src.name)
 
 // The instantiations a walk asked for, typed until nothing more is asked. Typing one body may reach
 // a call that asks for another, so it runs to a fixpoint.
@@ -610,6 +613,11 @@ analyze_body(a: &Analysis, scope: Scope, span: Span, d: FuncDecl, key: string = 
 
     val cx = analyzer_for(a, scope)
     val name = if key == "" then func_key(a, scope, span, d) else key
+    val outer_reading = a.sites.reading
+
+    a.sites.reading = name
+
+    defer a.sites.reading = outer_reading
 
     note_body_covers(a, name)
 
@@ -1133,10 +1141,15 @@ end analyze_instance
 analyze_instance_in(a: &Analysis, cx: &Analyzer, name: string, d: FuncDecl) -> TFunc
     val reaching = enter_reaching(a, d)
     val said = a.complaints()
+    val outer_reading = a.sites.reading
 
+    a.sites.reading = name
+
+    defer a.sites.reading = outer_reading
     defer leave_reaching(a, reaching)
-    // A member a `derives` clause wrote from a trait's template is refused at the clause.
-    defer told_at_derives(a, d.name, said)
+    // A member a `derives` clause wrote from a trait's template is refused at the clause -- or, where
+    // nothing in the program wrote that clause, at the line that reached the member.
+    defer told_at_derives(a, d.name, name, supplied_debug(d.params), said)
 
     val sig = a.tables.members.func_insts.get(name)
 
