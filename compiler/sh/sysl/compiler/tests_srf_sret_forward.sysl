@@ -1,0 +1,411 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// **A large result is built where it is going** (`emit_sig.sysl`'s `sysl_sret`). Where the caller
+// already has the storage -- its own out-pointer on `return f(x)`, a local that becomes the result,
+// the outer call of `f(g(x))` -- the front end hands the callee that storage itself. Where the call is
+// one part of a value being built in the caller's out-pointer (`Holder(2, make(x))`, `Ok(make(x))`,
+// a field after a `?`), the front end writes a temporary and copies it, and it is the optimizer that
+// points the callee at the field instead. It may do that only because the out-pointer says
+// `dead_on_unwind writable`: the storage is the caller's to overwrite, from the moment the function
+// is entered, and nobody looks at it if the call never comes back.
+//
+// What must stay a copy is a destination the callee can see: `v = rev(v)` reads `v` while the
+// result is written, so the result goes to a temporary first.
+
+private srf_ready() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+
+    true
+end srf_ready
+
+// The program every test below reads: each function is `@noinline`, so the call whose result is
+// placed stays a call to look at.
+private srf_program() -> string = raw"""
+    import sysl.buf.{Buf, buf}
+
+    struct Big
+        a: i64
+        cells: [20]i64
+
+    struct Holder
+        tag: i64
+        big: Big
+
+    struct Wrap[T]
+        n: i64
+        item: T
+
+    struct Small
+        cells: [18]i64
+
+    struct Named
+        name: string
+        big: Big
+
+    struct Res
+        id: i64
+
+    impl Drop for Res
+        drop(self)
+            print(s"drop ${self.id}")
+
+    struct Owning
+        res: &Res
+        big: Big
+
+    enum Fail
+        Neg
+
+    trait Shape
+        wide(self, x: i64) -> Big
+
+    struct Square
+        k: i64
+
+    impl Shape for Square
+        wide(self, x: i64) -> Big = make(x * self.k)
+
+    struct Grid
+        big: Big
+
+        @noinline
+        refill(*self, x: i64)
+            self.big = make(x)
+
+    @noinline
+    make(x: i64) -> Big
+        var b = Big(x, [0; 20])
+        for i in 0..<20
+            b.cells[i] = x * 100 + i
+        b
+
+    @noinline
+    rev(b: Big) -> Big
+        var c = Big(b.a + 1, [0; 20])
+        for i in 0..<20
+            c.cells[i] = b.cells[19 - i]
+        c
+
+    @noinline
+    check(x: i64) -> Result[i64, Fail] = if x < 0 then Err(Neg) else Ok(x)
+
+    @noinline
+    in_field(x: i64) -> Holder = Holder(2, make(x))
+
+    @noinline
+    in_variant(x: i64) -> Result[Big, Fail] = Ok(make(x))
+
+    @noinline
+    after_try(x: i64) -> Result[Holder, Fail]
+        val y = check(x)?
+        Ok(Holder(y, make(x)))
+
+    @noinline
+    early(x: i64) -> Holder
+        if x < 0 then return Holder(-1, make(0))
+        Holder(x, make(x))
+
+    @noinline
+    in_generic(x: i64) -> Wrap[Big] = Wrap(3, make(x))
+
+    @noinline
+    in_generic_small(x: i64) -> Wrap[Small] = Wrap(4, Small([x; 18]))
+
+    @noinline
+    returned(x: i64) -> Big = make(x)
+
+    @noinline
+    moved(x: i64) -> Holder
+        val v = make(x)
+        Holder(5, v)
+
+    @noinline
+    nested(x: i64) -> Big = rev(make(x))
+
+    @noinline
+    aliased(x: i64) -> Big
+        var v = make(x)
+        v = rev(v)
+        v
+
+    @noinline
+    reassigned(x: i64) -> Big
+        var v = make(x)
+        v = make(x + 1)
+        v
+
+    @noinline
+    named(s: string, x: i64) -> Named = Named(s, make(x))
+
+    @noinline
+    owning(id: i64, x: i64) -> Owning = Owning(Res(id), make(x))
+
+    @noinline
+    through(s: &Shape, x: i64) -> Holder = Holder(6, s.wide(x))
+
+    @noinline
+    pushed(out: Buf[Big], x: i64)
+        out.push(make(x))
+
+    show(b: Big) -> string = s"${b.a} ${b.cells[0]} ${b.cells[19]}"
+
+    main()
+        print(s"field ${in_field(1).tag} ${show(in_field(1).big)}")
+        print(s"variant ${show(in_variant(2).unwrap())}")
+        print(s"try ok ${after_try(3).unwrap().tag} ${show(after_try(3).unwrap().big)}")
+        print(s"try err ${after_try(-3).is_err()}")
+        print(s"early ${early(-1).tag} ${show(early(-1).big)} ${early(4).tag} ${show(early(4).big)}")
+        print(s"generic ${in_generic(5).n} ${show(in_generic(5).item)}")
+        print(s"generic small ${in_generic_small(6).n} ${in_generic_small(6).item.cells[17]}")
+        print(s"returned ${show(returned(7))}")
+        print(s"moved ${moved(8).tag} ${show(moved(8).big)}")
+        print(s"nested ${show(nested(9))}")
+        print(s"aliased ${show(aliased(10))}")
+        print(s"reassigned ${show(reassigned(11))}")
+        val nm = named("cell", 12)
+        print(s"named ${nm.name} ${show(nm.big)}")
+        val o = owning(13, 13)
+        print(s"owning ${o.res.id} ${show(o.big)}")
+        val sq: &Shape = Square(2)
+        print(s"dyn ${show(through(sq, 7).big)}")
+        var g = Grid(make(0))
+        g.refill(14)
+        print(s"self ${show(g.big)}")
+        val out: Buf[Big] = buf()
+        pushed(out, 15)
+        pushed(out, 16)
+        print(s"pushed ${show(out[0])} ${show(out[1])}")
+    """
+
+// What the program prints, worked out by hand: `make(x)` is `x`, then `100x + i` in cell `i`, and
+// `rev` adds one to `a` and reverses the cells.
+private srf_expected() -> string =
+    "field 2 1 100 119\n" +
+    "variant 2 200 219\n" +
+    "try ok 3 3 300 319\n" +
+    "try err true\n" +
+    "early -1 0 0 19 4 4 400 419\n" +
+    "generic 3 5 500 519\n" +
+    "generic small 4 6\n" +
+    "returned 7 700 719\n" +
+    "moved 5 8 800 819\n" +
+    "nested 10 919 900\n" +
+    "aliased 11 1019 1000\n" +
+    "reassigned 12 1200 1219\n" +
+    "named cell 12 1200 1219\n" +
+    "owning 13 13 1300 1319\n" +
+    "dyn 14 1400 1419\n" +
+    "self 14 1400 1419\n" +
+    "pushed 15 1500 1519 16 1600 1619\n" +
+    "drop 13\n"
+
+// The LLVM text the front end writes for `text`, for `target` or this machine.
+private srf_ir(text: string, target: Option[string]) -> string
+    val root = make_temp_dir("sysl-srf").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    val out = emit_llvm_text(src, target) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> if made.report.is_empty() then made.text else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end srf_ir
+
+// The module's `target triple`, which clang is told outright so it optimizes for that machine.
+private srf_triple(ir: string) -> string
+    for line in lines_of(ir)
+        if line.starts_with("target triple = \"") && line.ends_with("\"") then return line[17..<line.len - 1]
+
+    ""
+
+// The same text after clang's `-O2`.
+private srf_optimized(ir: string) -> string
+    val root = make_temp_dir("sysl-srf").unwrap()
+    val file = s"$root/t.ll"
+
+    make_dir_all(root).unwrap()
+    write_text(file, ir).unwrap()
+
+    val triple = srf_triple(ir)
+
+    assert(triple != "", "the emitted module names no target triple")
+
+    val got = capture("clang", [s"--target=$triple", "-O2", "-S", "-emit-llvm", "-o", "-", file], "", [], true).unwrap()
+
+    remove_dir_all(root).unwrap_or(())
+    assert(got.status.ok(), s"clang refused the emitted IR:\n${got.err.unwrap_or("")}")
+    got.text
+end srf_optimized
+
+// One function's text, from its `define` to the brace that closes it.
+private srf_body(out: string, name: string) -> string
+    var b = ""
+    var inside = false
+
+    for line in lines_of(out)
+        if !inside && line.starts_with("define ") && line.contains("@" + name + "(") then inside = true
+
+        if inside
+            if line == "}" then return b
+
+            b = b + line + "\n"
+
+    s"no definition of '$name' in:\n$out"
+end srf_body
+
+// The line that opens one function's definition.
+private srf_define(out: string, name: string) -> string
+    for line in lines_of(out)
+        if line.starts_with("define ") && line.contains("@" + name + "(") then return line
+
+    s"no definition of '$name' in:\n$out"
+end srf_define
+
+// -- what the signature says ----------------------------------------------------------------------
+
+@test("a large result's out-pointer is noalias, dead on unwind and writable, on every target")
+srf_the_out_pointer_says_so()
+    if !srf_ready() then return
+
+    for target in [None, Some("x86_64-freestanding"), Some("thumb-freestanding")]
+        val out = srf_ir(srf_program(), target)
+        val line = srf_define(out, "make")
+
+        assert(line.contains("ptr noalias sret(%struct.Big) align 8 dead_on_unwind writable %sret.out") ||
+               line.contains("ptr noalias sret(%struct.Big) align 4 dead_on_unwind writable %sret.out"), line)
+
+@test("a call names only sret and align on the storage it passes; the promises are the callee's")
+srf_the_call_promises_nothing()
+    if !srf_ready() then return
+
+    val body = srf_body(srf_ir(srf_program(), None), "in_field")
+
+    assert(body.contains("call void @make(ptr sret(%struct.Big) align 8 "), body)
+
+    for line in lines_of(body)
+        if line.contains("call ")
+            assert(!line.contains("writable"), line)
+            assert(!line.contains("dead_on_unwind"), line)
+
+@test("a trait object's entry hands its body the out-pointer it was handed, with what that one promised")
+srf_the_table_entry_forwards_its_own()
+    if !srf_ready() then return
+
+    val out = srf_ir(srf_program(), None)
+    val line = "ptr noalias sret(%struct.Big) align 8 dead_on_unwind writable %sret.out"
+
+    assert(srf_define(out, "Square.wide").contains(line), srf_define(out, "Square.wide"))
+    assert(srf_body(out, "Square.wide").contains("call void @Square.wide.self(" + line), srf_body(out, "Square.wide"))
+
+// -- where the front end already builds in place --------------------------------------------------
+
+@test("return f(x), a local that becomes the result, and the outer call of f(g(x)) are built in place")
+srf_built_in_place_already()
+    if !srf_ready() then return
+
+    val out = srf_ir(srf_program(), None)
+
+    for name in ["returned", "moved", "nested"]
+        val body = srf_body(out, name)
+
+        assert(!body.contains("llvm.memcpy"), body)
+
+    assert(srf_body(out, "returned").contains("call void @make(ptr sret(%struct.Big) align 8 %sret.out"),
+           srf_body(out, "returned"))
+    assert(srf_body(out, "nested").contains("call void @rev(ptr sret(%struct.Big) align 8 %sret.out"),
+           srf_body(out, "nested"))
+
+// -- where the optimizer now builds it in place ---------------------------------------------------
+
+@test("a call that fills one field of the caller's own result writes it there, with no copy, at -O2")
+srf_field_of_the_result()
+    if !srf_ready() then return
+
+    val front = srf_ir(srf_program(), None)
+    val out = srf_optimized(front)
+
+    // Each of these copied a temporary into the caller's out-pointer before the out-pointer said it
+    // was writable: a struct field, a variant's payload, a field after a `?` and after an early
+    // `return`, a generic struct's field, a reassigned local that is the result, a struct that also
+    // holds a counted string or a value with a destructor, and a call through a trait object.
+    for name in ["in_field", "in_variant", "after_try", "early", "in_generic", "reassigned", "named.owned",
+                 "owning", "through"]
+        assert(front.contains("define void @" + name + "("), srf_define(front, name))
+
+        val body = srf_body(out, name)
+
+        assert(!body.contains("llvm.memcpy"), body)
+
+@test("the same holds on a 32-bit Arm board")
+srf_field_of_the_result_on_thumb()
+    if !srf_ready() then return
+
+    val out = srf_optimized(srf_ir(srf_program(), Some("thumb-freestanding")))
+
+    for name in ["in_field", "in_variant", "after_try", "in_generic"]
+        val body = srf_body(out, name)
+
+        assert(!body.contains("llvm.memcpy"), body)
+        assert(body.contains("@make("), body)
+
+// -- where it must stay a copy --------------------------------------------------------------------
+
+@test("v = rev(v) still builds the result apart from v, which the callee is reading")
+srf_an_aliased_destination_is_copied()
+    if !srf_ready() then return
+
+    val out = srf_optimized(srf_ir(srf_program(), None))
+    val body = srf_body(out, "aliased")
+
+    assert(body.contains("@rev("), body)
+    assert(body.contains("llvm.memcpy"), body)
+
+// -- the programs ---------------------------------------------------------------------------------
+
+@test("every placement prints what the source says, the destructor runs once and the heap nets zero")
+srf_every_placement_prints()
+    if !srf_ready() then return
+
+    for level in [DefaultOptimization, "2"]
+        val root = make_temp_dir("sysl-srf").unwrap()
+
+        make_dir_all(root).unwrap()
+        write_text(s"$root/main.sysl", srf_program()).unwrap()
+        force_alloc_counting(true)
+
+        val built = build_native_program(s"$root/main.sysl", None, None, level, Some(s"$root/built"))
+
+        force_alloc_counting(false)
+
+        if built.is_err()
+            remove_dir_all(root).unwrap_or(())
+            assert(false, failure_text(built.unwrap_err()))
+            return
+        end if
+
+        val said = capture(s"$root/built", [], "", [], true)
+
+        remove_dir_all(root).unwrap_or(())
+
+        said match
+            Err(_) -> assert(false, "the program that was built could not be run")
+            Ok(ran) ->
+                assert_eq(ran.text, srf_expected())
+                assert(ran.status.ok(), "the program printed what was expected and did not exit cleanly")
+                assert(!ran.err.unwrap_or("").contains("still live"), ran.err.unwrap_or(""))
+end srf_every_placement_prints
