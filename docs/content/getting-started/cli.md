@@ -415,6 +415,24 @@ the same way.
 (`__asan_report`, `__tsan_func_entry`, `__msan_warning`, `__hwasan_`) is refused. `undefined` is
 reported when present and never refused, since sysl's own code is not instrumented by UBSan.
 
+**A test that cannot hold under a sanitizer skips itself with `#if sanitize_address`** (or
+`sanitize_thread`), which is true exactly when the build is instrumented
+([`#if`](/reference/attributes/#the-symbols-are-derived-from-the-target-and-the-set-is-closed)). A
+test that counts what the allocator frees, say, is measuring ASan's allocator rather than sysl's:
+
+```
+import sysl.testing.skip
+
+@test
+closing_frees()
+#if sanitize_address
+    skip("AddressSanitizer replaces the allocator this test counts")
+#endif
+    assert(freed_after_close() == 1, "the handle's storage is freed")
+```
+
+The report then shows the row as `skip` with that reason under ASan, and runs it everywhere else.
+
 **Tests run in parallel — one per processor, or `--jobs <n>`** — and the report is identical to a
 sequential run's: each row waits for every row above it, so rows appear in source order, and
 `--jobs 1` runs them sequentially. Each test already has its own process, so running them in

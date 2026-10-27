@@ -60,10 +60,17 @@ end Directive
 //
 // `features` are the `feature_<name>` symbols of the package the file belongs to -- the features its
 // own manifest declares that the resolution enabled, and no other package's.
-gate(src: Source, target: Target, features: Buf[string] = buf()) -> Result[Source, Diagnostic]
+//
+// `flags` are the extra clang flags the build is compiled under (`extra_cflags`), which decide the
+// instrumentation symbols; a parameter so that a test can ask about a build it is not running in.
+gate(src: Source, target: Target, features: Buf[string] = buf(),
+        flags: Buf[string] = extra_cflags()) -> Result[Source, Diagnostic]
     var on = defined(target)
 
     for item in features
+        on.push(item)
+
+    for item in instrumented(flags)
         on.push(item)
 
     val lines = src.line_count()
@@ -248,7 +255,7 @@ private in_text_block(d: Directive, text: string, line: usize, stack: *Buf[Frame
     val texts = ours && stack.at(n - 1).text
 
     if word == "if"
-        if read_condition(argument(text, d.at), d.at, "#if", on, symbols(), true).is_ok() then return true
+        if read_condition(argument(text, d.at), d.at, "#if", on, source_symbols(), true).is_ok() then return true
 
         stack.push(Frame(line, all_taken(*stack), true, 0, true, true))
         return false
@@ -400,8 +407,66 @@ directory_symbols() -> Buf[string]
     out
 end directory_symbols
 
+// The two facts about **the build rather than the machine** a source condition may ask:
+// whether every function is instrumented for AddressSanitizer (`sanitize_address`) or for
+// ThreadSanitizer (`sanitize_thread`). Each is the name of the LLVM attribute that does the marking.
+//
+// They are read from `sanitizer_attrs`, the list `for_clang` marks every definition with, so a
+// condition and the instrumentation cannot disagree: whatever makes the build instrumented makes
+// the condition true, on any target, and nothing else does. A dependency's `if` cannot name them --
+// what a resolution picks must not depend on how one build of it is compiled.
+instrumentation_symbols() -> Buf[string]
+    var out: Buf[string] = buf()
+
+    out.push("sanitize_address")
+    out.push("sanitize_thread")
+    out
+end instrumentation_symbols
+
+// The instrumentation symbols true for a build whose clang is handed `flags`.
+instrumented(flags: Buf[string]) -> Buf[string]
+    val attrs = sanitizer_attrs(flags)
+    var out: Buf[string] = buf()
+
+    for item in instrumentation_symbols()
+        if has(attrs, item) then out.push(item)
+
+    out
+end instrumented
+
+// Every symbol a source file's `#if` may name: the target's, and the build's instrumentation.
+source_symbols() -> Buf[string]
+    var out = symbols()
+
+    for item in instrumentation_symbols()
+        out.push(item)
+
+    out
+end source_symbols
+
+// What to say for a word that looks like a question about a sanitizer and is not one of the two
+// sysl answers -- `asan`, `tsan`, `sanitize_memory` -- or for an instrumentation symbol in a
+// dependency's condition, where none may be named.
+private instrumentation_message(word: string, source: bool) -> Option[string]
+    if !source && has(instrumentation_symbols(), word)
+        return Some(s"'$word' is a fact of one build, not of the machine, and a dependency's condition cannot ask it — whether a package is resolved may not depend on how it is compiled")
+
+    val spellings: []const string = ["asan", "tsan", "msan", "hwasan", "ubsan", "lsan"]
+    var near = word.starts_with("sanitize_") || word.starts_with("sanitizer")
+
+    for i in 0..<spellings.len
+        if word == spellings[i] then near = true
+
+    if !near then return None
+
+    if source
+        return Some(s"'$word' is not something a build says about itself — sysl answers sanitize_address (AddressSanitizer) and sanitize_thread (ThreadSanitizer)")
+
+    None
+end instrumentation_message
+
 // The whole vocabulary in one line, sorted, as a refusal names it.
-symbols_listed() -> string = listed(symbols())
+symbols_listed() -> string = listed(source_symbols())
 
 // A vocabulary in one line, sorted.
 private listed(known: Buf[string]) -> string
@@ -563,7 +628,7 @@ end CondFault
 // condition can hold are exactly the ones that would otherwise gate code out with nothing said.
 private condition(src: Source, line: usize, text: string, at: usize, word: string,
                   on: Buf[string]) -> Result[bool, Diagnostic]
-    read_condition(argument(text, at), at, s"#$word", on, symbols(), true) match
+    read_condition(argument(text, at), at, s"#$word", on, source_symbols(), true) match
         Ok(value) -> Ok(value)
         Err(fault) -> Err(fail_at(src, line, fault.col, fault.message))
 end condition
@@ -718,6 +783,11 @@ private cond_atom(c: *Cond) -> Result[bool, CondFault]
         // because the manifest of the file being gated says so, so `feature_x` in a package that
         // declares no `x` is false rather than refused. A dependency's condition has no feature
         // family: `optional` is how a feature turns a dependency on.
+        if !has(c.known, tok.text)
+            instrumentation_message(tok.text, c.source) match
+                Some(message) -> return Err(CondFault(tok.col, message))
+                None -> ()
+
         if c.source && !has(c.known, tok.text) && !is_feature_symbol(tok.text) && !is_option_symbol(tok.text)
             return Err(CondFault(tok.col,
                 s"'${tok.text}' is not something a target says about itself — sysl knows ${listed(c.known)}. A feature this package's manifest declares is named '${feature_symbol(tok.text)}'"))
