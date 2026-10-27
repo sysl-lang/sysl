@@ -232,7 +232,10 @@ private twp_script_available() -> bool = capture("sh", ["-c", "command -v script
 // **The input is delayed by a second, inside the subshell**: anything arriving before the program
 // calls `stty` is handled by a line discipline still in canonical mode and then discarded. BSD
 // `script` takes the command as trailing words, util-linux's through `-c`.
-private twp_on_tty(text: string, typed: string, after: string) -> string
+private twp_on_tty(text: string, typed: string, after: string) -> string = twp_on_tty_after(text, typed, "", after)
+
+// The same, with `before` run in the terminal ahead of the program -- an `stty` that sizes it.
+private twp_on_tty_after(text: string, typed: string, before: string, after: string) -> string
     val root = make_temp_dir("sysl-twp").unwrap()
 
     make_dir_all(root).unwrap()
@@ -241,7 +244,7 @@ private twp_on_tty(text: string, typed: string, after: string) -> string
         Err(why) -> why
         Ok(exe) ->
             write_text(s"$root/typed", typed).unwrap()
-            write_text(s"$root/session.sh", s"$exe\n$after\n").unwrap()
+            write_text(s"$root/session.sh", s"$before\n$exe\n$after\n").unwrap()
 
             val bsd = capture("uname", []).map((o) -> o.text.starts_with("Darwin")).unwrap_or(false)
             var under = s"script -qc 'sh $root/session.sh' /dev/null"
@@ -254,7 +257,7 @@ private twp_on_tty(text: string, typed: string, after: string) -> string
 
     remove_dir_all(root).unwrap_or(())
     out
-end twp_on_tty
+end twp_on_tty_after
 
 // The claim of a terminal case: what the terminal showed holds every one of `wants`. `script` adds
 // its own noise, so the claim is containment rather than equality.
@@ -333,3 +336,40 @@ twp_y_the_terminal_is_put_back()
 
     twp_tty_shows("import sysl.posix.tty.{raw, cooked}\n\nif raw() then cooked()\n", "",
                   raw"stty -a | tr ' ' '\n' | grep -c '^-echo$'", ["0"])
+
+// -- the size of the window ---------------------------------------------------------------------------
+
+@test("window_size() is None for a pipe, and for a descriptor that is not open")
+twp_y_no_window_without_a_terminal()
+    if !twp_ready() then return
+
+    twp_prints(twp_tty("print(size(), window_size(0), window_size(2), window_size(97))"), "None None None None\n")
+
+// The terminal `script` makes is sized by the `stty` run in it first, so each half of the packed answer
+// is checked against a number that could not come from the other: rows and columns swapped, or one of
+// them truncated, reads as a different pair.
+@test("and on a terminal it is the rows and columns the terminal was given")
+twp_y_the_window_size_of_a_terminal()
+    if !twp_ready() then return
+
+    if !twp_script_available()
+        print("skipped: there is no 'script' on this machine to make a terminal with")
+        return
+
+    val shown = twp_on_tty_after("import sysl.posix.tty.{size, window_size}\n\nprint(\"size:\", size(), window_size(0) == size())\n",
+                                 "", "stty rows 37 cols 211", "")
+
+    assert(shown.contains("size: Some(WindowSize(rows: 37, cols: 211)) true"), shown)
+
+// A pseudo-terminal nobody sized says zero by zero, which is no size to draw into.
+@test("and a terminal that reports no size has none")
+twp_y_an_unsized_terminal_has_no_size()
+    if !twp_ready() then return
+
+    if !twp_script_available()
+        print("skipped: there is no 'script' on this machine to make a terminal with")
+        return
+
+    val shown = twp_on_tty_after("import sysl.posix.tty.size\n\nprint(\"size:\", size())\n", "", "stty rows 0 cols 0", "")
+
+    assert(shown.contains("size: None"), shown)

@@ -1,0 +1,955 @@
+module sh.sysl.compiler
+
+import sh.sysl.hocon.path_text
+import sysl.buf.{Buf, buf}
+import sysl.text.{char_columns, join, str_builder, Search}
+
+// `sysl config` on a terminal: the menu over the root project's view (`docs/design/manifest-0.5.md §
+// 5.2`). Each dependency the project names is a branch, with its choices as radio buttons, its
+// features as check boxes, and its options under the feature they belong to.
+//
+// **The menu is a front over the subcommands, and this file is all of it but the terminal.** A key
+// moves a cursor or makes a change, and **every change is one or more `sysl config` command lines**,
+// carried out on the manifest's text by `config_edited` -- the very function the command line runs --
+// so the menu and the subcommands cannot drift. The state, the keys and the drawing are plain values
+// here; `config_menu_term.sysl` reads the keyboard, draws the lines, and writes the file.
+//
+// **What the menu shows comes from a resolved graph, and what it changes is the root's entries.** A
+// feature on is what the graph turned on, whoever asked for it; an edit writes only the project's own
+// `features` list, its `default_features`, and its `options` for that dependency. A feature that is
+// on for a reason the entry cannot take back -- another feature enables it, another package asks for
+// it -- is refused with that reason rather than written into a file that would not change the build.
+
+// -- what the menu is drawn from ------------------------------------------------------------------------
+
+// One dependency of the root project, as the graph resolved it.
+struct MenuPackage
+    // The entry's label, and the block it is written in.
+    label: string
+    block: string
+
+    // How the tree names it: `tinyusb 0.1.0`.
+    heading: string
+
+    // Its own manifest, which declares its features, choices and options.
+    manifest: Manifest
+
+    // The features the graph turned on for it.
+    on: Buf[string]
+
+    // Each option at the value the build settled on.
+    settled: Buf[SettledOption]
+
+    // The root's entry for it, as the root's manifest reads now.
+    entry: Dependency
+
+    // The features whose `if` fails on the menu's machine, each with that `if`.
+    unavailable: Buf[(string, string)]
+end MenuPackage
+
+// The whole view: the title line and each dependency.
+struct MenuView
+    // `app 0.1.0`.
+    project: string
+
+    // The machine the `if`s are evaluated against.
+    target: string
+
+    packages: Buf[MenuPackage]
+end MenuView
+
+// One line of the tree.
+enum MenuRow
+    // A dependency's heading.
+    RowPackage(p: usize)
+
+    // A choice: its members side by side.
+    RowChoice(p: usize, c: usize)
+
+    // A feature that is no choice's member.
+    RowFeature(p: usize, name: string)
+
+    // An option, by its index among the package's declared options.
+    RowOption(p: usize, o: usize)
+end MenuRow
+
+// A key, as the menu reads it. The terminal driver turns bytes into these.
+enum MenuKey
+    MkChar(c: char)
+    MkEnter
+    MkEscape
+    MkBackspace
+    MkTab
+    MkUp
+    MkDown
+    MkLeft
+    MkRight
+    MkHome
+    MkEnd
+    MkPageUp
+    MkPageDown
+    MkCtrl(c: char)
+end MenuKey
+
+// What the keys are doing: moving about, typing a search, or typing an option's value.
+enum MenuMode
+    Browsing
+    Searching
+    Editing
+end MenuMode
+
+// The menu's whole state.
+struct Menu
+    view: MenuView
+
+    // The root manifest as it stands -- what every change is carried out on.
+    text: string
+
+    rows: Buf[MenuRow]
+
+    // The row the cursor is on, the member of a choice row it is on, and the first row shown.
+    at: usize
+    member: usize
+    top: usize
+
+    mode: MenuMode
+
+    // What is being typed: a search, or an option's value.
+    typed: Buf[char]
+
+    // The last search, which `n` repeats.
+    query: string
+
+    // The line under the tree: what was done, a refusal, or a `doc`.
+    message: string
+
+    quit: bool
+end Menu
+
+// What one key changed in the manifest: the command lines, each as the words after `sysl config`, the
+// text after all of them, and what they said. No lines where the key changed nothing in the file.
+struct MenuStep
+    edits: Buf[Buf[string]]
+    text: string
+    said: Buf[string]
+end MenuStep
+
+private no_step(text: string) -> MenuStep = MenuStep(buf(), text, buf())
+
+// A menu over a view, with the cursor on the first row.
+menu_of(view: MenuView, text: string) -> Menu
+    val rows = menu_rows(view)
+
+    Menu(view, text, rows, 0, 0, 0, Browsing, buf(), "", "", false)
+end menu_of
+
+// The menu after the manifest changed: the new view, with the cursor kept on the row it was on where
+// that row is still there.
+menu_refreshed(m: Menu, view: MenuView, text: string) -> Menu
+    var out = m
+    val was = if m.at < m.rows.len() then Some(m.rows.at(m.at)) else None
+
+    out.view = view
+    out.text = text
+    out.rows = menu_rows(view)
+    out.at = 0
+
+    was match
+        None -> ()
+        Some(row) ->
+            for i in 0..<out.rows.len()
+                if same_row(out.rows.at(i), row) then out.at = i
+
+    if out.at >= out.rows.len() then out.at = 0
+
+    out
+end menu_refreshed
+
+private same_row(a: MenuRow, b: MenuRow) -> bool
+    a match
+        RowPackage(p) -> b match
+            RowPackage(q) -> p == q
+            _ -> false
+        RowChoice(p, c) -> b match
+            RowChoice(q, d) -> p == q && c == d
+            _ -> false
+        RowFeature(p, name) -> b match
+            RowFeature(q, other) -> p == q && name == other
+            _ -> false
+        RowOption(p, o) -> b match
+            RowOption(q, k) -> p == q && o == k
+            _ -> false
+end same_row
+
+// The rows of a view, in the order they are drawn: each package's heading, its choices, its own
+// options, then each feature with the options declared inside it.
+menu_rows(view: MenuView) -> Buf[MenuRow]
+    var out: Buf[MenuRow] = buf()
+
+    for p in 0..<view.packages.len()
+        val pkg = view.packages.at(p)
+        val m = pkg.manifest
+
+        out.push(RowPackage(p))
+
+        for c in 0..<m.choices.len()
+            out.push(RowChoice(p, c))
+
+        for o in 0..<m.options.len()
+            if m.options.at(o).feature == "" then out.push(RowOption(p, o))
+
+        for f in m.features
+            if f.0 == "default" || member_of_choice(m, f.0) then continue
+
+            out.push(RowFeature(p, f.0))
+
+            for o in 0..<m.options.len()
+                if m.options.at(o).feature == f.0 then out.push(RowOption(p, o))
+
+    out
+end menu_rows
+
+private member_of_choice(m: &Manifest, name: string) -> bool
+    for c in m.choices
+        if holds_string(c.of, name) then return true
+
+    false
+end member_of_choice
+
+// -- what a row says ---------------------------------------------------------------------------------------
+
+// Why a feature cannot be on for the menu's machine, or `""` where it can.
+private unavailable_why(view: &MenuView, pkg: &MenuPackage, name: string) -> string
+    for item in pkg.unavailable
+        if item.0 == name then return s"not this machine's: its 'if' is '${item.1}', which does not hold on '${view.target}'"
+
+    ""
+end unavailable_why
+
+private is_on(pkg: &MenuPackage, name: string) -> bool = holds_string(pkg.on, name)
+
+// An option's name as its feature's row shows it: `rx_buffer` rather than `cdc.rx_buffer`.
+private option_short(opt: &PackageOption) -> string
+    if opt.feature == "" then return opt.name
+
+    opt.name[(opt.feature.bytes.len + 1)..<opt.name.bytes.len]
+end option_short
+
+// The value an option is built with now.
+private option_value(pkg: &MenuPackage, opt: &PackageOption) -> string
+    for s in pkg.settled
+        if s.name == opt.name then return s.literal
+
+    opt.default
+end option_value
+
+// Whether the project's entry sets an option.
+private set_by_root(pkg: &MenuPackage, name: string) -> bool
+    for item in pkg.entry.options
+        if item.0 == name then return true
+
+    false
+end set_by_root
+
+// What an option allows: its range, or its values.
+private option_allows(opt: &PackageOption) -> string
+    opt.range match
+        Some(r) -> return s" (${shown_integer(r.0)}..${shown_integer(r.1)})"
+        None -> ()
+
+    if !opt.values.is_empty() then return s" (${join(opt.values.view(), " | ")})"
+
+    ""
+end option_allows
+
+private shown_integer(d: WrittenInteger) -> string = if d.negative then "-" + d.digits else d.digits
+
+// One row's text, without the tree's lines in front of it, and whether it is greyed.
+private row_text(menu: *Menu, row: MenuRow, selected: bool) -> (string, bool)
+    val view = menu.view
+
+    row match
+        RowPackage(p) -> (view.packages.at(p).heading, false)
+        RowChoice(p, c) ->
+            val pkg = view.packages.at(p)
+            val ch = pkg.manifest.choices.at(c)
+            var parts: Buf[string] = buf()
+            var shut: Buf[string] = buf()
+
+            for i in 0..<ch.of.len()
+                val name = ch.of.at(i)
+                val mark = if is_on(pkg, name) then "(•)" else "( )"
+                val here = if selected && i == menu.member then ">" else " "
+
+                parts.push(s"$here$mark $name")
+
+                if unavailable_why(view, pkg, name) != "" then shut.push(name)
+
+            var text = s"${ch.name}  ${join(parts.view(), " ")}"
+
+            if !shut.is_empty() then text = text + s" — ${join(shut.view(), ", ")} not this machine's"
+
+            (text, false)
+        RowFeature(p, name) ->
+            val pkg = view.packages.at(p)
+            val mark = if is_on(pkg, name) then "[x]" else "[ ]"
+            val why = unavailable_why(view, pkg, name)
+
+            if why != "" then (s"$mark $name — not this machine's", true) else (s"$mark $name", false)
+        RowOption(p, o) ->
+            val pkg = view.packages.at(p)
+            val opt = pkg.manifest.options.at(o)
+            val off = opt.feature != "" && !is_on(pkg, opt.feature)
+            var text = s"${option_short(opt)}  ${option_value(pkg, opt)}${option_allows(opt)}"
+
+            if set_by_root(pkg, opt.name) then text = text + s" — set by this project, default ${opt.default}"
+            if off then text = text + s" — off with '${opt.feature}'"
+
+            (text, off)
+end row_text
+
+// How deep a row sits, and whether it is the last of its siblings -- what the tree's lines need.
+private row_shape(menu: *Menu, i: usize) -> (usize, bool)
+    val rows = menu.rows
+
+    rows.at(i) match
+        RowPackage(p) -> (0, p + 1 == menu.view.packages.len())
+        RowOption(p, o) ->
+            val opt = menu.view.packages.at(p).manifest.options.at(o)
+
+            if opt.feature != ""
+                val last = i + 1 >= rows.len() || !is_option_of(rows.at(i + 1), opt.feature, menu.view)
+
+                return (2, last)
+
+            (1, i + 1 >= rows.len() || next_sibling_ends(rows, i))
+        _ -> (1, i + 1 >= rows.len() || next_sibling_ends(rows, i))
+end row_shape
+
+private is_option_of(row: MenuRow, feature: string, view: &MenuView) -> bool = row match
+    RowOption(p, o) -> view.packages.at(p).manifest.options.at(o).feature == feature
+    _ -> false
+
+// Whether no row after `i` at the same depth comes before the next package.
+private next_sibling_ends(rows: Buf[MenuRow], i: usize) -> bool
+    var j = i + 1
+
+    while j < rows.len()
+        rows.at(j) match
+            RowPackage(_) -> return true
+            RowFeature(_, _) -> return false
+            RowChoice(_, _) -> return false
+            RowOption(_, _) -> ()
+
+        j += 1
+
+    true
+end next_sibling_ends
+
+// The tree's lines in front of each row: `├─ `, `└─ `, and `│   ` under a branch that goes on.
+private row_prefixes(menu: *Menu) -> Buf[string]
+    var out: Buf[string] = buf()
+    var outer = " "
+    var middle = ""
+
+    for i in 0..<menu.rows.len()
+        val (depth, last) = row_shape(menu, i)
+        val joint = if last then "└─ " else "├─ "
+
+        if depth == 0
+            out.push(" " + joint)
+            outer = if last then "    " else " │  "
+        elif depth == 1
+            out.push(outer + joint)
+            middle = if last then "    " else "│   "
+        else
+            out.push(outer + middle + joint)
+
+    out
+end row_prefixes
+
+// -- drawing ------------------------------------------------------------------------------------------------
+
+// The screen, as `height` lines no wider than `width` columns: the title, as many rows of the tree as
+// fit with the cursor's row among them, and the line under it. **Plain text where `styled` is false**,
+// which is what a test reads; otherwise the cursor's row is reversed and a greyed row dimmed.
+menu_lines(menu: *Menu, width: usize, height: usize, styled: bool) -> Buf[string]
+    var out: Buf[string] = buf()
+    val title = s" ${menu.view.project} — ${menu.view.target}"
+    val keys = "[ / ] search  [ ? ] doc  [ q ] quit "
+    val title_cols = text_columns(title)
+    val keys_cols = text_columns(keys)
+    val gap = if width > title_cols + keys_cols then width - title_cols - keys_cols else 1
+
+    out.push(clipped(title + spaces(gap) + keys, width))
+
+    val shown = if height > 2 then height - 2 else 1
+
+    if menu.at < menu.top then menu.top = menu.at
+    if menu.at >= menu.top + shown then menu.top = menu.at + 1 - shown
+
+    val prefixes = row_prefixes(menu)
+    var i = menu.top
+
+    while i < menu.rows.len() && i < menu.top + shown
+        val selected = i == menu.at
+        val (text, grey) = row_text(menu, menu.rows.at(i), selected)
+        val line = clipped(prefixes.at(i) + text, width)
+
+        if styled && selected then out.push("\u{1b}[7m" + line + "\u{1b}[0m")
+        elif styled && grey then out.push("\u{1b}[2m" + line + "\u{1b}[0m")
+        else out.push(line)
+
+        i += 1
+
+    while out.len() < height - 1
+        out.push("")
+
+    out.push(clipped(status_line(menu), width))
+    out
+end menu_lines
+
+// What the last line says: what is being typed, or the message.
+private status_line(menu: *Menu) -> string
+    val typed = typed_text(menu)
+
+    menu.mode match
+        Searching -> s" /$typed"
+        Editing -> s" ${editing_name(menu)} = $typed"
+        Browsing -> if menu.message.is_empty() then "" else " " + menu.message
+end status_line
+
+private editing_name(menu: *Menu) -> string = current_row(menu) match
+    Some(RowOption(p, o)) -> menu.view.packages.at(p).manifest.options.at(o).name
+    _ -> ""
+
+private typed_text(menu: *Menu) -> string
+    var b = str_builder()
+
+    for c in menu.typed do b.push_char(c)
+
+    b.finish()
+end typed_text
+
+private text_columns(text: string) -> usize
+    var n: usize = 0
+
+    for c in text.chars do n += char_columns(c)
+
+    n
+end text_columns
+
+// A line cut to `width` columns.
+private clipped(text: string, width: usize) -> string
+    var b = str_builder()
+    var n: usize = 0
+
+    for c in text.chars
+        val w = char_columns(c)
+
+        if n + w > width then break
+
+        b.push_char(c)
+        n += w
+
+    b.finish()
+end clipped
+
+private spaces(n: usize) -> string
+    var b = str_builder()
+
+    for _ in 0..<n do b.push_char(' ')
+
+    b.finish()
+end spaces
+
+private current_row(menu: *Menu) -> Option[MenuRow] =
+    if menu.at < menu.rows.len() then Some(menu.rows.at(menu.at)) else None
+
+// -- keys -----------------------------------------------------------------------------------------------------
+
+// One key, and what it changed in the manifest. `page` is how many rows a page is.
+menu_key(menu: *Menu, k: MenuKey, page: usize) -> MenuStep
+    menu.mode match
+        Searching -> return search_key(menu, k)
+        Editing -> return edit_key(menu, k)
+        Browsing -> ()
+
+    menu.message = ""
+
+    k match
+        MkUp -> move_by(menu, -1)
+        MkDown -> move_by(menu, 1)
+        MkPageUp -> move_by(menu, -int(page))
+        MkPageDown -> move_by(menu, int(page))
+        MkHome -> move_to(menu, 0)
+        MkEnd -> move_to(menu, menu.rows.len())
+        MkLeft -> sideways(menu, -1)
+        MkRight -> sideways(menu, 1)
+        MkTab -> sideways(menu, 1)
+        MkEnter -> return activate(menu)
+        MkEscape -> menu.quit = true
+        MkCtrl(c) -> if c == 'c' then menu.quit = true
+        MkChar(c) ->
+            if c == ' ' then return activate(menu)
+            elif c == 'q' then menu.quit = true
+            elif c == 'j' then move_by(menu, 1)
+            elif c == 'k' then move_by(menu, -1)
+            elif c == 'h' then sideways(menu, -1)
+            elif c == 'l' then sideways(menu, 1)
+            elif c == '/'
+                menu.mode = Searching
+                menu.typed = buf()
+            elif c == 'n' then find_next(menu)
+            elif c == '?' then menu.message = row_doc(menu)
+        MkBackspace -> ()
+
+    no_step(menu.text)
+end menu_key
+
+private move_by(menu: *Menu, by: int)
+    val target = int(menu.at) + by
+
+    if target < 0 then move_to(menu, 0) else move_to(menu, usize(target))
+
+private move_to(menu: *Menu, to: usize)
+    if menu.rows.is_empty() then return
+
+    menu.at = if to >= menu.rows.len() then menu.rows.len() - 1 else to
+    menu.member = 0
+
+    // A choice row's cursor starts on the member that is on.
+    current_row(menu) match
+        Some(RowChoice(p, c)) ->
+            val pkg = menu.view.packages.at(p)
+            val ch = pkg.manifest.choices.at(c)
+
+            for i in 0..<ch.of.len()
+                if is_on(pkg, ch.of.at(i)) then menu.member = i
+        _ -> ()
+end move_to
+
+// Left and Right move along a choice's members.
+private sideways(menu: *Menu, by: int)
+    current_row(menu) match
+        Some(RowChoice(p, c)) ->
+            val n = menu.view.packages.at(p).manifest.choices.at(c).of.len()
+            val target = int(menu.member) + by
+
+            if target >= 0 && target < int(n) then menu.member = usize(target)
+        _ -> ()
+end sideways
+
+// What `?` shows: the row's `doc`, or that it has none.
+private row_doc(menu: *Menu) -> string
+    val view = menu.view
+
+    current_row(menu) match
+        None -> ""
+        Some(row) -> row match
+            RowPackage(p) ->
+                val pkg = view.packages.at(p)
+
+                s"${pkg.label}: written in '${pkg.block}' of this project's manifest"
+            RowChoice(p, c) ->
+                val pkg = view.packages.at(p)
+                val ch = pkg.manifest.choices.at(c)
+                val member = ch.of.at(menu.member)
+                val why = unavailable_why(view, pkg, member)
+                val about = feature_doc(pkg.manifest, member)
+                var text = if ch.doc.is_empty() then s"${ch.name}: no doc" else s"${ch.name}: ${ch.doc}"
+
+                if !about.is_empty() then text = text + s" · $member: $about"
+                if !why.is_empty() then text = text + s" · $member is $why"
+
+                text
+            RowFeature(p, name) ->
+                val pkg = view.packages.at(p)
+                val about = feature_doc(pkg.manifest, name)
+                val why = unavailable_why(view, pkg, name)
+                var text = if about.is_empty() then s"$name: no doc" else s"$name: $about"
+
+                if !why.is_empty() then text = text + s" · $why"
+
+                text
+            RowOption(p, o) ->
+                val opt = view.packages.at(p).manifest.options.at(o)
+                val about = if opt.doc.is_empty() then "no doc" else opt.doc
+
+                s"${opt.name}: $about · ${opt.type_name}, default ${opt.default}${option_allows(opt)}"
+end row_doc
+
+private feature_doc(m: &Manifest, name: string) -> string
+    for info in m.feature_info
+        if info.name == name then return info.doc
+
+    ""
+end feature_doc
+
+// -- searching -------------------------------------------------------------------------------------------------
+
+private search_key(menu: *Menu, k: MenuKey) -> MenuStep
+    k match
+        MkEscape -> menu.mode = Browsing
+        MkCtrl(c) -> if c == 'c' then menu.mode = Browsing
+        MkBackspace -> if !menu.typed.is_empty() then menu.typed.pop()
+        MkEnter ->
+            menu.mode = Browsing
+            menu.query = typed_text(menu)
+            find_next(menu)
+        MkChar(c) -> menu.typed.push(c)
+        _ -> ()
+
+    no_step(menu.text)
+end search_key
+
+// The words a search matches on a row.
+private row_words(menu: *Menu, row: MenuRow) -> string
+    val view = menu.view
+
+    row match
+        RowPackage(p) -> view.packages.at(p).heading + " " + view.packages.at(p).label
+        RowChoice(p, c) ->
+            val ch = view.packages.at(p).manifest.choices.at(c)
+
+            ch.name + " " + join(ch.of.view(), " ")
+        RowFeature(_, name) -> name
+        RowOption(p, o) -> view.packages.at(p).manifest.options.at(o).name
+end row_words
+
+// The cursor to the next row the last search matches, after the one it is on and round to the top.
+private find_next(menu: *Menu)
+    if menu.query.is_empty() || menu.rows.is_empty() then return
+
+    val n = menu.rows.len()
+
+    for step in 1..(n)
+        val i = (menu.at + step) % n
+
+        if row_words(menu, menu.rows.at(i)).contains(menu.query)
+            move_to(menu, i)
+            return
+
+    menu.message = s"nothing matches '${menu.query}'"
+end find_next
+
+// -- changes ---------------------------------------------------------------------------------------------------
+
+// Enter or Space on the cursor's row.
+private activate(menu: *Menu) -> MenuStep
+    current_row(menu) match
+        None -> no_step(menu.text)
+        Some(row) -> row match
+            RowPackage(_) -> no_step(menu.text)
+            RowChoice(p, c) -> pick_member(menu, p, c, menu.member)
+            RowFeature(p, name) -> toggle_feature(menu, p, name)
+            RowOption(p, o) -> start_editing(menu, p, o)
+end activate
+
+// A step that refuses: the message says why, and the manifest is as it was.
+private refusal(menu: *Menu, why: string) -> MenuStep
+    menu.message = why
+    no_step(menu.text)
+end refusal
+
+// The command lines carried out on the manifest, each by `config_edited`, or the first refusal.
+private carried(menu: *Menu, lines: Buf[Buf[string]]) -> MenuStep
+    var text = menu.text
+    var said: Buf[string] = buf()
+
+    for words in lines
+        val c = read_config_command(words.view()) match
+            Err(why) -> return refusal(menu, why)
+            Ok(got) -> got
+
+        config_edited(text, c) match
+            Err(why) -> return refusal(menu, why)
+            Ok(change) ->
+                text = change.text
+
+                for line in change.said
+                    said.push(line)
+
+    menu.text = text
+    menu.message = join(said.view(), "; ")
+    MenuStep(lines, text, said)
+end carried
+
+private words_of(parts: []const string) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for p in parts
+        out.push(p)
+
+    out
+end words_of
+
+// How a feature that is on can be taken out through the project's entry: the `--features` item that
+// does it, the lines that turn the defaults off and ask again for the rest of them, or why it cannot.
+enum MenuOff
+    OffItem(item: string)
+    OffDefaults(lines: Buf[Buf[string]])
+    OffChoiceDefault
+    OffRefused(why: string)
+end MenuOff
+
+private off_plan(pkg: &MenuPackage, name: string, keep: string) -> MenuOff
+    val label = pkg.label
+
+    if holds_string(pkg.entry.features, name) then return OffItem("-" + name)
+
+    for f in pkg.manifest.features
+        if f.0 == "default" || f.0 == name || !is_on(pkg, f.0) then continue
+
+        if holds_string(f.1, name)
+            return OffRefused(s"'$name' of '$label' is on because '${f.0}' enables it — turn '${f.0}' off instead")
+
+    for c in pkg.manifest.choices
+        if c.default_member == name && holds_string(c.of, name) && keep != "" && holds_string(c.of, keep)
+            return OffChoiceDefault
+
+    val defaults = default_list(pkg.manifest)
+
+    if holds_string(defaults, name) && pkg.entry.default_features
+        var lines: Buf[Buf[string]] = buf()
+
+        lines.push(words_of(["set", path_text(segments_of([pkg.block, label, "default_features"])), "false"]))
+
+        var again: Buf[string] = buf()
+
+        for d in defaults
+            if d != name && d != keep && is_on(pkg, d) && !holds_string(pkg.entry.features, d) then again.push("+" + d)
+
+        if keep != "" then again.push("+" + keep)
+
+        if !again.is_empty() then lines.push(words_of(["dep", label, "--features", join(again.view(), ",")]))
+
+        return OffDefaults(lines)
+    end if
+
+    OffRefused(s"'$name' of '$label' is on because another package that depends on '$label' asks for it — " +
+        "this project's entry cannot turn it off")
+end off_plan
+
+// The features a package turns on by default.
+private default_list(m: &Manifest) -> Buf[string]
+    for f in m.features
+        if f.0 == "default" then return f.1
+
+    buf()
+end default_list
+
+private toggle_feature(menu: *Menu, p: usize, name: string) -> MenuStep
+    val pkg = menu.view.packages.at(p)
+    val label = pkg.label
+
+    if !is_on(pkg, name)
+        val why = unavailable_why(menu.view, pkg, name)
+
+        if why != "" then return refusal(menu, s"'$name' of '$label' is $why")
+
+        var lines: Buf[Buf[string]] = buf()
+
+        lines.push(words_of(["dep", label, "--features", "+" + name]))
+        return carried(menu, lines)
+    end if
+
+    off_plan(pkg, name, "") match
+        OffItem(item) ->
+            var lines: Buf[Buf[string]] = buf()
+
+            lines.push(words_of(["dep", label, "--features", item]))
+            carried(menu, lines)
+        OffDefaults(lines) -> carried(menu, lines)
+        OffChoiceDefault -> no_step(menu.text)
+        OffRefused(why) -> refusal(menu, why)
+end toggle_feature
+
+private pick_member(menu: *Menu, p: usize, c: usize, i: usize) -> MenuStep
+    val pkg = menu.view.packages.at(p)
+    val label = pkg.label
+    val ch = pkg.manifest.choices.at(c)
+
+    if i >= ch.of.len() then return no_step(menu.text)
+
+    val name = ch.of.at(i)
+
+    if is_on(pkg, name) then return refusal(menu, s"'$name' is already the '${ch.name}' of '$label'")
+
+    val why = unavailable_why(menu.view, pkg, name)
+
+    if why != "" then return refusal(menu, s"'$name' of '$label' is $why")
+
+    var items: Buf[string] = buf()
+
+    items.push("+" + name)
+
+    for other in ch.of
+        if other == name || !is_on(pkg, other) then continue
+
+        off_plan(pkg, other, name) match
+            OffItem(item) -> items.push(item)
+            OffChoiceDefault -> ()
+            OffDefaults(lines) -> return carried(menu, lines)
+            OffRefused(why) -> return refusal(menu, why)
+
+    var lines: Buf[Buf[string]] = buf()
+
+    lines.push(words_of(["dep", label, "--features", join(items.view(), ",")]))
+    carried(menu, lines)
+end pick_member
+
+// -- options -----------------------------------------------------------------------------------------------------
+
+private start_editing(menu: *Menu, p: usize, o: usize) -> MenuStep
+    val pkg = menu.view.packages.at(p)
+    val opt = pkg.manifest.options.at(o)
+
+    if opt.feature != "" && !is_on(pkg, opt.feature)
+        return refusal(menu, s"the option '${opt.name}' of '${pkg.label}' belongs to the feature " +
+            s"'${opt.feature}', which is off — turn '${opt.feature}' on to set it")
+
+    // A flag has two values, so Enter on one is the other.
+    opt.kind match
+        OptBool ->
+            val now = option_value(pkg, opt)
+
+            return set_option(menu, p, o, if now == "true" then "false" else "true")
+        _ -> ()
+
+    menu.mode = Editing
+    menu.typed = buf()
+
+    for c in option_value(pkg, opt).chars
+        menu.typed.push(c)
+
+    no_step(menu.text)
+end start_editing
+
+private edit_key(menu: *Menu, k: MenuKey) -> MenuStep
+    k match
+        MkEscape -> menu.mode = Browsing
+        MkCtrl(c) -> if c == 'c' then menu.mode = Browsing
+        MkBackspace -> if !menu.typed.is_empty() then menu.typed.pop()
+        MkEnter ->
+            menu.mode = Browsing
+
+            current_row(menu) match
+                Some(RowOption(p, o)) -> return set_option(menu, p, o, typed_text(menu).trim())
+                _ -> ()
+        MkChar(c) -> menu.typed.push(c)
+        _ -> ()
+
+    no_step(menu.text)
+end edit_key
+
+// An option given a value: `dep <label> --set <name>=<value>`, **held to the option's declaration
+// before anything is written** -- its type, its range, its values -- with the refusal the build
+// would give for the same entry.
+private set_option(menu: *Menu, p: usize, o: usize, value: string) -> MenuStep
+    val pkg = menu.view.packages.at(p)
+    val opt = pkg.manifest.options.at(o)
+    val label = pkg.label
+
+    if value.is_empty() then return refusal(menu, s"the option '${opt.name}' of '$label' needs a value")
+
+    if value == option_value(pkg, opt) && set_by_root(pkg, opt.name)
+        return refusal(menu, s"'${opt.name}' of '$label' is already $value")
+
+    val words = words_of(["dep", label, "--set", s"${opt.name}=$value"])
+    val c = read_config_command(words.view()) match
+        Err(why) -> return refusal(menu, why)
+        Ok(got) -> got
+
+    val change = config_edited(menu.text, c) match
+        Err(why) -> return refusal(menu, why)
+        Ok(got) -> got
+
+    match_written(change.text, pkg.block, label, opt) match
+        Some(why) -> return refusal(menu, s"this project sets the option '${opt.name}' of '$label' to $why")
+        None -> ()
+
+    var lines: Buf[Buf[string]] = buf()
+
+    lines.push(words)
+    carried(menu, lines)
+end set_option
+
+// What is wrong with the value an entry now gives an option, or `None` where it is one the option takes.
+private match_written(text: string, block: string, label: string, opt: PackageOption) -> Option[string]
+    val m = read_manifest(text) match
+        Err(why) -> return Some(why)
+        Ok(got) -> got
+
+    val deps = if block == "dev_dependencies" then m.dev_dependencies else m.dependencies
+
+    for dep in deps
+        if dep.label != label then continue
+
+        for item in dep.options
+            if item.0 != opt.name then continue
+
+            option_literal(opt.kind, opt.type_name, opt.range, opt.values, item.1) match
+                Err(why) -> return Some(why)
+                Ok(_) -> return None
+
+    None
+end match_written
+
+// -- the view, from a resolved graph ------------------------------------------------------------------------------
+
+// What the menu shows for a project whose manifest reads `text`, resolved for `t`. The graph says what
+// is on and what each option is; the root's entries say who set what.
+menu_view_of(dir: string, text: string, t: Target) -> Result[MenuView, string]
+    val m = read_manifest(text)?
+
+    use_resolution_machine(Some(as_declared(m, t)))
+
+    val g = resolved_graph(dir, m) match
+        Err(r) -> return Err(r.message)
+        Ok(got) -> got
+
+    var packages: Buf[MenuPackage] = buf()
+
+    for dep in m.dependencies
+        if !present_here(dep) then continue
+
+        menu_package(dir, g, dep, "dependencies") match
+            Some(pkg) -> packages.push(pkg)
+            None -> ()
+
+    val project = if m.version.is_empty() then m.name else s"${m.name} ${m.version}"
+
+    Ok(MenuView(if project.is_empty() then "this project" else project, t.name, packages))
+end menu_view_of
+
+private menu_package(dir: string, g: &Graph, dep: Dependency, block: string) -> Option[MenuPackage]
+    for p in g.packages
+        if is_root_package(p) || !menu_names(dir, dep, p) then continue
+
+        val name = if p.manifest.name.is_empty() then dep.label else p.manifest.name
+        val version = p.version match
+            Some(v) -> release_shown(v)
+            None -> p.manifest.version
+
+        var unavailable: Buf[(string, string)] = buf()
+
+        for info in p.manifest.feature_info
+            if !machine_holds(info.condition) then unavailable.push((info.name, info.condition))
+
+        val heading = if version.is_empty() then name else s"$name $version"
+
+        return Some(MenuPackage(dep.label, block, heading, p.manifest, enabled_of(g.features, p.canonical),
+                                settled_options_of(g.settled, p.canonical), dep, unavailable))
+
+    None
+end menu_package
+
+// Whether a resolved package is the one a root entry names.
+private menu_names(dir: string, dep: &Dependency, p: &ResolvedPackage) -> bool
+    if dependency_canonical(dep) == p.canonical then return true
+
+    dependency_dir(dep) match
+        Some(d) -> absolute_path(join_path(dir, d)) == absolute_path(p.root) || absolute_path(d) == absolute_path(p.root)
+        None -> false
+end menu_names

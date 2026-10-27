@@ -114,6 +114,11 @@ private codegen_into(e: *Emit, p: TProgram, t: Target, pr: Promotions,
     val lazy = p.entry_point
     var pending: Buf[PendingEntry] = buf()
 
+    // The `self` methods a table reaches, whose bodies are emitted to take the table's word
+    // (`emit_vtable.sysl`'s `split_self`). A precompiled function's copy is left whole: the
+    // artifact's table is the one that reaches its body.
+    val self_bodies = self_forms(e, p)
+
     // A `@ghost` function is not emitted at all: nothing executable may call one, and the clauses
     // that may are the ones a body never reaches.
     for i in 0..<p.funcs.len()
@@ -130,7 +135,8 @@ private codegen_into(e: *Emit, p: TProgram, t: Target, pr: Promotions,
                 Some(built) ->
                     for whole in owned_split(e, f, built, lazy, false, pending)
                         for item in split_disjoint(f, whole)
-                            funcs.push(item)
+                            for part in split_self(e, f, item, self_bodies)
+                                funcs.push(part)
                 None -> gaps.push((f.name, gap_text(e)))
         elif imports && importable(f) && only.map((names) -> names.has(f.name)).unwrap_or(true)
             set_promoted(e, pr, f.name)

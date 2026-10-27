@@ -1,0 +1,207 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{remove_dir_all, write_text}
+import sysl.text.{join, split, Search}
+
+// A directory that holds C and no sysl is deliberately not a module: a benchmark built by hand, test
+// programs a script compiles. The warning such a directory draws names the `exclude` entry that says
+// so, and following it ends the warning (`reference/packages.md § Directories a walk leaves out`).
+//
+// The axes: where the directory is (the root's child, nested, two siblings of which one is listed),
+// what it holds (C only, or a real module too), the manifest's file name, whose manifest lists it (the
+// project's or a dependency's), and the key's shape (a list of paths, or something else). The glob
+// cell is `txd_bad_paths_are_refused`'s: an entry is a plain path, and `*` is refused.
+
+private const NamMain: string = "module geom\n\ndouble(n: int) -> int = n * 2\n"
+private const NamC: string = "int bench_main(void) { return 0; }\n"
+private const NamHead: string = "package { name = \"nam-pkg\", version = \"1.0.0\" }\n"
+
+// A package with one module, the manifest `head + extra` under `file`, and the files given.
+private nam_tree(file: string, extra: string, files: []string) -> string
+    var all: Buf[string] = buf()
+
+    all.push(file)
+    all.push(NamHead + extra)
+    all.push("geom/geom.sysl")
+    all.push(NamMain)
+
+    for i in 0..<files.len
+        all.push(files[i])
+
+    pkc_tree("sysl-nam", all.view())
+end nam_tree
+
+private nam_package(extra: string, files: []string) -> string = nam_tree("sysl.hocon", extra, files)
+
+private nam_drop(root: string) = remove_dir_all(root).unwrap_or(())
+
+// The entry a warning tells its reader to add: the text between `add "` and the next `"`.
+private nam_hint(warning: string) -> string
+    val words = split(warning, "add \"")
+
+    if words.len < 2 then return s"no hint in: $warning"
+
+    split(words[1], "\"")[0]
+end nam_hint
+
+private nam_manifest(text: string) -> string
+    read_manifest(NamHead + text) match
+        Ok(m) -> join(m.exclude.view(), ",")
+        Err(why) -> why
+
+// -- the warning names the entry ------------------------------------------------------------------------
+
+@test("the warning names the entry to add, as a path from the root, and the manifest's file")
+nam_the_warning_names_the_entry()
+    val root = nam_package("", ["bench/rt.c", NamC])
+    val said = stray_c_warnings(root)
+
+    nam_drop(root)
+    assert_eq(said.len(), 1)
+    assert(said.at(0).ends_with("; add \"bench\" to 'exclude' in sysl.hocon if that is intended"), said.at(0))
+
+@test("and following it ends the warning, leaving nothing named as stale")
+nam_following_the_hint_silences_it()
+    val root = nam_package("", ["bench/rt.c", NamC])
+    val entry = nam_hint(stray_c_warnings(root).at(0))
+
+    write_text(s"$root/sysl.hocon", NamHead + s"exclude = [\"$entry\"]\n").unwrap()
+
+    val said = stray_c_warnings(root)
+    val stale = exclude_warnings(root)
+
+    nam_drop(root)
+    assert_eq(entry, "bench")
+    assert_eq(said.len(), 0)
+    assert_eq(stale.len(), 0)
+
+@test("a nested directory's hint is its whole path, and listing one of two siblings leaves the other warned of")
+nam_nested_directories()
+    val root = nam_package("", ["tests/linux/a.c", NamC, "tests/qemu/b.c", NamC])
+    var hints: Buf[string] = buf()
+
+    for w in stray_c_warnings(root)
+        hints.push(nam_hint(w))
+
+    write_text(s"$root/sysl.hocon", NamHead + "exclude = [\"tests/linux\"]\n").unwrap()
+
+    val one = stray_c_warnings(root)
+
+    write_text(s"$root/sysl.hocon", NamHead + "exclude = [\"tests/linux\", \"tests/qemu\"]\n").unwrap()
+
+    val none = stray_c_warnings(root)
+
+    nam_drop(root)
+    assert_eq(join(hints.view(), " "), "tests/linux tests/qemu")
+    assert_eq(one.len(), 1)
+    assert_eq(nam_hint(one.at(0)), "tests/qemu")
+    assert_eq(none.len(), 0)
+
+@test("a project whose manifest is package.hocon is told to edit package.hocon")
+nam_the_legacy_file_name()
+    val root = nam_tree("package.hocon", "", ["bench/rt.c", NamC])
+    val said = stray_c_warnings(root)
+
+    nam_drop(root)
+    assert_eq(said.len(), 1)
+    assert(said.at(0).contains("to 'exclude' in package.hocon"), said.at(0))
+
+// -- what an excluded directory is ------------------------------------------------------------------------
+
+@test("an excluded directory holding a real module is not one, says nothing, and its C is not compiled")
+nam_an_excluded_module_is_not_one()
+    val root = nam_package("exclude = [\"bench\"]\n",
+                           ["bench/bench.sysl", "module bench\n\nrun() -> int = 1\n", "bench/rt.c", NamC])
+    var dirs: Buf[string] = buf()
+
+    collect(root, Some(host_target().os)) match
+        Err(e) -> dirs.push(e.message)
+        Ok(found) ->
+            for item in found
+                dirs.push(join(item.dir.view(), "/"))
+
+    val carried = c_sources(root, Some(host_target().os)).unwrap_or(buf())
+    val said = stray_c_warnings(root)
+    val stale = exclude_warnings(root)
+
+    nam_drop(root)
+    assert_eq(join(dirs.view(), " "), "geom")
+    assert_eq(carried.len(), 0)
+    assert_eq(said.len(), 0)
+    assert_eq(stale.len(), 0)
+
+@test("without the entry the same module is compiled, and its C with it")
+nam_an_unexcluded_module_is_one()
+    val root = nam_package("", ["bench/bench.sysl", "module bench\n\nrun() -> int = 1\n", "bench/rt.c", NamC])
+    var dirs: Buf[string] = buf()
+
+    collect(root, Some(host_target().os)) match
+        Err(e) -> dirs.push(e.message)
+        Ok(found) ->
+            for item in found
+                dirs.push(join(item.dir.view(), "/"))
+
+    val carried = c_sources(root, Some(host_target().os)).unwrap_or(buf())
+    val said = stray_c_warnings(root)
+
+    nam_drop(root)
+    assert_eq(join(dirs.view(), " "), "bench geom")
+    assert_eq(carried.len(), 1)
+    assert_eq(said.len(), 0)
+
+@test("an entry naming a file rather than a directory is stale, and the file's directory is still warned of")
+nam_an_entry_naming_a_file_is_stale()
+    val root = nam_package("exclude = [\"bench/rt.c\"]\n", ["bench/rt.c", NamC])
+    val stale = exclude_warnings(root)
+    val said = stray_c_warnings(root)
+
+    nam_drop(root)
+    assert_eq(stale.len(), 1)
+    assert(stale.at(0).contains("'exclude' names 'bench/rt.c', which is not a directory"), stale.at(0))
+    assert_eq(said.len(), 1)
+
+// -- whose list it is -------------------------------------------------------------------------------------
+
+@test("a dependency's entry leaves out its own directory and not the consumer's of the same name")
+nam_a_dependencys_entry_is_its_own()
+    val dep = nam_package("exclude = [\"bench\"]\n", ["bench/rt.c", NamC])
+    val app = pkc_tree("sysl-nam-app", ["sysl.hocon",
+                                         s"package { name = \"app\", version = \"0.1.0\" }\ndependencies { g { path = \"$dep\" } }\n",
+                                         "main.sysl", "print(geom.double(21))\n",
+                                         "bench/rt.c", NamC])
+    val mine = stray_c_warnings(app)
+    val theirs = stray_c_warnings(dep)
+
+    nam_drop(app)
+    nam_drop(dep)
+    assert_eq(mine.len(), 1)
+    assert_eq(nam_hint(mine.at(0)), "bench")
+    assert_eq(theirs.len(), 0)
+
+// -- the key's shape ---------------------------------------------------------------------------------------
+
+@test("a number, a boolean, a nested list and a block in the list are refused")
+nam_the_wrong_shape_is_refused()
+    val bad = "'exclude' is not a list of directories"
+
+    assert(nam_manifest("exclude = 3").contains(bad), "number")
+    assert(nam_manifest("exclude = [true]").contains(bad), "boolean")
+    assert(nam_manifest("exclude = [[\"bench\"]]").contains(bad), "nested list")
+    assert(nam_manifest("exclude = [{ dir = \"bench\" }]").contains(bad), "block")
+    assert_eq(nam_manifest("exclude = [\"bench\", \"tests/linux\"]"), "bench,tests/linux")
+
+@test("an edit by 'sysl config' leaves the list byte for byte as written")
+nam_config_keeps_the_list()
+    val text = NamHead + "// hand-built C, not part of the build\nexclude = [ \"./bench/\",  \"tests/linux\" ]\n"
+    val words: []string = ["dep", "add", "github.com/sysl-lang/fat@0.1.0"]
+    val edited = read_config_command(words) match
+        Err(why) -> why
+        Ok(c) -> config_edited(text, c) match
+            Ok(change) -> change.text
+            Err(why) -> s"refused: $why"
+
+    assert(edited.starts_with(text), edited)
+    assert(edited.contains("fat"), edited)
+    assert_eq(nam_manifest("exclude = [ \"./bench/\",  \"tests/linux\" ]"), "bench,tests/linux")
