@@ -840,6 +840,40 @@ struct copies that struct into the arm. A binding does **not** copy the object b
 payload: that payload is a reference, and copying it retains the object rather than duplicating it,
 as described under *Refcounts survive destructuring* above.
 
+### Changing state held in an `Option`
+
+State kept in an `Option[Recorder]` cannot be changed through the binding: the binding holds a copy,
+and a write to it is [refused](#a-binding-a-match-makes-is-written-once). Hold the state as an
+`Option[&Recorder]` instead. The binding then copies the reference, so a write through it reaches
+the object, and the change is still there after the `if` ends. A type with a `Drop` is held as a
+`&T` already, so a file or a volume kept in an `Option` takes this form without any change.
+
+```sysl
+struct Recorder
+    frames: int
+    bytes: int
+
+var current: Option[&Recorder] = Some(Recorder(0, 0))
+
+record(n: int)
+    if current is Some(rec)
+        rec.frames += 1
+        rec.bytes += n
+
+record(512)
+record(256)
+
+if current is Some(rec)
+    print("frames:", rec.frames, "bytes:", rec.bytes)
+```
+
+```output
+frames: 2 bytes: 768
+```
+
+Nothing is assigned back into the `Some`. To replace the object, or to empty the `Option`, assign
+to `current` itself.
+
 ---
 
 Next: [memory](/reference/memory/).
