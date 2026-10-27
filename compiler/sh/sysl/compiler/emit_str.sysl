@@ -390,18 +390,13 @@ gen_render(e: *Emit, value: TExpr, method: string, spec: TExpr, vslot: Option[in
 
     val table = buffer_table(e)
 
-    // **A receiver passed by address crosses as the address of storage nothing can change during the
-    // call** (`indirect_arg`), exactly as it does at any other call -- its parameter is a pointer, so
-    // producing it as a first-class aggregate and handing that over instead puts the struct's first
-    // word where the callee reads an address. The spec is worked out after it, so a local the spec
-    // assigns is not still (`held_unless`).
-    val big = e.layout.by_address(texpr_type(value))
+    // **A large receiver crosses as the address of storage nothing can change during the call**
+    // (`indirect_arg`), exactly as it does at any other call -- a value past the indirect boundary is
+    // passed and received through memory, so its parameter is a pointer. Producing it as a first-class aggregate and handing that over
+    // instead puts the struct's first word where the callee reads an address.
+    val big = e.layout.indirect(texpr_type(value))
     val lent = changes_nothing(spec) && lends_in_place(e, method, texpr_type(value))
-    var after: Buf[TExpr] = buf()
-
-    after.push(spec)
-
-    val v = if big then indirect_arg(e, value, held_unless(e, value, written_by(after)) || lent)
+    val v = if big then indirect_arg(e, value, held(e, value) || lent)
     else gen_expr(e, value)
     val s = gen_expr(e, spec)
     val slot_lty = buffer_lty(e)
@@ -444,7 +439,7 @@ gen_render(e: *Emit, value: TExpr, method: string, spec: TExpr, vslot: Option[in
             VGlobal(symbol_of(e, method))
 
     args.push(ir_arg(l_fat(), w))
-    args.push(operand_arg(e, texpr_type(spec), s))
+    args.push(ir_arg(lty(e, texpr_type(spec)), s))
     emit(e, ir_call(None, LVoid, callee, args))
 
     val r = fresh_reg(e)

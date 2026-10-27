@@ -155,39 +155,6 @@ private whole_range_width(t: Type) -> Option[int] = bitfield_width(t) match
 // The most bytes a value may be handed to a function in before it goes by address instead.
 const DirectBytes: usize = 128
 
-// The most bytes an aggregate crosses a call between two sysl functions in as a value
-// (`TargetLayout.by_address`): two words, where every C convention but one stops passing a struct in
-// registers.
-const PassedBytes: usize = 16
-
-// The floating-point scalars a type is made of, as a count and their one width, where it is made of
-// nothing else and they are all one width: a struct, an array or a nesting of them over `f32`s, say.
-// AAPCS64 hands such a thing over in vector registers at up to four members, whatever its size.
-private float_members(t: Type) -> Option[(int, int)] = underlying(t) match
-    Floating(bits, _) -> Some((1, bits))
-    Array(n, elem) -> float_members(*elem) match
-        Some(m) -> Some((m.0 * n, m.1))
-        None -> None
-    Struct(d) ->
-        if d.union_layout || !d.c_bits.is_empty() || bitfield_ranges(d).is_some() then return None
-
-        var count = 0
-        var bits = 0
-
-        for item in d.fields
-            if zero_sized(item.1) then continue
-
-            float_members(item.1) match
-                Some(m) ->
-                    if bits != 0 && m.1 != bits then return None
-
-                    bits = m.1
-                    count += m.0
-                None -> return None
-
-        if count == 0 then None else Some((count, bits))
-    _ -> None
-
 // What one target has already measured, keyed by the address of the declaration record.
 //
 // **A struct's size is asked of every struct holding it, so without this the work grows as three to
@@ -274,30 +241,6 @@ struct TargetLayout
         Array(_, _) -> self.size(t) > DirectBytes
         Enum(d) -> !d.simple && self.size(t) > DirectBytes
         _ -> false
-
-    // Whether a parameter of the type arrives as an address, in a call from sysl to sysl: everything
-    // `indirect` passes that way, and an aggregate over `PassedBytes` besides -- a `Ray` of seven
-    // doubles, a `Hit` -- unless it is at most four floats of one width, which go in vector registers
-    // as a value (`Vec3`). As a value, a seven-double struct is seven registers, and a callee that
-    // keeps it across a call saves seven callee-saved registers to do so, before its first test;
-    // as an address it is one, and a callee that only reads it reads it where the caller has it
-    // (`reads_in_place`). AAPCS64 draws the same line for C.
-    //
-    // **This is a convention between sysl functions only**: an `@export` thunk and a call to an
-    // `extern` convert through `cabi.sysl`, which asks the C convention, not this.
-    by_address(self, t: Type) -> bool
-        if self.indirect(t) then return true
-
-        underlying(t) match
-            Struct(d) -> d.base != TaskBase && self.size(t) > PassedBytes && !self.float_vector(t)
-            Array(_, _) -> self.size(t) > PassedBytes && !self.float_vector(t)
-            Enum(d) -> !d.simple && self.size(t) > PassedBytes
-            _ -> false
-    end by_address
-
-    private float_vector(self, t: Type) -> bool = float_members(t) match
-        Some(m) -> m.0 <= 4
-        None -> false
 
     // The boundary a value of the type sits on.
     align(self, t: Type) -> usize = underlying(t) match

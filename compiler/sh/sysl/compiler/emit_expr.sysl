@@ -1001,7 +1001,7 @@ end dispatch_value
 // call cannot change, which is all a callee reading its parameter in place needs (`indirect_arg`).
 // It holds a count of nothing, so nothing here releases it.
 operand_arg(e: *Emit, ty: Type, v: Val) -> IrArg
-    if !e.layout.by_address(ty) then return ir_arg(lty(e, ty), v)
+    if !e.layout.indirect(ty) then return ir_arg(lty(e, ty), v)
 
     val slot = alloca(e, fresh_reg(e), lty(e, ty))
 
@@ -1203,7 +1203,7 @@ emit_constraint_checks(e: *Emit, v: Val, c: Type)
 
                     var args: Buf[IrArg] = buf()
 
-                    args.push(operand_arg(e, base, v))
+                    args.push(ir_arg(lty(e, base), v))
                     emit(e, ir_call(Some(r), l_i1(), VGlobal(pf), args))
                     trap_unless(e, r, "where")
                 None -> ()
@@ -1511,7 +1511,7 @@ staged_args(e: *Emit, args: Buf[TExpr], out: *Buf[IrArg], callee: string) -> Buf
         val aty = texpr_type(a)
         val v = guaranteed_arg(e, a, if quiet_after(args, i) then callee else "", written)
 
-        if e.layout.by_address(aty)
+        if e.layout.indirect(aty)
             out.push(ir_arg(LPtr, v))
             staged.push((StagedSlot, v))
         else if zero_sized(aty) then staged.push((StagedNothing, VNothing))
@@ -1529,7 +1529,7 @@ arg_value(e: *Emit, a: TExpr, out: *Buf[IrArg], written: Set[string])
     val ty = texpr_type(a)
     val v = guaranteed_arg(e, a, "", written)
 
-    if e.layout.by_address(ty) then out.push(ir_arg(LPtr, v))
+    if e.layout.indirect(ty) then out.push(ir_arg(LPtr, v))
     else if !zero_sized(ty) then out.push(ir_arg(lty(e, ty), v))
 end arg_value
 
@@ -1593,7 +1593,7 @@ end changes_nothing
 // call (`written`).
 private guaranteed_arg(e: *Emit, a: TExpr, callee: string, written: Set[string]) -> Val
     val ty = texpr_type(a)
-    val big = e.layout.by_address(ty)
+    val big = e.layout.indirect(ty)
     val still = held_unless(e, a, written) || (big || contains_counted(ty)) && lends_in_place(e, callee, ty)
     val guarantee = contains_counted(ty) && !still
 
@@ -1928,7 +1928,7 @@ private type_arg_at(t: Type, i: usize) -> Type = underlying(t) match
 // that returns -- so the release would be emitted in a block the value does not reach.
 private gen_conversion(e: *Emit, fn: string, arg: Val, from: Type, to: Type) -> Val
     val passed =
-        if !e.layout.by_address(from) then ir_arg(lty(e, from), arg)
+        if !e.layout.indirect(from) then ir_arg(lty(e, from), arg)
         else
             val slot = alloca(e, fresh_reg(e), lty(e, from))
 
