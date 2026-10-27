@@ -1,0 +1,190 @@
+module sh.sysl.compiler
+@tests
+
+// A closure's annotated parameter is a type the program wrote, so it settles a member's own type
+// parameter ahead of the default a literal seed would fall back to: `xs.fold(0, (a: i64, n) -> …)` is
+// an `i64` fold on a concrete receiver exactly as it is through a `Sequence` bound. Where the literal
+// cannot be read at the annotation, or the seed carries a type of its own, the annotation is still
+// refused at the closure's parameter.
+//
+// Beside it: a named function passed as a callable is called a function, by its name, when what it
+// yields is wrong; and `flat_map` straight on an array, now that arrays are sequences.
+
+// What a refused program said, or nothing where it built.
+private cfu_refusal(text: string) -> string
+    rng_ran(text) match
+        Err(why) -> why
+        Ok(_) -> ""
+
+// How many complaints a report holds.
+private cfu_count(said: string) -> usize
+    var n: usize = 0
+    var rest = said
+
+    loop
+        rest.index_of("error: ") match
+            Some(at) ->
+                n += 1
+                rest = rest[at + 7..<rest.bytes.len]
+            None -> return n
+end cfu_count
+
+// `text` is refused with exactly one complaint, `message`, placed at `line`:`col` of the program.
+private cfu_refused(text: string, message: string, line: usize, col: usize)
+    if !rng_ready() then return
+
+    val said = cfu_refusal(text)
+    val head = s"error: $message\n"
+
+    assert_eq(cfu_count(said), 1)
+
+    val found = said.index_of(head)
+
+    assert(found.is_some(), s"no '$message' in:\n$said")
+
+    val at = found.unwrap() + head.bytes.len
+    val rest = said[at..<said.bytes.len]
+    val where = rest.index_of("\n") match
+        Some(i) -> rest[0..<i]
+        None -> rest
+
+    assert(where.ends_with(s"main.sysl:$line:$col"), s"placed at '$where':\n$said")
+end cfu_refused
+
+private val cfu_receivers = raw"""
+    import sysl.seq.Sequence
+    import sysl.buf.{Buf, buf}
+    val xs: []int = [1, 2, 3]
+    val arr = [1, 2, 3]
+    var b: Buf[int] = buf()
+    b.push(1)
+    b.push(2)
+    b.push(3)
+    """
+
+@test("a literal seed takes a concrete receiver's closure's annotated accumulator type")
+cfu_concrete_seed_takes_the_annotation() =
+    if !rng_ready() then return
+
+    rng_prints(cfu_receivers + raw"""
+        print(xs[..].fold(0, (a: i64, n) -> a + i64(n)), xs.fold(0, (a: u8, n) -> a + u8(n)),
+              xs.fold(0, (a: f64, n) -> a + f64(n) / 2))
+        print(arr.fold(0, (a: i64, n) -> a + i64(n)), arr.fold(0, (a: u8, n) -> a + u8(n)),
+              arr.fold(0, (a: f64, n) -> a + f64(n) / 2))
+        print(b.fold(0, (a: i64, n) -> a + i64(n)), b.fold(0, (a: u8, n) -> a + u8(n)),
+              b.fold(0, (a: f64, n) -> a + f64(n) / 2))
+        print(xs.fold(240, (a: u8, n) -> a + u8(n)), arr.fold(5000000000, (a: i64, n) -> a + i64(n)))
+        """, "6 6 3\n6 6 3\n6 6 3\n246 5000000006\n")
+
+@test("the same calls through a Sequence bound, with and without a result asked for")
+cfu_bound_seed_takes_the_annotation() =
+    if !rng_ready() then return
+
+    rng_prints(cfu_receivers + raw"""
+        wide[S: Sequence[int]](s: S) = s.fold(0, (a: i64, n) -> a + i64(n))
+        small[S: Sequence[int]](s: S) = s.fold(0, (a: u8, n) -> a + u8(n))
+        half[S: Sequence[int]](s: S) = s.fold(0, (a: f64, n) -> a + f64(n) / 2)
+        asked[S: Sequence[int]](s: S) -> i64 = s.fold(0, (a: i64, n) -> a + i64(n))
+        print(wide(xs), small(xs), half(xs), asked(xs))
+        print(wide(arr), small(arr), half(arr), asked(arr))
+        print(wide(b), small(b), half(b), asked(b))
+        """, "6 6 3 6\n6 6 3 6\n6 6 3 6\n")
+
+@test("an annotation settles a free generic's parameter, and a default seed takes it too")
+cfu_free_generic_and_default_seed() =
+    if !rng_ready() then return
+
+    rng_prints(raw"""
+        run[A](init: A, f: (A, int) -> A) -> A = f(f(init, 1), 2)
+        later[A](f: (A, int) -> A, init: A = 0) -> A = f(init, 7)
+        print(run(0, (a: i64, n) -> a * 10 + i64(n)), run(1, (a: f32, n) -> a / 2))
+        print(later((a: u16, n) -> a + u16(n)), later((a: i64, n) -> a - i64(n), 3))
+        """, "12 0.25\n7 -4\n")
+
+@test("a named function's declared parameters settle the seed as an annotation does")
+cfu_function_value_seed() =
+    if !rng_ready() then return
+
+    rng_prints(cfu_receivers + raw"""
+        addl(a: i64, n: int) -> i64 = a + i64(n)
+        halve(a: f64, n: int) -> f64 = a + f64(n) / 2
+        run[A](init: A, f: (A, int) -> A) -> A = f(f(init, 1), 2)
+        wide[S: Sequence[int]](s: S) = s.fold(0, addl)
+        print(xs.fold(0, addl), arr.fold(0, halve), b.fold(5000000000, addl), run(0, addl), wide(arr))
+        """, "6 3 5000000006 3 6\n")
+
+@test("an annotation the seed cannot take is still refused at the closure's parameter")
+cfu_unfit_annotation_refused() =
+    cfu_refused(raw"""
+        val xs: []int = [1, 2, 3]
+        print(xs.fold(300, (a: u8, n) -> a))
+        """, "this closure's 'a' is declared byte, but 'slice.fold' passes it int", 2, 21)
+
+    cfu_refused(raw"""
+        val xs: []int = [1, 2, 3]
+        print(xs.fold(0, (a: string, n) -> 1))
+        """, "this closure's 'a' is declared string, but 'slice.fold' passes it int", 2, 19)
+
+    // A seed with a type of its own is no literal to adapt: it settles `A`.
+    cfu_refused(raw"""
+        val xs: []int = [1, 2, 3]
+        val z = 0
+        print(xs.fold(z, (a: i64, n) -> 1))
+        """, "this closure's 'a' is declared long, but 'slice.fold' passes it int", 3, 19)
+
+    cfu_refused(raw"""
+        import sysl.seq.Sequence
+        w[S: Sequence[int]](s: S) = s.fold(300, (a: u8, n) -> a)
+        """, "this closure's 'a' is declared byte, but 'sysl.seq.Sequence.fold' passes it int", 2, 42)
+
+    // The annotation is right and the body is not: the closure is told what it should yield.
+    cfu_refused(raw"""
+        val xs: []int = [1, 2, 3]
+        print(xs.fold(0, (a: i64, n) -> "x"))
+        """, "this closure should yield long, but its body yields string", 2, 18)
+
+@test("a named function yielding the wrong type is called a function, by its name")
+cfu_function_value_wording() =
+    cfu_refused(raw"""
+        apply(f: (int, int) -> int) -> int = f(1, 2)
+        g(a: int, n: int) -> string = "x"
+        print(apply(g))
+        """, "the function 'g' should yield int here, but it yields string", 3, 13)
+
+    cfu_refused(raw"""
+        boxed(f: &Fn(int) -> int) -> int = f(1)
+        h(a: int) -> string = "y"
+        print(boxed(h))
+        """, "the function 'h' should yield int here, but it yields string", 3, 13)
+
+    cfu_refused(raw"""
+        h(a: int) -> string = "y"
+        val k: &Fn(int) -> int = h
+        """, "the function 'h' should yield int here, but it yields string", 2, 26)
+
+    // Through a member's own type parameter: the result `fold` asks for is the seed's.
+    cfu_refused(raw"""
+        val xs: []int = [1, 2, 3]
+        name(a: int, n: int) -> string = "n"
+        print(xs.fold(0, name))
+        """, "the function 'name' should yield int here, but it yields string", 3, 18)
+
+    // A closure literal keeps its own wording.
+    cfu_refused(raw"""
+        apply(f: (int, int) -> int) -> int = f(1, 2)
+        print(apply((a, n) -> "z"))
+        """, "this closure should yield int, but its body yields string", 2, 13)
+
+@test("flat_map straight on an array, of equal and of different lengths")
+cfu_array_flat_map() =
+    if !rng_ready() then return
+
+    rng_prints(raw"""
+        val arr = [1, 2, 3]
+        print([1, 2, 3].flat_map(n -> [n, n]))
+        print(arr.flat_map(n -> [n, n * 10]))
+        print([1, 2, 3].flat_map(n -> if n == 2 then [n] else [n, n, n]))
+        print(arr.flat_map(n -> if n == 1 then [s"one"] else [s"$n", "!"]))
+        print(arr.flat_map(n -> arr[0..<n]))
+        """, "[1, 1, 2, 2, 3, 3]\n[1, 10, 2, 20, 3, 30]\n[1, 1, 1, 2, 3, 3, 3]\n[one, 2, !, 3, !]\n" +
+             "[1, 1, 2, 1, 2, 3]\n")
