@@ -155,7 +155,15 @@ exclude = ["fixtures", "tools/gen"]
 Each entry is a path from the package root, naming a directory; that directory and everything under
 it is left out of the sysl walk, the C the package carries, `sysl doc`, and what the run cache keys a
 program on, so an edit there rebuilds nothing. It is what ends the warning a directory of C with no
-sysl draws when that C is built by a script of the package's own rather than by sysl.
+sysl draws when that C is built by a script of the package's own rather than by sysl — a hand-built
+benchmark in `bench/`, test programs in `tests/linux/` — and the warning names the entry to add:
+
+```text
+sysl: warning: '/…/mypkg/bench' holds C and no sysl, so it is not a module and its '.c' files are compiled by nothing — a directory becomes one by holding the '.sysl' that declares those 'extern's; add "bench" to 'exclude' in sysl.hocon if that is intended
+```
+
+**An excluded directory that does hold sysl is not a module either**, and says nothing about it:
+leaving it out is what the entry asks for.
 
 - **Entries are plain paths, not patterns.** `*`, `?` and `[` are refused, so a later release can give
   them a meaning without changing what a manifest already written does. A leading `./` and a trailing
@@ -2385,7 +2393,7 @@ something else. Writing the bare name says exactly that:
 ```
 'server' is not something a target says about itself — sysl knows aarch64, android, bsd, craft,
 fma, fma_dp, fpu, fpu_dp, freestanding, hardfloat, hosted, linux, macos, posix, ptr16, ptr32,
-ptr64, riscv32, riscv64, softfp, thread_local, thumb, wasi, wasm32, windows, x86, x86_64. A feature this package's manifest
+ptr64, riscv32, riscv64, sanitize_address, sanitize_thread, softfp, thread_local, thumb, wasi, wasm32, windows, x86, x86_64. A feature this package's manifest
 declares is named 'feature_server'
 ```
 
