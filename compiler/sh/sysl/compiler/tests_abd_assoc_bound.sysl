@@ -1,0 +1,640 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.text.Search
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// A **bound that fixes an associated type** -- `[S: ReadAt[Error = E]]`, as an object already could
+// (`&Seq[Item = int]`). Inside the body the projection IS the bound type, so `?` hands the store's
+// error to a function returning its own; a type parameter in the binding is inferred from the call;
+// an instantiation whose implementation chose otherwise is refused at the call. Crossed with what a
+// bound meets: a required trait's associated type, two bindings, `where`, another bound, a generic
+// type and its `impl`, a trait's own member, a nested generic, a trait object, the short form, a
+// library root and a built library, and the standard library's positioned stores.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private abd_ready() -> bool = std_root().is_ok() && clang_available()
+
+private abd_write(main: string) -> string
+    val root = make_temp_dir("sysl-abd").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(root + "/package.hocon", "package {\n  name = \"probe\"\n}\n").unwrap()
+    write_text(root + "/main.sysl", main).unwrap()
+    root
+end abd_write
+
+// What the program PRINTS, or what the build had to say about it.
+private abd_ran(main: string) -> string
+    val root = abd_write(main)
+    val exe = root + "/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            val said = failure_text(why)
+
+            remove_dir_all(root).unwrap_or(())
+            return said
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end abd_ran
+
+// Everything the analysis had to say about the program.
+private abd_report(main: string) -> string
+    val root = abd_write(main)
+
+    val out = emit_llvm_text(root, None) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> if made.report.is_empty() then made.text else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end abd_report
+
+// The program is refused with exactly this message, first, at this line and column of `main.sysl`.
+private abd_refused(main: string, message: string, at: string)
+    val out = abd_report(main)
+
+    assert(out.starts_with(s"error: $message\n "), s"expected 'error: $message' first, got: $out")
+    assert(out.index_of(s"/main.sysl:$at\n").is_some(), s"expected it at main.sysl:$at, got: $out")
+end abd_refused
+
+// A store whose `get` can fail, implemented by a type that chose `MyErr` and one that chose
+// `OtherErr`.
+private abd_src() -> string = raw"""
+    trait Source
+        type Error
+        get(self) -> Result[int, Self::Error]
+
+    enum MyErr
+        Bad
+
+    enum OtherErr
+        Worse
+
+    struct Good
+        v: int
+
+    struct Odd
+        v: int
+
+    impl Source for Good
+        type Error = MyErr
+        get(self) -> Result[int, Self::Error] = if self.v < 0 then Err(MyErr.Bad) else Ok(self.v)
+
+    impl Source for Odd
+        type Error = OtherErr
+        get(self) -> Result[int, Self::Error] = Ok(self.v)
+
+    """
+
+// The same with the error on a required trait and a second associated type on the trait itself.
+private abd_super() -> string = raw"""
+    trait Positioned
+        type Error
+        extent(self) -> Result[int, Self::Error]
+
+    trait Source: Positioned
+        type Item
+        get(self) -> Result[Self::Item, Self::Error]
+
+    enum MyErr
+        Bad
+
+    struct Good
+        v: int
+
+    impl Positioned for Good
+        type Error = MyErr
+        extent(self) -> Result[int, Self::Error] = Ok(3)
+
+    impl Source for Good
+        type Item = int
+        get(self) -> Result[Self::Item, Self::Error] = Ok(self.v)
+
+    """
+
+private val abd_mismatch: string = "'twice' requires its type parameter 'S' to implement " +
+    "'Source[Error = MyErr]', which says 'Error' is MyErr, and Odd supplies OtherErr for it — a bound " +
+    "that fixes an associated type is met only by a type that chose the same one"
+
+// -- what the body may assume --------------------------------------------------------------------
+
+@test("a bound fixing an associated type at a concrete type lets '?' hand the store's error back as that type")
+abd_concrete_binding()
+    if !abd_ready() then return
+
+    assert_eq(abd_ran(abd_src() + raw"""
+        twice[S: Source[Error = MyErr]](s: S) -> Result[int, MyErr]
+            val x = s.get()?
+            Ok(x * 2)
+
+        print(twice(Good(21)).unwrap())
+        twice(Good(-1)) match
+            Ok(_) -> print("ok")
+            Err(MyErr.Bad) -> print("bad")
+        """), "42\nbad\n")
+
+@test("a type parameter in the binding is inferred from the argument, a value and a construction alike")
+abd_binding_infers_a_parameter()
+    if !abd_ready() then return
+
+    assert_eq(abd_ran(abd_src() + raw"""
+        twice[S: Source[Error = E], E](s: S) -> Result[int, E]
+            val x = s.get()?
+            Ok(x * 2)
+
+        val g = Good(21)
+        val r = twice(g)
+        print(r.unwrap())
+        print(twice(Good(4)).unwrap())
+        print(twice(Odd(5)).unwrap())
+        """), "42\n8\n10\n")
+
+@test("'?' converts the bound's error through From into the function's own")
+abd_question_mark_converts()
+    if !abd_ready() then return
+
+    assert_eq(abd_ran(abd_src() + raw"""
+        enum Mine
+            Store(why: MyErr)
+
+        impl From[MyErr] for Mine
+            from(e: MyErr) -> Mine = Store(e)
+
+        read[S: Source[Error = MyErr]](s: S) -> Result[int, Mine]
+            val x = s.get()?
+            Ok(x + 1)
+
+        print(read(Good(1)).unwrap())
+        read(Good(-1)) match
+            Err(Store(MyErr.Bad)) -> print("converted")
+            _ -> print("?")
+        """), "2\nconverted\n")
+
+@test("a projection off the bound IS the bound type: a value of either stands for the other")
+abd_projection_is_the_type()
+    if !abd_ready() then return
+
+    assert_eq(abd_ran(abd_src() + raw"""
+        convert[S: Source[Error = MyErr]](s: S, e: MyErr) -> MyErr
+            val back: S::Error = e
+            val r: Result[int, S::Error] = Err(back)
+            r match
+                Ok(_) -> MyErr.Bad
+                Err(m) -> m
+
+        lift[S: Source[Error = MyErr]](s: S) -> S::Error = MyErr.Bad
+
+        convert(Good(1), MyErr.Bad) match
+            MyErr.Bad -> print("bad")
+        lift(Good(1)) match
+            MyErr.Bad -> print("lifted")
+        """), "bad\nlifted\n")
+
+@test("two bindings at once, one on a required trait's associated type under its declared name")
+abd_two_bindings_and_a_required_trait()
+    if !abd_ready() then return
+
+    assert_eq(abd_ran(abd_super() + raw"""
+        pass[S: Source[Item = int, Error = E], E](s: S) -> Result[int, E]
+            val x: int = s.get()?
+            val n = s.extent()?
+            Ok(x + n)
+
+        only[S: Source[Error = MyErr]](s: S) -> Result[int, MyErr] = s.extent()
+
+        print(pass(Good(39)).unwrap())
+        print(only(Good(0)).unwrap())
+        """), "42\n3\n")
+
+@test("a nested generic call hands its own binding on")
+abd_nested_generic()
+    if !abd_ready() then return
+
+    assert_eq(abd_ran(abd_super() + raw"""
+        pass[S: Source[Item = int, Error = E], E](s: S) -> Result[int, E] = s.get()
+
+        outer[S: Source[Item = int, Error = E], E](s: S) -> Result[int, E]
+            val v = pass(s)?
+            Ok(v + 1)
+
+        fixed[S: Source[Item = int, Error = MyErr]](s: S) -> Result[int, MyErr] = outer(s)
+
+        print(outer(Good(1)).unwrap())
+        print(fixed(Good(2)).unwrap())
+        """), "2\n3\n")
+
+@test("a nested call infers its parameter as the caller's projection when the caller fixed nothing")
+abd_nested_infers_the_projection()
+    if !abd_ready() then return
+
+    assert_eq(abd_ran(abd_src() + raw"""
+        pass[S: Source[Error = E], E](s: S) -> Result[int, E] = s.get()
+
+        open[S: Source](s: S) -> Result[int, S::Error] = pass(s)
+
+        print(open(Good(6)).unwrap())
+        """), "6\n")
+
+@test("the binding in a 'where' clause, beside another bound")
+abd_where_and_another_bound()
+    if !abd_ready() then return
+
+    assert_eq(abd_ran(abd_src() + raw"""
+        trait Named
+            name(self) -> string
+
+        impl Named for Good
+            name(self) -> string = "good"
+
+        both[S](s: S) -> Result[string, MyErr] where S: Source[Error = MyErr] + Named
+            val v = s.get()?
+            Ok(s"${s.name()} $v")
+
+        inline[S: Named + Source[Error = MyErr]](s: S) -> Result[string, MyErr] = both(s)
+
+        print(both(Good(3)).unwrap())
+        print(inline(Good(4)).unwrap())
+        """), "good 3\ngood 4\n")
+
+@test("a generic type and its 'impl' carry the binding")
+abd_generic_type_and_impl()
+    if !abd_ready() then return
+
+    assert_eq(abd_ran(abd_src() + raw"""
+        struct Reader[S: Source[Error = MyErr]]
+            src: S
+
+        impl[S: Source[Error = MyErr]] Reader[S]
+            read(self) -> Result[int, MyErr]
+                val v = self.src.get()?
+                Ok(v + 1)
+
+        print(Reader(Good(1)).read().unwrap())
+        """), "2\n")
+
+@test("a trait's own generic member bounds its parameter with a binding")
+abd_trait_member_bound()
+    if !abd_ready() then return
+
+    assert_eq(abd_ran(abd_src() + raw"""
+        trait Consumer
+            take[S: Source[Error = MyErr]](self, s: S) -> Result[int, MyErr]
+
+        struct Doubler
+        end Doubler
+
+        impl Consumer for Doubler
+            take[S: Source[Error = MyErr]](self, s: S) -> Result[int, MyErr]
+                val v = s.get()?
+                Ok(v * 2)
+
+        print(Doubler().take(Good(5)).unwrap())
+        """), "10\n")
+
+@test("the short form: a trait with no parameters and one associated type takes it bare, as an object does")
+abd_short_form()
+    if !abd_ready() then return
+
+    assert_eq(abd_ran(abd_src() + raw"""
+        short[S: Source[MyErr]](s: S) -> Result[int, MyErr] = s.get()
+
+        inferred[S: Source[E], E](s: S) -> Result[int, E] = s.get()
+
+        print(short(Good(7)).unwrap())
+        print(inferred(Odd(8)).unwrap())
+        """), "7\n8\n")
+
+@test("a trait object that fixed the same type meets the bound, and infers the parameter")
+abd_object_meets_the_bound()
+    if !abd_ready() then return
+
+    assert_eq(abd_ran(abd_src() + raw"""
+        short[S: Source[Error = MyErr]](s: S) -> Result[int, MyErr] = s.get()
+
+        pass[S: Source[Error = E], E](s: S) -> Result[int, E] = s.get()
+
+        dynamic(s: &Source[Error = MyErr]) -> Result[int, MyErr] = short(s)
+
+        through(s: &Source[Error = OtherErr]) -> Result[int, OtherErr] = pass(s)
+
+        print(dynamic(Good(8)).unwrap())
+        print(through(Odd(9)).unwrap())
+        """), "8\n9\n")
+
+// -- what is refused ------------------------------------------------------------------------------
+
+@test("an implementation that chose another type is refused at the call, naming both")
+abd_mismatch_at_the_call()
+    if !abd_ready() then return
+
+    abd_refused(abd_src() + raw"""
+        twice[S: Source[Error = MyErr]](s: S) -> Result[int, MyErr]
+            val x = s.get()?
+            Ok(x * 2)
+
+        print(twice(Odd(21)).unwrap())
+        """, abd_mismatch, "29:7")
+
+@test("an expected type that fixes the parameter otherwise is held to the bound too")
+abd_expected_type_mismatch()
+    if !abd_ready() then return
+
+    abd_refused(abd_src() + raw"""
+        pass[S: Source[Error = E], E](s: S) -> Result[int, E] = s.get()
+
+        main()
+            val forced: Result[int, MyErr] = pass(Odd(2))
+        """, "'pass' requires its type parameter 'S' to implement 'Source[Error = MyErr]', which says " +
+        "'Error' is MyErr, and Odd supplies OtherErr for it — a bound that fixes an associated type " +
+        "is met only by a type that chose the same one", "28:38")
+
+@test("a generic type applied to a type that chose otherwise is refused at the construction")
+abd_mismatch_on_a_generic_type()
+    if !abd_ready() then return
+
+    abd_refused(abd_src() + raw"""
+        struct Reader[S: Source[Error = MyErr]]
+            src: S
+
+        main()
+            val r = Reader(Odd(1))
+        """, "'Reader' requires its type parameter 'S' to implement 'Source[Error = MyErr]', which says " +
+        "'Error' is MyErr, and Odd supplies OtherErr for it — a bound that fixes an associated type " +
+        "is met only by a type that chose the same one", "29:13")
+
+@test("a conditional 'impl' whose binding the argument misses does not cover it")
+abd_mismatch_on_a_conditional_impl()
+    if !abd_ready() then return
+
+    abd_refused(abd_src() + raw"""
+        trait Named
+            name(self) -> string
+
+        struct Wrap[S]
+            s: S
+
+        impl[S: Source[Error = MyErr]] Named for Wrap[S]
+            name(self) -> string = "wrap"
+
+        show[N: Named](n: N) -> string = n.name()
+
+        print(show(Wrap(Good(1))))
+        print(show(Wrap(Odd(1))))
+        """, "'show' requires its type parameter 'N' to implement 'Named', but Wrap[Odd] does not — the " +
+        "'impl' that covers it asks 'Source[Error = MyErr]' of Odd, which does not implement it", "37:7")
+
+@test("a caller whose own bound leaves the type open cannot hand its parameter to a bound that fixes it")
+abd_caller_leaves_it_open()
+    if !abd_ready() then return
+
+    abd_refused(abd_src() + raw"""
+        twice[S: Source[Error = MyErr]](s: S) -> Result[int, MyErr] = s.get()
+
+        open[S: Source](s: S) -> Result[int, MyErr] = twice(s)
+
+        print(1)
+        """, "'twice' requires its type parameter 'S' to implement 'Source[Error = MyErr]', which says " +
+        "'Error' is MyErr, and nothing says what 'S' chose for it — its own bound has to fix 'Error' too",
+        "27:47")
+
+@test("a trait object that fixed another type does not meet the bound's type")
+abd_object_fixed_otherwise()
+    if !abd_ready() then return
+
+    abd_refused(abd_src() + raw"""
+        pass[S: Source[Error = E], E](s: S) -> Result[int, E] = s.get()
+
+        obj(s: &Source[Error = OtherErr]) -> Result[int, MyErr] = pass(s)
+
+        print(1)
+        """, "function 'obj' should return sysl.Result[int, MyErr], but its body yields " +
+        "sysl.Result[int, OtherErr]", "27:1")
+
+@test("a binding naming no associated type of the trait is refused, listing what it declares")
+abd_unknown_name()
+    if !abd_ready() then return
+
+    abd_refused(abd_src() + raw"""
+        f[S: Source[Fault = MyErr]](s: S) -> int = 0
+
+        print(1)
+        """, "'Source' declares no associated type 'Fault' — it declares 'Error'", "25:6")
+
+@test("a binding on a trait that declares no associated types is refused")
+abd_no_associated_types()
+    if !abd_ready() then return
+
+    abd_refused(raw"""
+        trait Plain
+            go(self) -> int
+
+        f[S: Plain[X = int]](s: S) -> int = 0
+
+        print(1)
+        """, "'Plain' declares no associated types, so there is nothing in 'Plain' for 'X' to fix — a " +
+        "trait declares one with 'type X: …' among its members", "4:6")
+
+@test("binding one associated type twice is refused")
+abd_bound_twice()
+    if !abd_ready() then return
+
+    abd_refused(abd_src() + raw"""
+        f[S: Source[Error = MyErr, Error = MyErr]](s: S) -> int = 0
+
+        print(1)
+        """, "'Source' fixes 'Error' more than once, and a type has one of each", "25:6")
+
+@test("a bound type is held to what the trait requires of the associated type")
+abd_binding_meets_the_declared_bound()
+    if !abd_ready() then return
+
+    abd_refused(raw"""
+        trait Render
+            render(self) -> string
+
+        trait Seq
+            type Item: Render
+            head(self) -> Self::Item
+
+        f[S: Seq[Item = int]](s: S) -> int = 0
+
+        print(1)
+        """, "'Seq' requires its associated type 'Item' to implement 'Render', but int does not", "8:6")
+
+@test("a bare argument is the short form only for one associated type and no parameters")
+abd_short_form_counts()
+    if !abd_ready() then return
+
+    abd_refused(abd_src() + raw"""
+        f[S: Source[MyErr, OtherErr]](s: S) -> int = 0
+
+        print(1)
+        """, "trait 'Source' does not take type arguments", "25:6")
+
+@test("a trait's requirement list cannot fix an associated type, there being no call to hold it at")
+abd_requirement_cannot_fix()
+    if !abd_ready() then return
+
+    abd_refused(abd_src() + raw"""
+        trait Doubled: Source[Error = MyErr]
+            twice(self) -> int
+
+        print(1)
+        """, "trait 'Doubled' requires 'Source' and fixes its 'Error', which a requirement cannot do — " +
+        "bound the type parameter that needs it instead, '[T: Doubled + Source[Error = …]]'", "25:16")
+
+// -- separate compilation -------------------------------------------------------------------------
+
+private val abd_lib: string = raw"""
+    module demo
+
+    trait Source
+        type Error
+        get(self) -> Result[int, Self::Error]
+
+    enum LibErr
+        Broken
+
+    twice[S: Source[Error = E], E](s: S) -> Result[int, E]
+        val x = s.get()?
+        Ok(x * 2)
+
+    fixed[S: Source[Error = LibErr]](s: S) -> Result[int, LibErr] = twice(s)
+    """
+
+@test("a library root's generic with a binding, instantiated by a program")
+abd_library_root()
+    if !abd_ready() then return
+
+    val lib = lbr_tree(lbr_one("demo/demo.sysl", abd_lib))
+    val prog = lbr_program(raw"""
+        import demo.*
+
+        struct Mine
+            v: int
+
+        impl Source for Mine
+            type Error = LibErr
+            get(self) -> Result[int, Self::Error] = Ok(self.v)
+
+        print(twice(Mine(4)).unwrap(), fixed(Mine(5)).unwrap())
+        """)
+    val said = lbr_run(prog, [lib])
+
+    lbr_drop([lib, prog])
+    assert_eq(said, "8 10\n")
+
+@test("and a program whose implementation chose otherwise is refused across the library")
+abd_library_root_mismatch()
+    if !abd_ready() then return
+
+    val lib = lbr_tree(lbr_one("demo/demo.sysl", abd_lib))
+    val prog = lbr_program(raw"""
+        import demo.*
+
+        enum Own
+            Mine
+
+        struct Mine
+            v: int
+
+        impl Source for Mine
+            type Error = Own
+            get(self) -> Result[int, Self::Error] = Ok(self.v)
+
+        print(fixed(Mine(5)).unwrap())
+        """)
+    val said = lbr_run(prog, [lib])
+
+    lbr_drop([lib, prog])
+    assert(said.index_of("'demo.fixed' requires its type parameter 'S' to implement " +
+                         "'demo.Source[Error = demo.LibErr]', which says 'Error' is demo.LibErr, and " +
+                         "Mine supplies Own for it").is_some(), said)
+
+@test("the library builds on its own with 'build-lib'")
+abd_build_lib()
+    if !abd_ready() then return
+
+    val root = lbr_temp("sysl-abd-")
+
+    make_dir_all(s"$root/demo").unwrap()
+    write_text(s"$root/demo/demo.sysl", abd_lib).unwrap()
+
+    val got = lbr_cli(["sysl", "build-lib", root])
+
+    remove_dir_all(root).unwrap_or(())
+    assert_eq(got.0, Fine, got.1)
+    assert_eq(got.1, s"checked $root")
+
+// -- the standard library's positioned stores ------------------------------------------------------
+
+private val abd_std: string = raw"""
+    import sysl.io.{ReadAt, MemoryError, read_exact_at, bytes_at}
+    import sysl.fs.{File, IoError, write_text, open, remove_file}
+    import sysl.process.pid
+
+    enum WavError
+        Short
+        Store(why: MemoryError)
+
+    impl From[MemoryError] for WavError
+        from(e: MemoryError) -> WavError = Store(e)
+
+    tag[S: ReadAt[Error = MemoryError]](s: *S) -> Result[u32, WavError]
+        var b: [4]u8 = [0; 4]
+        val got = read_exact_at(s, 0, b)?
+
+        if got.len < 4 then return Err(Short)
+        Ok(u32(b[0]) | (u32(b[1]) << 8))
+
+    first[S: ReadAt[Error = IoError]](s: *S) -> Result[u8, IoError]
+        var b: [1]u8 = [0; 1]
+        val got = s.read_at(0, b)?
+        Ok(got[0])
+
+    """
+
+@test("a format library bounds a store over memory and a file by their errors, keeping its own through '?'")
+abd_std_positioned()
+    if !abd_ready() then return
+
+    assert_eq(abd_ran(abd_std + raw"""
+        main()
+            var mem = bytes_at([1, 2, 3, 4])
+            print(tag(&mem).unwrap())
+            var tiny = bytes_at([1])
+            tag(&tiny) match
+                Err(Short) -> print("short")
+                _ -> print("?")
+
+            val where = s"/tmp/sysl-abd-${pid()}"
+            write_text(where, "A").unwrap()
+            var f = open(where).unwrap()
+            print(first(&f).unwrap())
+            remove_file(where).unwrap()
+        """), "513\nshort\n65\n")
+
+@test("and a file handed to the memory-error bound is refused, naming IoError")
+abd_std_file_refused()
+    if !abd_ready() then return
+
+    val out = abd_report(abd_std + raw"""
+        main()
+            var f = open("/nonexistent").unwrap()
+            print(tag(&f).unwrap())
+        """)
+
+    assert(out.starts_with("error: 'tag' requires its type parameter 'S' to implement " +
+                           "'sysl.io.ReadAt[Error = sysl.io.MemoryError]', which says 'Error' is " +
+                           "sysl.io.MemoryError, and sysl.fs.File supplies sysl.fs.IoError for it"), out)

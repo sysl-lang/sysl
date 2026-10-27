@@ -569,10 +569,45 @@ default says there is nothing to do, which is true of memory.
 
 **The error is an associated type, so each store keeps its own.** A file reports an
 [`IoError`](/library/fs/), the two stores over memory a `MemoryError`, and a codec's own store the
-codec's error; a generic function bounded on `ReadAt` hands `S::Error` back unchanged. A bound cannot
-fix an associated type ([`reference/traits.md`](/reference/traits/#an-object-may-fix-the-associated-type)),
-so a function that wants a particular error back through `?` takes a pointer object that fixes it —
-`s: *ReadAt[Error = MyError]` — which allocates nothing.
+codec's error; a generic function bounded on `ReadAt` hands `S::Error` back unchanged. **A library
+with an error of its own fixes the store's in the bound**
+([`reference/traits.md`](/reference/traits/#a-bound-may-fix-the-associated-type)), and `?` then
+converts it through the library's `From`:
+
+```sysl
+import sysl.io.{ReadAt, MemoryError, read_exact_at, bytes_at}
+
+enum WavError
+    Truncated
+    Store(why: MemoryError)
+
+impl From[MemoryError] for WavError
+    from(e: MemoryError) -> WavError = Store(e)
+
+// The format's own error comes back, whatever the store reported.
+channels[S: ReadAt[Error = MemoryError]](s: *S) -> Result[u16, WavError]
+    var b: [2]u8 = [0; 2]
+    val got = read_exact_at(s, 22, b)?
+
+    if got.len < 2 then return Err(Truncated)
+    Ok(u16(b[0]) | (u16(b[1]) << 8))
+
+main()
+    var header: [24]u8 = [0; 24]
+    header[22] = 2
+    var store = bytes_at(header)
+    print(channels(&store).unwrap())
+
+    var short = bytes_at([1, 2, 3])
+    print(channels(&short))
+```
+
+```output
+2
+Err(WavError.Truncated)
+```
+
+A store that chose another error — a `File`, which reports an `IoError` — is refused at the call.
 
 **`Positioned` is the part the two directions share**, for the reason `Fallible` is: an associated
 type is named off the type rather than the trait, so a type may implement only one trait declaring an

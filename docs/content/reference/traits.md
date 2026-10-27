@@ -2254,10 +2254,103 @@ A binding is checked against whatever the trait requires of the associated type,
 implementation is. A required trait's associated type is bound in the same brackets, under its
 declared name, since its members are slots in the same table.
 
-**A bound has no such form.** `[S: Seq[Item = int]]` cannot be written, and nothing bounds a
-projection either, so a generic body may call what a bound allows and may assume nothing about the
-result beyond what the trait itself requires of the type. Where a body needs more, the requirement
-belongs on the trait's own declaration: `type Item: Display`.
+### A bound may fix the associated type too
+
+A bound fixes an associated type exactly as an object does: by name, after the trait's own arguments,
+a required trait's under its declared name, and — for a trait with no parameters and one associated
+type — by a lone bare argument. **Inside the body the projection *is* the type the bound wrote**, not
+a type known to equal it, so `S::Error` and `E` below are one type, and `?` hands the store's error
+back as the function's own. The type it fixes may be another of the declaration's parameters, and a
+call infers that one from the argument's implementation:
+
+```sysl
+trait Source
+    type Error
+    get(self) -> Result[int, Self::Error]
+
+enum Fault
+    Empty
+
+struct Box
+    v: int
+
+impl Source for Box
+    type Error = Fault
+    get(self) -> Result[int, Self::Error] = if self.v == 0 then Err(Fault.Empty) else Ok(self.v)
+
+// The error is named, so the result can say it.
+doubled[S: Source[Error = Fault]](s: S) -> Result[int, Fault]
+    val v = s.get()?
+    Ok(v * 2)
+
+// The error is a parameter of its own, settled by what 'S' chose.
+tripled[S: Source[Error = E], E](s: S) -> Result[int, E]
+    val v = s.get()?
+    Ok(v * 3)
+
+print(doubled(Box(21)).unwrap(), tripled(Box(2)).unwrap())
+print(doubled(Box(0)))
+```
+
+```output
+42 6
+Err(Fault.Empty)
+```
+
+**A type meets such a bound only where its implementation chose the same type**, which is what makes
+the body's assumption sound. It is refused at the call, where both are known, as an object refuses
+the value erased into it:
+
+```sysl
+trait Source
+    type Error
+    get(self) -> Result[int, Self::Error]
+
+enum Fault
+    Empty
+
+enum Other
+    Gone
+
+struct Box
+    v: int
+
+impl Source for Box
+    type Error = Other
+    get(self) -> Result[int, Self::Error] = Ok(self.v)
+
+doubled[S: Source[Error = Fault]](s: S) -> Result[int, Fault]
+    val v = s.get()?
+    Ok(v * 2)
+
+print(doubled(Box(21)))
+```
+
+```error
+'doubled' requires its type parameter 'S' to implement 'Source[Error = Fault]', which says 'Error' is Fault, and Box supplies Other for it — a bound that fixes an associated type is met only by a type that chose the same one
+```
+
+A type parameter handed on meets it only where its own bound fixed the same type; one bounded by the
+bare trait leaves the type open, and is refused rather than assumed. A binding is held to the trait's
+declaration as an object's is — each name declared, each named once, each type meeting what the trait
+requires of it (`type Item: Display`) — and it applies wherever a bound is written: a function, a
+`where` clause, a generic type, an `impl`, a trait's own member. A trait's *requirement* list cannot
+fix one, since every implementation would then be held to it with no call to refuse at:
+
+```sysl
+trait Seq
+    type Item
+    head(self) -> Self::Item
+
+trait Doubles: Seq[Item = int]
+    doubled(self) -> int
+
+print(1)
+```
+
+```error
+trait 'Doubles' requires 'Seq' and fixes its 'Item', which a requirement cannot do — bound the type parameter that needs it instead, '[T: Doubles + Seq[Item = …]]'
+```
 
 ## A trait may require another trait
 
