@@ -540,9 +540,28 @@ lto          = "thin"
 ```
 
 `thin` keeps a summary per module and links at close to an ordinary link's cost; `full` merges every
-module into one and is the thorough, slower one. `lto = true` means `thin`, which is the answer for a
-project that has not thought about it, and `lto = false` says the same as saying nothing. The
-command-line spelling is `--lto thin`, and it beats the key exactly as `-O` beats `optimization`.
+module into one and is the thorough, slower one. `lto = true` means `thin`, and `lto = false` means
+`off`. The command-line spelling is `--lto thin` (or `full`, or `off`), and it beats the key exactly
+as `-O` beats `optimization`.
+
+### Thin LTO is the default for an optimized build
+
+**A `sysl build` or `sysl run` at `-O2`, `-O3`, `-Ofast`, `-Os` or `-Oz` links with thin LTO unless
+the command line or the manifest says otherwise**, whether the level came from `-O` or from
+`optimization`. `--lto off` or `lto = "off"` (or `false`) turns it off; `--lto full` or `lto =
+"full"` asks for the other mode instead. Where it does not apply, nothing changes:
+
+- **the default level and the debugging ones** (`-O1`, `-O0`, `-Og`) — a build that did not ask to
+  be optimized keeps its link time;
+- **`sysl test`**, which keeps its link time too;
+- **`build-c` and `build-lib`**, whose archives are read by a linker other than clang's — a Gradle
+  or CMake build, GNU ld — and so hold native objects unless `--lto` asks;
+- **a freestanding target** (a board image, `wasm32-freestanding`) and **`wasm32-wasi`**: a board
+  image is placed region by region by its own link, and `wasm-ld` is a linker of its own. Either
+  takes `--lto thin` or the key outright.
+
+The mode is part of every key a build is looked up by, so a build at `-O2` and one at `-O2 --lto off`
+are two entries of the run cache and two standard-module artifacts.
 
 ### Why a whole-program language has anything to gain from it
 
@@ -581,8 +600,8 @@ worth assuming.
 ### A mode clang does not have is refused when the file is read
 
 ```
-sysl.hocon: 'lto = "thick"' names no kind of link-time optimization clang has — it is thin or
-full, or 'true' for thin
+sysl.hocon: 'lto = "thick"' names no kind of link-time optimization clang has — it is thin, full
+or off, or 'true' for thin
 ```
 
 The reasoning is `optimization`'s: a manifest is read by builds nobody is watching, so a typo that

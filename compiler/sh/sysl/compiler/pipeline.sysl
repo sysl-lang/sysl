@@ -26,9 +26,13 @@ import sysl.text.Search
 // everybody but its author. **`build-c` takes no manifest `lto`**: the key says how this project's own
 // link is done, `build-c` does no link, and a bitcode archive is one GNU ld cannot read.
 
-// The modes `--lto` and the `lto` key take. **Two and no more**: `-flto` on its own is clang's
-// spelling of `full`, and a key read by a consumer who did not write it is better for saying which.
+// The modes of link-time optimization `--lto` and the `lto` key take. **Two and no more**: `-flto` on
+// its own is clang's spelling of `full`, and a key read by a consumer who did not write it is better
+// for saying which. Both also take `off` (`LtoOff`), which is not a mode but the refusal of one.
 val LtoModes: []const string = ["thin", "full"]
+
+// The answer that turns link-time optimization off, the default's included (`settle_default_lto`).
+const LtoOff: string = "off"
 
 // What the command line named, each as written.
 private var pl_lto_flag: Option[string] = None
@@ -36,8 +40,12 @@ private var pl_generate: Option[string] = None
 private var pl_use: Option[string] = None
 
 // The link-time optimization this build settled on: the flag's, and the root manifest's where the
-// command line named none (`settle_lto`).
+// command line named none (`settle_lto`), and the default's where neither did.
 private var pl_lto: Option[string] = None
+
+// Whether the flag or the manifest said anything about link-time optimization, `off` included -- the
+// one condition under which the default is not consulted.
+private var pl_lto_said = false
 
 // Nothing asked for, which is what every command line starts from (`reset_search_paths`).
 reset_pipeline()
@@ -45,12 +53,21 @@ reset_pipeline()
     pl_generate = None
     pl_use = None
     pl_lto = None
+    pl_lto_said = false
 
 is_lto_mode(mode: string) -> bool = mode == "thin" || mode == "full"
 
+// A mode, or `off`: what `--lto` and the key may say.
+is_lto_answer(mode: string) -> bool = is_lto_mode(mode) || mode == LtoOff
+
+// A stated answer as the build takes it: `off` asks for nothing.
+private lto_mode_of(said: Option[string]) -> Option[string] = said match
+    Some(mode) -> if mode == LtoOff then None else Some(mode)
+    None -> None
+
 // The refusal of a mode clang does not have, in the reference's words.
 lto_mode_refusal(mode: string) -> string =
-    s"'--lto $mode' names no kind of link-time optimization clang has — it is thin or full"
+    s"'--lto $mode' names no kind of link-time optimization clang has — it is thin, full or off"
 
 // The refusal of both ends of the profile workflow at once. Clang takes both and instruments the build
 // it was asked to optimize, saying nothing, so the contradiction is refused where it was typed.
@@ -93,7 +110,8 @@ took_pipeline_flag(args: []string, i: usize) -> int
     else if found.0 == "--profile-generate" then pl_generate = Some(found.1)
     else pl_use = Some(found.1)
 
-    pl_lto = pl_lto_flag
+    pl_lto = lto_mode_of(pl_lto_flag)
+    pl_lto_said = pl_lto_flag.is_some()
     found.2
 end took_pipeline_flag
 
@@ -113,7 +131,7 @@ pipeline_flag_refusal(args: []string) -> Option[string]
             Some(found) ->
                 if found.2 == 0 then return None
 
-                if found.0 == "--lto" && !is_lto_mode(found.1) then return Some(lto_mode_refusal(found.1))
+                if found.0 == "--lto" && !is_lto_answer(found.1) then return Some(lto_mode_refusal(found.1))
 
                 if found.0 == "--profile-generate" then generate = true
                 if found.0 == "--profile-use" then use = true
@@ -125,15 +143,44 @@ pipeline_flag_refusal(args: []string) -> Option[string]
     if generate && use then Some(ProfileBothRefusal) else None
 end pipeline_flag_refusal
 
-// What `--lto` named, and nothing else -- which is the whole of what `build-c` takes.
-lto_flag() -> Option[string] = pl_lto_flag
+// The mode `--lto` named, and nothing else -- which is the whole of what `build-c` takes. `off` is
+// no mode, and an archive is native objects without one.
+lto_flag() -> Option[string] = lto_mode_of(pl_lto_flag)
 
-// The build's link-time optimization: the flag's, then `manifest`'s. Called once per command, where
-// the root manifest is read (`build_level`), with `None` by `build-c`, which takes the flag alone.
+// The build's link-time optimization: the flag's, then `manifest`'s (either may be `off`). Called
+// once per command, where the root manifest is read (`build_level`), with `None` by `build-c`, which
+// takes the flag alone. The default is not settled here: it depends on the target (`settle_default_lto`).
 settle_lto(manifest: Option[string])
-    pl_lto = pl_lto_flag
+    val said = if pl_lto_flag.is_some() then pl_lto_flag else manifest
 
-    if pl_lto.is_none() then pl_lto = manifest
+    pl_lto = lto_mode_of(said)
+    pl_lto_said = said.is_some()
+
+// **An optimized build links with thin LTO unless told otherwise.** Measured on the raytrace showcase,
+// thin LTO took the run from 1.85x C's time to 1.22x: a sysl program is one LLVM module, but the
+// standard module and every C file a package carries are others, and only the link optimizes across
+// them (the trait-object adapters are folded into their methods, `Rng.next_u32` is inlined).
+//
+// The levels: 2, 3 and `fast`, and `s` and `z`, which are `-O2` with a size bias -- LTO shrinks a
+// binary rather than growing it. Not 0, `g` or 1, the default: a build that did not ask to be
+// optimized keeps its link time.
+//
+// The targets: a hosted one, not wasm. **A freestanding image is linked by `ld.lld` from a generated
+// script against a region map** (`image_link.sysl`), placed section by section, and a board's build
+// is measured in bytes rather than in run time; wasm's `wasm-ld` is a linker of its own. Neither is
+// what the measurement was made on, so neither changes behaviour by default: either takes `--lto
+// thin` or the key outright.
+//
+// Only the commands that link a program ask (`build`, `run`): `test` keeps its link time, and
+// `build-c` and `build-lib` write archives that a linker other than clang's may read.
+lto_by_default(level: string, t: Target) -> bool
+    val optimized = level == "2" || level == "3" || level == "fast" || level == "s" || level == "z"
+
+    optimized && os_hosted(t.os) && t.cpu != Wasm32
+
+// The default applied where neither the command line nor the manifest said anything.
+settle_default_lto(level: string, t: Target)
+    if !pl_lto_said && lto_by_default(level, t) then pl_lto = Some("thin")
 
 // The link-time optimization this build settled on.
 settled_lto() -> Option[string] = pl_lto

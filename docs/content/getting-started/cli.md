@@ -294,7 +294,8 @@ sysl build-c mylib -o libmylib.a --header include/mylib.h
 header** declaring everything the module marked `@export`. The compilation is the ordinary one, not
 a library check — the module is lowered for this target with its calls resolved — and the
 difference from `build` is that no entry point is emitted, since the C side supplies its own
-`main`. The archive holds **native objects** by default. A manifest's `lto` key does not apply to
+`main`. The archive holds **native objects** by default, at every level: the thin LTO an optimized
+`sysl build` links with by default is not applied here. A manifest's `lto` key does not apply to
 `build-c`, because LLVM bitcode links only under a linker with LLVM's plugin, and optimizing across
 the archive is the C project's link step's responsibility. A C project that links with clang and lld
 can request it on the command line: `--lto thin` (or `full`) makes the archive LLVM bitcode,
@@ -1173,7 +1174,7 @@ grammars.
 | `--include-path <name>=<dir>` | the same, and it answers the header requirement a package declared under that name |
 | `-D NAME` or `-D NAME=value` | a macro the C beside a module is compiled with; may be given more than once |
 | `-O <level>` | the optimization level handed to clang |
-| `--lto <mode>` | optimize across every object at the link: `thin` or `full` |
+| `--lto <mode>` | optimize across every object at the link: `thin`, `full`, or `off`; an optimized `build` or `run` (`-O2`, `-O3`, `-Ofast`, `-Os`, `-Oz`) links with `thin` unless told otherwise |
 | `--link <how>` | link `pkg_config` libraries from their static archives: `static`, `dynamic`, or a comma-separated list of their names |
 | `--profile-generate <dir>` | build an instrumented program that writes its counters into this directory |
 | `--profile-use <file>` | build against a merged profile |
@@ -1202,7 +1203,8 @@ as `-o` on `test`, is unknown to the second. A lone `-` is a path, and everythin
 The standard-module flags and `-O` are covered in
 [installation](/getting-started/installation/), including why the default is `-O1` rather than
 `-O0`. `--lto` is the flag form of the
-[`lto` manifest key](/reference/packages/#link-time-optimization), `--link` of the
+[`lto` manifest key](/reference/packages/#link-time-optimization), which also says when thin LTO
+is the default and what `--lto off` turns off, `--link` of the
 [`link` key](/reference/packages/#linking-a-library-statically), and the two profile flags are the
 first and last steps of the workflow below.
 

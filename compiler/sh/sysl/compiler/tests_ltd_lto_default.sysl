@@ -1,0 +1,352 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, read_bytes, remove_dir_all, write_text}
+import sysl.text.Search
+
+// **An optimized build links with thin LTO unless told otherwise** (`pipeline.sysl`,
+// `settle_default_lto`). The axes: the level (from the command line and from the manifest), the
+// target (hosted, freestanding, wasm), what said otherwise (`--lto off`, `--lto=off`, `lto = false`,
+// `lto = "off"`, another mode, a flag over the key), the command (`build` and `run` link a program;
+// `test`, `build-c` and `build-lib` keep today's behaviour), the C a project carries, and every key
+// the build is looked up by.
+//
+// Skipped: `emit-llvm`, which links nothing and never consults the default; a cross-target link at
+// `-O2` (a hosted cross target answers the same `lto_by_default` as the host, which is asserted, and
+// its link is `rcp_`'s); a `pkg_config` dependency built end to end, since a system library is linked
+// as a native library under LTO exactly as without it, and the line it adds is `pkc_`'s.
+
+// A project holding `manifest` beside a program, and -- where `carries_c` -- a C file.
+private ltd_project(manifest: string, carries_c: bool = false) -> string
+    val root = runner_project("main.sysl", "main()\n    print(1)\n")
+
+    write_text(s"$root/sysl.hocon", s"package { name = \"ltd\", version = \"0.1.0\" }\n$manifest\n")
+        .unwrap()
+
+    if carries_c then write_text(s"$root/shim.c", "int ltd_shim(void) { return 7; }\n").unwrap()
+
+    root
+end ltd_project
+
+private ltd_ready() -> bool = std_root().is_ok() && clang_available()
+
+private ltd_cli(args: []string) -> (int, string)
+    var said: Buf[string] = buf()
+    val sink = &said
+    val code = run_cli(args, piece -> sink.push(piece))
+    var text = ""
+
+    for item in said
+        text = text + item + "\n"
+
+    (code, text)
+end ltd_cli
+
+// The command line read the way a command reads it, the root manifest folded in at `level` (as
+// typed, or the manifest's), and the default settled for `target`: the mode the build would link with.
+private ltd_settled(args: []string, root: string, level: Option[string] = None,
+                    target: Option[string] = None) -> Option[string]
+    reset_search_paths()
+
+    var i: usize = 0
+
+    while i < args.len
+        if took_search_flag(args, i) == 2 then i += 1
+
+        i += 1
+
+    val at = build_level(root, level).unwrap()
+
+    settle_link_default(root, target, at)
+    settled_lto()
+end ltd_settled
+
+// `sysl <command> <root> <more>` with a run cache of its own: the status, what it said, the link line
+// and the C compile lines it drove.
+private ltd_built(command: string, root: string, more: []string) -> (int, string, string, Buf[string])
+    val cache = make_temp_dir("sysl-ltd-cache").unwrap()
+    var args: Buf[string] = buf()
+
+    args.push("sysl")
+    args.push(command)
+    args.push(root)
+
+    if command == "build"
+        args.push("-o")
+        args.push(s"$root/out")
+
+    for m in more
+        args.push(m)
+
+    use_run_cache_dir(Some(cache))
+    forget_last_link()
+    forget_c_compiles()
+
+    val got = ltd_cli(args.view())
+    val link = last_link_command()
+    val compiles = c_compile_commands()
+
+    use_run_cache_dir(None)
+    reset_search_paths()
+    remove_dir_all(cache).unwrap_or(())
+    (got.0, got.1, link, compiles)
+end ltd_built
+
+// The first four bytes of an archive's sysl code member.
+private ltd_code_head(archive: string) -> Buf[u8]
+    val members = ar_members(read_bytes(archive).unwrap()).unwrap()
+    var head: Buf[u8] = buf()
+
+    for item in members
+        if item.name == SyslibCodeMember
+            for j in 0usize..<4
+                head.push(item.body.at(j))
+
+    head
+end ltd_code_head
+
+// LLVM bitcode: the raw bitstream's `BC 0xC0DE`, or Apple's wrapper's `0x0B17C0DE` little-endian.
+private ltd_bitcode(h: Buf[u8]) -> bool =
+    h.len() == 4 && ((h.at(0) == 0x42 && h.at(1) == 0x43 && h.at(2) == 0xc0 && h.at(3) == 0xde) ||
+                     (h.at(0) == 0xde && h.at(1) == 0xc0 && h.at(2) == 0x17 && h.at(3) == 0x0b))
+
+// -- which builds the default reaches -------------------------------------------------------------
+
+@test("thin LTO is the default at every optimizing level, and at none of the others")
+ltd_levels()
+    val host = host_target()
+
+    for level in ["2", "3", "fast", "s", "z"]
+        assert(lto_by_default(level, host), level)
+
+    for level in ["0", "1", "g"]
+        assert(!lto_by_default(level, host), level)
+
+    assert(!lto_by_default(DefaultOptimization, host), "the default level is not an optimized build")
+
+@test("on a hosted target, and not on a freestanding image or wasm")
+ltd_targets()
+    for name in ["x86_64-linux", "aarch64-linux", "x86_64-macos"]
+        assert(lto_by_default("2", target_named(name).unwrap()), name)
+
+    for name in ["thumb-freestanding", "thumbv6m-freestanding", "riscv32-freestanding",
+                 "wasm32-freestanding", "wasm32-wasi"]
+        target_named(name) match
+            Some(t) -> assert(!lto_by_default("2", t), name)
+            None -> ()
+
+@test("'-O2' on the command line settles thin, where nothing said otherwise")
+ltd_flag_level_settles_thin()
+    val root = ltd_project("")
+
+    assert_eq(ltd_settled([], root, Some("2")), Some("thin"))
+    assert_eq(pipeline_key(), "-lto-thin")
+    assert_eq(ltd_settled([], root, Some("3")), Some("thin"))
+    assert_eq(ltd_settled([], root), None)
+    assert_eq(pipeline_key(), "")
+    assert_eq(ltd_settled([], root, Some("0")), None)
+    reset_search_paths()
+    remove_dir_all(root).unwrap_or(())
+end ltd_flag_level_settles_thin
+
+@test("and so does the manifest's 'optimization', which the command line's '-O1' beats")
+ltd_manifest_level_settles_thin()
+    val root = ltd_project("optimization = \"2\"")
+
+    assert_eq(ltd_settled([], root), Some("thin"))
+    assert_eq(ltd_settled([], root, Some("1")), None)
+    reset_search_paths()
+    remove_dir_all(root).unwrap_or(())
+
+@test("a freestanding image at '-O2' settles none")
+ltd_bare_metal_settles_none()
+    val root = ltd_project("")
+
+    assert_eq(ltd_settled([], root, Some("2"), Some("thumb-freestanding")), None)
+    assert_eq(ltd_settled(["--lto", "thin"], root, Some("2"), Some("thumb-freestanding")), Some("thin"))
+    reset_search_paths()
+    remove_dir_all(root).unwrap_or(())
+
+// -- what says otherwise --------------------------------------------------------------------------
+
+@test("'--lto off' turns the default off, in either spelling")
+ltd_flag_off()
+    val root = ltd_project("")
+
+    assert_eq(ltd_settled(["--lto", "off"], root, Some("2")), None)
+    assert_eq(pipeline_key(), "")
+    assert(pipeline_flags().is_empty(), "off asked LLVM for something")
+    assert_eq(ltd_settled(["--lto=off"], root, Some("3")), None)
+    reset_search_paths()
+    remove_dir_all(root).unwrap_or(())
+end ltd_flag_off
+
+@test("and so do 'lto = false' and 'lto = \"off\"' in the manifest")
+ltd_manifest_off()
+    for key in ["lto = false", "lto = \"off\"", "lto = off"]
+        val root = ltd_project(key)
+
+        assert_eq(ltd_settled([], root, Some("2")), None, key)
+        reset_search_paths()
+        remove_dir_all(root).unwrap_or(())
+
+@test("another mode is taken as asked, not replaced by the default")
+ltd_other_mode_kept()
+    val root = ltd_project("lto = \"full\"")
+    val bare = ltd_project("")
+
+    assert_eq(ltd_settled([], root, Some("2")), Some("full"))
+    assert_eq(ltd_settled(["--lto", "full"], bare, Some("2")), Some("full"))
+    reset_search_paths()
+    remove_dir_all(root).unwrap_or(())
+    remove_dir_all(bare).unwrap_or(())
+
+@test("the flag beats the manifest's 'off', and '--lto off' beats its mode")
+ltd_flag_beats_key()
+    val off = ltd_project("lto = false")
+    val full = ltd_project("lto = \"full\"")
+
+    assert_eq(ltd_settled(["--lto", "thin"], off, Some("2")), Some("thin"))
+    assert_eq(ltd_settled(["--lto", "off"], full, Some("2")), None)
+    reset_search_paths()
+    remove_dir_all(off).unwrap_or(())
+    remove_dir_all(full).unwrap_or(())
+
+@test("'build-c' does not take the default, and '--lto off' there is no mode")
+ltd_build_c_flag_off()
+    reset_search_paths()
+    took_search_flag(["--lto", "off"], 0)
+
+    val flag = lto_flag()
+
+    reset_search_paths()
+    assert_eq(flag, None)
+
+// -- what is refused ------------------------------------------------------------------------------
+
+@test("an answer that is neither a mode nor off is refused, on the command line and in the manifest")
+ltd_bad_answer_refused()
+    assert_eq(pipeline_flag_refusal(["build", "p", "--lto", "Off"]), Some(lto_mode_refusal("Off")))
+    assert_eq(pipeline_flag_refusal(["build", "p", "--lto=none"]), Some(lto_mode_refusal("none")))
+    assert(pipeline_flag_refusal(["build", "p", "--lto", "off"]).is_none(), "off was refused")
+
+    val got = ltd_cli(["sysl", "build", "/somewhere", "--lto", "no"])
+
+    assert_eq(got.0, Misused)
+    assert(got.1.contains("'--lto no' names no kind of link-time optimization clang has — it is thin, " +
+                          "full or off"), got.1)
+
+    read_manifest("lto = \"none\"\n") match
+        Ok(_) -> panic("'lto = \"none\"' was accepted")
+        Err(why) -> assert_eq(why, "'lto = \"none\"' names no kind of link-time optimization clang " +
+                              "has — it is thin, full or off, or 'true' for thin")
+end ltd_bad_answer_refused
+
+// -- the whole build ------------------------------------------------------------------------------
+
+@test("'sysl build -O2' links with -flto=thin and compiles the carried C with it, and runs")
+ltd_build_o2_links_thin()
+    if !ltd_ready() then return
+
+    val root = ltd_project("", true)
+    val got = ltd_built("build", root, ["-O2"])
+
+    remove_dir_all(root).unwrap_or(())
+    assert_eq(got.0, 0, got.1)
+    assert(got.2.index_of(" -flto=thin ").is_some(), got.2)
+    assert(got.3.len() > 0, "no C was compiled")
+
+    for compile in got.3
+        assert(compile.contains(" -flto=thin "), compile)
+end ltd_build_o2_links_thin
+
+@test("'sysl build' at the default level, and '-O2 --lto off', link without it")
+ltd_build_default_and_off_link_native()
+    if !ltd_ready() then return
+
+    val root = ltd_project("", true)
+    val plain = ltd_built("build", root, [])
+    val off = ltd_built("build", root, ["-O2", "--lto", "off"])
+
+    remove_dir_all(root).unwrap_or(())
+    assert_eq(plain.0, 0, plain.1)
+    assert_eq(off.0, 0, off.1)
+    assert(!plain.2.contains("-flto"), plain.2)
+    assert(!off.2.contains("-flto"), off.2)
+
+    for compile in off.3
+        assert(!compile.contains("-flto"), compile)
+end ltd_build_default_and_off_link_native
+
+@test("'sysl run -O2' links with it too, and the program answers")
+ltd_run_o2_links_thin()
+    if !ltd_ready() then return
+
+    val root = runner_project("main.sysl", "main()\n    exit(42)\n")
+
+    write_text(s"$root/sysl.hocon", "package { name = \"ltd\", version = \"0.1.0\" }\n").unwrap()
+
+    val got = ltd_built("run", root, ["-O2"])
+
+    remove_dir_all(root).unwrap_or(())
+    assert_eq(got.0, 42, got.1)
+    assert(got.2.index_of(" -flto=thin ").is_some(), got.2)
+end ltd_run_o2_links_thin
+
+@test("'sysl test -O2' keeps its link time: no LTO")
+ltd_test_o2_links_native()
+    if !ltd_ready() then return
+
+    val root = runner_project("tests_one.sysl", "@tests\n\n@test(\"one\")\none()\n    assert_eq(1, 1)\n")
+
+    write_text(s"$root/sysl.hocon", "package { name = \"ltd\", version = \"0.1.0\" }\n").unwrap()
+
+    val got = ltd_built("test", root, ["-O2"])
+
+    remove_dir_all(root).unwrap_or(())
+    assert_eq(got.0, 0, got.1)
+    assert(got.2 != "", "no link ran")
+    assert(!got.2.contains("-flto"), got.2)
+end ltd_test_o2_links_native
+
+// An archive is read by whatever links it -- Gradle's, CMake's, GNU ld -- so its code stays native.
+private ltd_lib_root() -> string
+    val root = make_temp_dir("sysl-ltd-lib").unwrap()
+
+    make_dir_all(s"$root/mylib").unwrap()
+    write_text(s"$root/mylib/lib.sysl", "module mylib\n\n@export(\"ltd_seven\")\nseven() -> i32 = 7\n")
+        .unwrap()
+    write_text(s"$root/sysl.hocon", "package { name = \"mylib\", version = \"0.1.0\" }\n").unwrap()
+    root
+end ltd_lib_root
+
+@test("'sysl build-c -O2' archives a native object, not bitcode")
+ltd_build_c_o2_native()
+    if !ltd_ready() then return
+
+    val root = ltd_lib_root()
+    val got = ltd_cli(["sysl", "build-c", root, "-O2", "-o", s"$root/libmylib.a"])
+    val head = if got.0 == 0 then ltd_code_head(s"$root/libmylib.a") else buf()
+
+    reset_search_paths()
+    remove_dir_all(root).unwrap_or(())
+    assert_eq(got.0, 0, got.1)
+    assert(head.len() == 4 && !ltd_bitcode(head), "the archive's code is bitcode")
+end ltd_build_c_o2_native
+
+// `build-lib` writes into the compiler's cache and names no file, so what is asserted is the mode the
+// command settled on, which is what its archive is compiled under.
+@test("and 'sysl build-lib -O2' settles on none")
+ltd_build_lib_o2_native()
+    if !ltd_ready() then return
+
+    val root = ltd_lib_root()
+    val got = ltd_cli(["sysl", "build-lib", root, "-O2"])
+    val settled = settled_lto()
+
+    reset_search_paths()
+    remove_dir_all(root).unwrap_or(())
+    assert_eq(got.0, 0, got.1)
+    assert_eq(settled, None)
+end ltd_build_lib_o2_native

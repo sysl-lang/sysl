@@ -131,7 +131,8 @@ struct Manifest
     link: Option[LinkMode]
 
     // Whether this project's builds are linked with link-time optimization, and in which mode -- `thin`
-    // or `full` (`pipeline.sysl`). Only the root project's applies, as only its `optimization` does.
+    // or `full` (`pipeline.sysl`), or `off`; `None` where the key is absent, which leaves the default.
+    // Only the root project's applies, as only its `optimization` does.
     lto: Option[string]
 
     // A key this compiler does not understand is said out loud and then ignored, once per key.
@@ -1299,10 +1300,11 @@ private read_optimization(root: Value) -> Result[Option[string], string]
     Err(s"'optimization = \"$level\"' names no level clang has — it is one of 0, 1, 2, 3, s, z")
 end read_optimization
 
-// The `lto` key: `"thin"` or `"full"`. **A boolean is taken as well as a mode**, and only because
-// `lto = true` is what somebody writes who has not read which modes there are: it means `thin`, near an
-// ordinary link's cost for most of the benefit. `lto = false` means the same as saying nothing, so a
-// fork of a manifest can turn it off without deleting the line. Anything else is refused here rather
+// The `lto` key: `"thin"`, `"full"` or `"off"`. **A boolean is taken as well as a mode**, and only
+// because `lto = true` is what somebody writes who has not read which modes there are: it means `thin`,
+// near an ordinary link's cost for most of the benefit. `lto = false` means `off`, which is not the
+// same as saying nothing: an optimized build links with thin LTO by default (`settle_default_lto`),
+// and `off` turns that default off too. Anything else is refused here rather
 // than left to arrive from inside clang with nothing naming the manifest.
 private read_lto(root: Value) -> Result[Option[string], string]
     val value = root.get("lto") match
@@ -1310,19 +1312,20 @@ private read_lto(root: Value) -> Result[Option[string], string]
         Some(v) -> v
 
     value.as_bool() match
-        Some(on) -> return Ok(if on then Some("thin") else None)
+        Some(on) -> return Ok(Some(if on then "thin" else LtoOff))
         None -> ()
 
     val mode = if is_prose(value) then text_of(value).unwrap() else ""
 
     if mode == ""
         return Err("'lto' says whether this project is linked with link-time optimization, so it " +
-                   "is thin or full — written as a string, or 'true' for thin, and not a block or a list")
+                   "is thin, full or off — written as a string, or 'true' for thin, and not a block or " +
+                   "a list")
 
-    if is_lto_mode(mode) then return Ok(Some(mode))
+    if is_lto_answer(mode) then return Ok(Some(mode))
 
-    Err(s"'lto = \"$mode\"' names no kind of link-time optimization clang has — it is thin or full, " +
-        "or 'true' for thin")
+    Err(s"'lto = \"$mode\"' names no kind of link-time optimization clang has — it is thin, full or " +
+        "off, or 'true' for thin")
 end read_lto
 
 // The `link` key: `"static"`, `"dynamic"`, or a list of the `pkg_config` names to link statically.
