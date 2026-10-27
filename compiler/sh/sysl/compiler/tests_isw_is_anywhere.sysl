@@ -274,6 +274,136 @@ isw_refused_names_quiet()
         print(o is Some(n), n)
         """), s"2:12 ${isw_binds()}\n")
 
+@test("a refused 'is' in a module binding is reported once, as the same refusal in a body is")
+isw_module_binding_once()
+    if xvr_no_library() then return
+
+    // A module binding is a recovery region: what the refused operand of '!' goes on to cause is
+    // not told, as inside a function (`isw_precedence`).
+    assert_eq(isc_diags(raw"""
+        val o: Option[int] = Some(1)
+        val b = !o is Some(_)
+
+        main()
+            print(b)
+        """), "2:9 condition must be bool, got sysl.Option[int]\n")
+
+    assert_eq(isc_diags(raw"""
+        val o: Option[int] = Some(1)
+        val b: bool = !o is Some(_)
+
+        main()
+            print(b)
+        """), "2:15 condition must be bool, got sysl.Option[int]\n")
+
+    assert_eq(isc_diags(raw"""
+        val o: Option[int] = Some(1)
+        val a = o is Some(n)
+
+        main()
+            print(a)
+        """), s"2:14 ${isw_binds()}\n")
+
+    assert_eq(isc_diags(raw"""
+        val o: Option[int] = Some(1)
+        val a = !(o is Some(m))
+
+        main()
+            print(a)
+        """), s"2:16 ${isw_binds()}\n")
+
+    assert_eq(isc_diags(raw"""
+        val o: Option[int] = Some(1)
+        val a = id(o is Some(k))
+
+        id(b: bool) -> bool = b
+
+        main()
+            print(a)
+        """), s"2:17 ${isw_binds()}\n")
+
+    // Each binding is a region of its own, so a second mistake in a later one is still told.
+    assert_eq(isc_diags(raw"""
+        val o: Option[int] = Some(1)
+        val b = !o is Some(_)
+        val c = !o
+
+        main()
+            print(b, c)
+        """), "2:9 condition must be bool, got sysl.Option[int]\n" +
+                "3:9 condition must be bool, got sysl.Option[int]\n")
+
+@test("a name a refused 'is' bound is quiet in later statements of its scope and later module bindings")
+isw_refused_names_quiet_later()
+    if xvr_no_library() then return
+
+    // In a body: a later statement, a nested block, an argument, under '!'; a name nothing bound
+    // is still undefined.
+    assert_eq(isc_diags(raw"""
+        f(o: Option[int]) -> int
+            val a = o is Some(n)
+            print(n)
+            if a
+                print(!(n == 1))
+            zz
+
+        main()
+            print(f(None))
+        """), s"2:18 ${isw_binds()}\n6:5 undefined name 'zz'\n")
+
+    // Under '!' and as an argument, read in the next statement.
+    assert_eq(isc_diags(raw"""
+        f(o: Option[int]) -> int
+            print(!(o is Some(m)), o is None)
+            m + 1
+
+        main()
+            print(f(None))
+        """), s"2:18 ${isw_binds()}\n")
+
+    // The names end with the scope the 'is' stands in: read after the block, or in another
+    // function, they are undefined again.
+    assert_eq(isc_diags(raw"""
+        f(o: Option[int]) -> int
+            if true
+                val a = o is Some(n)
+            n
+
+        g() -> int
+            n
+
+        main()
+            print(f(None), g())
+        """), s"3:22 ${isw_binds()}\n4:5 undefined name 'n'\n7:5 undefined name 'n'\n")
+
+    // At module level, a later binding of the module reads the name quietly; a name nothing bound,
+    // and a read in a function, whether written before the bindings or after, are still reported.
+    assert_eq(isc_diags(raw"""
+        g() -> int = n
+
+        val o: Option[int] = Some(1)
+        val a = o is Some(n)
+        val c = n + 1
+        val d = !(o is Some(m))
+        val e = id(m)
+        val f = zz
+
+        id(x: int) -> int = x
+
+        main()
+            print(a, c, d, e, f, g())
+            print(n)
+        """), s"1:14 undefined name 'n'\n4:14 ${isw_binds()}\n6:16 ${isw_binds()}\n" +
+              "8:9 undefined name 'zz'\n14:11 undefined name 'n'\n")
+
+    // In the entry file's own statements, the same.
+    assert_eq(isc_diags(raw"""
+        val o: Option[int] = Some(1)
+        val a = o is Some(n)
+        print(n, a)
+        print(zz)
+        """), s"2:14 ${isw_binds()}\n4:7 undefined name 'zz'\n")
+
 @test("'is not' and an alternative with a binder keep their own refusals outside a condition")
 isw_negated_and_alternative_refused()
     if xvr_no_library() then return

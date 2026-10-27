@@ -1789,6 +1789,8 @@ private pattern_binds_name(p: TPattern, name: string) -> Option[Type] = p match
 // type's zero where nothing was written, which a `val` may not and does not.
 private module_storage(a: &Analysis) -> Buf[TVal]
     var out: Buf[TVal] = buf()
+    // The names a refused `is` bound in a module binding, with the module it was written in.
+    var refused: Buf[(string, string)] = buf()
 
     for pass in 0..<2
         for i in 0..<a.tables.vals.len()
@@ -1811,6 +1813,17 @@ private module_storage(a: &Analysis) -> Buf[TVal]
                 else resolve_storage(a, d.scope, d.typ.unwrap(), d.name, writable)
 
                 var init: Option[TExpr] = None
+
+                // **The declaration is a recovery region**, as a statement in a body is
+                // (`recover_stmt`): its first refusal is the one it is told about. The names an `is`
+                // refused in an earlier one of the module's own bindings stay quiet in this one, as
+                // they do in a later statement of a body.
+                val outer = a.open_region()
+
+                for item in refused
+                    if item.0 == d.scope.module_name then cx.refused_is.push(item.1)
+
+                val seeded = cx.refused_is.len()
 
                 if inferred
                     a.vals_in_progress.push(key)
@@ -1857,6 +1870,12 @@ private module_storage(a: &Analysis) -> Buf[TVal]
                     val zero = checked_zero(cx, d.span, ty)
 
                     if !is_zero_expr(zero) then init = Some(zero)
+                end if
+
+                a.close_region(outer)
+
+                for i in seeded..<cx.refused_is.len()
+                    refused.push((d.scope.module_name, cx.refused_is.at(i)))
 
                 // What separates a `val` from a `const` is that it has an address, and a value with no
                 // representation has nothing to put one on.

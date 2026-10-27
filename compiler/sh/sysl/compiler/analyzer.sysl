@@ -81,9 +81,10 @@ struct Analyzer
     an: &Analysis
     scope: Scope
 
-    // The names in scope, innermost last, with `marks` holding where each open scope began.
+    // The names in scope, innermost last, with `marks` holding where each open scope began -- in
+    // `locals`, and in `refused_is`.
     locals: Buf[Local]
-    marks: Buf[usize]
+    marks: Buf[(usize, usize)]
 
     // Where each open scope found the file's imports. An `import` written inside a block binds for
     // the statements after it and no further, so what a block took on is taken back off at the
@@ -218,10 +219,12 @@ struct Analyzer
     // nested body or a closure is declared by whatever declared the body it is written in.
     owner: string
 
-    // The names bound by an `is` that was refused for where it stands, live until the statement it
-    // was written in ends. The reference abandons a statement at its first error, so a use of the
-    // name later in the same statement is never read there; this keeps it quiet here instead of
-    // reporting it as undefined, which it is not -- it is written right there.
+    // The names bound by an `is` that was refused for where it stands, live until the scope it was
+    // written in closes. The reference abandons a statement at its first error, so a use of the name
+    // later in the same statement is never read there; this keeps it quiet here instead of reporting
+    // it as undefined, which it is not -- it is written right there. A read in a later statement is
+    // the same mistake's consequence: the writer meant the name to be bound, and was told why it
+    // is not.
     refused_is: Buf[string]
 
     // Where a binding made now is reported from: the statement, the function header, the closure or
@@ -454,7 +457,7 @@ struct Analyzer
 
     // Opens a scope.
     enter(*self)
-        self.marks.push(self.locals.len())
+        self.marks.push((self.locals.len(), self.refused_is.len()))
         self.import_marks.push((self.scope.imports.names.len(),
                                 self.scope.imports.modules.len(),
                                 self.scope.imports.wildcards.len()))
@@ -463,9 +466,10 @@ struct Analyzer
     leave(*self)
         if self.marks.is_empty() then return
 
-        val mark = self.marks.at(self.marks.len() - 1)
+        val (mark, refused) = self.marks.at(self.marks.len() - 1)
 
         self.marks.truncate(self.marks.len() - 1)
+        self.refused_is.truncate(refused)
 
         // A `ref` bound in the scope stops being live where the scope's last statement ends.
         for i in 0..<self.an.ref_watches.len()
