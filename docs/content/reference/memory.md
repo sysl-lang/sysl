@@ -4725,15 +4725,16 @@ local, a `Buf`, or a field of a local — one at the counter of each turn of a c
 
 ```sysl
 import sysl.threads.*
+import sysl.sync.Atomic
 
 struct Tally
-    n: int
+    n: Atomic[int]
 
 add(t: *Tally)
-    t.n = t.n + 1
+    t.n.add(1)
 
 count(workers: int) -> int
-    var t = Tally(0)
+    var t = Tally(Atomic(0))
     var pool: []Option[Thread] = [None; workers]
 
     for i in 0..<workers
@@ -4742,7 +4743,7 @@ count(workers: int) -> int
     for h in pool
         if h is Some(th) then th.join()
 
-    t.n
+    t.n.load()
 
 print(count(4))
 ```
