@@ -711,6 +711,50 @@ end Reached
 // Nothing reached yet.
 private reached_none() -> &Reached = Reached(buf(), set())
 
+// Where a function was first reached: the expression being typed, the file it is in, and the body
+// whose reading reached it.
+struct ReachSite
+    src: Source
+    at: Span
+    by: string
+
+// **Where every function was first reached from**, which is what places a refusal in a body nobody
+// wrote. A `Debug` the compiler supplies, or a member a library type's `derives` wrote, is read only
+// once something reaches it, so the mistake in it is the program's at the line that asked for it --
+// followed back through whatever library bodies stood between (`print` reaching `Debug.debug`).
+//
+// `src` and `at` are the expression being typed now, innermost first (`expr.sysl`'s `typed_at`), and
+// `reading` the body being read. A site is kept for a name only while the name is reached, so a
+// trial thrown away and read again records the reading that counted.
+struct ReachSites
+    src: Option[Source]
+    at: Span
+    reading: string
+    first: Map[string, ReachSite]
+
+    // Where `name` was reached from in the program's own files, following the reaching bodies back
+    // through the library; nothing where no such site is known.
+    in_program(self, name: string, library: Source -> bool) -> Option[ReachSite]
+        var at = name
+        var steps = 0
+
+        // A chain of first reaches only ever leads back to an earlier reading, so it ends; the bound
+        // is for a table a rewind left inconsistent.
+        while steps < 256
+            val site = self.first.get(at)
+
+            if site.is_none() then return None
+            if !library(site.unwrap().src) then return site
+
+            at = site.unwrap().by
+            steps += 1
+
+        None
+    end in_program
+end ReachSites
+
+private reach_sites_none() -> &ReachSites = ReachSites(None, Span(0, 0), "", map())
+
 // Records a name in one of the reached sets, through the undo log when a trial is open. A name is
 // kept once.
 private note_reached(names: &Reached, journal: &Journal, name: string)
@@ -953,9 +997,19 @@ struct Analysis
     // its body does, so the call is asked about once every body has been typed.
     ptr_watches: Buf[PtrWatch]
 
+    // Where each function was first reached from (`ReachSites`).
+    sites: &ReachSites
+
     // Records a name as produced. The set is what matters and not the order, but the order is what
     // a walk over it reads, so a name is kept once.
-    uses(*self, name: string) = note_reached(self.reached, self.journal, name)
+    uses(*self, name: string)
+        val sites = self.sites
+
+        if sites.src.is_some() && !self.reached.holds(name) then
+            sites.first.put(name, ReachSite(sites.src.unwrap(), sites.at, sites.reading))
+
+        note_reached(self.reached, self.journal, name)
+    end uses
 
     // Records an `extern` as reached, on the same terms and through the same undo log.
     uses_extern(*self, name: string) = note_reached(self.externs_reached, self.journal, name)
@@ -1169,7 +1223,7 @@ analysis_producing(t: Target, producing: Buf[string]) -> &Analysis =
              set(), reached_none(), producing, reached_none(), reached_none(), 0, buf(), 0, None,
              false, buf(), false, None, buf(), buf(), buf(), table(), const_evaluation(), false,
              None, buf(), buf(), "", buf(), buf(), buf(), buf(), buf(), result_sites(), set(), map(), buf(),
-             buf())
+             buf(), reach_sites_none())
 
 // -- how far a declaration reaches ---------------------------------------------------------------
 
