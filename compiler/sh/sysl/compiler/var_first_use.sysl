@@ -9,8 +9,11 @@ import sysl.buf.{Buf, buf}
 //
 // **A use fixes a type where it stands at one**: compared with a typed operand, assigned a typed
 // value with `=`, handed to a parameter, returned -- every position that reads the name at a type it
-// expects. An operand of arithmetic does not: `sum + b` keeps `sum` at its default and widens `b`, as
-// it would with the default written out. Nor does a position that takes any integer at all -- an
+// expects. **Arithmetic carries the undecided type through**: `i + 1` is whatever `i` turns out to
+// be, so a comparison or a position that fixes it fixes `i`. **An operand of a type of its own beside
+// it in arithmetic does not**: `sum + b` keeps `sum` at its default and widens `b`, as it would with
+// the default written out, since sysl wraps on overflow and a narrow type the program never named
+// would wrap where the default does not. Nor does a position that takes any integer at all -- an
 // index of an array, a slice or a pointer, a slice's bounds, a vector run's start, a slot's index --
 // since no type is asked of it. A binding no use fixes has the literal's default, `int` or `real`.
 //
@@ -171,14 +174,59 @@ private numeric_scalar(t: Type) -> bool = repr(t) match
     Fixed(_, _, _) -> true
     _ -> false
 
-// A name read as an operand of arithmetic, or where an open binding's own assignment reads it, is
+// A name or arithmetic read as an operand, or where an open binding's own assignment reads it, is
 // one whose position fixes nothing: whatever its operator settles on is not a type it was used at.
 not_fixing_at(cx: &Analyzer, e: Expr)
     if cx.open_vars.is_empty() then return
 
     *e.kind match
         Ident(_) -> cx.not_fixing.push(e.span.start)
+        Unary(_, _) -> cx.not_fixing_spans.push(e.span)
+        Binary(_, _, _) -> cx.not_fixing_spans.push(e.span)
         _ -> ()
+
+// **Arithmetic over open bindings has their undecided type, as an integer variable's does in rustc**:
+// read where a type is expected of it, other than as an operand, it fixes each binding it waits on,
+// exactly as the position would fix one of them read there alone.
+arith_fixed_by_position(cx: &Analyzer, e: Expr, expected: Option[Type])
+    if expected.is_none() || cx.open_vars.is_empty() then return
+
+    for s in cx.not_fixing_spans
+        if s.start == e.span.start && s.end == e.span.end then return
+
+    for unique in opens_of(cx, e)
+        note_var_fix(cx, unique, expected.unwrap())
+end arith_fixed_by_position
+
+// The open bindings an expression's type waits on, where it is **undecided**: a literal, an open
+// binding, or arithmetic over undecided operands, which has their type -- so `i + 1` is whatever `i`
+// turns out to be. A shift has the type of the value shifted, whatever its amount. Nothing where any
+// part of it has a type of its own.
+private opens_of(cx: &Analyzer, e: Expr) -> Buf[string]
+    var found: Buf[string] = buf()
+
+    if undecided(cx, e, found) then found else buf()
+
+private undecided(cx: &Analyzer, e: Expr, into: Buf[string]) -> bool
+    if literal_default(e).is_some() then return true
+
+    val open = open_name(cx, e)
+
+    if open.is_some()
+        into.push(open.unwrap())
+        return true
+    end if
+
+    *e.kind match
+        Unary(op, operand) -> (op == "-" || op == "~") && undecided(cx, operand, into)
+        Binary(op, l, r) ->
+            if op == "<<" || op == ">>" then undecided(cx, l, into)
+            else arithmetic_op(op) && undecided(cx, l, into) && undecided(cx, r, into)
+        _ -> false
+end undecided
+
+private arithmetic_op(op: string) -> bool =
+    op == "+" || op == "-" || op == "*" || op == "/" || op == "%" || op == "&" || op == "|" || op == "^"
 
 // The open binding an expression names, if it is one.
 private open_name(cx: &Analyzer, e: Expr) -> Option[string]
@@ -216,13 +264,14 @@ end reads_open
 private fixes_a_neighbour(cx: &Analyzer, e: Expr, t: TExpr) -> bool =
     texpr_type(t) != Unknown && !adaptable(e, t) && open_name(cx, e).is_none() && !reads_open(cx, t)
 
-// A comparison: an open binding compared with an operand of a type of its own is fixed at that type.
+// A comparison: an undecided operand compared with an operand of a type of its own is that type, so
+// each open binding it waits on is fixed at it -- `i < xs.len` and `i + 1 < xs.len` each fix `i`.
 // `own` holds each operand's reading alone, before the pair settles anything.
 compare_fixes(cx: &Analyzer, operands: Buf[Expr], own: Buf[Option[TExpr]])
     for i in 0..<operands.len()
-        val unique = open_name(cx, operands.at(i))
+        val opens = opens_of(cx, operands.at(i))
 
-        if unique.is_none() then continue
+        if opens.is_empty() then continue
 
         for j in 0..<operands.len()
             if j + 1 != i && j != i + 1 then continue
@@ -230,7 +279,9 @@ compare_fixes(cx: &Analyzer, operands: Buf[Expr], own: Buf[Option[TExpr]])
             own.at(j) match
                 Some(t) ->
                     if fixes_a_neighbour(cx, operands.at(j), t)
-                        note_var_fix(cx, unique.unwrap(), texpr_type(t))
+                        for unique in opens
+                            note_var_fix(cx, unique, texpr_type(t))
+
                         break
                     end if
                 None -> ()
