@@ -1,0 +1,335 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.source_of
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.Search
+
+// **A variant whose payload is one `&T` field** is that field, so the payload `x.(c)` hands a walk is
+// already a `&T`. Every walk over the payload -- the supplied `Debug`, a derived `Display`, `Eq`,
+// `Hash` -- then selects the field with `p.(f)`, and that selection used to read through the
+// reference first and compare the `T` it found with the `&T` the descriptor names, refusing the copy
+// for that variant. The second half is where such a refusal is placed: a member written from a
+// `derive` body that nothing in the program asked for by name -- the `Debug` every type is given, a
+// library type's own `derives` -- is the program's mistake at the line that reached it.
+
+private struct ErpRun
+    ok: bool
+    out: string
+    err: string
+
+private erp_ready() -> bool
+    if std_root().is_err() || !clang_available()
+        print("skipped: the library or the toolchain is not on this machine")
+        return false
+    end if
+
+    true
+end erp_ready
+
+// The program built on the counted heap and run; a build that failed answers `ok` false with the
+// reason in `out`.
+private erp_run(text: string) -> ErpRun
+    val root = make_temp_dir("sysl-erp").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+    force_alloc_counting(true)
+
+    val built = build_native_program(s"$root/main.sysl", None, None, DefaultOptimization,
+                                     Some(s"$root/built"))
+
+    force_alloc_counting(false)
+
+    built match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return ErpRun(false, failure_text(why), "")
+        Ok(_) -> ()
+
+    val said = capture(s"$root/built", [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> ErpRun(false, "could not be started", "")
+        Ok(o) -> ErpRun(o.status.ok(), o.text, o.err.unwrap_or(""))
+end erp_run
+
+// The program ran to the end, printed `want`, and gave back every allocation it made.
+private erp_prints(text: string, want: string)
+    val run = erp_run(text)
+
+    assert(run.ok, run.out)
+    assert_eq(run.out, want)
+    assert(run.err == "", run.err)
+    assert(alloc_count_reported(run.err) == 0)
+end erp_prints
+
+private erp_types() -> string = raw"""
+    struct T
+        name: string
+
+    struct R
+        id: int
+
+    impl Drop for R
+        drop(self) = print(s"drop ${self.id}")
+
+    """
+
+@test("a variant holding one '&T' prints, which is the reported program")
+erp_one_ref_field_prints()
+    if !erp_ready() then return
+
+    erp_prints(raw"""
+        struct T
+            name: string
+
+        enum Rule
+            A(n: int)
+            B(t: &T)
+
+        main()
+            print(B(T("x")))
+        """, "Rule.B(t: T(name: \"x\"))\n")
+
+@test("'&T' beside value fields, the other variants, and a string hole all print")
+erp_mixed_fields()
+    if !erp_ready() then return
+
+    erp_prints(erp_types() + raw"""
+        enum Rule
+            A(n: int)
+            B(t: &T)
+            C(n: int, t: &T, s: string)
+            D
+
+        main()
+            val t = T("x")
+
+            print(B(t))
+            print(A(3))
+            print(C(1, t, "s"))
+            print(D)
+            print(s"${B(t)} and ${C(2, t, "q")}")
+            print(B(t).to_string().len)
+        """, "Rule.B(t: T(name: \"x\"))\nRule.A(n: 3)\nRule.C(n: 1, t: T(name: \"x\"), s: \"s\")\n" +
+             "Rule.D\nRule.B(t: T(name: \"x\")) and Rule.C(n: 2, t: T(name: \"x\"), s: \"q\")\n23\n")
+
+@test("a '&T' reached through a struct, a nested enum, a generic, an Option and a Result prints")
+erp_nested_and_generic()
+    if !erp_ready() then return
+
+    erp_prints(erp_types() + raw"""
+        struct Holder
+            t: &T
+
+        enum Rule
+            B(t: &T)
+
+        enum Nest
+            N(h: Holder)
+            M(r: Rule)
+
+        enum Box[X]
+            One(x: X)
+            Nothing
+
+        enum Wrap
+            O(o: Option[&T])
+            E(r: Result[&T, string])
+
+        main()
+            val t = T("x")
+            val none: Box[&T] = Nothing
+
+            print(N(Holder(t)))
+            print(M(B(t)))
+            print(One(t))
+            print(One(7))
+            print(none)
+            print(O(Some(t)))
+            print(O(None))
+            print(E(Ok(t)))
+            print(E(Err("no")))
+        """, "Nest.N(h: Holder(t: T(name: \"x\")))\nNest.M(r: Rule.B(t: T(name: \"x\")))\n" +
+             "Box.One(x: T(name: \"x\"))\nBox.One(x: 7)\nBox.Nothing\nWrap.O(o: Some(T(name: \"x\")))\n" +
+             "Wrap.O(o: None)\nWrap.E(r: Ok(T(name: \"x\")))\nWrap.E(r: Err(\"no\"))\n")
+
+@test("a '&sync T', a '*T' and a dropped '&R' payload print, and each 'R' is dropped once")
+erp_sync_pointer_and_drop()
+    if !erp_ready() then return
+
+    erp_prints(raw"""
+        struct T
+            n: int
+
+        struct R
+            id: int
+
+        impl Drop for R
+            drop(self) = print(s"drop ${self.id}")
+
+        enum E
+            S(s: &sync T)
+            M(a: &sync T, b: int)
+            D(r: &R)
+            Two(a: &R, n: int)
+            P(p: *T)
+
+        main()
+            val t: &sync T = T(3)
+
+            print(S(t))
+            print(M(t, 2))
+            print(D(R(4)))
+
+            val o = Two(R(5), 6)
+            val p = o
+
+            print(p)
+            print(s"$o")
+        """, "E.S(s: T(n: 3))\nE.M(a: T(n: 3), b: 2)\nE.D(r: R(id: 4))\ndrop 4\n" +
+             "E.Two(a: R(id: 5), n: 6)\nE.Two(a: R(id: 5), n: 6)\ndrop 5\n")
+
+// `==` on a `&T` is identity, as it is for a struct's `&T` field: equal values in two boxes differ.
+@test("derived Display, Eq and Hash walk a '&T' payload, and Eq agrees with a struct's '&T' field")
+erp_derived_walks()
+    if !erp_ready() then return
+
+    erp_prints(raw"""
+        struct T derives Eq, Hash, Display
+            name: string
+
+        struct S derives Eq
+            t: &T
+
+        enum Rule derives Eq, Hash, Display
+            A(n: int)
+            B(t: &T)
+            C(n: int, t: &T)
+
+        main()
+            val r: &T = T("x")
+            val u: &T = T("y")
+
+            print(B(r))
+            print(s"${C(2, u)}")
+            print(B(r) == B(r), B(r) == B(u), B(r) == A(1), C(1, r) == C(1, r), C(1, r) == C(2, r))
+            print(B(r) == B(T("x")), S(r) == S(T("x")), S(r) == S(r))
+            print(B(r).hash() == B(r).hash(), B(r).hash() == B(u).hash())
+        """, "B(T(x))\nC(2, T(y))\ntrue false false true false\nfalse false true\ntrue false\n")
+
+// -- where a refusal in a member written from a `derive` body is placed ---------------------------
+
+private var erp_std_cache: Buf[Program] = buf()
+private var erp_std_read: bool = false
+
+private erp_std() -> Buf[Program]
+    if erp_std_read then return erp_std_cache
+
+    erp_std_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> erp_std_cache = units
+
+    erp_std_cache
+end erp_std
+
+// Every error the compilation reported, as `file:line: message`: the standard module, a file
+// standing in for one more of its own (`lib`, empty for none), and the program's `main.sysl`.
+private erp_reported(lib: string, main: string) -> Buf[string]
+    var units: Buf[Program] = buf()
+
+    for item in erp_std()
+        units.push(item)
+
+    if lib != "" then units.push(parse(source_of(s"$StdPrefix/sysl/erp_probe.sysl", lib)).program)
+
+    units.push(parse(source_of("main.sysl", main)).program)
+
+    var out: Buf[string] = buf()
+
+    for item in analyze_bodies(units, host_target()).reported
+        if item.is_error()
+            out.push(s"${item.src.name}:${item.src.locate(item.diag.span.start).line}: ${item.diag.message}")
+
+    out
+end erp_reported
+
+private erp_joined(xs: Buf[string]) -> string
+    var out = ""
+
+    for x in xs
+        out = out + x + "\n"
+
+    out
+end erp_joined
+
+private erp_no_std() -> bool
+    if erp_std().is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return true
+
+    false
+end erp_no_std
+
+private erp_lib() -> string = raw"""
+    module sysl
+
+    struct ErpBare
+        n: int
+
+    struct ErpShown derives Display
+        b: ErpBare
+    """
+
+@test("a refusal in a library type's derived member is placed at the program line that reached it")
+erp_library_derive_refusal_at_use()
+    if erp_no_std() then return
+
+    val got = erp_reported(erp_lib(), "val x = ErpShown(ErpBare(1))\nval n = 2\nprint(s\"${x}\")\n")
+    val said = erp_joined(got)
+
+    assert(!got.is_empty(), said)
+
+    for line in got
+        assert(line.starts_with("main.sysl:3: "), said)
+
+    assert(said.contains("(in the copy for field 'sysl.ErpShown.b')"), said)
+
+@test("and a program that never reaches it hears nothing about it")
+erp_library_derive_unreached_is_silent()
+    if erp_no_std() then return
+
+    val got = erp_reported(erp_lib(), "val n = 2\nprint(n)\n")
+
+    assert(got.is_empty(), erp_joined(got))
+
+@test("a refusal in a derived member the program asked for stays at its 'derives' clause")
+erp_written_derive_refusal_at_clause()
+    if erp_no_std() then return
+
+    val got = erp_reported("", raw"""
+        struct T derives Eq, Ord
+            name: string
+
+        enum Rule derives Eq, Ord
+            A(n: int)
+            B(t: &T)
+
+        print(A(1) < A(2))
+        """)
+    val said = erp_joined(got)
+
+    assert(!got.is_empty(), said)
+
+    for line in got
+        assert(line.starts_with("main.sysl:4: '<' is not defined for &T (in the copy for field " +
+                                "'Rule.B.t') (in the copy for variant 'Rule.B')"), said)
