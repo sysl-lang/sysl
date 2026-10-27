@@ -1,0 +1,199 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.remove_dir_all
+import sysl.text.{Search, replace_all}
+
+// The keeps-analysis (`keeps.sysl`) settles the answers its first round left open a component at a
+// time (`settle_components`): the answers that lean on each other in a ring are worked out again
+// until they stop moving, callees' components first, and an answer in no ring is worked out once from
+// answers already settled. Each cell is a ring a verdict has to come round -- what a call keeps, what
+// its answer is made of, what it overwrites on every way out -- with its control where the ring lets
+// the pointer go.
+//
+// The axes: the ring's shape (a body calling itself, two bodies, six, two rings one above the other,
+// sixteen thousand rings in a chain), where its members are (one module, a ring in each of two), what
+// they are (plain functions, a generic's instantiations), and the question that comes round (keeps,
+// answers, clears).
+//
+// Skipped cells, and why: a ring through two modules -- refused, since modules may not depend on each
+// other; a ring of thousands of bodies -- its first round nests a walk per member, as
+// it did before components were settled, so it is the first round's depth and not this one's; a ring
+// through a trait object or a function pointer -- those calls are held to what the bodies they may
+// land in keep by rule (`vcall_keeps`, `pointer_keeps`), not by a question that comes round; a
+// build-lib split -- the analysis is per program, over the bodies the program reaches.
+
+private val ksc_store: string = "var spare = 0\nvar held: *int = &spare\n\nstore(p: *int)\n    held = p\n\nread(p: *int)\n    spare = *p\n\n"
+
+// Every message the analysis reports of `text`, one per line, or nothing.
+private ksc_said(text: string) -> string
+    val done = typed_of(text)
+    var out = ""
+
+    for item in done.reported
+        out = out + item.diag.message + "\n"
+
+    out
+end ksc_said
+
+private ksc_join(lines: Buf[string]) -> string
+    var text = ""
+
+    for item in lines
+        text = text + item
+
+    text
+end ksc_join
+
+@test("a body calling itself keeps what its base case stores, and not what it reads")
+ksc_self_ring()
+    val ring = "f(p: *int, k: int)\n    if k == 0 then store(p) else f(p, k - 1)\n\n"
+    val head = ksc_store + "main()\n    var n = 1\n    f(&n, 3)\n\n"
+    val kept = ksc_said(head + ring)
+
+    assert(kept.contains("is the address of a local of 'main'"), kept)
+    assert(kept.contains("'f'"), kept)
+    assert_eq(ksc_said(head + replace_all(ring, "store(p)", "read(p)")), "")
+
+@test("two bodies calling each other keep what either one stores, asked of the one the store is not in")
+ksc_two_ring()
+    val ring = "f(p: *int, k: int)\n    if k == 0 then g(p, k) else g(p, k - 1)\n\n" +
+               "g(p: *int, k: int)\n    if k == 0 then store(p) else f(p, k)\n\n"
+    val head = ksc_store + "main()\n    var n = 1\n    f(&n, 3)\n\n"
+    val kept = ksc_said(head + ring)
+
+    assert(kept.contains("'f' keeps its parameter 'p'"), kept)
+    assert_eq(ksc_said(head + replace_all(ring, "store(p)", "read(p)")), "")
+
+@test("a ring of six keeps what its far member stores, at each place the ring is entered")
+ksc_six_ring()
+    var lines: Buf[string] = buf()
+
+    lines.push(ksc_store + "enter0()\n    var n = 1\n    r0(&n, 9)\n\nenter3()\n    var m = 2\n    r3(&m, 9)\n\n" +
+               "main()\n    enter0()\n    enter3()\n\n")
+
+    for i in 0..<6
+        val next = (i + 1) % 6
+
+        if i == 5
+            lines.push(s"r$i(p: *int, k: int)\n    if k == 0 then store(p) else r$next(p, k - 1)\n\n")
+        else
+            lines.push(s"r$i(p: *int, k: int)\n    r$next(p, k)\n\n")
+    end for
+
+    val text = ksc_join(lines)
+    val kept = ksc_said(text)
+
+    assert(kept.contains("'r0' keeps its parameter 'p'"), kept)
+    assert(kept.contains("'r3' keeps its parameter 'p'"), kept)
+    assert_eq(ksc_said(replace_all(text, "store(p)", "read(p)")), "")
+
+@test("a ring calling a ring below it keeps what the lower one stores, and the lower settles first")
+ksc_ring_over_ring()
+    val lower = "l1(p: *int, k: int)\n    if k == 0 then store(p) else l2(p, k - 1)\n\n" +
+                "l2(p: *int, k: int)\n    l1(p, k)\n\n"
+    val upper = "u1(p: *int, k: int)\n    if k == 0 then l1(p, 3) else u2(p, k - 1)\n\n" +
+                "u2(p: *int, k: int)\n    u1(p, k)\n\n"
+    val head = ksc_store + "main()\n    var n = 1\n    u1(&n, 3)\n\n"
+    val kept = ksc_said(head + upper + lower)
+
+    assert(kept.contains("'u1' keeps its parameter 'p'"), kept)
+    assert_eq(ksc_said(head + upper + replace_all(lower, "store(p)", "read(p)")), "")
+
+@test("a pointer handed back round a ring is what the answer is made of, and a module's own is not")
+ksc_answer_ring()
+    val ring = "up(p: *int, k: int) -> *int = if k == 0 then p else down(p, k - 1)\n\n" +
+               "down(p: *int, k: int) -> *int = up(p, k)\n\n"
+    val head = ksc_store + "main()\n    var n = 1\n    store(up(&n, 3))\n\n"
+    val kept = ksc_said(head + ring)
+
+    assert(kept.contains("'store' keeps its parameter 'p'"), kept)
+    assert_eq(ksc_said(head + replace_all(ring, "then p else", "then &spare else")), "")
+
+@test("what a ring overwrites on every way out takes back a local's address; one way out that does not, does not")
+ksc_clears_ring()
+    val ring = "reset(q: **int, k: int)\n    if k == 0 then *q = &spare else again(q, k - 1)\n\n" +
+               "again(q: **int, k: int)\n    reset(q, k)\n\n"
+    val head = ksc_store + "use(q: **int)\n    var n = 1\n\n    *q = &n\n    reset(q, 3)\n\n" +
+               "main()\n    var p: *int = &spare\n\n    use(&p)\n    spare = *p\n\n"
+
+    assert_eq(ksc_said(head + ring), "")
+
+    val kept = ksc_said(head + replace_all(ring, "else again", "else if k < 9 then again"))
+
+    assert(kept.contains("'&n' is the address of a local of 'use', and it is stored in '*q', which outlives 'use'"),
+           kept)
+
+@test("a generic's instantiations calling each other round a ring each keep what the base case stores")
+ksc_generic_ring()
+    val ring = "hop[T](p: *int, x: T, k: int)\n    if k == 0 then store(p) else skip(p, x, k - 1)\n\n" +
+               "skip[T](p: *int, x: T, k: int)\n    hop(p, x, k)\n\n"
+    val head = ksc_store + "at_int()\n    var n = 1\n    hop(&n, 7, 3)\n\nat_bool()\n    var m = 2\n    hop(&m, true, 3)\n\n" +
+               "main()\n    at_int()\n    at_bool()\n\n"
+    val kept = ksc_said(head + ring)
+
+    assert(kept.contains("'&n' is the address of a local of 'at_int'"), kept)
+    assert(kept.contains("'&m' is the address of a local of 'at_bool'"), kept)
+    assert_eq(ksc_said(head + replace_all(ring, "store(p)", "read(p)")), "")
+
+// The KdcDepth-style chain: sixteen thousand two-body rings, each ring's way out calling the next ring.
+// Every answer above the bottom leans on a ring, so every one is open after the first round, and the
+// components are sixteen thousand deep.
+private val KscRings: usize = 16000
+
+private ksc_chain_of_rings(bottom: string) -> string
+    var lines: Buf[string] = buf()
+
+    lines.push(ksc_store + "main()\n    var n = 1\n    f0(&n, 2)\n\n")
+
+    for i in 0..<KscRings
+        val out = if i + 1 < KscRings then s"f${i + 1}(p, 2)" else bottom
+
+        lines.push(s"f$i(p: *int, k: int)\n    if k == 0 then $out else g$i(p, k - 1)\n\n")
+        lines.push(s"g$i(p: *int, k: int)\n    f$i(p, k)\n\n")
+
+    ksc_join(lines)
+end ksc_chain_of_rings
+
+@test("sixteen thousand rings in a chain are settled a ring at a time, and the bottom's keep reaches the top")
+ksc_chain_of_rings_settles()
+    val kept = ksc_said(ksc_chain_of_rings("store(p)"))
+
+    assert(kept.contains("'f0' keeps its parameter 'p'"), kept)
+    assert_eq(ksc_said(ksc_chain_of_rings("read(p)")), "")
+
+// -- across modules ------------------------------------------------------------------------------------
+
+private ksc_built(a: string, b: string) -> string
+    var fs = im_files()
+
+    fs.push(("", "main.sysl", "main()\n    var n = 1\n\n    a.up(&n, 3)\n    print(n)\n"))
+    fs.push(("a", "a.sysl", a))
+    fs.push(("b", "b.sysl", b))
+
+    val root = im_write(fs)
+    val said = build_native_program(root, None, None, DefaultOptimization, Some(root + "/built")) match
+        Err(why) -> failure_text(why)
+        Ok(_) -> "built"
+
+    remove_dir_all(root).unwrap_or(())
+    said
+end ksc_built
+
+// A ring cannot pass through two modules -- modules may not depend on each other, directly or through a
+// chain -- so the cell across modules is a ring in one module over a ring in another.
+@test("a ring in one module over a ring in another keeps what the lower module's ring stores")
+ksc_rings_across_modules()
+    if im_can_run() then return
+
+    val a = "module a\n\nup(p: *int, k: int)\n    if k == 0 then b.hop(p, 3) else down(p, k - 1)\n\n" +
+            "down(p: *int, k: int)\n    up(p, k)\n"
+    val b = "module b\n\nvar spare = 0\nvar held: *int = &spare\n\n" +
+            "hop(p: *int, k: int)\n    if k == 0 then held = p else skip(p, k - 1)\n\n" +
+            "skip(p: *int, k: int)\n    hop(p, k)\n"
+    val kept = ksc_built(a, b)
+
+    assert(kept.contains("'up' keeps its parameter 'p' (it is passed to 'hop', which keeps it), and '&n' is the address of a local of 'main'"),
+           kept)
+    assert_eq(ksc_built(a, replace_all(b, "held = p", "spare = *p")), "built")

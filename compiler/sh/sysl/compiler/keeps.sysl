@@ -46,7 +46,7 @@ struct KeptWhy
     at: Span
     locs: Buf[KeptAt]
 
-    // What a round compares, to know whether an answer moved.
+    // What a pass compares, to know whether an answer moved.
     sig(self) -> string
         var out = if self.kept then "1" else "0"
 
@@ -70,11 +70,11 @@ end clears_all
 
 // What the walk over a program keeps between bodies.
 //
-// **The answers are a fixed point reached a round at a time.** A function asked about while its own
-// answer is still being worked out -- recursion -- is answered with what the last round settled on,
-// starting from "keeps nothing", and every answer that leaned on such an assumption is held for the
-// round only. A round that changes none of those answers is the last: every walk only turns more of
-// its answer on as the answers it reads grow, so the rounds settle.
+// **The answers are a fixed point.** A function asked about while its own answer is still being
+// worked out -- recursion -- is answered with what the last pass settled on, starting from "keeps
+// nothing", and every answer that leaned on such an assumption is held open. The open answers are
+// worked out again, a component of them at a time (`settle_components`), until a pass changes none
+// of them: every walk only turns more of its answer on as the answers it reads grow, so they settle.
 struct KeepsCx
     an: &Analysis
     funcs: Buf[TFunc]
@@ -132,12 +132,28 @@ struct KeepsCx
     // The bodies holding an expression that was refused where it was read (`mistaken`), by name.
     mistaken: Map[string, bool]
 
+    // Every open answer read by the walks under way, in order (`leaned_on`); for each answer the first
+    // round left open, the open answers its walk read and the question it answers; and for each
+    // gathering of origins or handles that read open answers, which ones, by function.
+    reads: Buf[string]
+    deps: Map[string, Buf[string]]
+    questions: Map[string, (string, usize, string)]
+    origin_deps: Map[string, Buf[string]]
+    handle_deps: Map[string, Buf[string]]
+    leaning: Buf[string]
+
+    // While the open answers are settled a component at a time (`settle_components`): the members of
+    // the one under way, and whether a walk read an open answer outside it.
+    resolving: bool
+    members: Map[string, bool]
+    strayed: bool
+
     find(self, name: string) -> Option[TFunc] = self.index.get(name) match
         Some(i) -> Some(self.funcs.at(i))
         None -> None
 end KeepsCx
 
-// The refusals a round makes, held until the round is known to be the last.
+// The refusals the calls are held to, gathered so that each site is told once.
 struct KeepFaults
     items: Buf[(Scope, Span, string)]
 end KeepFaults
@@ -153,7 +169,7 @@ check_keeps(a: &Analysis, funcs: Buf[TFunc], vtables: Buf[TVtable])
 
     val cx: &KeepsCx = KeepsCx(a, funcs, index, map(), map(), map(), buf(), buf(), false, 0, map(),
                                map(), buf(), map(), buf(), map(), map(), map(), vtables, cast_graph_new(),
-                               map())
+                               map(), buf(), map(), map(), map(), map(), buf(), false, map(), false)
 
     for i in 0..<a.tables.extern_vars.len()
         cx.c_vars.push(extern_var_symbol(a.tables.extern_vars.at(i)))
@@ -192,34 +208,27 @@ check_keeps(a: &Analysis, funcs: Buf[TFunc], vtables: Buf[TVtable])
                 escape_types(cx, p.1, 0)
         end if
 
-    var faults: &KeepFaults = KeepFaults(buf())
-    var rounds = 0
+    // The first round asks every question, and settles every answer that leaned on no assumption.
+    // The ones it left open are settled a component at a time, callees first; a walk that strays
+    // outside its component -- it read an open answer the first round never saw it lean on -- sends
+    // the whole program back to rounds over everything.
+    warm_callees_first(cx)
 
-    loop
-        faults = KeepFaults(buf())
-        cx.casts = cast_graph_new()
+    if !round_settled(cx)
+        settle_components(cx)
 
-        warm_callees_first(cx)
+        if cx.strayed then settle_by_rounds(cx)
+    end if
 
-        rounds += 1
+    // **The calls are held to the rule once every answer is settled**, since only those refusals
+    // are told. Every question was asked by the warming, so holding the calls reads answers and
+    // changes none of them.
+    val faults: &KeepFaults = KeepFaults(buf())
 
-        // A clear assumed of a recursive callee narrows as the keeps it undoes grow, so the rounds
-        // are not monotone in both at once; a program that has not settled by now is one whose
-        // answers swing between two, and the last round's is as good as either.
-        //
-        // **Only the last round's calls are held to the rule**, since only its refusals are told.
-        // Every question was asked by the warming, so holding the calls reads answers and changes
-        // none of them: a round that is not the last would have made refusals and thrown them away.
-        if round_settled(cx) || rounds >= 12
-            for f in funcs
-                check_calls(cx, faults, f)
-                refuse_promised(cx, faults, f)
-                refuse_spread(cx, faults, f)
-
-            break
-        end if
-
-        next_round(cx)
+    for f in funcs
+        check_calls(cx, faults, f)
+        refuse_promised(cx, faults, f)
+        refuse_spread(cx, faults, f)
 
     var said: Buf[Span] = buf()
 
@@ -398,7 +407,218 @@ private next_round(cx: &KeepsCx)
     cx.assumed = buf()
     cx.origins = map()
     cx.handles = map()
+    cx.origin_deps = map()
+    cx.handle_deps = map()
+    cx.leaning = buf()
 end next_round
+
+// **The answers the first round left open are settled a component at a time.** Each open answer
+// leaned on others (`deps`), and those that lean on each other in a ring are one component: a
+// recursion, or a chain of calls that comes back to where it started. The components are settled
+// callees first, so every answer a component leans on outside itself is settled before it starts,
+// and only the component's own answers are worked out again until they stop moving. An open answer
+// in no ring leaned only on answers settled before it, and is worked out once.
+//
+// Rounds over everything (`settle_by_rounds`) do the same work once per round for every answer that
+// leaned on any recursion anywhere below it -- most of a program, through its callers -- however far
+// away the recursion is.
+private settle_components(cx: &KeepsCx)
+    val comps = open_components(cx)
+
+    cx.resolving = true
+
+    for comp in comps
+        settle_component(cx, comp)
+
+        if cx.strayed then break
+
+    cx.resolving = false
+    cx.members = map()
+    forget_leaning(cx)
+end settle_components
+
+// A component's answers, worked out again -- each one asked while it was still being worked out
+// answered with the last pass's -- until a pass changes none of them. A clear assumed of a recursive
+// callee narrows as the keeps it undoes grow, so the passes are not monotone in both at once; a
+// component that has not settled by the twelfth (the first round's among them) is one whose answers
+// swing between two, and the last pass's is as good as either.
+private settle_component(cx: &KeepsCx, comp: Buf[string])
+    cx.members = map()
+
+    for key in comp
+        cx.members.put(key, true)
+
+    var passes = 1
+
+    loop
+        passes += 1
+
+        // Whatever was gathered from an answer still open is gathered again from this pass's.
+        forget_leaning(cx)
+        cx.reads = buf()
+
+        for key in comp
+            cx.prev.put(key, cx.round.get(key).unwrap_or(assumed_answer(key)))
+            cx.round.remove(key)
+
+        for key in comp
+            if cx.settled.has(key) || cx.round.has(key) then continue
+
+            val q = cx.questions.get(key).unwrap()
+
+            summary(cx, q.0, q.1, q.2)
+
+        if cx.strayed then return
+
+        // A member that leaned on no other this pass came out settled. The pass is the last when none
+        // leaned, or when none of those that did moved.
+        var open = false
+        var moved = false
+
+        for key in comp
+            if cx.settled.has(key) then continue
+
+            val now = cx.round.get(key).unwrap_or(assumed_answer(key)).sig()
+
+            open = true
+
+            if now != cx.prev.get(key).unwrap_or(assumed_answer(key)).sig() then moved = true
+
+        if !open || !moved || passes >= 12
+            for key in comp
+                cx.round.get(key) match
+                    Some(v) ->
+                        cx.settled.put(key, v)
+                        cx.round.remove(key)
+                    None -> ()
+
+            return
+        end if
+    end loop
+end settle_component
+
+// Drops every gathering of origins or handles that read an answer still open.
+private forget_leaning(cx: &KeepsCx)
+    for name in cx.leaning
+        if cx.origin_deps.has(name)
+            cx.origins.remove(name)
+            cx.origin_deps.remove(name)
+        end if
+
+        if cx.handle_deps.has(name)
+            cx.handles.remove(name)
+            cx.handle_deps.remove(name)
+        end if
+
+    cx.leaning = buf()
+end forget_leaning
+
+// The open answers' components, each one after every component it leans on (Tarjan's, on a stack of
+// its own: a chain of open answers may be as long as the program). Each component lists its answers
+// with the ones found last -- the callees -- first.
+private open_components(cx: &KeepsCx) -> Buf[Buf[string]]
+    var out: Buf[Buf[string]] = buf()
+    var index: Map[string, usize] = map()
+    var low: Map[string, usize] = map()
+    var on: Map[string, bool] = map()
+    var stack: Buf[string] = buf()
+    var count: usize = 0
+
+    for root in cx.assumed
+        if index.has(root) || !cx.round.has(root) then continue
+
+        var names: Buf[string] = buf()
+        var next: Buf[usize] = buf()
+
+        index.put(root, count)
+        low.put(root, count)
+        count += 1
+        stack.push(root)
+        on.put(root, true)
+        names.push(root)
+        next.push(0)
+
+        while names.len() > 0
+            val top = names.len() - 1
+            val v = names.at(top)
+            val at = next.pop().unwrap_or(0)
+            val succ = cx.deps.get(v).unwrap_or(buf())
+
+            if at < succ.len()
+                next.push(at + 1)
+
+                val w = succ.at(at)
+
+                if !cx.round.has(w) then continue
+
+                if !index.has(w)
+                    index.put(w, count)
+                    low.put(w, count)
+                    count += 1
+                    stack.push(w)
+                    on.put(w, true)
+                    names.push(w)
+                    next.push(0)
+                else if on.has(w)
+                    val iw = index.get(w).unwrap()
+
+                    if iw < low.get(v).unwrap() then low.put(v, iw)
+                end if
+            else
+                names.truncate(top)
+
+                val lv = low.get(v).unwrap()
+
+                if top > 0
+                    val u = names.at(top - 1)
+
+                    if lv < low.get(u).unwrap() then low.put(u, lv)
+                end if
+
+                if lv == index.get(v).unwrap()
+                    var comp: Buf[string] = buf()
+
+                    loop
+                        val w = stack.pop().unwrap()
+
+                        on.remove(w)
+                        comp.push(w)
+
+                        if w == v then break
+
+                    out.push(comp)
+                end if
+            end if
+        end while
+
+    out
+end open_components
+
+// The rounds over everything: every answer that leaned on an assumption is worked out again, a round
+// at a time, until a round changes none of them -- or, swinging between two, by the twelfth.
+private settle_by_rounds(cx: &KeepsCx)
+    cx.settled = map()
+    cx.round = map()
+    cx.prev = map()
+    cx.assumed = buf()
+    cx.origins = map()
+    cx.handles = map()
+    cx.origin_deps = map()
+    cx.handle_deps = map()
+    cx.leaning = buf()
+    cx.reads = buf()
+
+    var rounds = 0
+
+    loop
+        warm_callees_first(cx)
+
+        rounds += 1
+
+        if round_settled(cx) || rounds >= 12 then break
+
+        next_round(cx)
+end settle_by_rounds
 
 // **Every body's questions are asked callees first**, so that answering one never nests a walk per
 // call down a chain as long as the program: a body is asked after every body it calls has been, and
@@ -517,12 +737,14 @@ private summary(cx: &KeepsCx, name: string, i: usize, q: string) -> KeptWhy
     cx.round.get(key) match
         Some(v) ->
             cx.taint = true
+            leaned_on(cx, key)
             return v
         None -> ()
 
     if holds_string(cx.busy, key)
         cx.taint = true
         cx.busy_reads += 1
+        leaned_on(cx, key)
         return cx.prev.get(key).unwrap_or(assumed_answer(key))
     end if
 
@@ -558,10 +780,15 @@ private summary(cx: &KeepsCx, name: string, i: usize, q: string) -> KeptWhy
         if crossed.is_some() then return crossed.unwrap()
     end if
 
+    // Settling a component walks only its own members: any other question still open is one the
+    // first round never saw a walk lean on.
+    if cx.resolving && !cx.members.has(key) then cx.strayed = true
+
     cx.busy.push(key)
 
     val outer = cx.taint
     val reads = cx.busy_reads
+    val logged = cx.reads.len()
 
     cx.taint = false
 
@@ -578,6 +805,14 @@ private summary(cx: &KeepsCx, name: string, i: usize, q: string) -> KeptWhy
     if leaned
         cx.round.put(key, out)
         cx.assumed.push(key)
+        cx.deps.put(key, logged_since(cx, logged))
+        cx.questions.put(key, (name, i, q))
+    end if
+
+    cx.reads.truncate(logged)
+
+    if leaned
+        leaned_on(cx, key)
     else
         cx.settled.put(key, out)
     end if
@@ -585,6 +820,30 @@ private summary(cx: &KeepsCx, name: string, i: usize, q: string) -> KeptWhy
     cx.taint = outer || leaned
     out
 end summary
+
+// A read of an answer still open, logged against every walk under way: what each one leaned on is
+// what the log gained while it ran.
+leaned_on(cx: &KeepsCx, key: string)
+    if cx.resolving && !cx.members.has(key) then cx.strayed = true
+
+    cx.reads.push(key)
+end leaned_on
+
+// The open answers read since the log stood at `from`, each once.
+logged_since(cx: &KeepsCx, from: usize) -> Buf[string]
+    var out: Buf[string] = buf()
+    var seen: Map[string, bool] = map()
+
+    for at in from..<cx.reads.len()
+        val key = cx.reads.at(at)
+
+        if seen.has(key) then continue
+
+        seen.put(key, true)
+        out.push(key)
+
+    out
+end logged_since
 
 // **A call through an object lands in the slot of every table made against its trait.** A raw pointer
 // it hands over is borrowed by the trait's promise, each such body held to it where it is written;
@@ -829,18 +1088,31 @@ private round_handles(cx: &KeepsCx, org: &Origins, f: TFunc) -> &Handles
         Some(kept) ->
             if kept.1 then cx.taint = true
 
+            for key in cx.handle_deps.get(f.name).unwrap_or(buf())
+                leaned_on(cx, key)
+
             return handles_copy(kept.0)
         None -> ()
 
     val outer = cx.taint
     val reads = cx.busy_reads
+    val logged = cx.reads.len()
 
     cx.taint = false
 
     val hs = handles_of(org, f)
     val leaned = cx.taint
 
-    if cx.busy_reads == reads then cx.handles.put(f.name, (handles_copy(hs), leaned))
+    if cx.busy_reads == reads
+        cx.handles.put(f.name, (handles_copy(hs), leaned))
+
+        val deps = logged_since(cx, logged)
+
+        if !deps.is_empty()
+            cx.handle_deps.put(f.name, deps)
+            cx.leaning.push(f.name)
+        end if
+    end if
 
     cx.taint = outer || leaned
     hs

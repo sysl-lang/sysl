@@ -648,9 +648,14 @@ end Origins
 
 origins_of(cx: &KeepsCx, f: TFunc) -> &Origins
     cx.origins.get(f.name) match
-        Some(o) -> return o
+        Some(o) ->
+            for key in cx.origin_deps.get(f.name).unwrap_or(buf())
+                leaned_on(cx, key)
+
+            return o
         None -> ()
 
+    val logged = cx.reads.len()
     val o: &Origins = Origins(cx, f.params, buf(), map(), false, map(), map())
 
     walk_block_stmts(f.body, stmt_walk(false, s -> s match
@@ -673,6 +678,15 @@ origins_of(cx: &KeepsCx, f: TFunc) -> &Origins
                                        s -> origin_bind_stmt(o, s)))
 
     cx.origins.put(f.name, o)
+
+    // What the gathering read that was still open, so that a walk reusing it leans on the same.
+    val deps = logged_since(cx, logged)
+
+    if !deps.is_empty()
+        cx.origin_deps.put(f.name, deps)
+        cx.leaning.push(f.name)
+    end if
+
     o
 end origins_of
 
