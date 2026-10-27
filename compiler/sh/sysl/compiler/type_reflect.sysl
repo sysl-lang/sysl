@@ -828,15 +828,17 @@ reflected_select(cx: &Analyzer, span: Span, receiver: Expr, selector: string) ->
 
     if texpr_type(outer) == Unknown then return outer
 
-    val tr = auto_deref(cx, outer)
-    val rt = texpr_type(tr)
-
     d.unwrap() match
         Descriptor(owner, v, f) ->
-            if f < 0 then return payload_of(cx, span, tr, *owner, v, selector)
+            if f < 0 then return payload_of(cx, span, auto_deref(cx, outer), *owner, v, selector)
 
             val fields = walked_fields(*owner, v)
             val wanted = if v >= 0 then payload_type(cx, fields) else *owner
+
+            // A payload of one field is that field, which may itself be a reference (`B(t: &T)`):
+            // the value is then already what is wanted, and reading through it would lose it.
+            val tr = if disagree(texpr_type(outer), wanted) then auto_deref(cx, outer) else outer
+            val rt = texpr_type(tr)
 
             if disagree(rt, wanted) then
                 return cx.err(span, s"'$selector' is the field '${descriptor_text(*owner, v, f)}', which " +
