@@ -943,7 +943,9 @@ provisional_of(cx: &Analyzer, span: Span, scope: Scope, tparams: Buf[string], pa
         for i in 0..<ready.len()
             val at = ready.at(i)
             val reader = arg_reader(cx, span, scope, slots.at(at).is_none())
-            val t = type_expr(reader, written.at(at).unwrap(), Some(wants.at(i)))
+            val want = settled_yield(reader, scope, written.at(at).unwrap(), wants.at(i),
+                                     param_refs.at(at), tparams, bounds, sub)
+            val t = type_expr(reader, written.at(at).unwrap(), Some(want))
 
             kept.set(at, Some(t))
             tys.set(at, texpr_type(t))
@@ -1139,6 +1141,116 @@ private held_want(cx: &Analyzer, scope: Scope, ptype: TypeRef, tparams: Buf[stri
 
     Some(resolve_type(cx.an, scope, ptype, sub))
 end held_want
+
+// What a held-back callable is read against when the declaration SHAPES its result and the shape is
+// still open -- `flat_map[U](f: T -> []U)` before anything has said what `U` is.
+//
+// **The body is read once on trial to settle the shape, then for real against it.** Read with an open
+// result, `n -> [n, n]` yields its own `[2]int`, which settles `U = int` and then implements
+// `Fn1[int, [2]int]` where the declaration asked for `Fn1[int, []int]`. Read against the settled
+// `[]int`, the array is taken where a slice is expected exactly as it is for an ordinary argument or a
+// call with `U` written out.
+//
+// **Only a slice-shaped result is asked**, since the array-to-slice step is the one way a body's own
+// type and the shape it settles can differ: a bare `U` (`map`) is whatever the body yields, and an
+// `Option[U]` (`and_then`) is matched part for part. Nor is the want changed where the trial's own
+// result already is the settled one, so the reading the program gets is the one it always got.
+private settled_yield(cx: &Analyzer, scope: Scope, e: Expr, want: Type, ptype: TypeRef,
+                      tparams: Buf[string], bounds: Buf[NamedBounds], sub: Buf[Binding]) -> Type
+    if !yield_open(want) then return want
+
+    val shape = call_shape(cx, scope, ptype, tparams, bounds)
+
+    if shape.is_none() || shape.unwrap().2.is_none() then return want
+    if open_slice_type(shape.unwrap().2.unwrap()) == Unknown then return want
+
+    val first = refusing_trial(cx, e, Some(want))
+    var tried = first.0
+    var refused = first.1
+    var yielded = callable_signature(cx.an, texpr_type(tried))
+    var shaped = false
+
+    // **A body that settles nothing on its own may settle it at the shape**: the branches of
+    // `if c then [n] else [n, n, n]` meet at no array, but they meet at a slice, which is what the
+    // declaration asked for -- so the second trial says "a slice of something" and lets the body say
+    // of what. A first reading that complained settled nothing, whatever type it came to.
+    if refused || yielded.is_none() || yielded.unwrap().1.is_none()
+        val open = open_slice(want, shape.unwrap().2.unwrap())
+
+        if open.is_none() then return want
+
+        val again = refusing_trial(cx, e, open)
+
+        tried = again.0
+        refused = again.1
+        yielded = callable_signature(cx.an, texpr_type(tried))
+        shaped = true
+
+        if refused || yielded.is_none() || yielded.unwrap().1.is_none() then return want
+        if yielded.unwrap().1.unwrap() == open_slice_type(shape.unwrap().2.unwrap()) then return want
+    end if
+
+    var trial_sub: Buf[Binding] = buf()
+
+    for item in sub
+        trial_sub.push(item)
+
+    unify(cx.an, scope, ptype, texpr_type(tried), tparams, &trial_sub)
+    solve_from_callables(cx.an, scope, tparams, bounds, &trial_sub)
+
+    val settled = held_want(cx, scope, ptype, tparams, bounds, trial_sub)
+
+    if settled.is_none() || yield_open(settled.unwrap()) then return want
+
+    val args = trait_args(settled.unwrap())
+
+    if !shaped && args.at(args.len() - 1) == yielded.unwrap().1.unwrap() then return want
+
+    settled.unwrap()
+end settled_yield
+
+// A reading of an argument with everything it said put back, and whether it complained.
+private refusing_trial(cx: &Analyzer, e: Expr, expected: Option[Type]) -> (TExpr, bool)
+    val opened = begin_trial(cx)
+    val t = type_expr(cx, e, expected)
+    val refused = refused_since(cx, opened)
+
+    discard_trial(cx, opened)
+    (t, refused)
+end refusing_trial
+
+// A callable's want with its open result read as "a slice of something", where the declaration's
+// result is a slice.
+private open_slice(want: Type, ret: TypeRef) -> Option[Type]
+    val shape = open_slice_type(ret)
+
+    if shape == Unknown then return None
+
+    want match
+        Trait(name, args, assocs) ->
+            var out: Buf[Type] = buf()
+
+            for i in 0..<args.len() - 1
+                out.push(args.at(i))
+
+            out.push(shape)
+            Some(Trait(name, out, assocs))
+        _ -> None
+end open_slice
+
+private open_slice_type(ret: TypeRef) -> Type = *ret.kind match
+    ArrayType(length, _, read_only) -> if length.is_none() then Slice(Unknown, read_only) else Unknown
+    _ -> Unknown
+
+// Whether a callable's want leaves what it yields open.
+private yield_open(want: Type) -> bool
+    val args = trait_args(want)
+
+    !args.is_empty() && args.at(args.len() - 1) == Unknown
+
+private trait_args(t: Type) -> Buf[Type] = t match
+    Trait(_, args, _) -> args
+    _ -> buf()
 
 // The two ways a parameter can ask for a callable, read down to one shape: the trait's key, what it
 // takes, and what it yields.
