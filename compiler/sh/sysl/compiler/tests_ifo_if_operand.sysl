@@ -1,0 +1,197 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.replace_all
+
+// An `if … then … else` may be the right operand of any binary operator and the operand of a prefix
+// one, and its last branch runs to the end of the expression, as in Rust, Scala and Kotlin:
+// `1 + if c then 2 else 3 * 4` is `1 + (if c then 2 else (3 * 4))`. The shapes are checked against
+// the parenthesised text they mean (the tree keeps no parentheses), and the values by running them,
+// each chosen so that the other grouping would print something else.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private ifo_ready() -> bool = std_root().is_ok() && clang_available()
+
+private ifo_root(text: string) -> string
+    val root = replace_all(make_temp_dir("sysl-ifo").unwrap(), "//", "/")
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+    root
+end ifo_root
+
+// What a one-file program prints, or the report it was refused with.
+private ifo_ran(text: string) -> string
+    val root = ifo_root(text)
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            val said = replace_all(failure_text(why), s"$root/", "")
+
+            remove_dir_all(root).unwrap_or(())
+            return said
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end ifo_ran
+
+private ifo_report(text: string) -> string
+    val root = ifo_root(text)
+
+    val out = emit_llvm_text(s"$root/main.sysl", None) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> if made.report.is_empty() then "" else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    replace_all(out, s"$root/", "")
+end ifo_report
+
+private ifo_prints(text: string, want: string)
+    if !ifo_ready() then return
+
+    assert_eq(ifo_ran(text), want)
+
+// Refused with exactly `message`, first, at `at` (`line:col`).
+private ifo_refused(text: string, message: string, at: string)
+    if !ifo_ready() then return
+
+    val said = ifo_report(text)
+    val head = s"error: $message"
+    val place = s"--> main.sysl:$at\n"
+
+    assert(said.starts_with(head) && said.contains(place),
+           s"expected a report starting\n$head\nlocated at$place\ngot\n$said")
+end ifo_refused
+
+// The two texts parse, cleanly, to one tree.
+private ifo_same(text: string, means: string)
+    assert_eq(pf_err(text), "")
+    assert_eq(pf(text), pf(means))
+
+// -- the shape ------------------------------------------------------------------------------------
+
+@test("an 'if' operand at every binary level is the operator's right operand")
+ifo_every_level_shape()
+    for o in ["||", "&&", "==", "<", "..", "..<", "|", "^", "&", "+", "-", "*", "/", "%", "<<", ">>"]
+        ifo_same(s"x = a $o if c then b else d\n", s"x = a $o (if c then b else d)\n")
+
+@test("the last branch runs to the end of the expression")
+ifo_extends_right_shape()
+    ifo_same("x = 1 + if c then 2 else 3 * 4\n", "x = 1 + (if c then 2 else (3 * 4))\n")
+    ifo_same("x = 1 * if c then 2 else 3 + 4\n", "x = 1 * (if c then 2 else (3 + 4))\n")
+    ifo_same("x = a && if c then b else d || e\n", "x = a && (if c then b else (d || e))\n")
+    ifo_same("x = 1 + if c then 2 elif d then 3 else 4 + 5\n",
+             "x = 1 + (if c then 2 elif d then 3 else (4 + 5))\n")
+
+@test("a prefix operator takes the whole 'if'")
+ifo_prefix_shape()
+    ifo_same("x = -if c then 1 else 2 * 3\n", "x = -(if c then 1 else (2 * 3))\n")
+    ifo_same("x = !if c then a else b && d\n", "x = !(if c then a else (b && d))\n")
+
+@test("an 'if' on the left is still the whole expression, as before")
+ifo_left_operand_shape()
+    ifo_same("x = if c then 1 else 2 + 3\n", "x = if c then 1 else (2 + 3)\n")
+    ifo_same("if c then 1 else 2 + 3\n", "if c then 1 else (2 + 3)\n")
+
+@test("a 'match' after a plain operand still takes the whole sum")
+ifo_match_unchanged_shape() =
+    ifo_same("x = 10 + s match\n    15 -> 1\n    _ -> 0\n", "x = (10 + s) match\n    15 -> 1\n    _ -> 0\n")
+
+@test("a loop is still not an operand")
+ifo_loop_refused()
+    for l in ["loop break 2", "while c do f()", "do f() while c", "for i in xs do f()"]
+        assert_eq(pf_err(s"x = 1 + $l\n"), "expression expected")
+        assert_eq(pf_at(s"x = 1 + $l\n"), "1:9")
+
+// -- the values -----------------------------------------------------------------------------------
+
+@test("the reported line, and every operator class, by value")
+ifo_every_class_values() =
+    ifo_prints("val s = 5\n" +
+               "print(10 + if s < 6 then 1 else 0)\n" +
+               "print(10 - if s < 6 then 1 else 0, 10 * if s > 6 then 1 else 3)\n" +
+               "print(s | if s > 4 then 8 else 0, s & if s > 4 then 4 else 1, s ^ if s > 4 then 1 else 0)\n" +
+               "print(1 << if s > 4 then 4 else 0, 64 >> if s > 4 then 2 else 0, 17 % if s > 4 then 5 else 3)\n" +
+               "print(s == if s > 4 then 5 else 0, s < if s > 4 then 2 else 9)\n" +
+               "print(true && if s > 4 then false else true, false || if s > 4 then true else false)\n" +
+               "for i in 0..<if s > 4 then 2 else 3\n    print(i)\n",
+               "11\n9 30\n13 4 4\n16 16 2\ntrue false\nfalse true\n0\n1\n")
+
+@test("grouping proved by value: else extends right, prefix takes all, elif, nested")
+ifo_grouping_values() =
+    ifo_prints("val s = 5\n" +
+               "print(1 + if s > 9 then 2 else 3 * 4)\n" +
+               "print(-if s > 9 then 1 else 2 * 3)\n" +
+               "print(1 + if s > 9 then 1 elif s > 4 then 20 else 300)\n" +
+               "print(1 + if s > 4 then 10 else s + if s > 2 then 100 else 1000)\n" +
+               "print(1 + if s > 9 then 10 else s + if s > 2 then 100 else 1000)\n" +
+               "print((if s > 4 then 1 else 2) + 3, if s > 4 then 1 else 2 + 3)\n",
+               "13\n-6\n21\n11\n106\n4 1\n")
+
+@test("in a val, an argument, a return and a compound assignment")
+ifo_positions_values() =
+    ifo_prints("pick(c: bool) -> int = 100 + if c then 1 else 2\n" +
+               "add(a: int, b: int) -> int = a + b\n" +
+               "give(c: bool) -> int\n    return 7 * if c then 2 else 3\n" +
+               "val n = 2 + if pick(true) > 100 then 1 else 0\n" +
+               "var acc = 0\nfor i in 0..<4\n    acc += i * if i % 2 == 0 then 1 else 10\n" +
+               "print(n, pick(false), give(true), give(false), acc, add(1, 2 + if n > 2 then 5 else 0))\n",
+               "3 102 14 21 42 8\n")
+
+@test("an 'if' operand inside an 'if' condition, before 'then'")
+ifo_in_a_condition() =
+    ifo_prints("val s = 5\nval x = 3\n" +
+               "if x > if s > 4 then 1 else 9 then print(\"gt\") else print(\"le\")\n" +
+               "if x > if s > 9 then 1 else 9 then print(\"gt\") else print(\"le\")\n",
+               "gt\nle\n")
+
+@test("a typed context still types a literal branch: u8, i64, f32")
+ifo_typed_contexts() =
+    ifo_prints("val s = 5\n" +
+               "val b: u8 = 200 + if s > 4 then 50 else 0\n" +
+               "val w: i64 = 1 + if s > 4 then 5000000000 else 0\n" +
+               "val v: i64 = 5000000000 + if s > 4 then 1 else 0\n" +
+               "val f: f32 = 1.5 + if s > 4 then 2.25 else 0.5\n" +
+               "val h: f32 = 0.5 * if s > 4 then 3 else 1\n" +
+               "print(b, w, v, f, h)\n",
+               "250 5000000001 5000000001 3.75 1.5\n")
+
+@test("a block 'if' is an operand too")
+ifo_block_form() =
+    ifo_prints("pick(c: bool) -> int\n    val n = 1 + if c\n        10\n    else\n        20\n    n\n" +
+               "print(pick(true), pick(false))\n",
+               "11 21\n")
+
+@test("a branch may leave the function, and a string branch is released")
+ifo_control_flow_and_strings() =
+    ifo_prints("first_neg(xs: []int) -> int\n    var total = 0\n    for x in xs\n" +
+               "        total = total + if x < 0 then return x else x\n    total\n" +
+               "label(n: int) -> string = \"n=\" + if n > 9 then \"big\" else s\"$n\"\n" +
+               "print(first_neg([1, 2, -7, 4]), first_neg([1, 2]), label(3), label(12))\n",
+               "-7 3 n=3 n=big\n")
+
+@test("a 'match' after a plain operand is still the sum's")
+ifo_match_value() =
+    ifo_prints("val s = 5\nval m = 10 + s match\n    15 -> 1\n    _ -> 0\nprint(m)\n", "1\n")
+
+// -- the refusals ---------------------------------------------------------------------------------
+
+@test("an operand 'if' with no 'else' is a unit, refused by the operator")
+ifo_no_else() =
+    ifo_refused("val c = true\nval n = 1 + if c then 2\nprint(n)\n",
+                "'+' needs matching types, got int and unit", "2:13")
+
+@test("the else branch takes the comparison after it, so its type is the comparison's")
+ifo_else_takes_the_comparison() =
+    ifo_refused("val s = 5\nval k = s * if s > 4 then 2 else 3 > 5\nprint(k)\n",
+                "if branches have different types: int and bool", "2:13")

@@ -43,6 +43,40 @@ member selections and indexes after it, so `await d.read(n)` awaits the call, an
 `?`, which then applies to the awaited value — `await f()?` is `(await f())?`, and `await f() + 1` is
 `(await f()) + 1`. [Where `await` binds](/reference/async/#where-await-binds) has the whole table.
 
+**An `if` may be the operand of any operator, binary or prefix, and its last branch runs to the end
+of the expression**, as in Rust, Scala and Kotlin. `1 + if c then 2 else 3 * 4` is
+`1 + (if c then 2 else (3 * 4))`, and `-if c then 1 else 2` negates the whole `if`. An `elif` chain
+and the indented form are operands the same way. Written first, an `if` is the whole expression, as
+it always was: `if c then 1 else 2 + 3` adds in the `else`. A loop (`loop`, `while`, `do`, `for`) is
+an operand only inside brackets.
+
+```sysl
+val s = 5
+
+print(10 + if s < 6 then 1 else 0)
+print(1 + if s > 9 then 2 else 3 * 4)
+print(-if s > 9 then 1 else 2 * 3)
+print((if s > 4 then 1 else 2) + 3, if s > 4 then 1 else 2 + 3)
+```
+
+```output
+11
+13
+-6
+4 1
+```
+
+An operand `if` with no `else` is a `unit`, which the operator refuses like any other:
+
+```sysl
+val c = true
+val n = 1 + if c then 2
+```
+
+```error
+'+' needs matching types, got int and unit
+```
+
 ### Two deliberate corrections to C
 
 Every level above matches C except two, and both are widely regarded as mistakes in C.
