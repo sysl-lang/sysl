@@ -1,0 +1,281 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{exists, make_dir_all, make_temp_dir, read_text, remove_dir_all, write_text}
+import sysl.process.{capture, start, Child, Group, Status}
+import sysl.signal.{send, HUP, INT, KILL, TERM}
+import sysl.testing.compiler
+import sysl.time.{sleep, millis}
+
+// A program `sysl run` started does not outlive the runner (`gen_runner_watch`, `testprocess.c`).
+//
+// Each test starts the real compiler as a process of its own, running a program that writes its pid
+// to a file and then does whatever the test needs. The runner is then signalled -- alone, by its pid,
+// as `kill` of a `sysl run … &` does -- and the program must be gone within a bound. **Every process
+// a test starts is ended by its recorded pid on the way out**, so a test that fails leaves nothing
+// spinning.
+//
+// Cells not written: a program that started children of its own (the watch ends the program; what
+// it started is its own, as for any program whose parent is killed); a run-built binary run outside
+// `sysl run` (it is never handed `SYSL_RUN_PARENT`, which is all the watch reads, and no command
+// hands one out).
+
+// A directory of the test's own, holding `main.sysl`: `head` above `main`, then `main` writing its
+// pid to `pid` and going on with `body` (lines indented by four).
+private rsg_program(head: string, body: string) -> string
+    val root = absolute_path(make_temp_dir("sysl-rsg").unwrap())
+
+    make_dir_all(root).unwrap()
+    rsg_write(root, head, body)
+    root
+end rsg_program
+
+private rsg_write(root: string, head: string, body: string) =
+    write_text(s"$root/main.sysl", "import sysl.fs.write_text\nimport sysl.process.pid\n" + head +
+        "\nmain()\n    write_text(\"" + root + "/pid\", pid().to_string()).unwrap()\n\n" + body).unwrap()
+
+// A program that never ends on its own.
+private rsg_spins() -> string = "    var n = 0\n\n    loop\n        n += 1\n"
+
+// The runner started over `root`, and the pid its program wrote -- zero where it never wrote one.
+private rsg_started(root: string, group: Group = Group.Inherit) -> (&Child, int)
+    val runner = start(compiler(), ["run", s"$root/main.sysl"], group = group).unwrap()
+    val marker = s"$root/pid"
+
+    // The compile comes first, and is the slow part.
+    var waited = 0
+
+    while !exists(marker) && waited < 1200
+        sleep(millis(100))
+        waited += 1
+
+    // Written and closed is not the same moment as visible and whole; a short read is read again.
+    var pid = 0
+
+    for _ in 0..<20
+        pid = rsg_number(read_text(marker).unwrap_or(""))
+
+        if pid > 0 then break
+
+        sleep(millis(50))
+
+    (runner, pid)
+end rsg_started
+
+private rsg_number(text: string) -> int
+    var n = 0
+
+    for c in text.bytes
+        if c >= u8('0') && c <= u8('9') then n = n * 10 + int(c - u8('0'))
+
+    n
+end rsg_number
+
+// Whether `pid` is gone within `tenths` tenths of a second -- no process a signal could reach.
+private rsg_gone(pid: int, tenths: int) -> bool
+    for _ in 0..<tenths
+        if send(i64(pid), 0).is_err() then return true
+
+        sleep(millis(100))
+
+    send(i64(pid), 0).is_err()
+end rsg_gone
+
+// What `ps` says of one process: nothing at all once it is gone.
+private rsg_ps(pid: int) -> string = capture("ps", ["-o", "pid=,ppid=,command=", "-p", s"$pid"]) match
+    Ok(o) -> o.text
+    Err(_) -> "ps would not run"
+
+// Everything a test started, ended by recorded pid, and its directory removed.
+private rsg_cleanup(runner: &Child, pid: int, root: string)
+    if pid > 0 then send(i64(pid), KILL)
+
+    runner.kill(KILL)
+    runner.wait()
+    remove_dir_all(root)
+end rsg_cleanup
+
+// The runner signalled alone with `sig`: it ends as that signal ends it, and the program goes too.
+private rsg_ends_with_runner(sig: int)
+    if !clx_ready() then return
+
+    val root = rsg_program("", rsg_spins())
+    val (runner, pid) = rsg_started(root)
+
+    assert(pid > 0, "the program never started")
+
+    runner.kill(sig).unwrap()
+
+    val how = runner.wait().unwrap().status
+    val gone = rsg_gone(pid, 50)
+    val left = rsg_ps(pid)
+
+    rsg_cleanup(runner, pid, root)
+    assert_eq(how, Status.Signalled(sig))
+    assert(gone, s"the program $pid outlived its runner: $left")
+    assert_eq(left, "")
+end rsg_ends_with_runner
+
+@test("a runner stopped with SIGTERM takes its program with it")
+rsg_term_ends_the_program()
+    rsg_ends_with_runner(TERM)
+
+@test("and with SIGINT sent to the runner alone")
+rsg_int_ends_the_program()
+    rsg_ends_with_runner(INT)
+
+@test("and with SIGHUP")
+rsg_hup_ends_the_program()
+    rsg_ends_with_runner(HUP)
+
+// The one a runner could never have passed on: it gets no chance to.
+@test("and with SIGKILL, which the runner cannot catch")
+rsg_kill_ends_the_program()
+    rsg_ends_with_runner(KILL)
+
+// What a terminal's Ctrl-C does, which already worked and must still: the signal goes to the whole
+// group, runner and program alike.
+@test("an interrupt sent to the runner's whole group ends both, as Ctrl-C always did")
+rsg_group_interrupt_ends_both()
+    if !clx_ready() then return
+
+    val root = rsg_program("", rsg_spins())
+    val (runner, pid) = rsg_started(root, Group.New)
+
+    assert(pid > 0, "the program never started")
+
+    send(-i64(runner.group()), INT).unwrap()
+
+    val how = runner.wait().unwrap().status
+    val gone = rsg_gone(pid, 50)
+
+    rsg_cleanup(runner, pid, root)
+    assert_eq(how, Status.Signalled(INT))
+    assert(gone, "the program outlived an interrupt to its group")
+end rsg_group_interrupt_ends_both
+
+// The program is asked before it is made: a program that watches `TERM` cleans up and leaves.
+@test("the program is sent SIGTERM first, so one that watches it can clean up")
+rsg_the_program_is_asked_first()
+    if !clx_ready() then return
+
+    val root = rsg_program("", "")
+
+    // The cleanup is a file it writes, named under the directory the program was given.
+    rsg_write(root, "import sysl.signal.{watch, TERM}\nimport sysl.time.{sleep, millis}\n",
+        "    var w = watch(TERM).unwrap()\n\n    loop\n        if w.take()\n" +
+        "            write_text(\"" + root + "/cleaned\", \"yes\").unwrap()\n" +
+        "            break\n\n        sleep(millis(10))\n")
+
+    val (runner, pid) = rsg_started(root)
+
+    assert(pid > 0, "the program never started")
+
+    runner.kill(TERM).unwrap()
+    runner.wait()
+
+    val gone = rsg_gone(pid, 30)
+    val cleaned = read_text(s"$root/cleaned").unwrap_or("")
+
+    rsg_cleanup(runner, pid, root)
+    assert(gone, "the program outlived its runner")
+    assert_eq(cleaned, "yes")
+end rsg_the_program_is_asked_first
+
+// And one that will not leave is made to.
+@test("a program that ignores SIGTERM is ended all the same")
+rsg_a_deaf_program_is_ended()
+    if !clx_ready() then return
+
+    val root = rsg_program("import sysl.signal.{watch, TERM}\n",
+        "    val w = watch(TERM).unwrap()\n    var n = 0\n\n    loop\n        n += 1\n")
+    val (runner, pid) = rsg_started(root)
+
+    assert(pid > 0, "the program never started")
+
+    runner.kill(TERM).unwrap()
+    runner.wait()
+
+    // Two seconds of grace after the runner is seen gone, and room either side.
+    val gone = rsg_gone(pid, 60)
+    val left = rsg_ps(pid)
+
+    rsg_cleanup(runner, pid, root)
+    assert(gone, s"a program that watched SIGTERM outlived its runner: $left")
+end rsg_a_deaf_program_is_ended
+
+// ---- what a run that is left alone still does ----
+
+// A program that runs well past a few of the watch's naps, with its runner alive throughout, is left
+// alone and says what it says.
+@test("a program whose runner stays is not ended, however long it takes")
+rsg_a_living_runner_is_left_alone()
+    if !clx_ready() then return
+
+    val root = rsg_program("import sysl.time.{sleep, millis}\n",
+        "    sleep(millis(1500))\n    print(\"finished\")\n")
+    val o = capture(compiler(), ["run", s"$root/main.sysl"]).unwrap()
+
+    remove_dir_all(root)
+    assert_eq(o.status, Status.Exited(0))
+    assert_eq(o.text, "finished\n")
+end rsg_a_living_runner_is_left_alone
+
+@test("the status a program exits with is the runner's")
+rsg_the_status_passes_through()
+    if !clx_ready() then return
+
+    val root = rsg_program("", "    print(\"three\")\n    exit(3)\n")
+    val o = capture(compiler(), ["run", s"$root/main.sysl"]).unwrap()
+
+    remove_dir_all(root)
+    assert_eq(o.status, Status.Exited(3))
+    assert_eq(o.text, "three\n")
+end rsg_the_status_passes_through
+
+@test("a program that traps is still reported as 133")
+rsg_a_trap_is_still_133()
+    if !clx_ready() then return
+
+    val root = rsg_program("", "    var a = [1, 2, 3]\n    var i = 3\n\n    print(a[i])\n")
+    val o = capture(compiler(), ["run", s"$root/main.sysl"]).unwrap()
+
+    remove_dir_all(root)
+    assert_eq(o.status, Status.Exited(133))
+end rsg_a_trap_is_still_133
+
+// The variable the runner names itself in is the watch's, not the program's.
+@test("the program does not see the variable that names its runner")
+rsg_the_variable_is_taken_out()
+    if !clx_ready() then return
+
+    val root = rsg_program("import sysl.env.get\n", "    print(get(\"SYSL_RUN_PARENT\").is_none())\n")
+    val o = capture(compiler(), ["run", s"$root/main.sysl"]).unwrap()
+
+    remove_dir_all(root)
+    assert_eq(o.status, Status.Exited(0))
+    assert_eq(o.text, "true\n")
+end rsg_the_variable_is_taken_out
+
+// A runner stopped while it is still building leaves no half-made entry behind: the next run of the
+// same program builds or finds a whole one, and runs it.
+@test("a runner stopped during the build leaves the next run whole")
+rsg_a_stop_during_the_build()
+    if !clx_ready() then return
+
+    val root = rsg_program("", "    print(\"built\")\n")
+
+    for after in [200, 600, 1500]
+        val runner = start(compiler(), ["run", s"$root/main.sysl"]).unwrap()
+
+        sleep(millis(after))
+        runner.kill(TERM)
+        runner.wait()
+
+        val o = capture(compiler(), ["run", s"$root/main.sysl"]).unwrap()
+
+        assert_eq(o.status, Status.Exited(0), s"after a stop at ${after}ms")
+        assert_eq(o.text, "built\n", s"after a stop at ${after}ms")
+
+    remove_dir_all(root)
+end rsg_a_stop_during_the_build

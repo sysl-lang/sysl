@@ -1,4 +1,5 @@
-/* What a test process does before its test: keep what it prints, and not outlive its runner.
+/* What a test process does before its test: keep what it prints, and not outlive its runner -- and
+ * what a program `sysl run` started does, which is the second half of that.
  *
  * `sysl test` starts one process per test and waits for it, for at most the test's limit. Both halves
  * of this file serve the case where that wait ends badly.
@@ -32,15 +33,30 @@
  *
  * `gen_test_main` emits the call first in a test build's entry point, and only for a POSIX machine;
  * this file is selected by the `__posix__` directory it sits in, as `stackguard.c` is.
+ *
+ * **A program `sysl run` started does not outlive its runner either** (`sysl_run_process_start`).
+ * The runner and the program share a process group, so Ctrl-C at a terminal reaches both; a signal
+ * sent to the runner alone -- `kill <pid>` of a `sysl run … &`, a job scheduler stopping it -- reaches
+ * only the runner, and the program went on under `init`, a window and all. The same watch ends it,
+ * with two differences from a test's. **The runner is named, not guessed**: `sysl run` puts its own
+ * pid in `SYSL_RUN_PARENT`, so a runner that died before this thread began is seen at once rather
+ * than recorded as the parent, and a program run any other way watches nothing. The variable is
+ * taken out of the environment before the program's own code runs, so the program and whatever it
+ * starts see the environment they always did. **And the program is asked first**: `SIGTERM`, which
+ * a program that ignores nothing dies of and a program that watches it can clean up after, and
+ * `SIGKILL` two seconds later for one that is still there. Only the process itself is ended -- the
+ * group is the runner's caller's, not the program's.
  */
 
 #include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <time.h>
 #include <unistd.h>
 
 static pid_t sysl_test_parent;
+static pid_t sysl_run_parent;
 
 static void *sysl_watch_parent(void *unused) {
     (void)unused;
@@ -55,11 +71,24 @@ static void *sysl_watch_parent(void *unused) {
     return 0;
 }
 
-void sysl_test_process_start(void) {
-    setvbuf(stdout, 0, _IOLBF, 0);
+static void *sysl_watch_runner(void *unused) {
+    (void)unused;
 
-    sysl_test_parent = getppid();
+    struct timespec nap = { 0, 100 * 1000 * 1000 };
 
+    while (getppid() == sysl_run_parent) nanosleep(&nap, 0);
+
+    kill(getpid(), SIGTERM);
+
+    for (int i = 0; i < 20; i++) nanosleep(&nap, 0);
+
+    kill(getpid(), SIGKILL);
+    return 0;
+}
+
+/* A detached thread running `watch`, started with every signal blocked so that it inherits that mask
+ * and the thread that called this keeps its own. */
+static void sysl_start_watch(void *(*watch)(void *)) {
     sigset_t all, before;
     pthread_t thread;
     pthread_attr_t attr;
@@ -69,7 +98,29 @@ void sysl_test_process_start(void) {
     pthread_attr_init(&attr);
     pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
     pthread_attr_setstacksize(&attr, 64 * 1024);
-    pthread_create(&thread, &attr, sysl_watch_parent, 0);
+    pthread_create(&thread, &attr, watch, 0);
     pthread_attr_destroy(&attr);
     pthread_sigmask(SIG_SETMASK, &before, 0);
+}
+
+void sysl_test_process_start(void) {
+    setvbuf(stdout, 0, _IOLBF, 0);
+
+    sysl_test_parent = getppid();
+    sysl_start_watch(sysl_watch_parent);
+}
+
+void sysl_run_process_start(void) {
+    const char *named = getenv("SYSL_RUN_PARENT");
+
+    if (named == 0) return;
+
+    long runner = strtol(named, 0, 10);
+
+    unsetenv("SYSL_RUN_PARENT");
+
+    if (runner <= 0 || (pid_t)runner != runner) return;
+
+    sysl_run_parent = (pid_t)runner;
+    sysl_start_watch(sysl_watch_runner);
 }

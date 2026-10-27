@@ -4,7 +4,7 @@ import sh.sysl.parsing.Source
 import sysl.buf.{Buf, buf}
 import sysl.text.{join, str_builder, Search}
 import sysl.fs.{exists, is_file, make_temp_dir, remove_dir_all, remove_file, make_dir_all, pending_name, publish_file, write_text}
-import sysl.process.{run as run_child, Status}
+import sysl.process.{run as run_child, pid, Status, Var}
 import sysl.env.{get as env_var}
 
 // What one invocation compiles: the program's files, the packages it depends on, and the standard
@@ -637,6 +637,9 @@ end typed_compilation
 // are the `--lib` roots' kept halves declared rather than defined: the text `emit-llvm` prints is the
 // whole program's, the roots' bodies included, since it is what the reference prints and what a diff
 // against it reads.
+//
+// **`watched` is set by `run` alone**: the entry of a program it is about to start ends the program
+// once the runner is gone (`gen_runner_watch`).
 // Whether a build at `level` is optimized, and so inlines: every level clang spells but `0`. An
 // `available_externally` copy at `-O0` is lowered and then dropped unread.
 imports_bodies(level: string) -> bool = level != "0"
@@ -645,7 +648,8 @@ emit_llvm_text(path: string, named_target: Option[string],
                level: string = DefaultOptimization,
                also_auto_imported: Buf[string] = buf(),
                against: Option[Buf[string]] = None,
-               linking: bool = false, keep_tests: bool = false) -> Result[Emitted, Failure]
+               linking: bool = false, keep_tests: bool = false,
+               watched: bool = false) -> Result[Emitted, Failure]
     val t = target_for(path, named_target)?
 
     phase_start()
@@ -738,7 +742,7 @@ emit_llvm_text(path: string, named_target: Option[string],
     // a call within the program does. The text `emit-llvm` prints has none, and nor does `-O0`.
     val lowered = codegen_with_gaps(kept with { precompiled = joined_names(linked.precompiled,
                                                                            roots.precompiled) },
-                                    t, promotions, linking && imports_bodies(level))
+                                    t, promotions, linking && imports_bodies(level), None, watched)
 
     phase_done("codegen")
 
@@ -1794,7 +1798,7 @@ run_native_program(path: string, named_target: Option[string], cc: Option[string
     // What this build's C reads is gathered afresh: it is part of where the program is kept.
     clear_files_read()
 
-    val emitted = emit_llvm_text(path, named_target, level, buf(), None, true)?
+    val emitted = emit_llvm_text(path, named_target, level, buf(), None, true, false, true)?
 
     if !emitted.report.is_empty() then return Err(Reported(analysis_report(emitted.report)))
 
@@ -1853,8 +1857,15 @@ end link_into_cache
 // `run` rather than `capture`, and the difference is the whole of what this command is for: the child
 // shares this program's streams, so its input is the reader's and what it writes is read as it is
 // written.
+//
+// **And it is told who started it** (`run_parent_variable`), so that it ends once this runner is gone
+// however this runner went (`gen_runner_watch`).
 private started(exe: string, args: Buf[string], staging: Option[string]) -> Result[int, Refusal]
-    val state = run_child(exe, args.view(), "", running_compiler_env().view()) match
+    var env = running_compiler_env()
+
+    env.push(Var(run_parent_variable(), s"${pid()}"))
+
+    val state = run_child(exe, args.view(), "", env.view()) match
         Err(_) ->
             discard_staging(staging)
             return Err(Refusal(s"$exe could not be run"))
