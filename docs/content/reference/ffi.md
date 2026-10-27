@@ -3161,7 +3161,11 @@ that declares its `extern`s, which is where every binding written so far has put
 tree is declared instead**, in the manifest's `c` block
 ([packages](/reference/packages/#a-vendored-c-library-left-as-upstream-shipped-it)): its root, its
 include roots, the exact list of files it compiles and the macros they take — so the tree stays byte
-for byte what upstream released, and the walk compiles none of the C under its root.
+for byte what upstream released, and the walk compiles none of the C under its root. And C that sysl
+is not meant to compile at all — a benchmark built by hand, test programs a script compiles — is a
+directory named in the manifest's `exclude` list
+([packages](/reference/packages/#directories-a-walk-leaves-out-testdata-and-exclude)), which the
+warning itself suggests.
 
 **A shim can be per-machine, and that is a directory rather than a condition.** A `.c`
 cannot carry a sysl attribute, so `#if` is no help to it; what selects it is where it sits. A
