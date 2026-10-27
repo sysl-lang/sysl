@@ -1,0 +1,446 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// An index takes any integer, so it is not a use that fixes a literal binding's type
+// (`var_first_use.sysl`, `reference/declarations.md § A literal binding takes its type from its first
+// use`): the next use that does fix one decides, and a binding with none keeps the literal's default.
+// The same holds for a slice's bounds. A subscript that goes through a method -- a `Buf`'s, a type's
+// own `Index` -- hands the index to a parameter, and a parameter still fixes it.
+
+private ixn_ready() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+
+    true
+end ixn_ready
+
+// What a program prints, built and run.
+private ixn_ran(text: string) -> string
+    val root = make_temp_dir("sysl-ixn").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end ixn_ran
+
+// What a program that is meant to stop exits with: a trap is `128 + n`, and `-1` is one that did not
+// build.
+private ixn_stopped(text: string) -> int
+    val root = make_temp_dir("sysl-ixn-stop").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    var args: Buf[string] = buf()
+
+    val code = run_native_program(s"$root/main.sysl", None, None, DefaultOptimization, args) match
+        Err(_) -> -1
+        Ok(state) -> state
+
+    remove_dir_all(root).unwrap_or(())
+    code
+end ixn_stopped
+
+// Everything a source has to say for itself.
+private ixn_err(text: string) -> string
+    val root = make_temp_dir("sysl-ixn").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    val out = emit_llvm_text(src, None) match
+        Err(why) -> why.message
+        Ok(made) -> if made.report.is_empty() then "" else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end ixn_err
+
+// Whether a report carries a diagnostic, pointed at a line and column of `main.sysl`.
+private ixn_says(report: string, message: string, at: string) -> bool =
+    report.contains(s"error: $message") && report.contains(s"main.sysl:$at\n")
+
+// How many diagnostics a report carries.
+private ixn_count(report: string) -> usize
+    var seen: usize = 0
+    var rest = report
+
+    loop
+        rest.index_of("error: ") match
+            None -> break
+            Some(at) ->
+                seen += 1
+                rest = rest[(at + 7)..<rest.bytes.len]
+
+    seen
+end ixn_count
+
+@test("an index then the result: the result decides, and a var stepped down by -= is that type")
+ixn_index_then_result()
+    if !ixn_ready() then return
+
+    assert_eq(ixn_ran(raw"""
+        val firsts = [0, 1, 9, 22, 35, 48, 59, 64, 69]
+
+        count_of(a: int) -> int
+            var n = 8
+            while firsts[n] > a do n -= 1
+            n
+
+        main()
+            print(count_of(30), count_of(70), count_of(0))
+        """), "3 8 0\n")
+
+    // At a result other than the default, the result still decides.
+    assert_eq(ixn_ran(raw"""
+        val xs = [5, 6, 7]
+
+        last() -> u16
+            var k = 2
+            print(xs[k])
+            k
+
+        main()
+            print(last())
+        """), "7\n2\n")
+
+@test("an index then an argument: the parameter decides")
+ixn_index_then_argument()
+    if !ixn_ready() then return
+
+    assert_eq(ixn_ran(raw"""
+        wide(x: i64) -> i64 = x * 1000000000000
+
+        main()
+            val xs = [10, 20, 30]
+            val w = 1
+            print(xs[w], wide(w))
+            val back: i64 = w
+            print(back)
+        """), "20 1000000000000\n1\n")
+
+    val report = ixn_err(raw"""
+        wide(x: i64) -> i64 = x
+
+        main()
+            val xs = [10, 20, 30]
+            val w = 1
+            print(xs[w], wide(w))
+            val z: int = w
+        """)
+
+    assert(ixn_says(report, "cannot initialize 'z': declared int but the value is long", "7:5"), report)
+    assert_eq(ixn_count(report), 1)
+
+@test("an index and nothing else: the binding is the default int")
+ixn_index_only()
+    if !ixn_ready() then return
+
+    assert_eq(ixn_ran(raw"""
+        main()
+            val xs = [10, 20, 30]
+            var i = 2
+            var sum = 0
+            print(xs[i])
+            i -= 1
+            sum += xs[i]
+            i -= 1
+            sum += xs[i]
+            val back: int = i
+            print(sum, back)
+        """), "30\n30 0\n")
+
+    val report = ixn_err(raw"""
+        main()
+            val xs = [10, 20, 30]
+            var i = 2
+            print(xs[i])
+            i -= 1
+            print(i + xs.len)
+        """)
+
+    // Arithmetic fixes nothing either, so the sum shows what the index left `i` at.
+    assert(ixn_says(report, "'+' needs matching types, got int and usize", "6:15"), report)
+    assert_eq(ixn_count(report), 1)
+
+@test("an index then a comparison with a usize: the comparison decides")
+ixn_index_then_compare()
+    if !ixn_ready() then return
+
+    assert_eq(ixn_ran(raw"""
+        main()
+            val xs = [10, 20, 30]
+            var i = 0
+            print(xs[i])
+            while i < xs.len
+                i += 1
+            val back: usize = i
+            print(back)
+        """), "10\n3\n")
+
+    val report = ixn_err(raw"""
+        main()
+            val xs = [10, 20, 30]
+            var i = 0
+            print(xs[i])
+            print(i < xs.len)
+            val z: int = i
+        """)
+
+    assert(ixn_says(report, "cannot initialize 'z': declared int but the value is usize", "6:5"), report)
+    assert_eq(ixn_count(report), 1)
+
+@test("an index no longer fixes a binding that only arithmetic compares with a usize, so the comparison is refused")
+ixn_arithmetic_compare_is_refused()
+    if !ixn_ready() then return
+
+    // The comparison fixes from a neighbour that is a name, and `i + 1` is arithmetic, which fixes
+    // nothing; the index used to be what made `i` a usize here, and now nothing does.
+    val report = ixn_err(raw"""
+        main()
+            val set = ["a", "b", "c", "d"]
+            var i = 0
+            while i + 1 < set.len
+                print(set[i], set[i + 1])
+                i += 2
+        """)
+
+    assert(ixn_says(report, "cannot compare int with usize", "4:11"), report)
+    assert_eq(ixn_count(report), 1)
+
+    // Compared as a name, it is fixed as before.
+    assert_eq(ixn_ran(raw"""
+        main()
+            val set = ["a", "b", "c", "d"]
+            var i = 0
+            while i < set.len - 1
+                print(set[i], set[i + 1])
+                i += 2
+        """), "a b\nc d\n")
+
+@test("a literal no int holds, used only as an index, is told it does not fit; a later use decides")
+ixn_literal_above_int()
+    if !ixn_ready() then return
+
+    val report = ixn_err(raw"""
+        main()
+            val xs = [10, 20, 30]
+            val big = 3000000000
+            print(xs[big - 2999999999])
+        """)
+
+    assert(ixn_says(report, "the literal 3000000000 does not fit int", "3:15"), report)
+    assert_eq(ixn_count(report), 1)
+
+    assert_eq(ixn_ran(raw"""
+        keep(x: u32) -> u32 = x
+
+        main()
+            val xs = [10, 20, 30]
+            val big = 3000000000
+            print(xs[big - 2999999999], keep(big))
+        """), "20 3000000000\n")
+
+@test("a negative literal used as an index is the default int and stops the program at run time")
+ixn_negative_index_traps()
+    if !ixn_ready() then return
+
+    assert_eq(ixn_stopped("val xs = [1, 2, 3]\nval i = -1\nprint(xs[i])\n"), 133)
+    assert_eq(ixn_stopped("val xs = [1, 2, 3]\nval s = xs[0..<3]\nvar i = -1\nprint(s[i])\n"), 133)
+    assert_eq(ixn_stopped("val xs = [1, 2, 3]\nval lo = -1\nprint(xs[lo..<2].len)\n"), 133)
+
+    // In range it is an ordinary index.
+    assert_eq(ixn_stopped("val xs = [1, 2, 3]\nval i = 1\nprint(xs[i])\n"), 0)
+
+@test("a slice's element index and its bounds fix nothing")
+ixn_slices()
+    if !ixn_ready() then return
+
+    assert_eq(ixn_ran(raw"""
+        main()
+            val xs = [10, 20, 30, 40]
+            val lo = 1
+            val hi = 3
+            val s = xs[lo..<hi]
+            val e = 1
+            print(s.len, s[e])
+            val a: int = lo
+            val b: int = hi
+            val c: int = e
+            print(a, b, c)
+        """), "2 30\n1 3 1\n")
+
+    val report = ixn_err(raw"""
+        main()
+            val xs = [10, 20, 30, 40]
+            val lo = 1
+            val e = 0
+            print(xs[lo..<4][e])
+            print(lo + xs.len)
+            print(e + xs.len)
+        """)
+
+    assert(ixn_says(report, "'+' needs matching types, got int and usize", "6:16"), report)
+    assert(ixn_says(report, "'+' needs matching types, got int and usize", "7:15"), report)
+    assert_eq(ixn_count(report), 2)
+
+@test("a Buf's subscript and a type's own Index hand the index to a parameter, which fixes it")
+ixn_method_subscripts_fix()
+    if !ixn_ready() then return
+
+    assert_eq(ixn_ran(raw"""
+        import sysl.buf.{Buf, buf}
+
+        struct Bag
+            items: Buf[int]
+
+        impl Index[u8, int] for Bag
+            index(self, i: u8) -> int = self.items.at(usize(i))
+
+        main()
+            var b: Buf[int] = buf()
+            b.push(5)
+            b.push(6)
+            val c = 1
+            print(b[c], b.at(c))
+            val bc: usize = c
+            val bag = Bag(b)
+            val g = 0
+            print(bag[g])
+            val bg: u8 = g
+            print(bc, bg)
+        """), "6 6\n5\n1 0\n")
+
+    val report = ixn_err(raw"""
+        import sysl.buf.{Buf, buf}
+
+        main()
+            var b: Buf[int] = buf()
+            b.push(5)
+            val c = 0
+            print(b[c])
+            val z: int = c
+        """)
+
+    assert(ixn_says(report, "cannot initialize 'z': declared int but the value is usize", "8:5"), report)
+    assert_eq(ixn_count(report), 1)
+
+@test("an index in a generic body fixes nothing, in every instance")
+ixn_generic_index()
+    if !ixn_ready() then return
+
+    assert_eq(ixn_ran(raw"""
+        second[T](xs: []T) -> T
+            val i = 1
+            val r = xs[i]
+            val back: int = i
+            r
+
+        main()
+            print(second([1, 2, 3]), second(["a", "b"]))
+        """), "2 b\n")
+
+    val report = ixn_err(raw"""
+        second[T](xs: []T) -> T
+            val i = 1
+            val r = xs[i]
+            print(i + xs.len)
+            r
+
+        main()
+            print(second([1, 2, 3]))
+        """)
+
+    assert(report.contains("error: '+' needs matching types, got int and usize"), report)
+
+@test("an index in a closure fixes nothing, and a later use outside it decides")
+ixn_closure_index()
+    if !ixn_ready() then return
+
+    assert_eq(ixn_ran(raw"""
+        val xs = [10, 20, 30]
+
+        pick() -> i64
+            val k = 2
+            val f = () -> xs[k]
+            print(f())
+            k
+
+        main()
+            print(pick())
+        """), "30\n2\n")
+
+@test("two later uses that disagree: the first of them decides, the second is told as with the type written")
+ixn_later_uses_disagree()
+    if !ixn_ready() then return
+
+    val report = ixn_err(raw"""
+        wide(n: usize) -> usize = n
+        narrow(n: u8) -> u8 = n
+
+        main()
+            val xs = [1, 2, 3]
+            var i = 0
+            print(xs[i])
+            print(wide(i))
+            print(narrow(i))
+        """)
+
+    assert(ixn_says(report, "'n' of 'narrow' is byte, but usize was given", "9:18"), report)
+    assert_eq(ixn_count(report), 1)
+
+    val written = ixn_err(raw"""
+        wide(n: usize) -> usize = n
+        narrow(n: u8) -> u8 = n
+
+        main()
+            val xs = [1, 2, 3]
+            var i: usize = 0
+            print(xs[i])
+            print(wide(i))
+            print(narrow(i))
+        """)
+
+    assert(ixn_says(written, "'n' of 'narrow' is byte, but usize was given", "9:18"), written)
+
+@test("a shift amount and a range's bounds fixed nothing before and still fix nothing")
+ixn_shift_and_range_unchanged()
+    if !ixn_ready() then return
+
+    assert_eq(ixn_ran(raw"""
+        main()
+            val xs = [10, 20, 30]
+            val s = 3
+            val n = 2
+            print(1 << s)
+            for k in 0..<n
+                print(xs[k])
+            val a: int = s
+            val b: int = n
+            print(a, b)
+        """), "8\n10\n20\n3 2\n")
