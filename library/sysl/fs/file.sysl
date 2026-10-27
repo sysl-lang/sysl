@@ -1,7 +1,7 @@
 module sysl.fs
 @requires(os)
 
-import sysl.io.Reader
+import sysl.io.{Reader, Positioned, ReadAt, WriteAt}
 import sysl.fs.sys as fsys
 import sysl.slices.{as_ptr, copy}
 
@@ -37,6 +37,11 @@ private const file_mode: u32 = 0o666
  * write that makes no progress would otherwise be retried for ever.
  */
 private const stalled: int = -5
+
+/** `EINVAL`, the same number on every platform: what an offset too large for the platform's own
+ * offset type is answered with, as the platform answers one.
+ */
+private const invalid: int = -22
 
 /** The handle itself, and everything that is true of it beyond the descriptor.
  *
@@ -392,6 +397,91 @@ impl Writer for File
             s.fault = code
         end if
     end write
+end File
+
+/** A file is a positioned store too (`sysl.io.ReadAt`, `sysl.io.WriteAt`), so a codec or a
+ * filesystem written against those reads and writes it with no adapter.
+ *
+ * `extent` is `size`, as the unsigned count the traits speak in.
+ */
+impl Positioned for File
+    type Error = IoError
+
+    extent(*self) -> Result[u64, IoError] = Ok(u64(self.size()?))
+
+/** **Reading at an offset does not move the position**, so it mixes freely with `read` and `write`:
+ * it is the platform's `pread`, past the buffer. Anything still buffered for writing is handed over
+ * first, so a read answers with every byte the program has written; what was read ahead stays where
+ * it is, since nothing it holds has changed.
+ *
+ * An offset past what a `long` can hold is refused as the platform refuses one, with `EINVAL`.
+ */
+impl ReadAt for File
+    read_at(*self, offset: u64, into: []u8) -> Result[[]const u8, IoError]
+        val s = self.inner
+
+        if s.shut then return Err(NotOpen)
+
+        val written = drain(s)
+
+        if written != 0 then return Err(from_status(written))
+
+        if offset > u64(long::Max) then return Err(from_status(invalid))
+
+        if into.len == 0 then return Ok(into)
+
+        var got: usize = 0
+        val code = fsys.pread(s.fd, &into[0], into.len, long(offset), &got)
+
+        if code != 0 then Err(from_status(code)) else Ok(into[0..<got])
+    end read_at
+end File
+
+/** **Writing at an offset does not move the position either.** It is the platform's `pwrite`, and
+ * what was buffered either way is settled first: pending writes are handed over so they cannot land
+ * on top of this one later, and what was read ahead is given up, since this write may have changed
+ * it.
+ *
+ * On Linux a file opened with `append` puts a positioned write at the end regardless of the offset
+ * -- a documented defect of the platform's `pwrite`, kept here rather than hidden.
+ *
+ * `sync` hands over what is buffered and then asks the device to keep it (`fsync`), returning once it
+ * has.
+ */
+impl WriteAt for File
+    write_at(*self, offset: u64, bytes: []const u8) -> Result[usize, IoError]
+        val s = self.inner
+
+        if s.shut then return Err(NotOpen)
+
+        var code = unread(s)
+
+        if code == 0 then code = drain(s)
+
+        if code != 0 then return Err(from_status(code))
+
+        if offset > u64(long::Max) then return Err(from_status(invalid))
+
+        if bytes.len == 0 then return Ok(0)
+
+        var put: usize = 0
+
+        code = fsys.pwrite(s.fd, &bytes[0], bytes.len, long(offset), &put)
+
+        if code == 0 && put == 0 then code = stalled
+
+        if code != 0 then Err(from_status(code)) else Ok(put)
+    end write_at
+
+    override sync(*self) -> Result[unit, IoError]
+        if self.inner.shut then return Err(NotOpen)
+
+        val written = drain(self.inner)
+
+        if written != 0 then return Err(from_status(written))
+
+        answered(fsys.sync(self.inner.fd))
+    end sync
 end File
 
 /** The three ways a program opens a file, named for what it means rather than for the flags it

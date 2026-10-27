@@ -1,0 +1,222 @@
+module sysl.fs
+@requires(os)
+@tests
+
+import sysl.io.{Reader, ReadAt, WriteAt, read_exact_at, write_all_at}
+
+// A `File` as a positioned store: reads and writes at an offset leave the position alone, and agree
+// with the buffer the stream half keeps -- a byte still held back for writing is seen, and a byte read
+// ahead and then overwritten is not handed out stale.
+
+private pio_path(name: string) -> string = "/tmp/sysl-fs-pio-" + name
+
+private pio_ignore(r: Result[unit, IoError]) = ()
+
+// A file holding "0123456789".
+private pio_digits(name: string) -> File
+    val path = pio_path(name)
+
+    write_text(path, "0123456789").unwrap()
+    open_update(path).unwrap()
+end pio_digits
+
+@test("pio_fs read_at reads at an offset and leaves the position where it was")
+pio_fs_read_at_keeps_position()
+    var f = pio_digits("read")
+    var into: [3]u8 = [0; 3]
+
+    val got = f.read_at(4, into).unwrap()
+
+    assert_eq(got.len, 3)
+    assert_eq(got[0], u8('4'))
+    assert_eq(f.tell().unwrap(), 0)
+
+    var one: [1]u8 = [0; 1]
+
+    assert_eq(f.read(one)[0], u8('0'))
+
+    pio_ignore(f.close())
+    pio_ignore(remove_file(pio_path("read")))
+
+@test("pio_fs a read at the end is empty, one running into it is short, and an empty one is empty")
+pio_fs_read_ends()
+    var f = pio_digits("ends")
+    var into: [4]u8 = [0; 4]
+
+    assert_eq(f.read_at(8, into).unwrap().len, 2)
+    assert_eq(f.read_at(10, into).unwrap().len, 0)
+    assert_eq(f.read_at(1000, into).unwrap().len, 0)
+    assert_eq(f.read_at(3, into[0..<0]).unwrap().len, 0)
+
+    pio_ignore(f.close())
+    pio_ignore(remove_file(pio_path("ends")))
+
+@test("pio_fs extent is the file's size, counting what is still held back")
+pio_fs_extent()
+    var f = pio_digits("extent")
+
+    assert_eq(f.extent().unwrap(), 10u64)
+
+    f.seek(10).unwrap()
+    f.write("ab".bytes)
+
+    assert_eq(f.extent().unwrap(), 12u64)
+
+    pio_ignore(f.close())
+    pio_ignore(remove_file(pio_path("extent")))
+
+@test("pio_fs write_at writes at an offset and leaves the position where it was")
+pio_fs_write_at_keeps_position()
+    val path = pio_path("write")
+    var f = pio_digits("write")
+
+    assert_eq(f.write_at(2, "xy".bytes).unwrap(), 2)
+    assert_eq(f.tell().unwrap(), 0)
+
+    f.write("A".bytes)
+    pio_ignore(f.close())
+
+    assert_eq(read_text(path).unwrap(), "A1xy456789")
+    pio_ignore(remove_file(path))
+
+@test("pio_fs a write past the end leaves a hole of zeroes")
+pio_fs_write_past_end()
+    val path = pio_path("hole")
+    var f = pio_digits("hole")
+
+    assert_eq(f.write_at(12, "z".bytes).unwrap(), 1)
+    assert_eq(f.extent().unwrap(), 13u64)
+
+    var into: [3]u8 = [9; 3]
+    val got = f.read_at(10, into).unwrap()
+
+    assert_eq(got.len, 3)
+    assert_eq(got[0], 0u8)
+    assert_eq(got[2], u8('z'))
+
+    pio_ignore(f.close())
+    pio_ignore(remove_file(path))
+
+@test("pio_fs an empty write_at takes nothing")
+pio_fs_write_empty()
+    var f = pio_digits("wempty")
+
+    assert_eq(f.write_at(3, []).unwrap(), 0)
+    assert_eq(f.extent().unwrap(), 10u64)
+
+    pio_ignore(f.close())
+    pio_ignore(remove_file(pio_path("wempty")))
+
+@test("pio_fs read_at sees bytes a stream write still holds back")
+pio_fs_read_sees_pending()
+    var f = pio_digits("pending")
+
+    f.write("abc".bytes)
+
+    var into: [4]u8 = [0; 4]
+    val got = f.read_at(1, into).unwrap()
+
+    assert_eq(got[0], u8('b'))
+    assert_eq(got[2], u8('3'))
+
+    pio_ignore(f.close())
+    pio_ignore(remove_file(pio_path("pending")))
+
+@test("pio_fs a stream read after write_at does not hand out what it read ahead before the write")
+pio_fs_write_drops_read_ahead()
+    var f = pio_digits("ahead")
+    var one: [1]u8 = [0; 1]
+
+    // The first read fills the buffer with the whole file.
+    assert_eq(f.read(one)[0], u8('0'))
+
+    f.write_at(1, "Q".bytes).unwrap()
+
+    assert_eq(f.read(one)[0], u8('Q'))
+    assert_eq(f.tell().unwrap(), 2)
+
+    pio_ignore(f.close())
+    pio_ignore(remove_file(pio_path("ahead")))
+
+@test("pio_fs a stream write after write_at lands where the stream was, not where write_at wrote")
+pio_fs_stream_after_write_at()
+    val path = pio_path("after")
+    var f = pio_digits("after")
+    var one: [1]u8 = [0; 1]
+
+    f.read(one)
+    f.write_at(8, "W".bytes).unwrap()
+    f.write("S".bytes)
+    pio_ignore(f.close())
+
+    assert_eq(read_text(path).unwrap(), "0S234567W9")
+    pio_ignore(remove_file(path))
+
+@test("pio_fs read_exact_at and write_all_at work over a File")
+pio_fs_helpers()
+    val path = pio_path("helpers")
+    var f = pio_digits("helpers")
+
+    write_all_at(&f, 5, "hello".bytes).unwrap()
+
+    var into: [16]u8 = [0; 16]
+    val got = read_exact_at(&f, 3, into).unwrap()
+
+    assert_eq(got.len, 7)
+    assert_eq(got[2], u8('h'))
+    assert_eq(got[6], u8('o'))
+
+    pio_ignore(f.close())
+    pio_ignore(remove_file(path))
+
+@test("pio_fs sync hands over what is held back")
+pio_fs_sync()
+    val path = pio_path("sync")
+    var f = pio_digits("sync")
+
+    f.write("zz".bytes)
+    f.sync().unwrap()
+
+    assert_eq(read_text(path).unwrap(), "zz23456789")
+
+    pio_ignore(f.close())
+    pio_ignore(remove_file(path))
+
+@test("pio_fs every positioned call on a closed file is NotOpen")
+pio_fs_closed()
+    var f = pio_digits("closed")
+    var into: [2]u8 = [0; 2]
+
+    pio_ignore(f.close())
+
+    assert(f.read_at(0, into) == Err(NotOpen))
+    assert(f.write_at(0, "a".bytes) == Err(NotOpen))
+    assert(f.sync() == Err(NotOpen))
+    assert(f.extent() == Err(NotOpen))
+
+    pio_ignore(remove_file(pio_path("closed")))
+
+@test("pio_fs an offset past what the platform can hold is EINVAL")
+pio_fs_offset_too_large()
+    var f = pio_digits("huge")
+    var into: [2]u8 = [0; 2]
+
+    assert(f.read_at(u64::Max, into) == Err(Other(22)))
+    assert(f.write_at(u64::Max, "a".bytes) == Err(Other(22)))
+
+    pio_ignore(f.close())
+    pio_ignore(remove_file(pio_path("huge")))
+
+@test("pio_fs write_at on a file opened only for reading is an error, not a write")
+pio_fs_write_read_only()
+    val path = pio_path("ronly")
+
+    write_text(path, "abc").unwrap()
+
+    var f = open(path).unwrap()
+
+    assert(f.write_at(0, "x".bytes).is_err())
+
+    pio_ignore(f.close())
+    assert_eq(read_text(path).unwrap(), "abc")
+    pio_ignore(remove_file(path))

@@ -17,9 +17,26 @@ literal in a test, and nothing in it has to be written twice.
 
 ## Index
 
-[`bytes_reader`](#bytes_reader) [`bytes_reader_at_most`](#bytes_reader_at_most) [`bytes_writer`](#bytes_writer) [`console_lines`](#console_lines) [`fd_reader`](#fd_reader) [`find_byte`](#find_byte) [`line_text`](#line_text) [`lines`](#lines) [`lines_ending`](#lines_ending) [`read_all`](#read_all) [`read_all_text`](#read_all_text) [`read_exact`](#read_exact) [`stdin`](#stdin) [`BytesReader`](#bytesreader) [`BytesWriter`](#byteswriter) [`FdReader`](#fdreader) [`LineEnding`](#lineending) [`Lines`](#lines-1) [`Reader`](#reader) [Fallible for BytesReader](#fallible-for-bytesreader) [Fallible for BytesWriter](#fallible-for-byteswriter) [Fallible for FdReader](#fallible-for-fdreader) [Iterate for Lines](#iterate-for-lines) [Reader for BytesReader](#reader-for-bytesreader) [Reader for FdReader](#reader-for-fdreader) [Writer for BytesWriter](#writer-for-byteswriter)
+[`bytes_at`](#bytes_at) [`bytes_at_most`](#bytes_at_most) [`bytes_reader`](#bytes_reader) [`bytes_reader_at_most`](#bytes_reader_at_most) [`bytes_writer`](#bytes_writer) [`console_lines`](#console_lines) [`fd_reader`](#fd_reader) [`find_byte`](#find_byte) [`line_text`](#line_text) [`lines`](#lines) [`lines_ending`](#lines_ending) [`read_all`](#read_all) [`read_all_text`](#read_all_text) [`read_exact`](#read_exact) [`read_exact_at`](#read_exact_at) [`slice_at`](#slice_at) [`slice_at_most`](#slice_at_most) [`stdin`](#stdin) [`write_all_at`](#write_all_at) [`BytesAt`](#bytesat) [`BytesReader`](#bytesreader) [`BytesWriter`](#byteswriter) [`FdReader`](#fdreader) [`LineEnding`](#lineending) [`Lines`](#lines-1) [`MemoryError`](#memoryerror) [`SliceAt`](#sliceat) [`Positioned`](#positioned) [`ReadAt`](#readat) [`Reader`](#reader) [`WriteAt`](#writeat) [Fallible for BytesReader](#fallible-for-bytesreader) [Fallible for BytesWriter](#fallible-for-byteswriter) [Fallible for FdReader](#fallible-for-fdreader) [Iterate for Lines](#iterate-for-lines) [Positioned for BytesAt](#positioned-for-bytesat) [Positioned for SliceAt](#positioned-for-sliceat) [ReadAt for BytesAt](#readat-for-bytesat) [ReadAt for SliceAt](#readat-for-sliceat) [Reader for BytesReader](#reader-for-bytesreader) [Reader for FdReader](#reader-for-fdreader) [WriteAt for SliceAt](#writeat-for-sliceat) [Writer for BytesWriter](#writer-for-byteswriter)
 
 ## Functions
+
+### `bytes_at`
+
+```sysl
+bytes_at(b: []const u8) -> BytesAt
+```
+
+A store over `b` that answers as much as it was offered room for.
+
+### `bytes_at_most`
+
+```sysl
+bytes_at_most(b: []const u8, most: usize) -> BytesAt
+```
+
+A store over `b` that hands back **at most `most` bytes per read**, which is what a device reading
+a sector at a time does and what a test of a caller's loop needs.
 
 ### `bytes_reader`
 
@@ -158,13 +175,69 @@ requests, and only the second one was expressible. What comes back is a prefix o
 as `read`'s is, so a caller checks `got.len` against what it asked for rather than being handed a
 count it might forget to apply.
 
+### `read_exact_at`
+
+```sysl
+read_exact_at[S: ReadAt](s: *S, offset: u64, into: []u8) -> Result[[]const u8, S::Error]
+```
+
+Reads at `offset` until `into` is full or the store ends, and hands back the prefix that was
+filled.
+
+It is `read_exact` at an offset: a short `read_at` is not the end of anything, an empty one is,
+and what comes back is a prefix of `into` so a caller checks `got.len` against what it asked for.
+A failure stops the loop and is handed back as the store reported it; the bytes read before it are
+in `into` but not counted, since a caller that is told something went wrong should not have to
+decide which of the bytes to believe.
+
+### `slice_at`
+
+```sysl
+slice_at(b: []u8) -> SliceAt
+```
+
+### `slice_at_most`
+
+```sysl
+slice_at_most(b: []u8, most: usize) -> SliceAt
+```
+
+A store over `b` that reads and writes **at most `most` bytes per call**.
+
 ### `stdin`
 
 ```sysl
 stdin() -> FdReader
 ```
 
+### `write_all_at`
+
+```sysl
+write_all_at[S: WriteAt](s: *S, offset: u64, bytes: []const u8) -> Result[unit, S::Error]
+```
+
+Writes all of `bytes` at `offset`, across as many `write_at`s as it takes.
+
+**A store that answers `Ok(0)` to a non-empty write has broken `WriteAt`'s contract, and this
+stops the program saying so.** There is no error to hand back instead: the error type is the
+store's, and nothing here can make one of those. The alternative -- answering a count the caller
+then has to compare -- would put that comparison at every call site, for a case no correct store
+produces.
+
 ## Types
+
+### `BytesAt`
+
+```sysl
+struct BytesAt
+    bytes: []const u8
+    most: usize
+```
+
+A read-only store over bytes already in hand -- a file's contents read whole, a table in flash, a
+literal in a test.
+
+It borrows, as `BytesReader` does, so it costs three words and the bytes must outlive it.
 
 ### `BytesReader`
 
@@ -279,7 +352,83 @@ caller wanting to read again past the end gets `None` every time rather than a s
 | `held_line` | `held_line(*self) -> Result[string, Utf8Error]` |  |
 | `refill` | `refill(*self)` |  |
 
+### `MemoryError`
+
+```sysl
+enum MemoryError
+    NoRoom
+```
+
+Why a store over memory refused: a write starting at or past the end of its storage, which is
+fixed. Reading cannot fail at all, and past the end is an empty answer rather than this.
+
+### `SliceAt`
+
+```sysl
+struct SliceAt
+    bytes: []u8
+    most: usize
+```
+
+A store over storage the caller owns, read and written in place -- a sector buffer, a RAM disk, a
+flash image being built.
+
+Its size is the slice's: a write is cut short at the end, and one starting at or past it is
+`NoRoom`, since there is nowhere for it to go. Nothing is grown, which is what keeps it usable where
+nothing can be allocated.
+
 ## Traits
+
+### `Positioned`
+
+```sysl
+trait Positioned
+    type Error
+    extent(*self) -> Result[u64, Self::Error]
+```
+
+What every positioned store has, whichever direction it is used in: its own error, and how many
+bytes it holds.
+
+**It is a trait of its own, required by both `ReadAt` and `WriteAt`, for the reason `Fallible`
+is.** An associated type is named off the type (`S::Error`), never off the trait, so a type may
+implement only one trait declaring an `Error` (`reference/traits.md § One name per type`). A file
+is read and written at offsets alike, and the error both directions report is one type, so it is
+declared once, here, and the two traits reach it.
+
+**The error is the implementation's, not the library's.** A file reports an `IoError`, a codec's
+own store reports the codec's error, and a slice in memory reports `MemoryError` -- nothing is
+squeezed through a common enum that would have to name every way every store can fail. A generic
+function bounded on `ReadAt` hands `S::Error` back unchanged; one that wants its own error back
+through `?` takes a `*ReadAt[Error = E]` instead, which fixes the type.
+
+`extent` is "size" under another name because `File` already has an inherent `size` answering a
+`long`, and a trait member may not share a name with an inherent one.
+
+| Member | Signature | Description |
+|---|---|---|
+| `extent` | `extent(*self) -> Result[u64, Self::Error]` | How many bytes the store holds -- the offset a read reaches the end at. |
+
+### `ReadAt`
+
+```sysl
+trait ReadAt: Positioned
+    read_at(*self, offset: u64, into: []u8) -> Result[[]const u8, Self::Error]
+```
+
+Reading at an offset, without a position to move.
+
+`read_at` fills a prefix of `into` with the bytes starting at `offset` and **hands that prefix
+back**, as `Reader.read` does, so the count and the bytes cannot disagree. It may answer short
+whenever it likes -- a device that reads a sector at a time, a store that hands over what one call
+reaches -- and an **empty** answer to a non-empty request means `offset` is at or past the end.
+Past the end is not an error: it is how a caller finds out where the end is.
+
+`read_exact_at` is the loop a caller would otherwise write round a short answer.
+
+| Member | Signature | Description |
+|---|---|---|
+| `read_at` | `read_at(*self, offset: u64, into: []u8) -> Result[[]const u8, Self::Error]` |  |
 
 ### `Reader`
 
@@ -335,6 +484,29 @@ at all on a board.
 |---|---|---|
 | `read` | `read(*self, into: []u8) -> []const u8` |  |
 
+### `WriteAt`
+
+```sysl
+trait WriteAt: Positioned
+    write_at(*self, offset: u64, bytes: []const u8) -> Result[usize, Self::Error]
+    sync(*self) -> Result[unit, Self::Error]
+```
+
+Writing at an offset, without a position to move.
+
+`write_at` writes a prefix of `bytes` at `offset` and answers how many it took. It may take fewer
+than it was given, but **a store that can take nothing answers an error** rather than `Ok(0)`, since
+a caller retrying a write that made no progress would retry for ever -- the contract
+`write_all_at` relies on. An empty `bytes` takes nothing and is `Ok(0)` anywhere.
+
+`sync` makes what was written durable -- a file's `fsync`, a flash controller's commit. Its default
+says there is nothing to do, which is true of memory and of any store whose writes land at once.
+
+| Member | Signature | Description |
+|---|---|---|
+| `write_at` | `write_at(*self, offset: u64, bytes: []const u8) -> Result[usize, Self::Error]` |  |
+| `sync` | `sync(*self) -> Result[unit, Self::Error]` |  |
+
 ## Implementations
 
 ### Fallible for BytesReader
@@ -369,6 +541,30 @@ impl Fallible for FdReader
 impl Iterate for Lines
 ```
 
+### Positioned for BytesAt
+
+```sysl
+impl Positioned for BytesAt
+```
+
+### Positioned for SliceAt
+
+```sysl
+impl Positioned for SliceAt
+```
+
+### ReadAt for BytesAt
+
+```sysl
+impl ReadAt for BytesAt
+```
+
+### ReadAt for SliceAt
+
+```sysl
+impl ReadAt for SliceAt
+```
+
 ### Reader for BytesReader
 
 ```sysl
@@ -379,6 +575,12 @@ impl Reader for BytesReader
 
 ```sysl
 impl Reader for FdReader
+```
+
+### WriteAt for SliceAt
+
+```sysl
+impl WriteAt for SliceAt
 ```
 
 ### Writer for BytesWriter
