@@ -211,8 +211,9 @@ print(xs[..].flat_map(n -> pair(n)))
 [1, 10, 2, 20, 3, 30]
 ```
 
-Writing the literal inline is refused, and the refusal is about the type rather than about lifetimes:
-an array literal is an **array**, `[2]int`, and the member asks for a slice.
+Writing the literal inline works too. An array literal is an **array**, `[2]int`, and the member
+asks for a slice of the elements it decides; a closure that returns an array is accepted there, and
+the arrays may differ in length from one call to the next.
 
 ```sysl
 import sysl.seq.Sequence
@@ -222,8 +223,8 @@ val xs = [1, 2]
 print(xs[..].flat_map(n -> [n, n * 10]))
 ```
 
-```error
-it implements 'sysl.Fn1[int, [2]int]'
+```output
+[1, 10, 2, 20]
 ```
 
 ## Making one from a count
@@ -294,12 +295,10 @@ generically means arithmetic at a type the bound says only is an integer — so 
 the way `filter` does. Reach for `generate` where the count is what you have, and for the range
 where the range is.
 
-## The members are on a slice, not on an array
+## An array has the members too
 
-The `impl` covers `[]const E`, so an array reaches these members the way it reaches anything expecting
-a slice — by being sliced, with `[..]`. That is one character and it is deliberate: an array is a
-value, a slice is a view of one, and which of the two a `map` walks is the difference between copying
-six words and not.
+An array implements `Sequence` as well as a slice, so these members are called on a `[N]T` directly,
+with no `[..]`. A large array is read where it lies, not copied in to be walked.
 
 ```sysl
 import sysl.seq.Sequence
@@ -309,8 +308,8 @@ val xs = [1, 2, 3]
 print(xs.map(n -> n * 2))
 ```
 
-```error
-type '[3]int' has no method 'map'
+```output
+[2, 4, 6]
 ```
 
 **Written for `[]const E` rather than `[]E`**, which is what makes it reachable on both: a `[]T` is
