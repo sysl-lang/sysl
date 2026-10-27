@@ -573,10 +573,12 @@ reads like sysl from sysl that reads like C with different punctuation.
 - The one place to say it is a `var` starting from nothing: `var i: usize = 0`, because a bare
   integer literal alone infers `int`. Better still, reach for `for i in 0..<xs.len`, which needs
   neither.
-- **A suffix is load-bearing in six places**, and stays: an array literal's element type
-  where **every** element is literal (`[104u8, 105, …]` — one suffix settles the rest, or annotate the binding instead), a range with **both** bounds literal, an `if` or
-  `match` where **both** sides are literals, a page whose subject is the type, a float width, and an
-  integer outside `int`'s range.
+- **A suffix is load-bearing in five places**, and stays: an array literal's element type
+  where **every** element is literal (`[104u8, 105, …]` — one suffix settles the rest, or annotate
+  the binding instead), a range with **both** bounds literal, a page whose subject is the type, a
+  float width, and an integer outside `int`'s range. An `if` or a `match` whose arms are all
+  literals is not among them: it takes its position's type as one literal does, generic argument
+  included (`buf_filled(3, if c then 1 else 0)` under a `Buf[u8]`).
 - For a byte constant write `u8(';')`, never `59u8` — a `char` will not compare to a byte, and there
   is no `b'…'` form.
 - Keep an annotation the compiler asks for: `var head: Buf[&Display] = buf()` has nothing to infer

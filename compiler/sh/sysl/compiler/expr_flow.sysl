@@ -1810,6 +1810,57 @@ private literal_block(cx: &Analyzer, stmts: Buf[Stmt]) -> bool = block_value(stm
     Some(e) -> literal_valued(cx, e)
     None -> false
 
+// The literal to blame where an `if`, a `match` or a block of literals comes to a type its position
+// does not take: `if c then 1 else 2.5` under `u8` is real only because of the `2.5`, and the `1`
+// beside it took the `u8` it was given. So where at least one branch's literal meets `want` and
+// another's does not, the complaint belongs at that other one; with no branch meeting it, the whole
+// expression is the mistake and nothing is named. A branch that is anything but a literal leaves the
+// expression its own blame.
+misfit_literal(t: TExpr, want: Type) -> Option[TExpr]
+    var leaves: Buf[TExpr] = buf()
+
+    if !literal_leaves(&leaves, t) || leaves.len() < 2 then return None
+
+    var fits = false
+    var misfit: Option[TExpr] = None
+
+    for leaf in leaves
+        if !disagree(texpr_type(leaf), want) then fits = true
+        elif misfit.is_none() then misfit = Some(leaf)
+
+    if fits then misfit else None
+end misfit_literal
+
+// The literals an expression's finishing branches end in, with the widening a meeting of branches
+// put over one taken off again; false where a branch ends in anything else.
+private literal_leaves(out: *Buf[TExpr], t: TExpr) -> bool = *t.kind match
+    TIntLit(_, _) ->
+        out.push(t)
+        true
+    TFloatLit(_, _) ->
+        out.push(t)
+        true
+    TCast(inner, _) -> *inner.kind match
+        TIntLit(_, _) -> literal_leaves(out, inner)
+        TFloatLit(_, _) -> literal_leaves(out, inner)
+        _ -> false
+    TIf(_, then_block, else_block, _) ->
+        else_block.is_some() && leaf_block(out, then_block) && leaf_block(out, else_block.unwrap())
+    TMatch(_, arms, _) ->
+        for arm in arms
+            if !leaf_block(out, arm.body) then return false
+
+        true
+    TBlockExpr(block) -> leaf_block(out, block)
+    _ -> false
+
+private leaf_block(out: *Buf[TExpr], b: TBlock) -> bool
+    if b.ty == Never then return true
+
+    b.result match
+        Some(r) -> literal_leaves(out, r)
+        None -> false
+
 // Whether a block ends by leaving: in a `return`, a `break` or a `continue`, or in a call of a
 // function declared `-> never` -- `panic(…)`, or one of the program's own.
 //
