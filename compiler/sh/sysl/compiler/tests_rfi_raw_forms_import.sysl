@@ -6,12 +6,12 @@ import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
 import sysl.process.capture
 import sysl.text.join
 
-// The forms a file imports: `ptr_cast`, `str_cast` and `str_alias` from `sysl.raw`, and the four
-// `va_` forms from `sysl.c`. The compiler answers each; nothing in either module declares one.
-// Imported by name, under another name with `as`, through a wildcard, or as a path through the
-// module, the form answers; written bare without an import it still does in 0.6.x, with a warning
-// that it is refused from 0.7.0 (`expr_call.sysl`'s `imported_form`, `analyze.sysl`'s
-// `import_name`; the warning's own cases are `tests_rwn_raw_warns.sysl`).
+// The forms a file may import on the 0.5 line, so a program written for 0.6.0 -- where it must --
+// builds here too: `ptr_cast`, `str_cast` and `str_alias` from `sysl.raw`, and the four `va_` forms
+// from `sysl.c`. The compiler answers each; nothing in either module declares one. Imported by name,
+// under another name with `as`, through a wildcard, or as a path through the module, the form
+// answers; written bare without an import it still does, as it always has on this line
+// (`expr_call.sysl`'s `imported_form`, `analyze.sysl`'s `import_name`).
 
 // -- the harness ----------------------------------------------------------------------------------
 
@@ -79,18 +79,6 @@ private rfi_refused(text: string, message: string, at: string)
     assert_eq(out.count_of("error: "), 1)
 end rfi_refused
 
-// The program builds, is warned once that this form was left out, at this line and column, and
-// prints this.
-private rfi_warned(text: string, form: string, home: string, at: string, prints: string)
-    val got = rwn_main(text)
-
-    assert_eq(got.0, Fine, got.1)
-    assert_eq(got.2, prints)
-    assert(got.1.contains(rwn_line(form, home)), got.1)
-    assert(got.1.contains(s"/main.sysl:$at\n"), got.1)
-    assert_eq(got.1.count_of("warning: "), 1)
-end rfi_warned
-
 private rfi_cli(args: []string) -> (int, string)
     var lines: Buf[string] = buf()
     val sink = &lines
@@ -116,7 +104,7 @@ rfi_ptr_cast()
     if !rfi_ready() then return
 
     assert_eq(rfi_ran("import sysl.raw.ptr_cast\n\n" + rfi_word), "1\n")
-    rfi_warned(rfi_word, "ptr_cast", "sysl.raw", "2:15", "1\n")
+    rfi_refused(rfi_word, "'ptr_cast' is in sysl.raw: add 'import sysl.raw.ptr_cast'", "2:15")
 
 @test("ptr_cast with its type written in brackets, imported and not")
 rfi_ptr_cast_written_type()
@@ -125,7 +113,7 @@ rfi_ptr_cast_written_type()
     val body = "var a: [4]u8 = [7, 0, 0, 0]\nprint(*ptr_cast[*u8](&a[0]))\n"
 
     assert_eq(rfi_ran("import sysl.raw.ptr_cast\n\n" + body), "7\n")
-    rfi_warned(body, "ptr_cast", "sysl.raw", "2:8", "7\n")
+    rfi_refused(body, "'ptr_cast' is in sysl.raw: add 'import sysl.raw.ptr_cast'", "2:8")
 
 @test("str_cast imported from sysl.raw takes bytes as a string, sliced short of a NUL, imported and not")
 rfi_str_cast()
@@ -134,7 +122,7 @@ rfi_str_cast()
     val body = "var b: [5]u8 = [104, 105, 33, 33, 33]\nprint(str_cast(b[0..<3]))\n"
 
     assert_eq(rfi_ran("import sysl.raw.str_cast\n\n" + body), "hi!\n")
-    rfi_warned(body, "str_cast", "sysl.raw", "2:7", "hi!\n")
+    rfi_refused(body, "'str_cast' is in sysl.raw: add 'import sysl.raw.str_cast'", "2:7")
 
 @test("str_alias imported from sysl.raw lays a string over a buffer, imported and not")
 rfi_str_alias()
@@ -143,7 +131,7 @@ rfi_str_alias()
     val body = "var b: [3]u8 = [111, 107, 33]\nval s = str_alias(b[0..<2])\nprint(s, s.len)\n"
 
     assert_eq(rfi_ran("import sysl.raw.str_alias\n\n" + body), "ok 2\n")
-    rfi_warned(body, "str_alias", "sysl.raw", "2:9", "ok 2\n")
+    rfi_refused(body, "'str_alias' is in sysl.raw: add 'import sysl.raw.str_alias'", "2:9")
 
 @test("the four va_ forms imported from sysl.c walk a tail twice; each one left out is told where it lives")
 rfi_va_forms()
@@ -151,22 +139,18 @@ rfi_va_forms()
 
     assert_eq(rfi_ran("import sysl.c.{va_start, va_arg, va_copy, va_end}\n\n" + rfi_sum), "12\n")
 
-    // Two forms left out over four uses: one warning each, and the tail is still walked.
-    val partly = rwn_main("import sysl.c.{va_start, va_end}\n\n" + rfi_sum)
+    val partly = rfi_said("import sysl.c.{va_start, va_end}\n\n" + rfi_sum)
 
-    assert_eq(partly.0, Fine, partly.1)
-    assert_eq(partly.2, "12\n")
-    assert(partly.1.contains(rwn_line("va_copy", "sysl.c")), partly.1)
-    assert(partly.1.contains(rwn_line("va_arg", "sysl.c")), partly.1)
-    assert(!partly.1.contains("'va_start' is in"), partly.1)
-    assert(!partly.1.contains("'va_end' is in"), partly.1)
-    assert_eq(partly.1.count_of("warning: "), 2)
+    assert(partly.index_of("error: 'va_copy' is in sysl.c: add 'import sysl.c.va_copy'").is_some(), partly)
+    assert(partly.index_of("error: 'va_arg' is in sysl.c: add 'import sysl.c.va_arg'").is_some(), partly)
+    assert(partly.index_of("'va_start' is in").is_none(), partly)
+    assert(partly.index_of("'va_end' is in").is_none(), partly)
+    assert_eq(partly.count_of("error: "), 3)
 
-    val none = rwn_main(rfi_sum)
+    val none = rfi_said(rfi_sum)
 
-    assert_eq(none.2, "12\n")
-    assert(none.1.contains(rwn_line("va_start", "sysl.c")), none.1)
-    assert(none.1.contains(rwn_line("va_end", "sysl.c")), none.1)
+    assert(none.index_of("error: 'va_start' is in sysl.c: add 'import sysl.c.va_start'").is_some(), none)
+    assert(none.index_of("error: 'va_end' is in sysl.c: add 'import sysl.c.va_end'").is_some(), none)
 
 // -- the spellings of the import ------------------------------------------------------------------
 
@@ -194,9 +178,9 @@ rfi_aliased()
 rfi_alias_beside_the_name()
     if !rfi_ready() then return
 
-    rfi_warned("import sysl.raw.ptr_cast as pc\n\nvar a: [4]u8 = [1, 0, 0, 0]\n" +
-               "val p: *u32 = ptr_cast(&a[0])\nval q: *u32 = pc(&a[0])\nprint(*p, *q)\n",
-               "ptr_cast", "sysl.raw", "4:15", "1 1\n")
+    rfi_refused("import sysl.raw.ptr_cast as pc\n\nvar a: [4]u8 = [1, 0, 0, 0]\n" +
+                "val p: *u32 = ptr_cast(&a[0])\nval q: *u32 = pc(&a[0])\nprint(*p, *q)\n",
+                "'ptr_cast' is in sysl.raw: add 'import sysl.raw.ptr_cast'", "4:15")
 
 @test("the module imported whole reaches the form through its name, and the whole path does too")
 rfi_through_the_module()

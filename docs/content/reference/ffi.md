@@ -2626,8 +2626,7 @@ is the line the "no functions built into the compiler" rule actually draws — n
 while `va_list` stays a predeclared type. The compiler answers them, but a file names the C variadic
 forms it uses, as it names anything else it did not declare; an alias, a wildcard (`import sysl.c.*`)
 and a path through the module reach them too. **The import is required.** Written bare without one,
-the form still answers in 0.6.x, with a warning naming the line to add — once per file per form, at
-its first use — and from 0.7.0 it is refused:
+the form is refused, and the error names the line to add:
 
 ```sysl
 sum(n: int, ...) -> int
@@ -2646,14 +2645,8 @@ sum(n: int, ...) -> int
 print(sum(3, 10, 20, 30))
 ```
 
-```output
-60
-```
-
-```
-warning: 'va_start' is in sysl.c: add 'import sysl.c.va_start' (this is refused from 0.7.0)
-warning: 'va_arg' is in sysl.c: add 'import sysl.c.va_arg' (this is refused from 0.7.0)
-warning: 'va_end' is in sysl.c: add 'import sysl.c.va_end' (this is refused from 0.7.0)
+```error
+'va_start' is in sysl.c: add 'import sysl.c.va_start'
 ```
 
 **The walk is the target's C walk, every class of argument included.** On most machines a `va_list`
