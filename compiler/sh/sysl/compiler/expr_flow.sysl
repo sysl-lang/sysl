@@ -1776,6 +1776,40 @@ private every_branch_guesses(cx: &Analyzer, e: Expr) -> bool = *e.kind match
             guessing(cx, eb) && stops(cx, then_body)
     _ -> false
 
+// Whether an expression comes to a bare literal on every path that finishes: a literal, or an `if`,
+// a `match` or a block whose every finishing branch is one -- however deeply they nest.
+//
+// **Such an expression takes its position's type exactly as a single literal does**, so it is in the
+// literal's tier wherever a type is being worked out: `buf_filled(3, if c then 1 else 0)` under a
+// `Buf[u8]` annotation is a call at `u8`, as `buf_filled(3, 0)` is. A branch that leaves is no
+// evidence either way, but one branch at least has to finish.
+literal_valued(cx: &Analyzer, e: Expr) -> bool
+    if is_literal(e) then return true
+
+    *e.kind match
+        IfExpr(_, then_body, else_body, _) ->
+            if else_body.is_none() then return false
+
+            val eb = else_body.unwrap()
+
+            literal_block(cx, then_body) && (literal_block(cx, eb) || stops(cx, eb)) ||
+                literal_block(cx, eb) && stops(cx, then_body)
+        MatchExpr(_, arms) ->
+            var finished = false
+
+            for arm in arms
+                if literal_block(cx, arm.body) then finished = true
+                else if !stops(cx, arm.body) then return false
+
+            finished
+        Block(stmts) -> literal_block(cx, stmts)
+        _ -> false
+end literal_valued
+
+private literal_block(cx: &Analyzer, stmts: Buf[Stmt]) -> bool = block_value(stmts) match
+    Some(e) -> literal_valued(cx, e)
+    None -> false
+
 // Whether a block ends by leaving: in a `return`, a `break` or a `continue`, or in a call of a
 // function declared `-> never` -- `panic(…)`, or one of the program's own.
 //
