@@ -34,6 +34,8 @@ private checks_before_lowering(a: &Analysis, p: TProgram, own: Buf[string],
     // **The escapes go first**, because what they answer with is not a verdict but a decision the
     // lowering needs: which of a body's arrays live in a buffer rather than in its frame.
     check_begin()
+    check_storage_typed(a, p)
+    check_done("storage_typed")
 
     val promotions = check_escapes(a, p)
 
@@ -54,6 +56,28 @@ private checks_before_lowering(a: &Analysis, p: TProgram, own: Buf[string],
     check_done("general_regs")
     promotions
 end checks_before_lowering
+
+// -- module storage has a type ------------------------------------------------------------------------
+
+// **Module storage reaches the lowering with a type, always.** Storage whose type could not be worked
+// out was refused where it was declared, and a program with a refusal is never lowered -- so storage
+// with no type here is a refusal that went missing, and lowering it would hand clang a global of type
+// `void`. This says so at the declaration rather than leaving the reader a clang error about IR. A
+// program already refused is not lowered, and its untyped storage is that refusal's consequence.
+private check_storage_typed(a: &Analysis, p: TProgram)
+    if any_errors(a.found) then return
+
+    for v in p.vals
+        if !mentions_unknown(v.ty) then continue
+
+        val d = a.tables.vals.get(v.symbol)
+
+        if d.is_some()
+            a.fault(d.unwrap().scope, d.unwrap().span,
+                    s"internal error: no type was worked out for '${qualified_name(v.symbol)}', and " +
+                    "nothing said why — write its type, and report this")
+        end if
+end check_storage_typed
 
 // -- `become` -----------------------------------------------------------------------------------------
 

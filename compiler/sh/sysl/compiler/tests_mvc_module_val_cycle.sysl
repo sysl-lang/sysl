@@ -1,0 +1,157 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.replace_all
+
+// Module storage written with no type whose value reaches the storage again has no type to take, and
+// is refused at its declaration (`reference/declarations.md`). The reading that meets the cycle gets
+// an operand with no type, which gives up on the declaration quietly as the consequence of a mistake
+// said elsewhere -- and the cycle is that mistake, told after the reading. It must be told, and the
+// storage must never reach the lowering as a global of type `void`.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private mvc_ready() -> bool = std_root().is_ok() && clang_available()
+
+private mvc_root(files: []const (string, string)) -> string
+    val root = replace_all(make_temp_dir("sysl-mvc").unwrap(), "//", "/")
+
+    write_text(s"$root/package.hocon", "").unwrap()
+
+    for i in 0..<files.len
+        val dir = files[i].0.last_index_of("/")
+
+        if dir.is_some() then make_dir_all(s"$root/${files[i].0[0..<dir.unwrap()]}").unwrap()
+
+        write_text(s"$root/${files[i].0}", files[i].1).unwrap()
+
+    root
+end mvc_root
+
+// The emitted module, or the report the program was refused with.
+private mvc_ir(files: []const (string, string)) -> string
+    val root = mvc_root(files)
+
+    val out = emit_llvm_text(root, None) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> if made.report.is_empty() then made.text else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    replace_all(out, s"$root/", "")
+end mvc_ir
+
+// What the program prints, or the report it was refused with.
+private mvc_ran(main_text: string) -> string
+    val root = mvc_root([("main.sysl", main_text)])
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            val said = replace_all(failure_text(why), s"$root/", "")
+
+            remove_dir_all(root).unwrap_or(())
+            return said
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end mvc_ran
+
+// The cycle message for `name`, as `word` (`val` or `var`), shown as `shown`.
+private mvc_cycle(shown: string, word: string, name: string) -> string =
+    s"'$shown' takes its type from its value, and the value reaches '$shown' again — write its type, " +
+    s"'$word $name: T = …'"
+
+// Refused with `message` at `at` (`line:col` of `file`), and with nothing that names a type of
+// `void` or an internal error.
+private mvc_refused_in(files: []const (string, string), file: string, message: string, at: string)
+    if !mvc_ready() then return
+
+    val said = mvc_ir(files)
+    val place = s"error: $message\n --> $file:$at\n"
+
+    assert(said.contains(place), s"expected\n$place\ngot\n$said")
+    assert(!said.contains("internal error"), said)
+    assert(!said.contains("clang failed"), said)
+end mvc_refused_in
+
+private mvc_refused(main_text: string, message: string, at: string) =
+    mvc_refused_in([("main.sysl", main_text)], "main.sysl", message, at)
+
+// -- the cycles ----------------------------------------------------------------------------------
+
+@test("two module vals whose values reach each other are refused at the first, not handed to clang")
+mvc_two_val_cycle() =
+    mvc_refused("static val a = b + 1\nstatic val b = a + 1\n\nprint(a)\n", mvc_cycle("a", "val", "a"), "1:8")
+
+@test("a module val whose value reaches itself directly is refused at its declaration")
+mvc_self_cycle() =
+    mvc_refused("static val a = a + 1\n\nprint(a)\n", mvc_cycle("a", "val", "a"), "1:8")
+
+@test("a cycle through three module vals is refused at the first of them")
+mvc_three_val_cycle() =
+    mvc_refused("static val a = c + 1\nstatic val b = a + 1\nstatic val c = b + 1\n\nprint(a)\n",
+                mvc_cycle("a", "val", "a"), "1:8")
+
+@test("a cycle through a comparison is refused, the comparison's type notwithstanding")
+mvc_compare_cycle() =
+    mvc_refused("static val a = b < 1\nstatic val b = if a then 1 else 2\n\nprint(a)\n",
+                mvc_cycle("a", "val", "a"), "1:8")
+
+@test("a cycle through a closure handed to a generic with a literal seed is refused at the val")
+mvc_fold_cycle() =
+    mvc_refused("static val a = [1, 2, 3].fold(0, (acc, x) -> acc + x + a)\n\nprint(a)\n",
+                mvc_cycle("a", "val", "a"), "1:8")
+
+@test("a cycle through a function with no result type is refused at the function, and only there")
+mvc_function_cycle()
+    if !mvc_ready() then return
+
+    val said = mvc_ir([("main.sysl", "static val a = twice() + 1\n\ntwice() = a * 2\n\nprint(a)\n")])
+    val place = "error: 'twice' takes its result type from its body, and the body reaches 'twice' again — " +
+                "write its result type, 'twice(…) -> T'\n --> main.sysl:3:1\n"
+
+    assert(said.contains(place), s"expected\n$place\ngot\n$said")
+    assert(!said.contains("internal error"), said)
+    assert(!said.contains("clang failed"), said)
+end mvc_function_cycle
+
+@test("a module var in a cycle is told with 'var', and a module's own storage is named with its module")
+mvc_var_and_module_cycle()
+    mvc_refused("static var a = b + 1\nstatic val b = a + 1\n\nprint(a)\n", mvc_cycle("a", "var", "a"), "1:8")
+    mvc_refused_in([("cfg/cfg.sysl", "module cfg\n\nval a = b * 2\nval b = a - 1\n"),
+                    ("main.sysl", "import cfg\n\nprint(cfg.a)\n")],
+                   "cfg/cfg.sysl", mvc_cycle("cfg.a", "val", "a"), "3:1")
+end mvc_var_and_module_cycle
+
+// The name already told about in a reading of the same initializer is what gives the region up here,
+// and the cycle is a second, independent mistake in the declaration: both are told, as 0.7.1 told them.
+@test("a refusal in an initializer that is also a cycle is told, and so is the cycle")
+mvc_refusal_and_cycle()
+    if !mvc_ready() then return
+
+    val said = mvc_ir([("main.sysl", "static val a = missing + b\nstatic val b = a + 1\n\nprint(a)\n")])
+
+    assert(said.contains("error: undefined name 'missing'\n --> main.sysl:1:16\n"), said)
+    assert(said.contains(s"error: ${mvc_cycle("a", "val", "a")}\n --> main.sysl:1:8\n"), said)
+    assert(!said.contains("internal error"), said)
+end mvc_refusal_and_cycle
+
+// -- what is no cycle -----------------------------------------------------------------------------
+
+@test("module vals that read each other in one direction still take their types and run")
+mvc_no_cycle()
+    if !mvc_ready() then return
+
+    assert_eq(mvc_ran("static val a = 1\nstatic val b = a + 1\nstatic val c = b < 3\n\nprint(a, b, c)\n"),
+              "1 2 true\n")
+    assert_eq(mvc_ran("static val b = a + 1\nstatic val a = 40\n\nprint(a + b)\n"), "81\n")
+end mvc_no_cycle
