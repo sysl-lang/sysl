@@ -576,6 +576,16 @@ end exports_main
 // accessor, a comparison.
 private const ImportLimit: usize = 48
 
+// What a body longer than `ImportLimit` raw instructions may cost the optimizer (`body_cost`) and
+// still be copied: LLVM's `-O2` inline threshold (225) over its cost per instruction (5), which is
+// what its own inliner would admit of the same body once the stack slots are registers. A PCG step,
+// `Rng.next_u32`, costs 33 and is the case that a limit of the codegen units' 32 refused.
+private const ImportCost: usize = 45
+
+// A body longer than `ImportLimit` raw instructions is printed and costed (`body_cost`) only up to
+// this many, so a large function is refused without printing it.
+private const ImportScanLimit: usize = 512
+
 // **Whether a precompiled function is also given to this module to inline**, as rustc gives a crate's
 // `#[inline]` and small functions to every crate that calls them. The body stays where the archive
 // put it; this module carries an `available_externally` copy the optimizer may inline and never
@@ -590,7 +600,8 @@ private importable(f: TFunc) -> bool =
         f.conv.is_none() && f.section.is_none() && !f.variadic
 
 // Whether a lowered precompiled body is kept as a copy: one marked `@inline` whatever its length,
-// otherwise one of at most `ImportLimit` instructions.
+// otherwise one of at most `ImportLimit` instructions, or of at most `ImportScanLimit` whose cost to the
+// optimizer is at most `ImportCost`.
 //
 // **A copy is the same function as the archive's** because a precompiled body keeps no storage of
 // its own: one reaching module storage is never precompiled (`root_artifact.sysl`), and what a body
@@ -605,7 +616,15 @@ private keeps_import(f: TFunc, built: IrFunc) -> bool
     for b in built.blocks
         count += b.instrs.len() + 1
 
-    count <= ImportLimit
+    if count <= ImportLimit then return true
+    if count > ImportScanLimit then return false
+
+    // Past the raw count, what the optimizer will make of the body decides, as it does for a copy
+    // across codegen units (`body_cost`): a PCG step is a dozen statements, ~60 lines of slots, and
+    // a handful of instructions once they are registers.
+    val text = ir_print_func(built)
+
+    body_cost(text, 0, text.len) <= ImportCost
 end keeps_import
 
 // The declarations a library's already-compiled functions get, in the order the program filed them.

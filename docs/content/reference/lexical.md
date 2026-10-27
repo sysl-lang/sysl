@@ -1108,7 +1108,9 @@ negative zero positive
 It is read exactly as the same branch written at the statement's margin. This holds for an
 `else if`, for an `if` nested in another's branch, and for a statement `if` after an arm's `->`. The
 `if` must be the one the line continues, in the same statement, and the column must be that of the
-`if` keyword itself; an `else` at any other column that no block opened is refused as above:
+`if` keyword itself, or of a `then` of it that begins a line
+([below](#an-unbracketed-line-continues-before-then)); an `else` at any other column that no block
+opened is refused as above:
 
 ```sysl
 sign(n: int) -> string
@@ -1334,6 +1336,49 @@ tuple index expected
 ```
 
 The language accepts only the leading-dot form, so every chain is written one way.
+
+### An unbracketed line continues before `then`
+
+**A line that begins with `then` continues the condition above it** — the statement above has to
+hold the `if`, so the word under `enum E` is still the reserved word refused as a variant's name.
+`then` can begin nothing else, so there is nothing to resolve, and as with a leading dot the line's
+own indentation is ignored. An
+`else` or `elif` on a line of its own may then line up under that `then`, as it may under the `if`:
+
+```sysl
+pick(c: bool) -> int
+    val n = if c
+        then 1
+        else 2
+    n
+
+word(n: int) -> string = if n < 0
+    then "negative"
+    elif n == 0
+    then "zero"
+    else "positive"
+
+print(pick(true), pick(false), word(-1), word(0), word(4))
+```
+
+```output
+1 2 negative zero positive
+```
+
+A branch opens no block, so an `else` or `elif` deeper than a statement holding an `if`, that lines
+up with neither, is refused, and the diagnostic says where it can go:
+
+```sysl
+pick(c: bool) -> int
+    val n = if c
+        then 1
+          else 2
+    n
+```
+
+```error
+an 'else' indented 10 columns lines up with no 'if' it could continue — put it under its 'if', or under a 'then' that begins a line
+```
 
 ### A dedented continuation line
 

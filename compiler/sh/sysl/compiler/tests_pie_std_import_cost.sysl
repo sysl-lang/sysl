@@ -1,0 +1,299 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// **A small standard function is copied into the program that calls it by what its body costs the
+// optimizer, not by how many instructions its unoptimized text has** (`codegen.sysl`'s
+// `keeps_import`, `body_cost`). Unoptimized text spells every local as a stack slot, so a PCG step
+// (`Rng.next_u32`, a dozen statements) is ~54 lines and costs 33 once the slots are registers:
+// past the limit a raw count gave, and a hot call the program could not inline. The copy is
+// `available_externally`, so the link still takes the one definition the standard module defines.
+
+private pie_lines(text: string, head: string, part: string) -> int
+    var n = 0
+
+    for line in lines_of(text)
+        if line.starts_with(head) && line.contains(part) then n += 1
+
+    n
+end pie_lines
+
+// Whether `text` calls the function whose name ends `tail`. clang's own printing quotes a name holding
+// `$` or `.` (`@"piel$mix"(`), the compiler's does not (`@piel$mix(`), so both spellings are asked.
+private pie_calls(text: string, tail: string) -> bool
+    for line in lines_of(text)
+        if line.contains("call ") && (line.contains(tail + "(") || line.contains(tail + "\"(")) then return true
+
+    false
+end pie_calls
+
+private pie_text(path: string, level: string) -> string
+    lbr_hand([])
+
+    val text = emit_llvm_text(path, None, level, buf(), None, true) match
+        Err(why) -> s"refused: ${failure_text(why)}"
+        Ok(emitted) -> emitted.text
+
+    reset_search_paths()
+    text
+end pie_text
+
+private pie_optimized(text: string) -> string
+    val dir = make_temp_dir("sysl-pie-opt").unwrap()
+    val file = s"$dir/t.ll"
+
+    write_text(file, text).unwrap()
+
+    val got = capture("clang", ["-O2", "-S", "-emit-llvm", "-o", "-", file], "", [], true).unwrap()
+
+    remove_dir_all(dir).unwrap_or(())
+    assert(got.status.ok(), s"clang refused the text:\n${got.err.unwrap_or("")}")
+    got.text
+end pie_optimized
+
+private pie_program() -> string =
+    lbr_program("import sysl.rand.{rng, Rng}\n\n@noinline\nstep(g: *Rng) -> u32 = g.next_u32()\n\n" +
+                "var g = rng(42, 54)\n\nprint(step(&g))\nprint(step(&g))\n")
+
+@test("a PCG step is copied into the program at -O2, once, with no declaration beside it, and inlined")
+pie_pcg_step_copied()
+    if !lbr_ready() then return
+
+    val app = pie_program()
+    val text = pie_text(app, "2")
+
+    assert_eq(pie_lines(text, "define available_externally ", "Rng.next_u32("), 1)
+    assert_eq(pie_lines(text, "declare ", "Rng.next_u32("), 0)
+
+    // The real definition stays in the standard module: this text defines it nowhere.
+    assert_eq(pie_lines(text, "define i32 ", "Rng.next_u32("), 0)
+    assert_eq(pie_lines(text, "define dso_local ", "Rng.next_u32("), 0)
+    assert(!pie_calls(pie_optimized(text), "Rng.next_u32"), "the copy was inlined")
+    lbr_drop([app])
+end pie_pcg_step_copied
+
+@test("the program links to the one definition and prints the published vector's first two outputs")
+pie_pcg_step_links_and_runs()
+    if !lbr_ready() then return
+
+    val app = pie_program()
+    val dir = make_temp_dir("sysl-pie-exe").unwrap()
+    val exe = s"$dir/pie-exe"
+
+    lbr_hand([])
+
+    val said = build_native_program(app, None, None, "2", Some(exe)) match
+        Err(why) -> s"refused: ${failure_text(why)}"
+        Ok(made) ->
+            capture(made, [], "", [], true) match
+                Err(_) -> "the program that was built could not be run"
+                Ok(out) -> if out.status.ok() then out.text else s"exited badly: ${out.text}"
+
+    reset_search_paths()
+    remove_dir_all(dir).unwrap_or(())
+    assert_eq(said, "2707161783\n2068313097\n")
+    lbr_drop([app])
+end pie_pcg_step_links_and_runs
+
+@test("at -O0 the step is only declared: nothing would read a copy")
+pie_pcg_step_declared_at_o0()
+    if !lbr_ready() then return
+
+    val app = pie_program()
+    val text = pie_text(app, "0")
+
+    assert_eq(pie_lines(text, "define available_externally ", ""), 0)
+    assert_eq(pie_lines(text, "declare ", "Rng.next_u32("), 1)
+    lbr_drop([app])
+end pie_pcg_step_declared_at_o0
+
+@test("emit-llvm's own text, which links nothing, carries no copy")
+pie_emit_llvm_text_has_no_copy()
+    if !lbr_ready() then return
+
+    val app = pie_program()
+    lbr_hand([])
+
+    val text = emit_llvm_text(app, None, "2", buf(), None, false) match
+        Err(why) -> s"refused: ${failure_text(why)}"
+        Ok(emitted) -> emitted.text
+
+    reset_search_paths()
+
+    assert_eq(pie_lines(text, "define available_externally ", ""), 0)
+    lbr_drop([app])
+end pie_emit_llvm_text_has_no_copy
+
+@test("a standard function whose body costs more than the optimizer would take stays a declaration")
+pie_large_body_stays_declared()
+    if !lbr_ready() then return
+
+    val app = lbr_program("import sysl.text.replace_all\n\nprint(replace_all(\"a-b-c\", \"-\", \"+\"))\n")
+    val text = pie_text(app, "2")
+
+    assert_eq(pie_lines(text, "declare ", "replace_all("), 1)
+    assert_eq(pie_lines(text, "define available_externally ", "replace_all("), 0)
+    lbr_drop([app])
+end pie_large_body_stays_declared
+
+// -- the same rule over a `--lib` root's own functions -------------------------------------------------
+//
+// Every body below is longer than `ImportLimit` raw instructions, so the cost decides. `mix` is a PCG
+// step that writes through its parameter (raw ~71, cost 31). `at45` and `at46` are one `^ a` apart:
+// a chain of shifts and multiplies whose cost is exactly the limit, and one past it. The marked
+// copies of `mix` are refused by what they ask for before the cost is asked. A generic is not
+// precompiled (each instantiation is the program's own `define`) and a closure is not a function a
+// program calls by name, so neither has a cell here.
+
+private pie_mix_body() -> string =
+    "    val old = m.s\n    val inc = m.t\n    m.s = old * 6364136223846793005 + inc\n" +
+    "    val a = old >> 18\n    val b = a ^ old\n    val c = b >> 27\n    val rot = old >> 59\n" +
+    "    val lo = c ^ (c >> 3)\n    val hi = lo + rot\n    hi ^ (hi << 7)\n\n"
+
+private pie_chain(tail: string) -> string =
+    "    val a = (x * 3 + 1) ^ (x >> 1) ^ (x * 5 + 2) ^ (x >> 2) ^ (x * 7 + 3) ^ (x >> 3)\n" +
+    s"    (a * 3 + 1) ^ (a >> 1) ^ (a * 5 + 2) ^ (a >> 2) ^ (a * 7 + 3)$tail\n\n"
+
+// The root's pure arithmetic, which every target can build.
+private pie_core() -> string =
+    "module piel\n\nstruct Mix\n    s: u64\n    t: u64\n\nmix(m: *Mix) -> u64\n" + pie_mix_body() +
+    "@noinline\nmix_noinline(m: *Mix) -> u64\n" + pie_mix_body() +
+    "@cold\nmix_cold(m: *Mix) -> u64\n" + pie_mix_body() +
+    "@export(\"piel_mix\")\nmix_export(m: *Mix) -> u64\n" + pie_mix_body() +
+    "at45(x: u64) -> u64\n" + pie_chain(" ^ a ^ a ^ a") +
+    "at46(x: u64) -> u64\n" + pie_chain(" ^ a ^ a ^ a ^ a")
+
+// The same root with a type that has a destructor, and a function past the raw limit that reads one.
+private pie_root() -> string = lbr_tree(lbr_one("piel/piel.sysl", pie_core() +
+    "struct Tag\n    id: int\n\nimpl Drop for Tag\n    drop(self) = print(\"drop\", self.id)\n\n" +
+    "tag_mix(t: &Tag, x: u64) -> u64\n    val y = x + u64(t.id)\n" +
+    "    val a = (y * 3 + 1) ^ (y >> 1) ^ (y * 5 + 2) ^ (y >> 2)\n" +
+    "    val b = (a * 3 + 1) ^ (a >> 1) ^ (a * 5 + 2) ^ (a >> 2)\n    b ^ (b >> 7)\n"))
+
+private pie_root_app() -> string = lbr_program(
+    "var m = piel.Mix(42, 54)\n\nprint(piel.mix(&m))\nprint(piel.mix(&m))\nprint(piel.mix_noinline(&m))\n" +
+    "print(piel.mix_cold(&m))\nprint(piel.mix_export(&m))\nprint(piel.at45(7))\nprint(piel.at46(7))\n" +
+    "\nshow()\n    val t = piel.Tag(3)\n    print(piel.tag_mix(t, 5))\n\nshow()\n")
+
+private pie_root_text(app: string, root: string, target: Option[string], level: string) -> string
+    lbr_hand([root])
+
+    val text = emit_llvm_text(app, target, level, buf(), None, true) match
+        Err(why) -> s"refused: ${failure_text(why)}"
+        Ok(emitted) -> emitted.text
+
+    reset_search_paths()
+    text
+end pie_root_text
+
+private pie_copies(text: string, name: string) -> int =
+    pie_lines(text, "define available_externally ", "piel$" + name + "(")
+
+private pie_declares(text: string, name: string) -> int = pie_lines(text, "declare ", "piel$" + name + "(")
+
+// A cache of the case's own, so the root is built for it and the machine's cache is left alone.
+private pie_begin() -> string
+    val cache = lbr_temp("sysl-pie-cache")
+
+    use_root_cache_dir(Some(cache))
+    use_c_object_cache_dir(Some(cache))
+    cache
+end pie_begin
+
+private pie_end(cache: string, trees: []string)
+    use_root_cache_dir(None)
+    use_c_object_cache_dir(None)
+    reset_search_paths()
+    remove_dir_all(cache).unwrap_or(())
+    lbr_drop(trees)
+end pie_end
+
+@test("a root's function past the raw limit is copied by its cost, and a marked or costlier one is declared")
+pie_root_copies_by_cost()
+    if !lbr_ready() then return
+
+    val cache = pie_begin()
+    val root = pie_root()
+    val app = pie_root_app()
+    val text = pie_root_text(app, root, None, "2")
+
+    // Written through its parameter and still the same function: copied, nothing declared beside it.
+    assert_eq(pie_copies(text, "mix"), 1)
+    assert_eq(pie_declares(text, "mix"), 0)
+
+    for name in ["mix_noinline", "mix_cold", "mix_export", "at46"]
+        assert_eq(pie_copies(text, name), 0)
+
+    assert_eq(pie_declares(text, "mix_noinline"), 1)
+    assert_eq(pie_declares(text, "mix_cold"), 1)
+    assert_eq(pie_declares(text, "at46"), 1)
+
+    // Exactly at the limit is copied; one instruction more is not.
+    assert_eq(pie_copies(text, "at45"), 1)
+    assert_eq(pie_declares(text, "at45"), 0)
+
+    // A function reading a type with a destructor is copied as any other is.
+    assert_eq(pie_copies(text, "tag_mix"), 1)
+
+    val out = pie_optimized(text)
+
+    assert(!pie_calls(out, "piel$mix"), "the copy of 'mix' was inlined")
+    assert(!pie_calls(out, "piel$at45"), "the copy of 'at45' was inlined")
+    assert(pie_calls(out, "piel$mix_noinline"), "the '@noinline' one is still called")
+    assert(pie_calls(out, "piel$at46"), "the costlier one is still called")
+    pie_end(cache, [root, app])
+end pie_root_copies_by_cost
+
+@test("the root's program prints the same at -O2, where the copies are, as at -O0, and drops its tag once")
+pie_root_runs_the_same()
+    if !lbr_ready() then return
+
+    val cache = pie_begin()
+    val root = pie_root()
+    val app = pie_root_app()
+    var said: Buf[string] = buf()
+
+    for level in ["0", "2"]
+        val dir = make_temp_dir("sysl-pie-root").unwrap()
+
+        lbr_hand([root])
+
+        said.push(build_native_program(app, None, None, level, Some(s"$dir/pie-root")) match
+            Err(why) -> s"refused: ${failure_text(why)}"
+            Ok(made) ->
+                capture(made, [], "", [], true) match
+                    Err(_) -> "the program that was built could not be run"
+                    Ok(out) -> if out.status.ok() then out.text else s"exited badly: ${out.text}")
+
+        reset_search_paths()
+        remove_dir_all(dir).unwrap_or(())
+
+    assert_eq(said[1], said[0])
+    assert(said[0].ends_with("drop 3\n"), said[0])
+    assert_eq(pie_lines(said[0], "", ""), 9)
+    pie_end(cache, [root, app])
+end pie_root_runs_the_same
+
+@test("the cost decides the same way on x86-64 and on a Cortex-M33, where a u64 is two registers")
+pie_root_copies_on_other_targets()
+    if !lbr_ready() then return
+
+    val cache = pie_begin()
+    val root = lbr_tree(lbr_one("piel/piel.sysl", pie_core()))
+    val app = lbr_program("@export(\"entry\")\nentry(seed: u64) -> u64\n" +
+        "    var m = piel.Mix(seed, 54)\n    piel.mix(&m) + piel.at45(seed) + piel.at46(seed) + piel.mix_noinline(&m)\n")
+
+    for target in ["x86_64-freestanding", "thumb-freestanding-softfp"]
+        val text = pie_root_text(app, root, Some(target), "2")
+
+        assert(!text.starts_with("refused"), s"$target: $text")
+        assert_eq(pie_copies(text, "mix"), 1)
+        assert_eq(pie_copies(text, "at45"), 1)
+        assert_eq(pie_copies(text, "at46"), 0)
+        assert_eq(pie_copies(text, "mix_noinline"), 0)
+
+    pie_end(cache, [root, app])
+end pie_root_copies_on_other_targets
