@@ -269,6 +269,31 @@ private report_unmet(a: &Analysis, scope: Scope, span: Span, what: string, tp: s
         return
     end if
 
+    // **The trait is implemented and an associated type it fixes is not the one chosen** -- said as
+    // the object's erasure says it, since the bound promised the body that very type.
+    val gap = if tr.assocs.is_empty() || !satisfies(a, plain_bound(tr.name, tr.args), arg) then None
+              else assoc_disagreement(a, tr, arg)
+
+    if gap.is_some()
+        val (n, want, got) = gap.unwrap()
+        val head = s"'${qualified_name(what)}' requires its $noun '$tp' to implement " +
+                   s"'${show_bound(a, tr, arg)}', which says '$n' is ${type_show(want)}"
+
+        var said = s"$head, and nothing says what '${type_show(arg)}' chose for it — its own bound " +
+                   s"has to fix '$n' too"
+
+        if got.is_some()
+            said = s"$head, and ${type_show(arg)} supplies ${type_show(got.unwrap())} for it — a bound " +
+                   "that fixes an associated type is met only by a type that chose the same one"
+
+        // A type parameter is asked during the walk over a generic body, which keeps what it says.
+        arg match
+            Abstract(_, _) -> a.bound_fault(scope, span, said)
+            _ -> a.fault(scope, span, said)
+
+        return
+    end if
+
     arg match
         // A type parameter standing in for itself, during the walk that checks a generic body. It is
         // not a type anything has an `impl` for, so what it can promise is exactly what its own
@@ -627,10 +652,11 @@ check_bound_names(a: &Analysis, scope: Scope, what: string, bounds: Buf[NamedBou
                 // worth saying at the declaration rather than at whatever first applied it.
                 val d = trait_decl_at(a, key.unwrap())
 
+                // An argument fixing an associated type is not one of the trait's own.
                 if d.is_some()
                     var unknown: Buf[Type] = buf()
 
-                    for k in 0..<written.args.len()
+                    for k in 0..<(written.args.len() - written_bindings(a, scope, written).len())
                         unknown.push(Unknown)
 
                     check_trait_arity_at(a, scope, written.span, written.name, d.unwrap(), unknown)

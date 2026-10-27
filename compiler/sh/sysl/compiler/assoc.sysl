@@ -103,8 +103,17 @@ end trait_scope_of
 // substitutes, mangles and refuses a layout exactly as `V` does, and nothing that walks types has a
 // new shape to learn. The substitution is the one place that knows the name has parts, and it is
 // where a projection stops being abstract.
+//
+// **A bound that fixed the associated type answers it outright** (`[S: Seq[Item = int]]`): `S::Item`
+// IS `int` in the body, not a projection known to equal it, so a value of one is a value of the other
+// and `?` converts through the error a bound named. The bound was held to the trait's declaration
+// where it was written, and every instantiation is held to it at the call.
 private abstract_assoc(a: &Analysis, subject: Type, name: string, bounds: Buf[Bound],
                        member: string) -> Option[Type]
+    for b in bounds
+        for item in b.assocs
+            if item.0 == member then return Some(item.1)
+
     for i in 0..<bounds.len()
         val closure = trait_closure(a, bounds.at(i), self_binding(subject))
 
@@ -536,7 +545,7 @@ callable_of(a: &Analysis, t: Type) -> Option[Bound]
 
             None
         Trait(n, args, _) ->
-            if fn_parts(n, args).is_some() then Some(Bound(n, args)) else None
+            if fn_parts(n, args).is_some() then Some(plain_bound(n, args)) else None
         Struct(d) -> callable_impl_of(a, d.base)
         Enum(d) -> callable_impl_of(a, d.base)
         _ -> None
@@ -547,7 +556,7 @@ private callable_impl_of(a: &Analysis, base: string) -> Option[Bound]
         val key = library_key(fn_base(n))
         val rows = impls_of(a, key, base)
 
-        if !rows.is_empty() then return Some(Bound(key, rows.at(0).written))
+        if !rows.is_empty() then return Some(plain_bound(key, rows.at(0).written))
 
     None
 end callable_impl_of

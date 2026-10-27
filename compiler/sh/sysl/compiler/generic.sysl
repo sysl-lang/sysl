@@ -463,6 +463,11 @@ solve(a: &Analysis, scope: Scope, site: Scope, span: Span, what: string, tparams
         if i < arg_tys.len() && !is_soft(soft, i) then
             unify(a, scope, param_refs.at(i), arg_tys.at(i), tparams, &sub)
 
+    // **A bound that fixes an associated type says what that type is**, so `[S: Seq[Item = E], E]`
+    // called with a sequence of `int` settles `E = int` from the argument alone -- ahead of the
+    // expected type, being read off a type the call already knows rather than off the context.
+    if sub.len() < tparams.len() then solve_from_bindings(a, scope, tparams, bounds, &sub)
+
     if sub.len() < tparams.len() && result_ref.is_some() && expected.is_some() then
         unify(a, scope, result_ref.unwrap(), expected.unwrap(), tparams, &sub)
 
@@ -479,6 +484,10 @@ solve(a: &Analysis, scope: Scope, site: Scope, span: Span, what: string, tparams
         for i in 0..<param_refs.len()
             if i < arg_tys.len() && is_soft(soft, i) && is_soft(defaulted, i) then
                 unify(a, scope, param_refs.at(i), arg_tys.at(i), tparams, &sub)
+
+    // Asked again for a parameter only a literal or a construction settled, which the passes above
+    // have just read.
+    if sub.len() < tparams.len() then solve_from_bindings(a, scope, tparams, bounds, &sub)
 
     // **What a callable argument yields is read back off the closure**, which is the other half of a
     // call handing one an open result. The parameter itself has by now been solved to the closure's
@@ -539,6 +548,47 @@ solve_from_callables(a: &Analysis, scope: Scope, tparams: Buf[string],
                         for k in 0..<b.args.len()
                             unify(a, scope, b.args.at(k), actual.unwrap().args.at(k), tparams, sub)
 end solve_from_callables
+
+private solve_from_bindings(a: &Analysis, scope: Scope, tparams: Buf[string],
+                            bounds: Buf[NamedBounds], sub: *Buf[Binding])
+    for nb in bounds
+        val t = bound_type(*sub, nb.name)
+
+        if t.is_some()
+            for b in nb.bounds
+                for item in written_bindings(a, scope, b)
+                    val got = assoc_type_opt(a, erased_trait(t.unwrap()).unwrap_or(t.unwrap()), item.0)
+
+                    if got.is_some() then unify(a, scope, item.1, got.unwrap(), tparams, sub)
+end solve_from_bindings
+
+// The associated types a written bound fixes, by name -- and by the lone bare argument of a trait
+// with no parameters and exactly one associated type, the short form `resolve_bound` reads.
+written_bindings(a: &Analysis, scope: Scope, b: BoundRef) -> Buf[(string, TypeRef)]
+    var out: Buf[(string, TypeRef)] = buf()
+    var bare: Buf[TypeRef] = buf()
+
+    for arg in b.args
+        *arg.kind match
+            AssocArgType(n, inner) -> out.push((n, inner))
+            _ -> bare.push(arg)
+
+    if !out.is_empty() || bare.len() != 1 then return out
+
+    val key = lookup_trait_key(a, scope, b.name)
+
+    if key.is_none() then return out
+
+    val d = trait_decl_at(a, key.unwrap())
+
+    if d.is_none() || !d.unwrap().tparams.is_empty() then return out
+
+    val declared = object_assocs(a, key.unwrap())
+
+    if declared.len() == 1 then out.push((declared.at(0).name, bare.at(0)))
+
+    out
+end written_bindings
 
 private mentions_unknown_any(ts: Buf[Type]) -> bool
     for item in ts
