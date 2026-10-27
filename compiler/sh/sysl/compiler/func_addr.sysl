@@ -756,10 +756,7 @@ private written_instantiation(cx: &Analyzer, span: Span, written: string, key: s
     // leaves an address with nothing to instantiate. A call is the other case and does not come
     // through here: there the arguments answer it, which is where it came from.
     if authored_tparams(decl.tparams).len() != decl.tparams.len()
-        cx.fault(span, s"'$written' takes a bare arrow, so it is generic in the callable's own " +
-                 "type — and an address has no arguments to read that from, nor any way to write " +
-                 "it. Declare the parameter as a counted callable, '&Fn(…) -> …', to give it a " +
-                 "type that can be named")
+        cx.fault(span, bare_arrow_unaddressable(written))
         return ""
     end if
 
@@ -802,6 +799,12 @@ private written_instantiation(cx: &Analyzer, span: Span, written: string, key: s
     asked(cx, span, instantiate_func(cx.an, f.scope, decl, targs, false))
 end written_instantiation
 
+// What an address of a function that takes a bare arrow is told.
+private bare_arrow_unaddressable(written: string) -> string =
+    s"'$written' takes a bare arrow, so it is generic in the callable's own type — and an address " +
+    "has no arguments to read that from, nor any way to write it. Declare the parameter as a " +
+    "counted callable, '&Fn(…) -> …', to give it a type that can be named"
+
 // Which copy of a generic function this address names, read off the type the context wants.
 //
 // The match is against the **signature as declared**, so it solves exactly what a call site's
@@ -810,6 +813,15 @@ end written_instantiation
 private addressed_instantiation(cx: &Analyzer, span: Span, written: string, f: Func,
                                 expected: Option[Type]) -> string
     val decl = f.decl
+
+    // The same refusal as a written address gets, and for the same reason: no type the context
+    // wants can name the callable's own type either. Advice to write the type arguments out would
+    // name the parameter the sugar made, which nobody can write.
+    if authored_tparams(decl.tparams).len() != decl.tparams.len()
+        cx.fault(span, bare_arrow_unaddressable(written))
+        return ""
+    end if
+
     val want = if expected.is_none() then None else cfn_of(expected.unwrap())
 
     if want.is_none()

@@ -131,9 +131,97 @@ closure_expr(cx: &Analyzer, span: Span, written: Buf[LambdaParam], body: Buf[Stm
             ptypes.push(Unknown)
 
     val result = if want.is_none() then None else want.unwrap().1
+    val lowered = lower_closure(cx, span, names, ptypes, result, body)
 
-    lower_closure(cx, span, names, ptypes, result, body)
+    *lowered.kind match
+        TStructNew(st, _) -> cx.an.closures_written.put(st.base, ClosureWritten(cx.scope, params, ptypes))
+        _ -> ()
+
+    lowered
 end closure_expr
+
+// What a closure literal wrote for its parameters, and the types they were read at. A closure is
+// only ever refused a callable bound because a parameter's written type disagrees with what the
+// callee passes there -- an unwritten one takes what the context said, and the result is checked
+// against the context as the body is read -- so the parameter is where that refusal belongs.
+struct ClosureWritten
+    scope: Scope
+    params: Buf[LambdaParam]
+    ptypes: Buf[Type]
+
+// A bound that a bare-arrow parameter became, refused for what arrived at it.
+//
+// **The type parameter the sugar added is never named**: a reader wrote `f: (int) -> int` and no
+// `$F0`. A closure literal is told at its first written parameter that disagrees with what the
+// callee passes there -- the same sentence wherever the call is read, at a generic's definition
+// through a bound or at a concrete receiver. Anything else is told what callable was asked for.
+call_bound_unmet(a: &Analysis, scope: Scope, span: Span, what: string, tr: Bound, arg: Type,
+                 at_definition: bool)
+    val parts = fn_parts(tr.name, tr.args)
+    val callee = qualified_name(what)
+
+    if parts.is_some()
+        val want = parts.unwrap().0
+        val written = arg match
+            Struct(st) -> a.closures_written.get(st.base)
+            _ -> None
+
+        if written.is_some()
+            val w = written.unwrap()
+
+            for i in 0..<w.params.len()
+                val p = w.params.at(i)
+
+                if p.typ.is_some() && i < want.len() && i < w.ptypes.len() &&
+                        !mentions_unknown(want.at(i)) && w.ptypes.at(i) != want.at(i)
+                    val message = s"this closure's '${p.name}' is declared ${type_show(w.ptypes.at(i))}, " +
+                                  s"but '$callee' passes it ${type_show(want.at(i))}"
+
+                    if at_definition then a.bound_fault(w.scope, p.span, message)
+                    else a.fault(w.scope, p.span, message)
+
+                    return
+        end if
+    end if
+
+    val asked = if parts.is_some() then arrow_shown(parts.unwrap().0, parts.unwrap().1)
+    else show_bound(a, tr, arg)
+
+    arg match
+        Abstract(n, _) ->
+            a.bound_fault(scope, span, s"'$callee' takes a callable $asked here, but '$n' is not " +
+                          s"bounded by '${show_bound(a, tr, arg)}'")
+        _ ->
+            val why = unmet_bound(a, tr, arg)
+            val tail = if why.is_some() then s" — ${why.unwrap()}" else ""
+            val message = s"'$callee' takes a callable $asked here, but ${type_show(arg)} is not one$tail"
+
+            if at_definition then a.bound_fault(scope, span, message)
+            else a.fault(scope, span, message)
+end call_bound_unmet
+
+// A callable as the parameter that asked for it was written: `(int, int) -> int`, and `int -> int`
+// for one parameter, which is the only way a bare arrow spells that.
+private arrow_shown(params: Buf[Type], result: Type) -> string
+    var b = str_builder()
+
+    if params.len() == 1
+        b.push(type_show(params.at(0)))
+    else
+        b.push("(")
+
+        for i in 0..<params.len()
+            if i > 0 then b.push(", ")
+
+            b.push(type_show(params.at(i)))
+
+        b.push(")")
+    end if
+
+    b.push(" -> ")
+    b.push(type_show(result))
+    b.finish()
+end arrow_shown
 
 // What a parameter with no type of its own and no context is told.
 //
