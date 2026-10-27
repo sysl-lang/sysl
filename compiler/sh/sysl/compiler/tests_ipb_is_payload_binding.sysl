@@ -1,0 +1,274 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// **A binding an `if`'s condition makes exists only on the edge where its pattern held.** A local
+// whose life ends inside the branch is handed into both arms (`hand_in`), and the search for such
+// locals once looked in the innermost scope -- which, after a binding `is` term, is the condition's
+// own scope of bindings rather than the scope that declared the locals. A binding used last in the
+// `then` was then handed into the `else` as well, which gave back a payload slot that path never
+// wrote: `if r is Cyclic(c) then … else …` with `r` some other variant released garbage as a `Cyc`,
+// and hung or printed a stranger's bytes. Every program here runs on the counted heap, prints what
+// its `match` twin prints, and gives back everything it took.
+
+private struct IpbRun
+    ok: bool
+    out: string
+    err: string
+
+private ipb_ready() -> bool
+    if std_root().is_err() || !clang_available()
+        print("skipped: the library or the toolchain is not on this machine")
+        return false
+    end if
+
+    true
+end ipb_ready
+
+private ipb_run(text: string) -> IpbRun
+    val root = make_temp_dir("sysl-ipb").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+    force_alloc_counting(true)
+
+    val built = build_native_program(s"$root/main.sysl", None, None, DefaultOptimization,
+                                     Some(s"$root/built"))
+
+    force_alloc_counting(false)
+
+    built match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return IpbRun(false, failure_text(why), "")
+        Ok(_) -> ()
+
+    val said = capture(s"$root/built", [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> IpbRun(false, "could not be started", "")
+        Ok(o) -> IpbRun(o.status.ok(), o.text, o.err.unwrap_or(""))
+end ipb_run
+
+// The program ran to the end, printed `want`, and gave back every allocation it made.
+private ipb_prints(text: string, want: string)
+    if !ipb_ready() then return
+
+    val run = ipb_run(text)
+
+    assert(run.ok, s"${run.out}\n${run.err}")
+    assert_eq(run.out, want)
+    assert(run.err == "", run.err)
+    assert(alloc_count_reported(run.err) == 0)
+end ipb_prints
+
+private ipb_types() -> string = raw"""
+    import sysl.buf.{Buf, buf}
+
+    struct Cyc
+        states: int
+        runs: Buf[int]
+
+    struct Node
+        v: int
+
+    struct Outer
+        inner: Cyc
+        tag: int
+
+    enum Rule
+        Plain(b: u16, s: u16)
+        Cyclic(rule: Cyc)
+        Named(name: string)
+        Ref(node: &Node)
+        Maybe(runs: Option[Buf[int]])
+        Deep(o: Outer)
+        Pair(p: (Buf[int], int))
+
+    cyc(n: int) -> Cyc
+        var b: Buf[int] = buf()
+        b.push(n)
+        Cyc(n, b)
+
+    """
+
+@test("an 'if … is' whose payload holds a Buf takes the else for another variant")
+ipb_the_report()
+    ipb_prints(ipb_types() + raw"""
+        main()
+            val r = Plain(8, 12)
+            if r is Cyclic(c) then print("then", c.states) else print("else")
+            r match
+                Cyclic(c) -> print("then", c.states)
+                _ -> print("else")
+        """, "else\nelse\n")
+
+@test("and the then, with the payload's own value, for the variant it names")
+ipb_the_matching_variant()
+    ipb_prints(ipb_types() + raw"""
+        main()
+            val r = Cyclic(cyc(7))
+            if r is Cyclic(c) then print("then", c.states, c.runs.at(0)) else print("else")
+            r match
+                Cyclic(c) -> print("then", c.states, c.runs.at(0))
+                _ -> print("else")
+        """, "then 7 7\nthen 7 7\n")
+
+// Every payload shape that holds a count, each variant through the whole chain, so every arm is
+// both the one taken and one skipped.
+@test("an elif chain over payloads holding a Buf, a string, a &T, an Option, a nested struct and a tuple")
+ipb_every_payload_shape()
+    ipb_prints(ipb_types() + raw"""
+        by_is(r: Rule)
+            if r is Cyclic(c) then print("cyc", c.states, c.runs.at(0))
+            elif r is Named(n) then print("named", n)
+            elif r is Ref(n) then print("ref", n.v)
+            elif r is Maybe(m) then print("maybe", m.is_some())
+            elif r is Deep(o) then print("deep", o.inner.states, o.tag)
+            elif r is Pair(p) then print("pair", p.0.len(), p.1)
+            else print("plain")
+
+        by_match(r: Rule) = r match
+            Cyclic(c) -> print("cyc", c.states, c.runs.at(0))
+            Named(n) -> print("named", n)
+            Ref(n) -> print("ref", n.v)
+            Maybe(m) -> print("maybe", m.is_some())
+            Deep(o) -> print("deep", o.inner.states, o.tag)
+            Pair(p) -> print("pair", p.0.len(), p.1)
+            _ -> print("plain")
+
+        main()
+            val rules = [Plain(8, 12), Cyclic(cyc(3)), Named(s"h${1}"), Ref(Node(5)), Maybe(Some(buf())),
+                         Maybe(None), Deep(Outer(cyc(4), 9)), Pair((buf(), 2))]
+            for r in rules
+                by_is(r)
+                by_match(r)
+        """, "plain\nplain\ncyc 3 3\ncyc 3 3\nnamed h1\nnamed h1\nref 5\nref 5\nmaybe true\nmaybe true\n" +
+             "maybe false\nmaybe false\ndeep 4 9\ndeep 4 9\npair 0 2\npair 0 2\n")
+
+// Each binding-bearing payload as the one that does NOT hold, with the binding's only use in the
+// then: the shape the report was, for every kind of count a payload can carry.
+@test("each counted payload, as the variant not taken, leaves the else alone")
+ipb_each_payload_not_taken()
+    ipb_prints(ipb_types() + raw"""
+        main()
+            val r = Plain(1, 2)
+            if r is Named(n) then print(n) else print("no name")
+            if r is Ref(n) then print(n.v) else print("no ref")
+            if r is Maybe(m) then print(m.is_some()) else print("no maybe")
+            if r is Deep(o) then print(o.inner.runs.len()) else print("no deep")
+            if r is Pair(p) then print(p.0.len()) else print("no pair")
+        """, "no name\nno ref\nno maybe\nno deep\nno pair\n")
+
+@test("a value-yielding if over a binding takes the else's value for another variant")
+ipb_value_form()
+    ipb_prints(ipb_types() + raw"""
+        main()
+            for r in [Plain(0, 0), Cyclic(cyc(6))]
+                val n = if r is Cyclic(c) then c.runs.at(0) else -1
+                val m = r match
+                    Cyclic(c) -> c.runs.at(0)
+                    _ -> -1
+                print(n, m)
+        """, "-1 -1\n6 6\n")
+
+// The `&&` chain: it fails at the test (wrong variant) and after the binding (right variant, small
+// count), and each failing edge gives back exactly what it took.
+@test("an && chain after a binding fails cleanly at the pattern and at the test beyond it")
+ipb_and_chain()
+    ipb_prints(ipb_types() + raw"""
+        main()
+            for r in [Plain(0, 0), Cyclic(cyc(2)), Cyclic(cyc(5))]
+                if r is Cyclic(c) && c.states > 3 then print("big", c.states) else print("not big")
+                r match
+                    Cyclic(c) if c.states > 3 -> print("big", c.states)
+                    _ -> print("not big")
+        """, "not big\nnot big\nnot big\nnot big\nbig 5\nbig 5\n")
+
+@test("two bindings in one chain, the second failing, give back the first")
+ipb_two_bindings()
+    ipb_prints(ipb_types() + raw"""
+        main()
+            val a = Cyclic(cyc(1))
+            for b in [Plain(0, 0), Named(s"n${2}")]
+                if a is Cyclic(c) && b is Named(n) then print(c.states, n) else print("no pair")
+        """, "no pair\n1 n2\n")
+
+@test("is not over a counted payload takes the right arm either way")
+ipb_is_not()
+    ipb_prints(ipb_types() + raw"""
+        main()
+            for r in [Plain(0, 0), Cyclic(cyc(2))]
+                if r is not Cyclic(_) then print("other") else print("cyclic")
+        """, "other\ncyclic\n")
+
+@test("a while over a binding stops at the first other variant, releasing each round's copy")
+ipb_while()
+    ipb_prints(ipb_types() + raw"""
+        main()
+            var k = 0
+            var cur = Cyclic(cyc(1))
+            while cur is Cyclic(c)
+                print("loop", c.states)
+                k += 1
+                cur = if k < 3 then Cyclic(cyc(k + 1)) else Plain(0, 0)
+            print("done", k)
+        """, "loop 1\nloop 2\nloop 3\ndone 3\n")
+
+// A generic enum whose payload is the Buf itself, through the generic body and concretely.
+@test("a generic enum instantiated at Buf takes the else for its empty variant")
+ipb_generic_enum()
+    ipb_prints(raw"""
+        import sysl.buf.{Buf, buf}
+
+        enum Box[T]
+            Empty
+            Full(item: T)
+
+        show[T](b: Box[T], what: string)
+            if b is Full(_) then print("full", what) else print("empty", what)
+
+        main()
+            val e: Box[Buf[int]] = Box.Empty
+            if e is Full(b) then print("full", b.len()) else print("empty")
+            e match
+                Full(b) -> print("full", b.len())
+                Empty -> print("empty")
+
+            var xs: Buf[int] = buf()
+            xs.push(4)
+            val f: Box[Buf[int]] = Full(xs)
+            if f is Full(b) then print("full", b.at(0)) else print("empty")
+            show(e, "e")
+            show(f, "f")
+        """, "empty\nempty\nfull 4\nempty e\nfull f\n")
+
+// The fix searches the declaring scope beneath the condition's own, so a local of the declaring scope
+// that dies in the branch is still handed into both arms -- and taking it out from under the
+// condition's scope must leave that scope's bookkeeping right.
+@test("a counted local dying in both arms is still handed in beside the binding")
+ipb_local_beside_binding()
+    ipb_prints(ipb_types() + raw"""
+        each(r: Rule)
+            var s: Buf[int] = buf()
+            s.push(1)
+            s.push(2)
+            if r is Cyclic(c) then print("then", c.states, s.len()) else print("else", s.len())
+
+        both(r: Rule, q: Rule)
+            var s: Buf[int] = buf()
+            s.push(9)
+            if r is Cyclic(c) && q is Named(n) then print(c.states, n, s.at(0)) else print("neither", s.at(0))
+
+        main()
+            each(Plain(0, 0))
+            each(Cyclic(cyc(3)))
+            both(Plain(0, 0), Named(s"x${1}"))
+            both(Cyclic(cyc(4)), Plain(0, 0))
+            both(Cyclic(cyc(4)), Named(s"x${2}"))
+        """, "else 2\nthen 3 2\nneither 9\nneither 9\n4 x2 9\n")

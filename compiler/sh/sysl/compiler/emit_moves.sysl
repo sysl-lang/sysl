@@ -171,15 +171,21 @@ dying_for_stmt(s: TStmt, dying: Set[string]) -> Set[string] = s match
 //
 // It applies only where the branch is the whole statement (or the block's value), so nothing beside it
 // in the statement can still read the local; where every arm is there to take it (an `if` with an
-// `else`); and where the local's slot is the innermost scope's own, exactly as a move's must be.
-hand_in(e: *Emit, cond: Buf[TCondTerm]) -> Buf[(Val, Type)]
+// `else`); and where the local's slot is the declaring scope's own, exactly as a move's must be.
+//
+// **The declaring scope is not the innermost one when the condition bound something.** Each binding
+// `is` term leaves a scope of its own open over the success path (`cond_scopes` of them), and a name
+// it binds is no local of the declaring scope: it exists only on the edge where the pattern held, so
+// handing it into the `else` would give back a slot that path never wrote.
+hand_in(e: *Emit, cond: Buf[TCondTerm], cond_scopes: usize) -> Buf[(Val, Type)]
     var out: Buf[(Val, Type)] = buf()
     val dying = e.moves.dying
 
     e.moves.dying = set()
 
-    if dying.is_empty() || e.owned_marks.is_empty() then return out
+    if dying.is_empty() || e.owned_marks.len() <= cond_scopes then return out
 
+    val declaring = e.owned_marks.len() - 1 - cond_scopes
     val named = names_none()
 
     for term in cond
@@ -194,7 +200,9 @@ hand_in(e: *Emit, cond: Buf[TCondTerm]) -> Buf[(Val, Type)]
         val slot = reg_of(local_slot(e, name))
         var found: Option[usize] = None
 
-        for j in e.owned_marks.at(e.owned_marks.len() - 1)..<e.owned_slots.len()
+        val upto = if cond_scopes == 0 then e.owned_slots.len() else e.owned_marks.at(declaring + 1)
+
+        for j in e.owned_marks.at(declaring)..<upto
             val s = e.owned_slots.at(j)
 
             if reg_of(s.0) == slot && movable_type(s.1) && !runs_code(e, s.1) then found = Some(j)
@@ -202,6 +210,10 @@ hand_in(e: *Emit, cond: Buf[TCondTerm]) -> Buf[(Val, Type)]
         if found.is_some()
             out.push(e.owned_slots.at(found.unwrap()))
             forget_slot(e, found.unwrap())
+
+            // The condition's scopes sit above the slot just taken out, so each begins one earlier.
+            for k in declaring + 1..<e.owned_marks.len()
+                e.owned_marks.set(k, e.owned_marks.at(k) - 1)
         end if
 
     out
