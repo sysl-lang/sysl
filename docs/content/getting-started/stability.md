@@ -75,7 +75,7 @@ The release platforms are:
 | `linux-arm64` | |
 | `linux-x86_64` | |
 
-**sysl 0.7.1 ships a binary for `darwin-arm64` only.** On Linux, build the compiler from source as
+**sysl 0.7.2 ships a binary for `darwin-arm64` only.** On Linux, build the compiler from source as
 described in [installation](/getting-started/installation/#build-from-source).
 
 There is **no darwin-x86_64 build and no Windows build**, by design. Building from source reaches
