@@ -601,6 +601,10 @@ rectangular
 Its level — between `&&` and the comparisons — makes `a is P && b > 0` a conjunction of two terms
 rather than an `is` against a conjunction.
 
+**The right side of `is` is a pattern, and the pattern ends at the first token a pattern cannot
+hold.** A comparison is not part of a pattern, so `a is P == b` is `(a is P) == b`: the test's `bool`
+compared with `b`, as Kotlin and C# read it.
+
 **Under `||` a test is allowed as long as it binds nothing.** A name bound by `is` is live from its
 own `is` rightward and through the branch, and under `||` the branch runs when either side held, so
 a name bound on one side would hold nothing when only the other side matched. A test that binds
