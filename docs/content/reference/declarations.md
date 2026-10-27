@@ -171,9 +171,9 @@ print(Limit)
 
 A local `var` or `val` with no type written whose value is a bare number — `0`, `-1`, `2.5` — takes
 its type from its **first use that fixes one**: a comparison with an operand that has a type of its
-own, an assignment of such a value or into a typed place, an argument, a `return` or the body's
-result. A counter compared with a length is a `usize`, and an index read with it needs no
-conversion:
+own, arithmetic beside such an operand, an assignment of such a value or into a typed place, an
+argument, a `return` or the body's result. A counter compared with a length is a `usize`, and an
+index read with it needs no conversion:
 
 ```sysl
 val xs = [10, 20, 30]
@@ -194,9 +194,29 @@ print(first < xs.len, i)
 true 3
 ```
 
-**Arithmetic fixes nothing.** In `sum + b` the binding keeps its default and the typed operand widens
-to it, exactly as though the default had been written. Nor does a conversion: `u8(n)` converts `n`
-from what it is rather than deciding it. **Nor does an index**, nor a slice's bounds: an array, a
+**The undecided type flows through arithmetic.** `i + 1`, `i * 2`, `-i`, `(i + 1) * 2` and `i + j`
+over two such bindings have the bindings' type, whatever it turns out to be, so a use that fixes the
+arithmetic fixes them: `i + 1 < xs.len` makes `i` a `usize` exactly as `i < xs.len` does, and
+`wide(i + 1)` makes it the parameter's type. An operand of a type of its own fixes them too — in
+`sum + b` with `b` a `u8`, `sum` is a `u8`, and the sum wraps as a byte's does. A shift has the type
+of the value shifted; its amount is fixed by nothing the shift is used at.
+
+```sysl
+val xs = [10, 20, 30, 40]
+var i = 0
+
+while i + 1 < xs.len
+    print(xs[i] + xs[i + 1])
+    i += 2
+```
+
+```output
+30
+70
+```
+
+**A conversion fixes nothing**: `u8(n)` converts `n` from what it is rather than deciding it.
+**Nor does an index**, nor a slice's bounds: an array, a
 slice or a pointer is indexed by any integer, so `xs[i]` asks no type of `i` and the next use that
 does ask one decides; the same goes for a vector run's start and a slot's index. A subscript that a
 method answers — a `Buf`'s, or a type's own `Index` — hands the index to a parameter, and that is an
@@ -218,7 +238,7 @@ print(sum + b, half(h), h / 2)
 ```
 
 ```output
-260 1.5 1.5
+4 1.5 1.5
 ```
 
 Here `n` indexes `firsts` first, but it is the result that decides, so `n` is the `int` the function

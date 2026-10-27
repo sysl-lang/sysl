@@ -1,0 +1,462 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// A literal binding's undecided type flows through arithmetic, as an integer variable's does in rustc
+// (`var_first_use.sysl`, `reference/declarations.md § A literal binding takes its type from its first
+// use`): `i + 1` has `i`'s type, whatever it turns out to be, so a position that fixes the arithmetic
+// fixes `i`, and an operand of a type of its own beside it fixes `i` at that type. A shift's amount
+// stays independent of the value shifted, and with no fixing use the binding is the default `int`.
+//
+// Each binding's type is shown by `val z: bool = <binding>`, which fixes nothing (a `bool` is no
+// number) and is told the type the binding has.
+
+private atf_ready() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+
+    true
+end atf_ready
+
+// What a program prints, built and run.
+private atf_ran(text: string) -> string
+    val root = make_temp_dir("sysl-atf").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end atf_ran
+
+// Everything a source has to say for itself.
+private atf_err(text: string) -> string
+    val root = make_temp_dir("sysl-atf").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    val out = emit_llvm_text(src, None) match
+        Err(why) -> why.message
+        Ok(made) -> if made.report.is_empty() then "" else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end atf_err
+
+// Whether a report carries a diagnostic, pointed at a line and column of `main.sysl`.
+private atf_says(report: string, message: string, at: string) -> bool =
+    report.contains(s"error: $message") && report.contains(s"main.sysl:$at\n")
+
+// Whether a report says the binding `z<name>` was handed is of a type.
+private atf_is(report: string, name: string, ty: string) -> bool =
+    report.contains(s"error: cannot initialize 'z$name': declared bool but the value is $ty\n")
+
+// How many diagnostics a report carries.
+private atf_count(report: string) -> usize
+    var seen: usize = 0
+    var rest = report
+
+    loop
+        rest.index_of("error: ") match
+            None -> break
+            Some(at) ->
+                seen += 1
+                rest = rest[(at + 7)..<rest.bytes.len]
+
+    seen
+end atf_count
+
+@test("a counter compared with a length through arithmetic is a usize, and indexes with no conversion")
+atf_loop_compare()
+    if !atf_ready() then return
+
+    assert_eq(atf_ran(raw"""
+        main()
+            val xs = [10, 20, 30, 40]
+            var i = 0
+            while i + 1 < xs.len
+                print(xs[i], xs[i + 1])
+                i += 2
+            print(i)
+        """), "10 20\n30 40\n4\n")
+
+    val report = atf_err(raw"""
+        main()
+            val xs = [10, 20, 30, 40]
+            var i = 0
+            while i + 1 < xs.len
+                i += 2
+            val zi: bool = i
+        """)
+
+    assert(atf_is(report, "i", "usize"), report)
+    assert_eq(atf_count(report), 1)
+
+@test("subtraction, a product and a nested chain carry the type through to the comparison")
+atf_chains()
+    if !atf_ready() then return
+
+    assert_eq(atf_ran(raw"""
+        main()
+            val xs = [10, 20, 30, 40]
+            var i = 1
+            var j = 1
+            var k = 1
+            print((i + 1) * 2 < xs.len, j - 1 < xs.len, k * 2 < xs.len)
+        """), "false true true\n")
+
+    val report = atf_err(raw"""
+        main()
+            val xs = [10, 20, 30, 40]
+            var i = 1
+            var j = 1
+            var k = 1
+            print((i + 1) * 2 < xs.len, j - 1 < xs.len, k * 2 < xs.len)
+            val zi: bool = i
+            val zj: bool = j
+            val zk: bool = k
+        """)
+
+    assert(atf_is(report, "i", "usize"), report)
+    assert(atf_is(report, "j", "usize"), report)
+    assert(atf_is(report, "k", "usize"), report)
+    assert_eq(atf_count(report), 3)
+
+@test("two undecided bindings in one sum are both fixed by the comparison")
+atf_two_bindings()
+    if !atf_ready() then return
+
+    assert_eq(atf_ran(raw"""
+        main()
+            val n: u32 = 100
+            var i = 3
+            var j = 4
+            print(i + j < n)
+        """), "true\n")
+
+    val report = atf_err(raw"""
+        main()
+            val n: u32 = 100
+            var i = 3
+            var j = 4
+            print(i + j < n)
+            val zi: bool = i
+            val zj: bool = j
+        """)
+
+    assert(atf_is(report, "i", "uint"), report)
+    assert(atf_is(report, "j", "uint"), report)
+    assert_eq(atf_count(report), 2)
+
+@test("an operand of a type of its own fixes the binding beside it, on either side, and the sum wraps at that type")
+atf_typed_operand()
+    if !atf_ready() then return
+
+    assert_eq(atf_ran(raw"""
+        main()
+            val k: u8 = 10
+            var i = 250
+            var j = 250
+            print(i + k, k + j)
+            val xs = [1, 2, 3]
+            var m = 1
+            print(m + xs.len)
+        """), "4 4\n4\n")
+
+    val report = atf_err(raw"""
+        main()
+            val k: u8 = 10
+            var i = 250
+            var j = 250
+            print(i + k, k + j)
+            val xs = [1, 2, 3]
+            var m = 1
+            print(m + xs.len)
+            val zi: bool = i
+            val zj: bool = j
+            val zm: bool = m
+        """)
+
+    assert(atf_is(report, "i", "byte"), report)
+    assert(atf_is(report, "j", "byte"), report)
+    assert(atf_is(report, "m", "usize"), report)
+    assert_eq(atf_count(report), 3)
+
+@test("an integer binding beside a float operand is fixed at the float, where it holds the value exactly")
+atf_float_operand()
+    if !atf_ready() then return
+
+    assert_eq(atf_ran(raw"""
+        main()
+            var c = 3
+            val h: f32 = 0.5
+            print(c * h)
+        """), "1.5\n")
+
+    assert(atf_is(atf_err(raw"""
+        main()
+            var c = 3
+            val h: f32 = 0.5
+            print(c * h)
+            val zc: bool = c
+        """), "c", "f32"))
+
+@test("a typed operand that reads another open binding fixes that one first, then the one beside it")
+atf_nested_typed()
+    if !atf_ready() then return
+
+    assert_eq(atf_ran(raw"""
+        main()
+            val k: u8 = 2
+            var e = 1
+            var g = 254
+            print(e + (k + g))
+        """), "1\n")
+
+    val report = atf_err(raw"""
+        main()
+            val k: u8 = 2
+            var e = 1
+            var g = 254
+            print(e + (k + g))
+            val ze: bool = e
+            val zg: bool = g
+        """)
+
+    assert(atf_is(report, "e", "byte"), report)
+    assert(atf_is(report, "g", "byte"), report)
+    assert_eq(atf_count(report), 2)
+
+@test("a negation has the binding's type: a result and a comparison each fix it")
+atf_negation()
+    if !atf_ready() then return
+
+    assert_eq(atf_ran(raw"""
+        neg() -> i8
+            val i = 5
+            -i
+
+        main()
+            val t: i16 = 2
+            var i = 5
+            print(-i < t, neg())
+        """), "true -5\n")
+
+    assert(atf_is(atf_err(raw"""
+        main()
+            val t: i16 = 2
+            var i = 5
+            print(-i < t)
+            val zi: bool = i
+        """), "i", "short"))
+
+@test("a shift has the type of the value shifted; its amount is fixed by nothing the shift is used at")
+atf_shift()
+    if !atf_ready() then return
+
+    assert_eq(atf_ran(raw"""
+        main()
+            val n: u32 = 100
+            var v = 5
+            var s = 2
+            print(v << 2 < n, v << s < n, 1 << s)
+        """), "true true 4\n")
+
+    val report = atf_err(raw"""
+        main()
+            val n: u32 = 100
+            var v = 5
+            var s = 2
+            print(v << s < n)
+            val zv: bool = v
+            val zs: bool = s
+        """)
+
+    assert(atf_is(report, "v", "uint"), report)
+    assert(atf_is(report, "s", "int"), report)
+    assert_eq(atf_count(report), 2)
+
+@test("arithmetic handed to a parameter, returned, or the body's result fixes the binding at that type")
+atf_positions()
+    if !atf_ready() then return
+
+    assert_eq(atf_ran(raw"""
+        wide(x: i64) -> i64 = x * 1000000000000
+
+        next(n: u16) -> u16
+            var i = 1
+            return i + n
+
+        small() -> u16
+            var i = 65534
+            i + 1
+
+        main()
+            var i = 1
+            print(wide(i + 1), next(4), small())
+        """), "2000000000000 5 65535\n")
+
+    assert(atf_is(atf_err(raw"""
+        wide(x: i64) -> i64 = x
+
+        main()
+            var i = 1
+            print(wide(i + 1))
+            val zi: bool = i
+        """), "i", "long"))
+
+@test("with no fixing use the binding is the default int, through any arithmetic")
+atf_no_fixing_use()
+    if !atf_ready() then return
+
+    assert_eq(atf_ran(raw"""
+        main()
+            var n = 7
+            print(n + 1, n * 2, -n, n << 1)
+        """), "8 14 -7 14\n")
+
+    assert(atf_is(atf_err(raw"""
+        main()
+            var n = 7
+            print(n + 1, n * 2, -n, n << 1)
+            val zn: bool = n
+        """), "n", "int"))
+
+@test("an index and a conversion of arithmetic fix nothing, as of the binding alone")
+atf_index_and_conversion()
+    if !atf_ready() then return
+
+    assert_eq(atf_ran(raw"""
+        main()
+            val xs = [10, 20, 30]
+            var d = 0
+            print(xs[d + 1], u8(d + 1))
+        """), "20 1\n")
+
+    assert(atf_is(atf_err(raw"""
+        main()
+            val xs = [10, 20, 30]
+            var d = 0
+            print(xs[d + 1], u8(d + 1))
+            val zd: bool = d
+        """), "d", "int"))
+
+@test("two fixing uses of arithmetic that disagree: the first decides, the second is told as with the type written")
+atf_disagree()
+    if !atf_ready() then return
+
+    val report = atf_err(raw"""
+        wide(n: usize) -> usize = n
+        narrow(n: u8) -> u8 = n
+
+        main()
+            var i = 0
+            print(wide(i + 1))
+            print(narrow(i + 1))
+        """)
+
+    assert(atf_says(report, "'n' of 'narrow' is byte, but usize was given", "7:18"), report)
+    assert_eq(atf_count(report), 1)
+
+    val written = atf_err(raw"""
+        wide(n: usize) -> usize = n
+        narrow(n: u8) -> u8 = n
+
+        main()
+            var i: usize = 0
+            print(wide(i + 1))
+            print(narrow(i + 1))
+        """)
+
+    assert(atf_says(written, "'n' of 'narrow' is byte, but usize was given", "7:18"), written)
+
+@test("a literal the fixing type cannot hold is not fixed by it: refused where an int is, compared where one widens")
+atf_literal_out_of_range()
+    if !atf_ready() then return
+
+    val report = atf_err(raw"""
+        narrow(n: u8) -> u8 = n
+
+        main()
+            var j = 300
+            print(narrow(j + 1))
+        """)
+
+    assert(atf_says(report, "'n' of 'narrow' is byte, but int was given", "5:18"), report)
+    assert_eq(atf_count(report), 1)
+
+    // Against a byte the comparison is an int one, as with `int` written.
+    assert_eq(atf_ran(raw"""
+        main()
+            val b: u8 = 200
+            var i = 300
+            print(i + 1 < b)
+        """), "false\n")
+
+@test("a val, a use inside a closure and a Buf's length each fix the binding through arithmetic")
+atf_val_closure_buf()
+    if !atf_ready() then return
+
+    assert_eq(atf_ran(raw"""
+        import sysl.buf.{Buf, buf}
+
+        main()
+            val xs = [10, 20, 30]
+            val o = 1
+            var a = 0
+            val f = () -> a + 1 < xs.len
+            var bs: Buf[int] = buf()
+            bs.push(4)
+            bs.push(5)
+            var b = 0
+            while b + 1 < bs.len()
+                print(bs[b] + bs[b + 1])
+                b += 1
+            print(o + 1 < xs.len, f())
+        """), "9\ntrue true\n")
+
+    val report = atf_err(raw"""
+        import sysl.buf.{Buf, buf}
+
+        main()
+            val xs = [10, 20, 30]
+            val o = 1
+            var a = 0
+            val f = () -> a + 1 < xs.len
+            var bs: Buf[int] = buf()
+            var b = 0
+            while b + 1 < bs.len()
+                b += 1
+            print(o + 1 < xs.len, f())
+            val zo: bool = o
+            val za: bool = a
+            val zb: bool = b
+        """)
+
+    assert(atf_is(report, "o", "usize"), report)
+    assert(atf_is(report, "a", "usize"), report)
+    assert(atf_is(report, "b", "usize"), report)
+    assert_eq(atf_count(report), 3)

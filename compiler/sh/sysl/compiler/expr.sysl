@@ -153,9 +153,12 @@ analyze_value(cx: &Analyzer, e: Expr, expected: Option[Type]) -> TExpr = *e.kind
     // minimum is writable even though its magnitude overflows the positive range.
     // Arithmetic over literals alone is computed exactly and held to the type it is read at
     // (`literal_arith.sysl`).
+    // Arithmetic over open bindings read where a type is expected of it fixes them, as the position
+    // would fix one of them read there alone (`var_first_use.sysl`).
     Unary(op, operand) ->
         val outermost = enter_literal_arithmetic(cx, e)
 
+        arith_fixed_by_position(cx, e, expected)
         literal_arithmetic(cx, outermost, unary_expr(cx, e, op, operand, expected))
     PreIncDec(op, operand) -> inc_dec(cx, e.span, op, operand, true)
     PostIncDec(op, operand) -> inc_dec(cx, e.span, op, operand, false)
@@ -163,6 +166,7 @@ analyze_value(cx: &Analyzer, e: Expr, expected: Option[Type]) -> TExpr = *e.kind
     Binary(op, l, r) ->
         val outermost = enter_literal_arithmetic(cx, e)
 
+        arith_fixed_by_position(cx, e, expected)
         literal_arithmetic(cx, outermost, binary_expr(cx, e.span, op, l, r, expected))
     Compare(operands, ops) -> compare_expr(cx, e.span, operands, ops)
 
@@ -1768,7 +1772,8 @@ private paired_operands(cx: &Analyzer, op: string, l: Expr, r: Expr,
     operands.push(l)
     operands.push(r)
 
-    val read = analyze_operands(cx, operands, numeric, op != "<<" && op != ">>", op == "*" || op == "/")
+    val shift = op == "<<" || op == ">>"
+    val read = analyze_operands(cx, operands, numeric, !shift, op == "*" || op == "/", false, !shift)
     val ts = if op == "+" || op == "-" then fixed_siblings(cx, operands, read) else read
     val tl = ts.at(0)
 
@@ -1903,7 +1908,8 @@ end compare_expr
 // formats`) -- rather than one being widened to the other first, which would round the product at
 // the wider operand's format.
 analyze_operands(cx: &Analyzer, operands: Buf[Expr], expected: Option[Type],
-                 widen: bool = false, rescales: bool = false, compared: bool = false) -> Buf[TExpr]
+                 widen: bool = false, rescales: bool = false, compared: bool = false,
+                 arithmetic: bool = false) -> Buf[TExpr]
     var own: Buf[Option[TExpr]] = buf()
     var refused_before = false
 
@@ -1921,9 +1927,10 @@ analyze_operands(cx: &Analyzer, operands: Buf[Expr], expected: Option[Type],
             else if !refused_before && texpr_type(t.unwrap()) == Unknown then
                 cx.an.poison_quietly()
 
-    // **`compared` marks a comparison**, whose operand of a type of its own fixes an open binding
-    // beside it (`var_first_use.sysl`).
-    if compared && !cx.open_vars.is_empty() then compare_fixes(cx, operands, own)
+    // **`compared` marks a comparison and `arithmetic` an operator other than a shift**, whose operand
+    // of a type of its own fixes the open bindings an undecided operand beside it waits on
+    // (`var_first_use.sysl`).
+    if (compared || arithmetic) && !cx.open_vars.is_empty() then neighbour_fixes(cx, operands, own)
 
     val settled = firmest(operands, own, widen, rescales).or_else(() -> expected)
     var told: Buf[Option[TExpr]] = buf()
