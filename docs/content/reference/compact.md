@@ -573,10 +573,12 @@ reads like sysl from sysl that reads like C with different punctuation.
 - The one place to say it is a `var` starting from nothing: `var i: usize = 0`, because a bare
   integer literal alone infers `int`. Better still, reach for `for i in 0..<xs.len`, which needs
   neither.
-- **A suffix is load-bearing in six places**, and stays: an array literal's element type
-  where **every** element is literal (`[104u8, 105, …]` — one suffix settles the rest, or annotate the binding instead), a range with **both** bounds literal, an `if` or
-  `match` where **both** sides are literals, a page whose subject is the type, a float width, and an
-  integer outside `int`'s range.
+- **A suffix is load-bearing in five places**, and stays: an array literal's element type
+  where **every** element is literal (`[104u8, 105, …]` — one suffix settles the rest, or annotate
+  the binding instead), a range with **both** bounds literal, a page whose subject is the type, a
+  float width, and an integer outside `int`'s range. An `if` or a `match` whose arms are all
+  literals is not among them: it takes its position's type as one literal does, generic argument
+  included (`buf_filled(3, if c then 1 else 0)` under a `Buf[u8]`).
 - For a byte constant write `u8(';')`, never `59u8` — a `char` will not compare to a byte, and there
   is no `b'…'` form.
 - Keep an annotation the compiler asks for: `var head: Buf[&Display] = buf()` has nothing to infer
@@ -644,7 +646,7 @@ do all along. One program and one `sysl build` settle it.
 | `'?' may only be used in a function returning sysl.Result, not int` | give the enclosing function the channel it early-returns into |
 | `this loop breaks with a int but has no 'else'` | add the `else` block that says what a normal finish is worth |
 | `a 'for' names one thing, and a pattern is what takes it apart` | `for (k, v) in …`, with the parentheses |
-| `'is' tests a pattern in the condition of an 'if' or a 'while', and nowhere else` | chain with `&&` inside the condition, or write a `match` |
+| `this pattern binds a name, and an 'is' that binds stands only in the condition of an 'if' or a 'while'` | take the value apart with `if` or `match`, or write `_` for the parts you do not name |
 | `a pattern under '\|\|' cannot bind a name` | write `_` for the parts you do not name, chain with `&&`, or write a `match` |
 | `already implements 'sysl.Eq' — no variant of it carries anything` | delete the block; a bare enum compares already |
 | `'&Cell' and '&sync Cell' are distinct types` | allocate it as the one you need where it is constructed |

@@ -575,9 +575,11 @@ a range with an open end is only allowed in a slice index
 
 Because a range is a value, it implements [`Sequence`](/library/seq/), so `(0..<n).map(f)` works as
 written. Nothing is materialized to answer a question about one, so `(0..<1_000_000).any(p)` costs
-the predicate calls and no storage.
+the predicate calls and no storage. An array is a `Sequence` too, at every length, so a question
+asked of a table needs no `[..]` first: `RUNS.any(p)` on a `val RUNS = [...]`
+([arrays](/reference/arrays/#asking-one-a-question)).
 
-## `is` — a pattern where a condition is wanted
+## `is` — testing a value against a pattern
 
 `x is Pat` tests a value against a pattern and yields a `bool`; `x is not Pat` negates it. The right
 side is a full pattern, alternatives (`|`) included — the same grammar a `match` arm's left side
@@ -600,6 +602,10 @@ rectangular
 
 Its level — between `&&` and the comparisons — makes `a is P && b > 0` a conjunction of two terms
 rather than an `is` against a conjunction.
+
+**The right side of `is` is a pattern, and the pattern ends at the first token a pattern cannot
+hold.** A comparison is not part of a pattern, so `a is P == b` is `(a is P) == b`: the test's `bool`
+compared with `b`, as Kotlin and C# read it.
 
 **Under `||` a test is allowed as long as it binds nothing.** A name bound by `is` is live from its
 own `is` rightward and through the branch, and under `||` the branch runs when either side held, so
@@ -632,6 +638,43 @@ if o is Some(n) || false
 
 ```error
 a pattern under '||' cannot bind a name
+```
+
+**Outside a condition, an `is` that binds nothing is an ordinary `bool`.** It can be negated, bound,
+passed, returned, made a closure's body or a `match` guard, and folded in a `const`:
+
+```sysl
+const LIMIT = 12
+const SMALL = LIMIT is 0..15
+
+ready(o: Option[int]) -> bool
+    return o is Some(_)
+
+val o: Option[int] = None
+val empty = o is None
+val some = (x: Option[int]) -> x is Some(_)
+
+print(SMALL, ready(Some(1)), !(o is Some(_)), empty, some(o))
+```
+
+```output
+true true true true false
+```
+
+Its level still applies: `!o is None` is `(!o) is None`, so a negation of the test is written
+`!(o is None)` — or `o is not None`.
+
+A pattern that binds a name still stands only in a condition, because the name is live through the
+branch the condition guards, and outside a condition there is no branch. Take the value apart with
+`if` or `match`, or write `_` for the parts you are not naming:
+
+```sysl
+val o: Option[int] = Some(1)
+val held = o is Some(n)
+```
+
+```error
+this pattern binds a name, and an 'is' that binds stands only in the condition of an 'if' or a 'while'
 ```
 
 Both `is` and `not` are **soft** words: neither is reserved, so both remain usable as ordinary

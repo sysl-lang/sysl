@@ -1462,7 +1462,14 @@ private as_read_only(tr: TExpr, want: Type) -> TExpr
                 Slice(gelem, got_ro) ->
                     if got_ro || !type_eq(*gelem, *welem) then return tr
 
-                    TExpr(tr.span, TConstView(tr))
+                    // A view taken right here is taken read-only, as one taken where an argument
+                    // wants a `[]const T` is: nothing can write through it, so `xs[..].any(p)` on a
+                    // large by-value array leaves the array where its caller put it
+                    // (`reads_in_place`) rather than copying it in to lend a licence nobody uses.
+                    *tr.kind match
+                        TSlice(base, lo, hi, inclusive, _) ->
+                            TExpr(tr.span, TSlice(base, lo, hi, inclusive, Slice(gelem, true)))
+                        _ -> TExpr(tr.span, TConstView(tr))
                 _ -> tr
         _ -> tr
 end as_read_only

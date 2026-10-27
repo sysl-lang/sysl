@@ -1,0 +1,202 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.process.capture
+
+// **An array a callable yields is taken where the declaration shapes a slice**, at a generic call
+// whose element type the callable itself settles (`expr_generic.sysl`'s `settled_yield`). Before,
+// `xs[..].flat_map(n -> [n, n])` read the closure with an open result, so it yielded its own `[2]int`,
+// settled `U = int`, and was refused for implementing `Fn1[int, [2]int]` where `Fn1[int, []int]` was
+// asked -- while the same closure at a non-generic `int -> []int`, or with `[int]` written out, was
+// taken.
+//
+// The axes: **the body** (an expression, a block ending in the literal, branches of differing
+// lengths that meet only at the slice, a nested `flat_map`) × **the element** (a scalar, a struct
+// value, a `&T` with a destructor) × **the callable** (a closure, a named function answering `[N]T`,
+// a closure already answering a slice) × **the receiver** (a slice, a range) × **the outcome**
+// (accepted with its output and a heap that nets zero; refused with the diagnostic it always had).
+//
+// Skipped, with the reason: a boxed `&Fn` parameter (`call_shape` reads it to the same shape a bare
+// arrow is read to, so it takes the same path); a codegen-unit split or a library root (the change is
+// in what the call is typed at, and the lowering is the ordinary array-to-slice one every
+// `int -> []int` argument already gets).
+
+// The program built with counting on and run: what it printed, and what the heap said at exit.
+private cay_counted(text: string) -> (string, string)
+    val prog = lbr_program(text)
+    val out_dir = lbr_temp("sysl-cay-exe")
+
+    force_alloc_counting(true)
+
+    val built = build_native_program(prog, None, None, DefaultOptimization, Some(s"$out_dir/program"))
+
+    force_alloc_counting(false)
+    reset_search_paths()
+
+    val said = built match
+        Err(why) -> (s"refused: ${failure_text(why)}", "")
+        Ok(made) ->
+            capture(made, [], "", [], true) match
+                Err(_) -> ("could not be started", "")
+                Ok(o) -> (o.text, o.err.unwrap_or(""))
+
+    lbr_drop([prog, out_dir])
+    said
+end cay_counted
+
+// Asserts the program prints `want` and its counted heap nets zero.
+private cay_prints(text: string, want: string)
+    if !lbr_ready() then return
+
+    val (out, err) = cay_counted(text)
+
+    assert_eq(out, want)
+    assert(!err.contains("still live"), err)
+
+// Asserts the program is refused, saying `message` exactly once.
+private cay_refused(text: string, message: string)
+    if !lbr_ready() then return
+
+    val prog = lbr_program(text)
+    val out = lbr_run(prog, [])
+
+    lbr_drop([prog])
+    assert(out.starts_with("refused: "), out)
+    assert_eq(out.count_of(message), usize(1), out)
+
+@test("a closure answering an array literal is taken where flat_map shapes a slice")
+cay_the_literal()
+    cay_prints(raw"""
+        val xs = [1, 2, 3]
+        val out = xs[..].flat_map(n -> [n, n * 10])
+
+        print(out.len, out[0], out[1], out[5])
+        """, "6 1 10 30\n")
+
+@test("the same through a generic of the program's own, and over a range")
+cay_own_generic_and_range()
+    cay_prints(raw"""
+        lengths[U](f: int -> []U) -> usize = f(3).len
+
+        print(lengths(n -> [n, n]), (0..<3).flat_map(i -> [i, i, i]).len)
+        """, "2 9\n")
+
+@test("a block-bodied closure ending in the literal")
+cay_block_body()
+    cay_prints(raw"""
+        val xs = [1, 2, 3]
+        val out = xs[..].flat_map(n ->
+            val m = n * 10
+            [n, m])
+
+        print(out.len, out[1], out[5])
+        """, "6 10 30\n")
+
+@test("branches of differing lengths meet at the slice the declaration shapes")
+cay_branches_of_differing_lengths()
+    cay_prints(raw"""
+        val xs = [1, 2, 3]
+        val a = xs[..].flat_map(n -> if n == 2 then [n] else [n, n, n])
+        val b = xs[..].flat_map(n -> n match
+            1 -> [n]
+            2 -> [n, n]
+            _ -> [n, n, n, n])
+
+        print(a.len, a[3], b.len, b[6])
+        """, "7 2 7 3\n")
+
+@test("a nested flat_map, each closure answering an array")
+cay_nested()
+    cay_prints(raw"""
+        val xs = [1, 2, 3]
+        val out = xs[..].flat_map(n -> [n, n][..].flat_map(m -> [m, m + 1]))
+
+        print(out.len, out[0], out[1], out[11])
+        """, "12 1 2 4\n")
+
+@test("an array of struct values")
+cay_struct_values()
+    cay_prints(raw"""
+        struct Cell
+            v: int
+
+        val xs = [1, 2, 3]
+        val cells = xs[..].flat_map(n -> [Cell(n), Cell(n + 1)])
+
+        print(cells.len, cells[0].v, cells[5].v)
+        """, "6 1 4\n")
+
+@test("an array of references with a destructor: each dropped once, the heap nets zero")
+cay_counted_references()
+    cay_prints(raw"""
+        struct Enc
+            id: int
+
+        impl Drop for Enc
+            drop(self) = print("drop", self.id)
+
+        run()
+            val xs = [1, 2]
+            val es = xs[..].flat_map(n -> [Enc(n), Enc(n * 10)])
+
+            print(es.len, es[0].id, es[3].id)
+
+        run()
+        print("done")
+        """, "4 1 20\ndrop 20\ndrop 2\ndrop 10\ndrop 1\ndone\n")
+
+@test("a named function answering [N]T is taken as the argument")
+cay_named_function()
+    cay_prints(raw"""
+        dup(n: int) -> [2]int = [n, n]
+
+        val xs = [1, 2, 3]
+        val out = xs[..].flat_map(dup)
+
+        print(out.len, out[4])
+        """, "6 3\n")
+
+@test("a closure already answering a slice reads as it always did")
+cay_slice_answer_unchanged()
+    cay_prints(raw"""
+        import sysl.buf.{Buf, buf}
+
+        pair(n: int) -> []int
+            var b: Buf[int] = buf()
+
+            b.push(n)
+            b.push(n * 10)
+            b.view()
+
+        val xs = [1, 2, 3]
+        val out = xs[..].flat_map(n -> pair(n))
+
+        print(out.len, out[5])
+        """, "6 30\n")
+
+@test("an array of strings where the call's position asks for []int is refused at the closure")
+cay_wrong_element_refused()
+    cay_refused(raw"""
+        val xs = [1, 2]
+        val bad: []int = xs[..].flat_map(n -> ["a", "b"])
+
+        print(bad.len)
+        """, "this closure should yield []int, but its body yields []string")
+
+@test("branches whose elements differ meet at nothing, and say so once")
+cay_branches_that_never_meet()
+    cay_refused(raw"""
+        val xs = [1, 2]
+        val bad = xs[..].flat_map(n -> if n == 1 then [n] else ["a", "b"])
+
+        print(bad.len)
+        """, "if branches have different types: [1]int and [2]string")
+
+@test("a mistake inside the closure is told once, not once per trial reading")
+cay_inner_mistake_once()
+    cay_refused(raw"""
+        val xs = [1, 2]
+        val bad = xs[..].flat_map(n -> [n, nope])
+
+        print(bad.len)
+        """, "undefined name 'nope'")

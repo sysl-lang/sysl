@@ -402,6 +402,38 @@ The result is a `u8` because one argument had a type and two did not, while `id(
 because no argument had one. Once the parameter is solved, the literals are read against it, in the
 same order the operand rule uses inside an expression.
 
+**An `if` or a `match` every arm of which is a literal counts as one**, as does a block ending in one,
+however they nest; an arm that leaves (`continue`, `return`, a `panic`) is no evidence either way. So
+the expected type reaches the arms exactly as it reaches a single literal, and no suffix is needed:
+
+```sysl
+import sysl.buf.{Buf, buf_filled}
+
+val c = true
+val live: Buf[u8] = buf_filled(3, if c then 255 else 0)
+
+print(live.len(), live[0])
+```
+
+```output
+3 255
+```
+
+An arm that does not fit is refused at that arm, as a lone literal is: under `Buf[u8]`,
+`if c then 256 else 0` says `the literal 256 does not fit byte` at the `256`, and `if c then 1 else 2.5`
+points at the `2.5`, the one arm the `u8` could not reach:
+
+```sysl
+import sysl.buf.{Buf, buf_filled}
+
+val c = true
+val b: Buf[u8] = buf_filled(3, if c then 1 else 2.5)
+```
+
+```error
+'value' of 'sysl.buf.buf_filled' is byte, but real was given
+```
+
 **A construction built only from literals is consulted last for the same reason.** `Some(3)` is a
 call rather than a literal, but the only thing that gives it the type `Option[int]` is the unsuffixed
 `3`. An argument carrying a type of its own therefore outranks it, whichever end of the call it is
