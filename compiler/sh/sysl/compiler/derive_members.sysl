@@ -61,20 +61,37 @@ end names_deriving_type
 // Every refusal said since `before`, while the body of a member written from a `derive` body was
 // read, is moved to the word in the `derives` clause that asked for the member. The message is kept
 // -- a refusal made in one copy of a field walk already names the field.
-told_at_derives(a: &Analysis, name: string, before: usize)
+//
+// **Where the program wrote no such clause, the refusal goes to the line that reached the member.**
+// A `Debug` the compiler `supplied` for every type, and a member a library type's own `derives`
+// wrote, are read only once something reaches them, and what reached them is the one place in the
+// program the reader can change: `print(x)`, not the declaration of `x`'s type. `reached` is the
+// name the member was reached by, followed back through library bodies (`ReachSites.in_program`).
+told_at_derives(a: &Analysis, name: string, reached: string, supplied: bool, before: usize)
     val copy = a.tables.members.derived.get(name)
 
     if copy.is_none() then return
 
     val site = copy.unwrap()
+    var src = site.scope.src
+    var at = site.span
+
+    if supplied || from_library(a, site.scope)
+        val use = a.sites.in_program(reached, s -> library_source(a, s))
+
+        if use.is_some()
+            src = use.unwrap().src
+            at = use.unwrap().at
+        end if
+    end if
+
     val found = a.found
 
     for i in before..<found.len()
         val p = found.at(i)
         val d = p.diag
 
-        found.set(i, Placed(site.scope.src, Diagnostic(d.severity, site.span, d.message, d.label, d.note),
-                            p.at_place))
+        found.set(i, Placed(src, Diagnostic(d.severity, at, d.message, d.label, d.note), p.at_place))
 end told_at_derives
 
 // The scope of the `derives` clause a member was written for, or nothing for any other member.
