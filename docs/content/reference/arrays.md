@@ -1035,6 +1035,33 @@ a call per element. The protocol is for sequences whose elements have to be
 *computed*, which a container's never are. What `Buf` implements instead is `Walk`, whose `walk()`
 answers the view, so `for x in b` asks for it once and then walks the slice by index.
 
+### Asking one a question
+
+An array is a [`Sequence`](/library/seq/) at every length, as a slice and a `Buf` are, so `any`,
+`all`, `find`, `position`, `count_where`, `fold`, `each`, `map`, `filter` and `flat_map` are called
+on it directly:
+
+```sysl
+val RUNS = ["warmup", "sprint", "cooldown"]
+
+print(RUNS.any(r -> r == "sprint"))
+print(RUNS.count_where(r -> r.len > 6))
+print(RUNS.map(r -> r.len)[2])
+print(RUNS.find(r -> r.starts_with("c")).unwrap())
+```
+
+```output
+true
+1
+8
+cooldown
+```
+
+**Asking costs no copy.** An array too large to travel in registers crosses as the address of the
+storage it is in, and these members only read it, so `RUNS.any(p)` walks the module's own `RUNS`.
+The answers that are sequences — `map`, `filter`, `flat_map` — are new buffers, never views of the
+array. A generic `S: Sequence[T]` takes an array as it takes a slice.
+
 ## What a view keeps alive
 
 Taking a slice **retains the owner**; dropping one releases it. That is what guarantees a slice never
