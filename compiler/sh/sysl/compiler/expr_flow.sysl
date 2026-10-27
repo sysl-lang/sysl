@@ -353,7 +353,11 @@ is_value(cx: &Analyzer, span: Span, subject: Expr, patterns: Buf[Pattern], negat
 
     cond_is(cx, span, subject, patterns, negated) match
         TCondIs(ts, tpats, _) ->
-            if !any_pattern_binds(tpats) then return pattern_match(cx, span, ts, tpats, negated)
+            // A subject whose type is already refused types its pattern as a wildcard, and still
+            // registers the names it binds, so a read of one is quiet; those names are what say the
+            // test binds, wherever it stands.
+            if !any_pattern_binds(tpats) && cx.locals.len() == mark.locals then
+                return pattern_match(cx, span, ts, tpats, negated)
 
             cx.rewind_scope(mark)
 
@@ -361,7 +365,7 @@ is_value(cx: &Analyzer, span: Span, subject: Expr, patterns: Buf[Pattern], negat
                 pattern_binds_into(item, &cx.refused_is)
 
             // `is not` and `|` with a binder were refused by `cond_is` already, with their own reason.
-            if negated || tpats.len() > 1 then return bad_expr(span)
+            if (negated || tpats.len() > 1) && any_pattern_binds(tpats) then return bad_expr(span)
 
             cx.err(patterns.at(0).span, "this pattern binds a name, and an 'is' that binds stands " +
                    "only in the condition of an 'if' or a 'while' — the name is live through the " +
