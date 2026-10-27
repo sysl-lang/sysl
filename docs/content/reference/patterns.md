@@ -297,7 +297,7 @@ the shape again inside the body.
 **A binding is not a test**, so a named arm covers exactly what the sub-pattern covers: it neither
 requires nor makes unreachable any other arm. It nests, since the part after the `@` is an ordinary
 pattern: `whole @ One(part @ Val(n))` names three things at three depths.
-It is also read at an [`is` test](/reference/expressions/#is-a-pattern-where-a-condition-is-wanted) and at a [binding](#a-pattern-at-a-binding), where
+It is also read at an [`is` test](/reference/expressions/#is-testing-a-value-against-a-pattern) and at a [binding](#a-pattern-at-a-binding), where
 `var whole @ Point{x, y} = p` gives the value a name alongside its fields.
 
 The name must be one a program could declare, so a qualified name is refused: a binding introduces a

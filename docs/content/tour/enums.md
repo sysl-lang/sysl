@@ -267,10 +267,12 @@ if lookup(1) is Some(row) && row.active && row.age is 18..65 then
 admitted at 30
 ```
 
-An `is` may appear only as a term of an `if` or `while` condition: not under `||`, not under `!`,
-and not on the right of an `=`. The restriction concerns the **binding**, not the boolean. Elsewhere
-in sysl a name is introduced by a declaration whose scope the indentation shows, and confining `is`
-to conditions keeps the scope of its bindings to a single rule:
+An `is` that binds nothing is an ordinary `bool` anywhere: `val empty = o is None`, `!(o is
+Some(_))`, an argument, a `return`. An `is` that **binds** may appear only as a term of an `if` or
+`while` condition: not under `||`, not under `!`, and not on the right of an `=`. The restriction
+concerns the binding, not the boolean. Elsewhere in sysl a name is introduced by a declaration whose
+scope the indentation shows, and confining a binding `is` to conditions keeps the scope of its
+bindings to a single rule:
 
 > A binding is live from its own `is` rightward through the rest of the condition, and through the
 > branch that condition guards.

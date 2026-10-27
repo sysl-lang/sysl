@@ -646,7 +646,7 @@ do all along. One program and one `sysl build` settle it.
 | `'?' may only be used in a function returning sysl.Result, not int` | give the enclosing function the channel it early-returns into |
 | `this loop breaks with a int but has no 'else'` | add the `else` block that says what a normal finish is worth |
 | `a 'for' names one thing, and a pattern is what takes it apart` | `for (k, v) in …`, with the parentheses |
-| `'is' tests a pattern in the condition of an 'if' or a 'while', and nowhere else` | chain with `&&` inside the condition, or write a `match` |
+| `this pattern binds a name, and an 'is' that binds stands only in the condition of an 'if' or a 'while'` | take the value apart with `if` or `match`, or write `_` for the parts you do not name |
 | `a pattern under '\|\|' cannot bind a name` | write `_` for the parts you do not name, chain with `&&`, or write a `match` |
 | `already implements 'sysl.Eq' — no variant of it carries anything` | delete the block; a bare enum compares already |
 | `'&Cell' and '&sync Cell' are distinct types` | allocate it as the one you need where it is constructed |
