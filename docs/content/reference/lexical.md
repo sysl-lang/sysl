@@ -1339,8 +1339,10 @@ The language accepts only the leading-dot form, so every chain is written one wa
 
 ### An unbracketed line continues before `then`
 
-**A line that begins with `then` continues the condition above it.** `then` can begin nothing else,
-so there is nothing to resolve, and as with a leading dot the line's own indentation is ignored. An
+**A line that begins with `then` continues the condition above it** — the statement above has to
+hold the `if`, so the word under `enum E` is still the reserved word refused as a variant's name.
+`then` can begin nothing else, so there is nothing to resolve, and as with a leading dot the line's
+own indentation is ignored. An
 `else` or `elif` on a line of its own may then line up under that `then`, as it may under the `if`:
 
 ```sysl
@@ -1363,8 +1365,8 @@ print(pick(true), pick(false), word(-1), word(0), word(4))
 1 2 negative zero positive
 ```
 
-A branch opens no block, so an `else` or `elif` deeper than the line above it that lines up with
-neither is refused, and the diagnostic says where it can go:
+A branch opens no block, so an `else` or `elif` deeper than a statement holding an `if`, that lines
+up with neither, is refused, and the diagnostic says where it can go:
 
 ```sysl
 pick(c: bool) -> int

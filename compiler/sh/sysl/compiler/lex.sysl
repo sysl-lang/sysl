@@ -204,11 +204,13 @@ private lex_from(start: Scanner) -> Result[Lexed, Diagnostic]
                     at_line_head = false
                     continue
 
-                // A branch can open no block, so one deeper than the line above it and lined up
-                // with nothing it could continue is a layout mistake, named as one.
+                // A branch can open no block, so one deeper than a statement holding an `if` and
+                // lined up with nothing it could continue is a layout mistake, named as one. Under a
+                // statement with no `if` the word is no branch at all (an enum's `else` variant), and
+                // the parser says what it is.
                 val branch = if word_ahead(&s, "else") then "else" else "elif"
 
-                if word_ahead(&s, "else") || word_ahead(&s, "elif")
+                if (word_ahead(&s, "else") || word_ahead(&s, "elif")) && statement_has_if(&out)
                     return Err(error(point(s.offset), misplaced_branch(branch, ind.columns)))
             end if
 
@@ -347,6 +349,29 @@ private first_on_its_line(src: []const u8, offset: usize) -> bool
         k -= 1
 
     k == 0 || src[k - 1] == u8('\n')
+
+// Whether the statement the tokens already emitted end in holds an `if` anywhere, however deeply
+// nested -- the statement a deeper `else` or `elif` could only have been meant to continue.
+private statement_has_if(out: *Buf[Spanned[Tok]]) -> bool
+    var depth: usize = 0
+    var i = out.len()
+
+    while i > 0
+        i -= 1
+
+        out.at(i).value match
+            Dedent -> depth += 1
+            Indent ->
+                if depth == 0 then return false
+                depth -= 1
+            Newline ->
+                if depth == 0 && statement_boundary(out, i) then return false
+            Keyword(w) ->
+                if w == "if" then return true
+            _ -> ()
+
+    false
+end statement_has_if
 
 // Whether the newline at `i` ends a statement rather than leading into a block or into another
 // branch of the same `if`.
@@ -503,9 +528,11 @@ end continues_before_a_dot
 //
 // **`then` can begin nothing else**, so a line starting with it belongs to the condition above it
 // and there is nothing to resolve; its indentation is discarded as a leading dot's is. Like a chain,
-// it continues only a line that could have ended an expression, which a condition is.
+// it continues only a line that could have ended an expression, which a condition is, and only a
+// statement holding the `if` the `then` belongs to: under `enum E` the word is a variant's name,
+// refused by the parser as the reserved word it is.
 private continues_before_then(s: *Scanner, out: *Buf[Spanned[Tok]]) -> bool
-    if !can_end_an_expression(out) then return false
+    if !can_end_an_expression(out) || !statement_has_if(out) then return false
 
     val m = s.mark()
     var joined = false
