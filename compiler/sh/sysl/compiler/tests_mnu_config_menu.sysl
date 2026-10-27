@@ -679,6 +679,47 @@ mnu_keyboard()
     assert_eq(mnu_decoded("\u{1b}\u{1b}[B", false), "MenuKey.MkEscape MenuKey.MkDown")
 end mnu_keyboard
 
+// The bytes of one read cut in two: what the first half yields, then what the second adds.
+private mnu_decoded_halves(bytes: string, cut: usize) -> string
+    var keys = menu_keys()
+    var got: Buf[string] = buf()
+    var i: usize = 0
+
+    for b in bytes.bytes
+        if i == cut
+            loop
+                keys.next() match
+                    None -> break
+                    Some(k) -> got.push(s"$k")
+
+        keys.push(b)
+        i += 1
+
+    loop
+        keys.next() match
+            None -> break
+            Some(k) -> got.push(s"$k")
+
+    join(got.view(), " ")
+end mnu_decoded_halves
+
+@test("mnu: keys the menu has no use for are dropped, and the key after one still decodes")
+mnu_dropped_keys()
+    val dropped = ["\u{1b}[3~", "\u{1b}[2~", "\u{1b}OP", "\u{1b}[15~", "\u{1b}[Z"]
+
+    for seq in dropped
+        assert_eq(mnu_decoded(seq, false), "")
+        assert_eq(mnu_decoded(seq, true), "")
+        assert_eq(mnu_decoded(seq + "j", false), "MenuKey.MkChar(c: 'j')")
+        assert_eq(mnu_decoded(seq + "\u{1b}[A", false), "MenuKey.MkUp")
+        assert_eq(mnu_decoded("\u{1b}[B" + seq + "j", false), "MenuKey.MkDown MenuKey.MkChar(c: 'j')")
+
+        for cut in 1..<seq.len
+            assert_eq(mnu_decoded_halves(seq, cut), "")
+            assert_eq(mnu_decoded_halves(seq + "j", cut), "MenuKey.MkChar(c: 'j')")
+            assert_eq(mnu_decoded_halves(seq + "\u{1b}[A", cut), "MenuKey.MkUp")
+end mnu_dropped_keys
+
 // -- off a terminal ----------------------------------------------------------------------------------------
 
 @test("mnu: off a terminal, bare sysl config prints the commands, with or without --target")
