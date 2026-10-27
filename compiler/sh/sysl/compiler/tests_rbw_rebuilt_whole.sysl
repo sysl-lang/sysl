@@ -1,0 +1,269 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.{Search, str_builder}
+
+// **An arm that hands its scrutinee back whole hands back the scrutinee** (`emit_pattern.sysl`'s
+// `rebuilt_whole`): `Some(h) -> Some(h)` stores the value it was given and takes its count off that
+// value, so a call's result passed on through a `match` meets its own release and `arc_elide.sysl`
+// drops the pair -- where building it field by field cost a retain and a release, two atomics on a
+// `&sync` reference. Three kinds of claim: the emitted text where it applies, the text still
+// counting where it must not apply, and programs whose counts and destructors come out exactly as
+// before, on the counted heap.
+
+private rbw_types() -> string = raw"""
+    struct Node
+        v: int
+
+    enum Maybe[T]
+        No
+        Yes(v: T)
+
+    enum Two
+        Empty
+        Both(a: &Node, b: &Node)
+
+    enum Other
+        Nope
+        Got(v: &Node)
+
+    get(n: int) -> Maybe[&Node] = if n > 0 then Yes(Node(n)) else No
+    both(n: int) -> Two = Both(Node(n), Node(n + 1))
+    touch(x: &Node) = ()
+
+    """
+
+private rbw_ir(body: string, symbol: string) -> string = emit_func_text(rbw_types() + body, symbol)
+
+private rbw_count(text: string, needle: string) -> int = int(text.count_of(needle))
+
+// No call of a retain, release, copy or dispose helper of any kind.
+private rbw_no_traffic(ir: string)
+    assert(ir.starts_with("define"), ir)
+    assert_eq(rbw_count(ir, "call void @arc."), 0)
+end rbw_no_traffic
+
+// How many counts a body takes.
+private rbw_takes(ir: string) -> int
+    assert(ir.starts_with("define"), ir)
+    rbw_count(ir, "call void @arc.retain(") + rbw_count(ir, "call void @arc.copy.")
+end rbw_takes
+
+// -- where it applies ---------------------------------------------------------------------------------
+
+@test("a call's result handed back whole through a match costs no count at all")
+rbw_call_result_through_match()
+    rbw_no_traffic(rbw_ir("pass(n: int) -> Maybe[&Node] = get(n) match\n    Yes(x) -> Yes(x)\n    No -> No\n",
+                          "pass"))
+
+@test("a variant of two counted fields handed back whole costs no count either")
+rbw_two_fields()
+    rbw_no_traffic(rbw_ir("pass(n: int) -> Two = both(n) match\n    Both(a, b) -> Both(a, b)\n    Empty -> Empty\n",
+                          "pass"))
+
+@test("the arm that hands back whole and the arm that hands back a local each give back exactly what they owe")
+rbw_with_local_arm()
+    val ir = rbw_ir("pass(n: int, d: Maybe[&Node]) -> Maybe[&Node] = get(n) match\n    Yes(x) -> Yes(x)\n    No -> d\n",
+                    "pass.owned")
+
+    // The parameter is owned (`owned_params.sysl`) and moves out of the `No` arm; the `Yes` arm hands
+    // the call's result on. Each arm gives back the one it does not hand on: `d` in one, the result in
+    // the other.
+    assert_eq(rbw_takes(ir), 0)
+    assert_eq(rbw_count(ir, "call void @arc.dispose."), 2)
+
+@test("on x86-64 and on a thumb board the arm costs no count too")
+rbw_other_targets()
+    if std_root().is_err() || !clang_available() then return
+
+    for target in ["x86_64-freestanding", "thumb-freestanding"]
+        val root = make_temp_dir("sysl-rbw").unwrap()
+
+        make_dir_all(root).unwrap()
+        write_text(s"$root/main.sysl", rbw_types() +
+                   "pass(n: int) -> Maybe[&Node] = get(n) match\n    Yes(x) -> Yes(x)\n    No -> No\n" +
+                   "main()\n    if pass(3) is Yes(x) then print(x.v)\n").unwrap()
+
+        val out = emit_llvm_text(s"$root/main.sysl", Some(target)) match
+            Err(why) -> failure_text(why)
+            Ok(made) -> made.text
+
+        remove_dir_all(root).unwrap_or(())
+
+        var b = str_builder()
+        var inside = false
+
+        for line in lines_of(out)
+            if !inside && line.starts_with("define ") && line.contains("@pass(") then inside = true
+
+            if inside
+                if line == "}" then break
+
+                b.push(line)
+                b.push_char('\n')
+
+        val body = b.finish()
+
+        assert(body.starts_with("define"), out)
+        assert_eq(rbw_count(body, "call void @arc."), 0)
+
+// -- where it must not apply --------------------------------------------------------------------------
+
+@test("fields handed back in another order are a new value, and take their counts")
+rbw_swapped_fields()
+    val ir = rbw_ir("pass(n: int) -> Two = both(n) match\n    Both(a, b) -> Both(b, a)\n    Empty -> Empty\n", "pass")
+
+    assert(rbw_takes(ir) > 0, ir)
+
+@test("a payload handed back as another enum's variant is a new value, and takes its count")
+rbw_other_enum()
+    val ir = rbw_ir("pass(n: int) -> Other = get(n) match\n    Yes(x) -> Got(x)\n    No -> Nope\n", "pass")
+
+    assert(rbw_takes(ir) > 0, ir)
+
+@test("a variant handed back into the same enum at other type arguments is a new value of another layout")
+rbw_other_instance()
+    val ir = rbw_ir("enum Either[T, E]\n    Good(v: T)\n    Bad(e: E)\n" +
+                    "narrow(n: int) -> Either[&Node, i8] = if n > 0 then Good(Node(n)) else Bad(1)\n" +
+                    "wide(n: int) -> Either[&Node, i64] = narrow(n) match\n    Good(x) -> Good(x)\n    Bad(_) -> Bad(0)\n",
+                    "wide")
+
+    // `Good(x)` is a value of the wider enum, built from the payload, so it takes the payload's count.
+    assert(rbw_takes(ir) > 0, ir)
+
+@test("an arm with a guard binds as it always did")
+rbw_guarded_arm()
+    val ir = rbw_ir("pass(n: int) -> Maybe[&Node] = get(n) match\n    Yes(x) if x.v > 1 -> Yes(x)\n    _ -> No\n",
+                    "pass")
+
+    assert(rbw_takes(ir) > 0, ir)
+
+@test("an arm that does anything before handing back is not the whole value")
+rbw_arm_with_statements()
+    val ir = rbw_ir("pass(n: int) -> Maybe[&Node] = get(n) match\n    Yes(x) ->\n        touch(x)\n        Yes(x)\n    No -> No\n",
+                    "pass")
+
+    assert(rbw_takes(ir) > 0, ir)
+
+// -- the programs ---------------------------------------------------------------------------------------
+
+private rbw_counted(text: string) -> (string, string)
+    val root = make_temp_dir("sysl-rbw").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+    force_alloc_counting(true)
+
+    val built = build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(s"$root/built"))
+
+    force_alloc_counting(false)
+
+    built match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (failure_text(why), "")
+        Ok(_) -> ()
+
+    val said = capture(s"$root/built", [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> ("could not be started", "")
+        Ok(o) -> (o.text, o.err.unwrap_or(""))
+end rbw_counted
+
+@test("every shape that hands back whole ends the counted heap at nothing live, dropping where it did")
+rbw_counted_heap()
+    if std_root().is_err() || !clang_available() then return
+
+    val ran = rbw_counted(raw"""
+        struct Tag
+            id: int
+
+        impl Drop for Tag
+            drop(self) = print("drop", self.id)
+
+        enum Two
+            Empty
+            Both(a: &Tag, b: &Tag)
+
+        get(n: int) -> Option[&Tag] = if n > 0 then Some(Tag(n)) else None
+
+        tail(n: int) -> Option[&Tag] = get(n) match
+            Some(t) -> Some(t)
+            None -> None
+
+        bound(n: int) -> int
+            val o = get(n) match
+                Some(t) -> Some(t)
+                None -> Some(Tag(99))
+            print("bound", n)
+            o.unwrap().id
+
+        local(n: int) -> Option[&Tag]
+            val m = get(n)
+            val again = m match
+                Some(t) -> Some(t)
+                None -> None
+            print("local", m.is_some(), again.is_some())
+            again
+
+        looped(n: int) -> int
+            var total = 0
+            var i = 0
+            loop
+                val o = get(n + i) match
+                    Some(t) -> Some(t)
+                    None -> break
+                total += o.unwrap().id
+                i += 1
+                if i == 2 then break
+            total
+
+        early(n: int) -> Option[&Tag]
+            val o = get(n) match
+                Some(t) -> Some(t)
+                None -> return Some(Tag(77))
+            print("early", n)
+            o
+
+        pair(n: int) -> Two = Both(Tag(n), Tag(n + 1)) match
+            Both(a, b) -> Both(a, b)
+            Empty -> Empty
+
+        shared(n: int) -> int
+            val x = get(n)
+            val y = x match
+                Some(t) -> Some(t)
+                None -> None
+            x.unwrap().id + y.unwrap().id
+
+        small(n: int) -> Result[&Tag, i8] = if n > 0 then Ok(Tag(n)) else Err(1)
+
+        widen(n: int) -> Result[&Tag, Two] = small(n) match
+            Ok(t) -> Ok(t)
+            Err(_) -> Err(Empty)
+
+        print("widen", widen(9).unwrap().id, widen(0).is_err())
+        print("tail", tail(1).unwrap().id)
+        print("bound", bound(2))
+        print("bound", bound(0))
+        print("local", local(3).unwrap().id)
+        print("looped", looped(4))
+        print("early", early(5).unwrap().id)
+        print("early", early(0).unwrap().id)
+        pair(6) match
+            Both(a, b) -> print("pair", a.id, b.id)
+            Empty -> print("empty")
+        print("shared", shared(8))
+        print("end")
+        """)
+
+    // What the lowering that built every arm field by field printed, line for line.
+    assert_eq(ran.0, "widen 9 true\ndrop 9\ntail 1\ndrop 1\nbound bound 2\ndrop 2\n2\nbound bound 0\ndrop 99\n99\nlocal local true true\n" +
+                     "3\ndrop 3\nlooped drop 4\ndrop 5\n9\nearly early 5\n5\ndrop 5\nearly 77\ndrop 77\n" +
+                     "pair 6 7\ndrop 6\ndrop 7\nshared drop 8\n16\nend\n")
+    assert(!ran.1.contains("still live"), ran.1)

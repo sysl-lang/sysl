@@ -250,6 +250,60 @@ private is_load(x: TExpr) -> bool = *x.kind match
     TLoad(_, _) -> true
     _ -> false
 
+// **An arm that hands its scrutinee back whole hands back the scrutinee** (`rebuilds`:
+// `Some(h) -> Some(h)`): the value it would build is the one it was given, bit for bit in every byte
+// the variant uses, so it is stored as it is and takes one count of it, with nothing bound. Built
+// field by field instead, the count was taken off a value assembled through a slot, which
+// `arc_elide.sysl` cannot see is the scrutinee -- so the scrutinee's own release, at the end of the
+// statement that made it, stayed paired with a retain of "another" value. Taken off the scrutinee
+// itself, the two are a retain and a release of one reference with nothing between them, and the
+// pass drops both: a call's result handed back through a `match` costs no count at all.
+//
+// Only where the scrutinee is a value: one a `match` reads through its address (`at`) may be held as
+// its tag alone (`load_held`). Answers whether it wrote the arm.
+private rebuilt_whole(e: *Emit, arm: TArm, sv: Val, at: Option[Val], ty: Type, slot: Merge) -> bool
+    if at.is_some() || slot.in_place || e.layout.indirect(ty) || !rebuilds(arm, ty) then return false
+
+    emit(e, InStore(lty(e, ty), sv, slot.at, AccPlain, None))
+    retain_value(e, ty, sv)
+    true
+end rebuilt_whole
+
+// Whether an arm hands its scrutinee back whole: `V(a, b) -> V(a, b)`, every field bound by name and
+// built back in its own place, with nothing else in the arm.
+private rebuilds(arm: TArm, sty: Type) -> bool
+    if arm.guard.is_some() || !arm.body.stmts.is_empty() || arm.patterns.len() != 1 then return false
+
+    val built = arm.body.result match
+        Some(r) -> r
+        None -> return false
+
+    *built.kind match
+        TEnumNew(enum_ty, variant, args) ->
+            if enum_ty != sty then return false
+
+            arm.patterns.at(0) match
+                // The pattern's enum is the scrutinee's: `Ok(s) -> Ok(s)` between two `Result`s of
+                // different error types builds a value of another layout.
+                TVariantPattern(pt, pv, pargs) ->
+                    if pt != enum_ty || pv.tag != variant.tag || pargs.len() != args.len() ||
+                       pargs.len() != variant.fields.len() then
+                        return false
+
+                    for i in 0..<args.len()
+                        val bound = pargs.at(i) match
+                            TBindPattern(n, _) -> n
+                            _ -> return false
+
+                        *args.at(i).kind match
+                            TLoad(n, _) -> if n != bound then return false
+                            _ -> return false
+
+                    true
+                _ -> false
+        _ -> false
+end rebuilds
+
 // Whether an arm writes its payload through the scrutinee's address rather than binding it: one that
 // is boxed always does, and an unboxed one where the `match` has a destination to write it to.
 private moves(e: *Emit, arm: TArm, into: bool) -> bool = moved_payload(e, arm) match
@@ -518,6 +572,12 @@ private gen_arm_body(e: *Emit, arm: TArm, sv: Val, at: Option[Val], ty: Type, sl
                      end_l: string)
     push_owned(e)
 
+    if rebuilt_whole(e, arm, sv, at, ty, slot)
+        pop_owned(e)
+        emit_term(e, InBr(end_l))
+        return
+    end if
+
     if !payload_move(e, arm, slot, at)
         if arm.patterns.len() == 1 then pattern_bind(e, arm.patterns.at(0), sv)
 
@@ -575,7 +635,7 @@ private gen_chain_arm(e: *Emit, arm: TArm, sv: Val, at: Option[Val], ty: Type, s
             emit_label(e, body_l)
             push_owned(e)
 
-            moved = payload_move(e, arm, slot, at)
+            moved = rebuilt_whole(e, arm, sv, at, ty, slot) || payload_move(e, arm, slot, at)
 
             if !moved && arm.patterns.len() == 1 then pattern_bind(e, arm.patterns.at(0), sv)
         Some(g) ->
