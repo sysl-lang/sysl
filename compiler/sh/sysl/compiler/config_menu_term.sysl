@@ -3,27 +3,16 @@ module sh.sysl.compiler
 import sysl.buf.{Buf, buf}
 import sysl.fs.{is_file, read_text, write_text}
 import sysl.io.stdin
-import sysl.posix.tty.{flush, is_tty}
+import sysl.posix.tty.{flush, is_tty, window_size}
 import sysl.signal.{HUP, TERM, WINCH, watch}
-import sysl.term.{clear_below, clear_to_line_end, hide_cursor, home, show_cursor}
+import sysl.term.{alt_screen, clear_below, clear_to_line_end, hide_cursor, home, main_screen, show_cursor, sync_begin, sync_end}
+import sysl.term.keys.{Key, KeyDecoder, key_decoder}
 import sysl.text.join
 import sysl.tty
 
 // The terminal half of `sysl config`'s menu (`config_menu.sysl` is the rest): the keyboard read a
 // key at a time, the screen drawn whole on each change, and the manifest written after each change
 // that resolves.
-//
-// **It reads the keys and the window's size itself**, through `menu_keys` below and
-// `config_menu_size.sysl`, because the compiler is built by the release before it: `sysl.term.keys`
-// and `sysl.posix.tty.window_size` are the library's own answers to both, and this file takes them up
-// in the release after the one that ships them.
-
-// The full-screen sequences `sysl.term` names as `alt_screen`, `main_screen`, `sync_begin` and
-// `sync_end`.
-private const menu_alt_screen: string = "\u{1b}[?1049h"
-private const menu_main_screen: string = "\u{1b}[?1049l"
-private const menu_sync_begin: string = "\u{1b}[?2026h"
-private const menu_sync_end: string = "\u{1b}[?2026l"
 
 // Whether bare `sysl config` opens the menu: both standard input and standard output are a terminal.
 config_menu_wanted() -> bool = is_tty(0) && is_tty(1)
@@ -107,7 +96,7 @@ private menu_session(dir: string, file: string, t: Target, start: Menu, done: *B
     var keys = menu_keys()
     var dirty = true
 
-    menu_put(menu_alt_screen + hide_cursor)
+    menu_put(alt_screen + hide_cursor)
 
     while !menu.quit
         if resized.take() then dirty = true
@@ -136,7 +125,7 @@ private menu_session(dir: string, file: string, t: Target, start: Menu, done: *B
         menu_take_keys(&menu, &keys, dir, file, t, rows, done)
         dirty = true
 
-    menu_put(show_cursor + menu_main_screen)
+    menu_put(show_cursor + main_screen)
     Fine
 end menu_session
 
@@ -182,7 +171,7 @@ private menu_draw(menu: *Menu, rows: int, cols: int)
     for line in lines
         parts.push(line + clear_to_line_end)
 
-    menu_put(menu_sync_begin + home + join(parts.view(), "\r\n") + clear_below + menu_sync_end)
+    menu_put(sync_begin + home + join(parts.view(), "\r\n") + clear_below + sync_end)
 end menu_draw
 
 private menu_put(text: string)
@@ -190,145 +179,61 @@ private menu_put(text: string)
     flush()
 
 // The window's rows and columns, or a VT100's where it gives none.
-private menu_window() -> (int, int) = menu_window_size(1) match
-    Some(size) -> size
+private menu_window() -> (int, int) = window_size(1) match
+    Some(size) -> (size.rows, size.cols)
     None -> (24, 80)
 
 // -- keys -------------------------------------------------------------------------------------------------
 
-// The bytes a terminal sends, as the menu's keys: `sysl.term.keys.KeyDecoder`'s rules, in the menu's
-// vocabulary -- both spellings of every arrow, a sequence read to its final byte, a lone Escape
-// answered at a pause, a CRLF one Enter.
+// The bytes a terminal sends, as the menu's keys: `sysl.term.keys.KeyDecoder` read in the menu's
+// vocabulary. A key the menu has no use for (Delete, Insert, a function key, Shift-Tab) is dropped, and
+// a character typed with Alt is an Escape and then the character.
 struct MenuKeys
-    private state: int
-    private param: int
-    private params: int
-    private cp: uint
-    private more: int
-    private owed_lf: bool
-    private first: Option[MenuKey]
-    private second: Option[MenuKey]
+    private decoder: KeyDecoder
+    private ready: Buf[MenuKey]
 
     push(*self, b: u8)
-        if self.state == 1 then self.after_escape(b)
-        elif self.state == 2 then self.csi(b)
-        elif self.state == 3
-            self.state = 0
-            self.final_key(b, 0)
-        elif self.state == 4 then self.continuation(b)
-        else self.ground(b)
+        self.decoder.push(b)
+        self.drain()
     end push
 
     pause(*self)
-        val was = self.state
-
-        self.state = 0
-
-        if was == 1 then self.emit(MkEscape)
-        elif was == 4 then self.emit(MkChar('\u{fffd}'))
+        self.decoder.pause()
+        self.drain()
     end pause
 
-    next(*self) -> Option[MenuKey]
-        val out = self.first
+    next(*self) -> Option[MenuKey] = if self.ready.is_empty() then None else Some(self.ready.remove(0))
 
-        self.first = self.second
-        self.second = None
-        out
-    end next
+    partial(self) -> bool = self.decoder.partial()
 
-    partial(self) -> bool = self.state != 0
+    private drain(*self)
+        loop
+            self.decoder.next() match
+                None -> return
+                Some(k) -> self.take(k)
+    end drain
 
-    private emit(*self, k: MenuKey)
-        if self.first.is_none() then self.first = Some(k) else self.second = Some(k)
-
-    private ground(*self, b: u8)
-        val lf_owed = self.owed_lf
-
-        self.owed_lf = false
-
-        if b == 27 then self.state = 1
-        elif b == 13
-            self.owed_lf = true
-            self.emit(MkEnter)
-        elif b == 10
-            if !lf_owed then self.emit(MkEnter)
-        elif b == 9 then self.emit(MkTab)
-        elif b == 8 || b == 127 then self.emit(MkBackspace)
-        elif b >= 1 && b <= 26 then self.emit(MkCtrl(char(uint(b) + 96)))
-        elif b < 32 then ()
-        elif b < 128 then self.emit(MkChar(char(uint(b))))
-        elif b & 224 == 192 then self.lead(uint(b & 31), 1)
-        elif b & 240 == 224 then self.lead(uint(b & 15), 2)
-        elif b & 248 == 240 then self.lead(uint(b & 7), 3)
-        else self.emit(MkChar('\u{fffd}'))
-    end ground
-
-    private lead(*self, cp: uint, more: int)
-        self.cp = cp
-        self.more = more
-        self.state = 4
-
-    private continuation(*self, b: u8)
-        if b & 192 != 128
-            self.state = 0
-            self.emit(MkChar('\u{fffd}'))
-            self.ground(b)
-            return
-
-        self.cp = (self.cp << 6) | uint(b & 63)
-        self.more -= 1
-
-        if self.more == 0
-            self.state = 0
-            self.emit(MkChar(char(self.cp)))
-    end continuation
-
-    private after_escape(*self, b: u8)
-        if b == u8('[')
-            self.state = 2
-            self.param = 0
-            self.params = 0
-        elif b == u8('O')
-            self.state = 3
-        elif b == 27
-            self.emit(MkEscape)
-        else
-            // Alt and a character is nothing the menu reads: Escape, then the key itself.
-            self.state = 0
-            self.emit(MkEscape)
-            self.ground(b)
-    end after_escape
-
-    private csi(*self, b: u8)
-        if b >= u8('0') && b <= u8('9')
-            if self.params == 0 then self.param = self.param * 10 + int(b - u8('0'))
-            return
-        end if
-
-        if b == u8(';')
-            self.params += 1
-            return
-        end if
-
-        if b < 64 || b > 126 then return
-
-        self.state = 0
-        self.final_key(b, self.param)
-    end csi
-
-    private final_key(*self, b: u8, n: int)
-        if b == u8('A') then self.emit(MkUp)
-        elif b == u8('B') then self.emit(MkDown)
-        elif b == u8('C') then self.emit(MkRight)
-        elif b == u8('D') then self.emit(MkLeft)
-        elif b == u8('H') then self.emit(MkHome)
-        elif b == u8('F') then self.emit(MkEnd)
-        elif b == u8('~')
-            if n == 1 || n == 7 then self.emit(MkHome)
-            elif n == 4 || n == 8 then self.emit(MkEnd)
-            elif n == 5 then self.emit(MkPageUp)
-            elif n == 6 then self.emit(MkPageDown)
-    end final_key
+    private take(*self, k: Key)
+        k match
+            Char(c) -> self.ready.push(MkChar(c))
+            Ctrl(c) -> self.ready.push(MkCtrl(c))
+            Alt(c) ->
+                self.ready.push(MkEscape)
+                self.ready.push(MkChar(c))
+            Enter -> self.ready.push(MkEnter)
+            Tab -> self.ready.push(MkTab)
+            Backspace -> self.ready.push(MkBackspace)
+            Escape -> self.ready.push(MkEscape)
+            Up -> self.ready.push(MkUp)
+            Down -> self.ready.push(MkDown)
+            Left -> self.ready.push(MkLeft)
+            Right -> self.ready.push(MkRight)
+            Home -> self.ready.push(MkHome)
+            End -> self.ready.push(MkEnd)
+            PageUp -> self.ready.push(MkPageUp)
+            PageDown -> self.ready.push(MkPageDown)
+            _ -> ()
+    end take
 end MenuKeys
 
-menu_keys() -> MenuKeys = MenuKeys(0, 0, 0, 0, 0, false, None, None)
+menu_keys() -> MenuKeys = MenuKeys(key_decoder(), buf())
