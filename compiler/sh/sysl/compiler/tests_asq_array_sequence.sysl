@@ -1,0 +1,555 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.source_of
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.str_builder
+
+// **An array is a `Sequence`** (`library/sysl/seq/seq.sysl`'s `impl ... for [N]E`), so `RUN.any(p)`
+// works on `val RUN = ["a", "b", "c"]` as it does on `RUN[..]`, at every length, element type and
+// place the array can be in.
+//
+// **Calling one copies nothing.** A large array crosses as the address of its caller's storage and a
+// member that only reads it reads it there (`reads_in_place`). That holds for the members that
+// delegate to the whole-array slice because a view taken right at a receiver whose member was written
+// for `[]const T` is a read-only view (`member_call.sysl`'s `as_read_only`): a writable one would make
+// the body copy its parameter in, as a write through it would otherwise reach the caller's array.
+//
+// **A view handed on read-only is still the view it was** (`escape.sysl`'s `views_value`): a local
+// writable slice passed where a `[]const T` is wanted, as an argument or as a receiver, and then
+// returned, promotes the array it views. Before, the read-only wrapper hid the array from the escape
+// analysis, and the function returned a view of its own dead frame.
+//
+// Shapes these tests avoid, each its own open defect: `fold` through a bound `S: Sequence[int]` whose
+// closure adds (the member's type parameter is not inferred), and `flat_map` with a closure returning
+// an array literal (`[2]int` is refused for `[]U`).
+
+private asq_ready() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+
+    true
+end asq_ready
+
+// The program built against the counted heap and run: its stdout, a clean exit and nothing left live.
+private asq_prints(text: string, expected: string)
+    if !asq_ready() then return
+
+    val root = make_temp_dir("sysl-asq").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+    force_alloc_counting(true)
+
+    val built = build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(s"$root/built"))
+
+    force_alloc_counting(false)
+
+    if built.is_err()
+        remove_dir_all(root).unwrap_or(())
+        assert(false, failure_text(built.unwrap_err()))
+        return
+    end if
+
+    val said = capture(s"$root/built", [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> assert(false, "the program that was built could not be run")
+        Ok(out) ->
+            assert_eq(out.text, expected)
+            assert(out.status.ok(), "the program printed what was expected and did not exit cleanly")
+            assert(!out.err.unwrap_or("").contains("still live"), out.err.unwrap_or(""))
+end asq_prints
+
+// The LLVM text of the module a program lowers to on this machine, or what its analysis said.
+private asq_ir(text: string) -> string
+    val root = make_temp_dir("sysl-asq").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    val out = emit_llvm_text(src, None) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> if made.report.is_empty() then made.text else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end asq_ir
+
+// One function's text, from its `define` to the brace that closes it.
+private asq_body(out: string, name: string) -> string
+    var b = str_builder()
+    var inside = false
+
+    for line in lines_of(out)
+        if !inside && line.starts_with("define ") && line.contains("@" + name + "(") then inside = true
+
+        if inside
+            if line == "}" then return b.finish()
+
+            b.push(line)
+            b.push_char('\n')
+
+    s"no definition of '$name' in:\n$out"
+end asq_body
+
+// The line that opens one function's definition.
+private asq_define(out: string, name: string) -> string
+    for line in lines_of(out)
+        if line.starts_with("define ") && line.contains("@" + name + "(") then return line
+
+    s"no definition of '$name' in:\n$out"
+end asq_define
+
+// Every function lowered for a `[20]` array's member, each from its `define` to its closing brace.
+private asq_array_members(out: string) -> Buf[string]
+    var found: Buf[string] = buf()
+    var b = str_builder()
+    var inside = false
+
+    for line in lines_of(out)
+        if !inside && line.starts_with("define ") && line.contains("@arr.") && line.contains(".c20.")
+            inside = true
+
+        if inside
+            if line == "}"
+                found.push(b.finish())
+                b = str_builder()
+                inside = false
+            else
+                b.push(line)
+                b.push_char('\n')
+
+    found
+end asq_array_members
+
+// How many lines of `text` contain `needle`.
+private asq_lines_with(text: string, needle: string) -> usize
+    var n: usize = 0
+
+    for line in lines_of(text)
+        if line.contains(needle) then n += 1
+
+    n
+end asq_lines_with
+
+private asq_thumb() -> Target = target_named("thumb-freestanding-softfp").unwrap()
+
+private asq_first_of(said: Buf[Placed]) -> string
+    for item in said
+        if !item.src.name.starts_with("library/") then return item.diag.message
+
+    ""
+end asq_first_of
+
+// A C archive for the freestanding thumb target, as `build-c` makes one: the first thing the
+// compilation had to say, or the LLVM text it lowered to.
+private asq_archive(text: string) -> string
+    val t = asq_thumb()
+    var units: Buf[Program] = buf()
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, t) match
+            Err(_) -> ()
+            Ok(found) -> units = found
+
+    val parsed = parse(source_of("main.sysl", text), t)
+
+    if !parsed.ok() then return parsed.report.at(0).message
+
+    units.push(parsed.program)
+
+    val done = analyze_produced(units, t, buf(), false)
+    val early = asq_first_of(done.reported)
+
+    if early != "" then return early
+
+    val whole = program_of(done, done.main_module) with { entry_point = false, c_artifact = true }
+    var own: Buf[string] = buf()
+
+    own.push("")
+
+    val pr = post_analysis_checks(done.an, whole, own)
+    val late = asq_first_of(done.an.diagnostics())
+
+    if late != "" then return late
+
+    ir_print_module(codegen_with_gaps(prune(strip_tests(whole), own), t, pr).0)
+end asq_archive
+
+// -- every member, on every place an array can be -----------------------------------------------------
+
+@test("a module 'val' array answers every Sequence member, as its whole-array slice does")
+asq_module_val_every_member()
+    asq_prints(raw"""
+        import sysl.seq.Sequence
+
+        val RUN = ["a", "b", "c"]
+
+        main()
+            print(RUN.any(s -> s == "b"))
+            print(RUN.any(s -> s == "z"))
+            print(RUN.all(s -> s.len == 1))
+            print(RUN.find(s -> s > "a").unwrap())
+            print(RUN.find(s -> s == "z").is_none())
+            print(RUN.position(s -> s == "c").unwrap())
+            print(RUN.count_where(s -> s != "b"))
+            print(RUN.fold("", (acc, s) -> acc + s))
+            print(RUN.map(s -> s + "!")[2])
+            print(RUN.filter(s -> s != "a").len)
+            print(RUN.flat_map(s -> RUN.map(t -> s + t)).len)
+            RUN.each(s -> print(s))
+        """, "true\nfalse\ntrue\nb\ntrue\n2\n2\nabc\nc!\n2\n9\na\nb\nc\n")
+
+@test("a 'var' array answers what it holds now, after a write")
+asq_var_array_after_a_write()
+    asq_prints(raw"""
+        import sysl.seq.Sequence
+
+        main()
+            var v = [3, 1, 2]
+            v[0] = 5
+            print(v.fold(0, (a, n) -> a + n))
+            print(v.filter(n -> n > 1).len)
+            v[1] = 9
+            print(v.any(n -> n == 9))
+        """, "8\n2\ntrue\n")
+
+@test("an array field reached through a counted reference, and through a struct value")
+asq_array_field()
+    asq_prints(raw"""
+        import sysl.seq.Sequence
+
+        struct Box
+            xs: [4]int
+
+        main()
+            val b = &Box(xs = [1, 2, 3, 4])
+            print(b.xs.any(n -> n == 4))
+            print(b.xs.map(n -> n * 2)[3])
+            val v = Box(xs = [5, 6, 7, 8])
+            print(v.xs.count_where(n -> n > 5))
+        """, "true\n8\n3\n")
+
+@test("an array of arrays: each row is itself a sequence")
+asq_nested_arrays()
+    asq_prints(raw"""
+        import sysl.seq.Sequence
+
+        main()
+            val g = [[1, 2, 3], [4, 5, 6]]
+            print(g.map(row -> row.fold(0, (a, n) -> a + n))[1])
+            print(g.all(row -> row.any(n -> n > 2)))
+            print(g.find(row -> row[0] == 4).unwrap()[2])
+        """, "15\ntrue\n6\n")
+
+@test("a zero-length array answers as the empty sequence does")
+asq_zero_length()
+    asq_prints(raw"""
+        import sysl.seq.Sequence
+
+        main()
+            val e: [0]int = []
+            print(e.all(n -> n > 100))
+            print(e.any(n -> n > 100))
+            print(e.map(n -> n).len)
+            print(e.filter(n -> true).len)
+            print(e.flat_map(n -> e.map(m -> m)).len)
+            print(e.find(n -> true).is_none())
+            print(e.position(n -> true).is_none())
+            print(e.fold(7, (a, n) -> a + n))
+            e.each(n -> print(n))
+        """, "true\nfalse\n0\n0\n0\ntrue\ntrue\n7\n")
+
+@test("an array meets a bound 'S: Sequence[int]' as a slice and a buffer do")
+asq_generic_bound()
+    asq_prints(raw"""
+        import sysl.seq.Sequence
+        import sysl.buf.buf
+
+        big[S: Sequence[int]](s: S) -> usize = s.count_where(n -> n > 2)
+
+        main()
+            print(big([1, 2, 3, 4]))
+            print(big([5, 6]))
+            val xs = [1, 2, 3, 4, 5]
+            print(big(xs[..]))
+            var b = buf[int]()
+            b.push(9)
+            print(big(b))
+        """, "2\n2\n3\n1\n")
+
+@test("a const-generic array parameter calls the members at each length it is made real at")
+asq_const_generic()
+    asq_prints(raw"""
+        import sysl.seq.Sequence
+
+        over_one[const N: usize](xs: [N]int) -> usize = xs.count_where(n -> n > 1)
+
+        evens[const N: usize, T](xs: [N]T, keep: T -> bool) -> []T = xs.filter(keep)
+
+        main()
+            print(over_one([1, 2, 3]))
+            print(over_one([4, 5, 6, 7, 8]))
+            print(evens([1, 2, 3, 4], n -> n % 2 == 0).len)
+            print(evens(["a", "bb"], s -> s.len > 1)[0])
+        """, "2\n5\n2\nbb\n")
+
+@test("an array of counted references: each is shared, given back once, and dropped once")
+asq_counted_elements()
+    asq_prints(raw"""
+        import sysl.seq.Sequence
+
+        struct Res
+            id: int
+
+        impl Drop for Res
+            drop(self)
+                print(s"drop ${self.id}")
+
+        run()
+            val rs: [2]&Res = [Res(1), Res(2)]
+            val kept = rs.filter(r -> r.id > 1)
+            print(kept[0].id)
+            print(rs.map(r -> r.id * 10)[1])
+            print(rs.find(r -> r.id == 1).unwrap().id)
+            print(rs.any(r -> r.id == 2))
+            print("end")
+
+        main()
+            run()
+            print("after")
+        """, "2\n20\n1\ntrue\nend\ndrop 1\ndrop 2\nafter\n")
+
+@test("a '*self' member on a 'val' array is refused, as on any 'val'")
+asq_mutating_member_on_val_refused()
+    if !asq_ready() then return
+
+    val out = asq_ir(raw"""
+        trait Swap
+            swap_ends(*self)
+
+        impl[const N: usize, E] Swap for [N]E
+            swap_ends(*self)
+                val t = self[0]
+                self[0] = self[N - 1]
+                self[N - 1] = t
+
+        val RUN = [1, 2, 3]
+
+        main()
+            RUN.swap_ends()
+        """)
+
+    assert(out.contains("'swap_ends' takes '*self', so it writes through what it is called on, and " +
+                        "a 'val' is written once — write 'var' if it is meant to change"), out)
+
+@test("and on a local 'val' array the refusal names the binding, while a 'var' one is written")
+asq_mutating_member_on_local()
+    if !asq_ready() then return
+
+    val swap = raw"""
+        trait Swap
+            swap_ends(*self)
+
+        impl[const N: usize, E] Swap for [N]E
+            swap_ends(*self)
+                val t = self[0]
+                self[0] = self[N - 1]
+                self[N - 1] = t
+
+        """
+    val tail = "    xs.swap_ends()\n    print(xs[0])\n"
+    val out = asq_ir(swap + "main()\n    val xs = [6, 7]\n" + tail)
+
+    assert(out.contains("a 'val' is written once — write 'var xs' if it is meant to change"), out)
+    asq_prints(swap + "main()\n    var xs = [6, 7]\n" + tail, "7\n")
+
+// -- nothing is copied to make the call ---------------------------------------------------------------
+
+private asq_large() -> string = raw"""
+    import sysl.seq.Sequence
+
+    val BIG: [20]i64 = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
+
+    from_module(k: i64) -> bool = BIG.any(n -> n == k)
+
+    from_local(k: i64) -> bool
+        val xs: [20]i64 = [k, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
+        xs.any(n -> n == 3)
+
+    summed() -> i64 = BIG.fold(0, (a, n) -> a + n)
+
+    main()
+        print(from_module(3))
+        print(from_local(1))
+        print(summed())
+    """
+
+@test("a large module 'val' array crosses as its own address, and the member reads it there")
+asq_large_module_val_not_copied()
+    if !asq_ready() then return
+
+    val out = asq_ir(asq_large())
+    val caller = asq_body(out, "from_module")
+
+    assert(caller.contains("(ptr @BIG,"), caller)
+    assert(!caller.contains("load [20 x i64]"), caller)
+
+    val members = asq_array_members(out)
+
+    assert_eq(members.len(), 3)
+
+    for body in members
+        assert(lines_of(body).at(0).contains("ptr noalias readonly %self.param"), body)
+        assert(!body.contains("memcpy"), body)
+        assert(!body.contains("alloca [20 x i64]"), body)
+
+    asq_prints(asq_large(), "true\ntrue\n210\n")
+
+@test("a large local 'val' array is handed over in place too: the frame holds one copy, its own")
+asq_large_local_val_not_copied()
+    if !asq_ready() then return
+
+    val body = asq_body(asq_ir(asq_large()), "from_local")
+
+    assert_eq(asq_lines_with(body, "alloca [20 x i64]"), 1)
+    assert_eq(asq_lines_with(body, "i64 160, i1"), 0)
+    assert(body.contains("(ptr %xs.addr,"), body)
+
+@test("a view taken at a receiver whose member reads a '[]const T' lets a large parameter be read in place")
+asq_receiver_view_is_read_only()
+    if !asq_ready() then return
+
+    val out = asq_ir(raw"""
+        trait Total
+            total(self) -> i64
+
+        impl Total for []const i64
+            total(self) -> i64
+                var t: i64 = 0
+                for x in self
+                    t += x
+                t
+
+        whole(xs: [20]i64) -> i64 = xs[..].total()
+
+        part(xs: [20]i64) -> i64 = xs[2..<5].total()
+
+        main()
+            val a: [20]i64 = [1; 20]
+            print(whole(a))
+            print(part(a))
+        """)
+
+    for name in ["whole", "part"]
+        assert(asq_define(out, name).contains("ptr noalias readonly %xs.param"), asq_define(out, name))
+        assert(!asq_body(out, name).contains("memcpy"), asq_body(out, name))
+
+@test("a receiver view whose member writes through it is still writable, and the parameter copied in")
+asq_receiver_view_writable_member()
+    asq_prints(raw"""
+        trait Zero
+            zero(self)
+
+        impl Zero for []i64
+            zero(self)
+                for i in 0..<self.len
+                    self[i] = 0
+
+        cleared(xs: [20]i64) -> i64
+            var ys = xs
+            ys[..].zero()
+            ys[0] + ys[19]
+
+        main()
+            val a: [20]i64 = [4; 20]
+            print(cleared(a))
+            print(a[0])
+        """, "0\n4\n")
+
+// -- a read-only view is still the array it views ---------------------------------------------------
+
+private asq_escape(body: string) -> string = raw"""
+    trait Head
+        head(self) -> []const int
+
+    impl Head for []const int
+        head(self) -> []const int = self[0..<1]
+
+    pass(v: []const int) -> []const int = v
+
+    leak() -> []const int
+        var a = [7, 2, 3]
+        var s = a[..]
+    """ + body + raw"""
+
+    clobber(n: int) -> int
+        var junk = [n, n, n, n, n, n, n, n]
+        junk[0] + junk[7]
+
+    main()
+        val h = leak()
+        print(clobber(99))
+        print(h[0])
+    """
+
+@test("a local writable view returned through a '[]const T' receiver promotes the array it views")
+asq_escape_through_receiver()
+    if !asq_ready() then return
+
+    val program = asq_escape("    s.head()\n")
+    val body = asq_body(asq_ir(program), "leak")
+
+    assert(body.contains("%a.box"), body)
+    assert(!body.contains("%a.addr = alloca [3 x i32]"), body)
+    asq_prints(program, "198\n7\n")
+
+@test("and so does one returned through a '[]const T' argument")
+asq_escape_through_argument()
+    if !asq_ready() then return
+
+    val program = asq_escape("    pass(s)\n")
+    val body = asq_body(asq_ir(program), "leak")
+
+    assert(body.contains("%a.box"), body)
+    asq_prints(program, "198\n7\n")
+
+@test("and one bound to a '[]const T' local before it is returned")
+asq_escape_through_binding()
+    if !asq_ready() then return
+
+    val program = asq_escape("    val r: []const int = s\n    r\n")
+    val body = asq_body(asq_ir(program), "leak")
+
+    assert(body.contains("%a.box"), body)
+    asq_prints(program, "198\n7\n")
+
+// -- bare metal -------------------------------------------------------------------------------------
+
+@test("a module 'val' array's members build for a freestanding thumb archive, the array laid down as data")
+asq_bare_metal_module_val()
+    if !asq_ready() then return
+
+    val out = asq_archive(raw"""
+        import sysl.seq.Sequence
+
+        val RUN = [3, 5, 8, 13]
+
+        @export("probe")
+        probe() -> i32 = if RUN.any(n -> n == 8) then i32(RUN.count_where(n -> n > 4)) else 0
+        """)
+
+    assert(out.contains("define") && out.contains("@probe("), out)
+    assert(out.contains("@RUN = ") && out.contains("[4 x i32] [i32 3, i32 5, i32 8, i32 13]"), out)

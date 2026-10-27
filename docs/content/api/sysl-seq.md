@@ -56,7 +56,7 @@ would have to work its length out generically from bounds the trait says only ar
 
 ## Index
 
-[`generate`](#generate) [`Sequence`](#sequence) [Sequence for []const E](#sequence-for-const-e) [Sequence for Buf[E]](#sequence-for-bufe) [Sequence for Range[E]](#sequence-for-rangee)
+[`generate`](#generate) [`Sequence`](#sequence) [Sequence for []const E](#sequence-for-const-e) [Sequence for [N]E](#sequence-for-ne) [Sequence for Buf[E]](#sequence-for-bufe) [Sequence for Range[E]](#sequence-for-rangee)
 
 ## Functions
 
@@ -128,6 +128,26 @@ matters: `Buf`'s below is this one reached through `view`.
 `reference/arrays.md § []const T — a view that may not be written` says a `[]T` is accepted wherever a
 `[]const T` is wanted, so a mutable slice finds these members and a read-only one is not given a
 member that could write through it. Nothing here writes.
+
+### Sequence for [N]E
+
+```sysl
+impl[const N: usize, E] Sequence[E] for [N]E
+```
+
+An array, at every length, answers every one of these as its whole-array slice does: `[..]` hands
+the elements over as a view of the array's own storage, so the seven that answer a value are a
+delegation rather than a second copy of each loop -- the shape `Eq`, `Display` and `Join` for `[N]T`
+already have.
+
+**Nothing is copied to make the call.** An array past the indirect boundary crosses as the address
+of its caller's storage, and a member that only reads it -- which is every member here -- reads it
+where it lies, so `RUN.any(p)` on a module `val` walks `RUN` itself.
+
+**The three that answer a slice build it here instead.** A slice handed back from a call that was
+given a view of `self` may, for all the caller can see, be that view -- and `self` is storage the
+caller lent, which no promotion can move. So `map`, `filter` and `flat_map` fill a buffer of their
+own straight from the elements, and what they return was never a view of the array.
 
 ### Sequence for Buf[E]
 

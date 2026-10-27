@@ -575,7 +575,9 @@ a range with an open end is only allowed in a slice index
 
 Because a range is a value, it implements [`Sequence`](/library/seq/), so `(0..<n).map(f)` works as
 written. Nothing is materialized to answer a question about one, so `(0..<1_000_000).any(p)` costs
-the predicate calls and no storage.
+the predicate calls and no storage. An array is a `Sequence` too, at every length, so a question
+asked of a table needs no `[..]` first: `RUNS.any(p)` on a `val RUNS = [...]`
+([arrays](/reference/arrays/#asking-one-a-question)).
 
 ## `is` — a pattern where a condition is wanted
 
