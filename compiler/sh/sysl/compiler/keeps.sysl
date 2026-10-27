@@ -92,6 +92,10 @@ struct KeepsCx
     busy: Buf[string]
     taint: bool
 
+    // How many answers were read while their own question was still being worked out, by the walk
+    // under way rather than by any question it worked out on the way (`round_handles`).
+    busy_reads: int
+
     // The bodies a call may reach with no body visible to the caller, so whose parameters are borrowed
     // by rule: the methods a trait object dispatches to, by the trait's key, and the functions whose
     // address is taken.
@@ -112,6 +116,11 @@ struct KeepsCx
     // What each body's locals point into (`keeps_flow.sysl`'s `origins_of`), by function, for the
     // round under way.
     origins: Map[string, &Origins]
+
+    // Where each body binds its thread handles (`keeps_join.sysl`'s `handles_of`), by function, for
+    // the round under way, with whether gathering them leaned on this round's answers -- only those
+    // every later gathering in the round would find again (`round_handles`).
+    handles: Map[string, (&Handles, bool)]
 
     // Every table the program reaches, which is every body a call through an object may land in.
     vtables: Buf[TVtable]
@@ -142,8 +151,9 @@ check_keeps(a: &Analysis, funcs: Buf[TFunc], vtables: Buf[TVtable])
     for i in 0..<funcs.len()
         if !index.has(funcs.at(i).name) then index.put(funcs.at(i).name, i)
 
-    val cx: &KeepsCx = KeepsCx(a, funcs, index, map(), map(), map(), buf(), buf(), false, map(), map(),
-                               buf(), map(), buf(), map(), map(), vtables, cast_graph_new(), map())
+    val cx: &KeepsCx = KeepsCx(a, funcs, index, map(), map(), map(), buf(), buf(), false, 0, map(),
+                               map(), buf(), map(), buf(), map(), map(), map(), vtables, cast_graph_new(),
+                               map())
 
     for i in 0..<a.tables.extern_vars.len()
         cx.c_vars.push(extern_var_symbol(a.tables.extern_vars.at(i)))
@@ -191,17 +201,25 @@ check_keeps(a: &Analysis, funcs: Buf[TFunc], vtables: Buf[TVtable])
 
         warm_callees_first(cx)
 
-        for f in funcs
-            check_calls(cx, faults, f)
-            refuse_promised(cx, faults, f)
-            refuse_spread(cx, faults, f)
-
         rounds += 1
 
         // A clear assumed of a recursive callee narrows as the keeps it undoes grow, so the rounds
         // are not monotone in both at once; a program that has not settled by now is one whose
         // answers swing between two, and the last round's is as good as either.
-        if settled_round(cx) || rounds >= 12 then break
+        //
+        // **Only the last round's calls are held to the rule**, since only its refusals are told.
+        // Every question was asked by the warming, so holding the calls reads answers and changes
+        // none of them: a round that is not the last would have made refusals and thrown them away.
+        if round_settled(cx) || rounds >= 12
+            for f in funcs
+                check_calls(cx, faults, f)
+                refuse_promised(cx, faults, f)
+                refuse_spread(cx, faults, f)
+
+            break
+        end if
+
+        next_round(cx)
 
     var said: Buf[Span] = buf()
 
@@ -362,24 +380,25 @@ private pointer_keeps(cx: &KeepsCx, callee: TExpr, j: usize) -> Buf[(string, Kep
 end pointer_keeps
 
 // Whether the round just made is the last: every answer that leaned on an assumption came out as it
-// was assumed. Otherwise the next round assumes what this one found.
-private settled_round(cx: &KeepsCx) -> bool
-    var same = true
-
+// was assumed.
+private round_settled(cx: &KeepsCx) -> bool
     for key in cx.assumed
         val now = cx.round.get(key).unwrap_or(assumed_answer(key)).sig()
         val was = cx.prev.get(key).unwrap_or(assumed_answer(key)).sig()
 
-        if now != was then same = false
+        if now != was then return false
 
-    if same then return true
+    true
+end round_settled
 
+// The next round assumes what this one found, and works out everything that leaned afresh.
+private next_round(cx: &KeepsCx)
     cx.prev = cx.round
     cx.round = map()
     cx.assumed = buf()
     cx.origins = map()
-    false
-end settled_round
+    cx.handles = map()
+end next_round
 
 // **Every body's questions are asked callees first**, so that answering one never nests a walk per
 // call down a chain as long as the program: a body is asked after every body it calls has been, and
@@ -503,6 +522,7 @@ private summary(cx: &KeepsCx, name: string, i: usize, q: string) -> KeptWhy
 
     if holds_string(cx.busy, key)
         cx.taint = true
+        cx.busy_reads += 1
         return cx.prev.get(key).unwrap_or(assumed_answer(key))
     end if
 
@@ -541,6 +561,7 @@ private summary(cx: &KeepsCx, name: string, i: usize, q: string) -> KeptWhy
     cx.busy.push(key)
 
     val outer = cx.taint
+    val reads = cx.busy_reads
 
     cx.taint = false
 
@@ -551,6 +572,7 @@ private summary(cx: &KeepsCx, name: string, i: usize, q: string) -> KeptWhy
 
     val leaned = cx.taint
 
+    cx.busy_reads = reads
     cx.busy.truncate(cx.busy.len() - 1)
 
     if leaned
@@ -781,13 +803,52 @@ end Track
 private track(cx: &KeepsCx, f: TFunc, i: usize, raw: bool) -> &Track
     val org = origins_of(cx, f)
     val t: &Track = Track(cx, func_home(cx.an, f.name), buf(), buf(), false, not_kept(), org, raw, false,
-                          handles_of(org, f), f)
+                          round_handles(cx, org, f), f)
 
     if i < f.params.len() then t.held.push(f.params.at(i).0)
 
     track_locals(t, f.body)
     t
 end track
+
+// Where `f` binds its thread handles, gathered once a round rather than once a question.
+//
+// **A gathering is kept only if it read no answer whose question was still being worked out.** Every
+// other answer it read is in the memo for the rest of the round -- settled, this round's, or worked
+// out on the way and filed -- so a later gathering would read the same answers and find exactly the
+// same handles. An answer read while its own question was open is the last round's guess, which a
+// later gathering would read as this round's instead: that gathering is made afresh each time, as
+// every question did before. A kept one that leaned on this round's answers marks each question it
+// serves as leaning, as gathering it afresh would have.
+//
+// Each walk gets a `Handles` of its own around what was gathered, since a walk marks on it the
+// statement it is saying (`at`, `why`), and a walk of a recursive body asks its own questions in the
+// middle of one of its statements.
+private round_handles(cx: &KeepsCx, org: &Origins, f: TFunc) -> &Handles
+    cx.handles.get(f.name) match
+        Some(kept) ->
+            if kept.1 then cx.taint = true
+
+            return handles_copy(kept.0)
+        None -> ()
+
+    val outer = cx.taint
+    val reads = cx.busy_reads
+
+    cx.taint = false
+
+    val hs = handles_of(org, f)
+    val leaned = cx.taint
+
+    if cx.busy_reads == reads then cx.handles.put(f.name, (handles_copy(hs), leaned))
+
+    cx.taint = outer || leaned
+    hs
+end round_handles
+
+private handles_copy(hs: &Handles) -> &Handles =
+    Handles(hs.org, hs.sources, hs.chained, hs.answers, hs.scrutinized, hs.at, hs.why, hs.fan_at,
+            hs.fan_whys, hs.fan_hooks)
 
 // Whether `f` lets its parameter at `i` outlive the call, where, and every location it may still be
 // held at when the call returns.
@@ -1551,7 +1612,7 @@ private check_calls(cx: &KeepsCx, faults: &KeepFaults, f: TFunc)
 
     val org = origins_of(cx, f)
     val ft: &FrameTrack = FrameTrack(cx, faults, func_home(cx.an, f.name), shown_name(cx.an, f.name),
-                                     f.params, buf(), buf(), false, org, handles_of(org, f), f, buf())
+                                     f.params, buf(), buf(), false, org, round_handles(cx, org, f), f, buf())
 
     walk_block_stmts(f.body, stmt_walk(false, s -> s match
         TRefDecl(n, _, place) -> ft.refs.push((n, place))
