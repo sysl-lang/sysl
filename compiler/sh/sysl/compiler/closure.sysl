@@ -332,9 +332,10 @@ private refuse_pinned_captures(cx: &Analyzer, span: Span, captured: Buf[string])
 end refuse_pinned_captures
 
 // Builds the struct, the implementation and the body of one closure, and yields the struct value
-// that *is* the closure -- its captures, in the order the fields hold them.
+// that *is* the closure -- its captures, in the order the fields hold them. `named` is the function a
+// program passed where the closure stands for one, and empty for a closure literal.
 lower_closure(cx: &Analyzer, span: Span, names: Buf[string], ptypes: Buf[Type],
-              result: Option[Type], body: Buf[Stmt]) -> TExpr
+              result: Option[Type], body: Buf[Stmt], named: string = "") -> TExpr
     val captured = captures(cx, body, names)
 
     if refuse_ref_captures(cx, span, captured) then return bad_expr(span)
@@ -355,7 +356,7 @@ lower_closure(cx: &Analyzer, span: Span, names: Buf[string], ptypes: Buf[Type],
     cx.an.tables.struct_insts.put(base, Struct(st))
 
     val fname = s"$base.call"
-    val lowered = closure_body(cx, span, st, fname, names, ptypes, result, captured, body)
+    val lowered = closure_body(cx, span, st, fname, names, ptypes, result, captured, body, named)
 
     cx.an.tables.members.func_insts.put(fname, FuncSig(lowered.params, lowered.ret_ty))
     cx.an.closure_funcs.push(lowered)
@@ -424,7 +425,7 @@ private reaches_self(place: TExpr) -> bool = *place.kind match
 // closure has no name a reader wrote.
 private closure_body(cx: &Analyzer, span: Span, st: &StructType, fname: string,
                      names: Buf[string], ptypes: Buf[Type], result: Option[Type],
-                     captured: Buf[string], body: Buf[Stmt]) -> TFunc
+                     captured: Buf[string], body: Buf[Stmt], named: string) -> TFunc
     val inner = analyzer_for(cx.an, cx.scope)
 
     inner.subst = cx.subst
@@ -520,7 +521,7 @@ private closure_body(cx: &Analyzer, span: Span, st: &StructType, fname: string,
 
     if result.is_some() && !open && result.unwrap() != Unit && block.result.is_some() &&
        disagree(block.ty, result.unwrap()) then
-        inner.fault(span, closure_disagreement(result.unwrap(), block.ty))
+        inner.fault(span, closure_disagreement(result.unwrap(), block.ty, named))
 
     // **Internal, always.** Nothing outside this compilation can name a closure, so the symbol has
     // no reason to leave the object file -- and leaving it there is what a per-compilation counter
@@ -536,8 +537,11 @@ end closure_body
 
 // A body yielding something other than the result its closure -- or nested function -- promised,
 // in the reference's words. It is said where the closure was written, not at the body's last line.
-closure_disagreement(want: Type, got: Type) -> string =
-    s"this closure should yield ${type_show(want)}, but its body yields ${type_show(got)}"
+// A named function passed as a callable is a closure only underneath, so it is called what the
+// program wrote: a function, by its name, whose result -- not a body anyone sees -- is the mismatch.
+closure_disagreement(want: Type, got: Type, named: string = "") -> string =
+    if named != "" then s"the function '$named' should yield ${type_show(want)} here, but it yields ${type_show(got)}"
+    else s"this closure should yield ${type_show(want)}, but its body yields ${type_show(got)}"
 
 // Who declared a body written inside another: whatever declared the body it is written in, or --
 // outside any body, in a module `val`'s initializer -- the module being read.
@@ -614,7 +618,7 @@ function_as_callable(cx: &Analyzer, span: Span, written: string, ptypes: Buf[Typ
     var body: Buf[Stmt] = buf()
 
     body.push(stmt(span, ExprStmt(expr(span, Call(expr(span, Ident(written)), args)))))
-    lower_closure(cx, span, names, ptypes, result, body)
+    lower_closure(cx, span, names, ptypes, result, body, written)
 end function_as_callable
 
 // -- what a body reads from around it ------------------------------------------------------------
