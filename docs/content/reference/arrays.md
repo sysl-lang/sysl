@@ -114,6 +114,26 @@ var bytes = [1u8, 1_000_000_000_000]
 the literal 1000000000000 does not fit byte
 ```
 
+**Tuple elements meet part by part**, each part by the same rule, however deeply they nest: a bare
+literal part takes the type of the part at its place in another element, so the `0`s below are
+`long`s and the list is a `[3](long, int)`. A tuple written out of bare literals alone takes the
+type of a tuple beside it whole, in an array literal, as an operand, and as an argument for a generic
+parameter.
+
+```sysl
+val spots = [(0, 0), (1i64 << 40, 2), (-1, 7)]
+val wide: [3](long, int) = spots
+
+print(wide[1].0, wide[2].0 + wide[2].1)
+```
+
+```output
+1099511627776 6
+```
+
+Two typed parts that do not meet are refused as two typed elements are, and the message names both
+tuples — `[(u, 0), (n, 0)]` over a `u32` and an `int` is told it got `(uint, int)` and `(int, int)`.
+
 **A declaration with no initializer** starts at the type's zero value. **A repeat** `[value; count]`
 fills every element with one value, and is the form for an element type whose zero is not the wanted
 starting point — or which has no zero at all:
