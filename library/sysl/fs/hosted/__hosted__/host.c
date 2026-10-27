@@ -40,10 +40,18 @@ int sysl_fs_host_open(const char *path, unsigned flags, unsigned mode) {
     return open(path, how, (mode_t) mode);
 }
 
-// The three calls that take or answer an `off_t`, whose width is the platform's: 64 bits on every
+// The five calls that take or answer an `off_t`, whose width is the platform's: 64 bits on every
 // 64-bit host and on wasm32, 32 on a 32-bit Linux. The sysl side always speaks 64.
 long long sysl_fs_host_lseek(int fd, long long offset, int whence) {
     return (long long) lseek(fd, (off_t) offset, whence);
+}
+
+long long sysl_fs_host_pread(int fd, void *into, size_t room, long long offset) {
+    return (long long) pread(fd, into, room, (off_t) offset);
+}
+
+long long sysl_fs_host_pwrite(int fd, const void *from, size_t len, long long offset) {
+    return (long long) pwrite(fd, from, len, (off_t) offset);
 }
 
 int sysl_fs_host_ftruncate(int fd, long long length) {

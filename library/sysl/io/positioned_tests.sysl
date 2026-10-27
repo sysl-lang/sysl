@@ -1,0 +1,269 @@
+module sysl.io
+@tests
+
+// What the positioned surface promises, over the two stores in memory and over a store of a test's
+// own with an error of its own -- which is the case the associated `Error` exists for.
+
+// -- the stores over memory --------------------------------------------------------------------------
+
+private abc() -> []const u8 = [u8('a'), u8('b'), u8('c'), u8('d'), u8('e')]
+
+@test("pio bytes_at reads at an offset and reports its extent")
+pio_bytes_read_at()
+    var s = bytes_at(abc())
+    var into: [3]u8 = [0; 3]
+
+    val got = s.read_at(1, into).unwrap()
+
+    assert_eq(got.len, 3)
+    assert_eq(got[0], u8('b'))
+    assert_eq(got[2], u8('d'))
+    assert_eq(s.extent().unwrap(), 5u64)
+
+@test("pio a read running into the end answers the bytes that are there")
+pio_read_into_end()
+    var s = bytes_at(abc())
+    var into: [4]u8 = [0; 4]
+
+    val got = s.read_at(3, into).unwrap()
+
+    assert_eq(got.len, 2)
+    assert_eq(got[1], u8('e'))
+
+@test("pio a read at or past the end is empty rather than an error")
+pio_read_past_end()
+    var s = bytes_at(abc())
+    var into: [4]u8 = [0; 4]
+
+    assert_eq(s.read_at(5, into).unwrap().len, 0)
+    assert_eq(s.read_at(6, into).unwrap().len, 0)
+    assert_eq(s.read_at(u64::Max, into).unwrap().len, 0)
+
+@test("pio a zero-length read answers empty anywhere")
+pio_read_zero_length()
+    var s = bytes_at(abc())
+    var into: [1]u8 = [0; 1]
+
+    assert_eq(s.read_at(0, into[0..<0]).unwrap().len, 0)
+    assert_eq(s.read_at(99, into[0..<0]).unwrap().len, 0)
+
+@test("pio bytes_at_most answers short, and read_exact_at loops it to completion")
+pio_read_exact_loops()
+    var s = bytes_at_most(abc(), 2)
+    var into: [4]u8 = [0; 4]
+
+    assert_eq(s.read_at(0, into).unwrap().len, 2)
+
+    val got = read_exact_at(&s, 1, into).unwrap()
+
+    assert_eq(got.len, 4)
+    assert_eq(got[0], u8('b'))
+    assert_eq(got[3], u8('e'))
+
+@test("pio read_exact_at stops at the end and hands back the prefix it filled")
+pio_read_exact_short()
+    var s = bytes_at_most(abc(), 1)
+    var into: [8]u8 = [0; 8]
+
+    val got = read_exact_at(&s, 2, into).unwrap()
+
+    assert_eq(got.len, 3)
+    assert_eq(got[2], u8('e'))
+    assert_eq(read_exact_at(&s, 5, into).unwrap().len, 0)
+
+@test("pio read_exact_at of nothing asks for nothing")
+pio_read_exact_empty()
+    var s = bytes_at(abc())
+    var into: [1]u8 = [0; 1]
+
+    assert_eq(read_exact_at(&s, 0, into[0..<0]).unwrap().len, 0)
+
+@test("pio slice_at writes in place and reads back what it wrote")
+pio_slice_write_read()
+    var store: [6]u8 = [0; 6]
+    var s = slice_at(store)
+
+    assert_eq(s.write_at(2, [u8('x'), u8('y')]).unwrap(), 2)
+    assert_eq(store[2], u8('x'))
+    assert_eq(store[3], u8('y'))
+    assert_eq(store[1], 0u8)
+
+    var into: [2]u8 = [0; 2]
+
+    assert_eq(s.read_at(3, into).unwrap()[0], u8('y'))
+    assert_eq(s.extent().unwrap(), 6u64)
+    assert(s.sync().is_ok())
+
+@test("pio a write running into the end is cut short there")
+pio_write_cut_short()
+    var store: [4]u8 = [0; 4]
+    var s = slice_at(store)
+
+    assert_eq(s.write_at(2, abc()).unwrap(), 2)
+    assert_eq(store[3], u8('b'))
+
+@test("pio a write at or past the end is NoRoom")
+pio_write_no_room()
+    var store: [4]u8 = [0; 4]
+    var s = slice_at(store)
+
+    assert(s.write_at(4, abc()) == Err(NoRoom))
+    assert(s.write_at(u64::Max, abc()) == Err(NoRoom))
+
+@test("pio an empty write takes nothing anywhere, even past the end")
+pio_write_empty()
+    var store: [4]u8 = [0; 4]
+    var s = slice_at(store)
+
+    assert_eq(s.write_at(1, []).unwrap(), 0)
+    assert_eq(s.write_at(9, []).unwrap(), 0)
+
+@test("pio write_all_at loops a store that takes a little at a time")
+pio_write_all_loops()
+    var store: [8]u8 = [0; 8]
+    var s = slice_at_most(store, 2)
+
+    assert_eq(s.write_at(0, abc()).unwrap(), 2)
+    assert(write_all_at(&s, 3, abc()).is_ok())
+    assert_eq(store[3], u8('a'))
+    assert_eq(store[7], u8('e'))
+
+@test("pio write_all_at hands back the store's error where the write runs out of room")
+pio_write_all_no_room()
+    var store: [4]u8 = [0; 4]
+    var s = slice_at_most(store, 1)
+
+    assert(write_all_at(&s, 2, abc()) == Err(NoRoom))
+    // What fitted before the refusal was written.
+    assert_eq(store[3], u8('b'))
+
+@test("pio write_all_at of nothing writes nothing, even past the end")
+pio_write_all_empty()
+    var store: [2]u8 = [0; 2]
+    var s = slice_at(store)
+
+    assert(write_all_at(&s, 7, []).is_ok())
+
+// -- a store with an error of its own ---------------------------------------------------------------
+
+private enum DiskError derives Eq
+    Bad(at: u64)
+    Unsynced
+
+// A store that fails at one offset, takes one byte per write, and refuses to sync until told.
+private struct Disk
+    cells: [8]u8
+    bad: u64
+    synced: bool
+
+impl Positioned for Disk
+    type Error = DiskError
+
+    extent(*self) -> Result[u64, DiskError] = Ok(8)
+
+impl ReadAt for Disk
+    read_at(*self, offset: u64, into: []u8) -> Result[[]const u8, DiskError]
+        if offset == self.bad then return Err(Bad(offset))
+        if offset >= 8 || into.len == 0 then return Ok(into[0..<0])
+
+        into[0] = self.cells[usize(offset)]
+        Ok(into[0..<1])
+
+impl WriteAt for Disk
+    write_at(*self, offset: u64, bytes: []const u8) -> Result[usize, DiskError]
+        if offset == self.bad then return Err(Bad(offset))
+        if bytes.len == 0 then return Ok(0)
+
+        self.cells[usize(offset)] = bytes[0]
+        Ok(1)
+
+    override sync(*self) -> Result[unit, DiskError] = if self.synced then Ok(()) else Err(Unsynced)
+
+private disk(bad: u64) -> Disk = Disk([0; 8], bad, false)
+
+// Generic over the store, so the error that comes back is whichever one the store declared.
+private first_two[S: ReadAt](s: *S) -> Result[u16, S::Error]
+    var b: [2]u8 = [0; 2]
+    val got = read_exact_at(s, 0, b)?
+
+    Ok(if got.len < 2 then 0 else u16(got[0]) | (u16(got[1]) << 8))
+end first_two
+
+@test("pio a generic function over ReadAt answers each store's own error type")
+pio_generic_own_error()
+    var d = disk(9)
+
+    d.cells[0] = 1
+    d.cells[1] = 2
+
+    assert_eq(first_two(&d).unwrap(), 0x0201u16)
+
+    var m = bytes_at([7, 1])
+
+    assert_eq(first_two(&m).unwrap(), 0x0107u16)
+
+@test("pio a failure part way through read_exact_at is the store's error, unchanged")
+pio_read_exact_error()
+    var d = disk(1)
+    var into: [4]u8 = [0; 4]
+
+    read_exact_at(&d, 0, into) match
+        Ok(_) -> assert(false, "a read through a bad offset answered")
+        Err(e) -> assert(e == Bad(1))
+
+    assert(first_two(&d) == Err(Bad(1)))
+
+@test("pio a failure part way through write_all_at is the store's error, unchanged")
+pio_write_all_error()
+    var d = disk(5)
+
+    assert(write_all_at(&d, 3, abc()) == Err(Bad(5)))
+    assert_eq(d.cells[4], u8('b'))
+
+@test("pio sync answers the store's own override")
+pio_sync_override()
+    var d = disk(9)
+
+    assert(d.sync() == Err(Unsynced))
+    d.synced = true
+    assert(d.sync().is_ok())
+
+// One that wants its own error back through `?` fixes it with a pointer object rather than a bound.
+private head(s: *ReadAt[Error = DiskError]) -> Result[u8, DiskError]
+    var b: [1]u8 = [0; 1]
+    val got = s.read_at(0, b)?
+
+    Ok(if got.len == 0 then 0 else got[0])
+end head
+
+@test("pio a *ReadAt object that fixes the error keeps it")
+pio_object_fixes_error()
+    var d = disk(9)
+
+    d.cells[0] = 42
+    assert(head(&d) == Ok(42u8))
+
+    var bad = disk(0)
+
+    assert(head(&bad) == Err(Bad(0)))
+
+// A store breaking the contract: it takes nothing and says nothing went wrong.
+private struct Stuck
+    n: int
+
+impl Positioned for Stuck
+    type Error = MemoryError
+
+    extent(*self) -> Result[u64, MemoryError] = Ok(0)
+
+impl WriteAt for Stuck
+    write_at(*self, offset: u64, bytes: []const u8) -> Result[usize, MemoryError] = Ok(0)
+
+@test("pio write_all_at stops the program over a store that takes nothing and reports nothing",
+      should_trap: "a WriteAt took nothing and reported no error")
+pio_write_all_stuck()
+    var s = Stuck(0)
+
+    val r = write_all_at(&s, 0, abc())
+
+    assert(r.is_ok())

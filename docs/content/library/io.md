@@ -1,6 +1,6 @@
 ---
 title: The io module
-summary: "`sysl.io` — `Reader`, the one trait input travels through; `FdReader` and `stdin()`; and `lines()`, the cursor that borrows what it reads from."
+summary: "`sysl.io` — `Reader`, the one trait input travels through; `FdReader` and `stdin()`; `lines()`, the cursor that borrows what it reads from; and `ReadAt`/`WriteAt`, reading and writing at an offset."
 weight: 40
 ---
 
@@ -41,9 +41,30 @@ struct Lines
 lines(r: *Reader) -> Lines
 console_lines(r: *Reader) -> Lines
 lines_ending(r: *Reader, ending: LineEnding) -> Lines
+
+trait Positioned
+    type Error
+    extent(*self) -> Result[u64, Self::Error]
+
+trait ReadAt: Positioned
+    read_at(*self, offset: u64, into: []u8) -> Result[[]const u8, Self::Error]
+
+trait WriteAt: Positioned
+    write_at(*self, offset: u64, bytes: []const u8) -> Result[usize, Self::Error]
+    sync(*self) -> Result[unit, Self::Error] = Ok(())
+
+read_exact_at[S: ReadAt](s: *S, offset: u64, into: []u8) -> Result[[]const u8, S::Error]
+write_all_at[S: WriteAt](s: *S, offset: u64, bytes: []const u8) -> Result[unit, S::Error]
+
+bytes_at(b: []const u8) -> BytesAt
+bytes_at_most(b: []const u8, most: usize) -> BytesAt
+slice_at(b: []u8) -> SliceAt
+slice_at_most(b: []u8, most: usize) -> SliceAt
+enum MemoryError
+    NoRoom
 ```
 
-That is the whole module. Its shape is [`Writer`](/library/core/) turned around, deliberately: one
+That is the whole module; the second half is reading and writing at an offset, below. Its shape is [`Writer`](/library/core/) turned around, deliberately: one
 method on bytes, a latch rather than a `Result`, and `*self` on both so a source can be stateful and
 still object-safe for a raw trait object — which is what lets a reader need no allocator.
 
@@ -500,6 +521,70 @@ of input straddles two reads — the two bytes of a `\r\n`, an escape sequence, 
 of one character. Those are exactly the cases a hand-rolled reader gets wrong, and a reader that
 always empties itself in one go can never produce them. It is also what a slow source honestly looks
 like: a serial port hands over what has arrived, not what was asked for.
+
+## Reading and writing at an offset — `ReadAt` and `WriteAt`
+
+A `Reader` is a stream: it has one position, and every read moves it. A binary format, a filesystem
+and a block device want something else — **N bytes at offset X**, every time. A WAV header is patched
+after the samples are written, a FAT volume reads one cluster at a time, a littlefs block is written
+wherever the allocator put it. These two traits are that surface, the shape of Go's `io.ReaderAt` and
+`io.WriterAt`, so a store written once — a file, a flash partition, a slice of memory — serves every
+library written against them, and none of those libraries defines a private adapter of its own.
+
+```sysl
+import sysl.io.{ReadAt, read_exact_at, write_all_at, slice_at_most}
+
+// A little-endian u32 at an offset, from any store at all.
+le32[S: ReadAt](s: *S, at: u64) -> Result[u32, S::Error]
+    var b: [4]u8 = [0; 4]
+    val got = read_exact_at(s, at, b)?
+
+    if got.len < 4 then return Ok(0)
+    Ok(u32(b[0]) | (u32(b[1]) << 8) | (u32(b[2]) << 16) | (u32(b[3]) << 24))
+
+main()
+    var storage: [16]u8 = [0; 16]
+    // At most three bytes per call, as a device reading a little at a time does.
+    var disk = slice_at_most(storage, 3)
+
+    write_all_at(&disk, 4, [0x78, 0x56, 0x34, 0x12]).unwrap()
+    print(le32(&disk, 4).unwrap() == 0x12345678)
+    print(disk.write_at(16, [1]))
+```
+
+```output
+true
+Err(MemoryError.NoRoom)
+```
+
+**`read_at` hands back the prefix of `into` it filled**, as `read` does, and may answer short whenever
+it likes; an **empty** answer to a non-empty request means the offset is at or past the end, which is
+not an error — it is how a caller finds the end. `read_exact_at` is the loop round a short answer:
+it reads until `into` is full or the store ends, and the caller compares `got.len` with what it asked
+for, exactly as with `read_exact`. **`write_at` answers how many bytes it took**, and may take fewer
+than it was given, but a store that can take nothing answers an error rather than `Ok(0)`;
+`write_all_at` loops the short writes, and stops the program if a store breaks that contract, since
+there is no error of the store's own it could make up. `sync` makes what was written durable; its
+default says there is nothing to do, which is true of memory.
+
+**The error is an associated type, so each store keeps its own.** A file reports an
+[`IoError`](/library/fs/), the two stores over memory a `MemoryError`, and a codec's own store the
+codec's error; a generic function bounded on `ReadAt` hands `S::Error` back unchanged. A bound cannot
+fix an associated type ([`reference/traits.md`](/reference/traits/#an-object-may-fix-the-associated-type)),
+so a function that wants a particular error back through `?` takes a pointer object that fixes it —
+`s: *ReadAt[Error = MyError]` — which allocates nothing.
+
+**`Positioned` is the part the two directions share**, for the reason `Fallible` is: an associated
+type is named off the type rather than the trait, so a type may implement only one trait declaring an
+`Error`, and a file is both read and written at offsets. `extent` is how many bytes the store holds.
+It is not called `size` because `File` already has a `size` of its own, answering a `long`, and a
+trait member may not share a name with an inherent one.
+
+`bytes_at` is a read-only store over bytes in hand; `slice_at` reads and writes storage the caller
+owns, cuts a write short at its end and answers `NoRoom` to one starting there. Their `_at_most`
+twins handle at most `n` bytes per call, which is what tests a caller's loop. **Nothing here allocates
+or needs an operating system**: the traits, the helpers and both memory stores build for a bare-metal
+target. A [`File`](/library/fs/) is a positioned store on a host.
 
 ## `FdReader` and `stdin`
 
