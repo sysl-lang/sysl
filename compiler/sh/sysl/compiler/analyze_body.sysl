@@ -661,9 +661,11 @@ analyze_body(a: &Analysis, scope: Scope, span: Span, d: FuncDecl, key: string = 
     val body = typed_body(cx, d, rest, ret)
 
     // **Anchored at the declaration, not at the statement that yields**, as the reference anchors it:
-    // the mistake is the signature and the body disagreeing, and the signature is where it is read.
+    // the mistake is the signature and the body disagreeing, and the signature is where it is read --
+    // unless the body is an `if` of literals one of which disagrees with the rest (`misfit_literal`).
     if ret != Unit && body.result.is_some() && disagree(body.ty, ret) then
-        cx.fault(span, body_disagreement(name, ret, body.ty, cx.ret_is_list))
+        cx.fault(misfit_literal(body.result.unwrap(), ret).map(l -> l.span).unwrap_or(span),
+                 body_disagreement(name, ret, body.ty, cx.ret_is_list))
 
     a.tables.homes.put(name, scope)
 
@@ -1198,7 +1200,8 @@ analyze_instance_in(a: &Analysis, cx: &Analyzer, name: string, d: FuncDecl) -> T
     val span = body_span(rest, span_zero())
 
     if ret != Unit && body.result.is_some() && disagree(body.ty, ret) then
-        cx.fault(span, body_disagreement(declared_key(a, cx.scope, d), ret, body.ty, cx.ret_is_list))
+        cx.fault(misfit_literal(body.result.unwrap(), ret).map(l -> l.span).unwrap_or(span),
+                 body_disagreement(declared_key(a, cx.scope, d), ret, body.ty, cx.ret_is_list))
 
     // **An instantiation whose name carries a closure's is internal on the same ground the closure
     // itself is.** `sysl.time$resolve.$closure4` is a symbol only the unit that lowered that closure
@@ -1831,7 +1834,8 @@ private module_storage(a: &Analysis) -> Buf[TVal]
                     val what = if is_held_whole(d.name) then "the parts of this binding" else s"'${d.name}'"
 
                     if disagree(got, ty) then
-                        cx.fault(d.span, s"cannot initialize $what: declared ${type_show(ty)} but " +
+                        cx.fault(misfit_literal(init.unwrap(), ty).map(l -> l.span).unwrap_or(d.span),
+                                 s"cannot initialize $what: declared ${type_show(ty)} but " +
                                  s"the value is ${type_show(got)}${await_hint(got, ty)}")
 
                     refuse_storage_slots(cx, init.unwrap())

@@ -284,6 +284,11 @@ callable_signature(a: &Analysis, t: Type) -> Option[(Buf[Type], Option[Type])]
     Some((parts.unwrap().0, if ret == Unknown then None else Some(ret)))
 end callable_signature
 
+// Whether a closure's asked-for result is a slice whose element nothing has said yet.
+private slice_of_something(t: Type) -> bool = t match
+    Slice(e, _) -> *e == Unknown
+    _ -> false
+
 // Refuses a capture of a `ref`, which is the one construct that would carry one out of its block,
 // and answers whether it did.
 //
@@ -504,10 +509,16 @@ private closure_body(cx: &Analyzer, span: Span, st: &StructType, fname: string,
 
     var ret = Unit
 
-    if result.is_some() then ret = result.unwrap()
+    // **A result asked for as "a slice of something" is told of what by the body** -- the reading
+    // a generic call makes of `n -> if c then [n] else [n, n, n]` at `f: T -> []U` before `U` is
+    // settled, where the branches meet only at the slice.
+    val open = result.is_some() && slice_of_something(result.unwrap())
+
+    if open && block.result.is_some() then ret = block.ty
+    else if result.is_some() then ret = result.unwrap()
     else if block.result.is_some() then ret = block.ty
 
-    if result.is_some() && result.unwrap() != Unit && block.result.is_some() &&
+    if result.is_some() && !open && result.unwrap() != Unit && block.result.is_some() &&
        disagree(block.ty, result.unwrap()) then
         inner.fault(span, closure_disagreement(result.unwrap(), block.ty))
 

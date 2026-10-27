@@ -1,0 +1,295 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// An `is` outside a condition's `&&` chain: a `bool` wherever an expression stands when its pattern
+// binds nothing, refused at its pattern when it binds (`expr_flow.sysl`'s `is_value`;
+// `reference/expressions.md § is`).
+//
+// Every program is built with the counted heap, so a scrutinee whose payload is reference-counted and
+// is thrown away after the test shows up as a leak line on standard error, which the comparison sees.
+//
+// Cells skipped: separate compilation and codegen units (the test lowers to the same one-arm match a
+// `match` does, and has no state of its own across modules); bare metal (it emits a compare and a
+// branch, nothing a libcall stands behind).
+
+private isw_outcome(text: string) -> (string, int)
+    val root = make_temp_dir("sysl-isw").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    force_alloc_counting(true)
+
+    val built = build_native_program(root, None, None, DefaultOptimization, Some(exe))
+
+    force_alloc_counting(false)
+
+    built match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (failure_text(why), -1)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> ("the program that was built could not be run", -1)
+        Ok(out) -> (out.text + out.err.unwrap_or(""), shell_status(out.status))
+end isw_outcome
+
+private isw_prints(text: string, want: string)
+    if xvr_no_library() then return
+
+    val out = isw_outcome(text)
+
+    assert_eq(out.0, want)
+    assert_eq(out.1, 0)
+end isw_prints
+
+private isw_binds() -> string =
+    "this pattern binds a name, and an 'is' that binds stands only in the condition of an 'if' or " +
+    "a 'while' — the name is live through the branch that condition guards, and there is no such " +
+    "branch here. Take the value apart with 'if' or 'match', or write '_' for the parts you are not " +
+    "naming"
+
+private isw_enums() -> string = raw"""
+    enum Sym
+        Wolfram(n: int)
+        Plain
+
+    enum Pair[T]
+        Both(a: T, b: T)
+        Neither
+
+    """
+
+@test("an 'is' is a bool under '!', in a 'val', and against Option and Result, 'is not' too")
+isw_value_positions()
+    isw_prints(isw_enums() + raw"""
+        val r: Sym = Wolfram(3)
+        val o: Option[int] = None
+        val res: Result[int, string] = Err("x")
+
+        print(!(r is Wolfram(_)), !(r is Plain))
+        val ok = o is Some(_)
+        print(ok, o is None, res is Err(_), res is not Ok(_))
+        """, "false true\nfalse true true true\n")
+
+@test("an 'is' is an argument, a returned value and a closure's body")
+isw_argument_return_closure()
+    isw_prints(isw_enums() + raw"""
+        pick(o: Option[int]) -> bool
+            return o is Some(_)
+
+        show(b: bool) -> string = if b then "y" else "n"
+
+        val r: Sym = Wolfram(3)
+
+        print(show(r is Wolfram(3)), show(r is Wolfram(4)))
+        print(pick(Some(1)), pick(None))
+        val f = (x: Option[int]) -> x is Some(_)
+        print(f(Some(2)), f(None))
+        """, "y n\ntrue false\ntrue false\n")
+
+@test("nested, literal, range, tuple and alternative patterns, and a generic enum")
+isw_pattern_shapes()
+    isw_prints(isw_enums() + raw"""
+        val pr: Pair[int] = Both(1, 2)
+        val ps: Pair[string] = Both("a", "b")
+        val t = (Some(1), 2)
+        val n = 5
+        val c: char = 'q'
+        val oo: Option[Option[int]] = Some(None)
+
+        print(pr is Both(1, _), pr is Both(_, 3), pr is Neither, ps is Both("a", _))
+        print(t is (Some(_), 2), t is (None, _))
+        print(n is 1 | 5, n is not 3, c is 'a'..'z', oo is Some(None), oo is Some(Some(_)))
+        """, "true false false true\ntrue false\ntrue true true true false\n")
+
+@test("'&&' and '||' around a value 'is' short-circuit, and the scrutinee is evaluated once")
+isw_short_circuit_and_once()
+    isw_prints(isw_enums() + raw"""
+        var calls = 0
+
+        next() -> Option[int]
+            calls += 1
+            Some(calls)
+
+        loud() -> bool
+            print("ran")
+            true
+
+        val r: Sym = Wolfram(3)
+        val o: Option[int] = None
+
+        print(o is Some(_) && loud())
+        print(r is Wolfram(_) || loud())
+        print(next() is Some(1), calls)
+        """, "false\ntrue\ntrue 1\n")
+
+@test("a scrutinee holding a counted payload is released after the test, and a '&T' is read through")
+isw_counted_and_reference()
+    isw_prints(raw"""
+        make(n: int) -> Result[int, string] = if n > 0 then Ok(n) else Err(s"no $n")
+
+        var ro: &Option[int] = Some(41)
+
+        var hits = 0
+        for i in -3..3
+            if make(i) is Err(_) then hits += 1
+            val bad = make(i) is Err(_)
+            if bad then hits += 10
+
+        print(hits, *ro is Some(41), *ro is None)
+        """, "44 true false\n")
+
+@test("a match guard is an 'is' that binds nothing")
+isw_match_guard()
+    isw_prints(isw_enums() + raw"""
+        val r: Sym = Wolfram(3)
+        val n = 5
+        val m = n match
+            x if r is Wolfram(_) -> x + 1
+            _ -> 0
+        val k = n match
+            x if r is Plain -> x
+            _ -> 0
+        print(m, k)
+        """, "6 0\n")
+
+@test("a binding 'is' still chains under '&&' beside a value 'is' under '!' and '||'")
+isw_mixed_conditions()
+    isw_prints(isw_enums() + raw"""
+        val r: Sym = Wolfram(3)
+        val o: Option[int] = None
+
+        if !(r is Plain) && r is Wolfram(k) then print(k)
+        if r is Wolfram(k) && !(o is Some(_)) then print(k + 1)
+        if r is Wolfram(k) && (o is Some(_) || k > 2) then print(k + 2)
+        """, "3\n4\n5\n")
+
+@test("an 'is' folds in a const and a module val, and reads in 'require', 'while' and 'for'")
+isw_const_and_loops()
+    isw_prints(raw"""
+        enum Hue
+            Red
+            Blue
+
+        const N = 5
+        const HAS = N is 0..9
+        const NOT = N is not 0..9
+        val ON: Hue = Red
+        val RED = ON is Red
+
+        f(o: Option[int]) -> int
+            require o is Some(_)
+            1
+
+        var o: Option[int] = Some(1)
+        var i = 0
+
+        while !(o is None) && i < 3
+            i += 1
+            if i == 2 then o = None
+
+        print(i, HAS, NOT, RED, f(Some(2)))
+
+        for var j = 0; !(o is Some(_)) && j < 2; j += 1 do print(j)
+        """, "2 true false true 1\n0\n1\n")
+
+@test("'is' sits below '==', so 'a is P == b' compares the test, and '!' binds its operand first")
+isw_precedence()
+    isw_prints(raw"""
+        val o: Option[int] = None
+        print(o is None == true, o is Some(_) == true, o is None != false)
+        """, "true false true\n")
+
+    if xvr_no_library() then return
+
+    assert_eq(isc_diags(raw"""
+        f(o: Option[int]) -> bool
+            val b = !o is Some(_)
+            b
+        """), "2:13 condition must be bool, got sysl.Option[int]\n")
+
+@test("a binding 'is' in a 'val', under '!', and as an argument is refused at its pattern")
+isw_binding_refused()
+    if xvr_no_library() then return
+
+    assert_eq(isc_diags(raw"""
+        val o: Option[int] = Some(1)
+        val a = o is Some(n)
+        """), s"2:14 ${isw_binds()}\n")
+
+    assert_eq(isc_diags(raw"""
+        val o: Option[int] = Some(1)
+        print(!(o is Some(m)))
+        """), s"2:14 ${isw_binds()}\n")
+
+    assert_eq(isc_diags(raw"""
+        val o: Option[int] = Some(1)
+        print(o is Some(k))
+        """), s"2:12 ${isw_binds()}\n")
+
+@test("a binding 'is' returned, in a closure, nested in a tuple pattern, or in a guard is refused")
+isw_binding_refused_elsewhere()
+    if xvr_no_library() then return
+
+    assert_eq(isc_diags(raw"""
+        f(o: Option[int]) -> bool
+            return o is Some(n)
+        """), s"2:17 ${isw_binds()}\n")
+
+    assert_eq(isc_diags(raw"""
+        h() -> bool
+            val g = (o: Option[int]) -> o is Some(n)
+            g(None)
+        """), s"2:38 ${isw_binds()}\n")
+
+    assert_eq(isc_diags(raw"""
+        val t = (Some(1), 2)
+        val b = t is (Some(n), _)
+        """), s"2:14 ${isw_binds()}\n")
+
+    assert_eq(isc_diags(raw"""
+        val o: Option[int] = Some(1)
+        val m = 3 match
+            x if o is Some(n) -> x
+            _ -> 0
+        """), s"3:15 ${isw_binds()}\n")
+
+@test("a refused binding is reported once, and a later read of its name is not undefined")
+isw_refused_names_quiet()
+    if xvr_no_library() then return
+
+    assert_eq(isc_diags(raw"""
+        val o: Option[int] = Some(1)
+        print(o is Some(n), n)
+        """), s"2:12 ${isw_binds()}\n")
+
+@test("'is not' and an alternative with a binder keep their own refusals outside a condition")
+isw_negated_and_alternative_refused()
+    if xvr_no_library() then return
+
+    val neg = isc_diags(raw"""
+        val o: Option[int] = Some(1)
+        print(o is not Some(z))
+        """)
+
+    assert(neg.index_of("a pattern under 'is not' cannot bind a name").is_some(), neg)
+    assert(neg.index_of("this pattern binds a name").is_none(), neg)
+
+    val alt = isc_diags(raw"""
+        val o: Option[int] = Some(1)
+        print(o is Some(p) | None)
+        """)
+
+    assert(alt.index_of("2:7 alternative patterns joined by '|' cannot bind a name").is_some(), alt)
+    assert(alt.index_of("this pattern binds a name").is_none(), alt)
