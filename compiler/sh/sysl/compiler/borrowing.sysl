@@ -595,7 +595,9 @@ end holds_dropping
 //   - **the body changes its own copy** -- assigns to it or a part of it, takes its address, binds a
 //     `ref` to it, or calls a `*self` method on it (`rebound`) -- or takes a writable view of an
 //     array inside it, since a write through the view would be a write to the caller's value;
-//   - **the function jumps back to its own entry**, which stores into the slots;
+//   - **the function jumps back to its own entry**, which stores into the slots, or **carries a
+//     `decreases` measure**, which a recursive call checks by laying its arguments in the slots for a
+//     moment (`gen_variant_at_call`);
 //   - **something outside the program may call it** -- `@export`, a `@section`, a foreign
 //     convention, an address taken for a `*fn` -- since nothing on that side promises a snapshot;
 //   - **the parameter is promoted**, its storage moving to the heap anyway.
@@ -603,7 +605,7 @@ reads_in_place(e: *Emit, f: TFunc, promoted: Buf[string]) -> Buf[string]
     var out: Buf[string] = buf()
 
     if e.address_taken.has(f.name) || f.exported.is_some() || f.section.is_some() ||
-       f.conv.is_some() || !tail_calls_of(f).is_empty() then
+       f.conv.is_some() || !tail_calls_of(f).is_empty() || f.variant.is_some() then
         return out
 
     val bound = rebound(f)
@@ -823,10 +825,24 @@ end exposed_unknown
 // whose value is either a temporary the enclosing region releases *after* the call, or a slot the
 // callee has no way to name; anything else keeps its count somewhere a callee can reach, and guessing
 // wrong about a new node is a use-after-free rather than a slow program.
-held(e: *Emit, a: TExpr) -> bool = *a.kind match
+held(e: *Emit, a: TExpr) -> bool = held_unless(e, a, set())
+
+// The same, where the locals in `written` are assigned by something that runs after `a` is worked out
+// and before the call is made -- a later argument of the same call (`written_by`). Such a local is
+// not still for the length of the call, however private its slot: the write would reach the callee
+// through the address a large argument crosses at, or give back the count a small one is read under.
+held_unless(e: *Emit, a: TExpr, written: Set[string]) -> bool = *a.kind match
     // A local or parameter the caller never let the address of out.
     TLoad(name, _) ->
-        !e.caller_exposed.has(OPAQUE) && !e.caller_exposed.has(name) && !is_promoted(e, name)
+        !e.caller_exposed.has(OPAQUE) && !e.caller_exposed.has(name) && !is_promoted(e, name) &&
+            !written.has(name)
+
+    // A field of a struct held by value lies in its receiver's own storage, so it is held exactly
+    // when the receiver is -- `self.noise` of a `self` read in place is the caller's snapshot. A field
+    // reached through a pointer is a `TDeref` below and is not.
+    TField(receiver, _, _) -> underlying(texpr_type(receiver)) match
+        Struct(_) -> held_unless(e, receiver, written)
+        _ -> false
 
     // A result, a box and a branch's value all arrive with a count already taken, registered in the
     // region the enclosing statement closes -- which is after the call this is an argument to.
@@ -843,14 +859,14 @@ held(e: *Emit, a: TExpr) -> bool = *a.kind match
     TFormat(_, _, _) -> true
 
     // Building a value takes no count of its own, so what it stands on is what has to be held.
-    TStructNew(_, args) -> all_held(e, args)
-    TEnumNew(_, _, args) -> all_held(e, args)
+    TStructNew(_, args) -> all_held(e, args, written)
+    TEnumNew(_, _, args) -> all_held(e, args, written)
 
     // Neither changes what is counted or where the count is.
-    TCast(o, _) -> held(e, o)
-    TFloorCast(o, _) -> held(e, o)
-    TErase(o, _, _) -> held(e, o)
-    TViewAs(o, _) -> held(e, o)
+    TCast(o, _) -> held_unless(e, o, written)
+    TFloorCast(o, _) -> held_unless(e, o, written)
+    TErase(o, _, _) -> held_unless(e, o, written)
+    TViewAs(o, _) -> held_unless(e, o, written)
 
     // A literal owns nothing and outlives everything. A string's is a view whose owner word is null,
     // so there is no count to lose, and taking one would pull the whole runtime into a program whose
@@ -868,9 +884,31 @@ held(e: *Emit, a: TExpr) -> bool = *a.kind match
 
     _ -> false
 
-private all_held(e: *Emit, args: Buf[TExpr]) -> bool
+// A literal's fields are worked out in order before it is built, so a later field can write a local
+// an earlier one names: the written set is the whole literal's, added to what the call's other
+// arguments write.
+private all_held(e: *Emit, args: Buf[TExpr], written: Set[string]) -> bool
+    var all = written_by(args)
+
+    for item in written
+        all.add(item)
+
     for arg in args
-        if !held(e, arg) then return false
+        if !held_unless(e, arg, all) then return false
 
     true
 end all_held
+
+// The locals a list of expressions assigns, by name, anywhere inside them: what may change between
+// the moment one of them is worked out and the moment the call they are the arguments of is made.
+// It over-counts on purpose -- a write in an earlier argument is in it too -- since a name in it only
+// costs a snapshot.
+written_by(xs: Buf[TExpr]) -> Set[string]
+    val out = name_sink()
+    val v = rebound_walk(out)
+
+    for x in xs
+        if !changes_nothing(x) then walk_texpr(x, v)
+
+    out.names
+end written_by

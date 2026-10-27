@@ -1,0 +1,96 @@
+module sh.sysl.compiler
+@tests
+
+// The memos the pointer rules answer from, on the shapes where a memo could hand back an answer
+// worked out somewhere else: the handles a body binds, gathered once a round (`keeps.sysl`'s
+// `round_handles`), in a recursive body whose gathering reads its own answer while that answer is
+// still being worked out; and whether a struct may hold a pointer, answered once a depth by its name
+// (`counted_pointers.sysl`'s `holds_pointer_at`), for one struct reached at two depths in one body.
+// Each accepted cell runs and prints; each refused one is told where and why, word for word as
+// before the memos.
+//
+// Skipped cells, and why: a body in another module is filed under its full lowered name, which is
+// what every other answer of the keeps analysis is filed under too (`tests_kso_*` holds the rule
+// across modules); a generic struct is never put in the depth memo, since what it holds is asked of
+// its type arguments every time (`tests_plh_*` holds a generic wrapper to the rule); a chain of
+// thirty-two thousand calls is `tests_kdc_*`'s.
+
+private kcs_threads() -> string =
+    "import sysl.threads.*\nimport sysl.buf.*\nimport sysl.sync.*\n\nstruct S\n    n: int\n\n" +
+    "work(s: *S)\n    atomic_add(&s.n, 1, SeqCst)\n\n" +
+    "deep(p: *S, n: int) -> Option[Thread]\n    if n == 0 then return spawn(&work, p)\n\n" +
+    "    val inner = deep(p, n - 1)\n\n    if inner is Some(h) then h.join()\n\n    spawn(&work, p)\n\n"
+
+@test("a recursive body that answers a thread's handle, asked twice, is joined by a caller that joins each")
+kcs_recursive_handles_joined()
+    if !azd_ready() then return
+
+    twp_prints(kcs_threads() + "go()\n    var s = S(0)\n    val t = deep(&s, 3)\n\n" +
+               "    if t is Some(h) then h.join()\n\n    val u = deep(&s, 1)\n\n" +
+               "    if u is Some(h) then h.join()\n\n    print(s.n)\n\ngo()\n", "6\n")
+
+@test("the second call of the same recursive body, whose handle is never joined, is refused")
+kcs_recursive_handles_refused()
+    if !azd_ready() then return
+
+    val said = azd_err(kcs_threads() + "go()\n    var s = S(0)\n    val t = deep(&s, 3)\n\n" +
+                       "    if t is Some(h) then h.join()\n\n    val u = deep(&s, 1)\n\n    print(s.n)\n\ngo()\n")
+
+    assert(said.contains("error: 'deep' keeps its parameter 'p' (it is passed to 'spawn', which keeps it), " +
+                         "and '&s' is the address of a local of 'go' — join that thread on every way out of " +
+                         "'go', or hand it storage that lasts\n"), said)
+    assert(said.contains("main.sysl:26:18"), said)
+    assert(!said.contains("main.sysl:22:"), said)
+
+// A chain of structs, each holding the next by value, ending in one that holds a pointer.
+private kcs_chain(root: string) -> string
+    var out = "import sysl.buf.*\n\nstruct D\n    p: *int\n\nstruct C5\n    d: D\n\n"
+    val names = ["C4", "C3", "C2", "C1", "C0"]
+    var inner = "C5"
+
+    for name in names
+        out = out + s"struct $name\n    c: $inner\n\n"
+
+        if name == root then break
+
+        inner = name
+
+    out + "struct Near\n    d: D\n\n"
+end kcs_chain
+
+private kcs_holds(name: string) -> string =
+    s"error: '$name' holds a pointer to an element whose storage 'push' could move or give up, since it is " +
+    "'@relocates', and it is used after this call — so it could be left pointing at freed memory. " +
+    "Make the call before taking the address, or after the pointer's last use"
+
+@test("a struct met first past the depth a pointer is followed to, then near the top, holds the pointer near the top")
+kcs_depth_far_then_near()
+    if !azd_ready() then return
+
+    val said = azd_err(kcs_chain("C0") + "run() -> int\n    var b: Buf[int] = buf()\n\n    b.push(1)\n\n" +
+                       "    var x = 0\n    var far = C0(C1(C2(C3(C4(C5(D(&x)))))))\n\n" +
+                       "    far = C0(C1(C2(C3(C4(C5(D(&x)))))))\n\n    var near = Near(D(&x))\n\n" +
+                       "    near = Near(D(&b[0]))\n    b.push(2)\n    *near.d.p + *far.c.c.c.c.c.d.p\n\n" +
+                       "print(run())\n")
+
+    assert(said.contains(kcs_holds("near")), said)
+    assert(!said.contains("'far'"), said)
+
+@test("the same struct met near the top first, then at the deepest depth followed, holds the pointer at both")
+kcs_depth_near_then_far()
+    if !azd_ready() then return
+
+    val said = azd_err(kcs_chain("C1") + "run() -> int\n    var b: Buf[int] = buf()\n\n    b.push(1)\n\n" +
+                       "    var x = 0\n    var near = Near(D(&x))\n    var far = C1(C2(C3(C4(C5(D(&x))))))\n\n" +
+                       "    far = C1(C2(C3(C4(C5(D(&b[0]))))))\n    b.push(2)\n    *near.d.p + *far.c.c.c.c.d.p\n\n" +
+                       "print(run())\n")
+
+    assert(said.contains(kcs_holds("far")), said)
+
+@test("the same chain with nothing of the buffer's kept prints what it read")
+kcs_depth_accepted()
+    if !azd_ready() then return
+
+    twp_prints(kcs_chain("C1") + "run() -> int\n    var b: Buf[int] = buf()\n\n    b.push(1)\n\n" +
+               "    var x = 40\n    var near = Near(D(&x))\n    var far = C1(C2(C3(C4(C5(D(&x))))))\n\n" +
+               "    b.push(2)\n    *near.d.p + *far.c.c.c.c.d.p + b[1]\n\nprint(run())\n", "82\n")

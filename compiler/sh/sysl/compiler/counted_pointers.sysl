@@ -97,6 +97,10 @@ private struct PtrWalk
     holders: Buf[string]
     told: Buf[Span]
     cx: &Analyzer
+
+    // Whether a struct or an enum with no type arguments may hold a pointer, by `<depth>|<name>`
+    // (`holds_pointer_at`).
+    holds: Map[string, bool]
 end PtrWalk
 
 // What an expression comes to: the state after it, the pointers its value may be, and the pointers
@@ -111,7 +115,7 @@ end PtrVal
 check_counted_pointers(cx: &Analyzer, block: TBlock)
     if cx.ptr_addrs.is_empty() then return
 
-    val w: &PtrWalk = PtrWalk(cx.ptr_addrs, cx.ptr_moves, buf(), buf(), buf(), 0, buf(), buf(), cx)
+    val w: &PtrWalk = PtrWalk(cx.ptr_addrs, cx.ptr_moves, buf(), buf(), buf(), 0, buf(), buf(), cx, map())
 
     seq_flow(w, block.stmts, block.result, live_flow())
 end check_counted_pointers
@@ -622,7 +626,7 @@ private store_flow(w: &PtrWalk, place: TExpr, value: TExpr, f: PtrFlow) -> PtrFl
     val root = aggregate_root(w, place)
     var stored = v.flow
 
-    if root != "" && can_hold_pointer(texpr_type(value)) then
+    if root != "" && can_hold_pointer(w, texpr_type(value)) then
         stored = add_held(v.flow, root, all_facts(v))
 
     written(w, place, stored)
@@ -683,45 +687,68 @@ private is_pointer(t: Type) -> bool = repr(t) match
 // whose fields, elements or payloads may. **A generic container is asked about what it is made
 // of**: what a `Buf[*T]` holds is its `*T`s, while the pointer inside a `Buf[int]` is its own
 // storage, whose address the program never took.
-private can_hold_pointer(t: Type) -> bool = holds_pointer_at(t, 0)
+private can_hold_pointer(w: &PtrWalk, t: Type) -> bool = holds_pointer_at(w, t, 0)
 
-private holds_pointer_at(t: Type, depth: int) -> bool
+// **A struct or an enum written with no type arguments is answered once a depth**, by its name
+// (`PtrWalk.holds`): its fields are what they are wherever it is met, so the walk below it comes out
+// the same each time, and without the memo a type reaching many others by value was walked once for
+// every way of reaching each of them.
+private holds_pointer_at(w: &PtrWalk, t: Type, depth: int) -> bool
     if depth > 6 then return false
 
     repr(t) match
         Ptr(_) -> true
-        Ref(inner, _) -> holds_pointer_at(*inner, depth + 1)
-        Array(_, elem) -> holds_pointer_at(*elem, depth + 1)
-        Slice(elem, _) -> holds_pointer_at(*elem, depth + 1)
+        Ref(inner, _) -> holds_pointer_at(w, *inner, depth + 1)
+        Array(_, elem) -> holds_pointer_at(w, *elem, depth + 1)
+        Slice(elem, _) -> holds_pointer_at(w, *elem, depth + 1)
         Struct(d) ->
-            if !d.targs.is_empty() then return any_holds_pointer(d.targs, depth)
+            if !d.targs.is_empty() then return any_holds_pointer(w, d.targs, depth)
 
-            for item in d.fields
-                if holds_pointer_at(item.1, depth + 1) then return true
+            val key = s"$depth|${d.base}"
 
-            false
+            w.holds.get(key) match
+                Some(v) -> v
+                None -> remembered(w, key, fields_hold_at(w, d.fields, depth))
         Enum(d) ->
-            if !d.targs.is_empty() then return any_holds_pointer(d.targs, depth)
+            if !d.targs.is_empty() then return any_holds_pointer(w, d.targs, depth)
 
-            for v in d.variants
-                for item in v.fields
-                    if holds_pointer_at(item.1, depth + 1) then return true
+            val key = s"$depth|${d.base}"
 
-            false
+            w.holds.get(key) match
+                Some(v) -> v
+                None -> remembered(w, key, variants_hold_at(w, d.variants, depth))
         _ -> false
 end holds_pointer_at
 
-private any_holds_pointer(ts: Buf[Type], depth: int) -> bool
+private remembered(w: &PtrWalk, key: string, held: bool) -> bool
+    w.holds.put(key, held)
+    held
+
+private fields_hold_at(w: &PtrWalk, fields: Buf[(string, Type)], depth: int) -> bool
+    for item in fields
+        if holds_pointer_at(w, item.1, depth + 1) then return true
+
+    false
+end fields_hold_at
+
+private variants_hold_at(w: &PtrWalk, vs: Buf[EnumVariant], depth: int) -> bool
+    for v in vs
+        if fields_hold_at(w, v.fields, depth) then return true
+
+    false
+end variants_hold_at
+
+private any_holds_pointer(w: &PtrWalk, ts: Buf[Type], depth: int) -> bool
     for t in ts
-        if holds_pointer_at(t, depth + 1) then return true
+        if holds_pointer_at(w, t, depth + 1) then return true
 
     false
 end any_holds_pointer
 
 // Whether a pointer's target may itself hold a pointer, so that what it answers is a place holding
 // the pointers rather than one of them.
-private points_at_pointers(t: Type) -> bool = repr(t) match
-    Ptr(inner) -> can_hold_pointer(*inner)
+private points_at_pointers(w: &PtrWalk, t: Type) -> bool = repr(t) match
+    Ptr(inner) -> can_hold_pointer(w, *inner)
     _ -> false
 
 private addr_at(w: &PtrWalk, e: TExpr) -> Option[usize]
@@ -873,7 +900,7 @@ private operands_flow(w: &PtrWalk, e: TExpr, f: PtrFlow) -> PtrVal
 
     if is_pointer(ty) && carries then return PtrVal(g, facts, inner)
     if is_pointer(ty) && deref then return PtrVal(g, inner, buf())
-    if is_pointer(ty) && points_at_pointers(ty) then return PtrVal(g, facts, inner)
+    if is_pointer(ty) && points_at_pointers(w, ty) then return PtrVal(g, facts, inner)
 
     var all = facts.copy()
 
@@ -881,7 +908,7 @@ private operands_flow(w: &PtrWalk, e: TExpr, f: PtrFlow) -> PtrVal
         all.push(x)
 
     if is_pointer(ty) then return val_of(g, all)
-    if can_hold_pointer(ty) then return PtrVal(g, buf(), all)
+    if can_hold_pointer(w, ty) then return PtrVal(g, buf(), all)
 
     just(g)
 end operands_flow
@@ -949,8 +976,8 @@ end call_effects
 // The aggregate local an argument hands the callee, where it may hold a pointer: the local itself,
 // or a place in it whose address is taken.
 private target_root(w: &PtrWalk, arg: TExpr) -> string = *arg.kind match
-    TLoad(unique, ty) -> if !is_pointer(ty) && can_hold_pointer(ty) then unique else ""
-    TAddrOf(place, _) -> if can_hold_pointer(texpr_type(place)) then aggregate_root(w, place) else ""
+    TLoad(unique, ty) -> if !is_pointer(ty) && can_hold_pointer(w, ty) then unique else ""
+    TAddrOf(place, _) -> if can_hold_pointer(w, texpr_type(place)) then aggregate_root(w, place) else ""
     _ -> ""
 
 // The place an argument hands the callee the storage of: one whose address is taken, or a value

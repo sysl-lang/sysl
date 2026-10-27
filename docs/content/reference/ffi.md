@@ -2626,8 +2626,7 @@ is the line the "no functions built into the compiler" rule actually draws — n
 while `va_list` stays a predeclared type. The compiler answers them, but a file names the C variadic
 forms it uses, as it names anything else it did not declare; an alias, a wildcard (`import sysl.c.*`)
 and a path through the module reach them too. **The import is required.** Written bare without one,
-the form still answers in 0.6.x, with a warning naming the line to add — once per file per form, at
-its first use — and from 0.7.0 it is refused:
+the form is refused, and the error names the line to add:
 
 ```sysl
 sum(n: int, ...) -> int
@@ -2646,14 +2645,8 @@ sum(n: int, ...) -> int
 print(sum(3, 10, 20, 30))
 ```
 
-```output
-60
-```
-
-```
-warning: 'va_start' is in sysl.c: add 'import sysl.c.va_start' (this is refused from 0.7.0)
-warning: 'va_arg' is in sysl.c: add 'import sysl.c.va_arg' (this is refused from 0.7.0)
-warning: 'va_end' is in sysl.c: add 'import sysl.c.va_end' (this is refused from 0.7.0)
+```error
+'va_start' is in sysl.c: add 'import sysl.c.va_start'
 ```
 
 **The walk is the target's C walk, every class of argument included.** On most machines a `va_list`
@@ -3161,7 +3154,11 @@ that declares its `extern`s, which is where every binding written so far has put
 tree is declared instead**, in the manifest's `c` block
 ([packages](/reference/packages/#a-vendored-c-library-left-as-upstream-shipped-it)): its root, its
 include roots, the exact list of files it compiles and the macros they take — so the tree stays byte
-for byte what upstream released, and the walk compiles none of the C under its root.
+for byte what upstream released, and the walk compiles none of the C under its root. And C that sysl
+is not meant to compile at all — a benchmark built by hand, test programs a script compiles — is a
+directory named in the manifest's `exclude` list
+([packages](/reference/packages/#directories-a-walk-leaves-out-testdata-and-exclude)), which the
+warning itself suggests.
 
 **A shim can be per-machine, and that is a directory rather than a condition.** A `.c`
 cannot carry a sysl attribute, so `#if` is no help to it; what selects it is where it sits. A

@@ -1,0 +1,418 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.{cstring, replace_all, Search}
+
+// **A `self` method a table reaches is emitted with a body that takes the table's data word**
+// (`emit_vtable.sysl`'s `split_self`), so the slot holds the method's body and not an adapter that
+// loads the receiver and calls the method a second time. The cases: the IR the slot and the two
+// halves promise, every result and parameter shape a slot forwards, the two kinds of object, the
+// receivers that keep their adapter, the program's output against the adapter's (including the
+// snapshot a receiver is taken at), the counted heap, codegen units, and two other targets.
+
+private extern "setenv" vts_c_setenv(name: *u8, value: *u8, overwrite: int) -> int
+private extern "unsetenv" vts_c_unsetenv(name: *u8) -> int
+
+// Every slot shape on one counted object: a register aggregate result, a narrow one, a `bool`, a
+// result too large for registers, a zero-sized parameter, another object of the same trait, a
+// directly recursive tail call, nothing returned, and a `*self` method beside them.
+private val vts_ball: string = raw"""
+    struct Node
+        v: int
+
+    struct Hit
+        t: f64
+        u: f64
+        n: int
+
+    struct Ball
+        r: f64
+        code: u8
+        left: int
+        inner: &Node
+
+    trait Probe
+        hit(self, lo: f64, hi: f64) -> Option[Hit]
+        tag(self) -> u8
+        small(self) -> bool
+        wide(self) -> [40]int
+        note(self, u: unit, k: int) -> int
+        seen(self, other: &Probe) -> int
+        count(self, n: int) -> int
+        say(self)
+        bump(*self)
+
+    impl Probe for Ball
+        hit(self, lo: f64, hi: f64) -> Option[Hit] =
+            if self.r > lo && self.r < hi then Some(Hit(self.r, hi, self.left + self.inner.v)) else None
+        tag(self) -> u8 = self.code
+        small(self) -> bool = self.r < 1.0
+        wide(self) -> [40]int
+            var out: [40]int = [0; 40]
+            out[39] = self.left
+            out
+        note(self, u: unit, k: int) -> int = self.left * k
+        seen(self, other: &Probe) -> int
+            other.bump()
+            self.left
+        count(self, n: int) -> int = if n == 0 then self.left else self.count(n - 1)
+        say(self) = print("ball", self.left)
+        bump(*self) = self.left += 1
+
+    val o: &Probe = Ball(2.5, 200, 7, Node(5))
+
+    print(o.hit(1.0, 3.0).map((h) -> h.n).unwrap_or(-1), o.hit(3.0, 4.0).is_none())
+    print(o.tag(), o.small(), o.wide()[39], o.note((), 3), o.count(4))
+    print(o.seen(o), o.seen(o), o.count(0))
+    o.say()
+
+    val b = Ball(0.5, 9, 1, Node(1))
+
+    print(b.tag(), b.small(), b.note((), 5), b.count(2), b.wide()[39])
+    """
+
+// What `vts_ball` prints, read out of the build before the split, where every slot was an adapter.
+// `seen` bumps the very object it was called through and then reads its own receiver: the first
+// call answers 7, because the receiver is the snapshot taken when the call began.
+private val vts_ball_out: string = "12 true\n200 false 7 21 7\n7 8 9\nball 9\n9 true 5 1 1\n"
+
+// The receivers around the rule: a generic type at two instantiations, a trait's default method, a
+// zero-sized struct, a receiver too large for registers, a raw object only, a type erased both raw
+// and counted, and a result too large for registers.
+private val vts_shapes: string = raw"""
+    trait Total
+        total(self) -> int
+        twice(self) -> int = self.total() * 2
+
+    struct Wrap[T]
+        v: T
+        n: int
+
+    impl[T] Total for Wrap[T]
+        total(self) -> int = self.n
+
+    struct Z
+    end Z
+
+    impl Total for Z
+        total(self) -> int = 3
+
+    struct Big
+        cells: [40]int
+
+    impl Total for Big
+        total(self) -> int = self.cells[39]
+
+    struct Raw
+        a: int
+        b: int
+
+    impl Total for Raw
+        total(self) -> int = self.a - self.b
+
+    struct Both
+        a: int
+
+    impl Total for Both
+        total(self) -> int = self.a + 100
+
+    var big: [40]int = [0; 40]
+    big[39] = 11
+
+    val a: &Total = Wrap("x", 7)
+    val b: &Total = Wrap(1.5, 8)
+    val z: &Total = Z()
+    val g: &Total = Big(big)
+    var r = Raw(9, 4)
+    val rp: *Total = &r
+    var both = Both(1)
+    val bp: *Total = &both
+    val bo: &Total = Both(2)
+
+    print(a.total(), b.total(), a.twice(), z.total(), g.total(), rp.total(), rp.twice())
+    print(bp.total(), bo.total(), bo.twice())
+    """
+
+private val vts_shapes_out: string = "7 8 14 3 11 5 10\n101 102 204\n"
+
+// A board's shape of the same thing: no heap, so a raw object.
+private val vts_board: string = raw"""
+    trait Total
+        total(self) -> int
+
+    struct Raw
+        a: int
+        b: int
+
+    impl Total for Raw
+        total(self) -> int = self.a - self.b
+
+    @export("vts_probe")
+    vts_probe(a: int) -> int
+        var r = Raw(a, 4)
+        val t: *Total = &r
+        t.total()
+    """
+
+private vts_ir(text: string) -> string
+    if !lbr_ready() then return "skipped"
+
+    val prog = lbr_program(text)
+    val ir = lbr_text(prog, [])
+
+    lbr_drop([prog])
+    ir
+end vts_ir
+
+// What the program prints and its exit, built at `level`, with the counted heap where asked.
+private vts_ran(text: string, level: string, counted: bool) -> string
+    val prog = lbr_program(text)
+    val exe = replace_all(prog, "main.sysl", "program")
+
+    force_alloc_counting(counted)
+
+    val said = build_native_program(prog, None, None, level, Some(exe)) match
+        Err(why) -> s"refused: ${failure_text(why)}"
+        Ok(made) ->
+            capture(made, [], "", [], true) match
+                Err(_) -> "the program that was built could not be run"
+                Ok(out) -> if out.status.ok() then out.text else s"exited badly: ${out.text}"
+
+    force_alloc_counting(false)
+    lbr_drop([prog])
+    said
+end vts_ran
+
+private vts_target_ir(text: string, target: string) -> string
+    val dir = lbr_tree(lbr_one("main.sysl", text))
+    val ir = emit_llvm_text(dir, Some(target), DefaultOptimization, buf(), Some(buf())) match
+        Err(why) -> s"did not compile: ${failure_text(why)}"
+        Ok(e) -> if e.report.is_empty() then e.text else s"did not compile: ${analysis_report(e.report)}"
+
+    lbr_drop([dir])
+    ir
+end vts_target_ir
+
+private vts_has_define(ir: string, name: string) -> bool = ir.contains(s"@$name(") && cgz_body(ir, name) != ""
+
+// -- the table and the two halves ---------------------------------------------------------------------
+
+@test("a counted object's table holds each 'self' method's body, and no adapter is emitted for it")
+vts_the_slot_is_the_body()
+    val ir = vts_ir(vts_ball)
+
+    if ir == "skipped" then return
+
+    assert(ir.contains("[ptr @Ball.hit.self, ptr @Ball.tag.self, ptr @Ball.small.self, ptr @Ball.wide.self, " +
+                       "ptr @Ball.note.self, ptr @Ball.seen.self, ptr @Ball.count.self, ptr @Ball.say.self, " +
+                       "ptr @vt.adapt.ref.Ball.bump, "), ir)
+    assert(!ir.contains("@vt.adapt.ref.Ball.hit("), ir)
+    assert(!ir.contains("@vt.adapt.ref.Ball.wide("), ir)
+
+@test("the body steps over the box header and loads its receiver once, ahead of everything else")
+vts_the_body_loads_the_receiver_at_entry()
+    val ir = vts_ir(vts_ball)
+
+    if ir == "skipped" then return
+
+    val body = cgz_body(ir, "Ball.hit.self")
+
+    assert(body.contains("(ptr %self.object, double %lo.param, double %hi.param)"), body)
+    assert(body.starts_with("define internal "), body)
+    assert(body.contains("entry:\n  %self.payload = getelementptr %arc.Ball, ptr %self.object, i32 0, i32 3\n" +
+                         "  %self.param = load %struct.Ball, ptr %self.payload\n"), body)
+
+@test("the method keeps its symbol and signature, and calls the body with the receiver stored in a box's shape")
+vts_the_method_keeps_its_signature()
+    val ir = vts_ir(vts_ball)
+
+    if ir == "skipped" then return
+
+    val m = cgz_body(ir, "Ball.hit")
+
+    assert(m.contains("@Ball.hit(%struct.Ball %self.param, double %lo.param, double %hi.param)"), m)
+    assert(m.contains("%self.object = alloca %arc.Ball\n"), m)
+    assert(m.contains("store %struct.Ball %self.param, ptr %self.payload\n"), m)
+    assert(m.contains("@Ball.hit.self(ptr %self.object, double %lo.param, double %hi.param)"), m)
+
+@test("a narrow result keeps its extension on both halves")
+vts_a_narrow_result_keeps_its_extension()
+    val ir = vts_ir(vts_ball)
+
+    if ir == "skipped" then return
+
+    assert(ir.contains("define zeroext i8 @Ball.tag(%struct.Ball %self.param)"), ir)
+    assert(ir.contains("define internal zeroext i8 @Ball.tag.self(ptr %self.object)"), ir)
+    assert(ir.contains("define internal zeroext i1 @Ball.small.self(ptr %self.object)"), ir)
+
+@test("a result too large for registers is written through the out-pointer the table's caller hands the body")
+vts_a_large_result_goes_through_the_out_pointer()
+    val ir = vts_ir(vts_ball)
+
+    if ir == "skipped" then return
+
+    assert(ir.contains("define internal void @Ball.wide.self(ptr noalias sret([40 x i32]) align 4 %sret.out, " +
+                       "ptr %self.object)"), ir)
+    assert(cgz_body(ir, "Ball.wide").contains("call void @Ball.wide.self(ptr noalias sret([40 x i32]) align 4 " +
+                                               "%sret.out, ptr %self.object)"), ir)
+
+@test("a zero-sized parameter is in neither half, as it is in no slot")
+vts_a_zero_sized_parameter_is_dropped()
+    val ir = vts_ir(vts_ball)
+
+    if ir == "skipped" then return
+
+    assert(ir.contains("define internal i32 @Ball.note.self(ptr %self.object, i32 %k.param)"), ir)
+
+@test("a method that calls itself last jumps back inside the body, after the receiver was loaded")
+vts_a_tail_call_stays_in_the_body()
+    val ir = vts_ir(vts_ball)
+
+    if ir == "skipped" then return
+
+    val body = cgz_body(ir, "Ball.count.self")
+
+    assert(body.contains("tailrec"), body)
+    assert(!body.contains("call i32 @Ball.count("), body)
+    assert(body.index_of("%self.param = load").unwrap_or(9999) < body.index_of("tailrec").unwrap_or(0), body)
+
+// -- what the program does ------------------------------------------------------------------------------
+
+@test("the program prints what it printed through adapters, the receiver a snapshot taken at the call")
+vts_the_program_runs_the_same()
+    if !lbr_ready() then return
+
+    assert_eq(vts_ran(vts_ball, DefaultOptimization, false), vts_ball_out)
+
+@test("and the same at -O2, where the method's half is inlined into its direct callers")
+vts_the_program_runs_the_same_optimized()
+    if !lbr_ready() then return
+
+    assert_eq(vts_ran(vts_ball, "2", false), vts_ball_out)
+
+@test("and on the counted heap every count comes back: the body takes and gives back its receiver's")
+vts_the_counted_heap_comes_back()
+    if !lbr_ready() then return
+
+    val out = vts_ran(vts_ball, DefaultOptimization, true)
+
+    assert_eq(out, vts_ball_out)
+    assert(!out.contains(alloc_count_said()), out)
+
+@test("and the same when the program is compiled as four codegen units")
+vts_four_units_run_the_same()
+    if !lbr_ready() then return
+
+    val k = cstring("SYSL_CODEGEN_UNITS")
+    val v = cstring("4")
+
+    vts_c_setenv(k.ptr, v.ptr, 1)
+
+    val out = vts_ran(vts_ball, DefaultOptimization, false)
+
+    vts_c_unsetenv(k.ptr)
+    assert_eq(out, vts_ball_out)
+
+// -- the receivers around the rule ------------------------------------------------------------------------
+
+@test("a generic type's two instantiations and a trait's default method each get a body of their own")
+vts_generic_and_default_split()
+    val ir = vts_ir(vts_shapes)
+
+    if ir == "skipped" then return
+
+    assert(ir.contains("[ptr @Wrap.total.string.self, ptr @Wrap.twice.string.self, "), ir)
+    assert(ir.contains("[ptr @Wrap.total.real.self, ptr @Wrap.twice.real.self, "), ir)
+
+@test("a raw object's body reads its receiver at the word itself, with no header to step over")
+vts_a_raw_body_reads_at_the_word()
+    val ir = vts_ir(vts_shapes)
+
+    if ir == "skipped" then return
+
+    val body = cgz_body(ir, "Raw.total.self")
+
+    assert(ir.contains("@vt.Total.Raw = private constant { i64, [3 x ptr] } { i64 "), ir)
+    assert(ir.contains("[ptr @Raw.total.self, ptr @Raw.twice.self, "), ir)
+    assert(body.contains("entry:\n  %self.param = load %struct.Raw, ptr %self.object\n"), body)
+    assert(!body.contains("getelementptr %arc.Raw"), body)
+    assert(cgz_body(ir, "Raw.total").contains("%self.object = alloca %struct.Raw\n"), ir)
+
+@test("a type erased both ways splits for the counted table, and the raw one keeps an adapter to the method")
+vts_both_kinds_the_counted_one_wins()
+    val ir = vts_ir(vts_shapes)
+
+    if ir == "skipped" then return
+
+    assert(ir.contains("[ptr @Both.total.self, ptr @Both.twice.self, "), ir)
+    assert(ir.contains("[ptr @vt.adapt.Both.total, ptr @vt.adapt.Both.twice, "), ir)
+    assert(cgz_body(ir, "vt.adapt.Both.total").contains("call i32 @Both.total(%struct.Both "), ir)
+
+@test("a receiver too large for registers keeps the adapter that forwards its address")
+vts_a_large_receiver_keeps_its_adapter()
+    val ir = vts_ir(vts_shapes)
+
+    if ir == "skipped" then return
+
+    assert(ir.contains("[ptr @vt.adapt.ref.Big.total, ptr @vt.adapt.ref.Big.twice, "), ir)
+    assert(!vts_has_define(ir, "Big.total.self"), ir)
+    assert(cgz_body(ir, "vt.adapt.ref.Big.total").contains("call i32 @Big.total(ptr "), ir)
+
+@test("a zero-sized struct's receiver is still a register aggregate, and splits like any other")
+vts_a_zero_sized_struct_splits()
+    val ir = vts_ir(vts_shapes)
+
+    if ir == "skipped" then return
+
+    assert(ir.contains("[ptr @Z.total.self, ptr @Z.twice.self, "), ir)
+
+@test("every one of those receivers prints what it printed through adapters")
+vts_the_shapes_run_the_same()
+    if !lbr_ready() then return
+
+    assert_eq(vts_ran(vts_shapes, DefaultOptimization, false), vts_shapes_out)
+    assert_eq(vts_ran(vts_shapes, "2", false), vts_shapes_out)
+
+@test("a method the standard module's artifact defines keeps its adapter: its body is not this module's")
+vts_a_precompiled_method_keeps_its_adapter()
+    val text = "val e: &Display = 2.5\nprint(e)\n"
+    val ir = vts_ir(text)
+
+    if ir == "skipped" then return
+
+    assert(ir.contains("[ptr @vt.adapt.ref.real.display, ptr @vt.adapt.ref.real.debug]"), ir)
+    assert(!vts_has_define(ir, "real.display.self"), ir)
+    assert_eq(vts_ran(text, DefaultOptimization, false), "2.5\n")
+
+// -- other targets ----------------------------------------------------------------------------------------
+
+@test("x86_64's table holds the body too")
+vts_x86_64_splits()
+    if !lbr_ready() then return
+
+    val ir = vts_target_ir(vts_ball, "x86_64-linux")
+
+    assert(ir.contains("[ptr @Ball.hit.self, ptr @Ball.tag.self, "), ir)
+    assert(ir.contains("define internal zeroext i8 @Ball.tag.self(ptr %self.object)"), ir)
+
+@test("a board's raw object holds the body, and the archive builds")
+vts_thumb_splits_and_builds()
+    if !lbr_ready() then return
+
+    val ir = vts_target_ir(vts_board, "thumb-freestanding-softfp")
+
+    assert(ir.contains("[ptr @Raw.total.self, "), ir)
+    assert(ir.contains("define internal i32 @Raw.total.self(ptr %self.object)"), ir)
+
+    val root = lbr_tree(lbr_one("main.sysl", vts_board))
+    val made = build_c_archive(root, Some("thumb-freestanding-softfp"), None, DefaultOptimization,
+                               Some(s"$root/lib.a"), None, (m) -> ())
+    val said = made match
+        Err(why) -> failure_text(why)
+        Ok(_) -> "ok"
+
+    remove_dir_all(root).unwrap_or(())
+    assert_eq(said, "ok")

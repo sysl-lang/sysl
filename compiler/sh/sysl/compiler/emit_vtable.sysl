@@ -1,6 +1,7 @@
 module sh.sysl.compiler
 
 import sysl.buf.{Buf, buf}
+import sysl.container.{Map, map}
 import sysl.math.bigint.from_int
 
 // **The method tables trait objects dispatch through.**
@@ -45,18 +46,186 @@ gen_vtable(e: *Emit, vt: TVtable) -> IrGlobal
 end gen_vtable
 
 // The function a slot holds: the implementation itself where its receiver already *is* the data word
-// -- a `*self` method reached through a raw object, a `&self` method reached through a counted one --
-// and an adapter for everything else.
+// -- a `*self` method reached through a raw object, a `&self` method reached through a counted one, a
+// `self` method whose body this module emitted to take its receiver at the word (`split_self`) -- and
+// an adapter for everything else.
 private slot_fn(e: *Emit, vt: TVtable, slot: TVSlot) -> string
     slot.recv match
         ByPtr -> if !vt.boxed then return symbol_of(e, slot.target)
         ByRef(_) -> if vt.boxed then return symbol_of(e, slot.target)
-        _ -> ()
+        ByValue ->
+            e.self_entries.get(slot.target) match
+                Some(boxed) -> if boxed == vt.boxed then return self_symbol(symbol_of(e, slot.target))
+                None -> ()
 
     val name = s"vt.adapt.${if vt.boxed then "ref." else ""}${slot.target}"
 
     request_helper(e, name, HrAdapter(vt, slot))
 end slot_fn
+
+// -- a `self` method whose body takes its receiver at the table's word ------------------------------
+
+// **A `self` method a table reaches is emitted with its body taking the receiver as the table's data
+// word**, so the slot holds the body itself rather than an adapter that loads the receiver out of the
+// object and calls the method a second time. That second call is not a tail call wherever the result
+// is a register aggregate the back end returns through memory, so it costs a frame, the call, and a
+// copy of the result into the caller's storage on every dispatch.
+//
+// The method keeps its own symbol and signature, so every direct call, function value and separately
+// compiled caller reaches it exactly as before; under that symbol it is now a few instructions that
+// put the receiver in storage shaped like the object and call the body. The body loads the receiver
+// out of the object **once, at entry** -- the snapshot the adapter took -- and reads its copy from then
+// on, so nothing a call inside it does to the object can change what it sees.
+//
+// One body serves one kind of table: a counted object's, whose word addresses the box and whose body
+// steps over the header, wherever the module builds one (`self_forms`); a raw object's, whose word is
+// the value's own address, otherwise. A table of the other kind keeps its adapter.
+
+// The symbol a split method's body is emitted under.
+self_symbol(symbol: string) -> string = s"$symbol.self"
+
+// Each method some table of the program reaches with a `self` receiver that is passed in registers,
+// and whether the body is to step over a counted object's header: a counted table wins over a raw one.
+//
+// A zero-sized receiver is no parameter at all, and a large one already arrives as an address the
+// adapter forwards untouched, so neither is split. The object's type rides along, so the body is only
+// split where its receiver is that type.
+self_forms(e: *Emit, p: TProgram) -> Map[string, (bool, string)]
+    var out: Map[string, (bool, string)] = map()
+
+    for i in 0..<p.vtables.len()
+        val vt = p.vtables.at(i)
+
+        if zero_sized(vt.for_type) || e.layout.indirect(vt.for_type) then continue
+
+        for slot in vt.slots
+            val by_value = slot.recv match
+                ByValue -> true
+                _ -> false
+
+            if by_value && (vt.boxed || out.get(slot.target).is_none()) then
+                out.put(slot.target, (vt.boxed, mangle(vt.for_type)))
+
+    out
+end self_forms
+
+// The functions a defined body is emitted as: itself, or -- for a method `self_forms` names -- the
+// method under its own symbol and the body under `self_symbol`, recorded in `e.self_entries`.
+//
+// What is never split: a body something outside sysl's convention enters (`@export`, a `@section`, a
+// foreign convention, a C-variadic one), a task, a function emitted as halves already (an owning
+// one's entry and body, a `@disjoint` one's), a definition the link may displace, and a receiver the
+// signature does not carry as one register aggregate.
+split_self(e: *Emit, f: TFunc, built: IrFunc, forms: Map[string, (bool, string)]) -> Buf[IrFunc]
+    var out: Buf[IrFunc] = buf()
+    val form = forms.get(f.name)
+
+    if form.is_none() || f.params.is_empty() || f.marks.is_async() || f.variadic ||
+       f.exported.is_some() || f.section.is_some() || f.conv.is_some() || built.sig.cconv.is_some() ||
+       !f.marks.disjoint.is_empty() || e.owning_funcs.has(f.name) || displaceable(built.sig.linkage) ||
+       mangle(f.params.at(0).1) != form.unwrap().1
+        out.push(built)
+        return out
+    end if
+
+    val boxed = form.unwrap().0
+    val recv = f.params.at(0)
+    val ty = recv.1
+    val param = s"${recv.0}.param"
+    val object = VReg(s"${recv.0}.object")
+    val payload = if boxed then VReg(s"${recv.0}.payload") else object
+    val sig = built.sig
+    val body_name = self_symbol(sig.name)
+
+    var found = false
+    var body_params: Buf[IrParam] = buf()
+    var args: Buf[IrArg] = buf()
+
+    for p in sig.ty.params
+        if !found && names_reg(p.name, param)
+            found = true
+            body_params.push(IrParam(LPtr, no_ir_attrs(), Some(object)))
+            args.push(ir_arg(LPtr, object))
+        else
+            body_params.push(p)
+            args.push(IrArg(p.ty, p.name.unwrap_or(VUndef), p.attrs))
+
+    if zero_sized(ty) || e.layout.indirect(ty) || !found
+        out.push(built)
+        return out
+    end if
+
+    val shape = if boxed then box_lty(e, ty) else lty(e, ty)
+    var step: Buf[IrArg] = buf()
+
+    step.push(ir_arg(l_i32(), VInt(from_int(0))))
+    step.push(ir_arg(l_i32(), VInt(from_int(long(box_payload_field(e, ty))))))
+
+    // The body: the method as it was emitted, its receiver loaded out of the object ahead of
+    // everything its entry block does.
+    var blocks: Buf[IrBlock] = buf()
+
+    for i in 0..<built.blocks.len()
+        val b = built.blocks.at(i)
+
+        if i == 0
+            var instrs: Buf[Inst] = buf()
+
+            if boxed then instrs.push(InGep(payload, shape, object, step))
+
+            instrs.push(InLoad(VReg(param), lty(e, ty), payload, AccPlain, None))
+
+            for item in b.instrs
+                instrs.push(item)
+
+            blocks.push(IrBlock(b.label, instrs, b.terminator))
+        else
+            blocks.push(b)
+
+    val body_sig = sig with { name = body_name, ty = IrFnType(sig.ty.ret, body_params, false, sig.ty.ret_attrs),
+                              linkage = LinkInternal, section = None, dso_local = false, hidden = false }
+
+    // The method: the receiver stored where the body expects the object, and the body called.
+    var entry: Buf[Inst] = buf()
+
+    entry.push(InAlloca(object, shape, None))
+
+    if boxed then entry.push(InGep(payload, shape, object, step))
+
+    entry.push(InStore(lty(e, ty), VReg(param), payload, AccPlain, None))
+
+    val nothing = sig.ty.ret match
+        LVoid -> true
+        _ -> false
+
+    val result = if nothing then None else Some(VReg("self.result"))
+    var fast: Buf[FastMath] = buf()
+
+    entry.push(InCall(result, sig.ty.ret, VGlobal(body_name), args, sig.ty.ret_attrs, None, fast, false))
+
+    val ret = if nothing then InRet(None, None) else InRet(Some(sig.ty.ret), result)
+    var bare: Buf[string] = buf()
+    var entry_blocks: Buf[IrBlock] = buf()
+
+    entry_blocks.push(IrBlock("entry", entry, Some(ret)))
+    e.self_entries.put(f.name, boxed)
+    out.push(IrFunc(sig with { bare = bare }, entry_blocks))
+    out.push(IrFunc(body_sig, blocks))
+    out
+end split_self
+
+// Whether the definition may not be the one the link keeps -- a `weak` seam another definition
+// displaces, a copy of a body defined elsewhere -- so a table has to reach it through its symbol.
+private displaceable(l: IrLinkage) -> bool = l match
+    LinkWeak -> true
+    LinkAvailableExternally -> true
+    LinkExternal -> true
+    _ -> false
+
+// Whether a parameter arrives in the register named.
+private names_reg(name: Option[Val], reg: string) -> bool = name match
+    Some(VReg(r)) -> r == reg
+    _ -> false
 
 // The adapter's signature. It carries the extension a narrow result owes whoever called through the
 // table; a large result is written into the caller's storage, so the adapter neither receives it in a
@@ -213,8 +382,20 @@ end gen_erase
 
 // A call whose callee is a word in the object's table rather than a name. The data word goes in front
 // of the declared arguments, which is the shape every slot was built to.
+//
+// The receiver is borrowed from wherever it is held, which is sound while nothing lets go of it
+// before the call is made. An argument that assigns the receiver's local does exactly that, so there
+// the object is held by a count of the call's own (`held_unless`).
 gen_vcall(e: *Emit, receiver: TExpr, slot: int, args: Buf[TExpr], ty: Type) -> Val
+    val written = written_by(args)
     val obj = gen_expr(e, receiver)
+    val rty = texpr_type(receiver)
+
+    if contains_counted(rty) && held(e, receiver) && !held_unless(e, receiver, written)
+        retain_value(e, rty, obj)
+        own_temp(e, obj, rty)
+    end if
+
     val table = fresh_reg(e)
 
     emit(e, InExtract(table, l_fat(), obj, index_list(0)))
@@ -226,7 +407,7 @@ gen_vcall(e: *Emit, receiver: TExpr, slot: int, args: Buf[TExpr], ty: Type) -> V
     var arg_vals: Buf[IrArg] = buf()
 
     for arg in args
-        arg_value(e, arg, &arg_vals)
+        arg_value(e, arg, &arg_vals, written)
 
     val fn = vtable_entry(e, table, slot)
 

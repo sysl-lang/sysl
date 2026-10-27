@@ -1,0 +1,246 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.str_builder
+
+// **A large parameter read where its caller put it says so to the optimizer**: `ptr noalias
+// readonly` (`emit_sig.sysl`'s `frame_attrs`). Every caller hands it storage nothing changes for the
+// length of the call (`indirect_arg`) and the body only reads it (`reads_in_place`), so a field read
+// before a call may stay in a register after it. A parameter the body copies at entry promises
+// nothing: one it changes, one something outside sysl may call through, and one whose `variant`
+// check lays the next call's arguments in the parameter's own storage for a moment, which in place
+// would be a write to the caller's.
+
+private lro_ready() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+
+    true
+end lro_ready
+
+// `Big` is past the indirect boundary on every target, `Edge` exactly at it, `Over` one word past.
+private lro_prelude() -> string = raw"""
+    struct Big
+        cells: [20]i64
+
+    struct Edge
+        cells: [16]i64
+
+    struct Over
+        cells: [17]i64
+
+    struct Named
+        name: string
+        cells: [16]i64
+
+    """
+
+// The LLVM text of the module a program lowers to, for `target` or this machine.
+private lro_ir(text: string, target: Option[string]) -> string
+    val root = make_temp_dir("sysl-lro").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, lro_prelude() + text).unwrap()
+
+    val out = emit_llvm_text(src, target) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> if made.report.is_empty() then made.text else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end lro_ir
+
+// The line that opens one function's definition.
+private lro_define(out: string, name: string) -> string
+    for line in lines_of(out)
+        if line.starts_with("define ") && line.contains("@" + name + "(") then return line
+
+    s"no definition of '$name' in:\n$out"
+end lro_define
+
+// One function's text, from its `define` to the brace that closes it.
+private lro_body(out: string, name: string) -> string
+    var b = str_builder()
+    var inside = false
+
+    for line in lines_of(out)
+        if !inside && line.starts_with("define ") && line.contains("@" + name + "(") then inside = true
+
+        if inside
+            if line == "}" then return b.finish()
+
+            b.push(line)
+            b.push_char('\n')
+
+    s"no definition of '$name' in:\n$out"
+end lro_body
+
+private lro_prints(text: string, expected: string)
+    if !lro_ready() then return
+
+    val root = make_temp_dir("sysl-lro").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", lro_prelude() + text).unwrap()
+    force_alloc_counting(true)
+
+    val built = build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(s"$root/built"))
+
+    force_alloc_counting(false)
+
+    if built.is_err()
+        remove_dir_all(root).unwrap_or(())
+        assert(false, failure_text(built.unwrap_err()))
+        return
+    end if
+
+    val said = capture(s"$root/built", [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> assert(false, "the program that was built could not be run")
+        Ok(out) ->
+            assert_eq(out.text, expected)
+            assert(out.status.ok(), "the program printed what was expected and did not exit cleanly")
+            assert(!out.err.unwrap_or("").contains("still live"), out.err.unwrap_or(""))
+end lro_prints
+
+// -- what it promises -------------------------------------------------------------------------------
+
+@test("a large parameter read only is a noalias readonly pointer, on every target")
+lro_read_only_is_readonly()
+    if !lro_ready() then return
+
+    for target in [None, Some("x86_64-freestanding"), Some("thumb-freestanding")]
+        val out = lro_ir("first(x: Big) -> i64 = x.cells[0] + x.cells[19]\n" +
+                         "main()\n    print(first(Big([1; 20])))\n", target)
+
+        assert(lro_define(out, "first").contains("ptr noalias readonly %x.param"), lro_define(out, "first"))
+
+@test("a struct exactly at the boundary is still a value, and one word past it a readonly pointer")
+lro_the_boundary()
+    if !lro_ready() then return
+
+    val out = lro_ir("edge(x: Edge) -> i64 = x.cells[0]\nover(x: Over) -> i64 = x.cells[0]\n" +
+                     "main()\n    print(edge(Edge([1; 16])) + over(Over([2; 17])))\n", None)
+
+    assert(lro_define(out, "edge").contains("%struct.Edge %x.param"), lro_define(out, "edge"))
+    assert(lro_define(out, "over").contains("ptr noalias readonly %x.param"), lro_define(out, "over"))
+
+@test("a generic instantiation over a large struct promises the same")
+lro_generic_instance()
+    if !lro_ready() then return
+
+    val out = lro_ir("first[T](a: T, b: T) -> T = a\nmain()\n    print(first(Big([1; 20]), Big([2; 20])).cells[3])\n",
+                     None)
+    var found = false
+
+    for line in lines_of(out)
+        if line.starts_with("define ") && line.contains("first") && line.contains("ptr noalias readonly %a.param")
+            found = true
+
+    assert(found, out)
+
+@test("a counted large struct read only is readonly too, and its count is given back once")
+lro_counted()
+    if !lro_ready() then return
+
+    val out = lro_ir("tag(x: Named) -> i64 = x.cells[0]\nmain()\n    print(tag(Named(\"a\", [3; 16])))\n", None)
+
+    assert(lro_define(out, "tag").contains("ptr noalias readonly %x.param"), lro_define(out, "tag"))
+
+    lro_prints(raw"""
+        tag(x: Named) -> string = x.name + "!"
+        keep(x: Named) -> Named = x
+
+        main()
+            val n = Named("a" + "b", [2; 16])
+            val k = keep(n)
+            print(tag(n), tag(k), k.cells[15])
+        """, "ab! ab! 2\n")
+
+// -- where it must not promise ----------------------------------------------------------------------
+
+@test("a callee that changes its parameter copies it at entry and promises nothing")
+lro_changed_parameter_copies()
+    if !lro_ready() then return
+
+    val out = lro_ir("grow(x: Big) -> i64\n    x.cells[0] += 1\n    x.cells[0]\nmain()\n    print(grow(Big([1; 20])))\n",
+                     None)
+    val line = lro_define(out, "grow")
+
+    assert(line.contains("ptr %x.param"), line)
+    assert(!line.contains("readonly"), line)
+    assert(lro_body(out, "grow").contains("llvm.memcpy"), lro_body(out, "grow"))
+
+@test("an exported function promises nothing about its argument")
+lro_exported()
+    if !lro_ready() then return
+
+    val out = lro_ir("@export(\"lro_sum\")\nsum(x: Big) -> i64 = x.cells[0] + x.cells[1]\nmain()\n    print(sum(Big([1; 20])))\n",
+                     None)
+
+    for line in lines_of(out)
+        if line.starts_with("define ") && line.contains("sum")
+            assert(!line.contains("readonly"), line)
+
+@test("a function with a variant copies its large parameter, since the check writes the slot")
+lro_variant_copies()
+    if !lro_ready() then return
+
+    val text = raw"""
+        down(x: Big, n: i64) -> i64
+            variant 100 - x.cells[0]
+            if x.cells[0] >= 4 then x.cells[0] else down(Big([x.cells[0] + 1; 20]), n - 1) + x.cells[1]
+
+        """
+    val out = lro_ir(text + "main()\n    print(down(Big([1; 20]), 3))\n", None)
+    val line = lro_define(out, "down")
+
+    assert(!line.contains("readonly"), line)
+    assert(lro_body(out, "down").contains("llvm.memcpy"), lro_body(out, "down"))
+
+    lro_prints(text + raw"""
+        main()
+            val b = Big([1; 20])
+            print(down(b, 3), b.cells[0], b.cells[1])
+        """, "10 1 1\n")
+
+// -- the programs ---------------------------------------------------------------------------------------
+
+@test("a large struct reaches its callee intact through a function value, a closure and a trait object")
+lro_every_route()
+    lro_prints(raw"""
+        trait Reads
+            read(self, x: Big) -> i64
+
+        struct Scale
+            k: i64
+
+        impl Reads for Scale
+            read(self, x: Big) -> i64 = x.cells[2] * self.k
+
+        grow(x: Big) -> i64
+            x.cells[0] += 10
+            x.cells[0] + x.cells[1]
+
+        look(x: Big) -> i64 = x.cells[0] * 100 + x.cells[19]
+
+        apply(f: &Fn(Big) -> i64, t: Big) -> i64 = f(t)
+
+        main()
+            val t = Big([1; 20])
+            val k = 3
+            val f = (x: Big) -> x.cells[5] * k
+            val s: &Reads = Scale(4)
+            print(apply(grow, t), apply(look, t), f(t), s.read(t), t.cells[0])
+        """, "12 101 3 4 1\n")
