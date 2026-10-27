@@ -59,7 +59,17 @@ array_literal(cx: &Analyzer, span: Span, elems: Buf[Expr], expected: Option[Type
     // for being an `int` nobody wrote. Where the position asks for an element type, every element
     // is read at that type and nothing here decides it. Elements of two types meet at the wider, as
     // the arms of an `if` do: `[b, n]` over a `byte` and an `int` is an `[int; 2]`.
-    if elem_exp.is_none() then ts = analyze_operands(cx, elems, None, true)
+    //
+    // **Tuples meet part by part**, each part by the same rule: `[(0, 0), (big, 2)]` over a `long`
+    // `big` is a `[2](long, int)`, the first `0` taking the type of the part at its place in the other
+    // element, exactly as `[0, big]` does. Where the parts have no type to meet at, the elements are
+    // read as they always were and the literal is refused for holding two types.
+    val parts = if elem_exp.is_none() && shapes_tuples(elems) then tuple_parts_meet(cx, elems) else None
+
+    if parts.is_some()
+        for item in elems
+            ts.push(type_expr(cx, item, parts))
+    elif elem_exp.is_none() then ts = analyze_operands(cx, elems, None, true)
     else
         for item in elems
             ts.push(type_expr(cx, item, elem_exp))
@@ -179,6 +189,136 @@ private settled_element(ts: Buf[TExpr], wanted: Option[Type]) -> Type
 
     Unknown
 end settled_element
+
+// Whether an unannotated literal's elements have a tuple written out among them, anywhere down its
+// rows -- the elements whose parts can meet one by one.
+private shapes_tuples(es: Buf[Expr]) -> bool
+    if es.len() < 2 then return false
+
+    for e in es
+        if mentions_tuple(e) then return true
+
+    false
+end shapes_tuples
+
+private mentions_tuple(e: Expr) -> bool = *e.kind match
+    Tuple(_) -> true
+    ArrayLit(xs) -> xs.len() > 1 && shapes_tuples(xs) || xs.len() == 1 && mentions_tuple(xs.at(0))
+    _ -> false
+
+// The one type the elements meet at, worked out part by part, where every element then reads at it
+// without a complaint -- and nothing where they do not, so the literal is read as it always was and
+// its complaint is the one it always had.
+//
+// **Found by a reading thrown away whole**: the parts are read once to learn their types and once to
+// check that every element takes the type they came to; the reading the program keeps is the one
+// made at it afterwards.
+private tuple_parts_meet(cx: &Analyzer, es: Buf[Expr]) -> Option[Type]
+    val tried = begin_trial(cx)
+    val met = parts_meet(cx, es)
+    var clean = met.is_some() && !refused_since(cx, tried)
+
+    if clean
+        for e in es
+            val t = texpr_type(type_expr(cx, e, met))
+
+            if refused_since(cx, tried) || t == Unknown || disagree(t, met.unwrap()) then clean = false
+
+    discard_trial(cx, tried)
+
+    if clean then met else None
+end tuple_parts_meet
+
+// The type a column of expressions meets at: a tuple of what each column of their parts meets at
+// where all of them are tuples of one arity, an array of what all their elements meet at where all
+// are array literals of one length, and otherwise the type they settle on as the operands of an
+// unannotated array literal, where that is one type.
+private parts_meet(cx: &Analyzer, es: Buf[Expr]) -> Option[Type]
+    val arity = shared_arity(es)
+
+    if arity > 0
+        var parts: Buf[Type] = buf()
+
+        for j in 0..<arity
+            var column: Buf[Expr] = buf()
+
+            for e in es
+                column.push(part_at(e, j))
+
+            val t = parts_meet(cx, column)
+
+            if t.is_none() then return None
+
+            parts.push(t.unwrap())
+
+        return Some(Struct(registered_tuple(cx.an, parts)))
+    end if
+
+    val rows = shared_row_length(es)
+
+    if rows > 0
+        var all: Buf[Expr] = buf()
+
+        for e in es
+            for i in 0..<rows
+                all.push(part_at(e, i))
+
+        val t = parts_meet(cx, all)
+
+        return if t.is_some() then Some(Array(int(rows), t.unwrap())) else None
+    end if
+
+    val ts = analyze_operands(cx, es, None, true)
+
+    if ts.is_empty() then return None
+
+    val first = texpr_type(ts.at(0))
+
+    if first == Unknown || no_value(first) then return None
+
+    for t in ts
+        if !type_eq(texpr_type(t), first) then return None
+
+    Some(first)
+end parts_meet
+
+// How many parts every one of `es` has as a tuple written out, or 0 where they are not all one.
+private shared_arity(es: Buf[Expr]) -> usize
+    var n: usize = 0
+
+    for e in es
+        val k = *e.kind match
+            Tuple(parts) -> parts.len()
+            _ -> 0
+
+        if k == 0 || n != 0 && k != n then return 0
+
+        n = k
+
+    n
+end shared_arity
+
+// How many elements every one of `es` has as an array literal, or 0 where they are not all one.
+private shared_row_length(es: Buf[Expr]) -> usize
+    var n: usize = 0
+
+    for e in es
+        val k = *e.kind match
+            ArrayLit(xs) -> xs.len()
+            _ -> 0
+
+        if k == 0 || n != 0 && k != n then return 0
+
+        n = k
+
+    n
+end shared_row_length
+
+// Part `i` of a tuple or an array literal written out.
+private part_at(e: Expr, i: usize) -> Expr = *e.kind match
+    Tuple(parts) -> parts.at(i)
+    ArrayLit(xs) -> xs.at(i)
+    _ -> e
 
 // -- reading one ---------------------------------------------------------------------------------
 

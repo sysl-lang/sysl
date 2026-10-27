@@ -1,0 +1,179 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.replace_all
+
+// The tuples written out among an unannotated array literal's elements meet part by part, each part
+// by the rule two operands meet by (`reference/arrays.md`): a bare literal takes the type of the part
+// at its place in another element, and two typed parts meet at the wider or are refused. A tuple of
+// nothing but bare literals is a pair of whatever its neighbour says, as `Some(0)` is an option of
+// it -- so a generic argument and an operator operand meet the same way. Each program names the
+// type it expects by binding the literal at it, which a tuple converts to only as itself.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private tlu_ready() -> bool = std_root().is_ok() && clang_available()
+
+private tlu_root(text: string) -> string
+    val root = replace_all(make_temp_dir("sysl-tlu").unwrap(), "//", "/")
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+    root
+end tlu_root
+
+// What a one-file program prints, or the report it was refused with.
+private tlu_ran(text: string) -> string
+    val root = tlu_root(text)
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            val said = replace_all(failure_text(why), s"$root/", "")
+
+            remove_dir_all(root).unwrap_or(())
+            return said
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end tlu_ran
+
+private tlu_report(text: string) -> string
+    val root = tlu_root(text)
+
+    val out = emit_llvm_text(s"$root/main.sysl", None) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> if made.report.is_empty() then "" else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    replace_all(out, s"$root/", "")
+end tlu_report
+
+private tlu_prints(text: string, want: string)
+    if !tlu_ready() then return
+
+    assert_eq(tlu_ran(text), want)
+end tlu_prints
+
+// Refused with exactly `message`, first, at `at` (`line:col`).
+private tlu_refused(text: string, message: string, at: string)
+    if !tlu_ready() then return
+
+    val said = tlu_report(text)
+    val head = s"error: $message"
+    val place = s"--> main.sysl:$at\n"
+
+    assert(said.starts_with(head) && said.contains(place),
+           s"expected a report starting\n$head\nlocated at$place\ngot\n$said")
+end tlu_refused
+
+// -- an array literal -----------------------------------------------------------------------------
+
+@test("a literal part takes the type of the typed part at its place in another tuple")
+tlu_repro() =
+    tlu_prints("val spots = [(0, 0), (i64(1) << 40, 2)]\nval w: [2](long, int) = spots\n" +
+               "print(spots[0].0, spots[1].0, spots[1].1, w.len)\n",
+               "0 1099511627776 2 2\n")
+
+@test("the typed tuple may come first")
+tlu_typed_first() =
+    tlu_prints("val spots = [(i64(1) << 40, 2), (0, 0)]\nval w: [2](long, int) = spots\n" +
+               "print(w[0].0, w[1].0)\n",
+               "1099511627776 0\n")
+
+@test("nested tuples meet part by part however deep")
+tlu_nested() =
+    tlu_prints("val t = [((0, 1), 2), ((i64(3), 4u8), 5)]\nval w: [2]((long, byte), int) = t\n" +
+               "print((w[1].0).0, (w[0].0).1, w[1].1)\n",
+               "3 1 5\n")
+
+@test("each part settles on its own, from a different element")
+tlu_mixed_positions() =
+    tlu_prints("val t = [(1, 0u8), (i64(5), 2)]\nval w: [2](long, byte) = t\n" +
+               "print(w[0].0, w[0].1, w[1].0, w[1].1)\n",
+               "1 0 5 2\n")
+
+@test("three elements meet, a float literal among the integer ones making that part a real")
+tlu_three() =
+    tlu_prints("val t = [(0, 0.5), (1, 2), (i64(7), 1)]\nval w: [3](long, real) = t\n" +
+               "print(w[0].1, w[1].1, w[2].0)\n",
+               "0.5 2 7\n")
+
+@test("a float literal part takes an f32 part's type")
+tlu_f32() =
+    tlu_prints("val t = [(1.5, 0), (2.5f32, 1)]\nval w: [2](f32, int) = t\nprint(w[0].0, w[1].0)\n",
+               "1.5 2.5\n")
+
+@test("a negative literal part takes the typed part's type")
+tlu_negative() =
+    tlu_prints("val t = [(-1, 0), (i64(2), -3)]\nval w: [2](long, int) = t\nprint(w[0].0, w[1].1)\n",
+               "-1 -3\n")
+
+@test("rows of tuples meet across the rows")
+tlu_rows() =
+    tlu_prints("val t = [[(0, 0)], [(i64(1), 2)]]\nval w: [2][1](long, int) = t\nprint(w[1][0].0, w[0][0].0)\n",
+               "1 0\n")
+
+@test("a tuple of literals beside a tuple-typed name takes the name's type")
+tlu_beside_name() =
+    tlu_prints("var p: (long, int) = (9, 9)\nval t = [(0, 0), p]\nval w: [2](long, int) = t\n" +
+               "print(w[0].0, w[1].0)\n",
+               "0 9\n")
+
+@test("two typed parts meet at the wider")
+tlu_wider() =
+    tlu_prints("var b: byte = 7\nvar n = 300\nval t = [(b, 1), (n, 2)]\nval w: [2](int, int) = t\n" +
+               "print(w[0].0, w[1].0)\n",
+               "7 300\n")
+
+@test("a literal part its neighbour cannot hold takes its default, and the neighbour widens to it")
+tlu_literal_default() =
+    tlu_prints("val t = [(1u8, 0), (300, 0)]\nval w: [2](int, int) = t\nprint(w[0].0, w[1].0)\n",
+               "1 300\n")
+
+@test("a part of another kind rides along")
+tlu_string_part() =
+    tlu_prints("val t = [(0, \"a\"), (i64(1), \"b\")]\nval w: [2](long, string) = t\nprint(w[0].1, w[1].0)\n",
+               "a 1\n")
+
+@test("two typed parts that do not meet are still refused, naming both tuples")
+tlu_disagree() =
+    tlu_refused("var u: u32 = 1\nvar n = 2\nval bad = [(u, 0), (n, 0)]\nprint(bad[0].1)\n",
+                "an array literal needs one element type, got (uint, int) and (int, int)", "3:11")
+
+@test("tuples of different arity are refused")
+tlu_arity() =
+    tlu_refused("val bad = [(0, 0), (i64(1), 2, 3)]\nprint(bad.len)\n",
+                "an array literal needs one element type, got (int, int) and (long, int, int)", "1:11")
+
+// -- the same cause elsewhere ---------------------------------------------------------------------
+
+@test("an operator operand that is a tuple of literals takes the other operand's type")
+tlu_operator() =
+    tlu_prints("var n: long = 0\nprint((0, 0) == (n, 0), (n, 1) == (0, 1))\n", "true true\n")
+
+@test("a generic argument that is a tuple of literals takes the typed argument's type")
+tlu_generic() =
+    tlu_prints("second[T](a: T, b: T) -> T = b\n" +
+               "val g = second((0, 0), (i64(1) << 40, 2))\nval h = second((i64(1) << 40, 2), (0, 0))\n" +
+               "val wg: (long, int) = g\nval wh: (long, int) = h\n" +
+               "print(wg.0, wh.0)\n",
+               "1099511627776 0\n")
+
+@test("the arms of an if and a match meet part by part")
+tlu_branches() =
+    tlu_prints("pick(c: bool) -> int\n" +
+               "    val p = if c then (0, 0) else (i64(1) << 40, 2)\n" +
+               "    val q = if c then (i64(1), 2) elif !c then (0, 0) else (3, 4)\n" +
+               "    val m = c match\n        true -> (0, 0)\n        false -> (i64(3), 4)\n" +
+               "    val wp: (long, int) = p\n    val wq: (long, int) = q\n    val wm: (long, int) = m\n" +
+               "    print(wp.0, wq.0, wm.0)\n    1\n\npick(false)\n",
+               "1099511627776 0 3\n")
