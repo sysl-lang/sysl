@@ -1,0 +1,239 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// An `if`, a `match` or a block whose every finishing branch is a bare literal takes the type its
+// position expects exactly as one literal does -- under an annotation, at a parameter, as a result,
+// and through a generic argument, where the parameter's type is worked out from the call's own
+// expected type. With no type expected it stays `int`. Where one literal disagrees with the rest,
+// the complaint points at that literal.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private ile_skip() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return true
+
+    false
+
+private ile_skip_run() -> bool
+    if ile_skip() then return true
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return true
+
+    false
+
+private ile_write(main: string) -> string
+    val root = make_temp_dir("sysl-ile").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(root + "/package.hocon", "package {\n  name = \"probe\"\n}\n").unwrap()
+    write_text(root + "/main.sysl", main).unwrap()
+    root
+
+private ile_ran(main: string) -> string
+    val root = ile_write(main)
+    val exe = root + "/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            val said = failure_text(why)
+
+            remove_dir_all(root).unwrap_or(())
+            return said
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end ile_ran
+
+// The program is refused with exactly this message, first, at this line and column of `main.sysl`.
+private ile_refused(main: string, message: string, at: string)
+    val root = ile_write(main)
+
+    val out = emit_llvm_text(root, None) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> if made.report.is_empty() then made.text else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+
+    assert(out.starts_with(s"error: $message\n --> ") || out.starts_with(s"error: $message\n  --> "),
+           s"expected 'error: $message' first, got: $out")
+    assert(out.index_of(s"/main.sysl:$at\n").is_some(), s"expected it at main.sysl:$at, got: $out")
+
+private ile_fill() -> string = "import sysl.buf.{Buf, buf_filled}\n\n"
+
+// -- accepted: the literal's tier, in every position --------------------------------------------
+
+@test("an if of literals under a u8 annotation is a u8, with a literal only a u8 holds")
+ile_annotation()
+    if ile_skip_run() then return
+
+    assert_eq(ile_ran("val c = true\nval x: u8 = if c then 255 else 0\nprint(x)\n"), "255\n")
+
+@test("an if of literals at a u8 parameter and as a u8 result")
+ile_parameter_and_result()
+    if ile_skip_run() then return
+
+    assert_eq(ile_ran("take(b: u8) -> u8 = b\nret(c: bool) -> u8 = if c then 200 else 0\n\n" +
+                      "print(take(if true then 7 else 0))\nprint(ret(true))\n"), "7\n200\n")
+
+@test("an if of literals as a generic argument takes the element type the annotation settles")
+ile_generic_argument()
+    if ile_skip_run() then return
+
+    assert_eq(ile_ran(ile_fill() + "val c = true\nval live: Buf[u8] = buf_filled(3, if c then 255 else 0)\n" +
+                      "print(live.len())\nprint(live[0])\n"), "3\n255\n")
+
+@test("a three-arm match with a wildcard, under an annotation and as a generic argument")
+ile_match_three_arms()
+    if ile_skip_run() then return
+
+    assert_eq(ile_ran(ile_fill() + "val k = 2\n" +
+                      "val m: u8 = k match\n    0 -> 10\n    1 -> 20\n    _ -> 250\n" +
+                      "val n: Buf[u8] = buf_filled(2, k match\n    0 -> 10\n    1 -> 20\n    _ -> 255)\n" +
+                      "print(m)\nprint(n[1])\n"), "250\n255\n")
+
+@test("an if nested in a match arm comes to the literal's type through both")
+ile_if_in_match()
+    if ile_skip_run() then return
+
+    assert_eq(ile_ran(ile_fill() + "val c = false\nval k = 5\n" +
+                      "val n: Buf[u8] = buf_filled(2, k match\n    0 -> 10\n" +
+                      "    _ -> if c then 40 else 255)\nprint(n[0])\n"), "255\n")
+
+@test("an elif chain of literals takes the expected type in every branch")
+ile_elif_chain()
+    if ile_skip_run() then return
+
+    assert_eq(ile_ran(ile_fill() + "pick(k: int) -> Buf[u8] = buf_filled(1, if k == 0 then 1 " +
+                      "elif k == 1 then 2 else 255)\n\n" +
+                      "print(pick(0)[0])\nprint(pick(1)[0])\nprint(pick(9)[0])\n"), "1\n2\n255\n")
+
+@test("a branch that is a block ends in a literal, after statements of its own")
+ile_block_final_value()
+    if ile_skip_run() then return
+
+    assert_eq(ile_ran(ile_fill() + "val k = 3\n" +
+                      "val n: Buf[u8] = buf_filled(1, k match\n    0 -> 1\n    _ ->\n" +
+                      "        print(\"other\")\n        255)\nprint(n[0])\n"), "other\n255\n")
+
+@test("a branch ending in continue is no evidence, and the literal beside it still takes u8")
+ile_arm_ending_in_continue()
+    if ile_skip_run() then return
+
+    assert_eq(ile_ran(ile_fill() + "for i in 0..<3\n" +
+                      "    val n: Buf[u8] = buf_filled(1, if i == 1 then continue else 255)\n" +
+                      "    print(n[0])\n"), "255\n255\n")
+
+@test("an if of literals at an f32 result and as an f32 generic argument")
+ile_f32()
+    if ile_skip_run() then return
+
+    assert_eq(ile_ran(ile_fill() + "half(c: bool) -> f32 = if c then 0.5 else 1\n\n" +
+                      "val fs: Buf[f32] = buf_filled(2, if false then 1 else 0.25)\n" +
+                      "print(half(true))\nprint(fs[0])\n"), "0.5\n0.25\n")
+
+@test("a negative literal arm into i8, directly and through a generic argument")
+ile_negative_into_i8()
+    if ile_skip_run() then return
+
+    assert_eq(ile_ran(ile_fill() + "val c = true\nval s: i8 = if c then -128 else 1\n" +
+                      "val b: Buf[i8] = buf_filled(1, if c then -128 else 127)\nprint(s)\nprint(b[0])\n"),
+              "-128\n-128\n")
+
+@test("a literal arm beside a u8 name takes u8, directly and through a generic argument")
+ile_mixed_with_a_name()
+    if ile_skip_run() then return
+
+    assert_eq(ile_ran(ile_fill() + "val x: u8 = 255\nval c = false\nval y: u8 = if c then x else 0\n" +
+                      "val b: Buf[u8] = buf_filled(1, if c then 0 else x)\nprint(y)\nprint(b[0])\n"),
+              "0\n255\n")
+
+@test("a u64 literal no int holds is fine in an arm under a Buf[u64] annotation")
+ile_wide_literal()
+    if ile_skip_run() then return
+
+    assert_eq(ile_ran(ile_fill() + "val c = true\n" +
+                      "val b: Buf[u64] = buf_filled(1, if c then 18446744073709551615 else 0)\n" +
+                      "print(b[0])\n"),
+              "18446744073709551615\n")
+
+@test("with no expected type an if of literals stays int, and a generic argument with it")
+ile_no_expected_type()
+    if ile_skip_run() then return
+
+    assert_eq(ile_ran("val c = true\nval d = if c then 1 else 0\nval e: int = d\nprint(e)\n"), "1\n")
+    if ile_skip() then return
+
+    ile_refused(ile_fill() + "val c = true\nval d = buf_filled(1, if c then 1 else 0)\nval e: Buf[u8] = d\n",
+                "cannot initialize 'e': declared sysl.buf.Buf[byte] but the value is sysl.buf.Buf[int]",
+                "5:1")
+
+// -- refused: at the literal that does not fit --------------------------------------------------
+
+@test("an arm out of a u8's range is refused at that arm, in every position")
+ile_out_of_range_arm()
+    if ile_skip() then return
+
+    ile_refused("val c = true\nval x: u8 = if c then 1 else 300\n", "the literal 300 does not fit byte",
+                "2:30")
+    ile_refused(ile_fill() + "val c = true\nval a: Buf[u8] = buf_filled(3, if c then 256 else 0)\n",
+                "the literal 256 does not fit byte", "4:42")
+    ile_refused("val k = 1\nval m: u8 = k match\n    0 -> 1\n    _ -> 256\n",
+                "the literal 256 does not fit byte", "4:10")
+    ile_refused("val c = true\nval s: i8 = if c then -129 else 0\n", "the literal -129 does not fit i8",
+                "2:23")
+
+@test("arms that disagree, 1 against 2.5, are refused at the 2.5 under an annotation")
+ile_disagree_annotation()
+    if ile_skip() then return
+
+    ile_refused("val c = true\nval y: u8 = if c then 1 else 2.5\n",
+                "cannot initialize 'y': declared byte but the value is real", "2:30")
+    ile_refused("f(c: bool)\n    val y: u8 = if c then 1 else 2.5\n    print(y)\n\nf(true)\n",
+                "cannot initialize 'y': declared byte but the value is real", "2:34")
+
+@test("arms that disagree are refused at the 2.5 at a parameter and through a generic argument")
+ile_disagree_argument()
+    if ile_skip() then return
+
+    ile_refused("take(b: u8) -> u8 = b\n\nprint(take(if true then 1 else 2.5))\n",
+                "'b' of 'take' is byte, but real was given", "3:32")
+    ile_refused(ile_fill() + "val c = true\nval b: Buf[u8] = buf_filled(3, if c then 1 else 2.5)\n",
+                "'value' of 'sysl.buf.buf_filled' is byte, but real was given", "4:49")
+
+@test("arms that disagree are refused at the 2.5 as a result, written either way")
+ile_disagree_result()
+    if ile_skip() then return
+
+    ile_refused("ret(c: bool) -> u8 = if c then 1 else 2.5\n\nprint(ret(true))\n",
+                "function 'ret' should return byte, but its body yields real", "1:39")
+    ile_refused("ret(c: bool) -> u8\n    return if c then 1 else 2.5\n\nprint(ret(true))\n",
+                "return type mismatch: expected byte, got real", "2:29")
+
+@test("a disagreeing literal nested in a match arm is the one pointed at")
+ile_disagree_nested()
+    if ile_skip() then return
+
+    ile_refused("val c = true\nval k = 1\nval m: u8 = k match\n    0 -> 1\n    1 -> if c then 2 else 3.5\n" +
+                "    _ -> 2\n", "cannot initialize 'm': declared byte but the value is real", "5:27")
+
+@test("where no arm meets the type, or an arm is not a literal, the whole statement is blamed")
+ile_disagree_whole()
+    if ile_skip() then return
+
+    ile_refused("val c = true\nval y: u8 = if c then 1.5 else 2.5\n",
+                "cannot initialize 'y': declared byte but the value is real", "2:1")
+    ile_refused("val c = true\nval r = 2.5\nval y: u8 = if c then 1 else r\n",
+                "cannot initialize 'y': declared byte but the value is real", "3:1")
