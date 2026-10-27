@@ -491,7 +491,7 @@ cat <<STEPS | tee -a $log
      git -C $repo push origin v$version
 
 2. The GitHub release (fill in $notes first):
-     gh release create v$version --repo sysl-lang/sysl --prerelease --title "sysl $version — <headline>" --notes-file $notes $tarball
+     gh release create v$version --repo sysl-lang/sysl --latest --title "sysl $version — <headline>" --notes-file $notes $tarball
 
 3. Hash the asset the release URL serves, not the local file:
      curl -sL -o $out/dl.tar.gz https://github.com/sysl-lang/sysl/releases/download/v$version/$asset
