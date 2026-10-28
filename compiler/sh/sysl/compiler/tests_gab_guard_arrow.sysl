@@ -1,0 +1,129 @@
+module sh.sysl.compiler
+@tests
+
+// **A match guard is read above the level a closure begins at** (`reference/patterns.md § Guards`):
+// the arrow after `if wide` is the arm's, whatever the guard's last token is. The axes: the guard's
+// shape (a bare name, a field, a call, a call taking a parenthesised closure, `not`, `&&`, a
+// comparison), the arm's layout (one line, a block body, several arms), and a closure in the body.
+// Skipped: a bare-metal target (the parse is the same on every target).
+
+private val gab_wrap: string = raw"""
+    struct Opts
+        wide: bool
+
+    pred(f: &Fn(int) -> bool, n: int) -> bool = f(n)
+
+    yes(n: int) -> bool = n > 1
+    """
+
+@test("a guard that is a bare name takes the arrow after it as the arm's")
+gab_bare_name()
+    if !azb_ready() then return
+
+    azb_prints(azb_main(raw"""
+        pick(n: int, wide: bool) -> string
+            n match
+                1..10 if wide -> "wide"
+                else "other"
+
+        print(pick(3, true), pick(3, false))
+        """), "wide other\n")
+
+@test("a guard that is a field takes the arrow as the arm's")
+gab_field()
+    if !azb_ready() then return
+
+    azb_prints(azb_main(gab_wrap + raw"""
+        pick(n: int, o: Opts) -> string
+            n match
+                1..10 if o.wide -> "wide"
+                else "other"
+
+        print(pick(3, Opts(true)), pick(3, Opts(false)))
+        """), "wide other\n")
+
+@test("a guard that is a call takes the arrow as the arm's")
+gab_call()
+    if !azb_ready() then return
+
+    azb_prints(azb_main(gab_wrap + raw"""
+        pick(n: int) -> string
+            n match
+                1..10 if yes(n) -> "big"
+                else "small"
+
+        print(pick(3), pick(1))
+        """), "big small\n")
+
+@test("a guard that calls with a parenthesised closure still parses it")
+gab_closure_argument()
+    if !azb_ready() then return
+
+    azb_prints(azb_main(gab_wrap + raw"""
+        pick(n: int) -> string
+            n match
+                1..10 if pred(x -> x > 1, n) -> "big"
+                else "small"
+
+        print(pick(3), pick(1))
+        """), "big small\n")
+
+@test("a guard written with !, with &&, ||, ==, and a comparison each take the arrow as the arm's")
+gab_operators()
+    if !azb_ready() then return
+
+    azb_prints(azb_main(raw"""
+        pick(n: int, a: bool, b: bool) -> string
+            n match
+                0 if !a -> "not"
+                1 if a && b -> "and"
+                2 if a || b -> "or"
+                3 if a == b -> "eq"
+                else "other"
+
+        print(pick(0, false, true), pick(1, true, true), pick(2, false, true), pick(3, false, false), pick(1, true, false))
+        """), "not and or eq other\n")
+
+@test("a guarded arm with a block body and a later arm both read")
+gab_block_body()
+    if !azb_ready() then return
+
+    azb_prints(azb_main(raw"""
+        pick(n: int, wide: bool) -> string
+            n match
+                1..10 if wide ->
+                    val s = "wide"
+                    s
+                1..10 -> "narrow"
+                else "other"
+
+        print(pick(3, true), pick(3, false), pick(30, true))
+        """), "wide narrow other\n")
+
+@test("a closure in the arm's body is still a closure")
+gab_closure_in_body()
+    if !azb_ready() then return
+
+    azb_prints(azb_main(raw"""
+        apply(f: &Fn(int) -> int, n: int) -> int = f(n)
+
+        pick(n: int, wide: bool) -> int
+            n match
+                1..10 if wide -> apply(x -> x + 1, n)
+                else apply(x -> x * 2, n)
+
+        print(pick(3, true), pick(3, false))
+        """), "4 6\n")
+
+@test("a guard with no arrow after it is still refused")
+gab_missing_arrow_refused()
+    if !azb_ready() then return
+
+    azb_refused(azb_main(raw"""
+        pick(n: int, wide: bool) -> string
+            n match
+                1..10 if wide "wide"
+                else "other"
+
+        print(pick(3, true))
+        """), ["'->' expected"])
