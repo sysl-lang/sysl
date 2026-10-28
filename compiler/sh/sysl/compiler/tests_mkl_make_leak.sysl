@@ -1,0 +1,259 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// **`T::Make(c, payload)` builds one new value** (`type_reflect.sysl`'s `built_variant`). A payload
+// that is not a tuple written on the spot is held in a local and its fields read off it, inside a
+// block the compiler writes; that block's span runs through the argument, so the local's scope is the
+// block, its value is a statement temporary (`emit_expr.sysl`), and `drop_values.sysl`'s
+// `constructs` sees through it, so a type with a `Drop` gets the `&T` a constructor gives.
+//
+// Every program runs on the counted heap, so a leaked payload is a line on stderr and a failed test.
+// Cells skipped, with the reason: a struct's `T::Make` (only a variant is made from a payload on this
+// line); separate compilation and codegen units (the form lays down no symbol of its own).
+
+// The program built with the counted heap and run: everything it said, and whether it exited zero.
+private mkl_counted(text: string) -> (string, bool)
+    val root = make_temp_dir("sysl-mkl").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", forms_imported(text)).unwrap()
+    force_alloc_counting(true)
+
+    val built = build_native_program(s"$root/main.sysl", None, None, DefaultOptimization,
+                                     Some(s"$root/built"))
+
+    force_alloc_counting(false)
+
+    built match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (failure_text(why), false)
+        Ok(_) -> ()
+
+    val said = capture(s"$root/built", [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> ("could not be started", false)
+        Ok(o) -> (o.text + o.err.unwrap_or(""), o.status.ok())
+end mkl_counted
+
+private mkl_enum() -> string = raw"""
+    import sysl.buf.{Buf, buf}
+
+    enum E
+        A(a: Buf[int], b: Buf[int])
+        One(a: Buf[int])
+        B
+
+    filled(n: int) -> Buf[int]
+        var b: Buf[int] = buf()
+
+        for i in 0..<n
+            b.push(i)
+
+        b
+
+    sizes(e: E) -> string = e match
+        A(a, b) -> s"${a.len()}+${b.len()}"
+        One(a) -> s"${a.len()}"
+        B -> "B"
+
+    """
+
+@test("'T::Make(c, payload)' from a payload held in a variable leaves nothing live on the counted heap")
+mkl_held_payload_does_not_leak()
+    if !enm_ready() then return
+
+    val out = mkl_counted(mkl_enum() + raw"""
+        held[T](p: (Buf[int], Buf[int])) -> T
+            for const c in T::Variants
+                if const c.name == "A"
+                    val e = T::Make(c, p)
+
+                    return e
+
+            panic("no A")
+
+        returned[T](p: (Buf[int], Buf[int])) -> T
+            for const c in T::Variants
+                if const c.name == "A" then return T::Make(c, p)
+
+            panic("no A")
+
+        plain(p: (Buf[int], Buf[int])) -> E
+            for const c in E::Variants
+                if const c.name == "A"
+                    val e = E::Make(c, p)
+
+                    return e
+
+            E.B
+
+        go()
+            val x = filled(2)
+
+            print(sizes(held[E]((x, x))), sizes(returned[E]((x, filled(1)))), sizes(plain((filled(3), x))))
+
+        go()
+        """)
+
+    assert(out.1, out.0)
+    assert_eq(out.0, "2+2 2+1 3+2\n")
+end mkl_held_payload_does_not_leak
+
+@test("'T::Make(c, payload)' from a literal, a call and a match binding: each built once, nothing leaked")
+mkl_payload_sources()
+    if !enm_ready() then return
+
+    val out = mkl_counted(mkl_enum() + raw"""
+        pair() -> (Buf[int], Buf[int]) = (filled(1), filled(4))
+
+        from_literal[T]() -> T
+            for const c in T::Variants
+                if const c.name == "A" then return T::Make(c, (filled(2), filled(3)))
+
+            panic("no A")
+
+        from_call[T]() -> T
+            for const c in T::Variants
+                if const c.name == "A"
+                    val e = T::Make(c, pair())
+
+                    return e
+
+            panic("no A")
+
+        from_binding[T](o: Option[(Buf[int], Buf[int])]) -> T
+            for const c in T::Variants
+                if const c.name == "A"
+                    return o match
+                        Some(q) -> T::Make(c, q)
+                        None -> T::Make(c, (filled(0), filled(0)))
+
+            panic("no A")
+
+        single[T](a: Buf[int]) -> T
+            for const c in T::Variants
+                if const c.name == "One"
+                    val e = T::Make(c, a)
+
+                    return e
+
+            panic("no One")
+
+        empty[T]() -> T
+            for const c in T::Variants
+                if const c.name == "B" then return T::Make(c, ())
+
+            panic("no B")
+
+        go()
+            print(sizes(from_literal[E]()), sizes(from_call[E]()))
+            print(sizes(from_binding[E](Some((filled(5), filled(6))))), sizes(from_binding[E](None)))
+            print(sizes(single[E](filled(7))), sizes(empty[E]()))
+
+        go()
+        """)
+
+    assert(out.1, out.0)
+    assert_eq(out.0, "2+3 1+4\n5+6 0+0\n7 B\n")
+end mkl_payload_sources
+
+@test("'T::Make(c, payload)' in a loop and in a closure leaves nothing live on the counted heap")
+mkl_loop_and_closure()
+    if !enm_ready() then return
+
+    val out = mkl_counted(mkl_enum() + raw"""
+        looped[T](n: int) -> int
+            var made = 0
+
+            for i in 0..<n
+                val p = (filled(i), filled(1))
+
+                for const c in T::Variants
+                    if const c.name == "A"
+                        val e = T::Make(c, p)
+
+                        made += 1
+
+            made
+
+        in_closure(p: (Buf[int], Buf[int])) -> string
+            val f = (q: (Buf[int], Buf[int])) ->
+                var s = ""
+
+                for const c in E::Variants
+                    if const c.name == "A"
+                        val e = E::Make(c, q)
+
+                        s = sizes(e)
+
+                s
+
+            f(p)
+
+        go()
+            print(looped[E](4), in_closure((filled(2), filled(5))))
+
+        go()
+        """)
+
+    assert(out.1, out.0)
+    assert_eq(out.0, "4 2+5\n")
+end mkl_loop_and_closure
+
+@test("'T::Make(c, payload)' of an enum with a Drop builds the '&T' a constructor does, and drops it once")
+mkl_drop_type_is_a_reference()
+    if !enm_ready() then return
+
+    val out = mkl_counted(raw"""
+        import sysl.buf.{Buf, buf}
+
+        enum Noisy
+            Pair(a: int, b: Buf[int])
+            Nothing
+
+        impl Drop for Noisy
+            drop(self)
+                print("drop")
+
+        held[T](p: (int, Buf[int])) -> &T
+            for const c in T::Variants
+                if const c.name == "Pair"
+                    val n: &T = T::Make(c, p)
+
+                    return n
+
+            panic("no Pair")
+
+        literal[T]() -> &T
+            for const c in T::Variants
+                if const c.name == "Pair" then return T::Make(c, (2, buf()))
+
+            panic("no Pair")
+
+        go()
+            var b: Buf[int] = buf()
+
+            b.push(9)
+
+            val n = held[Noisy]((3, b))
+
+            print(*n is Pair(3, _))
+
+            val m = literal[Noisy]()
+
+            print(*m is Pair(2, _))
+
+        go()
+        print("after")
+        """)
+
+    assert(out.1, out.0)
+    assert_eq(out.0, "true\ntrue\ndrop\ndrop\nafter\n")
+end mkl_drop_type_is_a_reference
