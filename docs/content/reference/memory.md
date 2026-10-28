@@ -245,7 +245,7 @@ a pointer.
 
 **Its other bounds a reference meets through its referent**, wherever a member call on the
 reference would reach the referent's members: a `[C: Index[usize, int]]` body takes a `&Buf[int]`
-and reads the buffer ([generics](/reference/generics/#a-reference-meets-its-referents-bounds)).
+and reads the buffer ([generics](/reference/generics/#a-reference-meets-its-referent-s-bounds)).
 
 ### There is no allocation keyword
 
