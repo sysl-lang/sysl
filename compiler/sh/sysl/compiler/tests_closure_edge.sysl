@@ -913,8 +913,10 @@ ce_one_that_writes_a_capture_is_refused()
     assert(ce_says(said, "write 'var bump'"), said)
 
 // The counting closure is the reason the mode is `*self` at all: the captures are the closure's own
-// copies, and the variable they were taken from does not move.
-@test("a counting closure still counts, and does not touch what it captured")
+// copies, and the variable they were taken from does not move -- which is why reading that variable
+// after the closure is refused (`tests_cwr_capture_write.sysl`), and the count is read through the
+// closure.
+@test("a counting closure still counts in its own copy")
 ce_a_counting_closure_still_counts()
     if !ce_ready() then return
 
@@ -925,8 +927,8 @@ ce_a_counting_closure_still_counts()
             n += 1
             n
 
-        print(bump(), bump(), bump(), n)
-        """), "1 2 3 0\n")
+        print(bump(), bump(), bump())
+        """), "1 2 3\n")
 
 @test("a boxed callable in a 'val' is unaffected")
 ce_a_boxed_callable_in_a_val()
@@ -958,6 +960,8 @@ ce_the_reading_closure_without_an_allocator()
 // **A `*self` method called ON a capture is admitted.** What a write has to reach for the refusal
 // to fire is `self`, and `c.bump()` has no such store -- the store is inside `bump`'s own body, and
 // what the closure writes is the receiver it passed.
+// A `*self` call on a capture writes the closure's copy, as an assignment would, so the closure is
+// held in a `var` and counts in its copy (`tests_cwr_capture_write.sysl` has the refusals).
 @test("one calling a '*self' method on a capture is called, with the by-value answer")
 ce_calling_a_star_self_method_on_a_capture()
     if !ce_ready() then return
@@ -972,10 +976,31 @@ ce_calling_a_star_self_method_on_a_capture()
 
         var c = Counter(0)
 
+        var tick = () -> c.bump()
+
+        print(tick(), tick())
+        """), "1 2\n")
+
+@test("and one held in a 'val' is refused, since the call writes its copy")
+ce_calling_a_star_self_method_in_a_val()
+    if !ce_ready() then return
+
+    val said = ce_err(raw"""
+        struct Counter
+            n: int
+
+            bump(*self) -> int
+                self.n += 1
+                self.n
+
+        var c = Counter(0)
+
         val tick = () -> c.bump()
 
-        print(tick(), tick(), c.n)
-        """), "1 2 0\n")
+        print(tick())
+        """)
+
+    assert(ce_says(said, "write 'var tick'"), said)
 
 private ce_counter() -> string = raw"""
     struct Counter

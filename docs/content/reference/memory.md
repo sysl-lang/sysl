@@ -154,6 +154,11 @@ named still reaches the referent's own (`r.hash()`, `r.eq(*s)`), the one level a
 through. To key by **value**, key on the value type — `Map[Node, V]` — or on a wrapper whose `Hash`
 and `Eq` read the fields.
 
+`Eq` and `Hash` are the two a reference answers for itself. **Its other bounds it meets through its
+referent**, wherever a member call on the reference would reach the referent's members: a
+`[C: Index[usize, int]]` body takes a `&Buf[int]` and reads the buffer
+([generics](/reference/generics/#a-reference-meets-its-referents-bounds)).
+
 ### There is no allocation keyword
 
 A reference is made by writing an ordinary construction **where a `&T` is expected**. The expectation

@@ -1,0 +1,306 @@
+module sysl.container.ring
+@tests
+
+import sysl.buf.{Buf, buf}
+
+/** What `InlineRing` promises: `Ring`'s answers over storage it carries itself. The wrapping is
+ * where the failures are, so most cells arrange for `head` to be off zero first; the capacity axis
+ * is crossed at one slot, a power of two and a size that is not one.
+ */
+
+@test("a fresh inline ring is empty, and its capacity is N")
+iring_fresh_is_empty()
+    var r = inline_ring[int, 4]()
+
+    assert_eq(r.capacity(), 4)
+    assert_eq(r.len(), 0)
+    assert(r.is_empty())
+    assert(!r.is_full())
+    assert_eq(r.first(), None)
+    assert_eq(r.last(), None)
+    assert_eq(r.pop_front(), None)
+    assert_eq(r.pop_back(), None)
+    assert_eq(r.get(0), None)
+end iring_fresh_is_empty
+
+@test("a plain declaration is an empty ring too")
+iring_declaration_is_empty()
+    var r: InlineRing[int, 3]
+
+    assert(r.is_empty())
+    assert(r.push_back(7))
+    assert_eq(r[0], 7)
+end iring_declaration_is_empty
+
+@test("pushing on the back reads back in order, and a full ring refuses and keeps what it had")
+iring_push_back_and_full()
+    var r = inline_ring[int, 3]()
+
+    assert(r.push_back(1))
+    assert(r.push_back(2))
+    assert(!r.is_full())
+    assert(r.push_back(3))
+    assert(r.is_full())
+    assert(!r.push_back(4))
+    assert(!r.push_front(0))
+
+    assert_eq(r.len(), 3)
+    assert_eq(r.first(), Some(1))
+    assert_eq(r.last(), Some(3))
+    assert_eq(r[0], 1)
+    assert_eq(r[1], 2)
+    assert_eq(r.at(2), 3)
+end iring_push_back_and_full
+
+@test("pushing on the front reverses the order and wraps head past zero")
+iring_push_front_wraps()
+    var r = inline_ring[int, 3]()
+
+    assert(r.push_front(1))
+    assert(r.push_front(2))
+    assert(r.push_front(3))
+    assert(!r.push_front(4))
+    assert_eq(r[0], 3)
+    assert_eq(r[1], 2)
+    assert_eq(r[2], 1)
+    assert_eq(r.pop_back(), Some(1))
+    assert_eq(r.pop_front(), Some(3))
+    assert_eq(r.pop_front(), Some(2))
+    assert_eq(r.pop_front(), None)
+end iring_push_front_wraps
+
+@test("a wrapped run reads back in order from either end")
+iring_wrapped_run()
+    var r = inline_ring[int, 4]()
+
+    for i in 1..4 do r.push_back(i)
+
+    assert_eq(r.pop_front(), Some(1))
+    assert_eq(r.pop_front(), Some(2))
+    assert(r.push_back(5))
+    assert(r.push_back(6))
+
+    assert_eq(r.len(), 4)
+    assert_eq(r[0], 3)
+    assert_eq(r[3], 6)
+    assert_eq(r.first(), Some(3))
+    assert_eq(r.last(), Some(6))
+    assert_eq(r.pop_back(), Some(6))
+    assert_eq(r.pop_back(), Some(5))
+    assert_eq(r.pop_front(), Some(3))
+    assert_eq(r.pop_front(), Some(4))
+    assert(r.is_empty())
+end iring_wrapped_run
+
+@test("an index past the live run answers nothing rather than a stale slot")
+iring_get_past_the_run()
+    var r = inline_ring[int, 4]()
+
+    r.push_back(1)
+    r.push_back(2)
+    r.pop_front()
+
+    assert_eq(r.get(0), Some(2))
+    assert_eq(r.get(1), None)
+    assert_eq(r.get(4), None)
+end iring_get_past_the_run
+
+@test("setting through a subscript writes the slot the ring is using")
+iring_set_through_subscript()
+    var r = inline_ring[int, 3]()
+
+    r.push_back(1)
+    r.push_back(2)
+    r.push_back(3)
+    r.pop_front()
+    r.push_back(4)
+    r[0] = 20
+    r.set(2, 40)
+
+    assert_eq(r[0], 20)
+    assert_eq(r[1], 3)
+    assert_eq(r[2], 40)
+end iring_set_through_subscript
+
+@test("overwriting drops the oldest value once the ring is full")
+iring_overwrite()
+    var r = inline_ring[int, 3]()
+
+    assert_eq(r.overwrite(1), None)
+    assert_eq(r.overwrite(2), None)
+    assert_eq(r.overwrite(3), None)
+    assert_eq(r.overwrite(4), Some(1))
+    assert_eq(r.overwrite(5), Some(2))
+    assert_eq(r.len(), 3)
+    assert_eq(r[0], 3)
+    assert_eq(r[2], 5)
+end iring_overwrite
+
+@test("a ring of no slots evicts what it was given")
+iring_no_slots()
+    var r = inline_ring[int, 0]()
+
+    assert_eq(r.capacity(), 0)
+    assert(r.is_empty())
+    assert(r.is_full())
+    assert(!r.push_back(1))
+    assert(!r.push_front(1))
+    assert_eq(r.overwrite(9), Some(9))
+    assert_eq(r.pop_front(), None)
+end iring_no_slots
+
+@test("a ring of one slot is a ring")
+iring_one_slot()
+    var r = inline_ring[int, 1]()
+
+    assert(r.push_back(1))
+    assert(r.is_full())
+    assert(!r.push_back(2))
+    assert_eq(r.overwrite(2), Some(1))
+    assert_eq(r.first(), Some(2))
+    assert_eq(r.last(), Some(2))
+    assert_eq(r.pop_back(), Some(2))
+    assert(r.is_empty())
+    assert(r.push_front(3))
+    assert_eq(r[0], 3)
+end iring_one_slot
+
+@test("head walks the whole storage over many laps, for a size that is a power of two and one that is not")
+iring_many_laps()
+    var four = inline_ring[int, 4]()
+    var five = inline_ring[int, 5]()
+
+    for i in 0..<30
+        assert(four.push_back(i))
+        assert(four.push_back(i + 100))
+        assert(five.push_front(i))
+        assert(five.push_back(i + 100))
+        assert_eq(four.pop_front(), Some(i))
+        assert_eq(four.pop_front(), Some(i + 100))
+        assert_eq(five.pop_front(), Some(i))
+        assert_eq(five.pop_back(), Some(i + 100))
+
+    assert(four.is_empty())
+    assert(five.is_empty())
+end iring_many_laps
+
+@test("clearing forgets the run and the ring is usable again")
+iring_clear()
+    var r = inline_ring[int, 3]()
+
+    r.push_back(1)
+    r.push_back(2)
+    r.pop_front()
+    r.push_back(3)
+    r.clear()
+
+    assert(r.is_empty())
+    assert_eq(r.first(), None)
+    assert(r.push_back(9))
+    assert_eq(r[0], 9)
+end iring_clear
+
+@test("for walks the ring front to back across the wrap, an empty one not at all")
+iring_for_walks()
+    var r = inline_ring[int, 4]()
+    var n = 0
+
+    for x in r do n += 1
+
+    assert_eq(n, 0)
+
+    for i in 1..4 do r.push_back(i)
+
+    r.pop_front()
+    r.push_back(5)
+
+    var seen: Buf[int] = buf()
+
+    for x in r do seen.push(x)
+
+    assert_eq(seen.len(), 4)
+    assert_eq(seen[0], 2)
+    assert_eq(seen[1], 3)
+    assert_eq(seen[2], 4)
+    assert_eq(seen[3], 5)
+end iring_for_walks
+
+@test("a cursor keeps reading the run it started on when the ring changes under it")
+iring_cursor_is_a_snapshot()
+    var r = inline_ring[int, 3]()
+
+    r.push_back(1)
+    r.push_back(2)
+
+    var c = r.walk()
+
+    r.push_back(3)
+    r.pop_front()
+
+    assert_eq(c.next(), Some(1))
+    assert_eq(c.next(), Some(2))
+    assert_eq(c.next(), None)
+end iring_cursor_is_a_snapshot
+
+struct Uart
+    id: int
+    rx: InlineRing[u8, 4]
+    tx: InlineRing[u8, 3]
+
+@test("a struct holds a ring as a field, and two fields are two rings")
+iring_struct_field()
+    var u: Uart
+
+    u.id = 7
+    assert(u.rx.push_back(1))
+    assert(u.rx.push_back(2))
+    assert(u.tx.push_back(9))
+    assert_eq(u.rx.len(), 2)
+    assert_eq(u.tx.len(), 1)
+    assert_eq(u.rx.pop_front(), Some(1))
+    assert_eq(u.tx.pop_front(), Some(9))
+    assert_eq(u.tx.pop_front(), None)
+    assert_eq(u.id, 7)
+
+    val v = Uart(1, inline_ring[u8, 4](), inline_ring[u8, 3]())
+
+    assert(v.rx.is_empty())
+end iring_struct_field
+
+private iring_filled(n: int) -> InlineRing[int, 4]
+    var r = inline_ring[int, 4]()
+
+    for i in 0..<n do r.push_back(i)
+
+    r
+end iring_filled
+
+@test("a ring is passed and returned by value, and a copy is its own ring")
+iring_by_value()
+    var a = iring_filled(3)
+    var b = a
+
+    b.pop_front()
+    b.push_back(99)
+
+    assert_eq(a.len(), 3)
+    assert_eq(a[0], 0)
+    assert_eq(b[0], 1)
+    assert_eq(b[2], 99)
+end iring_by_value
+
+@test("values that own memory are moved in and out and survive the wrap")
+iring_owning_values()
+    var r = inline_ring[string, 2]()
+
+    assert(r.push_back("a" + "1"))
+    assert(r.push_back("b" + "2"))
+    assert(!r.push_back("c"))
+    assert_eq(r.pop_front(), Some("a1"))
+    assert(r.push_back("c" + "3"))
+    assert_eq(r.overwrite("d" + "4"), Some("b2"))
+    assert_eq(r[0], "c3")
+    assert_eq(r[1], "d4")
+    r.clear()
+    assert(r.is_empty())
+end iring_owning_values
