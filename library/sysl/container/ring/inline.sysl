@@ -1,0 +1,181 @@
+module sysl.container.ring
+@no_alloc
+
+/** A ring of a **fixed capacity that carries its own storage**: the `N` slots are an `[N]T` inside
+ * the value, so a struct can simply hold one, and a copy of the struct holds a copy of the ring.
+ *
+ * ```
+ * struct Uart
+ *     rx: InlineRing[u8, 16]
+ *
+ * var u: Uart
+ * u.rx.push_back(1)
+ * ```
+ *
+ * **It is `Ring` with the storage moved inside**, and its members have `Ring`'s names and answers:
+ * `push_back` and `push_front` answer whether there was room, `pop_front` and `pop_back` answer an
+ * `Option`, `overwrite` drops the oldest value of a full ring, `r[i]` counts from the front and panics
+ * past the end, and `for x in r` walks front to back. Code can move between the two by changing the
+ * type and the line that makes it.
+ *
+ * **A fresh one is `inline_ring[T, N]()`, or a plain `var r: InlineRing[T, N]`**: a zeroed slot is an
+ * empty slot, so no slot needs a value to be made, and a type with no default value can still be held.
+ * `N` need not be a power of two; wrapping is a compare and a subtract, as in `Ring`.
+ *
+ * A value is moved in and out of its slot with `slot_put` and `slot_take`, exactly as `Ring` does it.
+ */
+struct InlineRing[T, const N: usize]
+    private slots: [N]T
+    private head: usize
+    private live: usize
+
+    /** How many values it can hold at once, which is `N`. */
+    capacity(self) -> usize = N
+
+    /** How many values are in it. */
+    len(self) -> usize = self.live
+
+    is_empty(self) -> bool = self.live == 0
+
+    /** Whether the next `push_back` will be refused. */
+    is_full(self) -> bool = self.live == N
+
+    // Which slot the `i`th value from the front lives in; `head` is below `N` and `i` below `live`, so
+    // one subtraction lands it.
+    private seat(self, i: usize) -> usize
+        var at = self.head + i
+
+        if at >= N then at -= N
+
+        at
+    end seat
+
+    /** The `i`th value from the front; past the end panics, and `get` is the total form. */
+    at(self, i: usize) -> T
+        if i >= self.live then inline_past_end(i, self.live)
+
+        self.slots[self.seat(i)]
+
+    /** The `i`th value from the front, or nothing where there is no such value. */
+    get(self, i: usize) -> Option[T] =
+        if i >= self.live then None else Some(self.slots[self.seat(i)])
+
+    set(*self, i: usize, v: T)
+        if i >= self.live then inline_past_end(i, self.live)
+
+        self.slots[self.seat(i)] = v
+
+    first(self) -> Option[T] = if self.live == 0 then None else Some(self.slots[self.head])
+
+    last(self) -> Option[T] =
+        if self.live == 0 then None else Some(self.slots[self.seat(self.live - 1)])
+
+    /** Adds to the back and answers whether there was room; a full ring is left unchanged. */
+    push_back(*self, v: T) -> bool
+        if self.live == N then return false
+
+        slot_put(&self.slots[self.seat(self.live)], v)
+        self.live += 1
+        true
+    end push_back
+
+    /** Adds to the front and answers whether there was room. */
+    push_front(*self, v: T) -> bool
+        if self.live == N then return false
+
+        self.head = if self.head == 0 then N - 1 else self.head - 1
+        slot_put(&self.slots[self.head], v)
+        self.live += 1
+        true
+    end push_front
+
+    /** Takes from the front, moving the value out and leaving its slot empty. */
+    pop_front(*self) -> Option[T]
+        if self.live == 0 then return None
+
+        val v = slot_take(&self.slots[self.head])
+
+        self.head = self.seat(1)
+        self.live -= 1
+        Some(v)
+    end pop_front
+
+    /** Takes from the back, moving the value out and leaving its slot empty. */
+    pop_back(*self) -> Option[T]
+        if self.live == 0 then return None
+
+        self.live -= 1
+        Some(slot_take(&self.slots[self.seat(self.live)]))
+
+    /** Adds to the back, **dropping the oldest value to make room** where the ring is full, and
+     * answers whatever was dropped. With `N == 0` the value is dropped at once.
+     */
+    overwrite(*self, v: T) -> Option[T]
+        if N == 0 then return Some(v)
+
+        var out: Option[T] = None
+
+        if self.live == N
+            out = Some(slot_take(&self.slots[self.head]))
+            self.head = self.seat(1)
+            self.live -= 1
+
+        slot_put(&self.slots[self.seat(self.live)], v)
+        self.live += 1
+        out
+    end overwrite
+
+    /** Lets go of every value, there and then, leaving every slot empty. */
+    clear(*self)
+        while self.live > 0
+            self.pop_front()
+
+        self.head = 0
+    end clear
+end InlineRing
+
+/** `for x in r` walks the ring from the front to the back. The cursor holds a copy of the run it
+ * started on, so pushing onto the ring while a cursor is live does not change what it reads.
+ */
+impl[T, const N: usize] Walk for InlineRing[T, N]
+    type Walker = InlineRingCursor[T, N]
+    walk(self) -> InlineRingCursor[T, N] = InlineRingCursor(self, 0)
+
+impl[T, const N: usize] Index[usize, T] for InlineRing[T, N]
+    index(self, i: usize) -> T = self.at(i)
+
+impl[T, const N: usize] IndexSet[usize, T] for InlineRing[T, N]
+    index_set(*self, i: usize, v: T) = self.set(i, v)
+
+/** An empty ring of capacity `N`: `inline_ring[int, 8]()`. */
+inline_ring[T, const N: usize]() -> InlineRing[T, N]
+    var r: InlineRing[T, N]
+
+    r
+end inline_ring
+
+private inline_past_end(i: usize, n: usize) -> never
+    prints("panic: index ")
+    printi(long(i))
+    prints(" past the ")
+    printi(long(n))
+    prints(" elements of a Ring\n")
+    exit(1)
+end inline_past_end
+
+/** A walk from the front to the back over a copy of the ring it started from. */
+struct InlineRingCursor[T, const N: usize]
+    ring: InlineRing[T, N]
+    at: usize
+
+impl[T, const N: usize] Iterate for InlineRingCursor[T, N]
+    type Item = T
+
+    next(*self) -> Option[T]
+        if self.at >= self.ring.len() then return None
+
+        val v = self.ring.slots[self.ring.seat(self.at)]
+
+        self.at += 1
+        Some(v)
+    end next

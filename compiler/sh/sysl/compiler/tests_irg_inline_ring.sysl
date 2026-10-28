@@ -1,0 +1,70 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_temp_dir, remove_dir_all, write_text}
+
+// **`sysl.container.ring.InlineRing[T, N]` builds for a bare Thumb machine**: it is allocation-free
+// (`@no_alloc`), its storage is an `[N]T` inside the value, and a struct holding one needs no heap and
+// no runtime. The behaviour is `library/sysl/container/ring/inline_tests.sysl`; this file is the
+// target axis, for a power-of-two and a non-power-of-two capacity, one slot, a struct field, and the
+// walk and subscript traits.
+
+private irg_ready() -> bool = std_root().is_ok() && clang_available()
+
+private irg_build_c(text: string, target: string) -> (int, string)
+    val root = make_temp_dir("sysl-irg-c").unwrap()
+
+    write_text(s"$root/package.hocon", "package {\n  name = \"probe\"\n}\n").unwrap()
+    write_text(s"$root/main.sysl", forms_imported(text)).unwrap()
+
+    var said: Buf[string] = buf()
+    val sink = &said
+    var args: [7]string = ["sysl", "build-c", "--target", target, "-o", s"$root/probe.a", root]
+    val code = run_cli(args[..], piece -> sink.push(piece))
+
+    reset_search_paths()
+    remove_dir_all(root).unwrap_or(())
+
+    var text_out = ""
+
+    for piece in said
+        text_out = text_out + piece
+
+    (code, text_out)
+end irg_build_c
+
+@test("an inline ring held in a struct builds for a bare Thumb machine, at a power of two, an odd size and one slot")
+irg_builds_on_thumb()
+    if !irg_ready() then return
+
+    val (code, said) = irg_build_c(raw"""
+        import sysl.container.ring.{InlineRing, inline_ring}
+
+        struct Dev
+            rx: InlineRing[u8, 16]
+            tx: InlineRing[u32, 5]
+            one: InlineRing[u8, 1]
+
+        var dev: Dev
+
+        @export("main")
+        probe() -> u32
+            dev.rx.push_back(1)
+            dev.tx.push_front(2)
+            dev.one.overwrite(3)
+
+            var local = inline_ring[u16, 3]()
+
+            local.overwrite(4)
+
+            var sum = u32(local[0])
+
+            for x in dev.tx do sum += x
+
+            sum + u32(dev.rx[0]) + u32(dev.rx.pop_front().unwrap_or(0)) + u32(dev.one.len())
+        """, "thumb-freestanding-softfp")
+
+    assert(!said.contains("error"), said)
+    assert_eq(code, 0)
+end irg_builds_on_thumb
