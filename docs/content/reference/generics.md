@@ -2122,6 +2122,39 @@ big empty small 7
 `pick(5)` compiles: `x.nothing_here()` is never type-checked for an `int`, because its arm is not the
 one `int` takes. An ordinary `if` would check both arms for every instance.
 
+**A `const` member reached through a type parameter is a constant too**, so a generic body can ask
+the type it was given a question and keep the arm that answers it; the arm not taken is not checked
+for that type:
+
+```sysl
+trait Format
+    keyed() -> bool
+
+struct Json
+end Json
+
+struct Compact
+end Compact
+
+impl Format for Json
+    const keyed() -> bool = true
+
+impl Format for Compact
+    const keyed() -> bool = false
+
+shape[F: Format](x: int) -> string
+    if const F.keyed()
+        "keys"
+    else
+        x.nothing_here()
+
+print(shape[Json](1))
+```
+
+```output
+keys
+```
+
 **A chain is decided entirely at compile time.** Every `elif` after an `if const` is an `elif const`,
 and a plain `else` covers the rest; a run-time test goes in a plain `if` inside that `else`. A
 condition not known at compile time is refused:

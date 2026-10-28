@@ -1,0 +1,302 @@
+module sh.sysl.compiler
+@tests
+
+// An `if const` whose condition is a `const` member reached through a type parameter
+// (`if const F.keyed()`, `reference/generics.md § if const`), the question a codec asks of its format:
+// is it keyed or positional. Each instance of the generic evaluates the member of the type it was
+// given and takes one arm; the other arm is not compiled for it.
+//
+// The axes: the format (keyed, positional), one type parameter or two, the condition's shape (the
+// call alone, `&&`, `||`, a comparison over a string answer), the nesting (an `if const` inside an
+// arm, an `elif const` chain), the arm not taken (code that would not type-check for that format),
+// the member (declared `const`, plain but computable, plain and not computable), the module the
+// format is in, and the condition that is no constant (a run-time parameter).
+// Skipped: bare metal and codegen units (the arm is chosen while analysing, before either matters).
+
+private val cq7_formats: string = raw"""
+    trait Format
+        keyed() -> bool
+        name() -> string
+
+    struct Json
+    end Json
+
+    struct Compact
+    end Compact
+
+    impl Format for Json
+        const keyed() -> bool = true
+        const name() -> string = "json"
+
+    impl Format for Compact
+        const keyed() -> bool = false
+        const name() -> string = "compact"
+
+    """
+
+@test("a const member through a type parameter picks the arm for each format")
+cq7_keyed_and_positional()
+    if !azb_ready() then return
+
+    azb_prints(azb_main(cq7_formats + raw"""
+        shape[F: Format]() -> string
+            if const F.keyed()
+                "keys"
+            else
+                "positions"
+
+        print(shape[Json](), shape[Compact]())
+        """), "keys positions\n")
+
+@test("the arm a format does not take is never type-checked for it")
+cq7_untaken_arm_is_not_checked()
+    if !azb_ready() then return
+
+    azb_prints(azb_main(cq7_formats + raw"""
+        only[F: Format](x: int) -> int
+            if const F.keyed()
+                x.nothing_here()
+            else
+                x + 1
+
+        only_keyed[F: Format](x: int) -> int
+            if const F.keyed()
+                x * 10
+            else
+                x.nothing_here()
+
+        print(only[Compact](4), only_keyed[Json](4))
+        """), "5 40\n")
+
+@test("the arm a format does take is checked, so a defect in it is refused")
+cq7_taken_arm_is_checked()
+    if !azb_ready() then return
+
+    azb_refused(azb_main(cq7_formats + raw"""
+        only[F: Format](x: int) -> int
+            if const F.keyed()
+                x.nothing_here()
+            else
+                x + 1
+
+        print(only[Json](4))
+        """), ["nothing_here"])
+
+@test("two type parameters, each asked in a nested if const, give four answers")
+cq7_two_parameters_nested()
+    if !azb_ready() then return
+
+    azb_prints(azb_main(cq7_formats + raw"""
+        both[A: Format, B: Format]() -> string
+            if const A.keyed()
+                if const B.keyed()
+                    "kk"
+                else
+                    "kp"
+            elif const B.keyed()
+                "pk"
+            else
+                "pp"
+
+        print(both[Json, Json](), both[Json, Compact](), both[Compact, Json](), both[Compact, Compact]())
+        """), "kk kp pk pp\n")
+
+@test("the same format passed for both parameters is asked twice, and agrees with itself")
+cq7_same_format_twice()
+    if !azb_ready() then return
+
+    azb_prints(azb_main(cq7_formats + raw"""
+        both[A: Format, B: Format]() -> string
+            if const A.keyed() && B.keyed()
+                "both keyed"
+            elif const A.keyed() || B.keyed()
+                "one keyed"
+            else
+                "none"
+
+        print(both[Json, Json](), both[Json, Compact](), both[Compact, Json](), both[Compact, Compact]())
+        """), "both keyed one keyed one keyed none\n")
+
+@test("a const member answering a string is compared at compile time")
+cq7_string_answer()
+    if !azb_ready() then return
+
+    azb_prints(azb_main(cq7_formats + raw"""
+        named[F: Format](x: int) -> int
+            if const F.name() == "json"
+                x.nothing_here()
+            else
+                x
+
+        print(named[Compact](3))
+        """), "3\n")
+
+@test("a plain member whose body can run is as good as a const one")
+cq7_plain_member_that_can_run()
+    if !azb_ready() then return
+
+    azb_prints(azb_main(raw"""
+        trait Format
+            keyed() -> bool
+
+        struct Json
+        end Json
+
+        impl Format for Json
+            keyed() -> bool = true
+
+        shape[F: Format]() -> string
+            if const F.keyed()
+                "keys"
+            else
+                "positions"
+
+        print(shape[Json]())
+        """), "keys\n")
+
+@test("a member that reaches outside the program is refused, naming the chain")
+cq7_member_outside_the_program()
+    if !azb_ready() then return
+
+    azb_refused(azb_main(raw"""
+        trait Format
+            keyed() -> bool
+
+        struct Json
+        end Json
+
+        extern getpid() -> int
+
+        impl Format for Json
+            keyed() -> bool = getpid() > 0
+
+        shape[F: Format]() -> string
+            if const F.keyed()
+                "keys"
+            else
+                "positions"
+
+        print(shape[Json]())
+        """), ["this value cannot be computed while compiling: it calls 'Json.keyed', which calls "
+               + "'getpid', which is outside the program"])
+
+@test("a run-time value is no condition, and the refusal says what a condition may be")
+cq7_runtime_value_refused()
+    if !azb_ready() then return
+
+    azb_refused(azb_main(cq7_formats + raw"""
+        shape[F: Format](flag: bool) -> string
+            if const flag
+                "keys"
+            else
+                "positions"
+
+        print(shape[Json](true))
+        """), ["an 'if const' is decided while compiling, so its condition has to be known then"])
+
+@test("a member called on a run-time value is refused the same way")
+cq7_member_on_a_runtime_value_refused()
+    if !azb_ready() then return
+
+    azb_refused(azb_main(raw"""
+        trait Format
+            keyed(self) -> bool
+
+        struct Json
+            deep: bool
+        end Json
+
+        impl Format for Json
+            keyed(self) -> bool = self.deep
+
+        shape[F: Format](f: F) -> string
+            if const f.keyed()
+                "keys"
+            else
+                "positions"
+
+        print(shape(Json(true)))
+        """), ["an 'if const' is decided while compiling, so its condition has to be known then"])
+
+@test("a format in another module answers the same question")
+cq7_format_in_another_module()
+    if !azb_ready() then return
+
+    azb_prints([("", "main.sysl", raw"""
+        import fmts.{Format, Json, Compact}
+
+        shape[F: Format]() -> string
+            if const F.keyed()
+                "keys"
+            else
+                "positions"
+
+        print(shape[Json](), shape[Compact]())
+        """), ("fmts", "f.sysl", raw"""
+        module fmts
+
+        trait Format
+            keyed() -> bool
+
+        struct Json
+        end Json
+
+        struct Compact
+        end Compact
+
+        impl Format for Json
+            const keyed() -> bool = true
+
+        impl Format for Compact
+            const keyed() -> bool = false
+        """)], "keys positions\n")
+
+@test("a generic type's method asks its own parameter, and one body serves both formats")
+cq7_a_method_of_a_generic_type()
+    if !azb_ready() then return
+
+    azb_prints(azb_main(cq7_formats + raw"""
+        struct Writer[F: Format]
+            n: int
+        end Writer
+
+        impl[F: Format] Writer[F]
+            open(self) -> string
+                if const F.keyed()
+                    "{"
+                else
+                    "["
+
+        print(Writer[Json](0).open(), Writer[Compact](0).open())
+        """), "{ [\n")
+
+@test("an if const over a format sits beside a run-time test in the arm it takes")
+cq7_runtime_if_inside_an_arm()
+    if !azb_ready() then return
+
+    azb_prints(azb_main(cq7_formats + raw"""
+        pad[F: Format](n: int) -> string
+            if const F.keyed()
+                if n > 1 then "keys" else "key"
+            else
+                if n > 1 then "slots" else "slot"
+
+        print(pad[Json](1), pad[Json](2), pad[Compact](1), pad[Compact](2))
+        """), "key keys slot slots\n")
+
+@test("a format marker trait and a const member agree about the same format")
+cq7_marker_trait_agrees()
+    if !azb_ready() then return
+
+    azb_prints(azb_main(cq7_formats + raw"""
+        trait Positional
+        end Positional
+
+        impl Positional for Compact
+        end Compact
+
+        by_member[F: Format]() -> string = if const F.keyed() then "keys" else "positions"
+        by_marker[F: Format]() -> string = if const F: Positional then "positions" else "keys"
+
+        print(by_member[Json](), by_marker[Json](), by_member[Compact](), by_marker[Compact]())
+        """), "keys keys positions positions\n")
