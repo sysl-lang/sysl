@@ -301,7 +301,9 @@ private renderer(cx: &Analyzer, span: Span, t: TExpr, asked: string,
     // definitions, a name that was refused -- and rendering it is not a second one.
     if vt == Unknown then return (t, "", None)
 
-    if shown_by_rule(vt) then return debugger(cx, span, t, asked, form)
+    // An expression that does not finish is refused before the library's `Display for never` is
+    // found, which is there for a never *stored* in something printed (`debugger` tells it).
+    if shown_by_rule(vt) || diverges(cx, t) then return debugger(cx, span, t, asked, form)
 
     val tr = display_bound(cx)
     val here = if !impls_of(cx.an, tr.name, owner_key(vt)).is_empty() then vt else underlying(vt)
@@ -423,9 +425,10 @@ private debugger(cx: &Analyzer, span: Span, t: TExpr, asked: string,
         return (TExpr(span, TIntOp("fixed_text", t, None, vt, Slice(byte_type(), true))),
                 lib_fn(cx, "display_pad"), None)
 
-    // A `never` is not a value at all -- the expression does not finish -- so there is nothing to
-    // show, and asking is the mistake.
-    if here == Never
+    // A `never` that does not finish is not a value at all, so there is nothing to show, and asking is
+    // the mistake. A read of storage of type `never` -- the payload of an `Err` that cannot happen --
+    // is shown through the library's `Display for never`, which nothing ever calls.
+    if here == Never && diverges(cx, t)
         cx.fault(span, s"cannot $asked a never value — it does not implement " +
                  s"'${module_show(library_key("Display"))}'")
         return (t, "", None)

@@ -935,20 +935,16 @@ end impl_bound
 // The type an `impl` is for, and where its members belong.
 impl_target(a: &Analysis, scope: Scope, span: Span, block: ImplDecl) -> (Type, MemberHome)
     *block.for_type.kind match
-        NamedType(written, arg_refs) ->
+        NamedType(written, _) ->
             val key = lookup_type_key(a, scope, written)
             val nom = if key.is_some() then nominal_of(a, key.unwrap()) else None
 
             if nom.is_some() then return named_target(a, scope, span, block, block.for_type,
                                                       key.unwrap(), nom.unwrap())
 
-            // The valueless type is named here rather than left to the resolution, which takes it as
-            // a type like any other -- true, and beside the point when what the block asks is whether
-            // the type can behave. `unit` is not refused: its one value still compares, hashes and
-            // prints, which is what lets a `Result[unit, E]` do the same.
-            if arg_refs.is_empty() && written == "never" then
-                a.fault(scope, span, "'never' has no values, so nothing can be implemented for it")
-
+            // **`never` may be implemented for**, as `unit` may: a type argument can be `never`, and a
+            // `Result[T, never]` compares, hashes and prints only if `never` has the traits that ask
+            // for. A member of such a block is never called, there being no receiver to call it on.
             structural_target(a, scope, span, block, block.for_type)
         _ -> structural_target(a, scope, span, block, block.for_type)
 end impl_target
@@ -1029,8 +1025,7 @@ private structural_target(a: &Analysis, scope: Scope, span: Span, block: ImplDec
                                    buf())
     // Resolved rather than taken as written, so the key is the type's one canonical name and two
     // spellings of one type are one implementation. **A bare `never` is read as the type it names**
-    // rather than refused as a place no value can stand: `impl_target` has already said why a block
-    // for it is wrong, and that is the one complaint.
+    // rather than refused as a place no value can stand, since a block may be written for it.
     // What the line has already been refused for, so that a subject refused for what it is gets
     // that one complaint rather than a second about its parameters.
     val before = a.complaints()

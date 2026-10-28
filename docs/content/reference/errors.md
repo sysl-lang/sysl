@@ -350,6 +350,65 @@ from types it does not own: the block is written beside `Fault`, and `Io` does n
 it. A type may implement `From` several times (`From[int]` and `From[real]` for one type are two
 blocks), so an error type may accept errors from every layer beneath it.
 
+**A generic error type is joined by a generic block**, which converts into every instantiation at
+once. A `?` finds it as `Wrap[Io].from(e)` would: made real at the destination's own arguments, so
+the source may be a fixed type, a type parameter, or an associated type read off a bound
+(`Wrap[S::Error]`).
+
+```sysl
+enum Io
+    NotFound
+
+enum Wrap[E]
+    Cause(inner: E)
+    Timeout
+
+impl[E] From[E] for Wrap[E]
+    from(e: E) -> Wrap[E] = Wrap.Cause(e)
+
+open(ok: bool) -> Result[int, Io] = if ok then Ok(7) else Err(Io.NotFound)
+
+lift[E](r: Result[int, E]) -> Result[int, Wrap[E]]
+    val n = r?
+
+    Ok(n + 1)
+
+read(ok: bool) -> Result[int, Wrap[Io]]
+    val n = open(ok)?
+
+    Ok(n * 2)
+
+print(read(true).is_ok(), read(false).is_err(), lift(read(true)).unwrap_or(0))
+```
+
+```output
+true true 15
+```
+
+A block with a condition (`impl[E: Show] From[E] for Wrap[E]`) converts only where the condition
+holds, and a `?` where it does not is told which bound the source lacks. Where **two** blocks would
+both take the source (`impl[E] From[E]` and `impl[E] From[string]`, meeting at `Wrap[string]`), the
+`?` is refused as ambiguous rather than choosing one; convert with `map_err` first. A generic type
+cannot take a block for one instantiation, so a missing conversion into one is told the generic block
+to write:
+
+```sysl
+enum Wrap[E]
+    Cause(inner: E)
+    Timeout
+
+step() -> Result[int, string] = Err("disk")
+
+outer() -> Result[int, Wrap[string]]
+    val n = step()?
+
+    Ok(n)
+```
+
+```error
+so 'impl[E] From[E] for Wrap[E]' is what joins the two layers
+```
+
 Where there is **no** such block, the `?` is refused, and the diagnostic names the block to write:
 
 ```sysl

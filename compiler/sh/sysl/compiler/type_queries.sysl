@@ -13,8 +13,45 @@ import sysl.math.bigint.{BigInt, from_int, pow, sub, negate, cmp, rem, add, zero
 // no room to hold it, and `never`, which does not come back at all.
 no_value(t: Type) -> bool = t == Unit || t == Never
 
-// Whether a value of this type takes no room, so that a field of it is not stored.
-zero_sized(t: Type) -> bool = t == Unit
+// Whether a value of this type takes no room, so that a field of it is not stored. `never` takes none
+// either: it reaches a field only through a type argument (`Box[never]`), and no value of it is ever
+// there to store.
+zero_sized(t: Type) -> bool = t == Unit || t == Never
+
+// Whether no value of this type can exist: `never`, and anything that would have to hold one by
+// value -- a struct or a tuple with such a field, an array of at least one such element, an enum
+// every variant of which carries one. A variant whose payload is uninhabited can never be built, so a
+// `match` need not name it and lowering never reaches it. A reference is not looked through: what it
+// points at is somebody else's storage, and a recursive type reaches itself only that way.
+uninhabited(t: Type) -> bool = uninhabited_at(t, 0)
+
+private uninhabited_at(t: Type, depth: int) -> bool
+    if depth > 32 then return false
+
+    repr(t) match
+        Never -> true
+        Struct(d) -> any_uninhabited(d.fields, depth + 1)
+        Results(parts) -> any_uninhabited(parts.fields, depth + 1)
+        Array(n, elem) -> n > 0 && uninhabited_at(*elem, depth + 1)
+        Enum(d) ->
+            if d.variants.is_empty() then return false
+
+            for v in d.variants
+                if !any_uninhabited(v.fields, depth + 1) then return false
+
+            true
+        _ -> false
+end uninhabited_at
+
+// Whether one of these fields cannot hold a value.
+uninhabited_fields(fields: Buf[(string, Type)]) -> bool = any_uninhabited(fields, 0)
+
+private any_uninhabited(fields: Buf[(string, Type)], depth: int) -> bool
+    for item in fields
+        if uninhabited_at(item.1, depth) then return true
+
+    false
+end any_uninhabited
 
 // Whether a type parameter is anywhere inside this type, which is what says a declaration is still
 // generic and cannot be lowered.

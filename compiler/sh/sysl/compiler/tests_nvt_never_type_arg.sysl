@@ -1,0 +1,284 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.Search
+
+// `never` as a type argument (`reference/types.md § unit and never`): `Result[T, never]`,
+// `Error[never]`, `Option[never]`, `Buf[never]`, a generic function or `impl` instantiated at it, and
+// a field whose type is a parameter bound to it. A variant whose payload cannot hold a value is never
+// built, so a `match` may leave it out; `?` on a `Result[T, never]` crosses into any error type with
+// no `From`; a type holding `never` compares, hashes and prints as its other parts allow. What stays
+// refused: `never` as a part of an argument (`&never`, `[2]never`, a tuple), as a field, a parameter
+// or a variable written out, and an expression that does not finish wherever a value must arrive --
+// including one a generic parameter would be inferred from.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+// What a program printed and whether it exited zero; a failure to build is its message.
+private nvt_outcome(text: string) -> (string, bool)
+    val root = make_temp_dir("sysl-nvt").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (failure_text(why), false)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> ("the program that was built could not be run", false)
+        Ok(out) -> (out.text + out.err.unwrap_or(""), out.status.ok())
+end nvt_outcome
+
+// The program runs to the end and prints exactly this.
+private nvt_prints(text: string, want: string)
+    if xvr_no_library() then return
+
+    val out = nvt_outcome(text)
+
+    assert(out.1, s"it did not exit zero: ${out.0}")
+    assert_eq(out.0, want)
+end nvt_prints
+
+// What the compiler says about a program, or the text it lowers to.
+private nvt_emit(text: string) -> (string, bool)
+    val root = make_temp_dir("sysl-nvt").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    val out = emit_llvm_text(src, None) match
+        Err(why) -> (why.message, false)
+        Ok(made) ->
+            if !made.report.is_empty() then (analysis_report(made.report), false)
+            else (made.text, true)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end nvt_emit
+
+// The program is refused with exactly one complaint: this message, at this `line:col`.
+private nvt_refused(text: string, message: string, at: string)
+    if xvr_no_library() then return
+
+    val out = nvt_emit(text)
+
+    assert(!out.1, s"it compiled: ${out.0}")
+    assert(out.0.contains(s"error: $message\n"), out.0)
+    assert(out.0.contains(s"main.sysl:$at\n"), out.0)
+    assert_eq(nvt_count(out.0, "error: "), 1, out.0)
+end nvt_refused
+
+private nvt_count(said: string, part: string) -> int
+    var rest = said
+    var n = 0
+
+    loop
+        rest.index_of(part) match
+            None -> break
+            Some(at) ->
+                n += 1
+                rest = rest[at + part.bytes.len..<rest.bytes.len]
+
+    n
+end nvt_count
+
+private val nvt_error: string = "enum Error[E] derives Eq, Hash, Display\n    Io(cause: E)\n    Short\n"
+
+// -- the positions --------------------------------------------------------------------------------
+
+@test("a Result[T, never] is built, printed, compared and unwrapped")
+nvt_result_never() =
+    nvt_prints("never_fails(n: int) -> Result[int, never] = Ok(n * 2)\n" +
+               "val r = never_fails(4)\n" +
+               "print(r, r == Ok(8), r != Ok(1), r.is_ok(), r.unwrap())\n" +
+               "print(never_fails(1).map(x -> x + 1), never_fails(2).unwrap_or(0))\n",
+               "Ok(8) true true true 8\nOk(3) 4\n")
+
+@test("an Error[never] of the program's own, with its derived traits")
+nvt_error_never() =
+    nvt_prints(nvt_error +
+               "header(n: int) -> Result[int, Error[never]] = if n > 0 then Ok(n) else Err(Short)\n" +
+               "print(header(3), header(0), header(0) == Err(Short), header(1) == Ok(2))\n" +
+               "val e: Error[never] = Short\n" +
+               "val f: Error[never] = Short\n" +
+               "print(e, e.hash() == f.hash())\n",
+               "Ok(3) Err(Short) true false\nShort true\n")
+
+@test("an Option[never] is always None, and says so")
+nvt_option_never() =
+    nvt_prints("none() -> Option[never] = None\n" +
+               "val o = none()\n" +
+               "print(o, o.is_none(), o == None, o.is_some())\n" +
+               "o match\n    None -> print(\"none\")\n",
+               "None true true false\nnone\n")
+
+@test("a Buf[never] is empty, and every length operation says so")
+nvt_buf_never() =
+    nvt_prints("import sysl.buf.{Buf, buf}\n" +
+               "count[T](b: Buf[T]) -> usize = b.len()\n" +
+               "val b: Buf[never] = buf()\n" +
+               "var n = 0\n" +
+               "for _ in b\n    n += 1\n" +
+               "print(b.len(), b.is_empty(), count(b), n)\n" +
+               "var c: Buf[never] = buf()\n" +
+               "print(c.pop(), c.view().len)\n" +
+               "c.clear()\n" +
+               "print(c == b, c.len())\n",
+               "0 true 0 0\nNone 0\ntrue 0\n")
+
+@test("a module-level Option[never] and Result[int, never]")
+nvt_module_level() =
+    nvt_prints("val nothing: Option[never] = None\n" +
+               "var fine: Result[int, never] = Ok(1)\n" +
+               "fine = Ok(2)\n" +
+               "print(nothing, fine)\n",
+               "None Ok(2)\n")
+
+@test("nested: a Result[Option[never], never] is covered by Ok(None) alone")
+nvt_nested() =
+    nvt_prints("f() -> Result[Option[never], never] = Ok(None)\n" +
+               "f() match\n    Ok(None) -> print(\"ok none\")\n" +
+               "print(f(), f() == Ok(None))\n",
+               "ok none\nOk(None) true\n")
+
+// -- a generic declaration at never ---------------------------------------------------------------
+
+// The body is checked once, for every `T`; at `never` its reads of `v` are reached by no run, and
+// handing one on -- to a call, a constructor, a binding, `print` -- is what a generic body does.
+@test("a generic function instantiated at never, its body reading the never value")
+nvt_generic_function() =
+    nvt_prints("id[T](x: T) -> T = x\n" +
+               "pass[T: Display](o: Option[T]) -> Option[T] = o match\n" +
+               "    Some(v) ->\n        val w = v\n        print(w)\n        Some(id(v))\n" +
+               "    None -> None\n" +
+               "print(pass[never](None), id[Option[never]](None), pass(Some(3)))\n",
+               "3\nNone None Some(3)\n")
+
+@test("a generic impl block instantiated at never")
+nvt_generic_impl() =
+    nvt_prints(nvt_error +
+               "impl[E] Error[E]\n    is_short(self) -> bool = self match\n" +
+               "        Io(_) -> false\n        Short -> true\n" +
+               "val e: Error[never] = Short\n" +
+               "print(e.is_short())\n",
+               "true\n")
+
+@test("a struct field whose type is a parameter bound to never makes the struct uninhabited")
+nvt_field_at_never() =
+    nvt_prints("struct Box[T]\n    v: T\n    n: int\n" +
+               "f() -> Option[Box[never]] = None\n" +
+               "g() -> Result[int, Box[never]] = Ok(5)\n" +
+               "f() match\n    None -> print(\"none\")\n" +
+               "g() match\n    Ok(v) -> print(v)\n",
+               "none\n5\n")
+
+@test("a variant whose payload is a parameter bound to never, with Eq, Ord, Hash and Display derived")
+nvt_derived_traits() =
+    nvt_prints("enum Pair[T] derives Eq, Ord, Hash, Display\n    L(v: T)\n    R(n: int)\n" +
+               "val p: Pair[never] = R(1)\n" +
+               "val q: Pair[never] = R(1)\n" +
+               "print(p, p == R(1), p < R(2), p.hash() == q.hash(), s\"$p\")\n" +
+               "p match\n    R(n) -> print(n)\n",
+               "R(1) true true true R(1)\n1\n")
+
+@test("a trait implemented for never, reached through a generic at never")
+nvt_impl_for_never() =
+    nvt_prints("trait Speak\n    speak(self) -> string\n" +
+               "impl Speak for never\n    speak(self) -> string = self\n" +
+               "impl Speak for int\n    speak(self) -> string = \"int\"\n" +
+               "say[T: Speak](o: Option[T]) -> string = o match\n" +
+               "    Some(v) -> v.speak()\n    None -> \"none\"\n" +
+               "print(say[never](None), say(Some(1)))\n",
+               "none int\n")
+
+// -- exhaustiveness -------------------------------------------------------------------------------
+
+@test("a match may leave out a variant whose payload is never, and may still write it")
+nvt_match_omits() =
+    nvt_prints(nvt_error +
+               "f() -> Result[int, never] = Ok(1)\n" +
+               "h(n: int) -> Result[int, Error[never]] = if n > 0 then Ok(n) else Err(Short)\n" +
+               "f() match\n    Ok(v) -> print(v)\n" +
+               "f() match\n    Ok(v) -> print(v + 1)\n    Err(e) -> print(\"impossible\", e)\n" +
+               "h(0) match\n    Ok(v) -> print(v)\n    Err(Short) -> print(\"short\")\n" +
+               "val v = f() match\n    Ok(v) -> v * 10\n" +
+               "print(v)\n",
+               "1\n2\nshort\n10\n")
+
+@test("a variant whose payload is inhabited is still required")
+nvt_match_still_required() =
+    nvt_refused(nvt_error + "f() -> Result[int, Error[never]] = Ok(1)\nf() match\n    Ok(v) -> print(v)\n",
+                "match on 'sysl.Result[int, Error[never]]' is not exhaustive; missing Err (add an 'else' arm)",
+                "5:1")
+
+@test("and the Ok arm of a Result[int, never] is required")
+nvt_match_ok_required() =
+    nvt_refused("f() -> Result[int, never] = Ok(1)\nf() match\n    Err(e) -> print(e)\n",
+                "match on 'sysl.Result[int, never]' is not exhaustive; missing Ok (add an 'else' arm)",
+                "2:1")
+
+// -- ? --------------------------------------------------------------------------------------------
+
+// **Decided: `?` on a `Result[T, never]` needs no `From`** -- its failure path is never taken, so
+// there is nothing to convert. Rust asks for `From<Infallible>`; here it would be a block nobody can
+// write a body for.
+@test("? on a Result[T, never] crosses into any error type with no From")
+nvt_try_into_any_error() =
+    nvt_prints("enum Fault\n    Low\n" +
+               "never_fails(n: int) -> Result[int, never] = Ok(n * 2)\n" +
+               "label(n: int) -> Result[string, never] = Ok(\"n\" + n.to_string())\n" +
+               "twice(n: int) -> Result[int, Fault]\n    val x = never_fails(n)?\n    Ok(x + 1)\n" +
+               "same(n: int) -> Result[int, never]\n    val x = never_fails(n)?\n    Ok(x)\n" +
+               "named(n: int) -> Result[string, Fault]\n    val s = label(n)?\n    Ok(s + \"!\")\n" +
+               "generic[E](r: Result[int, E]) -> Result[int, E]\n    val x = r?\n    Ok(x)\n" +
+               "print(twice(4), same(2), named(7), generic(never_fails(3)))\n",
+               "Ok(9) Ok(4) Ok(\"n7!\") Ok(6)\n")
+
+@test("an Err arm of a Result[T, never] hands its payload on as any error")
+nvt_err_arm_converts() =
+    nvt_prints("enum Fault\n    Low\n" +
+               "never_fails() -> Result[int, never] = Ok(1)\n" +
+               "lift() -> Result[int, Fault] = never_fails() match\n" +
+               "    Ok(v) -> Ok(v)\n    Err(e) -> Err(e)\n" +
+               "print(lift().is_ok(), never_fails().map_err(e -> Low).is_ok())\n",
+               "true true\n")
+
+// -- what stays refused ---------------------------------------------------------------------------
+
+@test("a generic parameter is still not inferred from an expression that does not finish")
+nvt_inference_from_divergence() =
+    nvt_refused("id[T](x: T) -> T = x\nprint(id(exit(1)))", "cannot pass an expression that never returns as 'x' of 'id'",
+                "2:10")
+
+@test("nor a constructor's, nor where never was written as the argument")
+nvt_constructor_from_divergence()
+    nvt_refused("val o = Some(exit(1))\nprint(1)", "cannot pass an expression that never returns as 'value' of 'Some'",
+                "1:14")
+    nvt_refused("id[T](x: T) -> T = x\nprint(id[never](exit(1)))",
+                "cannot pass an expression that never returns as 'x' of 'id'", "2:17")
+end nvt_constructor_from_divergence
+
+@test("a call answering never is still not bound")
+nvt_unwrap_err_not_bound() =
+    nvt_refused("f() -> Result[int, never] = Ok(1)\nval y = f().unwrap_err()\nprint(1)",
+                "cannot bind 'y' to an expression that never returns", "2:1")
+
+@test("never as a part of a type argument, a field or a parameter is still refused")
+nvt_parts_refused()
+    nvt_refused("var o: Option[&never] = None", NeverOnlyResult, "1:16")
+    nvt_refused("import sysl.buf.Buf\nvar b: Buf[[2]never]\nprint(1)", NeverOnlyResult, "2:15")
+    nvt_refused("struct S\n    x: never\nprint(1)", NeverOnlyResult, "2:8")
+    nvt_refused("f(x: never) -> int = 1\nprint(1)", NeverOnlyResult, "1:6")
+end nvt_parts_refused

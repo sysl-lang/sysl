@@ -55,6 +55,17 @@ resolve_result(a: &Analysis, scope: Scope, t: TypeRef, subst: Buf[Binding]) -> T
         else resolve_type(a, scope, t, subst)
     _ -> resolve_type(a, scope, t, subst)
 
+// The one complaint about `never` written where a value would have to be held.
+val NeverOnlyResult: string = "'never' is the type of an expression that does not finish, so it can " +
+    "only be a result type or a type argument (as in 'Result[T, never]')"
+
+// The type a written TYPE ARGUMENT means. **`never` is an ordinary type here**: a generic declaration
+// instantiated at it is one with no values in that position, so `Result[T, never]` is a result that
+// cannot fail and `Option[never]` one that is always `None`. Only the argument itself is let through
+// -- `Option[&never]` and `Buf[[4]never]` still name a value of a type that has none.
+resolve_type_arg(a: &Analysis, scope: Scope, t: TypeRef, subst: Buf[Binding]) -> Type =
+    resolve_result(a, scope, t, subst)
+
 // The type a written one means.
 resolve_type(a: &Analysis, scope: Scope, t: TypeRef, subst: Buf[Binding]) -> Type = *t.kind match
     NamedType(name, args) -> resolve_named(a, scope, t.span, name, args, subst, "")
@@ -297,6 +308,16 @@ resolve_list(a: &Analysis, scope: Scope, ts: Buf[TypeRef], subst: Buf[Binding]) 
 
     out
 end resolve_list
+
+// Every type of an argument list, in order, where `never` is a type like any other.
+private resolve_arg_list(a: &Analysis, scope: Scope, ts: Buf[TypeRef], subst: Buf[Binding]) -> Buf[Type]
+    var out: Buf[Type] = buf()
+
+    for item in ts
+        out.push(resolve_type_arg(a, scope, item, subst))
+
+    out
+end resolve_arg_list
 
 // `<N>T` -- a vector, whose lane count is a constant on the terms an array's length is.
 private resolve_vector(a: &Analysis, scope: Scope, span: Span, lanes: Expr, elem: TypeRef,
@@ -1020,8 +1041,7 @@ private resolve_named(a: &Analysis, scope: Scope, span: Span, name: string, args
         if stood_for.is_some() then return substituted(a, scope, span, stood_for.unwrap())
 
     if name == "never"
-        a.fault(scope, span, "'never' is the type of an expression that does not finish, so it can " +
-                "only be a result type")
+        a.fault(scope, span, NeverOnlyResult)
         return Unknown
     end if
 
@@ -1093,7 +1113,7 @@ private resolve_named(a: &Analysis, scope: Scope, span: Span, name: string, args
                 _ -> positional.push(item)
 
         return object_of(a, scope, span, name, key.unwrap(), d.unwrap(),
-                         resolve_list(a, scope, positional, subst), named, sigil)
+                         resolve_arg_list(a, scope, positional, subst), named, sigil)
     end if
 
     // **A raw pointer excuses its own pointee and nothing deeper** -- `*net.Conn` needs no layout,
@@ -1150,11 +1170,11 @@ end read_type_args
 private read_type_args_at(a: &Analysis, scope: Scope, span: Span, name: string,
                           args: Buf[TypeRef], subst: Buf[Binding]) -> Option[Buf[Type]]
     if args.is_empty() || bound_type(subst, name).is_some() then
-        return Some(resolve_list(a, scope, args, subst))
+        return Some(resolve_arg_list(a, scope, args, subst))
 
     val key = lookup_type_key(a, scope, name)
 
-    if key.is_none() then return Some(resolve_list(a, scope, args, subst))
+    if key.is_none() then return Some(resolve_arg_list(a, scope, args, subst))
 
     read_args_for(a, scope, span, key.unwrap(), args, subst)
 end read_type_args_at
@@ -1264,7 +1284,7 @@ type_arg_of(a: &Analysis, scope: Scope, key: string, i: usize, arg: TypeRef, sub
                 return substituted(a, scope, arg.span, stood_for.unwrap())
         _ -> ()
 
-    resolve_type(a, scope, arg, subst)
+    resolve_type_arg(a, scope, arg, subst)
 end type_arg_of
 
 // One **value** argument: the expression it was written as, folded to the constant that goes in the
