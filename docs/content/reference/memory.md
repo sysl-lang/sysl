@@ -3806,7 +3806,9 @@ print(nest.with((b) ->
 
 ```error
 but this answers a 'sysl.buf.Buf[byte]', whose 'core' reaches a '&sysl.buf.BufCore[byte]', whose count is not atomic. Answer what the caller needs from it — a count, a flag, a '.copy()' of a string, a value built fresh inside the closure — rather than the value itself
-``` A struct of a program's own opts in the same way — `@guards(items)` above
+```
+
+A struct of a program's own opts in the same way — `@guards(items)` above
 it names a field that is `private`, and every member that answers something is held to the rule at
 its calls. **What is not checked** is a closure that *stores* something read out of the guarded
 value where it outlives the call — through a pointer it captured, say: nothing follows a counted
