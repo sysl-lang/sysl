@@ -8,8 +8,8 @@ import sysl.text.replace_all
 // An operand that comes to a literal on every path takes its type from where it stands, as a bare
 // literal does (`expr.sysl`'s `analyze_operands`, `expr_flow.sysl`'s `literal_valued`). A shift's
 // result is its LEFT operand's type and its count may be any integer, so `1 << bit` is a literal's
-// value whatever `bit` is: it takes the type of the position or of the other operand, never the
-// count's (`paired_operands`). An `if` whose arms are literals is the same: `(if c then 1 else 2) |
+// value whatever `bit` is: it takes the type of the position or of the other operand, and the
+// count's only where neither says anything (`paired_operands`). An `if` whose arms are literals is the same: `(if c then 1 else 2) |
 // 7u32` is a `u32`. Where the literal does not fit the other operand's type, the pair widens to the
 // literal's default, as `b | 300` does.
 
@@ -191,6 +191,51 @@ ltc_if_arm_does_not_fit() =
 ltc_runtime_count_past_width() =
     ltc_prints("var bit = 3\nbit += 6\nval x: u8 = 1 << bit\nval y: u32 = 1 << (bit + 30)\nprint(x, y)\n",
                "0 0\n")
+
+// -- no context: the count's type stands in --------------------------------------------------------
+
+@test("png's two shapes: an if of a literal and a shift by a typed count, with nothing around it")
+ltc_png_shapes() =
+    ltc_prints("val depth: u8 = 8\nval key: [3]u8 = [255, 3, 7]\n" +
+               "val top = if depth == 16 then 65535 else (1 << u32(depth)) - 1\n" +
+               "print(u32(key[0]) > top, u32(key[1]) > top, top)\n" +
+               "val top2 = if depth == 16 then 65536 else 1 << usize(depth)\nval x: usize = 40\n" +
+               "print((x * 7 + 3) % top2, top2)\n",
+               "false false 255\n27 256\n")
+
+@test("a shift by a typed count with no context is the count's type")
+ltc_no_context_types() =
+    ltc_refused("val d: u8 = 4\nval a = 1 << u32(d)\nval s: string = a\n",
+                "cannot initialize 's': declared string but the value is uint", "3:1")
+
+@test("a no-context shift inside literal arithmetic is the count's type")
+ltc_no_context_arithmetic() =
+    ltc_refused("val d: u8 = 4\nval a = (1 << usize(d)) + 1\nval s: string = a\n",
+                "cannot initialize 's': declared string but the value is usize", "3:1")
+
+@test("a no-context if of a literal and a typed-count shift is the count's type")
+ltc_no_context_if() =
+    ltc_refused("val d: u8 = 4\nval a = if d == 16 then 65535 else (1 << u32(d)) - 1\nval s: string = a\n",
+                "cannot initialize 's': declared string but the value is uint", "3:1")
+
+@test("an int count with no context is an int, and a context still beats the count's type")
+ltc_no_context_int_and_context_wins() =
+    ltc_prints("val d: u8 = 40\nval bit = 3\nval a = 1 << bit\nval b: int = a\nval w: u64 = 1 << d\n" +
+               "val v: u64 = (1 << d) + 1\nval p: u64 = if bit == 3 then 1 << d else 2\nprint(b, w, v, p)\n",
+               "8 1099511627776 1099511627777 1099511627776\n")
+
+@test("a no-context shift by a byte count is a byte shift, as before the literal had a tier")
+ltc_no_context_byte_count() =
+    ltc_prints("val n: u8 = 7\nval t = 1 << n\nval m = (1 << n) | 1\nval u: u8 = t\nval y: u8 = m\nprint(u, y)\n",
+               "128 129\n")
+
+// The range bounds `c_probe.sysl`'s `whole` computes: read at `int`, `1 << 32` would shift
+// everything out and the bound would be wrong.
+@test("a typed-count shift inside a conversion and under a minus is the count's type")
+ltc_no_context_conversion() =
+    ltc_prints("val bits = 32\nval high = u64((1 << i64(bits)) - 1)\nval shigh = (1 << (i64(bits) - 1)) - 1\n" +
+               "val slow = -(1 << (i64(bits) - 1))\nprint(high, shigh, slow)\n",
+               "4294967295 2147483647 -2147483648\n")
 
 // -- constants -------------------------------------------------------------------------------------
 
