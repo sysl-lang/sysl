@@ -2031,11 +2031,15 @@ private member_accepts(cx: &Analyzer, rty: Type, base: string, filed: string,
 
     if m.is_none() then return None
 
+    // **Weighing a generic candidate makes it real, and that is put back**: the candidate may not be
+    // the one chosen, and an instantiation left queued is a body analyzed for a call nobody made --
+    // a conditional block's body read at a type its condition was written to keep out, refused
+    // inside the block. The chosen one is made real again by the call that goes through it.
+    val tried = begin_trial(cx)
     val fname = member_func_name_quiet(cx, rty, filed)
+    val sig = if fname == "" then None else cx.an.tables.members.func_insts.get(fname)
 
-    if fname == "" then return None
-
-    val sig = cx.an.tables.members.func_insts.get(fname)
+    discard_trial(cx, tried)
 
     if sig.is_none() then return None
 
@@ -2249,17 +2253,37 @@ end method_written
 // caller abandons the call rather than instantiating a body the condition was written to keep out --
 // whose own refusal would be a second diagnostic, located in the block and not at the call.
 private check_impl_condition(cx: &Analyzer, span: Span, rty: Type, base: string, filed: string) -> bool
-    val from = cx.an.tables.members.from_trait.get(member_key_of(base, filed))
+    val unmet = impl_condition_unmet(cx.an, rty, base, filed)
 
-    if from.is_none() then return true
+    if unmet.is_none() then return true
 
-    val owner = member_key(cx.an, rty, filed)
+    val from = cx.an.tables.members.from_trait.get(member_key_of(base, filed)).unwrap_or("")
 
-    if owner.0 != base then return true
+    cx.fault(span, s"'${source_member_name(unsuffixed_member(filed))}' is a member the 'impl' of " +
+             s"'${qualified_name(from)}' gives '${type_show(rty)}' only where its condition holds, " +
+             s"and ${unmet.unwrap()}")
+    false
+end check_impl_condition
 
-    val name = source_member_name(filed)
+// What a receiver lacks for the condition of the `impl` that gave it a member, as the tail of a
+// refusal (`it asks 'Show' of T, which does not implement it`), or nothing where the condition holds
+// or the block has none. A `?` converting through a conditional `From` asks the same question.
+impl_condition_unmet(a: &Analysis, rty: Type, base: string, filed: string) -> Option[string]
+    val from = a.tables.members.from_trait.get(member_key_of(base, filed))
 
-    for ti in impls_of(cx.an, from.unwrap(), base)
+    if from.is_none() then return None
+
+    val owner = member_key(a, rty, filed)
+
+    if owner.0 != base then return None
+
+    // **The block is told apart by its suffix**: a second block of one trait files its members as
+    // `from.2`, and the name it was written under is what comes before the suffix. Comparing the
+    // whole filed name against each block's name-plus-suffix would match `from.2` to the FIRST block
+    // (whose suffix is empty) and ask that block's condition of a call the second one answers.
+    val name = unsuffixed_member(filed)
+
+    for ti in impls_of(a, from.unwrap(), base)
         if !ti.conditional || name + ti.alt != filed || ti.tparams.len() != owner.1.len() then continue
 
         var subst: Buf[Binding] = buf()
@@ -2267,24 +2291,31 @@ private check_impl_condition(cx: &Analyzer, span: Span, rty: Type, base: string,
         for i in 0..<ti.tparams.len()
             subst.push(Binding(ti.tparams.at(i), owner.1.at(i)))
 
-        val unmet = unmet_condition_of(cx.an, ti, subst)
+        val unmet = unmet_condition_of(a, ti, subst)
 
-        if unmet.is_none() then return true
+        if unmet.is_none() then return None
 
         val (packed, tr) = unmet.unwrap()
-        val arg = first_unmet_part(cx.an, tr, packed)
-        val why = unmet_bound(cx.an, tr, arg)
+        val arg = first_unmet_part(a, tr, packed)
+        val why = unmet_bound(a, tr, arg)
         val tail = if why.is_some() then s" — ${why.unwrap()}" else ""
 
-        cx.fault(span, s"'$name' is a member the 'impl' of '${qualified_name(from.unwrap())}' " +
-                 s"gives '${type_show(rty)}' only where its condition holds, and it asks " +
-                 s"'${tr.show()}' of ${type_show(arg)}, which does not implement it$tail")
-
-        return false
+        return Some(s"it asks '${tr.show()}' of ${type_show(arg)}, which does not implement it$tail")
     end for
 
-    true
-end check_impl_condition
+    None
+end impl_condition_unmet
+
+// A filed member's name without the suffix a second block of one trait gives it (`from.2` is
+// `from`). A member's own name holds no dot, so the first one starts the suffix.
+private unsuffixed_member(filed: string) -> string
+    val b = filed.bytes
+
+    for i in 0..<b.len
+        if b[i] == u8('.') then return filed[0..<i]
+
+    filed
+end unsuffixed_member
 
 // Whether a member the reader named is one their file may reach.
 check_member_visible(cx: &Analyzer, span: Span, base: string, filed: string, m: MethodDecl,

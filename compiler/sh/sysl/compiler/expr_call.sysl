@@ -2328,7 +2328,7 @@ private into_subtype(cx: &Analyzer, span: Span, target: Type, written: string,
             // integer literal where the type has its own `From[int]`: read at a float base it would be
             // that float, and wrapped rather than handed to the `from` the type wrote for it.
             val own_int = d.derived && literal_default(args.at(0)).unwrap_or(Unknown) == int_type() &&
-                          from_conversion(cx.an, int_type(), target).is_some()
+                          from_conversion(cx, int_type(), target).is_some()
 
             // A conversion's value is not used at the type it is converted to, so a literal binding
             // is not fixed by it (`var_first_use.sysl`).
@@ -2351,7 +2351,7 @@ private subtype_from(cx: &Analyzer, span: Span, t: TExpr, target: Type, written:
             if !disagree(texpr_type(t), d.base) then return TExpr(span, TConstrainedCheck(t, target))
 
             if d.derived
-                val own = from_conversion(cx.an, texpr_type(t), target)
+                val own = from_conversion(cx, texpr_type(t), target)
 
                 if own.is_some() && own.unwrap() != cx.body
                     cx.an.uses(own.unwrap())
@@ -4275,14 +4275,38 @@ try_expr(cx: &Analyzer, span: Span, inner: Expr, expected: Option[Type]) -> TExp
     var convert: Option[string] = None
 
     if !type_eq(carried(fail), carried(ret_fail))
-        convert = from_conversion(cx.an, carried(fail), carried(ret_fail))
+        val source = carried(fail)
+        val target = carried(ret_fail)
+        val sorted = from_sorted(cx, source, target)
+        val found = sorted.0
+
+        // **Two blocks that both take the source are two conversions, and a `?` names neither**:
+        // a generic block and one written for this source alike would answer it, and choosing
+        // between them by a preference rule would make which wrapping a failure gets depend on a
+        // block nobody at the `?` can see.
+        if found.len() > 1
+            return cx.err(mark, s"'?' propagates a ${type_show(source)} error into " +
+                          s"${type_show(target)}, and ${found.len()} " +
+                          s"'${module_bare(from_key())}' blocks for ${type_show(target)} take a " +
+                          s"${type_show(source)} — convert it explicitly with '.map_err(...)' " +
+                          "before the '?'")
+
+        if found.len() == 1 then convert = from_named(cx, target, found.at(0))
+
+        // A block that would take the source but whose condition does not hold is what the reader
+        // wrote for this `?`, so its condition is what they are told -- not a block to write that
+        // they already have.
+        if convert.is_none() && !sorted.1.is_empty()
+            return cx.err(mark, s"'?' propagates a ${type_show(source)} error into " +
+                          s"${type_show(target)}, and the '${module_bare(from_key())}' block that " +
+                          s"would convert it holds only where its condition does — " +
+                          sorted.1.at(0))
 
         if convert.is_none()
-            return cx.err(mark, s"'?' propagates a ${type_show(carried(fail))} error, but this " +
-                          s"function returns ${type_show(carried(ret_fail))} — a '?' converts " +
+            return cx.err(mark, s"'?' propagates a ${type_show(source)} error, but this " +
+                          s"function returns ${type_show(target)} — a '?' converts " +
                           s"through '${qualified_name(from_key())}', so " +
-                          s"'impl ${module_bare(from_key())}[${type_show(carried(fail))}] for " +
-                          s"${type_show(carried(ret_fail))}' is what joins the two layers")
+                          s"'${from_block_text(cx.an, source, target)}' is what joins the two layers")
 
         cx.an.uses(convert.unwrap())
     end if
@@ -4303,28 +4327,119 @@ private from_key() -> string = module_qualify(StdModule, "From")
 // The trait is checked as well as the shape: an inherent `from` of the right signature is a function
 // that happens to be spelled the same, and reading it would make `?` convert through something
 // nobody declared a conversion.
-private from_conversion(a: &Analysis, from: Type, to: Type) -> Option[string]
+//
+// **A block written for a generic type is a conversion for every instantiation of it at once**
+// (`impl[E] From[E] for Wrap[E]`), and has no lowered function until one is asked for. So it is made
+// real at the destination's own arguments, exactly as `Wrap[string].from(x)` makes it real from its
+// receiver, and its signature is what is compared. That reading is a trial: a block whose parameter
+// turns out not to be the source asked for an instantiation nobody will call, and it is put back.
+private from_conversion(cx: &Analyzer, from: Type, to: Type) -> Option[string]
+    val found = from_candidates(cx, from, to)
+
+    if found.len() != 1 then return None
+
+    from_named(cx, to, found.at(0))
+end from_conversion
+
+// The `from` slots of the destination whose conversion takes exactly the source, in the order they
+// were filed. More than one is an ambiguity the caller reports; none is a missing block.
+private from_candidates(cx: &Analyzer, from: Type, to: Type) -> Buf[string] =
+    from_sorted(cx, from, to).0
+
+// The same, beside the reasons the slots that WOULD take the source are withheld: a conditional
+// block (`impl[E: Show] From[E] for Wrap[E]`) gives its `from` only to the instantiations its
+// condition holds for, exactly as it does to a written `Wrap[T].from(x)`. Every generic slot is read
+// inside a trial that is put back, so a body the condition was written to keep out is never kept.
+private from_sorted(cx: &Analyzer, from: Type, to: Type) -> (Buf[string], Buf[string])
+    val a = cx.an
     val owner = member_key(a, to, "from").0
     val slots = a.tables.members.alts.get(member_key_of(owner, "from")).unwrap_or(one_name("from"))
+    var out: Buf[string] = buf()
+    var held: Buf[string] = buf()
 
     for i in 0..<slots.len()
         val filed = member_key_of(owner, slots.at(i))
 
-        if a.tables.members.from_trait.get(filed).unwrap_or("") == from_key()
-            val decl = a.tables.members.decls.get(filed)
+        if a.tables.members.from_trait.get(filed).unwrap_or("") != from_key() then continue
 
-            if decl.is_some() && decl.unwrap().receiver.is_none() && !decl.unwrap().is_property
-                val fname = a.tables.members.funcs.get(filed)
+        val decl = a.tables.members.decls.get(filed)
 
-                if fname.is_some()
-                    val sig = a.tables.members.func_insts.get(fname.unwrap())
+        if decl.is_none() || decl.unwrap().receiver.is_some() || decl.unwrap().is_property then
+            continue
 
-                    if sig.is_some() && sig.unwrap().params.len() == 1 &&
-                       type_eq(sig.unwrap().params.at(0).1, from) && type_eq(sig.unwrap().ret, to)
-                        return fname
+        if a.tables.members.generic.has(filed)
+            val unmet = impl_condition_unmet(a, to, owner, slots.at(i))
+            val t = begin_trial(cx)
+            val fname = member_func_name(cx, span_zero(), to, slots.at(i))
+            val fits = !refused_since(cx, t) && fname != "" && converts(a, fname, from, to)
 
-    None
-end from_conversion
+            discard_trial(cx, t)
+            if fits && unmet.is_none() then out.push(slots.at(i))
+            if fits && unmet.is_some() then held.push(unmet.unwrap())
+        else
+            val fname = a.tables.members.funcs.get(filed)
+
+            if fname.is_some() && converts(a, fname.unwrap(), from, to) then out.push(slots.at(i))
+        end if
+
+    (out, held)
+end from_sorted
+
+// The lowered function one `from` slot of the destination goes under, made real where its block is
+// generic. Asked only of a slot `from_candidates` found, so the instantiation is one the program uses.
+private from_named(cx: &Analyzer, to: Type, slot: string) -> Option[string]
+    val a = cx.an
+    val filed = member_key_of(member_key(a, to, "from").0, slot)
+
+    if !a.tables.members.generic.has(filed) then return a.tables.members.funcs.get(filed)
+
+    val fname = member_func_name(cx, span_zero(), to, slot)
+
+    if fname == "" then None else Some(fname)
+end from_named
+
+// Whether a lowered function takes exactly the source and answers exactly the destination.
+private converts(a: &Analysis, fname: string, from: Type, to: Type) -> bool
+    val sig = a.tables.members.func_insts.get(fname)
+
+    sig.is_some() && sig.unwrap().params.len() == 1 && type_eq(sig.unwrap().params.at(0).1, from) &&
+        type_eq(sig.unwrap().ret, to)
+end converts
+
+// The block a refused `?` names. **A generic destination takes a generic block**, since a block
+// fixing its arguments is refused where it is written: so the destination is spelled with its own
+// parameters, and a source that is one of the destination's arguments is spelled as that parameter
+// -- `Wrap[string]` from a `string` is `impl[E] From[E] for Wrap[E]`, the block that joins every
+// instantiation at once.
+private from_block_text(a: &Analysis, from: Type, to: Type) -> string
+    val trait_name = module_bare(from_key())
+    var base = ""
+    var targs: Buf[Type] = buf()
+
+    repr(to) match
+        Enum(d) ->
+            base = d.base
+            targs = d.targs
+        Struct(d) ->
+            base = d.base
+            targs = d.targs
+        _ -> ()
+
+    val nom = if base == "" then None else nominal_of(a, base)
+
+    if nom.is_none() || nom.unwrap().0.is_empty() || nom.unwrap().0.len() != targs.len() then
+        return s"impl $trait_name[${type_show(from)}] for ${type_show(to)}"
+
+    val params = nom.unwrap().0
+    var source = type_show(from)
+
+    for i in 0..<targs.len()
+        if type_eq(targs.at(i), from) then source = params.at(i)
+
+    val names = joined(params, ", ")
+
+    s"impl[$names] $trait_name[$source] for ${module_show(base)}[$names]"
+end from_block_text
 
 private one_name(name: string) -> Buf[string]
     var out: Buf[string] = buf()
