@@ -378,6 +378,28 @@ e match
 none
 ```
 
+**An argument is read against what its parameter already knows.** `Ok(1)` alone says nothing of its
+error type, but at a parameter written `Result[T, Fault]` the `Fault` is fixed by the declaration, so
+the variant takes it and its value settles `T`. The same holds for a closure's result where the
+parameter states one:
+
+```sysl
+enum Fault
+    Bad
+
+keep[T](r: Result[T, Fault]) -> Result[T, Fault] = r
+run[T](f: () -> Result[T, Fault]) -> Result[T, Fault] = f()
+
+print(keep(Ok(1)).unwrap(), run(() -> Ok("two")).unwrap())
+```
+
+```output
+1 two
+```
+
+A parameter that leaves the variant's other half open as well (`both[T, F](r: Result[T, F])` called
+as `both(Ok(1))`) is still refused.
+
 The model is **unification**: each parameter is solved by matching the declared parameter and return
 types against the actual argument types and the expected type. A parameter left undetermined by
 **both** directions is a compile error asking for an annotation on the binding. There is no silent
