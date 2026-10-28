@@ -1121,7 +1121,7 @@ make_variant(cx: &Analyzer, span: Span, written: string, args: Buf[Expr], ty: Ty
                     val made = descriptor_text(*owner, v, -1)
                     val taken = taken_fields(cx, span, tv, partial, made, *owner, v, variant.fields)
 
-                    return TExpr(span, TBlockExpr(TBlock(taken.0, Some(TExpr(span, TEnumNew(Enum(en),
+                    return TExpr(through(span, tv.span), TBlockExpr(TBlock(taken.0, Some(TExpr(span, TEnumNew(Enum(en),
                                                                                     variant, taken.1))),
                                                          Enum(en))))
                 end if
@@ -1184,7 +1184,7 @@ private make_from_partial(cx: &Analyzer, span: Span, written: string, arg: Expr,
     val taken = taken_fields(cx, span, tv, partial, type_show(ty), ty, -1, s.fields)
     val made = checked_new(cx, span, TExpr(span, TStructNew(s, taken.1)), s)
 
-    TExpr(span, TBlockExpr(TBlock(taken.0, Some(made), Struct(s))))
+    TExpr(through(span, tv.span), TBlockExpr(TBlock(taken.0, Some(made), Struct(s))))
 end make_from_partial
 
 // Each field of a partial value taken out of its `Option`, in order, with the statement that holds
@@ -1273,8 +1273,16 @@ private built_variant(cx: &Analyzer, span: Span, en: Type, variant: EnumVariant,
 
     val made = TExpr(span, TEnumNew(en, variant, fields))
 
-    if stmts.is_empty() then made else TExpr(span, TBlockExpr(TBlock(stmts, Some(made), en)))
+    if stmts.is_empty() then made else TExpr(through(span, tv.span), TBlockExpr(TBlock(stmts, Some(made), en)))
 end built_variant
+
+// **The span of a block that holds an argument in a local runs through the argument**: a local's
+// scope is read off the spans (`escape.sysl`'s `scope_of` finds the innermost block whose span holds
+// the initializer's), so a block anchored at `::Make` alone would leave the local to the block
+// around it, and the value built from it would be counted once too often.
+private through(span: Span, arg: Span) -> Span =
+    Span(if arg.start < span.start then arg.start else span.start,
+         if arg.end > span.end then arg.end else span.end)
 
 // -- asking what a type can do ---------------------------------------------------------------------
 
