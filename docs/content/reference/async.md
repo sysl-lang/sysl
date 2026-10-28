@@ -83,6 +83,58 @@ tick
 
 `await pending * 2` is `(await pending) * 2` — [`await` binds tighter than arithmetic](#where-await-binds).
 
+### A task holds its arguments until it ends
+
+Since the body runs after the call has returned, **the task holds every argument the call was
+handed until it ends**. An async function therefore [keeps](/reference/memory/#a-borrowed-pointer-cannot-escape)
+every parameter for as long as its task lives, and the task is followed as a
+[thread's handle](/reference/memory/#a-thread-holds-what-it-is-handed-until-it-is-joined) is: the
+address of a local, or a closure holding one, may go to an async call only where the task is
+awaited or `block_on`'d before the frame that lent it ends — where the call is written, or from a
+local the task was kept in.
+
+```sysl
+async count(p: *int) -> int
+    *p += 1
+    *p
+
+run() -> int
+    var n = 4
+    val t = count(&n)
+
+    block_on(t) + block_on(count(&n)) + n
+
+print(run())
+```
+
+```output
+17
+```
+
+A task answered out of that frame, stored in module storage, pushed onto a queue, thrown away, or
+still running on some way out would read a frame that is gone, and is refused at the argument:
+
+```sysl
+async count(p: *int) -> int
+    *p += 1
+    *p
+
+later() -> Task[int]
+    var n = 4
+
+    count(&n)
+```
+
+```error
+'count' keeps its parameter 'p' (the task it answers holds it until that task is awaited), and '&n' is the address of a local of 'later' — await that task on every way out of 'later', or hand it storage that lasts
+```
+
+Counted, `&sync` and owned arguments are the task's own to hold — it keeps a count of each, as
+[passing a reference](/reference/memory/#passing-a-reference-to-a-call-usually-costs-nothing) explains — and a view of a local array handed to an async
+call moves the array to the heap, so none of them is refused. A `*self` method is the same rule at its
+receiver: `block_on(adc.sample())` on a local `adc` is fine, and `adc.sample()` answered out of the
+frame is not.
+
 ### `Task` takes one type argument
 
 The argument is the type the task produces, and there is no second argument for an error: a task

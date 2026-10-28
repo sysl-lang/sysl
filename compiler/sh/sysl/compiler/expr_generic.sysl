@@ -469,7 +469,7 @@ generic_call_with(cx: &Analyzer, span: Span, written: string, key: string, f: Fu
 
     val covered = enter_signature(cx.an, decl.needs)
     val targs = solve(cx.an, f.scope, cx.scope, span, key, decl.tparams, param_refs, prov.tys, decl.ret_type,
-                      expected, prov.soft, decl.bounds, known, left_to_default(slots))
+                      prov.expected, prov.soft, decl.bounds, known, left_to_default(slots))
 
     leave_reaching(cx.an, covered)
 
@@ -801,10 +801,14 @@ end quoted_and
 // from the first pass and read once the others have said what the parameter it stands at takes.
 // The node is kept because reading it again would lower a second closure for the one a program
 // wrote.
+//
+// `expected` is what the solve is to read the call's position as: the one the call was given, or the
+// `&T` box a callable turned out to yield where the position asked for its `T` (`boxed_result`).
 struct Provisional
     tys: Buf[Type]
     soft: Buf[bool]
     kept: Buf[Option[TExpr]]
+    expected: Option[Type]
 end Provisional
 
 // Which positions a call left to a parameter's default -- the literals among them are the last thing
@@ -876,7 +880,7 @@ provisional_of(cx: &Analyzer, span: Span, scope: Scope, tparams: Buf[string], pa
                     tys.push(Unknown)
                     soft.push(true)
 
-    if held.is_empty() then return Provisional(tys, soft, kept)
+    if held.is_empty() then return Provisional(tys, soft, kept, expected)
 
     // What the first pass settles, in the three tiers `solve` reads: what carries a type of its own
     // first, the expected type next, and a literal's default only where neither reached it. A held
@@ -899,9 +903,17 @@ provisional_of(cx: &Analyzer, span: Span, scope: Scope, tparams: Buf[string], pa
     // **What is still open is asked by NAME, never by counting `sub`**: `known` may carry a `Self`
     // beside the receiver's arguments, which is no parameter of the solve, and counted it makes a
     // member's own `A` look settled -- so the literal that would have settled it is never read and
-    // `W(4).fold(1, (a, n) -> a + n)` hands its closure nothing to take.
-    if !unsolved_names(tparams, sub).is_empty() && result.is_some() && expected.is_some() then
-        unify(cx.an, scope, result.unwrap(), expected.unwrap(), tparams, &sub)
+    // `W(4).fold(1, (a, n) -> a + n)` hands its closure nothing to take. Where the call stands in a
+    // `&T`, a callable yielding that box settles a bare result at it (`boxed_result`).
+    var position = expected
+
+    if !unsolved_names(tparams, sub).is_empty() && result.is_some() && expected.is_some()
+        val box = boxed_result(cx, span, scope, tparams, params, result.unwrap(), bounds, slots,
+                               written, held, expected.unwrap(), sub)
+
+        if box.is_some() then position = box
+
+        unify(cx.an, scope, result.unwrap(), position.unwrap(), tparams, &sub)
 
     // **A type a callable's parameter STATES outranks a literal's default**: in `xs.fold(0, (a: i64, n)
     // -> a + i64(n))` the annotation says `A = i64`, and the `0` takes it as it would take any type a
@@ -1002,8 +1014,66 @@ provisional_of(cx: &Analyzer, span: Span, scope: Scope, tparams: Buf[string], pa
         unify(cx.an, scope, param_refs.at(at), texpr_type(t), tparams, &sub)
         solve_from_callables(cx.an, scope, tparams, bounds, &sub)
 
-    Provisional(tys, soft, kept)
+    Provisional(tys, soft, kept, position)
 end provisional_of
+
+// **What a result that is a bare type parameter is settled from where the call stands in a `&T`.**
+// That position reads the call at its `T` and boxes what comes back (`expr_coerce.sysl`), so the `T`
+// is what the call is told it is expected to be -- and a callable still to be read that hands back
+// the `&T` itself would then be told to yield a `T`, which it cannot: `make() -> &Foo = apply(() ->
+// foo(1))` refused its closure for yielding the `&Foo` the function returns. Each such callable is
+// read on trial with its result open, and where one yields a box, the box the position wants is what
+// the parameter is settled at. Anything else leaves the `T`, which is what a callable yielding a value
+// to be boxed (`apply(() -> 5)` at `&u8`) needs.
+private boxed_result(cx: &Analyzer, span: Span, scope: Scope, tparams: Buf[string], params: Buf[Param],
+                     result: TypeRef, bounds: Buf[NamedBounds], slots: Buf[Option[Expr]],
+                     written: Buf[Option[Expr]], held: Buf[usize], expected: Type,
+                     sub: Buf[Binding]) -> Option[Type]
+    if cx.boxing.is_none() then return None
+
+    val box = cx.boxing.unwrap()
+    var payload = Unknown
+
+    box match
+        Ref(inner, _) -> payload = *inner
+        _ -> return None
+
+    // The box is this call's only where the payload is what this call was asked for: an expression
+    // read inside the boxed one without passing through `type_expr` sees the field too. A trait's
+    // payload settles nothing (`unify`), so a callable yielding a box of an implementation already
+    // settles the parameter at that, and the position erases it.
+    if !type_eq(payload, expected) || is_trait(payload) then return None
+
+    val bare = *result.kind match
+        NamedType(n, args) -> args.is_empty() && holds_string(unsolved_names(tparams, sub), n)
+        _ -> false
+
+    if !bare then return None
+
+    for at in held
+        val want = held_want(cx, scope, params.at(at).typ, tparams, bounds, sub)
+
+        if want.is_some()
+            val reader = arg_reader(cx, span, scope, slots.at(at).is_none())
+            val tried = refusing_trial(reader, written.at(at).unwrap(), want)
+
+            if !tried.1
+                val yielded = callable_signature(cx.an, texpr_type(tried.0))
+
+                if yielded.is_some() && yielded.unwrap().1.is_some() &&
+                   is_box(yielded.unwrap().1.unwrap()) then return Some(box)
+            end if
+        end if
+
+    None
+end boxed_result
+
+// Whether a callable yielded a box of any kind. Only the box the position wants is accepted there,
+// but a callable yielding another -- a `&sync Foo` where `&Foo` was asked, or a `&Bar` -- is told it
+// should yield the box rather than the payload, which is the disagreement the program has.
+private is_box(t: Type) -> bool = t match
+    Ref(_, _) -> true
+    _ -> false
 
 // What the callables a call wrote say about its type parameters through the types their own
 // parameters state, joined to `sub` -- or `sub` unchanged, where a literal at a parameter they settle,

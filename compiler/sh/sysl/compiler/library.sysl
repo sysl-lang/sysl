@@ -142,6 +142,7 @@ private library_build_of(units: Buf[Program], own: Buf[string], t: Target,
     var within: Buf[string] = buf()
     var foreign: Buf[string] = buf()
     var kept: Buf[TFunc] = buf()
+    var dropped: Buf[string] = buf()
 
     for i in 0..<whole.funcs.len()
         val f = whole.funcs.at(i)
@@ -154,6 +155,8 @@ private library_build_of(units: Buf[Program], own: Buf[string], t: Target,
         // deferred too, so nothing emitted here names it.
         if !(f.internal && holds_string(own, f.declared_in) && holds_string(defers, f.name))
             kept.push(f)
+        else
+            dropped.push(f.name)
 
         if !holds_string(own, f.declared_in)
             within.push(f.name)
@@ -200,7 +203,8 @@ private library_build_of(units: Buf[Program], own: Buf[string], t: Target,
             vals.push(v)
             within.push(v.symbol)
 
-    val library = whole with { funcs = kept, vals = vals, precompiled = within, entry_point = false }
+    val library = whole with { funcs = kept, vtables = tables_without(whole.vtables, dropped), vals = vals,
+                               precompiled = within, entry_point = false }
 
     LibraryBuild(library, promotions, sorted_names(determined), errors_of(done.an.diagnostics()),
                  foreign)
@@ -294,6 +298,7 @@ library_deferring_gaps(p: TProgram, gaps: Buf[(string, string)]) -> TProgram
     val grown = gap_closure(p, gapped)
 
     var kept: Buf[TFunc] = buf()
+    var dropped: Buf[string] = buf()
     // A buffer of its own (not `copy()`, which the reference's library has not got).
     var out: Buf[string] = buf()
 
@@ -303,14 +308,38 @@ library_deferring_gaps(p: TProgram, gaps: Buf[(string, string)]) -> TProgram
         val f = p.funcs.at(i)
 
         if !holds_string(grown, f.name) then kept.push(f)
-        else if f.internal then continue
+        else if f.internal then dropped.push(f.name)
         else
             kept.push(f)
 
             if !holds_string(out, f.name) then out.push(f.name)
 
-    p with { funcs = kept, precompiled = out }
+    p with { funcs = kept, vtables = tables_without(p.vtables, dropped), precompiled = out }
 end library_deferring_gaps
+
+// The tables left once the functions `dropped` are out of a library half.
+//
+// **A table goes with any body it names**: the emitter lays down every table it is handed, and the
+// adapter in a slot calls its target, so a table over a dropped `internal` function -- a closure's
+// `call` that reaches module storage -- would name a symbol this object neither defines nor can
+// declare. Nothing left in the half erases a value into such a table, since every body that does is
+// deferred with the slot it names (`reachability.sysl`'s `push_edges`); the program lays its own copy
+// down where it compiles that body.
+private tables_without(vtables: Buf[TVtable], dropped: Buf[string]) -> Buf[TVtable]
+    if dropped.is_empty() then return vtables
+
+    var out: Buf[TVtable] = buf()
+
+    for table in vtables
+        var keep = true
+
+        for slot in table.slots
+            if holds_string(dropped, slot.target) then keep = false
+
+        if keep then out.push(table)
+
+    out
+end tables_without
 
 // The split one source comes to when it is read as a library of its own: what its object half would
 // advertise, in the order a metadata record holds them.

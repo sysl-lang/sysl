@@ -220,6 +220,132 @@ cwr_shadow_after()
     assert_eq(enm_ran(cwr_call + "main()\n    var n = 0\n    call(() ->\n        n += 1\n        print(n))\n" +
                       "    for n in 7..<8\n        print(n)\n"), "1\n7\n")
 
+// ---- the read after the closure, in every form that reads its operand more than once
+//
+// Some positions read an operand once to choose what they mean and once for real: the right operand
+// of `+` after a literal (which every interpolation with text before a hole desugars to), and an
+// argument of a generic call. The first reading is thrown away, and it must give back the copy write
+// it answered -- otherwise the reading the program gets finds nothing owed, and the program prints
+// the variable's first value. The program is the one webview-demo had: a stored counter, read
+// afterwards in a string.
+
+private cwr_stored(inner: string, after: string) -> string =
+    "import sysl.buf.{Buf, buf}\n\nid[T](x: T) -> T = x\n\nmain()\n" +
+    "    var hs: Buf[&Fn() -> string] = buf()\n    var n = 0\n    var w = 2\n    hs.push(() ->\n" +
+    s"        n += 1\n        $inner)\n    print(hs[0](), hs[0]())\n    $after\n"
+
+private cwr_read_after(after: string)
+    cwr_refused(cwr_stored("n.to_string()", after), cwr_used_after("n", "'+='", "int"))
+
+@test("the stored counter read back inside 'f\"…${n}%d\"', then printed with text before the hole")
+cwr_interp_p29()
+    if !enm_ready() then return
+
+    cwr_refused(cwr_stored("f\"${n}%d\"", "print(f\"clicked ${n}%d times\")"),
+                cwr_used_after("n", "'+='", "int"))
+
+@test("read after the closure in an 's' interpolation with text before the hole")
+cwr_interp_s_lead()
+    if !enm_ready() then return
+
+    cwr_read_after("print(s\"n = ${n}\")")
+
+@test("read after the closure as a bare '$n' hole")
+cwr_interp_dollar_name()
+    if !enm_ready() then return
+
+    cwr_read_after("print(s\"n = $n!\")")
+
+@test("read after the closure under a width specifier")
+cwr_interp_width_spec()
+    if !enm_ready() then return
+
+    cwr_read_after("print(f\"n = ${n}%5d|\")")
+
+@test("read after the closure as the hole inside a specifier, the '*' count")
+cwr_interp_star_hole()
+    if !enm_ready() then return
+
+    cwr_read_after("print(f\"x = ${1.5}%.${n}f\")")
+
+@test("read after the closure in an interpolation nested in another")
+cwr_interp_nested()
+    if !enm_ready() then return
+
+    cwr_read_after("print(s\"a ${s\"b ${n}\"}\")")
+
+@test("read after the closure in a multi-line 's' literal")
+cwr_interp_multiline_s()
+    if !enm_ready() then return
+
+    cwr_read_after("print(s\"\"\"\n        n = ${n}\n        \"\"\")")
+
+@test("read after the closure in a multi-line 'f' literal")
+cwr_interp_multiline_f()
+    if !enm_ready() then return
+
+    cwr_read_after("print(f\"\"\"\n        n = ${n}%d\n        \"\"\")")
+
+@test("read after the closure on the right of '+' after a string literal")
+cwr_concat_after_literal()
+    if !enm_ready() then return
+
+    cwr_read_after("print(\"n = \" + n.to_string())")
+
+@test("read after the closure in the middle of a chain of '+'")
+cwr_concat_chain()
+    if !enm_ready() then return
+
+    cwr_read_after("print(\"n = \" + n.to_string() + \"!\")")
+
+@test("read after the closure on the right of '+' after an integer literal")
+cwr_int_literal_left()
+    if !enm_ready() then return
+
+    cwr_read_after("print(1 + n)")
+
+@test("read after the closure as a generic call's argument")
+cwr_generic_argument()
+    if !enm_ready() then return
+
+    cwr_read_after("print(id(n))")
+
+@test("read after the closure in one branch of an 'if'")
+cwr_interp_in_branch()
+    if !enm_ready() then return
+
+    cwr_read_after("print(if w > 1 then \"w\" + n.to_string() else \"x\")")
+
+@test("read after the closure as a 'print' argument beside a literal")
+cwr_print_arguments()
+    if !enm_ready() then return
+
+    cwr_read_after("print(\"n\", n)")
+
+@test("the counter's own interpolated reads lie inside it, and another variable is read after")
+cwr_interp_inside_only()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(cwr_stored("s\"clicked ${n} and ${n}\"", "print(s\"w = ${w}\")")),
+              "clicked 1 and 1 clicked 2 and 2\nw = 2\n")
+
+@test("an interpolated read of the variable before the closure is no read after it")
+cwr_interp_before_only()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran("import sysl.buf.{Buf, buf}\n\nmain()\n    var hs: Buf[&Fn() -> string] = buf()\n" +
+                      "    var n = 0\n    print(s\"start ${n}\")\n    hs.push(() ->\n        n += 1\n" +
+                      "        f\"${n}%d\")\n    print(hs[0](), hs[0]())\n"), "start 0\n1 2\n")
+
+@test("the fix the refusal names, interpolated: a '&int' box read after the closure")
+cwr_interp_box_fix()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran("import sysl.buf.{Buf, buf}\n\nmain()\n    var hs: Buf[&Fn() -> string] = buf()\n" +
+                      "    val n: &int = 0\n    hs.push(() ->\n        *n += 1\n        f\"${*n}%d\")\n" +
+                      "    print(hs[0](), hs[0]())\n    print(f\"clicked ${*n}%d times\")\n"),
+              "1 2\nclicked 2 times\n")
+
 // ---- the neighbour: a 'val' closure is asked about every write to its copy
 
 @test("a multiple assignment to captures makes a closure one a 'val' may not hold")

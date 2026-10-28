@@ -792,10 +792,12 @@ private summary(cx: &KeepsCx, name: string, i: usize, q: string) -> KeptWhy
 
     cx.taint = false
 
-    val out = if keeping && pointer_reached(cx, f, i) then held_through_params(walk_kept(cx, f, i), i)
+    val walked = if keeping && pointer_reached(cx, f, i) then held_through_params(walk_kept(cx, f, i), i)
     else if keeping then walk_kept(cx, f, i)
     else if q == ClearsQ then walk_clears(cx, f)
     else walk_answers(cx, f, i, q == RawAnswersQ)
+
+    val out = if keeping && f.marks.is_async() then task_held(walked) else walked
 
     val leaned = cx.taint
 
@@ -922,6 +924,26 @@ private crossing_kept(f: TFunc, i: usize) -> Option[KeptWhy]
     None
 end crossing_kept
 
+// **A task holds its arguments until it ends.** Calling an `async` function runs none of its body: the
+// call answers a task that holds every parameter, and the body reads them when the task is driven --
+// after the call has returned. So an async function keeps every parameter at `j`, the location a
+// thread's pointer is held at (`keeps_join.sysl`): the task is the handle, and an `await` or a
+// `block_on` of it -- of the call itself, or of a local or field it was kept in -- ends it and takes
+// the pointer back. A task answered keeps it on for the caller; one stored where no place names it,
+// or still held at a way out, holds it past the frame. Whatever the body itself keeps it in -- module
+// storage, say -- holds it as well, and no `await` takes that back.
+private task_held(w: KeptWhy) -> KeptWhy
+    val how = "the task it answers holds it until that task is awaited"
+    var locs: Buf[KeptAt] = buf()
+
+    for item in w.locs
+        locs.push(item)
+
+    locs.push(KeptAt("j", how, span_zero()))
+
+    if w.kept then KeptWhy(true, w.how, w.at, locs) else KeptWhy(true, how, span_zero(), locs)
+end task_held
+
 // Kept somewhere nothing can name, so nothing can take it back.
 private anywhere(how: string, at: Span) -> KeptWhy
     var locs: Buf[KeptAt] = buf()
@@ -941,6 +963,11 @@ private lent_by_rule(cx: &KeepsCx, f: TFunc, i: usize) -> bool
     // An object -- a callback among them -- is not an address anyone lent, so a body that stores one
     // says so to a call that sees it, whatever reaches it besides.
     if !holds_raw_pointer(f.params.at(i).1, 0) then return false
+
+    // **A task cannot keep a trait's promise to borrow**: an async method's body runs after the call
+    // that lent it a pointer has returned, so a call through the object is held to what the task
+    // holds instead (`task_held`), and an `await` of it takes it back.
+    if f.marks.is_async() then return false
 
     trait_of(cx, f.name).is_some() || (cx.addressed.has(f.name) && !relays(cx, f.name))
 end lent_by_rule
@@ -1330,6 +1357,8 @@ private kept_at(t: &Track, evs: &EvBuf, e: TExpr)
 
             for op in ops
                 if carries(t, op) then kept_hard(evs, "it is stored through a pointer by an atomic", op.span)
+        TAwait(task, _) -> await_clear(t.hs, evs, task, e.span)
+        TBlockOn(task, _) -> await_clear(t.hs, evs, task, e.span)
         TCall(name, args, _, _) ->
             join_clear(t.hs, evs, name, args, e.span)
 
@@ -1353,7 +1382,12 @@ private kept_at(t: &Track, evs: &EvBuf, e: TExpr)
                 if !hands_on(t, args.at(j)) then continue
 
                 for item in vcall_keeps(t.cx, recv, slot, j)
-                    val loc = translate_loc(t.org, all, item.1.loc)
+                    if item.1.loc == "j" && has_span(t.hs.chained, e.span) then continue
+
+                    val loc = if item.1.loc == "j" then joined_loc(t.hs, true) else translate_loc(t.org, all, item.1.loc)
+
+                    if loc.starts_with("j:") && said_already(evs, loc, args.at(j).span) then continue
+
                     val how = s"it is passed to '${shown_name(t.cx.an, item.0)}', which keeps it"
 
                     if !loc.starts_with("l:") then evs.items.push(FlowEv(false, loc, how, args.at(j).span))
@@ -2101,6 +2135,8 @@ end frame_clear_store
 private frame_event_at(ft: &FrameTrack, evs: &EvBuf, e: TExpr)
     *e.kind match
         TStore(place, v, _, _) -> frame_stored(ft, evs, place, v)
+        TAwait(task, _) -> await_clear(ft.hs, evs, task, e.span)
+        TBlockOn(task, _) -> await_clear(ft.hs, evs, task, e.span)
         TCall(_, _, _, _) -> call_at(ft, evs, e)
         TVCall(_, _, _, _, _) -> call_at(ft, evs, e)
         TCallPtr(_, _, _, _) -> call_at(ft, evs, e)
@@ -2212,8 +2248,10 @@ private call_at(ft: &FrameTrack, evs: &EvBuf, e: TExpr)
                     // clear can name (`?`), one per argument, and refused at a way out.
                     if item.loc == "j" && loc == "" then loc = s"j?${arg.span.start}"
 
-                    // A thread holds it until it is joined, so the cure is a join on every way out.
-                    val cure = if item.loc == "j" then s" — join that thread on every way out of '${ft.owner}', " +
+                    // A thread holds it until it is joined, so the cure is a join on every way out; a
+                    // task, until it is awaited.
+                    val ending = if task_result(texpr_type(e)).is_some() then "await that task" else "join that thread"
+                    val cure = if item.loc == "j" then s" — $ending on every way out of '${ft.owner}', " +
                         s"or hand it storage that lasts${ft.hs.why}" else ""
                     val said = s"'${shown_name(ft.cx.an, name)}' keeps its parameter " +
                         s"'${param_name(ft.cx, name, j)}' (${item.how}), and " +
@@ -2242,13 +2280,19 @@ private call_at(ft: &FrameTrack, evs: &EvBuf, e: TExpr)
                 if core.is_none() then continue
 
                 for item in vcall_keeps(ft.cx, recv, slot, j)
-                    val loc = translate_loc(ft.org, all, item.1.loc)
+                    if item.1.loc == "j" && has_span(ft.hs.chained, e.span) then continue
+
+                    val loc = if item.1.loc == "j" then joined_loc(ft.hs, false) else translate_loc(ft.org, all, item.1.loc)
 
                     if loc.starts_with("l:") then continue
+                    if loc.starts_with("j:") && said_already(evs, loc, arg.span) then continue
 
+                    // An async method's task holds it until that task is awaited.
+                    val cure = if item.1.loc == "j" then s" — await that task on every way out of '${ft.owner}', " +
+                        s"or hand it storage that lasts" else ""
                     val said = s"'${shown_name(ft.cx.an, item.0)}' keeps its parameter " +
                         s"'${param_name(ft.cx, item.0, j + 1)}' (${item.1.how}), and " +
-                        argument_said(ft, arg, core.unwrap())
+                        argument_said(ft, arg, core.unwrap()) + cure
 
                     if loc == "" || loc.index_of("?").is_some()
                         ft.faults.items.push((ft.scope, arg.span, said))

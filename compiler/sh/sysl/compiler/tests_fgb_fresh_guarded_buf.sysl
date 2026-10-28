@@ -1,0 +1,388 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// A value built fresh inside a guarded member's closure may leave it (`guarded.sysl`'s
+// `answers_fresh`): a `Buf` made in the closure and filled with copies of what it guards passes,
+// and so does a struct, a variant or a call made of fresh values. A local stays fresh only while
+// everything written into it is fresh and it goes nowhere but out through the answer -- stored into
+// the guarded value, bound to a second name, handed to a function, its address taken, overwritten
+// by a captured value -- and any of those refuses the whole closure in the words a shared answer
+// always got.
+
+// What a one-file program printed and whether it ran to a zero exit; a refused build answers the
+// driver's report.
+private fgb_outcome(text: string) -> (string, bool)
+    val root = make_temp_dir("sysl-fgb").unwrap()
+
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (failure_text(why), false)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> ("the program that was built could not be run", false)
+        Ok(out) -> (out.text + out.err.unwrap_or(""), out.status.ok())
+end fgb_outcome
+
+private fgb_ready() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+
+    true
+
+private fgb_ran(text: string) -> string
+    val out = fgb_outcome(fgb_prelude() + text)
+
+    if !out.1 then return s"it did not run to the end: ${out.0}"
+
+    out.0
+
+private fgb_err(text: string) -> string
+    val out = fgb_outcome(fgb_prelude() + text)
+
+    if out.1 then return s"it was not refused, and printed: ${out.0}"
+
+    out.0
+
+private fgb_says(said: string, words: string)
+    if !said.contains(words) then assert_eq(said, words)
+
+private fgb_prelude() -> string = raw"""
+    import sysl.buf.{Buf, buf, buf_filled}
+    import sysl.sync.{Guarded, SpinLock}
+    import sysl.threads.Mutex
+
+    var cell = Mutex.new(buf[u8]())
+    var nest = Mutex.new(buf[Buf[u8]]())
+    var names = Mutex.new(buf[string]())
+
+    cell.with(b -> b.extend([1, 2, 3]))
+    nest.with(b -> b.push(buf_filled(2, u8(5))))
+    names.with(b -> b.push("alpha"))
+
+    """
+
+// The refusal of a closure answering a `Buf` of `elem` that shares its count.
+private fgb_refusal(member: string, elem: string) -> string =
+    s"'sysl.threads.Mutex.$member' answers a value out of the 'value' it guards, and once the guard " +
+    "is let go that value is shared with whoever holds it next, so every count it reaches has to be " +
+    s"atomic — but this answers a 'sysl.buf.Buf[$elem]', whose 'core' reaches a " +
+    s"'&sysl.buf.BufCore[$elem]', whose count is not atomic. Answer what the caller needs from it — a " +
+    "count, a flag, a '.copy()' of a string, a value built fresh inside the closure — rather than the " +
+    "value itself"
+
+// -- accepted ------------------------------------------------------------------------------------
+
+@test("a Buf built in the closure and filled from the guarded one leaves 'with', and runs")
+fgb_a_fresh_buf_leaves()
+    if !fgb_ready() then return
+
+    assert_eq(fgb_ran(raw"""
+        snapshot() -> Buf[u8] = cell.with(b ->
+            var copy: Buf[u8] = buf()
+            copy.extend(b.view())
+            copy)
+
+        val s = snapshot()
+        cell.with(b -> b.push(4))
+        print(s.view(), cell.with(b -> b.len()))
+        """), "[1, 2, 3] 4\n")
+end fgb_a_fresh_buf_leaves
+
+@test("a struct holding the fresh Buf leaves, after an element of it was written and its length read")
+fgb_a_struct_of_a_fresh_buf_leaves()
+    if !fgb_ready() then return
+
+    assert_eq(fgb_ran(raw"""
+        struct Holder
+            log: Buf[u8]
+            n: usize
+
+        held() -> Holder = cell.with(b ->
+            var copy: Buf[u8] = buf()
+            copy.extend(b.view())
+            copy[0] = 9
+            Holder(copy, copy.len()))
+
+        val h = held()
+        print(h.log.view(), h.n)
+        """), "[9, 2, 3] 3\n")
+end fgb_a_struct_of_a_fresh_buf_leaves
+
+@test("a call handed only counts answers fresh, and so does '.copy()' of a Buf of bytes")
+fgb_calls_and_copies_are_fresh()
+    if !fgb_ready() then return
+
+    assert_eq(fgb_ran(raw"""
+        print(cell.with(b -> buf_filled(b.len(), u8(7))).view())
+        print(cell.with(b -> b.copy()).view())
+        print(cell.with(b -> Some(b.copy())).unwrap().view())
+        """), "[7, 7, 7]\n[1, 2, 3]\n[1, 2, 3]\n")
+end fgb_calls_and_copies_are_fresh
+
+@test("elements pushed in a loop, and an early 'return' of another fresh Buf, both leave")
+fgb_a_loop_and_an_early_return()
+    if !fgb_ready() then return
+
+    assert_eq(fgb_ran(raw"""
+        bumped(limit: usize) -> Buf[u8] = cell.with(b ->
+            var copy: Buf[u8] = buf()
+            for x in b.view()
+                copy.push(x + 1)
+            if copy.len() > limit then return buf()
+            copy)
+
+        print(bumped(10).view(), bumped(1).view())
+        """), "[2, 3, 4] []\n")
+end fgb_a_loop_and_an_early_return
+
+@test("a Buf of strings each taken with '.copy()' leaves")
+fgb_copied_strings_leave()
+    if !fgb_ready() then return
+
+    assert_eq(fgb_ran(raw"""
+        all() -> Buf[string] = names.with(b ->
+            var out: Buf[string] = buf()
+            for s in b.view()
+                out.push(s.copy())
+            out)
+
+        print(all().view())
+        """), "[alpha]\n")
+end fgb_copied_strings_leave
+
+@test("'try_with', a 'Guarded' record and a '&sync' closure take the same fresh Buf")
+fgb_the_other_guards_take_it()
+    if !fgb_ready() then return
+
+    assert_eq(fgb_ran(raw"""
+        static var table: Guarded[SpinLock, Buf[u8]] = Guarded.new(SpinLock(0), buf())
+        static var shared: Mutex[Buf[u8]] = Mutex.new(buf())
+
+        table.with(b -> b.push(5))
+        shared.with(b -> b.push(6))
+
+        tried() -> Option[Buf[u8]] = cell.try_with(b ->
+            var copy: Buf[u8] = buf()
+            copy.extend(b.view())
+            copy)
+
+        record() -> Buf[u8] = table.with(b ->
+            var copy: Buf[u8] = buf()
+            copy.push(u8(b.len()))
+            copy)
+
+        val job: &sync Fn() -> unit = () -> print(shared.with(b ->
+            var copy: Buf[u8] = buf()
+            copy.extend(b.view())
+            copy).view())
+
+        print(tried().unwrap().view(), record().view())
+        job()
+        """), "[1, 2, 3] [1]\n[6]\n")
+end fgb_the_other_guards_take_it
+
+@test("a fresh Buf captured by a closure that stays in the body still leaves")
+fgb_a_local_closure_over_it()
+    if !fgb_ready() then return
+
+    assert_eq(fgb_ran(raw"""
+        counted() -> Buf[u8] = cell.with(b ->
+            var copy: Buf[u8] = buf()
+            copy.extend(b.view())
+            val count = () -> copy.len()
+            copy.push(u8(count()))
+            copy)
+
+        print(counted().view())
+        """), "[1, 2, 3, 3]\n")
+end fgb_a_local_closure_over_it
+
+@test("a generic snapshot at bytes is accepted where its body builds a fresh Buf")
+fgb_a_generic_snapshot_at_bytes()
+    if !fgb_ready() then return
+
+    assert_eq(fgb_ran(raw"""
+        snap[T](m: *Mutex[Buf[T]]) -> Buf[T] = m.with(b ->
+            var copy: Buf[T] = buf()
+            copy.extend(b.view())
+            copy)
+
+        print(snap(&cell).view())
+        """), "[1, 2, 3]\n")
+end fgb_a_generic_snapshot_at_bytes
+
+// -- refused -------------------------------------------------------------------------------------
+
+@test("the guarded Buf itself is still refused")
+fgb_the_guarded_buf_is_refused()
+    if !fgb_ready() then return
+
+    fgb_says(fgb_err("print(cell.with(b -> *b).len())\n"), fgb_refusal("with", "byte"))
+
+@test("a view of the guarded Buf is still refused")
+fgb_a_view_of_it_is_refused()
+    if !fgb_ready() then return
+
+    fgb_says(fgb_err("print(cell.with(b -> b.view()).len)\n"),
+             "but this answers a '[]byte', whose count is not atomic. Answer what the caller needs")
+
+@test("a fresh Buf pushed into the guarded value and then answered is refused, being shared")
+fgb_stored_into_the_guard_is_refused()
+    if !fgb_ready() then return
+
+    fgb_says(fgb_err(raw"""
+        print(nest.with(b ->
+            var fresh: Buf[u8] = buf()
+            b.push(fresh)
+            fresh).len())
+        """), fgb_refusal("with", "byte"))
+end fgb_stored_into_the_guard_is_refused
+
+@test("so is one stored there under a second name")
+fgb_stored_under_a_second_name_is_refused()
+    if !fgb_ready() then return
+
+    fgb_says(fgb_err(raw"""
+        print(nest.with(b ->
+            var fresh: Buf[u8] = buf()
+            val again = fresh
+            b.push(again)
+            fresh).len())
+        """), fgb_refusal("with", "byte"))
+end fgb_stored_under_a_second_name_is_refused
+
+@test("so is one stored there by a function it was handed to")
+fgb_stored_by_a_call_is_refused()
+    if !fgb_ready() then return
+
+    fgb_says(fgb_err(raw"""
+        stash(into: *Buf[Buf[u8]], v: Buf[u8]) = into.push(v)
+
+        print(nest.with(b ->
+            var fresh: Buf[u8] = buf()
+            stash(b, fresh)
+            fresh).len())
+        """), fgb_refusal("with", "byte"))
+end fgb_stored_by_a_call_is_refused
+
+@test("so is one stored there through its address")
+fgb_stored_through_its_address_is_refused()
+    if !fgb_ready() then return
+
+    fgb_says(fgb_err(raw"""
+        print(nest.with(b ->
+            var fresh: Buf[u8] = buf()
+            val p = &fresh
+            b.push(*p)
+            fresh).len())
+        """), fgb_refusal("with", "byte"))
+end fgb_stored_through_its_address_is_refused
+
+@test("a captured outer Buf is refused, answered or written over the fresh one")
+fgb_a_captured_buf_is_refused()
+    if !fgb_ready() then return
+
+    fgb_says(fgb_err(raw"""
+        outer() -> usize
+            val kept: Buf[u8] = buf()
+
+            cell.with(b -> kept).len()
+
+        print(outer())
+        """), fgb_refusal("with", "byte"))
+
+    fgb_says(fgb_err(raw"""
+        overwritten() -> usize
+            val kept: Buf[u8] = buf()
+
+            cell.with(b ->
+                var fresh: Buf[u8] = buf()
+                fresh = kept
+                fresh).len()
+
+        print(overwritten())
+        """), fgb_refusal("with", "byte"))
+end fgb_a_captured_buf_is_refused
+
+@test("'.copy()' of a Buf of Bufs is refused, its elements still being the guarded ones")
+fgb_a_shallow_copy_is_refused()
+    if !fgb_ready() then return
+
+    fgb_says(fgb_err("print(nest.with(b -> b.copy()).len())\n"), fgb_refusal("with", "sysl.buf.Buf[byte]"))
+
+@test("a guarded string pushed into a fresh Buf without '.copy()' is refused")
+fgb_an_uncopied_string_is_refused()
+    if !fgb_ready() then return
+
+    fgb_says(fgb_err(raw"""
+        print(names.with(b ->
+            var out: Buf[string] = buf()
+            out.push(b[0])
+            out).len())
+        """), fgb_refusal("with", "string"))
+end fgb_an_uncopied_string_is_refused
+
+@test("and so is one written over an element of the fresh Buf")
+fgb_an_uncopied_string_written_is_refused()
+    if !fgb_ready() then return
+
+    fgb_says(fgb_err(raw"""
+        print(names.with(b ->
+            var out: Buf[string] = buf()
+            out.push("x")
+            out[0] = b[0]
+            out).len())
+        """), fgb_refusal("with", "string"))
+end fgb_an_uncopied_string_written_is_refused
+
+@test("a guarded inner Buf pushed into a fresh Buf of Bufs is refused")
+fgb_a_guarded_inner_buf_is_refused()
+    if !fgb_ready() then return
+
+    fgb_says(fgb_err(raw"""
+        print(nest.with(b ->
+            var out: Buf[Buf[u8]] = buf()
+            out.push(b[0])
+            out).len())
+        """), fgb_refusal("with", "sysl.buf.Buf[byte]"))
+end fgb_a_guarded_inner_buf_is_refused
+
+@test("'try_with' refuses the fresh Buf stored into the guard, as 'with' does")
+fgb_try_with_refuses_a_stored_one()
+    if !fgb_ready() then return
+
+    fgb_says(fgb_err(raw"""
+        print(nest.try_with(b ->
+            var fresh: Buf[u8] = buf()
+            b.push(fresh)
+            fresh).is_some())
+        """), "'sysl.threads.Mutex.try_with' answers a value out of the 'value' it guards")
+end fgb_try_with_refuses_a_stored_one
+
+@test("the generic snapshot at strings is refused, its elements being shared")
+fgb_a_generic_snapshot_at_strings()
+    if !fgb_ready() then return
+
+    fgb_says(fgb_err(raw"""
+        snap[T](m: *Mutex[Buf[T]]) -> Buf[T] = m.with(b ->
+            var copy: Buf[T] = buf()
+            copy.extend(b.view())
+            copy)
+
+        print(snap(&names).len())
+        """), fgb_refusal("with", "string"))
+end fgb_a_generic_snapshot_at_strings
