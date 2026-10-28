@@ -816,6 +816,87 @@ drop 7
 done
 ```
 
+### A share of something read out of storage takes no count while nothing can move
+
+The same goes for a reference read out of **storage** rather than out of a local: a field of the
+object a parameter refers to, an element of a buffer, the payload of the enum a `match` is looking at.
+A `val` bound to one, a tuple or struct built of them on the spot, and a key handed to a lookup each
+take a count and give it back at the end of their statement or scope; **where nothing between the
+two can give a count back, look at one, or hand the thread to other code, neither is taken**. That is
+what makes a map keyed by a tuple of references cost what a map keyed by numbers costs: the key built
+for `get`, and the stored key each probe compares it with, are read and never counted.
+
+- the stretch may hold what the rule above allows: arithmetic, reads, and calls to functions that
+  release nothing and write nothing but their own locals. Any other call or release keeps the count;
+- an `await` keeps it too, since another task may run there and write the storage;
+- a value that is returned, stored, captured by a closure, or handed to a function that keeps it
+  keeps its count. A tuple or struct built on the spot for such a call is **handed over whole**: the
+  call costs one copy of it, not a copy for the call and a second for the parameter.
+
+The reference is alive when the count would have been taken, and nothing in the stretch can lower a
+count, so it stays alive to the end of it, whoever else holds it — the storage need not stay put, and
+the count is the same afterwards as with both taken. Another thread reaches the same storage only
+under its lock, and taking or giving back a lock is a call that ends the stretch. As above, **no
+destructor moves**: below, the tags drop where they did when every count was taken.
+
+```sysl
+import sysl.buf.{Buf, buf}
+import sysl.container.{Map, map}
+
+struct Tag
+    id: int
+
+impl Drop for Tag
+    drop(self) = print("drop", self.id)
+
+struct Pair
+    a: &Tag
+    b: &Tag
+
+joined(m: Map[(&Tag, &Tag), int], tags: Buf[&Tag]) -> int
+    var n = 0
+
+    for i in 0..<tags.len() - 1
+        if m.get((tags[i], tags[i + 1])) is Some(v) then n += v
+
+    n
+
+ends(pairs: Buf[Pair]) -> int
+    pairs[0] match
+        Pair(a, b) -> a.id * b.id
+
+var tags: Buf[&Tag] = buf()
+
+for i in 1..3
+    tags.push(Tag(i))
+
+var m: Map[(&Tag, &Tag), int] = map()
+
+m.put((tags[0], tags[1]), 10)
+m.put((tags[1], tags[2]), 20)
+print(joined(m, tags))
+
+var pairs: Buf[Pair] = buf()
+
+pairs.push(Pair(tags[0], tags[2]))
+print(ends(pairs))
+tags.clear()
+m.clear()
+print("kept by the pair")
+pairs.clear()
+print("done")
+```
+
+```output
+30
+3
+drop 2
+kept by the pair
+drop 1
+drop 3
+done
+```
+
 ## `weak T` — breaking cycles
 
 Reference counting has one honest weakness: a cycle of strong references keeps itself alive. A parent

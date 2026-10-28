@@ -40,6 +40,35 @@ import sysl.text.Search
 // last release dropped, so the count never reaches zero inside the window, nothing inside reads it,
 // and outside it the count is what it was. Each path loses one retain and the one release that gave
 // it back, so no count ends anywhere else and no destructor moves.
+//
+// **A share of a reference read out of storage that is not a slot of this frame** -- a field of what a
+// parameter refers to, an element of a buffer, the payload of the enum a `match` is looking at -- is
+// dropped by the same rule, and so is the one share of a tuple or struct put together on the spot from
+// such reads (`m.get((n.a, n.b))`, `val (a, b) = (xs[i], xs[j])`). What that leans on is not a slot
+// of the frame but the window itself. The reference is alive when the retain runs, or the retain
+// would be touching freed memory, so its count is at least one there; a count only falls at a
+// release, and the window holds none -- a callee in it is one that releases nothing it did not take,
+// and so lets nothing reach zero. So the count stays at least one to the release that ends the window,
+// is read by nothing in between, and is the same after it as with both kept. That holds for whoever
+// else holds the object, which is why the place the reference came from need not stay put; what it
+// needs is that no other code runs in the window at all:
+//
+// - **a coroutine's suspension point, or the resumption of an awaited task,** hands the thread to other
+//   tasks of the domain, which may write the place and give back what it held, so a window over one is
+//   refused (`suspends`). A slot of the frame is out of their reach, but a count is not -- they may
+//   look at it -- so a covering slot's window is refused there too.
+// - **another thread** reaches such storage only under its lock (a `&T` never leaves its domain, and
+//   what a `&sync T` shares is not safe to mutate without one), and taking or giving back a lock is a
+//   call that ends the window; a reference read and given back with no lock between them by two
+//   threads at once is a data race whether the share is taken or not.
+// - **an interrupt handler** shares storage with the program through `volatile`, and a volatile read
+//   is no plain load, so a reference read out of one is never in a window. A plain variable both sides
+//   write is one the optimizer is already entitled to read once, and the program's own read of it
+//   races the handler with or without the share.
+//
+// A slot of this frame is still asked whether it covers: written once, with a value holding a count.
+// The frame keeps values there it took no count for -- a borrowed argument, the destination of a share
+// this pass already dropped -- and the narrower question is the one those were proved against.
 
 // Where a value comes from: the value a walk back through field reads and writes stopped at, the
 // field of it (each index followed by a `.`), and the field writes it passed (`|name|`). Values are
@@ -170,8 +199,9 @@ elide_covered(blocks: Buf[IrBlock], clean: Set[string], inert: Set[string]) -> B
     out
 end elide_covered
 
-// The retain at `blocks[b].instrs[i]`, if it is one of a reference read out of a covering slot whose
-// new count goes nowhere but into values and one clean slot.
+// The retain at `blocks[b].instrs[i]`, if it is one of a reference read out of a covering slot or out
+// of storage, or the copy of a value put together from such reads, whose new count goes nowhere but
+// into values and one clean slot.
 private cover_at(blocks: Buf[IrBlock], defs: Map[string, Inst], stores: Map[string, SlotStore],
                  clean: Set[string], b: usize, i: usize) -> Option[Cover]
     val (name, x) = arc_call_of(blocks[b].instrs[i])?
@@ -184,11 +214,13 @@ private cover_at(blocks: Buf[IrBlock], defs: Map[string, Inst], stores: Map[stri
     val from = origin_of(defs, x, "", "")
     val slot = loaded_slot(defs, from.leaf)
 
-    if slot == "" then return None
-
-    val held = stores.get(slot)?
-
-    if held.count != 1 || !holds_a_count(blocks, defs, held, from.path) then return None
+    // A slot of the frame must cover it. Any other place the reference was read out of -- a field, an
+    // element, the payload of the enum a `match` is looking at -- needs only the window, and so does a
+    // value built on the spot out of such reads (see the head of this file).
+    if slot == ""
+        if !name.starts_with("arc.copy.") || !built_of_places(blocks, defs, stores, clean, x) then return None
+    else if !held_where_read(blocks, defs, stores, clean, from)
+        return None
 
     val xs = v_render(x)
     val instrs = blocks[b].instrs
@@ -215,6 +247,59 @@ private cover_at(blocks: Buf[IrBlock], defs: Map[string, Inst], stores: Map[stri
     Some(Cover(b, i, release, slot, from.path, from.leaf, inserts, into, into_path))
 end cover_at
 
+// Whether `v` is a value put together on the spot by field writes into nothing, each counted field
+// written with something read out of a place (or itself put together the same way): a tuple or a
+// struct built of fields and elements, whose share is one share of each of those places' references.
+// A field of a plain number counts nothing; any other value -- a call's result, a fresh box, a
+// constant -- is a count no place holds, and keeps the share.
+private built_of_places(blocks: Buf[IrBlock], defs: Map[string, Inst], stores: Map[string, SlotStore],
+                        clean: Set[string], v: Val) -> bool
+    var cur = v
+    var fields = 0
+
+    loop
+        defs.get(v_render(cur)) match
+            Some(InInsert(_, _, agg, vty, value, _)) ->
+                val counted = vty match
+                    LInt(_) -> false
+                    LFloat(_, _) -> false
+                    _ -> true
+
+                if counted
+                    val from = origin_of(defs, value, "", "")
+                    val read = if loaded_slot(defs, from.leaf) == "" then false
+                               else held_where_read(blocks, defs, stores, clean, from)
+
+                    if !read && !built_of_places(blocks, defs, stores, clean, value) then return false
+
+                fields += 1
+                cur = agg
+            _ -> break
+
+    if fields == 0 then return false
+
+    cur match
+        VUndef -> true
+        VZero -> true
+        VPoison -> true
+        _ -> false
+end built_of_places
+
+// Whether the place the reference at `from` was read out of holds a count on it. A slot of this frame
+// does when it covers: written once, with a value that holds a count. Any other place -- a field, an
+// element, a global, a slot whose address has left the frame -- is storage the reference was kept
+// in, and storage keeps a count on what it holds.
+private held_where_read(blocks: Buf[IrBlock], defs: Map[string, Inst], stores: Map[string, SlotStore],
+                        clean: Set[string], from: Origin) -> bool
+    val slot = loaded_slot(defs, from.leaf)
+
+    if !clean.has(slot) then return true
+
+    stores.get(slot) match
+        Some(held) -> held.count == 1 && holds_a_count(blocks, defs, held, from.path)
+        None -> false
+end held_where_read
+
 // Whether the one value stored to a covering slot holds a count on field `path`: a parameter does,
 // and so does a value whose field had a count taken for it earlier in the store's own block.
 private holds_a_count(blocks: Buf[IrBlock], defs: Map[string, Inst], held: SlotStore, path: string) -> bool
@@ -223,6 +308,8 @@ private holds_a_count(blocks: Buf[IrBlock], defs: Map[string, Inst], held: SlotS
         _ -> ()
 
     val want = origin_of(defs, held.value, path, "")
+    // A copy of the whole value takes a count on every field of it.
+    val whole = origin_of(defs, held.value, "", "")
     val instrs = blocks[held.block].instrs
 
     for j in 0..<held.at
@@ -231,7 +318,7 @@ private holds_a_count(blocks: Buf[IrBlock], defs: Map[string, Inst], held: SlotS
                 if name != "arc.weak_retain" && release_for(name).is_some()
                     val got = origin_of(defs, v, "", "")
 
-                    if got.leaf == want.leaf && got.path == want.path then return true
+                    if same_place(got, want) || same_place(got, whole) then return true
             None -> ()
 
     false
@@ -240,6 +327,8 @@ end holds_a_count
 // The field of `v` that holds the reference `xs` (read out of `from`), if `v` carries it: a value
 // built by writing it into a field, or a read of the slot field it is part of.
 private carried(defs: Map[string, Inst], v: Val, from: Origin) -> Option[string]
+    if same_place(origin_of(defs, v, "", ""), from) then return Some("")
+
     var cur = v
 
     loop
@@ -306,7 +395,7 @@ private window_ends(blocks: Buf[IrBlock], defs: Map[string, Inst], labels: Map[s
                         return none
                 None -> ()
 
-            if !count_blind(defs, inert, inst) then return none
+            if !count_blind(defs, inert, inst) || suspends(inst) then return none
 
         if stopped then continue
 
@@ -365,10 +454,21 @@ private count_blind(defs: Map[string, Inst], inert: Set[string], inst: Inst) -> 
     InVaArg(_, _, _) -> false
     _ -> true
 
-// Whether a release of a reference from `o` gives back the count `c` took: it was put into a value by
-// one of the retain's own field writes, or read out of the slot that value was stored into.
+// Whether `inst` hands the thread to other code before it comes back: a coroutine's suspension point,
+// or the resumption of the task being awaited. That code is any task of the domain, which may write the
+// place a share was read out of and give back what it held, and may look at a count.
+private suspends(inst: Inst) -> bool = inst match
+    InCall(_, _, VGlobal(name), _, _, _, _, _) -> name.starts_with("llvm.coro.")
+    _ -> false
+
+// Whether a release of a reference from `o` gives back the count `c` took: it is the very value the
+// retain was handed, it was put into a value by one of the retain's own field writes, or it was read
+// out of the slot that value was stored into.
 private gives_back(defs: Map[string, Inst], c: Cover, o: Origin) -> bool
     if o.leaf == c.leaf && o.path == c.path
+        // The very value the retain was handed, read by the same instruction: one reference.
+        if o.through == "" then return true
+
         for n in c.inserts
             if o.through.contains(s"|$n|") then return true
 

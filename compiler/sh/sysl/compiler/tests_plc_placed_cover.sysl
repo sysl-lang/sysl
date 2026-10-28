@@ -1,0 +1,677 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.container.{Set, set}
+import sysl.process.capture
+import sysl.text.Search
+
+// A share of a reference read out of storage that is not a slot of the frame -- a field, an element,
+// the payload a `match` is looking at -- or of a value built on the spot out of such reads, dropped
+// where nothing in the window releases, reads a count or hands the thread to other code
+// (`arc_cover.sysl`); and a value built on the spot that a call took one copy of, handed to an owned
+// parameter without a second (`emit_moves.sysl`'s `take_over`).
+//
+// The pass on blocks built by hand, each thing that keeps the share; then the emitted text of the
+// shapes it is for and of the ones that must still count; then programs whose destructors print, run
+// on the counted heap.
+
+// -- the pass, on blocks built by hand ------------------------------------------------------------------
+
+private plc_call(name: string, ty: LType, v: string) -> Inst
+    var args: Buf[IrArg] = buf()
+
+    args.push(ir_arg(ty, VReg(v)))
+    ir_call(None, LVoid, VGlobal(name), args)
+end plc_call
+
+private plc_ref(name: string, v: string) -> Inst = plc_call(name, LPtr, v)
+
+private plc_pair() -> LType = LNamed("struct.Pair")
+
+private plc_idx(k: int) -> Buf[int]
+    var idx: Buf[int] = buf()
+
+    idx.push(k)
+    idx
+end plc_idx
+
+// `%d` is element `%i` of the storage `%base` points at, read plainly or not.
+private plc_element(d: string, i: string, acc: IrAccess) -> Buf[Inst]
+    var at: Buf[IrArg] = buf()
+    var out: Buf[Inst] = buf()
+
+    at.push(ir_arg(LInt(64), VReg(i)))
+    out.push(InGep(VReg(s"$d.at"), LPtr, VReg("base"), at))
+    out.push(InLoad(VReg(d), LPtr, VReg(s"$d.at"), acc, None))
+    out
+end plc_element
+
+private plc_store(v: string, slot: string) -> Inst = InStore(LPtr, VReg(v), VReg(slot), AccPlain, None)
+
+private plc_block(label: string, instrs: Buf[Inst], term: Inst) -> IrBlock = IrBlock(label, instrs, Some(term))
+
+private plc_pass(blocks: Buf[IrBlock]) -> string
+    var inert: Set[string] = set()
+
+    inert.add("quiet")
+
+    var out = ""
+
+    for b in elide_arc_pairs(blocks, inert)
+        out = s"$out${b.label}:\n"
+
+        for i in b.instrs
+            out = s"$out  ${inst_render(i)}\n"
+
+        b.terminator match
+            Some(t) -> out = s"$out  ${inst_render(t)}\n"
+            None -> ()
+
+    out
+end plc_pass
+
+private plc_count(text: string, needle: string) -> int = int(text.count_of(needle))
+
+// `val e = base[i]; <between>; …e…` lowered to what the pass reads: the element read through its
+// address, the share taken for the local, `between`, and the local given back at the end of its scope.
+private plc_read(between: Buf[Inst], acc: IrAccess) -> Buf[IrBlock]
+    var entry: Buf[Inst] = buf()
+
+    entry.push(InAlloca(VReg("e.addr"), LPtr, None))
+
+    for inst in plc_element("t1", "i", acc)
+        entry.push(inst)
+
+    entry.push(plc_ref("arc.retain", "t1"))
+    entry.push(plc_store("t1", "e.addr"))
+
+    for inst in between
+        entry.push(inst)
+
+    // The scope ends in a block of its own, reached by a branch, so the pair is one the cancelling
+    // inside a block (`arc_elide.sysl`) never sees and only the cover pass can drop.
+    var done: Buf[Inst] = buf()
+
+    done.push(InLoad(VReg("t9"), LPtr, VReg("e.addr"), AccPlain, None))
+    done.push(plc_ref("arc.release", "t9"))
+
+    var blocks: Buf[IrBlock] = buf()
+
+    blocks.push(plc_block("entry", entry, InCondBr(VReg("c"), "done", "done")))
+    blocks.push(plc_block("done", done, InRet(None, None)))
+    blocks
+end plc_read
+
+private plc_with(inst: Inst) -> string
+    var between: Buf[Inst] = buf()
+
+    between.push(inst)
+    plc_pass(plc_read(between, AccPlain))
+end plc_with
+
+private plc_none() -> Buf[IrArg] = buf()
+
+@test("a share of an element read into a local gives up its count, before and after")
+plc_element_before_and_after()
+    val after = plc_pass(plc_read(buf(), AccPlain))
+
+    assert_eq(after, raw"""
+        entry:
+          %e.addr = alloca ptr
+          %t1.at = getelementptr ptr, ptr %base, i64 %i
+          %t1 = load ptr, ptr %t1.at
+          store ptr %t1, ptr %e.addr
+          br i1 %c, label %done, label %done
+        done:
+          %t9 = load ptr, ptr %e.addr
+          ret void
+        """)
+
+@test("a call that releases nothing, a field read or another retain may sit in an element's window")
+plc_blind_inside()
+    var read: Buf[Inst] = buf()
+
+    for inst in plc_element("t5", "j", AccPlain)
+        read.push(inst)
+
+    for after in [plc_with(ir_call(None, LVoid, VGlobal("quiet"), plc_none())), plc_with(plc_ref("arc.retain", "other")),
+                  plc_pass(plc_read(read, AccPlain))]
+        assert_eq(after.contains("@arc.retain(ptr %t1)"), false, after)
+        assert_eq(after.contains("@arc.release"), false, after)
+
+@test("any other call, any other release, a load through the reference or a fence keeps an element's share")
+plc_count_could_move()
+    for after in [plc_with(ir_call(None, LVoid, VGlobal("anything"), plc_none())),
+                  plc_with(plc_ref("arc.release", "elsewhere")),
+                  plc_with(plc_ref("arc.dispose.Pair", "elsewhere")),
+                  plc_with(InLoad(VReg("n"), LInt(64), VReg("t1"), AccPlain, None)),
+                  plc_with(InFence(OrdSeqCst))]
+        assert_eq(plc_count(after, "@arc.retain(ptr %t1)"), 1, after)
+        assert_eq(plc_count(after, "@arc.release(ptr %t9)"), 1, after)
+
+@test("a suspension or a resumption in the window keeps the share, read out of storage or a covering slot")
+plc_suspension_keeps()
+    var token: Buf[IrArg] = buf()
+
+    token.push(ir_arg(LNamed("token"), VNothing))
+    token.push(ir_arg(LInt(1), VBool(false)))
+
+    for name in ["llvm.coro.suspend", "llvm.coro.resume"]
+        val after = plc_with(ir_call(Some(VReg("s")), LInt(8), VGlobal(name), token))
+
+        assert_eq(plc_count(after, "@arc.retain(ptr %t1)"), 1, after)
+
+    // The same suspension in a window whose share a parameter's slot covers; and without it the
+    // covering slot's pair goes, so the suspension is what kept it.
+    val covered = plc_pass(plc_covered(ir_call(Some(VReg("s")), LInt(8), VGlobal("llvm.coro.suspend"), token)))
+
+    assert_eq(plc_count(covered, "@arc.retain(ptr %t1)"), 1, covered)
+
+    val dropped = plc_pass(plc_covered(ir_call(None, LVoid, VGlobal("quiet"), plc_none())))
+
+    assert_eq(dropped.contains("@arc.retain"), false, dropped)
+
+// `val e = p` for a parameter `p`, `between`, and `e` given back in a block of its own.
+private plc_covered(between: Inst) -> Buf[IrBlock]
+    var entry: Buf[Inst] = buf()
+
+    entry.push(InAlloca(VReg("p.addr"), LPtr, None))
+    entry.push(InAlloca(VReg("e.addr"), LPtr, None))
+    entry.push(plc_store("p.param", "p.addr"))
+    entry.push(InLoad(VReg("t1"), LPtr, VReg("p.addr"), AccPlain, None))
+    entry.push(plc_ref("arc.retain", "t1"))
+    entry.push(plc_store("t1", "e.addr"))
+    entry.push(between)
+
+    var done: Buf[Inst] = buf()
+
+    done.push(InLoad(VReg("t9"), LPtr, VReg("e.addr"), AccPlain, None))
+    done.push(plc_ref("arc.release", "t9"))
+
+    var blocks: Buf[IrBlock] = buf()
+
+    blocks.push(plc_block("entry", entry, InCondBr(VReg("c"), "done", "done")))
+    blocks.push(plc_block("done", done, InRet(None, None)))
+    blocks
+end plc_covered
+
+@test("a reference read by a volatile load keeps its share")
+plc_volatile_source()
+    val after = plc_pass(plc_read(buf(), AccVolatile))
+
+    assert_eq(plc_count(after, "@arc.retain(ptr %t1)"), 1, after)
+
+@test("an element's share stored outside the frame keeps its count")
+plc_stored_away()
+    val after = plc_with(plc_store("t1", "heap"))
+
+    assert_eq(plc_count(after, "@arc.retain(ptr %t1)"), 1, after)
+
+@test("a path that returns before an element's share is given back keeps it")
+plc_path_returns_first()
+    var entry: Buf[Inst] = buf()
+
+    entry.push(InAlloca(VReg("e.addr"), LPtr, None))
+
+    for inst in plc_element("t1", "i", AccPlain)
+        entry.push(inst)
+
+    entry.push(plc_ref("arc.retain", "t1"))
+    entry.push(plc_store("t1", "e.addr"))
+
+    var done: Buf[Inst] = buf()
+
+    done.push(InLoad(VReg("t9"), LPtr, VReg("e.addr"), AccPlain, None))
+    done.push(plc_ref("arc.release", "t9"))
+
+    var blocks: Buf[IrBlock] = buf()
+
+    blocks.push(plc_block("entry", entry, InCondBr(VReg("c"), "done", "out")))
+    blocks.push(plc_block("done", done, InRet(None, None)))
+    blocks.push(plc_block("out", buf(), InRet(None, None)))
+
+    val after = plc_pass(blocks)
+
+    assert_eq(plc_count(after, "@arc.retain(ptr %t1)"), 1, after)
+
+// `(base[i], base[j], n)` built on the spot and copied, `between`, then given back as the statement
+// ends. `first` is what the first field is made of; `bottom` is what the field writes start from.
+private plc_built(first: Buf[Inst], bottom: Val, between: Buf[Inst]) -> string
+    var entry: Buf[Inst] = buf()
+
+    for inst in first
+        entry.push(inst)
+
+    for inst in plc_element("b", "j", AccPlain)
+        entry.push(inst)
+
+    entry.push(InInsert(VReg("p1"), plc_pair(), bottom, LPtr, VReg("a"), plc_idx(0)))
+    entry.push(InInsert(VReg("p2"), plc_pair(), VReg("p1"), LPtr, VReg("b"), plc_idx(1)))
+    entry.push(InInsert(VReg("p3"), plc_pair(), VReg("p2"), LInt(32), VReg("n"), plc_idx(2)))
+    entry.push(plc_call("arc.copy.Pair", plc_pair(), "p3"))
+
+    for inst in between
+        entry.push(inst)
+
+    entry.push(plc_call("arc.dispose.Pair", plc_pair(), "p3"))
+
+    var blocks: Buf[IrBlock] = buf()
+
+    blocks.push(plc_block("entry", entry, InRet(None, None)))
+    plc_pass(blocks)
+end plc_built
+
+private plc_quiet() -> Buf[Inst]
+    var q: Buf[Inst] = buf()
+
+    q.push(ir_call(None, LVoid, VGlobal("quiet"), plc_none()))
+    q
+end plc_quiet
+
+@test("a value built of elements and a number, copied for a call that releases nothing, takes no count")
+plc_built_dropped()
+    val after = plc_built(plc_element("a", "i", AccPlain), VUndef, plc_quiet())
+
+    assert_eq(after.contains("@arc.copy.Pair"), false, after)
+    assert_eq(after.contains("@arc.dispose.Pair"), false, after)
+
+@test("a value built with a field no place holds, or on top of another value, keeps its copy")
+plc_built_kept()
+    var fresh: Buf[Inst] = buf()
+
+    fresh.push(ir_call(Some(VReg("a")), LPtr, VGlobal("make"), plc_none()))
+
+    val made = plc_built(fresh, VUndef, plc_quiet())
+
+    assert_eq(plc_count(made, "@arc.copy.Pair"), 1, made)
+
+    val on_top = plc_built(plc_element("a", "i", AccPlain), VReg("old"), plc_quiet())
+
+    assert_eq(plc_count(on_top, "@arc.copy.Pair"), 1, on_top)
+
+    var volatile_field: Buf[Inst] = buf()
+
+    for inst in plc_element("a", "i", AccVolatile)
+        volatile_field.push(inst)
+
+    val read_volatile = plc_built(volatile_field, VUndef, plc_quiet())
+
+    assert_eq(plc_count(read_volatile, "@arc.copy.Pair"), 1, read_volatile)
+
+@test("a value built of elements keeps its copy across a call that may release")
+plc_built_across_a_call()
+    var call: Buf[Inst] = buf()
+
+    call.push(ir_call(None, LVoid, VGlobal("anything"), plc_none()))
+
+    val after = plc_built(plc_element("a", "i", AccPlain), VUndef, call)
+
+    assert_eq(plc_count(after, "@arc.copy.Pair"), 1, after)
+    assert_eq(plc_count(after, "@arc.dispose.Pair"), 1, after)
+
+// -- the emitted text ---------------------------------------------------------------------------------------
+
+private plc_source() -> string = raw"""
+    import sysl.buf.{Buf, buf}
+    import sysl.container.{Map, map}
+
+    struct Node
+        v: int
+
+    struct Kids
+        a: &Node
+        b: &Node
+
+    struct Bag
+        kids: Kids
+
+    struct SNode
+        v: int
+
+    enum Cell[K]
+        Empty
+        Live(h: u64, k: K)
+
+    find_in[K: Eq](cells: Buf[Cell[K]], k: K) -> bool
+        for i in 0..<cells.len()
+            cells[i] match
+                Cell.Live(_, sk) -> if sk == k then return true
+                _ -> ()
+
+        false
+
+    find_pairs(cells: Buf[Cell[(&Node, &Node)]], k: (&Node, &Node)) -> bool
+        for i in 0..<cells.len()
+            cells[i] match
+                Cell.Live(_, sk) -> if sk == k then return true
+                _ -> ()
+
+        false
+
+    use_generic(cells: Buf[Cell[(&Node, &Node)]], k: (&Node, &Node)) -> bool = find_in(cells, k)
+
+    get_kids(m: Map[(&Node, &Node), int], n: &Bag) -> bool = m.get((n.kids.a, n.kids.b)) is Some(_)
+
+    get_synced(m: Map[(&sync SNode, &sync SNode), int], xs: Buf[&sync SNode]) -> bool =
+        m.get((xs[0], xs[1])) is Some(_)
+
+    put_kids(m: Map[(&Node, &Node), int], n: &Bag) = m.put((n.kids.a, n.kids.b), 1)
+
+    hits(m: Map[(&Node, &Node), int], xs: Buf[&Node]) -> int
+        var n = 0
+
+        for i in 0..<xs.len() - 1
+            val (a, b) = (xs[i], xs[i + 1])
+
+            if m.get((a, b)) is Some(_) then n += 1
+
+        n
+
+    sum_elem(bs: Buf[&Bag], i: usize) -> int
+        val k = bs[i].kids
+        k.a.v + k.b.v
+
+    returned(n: &Bag) -> (&Node, &Node) = (n.kids.a, n.kids.b)
+
+    captured(n: &Bag) -> &Fn() -> int
+        val p = (n.kids.a, n.kids.b)
+        () -> p.0.v + p.1.v
+
+    replace(n: &Bag, p: (&Node, &Node)) -> int
+        n.kids = Kids(Node(9), Node(10))
+        p.0.v + p.1.v
+
+    swapped(n: &Bag) -> int = replace(n, (n.kids.a, n.kids.b))
+
+    keep(n: &Bag, p: (&Node, &Node)) -> int
+        n.kids = Kids(p.0, p.1)
+        p.0.v
+
+    kept(n: &Bag, m: &Bag) -> int = keep(n, (m.kids.a, m.kids.b))
+
+    main()
+        var xs: Buf[&Node] = buf()
+        var m: Map[(&Node, &Node), int] = map()
+        var cells: Buf[Cell[(&Node, &Node)]] = buf()
+        var ss: Buf[&sync SNode] = buf()
+        var sm: Map[(&sync SNode, &sync SNode), int] = map()
+        var bs: Buf[&Bag] = buf()
+
+        xs.push(Node(1))
+        xs.push(Node(2))
+        ss.push(SNode(1))
+        ss.push(SNode(2))
+
+        val b: &Bag = Bag(Kids(xs[0], xs[1]))
+
+        bs.push(b)
+        put_kids(m, b)
+        print(find_pairs(cells, (xs[0], xs[1])), use_generic(cells, (xs[1], xs[0])), get_kids(m, b),
+              get_synced(sm, ss), hits(m, xs), sum_elem(bs, 0), returned(b).0.v, captured(b)(), swapped(b),
+              kept(b, b))
+    """
+
+// The functions of the source lowered beside the standard library, which the maps and buffers need,
+// each as its symbol and its text; nothing when the library cannot be found.
+private plc_funcs() -> Buf[(string, string)]
+    var none: Buf[(string, string)] = buf()
+
+    std_root() match
+        Err(_) -> return none
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> return none
+            Ok(units) ->
+                var all: Buf[Program] = buf()
+
+                for item in units
+                    all.push(item)
+
+                val parsed = parse(source_of("test.sysl", plc_source()))
+
+                all.push(parsed.program)
+
+                val done = analyze_bodies(all, host_target())
+
+                if !done.reported.is_empty() then assert(false, done.reported.at(0).diag.message)
+
+                val whole = program_of(done, "")
+                val promotions = post_analysis_checks(done.an, whole, buf())
+                val lowered = codegen_with_gaps(prune(strip_tests(whole), program_own(all)), host_target(), promotions)
+
+                func_texts(ir_print_module(lowered.0))
+end plc_funcs
+
+// The text of the one function written as `symbol`.
+private plc_ir(fs: Buf[(string, string)], symbol: string) -> string
+    for item in fs
+        if names_as_written(item.0, symbol) then return item.1
+
+    assert(false, s"no function '$symbol'")
+    ""
+end plc_ir
+
+private plc_traffic(ir: string) -> int = plc_count(ir, "call void @arc.")
+
+@test("a match on an element that binds a key of references and compares it takes no count, generic or not")
+plc_emitted_match_payload()
+    val fs = plc_funcs()
+
+    if fs.is_empty() then return
+
+    val direct = plc_ir(fs, "find_pairs")
+
+    assert_eq(plc_traffic(direct), 0, direct)
+
+    var generic = ""
+
+    for item in fs
+        if item.0.starts_with("find_in.") && item.0.contains("Node") then generic = item.1
+
+    assert(generic.starts_with("define"), generic)
+    assert_eq(plc_traffic(generic), 0, generic)
+
+@test("a map's own lookup over a key of references takes no count, and a key built of places costs none")
+plc_emitted_lookups()
+    val fs = plc_funcs()
+
+    if fs.is_empty() then return
+
+    for name in ["get_kids", "get_synced", "hits", "sum_elem"]
+        val ir = plc_ir(fs, name)
+
+        assert_eq(plc_traffic(ir), 0, ir)
+
+    var lookups = 0
+
+    for item in fs
+        if item.0.contains("MapCore.find.") || item.0.contains("MapCore.get.")
+            lookups += 1
+            assert_eq(plc_traffic(item.1), 0, item.1)
+
+    assert(lookups >= 4, s"$lookups")
+
+@test("a key built of places handed to a map that keeps it is copied once, and never given back")
+plc_emitted_put_once()
+    val fs = plc_funcs()
+
+    if fs.is_empty() then return
+
+    val ir = plc_ir(fs, "put_kids")
+
+    assert_eq(plc_count(ir, "call void @arc.copy."), 1, ir)
+    assert_eq(plc_count(ir, "call void @arc.dispose."), 0, ir)
+
+@test("a value built of places that is returned, captured, kept or read across a write to its source counts")
+plc_emitted_still_counts()
+    val fs = plc_funcs()
+
+    if fs.is_empty() then return
+
+    for name in ["returned", "captured", "swapped", "kept"]
+        val ir = plc_ir(fs, name)
+
+        assert(plc_count(ir, "call void @arc.copy.") + plc_count(ir, "call void @arc.retain(") >= 1, ir)
+
+    // A copy given back at the end of the statement that a write to the source sits in front of.
+    val swapped = plc_ir(fs, "swapped")
+
+    assert_eq(plc_count(swapped, "call void @arc.dispose."), 1, swapped)
+
+// -- programs on the counted heap ---------------------------------------------------------------------------
+
+private plc_counted(text: string) -> (string, string)
+    val prog = lbr_program(text)
+    val out_dir = lbr_temp("sysl-plc-exe")
+
+    force_alloc_counting(true)
+
+    val built = build_native_program(prog, None, None, DefaultOptimization, Some(s"$out_dir/program"))
+
+    force_alloc_counting(false)
+
+    val said = built match
+        Err(why) -> (failure_text(why), "")
+        Ok(made) ->
+            capture(made, [], "", [], true) match
+                Err(_) -> ("could not be started", "")
+                Ok(o) -> (o.text, o.err.unwrap_or(""))
+
+    lbr_drop([prog, out_dir])
+    said
+end plc_counted
+
+@test("keys, copies and temporaries of references to dropping types end at nothing live, each dropped once")
+plc_counted_heap()
+    if !lbr_ready() then return
+
+    val ran = plc_counted(raw"""
+        import sysl.buf.{Buf, buf}
+        import sysl.container.{Map, map}
+
+        struct Tag
+            id: int
+
+        impl Drop for Tag
+            drop(self) = print("drop", self.id)
+
+        struct Pair
+            a: &Tag
+            b: &Tag
+
+        struct Holder
+            p: Pair
+
+        struct STag
+            id: int
+
+        keyed(xs: Buf[&Tag]) -> int
+            var m: Map[(&Tag, &Tag), int] = map()
+
+            m.put((xs[0], xs[1]), 1)
+            m.put((xs[1], xs[2]), 2)
+
+            var n = 0
+
+            if m.get((xs[0], xs[1])) is Some(v) then n += v
+            if m.has((xs[1], xs[2])) then n += 10
+            if m.get((xs[2], xs[0])) is None then n += 100
+
+            n
+
+        copied(h: &Holder) -> int
+            val p = h.p
+            p.a.id + p.b.id
+
+        matched(hs: Buf[&Holder]) -> int
+            hs[0].p match
+                Pair(a, b) -> a.id * b.id
+
+        borrowed(p: (&Tag, &Tag)) -> int = p.0.id - p.1.id
+
+        owned(into: Buf[(&Tag, &Tag)], p: (&Tag, &Tag)) -> int
+            into.push(p)
+            p.0.id
+
+        returned(h: &Holder) -> (&Tag, &Tag) = (h.p.a, h.p.b)
+
+        captured(h: &Holder) -> &Fn() -> int
+            val p = (h.p.a, h.p.b)
+            () -> p.0.id + p.1.id
+
+        replace(h: &Holder, p: (&Tag, &Tag)) -> int
+            h.p = Pair(Tag(90), Tag(91))
+            p.0.id + p.1.id
+
+        swapped(h: &Holder) -> int = replace(h, (h.p.a, h.p.b))
+
+        generic[T: Eq + Hash](xs: Buf[T], m: Map[(T, T), int]) -> bool = m.has((xs[0], xs[1]))
+
+        synced(xs: Buf[&sync STag]) -> int
+            var m: Map[(&sync STag, &sync STag), int] = map()
+
+            m.put((xs[0], xs[1]), 7)
+
+            if m.get((xs[0], xs[1])) is Some(v) then v else 0
+
+        main()
+            var xs: Buf[&Tag] = buf()
+
+            for i in 1..4
+                xs.push(Tag(i))
+
+            print("keyed", keyed(xs))
+
+            val h: &Holder = Holder(Pair(Tag(5), Tag(6)))
+
+            print("copied", copied(h))
+
+            var hs: Buf[&Holder] = buf()
+
+            hs.push(h)
+            print("matched", matched(hs))
+            print("borrowed", borrowed((h.p.a, xs[0])))
+
+            var into: Buf[(&Tag, &Tag)] = buf()
+
+            print("owned", owned(into, (h.p.b, xs[1])))
+
+            val r = returned(h)
+
+            print("returned", r.0.id)
+
+            val f = captured(h)
+
+            print("captured", f())
+            print("swapped", swapped(h))
+            print("after", h.p.a.id, r.0.id, f())
+
+            var m: Map[(&Tag, &Tag), int] = map()
+            var ys: Buf[&Tag] = buf()
+
+            m.put((xs[0], xs[1]), 1)
+            ys.push(xs[1])
+            ys.push(xs[0])
+
+            var ints: Map[(int, int), int] = map()
+            var ns: Buf[int] = buf()
+
+            ns.push(3)
+            ns.push(4)
+            ints.put((3, 4), 0)
+            print("generic", generic(xs, m), generic(ys, m), generic(ns, ints))
+
+            var ss: Buf[&sync STag] = buf()
+
+            ss.push(STag(1))
+            ss.push(STag(2))
+            print("synced", synced(ss))
+            into.clear()
+            print("end")
+        """)
+
+    assert_eq(ran.0, "keyed 111\ncopied 11\nmatched 30\nborrowed 4\nowned 6\nreturned 5\ncaptured 11\n" +
+                     "swapped 11\nafter 90 5 11\ngeneric true false true\nsynced 7\nend\n" +
+                     "drop 5\ndrop 6\ndrop 91\ndrop 90\ndrop 4\ndrop 3\ndrop 2\ndrop 1\n")
+    assert(!ran.1.contains("still live"), ran.1)
