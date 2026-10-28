@@ -1992,11 +1992,91 @@ print(twice, inc(41))
 A closure's parameter declares **no default**. A call reaches a closure through the `Fn` traits,
 which carry types and not names, so there would be nothing at the call to fill one from.
 
+### A closure that does not outlive its variables captures them by reference
+
+**A closure that does not outlive the variables it captures holds where each `var` lives**, so a
+write in the closure reaches the variable, and a read sees its value at the time of the call — the
+variable itself, shared with the code around it and with every other such closure. That is the
+closure handed to `each` or to a callback parameter its function only calls, the closure in a local
+`var` called in its own block, and any closure every use of which the compiler can follow.
+
+```sysl
+call(f: &Fn() -> unit) = f()
+
+each(xs: []int, f: int -> unit)
+    for x in xs
+        f(x)
+
+var hit = false
+call(() -> hit = true)
+
+var best = 0
+var xs = [3, 9, 2]
+each(xs[..], n -> if n > best then best = n)
+
+var n = 0
+var bump = () -> n += 1
+bump()
+bump()
+
+print(hit, best, n)
+```
+
+```output
+true 9 2
+```
+
+A `*self` method called on a captured struct reaches the variable the same way, as does a write to
+a field of one or an element of a captured array:
+
+```sysl
+struct Counter
+    n: int
+
+    bump(*self) = self.n += 1
+
+call(f: &Fn() -> unit) = f()
+
+var c = Counter(0)
+call(() -> c.bump())
+print(c.n)
+```
+
+```output
+1
+```
+
+**A closure that may outlive them captures by value**: one returned, stored in module storage or in
+a structure that outlives the block, pushed into a buffer, handed to a parameter its function keeps,
+kept in a local of a block around the one declaring a captured variable, built in an `async` body, or
+converted into a `&sync Fn` for another domain. It carries its own copy, which is state it keeps
+between its calls:
+
+```sysl
+make() -> &Fn() -> int
+    var n = 10
+
+    () ->
+        n += 1
+        n
+
+val next = make()
+print(next(), next())
+```
+
+```output
+11 12
+```
+
+Nothing is written for either: the compiler works it out from the bodies, as it does for every
+pointer a function is handed. **A `val` is copied either way**, since nothing can tell a copy of it
+from the variable, and so are a pattern's binding and a by-name parameter.
+
 ### A closure that only reads what it captured may be a `val`
 
-A closure captures **by value**, so it carries its own copy of what it closed over, and calling one
-that writes a capture writes through the closure itself. That is why `Fn::call` takes `*self` — and a
-`val` is written once, so binding such a closure to one and calling it is refused.
+Calling a closure that writes a capture it holds by value writes through the closure itself. That is
+why `Fn::call` takes `*self` — and a `val` is written once, so binding a writing closure to one and
+calling it is refused.
 
 **A closure that only reads its captures is the common case**, and it may be a `val`. It writes
 nothing, so nothing about the call needs the name to be mutable.
@@ -2031,12 +2111,13 @@ print(bump(), bump())
 use, since a `&T` is a box. A reading closure in a `val` is how freestanding code binds a closure to
 an immutable name.
 
-### A write to a capture that nothing will see is refused
+### A write to a copy that nothing will see is refused
 
-Because a closure holds a copy, a write to a capture reaches **the copy**, never the variable the
-closure was written beside. That copy is state the closure keeps between its calls, which is what the
-counter above is. But where nothing can read the copy, the write is lost, and a program that writes
-it almost always meant the variable outside. Two shapes are refused, at the write:
+A closure that captures by value holds a copy, so a write to a capture reaches **the copy**, never
+the variable the closure was written beside. That copy is state the closure keeps between its calls,
+which is what the counter `make` returns above is. But where nothing can read the copy, the write is
+lost, and a program that writes it almost always meant the variable outside. Two shapes are refused,
+at the write:
 
 - **the closure never reads the capture back** — every mention of it in the closure is the place of a
   write, as in `hit = true` or `count += 1`, so no call of the closure can observe what was written;
@@ -2045,10 +2126,12 @@ it almost always meant the variable outside. Two shapes are refused, at the writ
   (`f"clicked ${n}%d times"`) and an operand or argument as much as a plain `print(n)`.
 
 ```sysl
-call(f: &Fn() -> unit) = f()
+var later: Option[&Fn() -> unit] = None
+
+install(f: &Fn() -> unit) = later = Some(f)
 
 var hit = false
-call(() -> hit = true)
+install(() -> hit = true)
 print(hit)
 ```
 
@@ -2062,10 +2145,14 @@ through what a capture **refers to** is not a write to the copy, so the fix is t
 as a `&T` — a box both sides share — and write through it:
 
 ```sysl
-call(f: &Fn() -> unit) = f()
+var later: Option[&Fn() -> unit] = None
+
+install(f: &Fn() -> unit)
+    later = Some(f)
+    f()
 
 val hit: &bool = false
-call(() -> *hit = true)
+install(() -> *hit = true)
 print(*hit)
 ```
 
@@ -2089,10 +2176,12 @@ struct Counter
 
     bump(*self) = self.n += 1
 
-call(f: &Fn() -> unit) = f()
+var later: Option[&Fn() -> unit] = None
+
+install(f: &Fn() -> unit) = later = Some(f)
 
 var c = Counter(0)
-call(() -> c.bump())
+install(() -> c.bump())
 ```
 
 ```error

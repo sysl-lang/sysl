@@ -142,9 +142,8 @@ print(apply(x -> x * factor, 5))
 50
 ```
 
-If you come from Kotlin, Swift or JavaScript, one rule differs from what you expect. **Capturing a
-value copies it.** The closure has its own copy, and writing to it does not change the original —
-so a write that only the copy would see is refused rather than silently lost:
+As in Kotlin, Swift or JavaScript, **a closure that does not outlive the variables it captures
+shares them**: a write in it reaches the variable.
 
 ```sysl
 each3(f: int -> unit)
@@ -156,16 +155,35 @@ each3(i -> total += i * i)
 print("the total is", total)
 ```
 
+```output
+the total is 5
+```
+
+One rule differs from what you may expect. **A closure that may outlive them — returned, stored in
+module storage or a buffer, kept by the function it is handed to — copies them**: it has its own
+copy, and writing to it does not change the original, so a write that only the copy would see is
+refused rather than silently lost:
+
+```sysl
+var later: Option[&Fn(int) -> unit] = None
+
+keep(f: &Fn(int) -> unit) = later = Some(f)
+
+var total = 0
+
+keep(i -> total += i * i)
+print("the total is", total)
+```
+
 ```error
 a closure captures by value, so it holds a copy of 'total' — so '+=' would reach that copy rather than the variable it came from, and nothing in the closure reads it back
 ```
 
-`total` is an `int`, which is a value, so the closure received a copy, and incrementing that copy
-would change nothing anyone could see. This is not a rule specific to closures. It is the same copy
-behaviour a by-value parameter or a struct field has, applied when the closure is created. A closure
-that reads back what it wrote keeps its copy as state of its own between calls, and that is allowed.
+The compiler works out which one a closure is from the bodies; nothing is written for either. A
+closure that copies and reads back what it wrote keeps its copy as state of its own between calls,
+and that is allowed.
 
-To accumulate across calls, capture something that *is* shared. A `&T` is a counted reference, so
+To accumulate across calls in a closure that is kept, capture something that *is* shared. A `&T` is a counted reference, so
 capturing one retains the reference instead of copying the object, and every holder sees the same
 object:
 

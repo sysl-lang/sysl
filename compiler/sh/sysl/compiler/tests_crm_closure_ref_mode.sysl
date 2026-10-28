@@ -1,0 +1,502 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// A closure that cannot outlive the variables it captures holds each `var` by reference
+// (`closure_mode.sysl`, `docs/design/closures.md` §3.1): a write in it reaches the variable, and a
+// write made outside it is seen. One that escapes -- stored in module storage, returned, pushed into a
+// buffer, kept in a local of an enclosing block, converted to `&sync`, built in an `async` body --
+// holds a copy, and the lost-write rule refuses what it always did (`tests_cwr_capture_write.sysl`).
+//
+// The cells cross the way a closure is handed on (a borrowed `&Fn`, a bare arrow, a local, a `&Fn`
+// local, a struct field, a trait object, a closure, a task awaited in the frame) with what it writes
+// (a flag, a compound assignment, a counted string, a struct's field, a `*self` call, an array's
+// element, a multiple assignment) and where it is written (a function, the entry file, a generic
+// instantiated twice, a closure's own body, a loop body); and each way out with a writing closure,
+// refused, and a counter, by value.
+//
+// Skipped cells, and why: `@scoped`, `spawn` and a `@crossing` argument all take a `&sync Fn`, whose
+// conversion is the cell here and in `cwr_sync_closure`; build-lib and codegen units do not change
+// what is decided, which is read off the bodies of one program; a bare-metal target lowers the
+// by-reference form as it lowers a nested function's environment, which is the same `*T` field.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+// The program built and run, on the counted heap: what it printed on standard output, and on
+// standard error, where a count left over at exit is reported.
+private crm_counted(text: string) -> (string, string)
+    val root = make_temp_dir("sysl-crm").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", forms_imported(text)).unwrap()
+    force_alloc_counting(true)
+
+    val built = build_native_program(s"$root/main.sysl", None, None, DefaultOptimization,
+                                     Some(s"$root/built"))
+
+    force_alloc_counting(false)
+
+    built match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (failure_text(why), "")
+        Ok(_) -> ()
+
+    val said = capture(s"$root/built", [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> ("could not be started", "")
+        Ok(o) -> (o.text, o.err.unwrap_or(""))
+end crm_counted
+
+// The program printed `want`, and gave back everything it took.
+private crm_prints(text: string, want: string)
+    if !enm_ready() then return
+
+    val out = crm_counted(text)
+
+    assert_eq(out.0, want)
+    assert_eq(out.1, "")
+end crm_prints
+
+// The program is refused, saying each of `parts`.
+private crm_refused(text: string, parts: []const string)
+    if !enm_ready() then return
+
+    val said = enm_err(text)
+
+    assert(said != "", "it was accepted")
+
+    for part in parts
+        assert(said.index_of(part).is_some(), s"$part\n--- in ---\n$said")
+end crm_refused
+
+private const crm_call: string = "call(f: &Fn() -> unit) = f()\n\n"
+
+private crm_lost(name: string, form: string, shown: string, why: string) -> string =
+    s"a closure captures by value, so it holds a copy of '$name' — so $form would reach that copy " +
+    s"rather than the variable it came from, $why"
+
+private crm_unread(name: string, form: string, shown: string) -> string =
+    crm_lost(name, form, shown, "and nothing in the closure reads it back")
+
+// -- by reference: what it writes ----------------------------------------------------------------
+
+@test("a closure a borrowing call runs writes the variable: a flag, a sum, an increment, a field, an element")
+crm_writes_reach_the_variable()
+    crm_prints(crm_call + raw"""
+        struct P
+            x: int
+            y: int
+
+        main()
+            var hit = false
+            var total = 0
+            var steps = 0
+            var p = P(1, 2)
+            var arr = [1, 2, 3]
+
+            call(() -> hit = true)
+            call(() -> total += 5)
+            call(() -> steps++)
+            call(() -> p.x = 9)
+            call(() -> arr[1] = 7)
+            print(hit, total, steps, p.x, arr[1])
+        """, "true 5 1 9 7\n")
+
+@test("a multiple assignment and a '_' closure write the variables")
+crm_multiple_assignment_and_placeholder()
+    crm_prints(crm_call + raw"""
+        each(xs: []int, f: &Fn(int) -> unit)
+            for x in xs
+                f(x)
+
+        main()
+            var a = 1
+            var b = 2
+            var m = 0
+
+            call(() ->
+                a, b = b, a)
+            each([1, 2, 3][..], m += _)
+            print(a, b, m)
+        """, "2 1 6\n")
+
+@test("the largest so far, through a bare-arrow parameter")
+crm_bare_arrow_max()
+    crm_prints(raw"""
+        each(xs: []int, f: int -> unit)
+            for x in xs
+                f(x)
+
+        main()
+            var best = 0
+            var xs = [3, 9, 2]
+
+            each(xs[..], n -> if n > best then best = n)
+            print(best)
+        """, "9\n")
+
+@test("a '*self' call on a captured struct reaches the variable")
+crm_self_call()
+    crm_prints(crm_call + raw"""
+        struct Counter
+            n: int
+
+            bump(*self) = self.n += 1
+
+        main()
+            var c = Counter(0)
+            var cs = [Counter(5), Counter(6)]
+
+            call(() -> c.bump())
+            call(() -> cs[1].bump())
+            print(c.n, cs[1].n)
+        """, "1 7\n")
+
+@test("a counted string written in a closure is the variable's, and every count is given back")
+crm_counted_string()
+    crm_prints(crm_call + raw"""
+        main()
+            var s = "a"
+            val tail = "c"
+
+            call(() -> s = s + "b")
+            call(() -> s = s + tail)
+            print(s)
+        """, "abc\n")
+
+// -- by reference: how it is held ----------------------------------------------------------------
+
+@test("a closure in a 'var' called twice writes the variable both times, and is still a counter")
+crm_var_closure()
+    crm_prints(raw"""
+        main()
+            var n = 0
+            var bump = () -> n += 1
+
+            bump()
+            bump()
+
+            var m = 0
+            var step = () ->
+                m += 1
+                m
+
+            print(n)
+            print(step(), step())
+            print(m)
+        """, "2\n1 2\n2\n")
+
+@test("a '&Fn' local, a struct's '&Fn' field and a closure handed to a closure")
+crm_held_in_the_frame()
+    crm_prints(raw"""
+        struct H
+            f: &Fn() -> unit
+
+        main()
+            var k = 1
+            var g: &Fn() -> unit = () -> k += 1
+
+            g()
+
+            var j = 0
+            val h = H(() -> j = 4)
+
+            h.f()
+
+            var hit = false
+            val apply = (f: &Fn() -> unit) -> f()
+
+            apply(() -> hit = true)
+            print(k, j, hit)
+        """, "2 4 true\n")
+
+@test("a trait object's method that runs the callback it is handed")
+crm_through_a_trait_object()
+    crm_prints(raw"""
+        trait Walk
+            walk(self, f: &Fn(int) -> unit)
+
+        struct Three
+            base: int
+
+        impl Walk for Three
+            walk(self, f: &Fn(int) -> unit)
+                for i in 0..<3
+                    f(self.base + i)
+
+        main()
+            var sum = 0
+            val w: &Walk = Three(10)
+
+            w.walk(x -> sum += x)
+            print(sum)
+        """, "33\n")
+
+@test("a task awaited in the frame that made it")
+crm_awaited_task()
+    crm_prints(raw"""
+        async work(f: &Fn() -> unit) -> int
+            f()
+            1
+
+        main()
+            var hit = false
+
+            print(block_on(work(() -> hit = true)), hit)
+        """, "1 true\n")
+
+// -- by reference: where it is written -----------------------------------------------------------
+
+@test("the entry file's statements")
+crm_entry_file()
+    crm_prints(crm_call + raw"""
+        var hit = false
+
+        call(() -> hit = true)
+        print(hit)
+        """, "true\n")
+
+@test("a generic body, instantiated twice")
+crm_generic_twice()
+    crm_prints(crm_call + raw"""
+        last_of[T](xs: []T, start: T) -> T
+            var last = start
+
+            for x in xs
+                call(() -> last = x)
+
+            last
+
+        main()
+            print(last_of([1, 2, 3][..], 0), last_of(["a", "b"][..], ""))
+        """, "3 b\n")
+
+@test("a closure inside a closure, writing the outer closure's local and the outer variable")
+crm_nested()
+    crm_prints(crm_call + raw"""
+        main()
+            var outer = 0
+
+            call(() ->
+                var inner = 0
+
+                call(() -> inner = 1)
+                call(() -> outer = inner + 1)
+                print(inner))
+            print(outer)
+        """, "1\n2\n")
+
+@test("a closure made on every turn of a loop sees what the turns before it wrote")
+crm_loop_counter()
+    crm_prints(raw"""
+        twice(f: () -> int) -> int = f() + f()
+
+        main()
+            var t = 0
+
+            for i in 0..<3
+                print(twice(() ->
+                    t += 1
+                    t))
+        """, "3\n7\n11\n")
+
+@test("a loop body's own variable, captured in that body")
+crm_loop_body_variable()
+    crm_prints(crm_call + raw"""
+        main()
+            for i in 0..<3
+                var hits = 0
+
+                call(() -> hits += i)
+                print(hits)
+        """, "0\n1\n2\n")
+
+// -- by reference: what is shared ----------------------------------------------------------------
+
+@test("a write made outside during the call is seen, and two closures share one variable")
+crm_aliasing()
+    crm_prints(raw"""
+        poke(p: *int, f: &Fn() -> int) -> int
+            *p = 5
+            f()
+
+        main()
+            var n = 1
+
+            print(poke(&n, () -> n))
+
+            var c = 0
+            var up = () -> c += 1
+            var twice = () -> c += 2
+
+            up()
+            twice()
+            print(c)
+
+            var seen = 1
+            val look = () -> seen
+
+            seen = 8
+            print(look())
+        """, "5\n3\n8\n")
+
+@test("a 'val' capture is copied while the closure holds its 'var' by reference")
+crm_val_beside_var()
+    crm_prints(crm_call + raw"""
+        main()
+            val label = "n"
+            var n: usize = 0
+
+            call(() -> n += label.len)
+            call(() -> n += label.len)
+            print(label, n)
+        """, "n 2\n")
+
+// -- by value: each way out ----------------------------------------------------------------------
+
+@test("a writing closure stored in module storage is refused, as it always was")
+crm_stored_is_refused()
+    crm_refused(raw"""
+        var later: Option[&Fn() -> unit] = None
+
+        install(f: &Fn() -> unit) = later = Some(f)
+
+        main()
+            var hit = false
+
+            install(() -> hit = true)
+            print(hit)
+        """, [crm_unread("hit", "assignment", "bool")])
+
+// Module storage still holds the box at exit, so only the output is asserted.
+@test("a counter stored in module storage keeps its own copy")
+crm_stored_counter()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        var later: Option[&Fn() -> int] = None
+
+        install(f: &Fn() -> int) = later = Some(f)
+
+        main()
+            var n = 10
+
+            install(() ->
+                n += 1
+                n)
+
+            val f = later.unwrap()
+
+            print(f(), f())
+        """), "11 12\n")
+
+@test("a closure stored in module storage that is overwritten before every way out holds by reference")
+crm_stored_then_cleared()
+    crm_prints(raw"""
+        var later: Option[&Fn() -> unit] = None
+
+        install(f: &Fn() -> unit)
+            later = Some(f)
+            f()
+
+        main()
+            var hit = false
+
+            install(() -> hit = true)
+            later = None
+            print(hit)
+        """, "true\n")
+
+@test("a returned counter keeps its own copy")
+crm_returned_counter()
+    crm_prints(raw"""
+        make() -> &Fn() -> int
+            var n = 10
+
+            () ->
+                n += 1
+                n
+
+        main()
+            val f = make()
+
+            print(f(), f())
+        """, "11 12\n")
+
+@test("a bare-arrow callee that pushes what it is handed: the writing closure is refused")
+crm_pushed_is_refused()
+    crm_refused(raw"""
+        import sysl.buf.{Buf, buf}
+
+        hold(into: *Buf[&Fn() -> unit], f: () -> unit) = into.push(f)
+
+        main()
+            var fs: Buf[&Fn() -> unit] = buf()
+            var hit = false
+
+            hold(&fs, () -> hit = true)
+            fs[0]()
+            print(hit)
+        """, [crm_unread("hit", "assignment", "bool")])
+
+@test("a closure kept in a local of an enclosing block holds the inner variable by value")
+crm_outer_block()
+    crm_prints(raw"""
+        main()
+            var g: &Fn() -> int = () -> 0
+
+            for i in 0..<2
+                var n = 20 + i
+
+                g = () ->
+                    n += 1
+                    n
+
+            print(g(), g())
+        """, "22 23\n")
+
+@test("a writing closure kept in a local of an enclosing block is refused")
+crm_outer_block_refused()
+    crm_refused(raw"""
+        main()
+            var g: &Fn() -> unit = () -> ()
+
+            if true
+                var hit = false
+
+                g = () -> hit = true
+                g()
+                print(hit)
+        """, [crm_unread("hit", "assignment", "bool")])
+
+@test("a writing closure built in an 'async' body is refused")
+crm_async_body_refused()
+    crm_refused(crm_call + raw"""
+        async run() -> bool
+            var hit = false
+
+            call(() -> hit = true)
+            hit
+
+        main()
+            print(block_on(run()))
+        """, [crm_unread("hit", "assignment", "bool")])
+
+@test("a write to a 'val' capture reaches a copy even in a closure holding a 'var' by reference")
+crm_val_write_refused()
+    crm_refused(crm_call + raw"""
+        main()
+            val k = 1
+            var n = 0
+
+            call(() ->
+                n += 1
+                k = 2)
+            print(n)
+        """, ["'k'"])

@@ -161,7 +161,7 @@ end KeepFaults
 // -- the whole program ----------------------------------------------------------------------------
 
 // Holds every call in the program to the rule, and every body a default promised for to its promise.
-check_keeps(a: &Analysis, funcs: Buf[TFunc], vtables: Buf[TVtable])
+check_keeps(a: &Analysis, funcs: Buf[TFunc], vtables: Buf[TVtable], vals: Buf[TVal])
     var index: Map[string, usize] = map()
 
     for i in 0..<funcs.len()
@@ -219,6 +219,10 @@ check_keeps(a: &Analysis, funcs: Buf[TFunc], vtables: Buf[TVtable])
 
         if cx.strayed then settle_by_rounds(cx)
     end if
+
+    // Each closure literal's capture mode is the same question asked about the literal
+    // (`closure_mode.sysl`).
+    decide_closure_modes(cx, funcs, vals)
 
     // **The calls are held to the rule once every answer is settled**, since only those refusals
     // are told. Every question was asked by the warming, so holding the calls reads answers and
@@ -1823,7 +1827,11 @@ private holds_pointer_within(t: Type, seen: *Buf[string]) -> bool = t match
     Volatile(inner) -> holds_pointer_within(*inner, seen)
     Array(_, elem) -> holds_pointer_within(*elem, seen)
     Slice(elem, _) -> holds_pointer_within(*elem, seen)
-    Struct(d) -> first_visit(t, seen) && fields_hold_pointer(d.fields, seen)
+    // **A closure literal with captures may hold the address of each `var` it captures** (`closure_mode.sysl`),
+    // and whether it does is what this analysis is asked to decide -- so its value is followed
+    // wherever it goes, whatever its fields say before the decision.
+    Struct(d) -> (is_closure_literal(t) && !d.fields.is_empty()) ||
+        (first_visit(t, seen) && fields_hold_pointer(d.fields, seen))
     Enum(d) -> first_visit(t, seen) && variants_hold_pointer(d.variants, seen)
     _ -> false
 
@@ -1901,11 +1909,24 @@ struct FrameTrack
     // The locals bound once to a pointer, each with what it was bound to (`frame_lasting`).
     inits: Buf[(string, TExpr)]
 
-    core_of(self, name: string) -> Option[string]
-        for item in self.held
-            if item.0 == name then return Some(item.1)
+    // Whether this walk is the probe that decides closures' capture modes (`probe_frame`): what it
+    // follows is the closure literals rather than the frame's addresses.
+    probe: bool
 
-        None
+    // What a local holds. **A probe joins everything it was bound to**, since each closure a local
+    // may hold is decided on its own; the rule's own walk names the first thing, as its refusal does.
+    core_of(self, name: string) -> Option[string]
+        var all = ""
+
+        for item in self.held
+            if item.0 == name
+                if !self.probe then return Some(item.1)
+
+                all = all + item.1
+            end if
+        end for
+
+        if all == "" then None else Some(all)
     end core_of
 end FrameTrack
 
@@ -1914,12 +1935,63 @@ end FrameTrack
 // **The entry file's statements are the one body passed over**: their frame is the program's, laid
 // down before anything else runs and given back only as the program ends, so nothing kept from it can
 // outlive it.
-private check_calls(cx: &KeepsCx, faults: &KeepFaults, f: TFunc)
-    if module_bare(f.name) == "entry file" then return
+private check_calls(cx: &KeepsCx, faults: &KeepFaults, f: TFunc) = frame_walk(cx, faults, f, false)
+
+// Where each closure literal a body builds may be reached after the frame, or a block, it was built
+// in: the closures whose value the rule would refuse to let out if each held the address of the
+// variables it captures (`docs/design/closures.md` §3.1). **This is the rule's own walk** with the
+// closure literal as the thing followed, so it reaches everything the rule reaches -- a keeping
+// callee, a return, module storage, a parameter's storage, a task held at a way out -- and three
+// things the rule does not refuse a pointer for, which a closure is still held by value at: a
+// `@scoped`, `@crossing` or `@joined` parameter, a thread, and a conversion to `&sync`.
+//
+// **The entry file's statements are walked too**: their frame outlives every call, but a closure
+// stored where something may run it after them is still one that escapes.
+probe_frame(cx: &KeepsCx, f: TFunc) -> Buf[string]
+    val faults: &KeepFaults = KeepFaults(buf())
+
+    frame_walk(cx, faults, f, true)
+
+    var out: Buf[string] = buf()
+
+    for item in faults.items
+        for base in closure_markers_in(item.2)
+            if !holds_string(out, base) then out.push(base)
+
+    out
+end probe_frame
+
+// How a probe names a closure literal in what it gathers: brackets no identifier can hold.
+closure_marker(base: string) -> string = s"«$base»"
+
+// Every closure a probe's text names.
+closure_markers_in(text: string) -> Buf[string]
+    var out: Buf[string] = buf()
+    var rest = text
+
+    loop
+        val open = rest.index_of("«")
+
+        if open.is_none() then return out
+
+        rest = rest[open.unwrap() + "«".bytes.len..<rest.bytes.len]
+
+        val close = rest.index_of("»")
+
+        if close.is_none() then return out
+
+        out.push(rest[0..<close.unwrap()])
+        rest = rest[close.unwrap() + "»".bytes.len..<rest.bytes.len]
+    end loop
+end closure_markers_in
+
+private frame_walk(cx: &KeepsCx, faults: &KeepFaults, f: TFunc, probe: bool)
+    if !probe && module_bare(f.name) == "entry file" then return
 
     val org = origins_of(cx, f)
     val ft: &FrameTrack = FrameTrack(cx, faults, func_home(cx.an, f.name), shown_name(cx.an, f.name),
-                                     f.params, buf(), buf(), false, org, round_handles(cx, org, f), f, buf())
+                                     f.params, buf(), buf(), false, org, round_handles(cx, org, f), f, buf(),
+                                     probe)
 
     walk_block_stmts(f.body, stmt_walk(false, s -> s match
         TRefDecl(n, _, place) -> ft.refs.push((n, place))
@@ -1955,7 +2027,7 @@ private check_calls(cx: &KeepsCx, faults: &KeepFaults, f: TFunc)
         _ -> ()))
 
     if f.body.result.is_some() then returned_frame(ft, f.body.result.unwrap())
-end check_calls
+end frame_walk
 
 // **A pointer handed back is lent for as long as what it was made of**, so a function may not hand
 // back one made of its own frame's storage -- through a local that holds the address, a struct built
@@ -2037,12 +2109,8 @@ private frame_bind_ptr_call(ft: &FrameTrack, callee: TExpr, args: Buf[TExpr])
 
         for item in pointer_keeps(ft.cx, callee, j)
             val loc = translate_loc(ft.org, args, item.1.loc)
-            val local = if loc.starts_with("l:") then local_of(loc) else ""
 
-            if local != "" && ft.core_of(local).is_none()
-                ft.held.push((local, core.unwrap()))
-                ft.changed = true
-            end if
+            if loc.starts_with("l:") then frame_hold(ft, local_of(loc), core.unwrap())
 end frame_bind_ptr_call
 
 // A store into this frame's own storage -- by name, or through a pointer that points into it.
@@ -2069,12 +2137,8 @@ private frame_bind_call(ft: &FrameTrack, name: string, args: Buf[TExpr])
 
         for item in keeps_of(ft.cx, name, j).locs
             val loc = translate_loc(ft.org, args, item.loc)
-            val local = if loc.starts_with("l:") then local_of(loc) else ""
 
-            if local != "" && ft.core_of(local).is_none()
-                ft.held.push((local, core.unwrap()))
-                ft.changed = true
-            end if
+            if loc.starts_with("l:") then frame_hold(ft, local_of(loc), core.unwrap())
 end frame_bind_call
 
 // What one statement does with this frame's storage: the locations it overwrites at its top, and
@@ -2141,6 +2205,8 @@ private frame_event_at(ft: &FrameTrack, evs: &EvBuf, e: TExpr)
         TCall(_, _, _, _) -> call_at(ft, evs, e)
         TVCall(_, _, _, _, _) -> call_at(ft, evs, e)
         TCallPtr(_, _, _, _) -> call_at(ft, evs, e)
+        TErase(v, _, ty) -> if ft.probe then probe_synced(ft, e.span, v, ty)
+        TBox(v, ty) -> if ft.probe then probe_synced(ft, e.span, v, ty)
         _ -> ()
 end frame_event_at
 
@@ -2205,14 +2271,32 @@ private frame_lasting(ft: &FrameTrack, loc: string, depth: int) -> bool
 end frame_lasting
 
 private frame_bind(ft: &FrameTrack, name: string, v: TExpr)
-    if ft.core_of(name).is_some() then return
+    if !ft.probe && ft.core_of(name).is_some() then return
 
     frame_core(ft, v) match
-        Some(core) ->
-            ft.held.push((name, core))
-            ft.changed = true
+        Some(core) -> frame_hold(ft, name, core)
         None -> ()
 end frame_bind
+
+// `name` holds `core`. The rule's walk keeps the first thing a local holds; a probe keeps each closure
+// it may hold, and stops once a round adds none.
+private frame_hold(ft: &FrameTrack, name: string, core: string)
+    if !ft.probe
+        if ft.core_of(name).is_some() then return
+
+        ft.held.push((name, core))
+        ft.changed = true
+        return
+    end if
+
+    val had = ft.core_of(name).unwrap_or("")
+
+    for base in closure_markers_in(core)
+        if had.index_of(closure_marker(base)).is_none()
+            ft.held.push((name, closure_marker(base)))
+            ft.changed = true
+        end if
+end frame_hold
 
 // A call handing the address of this frame's storage to a parameter the callee keeps. Where the
 // callee holds it in module storage or in what this function's own parameter points at, a clear
@@ -2235,6 +2319,11 @@ private call_at(ft: &FrameTrack, evs: &EvBuf, e: TExpr)
                 val core = frame_core(ft, arg)
 
                 if core.is_none() then continue
+
+                if ft.probe && probe_held_apart(ft, e, name, j)
+                    ft.faults.items.push((ft.scope, arg.span, core.unwrap()))
+                    continue
+                end if
 
                 for item in keeps_of(ft.cx, name, j).locs
                     if item.loc == "j" && has_span(ft.hs.chained, e.span) then continue
@@ -2329,6 +2418,46 @@ private call_at(ft: &FrameTrack, evs: &EvBuf, e: TExpr)
         _ -> ()
 end call_at
 
+// **Where a closure is held by value whatever becomes of it** (`docs/design/closures.md` decision 9):
+// an argument a `@scoped`, `@crossing` or `@joined` annotation names -- the callee runs it in another
+// domain or as a child whose captures were settled where it was written -- and one a thread the call
+// starts holds. A task the call answers is not one: it is driven in this domain, and an `await` of it
+// takes it back.
+private probe_held_apart(ft: &FrameTrack, call: TExpr, name: string, j: usize) -> bool
+    val found = ft.cx.find(name)
+
+    if found.is_some()
+        val f = found.unwrap()
+
+        if j < f.params.len()
+            val p = f.params.at(j).0
+
+            if scoped_at(f, j) || holds_string(f.marks.copies, p) || holds_string(f.marks.joined, p) then return true
+        end if
+    end if
+
+    if task_result(texpr_type(call)).is_some() then return false
+
+    for item in keeps_of(ft.cx, name, j).locs
+        if item.loc == "j" then return true
+
+    false
+end probe_held_apart
+
+// What a conversion to `&sync` makes of a closure: one held by value, as every closure that crosses
+// a domain is.
+private probe_synced(ft: &FrameTrack, at: Span, v: TExpr, ty: Type)
+    val synced = ty match
+        Ref(_, sync) -> sync
+        _ -> false
+
+    if !synced then return
+
+    val core = frame_core(ft, v)
+
+    if core.is_some() then ft.faults.items.push((ft.scope, at, core.unwrap()))
+end probe_synced
+
 // **An address as an integer handed to a callee** is refused only where the callee may put it in
 // storage that outlives the call and something turns it back into a pointer from there; one the
 // callee turns back while it runs reaches a frame that is still there.
@@ -2365,8 +2494,80 @@ private argument_said(ft: &FrameTrack, arg: TExpr, core: string) -> string
         _ -> s"'$written' holds $core"
 end argument_said
 
-// What frame storage a value is, or holds the address of, as the refusal says it.
-private frame_core(ft: &FrameTrack, e: TExpr) -> Option[string] = *e.kind match
+// What frame storage a value is, or holds the address of, as the refusal says it -- or, for a probe,
+// every closure literal it is or holds.
+private frame_core(ft: &FrameTrack, e: TExpr) -> Option[string] =
+    if ft.probe then probe_core(ft, e) else rule_core(ft, e)
+
+// The closure literals a value is, or is built around, each by its marker. **Every one is named**,
+// not the first, since each is decided on its own -- and a closure capturing another holds it, by
+// value or by address, so the inner one goes wherever the outer one does.
+private probe_core(ft: &FrameTrack, e: TExpr) -> Option[string]
+    val text = probe_text(ft, e)
+
+    if text == "" then None else Some(text)
+end probe_core
+
+private probe_text(ft: &FrameTrack, e: TExpr) -> string = *e.kind match
+    TStructNew(st, args) ->
+        val own = if is_probe_candidate(ft.cx.an, st.base) then closure_marker(st.base) else ""
+
+        own + probe_all(ft, args)
+    TLoad(n, _) -> ft.core_of(n).unwrap_or("")
+
+    // The address of a local holding a closure reaches the closure through it.
+    TAddrOf(place, _) -> local_root(ft.refs, place) match
+        Some(n) -> ft.core_of(n).unwrap_or("")
+        None -> ""
+    TEnumNew(_, _, args) -> probe_all(ft, args)
+    TArrayLit(elems, _) -> probe_all(ft, elems)
+    TBox(v, _) -> probe_text(ft, v)
+    TErase(v, _, _) -> probe_text(ft, v)
+    TCast(v, _) -> probe_text(ft, v)
+    TField(r, _, _) -> probe_text(ft, r)
+    TDeref(r, _) -> probe_text(ft, r)
+    TSeq(exprs) -> if exprs.is_empty() then "" else probe_text(ft, exprs.at(exprs.len() - 1))
+    TBlockExpr(b) -> probe_block(ft, b)
+    TIf(_, then_block, else_block, _) ->
+        probe_block(ft, then_block) + (if else_block.is_some() then probe_block(ft, else_block.unwrap()) else "")
+    TMatch(_, arms, _) ->
+        var all = ""
+
+        for arm in arms
+            all = all + probe_block(ft, arm.body)
+
+        all
+    TCall(name, args, ty, _) ->
+        var all = ""
+
+        for i in 0..<args.len()
+            if answers_arg(ft.cx, name, args, i, ty, false) then all = all + probe_text(ft, args.at(i))
+
+        all
+    _ -> ""
+
+private probe_all(ft: &FrameTrack, es: Buf[TExpr]) -> string
+    var all = ""
+
+    for item in es
+        all = all + probe_text(ft, item)
+
+    all
+end probe_all
+
+private probe_block(ft: &FrameTrack, b: TBlock) -> string =
+    if b.result.is_some() then probe_text(ft, b.result.unwrap()) else ""
+
+// Whether a closure literal is one a probe decides: one with a capture it could hold by reference.
+is_probe_candidate(a: &Analysis, base: string) -> bool = a.closure_refs.get(base) match
+    Some(refs) ->
+        for r in refs
+            if r then return true
+
+        false
+    None -> false
+
+private rule_core(ft: &FrameTrack, e: TExpr) -> Option[string] = *e.kind match
     TAddrOf(place, _) -> frame_place(ft, place)
     TTempAddr(_, _) -> Some(s"the address of a value made in place in '${ft.owner}'")
     TLoad(n, ty) -> if may_hold_pointer(ft.cx, ty) || is_integer_type(ty) then ft.core_of(n) else None
