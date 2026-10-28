@@ -259,17 +259,34 @@ private struct BlockTrack
     held: Map[string, Buf[string]]
     changed: bool
     checking: bool
+
+    // Whether this is the probe deciding closures' capture modes (`probe_blocks`), and the closures
+    // it found kept past the block of a variable they capture.
+    probe: bool
+    escaped: Buf[string]
 end BlockTrack
 
 // Every place one body keeps the address of a block's local where it outlives the block. The entry
 // file's statements are checked too: their frame lasts the whole program, but their blocks do not.
 check_blocks(cx: &KeepsCx, faults: &KeepFaults, f: TFunc)
+    block_walk(cx, faults, f, false)
+
+// The closure literals one body keeps where they outlive the block of a variable they could hold by
+// reference: in a local of an enclosing block, or what a keeping callee stores in one
+// (`docs/design/closures.md` decision 6). **This is the rule's own walk with the closure followed**:
+// a closure is built around each variable it may hold the address of, `«closure»n` as a root.
+probe_blocks(cx: &KeepsCx, f: TFunc) -> Buf[string]
+    val faults: &KeepFaults = KeepFaults(buf())
+
+    block_walk(cx, faults, f, true).escaped
+end probe_blocks
+
+private block_walk(cx: &KeepsCx, faults: &KeepFaults, f: TFunc, probe: bool) -> &BlockTrack
     val sc = block_scopes_of(f)
-
-    if sc.blocks.len() == 1 then return
-
     val bt: &BlockTrack = BlockTrack(cx, faults, func_home(cx.an, f.name), origins_of(cx, f), sc, buf(),
-                                     map(), true, false)
+                                     map(), true, false, probe, buf())
+
+    if sc.blocks.len() == 1 then return bt
 
     walk_block_stmts(f.body, stmt_walk(false, s -> s match
         TRefDecl(n, _, place) -> bt.refs.push((n, place))
@@ -286,7 +303,8 @@ check_blocks(cx: &KeepsCx, faults: &KeepFaults, f: TFunc)
 
     bt.checking = true
     walk_block_stmts(f.body, walk)
-end check_blocks
+    bt
+end block_walk
 
 private block_expr_event(bt: &BlockTrack, e: TExpr)
     *e.kind match
@@ -335,7 +353,14 @@ private kept_in(bt: &BlockTrack, holder: string, v: TExpr, by: string)
 
     for r in roots
         if bt.checking
-            if bt.sc.ends_within(bt.sc.home_of(r), home)
+            if bt.sc.ends_within(bt.sc.home_of(root_local(r)), home)
+                if bt.probe
+                    val base = root_closure(r)
+
+                    if !holds_string(bt.escaped, base) then bt.escaped.push(base)
+                    continue
+                end if
+
                 refuse_kept(bt, holder, r, v, by)
                 return
             end if
@@ -343,6 +368,16 @@ private kept_in(bt: &BlockTrack, holder: string, v: TExpr, by: string)
             hold(bt, holder, r)
         end if
 end kept_in
+
+// A probe's root is a variable a closure may hold the address of, `«closure»n`; the rule's is the
+// local itself. These are its two halves.
+private root_local(r: string) -> string = r.index_of("»") match
+    Some(at) -> r[at + "»".bytes.len..<r.bytes.len]
+    None -> r
+
+private root_closure(r: string) -> string = r.index_of("»") match
+    Some(at) -> r["«".bytes.len..<at]
+    None -> ""
 
 private hold(bt: &BlockTrack, holder: string, r: string)
     bt.held.get(holder) match
@@ -424,9 +459,15 @@ private shown_local(name: string) -> string = name.index_of(".") match
 private roots_of(bt: &BlockTrack, e: TExpr, out: *Buf[string])
     *e.kind match
         TAddrOf(place, _) ->
+            if bt.probe then return
+
             frame_root_of(bt.refs, place) match
                 Some(root) -> if bt.sc.home_of(root.0) > 0 then add_root(out, root.0)
                 None -> ()
+        TStructNew(st, args) ->
+            if bt.probe then closure_roots(bt, st.base, args, out)
+
+            if may_hold_pointer(bt.cx, texpr_type(e)) then roots_of_all(bt, args, out)
         TLoad(n, ty) ->
             if !may_hold_pointer(bt.cx, ty) then return
 
@@ -435,7 +476,6 @@ private roots_of(bt: &BlockTrack, e: TExpr, out: *Buf[string])
                     for r in list
                         add_root(out, r)
                 None -> ()
-        TStructNew(_, args) -> if may_hold_pointer(bt.cx, texpr_type(e)) then roots_of_all(bt, args, out)
         TEnumNew(_, _, args) -> if may_hold_pointer(bt.cx, texpr_type(e)) then roots_of_all(bt, args, out)
         TArrayLit(elems, _) -> if may_hold_pointer(bt.cx, texpr_type(e)) then roots_of_all(bt, elems, out)
         TBox(v, _) -> roots_of(bt, v, out)
@@ -463,6 +503,22 @@ private roots_of(bt: &BlockTrack, e: TExpr, out: *Buf[string])
                 if answers_arg(bt.cx, name, args, i, ty, false) then roots_of(bt, args.at(i), out)
         _ -> ()
 end roots_of
+
+// The variables a closure literal may hold the address of, each as the probe's root: a capture it
+// could hold by reference, read from a local of this body.
+private closure_roots(bt: &BlockTrack, base: string, args: Buf[TExpr], out: *Buf[string])
+    val refs = bt.cx.an.closure_refs.get(base)
+
+    if refs.is_none() then return
+
+    for i in 0..<args.len()
+        if i >= refs.unwrap().len() || !refs.unwrap().at(i) then continue
+
+        *args.at(i).kind match
+            TLoad(n, _) -> if bt.sc.home_of(n) >= 0 then add_root(out, closure_marker(base) + n)
+            _ -> ()
+    end for
+end closure_roots
 
 private roots_of_all(bt: &BlockTrack, es: Buf[TExpr], out: *Buf[string])
     for x in es
