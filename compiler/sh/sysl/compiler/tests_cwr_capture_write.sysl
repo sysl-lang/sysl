@@ -1,0 +1,393 @@
+module sh.sysl.compiler
+@tests
+
+// A closure captures by value, so a write to a capture reaches the closure's own copy. That copy is
+// state the closure keeps between its calls when the closure reads it back; when nothing can read
+// it, the write is lost. Two shapes are refused, at the write: a capture every mention of which in
+// the closure is the place of a write, and one the enclosing body uses again after the closure, as
+// though the write had reached it. A closure that writes its copy and reads it back, with the
+// variable outside left alone, is a counter and is accepted; so is every write through what a
+// capture refers to (a `&T`, a `*T`, a `Buf`).
+//
+// The helpers are `tests_enm_enum_run.sysl`'s.
+
+private const cwr_call: string = "call(f: &Fn() -> unit) = f()\n\n"
+
+// The refusal, for a capture `name` of a type shown as `shown`, written with `form`.
+private cwr_unread(name: string, form: string, shown: string) -> string =
+    cwr_lost(name, form, shown, "and nothing in the closure reads it back")
+
+private cwr_used_after(name: string, form: string, shown: string) -> string =
+    cwr_lost(name, form, shown, "and the variable is used afterwards as though it had")
+
+private cwr_lost(name: string, form: string, shown: string, why: string) -> string =
+    s"a closure captures by value, so it holds a copy of '$name' — so $form would reach that copy " +
+    s"rather than the variable it came from, $why. Where you mean to change '$name', hold it as a " +
+    s"'&$shown' and write through it, or have the closure return the value"
+
+// What a refused program said, checked to hold `want` exactly once.
+private cwr_refused(text: string, want: string)
+    val said = enm_err(text)
+
+    assert(enm_says(said, want), said)
+
+    val first = said.index_of(want).unwrap()
+
+    assert(said[first + want.bytes.len..<said.bytes.len].index_of(want).is_none(), said)
+end cwr_refused
+
+// ---- a write nothing in the closure reads back
+
+@test("the flag a callback sets, read after the call: the write was lost")
+cwr_flag_set_in_a_callback()
+    if !enm_ready() then return
+
+    cwr_refused(cwr_call + "main()\n    var hit = false\n    call(() -> hit = true)\n    print(hit)\n",
+                cwr_unread("hit", "assignment", "bool"))
+
+@test("a compound assignment in a closure handed to 'each'")
+cwr_compound_in_each()
+    if !enm_ready() then return
+
+    cwr_refused("import sysl.seq.Sequence\n\nmain()\n    var total = 0\n" +
+                "    [1, 2, 3][..].each(n -> total += n)\n    print(total)\n",
+                cwr_unread("total", "'+='", "int"))
+
+@test("an increment")
+cwr_increment()
+    if !enm_ready() then return
+
+    cwr_refused(cwr_call + "main()\n    var steps = 0\n    call(() -> steps++)\n",
+                cwr_unread("steps", "'++'", "int"))
+
+@test("the '_' closure, which closes at the argument")
+cwr_placeholder()
+    if !enm_ready() then return
+
+    cwr_refused("import sysl.seq.Sequence\n\nmain()\n    var m = 0\n    [1, 2][..].each(m += _)\n",
+                cwr_unread("m", "'+='", "int"))
+
+@test("a field of a captured struct is part of the copy")
+cwr_field_of_a_struct()
+    if !enm_ready() then return
+
+    cwr_refused(cwr_call + "struct P\n    x: int\n    y: int\n\nmain()\n    var p = P(1, 2)\n" +
+                "    call(() -> p.x = 9)\n", cwr_unread("p", "assignment", "P"))
+
+@test("an element of a captured array is part of the copy")
+cwr_element_of_an_array()
+    if !enm_ready() then return
+
+    cwr_refused(cwr_call + "main()\n    var arr = [1, 2, 3]\n    call(() -> arr[1] = 7)\n",
+                cwr_unread("arr", "assignment", "[3]int"))
+
+@test("each place of a multiple assignment")
+cwr_multiple_assignment()
+    if !enm_ready() then return
+
+    cwr_refused(cwr_call + "main()\n    var a = 1\n    var b = 2\n    call(() ->\n        a, b = 3, 4)\n",
+                cwr_unread("a", "assignment", "int"))
+
+@test("a closure kept in a 'var' and called twice still has nobody to read the copy")
+cwr_kept_closure_never_reading()
+    if !enm_ready() then return
+
+    cwr_refused("main()\n    var hit = false\n    var g = () -> hit = true\n    g()\n    g()\n",
+                cwr_unread("hit", "assignment", "bool"))
+
+@test("a '&sync Fn' closure")
+cwr_sync_closure()
+    if !enm_ready() then return
+
+    cwr_refused("main()\n    var done = false\n    val job: &sync Fn() -> unit = () -> done = true\n" +
+                "    job()\n", cwr_unread("done", "assignment", "bool"))
+
+@test("a capture of a loop body's own variable")
+cwr_in_a_loop_body()
+    if !enm_ready() then return
+
+    cwr_refused(cwr_call + "main()\n    for i in 0..<3\n        var hits = 0\n" +
+                "        call(() -> hits += i)\n        print(hits)\n", cwr_unread("hits", "'+='", "int"))
+
+@test("a closure inside a closure, writing the outer closure's local")
+cwr_nested_closure()
+    if !enm_ready() then return
+
+    cwr_refused(cwr_call + "main()\n    call(() ->\n        var inner = 0\n" +
+                "        call(() -> inner = 1)\n        print(inner))\n",
+                cwr_unread("inner", "assignment", "int"))
+
+@test("a closure inside a closure, writing the outer closure's capture")
+cwr_nested_writes_outer_capture()
+    if !enm_ready() then return
+
+    cwr_refused(cwr_call + "main()\n    var outer = 0\n    call(() ->\n        call(() -> outer = 1))\n",
+                cwr_unread("outer", "assignment", "int"))
+
+@test("a closure in a generic body, at the type its call gives")
+cwr_generic_body()
+    if !enm_ready() then return
+
+    cwr_refused(cwr_call + "keep[T](x: T)\n    var last = x\n    call(() -> last = x)\n\n" +
+                "main()\n    keep(1)\n", cwr_unread("last", "assignment", "int"))
+
+// ---- a write the enclosing body expects to have reached the variable
+
+@test("the largest so far, read in the closure and printed after it")
+cwr_read_after_the_closure()
+    if !enm_ready() then return
+
+    cwr_refused("import sysl.seq.Sequence\n\nmain()\n    var best = 0\n    [1, 5, 3][..].each(n ->\n" +
+                "        if n > best then best = n)\n    print(best)\n",
+                cwr_used_after("best", "assignment", "int"))
+
+@test("a counter closure whose variable is printed beside its calls")
+cwr_counter_and_its_variable()
+    if !enm_ready() then return
+
+    cwr_refused("main()\n    var seen = 0\n    var g = () ->\n        seen += 1\n        seen\n" +
+                "    g()\n    print(seen)\n", cwr_used_after("seen", "'+='", "int"))
+
+@test("a second closure capturing the variable is a use of it after the first")
+cwr_second_closure_reads_it()
+    if !enm_ready() then return
+
+    cwr_refused(cwr_call + "main()\n    var n = 0\n    call(() ->\n        n += 1\n        print(n))\n" +
+                "    call(() -> print(n))\n", cwr_used_after("n", "'+='", "int"))
+
+// ---- what stays legal
+
+@test("a closure that counts in its own copy, called twice")
+cwr_counter_closure()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran("main()\n    var n = 0\n    var g = () ->\n        n += 1\n        n\n" +
+                      "    print(g(), g())\n"), "1 2\n")
+
+@test("a running sum the closure reads back, the variable outside left alone")
+cwr_running_sum_read_inside()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran("import sysl.seq.Sequence\n\nmain()\n    var k = 0\n    [1, 2, 3][..].each(x ->\n" +
+                      "        k += x\n        print(k))\n"), "1\n3\n6\n")
+
+@test("the variable read before the closure, not after")
+cwr_read_only_before()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(cwr_call + "main()\n    var n = 4\n    print(n)\n    call(() ->\n        n += 1\n" +
+                      "        print(n))\n"), "4\n5\n")
+
+@test("the fix the refusal names: a '&' box written through")
+cwr_box_written_through()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(cwr_call + "main()\n    val hit: &bool = false\n    call(() -> *hit = true)\n" +
+                      "    print(*hit)\n"), "true\n")
+
+@test("a pointer written through")
+cwr_pointer_written_through()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(cwr_call + "main()\n    var flag = false\n    val p = &flag\n" +
+                      "    call(() -> *p = true)\n    print(flag)\n"), "true\n")
+
+@test("a field written through a captured '&T'")
+cwr_reference_field()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(cwr_call + "struct C\n    n: int\n\nmain()\n    val c: &C = C(0)\n" +
+                      "    call(() -> c.n = 5)\n    print(c.n)\n"), "5\n")
+
+@test("a captured 'Buf' is the buffer")
+cwr_captured_buf()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(cwr_call + "import sysl.buf.{Buf, buf}\n\nmain()\n    var b: Buf[int] = buf()\n" +
+                      "    call(() -> b.push(1))\n    print(b.len())\n"), "1\n")
+
+@test("the closure's own local is no capture")
+cwr_own_local()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(cwr_call + "main()\n    call(() ->\n        var x = 0\n        x = 1\n" +
+                      "        print(x))\n"), "1\n")
+
+@test("a shadowing name read after the closure is another variable")
+cwr_shadow_after()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(cwr_call + "main()\n    var n = 0\n    call(() ->\n        n += 1\n        print(n))\n" +
+                      "    for n in 7..<8\n        print(n)\n"), "1\n7\n")
+
+// ---- the neighbour: a 'val' closure is asked about every write to its copy
+
+@test("a multiple assignment to captures makes a closure one a 'val' may not hold")
+cwr_val_closure_multiple_assignment()
+    if !enm_ready() then return
+
+    cwr_refused("main()\n    var a = 1\n    var b = 2\n    val swap = () ->\n        a, b = b, a\n        a\n" +
+                "    print(swap())\n",
+                "'call' takes '*self', so it writes through what it is called on, and a 'val' is " +
+                "written once — write 'var swap' if it is meant to change")
+
+// ---- a '*self' call on the closure's copy is a write to it
+
+// A struct with a `*self` member of each shape the cells below call: one answering nothing, one
+// answering an address into the copy, one answering a value it read, and the two reading modes.
+private const cwr_counter: string = raw"""
+    struct In
+        n: int
+
+        bump(*self) = self.n += 1
+
+    struct C
+        n: int
+        inner: In
+
+        bump(*self) = self.n += 1
+        put[T](*self, x: T) = self.n += 1
+        a(*self) -> *In = &self.inner
+        next(*self) -> int
+            self.n += 1
+            self.n
+        look(self) -> int = self.n
+        peek(&self) -> int = self.n
+
+    """
+
+private cwr_self_call(name: string, member: string, shown: string) -> string =
+    cwr_unread(name, s"'$member', which takes '*self',", shown)
+
+@test("a '*self' call on a captured struct, nothing reading it back")
+cwr_self_call_on_a_struct()
+    if !enm_ready() then return
+
+    cwr_refused(cwr_call + cwr_counter + "main()\n    var c = C(0, In(0))\n    call(() -> c.bump())\n",
+                cwr_self_call("c", "bump", "C"))
+
+@test("a '*self' call on a nested field of a captured struct")
+cwr_self_call_on_a_nested_field()
+    if !enm_ready() then return
+
+    cwr_refused(cwr_call + cwr_counter + "main()\n    var c = C(0, In(0))\n    call(() -> c.inner.bump())\n",
+                cwr_self_call("c", "bump", "C"))
+
+@test("a '*self' call on an element of a captured array")
+cwr_self_call_on_an_element()
+    if !enm_ready() then return
+
+    cwr_refused(cwr_call + cwr_counter + "main()\n    var xs = [In(0), In(1)]\n    call(() -> xs[0].bump())\n",
+                cwr_self_call("xs", "bump", "[2]In"))
+
+@test("a chain through a '*self' member answering an address into the copy")
+cwr_self_call_chain()
+    if !enm_ready() then return
+
+    cwr_refused(cwr_call + cwr_counter + "main()\n    var c = C(0, In(0))\n    call(() -> c.a().bump())\n",
+                cwr_self_call("c", "a", "C"))
+
+@test("a generic '*self' method, named as it was declared")
+cwr_self_call_generic_method()
+    if !enm_ready() then return
+
+    cwr_refused(cwr_call + cwr_counter + "main()\n    var c = C(0, In(0))\n    call(() -> c.put(true))\n",
+                cwr_self_call("c", "put", "C"))
+
+@test("a '*self' member of a generic type")
+cwr_self_call_generic_type()
+    if !enm_ready() then return
+
+    cwr_refused(cwr_call + "struct Box[T]\n    v: T\n    n: int\n\n    poke(*self) = self.n += 1\n\n" +
+                "main()\n    var b = Box(1, 0)\n    call(() -> b.poke())\n",
+                cwr_self_call("b", "poke", "Box[int]"))
+
+@test("a trait's '*self' member reached through a bound, at the type the call gives")
+cwr_self_call_through_a_bound()
+    if !enm_ready() then return
+
+    cwr_refused(cwr_call + "trait Bump\n    bump(*self)\n\nstruct K\n    n: int\n\n" +
+                "impl Bump for K\n    bump(*self) = self.n += 1\n\n" +
+                "twice[T: Bump](x: T)\n    var y = x\n    call(() -> y.bump())\n\n" +
+                "main()\n    twice(K(0))\n", cwr_self_call("y", "bump", "K"))
+
+@test("a setter is the assignment the program wrote")
+cwr_self_call_setter()
+    if !enm_ready() then return
+
+    cwr_refused(cwr_call + "struct C\n    n: int\n\n    width -> int = self.n\n\n    set width(v)\n" +
+                "        self.n = v\n\nmain()\n    var c = C(0)\n    call(() -> c.width = 3)\n",
+                cwr_unread("c", "assignment", "C"))
+
+@test("a '*self' call answering a value is read back, and the variable used after it is refused")
+cwr_self_call_value_used_after()
+    if !enm_ready() then return
+
+    cwr_refused(cwr_counter + "main()\n    var e = C(0, In(0))\n    var h = () -> e.next()\n" +
+                "    print(h(), e.n)\n", cwr_used_after("e", "'next', which takes '*self',", "C"))
+
+@test("a counting '*self' closure whose variable is printed beside its calls")
+cwr_self_call_counter_used_after()
+    if !enm_ready() then return
+
+    cwr_refused(cwr_counter + "main()\n    var c = C(0, In(0))\n    var k = () ->\n        c.bump()\n" +
+                "        c.n\n    k()\n    print(c.n)\n", cwr_used_after("c", "'bump', which takes '*self',", "C"))
+
+@test("a closure making a '*self' call on its copy cannot be held in a 'val'")
+cwr_self_call_val_refused()
+    if !enm_ready() then return
+
+    cwr_refused(cwr_counter + "main()\n    var d = C(0, In(0))\n    val g = () ->\n        d.bump()\n" +
+                "        print(d.n)\n    g()\n",
+                "'call' takes '*self', so it writes through what it is called on, and a 'val' is " +
+                "written once — write 'var g' if it is meant to change")
+
+@test("calling a captured counting closure writes the copy, so a 'val' cannot hold the caller")
+cwr_self_call_captured_counter_in_a_val()
+    if !enm_ready() then return
+
+    cwr_refused("main()\n    var n = 0\n    var counter = () ->\n        n += 1\n        n\n" +
+                "    val outer = () -> print(counter())\n    outer()\n",
+                "'call' takes '*self', so it writes through what it is called on, and a 'val' is " +
+                "written once — write 'var outer' if it is meant to change")
+
+@test("'(self)' and '&self' calls read, so a 'val' holds the closure")
+cwr_self_call_reading_modes()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(cwr_counter + "main()\n    val c = C(4, In(0))\n    val r: &C = C(5, In(0))\n" +
+                      "    val reads = () -> print(c.look(), r.peek())\n    reads()\n    print(c.n)\n"),
+              "4 5\n4\n")
+
+@test("a '*self' call through a captured '&T' or '*T' reaches the shared storage")
+cwr_self_call_through_shared()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(cwr_call + cwr_counter + "main()\n    val r: &C = C(0, In(0))\n" +
+                      "    val shared = () -> r.bump()\n    shared()\n    shared()\n" +
+                      "    var x = C(0, In(0))\n    val p = &x\n    call(() -> p.bump())\n    print(r.n, x.n)\n"),
+              "2 1\n")
+
+@test("a counting closure reading back what its '*self' calls wrote")
+cwr_self_call_counter()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(cwr_counter + "main()\n    var c = C(0, In(0))\n    var k = () ->\n        c.bump()\n" +
+                      "        c.n\n    var xs = [In(0), In(0)]\n    var e = () ->\n        xs[1].bump()\n" +
+                      "        xs[1].n\n    var it = C(0, In(0))\n    var gen = () -> it.next()\n" +
+                      "    print(k(), k(), e(), e(), gen(), gen())\n"), "1 2 1 2 1 2\n")
+
+@test("calling a captured closure that only reads is no write")
+cwr_self_call_reading_closure()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran("main()\n    val k = 3\n    val add = (v: int) -> v + k\n" +
+                      "    val outer = () -> print(add(1))\n    outer()\n"), "4\n")
+
+@test("a trait's '*self' member implemented with 'self' on a handle is no write")
+cwr_self_call_implemented_by_value()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(cwr_call + "import sysl.buf.{Buf, buf}\n\ntrait Bump\n    bump(*self)\n\n" +
+                      "struct Tally\n    b: Buf[int]\n\nimpl Bump for Tally\n    bump(self) = self.b.push(1)\n\n" +
+                      "main()\n    var t = Tally(buf())\n    call(() -> t.bump())\n    print(t.b.len())\n"), "1\n")
