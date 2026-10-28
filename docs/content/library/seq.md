@@ -138,9 +138,9 @@ xs[..].filter(n -> n % 2 == 1).each(n -> print(n))
 3
 ```
 
-**A closure captures by value, and a `Buf` captured is still the buffer** — a `Buf` is a reference,
-so the copy the closure holds is a second name for the one outside, and what it pushes is there when
-the call returns.
+**A closure handed to `each` shares the variables it captures**, and a `Buf` is a reference besides,
+so what it pushes is there when the call returns — as it would be even from a closure that copies,
+since a copy of a `Buf` is a second name for the one outside.
 
 ```sysl
 import sysl.seq.Sequence

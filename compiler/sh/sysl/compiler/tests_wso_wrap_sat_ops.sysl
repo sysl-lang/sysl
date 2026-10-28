@@ -251,14 +251,14 @@ wso_inference()
     wso_prints(WsoKeep + raw"""
         val x = k(u8(250))
         print(x +| 10, 10 +| x, 250 +| k(u8(10)), k(i16(-32000)) -| 1000)
-        print(k(u8(250)) +| k(u16(65535)), k(u16(65535)) +| k(u8(250)), k(i8(-1)) +% k(i32(1)))
+        print(k(u8(250)) +| k(u8(10)), k(u16(65535)) +| k(u16(250)), k(i8(-1)) +% k(i8(1)))
         val m: u8 = 250
         val w = m +% 6
         print(w)
         val y = k(u8(255))
         print(y + 300, y +| 255, y +% 255, 255 -| y)
         """,
-        "255 255 255 -32768\n65535 65535 0\n0\n555 255 254 0\n")
+        "255 255 255 -32768\n255 65535 0\n0\n555 255 254 0\n")
 
 // -- a literal the other operand's type does not hold ---------------------------------------------
 
@@ -328,7 +328,7 @@ wso_compound_literal_refused()
 
 @test("a typed constant is an operand of its own type, refused where it does not widen, and its literal init is held")
 wso_const_operand()
-    wso_refused("const K: i8 = 3\nval y: u8 = 1\nprint(y +| K)\n", "'+|' needs matching types, got byte and i8")
+    wso_refused("const K: i8 = 3\nval y: u8 = 1\nprint(y +| K)\n", "'+|' takes two values of one type, got byte and i8")
     wso_refused("const A: u8 = 250\nconst B: u8 = A +| 300\nprint(B)\n",
                 "the literal 300 does not fit byte, the type of the other operand of '+|'")
     wso_refused("const B: u8 = 250 +% 256\nprint(B)\n", "256 does not fit")
@@ -436,8 +436,8 @@ wso_vectors_refused()
 
 @test("operands of two types that do not widen are refused as for '+', and so is a literal operand of literal arithmetic its type does not hold")
 wso_mismatch_refused()
-    wso_refused("val s: i8 = -1\nval a: u8 = 1\nprint(s +| a)\n", "'+|' needs matching types, got i8 and")
-    wso_refused("val u: u64 = 1\nval t: i64 = 1\nprint(u *% t)\n", "'*%' needs matching types")
+    wso_refused("val s: i8 = -1\nval a: u8 = 1\nprint(s +| a)\n", "'+|' takes two values of one type, got i8 and")
+    wso_refused("val u: u64 = 1\nval t: i64 = 1\nprint(u *% t)\n", "'*%' takes two values of one type")
     wso_refused("val c: u8 = 300 +| 1\nprint(c)\n", "300 does not fit")
     wso_refused("const BAD: u8 = 300 +% 1\nprint(BAD)\n", "300 does not fit")
 
@@ -572,3 +572,56 @@ wso_on_the_boards()
     assert(ran > 0, "no board was booted")
     assert(bad.is_empty(), joined(bad, "\n"))
 end wso_on_the_boards
+
+// -- two typed operands of different types ----------------------------------------------------------
+
+@test("two typed operands of different integer types are refused for every width pair and sign mix, the six operators rotating")
+wso_mixed_width_pairs()
+    val tys = ["u8", "u16", "u64", "i8", "i16", "i64"]
+    val ops = ["+%", "-%", "*%", "+|", "-|", "*|"]
+    var n = 0
+
+    for a in tys
+        for b in tys
+            val op = ops[n % 6]
+
+            n += 1
+
+            if a != b
+                wso_refused(s"val x: $a = 1\nval y: $b = 1\nprint(x $op y)\n",
+                            s"'$op' takes two values of one type, got ")
+            else
+                wso_prints(s"val x: $a = 1\nval y: $b = 1\nprint(x $op y)\n", if op[0] == u8('+') then "2\n" else if op[0] == u8('-') then "0\n" else "1\n")
+        end for
+    end for
+end wso_mixed_width_pairs
+
+
+@test("an untyped constant is a typed value of its default type, so it is refused beside a narrower operand, even when its value fits")
+wso_untyped_const_refused()
+    wso_refused("const K = 300\nval y: u8 = 1\nprint(y +| K)\n", "'+|' takes two values of one type, got byte and int")
+    wso_refused("const K = 3\nval y: u8 = 1\nprint(y +| K)\n", "'+|' takes two values of one type, got byte and int")
+    wso_refused("const K = 3\nval y: u8 = 1\nprint(K *% y)\n", "'*%' takes two values of one type, got int and byte")
+    wso_prints("const K: u8 = 3\nval y: u8 = 250\nprint(y +| K, y +| K +| K)\nconst I = 3\nval z = 5\nprint(z +| I)\n",
+               "253 255\n8\n")
+
+@test("the compound and yielding forms hold a typed value to the place's type")
+wso_mixed_compound()
+    wso_refused("var a: u8 = 1\nval b: u16 = 1\na +|= b\nprint(a)\n", "'+|' takes two values of one type, got byte and ushort")
+    wso_refused("var a: u16 = 1\nval b: u8 = 1\na *%= b\nprint(a)\n", "'*%' takes two values of one type, got ushort and byte")
+    wso_refused("var a: u8 = 1\nval b: i8 = 1\nprint(a -|:= b)\n", "'-|' takes two values of one type, got byte and i8")
+    wso_refused("var a: u8 = 1\nconst K = 3\na +%= K\nprint(a)\n", "'+%' takes two values of one type, got byte and int")
+    wso_prints("var a: u8 = 250\nval b: u8 = 10\na +|= b\nprint(a)\nvar c: u8 = 3\nc +|= 4 + 1\nprint(c)\n", "255\n8\n")
+
+@test("fixed-point formats must match, and a generic body is checked at the types it is instantiated at")
+wso_mixed_fixed_generic()
+    wso_refused("val x: i8q4 = 1\nval y: i16q4 = 1\nprint(x +| y)\n", "'+|' takes two values of one type, got i8q4 and i16q4")
+    wso_refused("val x: q7 = 0.5\nval y: q15 = 0.5\nprint(x +% y)\n", "'+%' takes two values of one type, got q7 and q15")
+    wso_prints("val x: q7 = 0.5\nval y: q7 = 0.25\nprint(real(x +| y))\n", "0.75\n")
+    wso_refused("f[T: Integer](a: T, b: u16) -> T = a +| b\nprint(f(u8(1), u16(2)))\n", "takes two values of one type")
+    wso_prints("f[T: Integer](a: T, b: T) -> T = a +| b\nprint(f(u8(250), u8(10)))\n", "255\n")
+
+@test("a constant initializer holds a typed operand to one type too, and plain '+' still widens")
+wso_mixed_const_init()
+    wso_refused("const A: u8 = 1\nconst B: u16 = 2\nconst C = A +| B\nprint(C)\n", "takes two values of one type")
+    wso_prints("val a: u8 = 250\nval b: u16 = 10\nprint(a + b)\n", "260\n")

@@ -1193,7 +1193,8 @@ reference to a trait object is two words and meets `Hash` only through its table
 
 A trait may carry a **`derive` member**: `derive[T] name(self: T, …)`, with a body written over the
 structure of `T` using [reflection](/reference/reflection/): `T::Kind`, `for const f in T::Fields`,
-`self.(f)`. A `derives` clause naming the trait instantiates each `derive` member with `T` standing
+`self.(f)`. (A member with no receiver is derived with no `self`, [below](#a-derived-member-may-have-no-receiver).)
+A `derives` clause naming the trait instantiates each `derive` member with `T` standing
 for the type, producing the `impl` block a person would have written:
 
 ```sysl
@@ -1391,6 +1392,96 @@ print(1)
 ```error
 a member's own type parameters follow its name, as in 'derive[T] show[S: Sink](self: T, …)'
 ```
+
+### A derived member may have no receiver
+
+A trait member with no receiver — an associated function, such as `decode(s: *S) -> Self` — is
+derived by a `derive` member with no `self`: its parameter list holds the member's own parameters
+and nothing else, and **`T` stands where the member says `Self`**, typically in the result. Each
+deriving type gets an associated function of its own, called on the type, `P.decode(&s)`, or through
+a bound, `T.decode(s)`. A decoder is the case it exists for: there is no value to start from, so the
+body builds one field by field:
+
+```sysl
+trait Source
+    next(*self) -> int
+
+trait Decode
+    decode[S: Source](s: *S) -> Self
+
+    derive[T] decode[S: Source](s: *S) -> T
+        var out: T
+
+        for const f in T::Fields
+            out.(f) = field[f::Type, S](s)
+
+        out
+
+field[U: Decode, S: Source](s: *S) -> U = U.decode(s)
+
+impl Decode for int
+    decode[S: Source](s: *S) -> int = s.next()
+
+struct Count
+    n: int
+
+impl Source for Count
+    next(*self) -> int
+        self.n += 1
+        self.n
+
+struct Inner derives Decode
+    z: int
+
+struct Pt derives Decode
+    x: int
+    inner: Inner
+    y: int
+
+var c = Count(0)
+val p = Pt.decode(&c)
+print(p.x, p.inner.z, p.y)
+```
+
+```output
+1 2 3
+```
+
+Whether a `derive` member takes a receiver is decided by the member it writes, so one with `self`
+for a member without, or the other way about, is refused in the trait:
+
+```sysl
+trait Make
+    make() -> Self
+
+    derive[T] make(self: T) -> T = self
+
+print(1)
+```
+
+```error
+'derive' member 'make' takes a receiver, but the 'make' trait 'Make' declares takes none — a member with no receiver is derived with no 'self', as 'derive[T] make(…)'
+```
+
+**Every `derive` member's signature is its member's**, parameter by parameter and in its result,
+with `T` for `Self` and its own type parameters for the member's. It is compared where the trait is
+declared, whether or not anything derives it, so a mistake is told once, in the trait:
+
+```sysl
+trait Make
+    make() -> Self
+
+    derive[T] make() -> int = 0
+
+print(1)
+```
+
+```error
+'derive' member 'make' returns int, but trait 'Make' declares T — a 'derive' member writes that member's body, so it takes its signature, with 'T' for 'Self'
+```
+
+A body with no receiver has no `self` to read; naming one is refused at the `derives` that asked for
+the copy, as any mistake in a derived body is.
 
 ### Order is declaration order
 

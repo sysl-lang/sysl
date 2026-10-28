@@ -121,7 +121,18 @@ assign_expr(cx: &Analyzer, span: Span, written: string, target: Expr, value: Exp
 
     val want = scale_expectation(bin, texpr_type(place), value, update_expected(cx.an, bin, texpr_type(place)))
     // A wrapping or saturating update holds a literal to the place's type, as its operator does.
-    val read = if is_wrap_sat_op(bin) then held_literal(cx, value, want, bin, true) else type_expr(cx, value, want)
+    val read = if !is_wrap_sat_op(bin) then type_expr(cx, value, want)
+    else if literal_valued(cx, value) || is_char_literal(value) then held_literal(cx, value, want, bin, true)
+    else type_expr_unwidened(cx, value, want)
+    // ... and so does a typed value of another type, which does not widen to it.
+    if is_wrap_sat_op(bin) && texpr_type(read) != Unknown && !adaptable(value, read) &&
+       !literal_valued(cx, value) && !type_eq(repr(texpr_type(read)), repr(texpr_type(place)))
+        cx.err(value.span, s"'$bin' takes two values of one type, got ${type_show(texpr_type(place))} and " +
+               s"${type_show(texpr_type(read))}")
+
+        return bad_expr(span)
+    end if
+
     val tv = widened_operand(cx, span, bin, texpr_type(place), read, Some(value))
 
     if operand_refused(read, tv) then return bad_expr(span)

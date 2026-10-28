@@ -2031,6 +2031,14 @@ analyze_operands(cx: &Analyzer, operands: Buf[Expr], expected: Option[Type],
         else if is_literal(e) then told.push(None)
         else told.push(Some(type_expr_unwidened(cx, e, settled)))
 
+    if held != "" && !one_type_held(cx, operands, told, soft, held) then
+        var bad: Buf[TExpr] = buf()
+
+        for e in operands
+            bad.push(bad_expr(e.span))
+
+        return bad
+
     val firm = unless_soft(told, soft)
     val ty = literal_widened(cx, operands, firm, told, firmest(operands, firm, widen, rescales).or_else(() -> expected),
                              expected, widen && held == "", rescales)
@@ -2052,6 +2060,34 @@ analyze_operands(cx: &Analyzer, operands: Buf[Expr], expected: Option[Type],
 
     out
 end analyze_operands
+
+// Whether the operands of a wrapping or saturating operator that have a type of their own agree on
+// it, refusing the pair where they do not: `u8 +| u16` widens to nothing, as Rust's
+// `u8::saturating_add(u16)` is a mismatch. **A named constant is a typed value** of its declared or
+// default type (`const K = 300` is an `int`), so it is held to this as a variable is; only a bare
+// literal, or an expression that comes to one, adapts to its neighbour.
+private one_type_held(cx: &Analyzer, operands: Buf[Expr], told: Buf[Option[TExpr]], soft: Buf[bool],
+                      held: string) -> bool
+    var first: Option[Type] = None
+
+    for i in 0..<operands.len()
+        told.at(i) match
+            Some(t) ->
+                if !soft.at(i) && !adaptable(operands.at(i), t) && texpr_type(t) != Unknown
+                    val ty = repr(texpr_type(t))
+
+                    if first.is_none() then first = Some(ty)
+                    else if !type_eq(first.unwrap(), ty)
+                        cx.err(operands.at(i).span, s"'$held' takes two values of one type, got " +
+                               s"${type_show(first.unwrap())} and ${type_show(ty)}")
+
+                        return false
+                    end if
+                end if
+            None -> ()
+
+    true
+end one_type_held
 
 // A bare literal operand read at the pair's type -- told, where a wrapping or saturating operator
 // holds it to its typed neighbour's type (or, in a compound form, to its place's) and it does not fit

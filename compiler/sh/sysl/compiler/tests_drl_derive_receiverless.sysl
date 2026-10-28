@@ -1,0 +1,448 @@
+module sh.sysl.compiler
+@tests
+
+// **A `derive` member with no receiver** (`docs/design/codec.md` § 6, Q2): `derive[T] decode[D:
+// Decoder](d: *D) -> Result[T, D::Error]` writes an associated function per deriving type -- a decoder
+// has no value to start from, so the deriving type stands where the trait's member says `Self`, in the
+// result, rather than as `self`. It is called on the type, `P.decode(d)`, and through a bound,
+// `T.decode(d)`.
+
+// A pull source, an `int` that decodes from it by hand, and a struct that writes its own `impl`
+// rather than deriving one -- which a derived body reaches exactly as it reaches a derived one.
+private drl_source() -> string = raw"""
+    trait Source
+        next(*self) -> int
+
+    struct Count
+        n: int
+
+    impl Source for Count
+        next(*self) -> int
+            self.n += 1
+            self.n
+
+    """
+
+private drl_decode() -> string = drl_source() + raw"""
+    trait Decode
+        decode[S: Source](s: *S) -> Self
+
+        derive[T] decode[S: Source](s: *S) -> T
+            var out: T
+
+            for const f in T::Fields
+                out.(f) = decode_as[f::Type, S](s)
+
+            out
+
+    decode_as[U: Decode, S: Source](s: *S) -> U = U.decode(s)
+
+    impl Decode for int
+        decode[S: Source](s: *S) -> int = s.next()
+
+    struct Hand
+        a: int
+
+    impl Decode for Hand
+        decode[S: Source](s: *S) -> Hand = Hand(s.next() * 100)
+
+    """
+
+@test("the codec probe p12: a derive member with no receiver builds the value, called on the type")
+drl_probe_p12()
+    if !azb_ready() then return
+
+    azb_prints(azb_main(drl_source() + raw"""
+        trait Decode
+            decode(s: *Source) -> Self
+
+            derive[T] decode(s: *Source) -> T
+                var out: T
+
+                for const f in T::Fields
+                    out.(f) = s.next()
+
+                out
+
+        struct P derives Decode
+            x: int
+            y: int
+
+        var c = Count(0)
+        val p = P.decode(&c)
+        print(p.x, p.y)
+        """), "1 2\n")
+end drl_probe_p12
+
+@test("a receiverless derived member with its own type parameters, nested derived and hand-written fields")
+drl_nested_and_hand_written()
+    if !azb_ready() then return
+
+    azb_prints(azb_main(drl_decode() + raw"""
+        struct Inner derives Decode
+            z: int
+
+        struct P derives Decode
+            x: int
+            h: Hand
+            i: Inner
+            y: int
+
+        var c = Count(0)
+        val p = P.decode(&c)
+        print(p.x, p.h.a, p.i.z, p.y)
+        """), "1 200 3 4\n")
+end drl_nested_and_hand_written
+
+@test("a generic struct derives a receiverless member at each instance, nested in itself")
+drl_generic_struct()
+    if !azb_ready() then return
+
+    azb_prints(azb_main(drl_decode() + raw"""
+        struct Pair[A] derives Decode
+            l: A
+            r: A
+
+        var c = Count(0)
+        val g = Pair[Hand].decode(&c)
+        val n = Pair[Pair[int]].decode(&c)
+        print(g.l.a, g.r.a, n.l.l, n.l.r, n.r.l, n.r.r)
+        """), "100 200 3 4 5 6\n")
+end drl_generic_struct
+
+@test("a receiverless derived member is reached through a generic function's bound, as 'T.decode'")
+drl_through_a_bound()
+    if !azb_ready() then return
+
+    azb_prints(azb_main(drl_decode() + raw"""
+        struct P derives Decode
+            x: int
+            y: int
+
+        twice[T: Decode](c: *Count) -> (T, T) = (T.decode(c), decode_as[T, Count](c))
+
+        var c = Count(0)
+        val (a, b) = twice[P](&c)
+        val (h, k) = twice[Hand](&c)
+        print(a.x, a.y, b.x, b.y, h.a, k.a)
+        """), "1 2 3 4 500 600\n")
+end drl_through_a_bound
+
+@test("a data enum and a simple enum derive a receiverless member, built with 'T::Make'")
+drl_enums()
+    if !azb_ready() then return
+
+    azb_prints(azb_main(drl_source() + raw"""
+        trait Decode
+            decode[S: Source](s: *S) -> Self
+
+            derive[T] decode[S: Source](s: *S) -> T
+                val k = usize(s.next()) % T::Variants.len
+
+                for const c in T::Variants
+                    if k == c.index
+                        var p: c::Payload
+
+                        for const f in c::Fields
+                            p.(f) = s.next()
+
+                        return T::Make(c, p)
+
+                panic("no variant")
+
+        enum Shape derives Decode
+            Dot
+            Circle(r: int)
+            Rect(w: int, h: int)
+
+        enum Dir derives Decode
+            North
+            East
+            South
+
+        show(s: Shape) -> string = s match
+            Dot -> "Dot"
+            Circle(r) -> s"Circle($r)"
+            Rect(w, h) -> s"Rect($w, $h)"
+
+        var c = Count(0)
+        val a = Shape.decode(&c)
+        val b = Shape.decode(&c)
+        c.n = 4
+        val r = Shape.decode(&c)
+        val d = Dir.decode(&c)
+        print(show(a), show(b), show(r), d == .South)
+        """), "Circle(2) Dot Rect(6, 7) true\n")
+end drl_enums
+
+@test("the brief's shape: 'derive[T] decode[D: Decoder](d: *D) -> Result[T, D::Error]', '?' inside")
+drl_result_with_projection()
+    if !azb_ready() then return
+
+    azb_prints(azb_main(raw"""
+        trait Decoder
+            type Error
+            int(*self) -> Result[int, Self::Error]
+
+        trait Decode
+            decode[D: Decoder](d: *D) -> Result[Self, D::Error]
+
+            derive[T] decode[D: Decoder](d: *D) -> Result[T, D::Error]
+                var out: T
+
+                for const f in T::Fields
+                    out.(f) = field_of[f::Type, D](d)?
+
+                Ok(out)
+
+        field_of[U: Decode, D: Decoder](d: *D) -> Result[U, D::Error] = U.decode(d)
+
+        impl Decode for int
+            decode[D: Decoder](d: *D) -> Result[int, D::Error] = d.int()
+
+        struct Ints
+            vals: []const int
+            at: usize
+
+        impl Decoder for Ints
+            type Error = string
+            int(*self) -> Result[int, string]
+                if self.at == self.vals.len then return Err("out of input")
+                self.at += 1
+                Ok(self.vals[self.at - 1])
+
+        struct In derives Decode
+            a: int
+            b: int
+
+        struct Out derives Decode
+            i: In
+            c: int
+
+        var d = Ints([1, 2, 3, 4], 0)
+        val o = Out.decode(&d).unwrap()
+        print(o.i.a, o.i.b, o.c)
+        print(Out.decode(&d).unwrap_err())
+        """), "1 2 3\nout of input\n")
+end drl_result_with_projection
+
+@test("one trait derives a receiver member and receiverless ones side by side, one with no parameters")
+drl_beside_a_receiver_member()
+    if !azb_ready() then return
+
+    azb_prints(azb_main(drl_source() + raw"""
+        trait Codec
+            encode(self) -> int
+            decode[S: Source](s: *S) -> Self
+            width() -> usize
+
+            derive[T] encode(self: T) -> int
+                var sum = 0
+
+                for const f in T::Fields
+                    sum = sum * 10 + self.(f)
+
+                sum
+
+            derive[T] decode[S: Source](s: *S) -> T
+                var out: T
+
+                for const f in T::Fields
+                    out.(f) = s.next()
+
+                out
+
+            derive[T] width() -> usize = T::Fields.len
+
+        struct P derives Codec
+            a: int
+            b: int
+            c: int
+
+        var c = Count(0)
+        print(P.decode(&c).encode(), P.width())
+        """), "123 3\n")
+end drl_beside_a_receiver_member
+
+@test("a receiverless derived member's trait declared in another module derives in the program's")
+drl_trait_in_another_module()
+    if !azb_ready() then return
+
+    azb_prints([("", "main.sysl", raw"""
+        import fmt.{Source, Decode}
+
+        struct Count
+            n: int
+
+        impl Source for Count
+            next(*self) -> int
+                self.n += 1
+                self.n
+
+        struct Pt derives Decode
+            x: int
+            y: int
+
+        read[T: Decode](c: *Count) -> T = T.decode(c)
+
+        var c = Count(0)
+        val p = Pt.decode(&c)
+        val q = read[Pt](&c)
+        print(p.x, p.y, q.x, q.y)
+        """), ("fmt", "f.sysl", raw"""
+        module fmt
+
+        trait Source
+            next(*self) -> int
+
+        trait Decode
+            decode[S: Source](s: *S) -> Self
+
+            derive[T] decode[S: Source](s: *S) -> T
+                var out: T
+
+                for const f in T::Fields
+                    out.(f) = s.next()
+
+                out
+        """)], "1 2 3 4\n")
+end drl_trait_in_another_module
+
+// -- refusals ----------------------------------------------------------------------------------------
+
+@test("a derive member's receiver is refused where it differs from the trait member's, either way")
+drl_receiver_refusals()
+    if !azb_ready() then return
+
+    val cases = [
+        ("derive[T] make(self: T) -> T = self",
+         "'derive' member 'make' takes a receiver, but the 'make' trait 'Bad' declares takes none — a " +
+         "member with no receiver is derived with no 'self', as 'derive[T] make(…)'"),
+        ("derive[T] name() -> string = \"x\"",
+         "'derive' member 'name' takes no receiver, but the 'name' trait 'Bad' declares takes one — " +
+         "write the deriving type first, as 'self: T'"),
+        ("derive[T] make(n: int, m: int) -> T\n        var out: T\n        out",
+         "'derive' member 'make' takes 2 parameters, but trait 'Bad' declares 1"),
+        ("derive[T] make() -> T\n        var out: T\n        out",
+         "'derive' member 'make' takes 0 parameters, but trait 'Bad' declares 1")]
+
+    for c in cases
+        azb_refused(azb_main("trait Bad\n    make(n: int) -> Self\n    name(self) -> string\n\n" +
+                             s"    ${c.0}\n\nprint(1)\n"), [c.1])
+end drl_receiver_refusals
+
+@test("a derive member's types are held to the trait member's, with 'T' for 'Self', where nothing derives it")
+drl_signature_type_refusals()
+    if !azb_ready() then return
+
+    val tail = " — a 'derive' member writes that member's body, so it takes its signature, with 'T' for 'Self'"
+    val cases = [
+        ("derive[T] make(n: int) -> int = n",
+         "'derive' member 'make' returns int, but trait 'Bad' declares T" + tail),
+        ("derive[T] make(n: string) -> T\n        var out: T\n        out",
+         "parameter 'n' of 'derive' member 'make' is string, but trait 'Bad' declares int" + tail),
+        ("derive[T] make(n: int) -> Option[T] = None",
+         "'derive' member 'make' returns sysl.Option[T], but trait 'Bad' declares T" + tail),
+        ("derive[T] make(n: int)\n        ()",
+         "'derive' member 'make' returns unit, but trait 'Bad' declares T" + tail),
+        // A receiver member is held to the same rule.
+        ("derive[T] name(self: T) -> int = 1",
+         "'derive' member 'name' returns int, but trait 'Bad' declares string" + tail),
+        ("derive[T] same(self: T, other: int) -> bool = true",
+         "parameter 'other' of 'derive' member 'same' is int, but trait 'Bad' declares T" + tail)]
+
+    for c in cases
+        azb_refused(azb_main("trait Bad\n    make(n: int) -> Self\n    name(self) -> string\n" +
+                             "    same(self, other: Self) -> bool\n\n" +
+                             s"    ${c.0}\n\nprint(1)\n"), [c.1])
+end drl_signature_type_refusals
+
+@test("a derive member's own type parameter stands for the trait member's in the comparison of types")
+drl_signature_own_param_refusal()
+    if !azb_ready() then return
+
+    azb_refused(azb_main(raw"""
+        trait Sink
+            put(*self, n: int)
+
+        trait Make
+            make[S: Sink](s: *S) -> Self
+
+            derive[T] make[Q: Sink](s: Q) -> T
+                var out: T
+                out
+
+        print(1)
+        """), ["parameter 's' of 'derive' member 'make' is Q, but trait 'Make' declares *Q — a 'derive' " +
+               "member writes that member's body, so it takes its signature, with 'T' for 'Self'"])
+end drl_signature_own_param_refusal
+
+@test("a receiverless derived body has no 'self', and the refusal is told at the 'derives'")
+drl_no_self_in_the_body()
+    if !azb_ready() then return
+
+    azb_refused(azb_main(raw"""
+        trait Make
+            make() -> Self
+
+            derive[T] make() -> T
+                self
+
+        struct P derives Make
+            x: int
+
+        print(P.make().x)
+        """), ["undefined name 'self'", "7:18"])
+end drl_no_self_in_the_body
+
+@test("a receiverless derived member is not reached through the trait's name, which names no type")
+drl_not_through_the_trait()
+    if !azb_ready() then return
+
+    azb_refused(azb_main(raw"""
+        trait Make
+            make() -> Self
+
+            derive[T] make() -> T
+                var out: T
+                out
+
+        struct P derives Make
+            x: int
+
+        print(Make.make())
+        """), ["'make' is a member of the trait 'Make' — call it on a value of a type that implements " +
+               "'Make', or on a '&Make'"])
+end drl_not_through_the_trait
+
+@test("a field whose type neither derives nor implements the trait is refused at the 'derives', by name")
+drl_not_on_a_type_without_it()
+    if !azb_ready() then return
+
+    azb_refused(azb_main(drl_decode() + raw"""
+        struct P
+            x: int
+
+        struct Q derives Decode
+            p: P
+
+        var c = Count(0)
+        print(Q.decode(&c).p.x)
+        """), ["'decode_as' requires its type parameter 'U' to implement 'Decode', but P does not (in " +
+               "the copy for field 'Q.p')"])
+end drl_not_on_a_type_without_it
+
+@test("a type that derives the trait and also implements it by hand is refused, as for any derive")
+drl_derive_and_hand_written()
+    if !azb_ready() then return
+
+    azb_refused(azb_main(drl_decode() + raw"""
+        struct P derives Decode
+            x: int
+
+        impl Decode for P
+            decode[S: Source](s: *S) -> P = P(0)
+
+        print(1)
+        """), ["'P' already implements 'Decode'"])
+end drl_derive_and_hand_written

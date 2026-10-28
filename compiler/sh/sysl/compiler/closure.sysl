@@ -346,10 +346,15 @@ lower_closure(cx: &Analyzer, span: Span, names: Buf[string], ptypes: Buf[Type],
     for item in captured
         fields.push((item, cx.lookup(item).unwrap().ty))
 
-    val base = if borrows_its_views(cx, span, fields) then lending_closure_base(cx.an.closure_count)
-    else closure_base(cx.an.closure_count)
+    val lends = borrows_its_views(cx, span, fields)
+    val base = if lends then lending_closure_base(cx.an.closure_count) else closure_base(cx.an.closure_count)
 
     cx.an.closure_count += 1
+
+    // **A scoped child holds its captures by value** whatever else is true of it, so it is no
+    // candidate; any other closure may hold each `var` it captures by reference, decided once every
+    // body has been typed (`closure_mode.sysl`).
+    if !lends && !captured.is_empty() then cx.an.closure_refs.put(base, referable_captures(cx, captured))
 
     val st = StructType(base, buf(), fields, false, None, None, false, None, buf(), false, buf())
 
@@ -382,9 +387,27 @@ lower_closure(cx: &Analyzer, span: Span, names: Buf[string], ptypes: Buf[Type],
     TExpr(span, TStructNew(st, args))
 end lower_closure
 
+// Which captures a closure may hold by reference: a binding a write may reach -- not a `val`, a
+// pattern's binding or a by-name parameter -- of a type that has storage. A `val` is copied whatever
+// the closure's mode, since nothing can tell a copy of it from the variable; a value with no storage
+// has no address to hold, and changing its field to one would move every field after it.
+private referable_captures(cx: &Analyzer, captured: Buf[string]) -> Buf[bool]
+    var out: Buf[bool] = buf()
+
+    for item in captured
+        val local = cx.lookup(item).unwrap()
+
+        out.push(!local.read_only && local.stands_for.is_none() &&!reads_by_name(cx, item) &&
+                 !holds_waker(cx, item) && !zero_sized(local.ty))
+    end for
+
+    out
+end referable_captures
+
 // -- a write that reaches only the closure's copy ------------------------------------------------
 
-// **A closure captures by value, so a write to a capture reaches the closure's own copy** -- which
+// **A closure that escapes captures by value** (`closure_mode.sysl`), **so a write to a capture
+// reaches the closure's own copy** -- which
 // is a counter the closure keeps between its calls when the closure reads it back, and a write that
 // is lost when nothing does. Two shapes are refused, both at the write:
 //
@@ -419,16 +442,23 @@ private refuse_lost_writes(cx: &Analyzer, span: Span, st: &StructType, captured:
         val shown = if outer.is_some() then type_show(outer.unwrap().ty) else "T"
 
         if scan.uses.at(i) == scan.writes.at(i)
-            cx.fault(scan.at.at(i), lost_write(name, scan.form.at(i), shown,
-                                                "and nothing in the closure reads it back"))
+            lost_write_owed(cx, scan.at.at(i), lost_write(name, scan.form.at(i), shown,
+                                                          "and nothing in the closure reads it back"),
+                            st.base, i)
             continue
         end if
 
         if outer.is_some()
             cx.copy_writes.push(CopyWrite(outer.unwrap().unique, name, span, scan.at.at(i),
-                                          scan.form.at(i), shown))
+                                          scan.form.at(i), shown, st.base, i))
     end for
 end refuse_lost_writes
+
+// **A lost write is owed, not said**: it is lost only if the closure holds that capture by value,
+// which is known once every body has been typed (`closure_mode.sysl` says the ones still owed). A
+// trial thrown away takes back what it owed, as it takes back what it said.
+private lost_write_owed(cx: &Analyzer, at: Span, message: string, base: string, capture: usize) =
+    cx.an.lost_writes.push((cx.scope, at, message, base, capture))
 
 // The refusal, in the words the pattern binding's is said in: what was copied, where the write
 // lands instead, and the two ways to say what was meant.
@@ -445,10 +475,13 @@ struct CopyWrite
     write: Span
     form: string
     shown: string
+    base: string
+    capture: usize
+end CopyWrite
 
 // **A read of a binding after a closure wrote its own copy of it** is a program expecting the write
-// to have reached it: refused once, at the write. The closure's own reading of the name, when it is
-// formed, lies inside the closure and is not "after" it.
+// to have reached it: refused once, at the write, where the closure holds that capture by value. The
+// closure's own reading of the name, when it is formed, lies inside the closure and is not "after" it.
 read_after_copy_write(cx: &Analyzer, span: Span, unique: string)
     if cx.copy_writes.is_empty() then return
 
@@ -458,8 +491,9 @@ read_after_copy_write(cx: &Analyzer, span: Span, unique: string)
         if w.unique != unique then continue
         if span.start >= w.closure.start && span.end <= w.closure.end then continue
 
-        cx.fault(w.write, lost_write(w.name, w.form, w.shown,
-                                      "and the variable is used afterwards as though it had"))
+        lost_write_owed(cx, w.write, lost_write(w.name, w.form, w.shown,
+                                                "and the variable is used afterwards as though it had"),
+                        w.base, w.capture)
         cx.copy_writes.remove(i)
         return
     end for

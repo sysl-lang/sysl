@@ -37,7 +37,7 @@ Each row is one claim the design leans on, the probe that settles it, and what 0
 | C1 | a trait member may be generic over the format (`encode[E: Encoder](self, e: *E)`), and a generic helper written with reflection implements it for any struct, monomorphized per (type, format) | p02 | **yes**: `{"id":7,"name":"ann","inner":{"z":3}}` |
 | C2 | a **`derive` member** may be generic over the format | p01 | **no** — `'(' expected` at `derive[T] encode[E: Encoder](…)`; `derive[T, E: Encoder]` is refused with *a 'derive' member takes one type parameter* → **Q1** |
 | C3 | a `derive` member over a trait object (`e: *Encoder`) works today | p11 | **yes**: ` x=1 y=2` — one indirect call per primitive |
-| C4 | a `derive` member may have no receiver (a decoder has no value to start from) | p12 | **no** — *a 'derive' member takes the deriving type first, as 'self: T'* → **Q2** |
+| C4 | a `derive` member may have no receiver (a decoder has no value to start from) | p12 | **no** — *a 'derive' member takes the deriving type first, as 'self: T'* → **Q2** (built in 0.8.0: `1 2`) |
 | C5 | a generic decode builds a struct field by field: `var out: T`, `out.(f) = …`, keys matched per unrolled copy, unknown keys skipped, `return Err(…)` from inside a copy | p03 | **yes** for fields with a zero: `7 ann 3 0` |
 | C6 | `var seen: [T::Fields.len]bool` sizes an array by a reflection answer | p03 | **yes** |
 | C7 | an annotation is settled in an `if const`, so a `@skip` field's type is never asked to implement `Decode` | p03 | **yes**: the skipped field's type has no `Decode` and compiles |
@@ -155,7 +155,11 @@ in this design.
    may have type parameters of its own"); p01 runs.
 2. **A `derive` member with no receiver (C4).** `decode` has no value to read. Recommended: allow
    `derive[T] decode[D: Decoder](d: *D) -> Result[T, CodecError]`, the derived member taking `T`'s
-   place as `Self` in the result rather than as `self`.
+   place as `Self` in the result rather than as `self`. **Built in 0.8.0** as recommended
+   (`traits.md` § "A derived member may have no receiver"): a `derive` member whose list does not
+   open with `self` writes an associated function, called `P.decode(d)` or `T.decode(d)` through a
+   bound; p12 runs. Every `derive` member's types are now compared with its trait member's at the
+   trait (`T` for `Self`), which no derive member had been before.
 3. **Building a value whose fields have no zero (C9, C11).** `var out: T` is refused for any struct
    with an `Option`, `Buf`, `Map`, `&T` or data-enum field, and `var p: c::Payload` for any variant
    holding one — which is every real record and every syntax tree. The decision of 2026-10-19 (no
