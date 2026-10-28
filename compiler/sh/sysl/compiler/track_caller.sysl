@@ -1,0 +1,191 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.Span
+import sysl.buf.{Buf, buf}
+
+// `@track_caller` -- a function whose reports name the line that called it
+// (`reference/attributes.md § @track_caller`).
+//
+// **The location is a parameter nobody wrote.** A tracked function is defined with one more parameter
+// than it declares, last: the address of a NUL-terminated `file:line:column` -- the very text a failed
+// bounds check hands `sysl_bounds_fail` as `at` -- or null where the build dropped locations
+// (`bounds_locations = false`). Every direct call of one hands it the location of the call, and the
+// three things in a tracked body that would have named a line of their own name that one instead:
+//
+//   - a call of another tracked function hands on what this one was handed, so a chain names its
+//     outermost caller;
+//   - a failed check the compiler laid down -- an array's index, a slice's range -- reports it;
+//   - `__CALLER__`, which is what `caller_location()` is made of, answers it.
+//
+// **It is decided at the lowering and nowhere earlier.** The typed tree is the function as written,
+// so a trait's member and the `impl`'s member it resolves to still agree, a generic body's call of a
+// bound member is an ordinary call, and every analysis that counts parameters counts the declared
+// ones. What a call hands on is settled where the call is written down, by the callee's key: a
+// member's free function and each instantiation carry the mark (`FuncMarks.track_caller`), and a
+// function compiled into a `.syslib` is declared at the signature its definition wrote, the extra
+// parameter included (`sysl_fn_type`).
+//
+// **A call that cannot see the location gets the definition's own.** A function pointer and a trait
+// object's table are reached by calls that name no function, so what they hold is a stand-in that
+// calls the tracked function with the location of its own declaration -- Rust's answer, for Rust's
+// reason: the alternative is a second calling convention for every pointer that might reach one.
+//
+// `__CALLER__` reads as a C string literal whose text no literal can have (`caller_sentinel`), so
+// every analysis treats it as the constant pointer it lowers to. Outside any body it is null: module
+// storage is filled before any function runs, so nothing called it.
+
+// What a tracked function's stand-in needs: where it was declared, and its signature as written.
+struct TrackedFn
+    at: string
+    params: Buf[(string, Type)]
+    ret: Type
+end TrackedFn
+
+// The text `__CALLER__` is read as. A literal's text cannot begin with a NUL that it then carries
+// past -- `c"…"` is NUL-terminated -- so no program's literal is mistaken for it.
+caller_sentinel() -> string = "\0caller"
+
+// Whether a C string literal is `__CALLER__`.
+is_caller_text(s: string) -> bool = s == caller_sentinel()
+
+// The parameter a tracked definition receives its caller's location in.
+caller_param() -> Val = VReg("caller$.param")
+
+// Notes a function the program defines or declares, where it is tracked.
+record_tracked(e: *Emit, f: TFunc)
+    if !f.marks.track_caller then return
+
+    val at = f.src match
+        Some(s) ->
+            val loc = s.locate(past_annotations(s.bytes, f.span.start))
+
+            s"${location_file(s.name)}:${loc.line}:${loc.col}"
+        None -> ""
+
+    e.tracked.put(f.name, TrackedFn(at, f.params, defined_result(f)))
+end record_tracked
+
+// Where a declaration's own line begins, past the annotations written above it: a declaration's span
+// opens at its first `@`, and the location a stand-in reports is the function's line, as a reader
+// would point at it.
+private past_annotations(b: []const u8, start: usize) -> usize
+    var at = start
+
+    while at < b.len && b[at] == u8('@')
+        while at < b.len && b[at] != u8('\n')
+            at += 1
+
+        while at < b.len && (b[at] == u8('\n') || b[at] == u8(' '))
+            at += 1
+
+    at
+end past_annotations
+
+// The extra parameter on a tracked function's signature, after every declared one.
+caller_ir_param(named: bool) -> IrParam =
+    IrParam(LPtr, no_ir_attrs(), if named then Some(caller_param()) else None)
+
+// What a call written at `span` of the function keyed `name` hands it past its declared arguments:
+// nothing for an untracked callee, and the location for a tracked one.
+push_caller_arg(e: *Emit, name: string, span: Span, out: *Buf[IrArg])
+    if e.tracked.has(name) then out.push(ir_arg(LPtr, location_of(e, span)))
+
+// The same for a call the compiler makes on the program's behalf with no line of its own to name --
+// an operator's member, a conversion `?` applies, a value's `Display` inside an interpolation: what
+// a tracked body was handed, and otherwise nothing.
+push_caller_unplaced(e: *Emit, name: string, out: *Buf[IrArg])
+    if e.tracked.has(name)
+        out.push(ir_arg(LPtr, if e.in_tracked then caller_param() else VNull))
+end push_caller_unplaced
+
+// The symbol a function's ADDRESS is taken at: the stand-in for a tracked function, which calls it
+// with the location of its own declaration, and the function's entry otherwise.
+caller_entry(e: *Emit, name: string) -> string
+    if !e.tracked.has(name) then return entry_of(e, name)
+
+    request_helper(e, s"tc.shim.$name", HrCallerShim(name))
+end caller_entry
+
+// The stand-in itself: the tracked function's signature as written, every parameter handed on, and
+// the declaration's location after them.
+caller_shim_sig(e: *Emit, name: string, target: string) -> IrFuncSig
+    val t = e.tracked.get(target).unwrap()
+    val ty = sysl_fn_type(e, t.ret, t.params, false, None)
+
+    var named: Buf[IrParam] = buf()
+
+    for i in 0..<ty.params.len()
+        val p = ty.params.at(i)
+
+        named.push(IrParam(p.ty, p.attrs, Some(VReg(s"a$i"))))
+
+    ir_sig(name, IrFnType(ty.ret, named, false, ty.ret_attrs)) with { linkage = LinkInternal }
+end caller_shim_sig
+
+gen_caller_shim(e: *Emit, target: string)
+    val t = e.tracked.get(target).unwrap()
+    val ty = sysl_fn_type(e, t.ret, t.params, false, None)
+
+    var args: Buf[IrArg] = buf()
+
+    for i in 0..<ty.params.len()
+        val p = ty.params.at(i)
+
+        args.push(IrArg(p.ty, VReg(s"a$i"), p.attrs))
+
+    args.push(ir_arg(LPtr, if bounds_locations() && t.at != "" then c_text_of(e, t.at) else VNull))
+
+    val callee = VGlobal(symbol_of(e, target))
+
+    val void = ty.ret match
+        LVoid -> true
+        _ -> false
+
+    if void
+        emit(e, InCall(None, LVoid, callee, args, ty.ret_attrs, None, no_fast_math(), false))
+        emit_term(e, InRet(None, None))
+        return
+    end if
+
+    val r = fresh_reg(e)
+
+    emit(e, InCall(Some(r), ty.ret, callee, args, ty.ret_attrs, None, no_fast_math(), false))
+    emit_term(e, InRet(Some(ty.ret), Some(r)))
+end gen_caller_shim
+
+// -- what the declaration may be ------------------------------------------------------------------
+
+// A tracked function is called by sysl calls that can hand it a location. Each refusal is a caller
+// that cannot: C through an export, the program's start, the test runner, a hook, an interrupt, a
+// task's resumption, and a variadic tail, after which no parameter can stand.
+check_track_caller(a: &Analysis, scope: Scope, at: Span, d: FuncDecl)
+    if !d.marks.track_caller then return
+
+    val why = track_caller_refusal(d)
+
+    if why != "" then a.fault(scope, at, why)
+end check_track_caller
+
+private track_caller_refusal(d: FuncDecl) -> string
+    val head = s"'@track_caller' hands '${d.name}' the location of each call as a parameter past its declared ones"
+
+    if d.exported.is_some()
+        return s"$head, and an '@export'ed function is called from C, which hands it none — keep the export untracked and have it call a tracked function"
+
+    if d.name == "main"
+        return s"$head, and 'main' is called by the program's start, which has no line to hand it"
+
+    if d.test.is_some() || d.hook.is_some()
+        return s"$head, and a test or a hook is called by the test runner, which has no line to hand it"
+
+    if d.conv.is_some() || d.marks.domain.is_some()
+        return s"$head, and a handler is entered by the machine, which has no line to hand it"
+
+    if d.marks.is_async()
+        return s"$head, and an 'async' function's body runs when its task is resumed, long after the call that made it"
+
+    if d.variadic
+        return s"$head, and a variadic function's tail has no end for a parameter to stand after"
+
+    ""
+end track_caller_refusal

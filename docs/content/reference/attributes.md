@@ -1,6 +1,6 @@
 ---
 title: Attributes, annotations, and compile time
-summary: `::` attributes a type answers, the eighteen annotations a function takes, the three that lay out or place what they mark, the five a file's header takes, `@assert` which stands on its own, and the `#if` directive that gates lines before the lexer sees them.
+summary: `::` attributes a type answers, the nineteen annotations a function takes, the three that lay out or place what they mark, the five a file's header takes, `@assert` which stands on its own, and the `#if` directive that gates lines before the lexer sees them.
 weight: 130
 ---
 
@@ -10,7 +10,7 @@ has a name and a spelling of its own:
 | written | is | read by |
 |---|---|---|
 | `T::Attr` | an **attribute** — a question a type's own name answers | the analyzer, at the use |
-| `@test`, `@tailrec`, `@pure`, `@ghost`, `@export`, `@reads`, `@writes`, `@crossing`, `@joined`, `@domain`, `@noinline`, `@inline`, `@cold`, `@disjoint`, `@no_alloc`, `@no_block`, `@blocks`, `@abandons` | an **annotation** — a fact about the free function under it | the grammar |
+| `@test`, `@tailrec`, `@pure`, `@ghost`, `@export`, `@reads`, `@writes`, `@crossing`, `@joined`, `@domain`, `@noinline`, `@inline`, `@cold`, `@disjoint`, `@no_alloc`, `@no_block`, `@blocks`, `@abandons`, `@track_caller` | an **annotation** — a fact about the free function under it | the grammar |
 | `@setup`, `@teardown`, `@setup_all`, `@teardown_all` | an **annotation** — a hook `sysl test` runs around a module's tests | the grammar |
 | `@keeps(...)` | an **annotation** on an `extern` — the parameters the C function holds on to past the call; see [`@keeps`](/reference/ffi/#keeps-a-c-function-that-holds-on-to-a-pointer) | the grammar |
 | `@needs(...)` | an **annotation** — the capabilities reaching the declaration under it requires; with `@abandons` and `@keeps`, one of the three an `extern` takes | the grammar |
@@ -2207,6 +2207,127 @@ print(f())
 ```error
 'block' is what a module does, not something a machine has, and no machine takes it away
 ```
+
+## `@track_caller` — a function that reports its caller's line
+
+A function marked `@track_caller` is handed the location of each call — `file:line:column` — and
+`caller_location()` inside it answers that location rather than a line of its own:
+
+```sysl
+@track_caller
+where() -> Location = caller_location()
+
+print(where())
+print(where())
+```
+
+```output
+main.sysl:4:7
+main.sysl:5:7
+```
+
+Outside a tracked function, `caller_location()` names its own call. A `Location` prints as
+`file:line:column`, and has `file()`, `line()` and `column()` for its parts.
+
+**A chain of tracked functions names the outermost call.** A tracked function's call of another
+tracked function hands on the location it was handed, so a helper written over a helper still
+reports the line in the program that started it. An untracked function in the chain is where it
+stops: its calls name its own lines.
+
+```sysl
+@track_caller
+inner() -> Location = caller_location()
+
+@track_caller
+outer() -> Location = inner()
+
+plain() -> Location = inner()
+
+print(outer())
+print(plain())
+```
+
+```output
+main.sysl:9:7
+main.sysl:7:23
+```
+
+**What a tracked function reports names the caller too.** A check the compiler laid down in its
+body — an array's index, a slice's range — reports the caller's location, and so does every tracked
+function it calls. This is what the standard library is built on: `Buf`, `Frozen`, `Deque`, `Ring` and
+`InlineRing`'s `at`, `set`, `insert`, `remove` and their `Index` members, `Option` and `Result`'s
+`unwrap` and `expect`, and `assert`, `assert_eq`, `assert_slice_eq` and `panic` are all tracked, so
+`b[5]` on a three-element `Buf` reports `index 5 out of bounds for length 3` with the subscript's
+line and column, exactly as an array would, and a checking function of a program's own reports its caller's line by carrying
+the mark too:
+
+```sysl
+@track_caller
+positive(n: int) = assert(n > 0, "not positive")
+
+positive(1)
+print("held")
+```
+
+```output
+held
+```
+
+A failed `positive(-1)` prints `panic: not positive (main.sysl:<the line of the call>)`.
+
+### A call that cannot see the location gets the declaration's
+
+The location is a parameter nobody wrote, after the declared ones, so a direct call — of a function,
+a method, a generic function's instance, a member reached through a type parameter's bound — hands it
+over. A **function pointer** and a **trait object** name no function where they are called, so what
+they hold is a stand-in that passes the location of the tracked function's own declaration, as Rust
+does:
+
+```sysl
+@track_caller
+line() -> u32 = caller_location().line()
+
+val f: *extern() -> u32 = &line
+print(line())
+print(f())
+```
+
+```output
+5
+2
+```
+
+A closure calling a tracked function is an ordinary call, and names the line in the closure.
+
+### Where there is no location
+
+A build that leaves the bounds-check locations out (`bounds_locations = false`, or
+`--no-bounds-locations`) lays down none for a tracked call either: `caller_location()` is then
+*unknown* — `known()` is false, it prints `<unknown>`, its line and column are zero — and the
+reports that would have named it end at their values. Each distinct call site of a tracked function
+otherwise costs one `file:line:column` string in the image, as a bounds check does. `__CALLER__` is
+the raw pointer `caller_location()` is made of ([reserved identifiers](/reference/lexical/)).
+
+### What it may not mark
+
+A tracked function is called by sysl calls, which hand it the location. The callers that cannot are
+refused:
+
+```sysl
+@export("count")
+@track_caller
+count() -> int = 1
+
+print(count())
+```
+
+```error
+'@track_caller' hands 'count' the location of each call as a parameter past its declared ones, and an '@export'ed function is called from C, which hands it none
+```
+
+`main`, a `@test` or a hook, an interrupt handler, an `async` function (whose body runs when its task
+is resumed) and a variadic function are refused the same way, and so is an `extern`, whose body is
+compiled elsewhere. It takes no arguments.
 
 ## `@tailrec` — an assertion that the frame is reused
 

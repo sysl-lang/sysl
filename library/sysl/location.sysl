@@ -1,0 +1,119 @@
+module sysl
+
+import sysl.raw.str_cast
+
+/** Where a call was written, as `file:line:column`.
+ *
+ * **What `caller_location()` answers, and what a `@track_caller` function reports**
+ * (`reference/attributes.md § @track_caller`). The file is named as it sits in what was built --
+ * `main.sysl`, `src/parse.sysl` -- which is the name a failed bounds check gives too, and the column
+ * counts from one.
+ *
+ * It is one pointer: the address of the NUL-terminated text the compiler laid down for the call,
+ * which is the very text a failed check hands `sysl_bounds_fail` as `at`. A build that dropped
+ * locations (`bounds_locations = false`) lays down none, and a location there is *unknown*: `known`
+ * is false, the file is empty and the line and column are zero. Nothing about it allocates, so a
+ * `@no_alloc` module can ask for one and print it.
+ */
+struct Location
+    at: *u8
+
+    /** Whether the build laid a location down for this call. */
+    known(self) -> bool = self.at != null
+
+    /** The whole of it, `file:line:column`, or nothing where it is unknown. */
+    text(self) -> []const u8
+        if self.at == null then return []
+
+        var n: usize = 0
+
+        while self.at[n] != 0
+            n += 1
+
+        self.at[0..<n]
+    end text
+
+    /** The file, as the build names it -- a copy, so it allocates; `print(loc)` does not. */
+    file(self) -> string = str_cast(self.file_bytes())
+
+    /** The file's bytes where the location holds them, which costs nothing. */
+    file_bytes(self) -> []const u8
+        val t = self.text()
+        val cut = colon_before(t, colon_before(t, t.len))
+
+        if cut == t.len then t else t[0..<cut]
+
+    /** The line, from one; zero where the location is unknown. */
+    line(self) -> u32
+        val t = self.text()
+        val last = colon_before(t, t.len)
+
+        number_between(t, colon_before(t, last), last)
+
+    /** The column, from one; zero where the location is unknown. */
+    column(self) -> u32
+        val t = self.text()
+
+        number_between(t, colon_before(t, t.len), t.len)
+end Location
+
+/** `file:line:column`, or `<unknown>` where the build laid no location down. */
+impl Display for Location
+    display(self, out: *Writer, fmt: FormatSpec)
+        if self.known() then out.write(self.text()) else out.write("<unknown>".bytes)
+
+/** Where the function this is written in was called from -- the line of the call, where that
+ * function is `@track_caller`, and the line of this call otherwise. A chain of tracked functions
+ * answers the outermost call that is not itself in one.
+ */
+@track_caller
+caller_location() -> Location = Location(__CALLER__)
+
+// ` (file:line:column)` after a panic's words, as a failed bounds check writes it, or nothing where
+// the build laid no location down. Streamed, so it allocates nothing.
+private[sysl] print_location(loc: Location)
+    if !loc.known() then return
+
+    prints(" (")
+    putbytes(loc.text())
+    prints(")")
+end print_location
+
+// What `Option.unwrap`, `expect` and `Result.unwrap_err` stop with: the words, the caller's line,
+// and status 1. Out of line and cold, so what each keeps at its arm is a call.
+@noinline
+@cold
+@track_caller
+private[sysl] unwrap_failed(said: string) -> never
+    prints("panic: ")
+    prints(said)
+    print_location(caller_location())
+    prints("\n")
+    exit(1)
+end unwrap_failed
+
+// The position of the last `:` before `end`, or the whole length where there is none. The file's
+// name may hold a colon of its own; the line and the column are digits, so counting from the right
+// finds them.
+private colon_before(t: []const u8, end: usize) -> usize
+    var i = end
+
+    while i > 0
+        i -= 1
+
+        if t[i] == u8(':') then return i
+
+    t.len
+end colon_before
+
+// The decimal number between the colon at `from` and `to`, or zero where there is none.
+private number_between(t: []const u8, from: usize, to: usize) -> u32
+    if from >= to then return 0
+
+    var n: u32 = 0
+
+    for i in from + 1..<to
+        n = n * 10 + u32(t[i] - u8('0'))
+
+    n
+end number_between

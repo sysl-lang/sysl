@@ -287,10 +287,10 @@ it. The other two test traps: `@test(should_trap)` **passes if the program stops
 `@test(should_trap: "past the end")` also requires that text in the output. This is the only way to
 test a trap, since a trap cannot be caught; the test runner observes it from outside the program.
 
-`assert(cond)` traps when the condition is false and reports the file and line where it failed. Its
-`file` and `line` parameters default to the [reserved identifiers](/reference/lexical/) `__FILE__`
-and `__LINE__`, and since a default is evaluated at the call, they report your line rather than the
-library's.
+`assert(cond)` traps when the condition is false and reports the file and line where it failed. It
+is [`@track_caller`](/reference/attributes/#track-caller-a-function-that-reports-its-caller-s-line),
+so the line is yours rather than the library's — and a checking helper of your own marked
+`@track_caller` too reports the line that called the helper.
 
 The message is **optional**. Write one where it adds something the condition does not, as
 `"above the ceiling"` does above by naming the case rather than restating the comparison. The failed

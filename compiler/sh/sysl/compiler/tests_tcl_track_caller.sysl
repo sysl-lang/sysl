@@ -1,0 +1,299 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.{capture, Status}
+import sysl.text.Search
+
+// `@track_caller` (`reference/attributes.md § @track_caller`, `track_caller.sysl`): a tracked
+// function is handed the location of each call as a parameter nobody wrote, and its
+// `caller_location()`, its calls of other tracked functions and its failed checks name that location
+// instead of a line of its own.
+//
+// Axes: a direct call; a chain of three, and a chain broken by an untracked link; a generic function
+// instantiated twice; a method, a generic type's method, a trait member reached through a bound and
+// through a trait object (counted and raw); a function pointer and a function passed as a value; a
+// closure; an array check inside a tracked body; recursion; `-O0`, the default level and LTO; a `--lib`
+// root; locations dropped; module storage; the standard library's containers, `unwrap`, `expect` and
+// assertions through a tracked helper; and every refusal. Not covered here: a freestanding run (no
+// board in the suite) -- the thumb build is checked for what it links, below.
+
+private tcl_ready() -> bool = std_root().is_ok() && clang_available()
+
+// The tree built at `level` and run: its status, what it printed, and its standard error.
+private tcl_run(files: []const (string, string), level: string) -> (Status, string, string)
+    val root = make_temp_dir("sysl-tcl").unwrap()
+
+    for i in 0..<files.len
+        val at = s"$root/${files[i].0}"
+
+        make_dir_all(parent_of(at).unwrap()).unwrap()
+        write_text(at, files[i].1).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, level, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (Status.Exited(-1), "", failure_text(why))
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> (Status.Exited(-1), "", "the program that was built could not be run")
+        Ok(out) -> (out.status, out.text, out.err.unwrap_or(""))
+end tcl_run
+
+private tcl_main(text: string) -> []const (string, string) = [("main.sysl", text)]
+
+// At `-O0` and at the default level, the program prints exactly `printed` and exits cleanly.
+private tcl_prints(files: []const (string, string), printed: string)
+    if !tcl_ready() then return
+
+    for level in ["0", DefaultOptimization]
+        val (state, out, err) = tcl_run(files, level)
+
+        assert_eq(out, printed, s"-O$level: $err")
+        assert(state.ok(), s"-O$level stopped with $state: $err")
+end tcl_prints
+
+// At both levels, the program prints `printed` and stops with status 1.
+private tcl_panics(files: []const (string, string), printed: string)
+    if !tcl_ready() then return
+
+    for level in ["0", DefaultOptimization]
+        val (state, out, err) = tcl_run(files, level)
+
+        assert_eq(out, printed, s"-O$level: $err")
+        assert(state == Status.Exited(1), s"-O$level stopped with $state")
+end tcl_panics
+
+// At both levels, the program traps having written exactly `said` to standard error.
+private tcl_traps(files: []const (string, string), said: string)
+    if !tcl_ready() then return
+
+    for level in ["0", DefaultOptimization]
+        val (state, _, err) = tcl_run(files, level)
+
+        assert_eq(err, said)
+        assert(state == Status.Signalled(5), s"-O$level stopped with $state")
+end tcl_traps
+
+private tcl_ir(text: string) -> string = xvr_ir([("main.sysl", text)])
+
+// A refusal carries this message, anchored at this `line:column` of `main.sysl`.
+private tcl_refused(text: string, message: string, at: string)
+    val said = tcl_ir(text)
+
+    assert(said.contains("error: '@track_caller' hands '"), said)
+    assert(said.contains(message), said)
+    assert(said.contains(s"--> main.sysl:$at\n"), said)
+end tcl_refused
+
+private val TclWhere: string = "@track_caller\nwhere() -> Location = caller_location()\n\n"
+
+// -- what a call is told ---------------------------------------------------------------------------
+
+@test("a tracked function's caller_location() names the line and column of each call")
+tcl_direct_call()
+    tcl_prints(tcl_main(TclWhere + "print(where())\nprint(where())\n"), "main.sysl:4:7\nmain.sysl:5:7\n")
+
+@test("outside a tracked function, caller_location() names its own call")
+tcl_untracked_asks_itself()
+    tcl_prints(tcl_main("main()\n    print(caller_location())\n"), "main.sysl:2:11\n")
+
+@test("a chain of three tracked functions names the outermost call")
+tcl_chain_of_three()
+    tcl_prints(tcl_main(TclWhere + "@track_caller\nmid() -> Location = where()\n\n" +
+                        "@track_caller\ntop() -> Location = mid()\n\nprint(top())\n"),
+               "main.sysl:10:7\n")
+
+@test("an untracked link in the chain is where the chain stops")
+tcl_untracked_link()
+    tcl_prints(tcl_main(TclWhere + "mid() -> Location = where()\n\n" +
+                        "@track_caller\ntop() -> Location = mid()\n\nprint(top())\n"),
+               "main.sysl:4:21\n")
+
+@test("the parts of a location: file, line, column, known")
+tcl_the_parts()
+    tcl_prints(tcl_main(TclWhere + "val l = where()\nprint(l.file(), l.line(), l.column(), l.known())\n"),
+               "main.sysl 4 9 true\n")
+
+@test("a tracked generic function, instantiated twice, names each call")
+tcl_generic_twice()
+    tcl_prints(tcl_main("@track_caller\nat[T](x: T) -> u32 = caller_location().line()\n\n" +
+                        "print(at(1))\nprint(at(\"s\"))\n"), "4\n5\n")
+
+@test("a tracked method, and a tracked method of a generic type, name the call")
+tcl_methods()
+    tcl_prints(tcl_main("struct P\n    x: int\n\n    @track_caller\n    line(self) -> u32 = caller_location().line()\n\n" +
+                        "struct G[T]\n    v: T\n\n    @track_caller\n    line(self) -> u32 = caller_location().line()\n\n" +
+                        "print(P(1).line())\nprint(G(2).line())\nprint(G(\"s\").line())\n"),
+               "13\n14\n15\n")
+
+private val TclTrait: string =
+    "trait Lined\n    line(self) -> u32\n\n" +
+    "struct P\n    x: int\n\nimpl Lined for P\n    @track_caller\n    line(self) -> u32 = caller_location().line()\n\n"
+
+@test("a tracked trait member reached through a bound names the call")
+tcl_trait_through_a_bound()
+    tcl_prints(tcl_main(TclTrait + "ask[T: Lined](t: T) -> u32 = t.line()\n\nprint(ask(P(1)))\n"), "11\n")
+
+@test("through a trait object, a tracked member is told where it was declared")
+tcl_trait_object()
+    tcl_prints(tcl_main(TclTrait + "var p = P(1)\nval o: *Lined = &p\nprint(o.line())\n"), "9\n")
+
+@test("through a counted trait object too, a '&self' member included")
+tcl_counted_trait_object()
+    tcl_prints(tcl_main("trait Lined\n    line(&self) -> u32\n\nstruct P\n    x: int\n\n" +
+                        "impl Lined for P\n    @track_caller\n    line(&self) -> u32 = caller_location().line()\n\n" +
+                        "val o: &Lined = P(1)\nprint(o.line())\n"), "9\n")
+
+@test("through a function pointer, a tracked function is told where it was declared")
+tcl_function_pointer()
+    tcl_prints(tcl_main("@track_caller\nline() -> u32 = caller_location().line()\n\n" +
+                        "val f: *extern() -> u32 = &line\nprint(f())\nprint(f())\n"), "2\n2\n")
+
+@test("a closure calling a tracked function names the line in the closure")
+tcl_closure()
+    tcl_prints(tcl_main("@track_caller\nline() -> u32 = caller_location().line()\n\n" +
+                        "apply(f: () -> u32) -> u32 = f()\n\nprint(apply(() ->\n    line()))\n"), "7\n")
+
+@test("an array's check inside a tracked function names the caller's line")
+tcl_array_check()
+    tcl_traps(tcl_main("@track_caller\npick(xs: []const int, i: usize) -> int = xs[i]\n\n" +
+                       "val a = [1, 2, 3]\nprint(pick(a[..], 1))\nprint(pick(a[..], 7))\n"),
+              "index 7 out of bounds for length 3 (main.sysl:6:7)\n")
+
+@test("a tracked function calling itself hands on what it was handed")
+tcl_recursion()
+    tcl_prints(tcl_main("@track_caller\ndown(n: int) -> u32 = if n == 0 then caller_location().line() else down(n - 1)\n\n" +
+                        "print(down(3))\nprint(down(100000))\n"), "4\n5\n")
+
+@test("a tracked function in a module of its own, reached through an import")
+tcl_another_module()
+    var files: [2](string, string) = [
+        ("geom/geom.sysl", "module geom\n\n@track_caller\nline() -> u32 = caller_location().line()\n"),
+        ("main.sysl", "import geom.line\n\nprint(line())\n")]
+
+    tcl_prints(files[..], "3\n")
+
+@test("a tracked function in a --lib root, called from a program")
+tcl_lib_root()
+    if !tcl_ready() then return
+
+    val lib = lbr_tree(lbr_one("demo/lib.sysl",
+                               "module demo\n\n@track_caller\nline() -> u32 = caller_location().line()\n"))
+    val prog = lbr_program("import demo.line\n\nprint(line())\nprint(line())\n")
+    val said = lbr_run(prog, [lib])
+
+    lbr_drop([lib, prog])
+    assert_eq(said, "3\n4\n")
+end tcl_lib_root
+
+@test("under LTO a tracked function still names each call")
+tcl_lto()
+    var files: [2](string, string) = [
+        ("sysl.hocon", "package { name = \"probe\", version = \"0.1.0\" }\nlto = \"full\"\n"),
+        ("main.sysl", TclWhere + "print(where())\nprint(where())\n")]
+
+    tcl_prints(files[..], "main.sysl:4:7\nmain.sysl:5:7\n")
+
+@test("with the locations dropped, a location is unknown and says so")
+tcl_locations_dropped()
+    var files: [2](string, string) = [
+        ("sysl.hocon", "package { name = \"probe\", version = \"0.1.0\" }\nbounds_locations = false\n"),
+        ("main.sysl", TclWhere + "val l = where()\nprint(l, l.known(), l.line(), l.file().len)\n")]
+
+    tcl_prints(files[..], "<unknown> false 0 0\n")
+
+@test("module storage has no caller, so __CALLER__ there is null")
+tcl_module_storage()
+    tcl_prints(tcl_main("val at = __CALLER__\n\nmain()\n    print(at == null)\n"), "true\n")
+
+@test("the location is laid down once per distinct call, and not at all with locations dropped")
+tcl_one_string_per_call()
+    val ir = tcl_ir(TclWhere + "main()\n    print(where())\n")
+
+    assert(ir.contains("c\"main.sysl:5:11\\00\""), ir)
+    assert(ir.contains("ptr %caller$.param"), ir)
+
+    use_bounds_locations(false)
+
+    val bare = tcl_ir(TclWhere + "main()\n    print(where())\n")
+
+    use_bounds_locations(true)
+    assert(!bare.contains("main.sysl:5"), bare)
+end tcl_one_string_per_call
+
+// -- the standard library --------------------------------------------------------------------------
+
+@test("unwrap of None names the line that called it")
+tcl_unwrap_none()
+    tcl_panics(tcl_main("val o: Option[int] = None\nprint(o.unwrap())\n"),
+               "panic: unwrap of a None value (main.sysl:2:9)\n")
+
+@test("expect names the line that called it")
+tcl_expect()
+    tcl_panics(tcl_main("val o: Option[int] = None\nprint(o.expect(\"needed\"))\n"),
+               "panic: needed (main.sysl:2:9)\n")
+
+@test("Result's unwrap names the line after the error")
+tcl_result_unwrap()
+    tcl_panics(tcl_main("val r: Result[int, string] = Err(\"bad\")\nprint(r.unwrap())\n"),
+               "panic: unwrap of an Err value: \"bad\" (main.sysl:2:9)\n")
+
+@test("an unwrap inside a tracked helper names the helper's caller")
+tcl_unwrap_in_a_helper()
+    tcl_panics(tcl_main("@track_caller\nfirst(o: Option[int]) -> int = o.unwrap()\n\nprint(first(Some(1)))\nprint(first(None))\n"),
+               "1\npanic: unwrap of a None value (main.sysl:5:7)\n")
+
+@test("an assertion inside a tracked helper names the helper's caller")
+tcl_assert_in_a_helper()
+    tcl_panics(tcl_main("@track_caller\npositive(n: int) = assert_eq(n > 0, true)\n\npositive(1)\npositive(-1)\n"),
+               "panic: got false, want true (main.sysl:5)\n")
+
+@test("an assertion given a file and a line names those")
+tcl_assert_given_a_place()
+    tcl_panics(tcl_main("assert(false, \"no\", \"there.sysl\", 9)\n"), "panic: no (there.sysl:9)\n")
+
+@test("a container's failure inside a tracked helper names the helper's caller")
+tcl_container_in_a_helper()
+    tcl_traps(tcl_main("import sysl.buf.{Buf, buf}\n\n@track_caller\nsecond(b: Buf[int]) -> int = b[1]\n\n" +
+                       "var b: Buf[int] = buf()\nb.push(1)\nprint(second(b))\n"),
+              "index 1 out of bounds for length 1 (main.sysl:8:7)\n")
+
+// -- what it may not mark --------------------------------------------------------------------------
+
+@test("an exported function may not be tracked")
+tcl_refuses_export()
+    tcl_refused("@export(\"f\")\n@track_caller\nf() -> int = 1\n\nmain()\n    print(f())\n",
+                "'@track_caller' hands 'f' the location of each call as a parameter past its declared ones, and an '@export'ed function is called from C", "1:1")
+
+@test("main may not be tracked")
+tcl_refuses_main()
+    tcl_refused("@track_caller\nmain()\n    print(1)\n",
+                "and 'main' is called by the program's start, which has no line to hand it", "1:1")
+
+@test("an async function may not be tracked")
+tcl_refuses_async()
+    tcl_refused("@track_caller\nasync f() -> int = 1\n\nmain()\n    print(1)\n",
+                "and an 'async' function's body runs when its task is resumed", "1:1")
+
+@test("a variadic function may not be tracked")
+tcl_refuses_variadic()
+    tcl_refused("@track_caller\nf(n: int, ...) -> int = n\n\nmain()\n    print(f(1))\n",
+                "and a variadic function's tail has no end for a parameter to stand after", "1:1")
+
+@test("an extern may not be tracked")
+tcl_refuses_extern()
+    assert(pf_err("@track_caller\nextern \"abs\" c_abs(n: i32) -> i32\n").starts_with(
+        "'@track_caller' hands a function the location of each call as a parameter past its declared ones, so it marks a function or a method whose body is sysl"))
+
+@test("the annotation takes no arguments")
+tcl_refuses_arguments()
+    assert(pf_err("@track_caller(1)\nf() -> int = 1\n").starts_with("'@track_caller' takes no arguments"))

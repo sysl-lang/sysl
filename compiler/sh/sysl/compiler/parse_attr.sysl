@@ -171,7 +171,7 @@ answers_off_extern() -> string =
     "'@answers(...)' names the parameters the pointer a C function answers may point into, so it marks an 'extern' — a function's or a method's body is right here, and the compiler reads what its answer is made of out of it"
 
 private member_attr_refusal() -> string =
-    "the only annotations a member may carry are the ones about a parameter — '@crossing', '@reads' and '@writes' — and the six about the function it lowers to, '@noinline', '@inline', '@cold', '@no_alloc', '@no_block' and '@blocks', and '@relocates', '@views(self)' and '@consumes' about its receiver's storage. What the rest say is about a free function or about a type: what 'sysl test' calls, what recurses, what a symbol names, how fields are laid out. A member is neither, so it goes above a free function instead ('06')"
+    "the only annotations a member may carry are the ones about a parameter — '@crossing', '@reads' and '@writes' — and the six about the function it lowers to, '@noinline', '@inline', '@cold', '@no_alloc', '@no_block' and '@blocks', and '@relocates', '@views(self)' and '@consumes' about its receiver's storage, and '@track_caller' about the line what it reports names. What the rest say is about a free function or about a type: what 'sysl test' calls, what recurses, what a symbol names, how fields are laid out. A member is neither, so it goes above a free function instead ('06')"
 
 // A layout annotation above a field (or any member) is about the wrong thing rather than about a
 // function: `@packed` and `@align(n)` lay out a whole struct, and `@align(n)` marks one binding's
@@ -191,7 +191,8 @@ private member_attr_word(w: string) -> bool
     if fn_forgo_word(w) then return true
 
     for word in ["crossing", "reads", "writes", "noinline", "inline", "cold", "blocks",
-                 "relocates", "views", "consumes", "disjoint", "scoped", "joined", "strict_fp"]
+                 "relocates", "views", "consumes", "disjoint", "scoped", "joined", "strict_fp",
+                 "track_caller"]
         if word == w then return true
 
     false
@@ -242,7 +243,7 @@ builtin_attr_word(w: string) -> bool
                  "section", "crossing", "domain", "keeps", "answers", "disjoint", "guards", "needs",
                  "noinline", "inline", "cold", "thread_local", "abandons", "per_cpu", "main_thread",
                  "pinned", "pins", "relocates", "views", "consumes", "blocks", "scoped", "joined",
-                 "strict_fp"]
+                 "strict_fp", "track_caller"]
         if word == w then return true
 
     false
@@ -415,6 +416,9 @@ parse_attribute(p: *Parser) -> Option[Attr]
     // `@strict_fp` takes none: which rounding mode and which exceptions are the ones in force when
     // the code runs, and naming one here would be the static environment this exists to give up.
     if word == "strict_fp" then return no_inlining_args(p, StrictFp, "the rounding mode and the exceptions are whatever the floating-point environment holds when the body runs, which is what the annotation says to follow")
+    // `@track_caller` takes none: the location it hands on is the call's, which is not something a
+    // declaration could name.
+    if word == "track_caller" then return no_inlining_args(p, TrackCaller, "the location it hands on is the line of each call, which the call supplies")
     if word == "annotation" then return no_inlining_args(p, AnnotationMark, "what a use of the annotation says is written where it is used, as the values of the struct's fields")
 
     // `@ignore` is the spelling other test frameworks use, answered with this one's: ignoring is
@@ -961,6 +965,7 @@ apply_func_attrs(f: *FuncDecl, attrs: Buf[Attr])
             Forgoes(cap) -> f.marks.forgoes.push(cap)
             Blocks -> f.marks.blocks = true
             StrictFp -> f.marks.strict_fp = true
+            TrackCaller -> f.marks.track_caller = true
             Scoped(ns) -> f.marks.scoped = ns
             Joined(ns) -> f.marks.joined = ns
             _ -> ()
@@ -987,6 +992,7 @@ apply_member_attrs(m: *MethodDecl, attrs: Buf[Attr])
             Forgoes(cap) -> m.marks.forgoes.push(cap)
             Blocks -> m.marks.blocks = true
             StrictFp -> m.marks.strict_fp = true
+            TrackCaller -> m.marks.track_caller = true
             Relocates -> m.marks.relocates = true
             Views(_) -> m.marks.views = true
             Consumes -> m.marks.consumes = true
@@ -1229,6 +1235,11 @@ private attributed_refusal(attrs: Buf[Attr]) -> string
 
     if all_are(attrs, "byte_order")
         return "'@byte_order(...)' is the order a struct's integer fields keep their bytes in, so it can only mark a struct — and this declares none. A lone value is put in an order with 'to_be' and 'from_be', the members 'sysl.math.ByteOrder' gives every whole-byte integer"
+
+    // An `extern`'s definition is C's, compiled where no sysl call could hand it a location, so the
+    // parameter the mark adds could never be received.
+    if any_is(attrs, "track_caller")
+        return "'@track_caller' hands a function the location of each call as a parameter past its declared ones, so it marks a function or a method whose body is sysl — and this declares neither. An 'extern''s definition is compiled elsewhere, with no such parameter to receive it; a sysl function wrapping it can carry the mark"
 
     // An `extern` is where this is most often tried, and it has no body here to put in place of a
     // call: the definition is the linked object's, and only its own compiler can inline it.

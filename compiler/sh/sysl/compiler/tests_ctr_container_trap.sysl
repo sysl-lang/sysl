@@ -11,8 +11,8 @@ import sysl.text.split
 // does: the report goes through `sysl_bounds_fail` -- the same form, the same values, the same
 // override -- and the program then traps, with SIGTRAP's status (133 under a shell) rather than a
 // panic's exit 1. `Buf`, `Frozen`, `Deque` and `Ring` all report through `sysl.index_past` (and an
-// insertion through `insert_past`), whose location is null: a member cannot see the line that
-// called it, so the message ends at the values.
+// insertion through `insert_past`), and every member on the way is `@track_caller`, so the location
+// is the line and column of the subscript or the member call the program wrote, as an array's is.
 //
 // Axes: each container x subscript read, subscript write, compound (a `Buf`'s only -- the others
 // have no `IndexPlace`, and `+=` through `Index` is refused, pinned below), `at`, `set`, `insert`,
@@ -107,51 +107,54 @@ private val CtrRing: string =
 private val CtrFrozen: string =
     "var b: Buf[int] = buf()\nb.push(10)\nb.push(20)\nb.push(30)\nval f = b.freeze()\nval i: usize = 5\n"
 
-private val CtrPast: string = "index 5 out of bounds for length 3\n"
+// Index 5 past three elements, reported at `at` -- the line and column of the subscript or the
+// member call the program wrote, since every member on the way is `@track_caller`.
+private ctr_past(at: string) -> string = s"index 5 out of bounds for length 3 (main.sysl:$at)\n"
 
 // -- Buf --------------------------------------------------------------------------------------------
 
 @test("a Buf's subscript read past the count traps with an array's report")
 ctr_buf_read()
-    ctr_both(CtrBuf + "print(b[2])\nprint(b[i])\n", "30\n", CtrPast)
+    ctr_both(CtrBuf + "print(b[2])\nprint(b[i])\n", "30\n", ctr_past("11:8"))
 
 @test("a Buf's subscript write past the count traps")
 ctr_buf_write()
-    ctr_main(CtrBuf + "b[2] = 7\nprint(b[2])\nb[i] = 7\nprint(b[2])\n", "7\n", CtrPast)
+    ctr_main(CtrBuf + "b[2] = 7\nprint(b[2])\nb[i] = 7\nprint(b[2])\n", "7\n", ctr_past("12:2"))
 
 @test("a Buf's compound assignment past the count traps")
 ctr_buf_compound()
-    ctr_main(CtrBuf + "b[2] += 1\nprint(b[2])\nb[i] += 1\nprint(b[2])\n", "31\n", CtrPast)
+    ctr_main(CtrBuf + "b[2] += 1\nprint(b[2])\nb[i] += 1\nprint(b[2])\n", "31\n", ctr_past("12:2"))
 
 @test("a Buf's at and set past the count trap")
 ctr_buf_at_and_set()
-    ctr_main(CtrBuf + "print(b.at(0))\nprint(b.at(i))\n", "10\n", CtrPast)
-    ctr_main(CtrBuf + "b.set(0, 1)\nprint(b.at(0))\nb.set(i, 1)\n", "1\n", CtrPast)
+    ctr_main(CtrBuf + "print(b.at(0))\nprint(b.at(i))\n", "10\n", ctr_past("11:9"))
+    ctr_main(CtrBuf + "b.set(0, 1)\nprint(b.at(0))\nb.set(i, 1)\n", "1\n", ctr_past("12:3"))
 
 @test("a Buf's insert at the count is a push, and past it traps in its own form")
 ctr_buf_insert()
     ctr_main(CtrBuf + "b.insert(3, 40)\nprint(b.len())\nb.insert(i, 50)\n", "4\n",
-             "insertion index 5 is past length 4\n")
+             "insertion index 5 is past length 4 (main.sysl:12:3)\n")
 
 @test("a Buf's remove at the count traps")
 ctr_buf_remove()
     ctr_main(CtrBuf + "print(b.remove(2))\nprint(b.remove(2))\n", "30\n",
-             "index 2 out of bounds for length 2\n")
+             "index 2 out of bounds for length 2 (main.sysl:11:9)\n")
 
 @test("an index equal to a Buf's count traps")
 ctr_buf_at_the_count()
-    ctr_main(CtrBuf + "print(b[3])\n", "", "index 3 out of bounds for length 3\n")
+    ctr_main(CtrBuf + "print(b[3])\n", "", "index 3 out of bounds for length 3 (main.sysl:10:8)\n")
 
 @test("an empty Buf traps on index zero, as an empty array does")
 ctr_buf_empty()
     ctr_main("var b: Buf[int] = buf()\nprint(b.len())\nprint(b[0])\n", "0\n",
-             "index 0 out of bounds for length 0\n")
+             "index 0 out of bounds for length 0 (main.sysl:7:8)\n")
 
 @test("a Buf that was never given storage reads as empty, and traps the same way")
 ctr_buf_unassigned()
     ctr_main(ctr_zeroed("Buf[int]", "print(h.items.len())\nprint(h.items[1])\n"), "0\n",
-             "index 1 out of bounds for length 0\n")
-    ctr_main(ctr_zeroed("Buf[int]", "print(h.items.remove(0))\n"), "", "index 0 out of bounds for length 0\n")
+             "index 1 out of bounds for length 0 (main.sysl:14:14)\n")
+    ctr_main(ctr_zeroed("Buf[int]", "print(h.items.remove(0))\n"), "",
+             "index 0 out of bounds for length 0 (main.sysl:13:15)\n")
 
 @test("a negative index on a Buf is the compiler's check, and names where it was written")
 ctr_buf_negative()
@@ -161,47 +164,51 @@ ctr_buf_negative()
 
 @test("a frozen buffer's subscript and at past the length trap")
 ctr_frozen()
-    ctr_both(CtrFrozen + "print(f[2])\nprint(f[i])\n", "30\n", CtrPast)
-    ctr_main(CtrFrozen + "print(f.at(1))\nprint(f.at(3))\n", "20\n", "index 3 out of bounds for length 3\n")
+    ctr_both(CtrFrozen + "print(f[2])\nprint(f[i])\n", "30\n", ctr_past("12:8"))
+    ctr_main(CtrFrozen + "print(f.at(1))\nprint(f.at(3))\n", "20\n",
+             "index 3 out of bounds for length 3 (main.sysl:12:9)\n")
 
 @test("an empty frozen buffer traps on index zero")
 ctr_frozen_empty()
     ctr_main("var b: Buf[int] = buf()\nval f = b.freeze()\nprint(f.len())\nprint(f[0])\n", "0\n",
-             "index 0 out of bounds for length 0\n")
+             "index 0 out of bounds for length 0 (main.sysl:8:8)\n")
 
 // -- Deque ------------------------------------------------------------------------------------------
 
 @test("a Deque's subscript read and write past the count trap")
 ctr_deque_subscript()
-    ctr_both(CtrDeque + "print(d[2])\nprint(d[i])\n", "30\n", CtrPast)
-    ctr_main(CtrDeque + "d[0] = 1\nprint(d[0])\nd[i] = 1\n", "1\n", CtrPast)
+    ctr_both(CtrDeque + "print(d[2])\nprint(d[i])\n", "30\n", ctr_past("11:8"))
+    ctr_main(CtrDeque + "d[0] = 1\nprint(d[0])\nd[i] = 1\n", "1\n", ctr_past("12:2"))
 
 @test("a Deque's at and set past the count trap, the count itself included")
 ctr_deque_at_and_set()
-    ctr_main(CtrDeque + "print(d.at(3))\n", "", "index 3 out of bounds for length 3\n")
-    ctr_main(CtrDeque + "d.set(i, 1)\n", "", CtrPast)
+    ctr_main(CtrDeque + "print(d.at(3))\n", "", "index 3 out of bounds for length 3 (main.sysl:10:9)\n")
+    ctr_main(CtrDeque + "d.set(i, 1)\n", "", ctr_past("10:3"))
 
 @test("an empty Deque and one never given storage trap on index zero")
 ctr_deque_empty()
-    ctr_main("var d: Deque[int] = deque()\nprint(d[0])\n", "", "index 0 out of bounds for length 0\n")
-    ctr_main(ctr_zeroed("Deque[int]", "h.items.set(2, 1)\n"), "", "index 2 out of bounds for length 0\n")
+    ctr_main("var d: Deque[int] = deque()\nprint(d[0])\n", "",
+             "index 0 out of bounds for length 0 (main.sysl:6:8)\n")
+    ctr_main(ctr_zeroed("Deque[int]", "h.items.set(2, 1)\n"), "",
+             "index 2 out of bounds for length 0 (main.sysl:13:9)\n")
 
 // -- Ring -------------------------------------------------------------------------------------------
 
 @test("a wrapped Ring's subscript read and write past the count trap")
 ctr_ring_subscript()
-    ctr_both(CtrRing + "print(r[2])\nprint(r[i])\n", "30\n", CtrPast)
-    ctr_main(CtrRing + "r[0] = 1\nprint(r[0])\nr[3] = 1\n", "1\n", "index 3 out of bounds for length 3\n")
+    ctr_both(CtrRing + "print(r[2])\nprint(r[i])\n", "30\n", ctr_past("16:8"))
+    ctr_main(CtrRing + "r[0] = 1\nprint(r[0])\nr[3] = 1\n", "1\n",
+             "index 3 out of bounds for length 3 (main.sysl:17:2)\n")
 
 @test("a Ring's at and set past the count trap")
 ctr_ring_at_and_set()
-    ctr_main(CtrRing + "print(r.at(i))\n", "", CtrPast)
-    ctr_main(CtrRing + "r.set(i, 1)\n", "", CtrPast)
+    ctr_main(CtrRing + "print(r.at(i))\n", "", ctr_past("15:9"))
+    ctr_main(CtrRing + "r.set(i, 1)\n", "", ctr_past("15:3"))
 
 @test("an empty Ring traps on index zero")
 ctr_ring_empty()
     ctr_main("var slots: [2]int = [0; 2]\nvar r = ring(slots[..])\nprint(r[0])\n", "",
-             "index 0 out of bounds for length 0\n")
+             "index 0 out of bounds for length 0 (main.sysl:7:8)\n")
 
 @test("a compound assignment on a Deque or a Ring is still refused, as it is through any Index")
 ctr_compound_refused()
@@ -225,9 +232,9 @@ end ctr_compound_refused
 ctr_generic_index()
     val get = "pick[C: Index[usize, int]](c: C, i: usize) -> int = c[i]\n\n"
 
-    ctr_main(get + CtrBuf + "print(pick(b, 1))\nprint(pick(b, i))\n", "20\n", CtrPast)
-    ctr_main(get + CtrDeque + "print(pick(d, 1))\nprint(pick(d, i))\n", "20\n", CtrPast)
-    ctr_main(get + CtrRing + "print(pick(r, 1))\nprint(pick(r, i))\n", "20\n", CtrPast)
+    ctr_main(get + CtrBuf + "print(pick(b, 1))\nprint(pick(b, i))\n", "20\n", ctr_past("5:54"))
+    ctr_main(get + CtrDeque + "print(pick(d, 1))\nprint(pick(d, i))\n", "20\n", ctr_past("5:54"))
+    ctr_main(get + CtrRing + "print(pick(r, 1))\nprint(pick(r, i))\n", "20\n", ctr_past("5:54"))
 end ctr_generic_index
 
 // -- the override -----------------------------------------------------------------------------------
@@ -238,18 +245,18 @@ private val CtrReport: string =
     "    val place = if usize(at) == 0 then \"-\" else \"located\"\n\n" +
     "    eprints(s\"override $kind $a $b $n $place\\n\")\n"
 
-@test("an exported sysl_bounds_fail is handed every container's failure, with no location, and the trap follows")
+@test("an exported sysl_bounds_fail is handed every container's failure, with its location, and the trap follows")
 ctr_override()
     if !ctr_ready() then return
 
     val heads = "import report\nimport sysl.buf.{Buf, buf}\nimport sysl.container.{Deque, deque}\n" +
         "import sysl.container.ring.{Ring, ring}\n\n"
     val cases: [6](string, string) = [
-        (CtrBuf + "print(b[i])\n", "override 0 5 0 3 -\n"),
-        (CtrBuf + "b.insert(i, 1)\n", "override 14 5 0 3 -\n"),
-        (CtrFrozen + "print(f[i])\n", "override 0 5 0 3 -\n"),
-        (CtrDeque + "d[i] = 1\n", "override 0 5 0 3 -\n"),
-        (CtrRing + "print(r.at(i))\n", "override 0 5 0 3 -\n"),
+        (CtrBuf + "print(b[i])\n", "override 0 5 0 3 located\n"),
+        (CtrBuf + "b.insert(i, 1)\n", "override 14 5 0 3 located\n"),
+        (CtrFrozen + "print(f[i])\n", "override 0 5 0 3 located\n"),
+        (CtrDeque + "d[i] = 1\n", "override 0 5 0 3 located\n"),
+        (CtrRing + "print(r.at(i))\n", "override 0 5 0 3 located\n"),
         ("var b: Buf[int] = buf()\nval k = -1\nprint(b[k])\n", "override 269 18446744073709551615 0 0 located\n")]
 
     for c in cases
