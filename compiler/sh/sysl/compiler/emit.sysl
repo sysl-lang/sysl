@@ -344,6 +344,15 @@ struct Emit
     // `inert` as the symbols a lowered call names (`symbol_of`), which is what the count elision
     // reads off an emitted call: a root function's key is `count`, and its call is to `count$$sysl`.
     inert_symbols: Set[string]
+
+    // The functions declared `@track_caller`, by key, each taking one parameter past its declared
+    // ones: the address of the `file:line:column` text of the call that reached it, or null where the
+    // build dropped locations (`track_caller.sysl`). `in_tracked` says the body being written is one
+    // of them, so the location it hands on -- to a tracked callee, to a failed check, to
+    // `__CALLER__` -- is the one it was handed. A function pointer or a trait object's table holds a
+    // stand-in for one instead, which passes the definition's own location (`caller_shim`).
+    tracked: Map[string, TrackedFn]
+    in_tracked: bool
 end Emit
 
 // What a runtime helper is built from. A helper is asked for by name while a body is being written
@@ -384,6 +393,10 @@ enum HelperReq
     // The forwarder one slot of a method table holds, where what the table promises and what the
     // implementation declared are not already the same handover.
     HrAdapter(table: TVtable, slot: TVSlot)
+
+    // What a function pointer to a `@track_caller` function holds: a stand-in calling it with the
+    // location of its own declaration (`track_caller.sysl`).
+    HrCallerShim(target: string)
 end HelperReq
 
 // What a definition and every call to it name.
@@ -509,7 +522,7 @@ emitter_for(t: Target, destructors: Buf[(string, string)]) -> Emit
          set(), set(), set(), set(), map(), map(), false, None, set(), buf(), None, None, false,
          None, false, buf(), map(), map(), map(), set(), buf(), set(), set(), set(), false, untouched_none(), set(),
          no_wrap_none(), map(), buf(), Leaving, false, "", set(), buf(), map(), map(), 0, moves_none(), set(), set(),
-         set(), map(), 0, map(), set())
+         set(), map(), 0, map(), set(), map(), false)
 end emitter_for
 
 // -- what a body could not say --------------------------------------------------------------------
@@ -536,6 +549,7 @@ has_gap(e: *Emit) -> bool = e.gap.is_some()
 start_function(e: *Emit)
     e.nowrap = no_wrap_none()
     e.src = None
+    e.in_tracked = false
     e.prologue.clear()
     e.blocks.clear()
     e.current.clear()

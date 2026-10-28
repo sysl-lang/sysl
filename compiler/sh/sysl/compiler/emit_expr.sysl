@@ -31,7 +31,7 @@ private gen_expr_kind(e: *Emit, x: TExpr) -> Val = *x.kind match
     TUnitLit -> VNothing
     TNullLit(ty) -> zero_of(e, ty)
     TZero(ty) -> zero_of(e, ty)
-    TCStrLit(s) -> string_global(e, s)
+    TCStrLit(s) -> if is_caller_text(s) then location_of(e, x.span) else string_global(e, s)
 
     // Three words naming bytes that are never freed: the owner is null, so counting the value costs
     // nothing at run time and there is nothing for the statement around it to release.
@@ -186,7 +186,7 @@ private gen_expr_kind(e: *Emit, x: TExpr) -> Val = *x.kind match
 
         expansion_at(e, x) match
             Some(t) -> gen_expr(e, t)
-            None -> gen_call(e, name, args, ty)
+            None -> gen_call(e, name, args, ty, x.span)
     TAtomic(op, addr, ops, ordering, at, ty) -> gen_atomic(e, op, addr, ops, ordering, at, ty)
     TFence(ordering) -> gen_fence(e, ordering)
     TSlots(op, args, elem, ty) -> gen_slots(e, op, args, elem, ty)
@@ -204,7 +204,7 @@ private gen_expr_kind(e: *Emit, x: TExpr) -> Val = *x.kind match
 
     // An address is the C-callable entry rather than the definition, since a `*extern` may only
     // hold something C can call.
-    TFuncAddr(_, entry, _) -> VGlobal(entry_of(e, entry))
+    TFuncAddr(_, entry, _) -> VGlobal(caller_entry(e, entry))
 
     TBlockExpr(b) ->
         if zero_sized(b.ty)
@@ -1030,6 +1030,8 @@ dispatch_value(e: *Emit, d: TDispatch, aty: Type, bty: Type, av: Val, bv: Val,
     if !zero_sized(left_ty) then args.push(operand_arg(e, left_ty, left))
     if !zero_sized(right_ty) then args.push(operand_arg(e, right_ty, right))
 
+    push_caller_unplaced(e, d.name, &args)
+
     val res = gen_sysl_call(e, VGlobal(symbol_of(e, d.name)), args, result_ty)
 
     if !d.negate then return res
@@ -1467,7 +1469,7 @@ const StagedNothing: int = 0
 const StagedSlot: int = 1
 const StagedValue: int = 2
 
-private gen_call(e: *Emit, name: string, args: Buf[TExpr], ty: Type) -> Val
+private gen_call(e: *Emit, name: string, args: Buf[TExpr], ty: Type, span: Span) -> Val
     // A foreign result may be named by a type the sysl signature never mentions -- a coerced
     // aggregate, or `void` where the value comes back through an out-parameter -- and a variadic
     // callee is named by its whole function type, since the argument list alone does not say where
@@ -1504,6 +1506,8 @@ private gen_call(e: *Emit, name: string, args: Buf[TExpr], ty: Type) -> Val
     val mark = e.temps.len()
     val staged = staged_args(e, args, &arg_vals, name)
     val worked_out = e.temps.len()
+
+    push_caller_arg(e, name, span, &arg_vals)
 
     // A call the compiler can see is a call to the same body checks that the measure has gone down.
     // It sits before the call rather than inside the callee, which is what lets it be made out of
@@ -2008,6 +2012,7 @@ private gen_conversion(e: *Emit, fn: string, arg: Val, from: Type, to: Type) -> 
 
         args.push(IrArg(LPtr, slot, sret_attrs(lty(e, to), int(e.layout.claim(to)))))
         args.push(passed)
+        push_caller_unplaced(e, fn, &args)
         emit(e, InCall(None, LVoid, callee, args, no_ir_attrs(), None, no_fast_math(), false))
 
         val r = fresh_reg(e)
@@ -2019,6 +2024,7 @@ private gen_conversion(e: *Emit, fn: string, arg: Val, from: Type, to: Type) -> 
     var args: Buf[IrArg] = buf()
 
     args.push(passed)
+    push_caller_unplaced(e, fn, &args)
 
     val r = fresh_reg(e)
 
