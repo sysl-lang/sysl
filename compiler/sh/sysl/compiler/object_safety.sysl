@@ -258,10 +258,14 @@ end check_object_safe
 //   is the reference's, which has none;
 // - through a `*T`, a member taking `&self`, which needs the counted box a pointer does not carry.
 //
-// **And the traits a reference answers by the compiler's rule, never by its referent**: `Eq` and
-// `Hash` are the address's (`reference/memory.md § &T — counted references`), so a trait requiring
-// either is refused too rather than answering two of its members by identity and the rest by value;
-// an operator's trait, because the operator does not see through a reference (`a + b` on a `&V` is
+// **`Eq` and `Hash` reach through a `&T`**, since a reference compares and hashes as its referent
+// does wherever the referent has them (`reference/memory.md § References compare through their
+// referent`), so a trait requiring either is met through the referent and every member answers by
+// value. **Through a `*T` they do not**: a pointer is an address and is compared as one, so a trait
+// requiring either would answer two of its members by identity and the rest by value.
+//
+// **And the traits a reference answers by the compiler's rule, never by its referent**: an operator's
+// trait, because the operator does not see through a reference (`a + b` on a `&V` is
 // refused); `Drop`, which is the referent's own destruction rather than anything the reference
 // does; a callable, whose call is not a member call; and a family whose membership is the
 // compiler's.
@@ -277,7 +281,7 @@ through_reference_refusal(a: &Analysis, tr: Bound, raw: bool) -> Option[string]
     var settled: Buf[string] = buf()
 
     for item in closure
-        val why = answered_by_the_compiler(item.name)
+        val why = answered_by_the_compiler(item.name, raw)
 
         if why.is_some() then return why
 
@@ -297,6 +301,10 @@ through_reference_refusal(a: &Analysis, tr: Bound, raw: bool) -> Option[string]
         val m = item.1
         val from = qualified_name(item.0.name)
 
+        // `Eq.eq` names `Self` for its other operand, and through a reference that is the reference:
+        // which is exactly what `==` on two references compares through to the referent's.
+        if equality_trait(item.0.name) then continue
+
         if m.recv_mode().is_none() || m.is_static then
             return Some(s"'${m.name}' of '$from' is reached through the type, and a reference's type " +
                         "has none of its referent's associated members")
@@ -314,7 +322,7 @@ through_reference_refusal(a: &Analysis, tr: Bound, raw: bool) -> Option[string]
 end through_reference_refusal
 
 // The traits a reference meets by a rule of its own, or not at all, whatever its referent implements.
-private answered_by_the_compiler(key: string) -> Option[string]
+private answered_by_the_compiler(key: string, raw: bool) -> Option[string]
     val shown = qualified_name(key)
 
     if fn_is_call(key) then return Some(s"'$shown' is called, and a call does not see through a reference")
@@ -322,7 +330,8 @@ private answered_by_the_compiler(key: string) -> Option[string]
     library_spelling(key) match
         Some(s) ->
             if s == "Eq" || s == "Hash" then
-                Some(s"a reference meets '$shown' by its own identity, never by what it points at")
+                if raw then Some(s"a pointer meets '$shown' by its address, never by what it points at")
+                else None
             else if operator_trait(s) then
                 Some(s"'$shown' is an operator's, and an operator does not see through a reference")
             else if s == "Drop" then
@@ -332,6 +341,11 @@ private answered_by_the_compiler(key: string) -> Option[string]
             else None
         None -> None
 end answered_by_the_compiler
+
+// Whether a trait is the library's `Eq` or `Hash`.
+private equality_trait(key: string) -> bool = library_spelling(key) match
+    Some(s) -> s == "Eq" || s == "Hash"
+    None -> false
 
 // Whether a library trait is one an operator is written against -- `Eq` and `Ord` included.
 private operator_trait(spelling: string) -> bool = spelling match

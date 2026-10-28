@@ -1865,6 +1865,27 @@ private compare_expr(cx: &Analyzer, span: Span, operands: Buf[Expr], ops: Buf[st
         val a = texpr_type(ts.at(i))
         val b = texpr_type(ts.at(i + 1))
 
+        // `===` and `!==` are the identity of two references or pointers, whatever their referent
+        // defines: the machine's comparison of the addresses.
+        if op == "===" || op == "!=="
+            if a != Unknown && b != Unknown then identity_operands(cx, span, op, a, b)
+
+            cmps.push(TCmp(if op == "===" then "==" else "!=", None, 0))
+            continue
+        end if
+
+        // **A reference compares as its referent does, where the referent has an `Eq`**
+        // (`reference/memory.md § References compare through their referent`): the link reads both
+        // operands through to it and dispatches on its type. Where it has none, the reference is
+        // its own identity, and the link is the machine's comparison of the addresses below.
+        val through = if (op == "==" || op == "!=") && a != Unknown && b != Unknown &&
+                         type_eq(repr(a), repr(b)) then through_levels(cx.an, "Eq", a) else 0
+
+        if through > 0
+            cmps.push(TCmp(op, compare_at(cx, span, op, peeled(a, through)), through))
+            continue
+        end if
+
         var dispatch: Option[TDispatch] = None
 
         if a != Unknown && b != Unknown then dispatch = compare_link(cx, span, op, ts.at(i),
@@ -1888,10 +1909,30 @@ private compare_expr(cx: &Analyzer, span: Span, operands: Buf[Expr], ops: Buf[st
                              "'impl Eq' comparing the field you know is there")
                 else if !ok then cx.fault(span, s"'$op' is not defined for ${type_show(a)}")
 
-        cmps.push(TCmp(op, dispatch))
+        cmps.push(TCmp(op, dispatch, 0))
 
     TExpr(span, TCompare(ts, cmps))
 end compare_expr
+
+// The operands of `===` or `!==`: two references, or two pointers, of one type. A trait object is
+// two words and has no single address to compare; anything else has no identity apart from its
+// value, and `==` is the comparison it has.
+private identity_operands(cx: &Analyzer, span: Span, op: string, a: Type, b: Type)
+    val addressed = underlying(a) match
+        Ref(_, _) -> true
+        Ptr(_) -> true
+        _ -> false
+
+    if !addressed
+        cx.fault(span, s"'$op' compares the identity of two references or pointers, and " +
+                 s"${type_show(a)} is neither — '${if op == "===" then "==" else "!="}' compares its value")
+    else if erased(underlying(a))
+        cx.fault(span, s"'$op' is not defined for the trait object ${type_show(a)}, which is two words " +
+                 "rather than one address")
+    else if !type_eq(repr(a), repr(b))
+        cx.fault(span, s"'$op' compares two references or pointers of one type, got ${type_show(a)} " +
+                 s"and ${type_show(b)}")
+end identity_operands
 
 // -- the tiering a pair of operands is read in ---------------------------------------------------
 

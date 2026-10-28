@@ -10,9 +10,9 @@ import sysl.text.replace_all
 // referent's bounds`): `[C: Index[usize, int]]` takes a `&Buf[int]`, a `*Buf[int]` and a
 // `&sync Frozen[int]` as it takes the `Buf[int]`, and the body instantiated at each reaches the
 // referent's members exactly as a member call written on the reference does. The traits a call on a
-// reference does NOT reach through are refused, each with its reason: `Eq` and `Hash`, which a
-// reference meets by its own identity (`tests_rik_reference_identity_key.sysl` holds that rule, and
-// is unchanged); an operator's trait; a member naming `Self` away from its receiver; an associated
+// reference does NOT reach through are refused, each with its reason: through a `*T`, `Eq` and
+// `Hash`, which a pointer meets by its address (a `&T` meets them through its referent:
+// `tests_req_reference_eq.sysl`); an operator's trait; a member naming `Self` away from its receiver; an associated
 // function; `&self` through a raw pointer; a compiler family; and a second level of reference.
 //
 // Skipped cells: bare metal and separate compilation, since nothing new is emitted -- the
@@ -310,8 +310,8 @@ btr_generic_type_at_a_reference()
 
 // -- Eq and Hash stay identity ----------------------------------------------------------------------
 
-@test("one body bounded on Eq and Index at a &Buf compares identities and indexes the buffer")
-btr_eq_stays_identity_beside_index()
+@test("one body bounded on Eq and Index at a &Buf compares the buffers and indexes them")
+btr_eq_beside_index()
     if !btr_ready() then return
 
     btr_prints(btr_lib() + raw"""
@@ -327,8 +327,10 @@ btr_eq_stays_identity_beside_index()
             val ry: &Buf[int] = y
             val (s1, n1) = probe(rx, ry)
             val (s2, n2) = probe(rx, rx)
-            print(s1, n1, s2, n2)
-        """, "false 2 true 2\n")
+            y.push(2)
+            val (s3, n3) = probe(rx, ry)
+            print(s1, n1, s2, n2, s3, n3)
+        """, "true 2 true 2 false 2\n")
 
 // -- what is refused --------------------------------------------------------------------------------
 
@@ -441,11 +443,11 @@ btr_refused_associated_function()
         """, "but &N does not — N implements it, but 'make' of 'Make' is reached through the type, and a " +
              "reference's type has none of its referent's associated members")
 
-@test("a trait requiring Eq keeps a reference out, since the reference's Eq is its identity")
-btr_refused_trait_requiring_eq()
+@test("a trait requiring Eq is met through a &T, whose Eq is its referent's, and refused through a *T")
+btr_trait_requiring_eq()
     if !btr_ready() then return
 
-    btr_refused(btr_n() + raw"""
+    val lib = btr_n() + raw"""
         trait Keyed: Eq
             key(self) -> int
 
@@ -455,13 +457,24 @@ btr_refused_trait_requiring_eq()
         impl Keyed for N
             key(self) -> int = self.v
 
-        keyed[T: Keyed](a: T) -> int = a.key()
+        keyed[T: Keyed](a: T, b: T) -> (int, bool) = (a.key(), a == b)
 
+        """
+
+    btr_prints(lib + raw"""
         main()
             val n: &N = N(1)
-            print(keyed(n))
-        """, "but &N does not — N implements it, but a reference meets 'sysl.Eq' by its own identity, " +
-             "never by what it points at")
+            val m: &N = N(1)
+            val k = keyed(n, m)
+            print(k.0, k.1)
+        """, "1 true\n")
+
+    btr_refused(lib + raw"""
+        main()
+            var n = N(1)
+            print(keyed(&n, &n).0)
+        """, "but *N does not — N implements it, but a pointer meets 'sysl.Eq' by its address, never by " +
+             "what it points at")
 
 @test("a '&self' member is reached through a &T and refused through a *T")
 btr_ref_self_member()

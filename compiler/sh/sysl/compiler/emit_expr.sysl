@@ -963,9 +963,43 @@ end gen_compare
 
 // One comparison over two values the caller is holding: an instruction where the operand type has
 // one, the method its `Eq`/`Ord` supplies otherwise.
-comparison(e: *Emit, c: TCmp, ty: Type, av: Val, bv: Val) -> Val = c.dispatch match
-    Some(d) -> dispatch_value(e, d, ty, ty, av, bv, Bool)
-    None -> compare_value(e, c.op, underlying(ty), av, bv)
+comparison(e: *Emit, c: TCmp, ty: Type, av: Val, bv: Val) -> Val
+    if c.through > 0 then return through_comparison(e, c, ty, av, bv)
+
+    c.dispatch match
+        Some(d) -> dispatch_value(e, d, ty, ty, av, bv, Bool)
+        None -> compare_value(e, c.op, underlying(ty), av, bv)
+end comparison
+
+// **Two references compared as what they reach**: each is read through `c.through` levels, and the
+// two referents are compared as the link says -- by their type's `Eq` or by the machine. Reading a
+// referent takes no count; the comparison only looks.
+private through_comparison(e: *Emit, c: TCmp, ty: Type, av: Val, bv: Val) -> Val
+    var at = ty
+    var a = av
+    var b = bv
+
+    for _ in 0..<c.through
+        val inner = pointee(underlying(at)).unwrap_or(at)
+
+        a = referent_value(e, at, inner, a)
+        b = referent_value(e, at, inner, b)
+        at = inner
+    end for
+
+    comparison(e, TCmp(c.op, c.dispatch, 0), at, a, b)
+end through_comparison
+
+// The value a reference `p` of type `ty` reaches.
+private referent_value(e: *Emit, ty: Type, inner: Type, p: Val) -> Val
+    if zero_sized(inner) then return VNothing
+
+    val at = box_payload_addr(e, p, ty)
+    val r = fresh_reg(e)
+
+    emit(e, InLoad(r, lty(e, inner), at, if header_pointer(ty) then AccBufHeader else AccPlain, None))
+    r
+end referent_value
 
 // **An operator the type supplies rather than the machine**: one call to the member its `impl`
 // lowered to, with the operands in the order the block declared them and the answer negated where

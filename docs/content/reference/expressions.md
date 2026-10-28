@@ -24,7 +24,7 @@ operator symbols, and no facility to add one.
 | 2 | `\|\|` | logical or | left |
 | 3 | `&&` | logical and | left |
 | 4 | `is`, `is not` | pattern test | non-associative |
-| 5 | `==` `!=` `<` `>` `<=` `>=` | comparison | **chained** |
+| 5 | `==` `!=` `===` `!==` `<` `>` `<=` `>=` | comparison | **chained** |
 | 6 | `..` `..<` | range | non-associative |
 | 7 | `\|` | bitwise or | left |
 | 8 | `^` | bitwise xor | left |
@@ -475,8 +475,11 @@ a constant shifted by 40 places, at or past the 32 bits of int
 ### Equality reaches further than ordering
 
 `==` and `!=` are defined wherever `<` is, and additionally on `bool` and on the two pointer-shaped
-modes `*T` and `&T`, which compare by address. **Ordering on an address is not defined** — a bare
-address has no meaningful one.
+modes: a `*T` compares by address, and a `&T` as its referent does where the referent has an `Eq`,
+by address where it has none ([memory](/reference/memory/#references-compare-through-their-referent)).
+**`===` and `!==`** compare two references or two pointers by address whatever the referent defines,
+and bind as `==` does. **Ordering on an address is not defined** — a bare address has no meaningful
+one.
 
 ### The one arithmetic two pointers have is `-`
 

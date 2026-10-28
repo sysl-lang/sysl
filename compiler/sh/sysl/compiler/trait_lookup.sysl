@@ -763,6 +763,61 @@ private referent_shortfall(a: &Analysis, tr: Bound, t: Type) -> Option[string]
     Some(s"${type_show(inner.unwrap())} implements it, but ${why.unwrap()}")
 end referent_shortfall
 
+// **How many levels of reference `==` and `Hash` see through at `t`** (`reference/memory.md §
+// References compare through their referent`), where `spelling` is `"Eq"` or `"Hash"`: a `&T` or a
+// `&sync T` is equal, and hashes, as its referent does wherever the referent meets the trait, and is
+// its own identity where it does not. So the answer is 0 for everything else -- a `*T`, which is an
+// address and is compared as one (`p == null`, `p != end`), a trait object, and a value -- and for a
+// reference whose referent has no `Eq` (or no `Hash`). A reference to a reference sees through to
+// the inner reference, whose own equality is then its referent's or its identity, so `&&Node`
+// compares as `&Node` does.
+through_levels(a: &Analysis, spelling: string, t: Type) -> int
+    var n = 0
+    var at = t
+
+    loop
+        val inner = underlying(at) match
+            Ref(i, _) -> *i
+            _ -> return n
+
+        if erased(underlying(at)) then return n
+
+        val deeper = underlying(inner) match
+            Ref(_, _) -> !erased(underlying(inner))
+            _ -> false
+
+        if !deeper && !satisfies(a, plain_bound(library_key(spelling), buf()), inner) then return n
+
+        n += 1
+        at = inner
+    end loop
+end through_levels
+
+// The type `levels` references in from `t`: what a comparison seeing through them compares.
+peeled(t: Type, levels: int) -> Type
+    var at = t
+
+    for _ in 0..<levels
+        at = pointee(underlying(at)).unwrap_or(at)
+
+    at
+end peeled
+
+// **A reference whose referent defines `Eq` but not `Hash` has no hash**: its `==` is the referent's,
+// and a hash of its address would give two equal references two different hashes, which breaks the
+// one law a key needs. Refused as a key rather than keyed wrongly.
+hash_law_breaks(a: &Analysis, t: Type) -> bool =
+    through_levels(a, "Eq", t) > through_levels(a, "Hash", t)
+
+// Why a reference is refused `Hash` by the law above, said as the tail of the refusal.
+hash_law_refusal(a: &Analysis, t: Type) -> string
+    val inner = peeled(t, through_levels(a, "Hash", t) + 1)
+
+    s"${type_show(inner)} defines 'Eq' but not 'Hash', so a reference to it compares by its value and " +
+        s"has no hash that agrees — give ${type_show(inner)} a 'Hash', or key by its identity with " +
+        "'ByAddress'"
+end hash_law_refusal
+
 // **A reference or a pointer is `Debug` where what it reaches is**, because a member call sees
 // through one level of `&` or `*` to find its receiver (`reference/traits.md § Any type may carry an
 // impl`), so `x.debug(…)` on one reaches the referent's -- which is what lets an `Option[&Node]` or a
@@ -808,6 +863,8 @@ private builtin_satisfies(a: &Analysis, tr: Bound, t: Type) -> bool
         if disagree(item, t) then return false
 
     val spelling = library_spelling(tr.name)
+
+    if spelling == Some("Hash") && hash_law_breaks(a, t) then return false
 
     spelling.is_some() && core_builtin(spelling.unwrap(), t)
 end builtin_satisfies
@@ -1074,6 +1131,9 @@ unmet_bound(a: &Analysis, tr: Bound, t: Type) -> Option[string]
 
     // **A reference whose referent implements the trait** is refused for a reason worth saying, since
     // a member call on the same reference would have reached that implementation.
+    if library_spelling(tr.name) == Some("Hash") && hash_law_breaks(a, t) then
+        return Some(hash_law_refusal(a, t))
+
     val through = referent_shortfall(a, tr, t)
 
     if through.is_some() then return through

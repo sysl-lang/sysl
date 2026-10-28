@@ -20,7 +20,7 @@ were the middle.
 
 ## Index
 
-[`DebugDepth`](#debugdepth) [`esink`](#esink) [`sink`](#sink) [`assert`](#assert) [`assert_eq`](#assert_eq) [`assert_slice_eq`](#assert_slice_eq) [`cpu`](#cpu) [`cpu_count`](#cpu_count) [`debug_address`](#debug_address) [`debug_enter`](#debug_enter) [`debug_leave`](#debug_leave) [`debug_padded`](#debug_padded) [`debug_quoted`](#debug_quoted) [`debug_union`](#debug_union) [`display_bf16`](#display_bf16) [`display_bool`](#display_bool) [`display_char`](#display_char) [`display_digits`](#display_digits) [`display_f128`](#display_f128) [`display_f128_shortest`](#display_f128_shortest) [`display_f16`](#display_f16) [`display_f32`](#display_f32) [`display_f32_shortest`](#display_f32_shortest) [`display_fill`](#display_fill) [`display_int`](#display_int) [`display_pad`](#display_pad) [`display_real`](#display_real) [`display_real_shortest`](#display_real_shortest) [`display_str`](#display_str) [`display_uint`](#display_uint) [`encode_utf8`](#encode_utf8) [`eprints`](#eprints) [`eputbytes`](#eputbytes) [`flush`](#flush) [`hash_bool`](#hash_bool) [`hash_str`](#hash_str) [`hash_u128`](#hash_u128) [`hash_u64`](#hash_u64) [`os`](#os) [`panic`](#panic) [`printb`](#printb) [`printbf16`](#printbf16) [`printc`](#printc) [`printf16`](#printf16) [`printf32`](#printf32) [`printi`](#printi) [`printq`](#printq) [`printr`](#printr) [`prints`](#prints) [`printu`](#printu) [`putbytes`](#putbytes) [`stderr`](#stderr) [`stdout`](#stdout) [`trap`](#trap) [`exit`](#exit) [`Counting`](#counting) [`Cpu`](#cpu-1) [`FormatSpec`](#formatspec) [`Kind`](#kind) [`Option`](#option) [`Os`](#os-1) [`Range`](#range) [`Result`](#result) [`Rounding`](#rounding) [`Stderr`](#stderr-1) [`Stdout`](#stdout-1) [`Add`](#add) [`AnyBits`](#anybits) [`BitAnd`](#bitand) [`BitOr`](#bitor) [`BitXor`](#bitxor) [`Debug`](#debug) [`Display`](#display) [`Div`](#div) [`Drop`](#drop) [`Eq`](#eq) [`Fallible`](#fallible) [`FloatBits`](#floatbits) [`Fn0`](#fn0) [`Fn1`](#fn1) [`Fn2`](#fn2) [`Fn3`](#fn3) [`Fn4`](#fn4) [`From`](#from) [`Hash`](#hash) [`Index`](#index) [`IndexPlace`](#indexplace) [`IndexSet`](#indexset) [`Integer`](#integer) [`Iterate`](#iterate) [`Mul`](#mul) [`Neg`](#neg) [`Not`](#not) [`One`](#one) [`Ord`](#ord) [`Rem`](#rem) [`Shl`](#shl) [`Shr`](#shr) [`Sub`](#sub) [`Walk`](#walk) [`Writer`](#writer) [`Zero`](#zero) [Debug for (..A)](#debug-for-a) [Debug for []T](#debug-for-t) [Debug for [N]T](#debug-for-nt) [Debug for bf16](#debug-for-bf16) [Debug for bool](#debug-for-bool) [Debug for char](#debug-for-char) [Debug for f128](#debug-for-f128) [Debug for f16](#debug-for-f16) [Debug for f32](#debug-for-f32) [Debug for Option[T]](#debug-for-optiont) [Debug for real](#debug-for-real) [Debug for Result[T, E]](#debug-for-resultt-e) [Debug for string](#debug-for-string) [Debug for T](#debug-for-t-1) [Debug for unit](#debug-for-unit) [Display for (..A)](#display-for-a) [Display for []T](#display-for-t) [Display for [N]T](#display-for-nt) [Display for bf16](#display-for-bf16) [Display for bool](#display-for-bool) [Display for char](#display-for-char) [Display for f128](#display-for-f128) [Display for f16](#display-for-f16) [Display for f32](#display-for-f32) [Display for Option[T]](#display-for-optiont) [Display for real](#display-for-real) [Display for Result[T, E]](#display-for-resultt-e) [Display for string](#display-for-string) [Display for T](#display-for-t-1) [Display for unit](#display-for-unit) [Eq for (..A)](#eq-for-a) [Eq for []T](#eq-for-t) [Eq for [N]T](#eq-for-nt) [Eq for Option[T]](#eq-for-optiont) [Eq for Result[T, E]](#eq-for-resultt-e) [Eq for unit](#eq-for-unit) [Fallible for Counting](#fallible-for-counting) [Fallible for Stderr](#fallible-for-stderr) [Fallible for Stdout](#fallible-for-stdout) [FloatBits for bf16](#floatbits-for-bf16) [FloatBits for f128](#floatbits-for-f128) [FloatBits for f16](#floatbits-for-f16) [FloatBits for f32](#floatbits-for-f32) [FloatBits for real](#floatbits-for-real) [Hash for (..A)](#hash-for-a) [Hash for [N]T](#hash-for-nt) [Hash for bool](#hash-for-bool) [Hash for char](#hash-for-char) [Hash for string](#hash-for-string) [Hash for T](#hash-for-t) [Hash for unit](#hash-for-unit) [Iterate for Range[T]](#iterate-for-ranget) [One for bf16](#one-for-bf16) [One for f16](#one-for-f16) [One for f32](#one-for-f32) [One for real](#one-for-real) [Ord for (..A)](#ord-for-a) [Ord for []T](#ord-for-t) [Ord for [N]T](#ord-for-nt) [Ord for unit](#ord-for-unit) [Writer for Counting](#writer-for-counting) [Writer for Stderr](#writer-for-stderr) [Writer for Stdout](#writer-for-stdout) [Zero for bf16](#zero-for-bf16) [Zero for f16](#zero-for-f16) [Zero for f32](#zero-for-f32) [Zero for real](#zero-for-real)
+[`DebugDepth`](#debugdepth) [`esink`](#esink) [`sink`](#sink) [`assert`](#assert) [`assert_eq`](#assert_eq) [`assert_slice_eq`](#assert_slice_eq) [`cpu`](#cpu) [`cpu_count`](#cpu_count) [`debug_address`](#debug_address) [`debug_enter`](#debug_enter) [`debug_leave`](#debug_leave) [`debug_padded`](#debug_padded) [`debug_quoted`](#debug_quoted) [`debug_union`](#debug_union) [`display_bf16`](#display_bf16) [`display_bool`](#display_bool) [`display_char`](#display_char) [`display_digits`](#display_digits) [`display_f128`](#display_f128) [`display_f128_shortest`](#display_f128_shortest) [`display_f16`](#display_f16) [`display_f32`](#display_f32) [`display_f32_shortest`](#display_f32_shortest) [`display_fill`](#display_fill) [`display_int`](#display_int) [`display_pad`](#display_pad) [`display_real`](#display_real) [`display_real_shortest`](#display_real_shortest) [`display_str`](#display_str) [`display_uint`](#display_uint) [`encode_utf8`](#encode_utf8) [`eprints`](#eprints) [`eputbytes`](#eputbytes) [`flush`](#flush) [`hash_bool`](#hash_bool) [`hash_str`](#hash_str) [`hash_u128`](#hash_u128) [`hash_u64`](#hash_u64) [`os`](#os) [`panic`](#panic) [`printb`](#printb) [`printbf16`](#printbf16) [`printc`](#printc) [`printf16`](#printf16) [`printf32`](#printf32) [`printi`](#printi) [`printq`](#printq) [`printr`](#printr) [`prints`](#prints) [`printu`](#printu) [`putbytes`](#putbytes) [`stderr`](#stderr) [`stdout`](#stdout) [`trap`](#trap) [`exit`](#exit) [`ByAddress`](#byaddress) [`Counting`](#counting) [`Cpu`](#cpu-1) [`FormatSpec`](#formatspec) [`Kind`](#kind) [`Option`](#option) [`Os`](#os-1) [`Range`](#range) [`Result`](#result) [`Rounding`](#rounding) [`Stderr`](#stderr-1) [`Stdout`](#stdout-1) [`Add`](#add) [`AnyBits`](#anybits) [`BitAnd`](#bitand) [`BitOr`](#bitor) [`BitXor`](#bitxor) [`Debug`](#debug) [`Display`](#display) [`Div`](#div) [`Drop`](#drop) [`Eq`](#eq) [`Fallible`](#fallible) [`FloatBits`](#floatbits) [`Fn0`](#fn0) [`Fn1`](#fn1) [`Fn2`](#fn2) [`Fn3`](#fn3) [`Fn4`](#fn4) [`From`](#from) [`Hash`](#hash) [`Index`](#index) [`IndexPlace`](#indexplace) [`IndexSet`](#indexset) [`Integer`](#integer) [`Iterate`](#iterate) [`Mul`](#mul) [`Neg`](#neg) [`Not`](#not) [`One`](#one) [`Ord`](#ord) [`Rem`](#rem) [`Shl`](#shl) [`Shr`](#shr) [`Sub`](#sub) [`Walk`](#walk) [`Writer`](#writer) [`Zero`](#zero) [Debug for (..A)](#debug-for-a) [Debug for []T](#debug-for-t) [Debug for [N]T](#debug-for-nt) [Debug for bf16](#debug-for-bf16) [Debug for bool](#debug-for-bool) [Debug for char](#debug-for-char) [Debug for f128](#debug-for-f128) [Debug for f16](#debug-for-f16) [Debug for f32](#debug-for-f32) [Debug for Option[T]](#debug-for-optiont) [Debug for real](#debug-for-real) [Debug for Result[T, E]](#debug-for-resultt-e) [Debug for string](#debug-for-string) [Debug for T](#debug-for-t-1) [Debug for unit](#debug-for-unit) [Display for (..A)](#display-for-a) [Display for []T](#display-for-t) [Display for [N]T](#display-for-nt) [Display for bf16](#display-for-bf16) [Display for bool](#display-for-bool) [Display for char](#display-for-char) [Display for f128](#display-for-f128) [Display for f16](#display-for-f16) [Display for f32](#display-for-f32) [Display for Option[T]](#display-for-optiont) [Display for real](#display-for-real) [Display for Result[T, E]](#display-for-resultt-e) [Display for string](#display-for-string) [Display for T](#display-for-t-1) [Display for unit](#display-for-unit) [Eq for (..A)](#eq-for-a) [Eq for []T](#eq-for-t) [Eq for [N]T](#eq-for-nt) [Eq for ByAddress[T]](#eq-for-byaddresst) [Eq for Option[T]](#eq-for-optiont) [Eq for Result[T, E]](#eq-for-resultt-e) [Eq for unit](#eq-for-unit) [Fallible for Counting](#fallible-for-counting) [Fallible for Stderr](#fallible-for-stderr) [Fallible for Stdout](#fallible-for-stdout) [FloatBits for bf16](#floatbits-for-bf16) [FloatBits for f128](#floatbits-for-f128) [FloatBits for f16](#floatbits-for-f16) [FloatBits for f32](#floatbits-for-f32) [FloatBits for real](#floatbits-for-real) [Hash for (..A)](#hash-for-a) [Hash for [N]T](#hash-for-nt) [Hash for bool](#hash-for-bool) [Hash for ByAddress[T]](#hash-for-byaddresst) [Hash for char](#hash-for-char) [Hash for string](#hash-for-string) [Hash for T](#hash-for-t) [Hash for unit](#hash-for-unit) [Iterate for Range[T]](#iterate-for-ranget) [One for bf16](#one-for-bf16) [One for f16](#one-for-f16) [One for f32](#one-for-f32) [One for real](#one-for-real) [Ord for (..A)](#ord-for-a) [Ord for []T](#ord-for-t) [Ord for [N]T](#ord-for-nt) [Ord for unit](#ord-for-unit) [Writer for Counting](#writer-for-counting) [Writer for Stderr](#writer-for-stderr) [Writer for Stdout](#writer-for-stdout) [Zero for bf16](#zero-for-bf16) [Zero for f16](#zero-for-f16) [Zero for f32](#zero-for-f32) [Zero for real](#zero-for-real)
 
 ## Constants
 
@@ -620,6 +620,25 @@ has and the linker knows nothing about sysl's modules. So this is keyed under `s
 other name here while going on resolving to `exit`.
 
 ## Types
+
+### `ByAddress`
+
+```sysl
+struct ByAddress[T]
+    target: &T
+```
+
+A reference keyed by the object it names rather than by its value. A `&T` compares and
+hashes as its referent does wherever `T` defines `Eq` and `Hash` (`reference/memory.md §
+References compare through their referent`), which is what a table of values wants and not what a
+table of *objects* does -- a visited set over a graph, a cache per node. Wrapping the reference
+keys by its identity instead: two of these are equal exactly when they hold one object, whatever
+`T` says, and they hash by the address, so the two always agree.
+
+```
+var seen: Set[ByAddress[Node]] = set()
+seen.add(ByAddress(node))
+```
 
 ### `Counting`
 
@@ -1470,7 +1489,7 @@ bounded buffer, a device that goes away -- says so once, and nothing about the l
 
 | Member | Signature | Description |
 |---|---|---|
-| `write` | `write(*self, bytes: []const u8)` | *The bytes are borrowed for the call and may not be kept**, which is what keeps rendering allocation-free: a renderer writes into a buffer on its own stack and passes a slice of it, and without the promise every such call would put that buffer on the heap. |
+| `write` | `write(*self, bytes: []const u8)` | *The bytes are borrowed for the call and may not be kept**, which is what keeps rendering allocation-free: a renderer writes into a buffer on its own stack and passes a slice of it, and without that every such call would put the buffer on the heap. |
 
 ### `Zero`
 
@@ -1758,6 +1777,12 @@ Every array of an equatable element, at every length -- the whole-array view is 
 slice would have walked, so this is a delegation rather than a second copy of the loop, exactly as
 `Display for [N]T` delegates to `Display for []T`.
 
+### Eq for ByAddress[T]
+
+```sysl
+impl[T] Eq for ByAddress[T]
+```
+
 ### Eq for Option[T]
 
 ```sysl
@@ -1865,6 +1890,12 @@ built from the elements.
 
 ```sysl
 impl Hash for bool
+```
+
+### Hash for ByAddress[T]
+
+```sysl
+impl[T] Hash for ByAddress[T]
 ```
 
 ### Hash for char

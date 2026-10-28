@@ -891,8 +891,10 @@ main()
 is refused a bound its referent meets where that would make the body do something the same call on
 the reference does not, and the refusal says which:
 
-- **`Eq` and `Hash` are the reference's own identity** ([memory]({{< ref "memory" >}})), never the
-  referent's, and so is a trait that requires either;
+- **through a `*T`, `Eq` and `Hash`**, which a pointer meets by its address
+  ([memory]({{< ref "memory" >}})), and a trait that requires either. A `&T` meets both through its
+  referent where the referent has them and by its identity where it does not, so a trait requiring
+  either is met through a `&T` like any other;
 - **an operator's trait** — `Ord`, `Add` and the rest — since `a < b` and `a + b` do not see through a
   reference;
 - **a member naming `Self` away from its receiver**, such as `merge(self, other: Self)`, since `Self`
