@@ -1477,12 +1477,33 @@ quantifier_expr(cx: &Analyzer, span: Span, universal: bool, name: string, iter: 
         return cx.err(span, s"'$word' quantifies over an integer range, written 'lo..<hi' or " +
                       "'lo..hi'")
 
+    val lo = bounds.unwrap().0
+    val hi = bounds.unwrap().1
+    val inclusive = bounds.unwrap().2
+
+    if !counted_open(lo, hi) then
+        return counted_quantifier(cx, span, universal, name, lo, hi, inclusive, pred, None, None)
+
+    // Both bounds bare literals: the variable waits for its first fixing use, as a counted `for`'s does.
+    val at = iter.span.start
+
+    counted_first_use_read(cx, at, fixed ->
+        counted_quantifier(cx, span, universal, name, lo, hi, inclusive, pred, fixed,
+                           if fixed.is_none() then Some(at) else None))
+end quantifier_expr
+
+// `for all i in lo..hi do pred`, its bounds read at `fixed` where a use fixed their type. `open` is
+// where the range starts when its variable is one waiting for that use.
+private counted_quantifier(cx: &Analyzer, span: Span, universal: bool, name: string, lo: Expr,
+                           hi: Expr, inclusive: bool, pred: Expr, fixed: Option[Type],
+                           open: Option[usize]) -> TExpr
+    val word = if universal then "for all" else "for some"
     var ends: Buf[Expr] = buf()
 
-    ends.push(bounds.unwrap().0)
-    ends.push(bounds.unwrap().1)
+    ends.push(lo)
+    ends.push(hi)
 
-    val ts = analyze_operands(cx, ends, None, true)
+    val ts = analyze_operands(cx, ends, fixed, true)
     val tlo = ts.at(0)
     val thi = ts.at(1)
 
@@ -1495,11 +1516,14 @@ quantifier_expr(cx: &Analyzer, span: Span, universal: bool, name: string, iter: 
     cx.enter()
 
     val u = cx.bind(name, vty, name_after_keyword(cx, span.start, name))
+
+    if open.is_some() then open_counted(cx, open.unwrap(), lo, u)
+
     val tp = analyze_bool(cx, pred, span)
 
     cx.leave()
-    TExpr(span, TQuantifier(universal, u, vty, tlo, thi, bounds.unwrap().2, tp))
-end quantifier_expr
+    TExpr(span, TQuantifier(universal, u, vty, tlo, thi, inclusive, tp))
+end counted_quantifier
 
 // `for const i in 0..<A.len` -- the loop the compiler **unrolls**.
 //
