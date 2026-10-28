@@ -2467,9 +2467,23 @@ private variant_solved(cx: &Analyzer, span: Span, named_at: Span, name: string,
 
             if found.is_none() then return VsNone
 
-            variant_instance(cx, span, named_at, key, decl.unwrap().scope, ed, found.unwrap(), args)
+            variant_instance(cx, span, named_at, key, decl.unwrap().scope, ed, found.unwrap(), args,
+                             seeded_for(cx, span, key))
         _ -> VsNone
 end variant_solved
+
+// What the parameter this variant stands at already fixed of its enum, where it stands at one: the
+// seed names the argument by its span, so a variant written inside the argument gets nothing.
+private seeded_for(cx: &Analyzer, span: Span, key: string) -> Buf[Binding]
+    if cx.variant_seed.is_none() then return no_bindings()
+
+    val seed = cx.variant_seed.unwrap()
+
+    if seed.key != key || seed.at.start != span.start || seed.at.end != span.end then
+        return no_bindings()
+
+    seed.known
+end seeded_for
 
 private variant_decl_named(ed: EnumDecl, name: string) -> Option[EnumVariantDecl]
     for i in 0..<ed.variants.len()
@@ -2479,7 +2493,8 @@ private variant_decl_named(ed: EnumDecl, name: string) -> Option[EnumVariantDecl
 end variant_decl_named
 
 private variant_instance(cx: &Analyzer, span: Span, named_at: Span, key: string, home: Scope,
-                         ed: EnumDecl, vd: EnumVariantDecl, args: Buf[Expr]) -> VariantSolve
+                         ed: EnumDecl, vd: EnumVariantDecl, args: Buf[Expr],
+                         known: Buf[Binding]) -> VariantSolve
     if args.len() != vd.fields.len() then return VsNone
 
     var field_refs: Buf[TypeRef] = buf()
@@ -2498,7 +2513,7 @@ private variant_instance(cx: &Analyzer, span: Span, named_at: Span, key: string,
 
     val mark = cx.an.complaints()
     val targs = solve(cx.an, home, cx.scope, span, key, ed.tparams, field_refs, prov, None, None, soft,
-                      ed.bounds, buf())
+                      ed.bounds, known)
 
     cx.an.restore_complaints(mark)
 
@@ -2577,7 +2592,7 @@ private qualified_variant_solved(cx: &Analyzer, span: Span, named_at: Span, rece
             // The name in front of the dot has said which enum, so what could not be settled is
             // this enum's to say.
             variant_instance(cx, span, named_at, key.unwrap(), decl.unwrap().scope, ed,
-                             found.unwrap(), args)
+                             found.unwrap(), args, seeded_for(cx, span, key.unwrap()))
         _ -> VsNone
 end qualified_variant_solved
 
@@ -2633,7 +2648,7 @@ private module_variant_solved(cx: &Analyzer, span: Span, named_at: Span, receive
                 return VsFound(wanted.unwrap().0, wanted.unwrap().1)
 
             variant_instance(cx, span, named_at, key.unwrap(), decl.unwrap().scope, ed,
-                             found.unwrap(), args)
+                             found.unwrap(), args, seeded_for(cx, span, key.unwrap()))
         _ -> VsNone
 end module_variant_solved
 

@@ -877,6 +877,8 @@ provisional_of(cx: &Analyzer, span: Span, scope: Scope, tparams: Buf[string], pa
                     tys.push(Unknown)
                     soft.push(true)
 
+    seeded_readings(cx, span, scope, tparams, params, slots, written, held, known, needs, &tys, &soft)
+
     if held.is_empty() then return Provisional(tys, soft, kept, expected)
 
     // What the first pass settles, in the three tiers `solve` reads: what carries a type of its own
@@ -977,9 +979,15 @@ provisional_of(cx: &Analyzer, span: Span, scope: Scope, tparams: Buf[string], pa
         for i in 0..<ready.len()
             val at = ready.at(i)
             val reader = arg_reader(cx, span, scope, slots.at(at).is_none())
+            val outer_yield = reader.yield_seed
+
+            reader.yield_seed = yield_seed_of(cx, scope, param_refs.at(at), tparams, bounds, sub, needs)
+
             val want = settled_yield(reader, scope, written.at(at).unwrap(), wants.at(i),
                                      param_refs.at(at), tparams, bounds, sub)
             val t = type_expr(reader, written.at(at).unwrap(), Some(want))
+
+            reader.yield_seed = outer_yield
 
             kept.set(at, Some(t))
             tys.set(at, texpr_type(t))
@@ -1267,6 +1275,106 @@ any_ref_mentions(ts: Buf[TypeRef], names: Buf[string]) -> bool
 
     false
 end any_ref_mentions
+
+// **A refused bare reading is tried once more, told what its parameter already knows.** In
+// `keep[T](o: Result[T, E])` called as `keep(Ok(1))`, the `Ok` alone settles the enum's `T` and has
+// nothing to say what its `E` is, so the bare reading refuses it and nothing settles the call's `T`.
+// But the parameter fixes `E`: each of its arguments that names no parameter still open is resolved and
+// handed to the variant as its enum's own parameter (`VariantSeed`), the way rustc reads an argument
+// against the parameter's known parts. What is still open stays open -- `keep[T, F](o: Result[T, F])`
+// with `keep(Ok(1))` is refused as it was.
+private seeded_readings(cx: &Analyzer, span: Span, scope: Scope, tparams: Buf[string],
+                        params: Buf[Param], slots: Buf[Option[Expr]], written: Buf[Option[Expr]],
+                        held: Buf[usize], known: Buf[Binding], needs: Buf[string], tys: *Buf[Type],
+                        soft: *Buf[bool])
+    var sub: Buf[Binding] = buf()
+
+    for item in known
+        sub.push(item)
+
+    for i in 0..<params.len()
+        if i < tys.len() && !soft.at(i) then
+            unify(cx.an, scope, params.at(i).typ, tys.at(i), tparams, &sub)
+
+    val open = unsolved_names(tparams, known)
+
+    for i in 0..<params.len()
+        val e = written.at(i)
+        val p = params.at(i).typ
+
+        if e.is_some() && tys.at(i) == Unknown && !holds_index(held, i) && ref_mentions(p, open)
+            val seed = seed_of(cx, scope, p, tparams, sub, needs, anchor_of(written_arg(e.unwrap())))
+
+            if seed.is_some()
+                val inner = arg_reader(cx, span, scope, slots.at(i).is_none())
+                val outer = inner.variant_seed
+
+                inner.variant_seed = seed
+                val read = sandboxed_attempt(inner, e.unwrap())
+                inner.variant_seed = outer
+
+                if read.is_some()
+                    tys.set(i, texpr_type(read.unwrap()))
+                    soft.set(i, adaptable(e.unwrap(), read.unwrap()) || literal_valued(cx, e.unwrap()))
+            end if
+        end if
+end seeded_readings
+
+private holds_index(xs: Buf[usize], at: usize) -> bool
+    for item in xs
+        if item == at then return true
+
+    false
+end holds_index
+
+// What a parameter written as a generic enum fixes of it: the enum's own parameters whose written
+// arguments name nothing still open, resolved. Nothing where the parameter is no generic enum, or
+// fixes none of it.
+private seed_of(cx: &Analyzer, scope: Scope, written: TypeRef, tparams: Buf[string], sub: Buf[Binding],
+                needs: Buf[string], at: Span) -> Option[VariantSeed]
+    val applied = *written.kind match
+        NamedType(n, args) -> Some((n, args))
+        _ -> None
+
+    if applied.is_none() then return None
+
+    val name = applied.unwrap().0
+    val args = applied.unwrap().1
+    val key = lookup_type_key(cx.an, scope, name)
+
+    if key.is_none() then return None
+
+    val decl = cx.an.tables.types.get(key.unwrap())
+
+    if decl.is_none() then return None
+
+    decl.unwrap().kind match
+        EnumOf(ed) ->
+            if ed.tparams.is_empty() || ed.tparams.len() != args.len() then return None
+
+            val open = unsolved_names(tparams, sub)
+            var fixed: Buf[Binding] = buf()
+
+            for k in 0..<args.len()
+                if !ref_mentions(args.at(k), open)
+                    val t = signature_type(cx.an, needs, scope, args.at(k), sub)
+
+                    fixed.push(Binding(ed.tparams.at(k), t))
+
+            if fixed.is_empty() then None else Some(VariantSeed(at, key.unwrap(), fixed))
+        _ -> None
+end seed_of
+
+// The same for what a callable standing at `ptype` yields, where the shape states a result: the
+// closure's body places it on the value its last line gives.
+private yield_seed_of(cx: &Analyzer, scope: Scope, ptype: TypeRef, tparams: Buf[string],
+                      bounds: Buf[NamedBounds], sub: Buf[Binding], needs: Buf[string]) -> Option[VariantSeed]
+    val shape = call_shape(cx, scope, ptype, tparams, bounds)
+
+    if shape.is_none() || shape.unwrap().2.is_none() then return None
+
+    seed_of(cx, scope, shape.unwrap().2.unwrap(), tparams, sub, needs, span_zero())
+end yield_seed_of
 
 // -- the arguments a first pass holds back -------------------------------------------------------
 
