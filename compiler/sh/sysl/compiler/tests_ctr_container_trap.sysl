@@ -1,0 +1,355 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{is_file, make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.{capture, Status}
+import sysl.testing.skip
+import sysl.text.split
+
+// An index past a library container's count stops the program the way one past an array's length
+// does: the report goes through `sysl_bounds_fail` -- the same form, the same values, the same
+// override -- and the program then traps, with SIGTRAP's status (133 under a shell) rather than a
+// panic's exit 1. `Buf`, `Frozen`, `Deque` and `Ring` all report through `sysl.index_past` (and an
+// insertion through `insert_past`), whose location is null: a member cannot see the line that
+// called it, so the message ends at the values.
+//
+// Axes: each container x subscript read, subscript write, compound (a `Buf`'s only -- the others
+// have no `IndexPlace`, and `+=` through `Index` is refused, pinned below), `at`, `set`, `insert`,
+// `remove` where the container has them; an empty and an unassigned container; an index equal to
+// the count; a negative index (the compiler's own check, with a location); a body generic over
+// `Index`; an override; `should_trap` under the runner; and a bare-metal build. Every program runs at
+// `-O0` and at the default level, since an optimizer that folded the check must still make the call.
+
+private ctr_ready() -> bool = std_root().is_ok() && clang_available()
+
+// The tree built at `level` and run: its status, what it printed, and its standard error.
+private ctr_run(files: []const (string, string), level: string) -> (Status, string, string)
+    val root = make_temp_dir("sysl-ctr").unwrap()
+
+    for i in 0..<files.len
+        val at = s"$root/${files[i].0}"
+
+        make_dir_all(parent_of(at).unwrap()).unwrap()
+        write_text(at, files[i].1).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, level, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (Status.Exited(-1), "", failure_text(why))
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> (Status.Exited(-1), "", "the program that was built could not be run")
+        Ok(out) -> (out.status, out.text, out.err.unwrap_or(""))
+end ctr_run
+
+// At each level, the program prints `printed`, then stops on SIGTRAP having written exactly `said`
+// to standard error.
+private ctr_traps_at(levels: []const string, files: []const (string, string), printed: string,
+                     said: string)
+    if !ctr_ready() then return
+
+    for level in levels
+        val (state, out, err) = ctr_run(files, level)
+
+        assert_eq(err, said)
+        assert_eq(out, printed)
+        assert(state == Status.Signalled(5), s"-O$level stopped with $state, having printed '$out'")
+end ctr_traps_at
+
+// At the default level only: every container's first cell is run at `-O0` as well (`ctr_both`),
+// and the rest go through the one path those have shown both levels take.
+private ctr_traps(files: []const (string, string), printed: string, said: string) =
+    ctr_traps_at([DefaultOptimization], files, printed, said)
+
+private ctr_text(body: string) -> string =
+    "import sysl.buf.{Buf, buf}\nimport sysl.container.{Deque, deque}\n" +
+    "import sysl.container.ring.{Ring, ring}\n\n" + body
+
+// A one-file program, with the four containers imported, that prints `printed` and then traps
+// saying `said`.
+private ctr_main(body: string, printed: string, said: string)
+    var files: [1](string, string) = [("main.sysl", ctr_text(body))]
+
+    ctr_traps(files[..], printed, said)
+end ctr_main
+
+// The same, at `-O0` and at the default level.
+private ctr_both(body: string, printed: string, said: string)
+    var files: [1](string, string) = [("main.sysl", ctr_text(body))]
+
+    ctr_traps_at(["0", DefaultOptimization], files[..], printed, said)
+end ctr_both
+
+// A struct holding `field`, laid in memory `calloc` zeroed, so the container in it was never
+// assigned; the body reads it as `h.items`.
+private ctr_zeroed(field: string, body: string) -> string =
+    "import sysl.raw.ptr_cast\n\nextern \"calloc\" c_calloc(n: usize, size: usize) -> *u8\n\n" +
+    s"struct Holder\n    items: $field\n\nval h: *Holder = ptr_cast(c_calloc(1, sizeof(Holder)))\n" + body
+
+private val CtrBuf: string = "var b: Buf[int] = buf()\nb.push(10)\nb.push(20)\nb.push(30)\nval i: usize = 5\n"
+
+private val CtrDeque: string =
+    "var d: Deque[int] = deque()\nd.push_back(10)\nd.push_back(20)\nd.push_back(30)\nval i: usize = 5\n"
+
+// A ring of four slots, wrapped so its run does not start at slot zero, holding 10, 20, 30.
+private val CtrRing: string =
+    "var slots: [4]int = [0; 4]\nvar r = ring(slots[..])\nr.push_back(0)\nr.push_back(0)\n" +
+    "r.pop_front()\nr.pop_front()\nr.push_back(10)\nr.push_back(20)\nr.push_back(30)\nval i: usize = 5\n"
+
+private val CtrFrozen: string =
+    "var b: Buf[int] = buf()\nb.push(10)\nb.push(20)\nb.push(30)\nval f = b.freeze()\nval i: usize = 5\n"
+
+private val CtrPast: string = "index 5 out of bounds for length 3\n"
+
+// -- Buf --------------------------------------------------------------------------------------------
+
+@test("a Buf's subscript read past the count traps with an array's report")
+ctr_buf_read()
+    ctr_both(CtrBuf + "print(b[2])\nprint(b[i])\n", "30\n", CtrPast)
+
+@test("a Buf's subscript write past the count traps")
+ctr_buf_write()
+    ctr_main(CtrBuf + "b[2] = 7\nprint(b[2])\nb[i] = 7\nprint(b[2])\n", "7\n", CtrPast)
+
+@test("a Buf's compound assignment past the count traps")
+ctr_buf_compound()
+    ctr_main(CtrBuf + "b[2] += 1\nprint(b[2])\nb[i] += 1\nprint(b[2])\n", "31\n", CtrPast)
+
+@test("a Buf's at and set past the count trap")
+ctr_buf_at_and_set()
+    ctr_main(CtrBuf + "print(b.at(0))\nprint(b.at(i))\n", "10\n", CtrPast)
+    ctr_main(CtrBuf + "b.set(0, 1)\nprint(b.at(0))\nb.set(i, 1)\n", "1\n", CtrPast)
+
+@test("a Buf's insert at the count is a push, and past it traps in its own form")
+ctr_buf_insert()
+    ctr_main(CtrBuf + "b.insert(3, 40)\nprint(b.len())\nb.insert(i, 50)\n", "4\n",
+             "insertion index 5 is past length 4\n")
+
+@test("a Buf's remove at the count traps")
+ctr_buf_remove()
+    ctr_main(CtrBuf + "print(b.remove(2))\nprint(b.remove(2))\n", "30\n",
+             "index 2 out of bounds for length 2\n")
+
+@test("an index equal to a Buf's count traps")
+ctr_buf_at_the_count()
+    ctr_main(CtrBuf + "print(b[3])\n", "", "index 3 out of bounds for length 3\n")
+
+@test("an empty Buf traps on index zero, as an empty array does")
+ctr_buf_empty()
+    ctr_main("var b: Buf[int] = buf()\nprint(b.len())\nprint(b[0])\n", "0\n",
+             "index 0 out of bounds for length 0\n")
+
+@test("a Buf that was never given storage reads as empty, and traps the same way")
+ctr_buf_unassigned()
+    ctr_main(ctr_zeroed("Buf[int]", "print(h.items.len())\nprint(h.items[1])\n"), "0\n",
+             "index 1 out of bounds for length 0\n")
+    ctr_main(ctr_zeroed("Buf[int]", "print(h.items.remove(0))\n"), "", "index 0 out of bounds for length 0\n")
+
+@test("a negative index on a Buf is the compiler's check, and names where it was written")
+ctr_buf_negative()
+    ctr_main(CtrBuf + "val k = -1\nprint(b[k])\n", "", "index -1 is negative (main.sysl:11:9)\n")
+
+// -- Frozen -----------------------------------------------------------------------------------------
+
+@test("a frozen buffer's subscript and at past the length trap")
+ctr_frozen()
+    ctr_both(CtrFrozen + "print(f[2])\nprint(f[i])\n", "30\n", CtrPast)
+    ctr_main(CtrFrozen + "print(f.at(1))\nprint(f.at(3))\n", "20\n", "index 3 out of bounds for length 3\n")
+
+@test("an empty frozen buffer traps on index zero")
+ctr_frozen_empty()
+    ctr_main("var b: Buf[int] = buf()\nval f = b.freeze()\nprint(f.len())\nprint(f[0])\n", "0\n",
+             "index 0 out of bounds for length 0\n")
+
+// -- Deque ------------------------------------------------------------------------------------------
+
+@test("a Deque's subscript read and write past the count trap")
+ctr_deque_subscript()
+    ctr_both(CtrDeque + "print(d[2])\nprint(d[i])\n", "30\n", CtrPast)
+    ctr_main(CtrDeque + "d[0] = 1\nprint(d[0])\nd[i] = 1\n", "1\n", CtrPast)
+
+@test("a Deque's at and set past the count trap, the count itself included")
+ctr_deque_at_and_set()
+    ctr_main(CtrDeque + "print(d.at(3))\n", "", "index 3 out of bounds for length 3\n")
+    ctr_main(CtrDeque + "d.set(i, 1)\n", "", CtrPast)
+
+@test("an empty Deque and one never given storage trap on index zero")
+ctr_deque_empty()
+    ctr_main("var d: Deque[int] = deque()\nprint(d[0])\n", "", "index 0 out of bounds for length 0\n")
+    ctr_main(ctr_zeroed("Deque[int]", "h.items.set(2, 1)\n"), "", "index 2 out of bounds for length 0\n")
+
+// -- Ring -------------------------------------------------------------------------------------------
+
+@test("a wrapped Ring's subscript read and write past the count trap")
+ctr_ring_subscript()
+    ctr_both(CtrRing + "print(r[2])\nprint(r[i])\n", "30\n", CtrPast)
+    ctr_main(CtrRing + "r[0] = 1\nprint(r[0])\nr[3] = 1\n", "1\n", "index 3 out of bounds for length 3\n")
+
+@test("a Ring's at and set past the count trap")
+ctr_ring_at_and_set()
+    ctr_main(CtrRing + "print(r.at(i))\n", "", CtrPast)
+    ctr_main(CtrRing + "r.set(i, 1)\n", "", CtrPast)
+
+@test("an empty Ring traps on index zero")
+ctr_ring_empty()
+    ctr_main("var slots: [2]int = [0; 2]\nvar r = ring(slots[..])\nprint(r[0])\n", "",
+             "index 0 out of bounds for length 0\n")
+
+@test("a compound assignment on a Deque or a Ring is still refused, as it is through any Index")
+ctr_compound_refused()
+    if !ctr_ready() then return
+
+    for body in [CtrDeque + "d[0] += 1\n", CtrRing + "r[0] += 1\n"]
+        val text = "import sysl.container.{Deque, deque}\nimport sysl.container.ring.{Ring, ring}\n\n" + body
+        var files: [1](string, string) = [("main.sysl", text)]
+        val (state, _, err) = ctr_run(files[..], "0")
+
+        assert(err.contains("'+=' on an element read through 'sysl.Index' would evaluate the receiver and the index twice"),
+               err)
+        assert(state == Status.Exited(-1), s"$state")
+end ctr_compound_refused
+
+// -- generic over Index -----------------------------------------------------------------------------
+
+// A frozen buffer is held as `&sync Frozen[T]`, and a type parameter bound to that reference is not
+// bound to something implementing `Index` -- the impl is on `Frozen[T]` -- so it has no cell here.
+@test("a body generic over Index traps on each container, as it does on an array")
+ctr_generic_index()
+    val get = "pick[C: Index[usize, int]](c: C, i: usize) -> int = c[i]\n\n"
+
+    ctr_main(get + CtrBuf + "print(pick(b, 1))\nprint(pick(b, i))\n", "20\n", CtrPast)
+    ctr_main(get + CtrDeque + "print(pick(d, 1))\nprint(pick(d, i))\n", "20\n", CtrPast)
+    ctr_main(get + CtrRing + "print(pick(r, 1))\nprint(pick(r, i))\n", "20\n", CtrPast)
+end ctr_generic_index
+
+// -- the override -----------------------------------------------------------------------------------
+
+private val CtrReport: string =
+    "module report\n\n@export(\"sysl_bounds_fail\")\n" +
+    "on_bounds(kind: u32, a: usize, b: usize, n: usize, at: *u8)\n" +
+    "    val place = if usize(at) == 0 then \"-\" else \"located\"\n\n" +
+    "    eprints(s\"override $kind $a $b $n $place\\n\")\n"
+
+@test("an exported sysl_bounds_fail is handed every container's failure, with no location, and the trap follows")
+ctr_override()
+    if !ctr_ready() then return
+
+    val heads = "import report\nimport sysl.buf.{Buf, buf}\nimport sysl.container.{Deque, deque}\n" +
+        "import sysl.container.ring.{Ring, ring}\n\n"
+    val cases: [6](string, string) = [
+        (CtrBuf + "print(b[i])\n", "override 0 5 0 3 -\n"),
+        (CtrBuf + "b.insert(i, 1)\n", "override 14 5 0 3 -\n"),
+        (CtrFrozen + "print(f[i])\n", "override 0 5 0 3 -\n"),
+        (CtrDeque + "d[i] = 1\n", "override 0 5 0 3 -\n"),
+        (CtrRing + "print(r.at(i))\n", "override 0 5 0 3 -\n"),
+        ("var b: Buf[int] = buf()\nval k = -1\nprint(b[k])\n", "override 269 18446744073709551615 0 0 located\n")]
+
+    for c in cases
+        var files: [2](string, string) = [("main.sysl", heads + c.0), ("report/report.sysl", CtrReport)]
+
+        ctr_traps(files[..], "", c.1)
+end ctr_override
+
+@test("an override that is in the same module as the container's use still receives the report")
+ctr_override_same_module()
+    val text = "import sysl.buf.{Buf, buf}\n\n@export(\"sysl_bounds_fail\")\n" +
+        "on_bounds(kind: u32, a: usize, b: usize, n: usize, at: *u8)\n" +
+        "    eprints(s\"same $kind $a $n\\n\")\n\n" + CtrBuf + "print(b[i])\n"
+    var files: [1](string, string) = [("main.sysl", text)]
+
+    ctr_traps(files[..], "", "same 0 5 3\n")
+end ctr_override_same_module
+
+// -- under the test runner --------------------------------------------------------------------------
+
+@test("should_trap passes on a container index past the count, and can ask for the message")
+ctr_should_trap()
+    if !ctr_ready() then return
+
+    val root = make_temp_dir("sysl-ctr").unwrap()
+
+    write_text(s"$root/main.sysl",
+               "import sysl.buf.{Buf, buf}\n\n@test(should_trap)\nplain()\n    var b: Buf[int] = buf()\n\n" +
+               "    print(b[3])\n\n@test(should_trap: \"index 3 out of bounds for length 1\")\nsaying()\n" +
+               "    var b: Buf[int] = buf()\n\n    b.push(1)\n    print(b[3])\n").unwrap()
+
+    val build = test_build_of(root, None) match
+        Err(refusal) ->
+            remove_dir_all(root).unwrap_or(())
+            assert(false, failure_text(refusal))
+            return
+        Ok(made) -> made
+
+    val exe = build_test_binary(root, build, None, DefaultOptimization) match
+        Err(refusal) ->
+            remove_dir_all(root).unwrap_or(())
+            assert(false, refusal.message)
+            return
+        Ok(built) -> built
+
+    val ran = run_selected(exe, build.tests, TestOptions(None, false, 1, buf()), 0, piece -> ())
+
+    discard_test_binary(exe)
+    remove_dir_all(root).unwrap_or(())
+    assert_eq(ran.len(), 2)
+
+    for item in ran
+        assert(item.passed(), item.detail.unwrap_or(""))
+end ctr_should_trap
+
+// -- bare metal -------------------------------------------------------------------------------------
+
+private val CtrNm: string = "/opt/homebrew/opt/llvm/bin/llvm-nm"
+
+@test("on a bare-metal target a Ring's index past the count reports through the weak default and traps, linking nothing more")
+ctr_bare_metal()
+    if !is_file(CtrNm) then skip(s"there is no llvm-nm at $CtrNm to read the object")
+
+    val t = target_named("thumb-freestanding-softfp").unwrap()
+    val cc = find_backend_clang(t) match
+        Err(why) ->
+            skip(why)
+            return
+        Ok(found) -> found
+
+    val dir = make_temp_dir("sysl-ctr").unwrap()
+
+    write_text(s"$dir/main.sysl",
+               "import sysl.container.ring.{Ring, ring}\n\n@export(\"main\")\nentry(n: usize) -> int\n" +
+               "    var slots: [4]int = [0; 4]\n    var r = ring(slots[..])\n\n    r.push_back(7)\n" +
+               "    r[n] = 1\n    r.at(n)\n").unwrap()
+
+    val text = emit_llvm_text(dir, Some("thumb-freestanding-softfp"), DefaultOptimization, buf(), Some(buf())) match
+        Err(why) -> s"did not compile: ${failure_text(why)}"
+        Ok(e) -> if e.report.is_empty() then e.text else s"did not compile: ${analysis_report(e.report)}"
+
+    assert(!text.starts_with("did not compile"), text)
+    assert(text.contains("define weak dso_local void @sysl_bounds_fail("), text)
+    assert(!text.contains("declare void @sysl_bounds_fail"), text)
+
+    val obj = s"$dir/probe.o"
+
+    compile_object(cc, text, obj, t, "2") match
+        Err(why) ->
+            remove_dir_all(dir).unwrap_or(())
+            assert(false, why)
+            return
+        Ok(_) -> ()
+
+    val listing = capture(CtrNm, ["-u", obj]).map((o) -> o.text).unwrap_or("llvm-nm could not be run")
+
+    remove_dir_all(dir).unwrap_or(())
+
+    for line in split(listing, "\n")
+        val name = line.trim()
+
+        assert(name == "" || name == "U memcpy" || name == "U memset", s"left undefined: $listing")
+end ctr_bare_metal
