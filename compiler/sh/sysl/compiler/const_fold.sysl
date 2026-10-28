@@ -142,20 +142,26 @@ const_fold(cx: &Analyzer, e: Expr) -> Option[Const] = *e.kind match
 
         // `real.infinity`, `f32.nan` -- read off the float type they are of, exactly as the
         // analyzer reads them (`bare_type_member`).
-        if builtin_float(name).is_none() then return None
+        if builtin_float(name).is_some()
+            subject_named(cx, receiver) match
+                Some(Floating(_, _)) -> return Some(ConstFloat(builtin_float(name).unwrap()))
+                _ -> ()
 
-        subject_named(cx, receiver) match
-            Some(Floating(_, _)) -> Some(ConstFloat(builtin_float(name).unwrap()))
-            _ -> None
+        // `Op.Add` -- an enum's variant is a value known while compiling, and is typed and run as one.
+        if names_type(cx, receiver) then const_run(cx, e, true) else None
 
     Unary(op, operand) -> const_unary(cx, op, operand)
     Binary(op, l, r) -> const_binary(cx, e, op, l, r)
     // A comparison that asks about a type's make-up -- `T::Kind == Kind.Struct`, where the enum value
     // on the right is no constant the fold holds -- is typed and run whole.
+    //
+    // Two values the fold holds but cannot compare itself -- two variants, `Op.Add == Op.Sub`, or a
+    // value parameter of an enum against one -- are compared by running the comparison, as a `const`
+    // function's body would.
     Compare(operands, ops) ->
         if operands.len() == 2 && ops.len() == 1 then
             if reflects(operands.at(0)) || reflects(operands.at(1)) then reflected(cx, e)
-            else const_binary(cx, e, ops.at(0), operands.at(0), operands.at(1))
+            else const_compare(cx, e, ops.at(0), operands.at(0), operands.at(1))
         else
             None
 
@@ -220,6 +226,35 @@ reflects(e: Expr) -> bool = *e.kind match
             if reflects(item) then return true
 
         false
+    _ -> false
+
+// Whether a written name, plain or dotted, names a type rather than a value: `Op` in `Op.Add`.
+names_type(cx: &Analyzer, e: Expr) -> bool = dotted_name_written(cx, e) match
+    Some(n) -> lookup_type_key(cx.an, cx.scope, n).is_some()
+    None -> false
+
+// Whether a callee builds a value rather than calling a function: a struct's name, an enum's variant
+// (`Shape.Circle`), or `T::Make`.
+constructs(cx: &Analyzer, callee: Expr) -> bool = *callee.kind match
+    TypeAttr(_, attr, _, _) -> attr == "Make"
+    Field(receiver, _, _) -> names_type(cx, receiver)
+    Ident(_) -> names_type(cx, callee)
+    _ -> false
+
+// A comparison the fold cannot make itself because a side is a value it holds whole -- a variant,
+// a struct -- run as the comparison it is. A side that refused has said so, and a side that is not a
+// constant at all leaves the comparison unknown.
+private const_compare(cx: &Analyzer, e: Expr, op: string, l: Expr, r: Expr) -> Option[Const]
+    val refusals = cx.an.const_refusals
+    val folded = const_binary(cx, e, op, l, r)
+
+    if folded.is_some() || const_refused_since(cx.an, refusals) then return folded
+
+    if is_record(const_fold(cx, l)) || is_record(const_fold(cx, r)) then const_run(cx, e, true) else None
+end const_compare
+
+private is_record(v: Option[Const]) -> bool = v match
+    Some(ConstRecord(_, _)) -> true
     _ -> false
 
 // An expression asking about a type's make-up, typed and run -- once the type is known: a type

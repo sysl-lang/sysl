@@ -2162,6 +2162,54 @@ an 'if const' is decided while compiling, so its condition has to be known then
 A generic body is also checked once before any instance, for what does not depend on its parameters.
 That check reads neither arm of an `if const`; each instance reads the arm it takes.
 
+### Every constant position reads the same expressions
+
+**What a `const` function's body can compute, every place a constant is read accepts**: a value
+argument, an `if const`, a `const` and an array's length. That includes an enum's variant and a
+comparison of two, `T::Make(c, p)` in a `for const` copy, and a field of a struct literal, so a
+table of handlers can be built from a walk over an enum's variants:
+
+```sysl
+enum Op
+    Add
+    Sub
+
+apply[const o: Op](x: int) -> int = if const o == Op.Add then x + 1 else x - 1
+
+for const c in Op::Variants
+    print(c.name, apply[Op::Make(c, ())](10))
+
+const Differ = Op.Add != Op.Sub
+
+var lanes: [if Op.Add == Op.Sub then 2 else 3]int = [1, 2, 3]
+
+print(Differ, lanes.len)
+```
+
+```output
+Add 11
+Sub 9
+true 3
+```
+
+**A condition that does not type is refused for that**, not as a test made while the program runs. A
+`for const` variable over a range is a `usize`, and a function's parameter takes what any call to it
+takes, so a `uint` parameter wants it converted, `fast(uint(k))`, as it would anywhere else. (A value
+parameter is the one place an integer of any width is read at its declared type, fit-checked by its
+value: `H[k]` over a `const N: uint` is accepted.)
+
+```sysl
+const fast(x: uint) -> bool = x > 1
+
+for const k in 0..<3
+    if const fast(k)
+        print(k)
+```
+
+```error
+'x' of 'fast' is uint, but usize was given
+```
+
 ### What it is for: the catalog covers every tuple
 
 `impl[..A: Display] Display for (..A)` is one block covering every tuple, and `Eq`, `Ord` and `Hash`
