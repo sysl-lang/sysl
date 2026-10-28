@@ -156,10 +156,13 @@ const_evaluation() -> &ConstEvaluation =
 // expression typed and evaluated, as a method called on the answer already is.
 const_call(cx: &Analyzer, e: Expr) -> Option[Const]
     val off_a_call = *e.kind match
+        // A call that builds a value -- a struct, a variant, `T::Make(c, p)` -- is run as the value.
         Call(c, _) ->
-            if callee_word(c).is_none() then return None
+            val builds = constructs(cx, c)
 
-            false
+            if callee_word(c).is_none() && !builds then return None
+
+            builds
         Field(receiver, _, _) ->
             if !mentions_const_call(cx.an, receiver) && !names_descriptor(cx.subst, receiver) then
                 return None
@@ -180,6 +183,15 @@ const_call(cx: &Analyzer, e: Expr) -> Option[Const]
         IfExpr(_, _, _, _) | MatchExpr(_, _) | IsPattern(_, _, _) -> true
         _ -> return None
 
+    const_run(cx, e, off_a_call)
+end const_call
+
+// A constant expression the fold does not settle piece by piece, typed and run whole: an enum's
+// variant (`Op.Add`, `Op::Make(c, ())`), a comparison of two of them, what `const_call` hands on. It
+// is exactly what a `const` function's body may compute, so every place a constant is read -- a value
+// argument, an `if const`, a `const`, an array's length -- accepts the same expressions. A typed tree
+// that is not a call is run only where `whole` says the expression was admitted as one.
+const_run(cx: &Analyzer, e: Expr, whole: bool) -> Option[Const]
     val ev = cx.an.evaluation
 
     // Before every declaration is read, the call is one a declaration needs the value of.
@@ -213,7 +225,7 @@ const_call(cx: &Analyzer, e: Expr) -> Option[Const]
 
     *typed.unwrap().kind match
         TCall(name, _, _, _) -> if !runs_while_compiling(cx.an, name) then return None
-        _ -> if !off_a_call then return None
+        _ -> if !whole then return None
 
     evaluate(cx.an, cx.scope, subject_of(cx.an), typed.unwrap()) match
         // An array is storage, not a constant's value: it is laid down only as a `val`'s data.
@@ -236,7 +248,7 @@ const_call(cx: &Analyzer, e: Expr) -> Option[Const]
             cx.an.const_refusals += 1
             None
         EvQuiet -> None
-end const_call
+end const_run
 
 // The message of an `@assert` whose condition came out false, worked out now -- and only now, so a
 // message that could not be computed costs nothing while the condition holds. It is any `string`

@@ -1,0 +1,240 @@
+module sh.sysl.compiler
+@tests
+
+// **Every place a constant is read accepts what a `const` function's body can compute**
+// (`reference/generics.md § Which values`): a value argument, an `if const`, a `const` initializer and
+// an array's length all fold an enum's variant, a comparison of two, `T::Make(c, p)` in a `for const`
+// copy, a call to a `const` function and a struct literal's field alike. What is not a constant is
+// still refused, and a condition that does not even type is refused for that, not as a run-time test.
+
+private cka_ops() -> string = raw"""
+    enum Op
+        Add
+        Sub
+
+    struct H[const N: u32]
+        v: int
+
+    ho[const o: Op](x: int) -> int = if const o == Op.Add then x + 1 else x - 1
+
+    const two(n: u32) -> u32 = n * 2
+    """
+
+@test("Op::Make(c, ()) in a 'for const' copy is a value argument")
+cka_make_is_a_value_argument()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(cka_ops() + raw"""
+
+        for const c in Op::Variants
+            print(ho[Op::Make(c, ())](10))
+        """), "11\n9\n")
+end cka_make_is_a_value_argument
+
+@test("a variant chosen by an 'if' over nested 'for const' variables is a value argument, beside a usize at a u32 parameter")
+cka_nested_for_const_arguments()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(cka_ops() + raw"""
+
+        for const k in 0..<2
+            for const c in Op::Variants
+                val h: H[k] = H(int(c.index) + 10 * int(k))
+                print(h.v, ho[if k == 0 then Op.Add else Op.Sub](0))
+
+        val hs: H[two(3) + 1] = H(5)
+        print(hs.v)
+        """), "0 1\n1 1\n10 -1\n11 -1\n5\n")
+end cka_nested_for_const_arguments
+
+@test("a variant of another enum built by Make is refused as the mismatch it is")
+cka_make_of_another_enum()
+    if !enm_ready() then return
+
+    val said = enm_outcome(cka_ops() + raw"""
+
+        enum Mode
+            Fast
+            Slow
+
+        for const c in Mode::Variants
+            print(ho[Mode::Make(c, ())](0))
+        """).0
+
+    assert(said.contains("'o' of 'ho' is Op, but Mode was given"), said)
+    assert(!said.contains("must be a constant"), said)
+end cka_make_of_another_enum
+
+@test("a value argument read out of storage is still refused")
+cka_storage_is_not_a_value_argument()
+    if !enm_ready() then return
+
+    val variant = enm_outcome(cka_ops() + raw"""
+
+        var v = Op.Add
+
+        print(ho[v](0))
+        """).0
+
+    assert(variant.contains("'v' is not a variant of Op"), variant)
+
+    val number = enm_outcome(cka_ops() + raw"""
+
+        var n: u32 = 2
+
+        val h: H[n] = H(1)
+        print(h.v)
+        """).0
+
+    assert(number.contains("a value argument must be a constant — a literal, or a 'const' naming one"), number)
+end cka_storage_is_not_a_value_argument
+
+@test("'if const' compares variants with == and !=, at module level, in a generic body and in a copy")
+cka_if_const_compares_variants()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(cka_ops() + raw"""
+
+        if const Op.Add == Op.Add
+            print("same")
+
+        if const Op.Add != Op.Sub
+            print("differ")
+
+        if const Op.Add == Op.Sub
+            print("wrong")
+
+        print(ho[Op.Add](0), ho[Op.Sub](0))
+
+        for const c in Op::Variants
+            if const Op::Make(c, ()) != Op.Add
+                print(c.name)
+        """), "same\ndiffer\n1 -1\nSub\n")
+end cka_if_const_compares_variants
+
+@test("'if const' reads a data enum's variant built with a payload, by Make and by name")
+cka_if_const_payload_variants()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        enum Shape
+            Dot
+            Circle(r: int)
+
+        for const c in Shape::Variants
+            if const c.name == "Circle"
+                if const Shape::Make(c, 5) is Shape.Circle(5)
+                    print("make circle")
+
+        if const Shape.Circle(5) is Shape.Circle(_)
+            print("is circle")
+
+        if const Shape.Dot is Shape.Circle(_)
+            print("wrong")
+        """), "make circle\nis circle\n")
+end cka_if_const_payload_variants
+
+@test("a 'const' and an array length fold a comparison of variants")
+cka_const_and_length_compare_variants()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(cka_ops() + raw"""
+
+        const pick(o: Op) -> int = if o == Op.Add then 1 else 2
+
+        const Same = Op.Add == Op.Add
+        const Differ = Op.Add != Op.Sub
+        const Picked = pick(Op.Sub)
+
+        var arr: [if Op.Add == Op.Sub then 2 else 3]int = [1, 2, 3]
+        var picked: [pick(Op.Sub)]int = [7, 8]
+
+        print(Same, Differ, Picked, arr.len, picked.len)
+        """), "true true 2 3 2\n")
+end cka_const_and_length_compare_variants
+
+@test("a struct literal's field is a constant in an 'if const' and an array length")
+cka_struct_literal_fields()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        struct P
+            x: int
+            y: int
+
+        if const P(1, 2).x == 1
+            print("x")
+
+        var arr: [P(2, 3).y]int = [4, 5, 6]
+
+        print(arr.len)
+        """), "x\n3\n")
+end cka_struct_literal_fields
+
+@test("an enum or a struct is still no 'const': a constant is a scalar")
+cka_aggregate_const_refused()
+    if !enm_ready() then return
+
+    val said = enm_outcome(cka_ops() + raw"""
+
+        const A0 = Op.Add
+
+        print(0)
+        """).0
+
+    assert(said.contains("a constant is a scalar, and Op is not — 'A0'"), said)
+end cka_aggregate_const_refused
+
+@test("an 'if const' over a call handed the wrong integer type says the mismatch, not 'known then'")
+cka_if_const_argument_mismatch()
+    if !enm_ready() then return
+
+    val module_level = enm_outcome(raw"""
+        const fast(x: u32) -> bool = x > 1
+
+        for const k in 0..<3
+            if const fast(k)
+                print(k)
+        """).0
+
+    assert(module_level.contains("'x' of 'fast' is"), module_level)
+    assert(module_level.contains("but usize was given"), module_level)
+    assert(module_level.contains("main.sysl:4:19"), module_level)
+    assert(!module_level.contains("has to be known then"), module_level)
+
+    val in_body = enm_outcome(raw"""
+        const fast(x: u32) -> bool = x > 1
+
+        main()
+            for const k in 0..<3
+                if const fast(k)
+                    print(k)
+        """).0
+
+    assert(in_body.contains("but usize was given"), in_body)
+    assert(!in_body.contains("has to be known then"), in_body)
+
+    // The same call typed at a `u32` reads, and decides.
+    assert_eq(enm_ran(raw"""
+        const fast(x: u32) -> bool = x > 1
+
+        for const k in 0..<3
+            if const fast(u32(k))
+                print(k)
+        """), "2\n")
+end cka_if_const_argument_mismatch
+
+@test("an 'if const' over storage is still refused as a run-time test")
+cka_if_const_storage_refused()
+    if !enm_ready() then return
+
+    val said = enm_outcome(cka_ops() + raw"""
+
+        var v = Op.Add
+
+        if const v == Op.Add
+            print("no")
+        """).0
+
+    assert(said.contains("an 'if const' is decided while compiling, so its condition has to be known then"), said)
+end cka_if_const_storage_refused

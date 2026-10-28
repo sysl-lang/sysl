@@ -1320,7 +1320,7 @@ private value_arg(a: &Analysis, scope: Scope, span: Span, arg: TypeRef, ty: Type
     if tag.is_some() then return Some(ConstArg(tag.unwrap(), ty, false))
 
     val refusals = a.const_refusals
-    val folded = const_arg_value(a, scope, e, subst)
+    val folded = const_arg_value(a, scope, e, ty, subst)
 
     if folded.is_some()
         val read = value_arg_reading(a, scope, e, ty, subst)
@@ -1506,8 +1506,9 @@ default_value(a: &Analysis, scope: Scope, span: Span, name: string, arg: TypeRef
               subst: Buf[Binding]) -> Option[Type] =
     value_arg(a, scope, span, arg, ty, subst, s"the default for '$name'")
 
-// The number a value argument folds to, whichever admissible kind it is.
-private const_arg_value(a: &Analysis, scope: Scope, e: Expr, subst: Buf[Binding]) -> Option[BigInt]
+// The number a value argument folds to, whichever admissible kind it is. A simple enum's variant
+// computed rather than named -- `Op::Make(c, ())` in a `for const` copy -- is its tag, as a named one is.
+private const_arg_value(a: &Analysis, scope: Scope, e: Expr, ty: Type, subst: Buf[Binding]) -> Option[BigInt]
     val inner = analyzer_for(a, scope)
 
     inner.subst = subst
@@ -1521,6 +1522,11 @@ private const_arg_value(a: &Analysis, scope: Scope, e: Expr, subst: Buf[Binding]
         Some(ConstBool(b)) -> Some(from_int(if b then 1 else 0))
         Some(ConstChar(c)) -> Some(from_int(long(int(u32(c)))))
         Some(ConstInt(v)) -> Some(v)
+        Some(ConstRecord(i, _)) -> ty match
+            Enum(d) ->
+                if d.simple && i >= 0 && usize(i) < d.variants.len() then Some(d.variants.at(usize(i)).tag)
+                else None
+            _ -> None
         _ -> None
 end const_arg_value
 
