@@ -121,6 +121,39 @@ language with no lifetimes, no borrow checker, and nothing to prove to a checker
 name the same object, which is the only question a bare address can answer, and there is no ordering
 on either.
 
+**References hash by address too**, for the same reason: a hash has to agree with `==`. So a `&T` or
+a `*T` is a `Hash` and an `Eq` for every `T` — one with no `Hash` of its own included — and a table
+keyed on references keys by **identity**. Two distinct objects holding equal values are two keys; the
+same object twice is one. That is what a hash-consing table wants, where a node is made once per
+distinct pair of children:
+
+```sysl
+import sysl.container.{Map, map}
+
+struct Node
+    level: int
+
+main()
+    val leaf: &Node = Node(0)
+    val twin: &Node = Node(0)
+    val made = map[(&Node, &Node), &Node]()
+
+    for k in [(leaf, leaf), (leaf, twin), (leaf, leaf)]
+        if !made.has(k) then made.put(k, Node(k.0.level + k.1.level + 1))
+
+    print(made.len(), made.get((leaf, leaf)).unwrap() == made.get((leaf, leaf)).unwrap())
+```
+
+```output
+2 true
+```
+
+The identity is what a **bound** gets: inside a `[K: Hash + Eq]` body standing at `&Node`, `k.hash()`
+and `k.eq(other)` are the address's, as `k == other` is. A member call written on a reference you
+named still reaches the referent's own (`r.hash()`, `r.eq(*s)`), the one level a member call sees
+through. To key by **value**, key on the value type — `Map[Node, V]` — or on a wrapper whose `Hash`
+and `Eq` read the fields.
+
 ### There is no allocation keyword
 
 A reference is made by writing an ordinary construction **where a `&T` is expected**. The expectation
@@ -957,7 +990,10 @@ where it was allocated:
   or allocator-free, over static, stack, or heap memory;
 - **`*T` carries no length**, so it is the one unchecked primitive. `p[i]` reads the `i`th element
   and `p[0..<n]` views `n` of them, both exactly as C does and both unchecked, because there is no
-  length to check against and supplying one is the programmer's assertion.
+  length to check against and supplying one is the programmer's assertion. A pointer to something
+  with a subscript of its own — a `*[N]T`, or a `*Buf[T]` and any other type indexed through a trait
+  — is indexed as that thing, with its check
+  ([Arrays](/reference/arrays/#a-raw-pointer-is-indexed-anyway)).
 
 So even low-level, allocator-free code stays bounds-safe by *choosing* slices, and reaches for `*T`
 where it must — an MMIO window, a page table, a buffer a C function filled. That choice is the point.
@@ -981,8 +1017,9 @@ another object, so there is no count to take a share of. Reaching a `&T` means b
 constructing one, and taking the address of a local is therefore inherently in the unsafe tier —
 which is right, because it can dangle and nothing promotes it.
 
-**Selection is the only implicit dereference.** `p.x` is `(*p).x` and `p.x = 9` writes through the
-pointer — Go's rule, with no `->`. Matching a reference to an enum against its variants is `match *e`.
+**Selection is the only implicit dereference, with the subscript of an indexable pointee.** `p.x` is
+`(*p).x` and `p.x = 9` writes through the pointer — Go's rule, with no `->` — and `p[i]` on a pointer
+to an array or a container is `(*p)[i]`. Matching a reference to an enum against its variants is `match *e`.
 
 **The shorthand stops at one level**, so reaching through a `**T` is written:
 

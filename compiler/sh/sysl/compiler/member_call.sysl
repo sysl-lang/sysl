@@ -226,6 +226,10 @@ associated_on(cx: &Analyzer, span: Span, ty: Type, name: string, args: Buf[Expr]
     if generic.is_some() && !block_bounds_met(cx, span, generic.unwrap(), found.1) then
         return Some(bad_expr(span))
 
+    // **The condition is asked before the member is made real**: an instantiation the condition
+    // refuses would have its body read at arguments the block was written to keep out.
+    if !check_impl_condition(cx, span, ty, found.0, picked) then return Some(bad_expr(span))
+
     if generic.is_some() && generic.unwrap().tparams.len() > found.1.len()
         check_member_visible(cx, span, found.0, picked, decl, via)
 
@@ -248,7 +252,6 @@ associated_on(cx: &Analyzer, span: Span, ty: Type, name: string, args: Buf[Expr]
 
     note_member_reference(cx, span, fname, decl)
     check_member_visible(cx, span, found.0, picked, decl, via)
-    check_impl_condition(cx, span, ty, found.0, picked)
 
     // The arity names what kind of thing was called, and an argument's refusal names the callee
     // alone -- `'x' of 'Box.of' is int`, as a free function's does.
@@ -834,6 +837,17 @@ call_member(cx: &Analyzer, span: Span, receiver: TExpr, name: string, args: Buf[
 
     if rty == Unknown then return bad_expr(span)
 
+    // **Through a bound, a reference is its own key**: `Eq` and `Hash` at a `&T` or a `*T` are the
+    // address's (`reference/memory.md § References compare by address`), so a `[K: Hash + Eq]` body
+    // standing at `&Node` hashes and compares identities rather than reaching through to `Node`'s
+    // own members, which would key the table by a value its `==` never consults.
+    val held = underlying(texpr_type(receiver))
+
+    if (name == "hash" || name == "eq") && cx.at_definition then note_bound_site(cx, span, held)
+
+    if (name == "hash" || name == "eq") && hashes_by_address(held) && reached_through_bound(cx, span, held, name) then
+        return address_member(cx, span, receiver, held, name, args)
+
     // **Every value answers `to_string()` and `debug_string()`**, by the compiler, where its type has
     // no member of that name: the string its `Display` writes (its `Debug`, else `<T>`, where it has
     // none) and the string its `Debug` writes -- the same code `str(x)` and `debug(x)` become.
@@ -894,6 +908,82 @@ call_member(cx: &Analyzer, span: Span, receiver: TExpr, name: string, args: Buf[
                        "first, with 'p[0..<n]'")
             else call_declared(cx, span, receiver, rty, name, args, expected, via, targs)
 end call_member
+
+// Whether a member call on a reference was written through a bound rather than on a reference the
+// program named: inside a derivation, where every part is asked the trait being derived, or where the
+// receiver is DECLARED in the generic source as one of the body's type parameters -- or one member of
+// a pack -- including where it is built from them (`p.0` of a `(T, U)`, `w.x` of a `Wrap[T]`).
+//
+// **A written member call on a reference reaches its referent** (`r.eq(*s)`, `r.hash()`), and that
+// is left as it is: both reach the same object's members, so they agree with each other. It is the
+// bound that promised the reference's own `Eq` and `Hash`, so it is the bound that gets them.
+//
+// **The decision is the source's, not the instantiation's.** A `val r: &Node` in a body instantiated
+// at `T = &Node` has the same type as a `T`, and is still a reference the program named: its
+// `r.hash()` is `Node`'s at every instantiation. So the walk at the definition, where `T` stands for
+// itself, files each `hash`/`eq` call site with whether its receiver was a parameter's
+// (`bound_sites`), and an instantiation reads that. A body that walk never read -- the library's,
+// read where the library was built, and a nested generic -- falls back to asking whether the
+// receiver's type is what a parameter stands for.
+private reached_through_bound(cx: &Analyzer, span: Span, held: Type, name: string) -> bool
+    if derived_trait_key(cx, name).is_some() then return true
+
+    val filed = cx.an.tables.bound_sites.get(bound_site_key(cx, span))
+
+    if filed.is_some() then return filed.unwrap()
+
+    for item in cx.subst
+        if type_eq(underlying(item.ty), held) then return true
+
+        item.ty match
+            Pack(elems) ->
+                for e in elems
+                    if type_eq(underlying(e), held) then return true
+            _ -> ()
+    end for
+
+    false
+end reached_through_bound
+
+// Files a `hash`/`eq` call site read at its generic definition: through a bound exactly when the
+// receiver's type there is a type parameter standing for itself.
+private note_bound_site(cx: &Analyzer, span: Span, held: Type)
+    val through = held match
+        Abstract(_, _) -> true
+        _ -> false
+
+    cx.an.tables.bound_sites.put(bound_site_key(cx, span), through)
+
+// A call site, by the file it is written in and where in it.
+private bound_site_key(cx: &Analyzer, span: Span) -> string = s"${cx.scope.src.name}:${span.start}"
+
+// `eq` and `hash` on a reference or a pointer, as the address's: `eq` is its `==`, and `hash` mixes
+// the address through the integers' own finalizer. Neither takes or gives back a share.
+private address_member(cx: &Analyzer, span: Span, receiver: TExpr, held: Type, name: string,
+                       args: Buf[Expr]) -> TExpr
+    if name == "eq" then
+        return builtin_operator_method(cx, span, receiver, held, name, args).unwrap_or(bad_expr(span))
+
+    if !args.is_empty() then
+        return cx.err(span, s"method 'Hash.hash' takes no arguments, but " +
+                      supplied_phrase(args.len(), "argument"))
+
+    val key = library_key(cx, "hash_u64")
+
+    if key.is_none() then
+        return cx.err(span, "a reference hashes through the library's 'hash_u64', which the " +
+                      "standard module this compilation was given does not declare")
+
+    val word = Integer(64, false, false)
+    val address = held match
+        Ref(_, _) -> TExpr(span, TCast(receiver, Ptr(byte_type())))
+        _ -> receiver
+    var call_args: Buf[TExpr] = buf()
+
+    call_args.push(TExpr(span, TCast(address, word)))
+    cx.an.uses(key.unwrap())
+    TExpr(span, TCall(key.unwrap(), call_args, word, false))
+end address_member
 
 // Whether a member of that name is the type's own -- declared for it, supplied by a trait it
 // implements, or promised by a bound -- which then wins over the one every value has.
@@ -979,6 +1069,9 @@ private call_declared(cx: &Analyzer, span: Span, receiver: TExpr, rty: Type, nam
 
     if generic.is_some() && !block_bounds_met(cx, span, generic.unwrap(), found.1) then
         return bad_expr(span)
+
+    // Asked before either path makes the member real, a member with parameters of its own included.
+    if !check_impl_condition(cx, span, rty, found.0, chosen.unwrap()) then return bad_expr(span)
 
     if generic.is_some() && generic.unwrap().tparams.len() > found.1.len() then
         return call_generic_member(cx, span, Some(receiver), rty, found.0, decl, generic.unwrap(),
@@ -1251,7 +1344,8 @@ private member_dispatch(cx: &Analyzer, span: Span, receiver: TExpr, rty: Type, b
                         chosen: string, m: MethodDecl, args: Buf[Expr], expected: Option[Type],
                         written: string, via: Buf[string] = no_bound_traits()) -> TExpr
     check_member_visible(cx, span, base, chosen, m, via)
-    check_impl_condition(cx, span, rty, base, chosen)
+
+    if !check_impl_condition(cx, span, rty, base, chosen) then return bad_expr(span)
 
     val shown = member_subject(cx, rty, chosen)
     val fname = member_func_name(cx, span, rty, chosen)
@@ -2084,14 +2178,23 @@ end method_written
 // keyed by the type and not by its arguments, so a conditional block -- `impl[T: Show] Show for
 // Box[T]` -- files its members under every `Box`, and the condition is asked here, of the arguments
 // this receiver was made with. Without it a `Box` of something that is not `Show` would call `show`.
-private check_impl_condition(cx: &Analyzer, span: Span, rty: Type, base: string, filed: string)
+//
+// **The arguments are the ones the member was found at**, which for a shape-matched block are not the
+// type's own: `impl[..A: Hash] Hash for (..A)` is filed under the pack shape, and a tuple matches it
+// with its parts as one pack. Asked only of the type's own key, a tuple of something that is not
+// `Hash` reached the block's body and was refused inside the library rather than at the call.
+//
+// It answers whether the call may go on. A refused condition is the whole of what is wrong, so the
+// caller abandons the call rather than instantiating a body the condition was written to keep out --
+// whose own refusal would be a second diagnostic, located in the block and not at the call.
+private check_impl_condition(cx: &Analyzer, span: Span, rty: Type, base: string, filed: string) -> bool
     val from = cx.an.tables.members.from_trait.get(member_key_of(base, filed))
 
-    if from.is_none() then return
+    if from.is_none() then return true
 
-    val owner = member_owner(rty)
+    val owner = member_key(cx.an, rty, filed)
 
-    if owner.0 != base then return
+    if owner.0 != base then return true
 
     val name = source_member_name(filed)
 
@@ -2105,18 +2208,21 @@ private check_impl_condition(cx: &Analyzer, span: Span, rty: Type, base: string,
 
         val unmet = unmet_condition_of(cx.an, ti, subst)
 
-        if unmet.is_some()
-            val (arg, tr) = unmet.unwrap()
-            val why = unmet_bound(cx.an, tr, arg)
-            val tail = if why.is_some() then s" — ${why.unwrap()}" else ""
+        if unmet.is_none() then return true
 
-            cx.fault(span, s"'$name' is a member the 'impl' of '${qualified_name(from.unwrap())}' " +
-                     s"gives '${type_show(rty)}' only where its condition holds, and it asks " +
-                     s"'${tr.show()}' of ${type_show(arg)}, which does not implement it$tail")
-        end if
+        val (packed, tr) = unmet.unwrap()
+        val arg = first_unmet_part(cx.an, tr, packed)
+        val why = unmet_bound(cx.an, tr, arg)
+        val tail = if why.is_some() then s" — ${why.unwrap()}" else ""
 
-        return
+        cx.fault(span, s"'$name' is a member the 'impl' of '${qualified_name(from.unwrap())}' " +
+                 s"gives '${type_show(rty)}' only where its condition holds, and it asks " +
+                 s"'${tr.show()}' of ${type_show(arg)}, which does not implement it$tail")
+
+        return false
     end for
+
+    true
 end check_impl_condition
 
 // Whether a member the reader named is one their file may reach.

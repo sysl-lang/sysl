@@ -926,6 +926,19 @@ unmet_condition_of(a: &Analysis, ti: TraitImpl, subst: Buf[Binding]) -> Option[(
     None
 end unmet_condition_of
 
+// The part of a pack a bound refuses. A pack's bound is asked of each part, so the part that fails
+// is the one worth naming -- `(Plain, int)` fails `Hash` because of `Plain`, not because of the list
+// `Plain, int`. Any other type is its own answer.
+first_unmet_part(a: &Analysis, tr: Bound, t: Type) -> Type
+    t match
+        Pack(parts) ->
+            for p in parts
+                if !satisfies(a, tr, p) then return p
+        _ -> ()
+
+    t
+end first_unmet_part
+
 // The suffix the members of a type's implementation of one particular trait-at-arguments carry,
 // empty for the first implementation of that trait and distinct for each one after it.
 //
@@ -1025,8 +1038,10 @@ unmet_bound(a: &Analysis, tr: Bound, t: Type) -> Option[string]
 
     if unmet.is_none() then return None
 
-    Some(s"the 'impl' that covers it asks '${unmet.unwrap().1.show()}' of " +
-         s"${type_show(unmet.unwrap().0)}, which does not implement it")
+    val (packed, bound) = unmet.unwrap()
+
+    Some(s"the 'impl' that covers it asks '${bound.show()}' of " +
+         s"${type_show(first_unmet_part(a, bound, packed))}, which does not implement it")
 end unmet_bound
 
 private wrong_arguments(a: &Analysis, tr: Bound, t: Type) -> Option[string]

@@ -334,12 +334,11 @@ index_expr(cx: &Analyzer, span: Span, receiver: Expr, index: Expr,
     if texpr_type(raw) == Unknown then return raw
 
     // `p[i]` on a raw pointer is C's, unchecked: the pointer is a bare address, so the subscript is
-    // the address arithmetic C spells the same way. A pointer to an *array* keeps the checked form,
-    // because that one has a length in its type to check against.
+    // the address arithmetic C spells the same way. A pointer to something with a subscript of its
+    // own -- an array, or a container indexed through a trait -- is indexed as that thing, so `p[i]`
+    // means what `p.at(i)` and `(*p)[i]` mean rather than the `i`th container along.
     val tr = repr(texpr_type(raw)) match
-        Ptr(inner) -> *inner match
-            Array(_, _) -> auto_deref(cx, raw)
-            _ -> raw
+        Ptr(inner) -> if pointee_indexes(cx, *inner) then auto_deref(cx, raw) else raw
         _ -> auto_deref(cx, raw)
 
     repr(texpr_type(tr)) match
@@ -348,6 +347,54 @@ index_expr(cx: &Analyzer, span: Span, receiver: Expr, index: Expr,
         Vector(lanes, elem) -> lane_expr(cx, span, tr, index, lanes, *elem)
         _ -> index_non_vector(cx, span, raw, tr, index, expected)
 end index_expr
+
+// Whether a pointer's subscript reaches through to what it points at: an array, whose length is in
+// its type, or a type indexed through `IndexPlace` or `Index` -- by an implementation, or, for a type
+// parameter, by a bound that promises the method. Anything else is a bare element of a C array.
+//
+// **A pointee a type parameter stands for is decided by the parameter**, never by what it stood for
+// this time. The body was read once with the parameter opaque, where `p[i]` on an unbounded `*T` is
+// the `i`th `T`; an instantiation at `T = [4]int` or `T = Buf[int]` must read it the same way, or
+// the one body would mean two things and be refused for yielding an element where it promised a `T`.
+pointee_indexes(cx: &Analyzer, inner: Type) -> bool
+    val t = repr(inner)
+
+    t match
+        Abstract(_, _) -> ()
+        _ ->
+            for b in cx.subst
+                if b.name != "Self" && repr(b.ty) == t then return parameter_indexes(cx, b.name)
+
+    t match
+        Array(_, _) -> return true
+        Abstract(_, bounds) ->
+            return bound_member(cx.an, t, bounds, "index_place").is_some() ||
+                   bound_member(cx.an, t, bounds, "index").is_some()
+        _ -> ()
+
+    for name in ["IndexPlace", "Index"]
+        val key = catalog_key(cx.an, name)
+
+        if key.is_some() && indexes_through(cx.an, key.unwrap(), t) then return true
+
+    false
+end pointee_indexes
+
+// Whether a type parameter's written bounds promise a subscript, read the way the opaque reading
+// of the body read them: through each bound's supertraits, to an `index_place` or an `index`.
+private parameter_indexes(cx: &Analyzer, tparam: string) -> bool
+    var bounds: Buf[Bound] = buf()
+
+    for key in bound_traits(cx, tparam)
+        bounds.push(Bound(key, buf(), buf()))
+
+    if bounds.is_empty() then return false
+
+    val subject = Abstract(tparam, bounds)
+
+    bound_member(cx.an, subject, bounds, "index_place").is_some() ||
+        bound_member(cx.an, subject, bounds, "index").is_some()
+end parameter_indexes
 
 // Whether a subscript on this type reaches one of the two indexing traits, asked of a type that has
 // no elements of its own. A built-in's subscript is never this: an array, a slice and a string are
@@ -370,15 +417,12 @@ indexes_written(cx: &Analyzer, trait_name: string, receiver: Expr) -> bool
 
     if texpr_type(t) == Unknown then return false
 
-    // A type indexed in place is written through the place, never through the trait's call. A raw
-    // pointer's subscript is the pointer's own, so a write through `*Buf` keeps reaching `IndexSet`.
+    // A type indexed in place is written through the place, never through the trait's call -- and a
+    // pointer to one is indexed as the thing it points at, so a write through `*Buf` is the same
+    // write into the place that `(*p)[i] = v` is.
     val place_key = catalog_key(cx.an, "IndexPlace")
-    val through_ptr = texpr_type(t) match
-        Ptr(_) -> true
-        _ -> false
 
-    if !through_ptr && place_key.is_some() &&
-       indexes_through(cx.an, place_key.unwrap(), receiver_type(texpr_type(t)))
+    if place_key.is_some() && indexes_through(cx.an, place_key.unwrap(), receiver_type(texpr_type(t)))
         return false
 
     indexes_through(cx.an, key.unwrap(), receiver_type(texpr_type(t)))
@@ -452,8 +496,18 @@ private index_non_vector(cx: &Analyzer, span: Span, raw: TExpr, tr: TExpr, index
         // A parameter has no implementation to find -- a bound is not one -- so the subscript goes
         // the way every other use of a parameter goes: to the member machinery, which answers from
         // the bounds and complains where they license nothing.
+        // A bound that promises `IndexPlace` is indexed in place, exactly as a type implementing it is.
         texpr_type(tr) match
-            Abstract(_, _) -> return call_member(cx, span, raw, "index", args, expected)
+            Abstract(_, bounds) ->
+                if bound_member(cx.an, texpr_type(tr), bounds, "index_place").is_some()
+                    val call = call_member(cx, span, raw, "index_place", args, None)
+
+                    return repr(texpr_type(call)) match
+                        Ptr(inner) -> TExpr(span, TDeref(call, *inner))
+                        _ -> call
+                end if
+
+                return call_member(cx, span, raw, "index", args, expected)
             _ -> ()
 
         return cx.err(span, s"cannot index ${type_show(texpr_type(tr))}")
