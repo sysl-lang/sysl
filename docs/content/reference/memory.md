@@ -585,6 +585,47 @@ those arrive with a count the callee is responsible for. The caller supplies it 
 that builds a value and pushes it pays no reference traffic at all. A parameter only a part of which
 is kept, and every parameter of a function that does not keep it, stays borrowed as above.
 
+**Kept means kept on every way out.** A function that keeps a parameter on some paths only — an
+interning table that stores the pair it was asked about only when the pair is new, a set's `add`
+that stores nothing for a key it already holds — leaves it borrowed, and the path that keeps it
+takes a count where it stores it. Owned, every call would pay for the count's round trip, taken by
+the caller and given back by the callee, to spare one retain on the path that keeps; and the path
+that keeps nothing is, as often as not, the one that runs. The ways out are each `return`, each `?`
+that fails, and the end of the body. A branch keeps where each of its arms does; a loop
+keeps where each `break` out of it has kept and, unless it is a `loop` that only `break` ends, where
+the code before it already had, since its body may not run; a path that traps does not leave. A call that hands the parameter on to an owned parameter keeps it, recursion included.
+
+```sysl
+import sysl.container.{Map, map}
+
+struct Node
+    id: int
+
+// A hit hands back what the table holds and touches no count of `a` or `b`; only a miss takes one,
+// for each, where the pair is put in.
+intern(table: Map[(&Node, &Node), &Node], a: &Node, b: &Node) -> &Node
+    if table.get((a, b)) is Some(n) then return n
+
+    val n: &Node = Node(a.id + b.id)
+
+    table.put((a, b), n)
+    n
+
+val table = map[(&Node, &Node), &Node]()
+val x: &Node = Node(1)
+val y: &Node = Node(2)
+var sum = 0
+
+for _ in 0..<1000
+    sum += intern(table, x, y).id
+
+print(sum, table.len())
+```
+
+```output
+3000 1
+```
+
 Nothing about it is spelled in a signature either. A call through a closure, a function value or a
 trait object, and a call from C, reaches a borrowing entry that takes the count itself and then runs
 the owned body, so the convention is a matter between a function and its direct callers. A function
