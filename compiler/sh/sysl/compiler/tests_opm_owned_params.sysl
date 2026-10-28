@@ -737,3 +737,356 @@ opm_entry_library_routes()
     assert_eq(ran.0, "object 1\ndrop 1\nvalue 2\ndrop 2\ndirect 3\ndrop 3\n")
     assert(!ran.1.contains("still live"), ran.1)
     assert_eq(counts.1, 1)
+
+// -- kept on some ways out only: borrowed ---------------------------------------------------------------
+//
+// A parameter is owned only where every way out of the body has kept it -- each `return`, each `?`
+// that fails, and the end. One kept on some paths stays borrowed, the path that keeps it taking its
+// count at the store, so the paths that keep nothing touch no count at all.
+
+// Every cell is a function of one program built with the standard module, each called from `main` so
+// the program keeps it: the name of the owned body is there or it is not.
+private val opm_cold_cells: string = raw"""
+    struct Node
+        v: int
+
+    struct W
+        n: &Node
+
+    struct S
+        v: int
+
+    var last: W = W(Node(0))
+    var held: Option[W] = None
+    var shared: Option[&sync S] = None
+
+    wrap(n: &Node) -> W = W(n)
+
+    touch(v: int) = ()
+
+    remember(n: &Node, c: bool) -> int
+        if c then return n.v
+        last = W(n)
+        0
+
+    lend(n: &Node) -> int
+        var t = 0
+        for i in 0..<4
+            t += remember(n, i > 0)
+        t
+
+    both(n: &Node, c: bool) -> W
+        if c then return W(n)
+        wrap(n)
+
+    strict(n: &Node, c: bool) -> W
+        if c then panic("no")
+        W(n)
+
+    spin(n: &Node, k: int)
+        for _ in 0..<k
+            last = W(n)
+
+    once(n: &Node)
+        loop
+            last = W(n)
+            break
+
+    until(n: &Node, k: int)
+        var i = 0
+        while i < k
+            i += 1
+        else
+            last = W(n)
+
+    pick(a: &Node, b: &Node, c: bool) -> &Node = if c then a else b
+
+    same(a: &Node, c: int) -> W = c match
+        0 -> W(a)
+        _ -> wrap(a)
+
+    some(a: &Node, c: int) -> W = c match
+        0 -> W(a)
+        _ -> W(Node(c))
+
+    before(n: &Node, r: Result[int, int]) -> Result[W, int]
+        r?
+        Ok(W(n))
+
+    after(n: &Node, r: Result[int, int]) -> Result[int, int]
+        last = W(n)
+        r?
+        Ok(0)
+
+    maybe(n: &Node, c: bool) -> W = if c then wrap(n) else W(Node(0))
+
+    set_if(w: *W, n: &Node, c: bool)
+        if c then w.n = n
+
+    later(n: &Node, c: bool) -> int
+        if c
+            val f = () -> n.v
+            return f()
+        0
+
+    fwd(n: &Node) -> int = remember(n, false) + 1
+
+    rec(n: &Node, d: int) -> W
+        if d == 0 then return W(n)
+        if d > 5 then return W(Node(0))
+        val w = rec(n, d - 1)
+        touch(w.n.v)
+        w
+
+    cache[T](x: T, c: bool) -> Option[T] = if c then Some(x) else None
+
+    impl W
+        stash_if(self, c: bool) -> int
+            if c then held = Some(self)
+            self.n.v
+
+    sometimes(s: &sync S, c: bool)
+        if c then shared = Some(s)
+
+    always(s: &sync S)
+        shared = Some(s)
+
+    main()
+        val x: &Node = Node(1)
+        var w = W(x)
+        print(remember(x, true), lend(x), both(x, true).n.v, strict(x, false).n.v)
+        spin(x, 2)
+        once(x)
+        until(x, 1)
+        print(pick(x, x, true).v, same(x, 0).n.v, some(x, 0).n.v, before(x, Ok(1)).is_ok(), after(x, Ok(1)).is_ok())
+        print(maybe(x, true).n.v, later(x, true), fwd(x), rec(x, 2).n.v)
+        set_if(&w, x, true)
+        print(cache(x, true).is_some(), cache(3, true).is_some(), W(x).stash_if(true))
+        val s: &sync S = S(1)
+        sometimes(s, true)
+        always(s)
+    """
+
+// The functions of `opm_cold_cells`, lowered once.
+private opm_cold_funcs() -> Buf[(string, string)]
+    val prog = lbr_program(opm_cold_cells)
+    val ir = lbr_text(prog, [])
+
+    lbr_drop([prog])
+    func_texts(ir)
+end opm_cold_funcs
+
+private opm_cold_find(fs: Buf[(string, string)], symbol: string) -> string
+    for item in fs
+        if names_as_written(item.0, symbol) then return item.1
+
+    ""
+end opm_cold_find
+
+// Owned: the body under `<name>.owned`, and no plain body.
+private opm_cold_owned(fs: Buf[(string, string)], name: string)
+    assert_eq(s"$name: ${opm_cold_find(fs, name + ".owned").starts_with("define")}", s"$name: true")
+
+// Borrowed: one plain body and no owned one.
+private opm_cold_borrowed(fs: Buf[(string, string)], name: string)
+    assert_eq(s"$name: ${opm_cold_find(fs, name + ".owned").starts_with("define")}", s"$name: false")
+    assert_eq(s"$name: ${opm_cold_find(fs, name).starts_with("define")}", s"$name: true")
+
+@test("each way a parameter can be kept on some paths only leaves it borrowed, and every way of keeping it on all of them owns it")
+opm_cold_which_own()
+    if !lbr_ready() then return
+
+    val fs = opm_cold_funcs()
+
+    // Kept past an early return, in a loop body that may not run, by one arm of an `if` or a `match`,
+    // after a `?` that can leave first, handed on to an owned parameter, a field or a closure on one
+    // arm, through a call to a function that is itself borrowed, by a recursion with a way out that
+    // keeps nothing, by a generic, by a method's `self`, and as a `&sync`.
+    for name in ["remember", "spin", "pick", "some", "before", "maybe", "set_if", "later", "fwd", "rec",
+                 "cache.ref.Node", "W.stash_if", "sometimes"]
+        opm_cold_borrowed(fs, name)
+
+    // Kept on every way out: a return that keeps and an end that hands it on; around a path that
+    // traps, which leaves nothing; before the only `break` out of a `loop`; in a `while`'s `else`,
+    // which every end of a loop with no `break` runs; by every arm; before a `?`; always, as `&sync`.
+    for name in ["both", "strict", "once", "until", "same", "after", "always"]
+        opm_cold_owned(fs, name)
+
+@test("a cold keep takes its one count at the store, nothing on the path that returns early, and a lending caller none at all")
+opm_cold_counts()
+    if !lbr_ready() then return
+
+    val fs = opm_cold_funcs()
+    val ir = opm_cold_find(fs, "remember")
+
+    assert(ir.starts_with("define"), ir)
+    assert_eq(opm_takes(ir), 1)
+
+    // The early `return` is the first one in the text: nothing before it takes or gives a count.
+    val hit = ir[0..<ir.index_of("ret i32").unwrap()]
+
+    assert_eq(opm_count(hit, "call void @arc."), 0)
+
+    // `lend`'s own parameter is lent on to `remember` each round with no count taken.
+    opm_no_traffic(opm_cold_find(fs, "lend"))
+
+// Each cell run both ways -- the path that keeps and the one that does not -- through every route in:
+// a direct call, a trait object, a function value, a method, a generic, recursion, and the standard
+// map an interning table is built on.
+@test("parameters kept on some paths end the counted heap at nothing live on every route, each tag dropped once")
+opm_cold_counted_heap()
+    if !lbr_ready() then return
+
+    val ran = opm_counted(opm_tag + raw"""
+        import sysl.container.{Map, map}
+
+        var held: Option[&Tag] = None
+        var held_box: Option[Box2] = None
+
+        impl Box2
+            stash_if(self, c: bool) -> int
+                if c then held_box = Some(self)
+                self.t.id
+
+        remember(t: &Tag, c: bool) -> int
+            if c then return t.id
+            held = Some(t)
+            0
+
+        maybe_push(b: *Buf[&Tag], t: &Tag, c: bool) = if c then b.push(t)
+
+        later(t: &Tag, c: bool) -> Option[&Fn() -> int]
+            if c then return Some(() -> t.id)
+            None
+
+        pick(a: &Tag, b: &Tag, c: bool) -> &Tag = if c then a else b
+
+        rec(t: &Tag, d: int) -> int
+            if d == 0
+                held = Some(t)
+                return 1
+            if d > 5 then return 0
+            val r = rec(t, d - 1)
+            r + 1
+
+        cache[T](x: T, c: bool) -> Option[T] = if c then Some(x) else None
+
+        checked(t: &Tag, r: Result[int, string]) -> Result[int, string]
+            val v = r?
+            held = Some(t)
+            Ok(v)
+
+        trait Keeper
+            keep_if(self, t: &Tag, c: bool) -> int
+
+        struct K
+            n: int
+
+        impl Keeper for K
+            keep_if(self, t: &Tag, c: bool) -> int = remember(t, c)
+
+        apply(f: (&Tag, bool) -> int, t: &Tag, c: bool) -> int = f(t, c)
+
+        intern(table: Map[(&Tag, &Tag), &Tag], a: &Tag, b: &Tag, id: int) -> &Tag
+            if table.get((a, b)) is Some(n) then return n
+            val n: &Tag = Tag(id)
+            table.put((a, b), n)
+            n
+
+        main()
+            val a: &Tag = Tag(1)
+            print("remember", remember(a, true), remember(a, false))
+            held = None
+            var b: Buf[&Tag] = buf()
+            val p: &Tag = Tag(2)
+            maybe_push(&b, p, false)
+            maybe_push(&b, p, true)
+            maybe_push(&b, Tag(3), false)
+            maybe_push(&b, Tag(4), true)
+            print("push", b.len())
+            print("later", later(Tag(5), false).is_none(), later(Tag(6), true).unwrap()())
+            print("pick", pick(Tag(7), Tag(8), true).id, pick(Tag(9), Tag(10), false).id)
+            print("rec", rec(Tag(11), 3), rec(Tag(12), 9))
+            held = None
+            val g: &Tag = Tag(13)
+            print("cache", cache(g, false).is_none(), cache(g, true).unwrap().id, cache(7, true).unwrap())
+            print("checked", checked(Tag(14), Err("no")).is_err(), checked(Tag(15), Ok(3)).unwrap())
+            held = None
+            val k: &Keeper = K(0)
+            print("object", k.keep_if(Tag(16), true), k.keep_if(Tag(17), false))
+            held = None
+            print("value", apply(remember, Tag(18), true), apply(remember, Tag(19), false))
+            held = None
+            val bx = Box2(Tag(20))
+            print("self", bx.stash_if(false), bx.stash_if(true), Box2(Tag(21)).stash_if(true))
+            held_box = None
+            val table = map[(&Tag, &Tag), &Tag]()
+            val x: &Tag = Tag(22)
+            val y: &Tag = Tag(23)
+            var sum = 0
+            for i in 0..<5
+                sum += intern(table, x, y, 100 + i).id
+            print("intern", sum, table.len())
+            print("end")
+        """, [])
+
+    // A temporary lent to a borrowed parameter goes at the end of its statement, after the line is
+    // printed; one kept on the way is dropped by its keeper.
+    assert_eq(ran.0, "remember 1 0\ndrop 3\npush 2\nlater true 6\ndrop 6\ndrop 5\npick 7 10\ndrop 10\ndrop 9\n" +
+                     "drop 8\ndrop 7\nrec 4 0\ndrop 12\ndrop 11\ncache true 13 7\nchecked true 3\ndrop 14\n" +
+                     "drop 15\nobject 16 0\ndrop 16\ndrop 17\nvalue 18 0\ndrop 18\ndrop 19\nself 20 20 21\n" +
+                     "drop 21\nintern 500 1\nend\ndrop 100\ndrop 23\ndrop 22\ndrop 20\ndrop 13\ndrop 4\ndrop 2\n" +
+                     "drop 1\n")
+    assert(!ran.1.contains("still live"), ran.1)
+
+// The library and the program each work the answer out from the same body, so a cold keep compiled
+// into an artifact is called borrowed by a program built against it: a disagreement is a link error.
+private val opm_cold_lib: string = raw"""
+    module demo
+
+    import sysl.buf.{Buf, buf}
+
+    struct Tag
+        id: int
+
+    impl Drop for Tag
+        drop(self) = print("drop", self.id)
+
+    stash_if(b: *Buf[&Tag], t: &Tag, c: bool) = if c then b.push(t)
+
+    stash(b: *Buf[&Tag], t: &Tag) = b.push(t)
+    """
+
+@test("a program built against a library's artifact calls its cold-keeping function borrowed and ends at nothing live")
+opm_cold_library()
+    if !lbr_ready() then return
+
+    val lib = lbr_tree(lbr_one("demo/demo.sysl", opm_cold_lib))
+    val cache = lbr_temp("sysl-opm-cache")
+
+    use_root_cache_dir(Some(cache))
+    use_c_object_cache_dir(Some(cache))
+    clear_root_artifact_counts()
+
+    val ran = opm_counted(raw"""
+        import demo.*
+        import sysl.buf.{Buf, buf}
+
+        main()
+            var b: Buf[&Tag] = buf()
+            val x: &Tag = Tag(1)
+            stash_if(&b, x, false)
+            stash_if(&b, x, true)
+            stash_if(&b, Tag(2), false)
+            stash_if(&b, Tag(3), true)
+            stash(&b, Tag(4))
+            print(b.len(), x.id)
+        """, [lib])
+    val counts = root_artifact_counts()
+
+    use_root_cache_dir(None)
+    use_c_object_cache_dir(None)
+    lbr_drop([lib, cache])
+    assert_eq(ran.0, "drop 2\n3 1\ndrop 4\ndrop 3\ndrop 1\n")
+    assert(!ran.1.contains("still live"), ran.1)
+    assert_eq(counts.1, 1)
