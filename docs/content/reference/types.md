@@ -1427,6 +1427,22 @@ and calls the closure directly, with nothing on the heap. `f: &Fn(A) -> B` is a 
 a trait object, so the closure is boxed at the call and dispatched through a table. Both accept the
 same closures; they differ in what the call costs and in what the declaration compiles to.
 
+**Parentheses before the arrow are its parameter list**, whatever its length: `(string) -> usize`
+is the same type as `string -> usize`, `() -> T` takes nothing, and `((int, int)) -> int` takes one
+tuple. Only the arrow makes them a list — `(string)` with none after it is a type in parentheses,
+and refused.
+
+```sysl
+apply(f: (string) -> usize, s: string) -> usize = f(s)
+sum(f: ((int, int)) -> int) -> int = f((3, 4))
+
+print(apply(t -> t.len, "four"), sum(t -> t.0 + t.1))
+```
+
+```output
+4 7
+```
+
 **A trait member may use either**, with one further consequence: an arrow makes the member declare a
 type parameter, so it gets no table slot and cannot be dispatched through a trait object
 ([traits](/reference/traits/#object-safety)). A trait meant for trait objects uses `&Fn(…)`; one

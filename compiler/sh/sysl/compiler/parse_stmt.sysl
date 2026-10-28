@@ -1002,6 +1002,12 @@ end parse_asm_operand
 private parse_expr_or_multi(p: *Parser, start: Span, inline: bool) -> Stmt
     val first = parse_expr(p)
 
+    *first.kind match
+        Assign(op, target, value) -> paren_places(target) match
+            Some(places) -> return parse_paren_multi(p, start, inline, op, places, value)
+            None -> ()
+        _ -> ()
+
     // **Inside a bracket the comma is the bracket's**, so an inline branch there reads no list at
     // all: `f(a = if c then 1 else 2, b = 3)` is two arguments, not an `else` assigning `2, b = 3`.
     if !p.at_kw(",") || (inline && p.nest > 0)
@@ -1049,6 +1055,45 @@ private parse_expr_or_multi(p: *Parser, start: Span, inline: bool) -> Stmt
 
     stmt(start.to(p.just_taken()), MultiAssign(op, parts, values))
 end parse_expr_or_multi
+
+// The places a tuple on the left of an assignment lists. A tuple is where a `_` in it closes, so
+// `(a, _)` arrives as the closure over it, and is taken back apart here: the list a multiple
+// assignment checks is the one that was written, and it is the analyzer that says what `_` is not.
+private paren_places(target: Expr) -> Option[Buf[Expr]] = *target.kind match
+    Tuple(places) -> Some(places)
+    Lambda(params, body, false) ->
+        if body.len() != 1 then return None
+
+        for q in params
+            if !is_placeholder(q.name) then return None
+
+        *body.at(0).kind match
+            ExprStmt(e) -> *e.kind match
+                Tuple(places) -> Some(places)
+                _ -> None
+            _ -> None
+    _ -> None
+
+// `(a, b) = f()`, the parenthesised spelling of `a, b = f()`: a tuple of places on the left of an
+// assignment is the list of places a multiple assignment writes, so the two spellings are one
+// statement, compound operators and a list of values on the right included. The expression reading
+// has already taken the first value; the rest of the list follows its commas, which belong to a
+// bracket instead where an inline branch stands inside one.
+private parse_paren_multi(p: *Parser, start: Span, inline: bool, op: string, places: Buf[Expr],
+                          value: Expr) -> Stmt
+    var values: Buf[Expr] = buf()
+
+    values.push(lift_placeholders(value))
+
+    if !(inline && p.nest > 0)
+        loop
+            if !p.accept_kw(",") then break
+
+            values.push(lift_placeholders(parse_expr(p)))
+    end if
+
+    stmt(start.to(p.just_taken()), MultiAssign(op, places, values))
+end parse_paren_multi
 
 // The assignment operator standing at the cursor, or `""` where there is none.
 private assign_word(p: *Parser) -> string = p.peek() match

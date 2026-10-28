@@ -892,6 +892,28 @@ print(a, b)
 Both sides saw the values the statement started with. Two separate statements would differ:
 `a += b` followed by `b += a` folds the new `a` into `b`.
 
+**The places may be written in parentheses**, as a tuple of places: `(a, b) = (b, a)` is the
+statement above, with every operator, value list and place the bare list takes. The places do not
+nest, in either spelling, and each one is written — `_` is not a place.
+
+```sysl
+pair(n: int) -> (int, int) = (n, n * 2)
+
+var lo = 0
+var hi = 0
+
+(lo, hi) = pair(5)
+print(lo, hi)
+
+(lo, hi) = (hi, lo)
+print(lo, hi)
+```
+
+```output
+5 10
+10 5
+```
+
 A place's own subexpressions are evaluated **exactly once**, before the assignments — so in
 `xs[f()], xs[g()] = xs[g()], xs[f()]` each of `f` and `g` runs once.
 
