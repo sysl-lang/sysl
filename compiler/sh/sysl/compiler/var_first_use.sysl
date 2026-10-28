@@ -27,12 +27,15 @@ import sysl.buf.{Buf, buf}
 
 // A binding still waiting for a use to fix its type: its unique name in this body, where its
 // declaration starts (what a fix is filed under), the literal it was given, and how long the log of
-// fixes was when it was bound -- only a fix after that is about this reading of it.
+// fixes was when it was bound -- only a fix after that is about this reading of it. `counted` marks
+// the variable of a `for` over a range whose bounds are both bare literals: it is fixed only at an
+// integer type, and the bounds are read at that type, so one that does not fit is told at itself.
 struct OpenVar
     unique: string
     at: usize
     init: Expr
     since: usize
+    counted: bool
 end OpenVar
 
 // How far a scope's bindings and imports reached when a reading began.
@@ -140,7 +143,47 @@ end fixed_type
 open_binding(cx: &Analyzer, span: Span, typ: Option[TypeRef], init: Expr, unique: string)
     if typ.is_some() || literal_default(init).is_none() then return
 
-    cx.open_vars.push(OpenVar(unique, span.start, init, cx.var_fix_log.len()))
+    cx.open_vars.push(OpenVar(unique, span.start, init, cx.var_fix_log.len(), false))
+
+// Whether a range's bounds are both bare integer literals, so the variable of a `for` over it is
+// open: its first use that fixes a type decides the range's.
+counted_open(lo: Expr, hi: Expr) -> bool =
+    literal_default(lo).map(t -> type_eq(t, int_type())).unwrap_or(false) &&
+        literal_default(hi).map(t -> type_eq(t, int_type())).unwrap_or(false)
+
+// Reads a `for` over a range whose bounds are both bare integer literals -- `read(None)` binds the
+// variable at `int` as one waiting for its first use, filed under `at` -- and reads it again at the
+// type a use fixed, where one fixed it at anything else. The second reading is as though the bounds
+// had been written with that type, so a second use that disagrees, or a bound that does not fit, is
+// told exactly as it would be then.
+counted_first_use_read[T](cx: &Analyzer, at: usize, read: Option[Type] -> T) -> T
+    val open_mark = cx.open_vars.len()
+    val tried = begin_trial(cx)
+    val scope = cx.scope_mark()
+    val got = read(None)
+    var fixed: Option[Type] = None
+
+    for k in tried.var_fixes..<cx.var_fix_log.len()
+        val f = cx.var_fix_log.at(k)
+
+        if f.at == at && !type_eq(f.ty, int_type()) then fixed = Some(f.ty)
+
+    cx.open_vars.truncate(open_mark)
+
+    if fixed.is_none()
+        keep_trial(cx)
+
+        return got
+    end if
+
+    discard_trial(cx, tried)
+    cx.rewind_scope(scope)
+    read(fixed)
+end counted_first_use_read
+
+// Records a counted `for`'s variable, just bound at `int`, as one waiting for its first use.
+open_counted(cx: &Analyzer, at: usize, lo: Expr, unique: string) =
+    cx.open_vars.push(OpenVar(unique, at, lo, cx.var_fix_log.len(), true))
 
 // A name read where a type is expected of it: the use that fixes an open binding's type, unless the
 // name is an operand.
@@ -159,10 +202,12 @@ note_var_fix(cx: &Analyzer, unique: string, ty: Type)
 
         if !numeric_scalar(ty) then return
 
+        if o.counted && !integer_scalar(ty) then return
+
         for k in o.since..<cx.var_fix_log.len()
             if cx.var_fix_log.at(k).at == o.at then return
 
-        if !literal_fits(cx, o.init, ty) then return
+        if !o.counted && !literal_fits(cx, o.init, ty) then return
 
         cx.var_fix_log.push(VarFix(o.at, ty))
         return
@@ -172,6 +217,10 @@ private numeric_scalar(t: Type) -> bool = repr(t) match
     Integer(_, _, _) -> true
     Floating(_, _) -> true
     Fixed(_, _, _) -> true
+    _ -> false
+
+private integer_scalar(t: Type) -> bool = repr(t) match
+    Integer(_, _, _) -> true
     _ -> false
 
 // A name or arithmetic read as an operand, or where an open binding's own assignment reads it, is
@@ -310,4 +359,4 @@ end assigned_fix
 // The inner analyzer files its fixes in the outer's log.
 carry_open(outer: &Analyzer, inner: &Analyzer, outer_unique: string, inner_unique: string)
     for o in outer.open_vars
-        if o.unique == outer_unique then inner.open_vars.push(OpenVar(inner_unique, o.at, o.init, o.since))
+        if o.unique == outer_unique then inner.open_vars.push(OpenVar(inner_unique, o.at, o.init, o.since, o.counted))

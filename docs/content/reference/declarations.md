@@ -280,6 +280,60 @@ print(narrow(i))
 'n' of 'narrow' is byte, but usize was given
 ```
 
+**A `for` over a range whose bounds are both bare literals follows the same rule.** In `for s in
+1..3` the variable takes its type from its first use that fixes one, and the bounds are read at that
+type. Only an integer type fixes it. A loop with no such use, or with only an index or a float
+argument, counts in `int`. `for all` and `for some` read their ranges the same way. A range held in a
+binding (`val r = 1..3`) already has its type, as does one with a bound of a type of its own (`0..<n`,
+`0u16..<3`).
+
+```sysl
+seed(n: u64) -> u64 = n * 1000000007
+
+for s in 1..3
+    print(seed(s))
+```
+
+```output
+1000000007
+2000000014
+3000000021
+```
+
+A bound that does not fit the type a use fixed is refused at the bound. The top bound of an exclusive
+range is refused as well, because it is still a value of the range's type:
+
+```sysl
+narrow(n: u8) -> u8 = n
+
+for i in 0..<256
+    print(narrow(i))
+```
+
+```error
+the literal 256 does not fit byte
+```
+
+A comparison with a narrow value is a use that fixes the variable, so arithmetic on it wraps at that
+width, as it would with the type written on a bound:
+
+```sysl
+val limit: u8 = 252
+
+for i in 250..<255
+    if i == limit then print("at the limit")
+    print(i + 10)
+```
+
+```output
+4
+5
+at the limit
+6
+7
+8
+```
+
 ### A module member takes its type as a local does
 
 A **member of a module** may leave its type off as a local may: `val limit = 10` is an `int`
