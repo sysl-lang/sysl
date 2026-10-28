@@ -1210,6 +1210,7 @@ grammars.
 | `-p <member>`, `--package <member>` | in a [workspace](/reference/packages/#workspaces), the member to build, test or run |
 | `-v`, `--verbose` | report what the build decided: the files read, the standard module and how it was reached, the search paths, the allocator, and the clang and linker command lines |
 | `--explain-escapes` | report every local array promoted to the heap |
+| `--explain-drop-order` | report every local declared below a `defer` in its block, whose release the 0.8.0 drop order moves ahead of that `defer` |
 
 **An unknown option is refused, never ignored.** Each mistake is reported on a line of its own, with
 the command's usage below, on standard error, and the exit status is 2. A misspelt `--relase` is
@@ -1433,6 +1434,26 @@ tty.sysl:31:12: 'buf' is promoted to the heap, because this view of it is return
 The position given is the **view**, not the declaration, because the view is the part that is hard
 to find by reading. When nothing was promoted, the flag says so explicitly, so you know it took
 effect. [Memory](/reference/memory/) explains what promotion is and when it happens.
+
+### `--explain-drop-order`
+
+Reports on stderr one line for each local whose release changes place when sysl 0.8.0 adopts
+the interleaved drop order. In that order, leaving a block undoes it in reverse order of where
+each thing was written, so a `defer` runs **after** the locals declared below it are released. The
+current order runs every `defer` first. A local qualifies when it is declared below a `defer` or an
+`errdefer` in the same block and its type carries a count. The line says whether that release can
+run a destructor:
+
+```
+$ sysl build --explain-drop-order server.sysl
+server.sysl:169: 'conn' (&Connection) is declared after the defer at line 167: leaving the block will release it before that defer runs, not after -- a release that can run Connection's Drop
+```
+
+It reads every body in the project's own files, including bodies nothing calls. `build`, `run`,
+`test`, `build-c`, `build-lib` and `emit-llvm` all take it. A `run` or `test` that asks for it
+compiles instead of replaying a cached binary. When no block is affected, the flag says so. A
+local listed here may not actually be released by its block, for example one handed to a callee
+that keeps it, so read each line rather than counting them.
 
 ### `-O2` is written the way clang writes it
 

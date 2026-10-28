@@ -169,6 +169,14 @@ private var sp_say: Option[&Fn(string) -> unit] = None
 
 explaining() -> bool = sp_explain
 
+// Whether `--explain-drop-order` was given: the build says, one line per local, which blocks the
+// interleaved order of `docs/design/borrowed-return.md § 7` would undo differently
+// (`drop_census.sysl`). A run or a test build asking for it compiles rather than replaying, as one
+// asking for the escapes does.
+private var sp_explain_drops: bool = false
+
+explaining_drops() -> bool = sp_explain_drops
+
 // One line a command says beside its output rather than in it -- a manifest key this compiler does
 // not understand, say. It goes where `--explain-escapes` reports, which `main` points at standard
 // error, and to standard error where no command line set a channel.
@@ -185,6 +193,7 @@ set_explain_sink(say: &Fn(string) -> unit)
 // build in the same process neither reports nor calls a closure its caller has let go.
 close_explain_sink()
     sp_explain = false
+    sp_explain_drops = false
     sp_say = None
 
 // Says each line of the report, where one was asked for. Nothing otherwise.
@@ -199,6 +208,16 @@ explain_escapes(lines: Buf[string])
             for item in lines
                 say(item)
 end explain_escapes
+
+// Says the drop-order census, where one was asked for: each line, or that no block would change.
+explain_drop_order_lines(lines: Buf[string])
+    if !sp_explain_drops then return
+
+    if lines.is_empty() then say_note("no block's way out changes order under the interleaved drop order")
+
+    for item in lines
+        say_note(item)
+end explain_drop_order_lines
 
 // Every source root a `--lib` named, as it was written and in the order it was written.
 //
@@ -436,6 +455,11 @@ took_search_flag(args: []string, i: usize) -> int
 
     if arg == "--explain-escapes"
         sp_explain = true
+        return 1
+    end if
+
+    if arg == "--explain-drop-order"
+        sp_explain_drops = true
         return 1
     end if
 

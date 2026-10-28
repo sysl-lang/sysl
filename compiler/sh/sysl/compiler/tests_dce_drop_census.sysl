@@ -1,0 +1,474 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+
+// `--explain-drop-order`: the census the 0.8.0 drop order is landed behind
+// (`docs/design/borrowed-return.md § 7`, item D1). Each line names a local declared after a `defer` or
+// an `errdefer` in the same block, which the interleaved order releases before that deferred statement
+// runs rather than after it. The probes d01-d05 of the design note are the shapes; the negatives are
+// the neighbours whose order the change leaves alone.
+
+// What one command line came to: the status, and each line of the report on its own channel. The
+// program is written to a directory of its own and removed. `None` without the library.
+private dce_run(command: string, text: string, flag: bool) -> Option[(int, Buf[string], string)]
+    if xvr_no_library() then return None
+
+    val root = make_temp_dir("sysl-dce").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    var lines: Buf[string] = buf()
+    val sink = &lines
+    var notes: Buf[string] = buf()
+    val noted = &notes
+    val file = s"$root/main.sysl"
+    var args: Buf[string] = buf()
+
+    args.push("sysl")
+    args.push(command)
+    if flag then args.push("--explain-drop-order")
+
+    if command == "build"
+        args.push("-o")
+        args.push(s"$root/main")
+    end if
+
+    args.push(file)
+
+    val code = run_cli_noted(args.view(), (line) -> sink.push(line), (line) -> noted.push(line))
+
+    remove_dir_all(root).unwrap_or(())
+    Some((code, notes, file))
+end dce_run
+
+// The census lines among what a command said, which is every note but the standard module's build.
+private dce_census(notes: Buf[string]) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for item in notes
+        if !item.starts_with("building the standard module") then out.push(item)
+
+    out
+end dce_census
+
+private dce_drop(file: string, line: int, name: string, ty: string, word: string, at: int,
+                 dropped: string) -> string =
+    s"$file:$line: '$name' ($ty) is declared after the $word at line $at: leaving the block will " +
+        s"release it before that $word runs, not after -- a release that can run $dropped's Drop"
+
+private dce_count(file: string, line: int, name: string, ty: string, word: string, at: int) -> string =
+    s"$file:$line: '$name' ($ty) is declared after the $word at line $at: leaving the block will " +
+        s"release it before that $word runs, not after -- a count given back, no destructor"
+
+private dce_none() -> string = "no block's way out changes order under the interleaved drop order"
+
+private dce_noisy() -> string = raw"""
+    struct Noisy
+        name: string
+
+    impl Drop for Noisy
+        drop(self) = print("drop " + self.name)
+
+    """
+
+@test("d01: each local below a defer is one line, naming the nearest defer above it")
+dce_interleaved_defers()
+    dce_run("emit-llvm", dce_noisy() + raw"""
+        run()
+            val a: &Noisy = Noisy("a")
+            defer print("defer 1")
+            val b: &Noisy = Noisy("b")
+            defer print("defer 2")
+            val c: &Noisy = Noisy("c")
+
+            print("body " + a.name + b.name + c.name)
+
+        run()
+        """, true) match
+        None -> ()
+        Some((code, notes, file)) ->
+            val got = dce_census(notes)
+
+            assert_eq(code, Fine)
+            assert_eq(got.len(), 2)
+            assert_eq(got.at(0), dce_drop(file, 10, "b", "&Noisy", "defer", 9, "Noisy"))
+            assert_eq(got.at(1), dce_drop(file, 12, "c", "&Noisy", "defer", 11, "Noisy"))
+end dce_interleaved_defers
+
+@test("d02: a reference read out under a deferred unlock is a line, through an Option payload")
+dce_the_benchtop_race()
+    dce_run("emit-llvm", raw"""
+        struct Lock
+            held: bool
+
+            lock(*self)
+                self.held = true
+
+            unlock(*self)
+                self.held = false
+
+        struct Host
+            name: string
+
+        impl Drop for Host
+            drop(self) = print("release")
+
+        struct Shared
+            host: Option[&Host]
+
+        var guard = Lock(false)
+        var shared = Shared(None)
+
+        write()
+            guard.lock()
+            defer guard.unlock()
+
+            val h = shared.host.unwrap()
+
+            shared.host = None
+            print(h.name)
+
+        shared.host = Some(Host("dsi"))
+        write()
+        """, true) match
+        None -> ()
+        Some((code, notes, file)) ->
+            val got = dce_census(notes)
+
+            assert_eq(code, Fine)
+            assert_eq(got.len(), 1)
+            assert_eq(got.at(0), dce_drop(file, 26, "h", "&Host", "defer", 24, "Host"))
+end dce_the_benchtop_race
+
+@test("d03: a loop body is a block of its own; a local above the defer and the outer block are not lines")
+dce_loop_body()
+    dce_run("emit-llvm", dce_noisy() + raw"""
+        run(stop: bool) -> int
+            val a: &Noisy = Noisy("a")
+            defer print("defer outer")
+
+            for i in 0..<3
+                val b: &Noisy = Noisy(s"b$i")
+                defer print("defer loop")
+                val c: &Noisy = Noisy(s"c$i")
+
+                if i == 1 then break
+                if stop then return i
+
+            print(a.name)
+            0
+
+        run(false)
+        """, true) match
+        None -> ()
+        Some((code, notes, file)) ->
+            val got = dce_census(notes)
+
+            assert_eq(code, Fine)
+            assert_eq(got.len(), 1)
+            assert_eq(got.at(0), dce_drop(file, 14, "c", "&Noisy", "defer", 13, "Noisy"))
+end dce_loop_body
+
+@test("d04 and d05: a local the defer reads is above it; a local handed off is still listed")
+dce_read_and_moved()
+    dce_run("emit-llvm", dce_noisy() + raw"""
+        keep(n: &Noisy) -> &Noisy = n
+
+        run()
+            var late: Option[&Noisy] = None
+            defer print("defer " + (late match
+                Some(n) -> n.name
+                None -> "nothing"))
+            val b: &Noisy = Noisy("b")
+            val kept = keep(b)
+
+            late = Some(Noisy("late"))
+            print(kept.name)
+
+        run()
+        """, true) match
+        None -> ()
+        Some((code, notes, file)) ->
+            val got = dce_census(notes)
+
+            assert_eq(code, Fine)
+            assert_eq(got.len(), 2)
+            assert_eq(got.at(0), dce_drop(file, 14, "b", "&Noisy", "defer", 11, "Noisy"))
+            assert_eq(got.at(1), dce_drop(file, 15, "kept", "&Noisy", "defer", 11, "Noisy"))
+end dce_read_and_moved
+
+@test("an errdefer is named as one, and a string below it gives a count back with no destructor")
+dce_errdefer_and_count_only()
+    dce_run("emit-llvm", raw"""
+        enum Oops
+            Bad
+
+        work(n: int) -> Result[int, Oops]
+            errdefer print("undo")
+            val s = s"n=$n"
+
+            if n < 0 then return Err(Bad)
+            print(s)
+            Ok(n)
+
+        print(work(1).is_ok())
+        """, true) match
+        None -> ()
+        Some((code, notes, file)) ->
+            val got = dce_census(notes)
+
+            assert_eq(code, Fine)
+            assert_eq(got.len(), 1)
+            assert_eq(got.at(0), dce_count(file, 6, "s", "string", "errdefer", 5))
+end dce_errdefer_and_count_only
+
+@test("every block form: an if arm, a match arm, a while body, a nested block, a closure, a method")
+dce_block_forms()
+    dce_run("emit-llvm", dce_noisy() + raw"""
+        struct Holder
+            n: int
+
+            show(self)
+                defer print("method")
+                val m: &Noisy = Noisy("m")
+                print(m.name)
+
+        run(k: int)
+            if k > 0
+                defer print("if")
+                val i: &Noisy = Noisy("i")
+                print(i.name)
+
+            k match
+                1 ->
+                    defer print("arm")
+                    val a: &Noisy = Noisy("a")
+                    print(a.name)
+                _ -> ()
+
+            var j = 0
+
+            while j < 1
+                defer print("while")
+                val w: &Noisy = Noisy("w")
+                j += 1
+                print(w.name)
+
+            val f = () ->
+                defer print("closure")
+                val c: &Noisy = Noisy("c")
+                print(c.name)
+
+            f()
+
+        run(1)
+        Holder(0).show()
+        """, true) match
+        None -> ()
+        Some((code, notes, file)) ->
+            val got = dce_census(notes)
+            val want = [dce_drop(file, 12, "m", "&Noisy", "defer", 11, "Noisy"),
+                        dce_drop(file, 18, "i", "&Noisy", "defer", 17, "Noisy"),
+                        dce_drop(file, 24, "a", "&Noisy", "defer", 23, "Noisy"),
+                        dce_drop(file, 32, "w", "&Noisy", "defer", 31, "Noisy"),
+                        dce_drop(file, 38, "c", "&Noisy", "defer", 37, "Noisy")]
+
+            assert_eq(code, Fine)
+            assert_eq(got.len(), want.len)
+
+            for line in want
+                var found = false
+
+                for item in got
+                    if item == line then found = true
+
+                assert(found, s"missing: $line\n${got.join("\n")}")
+end dce_block_forms
+
+@test("a Drop reached through a struct's field; a generic body is a line only where its T counts, once")
+dce_drop_through_a_field_and_a_generic()
+    dce_run("emit-llvm", dce_noisy() + raw"""
+        struct Wrapper
+            inner: &Noisy
+
+        hold[T](x: T) -> T
+            defer print("generic")
+            val y: Option[T] = Some(x)
+
+            y.unwrap()
+
+        run()
+            defer print("run")
+            val w = Wrapper(Noisy("w"))
+
+            print(w.inner.name)
+
+        run()
+        print(hold(1))
+        print(hold("s"))
+        print(hold("t").len)
+        """, true) match
+        None -> ()
+        Some((code, notes, file)) ->
+            val got = dce_census(notes)
+            var generic = 0
+            var wrapped = 0
+
+            for item in got
+                if item == dce_count(file, 12, "y", "sysl.Option[string]", "defer", 11) then generic += 1
+                if item == dce_drop(file, 18, "w", "Wrapper", "defer", 17, "Noisy") then wrapped += 1
+
+            assert_eq(code, Fine)
+            assert_eq(got.len(), 2, got.join("\n"))
+            assert_eq(generic, 1, got.join("\n"))
+            assert_eq(wrapped, 1, got.join("\n"))
+end dce_drop_through_a_field_and_a_generic
+
+@test("a 'val _' holds its value to the block's end, so it is a line like any local")
+dce_val_underscore()
+    dce_run("emit-llvm", dce_noisy() + raw"""
+        make() -> &Noisy = Noisy("t")
+
+        run()
+            defer print("defer")
+            val _ = make()
+
+        run()
+        """, true) match
+        None -> ()
+        Some((code, notes, file)) ->
+            val got = dce_census(notes)
+
+            assert_eq(code, Fine)
+            assert_eq(got.len(), 1, got.join("\n"))
+            assert_eq(got.at(0), dce_drop(file, 11, "_", "&Noisy", "defer", 10, "Noisy"))
+end dce_val_underscore
+
+@test("a '&value' slot below a defer is the block's too, so it is a line; one above is not")
+dce_temp_address()
+    dce_run("emit-llvm", dce_noisy() + raw"""
+        make(n: string) -> &Noisy = Noisy(n)
+
+        peek(p: *&Noisy) -> usize = (*p).name.len
+
+        run()
+            print(peek(&make("above")))
+            defer print("defer")
+            val n = peek(&make("statement"))
+            print(n + peek(&make("last line")))
+
+        run()
+        """, true) match
+        None -> ()
+        Some((code, notes, file)) ->
+            val got = dce_census(notes)
+
+            assert_eq(code, Fine)
+            assert_eq(got.len(), 2, got.join("\n"))
+
+            for i in 0..<2
+                assert_eq(got.at(i), s"$file:${14 + i}: the slot a '&value' made (&Noisy) is declared after " +
+                    "the defer at line 13: leaving the block will release it before that defer runs, not " +
+                    "after -- a release that can run Noisy's Drop")
+end dce_temp_address
+
+@test("negatives: nothing counted below, a counted local in a nested block, a local above, a temporary")
+dce_negatives()
+    dce_run("emit-llvm", dce_noisy() + raw"""
+        make() -> &Noisy = Noisy("t")
+
+        run()
+            val above: &Noisy = Noisy("above")
+            defer print("defer")
+            val n = 3
+
+            if n > 2
+                val inner: &Noisy = Noisy("inner")
+                print(inner.name)
+
+            print(above.name + make().name)
+
+        run()
+        """, true) match
+        None -> ()
+        Some((code, notes, _)) ->
+            val got = dce_census(notes)
+
+            assert_eq(code, Fine)
+            assert_eq(got.len(), 1, got.join("\n"))
+            assert_eq(got.at(0), dce_none())
+end dce_negatives
+
+@test("without the flag the build says nothing about drop order")
+dce_not_asked()
+    dce_run("emit-llvm", dce_noisy() + raw"""
+        run()
+            defer print("defer")
+            val b: &Noisy = Noisy("b")
+            print(b.name)
+
+        run()
+        """, false) match
+        None -> ()
+        Some((code, notes, _)) ->
+            assert_eq(code, Fine)
+            assert_eq(dce_census(notes).len(), 0)
+end dce_not_asked
+
+@test("a program that does not compile reports only its error")
+dce_refused_program()
+    dce_run("emit-llvm", dce_noisy() + raw"""
+        run()
+            defer print("defer")
+            val b: &Noisy = Noisy("b")
+            print(b.nam)
+
+        run()
+        """, true) match
+        None -> ()
+        Some((code, notes, _)) ->
+            assert(code != Fine)
+
+            for item in dce_census(notes)
+                assert(!item.contains("is declared after the"), item)
+end dce_refused_program
+
+@test("a run asks again rather than replaying: the second run reports as the first did")
+dce_run_does_not_replay()
+    val text = dce_noisy() + raw"""
+        run()
+            defer print("defer")
+            val b: &Noisy = Noisy("b")
+            print(b.name)
+
+        run()
+        """
+
+    if xvr_no_library() then return
+
+    val root = make_temp_dir("sysl-dce").unwrap()
+    val file = s"$root/main.sysl"
+
+    write_text(file, text).unwrap()
+
+    for round in 0..<2
+        var notes: Buf[string] = buf()
+        val noted = &notes
+        val code = run_cli_noted(["sysl", "run", "--explain-drop-order", file], (line) -> (),
+                                 (line) -> noted.push(line))
+        val got = dce_census(notes)
+
+        assert_eq(code, Fine)
+        assert_eq(got.len(), 1, s"round $round: ${got.join("\n")}")
+        assert_eq(got.at(0), dce_drop(file, 9, "b", "&Noisy", "defer", 8, "Noisy"))
+
+    remove_dir_all(root).unwrap_or(())
+end dce_run_does_not_replay
+
+@test("the flag is under the help's options heading and in a compiling command's usage")
+dce_help_and_usage()
+    assert(where_flags().contains("[--explain-drop-order]"), where_flags())

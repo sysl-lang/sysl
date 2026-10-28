@@ -673,6 +673,7 @@ emit_llvm_text(path: string, named_target: Option[string],
 
     phase_done("checks")
     explain_promotions(promotions, program, done.an)
+    explain_drops(program, done.an, whole)
 
     // The tests go next, and they go **after** the analysis rather than instead of it: a `@test`
     // that does not compile is an error in a build that would never have run it, which is what makes
@@ -826,15 +827,7 @@ end joined_names
 private explain_promotions(pr: Promotions, program: Compilation, an: &Analysis)
     if !errors_of(an.diagnostics()).is_empty() then return
 
-    // The files of the modules the program declared, which is what a note is about.
-    var files: Buf[string] = buf()
-
-    for unit in program.units
-        for j in 0..<program.own.len()
-            if program.own.at(j) == module_written(unit)
-                files.push(unit.src.name)
-                break
-
+    val files = own_files(program)
     var lines: Buf[string] = buf()
 
     for item in pr.notes
@@ -845,6 +838,24 @@ private explain_promotions(pr: Promotions, program: Compilation, an: &Analysis)
 
     explain_escapes(lines)
 end explain_promotions
+
+// The files of the modules the program declared, which is what a report is about.
+private own_files(program: Compilation) -> Buf[string]
+    var files: Buf[string] = buf()
+
+    for unit in program.units
+        for j in 0..<program.own.len()
+            if program.own.at(j) == module_written(unit)
+                files.push(unit.src.name)
+                break
+
+    files
+end own_files
+
+// What `--explain-drop-order` reports about the program's own files (`drop_census.sysl`), read off
+// the unpruned tree so a body nothing calls yet is in it.
+private explain_drops(program: Compilation, an: &Analysis, whole: TProgram) =
+    explain_drop_census(an, whole, program.units, program.own)
 
 // The machine a command line asked for: the one it named, the manifest's default, or this host --
 // with the floor the manifest states checked before anything is read.
@@ -1672,6 +1683,7 @@ private lower_for_c(path: string, t: Target) -> Result[LoweredForC, Failure]
     val promotions = post_analysis_checks(done.an, whole, program.own)
 
     explain_promotions(promotions, program, done.an)
+    explain_drops(program, done.an, whole)
 
     val kept = prune(strip_tests(whole), program.own)
 
@@ -1963,9 +1975,15 @@ end std_tree_note
 // The key for one command over one tree, or nothing where the machine it names cannot be settled --
 // in which case the compilation this stands in front of is about to say so in its own words.
 run_cache_key_for(command: string, path: string, named_target: Option[string], level: string,
-                  cc: Option[string]) -> Option[string] = target_for(path, named_target) match
-    Ok(t) -> run_cache_key_of(command, path, t, level, cc)
-    Err(_) -> None
+                  cc: Option[string]) -> Option[string]
+    // A replayed build was compiled without the drop-order census being asked for, so one asking
+    // for it has no entry to replay.
+    if explaining_drops() then return None
+
+    target_for(path, named_target) match
+        Ok(t) -> run_cache_key_of(command, path, t, level, cc)
+        Err(_) -> None
+end run_cache_key_for
 
 // What a shell hears when a child ends. A signal has no exit status of its own, and `128 + n` is what
 // every shell reports for one -- so it is what a caller reading this number will already be
@@ -2081,6 +2099,9 @@ private test_build_from(program: Compilation, standalone: bool, level: string,
 
     val whole = program_of(done, done.main_module)
     val promotions = post_analysis_checks_of_tests(done.an, whole, program.own)
+
+    explain_drops(program, done.an, whole)
+
     val kept = tests_only(whole, program.own)
 
     check_library_hooks(done.an, kept)
