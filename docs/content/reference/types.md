@@ -587,6 +587,30 @@ true true false
 Ok(()) Err(Low)
 ```
 
+**A `unit` still has an address.** `&` of a `unit` binding is a `*unit`, and a `&unit` or a `weak
+unit` may hold one, as at every zero-sized type: the address is non-null and aligned, a load through
+it is `()` and a store writes nothing, so neither touches memory. This is what lets a generic body
+that takes the address of a `T` compile at `unit` like at any other type. C sees a `*unit` as a
+`void *`. An array or a slice of `unit` is still refused: `unit` is the type the compiler drops, so
+there would be nothing to index.
+
+```sysl
+through[T](x: T) -> T
+    var v = x
+    val p: *T = &v
+    *p
+
+var u = ()
+val p = &u
+
+*p = ()
+print(through(()), through(3), *p, usize(p) != 0)
+```
+
+```output
+() 3 () true
+```
+
 `never` is the type with **no** values: the type of an expression that does not finish. A call to
 `exit` has type `never`, as does a `return` or a `break` used as an expression. Because it has no
 values, `never` is a subtype of every type, so a `match` arm that aborts can sit beside arms that
