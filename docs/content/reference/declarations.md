@@ -202,7 +202,7 @@ annotation's type. **An operand of a type of its own beside them in arithmetic f
 `sum + b` with `b` a `u8`, `sum` keeps its default and `b` widens to it, exactly as though the
 default had been written, so the sum is 260 rather than a byte that wrapped. Arithmetic wraps on
 overflow, and a type the program never named is not chosen for it. A later comparison with `b` is
-still a use that fixes `sum`. A shift has the type of the value shifted; its amount is fixed by
+still a use that fixes `sum`. (A `for` variable is the exception, below.) A shift has the type of the value shifted; its amount is fixed by
 nothing the shift is used at.
 
 ```sysl
@@ -299,6 +299,29 @@ for s in 1..3
 1000000007
 2000000014
 3000000021
+```
+
+**Unlike a literal binding, a `for` variable is also fixed by arithmetic with an operand of a type
+of its own**: beside an integer operand of `+ - * / % & | ^` in either order, through nesting, and
+under a compound assignment, which is the same arithmetic written back — `n += k`, `n = n - k`,
+`m * k`, `k + m` and `(m + k) * 2` each make `k` the type of `n` or `m`. The loop's values are the
+range's, so the type the program put beside them is the one they are counted in; a literal binding
+keeps the rule above, so `sum + b` still widens `b` to `sum`'s `int`. A shift is not arithmetic
+between its operands: `m << k` and `m <<= k` fix nothing of `k`, and `(k << 1) + m` fixes it
+through the `+`. A literal operand fixes nothing (`k + 1`), and nor does a float.
+
+```sysl
+var n: usize = 0
+var m: u64 = 1
+
+for k in 1..20 do n += k
+for k in 1..5 do m *= k
+
+print(n, m)
+```
+
+```output
+210 120
 ```
 
 A bound that does not fit the type a use fixed is refused at the bound. The top bound of an exclusive
