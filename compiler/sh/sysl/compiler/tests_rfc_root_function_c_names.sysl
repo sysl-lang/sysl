@@ -127,7 +127,8 @@ rfc_every_root_function_is_displaced()
 
     val text = "extern \"labs\" c_labs(n: i64) -> i64\n\nwalk(n: int) -> int = n + 1\n" +
         "sysl_helper(n: int) -> int = n + 2\nlabs(n: i64) -> i64 = n\nlog(n: int) -> int = n + 3\n" +
-        "printf(n: int) -> int = n + 4\n\nprint(walk(1), sysl_helper(1), labs(-3), c_labs(-3), log(1), printf(1))\n"
+        "printf(n: int) -> int = n + 4\n_start(n: int) -> int = n + 5\n\n" +
+        "print(walk(1), sysl_helper(1), labs(-3), c_labs(-3), log(1), printf(1), _start(1))\n"
     val ir = rfc_ir(text)
 
     assert(ir.contains("define i32 @walk$$sysl("), ir)
@@ -135,9 +136,10 @@ rfc_every_root_function_is_displaced()
     assert(ir.contains("define i64 @labs$$sysl("), ir)
     assert(ir.contains("define i32 @log$$sysl("), ir)
     assert(ir.contains("define i32 @printf$$sysl("), ir)
+    assert(ir.contains("define i32 @_start$$sysl("), ir)
     assert(ir.contains("declare i64 @labs("), ir)
     assert(!ir.contains("define i32 @walk("), ir)
-    assert_eq(rfc_one(text), "2 3 -3 3 4 5\n")
+    assert_eq(rfc_one(text), "2 3 -3 3 4 5 6\n")
 
 // The hole the rule closes: C the compiler never reads, calling libc by a name the program also uses.
 // Laid down under its bare name, the program's `read` was what the C's call resolved to at the link,
@@ -334,7 +336,8 @@ rfc_a_thumb_archive()
     val root = rfc_root([
         ("sysl.hocon", "package { name = \"rfc\" }\n"),
         ("main.sysl", "memcpy(n: int) -> int = n + 3\nmalloc(n: int) -> int = n + 1\n\n" +
-                      "@export(\"main\")\nstart() -> int = memcpy(1) + malloc(2)\n")])
+                      "@export(\"main\")\nstart() -> int = memcpy(1) + malloc(2)\n\n" +
+                      "@export(\"SysTick_Handler\")\ntick() = ()\n")])
     val archive = s"$root/rfc.a"
     val (code, out, err) = clx_ran(["sysl", "build-c", root, "--target", "thumb-freestanding-softfp",
                                     "-o", archive])
@@ -349,6 +352,9 @@ rfc_a_thumb_archive()
     assert(defined.contains(" T memcpy$$sysl"), defined)
     assert(defined.contains(" T malloc$$sysl"), defined)
     assert(defined.contains(" T main"), defined)
+    // A vector-table handler is named by its export, which is the one C name it has.
+    assert(defined.contains(" T SysTick_Handler\n"), defined)
+    assert(defined.contains(" T tick$$sysl\n"), defined)
     assert(!defined.contains(" T memcpy\n"), defined)
     assert(!defined.contains(" T malloc\n"), defined)
 

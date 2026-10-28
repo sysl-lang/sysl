@@ -811,6 +811,21 @@ names_as_written(symbol: string, written: string) -> bool
     written.ends_with(".owned") && symbol == owned_symbol(root_symbol(written[0..<written.bytes.len - 6]))
 end names_as_written
 
+// Whether a line of IR text calls or defines `written` -- `@symbol(` for any symbol
+// `names_as_written` accepts, bare or in the quotes LLVM's own printer puts round a name holding a
+// `$` (`@"make$$sysl"(`), which is how an optimized module spells a root function.
+mentions_as_written(line: string, written: string) -> bool
+    var symbols = [written, root_symbol(written), ""]
+
+    if written.ends_with(".owned")
+        symbols[2] = owned_symbol(root_symbol(written[0..<written.bytes.len - 6]))
+
+    for s in symbols
+        if s != "" && (line.contains(s"@$s(") || line.contains(s"@\"$s\"(")) then return true
+
+    false
+end mentions_as_written
+
 // A function this module declares and something else defines, `dso_local` where the machine binds
 // every symbol inside the one image (an intrinsic never is: `bound_sig`).
 private declared_sig(e: *Emit, name: string, ty: IrFnType) -> IrFuncSig =
@@ -1296,6 +1311,10 @@ emit_func_text(text: string, symbol: string) -> string
     val p = strip_tests(program_of(done, done.main_module))
     val lowered = codegen_with_gaps(p, done.an.tables.target, check_escapes(done.an, p))
     val fs = func_texts(ir_print_module(lowered.0))
+
+    // The exact symbol first: an export's thunk is named what its definition is written as.
+    for item in fs
+        if item.0 == symbol then return item.1
 
     for item in fs
         if names_as_written(item.0, symbol) then return item.1

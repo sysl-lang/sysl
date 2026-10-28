@@ -54,8 +54,7 @@ private agl_ir(text: string) -> string
 end agl_ir
 
 private agl_names(line: string, name: string) -> bool =
-    line.contains("@" + name + "(") || line.contains("$" + name + "(") ||
-        line.contains("@" + root_symbol(name) + "(")
+    mentions_as_written(line, name) || line.contains("$" + name + "(")
 
 // One function's emitted text, from its `define` to the brace that closes it.
 private agl_body(out: string, name: string) -> string
@@ -132,7 +131,7 @@ agl_the_definition_receives_an_out_pointer()
     val out = agl_ir(agl_big() + "make(t: int) -> Big = Big([0; 64], t)\nprint(make(3).tag)")
 
     assert(out.contains(
-        "define void @make(ptr noalias sret(%struct.Big) align 8 dead_on_unwind writable %sret.out, " +
+        "define void @make$$sysl(ptr noalias sret(%struct.Big) align 8 dead_on_unwind writable %sret.out, " +
         "i32 %t.param)"), out)
     assert(!out.contains("ret %struct.Big"), out)
 end agl_the_definition_receives_an_out_pointer
@@ -144,7 +143,7 @@ agl_the_callers_own_storage_is_the_out_pointer()
     val out = agl_main(agl_big() +
                        "make(t: int) -> Big = Big([0; 64], t)\nvar b = make(7)\nprint(b.tag)")
 
-    assert(out.contains("call void @make(ptr sret(%struct.Big) align 8 %b.addr, i32 7)"), out)
+    assert(out.contains("call void @make$$sysl(ptr sret(%struct.Big) align 8 %b.addr, i32 7)"), out)
 
     // Nothing anywhere makes a `%struct.Big` value: not the call, not the store into `b`.
     assert(!out.contains("load %struct.Big"), out)
@@ -157,7 +156,7 @@ agl_a_small_result_is_returned_in_registers()
 
     val out = agl_ir(agl_small() + "make(x: int) -> Small = Small(x, 2)\nprint(make(1).y)")
 
-    assert(out.contains("define %struct.Small @make(i32 %x.param)"), out)
+    assert(out.contains("define %struct.Small @make$$sysl(i32 %x.param)"), out)
     assert(out.contains("ret %struct.Small"), out)
     assert(!out.contains("sret(%struct.Small)"), out)
 end agl_a_small_result_is_returned_in_registers
@@ -249,7 +248,7 @@ agl_a_large_parameter_is_an_address()
 
     val out = agl_ir(agl_big() + "tag(b: Big) -> int = b.tag\nprint(tag(Big([0; 64], 6)))")
 
-    assert(out.contains("define i32 @tag(ptr noalias readonly %b.param)"), out)
+    assert(out.contains("define i32 @tag$$sysl(ptr noalias readonly %b.param)"), out)
     assert(!agl_body(out, "tag").contains("llvm.memcpy"), out)
     assert(!agl_body(out, "tag").contains("alloca %struct.Big"), out)
 end agl_a_large_parameter_is_an_address
@@ -272,7 +271,7 @@ agl_the_caller_hands_over_storage_it_has()
     val out = agl_main(agl_big() +
                        "tag(b: Big) -> int = b.tag\nvar b = Big([0; 64], 6)\nprint(tag(b))")
 
-    assert(out.contains("call i32 @tag(ptr %b.addr)"), out)
+    assert(out.contains("call i32 @tag$$sysl(ptr %b.addr)"), out)
 end agl_the_caller_hands_over_storage_it_has
 
 @test("a large argument crosses the call in memory: while a small one is still passed in registers")
@@ -281,7 +280,7 @@ agl_a_small_argument_is_passed_in_registers()
 
     val out = agl_ir(agl_small() + "sum(s: Small) -> int = s.x + s.y\nprint(sum(Small(1, 2)))")
 
-    assert(out.contains("define i32 @sum(%struct.Small %s.param)"), out)
+    assert(out.contains("define i32 @sum$$sysl(%struct.Small %s.param)"), out)
 
 // Handing over an address is only a lowering if the callee's copy is genuinely its own. A callee
 // that wrote through the caller's storage would pass every test above, and this is the one it fails.
@@ -611,7 +610,7 @@ agl_question_mark_no_return_hands_it_back_directly()
         """)
 
     assert(out.contains("sret"), out)
-    assert(out.contains("define void @mk("), out)
+    assert(out.contains("define void @mk$$sysl("), out)
     assert(!out.contains("ret %enum.sysl$Result.Big.int"), out)
 end agl_question_mark_no_return_hands_it_back_directly
 

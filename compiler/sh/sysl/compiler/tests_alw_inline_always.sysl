@@ -67,12 +67,29 @@ private alw_no_library() -> bool
     false
 end alw_no_library
 
-// Every `define` line naming `name`.
+// Whether a line names `part` -- a name, `@name` or `name(` -- as the program wrote it or under the
+// symbol a root function is laid down as (`name$$sysl`, quoted or not).
+private alw_has(line: string, part: string) -> bool
+    if line.contains(part) then return true
+
+    val head = if part.ends_with("(") then part[0..<part.bytes.len - 1] else part
+    val bare = if head.starts_with("@") then head[1..<head.bytes.len] else head
+
+    line.contains(root_symbol(bare))
+end alw_has
+
+// Every `define` line naming `name` as written, or where none does, as a root function's symbol -- an
+// export's entry is named what its definition is written as.
 private alw_defines(out: string, name: string) -> Buf[string]
     var found: Buf[string] = buf()
 
     for item in lines_of(out)
         if item.starts_with("define") && item.contains(name) then found.push(item)
+
+    if !found.is_empty() then return found
+
+    for item in lines_of(out)
+        if item.starts_with("define") && alw_has(item, name) then found.push(item)
 
     found
 end alw_defines
@@ -83,7 +100,7 @@ private alw_body(out: string, name: string) -> string
     var inside = false
 
     for l in lines_of(out)
-        if !inside && l.starts_with("define") && l.contains(name) then inside = true
+        if !inside && l.starts_with("define") && alw_has(l, name) then inside = true
 
         if inside
             if l == "}" then return body
@@ -95,7 +112,7 @@ end alw_body
 
 private alw_calls(text: string, part: string) -> bool
     for line in lines_of(text)
-        if line.contains("call ") && line.contains(part) then return true
+        if line.contains("call ") && alw_has(line, part) then return true
 
     false
 end alw_calls

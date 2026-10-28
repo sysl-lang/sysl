@@ -258,7 +258,7 @@ private srf_body(out: string, name: string) -> string
     var inside = false
 
     for line in lines_of(out)
-        if !inside && line.starts_with("define ") && (line.contains("@" + name + "(") || line.contains("@" + root_symbol(name) + "(")) then inside = true
+        if !inside && line.starts_with("define ") && mentions_as_written(line, name) then inside = true
 
         if inside
             if line == "}" then return b
@@ -271,7 +271,7 @@ end srf_body
 // The line that opens one function's definition.
 private srf_define(out: string, name: string) -> string
     for line in lines_of(out)
-        if line.starts_with("define ") && (line.contains("@" + name + "(") || line.contains("@" + root_symbol(name) + "(")) then return line
+        if line.starts_with("define ") && mentions_as_written(line, name) then return line
 
     s"no definition of '$name' in:\n$out"
 end srf_define
@@ -295,7 +295,7 @@ srf_the_call_promises_nothing()
 
     val body = srf_body(srf_ir(srf_program(), None), "in_field")
 
-    assert(body.contains("call void @make(ptr sret(%struct.Big) align 8 "), body)
+    assert(body.contains("call void @make$$sysl(ptr sret(%struct.Big) align 8 "), body)
 
     for line in lines_of(body)
         if line.contains("call ")
@@ -325,9 +325,9 @@ srf_built_in_place_already()
 
         assert(!body.contains("llvm.memcpy"), body)
 
-    assert(srf_body(out, "returned").contains("call void @make(ptr sret(%struct.Big) align 8 %sret.out"),
+    assert(srf_body(out, "returned").contains("call void @make$$sysl(ptr sret(%struct.Big) align 8 %sret.out"),
            srf_body(out, "returned"))
-    assert(srf_body(out, "nested").contains("call void @rev(ptr sret(%struct.Big) align 8 %sret.out"),
+    assert(srf_body(out, "nested").contains("call void @rev$$sysl(ptr sret(%struct.Big) align 8 %sret.out"),
            srf_body(out, "nested"))
 
 // -- where the optimizer now builds it in place ---------------------------------------------------
@@ -345,7 +345,7 @@ srf_field_of_the_result()
     // holds a counted string or a value with a destructor, and a call through a trait object.
     for name in ["in_field", "in_variant", "after_try", "early", "in_generic", "reassigned", "named.owned",
                  "owning", "through"]
-        assert(front.contains("define void @" + name + "("), srf_define(front, name))
+        assert(srf_define(front, name).starts_with("define void @"), srf_define(front, name))
 
         val body = srf_body(out, name)
 
@@ -361,7 +361,7 @@ srf_field_of_the_result_on_thumb()
         val body = srf_body(out, name)
 
         assert(!body.contains("llvm.memcpy"), body)
-        assert(body.contains("@make("), body)
+        assert(mentions_as_written(body, "make"), body)
 
 // -- where it must stay a copy --------------------------------------------------------------------
 
@@ -372,7 +372,7 @@ srf_an_aliased_destination_is_copied()
     val out = srf_optimized(srf_ir(srf_program(), None))
     val body = srf_body(out, "aliased")
 
-    assert(body.contains("@rev("), body)
+    assert(mentions_as_written(body, "rev"), body)
     assert(body.contains("llvm.memcpy"), body)
 
 // -- the programs ---------------------------------------------------------------------------------
