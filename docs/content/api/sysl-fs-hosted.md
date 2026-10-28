@@ -9,7 +9,7 @@ requires: "requires { libc }, requires { os }"
 
 ## Index
 
-[`supply_access`](#supply_access) [`supply_chdir`](#supply_chdir) [`supply_chmod`](#supply_chmod) [`supply_chown`](#supply_chown) [`supply_close`](#supply_close) [`supply_closedir`](#supply_closedir) [`supply_fstat`](#supply_fstat) [`supply_ftruncate`](#supply_ftruncate) [`supply_getcwd`](#supply_getcwd) [`supply_link`](#supply_link) [`supply_mkdir`](#supply_mkdir) [`supply_open`](#supply_open) [`supply_opendir`](#supply_opendir) [`supply_pread`](#supply_pread) [`supply_pwrite`](#supply_pwrite) [`supply_read`](#supply_read) [`supply_readdir`](#supply_readdir) [`supply_readlink`](#supply_readlink) [`supply_realpath`](#supply_realpath) [`supply_rename`](#supply_rename) [`supply_rmdir`](#supply_rmdir) [`supply_seek`](#supply_seek) [`supply_set_modified`](#supply_set_modified) [`supply_stat`](#supply_stat) [`supply_symlink`](#supply_symlink) [`supply_sync`](#supply_sync) [`supply_temp_dir`](#supply_temp_dir) [`supply_truncate`](#supply_truncate) [`supply_unlink`](#supply_unlink) [`supply_write`](#supply_write)
+[`supply_access`](#supply_access) [`supply_chdir`](#supply_chdir) [`supply_chmod`](#supply_chmod) [`supply_chown`](#supply_chown) [`supply_close`](#supply_close) [`supply_closedir`](#supply_closedir) [`supply_fstat`](#supply_fstat) [`supply_ftruncate`](#supply_ftruncate) [`supply_getcwd`](#supply_getcwd) [`supply_link`](#supply_link) [`supply_map`](#supply_map) [`supply_mkdir`](#supply_mkdir) [`supply_open`](#supply_open) [`supply_opendir`](#supply_opendir) [`supply_pread`](#supply_pread) [`supply_pwrite`](#supply_pwrite) [`supply_read`](#supply_read) [`supply_readdir`](#supply_readdir) [`supply_readlink`](#supply_readlink) [`supply_realpath`](#supply_realpath) [`supply_rename`](#supply_rename) [`supply_rmdir`](#supply_rmdir) [`supply_seek`](#supply_seek) [`supply_set_modified`](#supply_set_modified) [`supply_stat`](#supply_stat) [`supply_symlink`](#supply_symlink) [`supply_sync`](#supply_sync) [`supply_temp_dir`](#supply_temp_dir) [`supply_truncate`](#supply_truncate) [`supply_unlink`](#supply_unlink) [`supply_unmap`](#supply_unmap) [`supply_write`](#supply_write)
 
 ## Functions
 
@@ -71,6 +71,12 @@ supply_getcwd(into: *u8, room: usize, got: *usize) -> int
 
 ```sysl
 supply_link(existing: *u8, existing_len: usize, fresh: *u8, fresh_len: usize) -> int
+```
+
+### `supply_map`
+
+```sysl
+supply_map(fd: int, len: usize, at: **u8) -> int
 ```
 
 ### `supply_mkdir`
@@ -185,6 +191,12 @@ supply_truncate(path: *u8, len: usize, length: long) -> int
 
 ```sysl
 supply_unlink(path: *u8, len: usize) -> int
+```
+
+### `supply_unmap`
+
+```sysl
+supply_unmap(at: *u8, len: usize) -> int
 ```
 
 ### `supply_write`

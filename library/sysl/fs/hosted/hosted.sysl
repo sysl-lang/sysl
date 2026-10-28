@@ -27,8 +27,8 @@ import sysl.sys.{UNSUPPORTED, host_status}
 // way; `off_t`, whose width is the platform's; and the two calls that write into a buffer of
 // `PATH_MAX`, which is a `#define`. Each shim does one call and hands back the plain answer, and the
 // `errno` it leaves is read here. The shims under `__hosted__/` use only what wasi-libc has too; the
-// two under `__posix__/` need a POSIX C library, and on any other target their hooks answer `UNSUPPORTED`, "not
-// supported on this target".
+// ones under `__posix__/` (`realpath`, the temporary directory, and mapping a file) need a POSIX C
+// library, and on any other target their hooks answer `UNSUPPORTED`, "not supported on this target".
 
 // `errno` is a **function** on every platform this builds for, not a variable -- C spells it as a
 // macro expanding to a dereference so that a threaded program gets its own -- so the binding is to
@@ -159,6 +159,8 @@ private extern "sysl_fs_host_readdir" c_readdir(d: *u8) -> *u8
 #if posix
 private extern "sysl_fs_host_realpath" c_realpath(path: *u8, into: *u8, room: u64) -> long
 private extern "sysl_fs_host_temp_dir" c_temp_dir(prefix: *u8, into: *u8, room: usize) -> int
+private extern "sysl_fs_host_map" c_map(fd: int, len: usize) -> *u8
+private extern "sysl_fs_host_unmap" c_unmap(at: *u8, len: usize) -> int
 #endif
 
 // -- descriptors -------------------------------------------------------------------------------------
@@ -238,6 +240,29 @@ supply_fstat(fd: int, out: *Stat) -> int = status(c_fstat(fd, ptr_cast(out)))
 
 @export("sysl_fs_ftruncate")
 supply_ftruncate(fd: int, length: long) -> int = status(c_ftruncate(fd, length))
+
+@export("sysl_fs_map")
+supply_map(fd: int, len: usize, at: **u8) -> int
+#if posix
+    val mapped = c_map(fd, len)
+
+    if mapped == null then return failed()
+
+    *at = mapped
+    0
+#else
+    UNSUPPORTED
+#endif
+end supply_map
+
+@export("sysl_fs_unmap")
+supply_unmap(at: *u8, len: usize) -> int
+#if posix
+    status(c_unmap(at, len))
+#else
+    UNSUPPORTED
+#endif
+end supply_unmap
 
 // -- paths -------------------------------------------------------------------------------------------
 

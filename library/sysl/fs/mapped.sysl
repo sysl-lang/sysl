@@ -1,0 +1,88 @@
+module sysl.fs
+@requires(os)
+
+import sysl.fs.sys as fsys
+
+// A file's bytes mapped into memory instead of read into it.
+//
+// **Mapping is what makes a file of any size cheap to open**: the operating system hands back an
+// address range and reads a page only when something touches it, so the cost of `map_file` is a few
+// calls whatever the size, and a byte nobody looks at is never read. The mapping is private and
+// read-only, so nothing can write the file through it.
+//
+// **A mapping outlives the descriptor it was made from, and the file's name.** `map_file` closes the
+// file before it answers, and a file renamed over or removed afterwards stays readable through the
+// mapping until it is dropped -- which is what lets an editor that saved by renaming a new file over
+// the old one still read the text it is undoing back to.
+//
+// **What it does not survive is the file being cut short underneath it.** A page past the new end
+// has nothing to be read from, and the operating system answers a read of it with a signal rather
+// than an error. A program mapping a file somebody else may truncate reads it instead.
+
+/** `st_mode`'s type bits, and the value they hold for a directory -- POSIX's encoding, which
+ * `fsys.Stat` carries.
+ */
+private const kind_mask: long = 0o170000
+private const kind_dir: long = 0o040000
+
+/** `EFBIG`, 27 on every platform: a file larger than this machine's address space can hold. */
+private const too_big: int = 27
+
+/** The bytes of one file as they were when it was mapped, from `map_file` or `File.map`.
+ *
+ * **Dropping the last reference unmaps it**, so it is held as a `&Mapped` like any other type with a
+ * destructor. `bytes()` is a view borrowed from it (`reference/memory.md § A view borrowed from its
+ * receiver`): the compiler refuses a view that would outlive the mapping it reads.
+ *
+ * An empty file maps nothing -- the operating system refuses a mapping of no bytes -- and answers an
+ * empty view.
+ */
+struct Mapped
+    private at: *u8
+    private n: usize
+
+    /** How many bytes are mapped: the file's size when it was mapped. */
+    len(self) -> usize = self.n
+
+    is_empty(self) -> bool = self.n == 0
+
+    /** The whole file, read-only. */
+    @views(self)
+    bytes(&self) -> []const u8 = if self.n == 0 then [] else self.at[0..<self.n]
+end Mapped
+
+impl Drop for Mapped
+    drop(self)
+        if self.n > 0 then fsys.unmap(self.at, self.n)
+
+/** The file at `path`, mapped read-only into memory. The file is closed before this answers; the
+ * mapping does not need it.
+ *
+ * A directory is `IsADirectory`, a missing file `NotFound`, an unreadable one `PermissionDenied`. A
+ * file the platform cannot map -- a pipe, a terminal -- answers the platform's own code as `Other`,
+ * and a target whose C library has no `mmap` answers "not supported on this target".
+ */
+map_file(path: string) -> Result[&Mapped, IoError]
+    var f = open(path)?
+
+    defer f.close()
+
+    f.map()
+end map_file
+
+/** The descriptor `fd`'s file, as it is now, mapped -- the one place a mapping is made. */
+private[fs] mapped_from(fd: int) -> Result[&Mapped, IoError]
+    var st = fsys.Stat(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+    val code = fsys.fstat(fd, &st)
+
+    if code != 0 then return Err(from_status(code))
+    if (st.mode & kind_mask) == kind_dir then return Err(IsADirectory)
+    if st.size <= 0 then return Ok(Mapped(null, 0))
+    if u64(st.size) > u64(usize::Max) then return Err(Other(too_big))
+
+    val n = usize(st.size)
+    var at: *u8 = null
+    val mapped = fsys.map(fd, n, &at)
+
+    if mapped != 0 then Err(from_status(mapped)) else Ok(Mapped(at, n))
+end mapped_from

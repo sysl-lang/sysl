@@ -85,6 +85,8 @@ private fsh_hooks(left_out: []string) -> string
     rows.push(("seek", "fd: int, offset: long, whence: int, at: *long"))
     rows.push(("fstat", "fd: int, out: *Stat"))
     rows.push(("ftruncate", "fd: int, length: long"))
+    rows.push(("map", "fd: int, len: usize, at: **u8"))
+    rows.push(("unmap", "at: *u8, len: usize"))
     rows.push(("stat", "path: *u8, len: usize, follow: int, out: *Stat"))
     rows.push(("truncate", "path: *u8, len: usize, length: long"))
     rows.push(("mkdir", "path: *u8, len: usize, mode: u32"))
@@ -300,9 +302,163 @@ fsh_refusal_names_only_what_is_reached()
     assert(said.1.contains("define 'sysl_fs_close', 'sysl_fs_open', 'sysl_fs_read', 'sysl_fs_write' with"),
            said.1)
     assert(!said.1.contains("sysl_fs_mkdir"), said.1)
+    assert(!said.1.contains("sysl_fs_map"), said.1)
+    assert(!said.1.contains("sysl_fs_unmap"), said.1)
 
     lbr_drop([p, out])
 end fsh_refusal_names_only_what_is_reached
+
+// -- mapping a file ------------------------------------------------------------------------------------
+
+// A program mapping a file, by path and from an open one, and reading a byte of each: it reaches the
+// two mapping hooks beside the four a mapping is made through.
+private val fsh_maps_a_file: string = raw"""
+    import sysl.fs.{map_file, open, Mapped}
+    import sysl.fs.sys.Stat
+
+    first(m: &Mapped) -> int
+        val v = m.bytes()
+
+        if v.len == 0 then -1 else int(v[0])
+
+    run() -> int
+        var n = 0
+
+        map_file("/hello.txt") match
+            Ok(m) -> n += first(m)
+            Err(_) -> ()
+
+        open("/hello.txt") match
+            Ok(f) ->
+                var g = f
+
+                g.map() match
+                    Ok(m) -> n += first(m)
+                    Err(_) -> ()
+
+                if g.fd().is_ok() then n += 1
+                if g.close().is_ok() then n += 1
+            Err(_) -> ()
+
+        n
+    end run
+    """
+
+@test("a freestanding program mapping a file links once it answers map and unmap, with no mmap in the image")
+fsh_mapping_hooks_answered_link()
+    if !fsh_link_ready() then return
+
+    val p = fsh_tree(fsh_maps_a_file + fsh_runtime + fsh_hooks([]))
+    val (said, out) = fsh_build(p)
+
+    assert(said.0 == 0, said.1)
+
+    val elf = s"$out/img.elf"
+    val all = fsh_symbols(elf, false)
+
+    assert_eq(fsh_symbols(elf, true).trim(), "")
+    assert(all.contains(" T sysl_fs_map"), all)
+    assert(all.contains(" T sysl_fs_unmap"), all)
+
+    for name in ["mmap", "munmap", "sysl_fs_host_map", "sysl_fs_host_unmap", "__errno_location"]
+        assert(!fsh_names(all, name), s"'$name' is in the image")
+
+    lbr_drop([p, out])
+end fsh_mapping_hooks_answered_link
+
+@test("a freestanding program mapping a file and leaving map and unmap unanswered is refused naming both")
+fsh_mapping_hooks_unanswered_refused()
+    if !lbr_ready() then return
+
+    val p = fsh_tree(fsh_maps_a_file + fsh_runtime + fsh_hooks(["map", "unmap"]))
+    val (said, out) = fsh_build(p)
+
+    assert(said.0 != 0, "built with the mapping hooks unanswered")
+    assert(said.1.contains("define 'sysl_fs_map', 'sysl_fs_unmap' with '@export'"), said.1)
+    assert(!said.1.contains("undefined symbol"), said.1)
+
+    lbr_drop([p, out])
+end fsh_mapping_hooks_unanswered_refused
+
+@test("on a hosted target a mapping is unmapped once, when its last reference goes, and an empty one never")
+fsh_hosted_mapping_unmaps_on_drop()
+    if !lbr_ready() then return
+
+    // The program's own `sysl_fs_unmap` displaces the library's weak one, so every unmap is seen.
+    val said = lbr_run(lbr_program(raw"""
+        import sysl.fs.{map_file, make_temp_dir, write_text, remove_dir_all, Mapped}
+
+        extern "munmap" c_munmap(at: *u8, len: usize) -> int
+
+        @export("sysl_fs_unmap")
+        seen_unmap(at: *u8, len: usize) -> int
+            print("unmap", len)
+            c_munmap(at, len)
+
+        show(m: &Mapped)
+            val v = m.bytes()
+
+            print(v.len, v[0], v[v.len - 1])
+
+        made(path: string) -> &Mapped = map_file(path).unwrap()
+
+        run(dir: string)
+            val path = dir + "/a.txt"
+
+            write_text(path, "abc").unwrap()
+
+            val m = made(path)
+            val again = m
+
+            remove_dir_all(dir).unwrap()
+            show(again)
+            print("dropping")
+
+        empty(dir: string)
+            val path = dir + "/e.txt"
+
+            write_text(path, "").unwrap()
+            print(map_file(path).unwrap().len())
+
+        val dir = make_temp_dir("sysl-fsh-map-").unwrap()
+
+        empty(dir)
+        run(dir)
+        print("done")
+        """), [])
+
+    assert_eq(said, "0\n3 97 99\ndropping\nunmap 3\ndone\n")
+end fsh_hosted_mapping_unmaps_on_drop
+
+@test("a program calling C itself turns the errno it leaves into the IoError the library would answer")
+fsh_public_from_errno()
+    if !lbr_ready() then return
+
+    val said = lbr_run(lbr_program(raw"""
+        import sysl.fs.{from_errno, open, NotFound, IsADirectory, Other}
+
+        extern "rmdir" c_rmdir(path: *u8) -> int
+
+        #if bsd
+        extern "__error" errno_location() -> *i32
+        #else
+        extern "__errno_location" errno_location() -> *i32
+        #endif
+
+        val mine = if c_rmdir(c"/sysl-fsh-no-such-dir") != 0 then from_errno(errno_location()[0]) else Other(0)
+        val theirs = open("/sysl-fsh-no-such-dir").unwrap_err()
+
+        print(mine == NotFound, mine == theirs, mine)
+
+        var f = open("/tmp").unwrap()
+        val fd = f.fd().unwrap()
+
+        print(fd >= 0, from_errno(21) == IsADirectory, from_errno(4242).code())
+        f.close().unwrap()
+        """), [])
+
+    assert_eq(said, "true true no such file or directory\ntrue true 4242\n")
+end fsh_public_from_errno
 
 // -- a bare image that never touches a file ------------------------------------------------------------
 

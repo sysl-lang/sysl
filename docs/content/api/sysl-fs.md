@@ -9,7 +9,8 @@ requires: "requires { os }"
 ---
 
 `read_text`, `write_bytes`, `write_text_atomic` and the other publishing calls, `metadata`,
-`make_dir_all`, `copy_file`, `canonicalize`, the walk, and
+`make_dir_all`, `copy_file`, `canonicalize`, the walk, `map_file` for a file's bytes mapped
+rather than read, and
 `IoError` — which carries the platform's own number so that a caller can act on *which* failure it
 was rather than only on there having been one.
 
@@ -20,7 +21,7 @@ handling away from every program with no operating system to ask. Deciding what 
 
 ## Index
 
-[`append`](#append) [`append_bytes`](#append_bytes) [`append_text`](#append_text) [`cache_dir`](#cache_dir) [`canonicalize`](#canonicalize) [`config_dir`](#config_dir) [`copy_dir_all`](#copy_dir_all) [`copy_file`](#copy_file) [`create`](#create) [`create_update`](#create_update) [`current_dir`](#current_dir) [`data_dir`](#data_dir) [`entries`](#entries) [`entry_bytes`](#entry_bytes) [`exists`](#exists) [`hard_link`](#hard_link) [`home_dir`](#home_dir) [`is_dir`](#is_dir) [`is_file`](#is_file) [`is_link`](#is_link) [`link_metadata`](#link_metadata) [`make_dir`](#make_dir) [`make_dir_all`](#make_dir_all) [`make_temp_dir`](#make_temp_dir) [`metadata`](#metadata) [`open`](#open) [`open_update`](#open_update) [`pending_name`](#pending_name) [`publish_dir`](#publish_dir) [`publish_file`](#publish_file) [`read_bytes`](#read_bytes) [`read_link`](#read_link) [`read_text`](#read_text) [`readable`](#readable) [`remove_dir`](#remove_dir) [`remove_dir_all`](#remove_dir_all) [`remove_file`](#remove_file) [`rename`](#rename) [`set_current_dir`](#set_current_dir) [`set_modified`](#set_modified) [`set_owner`](#set_owner) [`set_permissions`](#set_permissions) [`size_of`](#size_of) [`symlink`](#symlink) [`truncate`](#truncate) [`walk`](#walk) [`writable`](#writable) [`write_bytes`](#write_bytes) [`write_bytes_atomic`](#write_bytes_atomic) [`write_text`](#write_text) [`write_text_atomic`](#write_text_atomic) [`Entry`](#entry) [`File`](#file) [`FileState`](#filestate) [`IoError`](#ioerror) [`Kind`](#kind) [`Matching`](#matching) [`Meta`](#meta) [`Walk`](#walk-1) [Display for IoError](#display-for-ioerror) [Display for Kind](#display-for-kind) [Eq for IoError](#eq-for-ioerror) [Eq for Kind](#eq-for-kind) [Fallible for File](#fallible-for-file) [Iterate for Matching](#iterate-for-matching) [Iterate for Walk](#iterate-for-walk) [Positioned for File](#positioned-for-file) [ReadAt for File](#readat-for-file) [Reader for File](#reader-for-file) [WriteAt for File](#writeat-for-file) [Writer for File](#writer-for-file)
+[`append`](#append) [`append_bytes`](#append_bytes) [`append_text`](#append_text) [`cache_dir`](#cache_dir) [`canonicalize`](#canonicalize) [`config_dir`](#config_dir) [`copy_dir_all`](#copy_dir_all) [`copy_file`](#copy_file) [`create`](#create) [`create_update`](#create_update) [`current_dir`](#current_dir) [`data_dir`](#data_dir) [`entries`](#entries) [`entry_bytes`](#entry_bytes) [`exists`](#exists) [`from_errno`](#from_errno) [`hard_link`](#hard_link) [`home_dir`](#home_dir) [`is_dir`](#is_dir) [`is_file`](#is_file) [`is_link`](#is_link) [`link_metadata`](#link_metadata) [`make_dir`](#make_dir) [`make_dir_all`](#make_dir_all) [`make_temp_dir`](#make_temp_dir) [`map_file`](#map_file) [`metadata`](#metadata) [`open`](#open) [`open_update`](#open_update) [`pending_name`](#pending_name) [`publish_dir`](#publish_dir) [`publish_file`](#publish_file) [`read_bytes`](#read_bytes) [`read_link`](#read_link) [`read_text`](#read_text) [`readable`](#readable) [`remove_dir`](#remove_dir) [`remove_dir_all`](#remove_dir_all) [`remove_file`](#remove_file) [`rename`](#rename) [`set_current_dir`](#set_current_dir) [`set_modified`](#set_modified) [`set_owner`](#set_owner) [`set_permissions`](#set_permissions) [`size_of`](#size_of) [`symlink`](#symlink) [`truncate`](#truncate) [`walk`](#walk) [`writable`](#writable) [`write_bytes`](#write_bytes) [`write_bytes_atomic`](#write_bytes_atomic) [`write_text`](#write_text) [`write_text_atomic`](#write_text_atomic) [`Entry`](#entry) [`File`](#file) [`FileState`](#filestate) [`IoError`](#ioerror) [`Kind`](#kind) [`Mapped`](#mapped) [`Matching`](#matching) [`Meta`](#meta) [`Walk`](#walk-1) [Display for IoError](#display-for-ioerror) [Display for Kind](#display-for-kind) [Drop for Mapped](#drop-for-mapped) [Eq for IoError](#eq-for-ioerror) [Eq for Kind](#eq-for-kind) [Fallible for File](#fallible-for-file) [Iterate for Matching](#iterate-for-matching) [Iterate for Walk](#iterate-for-walk) [Positioned for File](#positioned-for-file) [ReadAt for File](#readat-for-file) [Reader for File](#reader-for-file) [WriteAt for File](#writeat-for-file) [Writer for File](#writer-for-file)
 
 ## Functions
 
@@ -229,6 +230,24 @@ which is the one way this differs from the question it looks like it is asking. 
 be told from absence without a second call whose answer would already be stale, and every caller
 that matters -- one about to open the file -- gets the truth from the open.
 
+### `from_errno`
+
+```sysl
+from_errno(code: int) -> IoError
+```
+
+A number from the platform as the case it stands for: `from_errno(2)` is `NotFound`, and a code no
+case names is `Other(code)`.
+
+**It is public so that a program calling C itself reports a failure the way this module does.** An
+`extern` that fails leaves its number in `errno`; read straight after the call, this turns it into
+the same `IoError` the library's own calls answer with, so `e == NotFound` means one thing whoever
+made the call. It is the table every `IoError` in the library comes through, not a second copy.
+
+The chain is over `errno` values rather than over a name per platform because these are the codes
+that have been stable since V7 -- `ENOENT` has been 2 on every Unix anyone has shipped -- and the
+one that is not is `not_empty` above, which is why it is a call rather than a literal here.
+
 ### `hard_link`
 
 ```sysl
@@ -339,6 +358,19 @@ not what makes the name unique.
 
 **Removing it is the caller's**, and `remove_dir_all` is the call: nothing here runs at the end of
 a scope that the scope did not say, so `defer remove_dir_all(d)` is the idiom.
+
+### `map_file`
+
+```sysl
+map_file(path: string) -> Result[&Mapped, IoError]
+```
+
+The file at `path`, mapped read-only into memory. The file is closed before this answers; the
+mapping does not need it.
+
+A directory is `IsADirectory`, a missing file `NotFound`, an unreadable one `PermissionDenied`. A
+file the platform cannot map -- a pipe, a terminal -- answers the platform's own code as `Other`,
+and a target whose C library has no `mmap` answers "not supported on this target".
 
 ### `metadata`
 
@@ -702,6 +734,8 @@ descriptor until the program exits, and loses whatever was still buffered.
 | Member | Signature | Description |
 |---|---|---|
 | `closed` | `closed(*self) -> bool` |  |
+| `fd` | `fd(self) -> Result[int, IoError]` | The descriptor the file reads and writes through, for a call this module does not make. |
+| `map` | `map(*self) -> Result[&Mapped, IoError]` | The file's bytes, mapped read-only into memory rather than read -- `map_file`, for a file that is already open. |
 | `flush` | `flush(*self) -> Result[unit, IoError]` | Hands over what is buffered. |
 | `close` | `close(*self) -> Result[unit, IoError]` | Releases the descriptor, handing over what is still buffered. |
 | `tell` | `tell(*self) -> Result[long, IoError]` | Where the next read or write will happen, in bytes from the start. |
@@ -796,6 +830,29 @@ make an ordinary use of the older name ambiguous, one program away.
 |---|---|---|
 | `is_dir` | `is_dir(self) -> bool` | So that `k == Directory` reads as itself. |
 | `name` | `name(self) -> string` | The word for what this is. |
+
+### `Mapped`
+
+```sysl
+struct Mapped
+    private at: *u8
+    private n: usize
+```
+
+The bytes of one file as they were when it was mapped, from `map_file` or `File.map`.
+
+**Dropping the last reference unmaps it**, so it is held as a `&Mapped` like any other type with a
+destructor. `bytes()` is a view borrowed from it (`reference/memory.md § A view borrowed from its
+receiver`): the compiler refuses a view that would outlive the mapping it reads.
+
+An empty file maps nothing -- the operating system refuses a mapping of no bytes -- and answers an
+empty view.
+
+| Member | Signature | Description |
+|---|---|---|
+| `len` | `len(self) -> usize` | How many bytes are mapped: the file's size when it was mapped. |
+| `is_empty` | `is_empty(self) -> bool` |  |
+| `bytes` | `bytes(&self) -> []const u8` | The whole file, read-only. |
 
 ### `Matching`
 
@@ -903,6 +960,12 @@ impl Display for Kind
 So that a kind prints as the word rather than as a number, and `Special` says what it is carrying:
 a program reporting what it found in a directory has one thing to print, and the alternative is a
 `match` at every such site.
+
+### Drop for Mapped
+
+```sysl
+impl Drop for Mapped
+```
 
 ### Eq for IoError
 

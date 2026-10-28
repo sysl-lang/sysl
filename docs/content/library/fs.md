@@ -201,6 +201,8 @@ enum IoError
     message(self) -> string
 
 impl Display for IoError
+
+from_errno(code: int) -> IoError
 ```
 
 Every `Result` this module hands back carries one. **It is an enum rather than a bare `int` for the
@@ -244,6 +246,31 @@ refused: no such file or directory 2
 read is the hosted answer to `sysl.fs.sys`'s hooks, straight after the C call that failed, and what
 crosses back is the number; `sysl.fs` turns it into an `IoError` once. A `File` that latches a
 failure keeps the code it failed with, so a close afterwards cannot overwrite it.
+
+**`from_errno` is that one table, and it is public** so that a program calling C for itself reports
+a failure exactly as the library does: `from_errno(2)` is `NotFound`, and a code no case names is
+`Other(code)`. Read `errno` straight after the call that set it, and `e == NotFound` means one thing
+whoever made the call:
+
+```sysl
+import sysl.fs.{from_errno, open, NotFound, Other}
+
+extern "rmdir" c_rmdir(path: *u8) -> int
+
+#if bsd
+extern "__error" errno_location() -> *i32
+#else
+extern "__errno_location" errno_location() -> *i32
+#endif
+
+val mine = if c_rmdir(c"/no-such-dir") != 0 then from_errno(errno_location()[0]) else Other(0)
+
+print(mine == NotFound, mine == open("/no-such-dir").unwrap_err(), from_errno(4242).code())
+```
+
+```output
+true true 4242
+```
 
 ### The words for an error number
 
@@ -302,6 +329,8 @@ struct File
     seek(*self, to: long) -> Result[unit, IoError]
     size(*self) -> Result[long, IoError]
     at_end(*self) -> bool
+    fd(self) -> Result[int, IoError]
+    map(*self) -> Result[&Mapped, IoError]
 
 impl Fallible for File
 impl Reader for File
@@ -323,10 +352,10 @@ read after a write and a write after a read all answer as though nothing were he
 functions above are named for what they *mean* rather than for the flags each becomes; `O_CREAT` and
 its siblings differ between C libraries, and are translated once, by the hosted answer to the hooks.
 
-What is given up is the descriptor itself. A program that needs one — to poll it, to hand it to a
-child — should say `open(2)` for itself, which is what [`sysl.io`](/library/io/)'s `FdReader` is
-already shaped for. The two live side by side on purpose: `Reader` is about bytes arriving, not about
-where a program got its handle.
+**`fd()` lends the descriptor**, for a call this module does not make — to poll it, to `fcntl` it, to
+hand it to C. Lent, not given: the `File` still closes it, bytes written and not yet flushed have not
+reached it, and a closed file answers `NotOpen` rather than a number that may by now be somebody
+else's.
 
 ### It is a `Reader` and a `Writer`, whole
 
@@ -540,6 +569,72 @@ holds its state behind a `&FileState` rather than holding the pointer directly, 
 `close` answerable at all: **every copy shares one state**, so closing either is closing the file, and
 closing it twice is harmless rather than a use-after-free. A value type holding the pointer would have
 made that mistake easy.
+
+### Mapping a file instead of reading it
+
+```sysl
+struct Mapped
+    len(self) -> usize
+    is_empty(self) -> bool
+    @views(self)
+    bytes(&self) -> []const u8
+
+map_file(path: string) -> Result[&Mapped, IoError]
+```
+
+**A mapping is a file's bytes made readable in place**: the operating system hands back an address
+range and reads a page only when something touches it, so `map_file` costs a few calls whatever the
+size of the file, and a byte nobody looks at is never read. That is what a program opening files of
+many gigabytes — an editor, an index — wants instead of `read_bytes`. `f.map()` is the same for a file
+already open, handing over what it still has buffered first.
+
+```sysl
+import sysl.fs.{map_file, write_text, remove_file, NotFound, IsADirectory}
+
+var path = "/tmp/sysl-fs-doc-map.txt"
+
+write_text(path, "mapped, not read").unwrap()
+
+count(path: string, b: u8) -> int
+    val m = map_file(path).unwrap()
+    var n = 0
+
+    for x in m.bytes() do if x == b then n += 1
+
+    remove_file(path).unwrap()
+    print(m.len(), m.bytes()[0..<6].len)
+    n
+
+print(count(path, u8('e')))
+print(map_file(path).unwrap_err() == NotFound, map_file("/tmp").unwrap_err() == IsADirectory)
+```
+
+```output
+16 6
+2
+true true
+```
+
+Four rules are in it.
+
+**It is read-only and private**, so nothing can write the file through it. A writable mapping is
+absent on purpose: a store into a shared mapping reaches the file with no `Result` to say it failed —
+a full disk is a signal, not an error — and a private writable one is a copy of the file in memory,
+which `read_bytes` already is.
+
+**It outlives the file and the name.** The descriptor is closed before `map_file` answers, and the
+file removed above is still readable through `m` until `m` goes — which is what lets an editor that
+saves by renaming a new file over the old one keep reading the text it is undoing back to.
+
+**Dropping the last reference unmaps it**, so it is a `&Mapped`, held like any type with a
+[destructor](/reference/memory/#a-destructor). `bytes()` is a [view borrowed from
+it](/reference/memory/#a-view-borrowed-from-its-receiver): the compiler refuses a view that would
+outlive the mapping, so a view cannot be read after the unmap.
+
+**An empty file maps nothing.** POSIX refuses a mapping of no bytes, so an empty file answers an empty
+`Mapped` with no call made. What a mapping cannot survive is the file being *cut short* underneath it:
+the pages past the new end have nothing behind them, and the operating system answers a read of one
+with a signal. A program mapping a file somebody else may truncate reads it instead.
 
 ## The path tier
 
@@ -1080,7 +1175,7 @@ way to get atomicity from a filesystem.
 ## Answering the filesystem on a freestanding target
 
 **Everything above reaches the filesystem through `sysl.fs.sys` and through nothing else**: one
-`extern` per call — `sysl_fs_open`, `_read`, `_write`, `_pread`, `_pwrite`, `_sync`, `_close`, `_seek`, `_fstat`, `_ftruncate`,
+`extern` per call — `sysl_fs_open`, `_read`, `_write`, `_pread`, `_pwrite`, `_sync`, `_close`, `_seek`, `_fstat`, `_ftruncate`, `_map`, `_unmap`,
 `_stat`, `_truncate`, `_mkdir`, `_rmdir`, `_unlink`, `_rename`, `_access`, `_chmod`, `_chown`, `_opendir`,
 `_readdir`, `_closedir`, `_getcwd`, `_chdir`, `_temp_dir`, `_symlink`, `_link`, `_readlink` and
 `_realpath`. Each answers an `int` by the contract every `*.sys` module has

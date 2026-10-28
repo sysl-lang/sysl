@@ -1,0 +1,281 @@
+module sysl.fs
+@requires(os)
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.sys as fsys
+import sysl.path.{join, parent}
+import sysl.text.from_utf8
+
+// A file mapped into memory (`map_file`, `File.map`), the descriptor a `File` lends (`File.fd`), and
+// `from_errno` as the one table a code becomes an `IoError` through.
+
+// A path no other test, and no other run of this one, is using: in a directory of its own, which
+// `fmp_done` removes with whatever is in it.
+private fmp_path(name: string) -> string = s"${make_temp_dir("sysl-fs-fmp-").unwrap()}/$name"
+
+private fmp_done(path: string) = fmp_ignore(remove_dir_all(parent(path).unwrap()))
+
+private fmp_ignore(r: Result[unit, IoError]) = ()
+
+// What a mapping holds, as text, read inside a function of its own so the view is gone before the
+// caller does anything else with the mapping.
+private fmp_text(m: &Mapped) -> string
+    val v = m.bytes()
+
+    from_utf8(v).unwrap() + ""
+end fmp_text
+
+@test("fmp_fs map_file maps the whole file, and len and bytes agree with it")
+fmp_fs_maps_the_bytes()
+    val path = fmp_path("bytes")
+
+    write_text(path, "hello, map").unwrap()
+
+    val m = map_file(path).unwrap()
+
+    assert_eq(m.len(), 10)
+    assert(!m.is_empty())
+    assert_eq(m.bytes().len, 10)
+    assert_eq(fmp_text(m), "hello, map")
+
+    fmp_done(path)
+end fmp_fs_maps_the_bytes
+
+@test("fmp_fs an empty file maps nothing and answers an empty view, from a path and from a File")
+fmp_fs_empty_file()
+    val path = fmp_path("empty")
+
+    write_text(path, "").unwrap()
+
+    val m = map_file(path).unwrap()
+
+    assert_eq(m.len(), 0)
+    assert(m.is_empty())
+    assert_eq(m.bytes().len, 0)
+
+    var f = open(path).unwrap()
+    val n = f.map().unwrap()
+
+    assert(n.is_empty())
+    fmp_ignore(f.close())
+    fmp_done(path)
+end fmp_fs_empty_file
+
+@test("fmp_fs a file larger than a page is mapped to its last byte")
+fmp_fs_more_than_a_page()
+    val path = fmp_path("large")
+    var data: Buf[u8] = buf()
+
+    for i in 0..<100003 do data.push(u8(i % 251))
+
+    write_bytes(path, data.view()).unwrap()
+
+    val m = map_file(path).unwrap()
+    val v = m.bytes()
+
+    assert_eq(v.len, 100003)
+    assert_eq(v[0], 0)
+    assert_eq(v[65536], u8(65536 % 251))
+    assert_eq(v[100002], u8(100002 % 251))
+
+    fmp_done(path)
+end fmp_fs_more_than_a_page
+
+@test("fmp_fs a missing file is NotFound, a directory IsADirectory, from a path and from a File")
+fmp_fs_refusals()
+    val missing = fmp_path("missing")
+
+    assert(map_file(missing).unwrap_err() == NotFound)
+    fmp_done(missing)
+    assert(map_file("/tmp").unwrap_err() == IsADirectory)
+    assert(map_file("/tmp/").unwrap_err() == IsADirectory)
+
+    var d = open("/tmp").unwrap()
+
+    assert(d.map().unwrap_err() == IsADirectory)
+    fmp_ignore(d.close())
+end fmp_fs_refusals
+
+@test("fmp_fs a file this process may not read is PermissionDenied")
+fmp_fs_permission_denied()
+    val path = fmp_path("locked")
+
+    write_text(path, "secret").unwrap()
+    set_permissions(path, 0o000).unwrap()
+
+    // Root reads a file whatever its mode says, so there the refusal cannot be seen.
+    val readable = open(path)
+
+    if readable.is_ok()
+        var f = readable.unwrap()
+
+        fmp_ignore(f.close())
+    else
+        assert(map_file(path).unwrap_err() == PermissionDenied)
+    end if
+
+    set_permissions(path, 0o600).unwrap()
+    fmp_done(path)
+end fmp_fs_permission_denied
+
+@test("fmp_fs a mapping outlives the File it came from, and the name it was opened by")
+fmp_fs_outlives_file_and_name()
+    val path = fmp_path("outlive")
+
+    write_text(path, "still here").unwrap()
+
+    var f = open(path).unwrap()
+    val m = f.map().unwrap()
+
+    f.close().unwrap()
+    remove_file(path).unwrap()
+
+    assert(!exists(path))
+    assert_eq(fmp_text(m), "still here")
+
+    fmp_done(path)
+end fmp_fs_outlives_file_and_name
+
+@test("fmp_fs a mapping made before a rename over its name keeps the old bytes")
+fmp_fs_rename_over()
+    val path = fmp_path("renamed")
+    val fresh = join(parent(path).unwrap(), "renamed-new")
+
+    write_text(path, "old text").unwrap()
+
+    val m = map_file(path).unwrap()
+
+    write_text(fresh, "new").unwrap()
+    rename(fresh, path).unwrap()
+
+    assert_eq(fmp_text(m), "old text")
+    assert_eq(read_text(path).unwrap(), "new")
+
+    fmp_done(path)
+end fmp_fs_rename_over
+
+@test("fmp_fs File.map sees what is still buffered, and leaves the file usable")
+fmp_fs_map_sees_buffered_writes()
+    val path = fmp_path("buffered")
+    var f = create_update(path).unwrap()
+
+    f.write("abc".bytes)
+
+    val m = f.map().unwrap()
+
+    assert_eq(fmp_text(m), "abc")
+
+    f.write("def".bytes)
+    f.close().unwrap()
+
+    assert_eq(read_text(path).unwrap(), "abcdef")
+    assert_eq(m.len(), 3)
+
+    fmp_done(path)
+end fmp_fs_map_sees_buffered_writes
+
+@test("fmp_fs two mappings of one file are two: dropping one leaves the other readable")
+fmp_fs_two_mappings()
+    val path = fmp_path("two")
+
+    write_text(path, "twice").unwrap()
+
+    val keep = map_file(path).unwrap()
+
+    for _ in 0..<3
+        val m = map_file(path).unwrap()
+
+        assert_eq(fmp_text(m), "twice")
+
+    assert_eq(fmp_text(keep), "twice")
+
+    fmp_done(path)
+end fmp_fs_two_mappings
+
+@test("fmp_fs a second name for one mapping shares it, and the mapping lasts until the last goes")
+fmp_fs_shared_reference()
+    val path = fmp_path("shared")
+
+    write_text(path, "one map").unwrap()
+
+    var a = map_file(path).unwrap()
+    val b = a
+
+    a = map_file(join(parent(path).unwrap(), "missing")).unwrap_or(b)
+
+    assert_eq(fmp_text(b), "one map")
+    assert_eq(fmp_text(a), "one map")
+
+    fmp_done(path)
+end fmp_fs_shared_reference
+
+@test("fmp_fs a closed File maps nothing and lends no descriptor: both are NotOpen")
+fmp_fs_closed_file()
+    val path = fmp_path("closed")
+
+    write_text(path, "x").unwrap()
+
+    var f = open(path).unwrap()
+
+    f.close().unwrap()
+
+    assert(f.map().unwrap_err() == NotOpen)
+    assert(f.fd().unwrap_err() == NotOpen)
+
+    fmp_done(path)
+end fmp_fs_closed_file
+
+@test("fmp_fs fd is the descriptor the file reads through, the same on every call and every copy")
+fmp_fs_fd_is_the_descriptor()
+    val path = fmp_path("fd")
+
+    write_text(path, "abc").unwrap()
+
+    var f = open(path).unwrap()
+    val g = f
+    val n = f.fd().unwrap()
+
+    assert(n >= 0)
+    assert_eq(f.fd().unwrap(), n)
+    assert_eq(g.fd().unwrap(), n)
+
+    var st = fsys.Stat(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+
+    assert_eq(fsys.fstat(n, &st), 0)
+    assert_eq(st.size, 3)
+
+    fmp_ignore(f.close())
+    fmp_done(path)
+end fmp_fs_fd_is_the_descriptor
+
+@test("fmp_fs from_errno names each code the set names, and keeps any other as Other")
+fmp_fs_from_errno_each_code()
+    assert(from_errno(1) == NotPermitted)
+    assert(from_errno(2) == NotFound)
+    assert(from_errno(4) == Interrupted)
+    assert(from_errno(9) == NotOpen)
+    assert(from_errno(13) == PermissionDenied)
+    assert(from_errno(17) == AlreadyExists)
+    assert(from_errno(20) == NotADirectory)
+    assert(from_errno(21) == IsADirectory)
+    assert(from_errno(24) == TooManyOpenFiles)
+    assert(from_errno(28) == NoSpaceLeft)
+    assert(from_errno(not_empty()) == DirectoryNotEmpty)
+
+    from_errno(4242) match
+        Other(code) -> assert_eq(code, 4242)
+        _ -> assert(false, "4242 named a case")
+
+    from_errno(0) match
+        Other(code) -> assert_eq(code, 0)
+        _ -> assert(false, "0 named a case")
+
+    from_errno(-5) match
+        Other(code) -> assert_eq(code, -5)
+        _ -> assert(false, "-5 named a case")
+
+    // Each named case round-trips: the code it answers is the code it came from.
+    for code in [1, 2, 4, 9, 13, 17, 20, 21, 24, 28, 4242]
+        assert_eq(from_errno(code).code(), code)
+end fmp_fs_from_errno_each_code

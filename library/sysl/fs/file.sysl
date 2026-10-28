@@ -18,10 +18,9 @@ import sysl.slices.{as_ptr, copy}
 // here is what lets a target that has system calls and no C library at all -- which answers
 // `sysl.fs.sys` and nothing more -- have a `File` that behaves exactly as a host's does.
 //
-// The descriptor itself is not handed out. A program that needs one -- to poll it, to pass it to a
-// child -- is not served here and should say `open(2)` for itself, which is what `sysl.io`'s
-// `FdReader` is already shaped for. The two live side by side on purpose: `Reader` is about bytes
-// arriving, not about where a program got its handle.
+// The descriptor is handed out by `fd()`, for a program that has to pass it to a call this module
+// does not make -- to poll it, to `fcntl` it, to hand it to C. The file keeps it: closing it stays the
+// `File`'s to do, and what is still buffered has not reached it until `flush`.
 
 /** How many bytes a file holds back before handing them over, and asks for at once when a caller
  * asks for fewer.
@@ -82,6 +81,31 @@ struct File
     inner: &FileState
 
     closed(*self) -> bool = self.inner.shut
+
+    /** The descriptor the file reads and writes through, for a call this module does not make.
+     *
+     * **It is lent, not given**: the file still closes it, and a descriptor closed behind the file's
+     * back is one the file goes on using. **Bytes written and not yet flushed are not in it yet**, and
+     * bytes read ahead have already left it, so a program mixing its own calls with the file's flushes
+     * first and reads through one or the other. A closed file answers `NotOpen` rather than a number
+     * that may by now name somebody else's file.
+     */
+    fd(self) -> Result[int, IoError] = if self.inner.shut then Err(NotOpen) else Ok(self.inner.fd)
+
+    /** The file's bytes, mapped read-only into memory rather than read -- `map_file`, for a file that
+     * is already open. What is still buffered is handed over first, so the mapping sees every byte
+     * the program has written. The mapping outlives the file: closing it afterwards takes nothing
+     * from the mapping.
+     */
+    map(*self) -> Result[&Mapped, IoError]
+        if self.inner.shut then return Err(NotOpen)
+
+        val written = drain(self.inner)
+
+        if written != 0 then return Err(from_status(written))
+
+        mapped_from(self.inner.fd)
+    end map
 
     /** Hands over what is buffered.
      *
