@@ -64,6 +64,10 @@ struct LoopCtx
     label: Option[string]
     break_tys: Buf[Type]
 
+    // Whether each `break` value, in `break_tys`'s order, comes to a bare literal on every path
+    // (`literal_valued`), and so has no type of its own to insist on.
+    break_soft: Buf[bool]
+
     // The measure the body declared at its head, taken once the body is read.
     variant: Option[(string, Type)]
 
@@ -74,7 +78,15 @@ end LoopCtx
 
 // A loop with nothing broken out of it yet.
 loop_ctx(expected: Option[Type], label: Option[string]) -> &LoopCtx =
-    LoopCtx(expected, label, buf(), None, false)
+    LoopCtx(expected, label, buf(), buf(), None, false)
+
+// The results a loop could not meet: each `break` value's type, whether each is a literal's value,
+// and the `else`'s type where it has one.
+struct LoopMiss
+    break_tys: Buf[Type]
+    break_soft: Buf[bool]
+    else_ty: Option[Type]
+end LoopMiss
 
 // Everything typing one expression needs.
 struct Analyzer
@@ -422,6 +434,11 @@ struct Analyzer
     ptr_addrs: Buf[PtrAddr]
     ptr_moves: Buf[PtrMove]
 
+    // What the loop just read had to meet and could not, where some of it was a literal's value:
+    // every `break` value's type and whether it was one, and the `else`'s type (`expr_flow.sysl`'s
+    // `loop_reading` reads the loop again at the type the rest settle).
+    loop_miss: Option[LoopMiss]
+
     // The body a `RefWatch` filed now belongs to.
     watch_key(self) -> string = if self.body != "" then self.body else self.func_name
 
@@ -729,7 +746,7 @@ analyzer_for(an: &Analysis, scope: Scope) -> &Analyzer =
              empty_names(), false, buf(), buf(), buf(), "", buf(), None, None, None, buf(), 0, buf(),
              false, false, false, AwaitOutside, false, buf(), "", buf(), buf(), 0, 0, "", buf(), buf(), buf(),
              false, buf(), buf(), map(), map(), buf(), false, buf(), buf(), buf(), buf(), buf(), false,
-             false, false, false, None, buf(), buf(), buf())
+             false, false, false, None, buf(), buf(), buf(), None)
 
 // A run of names with nothing in it, named so that a constructor can say which kind it means.
 private empty_names() -> Buf[string] = buf()

@@ -591,6 +591,25 @@ this loop breaks with a int but has no 'else' to give a value when it finishes n
 Every `break` value and the `else` value share one type, which becomes the loop's. A bare `break`
 with no `else` is the ordinary statement loop, of type `unit`.
 
+A literal among them has no type of its own, so it takes the one the others settle, exactly as an
+`if`'s literal branch takes its sibling's. Here the `else`'s `255` is a `u8` because `i` is, and the
+loop with it; a literal that does not fit that type is refused at the literal.
+
+```sysl
+val codes: [4]u8 = [7, 9, 12, 40]
+
+val at = for i in 0u8..<4
+    if codes[i] > 10 then break i
+else 255
+
+val code: u8 = codes[at] + at
+print(at, code)
+```
+
+```output
+2 14
+```
+
 ### `do … while`
 
 The test comes at the end, so the body runs at least once. The body is an indented block with the

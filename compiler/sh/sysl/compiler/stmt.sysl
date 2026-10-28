@@ -449,6 +449,9 @@ loop_result_type(cx: &Analyzer, span: Span, ctx: &LoopCtx, else_block: Option[TB
 
     if joined.is_some() then return joined.unwrap()
 
+    if else_block.is_some() then note_miss(cx, ctx, Some(else_block.unwrap().ty))
+    if reported(tys) then return Unknown
+
     if else_block.is_none()
         val v = first_value(ctx.break_tys)
 
@@ -477,12 +480,30 @@ endless_result_type(cx: &Analyzer, span: Span, ctx: &LoopCtx) -> Type
 
     if joined.is_some() then return joined.unwrap()
 
+    note_miss(cx, ctx, None)
+
+    if reported(ctx.break_tys) then return Unknown
+
     cx.fault(span, s"a loop's break values must have the same type, but got " +
              s"${type_list_show(ctx.break_tys)}")
     Unknown
 end endless_result_type
 
-private meet_all(tys: Buf[Type]) -> Option[Type]
+// Whether a result is a mistake already reported -- a `break 300` read at a `u8` -- which makes the
+// loop's results not meeting a consequence of it, and nothing to say twice.
+private reported(tys: Buf[Type]) -> bool
+    for t in tys
+        if t == Unknown then return true
+
+    false
+
+// Files what a loop could not meet, for the reading around it to try again where a literal's value
+// among it could have taken its siblings' type -- which a loop read at a type already cannot.
+private note_miss(cx: &Analyzer, ctx: &LoopCtx, else_ty: Option[Type])
+    if ctx.expected.is_none() then
+        cx.loop_miss = Some(LoopMiss(ctx.break_tys, ctx.break_soft, else_ty))
+
+meet_all(tys: Buf[Type]) -> Option[Type]
     if tys.is_empty() then return None
 
     var acc: Option[Type] = Some(tys.at(0))
@@ -1193,6 +1214,7 @@ private break_stmt(cx: &Analyzer, span: Span, label: Option[string],
     val tv = value.map(e -> type_expr(cx, e, ctx.expected))
 
     ctx.break_tys.push(if tv.is_none() then Unit else texpr_type(tv.unwrap()))
+    ctx.break_soft.push(value.is_some() && literal_valued(cx, value.unwrap()))
     one(TBreak(tv, found.unwrap().1))
 end break_stmt
 

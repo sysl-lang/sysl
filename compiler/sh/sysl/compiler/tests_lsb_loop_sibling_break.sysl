@@ -1,0 +1,218 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.replace_all
+
+// A loop's results meet the way an `if`'s branches do: a `break` value or an `else` that comes to a
+// literal on every path (`literal_valued`) takes the type the others settle, so
+// `for i in 0u8..<10 … break i … else 99` is a `u8` loop (`expr_flow.sysl`'s `loop_reading`). The
+// loop is read once as it is and, where its results then fail to meet with a literal's value among
+// them, read again at the type the rest settle -- so these tests also watch that the second reading
+// owes nothing to the first (closures, nested functions, instantiations, first-use variables).
+//
+// Cells skipped, with the reason: a loop in statement position, whose `else` is discarded and
+// whose value-carrying break is refused by design (`tests_stp_statement_position`); a loop read at
+// a type already, which told every literal that type before this change (`dwl_` covers it).
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private lsb_ready() -> bool = std_root().is_ok() && clang_available()
+
+private lsb_root(text: string) -> string
+    val root = replace_all(make_temp_dir("sysl-lsb").unwrap(), "//", "/")
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", forms_imported(text)).unwrap()
+    root
+end lsb_root
+
+// What a one-file program prints, or the report it was refused with.
+private lsb_ran(text: string) -> string
+    val root = lsb_root(text)
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            val said = replace_all(failure_text(why), s"$root/", "")
+
+            remove_dir_all(root).unwrap_or(())
+            return said
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end lsb_ran
+
+private lsb_report(text: string) -> string
+    val root = lsb_root(text)
+
+    val out = emit_llvm_text(s"$root/main.sysl", None) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> if made.report.is_empty() then "" else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    replace_all(out, s"$root/", "")
+end lsb_report
+
+private lsb_prints(text: string, want: string)
+    if !lsb_ready() then return
+
+    assert_eq(lsb_ran(text), want)
+
+// Refused with exactly `message`, first, at `at` (`line:col`), and with nothing after it.
+private lsb_refused(text: string, message: string, at: string)
+    if !lsb_ready() then return
+
+    val said = lsb_report(text)
+    val head = s"error: $message\n"
+    val place = s"--> main.sysl:$at\n"
+
+    assert(said.starts_with(head) && said.contains(place),
+           s"expected a report starting\n$head\nlocated at$place\ngot\n$said")
+    assert(!said[1..<said.len].contains("error: "), s"expected one complaint, got\n$said")
+end lsb_refused
+
+// -- the reported cases ---------------------------------------------------------------------------
+
+@test("a for's typed break and a literal else, and a loop's typed and literal breaks")
+lsb_the_reported_cases() =
+    lsb_prints("val c = true\nval found = for i in 3u8..<10\n    if c then break i\nelse 99\n" +
+               "val b: u8 = 7\nval v = loop\n    if !c then break b\n    break 99\n" +
+               "val k: u8 = found + v\nprint(found, v, k)\n",
+               "3 99 102\n")
+
+@test("the literal first or the typed one first, in a break or in the else")
+lsb_either_order() =
+    lsb_prints("val c = true\nval b: u8 = 7\n" +
+               "val w = loop\n    if !c then break 99\n    break b\n" +
+               "val x = for i in 0..<3\n    if i == 9 then break 4\nelse b\n" +
+               "val y = for i in 0..<3\n    if i == 1 then break b\nelse 200\n" +
+               "val s: u8 = w + x + y\nprint(w, x, y, s)\n",
+               "7 7 7 21\n")
+
+// -- every loop -----------------------------------------------------------------------------------
+
+@test("while, do-while, a three-clause for with and without a condition, and a for over a slice")
+lsb_every_loop() =
+    lsb_prints("val b: u16 = 1000\nvar n = 0\n" +
+               "val w = while n < 3\n    n += 1\n    if n == 9 then break 4\nelse b\n" +
+               "val d = do\n    n += 1\nwhile n < 5\nelse 6\n" +
+               "val dt = do\n    if n == 5 then break b\n    n += 1\nwhile n < 9\nelse 6\n" +
+               "val cf = for var i = 0; i < 3; i += 1\n    if i == 7 then break b\nelse 70\n" +
+               "val ce = for var i = 0; ; i += 1\n    if i == 2 then break b\n    if i == 9 then break 1\n" +
+               "val xs = [1u16, 2, 3]\nval sl = for x in xs[0..<3]\n    if x == 2 then break x\nelse 0\n" +
+               "val s: u16 = w + dt + cf + ce + sl\nprint(w, d, dt, cf, ce, sl, s)\n",
+               "1000 6 1000 70 1000 2 3072\n")
+
+@test("a labelled break from an inner loop, and an inner loop with its own literal")
+lsb_labels_and_nesting() =
+    lsb_prints("val c = true\nval b: u8 = 9\n" +
+               "val z = 'outer for i in 0u16..<4\n    for j in 0..<4\n        if j == 2 then break 'outer i + 5\n" +
+               "        if j == 3 then break 'outer 2\nelse 1000\n" +
+               "val nested = loop\n    val inner = loop\n        if c then break b\n        break 3\n" +
+               "    if !c then break 300\n    break u16(inner)\n" +
+               "val q: u16 = z + nested\nprint(z, nested, q)\n",
+               "5 9 14\n")
+
+// -- several breaks, and literal expressions ------------------------------------------------------
+
+@test("several breaks mixing literals, a shift, a negation and an if of literals with a typed one")
+lsb_several_breaks() =
+    lsb_prints("val c = false\nval h: i8 = -3\n" +
+               "val m = loop\n    if c then break -1\n    if c then break 1 << 3\n" +
+               "    if c then break if c then 1 else 2\n    if c then break 0x7F\n    break h\n" +
+               "val n: i8 = m\nprint(n)\n",
+               "-3\n")
+
+@test("a shift of a literal takes the type, and wraps at it")
+lsb_shift_at_type() =
+    lsb_prints("val c = true\nval b: u8 = 1\nval s = 9\n" +
+               "val r = for i in 0..<2\n    if c then break 1 << 3\nelse b\n" +
+               "val w = for i in 0..<2\n    if c then break 1 << s\nelse b\n" +
+               "print(r, w)\n",
+               "8 0\n")
+
+@test("u64, i64, f32 and real partners")
+lsb_partners() =
+    lsb_prints("val c = true\nval big: u64 = 1\nval neg: i64 = -2\nval f: f32 = 0.5\nval r = 1.5\n" +
+               "val a = loop\n    if !c then break 0xFFFF_FFFF_FFFF\n    break big\n" +
+               "val b = loop\n    if c then break -9_000_000_000\n    break neg\n" +
+               "val d = for i in 0..<2\n    if i == 5 then break 2.5\nelse f\n" +
+               "val e = loop\n    if !c then break 1\n    break r\n" +
+               "val a2: u64 = a\nval b2: i64 = b\nval d2: f32 = d\nprint(a2, b2, d2, e)\n",
+               "1 -9000000000 0.5 1.5\n")
+
+@test("a loop read at a type tells every literal that type, typed breaks widening to it")
+lsb_typed_context() =
+    lsb_prints("val c = true\nval b: u8 = 200\nval x: u16 = loop\n    if c then break b\n    break 3\n" +
+               "val y: u16 = for i in 0..<2\n    if i == 9 then break b\nelse 60000\nprint(x, y)\n",
+               "200 60000\n")
+
+// -- the second reading owes nothing to the first -------------------------------------------------
+
+@test("a body with a closure, a nested function, a generic call and a first-use var, read twice")
+lsb_reread_body() =
+    lsb_prints("square(n: int) -> int = n * n\npick[T](a: T, b: T, first: bool) -> T = if first then a else b\n" +
+               "var t = 0u8\nval g = loop\n    val k = (n: int) -> n + 1\n    nested(n: int) -> int = n * 2\n" +
+               "    t += 1\n    var acc = 0\n    acc = acc + nested(k(square(2)))\n" +
+               "    if t == 1 then continue\n    if acc > 1000 then break 1\n    break pick(t, t, true)\n" +
+               "val gx: u8 = g\nprint(gx, t)\n",
+               "2 2\n")
+
+@test("a for variable fixed by its first use, beside a literal else")
+lsb_first_use_variable() =
+    lsb_prints("val b: u8 = 4\nval r = for i in 0..<10\n    if i == b then break i\nelse 77\nval x: u8 = r\nprint(x)\n",
+               "4\n")
+
+@test("a loop of literal breaks inside a generic function, instantiated twice")
+lsb_generic_twin() =
+    lsb_prints("first_at[T: Eq](xs: []T, want: T) -> u8\n    val at = for i in 0u8..<u8(xs.len)\n" +
+               "        if xs[i] == want then break i\n    else 255\n    at\n" +
+               "print(first_at([1, 2, 3][0..<3], 2), first_at([\"a\", \"b\"][0..<2], \"z\"))\n",
+               "1 255\n")
+
+// -- what does not meet --------------------------------------------------------------------------
+
+@test("a literal break that does not fit its sibling's type is refused at the literal, once")
+lsb_break_does_not_fit() =
+    lsb_refused("val c = true\nval b: u8 = 7\nval v = loop\n    if c then break b\n    break 300\nprint(v)\n",
+                "the literal 300 does not fit byte", "5:11")
+
+@test("a literal else that does not fit is refused at the literal, once")
+lsb_else_does_not_fit() =
+    lsb_refused("val c = true\nval v = for i in 0u8..<3\n    if c then break i\nelse 300\nprint(v)\n",
+                "the literal 300 does not fit byte", "4:6")
+
+@test("a negative literal beside an unsigned break is refused at the literal")
+lsb_negative_does_not_fit() =
+    lsb_refused("val c = true\nval b: u8 = 7\nval v = loop\n    if c then break b\n    break -1\nprint(v)\n",
+                "the literal -1 does not fit byte", "5:11")
+
+@test("a literal beside a string is the old disagreement")
+lsb_string_sibling() =
+    lsb_refused("val c = true\nval s = \"a\"\nval v = loop\n    if c then break s\n    break 1\nprint(v)\n",
+                "a loop's break values must have the same type, but got string and int", "3:9")
+
+@test("a float literal beside an integer is the old disagreement")
+lsb_float_beside_integer() =
+    lsb_refused("val c = true\nval b: u8 = 7\nval v = loop\n    if c then break b\n    break 2.5\nprint(v)\n",
+                "a loop's break values must have the same type, but got byte and real", "3:9")
+
+@test("typed breaks that disagree between themselves settle nothing for the literal")
+lsb_typed_disagree() =
+    lsb_refused("val c = true\nval s = \"a\"\nval v = for i in 0u8..<3\n    if c then break i\n    if c then break 2\nelse s\nprint(v)\n",
+                "a loop's break values and its 'else' must have the same type, but got byte and int and string",
+                "3:9")
+
+@test("with no else a literal break still owes one")
+lsb_no_else() =
+    lsb_refused("val c = true\nval v = for i in 0u8..<3\n    if c then break 1\nprint(v)\n",
+                "this loop breaks with a int but has no 'else' to give a value when it finishes normally — add an 'else'",
+                "2:9")

@@ -42,15 +42,11 @@ private analyze_discarded(cx: &Analyzer, e: Expr) -> TExpr = *e.kind match
     IfExpr(cond, then_body, else_body, _) -> if_expr(cx, e.span, cond, then_body, else_body, None, true)
     MatchExpr(scrut, arms) -> match_expr(cx, e.span, scrut, arms, None, true)
     Block(stmts) -> TExpr(e.span, TBlockExpr(type_value_block(cx, stmts, None, true)))
-    While(label, cond, body, else_body) ->
-        while_expr(cx, e.span, label, cond, body, else_body, None, true)
-    DoWhile(label, body, cond, else_body) ->
-        do_while_expr(cx, e.span, label, body, cond, else_body, None, true)
-    Loop(label, body) -> loop_expr(cx, e.span, label, body, None)
-    For(label, name, iter, body, else_body) ->
-        for_expr(cx, e.span, label, name, iter, body, else_body, None, true)
-    CFor(label, init, cond, step, body, else_body) ->
-        c_for_expr(cx, e.span, label, init, cond, step, body, else_body, None, true)
+    While(_, _, _, _) -> loop_reading(cx, e, None, true)
+    DoWhile(_, _, _, _) -> loop_reading(cx, e, None, true)
+    Loop(_, _) -> loop_reading(cx, e, None, true)
+    For(_, _, _, _, _) -> loop_reading(cx, e, None, true)
+    CFor(_, _, _, _, _, _) -> loop_reading(cx, e, None, true)
     ConstFor(name, iter, body) -> const_for_expr(cx, e.span, name, iter, body)
     ConstIf(cond, then_body, else_body) -> const_if_expr(cx, e.span, cond, then_body, else_body, None, true)
     _ ->
@@ -913,6 +909,77 @@ private joined_types(ts: Buf[Type]) -> string
 end joined_types
 
 // -- the loops --------------------------------------------------------------------------------------
+
+// **A `break` value or an `else` that comes to a bare literal takes the type its siblings settle**,
+// exactly as a guessing branch of an `if` does: `for i in 0u8..<10 { if c then break i } else 99` is
+// a `u8` loop. A loop's breaks stand anywhere in its body and are read where they stand, before
+// the `else` and before one another, so nothing knows its siblings' type in time to be told it.
+// The loop is therefore read once as it is, and where its results then fail to meet with a
+// literal's value among them, read again at the type the others settle -- the reading a type
+// annotation on the loop would have given it. A loop read at a type already is told it everywhere.
+loop_reading(cx: &Analyzer, e: Expr, expected: Option[Type], discarded: bool) -> TExpr
+    if expected.is_some() then return loop_once(cx, e, expected, discarded)
+
+    val outer = cx.loop_miss
+
+    cx.loop_miss = None
+
+    val tried = begin_trial(cx)
+    val first = loop_once(cx, e, None, discarded)
+    val miss = cx.loop_miss
+
+    cx.loop_miss = outer
+
+    val want = miss.and_then(m -> sibling_type(cx, m, loop_else(e)))
+
+    if want.is_none()
+        keep_trial(cx)
+        return first
+    end if
+
+    discard_trial(cx, tried)
+    loop_once(cx, e, want, discarded)
+end loop_reading
+
+private loop_once(cx: &Analyzer, e: Expr, expected: Option[Type], discarded: bool) -> TExpr = *e.kind match
+    While(label, cond, body, else_body) ->
+        while_expr(cx, e.span, label, cond, body, else_body, expected, discarded)
+    DoWhile(label, body, cond, else_body) ->
+        do_while_expr(cx, e.span, label, body, cond, else_body, expected, discarded)
+    Loop(label, body) -> loop_expr(cx, e.span, label, body, expected)
+    For(label, name, iter, body, else_body) ->
+        for_expr(cx, e.span, label, name, iter, body, else_body, expected, discarded)
+    CFor(label, init, cond, step, body, else_body) ->
+        c_for_expr(cx, e.span, label, init, cond, step, body, else_body, expected, discarded)
+    _ -> bad_expr(e.span)
+
+private loop_else(e: Expr) -> Option[Buf[Stmt]] = *e.kind match
+    While(_, _, _, else_body) -> else_body
+    DoWhile(_, _, _, else_body) -> else_body
+    For(_, _, _, _, else_body) -> else_body
+    CFor(_, _, _, _, _, else_body) -> else_body
+    _ -> None
+
+// The type a loop's results that know their own settle for the ones that are a literal's value, or
+// nothing where none is one, where the rest do not meet either, or where all they settle is a
+// `unit`, a `never` or a mistake already reported.
+private sibling_type(cx: &Analyzer, m: LoopMiss, else_body: Option[Buf[Stmt]]) -> Option[Type]
+    var known: Buf[Type] = buf()
+    var soft = false
+
+    for i in 0..<m.break_tys.len()
+        if m.break_soft.at(i) then soft = true
+        else known.push(m.break_tys.at(i))
+
+    if m.else_ty.is_some()
+        if else_body.is_some() && literal_block(cx, else_body.unwrap()) then soft = true
+        else known.push(m.else_ty.unwrap())
+    end if
+
+    if !soft then return None
+
+    meet_all(known).and_then(t -> if t == Never || t == Unit || t == Unknown then None else Some(t))
+end sibling_type
 
 // A loop's `else` is a block like any other, so a loop in statement position discards it too --
 // without which Python's own idiom, walk and set a flag in the `else` when nothing hit, would be
