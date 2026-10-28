@@ -162,7 +162,17 @@ analyze_unwidened(cx: &Analyzer, e: Expr, expected: Option[Type]) -> TExpr
                 NullLit if erased(want) -> return analyze_value(cx, e, expected)
                 NullLit -> return cx.err(e.span, s"a ${type_show(want)} always points at a live " +
                                          s"object — an absent one is Option[${type_show(want)}]")
-                _ -> return coerce(cx, analyze_value(cx, e, Some(*inner)), want)
+                _ ->
+                    // The payload is what is asked for, and the box is named beside it: a generic
+                    // call whose result is a bare `R` may be handed the box itself by its callable.
+                    val outer = cx.boxing
+
+                    cx.boxing = Some(want)
+
+                    val v = analyze_value(cx, e, Some(*inner))
+
+                    cx.boxing = outer
+                    return coerce(cx, v, want)
         Weak(inner) ->
             *e.kind match
                 NullLit -> return cx.err(e.span, s"'null' is a raw pointer, and an empty " +
