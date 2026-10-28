@@ -198,6 +198,41 @@ add(xs[..], out[..])
 'W' is in neither the parameters of 'add' nor its result
 ```
 
+**A list may stop short: it fills the leading parameters, and the trailing ones are inferred.** The
+parameter only a bound mentions is written, and the rest come from the arguments and the expected
+type, exactly as when no list is written. This holds for a function, a nested function, a method's
+own parameters and an associated function's:
+
+```sysl
+trait Make
+    make(n: int) -> Self
+
+impl Make for int
+    make(n: int) -> int = n * 10
+
+decode_as[V: Make, S](n: int, source: S) -> V = V.make(n)
+
+print(decode_as[int](4, "input"))
+```
+
+```output
+40
+```
+
+What the list wrote is not reconsidered, so an argument that disagrees with it is refused rather
+than re-solving the parameter. A longer list than the parameters is refused, and so is a trailing
+parameter nothing in the call can settle:
+
+```sysl
+pick[A, B](a: A) -> A = a
+
+print(pick[int](1))
+```
+
+```error
+'B' is in neither the parameters of 'pick' nor its result, so nothing in this call says what it should be
+```
+
 **Two kinds of parameter are always inferred.** A **type pack** (`..A`) stands for a list of types
 rather than one and has no expression spelling, so its instantiation is always solved. A **bare
 arrow's own parameter** is the other, described below.
@@ -1405,7 +1440,8 @@ default of `Self` has nothing to name, and the argument must be written out.
 
 **Only those three declarations may carry defaults.** The type parameters of a function, a method and
 an `impl` block are *solved* from what they are given rather than written where they are used, so
-there is no argument list with a gap for a default to fill:
+there is no argument list with a gap for a default to fill — a list that stops short leaves the rest
+to inference, not to a default:
 
 ```sysl
 f[T = int](x: T) -> T = x

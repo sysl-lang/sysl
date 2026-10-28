@@ -1,0 +1,236 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.text.Search
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// `f::Type` and `c::Payload` stand before `.` as an alias does (`reference/reflection.md`): each copy
+// of a `for const` binds the spelling to the field's or the payload's type, so `f::Type.make(2)`
+// reaches the associated function `I.make(2)` does over `type I = int`.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private rpd_root(main: string) -> string
+    val root = make_temp_dir("sysl-rpd").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(root + "/package.hocon", "package {\n  name = \"probe\"\n}\n").unwrap()
+    write_text(root + "/main.sysl", main).unwrap()
+    root
+end rpd_root
+
+// What the program printed and the status it left with; a failure to build is its message and `-1`.
+private rpd_outcome(main: string) -> (string, int)
+    val root = rpd_root(main)
+    val exe = root + "/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (failure_text(why), -1)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> ("the program that was built could not be run", -1)
+        Ok(out) -> (out.text + out.err.unwrap_or(""), shell_status(out.status))
+end rpd_outcome
+
+private rpd_prints(main: string, want: string)
+    if xvr_no_library() then return
+
+    val out = rpd_outcome(main)
+
+    assert_eq(out.0, want)
+    assert_eq(out.1, 0)
+
+// The program is refused with exactly this message, first, at this line and column of `main.sysl`.
+private rpd_refused(main: string, message: string, at: string)
+    if xvr_no_library() then return
+
+    val root = rpd_root(main)
+
+    val out = emit_llvm_text(root, None) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> if made.report.is_empty() then made.text else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    assert(out.starts_with(s"error: $message\n  --> ") || out.starts_with(s"error: $message\n --> "),
+           s"expected 'error: $message' first, got: $out")
+    assert(out.index_of(s"/main.sysl:$at\n").is_some(), s"expected it at main.sysl:$at, got: $out")
+end rpd_refused
+
+private rpd_make() -> string = raw"""
+    trait Make
+        make(n: int) -> Self
+
+    impl Make for int
+        make(n: int) -> int = n * 10
+
+    impl Make for string
+        make(n: int) -> string = s"s$n"
+
+    """
+
+// -- what it does -----------------------------------------------------------------------------------
+
+// The codec note's probe for its question 4, as it was written.
+@test("the codec probe: a field's type reaches a trait's associated function before '.'")
+rpd_the_codec_probe() = rpd_prints(raw"""
+    trait Make
+        make(n: int) -> Self
+    impl Make for int
+        make(n: int) -> int = n
+    make_as[V: Make](n: int) -> V = V.make(n)
+    struct P
+        x: int
+    for const f in P::Fields
+        print(make_as[f::Type](1))
+        print(f::Type.make(2))
+    """, "1\n2\n")
+
+@test("'f::Type.m()' reads as 'I.m()' does over an alias, in every copy")
+rpd_reads_as_an_alias() = rpd_prints(rpd_make() + raw"""
+    type I = int
+
+    struct P
+        x: int
+        y: string
+
+    print(I.make(3))
+
+    for const f in P::Fields
+        print(f::Type.make(2))
+    """, "30\n20\ns2\n")
+
+@test("a struct's own static function, reached through the field's type")
+rpd_a_static_function() = rpd_prints(raw"""
+    struct W
+        k: int
+
+        zero() -> W = W(7)
+
+    struct P
+        w: W
+
+    for const f in P::Fields
+        print(f::Type.zero().k)
+    """, "7\n")
+
+@test("a generic type's associated function runs at the instantiation the field wrote")
+rpd_a_generic_type() = rpd_prints(raw"""
+    struct Box[T]
+        v: T
+
+        of(v: T) -> Box[T] = Box(v)
+
+        width() -> int = 7
+
+    struct P
+        b: Box[u8]
+
+    for const f in P::Fields
+        print(f::Type.width(), f::Type.of(255).v + 1)
+    """, "7 0\n")
+
+@test("a variant's payload type stands before '.' too")
+rpd_a_payload() = rpd_prints(rpd_make() + raw"""
+    enum E
+        A(n: int)
+        B(s: string)
+
+    for const c in E::Variants
+        print(c::Payload.make(4))
+    """, "40\ns4\n")
+
+@test("inside a generic function, a field whose type is the type parameter")
+rpd_a_field_of_the_parameter() = rpd_prints(rpd_make() + raw"""
+    struct G[T]
+        t: T
+
+    show[T: Make + Display](g: G[T])
+        for const f in G[T]::Fields
+            print(f::Type.make(5))
+
+    show(G(1))
+    show(G("q"))
+    """, "50\ns5\n")
+
+@test("a nested walk reaches both its own field's type and the outer one's")
+rpd_nested_walks() = rpd_prints(rpd_make() + raw"""
+    struct W
+        k: int
+
+    impl Make for W
+        make(n: int) -> W = W(n + 100)
+
+    struct P
+        w: W
+
+    for const f in P::Fields
+        for const g in f::Type::Fields
+            print(g::Type.make(6), f::Type.make(7).k)
+    """, "60 107\n")
+
+@test("the projection before '.' and as a written type argument agree")
+rpd_agrees_with_the_written_argument() = rpd_prints(rpd_make() + raw"""
+    make_as[V: Make](n: int) -> V = V.make(n)
+
+    struct P
+        x: int
+        y: string
+
+    for const f in P::Fields
+        print(make_as[f::Type](1) == f::Type.make(1))
+    """, "true\ntrue\n")
+
+// -- what it refuses --------------------------------------------------------------------------------
+
+@test("a member the field's type does not have is refused in that copy")
+rpd_no_such_member() = rpd_refused(rpd_make() + raw"""
+    struct P
+        x: int
+
+    for const f in P::Fields
+        print(f::Type.nope(2))
+    """, "int has no associated function 'nope' (in the copy for field 'P.x')", "14:19")
+
+@test("a member only one copy's type lacks is refused in that copy alone")
+rpd_one_copy_lacks_it() = rpd_refused(raw"""
+    trait Make
+        make(n: int) -> Self
+
+    impl Make for int
+        make(n: int) -> int = n
+
+    struct P
+        x: int
+        y: bool
+
+    for const f in P::Fields
+        print(f::Type.make(2))
+    """, "bool has no associated function 'make' (in the copy for field 'P.y')", "12:19")
+
+@test("the projection still is a type, not a value, where no '.' follows")
+rpd_still_not_a_value() = rpd_refused(raw"""
+    struct P
+        x: int
+
+    for const f in P::Fields
+        val t = f::Type
+    """, "'f::Type' is a type, so it stands where a type is written — 'var x: f::Type', " +
+         "'sizeof(f::Type)', 'decode[f::Type](r)' (in the copy for field 'P.x')", "5:14")
+
+@test("a field descriptor has no '::Payload' to stand before '.'")
+rpd_a_field_has_no_payload() = rpd_refused(raw"""
+    struct P
+        x: int
+
+    for const f in P::Fields
+        print(f::Payload.zero())
+    """, "'f' is the descriptor 'P.x', which answers '::Type', the field's type, and not '::Payload' " +
+    "(in the copy for field 'P.x')", "5:12")

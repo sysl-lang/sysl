@@ -1,0 +1,298 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.text.Search
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// A written type-argument list may be SHORTER than the parameters (`reference/generics.md § Writing
+// the type arguments`): it fills the leading ones, and the trailing ones are solved from the
+// arguments and the type the position expects, as they are when no list is written. A longer list is
+// refused, and so is a trailing parameter nothing in the call can settle.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private tai_root(main: string) -> string
+    val root = make_temp_dir("sysl-tai").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(root + "/package.hocon", "package {\n  name = \"probe\"\n}\n").unwrap()
+    write_text(root + "/main.sysl", main).unwrap()
+    root
+end tai_root
+
+// What the program printed and the status it left with; a failure to build is its message and `-1`.
+private tai_outcome(main: string) -> (string, int)
+    val root = tai_root(main)
+    val exe = root + "/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (failure_text(why), -1)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> ("the program that was built could not be run", -1)
+        Ok(out) -> (out.text + out.err.unwrap_or(""), shell_status(out.status))
+end tai_outcome
+
+private tai_prints(main: string, want: string)
+    if xvr_no_library() then return
+
+    val out = tai_outcome(main)
+
+    assert_eq(out.0, want)
+    assert_eq(out.1, 0)
+
+// The program is refused with exactly this message, first, at this line and column of `main.sysl`.
+private tai_refused(main: string, message: string, at: string)
+    if xvr_no_library() then return
+
+    val root = tai_root(main)
+
+    val out = emit_llvm_text(root, None) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> if made.report.is_empty() then made.text else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    assert(out.starts_with(s"error: $message\n"), s"expected 'error: $message' first, got: $out")
+    assert(out.index_of(s"/main.sysl:$at\n").is_some(), s"expected it at main.sysl:$at, got: $out")
+end tai_refused
+
+private tai_make() -> string = raw"""
+    trait Make
+        make(n: int) -> Self
+
+    impl Make for int
+        make(n: int) -> int = n * 10
+
+    impl Make for string
+        make(n: int) -> string = s"s$n"
+
+    """
+
+// -- what it does -----------------------------------------------------------------------------------
+
+// The codec note's probe for its question 4, as it was written.
+@test("the codec probe: one of two written, the second read off its argument")
+tai_the_codec_probe() = tai_prints(raw"""
+    trait Make
+        make(n: int) -> Self
+    impl Make for int
+        make(n: int) -> int = n
+    make_as[V: Make, S](n: int, s: S) -> V = V.make(n)
+    print(make_as[int](1, "s"))
+    """, "1\n")
+
+@test("two of three written, the third read off its argument")
+tai_two_of_three() = tai_prints(tai_make() + raw"""
+    three[A: Make, B, C](b: B, c: C) -> (A, B, C) = (A.make(1), b, c)
+
+    val t = three[string, real](2.5, 'c')
+    print(t.0, t.1, t.2)
+    """, "s1 2.5 c\n")
+
+@test("one of three written, the other two read off their arguments")
+tai_one_of_three() = tai_prints(tai_make() + raw"""
+    three[A: Make, B, C](b: B, c: C) -> (A, B, C) = (A.make(1), b, c)
+
+    val t = three[int](true, "x")
+    print(t.0, t.1, t.2)
+    """, "10 true x\n")
+
+@test("a trailing parameter only the result names is read off the type the position expects")
+tai_trailing_from_the_expected_type() = tai_prints(tai_make() + raw"""
+    made[A: Make, R: Make](n: int) -> (A, R) = (A.make(n), R.make(n + 1))
+
+    val p: (int, string) = made[int](2)
+    print(p.0, p.1)
+    """, "20 s3\n")
+
+@test("what the list writes beats what the argument would have said")
+tai_the_written_one_is_not_reconsidered() = tai_prints(raw"""
+    pair[A, B](a: A, b: B) -> A = a
+
+    val x = pair[u8](200, "b")
+    val y: u8 = x
+    print(y)
+    """, "200\n")
+
+@test("a value parameter is written first and the type after it is solved")
+tai_a_leading_value_parameter() = tai_prints(raw"""
+    fill[const N: usize, T](x: T) -> [N]T = [x; N]
+
+    val a = fill[3]("z")
+    print(a.len, a[2])
+    """, "3 z\n")
+
+@test("a trailing value parameter is read off an array's length")
+tai_a_trailing_value_parameter() = tai_prints(raw"""
+    total[T, const N: usize](xs: [N]T) -> usize = N
+
+    print(total[u8]([1, 2, 3, 4]))
+    """, "4\n")
+
+@test("a method's own parameters, on a concrete receiver")
+tai_a_method() = tai_prints(tai_make() + raw"""
+    struct Sq
+        s: int
+
+    impl Sq
+        both[U: Make, V](self, v: V) -> (U, V) = (U.make(self.s), v)
+
+    val w = Sq(3).both[string](1.5)
+    print(w.0, w.1)
+    """, "s3 1.5\n")
+
+// A short list meets the solve reading the expected type off its provisional: `R`, left unwritten, is
+// settled at the `&Tag` the position wants, so the box the closure yields is the one the caller gets.
+@test("a method's short list leaves R to the expected &T: the same object comes back, dropped once")
+tai_a_short_list_keeps_the_box() = tai_prints(tai_make() + raw"""
+    struct Tag
+        id: int
+
+    impl Drop for Tag
+        drop(self) = print("drop", self.id)
+
+    struct Runner
+        k: int
+
+    impl Runner
+        go[K: Make + Display, R](self, body: () -> R) -> R
+            print(K.make(self.k))
+            body()
+
+    same(t: &Tag) -> &Tag = Runner(4).go[string](() -> t)
+    fresh(n: int) -> &Tag = Runner(5).go[int](() -> Tag(n))
+
+    scene()
+        val t = Tag(1)
+        val u = same(t)
+
+        u.id = 2
+        print(t.id)
+        print(fresh(7).id)
+
+    scene()
+    print("end")
+    """, "s4\n2\n50\n7\ndrop 7\ndrop 2\nend\n")
+
+@test("an associated function's own parameters, through the type")
+tai_an_associated_function() = tai_prints(tai_make() + raw"""
+    struct Sq
+        s: int
+
+    impl Sq
+        stat[U: Make, V](v: V) -> (U, V) = (U.make(2), v)
+
+    val w = Sq.stat[int]("v")
+    print(w.0, w.1)
+    """, "20 v\n")
+
+@test("a trait method's own parameters, through a bound")
+tai_through_a_bound() = tai_prints(tai_make() + raw"""
+    trait Pick
+        pick[U: Make, V](self, v: V) -> (U, V)
+
+    struct Sq
+        s: int
+
+    impl Pick for Sq
+        pick[U: Make, V](self, v: V) -> (U, V) = (U.make(self.s), v)
+
+    via[O: Pick](o: O) -> (int, string) = o.pick[int]("via")
+
+    val v = via(Sq(4))
+    print(v.0, v.1)
+    """, "40 via\n")
+
+@test("an associated function's own parameters, through a bound on the type")
+tai_associated_through_a_bound() = tai_prints(tai_make() + raw"""
+    trait Build
+        build[U: Make, V](v: V) -> (U, V)
+
+    struct Sq
+        s: int
+
+    impl Build for Sq
+        build[U: Make, V](v: V) -> (U, V) = (U.make(5), v)
+
+    via[O: Build]() -> (int, bool) = O.build[int](true)
+
+    val v = via[Sq]()
+    print(v.0, v.1)
+    """, "50 true\n")
+
+@test("a nested function, and each instantiation is its own")
+tai_a_nested_function() = tai_prints(tai_make() + raw"""
+    outer() -> string
+        nested[A: Make, B](b: B) -> (A, B) = (A.make(4), b)
+
+        val x = nested[int]("n")
+        val y = nested[string](7)
+        s"${x.0} ${x.1} ${y.0} ${y.1}"
+
+    print(outer())
+    """, "40 n s4 7\n")
+
+// -- what it refuses --------------------------------------------------------------------------------
+
+@test("a list longer than the parameters is refused, naming them")
+tai_too_many() = tai_refused(raw"""
+    two[A, B](a: A, b: B) -> A = a
+
+    print(two[int, int, int](1, 2))
+    """, "'two' takes 2 type arguments ('A', 'B'), and 3 were written", "3:10")
+
+@test("a method's list longer than its own parameters is refused, naming them")
+tai_too_many_on_a_method() = tai_refused(raw"""
+    struct Sq
+        s: int
+
+    impl Sq
+        both[U, V](self, v: V) -> U = v
+
+    print(Sq(1).both[int, int, int](2))
+    """, "'both' takes 2 type arguments ('U', 'V'), and 3 were written", "7:17")
+
+@test("a trailing parameter nothing in the call settles is named")
+tai_a_trailing_one_cannot_be_inferred() = tai_refused(raw"""
+    stuck[A, B](a: A) -> A = a
+
+    print(stuck[int](1))
+    """, "'B' is in neither the parameters of 'stuck' nor its result, so nothing in this call says " +
+         "what it should be — write it out, as 'stuck[…](…)'", "3:12")
+
+@test("two arguments that disagree about a trailing parameter are refused")
+tai_an_inference_conflict() = tai_refused(raw"""
+    same[A, B](a: A, b: B, c: B) -> A = a
+
+    print(same[int](1, "x", true))
+    """, "'c' of 'same' is string, but bool was given", "3:25")
+
+@test("a leading parameter the list wrote is held to its bound")
+tai_the_written_one_meets_its_bound() = tai_refused(tai_make() + raw"""
+    make_as[V: Make, S](n: int, s: S) -> V = V.make(n)
+
+    print(make_as[bool](1, "s"))
+    """, "'make_as' requires its type parameter 'V' to implement 'Make', but bool does not", "12:14")
+
+@test("an argument the written one refuses is told so")
+tai_the_written_one_is_checked_against_the_argument() = tai_refused(raw"""
+    pair[A, B](a: A, b: B) -> A = a
+
+    print(pair[u8](300, 1))
+    """, "the literal 300 does not fit byte", "3:16")
+
+@test("a function's type parameter still takes no default, a list being able to leave it out")
+tai_no_default_on_a_function() = tai_refused(raw"""
+    f[A, B = int](a: A) -> A = a
+
+    print(f[int](1))
+    """, "'B' is a type parameter of the function 'f', whose type parameters are solved from what it " +
+         "is given rather than written where it is used — so '= int' has nothing to stand in for", "1:10")
