@@ -88,27 +88,283 @@ end Verdict
 // **A function owning a parameter gives back the count it was handed** wherever it does not keep it
 // (`owned_params.sysl`), so it is never one of these, and nor is anything that calls it. `owning` is
 // those functions.
+//
+// **A call on a path that ends the program is judged too, by a rule of its own** (`quiet_callees`).
+// A caller's count may be missing for as long as the callee runs, and a path that never comes back
+// still runs: `die(t)` that overwrites the global holding `t` and then reads `t` frees it under its
+// own feet. What that path may call is anything that releases nothing on the way out -- which, unlike
+// here, takes in a foreign function, so `unwrap`'s report and `Buf.at`'s bounds failure stay inert.
 inert_callees(p: TProgram, owning: Set[string] = set()) -> Set[string]
-    var calls: Buf[Buf[string]] = buf()
-    var alive: Buf[bool] = buf()
-    var out: Set[string] = set()
+    val s = call_summary(p, owning)
+    val quiet = quiet_callees(p, s)
+    var seed: Buf[bool] = buf()
+
+    for i in 0..<p.funcs.len()
+        var ok = s.ok.at(i)
+
+        for site in s.exit_sites.at(i)
+            if !quiet_admits(quiet, p, site) then ok = false
+
+        seed.push(ok)
+
+    greatest(p, s.calls, seed, set())
+end inert_callees
+
+// What every body of a program does that `inert_callees` and `quiet_callees` judge it by, each list
+// indexed as `p.funcs`:
+//
+// - `ok`: free of writes to memory it does not own and of every node off the `inert_leaf` list;
+// - `calls` and `exits`: the functions it calls on a path that may come back, and on one that ends
+//   the program (`exit_kinds`);
+// - `quiet_ok`, `through` and `sites`, for `quiet_callees`: the same verdict with one kind of write
+//   set aside rather than refused -- a value with no count in it written through a view or pointer
+//   PARAMETER, recorded as that parameter's index in `through` -- and every call with what each
+//   argument is (`Site`), so the fixpoint can tell whether such a write lands in its caller's own
+//   frame. `printi` hands `digits_long` a view of its own array, and `printc` hands `encode_utf8` one:
+//   both write nothing their caller did not own.
+private struct CallSummary
+    ok: Buf[bool]
+    calls: Buf[Buf[string]]
+    exits: Buf[Buf[string]]
+    quiet_ok: Buf[bool]
+    through: Buf[Buf[int]]
+    sites: Buf[Buf[Site]]
+    exit_sites: Buf[Buf[Site]]
+end CallSummary
+
+// One call, for `quiet_callees`: the callee, and for each argument whether it is a view or address of
+// the caller's own local (`own`), or else which of the caller's view or pointer parameters it passes
+// on (`pass`, -1 for none).
+private struct Site
+    name: string
+    own: Buf[bool]
+    pass: Buf[int]
+end Site
+
+// What `call_summary`'s walk of one body gathers for `quiet_callees`.
+private struct QuietSink
+    ok: bool
+    through: Buf[int]
+    sites: Buf[Site]
+    exit_sites: Buf[Site]
+
+    refuse(*self)
+        self.ok = false
+
+    note(*self, j: int)
+        self.through.push(j)
+
+    site(*self, s: Site)
+        self.sites.push(s)
+
+    exit_site(*self, s: Site)
+        self.exit_sites.push(s)
+end QuietSink
+
+private call_summary(p: TProgram, owning: Set[string]) -> CallSummary
+    var out = CallSummary(buf(), buf(), buf(), buf(), buf(), buf(), buf())
 
     for i in 0..<p.funcs.len()
         val f = p.funcs.at(i)
         val sink: &CallSink = CallSink(buf())
+        val exits: &CallSink = CallSink(buf())
         val v: &Verdict = Verdict(f.requires.is_empty() && f.ensures.is_empty() && f.olds.is_empty() &&
                                   f.variant.is_none() && !owning.has(f.name))
+        val q: &QuietSink = QuietSink(v.ok, buf(), buf(), buf())
 
         if v.ok
-            val locals = own_locals(f)
+            val b = Body(f.params, own_locals(f), declared_names(f), exit_kinds(f.body))
 
-            walk_block_stmts(f.body, TWalk(true, x -> inert_node(v, sink, locals, x), w -> v.refuse(),
-                                           s -> if !inert_stmt(s) then v.refuse()))
+            walk_block_stmts(f.body, TWalk(true, x -> inert_node(v, sink, exits, q, b, x),
+                                           w -> both_refuse(v, q),
+                                           s -> if !inert_stmt(s) then both_refuse(v, q)))
 
-        calls.push(sink.names)
-        alive.push(v.ok)
+        out.ok.push(v.ok)
+        out.calls.push(sink.names)
+        out.exits.push(exits.names)
+        out.quiet_ok.push(q.ok)
+        out.through.push(q.through)
+        out.sites.push(q.sites)
+        out.exit_sites.push(q.exit_sites)
 
-        if v.ok then out.add(f.name)
+    out
+end call_summary
+
+private both_refuse(v: &Verdict, q: &QuietSink)
+    v.refuse()
+    q.refuse()
+
+// What `inert_node` needs to know about the body it is in.
+private struct Body
+    params: Buf[(string, Type)]
+    locals: Set[string]
+    declared: Set[string]
+    ending: &KindSink
+end Body
+
+// Every name a body declares, `var`, `val` or `ref`: a parameter one of them shadows is not reliably
+// the parameter wherever it is named.
+private declared_names(f: TFunc) -> Set[string]
+    val declared: &CallSink = CallSink(buf())
+    val refs = name_sink()
+
+    walk_block_stmts(f.body, stmt_walk(true, s -> own_decl(declared, refs, s)))
+
+    var out: Set[string] = set()
+
+    for item in refs.names
+        out.add(item)
+
+    for item in declared.names
+        out.add(item)
+
+    out
+end declared_names
+
+// The index of the view or pointer parameter `r` reads, or -1.
+private param_view(r: TExpr, b: Body) -> int = *r.kind match
+    TLoad(name, ty) ->
+        if b.declared.has(name) || (!is_view(ty) && pointee(ty).is_none()) then return -1
+
+        for j in 0..<b.params.len()
+            if b.params.at(j).0 == name then return if j < 1024 then int(j) else -1
+
+        -1
+    _ -> -1
+
+// The parameter a write lands behind: a place reached from a view or pointer parameter by exactly one
+// step through it -- an element of the view, what the pointer points at, a field of either -- and by
+// fields and elements of arrays held by value from there. Anything else, -1.
+private through_param(place: TExpr, b: Body) -> int = *place.kind match
+    TIndex(r, _, _) -> repr(texpr_type(r)) match
+        Array(_, _) -> through_param(r, b)
+        _ -> param_view(r, b)
+    TField(r, _, _) -> if pointee(texpr_type(r)).is_some() then param_view(r, b) else through_param(r, b)
+    TDeref(r, _) -> param_view(r, b)
+    _ -> -1
+
+// A write `call_summary` meets: nothing where it lands in one of the body's own locals; otherwise a
+// refusal for `inert_callees`, and for `quiet_callees` either a note of the parameter it lands behind
+// or, where it holds a count or lands anywhere else, a refusal too.
+private write_at(v: &Verdict, q: &QuietSink, b: Body, place: TExpr)
+    if own_place(place, b.locals) then return
+
+    v.refuse()
+
+    val j = through_param(place, b)
+
+    if j < 0 || contains_counted(place_type(place)) then q.refuse() else q.note(j)
+end write_at
+
+// One argument of a call, as `Site` records it.
+private own_arg(a: TExpr, b: Body) -> bool = *a.kind match
+    TAddrOf(place, _) -> own_place(place, b.locals)
+    TSlice(base, _, _, _, _) -> repr(texpr_type(base)) match
+        Array(_, _) -> own_place(base, b.locals)
+        _ -> false
+    _ -> false
+
+private passed_arg(a: TExpr, b: Body) -> int = *a.kind match
+    TSlice(base, _, _, _, _) -> param_view(base, b)
+    _ -> param_view(a, b)
+
+private site_of(name: string, args: Buf[TExpr], b: Body) -> Site
+    var own: Buf[bool] = buf()
+    var pass: Buf[int] = buf()
+
+    for item in args
+        own.push(own_arg(item, b))
+        pass.push(passed_arg(item, b))
+
+    Site(name, own, pass)
+end site_of
+
+// The functions that release nothing at all, whether or not they come back, together with the
+// foreign functions a path ending the program may call: the names a call on such a path may reach.
+//
+// **The test is `inert_callees`' own, with two differences.** A call that does not come back is held
+// to it rather than passed over -- `die` above is refused for the store, and so is everything that
+// calls it -- and a FOREIGN call is trusted, since what a program is doing as it ends is reporting
+// why: `print`'s `putbytes`, `exit`, `sysl_bounds_fail`, the trap.
+//
+// **A foreign function is trusted only where no sysl function C can reach releases anything.** C
+// reaches sysl through an `@export` (a program's own `sysl_bounds_fail` among them), a `@section`, a
+// foreign convention and an address taken; where every one of those is itself in the set, nothing a
+// foreign call could call back into releases, and the answer is consistent. Otherwise the set is
+// computed again with no foreign function in it. The program's entry is left out: C calls it once,
+// before anything this asks about runs. An `@abandons` function is never in it, either side of the
+// boundary: its caller's frame is given back before the call, and the program goes on afterwards.
+//
+// **Trust is a fact about a whole program, so only a program has it.** A library artifact (a
+// `.syslib`, a C archive) cannot know what the program it is linked into exports, so it trusts no
+// foreign function. In a program the standard library's own exports are left out of the check: they
+// are the suppliers of its hooks (`sysl_env_get`, `__addtf3`, ...), they reach no storage of the
+// program's, and a precompiled standard module is not in the program's view at all -- leaving them in
+// would make a build whose standard module is read from source answer differently from one whose
+// module was precompiled.
+//
+// **A write through a view or pointer parameter is the caller's business** (`CallSummary`): a
+// function that makes one is in the set only as far as each call to it hands that parameter a view or
+// address of the caller's own local -- or the caller's own parameter, which passes the question on to
+// ITS callers. What the set answers is the functions with no such question left.
+private quiet_callees(p: TProgram, s: CallSummary) -> Quiet
+    var foreign: Set[string] = set()
+
+    for item in p.externs
+        if !item.abandons then foreign.add(item.name)
+
+    val trusting = quiet_fix(p, s, foreign)
+
+    if !p.entry_point || !c_reaches_quiet(p, trusting.names) then return quiet_fix(p, s, set())
+
+    trusting
+end quiet_callees
+
+// What `quiet_callees` answers: the functions alive, the parameters each writes through (`through_key`),
+// the index of each name in `p.funcs`, the foreign functions trusted (`also`), and `names` -- the
+// trusted foreign functions and the functions alive writing through no parameter, which is what a
+// call that hands over nothing of its own may reach.
+private struct Quiet
+    alive: Buf[bool]
+    through: Set[usize]
+    index: Map[string, usize]
+    also: Set[string]
+    names: Set[string]
+end Quiet
+
+// Whether a call on a path that ends the program releases nothing and writes nothing but what the
+// calling frame owns: a trusted foreign function, or one alive whose every written-through parameter
+// is handed a view or address of the caller's own local.
+private quiet_admits(q: Quiet, p: TProgram, site: Site) -> bool
+    if q.also.has(site.name) then return true
+
+    val k = q.index.get(site.name)
+
+    if k.is_none() || !q.alive.at(k.unwrap()) then return false
+
+    for j in 0..<p.funcs.at(k.unwrap()).params.len()
+        if q.through.has(through_key(k.unwrap(), j)) && !(j < site.own.len() && site.own.at(j)) then
+            return false
+
+    true
+end quiet_admits
+
+// The greatest assignment of "alive, writing through these parameters" closed under every call site,
+// and the functions it leaves alive writing through none. `also` names the foreign functions trusted.
+private quiet_fix(p: TProgram, s: CallSummary, also: Set[string]) -> Quiet
+    var index: Map[string, usize] = map()
+    var alive: Buf[bool] = buf()
+    var through: Set[usize] = set()
+
+    for i in 0..<p.funcs.len()
+        val f = p.funcs.at(i)
+
+        if !index.has(f.name) then index.put(f.name, i)
+
+        alive.push(s.quiet_ok.at(i) && !f.marks.abandons)
+
+        for j in s.through.at(i)
+            through.add(through_key(i, usize(j)))
 
     var moved = true
 
@@ -116,16 +372,202 @@ inert_callees(p: TProgram, owning: Set[string] = set()) -> Set[string]
         moved = false
 
         for i in 0..<p.funcs.len()
-            val named = calls.at(i)
+            for site in s.sites.at(i)
+                if alive.at(i) && !also.has(site.name)
+                    val k = index.get(site.name)
 
-            for item in named
-                if alive.at(i) && !out.has(item)
+                    if k.is_none() || !alive.at(k.unwrap())
+                        alive.set(i, false)
+                        moved = true
+                    else
+                        for j in 0..<p.funcs.at(k.unwrap()).params.len()
+                            if alive.at(i) && through.has(through_key(k.unwrap(), j)) &&
+                               !(j < site.own.len() && site.own.at(j))
+                                val from = if j < site.pass.len() then site.pass.at(j) else -1
+
+                                if from < 0
+                                    alive.set(i, false)
+                                    moved = true
+                                else if !through.has(through_key(i, usize(from)))
+                                    through.add(through_key(i, usize(from)))
+                                    moved = true
+
+    var out: Set[string] = set()
+
+    for i in 0..<p.funcs.len()
+        var clear = alive.at(i)
+
+        for j in 0..<p.funcs.at(i).params.len()
+            if through.has(through_key(i, j)) then clear = false
+
+        if clear then out.add(p.funcs.at(i).name)
+
+    for item in also
+        out.add(item)
+
+    Quiet(alive, through, index, also, out)
+end quiet_fix
+
+private through_key(i: usize, j: usize) -> usize = i * 1024 + j
+
+// Whether every sysl function C can call, but the program's entry and the standard library's own
+// exports, is one of `quiet`. A standard function whose address is taken is still checked: it may be
+// handed to C to call back into the program's own code.
+private c_reaches_quiet(p: TProgram, quiet: Set[string]) -> bool
+    val addressed = addressed_funcs(p)
+    val entry = if p.entry.is_some() then p.entry.unwrap().func else ""
+
+    for f in p.funcs
+        val supplier = f.exported.is_some() && (f.declared_in == "sysl" || f.declared_in.starts_with("sysl."))
+        val reached = (f.exported.is_some() && !supplier) || f.section.is_some() || f.conv.is_some() ||
+                      addressed.has(f.name)
+
+        if reached && f.name != entry && !quiet.has(f.name) then return false
+
+    true
+end c_reaches_quiet
+
+// The greatest set of `p.funcs` closed under the rule that a function stays only while every name in
+// its `calls` is still in it or is one of `also`, starting from those `seed` admits. A cycle stays,
+// since a release needs a finite path to it and none of the members has one.
+private greatest(p: TProgram, calls: Buf[Buf[string]], seed: Buf[bool], also: Set[string]) -> Set[string]
+    var alive: Buf[bool] = buf()
+    var out: Set[string] = set()
+
+    for i in 0..<p.funcs.len()
+        alive.push(seed.at(i))
+
+        if seed.at(i) then out.add(p.funcs.at(i).name)
+
+    var moved = true
+
+    while moved
+        moved = false
+
+        for i in 0..<p.funcs.len()
+            for item in calls.at(i)
+                if alive.at(i) && !out.has(item) && !also.has(item)
                     alive.set(i, false)
                     out.remove(p.funcs.at(i).name)
                     moved = true
 
     out
-end inert_callees
+end greatest
+
+// -- the calls on a path that ends the program -------------------------------------------------------
+
+// The call nodes of a body that sit on a path ending the program, by the identity of their node: every
+// call to a function that does not come back, and every call in the run of statements that leads
+// straight to one in the same block -- `unwrap`'s report before its `exit`. The run stops, going
+// back, at the first statement that could leave the block another way (a `return`, a `break`, a
+// `continue`, a `?`, a suspension), since what precedes that may be followed by a return after all.
+private struct KindSink
+    kinds: Buf[&TExprKind]
+
+    add(*self, k: &TExprKind)
+        self.kinds.push(k)
+
+    has(self, k: &TExprKind) -> bool
+        for item in self.kinds
+            if item === k then return true
+
+        false
+end KindSink
+
+private exit_kinds(b: TBlock) -> &KindSink
+    val sink: &KindSink = KindSink(buf())
+
+    exit_run(sink, b.stmts, b.result)
+    walk_block_stmts(b, expr_walk(true, x -> exit_node(sink, x)))
+    sink
+end exit_kinds
+
+// One node: a call that does not come back, or a form holding blocks whose runs are read.
+private exit_node(sink: &KindSink, x: TExpr) = *x.kind match
+    TCall(_, _, ty, _) -> if ty == Never then sink.add(x.kind)
+    TIf(_, then_block, else_block, _) ->
+        exit_run(sink, then_block.stmts, then_block.result)
+        exit_opt(sink, else_block)
+    TMatch(_, arms, _) ->
+        for arm in arms
+            exit_run(sink, arm.body.stmts, arm.body.result)
+    TBlockExpr(block) -> exit_run(sink, block.stmts, block.result)
+    TWhile(_, body, else_block, _) -> exit_loop(sink, body, else_block)
+    TDoWhile(body, _, else_block, _) -> exit_loop(sink, body, else_block)
+    TLoop(body, _) -> exit_run(sink, body, None)
+    TFor(_, _, _, _, _, body, else_block, _) -> exit_loop(sink, body, else_block)
+    TCFor(_, _, _, body, else_block, _) -> exit_loop(sink, body, else_block)
+    TForEach(_, _, _, body, else_block, _) -> exit_loop(sink, body, else_block)
+    TIterate(_, _, _, _, _, body, else_block, _) -> exit_loop(sink, body, else_block)
+    _ -> ()
+
+private exit_loop(sink: &KindSink, body: Buf[TStmt], else_block: Option[TBlock])
+    exit_run(sink, body, None)
+    exit_opt(sink, else_block)
+
+private exit_opt(sink: &KindSink, b: Option[TBlock]) =
+    if b.is_some() then exit_run(sink, b.unwrap().stmts, b.unwrap().result)
+
+// One block's statements and result: the first statement that ends the program, or a result that
+// does, and the run of statements before it that cannot leave the block another way.
+private exit_run(sink: &KindSink, stmts: Buf[TStmt], result: Option[TExpr])
+    var stop = stmts.len()
+
+    for i in 0..<stmts.len()
+        if stop == stmts.len() && ends_program(stmts.at(i)) then stop = i
+
+    if stop == stmts.len() && (result.is_none() || !exit_call(result.unwrap())) then return
+
+    val last = if stop < stmts.len() then stmts.at(stop) else TExprStmt(result.unwrap())
+
+    if leaves(last) then return
+
+    mark_calls(sink, last)
+
+    var j = stop
+
+    while j > 0 && !leaves(stmts.at(j - 1))
+        j -= 1
+        mark_calls(sink, stmts.at(j))
+end exit_run
+
+private ends_program(s: TStmt) -> bool = s match
+    TExprStmt(e) -> exit_call(e)
+    _ -> false
+
+private exit_call(e: TExpr) -> bool = *e.kind match
+    TCall(_, _, ty, _) -> ty == Never
+    _ -> false
+
+private mark_calls(sink: &KindSink, s: TStmt) = walk_stmt(s, expr_walk(true, x -> mark_call(sink, x)))
+
+private mark_call(sink: &KindSink, x: TExpr) = *x.kind match
+    TCall(_, _, _, _) -> sink.add(x.kind)
+    _ -> ()
+
+// Whether a statement could hand control anywhere but to the statement after it or to the end of
+// the program: a `return`, `become`, `break` or `continue` anywhere in it, a `?`, or a suspension.
+private leaves(s: TStmt) -> bool
+    val v: &Verdict = Verdict(true)
+
+    walk_stmt(s, TWalk(true, x -> leaves_node(v, x), w -> (), st -> leaves_stmt(v, st)))
+    !v.ok
+end leaves
+
+private leaves_stmt(v: &Verdict, s: TStmt) = s match
+    TReturn(_) -> v.refuse()
+    TBecome(_) -> v.refuse()
+    TBreak(_, _) -> v.refuse()
+    TContinue(_) -> v.refuse()
+    _ -> ()
+
+private leaves_node(v: &Verdict, x: TExpr) = *x.kind match
+    TTry(_, _, _, _, _, _, _) -> v.refuse()
+    TAwait(_, _) -> v.refuse()
+    TYieldNow -> v.refuse()
+    TStep(_, _) -> v.refuse()
+    TPark(_) -> v.refuse()
+    _ -> ()
 
 // The callees a body names, in a box a walk's closures push through.
 private struct CallSink
@@ -172,24 +614,37 @@ private inert_stmt(s: TStmt) -> bool = s match
     _ -> false
 
 // One node of a body being asked whether it is inert. A call is noted rather than judged, since
-// whether its callee qualifies is the fixpoint's question.
-private inert_node(v: &Verdict, calls: &CallSink, locals: Set[string], x: TExpr) = *x.kind match
-    // A call that does not come back never reaches the release this is deciding about.
-    TCall(name, _, ty, _) -> if ty != Never then calls.add(name)
+// whether its callee qualifies is the fixpoint's question -- in `exits` where it sits on a path that
+// ends the program (`ending`), in `calls` otherwise.
+private inert_node(v: &Verdict, calls: &CallSink, exits: &CallSink, q: &QuietSink, b: Body, x: TExpr) =
+    *x.kind match
+        TCall(name, args, _, _) ->
+            val site = site_of(name, args, b)
 
-    TStore(place, _, _, _) -> if !own_place(place, locals) then v.refuse()
-    TIncDec(place, _, _, _, _) -> if !own_place(place, locals) then v.refuse()
-    TUpdate(place, _, _, _, dispatch, _, _) ->
-        if !own_place(place, locals) then v.refuse()
+            if b.ending.has(x.kind)
+                exits.add(name)
+                q.exit_site(site)
+            else calls.add(name)
 
-        if dispatch.is_some() then calls.add(dispatch.unwrap().name)
+            q.site(site)
 
-    // A comparison may be a trait method rather than an instruction, and then it is a call.
-    TCompare(_, cmps) ->
-        for cmp in cmps
-            if cmp.dispatch.is_some() then calls.add(cmp.dispatch.unwrap().name)
+        TStore(place, _, _, _) -> write_at(v, q, b, place)
+        TIncDec(place, _, _, _, _) -> write_at(v, q, b, place)
+        TUpdate(place, _, _, _, dispatch, _, _) ->
+            write_at(v, q, b, place)
 
-    _ -> if !inert_leaf(x) then v.refuse()
+            if dispatch.is_some()
+                calls.add(dispatch.unwrap().name)
+                q.site(Site(dispatch.unwrap().name, buf(), buf()))
+
+        // A comparison may be a trait method rather than an instruction, and then it is a call.
+        TCompare(_, cmps) ->
+            for cmp in cmps
+                if cmp.dispatch.is_some()
+                    calls.add(cmp.dispatch.unwrap().name)
+                    q.site(Site(cmp.dispatch.unwrap().name, buf(), buf()))
+
+        _ -> if !inert_leaf(x) then both_refuse(v, q)
 
 // The place a write lands in, where that is one of `locals` reached without a dereference.
 private own_place(place: TExpr, locals: Set[string]) -> bool = *place.kind match
@@ -317,18 +772,26 @@ untouched_none() -> Untouched = Untouched(buf(), buf(), buf(), buf(), buf(), map
 untouched_summary(p: TProgram, dropping: Buf[Type], owning: Set[string] = set()) -> Untouched
     var u = untouched_none()
     val laundered = type_sink()
+    val quiet = quiet_callees(p, call_summary(p, owning))
 
     for i in 0..<p.funcs.len()
         val f = p.funcs.at(i)
         val calls: &CallSink = CallSink(buf())
+        val exits: &CallSink = CallSink(buf())
         val roots = type_sink()
         val v: &Verdict = Verdict(f.requires.is_empty() && f.ensures.is_empty() && f.olds.is_empty() &&
                                   f.variant.is_none())
         val locals = own_locals(f)
+        val ending = exit_kinds(f.body)
 
-        walk_block_stmts(f.body, TWalk(true, x -> touch_node(v, calls, roots, laundered, dropping, locals, x),
+        walk_block_stmts(f.body, TWalk(true, x -> touch_node(v, calls, exits, ending, roots, laundered,
+                                                             dropping, locals, x),
                                        w -> touch_write(v, calls, roots, locals, w),
                                        s -> if !touch_stmt(s) then v.refuse()))
+
+        // A call on a path that ends the program is held to `quiet_callees`, as in `inert_callees`.
+        for item in exits.names
+            if !quiet.names.has(item) then v.refuse()
 
         u.names.push(f.name)
         u.calls.push(calls.names)
@@ -443,14 +906,15 @@ private touch_stmt(s: TStmt) -> bool = s match
     TDefer(_, _) -> true
     _ -> inert_stmt(s)
 
-private touch_node(v: &Verdict, calls: &CallSink, roots: &TypeSink, laundered: &TypeSink,
-                   dropping: Buf[Type], locals: Set[string], x: TExpr)
+private touch_node(v: &Verdict, calls: &CallSink, exits: &CallSink, ending: &KindSink,
+                   roots: &TypeSink, laundered: &TypeSink, dropping: Buf[Type], locals: Set[string],
+                   x: TExpr)
     note_laundered(laundered, x)
 
     if makes_dropping(x, dropping) then v.refuse()
 
     *x.kind match
-        TCall(name, _, ty, _) -> if ty != Never then calls.add(name)
+        TCall(name, _, _, _) -> if ending.has(x.kind) then exits.add(name) else calls.add(name)
 
         TStore(place, _, _, _) -> touch_place(v, roots, locals, place)
         TIncDec(place, _, _, _, _) -> touch_place(v, roots, locals, place)

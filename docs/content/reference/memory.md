@@ -828,6 +828,11 @@ for `get`, and the stored key each probe compares it with, are read and never co
 
 - the stretch may hold what the rule above allows: arithmetic, reads, and calls to functions that
   release nothing and write nothing but their own locals. Any other call or release keeps the count;
+- a path that ends the program is held to the same rule, since the count is missing while it runs
+  too: a function that never comes back counts by what it does before the end, not as nothing. What
+  such a path may call besides is C — the report `unwrap` or a bounds check prints, `exit`, the trap —
+  as long as nothing C could call back into (an `@export`, a `@section` function, one whose address
+  was taken) releases anything;
 - an `await` keeps it too, since another task may run there and write the storage;
 - a value that is returned, stored, captured by a closure, or handed to a function that keeps it
   keeps its count. A tuple or struct built on the spot for such a call is **handed over whole**: the
