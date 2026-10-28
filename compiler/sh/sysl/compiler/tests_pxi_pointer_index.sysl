@@ -1,0 +1,282 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// **A pointer to something with a subscript of its own is indexed as that thing.** `p[i]` on a `*T`
+// is C's address arithmetic, the `i`th `T` along -- unless `T` is an array (whose length is in its
+// type) or a container indexed through `IndexPlace` or `Index`, when it means what `(*p)[i]` and
+// `p.at(i)` mean. The one body of a generic decides by what its parameter's bound promises, at the
+// definition and at every instantiation alike.
+
+private pxi_outcome(text: string) -> (string, bool)
+    val root = make_temp_dir("sysl-pointer-index").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", "import sysl.buf.*\n\n" + text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (failure_text(why), false)
+        Ok(_) -> ()
+
+    val said = capture("/bin/sh", ["-c", s"'$exe' < /dev/null"], "", [], true, 60000)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> ("the program that was built could not be run", false)
+        Ok(out) -> (out.text + out.err.unwrap_or(""), out.status.ok())
+end pxi_outcome
+
+private pxi_can_run() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+
+    true
+end pxi_can_run
+
+private pxi_ran(text: string) -> string
+    val out = pxi_outcome(text)
+
+    if !out.1 then return s"it did not exit zero: ${out.0}"
+
+    out.0
+
+private pxi_refused(text: string, part: string)
+    val out = pxi_outcome(text)
+
+    assert(!out.1, s"it built and ran: ${out.0}")
+    assert(out.0.contains(part), out.0)
+
+// A container indexed in place, and one indexed only by a call (with a separate write).
+private pxi_types() -> string = raw"""
+    struct Ring
+        cells: [4]int
+        head: usize
+
+    impl IndexPlace[usize, int] for Ring
+        index_place(*self, i: usize) -> *int = &self.cells[(self.head + i) % 4]
+
+    struct Sq
+        k: int
+
+    impl Index[int, int] for Sq
+        index(self, i: int) -> int = i * i + self.k
+
+    impl IndexSet[int, int] for Sq
+        index_set(*self, i: int, v: int)
+            self.k = i + v
+
+    """
+
+@test("a subscript through a *Buf reads the element, as its method calls do")
+pxi_buf_read_is_the_element()
+    if !pxi_can_run() then return
+
+    assert_eq(pxi_ran(raw"""
+        first(b: *Buf[int]) -> int = b[0]
+        var b: Buf[int] = buf()
+        b.push(4)
+        b.push(5)
+        print(first(&b), (&b)[1], (&b).len())
+        """), "4 5 2\n")
+
+@test("a subscript past the end through a *Buf stops the program the container's way")
+pxi_buf_past_the_end_through_pointer()
+    if !pxi_can_run() then return
+
+    val out = pxi_outcome(raw"""
+        first(b: *Buf[int]) -> int = b[3]
+        var b: Buf[int] = buf()
+        b.push(1)
+        print(first(&b))
+        """)
+
+    assert(!out.1, s"expected the program to stop, but it exited cleanly: ${out.0}")
+    assert(out.0.contains("panic: index 3 past the 1 elements of a Buf"), out.0)
+
+@test("every write through a *Buf lands in the element: =, +=, ++, & and ref")
+pxi_buf_writes_land_in_place()
+    if !pxi_can_run() then return
+
+    assert_eq(pxi_ran(raw"""
+        bump(b: *Buf[int]) -> *int
+            b[0] = 40
+            b[1] += 2
+            b[1]++
+            ref r = b[0]
+            r += 1
+            &b[1]
+        var b: Buf[int] = buf()
+        b.push(1)
+        b.push(2)
+        val p = bump(&b)
+        *p = *p * 10
+        print(b[0], b[1])
+        """), "41 50\n")
+
+@test("a *[N]T keeps the array's subscript and its check")
+pxi_array_pointer_is_checked()
+    if !pxi_can_run() then return
+
+    assert_eq(pxi_ran(raw"""
+        second(p: *[4]int) -> int = p[1]
+        set(p: *[4]int)
+            p[2] = 7
+            p[3] += 1
+        var a = [1, 2, 3, 4]
+        set(&a)
+        print(second(&a), a)
+        """), "2 [1, 2, 7, 5]\n")
+
+    val out = pxi_outcome(raw"""
+        at(p: *[4]int, i: int) -> int = p[i]
+        var a = [1, 2, 3, 4]
+        print(at(&a, 5))
+        """)
+
+    assert(!out.1, s"expected the program to stop, but it exited cleanly: ${out.0}")
+
+@test("a pointer to a program's own IndexPlace type reads and writes in place")
+pxi_index_place_type_through_pointer()
+    if !pxi_can_run() then return
+
+    assert_eq(pxi_ran(pxi_types() + raw"""
+        first(p: *Ring) -> int = p[0]
+        set(p: *Ring)
+            p[1] = 77
+            p[0] *= 10
+        var r = Ring([1, 2, 3, 4], 2)
+        set(&r)
+        print(first(&r), r.cells)
+        """), "30 [1, 2, 30, 77]\n")
+
+@test("a pointer to an Index type is read by the call and written through IndexSet")
+pxi_index_type_through_pointer()
+    if !pxi_can_run() then return
+
+    assert_eq(pxi_ran(pxi_types() + raw"""
+        read(p: *Sq) -> int = p[3]
+        store(p: *Sq)
+            p[1] = 5
+        var s = Sq(1)
+        print(read(&s))
+        store(&s)
+        print(s.k)
+        """), "10\n6\n")
+
+@test("a compound write through a pointer to an Index type is refused as it is on the value")
+pxi_index_compound_through_pointer_refused()
+    if !pxi_can_run() then return
+
+    val direct = pxi_outcome(pxi_types() + "var s = Sq(1)\ns[1] += 5\n")
+    val through = pxi_outcome(pxi_types() + "bump(p: *Sq)\n    p[1] += 5\nvar s = Sq(1)\nbump(&s)\n")
+
+    val said = "'+=' on an element read through 'sysl.Index' would evaluate the receiver and the " +
+               "index twice — write it out as 'b[i] = b[i] + …'"
+
+    assert(!direct.1, direct.0)
+    assert(!through.1, through.0)
+    assert(direct.0.contains(said), direct.0)
+    assert(through.0.contains(said), through.0)
+
+@test("a *self method of an IndexPlace type subscripts its own elements")
+pxi_self_pointer_method()
+    if !pxi_can_run() then return
+
+    assert_eq(pxi_ran(pxi_types() + raw"""
+        impl Ring
+            sum(*self) -> int = self[0] + self[1] + self[2] + self[3]
+        var r = Ring([1, 2, 3, 4], 1)
+        print(r.sum())
+        """), "10\n")
+
+@test("a raw pointer to a scalar stays C's subscript, negative index and all")
+pxi_raw_scalar_pointer_stays_arithmetic()
+    if !pxi_can_run() then return
+
+    assert_eq(pxi_ran(raw"""
+        around(p: *u8) -> (u8, u8) = (p[-1], p[1])
+        set(p: *int)
+            p[1] = 9
+        var bytes = [u8(1), 2, 3]
+        var ints = [1, 2, 3]
+        set(&ints[0])
+        print(around(&bytes[1]), ints)
+        """), "(1, 3) [1, 9, 3]\n")
+
+@test("a pointer to a pointer to a container stops at one level")
+pxi_two_levels_stay_arithmetic()
+    if !pxi_can_run() then return
+
+    pxi_refused(raw"""
+        first(pp: **Buf[int]) -> int = pp[0]
+        var b: Buf[int] = buf()
+        var p = &b
+        print(first(&p))
+        """, "function 'first' should return int, but its body yields *sysl.buf.Buf[int]")
+
+@test("a view of containers is indexed by the view, not the container")
+pxi_view_of_containers_unchanged()
+    if !pxi_can_run() then return
+
+    assert_eq(pxi_ran(raw"""
+        lens(xs: []Buf[int]) -> usize = xs[1].len()
+        var a: Buf[int] = buf()
+        var b: Buf[int] = buf()
+        b.push(1)
+        b.push(2)
+        var both = [a, b]
+        print(lens(both))
+        """), "2\n")
+
+@test("a generic over a pointer to a bounded container indexes the container at every instantiation")
+pxi_generic_bounded_pointer()
+    if !pxi_can_run() then return
+
+    assert_eq(pxi_ran(pxi_types() + raw"""
+        second[C: Index[usize, int]](p: *C) -> int = p[1]
+        triple[C: IndexPlace[usize, int]](p: *C)
+            p[0] *= 3
+        var b: Buf[int] = buf()
+        b.push(5)
+        b.push(6)
+        var r = Ring([1, 2, 3, 4], 0)
+        triple(&b)
+        triple(&r)
+        print(second(&b), b[0], r.cells)
+        """), "6 15 [3, 2, 3, 4]\n")
+
+@test("a generic over an unbounded *T reads the T along, even where T is an array or a Buf")
+pxi_generic_unbounded_pointer_stays_arithmetic()
+    if !pxi_can_run() then return
+
+    assert_eq(pxi_ran(raw"""
+        nth[T](p: *T, i: int) -> T = p[i]
+        var rows = [[1, 2], [3, 4]]
+        var bs = [buf[int](), buf[int]()]
+        bs[1].push(7)
+        print(nth(&rows[0], 1), nth(&bs[0], 1).len(), nth(&rows[0][0], 3))
+        """), "[3, 4] 1 4\n")
+
+@test("a parameter bounded by IndexPlace is subscripted in place, not refused for lacking Index")
+pxi_generic_index_place_bound_on_a_value()
+    if !pxi_can_run() then return
+
+    assert_eq(pxi_ran(pxi_types() + raw"""
+        first[C: IndexPlace[usize, int]](c: C) -> int = c[0]
+        var r = Ring([1, 2, 3, 4], 2)
+        var b: Buf[int] = buf()
+        b.push(8)
+        print(first(r), first(b))
+        """), "3 8\n")
