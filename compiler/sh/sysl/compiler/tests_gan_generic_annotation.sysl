@@ -1,0 +1,392 @@
+module sh.sysl.compiler
+@tests
+
+// **An annotation of the field's type** (`annotations.sysl`, `type_reflect.sysl § annotation_query`):
+// an annotation may declare one type parameter, which each use binds to the type of the field it is
+// written on, so `@default(8080) port: u16` is `default[u16](8080)` and `f::Annotation[default]`
+// answers an `Option[default[f::Type]]`.
+
+private gan_decls() -> string = raw"""
+    @annotation
+    struct default[F]
+        v: F
+
+    enum Mode
+        Fast
+        Slow
+
+    struct Point
+        x: int
+        y: int
+
+    shown[T]() -> string
+        var out = ""
+
+        for const f in T::Fields
+            val d = f::Annotation[default]
+
+            if d.is_some() then out = out + s"${f.name}=${d.unwrap().v} " else out = out + s"${f.name}- "
+
+        out
+
+    """
+
+@test("one annotation carries a value of each field's own type: ints, a string, an enum, an Option, a struct")
+gan_each_field_type()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(gan_decls() + raw"""
+        struct Cfg
+            @default(8080) port: u16
+            @default(255) top: u8
+            @default(-3) delta: i8
+            @default(5000000000) big: u64
+            @default(-5000000000) low: i64
+            @default("localhost") host: string
+            @default(Mode.Slow) mode: Mode
+            @default(None) none: Option[int]
+            @default(Some(3)) some: Option[int]
+            @default(Point(1, 2)) at: Point
+            plain: int
+
+        print(shown[Cfg]())
+        """), "port=8080 top=255 delta=-3 big=5000000000 low=-5000000000 host=localhost mode=Mode.Slow " +
+              "none=None some=Some(3) at=Point(x: 1, y: 2) plain- \n")
+end gan_each_field_type
+
+@test("the value read back has the field's type, so it is used as one")
+gan_value_has_the_field_type()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(gan_decls() + raw"""
+        struct Ports
+            @default(8080) http: u16
+            @default(65535) top: u16
+            plain: u16
+
+        var sum: u32 = 0
+
+        for const f in Ports::Fields
+            val d = f::Annotation[default]
+
+            if d.is_some()
+                val p: u16 = d.unwrap().v
+
+                sum = sum + u32(p)
+
+        print(sum)
+        """), "73615\n")
+end gan_value_has_the_field_type
+
+@test("on a generic declaration's field the parameter is the field's type at each instantiation")
+gan_generic_declaration()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(gan_decls() + raw"""
+        struct Wrap[T]
+            @default(None) x: Option[T]
+            @default(Some(7)) n: Option[int]
+            y: T
+
+        print(shown[Wrap[int]]())
+        print(shown[Wrap[string]]())
+
+        for const f in Wrap[u8]::Fields
+            if const f.name == "x" then print(f::Annotation[default].unwrap().v.is_none())
+        """), "x=None n=Some(7) y- \nx=None n=Some(7) y- \ntrue\n")
+end gan_generic_declaration
+
+@test("written with its argument, 'default[f::Type]' reads the same annotation")
+gan_written_argument()
+    if !enm_ready() then return
+
+    // The design note's probe p09, which 0.7 refused at the declaration.
+    assert_eq(enm_ran(raw"""
+        @annotation
+        struct default[T]
+            v: T
+
+        struct Cfg
+            @default(8080) port: int
+            @default("localhost") host: string
+            other: bool
+
+        for const f in Cfg::Fields
+            print(f.name, f::Annotation[default[f::Type]].is_some())
+        """), "port true\nhost true\nother false\n")
+end gan_written_argument
+
+@test("a payload's field carries a generic annotation, read by a variant's field walk")
+gan_payload_field()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(gan_decls() + raw"""
+        enum Shape
+            Circle(@default(5) r: int)
+            Label(@default("hi") text: string, size: u8)
+            Dot
+
+        for const c in Shape::Variants
+            print(c.name)
+
+            for const f in c::Fields
+                val d = f::Annotation[default]
+
+                if d.is_some() then print(" ", f.name, d.unwrap().v)
+        """), "Circle\n  r 5\nLabel\n  text hi\nDot\n")
+end gan_payload_field
+
+@test("a field of a type of its own checks the value against that type")
+gan_distinct_type_field()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(gan_decls() + raw"""
+        type Slot = new u8 within 0..<8
+
+        struct Rack
+            @default(3) slot: Slot
+
+        print(shown[Rack]())
+        """), "slot=3 \n")
+
+    val said = enm_err(gan_decls() + raw"""
+        type Slot = new u8 within 0..<8
+
+        struct Rack
+            @default(9) slot: Slot
+
+        print(1)
+        """)
+
+    assert(said.contains("error: '@default' traps while it is being compiled: 9 is not a value " +
+                         "'Slot' admits"), said)
+end gan_distinct_type_field
+
+@test("a generic annotation sits beside a plain one and another generic one on one field")
+gan_beside_others()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(gan_decls() + raw"""
+        @annotation
+        struct example[E]
+            v: E
+
+        @annotation
+        struct rename
+            name: string
+
+        struct Cfg
+            @default(1) @example(42) @rename("P") port: int
+            @example("me") host: string
+
+        for const f in Cfg::Fields
+            val d = f::Annotation[default]
+            val e = f::Annotation[example]
+            val r = f::Annotation[rename]
+
+            print(f.name, d.is_some(), e.unwrap().v, r.map(x -> x.name).unwrap_or("-"))
+        """), "port true 42 P\nhost false me -\n")
+end gan_beside_others
+
+@test("a bound on the parameter is asked of each use's field type")
+gan_bound()
+    if !enm_ready() then return
+
+    val decls = raw"""
+        @annotation
+        struct shown_as[F: Display]
+            v: F
+
+        struct P
+            x: int
+
+        """
+
+    assert_eq(enm_ran(decls + raw"""
+        struct Ok
+            @shown_as(3) n: int
+            @shown_as("s") s: string
+
+        for const f in Ok::Fields
+            print(f.name, f::Annotation[shown_as].unwrap().v)
+        """), "n 3\ns s\n")
+
+    val said = enm_err(decls + "struct Bad\n    @shown_as(P(1)) p: P\n\nprint(1)\n")
+
+    assert(said.contains("error: 'shown_as' requires its type parameter 'F' to implement " +
+                         "'sysl.Display', but P does not"), said)
+end gan_bound
+
+@test("a generic annotation from another module is written and read through its import")
+gan_from_another_module()
+    if !azb_ready() then return
+
+    val codec = raw"""
+        module codec
+
+        @annotation
+        struct default[F]
+            v: F
+
+        defaults[T]() -> string
+            var out = ""
+
+            for const f in T::Fields
+                val d = f::Annotation[default]
+
+                if d.is_some() then out = out + s"${f.name}=${d.unwrap().v} "
+
+            out
+        """
+
+    azb_prints([("codec", "codec.sysl", codec), ("", "main.sysl", raw"""
+                    import codec
+
+                    struct Cfg
+                        @codec.default(8080) port: u16
+                        @codec.default("h") host: string
+
+                    print(codec.defaults[Cfg]())
+
+                    for const f in Cfg::Fields
+                        print(f.name, f::Annotation[codec.default].is_some())
+                    """)],
+               "port=8080 host=h \nport true\nhost true\n")
+end gan_from_another_module
+
+@test("a value not of the field's type is refused at the use, naming the field and its type")
+gan_wrong_value()
+    if !enm_ready() then return
+
+    val text = gan_decls() + raw"""
+        struct Cfg
+            @default("x") port: u16
+
+        print(1)
+        """
+
+    val said = enm_err(text)
+
+    assert(said.contains("error: '@default' is written on 'port', of type 'ushort', so its 'F' is " +
+                         "'ushort' and what its parentheses say must be of that type"), said)
+    assert(said.contains("error: 'v' of 'default[ushort]' is ushort, but string was given"), said)
+
+    val wide = enm_err(gan_decls() + "struct C\n    @default(70000) small: u16\n\nprint(1)\n")
+
+    assert(wide.contains("error: '@default' is written on 'small', of type 'ushort'"), wide)
+    assert(wide.contains("error: the literal 70000 does not fit ushort"), wide)
+
+    val negative = enm_err(gan_decls() + "struct C\n    @default(-1) b: u8\n\nprint(1)\n")
+
+    assert(negative.contains("error: '@default' is written on 'b', of type 'byte'"), negative)
+
+    val inner = enm_err(gan_decls() + "struct C\n    @default(Some(\"x\")) o: Option[int]\n\nprint(1)\n")
+
+    assert(inner.contains("error: '@default' is written on 'o', of type 'sysl.Option[int]'"), inner)
+    assert(inner.contains("error: 'value' of 'Some' is int, but string was given"), inner)
+
+    val payload = enm_err(gan_decls() + "enum E\n    A(@default(\"s\") n: int)\n\nprint(1)\n")
+
+    assert(payload.contains("error: '@default' is written on 'A.n', of type 'int'"), payload)
+end gan_wrong_value
+
+@test("a generic annotation above a type or a variant has no field type to bind, and is refused")
+gan_not_on_a_field()
+    if !enm_ready() then return
+
+    val on_type = enm_err(gan_decls() + "@default(1)\nstruct C\n    x: int\n\nprint(1)\n")
+
+    assert(on_type.contains("error: '@default' is generic — its 'F' is the type of the field it is " +
+                            "written on — and the declaration 'C' is not a field, so there is no type " +
+                            "to give it"), on_type)
+
+    val on_enum = enm_err(gan_decls() + "@default(1)\nenum E\n    A\n\nprint(1)\n")
+
+    assert(on_enum.contains("and the declaration 'E' is not a field"), on_enum)
+
+    val on_variant = enm_err(gan_decls() + "enum E\n    @default(1) A(n: int)\n    B\n\nprint(1)\n")
+
+    assert(on_variant.contains("error: '@default' is generic — its 'F' is the type of the field it " +
+                               "is written on — and the variant 'A' is not a field, so there is no " +
+                               "type to give it"), on_variant)
+
+    val on_new = enm_err(gan_decls() + "@default(1)\ntype Id = new int\n\nprint(1)\n")
+
+    assert(on_new.contains("and the declaration 'Id' is not a field"), on_new)
+end gan_not_on_a_field
+
+@test("reflection reads a generic annotation off a field only, and at the field's own type")
+gan_read_refused()
+    if !enm_ready() then return
+
+    val off_type = enm_err(gan_decls() + "struct C\n    @default(1) x: int\n\nprint(C::Annotation[default].is_some())\n")
+
+    assert(off_type.contains("error: 'default' is a generic annotation — its parameter is the type " +
+                             "of the field it is written on — so '::Annotation[…]' reads it from a " +
+                             "field a 'for const' walk stands at, and this asks it of something that " +
+                             "is not one"), off_type)
+
+    val off_variant = enm_err(gan_decls() + raw"""
+        enum E
+            A(n: int)
+
+        for const c in E::Variants
+            print(c::Annotation[default].is_some())
+        """)
+
+    assert(off_variant.contains("error: 'default' is a generic annotation"), off_variant)
+
+    val other_type = enm_err(gan_decls() + raw"""
+        struct C
+            @default(1) port: u16
+
+        for const f in C::Fields
+            print(f::Annotation[default[string]].is_some())
+        """)
+
+    assert(other_type.contains("error: 'default[string]' asks for the annotation at a type the field " +
+                               "does not have — the field is a 'ushort', so it carries a " +
+                               "'default[ushort]'; written bare, '::Annotation[default]' reads it at " +
+                               "the field's type"), other_type)
+end gan_read_refused
+
+@test("an annotation takes one type parameter at most, and never a value parameter")
+gan_declaration_refused()
+    if !enm_ready() then return
+
+    val two = enm_err("@annotation\nstruct pair[A, B]\n    a: A\n\nprint(1)\n")
+
+    assert(two.contains("error: an annotation takes at most one type parameter — a use of '@pair' " +
+                        "gives it the type of the field it is written on, which is one type, and " +
+                        "nothing gives the others"), two)
+
+    val value = enm_err("@annotation\nstruct sized[const N: usize]\n    x: int\n\nprint(1)\n")
+
+    assert(value.contains("error: an annotation's parameter is a type — a use of '@sized' gives it " +
+                          "the type of the field it is written on — so it cannot be a value " +
+                          "parameter"), value)
+end gan_declaration_refused
+
+@test("'f::Type' nested in a written type argument reads as a type, and 'u8::Max' as a value")
+gan_projection_in_type_args()
+    if !enm_ready() then return
+
+    // Found beside Q5: 'Option[f::Type]' in an expression's brackets read the projection as a value
+    // argument and was refused.
+    assert_eq(enm_ran(raw"""
+        struct Cfg
+            port: u16
+            host: string
+
+        struct Arr[const N: usize]
+            x: int
+
+        sz[T]() -> usize = sizeof(T)
+        len_of[const N: usize](a: Arr[N]) -> usize = N
+
+        for const f in Cfg::Fields
+            print(sz[f::Type](), sz[*f::Type]() == sz[*u8](), sz[Option[f::Type]]() >= sz[f::Type]())
+
+        print(len_of(Arr[u8::Max](1)))
+        """), "2 true true\n24 true true\n255\n")
+end gan_projection_in_type_args

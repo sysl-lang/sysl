@@ -112,38 +112,98 @@ end library_type
 // (a plain alias is its base, and answers the base's); a type parameter read in its
 // own terms has no declaration yet and answers `None` as a stand-in, as `T::Fields` answers empty.
 
+// The key of the generic annotation a bracket names bare -- `default`, or `cfg.default` -- or empty
+// where it names anything else. A name the copy binds as a type parameter is that parameter.
+private generic_annotation_named(cx: &Analyzer, item: Expr) -> string
+    val bare = annot_path(item)
+
+    if bare == "" || bound_type(cx.subst, bare).is_some() then return ""
+
+    val key = lookup_type_key(cx.an, cx.scope, bare)
+
+    if key.is_none() then return ""
+
+    cx.an.tables.types.get(key.unwrap()) match
+        Some(decl) ->
+            decl.kind match
+                StructOf(sd) -> if sd.annotation && !sd.tparams.is_empty() then key.unwrap() else ""
+                _ -> ""
+        None -> ""
+end generic_annotation_named
+
 // `x::Annotation` with no brackets: the annotation it reads is not named.
 annotation_unnamed(cx: &Analyzer, span: Span, written: string) -> TExpr =
     cx.err(span, s"'$written::Annotation' reads one annotation, named in brackets — " +
            s"'$written::Annotation[rename]'")
 
+// **A generic annotation is asked for by its bare name**, `f::Annotation[default]`: its parameter is
+// the type of the field `f` stands at, so the answer is an `Option[default[f::Type]]`. Written with
+// its argument, the argument must be that type.
 annotation_query(cx: &Analyzer, span: Span, subject: Expr, item: Expr) -> TExpr
-    val asked = written_type_arg(cx, item)
+    var akey = generic_annotation_named(cx, item)
+    var asked = Unknown
+    var written_args = false
 
-    if asked == Unknown then return bad_expr(span)
+    if akey == ""
+        asked = written_type_arg(cx, item)
 
-    val shown = type_show(asked)
+        if asked == Unknown then return bad_expr(span)
 
-    val akey = underlying(asked) match
-        Struct(s) -> s.base
-        _ -> ""
+        akey = underlying(asked) match
+            Struct(s) -> s.base
+            _ -> ""
+
+        written_args = true
+    end if
 
     var is_annotation = false
+    var generic = false
+    var aname = ""
 
     cx.an.tables.types.get(akey) match
         Some(decl) ->
             decl.kind match
-                StructOf(sd) -> is_annotation = sd.annotation
+                StructOf(sd) ->
+                    is_annotation = sd.annotation
+                    generic = !sd.tparams.is_empty()
+                    aname = sd.name
                 _ -> ()
         None -> ()
 
-    if !is_annotation then
+    if !is_annotation
+        val shown = type_show(asked)
+
         return cx.err(span, s"'$shown' is ${kind_phrase(asked)}, not an annotation — an annotation is a " +
                       s"struct marked '@annotation', which is what lets '::Annotation[$shown]' read it")
+    end if
 
-    val opt = reinstantiate(cx.an, library_key("Option"), one_type(asked))
     val name = attr_type_name(subject)
     val d = if name.is_some() then descriptor_bound(cx.subst, name.unwrap()) else None
+    var field: Option[Type] = None
+
+    if generic
+        val bare = annot_path(item)
+        val written = if bare != "" then bare else type_show(asked)
+
+        field = if d.is_some() then descriptor_field_type(d.unwrap()) else None
+
+        if field.is_none() then
+            return cx.err(span, s"'$written' is a generic annotation — its parameter is the type of " +
+                          "the field it is written on — so '::Annotation[…]' reads it from a field a " +
+                          "'for const' walk stands at, and this asks it of something that is not one")
+
+        val bound = reinstantiate(cx.an, akey, one_type(field.unwrap()))
+
+        if written_args && asked != bound then
+            return cx.err(span, s"'${type_show(asked)}' asks for the annotation at a type the field " +
+                          s"does not have — the field is a '${type_show(field.unwrap())}', so it " +
+                          s"carries a '${type_show(bound)}'; written bare, '::Annotation[" +
+                          s"$aname]' reads it at the field's type")
+
+        asked = bound
+    end if
+
+    val opt = reinstantiate(cx.an, library_key("Option"), one_type(asked))
 
     // Whose annotations, and which of them: the declaration's key and the part's name.
     var owner = ""
@@ -185,7 +245,7 @@ annotation_query(cx: &Analyzer, span: Span, subject: Expr, item: Expr) -> TExpr
 
     if found.is_none() then return absent_annotation(span, opt)
 
-    val value = annotation_value(cx.an, held.unwrap().1, found.unwrap().0, found.unwrap().1, asked)
+    val value = annotation_value(cx.an, held.unwrap().1, found.unwrap().0, found.unwrap().1, asked, field)
 
     if value.is_none() then return bad_expr(span)
 

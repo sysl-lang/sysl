@@ -48,7 +48,7 @@ Each row is one claim the design leans on, the probe that settles it, and what 0
 | C12 | encoding reaches every shape: data enums (`x is c`, `x.(c)`), `Option`, `Buf`, tuples, `q15`, recursive `&Expr`, and `@flatten` by recursing into `f::Type`'s fields | p05 | **yes**: `{"title":"t","rev":4,"tag":"x","shapes":["Dot",{"Circle":{"r":5}},…],"note":null,"pair":[1,"one"],"gain":0.5,"tree":{"Add":{…}}}` |
 | C13 | a member call reaches through `&T`, so no `impl … for &T` is written | p05 | **yes** — and one is refused: *'&T' is a way of holding a T rather than a type of its own* |
 | C14 | what `T::Kind` says of the library's containers | p05 | `Option` `DataEnum`, **`Buf` `Struct`, `Map` `Struct`**, `q15` `Fixed`, `&Expr` `Ref` — a container must be met by its own `impl` before a derivation would walk its private fields |
-| C15 | an annotation's arguments: concrete fields only, constants only | p08, p09 | `@default_int(8080)`, `@tag("type", "data")` on an enum: **yes**. `struct default[T]` refused (*an annotation takes no type parameters*); a function as argument refused (*'@default_fn' takes constants*) → **Q5** |
+| C15 | an annotation's arguments: concrete fields only, constants only | p08, p09 | `@default_int(8080)`, `@tag("type", "data")` on an enum: **yes**. `struct default[T]` refused on 0.7 (*an annotation takes no type parameters*; accepted from 0.8.0, Q5); a function as argument refused (*'@default_fn' takes constants*) → **Q5** |
 | C16 | `f::Type.decode(d)` reaches a receiverless member through a field's type | p19 | **no** — *'f::Type' is a type, so it stands where a type is written*; and `decode_as[f::Type](d)` is refused (*takes 2 type arguments*), so it is `decode_as[f::Type, D](d)` → **Q4** |
 | C17 | a receiverless member on a tuple instance | p13 | **no** — *'(A, B)' is not a name a call could reach it through*. Not a gap for the codec: tuples and arrays are handled structurally (C18) |
 | C18 | a free generic function covers tuples and arrays by `T::Kind` with no `impl`, and one `impl[T: Integer + Display]` covers the open `iN`/`uN` family | p14 | **yes**: `70000 [-3,9] [1,2,3]` for a `u24`, an `(i7, u64)`, a `[3]u8` |
@@ -180,6 +180,11 @@ in this design.
    annotation. The bare `@default` (the field type's `Default`, a new std trait with `default() ->
    Self`) needs no language change. Recommended question: may an annotation field be typed
    **`Self`-of-the-annotated-field** (written, say, `v: Field`), checked against each use?
+   **Answered in 0.8.0** (spelling decided by the user): `@annotation struct default[F] { v: F }` —
+   an annotation may take one type parameter, which each use binds to the type of the field it is
+   written on; `f::Annotation[default]` answers an `Option[default[f::Type]]`. A use on a type or a
+   variant is refused (no field type to bind); a second parameter or a `const` one is refused; a bound
+   on `F` is checked at each use. `reference/reflection.md § An annotation of the field's type`.
 6. **`derives Codec` for a trait that only joins two derivable ones (C20).** Recommended: a
    `derives` naming a trait with no `derive` member derives each required trait that has one, and is
    refused only when none does.

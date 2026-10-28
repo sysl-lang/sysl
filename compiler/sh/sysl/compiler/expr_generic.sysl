@@ -332,6 +332,12 @@ private written_type_ref(cx: &Analyzer, e: Expr, at_address: bool) -> TypeRef = 
     Index(head, one, _) -> applied_type_ref(cx, anchor_of(e), head, one_arg(one), at_address)
     TypeArgs(head, inner, _) -> applied_type_ref(cx, anchor_of(e), head, inner, at_address)
     TypeArg(written) -> written
+    // `f::Type` or `T::Item` nested in an application -- `Option[f::Type]` -- reads as it does alone.
+    TypeAttr(head, member, _, _) -> *head.kind match
+        Ident(n) -> type_ref(e.span, AssocType(named_type(head.span, n), member))
+        _ ->
+            not_a_type_arg(cx, e, at_address)
+            named_type(e.span, "")
     _ ->
         not_a_type_arg(cx, e, at_address)
         named_type(e.span, "")
@@ -399,11 +405,33 @@ private applied_type_ref(cx: &Analyzer, span: Span, head: Expr, inner: Buf[Expr]
             Index(_, _, _) -> refs.push(written_type_ref(cx, arg, at_address))
             TypeArgs(_, _, _) -> refs.push(written_type_ref(cx, arg, at_address))
             TypeArg(_) -> refs.push(written_type_ref(cx, arg, at_address))
+            // `f::Type` and `u8::Bits` are spelled alike, so which one a projection is depends on
+            // the parameter it fills: a value where the declaration wrote `const`, a type elsewhere.
+            TypeAttr(_, _, _, _) ->
+                if value_param_at(cx, name, refs.len()) then refs.push(type_ref(arg.span, ValueArgType(arg)))
+                else refs.push(written_type_ref(cx, arg, at_address))
             _ -> refs.push(type_ref(arg.span, ValueArgType(arg)))
 
 
     type_ref(span, NamedType(name, refs))
 end applied_type_ref
+
+// Whether parameter `i` of the generic type `name` reaches is a value parameter, `const N: usize`.
+private value_param_at(cx: &Analyzer, name: string, i: usize) -> bool
+    val key = lookup_type_key(cx.an, cx.scope, name)
+
+    if key.is_none() then return false
+
+    val decl = cx.an.tables.types.get(key.unwrap())
+
+    if decl.is_none() then return false
+
+    decl.unwrap().kind match
+        StructOf(sd) -> i < sd.tparams.len() && binding_named(sd.tvalues, sd.tparams.at(i)).is_some()
+        EnumOf(ed) -> i < ed.tparams.len() && binding_named(ed.tvalues, ed.tparams.at(i)).is_some()
+        TypeOf(td) -> i < td.tp.names.len() && binding_named(td.tp.values, td.tp.names.at(i)).is_some()
+        _ -> false
+end value_param_at
 
 // One call to a generic function.
 generic_call(cx: &Analyzer, span: Span, written: string, key: string, f: Func, args: Buf[Expr],

@@ -14,9 +14,15 @@ import sysl.buf.{Buf, buf}
 // Every use is checked where it is written, whether or not anything reads it, and each reading types
 // the use again; a complaint is said once however often it is raised.
 
+// **A generic annotation**, `struct default[F]`, takes the one type parameter it may declare from
+// what a use is written on: the type of the field. `@default(8080) port: u16` is the construction
+// `default[u16](8080)`, so the value is checked as a `u16` and reflection answers a `default[u16]`.
+// A use on a type declaration or a variant has no field type to give it and is refused.
+
 // The annotation struct a written name reaches from `scope`: its key, its declaration and its type.
 // `None` where it is no annotation, which is said at `span` unless `quiet` -- `how` finishes the
-// sentence that tells a reader to mark it.
+// sentence that tells a reader to mark it. A generic annotation's type is `Unknown` here, since only
+// a use says what its parameter is (`annotation_type_at`).
 annotation_struct(a: &Analysis, scope: Scope, span: Span, written: string, how: string,
                   quiet: bool) -> Option[(string, StructDecl, Type)]
     val key = lookup_type_key(a, scope, written)
@@ -34,8 +40,11 @@ annotation_struct(a: &Analysis, scope: Scope, span: Span, written: string, how: 
     val kind = decl.kind match
         StructOf(sd) ->
             if sd.annotation then
-                return Some((key.unwrap(), sd, resolve_type(a, scope, named_type(span, written),
-                                                           no_bindings())))
+                val ty = if !sd.tparams.is_empty() then Unknown
+                         else resolve_type(a, scope, named_type(span, written), no_bindings())
+
+                return Some((key.unwrap(), sd, ty))
+            end if
 
             "a struct"
         EnumOf(_) -> "an enum"
@@ -49,8 +58,32 @@ annotation_struct(a: &Analysis, scope: Scope, span: Span, written: string, how: 
     None
 end annotation_struct
 
-// What one use comes to: the literal of its struct, or `None` where it was refused.
-annotation_value(a: &Analysis, scope: Scope, u: AnnotUse, sd: StructDecl, ty: Type) -> Option[TExpr]
+// The type one use of the annotation `key` stands for: `plain` where the annotation takes no
+// parameter, and otherwise the annotation at `field`, the type of the field the use is written on.
+// `None` where there is no field, which is said at the use; `owner` names what it was written on.
+annotation_type_at(a: &Analysis, scope: Scope, u: AnnotUse, key: string, sd: StructDecl, plain: Type,
+                   field: Option[Type], owner: string) -> Option[Type]
+    if sd.tparams.is_empty() then return Some(plain)
+
+    if field.is_none()
+        val what = if u.target == "" then s"the declaration '$owner'" else s"the variant '${u.target}'"
+
+        a.fault(scope, u.span, s"'@${annot_written(u)}' is generic — its '${sd.tparams.at(0)}' is the " +
+                s"type of the field it is written on — and $what is not a field, so there is no type " +
+                "to give it")
+        return None
+    end if
+
+    var targs: Buf[Type] = buf()
+
+    targs.push(field.unwrap())
+    Some(reinstantiate_at(a, scope, u.span, key, targs))
+end annotation_type_at
+
+// What one use comes to: the literal of its struct, or `None` where it was refused. `field` is the
+// type a generic annotation's parameter was given, which a refusal names with the field.
+annotation_value(a: &Analysis, scope: Scope, u: AnnotUse, sd: StructDecl, ty: Type,
+                 field: Option[Type]) -> Option[TExpr]
     val written = annot_written(u)
 
     if u.parens && sd.fields.is_empty()
@@ -59,8 +92,50 @@ annotation_value(a: &Analysis, scope: Scope, u: AnnotUse, sd: StructDecl, ty: Ty
         return None
     end if
 
-    annotation_image(analyzer_for(a, scope), written, u.call, ty)
+    val about = if field.is_none() || sd.tparams.is_empty() then ""
+                else s"'@$written' is written on '${u.target}', of type '${type_show(field.unwrap())}', " +
+                     s"so its '${sd.tparams.at(0)}' is '${type_show(field.unwrap())}' and what its " +
+                     "parentheses say must be of that type"
+
+    annotation_image(analyzer_for(a, scope), written, u.call, ty, about)
 end annotation_value
+
+// The type of the field a use is about -- `port`, or `Variant.field` on an enum -- read in the terms
+// of the declaration `key` that holds it, where a generic declaration's own parameters stand for
+// themselves. `None` where the use is about the declaration itself or a variant.
+annotated_field(a: &Analysis, key: string, target: string) -> Option[Type]
+    val decl = a.tables.types.get(key)
+
+    if decl.is_none() || target == "" then return None
+
+    val d = decl.unwrap()
+
+    d.kind match
+        StructOf(sd) -> field_named(a, d.scope, sd.tparams, sd.bounds, sd.tvalues, sd.fields, "", target)
+        EnumOf(ed) ->
+            for v in ed.variants
+                val found = field_named(a, d.scope, ed.tparams, ed.bounds, ed.tvalues, v.fields,
+                                        v.name + ".", target)
+
+                if found.is_some() then return found
+
+            None
+        _ -> None
+end annotated_field
+
+private field_named(a: &Analysis, scope: Scope, tparams: Buf[string], bounds: Buf[NamedBounds],
+                    tvalues: Buf[TypeBinding], fields: Buf[Param], prefix: string,
+                    target: string) -> Option[Type]
+    for p in fields
+        if prefix + p.name != target then continue
+
+        val subst = if tparams.is_empty() then no_bindings()
+                    else abstract_subst(a, scope, tparams, bounds, tvalues, buf(), buf())
+
+        return Some(unqualified(resolve_type(a, scope, p.typ, subst)))
+
+    None
+end field_named
 
 // The use among `annots` about `target` that names the annotation `key`, read in `scope`.
 annotation_on(a: &Analysis, scope: Scope, annots: Buf[AnnotUse], target: string,
@@ -100,20 +175,27 @@ check_annotations(a: &Analysis, units: Buf[Program])
 
         for j in 0..<unit.body.len()
             var annots: Buf[AnnotUse] = buf()
+            var owner = ""
 
             *unit.body.at(j).kind match
-                StructDecl(d) -> annots = d.annots
-                EnumDecl(d) -> annots = d.annots
-                TypeDecl(d) -> annots = d.annots
+                StructDecl(d) ->
+                    annots = d.annots
+                    owner = d.name
+                EnumDecl(d) ->
+                    annots = d.annots
+                    owner = d.name
+                TypeDecl(d) ->
+                    annots = d.annots
+                    owner = d.name
                 _ -> ()
 
             if annots.is_empty() then continue
             if scope.is_none() then scope = Some(scope_of_unit(a, unit))
 
-            check_uses(a, scope.unwrap(), annots)
+            check_uses(a, scope.unwrap(), annots, owner)
 end check_annotations
 
-private check_uses(a: &Analysis, scope: Scope, annots: Buf[AnnotUse])
+private check_uses(a: &Analysis, scope: Scope, annots: Buf[AnnotUse], owner: string)
     var seen: Buf[(string, string)] = buf()
 
     for u in annots
@@ -136,5 +218,17 @@ private check_uses(a: &Analysis, scope: Scope, annots: Buf[AnnotUse])
         end if
 
         seen.push((u.target, found.unwrap().0))
-        annotation_value(a, scope, u, found.unwrap().1, found.unwrap().2)
+
+        val sd = found.unwrap().1
+        var field: Option[Type] = None
+
+        if !sd.tparams.is_empty()
+            val key = lookup_type_key(a, scope, owner)
+
+            if key.is_some() then field = annotated_field(a, key.unwrap(), u.target)
+        end if
+
+        val ty = annotation_type_at(a, scope, u, found.unwrap().0, sd, found.unwrap().2, field, owner)
+
+        if ty.is_some() then annotation_value(a, scope, u, sd, ty.unwrap(), field)
 end check_uses

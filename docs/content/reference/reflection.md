@@ -491,6 +491,100 @@ struct S
 '@label' is written twice above 'a', and it says nothing the once does not
 ```
 
+### An annotation of the field's type
+
+**An annotation may take one type parameter, and each use binds it to the type of the field it is
+written on.** `@default(8080) port: u16` is the construction `default[u16](8080)`, so 8080 is checked
+as a `u16` and `@default("localhost") host: string` as a `string` — one annotation carries a value of
+every field's own type. Reflection asks for it by its bare name: `f::Annotation[default]` answers an
+`Option[default[f::Type]]`, whose `v` has the field's type. Written with its argument,
+`f::Annotation[default[f::Type]]` reads the same thing.
+
+```sysl
+@annotation
+struct default[F]
+    v: F
+
+enum Mode
+    Fast
+    Slow
+
+struct Point
+    x: int
+    y: int
+
+struct Cfg
+    @default(8080) port: u16
+    @default("localhost") host: string
+    @default(Mode.Slow) mode: Mode
+    @default(Some(3)) retries: Option[int]
+    @default(Point(1, 2)) origin: Point
+    name: string
+
+for const f in Cfg::Fields
+    val d = f::Annotation[default]
+
+    if d.is_some() then print(f.name, d.unwrap().v) else print(f.name, "-")
+```
+
+```output
+port 8080
+host localhost
+mode Mode.Slow
+retries Some(3)
+origin Point(x: 1, y: 2)
+name -
+```
+
+On a field of a generic declaration the parameter is the field's type in the declaration's own terms:
+`@default(None) x: Option[T]` is checked as an `Option[T]` where it is written, and read at each
+instantiation — `Wrap[int]::Fields` answers a `default[Option[int]]`. The parameter may carry a bound
+(`struct shown[F: Display]`), which each use's field type must meet.
+
+A value that is not of the field's type is refused at the use, naming the field:
+
+```sysl
+@annotation
+struct default[F]
+    v: F
+
+struct Cfg
+    @default("x") port: u16
+```
+
+```error
+'@default' is written on 'port', of type 'ushort', so its 'F' is 'ushort' and what its parentheses say must be of that type
+```
+
+Only a field has a type to give the parameter, so a generic annotation above a type declaration or a
+variant is refused, and so is reading one off something that is not a field:
+
+```sysl
+@annotation
+struct default[F]
+    v: F
+
+@default(1)
+struct Cfg
+    port: u16
+```
+
+```error
+'@default' is generic — its 'F' is the type of the field it is written on — and the declaration 'Cfg' is not a field, so there is no type to give it
+```
+
+An annotation takes at most one type parameter, and it is a type, never a `const` value:
+
+```sysl
+@annotation
+struct pair[A, B]
+    a: A
+```
+
+```error
+an annotation takes at most one type parameter — a use of '@pair' gives it the type of the field it is written on, which is one type, and nothing gives the others
+```
+
 ## Privacy
 
 **A query lists every field, and `f.public` says which are public.** `v.(f)` on a private field is
