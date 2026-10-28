@@ -19,9 +19,11 @@ import sysl.container.{Set, set}
 // **What "keeps" means here is what lets the callee move it**: the parameter, or a local or a value
 // built around it, lands somewhere that outlives the call -- a store outside the frame's own locals, a
 // box (a closure's environment among them), a buffer's slot, the function's result -- or is handed to
-// another function's owned parameter. The answer is a fixed point, so recursion settles on what the
-// body does. A wrong answer either way is still correct code, only slower, since both conventions are
-// complete; what has to hold is that caller and callee AGREE.
+// another function's owned parameter -- **on every way out of the body**. A parameter kept on some
+// paths only stays borrowed, and the path that keeps it takes its count where it stores it (`every way
+// out`, below). The answer is a fixed point, so recursion settles on what the body does. A wrong
+// answer either way is still correct code, only slower, since both conventions are complete; what has
+// to hold is that caller and callee AGREE.
 //
 // **That agreement is why the answer reads nothing but the function's own body and its callees'
 // answers.** A library's functions are compiled once, into the artifact, and each program that calls
@@ -51,7 +53,13 @@ owned_params(e: *Emit, p: TProgram) -> Set[string]
         for j in 0..<f.params.len()
             if may_own_param(e, f, j) then asks.push((f, j))
 
-    // Every answer only turns on as the answers it reads do, so the rounds settle.
+    // Every candidate starts owned and is let go once some way out of its body is found not to keep
+    // it. An answer only turns off as the answers it reads do, so the rounds settle -- on the largest
+    // agreeing answer, which is what lets a recursive call that hands the parameter on count as keeping
+    // it: `ping` calling `pong` calling `ping`, with a store at the bottom, owns all the way down.
+    for item in asks
+        owned.add(owned_key(item.0.name, item.1))
+
     var moved = true
 
     while moved
@@ -60,8 +68,8 @@ owned_params(e: *Emit, p: TProgram) -> Set[string]
         for item in asks
             val key = owned_key(item.0.name, item.1)
 
-            if !owned.has(key) && keeps_counted(item.0, item.1, owned)
-                owned.add(key)
+            if owned.has(key) && !keeps_counted(item.0, item.1, owned)
+                owned.remove(key)
                 moved = true
 
     owned
@@ -119,13 +127,16 @@ private contract_reads(f: TFunc, name: string) -> bool
 end contract_reads
 
 // One walk's state: the locals that may hold the parameter or something built around it, the refs
-// (whose writes land in somebody else's storage), and whether the body lets it outlive the call.
+// (whose writes land in somebody else's storage), whether the body lets it outlive the call, and
+// whether some way out of the body leaves without having done so (`lost`).
 private struct OwnTrack
     held: Set[string]
     refs: Set[string]
     owned: Set[string]
     kept: bool
     changed: bool
+    lost: bool
+    loops: Buf[&KeepLoop]
 
     hold(*self, name: string)
         if !self.held.has(name)
@@ -134,9 +145,10 @@ private struct OwnTrack
     end hold
 end OwnTrack
 
-// Whether `f` keeps its parameter at `j`, given the parameters already known to be owned.
+// Whether `f` keeps its parameter at `j` on every way out, given the parameters already known to be
+// owned.
 private keeps_counted(f: TFunc, j: usize, owned: Set[string]) -> bool
-    val t: &OwnTrack = OwnTrack(set(), set(), owned, false, true)
+    val t: &OwnTrack = OwnTrack(set(), set(), owned, false, true, false, buf())
 
     t.held.add(f.params.at(j).0)
 
@@ -153,7 +165,12 @@ private keeps_counted(f: TFunc, j: usize, owned: Set[string]) -> bool
 
     if f.body.result.is_some() && carries_count(t, f.body.result.unwrap()) then t.kept = true
 
-    t.kept
+    if !t.kept then return false
+
+    // Kept somewhere: now every way out has to have kept it, or the parameter stays borrowed.
+    keep_exit(t, keep_block(t, f.body, keep_live(false), true))
+
+    !t.lost
 end keeps_counted
 
 private own_stmt(t: &OwnTrack, s: TStmt) = s match
@@ -163,17 +180,26 @@ private own_stmt(t: &OwnTrack, s: TStmt) = s match
 
 private own_expr(t: &OwnTrack, x: TExpr) = *x.kind match
     TStore(place, v, _, _) -> own_write(t, place, v)
+    _ -> if keeps_at(t, x) then t.kept = true
+
+// Whether the node itself keeps what is tracked -- hands it to an owned parameter, a slot, a box or a
+// buffer literal. A store is `own_write`'s, since a store into a local only binds it.
+private keeps_at(t: &OwnTrack, x: TExpr) -> bool = *x.kind match
     TCall(name, args, _, _) ->
         for k in 0..<args.len()
-            if t.owned.has(owned_key(name, k)) && carries_count(t, args.at(k)) then t.kept = true
+            if t.owned.has(owned_key(name, k)) && carries_count(t, args.at(k)) then return true
+
+        false
     TSlots(op, args, _, _) ->
-        if op == "slot_place" && args.len() == 3 && carries_count(t, args.at(2)) then t.kept = true
-        if op == "slot_put" && args.len() == 2 && carries_count(t, args.at(1)) then t.kept = true
-    TBox(v, _) -> if carries_count(t, v) then t.kept = true
-    TBufLit(elems, _) ->
-        for item in elems
-            if carries_count(t, item) then t.kept = true
-    _ -> ()
+        op == "slot_place" && args.len() == 3 && carries_count(t, args.at(2)) ||
+            op == "slot_put" && args.len() == 2 && carries_count(t, args.at(1))
+    TBox(v, _) -> carries_count(t, v)
+    TBufLit(elems, _) -> any_carries_count(t, elems)
+    _ -> false
+
+// Whether a write keeps what is tracked: it is written somewhere other than a local's own storage.
+private write_keeps(t: &OwnTrack, place: TExpr, v: TExpr) -> bool =
+    carries_count(t, v) && own_root(t, place).is_none()
 
 // A write of what is tracked: into a local's own storage it binds the local; anywhere else it is kept.
 private own_write(t: &OwnTrack, place: TExpr, v: TExpr)
@@ -223,6 +249,232 @@ private any_carries_count(t: &OwnTrack, xs: Buf[TExpr]) -> bool
 end any_carries_count
 
 private block_carries_count(t: &OwnTrack, b: TBlock) -> bool = b.result.is_some() && carries_count(t, b.result.unwrap())
+
+// -- every way out ---------------------------------------------------------------------------------
+//
+// **A parameter is owned only where every way out of the body has kept it.** One kept on some paths
+// only -- a cache's miss, the arm of a `match` that inserts -- stays borrowed, and the path that keeps
+// it takes a count where it stores it. Owning it would charge every call the count's round trip (taken
+// by the caller, given back by the callee) to save one retain on the path that keeps, and the paths
+// that keep nothing are, as often as not, the ones that run: an interning table's hits, a set's
+// duplicates. Borrowed, those cost nothing at all.
+//
+// The walk runs in the order the body does, carrying whether every path to the point has kept the
+// parameter. The ways out are a `return`, a `?` that fails, and the end of the body. A branch counts
+// where every arm keeps; a loop where every `break` has kept and, unless only a `break` ends it, where
+// the state it started in had, since its body may run no times. A path that cannot go on -- a trap,
+// a `break`, a `continue`, a `return` -- joins as keeping everything.
+
+// What holds at one point: whether it is reached at all, and whether every path to it has kept.
+private struct KeepFlow
+    dead: bool
+    kept: bool
+
+private keep_live(kept: bool) -> KeepFlow = KeepFlow(false, kept)
+
+private keep_dead() -> KeepFlow = KeepFlow(true, true)
+
+private keep_join(a: KeepFlow, b: KeepFlow) -> KeepFlow
+    if a.dead then return b
+    if b.dead then return a
+
+    KeepFlow(false, a.kept && b.kept)
+end keep_join
+
+private keep_mark(f: KeepFlow, keeps: bool) -> KeepFlow = if keeps && !f.dead then keep_live(true) else f
+
+// A way out of the body: where it is reached without the parameter kept, the parameter is lost.
+private keep_exit(t: &OwnTrack, f: KeepFlow) = if !f.dead && !f.kept then t.lost = true
+
+// A block, and with `answer` its value is what the function hands back -- which keeps the parameter
+// on the paths whose value carries it.
+private keep_block(t: &OwnTrack, b: TBlock, f: KeepFlow, answer: bool) -> KeepFlow
+    val g = keep_stmts(t, b.stmts, f)
+
+    if b.result.is_none() then return g
+    if answer then return keep_result(t, b.result.unwrap(), g)
+
+    keep_expr(t, b.result.unwrap(), g)
+end keep_block
+
+// A value handed back to the caller. Only the arms of an `if` or a `match` that answer with the
+// parameter keep it, so the question is put to each arm's value rather than to the whole.
+private keep_result(t: &OwnTrack, x: TExpr, f: KeepFlow) -> KeepFlow = *x.kind match
+    TIf(cond, then_block, else_block, _) -> keep_if(t, cond, then_block, else_block, f, true)
+    TMatch(scrutinee, arms, _) -> keep_match(t, scrutinee, arms, f, true)
+    TBlockExpr(b) -> keep_block(t, b, f, true)
+    _ -> keep_mark(keep_expr(t, x, f), carries_count(t, x))
+
+// The branch not taken is left from wherever the condition failed, which is after any of its terms.
+private keep_if(t: &OwnTrack, cond: Buf[TCondTerm], then_block: TBlock, else_block: Option[TBlock],
+                f: KeepFlow, answer: bool) -> KeepFlow
+    var g = f
+    var failed = keep_dead()
+
+    for term in cond
+        g = keep_term(t, term, g)
+        failed = keep_join(failed, g)
+
+    keep_join(keep_block(t, then_block, g, answer),
+              if else_block.is_some() then keep_block(t, else_block.unwrap(), failed, answer) else failed)
+end keep_if
+
+private keep_match(t: &OwnTrack, scrutinee: TExpr, arms: Buf[TArm], f: KeepFlow, answer: bool) -> KeepFlow
+    var into = keep_expr(t, scrutinee, f)
+    var joined = keep_dead()
+
+    for arm in arms
+        var a = into
+
+        if arm.guard.is_some()
+            a = keep_expr(t, arm.guard.unwrap(), a)
+            into = keep_join(into, a)
+        end if
+
+        joined = keep_join(joined, keep_block(t, arm.body, a, answer))
+
+    joined
+end keep_match
+
+private keep_stmts(t: &OwnTrack, stmts: Buf[TStmt], f: KeepFlow) -> KeepFlow
+    var g = f
+
+    for s in stmts
+        g = keep_stmt(t, s, g)
+
+    g
+end keep_stmts
+
+private keep_stmt(t: &OwnTrack, s: TStmt, f: KeepFlow) -> KeepFlow = s match
+    TVarDecl(_, _, init, _) -> keep_expr(t, init, f)
+    TExprStmt(x) -> keep_expr(t, x, f)
+    TRefDecl(_, _, place) -> keep_expr(t, place, f)
+    TWriteStmt(w) -> keep_mark(keep_expr(t, w.value, keep_expr(t, w.place, f)), write_keeps(t, w.place, w.value))
+    TMultiAssign(writes) ->
+        var g = f
+
+        for w in writes
+            g = keep_expr(t, w.value, keep_expr(t, w.place, g))
+
+        for w in writes
+            g = keep_mark(g, write_keeps(t, w.place, w.value))
+
+        g
+    TReturn(value) ->
+        keep_exit(t, if value.is_some() then keep_result(t, value.unwrap(), f) else f)
+        keep_dead()
+    TBecome(call) ->
+        keep_exit(t, keep_expr(t, call, f))
+        keep_dead()
+    TBreak(value, depth) ->
+        val g = if value.is_some() then keep_expr(t, value.unwrap(), f) else f
+
+        if depth >= 0 && usize(depth) < t.loops.len()
+            val frame = t.loops.at(t.loops.len() - 1 - usize(depth))
+
+            frame.breaks = keep_join(frame.breaks, g)
+        end if
+
+        keep_dead()
+    TContinue(_) -> keep_dead()
+    _ -> f
+
+private keep_expr(t: &OwnTrack, x: TExpr, f: KeepFlow) -> KeepFlow
+    val out = *x.kind match
+        TStore(place, v, _, _) -> keep_mark(keep_expr(t, v, keep_expr(t, place, f)), write_keeps(t, place, v))
+        TRecheck(after, _, _, _) -> keep_expr(t, after, f)
+        TLogical(_, left, right) ->
+            val l = keep_expr(t, left, f)
+
+            keep_join(l, keep_expr(t, right, l))
+        TIf(cond, then_block, else_block, _) -> keep_if(t, cond, then_block, else_block, f, false)
+        TMatch(scrutinee, arms, _) -> keep_match(t, scrutinee, arms, f, false)
+        TBlockExpr(b) -> keep_block(t, b, f, false)
+        TTry(operand, _, _, _, _, _, _) ->
+            val g = keep_expr(t, operand, f)
+
+            keep_exit(t, g)
+            g
+        TWhile(_, _, _, _) -> keep_loop(t, x, f)
+        TDoWhile(_, _, _, _) -> keep_loop(t, x, f)
+        TLoop(_, _) -> keep_loop(t, x, f)
+        TFor(_, _, _, _, _, _, _, _) -> keep_loop(t, x, f)
+        TCFor(_, _, _, _, _, _) -> keep_loop(t, x, f)
+        TForEach(_, _, _, _, _, _) -> keep_loop(t, x, f)
+        TIterate(_, _, _, _, _, _, _, _) -> keep_loop(t, x, f)
+        TCheckedLoop(_, _, loop_expr) -> keep_expr(t, loop_expr, f)
+        TQuantifier(_, _, _, _, _, _, _) -> f
+        _ ->
+            var g = f
+
+            for item in texpr_children(x)
+                g = keep_expr(t, item, g)
+
+            g
+
+    if texpr_type(x) == Never then return keep_dead()
+
+    keep_mark(out, keeps_at(t, x))
+end keep_expr
+
+private keep_term(t: &OwnTrack, term: TCondTerm, f: KeepFlow) -> KeepFlow = term match
+    TCondTest(c) -> keep_expr(t, c, f)
+    TCondIs(subject, _, _) -> keep_expr(t, subject, f)
+
+// One loop being walked: what its `break`s have brought out of it.
+private struct KeepLoop
+    breaks: KeepFlow
+
+// A loop: its ways out are looked for from the state it starts in, which is a lower bound on every
+// turn's, since a path only ever gains a keep. What comes after it is every `break`'s state joined with
+// the way it ends on its own -- which is from the state it started in, through its `else` where it has
+// one, since the body may not have run at all. A `loop` ends only by its `break`s.
+private keep_loop(t: &OwnTrack, x: TExpr, f: KeepFlow) -> KeepFlow
+    val head = *x.kind match
+        TFor(_, _, lo, hi, _, _, _, _) -> keep_expr(t, hi, keep_expr(t, lo, f))
+        TCFor(init, _, _, _, _, _) -> keep_stmts(t, init, f)
+        TForEach(_, _, seq, _, _, _) -> keep_expr(t, seq, f)
+        TIterate(_, _, init, _, _, _, _, _) -> keep_expr(t, init, f)
+        _ -> f
+    val frame: &KeepLoop = KeepLoop(keep_dead())
+
+    t.loops.push(frame)
+
+    *x.kind match
+        TWhile(cond, body, _, _) ->
+            var g = head
+
+            for term in cond
+                g = keep_term(t, term, g)
+
+            keep_stmts(t, body, g)
+        TDoWhile(body, cond, _, _) -> keep_expr(t, cond, keep_stmts(t, body, head))
+        TLoop(body, _) -> keep_stmts(t, body, head)
+        TFor(_, _, _, _, _, body, _, _) -> keep_stmts(t, body, head)
+        TCFor(_, cond, step, body, _, _) ->
+            if cond.is_some() then keep_expr(t, cond.unwrap(), head)
+
+            keep_stmts(t, step, keep_stmts(t, body, head))
+        TForEach(_, _, _, body, _, _) -> keep_stmts(t, body, head)
+        TIterate(_, _, _, next, _, body, _, _) -> keep_stmts(t, body, keep_expr(t, next, head))
+        _ -> head
+
+    t.loops.pop()
+
+    val else_block = *x.kind match
+        TWhile(_, _, else_block, _) -> else_block
+        TDoWhile(_, _, else_block, _) -> else_block
+        TFor(_, _, _, _, _, _, else_block, _) -> else_block
+        TCFor(_, _, _, _, else_block, _) -> else_block
+        TForEach(_, _, _, _, else_block, _) -> else_block
+        TIterate(_, _, _, _, _, _, else_block, _) -> else_block
+        _ -> None
+    val ended = *x.kind match
+        TLoop(_, _) -> keep_dead()
+        _ -> if else_block.is_some() then keep_block(t, else_block.unwrap(), head, false) else head
+
+    keep_join(frame.breaks, ended)
+end keep_loop
 
 // -- emitting the convention ----------------------------------------------------------------------
 
