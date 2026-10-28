@@ -1,0 +1,272 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.Span
+import sysl.buf.{Buf, buf}
+import sysl.container.{Map, map, Set, set}
+
+// Whether a closure literal holds each `var` it captures by reference or by value
+// (`docs/design/closures.md`).
+//
+// **A closure that cannot outlive the variables it captures holds their addresses**, so a write in it
+// reaches the variable and a write made outside is seen by it: `call(() -> hit = true)` sets `hit`.
+// One that may be reached after the block declaring a captured variable has ended -- returned, stored
+// in module storage or through a parameter, kept by a callee, kept in a local of an enclosing block,
+// run by another thread or as a scoped child -- holds a copy, as every closure did before.
+//
+// **The decision is the escape analysis asked about the closure literal** (`keeps.sysl`'s
+// `probe_frame`, `keeps_block.sysl`'s `probe_blocks`): a closure escapes exactly where the rule would
+// refuse it if each of its captures were the address of the variable. Nothing is declared, and
+// nothing reaches a signature: the callee is handed a value it calls, whatever that value's fields
+// hold.
+//
+// The mode is a property of the literal, and of each capture: a `val`, a pattern's binding, a
+// by-name parameter and a value with no storage are copied whatever the literal's mode, since
+// nothing can tell a copy of them from the variable (`closure.sysl`'s `referable_captures`).
+//
+// **The typed tree is read in the by-value form until every check has run**, and only then turned into
+// the by-reference one (`apply_closure_modes`): the field becomes a `*T`, the construction takes the
+// variable's address, and a read of the capture in the body is `*self.f` -- the form a nested
+// function's environment already has, which everything after the analysis knows how to lower.
+
+// Decides every closure literal's mode once the keeps answers are settled, and says the writes that
+// reach only a copy of a capture the literal holds by value.
+//
+// A closure built in an `async` body holds its captures by value: the body's locals live in its
+// frame only between suspensions. One built in a module value's initializer does too, since nothing
+// follows that frame.
+decide_closure_modes(cx: &KeepsCx, funcs: Buf[TFunc], vals: Buf[TVal])
+    val a = cx.an
+    var built: Buf[string] = buf()
+    var escaped: Set[string] = set()
+
+    for f in funcs
+        val here = closures_built_in(walk_body_of(f))
+
+        if here.is_empty() then continue
+
+        var probing = false
+
+        for base in here
+            if !holds_string(built, base) then built.push(base)
+            if is_probe_candidate(a, base) then probing = true
+        end for
+
+        if !probing then continue
+
+        if f.marks.is_async()
+            for base in here
+                escaped.add(base)
+
+            continue
+        end if
+
+        for base in probe_frame(cx, f)
+            escaped.add(base)
+
+        for base in probe_blocks(cx, f)
+            escaped.add(base)
+    end for
+
+    for v in vals
+        if v.init.is_none() then continue
+
+        for base in closures_built_in(v.init.unwrap())
+            if !holds_string(built, base) then built.push(base)
+
+            escaped.add(base)
+        end for
+    end for
+
+    for base in built
+        if is_probe_candidate(a, base) && !escaped.has(base) then a.by_ref_closures.add(base)
+
+    say_lost_writes(a, built)
+end decide_closure_modes
+
+// A body as one expression, for a walk that takes one.
+private walk_body_of(f: TFunc) -> TExpr = TExpr(f.span, TBlockExpr(f.body))
+
+// The closure literals an expression builds, by their structs, each once.
+private closures_built_in(e: TExpr) -> Buf[string]
+    var out: Buf[string] = buf()
+    val into = &out
+
+    walk_texpr(e, expr_walk(true, x -> *x.kind match
+        TStructNew(st, _) -> if is_closure_literal(Struct(st)) && !holds_string(*into, st.base) then into.push(st.base)
+        _ -> ()))
+
+    out
+end closures_built_in
+
+// **A lost write is said where the closure holds that capture by value** -- and only for a closure the
+// program builds: one a reading lowered and then threw away is no closure of the program's, and the
+// reading the program got owes its own. Two readings of one closure owe one write twice; it is said
+// once.
+private say_lost_writes(a: &Analysis, built: Buf[string])
+    var said: Buf[(Span, string)] = buf()
+
+    for item in a.lost_writes
+        if !holds_string(built, item.3) then continue
+        if holds_by_reference(a, item.3, item.4) then continue
+
+        var again = false
+
+        for s in said
+            if s.0 == item.1 && s.1 == item.2 then again = true
+
+        if again then continue
+
+        said.push((item.1, item.2))
+        a.fault(item.0, item.1, item.2)
+    end for
+end say_lost_writes
+
+// Whether a closure holds its capture at `i` by reference.
+holds_by_reference(a: &Analysis, base: string, i: usize) -> bool
+    if !a.by_ref_closures.has(base) then return false
+
+    a.closure_refs.get(base) match
+        Some(refs) -> i < refs.len() && refs.at(i)
+        None -> false
+end holds_by_reference
+
+// -- the by-reference form --------------------------------------------------------------------------
+
+// What one closure held by reference had before it was turned: each capture it holds by reference,
+// by the field's slot, with the type it held by value.
+private struct Turned
+    slots: Buf[int]
+    types: Buf[Type]
+end Turned
+
+// Turns every closure held by reference into the by-reference form, once every check has run: its
+// field holds the variable's address, its construction takes it, and its body reads through it.
+//
+// **The tree is changed in place**, since a node is shared by every list that holds it -- the body the
+// emitter reads, the entry file's statements -- and the struct's record is shared by every type
+// naming it, so a layout measured after this sees the addresses.
+apply_closure_modes(a: &Analysis, funcs: Buf[TFunc], vals: Buf[TVal])
+    if a.by_ref_closures.is_empty() then return
+
+    var turned: Map[string, &Turned] = map()
+
+    for i in 0..<a.tables.struct_insts.len()
+        val base = a.tables.struct_insts.key_at(i)
+
+        if !a.by_ref_closures.has(base) then continue
+
+        a.tables.struct_insts.at(i) match
+            Struct(st) -> turned.put(base, turn_fields(a, st))
+            _ -> ()
+    end for
+
+    for f in funcs
+        turn_body(a, turned, f)
+
+    for v in vals
+        if v.init.is_some() then turn_constructions(a, turned, v.init.unwrap())
+end apply_closure_modes
+
+// The struct's by-reference fields become addresses.
+private turn_fields(a: &Analysis, st: &StructType) -> &Turned
+    val t: &Turned = Turned(buf(), buf())
+    val refs = a.closure_refs.get(st.base).unwrap()
+
+    for i in 0..<st.fields.len()
+        if i >= refs.len() || !refs.at(i) then continue
+
+        val field = st.fields.at(i)
+
+        t.slots.push(int(st.slot(i)))
+        t.types.push(field.1)
+        st.fields.set(i, (field.0, Ptr(field.1)))
+    end for
+
+    t
+end turn_fields
+
+private turn_body(a: &Analysis, turned: Map[string, &Turned], f: TFunc)
+    turn_constructions(a, turned, walk_body_of(f))
+
+    // A closure's own body reads its captures out of `*self`.
+    if !f.name.ends_with(".call") then return
+
+    val base = f.name[0..<f.name.bytes.len - ".call".bytes.len]
+    val t = turned.get(base)
+
+    if t.is_none() then return
+
+    var reads: Buf[TExpr] = buf()
+    val into = &reads
+    val walk = expr_walk(true, x -> *x.kind match
+        TField(recv, _, _) -> if reads_environment(recv) then into.push(x)
+        _ -> ())
+
+    walk_texpr(walk_body_of(f), walk)
+
+    for c in f.requires
+        walk_texpr(c.cond, walk)
+
+    for c in f.ensures
+        walk_texpr(c.cond, walk)
+
+    for o in f.olds
+        walk_texpr(o, walk)
+
+    if f.variant.is_some() then walk_texpr(f.variant.unwrap(), walk)
+
+    for x in reads
+        turn_read(t.unwrap(), x)
+end turn_body
+
+// `self.f` becomes `*self.f`, where the field now holds the address. **A node met twice is turned
+// once**: the first turning leaves no field read of the by-value type behind.
+private turn_read(t: &Turned, x: TExpr)
+    *x.kind match
+        TField(recv, slot, ty) ->
+            for j in 0..<t.slots.len()
+                if t.slots.at(j) != slot || !type_eq(t.types.at(j), ty) then continue
+
+                val field = TExpr(x.span, TField(recv, slot, Ptr(ty)))
+
+                *x.kind = TDeref(field, ty)
+                return
+            end for
+        _ -> ()
+end turn_read
+
+// Whether a field is read out of the closure's own environment, `(*self).f`.
+private reads_environment(recv: TExpr) -> bool = *recv.kind match
+    TDeref(inner, _) -> *inner.kind match
+        TLoad(name, _) -> name == "self"
+        _ -> false
+    _ -> false
+
+// Every construction of a closure held by reference takes the address of what it holds by reference.
+private turn_constructions(a: &Analysis, turned: Map[string, &Turned], e: TExpr)
+    var built: Buf[TExpr] = buf()
+    val into = &built
+
+    walk_texpr(e, expr_walk(true, x -> *x.kind match
+        TStructNew(st, _) -> if turned.has(st.base) then into.push(x)
+        _ -> ()))
+
+    for x in built
+        *x.kind match
+            TStructNew(st, args) ->
+                val refs = a.closure_refs.get(st.base).unwrap()
+
+                for i in 0..<args.len()
+                    if i >= refs.len() || !refs.at(i) then continue
+
+                    val arg = args.at(i)
+
+                    // A construction met twice is turned once.
+                    val done = *arg.kind match
+                        TAddrOf(_, _) -> true
+                        _ -> false
+
+                    if !done then args.set(i, TExpr(arg.span, TAddrOf(arg, Ptr(texpr_type(arg)))))
+                end for
+            _ -> ()
+end turn_constructions

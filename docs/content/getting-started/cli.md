@@ -123,8 +123,8 @@ binary's digest, so one that was truncated, damaged, or copied from another key'
 rather than run.
 
 **What is deliberately not in the key** cannot change the binary: the program's own arguments
-(`sysl run p -- a` and `sysl run p -- b` run one binary twice), `-o`, `-v`, `--explain-escapes` (a run
-that asks for the report compiles again), `SYSL_TIMINGS`, `SYSL_CODEGEN_UNITS` (how many pieces the
+(`sysl run p -- a` and `sysl run p -- b` run one binary twice), `-o`, `-v`, `--explain-escapes` and
+`--explain-borrows` (a run that asks for a report compiles again), `SYSL_TIMINGS`, `SYSL_CODEGEN_UNITS` (how many pieces the
 program is compiled in, not what it is), and where the caches and the library are (`HOME`,
 `XDG_CACHE_HOME`, `PATH`, the spelling of `SYSL_LIB` — the library's contents are keyed).
 
@@ -1211,6 +1211,7 @@ grammars.
 | `-v`, `--verbose` | report what the build decided: the files read, the standard module and how it was reached, the search paths, the allocator, and the clang and linker command lines |
 | `--explain-escapes` | report every local array promoted to the heap |
 | `--explain-drop-order` | report every local declared below a `defer` in its block, whose release the 0.8.0 drop order moves ahead of that `defer` |
+| `--explain-borrows` | report, for every function, whether its answer is a place of a parameter, +0 from one, or why not |
 
 **An unknown option is refused, never ignored.** Each mistake is reported on a line of its own, with
 the command's usage below, on standard error, and the exit status is 2. A misspelt `--relase` is
@@ -1454,6 +1455,33 @@ It reads every body in the project's own files, including bodies nothing calls. 
 compiles instead of replaying a cached binary. When no block is affected, the flag says so. A
 local listed here may not actually be released by its block, for example one handed to a callee
 that keeps it, so read each line rather than counting them.
+
+### `--explain-borrows`
+
+Reports on stderr one line for each function of the program's own files that takes a parameter and
+answers a value: whether that answer is **a place of a parameter** — the parameter's own storage, at
+the path given — or **+0 from one** — a value built on the spot every counted part of which is read
+out of the parameter — or, where it is neither, the first reason found:
+
+```
+$ sysl build --explain-borrows hashlife.sysl
+hashlife.sysl:8:5: 'Node.quad' answers a place of 'self': self.kids.unwrap()
+hashlife.sysl:23:5: 'Table.find' answers +0 from 'self': self.items.walk()[_], but its body may write or release what it was handed
+hashlife.sysl:30:1: 'make' is not borrowed: a reference made here, at 31:5
+```
+
+A path is written as the program reaches it: `.field`, `[_]` for an element, `.Some` for the
+payload a `match` binds, and `.method()` for a call into another module whose own answer is a place
+of its receiver. Two paths joined by `|` are two ways out. A function is answered for each
+instantiation of a generic, and the answer is worked out over the whole call graph, so a recursion
+settles on "not borrowed". Where no body is in sight — a call through a trait object or a function
+value, an `extern` — the answer is "not borrowed". A function whose answer is borrowed but whose body
+may write or release something (it calls, or writes, more than its own locals) says so.
+
+Nothing in the build changes with the flag. The report is what a borrowed return
+([the design note](https://github.com/sysl-lang/sysl/blob/dev/docs/design/borrowed-return.md)) will
+be decided from: an answer that is a place can be read in the caller without a copy or a count.
+When no function answers a borrow, the flag says so.
 
 ### `-O2` is written the way clang writes it
 

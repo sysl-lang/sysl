@@ -1,17 +1,21 @@
 module sh.sysl.compiler
 @tests
 
-// A closure captures by value, so a write to a capture reaches the closure's own copy. That copy is
-// state the closure keeps between its calls when the closure reads it back; when nothing can read
-// it, the write is lost. Two shapes are refused, at the write: a capture every mention of which in
-// the closure is the place of a write, and one the enclosing body uses again after the closure, as
-// though the write had reached it. A closure that writes its copy and reads it back, with the
-// variable outside left alone, is a counter and is accepted; so is every write through what a
+// A closure that escapes captures by value, so a write to a capture reaches the closure's own copy.
+// That copy is state the closure keeps between its calls when the closure reads it back; when nothing
+// can read it, the write is lost. Two shapes are refused, at the write: a capture every mention of
+// which in the closure is the place of a write, and one the enclosing body uses again after the
+// closure, as though the write had reached it. A closure that writes its copy and reads it back, with
+// the variable outside left alone, is a counter and is accepted; so is every write through what a
 // capture refers to (a `&T`, a `*T`, a `Buf`).
+//
+// **Every closure here escapes** -- each callee keeps what it is handed, in module storage -- since a
+// closure that does not holds its captures by reference and has no copy to lose a write to
+// (`tests_crm_closure_ref_mode.sysl`).
 //
 // The helpers are `tests_enm_enum_run.sysl`'s.
 
-private const cwr_call: string = "call(f: &Fn() -> unit) = f()\n\n"
+private const cwr_call: string = "run(f: &Fn() -> unit) = f()\n\nvar kept: Option[&Fn() -> unit] = None\n\ncall(f: &Fn() -> unit)\n    kept = Some(f)\n    f()\n\nvar held: Option[&Fn() -> int] = None\n\nstash(f: &Fn() -> int)\n    held = Some(f)\n    print(f())\n\nvar walker: Option[&Fn(int) -> unit] = None\n\nkeep_each(xs: []int, f: &Fn(int) -> unit)\n    walker = Some(f)\n\n    for x in xs\n        f(x)\n\n"
 
 // The refusal, for a capture `name` of a type shown as `shown`, written with `form`.
 private cwr_unread(name: string, form: string, shown: string) -> string =
@@ -45,12 +49,12 @@ cwr_flag_set_in_a_callback()
     cwr_refused(cwr_call + "main()\n    var hit = false\n    call(() -> hit = true)\n    print(hit)\n",
                 cwr_unread("hit", "assignment", "bool"))
 
-@test("a compound assignment in a closure handed to 'each'")
+@test("a compound assignment in a closure handed to an 'each' that keeps it")
 cwr_compound_in_each()
     if !enm_ready() then return
 
-    cwr_refused("import sysl.seq.Sequence\n\nmain()\n    var total = 0\n" +
-                "    [1, 2, 3][..].each(n -> total += n)\n    print(total)\n",
+    cwr_refused(cwr_call + "main()\n    var total = 0\n" +
+                "    keep_each([1, 2, 3][..], n -> total += n)\n    print(total)\n",
                 cwr_unread("total", "'+='", "int"))
 
 @test("an increment")
@@ -64,7 +68,7 @@ cwr_increment()
 cwr_placeholder()
     if !enm_ready() then return
 
-    cwr_refused("import sysl.seq.Sequence\n\nmain()\n    var m = 0\n    [1, 2][..].each(m += _)\n",
+    cwr_refused(cwr_call + "main()\n    var m = 0\n    keep_each([1, 2][..], m += _)\n",
                 cwr_unread("m", "'+='", "int"))
 
 @test("a field of a captured struct is part of the copy")
@@ -88,11 +92,12 @@ cwr_multiple_assignment()
     cwr_refused(cwr_call + "main()\n    var a = 1\n    var b = 2\n    call(() ->\n        a, b = 3, 4)\n",
                 cwr_unread("a", "assignment", "int"))
 
-@test("a closure kept in a 'var' and called twice still has nobody to read the copy")
+@test("a closure kept in a 'var', called twice and then kept, still has nobody to read the copy")
 cwr_kept_closure_never_reading()
     if !enm_ready() then return
 
-    cwr_refused("main()\n    var hit = false\n    var g = () -> hit = true\n    g()\n    g()\n",
+    cwr_refused(cwr_call + "main()\n    var hit = false\n    var g = () -> hit = true\n    g()\n    g()\n" +
+                "    call(g)\n",
                 cwr_unread("hit", "assignment", "bool"))
 
 @test("a '&sync Fn' closure")
@@ -137,38 +142,38 @@ cwr_generic_body()
 cwr_read_after_the_closure()
     if !enm_ready() then return
 
-    cwr_refused("import sysl.seq.Sequence\n\nmain()\n    var best = 0\n    [1, 5, 3][..].each(n ->\n" +
+    cwr_refused(cwr_call + "main()\n    var best = 0\n    keep_each([1, 5, 3][..], n ->\n" +
                 "        if n > best then best = n)\n    print(best)\n",
                 cwr_used_after("best", "assignment", "int"))
 
-@test("a counter closure whose variable is printed beside its calls")
+@test("a kept counter closure whose variable is printed beside its calls")
 cwr_counter_and_its_variable()
     if !enm_ready() then return
 
-    cwr_refused("main()\n    var seen = 0\n    var g = () ->\n        seen += 1\n        seen\n" +
-                "    g()\n    print(seen)\n", cwr_used_after("seen", "'+='", "int"))
+    cwr_refused(cwr_call + "main()\n    var seen = 0\n    var g = () ->\n        seen += 1\n        seen\n" +
+                "    stash(g)\n    print(seen)\n", cwr_used_after("seen", "'+='", "int"))
 
 @test("a second closure capturing the variable is a use of it after the first")
 cwr_second_closure_reads_it()
     if !enm_ready() then return
 
     cwr_refused(cwr_call + "main()\n    var n = 0\n    call(() ->\n        n += 1\n        print(n))\n" +
-                "    call(() -> print(n))\n", cwr_used_after("n", "'+='", "int"))
+                "    stash(() -> n)\n", cwr_used_after("n", "'+='", "int"))
 
 // ---- what stays legal
 
-@test("a closure that counts in its own copy, called twice")
+@test("a kept closure that counts in its own copy, called twice")
 cwr_counter_closure()
     if !enm_ready() then return
 
-    assert_eq(enm_ran("main()\n    var n = 0\n    var g = () ->\n        n += 1\n        n\n" +
-                      "    print(g(), g())\n"), "1 2\n")
+    assert_eq(enm_ran(cwr_call + "main()\n    var n = 0\n    var g = () ->\n        n += 1\n        n\n" +
+                      "    stash(g)\n    print(g(), g())\n"), "1\n1 2\n")
 
-@test("a running sum the closure reads back, the variable outside left alone")
+@test("a running sum the kept closure reads back, the variable outside left alone")
 cwr_running_sum_read_inside()
     if !enm_ready() then return
 
-    assert_eq(enm_ran("import sysl.seq.Sequence\n\nmain()\n    var k = 0\n    [1, 2, 3][..].each(x ->\n" +
+    assert_eq(enm_ran(cwr_call + "main()\n    var k = 0\n    keep_each([1, 2, 3][..], x ->\n" +
                       "        k += x\n        print(k))\n"), "1\n3\n6\n")
 
 @test("the variable read before the closure, not after")
@@ -190,7 +195,7 @@ cwr_pointer_written_through()
     if !enm_ready() then return
 
     assert_eq(enm_ran(cwr_call + "main()\n    var flag = false\n    val p = &flag\n" +
-                      "    call(() -> *p = true)\n    print(flag)\n"), "true\n")
+                      "    run(() -> *p = true)\n    print(flag)\n"), "true\n")
 
 @test("a field written through a captured '&T'")
 cwr_reference_field()
@@ -449,15 +454,15 @@ cwr_self_call_setter()
 cwr_self_call_value_used_after()
     if !enm_ready() then return
 
-    cwr_refused(cwr_counter + "main()\n    var e = C(0, In(0))\n    var h = () -> e.next()\n" +
-                "    print(h(), e.n)\n", cwr_used_after("e", "'next', which takes '*self',", "C"))
+    cwr_refused(cwr_call + cwr_counter + "main()\n    var e = C(0, In(0))\n    var h = () -> e.next()\n" +
+                "    stash(h)\n    print(h(), e.n)\n", cwr_used_after("e", "'next', which takes '*self',", "C"))
 
 @test("a counting '*self' closure whose variable is printed beside its calls")
 cwr_self_call_counter_used_after()
     if !enm_ready() then return
 
-    cwr_refused(cwr_counter + "main()\n    var c = C(0, In(0))\n    var k = () ->\n        c.bump()\n" +
-                "        c.n\n    k()\n    print(c.n)\n", cwr_used_after("c", "'bump', which takes '*self',", "C"))
+    cwr_refused(cwr_call + cwr_counter + "main()\n    var c = C(0, In(0))\n    var k = () ->\n        c.bump()\n" +
+                "        c.n\n    stash(k)\n    print(c.n)\n", cwr_used_after("c", "'bump', which takes '*self',", "C"))
 
 @test("a closure making a '*self' call on its copy cannot be held in a 'val'")
 cwr_self_call_val_refused()
@@ -491,7 +496,7 @@ cwr_self_call_through_shared()
 
     assert_eq(enm_ran(cwr_call + cwr_counter + "main()\n    val r: &C = C(0, In(0))\n" +
                       "    val shared = () -> r.bump()\n    shared()\n    shared()\n" +
-                      "    var x = C(0, In(0))\n    val p = &x\n    call(() -> p.bump())\n    print(r.n, x.n)\n"),
+                      "    var x = C(0, In(0))\n    val p = &x\n    run(() -> p.bump())\n    print(r.n, x.n)\n"),
               "2 1\n")
 
 @test("a counting closure reading back what its '*self' calls wrote")
