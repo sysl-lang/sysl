@@ -3719,7 +3719,53 @@ print(names.with((t) -> t.get("a").unwrap_or("none")))
 ```
 
 `t.get("a").unwrap_or("none").copy()` is accepted, and so is the `Map` itself held as a `&sync
-Mutex[...]` and captured. A struct of a program's own opts in the same way — `@guards(items)` above
+Mutex[...]` and captured.
+
+**A value the closure builds itself is fresh too** — a `Buf` it makes and fills with copies of what
+it guards, a struct or a variant holding one, or a call handed nothing that shares a count. A local
+stays fresh while everything written into it is fresh and it goes nowhere but out through the answer:
+calling the `Buf`'s own members on it, reading a length or an element out of it, and looping over it
+are all it may meet. A `.copy()` of a `Buf` is fresh where its elements hold no count; one of strings
+or of `Buf`s copies only the handles, and is refused:
+
+```sysl
+import sysl.buf.{Buf, buf}
+import sysl.threads.Mutex
+
+static var log: Mutex[Buf[u8]] = Mutex.new(buf())
+
+snapshot() -> Buf[u8] = log.with((b) ->
+    var copy: Buf[u8] = buf()
+    copy.extend(b.view())
+    copy)
+
+log.with((b) -> b.extend([1, 2, 3]))
+print(snapshot().view())
+```
+
+```output
+[1, 2, 3]
+```
+
+**The same local stored anywhere else as well is refused**, since the guarded value, or whatever it
+was handed to, would then share it — pushed into the guarded value, bound to a second name, handed to
+a function, its address taken, or written over with something captured:
+
+```sysl
+import sysl.buf.{Buf, buf}
+import sysl.threads.Mutex
+
+static var nest: Mutex[Buf[Buf[u8]]] = Mutex.new(buf())
+
+print(nest.with((b) ->
+    var fresh: Buf[u8] = buf()
+    b.push(fresh)
+    fresh).len())
+```
+
+```error
+but this answers a 'sysl.buf.Buf[byte]', whose 'core' reaches a '&sysl.buf.BufCore[byte]', whose count is not atomic. Answer what the caller needs from it — a count, a flag, a '.copy()' of a string, a value built fresh inside the closure — rather than the value itself
+``` A struct of a program's own opts in the same way — `@guards(items)` above
 it names a field that is `private`, and every member that answers something is held to the rule at
 its calls. **What is not checked** is a closure that *stores* something read out of the guarded
 value where it outlives the call — through a pointer it captured, say: nothing follows a counted
