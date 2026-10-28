@@ -702,7 +702,66 @@ private implements_bound(a: &Analysis, tr: Bound, t: Type) -> bool = t match
     // does, so a call is refused where it is written rather than inside a body already committed to.
     Pack(elems) -> every_satisfies(a, tr, elems)
     _ -> conforms(a, tr, t) || erased_satisfies(a, tr, t) || builtin_satisfies(a, tr, t) ||
-         debug_through(a, tr, t)
+         debug_through(a, tr, t) || referent_satisfies(a, tr, t)
+
+// **A reference or a pointer meets a bound its referent meets**, for the traits a member call on it
+// reaches the referent's members through (`reaches_through_reference`): `[T: Index[usize, int]]`
+// takes a `&Buf[int]` and a `*Buf[int]` as it takes the `Buf[int]`, and the body instantiated at
+// either reads `b[i]` off the buffer, as a member call written on one does. Only by a written
+// `impl`, or by a type parameter's own bounds: a membership the compiler gives a scalar by rule is
+// about the scalar's value and its operators, neither of which a reference to it has.
+private referent_satisfies(a: &Analysis, tr: Bound, t: Type) -> bool
+    val inner = bound_referent(t)
+
+    if inner.is_none() then return false
+
+    val raw = t match
+        Ptr(_) -> true
+        _ -> false
+
+    if !reaches_through_reference(a, tr, raw) then return false
+
+    referent_implements(a, tr, inner.unwrap())
+end referent_satisfies
+
+private referent_implements(a: &Analysis, tr: Bound, inner: Type) -> bool = inner match
+    Abstract(_, bounds) -> bound_promises(a, bounds, tr, inner)
+    _ -> conforms(a, tr, inner)
+
+// Why a reference is refused a bound its referent meets: the trait is one a reference does not reach
+// through (`through_reference_refusal`). Nothing where the referent does not meet it either -- that
+// is the referent's own refusal, and the ordinary one says it.
+private referent_shortfall(a: &Analysis, tr: Bound, t: Type) -> Option[string]
+    val inner = bound_referent(t)
+
+    // A reference to a reference: a member call reaches through one level and no further, and the
+    // bound agrees with it.
+    if inner.is_none()
+        val outer = pointee(t)
+
+        if outer.is_none() then return None
+
+        val deep = bound_referent(outer.unwrap())
+
+        if deep.is_some() && reaches_through_reference(a, tr, false) && referent_implements(a, tr, deep.unwrap()) then
+            return Some(s"${type_show(deep.unwrap())} does, two levels in — a bound sees through one " +
+                        "level of reference, as a member call does, so pass '*x'")
+
+        return None
+    end if
+
+    if !referent_implements(a, tr, inner.unwrap()) then return None
+
+    val raw = t match
+        Ptr(_) -> true
+        _ -> false
+
+    val why = through_reference_refusal(a, tr, raw)
+
+    if why.is_none() then return None
+
+    Some(s"${type_show(inner.unwrap())} implements it, but ${why.unwrap()}")
+end referent_shortfall
 
 // **A reference or a pointer is `Debug` where what it reaches is**, because a member call sees
 // through one level of `&` or `*` to find its receiver (`reference/traits.md § Any type may carry an
@@ -1012,6 +1071,12 @@ unmet_bound(a: &Analysis, tr: Bound, t: Type) -> Option[string]
     val short = erased_shortfall(a, tr, t)
 
     if short.is_some() then return short
+
+    // **A reference whose referent implements the trait** is refused for a reason worth saying, since
+    // a member call on the same reference would have reached that implementation.
+    val through = referent_shortfall(a, tr, t)
+
+    if through.is_some() then return through
 
     // A type that implements the trait at *other* arguments is a different situation from one that
     // does not implement it at all, and the advice differs with it: what is missing is one more

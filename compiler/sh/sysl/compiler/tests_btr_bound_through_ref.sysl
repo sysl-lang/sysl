@@ -1,0 +1,492 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.replace_all
+
+// **A reference meets a bound its referent meets** (`reference/generics.md § A reference meets its
+// referent's bounds`): `[C: Index[usize, int]]` takes a `&Buf[int]`, a `*Buf[int]` and a
+// `&sync Frozen[int]` as it takes the `Buf[int]`, and the body instantiated at each reaches the
+// referent's members exactly as a member call written on the reference does. The traits a call on a
+// reference does NOT reach through are refused, each with its reason: `Eq` and `Hash`, which a
+// reference meets by its own identity (`tests_rik_reference_identity_key.sysl` holds that rule, and
+// is unchanged); an operator's trait; a member naming `Self` away from its receiver; an associated
+// function; `&self` through a raw pointer; a compiler family; and a second level of reference.
+//
+// Skipped cells: bare metal and separate compilation, since nothing new is emitted -- the
+// instantiation is the ordinary one at a reference type, re-walked as any other is; literals and
+// layout, which the rule does not touch.
+
+private struct BtrRun
+    ok: bool
+    out: string
+    err: string
+
+private btr_ready() -> bool
+    if std_root().is_err() || !clang_available()
+        print("skipped: the library or the toolchain is not on this machine")
+        return false
+    end if
+
+    true
+end btr_ready
+
+private btr_root(text: string) -> string
+    val root = replace_all(make_temp_dir("sysl-btr").unwrap(), "//", "/")
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+    root
+end btr_root
+
+private btr_run(text: string) -> BtrRun
+    val root = btr_root(text)
+
+    force_alloc_counting(true)
+
+    val built = build_native_program(s"$root/main.sysl", None, None, DefaultOptimization,
+                                     Some(s"$root/built"))
+
+    force_alloc_counting(false)
+
+    built match
+        Err(why) ->
+            val said = replace_all(failure_text(why), s"$root/", "")
+
+            remove_dir_all(root).unwrap_or(())
+            return BtrRun(false, said, "")
+        Ok(_) -> ()
+
+    val said = capture(s"$root/built", [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> BtrRun(false, "could not be started", "")
+        Ok(o) -> BtrRun(o.status.ok(), o.text, o.err.unwrap_or(""))
+end btr_run
+
+// The program ran to the end, printed `want`, and gave back every allocation it made.
+private btr_prints(text: string, want: string)
+    val run = btr_run(text)
+
+    assert(run.ok, run.out)
+    assert_eq(run.out, want)
+    assert(alloc_count_reported(run.err) == 0, run.err)
+end btr_prints
+
+// The analysis report a program is refused with.
+private btr_report(text: string) -> string
+    val root = btr_root(text)
+
+    val out = emit_llvm_text(s"$root/main.sysl", None) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> if made.report.is_empty() then "" else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    replace_all(out, s"$root/", "")
+end btr_report
+
+// The program is refused, and the report says `want`.
+private btr_refused(text: string, want: string)
+    val said = btr_report(text)
+
+    assert(said.contains(want), said)
+end btr_refused
+
+private btr_lib() -> string = raw"""
+    import sysl.buf.{Buf, buf, Frozen}
+
+    read_at[C: Index[usize, int]](c: C, i: usize) -> int = c[i]
+
+    write_at[C: IndexSet[usize, int]](c: C, i: usize, v: int)
+        var w = c
+        w.index_set(i, v)
+
+    bump_at[C: IndexPlace[usize, int]](c: C, i: usize)
+        c[i] += 100
+
+    """
+
+// -- the subscript traits ---------------------------------------------------------------------------
+
+@test("an Index bound takes a Buf, a &Buf and a *Buf, and one generic is instantiated at all three")
+btr_index_at_value_reference_and_pointer()
+    if !btr_ready() then return
+
+    btr_prints(btr_lib() + raw"""
+        main()
+            var b: Buf[int] = buf()
+            b.push(1)
+            b.push(2)
+            val r: &Buf[int] = b
+            print(read_at(b, 0), read_at(r, 1), read_at(&b, 0), read_at(r, 0) + read_at(b, 1))
+        """, "1 2 1 3\n")
+
+@test("an Index bound takes a '&sync Frozen' (the frozen buffer's own Index)")
+btr_index_at_sync_frozen()
+    if !btr_ready() then return
+
+    btr_prints(btr_lib() + raw"""
+        sum[C: Index[usize, int]](c: C, n: usize) -> int
+            var s = 0
+            for i in 0..<n
+                s += c[i]
+            s
+
+        main()
+            var b: Buf[int] = buf()
+            b.push(30)
+            b.push(12)
+            val f: &sync Frozen[int] = b.freeze()
+            print(sum(f, 2), read_at(f, 1))
+        """, "42 12\n")
+
+@test("a write through an IndexSet bound at a &Buf or a *Buf reaches the caller's buffer")
+btr_index_set_writes_reach_the_caller()
+    if !btr_ready() then return
+
+    btr_prints(btr_lib() + raw"""
+        main()
+            var b: Buf[int] = buf()
+            b.push(1)
+            b.push(2)
+            val r: &Buf[int] = b
+            write_at(r, 0, 10)
+            write_at(&b, 1, 20)
+            print(b[0], b[1], r[0])
+        """, "10 20 10\n")
+
+@test("a compound write through an IndexPlace bound at a &Buf or a *Buf lands in the caller's buffer")
+btr_index_place_writes_reach_the_caller()
+    if !btr_ready() then return
+
+    btr_prints(btr_lib() + raw"""
+        main()
+            var b: Buf[int] = buf()
+            b.push(1)
+            b.push(2)
+            val r: &Buf[int] = b
+            bump_at(r, 0)
+            bump_at(&b, 1)
+            print(b[0], b[1])
+        """, "101 102\n")
+
+// -- other traits -----------------------------------------------------------------------------------
+
+@test("a user trait's '*self' member through a bound at a &T and a *T changes the referent; by value, a copy")
+btr_user_trait_star_self()
+    if !btr_ready() then return
+
+    btr_prints(raw"""
+        trait Tick
+            tick(*self)
+            seen(self) -> int
+
+        struct Counter
+            n: int
+
+        impl Tick for Counter
+            tick(*self)
+                self.n += 1
+            seen(self) -> int = self.n
+
+        twice[T: Tick](t: T) -> int
+            var u = t
+            u.tick()
+            u.tick()
+            u.seen()
+
+        main()
+            val c: &Counter = Counter(0)
+            print(twice(c), c.n)
+            var d = Counter(5)
+            print(twice(&d), d.n)
+            print(twice(d), d.n)
+        """, "2 2\n7 7\n9 7\n")
+
+@test("a Display bound at a &P reaches P's display; at a *P the member call does too, and str shows the address as a concrete call does")
+btr_display_through()
+    if !btr_ready() then return
+
+    btr_prints(raw"""
+        struct P
+            x: int
+
+        impl Display for P
+            display(self, out: *Writer, fmt: FormatSpec) = display_pad(s"P<${self.x}>".bytes, out, fmt)
+
+        shown[T: Display](v: T) -> string = v.to_string()
+        interp[T: Display](v: T) -> string = s"${v}"
+
+        direct[T: Display](v: T)
+            v.display(stdout(), FormatSpec(0, -1, false))
+            print("")
+
+        main()
+            val p: &P = P(3)
+            var q = P(4)
+            val qp: *P = &q
+            print(shown(p), interp(p))
+            direct(p)
+            direct(qp)
+            print(qp.to_string() == shown(qp), interp(qp) == s"${qp}", shown(qp) == "P<4>")
+        """, "P<3> P<3>\nP<3>\nP<4>\ntrue true false\n")
+
+@test("an Iterate bound at a *Cursor and a &Cursor advances the caller's cursor, and 'I::Item' is the cursor's")
+btr_iterate_and_its_item()
+    if !btr_ready() then return
+
+    btr_prints(raw"""
+        struct Up
+            i: int
+            hi: int
+
+        impl Iterate for Up
+            type Item = int
+            next(*self) -> Option[int]
+                if self.i >= self.hi then return None
+                self.i += 1
+                Some(self.i)
+
+        first[I: Iterate](it: I) -> Option[I::Item]
+            var c = it
+            c.next()
+
+        total[I: Iterate[Item = int]](it: I) -> int
+            var s = 0
+            var c = it
+            loop
+                val n = c.next()
+                if n.is_none() then break
+                s += n.unwrap()
+            s
+
+        main()
+            var up = Up(0, 3)
+            print(first(&up).unwrap(), up.i)
+            val ur: &Up = Up(10, 12)
+            print(total(ur), ur.i, total(Up(0, 2)))
+        """, "1 1\n23 12 3\n")
+
+@test("a '&C' over a bounded parameter meets the same bound, at every instantiation")
+btr_reference_to_a_type_parameter()
+    if !btr_ready() then return
+
+    btr_prints(btr_lib() + raw"""
+        first_of[C: Index[usize, int]](c: C) -> int
+            val r: &C = c
+            read_at(r, 0)
+
+        main()
+            var b: Buf[int] = buf()
+            b.push(5)
+            print(first_of(b))
+        """, "5\n")
+
+@test("a generic type bounded on Index is made at a &Buf, and its methods reach the buffer")
+btr_generic_type_at_a_reference()
+    if !btr_ready() then return
+
+    btr_prints(btr_lib() + raw"""
+        struct Window[C: Index[usize, int]]
+            c: C
+            at: usize
+
+        impl[C: Index[usize, int]] Window[C]
+            read(self) -> int = self.c[self.at]
+
+        main()
+            var b: Buf[int] = buf()
+            b.push(4)
+            b.push(9)
+            val r: &Buf[int] = b
+            val w = Window(r, 1)
+            b[1] = 11
+            print(w.read(), Window(b, 0).read())
+        """, "11 4\n")
+
+// -- Eq and Hash stay identity ----------------------------------------------------------------------
+
+@test("one body bounded on Eq and Index at a &Buf compares identities and indexes the buffer")
+btr_eq_stays_identity_beside_index()
+    if !btr_ready() then return
+
+    btr_prints(btr_lib() + raw"""
+        probe[C: Eq + Index[usize, int]](a: C, b: C) -> (bool, int)
+            (a == b, a[0] + b[0])
+
+        main()
+            var x: Buf[int] = buf()
+            x.push(1)
+            var y: Buf[int] = buf()
+            y.push(1)
+            val rx: &Buf[int] = x
+            val ry: &Buf[int] = y
+            val (s1, n1) = probe(rx, ry)
+            val (s2, n2) = probe(rx, rx)
+            print(s1, n1, s2, n2)
+        """, "false 2 true 2\n")
+
+// -- what is refused --------------------------------------------------------------------------------
+
+private btr_n() -> string = raw"""
+    import sysl.buf.{Buf, buf}
+
+    struct N
+        v: int
+
+    read_at[C: Index[usize, int]](c: C, i: usize) -> int = c[i]
+
+    """
+
+@test("a reference whose referent lacks the bound is refused, naming the reference")
+btr_refused_referent_lacks_it()
+    if !btr_ready() then return
+
+    btr_refused(btr_n() + raw"""
+        main()
+            val n: &N = N(1)
+            print(read_at(n, 0))
+        """, "'read_at' requires its type parameter 'C' to implement 'sysl.Index[usize, int]', but &N does not\n")
+
+@test("a reference to a reference is refused: a bound sees through one level, as a member call does")
+btr_refused_two_levels()
+    if !btr_ready() then return
+
+    btr_refused(btr_n() + raw"""
+        main()
+            val b: Buf[int] = buf()
+            val rb: &Buf[int] = b
+            val rr: & &Buf[int] = rb
+            print(read_at(rr, 0))
+        """, "but &&sysl.buf.Buf[int] does not — sysl.buf.Buf[int] does, two levels in — a bound sees " +
+             "through one level of reference, as a member call does, so pass '*x'")
+
+@test("Ord is refused at a reference: it is an operator's, and '<' does not see through one")
+btr_refused_ord()
+    if !btr_ready() then return
+
+    btr_refused(btr_n() + raw"""
+        impl Ord for N
+            lt(self, rhs: N) -> bool = self.v < rhs.v
+
+        least[T: Ord](a: T, b: T) -> bool = a < b
+
+        main()
+            val n: &N = N(1)
+            print(least(n, n))
+        """, "but &N does not — N implements it, but 'sysl.Ord' is an operator's, and an operator does " +
+             "not see through a reference")
+
+@test("an operator trait at explicit arguments is refused at a reference too (Add[int] at &int)")
+btr_refused_add_and_family()
+    if !btr_ready() then return
+
+    btr_refused(btr_n() + raw"""
+        plus[T: Add[int]](a: T) -> int = 0
+
+        main()
+            val i: &int = 3
+            print(plus(i))
+        """, "'plus' requires its type parameter 'T' to implement 'sysl.Add[int]', but &int does not")
+
+    btr_refused(btr_n() + raw"""
+        whole[T: Integer](a: T) -> int = 0
+
+        main()
+            val i: &int = 3
+            print(whole(i))
+        """, "'whole' requires its type parameter 'T' to implement 'sysl.Integer', but &int does not")
+
+@test("a member naming Self away from its receiver keeps a reference out")
+btr_refused_self_away_from_receiver()
+    if !btr_ready() then return
+
+    btr_refused(btr_n() + raw"""
+        trait Merge
+            merge(self, other: Self) -> int
+
+        impl Merge for N
+            merge(self, other: N) -> int = self.v + other.v
+
+        merged[T: Merge](a: T, b: T) -> int = a.merge(b)
+
+        main()
+            val n: &N = N(1)
+            print(merged(n, n))
+        """, "but &N does not — N implements it, but 'merge' of 'Merge' mentions 'Self' away from its " +
+             "receiver, which would be the reference in the body and the referent in the implementation")
+
+@test("an associated function keeps a reference out: it is reached through the type")
+btr_refused_associated_function()
+    if !btr_ready() then return
+
+    btr_refused(btr_n() + raw"""
+        trait Make
+            make() -> int
+            get(self) -> int
+
+        impl Make for N
+            make() -> int = 1
+            get(self) -> int = self.v
+
+        made[T: Make](a: T) -> int = a.get() + T.make()
+
+        main()
+            val n: &N = N(1)
+            print(made(n))
+        """, "but &N does not — N implements it, but 'make' of 'Make' is reached through the type, and a " +
+             "reference's type has none of its referent's associated members")
+
+@test("a trait requiring Eq keeps a reference out, since the reference's Eq is its identity")
+btr_refused_trait_requiring_eq()
+    if !btr_ready() then return
+
+    btr_refused(btr_n() + raw"""
+        trait Keyed: Eq
+            key(self) -> int
+
+        impl Eq for N
+            eq(self, other: N) -> bool = self.v == other.v
+
+        impl Keyed for N
+            key(self) -> int = self.v
+
+        keyed[T: Keyed](a: T) -> int = a.key()
+
+        main()
+            val n: &N = N(1)
+            print(keyed(n))
+        """, "but &N does not — N implements it, but a reference meets 'sysl.Eq' by its own identity, " +
+             "never by what it points at")
+
+@test("a '&self' member is reached through a &T and refused through a *T")
+btr_ref_self_member()
+    if !btr_ready() then return
+
+    val lib = btr_n() + raw"""
+        trait Boxed
+            peek(&self) -> int
+
+        impl Boxed for N
+            peek(&self) -> int = self.v
+
+        peeked[T: Boxed](a: T) -> int = a.peek()
+
+        """
+
+    btr_prints(lib + raw"""
+        main()
+            val n: &N = N(6)
+            print(peeked(n))
+        """, "6\n")
+
+    btr_refused(lib + raw"""
+        main()
+            var m = N(2)
+            print(peeked(&m))
+        """, "but *N does not — N implements it, but 'peek' of 'Boxed' takes '&self', which needs the " +
+             "counted box a pointer does not carry — pass a '&' reference instead")

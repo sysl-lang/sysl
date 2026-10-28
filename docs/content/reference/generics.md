@@ -832,6 +832,99 @@ print(first_of(&d, n -> n * 10).expect("a step"))
 
 `n` is an `int` because `Down` declares `type Item = int`; `first_of` never mentions `int`.
 
+### A reference meets its referent's bounds
+
+A member call sees through one level of `&` or `*` ([traits]({{< ref "traits" >}})), so `r[i]` and
+`r.len()` on a `&Buf[int]` reach the buffer. A bound agrees with it: a `&T`, a `&sync T` or a `*T`
+meets `B` wherever `T` does, and the body, instantiated at the reference, reaches the referent's
+members exactly as the same call written on the reference would. A write through one lands in the
+object the caller holds, and an associated type is the referent's:
+
+```sysl
+import sysl.buf.{Buf, buf}
+
+read_at[C: Index[usize, int]](c: C, i: usize) -> int = c[i]
+
+write_at[C: IndexSet[usize, int]](c: C, i: usize, v: int)
+    var w = c
+    w.index_set(i, v)
+
+struct Up
+    i: int
+    hi: int
+
+impl Iterate for Up
+    type Item = int
+
+    next(*self) -> Option[int]
+        if self.i >= self.hi then return None
+
+        self.i += 1
+        Some(self.i)
+
+first[I: Iterate](it: I) -> Option[I::Item]
+    var c = it
+    c.next()
+
+main()
+    var b: Buf[int] = buf()
+    b.push(1)
+    b.push(2)
+
+    val r: &Buf[int] = b
+
+    write_at(r, 0, 10)
+    write_at(&b, 1, 20)
+    print(read_at(b, 0), read_at(r, 1), read_at(&b, 0))
+
+    var up = Up(0, 3)
+
+    print(first(&up).unwrap(), up.i)
+```
+
+```output
+10 20 10
+1 1
+```
+
+**It is the traits a call on a reference reaches its referent through, and no others.** A reference
+is refused a bound its referent meets where that would make the body do something the same call on
+the reference does not, and the refusal says which:
+
+- **`Eq` and `Hash` are the reference's own identity** ([memory]({{< ref "memory" >}})), never the
+  referent's, and so is a trait that requires either;
+- **an operator's trait** — `Ord`, `Add` and the rest — since `a < b` and `a + b` do not see through a
+  reference;
+- **a member naming `Self` away from its receiver**, such as `merge(self, other: Self)`, since `Self`
+  would be the reference in the body and the referent in the implementation;
+- **an associated function or a static property**, which is reached through the type, and a
+  reference's type has none of its referent's;
+- **through a `*T`, a member taking `&self`**, which needs the counted box a pointer does not carry;
+- **a second level**: a `& &Buf[int]` meets nothing through the buffer, as `rr.len()` does not reach it.
+
+```sysl
+struct N
+    v: int
+
+impl Ord for N
+    lt(self, rhs: N) -> bool = self.v < rhs.v
+
+least[T: Ord](a: T, b: T) -> bool = a < b
+
+main()
+    val n: &N = N(1)
+    print(least(n, n))
+```
+
+```error
+'least' requires its type parameter 'T' to implement 'sysl.Ord', but &N does not — N implements it, but 'sysl.Ord' is an operator's, and an operator does not see through a reference
+```
+
+`Display` and `Debug` are reached through, so `v.display(…)` on a `T` at `*P` is `P`'s. What
+`str(v)`, `v.to_string()` and `s"${v}"` render is decided by the rule for showing a value, and a raw
+pointer is shown as its address there ([traits]({{< ref "traits" >}})), at `T = *P` as on a `*P`
+local.
+
 ### A trait object satisfies a bound on the trait it dispatches through
 
 A bound asks whether the members it names can be called on the value. A `*Trait` or a `&Trait` does
