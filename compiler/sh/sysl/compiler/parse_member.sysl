@@ -898,16 +898,23 @@ private parse_derive_member(p: *Parser) -> Option[DeriveDecl]
         return None
     end if
 
-    val mode = derive_receiver(p, param)
+    // **A list that does not open with `self` writes a member with no receiver** -- an associated
+    // function such as `decode(d: *D) -> Self`, called `T.decode(d)` -- and every parameter is the
+    // member's own. One that does open with `self` names the deriving type as the receiver.
+    if p.at_kw("self")
+        val mode = derive_receiver(p, param)
 
-    if mode.is_none()
-        p.fault(p.here(), s"a 'derive' member takes the deriving type first, as 'self: $param' (or " +
-                s"'self: *$param', 'self: &$param') — it is the receiver of the member it writes")
-        skip_line(p)
-        return None
+        if mode.is_none()
+            p.fault(p.here(), s"a 'derive' member takes the deriving type first, as 'self: $param' (or " +
+                    s"'self: *$param', 'self: &$param') — it is the receiver of the member it writes")
+            skip_line(p)
+            return None
+        end if
+
+        decl.receiver = mode
+    else if !p.at_kw(")")
+        decl.params.push(parse_func_param(p))
     end if
-
-    decl.receiver = mode
 
     loop
         if !p.accept_kw(",") then break
@@ -1018,13 +1025,23 @@ private check_derive_members(p: *Parser, decl: TraitDecl)
 
         val tm = declared.unwrap()
 
-        if tm.is_property || !same_receiver(tm.recv_mode(), m.receiver)
+        if !tm.is_property && tm.recv_mode().is_none() && m.receiver.is_some()
+            p.fault(m.span, s"'derive' member '${m.name}' takes a receiver, but the '${m.name}' trait " +
+                    s"'${decl.name}' declares takes none — a member with no receiver is derived with " +
+                    s"no 'self', as 'derive[${d.param}] ${m.name}(…)'")
+        else if !tm.is_property && tm.recv_mode().is_some() && m.receiver.is_none()
+            p.fault(m.span, s"'derive' member '${m.name}' takes no receiver, but the '${m.name}' trait " +
+                    s"'${decl.name}' declares takes one — write the deriving type first, as " +
+                    s"'self: ${d.param}'")
+        else if tm.is_property || !same_receiver(tm.recv_mode(), m.receiver)
             p.fault(m.span, s"'derive' member '${m.name}' takes its receiver differently from the " +
                     s"'${m.name}' trait '${decl.name}' declares — 'self: ${d.param}' is 'self', " +
                     s"'self: *${d.param}' is '*self' and 'self: &${d.param}' is '&self'")
         else if tm.params.len() != m.params.len()
-            p.fault(m.span, s"'derive' member '${m.name}' takes ${m.params.len()} parameters after " +
-                    s"'self', but trait '${decl.name}' declares ${tm.params.len()}")
+            val after = if m.receiver.is_some() then " after 'self'" else ""
+
+            p.fault(m.span, s"'derive' member '${m.name}' takes ${m.params.len()} parameters$after, " +
+                    s"but trait '${decl.name}' declares ${tm.params.len()}")
         else if tm.tparams.len() != m.tparams.len()
             p.fault(m.span, s"'derive' member '${m.name}' declares ${m.tparams.len()} type " +
                     s"parameters of its own, but the '${m.name}' trait '${decl.name}' declares " +
