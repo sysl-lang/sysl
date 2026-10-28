@@ -1040,35 +1040,18 @@ for_expr(cx: &Analyzer, span: Span, label: Option[string], name: string, iter: E
         val lo = bounds.unwrap().0
         val hi = bounds.unwrap().1
         val inclusive = bounds.unwrap().2
-        var ends: Buf[Expr] = buf()
 
-        ends.push(lo)
-        ends.push(hi)
+        if !counted_open(lo, hi) then
+            return counted_for(cx, span, label, name, lo, hi, inclusive, body, else_body, expected,
+                               discarded, None, None)
 
-        val ts = analyze_operands(cx, ends, None, true)
-        val tlo = ts.at(0)
-        val thi = ts.at(1)
+        // Both bounds bare literals: the variable takes its type from its first use that fixes one,
+        // exactly as a literal binding does (`var_first_use.sysl`), and the bounds take it too.
+        val at = iter.span.start
 
-        if disagree(texpr_type(tlo), texpr_type(thi)) then
-            cx.fault(span, s"a 'for' range needs matching bounds, got " +
-                     s"${type_show(texpr_type(tlo))} and ${type_show(texpr_type(thi))}")
-
-        val vty = counted_type(cx, span, "for", texpr_type(tlo))
-
-        cx.enter()
-
-        val u = cx.bind(name, vty, name_after_keyword(cx, span.start, name))
-        val ctx = open_loop(cx, span, expected, label)
-        val tb = loop_stmts(cx, body)
-
-        close_loop(cx, ctx)
-        cx.leave()
-
-        val telse = else_body.map(b -> type_value_block(cx, b, expected, discarded))
-        val ty = loop_result_type(cx, span, ctx, telse)
-
-        return checked_loop(ctx, span,
-                            TExpr(span, TFor(u, vty, tlo, thi, inclusive, tb, telse, ty)))
+        return counted_first_use_read(cx, at, fixed ->
+            counted_for(cx, span, label, name, lo, hi, inclusive, body, else_body, expected,
+                        discarded, fixed, if fixed.is_none() then Some(at) else None))
     end if
 
     val seq = walked_through(cx, span, auto_deref(cx, type_expr_bare(cx, iter)))
@@ -1097,6 +1080,45 @@ for_expr(cx: &Analyzer, span: Span, label: Option[string], name: string, iter: E
 
     checked_loop(ctx, span, TExpr(span, TForEach(u, elem.unwrap(), seq, tb, telse, ty)))
 end for_expr
+
+// `for i in lo..hi`, its bounds read at `fixed` where a use fixed their type. `open` is where the
+// range starts when its variable is one waiting for that use.
+private counted_for(cx: &Analyzer, span: Span, label: Option[string], name: string, lo: Expr,
+                    hi: Expr, inclusive: bool, body: Buf[Stmt], else_body: Option[Buf[Stmt]],
+                    expected: Option[Type], discarded: bool, fixed: Option[Type],
+                    open: Option[usize]) -> TExpr
+    var ends: Buf[Expr] = buf()
+
+    ends.push(lo)
+    ends.push(hi)
+
+    val ts = analyze_operands(cx, ends, fixed, true)
+    val tlo = ts.at(0)
+    val thi = ts.at(1)
+
+    if disagree(texpr_type(tlo), texpr_type(thi)) then
+        cx.fault(span, s"a 'for' range needs matching bounds, got " +
+                 s"${type_show(texpr_type(tlo))} and ${type_show(texpr_type(thi))}")
+
+    val vty = counted_type(cx, span, "for", texpr_type(tlo))
+
+    cx.enter()
+
+    val u = cx.bind(name, vty, name_after_keyword(cx, span.start, name))
+
+    if open.is_some() then open_counted(cx, open.unwrap(), lo, u)
+
+    val ctx = open_loop(cx, span, expected, label)
+    val tb = loop_stmts(cx, body)
+
+    close_loop(cx, ctx)
+    cx.leave()
+
+    val telse = else_body.map(b -> type_value_block(cx, b, expected, discarded))
+    val ty = loop_result_type(cx, span, ctx, telse)
+
+    checked_loop(ctx, span, TExpr(span, TFor(u, vty, tlo, thi, inclusive, tb, telse, ty)))
+end counted_for
 
 // `for x in c` where `c` is a **cursor** -- a value whose type implements `Iterate`.
 //
