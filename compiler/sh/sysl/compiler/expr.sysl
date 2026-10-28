@@ -1753,8 +1753,25 @@ private scalar_subject_widened(cx: &Analyzer, span: Span, op: string, l: Expr, t
 end scalar_subject_widened
 
 // The two operands of a binary operator, read as a pair that shares one type.
+//
+// **A shift is not a pair**: its result is its left operand's type, and its count may be any
+// integer. So a left operand with no type of its own -- `1`, or an `if` of literals -- takes the
+// type of the position the shift stands in, never the count's: `level |= 1 << bit` over a `u32`
+// level and an `int` bit is a `u32` shift.
 private paired_operands(cx: &Analyzer, op: string, l: Expr, r: Expr,
                         numeric: Option[Type]) -> (TExpr, TExpr)
+    if (op == "<<" || op == ">>") && literal_valued(cx, l) && !literal_valued(cx, r)
+        var left: Buf[Expr] = buf()
+        var count: Buf[Expr] = buf()
+
+        left.push(l)
+        count.push(r)
+
+        val tl = analyze_operands(cx, left, numeric).at(0)
+
+        return (tl, operand_rhs(cx, op, tl, r, analyze_operands(cx, count, None).at(0)))
+    end if
+
     var operands: Buf[Expr] = buf()
 
     operands.push(l)
@@ -1918,7 +1935,16 @@ analyze_operands(cx: &Analyzer, operands: Buf[Expr], expected: Option[Type],
     // operand, an open binding keeps its default and the operand widens to it.
     if compared && !cx.open_vars.is_empty() then compare_fixes(cx, operands, own)
 
-    val settled = firmest(operands, own, widen, rescales).or_else(() -> expected)
+    // **An operand that comes to a literal on every path is in the literal's tier** -- an `if` or a
+    // `match` of literals, `1 << bit`, literal arithmetic (`literal_valued`). It was read above, at
+    // the position's type or its default, but that reading is no more its own than a bare literal's
+    // `int` is, so the pair does not take its type from it.
+    var soft: Buf[bool] = buf()
+
+    for e in operands
+        soft.push(!is_literal(e) && literal_valued(cx, e))
+
+    val settled = firmest(operands, unless_soft(own, soft), widen, rescales).or_else(() -> expected)
     var told: Buf[Option[TExpr]] = buf()
 
     for i in 0..<operands.len()
@@ -1928,7 +1954,8 @@ analyze_operands(cx: &Analyzer, operands: Buf[Expr], expected: Option[Type],
         else if is_literal(e) then told.push(None)
         else told.push(Some(type_expr_unwidened(cx, e, settled)))
 
-    val ty = literal_widened(cx, operands, told, firmest(operands, told, widen, rescales).or_else(() -> expected),
+    val firm = unless_soft(told, soft)
+    val ty = literal_widened(cx, operands, firm, told, firmest(operands, firm, widen, rescales).or_else(() -> expected),
                              expected, widen, rescales).or_else(() -> if widen then float_among(operands) else None)
     var out: Buf[TExpr] = buf()
 
@@ -1956,26 +1983,57 @@ end analyze_operands
 //
 // **So does a position whose type the default would not reach**: `val z: u8 = b + 300` is told the
 // literal does not fit a byte, which is the mistake, rather than that an `int` sum is no byte.
-private literal_widened(cx: &Analyzer, operands: Buf[Expr], told: Buf[Option[TExpr]],
-                        settled: Option[Type], expected: Option[Type], widen: bool,
-                        rescales: bool) -> Option[Type]
-    if !widen || settled.is_none() || !any_typed(operands, told) then return settled
+//
+// **An operand in the literal's tier that is not a bare literal** (`firm` holds `None` there, `told`
+// its reading) is the same case: `b | (if c then 300 else 1)` is an `int` as `b | 300` is, its
+// reading at its default standing for the literal's default.
+private literal_widened(cx: &Analyzer, operands: Buf[Expr], firm: Buf[Option[TExpr]],
+                        told: Buf[Option[TExpr]], settled: Option[Type], expected: Option[Type],
+                        widen: bool, rescales: bool) -> Option[Type]
+    if !widen || settled.is_none() || !any_typed(operands, firm) then return settled
 
     var ty = settled.unwrap()
 
     for i in 0..<operands.len()
         val e = operands.at(i)
 
-        if told.at(i).is_none() && is_literal(e)
+        if firm.at(i).is_none() && is_literal(e)
             val own = literal_default(e)
 
             if own.is_some() && !type_eq(own.unwrap(), ty) && reaches_position(own.unwrap(), expected) &&
                     !literal_fits(cx, e, ty) && literal_fits(cx, e, own.unwrap()) &&
-                    holds_every_operand(operands, told, own.unwrap(), rescales) then
+                    holds_every_operand(operands, firm, own.unwrap(), rescales) then
                 ty = own.unwrap()
+        else if firm.at(i).is_none() && told.at(i).is_some()
+            val own = repr(texpr_type(told.at(i).unwrap()))
+
+            if own != Unknown && !type_eq(own, ty) && reaches_position(own, expected) &&
+                    !reads_at(cx, e, ty) && holds_every_operand(operands, firm, own, rescales) then
+                ty = own
 
     Some(ty)
 end literal_widened
+
+// The readings with every operand in the literal's tier taken out, as the pair's type is worked out
+// from the rest.
+private unless_soft(read: Buf[Option[TExpr]], soft: Buf[bool]) -> Buf[Option[TExpr]]
+    var out: Buf[Option[TExpr]] = buf()
+
+    for i in 0..<read.len()
+        out.push(if soft.at(i) then None else read.at(i))
+
+    out
+end unless_soft
+
+// Whether an expression reads at a type without a complaint, everything it said put back either way.
+private reads_at(cx: &Analyzer, e: Expr, ty: Type) -> bool
+    val tried = begin_trial(cx)
+    val t = analyze_expected(cx, e, Some(ty))
+    val ok = !refused_since(cx, tried) && texpr_type(t) != Unknown && !disagree(texpr_type(t), ty)
+
+    discard_trial(cx, tried)
+    ok
+end reads_at
 
 // **Where only literals meet and one of them is a float, the pair is that float**: `1 + 2.0` is a
 // `real` sum and `[1.5, 2]` a `[2]real`, the integer literal being read as the float where it holds
