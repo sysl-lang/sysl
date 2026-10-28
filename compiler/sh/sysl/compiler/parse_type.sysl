@@ -27,10 +27,13 @@ end begins_type_word
 // A type, including the bare-arrow function form written over it.
 //
 // `A -> R` and `(A, B) -> R` are the same node: a parenthesised list before an arrow is the
-// parameter list rather than a tuple, which is what the second arm below says.
+// parameter list rather than a tuple, which is what the second arm below says. **Whether a
+// parenthesised list is a parameter list is learned from the token after its `)`**, so this is the
+// one place that reads one knowing an arrow may follow: `(string) -> int` takes one parameter, while
+// `(string)` with no arrow is still a type in parentheses and refused.
 parse_type(p: *Parser) -> TypeRef
     val start = p.here()
-    val t = parse_core_type(p)
+    val t = if p.at_kw("(") && !p.kw_at(1, ")") then parse_tuple_type(p, start, true) else parse_core_type(p)
 
     if !p.accept_kw("->") then return t
 
@@ -93,7 +96,7 @@ parse_core_type(p: *Parser) -> TypeRef
         return type_ref(start.to(p.just_taken()), VolatileType(inner))
     end if
 
-    if p.at_kw("(") then return parse_tuple_type(p, start)
+    if p.at_kw("(") then return parse_tuple_type(p, start, false)
 
     // A bare `..A` parses so that the analyzer can say what a pack is and where one may be written.
     // Left to the grammar it would be a stray token, and the reader would be told a newline was
@@ -280,8 +283,9 @@ private parse_lane_count(p: *Parser) -> Expr
     parse_expr_bp(p, PostfixPower)
 end parse_lane_count
 
-// `(A, B)`, and the pack tuple `(..A)`.
-private parse_tuple_type(p: *Parser, start: Span) -> TypeRef
+// `(A, B)`, and the pack tuple `(..A)`. With `params`, a list of one followed by `->` is handed back
+// whole for `parse_type` to make the parameter list of a function type.
+private parse_tuple_type(p: *Parser, start: Span, params: bool) -> TypeRef
     p.bump()
 
     if p.at_kw("..")
@@ -319,7 +323,7 @@ private parse_tuple_type(p: *Parser, start: Span) -> TypeRef
 
     // A product of one thing is that thing, so `(T)` is a type in parentheses and not a tuple. The
     // reference anchors it at the token after the ')', where the reading learned it had one part.
-    if parts.len() == 1
+    if parts.len() == 1 && !(params && p.at_kw("->"))
         val shown = type_text(parts.at(0))
 
         p.fault(p.here(), s"'(${shown})' is a type in parentheses, and a tuple has two or more parts " +

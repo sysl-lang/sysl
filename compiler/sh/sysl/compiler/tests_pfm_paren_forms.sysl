@@ -1,0 +1,290 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// Two parenthesised forms whose meaning is learned from what follows them.
+//
+// A parenthesised list of types followed by `->` is a function type's parameter list, so
+// `(string) -> int` takes one parameter as `(A, B) -> R` takes two; `(string)` with no arrow is
+// still a type in parentheses, and refused (`reference/types.md`).
+//
+// A tuple of places on the left of an assignment is the parenthesised spelling of a multiple
+// assignment, so `(lo, hi) = pair(5)` is `lo, hi = pair(5)` (`reference/expressions.md § Several
+// places at once`): every operator, value list and place the bare form takes, and every refusal it
+// makes, with the same words.
+//
+// Cells skipped: layout, bare metal, module storage and separate compilation — both forms are
+// rewritten by the parser into the node the bare spelling already makes, so nothing below the
+// parser sees a difference.
+
+private pfm_ready() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+
+    true
+end pfm_ready
+
+private pfm_ran(text: string) -> string
+    val root = make_temp_dir("sysl-pfm").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end pfm_ran
+
+private pfm_err(text: string) -> string
+    val root = make_temp_dir("sysl-pfm").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    val out = emit_llvm_text(src, None) match
+        Err(why) -> why.message
+        Ok(made) -> if made.report.is_empty() then "" else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end pfm_err
+
+// -- a function type of one parameter ----------------------------------------------------------------
+
+@test("a parenthesised list of one type before '->' is a one-parameter function type")
+pfm_one_parameter()
+    if !pfm_ready() then return
+
+    assert_eq(pfm_ran(raw"""
+        apply(f: (string) -> usize, s: string) -> usize = f(s)
+        print(apply(t -> t.len, "four"))
+        """), "4\n")
+
+@test("empty parentheses before '->' are a function type of no parameters")
+pfm_zero_parameters()
+    if !pfm_ready() then return
+
+    assert_eq(pfm_ran(raw"""
+        call(f: () -> int) -> int = f()
+        print(call(() -> 9))
+        """), "9\n")
+
+@test("the one parameter may itself be a tuple")
+pfm_a_tuple_parameter()
+    if !pfm_ready() then return
+
+    assert_eq(pfm_ran(raw"""
+        sum(f: ((int, int)) -> int) -> int = f((3, 4))
+        print(sum(t -> t.0 + t.1))
+        """), "7\n")
+
+@test("the one parameter may itself be a function type")
+pfm_a_function_parameter()
+    if !pfm_ready() then return
+
+    assert_eq(pfm_ran(raw"""
+        twice(f: (&Fn(int) -> int) -> int) -> int = f(x -> x * 2)
+        print(twice(g -> g(21)))
+        """), "42\n")
+
+@test("a one-parameter function type in a generic function")
+pfm_generic()
+    if !pfm_ready() then return
+
+    assert_eq(pfm_ran(raw"""
+        apply[T](f: (T) -> T, x: T) -> T = f(x)
+        print(apply(n -> n + 1, 41))
+        print(apply(s -> s + "!", "hi"))
+        """), "42\nhi!\n")
+
+@test("one parameter and two read the same where a bare function type may not stand")
+pfm_outside_a_parameter()
+    if !pfm_ready() then return
+
+    // The parse is what changed: a field, an element type and a result reach the analyzer's own rule
+    // for a bare function type, exactly as the two-parameter spelling does.
+    val rule = "is a callable a function is passed and does not keep, which only a parameter may be"
+
+    for shape in ["struct H\n    f: (int) -> int\n", "var fs: Buf[(int) -> int] = buf()\n",
+                  "make() -> (int) -> int = x -> x\n", "struct H\n    f: (int, int) -> int\n"]
+        val said = pfm_err(shape)
+
+        assert(said.contains(rule), said)
+        assert(!said.contains("a type in parentheses"), said)
+end pfm_outside_a_parameter
+
+@test("a type in parentheses with no arrow after it is still refused")
+pfm_a_type_in_parentheses()
+    if !pfm_ready() then return
+
+    val said = pfm_err("f(s: (string)) -> int = 1\n")
+
+    assert(said.contains("'(string)' is a type in parentheses, and a tuple has two or more parts " +
+                         "\u{2014} a product of one thing is that thing, so write 'string'"), said)
+    assert(said.contains("1:14"), said)
+
+@test("a type in parentheses inside a parameter list is refused even before an arrow")
+pfm_parenthesised_inside_a_list()
+    if !pfm_ready() then return
+
+    val said = pfm_err("f(g: ((int), int) -> int) -> int = 1\n")
+
+    assert(said.contains("'(int)' is a type in parentheses"), said)
+
+// -- the parenthesised multiple assignment -----------------------------------------------------------
+
+private pfm_pair() -> string = "pair(n: int) -> (int, int) = (n, n * 2)\nvar lo = 0\nvar hi = 0\n"
+
+@test("a tuple of places takes a call's results, as the bare list does")
+pfm_the_reported_case()
+    if !pfm_ready() then return
+
+    assert_eq(pfm_ran(pfm_pair() + raw"""
+        (lo, hi) = pair(5)
+        print(lo, hi)
+        lo, hi = pair(6)
+        print(lo, hi)
+        """), "5 10\n6 12\n")
+
+@test("a parenthesised swap reads both values before writing either")
+pfm_swap()
+    if !pfm_ready() then return
+
+    assert_eq(pfm_ran(raw"""
+        var a = 1
+        var b = 2
+        (a, b) = (b, a)
+        print(a, b)
+        var s = "left"
+        var t = "right"
+        (s, t) = (t, s)
+        print(s, t)
+        """), "2 1\nright left\n")
+
+@test("a parenthesised list of places takes a comma list of values and a compound operator")
+pfm_value_list_and_compound()
+    if !pfm_ready() then return
+
+    assert_eq(pfm_ran(pfm_pair() + raw"""
+        (lo, hi) = 1, 2
+        print(lo, hi)
+        (lo, hi) += hi, lo
+        print(lo, hi)
+        """), "1 2\n3 3\n")
+
+@test("fields and elements are places inside the parentheses")
+pfm_fields_and_elements()
+    if !pfm_ready() then return
+
+    assert_eq(pfm_ran(raw"""
+        struct S
+            x: int
+            y: int
+        var s = S(1, 2)
+        var xs = [7, 8, 9]
+        val p = &xs[0]
+        (s.x, xs[2]) = (xs[2], s.x)
+        (*p, s.y) = 70, 20
+        print(s.x, s.y, xs[0], xs[2])
+        """), "9 20 70 1\n")
+
+@test("a parenthesised multiple assignment as a line of a bracketed closure keeps its commas")
+pfm_inside_a_bracket()
+    if !pfm_ready() then return
+
+    // A closure captures by value, so the places are written through pointers to be seen outside.
+    assert_eq(pfm_ran(raw"""
+        call(f: () -> unit) = f()
+        var a = 1
+        var b = 2
+        val pa = &a
+        val pb = &b
+        call(() ->
+            (*pa, *pb) = 5, 6
+            print(*pa + *pb))
+        call(() ->
+            print(a + b)
+            (*pa, *pb) = 20, 10)
+        print(a * 10 + b)
+        """), "11\n11\n210\n")
+
+@test("a parenthesised multiple assignment as an inline branch")
+pfm_inline_branch()
+    if !pfm_ready() then return
+
+    assert_eq(pfm_ran(pfm_pair() + raw"""
+        if lo == 0 then (lo, hi) = pair(3)
+        print(lo, hi)
+        """), "3 6\n")
+
+@test("a value that is not a place inside the parentheses is refused as in the bare list")
+pfm_not_a_place()
+    if !pfm_ready() then return
+
+    val said = pfm_err(pfm_pair() + "(1, hi) = pair(5)\n")
+    val bare = pfm_err(pfm_pair() + "1, hi = pair(5)\n")
+
+    assert(said.contains("assignment needs a variable, a field, an element, or a dereference"), said)
+    assert(said.contains("4:1"), said)
+    assert(bare.contains("assignment needs a variable, a field, an element, or a dereference"), bare)
+
+@test("a nested tuple of places is refused, as the bare list refuses one")
+pfm_nested()
+    if !pfm_ready() then return
+
+    val src = "var a = 1\nvar b = 2\nvar c = 3\n"
+    val said = pfm_err(src + "(a, (b, c)) = 10, (20, 30)\n")
+    val bare = pfm_err(src + "a, (b, c) = 10, (20, 30)\n")
+
+    assert(said.contains("assignment needs a variable, a field, an element, or a dereference"), said)
+    assert(bare.contains("assignment needs a variable, a field, an element, or a dereference"), bare)
+
+@test("'_' is not a place of a multiple assignment, parenthesised or bare")
+pfm_underscore()
+    if !pfm_ready() then return
+
+    val words = "'_' is not a place, and every place a multiple assignment names is written"
+
+    for line in ["(lo, _) = pair(5)\n", "lo, _ = pair(5)\n"]
+        val said = pfm_err(pfm_pair() + line)
+
+        assert(said.contains(words), said)
+        assert(!said.contains("undefined name"), said)
+end pfm_underscore
+
+@test("':=' over a tuple of places is the multiple assignment's own refusal")
+pfm_yielding()
+    if !pfm_ready() then return
+
+    val said = pfm_err(pfm_pair() + "(lo, hi) := pair(5)\n")
+
+    assert(said.contains("':=' yields the value it stores, and an assignment to several places is a " +
+                         "statement with no one value to yield \u{2014} write '='"), said)
+
+@test("two places meeting three values is the ordinary arity refusal")
+pfm_arity()
+    if !pfm_ready() then return
+
+    val said = pfm_err(pfm_pair() + "(lo, hi) = 1, 2, 3\n")
+
+    assert(said.contains("this assignment has 2 places on the left and 3 values on the right"), said)
