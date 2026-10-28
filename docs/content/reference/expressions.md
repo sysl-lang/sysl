@@ -181,6 +181,24 @@ print(b << wide)
 8
 ```
 
+**So a literal shifted by a typed count takes its type from where the shift stands, never from the
+count** — the position's type, or the other operand's — exactly as a bare literal does. `1 << bit`
+over an `int` bit is a `u32` where a `u32` is wanted and a `u64` beside a `u64`, and a literal the
+position cannot hold is refused at the literal.
+
+```sysl
+var level: u32 = 0
+val bit = 3
+val mask: u64 = 1 << 40
+
+level |= 1 << bit
+print(level, mask | (1 << bit) | (1 << 4))
+```
+
+```output
+8 1099511627800
+```
+
 The count must still be an **integer**, and the refusal names it as a count rather than as a
 mismatched operand.
 
@@ -1624,6 +1642,22 @@ print(1.0 / k, k / 2.0, k < 1.5, b + 300, x)
 
 ```output
 0.25 2 false 302 0.75
+```
+
+**An operand that comes to a literal on every path is a literal here too**: an `if` or a `match`
+whose every arm is one, a literal shifted by any count, and arithmetic over them. Each is read at
+the typed operand's type where it fits there, on either side, and otherwise at its default, as a
+single literal is.
+
+```sysl
+val c = true
+var b: byte = 16
+
+print((if c then 0x15 else 5) | 7u32, b | (if c then 1 else 2), b | (if c then 300 else 1))
+```
+
+```output
+23 17 316
 ```
 
 ```sysl

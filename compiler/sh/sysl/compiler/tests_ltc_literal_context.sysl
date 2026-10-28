@@ -1,0 +1,201 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.replace_all
+
+// An operand that comes to a literal on every path takes its type from where it stands, as a bare
+// literal does (`expr.sysl`'s `analyze_operands`, `expr_flow.sysl`'s `literal_valued`). A shift's
+// result is its LEFT operand's type and its count may be any integer, so `1 << bit` is a literal's
+// value whatever `bit` is: it takes the type of the position or of the other operand, never the
+// count's (`paired_operands`). An `if` whose arms are literals is the same: `(if c then 1 else 2) |
+// 7u32` is a `u32`. Where the literal does not fit the other operand's type, the pair widens to the
+// literal's default, as `b | 300` does.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private ltc_ready() -> bool = std_root().is_ok() && clang_available()
+
+private ltc_root(text: string) -> string
+    val root = replace_all(make_temp_dir("sysl-ltc").unwrap(), "//", "/")
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", forms_imported(text)).unwrap()
+    root
+end ltc_root
+
+// What a one-file program prints, or the report it was refused with.
+private ltc_ran(text: string) -> string
+    val root = ltc_root(text)
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            val said = replace_all(failure_text(why), s"$root/", "")
+
+            remove_dir_all(root).unwrap_or(())
+            return said
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end ltc_ran
+
+private ltc_report(text: string) -> string
+    val root = ltc_root(text)
+
+    val out = emit_llvm_text(s"$root/main.sysl", None) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> if made.report.is_empty() then "" else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    replace_all(out, s"$root/", "")
+end ltc_report
+
+private ltc_prints(text: string, want: string)
+    if !ltc_ready() then return
+
+    assert_eq(ltc_ran(text), want)
+end ltc_prints
+
+// Refused with exactly `message`, first, at `at` (`line:col`).
+private ltc_refused(text: string, message: string, at: string)
+    if !ltc_ready() then return
+
+    val said = ltc_report(text)
+    val head = s"error: $message\n"
+    val place = s"--> main.sysl:$at\n"
+
+    assert(said.starts_with(head) && said.contains(place),
+           s"expected a report starting\n$head\nlocated at$place\ngot\n$said")
+end ltc_refused
+
+// -- the reported cases ---------------------------------------------------------------------------
+
+@test("a literal shifted by a typed count takes the assignment's type, compound and plain")
+ltc_the_reported_shift() =
+    ltc_prints("var level: u32 = 0\nval bit = 3\nlevel |= 1 << bit\nprint(level)\n" +
+               "level = 1 << bit\nprint(level)\nlevel = level | 1 << 4\nprint(level)\n",
+               "8\n8\n24\n")
+
+@test("an if of literals takes the typed operand's type, on either side")
+ltc_the_reported_if() =
+    ltc_prints("val c = true\nval d = false\nprint((if c then 0x15 else 5) | 7u32, 7u32 | (if d then 0x15 else 8))\n" +
+               "val x: u32 = 0xFFFF_FFFF\nval m = (if c then 1 else 2) & x\nval y: u32 = m\nprint(y)\n",
+               "23 15\n1\n")
+
+// -- every shift, every count ---------------------------------------------------------------------
+
+@test("left and right shifts, plain and compound, with counts of every width")
+ltc_every_shift_and_count() =
+    ltc_prints("val n8: u8 = 4\nval n64: u64 = 33\nval ni: int = 2\nval ns: usize = 1\n" +
+               "var a: u64 = 0\na |= 1 << n64\na |= 1 << n8\na |= 1 << 1\nprint(a)\n" +
+               "var b: u32 = 0x8000_0000\nb = b >> n8\nb >>= ni\nb |= 0x8000_0000 >> ns\nprint(b)\n" +
+               "var c: u8 = 1\nc <<= n8\nc |= 1 << ni\nc = c >> ns\nprint(c)\n" +
+               "val d: u64 = 0x8000_0000_0000_0000 >> n64\nprint(d)\n",
+               "8589934610\n1107296256\n10\n1073741824\n")
+
+@test("u8, u32, u64, i64 and usize positions")
+ltc_every_width() =
+    ltc_prints("val k = 7\nval w = 40\nval b: u8 = 1 << k\nval h: u32 = 1 << 31\nval g: u32 = 1 << (w - 9)\n" +
+               "val q: u64 = 1 << w\nval s: i64 = -1 << w\nval z: usize = 1 << w\nval r: i64 = -(1 << w) >> 8\n" +
+               "print(b, h, g, q, s, z, r)\n",
+               "128 2147483648 2147483648 1099511627776 -1099511627776 1099511627776 -4294967296\n")
+
+// -- every position --------------------------------------------------------------------------------
+
+@test("an argument, a return, a typed val and an assignment")
+ltc_every_position() =
+    ltc_prints("take(x: u64) -> u64 = x\ngive(b: int) -> u64 = 1 << b\n" +
+               "give_return(b: u8) -> u64\n    return 1 << b\nend give_return\n" +
+               "val b = 40\nval v: u64 = 1 << b\nvar a: u64 = 0\na = 1 << b\n" +
+               "print(take(1 << b), give(b), give_return(41), v, a)\n",
+               "1099511627776 1099511627776 2199023255552 1099511627776 1099511627776\n")
+
+@test("the other operand of every binary operator and a comparison")
+ltc_every_operator() =
+    ltc_prints("val big: u64 = 1 << 40\nval b = 40\nval k: u8 = 3\n" +
+               "print(big | (1 << b), big & (1 << b), big ^ (1 << b), big + (1 << b), big - (1 << k))\n" +
+               "print(big == 1 << b, (1 << b) == big, big != 1 << k, big > 1 << k)\n",
+               "1099511627776 1099511627776 0 2199023255552 1099511627768\ntrue true true true\n")
+
+@test("nested shifts and literal arithmetic over them")
+ltc_nested() =
+    ltc_prints("val a = 33\nval b: u8 = 34\nvar mask: u64 = 0\nmask = (1 << a) | (1 << b)\nprint(mask)\n" +
+               "val x: u64 = 0\nprint(x | ((1 << a) | (1 << b)), x | (1 << a) + 1, x == (1 << a) - (1 << a))\n" +
+               "print(x | ~(1 << a) & (1 << b))\n",
+               "25769803776\n25769803776 8589934593 true\n17179869184\n")
+
+// -- if and match operands --------------------------------------------------------------------------
+
+@test("an if of literals beside a typed operand of each width")
+ltc_if_operands() =
+    ltc_prints("val c = true\nval b: u8 = 0xF0\nval l: u64 = 1 << 40\nval i: i64 = -8\n" +
+               "print(b | (if c then 0x0F else 1), l | (if c then 1 else 2), i & (if c then -1 else 0))\n" +
+               "val bt = b | (if c then 0x0F else 1)\nval at: u8 = bt\nprint(at)\n" +
+               "print(l == (if c then 1 else 2) << 40)\n",
+               "255 1099511627777 -8\n255\ntrue\n")
+
+@test("an elif chain and a nested if of literals are literals too")
+ltc_nested_ifs() =
+    ltc_prints("val s = 2\nval c = false\nval x: u32 = 0xFF00_0000\n" +
+               "print(x | (if s == 1 then 1 elif s == 2 then 2 else 3))\n" +
+               "print(7u32 | (if c then 1 else (if s > 1 then 8 else 16)))\n",
+               "4278190082\n15\n")
+
+@test("an if with a typed arm is that arm's type, as before")
+ltc_mixed_arms() =
+    ltc_prints("val c = true\nval n: u32 = 9\nprint(7u32 | (if c then n else 1))\n",
+               "15\n")
+
+@test("a mixed if is a typed operand, so one neither side widens to is still refused")
+ltc_mixed_arms_refused() =
+    ltc_refused("val c = true\nval n: int = 9\nval x: u32 = 1\nprint(x | (if c then n else 1))\n",
+                "'|' needs matching types, got uint and int", "4:12")
+
+@test("a block if whose branch is a match of literals")
+ltc_match_branch() =
+    ltc_prints("val c = true\nval sel = 2\nval x: u64 = 1 << 40\n" +
+               "val m = x | if c\n    sel match\n        1 -> 1\n        _ -> 2\nelse\n    4\nprint(m)\n",
+               "1099511627778\n")
+
+// -- what does not fit -----------------------------------------------------------------------------
+
+@test("a literal the other operand's type does not hold widens the pair to its default")
+ltc_does_not_fit_widens() =
+    ltc_prints("val c = true\nval b: u8 = 16\nprint(b | (if c then 300 else 1), b + (1 + 300))\n",
+               "316 317\n")
+
+@test("a literal shift past the position's width is refused as a constant")
+ltc_constant_past_width() =
+    ltc_refused("var level: u32 = 0\nlevel = 1 << 40\nprint(level)\n",
+                "a constant shifted by 40 places, at or past the 32 bits of uint", "2:9")
+
+@test("a left operand the position's type does not hold is refused at the literal")
+ltc_left_does_not_fit() =
+    ltc_refused("val bit = 3\nval x: u8 = 300 << bit\nprint(x)\n",
+                "the literal 300 does not fit byte", "2:13")
+
+@test("an if arm the position's type does not hold is refused at that arm")
+ltc_if_arm_does_not_fit() =
+    ltc_refused("val c = true\nval bit = 1\nval x: u8 = (if c then 1 else 256) << bit\nprint(x)\n",
+                "the literal 256 does not fit byte", "3:31")
+
+@test("a run-time count past the width shifts everything out")
+ltc_runtime_count_past_width() =
+    ltc_prints("var bit = 3\nbit += 6\nval x: u8 = 1 << bit\nval y: u32 = 1 << (bit + 30)\nprint(x, y)\n",
+               "0 0\n")
+
+// -- constants -------------------------------------------------------------------------------------
+
+@test("a const count and a const of a literal shift fold at the position's type")
+ltc_constants() =
+    ltc_prints("const N = 3\nconst S: u32 = 1 << 31\nconst T = 1 << N\nval G: u64 = 1 << 40\n" +
+               "var v: u64 = 0\nv |= 1 << N\nprint(S, T, G, v, (1 << N) | 0u8)\n",
+               "2147483648 8 1099511627776 8 8\n")
