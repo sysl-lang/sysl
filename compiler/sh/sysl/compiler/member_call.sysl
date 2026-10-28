@@ -226,6 +226,10 @@ associated_on(cx: &Analyzer, span: Span, ty: Type, name: string, args: Buf[Expr]
     if generic.is_some() && !block_bounds_met(cx, span, generic.unwrap(), found.1) then
         return Some(bad_expr(span))
 
+    // **The condition is asked before the member is made real**: an instantiation the condition
+    // refuses would have its body read at arguments the block was written to keep out.
+    if !check_impl_condition(cx, span, ty, found.0, picked) then return Some(bad_expr(span))
+
     if generic.is_some() && generic.unwrap().tparams.len() > found.1.len()
         check_member_visible(cx, span, found.0, picked, decl, via)
 
@@ -248,7 +252,6 @@ associated_on(cx: &Analyzer, span: Span, ty: Type, name: string, args: Buf[Expr]
 
     note_member_reference(cx, span, fname, decl)
     check_member_visible(cx, span, found.0, picked, decl, via)
-    check_impl_condition(cx, span, ty, found.0, picked)
 
     // The arity names what kind of thing was called, and an argument's refusal names the callee
     // alone -- `'x' of 'Box.of' is int`, as a free function's does.
@@ -980,6 +983,9 @@ private call_declared(cx: &Analyzer, span: Span, receiver: TExpr, rty: Type, nam
     if generic.is_some() && !block_bounds_met(cx, span, generic.unwrap(), found.1) then
         return bad_expr(span)
 
+    // Asked before either path makes the member real, a member with parameters of its own included.
+    if !check_impl_condition(cx, span, rty, found.0, chosen.unwrap()) then return bad_expr(span)
+
     if generic.is_some() && generic.unwrap().tparams.len() > found.1.len() then
         return call_generic_member(cx, span, Some(receiver), rty, found.0, decl, generic.unwrap(),
                                    found.1, args, expected, name, targs)
@@ -1251,7 +1257,8 @@ private member_dispatch(cx: &Analyzer, span: Span, receiver: TExpr, rty: Type, b
                         chosen: string, m: MethodDecl, args: Buf[Expr], expected: Option[Type],
                         written: string, via: Buf[string] = no_bound_traits()) -> TExpr
     check_member_visible(cx, span, base, chosen, m, via)
-    check_impl_condition(cx, span, rty, base, chosen)
+
+    if !check_impl_condition(cx, span, rty, base, chosen) then return bad_expr(span)
 
     val shown = member_subject(cx, rty, chosen)
     val fname = member_func_name(cx, span, rty, chosen)
@@ -2084,14 +2091,23 @@ end method_written
 // keyed by the type and not by its arguments, so a conditional block -- `impl[T: Show] Show for
 // Box[T]` -- files its members under every `Box`, and the condition is asked here, of the arguments
 // this receiver was made with. Without it a `Box` of something that is not `Show` would call `show`.
-private check_impl_condition(cx: &Analyzer, span: Span, rty: Type, base: string, filed: string)
+//
+// **The arguments are the ones the member was found at**, which for a shape-matched block are not the
+// type's own: `impl[..A: Hash] Hash for (..A)` is filed under the pack shape, and a tuple matches it
+// with its parts as one pack. Asked only of the type's own key, a tuple of something that is not
+// `Hash` reached the block's body and was refused inside the library rather than at the call.
+//
+// It answers whether the call may go on. A refused condition is the whole of what is wrong, so the
+// caller abandons the call rather than instantiating a body the condition was written to keep out --
+// whose own refusal would be a second diagnostic, located in the block and not at the call.
+private check_impl_condition(cx: &Analyzer, span: Span, rty: Type, base: string, filed: string) -> bool
     val from = cx.an.tables.members.from_trait.get(member_key_of(base, filed))
 
-    if from.is_none() then return
+    if from.is_none() then return true
 
-    val owner = member_owner(rty)
+    val owner = member_key(cx.an, rty, filed)
 
-    if owner.0 != base then return
+    if owner.0 != base then return true
 
     val name = source_member_name(filed)
 
@@ -2105,18 +2121,21 @@ private check_impl_condition(cx: &Analyzer, span: Span, rty: Type, base: string,
 
         val unmet = unmet_condition_of(cx.an, ti, subst)
 
-        if unmet.is_some()
-            val (arg, tr) = unmet.unwrap()
-            val why = unmet_bound(cx.an, tr, arg)
-            val tail = if why.is_some() then s" — ${why.unwrap()}" else ""
+        if unmet.is_none() then return true
 
-            cx.fault(span, s"'$name' is a member the 'impl' of '${qualified_name(from.unwrap())}' " +
-                     s"gives '${type_show(rty)}' only where its condition holds, and it asks " +
-                     s"'${tr.show()}' of ${type_show(arg)}, which does not implement it$tail")
-        end if
+        val (packed, tr) = unmet.unwrap()
+        val arg = first_unmet_part(cx.an, tr, packed)
+        val why = unmet_bound(cx.an, tr, arg)
+        val tail = if why.is_some() then s" — ${why.unwrap()}" else ""
 
-        return
+        cx.fault(span, s"'$name' is a member the 'impl' of '${qualified_name(from.unwrap())}' " +
+                 s"gives '${type_show(rty)}' only where its condition holds, and it asks " +
+                 s"'${tr.show()}' of ${type_show(arg)}, which does not implement it$tail")
+
+        return false
     end for
+
+    true
 end check_impl_condition
 
 // Whether a member the reader named is one their file may reach.

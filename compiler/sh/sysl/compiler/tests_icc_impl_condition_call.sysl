@@ -1,0 +1,330 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.text.Search
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// A conditional `impl` gives its members only where its condition holds, and the condition is asked
+// at the call -- of the arguments the member was found at. Two things follow, and each is pinned
+// here as exact text, place and count:
+//
+// - **A shape-matched block is asked too.** `impl[..A: Hash] Hash for (..A)` is filed under the
+//   pack shape rather than under the tuple's own key, and a tuple of something that is not `Hash`
+//   reached the block's body and was refused inside the standard library, at a line the reader
+//   never wrote.
+// - **A refused call is abandoned before the member is made real.** The body read at arguments the
+//   condition keeps out would be refused a second time, at the block, under the right diagnostic.
+
+private icc_ready() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+    end if
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+    end if
+
+    true
+end icc_ready
+
+// Every diagnostic a refused program is told, in one report.
+private icc_err(text: string) -> string
+    val root = make_temp_dir("sysl-icc").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    val out = emit_llvm_text(src, None) match
+        Err(why) -> why.message
+        Ok(made) -> if made.report.is_empty() then "" else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end icc_err
+
+// What a program that must compile prints when it runs.
+private icc_ran(text: string) -> string
+    val root = make_temp_dir("sysl-icc").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end icc_ran
+
+// How many diagnostics a report holds: each one opens with `error: `.
+private icc_count(said: string) -> int
+    var n = 0
+    var rest = said
+
+    loop
+        val at = rest.index_of("error: ")
+
+        if at.is_none() then return n
+
+        n += 1
+        rest = rest[at.unwrap() + 7..<rest.bytes.len]
+end icc_count
+
+// The program is refused with exactly `message`, at `line:col` of the entry file, and with nothing
+// else -- in particular nothing located in the library or in the block whose condition refused it.
+private icc_refused_once(text: string, message: string, at: string)
+    val said = icc_err(text)
+
+    assert(said.index_of(s"error: $message\n").is_some(), s"expected '$message', got: $said")
+    assert(said.index_of(s"/main.sysl:$at\n").is_some(), s"expected it at $at, got: $said")
+    assert(icc_count(said) == 1, s"expected one diagnostic, got: $said")
+
+private icc_plain() -> string = "struct Plain\n    v: int\n\n"
+
+// ---- the tuple blocks, filed under the pack shape ----
+
+@test("a tuple of a part with no Hash is refused at the call, once, naming the part")
+icc_tuple_hash_refused_at_the_call()
+    if !icc_ready() then return
+
+    icc_refused_once(icc_plain() + raw"""
+        main()
+            val p: &Plain = Plain(1)
+            print((p, p).hash())
+        """,
+        "'hash' is a member the 'impl' of 'sysl.Hash' gives '(&Plain, &Plain)' only where its " +
+        "condition holds, and it asks 'sysl.Hash' of &Plain, which does not implement it",
+        "6:18")
+
+@test("a tuple nested in a tuple is refused at the outer call, the inner tuple named and why")
+icc_nested_tuple_hash_refused()
+    if !icc_ready() then return
+
+    icc_refused_once(icc_plain() + raw"""
+        main()
+            print(((Plain(1), 2), 3).hash())
+        """,
+        "'hash' is a member the 'impl' of 'sysl.Hash' gives '((Plain, int), int)' only where its " +
+        "condition holds, and it asks 'sysl.Hash' of (Plain, int), which does not implement it — " +
+        "the 'impl' that covers it asks 'sysl.Hash' of Plain, which does not implement it",
+        "5:30")
+
+@test("a tuple whose parts all implement Hash hashes, nested or not")
+icc_tuple_hash_of_hashable_parts_works()
+    if !icc_ready() then return
+
+    assert_eq(icc_ran(raw"""
+        struct Node
+            level: int
+
+        impl Hash for Node
+            hash(self) -> u64 = u64(self.level)
+
+        main()
+            val a = (Node(1), "x")
+            val b = (Node(1), "x")
+            val c = (Node(2), "x")
+            print(a.hash() == b.hash(), a.hash() == c.hash())
+            print(((1, 2), 3).hash() == ((1, 2), 3).hash(), (1, 2).hash() == (2, 1).hash())
+        """), "true false\ntrue false\n")
+
+@test("the tuple Eq block is asked its condition at a member call")
+icc_tuple_eq_refused_at_the_call()
+    if !icc_ready() then return
+
+    icc_refused_once(icc_plain() + raw"""
+        main()
+            val a = (Plain(1), 2)
+            print(a.eq(a))
+        """,
+        "'eq' is a member the 'impl' of 'sysl.Eq' gives '(Plain, int)' only where its condition " +
+        "holds, and it asks 'sysl.Eq' of Plain, which does not implement it",
+        "6:13")
+
+@test("the tuple Ord block is asked its condition at a member call")
+icc_tuple_ord_refused_at_the_call()
+    if !icc_ready() then return
+
+    icc_refused_once(icc_plain() + raw"""
+        main()
+            val a = (Plain(1), 2)
+            print(a.lt(a))
+        """,
+        "'lt' is a member the 'impl' of 'sysl.Ord' gives '(Plain, int)' only where its condition " +
+        "holds, and it asks 'sysl.Ord' of Plain, which does not implement it",
+        "6:13")
+
+@test("the tuple Display block is asked its condition at a member call")
+icc_tuple_display_refused_at_the_call()
+    if !icc_ready() then return
+
+    icc_refused_once(icc_plain() + raw"""
+        main()
+            val a = (Plain(1), 2)
+            var count = Counting(0)
+            var sink: *Writer = &count
+            a.display(sink, FormatSpec(0, -1, false))
+        """,
+        "'display' is a member the 'impl' of 'sysl.Display' gives '(Plain, int)' only where its " +
+        "condition holds, and it asks 'sysl.Display' of Plain, which does not implement it",
+        "8:7")
+
+// The operator reaches the same block through its own check; what this pins is that the reason names
+// the part that fails rather than the whole list of parts.
+@test("an operator on such a tuple names the failing part, once")
+icc_tuple_operator_names_the_part()
+    if !icc_ready() then return
+
+    icc_refused_once(icc_plain() + raw"""
+        main()
+            val a = (1, Plain(2))
+            print(a == a)
+        """,
+        "'==' between (int, Plain) needs 'sysl.Eq' — the 'impl' that covers it asks 'sysl.Eq' of " +
+        "Plain, which does not implement it",
+        "6:11")
+
+@test("a generic function reaching the member through its bound is refused at its own call, once")
+icc_generic_through_a_bound()
+    if !icc_ready() then return
+
+    icc_refused_once(icc_plain() + raw"""
+        hh[T: Hash](x: T) -> u64 = x.hash()
+
+        main()
+            print(hh((Plain(1), 2)))
+        """,
+        "'hh' requires its type parameter 'T' to implement 'sysl.Hash', but (Plain, int) does not — " +
+        "the 'impl' that covers it asks 'sysl.Hash' of Plain, which does not implement it",
+        "7:11")
+
+    assert_eq(icc_ran(raw"""
+        hh[T: Hash](x: T) -> u64 = x.hash()
+
+        main()
+            print(hh((1, "a")) == hh((1, "a")))
+        """), "true\n")
+
+// ---- a block over a generic struct: the condition was asked, and the body was read anyway ----
+
+private icc_wrap() -> string = icc_plain() + "struct Wrap[T]\n    x: T\n\n"
+
+@test("a refused method is not made real, so its body is not refused a second time")
+icc_struct_shape_one_diagnostic()
+    if !icc_ready() then return
+
+    icc_refused_once(icc_wrap() + raw"""
+        trait Hh
+            hh(self) -> u64
+
+        impl[T: Hash] Hh for Wrap[T]
+            hh(self) -> u64 = self.x.hash()
+
+        main()
+            print(Wrap(Plain(1)).hh())
+        """,
+        "'hh' is a member the 'impl' of 'Hh' gives 'Wrap[Plain]' only where its condition holds, and " +
+        "it asks 'sysl.Hash' of Plain, which does not implement it",
+        "14:26")
+
+@test("a refused associated function is not made real either")
+icc_associated_one_diagnostic()
+    if !icc_ready() then return
+
+    icc_refused_once(icc_wrap() + raw"""
+        trait Mk[U]
+            mk(x: U) -> Self
+
+        impl[T: Hash] Mk[T] for Wrap[T]
+            mk(x: T) -> Self
+                print(x.hash())
+                Wrap(x)
+
+        main()
+            Wrap[Plain].mk(Plain(1))
+        """,
+        "'mk' is a member the 'impl' of 'Mk' gives 'Wrap[Plain]' only where its condition holds, and " +
+        "it asks 'sysl.Hash' of Plain, which does not implement it",
+        "16:17")
+
+@test("a method with type parameters of its own is asked the condition before it is made real")
+icc_generic_method_one_diagnostic()
+    if !icc_ready() then return
+
+    icc_refused_once(icc_wrap() + raw"""
+        trait Mix
+            mix[V](self, v: V) -> u64
+
+        impl[T: Hash] Mix for Wrap[T]
+            mix[V](self, v: V) -> u64 = self.x.hash()
+
+        main()
+            print(Wrap(Plain(1)).mix(2))
+        """,
+        "'mix' is a member the 'impl' of 'Mix' gives 'Wrap[Plain]' only where its condition holds, " +
+        "and it asks 'sysl.Hash' of Plain, which does not implement it",
+        "14:26")
+
+@test("an associated function with type parameters of its own is asked the condition too")
+icc_generic_associated_one_diagnostic()
+    if !icc_ready() then return
+
+    icc_refused_once(icc_wrap() + raw"""
+        trait Made[U]
+            made[V](t: U, v: V) -> u64
+
+        impl[T: Hash] Made[T] for Wrap[T]
+            made[V](t: T, v: V) -> u64 = t.hash()
+
+        main()
+            print(Wrap[Plain].made(Plain(1), 2))
+        """,
+        "'made' is a member the 'impl' of 'Made' gives 'Wrap[Plain]' only where its condition holds, " +
+        "and it asks 'sysl.Hash' of Plain, which does not implement it",
+        "14:23")
+
+@test("where the condition holds, each of those members is called")
+icc_conditions_met_all_run()
+    if !icc_ready() then return
+
+    assert_eq(icc_ran(raw"""
+        struct Wrap[T]
+            x: T
+
+        trait Hh
+            hh(self) -> u64
+
+        trait Mk[U]
+            mk(x: U) -> Self
+
+        trait Mix
+            mix[V](self, v: V) -> u64
+
+        impl[T: Hash] Hh for Wrap[T]
+            hh(self) -> u64 = self.x.hash()
+
+        impl[T: Hash] Mk[T] for Wrap[T]
+            mk(x: T) -> Self = Wrap(x)
+
+        impl[T: Hash] Mix for Wrap[T]
+            mix[V](self, v: V) -> u64 = self.x.hash()
+
+        main()
+            val w = Wrap[int].mk(7)
+            print(w.hh() == 7.hash(), w.mix("v") == w.hh(), w.x)
+        """), "true true 7\n")
