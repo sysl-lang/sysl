@@ -224,6 +224,16 @@ private lex_from(start: Scanner) -> Result[Lexed, Diagnostic]
 
             emit_dent(&out, dent, point(line_end), point(s.offset), started)
 
+            // **A dedent that closes the last block opened inside brackets hands the line back to
+            // the bracket rule**, where a line ending ends nothing. So the `Newline` that would end
+            // the statement outside the block is not emitted: the line closing it may begin with the
+            // bracket's `)` or the next argument's `,`, as a block closed on its own line by a comma
+            // or a bracket already does (`emit_drain`).
+            if lay.brackets > 0 && !lay.significant()
+                dent match
+                    Shallower(_) | Ragged(_) -> drop_trailing_newline(&out)
+                    _ -> ()
+
             started = true
             at_line_head = false
         else
@@ -416,6 +426,10 @@ private close_levels(out: *Buf[Spanned[Tok]], levels: usize, ended: Span, at: Sp
         out.push(Spanned(Dedent, at))
         out.push(Spanned(Newline, at))
 end close_levels
+
+// Takes back the `Newline` a closed block left after its last `Dedent`.
+private drop_trailing_newline(out: *Buf[Spanned[Tok]])
+    if last_token(out) == Some(Newline) then out.pop()
 
 // Whether the line ending under the cursor ends a statement, having consumed it either way.
 //

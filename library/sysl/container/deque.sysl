@@ -1,6 +1,7 @@
 module sysl.container
 
 import sysl.buf.{forget, unassigned, Unassigned}
+import sysl.index_past
 
 /** A sequence that grows and that is cheap to take from at **either** end.
  *
@@ -32,8 +33,8 @@ import sysl.buf.{forget, unassigned, Unassigned}
  * `push_front` through either is seen by both, a growth included. A destructor behind an element runs
  * when the element is taken out, or when the last name for the deque goes.
  *
- * The bounds-checked members panic rather than answering an `Option`, which is the bargain `Buf`
- * makes for the same reason: an index past the end is a mistake in the program. `pop_front` and
+ * The bounds-checked members trap rather than answering an `Option`, as `Buf`'s and an array's do,
+ * for the same reason: an index past the end is a mistake in the program. `pop_front` and
  * `pop_back` answer an `Option`, because taking from an empty sequence is a question a caller asks
  * on purpose.
  */
@@ -54,11 +55,11 @@ struct Deque[T]
 
     @inline
     at(self, i: usize) -> T
-        if is_null(self.core) then past_end(i)
+        if is_null(self.core) then index_past(i, 0)
         self.core.at(i)
 
     set(self, i: usize, v: T)
-        if is_null(self.core) then past_end(i)
+        if is_null(self.core) then index_past(i, 0)
         self.core.set(i, v)
 
     first(self) -> Option[T] = if !is_null(self.core) then self.core.first() else None
@@ -108,10 +109,6 @@ struct Deque[T]
     release(*self) = forget(self)
 end Deque
 
-private past_end(i: usize) -> never
-    print("panic: index", i, "past the 0 elements of a Deque")
-    exit(1)
-
 /** `for x in d` walks a deque from the front to the back, through the cursor `walk` answers. */
 impl[T] Walk for Deque[T]
     type Walker = DequeCursor[T]
@@ -134,15 +131,11 @@ private[container] struct DequeCore[T]
     seat(self, i: usize) -> usize = (self.head + i) & (self.elems.len - 1)
 
     at(self, i: usize) -> T
-        if i >= self.count
-            print("panic: index", i, "past the", self.count, "elements of a Deque")
-            exit(1)
+        if i >= self.count then index_past(i, self.count)
         self.elems[self.seat(i)].unwrap()
 
     set(*self, i: usize, v: T)
-        if i >= self.count
-            print("panic: index", i, "past the", self.count, "elements of a Deque")
-            exit(1)
+        if i >= self.count then index_past(i, self.count)
         val s = self.seat(i)
         self.elems[s] = Some(v)
     end set

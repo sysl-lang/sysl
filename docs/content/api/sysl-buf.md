@@ -110,10 +110,11 @@ of the buffer -- the elements go when the last name does -- and leaves the handl
 as zeroed storage does. It is what a finalizer for raw storage calls, where assigning `buf()` would
 make a fresh buffer that is lost when the storage is freed.
 
-The bounds-checked members panic rather than returning an `Option`, which is the same bargain
-`unwrap` makes -- an index past the end is a mistake in the program, not a value it meant to
-handle -- while `pop` returns one, because taking from an empty sequence is a question a caller
-asks on purpose.
+The bounds-checked members trap rather than returning an `Option`, as an array's subscript does --
+an index past the end is a mistake in the program, not a value it meant to handle -- while `pop`
+returns one, because taking from an empty sequence is a question a caller asks on purpose. The
+report is an array's (`index 5 out of bounds for length 3`, through `sysl_bounds_fail`), without
+the caller's line.
 
 | Member | Signature | Description |
 |---|---|---|
@@ -189,7 +190,7 @@ destructor touches that count, once, run by whichever thread lets go of the box'
 |---|---|---|
 | `len` | `const len(self) -> usize` |  |
 | `is_empty` | `const is_empty(self) -> bool` |  |
-| `at` | `const at(self, i: usize) -> T` | The element at `i`, checked against the length. |
+| `at` | `const at(self, i: usize) -> T` | The element at `i`, checked against the length: past it is a trap, as an array's index is. |
 | `view` | `const view(&sync self) -> []const T` | The elements as a read-only slice. |
 
 ### `FrozenWalk`

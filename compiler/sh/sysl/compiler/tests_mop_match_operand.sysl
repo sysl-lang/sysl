@@ -1,0 +1,199 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.replace_all
+
+// A `match` is an operand of any operator once it is in parentheses: the keyword goes after the value
+// and binds more loosely than every operator, so `a + k match …` matches on the sum, and
+// `a + (k match …)` adds the match's value. The parenthesised form takes every operator, binary and
+// prefix, on either side, with inline or block arms, guards and payload bindings, and its literal arms
+// adapt to the other operand's type as a literal does. The closing bracket may stand on a line of its
+// own, back at the margin the bracket was opened at, as may the next argument's comma.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private mop_ready() -> bool = std_root().is_ok() && clang_available()
+
+private mop_root(text: string) -> string
+    val root = replace_all(make_temp_dir("sysl-mop").unwrap(), "//", "/")
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+    root
+end mop_root
+
+// What a one-file program prints, or the report it was refused with.
+private mop_ran(text: string) -> string
+    val root = mop_root(text)
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            val said = replace_all(failure_text(why), s"$root/", "")
+
+            remove_dir_all(root).unwrap_or(())
+            return said
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end mop_ran
+
+private mop_report(text: string) -> string
+    val root = mop_root(text)
+
+    val out = emit_llvm_text(s"$root/main.sysl", None) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> if made.report.is_empty() then "" else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    replace_all(out, s"$root/", "")
+end mop_report
+
+private mop_prints(text: string, want: string)
+    if !mop_ready() then return
+
+    assert_eq(mop_ran(text), want)
+
+// Refused with exactly `message`, first, at `at` (`line:col`).
+private mop_refused(text: string, message: string, at: string)
+    if !mop_ready() then return
+
+    val said = mop_report(text)
+    val head = s"error: $message"
+    val place = s"--> main.sysl:$at\n"
+
+    assert(said.starts_with(head) && said.contains(place),
+           s"expected a report starting\n$head\nlocated at$place\ngot\n$said")
+end mop_refused
+
+// The two texts parse, cleanly, to one tree.
+private mop_same(text: string, means: string)
+    assert_eq(pf_err(text), "")
+    assert_eq(pf(text), pf(means))
+
+private val mop_arms ="\n    1 -> 10\n    _ -> 20"
+
+// -- the shape ------------------------------------------------------------------------------------
+
+@test("a parenthesised 'match' is the right operand of every binary operator")
+mop_every_level_shape()
+    for o in ["||", "&&", "==", "<", "..", "..<", "|", "^", "&", "+", "-", "*", "/", "%", "<<", ">>"]
+        assert_eq(pf_err(s"x = a $o (k match${mop_arms})\n"), "")
+        assert_eq(pf_err(s"x = (k match${mop_arms}) $o a\n"), "")
+
+@test("without the parentheses the 'match' takes the whole expression before it, as it always did")
+mop_bare_takes_the_sum_shape()
+    mop_same(s"x = a + k match${mop_arms}\n", s"x = (a + k) match${mop_arms}\n")
+    mop_same(s"x = -k match${mop_arms}\n", s"x = (-k) match${mop_arms}\n")
+    mop_same(s"x = a < k match${mop_arms}\n", s"x = (a < k) match${mop_arms}\n")
+
+@test("a 'match' statement at the start of a line is unchanged")
+mop_statement_unchanged_shape()
+    assert_eq(pf_err("k match\n    1 -> f()\n    _ -> g()\nh()\n"), "")
+    mop_same("k match\n    1 -> f()\n    _ -> g()\nh()\n", "k match\n    1 -> f()\n    _ -> g()\nh()\n")
+
+@test("the bracket may close on a line of its own, at the margin it was opened at")
+mop_closing_line_shape()
+    mop_same(s"x = 1 + (k match${mop_arms}\n)\n", s"x = 1 + (k match${mop_arms})\n")
+    mop_same(s"x = (k match${mop_arms}\n) + 1\n", s"x = (k match${mop_arms}) + 1\n")
+    mop_same(s"f(k match${mop_arms}\n, 2)\n", s"f(k match${mop_arms}, 2)\n")
+    mop_same("f((x) ->\n    val d = x * 2\n    d + 1\n, 5)\n", "f((x) ->\n    val d = x * 2\n    d + 1, 5)\n")
+
+// -- the values -----------------------------------------------------------------------------------
+
+@test("left and right operands, arithmetic, a comparison and '|', with inline arms")
+mop_positions_values() =
+    mop_prints("val k = 2\nval x: u8 = 16\n" +
+               "print(x | (k match\n    1 -> 1\n    _ -> 3))\n" +
+               "print((k match\n    1 -> 10\n    _ -> 20) + 1, 100 - (k match\n    2 -> 1\n    _ -> 0))\n" +
+               "print((k match\n    2 -> 1\n    _ -> 0) < 2, 3 == (k match\n    2 -> 3\n    _ -> 0))\n",
+               "19\n21 99\ntrue true\n")
+
+@test("a prefix operator takes the parenthesised 'match'")
+mop_prefix_values() =
+    mop_prints("val k = 2\nval c = true\n" +
+               "print(-(k match\n    2 -> 5\n    _ -> 6), !(k match\n    2 -> c\n    _ -> false))\n" +
+               "print(~(k match\n    2 -> 0\n    _ -> 1))\n",
+               "-5 false\n-1\n")
+
+@test("precedence: a + (k match …) * b multiplies the match, and the bare form matches the sum")
+mop_precedence_values() =
+    mop_prints("val k = 2\n" +
+               "print(1 + (k match\n    2 -> 4\n    _ -> 0) * 3)\n" +
+               "print(1 + (k match\n    2 -> 4\n    _ -> 0) + 10)\n" +
+               "val m = 1 + k match\n    2 -> 100\n    3 -> 200\n    _ -> 0\n" +
+               "print(m)\n",
+               "13\n15\n200\n")
+
+@test("block arms, a guard and a payload binding")
+mop_block_guard_payload_values() =
+    mop_prints("val k = 2\nval o: Option[int] = Some(7)\n" +
+               "print(1 + (k match\n    2 ->\n        val t = 4\n        t * 2\n    _ -> 0))\n" +
+               "print(10 * (o match\n    Some(v) if v > 5 -> v\n    Some(v) -> -v\n    None -> 0))\n" +
+               "print((o match\n    Some(v) if v > 9 -> v\n    Some(v) -> v + 1\n    None -> 0) - 1)\n",
+               "9\n70\n7\n")
+
+@test("a 'match' and an 'if' nested in each other's arms")
+mop_nested_values() =
+    mop_prints("val k = 2\nval o: Option[int] = Some(7)\n" +
+               "print(1 + (k match\n    2 -> if k > 1 then 100 else 0\n    _ -> 0))\n" +
+               "print(1 + (k match\n    2 -> (o match\n        Some(v) -> v\n        None -> 0) * 2\n    _ -> 0))\n" +
+               "print(1 + if k > 1 then (o match\n    Some(v) -> v\n    None -> 0) else 0)\n",
+               "101\n15\n8\n")
+
+@test("literal arms take a typed operand's type, on either side")
+mop_literal_arms_values() =
+    mop_prints("val k = 2\nval w: u8 = 250\nvar q: i64 = 5000000000\nval f: f32 = 0.5\n" +
+               "print(w + (k match\n    2 -> 3\n    _ -> 4), (k match\n    2 -> 0x15\n    _ -> 5) | 7u32)\n" +
+               "print(q + (k match\n    2 -> 1\n    _ -> 0), f * (k match\n    2 -> 3\n    _ -> 1))\n" +
+               "print(w | (k match\n    2 -> 300\n    _ -> 1))\n",
+               "253 23\n5000000001 1.5\n510\n")
+
+@test("typed arms keep their type")
+mop_typed_arms_values() =
+    mop_prints("val k = 2\nval a: i64 = 7\nval b: i64 = 9\n" +
+               "val s = 1 + (k match\n    2 -> a\n    _ -> b)\n" +
+               "print(s, \"n=\" + (k match\n    2 -> \"two\"\n    _ -> \"other\"))\n",
+               "8 n=two\n")
+
+@test("the closing bracket on its own line, in a function body, a closure and an argument")
+mop_closing_line_values() =
+    mop_prints("apply(f: int -> int, n: int) -> int = f(n)\n" +
+               "pick(k: int) -> int\n    val a = 100 + (k match\n        1 -> 1\n        _ -> 2\n    )\n" +
+               "    val b = apply((x) ->\n        val d = x * 2\n        d + 1\n    , k)\n    a + b\n" +
+               "print(pick(1), pick(5))\n" +
+               "print(apply((x) ->\n    val y = (x match\n        1 -> 10\n        _ -> 20\n    )\n    y + 1, 1))\n" +
+               "print(2 match\n    2 -> 1\n    _ -> 0\n)\n",
+               "104 113\n11\n1\n")
+
+// -- the refusals ---------------------------------------------------------------------------------
+
+@test("arms of different types are refused at the match")
+mop_mismatched_arms() =
+    mop_refused("val k = 2\nprint(1 + (k match\n    1 -> 1\n    _ -> \"two\"))\n",
+                "match arms have different types: int and string", "2:12")
+
+@test("a non-exhaustive match used as an operand is refused")
+mop_not_exhaustive() =
+    mop_refused("val k = 2\nprint(1 + (k match\n    1 -> 1\n    2 -> 2))\n",
+                "a 'match' that yields a value must be exhaustive \u{2014} add an 'else' arm", "2:12")
+
+@test("an arm that yields nothing makes the operand a unit, which the operator refuses")
+mop_unit_arm() =
+    mop_refused("val k = 2\nval n = 1 + (k match\n    1 -> print(1)\n    _ -> print(2))\nprint(n)\n",
+                "'+' needs matching types, got int and unit", "2:14")
+
+@test("a bracket closed at a margin shallower than its statement's is still refused")
+mop_closing_too_far_back()
+    val src = "g() -> int\n    val y = (k match\n        1 -> 10\n        _ -> 20\n)\n    y\n"
+
+    assert_eq(pf_err(src), "')' expected")
+    assert_eq(pf_at(src), "5:1")
