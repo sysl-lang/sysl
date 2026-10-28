@@ -325,6 +325,161 @@ rik_derived_over_a_reference_field()
             print(ByNode(a) == ByNode(b), ByNode(a).hash() == ByNode(a).hash(), ByNode(a).hash() != ByNode(b).hash())
         """, "true false 2 3\nfalse true true\n")
 
+// -- the source decides, not the instantiation ------------------------------------------------------
+//
+// Whether a call is through a bound is read off the generic SOURCE: a receiver declared as a type
+// parameter (or built from one) is the bound's, and a reference the body names with its concrete type
+// is a written member call, reaching the referent, at every instantiation -- including the one whose
+// parameter stands for that very type.
+
+@test("a concrete '&Node' local in a generic body hashes by Node.hash at T = &Node and at T = int")
+rik_concrete_local_hash_in_a_generic()
+    if !rik_ready() then return
+
+    rik_prints(rik_node() + raw"""
+        struct Box
+            n: &Node
+
+        make() -> &Node = Node(7)
+
+        both[T: Hash](x: T) -> u64
+            val r: &Node = make()
+            val inferred = make()
+            val b = Box(make())
+
+            print(r.hash(), inferred.hash(), b.n.hash())
+            x.hash()
+
+        main()
+            val a: &Node = Node(1)
+            val c: &Node = Node(1)
+
+            val ha = both(a)
+            val again = both(a)
+            val hc = both(c)
+            val h3 = both(3)
+
+            print(ha == again, ha != hc, h3 == keyed(3))
+        """, "7 7 7\n7 7 7\n7 7 7\n7 7 7\ntrue true true\n")
+
+@test("a concrete '&Node' local in a generic body compares by Node.eq at T = &Node and at T = int")
+rik_concrete_local_eq_in_a_generic()
+    if !rik_ready() then return
+
+    rik_prints(rik_node() + raw"""
+        make() -> &Node = Node(7)
+
+        agree[T: Eq](x: T, y: T) -> bool
+            val r: &Node = make()
+            val s: &Node = make()
+
+            print(r.eq(*s))
+            x.eq(y)
+
+        main()
+            val a: &Node = Node(1)
+            val c: &Node = Node(1)
+
+            val ac = agree(a, c)
+            val aa = agree(a, a)
+            val n3 = agree(3, 3)
+
+            print(ac, aa, n3)
+        """, "true\ntrue\ntrue\nfalse true true\n")
+
+@test("in a generic struct, the 'T' field is the bound's and a concrete '&Node' field is Node's")
+rik_concrete_field_beside_a_parameter_field()
+    if !rik_ready() then return
+
+    rik_prints(rik_node() + raw"""
+        struct Both[T]
+            x: T
+            n: &Node
+
+        trait Hh
+            hh(self) -> (u64, u64)
+
+        impl[T: Hash] Hh for Both[T]
+            hh(self) -> (u64, u64) = (self.x.hash(), self.n.hash())
+
+        pair_of[T: Hash](w: Both[T], p: (T, &Node)) -> (u64, u64) = (p.0.hash(), p.1.hash())
+
+        main()
+            val a: &Node = Node(1)
+            val c: &Node = Node(1)
+            val wa = Both(a, Node(9))
+            val wc = Both(c, Node(9))
+
+            print(wa.hh().0 == keyed(a), wa.hh().0 != wc.hh().0, wa.hh().1, Both(4, Node(9)).hh().1)
+            print(pair_of(wa, (a, a)).0 == keyed(a), pair_of(wa, (c, Node(5))).1, pair_of(Both(2, a), (2, Node(6))).1)
+        """, "true true 9 9\ntrue 5 6\n")
+
+@test("a pack member is the bound's and a concrete local beside it is Node's")
+rik_pack_member_and_concrete_local()
+    if !rik_ready() then return
+
+    rik_prints(rik_node() + raw"""
+        make() -> &Node = Node(7)
+
+        packed[..A: Hash](t: (..A)) -> u64
+            var s: u64 = 0
+
+            for const i in 0..<A.len
+                s = s ^ t.i.hash()
+
+            val r: &Node = make()
+
+            print(r.hash())
+            s
+
+        main()
+            val a: &Node = Node(1)
+            val c: &Node = Node(1)
+
+            val pa = packed((a, 2))
+            val again = packed((a, 2))
+            val pc = packed((c, 2))
+            val p5 = packed((5, 2))
+
+            print(pa == again, pa != pc, p5 == (keyed(5) ^ keyed(2)))
+        """, "7\n7\n7\n7\ntrue true true\n")
+
+@test("a closure in a generic body keeps the source's decision for each receiver it captures")
+rik_closure_in_a_generic()
+    if !rik_ready() then return
+
+    rik_prints(rik_node() + raw"""
+        make() -> &Node = Node(7)
+
+        later[T: Hash](x: T) -> (u64, u64)
+            val r: &Node = make()
+            val f = () -> (x.hash(), r.hash())
+
+            f()
+
+        main()
+            val a: &Node = Node(1)
+            val c: &Node = Node(1)
+
+            print(later(a).0 == later(a).0, later(a).0 != later(c).0, later(a).1, later(3).1, later(3).0 == keyed(3))
+        """, "true true 7 7 true\n")
+
+@test("a derivation over a generic struct at a reference is still the reference's identity")
+rik_derived_generic_at_a_reference()
+    if !rik_ready() then return
+
+    rik_prints(rik_node() + raw"""
+        struct G[T] derives Eq, Hash
+            x: T
+            k: int
+
+        main()
+            val a: &Node = Node(1)
+            val c: &Node = Node(1)
+
+            print(G(a, 1) == G(a, 1), G(a, 1) == G(c, 1), keyed(G(a, 1)) == keyed(G(a, 1)), keyed(G(a, 1)) != keyed(G(c, 1)))
+        """, "true false true true\n")
+
 // -- what is not a member -------------------------------------------------------------------------
 
 @test("a reference to a trait object is not given an identity hash")

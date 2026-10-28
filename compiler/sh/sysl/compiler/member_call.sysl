@@ -843,7 +843,9 @@ call_member(cx: &Analyzer, span: Span, receiver: TExpr, name: string, args: Buf[
     // own members, which would key the table by a value its `==` never consults.
     val held = underlying(texpr_type(receiver))
 
-    if (name == "hash" || name == "eq") && hashes_by_address(held) && reached_through_bound(cx, held, name) then
+    if (name == "hash" || name == "eq") && cx.at_definition then note_bound_site(cx, span, held)
+
+    if (name == "hash" || name == "eq") && hashes_by_address(held) && reached_through_bound(cx, span, held, name) then
         return address_member(cx, span, receiver, held, name, args)
 
     // **Every value answers `to_string()` and `debug_string()`**, by the compiler, where its type has
@@ -909,13 +911,26 @@ end call_member
 
 // Whether a member call on a reference was written through a bound rather than on a reference the
 // program named: inside a derivation, where every part is asked the trait being derived, or where the
-// receiver's type is what one of the body's type parameters -- or one member of a pack -- stands for.
+// receiver is DECLARED in the generic source as one of the body's type parameters -- or one member of
+// a pack -- including where it is built from them (`p.0` of a `(T, U)`, `w.x` of a `Wrap[T]`).
 //
 // **A written member call on a reference reaches its referent** (`r.eq(*s)`, `r.hash()`), and that
 // is left as it is: both reach the same object's members, so they agree with each other. It is the
 // bound that promised the reference's own `Eq` and `Hash`, so it is the bound that gets them.
-private reached_through_bound(cx: &Analyzer, held: Type, name: string) -> bool
+//
+// **The decision is the source's, not the instantiation's.** A `val r: &Node` in a body instantiated
+// at `T = &Node` has the same type as a `T`, and is still a reference the program named: its
+// `r.hash()` is `Node`'s at every instantiation. So the walk at the definition, where `T` stands for
+// itself, files each `hash`/`eq` call site with whether its receiver was a parameter's
+// (`bound_sites`), and an instantiation reads that. A body that walk never read -- the library's,
+// read where the library was built, and a nested generic -- falls back to asking whether the
+// receiver's type is what a parameter stands for.
+private reached_through_bound(cx: &Analyzer, span: Span, held: Type, name: string) -> bool
     if derived_trait_key(cx, name).is_some() then return true
+
+    val filed = cx.an.tables.bound_sites.get(bound_site_key(cx, span))
+
+    if filed.is_some() then return filed.unwrap()
 
     for item in cx.subst
         if type_eq(underlying(item.ty), held) then return true
@@ -929,6 +944,18 @@ private reached_through_bound(cx: &Analyzer, held: Type, name: string) -> bool
 
     false
 end reached_through_bound
+
+// Files a `hash`/`eq` call site read at its generic definition: through a bound exactly when the
+// receiver's type there is a type parameter standing for itself.
+private note_bound_site(cx: &Analyzer, span: Span, held: Type)
+    val through = held match
+        Abstract(_, _) -> true
+        _ -> false
+
+    cx.an.tables.bound_sites.put(bound_site_key(cx, span), through)
+
+// A call site, by the file it is written in and where in it.
+private bound_site_key(cx: &Analyzer, span: Span) -> string = s"${cx.scope.src.name}:${span.start}"
 
 // `eq` and `hash` on a reference or a pointer, as the address's: `eq` is its `==`, and `hash` mixes
 // the address through the integers' own finalizer. Neither takes or gives back a share.
