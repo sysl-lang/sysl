@@ -1,0 +1,266 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.buf
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.{capture, Status}
+
+// **`print(a, f())` evaluates every argument, left to right, before it writes anything**, as any call
+// does. The form once wrote each value as soon as it had it, so whatever `f` printed itself landed in
+// the middle of the line (`a inside` / `1`), and an argument that trapped or returned through `?` left
+// half a line behind. Every program here runs on the counted heap and gives back everything it took.
+
+private struct PeoRun
+    state: Status
+    out: string
+    err: string
+    built: bool
+
+private peo_ready() -> bool
+    if std_root().is_err() || !clang_available()
+        print("skipped: the library or the toolchain is not on this machine")
+        return false
+    end if
+
+    true
+end peo_ready
+
+private peo_run(text: string) -> PeoRun
+    val root = make_temp_dir("sysl-peo").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+    force_alloc_counting(true)
+
+    val built = build_native_program(s"$root/main.sysl", None, None, DefaultOptimization,
+                                     Some(s"$root/built"))
+
+    force_alloc_counting(false)
+
+    built match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return PeoRun(Status.Exited(1), failure_text(why), "", false)
+        Ok(_) -> ()
+
+    val said = capture(s"$root/built", [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> PeoRun(Status.Exited(1), "could not be started", "", false)
+        Ok(o) -> PeoRun(o.status, o.text, o.err.unwrap_or(""), true)
+end peo_run
+
+// The program ran to the end, printed `want`, and gave back every allocation it made.
+private peo_prints(text: string, want: string)
+    if !peo_ready() then return
+
+    val run = peo_run(text)
+
+    assert(run.built, run.out)
+    assert(run.state.ok(), s"${run.out}\n${run.err}")
+    assert_eq(run.out, want)
+    assert(run.err == "", run.err)
+    assert(alloc_count_reported(run.err) == 0)
+end peo_prints
+
+// The program stopped with `state` (a trap is `Signalled(5)`), having printed exactly `want` -- and,
+// for a panic, its own `panic:` line after that.
+private peo_stops(text: string, state: Status, want: string)
+    if !peo_ready() then return
+
+    val run = peo_run(text)
+
+    assert(run.built, run.out)
+    assert(run.state == state, s"stopped with ${run.state}, having printed '${run.out}'")
+
+    if run.out.starts_with(want) && run.out[want.bytes.len..].starts_with("panic: ") then return
+
+    assert_eq(run.out, want)
+end peo_stops
+
+private val peo_f: string = "f() -> int\n    print(\"inside\")\n    1\n\n"
+
+@test("print(a, f()) runs f, and whatever f prints, before it writes a")
+peo_the_report()
+    peo_prints(peo_f + "main()\n    print(\"a\", f())\n", "inside\na 1\n")
+
+@test("several arguments with effects run in order, each before any of the line is written")
+peo_several_calls()
+    peo_prints(peo_f + raw"""
+        g(tag: string) -> string
+            print("g", tag)
+            tag + "!"
+
+        main()
+            print(g("one"), f(), g("two"))
+            print(f(), "mid", f())
+        """, "g one\ninside\ng two\none! 1 two!\ninside\ninside\n1 mid 1\n")
+
+@test("a local read beside an argument that changes it is read in its turn, not when it is written")
+peo_local_beside_effect()
+    peo_prints(raw"""
+        main()
+            var i = 5
+            print(i++, i, ++i, i)
+            var j = 1
+            print(j, j +:= 10, j)
+            print(j, j)
+        """, "5 6 7 7\n1 11 11\n11 11\n")
+
+@test("an argument that returns unit runs in its turn and prints as ()")
+peo_unit_argument()
+    peo_prints(raw"""
+        u()
+            print("unit")
+
+        main()
+            print("u", u(), 3)
+        """, "unit\nu () 3\n")
+
+@test("a view of a temporary is still alive when it is written")
+peo_views_of_temporaries()
+    peo_prints(peo_f + raw"""
+        mk(s: string) -> string = s + "-made"
+
+        main()
+            print(f(), mk("cd")[0..<4], mk("ef").bytes[0..<2], mk("gh"))
+        """, "inside\n1 cd-m [101, 102] gh-made\n")
+
+@test("an argument that traps writes nothing of the line")
+peo_trap_in_second_argument()
+    peo_stops(peo_f + raw"""
+        pick(xs: []const int, k: int) -> int = xs[k]
+
+        main()
+            print("before")
+            val xs = [1, 2, 3]
+            print("a", f(), pick(xs, 7), f())
+        """, Status.Signalled(5), "before\ninside\n")
+
+@test("a diverging argument writes nothing of the line")
+peo_never_argument()
+    peo_stops(peo_f + raw"""
+        main()
+            print("before")
+            print("a", f(), panic("stop"), f())
+        """, Status.Exited(1), "before\ninside\n")
+
+@test("an argument that returns through ? writes nothing of the line, and the caller goes on")
+peo_question_mark_argument()
+    peo_prints(peo_f + raw"""
+        bad(n: int) -> Result[int, string] = if n > 0 then Ok(n) else Err("no")
+
+        tried(n: int) -> Result[string, string]
+            print("t", f(), bad(n)?, s"${n}x")
+            Ok("done")
+
+        main()
+            print(tried(1).is_ok())
+            print(tried(0).is_ok())
+        """, "inside\nt 1 1 1x\ntrue\ninside\nfalse\n")
+
+@test("a return inside an argument writes nothing of the line")
+peo_return_in_argument()
+    peo_prints(peo_f + raw"""
+        early(stop: bool)
+            print("a", f(), if stop then return else 2)
+            print("went on")
+
+        main()
+            early(true)
+            early(false)
+        """, "inside\ninside\na 1 2\nwent on\n")
+
+@test("an interpolated string is built in order, and so is a print of one beside a call")
+peo_interpolation_twin()
+    peo_prints(peo_f + raw"""
+        main()
+            val s = s"${f()} and ${f()}"
+            print(s)
+            print(s"x ${f()}", f())
+        """, "inside\ninside\n1 and 1\ninside\ninside\nx 1 1\n")
+
+@test("a generic function and a method print their arguments' effects first, at two types")
+peo_generic_and_method()
+    peo_prints(peo_f + raw"""
+        struct Box
+            n: int
+
+        impl Box
+            show(self, extra: int) = print(self.n, f(), extra)
+
+        twice[T: Display](v: T) = print(v, f(), v)
+
+        main()
+            twice(7)
+            twice("s")
+            Box(4).show(5)
+        """, "inside\n7 1 7\ninside\ns 1 s\ninside\n4 1 5\n")
+
+@test("a print in a loop body and as a match arm's value runs each round's arguments first")
+peo_loop_and_match()
+    peo_prints(peo_f + raw"""
+        main()
+            for k in 0..<2
+                print(k, f())
+            val n = 2
+            n match
+                2 -> print("two", f())
+                _ -> print("other")
+        """, "inside\n0 1\ninside\n1 1\ninside\ntwo 1\n")
+
+@test("a print of call results in a @no_alloc function still allocates nothing")
+peo_no_alloc()
+    peo_prints(raw"""
+        tick(n: int) -> int
+            print("tick", n)
+            n + 1
+
+        @no_alloc
+        both(a: int) = print(a, tick(a), 'c', 2.5, tick(a + 1))
+
+        main()
+            both(3)
+        """, "tick 3\ntick 4\n3 4 c 2.5 5\n")
+
+@test("the same print builds for a freestanding Thumb target, writing through putchar alone")
+peo_freestanding()
+    if !peo_ready() then return
+
+    val dir = make_temp_dir("sysl-peo").unwrap()
+
+    write_text(s"$dir/main.sysl", raw"""
+        tick(n: int) -> int
+            print("tick", n)
+            n + 1
+
+        @no_alloc
+        both(a: int) = print(a, tick(a), 'c', 2.5, tick(a + 1))
+
+        @export("main")
+        probe() -> i32
+            both(3)
+            0
+        """).unwrap()
+
+    val text = emit_llvm_text(dir, Some("thumb-freestanding-softfp"), DefaultOptimization, buf(), Some(buf())) match
+        Err(why) -> s"did not compile: ${failure_text(why)}"
+        Ok(e) -> if e.report.is_empty() then e.text else s"did not compile: ${analysis_report(e.report)}"
+
+    remove_dir_all(dir).unwrap_or(())
+    assert(!text.starts_with("did not compile"), text)
+
+    // Both calls come before the first write, and nothing in between allocates.
+    val start = text.index_of("define dso_local void @both(").unwrap()
+    val rest = text[start..]
+    val body = rest.index_of("\n}\n") match
+        Some(end_at) -> rest[0..<end_at]
+        None -> rest
+    val first_write = body.index_of("@sysl$printi").unwrap()
+
+    assert(body[0..<first_write].contains("@tick("), body)
+    assert(!body[first_write..].contains("@tick("), body)
+    assert(!body.contains("malloc") && !body.contains("retain"), body)
+end peo_freestanding
