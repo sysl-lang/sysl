@@ -453,3 +453,126 @@ req_identity_refusals()
             val n: &N = N(1)
             print(d === n)
         """, "'===' compares two references or pointers of one type, got &D and &N")
+
+// -- a referent's own inherent `hash` and `eq` ------------------------------------------------------
+//
+// A member the referent declares beats the rule's member of the same name, as a user's name beats
+// every compiler-supplied surface; but it implements nothing, so `==`, a key and a bound still see a
+// referent with no `Eq` or `Hash`. `I` is a reference type (it has a `Drop`); `P` is a value, reached
+// through a `&sync P` and a `*P`; `L` has an `Eq` and an inherent `hash` but no `Hash`.
+
+private req_inherent_types() -> string = raw"""
+    import sysl.container.{Map, map}
+
+    struct I
+        v: int
+
+        hash(&self) -> u64 = 42
+        eq(&self, other: int) -> bool = self.v == other
+
+    impl Drop for I
+        drop(self) = ()
+
+    struct P
+        v: int
+
+        hash(self) -> u64 = 43
+        eq(self, other: int) -> bool = self.v == other
+
+    struct L derives Eq
+        v: int
+
+        hash(self) -> u64 = 44
+
+    struct W derives Eq, Hash
+        r: &I
+
+    hashed[K: Hash](k: K) -> u64 = k.hash()
+    keyed[K: Eq + Hash](a: K, b: K) -> (bool, bool) = (a == b, a.hash() == b.hash())
+
+    var x = P(1)
+
+    """
+
+@test("a written .hash or .eq on a &T reaches T's inherent method, which == and a Map key never consult")
+req_inherent_members_on_a_reference()
+    if !req_ready() then return
+
+    req_prints(req_inherent_types() + raw"""
+        main()
+            val a: &I = I(1)
+            val b: &I = I(1)
+            val m = map[&I, int]()
+
+            m.put(a, 1)
+            m.put(b, 2)
+            print(a.hash(), b.hash(), a.eq(1), a.eq(2), a == b, a == a, a === b)
+            print(m.len(), m.get_or(a, 0), m.get_or(b, 0))
+        """, "42 42 true false false true false\n2 1 2\n")
+
+@test("an inherent hash and eq reached through a &sync T and a *T, and a bound still gets the identity")
+req_inherent_members_through_sync_and_pointer()
+    if !req_ready() then return
+
+    req_prints(req_inherent_types() + raw"""
+        main()
+            val s: &sync P = P(1)
+            val t: &sync P = P(1)
+            val p: *P = &x
+
+            print(s.hash(), s.eq(1), s.eq(2), s == t, s == s, hashed(s) == 43)
+            print(p.hash(), p.eq(1), p.eq(2), hashed(p) == 43, hashed(p) == hashed(p))
+        """, "43 true false false true false\n43 true false false true\n")
+
+@test("a generic body bounded by Hash at &T, and a derived Hash over a &T field, are the identity beside an inherent hash")
+req_inherent_members_under_a_bound()
+    if !req_ready() then return
+
+    req_prints(req_inherent_types() + raw"""
+        main()
+            val a: &I = I(1)
+            val b: &I = I(1)
+
+            print(hashed(a) == hashed(a), hashed(a) == hashed(b), hashed(a) == 42, a.hash() == 42)
+            print(keyed(a, b), keyed(a, a))
+            print(W(a) == W(b), W(a) == W(a), W(a).hash() == W(a).hash())
+        """, "true false false true\n(false, false) (true, true)\nfalse true true\n")
+
+@test("an inherent hash on a referent with Eq and no Hash answers a written call, and the reference is still no key")
+req_inherent_hash_beside_eq()
+    if !req_ready() then return
+
+    req_prints(req_inherent_types() + raw"""
+        main()
+            val l: &L = L(1)
+
+            print(l.hash(), l == L(1), l == L(2))
+        """, "44 true false\n")
+    req_refused(req_inherent_types() + raw"""
+        main()
+            val m = map[&L, int]()
+            print(m.len())
+        """, "L defines 'Eq' but not 'Hash', so a reference to it compares by its value")
+    req_refused(req_inherent_types() + raw"""
+        main()
+            val l: &L = L(1)
+            print(hashed(l))
+        """, "L defines 'Eq' but not 'Hash'")
+
+@test("an inherent hash beside an impl Hash for the same type is refused as a second member of that name")
+req_inherent_beside_trait_impl_refused()
+    if !req_ready() then return
+
+    req_refused(raw"""
+        struct K
+            v: int
+
+            hash(self) -> u64 = 42
+
+        impl Hash for K
+            hash(self) -> u64 = 7
+
+        main()
+            val k: &K = K(1)
+            print(k.hash())
+        """, "type 'K' already has a member named 'hash'")

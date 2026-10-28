@@ -925,11 +925,19 @@ end call_member
 // address's would disagree with its `==`.
 private reference_member(cx: &Analyzer, span: Span, receiver: TExpr, held: Type, name: string,
                          args: Buf[Expr], expected: Option[Type]) -> Option[TExpr]
+    val bound = reached_through_bound(cx, span, held, name)
+
+    // **A member the referent declares wins over the rule's**, as a user's name always beats a
+    // compiler-supplied surface: a written `r.hash()` on a `&Opts` whose `Opts` declares an inherent
+    // `hash` is that method, whether or not `Opts` implements `Hash` (or has an `Eq` the address's
+    // hash would disagree with). Only a bound asks for the trait's member, and an inherent method of
+    // the same name does not implement the trait, so there the rule still answers.
+    if !bound && has_method_named(cx, receiver_type(held), name) then return None
+
     if name == "hash" && hash_law_breaks(cx.an, held) then
         return Some(cx.err(span, s"'hash' is not defined for ${type_show(held)}: " +
                            hash_law_refusal(cx.an, held)))
 
-    val bound = reached_through_bound(cx, span, held, name)
     val levels = through_levels(cx.an, if name == "eq" then "Eq" else "Hash", held)
 
     // A written call on a pointer reaches its pointee's member wherever the pointee has one.

@@ -189,6 +189,13 @@ compares. A member call written on a reference you named reaches the referent's 
 `r.eq(*s)`), the one level a member call sees through. A struct deriving `Eq` or `Hash` over a
 `&T` field, and a tuple of references, compare and hash each reference the same way.
 
+**A method the referent declares itself wins over the rule.** Where `Node` has an inherent `hash`
+or `eq` and no `Hash` or `Eq` implementation, `r.hash()` written on a `&Node` (or a `&sync Node`, or
+a `*Node`) calls that method, as any member call on a reference reaches its referent's. But an
+inherent method of that name implements nothing, so `==`, a `Map` key and a `[K: Hash + Eq]` body
+still see a `Node` with no `Eq` or `Hash`, and compare and hash the reference by its identity. Only
+an `impl Eq` or `impl Hash` (written or derived) changes what those answer.
+
 **A referent with an `Eq` and no `Hash` makes a reference that is no key**: its `==` is the
 referent's, and a hash of the address would give two equal references two hashes. It is refused
 rather than keyed wrongly:
