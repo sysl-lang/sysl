@@ -272,3 +272,108 @@ ipb_local_beside_binding()
             both(Cyclic(cyc(4)), Plain(0, 0))
             both(Cyclic(cyc(4)), Named(s"x${2}"))
         """, "else 2\nthen 3 2\nneither 9\nneither 9\n4 x2 9\n")
+
+// The same fault reached from a call as the scrutinee rather than a local, with an `else` that
+// assigns: the payload slot of the call's temporary was given back on the `else` edge, so the
+// assignment there trapped (or faulted) before the program printed anything.
+@test("an 'if f() is Some(s)' whose else assigns takes the else for None, and the then for Some")
+ipb_call_scrutinee_else_assigns()
+    ipb_prints(raw"""
+        refusal(x: int) -> Option[string] = if x > 0 then Some("refused") else None
+
+        main()
+            var m = ""
+            if refusal(0) is Some(why)
+                m = why
+            else
+                m = "on"
+            print(m)
+            if refusal(1) is Some(why)
+                m = why
+            else
+                m = "on"
+            print(m)
+        """, "on\nrefused\n")
+
+@test("a heap string payload from a call, assigned over the old value each round of a loop")
+ipb_call_scrutinee_in_a_loop()
+    ipb_prints(raw"""
+        refusal(x: int) -> Option[string] = if x > 0 then Some(s"refused ${x}") else None
+
+        main()
+            var m = s"start ${0}"
+            for x in 0..<4
+                if refusal(x % 2) is Some(why)
+                    m = why
+                else
+                    m = s"on ${x}"
+                print(m)
+        """, "on 0\nrefused 1\non 2\nrefused 1\n")
+
+@test("the call-scrutinee binding inside a method, either variant")
+ipb_call_scrutinee_in_a_method()
+    ipb_prints(raw"""
+        refusal(x: int) -> Option[string] = if x > 0 then Some(s"refused ${x}") else None
+
+        struct Gate
+            level: int
+
+        impl Gate
+            verdict(self) -> string
+                var m = ""
+                if refusal(self.level) is Some(why)
+                    m = why
+                else
+                    m = "on"
+                m
+
+        main()
+            print(Gate(0).verdict())
+            print(Gate(3).verdict())
+        """, "on\nrefused 3\n")
+
+@test("a Buf payload from a call, the else assigning, either variant")
+ipb_call_scrutinee_buf_payload()
+    ipb_prints(raw"""
+        import sysl.buf.{Buf, buf}
+
+        runs(n: int) -> Option[Buf[int]]
+            if n == 0 then return None
+            var b: Buf[int] = buf()
+            for i in 0..<n do b.push(i * 10)
+            Some(b)
+
+        main()
+            var total = -1
+            if runs(0) is Some(b)
+                total = b.at(0)
+            else
+                total = 0
+            print(total)
+            if runs(3) is Some(b)
+                total = b.at(2)
+            else
+                total = 0
+            print(total)
+        """, "0\n20\n")
+
+@test("the value form over a call, and the statement form in a generic function at two types")
+ipb_call_scrutinee_value_and_generic()
+    ipb_prints(raw"""
+        refusal(x: int) -> Option[string] = if x > 0 then Some(s"refused ${x}") else None
+
+        pick[T](o: Option[T], d: T) -> T
+            var r = d
+            if o is Some(v)
+                r = v
+            else
+                r = d
+            r
+
+        main()
+            var m = if refusal(0) is Some(why) then why else "on"
+            print(m)
+            m = if refusal(2) is Some(why) then why else "on"
+            print(m)
+            print(pick(refusal(0), s"d${1}"), pick(refusal(4), s"d${2}"), pick(Some(5), 0))
+        """, "on\nrefused 2\nd1 refused 4 5\n")
