@@ -39,7 +39,7 @@ sysl --version
 sysl --help
 ```
 
-**The formula supports macOS on Apple silicon only.** sysl 0.7.3 ships a single binary,
+**The formula supports macOS on Apple silicon only.** sysl 0.7.4 ships a single binary,
 `darwin-arm64`. On any other platform, build from source as described below.
 
 ## Your first compile

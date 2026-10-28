@@ -1753,11 +1753,14 @@ end scalar_subject_widened
 //
 // **A shift is not a pair**: its result is its left operand's type, and its count may be any
 // integer. So a left operand with no type of its own -- `1`, or an `if` of literals -- takes the
-// type of the position the shift stands in, never the count's: `level |= 1 << bit` over a `u32`
-// level and an `int` bit is a `u32` shift.
+// type of the position the shift stands in: `level |= 1 << bit` over a `u32` level and an `int` bit
+// is a `u32` shift.
+//
+// **Where the position says nothing, the count's type stands in**, as it would for any pair: `val
+// top = 1 << usize(depth)` is a `usize`, so `x % top` over a `usize` x needs no cast.
 private paired_operands(cx: &Analyzer, op: string, l: Expr, r: Expr,
                         numeric: Option[Type]) -> (TExpr, TExpr)
-    if (op == "<<" || op == ">>") && literal_valued(cx, l) && !literal_valued(cx, r)
+    if (op == "<<" || op == ">>") && numeric.is_some() && literal_valued(cx, l) && !literal_valued(cx, r)
         var left: Buf[Expr] = buf()
         var count: Buf[Expr] = buf()
 
@@ -1941,7 +1944,11 @@ analyze_operands(cx: &Analyzer, operands: Buf[Expr], expected: Option[Type],
     for e in operands
         soft.push(!is_literal(e) && literal_valued(cx, e))
 
+    // Where neither a typed operand nor the position settles the pair, the readings of the operands
+    // in the literal's tier do, as they did before they had a tier: `(1 << usize(d)) + 1` with
+    // nothing around it is the `usize` its shift was read at.
     val settled = firmest(operands, unless_soft(own, soft), widen, rescales).or_else(() -> expected)
+                      .or_else(() -> firmest(operands, own, widen, rescales))
     var told: Buf[Option[TExpr]] = buf()
 
     for i in 0..<operands.len()
@@ -1954,6 +1961,7 @@ analyze_operands(cx: &Analyzer, operands: Buf[Expr], expected: Option[Type],
     val firm = unless_soft(told, soft)
     val ty = literal_widened(cx, operands, firm, told, firmest(operands, firm, widen, rescales).or_else(() -> expected),
                              expected, widen, rescales).or_else(() -> if widen then float_among(operands) else None)
+                 .or_else(() -> firmest(operands, told, widen, rescales))
     var out: Buf[TExpr] = buf()
 
     for i in 0..<operands.len()

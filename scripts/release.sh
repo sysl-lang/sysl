@@ -235,7 +235,9 @@ stamp() {
     git -C $repo diff --stat
     local changed
     changed=$(git -C $repo diff --name-only | sort | tr '\n' ' ')
-    [[ $changed == "${rel}${manifestname} ${rel}sh/sysl/compiler/main.sysl " ]] || { print "the stamp touched $changed"; return 1 }
+    local expected
+    expected=$(print -rl -- ${rel}${manifestname} ${rel}sh/sysl/compiler/main.sysl | sort | tr '\n' ' ')
+    [[ $changed == $expected ]] || { print "the stamp touched $changed"; return 1 }
 
     git -C $repo commit -q -am "sysl $version" || return 1
     git -C $repo log -1 --oneline
