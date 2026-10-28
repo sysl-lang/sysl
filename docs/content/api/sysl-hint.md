@@ -1,0 +1,38 @@
+---
+title: sysl.hint
+layout: api-module
+headingShift: 0
+slugStyle: github
+module: sysl.hint
+summary: "Hints to the optimizer that change what it may assume, never what a program computes."
+requires: "no alloc"
+---
+
+## Index
+
+[`black_box`](#black_box)
+
+## Functions
+
+### `black_box`
+
+```sysl
+black_box[T](x: T) -> T
+```
+
+Answers `x` unchanged, through a step the optimizer must treat as opaque.
+
+The compiler may not assume anything about the value that comes back -- not that it is the
+constant that went in, not that nobody looked at it -- so what is computed from it is computed
+by the machine at run time, and what is computed into it is not discarded as unused. A test
+holds a constant through it to make the machine do the arithmetic rather than the compiler, and
+a benchmark holds its input and its result through it so the work being timed is neither folded
+away nor dropped.
+
+It works for a value of any type: a scalar, a struct, a reference, a slice, an `Option`. The
+value is placed in memory whose address is handed to an empty block of assembly that the
+compiler must assume reads and writes all of memory. That costs a store and a load, and no
+instruction of its own, on every processor sysl builds for, with or without a C library.
+
+It is a hint about optimization, not a guarantee of timing: it does not make code constant-time,
+and it orders nothing between threads.

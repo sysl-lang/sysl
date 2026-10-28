@@ -34,6 +34,7 @@ These pages are generated from the library's own doc comments: every declaration
 | [`sysl.fs.hosted`](sysl-fs-hosted/) |  |
 | [`sysl.fs.sys`](sysl-fs-sys/) |  |
 | [`sysl.harness`](sysl-harness/) | A test framework that runs on the target. |
+| [`sysl.hint`](sysl-hint/) | Hints to the optimizer that change what it may assume, never what a program computes. |
 | [`sysl.io`](sysl-io/) | The byte surface a program reads through, and the line cursor over it. |
 | [`sysl.io.hosted`](sysl-io-hosted/) |  |
 | [`sysl.io.sys`](sysl-io-sys/) |  |

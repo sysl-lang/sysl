@@ -1,0 +1,374 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// **`sysl.hint.black_box` is opaque to the optimizer, at no cost of its own, on every machine.** What it
+// answers is `library/sysl/hint/tests.sysl`'s; this file is what the emitted code shows. The claim is
+// about what survives clang's `-O2`, so the IR cases ask clang, each beside its control: the same
+// program without `black_box`, which must fold, so a run where both pass is one where the optimizer
+// was really trying. The other axes are the targets with no C library (Thumb, RV32, wasm32), the
+// boards that run them, and the `const` context, which refuses it.
+
+private var bbx_library_cache: Buf[Program] = buf()
+private var bbx_library_read: bool = false
+
+private bbx_library() -> Buf[Program]
+    if bbx_library_read then return bbx_library_cache
+
+    bbx_library_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> bbx_library_cache = units
+
+    bbx_library_cache
+end bbx_library
+
+private bbx_no_library() -> bool
+    if bbx_library().is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return true
+
+    false
+end bbx_no_library
+
+// The LLVM text of the whole module a source lowers to, or the first thing it was refused with.
+private bbx_ir(text: string) -> string
+    val parsed = parse(source_of("t.sysl", text))
+
+    if !parsed.ok() then return parsed.first().message
+
+    var units: Buf[Program] = buf()
+
+    for item in bbx_library()
+        units.push(item)
+
+    units.push(parsed.program)
+
+    val done = analyze_bodies(units, host_target())
+
+    if !done.reported.is_empty() then return done.reported.at(0).diag.message
+
+    val whole = program_of(done, "")
+    val promotions = post_analysis_checks(done.an, whole, buf())
+    val said = errors_of(done.an.diagnostics())
+
+    if !said.is_empty() then return analysis_report(said)
+
+    val kept = prune(strip_tests(whole), program_own(units))
+
+    ir_print_module(codegen_with_gaps(kept, host_target(), promotions).0)
+end bbx_ir
+
+// What clang's `-O2` leaves of a program. `None` where there is no clang to ask.
+private bbx_optimized(text: string) -> Option[string]
+    if !clang_available()
+        print("skipped: clang is not installed, so there is no optimizer to ask")
+        return None
+    end if
+
+    val dir = make_temp_dir("sysl-bbx").unwrap()
+    val file = s"$dir/t.ll"
+
+    write_text(file, bbx_ir(text)).unwrap()
+
+    val got = capture("clang", ["-O2", "-S", "-emit-llvm", "-o", "-", file], "", [], true).unwrap()
+
+    remove_dir_all(dir).unwrap_or(())
+    assert(got.status.ok(), s"clang refused the emitted IR:\n${got.err.unwrap_or("")}")
+    Some(got.text)
+end bbx_optimized
+
+// The lines of the first definition whose `define` line names `name`.
+private bbx_body(out: string, name: string) -> string
+    var body = ""
+    var inside = false
+
+    for l in lines_of(out)
+        if !inside && l.starts_with("define") && l.contains(name) then inside = true
+
+        if inside
+            if l == "}" then return body
+
+            body = body + l + "\n"
+        end if
+
+    body
+end bbx_body
+
+// How many lines of `text` hold `what`.
+private bbx_count(text: string, what: string) -> int
+    var n = 0
+
+    for l in lines_of(text)
+        if l.contains(what) then n += 1
+
+    n
+end bbx_count
+
+private val bbx_barrier = "asm sideeffect \"\", \"r,~{memory}"
+
+// Every kind of value, each in a function of its own, beside a control that folds. No function's name
+// is part of another's, so `bbx_body` finds the one it is asked for.
+private val bbx_kinds: string = raw"""
+    module demo
+
+    import sysl.hint.black_box
+
+    struct Pair
+        a: i32
+        b: i32
+
+    through[T](x: T) -> T = black_box(x)
+
+    @export
+    control() -> i32 = 6 * 7
+
+    @export
+    one_int() -> i32 = black_box(6) * 7
+
+    @export
+    one_wide() -> u128 = black_box(u128(3)) << 100
+
+    @export
+    one_float() -> f32 = black_box(1.5f32) * 2.0f32
+
+    @export
+    one_pair() -> i32
+        val p = black_box(Pair(5, 9))
+        p.a * p.b
+
+    @export
+    one_slice() -> usize = black_box("abcdef"[1..<4]).len
+
+    @export
+    one_option() -> i32 = black_box(Some(4)).unwrap_or(0)
+
+    @export
+    one_generic() -> i32 = through(6) * 7
+
+    @export
+    lost_loop(n: i32)
+        var sum = 0
+        for i in 0..<n do sum += i * i
+
+    @export
+    kept_loop(n: i32)
+        var sum = 0
+        for i in 0..<n do sum += i * i
+        black_box(sum)
+    """
+
+@test("without black_box the product folds, which is the control")
+bbx_the_control_folds()
+    if bbx_no_library() then return
+
+    bbx_optimized(bbx_kinds) match
+        None -> ()
+        Some(out) ->
+            val body = bbx_body(out, "control")
+
+            assert(body.contains("ret i32 42"), body)
+            assert_eq(bbx_count(body, bbx_barrier), 0)
+
+@test("through black_box the product is computed at run time, with one empty barrier and no call")
+bbx_an_integer_is_not_folded()
+    if bbx_no_library() then return
+
+    bbx_optimized(bbx_kinds) match
+        None -> ()
+        Some(out) ->
+            val body = bbx_body(out, "one_int")
+
+            assert(!body.contains("ret i32 42"), body)
+            assert(body.contains("mul i32"), body)
+            assert_eq(bbx_count(body, bbx_barrier), 1)
+            assert(!body.contains("call i32 @"), body)
+
+@test("and so is the arithmetic on a u128, an f32, a struct's fields, a slice's length and an Option")
+bbx_every_kind_is_not_folded()
+    if bbx_no_library() then return
+
+    bbx_optimized(bbx_kinds) match
+        None -> ()
+        Some(out) ->
+            val wide = bbx_body(out, "one_wide")
+            val float = bbx_body(out, "one_float")
+            val pair = bbx_body(out, "one_pair")
+            val slice = bbx_body(out, "one_slice")
+            val option = bbx_body(out, "one_option")
+
+            assert(wide.contains("shl i128"), wide)
+            assert(float.contains("fmul float") || float.contains("fadd float"), float)
+            assert(pair.contains("mul i32"), pair)
+            assert(!slice.contains("ret i64 3"), slice)
+            assert(!option.contains("ret i32 4"), option)
+
+            for body in [wide, float, pair, slice, option]
+                assert_eq(bbx_count(body, bbx_barrier), 1)
+
+@test("a generic caller's own type parameter goes through it the same way")
+bbx_a_generic_caller()
+    if bbx_no_library() then return
+
+    bbx_optimized(bbx_kinds) match
+        None -> ()
+        Some(out) ->
+            val body = bbx_body(out, "one_generic")
+
+            assert(!body.contains("ret i32 42"), body)
+            assert_eq(bbx_count(body, bbx_barrier), 1)
+
+@test("work whose result goes into it is kept, and the same work unobserved is dropped")
+bbx_a_result_is_not_discarded()
+    if bbx_no_library() then return
+
+    bbx_optimized(bbx_kinds) match
+        None -> ()
+        Some(out) ->
+            val lost = bbx_body(out, "lost_loop")
+            val kept = bbx_body(out, "kept_loop")
+
+            assert(!lost.contains("br "), lost)
+            assert(lost.contains("ret void"), lost)
+            assert(kept.contains("mul "), kept)
+            assert_eq(bbx_count(kept, bbx_barrier), 1)
+
+@test("a const function may not call it, because it runs while compiling and it holds an asm block")
+bbx_refused_while_compiling()
+    if bbx_no_library() then return
+
+    val said = bbx_ir("module demo\n\nimport sysl.hint.black_box\n\nconst folded() -> int = black_box(3)\n")
+
+    assert(said.contains("'demo.folded' is 'const', so it runs while compiling, and it calls 'sysl.hint.black_box', " +
+                         "which holds an 'asm' block"), said)
+
+// -- the machines with no C library ---------------------------------------------------------------------
+
+private bbx_ready() -> bool = std_root().is_ok() && clang_available()
+
+private bbx_build_c(text: string, target: string) -> (int, string)
+    val root = make_temp_dir("sysl-bbx-c").unwrap()
+
+    write_text(s"$root/sysl.hocon","package {\n  name = \"probe\"\n}\n").unwrap()
+    write_text(s"$root/main.sysl", forms_imported(text)).unwrap()
+
+    var said: Buf[string] = buf()
+    val sink = &said
+    var args: [7]string = ["sysl", "build-c", "--target", target, "-o", s"$root/probe.a", root]
+    val code = run_cli(args[..], piece -> sink.push(piece))
+
+    reset_search_paths()
+    remove_dir_all(root).unwrap_or(())
+
+    var text_out = ""
+
+    for piece in said
+        text_out = text_out + piece
+
+    (code, text_out)
+end bbx_build_c
+
+private val bbx_bare: string = raw"""
+    import sysl.hint.black_box
+
+    struct Pair
+        a: u32
+        b: u8
+
+    struct Held
+        n: u32
+
+    impl Drop for Held
+        drop(self) = ()
+
+    through[T](x: T) -> T = black_box(x)
+
+    @no_alloc
+    squares(n: u32) -> u32
+        var sum: u32 = 0
+        for i in 0..<black_box(n) do sum += i * i
+        black_box(sum)
+
+    @export("main")
+    probe() -> u32
+        val xs = [1, 2, 3]
+        val h = Held(4)
+        val p = black_box(Pair(2, 3))
+        val s = black_box(xs[0..<2])
+        val o = black_box(Some(u16(5)))
+        val r = black_box(h)
+
+        u32(black_box(u8(1))) + u32(black_box(u64(2))) + u32(black_box(u128(3))) + u32(black_box(i16(-4))) +
+            u32(black_box(2.5f32)) + p.a + u32(p.b) + u32(s.len) + u32(o.unwrap_or(0)) + r.n +
+            through(u32(6)) + squares(3)
+    """
+
+@test("it builds with no C library for Thumb, RV32 and wasm32, at every kind of value")
+bbx_builds_bare()
+    if !bbx_ready() then return
+
+    for target in ["thumb-freestanding-softfp", "thumbv6m-freestanding", "riscv32-freestanding",
+                   "wasm32-freestanding"]
+        val (code, said) = bbx_build_c(bbx_bare, target)
+
+        assert(!said.contains("error"), s"$target: $said")
+        assert_eq(code, 0)
+    end for
+
+// -- the boards -----------------------------------------------------------------------------------------
+
+private val bbx_board_body: string = raw"""
+    struct Pair
+        a: u32
+        b: u8
+
+    through[T](x: T) -> T = black_box(x)
+
+    var wrong = 0
+    val xs = [10, 20, 30]
+
+    if black_box(u8(200)) + 50 != 250 then wrong += 1
+    if black_box(u64(1)) << 40 != 0x10000000000 then wrong += 1
+    if black_box(u128(1)) << 100 != u128(1) << 100 then wrong += 1
+    if black_box(i32(-7)) * 6 != -42 then wrong += 1
+    if black_box(2.5f32) * 2.0f32 != 5.0f32 then wrong += 1
+    if black_box(Pair(3, 4)).a != 3 then wrong += 1
+    if black_box(xs[1..<3])[1] != 30 then wrong += 1
+    if black_box(Some(9)).unwrap_or(0) != 9 then wrong += 1
+    if through(u16(0xBEEF)) != 0xBEEF then wrong += 1
+
+    w.write("bbx ".bytes)
+    wrong.display(w, FormatSpec(0, -1, false))
+    w.write(" done".bytes)
+    """
+
+@test("on every board it answers what went in, with the arithmetic done by the machine")
+bbx_on_the_boards()
+    var bad: Buf[string] = buf()
+    var ran: usize = 0
+
+    for b in qemu_boards()
+        ran += 1
+
+        var files: Buf[(string, string)] = buf()
+
+        files.push(("p.sysl", "import board.*\nimport sysl.hint.black_box\n\nval w = console()\n\n" + bbx_board_body))
+        files.push(("board/board.sysl", qemu_board_module(b)))
+
+        qemu_boot(b, files) match
+            Err(why) -> bad.push(s"${b.name} (${b.target}): $why")
+            Ok(r) ->
+                if !r.status.ok() || !r.out.contains("bbx 0 done") then
+                    bad.push(s"${b.name} (${b.target}): ${qemu_said(b, r)}")
+    end for
+
+    assert(ran > 0, "no board was booted")
+    assert(bad.is_empty(), joined(bad, "\n"))
+end bbx_on_the_boards
