@@ -776,7 +776,7 @@ private record_symbols(e: *Emit, p: TProgram)
 
         if f.variadic && f.exported.is_some() && !overridden_weak(p, f)
             e.symbols.push((f.name, f.exported.unwrap()))
-        else if is_displaced(e, f.name)
+        else if is_displaced(e, f.name) || spells_c_name(p, f.name)
             e.symbols.push((f.name, s"${f.name}${ModuleSep}${ModuleSep}sysl"))
 
         if f.variadic
@@ -787,6 +787,51 @@ private record_symbols(e: *Emit, p: TProgram)
         Some(en) -> e.symbols.push((en.func, "$$main"))
         None -> ()
 end record_symbols
+
+// **Whether a root function's key is a C symbol this compilation states or may be made to call.** A
+// root module's function has no module to carry into its key, so the key is its bare name and is
+// emitted as that symbol (`reference/ffi.md`) -- which, where the name is `write` or `malloc`, is
+// beside the compiler's own `declare` of it an invalid redefinition, and where the name is `memcpy`
+// is the definition every call the optimizer or a runtime routine makes to it resolves to. Such a
+// function is laid down under the displaced spelling, as root storage is (`$`-led there): an
+// `extern` or an export of the program's own, a name the compiler declares for its printing, its
+// stop, its heap or its counted heap, a routine the optimizer may call on its own
+// (`is_libcall_name`), and the runtime's namespaces, `sysl_` and the implementation's `__`. The
+// entry is named by `record_symbols` itself.
+private spells_c_name(p: TProgram, key: string) -> bool
+    if module_of(key) != ModuleRoot || !c_identifier(key) then return false
+
+    p.entry match
+        Some(en) -> if en.func == key then return false
+        None -> ()
+
+    if key.starts_with("sysl_") || key.starts_with("__") then return true
+    if is_libcall_name(key) || names_c_symbol(p, key) then return true
+
+    for s in compiler_c_names()
+        if s == key then return true
+
+    false
+end spells_c_name
+
+// The C names the compiler declares on its own account, whatever the program says: what the test
+// dispatcher and the bounds default write with, what the stop flushes with and ends by, the heap the
+// manifest names, and what the counted heap reports through.
+private compiler_c_names() -> Buf[string]
+    var out: Buf[string] = buf()
+
+    out.push("write")
+    out.push(trap_flush_symbol())
+    out.push("abort")
+    out.push("exit")
+    out.push(malloc_symbol())
+    out.push(free_symbol())
+
+    for s in alloc_count_symbols()
+        out.push(s)
+
+    out
+end compiler_c_names
 
 // Whether an export elsewhere in the program has claimed this key as its symbol -- whoever else
 // wanted it.

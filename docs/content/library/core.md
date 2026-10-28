@@ -462,7 +462,22 @@ true
 
 `print(a, b, c)` is **a desugaring, not a variadic function**. Each argument is looked at
 individually, its static type chooses a one-argument renderer, and the call becomes that sequence of
-calls with a space between and a newline at the end.
+calls with a space between and a newline at the end. **Like any call, it evaluates every argument,
+left to right, before it writes anything**: what an argument prints itself comes out before the
+line, and an argument that traps, panics or returns through `?` leaves nothing of the line behind.
+
+```sysl
+f() -> int
+    print("inside f")
+    1
+
+print("a", f())
+```
+
+```output
+inside f
+a 1
+```
 
 | static type | renderer | what it does |
 |---|---|---|
