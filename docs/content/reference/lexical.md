@@ -1199,7 +1199,8 @@ level, and its indentation is again ignored.
 
 **A comma at the block's own level ends the block, unless the line is a multi-assignment.** A line
 that is a list of places followed by an assignment operator is a statement of the block, and every
-comma on it, including those between the values, belongs to that statement:
+comma on it, including those between the values, belongs to that statement. The places may be
+written in parentheses, `(a, b) = 5, 6`, and the line is read the same way:
 
 ```sysl
 call(f: () -> unit) = f()
