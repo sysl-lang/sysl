@@ -25,6 +25,16 @@ private rgp_tests() -> Buf[TTest]
     out
 end rgp_tests
 
+// The names `--file` was given: one, or two where the second is not empty.
+private rgp_in(first: string, second: string) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    out.push(first)
+
+    if second != "" then out.push(second)
+    out
+end rgp_in
+
 private rgp_names(tests: Buf[TTest]) -> string
     var out = ""
 
@@ -48,16 +58,25 @@ rgp_a_file_is_named_by_whole_components()
 
 @test("--file keeps exactly the tests written in that file")
 rgp_a_file_selects_its_own_tests()
-    assert_eq(rgp_names(selected_in(rgp_tests(), None, Some("tests_arc"))), "one two six ")
-    assert_eq(rgp_names(selected_in(rgp_tests(), None, Some("x/tests_arc.sysl"))), "one two ")
-    assert_eq(rgp_names(selected_in(rgp_tests(), None, Some("tests_arcs"))), "three ")
-    assert_eq(rgp_names(selected_in(rgp_tests(), Some("tw"), Some("tests_arc"))), "two ")
-    assert(selected_in(rgp_tests(), None, Some("tests_nothing")).is_empty(), "no such file")
+    assert_eq(rgp_names(selected_in(rgp_tests(), None, rgp_in("tests_arc", ""))), "one two six ")
+    assert_eq(rgp_names(selected_in(rgp_tests(), None, rgp_in("x/tests_arc.sysl", ""))), "one two ")
+    assert_eq(rgp_names(selected_in(rgp_tests(), None, rgp_in("tests_arcs", ""))), "three ")
+    assert_eq(rgp_names(selected_in(rgp_tests(), Some("tw"), rgp_in("tests_arc", ""))), "two ")
+    assert(selected_in(rgp_tests(), None, rgp_in("tests_nothing", "")).is_empty(), "no such file")
+
+@test("several --file names keep the tests of each, once, in the run's order")
+rgp_several_files_select_their_union()
+    assert_eq(rgp_names(selected_in(rgp_tests(), None, rgp_in("x/tests_arc", "tests_arcs"))), "one two three ")
+    assert_eq(rgp_names(selected_in(rgp_tests(), None, rgp_in("tests_arcs", "x/tests_arc"))), "one two three ")
+    assert_eq(rgp_names(selected_in(rgp_tests(), None, rgp_in("tests_arcs", "tests_arcs.sysl"))), "three ")
+    assert_eq(rgp_names(selected_in(rgp_tests(), Some("o"), rgp_in("tests_arc", "tests_other"))), "one two unl_four ")
+    assert_eq(rgp_names(selected_in(rgp_tests(), None, rgp_in("tests_arcs", "tests_nothing"))), "three ")
+    assert_eq(rgp_names(selected_in(rgp_tests(), None, buf())), "one two three unl_four five six ")
 
 @test("a name filter selects what it did, and never a test because of the file it is in")
 rgp_a_name_filter_is_unchanged()
     assert_eq(rgp_names(selected_tests(rgp_tests(), Some("unl_"))), "unl_four ")
-    assert_eq(rgp_names(selected_in(rgp_tests(), Some("unl_"), None)), "unl_four ")
+    assert_eq(rgp_names(selected_in(rgp_tests(), Some("unl_"), buf())), "unl_four ")
     assert_eq(selected_tests(rgp_tests(), None).len(), 6)
     assert_eq(rgp_names(selected_tests(rgp_tests(), Some("arc"))), "")
 
@@ -68,9 +87,10 @@ rgp_a_file_selects_a_refused_program()
     files.push("/r/tests/refused/a.sysl")
     files.push("/r/tests/refused/ab.sysl")
 
-    assert_eq(selected_refused(files, None, Some("a")).len(), 1)
-    assert_eq(selected_refused(files, None, Some("refused/ab.sysl")).at(0), "/r/tests/refused/ab.sysl")
-    assert_eq(selected_refused(files, Some("ab"), Some("a")).len(), 0)
+    assert_eq(selected_refused(files, None, rgp_in("a", "")).len(), 1)
+    assert_eq(selected_refused(files, None, rgp_in("refused/ab.sysl", "")).at(0), "/r/tests/refused/ab.sysl")
+    assert_eq(selected_refused(files, None, rgp_in("a", "ab")).len(), 2)
+    assert_eq(selected_refused(files, Some("ab"), rgp_in("a", "")).len(), 0)
     assert_eq(selected_refused(files, None).len(), 2)
 
 // A package with tests in two files, one name a prefix of the other's.
@@ -114,3 +134,33 @@ rgp_the_command_runs_one_file()
 
     remove_dir_all(root).unwrap_or(())
 end rgp_the_command_runs_one_file
+
+@test("sysl test with a repeated --file runs every named file in one invocation")
+rgp_the_command_runs_several_files()
+    if !clx_ready() then return
+
+    val root = rgp_package()
+    val (code, out, err) = clx_ran(["sysl", "test", root, "--file", "one", "--file", "ones"])
+
+    assert(code != Fine, out + err)
+    assert(out.contains("running 3 tests"), out)
+    assert(out.contains("first") && out.contains("second") && out.contains("third"), out)
+
+    val (dup, dup_out, dup_err) = clx_ran(["sysl", "test", root, "--file", "one", "--file", "one.sysl", "--file", "one"])
+
+    assert_eq(dup, Fine, dup_out + dup_err)
+    assert(dup_out.contains("running 2 tests of 3"), dup_out)
+
+    val (mixed, mixed_out, mixed_err) = clx_ran(["sysl", "test", root, "--file", "one", "--file", "nope"])
+
+    assert_eq(mixed, Misused, mixed_out)
+    assert(mixed_err.contains("in file 'nope'"), mixed_err)
+    assert_eq(mixed_out, "")
+
+    val (filtered, filtered_out, _) = clx_ran(["sysl", "test", root, "--file", "one", "--file", "ones", "--filter", "sec"])
+
+    assert_eq(filtered, Fine, filtered_out)
+    assert(filtered_out.contains("running 1 test of 3"), filtered_out)
+
+    remove_dir_all(root).unwrap_or(())
+end rgp_the_command_runs_several_files

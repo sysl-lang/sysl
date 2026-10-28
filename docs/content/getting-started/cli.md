@@ -416,6 +416,12 @@ does not also run `clamps.sysl`. `--filter` and `--file` are independent: given 
 match each. A refused program under `tests/refused/` is a file of its own, so `--file` selects one
 the same way.
 
+**`--file` may be repeated**: `sysl test . --file clamp --file geom/lerp` runs the tests of both files
+in one invocation, each test once (naming a file twice, or by two spellings, does not run it twice).
+A name that reaches no file holding a test is refused, naming it, even when the others match. **`--filter`
+is not repeatable**: given twice, the last one counts. Both flags work with `--std` and with
+`SYSL_DOCS`, which they select among the tests the binary holds.
+
 **`--keep-binary <dir>` leaves a copy of the test binary in `<dir>`** as `<project>-tests` and prints
 `kept: <path>`. A binary replayed from the run cache is copied too; the cache entry stays. **A
 `-fsanitize=` in `SYSL_EXTRA_CFLAGS` is confirmed before any test runs**: the report starts with

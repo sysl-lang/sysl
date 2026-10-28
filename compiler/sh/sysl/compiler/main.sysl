@@ -968,7 +968,7 @@ private test_command(args: []string, say: string -> unit, note: string -> unit,
     var named: Option[string] = None
     var cc: Option[string] = None
     var filter: Option[string] = None
-    var within: Option[string] = None
+    var within: Buf[string] = buf()
     var keep: Option[string] = None
     var fail_fast = false
     var std = false
@@ -1035,7 +1035,7 @@ private test_command(args: []string, say: string -> unit, note: string -> unit,
 
             if flag == "--target" then named = Some(args[i])
             else if flag == "--cc" then cc = Some(args[i])
-            else if flag == "--file" then within = Some(args[i])
+            else if flag == "--file" then within.push(args[i])
             else if flag == "--keep-binary" then keep = Some(args[i])
             else filter = Some(args[i])
         else if args[i] == "--fail-fast"
@@ -1171,7 +1171,7 @@ private bad_timeout(text: string) -> string =
 private test_members(members: Buf[WorkspaceMember], named: Option[string], cc: Option[string],
                      opts: TestOptions, asked: TestAsked, std: bool, named_level: Option[string],
                      say: string -> unit, note: string -> unit, report: string -> unit,
-                     within: Option[string], keep: Option[string]) -> int
+                     within: Buf[string], keep: Option[string]) -> int
     var failed: Buf[string] = buf()
     var tested: usize = 0
 
@@ -1197,7 +1197,7 @@ end test_members
 // One project's suite, once the command line has been read.
 private test_project(file: string, named: Option[string], cc: Option[string], given: TestOptions,
                      asked: TestAsked, std: bool, named_level: Option[string], note: string -> unit,
-                     report: string -> unit, within: Option[string], keep: Option[string]) -> int
+                     report: string -> unit, within: Buf[string], keep: Option[string]) -> int
     // The package's own `test` block, under whatever the command line said.
     val settings = test_settings_of(file)
 
@@ -1294,22 +1294,37 @@ end RefusedRun
 // `--file` naming no file that has a test is the same mistake as a filter matching nothing, and is
 // said the same way, with the file named.
 private nothing_to_run(file: string, all: Buf[TTest], programs: Buf[string], filter: Option[string],
-                       within: Option[string], note: string -> unit) -> Option[int]
+                       within: Buf[string], note: string -> unit) -> Option[int]
     if all.is_empty() && programs.is_empty()
         note(s"no '@test' functions in $file")
         return Some(Fine)
     end if
 
     if selected_in(all, filter, within).is_empty() && selected_refused(programs, filter, within).is_empty()
-        val asked = within match
-            None -> s"'${filter.unwrap_or("")}'"
-            Some(named) -> filter match
-                None -> s"in file '$named'"
-                Some(f) -> s"'$f' in file '$named'"
+        val named = join(within.view(), "', '")
+        val asked = if within.is_empty() then s"'${filter.unwrap_or("")}'"
+                    else if filter.is_none() then s"in file '$named'"
+                    else s"'${filter.unwrap()}' in file '$named'"
 
         note(s"no test matches $asked — ${all.len() + programs.len()} to choose from")
         return Some(Fine)
     end if
+
+    // A name that reaches no file with a test is a mistake even when others do run: a typo would
+    // otherwise be skipped without a word.
+    for named in within
+        var found = false
+
+        for item in all
+            if file_named(item.file, named) then found = true
+
+        for item in programs
+            if file_named(item, named) then found = true
+
+        if !found
+            note(s"no test matches in file '$named' — ${all.len() + programs.len()} to choose from")
+            return Some(Misused)
+        end if
 
     None
 end nothing_to_run
@@ -1318,7 +1333,7 @@ end nothing_to_run
 // whole point of it being there. `exe` is empty where no `@test` function was chosen.
 private tests_run(file: string, exe: string, all: Buf[TTest], opts: TestOptions, seconds: int,
                   discard: bool, run: RefusedRun, note: string -> unit, report: string -> unit,
-                  within: Option[string], keep: Option[string]) -> int
+                  within: Buf[string], keep: Option[string]) -> int
     nothing_to_run(file, all, run.files, opts.filter, within, note) match
         Some(code) -> return code
         None -> ()
