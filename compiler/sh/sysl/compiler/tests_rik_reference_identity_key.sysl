@@ -7,14 +7,15 @@ import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
 import sysl.process.capture
 import sysl.text.replace_all
 
-// **A reference is its own key** (`reference/memory.md § &T — counted references`): `&T` and
-// `*T` meet `Hash` by the address they hold, for every `T`, exactly as they meet `Eq` by it. So a
-// table keyed on references keys by identity -- two distinct objects holding equal values are two
-// keys, the same object twice is one -- and a referent with no `Hash` of its own is a key all the
-// same. A call made THROUGH a bound at a reference type (`k.hash()`, `a.eq(b)` in a `[K: Hash + Eq]`
-// body, a tuple's or a derivation's parts) is the address's; a member call written on a reference
-// the program named (`r.hash()`, `r.eq(*s)`) still reaches the referent's, and the two agree with
-// each other.
+// **A reference whose referent has no `Eq` and no `Hash` is its own key** (`reference/memory.md §
+// References compare through their referent`): such a `&T` meets `Hash` and `Eq` by the address it
+// holds, so a table keyed on it keys by identity -- two distinct objects holding equal values are two
+// keys, the same object twice is one. That is `Cell` and `Plain` below. A `*T` is the address's
+// whatever `T` defines. **A referent that has them** (`Node`) is compared and hashed through, by a
+// call made through a bound (`k.hash()`, `a.eq(b)` in a `[K: Hash + Eq]` body, a tuple's or a
+// derivation's parts) and by a member call written on the reference alike, so the two agree.
+// `tests_req_reference_eq.sysl` holds the matrix of the through rule; this file holds the identity
+// it falls back to, and that both kinds of call keep agreeing.
 //
 // Skipped cells: a reference to a trait object, which is two words and meets `Hash` through its
 // table where its trait asks for one -- it is refused below rather than given an identity; separate
@@ -108,6 +109,9 @@ private rik_node() -> string = raw"""
     struct Plain
         v: int
 
+    struct Cell
+        level: int
+
     same_call[T: Eq](a: T, b: T) -> bool = a.eq(b)
     same_op[T: Eq](a: T, b: T) -> bool = a == b
     keyed[T: Hash](x: T) -> u64 = x.hash()
@@ -122,9 +126,9 @@ rik_pair_of_references_is_a_key()
 
     rik_prints(rik_node() + raw"""
         main()
-            val a: &Node = Node(1)
-            val b: &Node = Node(1)
-            val m = map[(&Node, &Node), int]()
+            val a: &Cell = Cell(1)
+            val b: &Cell = Cell(1)
+            val m = map[(&Cell, &Cell), int]()
 
             m.put((a, b), 1)
             m.put((b, a), 2)
@@ -138,19 +142,15 @@ rik_hash_consing_table()
     if !rik_ready() then return
 
     rik_prints(rik_node() + raw"""
-        struct Pair
-            l: &Node
-            r: &Node
-
         main()
-            val leaf: &Node = Node(0)
-            val other: &Node = Node(0)
-            val made = map[(&Node, &Node), &Node]()
+            val leaf: &Cell = Cell(0)
+            val other: &Cell = Cell(0)
+            val made = map[(&Cell, &Cell), &Cell]()
             var count = 0
 
             for k in [(leaf, leaf), (leaf, other), (leaf, leaf), (other, leaf), (leaf, other)]
                 if !made.has(k)
-                    made.put(k, Node(k.0.level + k.1.level + 1))
+                    made.put(k, Cell(k.0.level + k.1.level + 1))
                     count += 1
 
             print(count, made.len(), made.get((leaf, leaf)).unwrap() == made.get((leaf, leaf)).unwrap())
@@ -162,11 +162,11 @@ rik_set_of_references()
 
     rik_prints(rik_node() + raw"""
         main()
-            val a: &Node = Node(1)
-            val b: &Node = Node(1)
-            val s = set[&Node]()
+            val a: &Cell = Cell(1)
+            val b: &Cell = Cell(1)
+            val s = set[&Cell]()
 
-            print(s.add(a), s.add(b), s.add(a), s.len(), s.has(a), s.has(Node(1)))
+            print(s.add(a), s.add(b), s.add(a), s.len(), s.has(a), s.has(Cell(1)))
         """, "true true false 2 true false\n")
 
 @test("a referent with no Hash and no Eq of its own is a key by identity")
@@ -201,7 +201,7 @@ rik_value_keys_unchanged()
 
 // -- through a bound --------------------------------------------------------------------------------
 
-@test("'a.eq(b)' through an Eq bound at a reference compares identities (it used to reach Node.eq and be refused)")
+@test("'a.eq(b)' through an Eq bound at a reference is the referent's where it has one, the identity where not")
 rik_eq_through_a_bound()
     if !rik_ready() then return
 
@@ -215,9 +215,9 @@ rik_eq_through_a_bound()
             print(same_call(a, b), same_call(a, a), same_op(a, b), same_op(a, a))
             print(same_call(p, q), same_call(p, p))
             print(same_call(Node(1), Node(1)), same_call(*a, *b))
-        """, "false true false true\nfalse true\ntrue true\n")
+        """, "true true true true\nfalse true\ntrue true\n")
 
-@test("'x.hash()' through a Hash bound at a reference is the address's, and the hash law holds")
+@test("'x.hash()' through a Hash bound at a reference is the referent's or the address's, and the hash law holds")
 rik_hash_through_a_bound()
     if !rik_ready() then return
 
@@ -226,9 +226,12 @@ rik_hash_through_a_bound()
             val a: &Node = Node(7)
             val b: &Node = Node(7)
             val c = a
+            val p: &Plain = Plain(7)
+            val q: &Plain = Plain(7)
 
-            print(keyed(a) == keyed(c), keyed(a) != keyed(b), keyed(*a) == keyed(*b), keyed(*a))
-        """, "true true true 7\n")
+            print(keyed(a) == keyed(c), keyed(a) == keyed(b), keyed(*a) == keyed(*b), keyed(a))
+            print(keyed(p) == keyed(p), keyed(p) != keyed(q))
+        """, "true true true 7\ntrue true\n")
 
 @test("a member call written on a reference reaches the referent's, and eq and hash agree there")
 rik_written_member_reaches_the_referent()
@@ -240,9 +243,9 @@ rik_written_member_reaches_the_referent()
             val b: &Node = Node(7)
 
             print(a.eq(*b), a.hash() == b.hash(), a.hash(), a == b)
-        """, "true true 7 false\n")
+        """, "true true 7 true\n")
 
-@test("a raw pointer meets Hash and Eq by its address through a bound")
+@test("a raw pointer meets Hash and Eq by its address through a bound, though its pointee has both")
 rik_raw_pointer_through_a_bound()
     if !rik_ready() then return
 
@@ -290,16 +293,16 @@ rik_tuple_and_option_of_references()
 
     rik_prints(rik_node() + raw"""
         main()
-            val a: &Node = Node(1)
-            val b: &Node = Node(1)
-            val oa: Option[&Node] = Some(a)
-            val ob: Option[&Node] = Some(b)
+            val a: &Cell = Cell(1)
+            val b: &Cell = Cell(1)
+            val oa: Option[&Cell] = Some(a)
+            val ob: Option[&Cell] = Some(b)
 
             print(keyed((a, b)) == keyed((a, b)), keyed((a, b)) != keyed((b, a)), (a, b) == (a, b), (a, b) == (b, a))
             print(oa == ob, oa == Some(a), same_call(oa, ob), same_call(oa, Some(a)))
         """, "true true true false\nfalse true false true\n")
 
-@test("a derived Eq and Hash over a reference field are the field's identity, so they agree")
+@test("a derived Eq and Hash over a reference field are the field's identity or its referent's, so they agree")
 rik_derived_over_a_reference_field()
     if !rik_ready() then return
 
@@ -323,14 +326,14 @@ rik_derived_over_a_reference_field()
             m.put(Holder(p, 1), 3)
             print(Holder(p, 1) == Holder(p, 1), Holder(p, 1) == Holder(q, 1), m.len(), m.get_or(Holder(p, 1), 0))
             print(ByNode(a) == ByNode(b), ByNode(a).hash() == ByNode(a).hash(), ByNode(a).hash() != ByNode(b).hash())
-        """, "true false 2 3\nfalse true true\n")
+        """, "true false 2 3\ntrue true false\n")
 
-// -- the source decides, not the instantiation ------------------------------------------------------
+// -- a bound and a written call agree ---------------------------------------------------------------
 //
 // Whether a call is through a bound is read off the generic SOURCE: a receiver declared as a type
 // parameter (or built from one) is the bound's, and a reference the body names with its concrete type
-// is a written member call, reaching the referent, at every instantiation -- including the one whose
-// parameter stands for that very type.
+// is a written member call, reaching the referent, at every instantiation. At a referent with `Eq`
+// and `Hash` both reach it, so the answers below are the referent's on either side.
 
 @test("a concrete '&Node' local in a generic body hashes by Node.hash at T = &Node and at T = int")
 rik_concrete_local_hash_in_a_generic()
@@ -360,7 +363,7 @@ rik_concrete_local_hash_in_a_generic()
             val h3 = both(3)
 
             print(ha == again, ha != hc, h3 == keyed(3))
-        """, "7 7 7\n7 7 7\n7 7 7\n7 7 7\ntrue true true\n")
+        """, "7 7 7\n7 7 7\n7 7 7\n7 7 7\ntrue false true\n")
 
 @test("a concrete '&Node' local in a generic body compares by Node.eq at T = &Node and at T = int")
 rik_concrete_local_eq_in_a_generic()
@@ -385,7 +388,7 @@ rik_concrete_local_eq_in_a_generic()
             val n3 = agree(3, 3)
 
             print(ac, aa, n3)
-        """, "true\ntrue\ntrue\nfalse true true\n")
+        """, "true\ntrue\ntrue\ntrue true true\n")
 
 @test("in a generic struct, the 'T' field is the bound's and a concrete '&Node' field is Node's")
 rik_concrete_field_beside_a_parameter_field()
@@ -412,7 +415,7 @@ rik_concrete_field_beside_a_parameter_field()
 
             print(wa.hh().0 == keyed(a), wa.hh().0 != wc.hh().0, wa.hh().1, Both(4, Node(9)).hh().1)
             print(pair_of(wa, (a, a)).0 == keyed(a), pair_of(wa, (c, Node(5))).1, pair_of(Both(2, a), (2, Node(6))).1)
-        """, "true true 9 9\ntrue 5 6\n")
+        """, "true false 9 9\ntrue 5 6\n")
 
 @test("a pack member is the bound's and a concrete local beside it is Node's")
 rik_pack_member_and_concrete_local()
@@ -442,7 +445,7 @@ rik_pack_member_and_concrete_local()
             val p5 = packed((5, 2))
 
             print(pa == again, pa != pc, p5 == (keyed(5) ^ keyed(2)))
-        """, "7\n7\n7\n7\ntrue true true\n")
+        """, "7\n7\n7\n7\ntrue false true\n")
 
 @test("a closure in a generic body keeps the source's decision for each receiver it captures")
 rik_closure_in_a_generic()
@@ -462,9 +465,9 @@ rik_closure_in_a_generic()
             val c: &Node = Node(1)
 
             print(later(a).0 == later(a).0, later(a).0 != later(c).0, later(a).1, later(3).1, later(3).0 == keyed(3))
-        """, "true true 7 7 true\n")
+        """, "true false 7 7 true\n")
 
-@test("a derivation over a generic struct at a reference is still the reference's identity")
+@test("a derivation over a generic struct at a reference compares and hashes the referent")
 rik_derived_generic_at_a_reference()
     if !rik_ready() then return
 
@@ -478,7 +481,7 @@ rik_derived_generic_at_a_reference()
             val c: &Node = Node(1)
 
             print(G(a, 1) == G(a, 1), G(a, 1) == G(c, 1), keyed(G(a, 1)) == keyed(G(a, 1)), keyed(G(a, 1)) != keyed(G(c, 1)))
-        """, "true false true true\n")
+        """, "true true true false\n")
 
 // -- what is not a member -------------------------------------------------------------------------
 

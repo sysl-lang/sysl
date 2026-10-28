@@ -36,7 +36,7 @@ print(maybe.unwrap_or(0), "— and not one import above this line")
 | rendering to standard output | `print`-family: `prints`, `printi`, `printu`, `printr`, `printb`, `printc`, `putbytes`, `encode_utf8`; the sink itself, `Stdout` and `stdout` | below |
 | rendering to standard error | `eprints`, `eputbytes`; the sink itself, `Stderr` and `stderr` | below |
 | rendering to a sink | `Display`, `FormatSpec`, `Writer`, `Counting`, the `display_*` family | below |
-| hashing | `Hash`, `hash_u64`, `hash_u128`, `hash_bool`, `hash_str` | below |
+| hashing | `Hash`, `hash_u64`, `hash_u128`, `hash_bool`, `hash_str`, `ByAddress` | below |
 | a float's encoding | `FloatBits`: `bits`, `from_bits` | below |
 | destruction | `Drop` | [the memory model](/reference/memory/) |
 | operators | `Add`, `Sub`, `Mul`, `Div`, `Rem`, `BitAnd`, `BitOr`, `BitXor`, `Shl`, `Shr`, `Neg`, `Not`, `Eq`, `Ord` | [expressions](/reference/expressions/) |
@@ -1422,6 +1422,34 @@ true
 The widening is the law rather than an implementation detail: `1` and `1` are the same number,
 they compare equal across widths, and so they hash equal — each becomes the same `u64` before it
 reaches the mixer.
+
+### Keying by identity: `ByAddress`
+
+A `&T` hashes and compares as its referent does wherever `T` defines `Eq` and `Hash`
+([memory](/reference/memory/#references-compare-through-their-referent)). **`ByAddress[T]`** keys by
+the object instead: it holds a `&T` as `target`, two are equal exactly when they hold one object
+(`===`), and it hashes by the address, so a visited set over a graph or a cache per node works
+whatever the node's own `==` says:
+
+```sysl
+import sysl.container.{Map, map}
+
+struct Node derives Eq, Hash
+    v: int
+
+main()
+    val a: &Node = Node(1)
+    val b: &Node = Node(1)
+    val visits = map[ByAddress[Node], int]()
+
+    visits.put(ByAddress(a), 1)
+    visits.put(ByAddress(b), 2)
+    print(visits.len(), a == b, ByAddress(a) == ByAddress(b), ByAddress(a).target.v)
+```
+
+```output
+2 true false 1
+```
 
 ## Subscripting a type of your own
 

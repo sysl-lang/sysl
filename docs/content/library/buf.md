@@ -443,10 +443,10 @@ of a type you wrote works the moment that type does — the two blocks are
 [the slice's](/library/core/#a-slice-or-an-array-of-anything-equatable), reached one delegation away,
 which is also why a width pads the whole rendering rather than each element.
 
-**A `&Buf` is a different question and answers a different one.** References
-[compare by address](/reference/memory/#t-counted-references) and a `&T` implements nothing its referent implements, so
-`==` between two of them asks whether they are the same buffer, and `print` on one is refused. The
-deref is the way to the value:
+**A `&Buf` compares as the buffer does.** A reference
+[compares through its referent](/reference/memory/#references-compare-through-their-referent)
+wherever the referent has an `Eq`, so `==` between two of them compares the elements; `===` asks
+whether they are the same buffer. `print` on one is refused, and the deref is the way to the value:
 
 ```sysl
 import sysl.buf.{Buf, buf}
@@ -458,12 +458,12 @@ for i in 1..3
     b.push(i)
     c.push(i)
 
-print(b == c, *b == *c)
+print(b == c, b === c, *b == *c)
 print(*b)
 ```
 
 ```output
-false true
+true false true
 [1, 2, 3]
 ```
 

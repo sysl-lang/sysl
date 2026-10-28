@@ -1142,48 +1142,52 @@ named product by the same rules as a tuple, so a `Size` and an `(int, int)` comp
 and render alike except for the name in front. Any other trait is derived by **its own `derive`
 members**, described below.
 
-### A reference is compared and hashed by identity
+### A reference is compared and hashed through its referent
 
-A `&T` and a `*T` meet `Eq` and `Hash` by the compiler's rule, for every `T`, and both are the
-**address's**: `==` asks whether two references name one object
-([References compare by address](/reference/memory/)), so the hash has to agree with it. Wherever a
-bound asks for either — a `[K: Hash + Eq]` body, a tuple's parts, a derived block's fields — a
-reference answers with its identity, never with what its referent's own `impl` would say:
+A `&T` meets `Eq` and `Hash` for every `T`: **as `T` does wherever `T` has them, and by its
+identity where it does not** ([References compare through their
+referent](/reference/memory/#references-compare-through-their-referent)). Wherever a bound asks for
+either — a `[K: Hash + Eq]` body, a tuple's parts, a derived block's fields — a reference answers as
+`==` on two of them does, so the hash always agrees with the equality:
 
 ```sysl
-struct Node
+struct Node derives Hash
     level: int
 
 impl Eq for Node
     eq(self, other: Node) -> bool = self.level == other.level
 
+struct Cell
+    level: int
+
 struct Edge derives Eq, Hash
     from: &Node
-    to: &Node
+    to: &Cell
 
 same[T: Eq](a: T, b: T) -> bool = a.eq(b)
 
 main()
     val a: &Node = Node(1)
     val b: &Node = Node(1)
+    val c: &Cell = Cell(1)
+    val d: &Cell = Cell(1)
 
-    print(same(a, b), same(a, a), same(*a, *b))
-    print(Edge(a, b) == Edge(a, b), Edge(a, b) == Edge(b, a), Edge(a, b).hash() == Edge(a, b).hash())
+    print(same(a, b), same(c, d), same(c, c))
+    print(Edge(a, c) == Edge(b, c), Edge(a, c) == Edge(a, d), Edge(a, c).hash() == Edge(b, c).hash())
 ```
 
 ```output
-false true true
+true false true
 true false true
 ```
 
-`Node` has no `Hash` here and `Edge` derives one all the same: a reference is a key whatever it
-names. A member call written on a reference the program named reaches through it to the referent's
-own member (`a.eq(*b)` is `Node.eq`), so it is the bound — and the operator — that gives the
-identity. Which of the two a call is follows what the generic body **wrote**, not what it was
-instantiated with: in `[T: Hash]`, `x.hash()` on an `x: T` is the identity at `T = &Node`, while
-`r.hash()` on a `val r: &Node` in the same body is `Node.hash` at every `T`, `&Node` included. To
-key by value, key on the value type, or on a wrapper whose `Hash` and `Eq` read the
-fields; a reference to a trait object is two words and meets `Hash` only through its table.
+`Cell` has neither trait and `Edge` derives both all the same: a reference is a key whatever it
+names, by value where the referent has one and by identity where it has not. **A referent with an
+`Eq` and no `Hash`** is the one refused: its references compare by value, and the address's hash
+would not agree. **`===`** is identity whatever the referent defines, and
+[`ByAddress`](/reference/memory/#references-compare-through-their-referent) keys a table by it. A
+**`*T`** meets both by its address, and a trait requiring either is refused through one. A
+reference to a trait object is two words and meets `Hash` only through its table.
 
 ### A trait says how it is derived
 

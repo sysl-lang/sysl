@@ -1,0 +1,455 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.replace_all
+
+// **A reference compares and hashes through its referent** (`reference/memory.md § References
+// compare through their referent`): `==`, `!=`, `.eq` and `.hash` on a `&T` or a `&sync T` are
+// `T`'s wherever `T` has an `Eq` (a `Hash`), and the reference's identity where it has none. `===`
+// and `!==` are always identity. A `*T` is always its address. `ByAddress[T]` keys by identity.
+//
+// The matrix: a referent with a DERIVED `Eq`/`Hash` (`D`), a HAND-WRITTEN pair that is coarser than
+// the fields (`H`, equal modulo 10), `Eq` WITHOUT `Hash` (`E`), and NEITHER (`N`); each crossed with
+// `==`, `!=`, `===`, `!==`, a `Map` key, a `Set`, a tuple key, a derived `Hash` over a ref field, and
+// a generic `[K: Eq + Hash]` at `&T`. Then `&sync T`, `*T`, `& &T`, a trait object, a cyclic graph
+// under a user `Eq`, `ByAddress`, a comparison chain, `&int`, and the refusals.
+//
+// Skipped cells: bare metal, since the lowering is a load from the box and a call or an instruction
+// the target already has for the referent's own `==`; separate compilation beyond the library's own
+// `Map` and `Set`, whose bodies are read from the `.syslib` and instantiated here -- the decision is
+// the instantiation's walk at the reference type, the same in either form; layout, which the rule
+// does not touch.
+
+private struct ReqRun
+    ok: bool
+    out: string
+    err: string
+
+private req_ready() -> bool
+    if std_root().is_err() || !clang_available()
+        print("skipped: the library or the toolchain is not on this machine")
+        return false
+    end if
+
+    true
+end req_ready
+
+private req_root(text: string) -> string
+    val root = replace_all(make_temp_dir("sysl-req").unwrap(), "//", "/")
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+    root
+end req_root
+
+private req_run(text: string) -> ReqRun
+    val root = req_root(text)
+
+    force_alloc_counting(true)
+
+    val built = build_native_program(s"$root/main.sysl", None, None, DefaultOptimization,
+                                     Some(s"$root/built"))
+
+    force_alloc_counting(false)
+
+    built match
+        Err(why) ->
+            val said = replace_all(failure_text(why), s"$root/", "")
+
+            remove_dir_all(root).unwrap_or(())
+            return ReqRun(false, said, "")
+        Ok(_) -> ()
+
+    val said = capture(s"$root/built", [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> ReqRun(false, "could not be started", "")
+        Ok(o) -> ReqRun(o.status.ok(), o.text, o.err.unwrap_or(""))
+end req_run
+
+// The program ran to the end, printed `want`, and gave back every allocation it made.
+private req_prints(text: string, want: string)
+    val run = req_run(text)
+
+    assert(run.ok, run.out)
+    assert_eq(run.out, want)
+    assert(alloc_count_reported(run.err) == 0, run.err)
+end req_prints
+
+// The program is refused, and the report says `want`.
+private req_refused(text: string, want: string)
+    val run = req_run(text)
+
+    assert(!run.ok, run.out)
+    assert(run.out.contains(want), run.out)
+end req_refused
+
+private req_types() -> string = raw"""
+    import sysl.container.{Map, map, Set, set}
+
+    struct D derives Eq, Hash
+        v: int
+
+    struct H
+        v: int
+
+    impl Eq for H
+        eq(self, rhs: H) -> bool = self.v % 10 == rhs.v % 10
+
+    impl Hash for H
+        hash(self) -> u64 = hash_u64(u64(self.v % 10))
+
+    struct E derives Eq
+        v: int
+
+    struct N
+        v: int
+
+    same[K: Eq](a: K, b: K) -> bool = a == b
+    same_call[K: Eq](a: K, b: K) -> bool = a.eq(b)
+    keyed[K: Eq + Hash](a: K, b: K) -> (bool, bool) = (a == b, a.hash() == b.hash())
+
+    """
+
+// -- the operators, per referent -------------------------------------------------------------------
+
+@test("== and != on references compare the referent's derived, hand-written or missing Eq")
+req_operators_per_referent()
+    if !req_ready() then return
+
+    req_prints(req_types() + raw"""
+        main()
+            val d1: &D = D(1)
+            val d2: &D = D(1)
+            val d3: &D = D(2)
+            val h1: &H = H(3)
+            val h2: &H = H(13)
+            val h3: &H = H(4)
+            val e1: &E = E(1)
+            val e2: &E = E(1)
+            val n1: &N = N(1)
+            val n2: &N = N(1)
+
+            print(d1 == d2, d1 != d2, d1 == d3, d1 != d3)
+            print(h1 == h2, h1 != h2, h1 == h3)
+            print(e1 == e2, e1 != e2, e1 == E(2))
+            print(n1 == n2, n1 != n2, n1 == n1, n1 != n1)
+        """, "true false false true\ntrue false false\ntrue false false\nfalse true true false\n")
+
+@test("=== and !== are identity whatever the referent's Eq says")
+req_identity_operators()
+    if !req_ready() then return
+
+    req_prints(req_types() + raw"""
+        main()
+            val d1: &D = D(1)
+            val d2: &D = D(1)
+            val dd = d1
+            val h1: &H = H(3)
+            val h2: &H = H(13)
+            val n1: &N = N(1)
+            val n2: &N = N(1)
+
+            print(d1 === d2, d1 !== d2, d1 === dd, d1 !== dd, d1 === d1)
+            print(h1 === h2, h1 == h2, n1 === n2, n1 === n1, n1 !== n2)
+        """, "false true true false true\nfalse true false true true\n")
+
+@test(".eq and .hash on a reference agree with ==, for every kind of referent")
+req_members_agree()
+    if !req_ready() then return
+
+    req_prints(req_types() + raw"""
+        main()
+            val d1: &D = D(1)
+            val d2: &D = D(1)
+            val h1: &H = H(3)
+            val h2: &H = H(13)
+            val n1: &N = N(1)
+            val n2: &N = N(1)
+
+            print(d1.eq(*d2), d1.hash() == d2.hash(), h1.hash() == h2.hash(), h1.eq(*h2))
+            print(n1.hash() == n1.hash(), n1.hash() == n2.hash(), n1.eq(n1), n1.eq(n2))
+        """, "true true true true\ntrue false true false\n")
+
+// -- keys -----------------------------------------------------------------------------------------------
+
+@test("a Map keyed by references keys by the referent's value, or by identity where it has no Eq")
+req_map_keys()
+    if !req_ready() then return
+
+    req_prints(req_types() + raw"""
+        main()
+            val md = map[&D, int]()
+            val mh = map[&H, int]()
+            val mn = map[&N, int]()
+            val n1: &N = N(1)
+            val n2: &N = N(1)
+
+            md.put(D(1), 1)
+            md.put(D(1), 2)
+            md.put(D(2), 3)
+            mh.put(H(3), 1)
+            mh.put(H(13), 2)
+            mn.put(n1, 1)
+            mn.put(n2, 2)
+            mn.put(n1, 3)
+            print(md.len(), md.get_or(D(1), 0), md.get_or(D(2), 0))
+            print(mh.len(), mh.get_or(H(23), 0))
+            print(mn.len(), mn.get_or(n1, 0), mn.get_or(n2, 0), mn.has(N(1)))
+        """, "2 2 3\n1 2\n2 3 2 false\n")
+
+@test("a Set of references holds one member per referent value, or per object where it has no Eq")
+req_set_members()
+    if !req_ready() then return
+
+    req_prints(req_types() + raw"""
+        main()
+            val sd = set[&D]()
+            val sn = set[&N]()
+            val n1: &N = N(1)
+
+            print(sd.add(D(1)), sd.add(D(1)), sd.has(D(1)), sd.len())
+            print(sn.add(n1), sn.add(N(1)), sn.add(n1), sn.has(N(1)), sn.len())
+        """, "true false true 1\ntrue true false false 2\n")
+
+@test("a tuple key of references composes each part's rule, the identity part and the value part together")
+req_tuple_keys()
+    if !req_ready() then return
+
+    req_prints(req_types() + raw"""
+        main()
+            val n1: &N = N(1)
+            val n2: &N = N(1)
+            val m = map[(&D, &N), int]()
+
+            m.put((D(1), n1), 7)
+            print(m.get_or((D(1), n1), 0), m.get_or((D(1), n2), 0), m.get_or((D(2), n1), 0), m.len())
+            print((D(1), n1) == (D(1), n1), (D(1), n1) == (D(1), n2))
+        """, "7 0 0 1\ntrue false\n")
+
+@test("a derived Eq and Hash over a reference field read each field by its referent's rule")
+req_derived_over_ref_fields()
+    if !req_ready() then return
+
+    req_prints(req_types() + raw"""
+        struct Pair derives Eq, Hash
+            d: &D
+            n: &N
+
+        main()
+            val n1: &N = N(1)
+            val n2: &N = N(1)
+            val m = map[Pair, int]()
+
+            m.put(Pair(D(1), n1), 1)
+            m.put(Pair(D(1), n1), 2)
+            m.put(Pair(D(1), n2), 3)
+            print(Pair(D(1), n1) == Pair(D(1), n1), Pair(D(1), n1) == Pair(D(1), n2))
+            print(Pair(D(4), n1).hash() == Pair(D(4), n1).hash(), m.len(), m.get_or(Pair(D(1), n1), 0))
+        """, "true false\ntrue 2 2\n")
+
+@test("a generic [K: Eq + Hash] body at &T is the referent's Eq and Hash, or the identity")
+req_generic_bound()
+    if !req_ready() then return
+
+    req_prints(req_types() + raw"""
+        main()
+            val d1: &D = D(1)
+            val d2: &D = D(1)
+            val h1: &H = H(3)
+            val h2: &H = H(13)
+            val n1: &N = N(1)
+            val n2: &N = N(1)
+
+            print(keyed(d1, d2), keyed(h1, h2), keyed(n1, n2), keyed(n1, n1))
+            print(same(d1, d2), same_call(d1, d2), same(n1, n2), same_call(n1, n1))
+        """, "(true, true) (true, true) (false, false) (true, true)\ntrue true false true\n")
+
+// -- the other reference shapes --------------------------------------------------------------------
+
+@test("a &sync T compares and hashes as a &T does")
+req_sync_reference()
+    if !req_ready() then return
+
+    req_prints(req_types() + raw"""
+        main()
+            val a: &sync D = D(2)
+            val b: &sync D = D(2)
+            val p: &sync N = N(2)
+            val q: &sync N = N(2)
+
+            print(a == b, a === b, a.hash() == b.hash(), p == q, p === p)
+        """, "true false true false true\n")
+
+@test("a *T compares and hashes by its address, though its pointee defines Eq and Hash")
+req_pointer_is_its_address()
+    if !req_ready() then return
+
+    req_prints(req_types() + raw"""
+        var x = D(1)
+        var y = D(1)
+
+        main()
+            val p: *D = &x
+            val q: *D = &y
+            val r: *D = &x
+            val m = map[*D, int]()
+
+            m.put(p, 1)
+            m.put(q, 2)
+            print(p == q, p == r, p === r, p !== q, p == null, p != null)
+            print(same(p, q), keyed(p, q), keyed(p, r), m.len(), m.get_or(r, 0))
+            print(p.eq(*q), p.hash() == q.hash())
+        """, "false true true true false true\nfalse (false, false) (true, true) 2 1\ntrue true\n")
+
+@test("a reference to a reference compares as the inner reference does")
+req_reference_to_reference()
+    if !req_ready() then return
+
+    req_prints(req_types() + raw"""
+        main()
+            val d1: &D = D(1)
+            val d2: &D = D(1)
+            val n1: &N = N(1)
+            val n2: &N = N(1)
+            val a: & &D = d1
+            val b: & &D = d2
+            val c: & &N = n1
+            val d: & &N = n2
+            val e: & &N = n1
+
+            print(a == b, a === b, c == d, c == e, c === e, keyed(a, b), keyed(c, e))
+        """, "true false false true false (true, true) (true, true)\n")
+
+@test("a trait object keeps no == and is refused === with the reason")
+req_trait_object()
+    if !req_ready() then return
+
+    val shape = req_types() + raw"""
+        trait Shape
+            area(self) -> int
+
+        impl Shape for D
+            area(self) -> int = self.v
+
+        """
+
+    req_refused(shape + raw"""
+        main()
+            val s: &Shape = D(1)
+            print(s == s)
+        """, "'==' is not defined for &Shape")
+    req_refused(shape + raw"""
+        main()
+            val s: &Shape = D(1)
+            print(s === s)
+        """, "'===' is not defined for the trait object &Shape, which is two words rather than one address")
+
+@test("a cyclic graph under a user Eq is compared by that Eq, and === stops nothing")
+req_cycle_under_user_eq()
+    if !req_ready() then return
+
+    req_prints(raw"""
+        struct G
+            id: int
+            next: Option[&G]
+
+        impl Eq for G
+            eq(self, rhs: G) -> bool = self.id == rhs.id
+
+        main()
+            val a: &G = G(1, None)
+            val b: &G = G(1, Some(a))
+
+            a.next = Some(b)
+            print(a == b, a === b, a.next.unwrap() === b, b.next.unwrap() == a)
+            a.next = None
+        """, "true false true true\n")
+
+@test("a chain of == over references reads each link through, and &int compares its value")
+req_chain_and_builtin_referent()
+    if !req_ready() then return
+
+    req_prints(req_types() + raw"""
+        main()
+            val a: &D = D(1)
+            val b: &D = D(1)
+            val c: &D = D(2)
+            val i: &int = 5
+            val j: &int = 5
+
+            print(a == b == a, a == b == c, a == b != c, i == j, i === j, i.hash() == j.hash())
+        """, "true false true true false true\n")
+
+// -- ByAddress ------------------------------------------------------------------------------------------
+
+@test("ByAddress keys by identity where the referent defines Eq and Hash, and where it defines neither")
+req_by_address()
+    if !req_ready() then return
+
+    req_prints(req_types() + raw"""
+        main()
+            val d1: &D = D(1)
+            val d2: &D = D(1)
+            val e1: &E = E(1)
+            val sd = set[ByAddress[D]]()
+            val me = map[ByAddress[E], int]()
+
+            print(sd.add(ByAddress(d1)), sd.add(ByAddress(d2)), sd.add(ByAddress(d1)), sd.len())
+            print(ByAddress(d1) == ByAddress(d2), ByAddress(d1) == ByAddress(d1), d1 == d2, ByAddress(d1).target.v)
+            me.put(ByAddress(e1), 3)
+            print(me.get_or(ByAddress(e1), 0), me.get_or(ByAddress(E(1)), 0))
+        """, "true true false 2\nfalse true true 1\n3 0\n")
+
+// -- refusals -------------------------------------------------------------------------------------------
+
+@test("a referent with Eq and no Hash makes a reference no key: refused at the bound, the member and a derive")
+req_eq_without_hash_refused()
+    if !req_ready() then return
+
+    req_refused(req_types() + raw"""
+        main()
+            val m = map[&E, int]()
+            print(m.len())
+        """, "but &E does not — E defines 'Eq' but not 'Hash', so a reference to it compares by its value " +
+             "and has no hash that agrees — give E a 'Hash', or key by its identity with 'ByAddress'")
+    req_refused(req_types() + raw"""
+        main()
+            val e: &E = E(1)
+            print(e.hash())
+        """, "'hash' is not defined for &E: E defines 'Eq' but not 'Hash'")
+    req_refused(req_types() + raw"""
+        struct Holds derives Hash
+            e: &E
+
+        main()
+            print(Holds(E(1)).hash())
+        """, "Hash")
+    req_prints(req_types() + raw"""
+        main()
+            val e: &E = E(1)
+            print(e == E(1), same(e, e))
+        """, "true true\n")
+
+@test("=== on integers, and between references of two types, are refused with the reason")
+req_identity_refusals()
+    if !req_ready() then return
+
+    req_refused(req_types() + raw"""
+        main()
+            print(1 === 1)
+        """, "'===' compares the identity of two references or pointers, and int is neither — '==' compares its value")
+    req_refused(req_types() + raw"""
+        main()
+            print(2 !== 3)
+        """, "'!==' compares the identity of two references or pointers, and int is neither — '!=' compares its value")
+    req_refused(req_types() + raw"""
+        main()
+            val d: &D = D(1)
+            val n: &N = N(1)
+            print(d === n)
+        """, "'===' compares two references or pointers of one type, got &D and &N")

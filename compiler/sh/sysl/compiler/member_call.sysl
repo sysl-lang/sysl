@@ -837,16 +837,21 @@ call_member(cx: &Analyzer, span: Span, receiver: TExpr, name: string, args: Buf[
 
     if rty == Unknown then return bad_expr(span)
 
-    // **Through a bound, a reference is its own key**: `Eq` and `Hash` at a `&T` or a `*T` are the
-    // address's (`reference/memory.md § &T — counted references`), so a `[K: Hash + Eq]` body
-    // standing at `&Node` hashes and compares identities rather than reaching through to `Node`'s
-    // own members, which would key the table by a value its `==` never consults.
+    // **`Eq` and `Hash` at a reference are its referent's where the referent has them, and its
+    // identity where it does not** (`reference/memory.md § References compare through their
+    // referent`); at a `*T`, through a bound, they are the address's. So a `[K: Hash + Eq]` body
+    // standing at `&Node` keys the table by `Node`'s own value when `Node` defines one, and by the
+    // node's identity when it does not -- the two members always agreeing, which is the law a key
+    // needs.
     val held = underlying(texpr_type(receiver))
 
     if (name == "hash" || name == "eq") && cx.at_definition then note_bound_site(cx, span, held)
 
-    if (name == "hash" || name == "eq") && hashes_by_address(held) && reached_through_bound(cx, span, held, name) then
-        return address_member(cx, span, receiver, held, name, args)
+    if (name == "hash" || name == "eq") && hashes_by_address(held)
+        val member = reference_member(cx, span, receiver, held, name, args, expected)
+
+        if member.is_some() then return member.unwrap()
+    end if
 
     // **Every value answers `to_string()` and `debug_string()`**, by the compiler, where its type has
     // no member of that name: the string its `Display` writes (its `Debug`, else `<T>`, where it has
@@ -909,14 +914,62 @@ call_member(cx: &Analyzer, span: Span, receiver: TExpr, name: string, args: Buf[
             else call_declared(cx, span, receiver, rty, name, args, expected, via, targs)
 end call_member
 
+// `eq` or `hash` on a reference or a pointer, where the rule answers it rather than the referent's
+// own member; nothing where the call is the referent's, reached as any member call on a reference is.
+//
+// **Written on a reference whose referent has the member**, it is the referent's (`r.eq(*s)`,
+// `r.hash()`). **Reached through a bound or a derivation**, the other operand is the reference
+// itself, so `eq` is the `==` between two references -- read through to the referents -- and `hash`
+// is the referent's, read through the same levels. **Where the referent has neither**, both are the
+// address's, written or not; and a referent with an `Eq` but no `Hash` has no hash at all, since the
+// address's would disagree with its `==`.
+private reference_member(cx: &Analyzer, span: Span, receiver: TExpr, held: Type, name: string,
+                         args: Buf[Expr], expected: Option[Type]) -> Option[TExpr]
+    if name == "hash" && hash_law_breaks(cx.an, held) then
+        return Some(cx.err(span, s"'hash' is not defined for ${type_show(held)}: " +
+                           hash_law_refusal(cx.an, held)))
+
+    val bound = reached_through_bound(cx, span, held, name)
+    val levels = through_levels(cx.an, if name == "eq" then "Eq" else "Hash", held)
+
+    // A written call on a pointer reaches its pointee's member wherever the pointee has one.
+    val raw_reaches = held match
+        Ptr(inner) -> !bound && satisfies(cx.an, plain_bound(library_key(if name == "eq" then "Eq" else "Hash"),
+                                                             buf()), *inner)
+        _ -> false
+
+    if raw_reaches || (!bound && levels > 0) then return None
+    if levels == 0 then return Some(address_member(cx, span, receiver, held, name, args))
+
+    if name == "hash" then return Some(call_member(cx, span, auto_deref(cx, receiver), name, args, expected))
+
+    if args.len() != 1 then
+        return Some(cx.err(span, s"method 'Eq.eq' takes 1 argument, but " +
+                           supplied_phrase(args.len(), "argument")))
+
+    val rhs = type_expr(cx, args.at(0), Some(held))
+
+    if disagree(texpr_type(rhs), held) then
+        return Some(cx.err(args.at(0).span, s"'rhs' of 'Eq.eq' is ${type_show(held)}, but " +
+                           s"${type_show(texpr_type(rhs))} was given"))
+
+    var ts: Buf[TExpr] = buf()
+    var cmps: Buf[TCmp] = buf()
+
+    ts.push(receiver)
+    ts.push(rhs)
+    cmps.push(TCmp("==", compare_at(cx, span, "==", peeled(held, levels)), levels))
+    Some(TExpr(span, TCompare(ts, cmps)))
+end reference_member
+
 // Whether a member call on a reference was written through a bound rather than on a reference the
 // program named: inside a derivation, where every part is asked the trait being derived, or where the
 // receiver is DECLARED in the generic source as one of the body's type parameters -- or one member of
 // a pack -- including where it is built from them (`p.0` of a `(T, U)`, `w.x` of a `Wrap[T]`).
 //
-// **A written member call on a reference reaches its referent** (`r.eq(*s)`, `r.hash()`), and that
-// is left as it is: both reach the same object's members, so they agree with each other. It is the
-// bound that promised the reference's own `Eq` and `Hash`, so it is the bound that gets them.
+// **A written member call on a reference reaches its referent** (`r.eq(*s)`, `r.hash()`), whose
+// other operand is a referent. It is the bound that promised the reference's own `Eq`, whose other
+// operand is a second reference, so it is the bound that gets the comparison between two references.
 //
 // **The decision is the source's, not the instantiation's.** A `val r: &Node` in a body instantiated
 // at `T = &Node` has the same type as a `T`, and is still a reference the program named: its
@@ -2722,7 +2775,7 @@ private builtin_operator_method(cx: &Analyzer, span: Span, receiver: TExpr, rty:
 
         ts.push(receiver)
         ts.push(rhs)
-        cmps.push(TCmp(op, None))
+        cmps.push(TCmp(op, None, 0))
         return Some(TExpr(span, TCompare(ts, cmps)))
     end if
 

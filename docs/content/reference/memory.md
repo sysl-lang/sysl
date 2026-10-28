@@ -117,15 +117,49 @@ Two live mutable aliases is what Rust exists to prevent, and permitting them is 
 trade. Reference counting pays for it at run time — a retain here, a release there — and buys a
 language with no lifetimes, no borrow checker, and nothing to prove to a checker as you write.
 
-**References compare by address.** `==` and `!=` on a reference or a pointer ask whether the two
-name the same object, which is the only question a bare address can answer, and there is no ordering
-on either.
+### References compare through their referent
 
-**References hash by address too**, for the same reason: a hash has to agree with `==`. So a `&T` or
-a `*T` is a `Hash` and an `Eq` for every `T` — one with no `Hash` of its own included — and a table
-keyed on references keys by **identity**. Two distinct objects holding equal values are two keys; the
-same object twice is one. That is what a hash-consing table wants, where a node is made once per
-distinct pair of children:
+**A reference respects its referent's `Eq` and `Hash`.** `==` and `!=` on two `&T`s (or two
+`&sync T`s) compare the objects as `T` does wherever `T` has an `Eq` — written, derived, or a
+built-in's — and a `&T` hashes as `T` does wherever `T` has a `Hash`. That is what a reader expects
+of a `&Point` whose `Point` says what equal points are, and it is the rule of Rust's `&T`, and of
+every language whose objects are references until their type defines equality:
+
+```sysl
+struct Point derives Eq, Hash
+    x: int
+    y: int
+
+main()
+    val a: &Point = Point(1, 2)
+    val b: &Point = Point(1, 2)
+
+    print(a == b, a != b, a === b, a === a)
+```
+
+```output
+true false false true
+```
+
+**`===` and `!==` are identity**, always: whether two references or two pointers name the same
+object, whatever the referent's `==` says. They take two references or two pointers of one type, and
+nothing else — an integer has no identity apart from its value, and a trait object is two words
+rather than one address:
+
+```sysl
+main()
+    print(1 === 1)
+```
+
+```error
+'===' compares the identity of two references or pointers, and int is neither — '==' compares its value
+```
+
+**Where `T` has no `Eq`, a reference is its own identity**: `==` asks whether the two name the
+same object, and a `&T` hashes by the address it holds — so the two still agree. A table keyed on such
+references keys by **identity**. Two distinct objects holding equal values are two keys; the same
+object twice is one. That is what a hash-consing table wants, where a node is made once per distinct
+pair of children:
 
 ```sysl
 import sysl.container.{Map, map}
@@ -148,16 +182,70 @@ main()
 2 true
 ```
 
-The identity is what a **bound** gets: inside a `[K: Hash + Eq]` body standing at `&Node`, `k.hash()`
-and `k.eq(other)` are the address's, as `k == other` is. A member call written on a reference you
-named still reaches the referent's own (`r.hash()`, `r.eq(*s)`), the one level a member call sees
-through. To key by **value**, key on the value type — `Map[Node, V]` — or on a wrapper whose `Hash`
-and `Eq` read the fields.
+A **bound** gets the same answer: inside a `[K: Hash + Eq]` body standing at `&Node`, `k.hash()`
+and `k.eq(other)` are `Node`'s own where `Node` has them and the address's where it does not, as
+`k == other` is — so a `Map[&Node, V]` keys by value or by identity exactly as `==` on two `&Node`s
+compares. A member call written on a reference you named reaches the referent's own (`r.hash()`,
+`r.eq(*s)`), the one level a member call sees through. A struct deriving `Eq` or `Hash` over a
+`&T` field, and a tuple of references, compare and hash each reference the same way.
 
-`Eq` and `Hash` are the two a reference answers for itself. **Its other bounds it meets through its
-referent**, wherever a member call on the reference would reach the referent's members: a
-`[C: Index[usize, int]]` body takes a `&Buf[int]` and reads the buffer
-([generics](/reference/generics/#a-reference-meets-its-referent-s-bounds)).
+**A referent with an `Eq` and no `Hash` makes a reference that is no key**: its `==` is the
+referent's, and a hash of the address would give two equal references two hashes. It is refused
+rather than keyed wrongly:
+
+```sysl
+import sysl.container.{Map, map}
+
+struct Tag derives Eq
+    id: int
+
+main()
+    val tags = map[&Tag, int]()
+
+    print(tags.len())
+```
+
+```error
+Tag defines 'Eq' but not 'Hash', so a reference to it compares by its value and has no hash that agrees
+```
+
+**To key by identity when the referent defines equality**, wrap the reference in `ByAddress`, whose
+`Eq` is `===` and whose `Hash` is the address's:
+
+```sysl
+import sysl.container.{Set, set}
+
+struct Point derives Eq, Hash
+    x: int
+    y: int
+
+main()
+    val a: &Point = Point(1, 2)
+    val b: &Point = Point(1, 2)
+    val seen = set[ByAddress[Point]]()
+
+    seen.add(ByAddress(a))
+    print(seen.has(ByAddress(a)), seen.has(ByAddress(b)), a == b)
+```
+
+```output
+true false true
+```
+
+**A reference to a reference compares as the inner reference does**: two `& &Point`s are equal when
+the `&Point`s they reach are, which is the points' `==` — and the identity of the inner references
+where `Point` has no `Eq`. **A trait object** (`&Shape`) has no `==`: it has forgotten which type it
+holds, and with it what equal would mean.
+
+**A pointer compares by address.** `==` and `!=` on two `*T`s ask whether they hold one address, and
+a `*T` hashes by it, whatever `T` defines: a pointer is the unchecked tier's address, which is what
+`p == null` and a `p != end` walk over an array ask about, and a comparison through it would read
+storage a null or a one-past-the-end pointer does not have. There is no ordering on a reference or
+a pointer.
+
+**Its other bounds a reference meets through its referent**, wherever a member call on the
+reference would reach the referent's members: a `[C: Index[usize, int]]` body takes a `&Buf[int]`
+and reads the buffer ([generics](/reference/generics/#a-reference-meets-its-referent-s-bounds)).
 
 ### There is no allocation keyword
 
