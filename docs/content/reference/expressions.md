@@ -313,9 +313,8 @@ A wrapping operator's result is the two's-complement result at the operands' wid
 operator's is the nearest value the width holds — its maximum or its minimum. A signed saturating
 product saturates toward the side of the true product's sign. Each binds as its base operator does
 (`+|` with `+`, `*|` with `*`), takes the operands its base takes — two of one type, or two that
-[widen](#which-conversions-are-implicit) to one, with a literal read as `+` reads it — and has a
-compound form (`+%=` … `*|=`) and a yielding one (`+%:=` … `*|:=`). The width is the one the operands
-settle on, so a literal no `u8` holds makes `b +| 300` an `int` sum, exactly as it makes `b + 300` one.
+[widen](#which-conversions-are-implicit) to one — and has a compound form (`+%=` … `*|=`) and a
+yielding one (`+%:=` … `*|:=`).
 
 ```sysl
 val b: u8 = 250
@@ -333,6 +332,22 @@ print(level)
 4 255 0 255
 56 -128 -128 127
 255
+```
+
+**A literal beside a typed operand is a value of that operand's type, and one the type does not hold
+is refused.** Where `b + 300` over a `u8` is an `int` sum of 555, the 300 of `b +| 300` is a `u8`
+that does not exist: saturating to 255 would hide the mistake, and widening to `int` first would leave
+nothing to saturate. A literal that fits exactly (`b +| 255`) is taken, on either side, and so is one
+the compound and yielding forms add to their place; one that does not fit the place is refused the
+same way.
+
+```sysl
+val b: u8 = 250
+print(b +| 300)
+```
+
+```error
+the literal 300 does not fit byte, the type of the other operand of '+|' — a wrapping or saturating operator takes two values of one type
 ```
 
 They are defined on integers of every width, signed and unsigned — `u12`, `u128` and `i256` included,
