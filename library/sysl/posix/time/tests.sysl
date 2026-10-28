@@ -3,6 +3,7 @@ module sysl.posix.time
 @tests
 
 import sysl.time.{Resolution, parse_timestamp, since, whole_micros, whole_millis, millis, micros}
+import sysl.threads.spawn
 import sysl.time.tzif.{parse, offset_at, is_dst_at}
 
 // What `sysl.posix.time` claims, asserted in sysl.
@@ -285,3 +286,87 @@ cpu_time_ignores_sleep()
 
     assert(waited >= 200000, "the sleep returned early")
     assert(spent < waited / 2, s"a sleep of $waited us used $spent us of processor")
+
+// What a worker thread measured of its own clock, written by the worker and read after `join`.
+struct Lap
+    spent: long
+    waited: long
+
+private spin_lap(lap: *Lap) -> unit
+    val cpu0 = thread_cpu_time()
+    val wall0 = monotonic()
+    val work = churn(20000000)
+
+    lap.spent = (thread_cpu_time() - cpu0).us
+    lap.waited = (monotonic() - wall0).us
+
+    assert(work != 0)
+
+private sleep_lap(lap: *Lap) -> unit
+    val cpu0 = thread_cpu_time()
+    val wall0 = monotonic()
+
+    sleep(millis(200))
+
+    lap.spent = (thread_cpu_time() - cpu0).us
+    lap.waited = (monotonic() - wall0).us
+
+@test("thread cpu time grows over work on the thread and never goes backwards")
+thread_cpu_time_advances_over_work()
+    val a = thread_cpu_time()
+    val work = churn(20000000)
+    val b = thread_cpu_time()
+
+    assert((b - a).us > 0, "twenty million rounds used no thread time")
+    assert((thread_cpu_time() - b).us >= 0, "thread cpu time went backwards")
+    assert(work != 0)
+
+@test("thread cpu time barely moves while the thread sleeps")
+thread_cpu_time_ignores_sleep()
+    val cpu0 = thread_cpu_time()
+    val wall0 = monotonic()
+
+    sleep(millis(200))
+
+    val spent = (thread_cpu_time() - cpu0).us
+    val waited = (monotonic() - wall0).us
+
+    assert(waited >= 200000, "the sleep returned early")
+    assert(spent < waited / 2, s"a sleep of $waited us used $spent us of thread time")
+
+@test("a spinning thread accumulates cpu time its sleeping sibling does not")
+thread_cpu_time_is_per_thread()
+    val spin: &Lap = Lap(0, 0)
+    val nap: &Lap = Lap(0, 0)
+
+    val a = spawn(&spin_lap, &*spin)
+    val b = spawn(&sleep_lap, &*nap)
+
+    a match
+        Some(t) -> assert(t.join())
+        None -> assert(false, "a thread did not start")
+    b match
+        Some(t) -> assert(t.join())
+        None -> assert(false, "a thread did not start")
+
+    assert(spin.spent > 0, "the spinning thread used no thread time")
+    assert(nap.spent < nap.waited / 2, s"the sleeper used ${nap.spent} of ${nap.waited} us")
+    assert(spin.spent > nap.spent, "the spinner did not out-spend the sleeper")
+
+@test("thread cpu time is the thread's share, not the process total")
+thread_cpu_time_is_not_process_time()
+    val proc0 = cpu_time()
+    val me0 = thread_cpu_time()
+
+    val spin: &Lap = Lap(0, 0)
+
+    spawn(&spin_lap, &*spin) match
+        Some(t) -> assert(t.join())
+        None -> assert(false, "a thread did not start")
+
+    val proc = (cpu_time() - proc0).us
+    val me = (thread_cpu_time() - me0).us
+
+    // the worker's work is in the process total and not in this thread's
+    assert(proc >= spin.spent, "the process total missed the worker's time")
+    assert(me < proc, s"this thread ($me us) was charged the whole process ($proc us)")

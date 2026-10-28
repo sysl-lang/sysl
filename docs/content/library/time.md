@@ -862,6 +862,44 @@ error: 't' of 'sysl.time.instant_text' is sysl.time.Instant, but sysl.time.Durat
 
 Both require `posix`.
 
+There are two more readings of the same kind, for *how busy* rather than *how long*. `cpu_time`
+answers the processor time the whole process has used, summed over every thread, and
+`thread_cpu_time` answers the calling thread's own. Both are `Duration`s read as a difference, and
+neither moves while the thread sleeps, which is what separates them from `monotonic`. Take both
+readings of `thread_cpu_time` on the **same** thread: reading another thread's clock is not offered,
+because Linux and macOS spell it differently.
+
+```sysl
+import sysl.posix.time.{thread_cpu_time, cpu_time, monotonic}
+import sysl.time.{millis}
+import sysl.posix.time.sleep
+
+val c0 = thread_cpu_time()
+val p0 = cpu_time()
+
+var n: long = 1
+
+for i in 0..<2000000
+    n = n * 31 + long(i)
+
+val busy = (thread_cpu_time() - c0).us
+
+sleep(millis(50))
+
+val slept = (thread_cpu_time() - c0).us - busy
+print(busy > 0)
+print(slept < 25000)
+print((cpu_time() - p0).us >= busy)
+print(n != 0)
+```
+
+```output
+true
+true
+true
+true
+```
+
 ### Waiting
 
 `sleep` here is [`sysl.time.sleep`](#the-portable-spelling-sysl-time-now), which waits through a

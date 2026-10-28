@@ -37,3 +37,9 @@ long long sysl_posix_time_monotonic_us(void) {
 long long sysl_posix_time_cpu_us(void) {
     return micros_of(CLOCK_PROCESS_CPUTIME_ID);
 }
+
+// User plus system time of the calling thread alone. `CLOCK_THREAD_CPUTIME_ID` is a macro too (3 on
+// Linux, 16 on macOS), and both support it through `clock_gettime`.
+long long sysl_posix_time_thread_cpu_us(void) {
+    return micros_of(CLOCK_THREAD_CPUTIME_ID);
+}
