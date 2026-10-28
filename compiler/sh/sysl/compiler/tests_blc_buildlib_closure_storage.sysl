@@ -1,0 +1,156 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, remove_dir_all, write_text}
+import sysl.text.join
+
+// A library body that erases a value into a table names that table's slots as surely as it calls
+// them. A library half leaves a function reaching module storage filled at run time to the program,
+// and drops an `internal` one -- a closure's `call` -- outright; the sweeps that work that set out
+// followed only the calls, so a public `hook()` returning `(a) -> self.code(a)` over a storage-reading
+// `code` stayed in the half, and its closure's table called a `call` nothing defined:
+// "compiled half would name 1 symbol(s) it neither defines nor declares, the first of them
+// '$closure0.call'". The body that erases is now deferred with the slot it names, and a table over a
+// dropped body leaves the half with it.
+//
+// Beside it, the check that refuses such a half read a string constant's bytes as instructions: a
+// grammar embedded as text holding `call @x(` was a call to `x`.
+
+private blc_run(args: []string) -> (int, string)
+    var lines: Buf[string] = buf()
+    val sink = &lines
+    val code = run_cli(args, (line) -> sink.push(line))
+
+    (code, join(lines.view(), "\n"))
+end blc_run
+
+private blc_ready() -> bool = std_root().is_ok() && clang_available()
+
+// `sysl build-lib` over a root holding one module, `demo`, written as `src`, answers "checked".
+private blc_checked(src: string)
+    val root = lbr_temp("sysl-blc-")
+
+    make_dir_all(s"$root/demo").unwrap()
+    write_text(s"$root/demo/demo.sysl", src).unwrap()
+
+    val got = blc_run(["sysl", "build-lib", root])
+
+    assert_eq(got.0, Fine, got.1)
+    assert_eq(got.1, s"checked $root")
+    remove_dir_all(root).unwrap_or(())
+end blc_checked
+
+// What a program prints, built against `src` as a `--lib` root whose compiled half is made for the
+// build (a cache of the test's own), and how the root came to the build.
+private blc_ran(src: string, program: string) -> (string, string)
+    val cache = lbr_temp("sysl-blc-cache")
+
+    use_root_cache_dir(Some(cache))
+    use_c_object_cache_dir(Some(cache))
+    clear_root_artifact_counts()
+
+    val lib = lbr_tree(lbr_one("demo/demo.sysl", src))
+    val prog = lbr_program(program)
+    val said = lbr_run(prog, [lib])
+    val c = root_artifact_counts()
+
+    use_root_cache_dir(None)
+    use_c_object_cache_dir(None)
+    lbr_drop([lib, prog, cache])
+    (said, s"hits ${c.0}, built ${c.1}, from source ${c.2}")
+end blc_ran
+
+// Both forms: the half builds on its own, and a program linking it prints `want` from a half that was
+// compiled rather than one that fell back to source.
+private blc_both(src: string, program: string, want: string)
+    blc_checked(src)
+
+    val got = blc_ran(src, program)
+
+    assert_eq(got.0, want)
+    assert_eq(got.1, "hits 0, built 1, from source 0")
+end blc_both
+
+// Storage filled when the program starts: an initializer reading a `var` does not fold.
+private val blc_storage: string = "module demo\n\nvar base: u64 = 1\n\nval bump: u64 = base + 1\n\n"
+
+@test("a public method returning a closure over a storage-reading method builds as a library")
+blc_a_hook_over_a_storage_method_builds()
+    if !blc_ready() then return
+
+    blc_checked(blc_storage + "struct Langs\n    k: u64\n\n    code(self, a: u64) -> u64 = a + bump + self.k\n\n" +
+        "    hook(self) -> &Fn(u64) -> u64 = (a) -> self.code(a)\n")
+
+@test("and a program linking that half calls the hook and gets the storage's value")
+blc_the_hook_runs_from_the_half()
+    if !blc_ready() then return
+
+    blc_both(blc_storage + "struct Langs\n    k: u64\n\n    code(self, a: u64) -> u64 = a + bump + self.k\n\n" +
+             "    hook(self) -> &Fn(u64) -> u64 = (a) -> self.code(a)\n",
+             "import demo.*\n\nprint(Langs(5).hook()(1))\n", "8\n")
+
+@test("a public function returning a capturing closure that reads storage in its own body")
+blc_a_closure_reading_storage_itself()
+    if !blc_ready() then return
+
+    blc_both(blc_storage + "adder(k: u64) -> &Fn(u64) -> u64 = (a) -> a + k + bump\n",
+             "import demo.*\n\nval f = adder(10)\nprint(f(1), f(2))\n", "13 14\n")
+
+@test("a closure stored in a public struct field, its call reaching storage through a private function")
+blc_a_closure_in_a_field()
+    if !blc_ready() then return
+
+    blc_both(blc_storage + "struct Hook\n    f: &Fn(u64) -> u64\n\nprivate scaled(a: u64) -> u64 = a * bump\n\n" +
+             "make_hook(k: u64) -> Hook = Hook((a) -> scaled(a) + k)\n",
+             "import demo.*\n\nval h = make_hook(3)\nprint(h.f(4))\n", "11\n")
+
+@test("a closure made by a private function and handed out by a public one")
+blc_a_private_maker()
+    if !blc_ready() then return
+
+    blc_both(blc_storage + "private made(k: u64) -> &Fn(u64) -> u64 = (a) -> a + k + bump\n\n" +
+             "public_maker(k: u64) -> &Fn(u64) -> u64 = made(k * 2)\n",
+             "import demo.*\n\nprint(public_maker(5)(1))\n", "13\n")
+
+@test("a generic function returning a closure that reads storage, instantiated by the program")
+blc_a_generic_closure()
+    if !blc_ready() then return
+
+    blc_both(blc_storage + "tagger[T](x: T) -> &Fn(u64) -> u64 = (a) -> a + bump\n",
+             "import demo.*\n\nprint(tagger(\"s\")(1), tagger(7)(2))\n", "3 4\n")
+
+@test("a closure reading no storage stays in the half beside one that does, and both run")
+blc_a_plain_closure_beside()
+    if !blc_ready() then return
+
+    blc_both(blc_storage + "plain(k: u64) -> &Fn(u64) -> u64 = (a) -> a * k\n\n" +
+             "stored(k: u64) -> &Fn(u64) -> u64 = (a) -> a * k + bump\n",
+             "import demo.*\n\nprint(plain(3)(4), stored(3)(4))\n", "12 14\n")
+
+@test("a value erased into a trait object whose method reads storage")
+blc_a_trait_object_over_storage()
+    if !blc_ready() then return
+
+    blc_both(blc_storage + "trait Sized\n    size(self) -> u64\n\nstruct Box\n    n: u64\n\n" +
+             "impl Sized for Box\n    size(self) -> u64 = self.n + bump\n\n" +
+             "boxed(n: u64) -> &Sized = Box(n)\n",
+             "import demo.*\n\nprint(boxed(40).size())\n", "42\n")
+
+@test("a string constant holding the text of a call is not read as one")
+blc_a_string_holding_a_call()
+    if !blc_ready() then return
+
+    blc_both("module demo\n\nprivate val text: string = \"  %t = call void @nowhere(i64 1)\"\n\n" +
+             "shown() -> string = text\n",
+             "import demo.*\n\nprint(shown())\n", "  %t = call void @nowhere(i64 1)\n")
+
+@test("only an indented instruction calls: a top-level line holding 'call @x(' names nothing")
+blc_undefined_calls_reads_instructions_only()
+    val text = "@.str = private constant [21 x i8] c\"x = call void @gone()\"\n\n" +
+        "define void @here() {\nentry:\n  call void @missing()\n  ret void\n}\n"
+
+    val loose = undefined_calls(text)
+
+    assert_eq(loose.len(), 1)
+    assert_eq(loose.at(0), "missing")
