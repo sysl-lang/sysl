@@ -47,14 +47,19 @@ struct Trial
     ptr_addrs: usize
     ptr_moves: usize
     ptr_watches: usize
+    copy_writes: Buf[CopyWrite]
 end Trial
 
-// Opens a trial: where everything a reading writes stands now. The borrows are the one table a
-// reading rewrites in place rather than only adding to, so they are copied -- and only where there
-// are any, since nearly every body has none.
+// Opens a trial: where everything a reading writes stands now. The borrows and the closures' copy
+// writes are the tables a reading rewrites in place rather than only adding to -- a read of a binding
+// a closure wrote its copy of answers the write and takes it off the list -- so they are copied, and
+// only where there are any, since nearly every body has none. A copy write a thrown-away reading took
+// off is still owed to the reading the program gets: `"n = " + n` reads its right operand once to
+// choose the operator and once for real.
 begin_trial(cx: &Analyzer) -> Trial
     val a = cx.an
     val borrows = if cx.view_borrows.is_empty() then buf() else cx.view_borrows.copy()
+    val writes = if cx.copy_writes.is_empty() then buf() else cx.copy_writes.copy()
 
     Trial(a.sandboxed(), a.complaints(), a.warned.len(), a.kept.len(), a.closure_count,
           a.closure_funcs.len(), a.tables.members.pending.len(), a.tables.members.vtables.len(),
@@ -62,7 +67,7 @@ begin_trial(cx: &Analyzer) -> Trial
           a.target_refusals.len(), a.const_cycles.len(), cx.used.len(), cx.view_calls.len(),
           borrows, cx.consume_calls.len(), cx.by_name.len(), cx.refused_nested.len(),
           cx.variant_seq, cx.reach, cx.var_fix_log.len(), cx.ptr_addrs.len(), cx.ptr_moves.len(),
-          a.ptr_watches.len())
+          a.ptr_watches.len(), writes)
 end begin_trial
 
 // Whether the reading complained since the trial opened.
@@ -102,4 +107,5 @@ discard_trial(cx: &Analyzer, t: Trial)
     cx.var_fix_log.truncate(t.var_fixes)
     cx.ptr_addrs.truncate(t.ptr_addrs)
     cx.ptr_moves.truncate(t.ptr_moves)
+    cx.copy_writes = t.copy_writes
 end discard_trial
