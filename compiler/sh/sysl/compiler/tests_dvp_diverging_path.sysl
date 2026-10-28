@@ -1,0 +1,509 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.{cstring, Search}
+import sysl.fs.{make_temp_dir, remove_dir_all, write_text}
+import sysl.process.{Status, capture}
+
+// A call on a path that ends the program, judged rather than passed over (`borrowing.sysl`'s
+// `quiet_callees`).
+//
+// A caller lends a place to an inert callee with no count of its own, and the count stays missing for
+// as long as the callee runs -- including on a path that never comes back. So a never-returning
+// callee is held to "releases nothing on the way out" instead of skipped: `die` below overwrites the
+// global holding the tag it was lent and then reads the tag, which freed it under its own feet while
+// `die` was skipped. What such a path may call that an ordinary one may not is a FOREIGN function --
+// `putbytes`'s write, `exit`, `sysl_bounds_fail`, the trap -- and only while no sysl function C can
+// reach releases anything; otherwise foreign calls on those paths are untrusted too. A write through a
+// view parameter on such a path is judged at the call: `print`'s `printi` hands `digits_long` a view
+// of its own array, which is a write to storage the caller owns.
+//
+// The axes: how the path ends (`exit`, `trap`, `panic`, a user function every path of which diverges,
+// one that diverges on some paths); what the path does first (releases, or only prints); where it
+// sits (straight-line, a loop, a closure, an async task, after a `defer`); what it calls (a sysl
+// function, a trait object); and what C can reach (a `sysl_bounds_fail` override that releases or
+// not, an exported callback that releases). Each is read twice: in the caller's emitted text, where an
+// inert callee is lent `G.tag` with no `@arc.retain` around the call, and, where it matters, by
+// running the program -- under AddressSanitizer and on a counted heap.
+//
+// Not written: a `@section` function and an address-taken one stand beside `@export` in
+// `c_reaches_quiet` and are one `||` from it, so the exported callback is the cell for all three.
+
+// -- what the caller emits ----------------------------------------------------------------------------
+
+private var dvp_library_cache: Buf[Program] = buf()
+private var dvp_library_read: bool = false
+
+private dvp_library() -> Buf[Program]
+    if dvp_library_read then return dvp_library_cache
+
+    dvp_library_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> dvp_library_cache = units
+
+    dvp_library_cache
+end dvp_library
+
+// The text of `symbol` in a whole program read beside the standard library.
+private dvp_lowered(text: string, symbol: string) -> string = dvp_lowered_as(text, symbol, true)
+
+// The same, lowered as a program or as a library artifact, which has no entry point.
+private dvp_lowered_as(text: string, symbol: string, program: bool) -> string
+    if dvp_library().is_empty() then return "skipped"
+
+    val parsed = parse(source_of("test.sysl", text))
+    var units: Buf[Program] = buf()
+
+    for item in dvp_library()
+        units.push(item)
+
+    units.push(parsed.program)
+
+    val done = analyze_bodies(units, host_target())
+
+    if !done.reported.is_empty() then return done.reported.at(0).diag.message
+
+    val whole = program_of(done, "")
+    val promotions = post_analysis_checks(done.an, whole, buf())
+    val kept = prune(strip_tests(whole), program_own(units))
+    val lowered = codegen_with_gaps(kept with { entry_point = program && kept.entry_point }, host_target(),
+                                    promotions)
+
+    for item in func_texts(ir_print_module(lowered.0))
+        if names_as_written(item.0, symbol) then return item.1
+
+    s"no function '$symbol'"
+end dvp_lowered_as
+
+// A program lending the tag a global holds to `peek`, whose definition (and its helpers) is `callee`.
+private dvp_program(callee: string) -> string = dvp_program_with(callee, "5", "print(lend())", "")
+
+// The same, with the tag's id, the last line of `main` and declarations after it chosen.
+private dvp_program_with(callee: string, id: string, last: string, after: string) -> string = raw"""
+    struct Tag
+        id: int
+
+    impl Drop for Tag
+        drop(self) = print("drop", self.id)
+
+    struct Holder
+        tag: &Tag
+
+    var G: Holder = Holder(Tag(0))
+
+    die(t: &Tag) -> never
+        G = Holder(Tag(7))
+        print("still reading", t.id)
+        exit(1)
+
+    bail(t: &Tag) -> never
+        print("bad tag", t.id)
+        exit(1)
+
+    lend() -> int = peek(G.tag)
+
+    """ + callee + "\nmain()\n    G = Holder(Tag(" + id + "))\n    " + last + "\n\n" + after
+
+// How many counts `lend` takes around the call: none where `peek` is inert, a retain and its release
+// where it is not.
+private dvp_lend_counts(callee: string) -> int
+    val ir = dvp_lowered(dvp_program(callee), "lend")
+
+    if ir == "skipped" then return -1
+
+    assert(ir.starts_with("define"), ir)
+    int(ir.count_of("@arc.retain(")) + int(ir.count_of("@arc.release("))
+end dvp_lend_counts
+
+private dvp_inert(callee: string)
+    val n = dvp_lend_counts(callee)
+
+    if n >= 0 then assert_eq(n, 0, callee)
+
+private dvp_not_inert(callee: string)
+    val n = dvp_lend_counts(callee)
+
+    if n >= 0 then assert_eq(n, 2, callee)
+
+@test("a callee that may reach a never-returning function that releases is lent the place with a count")
+dvp_releasing_die_keeps_the_count()
+    dvp_not_inert("peek(t: &Tag) -> int\n    if t.id < 0 then die(t)\n\n    t.id\n")
+
+@test("a callee whose path ends in exit, trap or panic and does nothing else is lent it with none")
+dvp_exit_trap_panic_inert()
+    dvp_inert("peek(t: &Tag) -> int\n    if t.id < 0 then exit(1)\n\n    t.id\n")
+    dvp_inert("peek(t: &Tag) -> int\n    if t.id < 0 then trap()\n\n    t.id\n")
+    dvp_inert("peek(t: &Tag) -> int\n    if t.id < 0 then panic(\"negative\")\n\n    t.id\n")
+
+@test("a user function every path of which diverges after only printing leaves its caller inert")
+dvp_user_never_that_prints()
+    dvp_inert("peek(t: &Tag) -> int\n    if t.id < 0 then bail(t)\n\n    t.id\n")
+
+@test("a function diverging on some paths: printing before exit is inert, a store before it is not")
+dvp_diverges_on_some_paths()
+    dvp_inert(raw"""
+        check(t: &Tag) -> int
+            if t.id < 0
+                print("negative", t.id)
+                exit(1)
+
+            t.id
+
+        peek(t: &Tag) -> int = check(t) + 1
+        """)
+    dvp_not_inert(raw"""
+        check(t: &Tag) -> int
+            if t.id < 0
+                G = Holder(Tag(7))
+                exit(1)
+
+            t.id
+
+        peek(t: &Tag) -> int = check(t) + 1
+        """)
+
+@test("a printing call is trusted only on the run of statements that leads straight to the exit")
+dvp_only_the_run_before_the_exit()
+    // The `print` is followed by a statement that may return, so it is on a path that comes back.
+    dvp_not_inert(raw"""
+        peek(t: &Tag) -> int
+            if t.id < 0
+                print("negative")
+
+                if t.id < -5 then return 0
+
+                exit(1)
+
+            t.id
+        """)
+    // A print that is followed by nothing but the exit is on the path that ends the program.
+    dvp_inert(raw"""
+        peek(t: &Tag) -> int
+            if t.id < 0
+                if t.id < -5 then return 0
+
+                print("negative")
+                exit(1)
+
+            t.id
+        """)
+
+@test("a write through a view parameter on the path is the caller's own only where it passed its own array")
+dvp_write_through_a_view()
+    val fill = "fill(into: []u8)\n    into[0] = 1\n\nvar Scratch: [4]u8\n\n"
+
+    // `printi` and `printc` are this shape: they hand an encoder a view of their own array.
+    dvp_inert(fill + raw"""
+        peek(t: &Tag) -> int
+            if t.id < 0
+                var b: [4]u8
+
+                fill(b[0..<4])
+                exit(1)
+
+            t.id
+        """)
+    // The same write into a global's array is a write to storage the path does not own.
+    dvp_not_inert(fill + raw"""
+        peek(t: &Tag) -> int
+            if t.id < 0
+                fill(Scratch[0..<4])
+                exit(1)
+
+            t.id
+        """)
+    // Passed on through a parameter, the question goes to that function's caller.
+    dvp_not_inert(fill + raw"""
+        relay(v: []u8) = fill(v)
+
+        peek(t: &Tag) -> int
+            if t.id < 0
+                relay(Scratch[0..<4])
+                exit(1)
+
+            t.id
+        """)
+
+@test("inside a loop, the diverging path is judged the same way")
+dvp_inside_a_loop()
+    dvp_not_inert("peek(t: &Tag) -> int\n    for i in 0..<3\n        if t.id < i then die(t)\n\n    t.id\n")
+    dvp_inert("peek(t: &Tag) -> int\n    for i in 0..<3\n        if t.id < i then bail(t)\n\n    t.id\n")
+
+@test("a call through a trait object on the diverging path is unknown, so the callee is not inert")
+dvp_trait_object_on_the_path()
+    dvp_not_inert(raw"""
+        peek(t: &Tag) -> int
+            if t.id < 0
+                stdout().write("negative\n".bytes)
+                exit(1)
+
+            t.id
+        """)
+
+@test("a defer on the diverging path keeps the callee from being inert")
+dvp_defer_on_the_path()
+    dvp_not_inert(raw"""
+        peek(t: &Tag) -> int
+            defer print("left")
+
+            if t.id < 0 then exit(1)
+
+            t.id
+        """)
+
+@test("an exported function that releases, which C may call back, makes every foreign call untrusted")
+dvp_releasing_export_untrusts_foreign()
+    val callee = "peek(t: &Tag) -> int\n    if t.id < 0 then exit(1)\n\n    t.id\n"
+
+    dvp_not_inert(callee + raw"""
+
+        @export("dvp_reset")
+        reset()
+            G = Holder(Tag(3))
+        """)
+    // One that only reads is no reason to distrust anything.
+    dvp_inert(callee + raw"""
+
+        @export("dvp_peek")
+        look() -> int = 1
+        """)
+
+@test("a library artifact cannot know what its program exports, so it trusts no foreign call")
+dvp_library_artifact_trusts_nothing()
+    val text = dvp_program("peek(t: &Tag) -> int\n    if t.id < 0 then exit(1)\n\n    t.id\n")
+    val ir = dvp_lowered_as(text, "lend", false)
+
+    if ir == "skipped" then return
+
+    assert(ir.starts_with("define"), ir)
+    assert_eq(int(ir.count_of("@arc.retain(")) + int(ir.count_of("@arc.release(")), 2, ir)
+
+// -- `Buf.at`, `unwrap`, `Map.get`: the shapes the rule was written for -------------------------------
+
+private dvp_container_program(extra: string) -> string = dvp_containers("", extra, "")
+
+// The same, with declarations after `Leaf`, after everything else, and lines at the end of `main`.
+private dvp_containers(leaf: string, extra: string, tail: string) -> string = raw"""
+    import sysl.buf.{Buf, buf}
+
+    struct Leaf
+        v: int
+
+    """ + leaf + raw"""
+    struct Kids
+        nw: &Leaf
+        ne: &Leaf
+
+    struct Node
+        kids: Option[Kids]
+
+        quad(self) -> Kids = self.kids.unwrap()
+
+    total(k: Kids) -> int = k.nw.v + k.ne.v
+
+    walk(n: &Node) -> int = total(n.quad())
+
+    var B: Buf[&Leaf] = buf()
+
+    second() -> int = B.at(1).v
+
+    """ + extra + raw"""
+
+    main()
+        val l = Leaf(1)
+
+        B.push(l)
+        B.push(Leaf(2))
+        print(walk(Node(Some(Kids(l, l)))), second())
+    """ + tail
+
+private dvp_count_ops(ir: string) -> int =
+    int(ir.count_of("@arc.retain(")) + int(ir.count_of("@arc.release(")) + int(ir.count_of("@arc.copy.")) +
+        int(ir.count_of("@arc.dispose."))
+
+private dvp_opened() -> string = "var O: Option[&Leaf] = None\n\nopened() -> int = O.unwrap().v\n"
+
+@test("an accessor through unwrap takes no copy of its receiver, and Buf.at none of its element's owner")
+dvp_unwrap_and_at_are_inert()
+    val program = dvp_containers("", dvp_opened(), "    print(opened())\n")
+    val walk = dvp_lowered(program, "walk")
+
+    if walk == "skipped" then return
+
+    assert(walk.starts_with("define"), walk)
+    // `quad` is inert now, so `n`'s Node is read in place: no `arc.copy.Node` and `arc.dispose.Node`
+    // around the call (three count operations before the rule), and the Kids it answers is given
+    // back once.
+    assert_eq(walk.count_of("@arc.copy."), 0, walk)
+    assert_eq(walk.count_of("@arc.dispose.Kids"), 1, walk)
+    assert_eq(dvp_count_ops(walk), 1, walk)
+
+    // `O.unwrap()` lends the global in place: no copy of the Option and no dispose of it, only the
+    // release of the reference it answers (three before the rule).
+    val opened = dvp_lowered(program, "opened")
+
+    assert(opened.starts_with("define"), opened)
+    assert_eq(dvp_count_ops(opened), 1, opened)
+    assert_eq(opened.count_of("@arc.release("), 1, opened)
+
+    // `Buf.at` reaches the bounds failure through `index_past`, which never comes back and calls only
+    // foreign functions: still inert, so the only count is the release of the element it answers.
+    val second = dvp_lowered(program, "second")
+
+    assert(second.starts_with("define"), second)
+    assert_eq(dvp_count_ops(second), 1, second)
+    assert_eq(second.count_of("@arc.release("), 1, second)
+
+@test("a sysl_bounds_fail override that releases makes indexing non-inert; one that does not leaves it")
+dvp_bounds_fail_override()
+    val releasing = dvp_container_program(raw"""
+        var Spare: Option[&Leaf] = None
+
+        @export("sysl_bounds_fail")
+        report(kind: u32, a: usize, b: usize, n: usize, at: *u8)
+            Spare = None
+        """)
+    val second = dvp_lowered(releasing, "second")
+
+    if second == "skipped" then return
+
+    assert(second.starts_with("define"), second)
+    assert(dvp_count_ops(second) > 1, second)
+
+    val quiet = dvp_container_program(raw"""
+        @export("sysl_bounds_fail")
+        report(kind: u32, a: usize, b: usize, n: usize, at: *u8)
+            print("out of bounds", a, n)
+        """)
+    val again = dvp_lowered(quiet, "second")
+
+    assert(again.starts_with("define"), again)
+    assert_eq(dvp_count_ops(again), 1, again)
+
+// -- programs: what runs, under AddressSanitizer and on a counted heap --------------------------------
+
+private extern "setenv" dvp_c_setenv(name: *u8, value: *u8, overwrite: int) -> int
+private extern "unsetenv" dvp_c_unsetenv(name: *u8) -> int
+
+private struct DvpRun
+    out: string
+    err: string
+    code: int
+    hooks: usize
+end DvpRun
+
+// What the program prints and exits with, built counted or under `flags`, and how many ASan report
+// hooks it calls.
+private dvp_run(program: string, counted: bool, flags: string) -> DvpRun
+    val root = make_temp_dir("sysl-dvp").unwrap()
+
+    write_text(s"$root/main.sysl", program).unwrap()
+
+    val exe = s"$root/built"
+
+    if flags != ""
+        val n = cstring("SYSL_EXTRA_CFLAGS")
+        val v = cstring(flags)
+
+        dvp_c_setenv(n.ptr, v.ptr, 1)
+
+    force_alloc_counting(counted)
+
+    val made = build_native_program(s"$root/main.sysl", None, None, "0", Some(exe))
+
+    force_alloc_counting(false)
+
+    if flags != ""
+        val n = cstring("SYSL_EXTRA_CFLAGS")
+
+        dvp_c_unsetenv(n.ptr)
+
+    made match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return DvpRun(s"it did not build: ${failure_text(why)}", "", -1, 0)
+        Ok(_) -> ()
+
+    val hooks = capture("nm", ["-u", exe], "", [], true) match
+        Ok(o) -> o.text.count_of("__asan_report")
+        Err(_) -> 0
+
+    val ran = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    ran match
+        Err(_) -> DvpRun("the program that was built could not be run", "", -1, hooks)
+        Ok(o) -> o.status match
+            Status.Exited(c) -> DvpRun(o.text, o.err.unwrap_or(""), c, hooks)
+            _ -> DvpRun(o.text, o.err.unwrap_or(""), -2, hooks)
+end dvp_run
+
+private dvp_runnable() -> bool = std_root().is_ok() && clang_available()
+
+private dvp_uaf_program(last: string, after: string) -> string =
+    dvp_program_with("peek(t: &Tag) -> int\n    if t.id < 0 then die(t)\n\n    t.id\n", "-1", last, after)
+
+@test("the tag die frees is still held by its caller's count: no use after free under ASan")
+dvp_uaf_clean_under_asan()
+    if !dvp_runnable() then return
+
+    val run = dvp_run(dvp_uaf_program("print(lend())", ""), false, "-fsanitize=address -g")
+
+    assert(run.hooks > 1, s"the binary calls ${run.hooks} ASan report hooks, so it is not instrumented")
+    assert_eq(run.out, "drop 0\nstill reading -1\n")
+    assert_eq(run.code, 1, run.err)
+    assert(!run.err.contains("AddressSanitizer"), run.err)
+
+@test("the same reach through a closure reads nothing freed under ASan")
+dvp_closure_clean_under_asan()
+    if !dvp_runnable() then return
+
+    val program = dvp_uaf_program("val f = (k: int) -> peek(G.tag) + k\n    print(f(0))", "")
+    val run = dvp_run(program, false, "-fsanitize=address -g")
+
+    assert(run.hooks > 1, s"the binary calls ${run.hooks} ASan report hooks, so it is not instrumented")
+    assert_eq(run.out, "drop 0\nstill reading -1\n")
+    assert_eq(run.code, 1, run.err)
+    assert(!run.err.contains("AddressSanitizer"), run.err)
+
+@test("an async task that suspends and then dies reads nothing freed under ASan")
+dvp_async_clean_under_asan()
+    if !dvp_runnable() then return
+
+    val program = dvp_uaf_program("print(block_on(job(G.tag)))", raw"""
+        async job(t: &Tag) -> int
+            await yield_now()
+
+            if t.id < 0 then die(t)
+
+            t.id
+        """)
+    val run = dvp_run(program, false, "-fsanitize=address -g")
+
+    assert(run.hooks > 1, s"the binary calls ${run.hooks} ASan report hooks, so it is not instrumented")
+    assert_eq(run.out, "drop 0\nstill reading -1\n")
+    assert_eq(run.code, 1, run.err)
+    assert(!run.err.contains("AddressSanitizer"), run.err)
+
+private dvp_drops_program() -> string =
+    dvp_containers("impl Drop for Leaf\n    drop(self) = print(\"drop leaf\", self.v)\n\n",
+                   "var G2: Option[&Leaf] = None\n",
+                   "    G2 = Some(Leaf(9))\n    print(G2.unwrap().v)\n    G2 = None\n    B = buf()\n    print(\"end\")\n")
+
+@test("a counted heap gives every allocation back, the drops in the order they ran before")
+dvp_counted_heap_drop_order()
+    if !dvp_runnable() then return
+
+    val run = dvp_run(dvp_drops_program(), true, "")
+
+    // The same text, in the same order, as before the rule: the elided counts moved no drop.
+    assert_eq(run.out, "2 2\n9\ndrop leaf 9\ndrop leaf 2\nend\ndrop leaf 1\n")
+    assert_eq(run.code, 0, run.err)
+    assert_eq(alloc_count_reported(run.err), 0, run.err)
