@@ -42,6 +42,47 @@ private val jsg_job: string = raw"""
     print(s"plain ${plain.text}")
     """
 
+// Many foreground jobs in a row: the parent and the forked child both put the child in its new group,
+// and when they do it at the same instant the kernel answers one of them `EPERM`. Every start has to
+// succeed whichever side loses (the failure was one in a few hundred on a busy machine).
+private val jsg_many: string = raw"""
+    import sysl.process.{Group, Status, process_group, run, set_foreground_group}
+
+    val me = process_group()
+    var ended = 0
+
+    for i in 0..<400
+        val st = run("true", group = Group.New, foreground = true).unwrap()
+
+        set_foreground_group(me).unwrap()
+
+        if st == Status.Exited(0) then ended += 1
+
+    print(s"jobs $ended")
+    """
+
+@test("under a terminal, four hundred foreground jobs in a row all start")
+jsg_many_foreground_jobs_start()
+    if !lbr_ready() then return
+    if !is_file("/usr/bin/script") then skip("there is no script(1) to give the program a terminal")
+
+    val p = lbr_program(jsg_many)
+    val out = lbr_temp("sysl-jsg-many")
+    val exe = s"$out/job"
+    val built = lbr_cli(["sysl", "build", "-o", exe, p])
+
+    assert(built.0 == 0, built.1)
+
+    val uname = capture("uname").unwrap().text.trim()
+    val line = if uname == "Darwin" then s"/usr/bin/script -q /dev/null '$exe' < /dev/null"
+    else s"/usr/bin/script -q -e -c '$exe' /dev/null < /dev/null"
+    val ran = capture("sh", ["-c", line], timeout = 60000).unwrap()
+
+    lbr_drop([p, out])
+    assert(ran.status.ok(), s"${ran.status}: ${ran.text}")
+    assert(ran.text.contains("jobs 400"), ran.text)
+end jsg_many_foreground_jobs_start
+
 @test("under a terminal, a foreground job ends on the INT and QUIT its starter ignores; a plain child does not")
 jsg_foreground_job_resets_signals()
     if !lbr_ready() then return
