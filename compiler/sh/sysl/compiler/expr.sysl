@@ -1787,7 +1787,8 @@ private paired_operands(cx: &Analyzer, op: string, l: Expr, r: Expr,
     operands.push(l)
     operands.push(r)
 
-    val read = analyze_operands(cx, operands, numeric, op != "<<" && op != ">>", op == "*" || op == "/")
+    val unshifted = op != "<<" && op != ">>"
+    val read = analyze_operands(cx, operands, numeric, unshifted, op == "*" || op == "/", false, unshifted)
     val ts = if op == "+" || op == "-" then fixed_siblings(cx, operands, read) else read
     val tl = ts.at(0)
 
@@ -1973,7 +1974,8 @@ end identity_operands
 // formats`) -- rather than one being widened to the other first, which would round the product at
 // the wider operand's format.
 analyze_operands(cx: &Analyzer, operands: Buf[Expr], expected: Option[Type],
-                 widen: bool = false, rescales: bool = false, compared: bool = false) -> Buf[TExpr]
+                 widen: bool = false, rescales: bool = false, compared: bool = false,
+                 arithmetic: bool = false) -> Buf[TExpr]
     var own: Buf[Option[TExpr]] = buf()
     var refused_before = false
 
@@ -1992,9 +1994,10 @@ analyze_operands(cx: &Analyzer, operands: Buf[Expr], expected: Option[Type],
                 cx.an.poison_quietly()
 
     // **`compared` marks a comparison**, whose operand of a type of its own fixes the open bindings an
-    // undecided operand beside it waits on (`var_first_use.sysl`). Arithmetic does not: beside a typed
-    // operand, an open binding keeps its default and the operand widens to it.
-    if compared && !cx.open_vars.is_empty() then compare_fixes(cx, operands, own)
+    // undecided operand beside it waits on (`var_first_use.sysl`). **`arithmetic` marks `+ - * / % &
+    // | ^`**, whose operand of a type of its own fixes only a counted `for`'s variable beside it:
+    // an open `var` keeps its default and the operand widens to it.
+    if (compared || arithmetic) && !cx.open_vars.is_empty() then compare_fixes(cx, operands, own, !compared)
 
     // **An operand that comes to a literal on every path is in the literal's tier** -- an `if` or a
     // `match` of literals, `1 << bit`, literal arithmetic (`literal_valued`). It was read above, at
