@@ -157,7 +157,7 @@ and `Eq` read the fields.
 `Eq` and `Hash` are the two a reference answers for itself. **Its other bounds it meets through its
 referent**, wherever a member call on the reference would reach the referent's members: a
 `[C: Index[usize, int]]` body takes a `&Buf[int]` and reads the buffer
-([generics](/reference/generics/#a-reference-meets-its-referents-bounds)).
+([generics](/reference/generics/#a-reference-meets-its-referent-s-bounds)).
 
 ### There is no allocation keyword
 
