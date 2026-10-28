@@ -364,6 +364,70 @@ scv_emitted_var_parent()
     assert(ir.starts_with("define"), ir)
     assert(ir.contains("@arc.retain_maybe"), ir)
 
+// A root function is laid down as `name$$sysl`, so the call the elision reads names that symbol while
+// the functions known to release nothing are found by key: the two have to be matched up, for a
+// method's window and a root function's alike, and a callee that calls out to C still keeps the count.
+private scv_root_callees() -> string = raw"""
+    extern note(n: usize)
+
+    count(s: []const u8) -> usize = s.len
+
+    noted(s: []const u8) -> usize
+        note(s.len)
+        s.len
+
+    struct Holder
+        src: []const u8
+
+    impl Holder
+        total(self) -> usize
+            val src = self.src
+            var n: usize = 0
+            var i: usize = 0
+
+            while i < src.len
+                n += count(src[i..<i + 1])
+                i += 1
+
+            n
+
+    total_of(h: Holder) -> usize
+        val src = h.src
+        var n: usize = 0
+        var i: usize = 0
+
+        while i < src.len
+            n += count(src[i..<i + 1])
+            i += 1
+
+        n
+
+    noted_of(h: Holder) -> usize
+        val src = h.src
+        var n: usize = 0
+        var i: usize = 0
+
+        while i < src.len
+            n += noted(src[i..<i + 1])
+            i += 1
+
+        n
+    """
+
+@test("a call to a root function that releases nothing sits in a covered window under its laid-down symbol")
+scv_root_callee_symbol()
+    for name in ["Holder.total", "total_of"]
+        val ir = emit_func_text(scv_root_callees(), name)
+
+        assert(ir.starts_with("define"), ir)
+        assert(mentions_as_written(ir, "count"), ir)
+        assert_eq(ir.contains("@arc.retain"), false, ir)
+
+    val kept = emit_func_text(scv_root_callees(), "noted_of")
+
+    assert(kept.starts_with("define"), kept)
+    assert(kept.contains("@arc.retain_maybe"), kept)
+
 // -- programs whose destructors say when they ran --------------------------------------------------------
 
 private scv_ran(text: string) -> string
