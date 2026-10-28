@@ -834,6 +834,15 @@ call_member(cx: &Analyzer, span: Span, receiver: TExpr, name: string, args: Buf[
 
     if rty == Unknown then return bad_expr(span)
 
+    // **Through a bound, a reference is its own key**: `Eq` and `Hash` at a `&T` or a `*T` are the
+    // address's (`reference/memory.md § References compare by address`), so a `[K: Hash + Eq]` body
+    // standing at `&Node` hashes and compares identities rather than reaching through to `Node`'s
+    // own members, which would key the table by a value its `==` never consults.
+    val held = underlying(texpr_type(receiver))
+
+    if (name == "hash" || name == "eq") && hashes_by_address(held) && reached_through_bound(cx, held, name) then
+        return address_member(cx, span, receiver, held, name, args)
+
     // **Every value answers `to_string()` and `debug_string()`**, by the compiler, where its type has
     // no member of that name: the string its `Display` writes (its `Debug`, else `<T>`, where it has
     // none) and the string its `Debug` writes -- the same code `str(x)` and `debug(x)` become.
@@ -894,6 +903,57 @@ call_member(cx: &Analyzer, span: Span, receiver: TExpr, name: string, args: Buf[
                        "first, with 'p[0..<n]'")
             else call_declared(cx, span, receiver, rty, name, args, expected, via, targs)
 end call_member
+
+// Whether a member call on a reference was written through a bound rather than on a reference the
+// program named: inside a derivation, where every part is asked the trait being derived, or where the
+// receiver's type is what one of the body's type parameters -- or one member of a pack -- stands for.
+//
+// **A written member call on a reference reaches its referent** (`r.eq(*s)`, `r.hash()`), and that
+// is left as it is: both reach the same object's members, so they agree with each other. It is the
+// bound that promised the reference's own `Eq` and `Hash`, so it is the bound that gets them.
+private reached_through_bound(cx: &Analyzer, held: Type, name: string) -> bool
+    if derived_trait_key(cx, name).is_some() then return true
+
+    for item in cx.subst
+        if type_eq(underlying(item.ty), held) then return true
+
+        item.ty match
+            Pack(elems) ->
+                for e in elems
+                    if type_eq(underlying(e), held) then return true
+            _ -> ()
+    end for
+
+    false
+end reached_through_bound
+
+// `eq` and `hash` on a reference or a pointer, as the address's: `eq` is its `==`, and `hash` mixes
+// the address through the integers' own finalizer. Neither takes or gives back a share.
+private address_member(cx: &Analyzer, span: Span, receiver: TExpr, held: Type, name: string,
+                       args: Buf[Expr]) -> TExpr
+    if name == "eq" then
+        return builtin_operator_method(cx, span, receiver, held, name, args).unwrap_or(bad_expr(span))
+
+    if !args.is_empty() then
+        return cx.err(span, s"method 'Hash.hash' takes no arguments, but " +
+                      supplied_phrase(args.len(), "argument"))
+
+    val key = library_key(cx, "hash_u64")
+
+    if key.is_none() then
+        return cx.err(span, "a reference hashes through the library's 'hash_u64', which the " +
+                      "standard module this compilation was given does not declare")
+
+    val word = Integer(64, false, false)
+    val address = held match
+        Ref(_, _) -> TExpr(span, TCast(receiver, Ptr(byte_type())))
+        _ -> receiver
+    var call_args: Buf[TExpr] = buf()
+
+    call_args.push(TExpr(span, TCast(address, word)))
+    cx.an.uses(key.unwrap())
+    TExpr(span, TCall(key.unwrap(), call_args, word, false))
+end address_member
 
 // Whether a member of that name is the type's own -- declared for it, supplied by a trait it
 // implements, or promised by a bound -- which then wins over the one every value has.

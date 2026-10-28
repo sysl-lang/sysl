@@ -1,0 +1,408 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.source_of
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.replace_all
+
+// **A reference is its own key** (`reference/memory.md § References compare by address`): `&T` and
+// `*T` meet `Hash` by the address they hold, for every `T`, exactly as they meet `Eq` by it. So a
+// table keyed on references keys by identity -- two distinct objects holding equal values are two
+// keys, the same object twice is one -- and a referent with no `Hash` of its own is a key all the
+// same. A call made THROUGH a bound at a reference type (`k.hash()`, `a.eq(b)` in a `[K: Hash + Eq]`
+// body, a tuple's or a derivation's parts) is the address's; a member call written on a reference
+// the program named (`r.hash()`, `r.eq(*s)`) still reaches the referent's, and the two agree with
+// each other.
+//
+// Skipped cells: a reference to a trait object, which is two words and meets `Hash` through its
+// table where its trait asks for one -- it is refused below rather than given an identity; separate
+// compilation, since the identity is decided per call in the instantiation's own walk, which a
+// `.syslib` re-walks the same way.
+
+private struct RikRun
+    ok: bool
+    out: string
+    err: string
+
+private rik_ready() -> bool
+    if std_root().is_err() || !clang_available()
+        print("skipped: the library or the toolchain is not on this machine")
+        return false
+    end if
+
+    true
+end rik_ready
+
+private rik_root(text: string) -> string
+    val root = replace_all(make_temp_dir("sysl-rik").unwrap(), "//", "/")
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+    root
+end rik_root
+
+// The program built on the counted heap and run; a build that failed answers `ok` false with the
+// reason in `out`.
+private rik_run(text: string) -> RikRun
+    val root = rik_root(text)
+
+    force_alloc_counting(true)
+
+    val built = build_native_program(s"$root/main.sysl", None, None, DefaultOptimization,
+                                     Some(s"$root/built"))
+
+    force_alloc_counting(false)
+
+    built match
+        Err(why) ->
+            val said = replace_all(failure_text(why), s"$root/", "")
+
+            remove_dir_all(root).unwrap_or(())
+            return RikRun(false, said, "")
+        Ok(_) -> ()
+
+    val said = capture(s"$root/built", [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> RikRun(false, "could not be started", "")
+        Ok(o) -> RikRun(o.status.ok(), o.text, o.err.unwrap_or(""))
+end rik_run
+
+// The program ran to the end, printed `want`, and gave back every allocation it made.
+private rik_prints(text: string, want: string)
+    val run = rik_run(text)
+
+    assert(run.ok, run.out)
+    assert_eq(run.out, want)
+    assert(alloc_count_reported(run.err) == 0, run.err)
+end rik_prints
+
+// The analysis report a program is refused with.
+private rik_report(text: string) -> string
+    val root = rik_root(text)
+
+    val out = emit_llvm_text(s"$root/main.sysl", None) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> if made.report.is_empty() then "" else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    replace_all(out, s"$root/", "")
+end rik_report
+
+private rik_node() -> string = raw"""
+    import sysl.container.{Map, map, Set, set}
+
+    struct Node
+        level: int
+
+    impl Hash for Node
+        hash(self) -> u64 = u64(self.level)
+
+    impl Eq for Node
+        eq(self, other: Node) -> bool = self.level == other.level
+
+    struct Plain
+        v: int
+
+    same_call[T: Eq](a: T, b: T) -> bool = a.eq(b)
+    same_op[T: Eq](a: T, b: T) -> bool = a == b
+    keyed[T: Hash](x: T) -> u64 = x.hash()
+
+    """
+
+// -- tables keyed on references ---------------------------------------------------------------------
+
+@test("a hash-consing table keyed on a pair of references keys by both identities")
+rik_pair_of_references_is_a_key()
+    if !rik_ready() then return
+
+    rik_prints(rik_node() + raw"""
+        main()
+            val a: &Node = Node(1)
+            val b: &Node = Node(1)
+            val m = map[(&Node, &Node), int]()
+
+            m.put((a, b), 1)
+            m.put((b, a), 2)
+            m.put((a, b), 3)
+            m.put((a, a), 4)
+            print(m.len(), m.get_or((a, b), 0), m.get_or((b, a), 0), m.get_or((a, a), 0), m.has((b, b)))
+        """, "3 3 2 4 false\n")
+
+@test("a hash-consing table hands back the node it made for a pair it has seen")
+rik_hash_consing_table()
+    if !rik_ready() then return
+
+    rik_prints(rik_node() + raw"""
+        struct Pair
+            l: &Node
+            r: &Node
+
+        main()
+            val leaf: &Node = Node(0)
+            val other: &Node = Node(0)
+            val made = map[(&Node, &Node), &Node]()
+            var count = 0
+
+            for k in [(leaf, leaf), (leaf, other), (leaf, leaf), (other, leaf), (leaf, other)]
+                if !made.has(k)
+                    made.put(k, Node(k.0.level + k.1.level + 1))
+                    count += 1
+
+            print(count, made.len(), made.get((leaf, leaf)).unwrap() == made.get((leaf, leaf)).unwrap())
+        """, "3 3 true\n")
+
+@test("a Set of references holds two equal-valued nodes as two members, and one node once")
+rik_set_of_references()
+    if !rik_ready() then return
+
+    rik_prints(rik_node() + raw"""
+        main()
+            val a: &Node = Node(1)
+            val b: &Node = Node(1)
+            val s = set[&Node]()
+
+            print(s.add(a), s.add(b), s.add(a), s.len(), s.has(a), s.has(Node(1)))
+        """, "true true false 2 true false\n")
+
+@test("a referent with no Hash and no Eq of its own is a key by identity")
+rik_plain_referent_is_a_key()
+    if !rik_ready() then return
+
+    rik_prints(rik_node() + raw"""
+        main()
+            val p: &Plain = Plain(1)
+            val q: &Plain = Plain(1)
+            val m = map[&Plain, int]()
+
+            m.put(p, 1)
+            m.put(q, 2)
+            m.put(p, 3)
+            print(m.len(), m.get_or(p, 0), m.get_or(q, 0))
+        """, "2 3 2\n")
+
+@test("a value key is unchanged: two equal values are one key")
+rik_value_keys_unchanged()
+    if !rik_ready() then return
+
+    rik_prints(rik_node() + raw"""
+        main()
+            val m = map[Node, int]()
+
+            m.put(Node(1), 1)
+            m.put(Node(1), 2)
+            m.put(Node(2), 3)
+            print(m.len(), m.get_or(Node(1), 0))
+        """, "2 2\n")
+
+// -- through a bound --------------------------------------------------------------------------------
+
+@test("'a.eq(b)' through an Eq bound at a reference compares identities (it used to reach Node.eq and be refused)")
+rik_eq_through_a_bound()
+    if !rik_ready() then return
+
+    rik_prints(rik_node() + raw"""
+        main()
+            val a: &Node = Node(1)
+            val b: &Node = Node(1)
+            val p: &Plain = Plain(1)
+            val q: &Plain = Plain(1)
+
+            print(same_call(a, b), same_call(a, a), same_op(a, b), same_op(a, a))
+            print(same_call(p, q), same_call(p, p))
+            print(same_call(Node(1), Node(1)), same_call(*a, *b))
+        """, "false true false true\nfalse true\ntrue true\n")
+
+@test("'x.hash()' through a Hash bound at a reference is the address's, and the hash law holds")
+rik_hash_through_a_bound()
+    if !rik_ready() then return
+
+    rik_prints(rik_node() + raw"""
+        main()
+            val a: &Node = Node(7)
+            val b: &Node = Node(7)
+            val c = a
+
+            print(keyed(a) == keyed(c), keyed(a) != keyed(b), keyed(*a) == keyed(*b), keyed(*a))
+        """, "true true true 7\n")
+
+@test("a member call written on a reference reaches the referent's, and eq and hash agree there")
+rik_written_member_reaches_the_referent()
+    if !rik_ready() then return
+
+    rik_prints(rik_node() + raw"""
+        main()
+            val a: &Node = Node(7)
+            val b: &Node = Node(7)
+
+            print(a.eq(*b), a.hash() == b.hash(), a.hash(), a == b)
+        """, "true true 7 false\n")
+
+@test("a raw pointer meets Hash and Eq by its address through a bound")
+rik_raw_pointer_through_a_bound()
+    if !rik_ready() then return
+
+    rik_prints(rik_node() + raw"""
+        var n1 = Node(5)
+        var n2 = Node(5)
+
+        main()
+            val r1: *Node = &n1
+            val r2: *Node = &n2
+            val r3: *Node = &n1
+            val m = map[*Node, int]()
+
+            m.put(r1, 1)
+            m.put(r2, 2)
+            m.put(r3, 3)
+            print(same_call(r1, r2), same_call(r1, r3), keyed(r1) == keyed(r3), keyed(r1) != keyed(r2))
+            print(m.len(), m.get_or(r1, 0), m.get_or(r2, 0))
+        """, "false true true true\n2 3 2\n")
+
+@test("a field read through a bounded generic's own parameter is the address's (Wrap[&Plain])")
+rik_field_of_a_bounded_parameter()
+    if !rik_ready() then return
+
+    rik_prints(rik_node() + raw"""
+        struct Wrap[T]
+            x: T
+
+        trait Hh
+            hh(self) -> u64
+
+        impl[T: Hash] Hh for Wrap[T]
+            hh(self) -> u64 = self.x.hash()
+
+        main()
+            val p: &Plain = Plain(1)
+            val q: &Plain = Plain(1)
+
+            print(Wrap(p).hh() == Wrap(p).hh(), Wrap(p).hh() != Wrap(q).hh(), Wrap(3).hh() == keyed(3))
+        """, "true true true\n")
+
+@test("a tuple and an option of references compose the parts' identities")
+rik_tuple_and_option_of_references()
+    if !rik_ready() then return
+
+    rik_prints(rik_node() + raw"""
+        main()
+            val a: &Node = Node(1)
+            val b: &Node = Node(1)
+            val oa: Option[&Node] = Some(a)
+            val ob: Option[&Node] = Some(b)
+
+            print(keyed((a, b)) == keyed((a, b)), keyed((a, b)) != keyed((b, a)), (a, b) == (a, b), (a, b) == (b, a))
+            print(oa == ob, oa == Some(a), same_call(oa, ob), same_call(oa, Some(a)))
+        """, "true true true false\nfalse true false true\n")
+
+@test("a derived Eq and Hash over a reference field are the field's identity, so they agree")
+rik_derived_over_a_reference_field()
+    if !rik_ready() then return
+
+    rik_prints(rik_node() + raw"""
+        struct Holder derives Eq, Hash
+            n: &Plain
+            k: int
+
+        struct ByNode derives Eq, Hash
+            n: &Node
+
+        main()
+            val p: &Plain = Plain(1)
+            val q: &Plain = Plain(1)
+            val a: &Node = Node(1)
+            val b: &Node = Node(1)
+            val m = map[Holder, int]()
+
+            m.put(Holder(p, 1), 1)
+            m.put(Holder(q, 1), 2)
+            m.put(Holder(p, 1), 3)
+            print(Holder(p, 1) == Holder(p, 1), Holder(p, 1) == Holder(q, 1), m.len(), m.get_or(Holder(p, 1), 0))
+            print(ByNode(a) == ByNode(b), ByNode(a).hash() == ByNode(a).hash(), ByNode(a).hash() != ByNode(b).hash())
+        """, "true false 2 3\nfalse true true\n")
+
+// -- what is not a member -------------------------------------------------------------------------
+
+@test("a reference to a trait object is not given an identity hash")
+rik_trait_object_is_not_a_member()
+    if !rik_ready() then return
+
+    val said = rik_report(rik_node() + raw"""
+        trait Show
+            show(self) -> int
+
+        impl Show for Plain
+            show(self) -> int = self.v
+
+        main()
+            val s: &Show = Plain(1)
+
+            print(keyed(s))
+        """)
+
+    assert(said.contains("'keyed' requires its type parameter 'T' to implement 'sysl.Hash', but &Show does not"), said)
+
+// -- bare metal -------------------------------------------------------------------------------------
+
+private rik_first_of(said: Buf[Placed]) -> string
+    for item in said
+        if !item.src.name.starts_with("library/") then return item.diag.message
+
+    ""
+end rik_first_of
+
+// A C archive for the freestanding thumb target, as `build-c` makes one: the first thing the
+// compilation had to say, or the LLVM text it lowered to.
+private rik_archive(text: string) -> string
+    val t = target_named("thumb-freestanding-softfp").unwrap()
+    var units: Buf[Program] = buf()
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, t) match
+            Err(_) -> ()
+            Ok(found) -> units = found
+
+    val parsed = parse(source_of("main.sysl", text), t)
+
+    if !parsed.ok() then return parsed.report.at(0).message
+
+    units.push(parsed.program)
+
+    val done = analyze_produced(units, t, buf(), false)
+    val early = rik_first_of(done.reported)
+
+    if early != "" then return early
+
+    val whole = program_of(done, done.main_module) with { entry_point = false, c_artifact = true }
+    var own: Buf[string] = buf()
+
+    own.push("")
+
+    val pr = post_analysis_checks(done.an, whole, own)
+    val late = rik_first_of(done.an.diagnostics())
+
+    if late != "" then return late
+
+    ir_print_module(codegen_with_gaps(prune(strip_tests(whole), own), t, pr).0)
+end rik_archive
+
+@test("an identity hash on a 32-bit target widens the address to the 64-bit hash")
+rik_bare_metal_identity_hash()
+    if !rik_ready() then return
+
+    val out = rik_archive(raw"""
+        struct Node
+            level: int
+
+        keyed[T: Hash](x: T) -> u64 = x.hash()
+
+        @export("probe")
+        probe(p: *Node) -> u64 = keyed(p)
+        """)
+
+    assert(out.contains("@probe(") && out.contains("ptrtoint ptr") && out.contains("to i64"), out)
