@@ -143,7 +143,8 @@ print(apply(x -> x * factor, 5))
 ```
 
 If you come from Kotlin, Swift or JavaScript, one rule differs from what you expect. **Capturing a
-value copies it.** The closure has its own copy, and writing to it does not change the original:
+value copies it.** The closure has its own copy, and writing to it does not change the original —
+so a write that only the copy would see is refused rather than silently lost:
 
 ```sysl
 each3(f: int -> unit)
@@ -152,16 +153,17 @@ each3(f: int -> unit)
 var total = 0
 
 each3(i -> total += i * i)
-print("the outer total is still", total)
+print("the total is", total)
 ```
 
-```output
-the outer total is still 0
+```error
+a closure captures by value, so it holds a copy of 'total' — so '+=' would reach that copy rather than the variable it came from, and nothing in the closure reads it back
 ```
 
-`total` is an `int`, which is a value, so the closure received a copy and incremented that. This is
-not a rule specific to closures. It is the same copy behaviour a by-value parameter or a struct field
-has, applied when the closure is created.
+`total` is an `int`, which is a value, so the closure received a copy, and incrementing that copy
+would change nothing anyone could see. This is not a rule specific to closures. It is the same copy
+behaviour a by-value parameter or a struct field has, applied when the closure is created. A closure
+that reads back what it wrote keeps its copy as state of its own between calls, and that is allowed.
 
 To accumulate across calls, capture something that *is* shared. A `&T` is a counted reference, so
 capturing one retains the reference instead of copying the object, and every holder sees the same

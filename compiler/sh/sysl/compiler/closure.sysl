@@ -375,8 +375,176 @@ lower_closure(cx: &Analyzer, span: Span, names: Buf[string], ptypes: Buf[Type],
     for item in captured
         args.push(capture_source(cx, span, item))
 
+    // Asked after the captures are read, so the closure's own reading of a name is not a read
+    // "after" it.
+    refuse_lost_writes(cx, span, st, captured, lowered.body)
+
     TExpr(span, TStructNew(st, args))
 end lower_closure
+
+// -- a write that reaches only the closure's copy ------------------------------------------------
+
+// **A closure captures by value, so a write to a capture reaches the closure's own copy** -- which
+// is a counter the closure keeps between its calls when the closure reads it back, and a write that
+// is lost when nothing does. Two shapes are refused, both at the write:
+//
+// - **the closure never reads the copy back**: every mention of the capture in the body is the
+//   place of a write (`hit = true`, `count += 1`), so no call of the closure, now or later, can
+//   observe what was written;
+// - **the enclosing body reads the variable after the closure is written**: the program reads it
+//   as though the closure's write had reached it, which it never does.
+//
+// A closure that writes its copy and reads it back (`n += 1; n`), with the variable outside left
+// alone, keeps its state between calls, and that is what a closure in a `var` is for.
+//
+// A write counts when its place is the capture itself or a part of it held by value -- a field of
+// a captured struct, an element of a captured array. A write through what a capture refers to (a
+// `&T`, a `*T`, a slice's element, a `Buf`) reaches storage the closure shares, and is not one.
+private refuse_lost_writes(cx: &Analyzer, span: Span, st: &StructType, captured: Buf[string],
+                           body: TBlock)
+    if captured.is_empty() then return
+
+    val scan = scan_copy_writes(st, captured.len(), body, span)
+
+    for i in 0..<captured.len()
+        if scan.writes.at(i) == 0 then continue
+
+        val name = captured.at(i)
+        val outer = cx.lookup(name)
+        val shown = if outer.is_some() then type_show(outer.unwrap().ty) else "T"
+
+        if scan.uses.at(i) == scan.writes.at(i)
+            cx.fault(scan.at.at(i), lost_write(name, scan.form.at(i), shown,
+                                                "and nothing in the closure reads it back"))
+            continue
+        end if
+
+        if outer.is_some()
+            cx.copy_writes.push(CopyWrite(outer.unwrap().unique, name, span, scan.at.at(i),
+                                          scan.form.at(i), shown))
+    end for
+end refuse_lost_writes
+
+// The refusal, in the words the pattern binding's is said in: what was copied, where the write
+// lands instead, and the two ways to say what was meant.
+private lost_write(name: string, form: string, shown: string, why: string) -> string =
+    s"a closure captures by value, so it holds a copy of '$name' — so $form would reach that copy " +
+    s"rather than the variable it came from, $why. Where you mean to change '$name', hold it as a " +
+    s"'&$shown' and write through it, or have the closure return the value"
+
+// A binding a closure wrote its copy of, kept until the enclosing body reads the binding again.
+struct CopyWrite
+    unique: string
+    name: string
+    closure: Span
+    write: Span
+    form: string
+    shown: string
+
+// **A read of a binding after a closure wrote its own copy of it** is a program expecting the write
+// to have reached it: refused once, at the write. The closure's own reading of the name, when it is
+// formed, lies inside the closure and is not "after" it.
+read_after_copy_write(cx: &Analyzer, span: Span, unique: string)
+    if cx.copy_writes.is_empty() then return
+
+    for i in 0..<cx.copy_writes.len()
+        val w = cx.copy_writes.at(i)
+
+        if w.unique != unique then continue
+        if span.start >= w.closure.start && span.end <= w.closure.end then continue
+
+        cx.fault(w.write, lost_write(w.name, w.form, w.shown,
+                                      "and the variable is used afterwards as though it had"))
+        cx.copy_writes.remove(i)
+        return
+    end for
+end read_after_copy_write
+
+// What one closure body does with each capture: how often it names it, how many of those are the
+// place of a write to the closure's copy, and the first such write and its form.
+private struct CopyScan
+    slots: Buf[int]
+    uses: Buf[int]
+    writes: Buf[int]
+    at: Buf[Span]
+    form: Buf[string]
+end CopyScan
+
+private scan_copy_writes(st: &StructType, n: usize, body: TBlock, span: Span) -> &CopyScan
+    val scan: &CopyScan = CopyScan(buf(), buf(), buf(), buf(), buf())
+
+    for i in 0..<n
+        scan.slots.push(int(st.slot(i)))
+        scan.uses.push(0)
+        scan.writes.push(0)
+        scan.at.push(span)
+        scan.form.push("")
+    end for
+
+    // `a, b = b, a` is the one write that is not an expression: each of its places is a write of
+    // its own, said as the assignment it is.
+    walk_block_stmts(body, TWalk(true, e -> note_copy_use(scan, e),
+                                 w -> note_copy_write(scan, w.place, "assignment", w.place.span), s -> ()))
+    scan
+end scan_copy_writes
+
+// One node of the body: a mention of a capture, a write, or neither.
+private note_copy_use(scan: &CopyScan, e: TExpr)
+    *e.kind match
+        TField(recv, slot, _) -> if env_root(recv) then bump_at(scan.uses, scan.slots, slot)
+        TStore(place, _, _, _) -> note_copy_write(scan, place, "assignment", e.span)
+        TUpdate(place, op, _, _, _, _, _) -> note_copy_write(scan, place, s"'$op'", e.span)
+        TIncDec(place, op, _, _, _) -> note_copy_write(scan, place, s"'$op'", e.span)
+        TVecStore(recv, _, _) -> note_copy_write(scan, recv, "assignment", e.span)
+        _ -> ()
+
+private note_copy_write(scan: &CopyScan, place: TExpr, form: string, at: Span)
+    val slot = copy_root(place)
+
+    if slot.is_none() then return
+
+    for i in 0..<scan.slots.len()
+        if scan.slots.at(i) != slot.unwrap() then continue
+
+        if scan.writes.at(i) == 0
+            scan.at.set(i, at)
+            scan.form.set(i, form)
+        end if
+
+        scan.writes.set(i, scan.writes.at(i) + 1)
+        return
+    end for
+end note_copy_write
+
+private bump_at(counts: Buf[int], slots: Buf[int], slot: int)
+    for i in 0..<slots.len()
+        if slots.at(i) == slot then counts.set(i, counts.at(i) + 1)
+
+// The capture a place writes the closure's own copy of: the capture itself, or a field or an
+// element of it reached without passing through anything that refers elsewhere.
+private copy_root(place: TExpr) -> Option[int] = *place.kind match
+    TField(recv, slot, _) ->
+        if env_root(recv) then Some(slot)
+        else if held_by_value(texpr_type(recv)) then copy_root(recv)
+        else None
+    TIndex(recv, _, _) -> texpr_type(recv) match
+        Array(_, _) -> copy_root(recv)
+        _ -> None
+    _ -> None
+
+private held_by_value(t: Type) -> bool = t match
+    Struct(_) -> true
+    Array(_, _) -> true
+    Vector(_, _) -> true
+    _ -> false
+
+// The closure's environment: `*self`, where every capture is a field.
+private env_root(recv: TExpr) -> bool = *recv.kind match
+    TDeref(inner, _) -> *inner.kind match
+        TLoad(name, _) -> name == "self"
+        _ -> false
+    _ -> false
+
 
 // Whether a closure's body writes through its own environment -- a store, a compound assignment, an
 // increment or a lane store whose place reaches `self`. **Asked of the typed tree**, since a write is
@@ -385,7 +553,9 @@ end lower_closure
 private writes_environment(body: TBlock) -> bool
     val seen: &EnvWrites = EnvWrites(false)
 
-    walk_block_stmts(body, expr_walk(true, e -> note_env_write(seen, e)))
+    // `a, b = b, a` writes its places as a statement rather than as expressions.
+    walk_block_stmts(body, TWalk(true, e -> note_env_write(seen, e),
+                                 w -> if reaches_self(w.place) then seen.found = true, s -> ()))
     seen.found
 end writes_environment
 

@@ -1886,6 +1886,51 @@ print(bump(), bump())
 use, since a `&T` is a box. A reading closure in a `val` is how freestanding code binds a closure to
 an immutable name.
 
+### A write to a capture that nothing will see is refused
+
+Because a closure holds a copy, a write to a capture reaches **the copy**, never the variable the
+closure was written beside. That copy is state the closure keeps between its calls, which is what the
+counter above is. But where nothing can read the copy, the write is lost, and a program that writes
+it almost always meant the variable outside. Two shapes are refused, at the write:
+
+- **the closure never reads the capture back** — every mention of it in the closure is the place of a
+  write, as in `hit = true` or `count += 1`, so no call of the closure can observe what was written;
+- **the enclosing body uses the variable after the closure** — it reads it as though the write had
+  reached it, which it never does.
+
+```sysl
+call(f: &Fn() -> unit) = f()
+
+var hit = false
+call(() -> hit = true)
+print(hit)
+```
+
+```error
+a closure captures by value, so it holds a copy of 'hit' — so assignment would reach that copy rather than the variable it came from, and nothing in the closure reads it back. Where you mean to change 'hit', hold it as a '&bool' and write through it, or have the closure return the value
+```
+
+The rule reads what the closure writes the same way a [pattern binding's](/reference/patterns/) is
+read: a field of a captured struct and an element of a captured array are parts of the copy. A write
+through what a capture **refers to** is not a write to the copy, so the fix is to hold the variable
+as a `&T` — a box both sides share — and write through it:
+
+```sysl
+call(f: &Fn() -> unit) = f()
+
+val hit: &bool = false
+call(() -> *hit = true)
+print(*hit)
+```
+
+```output
+true
+```
+
+A `*T` to a local, a field of a captured `&T` and a captured `Buf` reach shared storage the same
+way. A closure that reads back what it wrote, with the variable outside left alone, keeps its state
+and is accepted: a closure whose body is `n += 1` followed by `n` is a counter of its own.
+
 ### `_` — a parameter with the name left out
 
 A bare `_` in operand position is a closure parameter, and the closure it builds closes at the
