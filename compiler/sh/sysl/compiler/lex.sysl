@@ -840,15 +840,24 @@ private line_start(out: *Buf[Spanned[Tok]]) -> Option[usize]
 end line_start
 
 // Whether the tokens from `from` on are a list of places, a list of places and an assignment
-// operator (the values have begun), or neither.
+// operator (the values have begun), or neither. `(a, b) = 5, 6` is the same line with its places in
+// parentheses: a `(` opening the line holds the list, and its `)` must meet the operator.
 private line_so_far(out: *Buf[Spanned[Tok]], from: usize) -> LineSoFar
     var depth: usize = 0
     var commas: usize = 0
     var after_dot = false
     var at_place_start = true
+    var paren = false
+    var closed = false
 
     for i in from..<out.len()
         val t = out.at(i).value
+
+        if closed
+            return t match
+                Keyword(w) if is_assign_op(w) && commas > 0 -> ValueList
+                _ -> NoPlaceList
+        end if
 
         if depth > 0
             t match
@@ -867,6 +876,11 @@ private line_so_far(out: *Buf[Spanned[Tok]], from: usize) -> LineSoFar
             Keyword(w) ->
                 if w == "["
                     depth = 1
+                elif w == "(" && i == from
+                    paren = true
+                elif w == ")" && paren
+                    paren = false
+                    closed = true
                 elif w == ","
                     commas += 1
                 elif is_assign_op(w)
@@ -879,7 +893,7 @@ private line_so_far(out: *Buf[Spanned[Tok]], from: usize) -> LineSoFar
             _ -> return NoPlaceList
 
         after_dot = t == Keyword(".")
-        at_place_start = t == Keyword(",") || t == Keyword("*")
+        at_place_start = t == Keyword(",") || t == Keyword("*") || t == Keyword("(")
     end for
 
     PlaceList
