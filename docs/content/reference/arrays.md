@@ -769,8 +769,10 @@ print(b[-1])
 the literal -1 does not fit usize
 ```
 
-What happens to an index past the end is the method's to decide: an array's check traps, and a
-`Buf`'s `index_place` panics, naming the index and the count ([`Buf`](/library/buf/)). A method that
+What happens to an index past the end is the method's to decide: an array's check traps, and the
+standard containers' — `Buf`, `Frozen`, `Deque`, `Ring` — trap the same way, reporting the index and
+the count through `sysl_bounds_fail` as an array's check does, without the caller's location
+([`Buf`](/library/buf/#bounds-a-trap-here-an-option-there)). A method that
 takes some other type — an `int`, a `string` key — is handed the index as it was written, and an
 argument of the wrong type is refused as it would be in a call.
 
@@ -1280,7 +1282,8 @@ rule specific to growable arrays.
 
 **A buffer that is done growing can be frozen.** `b.freeze()` takes its elements and answers a `&sync
 Frozen[T]` — one atomic count on the whole buffer, indexed, walked and viewed as a `[]const T`, and
-never written — which every thread may read at once without a lock; `b` is left empty. What it may
+never written — which every thread may read at once without a lock; `b` is left empty. An index
+past its length traps, as a `Buf`'s does. What it may
 hold, and why, is in [A frozen buffer crosses](/reference/memory/#a-frozen-buffer-crosses):
 
 ```sysl

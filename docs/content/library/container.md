@@ -306,7 +306,9 @@ doing 11
 ```
 
 That is the shape of every work list and every breadth-first walk. `d[i]` counts from the **front**
-whatever the ring is doing underneath, and `first`/`last` answer an `Option` at either end.
+whatever the ring is doing underneath, and `first`/`last` answer an `Option` at either end. An index
+past the count — through `d[i]`, `at` or `set` — traps as an array's index does, with an array's
+report (`index 5 out of bounds for length 3`) and no location ([`Buf`](/library/buf/#bounds-a-trap-here-an-option-there)).
 
 ## The priority queue
 
