@@ -1961,7 +1961,8 @@ it almost always meant the variable outside. Two shapes are refused, at the writ
 - **the closure never reads the capture back** — every mention of it in the closure is the place of a
   write, as in `hit = true` or `count += 1`, so no call of the closure can observe what was written;
 - **the enclosing body uses the variable after the closure** — it reads it as though the write had
-  reached it, which it never does.
+  reached it, which it never does. Every use counts, a hole of an interpolated string
+  (`f"clicked ${n}%d times"`) and an operand or argument as much as a plain `print(n)`.
 
 ```sysl
 call(f: &Fn() -> unit) = f()
