@@ -620,8 +620,9 @@ descriptor_bindings(cx: &Analyzer, name: string, d: Type) -> Buf[Binding]
 
     d match
         Descriptor(owner, v, f) ->
-            if f < 0 && v >= 0 then
+            if f < 0 && v >= 0
                 out.push(Binding(s"$name::Payload", payload_type(cx, walked_fields(*owner, v))))
+                out.push(Binding(s"$name::Partial", partial_type(cx.an, walked_fields(*owner, v))))
         _ -> ()
 
     out
@@ -652,7 +653,8 @@ end descriptor_projection
 private descriptor_refusal(written: string, attr: string, d: Type) -> string = d match
     Descriptor(owner, v, f) ->
         val answers = if f >= 0 then "'::Type', the field's type"
-        else "'::Fields', its payload's fields, and '::Payload', its payload's type"
+        else "'::Fields', its payload's fields, '::Payload', its payload's type, and '::Partial', " +
+             "its payload's partial value"
 
         s"'$written' is the descriptor '${descriptor_text(*owner, v, f)}', which answers $answers, " +
         s"and not '::$attr'"
@@ -707,7 +709,9 @@ private variant_name(owner: Type, v: int) -> string = underlying(owner) match
 
 // What a variant's payload travels as: `unit` with no fields, the field itself with one, and the
 // tuple of them with more.
-private payload_type(cx: &Analyzer, fields: Buf[(string, Type)]) -> Type
+private payload_type(cx: &Analyzer, fields: Buf[(string, Type)]) -> Type = product_of(cx.an, fields)
+
+private product_of(a: &Analysis, fields: Buf[(string, Type)]) -> Type
     if fields.is_empty() then return Unit
     if fields.len() == 1 then return unqualified(fields.at(0).1)
 
@@ -716,8 +720,87 @@ private payload_type(cx: &Analyzer, fields: Buf[(string, Type)]) -> Type
     for item in fields
         ts.push(unqualified(item.1))
 
-    Struct(registered_tuple(cx.an, ts))
-end payload_type
+    Struct(registered_tuple(a, ts))
+end product_of
+
+// **A partial value holds a type's fields one at a time** -- `T::Partial` for a struct, `c::Partial`
+// for a variant's payload: one `Option` per field, shaped as a payload is (`unit` with no fields, the
+// one `Option` with one, the tuple of them with more), so its zero is every field `None` whatever
+// the fields are. `p.(f)` reads and writes a field of it as `Option[f::Type]`, and `T::Make(p)` or
+// `T::Make(c, p)` builds the value from it.
+partial_type(a: &Analysis, fields: Buf[(string, Type)]) -> Type
+    var opts: Buf[(string, Type)] = buf()
+
+    for item in fields
+        opts.push((item.0, optional_of(a, unqualified(item.1))))
+
+    product_of(a, opts)
+end partial_type
+
+// `Option[t]`.
+private optional_of(a: &Analysis, t: Type) -> Type
+    var args: Buf[Type] = buf()
+
+    args.push(t)
+    reinstantiate(a, module_qualify(StdModule, "Option"), args)
+end optional_of
+
+// `T::Partial` written where a type is, with `T` worked out. **An associated type a trait declares
+// under the name wins**, as a user's name beats every form the compiler supplies; a type parameter
+// read in its own terms has no fields yet, so it answers `Unknown` and each instantiation reads its
+// own.
+partial_projection(a: &Analysis, scope: Scope, span: Span, subject: Type) -> Type
+    if subject == Unknown then return Unknown
+
+    val declared = assoc_type_opt(a, subject, "Partial")
+
+    if declared.is_some() then return declared.unwrap()
+
+    subject match
+        Abstract(_, _) -> return Unknown
+        _ -> ()
+
+    val shown = type_show(subject)
+    val refused = partial_refusal(a, scope, subject, shown)
+
+    if !refused.is_empty()
+        a.fault(scope, span, refused)
+        return Unknown
+    end if
+
+    underlying(subject) match
+        Struct(s) -> partial_type(a, s.fields)
+        _ -> Unknown
+end partial_projection
+
+// Why `T::Partial` names nothing, or nothing where it names the struct's partial value.
+private partial_refusal(a: &Analysis, scope: Scope, subject: Type, shown: string) -> string
+    val s = underlying(subject) match
+        Struct(s) -> s
+        Enum(_) ->
+            return s"'$shown::Partial' names nothing: an enum is built a variant at a time, and a " +
+                   s"variant's partial value is 'c::Partial', for the 'c' of a 'for const c in " +
+                   s"$shown::Variants'"
+        _ -> return s"'$shown::Partial' names nothing: a partial value holds a struct's fields, and " +
+                    s"'$shown' is ${kind_phrase(subject)}"
+
+    if s.opaque && (s.fields.is_empty() || layout_hidden(a, scope, s.base)) then
+        return s"'$shown' is an opaque struct, so its fields are not known here and it has no " +
+               "partial value"
+
+    if s.union_layout then
+        return s"'$shown' is a union, which holds one field at a time, so it has no partial value — " +
+               "it is built from exactly one field, by name"
+
+    for i in 0..<s.fields.len()
+        val name = s.fields.at(i).0
+
+        if is_anonymous_field(name) || (name == "_" && s.c_bit(i).is_some()) then
+            return s"'$shown' holds storage no field names (an anonymous member or an unnamed " +
+                   "bitfield), so it has no partial value"
+
+    ""
+end partial_refusal
 
 // A descriptor as a diagnostic names it: `P.x`, `Shape.Circle`, `Shape.Circle.r`.
 descriptor_text(owner: Type, v: int, f: int) -> string
@@ -785,7 +868,7 @@ descriptor_attr(cx: &Analyzer, span: Span, written: string, attr: string, d: Typ
         if attr == "Annotation" then annotation_unnamed(cx, span, written)
         else if attr == "Fields" && v >= 0 && f < 0 then
             payload_fields_answer(cx, span, *owner, v)
-        else if (attr == "Type" && f >= 0) || (attr == "Payload" && f < 0) then
+        else if (attr == "Type" && f >= 0) || ((attr == "Payload" || attr == "Partial") && f < 0) then
             cx.err(span, s"'$written::$attr' is a type, so it stands where a type is written — " +
                    s"'var x: $written::$attr', 'sizeof($written::$attr)', 'decode[$written::$attr](r)'")
         else
@@ -840,7 +923,13 @@ reflected_select(cx: &Analyzer, span: Span, receiver: Expr, selector: string) ->
             val tr = if disagree(texpr_type(outer), wanted) then auto_deref(cx, outer) else outer
             val rt = texpr_type(tr)
 
-            if disagree(rt, wanted) then
+            // A partial value holds the same fields, each as an `Option` of its type, in the same
+            // places -- so the one selector reads and writes both.
+            val partial = if disagree(rt, wanted) && v != MembersWalk then Some(partial_type(cx.an, fields))
+            else None
+            val in_partial = partial.is_some() && !disagree(rt, partial.unwrap())
+
+            if disagree(rt, wanted) && !in_partial then
                 return cx.err(span, s"'$selector' is the field '${descriptor_text(*owner, v, f)}', which " +
                               s"a value of '${type_show(wanted)}' holds, and this is a value of " +
                               s"'${type_show(rt)}'")
@@ -854,6 +943,12 @@ reflected_select(cx: &Analyzer, span: Span, receiver: Expr, selector: string) ->
 
                 if base != "" && !reflected_field_in_reach(cx, base, name) then
                     return cx.err(span, field_out_of_reach(cx, base, name))
+            end if
+
+            if in_partial
+                if fields.len() == 1 then return tr
+
+                return TExpr(span, TField(tr, f, optional_of(cx.an, unqualified(fields.at(usize(f)).1))))
             end if
 
             // A payload of one field is that field, so there is nothing to select.
@@ -985,8 +1080,11 @@ descriptor_pattern(cx: &Analyzer, span: Span, name: string, d: Type, ty: Type) -
 
 // `T::Make(c, payload)` -- the variant `c` stands for, built from the payload `x.(c)` hands back.
 make_variant(cx: &Analyzer, span: Span, written: string, args: Buf[Expr], ty: Type) -> TExpr
+    if args.len() == 1 then return make_from_partial(cx, span, written, args.at(0), ty)
+
     if args.len() != 2 then
-        return cx.err(span, s"'$written::Make' takes a variant and its payload — " +
+        return cx.err(span, s"'$written::Make' takes a partial value — '$written::Make(p)', where 'p' " +
+                      s"is a '$written::Partial' — or a variant and its payload — " +
                       s"'$written::Make(c, (a, b))', where 'c' is the name of a " +
                       s"'for const c in $written::Variants'")
 
@@ -1015,13 +1113,136 @@ make_variant(cx: &Analyzer, span: Span, written: string, args: Buf[Expr], ty: Ty
 
             if texpr_type(tv) == Unknown then return bad_expr(span)
 
-            if disagree(texpr_type(tv), pt) then
+            if disagree(texpr_type(tv), pt)
+                // Or from its partial value, each field taken out of its `Option`.
+                val partial = partial_type(cx.an, variant.fields)
+
+                if !disagree(texpr_type(tv), partial)
+                    val made = descriptor_text(*owner, v, -1)
+                    val taken = taken_fields(cx, span, tv, partial, made, *owner, v, variant.fields)
+
+                    return TExpr(span, TBlockExpr(TBlock(taken.0, Some(TExpr(span, TEnumNew(Enum(en),
+                                                                                    variant, taken.1))),
+                                                         Enum(en))))
+                end if
+
                 return cx.err(args.at(1).span, s"'${variant.name}' is built from its payload, a value " +
-                              s"of '${type_show(pt)}', and this is a value of '${type_show(texpr_type(tv))}'")
+                              s"of '${type_show(pt)}', or its partial value, a value of " +
+                              s"'${type_show(partial)}', and this is a value of " +
+                              s"'${type_show(texpr_type(tv))}'")
+            end if
 
             built_variant(cx, span, Enum(en), variant, tv, pt)
         _ -> bad_expr(span)
 end make_variant
+
+// `T::Make(p)` -- the struct `T` built from its partial value, each field taken out of its `Option`.
+// A field still `None` stops the program, naming it: the value would otherwise hold a field nothing
+// was given for.
+private make_from_partial(cx: &Analyzer, span: Span, written: string, arg: Expr, ty: Type) -> TExpr
+    if ty == Unknown then return bad_expr(span)
+
+    // Read in its own terms a type parameter has no fields yet, so the argument is read for its own
+    // mistakes and each instantiation builds its own.
+    ty match
+        Abstract(_, _) ->
+            type_expr_bare(cx, arg)
+            return bad_expr(span)
+        _ -> ()
+
+    underlying(ty) match
+        Enum(_) ->
+            return cx.err(span, s"'$written::Make(p)' builds a struct from its partial value, and " +
+                          s"'$written' is an enum, which is built a variant at a time — " +
+                          s"'$written::Make(c, p)', where 'p' is the payload or the 'c::Partial' of " +
+                          s"the 'c' of a 'for const c in $written::Variants'")
+        _ -> ()
+
+    val refused = partial_refusal(cx.an, cx.scope, ty, written)
+
+    if !refused.is_empty() then return cx.err(span, refused)
+
+    val s = underlying(ty) match
+        Struct(s) -> s
+        _ -> return bad_expr(span)
+
+    // Building it writes every field, so each has to be one this file may reach.
+    for item in s.fields
+        if !reflected_field_in_reach(cx, s.base, item.0) then
+            return cx.err(span, s"'$written::Make' writes every field, and " +
+                          field_out_of_reach(cx, s.base, item.0))
+
+    val partial = partial_type(cx.an, s.fields)
+    val tv = type_expr(cx, arg, Some(partial))
+
+    if texpr_type(tv) == Unknown then return bad_expr(span)
+
+    if disagree(texpr_type(tv), partial) then
+        return cx.err(arg.span, s"'$written::Make' builds '$written' from its partial value, a value " +
+                      s"of '${type_show(partial)}', and this is a value of '${type_show(texpr_type(tv))}'")
+
+    val taken = taken_fields(cx, span, tv, partial, type_show(ty), ty, -1, s.fields)
+    val made = checked_new(cx, span, TExpr(span, TStructNew(s, taken.1)), s)
+
+    TExpr(span, TBlockExpr(TBlock(taken.0, Some(made), Struct(s))))
+end make_from_partial
+
+// Each field of a partial value taken out of its `Option`, in order, with the statement that holds
+// the value while they are: a field still `None` stops the program, naming what was being `made` and
+// the field.
+private taken_fields(cx: &Analyzer, span: Span, tv: TExpr, partial: Type, made: string, owner: Type,
+                     v: int, fields: Buf[(string, Type)]) -> (Buf[TStmt], Buf[TExpr])
+    var stmts: Buf[TStmt] = buf()
+    var out: Buf[TExpr] = buf()
+
+    if fields.is_empty()
+        stmts.push(TExprStmt(tv))
+        return (stmts, out)
+    end if
+
+    val held = cx.fresh_name(s"${ModuleSep}partial")
+    val load = TExpr(span, TLoad(held, partial))
+
+    stmts.push(TVarDecl(held, partial, tv, None))
+
+    for j in 0..<fields.len()
+        val ft = unqualified(fields.at(j).1)
+        val ot = optional_of(cx.an, ft)
+        val opt = if fields.len() == 1 then load else TExpr(span, TField(load, int(j), ot))
+
+        out.push(taken_field(cx, span, opt, ot, ft, made, descriptor_text(owner, v, int(j))))
+
+    (stmts, out)
+end taken_fields
+
+// One field out of its `Option`: what `Some` holds, or the failure naming the field.
+private taken_field(cx: &Analyzer, span: Span, opt: TExpr, ot: Type, ft: Type, made: string,
+                    field: string) -> TExpr
+    val some = underlying(ot) match
+        Enum(d) -> d.variant("Some")
+        _ -> None
+
+    if some.is_none() then return bad_expr(span)
+
+    cx.enter()
+
+    val u = cx.bind_pattern(s"${ModuleSep}field", ft)
+
+    cx.leave()
+
+    var pats: Buf[TPattern] = buf()
+    var hit: Buf[TPattern] = buf()
+    var rest: Buf[TPattern] = buf()
+    var arms: Buf[TArm] = buf()
+
+    pats.push(TBindPattern(u, ft))
+    hit.push(TVariantPattern(underlying(ot), some.unwrap(), pats))
+    rest.push(TWildPattern(ot))
+    arms.push(TArm(hit, None, TBlock(buf(), Some(TExpr(span, TLoad(u, ft))), ft)))
+    arms.push(TArm(rest, None, TBlock(buf(), Some(TExpr(span, TFieldUnset(made, field))), Never)))
+
+    TExpr(span, TMatch(opt, arms, ft))
+end taken_field
 
 // The variant made from a payload already typed: with no fields the payload is run for what it does
 // and the variant follows, with one it is the field, and with more each field is read off it once
