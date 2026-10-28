@@ -713,6 +713,67 @@ print(r.cells)
 [1, 2, 30, 0]
 ```
 
+**Where the method takes a `usize`, the subscript takes any integer**, exactly as an array's does: the
+compiler brings the index to a `usize` before the call, so `b[i]` with `i` an `int`, an `i8` or a
+`u64` needs no conversion written, and the index fixes no literal binding's type. This holds for
+`Index`, `IndexPlace` and `IndexSet` alike, and for a type parameter bounded by one of them:
+
+```sysl
+import sysl.buf.{Buf, buf}
+
+var b: &Buf[int] = buf()
+
+b.push(10)
+b.push(20)
+
+val i = 1
+val narrow: i8 = 0
+
+b[narrow] += 5
+
+print(b[i], b[narrow])
+```
+
+```output
+20 15
+```
+
+**A negative index stops the program at the subscript**, as an array's does, since no `usize` holds
+it; the method is never called. A negative literal is refused while compiling:
+
+```sysl
+import sysl.buf.{Buf, buf}
+
+at(b: &Buf[int], i: int) -> int = b[i]
+
+var b: &Buf[int] = buf()
+
+b.push(1)
+print("reading")
+print(at(b, 0 - 1))
+```
+
+```output trap
+reading
+```
+
+```sysl
+import sysl.buf.{Buf, buf}
+
+var b: &Buf[int] = buf()
+
+print(b[-1])
+```
+
+```error
+the literal -1 does not fit usize
+```
+
+What happens to an index past the end is the method's to decide: an array's check traps, and a
+`Buf`'s `index_place` panics, naming the index and the count ([`Buf`](/library/buf/)). A method that
+takes some other type — an `int`, a `string` key — is handed the index as it was written, and an
+argument of the wrong type is refused as it would be in a call.
+
 **A type that implements only `Index` is read by a call**, which yields a value rather than a place.
 The index is whatever the implementation takes, and need not be an integer; `b[i] = v` reaches a
 second trait's method, `IndexSet`, and the compound forms are refused, since expanding them would
