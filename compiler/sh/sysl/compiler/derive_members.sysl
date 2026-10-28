@@ -474,3 +474,206 @@ supplied_debug(params: Buf[Param]) -> bool
 
     false
 end supplied_debug
+
+// -- a trait that only joins others -------------------------------------------------------------
+
+// **`derives Codec`, where `trait Codec: Encode + Decode` carries no `derive` member of its own,
+// derives what `Codec` requires** (`docs/design/codec.md` § 6, Q6): a block for every trait it
+// reaches that carries `derive` members, and an empty one for every trait between that only joins
+// others in turn, each written once however many paths reach it. The block for `Codec` itself stays,
+// empty, as a reader would have written it.
+//
+// It runs once every trait is registered and before any trait's block is read, since what a trait
+// requires is a question about its declaration. A required trait that reaches no `derive` member is
+// not written: it is the type's to implement, and the supertrait check says so naming it. A trait
+// that reaches none at all is refused at the clause by `hoist_impl`, as it always was.
+//
+// **One implementation per trait** is the rule a joined block is held to: one the type wrote by hand
+// is refused at the word that asked for the derivation, and one the clause also named outright is
+// refused at that name, as a trait named twice is. Two joining traits of one clause reaching the same
+// trait write it once -- that is a diamond, not a repetition. A type parameter of a generic type is
+// bound by the trait the clause named, which promises every block written for it.
+expand_joined_derives(a: &Analysis)
+    val n = a.tables.impls.len()
+
+    for i in 0..<n
+        val im = a.tables.impls.at(i)
+
+        if !im.decl.derived || im.joined then continue
+
+        val key = lookup_trait_key(a, im.scope, im.decl.trait_name)
+
+        if key.is_none() || !trait_decl_at(a, key.unwrap()).unwrap().derives.is_empty() then continue
+
+        val subject = subject_key(a, im)
+
+        if subject.is_none() then continue
+
+        var seen: Buf[string] = buf()
+        var reached: Buf[string] = buf()
+
+        seen.push(key.unwrap())
+        joined_traits(a, key.unwrap(), &seen, &reached)
+
+        // What is already there for each trait reached: nothing, a block this expansion may skip, or a
+        // block it may not stand beside.
+        var fresh: Buf[string] = buf()
+        var by_hand: Buf[string] = buf()
+
+        for k in reached
+            val other = impl_for(a, k, subject.unwrap())
+
+            if other.is_none() then fresh.push(k)
+            else
+                val o = a.tables.impls.at(other.unwrap())
+
+                if !o.decl.derived then by_hand.push(k)
+                else if !o.joined
+                    a.fault(o.scope, o.span, s"'${trait_name_of(a, k)}' is derived through " +
+                            s"'${im.decl.trait_name}' already, which requires it — remove " +
+                            s"'${o.decl.trait_name}' from the 'derives' clause")
+
+        // The rest are still written, so the one mistake is the one thing said: left out, each would be
+        // reported again as a requirement the type does not meet.
+        if !by_hand.is_empty() then a.fault(im.scope, im.span, by_hand_refusal(a, im, reached, by_hand))
+
+        for k in fresh
+            var decl = im.decl
+
+            decl.trait_name = k
+            decl.methods = buf()
+            decl.bounds = joined_bounds(im, k)
+            a.tables.impls.push(Impl(decl, im.span, im.scope, true))
+end expand_joined_derives
+
+// The bounds of a block written for `key` through a joining trait: the type's own, and each type
+// parameter bound by `key` where `derived_block` bound it by the joining trait -- so a `Box[T]` is
+// `Encode` wherever `T` is, whether or not `T` is the whole `Codec`. The bound the clause added is
+// told from one the type declared by its position, which is the clause's word.
+private joined_bounds(im: Impl, key: string) -> Buf[NamedBounds]
+    var out: Buf[NamedBounds] = buf()
+
+    for item in im.decl.bounds
+        var bs: Buf[BoundRef] = buf()
+
+        for b in item.bounds
+            if b.name == im.decl.trait_name && b.span.start == im.span.start && b.span.end == im.span.end
+                bs.push(BoundRef(b.span, key, buf()))
+            else bs.push(b)
+
+        out.push(NamedBounds(item.name, bs))
+
+    out
+end joined_bounds
+
+// Whether a trait reaches, through what it requires, a trait carrying `derive` members -- which is
+// what makes one with none of its own derivable.
+joins_derivable(a: &Analysis, key: string) -> bool
+    var seen: Buf[string] = buf()
+    var reached: Buf[string] = buf()
+
+    seen.push(key)
+    joined_traits(a, key, &seen, &reached)
+    !reached.is_empty()
+end joins_derivable
+
+// The traits a joining trait derives through, depth first, each taken once: every trait it requires
+// that carries a `derive` member, and every one that carries none but reaches one, walked in turn.
+// **`Debug` is never one of them** -- every type has it already -- and a requirement written with
+// arguments is not either, since a derived block takes none.
+private joined_traits(a: &Analysis, key: string, seen: *Buf[string], out: *Buf[string])
+    val tr = trait_decl_at(a, key).unwrap()
+    val home = trait_scope_of(a, key)
+
+    for sup in tr.supers
+        if !sup.args.is_empty() then continue
+
+        val k = lookup_trait_key(a, home, sup.name)
+
+        if k.is_none() || holds_string(*seen, k.unwrap()) then continue
+
+        // A joining trait is written only where something past it derives: its block stands between
+        // the type and the traits that do the work. One that reaches nothing is the type's to write.
+        var visiting: Buf[string] = buf()
+
+        if !reaches_derive(a, k.unwrap(), &visiting) then continue
+
+        seen.push(k.unwrap())
+        out.push(k.unwrap())
+
+        if trait_decl_at(a, k.unwrap()).unwrap().derives.is_empty() then joined_traits(a, k.unwrap(), seen, out)
+end joined_traits
+
+// Whether a trait carries `derive` members, or requires one that reaches some. `Debug` never counts.
+private reaches_derive(a: &Analysis, key: string, visiting: *Buf[string]) -> bool
+    if trait_name_of(a, key) == "Debug" && module_of(key) == AutoImportedModule then return false
+
+    val tr = trait_decl_at(a, key).unwrap()
+
+    if !tr.derives.is_empty() then return true
+    if holds_string(*visiting, key) then return false
+
+    visiting.push(key)
+
+    val home = trait_scope_of(a, key)
+
+    for sup in tr.supers
+        if !sup.args.is_empty() then continue
+
+        val k = lookup_trait_key(a, home, sup.name)
+
+        if k.is_some() && reaches_derive(a, k.unwrap(), visiting) then return true
+
+    false
+end reaches_derive
+
+// The declared type a derived block is for, by key.
+private subject_key(a: &Analysis, im: Impl) -> Option[string] = *im.decl.for_type.kind match
+    NamedType(n, _) -> lookup_type_key(a, im.scope, n)
+    _ -> None
+
+// The block, by its index, that implements the trait `key` for the declared type `subject`, where
+// one does.
+private impl_for(a: &Analysis, key: string, subject: string) -> Option[usize]
+    for i in 0..<a.tables.impls.len()
+        val o = a.tables.impls.at(i)
+
+        if o.decl.trait_name == "" then continue
+
+        val k = if o.joined then Some(o.decl.trait_name) else lookup_trait_key(a, o.scope, o.decl.trait_name)
+
+        if k.is_none() || k.unwrap() != key then continue
+
+        val s = subject_key(a, o)
+
+        if s.is_some() && s.unwrap() == subject then return Some(i)
+
+    None
+end impl_for
+
+// A trait's own name, for a message.
+private trait_name_of(a: &Analysis, key: string) -> string = trait_decl_at(a, key).unwrap().name
+
+// What is said where a joining trait would derive a trait the type implements by hand.
+private by_hand_refusal(a: &Analysis, im: Impl, reached: Buf[string], by_hand: Buf[string]) -> string
+    val joining = im.decl.trait_name
+    val first = trait_name_of(a, by_hand.at(0))
+    var rest = ""
+
+    for k in reached
+        if holds_string(by_hand, k) then continue
+
+        val inner = trait_decl_at(a, k).unwrap()
+
+        if inner.derives.is_empty() then continue
+
+        rest = if rest == "" then inner.name else s"$rest, ${inner.name}"
+
+    var advice = s"remove '$joining' from the clause and keep the 'impl'"
+
+    if rest != "" then advice = s"name the others instead ('derives $rest') and keep the 'impl'"
+
+    s"'$joining' would derive '$first' for ${type_text(im.decl.for_type)}, which already has an " +
+    s"'impl $first' written by hand — a type has one implementation of a trait. To derive the rest, " +
+    advice
+end by_hand_refusal

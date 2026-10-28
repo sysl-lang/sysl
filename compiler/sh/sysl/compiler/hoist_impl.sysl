@@ -18,7 +18,7 @@ import sysl.text.{str_builder, StrBuilder}
 hoist_impl(a: &Analysis, im: Impl) -> Impl
     val scope = im.scope
     val span = im.span
-    val key = lookup_trait_key(a, scope, im.decl.trait_name)
+    val key = if im.joined then Some(im.decl.trait_name) else lookup_trait_key(a, scope, im.decl.trait_name)
 
     if key.is_none() && im.decl.derived
         a.fault(scope, span, s"unknown trait '${im.decl.trait_name}' — 'derives' names Eq, Ord, Hash " +
@@ -35,8 +35,10 @@ hoist_impl(a: &Analysis, im: Impl) -> Impl
     var block = im.decl
 
     // A `derives` clause may name any trait that says how to write it -- which is what its `derive`
-    // members are. One without any is implemented by hand.
-    if block.derived && tr.derives.is_empty()
+    // members are. One without any is implemented by hand -- unless it only joins traits that have
+    // them (`trait Codec: Encode + Decode`), whose blocks `expand_joined_derives` has written beside
+    // this one, which is then the empty block a reader would have written for it.
+    if block.derived && tr.derives.is_empty() && !im.joined && !joins_derivable(a, key.unwrap())
         val simple = im.decl.trait_name
 
         a.fault(scope, span, s"'$simple' is not a trait the compiler knows how to write, and it " +
@@ -152,7 +154,7 @@ hoist_impl(a: &Analysis, im: Impl) -> Impl
         if family.is_some() then whose = s"every type in '${qualified_name(family.unwrap())}'"
 
         a.fault(scope, span, s"$whose already implements '${qualified_name(key.unwrap())}'$because")
-        return Impl(block, span, scope)
+        return Impl(block, span, scope, im.joined)
     end if
 
     // A **closed** trait names a family rather than a promise, so there is nothing for a block to
@@ -162,7 +164,7 @@ hoist_impl(a: &Analysis, im: Impl) -> Impl
         a.fault(scope, span, s"'${qualified_name(key.unwrap())}' names a family of types the compiler " +
                 "settles, so nothing implements it — a type is one of them or it is not, and " +
                 s"'${home.label}' is not")
-        return Impl(block, span, scope)
+        return Impl(block, span, scope, im.joined)
 
     // **The overriding side is always a type written out in full**, which is what makes `override` a
     // rule about two blocks rather than a rule about every pair of keys: a shape is one key and so is
@@ -172,7 +174,7 @@ hoist_impl(a: &Analysis, im: Impl) -> Impl
                 s"'${home.label}' is the general kind — an implementation for a shape or for a " +
                 "generic type covers every type it matches at once, so there is nothing below it. " +
                 "The override is written on the block for one type spelled out in full")
-        return Impl(block, span, scope)
+        return Impl(block, span, scope, im.joined)
 
     val already = impls_of(a, key.unwrap(), home.key)
     // Asked with **this** block's parameters standing in for the subject's arguments, so a block
@@ -184,7 +186,7 @@ hoist_impl(a: &Analysis, im: Impl) -> Impl
             a.fault(scope, span, s"'${home.label}' already implements " +
                     s"'${show_bound(a, bound, subject)}'" +
                     second_implementation(key.unwrap(), tr, already.at(i)))
-            return Impl(block, span, scope)
+            return Impl(block, span, scope, im.joined)
 
     // **A blanket block covering the subject is an implementation the subject already has**, and the
     // list above cannot see it: a blanket is filed under its bound's key rather than under any
@@ -204,7 +206,7 @@ hoist_impl(a: &Analysis, im: Impl) -> Impl
             a.fault(scope, span, s"'${home.label}' already implements '${show_bound(a, bound, subject)}' — " +
                     s"${every_shape(blankets.at(i).0)} does, through one block written over the family" +
                     inherited)
-            return Impl(block, span, scope)
+            return Impl(block, span, scope, im.joined)
 
     // **A result is not a selector.** An operator trait's last argument is what the operator gives
     // back, and `a * b` supplies the operands and nothing else -- so two implementations that agree
@@ -245,14 +247,14 @@ hoist_impl(a: &Analysis, im: Impl) -> Impl
                 a.fault(scope, span, s"'${one.unwrap().0}' already implements " +
                         s"'${qualified_name(key.unwrap())}', and this 'impl' would implement it for " +
                         s"${every_shape(h)} — including that one")
-                return Impl(block, span, scope)
+                return Impl(block, span, scope, im.joined)
         else
             if !impls_of(a, key.unwrap(), h).is_empty() && !block.overrides
                 a.fault(scope, span, s"${every_shape(h)} already implements " +
                         s"'${qualified_name(key.unwrap())}', so '${home.label}' has an implementation " +
                         "and cannot be given a second one — write 'override impl' to say that " +
                         "replacing it for this one type is what was meant")
-                return Impl(block, span, scope)
+                return Impl(block, span, scope, im.joined)
 
             a.tables.members.written_shapes.put(impl_key_of(key.unwrap(), h),
                                                 (home.label, block.overrides))
@@ -262,7 +264,7 @@ hoist_impl(a: &Analysis, im: Impl) -> Impl
     // implementation already covers the type is the more useful half of that.
     check_coherence(a, scope, span, block, home.label)
 
-    if a.complaints() > before then return Impl(block, span, scope)
+    if a.complaints() > before then return Impl(block, span, scope, im.joined)
 
     // The first implementation of a trait for a type files its members under the names they were
     // written with; each one after it under names that differ, since a type's members are one
@@ -344,7 +346,7 @@ hoist_impl(a: &Analysis, im: Impl) -> Impl
                     s"missing — supply it with 'type ${ad.name} = …', or give the member that " +
                     s"produces it the result 'some ${first_bound_shown(ad)}' and let the body say " +
                     "what it is")
-            return Impl(block, span, scope)
+            return Impl(block, span, scope, im.joined)
         end if
 
     // **An associated type is named without its trait**, so a second trait bringing a name the type
@@ -362,7 +364,7 @@ hoist_impl(a: &Analysis, im: Impl) -> Impl
                     s"declares an associated type '${ad.name}' — and so does " +
                     s"'${qualified_name(key.unwrap())}'. An associated type is named without its " +
                     "trait, so one type cannot have two of one name")
-            return Impl(block, span, scope)
+            return Impl(block, span, scope, im.joined)
 
     val wkey = if written.is_empty() then "" else plain_bound(key.unwrap(), written).key()
     var rows: Buf[TraitImpl] = buf()
@@ -393,16 +395,19 @@ hoist_impl(a: &Analysis, im: Impl) -> Impl
     for i in 0..<tr.tparams.len()
         if i < bound.args.len() then super_subst.push(Binding(tr.tparams.at(i), bound.args.at(i)))
 
+    // **A requirement is read in the trait's scope, where it was written**: `trait Codec: Encode`
+    // in `wire` means `wire.Encode` whatever the implementing file imports, and read in the block's
+    // scope it named nothing there -- or another trait of that name.
+    val tscope = trait_scope_of(a, key.unwrap())
+
     for s in tr.supers
         a.tables.super_checks.push(SuperCheck(home.label, module_show(block.trait_name),
-                                              resolve_bound(a, scope, s.span, s, super_subst),
+                                              resolve_bound(a, tscope, s.span, s, super_subst),
                                               subject, span, scope, ""))
 
     // What the trait asked of each associated type is asked of the type this block supplied, with
     // `Self` in the bound standing for **that** type -- a bare `type W: Add` asks for an
-    // `Add[<it>, <it>]`, never an `Add` of the implementing type. Read in the trait's scope, where
-    // the bound was written.
-    val tscope = trait_scope_of(a, key.unwrap())
+    // `Add[<it>, <it>]`, never an `Add` of the implementing type. Read in the trait's scope too.
 
     for bind in block.assocs
         val supplied = assoc_supplied(assocs, bind.name)
@@ -446,7 +451,7 @@ hoist_impl(a: &Analysis, im: Impl) -> Impl
     // **A block that does not conform supplies nothing.** Its members were written against a
     // signature the trait never declared, so lowering them reports the one mistake a second time
     // from inside a body -- `spec` handed on at the type the refusal was about.
-    if a.complaints() != said then return Impl(block, span, scope)
+    if a.complaints() != said then return Impl(block, span, scope, im.joined)
 
     // **The origin is the trait's KEY and the member, never the name the block spelled the trait
     // by**: it is what finds the trait's own file for the copy to be read in, and a block may have
@@ -525,7 +530,7 @@ hoist_impl(a: &Analysis, im: Impl) -> Impl
                                                         source_member_name(m.name), scope, m.span))
     end for
 
-    Impl(block, span, scope)
+    Impl(block, span, scope, im.joined)
 end hoist_impl
 
 // **A block naming no trait adds members to a type, and it is the type's own module's to write.**

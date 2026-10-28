@@ -1,0 +1,403 @@
+module sh.sysl.compiler
+@tests
+
+// **`derives` naming a trait that only joins others** (`docs/design/codec.md` § 6, Q6): `derives
+// Codec`, where `trait Codec: Encode + Decode` carries no `derive` member of its own, derives every
+// trait `Codec` requires that carries one -- through any number of joining traits between, each
+// written once however many paths reach it -- and gives `Codec` the empty block a reader would have
+// written. A required trait reaching no `derive` member is the type's to implement; a joining trait
+// reaching none at all is refused as before.
+
+// An encoder with a receiver, a decoder without one, and the trait joining them.
+private jdv_codec() -> string = raw"""
+    trait Encode
+        encode(self) -> string
+
+        derive[T] encode(self: T) -> string
+            var out = T::BaseName + "("
+
+            for const f in T::Fields
+                out = out + " " + f.name + "=" + self.(f).encode()
+
+            out + " )"
+
+    impl Encode for int
+        encode(self) -> string = s"$self"
+
+    trait Decode
+        decode(s: *Count) -> Self
+
+        derive[T] decode(s: *Count) -> T
+            var out: T
+
+            for const f in T::Fields
+                out.(f) = decode_as[f::Type](s)
+
+            out
+
+    decode_as[U: Decode](s: *Count) -> U = U.decode(s)
+
+    struct Count
+        n: int
+
+    impl Decode for int
+        decode(s: *Count) -> int
+            s.n += 1
+            s.n
+
+    trait Codec: Encode + Decode
+
+    """
+
+@test("the codec probe p16: 'derives Codec' derives both traits Codec requires")
+jdv_probe_p16()
+    if !azb_ready() then return
+
+    azb_prints(azb_main(jdv_codec() + raw"""
+        struct P derives Codec
+            x: int
+            y: int
+
+        var c = Count(0)
+
+        print(P(1, 2).encode(), P.decode(&c).encode(), P.decode(&c).y)
+        """), "P( x=1 y=2 ) P( x=1 y=2 ) 4\n")
+end jdv_probe_p16
+
+@test("a type deriving a joining trait meets a bound of it, and of each trait it joins")
+jdv_bounds_met()
+    if !azb_ready() then return
+
+    azb_prints(azb_main(jdv_codec() + raw"""
+        struct P derives Codec
+            x: int
+
+        round[T: Codec](v: T, c: *Count) -> string = v.encode() + " " + T.decode(c).encode()
+        shown[T: Encode](v: T) -> string = v.encode()
+        made[T: Decode](c: *Count) -> T = T.decode(c)
+
+        var c = Count(10)
+
+        print(round(P(1), &c), shown(P(2)), made[P](&c).x)
+        """), "P( x=1 ) P( x=11 ) P( x=2 ) 12\n")
+end jdv_bounds_met
+
+@test("a derived field of a type deriving a joining trait is encoded and decoded through it")
+jdv_nested_fields()
+    if !azb_ready() then return
+
+    azb_prints(azb_main(jdv_codec() + raw"""
+        struct P derives Codec
+            x: int
+            y: int
+
+        struct Line derives Codec
+            a: P
+            b: P
+            n: int
+
+        var c = Count(0)
+
+        print(Line(P(1, 2), P(3, 4), 5).encode())
+        print(Line.decode(&c).encode())
+        """), "Line( a=P( x=1 y=2 ) b=P( x=3 y=4 ) n=5 )\nLine( a=P( x=1 y=2 ) b=P( x=3 y=4 ) n=5 )\n")
+end jdv_nested_fields
+
+// Each block written through the joining trait binds the type's parameters by its OWN trait, so a
+// `Box[int]` is all three though `int` implements `Encode` and `Decode` and never `Codec` -- which a
+// block bound by `Codec` would have refused.
+@test("a generic type deriving a joining trait is each trait wherever its argument is that trait")
+jdv_generic_type()
+    if !azb_ready() then return
+
+    azb_prints(azb_main(jdv_codec() + raw"""
+        struct P derives Codec
+            x: int
+
+        struct Box[T] derives Codec
+            v: T
+
+        struct Pair[A, B: Encode] derives Codec
+            a: A
+            b: B
+
+        only_encode[T: Encode](v: T) -> string = v.encode()
+
+        var c = Count(0)
+
+        print(Box(P(1)).encode(), Box[int].decode(&c).encode(), only_encode(Box(7)))
+        print(Pair(P(2), 3).encode(), Pair[int, P].decode(&c).encode())
+        """), "Box( v=P( x=1 ) ) Box( v=1 ) Box( v=7 )\nPair( a=P( x=2 ) b=3 ) Pair( a=2 b=P( x=3 ) )\n")
+end jdv_generic_type
+
+@test("a type argument lacking one of the joined traits leaves the type lacking that one only")
+jdv_generic_argument_lacking()
+    if !azb_ready() then return
+
+    azb_refused(azb_main(jdv_codec() + raw"""
+        struct OnlyOut
+            x: int
+
+        impl Encode for OnlyOut
+            encode(self) -> string = "out"
+
+        struct Box[T] derives Codec
+            v: T
+
+        made[T: Decode](c: *Count) -> T = T.decode(c)
+
+        var c = Count(0)
+
+        print(Box(OnlyOut(1)).encode())
+        print(made[Box[OnlyOut]](&c).v.x)
+        """), ["Decode"])
+end jdv_generic_argument_lacking
+
+// A diamond: `Wide` reaches `Codec` twice and `Encode` three times, and each block is written once.
+@test("a trait reached by several paths through joining traits is derived once")
+jdv_diamond()
+    if !azb_ready() then return
+
+    azb_prints(azb_main(jdv_codec() + raw"""
+        trait Left: Codec
+        trait Right: Codec + Encode
+        trait Wide: Left + Right + Encode
+
+        struct P derives Wide
+            x: int
+
+        wide[T: Wide](v: T) -> string = v.encode()
+        left[T: Left](v: T) -> string = v.encode()
+        right[T: Right](c: *Count) -> T = T.decode(c)
+
+        var c = Count(0)
+
+        print(wide(P(1)), left(P(2)), right[P](&c).x)
+        """), "P( x=1 ) P( x=2 ) 1\n")
+end jdv_diamond
+
+@test("two joining traits of one clause reaching one trait derive it once")
+jdv_two_joining_entries()
+    if !azb_ready() then return
+
+    azb_prints(azb_main(jdv_codec() + raw"""
+        trait Shown: Encode
+
+        struct P derives Codec, Shown, Eq
+            x: int
+
+        shown[T: Shown](v: T) -> string = v.encode()
+
+        print(shown(P(1)), P(1) == P(1), P(1) == P(2))
+        """), "P( x=1 ) true false\n")
+end jdv_two_joining_entries
+
+// The joining trait's requirement that reaches no `derive` member is the type's to implement, and
+// the supertrait check names it -- `Debug` is never one, since every type has it already.
+@test("a required trait with no derive member is left to an impl, and the refusal names it")
+jdv_requirement_without_derive()
+    if !azb_ready() then return
+
+    azb_refused_without(azb_main(jdv_codec() + raw"""
+        trait Marker
+            mark(self) -> int
+
+        trait Tagged: Codec + Marker + Debug
+
+        struct P derives Tagged
+            x: int
+
+        print(P(1).encode())
+        """), ["'Tagged' requires 'Marker', so 'P' has to implement that too — write 'impl Marker for P'"],
+           ["Debug", "Encode", "Decode", "Codec"])
+
+    azb_prints(azb_main(jdv_codec() + raw"""
+        trait Marker
+            mark(self) -> int
+
+        trait Tagged: Codec + Marker + Debug
+
+        struct P derives Tagged
+            x: int
+
+        impl Marker for P
+            mark(self) -> int = self.x * 10
+
+        tagged[T: Tagged](v: T) -> string = s"${v.encode()} ${v.mark()}"
+
+        print(tagged(P(4)))
+        """), "P( x=4 ) 40\n")
+end jdv_requirement_without_derive
+
+@test("a joining trait reaching no derive member is refused with the clause's own message")
+jdv_joining_nothing_derivable()
+    if !azb_ready() then return
+
+    azb_refused(azb_main(raw"""
+        trait Marker
+            mark(self) -> int
+
+        trait Plain: Marker + Debug
+
+        struct P derives Plain
+            x: int
+
+        print(1)
+        """), ["'Plain' is not a trait the compiler knows how to write, and it carries no 'derive' " +
+               "member — 'derives' names Eq, Ord, Hash or Display, or a trait with a 'derive' body " +
+               "for its members. A trait without one is implemented with an 'impl' block"])
+
+    azb_refused(azb_main(raw"""
+        trait Joins: Debug
+
+        struct P derives Joins
+            x: int
+
+        print(1)
+        """), ["'Joins' is not a trait the compiler knows how to write, and it carries no 'derive'"])
+end jdv_joining_nothing_derivable
+
+// **A type has one implementation of a trait**: the derivation is refused where it would write a
+// second, at the word that asked for it, and the traits it still derives are written so the one
+// mistake is the one thing said.
+@test("a hand-written impl of a trait the joining trait would derive is refused, naming the rest")
+jdv_hand_written_conflict()
+    if !azb_ready() then return
+
+    azb_refused_without(azb_main(jdv_codec() + raw"""
+        struct H derives Codec
+            x: int
+
+        impl Encode for H
+            encode(self) -> string = "hand"
+
+        print(H(1).encode())
+        """), ["'Codec' would derive 'Encode' for H, which already has an 'impl Encode' written by " +
+               "hand — a type has one implementation of a trait. To derive the rest, name the others " +
+               "instead ('derives Decode') and keep the 'impl'"],
+           ["requires 'Decode'"])
+
+    azb_refused(azb_main(jdv_codec() + raw"""
+        struct H derives Codec
+            x: int
+
+        impl Encode for H
+            encode(self) -> string = "hand"
+
+        impl Decode for H
+            decode(s: *Count) -> H = H(0)
+
+        print(1)
+        """), ["'Codec' would derive 'Encode' for H", "remove 'Codec' from the clause and keep the 'impl'"])
+
+    // What the advice says to write builds.
+    azb_prints(azb_main(jdv_codec() + raw"""
+        struct H derives Decode
+            x: int
+
+        impl Encode for H
+            encode(self) -> string = "hand"
+
+        impl Codec for H
+
+        var c = Count(0)
+
+        print(H.decode(&c).encode(), H.decode(&c).x)
+        """), "hand 2\n")
+end jdv_hand_written_conflict
+
+@test("a trait named in the clause and also reached through a joining one is refused at its name")
+jdv_named_twice_through_joining()
+    if !azb_ready() then return
+
+    azb_refused(azb_main(jdv_codec() + raw"""
+        struct P derives Codec, Encode
+            x: int
+
+        print(1)
+        """), ["'Encode' is derived through 'Codec' already, which requires it — remove 'Encode' " +
+               "from the 'derives' clause"])
+
+    azb_refused(azb_main(jdv_codec() + raw"""
+        struct P derives Decode, Codec
+            x: int
+
+        print(1)
+        """), ["'Decode' is derived through 'Codec' already"])
+end jdv_named_twice_through_joining
+
+// The joined traits live in a module the deriving file imports only `Codec` from, so the blocks
+// written for `Encode` and `Decode` name traits that file never spells.
+@test("a joining trait from another module derives traits the deriving file never names")
+jdv_other_module()
+    if !azb_ready() then return
+
+    azb_prints([("", "main.sysl", raw"""
+        import wire.{Codec, Count, round}
+
+        struct P derives Codec
+            x: int
+            y: int
+
+        struct Box[T] derives Codec
+            v: T
+
+        var c = Count(0)
+
+        print(round(P(1, 2), &c), round(Box(P(3, 4)), &c))
+        """), ("wire", "w.sysl", "module wire\n\n" + jdv_codec() + raw"""
+        round[T: Codec](v: T, c: *Count) -> string = v.encode() + " " + T.decode(c).encode()
+        """)], "P( x=1 y=2 ) P( x=1 y=2 ) Box( v=P( x=3 y=4 ) ) Box( v=P( x=3 y=4 ) )\n")
+end jdv_other_module
+
+// **A trait's requirement is read where the trait was written**: `trait Codec: Encode` in `wire`
+// asks for `wire.Encode`. Read in the implementing file instead, it named nothing there, and a block
+// written by hand with every requirement met was refused.
+private jdv_wire() -> (string, string, string) = ("wire", "w.sysl", raw"""
+    module wire
+
+    trait Encode
+        encode(self) -> string
+
+    trait Codec: Encode
+    """)
+
+@test("a hand-written impl of a trait from another module meets a requirement the file never imports")
+jdv_requirement_read_in_the_trait()
+    if !azb_ready() then return
+
+    azb_prints([("", "main.sysl", raw"""
+        struct P
+            x: int
+
+        impl wire.Encode for P
+            encode(self) -> string = s"p${self.x}"
+
+        impl wire.Codec for P
+
+        shown[T: wire.Codec](v: T) -> string = v.encode()
+
+        print(shown(P(3)))
+        """), jdv_wire()], "p3\n")
+end jdv_requirement_read_in_the_trait
+
+@test("a trait of the implementing file's own with a required trait's name does not meet it")
+jdv_requirement_not_shadowed()
+    if !azb_ready() then return
+
+    azb_refused([("", "main.sysl", raw"""
+        trait Encode
+            encode(self) -> string
+
+        struct P
+            x: int
+
+        impl Encode for P
+            encode(self) -> string = "mine"
+
+        impl wire.Codec for P
+
+        print(1)
+        """), jdv_wire()], ["'wire.Codec' requires 'wire.Encode', so 'P' has to implement that too — write " +
+                            "'impl wire.Encode for P'"])
+end jdv_requirement_not_shadowed

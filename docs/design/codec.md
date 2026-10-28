@@ -53,7 +53,7 @@ Each row is one claim the design leans on, the probe that settles it, and what 0
 | C17 | a receiverless member on a tuple instance | p13 | **no** — *'(A, B)' is not a name a call could reach it through*. Not a gap for the codec: tuples and arrays are handled structurally (C18) |
 | C18 | a free generic function covers tuples and arrays by `T::Kind` with no `impl`, and one `impl[T: Integer + Display]` covers the open `iN`/`uN` family | p14 | **yes**: `70000 [-3,9] [1,2,3]` for a `u24`, an `(i7, u64)`, a `[3]u8` |
 | C19 | a decoder narrows a wide integer to any width with `T::Min`/`T::Max` and `T(x)` | p15 | **yes**: `true true true 255` |
-| C20 | `derives Codec`, for `trait Codec: Encode + Decode` | p16 | **no** — *'Codec' … carries no 'derive' member* → **Q6** |
+| C20 | `derives Codec`, for `trait Codec: Encode + Decode` | p16 | **no** — *'Codec' … carries no 'derive' member* → **Q6** (built in 0.8.0) |
 | C21 | a format answers a compile-time question (keyed or positional) through a `const` member | p17 | **no** — `if const F.keyed()`: *its condition has to be known then* → **Q7**. A **marker trait** does it today: `if const F: Positional` (p18: `keys positions`) |
 | C22 | the result is monomorphized and allocation-free: a fixed-buffer encoder under `@no_alloc` builds for `thumb-freestanding-softfp` | p10 | **yes**: symbols `encode_struct.Reading.Fixed`, `Reading.encode.Fixed`, `uint.encode.Fixed`, two `.L.str` (the field names), **no `malloc`**, no table of types |
 
@@ -192,7 +192,11 @@ in this design.
    on `F` is checked at each use. `reference/reflection.md § An annotation of the field's type`.
 6. **`derives Codec` for a trait that only joins two derivable ones (C20).** Recommended: a
    `derives` naming a trait with no `derive` member derives each required trait that has one, and is
-   refused only when none does.
+   refused only when none does. **Built in 0.8.0** as recommended (`traits.md` § "A trait that joins
+   others derives what it requires"): requirements are followed through every joining trait, each
+   trait derived once; a type parameter is bound by each block's own trait; a requirement reaching
+   no `derive` member is left to an `impl`; a trait also implemented by hand, or also named in the
+   clause, is refused. p16 runs.
 7. **A `const` member reached through a type parameter in `if const` (C21).** `if const F.keyed()`
    is refused although `keyed` is `const` in every `impl`; the comptime note's rule says "a call
    whose body can run", which at an instance it is. A marker trait (`if const F: Positional`) does
