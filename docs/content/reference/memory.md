@@ -1413,8 +1413,9 @@ print(e.rec.b)
 What is checked is the result only: a pointer to a local stored into module storage or into a struct
 somewhere else is still the raw tier's bargain.
 
-**Inside the function, a local's own slot lasts the whole frame**, not only its block, so a pointer
-to a plain local of an inner block may be read after the block closes:
+**Inside the function, a local lasts as long as its block**, not the whole frame, so the address of
+an inner block's local may not be kept in a local of the block around it (§ A block's local lives as
+long as its block):
 
 ```sysl
 run(c: bool) -> int
@@ -1431,8 +1432,8 @@ run(c: bool) -> int
 print(run(true))
 ```
 
-```output
-42
+```error
+'&n' is the address of 'n', a local of the 'if' block, and it is kept in 'p', which outlives that block — keep the value itself, or declare 'n' where 'p' is declared
 ```
 
 **What a block lets go of when it closes is what its locals hold**: a `Buf`'s elements, the object a
@@ -4301,6 +4302,117 @@ leak(out: **int)
 
 ```error
 '&n' is the address of a local of 'leak', and it is stored in '*out', which outlives 'leak' — store the value itself, or storage that lasts
+```
+
+### A block's local lives as long as its block
+
+**A local is good for as long as the block that declares it, not as long as the frame.** A loop body's
+local is a new variable on every turn, and an `if` arm's `string` is released where the arm ends, so
+the address of one may not be kept anywhere that is still there after its block: a local of an
+enclosing block, a field of one, a buffer an enclosing block holds, or a closure stored in one. It is
+judged against the innermost block declaring the local — an `if` or `else` arm, a `match` arm, a
+`for`, `while` or `loop` body, a nested block — wherever the address goes on to, through a local that
+holds it, a struct or variant built around it, a closure that captures such a local, a call that
+answers it, or a block or `break` that yields it:
+
+```sysl
+run()
+    var spare = ""
+    var q = &spare
+
+    if true
+        var s = "abc".copy()
+
+        q = &s
+
+    print(*q)
+```
+
+```error
+'&s' is the address of 's', a local of the 'if' block, and it is kept in 'q', which outlives that block — keep the value itself, or declare 's' where 'q' is declared
+```
+
+```sysl
+run()
+    var spare = 0
+    var seen: [3]*int = [&spare, &spare, &spare]
+
+    for i in 0..<3
+        var n = i * 10
+
+        seen[i] = &n
+```
+
+```error
+'&n' is the address of 'n', a local of the 'for' body, and it is kept in 'seen', which outlives that block — keep the value itself, or declare 'n' where 'seen' is declared
+```
+
+A callee that stores what it is handed into what another argument points at keeps it there:
+
+```sysl
+put(out: **int, v: *int)
+    *out = v
+
+run(c: bool)
+    var spare = 0
+    var last = &spare
+
+    if c
+        var a = 1
+
+        put(&last, &a)
+```
+
+```error
+'&a' is the address of 'a', a local of the 'if' block, and 'put' keeps it in 'last', which outlives that block — keep the value itself, or declare 'a' where 'last' is declared
+```
+
+A closure holding such an address is the same address:
+
+```sysl
+run()
+    var g: &Fn() -> int = () -> 0
+
+    for i in 0..<3
+        var n = i * 10
+        val p = &n
+
+        g = () -> *p
+
+    print(g())
+```
+
+```error
+'() -> *p' holds the address of 'n', a local of the 'for' body, and it is kept in 'g', which outlives that block — keep the value itself, or declare 'n' where 'g' is declared
+```
+
+**Inside the block, and into it, the address is free**: a local of the same block or a deeper one may
+hold it, a borrowing callee may be handed it, and an enclosing block's local may be pointed at from
+inside. What leaves the block by value is a copy, and is never refused:
+
+```sysl
+bump(p: *int)
+    *p += 1
+
+run() -> int
+    var total = 0
+    var at = &total
+
+    for i in 0..<3
+        var n = i
+        val p = &n
+
+        bump(p)
+        at = &total
+        *at += *p
+
+    total
+
+print(run())
+```
+
+```output
+6
 ```
 
 ### Taken back before it returns

@@ -1,0 +1,386 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// A block's local lives as long as its block (`keeps_block.sysl`, `reference/memory.md § A block's
+// local lives as long as its block`): its address, or anything built around it, may not be kept in a
+// local of an enclosing block. Each block form is refused once -- `if`, `else`, a `match` arm, the
+// `for`, three-clause `for`, `while`, `do … while` and `loop` bodies, a nested block, a `defer` -- and
+// each way the address travels: written in place, through a local, a struct, an enum payload, a
+// closure, a keeping callee, an array element, a block's result and a `break`; in a function, a
+// generic, a closure's own body and the entry file's statements. The accepted cells are the same
+// shapes kept inside the block, or pointing outward.
+//
+// Skipped cells, and why: a `with` statement does not exist (a `with`-shaped helper takes a closure,
+// whose body is the closure-body cell); a pattern binding's address is refused by its own rule before
+// this one; a local's address pushed into a `Buf` is refused by the frame rule (the buffer's storage
+// outlives the frame), as is a store through `*self` or another parameter; an address as an integer
+// is a number here, as it is to the frame rule until a `ptr_cast` turns it back; build-lib and codegen
+// units change nothing this rule reads, which is one body at a time.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private kbl_outcome(text: string) -> (string, int)
+    val root = make_temp_dir("sysl-kbl").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (failure_text(why), -1)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> ("the program that was built could not be run", -1)
+        Ok(out) -> (out.text + out.err.unwrap_or(""), shell_status(out.status))
+end kbl_outcome
+
+private kbl_prints(text: string, want: string)
+    if xvr_no_library() then return
+
+    val out = kbl_outcome(text)
+
+    assert_eq(out.0, want)
+    assert_eq(out.1, 0)
+end kbl_prints
+
+// Every part is said, each once.
+private kbl_refused(text: string, parts: []const string)
+    if xvr_no_library() then return
+
+    val out = kbl_outcome(text)
+
+    assert_eq(out.1, -1, out.0)
+
+    for part in parts
+        assert(out.0.index_of(part).is_some(), s"$part\n--- in ---\n${out.0}")
+end kbl_refused
+
+private kbl_said(local: string, block: string, kept: string, holder: string) -> string =
+    s"'$local', a local of $block, and $kept, which outlives that block — keep the value itself, or " +
+    s"declare '$local' where '$holder' is declared"
+
+// -- refused: each block form ----------------------------------------------------------------------
+
+@test("the address of an 'if' arm's or an 'else' arm's local kept in an enclosing block is refused")
+kbl_if_else_refused()
+    kbl_refused(raw"""
+        run(c: bool)
+            var spare = ""
+            var q = &spare
+
+            if c
+                var s = "abc".copy()
+
+                q = &s
+            else
+                var e = "de".copy()
+
+                q = &e
+
+            print(*q)
+
+        run(true)
+        """, [s"'&s' is the address of ${kbl_said("s", "the 'if' block", "it is kept in 'q'", "q")}",
+              s"'&e' is the address of ${kbl_said("e", "the 'else' block", "it is kept in 'q'", "q")}"])
+end kbl_if_else_refused
+
+@test("the address of a 'match' arm's local, a 'while' body's and a 'loop' body's, kept outside, is refused")
+kbl_match_while_loop_refused()
+    kbl_refused(raw"""
+        struct Holder
+            p: *int
+
+        run(c: bool, o: Option[int])
+            var spare = 0
+            var q = &spare
+            var h = Holder(&spare)
+
+            o match
+                Some(v) ->
+                    var m = v
+
+                    q = &m
+                None -> ()
+
+            while c
+                var x = 1
+
+                h = Holder(&x)
+
+            val w = loop
+                var u = 1
+
+                break &u
+
+            print(*q, *h.p, *w)
+
+        run(false, None)
+        """, [s"'&m' is the address of ${kbl_said("m", "a 'match' arm", "it is kept in 'q'", "q")}",
+              s"'Holder(&x)' holds the address of ${kbl_said("x", "the 'while' body", "it is kept in 'h'", "h")}",
+              s"'&u' is the address of ${kbl_said("u", "the 'loop' body", "it is kept in 'w'", "w")}"])
+end kbl_match_while_loop_refused
+
+@test("the address of a 'for' body's local, a three-clause 'for' body's and a 'do … while' body's is refused")
+kbl_for_do_refused()
+    kbl_refused(raw"""
+        run(c: bool)
+            var spare = 0
+            var seen: [3]*int = [&spare, &spare, &spare]
+            var q = &spare
+            var r = &spare
+
+            for i in 0..<3
+                var n = i
+
+                seen[i] = &n
+
+            for var j = 0; j < 2; j += 1
+                var k = j
+
+                q = &k
+
+            do
+                var d = 4
+
+                r = &d
+            while c
+
+            print(*seen[0], *q, *r)
+
+        run(false)
+        """, [s"'&n' is the address of ${kbl_said("n", "the 'for' body", "it is kept in 'seen'", "seen")}",
+              s"'&k' is the address of ${kbl_said("k", "the 'for' body", "it is kept in 'q'", "q")}",
+              s"'&d' is the address of ${kbl_said("d", "the 'while' body", "it is kept in 'r'", "r")}"])
+end kbl_for_do_refused
+
+@test("a nested block's result, a 'defer' in an arm and a deeper arm kept in a middle one are refused")
+kbl_nested_defer_deep_refused()
+    kbl_refused(raw"""
+        run(c: bool)
+            var spare = 0
+            var q = &spare
+
+            val r =
+                var t = 7
+
+                &t
+
+            if c
+                var d = 3
+
+                defer q = &d
+
+            if c
+                var mid = &spare
+
+                if c
+                    var deep = 2
+
+                    mid = &deep
+
+                print(*mid)
+
+            print(*q, *r)
+
+        run(false)
+        """, [s"'&t' is the address of ${kbl_said("t", "a nested block", "it is kept in 'r'", "r")}",
+              s"'&d' is the address of ${kbl_said("d", "the 'if' block", "it is kept in 'q'", "q")}",
+              s"'&deep' is the address of ${kbl_said("deep", "the 'if' block", "it is kept in 'mid'", "mid")}"])
+end kbl_nested_defer_deep_refused
+
+// -- refused: each way the address travels -----------------------------------------------------------
+
+@test("a block's local's address through a local, a payload, a keeping callee and a closure is refused")
+kbl_carriers_refused()
+    kbl_refused(raw"""
+        put(out: **int, v: *int)
+            *out = v
+
+        run(c: bool)
+            var spare = 0
+            var slot = &spare
+            var o: Option[*int] = None
+            var q = &spare
+            var g: &Fn() -> int = () -> 0
+
+            if c
+                var a = 1
+                val p = &a
+
+                q = p
+                put(&slot, &a)
+            else
+                var e = 4
+
+                o = Some(&e)
+
+            for i in 0..<3
+                var n = i * 10
+                val p = &n
+
+                g = () -> *p
+
+            print(*q, *slot, o.is_some(), g())
+
+        run(false)
+        """, [s"'p' holds the address of ${kbl_said("a", "the 'if' block", "it is kept in 'q'", "q")}",
+              s"'&a' is the address of ${kbl_said("a", "the 'if' block", "'put' keeps it in 'slot'", "slot")}",
+              s"'Some(&e)' holds the address of ${kbl_said("e", "the 'else' block", "it is kept in 'o'", "o")}",
+              s"'() -> *p' holds the address of ${kbl_said("n", "the 'for' body", "it is kept in 'g'", "g")}"])
+end kbl_carriers_refused
+
+@test("a counted local's address kept by a closure past its arm is refused, and so is the explicit address")
+kbl_counted_refused()
+    kbl_refused(raw"""
+        run()
+            var g: &Fn() -> string = () -> ""
+            var spare = ""
+            var q = &spare
+
+            if true
+                var s = "abc".copy()
+                val p = &s
+
+                g = () -> (*p).copy()
+                q = &s
+
+            print(g(), *q)
+
+        run()
+        """, [s"'() -> (*p).copy()' holds the address of ${kbl_said("s", "the 'if' block", "it is kept in 'g'", "g")}",
+              s"'&s' is the address of ${kbl_said("s", "the 'if' block", "it is kept in 'q'", "q")}"])
+end kbl_counted_refused
+
+@test("the rule holds in a generic, in a closure's own body and in the entry file's statements")
+kbl_bodies_refused()
+    kbl_refused(raw"""
+        keep[T](c: bool, spare: *T, fresh: T) -> T
+            var q = spare
+
+            if c
+                var s = fresh
+
+                q = &s
+
+            *q
+
+        each(f: &Fn() -> unit) = f()
+
+        run()
+            each(() ->
+                var spare = 1
+                var q = &spare
+
+                if true
+                    var b = 2
+
+                    q = &b
+
+                print(*q))
+
+        var top = 0
+        var tq = &top
+
+        if true
+            var tl = 5
+
+            tq = &tl
+
+        run()
+        print(keep(true, &top, 3), *tq)
+        """, [s"'&s' is the address of ${kbl_said("s", "the 'if' block", "it is kept in 'q'", "q")}",
+              s"'&b' is the address of ${kbl_said("b", "the 'if' block", "it is kept in 'q'", "q")}",
+              s"'&tl' is the address of ${kbl_said("tl", "the 'if' block", "it is kept in 'tq'", "tq")}"])
+end kbl_bodies_refused
+
+// -- accepted ---------------------------------------------------------------------------------------
+
+@test("inside its block, into a deeper one, pointing outward, borrowed, or copied out, the address is free")
+kbl_accepted()
+    kbl_prints(raw"""
+        struct Holder
+            p: *int
+
+        bump(p: *int)
+            *p += 1
+
+        put(out: **int, v: *int)
+            *out = v
+
+        call(f: &Fn() -> int) -> int = f()
+
+        run(o: Option[int]) -> int
+            var total = 0
+            var at = &total
+
+            for i in 0..<3
+                var n = i
+                val p = &n
+                var h = Holder(p)
+
+                bump(p)
+                at = &total
+                *at += *h.p
+
+                if true
+                    var inner = &n
+
+                    *inner += 1
+                    put(&inner, &n)
+                    total += call(() -> *inner)
+
+            val copied =
+                var t = 7
+                val q = &t
+
+                *q
+            val word = if true
+                var s = "abc".copy()
+                val r = &s
+
+                (*r).copy()
+            else
+                ""
+
+            o match
+                Some(v) ->
+                    var m = v
+                    val pm = &m
+
+                    total += *pm
+                None -> ()
+
+            total + copied + int(word.len)
+
+        print(run(Some(100)))
+        """, "125\n")
+end kbl_accepted
+
+@test("a shadowing local in an inner block is named as the reader wrote it")
+kbl_shadow_named()
+    kbl_refused(raw"""
+        run()
+            var s = 1
+            var q = &s
+
+            if true
+                var s = 2
+
+                q = &s
+
+            print(*q)
+
+        run()
+        """, [s"'&s' is the address of ${kbl_said("s", "the 'if' block", "it is kept in 'q'", "q")}"])
+end kbl_shadow_named
