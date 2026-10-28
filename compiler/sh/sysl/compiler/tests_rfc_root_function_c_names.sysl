@@ -9,8 +9,11 @@ import sysl.text.{cstring, replace_all}
 // emitted under it, `write(p: *int)` in an entry file WAS libc's `write`: beside the `declare` the
 // compiler writes for its own printing an invalid redefinition, and where nothing in the module
 // declared it, the definition every other object's call resolved to at the link (an archive's
-// `__aeabi_memcpy` reached a program's `memcpy(n: int)`). A root function is now laid down under a
-// name C cannot spell (`write$$sysl`), and a symbol C reaches is what `@export` publishes.
+// `__aeabi_memcpy` reached a program's `memcpy(n: int)`). A root function whose name is a C symbol the
+// program meets -- an extern or export of its own, a name the compiler declares, a routine the
+// optimizer may call, the runtime's `sysl_`/`__` -- is now laid down under a name C cannot spell
+// (`write$$sysl`); any other root function keeps its bare name; a symbol C reaches is what `@export`
+// publishes.
 
 // -- the harness ----------------------------------------------------------------------------------
 
@@ -118,6 +121,29 @@ rfc_the_definition_is_not_the_c_symbol()
 
     assert(ir.contains("define i32 @write$$sysl("), ir)
     assert(!ir.contains("define i32 @write("), ir)
+
+@test("a root function whose name C does not meet keeps its bare name, and one named for an extern of the program's does not")
+rfc_only_a_met_name_is_displaced()
+    if !rfc_ready() then return
+
+    val text = "extern \"labs\" c_labs(n: i64) -> i64\n\nwalk(n: int) -> int = n + 1\n" +
+        "sysl_helper(n: int) -> int = n + 2\nlabs(n: i64) -> i64 = n\n\n" +
+        "print(walk(1), sysl_helper(1), labs(-3), c_labs(-3))\n"
+    val ir = rfc_ir(text)
+
+    assert(ir.contains("define i32 @walk("), ir)
+    assert(ir.contains("define i32 @sysl_helper$$sysl("), ir)
+    assert(ir.contains("define i64 @labs$$sysl("), ir)
+    assert(ir.contains("declare i64 @labs("), ir)
+    assert_eq(rfc_one(text), "2 3 -3 3\n")
+
+@test("a root function named for a runtime routine of the compiler's own builds beside it")
+rfc_a_runtime_name()
+    if !rfc_ready() then return
+
+    val text = "sysl_stdout_write(n: int) -> int = n * 2\n\nprint(sysl_stdout_write(21))\n"
+
+    assert_eq(rfc_one(text), "42\n")
 
 @test("a generic root function and a nested one named for libc run as the program's")
 rfc_generic_and_nested()

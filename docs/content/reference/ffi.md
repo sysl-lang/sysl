@@ -175,12 +175,15 @@ Two declarations may share one symbol under different sysl names, as above; a mo
 symbol once. **A link name is an `extern`'s alone** — a sysl function is *defined* here, and what it
 is called is its name.
 
-Note what this does *not* do: nothing here changes what a sysl function's own symbol is. **That
-symbol is the compiler's, never a C name** — a module's function carries its module path into it,
-and a function of a file with no `module` header is laid down under a name C cannot spell — so a
-program may call its own functions `write`, `abs` or `malloc` without touching libc's, and the
-library's printing and allocation go on reaching libc. A symbol C is to reach is what `@export`,
-below, publishes.
+Note what this does *not* do: nothing here changes what a sysl function's own symbol is. A module's
+function carries its module path into it; a function of a file with no `module` header is its bare
+name — **except where that name is a C symbol the program meets**: one an `extern` or an `@export`
+of the program names, one the compiler declares for itself (`write`, `malloc`, `free`, `fflush`,
+`exit`, `abort`), a routine the optimizer may call on its own (`memcpy`, `strlen`, `putchar`, `abs`
+and the rest of C's runtime and `libm`), or the runtime's own `sysl_` and `__` names. Such a function
+is laid down under a name of the compiler's instead, so a program may call its own functions
+`write`, `abs` or `malloc` without touching libc's, and the library's printing and allocation go on
+reaching libc. A symbol C is to reach is what `@export`, below, publishes.
 
 ```sysl
 write(p: *int)
