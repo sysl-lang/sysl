@@ -912,7 +912,7 @@ Both sides saw the values the statement started with. Two separate statements wo
 
 **The places may be written in parentheses**, as a tuple of places: `(a, b) = (b, a)` is the
 statement above, with every operator, value list and place the bare list takes. The places do not
-nest, in either spelling, and each one is written — `_` is not a place.
+nest, in either spelling.
 
 ```sysl
 pair(n: int) -> (int, int) = (n, n * 2)
@@ -934,6 +934,64 @@ print(lo, hi)
 
 A place's own subexpressions are evaluated **exactly once**, before the assignments — so in
 `xs[f()], xs[g()] = xs[g()], xs[f()]` each of `f` and `g` runs once.
+
+#### `_` discards a part
+
+**A place written `_` takes its part and writes it nowhere**, in either spelling. A value of its own
+is still evaluated, in its turn among the others, and a part that holds something counted or with a
+`Drop` is let go of when the statement ends:
+
+```sysl
+pair(n: int) -> (int, int) = (n, n * 2)
+
+noisy(n: int) -> int
+    print(s"noisy $n")
+    n
+
+struct Tag
+    n: int
+
+impl Drop for Tag
+    drop(self)
+        print(s"drop ${self.n}")
+
+var a = 0
+var b = 0
+
+a, _ = pair(5)
+(_, b) = pair(6)
+print(a, b)
+
+a, _, b = noisy(1), noisy(2), noisy(3)
+print(a, b)
+
+a, _ = 4, Tag(7)
+print(a)
+```
+
+```output
+5 12
+noisy 1
+noisy 2
+noisy 3
+1 3
+drop 7
+4
+```
+
+Every place may be `_`, which evaluates the right side for its effects alone. Only a **whole** place
+may be `_` — one inside a place, as in `xs[_], a = 1, 2`, would stand for a closure's parameter — and
+only `=` discards: a compound form reads every place before writing it, and `_` has nothing to read.
+
+```sysl
+var a = 0
+
+a, _ += 1, 2
+```
+
+```error
+'+=' reads every place before writing it, and '_' has nothing to read
+```
 
 **A multiple assignment is a statement, not an expression**, which keeps it simple. A single
 `:=` yields the value it stored; a multiple one would have to yield several, which could only be a

@@ -323,18 +323,40 @@ end index_list
 // whether the value is an index or a count.
 widen_index(e: *Emit, index: TExpr, site: Span, kind: int = BoundsTooWide) -> Val =
     underlying(texpr_type(index)) match
-        Integer(bits, signed, _) ->
-            if bits <= e.word_bits then convert_int(e, bits, signed, e.word_bits, gen_expr(e, index))
-            else
-                val v = gen_expr(e, index)
-                val wide = LInt(bits)
-                val limit = sub(pow(from_int(2), usize(e.word_bits)), from_int(1))
-                val fits = fresh_reg(e)
+        Integer(bits, signed, _) -> widen_index_val(e, gen_expr(e, index), bits, signed, site, kind)
+        other -> gap_at(e, s"index of type ${type_show(other)}")
 
-                emit(e, InIntCmp(fits, IUle, wide, v, VInt(limit)))
-                bounds_unless(e, fits, "bounds", kind, bounds_none(), bounds_none(), bounds_none(),
-                              site)
-                convert_int(e, bits, signed, e.word_bits, v)
+// `widen_index` over an index already generated: `v`, an integer of `bits` bits.
+private widen_index_val(e: *Emit, v: Val, bits: int, signed: bool, site: Span, kind: int) -> Val
+    if bits <= e.word_bits then return convert_int(e, bits, signed, e.word_bits, v)
+
+    val limit = sub(pow(from_int(2), usize(e.word_bits)), from_int(1))
+    val fits = fresh_reg(e)
+
+    emit(e, InIntCmp(fits, IUle, LInt(bits), v, VInt(limit)))
+    bounds_unless(e, fits, "bounds", kind, bounds_none(), bounds_none(), bounds_none(), site)
+    convert_int(e, bits, signed, e.word_bits, v)
+end widen_index_val
+
+// **A container's subscript index brought to a `usize`** (`expr_coll.sysl`'s `subscript index`): a
+// negative one traps, saying so with its sign, and one wider than the address width is checked to
+// fit -- what an array's subscript does with the same index, done before the method is called, since
+// the method sees only the `usize`. A non-negative signed index is then an unsigned one.
+subscript_index_val(e: *Emit, index: TExpr) -> Val =
+    underlying(texpr_type(index)) match
+        Integer(bits, signed, _) ->
+            val v = gen_expr(e, index)
+
+            if signed
+                val ok = fresh_reg(e)
+
+                emit(e, InIntCmp(ok, ISge, LInt(bits), v, VZero))
+                bounds_unless(e, ok, "bounds", bounds_kind(BoundsNegative, true, false),
+                              convert_int(e, bits, true, e.word_bits, v), bounds_none(), bounds_none(),
+                              index.span)
+            end if
+
+            widen_index_val(e, v, bits, false, index.span, BoundsTooWide)
         other -> gap_at(e, s"index of type ${type_show(other)}")
 
 // Traps unless `i` names an element that exists. The comparison is unsigned at the address width, so

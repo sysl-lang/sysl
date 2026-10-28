@@ -469,7 +469,7 @@ private index_non_vector(cx: &Analyzer, span: Span, raw: TExpr, tr: TExpr, index
         // implementing a different `Index` rather than misusing this one.
         var args: Buf[Expr] = buf()
 
-        args.push(index)
+        args.push(subscript_index_arg(index))
 
         // **`IndexPlace` makes the subscript a place**: `b[i]` is `*b.index_place(i)`, so a field
         // of the element is read where it lives, a write lands in it, and a `ref` can name it. It
@@ -538,6 +538,61 @@ private index_non_vector(cx: &Analyzer, span: Span, raw: TExpr, tr: TExpr, index
 
             cx.err(index.span, s"an index must be an integer, not ${type_show(other)}")
 end index_non_vector
+
+// -- a subscript's index, handed to a method -----------------------------------------------------
+//
+// **A container's subscript takes any integer, as an array's does** (`reference/arrays.md`). The
+// method behind it -- `index`, `index_place`, `index_set` -- takes a `usize`, and an ordinary argument
+// of that type would refuse an `int`. So the subscript hands the method its index wrapped in a form
+// only the compiler can write (its name has a space in it): where the parameter the index lands on is
+// a `usize`, the form takes any integer, brings it to the address width, and traps on a negative one
+// or one too wide, exactly where an array's own check would. Where the parameter is anything else --
+// a container indexed by a key, or by a type parameter -- the form is the index itself, typed as an
+// ordinary argument would be.
+
+// The form's name, which no program can spell.
+const SubscriptIndex: string = "subscript index"
+
+// The integer operation the form becomes, read by the lowering and the compile-time evaluator.
+const SubscriptIndexOp: string = "subscript_index"
+
+// `index`, wrapped so that its method's argument is read as a subscript's index.
+subscript_index_arg(index: Expr) -> Expr
+    var one: Buf[Expr] = buf()
+
+    one.push(index)
+    Expr(index.span, Call(Expr(index.span, Ident(SubscriptIndex)), one))
+end subscript_index_arg
+
+// The form itself, with `expected` the type of the parameter the index lands on.
+subscript_index_form(cx: &Analyzer, span: Span, args: Buf[Expr], expected: Option[Type]) -> TExpr
+    val index = args.at(0)
+
+    val to_usize = expected match
+        Some(t) -> repr(t) match
+            Integer(bits, false, true) -> bits == word_bits(cx)
+            _ -> false
+        None -> false
+
+    if !to_usize then return type_expr(cx, index, expected)
+
+    // Any integer indexes, so an index is not a use that fixes a literal binding's type, here as
+    // on an array (`var_first_use.sysl`).
+    not_fixing_at(cx, index)
+
+    val ti = type_expr(cx, index, expected)
+
+    repr(texpr_type(ti)) match
+        Integer(bits, signed, pw) ->
+            if !signed && pw && bits == word_bits(cx) then ti
+            else TExpr(span, TIntOp(SubscriptIndexOp, ti, None, texpr_type(ti), expected.unwrap()))
+        // Said as an array's subscript says it, rather than as an argument of the wrong type to a
+        // method the reader never named.
+        other ->
+            if other == Unknown then return ti
+
+            cx.err(index.span, s"an index must be an integer, not ${type_show(other)}")
+end subscript_index_form
 
 // A range subscript takes a view. The receiver is left *undereferenced* on purpose: for a heap
 // array the reference is both where the elements are and what keeps them alive, and evaluating it
