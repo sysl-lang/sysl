@@ -129,6 +129,18 @@ multi_assign(cx: &Analyzer, span: Span, op: string, targets: Buf[Expr],
             end if
     end if
 
+    // Only a whole place may be `_`: one inside a place would be a closure's parameter, and the list
+    // of places is no closure's body.
+    for t in targets
+        if !discards(t) && has_free_placeholder(t)
+            cx.fault(t.span, "'_' inside a place stands for a closure's parameter, and the places of a " +
+                     "multiple assignment are not a closure \u{2014} only a whole place may be '_', " +
+                     "which discards its part")
+            var none: Buf[TStmt] = buf()
+
+            return none
+        end if
+
     val what = if op == "=" then "assignment" else s"'$op'"
     var places: Buf[Option[TExpr]] = buf()
 
@@ -150,10 +162,22 @@ multi_assign(cx: &Analyzer, span: Span, op: string, targets: Buf[Expr],
 
                 writes.push(w)
             None ->
-                // A part read out of a carrier stays in the carrier, which already holds it; a value
-                // of its own is still produced in its turn, and is let go of once the statement ends.
+                // A part read out of a carrier stays in the carrier, which already holds it, and is
+                // let go of with it below; a value of its own is still produced in its turn, and is
+                // let go of once the statement ends.
                 if taken.is_none() && i < values.len() then
                     discard_arm(cx, written, &held, &writes, &emptied)
+
+    // **A carrier with a discarded part is emptied once the parts are written**, so the part nobody
+    // took goes when the statement ends, as a discarded value of its own does, rather than when the
+    // block does. Every part that was taken holds a count of its own in its place by then.
+    if taken.is_some()
+        for p in places
+            if p.is_none()
+                empty_carrier(span, taken.unwrap().0, &emptied)
+                break
+            end if
+    end if
 
     var out: Buf[TStmt] = buf()
 
@@ -174,6 +198,15 @@ end multi_assign
 private discards(target: Expr) -> bool = *target.kind match
     Ident(n) -> is_placeholder(n)
     _ -> false
+
+// The store that empties a carrier's hidden name, declared by `decl`.
+private empty_carrier(span: Span, decl: TStmt, emptied: *Buf[TStmt])
+    decl match
+        TVarDecl(name, ty, _, _) ->
+            val place = TExpr(span, TLoad(name, ty))
+
+            emptied.push(TExprStmt(TExpr(span, TStore(place, TExpr(span, TZero(ty)), ty, false))))
+        _ -> ()
 
 // `_` beside a value of its own: the value is evaluated in its turn among the others, and dropped.
 //

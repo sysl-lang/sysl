@@ -1,0 +1,391 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.Search
+
+// `_` as a place of a multiple assignment: the part is taken and written nowhere
+// (`reference/expressions.md § _ discards a part`).
+//
+// The promises are three: a value of its own is still evaluated, in its turn among the others; a part
+// that holds something counted or with a `Drop` is let go of exactly once, at the end of the
+// statement; and the statement means the same wherever it stands -- a loop body, a branch, a `match`
+// arm and a closure all hold a statement whose `_` must not be lifted into a closure of their own.
+// So every program that runs here is built on the counted heap and must give everything back.
+//
+// Not crossed, with the reason: bare metal and separate compilation (the lowering is a statement-local
+// variable, a store and a reset, with nothing a target or a module boundary can see), and layout (the
+// discarded part is stored at its own type, as any local is).
+
+private struct AsdRun
+    ok: bool
+    out: string
+    err: string
+
+private asd_ready() -> bool
+    if std_root().is_err() || !clang_available()
+        print("skipped: the library or the toolchain is not on this machine")
+        return false
+    end if
+
+    true
+end asd_ready
+
+// The program built on the counted heap and run; a build that failed answers `ok` false with the
+// reason in `out`.
+private asd_run(text: string) -> AsdRun
+    val root = make_temp_dir("sysl-asd").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    force_alloc_counting(true)
+
+    val built = build_native_program(s"$root/main.sysl", None, None, DefaultOptimization,
+                                     Some(s"$root/built"))
+
+    force_alloc_counting(false)
+
+    built match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return AsdRun(false, failure_text(why), "")
+        Ok(_) -> ()
+
+    val said = capture(s"$root/built", [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> AsdRun(false, "could not be started", "")
+        Ok(o) -> AsdRun(o.status.ok(), o.text, o.err.unwrap_or(""))
+end asd_run
+
+// The program runs, prints exactly this, and gives back everything it took.
+private asd_prints(text: string, want: string)
+    if !asd_ready() then return
+
+    val run = asd_run(text)
+
+    assert(run.ok, run.out)
+    assert_eq(run.out, want)
+    assert(alloc_count_reported(run.err) == 0, run.err)
+end asd_prints
+
+// What a program that must be refused is told, every diagnostic in one report.
+private asd_err(text: string) -> string
+    val root = make_temp_dir("sysl-asd").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    val out = emit_llvm_text(src, None) match
+        Err(why) -> why.message
+        Ok(made) -> if made.report.is_empty() then "" else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end asd_err
+
+// The build is refused with this message, at this `line:column`, and no internal name leaks out.
+private asd_refused(text: string, message: string, at: string)
+    if !asd_ready() then return
+
+    val said = asd_err(text)
+
+    assert(said.contains(message), said)
+    assert(said.contains(s"/main.sysl:$at"), said)
+    assert(!said.contains("$ph"), said)
+    assert(!said.contains("$discard"), said)
+end asd_refused
+
+private asd_common() -> string = """
+    pair(n: int) -> (int, int)
+        print("pair")
+        (n, n * 2)
+
+    noisy(n: int) -> int
+        print(s"noisy $n")
+        n
+
+    name(n: int) -> string = s"name-$n"
+
+    named(n: int) -> (int, string) = (n, name(n))
+
+    struct Tag
+        n: int
+
+    impl Drop for Tag
+        drop(self)
+            print(s"drop ${self.n}")
+
+    tagged(n: int) -> (int, &Tag) = (n, Tag(n))
+
+    """
+
+// -- a carrier: the part stays where the carrier holds it -------------------------------------------
+
+@test("a carrier's part is discarded, bare and parenthesised, and the call runs once")
+asd_carrier()
+    asd_prints(asd_common() + """
+        var a = 0
+        var b = 0
+        a, _ = pair(5)
+        (_, b) = pair(6)
+        print(a, b)
+        """, "pair\npair\n5 12\n")
+
+@test("every part of a carrier may be discarded, and the call still runs")
+asd_carrier_all()
+    asd_prints(asd_common() + """
+        _, _ = pair(7)
+        (_, _) = pair(8)
+        print("end")
+        """, "pair\npair\nend\n")
+
+@test("a carrier's discarded string is released with the carrier")
+asd_carrier_string()
+    asd_prints(asd_common() + """
+        var a = 0
+        var s = ""
+        a, _ = named(1)
+        (_, s) = named(2)
+        print(a, s)
+        """, "1 name-2\n")
+
+@test("a carrier's discarded Drop part is dropped once, when the statement ends")
+asd_carrier_drop()
+    asd_prints(asd_common() + """
+        var a = 0
+        (a, _) = tagged(12)
+        print(a)
+        a, _ = tagged(13)
+        print(a)
+        """, "drop 12\n12\ndrop 13\n13\n")
+
+@test("a carrier's kept Drop part outlives the statement while the discarded one does not")
+asd_carrier_keeps_one()
+    asd_prints(asd_common() + """
+        two(n: int) -> (&Tag, &Tag) = (Tag(n), Tag(n + 1))
+
+        var k = Tag(0)
+        (k, _) = two(40)
+        print("kept", k.n)
+        _, k = two(50)
+        print("kept", k.n)
+        """, "drop 0\ndrop 41\nkept 40\ndrop 40\ndrop 50\nkept 51\ndrop 51\n")
+
+// -- a value list: each value is still produced, in its turn -----------------------------------------
+
+@test("a discarded value is evaluated in its turn among the others")
+asd_order()
+    asd_prints(asd_common() + """
+        var a = 0
+        var b = 0
+        a, _, b = noisy(1), noisy(2), noisy(3)
+        print(a, b)
+        """, "noisy 1\nnoisy 2\nnoisy 3\n1 3\n")
+
+@test("an all-'_' value list evaluates every value for its effect")
+asd_all_values()
+    asd_prints(asd_common() + """
+        _, _ = noisy(1), noisy(2)
+        (_, _, _) = noisy(3), name(4), Tag(5)
+        print("end")
+        """, "noisy 1\nnoisy 2\nnoisy 3\ndrop 5\nend\n")
+
+@test("a place's subexpressions run in the same order as with no '_' beside them")
+asd_place_order()
+    asd_prints(asd_common() + """
+        idx(n: int) -> int
+            print(s"idx $n")
+            n
+
+        var xs = [0, 0, 0]
+        var c = 0
+        xs[idx(1)], c = noisy(5), noisy(6)
+        xs[idx(2)], _ = noisy(7), noisy(8)
+        print(xs[1], xs[2])
+        """, "idx 1\nnoisy 5\nnoisy 6\nidx 2\nnoisy 7\nnoisy 8\n5 7\n")
+
+@test("the values are read before the kept place is written")
+asd_reads_first()
+    asd_prints(asd_common() + """
+        var s = "a"
+        _, s = s + "b", s + "c"
+        print(s)
+        var t = "x"
+        t, _ = t + "y", t + "z"
+        print(t)
+        """, "ac\nxy\n")
+
+@test("a discarded string is released once, at the end of the statement")
+asd_value_string()
+    asd_prints(asd_common() + """
+        var s = "x"
+        s, _ = name(1), name(2)
+        print(s)
+        """, "name-1\n")
+
+@test("a discarded Drop value is dropped once, before the next statement")
+asd_value_drop()
+    asd_prints(asd_common() + """
+        var a = 0
+        a, _ = 4, Tag(1)
+        print("after")
+        val keep = Tag(2)
+        a, _ = 5, keep
+        print("kept", keep.n)
+        """, "drop 1\nafter\nkept 2\ndrop 2\n")
+
+@test("a literal beside '_' takes its own type")
+asd_literal()
+    asd_prints(asd_common() + """
+        var o: Option[int] = None
+        o, _ = Some(1), 5u8
+        var a = 0
+        a, _ = 2, 3.5
+        print(o.unwrap(), a)
+        """, "1 2\n")
+
+@test("the counts hold up over a loop's worth of discards")
+asd_counts_hold_up()
+    asd_prints(asd_common() + """
+        var a = 0
+        for i in 0..<100
+            a, _ = i, name(i)
+            (a, _) = named(i)
+        print(a)
+        """, "99\n")
+
+// -- the statement means the same in every block that can hold it -------------------------------------
+
+@test("in a 'for' body, bare and parenthesised")
+asd_in_for()
+    asd_prints(asd_common() + """
+        var a = 0
+        for i in 0..<3
+            a, _ = i, name(i)
+        print(a)
+        for k in 0..<2
+            (a, _) = k, Tag(20 + k)
+            print(s"k $a")
+        """, "2\ndrop 20\nk 0\ndrop 21\nk 1\n")
+
+@test("in a 'while' body and a 'loop' left by 'break'")
+asd_in_while_and_loop()
+    asd_prints(asd_common() + """
+        var a = 0
+        var i = 0
+        while i < 2
+            a, _ = i, name(i)
+            (a, _) = named(i)
+            i += 1
+        print(a)
+        loop
+            (a, _) = tagged(12)
+            break
+        print(a)
+        """, "1\ndrop 12\n12\n")
+
+@test("in both branches of an 'if' and in a 'match' arm")
+asd_in_branches()
+    asd_prints(asd_common() + """
+        var a = 0
+        for c in [true, false]
+            if c
+                a, _ = 10, name(10)
+            else
+                (_, a) = name(3), 3
+            print(a)
+        a match
+            3 -> a, _ = 11, Tag(11)
+            _ -> ()
+        print(a)
+        """, "10\n3\ndrop 11\n11\n")
+
+@test("in a closure body and a nested function")
+asd_in_closure()
+    asd_prints(asd_common() + """
+        val f = (n: int) ->
+            var q = 0
+            q, _ = n, Tag(n)
+            q
+        print(f(30))
+        inner(n: int) -> int
+            var q = 0
+            (q, _) = named(n)
+            q
+        print(inner(31))
+        """, "drop 30\n30\n31\n")
+
+@test("in a generic function, at a string and at a Drop type")
+asd_generic()
+    asd_prints(asd_common() + """
+        keep[T](x: T, y: T) -> T
+            var r = x
+            r, _ = y, x
+            r
+
+        print(keep("p", "q"))
+        val one = Tag(1)
+        val two = Tag(2)
+        print(keep(one, two).n)
+        print("end")
+        """, "q\n2\nend\ndrop 2\ndrop 1\n")
+
+@test("before an early return")
+asd_early_return()
+    asd_prints(asd_common() + """
+        early(t: &Tag) -> int
+            var a = 0
+            a, _ = 1, t
+            return a
+
+        print(early(Tag(3)))
+        """, "1\ndrop 3\n")
+
+// -- what is refused --------------------------------------------------------------------------------
+
+@test("a compound operator does not discard, bare or parenthesised")
+asd_compound()
+    asd_refused(asd_common() + "var a = 0\na, _ += 1, 2\n",
+                "'+=' reads every place before writing it, and '_' has nothing to read \u{2014} a part " +
+                "is discarded only by '='", "23:4")
+    asd_refused(asd_common() + "var a = 0\n(a, _) -= pair(1)\n",
+                "'-=' reads every place before writing it", "23:5")
+
+@test("a discarded value that never returns is refused, as a kept one is")
+asd_never()
+    asd_refused(asd_common() + "var a = 0\na, _ = 1, panic(\"x\")\n",
+                "'_' drops the value it is given, and this expression never returns one", "23:11")
+
+@test("a '_' inside a place is refused by name, bare, parenthesised and in a loop body")
+asd_inside_a_place()
+    val words = "'_' inside a place stands for a closure's parameter, and the places of a multiple " +
+                "assignment are not a closure"
+
+    asd_refused(asd_common() + "var a = 0\nvar xs = [1, 2]\nxs[_], a = 1, 2\n", words, "24:1")
+    asd_refused(asd_common() + "var a = 0\nvar xs = [1, 2]\n(xs[_], a) = 1, 2\n", words, "24:2")
+    asd_refused(asd_common() + "var a = 0\nvar xs = [1, 2]\nfor i in 0..<1\n    xs[_], a = 1, 2\n",
+                words, "25:5")
+
+@test("an error inside a discarded value is still reported")
+asd_error_inside()
+    asd_refused(asd_common() + "var a = 0\na, _ = 1, nothing_here\n", "undefined name 'nothing_here'",
+                "23:11")
+
+@test("a value with nothing to infer from beside '_' says so")
+asd_nothing_to_infer()
+    asd_refused(asd_common() + "var a = 0\na, _ = 1, None\n",
+                "cannot infer the type argument 'T' of 'None' here", "23:11")
+
+@test("the arity and carrier refusals are unchanged by '_'")
+asd_arity()
+    asd_refused(asd_common() + "var a = 0\na, _ = 1, 2, 3\n",
+                "this assignment has 2 places on the left and 3 values on the right", "23:1")
+    asd_refused(asd_common() + "(_, _) = 1\n",
+                "this assignment has 2 places on the left, and one int is not something to take " +
+                "apart", "22:10")

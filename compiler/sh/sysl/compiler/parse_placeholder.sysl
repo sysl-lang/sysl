@@ -52,6 +52,13 @@ lift_placeholders(e: Expr) -> Expr
     expr(e.span, Lambda(params, body, false))
 end lift_placeholders
 
+// Whether a `_` stands free in the expression -- one no boundary inside it has closed over.
+has_free_placeholder(e: Expr) -> bool
+    var found: Buf[Expr] = buf()
+
+    collect_free(e, &found)
+    !found.is_empty()
+
 // The same, at an argument.
 //
 // **A bare `_` argument is left alone**, and so is one under a name: `f(_)` is the enclosing call's
@@ -204,9 +211,10 @@ private collect_stmt(s: Stmt, out: *Buf[Expr])
         ValDecl(_, _, value, _, _, _, _, _) -> collect_free(value, out)
         ConstDecl(_, _, value, _) -> collect_free(value, out)
         RefDecl(_, place) -> collect_free(place, out)
-        MultiAssign(_, targets, values) ->
-            collect_each(targets, out)
-            collect_each(values, out)
+        // **A multiple assignment's places are not operands**: a `_` among them discards its part,
+        // and its own statement is the boundary it would have closed at, so a loop or a branch
+        // holding the statement must not lift it into a closure of its own.
+        MultiAssign(_, _, values) -> collect_each(values, out)
         MultiDecl(_, _, values, _) -> collect_each(values, out)
         PatternDecl(_, _, value, _, _) -> collect_free(value, out)
         Return(value) -> collect_opt(value, out)
