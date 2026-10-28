@@ -1769,6 +1769,7 @@ private eval_rest(r: &EvRun, e: TExpr) -> Flow
         TDeref(operand, _) -> read_through(r, operand)
         TIntOp(op, operand, amount, width, ty) ->
             if op == "fixed_bits" || op == "fixed_from_bits" then fixed_bits(r, operand, ty)
+            else if op == SubscriptIndexOp then subscript_index(r, operand, ty)
             else bit_operation(r, e.span, op, operand, amount, width)
         _ -> refuse_form(r, e.span, s"'${texpr_kind_name(e)}' is not evaluated while compiling yet")
 end eval_rest
@@ -3062,6 +3063,27 @@ private fields_match(r: &EvRun, args: Buf[TPattern], fields: Buf[Const]) -> Resu
 
     Ok(true)
 end fields_match
+
+// A container subscript's index read as the `usize` its method takes: a negative one, or one past
+// what a `usize` holds, traps, as it would where the program ran.
+@noinline
+private subscript_index(r: &EvRun, operand: TExpr, ty: Type) -> Flow
+    val n = eval_value(r, operand) match
+        Ok(ConstInt(k)) -> k
+        Ok(_) -> return refuse_form(r, operand.span, "an index that is not an integer")
+        Err(f) -> return f
+
+    if cmp(n, from_int(0)) < 0 then return trap(r, operand.span, s"index ${to_string(n)} is negative")
+
+    val bits = underlying(ty) match
+        Integer(b, _, _) -> b
+        _ -> 64
+
+    if cmp(n, big_shl(from_int(1), usize(bits))) >= 0 then
+        return trap(r, operand.span, s"index ${to_string(n)} does not fit in usize")
+
+    EvGave(ConstInt(n))
+end subscript_index
 
 // `x.bits` and `T::Bits(n)`: the same integer, read at the other type.
 @noinline

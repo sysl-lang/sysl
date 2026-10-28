@@ -8,8 +8,9 @@ import sysl.process.capture
 // An index takes any integer, so it is not a use that fixes a literal binding's type
 // (`var_first_use.sysl`, `reference/declarations.md § A literal binding takes its type from its first
 // use`): the next use that does fix one decides, and a binding with none keeps the literal's default.
-// The same holds for a slice's bounds. A subscript that goes through a method -- a `Buf`'s, a type's
-// own `Index` -- hands the index to a parameter, and a parameter still fixes it.
+// The same holds for a slice's bounds, and for a subscript that goes through a method taking a `usize`
+// -- a `Buf`'s, a type's own `Index[usize, _]` -- which takes any integer as an array's does. One whose
+// method takes some other type hands the index to that parameter, which fixes it.
 
 private ixn_ready() -> bool
     if std_root().is_err()
@@ -306,7 +307,7 @@ ixn_slices()
     assert(ixn_says(report, "'+' needs matching types, got int and usize", "7:15"), report)
     assert_eq(ixn_count(report), 2)
 
-@test("a Buf's subscript and a type's own Index hand the index to a parameter, which fixes it")
+@test("a Buf's subscript fixes nothing, a method call's argument does, and an Index by u8 fixes it")
 ixn_method_subscripts_fix()
     if !ixn_ready() then return
 
@@ -333,7 +334,8 @@ ixn_method_subscripts_fix()
             print(bc, bg)
         """), "6 6\n5\n1 0\n")
 
-    val report = ixn_err(raw"""
+    // The subscript left `c` open, so the `int` after it decides, and the binding goes negative.
+    assert_eq(ixn_ran(raw"""
         import sysl.buf.{Buf, buf}
 
         main()
@@ -342,9 +344,25 @@ ixn_method_subscripts_fix()
             val c = 0
             print(b[c])
             val z: int = c
+            print(z - 1)
+        """), "5\n-1\n")
+
+    // An `Index` by `u8` still takes its index as a parameter, so the `i8` after it is refused (an
+    // `int` would take the `u8` by widening).
+    val report = ixn_err(raw"""
+        struct Bag
+            items: [2]int
+
+        impl Index[u8, int] for Bag
+            index(self, i: u8) -> int = self.items[i]
+
+        main()
+            val g = 0
+            print(Bag([1, 2])[g])
+            val z: i8 = g
         """)
 
-    assert(ixn_says(report, "cannot initialize 'z': declared int but the value is usize", "8:5"), report)
+    assert(ixn_says(report, "cannot initialize 'z': declared i8 but the value is byte", "10:5"), report)
     assert_eq(ixn_count(report), 1)
 
 @test("an index in a generic body fixes nothing, in every instance")

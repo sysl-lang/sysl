@@ -223,8 +223,9 @@ while i + 1 < xs.len
 **Nor does an index**, nor a slice's bounds: an array, a
 slice or a pointer is indexed by any integer, so `xs[i]` asks no type of `i` and the next use that
 does ask one decides; the same goes for a vector run's start and a slot's index. A subscript that a
-method answers — a `Buf`'s, or a type's own `Index` — hands the index to a parameter, and that is an
-argument like any other. A binding no use fixes has the literal's default: `int`, or `real` for a
+method answers with a `usize` parameter — a `Buf`'s, or a type's own `Index[usize, E]` — takes any
+integer the same way, so it fixes nothing either; one whose parameter is some other type — a table
+keyed by `string`, an `Index[int, E]` — hands the index to it as an argument like any other. A binding no use fixes has the literal's default: `int`, or `real` for a
 float literal, so a literal `int` cannot hold, used only as an index, is refused as it would be with
 `int` written, and a negative one stops the program at the subscript. A use whose type cannot hold
 the literal — `300` handed to a `u8` — fixes nothing either, and is refused as it would be with

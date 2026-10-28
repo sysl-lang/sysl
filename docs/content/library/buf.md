@@ -223,7 +223,11 @@ print(items[0].block, items[0].data.len())
 80 1
 ```
 
-An index past the count panics, as `at` does — `panic: index 3 past the 1 elements of a Buf`.
+**The subscript takes any integer**, as an array's does: `items[i]` with `i` an `int` or an `i8`
+needs no `usize(i)`, and a negative index stops the program at the subscript, as an array's does
+([arrays](/reference/arrays/#a-type-with-no-elements-of-its-own-is-indexed-through-a-trait)). The
+methods themselves — `at`, `set`, `insert`, `remove` — take a `usize`, as written. An index past the
+count panics, as `at` does — `panic: index 3 past the 1 elements of a Buf`.
 
 **A member that can move the storage is `@relocates`** — `push`, `extend`, `insert`, `pop`,
 `truncate`, `clear`, `remove`, `reserve`, `set_len` and `release` — and is refused on a buffer a live

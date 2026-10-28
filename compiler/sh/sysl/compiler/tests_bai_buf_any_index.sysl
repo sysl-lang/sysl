@@ -1,0 +1,281 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_temp_dir, remove_dir_all, write_text}
+import sysl.process.{capture, Status}
+import sysl.text.Search
+
+// **A container's subscript takes any integer, as an array's does** (`reference/arrays.md § A type
+// with no elements of its own is indexed through a trait`). Where the method behind `b[i]` --
+// `index`, `index_place`, `index_set` -- takes a `usize`, the compiler brings the index to one before
+// the call (`expr_coll.sysl`'s `subscript index` form), trapping on a negative index or one too wide
+// for the address, and the index fixes no literal binding's type. Where the method takes anything
+// else, the index is an ordinary argument.
+//
+// The axes: the index's type (int, i8, u8, i16, i64, u64, usize, u128, i128, a literal, a negative
+// literal, a negative value at run time); the subscript's use (a read, a write, a compound
+// assignment, a `ref`); the container (`Buf` through `IndexPlace`, a program's own `Index`, `IndexSet`
+// and `IndexPlace`, a type parameter bounded by `Index` or `IndexPlace`, an `Index[int, _]` that
+// takes the index as written); a `const` function folded while compiling; the optimizer level for
+// every trap. Skipped: a 32-bit target, where an `i64` index goes through the same too-wide check
+// an array's does (`widen_index_val`) and `bfm_` already reads that check's report; a pointer to a
+// container, whose subscript reaches the same `index_non_vector` (`pxi_`).
+
+private bai_ready() -> bool = std_root().is_ok() && clang_available()
+
+// The program built at `level` and run: its status, what it printed, and what it wrote to standard
+// error -- or, where the build refused it, the refusal as the error text.
+private bai_run(text: string, level: string) -> (Status, string, string)
+    val root = make_temp_dir("sysl-bai").unwrap()
+
+    write_text(s"$root/main.sysl", "import sysl.buf.{Buf, buf}\n\n" + text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, level, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (Status.Exited(-1), "", failure_text(why))
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> (Status.Exited(-1), "", "the program that was built could not be run")
+        Ok(out) -> (out.status, out.text, out.err.unwrap_or(""))
+end bai_run
+
+// The program runs to completion at both levels and prints exactly `want`.
+private bai_prints(text: string, want: string)
+    if !bai_ready() then return
+
+    for level in ["0", DefaultOptimization]
+        val (state, printed, err) = bai_run(text, level)
+
+        assert(state == Status.Exited(0), s"-O$level: $state, '$err'")
+        assert_eq(printed, want)
+end bai_prints
+
+// At both levels the program stops on SIGTRAP, having printed `printed` and said `said` on standard
+// error.
+private bai_traps(text: string, printed: string, said: string)
+    if !bai_ready() then return
+
+    for level in ["0", DefaultOptimization]
+        val (state, out, err) = bai_run(text, level)
+
+        assert(state == Status.Signalled(5), s"-O$level stopped with $state, saying '$err'")
+        assert_eq(out, printed)
+        assert_eq(err, said)
+end bai_traps
+
+// The build refuses the program, saying `part`.
+private bai_refused(text: string, part: string)
+    if !bai_ready() then return
+
+    val (_, _, err) = bai_run(text, "0")
+
+    assert(err.contains(part), err)
+end bai_refused
+
+private bai_three() -> string = "var b: &Buf[int] = buf()\n\nb.push(10)\nb.push(20)\nb.push(30)\n\n"
+
+// -- a Buf, read, by every integer type -----------------------------------------------------------
+
+@test("a Buf is read by an index of any integer type, with no conversion written")
+bai_every_integer_type_reads()
+    bai_prints(bai_three() + raw"""
+        val a = 1
+        val c: i8 = 2
+        val d: u8 = 0
+        val e: i16 = 1
+        val f: i64 = 2
+        val g: u64 = 0
+        val h: usize = 1
+        val w: u128 = 2
+        val v: i128 = 0
+
+        print(b[a], b[c], b[d], b[e], b[f], b[g], b[h], b[w], b[v], b[2])
+        """, "20 30 10 20 30 10 20 30 10 30\n")
+
+@test("a Buf is written and compound-assigned by an int index, and a ref names the element")
+bai_write_compound_and_ref()
+    bai_prints(bai_three() + raw"""
+        val i = 0
+        val j: i8 = 1
+        val k: u64 = 2
+
+        b[i] = 11
+        b[j] += 5
+        b[k] *= 2
+
+        ref e = b[i]
+
+        e -= 1
+        print(b[0], b[1], b[2])
+        """, "10 25 60\n")
+
+@test("an index does not fix a literal binding's type, so the binding stays an int and goes negative")
+bai_literal_binding_not_fixed()
+    bai_prints(bai_three() + raw"""
+        var i = 1
+
+        print(b[i])
+        i = i - 2
+        print(i)
+        """, "20\n-1\n")
+
+@test("an index computed in the subscript is any integer too")
+bai_computed_index()
+    bai_prints(bai_three() + raw"""
+        val n: i32 = 3
+
+        print(b[n - 1], b[n / 3])
+        """, "30 20\n")
+
+// -- a program's own containers --------------------------------------------------------------------
+
+private bai_types() -> string = raw"""
+    struct Table
+        cells: [4]int
+
+    impl Index[usize, int] for Table
+        index(self, i: usize) -> int = self.cells[i]
+
+    struct Store
+        cells: [4]int
+
+    impl Index[usize, int] for Store
+        index(self, i: usize) -> int = self.cells[i]
+
+    impl IndexSet[usize, int] for Store
+        index_set(*self, i: usize, v: int) = self.cells[i] = v
+
+    struct Ring
+        cells: [4]int
+        head: usize
+
+    impl IndexPlace[usize, int] for Ring
+        index_place(*self, i: usize) -> *int = &self.cells[(self.head + i) % 4]
+
+    struct Offset
+        base: int
+
+    impl Index[int, int] for Offset
+        index(self, k: int) -> int = self.base + k
+
+    """
+
+@test("a program's own Index, IndexSet and IndexPlace take any integer where they take a usize")
+bai_user_traits()
+    bai_prints(bai_types() + raw"""
+        val i = 1
+        val j: i8 = 2
+        val t = Table([1, 2, 3, 4])
+        var s = Store([0, 0, 0, 0])
+        var r = Ring([1, 2, 3, 4], 2)
+
+        s[i] = 7
+        s[j] = s[i] + 1
+        r[i] += 100
+        print(t[i], t[j], s[1], s[2], r.cells)
+        """, "2 3 7 8 [1, 2, 3, 104]\n")
+
+@test("an Index taking an int is handed the index as written, a negative one included")
+bai_index_by_int_untouched()
+    bai_prints(bai_types() + raw"""
+        val o = Offset(100)
+        val k: i8 = 3
+
+        print(o[-5], o[0 - 1], o[k])
+        """, "95 99 103\n")
+
+@test("a type parameter bounded by Index or IndexPlace is subscripted by any integer")
+bai_generic_bounds()
+    bai_prints(bai_types() + raw"""
+        read_at[T: Index[usize, int]](t: T, i: int) -> int = t[i] + t[1]
+
+        bump[T: IndexPlace[usize, int]](t: *T, i: i8)
+            t[i] += 1
+
+        var r = Ring([1, 2, 3, 4], 0)
+
+        bump(&r, 3)
+        print(read_at(Table([5, 6, 7, 8]), 2), r.cells)
+        """, "13 [1, 2, 3, 5]\n")
+
+// -- folded while compiling ------------------------------------------------------------------------
+
+private bai_const() -> string = raw"""
+    struct Table
+        cells: [4]int
+
+    impl Index[usize, int] for Table
+        index(self, i: usize) -> int = self.cells[i]
+
+    const pick(t: Table, k: i8) -> int = t[k]
+
+    """
+
+@test("a const function's subscript by an i8 is folded while compiling")
+bai_const_folds()
+    bai_prints(bai_const() + "const P = pick(Table([5, 6, 7, 8]), 2)\n\nprint(P)\n", "7\n")
+
+@test("and a negative index traps while compiling, saying so with its sign")
+bai_const_negative_traps()
+    bai_refused(bai_const() + "const P = pick(Table([5, 6, 7, 8]), -1)\n\nprint(P)\n",
+                "'P' traps while it is being compiled: index -1 is negative")
+
+// -- the error paths --------------------------------------------------------------------------------
+
+@test("a negative index at run time stops the program at the subscript, before the method runs")
+bai_negative_traps()
+    bai_traps(bai_three() + raw"""
+        val i = 0 - 1
+
+        print("before")
+        print(b[i])
+        """, "before\n", "index -1 is negative (main.sysl:12:9)\n")
+
+@test("and so does a negative narrow index written to, and one compound-assigned")
+bai_negative_write_traps()
+    bai_traps(bai_three() + "val k: i8 = -2\n\nb[k] = 1\n", "", "index -2 is negative (main.sysl:11:3)\n")
+    bai_traps(bai_three() + "val k: i64 = -3\n\nb[k] += 1\n", "", "index -3 is negative (main.sysl:11:3)\n")
+
+@test("a negative index into a program's own Index traps too, and an i128 one is shown with its sign")
+bai_negative_user_and_wide()
+    bai_traps(bai_types() + "val t = Table([1, 2, 3, 4])\nval i: i128 = 0 - 3\n\nprint(t[i])\n", "",
+              "index -3 is negative (main.sysl:34:9)\n")
+
+@test("an index too wide for a usize traps as an array's does")
+bai_too_wide_traps()
+    bai_traps(bai_three() + "val big: u128 = 1 << 70\n\nprint(b[big])\n", "",
+              "index does not fit in usize (main.sysl:11:9)\n")
+
+@test("an index past the count is the method's to report: a Buf's still panics, naming both")
+bai_past_the_count_panics()
+    if !bai_ready() then return
+
+    val (state, printed, _) = bai_run(bai_three() + "val i = 3\n\nprint(b[i])\n", "0")
+
+    assert(state == Status.Exited(1), s"$state")
+    assert(printed.contains("panic: index 3 past the 3 elements of a Buf"), printed)
+
+@test("a negative literal is refused while compiling, read or written")
+bai_negative_literal_refused()
+    bai_refused(bai_three() + "print(b[-1])\n", "the literal -1 does not fit usize")
+    bai_refused(bai_three() + "b[-2] += 1\n", "the literal -2 does not fit usize")
+    bai_refused(bai_types() + "val t = Table([1, 2, 3, 4])\n\nprint(t[-1])\n", "the literal -1 does not fit usize")
+
+@test("an index that is not an integer is told so, as an array's is")
+bai_not_an_integer()
+    bai_refused(bai_three() + "print(b[\"x\"])\n", "an index must be an integer, not string")
+    bai_refused(bai_three() + "b[1.5] = 2\n", "an index must be an integer, not real")
+    bai_refused(bai_types() + "var s = Store([0, 0, 0, 0])\n\ns[true] = 1\n", "an index must be an integer, not bool")
+
+@test("an Index taking an int still refuses what an int parameter refuses")
+bai_index_by_int_refuses()
+    bai_refused(bai_types() + "val o = Offset(1)\n\nprint(o[\"x\"])\n",
+                "is int, but string was given")

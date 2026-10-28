@@ -1149,7 +1149,7 @@ fill() -> Buf[i32]
 count() -> i32 = i32(squares.len())
 
 @export("mylib_at")
-at(i: i32) -> i32 = squares[usize(i)]
+at(i: i32) -> i32 = squares[i]
 ```
 
 A C project linking that archive sees `3`, `1`, `4`, `9`. Nothing in the sysl says where the filling
