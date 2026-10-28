@@ -990,7 +990,10 @@ where it was allocated:
   or allocator-free, over static, stack, or heap memory;
 - **`*T` carries no length**, so it is the one unchecked primitive. `p[i]` reads the `i`th element
   and `p[0..<n]` views `n` of them, both exactly as C does and both unchecked, because there is no
-  length to check against and supplying one is the programmer's assertion.
+  length to check against and supplying one is the programmer's assertion. A pointer to something
+  with a subscript of its own — a `*[N]T`, or a `*Buf[T]` and any other type indexed through a trait
+  — is indexed as that thing, with its check
+  ([Arrays](/reference/arrays/#a-raw-pointer-is-indexed-anyway)).
 
 So even low-level, allocator-free code stays bounds-safe by *choosing* slices, and reaches for `*T`
 where it must — an MMIO window, a page table, a buffer a C function filled. That choice is the point.
@@ -1014,8 +1017,9 @@ another object, so there is no count to take a share of. Reaching a `&T` means b
 constructing one, and taking the address of a local is therefore inherently in the unsafe tier —
 which is right, because it can dangle and nothing promotes it.
 
-**Selection is the only implicit dereference.** `p.x` is `(*p).x` and `p.x = 9` writes through the
-pointer — Go's rule, with no `->`. Matching a reference to an enum against its variants is `match *e`.
+**Selection is the only implicit dereference, with the subscript of an indexable pointee.** `p.x` is
+`(*p).x` and `p.x = 9` writes through the pointer — Go's rule, with no `->` — and `p[i]` on a pointer
+to an array or a container is `(*p)[i]`. Matching a reference to an enum against its variants is `match *e`.
 
 **The shorthand stops at one level**, so reaching through a `**T` is written:
 

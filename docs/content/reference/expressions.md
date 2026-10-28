@@ -942,7 +942,7 @@ Eight things attach to an expression on the right, and they compose left to righ
 
 | tail | what it does |
 |---|---|
-| `e[i]` | index — an element of an array, a slice, or a type implementing `Index` |
+| `e[i]` | index — an element of an array, a slice, or a type implementing `Index`, reached through one `*T` too; on a pointer to anything else, C's `i`th element along ([Arrays](/reference/arrays/#a-raw-pointer-is-indexed-anyway)) |
 | `e.name` | select a field, or call a method |
 | `e.0` | select a tuple's part by position |
 | `e(…)` | call |

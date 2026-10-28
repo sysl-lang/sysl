@@ -179,7 +179,19 @@ static int job_signals_reset(void) {
  * Answers 0 or an `errno`. */
 static int child_group(int pgid, int tty) {
     if (pgid < 0) return 0;
-    if (setpgid(0, pgid) != 0) return errno;
+    /* The parent puts the child in the group too (`start_forked`), so that the group exists whichever of
+     * the two runs first -- and when both create it at once, the kernel's check-then-create is not
+     * atomic and the loser is answered `EPERM` though the group is now exactly the one asked for. The
+     * child is where it was asked to be if its group is already the wanted one, and otherwise the
+     * call is made again: the group exists by then, and joining it is allowed. */
+    for (int tries = 0;; tries++) {
+        if (setpgid(0, pgid) == 0) break;
+
+        int failed = errno;
+
+        if (getpgrp() == (pgid == 0 ? getpid() : (pid_t) pgid)) break;
+        if (failed != EPERM || tries >= 1000) return failed;
+    }
 
     int e = tty < 0 ? 0 : handed_terminal(tty, getpgrp());
 

@@ -612,6 +612,37 @@ property of the type, not of the syntax**: a `*[N]T`, whose length is in its typ
 an array has. A slice keeps a program safe; a pointer is how it talks to hardware and to C, and the
 language supplies both.
 
+**A pointer to something with a subscript of its own is indexed as that thing.** The `*[N]T` above
+is one; a pointer to a container indexed through a trait (the next section) is the other. `p[i]` on a
+`*Buf[int]` is the `i`th element, checked by the `Buf` — exactly what `p.at(i)`, `p.len()` and
+`(*p)[i]` reach — and a write through it lands in the element, never the `i`th `Buf` along:
+
+```sysl
+import sysl.buf.{Buf, buf}
+
+first(b: *Buf[int]) -> int = b[0]
+
+bump(b: *Buf[int])
+    b[0] += 1
+
+var b: Buf[int] = buf()
+
+b.push(41)
+bump(&b)
+
+print(first(&b), b.len())
+```
+
+```output
+42 1
+```
+
+The shorthand reaches one level, as selection does, so a `**Buf[int]` is subscripted as the pointer
+it is. **A generic decides by the bound, not by the instantiation**: in `nth[T](p: *T, i: int) -> T
+= p[i]` the subscript is the `i`th `T` whatever `T` turns out to be, an array or a `Buf` included,
+while a `[C: Index[usize, int]](p: *C)` reads `p[i]` as the container's element at every
+instantiation.
+
 ### A type with no elements of its own is indexed through a trait
 
 Everything above is about the built-in subscript rather than about `[]` as a token. A user type — the

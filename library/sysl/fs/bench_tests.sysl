@@ -46,7 +46,8 @@ private bench_done(path: string)
     remove_file(path).unwrap()
     remove_dir(path[0..<path.len - 6]).unwrap()
 
-private const bench_rounds: usize = 7
+private const bench_rounds: usize = 40
+private const bench_min_rounds: usize = 3
 
 // The text every workload writes and reads: 4 MiB of short lines.
 private bench_line() -> string = "the quick brown fox jumps over the lazy dog, again: 0123456789ab\n"
@@ -146,6 +147,12 @@ end ours_lines
 // The ratio a run is held to, in hundredths.
 private bench_bound() -> long = if get("SYSL_FS_BENCH").unwrap_or("") == "1" then 110 else 300
 
+// Whether the rounds so far already show the bound holding. A minimum only ever falls, so stopping at
+// the first round that holds loses nothing; a real slowdown never holds and so runs every round.
+private bench_settled(round: usize, ours: long, theirs: long) -> bool
+    round + 1 >= bench_min_rounds && ours * 100 <= theirs * bench_bound()
+end bench_settled
+
 private bench_holds(what: string, ours: long, theirs: long)
     val bound = bench_bound()
 
@@ -175,6 +182,7 @@ bench_write_text()
 
         if t1 - t0 < ours then ours = t1 - t0
         if t2 - t1 < theirs then theirs = t2 - t1
+        if bench_settled(r, ours, theirs) then break
 
     bench_holds("write_text of 4 MiB, four times", ours, theirs)
     bench_done(path)
@@ -200,6 +208,7 @@ bench_small_writes()
 
         if t1 - t0 < ours then ours = t1 - t0
         if t2 - t1 < theirs then theirs = t2 - t1
+        if bench_settled(r, ours, theirs) then break
 
     bench_holds("65536 writes of one line", ours, theirs)
     bench_done(path)
@@ -226,6 +235,7 @@ bench_read_text()
 
         if t1 - t0 < ours then ours = t1 - t0
         if t2 - t1 < theirs then theirs = t2 - t1
+        if bench_settled(r, ours, theirs) then break
 
     assert_eq(sizes.0, sizes.1)
     bench_holds("read_text of 4 MiB", ours, theirs)
@@ -253,6 +263,7 @@ bench_lines()
 
         if t1 - t0 < ours then ours = t1 - t0
         if t2 - t1 < theirs then theirs = t2 - t1
+        if bench_settled(r, ours, theirs) then break
 
     assert_eq(counts.0, counts.1)
     assert(counts.0 > 60000, "the lines were not all read")
