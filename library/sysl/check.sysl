@@ -32,6 +32,45 @@ private extern "llvm.trap" llvm_trap() -> never
  */
 trap() -> never = llvm_trap()
 
+/** **An index past a container's count stops the program exactly as one past an array's length
+ * does**: the failure is reported through `sysl_bounds_fail` -- the default's message on standard
+ * error, or a program's own `@export("sysl_bounds_fail")` -- and then the program traps, so the exit
+ * status is SIGTRAP's and an override that returns still stops it. `Buf`, `Frozen`, `Deque` and
+ * `Ring` all report through here, which is what makes `b[5]` on a three-element `Buf` say what
+ * `a[5]` on a three-element array says.
+ *
+ * **What it cannot give is the caller's line.** An array's check is laid down at the subscript, so
+ * it names where that was written; this one runs inside the container's member, and a member has no
+ * way to learn where it was called from that a subscript could reach (a trait's `index` takes the
+ * index and nothing else). The location is null, which is what an override is handed wherever a
+ * build has none to give, and the message ends at the values.
+ *
+ * Out of line and cold, so what a bounds-checked member keeps at the check is a compare and a
+ * branch.
+ */
+@noinline
+@cold
+private[sysl] index_past(i: usize, n: usize) -> never
+    bounds_report(BoundsIndex, i, 0, n, null)
+    trap()
+
+/** The same report for an insertion, which may stand at the count itself and no further. */
+@noinline
+@cold
+private[sysl] insert_past(i: usize, n: usize) -> never
+    bounds_report(BoundsInsertPastLength, i, 0, n, null)
+    trap()
+
+// The forms the two reports take, as `sysl_bounds_fail` numbers them -- the compiler's
+// `bounds_fail.sysl` holds the whole list, and the numbers are part of the C surface.
+private const BoundsIndex: u32 = 0
+private const BoundsInsertPastLength: u32 = 14
+
+// The hook every failed bounds check reports through: the compiler's weak default, or a program's
+// own definition. Its C signature is `void (uint32_t kind, size_t a, size_t b, size_t length,
+// const char *at)`.
+private extern "sysl_bounds_fail" bounds_report(kind: u32, a: usize, b: usize, n: usize, at: *u8)
+
 // Where the caller was. Both take these and neither is ever given them: a default is evaluated at
 // the call, standing exactly where the argument would have been written (`reference/declarations.md
 // § Default parameters and named arguments`), so `__FILE__` and `__LINE__` written here report the

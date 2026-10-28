@@ -77,6 +77,52 @@ val n = 1 + if c then 2
 '+' needs matching types, got int and unit
 ```
 
+**A `match` is the operand of any operator, binary or prefix, once it is in parentheses.** Its keyword
+goes after the value and binds more loosely than every operator, so written bare it takes the whole
+expression before it: `a + k match …` matches on `a + k`
+([patterns](/reference/patterns/)). Parenthesised, it is one operand like any other, on either side:
+`a + (k match …) * b` multiplies the match's value by `b` and adds `a`, and `-(k match …)` negates
+it. The arms may be one line each or blocks, with guards and payload bindings, and a `match` or an
+`if` may nest in an arm. Literal arms take a typed operand's type, as a literal does
+([which conversions are implicit](#which-conversions-are-implicit)). The closing bracket may stand on a line of its
+own, back at the margin the bracket was opened at:
+
+```sysl
+val k = 2
+val o: Option[int] = Some(7)
+val b: u8 = 250
+
+print(1 + (k match
+    2 -> 4
+    _ -> 0) * 3)
+print(-(o match
+    Some(v) if v > 5 -> v
+    _ -> 0))
+print(b + (k match
+    2 -> 3
+    _ -> 4
+))
+```
+
+```output
+13
+-7
+253
+```
+
+A `match` used as an operand yields a value, so it must be exhaustive and its arms must agree:
+
+```sysl
+val k = 2
+val n = 1 + (k match
+    1 -> 1
+    2 -> 2)
+```
+
+```error
+a 'match' that yields a value must be exhaustive
+```
+
 ### Two deliberate corrections to C
 
 Every level above matches C except two, and both are widely regarded as mistakes in C.
@@ -181,10 +227,10 @@ print(b << wide)
 8
 ```
 
-**So a literal shifted by a typed count takes its type from where the shift stands, never from the
-count** — the position's type, or the other operand's — exactly as a bare literal does. `1 << bit`
-over an `int` bit is a `u32` where a `u32` is wanted and a `u64` beside a `u64`, and a literal the
-position cannot hold is refused at the literal.
+**So a literal shifted by a typed count takes its type from where the shift stands** — the
+position's type, or the other operand's — exactly as a bare literal does. `1 << bit` over an `int`
+bit is a `u32` where a `u32` is wanted and a `u64` beside a `u64`, and a literal the position cannot
+hold is refused at the literal.
 
 ```sysl
 var level: u32 = 0
@@ -197,6 +243,22 @@ print(level, mask | (1 << bit) | (1 << 4))
 
 ```output
 8 1099511627800
+```
+
+**Only where nothing around it gives a type does the count's stand in**: `val top = 1 <<
+usize(depth)` is a `usize`, and so is `(1 << usize(depth)) - 1` or an `if` with it in one arm and a
+literal in the other.
+
+```sysl
+val depth: u8 = 8
+val x: usize = 40
+val top = if depth == 16 then 65536 else 1 << usize(depth)
+
+print((x * 7 + 3) % top, top)
+```
+
+```output
+27 256
 ```
 
 The count must still be an **integer**, and the refusal names it as a count rather than as a

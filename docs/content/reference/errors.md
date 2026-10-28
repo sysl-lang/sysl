@@ -719,6 +719,7 @@ before the program stops. So `defer` is for releasing a resource, not for restor
 | source | example |
 |---|---|
 | an out-of-bounds array or slice index | `xs[5]` on a `[3]int` |
+| an index past a standard container's count | `b[5]`, `b.at(5)`, `b.remove(5)` on a three-element `Buf`; likewise `Frozen`, `Deque`, `Ring` |
 | an inverted or out-of-range slice range | `xs[3..1]`, `xs[0..9]` |
 | a checked cast that fails | `char(u)` on an invalid scalar, `Color(n)` on an undeclared discriminant, a bitfield's enum field holding one — each enum form has a fallible twin, `Color.try(n)` and `Color.try(s.field)`, [below](#turning-a-trap-back-into-a-value) |
 | an integer divide by zero | `n / 0`, `n % 0` |
@@ -773,7 +774,7 @@ you debug one:
 
 | stopped by | what you see | exit status |
 |---|---|---|
-| a **bounds check** — an index, a range, a substring cut inside a character | everything the program printed before it, and one line on stderr saying what failed and where | the platform's signal status for a trap instruction |
+| a **bounds check** — an index, a range, a substring cut inside a character, an index past a container's count | everything the program printed before it, and one line on stderr saying what failed and where | the platform's signal status for a trap instruction |
 | any other **compiler-inserted check** — a cast, a constrained range, a contract — or `trap()` | everything the program printed before it, and nothing more | the same |
 | a **library forcing member** — `unwrap`, `expect` | `panic: <message>` on stdout, after everything the program printed before it | 1 |
 
@@ -824,6 +825,11 @@ variant 'Shape.Circle' was asked for, and the value is 'Shape.Dot' (main.sysl:9:
 
 The last is [`x.(c)`](/reference/reflection/) reading the payload of a variant the value does not
 hold; it goes through the same function, which receives the two names as NUL-terminated strings.
+
+**The standard containers report through it too.** An index past a `Buf`'s, `Frozen`'s, `Deque`'s or
+`Ring`'s count — by subscript, `at`, `set` or `remove` — is reported as an array's index is and then
+traps; an `insert` past the count says `insertion index 5 is past length 3`. Their report carries no
+location: the check runs inside the container's member, which cannot see the line that called it.
 
 The location is the bracket's line and column, with the file named by its path inside the build (a
 fetched package's file by its coordinate), so no build directory appears in it. The exit status is
