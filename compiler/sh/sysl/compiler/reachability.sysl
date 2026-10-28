@@ -642,6 +642,7 @@ storage_reaching(p: TProgram, shared: Set[string]) -> Buf[string]
     for i in 0..<p.funcs.len()
         index.put(p.funcs.at(i).name, i)
 
+    val tables = table_index(p)
     var reaches: Buf[bool] = buf()
     var edges: Buf[(usize, usize)] = buf()
 
@@ -654,10 +655,7 @@ storage_reaching(p: TProgram, shared: Set[string]) -> Buf[string]
         for item in refs.vals
             if !shared.has(item) then reaches.set(i, true)
 
-        for item in refs.calls
-            index.get(item) match
-                None -> ()
-                Some(j) -> edges.push((i, j))
+        push_edges(p, index, tables, refs, i, &edges)
 
     var moved = true
 
@@ -694,6 +692,7 @@ gap_closure(p: TProgram, gapped: Buf[string]) -> Buf[string]
     for i in 0..<p.funcs.len()
         index.put(p.funcs.at(i).name, i)
 
+    val tables = table_index(p)
     var absent: Buf[bool] = buf()
     var deferred: Buf[bool] = buf()
     var edges: Buf[(usize, usize)] = buf()
@@ -704,12 +703,7 @@ gap_closure(p: TProgram, gapped: Buf[string]) -> Buf[string]
         deferred.push(gone)
         absent.push(gone && p.funcs.at(i).internal)
 
-        val refs = body_refs(p, p.funcs.at(i))
-
-        for item in refs.calls
-            index.get(item) match
-                None -> ()
-                Some(j) -> edges.push((i, j))
+        push_edges(p, index, tables, body_refs(p, p.funcs.at(i)), i, &edges)
 
     var moved = true
 
@@ -730,6 +724,41 @@ gap_closure(p: TProgram, gapped: Buf[string]) -> Buf[string]
 
     out
 end gap_closure
+
+// The tables of a compilation by name, to their place in `p.vtables`.
+private table_index(p: TProgram) -> Map[string, usize]
+    var out: Map[string, usize] = map()
+
+    for i in 0..<p.vtables.len()
+        out.put(p.vtables.at(i).name, i)
+
+    out
+end table_index
+
+// The edges from function `i` to every function of the compilation its body names: the ones it calls,
+// and the slots of every table it erases a value into.
+//
+// **A table's slots are named as surely as a call is**: erasing a closure into `&Fn` builds a value
+// whose table is laid down beside the body, and the table's adapter calls the closure's `call`. A
+// sweep that followed only the calls left the body erasing a closure standing while the closure's own
+// body was taken out -- in a library half, a public `hook()` returning `(a, b) -> self.m(a, b)` over a
+// deferred `m` kept a table naming a `call` nothing defined.
+private push_edges(p: TProgram, index: Map[string, usize], tables: Map[string, usize], refs: &Live,
+                   i: usize, edges: *Buf[(usize, usize)])
+    for item in refs.calls
+        index.get(item) match
+            None -> ()
+            Some(j) -> edges.push((i, j))
+
+    for item in refs.erased
+        tables.get(item) match
+            None -> ()
+            Some(k) ->
+                for slot in p.vtables.at(k).slots
+                    index.get(slot.target) match
+                        None -> ()
+                        Some(j) -> edges.push((i, j))
+end push_edges
 
 // What one body names, without following any of it.
 private body_refs(p: TProgram, f: TFunc) -> &Live
