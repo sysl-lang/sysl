@@ -21,7 +21,7 @@ handling away from every program with no operating system to ask. Deciding what 
 
 ## Index
 
-[`append`](#append) [`append_bytes`](#append_bytes) [`append_text`](#append_text) [`cache_dir`](#cache_dir) [`canonicalize`](#canonicalize) [`config_dir`](#config_dir) [`copy_dir_all`](#copy_dir_all) [`copy_file`](#copy_file) [`create`](#create) [`create_update`](#create_update) [`current_dir`](#current_dir) [`data_dir`](#data_dir) [`entries`](#entries) [`entry_bytes`](#entry_bytes) [`exists`](#exists) [`from_errno`](#from_errno) [`hard_link`](#hard_link) [`home_dir`](#home_dir) [`is_dir`](#is_dir) [`is_file`](#is_file) [`is_link`](#is_link) [`link_metadata`](#link_metadata) [`make_dir`](#make_dir) [`make_dir_all`](#make_dir_all) [`make_temp_dir`](#make_temp_dir) [`map_file`](#map_file) [`metadata`](#metadata) [`open`](#open) [`open_update`](#open_update) [`pending_name`](#pending_name) [`publish_dir`](#publish_dir) [`publish_file`](#publish_file) [`read_bytes`](#read_bytes) [`read_link`](#read_link) [`read_text`](#read_text) [`readable`](#readable) [`remove_dir`](#remove_dir) [`remove_dir_all`](#remove_dir_all) [`remove_file`](#remove_file) [`rename`](#rename) [`set_current_dir`](#set_current_dir) [`set_modified`](#set_modified) [`set_owner`](#set_owner) [`set_permissions`](#set_permissions) [`size_of`](#size_of) [`symlink`](#symlink) [`truncate`](#truncate) [`walk`](#walk) [`writable`](#writable) [`write_bytes`](#write_bytes) [`write_bytes_atomic`](#write_bytes_atomic) [`write_text`](#write_text) [`write_text_atomic`](#write_text_atomic) [`Entry`](#entry) [`File`](#file) [`FileState`](#filestate) [`IoError`](#ioerror) [`Kind`](#kind) [`Mapped`](#mapped) [`Matching`](#matching) [`Meta`](#meta) [`Walk`](#walk-1) [Display for IoError](#display-for-ioerror) [Display for Kind](#display-for-kind) [Drop for Mapped](#drop-for-mapped) [Eq for IoError](#eq-for-ioerror) [Eq for Kind](#eq-for-kind) [Fallible for File](#fallible-for-file) [Iterate for Matching](#iterate-for-matching) [Iterate for Walk](#iterate-for-walk) [Positioned for File](#positioned-for-file) [ReadAt for File](#readat-for-file) [Reader for File](#reader-for-file) [WriteAt for File](#writeat-for-file) [Writer for File](#writer-for-file)
+[`append`](#append) [`append_bytes`](#append_bytes) [`append_text`](#append_text) [`cache_dir`](#cache_dir) [`canonicalize`](#canonicalize) [`config_dir`](#config_dir) [`copy_dir_all`](#copy_dir_all) [`copy_file`](#copy_file) [`create`](#create) [`create_update`](#create_update) [`current_dir`](#current_dir) [`data_dir`](#data_dir) [`entries`](#entries) [`entry_bytes`](#entry_bytes) [`exists`](#exists) [`from_errno`](#from_errno) [`hard_link`](#hard_link) [`home_dir`](#home_dir) [`is_dir`](#is_dir) [`is_file`](#is_file) [`is_link`](#is_link) [`link_metadata`](#link_metadata) [`make_dir`](#make_dir) [`make_dir_all`](#make_dir_all) [`make_temp_dir`](#make_temp_dir) [`map_file`](#map_file) [`metadata`](#metadata) [`open`](#open) [`open_update`](#open_update) [`page_size`](#page_size) [`pending_name`](#pending_name) [`publish_dir`](#publish_dir) [`publish_file`](#publish_file) [`read_bytes`](#read_bytes) [`read_link`](#read_link) [`read_text`](#read_text) [`readable`](#readable) [`remove_dir`](#remove_dir) [`remove_dir_all`](#remove_dir_all) [`remove_file`](#remove_file) [`rename`](#rename) [`set_current_dir`](#set_current_dir) [`set_modified`](#set_modified) [`set_owner`](#set_owner) [`set_permissions`](#set_permissions) [`size_of`](#size_of) [`symlink`](#symlink) [`truncate`](#truncate) [`walk`](#walk) [`writable`](#writable) [`write_bytes`](#write_bytes) [`write_bytes_atomic`](#write_bytes_atomic) [`write_text`](#write_text) [`write_text_atomic`](#write_text_atomic) [`Advice`](#advice) [`Entry`](#entry) [`File`](#file) [`FileState`](#filestate) [`IoError`](#ioerror) [`Kind`](#kind) [`Mapped`](#mapped) [`Matching`](#matching) [`Meta`](#meta) [`Walk`](#walk-1) [Display for IoError](#display-for-ioerror) [Display for Kind](#display-for-kind) [Drop for Mapped](#drop-for-mapped) [Eq for IoError](#eq-for-ioerror) [Eq for Kind](#eq-for-kind) [Fallible for File](#fallible-for-file) [Iterate for Matching](#iterate-for-matching) [Iterate for Walk](#iterate-for-walk) [Positioned for File](#positioned-for-file) [ReadAt for File](#readat-for-file) [Reader for File](#reader-for-file) [WriteAt for File](#writeat-for-file) [Writer for File](#writer-for-file)
 
 ## Functions
 
@@ -405,6 +405,14 @@ update mode is a different answer to "and what about what is already there", and
 is what keeps a caller from having to know that one fails on a missing file while the other empties
 one that exists.
 
+### `page_size`
+
+```sysl
+page_size() -> usize
+```
+
+The size in bytes of a page of memory, which a mapping is made and advised in.
+
 ### `pending_name`
 
 ```sysl
@@ -692,6 +700,19 @@ write_text_atomic(path: string, text: string) -> Result[unit, IoError]
 
 ## Types
 
+### `Advice`
+
+```sysl
+enum Advice
+    Normal
+    Random
+    Sequential
+    WillNeed
+    DontNeed
+```
+
+How a mapped range is about to be read, for `Mapped.advise`.
+
 ### `Entry`
 
 ```sysl
@@ -853,6 +874,7 @@ empty view.
 | `len` | `len(self) -> usize` | How many bytes are mapped: the file's size when it was mapped. |
 | `is_empty` | `is_empty(self) -> bool` |  |
 | `bytes` | `bytes(&self) -> []const u8` | The whole file, read-only. |
+| `advise` | `advise(self, advice: Advice, from: usize = 0, len: usize = …) -> Result[unit, IoError]` | Tells the operating system how `len` bytes from offset `from` are about to be used; `len` left out means to the end of the mapping. |
 
 ### `Matching`
 
