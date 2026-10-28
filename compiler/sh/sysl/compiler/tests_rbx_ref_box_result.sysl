@@ -1,0 +1,191 @@
+module sh.sysl.compiler
+@tests
+
+// A position wanting a `&T` reads what stands there at its `T` and boxes what comes back, so a
+// generic call standing there was told its result is expected to be the `T`. Where that result is a
+// bare type parameter and a callable argument yields the `&T` itself, the parameter was settled at
+// the payload and the callable refused: `make() -> &Foo = apply(() -> foo(1))` said "this closure
+// should yield Foo, but its body yields &Foo". A callable that yields a box now settles the
+// parameter at the box the position wants -- the same object, never a copy -- and one that yields a
+// value still settles it at the payload, which is then boxed.
+
+// What a refused program said, or nothing where it built.
+private rbx_refusal(text: string) -> string
+    rng_ran(text) match
+        Err(why) -> why
+        Ok(_) -> ""
+
+// How many complaints a report holds.
+private rbx_count(said: string) -> usize
+    var n: usize = 0
+    var rest = said
+
+    loop
+        rest.index_of("error: ") match
+            Some(at) ->
+                n += 1
+                rest = rest[at + 7..<rest.bytes.len]
+            None -> return n
+end rbx_count
+
+// `text` is refused with exactly one complaint, `message`.
+private rbx_refused(text: string, message: string)
+    if !rng_ready() then return
+
+    val said = rbx_refusal(text)
+
+    assert_eq(rbx_count(said), 1)
+    assert(said.contains(s"error: $message\n"), s"no '$message' in:\n$said")
+end rbx_refused
+
+private val rbx_decls = raw"""
+    struct Foo
+        n: int
+
+    struct Bar
+        m: int
+
+    trait Named
+        name(self) -> string
+
+    impl Named for Foo
+        name(self) -> string = s"foo${self.n}"
+
+    struct Runner
+        k: int
+
+    impl Runner
+        run[R](self, body: () -> R) -> R = body()
+
+    apply[R](body: () -> R) -> R = body()
+    named[R: Named](body: () -> R) -> R = body()
+    foo(n: int) -> &Foo = Foo(n)
+    sfoo(n: int) -> &sync Foo = Foo(n)
+    bar(n: int) -> &Bar = Bar(n)
+    mk() -> &Foo = foo(9)
+
+    """
+
+@test("a closure yielding the &T a function returns settles R at the &T, in every position that boxes")
+rbx_function_body_val_and_return() =
+    if !rng_ready() then return
+
+    rng_prints(rbx_decls + raw"""
+        make() -> &Foo = apply(() -> foo(1))
+
+        bound() -> &Foo
+            val r: &Foo = apply(() -> foo(2))
+            r
+
+        returned() -> &Foo
+            return apply(() -> foo(3))
+
+        takes(f: &Foo) -> int = f.n
+
+        struct Holder
+            f: &Foo
+
+        print(make().n, bound().n, returned().n)
+        print(takes(apply(() -> foo(4))), Holder(apply(() -> foo(5))).f.n)
+
+        val c = make().n == 1
+        val r: &Foo = if c then apply(() -> foo(6)) else foo(7)
+        print(r.n)
+        """, "1 2 3\n4 5\n6\n")
+
+@test("&sync T, Option[&T] and Result[&T, E] each settle R at what the position wants")
+rbx_sync_option_result() =
+    if !rng_ready() then return
+
+    rng_prints(rbx_decls + raw"""
+        make_sync() -> &sync Foo = apply(() -> sfoo(2))
+        make_opt() -> Option[&Foo] = apply(() -> Some(foo(3)))
+        make_res() -> Result[&Foo, string] = apply(() -> Ok(foo(4)))
+
+        print(make_sync().n, make_opt().unwrap().n, make_res().unwrap().n)
+        """, "2 3 4\n")
+
+@test("a nested call, a method generic in R, R bound by a trait, and a named function as the callable")
+rbx_generic_twins() =
+    if !rng_ready() then return
+
+    rng_prints(rbx_decls + raw"""
+        make_nested() -> &Foo = apply(() -> apply(() -> foo(5)))
+        make_method() -> &Foo = Runner(0).run(() -> foo(6))
+        make_bound() -> &Foo = named(() -> foo(7))
+        make_named() -> &Foo = apply(mk)
+        make_erased() -> &Named = apply(() -> foo(8))
+
+        print(make_nested().n, make_method().n, make_bound().name(), make_named().n, make_erased().name())
+        """, "5 6 foo7 9 foo8\n")
+
+@test("the box the closure yields is the one the caller gets: the same object, dropped once")
+rbx_same_object_dropped_once() =
+    if !rng_ready() then return
+
+    rng_prints(raw"""
+        struct Tag
+            id: int
+
+        impl Drop for Tag
+            drop(self) = print("drop", self.id)
+
+        apply[R](body: () -> R) -> R = body()
+
+        same(t: &Tag) -> &Tag = apply(() -> t)
+
+        run()
+            val t = Tag(1)
+            val u = same(t)
+
+            u.id = 2
+            print(t.id)
+
+        run()
+        print("end")
+        """, "2\ndrop 2\nend\n")
+
+@test("a closure yielding a value is still read at the payload and boxed; no reference asked changes nothing")
+rbx_payload_and_plain_positions_unchanged() =
+    if !rng_ready() then return
+
+    rng_prints(rbx_decls + raw"""
+        make_value() -> &Foo = apply(() -> Foo(8))
+        make_lit() -> &u8 = apply(() -> 5)
+        make_plain() -> int = apply(() -> 10)
+        make_struct() -> Foo = apply(() -> Foo(11))
+
+        print(make_value().n, *make_lit(), make_plain(), make_struct().n)
+        """, "8 5 10 11\n")
+
+@test("a raw pointer is not a box: a closure yielding &Foo where *Foo is returned is still refused")
+rbx_pointer_still_refused() =
+    rbx_refused(rbx_decls + raw"""
+        e() -> *Foo = apply(() -> foo(1))
+        """, "this closure should yield *Foo, but its body yields &Foo")
+
+@test("a box of another type is refused naming the box the position wants")
+rbx_other_box_refused() =
+    rbx_refused(rbx_decls + raw"""
+        e() -> &Foo = apply(() -> bar(1))
+        """, "this closure should yield &Foo, but its body yields &Bar")
+
+@test("&Foo where &sync Foo is wanted is refused as the two distinct counts")
+rbx_sync_mismatch_refused() =
+    if !rng_ready() then return
+
+    val said = rbx_refusal(rbx_decls + raw"""
+        e() -> &sync Foo = apply(() -> foo(1))
+        """)
+
+    assert_eq(rbx_count(said), 1)
+    assert(said.contains("error: '&Foo' and '&sync Foo' are distinct types"), said)
+
+@test("a value of the wrong type is refused naming the payload, and Option[&T] still wants an Option")
+rbx_value_mismatch_refused() =
+    rbx_refused(rbx_decls + raw"""
+        e() -> &Foo = apply(() -> "x")
+        """, "this closure should yield Foo, but its body yields string")
+    rbx_refused(rbx_decls + raw"""
+        e() -> Option[&Foo] = apply(() -> foo(1))
+        """, "this closure should yield sysl.Option[&Foo], but its body yields &Foo")
