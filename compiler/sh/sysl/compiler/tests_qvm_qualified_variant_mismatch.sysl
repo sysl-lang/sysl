@@ -1,0 +1,255 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// A variant named by its path -- `m.Error.Timeout` -- belongs to the enum the path names. Where the
+// position expects a DIFFERENT enum that is also called `Error`, the variant is that other enum's
+// value and the position is refused with the ordinary mismatch; it is never looked up again in the
+// position's enum and refused as "carries data".
+
+private var qvm_library_cache: Buf[Program] = buf()
+private var qvm_library_read: bool = false
+
+private qvm_library() -> Buf[Program]
+    if qvm_library_read then return qvm_library_cache
+
+    qvm_library_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> qvm_library_cache = units
+
+    qvm_library_cache
+end qvm_library
+
+private qvm_ready() -> bool
+    if qvm_library().is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+
+    true
+end qvm_ready
+
+// What a program of two files says: its output, or the text of what refused it.
+private qvm_ran(module_text: string, main_text: string) -> string
+    val root = make_temp_dir("sysl-qvm").unwrap()
+
+    write_text(s"$root/sysl.hocon", "package { name = \"qvm\", version = \"0.0.1\", sysl = \"0.7.8\" }\n").unwrap()
+    make_dir_all(s"$root/m").unwrap()
+    write_text(s"$root/m/m.sysl", module_text).unwrap()
+    write_text(s"$root/main.sysl", main_text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end qvm_ran
+
+private qvm_other() -> string = raw"""
+    module m
+    enum Error
+        Timeout
+        Io(code: int)
+        Only
+    """
+
+private qvm_local() -> string = raw"""
+    enum Error
+        Timeout
+        Io(code: int)
+    """
+
+private qvm_refused(main_text: string, line: string)
+    val said = qvm_ran(qvm_other(), "import m\n" + qvm_local() + main_text)
+
+    assert(said.contains(line), said)
+    assert(said.contains("declared Error but the value is m.Error"), said)
+    assert(!said.contains("carries data"), said)
+end qvm_refused
+
+@test("qvm: another module's unit variant at a same-named enum is a mismatch, the variant in both")
+qvm_unit_in_both()
+    if !qvm_ready() then return
+
+    qvm_refused("val wrong: Error = m.Error.Timeout\n", "val wrong: Error = m.Error.Timeout")
+
+@test("qvm: the same where only the other enum has the variant")
+qvm_unit_in_one()
+    if !qvm_ready() then return
+
+    qvm_refused("val wrong: Error = m.Error.Only\n", "val wrong: Error = m.Error.Only")
+
+@test("qvm: a payload variant of the other enum, called, is a mismatch")
+qvm_payload_called()
+    if !qvm_ready() then return
+
+    qvm_refused("val wrong: Error = m.Error.Io(3)\n", "val wrong: Error = m.Error.Io(3)")
+
+@test("qvm: through an import alias the path still names the other enum")
+qvm_alias()
+    if !qvm_ready() then return
+
+    val said = qvm_ran(qvm_other(), "import m.Error as E2\n" + qvm_local() +
+                       "val wrong: Error = E2.Timeout\n")
+
+    assert(said.contains("declared Error but the value is m.Error"), said)
+    assert(!said.contains("carries data"), said)
+
+@test("qvm: a qualified variant of the right enum is accepted, unit and payload")
+qvm_right_enum()
+    if !qvm_ready() then return
+
+    assert_eq(qvm_ran(qvm_other(), raw"""
+        import m
+        val a: m.Error = m.Error.Timeout
+        val b: m.Error = m.Error.Io(3)
+        a match
+            m.Error.Timeout -> print("t")
+            _ -> print("other")
+        b match
+            m.Error.Io(c) -> print(c)
+            _ -> print(0)
+        """), "t\n3\n")
+
+@test("qvm: a qualified variant of the local enum is accepted too")
+qvm_local_enum()
+    if !qvm_ready() then return
+
+    assert_eq(qvm_ran(qvm_other(), "import m\n" + qvm_local() + raw"""
+        val a: Error = Error.Timeout
+        val b: Error = Error.Io(4)
+        b match
+            Error.Io(c) -> print(c)
+            _ -> print(0)
+        """), "4\n")
+
+@test("qvm: a bare variant at the expected type is the expected type's, unchanged")
+qvm_bare()
+    if !qvm_ready() then return
+
+    assert_eq(qvm_ran(qvm_other(), "import m\n" + qvm_local() + raw"""
+        val a: Error = Timeout
+        val b: Error = Io(5)
+        b match
+            Io(c) -> print(c)
+            Timeout -> print(0)
+        """), "5\n")
+
+private qvm_pattern_refused(arm_text: string)
+    val said = qvm_ran(qvm_other(), "import m\n" + qvm_local() + raw"""
+        val e: Error = Error.Timeout
+        val o: Option[Error] = Some(e)
+        """ + "\n" + arm_text)
+
+    assert(said.contains("pattern is m.Error but the value is Error"), said)
+    assert(!said.contains("carries data"), said)
+end qvm_pattern_refused
+
+@test("qvm: a unit pattern naming the other enum's variant against a local scrutinee is refused")
+qvm_pattern_unit()
+    if !qvm_ready() then return
+
+    qvm_pattern_refused("e match\n    m.Error.Timeout -> print(1)\n    _ -> print(2)\n")
+
+@test("qvm: the same where only the other enum has the variant")
+qvm_pattern_unit_only()
+    if !qvm_ready() then return
+
+    qvm_pattern_refused("e match\n    m.Error.Only -> print(1)\n    _ -> print(2)\n")
+
+@test("qvm: a payload pattern of the other enum is refused")
+qvm_pattern_payload()
+    if !qvm_ready() then return
+
+    qvm_pattern_refused("e match\n    m.Error.Io(c) -> print(c)\n    _ -> print(2)\n")
+
+@test("qvm: a nested pattern of the other enum is refused")
+qvm_pattern_nested()
+    if !qvm_ready() then return
+
+    qvm_pattern_refused("o match\n    Some(m.Error.Timeout) -> print(1)\n    _ -> print(2)\n")
+
+@test("qvm: an or-pattern with one alternative of the other enum is refused")
+qvm_pattern_or()
+    if !qvm_ready() then return
+
+    qvm_pattern_refused("e match\n    Error.Timeout | m.Error.Timeout -> print(1)\n    _ -> print(2)\n")
+
+@test("qvm: an `is` test against the other enum's variant is refused")
+qvm_pattern_is()
+    if !qvm_ready() then return
+
+    qvm_pattern_refused("if e is m.Error.Timeout then print(1)\n")
+
+@test("qvm: through an import alias the pattern still names the other enum")
+qvm_pattern_alias_refused()
+    if !qvm_ready() then return
+
+    val said = qvm_ran(qvm_other(), "import m.Error as E2\n" + qvm_local() + raw"""
+        val e: Error = Error.Timeout
+        e match
+            E2.Timeout -> print(1)
+            _ -> print(2)
+        """)
+
+    assert(said.contains("pattern is E2 but the value is Error"), said)
+
+@test("qvm: the scrutinee's own enum is accepted in a pattern under every spelling")
+qvm_pattern_accepted()
+    if !qvm_ready() then return
+
+    assert_eq(qvm_ran(qvm_other(), "import m\nimport m.Error as E2\n" + raw"""
+        val a: m.Error = m.Error.Io(7)
+        val o: Option[m.Error] = Some(m.Error.Timeout)
+        a match
+            E2.Io(c) -> print(c)
+            m.Error.Timeout | m.Error.Only -> print(0)
+        o match
+            Some(m.Error.Timeout) -> print("t")
+            Some(E2.Io(_)) -> print("i")
+            Some(E2.Only) -> print("o")
+            None -> print("n")
+        if a is m.Error.Io(k) then print(k)
+        """), "7\nt\n7\n")
+
+@test("qvm: a type alias of the scrutinee's own enum is accepted in a pattern")
+qvm_pattern_type_alias()
+    if !qvm_ready() then return
+
+    assert_eq(qvm_ran(qvm_other(), "import m\ntype Alias = m.Error\n" + raw"""
+        val a: m.Error = m.Error.Io(5)
+        a match
+            Alias.Io(c) -> print(c)
+            _ -> print(0)
+        """), "5\n")
+
+@test("qvm: a bare pattern and exhaustiveness over the scrutinee's enum are unchanged")
+qvm_pattern_bare_exhaustive()
+    if !qvm_ready() then return
+
+    assert_eq(qvm_ran(qvm_other(), "import m\n" + qvm_local() + raw"""
+        val e: Error = Error.Io(2)
+        e match
+            Timeout -> print(0)
+            Error.Io(c) -> print(c)
+        """), "2\n")
