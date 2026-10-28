@@ -312,8 +312,8 @@ see [arithmetic over literals](/reference/types/#arithmetic-over-literals-is-exa
 A wrapping operator's result is the two's-complement result at the operands' width; a saturating
 operator's is the nearest value the width holds — its maximum or its minimum. A signed saturating
 product saturates toward the side of the true product's sign. Each binds as its base operator does
-(`+|` with `+`, `*|` with `*`), takes the operands its base takes — two of one type, or two that
-[widen](#which-conversions-are-implicit) to one — and has a compound form (`+%=` … `*|=`) and a
+(`+|` with `+`, `*|` with `*`), takes two operands of one type (unlike its base, nothing
+[widens](#which-conversions-are-implicit) to match) — and has a compound form (`+%=` … `*|=`) and a
 yielding one (`+%:=` … `*|:=`).
 
 ```sysl
@@ -348,6 +348,22 @@ print(b +| 300)
 
 ```error
 the literal 300 does not fit byte, the type of the other operand of '+|' — a wrapping or saturating operator takes two values of one type
+```
+
+**The two operands are one type, as in Rust, and neither widens to the other.** Where `a + b` over a
+`u8` and a `u16` is a `u16`, `a +| b` is refused, and so is a named constant of another type: `const K
+= 300` is an `int`, a typed value, so `y +| K` over a `u8` is refused whatever K holds. Only a
+bare literal, or arithmetic over literals alone, takes its neighbour's type. The compound and
+yielding forms hold the value to the place's type the same way. Convert one side (`u16(a) +| b`).
+
+```sysl
+val a: u8 = 250
+val b: u16 = 10
+print(a +| b)
+```
+
+```error
+'+|' takes two values of one type, got byte and ushort
 ```
 
 They are defined on integers of every width, signed and unsigned — `u12`, `u128` and `i256` included,

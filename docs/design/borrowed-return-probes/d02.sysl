@@ -1,0 +1,38 @@
+// The benchtop race's shape (benchtop d72cffd, `dsi_write`): a lock taken and its unlock deferred,
+// then a reference read out of the guarded state. The reference's count is released AFTER the
+// unlock, so another thread taking the lock can see the count change under it. A lock that prints
+// stands in for the mutex; the order of the lines is the bug.
+struct Lock
+    held: bool
+
+    lock(*self)
+        self.held = true
+        print("lock")
+
+    unlock(*self)
+        self.held = false
+        print("unlock")
+
+struct Host
+    name: string
+
+impl Drop for Host
+    drop(self) = print("release the host's last count")
+
+struct Shared
+    host: Option[&Host]
+
+var guard = Lock(false)
+var shared = Shared(None)
+
+write()
+    guard.lock()
+    defer guard.unlock()
+
+    val h = shared.host.unwrap()
+
+    shared.host = None
+    print("use " + h.name + (if guard.held then " under the lock" else " UNLOCKED"))
+
+shared.host = Some(Host("dsi"))
+write()
