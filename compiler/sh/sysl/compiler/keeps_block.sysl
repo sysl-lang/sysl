@@ -1,0 +1,480 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.Span
+import sysl.buf.{Buf, buf}
+import sysl.container.{Map, map}
+
+// **A local lives as long as the block that declares it, not as long as the frame**
+// (`reference/memory.md § A borrowed pointer cannot escape`). A loop body's local is a new variable
+// on every turn, and an `if` arm's counted local is released where the arm ends, so the address of
+// one is good only while its block runs. The frame rule (`keeps.sysl`'s `check_calls`) holds what
+// leaves the function; this one holds what leaves a block inside it: the address of a block's local,
+// or anything built around it -- a closure capturing a pointer to it, a struct, a variant -- may not
+// be kept in a local of an enclosing block, a parameter, or what a keeping callee stores it in,
+// since that holder is still there after the block has ended.
+//
+// The blocks of a body (`BlockScopes`) are also what a closure's capture mode is judged against: a
+// closure that may be reached after the block declaring a variable it captures has ended cannot
+// hold that variable's address (`docs/design/closures.md`, decision 6).
+
+// One block of a body: the block around it, how deep it is, and what it is, as a refusal names it.
+struct BodyBlock
+    parent: int
+    depth: int
+    said: string
+end BodyBlock
+
+// The blocks of one body, and the block each of its locals is declared in. Block 0 is the body
+// itself, which is where a parameter lives.
+struct BlockScopes
+    blocks: Buf[BodyBlock]
+    homes: Map[string, int]
+
+    // The block a local is declared in, or -1 for a name the body does not declare.
+    home_of(self, name: string) -> int = self.homes.get(name).unwrap_or(-1)
+
+    // Whether block `inner` lies strictly inside block `outer`, so that it ends while `outer` runs on.
+    ends_within(self, inner: int, outer: int) -> bool
+        if inner <= 0 || outer < 0 || inner == outer then return false
+
+        var at = self.blocks.at(usize(inner)).parent
+
+        while at >= 0
+            if at == outer then return true
+
+            at = self.blocks.at(usize(at)).parent
+
+        false
+    end ends_within
+
+    // Whether `holder` may still be read after the block declaring `local` has ended: the question
+    // both the rule here and a closure's capture mode ask.
+    outlives_block(self, holder: string, local: string) -> bool =
+        self.ends_within(self.home_of(local), self.home_of(holder))
+end BlockScopes
+
+// The blocks of a body: every `if` and `else` arm, `match` arm, loop body, nested block and `defer`.
+block_scopes_of(f: TFunc) -> &BlockScopes
+    val sc: &BlockScopes = BlockScopes(buf(), map())
+
+    sc.blocks.push(BodyBlock(-1, 0, "the body"))
+
+    for p in f.params
+        sc.homes.put(p.0, 0)
+
+    scope_block(sc, f.body, 0)
+    sc
+end block_scopes_of
+
+private open(sc: &BlockScopes, parent: int, said: string) -> int
+    sc.blocks.push(BodyBlock(parent, sc.blocks.at(usize(parent)).depth + 1, said))
+    int(sc.blocks.len()) - 1
+end open
+
+// **The deepest declaration wins**: a form whose span is not inside its parent's is reached both from
+// the statement around it and from its parent, and only the second knows its real block.
+private declare(sc: &BlockScopes, name: string, block: int)
+    val was = sc.homes.get(name)
+
+    if was.is_some() && sc.blocks.at(usize(was.unwrap())).depth >= sc.blocks.at(usize(block)).depth then return
+
+    sc.homes.put(name, block)
+end declare
+
+private declare_pattern(sc: &BlockScopes, p: TPattern, block: int)
+    var names: Buf[string] = buf()
+
+    pattern_names(p, &names)
+
+    for n in names
+        declare(sc, n, block)
+end declare_pattern
+
+private scope_block(sc: &BlockScopes, b: TBlock, at: int)
+    scope_stmts(sc, b.stmts, at)
+
+    if b.result.is_some() then scope_inner(sc, b.result.unwrap(), at)
+end scope_block
+
+private scope_opt_block(sc: &BlockScopes, b: Option[TBlock], parent: int, said: string) =
+    if b.is_some() then scope_block(sc, b.unwrap(), open(sc, parent, said))
+
+private scope_stmts(sc: &BlockScopes, stmts: Buf[TStmt], at: int)
+    for s in stmts
+        s match
+            TVarDecl(n, _, init, _) ->
+                declare(sc, n, at)
+                scope_inner(sc, init, at)
+            TDefer(body, _) -> scope_stmts(sc, body, open(sc, at, "a 'defer'"))
+            _ -> scope_found(sc, bearing_in_stmt(s), at)
+end scope_stmts
+
+private struct Bearing
+    items: Buf[TExpr]
+end Bearing
+
+// The outermost forms with a block of their own in a statement or an expression, outermost first;
+// one inside another is reached through it.
+private bearing_in_stmt(s: TStmt) -> Buf[TExpr]
+    val found: &Bearing = Bearing(buf())
+
+    walk_stmt(s, expr_walk(false, e -> note_bearing(found, e)))
+    found.items
+end bearing_in_stmt
+
+private scope_inner(sc: &BlockScopes, e: TExpr, at: int)
+    val found: &Bearing = Bearing(buf())
+
+    walk_texpr(e, expr_walk(false, x -> note_bearing(found, x)))
+    scope_found(sc, found.items, at)
+end scope_inner
+
+private scope_found(sc: &BlockScopes, found: Buf[TExpr], at: int)
+    for e in found
+        scope_bearing(sc, e, at)
+end scope_found
+
+private note_bearing(found: &Bearing, e: TExpr)
+    if !has_blocks(e) then return
+
+    for o in found.items
+        if o.span.len() > 0 && e.span.start >= o.span.start && e.span.end <= o.span.end then return
+
+    found.items.push(e)
+end note_bearing
+
+private has_blocks(e: TExpr) -> bool = *e.kind match
+    TIf(_, _, _, _) -> true
+    TMatch(_, _, _) -> true
+    TBlockExpr(_) -> true
+    TWhile(_, _, _, _) -> true
+    TDoWhile(_, _, _, _) -> true
+    TLoop(_, _) -> true
+    TFor(_, _, _, _, _, _, _, _) -> true
+    TCFor(_, _, _, _, _, _) -> true
+    TForEach(_, _, _, _, _, _) -> true
+    TIterate(_, _, _, _, _, _, _, _) -> true
+    _ -> false
+
+private scope_terms(sc: &BlockScopes, cond: Buf[TCondTerm], at: int)
+    for t in cond
+        t match
+            TCondTest(c) -> scope_inner(sc, c, at)
+            TCondIs(subject, patterns, _) ->
+                scope_inner(sc, subject, at)
+
+                for p in patterns
+                    declare_pattern(sc, p, at)
+end scope_terms
+
+private scope_bearing(sc: &BlockScopes, e: TExpr, at: int)
+    *e.kind match
+        TIf(cond, then_block, else_block, _) ->
+            val b = open(sc, at, "the 'if' block")
+
+            scope_terms(sc, cond, b)
+            scope_block(sc, then_block, open(sc, b, "the 'if' block"))
+            scope_opt_block(sc, else_block, b, "the 'else' block")
+        TMatch(scrutinee, arms, _) ->
+            scope_inner(sc, scrutinee, at)
+
+            for arm in arms
+                val b = open(sc, at, "a 'match' arm")
+
+                for p in arm.patterns
+                    declare_pattern(sc, p, b)
+
+                if arm.guard.is_some() then scope_inner(sc, arm.guard.unwrap(), b)
+
+                scope_block(sc, arm.body, b)
+            end for
+        TBlockExpr(block) -> scope_block(sc, block, open(sc, at, "a nested block"))
+        TWhile(cond, body, else_block, _) ->
+            val b = open(sc, at, "the 'while' body")
+
+            scope_terms(sc, cond, b)
+            scope_stmts(sc, body, b)
+            scope_opt_block(sc, else_block, at, "the 'else' block")
+        TDoWhile(body, cond, else_block, _) ->
+            val b = open(sc, at, "the 'while' body")
+
+            scope_stmts(sc, body, b)
+            scope_inner(sc, cond, b)
+            scope_opt_block(sc, else_block, at, "the 'else' block")
+        TLoop(body, _) -> scope_stmts(sc, body, open(sc, at, "the 'loop' body"))
+        TFor(name, _, lo, hi, _, body, else_block, _) ->
+            scope_inner(sc, lo, at)
+            scope_inner(sc, hi, at)
+
+            val b = open(sc, at, "the 'for' body")
+
+            declare(sc, name, b)
+            scope_stmts(sc, body, b)
+            scope_opt_block(sc, else_block, at, "the 'else' block")
+        TCFor(init, cond, step, body, else_block, _) ->
+            val head = open(sc, at, "the 'for' loop")
+
+            scope_stmts(sc, init, head)
+
+            if cond.is_some() then scope_inner(sc, cond.unwrap(), head)
+
+            scope_stmts(sc, step, head)
+            scope_stmts(sc, body, open(sc, head, "the 'for' body"))
+            scope_opt_block(sc, else_block, at, "the 'else' block")
+        TForEach(name, _, seq, body, else_block, _) ->
+            scope_inner(sc, seq, at)
+
+            val b = open(sc, at, "the 'for' body")
+
+            declare(sc, name, b)
+            scope_stmts(sc, body, b)
+            scope_opt_block(sc, else_block, at, "the 'else' block")
+        TIterate(cursor, _, init, next, bind, body, else_block, _) ->
+            scope_inner(sc, init, at)
+
+            val head = open(sc, at, "the 'for' loop")
+
+            declare(sc, cursor, head)
+            scope_inner(sc, next, head)
+
+            val b = open(sc, head, "the 'for' body")
+
+            declare_pattern(sc, bind, b)
+            scope_stmts(sc, body, b)
+            scope_opt_block(sc, else_block, at, "the 'else' block")
+        _ -> ()
+end scope_bearing
+
+// -- the rule ---------------------------------------------------------------------------------------
+
+// What one body's check follows: the locals that hold the address of a block's local, each with every
+// such local it may hold.
+private struct BlockTrack
+    cx: &KeepsCx
+    faults: &KeepFaults
+    scope: Scope
+    org: &Origins
+    sc: &BlockScopes
+    refs: Buf[(string, TExpr)]
+    held: Map[string, Buf[string]]
+    changed: bool
+    checking: bool
+end BlockTrack
+
+// Every place one body keeps the address of a block's local where it outlives the block. The entry
+// file's statements are checked too: their frame lasts the whole program, but their blocks do not.
+check_blocks(cx: &KeepsCx, faults: &KeepFaults, f: TFunc)
+    val sc = block_scopes_of(f)
+
+    if sc.blocks.len() == 1 then return
+
+    val bt: &BlockTrack = BlockTrack(cx, faults, func_home(cx.an, f.name), origins_of(cx, f), sc, buf(),
+                                     map(), true, false)
+
+    walk_block_stmts(f.body, stmt_walk(false, s -> s match
+        TRefDecl(n, _, place) -> bt.refs.push((n, place))
+        _ -> ()))
+
+    val walk = TWalk(false, e -> block_expr_event(bt, e), w -> block_store(bt, w.place, w.value),
+                     s -> s match
+                         TVarDecl(n, ty, init, _) -> if may_hold_pointer(cx, ty) then kept_in(bt, n, init, "")
+                         _ -> ())
+
+    while bt.changed
+        bt.changed = false
+        walk_block_stmts(f.body, walk)
+
+    bt.checking = true
+    walk_block_stmts(f.body, walk)
+end check_blocks
+
+private block_expr_event(bt: &BlockTrack, e: TExpr)
+    *e.kind match
+        TStore(place, v, _, _) -> block_store(bt, place, v)
+        TCall(name, args, _, _) ->
+            for j in 0..<args.len()
+                for item in keeps_of(bt.cx, name, j).locs
+                    kept_by_call(bt, args, j, item.loc, s"'${shown_name(bt.cx.an, name)}'")
+        TCallPtr(callee, args, _, _) ->
+            for j in 0..<args.len()
+                for item in pointer_keeps(bt.cx, callee, j)
+                    kept_by_call(bt, args, j, item.1.loc, "the call")
+        _ -> ()
+end block_expr_event
+
+private kept_by_call(bt: &BlockTrack, args: Buf[TExpr], j: usize, callee_loc: string, by: string)
+    val arg = args.at(j)
+
+    if !may_hold_pointer(bt.cx, texpr_type(arg)) then return
+
+    val loc = translate_loc(bt.org, args, callee_loc)
+
+    if loc.starts_with("l:") then kept_in(bt, local_of(loc), arg, by)
+end kept_by_call
+
+private block_store(bt: &BlockTrack, place: TExpr, v: TExpr)
+    if !may_hold_pointer(bt.cx, texpr_type(v)) then return
+
+    local_root(bt.refs, place) match
+        Some(n) -> kept_in(bt, n, v, "")
+        None ->
+            val loc = place_loc(bt.org, place)
+
+            if loc.starts_with("l:") then kept_in(bt, local_of(loc), v, "")
+end block_store
+
+// `v` is kept in the local `holder` -- by a store, or by `by`, a callee that stores it there.
+private kept_in(bt: &BlockTrack, holder: string, v: TExpr, by: string)
+    val home = bt.sc.home_of(holder)
+
+    if home < 0 then return
+
+    var roots: Buf[string] = buf()
+
+    roots_of(bt, v, &roots)
+
+    for r in roots
+        if bt.checking
+            if bt.sc.ends_within(bt.sc.home_of(r), home)
+                refuse_kept(bt, holder, r, v, by)
+                return
+            end if
+        else
+            hold(bt, holder, r)
+        end if
+end kept_in
+
+private hold(bt: &BlockTrack, holder: string, r: string)
+    bt.held.get(holder) match
+        Some(list) ->
+            for x in list
+                if x == r then return
+
+            var more = list
+
+            more.push(r)
+            bt.held.put(holder, more)
+        None ->
+            var list: Buf[string] = buf()
+
+            list.push(r)
+            bt.held.put(holder, list)
+
+    bt.changed = true
+end hold
+
+private refuse_kept(bt: &BlockTrack, holder: string, r: string, kept: TExpr, by: string)
+    val v = carrier(bt, kept, r)
+    val block = bt.sc.blocks.at(usize(bt.sc.home_of(r))).said
+    val local = shown_local(r)
+    val direct = *v.kind match
+        TAddrOf(place, _) -> frame_root_of(bt.refs, place).is_some()
+        _ -> false
+
+    val what = if direct then "is the address of" else "holds the address of"
+    val keeps = if by == "" then s"it is kept in '${shown_local(holder)}'" else s"$by keeps it in '${shown_local(holder)}'"
+
+    bt.faults.items.push((bt.scope, v.span,
+        s"'${value_text(bt.scope, v)}' $what '$local', a local of $block, and $keeps, which outlives " +
+        s"that block — keep the value itself, or declare '$local' where '${shown_local(holder)}' is declared"))
+end refuse_kept
+
+// **What a refusal points at is the expression that yields the address**, not the block or branch it
+// is yielded out of: `&t` at the end of a nested block, the `break &u` of a loop.
+private carrier(bt: &BlockTrack, v: TExpr, r: string) -> TExpr
+    var arms: Buf[TExpr] = buf()
+
+    *v.kind match
+        TBlockExpr(b) -> if b.result.is_some() then arms.push(b.result.unwrap())
+        TIf(_, then_block, else_block, _) ->
+            if then_block.result.is_some() then arms.push(then_block.result.unwrap())
+            if else_block.is_some() && else_block.unwrap().result.is_some() then arms.push(else_block.unwrap().result.unwrap())
+        TMatch(_, arms_of, _) ->
+            for arm in arms_of
+                if arm.body.result.is_some() then arms.push(arm.body.result.unwrap())
+        TLoop(body, _) ->
+            val into = &arms
+
+            walk_stmts(body, stmt_walk(false, s -> s match
+                TBreak(value, _) -> if value.is_some() then into.push(value.unwrap())
+                _ -> ()))
+        TSeq(exprs) -> if !exprs.is_empty() then arms.push(exprs.at(exprs.len() - 1))
+        _ -> ()
+
+    for x in arms
+        var found: Buf[string] = buf()
+
+        roots_of(bt, x, &found)
+
+        for f in found
+            if f == r then return carrier(bt, x, r)
+    end for
+
+    v
+end carrier
+
+// A local as the reader wrote it: a shadowing declaration's own name carries a `.N` the reader never
+// wrote.
+private shown_local(name: string) -> string = name.index_of(".") match
+    Some(at) -> name[0..<at]
+    None -> name
+
+// The block locals whose addresses a value is, or is built around: through a local that holds one, a
+// struct, a variant, a closure's environment, a box, a branch that yields one, a call that answers one.
+private roots_of(bt: &BlockTrack, e: TExpr, out: *Buf[string])
+    *e.kind match
+        TAddrOf(place, _) ->
+            frame_root_of(bt.refs, place) match
+                Some(root) -> if bt.sc.home_of(root.0) > 0 then add_root(out, root.0)
+                None -> ()
+        TLoad(n, ty) ->
+            if !may_hold_pointer(bt.cx, ty) then return
+
+            bt.held.get(n) match
+                Some(list) ->
+                    for r in list
+                        add_root(out, r)
+                None -> ()
+        TStructNew(_, args) -> if may_hold_pointer(bt.cx, texpr_type(e)) then roots_of_all(bt, args, out)
+        TEnumNew(_, _, args) -> if may_hold_pointer(bt.cx, texpr_type(e)) then roots_of_all(bt, args, out)
+        TArrayLit(elems, _) -> if may_hold_pointer(bt.cx, texpr_type(e)) then roots_of_all(bt, elems, out)
+        TBox(v, _) -> roots_of(bt, v, out)
+        TErase(v, _, _) -> roots_of(bt, v, out)
+        TCast(v, ty) -> if may_hold_pointer(bt.cx, ty) then roots_of(bt, v, out)
+        TField(r, _, ty) -> if may_hold_pointer(bt.cx, ty) then roots_of(bt, r, out)
+        TSeq(exprs) -> if !exprs.is_empty() then roots_of(bt, exprs.at(exprs.len() - 1), out)
+        TBlockExpr(b) -> roots_of_block(bt, b, out)
+        TIf(_, then_block, else_block, _) ->
+            roots_of_block(bt, then_block, out)
+
+            if else_block.is_some() then roots_of_block(bt, else_block.unwrap(), out)
+        TMatch(_, arms, _) ->
+            for arm in arms
+                roots_of_block(bt, arm.body, out)
+        TLoop(body, _) ->
+            // A loop yields what a `break` hands out of it.
+            walk_stmts(body, stmt_walk(false, s -> s match
+                TBreak(value, _) -> if value.is_some() then roots_of(bt, value.unwrap(), out)
+                _ -> ()))
+        TCall(name, args, ty, _) ->
+            if !may_hold_pointer(bt.cx, ty) then return
+
+            for i in 0..<args.len()
+                if answers_arg(bt.cx, name, args, i, ty, false) then roots_of(bt, args.at(i), out)
+        _ -> ()
+end roots_of
+
+private roots_of_all(bt: &BlockTrack, es: Buf[TExpr], out: *Buf[string])
+    for x in es
+        roots_of(bt, x, out)
+end roots_of_all
+
+private roots_of_block(bt: &BlockTrack, b: TBlock, out: *Buf[string]) =
+    if b.result.is_some() then roots_of(bt, b.result.unwrap(), out)
+
+private add_root(out: *Buf[string], r: string)
+    for x in out
+        if x == r then return
+
+    out.push(r)
+end add_root
