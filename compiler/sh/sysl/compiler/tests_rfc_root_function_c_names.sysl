@@ -1,0 +1,292 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.{cstring, replace_all}
+
+// A root module's function has no module to carry into its key, so its key is the bare name -- and
+// emitted under it, `write(p: *int)` in an entry file WAS libc's `write`: beside the `declare` the
+// compiler writes for its own printing an invalid redefinition, and where nothing in the module
+// declared it, the definition every other object's call resolved to at the link (an archive's
+// `__aeabi_memcpy` reached a program's `memcpy(n: int)`). A root function whose name is a C symbol the
+// program meets -- an extern or export of its own, a name the compiler declares, a routine the
+// optimizer may call, the runtime's `sysl_`/`__` -- is now laid down under a name C cannot spell
+// (`write$$sysl`); any other root function keeps its bare name; a symbol C reaches is what `@export`
+// publishes.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private rfc_ready() -> bool = std_root().is_ok() && clang_available()
+
+private rfc_root(files: []const (string, string)) -> string
+    val root = replace_all(make_temp_dir("sysl-rfc").unwrap(), "//", "/")
+
+    for i in 0..<files.len
+        val dir = files[i].0.last_index_of("/")
+
+        if dir.is_some() then make_dir_all(s"$root/${files[i].0[0..<dir.unwrap()]}").unwrap()
+
+        write_text(s"$root/${files[i].0}", files[i].1).unwrap()
+
+    root
+end rfc_root
+
+// What the program these files make prints, or the report it was refused with.
+private rfc_ran(files: []const (string, string)) -> string
+    val root = rfc_root(files)
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            val said = replace_all(failure_text(why), s"$root/", "")
+
+            remove_dir_all(root).unwrap_or(())
+            return said
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end rfc_ran
+
+private rfc_one(text: string) -> string = rfc_ran([("main.sysl", text)])
+
+private rfc_ir(text: string) -> string
+    val root = rfc_root([("main.sysl", text)])
+
+    val out = emit_llvm_text(root, None) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> if made.report.is_empty() then made.text else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end rfc_ir
+
+private extern "setenv" rfc_c_setenv(name: *u8, value: *u8, overwrite: int) -> int
+private extern "unsetenv" rfc_c_unsetenv(name: *u8) -> int
+
+// Eight functions named for libc's, each called and each answering something of its own.
+private rfc_libc_names() -> string = raw"""
+    write(s: string) -> usize = s.len
+    read() -> int = 2
+    malloc(n: int) -> int = n * 3
+    free(n: int) -> int = n + 4
+    exit(n: int) -> int = n + 5
+    memcpy(a: int, b: int) -> int = a + b
+    abort() -> string = "not aborted"
+    putchar(c: int) -> int = c + 1
+
+    print(write("abc"), read(), malloc(2), free(1), exit(0), memcpy(1, 2), abort(), putchar(64))
+    """
+
+private val rfc_libc_said: string = "3 2 6 5 5 3 not aborted 65\n"
+
+// -- the entry file -------------------------------------------------------------------------------
+
+@test("an entry-file function named write builds and runs beside the compiler's own write")
+rfc_the_reported_write()
+    if !rfc_ready() then return
+
+    assert_eq(rfc_one("write(p: *int)\n    *p = 1\n\nvar x = 0\n\nwrite(&x)\nprint(x)\n"), "1\n")
+
+@test("entry-file functions named write, read, malloc, free, exit, memcpy, abort and putchar each run as the program's")
+rfc_eight_libc_names_in_the_entry_file()
+    if !rfc_ready() then return
+
+    assert_eq(rfc_one(rfc_libc_names()), rfc_libc_said)
+
+@test("the program's print still prints, a counted heap is still counted, and an exit still exits")
+rfc_the_runtime_still_reaches_libc()
+    if !rfc_ready() then return
+
+    // The library's own `malloc`, `free` and `exit` are libc's whatever the root calls its functions:
+    // the strings are allocated and freed, and the library's `extern exit` -- reached through `sysl`,
+    // the root's `exit` shadowing it -- ends the run.
+    val text = "malloc(n: int) -> int = n\nfree(n: int) -> int = n\n" +
+        "exit(n: int) -> int = n\n\nval s = \"ab\".to_string() + \"cd\"\n" +
+        "print(s, malloc(1), free(2), exit(3))\nsysl.exit(0)\nprint(\"unreached\")\n"
+
+    assert_eq(rfc_one(text), "abcd 1 2 3\n")
+
+@test("the emitted module defines the root's write under a name of the compiler's, and no @write at all")
+rfc_the_definition_is_not_the_c_symbol()
+    if !rfc_ready() then return
+
+    val ir = rfc_ir("write(n: int) -> int = n + 1\n\nprint(write(1))\n")
+
+    assert(ir.contains("define i32 @write$$sysl("), ir)
+    assert(!ir.contains("define i32 @write("), ir)
+
+@test("a root function whose name C does not meet keeps its bare name, and one named for an extern of the program's does not")
+rfc_only_a_met_name_is_displaced()
+    if !rfc_ready() then return
+
+    val text = "extern \"labs\" c_labs(n: i64) -> i64\n\nwalk(n: int) -> int = n + 1\n" +
+        "sysl_helper(n: int) -> int = n + 2\nlabs(n: i64) -> i64 = n\n\n" +
+        "print(walk(1), sysl_helper(1), labs(-3), c_labs(-3))\n"
+    val ir = rfc_ir(text)
+
+    assert(ir.contains("define i32 @walk("), ir)
+    assert(ir.contains("define i32 @sysl_helper$$sysl("), ir)
+    assert(ir.contains("define i64 @labs$$sysl("), ir)
+    assert(ir.contains("declare i64 @labs("), ir)
+    assert_eq(rfc_one(text), "2 3 -3 3\n")
+
+@test("a root function named for a runtime routine of the compiler's own builds beside it")
+rfc_a_runtime_name()
+    if !rfc_ready() then return
+
+    val text = "sysl_stdout_write(n: int) -> int = n * 2\n\nprint(sysl_stdout_write(21))\n"
+
+    assert_eq(rfc_one(text), "42\n")
+
+@test("a generic root function and a nested one named for libc run as the program's")
+rfc_generic_and_nested()
+    if !rfc_ready() then return
+
+    val text = "free[T](x: T) -> T = x\n\nouter() -> int\n    read(n: int) -> int = n * 7\n" +
+        "    read(6)\n\nprint(free(1), free(\"s\"), outer())\n"
+
+    assert_eq(rfc_one(text), "1 s 42\n")
+
+@test("a root function named for libc is the one its address names to C")
+rfc_the_address_of_a_root_function()
+    if !rfc_ready() then return
+
+    val text = raw"""
+        import sysl.raw.ptr_cast
+
+        extern qsort(base: *u8, n: usize, size: usize, cmp: *extern(*u8, *u8) -> i32)
+
+        strcmp(a: *u8, b: *u8) -> i32
+            var pa: *i32 = ptr_cast(a)
+            var pb: *i32 = ptr_cast(b)
+
+            *pb - *pa
+
+        var xs = [10, 30, 20]
+
+        qsort(ptr_cast(&xs[0]), 3, 4, &strcmp)
+        print(xs[0], xs[1], xs[2])
+        """
+
+    assert_eq(rfc_one(text), "30 20 10\n")
+
+// The forms yield to a user's name, and the root's `print` is printed through a module's form.
+@test("a user print and a user str in the entry file are the program's")
+rfc_print_and_str_are_the_users()
+    if !rfc_ready() then return
+
+    val files = [
+        ("main.sysl", "import m\n\nprint(n: int) -> int = n * 2\n" +
+                      "str(n: int) -> string = \"<\" + n.to_string() + \">\"\n\nm.say(print(4), str(5))\n"),
+        ("m/m.sysl", "module m\n\nsay(n: int, s: string) = print(n, s)\n")]
+
+    assert_eq(rfc_ran(files), "8 <5>\n")
+
+// -- an export ------------------------------------------------------------------------------------
+
+@test("@export(\"write\") on a root function named write publishes write once and keeps the definition apart")
+rfc_an_exported_write()
+    if !rfc_ready() then return
+
+    val ir = rfc_ir("@export(\"write\")\nwrite(fd: i32, p: *u8, n: usize) -> isize = isize(n)\n\nprint(1)\n")
+
+    assert(ir.contains("define i64 @write(i32"), ir)
+    assert(ir.contains("@write$$sysl("), ir)
+    assert(!ir.contains("declare i64 @write("), ir)
+
+@test("a bare @export on a root function named for libc publishes that name, and the program runs")
+rfc_a_bare_export_of_a_libc_name()
+    if !rfc_ready() then return
+
+    val text = "@export\nlabs(n: i64) -> i64 = n + 1\n\nprint(labs(-1))\n"
+
+    assert_eq(rfc_one(text), "0\n")
+    assert(rfc_ir(text).contains("define i64 @labs(i64"), rfc_ir(text))
+
+// -- a module, a --lib root, and units --------------------------------------------------------------
+
+@test("a module's write and the entry file's write are two functions, and both run")
+rfc_a_module_and_the_entry_file()
+    if !rfc_ready() then return
+
+    val files = [
+        ("main.sysl", "import m\n\nwrite(n: int) -> int = n + 1\nmalloc(n: int) -> int = n + 2\n\n" +
+                      "print(write(1), malloc(1), m.write(1), m.malloc(1))\n"),
+        ("m/m.sysl", "module m\n\nwrite(n: int) -> int = n + 100\nmalloc(n: int) -> int = n + 200\n")]
+
+    assert_eq(rfc_ran(files), "2 3 101 201\n")
+
+@test("a --lib root defining write is reached beside the program's own write")
+rfc_a_lib_root_defining_write()
+    if !rfc_ready() then return
+
+    val lib = lbr_tree(lbr_one("demo/lib.sysl", "module demo\n\nwrite(n: int) -> int = n * 10\n"))
+    val prog = lbr_program("import demo\n\nwrite(n: int) -> int = n + 1\n\nprint(write(1), demo.write(2))\n")
+    val said = lbr_run(prog, [lib])
+
+    lbr_drop([lib, prog])
+    assert_eq(said, "2 20\n")
+
+@test("the eight libc names run the same built as four codegen units")
+rfc_four_units()
+    if !rfc_ready() then return
+
+    val k = cstring("SYSL_CODEGEN_UNITS")
+    val v = cstring("4")
+
+    rfc_c_setenv(k.ptr, v.ptr, 1)
+
+    val said = rfc_one(rfc_libc_names())
+
+    rfc_c_unsetenv(k.ptr)
+    assert_eq(said, rfc_libc_said)
+
+// -- a test build ---------------------------------------------------------------------------------
+
+@test("a test build whose tests, setup and helpers are named for libc runs them")
+rfc_a_test_build()
+    if !rfc_ready() then return
+
+    val root = rfc_root([
+        ("sysl.hocon", "package { name = \"rfc\" }\n"),
+        ("main.sysl", "write(n: int) -> int = n + 1\n\n@setup\nmalloc() = ()\n\n" +
+                      "@test(\"write is the program's\")\nfree() = assert(write(1) == 2)\n\n" +
+                      "@test(\"exit is a test\")\nexit() = assert(write(2) == 3)\n")])
+    val (code, out, err) = clx_ran(["sysl", "test", root])
+
+    remove_dir_all(root).unwrap_or(())
+    assert_eq(code, Fine, s"$out$err")
+    assert(out.contains("2 passed, 0 failed"), s"$out$err")
+
+// -- bare metal -----------------------------------------------------------------------------------
+
+@test("a thumb archive whose root defines memcpy and malloc leaves libc's undefined rather than defining them")
+rfc_a_thumb_archive()
+    if !rfc_ready() then return
+
+    val root = rfc_root([
+        ("sysl.hocon", "package { name = \"rfc\" }\n"),
+        ("main.sysl", "memcpy(n: int) -> int = n + 3\nmalloc(n: int) -> int = n + 1\n\n" +
+                      "@export(\"main\")\nstart() -> int = memcpy(1) + malloc(2)\n")])
+    val archive = s"$root/rfc.a"
+    val (code, out, err) = clx_ran(["sysl", "build-c", root, "--target", "thumb-freestanding-softfp",
+                                    "-o", archive])
+
+    assert_eq(code, Fine, s"$out$err")
+
+    val defined = capture("nm", ["--defined-only", archive], "", [], true) match
+        Err(_) -> ""
+        Ok(o) -> o.text
+
+    remove_dir_all(root).unwrap_or(())
+    assert(defined.contains(" T memcpy$$sysl"), defined)
+    assert(defined.contains(" T main"), defined)
+    assert(!defined.contains(" T memcpy\n"), defined)
+    assert(!defined.contains(" T malloc\n"), defined)
