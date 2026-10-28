@@ -121,6 +121,39 @@ language with no lifetimes, no borrow checker, and nothing to prove to a checker
 name the same object, which is the only question a bare address can answer, and there is no ordering
 on either.
 
+**References hash by address too**, for the same reason: a hash has to agree with `==`. So a `&T` or
+a `*T` is a `Hash` and an `Eq` for every `T` — one with no `Hash` of its own included — and a table
+keyed on references keys by **identity**. Two distinct objects holding equal values are two keys; the
+same object twice is one. That is what a hash-consing table wants, where a node is made once per
+distinct pair of children:
+
+```sysl
+import sysl.container.{Map, map}
+
+struct Node
+    level: int
+
+main()
+    val leaf: &Node = Node(0)
+    val twin: &Node = Node(0)
+    val made = map[(&Node, &Node), &Node]()
+
+    for k in [(leaf, leaf), (leaf, twin), (leaf, leaf)]
+        if !made.has(k) then made.put(k, Node(k.0.level + k.1.level + 1))
+
+    print(made.len(), made.get((leaf, leaf)).unwrap() == made.get((leaf, leaf)).unwrap())
+```
+
+```output
+2 true
+```
+
+The identity is what a **bound** gets: inside a `[K: Hash + Eq]` body standing at `&Node`, `k.hash()`
+and `k.eq(other)` are the address's, as `k == other` is. A member call written on a reference you
+named still reaches the referent's own (`r.hash()`, `r.eq(*s)`), the one level a member call sees
+through. To key by **value**, key on the value type — `Map[Node, V]` — or on a wrapper whose `Hash`
+and `Eq` read the fields.
+
 ### There is no allocation keyword
 
 A reference is made by writing an ordinary construction **where a `&T` is expected**. The expectation
