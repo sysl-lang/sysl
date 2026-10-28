@@ -39,26 +39,28 @@ trap() -> never = llvm_trap()
  * `Ring` all report through here, which is what makes `b[5]` on a three-element `Buf` say what
  * `a[5]` on a three-element array says.
  *
- * **What it cannot give is the caller's line.** An array's check is laid down at the subscript, so
- * it names where that was written; this one runs inside the container's member, and a member has no
- * way to learn where it was called from that a subscript could reach (a trait's `index` takes the
- * index and nothing else). The location is null, which is what an override is handed wherever a
- * build has none to give, and the message ends at the values.
+ * **It names the caller's line, as an array's check does.** It is `@track_caller`, and so is every
+ * member that reaches it -- `at`, `set`, `insert`, `remove` and the `Index` members that call them --
+ * so the location it reports is the subscript or the call the program wrote, handed down the chain
+ * (`reference/attributes.md § @track_caller`). A build that dropped locations hands down null, and
+ * the message ends at the values.
  *
  * Out of line and cold, so what a bounds-checked member keeps at the check is a compare and a
  * branch.
  */
 @noinline
 @cold
+@track_caller
 private[sysl] index_past(i: usize, n: usize) -> never
-    bounds_report(BoundsIndex, i, 0, n, null)
+    bounds_report(BoundsIndex, i, 0, n, __CALLER__)
     trap()
 
 /** The same report for an insertion, which may stand at the count itself and no further. */
 @noinline
 @cold
+@track_caller
 private[sysl] insert_past(i: usize, n: usize) -> never
-    bounds_report(BoundsInsertPastLength, i, 0, n, null)
+    bounds_report(BoundsInsertPastLength, i, 0, n, __CALLER__)
     trap()
 
 // The forms the two reports take, as `sysl_bounds_fail` numbers them -- the compiler's
@@ -71,15 +73,14 @@ private const BoundsInsertPastLength: u32 = 14
 // const char *at)`.
 private extern "sysl_bounds_fail" bounds_report(kind: u32, a: usize, b: usize, n: usize, at: *u8)
 
-// Where the caller was. Both take these and neither is ever given them: a default is evaluated at
-// the call, standing exactly where the argument would have been written (`reference/declarations.md
-// § Default parameters and named arguments`), so `__FILE__` and `__LINE__` written here report the
-// line that called `assert` rather than this line (`reference/lexical.md § Reserved identifiers`).
+// Where the caller was. Every assertion here is `@track_caller`, so the line it names is the one that
+// called it -- and where that call is itself in a `@track_caller` function, the line that called
+// THAT, which is how a program's own checking helper reports its caller's line rather than its own
+// (`reference/attributes.md § @track_caller`). `file` and `line` stay, empty, for a caller that has a
+// location of its own to name instead; given one, that is what is printed.
 //
-// **This is why `assert`'s message is now optional, and it used to be required.** The comment that
-// stood here said the message could not be defaulted "because the condition's source is not
-// available to print" -- true when it was written, and a workaround stated as a principle. A check
-// that names its own line does not need to be told in prose which check it was.
+// **This is why `assert`'s message is optional.** A check that names its own line does not need to
+// be told in prose which check it was.
 
 /** The location is **streamed** rather than interpolated, and that is not a style choice: an
  * f-string builds a string, and building one makes heap storage, which would put `panic` and
@@ -88,25 +89,19 @@ private extern "sysl_bounds_fail" bounds_report(kind: u32, a: usize, b: usize, n
  * most, so it is composed out of `prints` and `printi`, each of which goes straight to `putbytes`.
  * Caught by the `@no_alloc` test that already existed.
  */
-panic(msg: string, file: string = __FILE__, line: long = __LINE__) -> never
+@track_caller
+panic(msg: string, file: string = "", line: long = 0) -> never
     prints("panic: ")
     prints(msg)
-    prints(" (")
-    prints(file)
-    prints(":")
-    printi(line)
-    prints(")\n")
-    exit(1)
+    report_tail(file, line)
 
 /** The condition is checked and nothing else is: a false one names where it was written, and the
  * message if it was given one.
  *
- * **`file` and `line` are passed on explicitly**, which is the one thing about this that is easy to
- * get wrong: letting `panic` fill its own defaults would report *this* line, in this file, for every
- * assertion in every program -- the call that fills them would be the one three lines down rather
- * than the reader's. Forwarding them is how a location travels through a helper.
+ * `panic` is tracked as this is, so the location travels to it with nothing written here.
  */
-assert(cond: bool, msg: string = "", file: string = __FILE__, line: long = __LINE__)
+@track_caller
+assert(cond: bool, msg: string = "", file: string = "", line: long = 0)
     if !cond then
         if msg.len == 0 then panic("assertion failed", file, line)
         else panic(msg, file, line)
@@ -136,13 +131,31 @@ private[sysl] report_head(msg: string)
         prints(msg)
         prints(": ")
 
+//
+// The tail names `file:line` where the caller gave one, and otherwise the line that called the
+// tracked assertion -- nothing at all where the build laid no location down.
+@track_caller
 private[sysl] report_tail(file: string, line: long) -> never
-    prints(" (")
-    prints(file)
-    prints(":")
-    printi(line)
-    prints(")\n")
+    if file.len > 0
+        prints(" (")
+        prints(file)
+        prints(":")
+        printi(line)
+        prints(")")
+    else
+        val loc = caller_location()
+
+        if loc.known()
+            prints(" (")
+            putbytes(loc.file_bytes())
+            prints(":")
+            printu(ulong(loc.line()))
+            prints(")")
+    end if
+
+    prints("\n")
     exit(1)
+end report_tail
 
 // Each side of a failed comparison is shown through its `Debug`, which every type has: a string
 // keeps its quotes, so `got "1", want 1` cannot read as two equal values.
@@ -151,8 +164,8 @@ private[sysl] show[T: Debug](v: T) = v.debug(stdout(), FormatSpec(0, -1, false))
 /** `got` and `want` in that order, which is Go's and the order a failure is read in: what happened,
  * then what was meant to.
  */
-assert_eq[T: Eq + Debug](got: T, want: T, msg: string = "", file: string = __FILE__,
-                         line: long = __LINE__)
+@track_caller
+assert_eq[T: Eq + Debug](got: T, want: T, msg: string = "", file: string = "", line: long = 0)
     if got != want then
         report_head(msg)
         prints("got ")
@@ -165,8 +178,9 @@ assert_eq[T: Eq + Debug](got: T, want: T, msg: string = "", file: string = __FIL
  * sends its reader to find out where, and finding out where is a loop nobody wants to write at each
  * call. Length first, since a length mismatch explains every index after the shorter one.
  */
+@track_caller
 assert_slice_eq[T: Eq + Debug](got: []const T, want: []const T, msg: string = "",
-                               file: string = __FILE__, line: long = __LINE__)
+                               file: string = "", line: long = 0)
     if got.len != want.len then
         report_head(msg)
         prints("got ")

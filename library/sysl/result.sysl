@@ -26,20 +26,21 @@ enum Result[T, E]
     /** The success's value, or -- on an `Err` -- a panic that names the error and prints where it
      * came from (`sysl.debug`'s error return trace) before the program exits with status 1.
      */
+    @track_caller
     unwrap(self) -> T = self match
         Ok(v) -> v
         Err(_) -> failed_on_err(self, "unwrap of an Err value")
 
     /** `unwrap` with the panic line saying `msg`, the error after it. */
+    @track_caller
     expect(self, msg: string) -> T = self match
         Ok(v) -> v
         Err(_) -> failed_on_err(self, msg)
 
+    @track_caller
     unwrap_err(self) -> E = self match
         Err(e) -> e
-        Ok(_) ->
-            print("panic: unwrap_err of an Ok value")
-            exit(1)
+        Ok(_) -> unwrap_failed("unwrap_err of an Ok value")
 
     /** The failure computed rather than passed, for a default that costs something to make. */
     unwrap_or_else(self, f: E -> T) -> T = self match
@@ -254,6 +255,10 @@ end test_result
 // while every type has a `Debug` that writes straight into the stream. The result is taken whole and
 // matched here, so the members that call this bind nothing in their `Err` arm and keep their `Ok`
 // arm a single copy.
+//
+// **It names the line that called `unwrap`**, after the error: it is `@track_caller`, as the members
+// that call it are (`reference/attributes.md § @track_caller`).
+@track_caller
 private failed_on_err[T, E](r: Result[T, E], said: string) -> never
     prints("panic: ")
     prints(said)
@@ -265,6 +270,7 @@ private failed_on_err[T, E](r: Result[T, E], said: string) -> never
                 e.debug(stdout(), FormatSpec(0, -1, false))
         Ok(_) -> ()
 
+    print_location(caller_location())
     prints("\n")
 
     // Standard output first, so the panic line comes out before the trace under it. A board has no
