@@ -64,8 +64,9 @@ private lowered_beside_library(text: string, symbol: string) -> string
     val kept = prune(strip_tests(whole), program_own(units))
     val fs = func_texts(ir_print_module(codegen_with_gaps(kept, host_target(), promotions).0))
 
+    // A root function is laid down under `root_symbol` of its name; a caller names it as written.
     for item in fs
-        if item.0 == symbol then return item.1
+        if item.0 == symbol || item.0 == root_symbol(symbol) then return item.1
 
     s"no function named '$symbol'"
 end lowered_beside_library
@@ -83,7 +84,7 @@ end first_refusal
 @test("a parameter is copied into a slot of its own at entry, and the body reads the slot")
 a_frame_copies_its_parameters()
     assert_eq(lowered("add(a: int, b: int) -> int = a + b\n", "add"),
-              "define i32 @add(i32 %a.param, i32 %b.param) {\n" +
+              "define i32 @add$$sysl(i32 %a.param, i32 %b.param) {\n" +
               "entry:\n" +
               "  %a.addr = alloca i32\n" +
               "  %b.addr = alloca i32\n" +
@@ -99,7 +100,7 @@ end a_frame_copies_its_parameters
 @test("a zero-sized parameter takes no slot and is not in the signature")
 a_zero_sized_parameter_is_not_an_argument()
     assert_eq(lowered("f(u: unit, n: int) -> int = n\n", "f"),
-              "define i32 @f(i32 %n.param) {\n" +
+              "define i32 @f$$sysl(i32 %n.param) {\n" +
               "entry:\n" +
               "  %n.addr = alloca i32\n" +
               "  store i32 %n.param, ptr %n.addr\n" +
@@ -111,7 +112,7 @@ end a_zero_sized_parameter_is_not_an_argument
 @test("a file-private function is emitted under internal linkage")
 a_private_definition_is_internal()
     assert_eq(lowered("private p() -> int = 1\n", "p"),
-              "define internal i32 @p() {\n" +
+              "define internal i32 @p$$sysl() {\n" +
               "entry:\n" +
               "  ret i32 1\n" +
               "}\n")
@@ -122,7 +123,7 @@ end a_private_definition_is_internal
 @test("integer division traps on a zero divisor and on the one overflow a signed quotient has")
 a_signed_division_is_guarded()
     assert_eq(lowered("d(a: int, b: int) -> int = a / b\n", "d"),
-              "define i32 @d(i32 %a.param, i32 %b.param) {\n" +
+              "define i32 @d$$sysl(i32 %a.param, i32 %b.param) {\n" +
               "entry:\n" +
               "  %a.addr = alloca i32\n" +
               "  %b.addr = alloca i32\n" +
@@ -153,7 +154,7 @@ end a_signed_division_is_guarded
 @test("a shift is clamped so that every amount means something")
 a_shift_is_bounded()
     assert_eq(lowered("s(a: uint, n: uint) -> uint = a << n\n", "s"),
-              "define i32 @s(i32 %a.param, i32 %n.param) {\n" +
+              "define i32 @s$$sysl(i32 %a.param, i32 %n.param) {\n" +
               "entry:\n" +
               "  %a.addr = alloca i32\n" +
               "  %n.addr = alloca i32\n" +
@@ -172,7 +173,7 @@ end a_shift_is_bounded
 @test("'&&' does not evaluate its right operand unless it must")
 a_short_circuit_branches()
     assert_eq(lowered("f(a: bool, b: bool) -> bool = a && b\n", "f"),
-              "define zeroext i1 @f(i1 %a.param, i1 %b.param) {\n" +
+              "define zeroext i1 @f$$sysl(i1 %a.param, i1 %b.param) {\n" +
               "entry:\n" +
               "  %a.addr = alloca i1\n" +
               "  %b.addr = alloca i1\n" +
@@ -197,7 +198,7 @@ end a_short_circuit_branches
 @test("an element is reached through a bounds check the index is widened for")
 an_index_is_checked()
     assert_eq(lowered("ix(xs: [3]int, i: usize) -> int = xs[i]\n", "ix"),
-              "define i32 @ix([3 x i32] %xs.param, i64 %i.param) {\n" +
+              "define i32 @ix$$sysl([3 x i32] %xs.param, i64 %i.param) {\n" +
               "entry:\n" +
               "  %xs.addr = alloca [3 x i32]\n" +
               "  %i.addr = alloca i64\n" +
@@ -220,7 +221,7 @@ end an_index_is_checked
 @test("a field is lifted out of the receiver's value where the receiver is one")
 a_field_is_extracted()
     assert_eq(lowered("struct P\n    x: int\n    y: int\nend P\n\nfld(q: P) -> int = q.y\n", "fld"),
-              "define i32 @fld(%struct.P %q.param) {\n" +
+              "define i32 @fld$$sysl(%struct.P %q.param) {\n" +
               "entry:\n" +
               "  %q.addr = alloca %struct.P\n" +
               "  store %struct.P %q.param, ptr %q.addr\n" +
@@ -236,7 +237,7 @@ end a_field_is_extracted
 a_counted_loop()
     assert_eq(lowered("f(n: int) -> int\n    var t = 0\n\n    for i in 0..<n\n        t += i\n\n" +
                       "    t\n", "f"),
-              "define i32 @f(i32 %n.param) {\n" +
+              "define i32 @f$$sysl(i32 %n.param) {\n" +
               "entry:\n" +
               "  %n.addr = alloca i32\n" +
               "  %t.addr = alloca i32\n" +
@@ -271,7 +272,7 @@ end a_counted_loop
 a_match_on_an_enum()
     assert_eq(lowered("enum C\n    Red\n    Green\nend C\n\nm(c: C) -> int = c match\n" +
                       "    C.Red -> 1\n    C.Green -> 2\n", "m"),
-              "define i32 @m(i32 %c.param) {\n" +
+              "define i32 @m$$sysl(i32 %c.param) {\n" +
               "entry:\n" +
               "  %c.addr = alloca i32\n" +
               "  %t2 = alloca i32\n" +
@@ -376,7 +377,7 @@ end a_membership_test_compares_before_it_folds
 a_tail_call_is_a_jump()
     assert_eq(lowered("count(n: int, acc: int) -> int\n    if n == 0 then return acc\n\n" +
                       "    count(n - 1, acc + n)\n", "count"),
-              "define i32 @count(i32 %n.param, i32 %acc.param) {\n" +
+              "define i32 @count$$sysl(i32 %n.param, i32 %acc.param) {\n" +
               "entry:\n" +
               "  %n.addr = alloca i32\n" +
               "  %acc.addr = alloca i32\n" +

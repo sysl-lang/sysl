@@ -6,14 +6,13 @@ import sysl.process.capture
 import sysl.text.{cstring, replace_all}
 
 // A root module's function has no module to carry into its key, so its key is the bare name -- and
-// emitted under it, `write(p: *int)` in an entry file WAS libc's `write`: beside the `declare` the
-// compiler writes for its own printing an invalid redefinition, and where nothing in the module
-// declared it, the definition every other object's call resolved to at the link (an archive's
-// `__aeabi_memcpy` reached a program's `memcpy(n: int)`). A root function whose name is a C symbol the
-// program meets -- an extern or export of its own, a name the compiler declares, a routine the
-// optimizer may call, the runtime's `sysl_`/`__` -- is now laid down under a name C cannot spell
-// (`write$$sysl`); any other root function keeps its bare name; a symbol C reaches is what `@export`
-// publishes.
+// emitted under it, `write(p: *int)` in an entry file would be libc's `write`: beside the `declare`
+// the compiler writes for its own printing an invalid redefinition, and where nothing in the module
+// declared it, the definition every other object's call resolves to at the link (an archive's
+// `__aeabi_memcpy` reaching a program's `memcpy(n: int)`, a package's C calling `read` reaching the
+// program's). So EVERY root function is laid down under a name C cannot spell (`write$$sysl`), as
+// Rust mangles every function, and the one C name a sysl function has is what `@export` publishes.
+// A method, an instance and a closure already carry a `.` or a `$` and keep their names.
 
 // -- the harness ----------------------------------------------------------------------------------
 
@@ -122,20 +121,81 @@ rfc_the_definition_is_not_the_c_symbol()
     assert(ir.contains("define i32 @write$$sysl("), ir)
     assert(!ir.contains("define i32 @write("), ir)
 
-@test("a root function whose name C does not meet keeps its bare name, and one named for an extern of the program's does not")
-rfc_only_a_met_name_is_displaced()
+@test("every root function is laid down under a name C cannot spell, whether or not the program meets that name")
+rfc_every_root_function_is_displaced()
     if !rfc_ready() then return
 
     val text = "extern \"labs\" c_labs(n: i64) -> i64\n\nwalk(n: int) -> int = n + 1\n" +
-        "sysl_helper(n: int) -> int = n + 2\nlabs(n: i64) -> i64 = n\n\n" +
-        "print(walk(1), sysl_helper(1), labs(-3), c_labs(-3))\n"
+        "sysl_helper(n: int) -> int = n + 2\nlabs(n: i64) -> i64 = n\nlog(n: int) -> int = n + 3\n" +
+        "printf(n: int) -> int = n + 4\n\nprint(walk(1), sysl_helper(1), labs(-3), c_labs(-3), log(1), printf(1))\n"
     val ir = rfc_ir(text)
 
-    assert(ir.contains("define i32 @walk("), ir)
+    assert(ir.contains("define i32 @walk$$sysl("), ir)
     assert(ir.contains("define i32 @sysl_helper$$sysl("), ir)
     assert(ir.contains("define i64 @labs$$sysl("), ir)
+    assert(ir.contains("define i32 @log$$sysl("), ir)
+    assert(ir.contains("define i32 @printf$$sysl("), ir)
     assert(ir.contains("declare i64 @labs("), ir)
-    assert_eq(rfc_one(text), "2 3 -3 3\n")
+    assert(!ir.contains("define i32 @walk("), ir)
+    assert_eq(rfc_one(text), "2 3 -3 3 4 5\n")
+
+// The hole the rule closes: C the compiler never reads, calling libc by a name the program also uses.
+// Laid down under its bare name, the program's `read` was what the C's call resolved to at the link,
+// and the shim answered `fd + 90`; now it reaches libc, whose read of /dev/null is 0 bytes.
+@test("a package's C calling read reaches libc's, not the program's own read")
+rfc_c_of_the_package_calling_read()
+    if !rfc_ready() then return
+
+    val shim = "#include <fcntl.h>\n#include <unistd.h>\n" +
+        "int shim_read(void) { char b[4]; int fd = open(\"/dev/null\", O_RDONLY);\n" +
+        "  long n = read(fd, b, 4); close(fd); return (int)n; }\n"
+    val files = [
+        ("main.sysl", "extern shim_read() -> i32\n\nread(n: int) -> int = n + 90\n\nprint(shim_read(), read(1))\n"),
+        ("shim.c", shim)]
+
+    assert_eq(rfc_ran(files), "0 91\n")
+
+// The other half of the rule: C reaches a sysl function by what `@export` publishes, and only by it.
+@test("a package's C reaches a root function through its export, and the export may share the name")
+rfc_c_of_the_package_calling_an_export()
+    if !rfc_ready() then return
+
+    val files = [
+        ("main.sysl", "extern shim_twice(n: i32) -> i32\n\n@export\ntriple(n: i32) -> i32 = n * 3\n\n" +
+                      "print(shim_twice(5), triple(2))\n"),
+        ("shim.c", "int triple(int);\nint shim_twice(int n) { return triple(n) * 2; }\n")]
+
+    assert_eq(rfc_ran(files), "30 6\n")
+
+@test("a root function named like another's @export is a different function, and both run")
+rfc_named_like_another_export()
+    if !rfc_ready() then return
+
+    val text = "@export(\"walk\")\nstride(n: int) -> int = n * 10\n\nwalk(n: int) -> int = n + 1\n\n" +
+        "print(stride(2), walk(2))\n"
+    val ir = rfc_ir(text)
+
+    assert(ir.contains("define i32 @walk$$sysl("), ir)
+    assert(ir.contains("define i32 @stride$$sysl("), ir)
+    assert(ir.contains("define i32 @walk(i32"), ir)
+    assert_eq(rfc_one(text), "20 3\n")
+
+@test("a method, a generic instance, a closure and a nested function keep the names they had")
+rfc_members_and_instances_keep_their_names()
+    if !rfc_ready() then return
+
+    val text = "struct P\n    x: int\n\nimpl P\n    read(self) -> int = self.x\n\n" +
+        "free[T](x: T) -> T = x\n\napply(f: (int) -> int) -> int = f(2)\n\n" +
+        "outer() -> int\n    write(n: int) -> int = n * 7\n    write(6)\n\n" +
+        "val p = P(4)\nprint(p.read(), free(1), apply((n) -> n + 1), outer())\n"
+    val ir = rfc_ir(text)
+
+    assert(ir.contains("define i32 @P.read("), ir)
+    assert(ir.contains("define i32 @free.int("), ir)
+    assert(ir.contains("@apply.$closure0("), ir)
+    assert(ir.contains("define i32 @outer$$sysl("), ir)
+    assert(!ir.contains("define i32 @write("), ir)
+    assert_eq(rfc_one(text), "4 1 3 42\n")
 
 @test("a root function named for a runtime routine of the compiler's own builds beside it")
 rfc_a_runtime_name()
@@ -287,6 +347,31 @@ rfc_a_thumb_archive()
 
     remove_dir_all(root).unwrap_or(())
     assert(defined.contains(" T memcpy$$sysl"), defined)
+    assert(defined.contains(" T malloc$$sysl"), defined)
     assert(defined.contains(" T main"), defined)
     assert(!defined.contains(" T memcpy\n"), defined)
     assert(!defined.contains(" T malloc\n"), defined)
+
+@test("a host archive defines a root read under the compiler's name and publishes only its export")
+rfc_a_host_archive()
+    if !rfc_ready() then return
+
+    val root = rfc_root([
+        ("sysl.hocon", "package { name = \"rfc\" }\n"),
+        ("main.sysl", "read(n: int) -> int = n + 3\nwalk(n: int) -> int = n + 1\n\n" +
+                      "@export(\"rfc_start\")\nstart() -> int = read(1) + walk(2)\n")])
+    val archive = s"$root/rfc.a"
+    val (code, out, err) = clx_ran(["sysl", "build-c", root, "-o", archive])
+
+    assert_eq(code, Fine, s"$out$err")
+
+    val defined = capture("nm", ["--defined-only", archive], "", [], true) match
+        Err(_) -> ""
+        Ok(o) -> o.text
+
+    remove_dir_all(root).unwrap_or(())
+    assert(defined.contains("read$$sysl"), defined)
+    assert(defined.contains("walk$$sysl"), defined)
+    assert(defined.contains(" T _rfc_start\n") || defined.contains(" T rfc_start\n"), defined)
+    assert(!defined.contains(" T _read\n") && !defined.contains(" T read\n"), defined)
+    assert(!defined.contains(" T _walk\n") && !defined.contains(" T walk\n"), defined)

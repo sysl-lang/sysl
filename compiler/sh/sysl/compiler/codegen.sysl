@@ -756,16 +756,12 @@ private record_symbols(e: *Emit, p: TProgram)
             e.variadics.push(f.name)
             e.variadic_types.push((f.name, sysl_fn_type(e, f.ret_ty, f.params, true, None)))
 
-    // **A symbol C has claimed is not available to a sysl definition.** A key is normally
-    // `module$name`, which no exported symbol can be -- `$` is not a C identifier character. A
-    // function in the **root** module has no such qualification, so its key *is* the bare name, and
-    // an export under its own name there claims the very symbol the definition would be emitted
-    // under: two definitions of one symbol, which clang reports as an invalid redefinition of a
-    // function nobody wrote twice.
-    //
-    // **Renaming the definition rather than the thunk keeps the promise the right way round**: the
-    // exported symbol is the one somebody outside has written down, and a mangled key is this
-    // compiler's own business.
+    // **No sysl definition is ever emitted under a name C can spell**, so no C symbol can meet one at
+    // the link -- a C file of a package calling `read` reaches libc's whatever the program names its
+    // own functions. A key is normally `module$name`, and `$` is not a C identifier character. A
+    // function in the **root** module has no module to carry, so its key *is* the bare name, and it
+    // is laid down under `name$$sysl` instead (`root_symbol`). A symbol C is to reach is what
+    // `@export` publishes, and is the only C name a sysl function has.
     //
     // **A variadic export is the one definition emitted under its exported symbol**, with no thunk:
     // no function can hand a C tail it was given on to another, so the definition itself has to be
@@ -776,8 +772,8 @@ private record_symbols(e: *Emit, p: TProgram)
 
         if f.variadic && f.exported.is_some() && !overridden_weak(p, f)
             e.symbols.push((f.name, f.exported.unwrap()))
-        else if is_displaced(e, f.name) || spells_c_name(p, f.name)
-            e.symbols.push((f.name, s"${f.name}${ModuleSep}${ModuleSep}sysl"))
+        else if spells_c_name(p, f.name)
+            e.symbols.push((f.name, root_symbol(f.name)))
 
         if f.variadic
             e.variadics.push(f.name)
@@ -788,59 +784,32 @@ private record_symbols(e: *Emit, p: TProgram)
         None -> ()
 end record_symbols
 
-// **Whether a root function's key is a C symbol this compilation states or may be made to call.** A
-// root module's function has no module to carry into its key, so the key is its bare name and is
-// emitted as that symbol (`reference/ffi.md`) -- which, where the name is `write` or `malloc`, is
-// beside the compiler's own `declare` of it an invalid redefinition, and where the name is `memcpy`
-// is the definition every call the optimizer or a runtime routine makes to it resolves to. Such a
-// function is laid down under the displaced spelling, as root storage is (`$`-led there): an
-// `extern` or an export of the program's own, a name the compiler declares for its printing, its
-// stop, its heap or its counted heap, a routine the optimizer may call on its own
-// (`is_libcall_name`), and the runtime's namespaces, `sysl_` and the implementation's `__`. The
-// entry is named by `record_symbols` itself.
+// **Whether a function's key is a word C could spell**, which no sysl definition is emitted under.
+// Only a root module's function can have one: everywhere else the key carries `module$`, and a
+// method, an instance or a closure carries a `.` or a `$` of its own. The entry is named by
+// `record_symbols` itself.
 private spells_c_name(p: TProgram, key: string) -> bool
     if module_of(key) != ModuleRoot || !c_identifier(key) then return false
 
     p.entry match
-        Some(en) -> if en.func == key then return false
-        None -> ()
-
-    if key.starts_with("sysl_") || key.starts_with("__") then return true
-    if is_libcall_name(key) || names_c_symbol(p, key) then return true
-
-    for s in compiler_c_names()
-        if s == key then return true
-
-    false
+        Some(en) -> en.func != key
+        None -> true
 end spells_c_name
 
-// The C names the compiler declares on its own account, whatever the program says: what the test
-// dispatcher and the bounds default write with, what the stop flushes with and ends by, the heap the
-// manifest names, and what the counted heap reports through.
-private compiler_c_names() -> Buf[string]
-    var out: Buf[string] = buf()
+// The symbol a root function is laid down under: its name, then `$$sysl`. **`$` keeps it out of C's
+// reach** -- no C identifier holds one -- and **the doubled `$` out of every other key's**, since a
+// module key is `module$name` with one separator and a name's own `$` is escaped (`llvm_guard`). It
+// reads as the function it is in `nm` and in a debugger, which a hashed mangling would not.
+root_symbol(key: string) -> string = s"$key${ModuleSep}${ModuleSep}sysl"
 
-    out.push("write")
-    out.push(trap_flush_symbol())
-    out.push("abort")
-    out.push("exit")
-    out.push(malloc_symbol())
-    out.push(free_symbol())
+// Whether an emitted function's `symbol` is the one `written` names the way a program writes it: the
+// same, a root function's (`root_symbol`), or a root function's owned body (`keep.owned`, emitted
+// as `keep$$sysl.owned`). It is what a test that finds a body by its name asks.
+names_as_written(symbol: string, written: string) -> bool
+    if symbol == written || symbol == root_symbol(written) then return true
 
-    for s in alloc_count_symbols()
-        out.push(s)
-
-    out
-end compiler_c_names
-
-// Whether an export elsewhere in the program has claimed this key as its symbol -- whoever else
-// wanted it.
-private is_displaced(e: *Emit, name: string) -> bool
-    for export_symbol in e.export_symbols
-        if export_symbol.1 == name then return true
-
-    false
-end is_displaced
+    written.ends_with(".owned") && symbol == owned_symbol(root_symbol(written[0..<written.bytes.len - 6]))
+end names_as_written
 
 // A function this module declares and something else defines, `dso_local` where the machine binds
 // every symbol inside the one image (an intrinsic never is: `bound_sig`).
@@ -1308,7 +1277,8 @@ end index_of_text
 // -- the seams a test asserts on ------------------------------------------------------------------
 
 // One source lowered, and the LLVM text of the function named -- the whole `define` line to the
-// brace that closes it, or an empty string where the body was not lowered.
+// brace that closes it, or an empty string where the body was not lowered. A root function is named
+// as written and found under the symbol it is laid down as (`names_as_written`).
 //
 // **It is what a lowering test reads**, since what a body becomes is text and nothing about the
 // intermediate representation says whether it is the reference's text.
@@ -1324,7 +1294,7 @@ emit_func_text(text: string, symbol: string) -> string
     val fs = func_texts(ir_print_module(lowered.0))
 
     for item in fs
-        if item.0 == symbol then return item.1
+        if names_as_written(item.0, symbol) then return item.1
 
     ""
 end emit_func_text

@@ -175,15 +175,15 @@ Two declarations may share one symbol under different sysl names, as above; a mo
 symbol once. **A link name is an `extern`'s alone** — a sysl function is *defined* here, and what it
 is called is its name.
 
-Note what this does *not* do: nothing here changes what a sysl function's own symbol is. A module's
-function carries its module path into it; a function of a file with no `module` header is its bare
-name — **except where that name is a C symbol the program meets**: one an `extern` or an `@export`
-of the program names, one the compiler declares for itself (`write`, `malloc`, `free`, `fflush`,
-`exit`, `abort`), a routine the optimizer may call on its own (`memcpy`, `strlen`, `putchar`, `abs`
-and the rest of C's runtime and `libm`), or the runtime's own `sysl_` and `__` names. Such a function
-is laid down under a name of the compiler's instead, so a program may call its own functions
-`write`, `abs` or `malloc` without touching libc's, and the library's printing and allocation go on
-reaching libc. A symbol C is to reach is what `@export`, below, publishes.
+Note what this does *not* do: nothing here changes what a sysl function's own symbol is. **That
+symbol is the compiler's, never a C name.** A module's function carries its module path into it
+(`mylib$add`), and a function of a file with no `module` header is laid down under its name followed
+by `$$sysl` (`write$$sysl`) — `$` is a character no C identifier holds, so no C symbol can meet a
+sysl function at the link. A program may call its own functions `write`, `read`, `abs` or `malloc`
+without touching libc's: the library's printing and allocation go on reaching libc, and so does a C
+file of the program's own package that calls `read`, which the compiler never sees. **A symbol C is
+to reach is what `@export`, below, publishes** — the only C name a sysl function has, as
+`#[no_mangle]` is in Rust; C that wants to call a sysl function calls an `@export` of it.
 
 ```sysl
 write(p: *int)
@@ -664,8 +664,9 @@ extern exit(code: int) -> never
 add(a: i32, b: i32) -> i32 = a + b
 ```
 
-A sysl definition ordinarily carries its module path into its symbol, so two modules may each declare
-an `init` without colliding. `@export` publishes a bare, unmangled name beside it — one a C
+A sysl definition's own symbol is one C cannot spell — it carries its module path, or `$$sysl` in a
+file with no `module` header — so two modules may each declare an `init` without colliding, and
+neither collides with C's. `@export` publishes a bare, unmangled name beside it — one a C
 declaration can spell and a C linker can resolve.
 
 ### Naming the symbol
