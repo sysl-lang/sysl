@@ -1,0 +1,374 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// The variable of a `for` over a range whose bounds are both bare integer literals is fixed by
+// arithmetic beside an integer operand of a type of its own -- `+ - * / % & | ^` and their compound
+// assignments, in either operand order, through nesting -- as it is by a comparison
+// (`var_first_use.sysl`, `reference/declarations.md § A literal binding takes its type from its first
+// use`). A shift's amount is fixed by nothing, a literal beside it fixes nothing, and an open `var`
+// beside a typed operand keeps its default.
+//
+// Each variable's type is shown by `val z: bool = <name>`, which fixes nothing (a `bool` is no number)
+// and is told the type the name has.
+
+private fva_ready() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+
+    true
+end fva_ready
+
+private fva_fns() -> string = raw"""
+    narrow(n: u8) -> u8 = n
+    signed(n: i8) -> i8 = n
+
+    """
+
+// What a program prints, built and run.
+private fva_ran(text: string) -> string
+    val root = make_temp_dir("sysl-fva").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end fva_ran
+
+// Everything a source has to say for itself.
+private fva_err(text: string) -> string
+    val root = make_temp_dir("sysl-fva").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    val out = emit_llvm_text(src, None) match
+        Err(why) -> why.message
+        Ok(made) -> if made.report.is_empty() then "" else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end fva_err
+
+// Whether a report carries a diagnostic, pointed at a line and column of `main.sysl`.
+private fva_says(report: string, message: string, at: string) -> bool =
+    report.contains(s"error: $message") && report.contains(s"main.sysl:$at\n")
+
+// Whether a report says the binding `z<name>` was handed is of a type.
+private fva_is(report: string, name: string, ty: string) -> bool =
+    report.contains(s"error: cannot initialize 'z$name': declared bool but the value is $ty\n")
+
+// How many diagnostics a report carries.
+private fva_count(report: string) -> usize
+    var seen: usize = 0
+    var rest = report
+
+    loop
+        rest.index_of("error: ") match
+            None -> break
+            Some(at) ->
+                seen += 1
+                rest = rest[(at + 7)..<rest.bytes.len]
+
+    seen
+end fva_count
+
+@test("a compound assignment and its longhand fix the variable at the place's type")
+fva_compound_and_longhand()
+    if !fva_ready() then return
+
+    assert_eq(fva_ran(raw"""
+        main()
+            var n: usize = 100
+            for k in 1..20 do n += k
+            print(n)
+            for k in 1..20 do n -= k
+            print(n)
+            for k in 1..20 do n = n - k
+            print(n)
+            var m: u64 = 1
+            for k in 1..5 do m *= k
+            print(m)
+            var f: u64 = 0xff
+            for k in 1..3 do f ^= k
+            print(f)
+        """), "310\n100\n18446744073709551506\n120\n255\n")
+
+    val report = fva_err(raw"""
+        main()
+            var n: usize = 0
+            var m: u64 = 1
+            var w: i16 = 0
+            for a in 1..3
+                n += a
+                val za: bool = a
+            for b in 1..3
+                n = n - b
+                val zb: bool = b
+            for c in 1..3
+                m %= c
+                val zc: bool = c
+            for d in 1..3
+                w |= d
+                val zd: bool = d
+        """)
+
+    assert(fva_is(report, "a", "usize"), report)
+    assert(fva_is(report, "b", "usize"), report)
+    assert(fva_is(report, "c", "ulong"), report)
+    assert(fva_is(report, "d", "short"), report)
+    assert_eq(fva_count(report), 4)
+
+@test("arithmetic fixes the variable in either operand order and through nesting")
+fva_operand_order_and_nesting()
+    if !fva_ready() then return
+
+    assert_eq(fva_ran(raw"""
+        main()
+            val m: u64 = 3
+            for k in 1..3 do print(m * k, k + m, (m + k) * 2, (k + 1) - m)
+        """), "3 4 8 18446744073709551615\n6 5 10 0\n9 6 12 1\n")
+
+    val report = fva_err(raw"""
+        main()
+            val m: u64 = 3
+            val s: i16 = 2
+            for a in 1..3
+                print(m * a)
+                val za: bool = a
+            for b in 1..3
+                print(b + m)
+                val zb: bool = b
+            for c in 1..3
+                print((m + c) * 2)
+                val zc: bool = c
+            for d in 1..3
+                print((d + 1) - s)
+                val zd: bool = d
+            for e in 1..3
+                print(m / (e * 2))
+                val ze: bool = e
+        """)
+
+    assert(fva_is(report, "a", "ulong"), report)
+    assert(fva_is(report, "b", "ulong"), report)
+    assert(fva_is(report, "c", "ulong"), report)
+    assert(fva_is(report, "d", "short"), report)
+    assert(fva_is(report, "e", "ulong"), report)
+    assert_eq(fva_count(report), 5)
+
+@test("a literal operand, a shift's amount and a float operand fix nothing; a shifted value is fixed where it is used")
+fva_what_fixes_nothing()
+    if !fva_ready() then return
+
+    assert_eq(fva_ran(raw"""
+        main()
+            var m: u64 = 1
+            for k in 0..3 do print(m << k)
+            for k in 0..3 do m <<= k
+            print(m)
+        """), "1\n2\n4\n8\n64\n")
+
+    val report = fva_err(raw"""
+        main()
+            var m: u64 = 1
+            val x: f64 = 0.5
+            for a in 0..3
+                print(a + 1, a * 2 - 1)
+                val za: bool = a
+            for b in 0..3
+                print(m << b, m >> b)
+                val zb: bool = b
+            for c in 0..3
+                m <<= c
+                val zc: bool = c
+            for d in 0..3
+                print((d << 1) + m)
+                val zd: bool = d
+            for e in 0..3
+                print(x + e)
+                val ze: bool = e
+        """)
+
+    assert(fva_is(report, "a", "int"), report)
+    assert(fva_is(report, "b", "int"), report)
+    assert(fva_is(report, "c", "int"), report)
+    assert(fva_is(report, "d", "ulong"), report)
+    assert(fva_is(report, "e", "int"), report)
+    assert_eq(fva_count(report), 5)
+
+@test("the first fixing use wins over a later one that disagrees, either way round, naming both types")
+fva_first_wins()
+    if !fva_ready() then return
+
+    val report = fva_err(fva_fns() + raw"""
+        main()
+            var n: usize = 0
+            for k in 1..3
+                n += k
+                print(narrow(k))
+        """)
+
+    assert(fva_says(report, "'n' of 'narrow' is byte, but usize was given", "8:22"), report)
+    assert_eq(fva_count(report), 1)
+
+    val reversed = fva_err(fva_fns() + raw"""
+        main()
+            var n: usize = 0
+            for k in 1..3
+                print(signed(k))
+                n += k
+        """)
+
+    assert(fva_says(reversed, "'+' needs matching types, got usize and i8", "8:14"), reversed)
+    assert_eq(fva_count(reversed), 1)
+
+    val longhand = fva_err(fva_fns() + raw"""
+        main()
+            val m: u64 = 3
+            for k in 1..3
+                print(m + k)
+                print(signed(k))
+        """)
+
+    assert(fva_says(longhand, "'n' of 'signed' is i8, but ulong was given", "8:22"), longhand)
+    assert_eq(fva_count(longhand), 1)
+
+    // A narrower fix first widens into the wider place later, as a written `u8` would.
+    assert_eq(fva_ran(fva_fns() + raw"""
+        main()
+            var n: usize = 0
+            for k in 1..3
+                print(narrow(k))
+                n += k
+            print(n)
+        """), "1\n2\n3\n6\n")
+
+@test("a bound the arithmetic's type cannot hold is told at the bound; a signed type takes negative bounds")
+fva_bounds()
+    if !fva_ready() then return
+
+    val report = fva_err(raw"""
+        main()
+            var b: u8 = 0
+            for k in 0..300 do b += k
+        """)
+
+    assert(fva_says(report, "the literal 300 does not fit byte", "3:17"), report)
+    assert_eq(fva_count(report), 1)
+
+    val negative = fva_err(raw"""
+        main()
+            var n: usize = 0
+            for k in -2..2 do n += k
+        """)
+
+    assert(fva_says(negative, "the literal -2 does not fit usize", "3:14"), negative)
+    assert_eq(fva_count(negative), 1)
+
+    assert_eq(fva_ran(raw"""
+        main()
+            var s: i8 = 0
+            for k in -5..2 do s += k
+            print(s)
+            var t: i32 = 0
+            for k in -100..-98 do t = t + k
+            print(t)
+        """), "-12\n-297\n")
+
+@test("a range with a bound of its own type, and an open var beside a typed operand, are unchanged")
+fva_unchanged_neighbours()
+    if !fva_ready() then return
+
+    // `sum` is an open `var`, not a counted variable: the typed `b` beside it widens to its `int`.
+    assert_eq(fva_ran(raw"""
+        main()
+            val xs = [10, 20, 30]
+            var n: usize = 0
+            for i in 0..<xs.len do n += i
+            var sum = 250
+            val b: u8 = 10
+            print(n, sum + b)
+            sum += b
+            print(sum)
+        """), "3 260\n260\n")
+
+    val report = fva_err(raw"""
+        main()
+            val xs = [10, 20, 30]
+            var sum = 250
+            val b: u8 = 10
+            for i in 0..<xs.len
+                val zi: bool = i
+            print(sum + b)
+            val zsum: bool = sum
+        """)
+
+    assert(fva_is(report, "i", "usize"), report)
+    assert(fva_is(report, "sum", "int"), report)
+    assert_eq(fva_count(report), 2)
+
+@test("arithmetic in a closure, a nested loop and a 'while' body fixes the variable it reads")
+fva_inner_uses()
+    if !fva_ready() then return
+
+    assert_eq(fva_ran(raw"""
+        main()
+            val m: u64 = 10
+            for k in 1..2
+                val f = () -> m + k
+                print(f())
+            var t: u16 = 0
+            for k in 1..3
+                for j in 1..2
+                    t += k * j
+            print(t)
+            var w: u32 = 0
+            for k in 1..3
+                var c = 0
+                while c < 2
+                    w += k
+                    c += 1
+            print(w)
+        """), "11\n12\n18\n12\n")
+
+    val report = fva_err(raw"""
+        main()
+            val m: u64 = 10
+            var t: u16 = 0
+            for a in 1..2
+                val f = () -> m + a
+                val za: bool = a
+            for b in 1..3
+                for j in 1..2
+                    t += b * j
+                    val zj: bool = j
+                val zb: bool = b
+        """)
+
+    assert(fva_is(report, "a", "ulong"), report)
+    assert(fva_is(report, "b", "ushort"), report)
+    assert(fva_is(report, "j", "ushort"), report)
+    assert_eq(fva_count(report), 3)
