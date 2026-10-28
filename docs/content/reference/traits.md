@@ -1179,7 +1179,10 @@ true false true
 `Node` has no `Hash` here and `Edge` derives one all the same: a reference is a key whatever it
 names. A member call written on a reference the program named reaches through it to the referent's
 own member (`a.eq(*b)` is `Node.eq`), so it is the bound — and the operator — that gives the
-identity. To key by value, key on the value type, or on a wrapper whose `Hash` and `Eq` read the
+identity. Which of the two a call is follows what the generic body **wrote**, not what it was
+instantiated with: in `[T: Hash]`, `x.hash()` on an `x: T` is the identity at `T = &Node`, while
+`r.hash()` on a `val r: &Node` in the same body is `Node.hash` at every `T`, `&Node` included. To
+key by value, key on the value type, or on a wrapper whose `Hash` and `Eq` read the
 fields; a reference to a trait object is two words and meets `Hash` only through its table.
 
 ### A trait says how it is derived
