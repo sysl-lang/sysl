@@ -20,6 +20,7 @@ Reflection is built from forms described on other pages, and this page brings th
 | `T::Variants` | the variants of an enum | [variants](#variants) |
 | `v.(f)`, `f::Type` | one field of a value, and its type | [walking fields](#walking-the-fields) |
 | `x is c`, `x.(c)`, `c::Payload`, `T::Make(c, p)` | testing, reading and building a variant | [variants](#variants) |
+| `T::Partial`, `c::Partial`, `T::Make(p)` | building a value a field at a time | [partial values](#building-a-value-a-field-at-a-time) |
 | `if const T: Trait` | what a type can do | [asking for a trait](#asking-what-a-type-can-do) |
 | `@annotation`, `f::Annotation[A]` | a program's own marks on a field, variant or type | [annotations](#annotations) |
 
@@ -375,6 +376,114 @@ true true true
 
 A simple enum is walked the same way: its variants have no payload, and `x is c` and `c.name` are all
 a serializer needs.
+
+## Building a value a field at a time
+
+`var p: c::Payload` works above because every field is an `int`, which starts at zero. A field that is
+a `Buf`, a `Map`, a `&T` or an enum that carries data has no zero, so a value holding one cannot be
+declared first and filled in later. **A partial value is the type's fields held one at a time**:
+
+- **`T::Partial`** is, for a struct `T`, a tuple with one `Option` per field, in the fields' order;
+  **`c::Partial`** is the same for the payload of the variant `c`. Like a payload, a partial value of
+  one field is that field's `Option`, and one of no fields is `unit`.
+- **Its zero is every field `None`**, whatever the fields are, so `var p: T::Partial` needs no
+  initial value.
+- **`p.(f)` reads and writes field `f` of it as an `Option[f::Type]`**, for the same `f` that
+  `v.(f)` selects with; being a tuple, it is also reached by position, `p.0`.
+- **`T::Make(p)` builds the struct**, and `T::Make(c, p)` builds the variant `c`, taking each field out
+  of its `Option`. `T::Make(c, payload)` still takes the payload itself.
+
+```sysl
+import sysl.buf.{Buf, buf}
+
+enum Expr
+    Lit(n: int)
+    Add(a: &Expr, b: &Expr)
+
+struct Rec
+    name: string
+    items: Buf[int]
+    root: &Expr
+
+fill[T](given: Buf[string]) -> T
+    var p: T::Partial
+
+    for const f in T::Fields
+        if const f.name == "name"
+            p.(f) = Some(given[0])
+        else if const f.name == "items"
+            var b: Buf[int] = buf()
+
+            b.push(7)
+            p.(f) = Some(b)
+        else if const f.name == "root"
+            p.(f) = Some(Expr.Add(Expr.Lit(1), Expr.Lit(2)))
+
+    T::Make(p)
+
+show() -> string
+    var given: Buf[string] = buf()
+
+    given.push("rec")
+
+    val r = fill[Rec](given)
+
+    s"${r.name} ${r.items[0]} ${*r.root is Add(_, _)}"
+
+print(show())
+```
+
+```output
+rec 7 true
+```
+
+**A field still `None` when the value is made stops the program**, as a bounds check does, naming
+the type and the field and writing the location to standard error. The value would otherwise hold a
+field nothing was given for; a decoder reports a missing field itself before it gets that far.
+
+```sysl
+struct P
+    x: int
+    y: int
+
+var p: P::Partial
+
+p.0 = Some(1)
+print(P::Make(p).x)
+```
+
+```output trap
+```
+
+The program stops with `'P' was made from a partial value whose field 'P.y' is None
+(main.sysl:8:8)`. Where the value is made while compiling (a `const`), the compilation stops with
+the same words.
+
+A partial value is a plain tuple: it is copied, returned and passed like one, and over scalar fields it
+allocates nothing, so it may be used in a `@no_alloc` body. A field the file could not name — a
+`private` one of another file's struct — cannot be reached through `p.(f)`, and `T::Make(p)` of such a
+struct is refused there, since building it writes every field. A struct with a `Drop` comes out of
+`T::Make(p)` as the `&T` its constructor makes.
+
+**Only a struct, or a variant's payload, has a partial value.** An enum is built a variant at a time,
+a union holds one field at a time, an opaque struct's fields are not known outside its module, and a
+struct with an anonymous member or an unnamed bitfield holds storage no field names; each is refused:
+
+```sysl
+enum Shape
+    Circle(r: int)
+    Dot
+
+var s: Shape::Partial
+```
+
+```error
+'Shape::Partial' names nothing: an enum is built a variant at a time, and a variant's partial value is 'c::Partial', for the 'c' of a 'for const c in Shape::Variants'
+```
+
+**A trait's associated type named `Partial` wins**: where `T` implements a trait declaring `type
+Partial`, `T::Partial` is that type, as a name a program declares beats every form the compiler
+supplies.
 
 ## Asking what a type can do
 
@@ -793,7 +902,7 @@ print(Box::Name)
 ```
 
 A descriptor answers only for its own kind of thing: a field has a `::Type`, and a variant has
-`::Fields` and `::Payload`.
+`::Fields`, `::Payload` and `::Partial`.
 
 ```sysl
 struct P
@@ -816,7 +925,7 @@ for const c in E::Variants
 ```
 
 ```error
-'c' is the descriptor 'E.A', which answers '::Fields', its payload's fields, and '::Payload', its payload's type, and not '::Type'
+'c' is the descriptor 'E.A', which answers '::Fields', its payload's fields, '::Payload', its payload's type, and '::Partial', its payload's partial value, and not '::Type'
 ```
 
 A name a type does not answer is refused with the type named:

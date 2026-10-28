@@ -64,6 +64,7 @@ const BoundsNoVariant: int = 11
 const BoundsWrongVariant: int = 12
 const BoundsNegative: int = 13
 const BoundsInsertPastLength: int = 14
+const BoundsFieldUnset: int = 15
 
 // Or-ed into the form where the value in `a` -- or `b` -- is a signed integer's, widened with its
 // sign, so the message prints `-1` rather than eighteen quintillion.
@@ -88,7 +89,8 @@ private val BoundsForms: []const (string, string) = [
     ("value %s is not one of the enum's variants", "a"),
     ("variant '%s' was asked for, and the value is '%s'", "AB"),
     ("index %s is negative", "a"),
-    ("insertion index %s is past length %s", "an")]
+    ("insertion index %s is past length %s", "an"),
+    ("'%s' was made from a partial value whose field '%s' is None", "AB")]
 
 // -- whether locations are laid down --------------------------------------------------------------
 
@@ -229,7 +231,20 @@ private variant_name_table(e: *Emit, ty: Type, d: &EnumType) -> string
     name
 end variant_name_table
 
-private variant_fail_at(e: *Emit, asked: string, holds: Val, site: Span) -> Val
+private variant_fail_at(e: *Emit, asked: string, holds: Val, site: Span) -> Val =
+    two_texts_fail(e, BoundsWrongVariant, c_text_of(e, asked), holds, site)
+
+// **`T::Make(p)` reached with a field of `p` still `None`** reports through the same function, the
+// type (or variant) being made and the field's name handed over as two texts, and stops the program.
+field_unset(e: *Emit, made: string, field: string, site: Span) -> Val =
+    two_texts_fail(e, BoundsFieldUnset, c_text_of(e, made), c_text_of(e, field), site)
+
+// What the default prints for it, which is also what an evaluation while compiling says.
+field_unset_text(made: string, field: string) -> string =
+    s"'$made' was made from a partial value whose field '$field' is None"
+
+// A failure whose two values are the addresses of NUL-terminated texts.
+private two_texts_fail(e: *Emit, kind: int, first: Val, second: Val, site: Span) -> Val
     e.traps = true
     e.bounds_fails = true
 
@@ -237,12 +252,12 @@ private variant_fail_at(e: *Emit, asked: string, holds: Val, site: Span) -> Val
     val a = fresh_reg(e)
     val b = fresh_reg(e)
 
-    emit(e, InCast(a, CastPtrToInt, LPtr, c_text_of(e, asked), w))
-    emit(e, InCast(b, CastPtrToInt, LPtr, holds, w))
+    emit(e, InCast(a, CastPtrToInt, LPtr, first, w))
+    emit(e, InCast(b, CastPtrToInt, LPtr, second, w))
 
     var args: Buf[IrArg] = buf()
 
-    args.push(ir_arg(l_i32(), VInt(from_int(long(BoundsWrongVariant)))))
+    args.push(ir_arg(l_i32(), VInt(from_int(long(kind)))))
     args.push(ir_arg(w, a))
     args.push(ir_arg(w, b))
     args.push(ir_arg(w, bounds_none()))
@@ -251,7 +266,7 @@ private variant_fail_at(e: *Emit, asked: string, holds: Val, site: Span) -> Val
     emit(e, ir_call(None, LVoid, VGlobal(trap_symbol(e)), no_ir_args()))
     emit_term(e, InUnreachable)
     VNothing
-end variant_fail_at
+end two_texts_fail
 
 // What the default prints for it, which is also what an evaluation while compiling says.
 variant_fail_text(asked: string, holds: string) -> string =

@@ -883,7 +883,10 @@ variant 'Shape.Circle' was asked for, and the value is 'Shape.Dot' (main.sysl:9:
 ```
 
 The last is [`x.(c)`](/reference/reflection/) reading the payload of a variant the value does not
-hold; it goes through the same function, which receives the two names as NUL-terminated strings.
+hold; it goes through the same function, which receives the two names as NUL-terminated strings. So
+does [`T::Make(p)`](/reference/reflection/#building-a-value-a-field-at-a-time) made from a partial
+value with a field still `None`: `'P' was made from a partial value whose field 'P.y' is None
+(main.sysl:8:8)`.
 
 **The standard containers report through it too.** An index past a `Buf`'s, `Frozen`'s, `Deque`'s or
 `Ring`'s count — by subscript, `at`, `set` or `remove` — is reported as an array's index is and then

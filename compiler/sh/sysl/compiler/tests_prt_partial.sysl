@@ -1,0 +1,682 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.Search
+
+// **A partial value** (`type_reflect.sysl`): `T::Partial` for a struct and `c::Partial` for a
+// variant's payload hold one `Option` per field, shaped as a payload is, so their zero is every field
+// `None` whatever the fields are -- a `Buf`, a `Map`, a `&T` or a data enum among them, none of which
+// has a zero of its own. `p.(f)` reads and writes a field of one, and `T::Make(p)` / `T::Make(c, p)`
+// build the value, a field still `None` stopping the program with its name.
+//
+// Cells skipped, with the reason: separate compilation and codegen units (the forms are an analyzer
+// desugaring that lays down no symbol of its own; the one runtime piece, the failure's words, is a
+// row of the `sysl_bounds_fail` table every check already reaches); a thumb build (the same table,
+// and a freestanding default writes nothing); trait objects and closures (a partial value is a plain
+// tuple, and neither holds anything a tuple does not).
+
+// The program built with the counted heap and run: everything it said, and whether it exited zero.
+private prt_counted(text: string) -> (string, bool)
+    val root = make_temp_dir("sysl-prt").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", forms_imported(text)).unwrap()
+    force_alloc_counting(true)
+
+    val built = build_native_program(s"$root/main.sysl", None, None, DefaultOptimization,
+                                     Some(s"$root/built"))
+
+    force_alloc_counting(false)
+
+    built match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (failure_text(why), false)
+        Ok(_) -> ()
+
+    val said = capture(s"$root/built", [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> ("could not be started", false)
+        Ok(o) -> (o.text + o.err.unwrap_or(""), o.status.ok())
+end prt_counted
+
+private prt_record() -> string = raw"""
+    import sysl.buf.{Buf, buf}
+    import sysl.container.{Map, map}
+
+    enum Expr
+        Lit(n: int)
+        Add(a: &Expr, b: &Expr)
+
+    struct Inner
+        k: int
+
+    struct Rec
+        n: int
+        name: string
+        items: Buf[int]
+        m: Map[string, int]
+        e: &Expr
+        tag: Expr
+        inner: Inner
+        o: Option[int]
+
+    // Every field given, read off the field's own type in each copy.
+    fill[T](skip: string) -> T
+        var p: T::Partial
+
+        for const f in T::Fields
+            if f.name != skip
+                if const f.name == "n"
+                    p.(f) = Some(7)
+                else if const f.name == "name"
+                    p.(f) = Some("seven")
+                else if const f.name == "items"
+                    var b: Buf[int] = buf()
+
+                    b.push(1)
+                    b.push(2)
+                    p.(f) = Some(b)
+                else if const f.name == "m"
+                    var m: Map[string, int] = map()
+
+                    m.put("a", 1)
+                    p.(f) = Some(m)
+                else if const f.name == "e"
+                    p.(f) = Some(Expr.Lit(3))
+                else if const f.name == "tag"
+                    p.(f) = Some(Expr.Lit(4))
+                else if const f.name == "inner"
+                    p.(f) = Some(Inner(5))
+                else if const f.name == "o"
+                    p.(f) = Some(None)
+
+        T::Make(p)
+
+    lit(e: Expr) -> int = e match
+        Lit(n) -> n
+        _ -> -1
+
+    """
+
+@test("a partial value of a struct holding a Buf, a Map, a &T, a data enum, a struct and an Option starts all None and builds it")
+prt_record_built_field_by_field()
+    if !enm_ready() then return
+
+    val out = prt_counted(prt_record() + raw"""
+        go()
+            var p: Rec::Partial
+            var none = true
+
+            for const f in Rec::Fields
+                if p.(f).is_some() then none = false
+
+            print(none)
+
+            val r = fill[Rec]("")
+
+            print(r.n, r.name, r.items.len(), r.m.get("a").unwrap(), lit(*r.e), lit(r.tag), r.inner.k,
+                  r.o.is_none())
+
+        go()
+        """)
+
+    assert(out.1, out.0)
+    assert_eq(out.0, "true\n7 seven 2 1 3 4 5 true\n")
+end prt_record_built_field_by_field
+
+@test("a field left None stops 'T::Make' with the type and the field named, and the location of the call")
+prt_unset_field_traps()
+    if !enm_ready() then return
+
+    val out = enm_outcome(prt_record() + raw"""
+        print("before")
+        val r = fill[Rec]("items")
+        print("not reached")
+        """)
+
+    assert(!out.1, out.0)
+    assert(out.0.starts_with("before\n'Rec' was made from a partial value whose field 'Rec.items' is None " +
+                             "(main.sysl:"), out.0)
+    assert(!out.0.contains("not reached"), out.0)
+end prt_unset_field_traps
+
+@test("only the first field still None is named, in field order")
+prt_first_unset_field_named()
+    if !enm_ready() then return
+
+    val out = enm_outcome(raw"""
+        struct P
+            x: int
+            y: int
+            z: int
+
+        var p: P::Partial
+
+        p.1 = Some(2)
+        print(P::Make(p).y)
+        """)
+
+    assert(!out.1, out.0)
+    assert(out.0.starts_with("'P' was made from a partial value whose field 'P.x' is None ("), out.0)
+end prt_first_unset_field_named
+
+@test("a struct built from a full partial value equals the one its constructor builds")
+prt_full_equals_constructor()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        struct P
+            x: int
+            s: string
+            b: bool
+
+        same(a: P, b: P) -> bool = a.x == b.x && a.s == b.s && a.b == b.b
+
+        var p: P::Partial
+
+        p.0 = Some(4)
+        p.1 = Some("four")
+        p.2 = Some(true)
+
+        print(same(P::Make(p), P(4, "four", true)))
+        print(same(P::Make(p), P(4, "four", false)))
+        """), "true\nfalse\n")
+end prt_full_equals_constructor
+
+@test("a generic struct's partial value is read at each instantiation, and a generic fill builds both")
+prt_generic_struct()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        struct Pair[T]
+            a: T
+            b: T
+
+        all_set[S, V](v: V) -> S
+            var p: S::Partial
+
+            for const f in S::Fields
+                p.(f) = Some(v)
+
+            S::Make(p)
+
+        val i = all_set[Pair[int], int](5)
+        val s = all_set[Pair[string], string]("x")
+        var q: Pair[u8]::Partial
+
+        q.1 = Some(9)
+        print(i.a + i.b, s.a + s.b, q.0.is_none(), q.1.unwrap())
+        """), "10 xx true 9\n")
+end prt_generic_struct
+
+@test("a struct of one field has that field's Option as its partial value, and one of none has unit")
+prt_one_and_no_fields()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        struct One
+            x: string
+
+        struct Empty
+        end Empty
+
+        var o: One::Partial
+
+        print(o.is_none())
+
+        o = Some("one")
+        print(One::Make(o).x)
+
+        for const f in One::Fields
+            print(o.(f).unwrap())
+
+        val e: Empty = Empty::Make(())
+        var u: Empty::Partial = ()
+
+        print("built")
+        """), "true\none\none\nbuilt\n")
+end prt_one_and_no_fields
+
+@test("a variant's payload is built through 'c::Partial' and 'T::Make(c, p)' -- the codec note's probe p07")
+prt_variant_partial()
+    if !enm_ready() then return
+
+    val out = prt_counted(raw"""
+        enum Expr
+            Lit(n: int)
+            Add(a: &Expr, b: &Expr)
+            Neg(x: &Expr)
+            Zero
+
+        build[T](name: string, leaf: &Expr) -> Option[T]
+            for const c in T::Variants
+                if const c.name != "Lit"
+                    if name == c.name
+                        var p: c::Partial
+
+                        for const f in c::Fields
+                            p.(f) = Some(leaf)
+
+                        return Some(T::Make(c, p))
+
+            None
+
+        show(e: Expr) -> string = e match
+            Lit(n) -> s"$n"
+            Add(a, b) -> s"(${show(*a)} + ${show(*b)})"
+            Neg(x) -> s"-${show(*x)}"
+            Zero -> "0"
+
+        go()
+            print(show(build[Expr]("Add", Expr.Lit(1)).unwrap()))
+            print(show(build[Expr]("Neg", Expr.Lit(2)).unwrap()))
+            print(show(build[Expr]("Zero", Expr.Lit(3)).unwrap()))
+
+        go()
+        """)
+
+    assert(out.1, out.0)
+    assert_eq(out.0, "(1 + 1)\n-2\n0\n")
+end prt_variant_partial
+
+@test("a variant's partial value with a field still None stops 'T::Make(c, p)', naming the variant's field")
+prt_variant_unset_traps()
+    if !enm_ready() then return
+
+    val out = enm_outcome(raw"""
+        enum Shape
+            Rect(w: int, h: int)
+            Dot
+
+        make[T]() -> T
+            for const c in T::Variants
+                if const c.name == "Rect"
+                    var p: c::Partial
+
+                    for const f in c::Fields
+                        if f.name == "w" then p.(f) = Some(3)
+
+                    return T::Make(c, p)
+
+            panic("no Rect")
+
+        print(make[Shape]() is Rect(_, _))
+        """)
+
+    assert(!out.1, out.0)
+    assert(out.0.starts_with("'Shape.Rect' was made from a partial value whose field 'Shape.Rect.h' " +
+                             "is None (main.sysl:"), out.0)
+end prt_variant_unset_traps
+
+@test("'T::Make(c, payload)' from a payload held in a variable leaves nothing live on the counted heap")
+prt_held_payload_does_not_leak()
+    if !enm_ready() then return
+
+    // The block that holds the payload hands its value out with a count of its own; reading it as a
+    // statement's temporary is what lets the binding take that count over rather than a second one.
+    val out = prt_counted(raw"""
+        import sysl.buf.{Buf, buf}
+
+        enum E
+            A(a: Buf[int], b: Buf[int])
+            B
+
+        held(p: (Buf[int], Buf[int])) -> E
+            for const c in E::Variants
+                if const c.name == "A"
+                    val e = E::Make(c, p)
+
+                    return e
+
+            E.B
+
+        returned(p: (Buf[int], Buf[int])) -> E
+            for const c in E::Variants
+                if const c.name == "A" then return E::Make(c, p)
+
+            E.B
+
+        go()
+            var x: Buf[int] = buf()
+
+            x.push(1)
+            print(held((x, x)) is A(_, _), returned((x, buf())) is A(_, _))
+
+        go()
+        """)
+
+    assert(out.1, out.0)
+    assert_eq(out.0, "true true\n")
+end prt_held_payload_does_not_leak
+
+@test("'T::Make(p)' of a type with a Drop builds the '&T' a constructor does, and drops it once")
+prt_drop_type_is_a_reference()
+    if !enm_ready() then return
+
+    val out = prt_counted(raw"""
+        struct Noisy
+            n: int
+
+        impl Drop for Noisy
+            drop(self)
+                print("drop", self.n)
+
+        go()
+            var p: Noisy::Partial
+
+            p = Some(4)
+
+            val n = Noisy::Make(p)
+
+            print(n.n)
+
+        go()
+        print("after")
+        """)
+
+    assert(out.1, out.0)
+    assert_eq(out.0, "4\ndrop 4\nafter\n")
+end prt_drop_type_is_a_reference
+
+@test("a partial value over scalars builds under '@no_alloc', in a generic body too")
+prt_no_alloc_scalars()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        struct P
+            x: int
+            y: i16
+
+        @no_alloc
+        scalars() -> int
+            var p: P::Partial
+
+            p.0 = Some(3)
+            p.1 = Some(4)
+
+            val q = P::Make(p)
+
+            q.x * int(q.y)
+
+        @no_alloc
+        twice[T]() -> T
+            var p: T::Partial
+
+            for const f in T::Fields
+                p.(f) = Some(2)
+
+            T::Make(p)
+
+        print(scalars(), twice[P]().x)
+        """), "12 2\n")
+end prt_no_alloc_scalars
+
+@test("a field still None while compiling stops the evaluation with the same words")
+prt_unset_while_compiling()
+    if !azb_ready() then return
+
+    azb_refused(azb_main(raw"""
+        struct P
+            x: int
+            y: int
+
+        const both() -> int
+            var p: P::Partial
+
+            p.0 = Some(1)
+            P::Make(p).x
+
+        const B: int = both()
+
+        print(B)
+        """), ["'B' traps while it is being compiled: 'P' was made from a partial value whose field " +
+               "'P.y' is None"])
+
+    azb_prints(azb_main(raw"""
+        struct P
+            x: int
+            y: int
+
+        const both() -> int
+            var p: P::Partial
+
+            p.0 = Some(1)
+            p.1 = Some(2)
+            P::Make(p).x + P::Make(p).y
+
+        const B: int = both()
+
+        print(B)
+        """), "3\n")
+end prt_unset_while_compiling
+
+@test("a trait's own associated type named 'Partial' wins over the partial value")
+prt_trait_partial_wins()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        trait Staged
+            type Partial
+
+        struct Q
+            z: int
+
+        impl Staged for Q
+            type Partial = bool
+
+        struct R
+            z: int
+
+        val q: Q::Partial = true
+        var r: R::Partial
+
+        print(q, r.is_none())
+        """), "true true\n")
+end prt_trait_partial_wins
+
+@test("'T::Partial' of an enum, a scalar, a union, an opaque struct and a struct with an anonymous member is refused")
+prt_partial_refusals()
+    if !enm_ready() then return
+
+    val en = enm_outcome("enum Shape\n    Circle(r: int)\n    Dot\n\nvar s: Shape::Partial\n")
+
+    assert(en.0.contains("'Shape::Partial' names nothing: an enum is built a variant at a time, and a " +
+                         "variant's partial value is 'c::Partial', for the 'c' of a 'for const c in " +
+                         "Shape::Variants'"), en.0)
+
+    val scalar = enm_outcome("type I = int\n\nvar i: I::Partial\n")
+
+    assert(scalar.0.contains("'int::Partial' names nothing: a partial value holds a struct's fields, and " +
+                             "'int' is an integer"), scalar.0)
+
+    val un = enm_outcome("union U\n    a: int\n    b: real\n\nvar u: U::Partial\n")
+
+    assert(un.0.contains("'U' is a union, which holds one field at a time, so it has no partial value — " +
+                         "it is built from exactly one field, by name"), un.0)
+
+    val anon = enm_outcome(raw"""
+        struct A
+            tag: int
+            union
+                i: int
+                r: real
+
+        var a: A::Partial
+        """)
+
+    assert(anon.0.contains("'A' holds storage no field names (an anonymous member or an unnamed " +
+                           "bitfield), so it has no partial value"), anon.0)
+
+    // In its own module an opaque struct with fields has a partial value; outside it the type itself
+    // may not be laid out, which is refused before the attribute is asked; one with no body has no
+    // fields to hold anywhere.
+    val lib = "module lib\n\nopaque struct Dev\n    reg: u32\n\nvar here: Dev::Partial\n"
+
+    azb_prints([("lib", "lib.sysl", lib), ("", "main.sysl", "import lib.*\n\nprint(here.is_none())\n")],
+               "true\n")
+    azb_refused([("lib", "lib.sysl", lib), ("", "main.sysl", "import lib.*\n\nvar d: Dev::Partial\n")],
+                ["'Dev' is opaque outside 'lib', so its layout is not known here"])
+    azb_refused([("lib", "lib.sysl", lib + "\nopaque struct Bare\n\nvar b: Bare::Partial\n"),
+                 ("", "main.sysl", "import lib.*\n\nprint(1)\n")],
+                ["is an opaque struct, so its fields are not known here and it has no partial value"])
+end prt_partial_refusals
+
+@test("'T::Make' with the wrong argument or count, or of an enum, is refused with what it takes")
+prt_make_refusals()
+    if !enm_ready() then return
+
+    val p = "struct P\n    x: int\n    y: int\n\n"
+    val wrong = enm_outcome(p + "val bad = P::Make(3)\n")
+
+    assert(wrong.0.contains("'P::Make' builds 'P' from its partial value, a value of " +
+                            "'(sysl.Option[int], sysl.Option[int])', and this is a value of 'int'"), wrong.0)
+
+    val count = enm_outcome(p + "val bad = P::Make(1, 2, 3)\n")
+
+    assert(count.0.contains("'P::Make' takes a partial value — 'P::Make(p)', where 'p' is a 'P::Partial' " +
+                            "— or a variant and its payload — 'P::Make(c, (a, b))'"), count.0)
+
+    val en = enm_outcome("enum Shape\n    Circle(r: int)\n    Dot\n\nval s = Shape::Make(1)\n")
+
+    assert(en.0.contains("'Shape::Make(p)' builds a struct from its partial value, and 'Shape' is an enum, " +
+                         "which is built a variant at a time — 'Shape::Make(c, p)'"), en.0)
+
+    val payload = enm_outcome(raw"""
+        enum Shape
+            Rect(w: int, h: int)
+            Dot
+
+        make[T]() -> T
+            for const c in T::Variants
+                if const c.name == "Rect"
+                    var p: (Option[int], Option[string])
+
+                    return T::Make(c, p)
+
+            panic("no Rect")
+
+        print(make[Shape]() is Rect(_, _))
+        """)
+
+    assert(payload.0.contains("'Rect' is built from its payload, a value of '(int, int)', or its partial " +
+                              "value, a value of '(sysl.Option[int], sysl.Option[int])', and this is a " +
+                              "value of '(sysl.Option[int], sysl.Option[string])'"), payload.0)
+end prt_make_refusals
+
+@test("'c::Partial' is a type and 'f::Partial' names nothing, each refused in its copy")
+prt_descriptor_partial_refusals()
+    if !enm_ready() then return
+
+    val value = enm_outcome(raw"""
+        enum Shape
+            Circle(r: int)
+
+        for const c in Shape::Variants
+            val y = c::Partial
+        """)
+
+    assert(value.0.contains("'c::Partial' is a type, so it stands where a type is written — " +
+                            "'var x: c::Partial'"), value.0)
+
+    val field = enm_outcome(raw"""
+        enum Shape
+            Circle(r: int)
+
+        for const c in Shape::Variants
+            for const f in c::Fields
+                var z: f::Partial
+        """)
+
+    assert(field.0.contains("'f' is the descriptor 'Shape.Circle.r', which answers '::Type', the field's " +
+                            "type, and not '::Partial'"), field.0)
+
+    val variant = enm_outcome(raw"""
+        enum Shape
+            Circle(r: int)
+
+        for const c in Shape::Variants
+            var x: c::Type
+        """)
+
+    assert(variant.0.contains("which answers '::Fields', its payload's fields, '::Payload', its payload's " +
+                              "type, and '::Partial', its payload's partial value, and not '::Type'"),
+           variant.0)
+end prt_descriptor_partial_refusals
+
+@test("'p.(f)' over a partial value of another type is refused, naming the field and both types")
+prt_select_mismatch()
+    if !enm_ready() then return
+
+    val out = enm_outcome(raw"""
+        struct P
+            x: int
+            y: int
+
+        struct Q
+            a: string
+            b: string
+
+        var q: Q::Partial
+
+        for const f in P::Fields
+            print(q.(f).is_none())
+        """)
+
+    assert(out.0.contains("'f' is the field 'P.x', which a value of 'P' holds, and this is a value of " +
+                          "'(sysl.Option[string], sysl.Option[string])'"), out.0)
+end prt_select_mismatch
+
+@test("a private field is reached through a partial value and built by 'T::Make' only in its own file")
+prt_private_field_reach()
+    if !azb_ready() then return
+
+    val secret = raw"""
+        struct Secret
+            shown: int
+            private hidden: int
+
+        make_here() -> Secret
+            var p: Secret::Partial
+
+            for const f in Secret::Fields
+                p.(f) = Some(int(f.index) + 1)
+
+            Secret::Make(p)
+
+        shown_of(s: Secret) -> int = s.shown
+
+        """
+
+    azb_prints([("", "secret.sysl", secret),
+                ("", "main.sysl", "print(shown_of(make_here()))\n")], "1\n")
+
+    azb_refused([("", "secret.sysl", secret),
+                 ("", "main.sysl", raw"""
+                     var p: Secret::Partial
+
+                     p.0 = Some(1)
+                     p.1 = Some(2)
+                     print(Secret::Make(p).shown)
+                     """)],
+                ["'Secret::Make' writes every field, and field 'hidden' of 'Secret' is"])
+
+    azb_refused([("", "secret.sysl", secret),
+                 ("", "main.sysl", raw"""
+                     fill[T]() -> T::Partial
+                         var p: T::Partial
+
+                         for const f in T::Fields
+                             p.(f) = Some(0)
+
+                         p
+
+                     print(fill[Secret]().0.is_some())
+                     """)],
+                ["field 'hidden' of 'Secret' is", "(in the copy for field 'Secret.hidden')"])
+end prt_private_field_reach
