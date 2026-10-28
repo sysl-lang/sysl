@@ -181,15 +181,18 @@ a `From` block, write `step().map_err(to_mine)?`.
 
 ### They are written in sysl
 
-The forcing members stop the program without any compiler support of their own:
+The forcing members stop the program with no compiler support beyond one annotation:
 
 ```sysl
+@track_caller
 unwrap(self) -> T = self match
     Some(v) -> v
-    None ->
-        print("panic: unwrap of a None value")
-        exit(1)
+    None -> unwrap_failed("unwrap of a None value")
 ```
+
+`unwrap_failed` prints `panic:`, the words and `caller_location()`, and calls `exit(1)`. The
+[`@track_caller`](/reference/attributes/#track-caller-a-function-that-reports-its-caller-s-line) on
+both is what makes the location the line that called `unwrap`.
 
 So "a bug stops the program" does not require the compiler to know every way of stopping. Two
 ordinary features make it work. A diverging arm has a type, [`never`](/reference/types/), so
@@ -714,7 +717,9 @@ parse(s: string) -> Result[int, string] = if s == "" then Err("empty input") els
 print(parse("").expect("a number"))
 ```
 
-prints `panic: a number: "empty input"`, and then
+prints `panic: a number: "empty input" (main.sysl:3:22)` — the line that called `expect`, since it
+is [`@track_caller`](/reference/attributes/#track-caller-a-function-that-reports-its-caller-s-line)
+— and then
 
 ```text
 error return trace (origin first):
@@ -835,7 +840,7 @@ you debug one:
 |---|---|---|
 | a **bounds check** — an index, a range, a substring cut inside a character, an index past a container's count | everything the program printed before it, and one line on stderr saying what failed and where | the platform's signal status for a trap instruction |
 | any other **compiler-inserted check** — a cast, a constrained range, a contract — or `trap()` | everything the program printed before it, and nothing more | the same |
-| a **library forcing member** — `unwrap`, `expect` | `panic: <message>` on stdout, after everything the program printed before it | 1 |
+| a **library forcing member** — `unwrap`, `expect` | `panic: <message> (file:line:column)` on stdout, naming the line that called it, after everything the program printed before it | 1 |
 
 **A trap flushes standard output before it stops the program.** Standard output is buffered (fully
 buffered when it goes to a file or a pipe rather than a terminal), so what a program printed may
@@ -887,8 +892,11 @@ hold; it goes through the same function, which receives the two names as NUL-ter
 
 **The standard containers report through it too.** An index past a `Buf`'s, `Frozen`'s, `Deque`'s or
 `Ring`'s count — by subscript, `at`, `set` or `remove` — is reported as an array's index is and then
-traps; an `insert` past the count says `insertion index 5 is past length 3`. Their report carries no
-location: the check runs inside the container's member, which cannot see the line that called it.
+traps; an `insert` past the count says `insertion index 5 is past length 3`. **Their report names
+the caller's line, as an array's does**: the members are
+[`@track_caller`](/reference/attributes/#track-caller-a-function-that-reports-its-caller-s-line), so
+`b[5]` on line 4 reports `index 5 out of bounds for length 3 (main.sysl:4:6)`, the bracket's column
+as an array's report gives it, and `b.at(5)` names the call.
 
 The location is the bracket's line and column, with the file named by its path inside the build (a
 fetched package's file by its coordinate), so no build directory appears in it. The exit status is

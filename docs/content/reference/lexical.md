@@ -557,6 +557,7 @@ private extern "__errno_location" errno_location() -> *i32
 | `__TIME__` | `string` | build time, `hh:mm:ss` (UTC) |
 | `__NAME__` | `string` | the `name` in the `sysl.hocon` of the package the file belongs to — as a default, the caller's |
 | `__VERSION__` | `string` | the `version` in the `sysl.hocon` of the package the file belongs to — as a default, the caller's |
+| `__CALLER__` | `*u8` | where the enclosing function was called from, as a NUL-terminated `file:line:column` — see [`@track_caller`](/reference/attributes/#track-caller-a-function-that-reports-its-caller-s-line) |
 
 `__LINE__` and `__COLUMN__` are ordinary integer literals, so each takes the type its context asks
 for and is range-checked with it.
@@ -576,8 +577,15 @@ print(where())
 4
 ```
 
-This is how the standard library's `assert` reports the line that failed, which is why its message
-is optional. Where a default fills another default, the outermost call is the one reported.
+Where a default fills another default, the outermost call is the one reported. A default reports
+only the call it is filled at, though: a helper that calls `where()` gets its own line back. A
+function that wants its caller's line through any number of helpers is marked `@track_caller` and
+asks `caller_location()`, which is how the standard library's `assert` and `unwrap` report the line
+that failed.
+
+`__CALLER__` is the raw form `caller_location()` is made of. In a `@track_caller` function it is the
+location the function was handed; anywhere else it is where it is written; in module storage, which
+no function called, it is `null`, as it is in a build with `bounds_locations = false`.
 
 `__DATE__` and `__TIME__` make a build non-reproducible, as C's do. They suit a firmware build stamp
 and are best avoided otherwise.

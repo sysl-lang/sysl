@@ -166,17 +166,14 @@ take a buffer's unwritten room into its length.
 Two functions stop a program on purpose, and both are ordinary sysl:
 
 ```sysl
-panic(msg: string, file: string = __FILE__, line: long = __LINE__) -> never
+@track_caller
+panic(msg: string, file: string = "", line: long = 0) -> never
     prints("panic: ")
     prints(msg)
-    prints(" (")
-    prints(file)
-    prints(":")
-    printi(line)
-    prints(")\n")
-    exit(1)
+    report_tail(file, line)
 
-assert(cond: bool, msg: string = "", file: string = __FILE__, line: long = __LINE__)
+@track_caller
+assert(cond: bool, msg: string = "", file: string = "", line: long = 0)
     if !cond then
         if msg.len == 0 then panic("assertion failed", file, line)
         else panic(msg, file, line)
@@ -186,17 +183,23 @@ assert(cond: bool, msg: string = "", file: string = __FILE__, line: long = __LIN
 is what lets it sit in one arm of a `match` whose other arms produce values, exactly as `unwrap`
 does.
 
-**The message is optional, because a failure names the line it happened on.** `__FILE__` and
-`__LINE__` are [reserved identifiers](/reference/lexical/), and a default is evaluated at the call —
-so a parameter defaulted to one reports the *caller's* position rather than the library's. Write a
-message where it says something the condition does not; leave it out where the condition speaks for
-itself.
+**The message is optional, because a failure names the line it happened on.** Both are
+[`@track_caller`](/reference/attributes/#track-caller-a-function-that-reports-its-caller-s-line), so
+`report_tail` asks `caller_location()` and is told the line that called `assert` — and where that
+call is in a `@track_caller` function of your own, the line that called *it*. Write a message where
+it says something the condition does not; leave it out where the condition speaks for itself.
+`file` and `line` are there for a caller with a location of its own to report instead.
 
-Two details of that are worth copying if you write a checking function of your own. `assert` passes
-`file` and `line` **on** to `panic` rather than letting `panic` fill its own defaults — otherwise
-every assertion in every program would report the line inside the library that calls `panic`. And the
-location is composed with `prints` and `printi` instead of an interpolated string, because building a
-string makes heap storage, which would put `assert` out of reach of a module that declared
+A checking function of your own gets the same report by being marked `@track_caller` too:
+
+```sysl
+@track_caller
+check_positive(n: int) = assert(n > 0, "not positive")
+```
+
+A failed `check_positive(-1)` names the line that called `check_positive`, not the line inside it.
+The location is written with `prints` instead of an interpolated string, because building a string
+makes heap storage, which would put `assert` out of reach of a module that declared
 [`@no_alloc`](/reference/attributes/) — the module that wants an assertion most.
 
 ```sysl
