@@ -18,7 +18,9 @@ import sysl.container.{Map, map}
 // an `int`, a `bool`, a `*T`, a `&sync T` pass on their type alone. A value whose type carries a
 // count that is not atomic passes only where the body that made it can be read and every way it
 // answers is **fresh** -- a string literal (immortal), a `.copy()` of a string (which allocates an
-// owner of its own and copies the bytes), or a branch, a block, a variant or a struct built of those.
+// owner of its own and copies the bytes), a `.copy()` of a `Buf` whose elements hold no count, a call
+// handed nothing that shares a count, a local built fresh and let go nowhere else (`answers_fresh`),
+// or a branch, a block, a variant or a struct built of those.
 //
 // **The rule fires only where the guarded field itself reaches such a count**: a `Mutex[int]` hands
 // nothing out that could share one.
@@ -133,49 +135,285 @@ private answering_body(funcs: Buf[TFunc], index: Map[string, usize], args: Buf[T
     None
 end answering_body
 
+// What the freshness walk of one body carries: the locals it built fresh, one entry in `cleared` for
+// every mention of one that was seen to be harmless, and whether anything wrote a shared value into
+// one.
+private struct Fresh
+    locals: Buf[string]
+    cleared: Buf[string]
+    spoiled: bool
+end Fresh
+
 // Whether every way a body answers is a value made fresh, sharing no count with anything.
+//
+// **A local counts as fresh where everything it ever holds was built inside the body, and the body
+// lets it go nowhere but out through the answer.** Its initializer and every value written into it
+// must be fresh, and every mention of it must be one of the harmless shapes: the answer itself (or a
+// part of one being built), a member of the library's `Buf` called on it -- which keeps nothing but
+// copies of what it is given -- or a read that comes to a value holding no count and no address
+// (`copy.len()`, `copy[0]`, a loop over its elements). Any other mention -- passed to a function,
+// captured, bound to a second name, its address taken -- could leave it reachable from something that
+// outlives the call, so the whole body is refused rather than followed there. Locals are named
+// uniquely within a body (a shadowing one is renamed), so a name is one local.
 private answers_fresh(f: TFunc) -> bool
-    var fresh = fresh_block(f.body)
+    var st = Fresh(buf(), buf(), false)
+    val p = &st
+
+    walk_block_stmts(f.body, stmt_walk(false, s -> fresh_local(p, s)))
+
+    var fresh = fresh_block(p, f.body)
     val sink = &fresh
 
-    walk_block_stmts(f.body, stmt_walk(false, s -> fresh_return(sink, s)))
-    fresh
+    walk_block_stmts(f.body, stmt_walk(false, s -> fresh_return(p, sink, s)))
 
-private fresh_return(sink: *bool, s: TStmt)
+    if !fresh then return false
+
+    var mentions: Buf[string] = buf()
+    val seen = &mentions
+
+    walk_block_stmts(f.body, TWalk(false, e -> fresh_use(p, seen, e), w -> fresh_write(p, w.place, w.value),
+                                   s -> ()))
+
+    if st.spoiled then return false
+
+    for name in st.locals
+        if occurrences(mentions, name) != occurrences(st.cleared, name) then return false
+
+    true
+end answers_fresh
+
+private occurrences(names: Buf[string], name: string) -> int
+    var n = 0
+
+    for item in names
+        if item == name then n += 1
+
+    n
+end occurrences
+
+// A local whose type shares a count, and whose initializer is fresh, is one the walk follows.
+private fresh_local(st: *Fresh, s: TStmt)
     s match
-        TReturn(v) -> if v.is_some() && !fresh_value(v.unwrap()) then *sink = false
+        TVarDecl(name, ty, init, _) ->
+            if unshareable(ty).is_some() && tentative(st, init) then st.locals.push(name)
         _ -> ()
 
-private fresh_block(b: TBlock) -> bool = b.result match
-    Some(r) -> fresh_value(r)
+private fresh_return(st: *Fresh, sink: *bool, s: TStmt)
+    s match
+        TReturn(v) -> if v.is_some() && !fresh_value(st, v.unwrap()) then *sink = false
+        _ -> ()
+
+// One node of the body, asked about the fresh locals it mentions.
+private fresh_use(st: *Fresh, seen: *Buf[string], e: TExpr)
+    *e.kind match
+        TLoad(name, _) -> if holds_string(st.locals, name) then seen.push(name)
+        TStore(place, value, _, _) -> fresh_write(st, place, value)
+        TForEach(_, elem, seq, _, _, _) -> if inert(elem) then clear_chain(st, seq)
+        _ -> if inert(texpr_type(e)) then clear_read(st, e)
+end fresh_use
+
+// A node that comes to a value holding no count and no address, read straight out of a fresh local
+// -- a field, an element, a length, a `Buf` member's answer -- lets nothing of the local go.
+private clear_read(st: *Fresh, e: TExpr)
+    val inner: Option[TExpr] = *e.kind match
+        TField(r, _, _) -> Some(r)
+        TIndex(r, _, _) -> Some(r)
+        TLen(r, _) -> Some(r)
+        TDeref(r, _) -> Some(r)
+        TCall(name, args, _, _) ->
+            if !args.is_empty() && rooted_fresh(st, args.at(0)) && call_keeps_nothing(st, name, args) then Some(args.at(0))
+            else None
+        _ -> None
+
+    if inner.is_some() then clear_chain(st, inner.unwrap())
+end clear_read
+
+// A write into a place rooted at a fresh local has to write something fresh, or the local now shares
+// it. A write of a whole value, or of a part that holds a count, is itself a harmless mention.
+private fresh_write(st: *Fresh, place: TExpr, value: TExpr)
+    if !rooted_fresh(st, place) then return
+
+    if !fresh_arg(st, value)
+        st.spoiled = true
+        return
+
+    if !inert(texpr_type(place)) then clear_chain(st, place)
+end fresh_write
+
+// Follows a chain of reads down to the fresh local it starts from, through nodes that still hold a
+// count or an address, and clears that one mention. A chain that does not start from one is left
+// alone before anything in it is asked: what its calls are handed goes into something else.
+private clear_chain(st: *Fresh, start: TExpr)
+    if !rooted_fresh(st, start) then return
+
+    var at = start
+
+    loop
+        if inert(texpr_type(at)) then return
+
+        val next: Option[TExpr] = *at.kind match
+            TLoad(name, _) ->
+                if holds_string(st.locals, name) then st.cleared.push(name)
+                return
+            _ -> chain_step(st, at)
+
+        if next.is_none() then return
+
+        at = next.unwrap()
+end clear_chain
+
+private rooted_fresh(st: *Fresh, e: TExpr) -> bool
+    val root = chain_root(e)
+
+    root.is_some() && holds_string(st.locals, root.unwrap())
+
+// The local a chain of reads or a place starts from, where it is one.
+private chain_root(start: TExpr) -> Option[string]
+    var at = start
+
+    loop
+        val next: Option[TExpr] = *at.kind match
+            TLoad(name, _) -> return Some(name)
+            TCall(name, args, _, _) -> if is_buf_member(name) && !args.is_empty() then Some(args.at(0)) else None
+            _ -> chain_step_shape(at)
+
+        if next.is_none() then return None
+
+        at = next.unwrap()
+end chain_root
+
+// One step down a chain of reads, where the node only reads what it is handed.
+private chain_step(st: *Fresh, e: TExpr) -> Option[TExpr] = *e.kind match
+    TCall(name, args, _, _) ->
+        if is_buf_member(name) && !args.is_empty() && call_keeps_nothing(st, name, args) then Some(args.at(0))
+        else None
+    _ -> chain_step_shape(e)
+
+private chain_step_shape(e: TExpr) -> Option[TExpr] = *e.kind match
+    TAddrOf(p, _) -> Some(p)
+    TDeref(p, _) -> Some(p)
+    TField(r, _, _) -> Some(r)
+    TIndex(r, _, _) -> Some(r)
+    TLen(r, _) -> Some(r)
+    TSlice(base, _, _, _, _) -> Some(base)
+    TConstView(arg) -> Some(arg)
+    _ -> None
+
+// Whether a call handed a fresh local first can keep nothing of what it is handed: every other
+// argument is fresh or holds no count and no address -- or the call is the library `Buf`'s own
+// member over elements that hold no count, which copies what it is given and keeps nothing of
+// itself anywhere. Every argument is asked either way, so the fresh locals in them are cleared.
+private call_keeps_nothing(st: *Fresh, name: string, args: Buf[TExpr]) -> bool
+    var all = true
+
+    for i in 1..<args.len()
+        if !fresh_arg(st, args.at(i)) then all = false
+
+    all || is_buf_member(name) && plain_elements(texpr_type(args.at(0)))
+end call_keeps_nothing
+
+// The library's `Buf`, whose members keep nothing of the buffer they are called on.
+private is_buf_member(name: string) -> bool = name.starts_with(module_qualify("sysl.buf", "Buf") + ".")
+
+// Whether a `Buf` (or a pointer to one) holds elements that share no count.
+private plain_elements(t: Type) -> bool = t match
+    Ptr(inner) -> plain_elements(*inner)
+    Struct(d) -> d.base == module_qualify("sysl.buf", "Buf") && d.targs.len() == 1 &&
+                 unshareable(d.targs.at(0)).is_none()
+    _ -> false
+
+// A value that holds no count and no address, so nothing about it can be shared with anything.
+private inert(t: Type) -> bool = unshareable(t).is_none() && !holds_address(t)
+
+private holds_address(t: Type) -> bool = t match
+    Ptr(_) -> true
+    Ref(_, _) -> true
+    Weak(_) -> true
+    Array(_, elem) -> holds_address(*elem)
+    Constrained(d) -> holds_address(d.base)
+    Struct(d) -> any_address(d.fields)
+    Enum(d) -> variants_address(d.variants)
+    _ -> false
+
+private any_address(fields: Buf[(string, Type)]) -> bool
+    for item in fields
+        if holds_address(item.1) then return true
+
+    false
+
+private variants_address(vs: Buf[EnumVariant]) -> bool
+    for item in vs
+        if any_address(item.fields) then return true
+
+    false
+
+// An argument that may go into a call without sharing anything: one holding no count and no
+// address, or a fresh value.
+private fresh_arg(st: *Fresh, e: TExpr) -> bool =
+    inert(texpr_type(e)) || (unshareable(texpr_type(e)).is_some() && tentative(st, e))
+
+// Whether a value is fresh, keeping the mentions it cleared only where it is.
+private tentative(st: *Fresh, e: TExpr) -> bool
+    val mark = st.cleared.len()
+
+    if fresh_value(st, e) then return true
+
+    st.cleared.truncate(mark)
+    false
+
+private fresh_block(st: *Fresh, b: TBlock) -> bool = b.result match
+    Some(r) -> fresh_value(st, r)
     None -> true
 
 // A value that shares no count that is not atomic: one whose type carries none, a literal, a copy of
-// a string, or something built of those.
-private fresh_value(e: TExpr) -> bool
+// a string, a call handed only fresh or inert arguments, a `.copy()` of a `Buf` whose elements hold
+// no count, a fresh local, or something built of those.
+private fresh_value(st: *Fresh, e: TExpr) -> bool
     if unshareable(texpr_type(e)).is_none() then return true
 
     *e.kind match
         TStrLit(_) -> true
         TFromBytes(_) -> true
+        TLoad(name, _) ->
+            if !holds_string(st.locals, name) then return false
+
+            st.cleared.push(name)
+            true
+        TCall(name, args, ty, _) -> fresh_call(st, name, args, ty)
+        TConstView(arg) -> fresh_value(st, arg)
         TIf(_, then_block, else_block, _) ->
-            fresh_block(then_block) && (else_block.is_none() || fresh_block(else_block.unwrap()))
-        TMatch(_, arms, _) -> fresh_arms(arms)
-        TBlockExpr(b) -> fresh_block(b)
-        TEnumNew(_, _, parts) -> all_fresh(parts)
-        TStructNew(_, parts) -> all_fresh(parts)
+            fresh_block(st, then_block) && (else_block.is_none() || fresh_block(st, else_block.unwrap()))
+        TMatch(_, arms, _) -> fresh_arms(st, arms)
+        TBlockExpr(b) -> fresh_block(st, b)
+        TEnumNew(_, _, parts) -> all_fresh(st, parts)
+        TStructNew(_, parts) -> all_fresh(st, parts)
         _ -> false
 end fresh_value
 
-private fresh_arms(arms: Buf[TArm]) -> bool
+// A call answers something fresh where nothing it is handed can be in what it answers: every
+// argument is fresh or holds no count and no address. A `Buf`'s `.copy()` is fresh whatever it is
+// called on, where the elements it copies hold no count.
+private fresh_call(st: *Fresh, name: string, args: Buf[TExpr], ty: Type) -> bool
+    if name.starts_with(module_qualify("sysl.buf", "Buf") + ".copy.") && plain_elements(ty)
+        if !args.is_empty() then tentative(st, args.at(0))
+
+        return true
+
+    for arg in args
+        if !fresh_arg(st, arg) then return false
+
+    true
+end fresh_call
+
+private fresh_arms(st: *Fresh, arms: Buf[TArm]) -> bool
     for arm in arms
-        if !fresh_block(arm.body) then return false
+        if !fresh_block(st, arm.body) then return false
 
     true
 
-private all_fresh(parts: Buf[TExpr]) -> bool
+private all_fresh(st: *Fresh, parts: Buf[TExpr]) -> bool
     for part in parts
-        if !fresh_value(part) then return false
+        if !fresh_value(st, part) then return false
 
     true
 
@@ -204,5 +442,5 @@ private leaving_remedy(ty: Type) -> string
                "literal is immortal"
 
     "whose count is not atomic. Answer what the caller needs from it — a count, a flag, a " +
-    "'.copy()' of a string — rather than the value itself"
+    "'.copy()' of a string, a value built fresh inside the closure — rather than the value itself"
 end leaving_remedy
