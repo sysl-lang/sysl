@@ -1,0 +1,245 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.text.cstring
+import sysl.fs.{make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// **A task holds its arguments until it ends** (`reference/memory.md § A borrowed pointer cannot
+// escape`, `reference/async.md § A task holds its arguments`). Calling an `async` function runs none
+// of its body: it answers a task, and the body reads its parameters when the task is driven -- after
+// the call has returned. So an async call keeps every parameter while its task lives, and the task is
+// followed as a thread's handle is (`keeps_join.sysl`): awaited or `block_on`'d in the frame that lent
+// the address -- where the call is written, or from a local it was kept in -- it takes the address
+// back; answered, stored, queued, thrown away, or still held at a way out, it is refused at the
+// argument. A view of a local array handed to an async call moves the array to the heap instead.
+//
+// Each refused cell asserts the whole diagnostic and its place; each accepted cell its output, and
+// again under AddressSanitizer with the binary's report hooks counted, so an accepted cell that read a
+// dead frame fails rather than printing a lucky value.
+//
+// Skipped cells, and why: a task built into a struct literal (`Pending(work(&n))`) and driven through
+// the field is held for good, as a thread's handle there is (`tests_jnd_joined.sysl` pins that
+// shape); `step` drives a task but does not end it, so it takes nothing back, and an executor's queue
+// is the module-storage cell; a function pointer cannot name an async function's task-answering call
+// any differently from a plain one, and is `tests_kfp_*`'s; bare metal changes no part of an analysis
+// that runs before lowering.
+
+private extern "setenv" atk_c_setenv(name: *u8, value: *u8, overwrite: int) -> int
+private extern "unsetenv" atk_c_unsetenv(name: *u8) -> int
+
+private atk_cure(callee: string, param: string, arg: string, owner: string) -> string =
+    s"'$callee' keeps its parameter '$param' (the task it answers holds it until that task is awaited), " +
+        s"and '$arg' is the address of a local of '$owner' — await that task on every way out of '$owner', " +
+        "or hand it storage that lasts"
+
+private atk_refused(program: string, said: string, at: string)
+    if !azd_ready() then return
+
+    val got = azd_err(program)
+
+    assert(got.contains(s"error: $said"), got)
+    assert(got.contains(s"main.sysl:$at"), got)
+end atk_refused
+
+// What the program prints when built under `flags` (none where empty), and how many ASan report hooks
+// the binary calls.
+private atk_outcome(program: string, flags: string) -> (string, usize)
+    val root = make_temp_dir("sysl-atk").unwrap()
+
+    write_text(s"$root/main.sysl", program).unwrap()
+
+    val exe = s"$root/built"
+    val n = cstring("SYSL_EXTRA_CFLAGS")
+    val v = cstring(flags)
+
+    if flags != "" then atk_c_setenv(n.ptr, v.ptr, 1)
+
+    val made = build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe))
+
+    if flags != "" then atk_c_unsetenv(n.ptr)
+
+    made match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (s"it did not build: ${failure_text(why)}", 0)
+        Ok(_) -> ()
+
+    val hooks = capture("nm", ["-u", exe], "", [], true) match
+        Ok(out) -> out.text.count_of("__asan_report")
+        Err(_) -> 0
+
+    val ran = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    val said = ran match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> if out.status.ok() then out.text else
+            s"it did not run to the end: ${out.text}${out.err.unwrap_or("")}"
+
+    (said, hooks)
+end atk_outcome
+
+// The program prints `want` under AddressSanitizer, with the sysl side instrumented.
+private atk_runs_clean(program: string, want: string)
+    if !azd_ready() then return
+
+    val got = atk_outcome(program, "-fsanitize=address -g")
+
+    assert_eq(got.0, want, "under ASan")
+    assert(got.1 > 1, s"the binary calls ${got.1} ASan report hooks, so it is not instrumented")
+end atk_runs_clean
+
+private atk_work() -> string = "async work(p: *int) -> int\n    *p += 1\n    *p\n\n"
+
+// -- refused: the task leaves the frame that lent the address ---------------------------------------
+
+@test("a task holding the address of a local, answered out of its frame, is refused at the argument")
+atk_pointer_answered()
+    atk_refused(atk_work() + "make() -> Task[int]\n    var n = 0\n\n    work(&n)\n\nprint(block_on(make()))\n",
+                atk_cure("work", "p", "&n", "make"), "8:10")
+
+@test("a closure over a local's address handed to an async call whose task is answered is refused")
+atk_closure_answered()
+    atk_refused("async work(f: &Fn() -> unit) -> int\n    f()\n    1\n\nmake() -> Task[int]\n    var n = 0\n" +
+                "    val p = &n\n\n    work(() -> *p += 1)\n\nprint(block_on(make()))\n",
+                "'work' keeps its parameter 'f' (the task it answers holds it until that task is awaited), and " +
+                "'() -> *p += 1' holds the address of a local of 'make' — await that task on every way out of " +
+                "'make', or hand it storage that lasts", "9:10")
+
+@test("a task over a local stored in module storage is refused")
+atk_module_storage()
+    atk_refused("static var queued: Option[Task[int]] = None\n\n" + atk_work() +
+                "run()\n    var n = 1\n\n    queued = Some(work(&n))\n\nrun()\n",
+                atk_cure("work", "p", "&n", "run"), "10:24")
+
+@test("a task pushed onto an executor's queue in module storage is refused")
+atk_queued()
+    atk_refused("import sysl.buf.{Buf, buf}\n\nstatic var ready: Buf[Task[int]] = buf()\n\n" + atk_work() +
+                "run()\n    var n = 1\n\n    ready.push(work(&n))\n\nrun()\n",
+                atk_cure("work", "p", "&n", "run"), "12:21")
+
+@test("a plain function answering the task of its own parameter passes the keep on to its caller")
+atk_wrapper_answered()
+    atk_refused(atk_work() + "later(p: *int) -> Task[int] = work(p)\n\nmake() -> Task[int]\n    var n = 1\n\n" +
+                "    later(&n)\n\nprint(block_on(make()))\n",
+                "'later' keeps its parameter 'p' (it is passed to 'work', which keeps it), and '&n' is the " +
+                "address of a local of 'make' — await that task on every way out of 'make', or hand it " +
+                "storage that lasts", "10:11")
+
+@test("a generic async function keeps its parameter as the concrete one does")
+atk_generic()
+    atk_refused("async work[T](p: *T, v: T) -> int\n    *p = v\n    1\n\nmake() -> Task[int]\n    var n = 0\n\n" +
+                "    work(&n, 3)\n\nprint(block_on(make()))\n", atk_cure("work", "p", "&n", "make"), "8:10")
+
+@test("an outer async function that awaits an inner one still holds its parameter in its own task")
+atk_nested_answered()
+    atk_refused(atk_work() + "async outer(p: *int) -> int = await work(p)\n\nmake() -> Task[int]\n" +
+                "    var n = 0\n\n    outer(&n)\n\nprint(block_on(make()))\n",
+                atk_cure("outer", "p", "&n", "make"), "10:11")
+
+@test("a task driven on one way out only is refused at the way that leaves it running")
+atk_one_way()
+    atk_refused(atk_work() + "run(go: bool) -> int\n    var n = 0\n    val t = work(&n)\n\n" +
+                "    if go then return block_on(t)\n\n    n\n\nprint(run(true))\n",
+                atk_cure("work", "p", "&n", "run"), "7:18")
+
+@test("a task made and thrown away holds the address with nobody to drive it")
+atk_thrown_away()
+    atk_refused(atk_work() + "run() -> int\n    var n = 0\n\n    work(&n)\n    n\n\nprint(run())\n",
+                atk_cure("work", "p", "&n", "run"), "8:10")
+
+@test("a '*self' async method on a local, its task answered, is refused at the receiver")
+atk_self_answered()
+    atk_refused("struct Adc\n    reads: int\n\n    async sample(*self) -> int\n        self.reads += 1\n" +
+                "        self.reads\n\nmake() -> Task[int]\n    var adc = Adc(0)\n\n    adc.sample()\n\n" +
+                "print(block_on(make()))\n",
+                "'sample' keeps its parameter 'self' (the task it answers holds it until that task is awaited), " +
+                "and 'adc' is a local of 'make' — await that task on every way out of 'make', or hand it " +
+                "storage that lasts", "11:9")
+
+@test("an async body that stores its parameter keeps it for good, and awaiting its task does not help")
+atk_body_stores()
+    atk_refused("static var last: *int = null\n\nasync work(p: *int) -> int\n    last = p\n    1\n\n" +
+                "run() -> int\n    var n = 0\n\n    block_on(work(&n))\n\nprint(run())\n",
+                "'work' keeps its parameter 'p' (it is stored in 'last'), and '&n' is the address of a local of 'run'",
+                "10:19")
+
+@test("an async method reached through a trait object, its task answered, is refused")
+atk_object_answered()
+    atk_refused("trait Source\n    async read(self, p: *int) -> int\n\nstruct Adc\n    ch: int\n\n" +
+                "impl Source for Adc\n    async read(self, p: *int) -> int\n        *p += self.ch\n        *p\n\n" +
+                "make(s: &Source) -> Task[int]\n    var n = 0\n\n    s.read(&n)\n\nprint(block_on(make(Adc(3))))\n",
+                atk_cure("read", "p", "&n", "make"), "15:12")
+
+// -- accepted: the task ends before the frame does ---------------------------------------------------
+
+@test("a closure over a local's address handed to an async call driven where it is written")
+atk_closure_driven()
+    atk_runs_clean("async work(f: &Fn() -> unit) -> int\n    f()\n    1\n\nrun() -> int\n    var n = 0\n" +
+                   "    val p = &n\n\n    block_on(work(() -> *p += 1)) + n\n\nprint(run())\n", "2\n")
+
+@test("a task kept in a local and driven before the frame ends")
+atk_local_driven()
+    atk_runs_clean(atk_work() + "run() -> int\n    var n = 4\n    val t = work(&n)\n\n    block_on(t) + n\n\n" +
+                   "print(run())\n", "10\n")
+
+@test("in an async body, a task awaited where it is made and one awaited from a local")
+atk_awaited_in_body()
+    atk_runs_clean(atk_work() + "async run() -> int\n    var n = 1\n    val a = await work(&n)\n" +
+                   "    val t = work(&n)\n\n    a + await t\n\nprint(block_on(run()))\n", "5\n")
+
+@test("a closure over a local's address in an async body, awaited in place and from a local")
+atk_closure_awaited()
+    atk_runs_clean("async work(f: &Fn() -> unit) -> int\n    f()\n    1\n\nasync run() -> int\n    var n = 0\n" +
+                   "    val p = &n\n    val a = await work(() -> *p += 1)\n    val t = work(() -> *p += 10)\n\n" +
+                   "    a + await t + n\n\nprint(block_on(run()))\n", "13\n")
+
+@test("a wrapper answering the task of its own parameter, driven in the caller's frame")
+atk_wrapper_driven()
+    atk_runs_clean("async work(p: *int) -> int\n    *p += 10\n    *p\n\nlater(p: *int) -> Task[int] = work(p)\n\n" +
+                   "run() -> int\n    var n = 1\n\n    block_on(later(&n)) + n\n\nprint(run())\n", "22\n")
+
+@test("nested async functions handing a parameter on, the outer task driven in the frame")
+atk_nested_driven()
+    atk_runs_clean(atk_work() + "async outer(p: *int) -> int\n    val t = work(p)\n\n    (await t) + (await work(p))\n\n" +
+                   "run() -> int\n    var n = 0\n\n    block_on(outer(&n)) + n\n\nprint(run())\n", "5\n")
+
+@test("counted, '&sync', owned and literal-slice arguments: a task answered out of the frame is fine")
+atk_owned_answered()
+    atk_runs_clean("struct Counter\n    n: int\n\nasync bump(c: &Counter, by: int, label: string, xs: []const int) -> int\n" +
+                   "    c.n += by\n    print(label, xs.len)\n    c.n\n\nmake() -> Task[int]\n    val c = Counter(5)\n\n" +
+                   "    bump(c, 2, \"counted\", [1, 2, 3])\n\nshared() -> Task[int]\n    val c: &sync Counter = Counter(7)\n\n" +
+                   "    bump(Counter(c.n), 1, \"sync\", [])\n\nprint(block_on(make()))\nprint(block_on(shared()))\n",
+                   "counted 3\n7\nsync 0\n8\n")
+
+@test("a view of a local array handed to an async call whose task leaves the frame moves the array to the heap")
+atk_view_answered()
+    atk_runs_clean("async total(xs: []const int) -> int\n    var s = 0\n\n    for x in xs\n        s += x\n\n    s\n\n" +
+                   "make(k: int) -> Task[int]\n    val a = [k, k + 1, k + 2]\n\n    total(a[..])\n\n" +
+                   "print(block_on(make(10)))\n", "33\n")
+
+@test("a view of a local array handed to an async call driven where it is written, plainly and in an async body")
+atk_view_driven()
+    atk_runs_clean("async total(xs: []const int) -> int\n    var s = 0\n\n    for x in xs\n        s += x\n\n    s\n\n" +
+                   "run(k: int) -> int\n    val a = [k, k + 1]\n\n    block_on(total(a[..]))\n\n" +
+                   "async twice(k: int) -> int\n    val a = [k, k]\n\n    await total(a[..])\n\n" +
+                   "print(run(10), block_on(twice(4)))\n", "21 8\n")
+
+@test("a '*self' async method on a local, driven where it is called")
+atk_self_driven()
+    atk_runs_clean("struct Adc\n    reads: int\n\n    async sample(*self) -> int\n        self.reads += 1\n" +
+                   "        self.reads\n\nrun() -> int\n    var adc = Adc(0)\n\n" +
+                   "    block_on(adc.sample()) + block_on(adc.sample())\n\nprint(run())\n", "3\n")
+
+@test("through a trait object: a task driven in place and from a local, and a view the task carries out")
+atk_object_driven()
+    atk_runs_clean("trait Source\n    async read(self, p: *int) -> int\n    async total(self, xs: []const int) -> int\n\n" +
+                   "struct Adc\n    ch: int\n\nimpl Source for Adc\n    async read(self, p: *int) -> int\n" +
+                   "        *p += self.ch\n        *p\n\n    async total(self, xs: []const int) -> int\n" +
+                   "        var s = self.ch\n\n        for x in xs\n            s += x\n\n        s\n\n" +
+                   "run(s: &Source) -> int\n    var n = 1\n    val t = s.read(&n)\n\n" +
+                   "    block_on(s.read(&n)) + block_on(t)\n\nmake(s: &Source, k: int) -> Task[int]\n" +
+                   "    val a = [k, k + 1]\n\n    s.total(a[..])\n\nprint(run(Adc(3)))\nprint(block_on(make(Adc(3), 10)))\n",
+                   "11\n24\n")

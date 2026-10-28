@@ -141,6 +141,10 @@ struct EscapeWalk
     // scope encloses whose (`outlives`).
     decl_at: Buf[(string, Span)]
     blocks: Buf[Span]
+
+    // Every call written straight under an `await` or a `block_on`: its task ends before the
+    // expression does, so what it was handed outlives nothing.
+    driven: Buf[Span]
 end EscapeWalk
 
 // One promotion, with its parts still separate.
@@ -450,7 +454,7 @@ private walk_seeded(p: TProgram, keeps: &KeptParams, seeds: Buf[(string, EView)]
     var framed: Buf[Span] = buf()
 
     val w: &EscapeWalk = EscapeWalk(seeds, promoted, temps, sites, false, None, returning, locals,
-                                    ref_of, aligned, lits, framed, decl_at, blocks)
+                                    ref_of, aligned, lits, framed, decl_at, blocks, buf())
     val prog = p
     val kp = keeps
     var changed = true
@@ -700,15 +704,23 @@ private escaping_one(p: TProgram, keeps: &KeptParams, w: &EscapeWalk, e: TExpr) 
         else if op == "slot_put" && args.len() == 2 && views(p, keeps, w, args.at(1)).non_empty()
             gets_out(p, keeps, w, args.at(1), "is stored somewhere the frame does not own")
 
+    // A task driven where its call is written ends before the expression does.
+    TAwait(task, _) -> w.driven.push(task.span)
+    TBlockOn(task, _) -> w.driven.push(task.span)
+
     TCall(name, args, ty, _) ->
         val frames = frames_literals(ty)
+
+        // A task holds what its call was handed until it ends, which is past the frame unless it is
+        // driven right here.
+        val tasked = async_callee(p, keeps, name) && !holds_span(w.driven, e.span)
 
         for i in 0..<args.len()
             if frames && literal_argument(args.at(i))
                 frame_literal(w, args.at(i), kept_by(p, keeps, name, i) || async_callee(p, keeps, name),
                               s"is passed to '$name', which holds on to it")
 
-            if views(p, keeps, w, args.at(i)).non_empty() && kept_by(p, keeps, name, i)
+            if views(p, keeps, w, args.at(i)).non_empty() && (kept_by(p, keeps, name, i) || tasked)
                 gets_out(p, keeps, w, args.at(i), s"is passed to '$name', which holds on to it")
 
     // Which body a trait object's call reaches is decided at run time, so there is no one summary to
@@ -718,7 +730,10 @@ private escaping_one(p: TProgram, keeps: &KeptParams, w: &EscapeWalk, e: TExpr) 
     // `&Fn` may keep what it is handed, and the conservative answer is the only sound one there,
     // exactly as it is for a function whose body this program does not have.
     TVCall(recv, _, args, ty, _) ->
-        val borrowed = borrowed_through(texpr_type(recv))
+        // A method whose call answers a task holds its arguments until the task runs, whatever the
+        // trait promises -- unless it is driven right here.
+        val borrowed = borrowed_through(texpr_type(recv)) &&
+            (task_result(ty).is_none() || holds_span(w.driven, e.span))
         val frames = frames_literals(ty)
 
         for i in 0..<args.len()

@@ -4170,7 +4170,11 @@ each pointer it is handed, so it works that out, and nothing is written for it.
 
 - it stores it somewhere the call does not own — a field reached through a pointer, module storage, a
   buffer's slot, or a box or a closure that is stored there;
-- it passes it to another function's parameter that keeps it.
+- it passes it to another function's parameter that keeps it;
+- it is `async`: the task its call answers holds every parameter until that task ends, so a call
+  is accepted only where the task is awaited or `block_on`'d before the frame that lent the address
+  ends ([a task holds its arguments](/reference/async/#a-task-holds-its-arguments-until-it-ends)) —
+  the rule a [thread's handle](#a-thread-holds-what-it-is-handed-until-it-is-joined) is held to.
 
 **The address as an integer is the address**: `usize(p)` handed back directly, and a call's answer
 that is one, is followed as `p` would be. `usize(p)` stored somewhere the call does not own, or
