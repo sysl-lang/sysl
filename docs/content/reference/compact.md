@@ -571,7 +571,8 @@ reads like sysl from sysl that reads like C with different punctuation.
 - **No literal suffix where the position gives the type.** `if xs.len > 1`, not `1usize`; `b[0]`, not
   `b[0usize]`. Arithmetic propagates it, and a `match` or an `if` takes it from the sibling arm.
 - A `var i = 0` or a `for s in 1..3` takes its type from its first use that fixes one (an argument,
-  a comparison, an assignment, a result), so `wide(s)` makes `s` a `u64`. The one place to say it is
+  a comparison, an assignment, a result), so `wide(s)` makes `s` a `u64`; a `for` variable is
+  fixed by arithmetic with a typed operand too, so `n += s` makes `s` the `n`'s type. The one place to say it is
   a binding no use fixes, which is `int`. Better still, reach for `for i in 0..<xs.len`, which needs
   neither.
 - **A suffix is load-bearing in five places**, and stays: an array literal's element type
