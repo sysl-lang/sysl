@@ -256,9 +256,97 @@ wso_inference()
         val w = m +% 6
         print(w)
         val y = k(u8(255))
-        print(y + 300, y +| 300, y +% 256, y +| 255)
+        print(y + 300, y +| 255, y +% 255, 255 -| y)
         """,
-        "255 255 255 -32768\n65535 65535 0\n0\n555 555 511 255\n")
+        "255 255 255 -32768\n65535 65535 0\n0\n555 255 254 0\n")
+
+// -- a literal the other operand's type does not hold ---------------------------------------------
+
+// The words every refusal of a literal beside a typed operand ends with.
+private val WsoHeld: string = "a wrapping or saturating operator takes two values of one type"
+
+@test("a literal that fits the typed operand's type exactly is taken, on either side, in hex and binary too")
+wso_literal_at_the_edge()
+    wso_prints(WsoKeep + raw"""
+        val y = k(u8(250))
+        print(y +| 255, 255 +| y, y +% 0xFF, y -| 0b1111_1111, 6 +% y)
+        val s = k(i8(-100))
+        print(s -| 127, s +| -128, -128 +| s, s *| 127, s *% -128)
+        val w = k(u64(18446744073709551615))
+        print(w +| 0xFFFF_FFFF_FFFF_FFFF, w *% 0xFFFF_FFFF_FFFF_FFFF)
+        val q = k(i128(1))
+        print(q *| 170141183460469231731687303715884105727, q -| -170141183460469231731687303715884105728)
+        val t = k(u12(4000))
+        print(t +| 0b1111_1111_1111, t +% 0xFFF)
+        """,
+        "255 255 249 0 0\n-128 -128 -128 -128 0\n" +
+        "18446744073709551615 1\n" +
+        "170141183460469231731687303715884105727 170141183460469231731687303715884105727\n" +
+        "4095 3999\n")
+
+@test("a literal one past the typed operand's range is refused at u8, i8, u64, i128 and u12, naming the operator")
+wso_literal_past_the_edge_refused()
+    wso_refused("val y: u8 = 255\nprint(y +| 300)\n",
+                s"the literal 300 does not fit byte, the type of the other operand of '+|' — $WsoHeld")
+    wso_refused("val y: u8 = 255\nprint(y +% 256)\n", "the literal 256 does not fit byte, the type of the other operand of '+%'")
+    wso_refused("val y: u8 = 1\nprint(y *| 256)\n", "the literal 256 does not fit byte, the type of the other operand of '*|'")
+    wso_refused("val s: i8 = 1\nprint(s -% 128)\n", "the literal 128 does not fit i8, the type of the other operand of '-%'")
+    wso_refused("val s: i8 = 1\nprint(s *| -129)\n", "the literal -129 does not fit i8, the type of the other operand of '*|'")
+    wso_refused("val w: u64 = 1\nprint(w +| 18446744073709551616)\n",
+                "the literal 18446744073709551616 does not fit ulong, the type of the other operand of '+|'")
+    wso_refused("val q: i128 = 1\nprint(q -| 170141183460469231731687303715884105728)\n",
+                "the literal 170141183460469231731687303715884105728 does not fit i128")
+    wso_refused("val t: u12 = 1\nprint(t *% 4096)\n", "the literal 4096 does not fit u12, the type of the other operand of '*%'")
+
+@test("the literal is refused on the left too, and a negative literal beside an unsigned operand")
+wso_literal_left_and_negative_refused()
+    wso_refused("val y: u8 = 1\nprint(300 +% y)\n", "the literal 300 does not fit byte, the type of the other operand of '+%'")
+    wso_refused("val y: u8 = 1\nprint(256 -| y)\n", "the literal 256 does not fit byte, the type of the other operand of '-|'")
+    wso_refused("val y: u8 = 1\nprint(y +| -1)\n", "the literal -1 does not fit byte, the type of the other operand of '+|'")
+    wso_refused("val u: u64 = 1\nprint(-1 *% u)\n", "the literal -1 does not fit ulong, the type of the other operand of '*%'")
+
+@test("a hex or binary literal past the range is refused by its value")
+wso_literal_radix_refused()
+    wso_refused("val w: u64 = 1\nprint(w +| 0x1_0000_0000_0000_0000)\n",
+                "the literal 18446744073709551616 does not fit ulong, the type of the other operand of '+|'")
+    wso_refused("val t: u12 = 1\nprint(t *| 0b1_0000_0000_0000)\n", "the literal 4096 does not fit u12")
+    wso_refused("val y: u8 = 1\nprint(y -% 0x100)\n", "the literal 256 does not fit byte")
+
+@test("plain '+' still widens past the typed operand's type where the literal does not fit it")
+wso_plain_still_widens()
+    wso_prints(WsoKeep + "val y = k(u8(255))\nprint(y + 300, y - 256, y * 300)\n", "555 -1 76500\n")
+
+@test("a compound or yielding form holds its literal to the place's type, naming the operator")
+wso_compound_literal_refused()
+    wso_refused("var z: u8 = 1\nz +|= 300\nprint(z)\n",
+                s"the literal 300 does not fit byte, the type of the other operand of '+|' — $WsoHeld")
+    wso_refused("var z: u8 = 1\nz -%= -1\nprint(z)\n", "the literal -1 does not fit byte, the type of the other operand of '-%'")
+    wso_refused("var z: i8 = 1\nz *|= 128\nprint(z)\n", "the literal 128 does not fit i8, the type of the other operand of '*|'")
+    wso_refused("var z: u8 = 1\nprint(z *%:= 256)\n", "the literal 256 does not fit byte, the type of the other operand of '*%'")
+    wso_refused("var z: u12 = 1\nprint(z +|:= 0x1000)\n", "the literal 4096 does not fit u12, the type of the other operand of '+|'")
+    wso_prints(WsoKeep + "var z: u8 = k(200)\nz +|= 255\nprint(z)\nprint(z -%:= 255, z *|:= 255)\n", "255\n0 0\n")
+
+@test("a typed constant is an operand of its own type, refused where it does not widen, and its literal init is held")
+wso_const_operand()
+    wso_refused("const K: i8 = 3\nval y: u8 = 1\nprint(y +| K)\n", "'+|' needs matching types, got byte and i8")
+    wso_refused("const A: u8 = 250\nconst B: u8 = A +| 300\nprint(B)\n",
+                "the literal 300 does not fit byte, the type of the other operand of '+|'")
+    wso_refused("const B: u8 = 250 +% 256\nprint(B)\n", "256 does not fit")
+    wso_prints("const A: u8 = 250\nconst B: u8 = A +| 255\nconst C: u8 = 250 +| 10\nprint(B, C)\n", "255 255\n")
+
+@test("a literal beside a generic operand is held at the type the body is instantiated at")
+wso_generic_literal()
+    wso_prints("sat[T: Integer](a: T) -> T = a +| 1\nprint(sat(u8(255)), sat(i64(5)), sat(u12(4095)))\n",
+               "255 6 4095\n")
+    wso_refused("sat[T: Integer](a: T) -> T = a +| 300\nprint(sat(u8(1)))\n",
+                "the literal 300 does not fit byte, the type of the other operand of '+|'")
+
+@test("on fixed point a literal outside the format's range is refused; one inside it saturates or wraps")
+wso_fixed_literal()
+    wso_refused("val x: q7 = 0.5\nprint(x +| 2.0)\n", "the literal 2.0 does not fit q7, the type of the other operand of '+|'")
+    wso_refused("val x: i8q4 = 1\nprint(x +% 9)\n", "the literal 9 does not fit i8q4, the type of the other operand of '+%'")
+    wso_refused("var x: i8q4 = 1\nx -|= -9\nprint(real(x))\n", "the literal -9 does not fit i8q4")
+    wso_prints(WsoKeep + "val x: i8q4 = k(1)\nprint(real(x +| 7.5), real(x +% 7.5))\n", "7.9375 -7.5\n")
 
 @test("a generic body's operator is the one at the type it is instantiated at")
 wso_generic()

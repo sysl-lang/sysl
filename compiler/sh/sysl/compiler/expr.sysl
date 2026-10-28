@@ -2,7 +2,7 @@ module sh.sysl.compiler
 
 import sh.sysl.parsing.*
 import sysl.buf.{Buf, buf}
-import sysl.math.bigint.{BigInt, from_int, negate}
+import sysl.math.bigint.{BigInt, from_int, negate, to_string}
 
 // Typing an expression: the dispatcher every form goes through, and the leaves that are answered
 // here rather than in a file of their own.
@@ -1791,7 +1791,8 @@ private paired_operands(cx: &Analyzer, op: string, l: Expr, r: Expr,
     operands.push(r)
 
     val unshifted = op != "<<" && op != ">>"
-    val read = analyze_operands(cx, operands, numeric, unshifted, op == "*" || op == "/", false, unshifted)
+    val read = analyze_operands(cx, operands, numeric, unshifted, op == "*" || op == "/", false, unshifted,
+                                if is_wrap_sat_op(op) then op else "")
     val ts = if op == "+" || op == "-" then fixed_siblings(cx, operands, read) else read
     val tl = ts.at(0)
 
@@ -1976,9 +1977,14 @@ end identity_operands
 // product of two formats takes the format of where it is written (`reference/fixed-point.md § Two
 // formats`) -- rather than one being widened to the other first, which would round the product at
 // the wider operand's format.
+//
+// **`held` names a wrapping or saturating operator** (`wrap_sat.sysl`), whose two operands are two
+// values of one type: a literal beside a typed operand is read at that type and refused where it does
+// not fit, rather than taking its default for the typed operand to widen to -- `y +| 300` over a `u8`
+// is the 300 no `u8` holds, not an `int` sum of 555. That is Rust's reading of `255u8.saturating_add(300)`.
 analyze_operands(cx: &Analyzer, operands: Buf[Expr], expected: Option[Type],
                  widen: bool = false, rescales: bool = false, compared: bool = false,
-                 arithmetic: bool = false) -> Buf[TExpr]
+                 arithmetic: bool = false, held: string = "") -> Buf[TExpr]
     var own: Buf[Option[TExpr]] = buf()
     var refused_before = false
 
@@ -2027,7 +2033,8 @@ analyze_operands(cx: &Analyzer, operands: Buf[Expr], expected: Option[Type],
 
     val firm = unless_soft(told, soft)
     val ty = literal_widened(cx, operands, firm, told, firmest(operands, firm, widen, rescales).or_else(() -> expected),
-                             expected, widen, rescales).or_else(() -> if widen then float_among(operands) else None)
+                             expected, widen && held == "", rescales)
+                 .or_else(() -> if widen then float_among(operands) else None)
                  .or_else(() -> firmest(operands, told, widen, rescales))
     var out: Buf[TExpr] = buf()
 
@@ -2041,10 +2048,33 @@ analyze_operands(cx: &Analyzer, operands: Buf[Expr], expected: Option[Type],
 
                     out.push(reread(cx, t, operands.at(i), ty.unwrap(), widens))
                 else out.push(t)
-            None -> out.push(type_expr(cx, operands.at(i), ty))
+            None -> out.push(held_literal(cx, operands.at(i), ty, held, any_typed(operands, firm)))
 
     out
 end analyze_operands
+
+// A bare literal operand read at the pair's type -- told, where a wrapping or saturating operator
+// holds it to its typed neighbour's type (or, in a compound form, to its place's) and it does not fit
+// there, which operator held it.
+held_literal(cx: &Analyzer, e: Expr, ty: Option[Type], held: string, beside_typed: bool) -> TExpr
+    if held == "" || !beside_typed || ty.is_none() || !is_literal(e) || literal_fits(cx, e, ty.unwrap()) then
+        return type_expr(cx, e, ty)
+
+    val shown = *e.kind match
+        Unary(_, operand) -> held_text(operand).map(t -> "-" + t)
+        _ -> held_text(e)
+
+    if shown.is_none() then return type_expr(cx, e, ty)
+
+    cx.err(e.span, s"the literal ${shown.unwrap()} does not fit ${type_show(ty.unwrap())}, the type of " +
+           s"the other operand of '$held' — a wrapping or saturating operator takes two values of one type")
+end held_literal
+
+// A numeric literal as a refusal shows it: an integer by its value, a float as written.
+private held_text(e: Expr) -> Option[string] = *e.kind match
+    IntLit(digits, base, _) -> Some(to_string(literal_value(digits, base)))
+    FloatLit(text, _) -> Some(text)
+    _ -> None
 
 // **A literal is read at the typed operand's type where it fits there, and otherwise at its own
 // default**, to which the typed operands then widen: `h * 0.5` over an `f32` stays `f32` and `b + 3`
