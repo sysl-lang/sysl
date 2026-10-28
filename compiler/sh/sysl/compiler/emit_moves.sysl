@@ -272,6 +272,16 @@ private take_over(e: *Emit, x: TExpr, ty: Type, v: Val, lasting: bool)
         return
     end if
 
+    // A value built on the spot that the statement already holds whole -- a tuple of places handed to a
+    // call, which took one copy of it to keep it alive across the call -- hands over that copy, rather
+    // than taking a second for the destination and giving the first back at the statement's end.
+    val whole = temp_at(e, v, ty)
+
+    if whole.is_some()
+        forget_temp(e, whole.unwrap())
+        return
+    end if
+
     *x.kind match
         TLoad(name, _) -> forget_slot(e, local_at(e, name, ty, lasting).unwrap())
         TStructNew(_, args) -> take_fields(e, x, v, args, built_fields(x, ty).unwrap(), lasting)
@@ -306,8 +316,8 @@ private takes_any(e: *Emit, x: TExpr, ty: Type, v: Val, lasting: bool) -> bool
 
     *x.kind match
         TLoad(name, _) -> local_at(e, name, ty, lasting).is_some()
-        TStructNew(_, args) -> parts_take_any(e, x, ty, v, args, lasting)
-        TEnumNew(_, _, args) -> parts_take_any(e, x, ty, v, args, lasting)
+        TStructNew(_, args) -> temp_at(e, v, ty).is_some() || parts_take_any(e, x, ty, v, args, lasting)
+        TEnumNew(_, _, args) -> temp_at(e, v, ty).is_some() || parts_take_any(e, x, ty, v, args, lasting)
         _ -> temp_at(e, v, ty).is_some()
 end takes_any
 
