@@ -35,7 +35,7 @@ is from a probe in [`closures-probes/`](closures-probes/), run on the installed 
 | 12 | `defer`, and drop order | independent questions. By-reference capture is safe under either order, because a closure cannot outlive its captured variables' block and a release empties a slot without ending it | §8 |
 | 13 | async | **a Task holds its arguments until it finishes**: an async call keeps every parameter, and the Task's own escape is followed as a stored closure's is. Today this is missing — **a bug** (p21, p25, ASan-confirmed) | §9 |
 | 14 | aliasing | **no exclusivity rule.** Two closures over one variable share it (p04/p18 become legal); a write made during the call through `&n` is seen (p05). A whole variable's slot never moves, so none of it is unsafe | §10 |
-| 15 | migration | three accepted shapes change meaning; the org sweep found **N** of them (§11) | §11 |
+| 15 | migration | three accepted shapes change meaning (M1 loop-made writer, M2 aliased read-only capture, M3 callee stops keeping); **the org sweep found none of M1/M3** — its one hit is a today-bug (interpolation hides a read-after, p29), not a change | §11 |
 
 ## 2. What 0.7.5 does — the probes
 
@@ -69,8 +69,13 @@ is from a probe in [`closures-probes/`](closures-probes/), run on the installed 
 | p26 | a loop body's `&n` kept in an outer `var g` | `20` (a stale slot) | the implicit form is by value: `20` from the copy |
 | p27 | the same with a `string`, read after the block | **accepted; ASan: `heap-use-after-free`** | the implicit form is by value; the explicit `&s` is §12 Q4 |
 | p28 | `q = &s` from an inner block, read after it | **accepted; ASan: `heap-use-after-free`** | §12 Q4 |
+| p29 | a stored writing counter, the variable read after it inside `f"${clicks}%d"` | **accepted, prints `clicked 0 times`** (plain `print(clicks)` is refused) | refused (bug fix C0b); by value, since it is stored |
 
-Two of these are bugs in today's compiler and one is a hole the reference does not speak to:
+Three of these are bugs in today's compiler and one is a hole the reference does not speak to:
+
+- **p29 — a read inside string interpolation is not a read for the lost-write rule.**
+  `read_after_copy_write` is asked from `name_expr`, and an interpolated name reaches the `$format`
+  desugaring without passing it. Found by the org sweep in `webview-demo` (§11). A 0.7.x patch fix.
 
 - **p21/p25 — an async call keeps its arguments, and `keeps` does not know.** `memory.md § A
   borrowed pointer cannot escape` says a function keeps a parameter it stores somewhere the call does
@@ -291,10 +296,26 @@ it changes nothing that compiled. What compiled and changes:
 **The sweep.** A stage-1 compiler with one extra fault at the accepted read-back write
 (`closure.sysl`'s `refuse_lost_writes`, the `copy_writes.push` arm, under `SYSL_CLOSURE_CENSUS=1`;
 built, not committed) was run as `emit-typed` over every project in every repository under
-`~/dev/sysl-lang` (scratch `closures/sweep.zsh`). It lists every M1/M3 candidate — every closure that
+`~/dev/sysl-lang` ([`closures-probes/sweep.zsh`](closures-probes/sweep.zsh), which quotes the
+two-line instrumentation). It lists every M1/M3 candidate — every closure that
 writes a capture and compiles today — which is a superset of what changes.
 
-SWEEP-RESULT
+**Result: 140 projects analysed, one hit, and it is not a migration case — it is a bug.**
+
+- `webview-demo/main.sysl:21` — `w.bind("count", (args) -> { clicks += 1; Ok(f"${clicks}%d") })`.
+  `bind` stores the callback, so the closure escapes and stays by value under this design: **its
+  meaning does not change.** But line 35 reads `clicks` after it (`print(f"… ${clicks}%d clicks")`),
+  which should have been refused today and was not: **the read-after refusal does not see a read inside
+  string interpolation** (p29 prints `1 2` then `clicked 0 times`; with `print(clicks)` the same program
+  is refused). webview-demo has been printing "closed after 0 clicks". That is a 0.7.x patch fix
+  (item C0b), after which webview-demo needs a `&int` (or a `static`) — under 0.8.0 too, since `bind`
+  keeps its callback.
+- **No M1 or M3 case exists in the org.** Every other closure that writes a capture is already refused.
+- **Limits of the sweep, stated:** `emit-typed` analyses a project's sources, not its `@tests` files;
+  17 of the 140 projects stopped at an unrelated error against dev's library (stale imports such as
+  `ptr_cast`/`str_cast` moved to `sysl.raw`, `str(x)` removed in 0.7.0, a C header absent on this
+  machine), so their remaining bodies may not have been read — the 0.8.0 org sweep after the switch
+  covers them. The compiler's own tree and `library/` are among the 140.
 
 M2 is not something a single fault can list (it needs the address-taken set of the enclosing body);
 implementation item C9 adds it as a one-release diagnostic, run over the census before the switch.
@@ -337,6 +358,7 @@ Each is one agent, one branch off `dev`, in dependency order. C0 is a patch.
 | item | what | depends on | tests |
 |---|---|---|---|
 | **C0** (patch, `release-0.7`) | an async call keeps every parameter while its Task lives; the Task is a carrier of what its arguments carry, followed as a stored closure is | — | p21, p25 refused; p15 accepted; a Task answered/stored/queued × `*T` / closure-with-`*T` / `&T`; an awaited Task in an async body; ASan on the accepted ones |
+| **C0b** (patch, `release-0.7`) | a read of a variable inside string interpolation (`f"${x}"`, `s"$x"`, a format spec) counts as a read for `read_after_copy_write`; webview-demo then holds `clicks` as `&int` | — | p29 in `f`/`s` strings, with and without a spec, in a nested interpolation, inside the closure's own span (not a read after) |
 | **C1** | judge a frame address against the innermost **block** that declares it (decision 6) — at first only for the closure decision; Q4 decides whether `&s` gets it too | — | p26/p27/p28 shapes in every block form: `if`, `match` arm, `for`/`while`/`loop` body, nested block, `defer` |
 | **C2** | the mode decision: after `check_keeps`, mark each closure literal by-reference or by-value per §3.1; a capture of a by-reference literal becomes `*self.f` (the nested-function environment's form); laid out at lowering | C0, C1 | p01, p02, p08, p10, p19, p22; the flows of §3.1 one row each |
 | **C3** | move `refuse_lost_writes` and the `val` refusal into that pass, by-value literals only; the message names the reason (callee + its own `keeps` why, return, `static`, outer block, `&sync`) | C2 | p07, p23 messages; `val` writer by reference accepted, by value refused |
