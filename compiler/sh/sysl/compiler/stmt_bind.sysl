@@ -117,44 +117,92 @@ multi_assign(cx: &Analyzer, span: Span, op: string, targets: Buf[Expr],
                              "one place of a multiple assignment — write that one on its own")
             _ -> ()
 
-    // `_` stands for a closure's parameter in an expression, and a list of places has no part that
-    // writes nowhere: every place it names is written.
-    for t in targets
-        *t.kind match
-            Ident(n) if is_placeholder(n) ->
-                cx.fault(t.span, "'_' is not a place, and every place a multiple assignment names is " +
-                         "written \u{2014} take the parts you want from the value instead")
+    // A compound arm reads its place before it writes it, and `_` has nothing to read.
+    if op != "="
+        for t in targets
+            if discards(t)
+                cx.fault(t.span, s"'$op' reads every place before writing it, and '_' has nothing to " +
+                         "read \u{2014} a part is discarded only by '='")
                 var none: Buf[TStmt] = buf()
 
                 return none
-            _ -> ()
+            end if
+    end if
 
     val what = if op == "=" then "assignment" else s"'$op'"
-    var places: Buf[TExpr] = buf()
+    var places: Buf[Option[TExpr]] = buf()
 
     for item in targets
-        places.push(analyze_place(cx, item, what, span))
+        places.push(if discards(item) then None else Some(analyze_place(cx, item, what, span)))
 
     var writes: Buf[TWrite] = buf()
+    var held: Buf[TStmt] = buf()
+    var emptied: Buf[TStmt] = buf()
 
     for i in 0..<targets.len()
-        val place = places.at(i)
-        val part = part_at(taken, i)
         val written = value_written(taken, targets, values, i)
 
-        val w = one_write(cx, op, targets.at(i), place, part, written)
+        places.at(i) match
+            Some(place) ->
+                val w = one_write(cx, op, targets.at(i), place, part_at(taken, i), written)
 
-        if op == "=" then note_view_store(cx, span, place, w.value)
+                if op == "=" then note_view_store(cx, span, place, w.value)
 
-        writes.push(w)
+                writes.push(w)
+            None ->
+                // A part read out of a carrier stays in the carrier, which already holds it; a value
+                // of its own is still produced in its turn, and is let go of once the statement ends.
+                if taken.is_none() && i < values.len() then
+                    discard_arm(cx, written, &held, &writes, &emptied)
 
     var out: Buf[TStmt] = buf()
 
     if taken.is_some() then out.push(taken.unwrap().0)
 
-    out.push(TMultiAssign(writes))
+    for item in held
+        out.push(item)
+
+    if !writes.is_empty() then out.push(TMultiAssign(writes))
+
+    for item in emptied
+        out.push(item)
+
     out
 end multi_assign
+
+// Whether a place in the list is `_`, which writes its part nowhere.
+private discards(target: Expr) -> bool = *target.kind match
+    Ident(n) -> is_placeholder(n)
+    _ -> false
+
+// `_` beside a value of its own: the value is evaluated in its turn among the others, and dropped.
+//
+// **It is written into a name no program can write**, declared empty before the statement and
+// emptied again after it, so every rule the statement already keeps -- the order of evaluation, what
+// a counted value owes when it is stored and when it is overwritten -- holds for the dropped part with
+// nothing new to keep: the part is released at the end of the statement rather than at the end of the
+// block.
+private discard_arm(cx: &Analyzer, written: Expr, held: *Buf[TStmt], writes: *Buf[TWrite],
+                    emptied: *Buf[TStmt])
+    val tv = type_expr_bare(cx, written)
+    val ty = texpr_type(tv)
+
+    if ty == Unknown then return
+
+    if ty == Never
+        cx.fault(written.span, "'_' drops the value it is given, and this expression never returns one")
+        return
+    end if
+
+    val name = cx.bind("$discard", ty)
+    val place = TExpr(written.span, TLoad(name, ty))
+    var checks: Buf[TInvCheck] = buf()
+
+    held.push(TVarDecl(name, ty, TExpr(written.span, TZero(ty)), None))
+    writes.push(TWrite(place, "=", tv, None, checks, None))
+    emptied.push(TExprStmt(TExpr(written.span, TStore(place, TExpr(written.span, TZero(ty)), ty,
+                                                      false))))
+end discard_arm
 
 // Each arm's position is the value it was written with, or -- where one carrier supplied them all
 // -- that carrier, since there is no separate expression to point at.
