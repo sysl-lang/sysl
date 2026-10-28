@@ -1195,7 +1195,25 @@ print(apply((x) ->
 ```
 
 The bracket rule resumes at the dedent, so an argument written after the block is read at the outer
-level, and its indentation is again ignored.
+level, and its indentation is again ignored. A line that closes the block may therefore begin with
+the next argument's `,` or with the closing bracket, back at the margin the bracket was opened at:
+
+```sysl
+apply(f: int -> int, n: int) -> int = f(n)
+
+print(apply((x) ->
+    val doubled = x * 2
+
+    doubled + 1
+, 5), 2 match
+    2 -> "two"
+    else "other"
+)
+```
+
+```output
+11 two
+```
 
 **A comma at the block's own level ends the block, unless the line is a multi-assignment.** A line
 that is a list of places followed by an assignment operator is a statement of the block, and every

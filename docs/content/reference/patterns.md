@@ -26,7 +26,8 @@ zero small medium large
 **The keyword goes after the value.** A match transforms the value to its left, so matches can be
 chained: `x match … match …` reads in the order the values flow. It binds **more loosely than every
 operator**, so the scrutinee is the whole expression before it — `a < b match` matches on the
-comparison, and parentheses narrow it.
+comparison, and parentheses narrow it. A parenthesised `match` is an operand of any operator,
+`a + (k match …) * b` ([expressions](/reference/expressions/#precedence)).
 
 **The `else` arm has no `->`.** The arrow separates a *pattern* from its body, and `else` is not a
 pattern but the fallback, which takes its body the way an `if`'s `else` does.

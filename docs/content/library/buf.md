@@ -100,16 +100,40 @@ print(names.len(), names[1])
 2 grace
 ```
 
-## Bounds: a panic here, an `Option` there
+## Bounds: a trap here, an `Option` there
 
-`at` and `set` **panic** on an index past the end. `pop` returns an `Option`. That looks like two
-minds about the same question and is not:
+`at` and `set` **trap** on an index past the end, exactly as an array's subscript does. `pop` returns
+an `Option`. That looks like two minds about the same question and is not:
 
 > An index past the end is a **mistake in the program**, not a value it meant to handle. Taking from
 > an empty sequence is a question a caller asks **on purpose**.
 
-It is the same bargain [`unwrap`](/reference/errors/) makes. A `pop` that returned `T` and panicked
-would make every drain loop write a length test it could have got from the answer.
+A `pop` that returned `T` and trapped would make every drain loop write a length test it could have
+got from the answer.
+
+**The trap is an array's trap**: the program stops with the trap instruction's status (133 under a
+shell), having written the array's report to standard error through
+[`sysl_bounds_fail`](/reference/errors/#what-stopping-looks-like) — so a program's own override of
+that function hears about a `Buf` too, and a [`should_trap`](/reference/attributes/#a-test-passes-by-returning)
+test recognises it. The one difference is the location: an array's check is laid down at the
+subscript, so it names that line; a `Buf`'s runs inside the member, which cannot see who called it,
+and the report ends at the values:
+
+```sysl
+import sysl.buf.{Buf, buf}
+
+var b: Buf[int] = buf()
+
+b.push(1)
+print(b[0])
+print(b[3])
+```
+
+```output trap
+1
+```
+
+and standard error says `index 3 out of bounds for length 1`.
 
 ```sysl
 import sysl.buf.{Buf, buf}
@@ -145,13 +169,13 @@ true
 count, and does nothing where `n` is a length the buffer does not have — a length past the end names
 no element, so unlike an index there is nothing for it to read and nothing to stop the program about.
 `clear()` is `truncate(0)`. `remove(i)` shifts the survivors down over element `i`, hands that element
-back, and ends at `truncate`; an `i` that names no element is `at`'s panic, for `at`'s reason.
+back, and ends at `truncate`; an `i` that names no element is `at`'s trap, for `at`'s reason.
 
 **`insert(i, v)` is `remove`'s other half**, putting an element at `i` and moving everything from
 there on up one. Inserting at `len` is a `push` and is allowed for that reason — a loop inserting at
 a cursor reaches the end on its last step, and refusing there would make every caller write the case
-this one already handles. Anything past `len` is a gap, which a sequence cannot represent, and panics
-the way any other index past the end does.
+this one already handles. Anything past `len` is a gap, which a sequence cannot represent, and traps
+the way any other index past the end does, in a form of its own: `insertion index 5 is past length 3`.
 
 ```sysl
 import sysl.buf.{Buf, buf}
@@ -227,7 +251,7 @@ print(items[0].block, items[0].data.len())
 needs no `usize(i)`, and a negative index stops the program at the subscript, as an array's does
 ([arrays](/reference/arrays/#a-type-with-no-elements-of-its-own-is-indexed-through-a-trait)). The
 methods themselves — `at`, `set`, `insert`, `remove` — take a `usize`, as written. An index past the
-count panics, as `at` does — `panic: index 3 past the 1 elements of a Buf`.
+count traps, as `at` does — `index 3 out of bounds for length 1`.
 
 **A member that can move the storage is `@relocates`** — `push`, `extend`, `insert`, `pop`,
 `truncate`, `clear`, `remove`, `reserve`, `set_len` and `release` — and is refused on a buffer a live
@@ -678,7 +702,7 @@ elements, with no second copy and no fill pass first:
 - **`spare()`** is the room past the length, a `[]T` of `cap() - len()` slots — a view of the
   storage, so valid until the buffer next grows.
 - **`set_len(n)`** moves the length to `n`, taking the slots in between as the elements they already
-  hold. Below `len()` it is `truncate(n)`; past `cap()` it panics, as an index past the end does
+  hold. Below `len()` it is `truncate(n)`; past `cap()` it panics
   (`panic: length 17 past the 16 slots a Buf has room for`).
 
 ```sysl

@@ -1,5 +1,6 @@
 module sysl.buf
 
+import sysl.{index_past, insert_past}
 import sysl.raw.ptr_cast
 
 /** The growable sequence and the sink built on it.
@@ -27,15 +28,16 @@ import sysl.raw.ptr_cast
  * else is still reading: a `view()` held elsewhere, or storage a growth replaced while a view of it
  * was out, keeps those slots alive until it lets go.
  *
- * The bounds-checked members panic rather than returning an `Option`, which is the same bargain
- * `unwrap` makes -- an index past the end is a mistake in the program, not a value it meant to
- * handle -- while `pop` returns one, because taking from an empty sequence is a question a caller
- * asks on purpose.
+ * The bounds-checked members trap rather than returning an `Option`, as an array's subscript does --
+ * an index past the end is a mistake in the program, not a value it meant to handle -- while `pop`
+ * returns one, because taking from an empty sequence is a question a caller asks on purpose. The
+ * report is an array's (`index 5 out of bounds for length 3`, through `sysl_bounds_fail`), without
+ * the caller's line.
  *
  * **The count never passes the storage, and the type says so.** The clause is checked wherever
  * either field is written, which in this module is at a handful of places the storage has just made
  * room at -- and in return every member is told it on entry. That is what makes `at` one compare:
- * the index is tested against `count` for the panic, and the slice's own test against `elems.len`
+ * the index is tested against `count` for the trap, and the slice's own test against `elems.len`
  * is then implied by it and folds.
  */
 private[buf] struct BufCore[T]
@@ -44,19 +46,19 @@ private[buf] struct BufCore[T]
     invariant count <= elems.len
 
     at(self, i: usize) -> T
-        if i >= self.count then past_end(i, self.count)
+        if i >= self.count then index_past(i, self.count)
 
         self.elems[i]
 
     set(*self, i: usize, v: T)
-        if i >= self.count then past_end(i, self.count)
+        if i >= self.count then index_past(i, self.count)
 
         self.elems[i] = v
 
     // The address of element `i`, checked against the count -- the slice's own check folds behind
     // it, as `at`'s does.
     place(self, i: usize) -> *T
-        if i >= self.count then past_end(i, self.count)
+        if i >= self.count then index_past(i, self.count)
 
         &self.elems[i]
 
@@ -234,10 +236,10 @@ private[buf] struct BufCore[T]
      * Inserting at `len` is a `push`, and is allowed for that reason: a loop inserting at a cursor
      * reaches the end of the sequence on its last step, and refusing there would make the caller
      * write the case that this one already handles. Anything past `len` is a gap, which a sequence
-     * has no way to represent, and panics the way every other index past the end does.
+     * has no way to represent, and traps the way every other index past the end does.
      */
     insert(*self, i: usize, v: T)
-        if i > self.count then past_end(i, self.count)
+        if i > self.count then insert_past(i, self.count)
 
         self.push(v)
 
@@ -251,7 +253,7 @@ private[buf] struct BufCore[T]
     end insert
 
     remove(*self, i: usize) -> T
-        if i >= self.count then past_end(i, self.count)
+        if i >= self.count then index_past(i, self.count)
 
         var gone = self.elems[i]
 
@@ -317,10 +319,11 @@ end BufCore
  * as zeroed storage does. It is what a finalizer for raw storage calls, where assigning `buf()` would
  * make a fresh buffer that is lost when the storage is freed.
  *
- * The bounds-checked members panic rather than returning an `Option`, which is the same bargain
- * `unwrap` makes -- an index past the end is a mistake in the program, not a value it meant to
- * handle -- while `pop` returns one, because taking from an empty sequence is a question a caller
- * asks on purpose.
+ * The bounds-checked members trap rather than returning an `Option`, as an array's subscript does --
+ * an index past the end is a mistake in the program, not a value it meant to handle -- while `pop`
+ * returns one, because taking from an empty sequence is a question a caller asks on purpose. The
+ * report is an array's (`index 5 out of bounds for length 3`, through `sysl_bounds_fail`), without
+ * the caller's line.
  */
 struct Buf[T]
     private core: &BufCore[T]
@@ -353,7 +356,7 @@ struct Buf[T]
      * reads keep the storage and the count in registers. Behind an `if` the core's fields are read
      * only on the arm where the handle names something, and a read the optimizer cannot prove happens
      * on every turn is one it may not hoist; chosen this way, every turn reads the same address, and
-     * the panic that reports an index stays inside the loop where the index is.
+     * the trap that reports an index stays inside the loop where the index is.
      */
     private reading(self) -> *BufCore[T] = if is_null(self.core) then ptr_cast(&NoCore[0]) else &*self.core
 
@@ -399,7 +402,7 @@ struct Buf[T]
 
     @relocates
     const remove(self, i: usize) -> T
-        if is_null(self.core) then past_end(i, 0)
+        if is_null(self.core) then index_past(i, 0)
         self.core.remove(i)
 
     /** A second buffer holding the same elements, sized to them -- the one way to get a buffer that
@@ -471,23 +474,17 @@ private[sysl] enum Unassigned
     DequeUnassigned
     MapUnassigned
 
-// The report an index past the end makes, out of line because of what a bounds-checked member costs
-// when it is not. Written inline, the report is a dozen calls in the middle of a two-instruction
-// accessor: the whole member is then too big for a caller to absorb, so every read is a call and a
-// frame. Behind a name that does not return, what is left where the check was is a compare and a
-// branch, and the accessor is small enough to disappear into its caller.
 /** An empty core at every element type: storage `[]` and a count of zero are all-zero words, four of
  * them -- the view's three and the count -- whatever `T` is. A `var` only because an address is taken
  * of it: it is never written, since a count of zero refuses every index before anything is.
  */
 private[buf] var NoCore: [4]usize = [0, 0, 0, 0]
 
-private past_end(i: usize, n: usize) -> never
-    print("panic: index", i, "past the", n, "elements of a Buf")
-    exit(1)
-end past_end
-
-// The report a length past the storage makes, out of line for `past_end`'s reason.
+// The report a length past the storage makes, out of line because of what a checked member costs
+// when it is not: written inline, the report is a dozen calls in the middle of a small member, which
+// is then too big for a caller to absorb. Behind a name that does not return, what is left where the
+// check was is a compare and a branch. An index past the count is `sysl.index_past`, for the same
+// reason.
 private past_room(n: usize, room: usize) -> never
     print("panic: length", n, "past the", room, "slots a Buf has room for")
     exit(1)
@@ -520,7 +517,7 @@ impl[T: AnyBits] Buf[T]
      * already hold. **Nothing is written** -- not a fill, not a zero: a slot holds what was last
      * stored in it, which for a slot never written is whatever the allocator left, and for one
      * `truncate` gave up is the value it had. Below `len()` it is `truncate(n)`. Past `cap()` it
-     * panics, the way an index past the end does.
+     * panics: a count claiming storage nobody gave the buffer.
      */
     @relocates
     set_len(self, n: usize)

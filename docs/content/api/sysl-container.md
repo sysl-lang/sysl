@@ -229,8 +229,8 @@ closure or reading it out of another container gives a second name for the same 
 `push_front` through either is seen by both, a growth included. A destructor behind an element runs
 when the element is taken out, or when the last name for the deque goes.
 
-The bounds-checked members panic rather than answering an `Option`, which is the bargain `Buf`
-makes for the same reason: an index past the end is a mistake in the program. `pop_front` and
+The bounds-checked members trap rather than answering an `Option`, as `Buf`'s and an array's do,
+for the same reason: an index past the end is a mistake in the program. `pop_front` and
 `pop_back` answer an `Option`, because taking from an empty sequence is a question a caller asks
 on purpose.
 
