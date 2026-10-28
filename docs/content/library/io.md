@@ -571,7 +571,7 @@ default says there is nothing to do, which is true of memory.
 [`IoError`](/library/fs/), the two stores over memory a `MemoryError`, and a codec's own store the
 codec's error; a generic function bounded on `ReadAt` hands `S::Error` back unchanged. **A library
 with an error of its own fixes the store's in the bound**
-([`reference/traits.md`](/reference/traits/#a-bound-may-fix-the-associated-type)), and `?` then
+([`reference/traits.md`](/reference/traits/#a-bound-may-fix-the-associated-type-too)), and `?` then
 converts it through the library's `From`:
 
 ```sysl
