@@ -368,7 +368,7 @@ lower_closure(cx: &Analyzer, span: Span, names: Buf[string], ptypes: Buf[Type],
 
     // **A reading thrown away rewinds the counter**, so the name may already be on the list from a
     // body that is gone; the entry is the answer about THIS body or nothing.
-    note_read_only(cx.an, base, !writes_environment(cx.an, lowered.body))
+    note_env_writes(cx.an, st, captured.len(), lowered.body)
 
     register_call_trait(cx, span, st, ptypes, lowered.ret_ty)
 
@@ -442,9 +442,8 @@ private refuse_lost_writes(cx: &Analyzer, span: Span, st: &StructType, captured:
         val shown = if outer.is_some() then type_show(outer.unwrap().ty) else "T"
 
         if scan.uses.at(i) == scan.writes.at(i)
-            lost_write_owed(cx, scan.at.at(i), lost_write(name, scan.form.at(i), shown,
-                                                          "and nothing in the closure reads it back"),
-                            st.base, i)
+            lost_write_owed(cx, scan.at.at(i), name, scan.form.at(i), shown,
+                            "and nothing in the closure reads it back", st.base, i)
             continue
         end if
 
@@ -455,17 +454,17 @@ private refuse_lost_writes(cx: &Analyzer, span: Span, st: &StructType, captured:
 end refuse_lost_writes
 
 // **A lost write is owed, not said**: it is lost only if the closure holds that capture by value,
-// which is known once every body has been typed (`closure_mode.sysl` says the ones still owed). A
-// trial thrown away takes back what it owed, as it takes back what it said.
-private lost_write_owed(cx: &Analyzer, at: Span, message: string, base: string, capture: usize) =
-    cx.an.lost_writes.push((cx.scope, at, message, base, capture))
-
-// The refusal, in the words the pattern binding's is said in: what was copied, where the write
+// which is known once every body has been typed (`closure_mode.sysl` says the ones still owed, with
+// what keeps the closure). A trial thrown away takes back what it owed, as it takes back what it said.
+//
+// The refusal is in the words the pattern binding's is said in: what was copied, where the write
 // lands instead, and the two ways to say what was meant.
-private lost_write(name: string, form: string, shown: string, why: string) -> string =
-    s"a closure captures by value, so it holds a copy of '$name' — so $form would reach that copy " +
-    s"rather than the variable it came from, $why. Where you mean to change '$name', hold it as a " +
-    s"'&$shown' and write through it, or have the closure return the value"
+private lost_write_owed(cx: &Analyzer, at: Span, name: string, form: string, shown: string, why: string,
+                        base: string, capture: usize) =
+    cx.an.lost_writes.push(OwedWrite(cx.scope, at, "this closure captures by value", ", since ",
+        s", so it holds a copy of '$name' — so $form would reach that copy rather than the variable it " +
+        s"came from, $why. Where you mean to change '$name', hold it as a '&$shown' and write through " +
+        "it, or have the closure return the value", base, capture))
 
 // A binding a closure wrote its copy of, kept until the enclosing body reads the binding again.
 struct CopyWrite
@@ -491,9 +490,8 @@ read_after_copy_write(cx: &Analyzer, span: Span, unique: string)
         if w.unique != unique then continue
         if span.start >= w.closure.start && span.end <= w.closure.end then continue
 
-        lost_write_owed(cx, w.write, lost_write(w.name, w.form, w.shown,
-                                                "and the variable is used afterwards as though it had"),
-                        w.base, w.capture)
+        lost_write_owed(cx, w.write, w.name, w.form, w.shown,
+                        "and the variable is used afterwards as though it had", w.base, w.capture)
         cx.copy_writes.remove(i)
         return
     end for
@@ -634,50 +632,81 @@ private env_root(recv: TExpr) -> bool = *recv.kind match
     _ -> false
 
 
-// Whether a closure's body writes through its own environment -- a store, a compound assignment, an
-// increment or a lane store whose place reaches `self`. **Asked of the typed tree**, since a write is
-// a node and these four are all of them. A closure written inside this one is a body of its own with
-// its own `self`, reached here only as the struct that builds it, so its writes are its own.
+// **Which captures a closure's body writes its own copy of**, by position: a store, a compound
+// assignment, an increment or a lane store whose place is a capture or a part of it held by value,
+// and a `*self` method called on one (`c.bump()`). **Asked of the typed tree**, since a write is a
+// node and these are all of them. A closure written inside this one is a body of its own with its own
+// `self`, reached here only as the struct that builds it, so its writes are its own.
 //
-// A `*self` method called on the closure's own copy of a capture, or a part of it held by value, is
-// a write too (`c.bump()`). One called on what a capture refers to -- a `&T`, a `*T` -- writes
-// storage the closure shares rather than its environment.
-private writes_environment(a: &Analysis, body: TBlock) -> bool
-    val seen: &EnvWrites = EnvWrites(false)
+// A write through what a capture refers to -- a `&T`, a `*T`, a slice's element -- writes storage the
+// closure shares rather than its environment, so a closure doing only that is one a `val` may hold.
+//
+// **None means the closure writes nothing of its own**, and a call of it only reads
+// (`Analysis.read_only_closures`). Any other answer is kept (`Analysis.closure_env_writes`): held by
+// reference, those captures are written through the closure rather than in it, and a `val` may hold
+// it once that is known (`place.sysl`'s `refuse_written_once_receiver`).
+private note_env_writes(a: &Analysis, st: &StructType, n: usize, body: TBlock)
+    var at: Buf[usize] = buf()
+    var slots: Buf[int] = buf()
+
+    for i in 0..<n
+        slots.push(int(st.slot(i)))
+
+    val seen = &at
 
     // `a, b = b, a` writes its places as a statement rather than as expressions.
-    walk_block_stmts(body, TWalk(true, e -> note_env_write(a, seen, e),
-                                 w -> if reaches_self(w.place) then seen.found = true, s -> ()))
-    seen.found
-end writes_environment
+    walk_block_stmts(body, TWalk(true, e -> env_roots_at(a, seen, slots, e),
+                                 w -> env_root_of(seen, slots, w.place), s -> ()))
 
-private struct EnvWrites
-    found: bool
+    if at.is_empty()
+        a.read_only_closures.add(st.base)
+        a.closure_env_writes.remove(st.base)
+    else
+        a.read_only_closures.remove(st.base)
+        a.closure_env_writes.put(st.base, at)
+    end if
+end note_env_writes
 
-private note_read_only(a: &Analysis, base: string, reads_only: bool)
-    if reads_only then a.read_only_closures.add(base)
-    else a.read_only_closures.remove(base)
-
-private note_env_write(a: &Analysis, seen: &EnvWrites, e: TExpr)
-    val hit = *e.kind match
-        TStore(place, _, _, _) -> reaches_self(place)
-        TUpdate(place, _, _, _, _, _, _) -> reaches_self(place)
-        TIncDec(place, _, _, _, _) -> reaches_self(place)
-        TVecStore(recv, _, _) -> reaches_self(recv)
+private env_roots_at(a: &Analysis, seen: *Buf[usize], slots: Buf[int], e: TExpr)
+    *e.kind match
+        TStore(place, _, _, _) -> env_root_of(seen, slots, place)
+        TUpdate(place, _, _, _, _, _, _) -> env_root_of(seen, slots, place)
+        TIncDec(place, _, _, _, _) -> env_root_of(seen, slots, place)
+        TVecStore(recv, _, _) -> env_root_of(seen, slots, recv)
         TCall(_, _, _, _) -> self_receiver(a, e) match
-            Some(place) -> copy_root(place).is_some()
-            None -> false
-        _ -> false
+            Some(place) -> env_root_of(seen, slots, place)
+            None -> ()
+        _ -> ()
+end env_roots_at
 
-    if hit then seen.found = true
+private env_root_of(seen: *Buf[usize], slots: Buf[int], place: TExpr)
+    val slot = env_capture(place)
 
-private reaches_self(place: TExpr) -> bool = *place.kind match
-    TLoad(name, _) -> name == "self"
-    TDeref(inner, _) -> reaches_self(inner)
-    TField(recv, _, _) -> reaches_self(recv)
-    TIndex(recv, _, _) -> reaches_self(recv)
-    TSlice(base, _, _, _, _) -> reaches_self(base)
-    _ -> false
+    if slot.is_none() then return
+
+    for i in 0..<slots.len()
+        if slots.at(i) == slot.unwrap() && !holds_index(*seen, i) then seen.push(i)
+end env_root_of
+
+// The capture a place writes the closure's own storage of: the capture itself, a field or an element
+// of it held by value, or an element of a slice taken of a captured array.
+private env_capture(place: TExpr) -> Option[int] = *place.kind match
+    TSlice(base, _, _, _, _) -> texpr_type(base) match
+        Array(_, _) -> env_capture(base)
+        _ -> None
+    TIndex(recv, _, _) -> texpr_type(recv) match
+        Slice(_, _) -> *recv.kind match
+            TSlice(_, _, _, _, _) -> env_capture(recv)
+            _ -> None
+        _ -> copy_root(place)
+    _ -> copy_root(place)
+
+private holds_index(xs: Buf[usize], i: usize) -> bool
+    for x in xs
+        if x == i then return true
+
+    false
+end holds_index
 
 // The body itself, read in a frame of its own.
 //

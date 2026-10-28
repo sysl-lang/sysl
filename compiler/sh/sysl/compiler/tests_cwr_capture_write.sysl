@@ -24,8 +24,10 @@ private cwr_unread(name: string, form: string, shown: string) -> string =
 private cwr_used_after(name: string, form: string, shown: string) -> string =
     cwr_lost(name, form, shown, "and the variable is used afterwards as though it had")
 
+// The words after the reason the closure holds its captures by value, which
+// `tests_crm_closure_ref_mode.sysl` pins for each way out.
 private cwr_lost(name: string, form: string, shown: string, why: string) -> string =
-    s"a closure captures by value, so it holds a copy of '$name' — so $form would reach that copy " +
+    s", so it holds a copy of '$name' — so $form would reach that copy " +
     s"rather than the variable it came from, $why. Where you mean to change '$name', hold it as a " +
     s"'&$shown' and write through it, or have the closure return the value"
 
@@ -353,14 +355,24 @@ cwr_interp_box_fix()
 
 // ---- the neighbour: a 'val' closure is asked about every write to its copy
 
-@test("a multiple assignment to captures makes a closure one a 'val' may not hold")
+// A closure that does not escape writes through to its variables, so a `val` holds it
+// (`tests_crm_closure_ref_mode.sysl` has the matrix); one that escapes writes its copy, and may not.
+@test("a multiple assignment to captures, in a closure a 'val' holds, swaps the variables")
 cwr_val_closure_multiple_assignment()
     if !enm_ready() then return
 
-    cwr_refused("main()\n    var a = 1\n    var b = 2\n    val swap = () ->\n        a, b = b, a\n        a\n" +
-                "    print(swap())\n",
+    assert_eq(enm_ran("main()\n    var a = 1\n    var b = 2\n    val swap = () ->\n        a, b = b, a\n" +
+                      "        a\n    print(swap(), a, b)\n"), "2 2 1\n")
+
+@test("a multiple assignment to captures makes an escaping closure one a 'val' may not hold")
+cwr_val_closure_multiple_assignment_kept()
+    if !enm_ready() then return
+
+    cwr_refused("make() -> &Fn() -> int\n    var a = 1\n    var b = 2\n    val swap = () ->\n" +
+                "        a, b = b, a\n        a\n    print(swap())\n    swap\n\nmain()\n    print(make()())\n",
                 "'call' takes '*self', so it writes through what it is called on, and a 'val' is " +
-                "written once — write 'var swap' if it is meant to change")
+                "written once — this closure captures by value, since it is returned from 'make' on " +
+                "line 8 — write 'var swap' if it is meant to change")
 
 // ---- a '*self' call on the closure's copy is a write to it
 
@@ -464,23 +476,31 @@ cwr_self_call_counter_used_after()
     cwr_refused(cwr_call + cwr_counter + "main()\n    var c = C(0, In(0))\n    var k = () ->\n        c.bump()\n" +
                 "        c.n\n    stash(k)\n    print(c.n)\n", cwr_used_after("c", "'bump', which takes '*self',", "C"))
 
-@test("a closure making a '*self' call on its copy cannot be held in a 'val'")
+@test("a closure a 'val' holds makes a '*self' call on the variable it does not escape")
 cwr_self_call_val_refused()
     if !enm_ready() then return
 
-    cwr_refused(cwr_counter + "main()\n    var d = C(0, In(0))\n    val g = () ->\n        d.bump()\n" +
-                "        print(d.n)\n    g()\n",
-                "'call' takes '*self', so it writes through what it is called on, and a 'val' is " +
-                "written once — write 'var g' if it is meant to change")
+    assert_eq(enm_ran(cwr_counter + "main()\n    var d = C(0, In(0))\n    val g = () ->\n        d.bump()\n" +
+                      "        print(d.n)\n    g()\n    g()\n    print(d.n)\n"), "1\n2\n2\n")
 
-@test("calling a captured counting closure writes the copy, so a 'val' cannot hold the caller")
+@test("a closure kept by a callee, making a '*self' call on its copy, cannot be held in a 'val'")
+cwr_self_call_val_kept_refused()
+    if !enm_ready() then return
+
+    cwr_refused(cwr_call + cwr_counter + "main()\n    var d = C(0, In(0))\n    val g = () ->\n" +
+                "        d.bump()\n        d.n\n    stash(g)\n    print(g())\n",
+                "'call' takes '*self', so it writes through what it is called on, and a 'val' is " +
+                "written once — this closure captures by value, since it is handed to 'stash' on " +
+                "line 46, which keeps its parameter 'f' (it is stored in 'held') — write 'var g' if " +
+                "it is meant to change")
+
+@test("calling a captured counting closure writes the variable, so a 'val' holds the caller")
 cwr_self_call_captured_counter_in_a_val()
     if !enm_ready() then return
 
-    cwr_refused("main()\n    var n = 0\n    var counter = () ->\n        n += 1\n        n\n" +
-                "    val outer = () -> print(counter())\n    outer()\n",
-                "'call' takes '*self', so it writes through what it is called on, and a 'val' is " +
-                "written once — write 'var outer' if it is meant to change")
+    assert_eq(enm_ran("main()\n    var n = 0\n    var counter = () ->\n        n += 1\n        n\n" +
+                      "    val outer = () -> print(counter())\n    outer()\n    outer()\n    print(n)\n"),
+              "1\n2\n2\n")
 
 @test("'(self)' and '&self' calls read, so a 'val' holds the closure")
 cwr_self_call_reading_modes()

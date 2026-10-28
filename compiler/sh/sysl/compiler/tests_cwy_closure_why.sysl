@@ -1,0 +1,449 @@
+module sh.sysl.compiler
+@tests
+
+// **Why a closure holds its captures by value, as a refusal says it** (`closure_mode.sysl`,
+// `docs/design/closures.md` C3), and **a `val` holding a closure that writes its captures**, which is
+// legal exactly when the closure holds those captures by reference.
+//
+// A write that reaches only a closure's copy names what keeps the closure, and where: returned, stored
+// in module storage or through a parameter, handed to a callee that keeps it (directly, through
+// another parameter, through `Buf.push`), kept in a local of an enclosing block, converted to
+// `&sync`, handed to a `@crossing` parameter, built in an `async` body or a module value's
+// initializer. The `val` refusal names the same reason, and is not said at all for a closure held by
+// reference: an `int`, a field, an element, a `*self` call, a multiple assignment, a captured
+// closure's call, a pattern binding, a struct field, a generic `Option` and a tuple holding it.
+//
+// Skipped cells, and why: a thread holding a closure needs a starter that takes one, and the library's
+// take a `*extern` function, so `&sync` is that cell; a `@scoped` child that borrows views is
+// `tests_sce_scoped_emission.sysl`'s, and its reason is a fixed phrase; `@joined` names `*T`
+// parameters, never a closure.
+//
+// The helpers are `tests_enm_enum_run.sysl`'s.
+
+// The program is refused, saying each of `parts`, each once.
+private cwy_refused(text: string, parts: []const string)
+    if !enm_ready() then return
+
+    val said = enm_err(text)
+
+    assert(said != "", "it was accepted")
+
+    for part in parts
+        val at = said.index_of(part)
+
+        assert(at.is_some(), s"$part\n--- in ---\n$said")
+        assert(said[at.unwrap() + part.bytes.len..<said.bytes.len].index_of(part).is_none(), said)
+    end for
+end cwy_refused
+
+private cwy_prints(text: string, want: string)
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(text), want)
+
+// The lost write's reason, as the refusal opens.
+private cwy_since(why: string) -> string = s"this closure captures by value, since $why, so it holds a copy"
+
+// The `val` refusal's reason, for the binding `name`.
+private cwy_val(why: string, name: string) -> string =
+    "'call' takes '*self', so it writes through what it is called on, and a 'val' is written once — " +
+    s"this closure captures by value, since $why — write 'var $name' if it is meant to change"
+
+// -- each reason a lost write names -------------------------------------------------------------
+
+@test("returned from the function that declares the variable")
+cwy_returned()
+    cwy_refused(raw"""
+        make() -> &Fn() -> unit
+            var n = 0
+
+            () -> n = 5
+
+        main()
+            make()()
+        """, [cwy_since("it is returned from 'make' on line 4")])
+
+@test("stored in module storage")
+cwy_module_storage()
+    cwy_refused(raw"""
+        var later: Option[&Fn() -> unit] = None
+
+        main()
+            var hit = false
+
+            later = Some(() -> hit = true)
+        """, [cwy_since("it is stored in 'later' on line 6, which outlives 'main'")])
+
+@test("stored through a parameter")
+cwy_through_a_parameter()
+    cwy_refused(raw"""
+        struct H
+            f: &Fn() -> unit
+
+        fill(h: *H)
+            var hit = false
+
+            h.f = () -> hit = true
+
+        main()
+            var h = H(() -> ())
+
+            fill(&h)
+            h.f()
+        """, ["this closure captures by value, since it is stored in 'h", "on line 7, which outlives 'fill'"])
+
+@test("pushed into a buffer")
+cwy_pushed()
+    cwy_refused(raw"""
+        import sysl.buf.{Buf, buf}
+
+        main()
+            var fs: Buf[&Fn() -> unit] = buf()
+            var hit = false
+
+            fs.push(() -> hit = true)
+            fs[0]()
+        """, ["this closure captures by value, since it is handed to 'push' on line 7, which keeps its " +
+              "parameter"])
+
+@test("handed to a callee that keeps it")
+cwy_kept_by_a_callee()
+    cwy_refused(raw"""
+        var later: Option[&Fn() -> unit] = None
+
+        install(f: &Fn() -> unit) = later = Some(f)
+
+        main()
+            var hit = false
+
+            install(() -> hit = true)
+        """, ["this closure captures by value, since it is handed to 'install' on line 8, which keeps " +
+              "its parameter 'f' ("])
+
+@test("kept by a callee through a callee that keeps it")
+cwy_kept_through_a_callee()
+    cwy_refused(raw"""
+        var later: Option[&Fn() -> unit] = None
+
+        install(f: &Fn() -> unit) = later = Some(f)
+
+        relay(f: &Fn() -> unit) = install(f)
+
+        main()
+            var hit = false
+
+            relay(() -> hit = true)
+        """, ["this closure captures by value, since it is handed to 'relay' on line 10, which keeps " +
+              "its parameter 'f' ("])
+
+@test("kept in a local of an enclosing block: a 'match' arm")
+cwy_outer_block_match_arm()
+    cwy_refused(raw"""
+        main()
+            var g: &Fn() -> unit = () -> ()
+            val o: Option[int] = Some(1)
+
+            o match
+                Some(k) ->
+                    var hit = k
+
+                    g = () -> hit = 2
+                None -> ()
+
+            g()
+        """, [cwy_since("it is kept in 'g' on line 9, which outlives the block declaring 'hit'")])
+
+@test("converted to '&sync'")
+cwy_sync()
+    cwy_refused(raw"""
+        main()
+            var hit = false
+            val f: &sync Fn() -> unit = () -> hit = true
+
+            f()
+        """, [cwy_since("it becomes a '&sync Fn() -> unit' on line 3, which another thread may run")])
+
+@test("handed to a '@crossing' parameter")
+cwy_crossing()
+    cwy_refused(raw"""
+        @crossing(f)
+        run(f: () -> unit) = f()
+
+        main()
+            var hit = false
+
+            run(() -> hit = true)
+            print(hit)
+        """, [cwy_since("it is handed to 'run' on line 7, whose parameter 'f' is '@crossing'")])
+
+@test("built in an 'async' body")
+cwy_async()
+    cwy_refused(raw"""
+        call(f: &Fn() -> unit) = f()
+
+        async run() -> bool
+            var hit = false
+
+            call(() -> hit = true)
+            hit
+
+        main()
+            print(block_on(run()))
+        """, [cwy_since("it is built in the 'async' body of 'run', whose variables live in its frame " +
+                        "only between suspensions")])
+
+@test("built in a module value's initializer")
+cwy_module_value()
+    cwy_refused(raw"""
+        val f: &Fn() -> unit = if true
+            var k = 0
+
+            () -> k = 5
+        else
+            () -> ()
+
+        main()
+            f()
+        """, [cwy_since("it is built in the initializer of 'f', whose frame nothing follows")])
+
+@test("the variable used after the closure, with the reason")
+cwy_used_after()
+    cwy_refused(raw"""
+        var later: Option[&Fn() -> int] = None
+
+        install(f: &Fn() -> int) = later = Some(f)
+
+        main()
+            var n = 0
+
+            install(() ->
+                n += 1
+                n)
+            print(n)
+        """, ["this closure captures by value, since it is handed to 'install' on line 8",
+              "so it holds a copy of 'n' — so '+=' would reach that copy rather than the variable it " +
+              "came from, and the variable is used afterwards as though it had"])
+
+// -- a 'val' holding a closure that writes its captures ---------------------------------------------
+
+@test("a 'val' holds a closure writing an 'int', a field, an element and a '*self' call")
+cwy_val_writers_by_reference()
+    cwy_prints(raw"""
+        struct C
+            n: int
+
+            bump(*self) = self.n += 1
+
+        main()
+            var n = 0
+            var c = C(0)
+            var xs = [1, 2]
+            val f = () ->
+                n += 1
+                c.bump()
+                c.n += 1
+                xs[0] = 9
+
+            f()
+            f()
+            print(n, c.n, xs[0])
+        """, "2 4 9\n")
+
+@test("a 'val' holds a closure that writes through a '&T' and a '*T' it captures")
+cwy_val_writes_through_a_capture()
+    cwy_prints(raw"""
+        main()
+            val p: &int = 0
+            var m = 0
+            val q = &m
+            val f = () ->
+                *p += 1
+                *q += 2
+
+            f()
+            f()
+            print(*p, m)
+        """, "2 4\n")
+
+@test("a pattern binding, a struct field and a tuple hold a writing closure")
+cwy_val_writers_in_values()
+    cwy_prints(raw"""
+        struct Pair[A]
+            a: A
+            k: int
+
+        main()
+            var n = 0
+            val o = Some(() -> n += 1)
+
+            o match
+                Some(g) -> g()
+                None -> ()
+
+            val p = Pair(() -> n += 10, 3)
+
+            p.a()
+
+            val t = (() -> n += 100, 7)
+
+            t.0()
+            print(n, p.k, t.1)
+        """, "111 3 7\n")
+
+@test("a generic function's 'Option' holds a writing closure, matched out and called")
+cwy_val_writer_in_a_generic_option()
+    cwy_prints(raw"""
+        wrap[T](x: T) -> Option[T] = Some(x)
+
+        main()
+            var n = 0
+            val w = wrap(() -> n += 100)
+
+            w match
+                Some(g) ->
+                    g()
+                    g()
+                None -> ()
+
+            print(n)
+        """, "200\n")
+
+// The closure leaves through the name a `match` binds, so it holds a copy, and the counter it keeps
+// outlives the frame of `run`.
+@test("a closure handed on through a pattern binding holds its captures by value")
+cwy_escapes_through_a_pattern_binding()
+    cwy_prints(raw"""
+        var later: Option[&Fn() -> int] = None
+
+        install(f: &Fn() -> int) = later = Some(f)
+
+        run()
+            var n = 10
+            val o = Some(() ->
+                n += 1
+                n)
+
+            o match
+                Some(g) -> install(g)
+                None -> ()
+
+        main()
+            run()
+
+            val junk = [1, 2, 3, 4, 5, 6, 7, 8]
+            val f = later.unwrap()
+
+            print(f(), f(), junk[0])
+        """, "11 12 1\n")
+
+@test("a writing closure handed on through a pattern binding is refused, naming the callee")
+cwy_escapes_through_a_pattern_binding_refused()
+    cwy_refused(raw"""
+        var later: Option[&Fn() -> unit] = None
+
+        install(f: &Fn() -> unit) = later = Some(f)
+
+        run()
+            var n = 0
+            val o = Some(() -> n = 5)
+
+            o match
+                Some(g) -> install(g)
+                None -> ()
+
+        main()
+            run()
+        """, [cwy_since("it is handed to 'install' on line 10, which keeps its parameter 'f' (it is " +
+                        "stored in 'later')")])
+
+@test("a closure kept in an outer local through a pattern binding holds its captures by value")
+cwy_kept_through_a_pattern_binding()
+    cwy_refused(raw"""
+        main()
+            var held: Option[&Fn() -> unit] = None
+
+            if true
+                var hit = false
+                val o = Some(() -> hit = true)
+
+                o match
+                    Some(g) -> held = Some(g)
+                    None -> ()
+
+            held.unwrap()()
+        """, [cwy_since("it is kept in 'held' on line 9, which outlives the block declaring 'hit'")])
+
+@test("a 'val' may not hold a writing closure that is returned, naming why")
+cwy_val_returned()
+    cwy_refused(raw"""
+        make() -> &Fn() -> int
+            var n = 0
+            val f = () ->
+                n += 1
+                n
+
+            f()
+            f
+
+        main()
+            print(make()())
+        """, [cwy_val("it is returned from 'make' on line 8", "f")])
+
+@test("a 'val' may not hold a writing closure kept in a local of an enclosing block")
+cwy_val_outer_block()
+    cwy_refused(raw"""
+        main()
+            var held: &Fn() -> int = () -> 0
+
+            if true
+                var k = 0
+                val g = () ->
+                    k += 1
+                    k
+
+                g()
+                held = g
+
+            print(held())
+        """, [cwy_val("it is kept in 'held' on line 11, which outlives the block declaring 'k'", "g")])
+
+@test("a 'val' closure writing two captures it holds by value is refused once")
+cwy_val_two_captures_once()
+    cwy_refused(raw"""
+        make() -> &Fn() -> int
+            var a = 0
+            var b = 0
+            val f = () ->
+                a += 1
+                b += 1
+                a + b
+
+            f()
+            f
+
+        main()
+            print(make()())
+        """, [cwy_val("it is returned from 'make' on line 10", "f")])
+
+@test("a pattern binding of a closure held by value names the reason before the copy it holds")
+cwy_pattern_binding_by_value()
+    cwy_refused(raw"""
+        var later: Option[&Fn() -> int] = None
+
+        install(f: &Fn() -> int) = later = Some(f)
+
+        main()
+            var n = 0
+            val o = Some(() ->
+                n += 1
+                n)
+
+            o match
+                Some(g) ->
+                    install(g)
+                    print(g())
+                None -> ()
+        """, ["'call' takes '*self', so it writes through what it is called on, and this closure " +
+              "captures by value, since it is handed to 'install' on line 13, which keeps its " +
+              "parameter 'f' (it is stored in 'later')",
+              "— and a pattern binding holds a copy of what it matched"])

@@ -2056,39 +2056,51 @@ Nothing is written for either: the compiler works it out from the bodies, as it 
 pointer a function is handed. **A `val` is copied either way**, since nothing can tell a copy of it
 from the variable, and so are a pattern's binding and a by-name parameter.
 
-### A closure that only reads what it captured may be a `val`
+### A `val` may hold a closure that writes only through to its variables
 
-Calling a closure that writes a capture it holds by value writes through the closure itself. That is
-why `Fn::call` takes `*self` — and a `val` is written once, so binding a writing closure to one and
-calling it is refused.
+Calling a closure that writes a capture it holds by value writes into the closure itself. That is why
+`Fn::call` takes `*self` — and a `val` is written once, so binding such a closure to one and calling
+it is refused.
 
-**A closure that only reads its captures is the common case**, and it may be a `val`. It writes
-nothing, so nothing about the call needs the name to be mutable.
-
-```sysl
-val inc = (x: int) -> x + 1
-val double = (x: int) -> x * 2
-
-print(inc(41), double(21))
-```
-
-```output
-42 42
-```
-
-A closure that writes a capture is a value the call mutates, so a `val` holding one is refused:
+**A closure that only reads its captures may be a `val`**, and so may one that writes only the
+variables it holds by reference: the call writes through the closure to them and leaves the closure
+as it was. Nothing about the call needs the name to be mutable.
 
 ```sysl
 var n = 0
+val inc = (x: int) -> x + 1
 val bump = () ->
     n += 1
     n
 
-print(bump(), bump())
+print(inc(41), bump(), bump(), n)
+```
+
+```output
+42 1 2 2
+```
+
+A write through what a capture refers to — a `&T`, a `*T`, a slice's element, a `Buf` — reaches
+storage the closure shares, and a `val` may hold that closure whatever its mode.
+
+**A closure that holds a written capture by value is a value the call mutates**, so a `val` holding
+one is refused, and the refusal says what keeps the closure:
+
+```sysl
+make() -> &Fn() -> int
+    var n = 0
+    val bump = () ->
+        n += 1
+        n
+
+    print(bump())
+    bump
+
+print(make()())
 ```
 
 ```error
-'call' takes '*self', so it writes through what it is called on, and a 'val' is written once — write 'var bump' if it is meant to change
+'call' takes '*self', so it writes through what it is called on, and a 'val' is written once — this closure captures by value, since it is returned from 'make' on line 8 — write 'var bump' if it is meant to change
 ```
 
 `&Fn(int) -> int` holds a closure behind a reference, which a program without an allocator cannot
@@ -2120,7 +2132,29 @@ print(hit)
 ```
 
 ```error
-a closure captures by value, so it holds a copy of 'hit' — so assignment would reach that copy rather than the variable it came from, and nothing in the closure reads it back. Where you mean to change 'hit', hold it as a '&bool' and write through it, or have the closure return the value
+this closure captures by value, since it is handed to 'install' on line 6, which keeps its parameter 'f' (it is stored in 'later'), so it holds a copy of 'hit' — so assignment would reach that copy rather than the variable it came from, and nothing in the closure reads it back. Where you mean to change 'hit', hold it as a '&bool' and write through it, or have the closure return the value
+```
+
+**The refusal names what keeps the closure, and where**, in the words of what the compiler followed
+it to: returned from the function (`it is returned from 'make' on line 4`), stored where it outlives
+the frame (`it is stored in 'later' on line 6, which outlives 'main'`), handed to a callee that keeps
+it — directly, through another parameter, or into a `Buf` with `push` — kept in a local of an
+enclosing block (`it is kept in 'g' on line 7, which outlives the block declaring 'hit'`), converted
+to a `&sync Fn` (`it becomes a '&sync Fn() -> unit' on line 3, which another thread may run`), handed
+to a `@crossing` or `@scoped` parameter, or built in an `async` body or a module value's initializer.
+A closure handed on through a name a `match` binds goes where that name goes.
+
+```sysl
+make() -> &Fn() -> unit
+    var n = 0
+
+    () -> n = 5
+
+make()()
+```
+
+```error
+this closure captures by value, since it is returned from 'make' on line 4, so it holds a copy of 'n'
 ```
 
 The rule reads what the closure writes the same way a [pattern binding's](/reference/patterns/) is
@@ -2169,12 +2203,12 @@ install(() -> c.bump())
 ```
 
 ```error
-a closure captures by value, so it holds a copy of 'c' — so 'bump', which takes '*self', would reach that copy rather than the variable it came from, and nothing in the closure reads it back
+so it holds a copy of 'c' — so 'bump', which takes '*self', would reach that copy rather than the variable it came from, and nothing in the closure reads it back
 ```
 
 A call answering a value hands back what it read of the copy, so `() -> it.next()` reads its copy
-back and is a generator of its own. A closure that writes its copy this way can no longer be held in
-a `val`, for the reason a counting closure cannot: calling it writes its environment.
+back and is a generator of its own. Where such a closure holds that capture by value it can no longer
+be held in a `val`, for the reason an escaping counter cannot: calling it writes its environment.
 
 ### `_` — a parameter with the name left out
 
