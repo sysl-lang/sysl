@@ -18,20 +18,75 @@ import sysl.buf.{Buf, buf}
 // a number reaches nothing that allocates: a `string` is reference-counted, and a single
 // `prints(" ")` would pull the whole reference-counting runtime and an allocator into a program
 // whose own code asks for neither.
+//
+// **Every argument is evaluated, left to right, before anything is written**, as for any call: in
+// `print("a", f())` whatever `f` prints itself comes out before the `a`, and an argument that traps
+// or returns through `?` leaves nothing of the line behind. Where a later argument could do anything
+// at all -- anything but a literal or a local's value -- each argument that is not a literal is
+// stored into a hidden local first, all inside the one statement, so a view of a temporary
+// (`s().bytes[0..<2]`) still has its temporary when it is written. The writes then read the locals;
+// nothing is rendered into a string on the way, so the no-allocation path is kept.
 print_call(cx: &Analyzer, span: Span, args: Buf[Expr]) -> TExpr
-    var parts: Buf[TExpr] = buf()
+    var typed: Buf[TExpr] = buf()
+    var settles = false
 
     for i in 0..<args.len()
+        val t = type_expr_bare(cx, args.at(i))
+
+        if i > 0 && !quiet_arg(t) then settles = true
+        typed.push(t)
+
+    var decls: Buf[TStmt] = buf()
+    var parts: Buf[TExpr] = buf()
+    var shown: Buf[TExpr] = buf()
+
+    for i in 0..<typed.len()
+        val t = typed.at(i)
+        val ty = texpr_type(t)
+
+        if !settles || literal_arg(t) || ty == Unknown
+            shown.push(t)
+        else if ty == Never
+            // Nothing after a diverging argument runs, and nothing of the line is written.
+            parts.push(t)
+            return TExpr(span, TBlockExpr(TBlock(decls, Some(TExpr(span, TSeq(parts))), Unit)))
+        else if ty == Unit
+            parts.push(t)
+            shown.push(TExpr(span, TZero(Unit)))
+        else
+            val held = cx.fresh_name(s"${ModuleSep}printed")
+            val load = TExpr(span, TLoad(held, ty))
+
+            decls.push(TVarDecl(held, ty, TExpr(span, TZero(ty)), None))
+            parts.push(TExpr(span, TStore(load, t, ty, false)))
+            shown.push(load)
+    end for
+
+    for i in 0..<shown.len()
         if i > 0 then parts.push(print_char(cx, span, ' '))
 
-        val v = through_ref(cx, type_expr_bare(cx, args.at(i)))
+        val v = through_ref(cx, shown.at(i))
 
         warn_placeholder(cx, args.at(i).span, args.at(i), v)
         parts.push(print_one(cx, span, v))
 
     parts.push(print_char(cx, span, '\n'))
-    TExpr(span, TSeq(parts))
+
+    if decls.is_empty() then return TExpr(span, TSeq(parts))
+
+    TExpr(span, TBlockExpr(TBlock(decls, Some(TExpr(span, TSeq(parts))), Unit)))
 end print_call
+
+// A value that is the same whenever it is read: a literal.
+private literal_arg(t: TExpr) -> bool = *t.kind match
+    TIntLit(_, _) | TFloatLit(_, _) | TQuadLit(_, _, _) | TStrLit(_) | TBoolLit(_) | TNullLit(_) -> true
+    _ -> false
+
+// An argument whose evaluation can change nothing an earlier argument reads: a literal, or a local's
+// value (no rendering can assign to a caller's local).
+private quiet_arg(t: TExpr) -> bool = *t.kind match
+    TLoad(_, _) -> true
+    _ -> literal_arg(t)
 
 // **A reference renders as what it refers to**, through the one level a member call reaches through
 // to find an `impl` -- which is why no block may be written for `&T` itself. Every rendering form
