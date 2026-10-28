@@ -1,0 +1,309 @@
+module sh.sysl.compiler
+@tests
+
+// `@no_alloc` meeting a trait's DEFAULT method (`reference/modules.md § A generic answers for what it
+// wrote, not for what its caller chose`). A default is generic over `Self`: its copy is lowered under
+// each implementing type, but a call through `self` goes to whatever that type's author wrote, in a
+// module of their own -- exactly a generic's call through a bound. So the trait module answers for
+// what the default writes, and not for what `Self` answers with. The module that calls the default
+// at a concrete type is held to its own clause, and the walk from its call goes straight through.
+
+// The trait module's text below its clause: `put` is the caller's, `twice` the module's own.
+private val nad_sink_body: string = raw"""
+
+    trait Sink
+        put(*self, s: string)
+
+        twice(*self, msg: string)
+            self.put(msg)
+            self.put(msg)
+    """
+
+private nad_lib(clause: string, body: string) -> (string, string, string) =
+    ("lib", "lib.sysl", "module lib\n" + clause + body)
+
+// A type in the program's own module whose `put` allocates on every call.
+private val nad_loud: string = raw"""
+    import lib.*
+    import sysl.text.cstring
+
+    struct Loud
+        n: int
+
+    impl Sink for Loud
+        put(*self, s: string)
+            val c = cstring(s)
+            self.n += 1
+    """
+
+private nad_main(rest: string) -> (string, string, string) = ("", "main.sysl", nad_loud + rest)
+
+private val nad_twice_main: string = raw"""
+
+    main()
+        var l = Loud(0)
+        l.twice("hi")
+        print(l.n)
+    """
+
+@test("a default reaching an allocating impl through 'self' is accepted in an allocator-free module")
+nad_default_through_self()
+    if !azb_ready() then return
+
+    azb_prints([nad_lib("@no_alloc\n", nad_sink_body), nad_main(nad_twice_main)], "2\n")
+
+@test("and the same program compiles identically with the trait module's clause removed")
+nad_default_without_the_clause()
+    if !azb_ready() then return
+
+    azb_prints([nad_lib("", nad_sink_body), nad_main(nad_twice_main)], "2\n")
+
+// The free generic the default is the counterpart of, kept beside it.
+@test("the free generic over the same trait is accepted as before")
+nad_the_free_generic()
+    if !azb_ready() then return
+
+    azb_prints([nad_lib("@no_alloc\n", nad_sink_body + "\nboth[S: Sink](s: *S, msg: string) = s.twice(msg)\n"),
+                nad_main("\nmain()\n    var l = Loud(0)\n    both(&l, \"hi\")\n    print(l.n)\n")], "2\n")
+
+@test("a default that allocates in its own body is still the trait module's")
+nad_default_allocates_itself()
+    if !azb_ready() then return
+
+    azb_refused([nad_lib("@no_alloc\n", raw"""
+
+                     import sysl.text.cstring
+
+                     trait Sink
+                         put(*self, s: string)
+
+                         twice(*self, msg: string)
+                             val c = cstring(msg)
+                             self.put(msg)
+                     """),
+                 nad_main(nad_twice_main)],
+                ["sysl.text.cstring", "lib/lib.sysl"])
+
+// `Self` is passed over, nothing else: a free function the default calls is the module's choice.
+@test("a default reaching an allocating free function is still the trait module's")
+nad_default_reaches_a_free_function()
+    if !azb_ready() then return
+
+    azb_refused([("helper", "helper.sysl", "module helper\n\nimport sysl.text.cstring\n\n" +
+                  "shout(s: string) -> usize = cstring(s).len\n"),
+                 nad_lib("@no_alloc\n", raw"""
+
+                     import helper.*
+
+                     trait Sink
+                         put(*self, s: string)
+
+                         twice(*self, msg: string)
+                             self.put(msg)
+                             val n = shout(msg)
+                     """),
+                 nad_main(nad_twice_main)],
+                ["this reaches 'helper.shout'", "lib/lib.sysl"])
+
+@test("a default calling another default that calls 'self' is accepted")
+nad_default_calls_a_default()
+    if !azb_ready() then return
+
+    azb_prints([nad_lib("@no_alloc\n", nad_sink_body + raw"""
+
+                        thrice(*self, msg: string)
+                            self.twice(msg)
+                            self.put(msg)
+                    """),
+                nad_main("\nmain()\n    var l = Loud(0)\n    l.thrice(\"hi\")\n    print(l.n)\n")], "3\n")
+
+// The override is the implementing module's own code, and the default that calls it does not answer
+// for it.
+@test("a default calling a default the impl overrode with an allocating body is accepted")
+nad_an_overridden_default()
+    if !azb_ready() then return
+
+    azb_prints([nad_lib("@no_alloc\n", nad_sink_body + raw"""
+
+                        thrice(*self, msg: string)
+                            self.twice(msg)
+                            self.put(msg)
+                    """),
+                ("", "main.sysl", raw"""
+                    import lib.*
+                    import sysl.text.cstring
+
+                    struct Loud
+                        n: int
+
+                    impl Sink for Loud
+                        put(*self, s: string) = self.n += 1
+
+                        override twice(*self, msg: string)
+                            val c = cstring(msg)
+                            self.n += 10
+
+                    main()
+                        var l = Loud(0)
+                        l.thrice("hi")
+                        print(l.n)
+                    """)], "11\n")
+
+@test("a supertrait's default reaching 'self' is accepted, and so is a default calling it")
+nad_a_supertrait_default()
+    if !azb_ready() then return
+
+    azb_prints([nad_lib("@no_alloc\n", raw"""
+
+                     trait Base
+                         put(*self, s: string)
+
+                         twice(*self, msg: string)
+                             self.put(msg)
+                             self.put(msg)
+
+                     trait Sink: Base
+                         thrice(*self, msg: string)
+                             self.twice(msg)
+                             self.put(msg)
+                     """),
+                ("", "main.sysl", raw"""
+                    import lib.*
+                    import sysl.text.cstring
+
+                    struct Loud
+                        n: int
+
+                    impl Base for Loud
+                        put(*self, s: string)
+                            val c = cstring(s)
+                            self.n += 1
+
+                    impl Sink for Loud
+
+                    main()
+                        var l = Loud(0)
+                        l.thrice("hi")
+                        l.twice("hi")
+                        print(l.n)
+                    """)], "5\n")
+
+@test("a generic over the trait calling the default is accepted")
+nad_a_generic_calling_the_default()
+    if !azb_ready() then return
+
+    azb_prints([nad_lib("@no_alloc\n", nad_sink_body + "\nboth[S: Sink](s: *S, msg: string) = s.twice(msg)\n"),
+                nad_main("\nmain()\n    var l = Loud(0)\n    both(&l, \"hi\")\n    both(&l, \"ho\")\n    print(l.n)\n")],
+               "4\n")
+
+// The existing rule for a dynamic call: it is answered against the tables THIS code erased into, so
+// the trait module calling through a `*Sink` it was handed answers for nothing behind it.
+@test("a default reached through a trait object the caller erased is accepted")
+nad_through_a_trait_object()
+    if !azb_ready() then return
+
+    azb_prints([nad_lib("@no_alloc\n", nad_sink_body + "\nrelay(s: *Sink, msg: string) = s.twice(msg)\n"),
+                nad_main("\nmain()\n    var l = Loud(0)\n    val s: *Sink = &l\n    relay(s, \"hi\")\n    print(l.n)\n")],
+               "2\n")
+
+// Three modules, so the allocating impl is in neither the trait's module nor the caller's.
+private val nad_app: (string, string, string) = ("app", "app.sysl", raw"""
+    module app
+
+    import lib.*
+    import sysl.text.cstring
+
+    struct Loud
+        n: int
+
+    impl Sink for Loud
+        put(*self, s: string)
+            val c = cstring(s)
+            self.n += 1
+    """)
+
+@test("an allocator-free module calling the default at an allocating type is refused there")
+nad_the_caller_is_held_to_its_own_clause()
+    if !azb_ready() then return
+
+    azb_refused_without([nad_lib("@no_alloc\n", nad_sink_body), nad_app,
+                         ("b", "b.sysl", "module b\n@no_alloc\n\nimport app.*\nimport lib.*\n\n" +
+                          "poke(l: *Loud) = l.twice(\"hi\")\n"),
+                         ("", "main.sysl", "import app.*\nimport b.*\n\nmain()\n    var l = Loud(0)\n" +
+                          "    poke(&l)\n    print(l.n)\n")],
+                        ["b/b.sysl", "Loud.twice", "makes heap storage"], ["lib/lib.sysl"])
+
+// The same through a trait object: the erasure is the allocator-free module's own, so it answers for it.
+@test("an allocator-free module erasing an allocating type and calling the default is refused there")
+nad_the_eraser_is_held_to_its_own_clause()
+    if !azb_ready() then return
+
+    azb_refused_without([nad_lib("@no_alloc\n", nad_sink_body + "\nrelay(s: *Sink, msg: string) = s.twice(msg)\n"),
+                         nad_app,
+                         ("b", "b.sysl", "module b\n@no_alloc\n\nimport app.*\nimport lib.*\n\n" +
+                          "poke(l: *Loud) = relay(l, \"hi\")\n"),
+                         ("", "main.sysl", "import app.*\nimport b.*\n\nmain()\n    var l = Loud(0)\n" +
+                          "    poke(&l)\n    print(l.n)\n")],
+                        ["b/b.sysl", "makes heap storage"], ["lib/lib.sysl"])
+
+// A default that made the promise ITSELF keeps it at every type, as a generic declaring '@no_alloc'
+// keeps it at every instance (`reference/attributes.md § @no_alloc on a function`).
+@test("a default declaring '@no_alloc' itself is refused at a type whose impl allocates")
+nad_a_default_that_promised_itself()
+    if !azb_ready() then return
+
+    azb_refused([nad_lib("", raw"""
+
+                     trait Sink
+                         put(*self, s: string)
+
+                         @no_alloc
+                         twice(*self, msg: string)
+                             self.put(msg)
+                             self.put(msg)
+                     """),
+                 nad_main(nad_twice_main)],
+                ["this reaches 'Loud.put'", "'Loud.twice' declared '@no_alloc'", "lib/lib.sysl:8:14"])
+
+// `@no_block` reads its bodies with the same walk and the same promise, so it passes `Self` over too.
+@test("a default in a '@no_block' module reaching a blocking impl through 'self' is accepted")
+nad_no_block_default_through_self()
+    if !azb_ready() then return
+
+    azb_prints([nad_lib("@no_block\n", nad_sink_body),
+                ("", "main.sysl", raw"""
+                    import lib.*
+
+                    @blocks
+                    wait_a_bit(n: int) -> int = n + 1
+
+                    struct Slow
+                        n: int
+
+                    impl Sink for Slow
+                        put(*self, s: string) = self.n = wait_a_bit(self.n)
+
+                    main()
+                        var l = Slow(0)
+                        l.twice("hi")
+                        print(l.n)
+                    """)], "2\n")
+
+@test("but a default in a '@no_block' module calling a blocking function itself is refused")
+nad_no_block_default_blocks_itself()
+    if !azb_ready() then return
+
+    azb_refused([("helper", "helper.sysl", "module helper\n\n@blocks\nwait_a_bit(n: int) -> int = n + 1\n"),
+                 nad_lib("@no_block\n", raw"""
+
+                     import helper.*
+
+                     trait Sink
+                         put(*self, s: string)
+
+                         twice(*self, msg: string)
+                             self.put(msg)
+                             val n = wait_a_bit(1)
+                     """),
+                 nad_main(nad_twice_main)],
+                ["this reaches 'helper.wait_a_bit', which blocks", "lib/lib.sysl"])
