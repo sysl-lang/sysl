@@ -7,77 +7,24 @@ import sysl.buf.{Buf, buf}
 // host's answers are `library/sysl/math/tests.sysl`'s. What only a board can show is the lowering
 // where `llvm.bitreverse` is not one instruction: the Cortex-M0 (Armv6-M) and RV32I have none, so
 // LLVM expands it into shifts and masks, and a `u64` or a `u128` is two or four registers on every
-// 32-bit core. The Armv7-M and Armv8-M boards have `rbit`. Every value is read through a volatile
-// field so that the machine computes it, rather than the compiler while compiling.
-
-private val RvbHelpers: string = raw"""
-
-    struct Hidden
-        a: volatile u8
-        b: volatile u16
-        c: volatile u32
-        d: volatile u64
-        e: volatile u12
-        f: volatile u128
-        g: volatile i8
-        i: volatile i32
-        j: volatile i64
-    end Hidden
-
-    var hid = Hidden(0, 0, 0, 0, 0, 0, 0, 0, 0)
-
-    hidden(x: u8) -> u8
-        hid.a = x
-        hid.a
-
-    hidden(x: u16) -> u16
-        hid.b = x
-        hid.b
-
-    hidden(x: u32) -> u32
-        hid.c = x
-        hid.c
-
-    hidden(x: u64) -> u64
-        hid.d = x
-        hid.d
-
-    hidden(x: u12) -> u12
-        hid.e = x
-        hid.e
-
-    hidden(x: u128) -> u128
-        hid.f = x
-        hid.f
-
-    hidden(x: i8) -> i8
-        hid.g = x
-        hid.g
-
-    hidden(x: i32) -> i32
-        hid.i = x
-        hid.i
-
-    hidden(x: i64) -> i64
-        hid.j = x
-        hid.j
-    """
+// 32-bit core. The Armv7-M and Armv8-M boards have `rbit`. Every value goes through `black_box` so
+// that the machine computes it, rather than the compiler while compiling.
 
 private val RvbBody: string = raw"""
     var wrong = 0
 
-    if hidden(u8(0b10110000)).reverse_bits() != 0b00001101 then wrong += 1
-    if hidden(u16(0x1234)).reverse_bits() != 0x2C48 then wrong += 1
-    if hidden(u32(0x12345678)).reverse_bits() != 0x1E6A2C48 then wrong += 1
-    if hidden(u32(1)).reverse_bits() != 0x80000000 then wrong += 1
-    if hidden(u64(0x0123456789ABCDEF)).reverse_bits() != 0xF7B3D591E6A2C480 then wrong += 1
-    if hidden(u12(6)).reverse_bits() != 1536 then wrong += 1
-    if hidden(u128(0x0123456789ABCDEF) << 64).reverse_bits() != u128(0xF7B3D591E6A2C480) then wrong += 1
-    if hidden(u128(1)).reverse_bits() != u128(1) << 127 then wrong += 1
-    if hidden(i8(1)).reverse_bits() != i8::Min then wrong += 1
-    if hidden(i32(-2)).reverse_bits() != i32::Max then wrong += 1
-    if hidden(i64(1)).reverse_bits() != i64::Min then wrong += 1
-    if hidden(u64(0xDEADBEEFCAFEF00D)).reverse_bits().reverse_bits() != 0xDEADBEEFCAFEF00D then wrong += 1
+    if black_box(u8(0b10110000)).reverse_bits() != 0b00001101 then wrong += 1
+    if black_box(u16(0x1234)).reverse_bits() != 0x2C48 then wrong += 1
+    if black_box(u32(0x12345678)).reverse_bits() != 0x1E6A2C48 then wrong += 1
+    if black_box(u32(1)).reverse_bits() != 0x80000000 then wrong += 1
+    if black_box(u64(0x0123456789ABCDEF)).reverse_bits() != 0xF7B3D591E6A2C480 then wrong += 1
+    if black_box(u12(6)).reverse_bits() != 1536 then wrong += 1
+    if black_box(u128(0x0123456789ABCDEF) << 64).reverse_bits() != u128(0xF7B3D591E6A2C480) then wrong += 1
+    if black_box(u128(1)).reverse_bits() != u128(1) << 127 then wrong += 1
+    if black_box(i8(1)).reverse_bits() != i8::Min then wrong += 1
+    if black_box(i32(-2)).reverse_bits() != i32::Max then wrong += 1
+    if black_box(i64(1)).reverse_bits() != i64::Min then wrong += 1
+    if black_box(u64(0xDEADBEEFCAFEF00D)).reverse_bits().reverse_bits() != 0xDEADBEEFCAFEF00D then wrong += 1
 
     w.write("rvb ".bytes)
     wrong.display(w, FormatSpec(0, -1, false))
@@ -94,8 +41,9 @@ rvb_reverse_bits_on_the_boards()
 
         var files: Buf[(string, string)] = buf()
 
-        files.push(("p.sysl", "import board.*\nimport sysl.math.Bits\n\nval w = console()\n\n" + RvbBody))
-        files.push(("board/board.sysl", qemu_board_module(b, RvbHelpers)))
+        files.push(("p.sysl", "import board.*\nimport sysl.hint.black_box\nimport sysl.math.Bits\n\nval w = console()\n\n" +
+                    RvbBody))
+        files.push(("board/board.sysl", qemu_board_module(b)))
 
         qemu_boot(b, files) match
             Err(why) -> bad.push(s"${b.name} (${b.target}): $why")

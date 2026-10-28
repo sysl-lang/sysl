@@ -1,0 +1,140 @@
+module sysl.hint
+@tests
+@requires(heap)
+
+// What `black_box` claims at run time: it hands back exactly what went in, for a value of every
+// kind, and a value that owns something is still released exactly once. Whether the optimizer can
+// see through it is a claim about the emitted code, and is `compiler/…/tests_bbx_black_box.sysl`'s.
+
+private struct Pair
+    a: int
+    b: real
+
+private struct Nothing
+end Nothing
+
+private enum Shape
+    Dot
+    Square(side: int)
+
+private var drops = 0
+
+private struct Tracked
+    n: int
+
+impl Drop for Tracked
+    drop(self)
+        drops += 1
+
+@test("an integer of every width comes back as it went in")
+bbx_integers()
+    assert_eq(black_box(u8(0xA5)), 0xA5)
+    assert_eq(black_box(i8(-128)), i8::Min)
+    assert_eq(black_box(u16(0xBEEF)), 0xBEEF)
+    assert_eq(black_box(i32(-123456)), -123456)
+    assert_eq(black_box(u64(0xDEADBEEFCAFEF00D)), 0xDEADBEEFCAFEF00D)
+    assert_eq(black_box(u12(0xFFF)), 0xFFF)
+    assert_eq(black_box(u128(1) << 127), u128(1) << 127)
+    assert_eq(black_box(i512(-1)), -1)
+    assert_eq(black_box(6) * 7, 42)
+
+@test("a float, a bool and a char come back as they went in")
+bbx_scalars()
+    assert_eq(black_box(2.5), 2.5)
+    assert_eq(black_box(-0.0).bits(), 0x8000000000000000)
+    assert_eq(black_box(1.5f32), 1.5f32)
+    assert(black_box(real.nan()).is_nan())
+    assert(black_box(true))
+    assert_eq(black_box('é'), 'é')
+
+@test("a struct, an empty struct, a tuple and an array come back whole")
+bbx_aggregates()
+    val p = black_box(Pair(7, -1.25))
+
+    assert_eq(p.a, 7)
+    assert_eq(p.b, -1.25)
+
+    val _ = black_box(Nothing())
+    val t = black_box((1, "two", 3.0))
+
+    assert_eq(t.0, 1)
+    assert_eq(t.1, "two")
+    assert_eq(t.2, 3.0)
+
+    val a = black_box([1, 2, 3, 4])
+
+    assert_eq(a[3], 4)
+    assert_eq(a.len, 4)
+
+@test("a string and a slice come back as views of the same storage")
+bbx_views()
+    val s = "a+b)))"[0..<3]
+
+    assert_eq(black_box(s), "a+b")
+    assert_eq(black_box("").len, 0)
+
+    val xs = [10, 20, 30, 40]
+    val v = black_box(xs[1..<3])
+
+    assert_eq(v.len, 2)
+    assert_eq(v[0], 20)
+    assert_eq(v[1], 30)
+
+@test("an Option, an enum and a Result come back as the same variant with the same payload")
+bbx_sums()
+    assert_eq(black_box(Some(4)), Some(4))
+    assert(black_box(Option[int].None).is_none())
+
+    black_box(Square(3)) match
+        Square(side) -> assert_eq(side, 3)
+        Dot -> assert(false, "Square came back as Dot")
+
+    black_box(Dot) match
+        Dot -> ()
+        Square(_) -> assert(false, "Dot came back as Square")
+
+    val r: Result[int, string] = Err("no")
+
+    assert_eq(black_box(r), Err("no"))
+
+private hold_tracked(n: int) -> int
+    val t = Tracked(n)
+    val u = black_box(t)
+
+    u.n
+end hold_tracked
+
+@test("a value with a destructor comes back as the same object, released once")
+bbx_reference()
+    drops = 0
+
+    assert_eq(hold_tracked(9), 9)
+    assert_eq(drops, 1)
+
+    val t = Tracked(5)
+    val u = black_box(t)
+
+    assert(t === u)
+
+private through[T](x: T) -> T = black_box(black_box(x))
+
+@test("a generic caller passes its own type parameter through")
+bbx_generic_caller()
+    assert_eq(through(u12(9)), 9)
+    assert_eq(through("generic"), "generic")
+    assert_eq(through(Pair(1, 2.0)).b, 2.0)
+    assert_eq(through(Some(Some(1))), Some(Some(1)))
+
+@no_alloc
+private sum_squares(n: int) -> int
+    var sum = 0
+
+    for i in 0..<black_box(n) do sum += i * i
+
+    black_box(sum)
+end sum_squares
+
+@test("a function that may not allocate may call it")
+bbx_no_alloc()
+    assert_eq(sum_squares(4), 14)
+    assert_eq(sum_squares(black_box(0)), 0)
