@@ -104,6 +104,11 @@ print(small + 10)
 
 Overflow is therefore **not** a trap source. See [errors and traps](/reference/errors/) for what is.
 
+Where the wrap is the point — a hash, a checksum, a counter that rolls over — `+%`, `-%` and `*%` say
+so in the spelling, and where the edge of the range is the right answer instead, `+|`, `-|` and `*|`
+stop there: `small +| 10` is 255. Both families are defined in every build, at every width
+([wrapping and saturating operators](/reference/expressions/#wrapping-and-saturating-operators)).
+
 ### Arithmetic over literals is exact
 
 An expression written out of integer literals alone — `65536 * 65536`, `(1 << 16) - 1`,

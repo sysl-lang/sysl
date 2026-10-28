@@ -20,7 +20,7 @@ operator symbols, and no facility to add one.
 
 | Prec | Operators | Role | Associativity |
 |---|---|---|---|
-| 1 | `=` `+=` `-=` `*=` `/=` `%=` `&=` `\|=` `^=` `<<=` `>>=`, and `:=` `+:=` … `>>:=` | assignment | right |
+| 1 | `=` `+=` `-=` `*=` `/=` `%=` `&=` `\|=` `^=` `<<=` `>>=` `+%=` `-%=` `*%=` `+\|=` `-\|=` `*\|=`, and `:=` `+:=` … `*\|:=` | assignment | right |
 | 2 | `\|\|` | logical or | left |
 | 3 | `&&` | logical and | left |
 | 4 | `is`, `is not` | pattern test | non-associative |
@@ -29,8 +29,8 @@ operator symbols, and no facility to add one.
 | 7 | `\|` | bitwise or | left |
 | 8 | `^` | bitwise xor | left |
 | 9 | `&` | bitwise and | left |
-| 10 | `+` `-` | add, subtract | left |
-| 11 | `*` `/` `%` `<<` `>>` | multiply, divide, remainder, shift | left |
+| 10 | `+` `-`, `+%` `-%`, `+\|` `-\|` | add, subtract; wrapping, saturating | left |
+| 11 | `*` `/` `%` `<<` `>>`, `*%`, `*\|` | multiply, divide, remainder, shift; wrapping, saturating | left |
 | 12 | `-` `!` `~` `*` `&` `++` `--` | prefix unary | right |
 | 13 | `[]` `.` `()` `::` `with` `?` `++` `--` | postfix | left |
 | — | `await` | run a task: prefix, taking the postfix chain up to its first `?` | right |
@@ -305,6 +305,55 @@ Integer arithmetic **wraps** at the declared width; see [types](/reference/types
 by zero traps. Arithmetic written out of literals alone is the exception to both: it is computed
 exactly, a value that does not fit its type is refused, and so is a division by a literal zero —
 see [arithmetic over literals](/reference/types/#arithmetic-over-literals-is-exact).
+
+### Wrapping and saturating operators
+
+**`+%` `-%` `*%` wrap and `+|` `-|` `*|` saturate, in every build**, whatever a plain `+` does there.
+A wrapping operator's result is the two's-complement result at the operands' width; a saturating
+operator's is the nearest value the width holds — its maximum or its minimum. A signed saturating
+product saturates toward the side of the true product's sign. Each binds as its base operator does
+(`+|` with `+`, `*|` with `*`), takes the operands its base takes — two of one type, or two that
+[widen](#which-conversions-are-implicit) to one, with a literal read as `+` reads it — and has a
+compound form (`+%=` … `*|=`) and a yielding one (`+%:=` … `*|:=`). The width is the one the operands
+settle on, so a literal no `u8` holds makes `b +| 300` an `int` sum, exactly as it makes `b + 300` one.
+
+```sysl
+val b: u8 = 250
+val s: i8 = -100
+
+print(b +% 10, b +| 10, b -| 251, b *| 2)
+print(s -% 100, s -| 100, s *| 2, s *| -2)
+
+var level: u8 = 200
+level +|= 100
+print(level)
+```
+
+```output
+4 255 0 255
+56 -128 -128 127
+255
+```
+
+They are defined on integers of every width, signed and unsigned — `u12`, `u128` and `i256` included,
+an inline expansion past the machine's word — and on [fixed-point](/reference/fixed-point/) values of
+one format, where `+|` is the saturating `+` every format has and `+%` is the one a `wrapping` format
+has, whichever kind the operands are. A constant written with one is folded at the constant's own
+type: `const K: u8 = 250 +| 10` is 255. There is no prefix form, and they are not dispatched to a
+trait: an operator method is what a type of your own defines for `+`. A float's arithmetic neither
+wraps nor saturates, and is refused:
+
+```sysl
+val f = 1.5
+print(f +| 1.0)
+```
+
+```error
+'+|' is not defined for real — floating-point arithmetic neither wraps nor saturates, it rounds and overflows to infinity, so write '+'
+```
+
+A register of lanes is refused too (`'+|' is not defined for <4>int`); a lane's saturating `+` is a
+fixed-point lane's own `+`.
 
 ### A multiply feeding an add is fused where the machine fuses
 

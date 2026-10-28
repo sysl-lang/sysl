@@ -1016,19 +1016,24 @@ Operators are tokenized by longest match, so `..<` wins over `..`, `<<=` over `<
 one token rather than `+` and `:=`.
 
 ```
-=  +=  -=  *=  /=  %=  &=  |=  ^=  <<=  >>=
-:=  +:=  -:=  *:=  /:=  %:=  &:=  |:=  ^:=  <<:=  >>:=
+=  +=  -=  *=  /=  %=  &=  |=  ^=  <<=  >>=  +%=  -%=  *%=  +|=  -|=  *|=
+:=  +:=  -:=  *:=  /:=  %:=  &:=  |:=  ^:=  <<:=  >>:=  +%:=  -%:=  *%:=  +|:=  -|:=  *|:=
 ||  &&  !
 ==  !=  ===  !==  <  >  <=  >=
 ..  ..<  ...
 |  ^  &  ~
 +  -  *  /  %  <<  >>
++%  -%  *%  +|  -|  *|
 ++  --
 (  )  [  ]  {  }  .  ?
 .*
 ,  ::  :  ->
 #  ;
 ```
+
+The wrapping and saturating operators (`+%`, `*|` …) are one token each, and took no spelling from
+anyone: `%` is never a prefix and `|` never begins an operand, so `+` straight before either was no
+expression before. `n |-1` is still `|` and `-1`.
 
 Two of these need a note. `.*` is lexed as **one token** — the tail of a wildcard import — which is
 possible because a `.` is otherwise always followed by a name. And `;` is a separator *only* inside a

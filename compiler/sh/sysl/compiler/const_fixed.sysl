@@ -59,7 +59,18 @@ fixed_eval_binary(op: string, lt: Type, rt: Type, ty: Type, x: BigInt, y: BigInt
         "/" -> fe_quotient(x, y, ft - fa + fb, ty)
         "<<" -> Ok(fe_shift(true, x, y, lt))
         ">>" -> Ok(fe_shift(false, x, y, lt))
-        _ -> Err(s"'$op' on ${type_show(lt)}")
+        _ ->
+            if !is_wrap_sat_op(op) then return Err(s"'$op' on ${type_show(lt)}")
+
+            // A wrapping or saturating form settles as a `wrapping` format does, or as every other
+            // one does, whichever kind `ty` is.
+            val base = base_of_wrap_sat(op)
+            val exact = if base == "+" then big_add(x, y)
+            else if base == "-" then big_sub(x, y)
+            else fe_scaled(big_mul(x, y), ft - fa - fb)
+            val (bits, _, signed) = fixed_format(ty).unwrap_or((64, 0, true))
+
+            Ok(if is_wrap_op(op) then wrap(exact, bits, signed) else fe_clamped(exact, bits, signed))
 end fixed_eval_binary
 
 // `x · 2^sh / y`, rounded to nearest with a half going up and settled into `ty`. The divisor is made

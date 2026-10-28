@@ -1,0 +1,53 @@
+module sh.sysl.compiler
+
+import sysl.math.bigint.{BigInt, add, cmp, mul, sub}
+
+// The wrapping operators `+%` `-%` `*%` and the saturating operators `+|` `-|` `*|`.
+//
+// **Each is its base operator with the overflow answered in the spelling** rather than by the build:
+// a wrapping one is the two's-complement result at the operands' width whatever that build does with
+// a plain `+`, and a saturating one is the nearest value the width holds -- its minimum or its
+// maximum. They bind as their base operator does, take the same operands, and have compound forms
+// (`+%=`, `*|=` …) that the base's compound form's rules cover.
+//
+// They are defined on integers of every width, signed and unsigned, and on fixed-point values of one
+// format, where they choose between the two behaviours a fixed-point type already has: `+|` is the
+// saturating `+` every format but a `wrapping` one has, and `+%` is that one's. A float has no
+// overflow to choose about, a register of lanes is not covered, and neither is anything else.
+
+// Whether an operator is one of the six.
+is_wrap_sat_op(op: string) -> bool = is_wrap_op(op) || is_sat_op(op)
+
+// `+%`, `-%`, `*%`.
+is_wrap_op(op: string) -> bool = op == "+%" || op == "-%" || op == "*%"
+
+// `+|`, `-|`, `*|`.
+is_sat_op(op: string) -> bool = op == "+|" || op == "-|" || op == "*|"
+
+// The operator one of the six is the overflow-defined form of: `+%` is `+`. Any other operator is its
+// own.
+base_of_wrap_sat(op: string) -> string = if is_wrap_sat_op(op) then op[0..<1] else op
+
+// Whether an expression's operators include one of the six, outside any call -- what decides that a
+// constant is folded at its own type rather than as width-less numbers.
+mentions_wrap_sat(e: Expr) -> bool = *e.kind match
+    Binary(op, l, r) -> is_wrap_sat_op(op) || mentions_wrap_sat(l) || mentions_wrap_sat(r)
+    Unary(_, operand) -> mentions_wrap_sat(operand)
+    _ -> false
+
+// A constant declaration's value: folded at the constant's own type where its initializer is written
+// with one of the six, and by the untyped fold otherwise.
+const_decl_value(cx: &Analyzer, init: Expr, ty: Type) -> Option[Const] =
+    if mentions_wrap_sat(init) then const_wrap_sat(cx, init, Some(ty)) else const_fold(cx, init)
+
+// One of the six over two values the width holds, exactly as the program computes it.
+wrap_sat_value(op: string, x: BigInt, y: BigInt, bits: int, signed: bool) -> BigInt
+    val base = base_of_wrap_sat(op)
+    val exact = if base == "+" then add(x, y) else if base == "-" then sub(x, y) else mul(x, y)
+
+    if is_wrap_op(op) then return wrap(exact, bits, signed)
+
+    if cmp(exact, min_of(bits, signed)) < 0 then min_of(bits, signed)
+    else if cmp(exact, max_of(bits, signed)) > 0 then max_of(bits, signed)
+    else exact
+end wrap_sat_value

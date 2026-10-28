@@ -423,6 +423,8 @@ arith_type(cx: &Analyzer, span: Span, op: string, a: Type, b: Type, rhs: Span) -
         Constrained(d) -> if d.derived && (type_eq(a, b) || shift) then a else ra
         _ -> ra
 
+    if is_wrap_sat_op(op) then return wrap_sat_type(cx, span, op, a, result)
+
     underlying(a) match
         Integer(_, _, _) -> if integer_op(op) then result else undefined_for(cx, span, op, a)
         Floating(_, _) -> if floating_op(op) then result else undefined_for(cx, span, op, a)
@@ -437,6 +439,29 @@ arith_type(cx: &Analyzer, span: Span, op: string, a: Type, b: Type, rhs: Span) -
         Vector(_, lane) -> vector_arith(cx, span, op, a, *lane, result)
         _ -> undefined_for(cx, span, op, a)
 end arith_type
+
+// What a wrapping or saturating operator (`wrap_sat.sysl`) makes of two operands of one type: that
+// type, on an integer of any width or a fixed-point value. A float is refused for what it is -- its
+// arithmetic neither wraps nor saturates, it rounds and runs to infinity -- and a register of lanes
+// because the six are not defined per lane.
+private wrap_sat_type(cx: &Analyzer, span: Span, op: string, a: Type, result: Type) -> Type
+    underlying(a) match
+        Integer(_, _, _) -> result
+        Fixed(_, _, _) -> result
+        Floating(_, _) ->
+            val base = base_of_wrap_sat(op)
+
+            cx.fault(span, s"'$op' is not defined for ${type_show(a)} — floating-point arithmetic " +
+                     s"neither wraps nor saturates, it rounds and overflows to infinity, so write '$base'")
+            Unknown
+        Vector(_, _) ->
+            val does = if is_wrap_op(op) then "wrapping" else "saturating"
+
+            cx.fault(span, s"'$op' is not defined for ${type_show(a)} — the $does operators are " +
+                     "defined on one integer or fixed-point value, not lane by lane")
+            Unknown
+        _ -> undefined_for(cx, span, op, a)
+end wrap_sat_type
 
 private integer_op(op: string) -> bool =
     op == "+" || op == "-" || op == "*" || op == "/" || op == "%" || op == "<<" || op == ">>" ||
