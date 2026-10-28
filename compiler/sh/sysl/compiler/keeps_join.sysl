@@ -86,6 +86,10 @@ private handle_expr(hs: &Handles, e: TExpr)
 
                 if started.is_some() then hs.chained.push(started.unwrap())
             end if
+
+        // A task awaited or driven where its call is written ends before the statement does.
+        TAwait(task, _) -> chain_task(hs, task)
+        TBlockOn(task, _) -> chain_task(hs, task)
         TMatch(scrutinee, arms, _) ->
             scrutinized(hs, scrutinee)
 
@@ -111,6 +115,13 @@ private handle_expr(hs: &Handles, e: TExpr)
                     _ -> ()
         _ -> ()
 end handle_expr
+
+private chain_task(hs: &Handles, task: TExpr)
+    *task.kind match
+        TCall(_, _, _, _) -> hs.chained.push(task.span)
+        TVCall(_, _, _, _, _) -> hs.chained.push(task.span)
+        _ -> ()
+end chain_task
 
 private bind_handle(hs: &Handles, p: TPattern, k: string)
     p match
@@ -222,6 +233,13 @@ join_clear(hs: &Handles, evs: &EvBuf, name: string, args: Buf[TExpr], at: Span)
 
     if k != "" then evs.items.push(FlowEv(true, s"j:$k", "", at))
 end join_clear
+
+// An `await` or a `block_on` runs its task to its end, which lets go of what the task held.
+await_clear(hs: &Handles, evs: &EvBuf, task: TExpr, at: Span)
+    val k = handle_key(hs, task)
+
+    if k != "" then evs.items.push(FlowEv(true, s"j:$k", "", at))
+end await_clear
 
 // A way on which a handle is known to be `None` holds no thread: the arm `None` matches, or the way
 // `Some(...)` did not.
