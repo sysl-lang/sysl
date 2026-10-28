@@ -928,8 +928,9 @@ print(block_on(fill()))
 ## Dropping a task cancels it
 
 **There is no cancel operation: a task is cancelled by dropping it.** A task dropped while it is
-suspended releases exactly what a `return` at that suspension point would: its pending `defer`s run,
-then its locals and parameters are released, in the same order a `return` releases them. A task that
+suspended releases exactly what a `return` at that suspension point would: its pending `defer`s run
+and its locals are released, in the one reverse order a `return` undoes its blocks in, and then its
+parameters are released. A task that
 is awaiting another releases the awaited task first. A task dropped before it started releases only
 its parameters, since none of its body ran.
 

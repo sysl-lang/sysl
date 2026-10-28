@@ -176,6 +176,12 @@ struct Emit
     defers: Buf[TStmt]
     defer_marks: Buf[usize]
 
+    // Beside each entry of `defers`, how many entries `owned_slots` had when it was registered: the
+    // slots below that index were written above the `defer`, the ones from it on below. Leaving a
+    // block undoes both in one reverse order by position (`emit_arc.sysl`'s `leave_scope`), and a
+    // slot taken out of the list (`emit_moves.sysl`'s `forget_slot`) moves every later position down.
+    defer_at: Buf[usize]
+
     // The registers this body has named for a local's storage, and the locals whose address has been
     // named more than once: a deferred statement is laid down at every edge that leaves its block,
     // so a local it declares is declared once per edge. A slot is shared by every laying; an address
@@ -297,7 +303,7 @@ struct Emit
     framed_lits: Buf[Span]
 
     // How the function is being left while a way out lays its deferred statements down, which is
-    // what decides whether an `errdefer` among them runs (`emit_arc.sysl`'s `run_deferrals`).
+    // what decides whether an `errdefer` among them runs (`emit_arc.sysl`'s `leave_scope`).
     exit: ExitMode
 
     // The error return trace (`error_trace.sysl`): whether this module records into it, so it declares
@@ -518,7 +524,7 @@ emitter_for(t: Target, destructors: Buf[(string, string)]) -> Emit
          foreigns, variadics, variadic_types, export_symbols, ensures, None, "", tail_calls, tail_params,
          "", self_params, None, ghost_funcs, destructors, false, false, false,
          false, boxes, bufs, requested, requested_set, queue, temps, temp_marks, owned_slots, owned_marks, defers,
-         defer_marks, set(), relaid, set(), promoted, promoted_boxes, promoted_temps, ref_places, exposed_unknown(),
+         defer_marks, buf(), set(), relaid, set(), promoted, promoted_boxes, promoted_temps, ref_places, exposed_unknown(),
          set(), set(), set(), set(), map(), map(), false, None, set(), buf(), None, None, false,
          None, false, buf(), map(), map(), map(), set(), buf(), set(), set(), set(), false, untouched_none(), set(),
          no_wrap_none(), map(), buf(), Leaving, false, "", set(), buf(), map(), map(), 0, moves_none(), set(), set(),
@@ -576,6 +582,7 @@ start_function(e: *Emit)
     e.owned_marks.clear()
     e.defers.clear()
     e.defer_marks.clear()
+    e.defer_at.clear()
     e.declared.clear()
     e.frame_slots.clear()
     e.relaid.clear()

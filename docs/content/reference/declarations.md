@@ -1181,8 +1181,8 @@ the call was made on is never resumed, so every count a frame on it holds is sto
 ever free.
 
 `@abandons` says a function is the second kind. **A call to one ends the caller's frame first,
-exactly as a `return` would** — its deferred statements run, then its counts are given back — and
-then the call is made:
+exactly as a `return` would** — its deferred statements run and its counts are given back, in the
+one reverse order a block is undone in — and then the call is made:
 
 ```sysl
 struct Node

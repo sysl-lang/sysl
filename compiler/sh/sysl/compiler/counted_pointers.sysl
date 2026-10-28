@@ -86,13 +86,14 @@ private struct PtrLoop
 end PtrLoop
 
 // `scopes` and `defers` are kept in step: for every block open, the locals it declared so far and
-// the `defer` bodies it has met so far, which is what leaving it early runs and lets go of.
+// the `defer` bodies it has met so far, each with how many of those locals were declared above it,
+// which is what leaving it early runs and lets go of.
 private struct PtrWalk
     addrs: Buf[PtrAddr]
     moves: Buf[PtrMove]
     loops: Buf[&PtrLoop]
     scopes: Buf[Buf[string]]
-    defers: Buf[Buf[Buf[TStmt]]]
+    defers: Buf[Buf[(Buf[TStmt], usize)]]
     in_defer: int
     holders: Buf[string]
     told: Buf[Span]
@@ -451,11 +452,11 @@ end shown_local
 
 // -- statements -------------------------------------------------------------------------------------
 
-// A run of statements and what it comes to, with every `defer` among them run after both, last
-// first -- and then every local it declared let go of, which strands what pointed into it.
+// A run of statements and what it comes to, and then the block left (`leave`): every `defer` among
+// them run and every local it declared let go of, which strands what pointed into it.
 private seq_flow(w: &PtrWalk, stmts: Buf[TStmt], result: Option[TExpr], entry: PtrFlow) -> PtrVal
     var f = entry
-    val held: Buf[Buf[TStmt]] = buf()
+    val held: Buf[(Buf[TStmt], usize)] = buf()
     val mine: Buf[string] = buf()
 
     w.scopes.push(mine)
@@ -463,7 +464,7 @@ private seq_flow(w: &PtrWalk, stmts: Buf[TStmt], result: Option[TExpr], entry: P
 
     for s in stmts
         s match
-            TDefer(body, _) -> held.push(body)
+            TDefer(body, _) -> held.push((body, mine.len()))
             TVarDecl(name, _, _, _) ->
                 mine.push(name)
                 f = stmt_flow(w, s, f)
@@ -478,27 +479,38 @@ private seq_flow(w: &PtrWalk, stmts: Buf[TStmt], result: Option[TExpr], entry: P
 
     w.defers.pop()
     w.scopes.pop()
-    f = run_defers(w, held, f)
-    PtrVal(release(w, f, mine), out.facts, out.inner)
+    PtrVal(leave(w, held, mine, f, true), out.facts, out.inner)
 end seq_flow
 
-// The `defer` bodies a block has met so far, run last first, as leaving it runs them.
-private run_defers(w: &PtrWalk, held: Buf[Buf[TStmt]], f: PtrFlow) -> PtrFlow
+// Leaving a block, as emission does it: the `defer` bodies it has met so far and the locals it
+// declared, undone in one reverse order by where each was written -- so a local declared below a
+// `defer` is let go of before that body runs, and one declared above it after. `run` is false for a
+// jump out of a `defer` body itself, which runs nothing more.
+private leave(w: &PtrWalk, held: Buf[(Buf[TStmt], usize)], names: Buf[string], f: PtrFlow, run: bool) -> PtrFlow
     var g = f
+    var upper = names.len()
     var i = held.len()
 
     while i > 0
         i -= 1
-        g = seq_flow(w, held.at(i), None, g).flow
 
-    g
-end run_defers
+        val at = held.at(i).1
 
-private release(w: &PtrWalk, f: PtrFlow, names: Buf[string]) -> PtrFlow
+        g = release(w, g, names, at, upper)
+
+        if at < upper then upper = at
+
+        if run then g = seq_flow(w, held.at(i).0, None, g).flow
+
+    release(w, g, names, 0, upper)
+end leave
+
+// The locals `[from, upto)` let go of.
+private release(w: &PtrWalk, f: PtrFlow, names: Buf[string], from: usize, upto: usize) -> PtrFlow
     var g = f
 
-    for item in names
-        g = apply_move(w, g, PtrMove(span_zero(), 3, "", item, 0))
+    for j in from..<upto
+        g = apply_move(w, g, PtrMove(span_zero(), 3, "", names.at(j), 0))
 
     g
 end release
@@ -513,13 +525,11 @@ private release_to(w: &PtrWalk, mark: usize, f: PtrFlow) -> PtrFlow
     while i > mark
         i -= 1
 
-        if w.in_defer == 0
-            w.in_defer += 1
-            g = run_defers(w, w.defers.at(i), g)
-            w.in_defer -= 1
-        end if
+        val run = w.in_defer == 0
 
-        g = release(w, g, w.scopes.at(i))
+        w.in_defer += 1
+        g = leave(w, w.defers.at(i), w.scopes.at(i), g, run)
+        w.in_defer -= 1
 
     g
 end release_to
@@ -1088,7 +1098,7 @@ private scoped_flow(w: &PtrWalk, names: Buf[string], stmts: Buf[TStmt], result: 
 
     w.defers.pop()
     w.scopes.pop()
-    PtrVal(release(w, v.flow, names), v.facts, v.inner)
+    PtrVal(release(w, v.flow, names, 0, names.len()), v.facts, v.inner)
 end scoped_flow
 
 // Whether a value is made where it is read rather than read out of a place: nothing else holds it,
