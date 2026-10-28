@@ -220,6 +220,8 @@ check_keeps(a: &Analysis, funcs: Buf[TFunc], vtables: Buf[TVtable])
         if cx.strayed then settle_by_rounds(cx)
     end if
 
+    if explaining_borrows() then note_borrows(cx)
+
     // **The calls are held to the rule once every answer is settled**, since only those refusals
     // are told. Every question was asked by the warming, so holding the calls reads answers and
     // changes none of them.
@@ -682,6 +684,8 @@ private ask_every_question(cx: &KeepsCx, f: TFunc)
         keeps_of(cx, f.name, i)
         answers_of(cx, f.name, i)
         raw_answers_of(cx, f.name, i)
+
+        if explaining_borrows() then borrow_of(cx, f.name, i)
 end ask_every_question
 
 // The functions `f`'s body calls by name, in the order they are written, a name once for each call.
@@ -708,11 +712,13 @@ private assumed_answer(key: string) -> KeptWhy = if key.starts_with("!") then cl
 
 // -- the summaries --------------------------------------------------------------------------------
 
-// The four questions asked of a body, by the mark its answers are filed under.
+// The five questions asked of a body, by the mark its answers are filed under. The last is asked
+// only where `--explain-borrows` was given (`borrow_summary.sysl`).
 private val KeepsQ = ""
 private val AnswersQ = "="
 private val RawAnswersQ = "~"
 private val ClearsQ = "!"
+private val BorrowQ = "^"
 
 // Whether `name` keeps the argument at position `i`, why, and every location it may be held at.
 keeps_of(cx: &KeepsCx, name: string, i: usize) -> KeptWhy = summary(cx, name, i, KeepsQ)
@@ -726,6 +732,10 @@ raw_answers_of(cx: &KeepsCx, name: string, i: usize) -> bool = summary(cx, name,
 
 // The locations `name` overwrites on every way out, in terms of its own parameters.
 clears_of(cx: &KeepsCx, name: string) -> KeptWhy = summary(cx, name, 0, ClearsQ)
+
+// Whether what `name` answers is a place of, or +0 from, the argument at position `i`
+// (`borrow_summary.sysl`): kept with the paths where it is, not kept with the reason where not.
+borrow_of(cx: &KeepsCx, name: string, i: usize) -> KeptWhy = summary(cx, name, i, BorrowQ)
 
 private summary(cx: &KeepsCx, name: string, i: usize, q: string) -> KeptWhy
     val key = s"$q$name|$i"
@@ -754,6 +764,7 @@ private summary(cx: &KeepsCx, name: string, i: usize, q: string) -> KeptWhy
     if found.is_none()
         if keeping then return extern_kept(cx, name, i)
         if q == ClearsQ then return not_kept()
+        if q == BorrowQ then return KeptWhy(false, s"'$name' has no body in sight", span_zero(), buf())
 
         val said = extern_answers(cx, name, i)
 
@@ -796,6 +807,7 @@ private summary(cx: &KeepsCx, name: string, i: usize, q: string) -> KeptWhy
     val walked = if keeping && pointer_reached(cx, f, i) then held_through_params(walk_kept(cx, f, i), i)
     else if keeping then walk_kept(cx, f, i)
     else if q == ClearsQ then walk_clears(cx, f)
+    else if q == BorrowQ then walk_borrow(cx, f, i)
     else walk_answers(cx, f, i, q == RawAnswersQ)
 
     val out = if keeping && f.marks.is_async() then task_held(walked) else walked

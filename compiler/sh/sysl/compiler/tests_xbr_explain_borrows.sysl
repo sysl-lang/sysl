@@ -1,0 +1,329 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+
+// `--explain-borrows`: for each function of the program's own files, whether its answer is a place of
+// a parameter, +0 from one, or why it is neither (`borrow_summary.sysl`,
+// `docs/design/borrowed-return.md § 5.1`). The programs are the design note's probes and the shapes
+// its edge-case matrix names -- what is answered, the callee kind, recursion, generics -- each line
+// quoted whole.
+
+// What one `emit-llvm` came to: the status, each line of the report, and the file the program was
+// written to. `None` without the library.
+private xbr_run(text: string, flag: bool) -> Option[(int, Buf[string], string)]
+    if xvr_no_library() then return None
+
+    val root = make_temp_dir("sysl-xbr").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    var lines: Buf[string] = buf()
+    val sink = &lines
+    var notes: Buf[string] = buf()
+    val noted = &notes
+    val file = s"$root/main.sysl"
+    var args: Buf[string] = buf()
+
+    args.push("sysl")
+    args.push("emit-llvm")
+    if flag then args.push("--explain-borrows")
+    args.push(file)
+
+    val code = run_cli_noted(args.view(), (line) -> sink.push(line), (line) -> noted.push(line))
+
+    remove_dir_all(root).unwrap_or(())
+    Some((code, notes, file))
+end xbr_run
+
+// The report's line about the function written at `where`, without the file it names.
+private xbr_line(notes: Buf[string], file: string, where: string) -> string
+    for item in notes
+        if item.starts_with(s"$file:$where: ") then return item[file.len + where.len + 3..<item.len]
+
+    s"no line at $where in: $notes"
+end xbr_line
+
+// The motivating probe (b01) and the shapes beside it: a field, a chain, a fixed array's element, a
+// `match` payload, both arms a place, and an arm answering something made here.
+@test("a field, a chain, an element, a payload and unwrap are places of the receiver")
+xbr_places()
+    xbr_run(raw"""
+        struct Leaf
+            v: int
+
+        struct Kids
+            nw: &Leaf
+            ne: &Leaf
+
+        struct Inner
+            leaf: &Leaf
+
+        struct Node
+            level: int
+            kids: Option[Kids]
+            inner: Inner
+            arr: [3]int
+            left: &Leaf
+            right: &Leaf
+
+            quad(self) -> Kids = self.kids.unwrap()
+            lvl(self) -> int = self.level
+            chain(self) -> &Leaf = self.inner.leaf
+            third(self) -> int = self.arr[2]
+            kid(self) -> Kids = self.kids match
+                Some(k) -> k
+                None -> panic("leaf")
+            two(self, c: bool) -> &Leaf = if c then self.left else self.right
+            fresh(self, c: bool) -> &Leaf = if c then self.left else Leaf(0)
+
+        walk(n: &Node) -> int
+            if n.level == 0 then return 1
+
+            val q = n.quad()
+
+            q.nw.v + q.ne.v
+
+        val l: &Leaf = Leaf(1)
+        val top: &Node = Node(1, Some(Kids(l, l)), Inner(l), [1, 2, 3], l, l)
+
+        print(walk(top) + top.lvl() + top.third() + top.chain().v + top.two(true).v + top.fresh(false).v)
+        """, true) match
+        None -> ()
+        Some((code, notes, file)) ->
+            assert_eq(code, Fine)
+            assert_eq(xbr_line(notes, file, "19:5"), "'Node.quad' answers a place of 'self': self.kids.unwrap()")
+            assert_eq(xbr_line(notes, file, "20:5"), "'Node.lvl' answers a place of 'self': self.level")
+            assert_eq(xbr_line(notes, file, "21:5"), "'Node.chain' answers a place of 'self': self.inner.leaf")
+            assert_eq(xbr_line(notes, file, "22:5"), "'Node.third' answers a place of 'self': self.arr[_]")
+            assert_eq(xbr_line(notes, file, "23:5"), "'Node.kid' answers a place of 'self': self.kids.Some")
+            assert_eq(xbr_line(notes, file, "26:5"),
+                      "'Node.two' answers a place of 'self': self.left | self.right")
+            assert_eq(xbr_line(notes, file, "27:5"),
+                      "'Node.fresh' is not borrowed: a reference made here, at 27:62")
+            assert_eq(xbr_line(notes, file, "29:1"), "'walk' is not borrowed: its answer holds nothing it was handed")
+end xbr_places
+
+// b07 and b08: an element of a `Buf`, through the index operator and through a `for` loop, and the
+// `Option[&T]` a lookup answers. The pre-0.7.5 HashLife `node` is a place; `find` is +0, and the
+// inert-body test of `borrowing.sysl` does not admit its loop, which the line says.
+@test("a Buf element is a place, an Option or a Result built of one is +0")
+xbr_wrappers()
+    xbr_run(raw"""
+        import sysl.buf.{Buf, buf}
+
+        struct Item
+            key: int
+
+        struct Table
+            items: Buf[&Item]
+            one: &Item
+
+            find(self, key: int) -> Option[&Item]
+                for it in self.items
+                    if it.key == key then return Some(it)
+
+                None
+            at(self, i: int) -> &Item = self.items[usize(i)]
+            wrap(self) -> Option[&Item] = Some(self.one)
+            ok(self, n: int) -> Result[&Item, int] = if n > 0 then Ok(self.one) else Err(n)
+
+        val t = Table(buf(), Item(7))
+
+        t.items.push(Item(1))
+        print(t.at(0).key + t.wrap().unwrap().key + t.ok(1).unwrap().key)
+        print(t.find(1).unwrap().key)
+        """, true) match
+        None -> ()
+        Some((code, notes, file)) ->
+            assert_eq(code, Fine)
+            assert_eq(xbr_line(notes, file, "10:5"), "'Table.find' answers +0 from 'self': self.items.walk()[_], " +
+                      "but its body may write or release what it was handed")
+            assert_eq(xbr_line(notes, file, "15:5"), "'Table.at' answers a place of 'self': self.items[_]")
+            assert_eq(xbr_line(notes, file, "16:5"), "'Table.wrap' answers +0 from 'self': self.one")
+            assert_eq(xbr_line(notes, file, "17:5"), "'Table.ok' answers +0 from 'self': self.one")
+end xbr_wrappers
+
+// Recursion settles on "not a place", as the design note asks: the answers start there and only grow
+// with what they read, and a call to itself reads its own.
+@test("a recursion and a mutual recursion settle on not borrowed")
+xbr_recursion()
+    xbr_run(raw"""
+        struct Leaf
+            v: int
+
+        struct Node
+            leaf: &Leaf
+
+            deep(self, n: int) -> &Leaf = if n == 0 then self.leaf else self.deep(n - 1)
+
+        ping(n: &Node, k: int) -> &Leaf = if k == 0 then n.leaf else pong(n, k - 1)
+        pong(n: &Node, k: int) -> &Leaf = if k == 0 then n.leaf else ping(n, k - 1)
+
+        val n: &Node = Node(Leaf(3))
+
+        print(n.deep(2).v + ping(n, 3).v)
+        """, true) match
+        None -> ()
+        Some((code, notes, file)) ->
+            assert_eq(code, Fine)
+            assert_eq(xbr_line(notes, file, "7:5"), "'Node.deep' is not borrowed: a call to itself, at 7:70")
+            assert_eq(xbr_line(notes, file, "9:1"),
+                      "'ping' is not borrowed: what 'pong' answers, which is not borrowed, at 9:62")
+            assert_eq(xbr_line(notes, file, "10:1"),
+                      "'pong' is not borrowed: what 'ping' answers, which is not borrowed, at 10:62")
+end xbr_recursion
+
+// Where no body is in sight the answer is "not borrowed": a function value, a trait object, an
+// `extern`. A parameter whose address the body takes is the callee's copy, never the caller's place.
+@test("a closure, a trait object, an extern and an address taken are not borrowed")
+xbr_unknowns()
+    xbr_run(raw"""
+        struct Leaf
+            v: int
+
+        trait Get
+            get(self) -> &Leaf
+
+        struct A
+            leaf: &Leaf
+
+        impl Get for A
+            get(self) -> &Leaf = self.leaf
+
+        extern labs(n: i64) -> i64
+
+        via(a: A, f: &Fn(&Leaf) -> &Leaf) -> &Leaf = f(a.leaf)
+        dyn_get(x: *Get) -> &Leaf = x.get()
+        ext(n: i64) -> i64 = labs(n)
+        read(p: *&Leaf) -> &Leaf = *p
+        peek(a: A) -> &Leaf = read(&a.leaf)
+
+        extern c_pick(p: *int) -> *int
+
+        pick(p: *int) -> *int = c_pick(p)
+
+        var a = A(Leaf(4))
+        var n = 3
+
+        print(via(a, (l) -> l).v + dyn_get(&a).v + int(ext(-1)) + a.get().v + peek(a).v + *pick(&n))
+        """, true) match
+        None -> ()
+        Some((code, notes, file)) ->
+            assert_eq(code, Fine)
+            assert_eq(xbr_line(notes, file, "11:5"), "'A.get' answers a place of 'self': self.leaf")
+            assert_eq(xbr_line(notes, file, "15:1"),
+                      "'via' is not borrowed: a call through a function value, at 15:46")
+            assert_eq(xbr_line(notes, file, "16:1"),
+                      "'dyn_get' is not borrowed: a call through a trait object, at 16:31")
+            assert_eq(xbr_line(notes, file, "17:1"), "'ext' is not borrowed: its answer holds nothing it was handed")
+            assert_eq(xbr_line(notes, file, "18:1"), "'read' answers a place of 'p': p")
+            assert_eq(xbr_line(notes, file, "19:1"),
+                      "'peek' is not borrowed: 'a' is written or its address taken, at 19:31")
+            assert_eq(xbr_line(notes, file, "23:1"), "'pick' is not borrowed: what 'c_pick' answers, which is " +
+                      "not borrowed: 'c_pick' has no body in sight, at 23:25")
+end xbr_unknowns
+
+// A generic is answered per instantiation: `first` is a place at both, and `fetch` reaches a place
+// through one implementation and something made here through the other.
+@test("a generic is answered once per instantiation")
+xbr_generics()
+    xbr_run(raw"""
+        struct Leaf
+            v: int
+
+        struct Pair[T]
+            a: T
+            b: T
+
+        trait Get
+            get(self) -> &Leaf
+
+        struct Held
+            leaf: &Leaf
+
+        struct Made
+            v: int
+
+        impl Get for Held
+            get(self) -> &Leaf = self.leaf
+
+        impl Get for Made
+            get(self) -> &Leaf = Leaf(self.v)
+
+        first[T](p: Pair[T]) -> T = p.a
+        fetch[T: Get](x: T) -> &Leaf = x.get()
+
+        val l: &Leaf = Leaf(2)
+
+        print(first(Pair(1, 2)) + first(Pair(l, l)).v + fetch(Held(l)).v + fetch(Made(5)).v)
+        """, true) match
+        None -> ()
+        Some((code, notes, file)) ->
+            assert_eq(code, Fine)
+
+            var firsts: Buf[string] = buf()
+            var fetches: Buf[string] = buf()
+
+            // An instantiation is placed at its body, which is where the two copies differ from the
+            // declaration they were made from.
+            for item in notes
+                if item.starts_with(s"$file:23:29: ") then firsts.push(item[file.len + 8..<item.len])
+                if item.starts_with(s"$file:24:32: ") then fetches.push(item[file.len + 8..<item.len])
+
+            assert_eq(firsts.len(), 2)
+            assert(firsts.at(0).ends_with("answers a place of 'p': p.a"), firsts.at(0))
+            assert(firsts.at(1).ends_with("answers a place of 'p': p.a"), firsts.at(1))
+            assert(firsts.at(0) != firsts.at(1), firsts.at(0))
+            assert_eq(fetches.len(), 2)
+
+            var place = 0
+            var made = 0
+
+            for item in fetches
+                if item.ends_with("answers a place of 'x': x.leaf") then place += 1
+                if item.contains("is not borrowed: what 'Made.get' answers, which is not borrowed: " +
+                                 "a reference made here") then made += 1
+
+            assert_eq(place, 1)
+            assert_eq(made, 1)
+end xbr_generics
+
+// The report answers a question somebody asked: without the flag there is none, a program with no
+// function says so, and a program that does not compile says only its error.
+@test("no flag, no report; nothing to say is said; an error is the only line")
+xbr_report_edges()
+    xbr_run(raw"""
+        struct S
+            a: int
+
+            get(self) -> int = self.a
+
+        print(S(1).get())
+        """, false) match
+        None -> ()
+        Some((code, notes, _)) ->
+            assert_eq(code, Fine)
+            assert_eq(notes.len(), 0)
+
+    xbr_run(raw"""
+        print(1)
+        """, true) match
+        None -> ()
+        Some((code, notes, _)) ->
+            assert_eq(code, Fine)
+            assert_eq(notes.len(), 1)
+            assert_eq(notes.at(0), "no function of this program answers a borrow")
+
+    xbr_run(raw"""
+        f(n: int) -> int = m
+        print(f(1))
+        """, true) match
+        None -> ()
+        Some((code, notes, _)) ->
+            assert_eq(code, Failed)
+            assert_eq(notes.len(), 1)
+            assert(notes.at(0).starts_with("error: undefined name 'm'"), notes.at(0))
+end xbr_report_edges

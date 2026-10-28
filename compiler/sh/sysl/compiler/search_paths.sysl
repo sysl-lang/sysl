@@ -56,6 +56,7 @@ reset_search_paths()
     sp_std_from_source = false
     sp_verbose = false
     sp_explain = false
+    sp_explain_borrows = false
     sp_cc = None
     sp_say = None
     sp_link_mode = None
@@ -167,7 +168,14 @@ private var sp_explain: bool = false
 // lines arrive in the order they were found, ahead of anything the command says when it finishes.
 private var sp_say: Option[&Fn(string) -> unit] = None
 
-explaining() -> bool = sp_explain
+explaining() -> bool = sp_explain || sp_explain_borrows
+
+// Whether `--explain-borrows` was given: the build says, one line per function of the program's own
+// files, whether its answer is a place of a parameter, +0 from one, or why it is neither
+// (`borrow_summary.sysl`).
+private var sp_explain_borrows: bool = false
+
+explaining_borrows() -> bool = sp_explain_borrows
 
 // One line a command says beside its output rather than in it -- a manifest key this compiler does
 // not understand, say. It goes where `--explain-escapes` reports, which `main` points at standard
@@ -185,6 +193,7 @@ set_explain_sink(say: &Fn(string) -> unit)
 // build in the same process neither reports nor calls a closure its caller has let go.
 close_explain_sink()
     sp_explain = false
+    sp_explain_borrows = false
     sp_say = None
 
 // Says each line of the report, where one was asked for. Nothing otherwise.
@@ -199,6 +208,19 @@ explain_escapes(lines: Buf[string])
             for item in lines
                 say(item)
 end explain_escapes
+
+// Says each line of the `--explain-borrows` report, where one was asked for. Nothing otherwise.
+explain_borrows(lines: Buf[string])
+    if !sp_explain_borrows then return
+
+    sp_say match
+        None -> ()
+        Some(say) ->
+            if lines.is_empty() then say("no function of this program answers a borrow")
+
+            for item in lines
+                say(item)
+end explain_borrows
 
 // Every source root a `--lib` named, as it was written and in the order it was written.
 //
@@ -436,6 +458,11 @@ took_search_flag(args: []string, i: usize) -> int
 
     if arg == "--explain-escapes"
         sp_explain = true
+        return 1
+    end if
+
+    if arg == "--explain-borrows"
+        sp_explain_borrows = true
         return 1
     end if
 

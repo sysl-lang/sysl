@@ -1,0 +1,644 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.Span
+import sysl.buf.{Buf, buf}
+import sysl.container.{Map, map, Set, set}
+
+// **What a function's answer is made of, as storage rather than as an address**
+// (`docs/design/borrowed-return.md § 5.1`).
+//
+// `keeps.sysl` already asks of every body whether its answer can be made of a parameter's ADDRESS
+// (`answers_of`). This is the same question asked of the answer's BYTES, and with the opposite
+// quantifier: the answer is **a place of parameter `p`** when every way out of the body answers a
+// place expression rooted at `p` -- a field chain, an element of a fixed array or of a view reached
+// through `p`, the payload a `match` binds, the referent of a reference read out of `p` -- or the
+// answer of a call whose own answer is a place of the argument handed in that position, so
+// `self.kids.unwrap()` is a place of `self` because `unwrap`'s answer is a place of its receiver.
+// It is **+0 from `p`** when every way out answers either such a place or a value built on the spot
+// (`Some(it)`, a struct of references) every counted part of which is one, with paths that hold
+// nothing counted (`None`, a literal, an integer) allowed beside them.
+//
+// The question is asked of the same fixed point as `keeps` (`keeps.sysl`'s `summary`, under the mark
+// `^`): a call reads its callee's answer, a recursion is answered with the last pass's answer starting
+// from "not a place", and the answers only grow as the ones they read do -- so a recursion settles on
+// "not a place", which is what the design note asks of it. A generic is answered per instantiation,
+// since each instantiation is a body of its own. Where no body is in sight -- a call through a trait
+// object, through a function value, an `extern`, a function a library already compiled -- the answer
+// is "not a place", the default every inferred fact here draws.
+//
+// **A parameter the body writes, or whose address it takes, is never answered as a place**: the
+// answer would then be the callee's copy rather than the caller's storage. Whether the body may write
+// or release anything else is `borrowing.sysl`'s `inert_callees`, asked once per report
+// (`explain_borrow_notes`), not part of the summary.
+//
+// Nothing is lowered from this yet. `--explain-borrows` prints it, one line per function of the
+// program's own files.
+
+// What an expression's value is, asked of one parameter.
+enum BKind
+    // The expression never produces a value: a trap, a `return`, a `panic`.
+    BNever
+    // A value that holds nothing counted and no address -- an integer, `None`, a literal.
+    BNeutral
+    // A value built on the spot, every counted part of which is read out of the parameter.
+    BZero
+    // The parameter's own storage, at one of `paths`.
+    BPlace
+    // Anything else; `why` says what and `at` where.
+    BNot
+end BKind
+
+// The answer for one expression: the kind, the paths into the parameter it may be at (each written
+// as it would be after the parameter's name -- `.kids.Some`, `.items[_]`), and the reason where it is
+// not one.
+struct BAns
+    kind: BKind
+    paths: Buf[string]
+    why: string
+    at: Span
+end BAns
+
+private b_never() -> BAns = BAns(BNever, buf(), "", span_zero())
+private b_neutral() -> BAns = BAns(BNeutral, buf(), "", span_zero())
+private b_not(why: string, at: Span) -> BAns = BAns(BNot, buf(), why, at)
+
+private b_place(path: string) -> BAns
+    var paths: Buf[string] = buf()
+
+    paths.push(path)
+    BAns(BPlace, paths, "", span_zero())
+end b_place
+
+private of_param(a: BAns) -> bool = a.kind == BPlace || a.kind == BZero
+
+// The paths of both, each once, in the order met; past eight a function's paths are a list nobody
+// reads, so the rest are summed up by one.
+private union_paths(a: Buf[string], b: Buf[string]) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for item in a
+        add_path(&out, item)
+
+    for item in b
+        add_path(&out, item)
+
+    out
+end union_paths
+
+private add_path(out: *Buf[string], path: string)
+    for item in *out
+        if item == path then return
+
+    if out.len() < 8 then out.push(path)
+    else if out.len() == 8 then out.push("…")
+end add_path
+
+// One way out joined to another: a value that never comes back says nothing, a reason wins, two
+// places stay a place, and a place beside a fresh value or a neutral one is +0 at best.
+private join(a: BAns, b: BAns) -> BAns
+    if a.kind == BNever then return b
+    if b.kind == BNever then return a
+    if a.kind == BNot then return a
+    if b.kind == BNot then return b
+    if a.kind == BNeutral && b.kind == BNeutral then return a
+    if a.kind == BPlace && b.kind == BPlace then return BAns(BPlace, union_paths(a.paths, b.paths), "", a.at)
+
+    BAns(BZero, union_paths(a.paths, b.paths), "", a.at)
+end join
+
+// A step further into what `a` is: a field, an element, a variant's payload.
+private step(a: BAns, s: string) -> BAns
+    if !of_param(a) then return a
+
+    var paths: Buf[string] = buf()
+
+    for item in a.paths
+        paths.push(item + s)
+
+    BAns(a.kind, paths, a.why, a.at)
+end step
+
+// The answer of a callee whose own answer is `inner` of the argument `outer` was handed: every path
+// of one followed by every path of the other, a place only where both were.
+private through(outer: BAns, inner: KeptWhy) -> BAns
+    var paths: Buf[string] = buf()
+    var place = outer.kind == BPlace
+
+    for k in 0..<inner.locs.len()
+        val loc = inner.locs.at(k).loc
+
+        if k == 0
+            if loc != "place" then place = false
+            continue
+        end if
+
+        for item in outer.paths
+            add_path(&paths, item + loc)
+
+    BAns(if place then BPlace else BZero, paths, "", outer.at)
+end through
+
+// A local the body binds, and what to: an expression with a path after it (`steps`), the element of
+// a sequence, or something this summary does not follow.
+private struct BBind
+    from: Option[TExpr]
+    element: bool
+    steps: string
+end BBind
+
+// What one question about one body carries: the body, the parameter asked about, every local it
+// binds, the names bound twice or written, and how deep the reading of locals has gone.
+private struct BTrack
+    cx: &KeepsCx
+    f: TFunc
+    i: usize
+    binds: Map[string, BBind]
+    written: Map[string, Span]
+    outs: Buf[TExpr]
+    tries: Buf[TExpr]
+    bare_return: bool
+    depth: int
+end BTrack
+
+// Whether what `f` answers is a place of, or +0 from, its parameter at `i` -- the walk `keeps.sysl`'s
+// `summary` runs for the question marked `^`. A kept answer's first location says which (`place` or
+// `zero`), and the rest are the paths; one not kept says why in `how`, at `at`.
+walk_borrow(cx: &KeepsCx, f: TFunc, i: usize) -> KeptWhy
+    if f.marks.is_async() then return KeptWhy(false, "an async function answers a task", f.span, buf())
+
+    val t: &BTrack = BTrack(cx, f, i, map(), map(), buf(), buf(), false, 0)
+
+    walk_block_stmts(f.body, TWalk(false, e -> gather_expr(t, e), w -> written_at(t, w.place),
+                                   s -> gather_stmt(t, s)))
+
+    var out = block_ans(t, f.body)
+
+    for item in t.outs
+        out = join(out, ans(t, item))
+
+    for item in t.tries
+        out = join(out, try_out(item))
+
+    if t.bare_return then out = join(out, b_neutral())
+
+    out.kind match
+        BPlace -> kept_borrow("place", out.paths, out.at)
+        BZero -> kept_borrow("zero", out.paths, out.at)
+        BNot -> KeptWhy(false, out.why, out.at, buf())
+        BNever -> KeptWhy(false, "it never returns", f.span, buf())
+        BNeutral -> KeptWhy(false, "its answer holds nothing it was handed", f.span, buf())
+end walk_borrow
+
+private kept_borrow(kind: string, paths: Buf[string], at: Span) -> KeptWhy
+    var locs: Buf[KeptAt] = buf()
+
+    locs.push(KeptAt(kind, "", span_zero()))
+
+    for item in paths
+        locs.push(KeptAt(item, "", span_zero()))
+
+    KeptWhy(true, kind, at, locs)
+end kept_borrow
+
+// -- what the body binds, writes and answers ----------------------------------------------------------
+
+private gather_stmt(t: &BTrack, s: TStmt)
+    s match
+        TVarDecl(name, _, init, _) -> bind(t, name, BBind(Some(init), false, ""))
+        TRefDecl(name, _, place) -> bind(t, name, BBind(Some(place), false, ""))
+        TReturn(value) -> value match
+            Some(v) -> t.outs.push(v)
+            None -> t.bare_return = true
+        TBecome(call) -> t.outs.push(call)
+        _ -> ()
+end gather_stmt
+
+private gather_expr(t: &BTrack, e: TExpr)
+    *e.kind match
+        TMatch(scrutinee, arms, _) ->
+            for arm in arms
+                for p in arm.patterns
+                    bind_pattern(t, scrutinee, p, "")
+        TIf(cond, _, _, _) -> bind_terms(t, cond)
+        TWhile(cond, _, _, _) -> bind_terms(t, cond)
+        TForEach(name, _, seq, _, _, _) -> bind(t, name, BBind(Some(seq), true, ""))
+        TIterate(_, _, _, _, p, _, _, _) -> unbind_pattern(t, p)
+        TFor(name, _, _, _, _, _, _, _) -> bind(t, name, BBind(None, false, ""))
+        TTry(_, _, _, _, _, _, _) -> t.tries.push(e)
+        TStore(place, _, _, _) -> written_at(t, place)
+        TUpdate(place, _, _, _, _, _, _) -> written_at(t, place)
+        TIncDec(place, _, _, _, _) -> written_at(t, place)
+        TAddrOf(place, _) -> written_at(t, place)
+        _ -> ()
+end gather_expr
+
+private bind_terms(t: &BTrack, cond: Buf[TCondTerm])
+    for item in cond
+        item match
+            TCondIs(subject, patterns, _) ->
+                for p in patterns
+                    bind_pattern(t, subject, p, "")
+            TCondTest(_) -> ()
+end bind_terms
+
+// Each name a pattern binds, bound to the place it takes out of the subject: a variant's payload is
+// `.Variant` (`.Variant.field` where it has more than one), a struct's field `.field`.
+private bind_pattern(t: &BTrack, subject: TExpr, p: TPattern, steps: string)
+    p match
+        TBindPattern(name, _) -> bind(t, name, BBind(Some(subject), false, steps))
+        TAtPattern(name, inner) ->
+            bind(t, name, BBind(Some(subject), false, steps))
+            bind_pattern(t, subject, *inner, steps)
+        TVariantPattern(_, variant, args) ->
+            for k in 0..<args.len()
+                val s = if variant.fields.len() == 1 then s".${variant.name}"
+                else s".${variant.name}.${variant.fields.at(k).0}"
+
+                bind_pattern(t, subject, args.at(k), steps + s)
+        TStructPattern(decl, args) ->
+            for k in 0..<args.len()
+                bind_pattern(t, subject, args.at(k), s"$steps.${decl.fields.at(k).0}")
+        _ -> ()
+end bind_pattern
+
+private unbind_pattern(t: &BTrack, p: TPattern)
+    p match
+        TBindPattern(name, _) -> bind(t, name, BBind(None, false, ""))
+        TAtPattern(name, inner) ->
+            bind(t, name, BBind(None, false, ""))
+            unbind_pattern(t, *inner)
+        TVariantPattern(_, _, args) ->
+            for item in args
+                unbind_pattern(t, item)
+        TStructPattern(_, args) ->
+            for item in args
+                unbind_pattern(t, item)
+        _ -> ()
+end unbind_pattern
+
+// A name bound twice is one this summary does not follow: which binding a read meets is the scope's
+// business, and guessing would be answering for the wrong one.
+private bind(t: &BTrack, name: string, b: BBind)
+    if t.binds.has(name) then t.binds.put(name, BBind(None, false, "")) else t.binds.put(name, b)
+
+// The local or parameter a written place belongs to, where the write changes that name's own bytes:
+// through a field or an element, but not through a reference or a pointer, whose referent is
+// somebody else's.
+private written_at(t: &BTrack, place: TExpr)
+    own_root(place) match
+        Some(name) -> if !t.written.has(name) then t.written.put(name, place.span)
+        None -> ()
+end written_at
+
+private own_root(e: TExpr) -> Option[string] = *e.kind match
+    TLoad(name, _) -> Some(name)
+    TField(r, _, _) -> own_root(r)
+    TIndex(r, _, _) -> if is_array(texpr_type(r)) then own_root(r) else None
+    _ -> None
+
+private is_array(t: Type) -> bool = underlying(t) match
+    Array(_, _) -> true
+    _ -> false
+
+private is_never(t: Type) -> bool = t match
+    Never -> true
+    _ -> false
+
+// A value with nothing counted and no address in it says nothing about where it came from.
+private holds_nothing(t: Type) -> bool = !contains_counted(t) && !holds_pointer(t)
+
+// -- what an expression is ------------------------------------------------------------------------
+
+private block_ans(t: &BTrack, b: TBlock) -> BAns
+    if is_never(b.ty) then return b_never()
+
+    b.result match
+        Some(r) -> ans(t, r)
+        None -> b_neutral()
+end block_ans
+
+private ans(t: &BTrack, e: TExpr) -> BAns
+    val ty = texpr_type(e)
+
+    if is_never(ty) then return b_never()
+
+    *e.kind match
+        TLoad(name, _) -> load_ans(t, name, e)
+        TField(r, index, _) -> step(ans(t, r), s".${field_name(texpr_type(r), index)}")
+        TIndex(r, _, _) -> element(ans(t, r), texpr_type(r), e, ty)
+        TDeref(r, _) -> referent(ans(t, r), e, ty)
+        TAddrOf(place, _) -> if in_module_storage(place) then b_neutral() else made_of(ans(t, place), e, ty)
+        TCast(operand, _) -> if is_pointer(ty) && is_pointer(texpr_type(operand)) then ans(t, operand)
+        else if holds_nothing(ty) then b_neutral()
+        else b_not("a value made here", e.span)
+        TSlice(base, _, _, _, _) -> made_of(ans(t, base), e, ty)
+        TStrView(arg) -> made_of(ans(t, arg), e, ty)
+        TConstView(arg) -> made_of(ans(t, arg), e, ty)
+        TViewAs(arg, _) -> made_of(ans(t, arg), e, ty)
+        TCall(name, args, _, _) -> call_ans(t, name, args, e, ty)
+        TVCall(r, _, _, _, _) -> if calls_a_closure(texpr_type(r)) then b_not("a call through a function value", e.span)
+        else b_not("a call through a trait object", e.span)
+        TCallPtr(_, _, _, _) -> b_not("a call through a function value", e.span)
+        TStructNew(_, args) -> built(t, args, e)
+        TEnumNew(_, _, args) -> built(t, args, e)
+        TBox(_, _) -> b_not("a reference made here", e.span)
+        // An empty view reaches nothing, which is what `Buf.view` answers for a buffer never grown.
+        TBufLit(elems, _) -> if elems.is_empty() then b_neutral() else b_not("a buffer made here", e.span)
+        TIf(_, then_block, else_block, _) -> else_block match
+            Some(eb) -> join(block_ans(t, then_block), block_ans(t, eb))
+            None -> b_neutral()
+        TMatch(_, arms, _) ->
+            var out = b_never()
+
+            for arm in arms
+                out = join(out, block_ans(t, arm.body))
+
+            out
+        TBlockExpr(b) -> block_ans(t, b)
+        TSeq(exprs) -> if exprs.is_empty() then b_neutral() else ans(t, exprs.at(exprs.len() - 1))
+        TTry(operand, ok, _, _, _, _, _) ->
+            step(ans(t, operand), if ok.fields.len() == 1 then s".${ok.name}" else s".${ok.name}.0")
+        _ -> if holds_nothing(ty) then b_neutral() else b_not("a value made here", e.span)
+end ans
+
+private load_ans(t: &BTrack, name: string, e: TExpr) -> BAns
+    for k in 0..<t.f.params.len()
+        if t.f.params.at(k).0 != name then continue
+
+        t.written.get(name) match
+            Some(at) -> return b_not(s"'$name' is written or its address taken", at)
+            None -> ()
+
+        if k == t.i then return b_place("")
+
+        return if holds_nothing(t.f.params.at(k).1) then b_neutral()
+        else b_not(s"'$name' is another parameter", e.span)
+
+    if t.written.has(name) then return b_not(s"'$name' is written after it is bound", e.span)
+
+    val b = t.binds.get(name) match
+        Some(found) -> found
+        None -> return b_not(s"'$name' is not followed", e.span)
+
+    if b.from.is_none() || t.depth > 64 then return b_not(s"'$name' is not followed", e.span)
+
+    t.depth += 1
+
+    val from = ans(t, b.from.unwrap())
+
+    t.depth -= 1
+
+    if b.element then element(from, texpr_type(b.from.unwrap()), e, texpr_type(e)) else step(from, b.steps)
+end load_ans
+
+// The name of a struct's field, or its position where it has none to show.
+private field_name(t: Type, index: int) -> string = underlying(t) match
+    Struct(d) -> if usize(index) < d.fields.len() then d.fields.at(usize(index)).0 else s"$index"
+    Ref(inner, _) -> field_name(*inner, index)
+    Ptr(inner) -> field_name(*inner, index)
+    _ -> s"$index"
+
+// An element of what `of` is: of an array held in the parameter, or of a view or a buffer reached
+// through it, is the parameter's storage either way.
+private element(of: BAns, seq_ty: Type, e: TExpr, ty: Type) -> BAns
+    if !of_param(of)
+        if of.kind == BNot then return of
+
+        return if holds_nothing(ty) then b_neutral() else b_not("an element of a value made here", e.span)
+    end if
+
+    val inner = step(of, "[_]")
+
+    // An element of an array built here is in the temporary, not in the parameter.
+    if of.kind == BZero && is_array(seq_ty) then return inner
+
+    BAns(BPlace, inner.paths, "", inner.at)
+end element
+
+// What a reference or a pointer read out of the parameter points at is storage reached through it.
+private referent(of: BAns, e: TExpr, ty: Type) -> BAns
+    if of_param(of) then return BAns(BPlace, of.paths, "", of.at)
+
+    if of.kind == BNot then return of
+
+    if holds_nothing(ty) then b_neutral() else b_not("what a value made here points at", e.span)
+end referent
+
+// **The address of module storage says nothing about the parameter and costs no count**: the storage
+// outlives every caller, and whatever ends a caller's stretch for the parameter's storage -- a write,
+// an unknown call -- ends it for this too. So it stands beside a place as a value that holds nothing
+// (`Buf`'s `reading` answers either its core or the shared empty one).
+private in_module_storage(place: TExpr) -> bool = *place.kind match
+    TGlobal(_, _, _) -> true
+    TField(r, _, _) -> in_module_storage(r)
+    TIndex(r, _, _) -> is_array(texpr_type(r)) && in_module_storage(r)
+    _ -> false
+
+// Whether a call through an object is a call of a closure: an object of `Fn` or one of its kin.
+private calls_a_closure(t: Type) -> bool = underlying(t) match
+    Ref(inner, _) -> calls_a_closure(*inner)
+    Ptr(inner) -> calls_a_closure(*inner)
+    Trait(name, _, _) -> is_call_trait(module_bare(name))
+    _ -> false
+
+private is_pointer(t: Type) -> bool = underlying(t) match
+    Ptr(_) -> true
+    _ -> false
+
+// An address of, or a view into, the parameter's storage is a value made here that reaches it: +0,
+// and what it reaches is a place again (`referent`, `element`).
+private made_of(of: BAns, e: TExpr, ty: Type) -> BAns
+    if of_param(of) then return BAns(BZero, of.paths, "", of.at)
+
+    if of.kind == BNot then return of
+
+    if holds_nothing(ty) then b_neutral() else b_not("a view or an address of a value made here", e.span)
+end made_of
+
+// A value built on the spot is +0 from the parameter where every counted part of it is.
+private built(t: &BTrack, args: Buf[TExpr], e: TExpr) -> BAns
+    var out = b_neutral()
+
+    for item in args
+        val a = ans(t, item)
+
+        val part = if a.kind == BPlace then BAns(BZero, a.paths, "", a.at)
+        else if a.kind == BNot && holds_nothing(texpr_type(item)) then b_neutral()
+        else a
+
+        out = join(out, part)
+
+    out
+end built
+
+// A call answers a place of the parameter where an argument is one and the callee's answer is a place
+// of that argument; +0 where either is only +0.
+private call_ans(t: &BTrack, name: string, args: Buf[TExpr], e: TExpr, ty: Type) -> BAns
+    var reason = ""
+
+    for j in 0..<args.len()
+        val a = ans(t, args.at(j))
+
+        // An argument the callee would have answered a place of, which is not one here, is the reason.
+        if a.kind == BNot && borrow_of(t.cx, name, usize(j)).kept then return a
+
+        if !of_param(a) then continue
+
+        val callee = borrow_of(t.cx, name, usize(j))
+
+        if callee.kept
+            if in_module(t, name) then return through(a, callee)
+
+            // A callee in another module is shown as the call a reader wrote rather than by the
+            // fields it reaches, which are that module's business.
+            val shown = if name.contains("index_place") then "[_]" else s".${method_name(name)}()"
+            val kind = if a.kind == BPlace && callee.how == "place" then BPlace else BZero
+
+            return BAns(kind, step(a, shown).paths, "", a.at)
+        end if
+
+        if reason == "" then reason = callee.how
+
+    if holds_nothing(ty) then return b_neutral()
+
+    val shown = short_name(name)
+
+    // One level of why is said; a callee's own "what ... answers" is a chain the reader follows by
+    // reading that callee's line.
+    if name == t.f.name then b_not(s"a call to itself", e.span)
+    else if reason == "" then b_not(s"what '$shown' makes", e.span)
+    else if reason.starts_with("what '") || reason.starts_with("a call to itself") then
+        b_not(s"what '$shown' answers, which is not borrowed", e.span)
+    else b_not(s"what '$shown' answers, which is not borrowed: $reason", e.span)
+end call_ans
+
+// Whether the function called `name` was declared in the module of the body being asked about.
+private in_module(t: &BTrack, name: string) -> bool = t.cx.find(name) match
+    Some(g) -> g.declared_in == t.f.declared_in
+    None -> false
+
+// The member a call reaches, as it was written after the dot: `Option.unwrap.Kids` is `unwrap`.
+private method_name(name: string) -> string
+    val s = short_name(name)
+    val b = s.bytes
+    var dots: Buf[usize] = buf()
+
+    for k in 0..<b.len
+        if b[k] == u8('.') then dots.push(k)
+
+    if dots.is_empty() || b.len == 0 then return s
+    if !is_upper_byte(b[0]) then return s[0..<dots.at(0)]
+
+    s[dots.at(0) + 1..<if dots.len() > 1 then dots.at(1) else b.len]
+end method_name
+
+private is_upper_byte(b: u8) -> bool = b >= u8('A') && b <= u8('Z')
+
+// A function's name without the module it was declared in.
+private short_name(name: string) -> string
+    var start = 0
+    val b = name.bytes
+
+    for k in 0..<b.len
+        if b[k] == u8('$') then start = k + 1
+
+    name[start..<name.len]
+end short_name
+
+// The way out `?` takes: the failure handed back, which is built from what the operand failed with.
+private try_out(e: TExpr) -> BAns = *e.kind match
+    TTry(_, _, fail, _, _, _, _) ->
+        var plain = true
+
+        for item in fail.fields
+            if !holds_nothing(item.1) then plain = false
+
+        if plain then b_neutral() else b_not("'?' hands back the failure it met", e.span)
+    _ -> b_neutral()
+
+// -- the report -------------------------------------------------------------------------------------
+
+// One function's line of the `--explain-borrows` report, before the driver knows which bodies are
+// inert: the file it is in, the line's text, and whether it answers a borrow.
+struct BorrowNote
+    func: string
+    file: string
+    start: usize
+    text: string
+    borrowed: bool
+end BorrowNote
+
+private var bs_notes: Buf[BorrowNote] = buf()
+
+// The notes the last whole-program check gathered, handed over once.
+take_borrow_notes() -> Buf[BorrowNote]
+    val out = bs_notes
+
+    bs_notes = buf()
+    out
+end take_borrow_notes
+
+// One note per function a reader wrote that takes a parameter and answers a value: the first
+// parameter its answer is a place of, else the first it is +0 from, else why not.
+note_borrows(cx: &KeepsCx)
+    var out: Buf[BorrowNote] = buf()
+
+    for f in cx.funcs
+        if f.params.is_empty() || is_closure_body(f) || f.src.is_none() then continue
+
+        f.ret_ty match
+            Unit -> continue
+            Never -> continue
+            _ -> ()
+
+        val src = f.src.unwrap()
+        val at = src.locate(f.span.start)
+        val head = s"${src.name}:${at.line}:${at.col + literate_shift(src)}: '${short_name(f.name)}'"
+        var said = ""
+        var borrowed = false
+
+        for pass in 0..<2
+            if said != "" then break
+
+            for k in 0..<f.params.len()
+                val w = borrow_of(cx, f.name, k)
+
+                if !w.kept || (pass == 0) != (w.how == "place") then continue
+
+                val name = f.params.at(k).0
+                var paths = ""
+
+                for j in 1..<w.locs.len()
+                    paths = if paths == "" then name + w.locs.at(j).loc else s"$paths | $name${w.locs.at(j).loc}"
+
+                said = if pass == 0 then s"answers a place of '$name': $paths"
+                else if contains_counted(f.ret_ty) then s"answers +0 from '$name': $paths"
+                else ""
+
+                borrowed = said != ""
+                break
+
+        if said == ""
+            val w = borrow_of(cx, f.name, 0)
+            val why = if w.kept || w.how == "" then "its answer is a fresh value" else w.how
+
+            said = if w.at == f.span || !(w.at.start > f.span.start && w.at.start <= f.span.end) then
+                s"is not borrowed: $why"
+            else
+                val there = src.locate(w.at.start)
+
+                s"is not borrowed: $why, at ${there.line}:${there.col + literate_shift(src)}"
+        end if
+
+        // In the order the functions are written, file by file.
+        val note = BorrowNote(f.name, src.name, f.span.start, s"$head $said", borrowed)
+        var k = out.len()
+
+        while k > 0 && (out.at(k - 1).file > note.file ||
+                        (out.at(k - 1).file == note.file && out.at(k - 1).start > note.start))
+            k -= 1
+
+        out.insert(k, note)
+
+    bs_notes = out
+end note_borrows

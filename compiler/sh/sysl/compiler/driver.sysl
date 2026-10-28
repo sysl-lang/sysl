@@ -673,6 +673,7 @@ emit_llvm_text(path: string, named_target: Option[string],
 
     phase_done("checks")
     explain_promotions(promotions, program, done.an)
+    explain_borrow_notes(whole, program, done.an)
 
     // The tests go next, and they go **after** the analysis rather than instead of it: a `@test`
     // that does not compile is an error in a build that would never have run it, which is what makes
@@ -826,15 +827,7 @@ end joined_names
 private explain_promotions(pr: Promotions, program: Compilation, an: &Analysis)
     if !errors_of(an.diagnostics()).is_empty() then return
 
-    // The files of the modules the program declared, which is what a note is about.
-    var files: Buf[string] = buf()
-
-    for unit in program.units
-        for j in 0..<program.own.len()
-            if program.own.at(j) == module_written(unit)
-                files.push(unit.src.name)
-                break
-
+    val files = own_files(program)
     var lines: Buf[string] = buf()
 
     for item in pr.notes
@@ -845,6 +838,43 @@ private explain_promotions(pr: Promotions, program: Compilation, an: &Analysis)
 
     explain_escapes(lines)
 end explain_promotions
+
+// The files of the modules the program declared, which is what a note is about.
+private own_files(program: Compilation) -> Buf[string]
+    var files: Buf[string] = buf()
+
+    for unit in program.units
+        for j in 0..<program.own.len()
+            if program.own.at(j) == module_written(unit)
+                files.push(unit.src.name)
+                break
+
+    files
+end own_files
+
+// What `--explain-borrows` reports about the program's own files: one line per function, from the
+// summary the whole-program checks worked out (`borrow_summary.sysl`). **A function whose answer is
+// borrowed but whose body may write or release** -- one `borrowing.sysl`'s `inert_callees` does not
+// admit -- is said to be so, since nothing could hand its answer back uncopied.
+private explain_borrow_notes(whole: TProgram, program: Compilation, an: &Analysis)
+    val notes = take_borrow_notes()
+
+    if !explaining_borrows() || !errors_of(an.diagnostics()).is_empty() then return
+
+    val files = own_files(program)
+    val inert = inert_callees(whole)
+    var lines: Buf[string] = buf()
+
+    for item in notes
+        for j in 0..<files.len()
+            if files.at(j) == item.file
+                lines.push(if item.borrowed && !inert.has(item.func) then
+                               item.text + ", but its body may write or release what it was handed"
+                           else item.text)
+                break
+
+    explain_borrows(lines)
+end explain_borrow_notes
 
 // The machine a command line asked for: the one it named, the manifest's default, or this host --
 // with the floor the manifest states checked before anything is read.
@@ -1672,6 +1702,7 @@ private lower_for_c(path: string, t: Target) -> Result[LoweredForC, Failure]
     val promotions = post_analysis_checks(done.an, whole, program.own)
 
     explain_promotions(promotions, program, done.an)
+    explain_borrow_notes(whole, program, done.an)
 
     val kept = prune(strip_tests(whole), program.own)
 
