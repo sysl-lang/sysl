@@ -264,3 +264,56 @@ region something else owns — all fine; a slice over a local of a function that
 
 It is the same contract [`channel(slots[..])`](/library/threads/#channel-t) already has, and the same
 one every C binding in the organisation makes when it hands a library a buffer to work in.
+
+## `InlineRing[T, N]` carries its own storage, so a struct can simply hold one
+
+`Ring[T]` needs a slice from outside, and a struct that wants a queue as a field has nowhere to get
+one. `InlineRing[T, const N: usize]` is the same ring with the `N` slots as an `[N]T` **inside the
+value**: allocation-free like `Ring` (the module is `@no_alloc`), usable in a `static var`, a field or
+a local, and copied, passed and returned by value like any struct.
+
+```sysl
+import sysl.container.ring.{InlineRing, inline_ring}
+
+struct Uart
+    rx: InlineRing[u8, 4]
+    tx: InlineRing[u8, 3]
+
+var u: Uart
+
+u.rx.push_back(1)
+u.rx.push_back(2)
+u.tx.push_back(9)
+
+print(u.rx.len(), u.tx.len(), u.rx[1])
+
+var window = inline_ring[int, 3]()
+
+for i in 0..<5
+    window.overwrite(i)
+
+print(window.len(), window.first(), window.last())
+```
+
+```output
+2 1 2
+3 Some(2) Some(4)
+```
+
+**Its members are `Ring`'s, with the same names and answers**: `push_back` and `push_front` answer
+whether there was room, `pop_front` and `pop_back` answer an `Option`, `overwrite` answers what it
+dropped, `r[i]` counts from the front and traps past the end as an array's index does, `get` is the total form, `first`, `last`,
+`clear`, `capacity`, `len`, `is_empty`, `is_full`, and `for x in r` walks front to back. Code moves
+between the two by changing the type and the line that makes it; the only difference is that
+`inline_ring[T, N]()` takes no slice.
+
+- **A fresh one needs no value.** `inline_ring[T, N]()` and a plain `var r: InlineRing[T, N]` are both
+  empty rings, because a zeroed slot is an empty slot; a `T` with no default can still be held.
+- **`N` need not be a power of two**; wrapping is a compare and a subtract, as in `Ring`. `N` of 1 is a
+  ring, and `N` of 0 is a ring that refuses every push and evicts every `overwrite`.
+- **It builds for a bare machine.** A struct holding one compiles for `thumb-freestanding-softfp` with
+  no heap and no runtime.
+- **A copy is its own ring.** The storage is part of the value, so unlike `Ring` there is no shared
+  slice and nothing to outlive. The flip side is size: `InlineRing[u8, 4096]` is 4 KiB wherever it is
+  held, so a large capacity belongs in a `static var`, not on a small stack.
+- **A cursor from `for` walks a copy** of the ring as it was when the walk began.
