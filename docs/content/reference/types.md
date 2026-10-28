@@ -592,6 +592,65 @@ Ok(()) Err(Low)
 values, `never` is a subtype of every type, so a `match` arm that aborts can sit beside arms that
 produce an `int`.
 
+**`never` is also an ordinary type argument.** `Result[T, never]` is a result that cannot fail,
+`Option[never]` one that is always `None`, `Buf[never]` a buffer that stays empty, and a generic
+function, struct or `impl` may be instantiated at it. A variant whose payload holds a `never` — by
+itself, or through a struct, tuple or enum that must hold one — can never be built, so **a `match`
+may leave it out**; writing the arm anyway stays legal. `never` implements `Eq`, `Ord`, `Hash`,
+`Display` and `Debug`, vacuously, so a type holding it compares, hashes and prints as its other parts
+allow. And **`?` on a `Result[T, never]` needs no `From`**: its failure path is never taken, so it
+crosses into a function returning any error type.
+
+```sysl
+enum Error[E] derives Eq, Display
+    Io(cause: E)
+    Short
+
+enum Fault
+    Low
+
+header(n: int) -> Result[int, Error[never]] = if n > 0 then Ok(n) else Err(Short)
+
+doubled(n: int) -> Result[int, never] = Ok(n * 2)
+
+total(n: int) -> Result[int, Fault]
+    val d = doubled(n)?
+    Ok(d + 1)
+end total
+
+header(0) match
+    Ok(n) -> print(n)
+    Err(Short) -> print("short")
+
+doubled(4) match
+    Ok(n) -> print(n)
+
+print(header(3), total(4), header(0) == Err(Short))
+```
+
+```output
+short
+8
+Ok(3) Ok(9) true
+```
+
+Only the argument itself may be `never`. A part of one — `Option[&never]`, `Buf[[2]never]` — still
+names a value of a type that has none, and so does a field, a parameter or a variable that writes
+`never` out:
+
+```sysl
+var o: Option[&never] = None
+```
+
+```error
+'never' is the type of an expression that does not finish, so it can only be a result type or a type argument
+```
+
+**An expression that does not finish is still refused wherever a value must arrive**, and a generic
+parameter is never inferred from one: `id(exit(1))` is refused, as `val x = exit(1)` is. A read of
+storage whose type is `never` — the payload an `Err` arm binds out of a `Result[T, never]`, or a
+parameter of a body instantiated at `never` — is not refused: no run reaches it.
+
 ## `string`
 
 A validated UTF-8 string, three words wide. It is immutable; indexing it by byte position gives

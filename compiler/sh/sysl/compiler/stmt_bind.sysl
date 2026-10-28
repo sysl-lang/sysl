@@ -222,8 +222,11 @@ private discard_arm(cx: &Analyzer, written: Expr, held: *Buf[TStmt], writes: *Bu
 
     if ty == Unknown then return
 
+    // A read of storage of type `never` has nothing to drop, and is reached by no run.
     if ty == Never
-        cx.fault(written.span, "'_' drops the value it is given, and this expression never returns one")
+        if diverges(cx, tv) then
+            cx.fault(written.span, "'_' drops the value it is given, and this expression never returns one")
+
         return
     end if
 
@@ -351,7 +354,7 @@ multi_decl(cx: &Analyzer, span: Span, names: Buf[string], mutable: bool,
         for i in 0..<values.len()
             val tv = type_expr_bare(cx, values.at(i))
 
-            if texpr_type(tv) == Never then
+            if diverges(cx, tv) then
                 cx.fault(values.at(i).span,
                          "cannot bind a name to an expression that never returns")
 
@@ -401,7 +404,7 @@ pattern_decl(cx: &Analyzer, span: Span, pat: Pattern, mutable: bool,
     val declared = typ.map(w -> resolve_type(cx.an, cx.scope, w, cx.subst))
     val tv = type_expr(cx, value, declared)
 
-    if texpr_type(tv) == Never then
+    if diverges(cx, tv) then
         cx.fault(value.span, "cannot bind a name to an expression that never returns")
 
     val held = stated_whole(cx, span, declared, texpr_type(tv))

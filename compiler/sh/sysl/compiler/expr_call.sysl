@@ -2426,8 +2426,9 @@ refused_field(cx: &Analyzer, span: Span, shown: string, fields: Buf[(string, Typ
                                mismatch_hint(cx, got, fields.at(i).1)))
 
         // A field is held to what a parameter is: one inferred from a diverging argument would be
-        // a slot of a type that has no values.
-        if fields.at(i).1 == Never then
+        // a slot of a type that has no values. A field at `never` by a written argument, or by a
+        // read of storage of that type, is an ordinary field nothing reaches (`diverges`).
+        if fields.at(i).1 == Never && diverges(cx, ts.at(i)) then
             return Some(cx.err(given.at(i).span, s"cannot pass an expression that never returns as " +
                                s"'${fields.at(i).0}' of '$shown'"))
 
@@ -3679,7 +3680,9 @@ refused_argument(cx: &Analyzer, span: Span, quoted: string, params: Buf[Param],
                 // one**: a generic parameter takes whatever its argument is, and an expression that
                 // never arrives is the one thing a slot must not be concluded from. A written
                 // parameter is untouched -- the call is dead code, and the slot still has a layout.
-                if wants.at(i) == Never
+                // A read of storage of type `never` is not concluded from (`diverges`): a
+                // parameter at `never` is a type argument like any other.
+                if wants.at(i) == Never && diverges(cx, ts.at(i))
                     if !report then return Some(cx.err(e.span, "argument disagrees"))
 
                     return Some(cx.err(e.span, s"cannot pass an expression that never returns as " +
@@ -4272,9 +4275,12 @@ try_expr(cx: &Analyzer, span: Span, inner: Expr, expected: Option[Type]) -> TExp
     // layer of a program otherwise writes `.map_err(...)` at each call that crosses between two
     // error types. What is found here is the concrete function the `impl` lowered to, and the
     // lowering splices a call to it between unwrapping the failure and re-wrapping it.
+    //
+    // **A failure of type `never` needs no conversion**, there being none to convert: a
+    // `Result[T, never]`'s `?` crosses into any error type, and its failure path is never taken.
     var convert: Option[string] = None
 
-    if !type_eq(carried(fail), carried(ret_fail))
+    if !type_eq(carried(fail), carried(ret_fail)) && carried(fail) != Never
         convert = from_conversion(cx.an, carried(fail), carried(ret_fail))
 
         if convert.is_none()

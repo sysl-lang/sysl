@@ -397,26 +397,33 @@ gen_for_each(e: *Emit, name: string, elem_ty: Type, seq: TExpr, body: Buf[TStmt]
     emit_term(e, InCondBr(more, body_l, else_l))
     emit_label(e, body_l)
 
-    val ep = fresh_reg(e)
+    // **A sequence of a type with no values is empty**, so its body is reached by no run and there
+    // is no element to load -- a `Buf[never]`'s.
+    if uninhabited(elem_ty)
+        emit_term(e, InUnreachable)
+    else
+        val ep = fresh_reg(e)
 
-    var at: Buf[IrArg] = buf()
+        var at: Buf[IrArg] = buf()
 
-    at.push(ir_arg(w, iv))
-    emit(e, InGep(ep, lty(e, elem_ty), parts.0, at))
+        at.push(ir_arg(w, iv))
+        emit(e, InGep(ep, lty(e, elem_ty), parts.0, at))
 
-    val ev = fresh_reg(e)
+        val ev = fresh_reg(e)
 
-    emit(e, InLoad(ev, lty(e, elem_ty), ep, AccPlain, None))
+        emit(e, InLoad(ev, lty(e, elem_ty), ep, AccPlain, None))
 
-    val home = local_alloca(e, name, lty(e, elem_ty))
+        val home = local_alloca(e, name, lty(e, elem_ty))
 
-    retain_value(e, elem_ty, ev)
-    emit(e, InStore(lty(e, elem_ty), ev, home, AccPlain, None))
-    push_owned(e)
-    own_slot(e, name, elem_ty)
-    gen_body(e, body)
-    pop_owned(e)
-    emit_term(e, InBr(step_l))
+        retain_value(e, elem_ty, ev)
+        emit(e, InStore(lty(e, elem_ty), ev, home, AccPlain, None))
+        push_owned(e)
+        own_slot(e, name, elem_ty)
+        gen_body(e, body)
+        pop_owned(e)
+        emit_term(e, InBr(step_l))
+    end if
+
     emit_label(e, step_l)
 
     val nxt = fresh_reg(e)

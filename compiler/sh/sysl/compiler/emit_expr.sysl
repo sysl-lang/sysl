@@ -13,7 +13,19 @@ import sysl.math.decimal.{Decimal, rescale, Rounding}
 // from is left out of the module altogether -- so a partial lowering is a smaller module rather than
 // a different one.
 
-gen_expr(e: *Emit, x: TExpr) -> Val = *x.kind match
+gen_expr(e: *Emit, x: TExpr) -> Val
+    // **A read of storage of type `never` is reached by no run**: the storage is the payload of a
+    // variant nobody can build, or a parameter of a body instantiated at `never` that nobody can
+    // call. It ends the block, as a call that does not come back does, and there is nothing to load.
+    if is_place(x) && texpr_type(x) == Never
+        emit_term(e, InUnreachable)
+        return VNothing
+    end if
+
+    gen_expr_kind(e, x)
+end gen_expr
+
+private gen_expr_kind(e: *Emit, x: TExpr) -> Val = *x.kind match
     TIntLit(v, _) -> VInt(v)
     TBoolLit(b) -> VInt(from_int(if b then 1 else 0))
     TUnitLit -> VNothing
@@ -1898,6 +1910,17 @@ private gen_try(e: *Emit, operand: TExpr, ok: EnumVariant, fail: EnumVariant, re
 
     emit_term(e, InCondBr(is_ok, ok_l, fail_l))
     emit_label(e, fail_l)
+
+    // **A failure that cannot be built is never taken** -- a `Result[T, never]`'s -- so the branch
+    // holds nothing, and there is no payload to convert or carry out.
+    if uninhabited_fields(fail.fields)
+        emit_term(e, InUnreachable)
+        emit_label(e, ok_l)
+
+        val only = payload_values(e, en, ok, v)
+
+        return if only.is_empty() then VNothing else only.at(0)
+    end if
 
     // **The conversion happens here and nowhere else**, which is why `?` carries a name rather than
     // a node: what it converts is the failure payload, and the payload exists only inside this
