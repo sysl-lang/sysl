@@ -273,7 +273,8 @@ const_of_name(cx: &Analyzer, name: string) -> Option[Const]
 
     cx.an.consts_in_progress.push(key.unwrap())
 
-    val out = const_fold(inner, d.init.unwrap())
+    val out = if mentions_wrap_sat(d.init.unwrap()) then const_decl_value(inner, d.init.unwrap(), const_type(inner, d))
+    else const_fold(inner, d.init.unwrap())
 
     cx.an.consts_in_progress.truncate(cx.an.consts_in_progress.len() - 1)
     out
@@ -309,7 +310,9 @@ private const_binary(cx: &Analyzer, whole: Expr, op: string, l: Expr, r: Expr) -
 
     a.unwrap() match
         ConstInt(x) -> b.unwrap() match
-            ConstInt(y) -> int_binary(cx, span, op, x, y)
+            // A number here has no width to wrap or saturate at, so the operator is read at the
+            // types its operands are written at.
+            ConstInt(y) -> if is_wrap_sat_op(op) then const_wrap_sat(cx, whole, None) else int_binary(cx, span, op, x, y)
             _ -> None
         ConstFloat(x) -> b.unwrap() match
             ConstFloat(y) -> const_float_operator(cx, whole).or_else(() -> float_binary(op, x, y))
@@ -1289,6 +1292,12 @@ private typed_int_binary(op: string, x: BigInt, y: BigInt, lt: Type) -> Option[C
         return Some(ConstInt(q.0))
     end if
 
+    if is_wrap_sat_op(op)
+        lt match
+            Integer(bits, signed, _) -> return Some(ConstInt(wrap_sat_value(op, x, y, bits, signed)))
+            _ -> return None
+    end if
+
     if op == "+" then return Some(ConstInt(add(x, y)))
     if op == "-" then return Some(ConstInt(sub(x, y)))
     if op == "*" then return Some(ConstInt(mul(x, y)))
@@ -1397,6 +1406,9 @@ run_int_binary(op: string, x: BigInt, y: BigInt, bits: int, signed: bool,
 
         return Ok(ConstInt(shift_at_width(op, x, y, bits, signed)))
     end if
+
+    // The wrapping and saturating forms say what overflow does, so a `within` operand checks nothing.
+    if is_wrap_sat_op(op) then return Ok(ConstInt(wrap_sat_value(op, x, y, bits, signed)))
 
     if op == "+" || op == "-" || op == "*"
         val exact = if op == "+" then add(x, y) else if op == "-" then sub(x, y) else mul(x, y)

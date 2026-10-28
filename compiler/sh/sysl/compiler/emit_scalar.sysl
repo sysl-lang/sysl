@@ -64,6 +64,12 @@ arith(e: *Emit, op: string, ty: Type, lv: Val, rv: Val) -> Val
     // Over a register of them it is the same, lane by lane, so the whole type goes.
     if is_fixed(lane) then return fixed_arith(e, op, ty, lv, rv)
 
+    if is_sat_op(op)
+        lane match
+            Integer(bits, signed, _) -> return saturating(e, op, bits, signed, lv, rv)
+            _ -> ()
+    end if
+
     val ety = lty(e, ty)
 
     val instr = lane match
@@ -141,10 +147,14 @@ arith(e: *Emit, op: string, ty: Type, lv: Val, rv: Val) -> Val
     r
 end arith
 
+// A wrapping form is the plain instruction, with no `nsw` or `nuw` to promise it does not wrap.
 private int_instr(e: *Emit, op: string, signed: bool) -> BinOp = op match
     "+" -> OpAdd
     "-" -> OpSub
     "*" -> OpMul
+    "+%" -> OpAdd
+    "-%" -> OpSub
+    "*%" -> OpMul
     "/" -> if signed then OpSDiv else OpUDiv
     "%" -> if signed then OpSRem else OpURem
     "<<" -> OpShl
@@ -465,6 +475,91 @@ checked_arith(e: *Emit, op: string, bits: int, signed: bool, lv: Val, rv: Val) -
     trap_unless(e, ok, "overflow")
     v
 end checked_arith
+
+// A saturating `+|`, `-|` or `*|` at an integer width. A sum or a difference is LLVM's own saturating
+// intrinsic -- one `QADD` or `UQADD` where the machine has it, an inline expansion at any other width.
+// A product has no such intrinsic short of the fixed-point `llvm.smul.fix.sat`, so it is the
+// overflow-detecting multiply with the bound chosen where it overflowed: the maximum for an unsigned
+// product, and for a signed one the bound on the side of the product's true sign, which is the
+// operands' signs disagreeing.
+saturating(e: *Emit, op: string, bits: int, signed: bool, lv: Val, rv: Val) -> Val
+    val ity = LInt(bits)
+
+    if op != "*|"
+        val name = (if signed then "s" else "u") + (if op == "+|" then "add" else "sub")
+        val fn = llvm_sat_entry(name).unwrap().at([ity])
+
+        var params: Buf[IrParam] = buf()
+
+        params.push(ir_param(ity))
+        params.push(ir_param(ity))
+        request_intrinsic(e, ir_sig(fn, ir_fn_type(ity, params)))
+
+        var args: Buf[IrArg] = buf()
+
+        args.push(ir_arg(ity, lv))
+        args.push(ir_arg(ity, rv))
+
+        val r = fresh_reg(e)
+
+        emit(e, ir_call(Some(r), ity, VGlobal(fn), args))
+        return r
+    end if
+
+    val fn = llvm_with_overflow("mul", signed, ity)
+
+    var pair_fields: Buf[LType] = buf()
+
+    pair_fields.push(ity)
+    pair_fields.push(l_i1())
+
+    val both = LStruct(pair_fields)
+
+    var params: Buf[IrParam] = buf()
+
+    params.push(ir_param(ity))
+    params.push(ir_param(ity))
+    request_intrinsic(e, ir_sig(fn, ir_fn_type(both, params)))
+
+    var args: Buf[IrArg] = buf()
+
+    args.push(ir_arg(ity, lv))
+    args.push(ir_arg(ity, rv))
+
+    val pair = fresh_reg(e)
+
+    emit(e, ir_call(Some(pair), both, VGlobal(fn), args))
+
+    val product = fresh_reg(e)
+
+    emit(e, InExtract(product, both, pair, one_index(0)))
+
+    val ovf = fresh_reg(e)
+
+    emit(e, InExtract(ovf, both, pair, one_index(1)))
+
+    var bound = VInt(base_max(bits, signed))
+
+    if signed
+        val signs = fresh_reg(e)
+
+        emit(e, InBin(signs, OpXor, ity, lv, rv))
+
+        val negative = fresh_reg(e)
+
+        emit(e, InIntCmp(negative, ISlt, ity, signs, VInt(from_int(0))))
+
+        val chosen = fresh_reg(e)
+
+        emit(e, InSelect(chosen, negative, ity, VInt(base_min(bits, signed)), VInt(base_max(bits, signed)), l_i1()))
+        bound = chosen
+    end if
+
+    val r = fresh_reg(e)
+
+    emit(e, InSelect(r, ovf, ity, bound, product, l_i1()))
+    r
+end saturating
 
 private one_index(n: int) -> Buf[int]
     var out: Buf[int] = buf()

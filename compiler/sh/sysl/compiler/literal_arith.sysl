@@ -98,7 +98,9 @@ private bad_shift(t: TExpr) -> Option[(Span, string)] = *t.kind match
 
         val right = bad_shift(r)
 
-        if right.is_some() || op != "<<" then return right
+        if right.is_some() then return right
+        if is_wrap_sat_op(op) then return unheld_operand(l, r, ty)
+        if op != "<<" then return None
 
         val count = exact_value(r)
 
@@ -123,6 +125,20 @@ private bad_shift(t: TExpr) -> Option[(Span, string)] = *t.kind match
             _ -> None
     _ -> None
 
+// The operand of a wrapping or saturating step that its type does not hold. The step is defined on
+// two values of the type, so `300 +| 1` at `u8` is the 300 that does not fit -- not a 255 that
+// pretends the operand was clamped first.
+private unheld_operand(l: TExpr, r: TExpr, ty: Type) -> Option[(Span, string)] = underlying(ty) match
+    Integer(bits, signed, _) ->
+        for side in [l, r]
+            val v = exact_value(side)
+
+            if v.is_some() && !fits(v.unwrap(), bits, signed) then
+                return Some((side.span, s"the value${shown(v.unwrap())} does not fit ${type_show(ty)}"))
+
+        None
+    _ -> None
+
 // Whether an expression is integer literals and the integer operators over them, and nothing else.
 // Parentheses are not a node, so `(1 << 31) - 1` is one.
 literals_only(e: Expr) -> bool = *e.kind match
@@ -133,7 +149,7 @@ literals_only(e: Expr) -> bool = *e.kind match
 
 private exact_operator(op: string) -> bool =
     op == "+" || op == "-" || op == "*" || op == "/" || op == "%" || op == "&" || op == "|" ||
-        op == "^" || op == "<<" || op == ">>"
+        op == "^" || op == "<<" || op == ">>" || is_wrap_sat_op(op)
 
 // The operator node itself, under the check a constrained result is given where it is made.
 private node_of(t: TExpr) -> TExpr = *t.kind match
@@ -166,6 +182,13 @@ private exact_value(t: TExpr) -> Option[BigInt] = *t.kind match
 // the check has its answer without the compiler multiplying out a number of megabytes.
 private binary_value(op: string, x: BigInt, y: BigInt, ty: Type) -> Option[BigInt]
     if is_beyond(x) || is_beyond(y) then return Some(beyond())
+
+    // A wrapping or saturating step is computed at its type's width, from operands `bad_shift` has
+    // found the type holds.
+    if is_wrap_sat_op(op)
+        underlying(ty) match
+            Integer(bits, signed, _) -> return Some(wrap_sat_value(op, x, y, bits, signed))
+            _ -> return None
 
     if op == "+" then return Some(bounded(add(x, y)))
     if op == "-" then return Some(bounded(sub(x, y)))
