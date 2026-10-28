@@ -334,6 +334,23 @@ type Acc = i64q61 wrapping
 'wrapping' changes what the operators do, so it makes a type of its own — write 'type Acc = new i64q61 wrapping'
 ```
 
+**One operation can choose for itself, whatever its format is**: `+%`, `-%` and `*%` are the
+`wrapping` arithmetic and `+|`, `-|` and `*|` the saturating arithmetic, on two values of one format
+([wrapping and saturating operators](/reference/expressions/#wrapping-and-saturating-operators)):
+
+```sysl
+type Acc = new i8q4 wrapping
+
+val s: i8q4 = 7
+val w = Acc(7)
+
+print(real(s +% 2), real(s +| 2), real(w +| Acc(2)), real(w + Acc(2)))
+```
+
+```output
+-7 7.9375 7.9375 -7
+```
+
 It is for a fixed-point base only — an integer already wraps. Converting **out** of a wrapping type
 still rounds and saturates, so the step from accumulator to sample is the safe one. A direct-form-I
 biquad in this shape, with `q31` samples, `i32q30` coefficients and the accumulator above, is five

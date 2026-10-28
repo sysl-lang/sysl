@@ -1,0 +1,486 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{is_file, make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.testing.skip
+import sysl.text.split
+
+// The wrapping operators `+%` `-%` `*%` and the saturating operators `+|` `-|` `*|`, with their
+// compound and yielding forms (`wrap_sat.sysl`; `reference/expressions.md § Wrapping and saturating
+// operators`). Every operator is run at the edges of each width the language spells differently --
+// a byte, a machine word, a width past the word, a width that is no machine's -- signed and unsigned;
+// the same values are folded while compiling and must agree with the run; and every refusal is pinned
+// with its words. The Thumb and RISC-V tiers are run on the QEMU boards and read for libcalls, since
+// a wide saturating product is the operation a 32-bit core is most likely to be handed a helper for.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private wso_ready() -> bool = std_root().is_ok() && clang_available()
+
+// What a program prints, or why it did not build or run.
+private wso_ran(text: string) -> string
+    val root = make_temp_dir("sysl-wso").unwrap()
+    val exe = s"$root/built"
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val said = build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) -> s"did not build: ${failure_text(why)}"
+        Ok(_) ->
+            capture(exe, [], "", [], true) match
+                Err(_) -> "the program that was built could not be run"
+                Ok(out) -> if out.status.ok() then out.text else s"exited badly: ${out.text}"
+
+    remove_dir_all(root).unwrap_or(())
+    said
+end wso_ran
+
+// The LLVM text a program lowers to for `target`, or its report where it was refused.
+private wso_emitted(text: string, target: Option[string]) -> string
+    val root = make_temp_dir("sysl-wso").unwrap()
+
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val out = emit_llvm_text(root, target, DefaultOptimization, buf(), Some(buf())) match
+        Err(why) -> s"did not compile: ${failure_text(why)}"
+        Ok(e) -> if e.report.is_empty() then e.text else s"did not compile: ${analysis_report(e.report)}"
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end wso_emitted
+
+private wso_prints(text: string, printed: string)
+    if !wso_ready() then skip("the standard module's source or clang is not on this machine")
+
+    assert_eq(wso_ran(text), printed)
+
+// A program that must be refused with a diagnostic containing `said`.
+private wso_refused(text: string, said: string)
+    if std_root().is_err() then skip("the standard module's source is not on this machine")
+
+    val got = wso_emitted(text, None)
+
+    assert(got.starts_with("did not compile") && got.contains(said), s"wanted '$said', got: $got")
+
+// Identities the optimizer may not see through, so an operator applied to one is run, not folded.
+private val WsoKeep: string = "@noinline\nk[T](x: T) -> T = x\n\n"
+
+// The six operators at an unsigned width's edges: the maximum plus one, zero minus one and the
+// maximum doubled, each wrapped and saturated.
+private wso_unsigned(ty: string, max: string) -> string =
+    s"val mx: $ty = $max\nval z: $ty = 0\nval two: $ty = 2\n" +
+    "print(k(mx) +% 1, k(mx) +| 1, k(z) -% 1, k(z) -| 1, k(mx) *% two, k(mx) *| two)\n"
+
+// The same at a signed width, with the minimum minus one, the minimum times -1 -- the one product a
+// signed width cannot hold that has a positive sign -- and the minimum doubled.
+private wso_signed(ty: string, max: string, min: string) -> string =
+    s"val mx: $ty = $max\nval mn: $ty = $min\n" +
+    "print(k(mx) +% 1, k(mx) +| 1, k(mn) -% 1, k(mn) -| 1, k(mx) *% 2, k(mx) *| 2)\n" +
+    "print(k(mn) *% -1, k(mn) *| -1, k(mn) *| 2, k(mn) +| k(mn), k(mx) -| k(mn))\n"
+
+private val U64Max = "18446744073709551615"
+private val I64Max = "9223372036854775807"
+private val I64Min = "-9223372036854775808"
+private val U128Max = "340282366920938463463374607431768211455"
+private val I256Max = "57896044618658097711785492504343953926634992332820282019728792003956564819967"
+private val I256Min = "-57896044618658097711785492504343953926634992332820282019728792003956564819968"
+
+// -- every width, at its edges --------------------------------------------------------------------
+
+@test("the six at the edges of u8, u64, u128 and u12 wrap and saturate at the width")
+wso_unsigned_edges()
+    wso_prints(WsoKeep + wso_unsigned("u8", "255") + wso_unsigned("u64", U64Max) +
+               wso_unsigned("u128", U128Max) + wso_unsigned("u12", "4095"),
+               "0 255 255 0 254 255\n" +
+               s"0 $U64Max $U64Max 0 18446744073709551614 $U64Max\n" +
+               s"0 $U128Max $U128Max 0 340282366920938463463374607431768211454 $U128Max\n" +
+               "0 4095 4095 0 4094 4095\n")
+
+@test("the six at the edges of i8, i64 and i256 wrap and saturate, toward the bound on the product's side")
+wso_signed_edges()
+    wso_prints(WsoKeep + wso_signed("i8", "127", "-128") + wso_signed("i64", I64Max, I64Min) +
+               wso_signed("i256", I256Max, I256Min),
+               "-128 127 127 -128 -2 127\n-128 127 -128 -128 127\n" +
+               s"$I64Min $I64Max $I64Max $I64Min -2 $I64Max\n$I64Min $I64Max $I64Min $I64Min $I64Max\n" +
+               s"$I256Min $I256Max $I256Max $I256Min -2 $I256Max\n$I256Min $I256Max $I256Min $I256Min $I256Max\n")
+
+@test("a result the width holds is the plain result, whatever the signs")
+wso_in_range_is_plain()
+    wso_prints(WsoKeep +
+               "print(k(u8(3)) *| 4, k(i8(-3)) *| 4, k(i8(-3)) *| -4, k(i8(-20)) -| 100, k(i8(20)) +| -30)\n" +
+               "print(k(u8(3)) *% 4, k(i8(-3)) *% -4, k(i64(-7)) +% 3, k(u12(7)) -% 3, k(i256(-5)) *| 5)\n" +
+               "print(k(i8(-64)) *| 2, k(i8(-65)) *| 2, k(i8(64)) *| -2, k(i8(65)) *| -2, k(i8(0)) *| -128)\n",
+               "12 -12 12 -120 -10\n12 12 -4 4 -25\n-128 -128 -128 -128 0\n")
+
+// -- folded while compiling, and run --------------------------------------------------------------
+
+private val WsoFoldedText: string = raw"""
+    const A: u8 = 255 +% 1
+    const B: u8 = 255 +| 1
+    const C: i8 = -128 -| 1
+    const D: i8 = -128 *| -1
+    const E: i64 = 9223372036854775807 *% 2
+    const F: u12 = 4095 +% 1
+    const G: i256 = 57896044618658097711785492504343953926634992332820282019728792003956564819967 *| 2
+    const H = 2147483647 +% 1
+    const J: u8 = B -| 10
+    const L = u8(250) +| 10
+    const sat(a: u8, b: u8) -> u8 = a +| b
+    const M: u8 = sat(250, 10)
+    const wrapped(a: i8, b: i8) -> i8
+        var x = a
+        x *%= b
+        x
+    const N: i8 = wrapped(100, 3)
+    val P: u8 = 200 +| 100
+
+    @noinline
+    k[T](x: T) -> T = x
+
+    print(A, B, C, D, E, F, G, H, J, L, M, N, P)
+    print(k(u8(255)) +% 1, k(u8(255)) +| 1, k(i8(-128)) -| 1, k(i8(-128)) *| -1,
+          k(i64(9223372036854775807)) *% 2, k(u12(4095)) +% 1,
+          k(i256(57896044618658097711785492504343953926634992332820282019728792003956564819967)) *| 2,
+          k(2147483647) +% 1, k(u8(255)) -| 10, k(u8(250)) +| 10, k(u8(250)) +| 10, k(i8(100)) *% 3,
+          k(u8(200)) +| 100)
+    print(u8(250) +| u8(10), i8(-128) -% i8(1), u8(5) -| u8(9))
+    """
+
+@test("constants, const functions and literal arithmetic fold to what the run computes")
+wso_folded_matches_the_run()
+    if !wso_ready() then skip("the standard module's source or clang is not on this machine")
+
+    val got = wso_ran(WsoFoldedText)
+    val lines = split(got, "\n")
+    val want = s"0 255 -128 127 -2 0 $I256Max -2147483648 245 255 255 44 255"
+
+    assert(lines.len >= 3, got)
+    assert_eq(lines[0], want)
+    assert_eq(lines[1], want)
+    assert_eq(lines[2], "255 127 0")
+
+@test("a constant's operator is lowered to no instruction: the folded value is the constant")
+wso_constant_is_folded()
+    val ir = wso_emitted("const B: u8 = 250 +| 10\nconst W: u8 = 250 +% 10\n\nmain()\n    print(B, W)\n", None)
+
+    assert(!ir.starts_with("did not compile"), ir)
+    assert(!ir.contains("llvm.uadd.sat"), "a constant's saturating sum reached the lowering")
+    assert(ir.contains("i8 255 to") && ir.contains("i8 4 to"), "the folded 255 and 4 are not what is printed")
+
+// -- compound and yielding forms ------------------------------------------------------------------
+
+@test("every compound form updates its place as the operator does, on locals, fields and elements")
+wso_compound_forms()
+    wso_prints(WsoKeep + raw"""
+        struct S
+            f: u8
+
+        var a = k(u8(200))
+        a +|= 100
+        print(a)
+        a +%= 100
+        print(a)
+        a -|= 200
+        print(a)
+        a -%= 1
+        print(a)
+        a *%= 3
+        print(a)
+        a *|= 3
+        print(a)
+        var b = k(i8(-100))
+        b -|= 100
+        print(b)
+        b *%= 3
+        print(b)
+        var c = k(u12(4000))
+        c +%= 200
+        print(c)
+        c *|= 100
+        print(c)
+        var d = k(i256(1)) << 254
+        d *|= 4
+        print(d)
+        var s = S(250)
+        s.f +|= 10
+        print(s.f)
+        var xs: [2]i64 = [9223372036854775807, 2]
+        xs[0] +%= 1
+        xs[1] *|= -4611686018427387905
+        print(xs[0], xs[1])
+        """,
+        "255\n99\n0\n255\n253\n255\n-128\n-128\n104\n4095\n" + s"$I256Max\n" + "255\n" + s"$I64Min $I64Min\n")
+
+@test("a yielding form assigns and is the value it assigned")
+wso_yielding_forms()
+    wso_prints(WsoKeep + "var e = k(u8(250))\nprint(e +|:= 10)\nprint(e +%:= 1)\nprint(e -|:= 5)\n" +
+               "print(e -%:= 1)\nprint(e *|:= 2)\nprint(e *%:= 2)\nprint(e)\n",
+               "255\n0\n0\n255\n255\n254\n254\n")
+
+// -- reading them: spelling, precedence, inference ------------------------------------------------
+
+@test("each binds as its base operator: '+|' with '+', '*|' with '*', all left to right")
+wso_precedence()
+    wso_prints(WsoKeep + raw"""
+        val five = k(u8(5))
+        print(1 + 2 *| 3, 2 *| 3 + 1, 1 << 2 *| 3, 10 -| 2 -| 3)
+        print(five -| 3 -| 3, five -| (3 -| 3), five *| 2 +| 250, k(u8(255)) +| 1 == 255)
+        print(k(i8(100)) +% 100 *% 1 -| 1)
+        """,
+        "7 7 12 5\n0 5 255 true\n-57\n")
+
+@test("written without spaces they are still the operators, and '%' and '|' keep their own readings")
+wso_spelling()
+    wso_prints(WsoKeep + raw"""
+        val x = k(u8(250))
+        val y = k(u8(10))
+        print(x+%y, x+|y, x-|y, x*%y, x*|y, x -%y, x +|y)
+        val n = k(7)
+        print(n % 3, n | -1, n |-1, n % -3, 3|-n, -n % 2)
+        val long = x +|
+            y
+        print(long)
+        """,
+        "4 255 240 196 255 240 255\n1 -1 -1 1 -5 -1\n255\n")
+
+@test("a literal beside a typed operand is read at its type, and two widths that widen do so as for '+'")
+wso_inference()
+    wso_prints(WsoKeep + raw"""
+        val x = k(u8(250))
+        print(x +| 10, 10 +| x, 250 +| k(u8(10)), k(i16(-32000)) -| 1000)
+        print(k(u8(250)) +| k(u16(65535)), k(u16(65535)) +| k(u8(250)), k(i8(-1)) +% k(i32(1)))
+        val m: u8 = 250
+        val w = m +% 6
+        print(w)
+        val y = k(u8(255))
+        print(y + 300, y +| 300, y +% 256, y +| 255)
+        """,
+        "255 255 255 -32768\n65535 65535 0\n0\n555 555 511 255\n")
+
+@test("a generic body's operator is the one at the type it is instantiated at")
+wso_generic()
+    wso_prints(raw"""
+        sat_add[T: Integer](a: T, b: T) -> T = a +| b
+        wrap_mul[T: Integer](a: T, b: T) -> T = a *% b
+
+        print(sat_add(u8(250), 10), sat_add(i16(-32000), -1000), sat_add(u128(1), 2))
+        print(wrap_mul(i8(100), 3), wrap_mul(u12(4095), 2))
+        """,
+        "255 -32768 3\n44 4094\n")
+
+@test("a 'new' integer type keeps its type through the operator, and a transparent range computes at its base")
+wso_constrained()
+    wso_prints(WsoKeep + raw"""
+        type Meters = new u8
+        type Small = int within 0..10
+
+        val m = k(Meters(200))
+        print(u8(m +| Meters(100)), u8(m +% Meters(100)))
+        val s: Small = 10
+        print(k(s) +| 1, k(s) -% 11)
+        """,
+        "255 44\n11 -1\n")
+
+// -- fixed point ----------------------------------------------------------------------------------
+
+@test("on fixed point '+|' saturates and '+%' wraps, whichever kind the format is, at run time and folded")
+wso_fixed_point()
+    wso_prints(raw"""
+        type Acc = new i8q4 wrapping
+
+        const add_sat(a: i8q4, b: i8q4) -> i8q4 = a +| b
+        const add_wrap(a: i8q4, b: i8q4) -> i8q4 = a +% b
+        const mul_wrap(a: i8q4, b: i8q4) -> i8q4 = a *% b
+
+        val CS = add_sat(7, 2)
+        val CW = add_wrap(7, 2)
+        val CM = mul_wrap(4, 4)
+
+        @noinline
+        k[T](x: T) -> T = x
+
+        val s: i8q4 = k(7)
+        val two: i8q4 = 2
+        val four: i8q4 = k(4)
+        print(real(s +| two), real(s +% two), real(s -| -two), real(s -% -two))
+        print(real(four *| four), real(four *% four), real(four *| -four), real(-four *% two))
+        val w = k(Acc(7))
+        print(real(w +| Acc(2)), real(w +% Acc(2)), real(w + Acc(2)), real(w *| Acc(2)))
+        var x: i8q4 = k(7)
+        x +%= two
+        print(real(x))
+        x -|= four
+        x -|= four
+        print(real(x))
+        print(real(CS), real(CW), real(CM))
+        """,
+        "7.9375 -7 7.9375 -7\n7.9375 0 -8 -8\n7.9375 -7 -7 7.9375\n-7\n-8\n7.9375 -7 0\n")
+
+// -- what is refused ------------------------------------------------------------------------------
+
+@test("a float is refused with what its arithmetic does instead, and the operator to write")
+wso_float_refused()
+    wso_refused("val f = 1.5\nprint(f +| 1.0)\n",
+                "'+|' is not defined for real — floating-point arithmetic neither wraps nor saturates, " +
+                "it rounds and overflows to infinity, so write '+'")
+    wso_refused("val f: f32 = 1.5\nprint(f *% 2.0)\n", "'*%' is not defined for f32")
+    wso_refused("var g = 2.0\ng -%= 1.0\n", "'-%' is not defined for real")
+    wso_refused("var g = 2.0\ng *|= 1.0\n", "so write '*'")
+
+@test("bool, char, string, a pointer and a struct with its own '+' have none of the six")
+wso_other_types_refused()
+    wso_refused("print(true +% false)\n", "operator '+%' is not defined for bool")
+    wso_refused("print('a' +| 'b')\n", "operator '+|' is not defined for char")
+    wso_refused("print(\"a\" +| \"b\")\n", "operator '+|' is not defined for string")
+    wso_refused("var v = 1\nval p = &v\nprint(p -% p)\n", "operator '-%' is not defined for")
+    wso_refused("struct P\n    x: int\n\nimpl Add for P\n    add(self, o: P) -> P = P(self.x + o.x)\n\n" +
+                "print((P(1) + P(2)).x)\nprint((P(1) +| P(2)).x)\n", "operator '+|' is not defined for P")
+
+@test("a register of lanes is refused, integer or fixed-point, wrapping or saturating")
+wso_vectors_refused()
+    wso_refused("val v: <4>i32 = [1, 2, 3, 4]\nprint(v +| v)\n",
+                "the saturating operators are defined on one integer or fixed-point value, not lane by lane")
+    wso_refused("val v: <4>i32 = [1, 2, 3, 4]\nprint(v *% v)\n", "the wrapping operators are defined")
+    wso_refused("val v: <2>q15 = [0.5, 0.25]\nprint(v -| v)\n", "'-|' is not defined for <2>q15")
+
+@test("operands of two types that do not widen are refused as for '+', and so is a literal operand of literal arithmetic its type does not hold")
+wso_mismatch_refused()
+    wso_refused("val s: i8 = -1\nval a: u8 = 1\nprint(s +| a)\n", "'+|' needs matching types, got i8 and")
+    wso_refused("val u: u64 = 1\nval t: i64 = 1\nprint(u *% t)\n", "'*%' needs matching types")
+    wso_refused("val c: u8 = 300 +| 1\nprint(c)\n", "300 does not fit")
+    wso_refused("const BAD: u8 = 300 +% 1\nprint(BAD)\n", "300 does not fit")
+
+@test("there is no prefix form: '-%x' is a '-' before a '%' that begins nothing")
+wso_no_prefix_form()
+    val got = wso_emitted("val x = 1\nprint(-%x)\n", None)
+
+    assert(got.starts_with("did not compile"), got)
+
+// -- the lowering ---------------------------------------------------------------------------------
+
+@test("a wrapping operator is the plain instruction with no 'nsw' or 'nuw', and a saturating one LLVM's intrinsic")
+wso_lowered_shape()
+    val ir = wso_emitted(WsoKeep + "print(k(i32(1)) +% 2, k(u8(1)) -% 2, k(i64(3)) *% 4)\n" +
+                         "print(k(i32(1)) +| 2, k(u8(1)) -| 2, k(i16(1)) -| 2, k(u32(1)) +| 2)\n" +
+                         "print(k(i64(3)) *| 4, k(u128(3)) *| 4)\n", None)
+
+    assert(!ir.starts_with("did not compile"), ir)
+    assert(ir.contains("= add i32 "), "no plain 'add i32'")
+    assert(ir.contains("= sub i8 "), "no plain 'sub i8'")
+    assert(ir.contains("= mul i64 "), "no plain 'mul i64'")
+    assert(!ir.contains("add nsw") && !ir.contains("add nuw") && !ir.contains("mul nsw"), "a wrap was promised not to")
+    assert(ir.contains("@llvm.sadd.sat.i32("), "no llvm.sadd.sat.i32")
+    assert(ir.contains("@llvm.usub.sat.i8("), "no llvm.usub.sat.i8")
+    assert(ir.contains("@llvm.ssub.sat.i16("), "no llvm.ssub.sat.i16")
+    assert(ir.contains("@llvm.uadd.sat.i32("), "no llvm.uadd.sat.i32")
+    assert(ir.contains("@llvm.smul.with.overflow.i64("), "no llvm.smul.with.overflow.i64")
+    assert(ir.contains("@llvm.umul.with.overflow.i128("), "no llvm.umul.with.overflow.i128")
+
+// Every operator at a width past the word, a width that is no machine's, and the word, as a library
+// of exported functions a board image could link.
+private val WsoWide: string = raw"""
+    @export("wso_a")
+    wso_a(a: i64, b: i64) -> i64 = (a *| b) +| (a -| b) +% (a *% b)
+
+    @export("wso_b")
+    wso_b(a: u128, b: u128) -> u128 = (a *| b) +| (a -| b) +% (a *% b)
+
+    @export("wso_c")
+    wso_c(a: i256, b: i256) -> i256 = (a *| b) +| (a -| b) -% (a *% b)
+
+    @export("wso_d")
+    wso_d(a: u12, b: i40) -> i40 = i40(a *| a) +| (b *| b) -| b
+    """
+
+private val WsoNm: string = "/opt/homebrew/opt/llvm/bin/llvm-nm"
+
+@test("the wide and odd-width operators leave nothing undefined on any Thumb or RISC-V target")
+wso_bare_metal_needs_no_helper()
+    if !is_file(WsoNm) then skip(s"there is no llvm-nm at $WsoNm to read the object")
+    if std_root().is_err() then skip("the standard module's source is not on this machine")
+
+    for name in ["thumbv6m-freestanding", "thumbv7m-freestanding", "thumbv7em-freestanding",
+                 "thumb-freestanding-softfp", "riscv32-freestanding"]
+        val t = target_named(name).unwrap()
+        val found = find_backend_clang(t)
+
+        if found.is_err() then skip(found.unwrap_err())
+
+        val cc = found.unwrap()
+        val text = wso_emitted(WsoWide, Some(name))
+
+        assert(!text.starts_with("did not compile"), s"$name: $text")
+
+        val dir = make_temp_dir("sysl-wso").unwrap()
+        val obj = s"$dir/probe.o"
+
+        compile_object(cc, text, obj, t, "2") match
+            Err(why) -> assert(false, s"$name: $why")
+            Ok(_) ->
+                val listing = capture(WsoNm, ["-u", obj]).map((o) -> o.text).unwrap_or("llvm-nm could not be run")
+
+                for line in split(listing, "\n")
+                    val n = line.trim()
+
+                    assert(n == "" || n == "U memcpy" || n == "U memset", s"$name leaves $n undefined")
+
+        remove_dir_all(dir).unwrap_or(())
+    end for
+end wso_bare_metal_needs_no_helper
+
+// The edges of the wide widths, run on a board: a count of the answers that were not the expected one.
+private val WsoBoardBody: string = raw"""
+    @noinline
+    k[T](x: T) -> T = x
+
+    var wrong = 0
+    val mx: i256 = 57896044618658097711785492504343953926634992332820282019728792003956564819967
+    val mn: i256 = -57896044618658097711785492504343953926634992332820282019728792003956564819968
+    if k(mx) *| 2 != mx then wrong += 1
+    if k(mn) *| -1 != mx then wrong += 1
+    if k(mn) *| 2 != mn then wrong += 1
+    if k(mx) +| 1 != mx then wrong += 1
+    if k(mn) -| 1 != mn then wrong += 1
+    if k(mx) +% 1 != mn then wrong += 1
+    if k(i256(-5)) *| 5 != -25 then wrong += 1
+    val um: u128 = 340282366920938463463374607431768211455
+    if k(um) *| 3 != um then wrong += 1
+    if k(u128(0)) -| 1 != 0 then wrong += 1
+    if k(u128(0)) -% 1 != um then wrong += 1
+    if k(u128(1) << 64) *| (u128(1) << 63) != u128(1) << 127 then wrong += 1
+    val m64: i64 = -9223372036854775807 - 1
+    val u64max: u64 = 18446744073709551615
+    if k(m64) *| -1 != 9223372036854775807 then wrong += 1
+    if k(u64(1) << 63) *| 2 != u64max then wrong += 1
+    if k(u12(4000)) +| 200 != 4095 then wrong += 1
+    if k(i8(-100)) *| 2 != -128 then wrong += 1
+    w.write("wso ".bytes)
+    wrong.display(w, FormatSpec(0, -1, false))
+    w.write(" done".bytes)
+    """
+
+@test("on every QEMU board the wide saturating and wrapping operators give the host's answers")
+wso_on_the_boards()
+    var bad: Buf[string] = buf()
+    var ran: usize = 0
+
+    for b in qemu_boards()
+        var files: Buf[(string, string)] = buf()
+
+        files.push(("p.sysl", "import board.*\nimport sysl.math.Bits\n\nval w = console()\n\n" + WsoBoardBody))
+        files.push(("board/board.sysl", qemu_board_module(b)))
+        ran += 1
+
+        qemu_boot(b, files) match
+            Err(why) -> bad.push(s"${b.name}: $why")
+            Ok(r) ->
+                if !r.status.ok() || !r.out.contains("wso 0 done") then
+                    bad.push(s"${b.name} (${b.target}): ${qemu_said(b, r)}")
+    end for
+
+    assert(ran > 0, "no board was booted")
+    assert(bad.is_empty(), joined(bad, "\n"))
+end wso_on_the_boards
