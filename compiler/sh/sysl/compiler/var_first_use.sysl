@@ -13,7 +13,11 @@ import sysl.buf.{Buf, buf}
 // be, so a comparison or a position that fixes it fixes `i`. **An operand of a type of its own beside
 // it in arithmetic does not**: `sum + b` keeps `sum` at its default and widens `b`, as it would with
 // the default written out, since sysl wraps on overflow and a narrow type the program never named
-// would wrap where the default does not. Nor does a position that takes any integer at all -- an
+// would wrap where the default does not. **The variable of a `for` over a literal range is the
+// exception**: an integer operand of a type of its own beside it in `+ - * / % & | ^`, or the place a
+// compound assignment of one of those writes, fixes it -- `n += k` makes `k` the `n`'s type. Its
+// values are the range's, so the type it is fixed at is the one the program named for them. A
+// shift's amount is fixed by nothing, and a shifted value only by where the shift is used. Nor does a position that takes any integer at all -- an
 // index of an array, a slice or a pointer, a slice's bounds, a vector run's start, a slot's index --
 // since no type is asked of it. A binding no use fixes has the literal's default, `int` or `real`.
 //
@@ -196,11 +200,12 @@ end fixed_by_position
 
 // Files a use as fixing a binding's type, where the binding is open, no use has fixed it yet, and
 // the literal it was given reads at the type -- a number no `u8` holds is not made one by its use.
-note_var_fix(cx: &Analyzer, unique: string, ty: Type)
+// `counted_only` files it only where the binding is a counted `for`'s variable.
+note_var_fix(cx: &Analyzer, unique: string, ty: Type, counted_only: bool = false)
     for o in cx.open_vars
         if o.unique != unique then continue
 
-        if !numeric_scalar(ty) then return
+        if !numeric_scalar(ty) || counted_only && !o.counted then return
 
         if o.counted && !integer_scalar(ty) then return
 
@@ -316,8 +321,11 @@ private fixes_a_neighbour(cx: &Analyzer, e: Expr, t: TExpr) -> bool =
 
 // A comparison: an undecided operand compared with an operand of a type of its own is that type, so
 // each open binding it waits on is fixed at it -- `i < xs.len` and `i + 1 < xs.len` each fix `i`.
-// `own` holds each operand's reading alone, before the pair settles anything.
-compare_fixes(cx: &Analyzer, operands: Buf[Expr], own: Buf[Option[TExpr]])
+// `own` holds each operand's reading alone, before the pair settles anything. `counted_only` is
+// arithmetic's reading of the same pair: an operand of a type of its own fixes only a counted `for`'s
+// variable beside it -- `n * k` and `k + n` make `k` the `n`'s type -- and an open `var` keeps its
+// default.
+compare_fixes(cx: &Analyzer, operands: Buf[Expr], own: Buf[Option[TExpr]], counted_only: bool = false)
     for i in 0..<operands.len()
         val opens = opens_of(cx, operands.at(i))
 
@@ -330,12 +338,22 @@ compare_fixes(cx: &Analyzer, operands: Buf[Expr], own: Buf[Option[TExpr]])
                 Some(t) ->
                     if fixes_a_neighbour(cx, operands.at(j), t)
                         for unique in opens
-                            note_var_fix(cx, unique, texpr_type(t))
+                            note_var_fix(cx, unique, texpr_type(t), counted_only)
 
                         break
                     end if
                 None -> ()
 end compare_fixes
+
+// `n += k`: a compound assignment of `+ - * / % & | ^` is the arithmetic `n + k` written back, so an
+// undecided value fixes each counted `for`'s variable it waits on at the type of the place, where that
+// place is not itself an open binding's. A shift's amount (`n <<= k`) is fixed by nothing.
+compound_fixes(cx: &Analyzer, bin: string, target: Expr, place: TExpr, value: Expr)
+    if !arithmetic_op(bin) || open_name(cx, target).is_some() then return
+
+    for unique in opens_of(cx, value)
+        note_var_fix(cx, unique, texpr_type(place), true)
+end compound_fixes
 
 // `n = v`: an open binding assigned a value of a type of its own is fixed at that type. The value is
 // read alone, in a trial, for the type it has; the assignment reads it again at the binding's.
