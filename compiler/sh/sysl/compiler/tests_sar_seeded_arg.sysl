@@ -1,0 +1,175 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// **An argument is read against what its parameter already knows** (`expr_generic.sysl`'s
+// `seeded_readings`). In `keep[T](o: Result[T, E])` called as `keep(Ok(1))`, the `Ok` settles the
+// enum's `T` from its value and the parameter settles its `E`, so the call is `keep[int]` -- as rustc
+// reads it. What neither says is still refused, in the words it always was. The run helpers are
+// `tests_enm_enum_run.sysl`'s.
+
+private sar_decls() -> string = raw"""
+    enum E derives Display
+        A
+
+    enum Pick[L, R]
+        Left(v: L)
+        Right(w: R)
+
+    keep[T](o: Result[T, E]) -> Result[T, E] = o
+    keep_err[F](o: Result[int, F]) -> Result[int, F] = o
+    keep_opt[T](o: Option[T], fallback: T) -> T = o.unwrap_or(fallback)
+    side[L](p: Pick[L, string]) -> Pick[L, string] = p
+    side_r[R](p: Pick[int, R]) -> Pick[int, R] = p
+    pair[T](o: Result[T, E], extra: T) -> T = o.unwrap_or(extra)
+    both[T, F](o: Result[T, F]) -> bool = o.is_ok()
+    run[T](f: &Fn() -> Result[T, E]) -> Result[T, E] = f()
+    run_b[T](f: () -> Result[T, E]) -> Result[T, E] = f()
+    run_n[T](n: int, f: int -> Result[T, E]) -> Result[T, E] = f(n)
+
+    struct Holder
+        n: int
+
+    impl Holder
+        hold[T](self, o: Result[T, E]) -> T = o.unwrap()
+
+    """
+
+private sar_ran(body: string) -> string = enm_ran(sar_decls() + body)
+
+private sar_err(body: string) -> string = enm_err(sar_decls() + body)
+
+@test("Ok as the argument takes the error type its parameter fixes")
+sar_ok_takes_the_parameters_error()
+    if !enm_ready() then return
+
+    assert_eq(sar_ran("print(keep(Ok(1)).unwrap() + 1)\n"), "2\n")
+
+@test("Err as the argument takes the value type its parameter fixes")
+sar_err_takes_the_parameters_value()
+    if !enm_ready() then return
+
+    assert_eq(sar_ran("print(keep_err(Err(E.A)).is_err())\n"), "true\n")
+
+@test("Some and None stand at an Option parameter, None settled by the next argument")
+sar_some_and_none()
+    if !enm_ready() then return
+
+    assert_eq(sar_ran("print(keep_opt(Some(4), 0), keep_opt(None, 9))\n"), "4 9\n")
+
+@test("a user generic enum's variant takes the half its parameter fixes, on either side")
+sar_user_enum_either_side()
+    if !enm_ready() then return
+
+    assert_eq(sar_ran(raw"""
+        side(Left(3)) match
+            Left(v) -> print(v + 1)
+            Right(w) -> print(w)
+        side_r(Right("r")) match
+            Left(v) -> print(v + 1)
+            Right(w) -> print(w)
+        """), "4\nr\n")
+
+@test("a variant nested in the argument is read inside the seeded one")
+sar_nested_variant()
+    if !enm_ready() then return
+
+    assert_eq(sar_ran("print(keep(Ok(Some(2))).unwrap().unwrap())\n"), "2\n")
+
+@test("a method's own generic parameter is settled the same way")
+sar_method_generic_param()
+    if !enm_ready() then return
+
+    assert_eq(sar_ran("print(Holder(1).hold(Ok(5)) + 1)\n"), "6\n")
+
+@test("a closure's result takes what its parameter fixes, boxed, bare and taking an argument")
+sar_closure_result()
+    if !enm_ready() then return
+
+    assert_eq(sar_ran(raw"""
+        print(run(() -> Ok(1)).unwrap())
+        print(run_b(() -> Ok("b")).unwrap())
+        print(run_n(4, n -> Ok(n + 1)).unwrap())
+        print(run_n(5, n -> if n > 3 then Ok(n) else Err(E.A)).unwrap())
+        """), "1\nb\n5\n5\n")
+
+@test("a second argument settles the half the variant leaves open")
+sar_second_argument_fixes()
+    if !enm_ready() then return
+
+    assert_eq(sar_ran("print(pair(Err(E.A), 7), pair(Ok(3), 8))\n"), "7 3\n")
+
+@test("the annotated spelling still reads as it did")
+sar_annotated_val_still_works()
+    if !enm_ready() then return
+
+    assert_eq(sar_ran("val r: Result[int, E] = Ok(6)\nprint(keep(r).unwrap())\n"), "6\n")
+
+@test("a variant whose enum the parameter leaves wholly open is still refused")
+sar_both_open_refused()
+    if !enm_ready() then return
+
+    val said = sar_err("print(both(Ok(1)))\n")
+
+    assert(said.contains("cannot infer the type argument 'E' of 'Ok' here — annotate the expected type"),
+           said)
+
+@test("a parameter the variant does not carry and the parameter does not fix is still refused")
+sar_uncarried_half_refused()
+    if !enm_ready() then return
+
+    val said = sar_err("print(keep(Err(E.A)).is_err())\n")
+
+    assert(said.contains("cannot infer the type argument 'T' of 'Err' here — annotate the expected type"),
+           said)
+
+@test("a variant and a second argument that disagree are refused with the mismatch")
+sar_conflicting_fixes_refused()
+    if !enm_ready() then return
+
+    val said = sar_err("print(pair(Ok(1), \"s\"))\n")
+
+    assert(said.contains("'value' of 'Ok' is string, but int was given"), said)
+
+// -- a generic function declared in another module ------------------------------------------------
+
+private sar_lib() -> string = raw"""
+    module lib.m
+
+    enum Fault
+        Bad
+
+    keep[T](o: Result[T, Fault]) -> Result[T, Fault] = o
+    """
+
+private sar_tree_ran(main: string) -> string
+    val root = make_temp_dir("sysl-sar").unwrap()
+
+    make_dir_all(s"$root/lib/m").unwrap()
+    write_text(s"$root/lib/m/m.sysl", sar_lib()).unwrap()
+    write_text(s"$root/main.sysl", main).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end sar_tree_ran
+
+@test("a library module's generic function reads its argument against its own error type")
+sar_library_generic()
+    if !enm_ready() then return
+
+    assert_eq(sar_tree_ran("import lib.m.keep\n\nprint(keep(Ok(3)).unwrap())\n"), "3\n")
