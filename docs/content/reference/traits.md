@@ -1298,6 +1298,100 @@ struct P derives Show
 'Show' is not a trait the compiler knows how to write, and it carries no 'derive' member
 ```
 
+### A derived member may have type parameters of its own
+
+The bracket after `derive` names the deriving type and nothing else. A member that is generic in the
+trait is generic in its `derive` member too, and **its own type parameters follow its name**, as they
+do in the trait: `derive[T] encode[E: Encoder](self: T, e: *E)`. Each deriving type gets one body,
+instantiated per `(T, E)` at each use, so one derivation serves every format with a direct call to
+each of the format's members:
+
+```sysl
+trait Sink
+    put(*self, s: string)
+
+trait Show
+    show[S: Sink](self, s: *S)
+
+    derive[T] show[S: Sink](self: T, s: *S)
+        s.put(T::BaseName)
+
+        for const f in T::Fields
+            s.put(s" ${f.name}=")
+            self.(f).show(s)
+
+impl Show for int
+    show[S: Sink](self, s: *S) = s.put(s"$self")
+
+struct Plain
+    out: string
+
+impl Sink for Plain
+    put(*self, s: string) = self.out = self.out + s
+
+struct Bracketed
+    out: string
+
+impl Sink for Bracketed
+    put(*self, s: string) = self.out = self.out + s"[$s]"
+
+struct Pt derives Show
+    x: int
+    y: int
+
+var p = Plain("")
+var b = Bracketed("")
+Pt(1, 2).show(&p)
+Pt(1, 2).show(&b)
+print(p.out)
+print(b.out)
+```
+
+```output
+Pt x=1 y=2
+[Pt][ x=][1][ y=][2]
+```
+
+The derived member is the trait's member written once for every type, so its type parameters are
+held to the trait's: as many, in the same order, each with the bounds the trait declares for it, in
+the bracket or in a `where`. They may be renamed, and may not reuse the deriving type's name. A
+missing bound is refused, since the body could not ask for what the trait promises every caller, and
+so is an extra one, which would ask a caller for what the trait never required:
+
+```sysl
+trait Sink
+    put(*self, s: string)
+
+trait Show
+    show[S: Sink](self, s: *S)
+
+    derive[T] show[S](self: T, s: *S) = s.put(T::BaseName)
+
+print(1)
+```
+
+```error
+'derive' member 'show' leaves 'S' without the bound 'Sink' trait 'Show' declares for its 'show' — write 'S: Sink'
+```
+
+Written inside the `derive` bracket, the member's own parameters are refused with where they go:
+
+```sysl
+trait Sink
+    put(*self, s: string)
+
+trait Show
+    show[S: Sink](self, s: *S)
+
+    derive[T, S: Sink] show(self: T, s: *S) = s.put(T::BaseName)
+
+print(1)
+```
+
+```error
+a member's own type parameters follow its name, as in 'derive[T] show[S: Sink](self: T, …)'
+```
+
 ### Order is declaration order
 
 `Ord` is lexicographic, first field first: the only ordering a named product can claim, and the one

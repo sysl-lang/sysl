@@ -151,7 +151,8 @@ in this design.
    member may carry its own type parameters after the name, exactly as the member it writes does
    (p02 shows the instantiated body already compiles). The alternative that runs today, `e:
    *Encoder` (C3), pays an indirect call per primitive and stops inlining across the format; it is
-   rejected as the shipped shape.
+   rejected as the shipped shape. **Built in 0.8.0** as recommended (`traits.md` § "A derived member
+   may have type parameters of its own"); p01 runs.
 2. **A `derive` member with no receiver (C4).** `decode` has no value to read. Recommended: allow
    `derive[T] decode[D: Decoder](d: *D) -> Result[T, CodecError]`, the derived member taking `T`'s
    place as `Self` in the result rather than as `self`.

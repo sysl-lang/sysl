@@ -1,0 +1,416 @@
+module sh.sysl.compiler
+@tests
+
+// **A `derive` member's own type parameters** (`docs/design/codec.md` § 6, Q1): `derive[T]
+// encode[E: Encoder](self: T, e: *E)` writes a member that is generic over `E` exactly as the trait's
+// member is, so each type deriving it gets one body per format it is used with. The bracket after
+// `derive` names the deriving type alone; the member's own parameters follow its name, bounded as the
+// trait bounds them.
+
+// The codec design note's probe p01, a format-neutral `Encode` whose derived body is generic over the
+// format, with two formats used in one program and a derived field inside a derived struct.
+private dgp_encode() -> string = raw"""
+    trait Encoder
+        begin_struct(*self, name: string, n: usize)
+        field(*self, key: string)
+        end_struct(*self)
+        int(*self, v: long)
+        str(*self, v: string)
+
+    trait Encode
+        encode[E: Encoder](self, e: *E)
+
+        derive[T] encode[E: Encoder](self: T, e: *E)
+            if const T::Kind == Kind.Struct
+                e.begin_struct(T::BaseName, T::Fields.len)
+
+                for const f in T::Fields
+                    e.field(f.name)
+                    self.(f).encode(e)
+
+                e.end_struct()
+            else
+                @assert(false, s"Encode cannot derive for ${T::Name}")
+
+    impl Encode for int
+        encode[E: Encoder](self, e: *E) = e.int(self)
+
+    impl Encode for string
+        encode[E: Encoder](self, e: *E) = e.str(self)
+
+    struct Json
+        out: string
+
+    impl Encoder for Json
+        begin_struct(*self, name: string, n: usize) = self.out = self.out + "{"
+        field(*self, key: string)
+            if !self.out.ends_with("{") then self.out = self.out + ","
+            self.out = self.out + s"\"$key\":"
+        end_struct(*self) = self.out = self.out + "}"
+        int(*self, v: long) = self.out = self.out + s"$v"
+        str(*self, v: string) = self.out = self.out + s"\"$v\""
+
+    struct Debugish
+        out: string
+
+    impl Encoder for Debugish
+        begin_struct(*self, name: string, n: usize) = self.out = self.out + s"$name("
+        field(*self, key: string)
+            if !self.out.ends_with("(") then self.out = self.out + ", "
+            self.out = self.out + s"$key="
+        end_struct(*self) = self.out = self.out + ")"
+        int(*self, v: long) = self.out = self.out + s"$v"
+        str(*self, v: string) = self.out = self.out + v
+
+    """
+
+@test("the codec probe p01: one derived body generic over the format, used with two formats")
+dgp_probe_p01_two_formats()
+    if !azb_ready() then return
+
+    azb_prints(azb_main(dgp_encode() + raw"""
+        struct Inner derives Encode
+            z: int
+
+        struct User derives Encode
+            id: int
+            name: string
+            inner: Inner
+
+        val u = User(7, "ann", Inner(3))
+        var j = Json("")
+        u.encode(&j)
+        print(j.out)
+        var d = Debugish("")
+        u.encode(&d)
+        print(d.out)
+        """), "{\"id\":7,\"name\":\"ann\",\"inner\":{\"z\":3}}\nUser(id=7, name=ann, inner=Inner(z=3))\n")
+end dgp_probe_p01_two_formats
+
+@test("a generic struct derives a generic member at each instance, nested in itself")
+dgp_generic_struct()
+    if !azb_ready() then return
+
+    azb_prints(azb_main(dgp_encode() + raw"""
+        struct Box[V] derives Encode
+            item: V
+
+        var j = Json("")
+        Box(Box("x")).encode(&j)
+        print(j.out)
+        var d = Debugish("")
+        Box(5).encode(&d)
+        print(d.out)
+        """), "{\"item\":{\"item\":\"x\"}}\nBox(item=5)\n")
+end dgp_generic_struct
+
+@test("a derived generic member is reached through a generic function's bounds")
+dgp_through_a_generic_function()
+    if !azb_ready() then return
+
+    azb_prints(azb_main(dgp_encode() + raw"""
+        struct Pt derives Encode
+            x: int
+            y: int
+
+        to_text[V: Encode, E: Encoder](v: V, e: *E) = v.encode(e)
+
+        var j = Json("")
+        to_text(Pt(1, 2), &j)
+        print(j.out)
+        """), "{\"x\":1,\"y\":2}\n")
+end dgp_through_a_generic_function
+
+// A trait with a member for each shape a derived member's own parameters take: a bound in the bracket
+// and a `*S` parameter, an unbounded parameter taken as `&R` with a result, and two parameters bounded
+// in a `where`, renamed from the trait's.
+private dgp_show() -> string = raw"""
+    trait Sink
+        put(*self, s: string)
+
+    trait Show
+        show[S: Sink](self, s: *S)
+        tag[S](self, s: &S) -> int
+        pair[A: Sink, B: Sink](self, a: *A, b: *B)
+
+        derive[T] show[S: Sink](self: T, s: *S)
+            if const T::Kind == Kind.Struct
+                s.put(T::BaseName)
+                s.put("(")
+
+                for const f in T::Fields
+                    if f.index > 0 then s.put(",")
+                    self.(f).show(s)
+
+                s.put(")")
+            elif const T::Kind == Kind.DataEnum
+                for const c in T::Variants
+                    if self is c
+                        s.put(c.name)
+                        val p = self.(c)
+
+                        for const f in c::Fields
+                            s.put(" ")
+                            p.(f).show(s)
+                    end if
+            else
+                s.put(T::Image(self))
+
+        derive[T] tag[R](self: T, s: &R) -> int = int(T::Fields.len)
+
+        derive[T] pair[X, Y](self: T, a: *X, b: *Y) where X: Sink, Y: Sink
+            self.show(a)
+            self.show(b)
+
+    impl Show for int
+        show[S: Sink](self, s: *S) = s.put(s"$self")
+        tag[S](self, s: &S) -> int = 0
+        pair[A: Sink, B: Sink](self, a: *A, b: *B)
+            a.put(s"$self")
+            b.put(s"$self")
+
+    struct Angle
+        out: string
+
+    impl Sink for Angle
+        put(*self, s: string) = self.out = self.out + s"<$s>"
+
+    struct Square
+        out: string
+
+    impl Sink for Square
+        put(*self, s: string) = self.out = self.out + s"[$s]"
+
+    struct Pt derives Show
+        x: int
+        y: int
+
+    """
+
+@test("a data enum and a simple enum derive a member generic over its sink")
+dgp_enums()
+    if !azb_ready() then return
+
+    azb_prints(azb_main(dgp_show() + raw"""
+        enum Shape derives Show
+            Dot(at: Pt)
+            Line(a: Pt, b: Pt)
+
+        enum Color derives Show
+            Red
+            Green
+
+        var a = Angle("")
+        var q = Square("")
+        Shape.Line(Pt(1, 2), Pt(5, 6)).show(&a)
+        Color.Green.show(&q)
+        print(a.out)
+        print(q.out)
+        """), "<Line>< ><Pt><(><1><,><2><)>< ><Pt><(><5><,><6><)>\n[Green]\n")
+end dgp_enums
+
+@test("two own parameters bounded in a 'where' and renamed, and an unbounded one taken as '&R'")
+dgp_where_rename_and_ref()
+    if !azb_ready() then return
+
+    azb_prints(azb_main(dgp_show() + raw"""
+        struct Holder
+            n: int
+
+        var a = Angle("")
+        var q = Square("")
+        Pt(7, 8).pair(&a, &q)
+        print(a.out)
+        print(q.out)
+        print(Pt(1, 2).tag(Holder(3)))
+        """), "<Pt><(><7><,><8><)>\n[Pt][(][7][,][8][)]\n2\n")
+end dgp_where_rename_and_ref
+
+@test("a derived generic member's trait declared in another module derives in the program's")
+dgp_trait_in_another_module()
+    if !azb_ready() then return
+
+    azb_prints([("", "main.sysl", raw"""
+        import fmt.{Sink, Show}
+
+        struct Text
+            out: string
+
+        impl Sink for Text
+            put(*self, s: string) = self.out = self.out + s
+
+        struct Pt derives Show
+            x: int
+            y: int
+
+        var t = Text("")
+        Pt(3, 4).show(&t)
+        print(t.out)
+        """), ("fmt", "f.sysl", raw"""
+        module fmt
+
+        trait Sink
+            put(*self, s: string)
+
+        trait Show
+            show[S: Sink](self, s: *S)
+
+            derive[T] show[S: Sink](self: T, s: *S)
+                for const f in T::Fields
+                    s.put(s" ${f.name}=")
+                    self.(f).show(s)
+
+        impl Show for int
+            show[S: Sink](self, s: *S) = s.put(s"$self")
+        """)], " x=3 y=4\n")
+end dgp_trait_in_another_module
+
+@test("the trait-object form, 'e: *Encoder', still derives (the codec probe p11)")
+dgp_trait_object_form()
+    if !azb_ready() then return
+
+    azb_prints(azb_main(raw"""
+        trait Encoder
+            field(*self, key: string)
+            int(*self, v: long)
+
+        trait Encode
+            encode(self, e: *Encoder)
+
+            derive[T] encode(self: T, e: *Encoder)
+                for const f in T::Fields
+                    e.field(f.name)
+                    self.(f).encode(e)
+
+        impl Encode for int
+            encode(self, e: *Encoder) = e.int(self)
+
+        struct Text
+            out: string
+
+        impl Encoder for Text
+            field(*self, key: string) = self.out = self.out + s" $key="
+            int(*self, v: long) = self.out = self.out + s"$v"
+
+        struct P derives Encode
+            x: int
+            y: int
+
+        var t = Text("")
+        P(1, 2).encode(&t)
+        print(t.out)
+        """), " x=1 y=2\n")
+end dgp_trait_object_form
+
+// -- refusals ----------------------------------------------------------------------------------------
+
+@test("a derive member's own type parameters are refused where they differ from the trait member's")
+dgp_signature_refusals()
+    if !azb_ready() then return
+
+    val cases = [
+        ("derive[T] show(self: T, s: *S) = s.put(\"x\")",
+         "'derive' member 'show' declares 0 type parameters of its own, but the 'show' trait 'Show' " +
+         "declares 1 — write them after the name, as the trait does"),
+        ("derive[T] show[S, Q](self: T, s: *S) = s.put(\"x\")",
+         "'derive' member 'show' declares 2 type parameters of its own, but the 'show' trait 'Show' " +
+         "declares 1 — write them after the name, as the trait does"),
+        ("derive[T] show[S](self: T, s: *S) = s.put(\"x\")",
+         "'derive' member 'show' leaves 'S' without the bound 'Sink' trait 'Show' declares for its " +
+         "'show' — write 'S: Sink'"),
+        ("derive[T] show[S: Other](self: T, s: *S) = s.put(\"x\")",
+         "'derive' member 'show' leaves 'S' without the bound 'Sink' trait 'Show' declares for its " +
+         "'show' — write 'S: Sink'"),
+        ("derive[T] show[S: Sink + Other](self: T, s: *S) = s.put(\"x\")",
+         "'derive' member 'show' bounds 'S' by 'Other', which trait 'Show' does not declare for its " +
+         "'show' — the derived body is that member's, so it asks for what the member does and no more"),
+        ("derive[T] show[S](self: T, s: *S) where S: Other = s.put(\"x\")",
+         "'derive' member 'show' leaves 'S' without the bound 'Sink'"),
+        ("derive[T] show[T: Sink](self: T, s: *T) = s.put(\"x\")",
+         "'T' stands for the type that derives the trait, so the member's own type parameters take " +
+         "other names"),
+        ("derive[T, S: Sink] show(self: T, s: *S) = s.put(\"x\")",
+         "a 'derive' member takes one type parameter, which stands for the type that derives the " +
+         "trait — write 'derive[T] show(self: T, …)'; a member's own type parameters follow its name, " +
+         "as in 'derive[T] show[S: Sink](self: T, …)'"),
+        ("derive[T, A: Sink + Other, B] show(self: T, s: *A) = s.put(\"x\")",
+         "as in 'derive[T] show[A: Sink + Other, B](self: T, …)'")]
+
+    for c in cases
+        azb_refused(azb_main("trait Sink\n    put(*self, s: string)\n\ntrait Other\n    go(self)\n\n" +
+                             s"trait Show\n    show[S: Sink](self, s: *S)\n\n    ${c.0}\n\nprint(1)\n"),
+                    [c.1])
+end dgp_signature_refusals
+
+@test("a derive member with own type parameters for a trait member that has none is refused")
+dgp_own_params_on_a_plain_member()
+    if !azb_ready() then return
+
+    azb_refused(azb_main(raw"""
+        trait Show
+            show(self) -> int
+
+            derive[T] show[S](self: T) -> int = 1
+
+        print(1)
+        """), ["'derive' member 'show' declares 1 type parameters of its own, but the 'show' trait " +
+               "'Show' declares 0 — write them after the name, as the trait does"])
+end dgp_own_params_on_a_plain_member
+
+@test("a mistake in a derived generic body is told at the 'derives', naming the field")
+dgp_body_refusal_at_the_derives()
+    if !azb_ready() then return
+
+    val said = azb_refusal(azb_main(raw"""
+        trait Sink
+            put(*self, s: string)
+
+        trait Show
+            show[S: Sink](self, s: *S)
+
+            derive[T] show[S: Sink](self: T, s: *S)
+                for const f in T::Fields
+                    s.put(1)
+
+        impl Sink for string
+            put(*self, s: string) = *self = *self + s
+
+        struct P derives Show
+            x: int
+
+        var o = ""
+        P(1).show(&o)
+        print(o)
+        """))
+
+    assert(said.contains("'s' of 'string.put' is string, but int was given (in the copy for field " +
+                         "'P.x')"), said)
+    // Told at the clause, not inside the trait's body.
+    assert(said.contains("main.sysl:14:"), said)
+end dgp_body_refusal_at_the_derives
+
+@test("a call of a derived generic member with a type outside its bound is refused at the call")
+dgp_call_outside_the_bound()
+    if !azb_ready() then return
+
+    azb_refused(azb_main(raw"""
+        trait Sink
+            put(*self, s: string)
+
+        trait Show
+            show[S: Sink](self, s: *S)
+
+            derive[T] show[S: Sink](self: T, s: *S)
+                for const f in T::Fields
+                    s.put(f.name)
+
+        struct P derives Show
+            x: int
+
+        struct Q
+            n: int
+
+        var q = Q(1)
+        P(1).show(&q)
+        """), ["'P.show' requires its type parameter 'S' to implement 'Sink', but Q does not"])
+end dgp_call_outside_the_bound

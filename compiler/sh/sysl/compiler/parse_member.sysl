@@ -851,6 +851,10 @@ end at_derive_member
 // `derive[T] encode(self: T, w: *Writer)` and its body. **The subject comes first and is named
 // `self`**, typed as the one parameter, `*` it or `&` it -- which is the receiver the member an
 // `impl` would have written takes -- and the rest of the list is that member's.
+//
+// **The member's own type parameters follow its name**, exactly as the member it writes declares
+// them: `derive[T] encode[E: Encoder](self: T, e: *E)` is one body per deriving type, generic over
+// `E` as the trait's `encode` is, so each use instantiates it at `(T, E)`.
 private parse_derive_member(p: *Parser) -> Option[DeriveDecl]
     val start = p.here()
 
@@ -861,7 +865,7 @@ private parse_derive_member(p: *Parser) -> Option[DeriveDecl]
 
     if tp.names.len() != 1 || !tp.values.is_empty() || !tp.packs.is_empty()
         p.fault(start, "a 'derive' member takes one type parameter, which stands for the type that " +
-                s"derives the trait — write 'derive[T] $name(self: T, …)'")
+                s"derives the trait — write 'derive[T] $name(self: T, …)'${own_params_hint(tp, name)}")
         skip_line(p)
         return None
     end if
@@ -872,6 +876,17 @@ private parse_derive_member(p: *Parser) -> Option[DeriveDecl]
         p.fault(start, s"'$param' stands for the type that derives the trait, which the 'derives' " +
                 "clause names, so it takes no bound — a field's type is asked what it can do with " +
                 "'if const f::Type: Trait'")
+        skip_line(p)
+        return None
+    end if
+
+    var own = no_type_params()
+
+    if p.at_kw("[") then own = parse_type_params(p)
+
+    if holds_derive(own.names, param)
+        p.fault(start, s"'$param' stands for the type that derives the trait, so the member's own " +
+                "type parameters take other names")
         skip_line(p)
         return None
     end if
@@ -904,6 +919,13 @@ private parse_derive_member(p: *Parser) -> Option[DeriveDecl]
 
     if p.accept_kw("->") then decl.ret_type = Some(parse_result_type(p))
 
+    own = parse_where_on(p, own)
+    decl.tparams = own.names
+    decl.bounds = own.bounds
+    decl.tdefaults = own.defaults
+    decl.tvalues = own.values
+    decl.tpacks = own.packs
+
     if !p.at_kw("=") && !p.block_ahead()
         p.fault(p.here(), s"a 'derive' member is the body the trait writes for '$name', so it has one")
         return None
@@ -915,6 +937,29 @@ private parse_derive_member(p: *Parser) -> Option[DeriveDecl]
     decl.named_at = decl.span
     Some(DeriveDecl(param, decl))
 end parse_derive_member
+
+// Where the bracket after `derive` held more than the deriving type, the rest were meant as the
+// member's own, and the refusal says where they go: `derive[T, E: Encoder] encode` is
+// `derive[T] encode[E: Encoder]`.
+private own_params_hint(tp: TypeParams, name: string) -> string
+    if tp.names.len() < 2 then return ""
+
+    var rest = ""
+
+    for i in 1..<tp.names.len()
+        val own = tp.names.at(i)
+        var shown = own
+        var sep = ": "
+
+        for b in bound_names(tp.bounds, own)
+            shown = shown + sep + b
+            sep = " + "
+
+        rest = if i == 1 then shown else rest + ", " + shown
+
+    s"; a member's own type parameters follow its name, as in 'derive[${tp.names.at(0)}] " +
+        s"$name[$rest](self: ${tp.names.at(0)}, …)'"
+end own_params_hint
 
 // `self: T`, `self: *T`, `self: &T` -- the receiver the deriving type is taken by, or nothing where
 // the list does not open that way.
@@ -980,8 +1025,53 @@ private check_derive_members(p: *Parser, decl: TraitDecl)
         else if tm.params.len() != m.params.len()
             p.fault(m.span, s"'derive' member '${m.name}' takes ${m.params.len()} parameters after " +
                     s"'self', but trait '${decl.name}' declares ${tm.params.len()}")
+        else if tm.tparams.len() != m.tparams.len()
+            p.fault(m.span, s"'derive' member '${m.name}' declares ${m.tparams.len()} type " +
+                    s"parameters of its own, but the '${m.name}' trait '${decl.name}' declares " +
+                    s"${tm.tparams.len()} — write them after the name, as the trait does")
+        else
+            check_derive_bounds(p, decl.name, tm, m)
         end if
 end check_derive_members
+
+// A `derive` member's own type parameters are bounded exactly as the trait's member bounds them,
+// position by position and whatever each is called: the copy is that member's body, so a missing
+// bound would leave the body unable to ask for what the trait promised every caller, and an extra one
+// would ask a caller for what the trait never required.
+private check_derive_bounds(p: *Parser, trait_name: string, tm: MethodDecl, m: MethodDecl)
+    for i in 0..<tm.tparams.len()
+        val want = bound_names(tm.bounds, tm.tparams.at(i))
+        val got = bound_names(m.bounds, m.tparams.at(i))
+        val own = m.tparams.at(i)
+
+        for b in want
+            if !holds_derive(got, b)
+                p.fault(m.span, s"'derive' member '${m.name}' leaves '$own' without the bound '$b' " +
+                        s"trait '$trait_name' declares for its '${m.name}' — write '$own: $b'")
+                return
+            end if
+
+        for b in got
+            if !holds_derive(want, b)
+                p.fault(m.span, s"'derive' member '${m.name}' bounds '$own' by '$b', which trait " +
+                        s"'$trait_name' does not declare for its '${m.name}' — the derived body is " +
+                        "that member's, so it asks for what the member does and no more")
+                return
+            end if
+end check_derive_bounds
+
+// The names of the bounds a parameter carries, from the brackets and any `where` alike.
+private bound_names(bounds: Buf[NamedBounds], param: string) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for nb in bounds
+        if nb.name != param then continue
+
+        for b in nb.bounds
+            out.push(b.name)
+
+    out
+end bound_names
 
 private holds_derive(seen: Buf[string], name: string) -> bool
     for item in seen
