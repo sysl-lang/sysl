@@ -1,0 +1,537 @@
+module sh.sysl.compiler
+@tests
+
+// `?` converting through a GENERIC `From` block (`reference/errors.md § A ? converts through From`).
+// A block written for a generic type (`impl[E] From[E] for Wrap[E]`) is a conversion for every
+// instantiation at once, so a `?` into `Wrap[string]` finds it exactly as `Wrap[string].from(x)`
+// does: made real at the destination's own arguments, its condition asked, its signature compared.
+//
+// The axes: the source (a type argument of the destination, a fixed type, an associated type, a
+// type parameter of a generic function), the number of blocks that take it (none, one, two), the
+// block's condition (holding, failing), the destination (generic, one parameter or two; plain, from
+// a generic instance), the module the block is in, and a payload whose count a destructor checks.
+// Skipped: a `.syslib` crossing (a block's members are made real per receiver wherever the receiver
+// is, which `tests_azb_imported_bound` covers for conditional blocks) and bare metal (the conversion
+// is an ordinary call, nothing the target changes).
+
+private val azb_gfr_wrap: string = raw"""
+    enum Wrap[E]
+        Io(cause: E)
+        Short
+
+    impl[E] From[E] for Wrap[E]
+        from(e: E) -> Wrap[E] = Wrap.Io(e)
+
+    step(fail: bool) -> Result[int, string] = if fail then Err("disk") else Ok(1)
+
+    show(r: Result[int, Wrap[string]]) -> string = r match
+        Ok(n) -> s"ok $n"
+        Err(Wrap.Io(c)) -> s"io $c"
+        Err(Wrap.Short) -> "short"
+
+    """
+
+@test("a '?' converts through a generic block whose source is the destination's own argument")
+azb_gfr_source_is_the_argument()
+    if !azb_ready() then return
+
+    azb_prints(azb_main(azb_gfr_wrap + raw"""
+        outer(fail: bool) -> Result[int, Wrap[string]]
+            val n = step(fail)?
+
+            Ok(n + 1)
+
+        print(show(outer(false)), show(outer(true)))
+        """), "ok 2 io disk\n")
+
+@test("a generic block for a fixed source sits beside it, and the source picks the block")
+azb_gfr_the_source_picks_the_block()
+    if !azb_ready() then return
+
+    azb_prints(azb_main(azb_gfr_wrap + raw"""
+        impl[E] From[int] for Wrap[E]
+            from(e: int) -> Wrap[E] = Wrap.Short
+
+        count(fail: bool) -> Result[int, int] = if fail then Err(7) else Ok(2)
+
+        by_text(fail: bool) -> Result[int, Wrap[string]]
+            val n = step(fail)?
+
+            Ok(n)
+
+        by_count(fail: bool) -> Result[int, Wrap[string]]
+            val n = count(fail)?
+
+            Ok(n)
+
+        print(show(by_text(true)), show(by_count(true)), show(by_count(false)))
+        """), "io disk short ok 2\n")
+
+// The reported case: a store's own error, named off the bound, wrapped in the caller's generic one.
+@test("an associated type is the source, read off a bound")
+azb_gfr_an_associated_type_source()
+    if !azb_ready() then return
+
+    azb_prints(azb_main(raw"""
+        import sysl.io.{Positioned, ReadAt, read_exact_at}
+
+        enum Wrap[E]
+            Io(cause: E)
+            Short
+
+        impl[E] From[E] for Wrap[E]
+            from(e: E) -> Wrap[E] = Wrap.Io(e)
+
+        enum Bad
+            Gone
+
+        struct Broken
+            at: u64
+
+        impl Positioned for Broken
+            type Error = Bad
+
+            extent(*self) -> Result[u64, Bad] = Ok(100)
+
+        impl ReadAt for Broken
+            read_at(*self, offset: u64, into: []u8) -> Result[[]const u8, Bad]
+                if offset >= self.at then return Err(Bad.Gone)
+
+                for i in 0..<into.len
+                    into[i] = 9
+
+                Ok(into)
+
+        load[S: ReadAt](s: *S, offset: u64) -> Result[int, Wrap[S::Error]]
+            var room: [4]u8 = [0; 4]
+            val got = read_exact_at(s, offset, room[..])?
+
+            Ok(int(got[0]) + int(got.len))
+
+        var b = Broken(10)
+
+        print(load(&b, 0) match
+            Ok(n) -> s"ok $n"
+            Err(Wrap.Io(Bad.Gone)) -> "gone"
+            Err(Wrap.Short) -> "short")
+        print(load(&b, 20) match
+            Ok(n) -> s"ok $n"
+            Err(Wrap.Io(Bad.Gone)) -> "gone"
+            Err(Wrap.Short) -> "short")
+        """), "ok 13\ngone\n")
+
+@test("a type parameter is the source, and each instantiation finds its own conversion")
+azb_gfr_a_type_parameter_source()
+    if !azb_ready() then return
+
+    azb_prints(azb_main(azb_gfr_wrap + raw"""
+        lift[E](r: Result[int, E]) -> Result[int, Wrap[E]]
+            val n = r?
+
+            Ok(n * 3)
+
+        flag(fail: bool) -> Result[int, bool] = if fail then Err(true) else Ok(2)
+
+        print(lift(flag(false)) match
+            Ok(n) -> s"ok $n"
+            Err(Wrap.Io(b)) -> s"io $b"
+            Err(Wrap.Short) -> "short")
+        print(lift(flag(true)) match
+            Ok(n) -> s"ok $n"
+            Err(Wrap.Io(b)) -> s"io $b"
+            Err(Wrap.Short) -> "short")
+        print(show(lift(step(true))))
+        """), "ok 6\nio true\nio disk\n")
+
+@test("a '?' between two instantiations of one generic type makes no conversion")
+azb_gfr_the_same_type_is_no_conversion()
+    if !azb_ready() then return
+
+    azb_prints(azb_main(azb_gfr_wrap + raw"""
+        outer(fail: bool) -> Result[int, Wrap[string]]
+            val n = step(fail)?
+
+            Ok(n)
+
+        again(fail: bool) -> Result[int, Wrap[string]]
+            val n = outer(fail)?
+
+            Ok(n + 10)
+
+        print(show(again(false)), show(again(true)))
+        """), "ok 11 io disk\n")
+
+@test("an Option's '?' beside a generic block is unaffected")
+azb_gfr_an_option_is_unaffected()
+    if !azb_ready() then return
+
+    azb_prints(azb_main(azb_gfr_wrap + raw"""
+        first[E](o: Option[E]) -> Option[Wrap[E]]
+            val e = o?
+
+            Some(Wrap.from(e))
+
+        nothing() -> Option[string] = None
+
+        print(first(Some("a")).is_some(), first(nothing()).is_some())
+        """), "true false\n")
+
+@test("a plain destination converts from an instance of a generic type")
+azb_gfr_a_plain_destination()
+    if !azb_ready() then return
+
+    azb_prints(azb_main(azb_gfr_wrap + raw"""
+        enum Plain
+            Lifted(why: string)
+            Other
+
+        impl From[Wrap[string]] for Plain
+            from(w: Wrap[string]) -> Plain = w match
+                Wrap.Io(c) -> Plain.Lifted(c)
+                Wrap.Short -> Plain.Other
+
+        outer(fail: bool) -> Result[int, Wrap[string]]
+            val n = step(fail)?
+
+            Ok(n)
+
+        top(fail: bool) -> Result[int, Plain]
+            val n = outer(fail)?
+
+            Ok(n)
+
+        print(top(true) match
+            Err(Plain.Lifted(c)) -> c
+            _ -> "other")
+        """), "disk\n")
+
+@test("a generic block written in another module converts across it")
+azb_gfr_a_block_in_another_module()
+    if !azb_ready() then return
+
+    azb_prints([("", "main.sysl", raw"""
+        import errs.Wrap
+
+        step() -> Result[int, string] = Err("far")
+
+        outer() -> Result[int, Wrap[string]]
+            val n = step()?
+
+            Ok(n)
+
+        print(outer() match
+            Ok(_) -> "ok"
+            Err(Wrap.Io(c)) -> c
+            Err(Wrap.Short) -> "short")
+        """), ("errs", "e.sysl", raw"""
+        module errs
+
+        enum Wrap[E]
+            Io(cause: E)
+            Short
+
+        impl[E] From[E] for Wrap[E]
+            from(e: E) -> Wrap[E] = Wrap.Io(e)
+        """)], "far\n")
+
+// A conversion made real inside a generic block hands its payload on; the destructor counting
+// releases is what tells a right count from one that merely runs.
+@test("a counted payload converted through a generic block is released exactly once")
+azb_gfr_a_counted_payload()
+    if !azb_ready() then return
+
+    azb_prints(azb_main(raw"""
+        static var dropped: int = 0
+
+        struct Note
+            text: string
+
+        impl Drop for Note
+            drop(self)
+                dropped += 1
+
+        enum Wrap[E]
+            Io(cause: E)
+            Short
+
+        impl[E] From[E] for Wrap[E]
+            from(e: E) -> Wrap[E] = Wrap.Io(e)
+
+        deep() -> Result[int, &Note] = Err(Note("boom"))
+
+        shallow() -> Result[int, Wrap[&Note]]
+            val n = deep()?
+
+            Ok(n)
+
+        run()
+            for i in 0..<5
+                shallow() match
+                    Err(Wrap.Io(n)) -> print(n.text)
+                    _ -> print("other")
+
+        run()
+        print(dropped)
+        """), "boom\nboom\nboom\nboom\nboom\n5\n")
+
+// The block whose condition fails is still read to see whether it would take the source, and that
+// reading is thrown away: its body, which calls what the condition guards, is never analyzed.
+@test("a conditional block whose condition fails is read and put back, leaving no body behind")
+azb_gfr_a_failing_condition_leaves_no_body()
+    if !azb_ready() then return
+
+    azb_prints(azb_main(raw"""
+        trait Loud
+            shout(self) -> string
+
+        enum Wrap[E]
+            Io(cause: string)
+            Short
+
+        impl[E: Loud] From[E] for Wrap[E]
+            from(e: E) -> Wrap[E] = Wrap.Io(e.shout())
+
+        impl[E] From[int] for Wrap[E]
+            from(e: int) -> Wrap[E] = Wrap.Short
+
+        count() -> Result[int, int] = Err(4)
+
+        outer() -> Result[int, Wrap[string]]
+            val n = count()?
+
+            Ok(n)
+
+        print(outer() match
+            Err(Wrap.Short) -> "short"
+            _ -> "other")
+        """), "short\n")
+
+// The written call has the same two questions. Its candidates are weighed by making each real, and
+// that was kept: the conditional block's body was analyzed at `string` and refused inside the block.
+// And a second block's condition was looked up by the FIRST block's, since `from.2` was compared
+// whole against each block's name-plus-suffix.
+private val azb_gfr_two_kinds: string = raw"""
+    trait Loud
+        shout(self) -> string
+
+    impl Loud for bool
+        shout(self) -> string = "BOOL"
+
+    enum Wrap[E]
+        Io(cause: string)
+        Short
+
+    impl[E] From[int] for Wrap[E]
+        from(e: int) -> Wrap[E] = Wrap.Short
+
+    impl[E: Loud] From[E] for Wrap[E]
+        from(e: E) -> Wrap[E] = Wrap.Io(e.shout())
+
+    show[E](w: Wrap[E]) -> string = w match
+        Wrap.Short -> "short"
+        Wrap.Io(c) -> c
+
+    """
+
+@test("a written call weighs a conditional block without keeping its body, whichever block is second")
+azb_gfr_a_written_call_weighs_without_keeping()
+    if !azb_ready() then return
+
+    azb_prints(azb_main(azb_gfr_two_kinds +
+                        "print(show(Wrap[string].from(4)), show(Wrap[bool].from(true)), " +
+                        "show(Wrap[bool].from(5)))\n"), "short BOOL short\n")
+
+@test("and a written call the condition refuses names the member without its suffix")
+azb_gfr_a_written_call_refused_by_the_condition()
+    if !azb_ready() then return
+
+    azb_refused_without(azb_main(azb_gfr_two_kinds + "print(show(Wrap[string].from(\"x\")))\n"),
+                        ["'from' is a member the 'impl' of 'sysl.From' gives 'Wrap[string]' only " +
+                         "where its condition holds, and it asks 'Loud' of string"],
+                        ["from.2", "has no method 'shout'"])
+
+// -- what is refused ------------------------------------------------------------------------------
+
+@test("a block whose condition the source fails is refused, and the condition is what is told")
+azb_gfr_a_failing_condition_is_told()
+    if !azb_ready() then return
+
+    azb_refused(azb_main(raw"""
+        trait Loud
+            shout(self) -> string
+
+        impl Loud for int
+            shout(self) -> string = "INT"
+
+        enum Wrap[E]
+            Io(cause: E)
+            Short
+
+        impl[E: Loud] From[E] for Wrap[E]
+            from(e: E) -> Wrap[E] = Wrap.Io(e)
+
+        num() -> Result[int, int] = Err(3)
+        step() -> Result[int, string] = Err("disk")
+
+        good() -> Result[int, Wrap[int]]
+            val n = num()?
+
+            Ok(n)
+
+        bad() -> Result[int, Wrap[string]]
+            val n = step()?
+
+            Ok(n)
+
+        print(good().is_err(), bad().is_err())
+        """), ["'?' propagates a string error into Wrap[string], and the 'From' block that would " +
+               "convert it holds only where its condition does — it asks 'Loud' of string, which " +
+               "does not implement it"])
+
+@test("two generic blocks that both take the source are an ambiguity, told at the '?'")
+azb_gfr_two_blocks_are_ambiguous()
+    if !azb_ready() then return
+
+    azb_refused(azb_main(raw"""
+        enum Wrap[E]
+            Io(cause: E)
+            Text(s: string)
+
+        impl[E] From[E] for Wrap[E]
+            from(e: E) -> Wrap[E] = Wrap.Io(e)
+
+        impl[E] From[string] for Wrap[E]
+            from(s: string) -> Wrap[E] = Wrap.Text(s)
+
+        step() -> Result[int, string] = Err("disk")
+
+        fine() -> Result[int, Wrap[int]]
+            val n = step()?
+
+            Ok(n)
+
+        both() -> Result[int, Wrap[string]]
+            val n = step()?
+
+            Ok(n)
+
+        print(fine().is_err(), both().is_err())
+        """), ["'?' propagates a string error into Wrap[string], and 2 'From' blocks for " +
+               "Wrap[string] take a string — convert it explicitly with '.map_err(...)' before the '?'"])
+
+@test("with no block, a generic destination is told the generic block to write")
+azb_gfr_the_refusal_names_a_generic_block()
+    if !azb_ready() then return
+
+    azb_refused(azb_main(raw"""
+        enum Wrap[E]
+            Io(cause: E)
+            Short
+
+        step() -> Result[int, string] = Err("disk")
+
+        outer() -> Result[int, Wrap[string]]
+            val n = step()?
+
+            Ok(n)
+
+        print(outer().is_err())
+        """), ["so 'impl[E] From[E] for Wrap[E]' is what joins the two layers"])
+
+@test("a source that is none of the arguments is spelled as itself, and two parameters both appear")
+azb_gfr_the_refusal_spells_other_sources()
+    if !azb_ready() then return
+
+    azb_refused_without(azb_main(raw"""
+        enum Wrap[E]
+            Io(cause: E)
+            Short
+
+        enum Pair[A, B]
+            One(a: A)
+            Two(b: B)
+
+        step() -> Result[int, string] = Err("disk")
+        flag() -> Result[int, bool] = Err(true)
+
+        other() -> Result[int, Wrap[string]]
+            val n = flag()?
+
+            Ok(n)
+
+        second() -> Result[int, Pair[int, string]]
+            val n = step()?
+
+            Ok(n)
+
+        print(other().is_err(), second().is_err())
+        """), ["so 'impl[E] From[bool] for Wrap[E]' is what joins",
+               "so 'impl[A, B] From[B] for Pair[A, B]' is what joins"],
+              ["impl From[bool] for Wrap[string]", "for Pair[int, string]'"])
+
+// The suggestion is only worth giving if it is a block the compiler takes.
+@test("the block the refusal names is one that builds, and then the '?' converts")
+azb_gfr_the_named_block_builds()
+    if !azb_ready() then return
+
+    azb_prints(azb_main(raw"""
+        enum Wrap[E]
+            Io(cause: E)
+            Flag(b: bool)
+
+        impl[E] From[bool] for Wrap[E]
+            from(b: bool) -> Wrap[E] = Wrap.Flag(b)
+
+        flag() -> Result[int, bool] = Err(true)
+
+        other() -> Result[int, Wrap[string]]
+            val n = flag()?
+
+            Ok(n)
+
+        print(other() match
+            Err(Wrap.Flag(b)) -> s"flag $b"
+            _ -> "other")
+        """), "flag true\n")
+
+@test("inside a generic function with no block, the instantiation's '?' is refused")
+azb_gfr_a_generic_function_with_no_block()
+    if !azb_ready() then return
+
+    azb_refused(azb_main(raw"""
+        enum Wrap[E]
+            Io(cause: E)
+            Short
+
+        step() -> Result[int, string] = Err("disk")
+
+        lift[E](r: Result[int, E]) -> Result[int, Wrap[E]]
+            val n = r?
+
+            Ok(n)
+
+        print(lift(step()).is_err())
+        """), ["'?' propagates a string error, but this function returns Wrap[string]",
+               "'impl[E] From[E] for Wrap[E]'"])
+
+@test("a plain destination with no block is still told the plain block")
+azb_gfr_a_plain_destination_with_no_block()
+    if !azb_ready() then return
+
+    azb_refused(azb_main(raw"""
+        enum Wrap[E]
+            Io(cause: E)
+            Short
+
+        enum Plain
+            Lifted
+
+        deep() -> Result[int, Wrap[int]] = Err(Wrap.Short)
+
+        top() -> Result[int, Plain]
+            val n = deep()?
+
+            Ok(n)
+
+        print(top().is_err())
+        """), ["so 'impl From[Wrap[int]] for Plain' is what joins the two layers"])
