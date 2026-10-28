@@ -1931,6 +1931,32 @@ A `*T` to a local, a field of a captured `&T` and a captured `Buf` reach shared 
 way. A closure that reads back what it wrote, with the variable outside left alone, keeps its state
 and is accepted: a closure whose body is `n += 1` followed by `n` is a counter of its own.
 
+**A `*self` method called on the copy is a write to it**, exactly as an assignment is: the method is
+handed the copy's address to write through. That holds for a captured struct, a field of one, an
+element of a captured array, and the first link of a chain such as `c.a().bump()`, and it is asked
+the same two questions. A `(self)` or `&self` call only reads, and a `*self` call on a captured `&T`
+or `*T` reaches the shared storage.
+
+```sysl
+struct Counter
+    n: int
+
+    bump(*self) = self.n += 1
+
+call(f: &Fn() -> unit) = f()
+
+var c = Counter(0)
+call(() -> c.bump())
+```
+
+```error
+a closure captures by value, so it holds a copy of 'c' — so 'bump', which takes '*self', would reach that copy rather than the variable it came from, and nothing in the closure reads it back
+```
+
+A call answering a value hands back what it read of the copy, so `() -> it.next()` reads its copy
+back and is a generator of its own. A closure that writes its copy this way can no longer be held in
+a `val`, for the reason a counting closure cannot: calling it writes its environment.
+
 ### `_` — a parameter with the name left out
 
 A bare `_` in operand position is a closure parameter, and the closure it builds closes at the
