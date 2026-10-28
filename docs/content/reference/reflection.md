@@ -251,6 +251,54 @@ print(p.x, p.y)
 0 0
 ```
 
+**It stands before `.` the way an alias does**, so an associated function is called through it —
+a trait's, reached through the field's type, or one the type declares itself. `c::Payload` does
+the same for a variant's payload:
+
+```sysl
+trait Make
+    make(n: int) -> Self
+
+impl Make for int
+    make(n: int) -> int = n * 10
+
+impl Make for string
+    make(n: int) -> string = s"#$n"
+
+struct Row
+    id: int
+    label: string
+
+for const f in Row::Fields
+    print(f.name, f::Type.make(4))
+```
+
+```output
+id 40
+label #4
+```
+
+Each copy asks its own field's type, so a type without the member is refused in that copy alone:
+
+```sysl
+trait Make
+    make(n: int) -> Self
+
+impl Make for int
+    make(n: int) -> int = n
+
+struct Row
+    id: int
+    on: bool
+
+for const f in Row::Fields
+    print(f::Type.make(4))
+```
+
+```error
+bool has no associated function 'make' (in the copy for field 'Row.on')
+```
+
 **A value is built with `var out: T` and one assignment per field.** Like any `var`, `out` starts at
 the type's zero value, so an unassigned field keeps its zero; a type with no zero value is refused at
 the `var`.

@@ -345,7 +345,9 @@ field_out_of_reach(cx: &Analyzer, base: string, field: string) -> string =
 // can do least with. Each arm below names the member instead and says where it is reached from.
 private type_member(cx: &Analyzer, span: Span, receiver: Expr, name: string,
                     expected: Option[Type]) -> Option[TExpr]
-    val written = dotted_name_written(cx, receiver)
+    val written = dotted_name_written(cx, receiver) match
+        Some(w) -> Some(w)
+        None -> descriptor_projection_written(cx, receiver)
 
     if written.is_none() then return None
 
@@ -884,9 +886,27 @@ dotted_name_written(cx: &Analyzer, e: Expr) -> Option[string] = *e.kind match
 // reading that asks which type the receiver names (a generic one's inferred instantiation, a generic
 // enum's variant) accepts both spellings alike; reading only the bare one sent the qualified call on
 // to the receiver's value reading, which reported the module as an undefined name.
+//
+// **`f::Type` and `c::Payload` in a reflection walk name a type the way an alias does**: the copy
+// bound that very spelling to the field's or payload's type (`descriptor_bindings`), so
+// `f::Type.make(2)` reaches the associated function `I.make(2)` does over `type I = int`.
 written_type_name(cx: &Analyzer, receiver: Expr) -> Option[string] = *receiver.kind match
     Ident(n) -> if cx.lookup(n).is_none() then Some(n) else None
     Field(_, _, _) -> dotted_name_written(cx, receiver)
+    TypeAttr(_, _, _, _) -> descriptor_projection_written(cx, receiver)
+    _ -> None
+
+// `f::Type` or `c::Payload`, spelled as the copy bound it, where the left side is a descriptor this
+// copy stands at and the attribute is the one it answers with a type.
+descriptor_projection_written(cx: &Analyzer, e: Expr) -> Option[string] = *e.kind match
+    TypeAttr(inner, attr, _, _) -> *inner.kind match
+        Ident(n) ->
+            if descriptor_bound(cx.subst, n).is_none() then return None
+
+            val spelled = s"$n::$attr"
+
+            if bound_type(cx.subst, spelled).is_some() then Some(spelled) else None
+        _ -> None
     _ -> None
 
 // Whether the reader's own module declares storage of this spelling the reader may reach -- this
