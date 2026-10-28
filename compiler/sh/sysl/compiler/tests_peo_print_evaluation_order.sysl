@@ -65,7 +65,8 @@ private peo_prints(text: string, want: string)
     assert(alloc_count_reported(run.err) == 0)
 end peo_prints
 
-// The program stopped with `state` (a trap is `Signalled(5)`), having printed exactly `want`.
+// The program stopped with `state` (a trap is `Signalled(5)`), having printed exactly `want` -- and,
+// for a panic, its own `panic:` line after that.
 private peo_stops(text: string, state: Status, want: string)
     if !peo_ready() then return
 
@@ -73,6 +74,9 @@ private peo_stops(text: string, state: Status, want: string)
 
     assert(run.built, run.out)
     assert(run.state == state, s"stopped with ${run.state}, having printed '${run.out}'")
+
+    if run.out.starts_with(want) && run.out[want.bytes.len..].starts_with("panic: ") then return
+
     assert_eq(run.out, want)
 end peo_stops
 
@@ -247,6 +251,16 @@ peo_freestanding()
 
     remove_dir_all(dir).unwrap_or(())
     assert(!text.starts_with("did not compile"), text)
-    assert(text.contains("putchar"), text)
-    assert(!text.contains("malloc"), text)
+
+    // Both calls come before the first write, and nothing in between allocates.
+    val start = text.index_of("define dso_local void @both(").unwrap()
+    val rest = text[start..]
+    val body = rest.index_of("\n}\n") match
+        Some(end_at) -> rest[0..<end_at]
+        None -> rest
+    val first_write = body.index_of("@sysl$printi").unwrap()
+
+    assert(body[0..<first_write].contains("@tick("), body)
+    assert(!body[first_write..].contains("@tick("), body)
+    assert(!body.contains("malloc") && !body.contains("retain"), body)
 end peo_freestanding
