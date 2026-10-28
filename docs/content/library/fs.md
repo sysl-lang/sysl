@@ -636,6 +636,56 @@ outlive the mapping, so a view cannot be read after the unmap.
 the pages past the new end have nothing behind them, and the operating system answers a read of one
 with a signal. A program mapping a file somebody else may truncate reads it instead.
 
+### Advising the system about a mapping
+
+```sysl
+enum Advice
+    Normal
+    Random
+    Sequential
+    WillNeed
+    DontNeed
+
+struct Mapped
+    advise(self, advice: Advice, from: usize = 0, len: usize = usize::Max) -> Result[unit, IoError]
+
+page_size() -> usize
+```
+
+A program reading a huge file through once can tell the system it is done with the part behind it:
+`m.advise(Advice.DontNeed, 0, done)`. `from` is rounded down to a page boundary (`page_size()`) and
+the end up, `len` left out means to the end of the mapping, and a range past the end is
+`Other(22)` (`EINVAL`). An empty mapping or an empty range does nothing and answers `Ok`. The advice
+never changes what `bytes()` reads: a dropped page is read back from the file if touched again.
+
+```sysl
+import sysl.fs.{map_file, write_text, remove_file, Advice, page_size}
+
+val path = "/tmp/sysl-fs-doc-advise.txt"
+
+write_text(path, "advised, not changed").unwrap()
+
+val m = map_file(path).unwrap()
+
+for a in [Advice.Sequential, Advice.WillNeed, Advice.DontNeed]
+    m.advise(a, 3, 5).unwrap()
+
+print(m.advise(Advice.Normal, 0, m.len() + 1).is_err(), page_size() >= 512)
+print(m.bytes()[0..<7].len, m.bytes()[0])
+remove_file(path).unwrap()
+```
+
+```output
+true true
+7 97
+```
+
+**It is a hint**, and what the system does with it is its own. On Linux `DontNeed` drops a file
+mapping's pages, which keeps the resident size small through a long scan; **macOS ignores it for a
+file mapping**, so the call succeeds and the pages stay. On a freestanding target a program that calls
+`advise` supplies `sysl_fs_advise` (a build that calls it without is refused, naming it), and
+`sysl_fs_page_size` if its pages are not 4096 bytes.
+
 ## The path tier
 
 ```sysl
@@ -1175,7 +1225,7 @@ way to get atomicity from a filesystem.
 ## Answering the filesystem on a freestanding target
 
 **Everything above reaches the filesystem through `sysl.fs.sys` and through nothing else**: one
-`extern` per call — `sysl_fs_open`, `_read`, `_write`, `_pread`, `_pwrite`, `_sync`, `_close`, `_seek`, `_fstat`, `_ftruncate`, `_map`, `_unmap`,
+`extern` per call — `sysl_fs_open`, `_read`, `_write`, `_pread`, `_pwrite`, `_sync`, `_close`, `_seek`, `_fstat`, `_ftruncate`, `_map`, `_unmap`, `_advise` and `_page_size` (the last two asked only by a program that advises a mapping; `_page_size` answers `usize`, zero meaning 4096),
 `_stat`, `_truncate`, `_mkdir`, `_rmdir`, `_unlink`, `_rename`, `_access`, `_chmod`, `_chown`, `_opendir`,
 `_readdir`, `_closedir`, `_getcwd`, `_chdir`, `_temp_dir`, `_symlink`, `_link`, `_readlink` and
 `_realpath`. Each answers an `int` by the contract every `*.sys` module has

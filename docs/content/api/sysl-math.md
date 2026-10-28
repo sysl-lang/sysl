@@ -576,6 +576,11 @@ trait Float: Zero + One + Eq + Ord + Neg + Add + Sub + Mul + Div
     ceil(self) -> Self
     round(self) -> Self
     trunc(self) -> Self
+    round_even(self) -> Self
+    nearbyint(self) -> Self
+    rint(self) -> Self
+    max_num(self, other: Self) -> Self
+    min_num(self, other: Self) -> Self
     fmod(self, divisor: Self) -> Self
     abs(self) -> Self
     copysign(self, sign: Self) -> Self
@@ -611,7 +616,7 @@ editing call sites. `02` allows an `impl` for a built-in precisely so a library 
 mathematics is.** A method whose result C computes -- a range-reduced sine, a correctly rounded
 root -- is required, and each width binds it to its own libm entry point. A method that is
 arithmetic over the others is a default, written once and inherited by both. So `log` in an
-arbitrary base exists in exactly one place, and adding a third floating-point width would be 38
+arbitrary base exists in exactly one place, and adding a third floating-point width would be 41
 bindings and no new mathematics.
 
 **The constants are members too, and they are how the defaults get to be defaults.** A signum
@@ -655,6 +660,11 @@ conversions, whose factor is pi over 180.
 | `ceil` | `ceil(self) -> Self` |  |
 | `round` | `round(self) -> Self` |  |
 | `trunc` | `trunc(self) -> Self` |  |
+| `round_even` | `round_even(self) -> Self` | The nearest integral value, a half going to the even neighbour (`2.5` is `2`, `3.5` is `4`, `-0.5` is `-0`), in any rounding mode and without raising inexact. |
+| `nearbyint` | `nearbyint(self) -> Self` | The nearest integral value **in the rounding mode in force** (`sysl.fenv`), which is what C's `nearbyint` and `rint` are and what an Arm `vrintr` and `vrintx` compute. |
+| `rint` | `rint(self) -> Self` |  |
+| `max_num` | `max_num(self, other: Self) -> Self` | The larger and the smaller of two, IEEE 754-2008's maxNum and minNum: **a NaN loses to a number**, so `nan.max_num(1.0)` and `1.0.max_num(nan)` are both `1.0`, and only two NaNs answer a NaN. |
+| `min_num` | `min_num(self, other: Self) -> Self` |  |
 | `fmod` | `fmod(self, divisor: Self) -> Self` | The remainder of a division that truncates, keeping the sign of the receiver. |
 | `abs` | `abs(self) -> Self` | Sign, taken two ways because the two answer differently at the edges. |
 | `copysign` | `copysign(self, sign: Self) -> Self` |  |

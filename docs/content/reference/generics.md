@@ -413,6 +413,28 @@ e match
 none
 ```
 
+**An argument is read against what its parameter already knows.** `Ok(1)` alone says nothing of its
+error type, but at a parameter written `Result[T, Fault]` the `Fault` is fixed by the declaration, so
+the variant takes it and its value settles `T`. The same holds for a closure's result where the
+parameter states one:
+
+```sysl
+enum Fault
+    Bad
+
+keep[T](r: Result[T, Fault]) -> Result[T, Fault] = r
+run[T](f: () -> Result[T, Fault]) -> Result[T, Fault] = f()
+
+print(keep(Ok(1)).unwrap(), run(() -> Ok("two")).unwrap())
+```
+
+```output
+1 two
+```
+
+A parameter that leaves the variant's other half open as well (`both[T, F](r: Result[T, F])` called
+as `both(Ok(1))`) is still refused.
+
 The model is **unification**: each parameter is solved by matching the declared parameter and return
 types against the actual argument types and the expected type. A parameter left undetermined by
 **both** directions is a compile error asking for an annotation on the binding. There is no silent
@@ -2208,6 +2230,54 @@ an 'if const' is decided while compiling, so its condition has to be known then
 
 A generic body is also checked once before any instance, for what does not depend on its parameters.
 That check reads neither arm of an `if const`; each instance reads the arm it takes.
+
+### Every constant position reads the same expressions
+
+**What a `const` function's body can compute, every place a constant is read accepts**: a value
+argument, an `if const`, a `const` and an array's length. That includes an enum's variant and a
+comparison of two, `T::Make(c, p)` in a `for const` copy, and a field of a struct literal, so a
+table of handlers can be built from a walk over an enum's variants:
+
+```sysl
+enum Op
+    Add
+    Sub
+
+apply[const o: Op](x: int) -> int = if const o == Op.Add then x + 1 else x - 1
+
+for const c in Op::Variants
+    print(c.name, apply[Op::Make(c, ())](10))
+
+const Differ = Op.Add != Op.Sub
+
+var lanes: [if Op.Add == Op.Sub then 2 else 3]int = [1, 2, 3]
+
+print(Differ, lanes.len)
+```
+
+```output
+Add 11
+Sub 9
+true 3
+```
+
+**A condition that does not type is refused for that**, not as a test made while the program runs. A
+`for const` variable over a range is a `usize`, and a function's parameter takes what any call to it
+takes, so a `uint` parameter wants it converted, `fast(uint(k))`, as it would anywhere else. (A value
+parameter is the one place an integer of any width is read at its declared type, fit-checked by its
+value: `H[k]` over a `const N: uint` is accepted.)
+
+```sysl
+const fast(x: uint) -> bool = x > 1
+
+for const k in 0..<3
+    if const fast(k)
+        print(k)
+```
+
+```error
+'x' of 'fast' is uint, but usize was given
+```
 
 ### What it is for: the catalog covers every tuple
 

@@ -1,14 +1,17 @@
 module sh.sysl.compiler
 @tests
 
-import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.buf.buf
+import sysl.fs.{is_file, make_dir_all, make_temp_dir, remove_dir_all, write_text}
 import sysl.process.capture
-import sysl.text.Search
+import sysl.testing.skip
+import sysl.text.{Search, split}
 
 // The reference's `UnitErrorTests`: `unit` is the language's zero-sized type
 // (`reference/types.md § unit and never`), so a field, a parameter, a type argument or a binding of
 // it is legal and costs nothing -- the field is skipped, the parameter is dropped from the emitted
-// signature, the binding is not a slot -- while `&unit`, `*unit`, a slice or an array of it, and the
+// signature, the binding is not a slot -- and so is a `*unit`, a `&unit` or a `weak unit`, whose
+// address is non-null and whose loads and stores touch nothing; a slice or an array of it, and the
 // operations that would have to invent a value (`str`, `==`, a variadic tail) stay refused. `never`
 // is untouched throughout: it has no values at all, so it stands only as a result.
 //
@@ -286,17 +289,125 @@ uer_into_a_generic_payload() =
 uer_effects_in_order() =
     uer_prints("f(a: unit, n: int, b: unit) -> int = n\nprint(f(print(1), 2, print(3)))", "1\n3\n2\n")
 
-// -- what is still refused, and not because of a layout ----------------------------------------------
+// -- an address of nothing: what Rust gives a zero-sized type ----------------------------------------
+//
+// A generic that compiles for every `T` compiles at `unit` too, so a `*T` taken of a `T` binding has
+// to exist there. Its address is non-null and aligned (a `unit` binding has no slot, so it is the
+// address 1; a `unit` field's is its place in the struct), a load through it is `()` and a store
+// writes nothing -- each still evaluating the pointer, and the stored value, for their effects.
 
-@test("a reference or a pointer to nothing")
-uer_no_reference_or_pointer()
-    uer_refused("f(x: *unit) -> int = 1\nprint(1)",
-                "unit occupies no storage, so there is nothing for '*' to point at", "1:6")
-    uer_refused("f(x: &unit) -> int = 1\nprint(1)",
-                "unit occupies no storage, so there is nothing for '&' to point at", "1:6")
-    uer_refused("f(x: weak unit) -> int = 1\nprint(1)",
-                "unit occupies no storage, so there is nothing for 'weak' to point at", "1:6")
-end uer_no_reference_or_pointer
+private val ZsaThrough: string = "through[T](x: T) -> T\n    var v = x\n    val p: *T = &v\n    *p = x\n    *p\n"
+
+@test("a generic body's address of a T, instantiated at unit")
+zsa_generic_at_unit() = uer_prints(ZsaThrough + "print(through(()), through(3))", "() 3\n")
+
+@test("and at the other zero-sized types, an empty struct and an empty array")
+zsa_generic_at_other_zero_sizes() =
+    uer_prints("struct Empty\nend Empty\n" + ZsaThrough +
+               "val e: Empty = through(Empty())\nval z: [0]int = []\nprint(through(z).len)", "0\n")
+
+@test("written directly, with a store, a load, and a non-null address")
+zsa_direct_pointer() =
+    uer_prints("var u = ()\nval p: *unit = &u\n*p = ()\nprint(*p, usize(p) != 0)", "() true\n")
+
+@test("as a parameter, stored through and read back")
+zsa_pointer_parameter() =
+    uer_prints("touch(p: *unit) -> unit\n    *p = ()\n    *p\n\nvar u = ()\ntouch(&u)\nprint(touch(&u))", "()\n")
+
+// The order is an `int` store's: the value, then the place it goes to.
+@test("where the stored value and the pointer each still run, once, in an int store's order")
+zsa_effects_still_run() =
+    uer_prints("var u = ()\nwhere(p: *unit) -> *unit\n    print(\"p\")\n    p\n\n" +
+               "*where(&u) = print(\"v\")\nprint(*where(&u))", "v\np\np\n()\n")
+
+@test("of a unit field, and through a pointer to its struct")
+zsa_unit_field() =
+    uer_prints("struct S\n    a: unit\n    b: int\nvar s = S((), 7)\nval ps = &s\nval q = &ps.a\n*q = ()\n" +
+               "print(*q, ps.a, ps.b, usize(q) != 0)", "() () 7 true\n")
+
+@test("as a generic struct's method handing out its field's address")
+zsa_generic_method() =
+    uer_prints("struct Cell[T]\n    v: T\n    n: int\nimpl[T] Cell[T]\n    at(*self) -> *T = &self.v\n" +
+               "var c = Cell((), 2)\nvar d = Cell(5, 3)\nprint(*c.at(), c.n, *d.at())", "() 2 5\n")
+
+@test("under @no_alloc")
+zsa_no_alloc() =
+    uer_prints("@no_alloc\nquiet[T](x: T) -> T\n    var v = x\n    val p: *T = &v\n    *p\n\n" +
+               "print(quiet(()), quiet(5))", "() 5\n")
+
+// C sees a `*unit` as a `void *`, which may be any non-null pointer it does not read through.
+@test("handed to C, which reads zero bytes through it")
+zsa_to_c() =
+    uer_prints("extern \"memcmp\" memcmp(a: *unit, b: *unit, n: usize) -> i32\n" +
+               "struct S\n    a: unit\n    b: int\nvar u = ()\nvar s = S((), 1)\nprint(memcmp(&u, &s.a, 0))", "0\n")
+
+@test("and exported to C as a pointer parameter and result")
+zsa_exported() =
+    uer_ir_has("@export(\"hand_unit\")\nhand(p: *unit) -> *unit = p\nprint(1)", ["@hand_unit(ptr"])
+
+@test("a counted reference to one, and a weak one, hold a box with an empty payload")
+zsa_reference() =
+    uer_prints("boxed[T](x: T) -> &T\n    val r: &T = x\n    r\n\nholds(r: &unit) -> int = 1\n" +
+               "val r = boxed(())\nval w: weak unit = r\nprint(holds(r), *r, w.get().is_some(), *boxed(5))",
+               "1 () true 5\n")
+
+@test("whose box is laid out with an empty payload, never a void one")
+zsa_reference_layout() =
+    uer_ir_has("val r: &unit = ()\nprint(*r)", ["%arc.unit = type { i64, ptr, i64, {} }"])
+
+@test("but never, which has no values, still has nothing to point at")
+zsa_never_refused() =
+    uer_refused("f(x: *never) -> int = 1\nprint(1)",
+                "'never' is the type of an expression that does not finish, so it can only be a result " +
+                "type or a type argument (as in 'Result[T, never]')", "1:7")
+
+private val ZsaNm: string = "/opt/homebrew/opt/llvm/bin/llvm-nm"
+
+// On a 32-bit core with no OS, the address is still a constant and nothing is loaded or stored.
+@test("on bare metal, where the address is a constant and nothing else is needed")
+zsa_bare_metal()
+    if xvr_no_library() then return
+    if !is_file(ZsaNm) then skip(s"there is no llvm-nm at $ZsaNm to read the object")
+
+    val t = target_named("thumb-freestanding-softfp").unwrap()
+    val cc = find_backend_clang(t) match
+        Err(why) ->
+            skip(why)
+            return
+        Ok(found) -> found
+
+    val dir = make_temp_dir("sysl-zsa").unwrap()
+
+    write_text(s"$dir/main.sysl", ZsaThrough + "extern \"sink\" sink(p: *unit) -> i32\n\n@export(\"main\")\n" +
+               "entry() -> i32\n    var u = through(())\n    val p = &u\n    *p = ()\n    sink(p) + through(3)\n").unwrap()
+
+    val text = emit_llvm_text(dir, Some("thumb-freestanding-softfp"), DefaultOptimization, buf(), Some(buf())) match
+        Err(why) -> s"did not compile: ${failure_text(why)}"
+        Ok(e) -> if e.report.is_empty() then e.text else s"did not compile: ${analysis_report(e.report)}"
+
+    assert(!text.starts_with("did not compile"), text)
+    assert(!text.contains("load void") && !text.contains("store void"), text)
+
+    val obj = s"$dir/probe.o"
+
+    compile_object(cc, text, obj, t, "2") match
+        Err(why) ->
+            remove_dir_all(dir).unwrap_or(())
+            assert(false, why)
+            return
+        Ok(_) -> ()
+
+    val listing = capture(ZsaNm, ["-u", obj]).map((o) -> o.text).unwrap_or("llvm-nm could not be run")
+
+    remove_dir_all(dir).unwrap_or(())
+
+    for line in split(listing, "\n")
+        val name = line.trim()
+
+        assert(name == "" || name == "U sink" || name == "U memcpy" || name == "U memset", s"left undefined: $listing")
+end zsa_bare_metal
+
+// -- what is still refused, and not because of a layout ----------------------------------------------
 
 // Not because the elements would share an address -- a fieldless struct's do, and an array of those
 // is admitted. It is that `unit` is the type the compiler DROPS: an array of it would have nothing

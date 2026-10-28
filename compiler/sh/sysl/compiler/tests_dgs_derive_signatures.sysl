@@ -1,0 +1,120 @@
+module sh.sysl.compiler
+@tests
+
+// **A `derive` member takes the signature of the trait member it writes**, with the deriving type's
+// name for `Self`: its parameter and result types are compared with the trait member's once, at the
+// trait, whether or not anything derives it.
+
+@test("a derive member whose result differs from the trait member's is refused at the trait")
+dgs_result_mismatch()
+    if !azb_ready() then return
+
+    azb_refused(azb_main(raw"""
+        trait Maker
+            make(self) -> Self
+
+            derive[T] make(self: T) -> int
+                1
+
+        print("x")
+        """), ["'derive' member 'make' returns int, but trait 'Maker' declares T"])
+end dgs_result_mismatch
+
+@test("a derive member whose parameter differs from the trait member's is refused")
+dgs_parameter_mismatch()
+    if !azb_ready() then return
+
+    azb_refused(azb_main(raw"""
+        trait Scaled
+            scale(self, k: int) -> int
+
+            derive[T] scale(self: T, k: string) -> int
+                0
+
+        print("x")
+        """), ["parameter 'k' of 'derive' member 'scale' is string, but trait 'Scaled' declares int"])
+end dgs_parameter_mismatch
+
+@test("a derive member whose receiver type is not the deriving type is refused")
+dgs_receiver_type_mismatch()
+    if !azb_ready() then return
+
+    azb_refused(azb_main(raw"""
+        trait Same
+            same(self, other: Self) -> bool
+
+            derive[T] same(self: T, other: int) -> bool
+                true
+
+        print("x")
+        """), ["parameter 'other' of 'derive' member 'same' is int, but trait 'Same' declares T"])
+end dgs_receiver_type_mismatch
+
+@test("a derive member returning a unit where the trait gives a value is refused")
+dgs_missing_result()
+    if !azb_ready() then return
+
+    azb_refused(azb_main(raw"""
+        trait Named
+            name(self) -> string
+
+            derive[T] name(self: T)
+                ()
+
+        print("x")
+        """), ["'derive' member 'name' returns", "but trait 'Named' declares string"])
+end dgs_missing_result
+
+@test("a mismatch is refused even when a type derives the trait, once")
+dgs_refused_with_a_deriver()
+    if !azb_ready() then return
+
+    azb_refused(azb_main(raw"""
+        trait Maker
+            make(self) -> Self
+
+            derive[T] make(self: T) -> int
+                1
+
+        struct P derives Maker
+            x: int
+
+        print("x")
+        """), ["'derive' member 'make' returns int, but trait 'Maker' declares T"])
+end dgs_refused_with_a_deriver
+
+@test("correct derive members of a user trait are accepted and run")
+dgs_accepted_user_trait()
+    if !azb_ready() then return
+
+    azb_prints(azb_main(raw"""
+        trait Twin
+            twin(self, other: Self) -> bool
+            again(self) -> Self
+
+            derive[T] twin(self: T, other: T) -> bool
+                true
+
+            derive[T] again(self: T) -> T
+                self
+
+        struct P derives Twin
+            x: int
+
+        print(P(1).twin(P(2)))
+        print(P(5).again().x)
+        """), "true\n5\n")
+end dgs_accepted_user_trait
+
+@test("the library's own derive traits are still accepted")
+dgs_accepted_std_traits()
+    if !azb_ready() then return
+
+    azb_prints(azb_main(raw"""
+        struct P derives Eq, Hash
+            x: int
+
+        print(P(1) == P(1))
+        print(P(1).hash() == P(1).hash())
+        """), "true\ntrue\n")
+end dgs_accepted_std_traits

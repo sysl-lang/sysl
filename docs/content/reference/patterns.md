@@ -167,7 +167,31 @@ Rust and Swift resolve bare names the same way; sysl makes the data-variant case
 a lint.
 
 **A qualified name is a pattern wherever a bare one is.** `Shape.Empty` matches exactly as `Empty`
-does, since the scrutinee's type already determines the enum. A qualified name can never be a
+does, so long as the path names the scrutinee's own enum, under any spelling of it (its full path, an
+import alias, a local name). **A path naming a different enum is refused**, even when the scrutinee's
+enum has a variant of the same name — as Rust refuses it — rather than being read as the scrutinee's
+own variant:
+
+```sysl
+enum Light
+    Red
+    Green
+
+enum Signal
+    Red
+    Blue
+
+describe(l: Light) -> string
+    l match
+        Signal.Red -> "stop"
+        else "go"
+```
+
+```error
+pattern is Signal but the value is Light
+```
+
+A qualified name can never be a
 *binding*, because no declared name contains a dot, so one that resolves to neither a variant nor a
 constant is a diagnostic rather than a new local.
 
@@ -669,6 +693,22 @@ print(band(7), band(2), band(50))
 
 ```output
 high low out
+```
+
+A guard is any boolean expression, a bare name included. The `->` after it is the arm's, never the
+arrow of a closure; a closure inside a guard is written in parentheses, as an argument.
+
+```sysl
+pick(n: int, wide: bool) -> string
+    n match
+        1..10 if wide -> "wide"
+        else "other"
+
+print(pick(3, true), pick(3, false))
+```
+
+```output
+wide other
 ```
 
 Three rules:

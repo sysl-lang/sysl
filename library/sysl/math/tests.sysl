@@ -2,6 +2,8 @@ module sysl.math
 @tests
 @requires(heap)
 
+import sysl.hint.black_box
+
 // The module ships allocating nowhere and says so. Testing it does not: `assert_eq` renders
 // both sides into the message it would print on a failure, and rendering builds a string. That
 // is the harness's business rather than this module's, and none of it ships.
@@ -152,6 +154,67 @@ width_through_a_bound()
     assert_eq(reversed_low(u8(0b001), 3), u8(0b100))
     assert_eq(reversed_low(u32(0b001), 3), u32(0b100))
 
+// A value through `black_box` is one the compiler may not see through: what is computed from it is
+// computed by the machine rather than folded while compiling, so each answer below is asserted both
+// ways.
+
+@test("reverse_bits puts the lowest bit highest at every whole-byte width, folded and at run time")
+reverse_bits_at_each_width()
+    assert_eq(u8(0b10110000).reverse_bits(), 0b00001101)
+    assert_eq(black_box(u8(0b10110000)).reverse_bits(), 0b00001101)
+    assert_eq(u16(0x1234).reverse_bits(), 0x2C48)
+    assert_eq(black_box(u16(0x1234)).reverse_bits(), 0x2C48)
+    assert_eq(black_box(u16(1)).reverse_bits(), 0x8000)
+    assert_eq(u32(0x12345678).reverse_bits(), 0x1E6A2C48)
+    assert_eq(black_box(u32(0x12345678)).reverse_bits(), 0x1E6A2C48)
+    assert_eq(black_box(u32(1)).reverse_bits(), 0x80000000)
+    assert_eq(u64(0x0123456789ABCDEF).reverse_bits(), 0xF7B3D591E6A2C480)
+    assert_eq(black_box(u64(0x0123456789ABCDEF)).reverse_bits(), 0xF7B3D591E6A2C480)
+    assert_eq(black_box(u64(1)).reverse_bits(), 0x8000000000000000)
+end reverse_bits_at_each_width
+
+// u12 is not a whole number of bytes and u128 is wider than any register: neither is a width a
+// byte swap or a 64-bit instruction answers by itself.
+@test("reverse_bits reverses within the receiver's own width at 12 and at 128 bits")
+reverse_bits_at_odd_and_wide_widths()
+    assert_eq(u12(6).reverse_bits(), 1536)
+    assert_eq(black_box(u12(6)).reverse_bits(), 1536)
+    assert_eq(black_box(u12(0xFFF)).reverse_bits(), 0xFFF)
+
+    val top: u128 = u128(0x0123456789ABCDEF) << 64
+    val low: u128 = 0xF7B3D591E6A2C480
+
+    assert_eq(top.reverse_bits(), low)
+    assert_eq(black_box(top).reverse_bits(), low)
+    assert_eq(black_box(u128(1)).reverse_bits(), u128(1) << 127)
+    assert_eq(black_box(u128(5)).reverse_bits(), u128(0b101) << 125)
+end reverse_bits_at_odd_and_wide_widths
+
+// Signedness changes nothing about the pattern: the lowest bit set reverses into the sign bit.
+@test("reverse_bits on a signed integer reverses the pattern, the sign bit included")
+reverse_bits_signed()
+    assert_eq(black_box(i8(1)).reverse_bits(), i8::Min)
+    assert_eq(black_box(i8(-2)).reverse_bits(), 127)
+    assert_eq(i8(-2).reverse_bits(), 127)
+    assert_eq(black_box(i16(1)).reverse_bits(), i16::Min)
+    assert_eq(black_box(i32(-1)).reverse_bits(), -1)
+    assert_eq(black_box(i32(0x12345678)).reverse_bits(), 0x1E6A2C48)
+    assert_eq(black_box(i64(1)).reverse_bits(), i64::Min)
+    assert_eq(black_box(i64(0)).reverse_bits(), 0)
+end reverse_bits_signed
+
+@test("reverse_bits twice is the value again, at every width")
+reverse_bits_is_an_involution()
+    assert_eq(black_box(u16(0xBEEF)).reverse_bits().reverse_bits(), 0xBEEF)
+    assert_eq(black_box(u64(0xDEADBEEFCAFEF00D)).reverse_bits().reverse_bits(), 0xDEADBEEFCAFEF00D)
+    assert_eq(black_box(u12(0xA5C)).reverse_bits().reverse_bits(), 0xA5C)
+    assert_eq(black_box(i32(-123456)).reverse_bits().reverse_bits(), -123456)
+
+    val big: u128 = (u128(0xDEADBEEF) << 96) | 0x1234
+
+    assert_eq(black_box(big).reverse_bits().reverse_bits(), big)
+end reverse_bits_is_an_involution
+
 // -- floating point ------------------------------------------------------------------------------------
 
 @test("the roots are the roots")
@@ -169,8 +232,8 @@ mul_add_rounds_once()
     assert_eq((1.0f32 + 2.0f32.pow(-12.0f32)).mul_add(1.0f32 + 2.0f32.pow(-12.0f32), -1.0f32).bits(),
               0x3A000400)
 
-    val x = opaque_real(1.0 + 2.0.pow(-27.0))
-    val y = opaque_f32(1.0f32 + 2.0f32.pow(-12.0f32))
+    val x = black_box(1.0 + 2.0.pow(-27.0))
+    val y = black_box(1.0f32 + 2.0f32.pow(-12.0f32))
 
     assert_eq(x.mul_add(x, -1.0).bits(), 0x3E50000001000000)
     assert_eq(y.mul_add(y, -1.0f32).bits(), 0x3A000400)
@@ -183,42 +246,22 @@ end mul_add_rounds_once
 
 @test("mul_add answers a NaN and the infinities as IEEE 754's fusedMultiplyAdd does")
 mul_add_nan_and_infinities()
-    val inf = opaque_real(real.infinity())
-    val finf = opaque_f32(f32.infinity())
+    val inf = black_box(real.infinity())
+    val finf = black_box(f32.infinity())
 
-    assert(opaque_real(real.nan()).mul_add(1.0, 1.0).is_nan())
-    assert(1.0.mul_add(1.0, opaque_real(real.nan())).is_nan())
+    assert(black_box(real.nan()).mul_add(1.0, 1.0).is_nan())
+    assert(1.0.mul_add(1.0, black_box(real.nan())).is_nan())
     assert(inf.mul_add(0.0, 1.0).is_nan())
     assert(inf.mul_add(1.0, -inf).is_nan())
     assert_eq(inf.mul_add(2.0, 1.0), inf)
     assert_eq(2.0.mul_add(3.0, -inf), -inf)
 
-    assert(opaque_f32(f32.nan()).mul_add(1.0f32, 1.0f32).is_nan())
+    assert(black_box(f32.nan()).mul_add(1.0f32, 1.0f32).is_nan())
     assert(finf.mul_add(0.0f32, 1.0f32).is_nan())
     assert(finf.mul_add(1.0f32, -finf).is_nan())
     assert_eq(finf.mul_add(2.0f32, 1.0f32), finf)
     assert_eq(2.0f32.mul_add(3.0f32, -finf), -finf)
 end mul_add_nan_and_infinities
-
-// A value the compiler is not allowed to see through -- it went through a volatile place -- so what is
-// computed from it is computed by the machine rather than while compiling.
-private struct Unseen
-    wide: volatile real
-    narrow: volatile f32
-
-private opaque_real(x: real) -> real
-    var u = Unseen(0.0, 0.0f32)
-
-    u.wide = x
-    u.wide
-end opaque_real
-
-private opaque_f32(x: f32) -> f32
-    var u = Unseen(0.0, 0.0f32)
-
-    u.narrow = x
-    u.narrow
-end opaque_f32
 
 // The exponent and the logarithm undo each other, which is worth asserting as a pair: either one
 // alone could be scaled by a constant and still look plausible.
@@ -247,6 +290,85 @@ roundings_differ()
 round_half_away()
     assert_eq(2.5.round(), 3.0)
     assert_eq(3.5.round(), 4.0)
+
+// Outside a strict body the mode is the default one, so both roundings that read it are ties-to-even:
+// on the ties they part from `round`, and a negative half keeps its sign as a negative zero.
+// (`tests_sfp_strict_fp.sysl` asserts them in the other three modes, and the inexact flag.)
+@test("nearbyint and rint round ties to even in the default mode, at every width")
+nearbyint_and_rint_default_mode()
+    for x in [2.5, 3.5, -2.5, 0.4, 1.0e300]
+        val want = x.round_even()
+
+        assert_eq(x.nearbyint(), want)
+        assert_eq(x.rint(), want)
+        assert_eq(black_box(x).nearbyint(), want)
+        assert_eq(black_box(x).rint(), want)
+        assert_eq(f32(x).nearbyint(), f32(want))
+        assert_eq(black_box(f32(x)).rint(), f32(want))
+    end for
+
+    assert_eq(black_box(2.5).nearbyint(), 2.0)
+    assert_eq(black_box(3.5f32).rint(), 4.0f32)
+    assert_eq(black_box(-0.5).nearbyint().bits(), 0x8000000000000000)
+    assert_eq(black_box(-0.5f32).rint().bits(), 0x80000000)
+    assert_eq(2.5f16.nearbyint(), 2.0f16)
+    assert_eq(3.5f16.rint(), 4.0f16)
+    assert_eq(2.5bf16.nearbyint(), 2.0bf16)
+    assert_eq((-3.5bf16).rint(), -4.0bf16)
+end nearbyint_and_rint_default_mode
+
+@test("nearbyint and rint leave the infinities and a NaN as they are")
+nearbyint_and_rint_non_finite()
+    val inf = black_box(real.infinity())
+
+    assert_eq(inf.nearbyint(), inf)
+    assert_eq((-inf).rint(), -inf)
+    assert(black_box(real.nan()).nearbyint().is_nan())
+    assert(black_box(f32.nan()).rint().is_nan())
+    assert_eq(f32.infinity().rint(), f32.infinity())
+end nearbyint_and_rint_non_finite
+
+@test("max_num and min_num pick the right end, at every width")
+max_num_min_num_ordinary()
+    assert_eq(black_box(1.0).max_num(2.0), 2.0)
+    assert_eq(black_box(1.0).min_num(2.0), 1.0)
+    assert_eq(black_box(-3.0f32).max_num(-4.0f32), -3.0f32)
+    assert_eq(black_box(-3.0f32).min_num(-4.0f32), -4.0f32)
+    assert_eq(1.5f16.max_num(2.5f16), 2.5f16)
+    assert_eq(1.5f16.min_num(2.5f16), 1.5f16)
+    assert_eq(1.5bf16.max_num(-2.5bf16), 1.5bf16)
+    assert_eq(1.5bf16.min_num(-2.5bf16), -2.5bf16)
+
+    val inf = black_box(real.infinity())
+
+    assert_eq(inf.max_num(1.0), inf)
+    assert_eq((-inf).min_num(1.0), -inf)
+    assert_eq(inf.min_num(1.0), 1.0)
+end max_num_min_num_ordinary
+
+// The property that is the whole reason for the pair: which side the NaN is on does not matter,
+// unlike `max`, whose answer is whatever its comparison falls through to.
+@test("max_num and min_num answer the number when one operand is a NaN, on either side")
+max_num_min_num_nan()
+    val nan = black_box(real.nan())
+    val fnan = black_box(f32.nan())
+
+    assert_eq(nan.max_num(1.0), 1.0)
+    assert_eq(black_box(1.0).max_num(nan), 1.0)
+    assert_eq(nan.min_num(-1.0), -1.0)
+    assert_eq(black_box(-1.0).min_num(nan), -1.0)
+    assert_eq(fnan.max_num(3.0f32), 3.0f32)
+    assert_eq(black_box(3.0f32).min_num(fnan), 3.0f32)
+    assert_eq(f16.nan().max_num(1.0f16), 1.0f16)
+    assert_eq(1.0bf16.min_num(bf16.nan()), 1.0bf16)
+
+    assert(nan.max_num(nan).is_nan())
+    assert(fnan.min_num(fnan).is_nan())
+
+    // `max` keeps the first argument's NaN; `max_num` does not.
+    assert(max(nan, 1.0).is_nan())
+    assert_eq(nan.max_num(1.0), 1.0)
+end max_num_min_num_nan
 
 // -- the two sixteen-bit widths --------------------------------------------------------------------
 

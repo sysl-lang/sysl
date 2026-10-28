@@ -49,7 +49,7 @@ decide.
 
 ## Index
 
-[`default_zoneinfo_root`](#default_zoneinfo_root) [`cpu_time`](#cpu_time) [`from_local`](#from_local) [`local`](#local) [`local_offset`](#local_offset) [`local_text`](#local_text) [`local_zone_data`](#local_zone_data) [`monotonic`](#monotonic) [`nanosleep`](#nanosleep) [`now`](#now) [`sleep`](#sleep) [`supply_monotonic_us`](#supply_monotonic_us) [`supply_sleep_us`](#supply_sleep_us) [`supply_wall_us`](#supply_wall_us) [`zone_data`](#zone_data) [`zone_data_in`](#zone_data_in) [`zoneinfo_root`](#zoneinfo_root)
+[`default_zoneinfo_root`](#default_zoneinfo_root) [`cpu_time`](#cpu_time) [`from_local`](#from_local) [`local`](#local) [`local_offset`](#local_offset) [`local_text`](#local_text) [`local_zone_data`](#local_zone_data) [`monotonic`](#monotonic) [`nanosleep`](#nanosleep) [`now`](#now) [`sleep`](#sleep) [`supply_monotonic_us`](#supply_monotonic_us) [`supply_sleep_us`](#supply_sleep_us) [`supply_wall_us`](#supply_wall_us) [`thread_cpu_time`](#thread_cpu_time) [`zone_data`](#zone_data) [`zone_data_in`](#zone_data_in) [`zoneinfo_root`](#zoneinfo_root)
 
 ## Constants
 
@@ -252,6 +252,28 @@ codegen unit, and the standard module's artifact is the one every build pays tha
 The name says what it is for rather than what it reads, so that it does not compete with anything
 a program would reach for -- and a package answering the same seam on a board writes the same two
 lines with its own chip behind them.
+
+### `thread_cpu_time`
+
+```sysl
+thread_cpu_time() -> Duration
+```
+
+The processor time the calling thread has used: user plus system, this thread only.
+
+The per-thread counterpart of `cpu_time`, with the same shape: no origin worth naming, so only the
+difference of two readings means anything, and it never goes backwards. A thread asleep or blocked
+spends none, whatever its siblings do, which is what makes it the honest measure of how busy a
+worker is:
+
+val t0 = thread_cpu_time()
+work()
+print(s"this thread used ${(thread_cpu_time() - t0).us}us of processor")
+
+**It reads the calling thread's own clock, so two readings must be taken on the same thread** --
+a reading taken on one thread and subtracted from another's is meaningless. Reading a *different*
+thread's clock is not offered: Linux does it through `pthread_getcpuclockid`, macOS has no such
+call and needs the Mach `thread_info` interface, so no one spelling is portable.
 
 ### `zone_data`
 

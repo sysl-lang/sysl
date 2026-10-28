@@ -1,0 +1,116 @@
+module sysl.fs
+@requires(os)
+@tests
+
+import sysl.path.parent
+
+// `Mapped.advise` and `page_size`.
+
+private mad_path(name: string) -> string = s"${make_temp_dir("sysl-fs-mad-").unwrap()}/$name"
+
+private mad_done(path: string) = mad_ignore(remove_dir_all(parent(path).unwrap()))
+
+private mad_ignore(r: Result[unit, IoError]) = ()
+
+// A file of `pages` whole pages and a few bytes over, every byte `i % 251`.
+private mad_file(path: string, pages: usize) -> usize
+    val n = pages * page_size() + 7
+    var text = ""
+
+    for i in 0..<n
+        text += if i % 2 == 0 then "a" else "b"
+
+    write_text(path, text).unwrap()
+    n
+end mad_file
+
+private mad_sum(m: &Mapped) -> usize
+    val v = m.bytes()
+    var s: usize = 0
+
+    for b in v
+        s += usize(b)
+
+    s
+end mad_sum
+
+@test("mad_fs page_size is a power of two and at least 512")
+mad_fs_page_size()
+    val p = page_size()
+
+    assert(p >= 512, "page")
+    assert_eq(p & (p - 1), 0)
+end mad_fs_page_size
+
+@test("mad_fs every Advice value succeeds on a mapped file and leaves the bytes alone")
+mad_fs_each_advice()
+    val path = mad_path("each")
+    val n = mad_file(path, 3)
+    val m = map_file(path).unwrap()
+    val before = mad_sum(m)
+
+    for a in [Advice.Normal, Advice.Random, Advice.Sequential, Advice.WillNeed, Advice.DontNeed]
+        assert(m.advise(a).is_ok(), "advise whole")
+        assert_eq(mad_sum(m), before)
+
+    assert_eq(m.len(), n)
+    mad_done(path)
+end mad_fs_each_advice
+
+@test("mad_fs ranges are rounded to pages: unaligned from and len, a range inside one page, the tail")
+mad_fs_rounding()
+    val path = mad_path("round")
+    val n = mad_file(path, 3)
+    val m = map_file(path).unwrap()
+    val p = page_size()
+
+    assert(m.advise(Advice.DontNeed, 1, 1).is_ok(), "one byte")
+    assert(m.advise(Advice.DontNeed, p + 5, p).is_ok(), "straddling")
+    assert(m.advise(Advice.WillNeed, 2 * p + 3).is_ok(), "tail")
+    assert(m.advise(Advice.Sequential, n - 1, 1).is_ok(), "last byte")
+    assert(m.advise(Advice.Normal, n, 0).is_ok(), "empty range at the end")
+    assert(m.advise(Advice.Normal, 3, 0).is_ok(), "empty range")
+    mad_done(path)
+end mad_fs_rounding
+
+@test("mad_fs a range outside the mapping is refused as EINVAL")
+mad_fs_out_of_range()
+    val path = mad_path("range")
+    val n = mad_file(path, 1)
+    val m = map_file(path).unwrap()
+
+    for (from, len) in [(n + 1, 0usize), (n + 1, 1), (0, n + 1), (n - 1, 2), (1, n), (usize::Max - 1, 4)]
+        m.advise(Advice.DontNeed, from, len) match
+            Err(Other(c)) -> assert_eq(c, 22)
+            _ -> assert(false, s"accepted $from+$len of $n")
+
+    mad_done(path)
+end mad_fs_out_of_range
+
+@test("mad_fs an empty mapping is a no-op, whatever the range")
+mad_fs_empty()
+    val path = mad_path("empty")
+
+    write_text(path, "").unwrap()
+
+    val m = map_file(path).unwrap()
+
+    assert(m.advise(Advice.DontNeed).is_ok(), "empty")
+    assert(m.advise(Advice.WillNeed, 100, 100).is_ok(), "empty range")
+    mad_done(path)
+end mad_fs_empty
+
+@test("mad_fs advising works after the File is closed and the name removed")
+mad_fs_after_close()
+    val path = mad_path("closed")
+    val n = mad_file(path, 2)
+    var f = open(path).unwrap()
+    val m = f.map().unwrap()
+
+    f.close()
+    remove_file(path).unwrap()
+    assert(m.advise(Advice.DontNeed).is_ok(), "after close")
+    assert_eq(m.len(), n)
+    assert_eq(m.bytes()[0], u8('a'))
+    mad_done(path)
+end mad_fs_after_close

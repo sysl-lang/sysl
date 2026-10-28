@@ -103,9 +103,14 @@ trait Float: Zero + One + Eq + Ord + Neg + Add + Sub + Mul + Div
     ceil(self) -> Self
     round(self) -> Self
     trunc(self) -> Self
+    round_even(self) -> Self
+    nearbyint(self) -> Self
+    rint(self) -> Self
     fmod(self, divisor: Self) -> Self
     abs(self) -> Self
     copysign(self, sign: Self) -> Self
+    max_num(self, other: Self) -> Self
+    min_num(self, other: Self) -> Self
     to_radians(self) -> Self
     to_degrees(self) -> Self
 
@@ -253,6 +258,50 @@ caller who knows the range, and casts.
 
 `round` goes **away from zero** at a half, which is C's rule and not the banker's rounding a printed
 value gets. `trunc` goes towards zero, which is what a cast already does.
+
+**Three more round to the even neighbour at a half, and two of them read the rounding mode.**
+`round_even` always goes to the even neighbour. `nearbyint` and `rint` round in the mode in force
+(`sysl.fenv`) — C's two functions of those names, and an Arm core's `vrintr` and `vrintx`. They differ
+only in a flag: `rint` raises inexact when the answer is not the operand, and `nearbyint` raises
+nothing. The mode is read only in a
+[`@strict_fp`](/reference/attributes/#strict-fp-floating-point-that-follows-the-environment-it-runs-in)
+body; anywhere else it is the default mode, and both give what `round_even` gives.
+
+```sysl
+import sysl.math.Float
+
+var half = 2.5
+var tie = 3.5
+var neg = -2.5
+
+print(half.round(), half.round_even(), half.nearbyint(), half.rint())
+print(tie.round_even(), neg.nearbyint(), f32(neg).rint())
+```
+
+```output
+3 2 2 2
+4 -2 -2
+```
+
+**`max_num` and `min_num` let a NaN lose to a number.** These are IEEE 754-2008's maxNum and minNum.
+Whichever side the NaN is on, the number is the answer, and only two NaNs give a NaN. `max` and `min`
+(below) answer whatever their one comparison falls through to, and that depends on which side the NaN
+is on. Two zeros of opposite sign compare equal, and either one may be the answer.
+
+```sysl
+import sysl.math.{Float, max}
+
+var one = 1.0
+val hole = 0.0 / 0.0
+
+print(hole.max_num(one), one.max_num(hole), one.min_num(-one))
+print(max(hole, one).is_nan(), hole.max_num(hole).is_nan())
+```
+
+```output
+1 1 -1
+true true
+```
 
 **`fmod` is not `%`.** The integer types have `Rem` and the floats do not, because a float remainder is
 a library operation rather than an instruction. It keeps the sign of the receiver.

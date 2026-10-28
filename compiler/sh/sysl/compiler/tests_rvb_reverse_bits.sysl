@@ -1,0 +1,57 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+
+// **`reverse_bits` on the machines that have no instruction for it, and on the one that does.** The
+// host's answers are `library/sysl/math/tests.sysl`'s. What only a board can show is the lowering
+// where `llvm.bitreverse` is not one instruction: the Cortex-M0 (Armv6-M) and RV32I have none, so
+// LLVM expands it into shifts and masks, and a `u64` or a `u128` is two or four registers on every
+// 32-bit core. The Armv7-M and Armv8-M boards have `rbit`. Every value goes through `black_box` so
+// that the machine computes it, rather than the compiler while compiling.
+
+private val RvbBody: string = raw"""
+    var wrong = 0
+
+    if black_box(u8(0b10110000)).reverse_bits() != 0b00001101 then wrong += 1
+    if black_box(u16(0x1234)).reverse_bits() != 0x2C48 then wrong += 1
+    if black_box(u32(0x12345678)).reverse_bits() != 0x1E6A2C48 then wrong += 1
+    if black_box(u32(1)).reverse_bits() != 0x80000000 then wrong += 1
+    if black_box(u64(0x0123456789ABCDEF)).reverse_bits() != 0xF7B3D591E6A2C480 then wrong += 1
+    if black_box(u12(6)).reverse_bits() != 1536 then wrong += 1
+    if black_box(u128(0x0123456789ABCDEF) << 64).reverse_bits() != u128(0xF7B3D591E6A2C480) then wrong += 1
+    if black_box(u128(1)).reverse_bits() != u128(1) << 127 then wrong += 1
+    if black_box(i8(1)).reverse_bits() != i8::Min then wrong += 1
+    if black_box(i32(-2)).reverse_bits() != i32::Max then wrong += 1
+    if black_box(i64(1)).reverse_bits() != i64::Min then wrong += 1
+    if black_box(u64(0xDEADBEEFCAFEF00D)).reverse_bits().reverse_bits() != 0xDEADBEEFCAFEF00D then wrong += 1
+
+    w.write("rvb ".bytes)
+    wrong.display(w, FormatSpec(0, -1, false))
+    w.write(" done".bytes)
+    """
+
+@test("reverse_bits answers the same at every width on every board, with rbit and without it")
+rvb_reverse_bits_on_the_boards()
+    var bad: Buf[string] = buf()
+    var ran: usize = 0
+
+    for b in qemu_boards()
+        ran += 1
+
+        var files: Buf[(string, string)] = buf()
+
+        files.push(("p.sysl", "import board.*\nimport sysl.hint.black_box\nimport sysl.math.Bits\n\nval w = console()\n\n" +
+                    RvbBody))
+        files.push(("board/board.sysl", qemu_board_module(b)))
+
+        qemu_boot(b, files) match
+            Err(why) -> bad.push(s"${b.name} (${b.target}): $why")
+            Ok(r) ->
+                if !r.status.ok() || !r.out.contains("rvb 0 done") then
+                    bad.push(s"${b.name} (${b.target}): ${qemu_said(b, r)}")
+    end for
+
+    assert(ran > 0, "no board was booted")
+    assert(bad.is_empty(), joined(bad, "\n"))
+end rvb_reverse_bits_on_the_boards

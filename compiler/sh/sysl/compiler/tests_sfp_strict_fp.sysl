@@ -470,6 +470,71 @@ sfp_mul_add_in_each_mode()
     sfp_lacks(body, "@llvm.fma.")
 end sfp_mul_add_in_each_mode
 
+// -- rounding in the mode in force, and the NaN-losing maximum -----------------------------------------
+
+// `nearbyint` and `rint` round to an integral value in the mode in force: 2.5 and -2.5 go to the even
+// neighbour, up, down and toward zero in the four modes, at f64 and at f32. `rint` raises inexact where
+// the answer moved and `nearbyint` never does; an integral operand raises nothing through either.
+// `max_num` and `min_num` answer the number beside a NaN, and are the constrained operations here too.
+private val sfp_round_mode_program: string = raw"""
+    import sysl.fenv.*
+
+    @strict_fp
+    modes(h: f64, s: f32) -> string
+        var out = ""
+
+        for r in [NearestEven, Upward, Downward, TowardZero]
+            set_rounding(r)
+            out = out + s"${i64(h.nearbyint())} ${i64((-h).rint())} ${i64(s.rint())} ${i64((-s).nearbyint())} "
+
+        set_rounding(NearestEven)
+        out
+    end modes
+
+    @strict_fp
+    raised(h: f64, s: f32) -> string
+        clear_flags()
+        val a = h.nearbyint()
+        val quiet = flags().inexact
+        clear_flags()
+        val b = s.rint()
+        val loud = flags().inexact
+        clear_flags()
+        val c = (h + 0.5).rint()
+        val exact = flags().any()
+
+        s"$quiet $loud $exact ${a + f64(b) + c}"
+    end raised
+
+    @strict_fp
+    nums(h: f64, s: f32, nan: f64) -> string =
+        s"${h.max_num(nan)} ${nan.min_num(h)} ${s.max_num(f32(nan))} ${(-s).min_num(s)}"
+
+    main(args: []string)
+        val one = real(args.len)
+
+        print(modes(2.5 * one, 2.5f32 * f32(one)))
+        print(raised(2.5 * one, 2.5f32 * f32(one)))
+        print(nums(2.0 * one, 3.0f32 * f32(one), (one - 1.0) / (one - 1.0)))
+    """
+
+@test("nearbyint and rint round in each of the four modes, rint alone raising inexact, at f32 and f64")
+sfp_round_in_the_mode_in_force()
+    if !sfp_ready() then return
+
+    sfp_prints(sfp_round_mode_program,
+               "2 -2 2 -2 3 -2 3 -2 2 -3 2 -3 2 -2 2 -2 \nfalse true false 7\n2 2 3 -3\n")
+
+    val ir = sfp_ir(sfp_round_mode_program, Some("aarch64-freestanding"))
+
+    sfp_says(sfp_body(ir, "modes"), "@llvm.experimental.constrained.nearbyint.f64(")
+    sfp_says(sfp_body(ir, "modes"), "@llvm.experimental.constrained.rint.f32(")
+    sfp_says(sfp_body(ir, "nums"), "@llvm.experimental.constrained.maxnum.f64(")
+    sfp_says(sfp_body(ir, "nums"), "@llvm.experimental.constrained.minnum.f32(")
+    sfp_lacks(sfp_body(ir, "modes"), "@llvm.rint.")
+    sfp_lacks(sfp_body(ir, "nums"), "@llvm.maxnum.")
+end sfp_round_in_the_mode_in_force
+
 // -- conversions --------------------------------------------------------------------------------------
 
 // 2^24 + 1 is no binary32: an integer read as one rounds it, to 2^24 (0x4b800000) to nearest-even,
