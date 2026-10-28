@@ -302,7 +302,7 @@ print(window.len(), window.first(), window.last())
 
 **Its members are `Ring`'s, with the same names and answers**: `push_back` and `push_front` answer
 whether there was room, `pop_front` and `pop_back` answer an `Option`, `overwrite` answers what it
-dropped, `r[i]` counts from the front and panics past the end, `get` is the total form, `first`, `last`,
+dropped, `r[i]` counts from the front and traps past the end as an array's index does, `get` is the total form, `first`, `last`,
 `clear`, `capacity`, `len`, `is_empty`, `is_full`, and `for x in r` walks front to back. Code moves
 between the two by changing the type and the line that makes it; the only difference is that
 `inline_ring[T, N]()` takes no slice.
