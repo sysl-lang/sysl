@@ -191,7 +191,8 @@ check_no_alloc(a: &Analysis, funcs: Buf[TFunc], vals: Buf[TVal], vtables: Buf[TV
 
         // **A trait's default is the trait module's conduct**, the same at every implementing type:
         // the copy is lowered under the receiver's symbol, but its body was written beside the trait
-        // and is read in the trait's file, so that module's clause is the one it answers to.
+        // and is read in the trait's file, so that module's clause is the one it answers to -- for
+        // what it writes, and not for what `Self` answers with (`Promised.chosen`).
         val copied = a.tables.members.default_origin.has(f.name)
         val module_name = if copied then scope.module_name else module_of(f.name)
 
@@ -260,7 +261,7 @@ check_no_alloc(a: &Analysis, funcs: Buf[TFunc], vals: Buf[TVal], vtables: Buf[TV
         if !no_alloc_here(a, reach, scope, module_name, scaffolding, true) then continue
 
         val why = because(a, scope, module_name, scaffolding)
-        val held = Promised(why, None, made, false)
+        val held = Promised(why, None, made, false, "")
         val skip: &Skipped = Skipped(buf())
         val kept: &Deferred = Deferred(buf(), false)
         val said: &Counted = Counted(0)
@@ -283,11 +284,19 @@ const NoAllocWord: string = "alloc"
 // **`blocking` is which promise it is** -- `@no_alloc`'s, or `@no_block`'s (`no_block.sysl`), whose
 // seeds are the declarations marked `@blocks`. The walk that finds where a body arrives is the same
 // for both; only the sentence differs.
+//
+// **`chosen` is the prefix of the names a body reaches through `Self`**, and empty everywhere but a
+// trait default held to its module's clause: a call there through `self` goes to whatever the
+// implementing type wrote, which is its author's choice in a module of their own -- exactly a
+// generic's call through a bound (`reference/modules.md § A generic answers for what it wrote, not
+// for what its caller chose`). Such a call is passed over; everything else the default writes is
+// still the trait module's.
 struct Promised
     why: string
     func: Option[string]
     made: Buf[(string, string)]
     blocking: bool
+    chosen: string
 
 // The promise a body is held to, or nothing where it made none. **The module's comes first**: it
 // holds every body in the module, so a function there carrying `@no_alloc` as well says nothing the
@@ -296,14 +305,56 @@ private held_to(a: &Analysis, reach: Option[Set[string]], scope: Scope, module_n
                 scaffolding: bool, in_image: bool, f: TFunc,
                 made: Buf[(string, string)]) -> Option[Promised]
     if no_alloc_here(a, reach, scope, module_name, scaffolding, in_image) then
-        return Some(Promised(because(a, scope, module_name, scaffolding), None, made, false))
+        return Some(Promised(because(a, scope, module_name, scaffolding), None, made, false,
+                             chosen_by_self(a, f.name)))
 
     if !f.marks.gives_up(NoAllocWord) then return None
 
     val name = qualified_name(f.name)
 
-    Some(Promised(s"'$name' declared '@no_alloc'", Some(f.name), made, false))
+    Some(Promised(s"'$name' declared '@no_alloc'", Some(f.name), made, false, ""))
 end held_to
+
+// The prefix every member of the implementing type is lowered under, where `name` is a trait
+// default's copy, and empty where it is no copy. The copy is `<type symbol>.<member>` with the impl's
+// suffix after it, and the member is the last step of the origin it was recorded with -- a member
+// name holds no dot, a type symbol may.
+chosen_by_self(a: &Analysis, name: string) -> string
+    val origin = a.tables.members.default_origin.get(name)
+
+    if origin.is_none() then return ""
+
+    val written = origin.unwrap()
+    val dot = written.last_index_of_byte(u8('.'))
+
+    if dot.is_none() then return ""
+
+    name.last_index_of(written[dot.unwrap()..<written.bytes.len]) match
+        Some(at) -> name[0..<at + 1]
+        None -> ""
+end chosen_by_self
+
+// The names a tree reached, less the ones it reached through `Self` where the promise does not
+// answer for them (`Promised.chosen`).
+private unchosen(refs: &Refs, held: Promised) -> &Refs
+    if held.chosen == "" then return refs
+
+    val out = no_refs()
+
+    for name in refs.calls
+        if !name.starts_with(held.chosen) then out.call(name)
+
+    for name in refs.erased
+        out.erase(name)
+
+    for item in refs.sites
+        out.site(item.0, item.1)
+
+    for symbol in refs.globals
+        out.global(symbol)
+
+    out
+end unchosen
 
 // **A generic that made the promise for ITSELF keeps it at every instance** (`reference/attributes.md
 // § @no_alloc on a function`). The body it was written as is held first, and answers for everything
@@ -329,7 +380,7 @@ check_instances(a: &Analysis, walk: &Reaches, funcs: Buf[TFunc], from: usize, wo
         val skip: &Skipped = Skipped(reported_since(a, from, scope.src.name))
         val why = s"'${qualified_name(origin.unwrap())}' declared '@no_$word' (instance " +
                   s"'${qualified_name(f.name)}')"
-        val held = Promised(why, Some(f.name), made, blocking)
+        val held = Promised(why, Some(f.name), made, blocking, "")
         val said: &Counted = Counted(0)
         val deferred: &Deferred = Deferred(buf(), true)
 
@@ -535,13 +586,13 @@ blame_block(a: &Analysis, walk: &Reaches, scope: Scope, b: TBlock, held: Promise
 
     if said.n > 0 then return
 
-    val all = refs_of_block(b)
+    val all = unchosen(refs_of_block(b), held)
     val whole = least_seed(walk, all)
 
     if whole.is_none() then return
 
     for stmt in b.stmts
-        val refs = refs_of_stmt(stmt)
+        val refs = unchosen(refs_of_stmt(stmt), held)
         val one = least_seed(walk, refs)
 
         if one.is_some()
@@ -669,11 +720,11 @@ private held_core(t: Type) -> Option[(string, string)] = t match
     _ -> None
 
 blame_one(a: &Analysis, walk: &Reaches, scope: Scope, e: TExpr, held: Promised, said: &Counted)
-    val own = own_refs(e)
+    val own = unchosen(own_refs(e), held)
     val mine = named_reach(walk, own)
 
     if mine.is_none() then return
-    if reaches_a_seed(walk, strict_refs(e)) then return
+    if reaches_a_seed(walk, unchosen(strict_refs(e), held)) then return
 
     said.n += 1
     reaches_fault(a, walk, scope, e.span, own, mine.unwrap(), held)
@@ -687,10 +738,11 @@ blame_write(a: &Analysis, walk: &Reaches, scope: Scope, w: TWrite, held: Promise
 
     write_refs(out, w)
 
-    val mine = named_reach(walk, out)
+    val kept = unchosen(out, held)
+    val mine = named_reach(walk, kept)
 
     if mine.is_none() then return
 
     said.n += 1
-    reaches_fault(a, walk, scope, w.place.span, out, mine.unwrap(), held)
+    reaches_fault(a, walk, scope, w.place.span, kept, mine.unwrap(), held)
 end blame_write
