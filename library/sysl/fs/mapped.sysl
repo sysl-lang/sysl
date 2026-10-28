@@ -49,7 +49,75 @@ struct Mapped
     /** The whole file, read-only. */
     @views(self)
     bytes(&self) -> []const u8 = if self.n == 0 then [] else self.at[0..<self.n]
+
+    /** Tells the operating system how `len` bytes from offset `from` are about to be used; `len`
+     * left out means to the end of the mapping.
+     *
+     * **The range is widened to whole pages**: `from` is rounded down to a page boundary
+     * (`page_size()`) and the end up, since a page is the unit the system advises in. A range
+     * past the end of the mapping is `Other(22)` (`EINVAL`, "Invalid argument"); an empty mapping
+     * or an empty range does nothing and answers `Ok`. The advice never changes what `bytes()` reads.
+     *
+     * It is a hint, and what the system does with it is its own: `DontNeed` drops the pages of a
+     * file mapping on Linux, which keeps the resident size small while a huge file is read through
+     * once, and is ignored for a file mapping on macOS.
+     *
+     * On a target with no C library the program supplies `sysl_fs_advise` (and `sysl_fs_page_size`,
+     * where it is not 4096) to a call of this; a program that never calls it supplies neither.
+     */
+    advise(self, advice: Advice, from: usize = 0, len: usize = usize::Max) -> Result[unit, IoError]
+        if self.n == 0 then return Ok(())
+        if from > self.n then return Err(Other(einval))
+
+        val room = self.n - from
+        val count = if len == usize::Max then room else len
+
+        if count > room then return Err(Other(einval))
+        if count == 0 then return Ok(())
+
+        val page = page_size()
+        val start = from - from % page
+
+        answered(fsys.advise(&self.at[start], from + count - start, advice.rank()))
+    end advise
 end Mapped
+
+/** How a mapped range is about to be read, for `Mapped.advise`. */
+enum Advice
+    /** No special treatment: the default. */
+    Normal
+
+    /** Accesses will be scattered, so reading ahead is wasted. */
+    Random
+
+    /** Accesses will run from low addresses to high, so read ahead aggressively. */
+    Sequential
+
+    /** The range will be needed soon: fetch it now. */
+    WillNeed
+
+    /** The range will not be needed again soon: its pages may be dropped (Linux; ignored for a file
+     * mapping on macOS). The bytes stay readable and are read back from the file if touched again.
+     */
+    DontNeed
+
+    private[fs] rank(self) -> int = self match
+        Normal     -> 0
+        Random     -> 1
+        Sequential -> 2
+        WillNeed   -> 3
+        DontNeed   -> 4
+end Advice
+
+/** `EINVAL`, 22 on every platform: a range outside the mapping. */
+private const einval: int = 22
+
+/** The size in bytes of a page of memory, which a mapping is made and advised in. */
+page_size() -> usize
+    val got = fsys.page_size()
+
+    if got == 0 then 4096 else got
+end page_size
 
 impl Drop for Mapped
     drop(self)
