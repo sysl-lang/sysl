@@ -132,6 +132,8 @@ private ident_pattern(cx: &Analyzer, span: Span, written: string, ty: Type) -> T
 
     if descriptor.is_some() then return descriptor_pattern(cx, span, name, descriptor.unwrap(), ty)
 
+    if enum_path_mismatch(cx, span, written, name, ty) then return TWildPattern(ty)
+
     val v = variant_named(ty, name)
 
     if v.is_some() then return nullary_variant(cx, span, ty, v.unwrap(), name)
@@ -215,6 +217,9 @@ end hidden_value_key
 // nothing and the arm still needs a catch-all after it.
 private eq_pattern(cx: &Analyzer, span: Span, written: string, ty: Type) -> TPattern
     val name = last_segment(written)
+
+    if enum_path_mismatch(cx, span, written, name, ty) then return TWildPattern(ty)
+
     val v = variant_named(ty, name)
 
     if v.is_some() then return nullary_variant(cx, span, ty, v.unwrap(), name)
@@ -258,6 +263,40 @@ private const_pattern(cx: &Analyzer, span: Span, key: string, ty: Type) -> TPatt
     TLitPattern(t)
 end const_pattern
 
+// A variant written with a path belongs to the enum the path names. Where that is not the enum the
+// value has, the pattern is of another type and is refused as a mismatch, rather than being read as
+// the value's own same-named variant. A prefix that names no type (a module path to a bare name) is
+// left to the lookups that follow.
+private enum_path_mismatch(cx: &Analyzer, span: Span, written: string, name: string,
+                           ty: Type) -> bool
+    if written == name then return false
+
+    underlying(ty) match
+        Enum(d) ->
+            val prefix = written[0..<(written.bytes.len - name.bytes.len - 1)]
+            val key = lookup_type_key(cx.an, cx.scope, prefix)
+
+            if key.is_none() then return false
+
+            // An alias is another spelling of what it names, so it stands for that declaration.
+            var target = key.unwrap()
+            val named = cx.an.tables.constrained_insts.get(target)
+
+            if named.is_some()
+                underlying(named.unwrap()) match
+                    Enum(e) -> target = e.base
+                    _ -> ()
+
+            if target != d.base
+                cx.fault(span, s"pattern is $prefix but the value is ${type_show(ty)}")
+
+                return true
+            end if
+
+            false
+        _ -> false
+end enum_path_mismatch
+
 // The variant a name stands for, where the value is an enum that declares one.
 private variant_named(ty: Type, name: string) -> Option[EnumVariant] = underlying(ty) match
     Enum(d) -> d.variant(name)
@@ -284,6 +323,8 @@ private variant_pattern(cx: &Analyzer, span: Span, written: string, args: Buf[Pa
 
     underlying(ty) match
         Enum(d) ->
+            if enum_path_mismatch(cx, span, written, name, ty) then return TWildPattern(ty)
+
             val found = d.variant(name)
 
             if found.is_none()

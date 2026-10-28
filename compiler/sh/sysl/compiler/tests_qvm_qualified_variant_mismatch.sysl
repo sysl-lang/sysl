@@ -155,18 +155,101 @@ qvm_bare()
             Timeout -> print(0)
         """), "5\n")
 
-// TODO: un-ignore when a qualified variant pattern is checked against the enum its path names
-@test("qvm: a pattern naming the other enum's variant against a local scrutinee is refused",
-      ignore: "pattern.sysl ident_pattern drops the qualifier and trusts the scrutinee's type")
-qvm_pattern_refused()
-    if !qvm_ready() then return
-
+private qvm_pattern_refused(arm_text: string)
     val said = qvm_ran(qvm_other(), "import m\n" + qvm_local() + raw"""
         val e: Error = Error.Timeout
+        val o: Option[Error] = Some(e)
+        """ + "\n" + arm_text)
+
+    assert(said.contains("pattern is m.Error but the value is Error"), said)
+    assert(!said.contains("carries data"), said)
+end qvm_pattern_refused
+
+@test("qvm: a unit pattern naming the other enum's variant against a local scrutinee is refused")
+qvm_pattern_unit()
+    if !qvm_ready() then return
+
+    qvm_pattern_refused("e match\n    m.Error.Timeout -> print(1)\n    _ -> print(2)\n")
+
+@test("qvm: the same where only the other enum has the variant")
+qvm_pattern_unit_only()
+    if !qvm_ready() then return
+
+    qvm_pattern_refused("e match\n    m.Error.Only -> print(1)\n    _ -> print(2)\n")
+
+@test("qvm: a payload pattern of the other enum is refused")
+qvm_pattern_payload()
+    if !qvm_ready() then return
+
+    qvm_pattern_refused("e match\n    m.Error.Io(c) -> print(c)\n    _ -> print(2)\n")
+
+@test("qvm: a nested pattern of the other enum is refused")
+qvm_pattern_nested()
+    if !qvm_ready() then return
+
+    qvm_pattern_refused("o match\n    Some(m.Error.Timeout) -> print(1)\n    _ -> print(2)\n")
+
+@test("qvm: an or-pattern with one alternative of the other enum is refused")
+qvm_pattern_or()
+    if !qvm_ready() then return
+
+    qvm_pattern_refused("e match\n    Error.Timeout | m.Error.Timeout -> print(1)\n    _ -> print(2)\n")
+
+@test("qvm: an `is` test against the other enum's variant is refused")
+qvm_pattern_is()
+    if !qvm_ready() then return
+
+    qvm_pattern_refused("if e is m.Error.Timeout then print(1)\n")
+
+@test("qvm: through an import alias the pattern still names the other enum")
+qvm_pattern_alias_refused()
+    if !qvm_ready() then return
+
+    val said = qvm_ran(qvm_other(), "import m.Error as E2\n" + qvm_local() + raw"""
+        val e: Error = Error.Timeout
         e match
-            m.Error.Timeout -> print(1)
+            E2.Timeout -> print(1)
             _ -> print(2)
         """)
 
-    assert(said.contains("error"), said)
-    assert(!said.contains("carries data"), said)
+    assert(said.contains("pattern is E2 but the value is Error"), said)
+
+@test("qvm: the scrutinee's own enum is accepted in a pattern under every spelling")
+qvm_pattern_accepted()
+    if !qvm_ready() then return
+
+    assert_eq(qvm_ran(qvm_other(), "import m\nimport m.Error as E2\n" + raw"""
+        val a: m.Error = m.Error.Io(7)
+        val o: Option[m.Error] = Some(m.Error.Timeout)
+        a match
+            E2.Io(c) -> print(c)
+            m.Error.Timeout | m.Error.Only -> print(0)
+        o match
+            Some(m.Error.Timeout) -> print("t")
+            Some(E2.Io(_)) -> print("i")
+            Some(E2.Only) -> print("o")
+            None -> print("n")
+        if a is m.Error.Io(k) then print(k)
+        """), "7\nt\n7\n")
+
+@test("qvm: a type alias of the scrutinee's own enum is accepted in a pattern")
+qvm_pattern_type_alias()
+    if !qvm_ready() then return
+
+    assert_eq(qvm_ran(qvm_other(), "import m\ntype Alias = m.Error\n" + raw"""
+        val a: m.Error = m.Error.Io(5)
+        a match
+            Alias.Io(c) -> print(c)
+            _ -> print(0)
+        """), "5\n")
+
+@test("qvm: a bare pattern and exhaustiveness over the scrutinee's enum are unchanged")
+qvm_pattern_bare_exhaustive()
+    if !qvm_ready() then return
+
+    assert_eq(qvm_ran(qvm_other(), "import m\n" + qvm_local() + raw"""
+        val e: Error = Error.Io(2)
+        e match
+            Timeout -> print(0)
+            Error.Io(c) -> print(c)
+        """), "2\n")
