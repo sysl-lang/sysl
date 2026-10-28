@@ -279,6 +279,98 @@ same_receiver(x: Option[RecvMode], y: Option[RecvMode]) -> bool
             _ -> false
 end same_receiver
 
+// -- a `derive` member against the member it writes ------------------------------------------------
+//
+// **A `derive` member is the body of a member the trait declares, so its signature is that member's**,
+// with the deriving type's name standing where the trait wrote `Self`. The parser has already matched
+// the shape -- receiver, counts, own bounds -- and this compares the types, once per trait, where the
+// trait is declared: a mismatch is the trait's mistake, not each deriving type's.
+//
+// Both sides are read with `Self` and the deriving type's name bound to ONE stand-in, and the member's
+// own parameters to the trait member's stand-ins by position, so `-> int` against `-> Self` is told
+// even where some deriving type happens to be `int`. The reading is a trial: what resolving the types
+// made real belongs to the uses.
+check_derive_signatures(a: &Analysis, scope: Scope, body: Buf[Stmt])
+    for item in body
+        *item.kind match
+            TraitDecl(d) ->
+                for dm in d.derives
+                    check_derive_signature(a, scope, d, dm)
+            _ -> ()
+end check_derive_signatures
+
+private check_derive_signature(a: &Analysis, scope: Scope, tr: TraitDecl, d: DeriveDecl)
+    val m = d.member
+    var found: Option[MethodDecl] = None
+
+    for tm in tr.methods
+        if tm.name == m.name then found = Some(tm)
+
+    // A shape the parser refused has been told already.
+    if found.is_none() then return
+
+    val tm = found.unwrap()
+
+    if tm.is_property || !same_receiver(tm.receiver, m.receiver) then return
+    if tm.params.len() != m.params.len() || tm.tparams.len() != m.tparams.len() then return
+    if is_inferred_result(m.ret_type) then return
+
+    val outer = a.open_region()
+    val trial = a.sandboxed()
+    val queued = a.tables.members.pending.len()
+    val tables = a.tables.members.vtables.len()
+    val structs = a.tables.struct_insts.len()
+    val enums = a.tables.enum_insts.len()
+    val constrained = a.tables.constrained_insts.len()
+    val mark = a.complaints()
+    // Named for the deriving type, so a message shows both sides in the derive member's own words.
+    val me = Abstract(d.param, buf())
+    var base: Buf[Binding] = buf()
+
+    base.push(Binding(d.param, me))
+    base.push(Binding("Self", me))
+
+    val held = abstract_subst(a, scope, tr.tparams, tr.bounds, tr.tvalues, buf(), base)
+    val own = abstract_subst(a, scope, m.tparams, m.bounds, m.tvalues, m.tpacks, held)
+    val stand = joined_bindings(held, renamed_stand_ins(m.tparams, tm.tparams, own))
+    var said: Option[string] = None
+
+    for i in 0..<tm.params.len()
+        if said.is_some() then break
+
+        val want = resolve_type(a, scope, tm.params.at(i).typ, stand)
+        val got = resolve_type(a, scope, m.params.at(i).typ, own)
+
+        if !mentions_unknown(want) && !mentions_unknown(got) && !type_eq(want, got)
+            said = Some(s"parameter '${m.params.at(i).name}' of 'derive' member '${m.name}' is " +
+                        s"${type_show(got)}, but trait '${tr.name}' declares ${type_show(want)}")
+        end if
+
+    if said.is_none()
+        var want = Unit
+        var got = Unit
+
+        if tm.ret_type.is_some() then
+            want = declared_result_type(Some(resolve_result(a, scope, tm.ret_type.unwrap(), stand)))
+
+        if m.ret_type.is_some() then
+            got = declared_result_type(Some(resolve_result(a, scope, m.ret_type.unwrap(), own)))
+
+        if !mentions_unknown(want) && !mentions_unknown(got) && !type_eq(want, got) then
+            said = Some(s"'derive' member '${m.name}' returns ${type_show(got)}, but trait " +
+                        s"'${tr.name}' declares ${type_show(want)}")
+    end if
+
+    a.restore_complaints(mark)
+    a.release(trial)
+    rewind_instantiations(a, queued, tables, structs, enums, constrained)
+    a.close_region(outer)
+
+    if said.is_some() then
+        a.fault(scope, m.span, said.unwrap() + " — a 'derive' member writes that member's body, so " +
+                s"it takes its signature, with '${d.param}' for 'Self'")
+end check_derive_signature
+
 // The trait's stand-ins under the block's own spellings, so that a member renaming its parameters is
 // read as the same promise.
 private renamed_stand_ins(from: Buf[string], to: Buf[string], stand: Buf[Binding]) -> Buf[Binding]
