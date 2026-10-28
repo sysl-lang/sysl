@@ -776,7 +776,7 @@ private record_symbols(e: *Emit, p: TProgram)
 
         if f.variadic && f.exported.is_some() && !overridden_weak(p, f)
             e.symbols.push((f.name, f.exported.unwrap()))
-        else if is_displaced(e, f.name)
+        else if is_displaced(e, f.name) || spells_c_name(p, f.name)
             e.symbols.push((f.name, s"${f.name}${ModuleSep}${ModuleSep}sysl"))
 
         if f.variadic
@@ -787,6 +787,21 @@ private record_symbols(e: *Emit, p: TProgram)
         Some(en) -> e.symbols.push((en.func, "$$main"))
         None -> ()
 end record_symbols
+
+// **Whether a definition's key is a word C could spell, which no sysl definition may be emitted
+// under.** A root module's function has no module to carry into its key, so the key is the bare name
+// -- `write`, `read`, `malloc` -- and emitted under it the definition is that C symbol: beside the
+// compiler's own `declare` of it in this module an invalid redefinition, and at the link the
+// definition every other object's call to it resolves to, the library's C included. A symbol C
+// reaches is what `@export` publishes; everything else is the compiler's to spell. The entry is
+// named by `record_symbols` itself.
+private spells_c_name(p: TProgram, key: string) -> bool
+    if module_of(key) != ModuleRoot || !c_identifier(key) then return false
+
+    p.entry match
+        Some(en) -> en.func != key
+        None -> true
+end spells_c_name
 
 // Whether an export elsewhere in the program has claimed this key as its symbol -- whoever else
 // wanted it.

@@ -175,8 +175,26 @@ Two declarations may share one symbol under different sysl names, as above; a mo
 symbol once. **A link name is an `extern`'s alone** — a sysl function is *defined* here, and what it
 is called is its name.
 
-Note what this does *not* do: nothing here changes what a sysl function's own symbol is. It is the
-name, unmangled, so a program that defines `abs` collides with libc's whatever else it declares.
+Note what this does *not* do: nothing here changes what a sysl function's own symbol is. **That
+symbol is the compiler's, never a C name** — a module's function carries its module path into it,
+and a function of a file with no `module` header is laid down under a name C cannot spell — so a
+program may call its own functions `write`, `abs` or `malloc` without touching libc's, and the
+library's printing and allocation go on reaching libc. A symbol C is to reach is what `@export`,
+below, publishes.
+
+```sysl
+write(p: *int)
+    *p = 1
+
+var x = 0
+
+write(&x)
+print(x)
+```
+
+```output
+1
+```
 
 ### A link name in the `llvm.` namespace names an instruction
 
