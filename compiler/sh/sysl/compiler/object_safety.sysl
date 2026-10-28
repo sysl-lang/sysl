@@ -241,6 +241,104 @@ private check_object_safe(a: &Analysis, scope: Scope, span: Span, key: string, a
     false
 end check_object_safe
 
+// **Whether a reference or a pointer may meet a bound through what it points at**, which it does for
+// exactly the traits whose every member a call on the reference reaches the same way a call on the
+// referent would. A member call sees through one level of `&` or `*` (`reference/traits.md § Any type
+// may carry an impl`), so a generic body instantiated at `&Buf[int]` reads `b[i]` and `b.len()` off
+// the buffer -- and the bound has to agree with that, or the body is refused for a call it would
+// have made.
+//
+// It is the same question an object asks, for the same reason: what the body is handed is not the
+// type the implementation was written for. So the refusals are an object's, less the one an object
+// has and a reference does not -- an associated type is still known, being the referent's:
+//
+// - a member that names `Self` away from its receiver, since `Self` would be the reference in the
+//   body and the referent in the implementation (`merge(self, other: Self) -> Self`, `Ord`'s `lt`);
+// - an associated function or a static property, which is reached through the *type*, and the type
+//   is the reference's, which has none;
+// - through a `*T`, a member taking `&self`, which needs the counted box a pointer does not carry.
+//
+// **And the traits a reference answers by the compiler's rule, never by its referent**: `Eq` and
+// `Hash` are the address's (`reference/memory.md § &T — counted references`), so a trait requiring
+// either is refused too rather than answering two of its members by identity and the rest by value;
+// an operator's trait, because the operator does not see through a reference (`a + b` on a `&V` is
+// refused); `Drop`, which is the referent's own destruction rather than anything the reference
+// does; a callable, whose call is not a member call; and a family whose membership is the
+// compiler's.
+reaches_through_reference(a: &Analysis, tr: Bound, raw: bool) -> bool =
+    through_reference_refusal(a, tr, raw).is_none()
+
+// Why a reference does not meet a bound through its referent, said as the tail of the refusal; nothing
+// where it does.
+through_reference_refusal(a: &Analysis, tr: Bound, raw: bool) -> Option[string]
+    val self_bind = self_binding(Abstract("Self", buf()))
+    val head = plain_bound(tr.name, tr.args)
+    val closure = trait_closure(a, head, self_bind)
+    var settled: Buf[string] = buf()
+
+    for item in closure
+        val why = answered_by_the_compiler(item.name)
+
+        if why.is_some() then return why
+
+        val d = trait_decl_at(a, item.name)
+
+        if d.is_none() then return Some(s"'${qualified_name(item.name)}' is not a trait it can be asked")
+
+        for x in d.unwrap().assocs
+            settled.push(x.name)
+    end for
+
+    var selves: Buf[string] = buf()
+
+    selves.push("Self")
+
+    for item in trait_members(a, head, self_bind)
+        val m = item.1
+        val from = qualified_name(item.0.name)
+
+        if m.recv_mode().is_none() || m.is_static then
+            return Some(s"'${m.name}' of '$from' is reached through the type, and a reference's type " +
+                        "has none of its referent's associated members")
+
+        if raw && takes_ref_self(m) then
+            return Some(s"'${m.name}' of '$from' takes '&self', which needs the counted box a pointer " +
+                        "does not carry — pass a '&' reference instead")
+
+        if member_mentions(m, selves, settled) then
+            return Some(s"'${m.name}' of '$from' mentions 'Self' away from its receiver, which would " +
+                        "be the reference in the body and the referent in the implementation")
+    end for
+
+    None
+end through_reference_refusal
+
+// The traits a reference meets by a rule of its own, or not at all, whatever its referent implements.
+private answered_by_the_compiler(key: string) -> Option[string]
+    val shown = qualified_name(key)
+
+    if fn_is_call(key) then return Some(s"'$shown' is called, and a call does not see through a reference")
+
+    library_spelling(key) match
+        Some(s) ->
+            if s == "Eq" || s == "Hash" then
+                Some(s"a reference meets '$shown' by its own identity, never by what it points at")
+            else if operator_trait(s) then
+                Some(s"'$shown' is an operator's, and an operator does not see through a reference")
+            else if s == "Drop" then
+                Some(s"'$shown' is the referent's own destruction, which a reference does not carry out")
+            else if core_settled(s) then
+                Some(s"'$shown' is a family whose members the compiler names, and a reference is not one")
+            else None
+        None -> None
+end answered_by_the_compiler
+
+// Whether a library trait is one an operator is written against -- `Eq` and `Ord` included.
+private operator_trait(spelling: string) -> bool = spelling match
+    "Add" | "Sub" | "Mul" | "Div" | "Rem" | "BitAnd" | "BitOr" | "BitXor" | "Shl" | "Shr" -> true
+    "Neg" | "Not" | "Eq" | "Ord" -> true
+    _ -> false
+
 private takes_ref_self(m: MethodDecl) -> bool = m.receiver match
     Some(ByRef(_)) -> true
     _ -> false
