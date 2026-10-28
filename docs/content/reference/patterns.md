@@ -695,6 +695,22 @@ print(band(7), band(2), band(50))
 high low out
 ```
 
+A guard is any boolean expression, a bare name included. The `->` after it is the arm's, never the
+arrow of a closure; a closure inside a guard is written in parentheses, as an argument.
+
+```sysl
+pick(n: int, wide: bool) -> string
+    n match
+        1..10 if wide -> "wide"
+        else "other"
+
+print(pick(3, true), pick(3, false))
+```
+
+```output
+wide other
+```
+
 Three rules:
 
 - **A guard runs only when its pattern has already matched**, never for an arm that was ruled out, so
