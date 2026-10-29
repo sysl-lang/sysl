@@ -1,0 +1,120 @@
+module sh.sysl.compiler
+@tests
+
+// **A write made by a closure nested inside another reaches a copy of a copy.** The inner closure's
+// capture is the outer closure's own copy of the variable, so a read of the variable after the outer
+// closure is a program expecting the write to have reached it -- refused, at the write, as it is for
+// a closure written directly in the body. A counter the inner closure reads back, with the variable
+// outside left alone, is accepted, and so is the outer closure's own local.
+//
+// The helpers are `tests_enm_enum_run.sysl`'s.
+
+private const cwn_calls: string = "share(f: &Fn() -> unit) = f()\ncall(f: &Fn() -> unit) = f()\n\n"
+
+private cwn_used_after(name: string) -> string =
+    s"a closure captures by value, so it holds a copy of '$name' — so '+=' would reach that copy " +
+    "rather than the variable it came from, and the variable is used afterwards as though it had"
+
+private cwn_refused_once(text: string, want: string)
+    val said = enm_err(text)
+
+    assert(enm_says(said, want), said)
+
+    val first = said.index_of(want).unwrap()
+
+    assert(said[first + want.bytes.len..<said.bytes.len].index_of(want).is_none(), said)
+end cwn_refused_once
+
+@test("a nested closure's counter, the variable read after the outer closure: refused")
+cwn_read_after_outer()
+    if !enm_ready() then return
+
+    cwn_refused_once(cwn_calls + raw"""
+        main()
+            var n = 0
+            share(() -> call(() ->
+                n += 1
+                print(n)))
+            print(n)
+        """, cwn_used_after("n"))
+end cwn_read_after_outer
+
+@test("three closures deep, the variable read after the outermost: refused")
+cwn_three_deep()
+    if !enm_ready() then return
+
+    cwn_refused_once(cwn_calls + raw"""
+        main()
+            var n = 0
+            share(() -> share(() -> call(() ->
+                n += 1
+                print(n))))
+            print(n)
+        """, cwn_used_after("n"))
+end cwn_three_deep
+
+@test("the inner closure held in the outer one's 'val', the variable read after: refused")
+cwn_inner_in_a_val()
+    if !enm_ready() then return
+
+    cwn_refused_once(cwn_calls + raw"""
+        main()
+            var n = 0
+            share(() ->
+                var g = () ->
+                    n += 1
+                    print(n)
+                g())
+            print(n)
+        """, cwn_used_after("n"))
+end cwn_inner_in_a_val
+
+@test("the variable read inside the outer closure after the inner one: refused, as before")
+cwn_read_inside_outer()
+    if !enm_ready() then return
+
+    cwn_refused_once(cwn_calls + raw"""
+        main()
+            var n = 0
+            share(() ->
+                call(() ->
+                    n += 1
+                    print(n))
+                print(n))
+        """, cwn_used_after("n"))
+end cwn_read_inside_outer
+
+@test("a nested write nothing reads back: refused, as before")
+cwn_unread()
+    if !enm_ready() then return
+
+    cwn_refused_once(cwn_calls + raw"""
+        main()
+            var n = 0
+            share(() -> call(() -> n += 1))
+            print(n)
+        """, "a closure captures by value, so it holds a copy of 'n' — so '+=' would reach that copy " +
+             "rather than the variable it came from, and nothing in the closure reads it back")
+end cwn_unread
+
+@test("a nested counter with the variable outside left alone, and the outer closure's own local")
+cwn_accepted()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(cwn_calls + raw"""
+        main()
+            var n = 0
+            print(n)
+            share(() -> call(() ->
+                n += 1
+                print(n)))
+            share(() ->
+                var k = 10
+                call(() ->
+                    k += 1
+                    print(k)))
+            val p: &int = 0
+            share(() -> call(() -> *p += 5))
+            print(*p)
+        """), "0\n1\n11\n5\n")
+end cwn_accepted
