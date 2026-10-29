@@ -12,7 +12,7 @@ module sysl.fmt
 import sysl.text.from_utf8_unchecked
 import sysl.buf.byte_sink
 import sysl.{Integer, Big, FloatField, FloatValue, f32_value, fixed_value, quad_value, real_value, shortest_f32, shortest_quad,
-             shortest_real, write_float_field, float_scratch_need, wide_digits, float_request, write_float_laid,
+             shortest_real, real_parts, f32_parts, write_float_field, float_scratch_need, wide_digits, float_request, write_float_laid,
              scratch_need_of, bits_of, plain_real, plain_f32, plain_f16, plain_bf16, plain_quad}
 
 /** An integer rendered through a printf specifier, written here rather than handed to C's
@@ -502,6 +502,57 @@ shortest(x: f32) -> string
     var buf: [32]u8
 
     from_utf8_unchecked(buf[0..<shortest_f32(x, buf[..])])
+
+/** What kind of number a `RealDigits` describes. */
+enum RealKind
+    /** A finite, non-zero value: `digits` and `exponent` name it. */
+    Finite
+
+    /** Zero, of either sign. */
+    Zero
+
+    /** Positive or negative infinity. */
+    Infinite
+
+    /** Not a number. */
+    NaN
+
+/** A float's shortest round-trip decimal, taken apart so a program can lay it out in its own style.
+ *
+ * For a `Finite` value the number is `-`(if `negative`) then `d.ddd` times ten to the `exponent`,
+ * where `digits` is `"dddd"` -- ASCII digits, the first non-zero, no trailing zero: `1e20` is digits
+ * `"1"`, exponent 20; `123.456` is `"123456"`, exponent 2; `0.001` is `"1"`, exponent -3. A `Zero`
+ * has digits `"0"` and exponent 0, and `Infinite` and `NaN` have no digits. `negative` is the sign
+ * bit, so it is set for `-0` and `-inf`.
+ */
+struct RealDigits
+    kind: RealKind
+    negative: bool
+    digits: string
+    exponent: int
+
+private digits_text(parts: (int, usize, int, bool), buf: []u8) -> RealDigits
+    val kind = if parts.0 == 0 then RealKind.Finite elif parts.0 == 1 then RealKind.Zero
+    elif parts.0 == 2 then RealKind.Infinite else RealKind.NaN
+    val text = if parts.0 == 0 then from_utf8_unchecked(buf[0..<parts.1])
+    elif parts.0 == 1 then "0" else ""
+
+    RealDigits(kind, parts.3, text, parts.2)
+
+/** The fewest digits that read back as `x`, and the decimal exponent of the first -- the same digits
+ * `shortest(x)` spells in `%g` style, for a program that writes reals its own way (Java's `1.0E20`,
+ * say). See `RealDigits` for how to read the answer.
+ */
+real_digits(x: real) -> RealDigits
+    var buf: [24]u8
+
+    digits_text(real_parts(x, buf[..]), buf[..])
+
+/** The fewest digits that read back as the same `f32`: `real_digits(f32(0.1))` is `"1"`, exponent -1. */
+real_digits(x: f32) -> RealDigits
+    var buf: [24]u8
+
+    digits_text(f32_parts(x, buf[..]), buf[..])
 
 private float_text(v: FloatValue, spec: string, width: int, precision: int) -> string
     var sink = byte_sink()

@@ -64,6 +64,46 @@ private[sysl] shortest_f32(x: f32, into: []u8) -> usize
                    fraction != 0 || biased <= 1, into)
 end shortest_f32
 
+/** The shortest digits of `x` as `(kind, count, point, negative)`, the digits written to the front of
+ * `into` (twenty bytes are always enough). `kind` is 0 for a finite non-zero value, 1 for a zero, 2
+ * for an infinity and 3 for a NaN; only kind 0 has digits, whose first stands for `10^point`.
+ */
+private[sysl] real_parts(x: real, into: []u8) -> (int, usize, int, bool)
+    val bits = x.bits()
+    val biased = int((bits >> 52) & 0x7ff)
+    val fraction = bits & 0xfffffffffffff
+    val m2 = if biased == 0 then fraction else (1 << 52) | fraction
+    val e2 = (if biased == 0 then 1 else biased) - 1023 - 52 - 2
+
+    decimal_parts(bits >> 63 != 0, biased == 0x7ff, fraction != 0, m2, e2, fraction != 0 || biased <= 1, into)
+end real_parts
+
+/** `real_parts` for an `f32`, in the digits an `f32` needs. */
+private[sysl] f32_parts(x: f32, into: []u8) -> (int, usize, int, bool)
+    val bits = x.bits()
+    val biased = int((bits >> 23) & 0xff)
+    val fraction = u64(bits & 0x7fffff)
+    val m2 = if biased == 0 then fraction else (1 << 23) | fraction
+    val e2 = (if biased == 0 then 1 else biased) - 127 - 23 - 2
+
+    decimal_parts(bits >> 31 != 0, biased == 0xff, fraction != 0, m2, e2, fraction != 0 || biased <= 1, into)
+end f32_parts
+
+private decimal_parts(negative: bool, special: bool, nan: bool, m2: u64, e2: int, lower_half: bool,
+                      into: []u8) -> (int, usize, int, bool)
+    if special && nan then return (3, 0, 0, negative)
+    if special then return (2, 0, 0, negative)
+    if m2 == 0 then return (1, 0, 0, negative)
+
+    val found = shortest_decimal(m2, e2, lower_half, false)
+    var digits: [20]u8
+    val first = digits_ulong(found.0, digits[..])
+    val count = digits.len - first
+
+    put_bytes(into, 0, digits[first..])
+    (0, count, found.1 + int(count) - 1, negative)
+end decimal_parts
+
 /** A `real` the way `print`, `str` and a plain hole write it, which is what Rust's `{}` writes: the
  * fewest digits that read back as the same `real` -- the closest of those, and of two equally close
  * the larger -- set out positionally, never an exponent, a whole number with no `.0`, and `-0`,

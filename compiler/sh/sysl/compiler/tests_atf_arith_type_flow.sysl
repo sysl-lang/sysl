@@ -8,10 +8,9 @@ import sysl.process.capture
 // A literal binding's undecided type flows through arithmetic (`var_first_use.sysl`,
 // `reference/declarations.md § A literal binding takes its type from its first use`): `i + 1` has
 // `i`'s type, whatever it turns out to be, so a comparison or a position that fixes the arithmetic
-// fixes `i`. An operand of a type of its own beside it in arithmetic does NOT fix `i`: the binding
-// keeps its default and the operand widens to it, so nothing wraps at a type the program never named.
-// A shift's amount stays independent of the value shifted, and with no fixing use the binding is the
-// default `int`.
+// fixes `i`, and so does an operand of a type of its own beside it in arithmetic, as rustc's integer
+// variables are fixed (`tests_aif_arith_infer_full.sysl` has that rule's matrix). A shift's amount
+// stays independent of the value shifted, and with no fixing use the binding is the default `int`.
 //
 // Each binding's type is shown by `val z: bool = <binding>`, which fixes nothing (a `bool` is no
 // number) and is told the type the binding has.
@@ -173,18 +172,17 @@ atf_two_bindings()
     assert(atf_is(report, "j", "uint"), report)
     assert_eq(atf_count(report), 2)
 
-@test("an operand of a type of its own fixes nothing beside it, on either side: the binding stays int and nothing wraps")
+@test("an operand of a type of its own fixes the binding beside it, on either side, and the sum wraps at that type")
 atf_typed_operand()
     if !atf_ready() then return
 
-    // A `u8` beside `250` would wrap to 4 were the binding fixed at it; it widens to `int` instead.
     assert_eq(atf_ran(raw"""
         main()
             val k: u8 = 10
             var i = 250
             var j = 250
             print(i + k, k + j)
-        """), "260 260\n")
+        """), "4 4\n")
 
     val report = atf_err(raw"""
         main()
@@ -196,24 +194,22 @@ atf_typed_operand()
             val zj: bool = j
         """)
 
-    assert(atf_is(report, "i", "int"), report)
-    assert(atf_is(report, "j", "int"), report)
+    assert(atf_is(report, "i", "byte"), report)
+    assert(atf_is(report, "j", "byte"), report)
     assert_eq(atf_count(report), 2)
 
-@test("a usize operand fixes nothing beside it, so an int and a usize are refused as with the default written")
+@test("a usize operand fixes the binding beside it, so a counter plus a length needs no conversion")
 atf_usize_operand()
     if !atf_ready() then return
 
-    val report = atf_err(raw"""
+    assert_eq(atf_ran(raw"""
         main()
             val xs = [1, 2, 3]
             var m = 1
             print(m + xs.len)
-        """)
+        """), "4\n")
 
-    assert(atf_says(report, "'+' needs matching types, got int and usize", "4:15"), report)
-    assert_eq(atf_count(report), 1)
-
+    // With `int` written the pair is refused, as before: only an undecided binding is fixed.
     val written = atf_err(raw"""
         main()
             val xs = [1, 2, 3]
@@ -223,21 +219,26 @@ atf_usize_operand()
 
     assert(atf_says(written, "'+' needs matching types, got int and usize", "4:15"), written)
 
-@test("a float operand fixes nothing beside an integer binding, which is refused as with the default written")
+@test("an integer binding beside a float operand is fixed at the float, where it holds the value exactly")
 atf_float_operand()
     if !atf_ready() then return
 
-    val report = atf_err(raw"""
+    assert_eq(atf_ran(raw"""
         main()
             var c = 3
             val h: f32 = 0.5
             print(c * h)
-        """)
+        """), "1.5\n")
 
-    assert(atf_says(report, "'*' needs matching types, got int and f32", "4:15"), report)
-    assert_eq(atf_count(report), 1)
+    assert(atf_is(atf_err(raw"""
+        main()
+            var c = 3
+            val h: f32 = 0.5
+            print(c * h)
+            val zc: bool = c
+        """), "c", "f32"))
 
-@test("a typed operand that reads another open binding fixes neither: both stay int and the sum widens")
+@test("a typed operand that reads another open binding fixes that one first, then the one beside it")
 atf_nested_typed()
     if !atf_ready() then return
 
@@ -247,7 +248,7 @@ atf_nested_typed()
             var e = 1
             var g = 254
             print(e + (k + g))
-        """), "257\n")
+        """), "1\n")
 
     val report = atf_err(raw"""
         main()
@@ -259,16 +260,15 @@ atf_nested_typed()
             val zg: bool = g
         """)
 
-    assert(atf_is(report, "e", "int"), report)
-    assert(atf_is(report, "g", "int"), report)
+    assert(atf_is(report, "e", "byte"), report)
+    assert(atf_is(report, "g", "byte"), report)
     assert_eq(atf_count(report), 2)
 
-@test("arithmetic beside a typed operand fixes nothing, but a later comparison with it does, and decides the sum too")
+@test("arithmetic beside a typed operand and a later comparison with it agree, so the binding is that type throughout")
 atf_later_compare_fixes()
     if !atf_ready() then return
 
-    // The comparison is the first use that fixes `sum`, so it is a `u8` everywhere, the sum before
-    // it included, and wraps as a byte does.
+    // The sum is the first use that fixes `sum`, so it is a `u8` everywhere and wraps as a byte does.
     assert_eq(atf_ran(raw"""
         main()
             var sum = 250
@@ -357,18 +357,15 @@ atf_positions()
         """), "2000000000000 5 65535\n")
 
     // Arithmetic with an operand of a type of its own is not undecided, so the position fixes nothing
-    // through it, and the sum is the `int` it widened to, as with the default written.
-    val typed = atf_err(raw"""
+    // through it; the operand beside the binding does, and the sum is that type.
+    assert_eq(atf_ran(raw"""
         next(n: u16) -> u16
             var i = 1
             return i + n
 
         main()
             print(next(4))
-        """)
-
-    assert(atf_says(typed, "return type mismatch: expected ushort, got int", "3:5"), typed)
-    assert_eq(atf_count(typed), 1)
+        """), "5\n")
 
     assert(atf_is(atf_err(raw"""
         wide(x: i64) -> i64 = x
@@ -444,7 +441,7 @@ atf_disagree()
 
     assert(atf_says(written, "'n' of 'narrow' is byte, but usize was given", "7:18"), written)
 
-@test("a literal the fixing type cannot hold is not fixed by it: refused where an int is, compared where one widens")
+@test("a literal a position or a comparison cannot hold is not fixed by it: refused where an int is, compared where one widens")
 atf_literal_out_of_range()
     if !atf_ready() then return
 

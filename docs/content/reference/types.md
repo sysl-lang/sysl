@@ -87,6 +87,12 @@ val big = 4294967295
 the literal 4294967295 does not fit int
 ```
 
+**A binding given a bare literal takes its type from its first use that fixes one**, not from the
+literal: a comparison, an argument, a result, or arithmetic beside an operand of a type of its own.
+In `var sum = 250` followed by `sum + b` over a `u8`, `sum` is a `u8` — and `var s = 300` beside the
+same `b` is refused as `300` would be with `u8` written. A binding no use fixes is the literal's
+default, `int` or `real` ([declarations](/reference/declarations/#a-literal-binding-takes-its-type-from-its-first-use)).
+
 ### Arithmetic wraps
 
 **What a plain `+`, `-` or `*` does when the answer does not fit is the build mode's.** In a
