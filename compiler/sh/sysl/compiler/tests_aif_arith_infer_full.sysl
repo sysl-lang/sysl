@@ -1,0 +1,419 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// Arithmetic beside an operand of a type of its own fixes a literal binding at that type, as rustc's
+// integer variables are fixed (`var_first_use.sysl`, `reference/declarations.md § A literal binding
+// takes its type from its first use`): `sum + b` over a `u8` makes `sum` a `u8`, and `s += b` makes
+// `s` one. Each cell is checked against what rustc 1.94 does with the same program; where sysl
+// differs by its own design (two typed integer operands widen losslessly), the cell says so.
+//
+// Each binding's type is shown by `val z: bool = <binding>`, which fixes nothing and is told the type
+// the binding has.
+
+private aif_ready() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+
+    true
+end aif_ready
+
+// What a program prints, built and run.
+private aif_ran(text: string) -> string
+    val root = make_temp_dir("sysl-aif").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end aif_ran
+
+// Everything a source has to say for itself.
+private aif_err(text: string) -> string
+    val root = make_temp_dir("sysl-aif").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    val out = emit_llvm_text(src, None) match
+        Err(why) -> why.message
+        Ok(made) -> if made.report.is_empty() then "" else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end aif_err
+
+// Whether a report carries a diagnostic, pointed at a line and column of `main.sysl`.
+private aif_says(report: string, message: string, at: string) -> bool =
+    report.contains(s"error: $message") && report.contains(s"main.sysl:$at\n")
+
+// Whether a report says the binding `z<name>` was handed is of a type.
+private aif_is(report: string, name: string, ty: string) -> bool =
+    report.contains(s"error: cannot initialize 'z$name': declared bool but the value is $ty\n")
+
+// How many diagnostics a report carries.
+private aif_count(report: string) -> usize
+    var seen: usize = 0
+    var rest = report
+
+    loop
+        rest.index_of("error: ") match
+            None -> break
+            Some(at) ->
+                seen += 1
+                rest = rest[(at + 7)..<rest.bytes.len]
+
+    seen
+end aif_count
+
+@test("a sum beside a byte is a byte and wraps as one, on either side, as rustc's integer variable is")
+aif_sum_beside_byte()
+    if !aif_ready() then return
+
+    // rustc: `let sum = 250; sum + b` with `b: u8` makes `sum` a `u8` (and its overflow lint refuses
+    // the constant 260 at compile time; a run wraps).
+    assert_eq(aif_ran(raw"""
+        main()
+            val b: u8 = 10
+            var sum = 250
+            var other = 250
+            print(sum + b, b + other)
+        """), "4 4\n")
+
+    val report = aif_err(raw"""
+        main()
+            val b: u8 = 10
+            var sum = 250
+            var other = 250
+            print(sum + b, b + other)
+            val zsum: bool = sum
+            val zother: bool = other
+        """)
+
+    assert(aif_is(report, "sum", "byte"), report)
+    assert(aif_is(report, "other", "byte"), report)
+    assert_eq(aif_count(report), 2)
+
+@test("a compound assignment fixes an open place at the value's type and an open value at the place's")
+aif_compound()
+    if !aif_ready() then return
+
+    // rustc: `let mut s = 3; s += b` makes `s` a `u8` (13).
+    assert_eq(aif_ran(raw"""
+        main()
+            val b: u8 = 10
+            val w: u16 = 1000
+            var s = 3
+            s += b
+            var t = 250
+            t += b
+            var u = 2
+            u = u * b
+            var total: u64 = 5
+            var k = 7
+            total -= k
+            var m = 4
+            m *= w
+            print(s, t, u, total, m)
+        """), "13 4 20 18446744073709551614 4000\n")
+
+    val report = aif_err(raw"""
+        main()
+            val b: u8 = 10
+            val w: u16 = 1000
+            var s = 3
+            s += b
+            var u = 2
+            u = u * b
+            var total: u64 = 5
+            var k = 7
+            total -= k
+            var m = 4
+            m *= w
+            val zs: bool = s
+            val zu: bool = u
+            val zk: bool = k
+            val zm: bool = m
+        """)
+
+    assert(aif_is(report, "s", "byte"), report)
+    assert(aif_is(report, "u", "byte"), report)
+    assert(aif_is(report, "k", "ulong"), report)
+    assert(aif_is(report, "m", "ushort"), report)
+    assert_eq(aif_count(report), 4)
+
+@test("a shift is not arithmetic between its operands: neither a shifted place nor a shifted value is fixed by the amount")
+aif_shift()
+    if !aif_ready() then return
+
+    assert_eq(aif_ran(raw"""
+        main()
+            val b: u8 = 10
+            var v = 5
+            var sh = 250
+            sh <<= b
+            print(v << b, sh)
+        """), "5120 256000\n")
+
+    val report = aif_err(raw"""
+        main()
+            val b: u8 = 10
+            var v = 5
+            var sh = 250
+            sh <<= b
+            print(v << b)
+            val zv: bool = v
+            val zsh: bool = sh
+        """)
+
+    assert(aif_is(report, "v", "int"), report)
+    assert(aif_is(report, "sh", "int"), report)
+    assert_eq(aif_count(report), 2)
+
+@test("a chain fixes every open binding in it, and a typed operand anywhere in it fixes them all")
+aif_chains()
+    if !aif_ready() then return
+
+    // rustc: `t + b + c` with `b, c: u8` makes `t` a `u8` (13).
+    assert_eq(aif_ran(raw"""
+        main()
+            val b: u8 = 10
+            val c: u8 = 2
+            var t = 1
+            var x = 1
+            var y = 1
+            print(t + b + c, (x + 1) * b, b * (y + 1) + c)
+        """), "13 20 22\n")
+
+    val report = aif_err(raw"""
+        main()
+            val b: u8 = 10
+            val c: u8 = 2
+            var t = 1
+            var x = 1
+            var y = 1
+            print(t + b + c, (x + 1) * b, b * (y + 1) + c)
+            val zt: bool = t
+            val zx: bool = x
+            val zy: bool = y
+        """)
+
+    assert(aif_is(report, "t", "byte"), report)
+    assert(aif_is(report, "x", "byte"), report)
+    assert(aif_is(report, "y", "byte"), report)
+    assert_eq(aif_count(report), 3)
+
+@test("a literal the typed operand's type does not hold is refused at the literal, as with the type written")
+aif_out_of_range()
+    if !aif_ready() then return
+
+    // rustc: `let s = 300; s + b` with `b: u8` -- "literal out of range for `u8`" at the 300.
+    val report = aif_err(raw"""
+        main()
+            val b: u8 = 10
+            var s = 300
+            print(s + b)
+        """)
+
+    assert(aif_says(report, "the literal 300 does not fit byte", "3:13"), report)
+    assert_eq(aif_count(report), 1)
+
+    // A negative literal beside an unsigned operand, through a compound assignment.
+    val negative = aif_err(raw"""
+        main()
+            val b: u8 = 10
+            var t = -1
+            t += b
+        """)
+
+    assert(aif_says(negative, "the literal -1 does not fit byte", "3:13"), negative)
+    assert_eq(aif_count(negative), 1)
+
+    // The written type is refused the same way, at the same place.
+    val written = aif_err(raw"""
+        main()
+            val b: u8 = 10
+            var s: u8 = 300
+            print(s + b)
+        """)
+
+    assert(aif_says(written, "the literal 300 does not fit byte", "3:17"), written)
+
+    // A later value the fixed type does not hold is told at the assignment.
+    val later = aif_err(raw"""
+        main()
+            val b: u8 = 10
+            var u = 1
+            print(u + b)
+            u = 1000
+        """)
+
+    assert(aif_says(later, "the literal 1000 does not fit byte", "5:9"), later)
+    assert_eq(aif_count(later), 1)
+
+@test("a float literal beside an integer operand fixes nothing: the binding is a real and the integer widens")
+aif_float_literal_beside_integer()
+    if !aif_ready() then return
+
+    assert_eq(aif_ran(raw"""
+        main()
+            val b: u8 = 10
+            var f = 2.5
+            print(f + b)
+        """), "12.5\n")
+
+    assert(aif_is(aif_err(raw"""
+        main()
+            val b: u8 = 10
+            var f = 2.5
+            print(f + b)
+            val zf: bool = f
+        """), "f", "real"))
+
+@test("the first fixing use decides: a later operand of another type widens where it may and is refused where not")
+aif_first_use_decides()
+    if !aif_ready() then return
+
+    // rustc refuses `s + w` after `s + b` ("expected `u8`, found `u16`"); sysl widens a byte to a
+    // ushort losslessly, as it does for two typed operands written out (`b + w` is 1010).
+    assert_eq(aif_ran(raw"""
+        main()
+            val b: u8 = 10
+            val w: u16 = 1000
+            var s = 3
+            print(s + b, s + w, b + w)
+        """), "13 1003 1010\n")
+
+    assert(aif_is(aif_err(raw"""
+        main()
+            val b: u8 = 10
+            val w: u16 = 1000
+            var s = 3
+            print(s + b, s + w)
+            val zs: bool = s
+        """), "s", "byte"))
+
+    // A later operand the first type does not widen to is refused naming both, as with `u8` written.
+    val report = aif_err(raw"""
+        main()
+            val b: u8 = 10
+            val j: i8 = 3
+            var s = 1
+            print(s + b)
+            print(s + j)
+        """)
+
+    assert(aif_says(report, "'+' needs matching types, got byte and i8", "6:15"), report)
+    assert_eq(aif_count(report), 1)
+
+    val written = aif_err(raw"""
+        main()
+            val b: u8 = 10
+            val j: i8 = 3
+            var s: u8 = 1
+            print(s + b)
+            print(s + j)
+        """)
+
+    assert(aif_says(written, "'+' needs matching types, got byte and i8", "6:15"), written)
+
+@test("a for variable and a literal binding in one sum are both fixed by the typed operand beside them")
+aif_for_interplay()
+    if !aif_ready() then return
+
+    // rustc: `for i in 1..4 { i * g + b }` makes `i` and `g` `u8`.
+    assert_eq(aif_ran(raw"""
+        main()
+            val b: u8 = 10
+            var g = 2
+            for i in 1..4 do print(i * g + b)
+            var acc = 0
+            for k in 0u16..<3 do acc += k
+            var n: u64 = 0
+            for i in 1..4 do n += i
+            print(acc, n)
+        """), "12\n14\n16\n18\n3 10\n")
+
+    val report = aif_err(raw"""
+        main()
+            val b: u8 = 10
+            var g = 2
+            for i in 1..4
+                print(i * g + b)
+                val zi: bool = i
+            var acc = 0
+            for k in 0u16..<3 do acc += k
+            val zg: bool = g
+            val zacc: bool = acc
+        """)
+
+    assert(aif_is(report, "i", "byte"), report)
+    assert(aif_is(report, "g", "byte"), report)
+    assert(aif_is(report, "acc", "ushort"), report)
+    assert_eq(aif_count(report), 3)
+
+@test("arithmetic as a generic call's argument, in a closure, and under the wrapping and saturating operators fixes the binding")
+aif_generic_closure_wrap()
+    if !aif_ready() then return
+
+    assert_eq(aif_ran(raw"""
+        pick[T](a: T, b: T) -> T = a
+
+        main()
+            val b: u8 = 10
+            val c: u8 = 2
+            var k = 7
+            var e = 0
+            val f = () -> e + b
+            var p = 250
+            var q = 250
+            var r = 250
+            r +%= b
+            print(pick(k + b, c), f(), p +% b, q +| b, r)
+        """), "17 10 4 255 4\n")
+
+    val report = aif_err(raw"""
+        pick[T](a: T, b: T) -> T = a
+
+        main()
+            val b: u8 = 10
+            val c: u8 = 2
+            var k = 7
+            var e = 0
+            val f = () -> e + b
+            var p = 250
+            var q = 250
+            print(pick(k + b, c), f(), p +% b, q +| b)
+            val zk: bool = k
+            val ze: bool = e
+            val zp: bool = p
+            val zq: bool = q
+        """)
+
+    assert(aif_is(report, "k", "byte"), report)
+    assert(aif_is(report, "e", "byte"), report)
+    assert(aif_is(report, "p", "byte"), report)
+    assert(aif_is(report, "q", "byte"), report)
+    assert_eq(aif_count(report), 4)
