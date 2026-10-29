@@ -568,21 +568,29 @@ end CopyWrite
 // **A read of a binding after a closure wrote its own copy of it** is a program expecting the write
 // to have reached it: refused once, at the write, where the closure holds that capture by value. The
 // closure's own reading of the name, when it is formed, lies inside the closure and is not "after" it.
+//
+// **One write can be on record twice**, with conditions that exclude each other: a closure nested in
+// a by-value one writes its own copy where it holds the capture by value (the record handed up from
+// the outer closure's body), and the outer closure's copy where it holds it by reference (the outer
+// closure's record, naming the inner one as `via`). Each is owed, so whichever holds is said.
 read_after_copy_write(cx: &Analyzer, span: Span, unique: string)
     if cx.copy_writes.is_empty() then return
 
-    for i in 0..<cx.copy_writes.len()
+    var i: usize = 0
+
+    while i < cx.copy_writes.len()
         val w = cx.copy_writes.at(i)
 
-        if w.unique != unique then continue
-        if span.start >= w.closure.start && span.end <= w.closure.end then continue
+        if w.unique != unique || span.start >= w.closure.start && span.end <= w.closure.end
+            i += 1
+            continue
+        end if
 
         lost_write_owed(cx, w.write, w.name, w.form, w.shown,
                         "and the variable is used afterwards as though it had", w.base, w.capture, w.via,
                         w.via_capture)
         cx.copy_writes.remove(i)
-        return
-    end for
+    end while
 end read_after_copy_write
 
 // **A closure written inside another writes a copy of the outer closure's capture**, and that capture
@@ -601,7 +609,7 @@ private hand_up_copy_writes(cx: &Analyzer, inner: &Analyzer, span: Span, capture
 
             if outer.is_some()
                 cx.copy_writes.push(CopyWrite(outer.unwrap().unique, w.name, span, w.write, w.form,
-                                              w.shown, w.base, w.capture))
+                                              w.shown, w.base, w.capture, w.via, w.via_capture))
         end for
     end for
 end hand_up_copy_writes
