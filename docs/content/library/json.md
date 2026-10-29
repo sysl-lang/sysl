@@ -126,7 +126,7 @@ print(from_json[Server]("{\"host\": \"h\", \"port\": 70000}").unwrap_err())
 ```output
 example.org 8443 None
 {"host":"a\"b","port":80,"tls":true}
-port: out of range for u16 (byte 23)
+port: out of range for ushort (byte 22)
 ```
 
 `JsonEncoder` writes into any `Writer` as it goes, compactly, with a real in its shortest form. A

@@ -155,19 +155,20 @@ cdc_not_finite()
     val bad = Scalars(false, 0, 0, 0, 0, 0, 0.0 / 0.0, 1.0, 'x', "")
 
     assert_eq(to_json(bad).unwrap_err().to_string(),
-              "a NaN or an infinity, which the format has no spelling for (byte 56)")
+              "a NaN or an infinity, which the format has no spelling for (byte 58)")
     assert_eq(to_json(1.0 / 0.0).unwrap_err().to_string(),
               "a NaN or an infinity, which the format has no spelling for (byte 0)")
 
 @test("an integer is held to its type's range, at every width")
 cdc_integer_ranges()
     assert_eq(from_json[u8]("255").unwrap(), 255)
-    assert_eq(refused[u8]("256"), "out of range for u8 (byte 0)")
-    assert_eq(refused[u8]("-1"), "out of range for u8 (byte 0)")
+    // A width with a name of its own is called by it, as every diagnostic calls it.
+    assert_eq(refused[u8]("256"), "out of range for byte (byte 0)")
+    assert_eq(refused[u8]("-1"), "out of range for byte (byte 0)")
     assert_eq(refused[i8](" -129"), "out of range for i8 (byte 1)")
     assert_eq(from_json[u64]("18446744073709551615").unwrap(), 18446744073709551615)
-    assert_eq(refused[u64]("18446744073709551616"), "out of range for u64 (byte 0)")
-    assert_eq(refused[i64]("-9223372036854775809"), "out of range for i64 (byte 0)")
+    assert_eq(refused[u64]("18446744073709551616"), "out of range for ulong (byte 0)")
+    assert_eq(refused[i64]("-9223372036854775809"), "out of range for long (byte 0)")
     assert_eq(refused[int]("123456789012345678901234567890123456789012345"), "out of range for int (byte 0)")
     assert_eq(refused[u24]("16777216"), "out of range for u24 (byte 0)")
     assert_eq(refused[int]("1.0"), "an integer expected (byte 0)")
@@ -316,6 +317,9 @@ cdc_unknown_fields()
     assert_eq(from_json[Inner]("{\"x\":{\"y\":[1,{\"z\":\"no\"}],\"w\":null},\"z\":4,\"q\":true}").unwrap().z, 4)
     assert_eq(from_json[Strict]("{\"a\":1,\"bee\":2}").unwrap().b, 2)
     assert_eq(refused[Strict]("{\"a\":1,\"b\":2}"), "'b' is not a field of Strict (byte 7)")
+    // The byte is the key's own, past the comma and the blanks around it.
+    assert_eq(refused[Strict]("{\"a\":1 ,\n \"b\":2}"), "'b' is not a field of Strict (byte 10)")
+    assert_eq(refused[Inner]("{ }"), "the field 'z' is missing (byte 2)")
     // A skipped value is still read, and refused where it is not JSON.
     assert_eq(refused[Inner]("{\"x\":[1,],\"z\":4}"), "a value expected (byte 8)")
 
@@ -323,7 +327,7 @@ cdc_unknown_fields()
 cdc_missing_field()
     assert_eq(refused[Inner]("{}"), "the field 'z' is missing (byte 1)")
     assert_eq(refused[Outer]("{\"id\":1,\"inner\":{ }}"), "inner: the field 'z' is missing (byte 18)")
-    assert_eq(refused[Shape]("{\"Rect\":{\"w\":1}}"), "Rect: the field 'h' is missing (byte 15)")
+    assert_eq(refused[Shape]("{\"Rect\":{\"w\":1}}"), "Rect: the field 'h' is missing (byte 14)")
 
 @test("a flattened struct's fields are written at its level, and read from there")
 cdc_flatten()
@@ -338,8 +342,8 @@ cdc_flatten()
     assert_eq(back.meta.version, 3)
     assert_eq(back.body, "x")
     assert_eq(refused[Doc]("{\"title\":\"t\",\"version\":2,\"author\":\"a\",\"body\":\"b\",\"x\":1}"),
-              "'x' is not a field of Doc (byte 50)")
-    assert_eq(refused[Doc]("{\"title\":\"t\",\"author\":\"a\",\"body\":\"b\"}"), "the field 'version' is missing (byte 37)")
+              "'x' is not a field of Doc (byte 49)")
+    assert_eq(refused[Doc]("{\"title\":\"t\",\"author\":\"a\",\"body\":\"b\"}"), "the field 'version' is missing (byte 36)")
 end cdc_flatten
 
 // -- tagged enums ----------------------------------------------------------------------------------
@@ -358,7 +362,7 @@ cdc_internal_tag()
     assert_eq(refused[Event]("{\"user\":\"c\"}"), "no 'type' member says which variant this is (byte 0)")
     assert_eq(refused[Event]("{\"type\":\"Leave\"}"), "'Leave' is not a variant of Event (byte 8)")
     assert_eq(refused[Event]("{\"type\":7}"), "type: a string expected (byte 8)")
-    assert_eq(refused[Event]("{\"type\":\"logout\",\"user\":\"c\"}"), "logout: the field 'after_ms' is missing (byte 28)")
+    assert_eq(refused[Event]("{\"type\":\"logout\",\"user\":\"c\"}"), "logout: the field 'after_ms' is missing (byte 27)")
     assert_eq(refused[Event]("[]"), "an object expected (byte 0)")
 end cdc_internal_tag
 
@@ -372,8 +376,8 @@ cdc_adjacent_tag()
         assert(rt(m) == m)
 
     assert(from_json[Msg]("{\"c\":{\"y\":4,\"x\":3},\"t\":\"Move\"}").unwrap() == Msg.Move(3, 4))
-    assert_eq(refused[Msg]("{\"t\":\"Move\"}"), "Move: the field 'c' is missing (byte 12)")
-    assert_eq(refused[Msg]("{\"t\":\"Move\",\"c\":{\"x\":\"1\"}}"), "Move.x: an integer expected (byte 22)")
+    assert_eq(refused[Msg]("{\"t\":\"Move\"}"), "Move: the field 'c' is missing (byte 11)")
+    assert_eq(refused[Msg]("{\"t\":\"Move\",\"c\":{\"x\":\"1\"}}"), "Move.x: an integer expected (byte 21)")
 
 // -- errors ----------------------------------------------------------------------------------------
 
@@ -381,7 +385,7 @@ cdc_adjacent_tag()
 cdc_wrong_shape()
     assert_eq(refused[Outer]("{\"id\":1,\"inner\":{\"z\":\"q\"}}"), "inner.z: an integer expected (byte 21)")
     assert_eq(refused[Outer]("{\"id\":1,\"items\":[{\"z\":1},{\"z\":true}]}"), "items[1].z: an integer expected (byte 30)")
-    assert_eq(refused[Tables]("{\"by_name\":{\"k\":\"v\"}}"), "by_name[\"k\"]: an integer expected (byte 17)")
+    assert_eq(refused[Tables]("{\"by_name\":{\"k\":\"v\"}}"), "by_name[\"k\"]: an integer expected (byte 16)")
     assert_eq(refused[Inner]("[1]"), "an object expected (byte 0)")
     assert_eq(refused[Buf[int]]("{}"), "an array expected (byte 0)")
     assert_eq(refused[string]("1"), "a string expected (byte 0)")
@@ -393,7 +397,9 @@ cdc_wrong_shape()
     assert_eq(refused[Shape]("\"Square\""), "'Square' is not a variant of Shape (byte 0)")
     assert_eq(refused[Shape]("\"Circle\""), "Circle: an object holding its fields expected (byte 0)")
     assert_eq(refused[Shape]("{\"Dot\":null,\"Rect\":null}"), "one member, naming the variant, and no other expected (byte 12)")
-    assert_eq(refused[Shape]("7"), "a variant: its name, or an object of one member expected (byte 0)")
+    assert_eq(refused[Shape]("{ }"), "a variant's name expected (byte 2)")
+    assert_eq(refused[Shape]("{\"Dot\":{\"x\":1}}"), "Dot: no fields expected (byte 8)")
+    assert_eq(refused[Shape]("7"),"a variant: its name, or an object of one member expected (byte 0)")
     assert_eq(refused[Inner]("{\"z\":1,\"z\":2}"), "'z' is written twice (byte 7)")
 end cdc_wrong_shape
 
@@ -402,11 +408,16 @@ cdc_malformed()
     assert_eq(refused[Inner]("{\"z\":1,}"), "a member name expected (byte 7)")
     assert_eq(refused[Inner]("{\"z\":1"), "the text ends where ',' or '}' was expected (byte 6)")
     assert_eq(refused[Inner]("{\"z\" 1}"), "':' expected (byte 5)")
-    assert_eq(refused[Inner]("{\"z\":01}"), "a number may not have a leading zero (byte 5)")
+    // A fault inside a member is told with the path to it, like any other.
+    assert_eq(refused[Inner]("{\"z\":01}"), "z: a number may not have a leading zero (byte 5)")
     assert_eq(refused[Inner]("{\"z\":1} x"), "more text after the value (byte 8)")
     assert_eq(refused[Inner](""), "the text ends where an object was expected (byte 0)")
     assert_eq(refused[string]("\"abc"), "this string is never closed (byte 0)")
     assert_eq(refused[Buf[int]]("[1 2]"), "',' or ']' expected (byte 3)")
+    // A comma before the close is the grammar's fault, whatever was being read.
+    assert_eq(refused[Buf[int]]("[1, ]"), "a value expected (byte 4)")
+    assert_eq(refused[(int, int)]("[1,]"), "a value expected (byte 3)")
+    assert_eq(refused[[2]u8]("[1,]"), "a value expected (byte 3)")
     assert_eq(from_json_bytes[string]([u8('"'), 0xFF, u8('"')]).unwrap_err().to_string(), "this string is not UTF-8 (byte 1)")
 end cdc_malformed
 

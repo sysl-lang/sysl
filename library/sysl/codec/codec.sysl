@@ -114,7 +114,10 @@ trait Decoder
     mark(*self) -> Self::Mark
     rewind(*self, m: Self::Mark)
 
-    /** The byte offset the next value starts at. */
+    /**
+     * The byte offset the next thing read starts at: a value, a key, or the close of the sequence
+     * or struct being read -- past any separator still to be read before it.
+     */
     offset(*self) -> usize
 
     peek(*self) -> Result[Token, CodecError]
@@ -346,7 +349,9 @@ decode[T, D: Decoder](d: *D) -> Result[T, CodecError]
         d.begin_seq()?
 
         for const f in T::Fields
-            if !d.next_item()? then return Err(refusal(Expected(s"a tuple of ${T::Fields.len}"), d.offset()))
+            val at = d.offset()
+
+            if !d.next_item()? then return Err(refusal(Expected(s"a tuple of ${T::Fields.len}"), at))
 
             p.(f) = Some(decode[f::Type, D](d) match
                 Ok(v) -> v
@@ -361,15 +366,20 @@ decode[T, D: Decoder](d: *D) -> Result[T, CodecError]
 
         d.begin_seq()?
 
-        while d.next_item()?
+        loop
+            val at = d.offset()
+
+            if !d.next_item()?
+                if i < out.len then return Err(refusal(Expected(s"an array of ${out.len}, and it has $i"), at))
+
+                break
+
             if i == out.len then return Err(refusal(Expected(s"the end of an array of ${out.len}"), d.offset()))
 
-            out[i] = decode(d) match
+            out[i] = decode_like(d, out[i]) match
                 Ok(v) -> v
                 Err(e) -> return Err(within(e, 2, "", i))
             i += 1
-
-        if i < out.len then return Err(refusal(Expected(s"an array of ${out.len}, and it has $i"), d.offset()))
 
         Ok(out)
     elif const T::Kind == Kind.Fixed
@@ -384,6 +394,11 @@ decode[T, D: Decoder](d: *D) -> Result[T, CodecError]
         @assert(false, s"${T::Name} cannot be decoded: it implements no Decode, and a ${Kind::Image(T::Kind)} has no decoding of its own")
         Err(refusal(Expected("a value"), 0))
 end decode
+
+// An array's element type has no spelling inside a function generic over the array, and the
+// expected type of `out[i] = decode(d)?` does not reach through the `?` or a `match`, so the element
+// already in the slot names the type for the call.
+private decode_like[U, D: Decoder](d: *D, witness: U) -> Result[U, CodecError] = decode[U, D](d)
 
 // A reference is read as what it refers to, which is then boxed.
 private decode_ref[U, D: Decoder](d: *D) -> Result[&U, CodecError] = Ok(decode[U, D](d)?)
@@ -437,11 +452,16 @@ private decode_object[T, D: Decoder](d: *D, strict: bool) -> Result[T, CodecErro
 
     d.begin_struct()?
 
+    // Where the struct closes, which is where a field it leaves out is reported.
+    var end: usize = 0
+
     loop
         val at = d.offset()
         val k = d.next_key()?
 
-        if k.is_none() then break
+        if k.is_none()
+            end = at
+            break
 
         val key = k.unwrap()
         var known = false
@@ -462,8 +482,6 @@ private decode_object[T, D: Decoder](d: *D, strict: bool) -> Result[T, CodecErro
             if strict && !knows_key[T](key) then return Err(refusal(Unknown(key, T::BaseName), at))
 
             d.skip_value()?
-
-    val end = d.offset()
 
     for const f in T::Fields
         if const f::Annotation[flatten].is_some()
@@ -572,9 +590,10 @@ private decode_enum[T, D: Decoder](d: *D) -> Result[T, CodecError]
             Struct ->
                 d.begin_struct()?
 
+                val close = d.offset()
                 val k = d.next_key()?
 
-                if k.is_none() then return Err(refusal(Expected("a variant's name"), d.offset()))
+                if k.is_none() then return Err(refusal(Expected("a variant's name"), close))
 
                 val name = k.unwrap()
                 val v = decode_named[T, D](d, name, at)?
@@ -595,7 +614,9 @@ private decode_named[T, D: Decoder](d: *D, name: string, at: usize) -> Result[T,
                 if !d.none()?
                     d.begin_struct()?
 
-                    if d.next_key()?.is_some() then return Err(within(refusal(Expected("no fields"), d.offset()), 1, name, 0))
+                    val key_at = d.offset()
+
+                    if d.next_key()?.is_some() then return Err(within(refusal(Expected("no fields"), key_at), 1, name, 0))
 
                 return Ok(T::Make(c, ()))
             else
@@ -615,11 +636,15 @@ private decode_payload[T, D: Decoder](d: *D, which: usize, extra: string) -> Res
 
                 d.begin_struct()?
 
+                var end: usize = 0
+
                 loop
                     val at = d.offset()
                     val k = d.next_key()?
 
-                    if k.is_none() then break
+                    if k.is_none()
+                        end = at
+                        break
 
                     val key = k.unwrap()
                     var known = false
@@ -641,8 +666,6 @@ private decode_payload[T, D: Decoder](d: *D, which: usize, extra: string) -> Res
                             if key != extra then return Err(refusal(Unknown(key, c.name), at))
 
                         d.skip_value()?
-
-                val end = d.offset()
 
                 for const f in c::Fields
                     if p.(f).is_none()
@@ -723,6 +746,7 @@ private decode_tagged[T, D: Decoder](d: *D) -> Result[T, CodecError]
     else
         val body = T::Annotation[content].unwrap().field
         var out: Option[T] = None
+        var end: usize = 0
 
         d.begin_struct()?
 
@@ -730,7 +754,9 @@ private decode_tagged[T, D: Decoder](d: *D) -> Result[T, CodecError]
             val kat = d.offset()
             val k = d.next_key()?
 
-            if k.is_none() then break
+            if k.is_none()
+                end = kat
+                break
 
             if k.unwrap() == body
                 out = Some(decode_named[T, D](d, name.unwrap(), kat)?)
@@ -743,7 +769,7 @@ private decode_tagged[T, D: Decoder](d: *D) -> Result[T, CodecError]
         if out.is_some() then return Ok(out.unwrap())
         if variant_fields[T](which) == 0 then return Ok(unit_variant[T](which))
 
-        Err(within(refusal(Missing(body), d.offset()), 1, name.unwrap(), 0))
+        Err(within(refusal(Missing(body), end), 1, name.unwrap(), 0))
 end decode_tagged
 
 private has_variant[T](name: string) -> bool
@@ -770,8 +796,7 @@ private unit_variant[T](which: usize) -> T
         if const c::Fields.len == 0
             if c.index == which then return T::Make(c, ())
 
-    @assert(false, "unreachable")
-    unit_variant[T](which)
+    panic(s"${T::BaseName} has no variant $which without fields")
 end unit_variant
 
 // -- the library's own types -----------------------------------------------------------------------

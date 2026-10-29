@@ -476,9 +476,23 @@ impl Decoder for JsonDecoder
         self.depth = m.1
         self.first = m.2
 
+    // A comma still to be read belongs to no one, so the offset is the key or item after it, which
+    // is looked at without being read.
     offset(*self) -> usize
         blank(self)
-        self.at
+
+        if self.first || self.depth == 0 || !peek_is(self, u8(',')) then return self.at
+
+        val m = self.mark()
+
+        self.at += 1
+        blank(self)
+
+        val at = self.at
+
+        self.rewind(m)
+        at
+    end offset
 
     peek(*self) -> Result[Token, CodecError]
         blank(self)
@@ -566,6 +580,9 @@ impl Decoder for JsonDecoder
 
             self.at += 1
             blank(self)
+
+            // A comma promises an item, so a close after one breaks the grammar rather than the shape.
+            if peek_is(self, u8(']')) then return Err(lift(missing(self, "a value")))
 
         self.first = false
         Ok(true)

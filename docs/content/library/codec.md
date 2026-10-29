@@ -158,9 +158,9 @@ for text in ["{\"points\": [{\"x\": 1, \"y\": 2}, {\"x\": 3, \"y\": \"4\"}]}", "
 ```
 
 ```output
-points[1].y: an integer expected (byte 43)
+points[1].y: an integer expected (byte 44)
 points[0]: the field 'y' is missing (byte 19)
-a value expected (byte 32)
+points: a value expected (byte 29)
 points[0].x: out of range for int (byte 18)
 ```
 
