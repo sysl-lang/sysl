@@ -29,6 +29,7 @@ check_conformance(a: &Analysis, scope: Scope, span: Span, tr: TraitDecl, block: 
                             member_key_of(home.key, im.unwrap().name))
             check_override_marking(a, home.scope, shown, tm, im.unwrap())
             check_views_marking(a, home.scope, home.label, shown, tm, im.unwrap())
+            check_place_marking(a, home.scope, home.label, shown, im.unwrap())
         else if block.derived && derive_for(tr, tm.name).is_some()
             // A block a `derives` clause wrote takes the trait's `derive` body before its default:
             // the default is what a hand-written block inherits.
@@ -149,6 +150,21 @@ private check_views_marking(a: &Analysis, scope: Scope, for_type: string, trait_
             s"a '&$trait_name' reads only the trait's member, so the view it answers would be held to " +
             s"nothing. Mark '$trait_name.$name' '@views(self)' as well")
 end check_views_marking
+
+// **A member answering a place cannot supply a trait's**, which says `-> T` and is all a call through
+// a `&Trait` reads: that caller would take the place's address for the value (`ref_result.sysl`).
+// A trait cannot declare `-> ref` either, so there is no mark for the two to share.
+private check_place_marking(a: &Analysis, scope: Scope, for_type: string, trait_name: string,
+                            im: MethodDecl)
+    if !im.marks.answers_place then return
+
+    val name = source_member_name(im.name)
+
+    a.fault(scope, method_anchor(im), s"'$name' of 'impl $trait_name for $for_type' answers a place " +
+            s"with '-> ref', but trait '$trait_name' declares '$name' to answer a value — a call " +
+            s"through a '&$trait_name' reads only the trait's member. Declare the place-answering " +
+            "member on the type itself, under another name")
+end check_place_marking
 
 // Compares one implementing method against the trait's signature: the same receiver mode -- except that
 // a `self` may stand for the trait's `*self`, the call handing the implementation a copy of what it
