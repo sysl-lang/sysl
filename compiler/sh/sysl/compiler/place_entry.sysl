@@ -42,11 +42,9 @@ import sysl.math.bigint.from_int
 // carries, so a library artifact and its user never have to agree about it.
 
 // The functions of `p` given a place entry, read from what the whole-program check found
-// (`take_place_answers`), with the symbols of those that release nothing added to what the count
-// elision may cross.
-place_entries(e: *Emit, p: TProgram)
-    val answers = take_place_answers()
-
+// (`answers`, `Promotions.place_answers`), with the symbols of those that release nothing added to
+// what the count elision may cross.
+place_entries(e: *Emit, p: TProgram, answers: Map[string, usize])
     if answers.is_empty() then return
 
     var cands: Buf[(TFunc, usize)] = buf()
@@ -72,14 +70,31 @@ place_entries(e: *Emit, p: TProgram)
                 e.places.put(c.0.name, c)
                 grew = true
 
+    if e.places.is_empty() then return
+
+    // **A place entry owns nothing**, so it is judged as its body would be were it handed its
+    // parameters rather than owning them: `quad(self)` owns `self` and gives it back, and so releases
+    // something, but `quad$place` is handed an address and releases nothing -- and a share read before
+    // it may be held across it. The rest of the program is judged as `inert` judged it.
+    var owning: Set[string] = set()
+
+    for name in e.owning_funcs
+        if !e.places.has(name) then owning.add(name)
+
+    val quiet = if owning.len() == e.owning_funcs.len() then e.inert else inert_callees(p, owning)
+
     for c in cands
         val name = c.0.name
 
-        if e.places.has(name) && e.inert.has(name) then e.inert_symbols.add(place_symbol(e, name))
+        if e.places.has(name) && quiet.has(name) then e.inert_symbols.add(place_symbol(e, name))
 end place_entries
 
 // The symbol a function's place entry is defined and called at.
 place_symbol(e: *Emit, name: string) -> string = symbol_of(e, name) + "$place"
+
+// Whether a symbol is a place entry's. No other symbol holds a `$` followed by `place` at its end: a
+// function's own carries its module, and a helper's names what it is for.
+is_place_symbol(symbol: string) -> bool = symbol.ends_with("$place")
 
 // Whether `f`'s declaration lets it have a second entry at all: an ordinary sysl function, called only
 // as one, whose body is an expression answering a value and whose parameter `k` takes room.
