@@ -17,11 +17,13 @@ import sysl.container.{Map, map}
 // closure that may be reached after the block declaring a variable it captures has ended cannot
 // hold that variable's address (`docs/design/closures.md`, decision 6).
 
-// One block of a body: the block around it, how deep it is, and what it is, as a refusal names it.
+// One block of a body: the block around it, how deep it is, what it is, as a refusal names it, and
+// whether it runs again while the body runs on -- a loop's body, or the head a loop asks each turn.
 struct BodyBlock
     parent: int
     depth: int
     said: string
+    repeats: bool
 end BodyBlock
 
 // The blocks of one body, and the block each of its locals is declared in. Block 0 is the body
@@ -29,6 +31,9 @@ end BodyBlock
 struct BlockScopes
     blocks: Buf[BodyBlock]
     homes: Map[string, int]
+
+    // The sites of the closure literals the body builds, each once (`site_name`).
+    sites: Buf[string]
 
     // The block a local is declared in, or -1 for a name the body does not declare.
     home_of(self, name: string) -> int = self.homes.get(name).unwrap_or(-1)
@@ -55,21 +60,59 @@ end BlockScopes
 
 // The blocks of a body: every `if` and `else` arm, `match` arm, loop body, nested block and `defer`.
 block_scopes_of(f: TFunc) -> &BlockScopes
-    val sc: &BlockScopes = BlockScopes(buf(), map())
+    val sc: &BlockScopes = BlockScopes(buf(), map(), buf())
 
-    sc.blocks.push(BodyBlock(-1, 0, "the body"))
+    sc.blocks.push(BodyBlock(-1, 0, "the body", false))
 
     for p in f.params
         sc.homes.put(p.0, 0)
 
     scope_block(sc, f.body, 0)
+    settle_sites(sc)
     sc
 end block_scopes_of
 
 private open(sc: &BlockScopes, parent: int, said: string) -> int
-    sc.blocks.push(BodyBlock(parent, sc.blocks.at(usize(parent)).depth + 1, said))
+    sc.blocks.push(BodyBlock(parent, sc.blocks.at(usize(parent)).depth + 1, said, false))
     int(sc.blocks.len()) - 1
 end open
+
+// A block that runs once each turn of a loop.
+private open_turn(sc: &BlockScopes, parent: int, said: string) -> int
+    sc.blocks.push(BodyBlock(parent, sc.blocks.at(usize(parent)).depth + 1, said, true))
+    int(sc.blocks.len()) - 1
+end open_turn
+
+// **Where a closure literal is built, as the block its frame box must not outlive.** A box laid in
+// the frame (`closure_mode.sysl`'s `frame_boxes`) has one slot per literal, so a literal built again
+// on the next turn of a loop builds into the slot the last turn's box is in: that box may not be
+// reached after the turn it was built in. The literal is declared, under a name no program can
+// write, in the block it is built in -- the deepest declaration wins -- and then moved out to the
+// innermost block around it that repeats; one built where nothing repeats has no such block, and
+// its box may be reached for as long as the frame lasts.
+site_name(base: string) -> string = s"«site»$base"
+
+private declare_sites(sc: &BlockScopes, e: TExpr, at: int) = *e.kind match
+    TStructNew(st, _) ->
+        if !is_closure_literal(Struct(st)) then return
+
+        val name = site_name(st.base)
+
+        if !holds_string(sc.sites, name) then sc.sites.push(name)
+
+        declare(sc, name, at)
+    _ -> ()
+
+private settle_sites(sc: &BlockScopes)
+    for name in sc.sites
+        var at = sc.home_of(name)
+
+        while at >= 0 && !sc.blocks.at(usize(at)).repeats
+            at = sc.blocks.at(usize(at)).parent
+
+        sc.homes.put(name, at)
+    end for
+end settle_sites
 
 // **The deepest declaration wins**: a form whose span is not inside its parent's is reached both from
 // the statement around it and from its parent, and only the second knows its real block.
@@ -101,6 +144,8 @@ private scope_opt_block(sc: &BlockScopes, b: Option[TBlock], parent: int, said: 
 
 private scope_stmts(sc: &BlockScopes, stmts: Buf[TStmt], at: int)
     for s in stmts
+        walk_stmt(s, expr_walk(false, e -> declare_sites(sc, e, at)))
+
         s match
             TVarDecl(n, _, init, _) ->
                 declare(sc, n, at)
@@ -125,7 +170,9 @@ end bearing_in_stmt
 private scope_inner(sc: &BlockScopes, e: TExpr, at: int)
     val found: &Bearing = Bearing(buf())
 
-    walk_texpr(e, expr_walk(false, x -> note_bearing(found, x)))
+    walk_texpr(e, expr_walk(false, x ->
+        declare_sites(sc, x, at)
+        note_bearing(found, x)))
     scope_found(sc, found.items, at)
 end scope_inner
 
@@ -190,41 +237,41 @@ private scope_bearing(sc: &BlockScopes, e: TExpr, at: int)
             end for
         TBlockExpr(block) -> scope_block(sc, block, open(sc, at, "a nested block"))
         TWhile(cond, body, else_block, _) ->
-            val b = open(sc, at, "the 'while' body")
+            val b = open_turn(sc, at, "the 'while' body")
 
             scope_terms(sc, cond, b)
             scope_stmts(sc, body, b)
             scope_opt_block(sc, else_block, at, "the 'else' block")
         TDoWhile(body, cond, else_block, _) ->
-            val b = open(sc, at, "the 'while' body")
+            val b = open_turn(sc, at, "the 'while' body")
 
             scope_stmts(sc, body, b)
             scope_inner(sc, cond, b)
             scope_opt_block(sc, else_block, at, "the 'else' block")
-        TLoop(body, _) -> scope_stmts(sc, body, open(sc, at, "the 'loop' body"))
+        TLoop(body, _) -> scope_stmts(sc, body, open_turn(sc, at, "the 'loop' body"))
         TFor(name, _, lo, hi, _, body, else_block, _) ->
             scope_inner(sc, lo, at)
             scope_inner(sc, hi, at)
 
-            val b = open(sc, at, "the 'for' body")
+            val b = open_turn(sc, at, "the 'for' body")
 
             declare(sc, name, b)
             scope_stmts(sc, body, b)
             scope_opt_block(sc, else_block, at, "the 'else' block")
         TCFor(init, cond, step, body, else_block, _) ->
-            val head = open(sc, at, "the 'for' loop")
+            val head = open_turn(sc, at, "the 'for' loop")
 
             scope_stmts(sc, init, head)
 
             if cond.is_some() then scope_inner(sc, cond.unwrap(), head)
 
             scope_stmts(sc, step, head)
-            scope_stmts(sc, body, open(sc, head, "the 'for' body"))
+            scope_stmts(sc, body, open_turn(sc, head, "the 'for' body"))
             scope_opt_block(sc, else_block, at, "the 'else' block")
         TForEach(name, _, seq, body, else_block, _) ->
             scope_inner(sc, seq, at)
 
-            val b = open(sc, at, "the 'for' body")
+            val b = open_turn(sc, at, "the 'for' body")
 
             declare(sc, name, b)
             scope_stmts(sc, body, b)
@@ -232,12 +279,12 @@ private scope_bearing(sc: &BlockScopes, e: TExpr, at: int)
         TIterate(cursor, _, init, next, bind, body, else_block, _) ->
             scope_inner(sc, init, at)
 
-            val head = open(sc, at, "the 'for' loop")
+            val head = open_turn(sc, at, "the 'for' loop")
 
             declare(sc, cursor, head)
             scope_inner(sc, next, head)
 
-            val b = open(sc, head, "the 'for' body")
+            val b = open_turn(sc, head, "the 'for' body")
 
             declare_pattern(sc, bind, b)
             scope_stmts(sc, body, b)
@@ -264,6 +311,10 @@ private struct BlockTrack
     // it found kept past the block of a variable they capture, each with why.
     probe: bool
     escaped: Buf[(string, string)]
+
+    // The closures it found kept past a turn of the loop that builds them, each with why: their box
+    // cannot be built in the frame, whatever their mode (`site_name`).
+    turned_out: Buf[(string, string)]
 end BlockTrack
 
 // Every place one body keeps the address of a block's local where it outlives the block. The entry
@@ -275,16 +326,20 @@ check_blocks(cx: &KeepsCx, faults: &KeepFaults, f: TFunc)
 // reference: in a local of an enclosing block, or what a keeping callee stores in one
 // (`docs/design/closures.md` decision 6). **This is the rule's own walk with the closure followed**:
 // a closure is built around each variable it may hold the address of, `«closure»n` as a root.
-probe_blocks(cx: &KeepsCx, f: TFunc) -> Buf[(string, string)]
+//
+// The second list is the closures kept past a turn of the loop that builds them, by the same walk:
+// the literal's own site is one more root (`site_name`).
+probe_blocks(cx: &KeepsCx, f: TFunc) -> (Buf[(string, string)], Buf[(string, string)])
     val faults: &KeepFaults = KeepFaults(buf())
+    val bt = block_walk(cx, faults, f, true)
 
-    block_walk(cx, faults, f, true).escaped
+    (bt.escaped, bt.turned_out)
 end probe_blocks
 
 private block_walk(cx: &KeepsCx, faults: &KeepFaults, f: TFunc, probe: bool) -> &BlockTrack
     val sc = block_scopes_of(f)
     val bt: &BlockTrack = BlockTrack(cx, faults, func_home(cx.an, f.name), origins_of(cx, f), sc, buf(),
-                                     map(), true, false, probe, buf())
+                                     map(), true, false, probe, buf(), buf())
 
     if sc.blocks.len() == 1 then return bt
 
@@ -413,10 +468,21 @@ end kept_in
 
 // A closure a probe found kept past the block of `r`'s variable, with the reason, once.
 private probe_escaped(bt: &BlockTrack, base: string, holder: string, r: string, v: TExpr, by: string)
+    val keeps = if by == "" then "it is kept in" else s"$by keeps it in"
+
+    if root_local(r).starts_with("«site»")
+        for item in bt.turned_out
+            if item.0 == base then return
+
+        val block = bt.sc.blocks.at(usize(bt.sc.home_of(root_local(r)))).said
+
+        bt.turned_out.push((base, s"$keeps '${shown_local(holder)}' ${probe_line(bt.scope, v.span)}, which " +
+                                  s"outlives the turn of $block that builds it"))
+        return
+    end if
+
     for item in bt.escaped
         if item.0 == base then return
-
-    val keeps = if by == "" then "it is kept in" else s"$by keeps it in"
 
     bt.escaped.push((base, s"$keeps '${shown_local(holder)}' ${probe_line(bt.scope, v.span)}, which " +
                            s"outlives the block declaring '${shown_local(root_local(r))}'"))
@@ -560,6 +626,10 @@ end roots_of
 // The variables a closure literal may hold the address of, each as the probe's root: a capture it
 // could hold by reference, read from a local of this body.
 private closure_roots(bt: &BlockTrack, base: string, args: Buf[TExpr], out: *Buf[string])
+    // The turn of the loop that builds it, for a closure whose box may be laid in the frame.
+    if bt.cx.an.boxed_closures.has(base) && bt.sc.home_of(site_name(base)) >= 0 then
+        add_root(out, closure_marker(base) + site_name(base))
+
     val refs = bt.cx.an.closure_refs.get(base)
 
     if refs.is_none() then return

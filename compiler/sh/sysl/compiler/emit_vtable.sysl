@@ -123,16 +123,24 @@ end self_forms
 // method under its own symbol and the body under `self_symbol`, recorded in `e.self_entries`.
 //
 // What is never split: a body something outside sysl's convention enters (`@export`, a `@section`, a
-// foreign convention, a C-variadic one), a task, a function emitted as halves already (an owning
-// one's entry and body, a `@disjoint` one's), a definition the link may displace, and a receiver the
+// foreign convention, a C-variadic one), a task, a function emitted as halves already (a split
+// one's entry and body -- owning a parameter or lent one -- and a `@disjoint` one's), a definition the link may displace, and a receiver the
 // signature does not carry as one register aggregate.
 split_self(e: *Emit, f: TFunc, built: IrFunc, forms: Map[string, (bool, string)]) -> Buf[IrFunc]
     var out: Buf[IrFunc] = buf()
     val form = forms.get(f.name)
 
+    if form.is_some() && !f.params.is_empty() && e.lent_params.has(owned_key(f.name, 0)) &&
+       !e.owning_funcs.has(f.name) && f.marks.disjoint.is_empty() && !displaceable(built.sig.linkage) &&
+       mangle(f.params.at(0).1) == form.unwrap().1 && built.sig.name == owned_symbol(symbol_of(e, f.name)) then
+        out.push(built)
+        out.push(lent_self(e, f, built.sig, form.unwrap().0))
+        return out
+    end if
+
     if form.is_none() || f.params.is_empty() || f.marks.is_async() || f.variadic ||
        f.exported.is_some() || f.section.is_some() || f.conv.is_some() || built.sig.cconv.is_some() ||
-       !f.marks.disjoint.is_empty() || e.owning_funcs.has(f.name) || displaceable(built.sig.linkage) ||
+       !f.marks.disjoint.is_empty() || e.split_funcs.has(f.name) || displaceable(built.sig.linkage) ||
        mangle(f.params.at(0).1) != form.unwrap().1
         out.push(built)
         return out
@@ -223,6 +231,65 @@ split_self(e: *Emit, f: TFunc, built: IrFunc, forms: Map[string, (bool, string)]
     out.push(IrFunc(body_sig, blocks))
     out
 end split_self
+
+// The body a table reaches for a method whose receiver is lent by address (`read_by_address`): the
+// receiver's bytes copied out of the object into a slot of its own -- the snapshot a by-value `self`
+// promises, since the object is anybody's to change while the method runs -- and the method's own
+// body, which reads in place, lent that slot. It takes the table's word, as a split method's body
+// does, so the table calls it with no adapter loading the value first.
+private lent_self(e: *Emit, f: TFunc, body: IrFuncSig, boxed: bool) -> IrFunc
+    val recv = f.params.at(0)
+    val ty = recv.1
+    val param = s"${recv.0}.param"
+    val object = VReg(s"${recv.0}.object")
+    val payload = if boxed then VReg(s"${recv.0}.payload") else object
+    val slot = VReg(s"${recv.0}.lent")
+    val shape = if boxed then box_lty(e, ty) else lty(e, ty)
+    val value = VReg(s"${recv.0}.value")
+
+    var params: Buf[IrParam] = buf()
+    var args: Buf[IrArg] = buf()
+
+    for p in body.ty.params
+        if names_reg(p.name, param)
+            params.push(IrParam(LPtr, no_ir_attrs(), Some(object)))
+            args.push(ir_arg(LPtr, slot))
+        else
+            params.push(p)
+            args.push(IrArg(p.ty, p.name.unwrap_or(VUndef), p.attrs))
+
+    var instrs: Buf[Inst] = buf()
+    var step: Buf[IrArg] = buf()
+
+    step.push(ir_arg(l_i32(), VInt(from_int(0))))
+    step.push(ir_arg(l_i32(), VInt(from_int(long(box_payload_field(e, ty))))))
+
+    if boxed then instrs.push(InGep(payload, shape, object, step))
+
+    instrs.push(InAlloca(slot, lty(e, ty), None))
+    instrs.push(InLoad(value, lty(e, ty), payload, AccPlain, None))
+    instrs.push(InStore(lty(e, ty), value, slot, AccPlain, None))
+
+    val nothing = body.ty.ret match
+        LVoid -> true
+        _ -> false
+
+    val result = if nothing then None else Some(VReg("self.result"))
+    var fast: Buf[FastMath] = buf()
+
+    instrs.push(InCall(result, body.ty.ret, VGlobal(body.name), args, body.ty.ret_attrs, None, fast, false))
+
+    val ret = if nothing then InRet(None, None) else InRet(Some(body.ty.ret), result)
+    var blocks: Buf[IrBlock] = buf()
+
+    blocks.push(IrBlock("entry", instrs, Some(ret)))
+    e.self_entries.put(f.name, boxed)
+
+    val sig = body with { name = self_symbol(symbol_of(e, f.name)), ty = IrFnType(body.ty.ret, params, false, body.ty.ret_attrs),
+                          linkage = LinkInternal, section = None, dso_local = false, hidden = false, bare = buf() }
+
+    IrFunc(sig, blocks)
+end lent_self
 
 // Whether the definition may not be the one the link keeps -- a `weak` seam another definition
 // displaces, a copy of a body defined elsewhere -- so a table has to reach it through its symbol.
