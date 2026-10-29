@@ -3,6 +3,8 @@ module sysl.encoding.json
 import sysl.buf.byte_sink
 import sysl.math.Float
 import sysl.text.from_utf8_unchecked
+import sysl.codec as codec
+import sysl.codec.{CodecError, Encoder}
 
 // Writing. **The compact form is the `Display`**, so `j.to_string()`, `print(j)` and `s"$j"` all produce
 // JSON with no space anywhere -- what a wire wants, and what round-trips: `parse(j.to_string())` reads back
@@ -145,3 +147,95 @@ private quote(s: string, out: *Writer)
     out.write(bs[start..])
     out.write("\"".bytes)
 end quote
+
+// -- writing a caller's type ----------------------------------------------------------------------
+
+/** `sysl.codec`'s `Encoder` for JSON: compact JSON, written into any `Writer` as it goes.
+ *
+ * A struct is an object, a sequence an array, `None` and `unit` are `null`. A real is written as the
+ * shortest text that reads back as the same value. **A NaN or an infinity is refused** — JSON has no
+ * spelling for one — by latching `NotFinite` and writing `null` in its place, so the text stays
+ * well-formed and `failed()` says it is not the value.
+ */
+struct JsonEncoder
+    private out: *Writer
+    // Whether the next member or element is the first of its object or array, so no comma is due.
+    private first: bool
+    private written: usize
+    private fault: Option[codec.Fault]
+    private fault_at: usize
+
+/** An encoder writing into `out`. */
+json_encoder(out: *Writer) -> JsonEncoder = JsonEncoder(out, true, 0, None, 0)
+
+/** `v` as compact JSON, through its `Encode`; refused only where `v` holds a NaN or an infinity, with
+ * the byte it would have been written at.
+ */
+to_json[T](v: T) -> Result[string, CodecError]
+    var sink = byte_sink()
+    var e = json_encoder(&sink)
+
+    codec.encode(v, &e)
+
+    if e.fault.is_some() then return Err(codec.refusal(e.fault.unwrap(), e.fault_at))
+
+    Ok(from_utf8_unchecked(sink.text()))
+end to_json
+
+impl Fallible for JsonEncoder
+    override failed(*self) -> bool = self.fault.is_some() || self.out.failed()
+
+// Every byte goes through here, so the encoder knows how far into the text it is.
+impl Writer for JsonEncoder
+    write(*self, bytes: []const u8)
+        self.out.write(bytes)
+        self.written += bytes.len
+
+impl Encoder for JsonEncoder
+    none(*self) = self.write("null".bytes)
+
+    bool(*self, v: bool) = self.write(if v then "true".bytes else "false".bytes)
+
+    int(*self, v: i128) = v.display(self, FormatSpec(0, -1, false))
+
+    real(*self, v: real)
+        if !v.is_finite() then self.fail(codec.Fault.NotFinite)
+
+        real_text(v, self)
+
+    str(*self, v: string) = quote(v, self)
+
+    begin_seq(*self, n: usize)
+        self.write("[".bytes)
+        self.first = true
+
+    item(*self)
+        if !self.first then self.write(",".bytes)
+
+        self.first = false
+
+    end_seq(*self)
+        self.write("]".bytes)
+        self.first = false
+
+    begin_struct(*self, name: string, n: usize)
+        self.write("{".bytes)
+        self.first = true
+
+    field(*self, key: string)
+        if !self.first then self.write(",".bytes)
+
+        self.first = false
+        quote(key, self)
+        self.write(":".bytes)
+
+    end_struct(*self)
+        self.write("}".bytes)
+        self.first = false
+
+    fail(*self, fault: codec.Fault)
+        if self.fault.is_some() then return
+
+        self.fault = Some(fault)
+        self.fault_at = self.written
+end JsonEncoder
