@@ -42,8 +42,68 @@ spelled_show(t: Type, s: Option[Spelling]) -> string = s match
 spelling_of(written: TypeRef, t: Type, tparams: Buf[string]) -> Option[Spelling] =
     spell_verdict(written, t, tparams) match
         SpellUntrusted -> None
-        SpellPlain -> Some(Spelling(type_text(written), false))
-        SpellAliased -> Some(Spelling(type_text(written), true))
+        SpellPlain -> Some(Spelling(type_text(with_paths(written, t)), false))
+        SpellAliased -> Some(Spelling(type_text(with_paths(written, t)), true))
+
+// The written type with every name of a declared type put back on its full path, so that the
+// sentence's shortening (`short_names.sysl`) decides how it reads, as it does for a type nothing
+// spelled: `Option` stays `Option` where it can mean only one type, and is `sysl.Option` in a file,
+// or a message, where another `Option` stands beside it. What the spelling chose is kept -- an
+// alias's name, a width's word, the shape around the names. Only called on a trusted spelling, so
+// each part lines up with the type it resolved to.
+private with_paths(w: TypeRef, t: Type) -> TypeRef = *w.kind match
+    NamedType(n, args) -> own_path(t) match
+        Some(own) ->
+            if last_segment(n) != last_segment(own.0) then return w
+
+            var parts: Buf[TypeRef] = buf()
+
+            for i in 0..<args.len()
+                parts.push(if i < own.1.len() then with_paths(args.at(i), own.1.at(i)) else args.at(i))
+
+            TypeRef(w.span, NamedType(own.0, parts))
+        None -> w
+    PtrType(wi) -> t match
+        Ptr(ti) -> TypeRef(w.span, PtrType(with_paths(wi, *ti)))
+        _ -> w
+    RefType(wi, ws) -> t match
+        Ref(ti, _) -> TypeRef(w.span, RefType(with_paths(wi, *ti), ws))
+        _ -> w
+    WeakType(wi) -> t match
+        Weak(ti) -> TypeRef(w.span, WeakType(with_paths(wi, *ti)))
+        _ -> w
+    VolatileType(wi) -> t match
+        Volatile(ti) -> TypeRef(w.span, VolatileType(with_paths(wi, *ti)))
+        _ -> w
+    ArrayType(length, we, ro) -> t match
+        Slice(te, _) -> TypeRef(w.span, ArrayType(length, with_paths(we, *te), ro))
+        Array(_, te) -> TypeRef(w.span, ArrayType(length, with_paths(we, *te), ro))
+        _ -> w
+    VectorType(lanes, we) -> t match
+        Vector(_, te) -> TypeRef(w.span, VectorType(lanes, with_paths(we, *te)))
+        _ -> w
+    TupleType(parts, results) -> t match
+        Struct(d) ->
+            var out: Buf[TypeRef] = buf()
+
+            for i in 0..<parts.len()
+                out.push(if i < d.targs.len() then with_paths(parts.at(i), d.targs.at(i)) else parts.at(i))
+
+            TypeRef(w.span, TupleType(out, results))
+        _ -> w
+    _ -> w
+
+// A declared type's full path as a message names it, and its type arguments.
+private own_path(t: Type) -> Option[(string, Buf[Type])] = t match
+    Struct(d) ->
+        if is_tuple(d) || is_closure_literal(t) || d.base == TaskBase then None
+        else Some((module_show(d.base), d.targs))
+    Enum(d) -> Some((module_show(d.base), d.targs))
+    Constrained(d) ->
+        if d.targs.is_empty() then Some((module_show(d.name), d.targs))
+        else Some((module_show(d.generic), d.targs))
+    Trait(n, targs, assocs) -> if assocs.is_empty() then Some((module_show(n), targs)) else None
+    _ -> None
 
 // The same where the written type may be absent.
 spelling_of_opt(written: Option[TypeRef], t: Type, tparams: Buf[string]) -> Option[Spelling] =
