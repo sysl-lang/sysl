@@ -728,6 +728,8 @@ private val ClearsQ = "!"
 private val BorrowQ = "^"
 private val ThroughQ = "&"
 private val ThroughAnswersQ = "%"
+private val ReadQ = "#"
+private val ReadAnswersQ = "+"
 
 // Whether `name` keeps the argument at position `i`, why, and every location it may be held at.
 keeps_of(cx: &KeepsCx, name: string, i: usize) -> KeptWhy = summary(cx, name, i, KeepsQ)
@@ -759,10 +761,31 @@ through_of(cx: &KeepsCx, name: string, i: usize) -> KeptWhy = summary(cx, name, 
 // Whether what `name` answers can be made of a value it read through the parameter at `i`.
 through_answers_of(cx: &KeepsCx, name: string, i: usize) -> bool = summary(cx, name, i, ThroughAnswersQ).kept
 
+// **What a body lets out of what it reads EXACTLY `steps` steps through the pointer or view at `i`**
+// -- one step: the pointee's own fields and elements; two: what is read through an address one of
+// those holds -- which is the borrow rule's question (`read_cores`): `stash(p: *H) = kept.push(p.p)`
+// lets out, one step in, the address the caller's `h` holds, and `deep(w: *W) = kept.push(w.s.f)`
+// lets out only what sits two steps in. A pointer on the way handed on, or stored, counts, as for
+// `through_of`, since whoever holds it may read on; a value read `steps` in and handed on counts only
+// where the callee keeps it. Where no body is in sight the answer is the rule's own default for the
+// pointer: an `extern` borrows unless its `@keeps` names the parameter, and a call through an object
+// of no known trait, or a function pointer C may call, is held to the default (`vcall_reads`,
+// `pointer_reads`). Asked for one to four steps.
+read_of(cx: &KeepsCx, name: string, i: usize, steps: int) -> KeptWhy = summary(cx, name, i, s"$ReadQ$steps")
+
+// Whether what `name` answers can be made of a value it read `steps` steps through the parameter at `i`.
+read_answers_of(cx: &KeepsCx, name: string, i: usize, steps: int) -> bool =
+    summary(cx, name, i, s"$ReadAnswersQ$steps").kept
+
+// The steps a read question asks about, out of its mark (`#2` is two).
+private steps_of(q: string) -> int = int(q.bytes[1]) - int(u8('0'))
+
 private summary(cx: &KeepsCx, name: string, i: usize, q: string) -> KeptWhy
     val key = s"$q$name|$i"
     val keeping = q == KeepsQ
-    val through = q == ThroughQ || q == ThroughAnswersQ
+    val reading = q.starts_with(ReadQ)
+    val read_answering = q.starts_with(ReadAnswersQ)
+    val through = q == ThroughQ || q == ThroughAnswersQ || reading || read_answering
 
     cx.settled.get(key) match
         Some(v) -> return v
@@ -787,6 +810,7 @@ private summary(cx: &KeepsCx, name: string, i: usize, q: string) -> KeptWhy
     if found.is_none()
         if keeping then return extern_kept(cx, name, i)
         if q == ThroughQ then return extern_through(cx, name, i)
+        if reading then return extern_kept(cx, name, i)
         if q == ClearsQ then return not_kept()
         if q == BorrowQ then return KeptWhy(false, s"'$name' has no body in sight", span_zero(), buf())
 
@@ -811,7 +835,7 @@ private summary(cx: &KeepsCx, name: string, i: usize, q: string) -> KeptWhy
     if keeping && lent_by_rule(cx, f, i) then return not_kept()
     if through && !read_through(f.params.at(i).1, 0) then return not_kept()
 
-    if q == KeepsQ || q == ThroughQ
+    if q == KeepsQ || q == ThroughQ || reading
         val crossed = crossing_kept(f, i)
 
         if crossed.is_some() then return crossed.unwrap()
@@ -835,9 +859,12 @@ private summary(cx: &KeepsCx, name: string, i: usize, q: string) -> KeptWhy
     else if q == BorrowQ then walk_borrow(cx, f, i)
     else if q == ThroughQ then walk_through(cx, f, i)
     else if q == ThroughAnswersQ then walk_answers_through(cx, f, i)
+    else if reading then walk_track(track_as(cx, f, i, false, true, steps_of(q)), i)
+    else if read_answering then answered(track_as(cx, f, i, false, true, steps_of(q)), f)
     else walk_answers(cx, f, i, q == RawAnswersQ)
 
-    val out = if (keeping || q == ThroughQ) && f.marks.is_async() then task_held(walked) else walked
+    val held_on = keeping || q == ThroughQ || reading
+    val out = if held_on && f.marks.is_async() then task_held(walked) else walked
 
     val leaned = cx.taint
 
@@ -959,6 +986,29 @@ vcall_through(cx: &KeepsCx, recv: TExpr, slot: int, k: usize) -> Buf[(string, Ke
     out
 end vcall_through
 
+// What a call through an object lets out of what it reads `steps` steps through its argument at `k`
+// (`read_of`): nothing where the receiver's type names no trait, which the rule holds to the default.
+vcall_reads(cx: &KeepsCx, recv: TExpr, slot: int, k: usize, steps: int) -> Buf[(string, KeptAt)]
+    var out: Buf[(string, KeptAt)] = buf()
+    val tr = erased_trait(texpr_type(recv))
+
+    if tr.is_none() || slot < 0 then return out
+
+    val name = tr.unwrap() match
+        Trait(n, _, _) -> n
+        _ -> ""
+
+    for vt in cx.vtables
+        if vt.trait_name != name || usize(slot) >= vt.slots.len() then continue
+
+        val target = vt.slots.at(usize(slot)).target
+
+        for item in read_of(cx, target, k, steps).locs
+            out.push((target, item))
+
+    out
+end vcall_reads
+
 // Whether a call through an object may answer with a value it read through its argument at `k`.
 vcall_through_answers(cx: &KeepsCx, recv: TExpr, slot: int, k: usize) -> bool
     val tr = erased_trait(texpr_type(recv))
@@ -996,6 +1046,23 @@ pointer_through(cx: &KeepsCx, callee: TExpr, j: usize) -> Buf[(string, KeptAt)]
 
     out
 end pointer_through
+
+// What a call through a function pointer lets out of what it reads `steps` steps through its argument
+// at `j` (`read_of`): nothing where C may call through the type, which the rule holds to the default.
+pointer_reads(cx: &KeepsCx, callee: TExpr, j: usize, steps: int) -> Buf[(string, KeptAt)]
+    var out: Buf[(string, KeptAt)] = buf()
+    val key = fn_key(texpr_type(callee))
+
+    if key == "" || cx.escaped.has(key) then return out
+
+    for item in cx.by_type
+        if item.0 != key then continue
+
+        for k in read_of(cx, item.1, j, steps).locs
+            out.push((item.1, k))
+
+    out
+end pointer_reads
 
 // Whether a call through a function pointer may answer with a value it read through its argument at
 // `j`.
@@ -1264,6 +1331,15 @@ struct Track
     // field of its pointee, an element of its view -- is followed as the parameter itself is.
     through: bool
 
+    // A walk of what is read EXACTLY `steps` steps through the parameter (`read_of`), where it is not
+    // zero: a value read fewer steps in is a pointer on the way (`ptrs`, with its step), followed as
+    // the parameter is, and a step through a value read `steps` in reads storage nobody asked about.
+    steps: int
+    ptrs: Buf[(string, int)]
+
+    // Every local the body declares, with its initializer (`read_back_loc`).
+    decls: Buf[(string, TExpr)]
+
     // A walk of a `@scoped` pointer, which follows only what the body's promise does not cover: the
     // pointer handed to a callee that keeps it, or captured by an object that is stored.
     promised: bool
@@ -1278,14 +1354,17 @@ end Track
 
 // A walk following the parameter at `i`, or nothing at all where `i` is past the parameters -- which
 // is how what a body overwrites is asked.
-private track(cx: &KeepsCx, f: TFunc, i: usize, raw: bool) -> &Track = track_as(cx, f, i, raw, false)
+private track(cx: &KeepsCx, f: TFunc, i: usize, raw: bool) -> &Track = track_as(cx, f, i, raw, false, 0)
 
-private track_as(cx: &KeepsCx, f: TFunc, i: usize, raw: bool, through: bool) -> &Track
+private track_as(cx: &KeepsCx, f: TFunc, i: usize, raw: bool, through: bool, steps: int) -> &Track
     val org = origins_of(cx, f)
     val t: &Track = Track(cx, func_home(cx.an, f.name), buf(), buf(), false, not_kept(), org, raw, through,
-                          false, round_handles(cx, org, f), f)
+                          steps, buf(), buf(), false, round_handles(cx, org, f), f)
 
-    if i < f.params.len() then t.held.push(f.params.at(i).0)
+    if i < f.params.len()
+        t.held.push(f.params.at(i).0)
+        t.ptrs.push((f.params.at(i).0, 0))
+    end if
 
     track_locals(t, f.body)
     t
@@ -1355,11 +1434,12 @@ private walk_kept_as(cx: &KeepsCx, f: TFunc, i: usize, promised: bool) -> KeptWh
 end walk_kept_as
 
 // Every location a value `f` reads through its parameter at `i` may still be held at once it returns.
-private walk_through(cx: &KeepsCx, f: TFunc, i: usize) -> KeptWhy = walk_track(track_as(cx, f, i, false, true), i)
+private walk_through(cx: &KeepsCx, f: TFunc, i: usize) -> KeptWhy =
+    walk_track(track_as(cx, f, i, false, true, 0), i)
 
 // Whether what `f` answers can be made of a value it reads through its parameter at `i`.
 private walk_answers_through(cx: &KeepsCx, f: TFunc, i: usize) -> KeptWhy =
-    answered(track_as(cx, f, i, false, true), f)
+    answered(track_as(cx, f, i, false, true, 0), f)
 
 private walk_track(t: &Track, i: usize) -> KeptWhy
     val f = t.func
@@ -1368,15 +1448,54 @@ private walk_track(t: &Track, i: usize) -> KeptWhy
 
     flow_body(w, f.body)
 
+    val pending = if t.steps > 0 then read_back_locs(t, w.out_pending) else w.out_pending
     var first: Option[KeptAt] = None
 
-    for item in w.out_pending
+    for item in pending
         if first.is_none() && !item.loc.starts_with(s"p$i:") then first = Some(item)
 
-    if first.is_none() then return KeptWhy(false, "", span_zero(), w.out_pending)
+    if first.is_none() then return KeptWhy(false, "", span_zero(), pending)
 
-    KeptWhy(true, first.unwrap().how, first.unwrap().at, w.out_pending)
+    KeptWhy(true, first.unwrap().how, first.unwrap().at, pending)
 end walk_track
+
+// **A store through a local holding a pointer on the way is a store through the parameter**, for a walk
+// of what is read some steps in: `val vm = s.vm` then `vm.con = old` is held at `d:@vm.con`, the local's
+// own name, which the caller cannot say -- so it is said as the pointer it was read from
+// (`d:p0:.vm>{*VM}.con`), which the caller can tell is reached through what it handed over
+// (`frame_read_locs`).
+private read_back_locs(t: &Track, locs: Buf[KeptAt]) -> Buf[KeptAt]
+    var out: Buf[KeptAt] = buf()
+
+    for item in locs
+        out.push(KeptAt(read_back_loc(t, item.loc, 0), item.how, item.at))
+
+    out
+end read_back_locs
+
+private read_back_loc(t: &Track, loc: string, depth: int) -> string
+    if !loc.starts_with("d:@") || depth > 8 then return loc
+
+    val n = local_of(loc[1..<loc.bytes.len])
+
+    if !bound_step(t, n) then return loc
+
+    for item in t.decls
+        if item.0 != n then continue
+
+        val at = place_loc(t.org, item.1)
+        val key = type_show(texpr_type(item.1))
+
+        if at == "" || at.index_of("?").is_some() || key.index_of("?").is_some() then return loc
+
+        val root = if at.starts_with("d:") then read_back_loc(t, at, depth + 1) else s"d:$at"
+        val rest = loc["d:@".bytes.len + n.bytes.len..<loc.bytes.len]
+
+        return s"$root>{$key}$rest"
+    end for
+
+    loc
+end read_back_loc
 
 // The locations `f` overwrites on every way out.
 private walk_clears(cx: &KeepsCx, f: TFunc) -> KeptWhy
@@ -1633,14 +1752,14 @@ end kept_at
 private track_call_locs(t: &Track, name: string, j: usize, arg: TExpr) -> Buf[KeptAt]
     val kept = keeps_of(t.cx, name, j).locs
 
-    if !t.through || !asks_through(t.cx, texpr_type(arg)) then return kept
+    if !reads_on(t, arg) then return kept
 
     var out: Buf[KeptAt] = buf()
 
     for item in kept
         out.push(item)
 
-    for item in through_of(t.cx, name, j).locs
+    for item in (if t.steps > 0 then read_of(t.cx, name, j, steps_left(t, arg)) else through_of(t.cx, name, j)).locs
         out.push(item)
 
     out
@@ -1649,14 +1768,15 @@ end track_call_locs
 private track_vcall_locs(t: &Track, recv: TExpr, slot: int, k: usize, arg: TExpr) -> Buf[(string, KeptAt)]
     val kept = vcall_keeps(t.cx, recv, slot, k)
 
-    if !t.through || !asks_through(t.cx, texpr_type(arg)) then return kept
+    if !reads_on(t, arg) then return kept
 
     var out: Buf[(string, KeptAt)] = buf()
 
     for item in kept
         out.push(item)
 
-    for item in vcall_through(t.cx, recv, slot, k)
+    for item in (if t.steps > 0 then vcall_reads(t.cx, recv, slot, k, steps_left(t, arg))
+                 else vcall_through(t.cx, recv, slot, k))
         out.push(item)
 
     out
@@ -1665,18 +1785,69 @@ end track_vcall_locs
 private track_pointer_locs(t: &Track, callee: TExpr, j: usize, arg: TExpr) -> Buf[(string, KeptAt)]
     val kept = pointer_keeps(t.cx, callee, j)
 
-    if !t.through || !asks_through(t.cx, texpr_type(arg)) then return kept
+    if !reads_on(t, arg) then return kept
 
     var out: Buf[(string, KeptAt)] = buf()
 
     for item in kept
         out.push(item)
 
-    for item in pointer_through(t.cx, callee, j)
+    for item in (if t.steps > 0 then pointer_reads(t.cx, callee, j, steps_left(t, arg))
+                 else pointer_through(t.cx, callee, j))
         out.push(item)
 
     out
 end track_pointer_locs
+
+// Whether a callee handed `arg` is asked what it lets out of what it reads through it: in a walk of
+// what is read through the parameter, an argument something can be read through -- and in a walk of
+// what is read `steps` in, only a pointer on the way handed on, of which the callee is asked the steps
+// left (`steps_left`); a value read `steps` in and handed on is followed by what the callee keeps of it.
+private reads_on(t: &Track, arg: TExpr) -> bool =
+    t.through && asks_through(t.cx, texpr_type(arg)) && (t.steps == 0 || ptr_step(t, arg, 0) >= 0)
+
+private steps_left(t: &Track, arg: TExpr) -> int = t.steps - ptr_step(t, arg, 0)
+
+// **How many steps through the parameter a pointer on the way was read** in a walk of what is read
+// `steps` in, or -1 for a value that is no such pointer: 0 for the parameter and a name bound to it,
+// one more for each step through one (`p.s`, `p[i]` of a view), the same for a field or element in
+// place, a view or a cast of it, and one fewer for an address taken into what one points at (`&p.x`
+// reads, a step in, what `p` does). A value read `steps` in is what is followed, not a pointer on the
+// way.
+private ptr_step(t: &Track, e: TExpr, depth: int) -> int
+    if t.steps == 0 || depth > 12 then return -1
+
+    *e.kind match
+        TLoad(n, _) ->
+            for item in t.ptrs
+                if item.0 == n then return item.1
+
+            -1
+        TAddrOf(place, _) ->
+            val s = ptr_step(t, place, depth + 1)
+
+            if s >= 1 then s - 1 else -1
+        TDeref(x, _) -> step_on(t, ptr_step(t, x, depth + 1))
+        TField(r, _, _) -> ptr_step(t, r, depth + 1)
+        TIndex(r, _, _) -> texpr_type(r) match
+            Array(_, _) -> ptr_step(t, r, depth + 1)
+            _ -> step_on(t, ptr_step(t, r, depth + 1))
+        TCast(v, _) -> ptr_step(t, v, depth + 1)
+        TSlice(base, _, _, _, _) -> ptr_step(t, base, depth + 1)
+        TConstView(v) -> ptr_step(t, v, depth + 1)
+        TViewAs(v, _) -> ptr_step(t, v, depth + 1)
+        TSeq(exprs) -> if exprs.is_empty() then -1 else ptr_step(t, exprs.at(exprs.len() - 1), depth + 1)
+        TBlockExpr(b) -> if b.result.is_some() then ptr_step(t, b.result.unwrap(), depth + 1) else -1
+        _ -> -1
+end ptr_step
+
+// One step further through a pointer read `s` steps in: still a pointer on the way short of `steps`.
+private step_on(t: &Track, s: int) -> int = if s >= 0 && s + 1 < t.steps then s + 1 else -1
+
+// A step through `x` reads what is followed: anything for a walk of what is read through the
+// parameter; for a walk of what is read `steps` in, the last step, or one that reads a pointer on the
+// way.
+private steps_in(t: &Track, x: TExpr) -> bool = t.through && (t.steps == 0 || ptr_step(t, x, 0) >= 0)
 
 // A store: into this frame's own storage it binds the local (`track_locals`); anywhere else it is
 // held at the location the place names.
@@ -1787,6 +1958,7 @@ end whole_place
 private track_locals(t: &Track, body: TBlock)
     walk_block_stmts(body, stmt_walk(false, s -> s match
         TRefDecl(n, _, place) -> t.refs.push((n, place))
+        TVarDecl(n, _, init, _) -> if t.steps > 0 then t.decls.push((n, init))
         _ -> ()))
 
     t.changed = true
@@ -1878,7 +2050,26 @@ private bind_pattern(t: &Track, p: TPattern)
         bind_name(t, n)
 end bind_pattern
 
-private bind(t: &Track, name: string, value: TExpr) = if carries(t, value) then bind_name(t, name)
+private bind(t: &Track, name: string, value: TExpr)
+    if !carries(t, value) then return
+
+    // A name bound to a pointer on the way is read through as that pointer is.
+    val s = ptr_step(t, value, 0)
+
+    if s >= 0 && !bound_step(t, name)
+        t.ptrs.push((name, s))
+        t.changed = true
+    end if
+
+    bind_name(t, name)
+end bind
+
+private bound_step(t: &Track, name: string) -> bool
+    for item in t.ptrs
+        if item.0 == name then return true
+
+    false
+end bound_step
 
 private bind_name(t: &Track, name: string)
     if t.holds(name) then return
@@ -1968,8 +2159,8 @@ private carries(t: &Track, e: TExpr) -> bool = *e.kind match
     // that carries it is the box's own, and for a walk of what is read through a parameter, anything
     // read through what carries it is what is followed.
     TField(r, _, ty) -> may_hold_pointer(t.cx, ty) && carries(t, r)
-    TDeref(x, ty) -> may_hold_pointer(t.cx, ty) && (t.through || boxed(texpr_type(x))) && carries(t, x)
-    TIndex(r, _, ty) -> may_hold_pointer(t.cx, ty) && (t.through || is_array_type(texpr_type(r))) && carries(t, r)
+    TDeref(x, ty) -> may_hold_pointer(t.cx, ty) && (steps_in(t, x) || boxed(texpr_type(x))) && carries(t, x)
+    TIndex(r, _, ty) -> may_hold_pointer(t.cx, ty) && (steps_in(t, r) || is_array_type(texpr_type(r))) && carries(t, r)
 
     // A view cut from, or seen as, what is read through is read through as well.
     TSlice(base, _, _, _, ty) -> t.through && may_hold_pointer(t.cx, ty) && carries(t, base)
@@ -2039,10 +2230,14 @@ private call_carries(t: &Track, name: string, args: Buf[TExpr], ty: Type) -> boo
     for i in 0..<args.len()
         if !carries(t, args.at(i)) then continue
         if answers_arg(t.cx, name, args, i, ty, t.raw) then return true
-        if t.through && asks_through(t.cx, texpr_type(args.at(i))) && through_answers_of(t.cx, name, i) then return true
+        if reads_on(t, args.at(i)) && answers_read(t, name, args, i) then return true
 
     false
 end call_carries
+
+private answers_read(t: &Track, name: string, args: Buf[TExpr], i: usize) -> bool =
+    if t.steps > 0 then read_answers_of(t.cx, name, i, steps_left(t, args.at(i)))
+    else through_answers_of(t.cx, name, i)
 
 private any_carries(t: &Track, es: Buf[TExpr]) -> bool
     for item in es
@@ -2186,6 +2381,11 @@ struct FrameTrack
     // The locals bound once to a pointer, each with what it was bound to (`frame_lasting`).
     inits: Buf[(string, TExpr)]
 
+    // Every value put into a local's own storage that may hold an address -- its initializer and each
+    // store into it or a field or element of it -- for what a read through its address reaches
+    // (`read_cores`).
+    bound: Buf[(string, TExpr)]
+
     // Whether this walk is the probe that decides closures' capture modes (`probe_frame`): what it
     // follows is the closure literals rather than the frame's addresses.
     probe: bool
@@ -2291,12 +2491,18 @@ private frame_walk(cx: &KeepsCx, faults: &KeepFaults, f: TFunc, probe: bool)
     val org = origins_of(cx, f)
     val ft: &FrameTrack = FrameTrack(cx, faults, func_home(cx.an, f.name), shown_name(cx.an, f.name),
                                      f.params, buf(), buf(), false, org, round_handles(cx, org, f), f, buf(),
-                                     probe)
+                                     buf(), probe)
 
     walk_block_stmts(f.body, stmt_walk(false, s -> s match
         TRefDecl(n, _, place) -> ft.refs.push((n, place))
         TVarDecl(n, ty, init, _) -> if may_hold_pointer(cx, ty) && stable_name(org, n) != "" then ft.inits.push((n, init))
         _ -> ()))
+
+    if !probe
+        walk_block_stmts(f.body, TWalk(false, e -> (), w -> frame_note_bound(ft, w.place, w.value), s -> s match
+            TVarDecl(n, ty, init, _) -> if may_hold_pointer(cx, ty) then ft.bound.push((n, init))
+            _ -> ()))
+    end if
 
     ft.changed = true
 
@@ -2483,6 +2689,15 @@ private frame_bind_ptr_call(ft: &FrameTrack, callee: TExpr, args: Buf[TExpr])
             else if ft.probe then probe_hold_kept(ft, args, item.1.loc, core.unwrap())
 end frame_bind_ptr_call
 
+// A value stored into a local's own storage, noted for what a read through its address reaches.
+private frame_note_bound(ft: &FrameTrack, place: TExpr, v: TExpr)
+    if !may_hold_pointer(ft.cx, texpr_type(v)) then return
+
+    local_root(ft.refs, place) match
+        Some(n) -> ft.bound.push((n, v))
+        None -> ()
+end frame_note_bound
+
 // A store into this frame's own storage -- by name, or through a pointer that points into it.
 private frame_bind_store(ft: &FrameTrack, place: TExpr, v: TExpr)
     local_root(ft.refs, place) match
@@ -2532,13 +2747,21 @@ private frame_bind_call(ft: &FrameTrack, name: string, args: Buf[TExpr])
 
         val core = frame_core(ft, arg)
 
-        if core.is_none() then continue
+        if core.is_some()
+            for pair in frame_call_locs(ft, name, j, arg)
+                val loc = translate_loc(ft.org, args, pair.0.loc)
 
-        for pair in frame_call_locs(ft, name, j, arg)
-            val loc = translate_loc(ft.org, args, pair.0.loc)
+                if loc.starts_with("l:") then frame_hold(ft, local_of(loc), core.unwrap())
+                else if ft.probe then probe_hold_kept(ft, args, pair.0.loc, core.unwrap())
+        end if
 
-            if loc.starts_with("l:") then frame_hold(ft, local_of(loc), core.unwrap())
-            else if ft.probe then probe_hold_kept(ft, args, pair.0.loc, core.unwrap())
+        // What the callee copies out of what it reads through the argument into a local's storage --
+        // `copy(&into, &h)` -- makes that local hold what was read.
+        for r in frame_read_locs(ft, name, j, arg)
+            val loc = translate_loc(ft.org, args, r.1.loc)
+
+            if loc.starts_with("l:") then frame_hold(ft, local_of(loc), r.2)
+    end for
 end frame_bind_call
 
 // **For a probe, a callee keeping an argument in what another argument points at, where that one is
@@ -2754,8 +2977,9 @@ private call_at(ft: &FrameTrack, evs: &EvBuf, e: TExpr)
                 if !may_hold_pointer(ft.cx, texpr_type(arg)) then continue
 
                 val core = frame_core(ft, arg)
+                val reads = frame_read_locs(ft, name, j, arg)
 
-                if core.is_none() then continue
+                if core.is_none() && reads.is_empty() then continue
 
                 if ft.probe
                     val apart = probe_held_apart(ft, e, name, j)
@@ -2768,8 +2992,20 @@ private call_at(ft: &FrameTrack, evs: &EvBuf, e: TExpr)
                     end if
                 end if
 
-                for pair in frame_call_locs(ft, name, j, arg)
-                    val item = pair.0
+                // Where the callee holds the argument (or, for a probe, what it reads through it), and
+                // where it holds the frame storage the argument reaches, with that storage as said.
+                var held: Buf[(KeptAt, bool, string)] = buf()
+
+                if core.is_some()
+                    for pair in frame_call_locs(ft, name, j, arg)
+                        held.push((pair.0, pair.1, ""))
+
+                for r in reads
+                    held.push((r.1, true, r.2))
+
+                for h in held
+                    val item = h.0
+                    val read = h.2 != ""
 
                     if item.loc == "j" && has_span(ft.hs.chained, e.span) then continue
 
@@ -2788,11 +3024,14 @@ private call_at(ft: &FrameTrack, evs: &EvBuf, e: TExpr)
                     val ending = if task_result(texpr_type(e)).is_some() then "await that task" else "join that thread"
                     val cure = if item.loc == "j" then s" — $ending on every way out of '${ft.owner}', " +
                         s"or hand it storage that lasts${ft.hs.why}" else ""
-                    var said = s"'${shown_name(ft.cx.an, name)}' keeps its parameter " +
-                        s"'${param_name(ft.cx, name, j)}' (${item.how}), and " +
-                        argument_said(ft, arg, core.unwrap()) + cure
+                    var said = if read
+                        read_said(ft, name, param_name(ft.cx, name, j), item.how, arg, h.2, false) + cure
+                    else
+                        s"'${shown_name(ft.cx.an, name)}' keeps its parameter " +
+                            s"'${param_name(ft.cx, name, j)}' (${item.how}), and " +
+                            argument_said(ft, arg, core.unwrap()) + cure
 
-                    if ft.probe then said = probe_kept(ft, core.unwrap(), arg, name, param_name(ft.cx, name, j), item.how, pair.1)
+                    if ft.probe then said = probe_kept(ft, core.unwrap(), arg, name, param_name(ft.cx, name, j), item.how, h.1)
 
                     if loc == "" || (loc.index_of("?").is_some() && !loc.starts_with("j?"))
                         ft.faults.items.push((ft.scope, arg.span, said))
@@ -2815,11 +3054,22 @@ private call_at(ft: &FrameTrack, evs: &EvBuf, e: TExpr)
                 if !may_hold_pointer(ft.cx, texpr_type(arg)) then continue
 
                 val core = frame_core(ft, arg)
+                val reads = frame_vread_locs(ft, recv, slot, k, arg)
 
-                if core.is_none() then continue
+                if core.is_none() && reads.is_empty() then continue
 
-                for triple in frame_vcall_locs(ft, recv, slot, k, arg)
-                    val item = (triple.0, triple.1)
+                var held: Buf[(string, KeptAt, bool, string)] = buf()
+
+                if core.is_some()
+                    for triple in frame_vcall_locs(ft, recv, slot, k, arg)
+                        held.push((triple.0, triple.1, triple.2, ""))
+
+                for r in reads
+                    held.push((r.0, r.1, true, r.2))
+
+                for h in held
+                    val item = (h.0, h.1)
+                    val read = h.3 != ""
 
                     if item.1.loc == "j" && has_span(ft.hs.chained, e.span) then continue
 
@@ -2831,13 +3081,16 @@ private call_at(ft: &FrameTrack, evs: &EvBuf, e: TExpr)
                     // An async method's task holds it until that task is awaited.
                     val cure = if item.1.loc == "j" then s" — await that task on every way out of '${ft.owner}', " +
                         s"or hand it storage that lasts" else ""
-                    var said = s"'${shown_name(ft.cx.an, item.0)}' keeps its parameter " +
-                        s"'${param_name(ft.cx, item.0, k)}' (${item.1.how}), and " +
-                        argument_said(ft, arg, core.unwrap()) + cure
+                    var said = if read
+                        read_said(ft, item.0, param_name(ft.cx, item.0, k), item.1.how, arg, h.3, false) + cure
+                    else
+                        s"'${shown_name(ft.cx.an, item.0)}' keeps its parameter " +
+                            s"'${param_name(ft.cx, item.0, k)}' (${item.1.how}), and " +
+                            argument_said(ft, arg, core.unwrap()) + cure
 
                     if ft.probe
                         said = probe_kept(ft, core.unwrap(), arg, item.0, param_name(ft.cx, item.0, k),
-                                          item.1.how, triple.2)
+                                          item.1.how, h.2)
                     end if
 
                     if loc == "" || loc.index_of("?").is_some()
@@ -2853,22 +3106,36 @@ private call_at(ft: &FrameTrack, evs: &EvBuf, e: TExpr)
                 if !may_hold_pointer(ft.cx, texpr_type(arg)) then continue
 
                 val core = frame_core(ft, arg)
+                val reads = frame_pread_locs(ft, callee, j, arg)
 
-                if core.is_none() then continue
+                if core.is_none() && reads.is_empty() then continue
 
-                for triple in frame_pointer_locs(ft, callee, j, arg)
-                    val item = (triple.0, triple.1)
+                var held: Buf[(string, KeptAt, bool, string)] = buf()
+
+                if core.is_some()
+                    for triple in frame_pointer_locs(ft, callee, j, arg)
+                        held.push((triple.0, triple.1, triple.2, ""))
+
+                for r in reads
+                    held.push((r.0, r.1, true, r.2))
+
+                for h in held
+                    val item = (h.0, h.1)
+                    val read = h.3 != ""
                     val loc = translate_loc(ft.org, args, item.1.loc)
 
                     if loc.starts_with("l:") then continue
 
-                    var said = s"a call through '${type_show(texpr_type(callee))}' may reach " +
-                        s"'${shown_name(ft.cx.an, item.0)}', which keeps its parameter " +
-                        s"'${param_name(ft.cx, item.0, j)}' (${item.1.how}), and " + argument_said(ft, arg, core.unwrap())
+                    val through = s"a call through '${type_show(texpr_type(callee))}' may reach "
+                    var said = if read
+                        through + read_said(ft, item.0, param_name(ft.cx, item.0, j), item.1.how, arg, h.3, true)
+                    else
+                        through + s"'${shown_name(ft.cx.an, item.0)}', which keeps its parameter " +
+                            s"'${param_name(ft.cx, item.0, j)}' (${item.1.how}), and " + argument_said(ft, arg, core.unwrap())
 
                     if ft.probe
                         said = probe_kept(ft, core.unwrap(), arg, item.0, param_name(ft.cx, item.0, j), item.1.how,
-                                          triple.2)
+                                          h.2)
                     end if
 
                     if loc == "" || loc.index_of("?").is_some()
@@ -2927,7 +3194,8 @@ private probe_kept(ft: &FrameTrack, core: string, arg: TExpr, callee: string, pa
 // argument, and where the argument is a pointer or a view -- `install(&s)`, `run_all([f, g])` --
 // what the callee lets out of what it reads through it (`through_of`), each marked `true`. A callee
 // that only calls or reads the elements lets nothing out, and the closures stay in the frame; one
-// that copies one out holds it wherever it copies it. The rule's own walk asks only what is kept.
+// that copies one out holds it wherever it copies it. The rule's own walk asks what is kept here, and
+// what is read through an argument by the steps it takes (`frame_read_locs`).
 private frame_call_locs(ft: &FrameTrack, name: string, j: usize, arg: TExpr) -> Buf[(KeptAt, bool)]
     var out: Buf[(KeptAt, bool)] = buf()
 
@@ -2969,6 +3237,119 @@ private frame_pointer_locs(ft: &FrameTrack, callee: TExpr, j: usize, arg: TExpr)
 
     out
 end frame_pointer_locs
+
+// **The rule's own walk asks what a callee lets out of what it reads through an argument, step by
+// step, where the storage the argument reaches holds an address of this frame** (`read_cores`,
+// `read_of`): `stash(&h)`, where `h` holds `&x` and `stash` pushes `h.p`, lets `&x` out as surely as
+// `stash(&x)` would. Each address is asked of the step it sits at -- `&x` in `h` one step through
+// `&h`; in `s`, where `w` holds `&s`, two steps through `&w` -- so a callee letting out what sits at
+// another step lets out somebody else's storage, or a copy. Each comes back with the frame storage it
+// lets out, as the refusal says it. Where no body is in sight it keeps to what the rule says of the
+// pointer itself (`read_of`, `vcall_reads`, `pointer_reads`).
+//
+// **What the callee puts back into storage reached through the same argument stays where the argument
+// reaches** -- `old = s.vm.con`, then `s.vm.con = old` -- so it lets nothing out where all of that is
+// this frame's own (`frame_closed`). Where any of it may be somebody else's -- a pointer the frame was
+// handed, made, or read -- it is held there as anywhere else.
+private frame_read_locs(ft: &FrameTrack, name: string, j: usize, arg: TExpr) -> Buf[(string, KeptAt, string)]
+    var out: Buf[(string, KeptAt, string)] = buf()
+
+    if ft.probe || !asks_through(ft.cx, texpr_type(arg)) then return out
+
+    val closed = frame_closed(ft, arg)
+
+    for r in read_cores(ft, arg)
+        for item in read_of(ft.cx, name, j, r.0).locs
+            if !(closed && put_back(item.loc, j)) then out.push((name, item, r.1))
+
+    out
+end frame_read_locs
+
+private frame_vread_locs(ft: &FrameTrack, recv: TExpr, slot: int, k: usize, arg: TExpr) -> Buf[(string, KeptAt, string)]
+    var out: Buf[(string, KeptAt, string)] = buf()
+
+    if ft.probe || !asks_through(ft.cx, texpr_type(arg)) then return out
+
+    val closed = frame_closed(ft, arg)
+
+    for r in read_cores(ft, arg)
+        for item in vcall_reads(ft.cx, recv, slot, k, r.0)
+            if !(closed && put_back(item.1.loc, k)) then out.push((item.0, item.1, r.1))
+
+    out
+end frame_vread_locs
+
+private frame_pread_locs(ft: &FrameTrack, callee: TExpr, j: usize, arg: TExpr) -> Buf[(string, KeptAt, string)]
+    var out: Buf[(string, KeptAt, string)] = buf()
+
+    if ft.probe || !asks_through(ft.cx, texpr_type(arg)) then return out
+
+    val closed = frame_closed(ft, arg)
+
+    for r in read_cores(ft, arg)
+        for item in pointer_reads(ft.cx, callee, j, r.0)
+            if !(closed && put_back(item.1.loc, j)) then out.push((item.0, item.1, r.1))
+
+    out
+end frame_pread_locs
+
+// Whether a callee's location is storage reached through its own parameter at `j`.
+private put_back(loc: string, j: usize) -> bool = loc.starts_with(s"p$j:") || loc.starts_with(s"d:p$j:")
+
+// **Whether everything a pointer argument reaches is this frame's own storage**: the locals it points
+// at, and every local whose address what they were given holds, with no address in any of it that came
+// from anywhere else -- a parameter, a call, module storage, a pointer read out of something.
+private frame_closed(ft: &FrameTrack, arg: TExpr) -> bool
+    var reached = pointed_locals(ft, arg, 0)
+    var seen: Buf[string] = buf()
+
+    if reached.is_empty() then return false
+
+    while !reached.is_empty()
+        var next: Buf[string] = buf()
+
+        for n in reached
+            if holds_string(seen, n) then continue
+
+            seen.push(n)
+
+            for p in ft.params
+                if p.0 == n then return false
+
+            for item in ft.bound
+                if item.0 == n && !frame_only(ft, item.1, &next, 0) then return false
+        end for
+
+        reached = next
+    end while
+
+    true
+end frame_closed
+
+// Whether a value holds no address but those of this frame's locals, each gathered into `out`.
+private frame_only(ft: &FrameTrack, e: TExpr, out: *Buf[string], depth: int) -> bool
+    if depth > 8 then return false
+    if !may_hold_pointer(ft.cx, texpr_type(e)) then return true
+
+    *e.kind match
+        TAddrOf(place, _) -> local_root(ft.refs, place) match
+            Some(n) ->
+                out.push(n)
+                true
+            None -> false
+        TStructNew(_, args) -> all_frame_only(ft, args, out, depth)
+        TEnumNew(_, _, args) -> all_frame_only(ft, args, out, depth)
+        TArrayLit(elems, _) -> all_frame_only(ft, elems, out, depth)
+        TCast(v, _) -> frame_only(ft, v, out, depth + 1)
+        _ -> false
+end frame_only
+
+private all_frame_only(ft: &FrameTrack, es: Buf[TExpr], out: *Buf[string], depth: int) -> bool
+    for item in es
+        if !frame_only(ft, item, out, depth + 1) then return false
+
+    true
+end all_frame_only
 
 // What a conversion to `&sync` makes of a closure: one held by value, as every closure that crosses
 // a domain is.
@@ -3187,15 +3568,177 @@ private rule_core(ft: &FrameTrack, e: TExpr) -> Option[string] = *e.kind match
         None
     _ -> None
 
-// The frame storage a call's answer may be made of: an argument's, where the callee answers with it.
+// The frame storage a call's answer may be made of: an argument's, where the callee answers with it,
+// or what the storage an argument points at holds, where the callee answers with what it reads
+// through it (`get(&h)` answering `h.p`).
 private answer_core(ft: &FrameTrack, name: string, args: Buf[TExpr], ty: Type) -> Option[string]
     for i in 0..<args.len()
         val c = frame_core(ft, args.at(i))
 
         if c.is_some() && answers_arg(ft.cx, name, args, i, ty, false) then return c
 
+        if !asks_through(ft.cx, texpr_type(args.at(i))) || ft.cx.find(name).is_none() then continue
+
+        for r in read_cores(ft, args.at(i))
+            if read_answers_of(ft.cx, name, i, r.0) then return Some(r.1)
+    end for
+
     None
 end answer_core
+
+// **What a read through a pointer or a view reaches of this frame**, for the rule's walk: the
+// address of this frame's storage that the storage it points at holds. `&h`, where `h` holds `&x`,
+// reaches `&x`; so does a local bound once to `&h`, a view of an array of such addresses, and the
+// address of a value made in place around one. A pointer read out of a field, or one a parameter
+// brought, reaches nothing this walk follows. A probe asks what a value reaches in `probe_text`.
+private read_core(ft: &FrameTrack, e: TExpr, depth: int) -> Option[string]
+    if ft.probe || depth > 8 then return None
+
+    *e.kind match
+        TAddrOf(place, _) -> local_root(ft.refs, place) match
+            Some(n) -> ft.core_of(n)
+            None -> None
+        TTempAddr(v, _) -> frame_core(ft, v)
+        TLoad(n, _) ->
+            for item in ft.inits
+                if item.0 == n then return read_core(ft, item.1, depth + 1)
+
+            None
+        TSlice(base, _, _, _, _) -> texpr_type(base) match
+            Array(_, _) -> local_root(ft.refs, base) match
+                Some(n) -> ft.core_of(n)
+                None -> frame_core(ft, base)
+            _ -> read_core(ft, base, depth + 1)
+        TBufLit(elems, _) -> first_core(ft, elems)
+        TCast(v, _) -> read_core(ft, v, depth + 1)
+        TViewAs(v, _) -> read_core(ft, v, depth + 1)
+        TSeq(exprs) -> if exprs.is_empty() then None else read_core(ft, exprs.at(exprs.len() - 1), depth + 1)
+        TBlockExpr(b) -> if b.result.is_some() then read_core(ft, b.result.unwrap(), depth + 1) else None
+        _ -> None
+end read_core
+
+// **Every address of this frame's storage that a read through an argument reaches, with the steps it
+// takes** (the rule's walk): one step, what `read_core` says; then, where what it points at is a local
+// given a value holding `&s` (`var w = W(&s)`, `w.s = &s`), what `s` holds, a step further -- up to
+// four.
+private read_cores(ft: &FrameTrack, arg: TExpr) -> Buf[(int, string)]
+    var out: Buf[(int, string)] = buf()
+
+    if ft.probe then return out
+
+    val first = read_core(ft, arg, 0)
+
+    if first.is_some() then out.push((1, first.unwrap()))
+
+    var reached = pointed_locals(ft, arg, 0)
+    var steps = 1
+
+    while steps < 4 && !reached.is_empty()
+        var next: Buf[string] = buf()
+
+        for n in reached
+            for item in ft.bound
+                if item.0 == n then addressed_locals(ft, item.1, &next, 0)
+
+        steps += 1
+
+        for n in next
+            val c = ft.core_of(n)
+
+            if c.is_some() then out.push((steps, c.unwrap()))
+
+        reached = next
+    end while
+
+    out
+end read_cores
+
+// The locals whose own storage a pointer or a view points at.
+private pointed_locals(ft: &FrameTrack, e: TExpr, depth: int) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    if depth > 8 then return out
+
+    *e.kind match
+        TAddrOf(place, _) -> local_root(ft.refs, place) match
+            Some(n) -> out.push(n)
+            None -> ()
+        TLoad(n, _) ->
+            for item in ft.inits
+                if item.0 == n then return pointed_locals(ft, item.1, depth + 1)
+        TSlice(base, _, _, _, _) -> texpr_type(base) match
+            Array(_, _) -> local_root(ft.refs, base) match
+                Some(n) -> out.push(n)
+                None -> ()
+            _ -> return pointed_locals(ft, base, depth + 1)
+        TCast(v, _) -> return pointed_locals(ft, v, depth + 1)
+        TViewAs(v, _) -> return pointed_locals(ft, v, depth + 1)
+        _ -> ()
+
+    out
+end pointed_locals
+
+// The locals whose addresses a value is built of: `W(&s)`, `[&a, &b]`, `Some(&s)`.
+private addressed_locals(ft: &FrameTrack, e: TExpr, out: *Buf[string], depth: int)
+    if depth > 8 then return
+
+    *e.kind match
+        TAddrOf(place, _) -> local_root(ft.refs, place) match
+            Some(n) -> out.push(n)
+            None -> ()
+        TStructNew(_, args) ->
+            for a in args
+                addressed_locals(ft, a, out, depth + 1)
+        TEnumNew(_, _, args) ->
+            for a in args
+                addressed_locals(ft, a, out, depth + 1)
+        TArrayLit(elems, _) ->
+            for a in elems
+                addressed_locals(ft, a, out, depth + 1)
+        TCast(v, _) -> addressed_locals(ft, v, out, depth + 1)
+        _ -> ()
+end addressed_locals
+
+// A refusal of a call that lets out what it reads through an argument whose pointee holds the
+// address of this frame's storage, in the words of the rule's other refusals.
+private read_said(ft: &FrameTrack, callee: string, param: string, how: string, arg: TExpr, inside: string,
+                  which: bool) -> string
+    val named = s"'${shown_name(ft.cx.an, callee)}'" + (if which then ", which" else "")
+
+    // A slice is written from its base to its closing bracket; a receiver's address taken by a method
+    // call is written as the receiver (`argument_said`).
+    val text = value_text(ft.scope, arg)
+    val written = *arg.kind match
+        TSlice(base, _, _, _, _) -> source_text(ft.scope, Span(base.span.start, bracket_end(ft.scope, base.span.end)))
+        TAddrOf(place, _) -> if text.starts_with("&") then text else source_text(ft.scope, whole_place(place))
+        _ -> text
+
+    s"$named lets what it reads through its parameter '$param' outlive the call ($how), and what is " +
+        s"read through '$written' holds $inside"
+end read_said
+
+// Where the bracket that opens at `at` closes, one past it; `at` itself where none opens there.
+private bracket_end(scope: Scope, at: usize) -> usize
+    val bytes = scope.src.bytes
+
+    if at >= bytes.len || bytes[at] != u8('[') then return at
+
+    var depth = 0
+    var i = at
+
+    while i < bytes.len
+        if bytes[i] == u8('[') then depth += 1
+
+        if bytes[i] == u8(']')
+            depth -= 1
+
+            if depth == 0 then return i + 1
+        end if
+
+        i += 1
+
+    at
+end bracket_end
 
 private first_core(ft: &FrameTrack, es: Buf[TExpr]) -> Option[string]
     for item in es
