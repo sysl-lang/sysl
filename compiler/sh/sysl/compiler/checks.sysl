@@ -2,7 +2,7 @@ module sh.sysl.compiler
 
 import sh.sysl.parsing.{point, Span}
 import sysl.buf.{Buf, buf}
-import sysl.container.{map, Set, set}
+import sysl.container.{Map, map, Set, set}
 import sysl.text.{Search, from_utf8_unchecked}
 
 // The checks a whole program is held to once every body it reaches has been typed.
@@ -124,10 +124,165 @@ private check_ref_calls(a: &Analysis, funcs: Buf[TFunc], vals: Buf[TVal])
 
         val scope = func_home(a, f.name)
         val at: *Untouched = &u
+        val holders = closure_holders(f)
 
         walk_block_stmts(f.body, expr_walk(false, e -> ref_call(a, at, known, globals, erased, scope,
-                                                                mine, e)))
+                                                                mine, holders, e)))
 end check_ref_calls
+
+// -- a closure held by reference, writing what a live `ref` stands on ----------------------------
+//
+// **A closure that holds its captures by reference writes the caller's variables when it is called**
+// (`docs/design/closures.md` §7), so calling one -- or handing one to a call, which may call it --
+// while a `ref` stands on storage such a write releases is the assignment `check_ref_guards` refuses,
+// made one call away. Asked here, where every closure's mode is known: one held by value writes its
+// own copy and releases nothing of the caller's.
+//
+// The closure is found by its type wherever the call reaches it -- an argument, the receiver of its
+// own `call`, a `&Fn` box, a struct or enum built around it -- and by name where a local holds it
+// erased: every local whose initializer or assignment builds or reads one (`closure_holders`). A
+// closure that captures another calls it, so it writes what that one writes too.
+
+// For each local of a body, the closures what was put in it builds or reads: a `&Fn` local, a struct
+// or an `Option` holding one, a second name for another.
+private closure_holders(f: TFunc) -> Map[string, Buf[string]]
+    var out: Map[string, Buf[string]] = map()
+    val into = &out
+
+    walk_block_stmts(f.body, TWalk(true, e -> (), w -> held_into(into, w.place, w.value), s -> s match
+        TVarDecl(name, _, init, _) -> hold_closures(into, name, init)
+        _ -> ()))
+
+    out
+end closure_holders
+
+private held_into(into: *Map[string, Buf[string]], place: TExpr, value: TExpr) = *place.kind match
+    TLoad(name, _) -> hold_closures(into, name, value)
+    _ -> ()
+
+private hold_closures(into: *Map[string, Buf[string]], name: string, value: TExpr)
+    var found: Buf[string] = buf()
+
+    walk_texpr(value, expr_walk(true, x -> closure_named(*into, &found, x)))
+
+    if found.is_empty() then return
+
+    var held = into.get(name).unwrap_or(buf())
+
+    for base in found
+        if !holds_string(held, base) then held.push(base)
+
+    into.put(name, held)
+end hold_closures
+
+// A closure a node builds or reads: by its type, or by the local holding it erased.
+private closure_named(holders: Map[string, Buf[string]], out: *Buf[string], x: TExpr)
+    texpr_type(x) match
+        Struct(st) -> if is_closure_literal(Struct(st)) && !holds_string(*out, st.base) then out.push(st.base)
+        _ -> ()
+
+    *x.kind match
+        TLoad(name, _) ->
+            for base in holders.get(name).unwrap_or(buf())
+                if !holds_string(*out, base) then out.push(base)
+        _ -> ()
+end closure_named
+
+// Every closure a call hands on or runs, and every closure those capture, each once.
+private closures_called(a: &Analysis, holders: Map[string, Buf[string]], e: TExpr) -> Buf[string]
+    var direct: Buf[string] = buf()
+    val parts: Buf[TExpr] = *e.kind match
+        TCall(_, args, _, _) -> args
+        TCallPtr(callee, args, _, _) ->
+            var all = args.copy()
+
+            all.push(callee)
+            all
+        TVCall(receiver, _, args, _, _) ->
+            var all = args.copy()
+
+            all.push(receiver)
+            all
+        _ -> buf()
+
+    for part in parts
+        handed(holders, &direct, part)
+
+    var out: Buf[string] = buf()
+
+    for base in direct
+        follow_closure(a, holders, &out, base)
+
+    out
+end closures_called
+
+// The closures an argument is, or carries: through an address, a box, an erasure, a dereference, or
+// a struct or enum built around one -- not through a call, whose result is the callee's.
+private handed(holders: Map[string, Buf[string]], out: *Buf[string], x: TExpr)
+    closure_named(holders, out, x)
+
+    *x.kind match
+        TAddrOf(inner, _) -> handed(holders, out, inner)
+        TBox(inner, _) -> handed(holders, out, inner)
+        TErase(inner, _, _) -> handed(holders, out, inner)
+        TDeref(inner, _) -> handed(holders, out, inner)
+        TStructNew(st, args) ->
+            if !is_closure_literal(Struct(st))
+                for item in args
+                    handed(holders, out, item)
+        TEnumNew(_, _, args) ->
+            for item in args
+                handed(holders, out, item)
+        _ -> ()
+end handed
+
+// A closure and the closures it captures, by their types or by the locals holding them erased.
+private follow_closure(a: &Analysis, holders: Map[string, Buf[string]], out: *Buf[string], base: string)
+    if holds_string(*out, base) then return
+
+    out.push(base)
+
+    val st = a.tables.struct_insts.get(base)
+    val writes = a.closure_write_keys.get(base)
+
+    if st.is_none() || writes.is_none() then return
+
+    st.unwrap() match
+        Struct(d) ->
+            for i in 0..<d.fields.len()
+                d.fields.at(i).1 match
+                    Struct(inner) -> if is_closure_literal(Struct(inner)) then follow_closure(a, holders, out, inner.base)
+                    _ -> ()
+
+                if i < writes.unwrap().captures.len()
+                    for held in holders.get(writes.unwrap().captures.at(i)).unwrap_or(buf())
+                        follow_closure(a, holders, out, held)
+            end for
+        _ -> ()
+end follow_closure
+
+// The first place a closure held by reference writes that a `ref` stands through, or on a value
+// holding it: the variable's name as written.
+private closure_writes_under(a: &Analysis, bases: Buf[string], keys: Buf[string]) -> Option[string]
+    for base in bases
+        if !a.by_ref_closures.has(base) then continue
+
+        val writes = a.closure_write_keys.get(base)
+
+        if writes.is_none() then continue
+
+        val w = writes.unwrap()
+
+        for i in 0..<w.keys.len()
+            val at = w.keys.at(i)
+
+            for k in keys
+                if k == at || k.starts_with(s"$at/") then return Some(w.names.at(i))
+        end for
+    end for
+
+    None
+end closure_writes_under
 
 // Every value the program puts behind a trait, by the trait's name.
 private struct ErasedSink
@@ -145,7 +300,7 @@ private note_erased(out: &ErasedSink, e: TExpr) = *e.kind match
 
 private ref_call(a: &Analysis, u: *Untouched, known: Set[string], globals: Buf[Type],
                  erased: Buf[(string, Type)], scope: Scope,
-                 mine: Buf[RefWatch], e: TExpr)
+                 mine: Buf[RefWatch], holders: Map[string, Buf[string]], e: TExpr)
     val callee = *e.kind match
         TCall(name, args, ty, _) -> if ty == Never then None else Some((name, args))
         TCallPtr(_, args, _, _) -> Some(("", args))
@@ -157,10 +312,23 @@ private ref_call(a: &Analysis, u: *Untouched, known: Set[string], globals: Buf[T
     for item in a.ref_refusals
         if item >= e.span.start && item < e.span.end then return
 
+    val closures = closures_called(a, holders, e)
+
     for w in mine
         val live = e.span.start >= w.start && (w.end.is_none() || e.span.start < w.end.unwrap())
 
         if !live then continue
+
+        val written = if closures.is_empty() then None else closure_writes_under(a, closures, w.keys)
+
+        if written.is_some()
+            a.fault(scope, e.span, s"'${w.name}' is a 'ref' standing on storage this call could " +
+                    s"release, since a closure it runs writes '${written.unwrap()}' — so the name could " +
+                    "be left pointing at freed memory. Make the call before the 'ref', or put the 'ref' " +
+                    "in a block that closes first")
+            a.ref_refusals.push(e.span.start)
+            return
+        end if
 
         val name = callee.unwrap().0
         val args = callee.unwrap().1
