@@ -1,0 +1,168 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.cstring
+
+// **A trait method whose receiver is lent by address is reached from its table through a body that
+// takes every other parameter the way the table passes it** (`emit_vtable.sysl`'s `lent_self`): a
+// parameter the method's own body is lent too -- a read-only aggregate wider than two words -- arrives
+// as the value and is lent a slot of the body's own. Handed on as it arrived, the table's value was
+// read as an address, and a ray tracer's `hit(self, r: Ray, …)` through a `&sync Hittable` faulted.
+//
+// The cells cross the parameter's place (alone, beside a scalar, two of them around a scalar, after a
+// counted `string`), what the method answers (a scalar, a large struct, a counted `string`), the
+// implementing type (a plain struct, an instantiation of a generic one), the table (`&T`, `&sync T`),
+// and a direct call beside them; the build modes are the counted heap and AddressSanitizer.
+//
+// Skipped cells, and why: a receiver of two words or fewer is not lent and its table reaches the
+// method's ordinary entry (`tests_vts_vtable_self.sysl`); a zero-sized or indirect receiver's table
+// goes through an adapter calling that entry, which already lends.
+
+private extern "setenv" lvs_c_setenv(name: *u8, value: *u8, overwrite: int) -> int
+private extern "unsetenv" lvs_c_unsetenv(name: *u8) -> int
+
+// The program built and run, on the counted heap or with `flags` handed to clang: what it printed,
+// what it said on stderr, and how many AddressSanitizer report hooks its binary carries.
+private lvs_run(text: string, counted: bool, flags: string) -> (string, string, usize)
+    val root = make_temp_dir("sysl-lvs").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", forms_imported(text)).unwrap()
+
+    val exe = s"$root/built"
+
+    if flags != ""
+        val n = cstring("SYSL_EXTRA_CFLAGS")
+        val v = cstring(flags)
+
+        lvs_c_setenv(n.ptr, v.ptr, 1)
+    end if
+
+    force_alloc_counting(counted)
+
+    val made = build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe))
+
+    force_alloc_counting(false)
+
+    if flags != ""
+        val n = cstring("SYSL_EXTRA_CFLAGS")
+
+        lvs_c_unsetenv(n.ptr)
+    end if
+
+    made match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (failure_text(why), "", 0)
+        Ok(_) -> ()
+
+    val hooks = capture("nm", ["-u", exe], "", [], true) match
+        Ok(o) -> o.text.count_of("__asan_report")
+        Err(_) -> 0
+
+    val ran = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    ran match
+        Err(_) -> ("could not be started", "", hooks)
+        Ok(o) -> (o.text, o.err.unwrap_or(""), hooks)
+end lvs_run
+
+private const lvs_matrix: string = raw"""
+    struct V
+        x: real
+        y: real
+        z: real
+
+    struct Big
+        a: real
+        b: real
+        c: real
+
+    trait Shape
+        reach(self, v: V, k: int) -> real
+        span(self, lo: V, k: int, hi: V) -> real
+        moved(self, by: V) -> Big
+        tagged(self, label: string, v: V) -> string
+
+    impl Shape for Big
+        reach(self, v: V, k: int) -> real = self.a + v.x + v.y + v.z + real(k)
+        span(self, lo: V, k: int, hi: V) -> real = self.b + hi.x - lo.x + real(k)
+        moved(self, by: V) -> Big = Big(self.a + by.x, self.b + by.y, self.c + by.z)
+        tagged(self, label: string, v: V) -> string = s"$label ${self.c + v.z}"
+
+    struct Pair[T]
+        tag: T
+        first: real
+        second: real
+        third: real
+
+    impl[T] Shape for Pair[T]
+        reach(self, v: V, k: int) -> real = self.first + v.y + real(k)
+        span(self, lo: V, k: int, hi: V) -> real = self.second + hi.y - lo.y + real(k)
+        moved(self, by: V) -> Big = Big(self.first, self.second, by.z)
+        tagged(self, label: string, v: V) -> string = s"$label ${self.third + v.x}"
+
+    each(xs: []&Shape, ys: []&sync Shape)
+        val v = V(10.0, 20.0, 30.0)
+        val w = V(1.0, 2.0, 3.0)
+
+        for s in xs
+            print(s.reach(v, 4), s.span(w, 5, v), s.moved(w).c, s.tagged("t", v))
+
+        for s in ys
+            print(s.reach(v, 4), s.span(w, 5, v), s.moved(w).c, s.tagged("u", v))
+
+    main()
+        val b = Big(1.0, 2.0, 3.0)
+        val p = Pair(1, 7.0, 8.0, 9.0)
+        val bs: &Shape = b
+        val ps: &Shape = p
+        val sb: &sync Shape = b
+        val sp: &sync Shape = p
+
+        each([bs, ps], [sb, sp])
+        print(b.reach(V(10.0, 20.0, 30.0), 4))
+    """
+
+private const lvs_matrix_output: string = "65 16 6 t 33\n31 31 3 t 19\n65 16 6 u 33\n31 31 3 u 19\n65\n"
+
+@test("a lent-receiver method reached through '&T' and '&sync T' reads every lent parameter it was handed")
+lvs_table_lends_each_parameter()
+    if !enm_ready() then return
+
+    val got = lvs_run(lvs_matrix, true, "")
+
+    assert_eq(got.0, lvs_matrix_output)
+    assert_eq(got.1, "")
+
+@test("and under AddressSanitizer: instrumented, and nothing read through a value taken for an address")
+lvs_table_lends_under_asan()
+    if !enm_ready() then return
+
+    val got = lvs_run(lvs_matrix, false, "-fsanitize=address -g")
+
+    assert(got.2 > 0, s"not instrumented: ${got.0}")
+    assert_eq(got.0, lvs_matrix_output)
+    assert_eq(got.1, "")
+
+@test("the table's body for a lent receiver takes a lent parameter as its value, and lends it a slot")
+lvs_table_body_takes_the_value()
+    if xvr_no_library() then return
+
+    val root = make_temp_dir("sysl-lvs").unwrap()
+
+    write_text(s"$root/main.sysl", lvs_matrix).unwrap()
+
+    val ir = emit_llvm_text(s"$root/main.sysl", None) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> made.text
+
+    remove_dir_all(root).unwrap_or(())
+
+    assert(ir.contains("@Big.span.self(ptr %self.object, %struct.V %lo.param, i32 %k.param, %struct.V %hi.param)"), ir)
+    assert(ir.contains("@Pair.reach.int.self(ptr %self.object, %struct.V %v.param, i32 %k.param)"), ir)
+    assert(ir.contains("store %struct.V %v.param, ptr %v.lent"), ir)

@@ -170,10 +170,10 @@ print(Limit)
 ### A literal binding takes its type from its first use
 
 A local `var` or `val` with no type written whose value is a bare number — `0`, `-1`, `2.5` — takes
-its type from its **first use that fixes one**: a comparison with an operand that has a type of its
-own, an assignment of such a value or into a typed place, an argument, a `return` or the body's
-result. A counter compared with a length is a `usize`, and an
-index read with it needs no conversion:
+its type from its **first use that fixes one**: a comparison or arithmetic with an operand that has
+a type of its own, an assignment of such a value or into a typed place, an argument, a `return` or
+the body's result. A counter compared with a length is a `usize`, and an index read with it needs no
+conversion:
 
 ```sysl
 val xs = [10, 20, 30]
@@ -198,12 +198,12 @@ true 3
 over two such bindings have the bindings' type, whatever it turns out to be, so a use that fixes the
 arithmetic fixes them: `i + 1 < xs.len` makes `i` a `usize` exactly as `i < xs.len` does, and
 `wide(i + 1)`, `return i + 1` and `val x: u8 = i + 1` make it the parameter's, the result's or the
-annotation's type. **An operand of a type of its own beside them in arithmetic fixes nothing**: in
-`sum + b` with `b` a `u8`, `sum` keeps its default and `b` widens to it, exactly as though the
-default had been written, so the sum is 260 rather than a byte that wrapped. Arithmetic wraps on
-overflow, and a type the program never named is not chosen for it. A later comparison with `b` is
-still a use that fixes `sum`. (A `for` variable is the exception, below.) A shift has the type of the value shifted; its amount is fixed by
-nothing the shift is used at.
+annotation's type. **An operand of a type of its own beside them in arithmetic fixes them too**, as
+Rust's integer variables are fixed: in `sum + b` with `b` a `u8`, `sum` is a `u8`, and so is the
+sum. The operators are `+ - * / % & | ^` and their wrapping and saturating forms, in either order and
+through nesting — `b + sum`, `(sum + 1) * b` and `sum + b + c` each fix `sum`. A shift has the type
+of the value shifted; its amount is fixed by nothing the shift is used at, and the shifted value
+only by where the shift is used.
 
 ```sysl
 val xs = [10, 20, 30, 40]
@@ -232,18 +232,39 @@ the literal — `300` handed to a `u8` — fixes nothing either, and is refused 
 `int` written. An integer literal is fixed at a float type where it holds the value exactly. A use
 inside a closure or a nested function is a use like any other.
 
+**A compound assignment is the same arithmetic written back**, so `s += b` fixes `s` at `b`'s type
+just as `s + b` does, and `total += k` fixes an undecided `k` at `total`'s:
+
 ```sysl
 half(x: f32) -> f32 = x / 2
 
-var sum = 250
 val b: u8 = 10
+var sum = 250
+var s = 3
 var h = 3
 
-print(sum + b, half(h), h / 2)
+s += b
+print(sum + b, s, half(h), h / 2)
 ```
 
 ```output
-260 1.5 1.5
+4 13 1.5 1.5
+```
+
+The sum wraps at the byte's width, as it would with `u8` written on `sum`. Arithmetic beside a typed
+operand is the one use that **holds the literal to the type even where it does not fit**: `300`
+beside a `u8` is a mistake in what was written, not an `int` sum, and is refused at the literal. A
+float literal beside an integer operand fixes nothing, and the integer widens to `real`:
+
+```sysl
+val b: u8 = 10
+var s = 300
+
+print(s + b)
+```
+
+```error
+the literal 300 does not fit byte
 ```
 
 Here `n` indexes `firsts` first, but it is the result that decides, so `n` is the `int` the function
@@ -301,14 +322,12 @@ for s in 1..3
 3000000021
 ```
 
-**Unlike a literal binding, a `for` variable is also fixed by arithmetic with an operand of a type
-of its own**: beside an integer operand of `+ - * / % & | ^` in either order, through nesting, and
-under a compound assignment, which is the same arithmetic written back — `n += k`, `n = n - k`,
-`m * k`, `k + m` and `(m + k) * 2` each make `k` the type of `n` or `m`. The loop's values are the
-range's, so the type the program put beside them is the one they are counted in; a literal binding
-keeps the rule above, so `sum + b` still widens `b` to `sum`'s `int`. A shift is not arithmetic
-between its operands: `m << k` and `m <<= k` fix nothing of `k`, and `(k << 1) + m` fixes it
-through the `+`. A literal operand fixes nothing (`k + 1`), and nor does a float.
+**A `for` variable is fixed by arithmetic with an operand of a type of its own, as a literal binding
+is**: beside an integer operand of `+ - * / % & | ^` in either order, through nesting, and under a
+compound assignment — `n += k`, `n = n - k`, `m * k`, `k + m` and `(m + k) * 2` each make `k` the
+type of `n` or `m`. A shift is not arithmetic between its operands: `m << k` and `m <<= k` fix
+nothing of `k`, and `(k << 1) + m` fixes it through the `+`. A literal operand fixes nothing
+(`k + 1`), and nor does a float, since the loop counts in integers.
 
 ```sysl
 var n: usize = 0
