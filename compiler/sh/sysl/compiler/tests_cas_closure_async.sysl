@@ -1,0 +1,352 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.text.cstring
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// A closure built in an `async` body is decided as any other closure is (`closure_mode.sysl`,
+// `docs/design/closures.md` §9): one that cannot outlive the variables it captures holds them by
+// reference, and a write in it reaches the variable. The variable has its address taken, so the
+// coroutine lowering lays it in the task's promise (`emit_async.sysl`'s `frame_locals`) -- storage
+// that lives as long as the frame, across every `await`, rather than on the stack of one resumption.
+//
+// The cells cross where the closure is made and called around a suspension (made before an `await`
+// and called after it, called on both sides, handed to a borrowing call after one, handed to an
+// awaited task that suspends before calling it, kept in a `&Fn` local across one) with what it
+// captures (an `int`, a counted `string`, a loop body's own variable, a generic body's `T`, an outer
+// closure's capture) and how deep the tasks go (an awaited task's own body holding a closure over its
+// own local, three levels of `await`). Every accepted program runs on the counted heap and gives back
+// everything it took; the async ones are run again at `-O0` and `-O2`, and under AddressSanitizer with
+// the binary's report hooks counted, so a variable left on a resumption's stack fails rather than
+// printing a lucky value. A task dropped while suspended in its body gives back the variables a
+// closure held by reference. Each way out is refused for a writing closure, naming the way out, and a
+// returned counter keeps its own copy.
+//
+// Skipped cells, and why: `spawn`, `@scoped`, `@crossing` and an executor's queue take a `&sync Fn`
+// or make the task leave the frame, which `tests_crm_closure_ref_mode.sysl` and
+// `tests_atk_async_task_keeps.sysl` pin; a bare-metal target lowers the promise as it lowers any
+// other, and decides nothing differently.
+
+private extern "setenv" cas_c_setenv(name: *u8, value: *u8, overwrite: int) -> int
+private extern "unsetenv" cas_c_unsetenv(name: *u8) -> int
+
+// -- the harness ----------------------------------------------------------------------------------
+
+// The program built at `level` under `flags` (none where empty) and run, on the counted heap where no
+// flags are given: standard output, standard error, and the ASan report hooks the binary calls.
+private cas_outcome(text: string, level: string, flags: string) -> (string, string, usize)
+    val root = make_temp_dir("sysl-cas").unwrap()
+    val exe = s"$root/built"
+    val n = cstring("SYSL_EXTRA_CFLAGS")
+    val v = cstring(flags)
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", forms_imported(text)).unwrap()
+
+    if flags != "" then cas_c_setenv(n.ptr, v.ptr, 1) else force_alloc_counting(true)
+
+    val built = build_native_program(s"$root/main.sysl", None, None, level, Some(exe))
+
+    if flags != "" then cas_c_unsetenv(n.ptr) else force_alloc_counting(false)
+
+    built match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (s"it did not build: ${failure_text(why)}", "", 0)
+        Ok(_) -> ()
+
+    val hooks = capture("nm", ["-u", exe], "", [], true) match
+        Ok(out) -> out.text.count_of("__asan_report")
+        Err(_) -> 0
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> ("could not be started", "", hooks)
+        Ok(o) -> (o.text, o.err.unwrap_or(""), hooks)
+end cas_outcome
+
+// The program printed `want` at the default level, and gave back everything it took.
+private cas_prints(text: string, want: string)
+    if !enm_ready() then return
+
+    val out = cas_outcome(text, DefaultOptimization, "")
+
+    assert_eq(out.0, want)
+    assert_eq(out.1, "")
+end cas_prints
+
+// The program printed `want` at `-O0`, `-O1` and `-O2` on the counted heap, giving back everything it
+// took, and again under AddressSanitizer with the sysl side instrumented.
+private cas_prints_everywhere(text: string, want: string)
+    if !enm_ready() then return
+
+    for level in ["0", "1", "2"]
+        val out = cas_outcome(text, level, "")
+
+        assert_eq(out.0, want, s"at -O$level")
+        assert_eq(out.1, "", s"at -O$level")
+    end for
+
+    val asan = cas_outcome(text, DefaultOptimization, "-fsanitize=address -g")
+
+    assert_eq(asan.0, want, "under ASan")
+    assert(asan.2 > 1, s"the binary calls ${asan.2} ASan report hooks, so it is not instrumented")
+end cas_prints_everywhere
+
+// The program is refused, saying each of `parts`.
+private cas_refused(text: string, parts: []const string)
+    if !enm_ready() then return
+
+    val said = enm_err(text)
+
+    assert(said != "", "it was accepted")
+
+    for part in parts
+        assert(said.index_of(part).is_some(), s"$part\n--- in ---\n$said")
+end cas_refused
+
+private cas_since(why: string) -> string = s"this closure captures by value, since $why, so it holds a copy"
+
+private cas_unread(name: string) -> string =
+    s", so it holds a copy of '$name' — so assignment would reach that copy rather than the variable it " +
+        "came from, and nothing in the closure reads it back"
+
+// -- by reference across an `await` --------------------------------------------------------------
+
+@test("a closure made before an 'await' and called after it writes the variable, an int and a string")
+cas_made_before_called_after()
+    cas_prints_everywhere(raw"""
+        call(f: &Fn() -> unit) = f()
+
+        async run() -> int
+            var n = 0
+            var s = "a"
+            val bump = () ->
+                n += 1
+                s = s + "b"
+
+            bump()
+            await yield_now()
+            bump()
+            await yield_now()
+            call(bump)
+            print(s)
+            n
+
+        main()
+            print(block_on(run()))
+        """, "abbb\n3\n")
+
+@test("'await work(() -> hit += 1)': the awaited task suspends before and between its calls")
+cas_awaited_callee()
+    cas_prints_everywhere(raw"""
+        async work(f: &Fn() -> unit) -> int
+            await yield_now()
+            f()
+            await yield_now()
+            f()
+            7
+
+        async run() -> int
+            var hit = 0
+            val r = await work(() -> hit += 1)
+
+            print(r, hit)
+            hit
+
+        main()
+            print(block_on(run()))
+        """, "7 2\n2\n")
+
+@test("nested async: each task's own closure over its own local, a closure in a closure, three levels")
+cas_nested_async()
+    cas_prints_everywhere(raw"""
+        async leaf(f: &Fn() -> unit) -> int
+            await yield_now()
+            f()
+            1
+
+        async mid(tag: string, n: *int) -> string
+            var log = tag
+            var k = 10
+            val add = () -> k += *n
+            val r = await leaf(() -> log = log + "+leaf")
+
+            await yield_now()
+            add()
+
+            val outer = () ->
+                val inner = () -> log = log + "+inner"
+
+                inner()
+
+            outer()
+            s"$log $r $k"
+
+        async top() -> string
+            var n = 5
+            val first = await mid("a", &n)
+
+            n = 1
+
+            val second = await mid("b", &n)
+
+            s"$first $second"
+
+        main()
+            print(block_on(top()))
+        """, "a+leaf+inner 1 15 b+leaf+inner 1 11\n")
+
+@test("a loop body's own variable, captured and written across an 'await' on every turn")
+cas_loop_body()
+    cas_prints_everywhere(raw"""
+        async run() -> int
+            var sum = 0
+
+            for i in 1..<4
+                var turn = i
+                val twice = () -> turn *= 2
+
+                await yield_now()
+                twice()
+                sum += turn
+            end for
+
+            sum
+
+        main()
+            print(block_on(run()))
+        """, "12\n")
+
+@test("a closure kept in a '&Fn' local across an 'await', and a bare one handed on after it")
+cas_fn_local()
+    cas_prints_everywhere(raw"""
+        call(f: &Fn() -> unit) = f()
+
+        async run() -> int
+            var n = 0
+            var s = "a"
+            val g: &Fn() -> unit = () ->
+                n += 1
+                s = s + "b"
+
+            await yield_now()
+            g()
+            await yield_now()
+            call(g)
+            call(() -> n += 10)
+            await yield_now()
+            print(s)
+            n
+
+        main()
+            print(block_on(run()))
+        """, "abb\n12\n")
+
+@test("a generic async body, instantiated for an int and a string")
+cas_generic()
+    cas_prints(raw"""
+        async pick[T](a: T, b: T) -> T
+            var chosen = a
+            val swap = () -> chosen = b
+
+            await yield_now()
+            swap()
+            chosen
+
+        main()
+            print(block_on(pick(1, 2)), block_on(pick("x", "y")))
+        """, "2 y\n")
+
+@test("a task dropped while suspended in its body gives back a counted variable a closure wrote")
+cas_dropped_suspended()
+    cas_prints_everywhere(raw"""
+        async stuck() -> usize
+            var s = "held"
+            val grow = () -> s = s + "!"
+
+            grow()
+            await park(w -> ())
+            grow()
+            s.len
+
+        main()
+            val t = stuck()
+
+            print(step(t, () -> ()))
+        """, "false\n")
+
+// -- by value: the ways out of an async body ------------------------------------------------------
+
+@test("a counter returned from an async body keeps its own copy")
+cas_returned_counter()
+    cas_prints(raw"""
+        async make() -> &Fn() -> int
+            var c = 0
+
+            await yield_now()
+            () ->
+                c += 1
+                c
+
+        main()
+            val f = block_on(make())
+
+            print(f(), f())
+        """, "1 2\n")
+
+@test("a writing closure returned from an async body is refused, naming the return")
+cas_returned_refused()
+    cas_refused(raw"""
+        async make() -> &Fn() -> unit
+            var hit = false
+
+            await yield_now()
+            () -> hit = true
+
+        main()
+            block_on(make())()
+        """, [cas_unread("hit"), cas_since("it is returned from 'make' on line 5")])
+
+@test("a writing closure kept in a local of an enclosing block of an async body is refused")
+cas_outer_block_refused()
+    cas_refused(raw"""
+        async run() -> bool
+            var g: &Fn() -> unit = () -> ()
+
+            if true
+                var hit = false
+
+                g = () -> hit = true
+                await yield_now()
+                g()
+                print(hit)
+
+            true
+
+        main()
+            print(block_on(run()))
+        """, [cas_unread("hit"), cas_since("it is kept in 'g' on line 7, which outlives the block declaring 'hit'")])
+
+@test("a writing closure handed to a task an async body answers is refused, naming the task")
+cas_answered_task_refused()
+    cas_refused(raw"""
+        async work(f: &Fn() -> unit) -> int
+            f()
+            1
+
+        async run() -> Task[int]
+            var hit = false
+
+            await yield_now()
+            work(() -> hit = true)
+
+        main()
+            print(block_on(block_on(run())))
+        """, [cas_unread("hit"),
+              cas_since("it is handed to 'work' on line 9, which keeps its parameter 'f' (the task it " +
+                        "answers holds it until that task is awaited)")])
