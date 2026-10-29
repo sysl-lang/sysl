@@ -440,16 +440,18 @@ private refuse_lost_writes(cx: &Analyzer, span: Span, st: &StructType, captured:
         val name = captured.at(i)
         val outer = cx.lookup(name)
         val shown = if outer.is_some() then type_show(outer.unwrap().ty) else "T"
+        val via = if scan.direct.at(i) == 0 then scan.via.at(i) else ""
 
         if scan.uses.at(i) == scan.writes.at(i)
             lost_write_owed(cx, scan.at.at(i), name, scan.form.at(i), shown,
-                            "and nothing in the closure reads it back", st.base, i)
+                            "and nothing in the closure reads it back", st.base, i, via,
+                            scan.via_capture.at(i))
             continue
         end if
 
         if outer.is_some()
             cx.copy_writes.push(CopyWrite(outer.unwrap().unique, name, span, scan.at.at(i),
-                                          scan.form.at(i), shown, st.base, i))
+                                          scan.form.at(i), shown, st.base, i, via, scan.via_capture.at(i)))
     end for
 end refuse_lost_writes
 
@@ -460,11 +462,11 @@ end refuse_lost_writes
 // The refusal is in the words the pattern binding's is said in: what was copied, where the write
 // lands instead, and the two ways to say what was meant.
 private lost_write_owed(cx: &Analyzer, at: Span, name: string, form: string, shown: string, why: string,
-                        base: string, capture: usize) =
+                        base: string, capture: usize, via: string, via_capture: usize) =
     cx.an.lost_writes.push(OwedWrite(cx.scope, at, "this closure captures by value", ", since ",
         s", so it holds a copy of '$name' — so $form would reach that copy rather than the variable it " +
         s"came from, $why. Where you mean to change '$name', hold it as a '&$shown' and write through " +
-        "it, or have the closure return the value", base, capture))
+        "it, or have the closure return the value", base, capture, via, via_capture))
 
 // A binding a closure wrote its copy of, kept until the enclosing body reads the binding again.
 struct CopyWrite
@@ -476,6 +478,8 @@ struct CopyWrite
     shown: string
     base: string
     capture: usize
+    via: string
+    via_capture: usize
 end CopyWrite
 
 // **A read of a binding after a closure wrote its own copy of it** is a program expecting the write
@@ -491,7 +495,8 @@ read_after_copy_write(cx: &Analyzer, span: Span, unique: string)
         if span.start >= w.closure.start && span.end <= w.closure.end then continue
 
         lost_write_owed(cx, w.write, w.name, w.form, w.shown,
-                        "and the variable is used afterwards as though it had", w.base, w.capture)
+                        "and the variable is used afterwards as though it had", w.base, w.capture, w.via,
+                        w.via_capture)
         cx.copy_writes.remove(i)
         return
     end for
@@ -499,23 +504,36 @@ end read_after_copy_write
 
 // What one closure body does with each capture: how often it names it, how many of those are the
 // place of a write to the closure's copy, and the first such write and its form.
+//
+// **A closure written inside this one writes this one's copy where it holds the capture by
+// reference** (`() -> { val g = () -> n += 1; g() }`): its write is this closure's, but only if it
+// turns out to hold its own capture by reference, which is not known until every body is typed. So
+// such a write is counted with the inner closure it depends on (`via`, `via_capture`), and `direct`
+// counts the writes this body makes itself: a refusal owed for writes that all come through an inner
+// closure is said only where that closure holds the capture by reference.
 private struct CopyScan
     slots: Buf[int]
     uses: Buf[int]
     writes: Buf[int]
+    direct: Buf[int]
     at: Buf[Span]
     form: Buf[string]
+    via: Buf[string]
+    via_capture: Buf[usize]
 end CopyScan
 
 private scan_copy_writes(a: &Analysis, st: &StructType, n: usize, body: TBlock, span: Span) -> &CopyScan
-    val scan: &CopyScan = CopyScan(buf(), buf(), buf(), buf(), buf())
+    val scan: &CopyScan = CopyScan(buf(), buf(), buf(), buf(), buf(), buf(), buf(), buf())
 
     for i in 0..<n
         scan.slots.push(int(st.slot(i)))
         scan.uses.push(0)
         scan.writes.push(0)
+        scan.direct.push(0)
         scan.at.push(span)
         scan.form.push("")
+        scan.via.push("")
+        scan.via_capture.push(0)
     end for
 
     // `a, b = b, a` is the one write that is not an expression: each of its places is a write of
@@ -541,7 +559,55 @@ private note_copy_use(a: &Analysis, scan: &CopyScan, e: TExpr)
                 if answers_a_value(ty) then
                     bump_at(scan.uses, scan.slots, copy_root(place.unwrap()).unwrap())
             end if
+        TStructNew(st, args) -> if is_closure_literal(Struct(st)) then note_inner_writes(a, scan, st, args)
         _ -> ()
+
+// **A closure built here from this closure's captures**: each capture it is handed that it writes is
+// a write of this closure's copy where it holds that capture by reference, and one it also reads is
+// read back. Its construction already counted as a use of what it is handed.
+private note_inner_writes(a: &Analysis, scan: &CopyScan, st: &StructType, args: Buf[TExpr])
+    val inner = lowered_closure(a, s"${st.base}.call")
+
+    if inner.is_none() then return
+
+    val seen = scan_copy_writes(a, st, args.len(), inner.unwrap().body, inner.unwrap().span)
+
+    for j in 0..<args.len()
+        if seen.writes.at(j) == 0 then continue
+
+        val slot = copy_root(args.at(j))
+
+        if slot.is_none() then continue
+
+        for i in 0..<scan.slots.len()
+            if scan.slots.at(i) != slot.unwrap() then continue
+
+            if scan.writes.at(i) == 0
+                scan.at.set(i, seen.at.at(j))
+                scan.form.set(i, seen.form.at(j))
+                scan.via.set(i, st.base)
+                scan.via_capture.set(i, j)
+            end if
+
+            scan.writes.set(i, scan.writes.at(i) + 1)
+
+            if seen.uses.at(j) > seen.writes.at(j) then scan.uses.set(i, scan.uses.at(i) + 1)
+        end for
+    end for
+end note_inner_writes
+
+// The body a closure literal was lowered to, by its function's name: the last reading of it.
+private lowered_closure(a: &Analysis, fname: string) -> Option[TFunc]
+    var i = a.closure_funcs.len()
+
+    while i > 0
+        i -= 1
+
+        if a.closure_funcs.at(i).name == fname then return Some(a.closure_funcs.at(i))
+    end while
+
+    None
+end lowered_closure
 
 // Whether the write landed on a capture's copy.
 private note_copy_write(scan: &CopyScan, place: TExpr, form: string, at: Span) -> bool
@@ -552,12 +618,14 @@ private note_copy_write(scan: &CopyScan, place: TExpr, form: string, at: Span) -
     for i in 0..<scan.slots.len()
         if scan.slots.at(i) != slot.unwrap() then continue
 
-        if scan.writes.at(i) == 0
+        if scan.direct.at(i) == 0
             scan.at.set(i, at)
             scan.form.set(i, form)
+            scan.via.set(i, "")
         end if
 
         scan.writes.set(i, scan.writes.at(i) + 1)
+        scan.direct.set(i, scan.direct.at(i) + 1)
         return true
     end for
 
