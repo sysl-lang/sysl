@@ -83,8 +83,11 @@ runner_func(a: &Analysis, name: string) -> bool = a.tables.funcs.get(name) match
 // A weakening is deliberately absent: a weak reference is a count inside the box the strong one
 // already made, so it allocates nothing -- and the `&T` it has to come from is the boxing, which is
 // gated one step earlier.
-allocates(e: TExpr) -> Option[string] = *e.kind match
-    TBox(_, _) -> Some("a reference")
+//
+// **Nor does the box of a closure nothing keeps past its frame**, which is laid in that frame
+// (`closure_mode.sysl`'s `framed_box`).
+allocates(a: &Analysis, e: TExpr) -> Option[string] = *e.kind match
+    TBox(v, ref_ty) -> if framed_box(a, v, ref_ty) then None else Some("a reference")
 
     // An **empty** buffer makes none: a view of nothing is the zero value of its own representation
     // and reaches no allocator, which is what a function answering "no results" wants to write.
@@ -163,7 +166,7 @@ check_no_alloc(a: &Analysis, funcs: Buf[TFunc], vals: Buf[TVal], vtables: Buf[TV
     val graph = with_abstract_callees(a, funcs)
 
     for item in graph
-        first_allocation(item.body) match
+        first_allocation(a, item.body) match
             Some(what) ->
                 seeds.push(item.name)
                 made.push((item.name, what))
@@ -468,10 +471,10 @@ val_home(a: &Analysis, symbol: string) -> Scope
 end val_home
 
 // What the first construction under a body that makes heap storage makes, wherever it is.
-private first_allocation(b: TBlock) -> Option[string]
+private first_allocation(a: &Analysis, b: TBlock) -> Option[string]
     val found: &FirstMade = FirstMade(None, Deferred(buf(), true))
 
-    walk_block_stmts(b, expr_walk(false, e -> note_allocation(found, e)))
+    walk_block_stmts(b, expr_walk(false, e -> note_allocation(a, found, e)))
     found.what
 end first_allocation
 
@@ -479,10 +482,10 @@ private struct FirstMade
     what: Option[string]
     deferred: &Deferred
 
-private note_allocation(found: &FirstMade, e: TExpr)
+private note_allocation(a: &Analysis, found: &FirstMade, e: TExpr)
     if found.what.is_some() || found.deferred.passes(e) then return
 
-    found.what = allocates(e)
+    found.what = allocates(a, e)
 end note_allocation
 
 // **An array literal handed straight to a call is the escape analysis's to answer for, not this
@@ -557,7 +560,7 @@ private scan_one(a: &Analysis, scope: Scope, skip: &Skipped, deferred: &Deferred
                  why: string)
     if deferred.passes(e) then return
 
-    val what = allocates(e)
+    val what = allocates(a, e)
 
     if what.is_none() || skip.covers(e.span) then return
 
