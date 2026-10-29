@@ -867,8 +867,9 @@ end logged_since
 // **A call through an object lands in the slot of every table made against its trait.** A raw pointer
 // it hands over is borrowed by the trait's promise, each such body held to it where it is written;
 // an object it hands over -- a callback among them -- is kept wherever any of those bodies keeps it.
-// Each location comes with the body that keeps it there.
-private vcall_keeps(cx: &KeepsCx, recv: TExpr, slot: int, j: usize) -> Buf[(string, KeptAt)]
+// Each location comes with the body that keeps it there. `k` numbers the parameter as the body does,
+// the receiver first (`with_receiver`): an object kept through `self` is kept as surely as an argument.
+vcall_keeps(cx: &KeepsCx, recv: TExpr, slot: int, k: usize) -> Buf[(string, KeptAt)]
     var out: Buf[(string, KeptAt)] = buf()
     val tr = erased_trait(texpr_type(recv))
 
@@ -883,14 +884,33 @@ private vcall_keeps(cx: &KeepsCx, recv: TExpr, slot: int, j: usize) -> Buf[(stri
 
         val target = vt.slots.at(usize(slot)).target
 
-        for item in keeps_of(cx, target, j + 1).locs
+        for item in keeps_of(cx, target, k).locs
             out.push((target, item))
 
     out
 end vcall_keeps
 
+// **Whether a call through an object may answer with what it is handed at `k`** (the receiver first):
+// wherever any body its slot lands in does, as `vcall_keeps` asks of keeping. A trait the receiver's
+// type does not name is answered yes, since no body can say otherwise.
+vcall_answers(cx: &KeepsCx, recv: TExpr, slot: int, all: Buf[TExpr], k: usize, ty: Type) -> bool
+    val tr = erased_trait(texpr_type(recv))
+
+    if tr.is_none() || slot < 0 then return true
+
+    val name = tr.unwrap() match
+        Trait(n, _, _) -> n
+        _ -> ""
+
+    for vt in cx.vtables
+        if vt.trait_name != name || usize(slot) >= vt.slots.len() then continue
+        if answers_arg(cx, vt.slots.at(usize(slot)).target, all, k, ty, false) then return true
+
+    false
+end vcall_answers
+
 // A method call's arguments as its body numbers its parameters: the receiver first.
-private with_receiver(recv: TExpr, args: Buf[TExpr]) -> Buf[TExpr]
+with_receiver(recv: TExpr, args: Buf[TExpr]) -> Buf[TExpr]
     var out: Buf[TExpr] = buf()
 
     out.push(recv)
@@ -1398,19 +1418,19 @@ private kept_at(t: &Track, evs: &EvBuf, e: TExpr)
         TVCall(recv, slot, args, _, _) ->
             val all = with_receiver(recv, args)
 
-            for j in 0..<args.len()
-                if !hands_on(t, args.at(j)) then continue
+            for k in 0..<all.len()
+                if !hands_on(t, all.at(k)) then continue
 
-                for item in vcall_keeps(t.cx, recv, slot, j)
+                for item in vcall_keeps(t.cx, recv, slot, k)
                     if item.1.loc == "j" && has_span(t.hs.chained, e.span) then continue
 
                     val loc = if item.1.loc == "j" then joined_loc(t.hs, true) else translate_loc(t.org, all, item.1.loc)
 
-                    if loc.starts_with("j:") && said_already(evs, loc, args.at(j).span) then continue
+                    if loc.starts_with("j:") && said_already(evs, loc, all.at(k).span) then continue
 
                     val how = s"it is passed to '${shown_name(t.cx.an, item.0)}', which keeps it"
 
-                    if !loc.starts_with("l:") then evs.items.push(FlowEv(false, loc, how, args.at(j).span))
+                    if !loc.starts_with("l:") then evs.items.push(FlowEv(false, loc, how, all.at(k).span))
         TCallPtr(callee, args, _, _) ->
             for j in 0..<args.len()
                 if !hands_on(t, args.at(j)) then continue
@@ -2473,8 +2493,10 @@ private call_at(ft: &FrameTrack, evs: &EvBuf, e: TExpr)
         TVCall(recv, slot, args, _, _) ->
             val all = with_receiver(recv, args)
 
-            for j in 0..<args.len()
-                val arg = args.at(j)
+            // The receiver is handed over as surely as an argument: `reactive(() -> …).on_tap(f)`
+            // gives the object that holds the closure to a default method that keeps `self`.
+            for k in 0..<all.len()
+                val arg = all.at(k)
 
                 if !may_hold_pointer(ft.cx, texpr_type(arg)) then continue
 
@@ -2482,7 +2504,7 @@ private call_at(ft: &FrameTrack, evs: &EvBuf, e: TExpr)
 
                 if core.is_none() then continue
 
-                for item in vcall_keeps(ft.cx, recv, slot, j)
+                for item in vcall_keeps(ft.cx, recv, slot, k)
                     if item.1.loc == "j" && has_span(ft.hs.chained, e.span) then continue
 
                     val loc = if item.1.loc == "j" then joined_loc(ft.hs, false) else translate_loc(ft.org, all, item.1.loc)
@@ -2494,11 +2516,11 @@ private call_at(ft: &FrameTrack, evs: &EvBuf, e: TExpr)
                     val cure = if item.1.loc == "j" then s" — await that task on every way out of '${ft.owner}', " +
                         s"or hand it storage that lasts" else ""
                     var said = s"'${shown_name(ft.cx.an, item.0)}' keeps its parameter " +
-                        s"'${param_name(ft.cx, item.0, j + 1)}' (${item.1.how}), and " +
+                        s"'${param_name(ft.cx, item.0, k)}' (${item.1.how}), and " +
                         argument_said(ft, arg, core.unwrap()) + cure
 
                     if ft.probe
-                        said = probe_kept(ft, core.unwrap(), arg, item.0, param_name(ft.cx, item.0, j + 1),
+                        said = probe_kept(ft, core.unwrap(), arg, item.0, param_name(ft.cx, item.0, k),
                                           item.1.how)
                     end if
 
@@ -2686,6 +2708,17 @@ private probe_text(ft: &FrameTrack, e: TExpr) -> string = *e.kind match
             if answers_arg(ft.cx, name, args, i, ty, false) then all = all + probe_text(ft, args.at(i))
 
         all
+
+    // A call through an object answers with its receiver as readily as a direct one with an argument:
+    // `reactive(() -> …).on_tap(f)` hands back the object holding the closure.
+    TVCall(recv, slot, args, ty, _) ->
+        val handed = with_receiver(recv, args)
+        var all = ""
+
+        for k in 0..<handed.len()
+            if vcall_answers(ft.cx, recv, slot, handed, k, ty) then all = all + probe_text(ft, handed.at(k))
+
+        all
     _ -> ""
 
 private probe_all(ft: &FrameTrack, es: Buf[TExpr]) -> string
@@ -2746,6 +2779,17 @@ private rule_core(ft: &FrameTrack, e: TExpr) -> Option[string] = *e.kind match
         val image = is_integer_type(ty) && ft.cx.find(name).is_some()
 
         if may_hold_pointer(ft.cx, ty) || image then answer_core(ft, name, args, ty) else None
+    TVCall(recv, slot, args, ty, _) ->
+        if !may_hold_pointer(ft.cx, ty) then return None
+
+        val handed = with_receiver(recv, args)
+
+        for k in 0..<handed.len()
+            val c = frame_core(ft, handed.at(k))
+
+            if c.is_some() && vcall_answers(ft.cx, recv, slot, handed, k, ty) then return c
+
+        None
     _ -> None
 
 // The frame storage a call's answer may be made of: an argument's, where the callee answers with it.
