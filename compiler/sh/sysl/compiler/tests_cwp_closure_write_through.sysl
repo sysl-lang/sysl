@@ -1,0 +1,168 @@
+module sh.sysl.compiler
+@tests
+
+// **A write through what a capture refers to is no write of the closure's own**: a `&T`, a `*T` or a
+// slice's element is storage the closure shares, so a closure whose only writes go through one only
+// reads its environment, and a `val` may hold it -- whether the write is a store, a compound
+// assignment, an increment or a `*self` method. A write to the capture itself, or to a part of it held
+// by value (a field, an array element, an element of a slice taken of a captured array), still writes
+// the closure's copy, and a `val` holding that closure is refused.
+//
+// The helpers are `tests_enm_enum_run.sysl`'s.
+
+private cwp_val_refused(text: string, name: string)
+    val said = enm_err("var kept: Option[&Fn() -> int] = None\n\nkeep(f: &Fn() -> int)\n    kept = Some(f)\n\n" + text)
+
+    assert(enm_says(said, "'call' takes '*self', so it writes through what it is called on, and a " +
+                          "'val' is written once"), said)
+    assert(enm_says(said, s"write 'var $name' if it is meant to change"), said)
+end cwp_val_refused
+
+@test("a val holds a closure writing through a captured '&int' and a captured '*int'")
+cwp_through_box_and_pointer()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        main()
+            val p: &int = 0
+            var m = 0
+            val q = &m
+            val f = () ->
+                *p += 1
+                *q += 2
+
+            f()
+            f()
+            print(*p, m)
+        """), "2 4\n")
+end cwp_through_box_and_pointer
+
+@test("a store, an increment and a field write through a captured '&T' are no write of the closure")
+cwp_through_shared_forms()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        struct C
+            n: int
+
+        main()
+            val c: &C = C(0)
+            var k = C(0)
+            val p = &k
+            val f = () ->
+                c.n += 10
+                p.n = p.n + 3
+                c.n++
+
+            f()
+            f()
+            print(c.n, k.n)
+        """), "22 6\n")
+end cwp_through_shared_forms
+
+@test("an element of a captured slice is the slice's storage, not the closure's")
+cwp_through_a_slice()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        main()
+            var a = [1, 2, 3]
+            val s = a[0..<3]
+            val f = () ->
+                s[1] += 5
+                s[2] = 9
+
+            f()
+            print(a[0], a[1], a[2])
+        """), "1 7 9\n")
+end cwp_through_a_slice
+
+@test("a field of a captured struct, an element of a captured array: the closure's copy, refused in a val")
+cwp_own_copy_still_refused()
+    if !enm_ready() then return
+
+    cwp_val_refused(raw"""
+        struct C
+            n: int
+
+        main()
+            var c = C(0)
+            val f = () ->
+                c.n += 1
+                c.n
+
+            keep(f)
+            print(f())
+        """, "f")
+
+    cwp_val_refused(raw"""
+        main()
+            var xs = [1, 2]
+            val g = () ->
+                xs[0] = 5
+                xs[0]
+
+            keep(g)
+            print(g())
+        """, "g")
+
+    cwp_val_refused(raw"""
+        main()
+            var xs = [1, 2]
+            val h = () ->
+                xs[0..<2][1] = 7
+                xs[1]
+
+            keep(h)
+            print(h())
+        """, "h")
+end cwp_own_copy_still_refused
+
+@test("a closure writing both through a pointer and its own copy is still refused in a val")
+cwp_mixed_writes_refused()
+    if !enm_ready() then return
+
+    cwp_val_refused(raw"""
+        main()
+            val p: &int = 0
+            var n = 0
+            val f = () ->
+                *p += 1
+                n += 1
+                n
+
+            keep(f)
+            print(f())
+        """, "f")
+end cwp_mixed_writes_refused
+
+@test("a var still holds a writing-through closure, and generic and nested closures agree")
+cwp_var_generic_nested()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        twice[T](f: &Fn() -> T)
+            f()
+            f()
+
+        bump_all[T: Add](p: &T, by: T)
+            val f = () -> *p += by
+
+            f()
+
+        main()
+            val p: &int = 0
+            var g = () -> *p += 1
+
+            g()
+            twice(() -> *p += 10)
+            bump_all(p, 1)
+
+            val outer = () ->
+                val inner = () -> *p += 100
+                inner()
+
+            outer()
+            print(*p)
+        """), "122\n")
+end cwp_var_generic_nested

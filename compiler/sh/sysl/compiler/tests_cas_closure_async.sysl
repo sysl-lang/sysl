@@ -247,6 +247,40 @@ cas_fn_local()
             print(block_on(run()))
         """, "abb\n12\n")
 
+// The closures a plain body would box in its frame (handed to a callee that only calls them) are on
+// the heap in an async body: one built before an `await` and called after it, one held by an awaited
+// task across its own suspensions, and one built after the last `await`.
+@test("a closure handed on as '&Fn' in an async body, called after an 'await', on its heap box")
+cas_box_across_await()
+    cas_prints_everywhere(raw"""
+        call(f: &Fn() -> unit) = f()
+
+        async later(f: &Fn() -> unit) -> int
+            await yield_now()
+            f()
+            await yield_now()
+            f()
+            0
+
+        async run() -> int
+            var n = 0
+            var s = "a"
+            val g: &Fn() -> unit = () ->
+                n += 1
+                s = s + "b"
+
+            await yield_now()
+            call(g)
+            await later(() -> n += 10)
+            await yield_now()
+            call(() -> s = s + "c")
+            print(s)
+            n
+
+        main()
+            print(block_on(run()))
+        """, "abc\n21\n")
+
 @test("a generic async body, instantiated for an int and a string")
 cas_generic()
     cas_prints(raw"""

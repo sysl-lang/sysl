@@ -1122,7 +1122,41 @@ unlock
 Err(declined)
 ```
 
-When the debit fails, the `errdefer` below it was never reached, so only the `unlock` runs. Every
+When the debit fails, the `errdefer` below it was never reached, so only the `unlock` runs.
+
+**Locals take their place in the same order.** An `errdefer` runs after every local declared below
+it is released and before every local declared above it, so what it undoes is still held when it
+runs:
+
+```sysl
+struct Slot
+    name: string
+
+impl Drop for Slot
+    drop(self) = print(s"release ${self.name}")
+
+reserve(ok: bool) -> Result[unit, string]
+    val first: &Slot = Slot("first")
+    errdefer print("undo", first.name)
+    val second: &Slot = Slot("second")
+
+    if ok then Ok(()) else Err("full")
+
+print(reserve(true))
+print(reserve(false))
+```
+
+```output
+release second
+release first
+Ok(())
+release second
+undo first
+release first
+Err(full)
+```
+
+Every
 rule of a deferred statement applies to it unchanged: it may not `return`, `break` or `continue` out
 of itself or use `?`, and it reads every name at the exit rather than where it is written.
 

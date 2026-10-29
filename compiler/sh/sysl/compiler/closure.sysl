@@ -223,6 +223,89 @@ private arrow_shown(params: Buf[Type], result: Type) -> string
     b.finish()
 end arrow_shown
 
+// -- two closures a refusal names alike ----------------------------------------------------------
+
+// What a mismatch adds where the two types read the same and differ only in a closure: every closure
+// literal is a struct of its own, and a reader is shown each one as "a closure", so a refusal saying
+// *"is a closure, but a closure was given"* would name nothing that differs. Nothing where the two
+// read differently -- the sentence already says what differs.
+//
+// **Two shapes apart is the difference itself**; two of one shape are apart because each literal is
+// its own type, and the boxed callable is what holds either.
+closure_mismatch_hint(a: &Analysis, got: Type, wanted: Type) -> string
+    if type_show(got) != type_show(wanted) then return ""
+
+    val pair = closures_apart(got, wanted)
+
+    if pair.is_none() then return ""
+
+    val given = closure_shape(a, pair.unwrap().0)
+    val asked = closure_shape(a, pair.unwrap().1)
+
+    if given != asked then return s"the closure asked for is '$asked', and the one given is '$given'"
+
+    s"each closure literal is a type of its own, so this one is not the '$asked' the type was made " +
+    s"from; to hold either, write the type as '&Fn$asked'"
+end closure_mismatch_hint
+
+// The first two closures standing at the same place in two types and not the same closure: the types
+// themselves, or a pair inside what both apply or point at.
+private closures_apart(got: Type, wanted: Type) -> Option[(Type, Type)]
+    if is_closure_literal(got) && is_closure_literal(wanted)
+        return if type_eq(got, wanted) then None else Some((got, wanted))
+
+    got match
+        Struct(g) -> wanted match
+            Struct(w) -> closures_apart_list(g.targs, w.targs)
+            _ -> None
+        Enum(g) -> wanted match
+            Enum(w) -> closures_apart_list(g.targs, w.targs)
+            _ -> None
+        Ptr(g) -> wanted match
+            Ptr(w) -> closures_apart(*g, *w)
+            _ -> None
+        Ref(g, _) -> wanted match
+            Ref(w, _) -> closures_apart(*g, *w)
+            _ -> None
+        _ -> None
+end closures_apart
+
+private closures_apart_list(gs: Buf[Type], ws: Buf[Type]) -> Option[(Type, Type)]
+    if gs.len() != ws.len() then return None
+
+    for i in 0..<gs.len()
+        val found = closures_apart(gs.at(i), ws.at(i))
+
+        if found.is_some() then return found
+
+    None
+end closures_apart_list
+
+// A closure's shape as a callable type spells it -- `(int, int) -> int`, `() -> unit` -- read off the
+// `call` its literal was lowered to, whose first parameter is the closure's own environment.
+private closure_shape(a: &Analysis, t: Type) -> string
+    val base = t match
+        Struct(d) -> d.base
+        _ -> ""
+    val sig = a.tables.members.func_insts.get(s"$base.call")
+
+    if sig.is_none() then return "(…) -> …"
+
+    var b = str_builder()
+    val params = sig.unwrap().params
+
+    b.push("(")
+
+    for i in 1..<params.len()
+        if i > 1 then b.push(", ")
+
+        b.push(type_show(params.at(i).1))
+
+    b.push(") -> ")
+    b.push(type_show(sig.unwrap().ret))
+    b.finish()
+end closure_shape
+
 // What a parameter with no type of its own and no context is told.
 //
 // **The type position is an ellipsis and not a `T`.** The place this fires is a call into a generic
@@ -496,6 +579,27 @@ read_after_copy_write(cx: &Analyzer, span: Span, unique: string)
         return
     end for
 end read_after_copy_write
+
+// **A closure written inside another writes a copy of the outer closure's capture**, and that capture
+// is itself a copy of the enclosing body's variable. Nothing in the outer closure read it after the
+// inner one, so the record is handed to the enclosing body as a write of ITS variable: a read there
+// after the outer closure is a program expecting the write to have reached it, refused as it is for
+// a closure written directly in that body. A record of the outer closure's own local stays behind.
+private hand_up_copy_writes(cx: &Analyzer, inner: &Analyzer, span: Span, captured: Buf[string])
+    if inner.copy_writes.is_empty() then return
+
+    for w in inner.copy_writes
+        for i in 0..<inner.captured.len()
+            if inner.captured.at(i).0 != w.unique then continue
+
+            val outer = cx.lookup(captured.at(i))
+
+            if outer.is_some()
+                cx.copy_writes.push(CopyWrite(outer.unwrap().unique, w.name, span, w.write, w.form,
+                                              w.shown, w.base, w.capture))
+        end for
+    end for
+end hand_up_copy_writes
 
 // What one closure body does with each capture: how often it names it, how many of those are the
 // place of a write to the closure's copy, and the first such write and its form.
@@ -811,6 +915,7 @@ private closure_body(cx: &Analyzer, span: Span, st: &StructType, fname: string,
 
     check_consumes(inner, block)
     check_counted_pointers(inner, block)
+    hand_up_copy_writes(cx, inner, span, captured)
 
     var ret = Unit
 

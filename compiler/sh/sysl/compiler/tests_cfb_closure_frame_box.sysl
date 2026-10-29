@@ -1,0 +1,708 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.{cstring, Search}
+
+// A closure literal erased to `&Fn` whose box nothing reaches after the frame that builds it -- or
+// after the turn of a loop that builds it -- is boxed in that frame (`closure_mode.sysl`'s
+// `frame_boxes`, `emit_box.sysl`'s `gen_frame_box`, `docs/design/closures.md` decision 8): no
+// allocation, so `@no_alloc` and a board with no heap accept it. Every other box is on the heap, as
+// before, and `--explain-escapes` says why.
+//
+// The cells cross where the `&Fn` goes (a borrowing callee, one that takes shares of it and hands it
+// on, a closure-typed callee, a trait object's method, a generic, a local `&Fn`, a struct field of a
+// local, an `Option` payload, a local of an `if` assigned to the function's own, a loop body, a
+// `while` condition, a `loop` that breaks with a call, a `defer`, a closure inside a closure, a
+// recursive function) with what the closure holds (nothing, a `var` by reference, a counted `string`
+// by value, a `&T` by value, a loop body's `val`); each way out (a keeping callee, a callee keeping it
+// through another parameter, a return, an outer local of a loop, an `async` body, a `&sync Fn`) is on
+// the heap with its reason; and the build modes are the counted heap (nothing left at exit),
+// AddressSanitizer, `@no_alloc`, and a board with no allocator.
+//
+// Skipped cells, and why: a function pointer or an `extern` cannot be handed a closure at all (p12);
+// `@scoped`/`@crossing`/`spawn` take a `&sync Fn`, which is the `&sync` cell; a precompiled `.syslib`
+// callee answers `keeps` from the source it is fingerprinted by, the same question as a program's own.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private extern "setenv" cfb_c_setenv(name: *u8, value: *u8, overwrite: int) -> int
+private extern "unsetenv" cfb_c_unsetenv(name: *u8) -> int
+
+private struct CfbRun
+    out: string
+    err: string
+    hooks: usize
+end CfbRun
+
+// The program built and run: on the counted heap, or with `flags` handed to clang.
+private cfb_run(text: string, counted: bool, flags: string) -> CfbRun
+    val root = make_temp_dir("sysl-cfb").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", forms_imported(text)).unwrap()
+
+    val exe = s"$root/built"
+
+    if flags != ""
+        val n = cstring("SYSL_EXTRA_CFLAGS")
+        val v = cstring(flags)
+
+        cfb_c_setenv(n.ptr, v.ptr, 1)
+    end if
+
+    force_alloc_counting(counted)
+
+    val made = build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe))
+
+    force_alloc_counting(false)
+
+    if flags != ""
+        val n = cstring("SYSL_EXTRA_CFLAGS")
+
+        cfb_c_unsetenv(n.ptr)
+    end if
+
+    made match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return CfbRun(failure_text(why), "", 0)
+        Ok(_) -> ()
+
+    val hooks = capture("nm", ["-u", exe], "", [], true) match
+        Ok(o) -> o.text.count_of("__asan_report")
+        Err(_) -> 0
+
+    val ran = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    ran match
+        Err(_) -> CfbRun("could not be started", "", hooks)
+        Ok(o) -> CfbRun(o.text, o.err.unwrap_or(""), hooks)
+end cfb_run
+
+// The program printed `want` on the counted heap, and gave back everything it took.
+private cfb_prints(text: string, want: string)
+    if !enm_ready() then return
+
+    val got = cfb_run(text, true, "")
+
+    assert_eq(got.out, want)
+    assert_eq(got.err, "")
+end cfb_prints
+
+// The program is refused, saying each of `parts`.
+private cfb_refused(text: string, parts: []const string)
+    if !enm_ready() then return
+
+    val said = enm_err(text)
+
+    assert(said != "", "it was accepted")
+
+    for part in parts
+        assert(said.index_of(part).is_some(), s"$part\n--- in ---\n$said")
+end cfb_refused
+
+// The LLVM text of a program, or its report.
+private cfb_ir(text: string) -> string
+    val root = make_temp_dir("sysl-cfb").unwrap()
+
+    write_text(s"$root/main.sysl", forms_imported(text)).unwrap()
+
+    val out = emit_llvm_text(s"$root/main.sysl", None) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> if made.report.is_empty() then made.text else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end cfb_ir
+
+// How many lines of `ir` say `part`.
+private cfb_lines_with(ir: string, part: string) -> int
+    var n = 0
+
+    for line in lines_of(ir).view()
+        if line.contains(part) then n += 1
+
+    n
+end cfb_lines_with
+
+// What `--explain-escapes` reports for a program, each line with the directory taken out.
+private cfb_explained(text: string) -> Buf[string]
+    var notes: Buf[string] = buf()
+
+    if xvr_no_library() then return notes
+
+    val root = make_temp_dir("sysl-cfb").unwrap()
+
+    write_text(s"$root/main.sysl", forms_imported(text)).unwrap()
+
+    var lines: Buf[string] = buf()
+    val sink = &lines
+    val noted = &notes
+    var args: Buf[string] = buf()
+
+    args.push("sysl")
+    args.push("emit-llvm")
+    args.push("--explain-escapes")
+    args.push(s"$root/main.sysl")
+
+    run_cli_noted(args.view(), (line) -> sink.push(line), (line) -> noted.push(cfb_local(root, line)))
+    remove_dir_all(root).unwrap_or(())
+    notes
+end cfb_explained
+
+// A line of the report with the program's directory taken off its file name.
+private cfb_local(root: string, line: string) -> string =
+    if line.starts_with(s"$root/") then line[s"$root/".bytes.len..<line.bytes.len] else line
+
+// -- p09: `@no_alloc` -----------------------------------------------------------------------------
+
+private const cfb_p09: string = raw"""
+    each(xs: []int, f: int -> unit)
+        for x in xs do f(x)
+
+    @no_alloc
+    sum(xs: []int) -> int
+        var p: [1]int = [0]
+        val q = &p[0]
+
+        each(xs, n -> *q += n)
+        p[0]
+
+    @no_alloc
+    apply(f: &Fn() -> int) -> int = f()
+
+    @no_alloc
+    call(f: &Fn() -> unit) = f()
+
+    @no_alloc
+    boxed() -> int = apply(() -> 1)
+
+    @no_alloc
+    counted() -> int
+        var n = 0
+
+        call(() -> n += 1)
+        call(() -> n += 1)
+        n
+
+    main()
+        var xs = [1, 2, 3]
+
+        print(sum(xs[..]), boxed(), counted())
+    """
+
+@test("p09: under '@no_alloc' a closure handed to a '&Fn' that only calls it is boxed in the frame")
+cfb_p09_no_alloc_accepts_a_frame_box()
+    cfb_prints(cfb_p09, "6 1 2\n")
+
+@test("'@no_alloc' still refuses the box of a closure a callee keeps, at the closure")
+cfb_no_alloc_refuses_a_kept_closure()
+    cfb_refused(raw"""
+        var slot: Option[&Fn() -> int] = None
+
+        install(f: &Fn() -> int)
+            slot = Some(f)
+
+        @no_alloc
+        boxed()
+            install(() -> 1)
+
+        main()
+            boxed()
+        """, ["a reference needs an allocator, and 'boxed' declared '@no_alloc'", "main.sysl:8:"])
+
+// 'make' here and 'last' below are written directly under the header, so the word is the module's
+// clause.
+@test("'@no_alloc' refuses a closure returned from its frame, and one built into a '&sync Fn'")
+cfb_no_alloc_refuses_returned_and_sync()
+    cfb_refused(raw"""
+        @no_alloc
+        make(k: int) -> &Fn() -> int = () -> k
+
+        main()
+            print(make(1)())
+        """, ["a reference needs an allocator, and this module declared '@no_alloc'", "main.sysl:2:32"])
+    cfb_refused(raw"""
+        run(f: &sync Fn() -> int) -> int = f()
+
+        @no_alloc
+        shared() -> int = run(() -> 2)
+
+        main()
+            print(shared())
+        """, ["a reference needs an allocator, and 'shared' declared '@no_alloc'"])
+
+@test("'@no_alloc' refuses a closure kept in an outer local by a loop that builds it again")
+cfb_no_alloc_refuses_a_loop_kept_closure()
+    cfb_refused(raw"""
+        @no_alloc
+        last() -> int
+            var g: &Fn() -> int = () -> 0
+
+            for i in 0..<3
+                val k = i
+                g = () -> k
+
+            g()
+
+        main()
+            print(last())
+        """, ["a reference needs an allocator, and this module declared '@no_alloc'", "main.sysl:7:13"])
+
+@test("'@no_alloc' on a generic: the body it was written as boxes its closure in the frame too")
+cfb_no_alloc_generic_body_accepts_a_frame_box()
+    cfb_prints(raw"""
+        apply(f: &Fn() -> int) -> int = f()
+
+        @no_alloc
+        twice[T](x: T) -> int = apply(() -> 2)
+
+        @no_alloc
+        plain() -> int = twice(1) + twice("a")
+
+        main()
+            print(plain())
+        """, "4\n")
+
+@test("and refuses the one its own body hands to a keeping callee")
+cfb_no_alloc_generic_body_refuses_a_kept_closure()
+    cfb_refused(raw"""
+        var slot: Option[&Fn() -> int] = None
+
+        install(f: &Fn() -> int)
+            slot = Some(f)
+
+        @no_alloc
+        keep[T](x: T)
+            install(() -> 2)
+
+        main()
+            keep(1)
+        """, ["a reference needs an allocator, and 'keep' declared '@no_alloc'", "main.sysl:8:"])
+
+// -- the frame box, where the `&Fn` goes ------------------------------------------------------------
+
+private const cfb_matrix: string = raw"""
+    trait Visitor
+        visit(self, f: &Fn(int) -> int) -> int
+
+    struct Twice
+    end Twice
+
+    impl Visitor for Twice
+        visit(self, f: &Fn(int) -> int) -> int = f(f(1))
+
+    struct Holder
+        f: &Fn() -> int
+
+    struct Cell
+        v: int
+
+    apply(f: &Fn() -> int) -> int = f()
+
+    call(f: &Fn() -> unit) = f()
+
+    relay(f: &Fn() -> int) -> int
+        val g = f
+        val h = g
+
+        apply(h) + apply(f)
+
+    through(run: &Fn(&Fn() -> int) -> int, f: &Fn() -> int) -> int = run(f)
+
+    twice_of[T](x: T, f: &Fn(T) -> T) -> T = f(f(x))
+
+    depth(n: int) -> int
+        if n == 0 then return 0
+
+        apply(() -> n) + depth(n - 1)
+
+    main()
+        var n = 1
+        val word = "abc"
+        val cell: &Cell = Cell(5)
+        val obj: &Visitor = Twice()
+
+        print(apply(() -> 1), apply(() -> n), apply(() -> int(word.bytes.len)), apply(() -> cell.v))
+        call(() -> n += 10)
+        print(n, relay(() -> n), through(f -> f() + 1, () -> n), twice_of(3, x -> x * n))
+        print(obj.visit(x -> x + n), depth(4))
+
+        val g: &Fn() -> int = () -> n * 2
+        val local = Holder(() -> n + 100)
+        val maybe: Option[&Fn() -> int] = Some(() -> 7)
+
+        n = 20
+        print(g(), g(), local.f(), maybe.map(f -> f()).unwrap_or(0))
+
+        var pick: &Fn() -> int = () -> 0
+
+        if n > 5
+            pick = () -> n + int(word.bytes.len)
+        else
+            pick = () -> -1
+
+        print(pick())
+
+        var total = 0
+
+        for i in 0..<3
+            val k = i * 10
+            val each: &Fn() -> int = () -> k + n
+
+            total += apply(() -> k) + each()
+
+        var j = 0
+
+        while apply(() -> j) < 3
+            j += 1
+
+        val found = loop
+            if apply(() -> j) > 1 then break apply(() -> j * 2)
+
+        print(total, j, found)
+
+        defer print(apply(() -> n + 1))
+
+        val outer = 2
+        val nested = apply(() -> apply(() -> outer * n))
+
+        print(nested)
+    """
+
+private const cfb_matrix_output: string = "1 1 3 5\n11 22 12 363\n23 10\n40 40 120 7\n23\n120 3 6\n40\n21\n"
+
+@test("every frame-boxed cell prints what it would on the heap, and gives back everything it took")
+cfb_frame_boxes_run_on_the_counted_heap()
+    cfb_prints(cfb_matrix, cfb_matrix_output)
+
+@test("and under AddressSanitizer: instrumented, and nothing read outside a live frame")
+cfb_frame_boxes_run_clean_under_asan()
+    if !enm_ready() then return
+
+    val got = cfb_run(cfb_matrix, false, "-fsanitize=address -g")
+
+    assert(got.hooks > 0, s"not instrumented: ${got.out}")
+    assert_eq(got.out, cfb_matrix_output)
+    assert_eq(got.err, "")
+
+@test("every closure of the matrix is boxed in its frame, and only the two counted values reach the heap")
+cfb_frame_boxes_are_allocas()
+    if xvr_no_library() then return
+
+    val ir = cfb_ir(cfb_matrix)
+
+    assert_eq(cfb_lines_with(ir, "= alloca %arc.$closure"), 25)
+    assert_eq(cfb_lines_with(ir, "call ptr @malloc"), 2)
+
+@test("a frame box whose closure holds a counted value lets go of it at the last release, and frees nothing")
+cfb_counted_payload_has_a_frame_hook()
+    if xvr_no_library() then return
+
+    val text = raw"""
+        apply(f: &Fn() -> int) -> int = f()
+
+        main()
+            val word = "abcd"
+            val none = 3
+
+            print(apply(() -> int(word.bytes.len)), apply(() -> none))
+        """
+    val ir = cfb_ir(text)
+
+    assert_eq(cfb_lines_with(ir, "define private void @arc.dropframe."), 1)
+    assert_eq(cfb_lines_with(ir, "call ptr @malloc"), 0)
+    cfb_prints(text, "4 3\n")
+end cfb_counted_payload_has_a_frame_hook
+
+@test("a loop body's closure is boxed again each turn: the slot holds this turn's capture")
+cfb_loop_turns_reuse_the_slot()
+    cfb_prints(raw"""
+        apply(f: &Fn() -> int) -> int = f()
+
+        main()
+            var seen = ""
+
+            for i in 0..<4
+                val k = i * i
+                val s = f"$k"
+
+                seen = seen + f"${apply(() -> k)}/${apply(() -> int(s.bytes.len))} "
+
+            print(seen)
+        """, "0/1 1/1 4/1 9/1 \n")
+
+// -- where a frame box meets a parameter lent by address ------------------------------------------
+
+// `Wide` is wider than two words and only read, so a body that does nothing else with it is lent it by
+// address (`borrowing.sysl`'s `read_by_address`) and emitted as `<symbol>.owned` beside an entry. The
+// cells: a closure literal handed to a callee beside a lent parameter; a frame-boxed closure built in a
+// lent body, holding plain locals of that body; a closure holding a counted copy of the parameter
+// (the copy keeps its count, so that body owns it); the lent parameter itself captured, in a loop --
+// which the closure's environment keeps, so that body takes it by value -- and that body reached
+// through its entry as a function value, beside a parameter lent to `via`.
+private const cfb_lent: string = raw"""
+    struct Wide
+        a: int
+        b: int
+        c: int
+        tag: string
+
+    apply(f: &Fn() -> int) -> int = f()
+
+    both(w: Wide, f: &Fn() -> int) -> int = w.a + w.c + f()
+
+    inner(w: Wide) -> int
+        val k = w.b * 10
+        val n = int(w.tag.bytes.len)
+
+        apply(() -> k + n)
+
+    copied(w: Wide) -> int
+        val x = w
+
+        apply(() -> x.a + int(x.tag.bytes.len))
+
+    held(w: Wide) -> int
+        var t = 0
+
+        for i in 0..<3
+            t += apply(() -> w.a + w.b + w.c + i + int(w.tag.bytes.len))
+
+        t
+
+    via(h: &Fn(Wide) -> int, w: Wide) -> int = h(w)
+
+    main()
+        val w = Wide(1, 2, 3, f"t${4}ag")
+        val v = Wide(10, 20, 30, "x")
+
+        print(both(w, () -> v.a + int(v.tag.bytes.len)), inner(w), copied(w), held(w), via(held, v))
+    """
+
+@test("a closure beside, inside, or capturing a parameter lent by address prints what a copy would, and frees all")
+cfb_lent_parameters_run_on_the_counted_heap()
+    cfb_prints(cfb_lent, "15 24 5 33 186\n")
+
+@test("a lent body boxes its closures in its own frame, and a closure beside a lent parameter is boxed in the caller's")
+cfb_lent_bodies_box_in_their_frame()
+    if xvr_no_library() then return
+
+    val ir = cfb_ir(cfb_lent)
+
+    assert_eq(cfb_lines_with(ir, "= alloca %arc.$closure"), 5)
+
+    for name in ["@both", "@inner", "@via"]
+        var lent = 0
+
+        for line in lines_of(ir).view()
+            if line.starts_with("define ") && line.contains(name) && line.contains(".owned(") &&
+               line.contains("ptr noalias readonly %w.param") then lent += 1
+
+        assert_eq(lent, 1)
+
+// -- the heap box, and why ------------------------------------------------------------------------
+
+private const cfb_heap: string = raw"""
+    import sysl.buf.{Buf, buf}
+
+    var slot: Option[&Fn() -> int] = None
+
+    install(f: &Fn() -> int)
+        slot = Some(f)
+
+    make(k: int) -> &Fn() -> int = () -> k * 3
+
+    hold(into: *Buf[&Fn() -> int], f: &Fn() -> int)
+        into.push(f)
+
+    main()
+        val n = 4
+
+        install(() -> n + 1)
+
+        var fs: Buf[&Fn() -> int] = buf()
+
+        hold(&fs, () -> n + 2)
+
+        var last: &Fn() -> int = () -> 0
+
+        for i in 0..<3
+            val k = i
+            last = () -> k + 100
+
+        var gs: [3]&Fn() -> int = [() -> 0, () -> 0, () -> 0]
+
+        for i in 0..<3
+            val k = i * 10
+            gs[i] = () -> k
+
+        print(slot.map(f -> f()).unwrap_or(0), make(2)(), fs[0](), last(), gs[0](), gs[1](), gs[2]())
+        slot = None
+    """
+
+// A static cleared before every way out of `main` does not keep what it held past the frame (the
+// rule's own flow), so `install`'s closure is boxed in the frame; the other four are on the heap.
+@test("a closure that escapes keeps its heap box, and each still answers its own capture")
+cfb_escaping_closures_run_on_the_heap()
+    cfb_prints(cfb_heap, "5 6 6 102 0 10 20\n")
+
+@test("and under AddressSanitizer, the static cleared before the frame ends among them")
+cfb_escaping_closures_run_clean_under_asan()
+    if !enm_ready() then return
+
+    val got = cfb_run(cfb_heap, false, "-fsanitize=address -g")
+
+    assert(got.hooks > 0, s"not instrumented: ${got.out}")
+    assert_eq(got.out, "5 6 6 102 0 10 20\n")
+    assert_eq(got.err, "")
+
+private cfb_said(notes: Buf[string]) -> string
+    var said = ""
+
+    for line in notes
+        said = said + line + "\n"
+
+    said
+end cfb_said
+
+@test("--explain-escapes names each heap box of a closure and why, and no frame box")
+cfb_explain_escapes_names_the_heap_boxes()
+    val notes = cfb_explained(cfb_heap)
+
+    if xvr_no_library() then return
+
+    val lead = "a closure erased to '&Fn() -> int' is boxed on the heap, because"
+    val want = [
+        s"main.sysl:8:32: $lead it is returned from 'make' on line 8",
+        s"main.sysl:20:15: $lead it is handed to 'hold' on line 20, which keeps its parameter 'f' (it is passed to 'push', which keeps it)",
+        s"main.sysl:26:16: $lead it is kept in 'last' on line 26, which outlives the turn of the 'for' body that builds it",
+        s"main.sysl:32:17: $lead it is kept in 'gs' on line 32, which outlives the turn of the 'for' body that builds it"]
+    val said = cfb_said(notes)
+
+    for w in want
+        assert(said.contains(w), s"$w\n--- in ---\n$said")
+
+    assert_eq(notes.len(), want.len)
+end cfb_explain_escapes_names_the_heap_boxes
+
+// A closure an `async` body hands to a callee that only calls it would be framed in a plain body; its
+// box is on the heap, since the frame keeps no box across an `await` (`closure_mode.sysl`'s
+// `async_box_why`). The run across an `await` is `tests_cas_closure_async.sysl`'s.
+@test("--explain-escapes says a closure boxed in an 'async' body is on the heap, and why")
+cfb_explain_escapes_names_an_async_box()
+    val notes = cfb_explained(raw"""
+        call(f: &Fn() -> int) -> int = f()
+
+        async run() -> int
+            var n = 1
+            await yield_now()
+            call(() -> n + 1)
+
+        main()
+            print(block_on(run()))
+        """)
+
+    if xvr_no_library() then return
+
+    assert_eq(cfb_said(notes), "main.sysl:6:10: a closure erased to '&Fn() -> int' is boxed on the heap, " +
+              "because it is built in the 'async' body of 'run', whose frame keeps no box across an 'await'\n")
+end cfb_explain_escapes_names_an_async_box
+
+@test("--explain-escapes names the callee that keeps a closure in a static nothing clears")
+cfb_explain_escapes_names_a_keeping_callee()
+    val notes = cfb_explained(raw"""
+        var slot: Option[&Fn() -> int] = None
+
+        install(f: &Fn() -> int)
+            slot = Some(f)
+
+        main()
+            install(() -> 1)
+        """)
+
+    if xvr_no_library() then return
+
+    assert_eq(cfb_said(notes), "main.sysl:7:13: a closure erased to '&Fn() -> int' is boxed on the heap, " +
+              "because it is handed to 'install' on line 7, which keeps its parameter 'f' (it is stored in 'slot')\n")
+end cfb_explain_escapes_names_a_keeping_callee
+
+@test("--explain-escapes says nothing of a program whose closures are all boxed in their frames")
+cfb_explain_escapes_is_quiet_for_frame_boxes()
+    val notes = cfb_explained(cfb_matrix)
+
+    if xvr_no_library() then return
+
+    for line in notes
+        assert(!line.contains("closure"), line)
+
+@test("a closure built in an 'async' body is boxed on the heap, and says so")
+cfb_async_body_boxes_on_the_heap()
+    val text = raw"""
+        apply(f: &Fn() -> int) -> int = f()
+
+        async work(k: int) -> int = apply(() -> k + 1)
+
+        main()
+            print(block_on(work(2)))
+        """
+    val notes = cfb_explained(text)
+
+    if xvr_no_library() then return
+
+    val said = cfb_said(notes)
+
+    assert(said.contains("main.sysl:3:35: a closure erased to '&Fn() -> int' is boxed on the heap, " +
+                         "because it is built in the 'async' body of 'work'"), said)
+    cfb_prints(text, "3\n")
+end cfb_async_body_boxes_on_the_heap
+
+// -- a board with no allocator --------------------------------------------------------------------
+
+private cfb_board(program: string) -> string =
+    lbr_tree(lbr_two("package.hocon",
+                     "package {\n  name = \"cfb-board\"\n  version = \"0.1.0\"\n}\n\n" +
+                     "capabilities { heap = false }\n",
+                     "main.sysl", program))
+
+private cfb_board_build(program: string) -> (int, string)
+    val root = cfb_board(program)
+    val got = lbr_cli(["sysl", "build-c", root, "--target", "thumbv7em-freestanding", "-o", s"$root/out.a"])
+
+    remove_dir_all(root).unwrap_or(())
+    got
+end cfb_board_build
+
+@test("a board with no heap builds a closure handed to a '&Fn', in a loop and out of one")
+cfb_board_builds_frame_boxes()
+    if !lbr_ready() then return
+
+    val got = cfb_board_build(
+        "apply(f: &Fn(int) -> int, x: int) -> int = f(x)\n\n" +
+        "@export(\"main\")\nmain()\n" +
+        "    var n = 2\n    val k = 3\n\n" +
+        "    for i in 0..<4\n        n += apply(x -> x * k + n, i)\n\n" +
+        "    if apply(x -> x + n, 1) == 0 then loop do ()\n")
+
+    assert(got.0 == 0, got.1)
+    assert(got.1.index_of("error").is_none(), got.1)
+end cfb_board_builds_frame_boxes
+
+@test("and refuses the one a callee keeps, saying the board has no allocator")
+cfb_board_refuses_a_heap_box()
+    if !lbr_ready() then return
+
+    val got = cfb_board_build(
+        "var slot: Option[&Fn() -> int] = None\n\n" +
+        "install(f: &Fn() -> int)\n    slot = Some(f)\n\n" +
+        "@export(\"main\")\nmain()\n    install(() -> 1)\n")
+
+    assert(got.0 != 0, got.1)
+    assert(got.1.contains("a reference needs an allocator, and 'thumbv7em-freestanding' provides no allocator"),
+           got.1)
+end cfb_board_refuses_a_heap_box
