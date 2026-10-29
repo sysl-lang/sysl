@@ -1472,8 +1472,9 @@ out of the parameter — or, where it is neither, the first reason found:
 ```
 $ sysl build --explain-borrows hashlife.sysl
 hashlife.sysl:8:5: 'Node.quad' answers a place of 'self': self.kids.unwrap()
-hashlife.sysl:23:5: 'Table.find' answers +0 from 'self': self.items.walk()[_], but its body may write or release what it was handed
-hashlife.sysl:30:1: 'make' is not borrowed: a reference made here, at 31:5
+hashlife.sysl:23:5: 'Table.find' answers +0 from 'self': self.items.walk()[_]
+hashlife.sysl:30:5: 'Table.take' answers +0 from 'self': self.items[_], but its body may write or release what it was handed
+hashlife.sysl:36:1: 'make' is not borrowed: a reference made here, at 37:5
 ```
 
 A path is written as the program reaches it: `.field`, `[_]` for an element, `.Some` for the
@@ -1482,11 +1483,12 @@ of its receiver. Two paths joined by `|` are two ways out. A function is answere
 instantiation of a generic, and the answer is worked out over the whole call graph, so a recursion
 settles on "not borrowed". Where no body is in sight — a call through a trait object or a function
 value, an `extern` — the answer is "not borrowed". A function whose answer is borrowed but whose body
-may write or release something (it calls, or writes, more than its own locals) says so.
+may write or release something (it calls, or writes, more than its own locals) says so; such a
+function is called the ordinary way, its answer carrying a count of its own.
 
-Nothing in the build changes with the flag. The report is what a borrowed return
-([the design note](https://github.com/sysl-lang/sysl/blob/dev/docs/design/borrowed-return.md)) will
-be decided from: an answer that is a place can be read in the caller without a copy or a count.
+Nothing in the build changes with the flag. The report is what the build decides from: a call to a
+function whose answer is a place or +0 is read where the answer lies, with no copy or count
+([a method's answer borrowed from its receiver](../reference/memory.md#a-methods-answer-borrowed-from-its-receiver)).
 When no function answers a borrow, the flag says so.
 
 ### `-O2` is written the way clang writes it

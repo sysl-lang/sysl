@@ -1,0 +1,158 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.Span
+import sysl.buf.{Buf, buf}
+import sysl.container.{Map, Set, set}
+
+// **A method's answer handed over without a count** (`docs/design/borrowed-return.md § 4, decision 4`).
+//
+// A function whose answer is +0 from one of its parameters (`borrow_summary.sysl`) -- every way out
+// answers references read out of that parameter's storage, or a value built on the spot of nothing
+// else, like `find(self, key) -> Option[&Item]` answering `Some(it)` for an element of `self.items`
+// -- answers, through its ordinary entry, with a count taken for every reference in the answer, and
+// its caller gives them back when it is done with it. Nothing needed those counts: the storage the
+// references were read out of holds one of its own on each of them for as long as nothing writes it.
+//
+// So such a function is given a second entry, its **+0 entry** (`<symbol>-zero`): the same body,
+// taking its parameters as the ordinary entry's caller hands them over -- borrowed, whatever the
+// ordinary entry owns -- and answering the same value with no count of its own. Everything the body
+// takes a count of it gives back as it always did, so the answer is held only by the storage it was
+// read out of.
+//
+// **The caller takes the counts at once**, so the call's value is an ordinary owned temporary, exactly
+// as a field read out of storage is, and nothing downstream can tell the two entries apart. Where the
+// value's uses until its last lie in a stretch that can release nothing, the counts are dropped with
+// their releases by the pass that drops every such share (`arc_cover.sysl`), which takes a +0 entry's
+// answer for a read out of storage. Where the stretch ends first, they stay.
+//
+// **What makes the answer alive when the caller takes its counts is that the entry is inert**: it
+// writes nothing but its own locals and calls nothing that might release, so the storage the
+// references were read out of holds every one of them when it returns. So a +0 entry is given only to a
+// body `inert_callees` admits when its function owns nothing (the entry owns nothing), and a body that
+// releases or writes what it answers -- `items.clear()` after reading an element -- keeps the ordinary
+// entry, as does a path answering a reference made here, which the summary never calls +0.
+//
+// It is written beside the ordinary entry, by the compilation that writes that one, and is `internal`:
+// a library artifact and its user never have to agree about it. A function whose own answer is a
+// place has a place entry instead where the place entry can take it (`place_entry.sysl`); a place it
+// cannot take, being +0 too, is answered through this.
+
+// The functions of `p` given a +0 entry, read from what the whole-program check found (`answers`,
+// `Promotions.zero_answers`), each added to what a call may lend its arguments to in place and to the
+// symbols the count elision may cross.
+zero_entries(e: *Emit, p: TProgram, answers: Map[string, usize])
+    if answers.is_empty() then return
+
+    var cands: Buf[TFunc] = buf()
+
+    for f in p.funcs
+        if answers.has(f.name) && !e.places.has(f.name) && zero_candidate(e, p, f) then cands.push(f)
+
+    if cands.is_empty() then return
+
+    // **A +0 entry owns nothing**, so it is judged as its body would be were it handed its parameters
+    // rather than owning them, as a place entry is.
+    var owning: Set[string] = set()
+
+    for name in e.owning_funcs
+        var entry = false
+
+        for f in cands
+            if f.name == name then entry = true
+
+        if !entry then owning.add(name)
+
+    val quiet = if owning.len() == e.owning_funcs.len() then e.inert else inert_callees(p, owning)
+
+    for f in cands
+        if !quiet.has(f.name) then continue
+
+        e.zeros.add(f.name)
+        e.inert.add(zero_key(f.name))
+        e.inert_symbols.add(zero_symbol(e, f.name))
+end zero_entries
+
+// The symbol a function's +0 entry is defined and called at. No function's own symbol holds a `-`:
+// a sysl name is an identifier, and a module path and a generic's arguments are joined by `.` and `$`.
+zero_symbol(e: *Emit, name: string) -> string = symbol_of(e, name) + "-zero"
+
+// Whether a symbol is a +0 entry's.
+is_zero_symbol(symbol: string) -> bool = symbol.ends_with("-zero")
+
+// What a call to a +0 entry is asked about by name where a callee is judged (`lends_in_place`): no
+// function's name holds a line break, so it never answers for the ordinary entry.
+zero_key(name: string) -> string = name + "\n+0"
+
+// Whether `f` may have a second entry at all: an ordinary sysl function this compilation writes,
+// called only as one, answering a value in registers, whose parameters cross in registers or as a
+// large one does and whose frame is its own.
+private zero_candidate(e: *Emit, p: TProgram, f: TFunc) -> bool
+    if f.ghost || f.marks.is_async() || f.exported.is_some() || f.section.is_some() || f.conv.is_some() then
+        return false
+    if f.variadic || f.variant.is_some() || is_closure_body(f) || !f.marks.disjoint.is_empty() then return false
+    if !f.requires.is_empty() || !f.ensures.is_empty() || !f.olds.is_empty() then return false
+    if !f.internal && holds_string(p.precompiled, f.name) then return false
+    if !tail_calls_of(f).is_empty() then return false
+    if no_value(f.ret_ty) || e.layout.indirect(f.ret_ty) || !contains_counted(f.ret_ty) then return false
+
+    for j in 0..<f.params.len()
+        if underlying(f.params.at(j).1) == VaList then return false
+        if e.lent_params.has(owned_key(f.name, j)) then return false
+        if e.in_place.has(f.name + "\n" + f.params.at(j).0) then return false
+
+    true
+end zero_candidate
+
+// -- the entry ----------------------------------------------------------------------------------------
+
+// The count a way out of a body takes for the answer `v`, the value of `x`: none in a +0 entry, where
+// whatever the frame holds of it is given back with the frame and the storage it was read out of
+// holds the rest; otherwise the one `retain_moving` takes or takes over.
+answer_count(e: *Emit, x: TExpr, ty: Type, v: Val)
+    if !e.zero_body then retain_moving(e, x, ty, v)
+
+// The +0 entry of `f`, written from its body as the ordinary one is, under its own symbol and local to
+// this module.
+gen_zero_entry(e: *Emit, f: TFunc) -> Option[IrFunc]
+    e.zero_body = true
+
+    val built = gen_function(e, f)
+
+    e.zero_body = false
+
+    val made = built?
+
+    Some(made with { sig = made.sig with { name = zero_symbol(e, f.name), linkage = LinkInternal } })
+end gen_zero_entry
+
+// -- the caller ---------------------------------------------------------------------------------------
+
+// A call to `name` made through its +0 entry, where it has one: the answer with its counts taken
+// here, owned by the statement as a call's result is. `None` where the ordinary entry is called.
+gen_zero_call(e: *Emit, name: string, args: Buf[TExpr], ty: Type, span: Span) -> Option[Val]
+    if !e.zeros.has(name) || e.abandoning.has(name) then return None
+
+    var arg_vals: Buf[IrArg] = buf()
+    val written = written_by(args)
+
+    for j in 0..<args.len()
+        arg_value(e, args.at(j), &arg_vals, written, if quiet_args_after(args, j) then zero_key(name) else "")
+
+    push_caller_arg(e, name, span, &arg_vals)
+
+    // The call's result is the statement's temporary already, given back with its others; the count
+    // it gives back is the one taken here.
+    val r = gen_sysl_call(e, VGlobal(zero_symbol(e, name)), arg_vals, ty)
+
+    retain_value(e, ty, r)
+    Some(r)
+end gen_zero_call
+
+// Whether the arguments after the `j`th change nothing while they are worked out, so the ones before
+// may be lent as they stand.
+private quiet_args_after(args: Buf[TExpr], j: usize) -> bool
+    for k in j + 1..<args.len()
+        if !changes_nothing(args.at(k)) then return false
+
+    true
+end quiet_args_after

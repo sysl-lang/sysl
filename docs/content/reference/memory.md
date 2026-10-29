@@ -902,6 +902,139 @@ drop 3
 done
 ```
 
+### A method's answer borrowed from its receiver
+
+The rule above stops at a call: `n.kids match Some(q) -> …` reads the field and takes no count, but a
+method `quad(self) -> Kids = self.kids.unwrap()` that does the same reading hands back a **copy**, a
+count taken for every reference in it, which the caller gives back when it is done. **A function whose
+answer is read out of a parameter's storage is called so that the caller reads it there instead**, and
+the two spellings below cost the same — no count at all in either walk:
+
+```sysl
+struct Node
+    level: int
+    kids: Option[Kids]
+
+    quad(self) -> Kids = self.kids.unwrap()
+
+struct Kids
+    nw: &Node
+    ne: &Node
+    sw: &Node
+    se: &Node
+
+leaf() -> &Node = Node(0, None)
+
+by_method(n: &Node) -> int
+    if n.level == 0 then return 1
+
+    val q = n.quad()
+
+    by_method(q.nw) + by_method(q.ne) + by_method(q.sw) + by_method(q.se)
+
+by_match(n: &Node) -> int = n.kids match
+    Some(q) -> by_match(q.nw) + by_match(q.ne) + by_match(q.sw) + by_match(q.se)
+    None -> 1
+
+val l = leaf()
+val top: &Node = Node(1, Some(Kids(l, l, l, l)))
+
+print(by_method(top), by_match(top))
+```
+
+```output
+4 4
+```
+
+Nothing is written to ask for it; the compiler works out from the body what an answer is made of:
+
+- **a place of a parameter** — a field, a field of a field, an element of a fixed array or of a buffer
+  the parameter holds, the payload a `match` binds where every other arm ends the program, or the
+  answer of another such method on such a place (`self.kids.unwrap()`). Where the body is one such
+  expression, the call reads the value where it lies;
+- **+0 from a parameter** — a value built on the spot out of references read from its storage and
+  nothing else: `Some(it)` for an element `it` of `self.items`, a struct or a tuple of fields. Such a
+  function is called so that it hands the references over without a count of its own, and the caller
+  counts them only where it has to.
+
+```sysl
+import sysl.buf.{Buf, buf}
+
+struct Item
+    key: int
+    value: int
+
+impl Drop for Item
+    drop(self) = print("drop", self.key)
+
+struct Table
+    items: Buf[&Item]
+
+    find(self, key: int) -> Option[&Item]
+        for it in self.items
+            if it.key == key then return Some(it)
+
+        None
+
+look(t: &Table, k: int) -> int = t.find(k) match
+    Some(it) -> it.value
+    None -> 0
+
+drained(t: &Table) -> int
+    val it = t.find(2)
+
+    t.items.clear()
+    print("cleared")
+    it.unwrap().value
+
+val t: &Table = Table(buf())
+
+for i in 1..3
+    t.items.push(Item(i, i * 10))
+
+print(look(t, 1) + look(t, 3))
+print(drained(t))
+```
+
+```output
+40
+drop 1
+drop 3
+cleared
+drop 2
+20
+```
+
+`look` takes no count of the item it reads, and neither does `find` for the one it answers. In
+`drained` the stretch ends at `clear`, which releases what the buffer held, so the answer's count is
+taken at the call and the item outlives the buffer's hold on it, exactly as it did when every count
+was taken. The stretch is the one above, and **what keeps the count is the same list**: a release, a
+write that may reach the storage, a call into anything that might do either, an `await`, a lock, or
+using the answer in a way that keeps it — storing, returning, capturing or handing it to a function
+that keeps it.
+
+A function keeps the ordinary call — an answer with its count — where:
+
+- **some path answers a reference made there** (`if c then Some(self.one) else Some(Item(9, 90))`);
+- **the body may release or write what it answers**, or calls anything that might: reading an
+  element and then clearing the buffer it came from. The body has to release nothing the caller
+  could be relying on, so that what it read is still held by the storage when it returns;
+- **no body is in sight**: a call through a trait object or a function value, an `extern`, a function
+  a library already compiled. These are the defaults every inferred fact here keeps (see
+  [where no body is in sight](#where-no-body-is-in-sight-the-call-borrows)).
+
+A generic is decided per instantiation: `get(self) -> Option[T]` answers `+0` for `T = &Item` and
+holds nothing to count for `T = int`. Nothing about any function's type changes, so none of this is
+visible except in the time it saves and in what `--explain-borrows` reports
+([the CLI](../getting-started/cli.md#--explain-borrows)):
+
+```
+$ sysl build --explain-borrows table.sysl
+table.sysl:13:5: 'Table.find' answers +0 from 'self': self.items.walk()[_]
+table.sysl:19:1: 'look' is not borrowed: its answer is a fresh value
+table.sysl:23:1: 'drained' answers a place of 't': t.items.walk()[_].unwrap().value, but its body may write or release what it was handed
+```
+
 ## `weak T` — breaking cycles
 
 Reference counting has one honest weakness: a cycle of strong references keeps itself alive. A parent
@@ -2423,6 +2556,10 @@ Put the view in a block that closes first, and the name is free again once it ha
 a member whose result is a view (`[]T`, `[]const T`, `string`), and nothing about the borrow is in a
 type: there are no lifetime parameters, and no borrow is tracked through a struct a member returns.
 A view of a `*T` region that no member marked stays the programmer's problem, as every `*T` is.
+The mark is about memory a *destructor* frees, which is why it is declared. A member whose answer is
+simply read out of its receiver's storage — a field, an element, a `Some` of one — needs no mark at
+all: the compiler works that out from the body and reads the answer where it lies (see
+[a method's answer borrowed from its receiver](#a-methods-answer-borrowed-from-its-receiver)).
 
 ## Escape analysis
 
