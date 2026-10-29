@@ -57,9 +57,11 @@ gen_function(e: *Emit, f: TFunc) -> Option[IrFunc]
     //
     // **A task keeps every parameter**: its body runs after the call has returned, so nothing its
     // caller holds for the length of the call is held for long enough.
+    //
+    // **A +0 entry owns nothing** (`zero_entry.sysl`): its caller hands every parameter over borrowed.
     val found = tail_calls_of(f)
-    val owns = owning(f, e.address_taken.has(f.name), is_async || !found.is_empty(),
-                      e.inert.has(f.name))
+    val owns = if e.zero_body then set()
+               else owning(f, e.address_taken.has(f.name), is_async || !found.is_empty(), e.inert.has(f.name))
 
     // A zero-sized parameter is not an argument: there is nothing to receive and nothing to keep, so
     // it takes no slot and the emitted signature does not mention it.
@@ -71,7 +73,7 @@ gen_function(e: *Emit, f: TFunc) -> Option[IrFunc]
 
         if !zero_sized(p.1)
             val ty = p.1
-            val handed = e.owned_params.has(owned_key(f.name, j))
+            val handed = !e.zero_body && e.owned_params.has(owned_key(f.name, j))
             val owned = owns.has(p.0) || handed
 
             if underlying(ty) == VaList
@@ -182,7 +184,7 @@ gen_function(e: *Emit, f: TFunc) -> Option[IrFunc]
                     val v = gen_expr(e, r)
 
                     trace_leave(e, mark)
-                    retain_moving(e, r, f.ret_ty, v)
+                    answer_count(e, r, f.ret_ty, v)
                     emit_ensures(e, Some(v))
                     release_all_as(e, exit_returning(e, Some(r), v, f.ret_ty))
                     emit_term(e, InRet(Some(lty(e, f.ret_ty)), Some(v)))

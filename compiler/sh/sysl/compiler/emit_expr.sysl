@@ -1561,6 +1561,12 @@ private gen_call(e: *Emit, name: string, args: Buf[TExpr], ty: Type, span: Span)
         Some(v) -> return v
         None -> ()
 
+    // One answering references read out of an argument's storage is called through its +0 entry
+    // (`zero_entry.sysl`).
+    gen_zero_call(e, name, args, ty, span) match
+        Some(v) -> return v
+        None -> ()
+
     var arg_vals: Buf[IrArg] = buf()
     val mark = e.temps.len()
     val staged = staged_args(e, args, &arg_vals, name)
@@ -1644,10 +1650,11 @@ end staged_args
 
 // One argument, in whatever form the boundary takes it: a large value crosses as the address of
 // storage the caller holds, and a zero-sized one is evaluated and not passed. `written` is what the
-// call's arguments assign (`written_by`).
-arg_value(e: *Emit, a: TExpr, out: *Buf[IrArg], written: Set[string])
+// call's arguments assign (`written_by`). `callee` is what a direct call is judged by where nothing
+// after this argument can change it (`lends_in_place`), or empty.
+arg_value(e: *Emit, a: TExpr, out: *Buf[IrArg], written: Set[string], callee: string = "")
     val ty = texpr_type(a)
-    val v = guaranteed_arg(e, a, "", written)
+    val v = guaranteed_arg(e, a, callee, written)
 
     if e.layout.indirect(ty) then out.push(ir_arg(LPtr, v))
     else if !zero_sized(ty) then out.push(ir_arg(lty(e, ty), v))

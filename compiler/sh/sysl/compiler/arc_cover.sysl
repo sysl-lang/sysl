@@ -149,9 +149,10 @@ elide_covered(blocks: Buf[IrBlock], clean: Set[string], inert: Set[string]) -> B
                 InAlloca(d, _, _) -> defs.put(v_render(d), inst)
                 InExtract(d, _, _, _) -> defs.put(v_render(d), inst)
                 InInsert(d, _, _, _, _, _) -> defs.put(v_render(d), inst)
-                // A place entry's answer, for `count_blind`'s loads through it.
+                // A place entry's answer, for `count_blind`'s loads through it, and a +0 entry's, which
+                // is read out of storage (`zero_entry.sysl`).
                 InCall(Some(d), _, VGlobal(callee), _, _, _, _, _) ->
-                    if is_place_symbol(callee) then defs.put(v_render(d), inst)
+                    if is_place_symbol(callee) || is_zero_symbol(callee) then defs.put(v_render(d), inst)
                 InStore(_, v, p, _, _) ->
                     val slot = v_render(p)
 
@@ -220,8 +221,13 @@ private cover_at(blocks: Buf[IrBlock], defs: Map[string, Inst], stores: Map[stri
     // A slot of the frame must cover it. Any other place the reference was read out of -- a field, an
     // element, the payload of the enum a `match` is looking at -- needs only the window, and so does a
     // value built on the spot out of such reads (see the head of this file).
+    //
+    // **What a +0 entry answers is such a read too** (`zero_entry.sysl`): references read out of the
+    // storage of an argument, by a body that released nothing, so each is alive when the retain runs.
     if slot == ""
-        if !name.starts_with("arc.copy.") || !built_of_places(blocks, defs, stores, clean, x) then return None
+        if !zero_answer(defs, from) && (!name.starts_with("arc.copy.") ||
+                                         !built_of_places(blocks, defs, stores, clean, x)) then
+            return None
     else if !held_where_read(blocks, defs, stores, clean, from)
         return None
 
@@ -249,6 +255,11 @@ private cover_at(blocks: Buf[IrBlock], defs: Map[string, Inst], stores: Map[stri
 
     Some(Cover(b, i, release, slot, from.path, from.leaf, inserts, into, into_path))
 end cover_at
+
+// Whether the reference at `from` is what a +0 entry answered, or a part of it.
+private zero_answer(defs: Map[string, Inst], from: Origin) -> bool = defs.get(from.leaf) match
+    Some(InCall(_, _, VGlobal(callee), _, _, _, _, _)) -> is_zero_symbol(callee)
+    _ -> false
 
 // Whether `v` is a value put together on the spot by field writes into nothing, each counted field
 // written with something read out of a place (or itself put together the same way): a tuple or a

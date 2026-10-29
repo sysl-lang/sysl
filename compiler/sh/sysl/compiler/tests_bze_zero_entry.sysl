@@ -1,0 +1,427 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.text.str_builder
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// A function whose answer is +0 from one of its parameters -- references read out of that parameter's
+// storage, like `find(self, key) -> Option[&Item]` answering an element of `self.items` -- is given a
+// +0 entry, `<symbol>-zero`, that answers the same value with no count of its own
+// (`zero_entry.sysl`). Its caller takes the counts at once, and they are dropped with their releases
+// wherever nothing between the call and the last use could release or write anything. Where something
+// could, the counts stay, and the program sees exactly what the ordinary entry would have answered.
+//
+// Every program here is run at `-O0` and `-O2` on the counted heap, and must give back everything.
+
+private struct BzeRun
+    ok: bool
+    out: string
+    err: string
+
+private bze_ready() -> bool
+    if std_root().is_err() || !clang_available()
+        print("skipped: the library or the toolchain is not on this machine")
+        return false
+    end if
+
+    true
+end bze_ready
+
+private bze_ir(text: string) -> string
+    val root = make_temp_dir("sysl-bze").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    val out = emit_llvm_text(src, None) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> if made.report.is_empty() then made.text else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end bze_ir
+
+// One function's emitted text, from its `define` to the brace that closes it.
+private bze_body(out: string, symbol: string) -> string
+    var b = str_builder()
+    var inside = false
+
+    for line in lines_of(out)
+        if !inside && line.starts_with("define ") && line.contains("@" + symbol + "(") then inside = true
+
+        if inside
+            if line == "}" then return b.finish()
+
+            b.push(line)
+            b.push_char('\n')
+
+    if inside then b.finish() else s"no definition of '$symbol' in:\n$out"
+end bze_body
+
+private bze_defines(out: string, symbol: string) -> bool
+    for line in lines_of(out)
+        if line.starts_with("define ") && line.contains("@" + symbol + "(") then return true
+
+    false
+end bze_defines
+
+// Whether a body takes or gives back a count of anything.
+private bze_counts(body: string) -> bool =
+    body.contains("@arc.copy.") || body.contains("@arc.dispose.") || body.contains("@arc.retain(") ||
+        body.contains("@arc.release(")
+
+private bze_run_at(text: string, level: string) -> BzeRun
+    val root = make_temp_dir("sysl-bze").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    force_alloc_counting(true)
+
+    val built = build_native_program(s"$root/main.sysl", None, None, level, Some(s"$root/built"))
+
+    force_alloc_counting(false)
+
+    built match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return BzeRun(false, failure_text(why), "")
+        Ok(_) -> ()
+
+    val said = capture(s"$root/built", [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> BzeRun(false, "could not be started", "")
+        Ok(o) -> BzeRun(o.status.ok(), o.text, o.err.unwrap_or(""))
+end bze_run_at
+
+// Printed exactly `expected` at both ends of the optimizer, exited cleanly, and gave everything back.
+private bze_prints(text: string, expected: string)
+    if !bze_ready() then return
+
+    for level in ["0", "2"]
+        val run = bze_run_at(text, level)
+
+        assert(run.ok, s"-O$level: ${run.out}${run.err}")
+        assert_eq(run.out, expected)
+        assert(alloc_count_reported(run.err) == 0, s"-O$level: ${run.err}")
+end bze_prints
+
+// The table every program here looks things up in. An item says when it is freed, so a count that
+// went missing shows as a `drop` printed too early, and one taken twice as a leak.
+private bze_table() -> string = raw"""
+    import sysl.buf.{Buf, buf}
+
+    struct Item
+        key: int
+        value: int
+
+    impl Drop for Item
+        drop(self) = print("drop", self.key)
+
+    struct Table
+        items: Buf[&Item]
+
+        find(self, key: int) -> Option[&Item]
+            for it in self.items
+                if it.key == key then return Some(it)
+
+            None
+
+    filled() -> &Table
+        val t: &Table = Table(buf())
+
+        for i in 1..3
+            t.items.push(Item(i, i * 10))
+
+        t
+
+    """
+
+// -- the motivating shape ----------------------------------------------------------------------------
+
+// b08: a lookup answering an element of the receiver's buffer, through a loop over it.
+private bze_lookup() -> string = bze_table() + raw"""
+    look(t: &Table, k: int) -> int = t.find(k) match
+        Some(it) -> it.value
+        None -> 0
+
+    val t = filled()
+
+    print(look(t, 1) + look(t, 2) + look(t, 3) + look(t, 4))
+    """
+
+@test("a lookup answering an element of its receiver is called through its +0 entry, with no count taken")
+bze_lookup_takes_no_count()
+    if !bze_ready() then return
+
+    val out = bze_ir(bze_lookup())
+    val look = bze_body(out, "look$$sysl")
+
+    assert(look.contains("@Table.find-zero("), look)
+    assert(!bze_counts(look), look)
+
+    // The entry gives back the counts of the loop it walks and takes none for what it answers.
+    val entry = bze_body(out, "Table.find-zero")
+
+    assert(!entry.contains("@arc.copy.sysl$Option"), entry)
+    assert(bze_body(out, "Table.find").contains("@arc.copy.sysl$Option"), out)
+end bze_lookup_takes_no_count
+
+@test("and the lookups add up, freeing every item once, at the end")
+bze_lookup_runs()
+    bze_prints(bze_lookup(), "60\ndrop 3\ndrop 2\ndrop 1\n")
+
+// -- what keeps the ordinary entry -------------------------------------------------------------------
+
+@test("a path answering a reference made here keeps the ordinary entry, and its count")
+bze_fresh_path()
+    val text = bze_table() + raw"""
+        struct Shelf
+            one: &Item
+
+            pick(self, c: bool) -> Option[&Item] = if c then Some(self.one) else Some(Item(9, 90))
+
+        val s: &Shelf = Shelf(Item(5, 50))
+
+        print(s.pick(false).unwrap().value)
+        print(s.pick(true).unwrap().value)
+        """
+
+    if bze_ready() then assert(!bze_ir(text).contains("-zero"), text)
+
+    bze_prints(text, "90\ndrop 9\n50\ndrop 5\n")
+end bze_fresh_path
+
+@test("a body that releases what it answers keeps the ordinary entry, and the item lives on")
+bze_body_releases()
+    val text = bze_table() + raw"""
+        struct Bag
+            items: Buf[&Item]
+
+            take(self) -> Option[&Item]
+                val x = self.items[0]
+
+                self.items.clear()
+                Some(x)
+
+        val b: &Bag = Bag(buf())
+
+        b.items.push(Item(7, 70))
+        print(b.take().unwrap().value)
+        print("after")
+        """
+
+    if bze_ready() then assert(!bze_defines(bze_ir(text), "Bag.take-zero"), text)
+
+    bze_prints(text, "70\ndrop 7\nafter\n")
+end bze_body_releases
+
+@test("a call through a trait object takes the ordinary entry")
+bze_trait_object()
+    val text = bze_table() + raw"""
+        trait Finder
+            find_in(self, key: int) -> Option[&Item]
+
+        impl Finder for Table
+            find_in(self, key: int) -> Option[&Item] = self.find(key)
+
+        look(f: &Finder, k: int) -> int = f.find_in(k).map((it) -> it.value).unwrap_or(0)
+
+        val t = filled()
+
+        print(look(t, 2))
+        """
+
+    bze_prints(text, "20\ndrop 3\ndrop 2\ndrop 1\n")
+
+// -- what ends the stretch: the count stays, and the value is the one answered -----------------------
+
+@test("a write that frees the answer's item between the call and the last use keeps the count")
+bze_write_between()
+    val text = bze_table() + raw"""
+        read(t: &Table) -> int
+            val it = t.find(2)
+
+            t.items.clear()
+            print("cleared")
+            it.unwrap().value
+
+        print(read(filled()))
+        """
+
+    if bze_ready()
+        val read = bze_body(bze_ir(text), "read$$sysl")
+
+        assert(read.contains("@Table.find-zero("), read)
+        assert(read.contains("@arc.copy.sysl$Option"), read)
+    end if
+
+    bze_prints(text, "drop 1\ndrop 3\ncleared\ndrop 2\n20\n")
+end bze_write_between
+
+@test("a closure capturing the answer keeps it past a write that would have freed it")
+bze_closure_captures()
+    bze_prints(bze_table() + raw"""
+        read(t: &Table) -> int
+            val it = t.find(1).unwrap()
+            val f = () -> it.value
+
+            t.items.clear()
+            f()
+
+        print(read(filled()))
+        """, "drop 2\ndrop 3\ndrop 1\n10\n")
+
+@test("an answer stored, and one returned, keep their counts past the table")
+bze_stored_and_returned()
+    bze_prints(bze_table() + raw"""
+        struct Box
+            it: Option[&Item]
+
+        take(t: &Table) -> Option[&Item] = t.find(3)
+
+        val b: &Box = Box(None)
+        var got = take(filled())
+
+        b.it = filled().find(1)
+        print("tables gone")
+        print(got.unwrap().value + b.it.unwrap().value)
+        """, "drop 2\ndrop 1\ndrop 3\ndrop 2\ntables gone\n40\ndrop 3\ndrop 1\n")
+
+@test("a temporary receiver's answer outlives the receiver")
+bze_temporary_receiver()
+    bze_prints(bze_table() + raw"""
+        val it = filled().find(2).unwrap()
+
+        print("table gone")
+        print(it.value)
+        """, "drop 3\ndrop 1\ntable gone\n20\ndrop 2\n")
+
+// -- what is answered ------------------------------------------------------------------------------
+
+@test("a struct and a tuple of references, and an element through the index operator, are +0 too")
+bze_shapes()
+    val text = bze_table() + raw"""
+        struct Pair
+            a: &Item
+            b: &Item
+
+        struct Two
+            a: &Item
+            b: &Item
+
+            pair(self) -> Pair = Pair(self.a, self.b)
+            both(self) -> (&Item, &Item) = (self.b, self.a)
+
+        struct Row
+            items: Buf[&Item]
+
+            at(self, i: int) -> &Item = self.items[usize(i)]
+
+        sum(w: &Two, r: &Row) -> int
+            val p = w.pair()
+            val (x, y) = w.both()
+
+            p.a.value + p.b.value + x.value * y.value + r.at(0).value
+
+        val w: &Two = Two(Item(1, 2), Item(2, 3))
+        val r: &Row = Row(buf())
+
+        r.items.push(Item(3, 100))
+        print(sum(w, r))
+        """
+
+    if bze_ready()
+        val out = bze_ir(text)
+        val sum = bze_body(out, "sum$$sysl")
+
+        assert(sum.contains("@Two.pair-zero("), sum)
+        assert(sum.contains("@Two.both-zero("), sum)
+        assert(sum.contains("@Row.at-zero("), sum)
+        assert(!bze_counts(sum), sum)
+    end if
+
+    bze_prints(text, "111\ndrop 3\ndrop 2\ndrop 1\n")
+end bze_shapes
+
+@test("an index past the end still stops the program through the +0 entry")
+bze_index_past_end()
+    if !bze_ready() then return
+
+    val text = bze_table() + raw"""
+        struct Row
+            items: Buf[&Item]
+
+            at(self, i: int) -> &Item = self.items[usize(i)]
+
+        val r: &Row = Row(buf())
+
+        r.items.push(Item(1, 10))
+        print(r.at(0).value)
+        print(r.at(3).value)
+        """
+
+    for level in ["0", "2"]
+        val run = bze_run_at(text, level)
+
+        assert(!run.ok, s"-O$level ran to the end: ${run.out}")
+        assert(run.out.starts_with("10\n"), s"-O$level: ${run.out}")
+        assert((run.out + run.err).contains("out of bounds"), s"-O$level: ${run.out}${run.err}")
+end bze_index_past_end
+
+@test("a generic answers +0 for the instantiation that holds a reference, and not for one that does not")
+bze_generic()
+    val text = bze_table() + raw"""
+        struct Slot[T]
+            v: T
+
+            get(self) -> Option[T] = Some(self.v)
+
+        read(s: &Slot[&Item], n: &Slot[int]) -> int = s.get().unwrap().value + n.get().unwrap()
+
+        print(read(Slot(Item(4, 40)), Slot(2)))
+        """
+
+    if bze_ready()
+        val out = bze_ir(text)
+
+        assert(bze_defines(out, "Slot.get.ref.Item-zero"), out)
+        assert(!bze_defines(out, "Slot.get.int-zero"), out)
+    end if
+
+    bze_prints(text, "42\ndrop 4\n")
+end bze_generic
+
+@test("an owning method's +0 entry borrows what it is handed")
+bze_owning()
+    bze_prints(bze_table() + raw"""
+        struct Shelf
+            one: &Item
+
+            wrap(self) -> Option[&Item] = Some(self.one)
+
+        make(k: int) -> &Shelf = Shelf(Item(k, k * 10))
+
+        val a = make(6).wrap().unwrap()
+        val s = make(8)
+
+        print(a.value + s.wrap().unwrap().value)
+        """, "140\ndrop 8\ndrop 6\n")
+
+// -- the symbols -------------------------------------------------------------------------------------
+
+@test("an entry's suffix is one no function's own symbol can end in")
+bze_suffixes()
+    assert(is_zero_symbol("Table.find-zero"), "+0 entry")
+    assert(is_place_symbol("Node.quad-place"), "place entry")
+
+    // A function called `zero` or `place` in a module is not an entry.
+    assert(!is_zero_symbol("geo$zero"), "geo$zero")
+    assert(!is_place_symbol("geo$place"), "geo$place")
+end bze_suffixes
