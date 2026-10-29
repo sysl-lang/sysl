@@ -1,0 +1,532 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.{cstring, replace_all, Search}
+
+// A closure held in a local whose ADDRESS is handed to a call -- `install(&s)`, `s.keep_me()`, a slice
+// literal -- reaches the callee through a pointer or a view. What the callee does with the pointer is
+// the keeps summary's question; what it does with what it READS through it is `through_of`'s
+// (`keeps.sysl`). `install(p: *S) = kept.push(p.f)` keeps nothing of `p` and lets `p.f` out, so a
+// closure in `s` is boxed on the heap and, held by reference, by value; one whose callee only calls
+// or reads it (`call_it(&s)`, `run_all([f, g])`) stays in the frame.
+//
+// The matrix crosses the ways a callee lets a value read through its parameter out -- a push, a store
+// into module storage, a store into a heap object another parameter reaches, an answer, a `*self`
+// method, an element of a view, a callee chain, a pointer read out of the pointee, recursion, a call
+// through a trait object, a copy into a local of an outer block -- with the two ways a closure is
+// decided: its `&Fn` box (captures by value) and its captures by reference (a `var` captured, the same
+// cells). Each cell runs twice with different captures, so a box or a capture left in a dead frame
+// prints the second call's value, or garbage, for the first.
+//
+// Skipped cells, and why: a call through a function pointer asks the same summary of every function
+// taken at the type (`pointer_through`), as `pointer_keeps` is asked and tested in
+// `tests_kps_keeps.sysl`; `@no_alloc` and a board with no heap cannot build the escaping cells, which
+// allocate the closures they keep; separate compilation asks a `.syslib` callee the same questions as
+// the program's own.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private extern "setenv" fbp_c_setenv(name: *u8, value: *u8, overwrite: int) -> int
+private extern "unsetenv" fbp_c_unsetenv(name: *u8) -> int
+
+private struct FbpRun
+    out: string
+    err: string
+    hooks: usize
+end FbpRun
+
+// The program built and run: on the counted heap, or with `flags` handed to clang.
+private fbp_run(text: string, counted: bool, flags: string) -> FbpRun
+    val root = make_temp_dir("sysl-fbp").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", forms_imported(text)).unwrap()
+
+    val exe = s"$root/built"
+
+    if flags != ""
+        val n = cstring("SYSL_EXTRA_CFLAGS")
+        val v = cstring(flags)
+
+        fbp_c_setenv(n.ptr, v.ptr, 1)
+    end if
+
+    force_alloc_counting(counted)
+
+    val made = build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe))
+
+    force_alloc_counting(false)
+
+    if flags != ""
+        val n = cstring("SYSL_EXTRA_CFLAGS")
+
+        fbp_c_unsetenv(n.ptr)
+    end if
+
+    made match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return FbpRun(failure_text(why), "", 0)
+        Ok(_) -> ()
+
+    val hooks = capture("nm", ["-u", exe], "", [], true) match
+        Ok(o) -> o.text.count_of("__asan_report")
+        Err(_) -> 0
+
+    val ran = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    ran match
+        Err(_) -> FbpRun("could not be started", "", hooks)
+        Ok(o) -> FbpRun(o.text, o.err.unwrap_or(""), hooks)
+end fbp_run
+
+// The program printed `want` on the counted heap, and gave back everything it took.
+private fbp_prints(text: string, want: string)
+    if !enm_ready() then return
+
+    val got = fbp_run(text, true, "")
+
+    assert_eq(got.out, want)
+    assert_eq(got.err, "")
+end fbp_prints
+
+// The program printed `want` under AddressSanitizer, instrumented, and nothing was reported.
+private fbp_asan(text: string, want: string)
+    if !enm_ready() then return
+
+    val got = fbp_run(text, false, "-fsanitize=address -g")
+
+    assert(got.hooks > 0, s"not instrumented: ${got.out}")
+    assert_eq(got.out, want)
+    assert_eq(got.err, "")
+end fbp_asan
+
+// The LLVM text of a program, or its report.
+private fbp_ir(text: string) -> string
+    val root = make_temp_dir("sysl-fbp").unwrap()
+
+    write_text(s"$root/main.sysl", forms_imported(text)).unwrap()
+
+    val out = emit_llvm_text(s"$root/main.sysl", None) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> if made.report.is_empty() then made.text else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end fbp_ir
+
+// How many closure boxes the IR lays in a frame.
+private fbp_frame_boxes(ir: string) -> int
+    var n = 0
+
+    for line in lines_of(ir).view()
+        if line.contains("= alloca %arc.$closure") then n += 1
+
+    n
+end fbp_frame_boxes
+
+// What `--explain-escapes` reports for a program, one line each.
+private fbp_explained(text: string) -> string
+    if xvr_no_library() then return ""
+
+    val root = make_temp_dir("sysl-fbp").unwrap()
+
+    write_text(s"$root/main.sysl", forms_imported(text)).unwrap()
+
+    var lines: Buf[string] = buf()
+    var notes: Buf[string] = buf()
+    val sink = &lines
+    val noted = &notes
+    var args: Buf[string] = buf()
+
+    args.push("sysl")
+    args.push("emit-llvm")
+    args.push("--explain-escapes")
+    args.push(s"$root/main.sysl")
+
+    run_cli_noted(args.view(), (line) -> sink.push(line), (line) -> noted.push(line))
+    remove_dir_all(root).unwrap_or(())
+
+    var said = ""
+
+    for line in notes
+        said = said + line + "\n"
+
+    said
+end fbp_explained
+
+// -- the regression -------------------------------------------------------------------------------
+
+// `install` keeps nothing of `p`; it pushes the closure it reads through it. Before, the closure's box
+// was laid in `via_ptr`'s frame, and both kept closures printed the second call's capture.
+private const fbp_reduction: string = raw"""
+    import sysl.buf.{Buf, buf}
+
+    struct S
+        f: &Fn(int) -> unit
+
+    var kept: Buf[&Fn(int) -> unit] = buf()
+
+    install(p: *S)
+        kept.push(p.f)
+
+    via_ptr(tag: int)
+        var s = S((e) -> print(tag + e))
+        install(&s)
+
+    main()
+        via_ptr(10)
+        via_ptr(70)
+        for f in kept
+            f(5)
+        kept = buf()
+    """
+
+@test("a closure read through a pointer and pushed by the callee is boxed on the heap, and answers its own capture")
+fbp_pushed_through_a_pointer()
+    fbp_prints(fbp_reduction, "15\n75\n")
+
+@test("and under AddressSanitizer: instrumented, and nothing read outside a live frame")
+fbp_pushed_through_a_pointer_under_asan()
+    fbp_asan(fbp_reduction, "15\n75\n")
+
+@test("its IR has no frame box for the closure")
+fbp_pushed_through_a_pointer_has_no_frame_box()
+    if xvr_no_library() then return
+
+    assert_eq(fbp_frame_boxes(fbp_ir(fbp_reduction)), 0)
+
+@test("--explain-escapes says the callee lets what it reads through its parameter outlive the call")
+fbp_pushed_through_a_pointer_is_explained()
+    val said = fbp_explained(fbp_reduction)
+
+    if xvr_no_library() then return
+
+    assert(said.contains("is boxed on the heap, because it is handed to 'install' on line 13, which lets what it " +
+                         "reads through its parameter 'p' outlive the call (it is passed to 'push', which keeps it)"), said)
+
+// -- the matrix -----------------------------------------------------------------------------------
+
+// Every closure captures `CAP`: `tag`, a parameter, for the `&Fn` box alone, or `n`, a `var`, which the
+// closure may also hold by reference. Nothing writes `n` after the closure is made.
+private const fbp_matrix_template: string = raw"""
+    import sysl.buf.{Buf, buf}
+
+    struct S
+        f: &Fn(int) -> unit
+
+        keep_me(*self)
+            kept.push(self.f)
+
+    struct W
+        s: *S
+
+    struct H
+        one: Option[&Fn(int) -> unit]
+
+    trait Installer
+        put(self, p: *S)
+
+    struct I
+        n: int
+
+    impl Installer for I
+        put(self, p: *S) = kept.push(p.f)
+
+    var kept: Buf[&Fn(int) -> unit] = buf()
+    var ga: Option[&Fn(int) -> unit] = None
+    var gb: Option[&Fn(int) -> unit] = None
+
+    install(p: *S)
+        kept.push(p.f)
+
+    store_global(p: *S, first: bool)
+        if first then ga = Some(p.f) else gb = Some(p.f)
+
+    into_heap(h: &H, p: *S)
+        h.one = Some(p.f)
+
+    get(p: *S) -> &Fn(int) -> unit = p.f
+
+    install_first(ss: []S)
+        kept.push(ss[0].f)
+
+    inner(p: *S)
+        kept.push(p.f)
+
+    outer(p: *S) = inner(p)
+
+    deep(w: *W)
+        kept.push(w.s.f)
+
+    rec(p: *S, n: int)
+        if n == 0 then kept.push(p.f) else rec(p, n - 1)
+
+    copy_into(dst: *S, src: *S)
+        dst.f = src.f
+
+    via_ptr(tag: int)
+        var n = tag
+        var s = S((e) -> print(CAP + e))
+        install(&s)
+
+    via_global(tag: int, first: bool)
+        var n = tag
+        var s = S((e) -> print(CAP + e))
+        store_global(&s, first)
+
+    via_heap(tag: int) -> &H
+        var n = tag
+        val h: &H = H(None)
+        var s = S((e) -> print(CAP + e))
+        into_heap(h, &s)
+        h
+
+    via_get(tag: int) -> &Fn(int) -> unit
+        var n = tag
+        var s = S((e) -> print(CAP + e))
+        get(&s)
+
+    via_self(tag: int)
+        var n = tag
+        var s = S((e) -> print(CAP + e))
+        s.keep_me()
+
+    via_view(tag: int)
+        var n = tag
+        install_first([S((e) -> print(CAP + e))])
+
+    via_chain(tag: int)
+        var n = tag
+        var s = S((e) -> print(CAP + e))
+        outer(&s)
+
+    via_deep(tag: int)
+        var n = tag
+        var s = S((e) -> print(CAP + e))
+        var w = W(&s)
+        deep(&w)
+
+    via_rec(tag: int)
+        var n = tag
+        var s = S((e) -> print(CAP + e))
+        rec(&s, 3)
+
+    via_object(tag: int)
+        var n = tag
+        val i: &Installer = I(0)
+        var s = S((e) -> print(CAP + e))
+        i.put(&s)
+
+    in_a_loop(tag: int) -> &Fn(int) -> unit
+        var n = tag
+        var out = S((e) -> print(e))
+        for i in 0..<2
+            var s = S((e) -> print(CAP + e + 1))
+            copy_into(&out, &s)
+        out.f
+
+    main()
+        via_ptr(10)
+        via_ptr(70)
+        via_global(11, true)
+        via_global(71, false)
+        val h = via_heap(12)
+        val hj = via_heap(72)
+        h.one.unwrap()(5)
+        hj.one.unwrap()(5)
+        val g = via_get(13)
+        val gj = via_get(73)
+        g(5)
+        gj(5)
+        ga.unwrap()(5)
+        gb.unwrap()(5)
+        val l = in_a_loop(20)
+        val lj = in_a_loop(80)
+        l(5)
+        lj(5)
+        via_self(14)
+        via_self(74)
+        via_view(15)
+        via_view(75)
+        via_chain(16)
+        via_chain(76)
+        via_deep(17)
+        via_deep(77)
+        via_rec(18)
+        via_rec(78)
+        via_object(19)
+        via_object(79)
+        for f in kept
+            f(5)
+        kept = buf()
+        ga = None
+        gb = None
+    """
+
+private fbp_matrix(cap: string) -> string = replace_all(fbp_matrix_template, "CAP", cap)
+
+private const fbp_matrix_output: string =
+    "17\n77\n18\n78\n16\n76\n26\n86\n15\n75\n19\n79\n20\n80\n21\n81\n22\n82\n23\n83\n24\n84\n"
+
+@test("every way a callee lets a closure read through its parameter out prints its own capture, and frees all")
+fbp_matrix_runs_on_the_counted_heap()
+    fbp_prints(fbp_matrix("tag"), fbp_matrix_output)
+
+@test("and under AddressSanitizer: instrumented, and nothing read outside a live frame")
+fbp_matrix_runs_clean_under_asan()
+    fbp_asan(fbp_matrix("tag"), fbp_matrix_output)
+
+@test("no closure the matrix lets out is boxed in its frame")
+fbp_matrix_has_no_frame_box()
+    if xvr_no_library() then return
+
+    assert_eq(fbp_frame_boxes(fbp_ir(fbp_matrix("tag"))), 0)
+
+@test("each closure capturing a 'var' prints its own capture, so none holds it by reference past its frame")
+fbp_matrix_by_reference_runs_on_the_counted_heap()
+    fbp_prints(fbp_matrix("n"), fbp_matrix_output)
+
+@test("and under AddressSanitizer: instrumented, and nothing read outside a live frame")
+fbp_matrix_by_reference_runs_clean_under_asan()
+    fbp_asan(fbp_matrix("n"), fbp_matrix_output)
+
+@test("--explain-escapes names the callee and what it does with what it reads, for each kind of callee")
+fbp_matrix_is_explained()
+    val said = fbp_explained(fbp_matrix("tag"))
+
+    if xvr_no_library() then return
+
+    assert(said.contains("handed to 'store_global' on line 64, which lets what it reads through its parameter 'p' outlive the call (it is stored in 'ga')"), said)
+    assert(said.contains("handed to 'into_heap' on line 70, which lets what it reads through its parameter 'p' outlive the call (it is stored in 'h.one')"), said)
+    assert(said.contains("it is returned from 'via_get' on line 76"), said)
+    assert(said.contains("handed to 'keep_me' on line 81, which lets what it reads through its parameter 'self'"), said)
+    assert(said.contains("handed to 'install_first' on line 85, which lets what it reads through its parameter 'ss'"), said)
+    assert(said.contains("handed to 'outer' on line 90, which lets what it reads through its parameter 'p' outlive the call (it is passed to 'inner', which lets what it reads through it out)"), said)
+    assert(said.contains("handed to 'deep' on line 96, which lets what it reads through its parameter 'w'"), said)
+    assert(said.contains("handed to 'rec' on line 101, which lets what it reads through its parameter 'p'"), said)
+    assert(said.contains("handed to 'put' on line 107, which lets what it reads through its parameter 'p'"), said)
+    assert(said.contains("it is returned from 'in_a_loop' on line 115"), said)
+
+// -- C and an object with no trait to dispatch through --------------------------------------------
+
+// What C does with what it reads through a pointer is unknown, so a closure in a struct whose address
+// goes to an `extern` is on the heap. A pointer to bytes (`*u8`) reads numbers, so one handed to C as
+// bytes stays in the frame.
+private const fbp_foreign: string = raw"""
+    struct S
+        f: &Fn(int) -> unit
+
+    extern "fbp_c_take" fbp_take(p: *S)
+    extern "fbp_c_bytes" fbp_bytes(p: *u8)
+
+    to_c(tag: int)
+        var s = S((e) -> print(tag + e))
+        fbp_take(&s)
+
+    as_bytes(tag: int)
+        var s = S((e) -> print(tag + e))
+        fbp_bytes(ptr_cast(&s))
+        s.f(1)
+
+    main()
+        to_c(10)
+        as_bytes(20)
+    """
+
+@test("a closure whose holder's address goes to C is boxed on the heap; one handed to C as bytes is not")
+fbp_foreign_is_conservative()
+    if xvr_no_library() then return
+
+    val ir = fbp_ir(fbp_foreign)
+
+    assert(ir.contains("define"), ir)
+    assert_eq(fbp_frame_boxes(ir), 1)
+
+// -- what stays in the frame ----------------------------------------------------------------------
+
+// Callees that only call or read what they reach through a pointer or a view: directly, through a
+// `*self` method, a callee chain, a trait object, a slice of closures and a view of structs. Each
+// closure is boxed in its frame, and captured `var`s are held by reference.
+private const fbp_read_only_template: string = raw"""
+    struct S
+        f: &Fn(int) -> unit
+
+        run_me(*self) = self.f(1)
+
+    trait Runner
+        go(self, p: *S)
+
+    struct I
+        n: int
+
+    impl Runner for I
+        go(self, p: *S) = p.f(1)
+
+    call_it(p: *S) = p.f(1)
+
+    peek(p: *S)
+        val g = p.f
+        g(2)
+
+    run_all(fs: []&Fn(int) -> unit)
+        for f in fs
+            f(1)
+
+    run_view(ss: []S)
+        for s in ss
+            s.f(3)
+
+    through_chain(p: *S) = call_it(p)
+
+    read_only(tag: int)
+        var n = tag
+        var s = S((e) -> print(CAP + e))
+        call_it(&s)
+        peek(&s)
+        through_chain(&s)
+        s.run_me()
+
+    slices(tag: int)
+        var n = tag
+        run_all([(e) -> print(CAP + e), (e) -> print(CAP + e + 1)])
+        run_view([S((e) -> print(CAP + e + 2))])
+
+    object(tag: int)
+        var n = tag
+        val r: &Runner = I(0)
+        var s = S((e) -> print(CAP + e))
+        r.go(&s)
+
+    main()
+        read_only(10)
+        slices(20)
+        object(30)
+    """
+
+private fbp_read_only(cap: string) -> string = replace_all(fbp_read_only_template, "CAP", cap)
+
+@test("callees that only call or read what they reach through a pointer or a view print the same, and free all")
+fbp_read_only_runs()
+    fbp_prints(fbp_read_only("tag"), "11\n12\n11\n11\n21\n22\n25\n31\n")
+    fbp_prints(fbp_read_only("n"), "11\n12\n11\n11\n21\n22\n25\n31\n")
+
+@test("and every closure handed to them is boxed in its frame")
+fbp_read_only_stays_in_the_frame()
+    if xvr_no_library() then return
+
+    assert_eq(fbp_frame_boxes(fbp_ir(fbp_read_only("tag"))), 5)
+
+@test("and --explain-escapes puts none of them on the heap")
+fbp_read_only_is_not_explained()
+    val said = fbp_explained(fbp_read_only("n"))
+
+    if xvr_no_library() then return
+
+    assert(!said.contains("boxed on the heap"), said)
+    assert(!said.contains("by value"), said)

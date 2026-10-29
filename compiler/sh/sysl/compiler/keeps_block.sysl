@@ -368,16 +368,35 @@ private block_expr_event(bt: &BlockTrack, e: TExpr)
             for j in 0..<args.len()
                 for item in keeps_of(bt.cx, name, j).locs
                     kept_by_call(bt, args, j, item.loc, s"'${shown_name(bt.cx.an, name)}'")
+
+                // For a probe, what the callee copies out of a pointer or a view into a local.
+                if block_reads_through(bt, args.at(j))
+                    for item in through_of(bt.cx, name, j).locs
+                        kept_by_call(bt, args, j, item.loc, s"'${shown_name(bt.cx.an, name)}'")
+                end if
+            end for
         TVCall(recv, slot, args, _, _) ->
             val all = with_receiver(recv, args)
 
             for k in 0..<all.len()
                 for item in vcall_keeps(bt.cx, recv, slot, k)
                     kept_by_call(bt, all, k, item.1.loc, s"'${shown_name(bt.cx.an, item.0)}'")
+
+                if block_reads_through(bt, all.at(k))
+                    for item in vcall_through(bt.cx, recv, slot, k)
+                        kept_by_call(bt, all, k, item.1.loc, s"'${shown_name(bt.cx.an, item.0)}'")
+                end if
+            end for
         TCallPtr(callee, args, _, _) ->
             for j in 0..<args.len()
                 for item in pointer_keeps(bt.cx, callee, j)
                     kept_by_call(bt, args, j, item.1.loc, "the call")
+
+                if block_reads_through(bt, args.at(j))
+                    for item in pointer_through(bt.cx, callee, j)
+                        kept_by_call(bt, args, j, item.1.loc, "the call")
+                end if
+            end for
         _ -> if bt.probe && !bt.checking then probe_bind_patterns(bt, e)
 end block_expr_event
 
@@ -424,6 +443,9 @@ private probe_bind_roots(bt: &BlockTrack, name: string, subject: TExpr)
     for r in roots
         hold(bt, name, r)
 end probe_bind_roots
+
+// Whether a probe asks a call what it lets out of what it reads through an argument (`through_of`).
+private block_reads_through(bt: &BlockTrack, arg: TExpr) -> bool = bt.probe && asks_through(bt.cx, texpr_type(arg))
 
 private kept_by_call(bt: &BlockTrack, args: Buf[TExpr], j: usize, callee_loc: string, by: string)
     val arg = args.at(j)
