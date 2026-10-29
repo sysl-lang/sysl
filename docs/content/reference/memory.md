@@ -4817,6 +4817,99 @@ leak(out: **int)
 '&n' is the address of a local of 'leak', and it is stored in '*out', which outlives 'leak' — store the value itself, or storage that lasts
 ```
 
+### An address held inside what is handed over
+
+**A function may let out what it reads through a pointer as well as the pointer itself.** `keep`
+below keeps nothing of `h` — the struct's own address ends with the call — but it copies the address
+the struct *holds* into module storage. So the same rule is asked of what the argument points at: the
+address of a local stored in a struct, an array or a view whose address goes to such a callee is
+refused, whether the callee stores what it read, pushes it into a buffer, puts it in a heap object,
+hands it to another callee that does, or answers with it:
+
+```sysl
+var last: *int = null
+
+struct Holder
+    p: *int
+
+keep(h: *Holder)
+    last = h.p
+
+run()
+    var n = 5
+    var h = Holder(&n)
+    keep(&h)
+```
+
+```error
+'keep' lets what it reads through its parameter 'h' outlive the call (it is stored in 'last'), and what is read through '&h' holds the address of a local of 'run'
+```
+
+The question is about the one step from the pointer into what it points at, since that is where the
+addresses the frame's storage holds are read. A callee that only reads through it, copies out a
+number rather than an address, or lets out only what it reads *through* the address the struct
+holds — a step further, which is not this frame's storage — stays accepted:
+
+```sysl
+struct Holder
+    p: *int
+    n: int
+
+total(h: *Holder) -> int = *h.p + h.n
+
+run() -> int
+    var n = 5
+    var h = Holder(&n, 2)
+    total(&h)
+
+print(run())
+```
+
+```output
+7
+```
+
+**How the address got there does not matter.** One copied out of a field into a local, read through a
+pointer, chosen by a branch, stored after the struct was made, or answered by another call is
+followed into whatever is handed over, at whatever depth it ends up — an address two steps in is
+asked of what the callee lets out of what it reads two steps through its parameter. Here `hs` is
+`&h`, read out of `w0`, and `&n` sits two steps through `&w`:
+
+```sysl
+var last: *int = null
+
+struct Holder
+    p: *int
+
+struct Wrap
+    h: *Holder
+
+keep_deep(w: *Wrap)
+    last = w.h.p
+
+run()
+    var n = 5
+    var h = Holder(&n)
+    var w0 = Wrap(&h)
+    val hs = w0.h
+    var w = Wrap(hs)
+    keep_deep(&w)
+```
+
+```error
+'keep_deep' lets what it reads through its parameter 'w' outlive the call (it is stored in 'last'), and what is read through '&w' holds the address of a local of 'run'
+```
+
+The callee is followed the same way: a pointer it copies out of its parameter into a local, gets back
+from another call, or hands on by the address of a local holding it is still read through as the
+parameter is. Each step is told apart up to eight steps in; past that, a callee is asked what it lets
+out of anything it reads through the pointer, which cannot tell the steps apart, so it is refused if it
+lets out anything read that deep — conservatively — and accepted if it only reads.
+
+As with the pointer itself, a call with no body in sight borrows what it reads for the call: an
+`extern` lets nothing out unless its `@keeps` names the parameter, and neither does a call through an
+object of no known trait or through a function pointer C may call.
+
 ### A block's local lives as long as its block
 
 **A local is good for as long as the block that declares it, not as long as the frame.** A loop body's
