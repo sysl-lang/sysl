@@ -536,7 +536,9 @@ private gen_field(e: *Emit, x: TExpr, receiver: TExpr, index: int, ty: Type) -> 
         return r
     end if
 
-    if e.layout.indirect(rty) && has_address(receiver)
+    // So is a field of a parameter read where its caller lent it (`reads_in_place`): the storage is
+    // already there, and loading the whole value to lift one field out is the copy the lending saved.
+    if (e.layout.indirect(rty) || in_lent_storage(e, receiver)) && has_address(receiver)
         val p = address(e, x)
         val r = fresh_reg(e)
 
@@ -549,6 +551,15 @@ private gen_field(e: *Emit, x: TExpr, receiver: TExpr, index: int, ty: Type) -> 
     emit(e, InExtract(r, lty(e, rty), v, index_list(field_index_of(e, rty, index))))
     r
 end gen_field
+
+// Whether a place lies inside a parameter this body reads where its caller put it: the parameter
+// itself, or a field of one held by value.
+private in_lent_storage(e: *Emit, place: TExpr) -> bool = *place.kind match
+    TLoad(name, _) -> e.in_place.has(e.self_name + "\n" + name)
+    TField(receiver, _, _) -> underlying(texpr_type(receiver)) match
+        Struct(_) -> in_lent_storage(e, receiver)
+        _ -> false
+    _ -> false
 
 private container_read(e: *Emit, receiver: TExpr, rty: Type, ct: LType, acc: IrAccess,
                        at_address: bool) -> Val
@@ -1574,9 +1585,13 @@ staged_args(e: *Emit, args: Buf[TExpr], out: *Buf[IrArg], callee: string) -> Buf
     for i in 0..<args.len()
         val a = args.at(i)
         val aty = texpr_type(a)
-        val v = guaranteed_arg(e, a, if quiet_after(args, i) then callee else "", written)
 
-        if e.layout.indirect(aty)
+        // A parameter the callee's body is lent by address (`read_by_address`) crosses as a large
+        // one does, under the same promise; `callee` is a direct call's, which names that body.
+        val lent = callee != "" && e.lent_params.has(owned_key(callee, i))
+        val v = guaranteed_arg(e, a, if quiet_after(args, i) then callee else "", written, lent)
+
+        if e.layout.indirect(aty) || lent
             out.push(ir_arg(LPtr, v))
             staged.push((StagedSlot, v))
         else if zero_sized(aty) then staged.push((StagedNothing, VNothing))
@@ -1607,14 +1622,20 @@ end arg_value
 // place a call is free to change while the callee is still reading it, so it is staged into a slot
 // of this frame's first: the snapshot `self` promises, with a count taken for what it refers to and
 // given back, at its address, with the scope.
-indirect_arg(e: *Emit, a: TExpr, still: bool) -> Val
+//
+// **A snapshot of a value lent below the indirect boundary (`read_by_address`) is a temporary**, given
+// back with the statement's others exactly as the copy it replaces was: whether a parameter crosses in
+// registers or by address must not move a destructor.
+indirect_arg(e: *Emit, a: TExpr, still: bool, lent: bool = false) -> Val
     if still then return address(e, a)
 
     val ty = texpr_type(a)
     val slot = alloca(e, fresh_reg(e), lty(e, ty))
 
     gen_into(e, slot, a)
-    own_at(e, slot, ty)
+
+    if lent then own_temp_at(e, slot, ty) else own_at(e, slot, ty)
+
     slot
 end indirect_arg
 
@@ -1656,13 +1677,13 @@ end changes_nothing
 //
 // A local a later argument assigns is held by neither: the write lands between this argument and the
 // call (`written`).
-private guaranteed_arg(e: *Emit, a: TExpr, callee: string, written: Set[string]) -> Val
+private guaranteed_arg(e: *Emit, a: TExpr, callee: string, written: Set[string], lent: bool = false) -> Val
     val ty = texpr_type(a)
-    val big = e.layout.indirect(ty)
+    val big = e.layout.indirect(ty) || lent
     val still = held_unless(e, a, written) || (big || contains_counted(ty)) && lends_in_place(e, callee, ty)
     val guarantee = contains_counted(ty) && !still
 
-    if big then return indirect_arg(e, a, still)
+    if big then return indirect_arg(e, a, still, lent && !e.layout.indirect(ty))
 
     val v = gen_expr(e, a)
 
