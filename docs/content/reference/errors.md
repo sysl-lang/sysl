@@ -792,16 +792,42 @@ before the program stops. So `defer` is for releasing a resource, not for restor
 | a violated `within` range or `where` predicate, at a produce site | below |
 | `T::Succ` past `T::Last`, `T::Pred` below `T::First` | below |
 | overflow of `+`, `-`, `*` where an operand came through a ranged type | below |
+| in a **debug build**, overflow of a plain `+`, `-`, `*`, a unary `-`, or a written integer conversion | `i8(200)`, `x * 2` past the width |
 
-**Integer overflow is otherwise not a trap source**, which is worth saying because Rust traps on it
-in a debug build. Plain arithmetic [wraps at the declared width](/reference/types/), so
-overflow is defined behaviour rather than a broken invariant and there is nothing for a trap to
-report. The last row of the table is the narrow exception, and it belongs to constrained types rather
-than to arithmetic.
+**A build is debug or release, and the one difference is integer overflow.** `sysl test` and `sysl
+run` build in debug; `sysl build` and every other command build in release; `--debug` and
+`--release` say otherwise for any of them ([the command line](/getting-started/cli/#debug-and-release)).
+In a debug build an overflow of a plain operator is a bug, and it stops the program with a report. In
+a release build the same operation [wraps at the declared width](/reference/types/#arithmetic-wraps),
+which is defined behaviour — never undefined, at any optimization level. The mode is not the
+optimization level: a debug build may be optimized, and a release build may be built at `-O0`.
 
-**No build option removes any of these.** There is no `--no-contracts`, no bounds-check stripping, no
-`NDEBUG`. A check that is in the language is in every build, because a switch that removed one would
-make a program's meaning depend on how it was compiled.
+```sysl
+main()
+    var level: u8 = 250
+
+    print(level +% 10)
+    level += 10
+    print(level)
+```
+
+```output trap
+4
+```
+
+`+%` says the wrap in its spelling, so it wraps in every build; the plain `+=` is checked, and the run
+above — the site runs its examples as `sysl run` does, in debug — stops with `integer overflow: byte
++= byte (main.sysl:5:5)` on standard error. Built with `sysl build` it prints `4` twice. Where the wrap
+is the point, `+%` `-%` `*%` say so; where the answer should stop at the end of the range, `+|` `-|`
+`*|` ([wrapping and saturating operators](/reference/expressions/#wrapping-and-saturating-operators)).
+
+**No build option removes any other check, and this is the one stated exception.** There is no
+`--no-contracts`, no bounds-check stripping, no `NDEBUG`: bounds checks, contracts, invariants and a
+ranged type's checks — including the ranged-type overflow row above — are in every build, because a
+switch that removed one would make a program's meaning depend on how it was compiled. Overflow of a
+plain operator is the exception because both of its meanings are defined: a release build gives the
+two's-complement answer, and a debug build refuses to give one. A program whose output differs
+between the two has a bug a debug run reports.
 
 **A trap while a constant is being evaluated is a compile error.** A
 [`const` function](/reference/declarations/#a-const-function-runs-while-compiling) called where a
@@ -838,7 +864,7 @@ you debug one:
 
 | stopped by | what you see | exit status |
 |---|---|---|
-| a **bounds check** — an index, a range, a substring cut inside a character, an index past a container's count | everything the program printed before it, and one line on stderr saying what failed and where | the platform's signal status for a trap instruction |
+| a **bounds check** — an index, a range, a substring cut inside a character, an index past a container's count — or an **integer overflow** check | everything the program printed before it, and one line on stderr saying what failed and where | the platform's signal status for a trap instruction |
 | any other **compiler-inserted check** — a cast, a constrained range, a contract — or `trap()` | everything the program printed before it, and nothing more | the same |
 | a **library forcing member** — `unwrap`, `expect` | `panic: <message> (file:line:column)` on stdout, naming the line that called it, after everything the program printed before it | 1 |
 
@@ -891,7 +917,11 @@ The last is [`x.(c)`](/reference/reflection/) reading the payload of a variant t
 hold; it goes through the same function, which receives the two names as NUL-terminated strings. So
 does [`T::Make(p)`](/reference/reflection/#building-a-value-a-field-at-a-time) made from a partial
 value with a field still `None`: `'P' was made from a partial value whose field 'P.y' is None
-(main.sysl:8:8)`.
+(main.sysl:8:8)`. So does an integer overflow, naming the operation and its types — `integer
+overflow: int * int (main.sysl:3:13)`, `integer overflow: -i8`, `integer overflow: byte(int)`; inside
+a [`@track_caller`](/reference/attributes/#track-caller-a-function-that-reports-its-caller-s-line)
+function it names the caller's line, as a bounds check there does. On a freestanding target the
+report needs no allocator and no formatter: the text is a constant, and the trap follows.
 
 **The standard containers report through it too.** An index past a `Buf`'s, `Frozen`'s, `Deque`'s or
 `Ring`'s count — by subscript, `at`, `set` or `remove` — is reported as an array's index is and then

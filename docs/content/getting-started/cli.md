@@ -1205,6 +1205,7 @@ grammars.
 | `--include-path <name>=<dir>` | the same, and it answers the header requirement a package declared under that name |
 | `-D NAME` or `-D NAME=value` | a macro the C beside a module is compiled with; may be given more than once |
 | `-O <level>` | the optimization level handed to clang |
+| `--debug`, `--release` | the [build mode](#debug-and-release): whether integer overflow of a plain operator stops the program or wraps |
 | `--lto <mode>` | optimize across every object at the link: `thin` or `full` |
 | `--link <how>` | link `pkg_config` libraries from their static archives: `static`, `dynamic`, or a comma-separated list of their names |
 | `--profile-generate <dir>` | build an instrumented program that writes its counters into this directory |
@@ -1239,6 +1240,35 @@ The standard-module flags and `-O` are covered in
 [`lto` manifest key](/reference/packages/#link-time-optimization), `--link` of the
 [`link` key](/reference/packages/#linking-a-library-statically), and the two profile flags are the
 first and last steps of the workflow below.
+
+### Debug and release
+
+**Every build is debug or release, and the mode decides one thing: what a plain integer `+`, `-`,
+`*`, a unary `-` and a written integer conversion such as `u8(n)` do when the answer does not fit the
+type.** In a debug build they stop the program with a report naming the operation, its types and the
+line — `integer overflow: int * int (main.sysl:3:13)`. In a release build they wrap at the declared
+width, which is defined behaviour.
+
+| command | builds in |
+|---|---|
+| `sysl run`, `sysl test` | debug |
+| `sysl build`, `build-lib`, `build-c`, `emit-llvm` and the rest | release |
+
+`--debug` or `--release` on any of them says otherwise; the last one written wins. **The mode is not
+the optimization level**: `sysl run -O2` is an optimized debug build and `sysl build -O0 --release`
+an unoptimized release one. Nothing else differs between them — bounds checks, contracts, invariants
+and a ranged type's checks are in every build ([traps](/reference/errors/#what-traps)) — and the
+operators that say their overflow, `+%` and `+|` and the rest, do the same in both.
+
+**A conversion of a constant is the bit pattern written down** and is the same in both modes:
+`u32(-1)` is `4294967295`, exactly as it is in a `const`. A `const` itself is worked out exactly by
+the compiler and refused if it does not fit its type, in every mode; the modes reach only what runs.
+
+**Each body keeps the mode it was compiled in.** The standard module's cached artifact is built once
+per mode, so a program and its standard library always agree. A `.syslib` made by `build-lib`
+records the mode in its metadata, and a debug program may link one built in release: the library's
+compiled functions wrap and the program's own code is checked. A generic function the program
+instantiates from it is compiled with the program, in the program's mode.
 
 ### Profile-guided builds
 

@@ -65,6 +65,7 @@ const BoundsWrongVariant: int = 12
 const BoundsNegative: int = 13
 const BoundsInsertPastLength: int = 14
 const BoundsFieldUnset: int = 15
+const BoundsOverflow: int = 16
 
 // Or-ed into the form where the value in `a` -- or `b` -- is a signed integer's, widened with its
 // sign, so the message prints `-1` rather than eighteen quintillion.
@@ -90,7 +91,8 @@ private val BoundsForms: []const (string, string) = [
     ("variant '%s' was asked for, and the value is '%s'", "AB"),
     ("index %s is negative", "a"),
     ("insertion index %s is past length %s", "an"),
-    ("'%s' was made from a partial value whose field '%s' is None", "AB")]
+    ("'%s' was made from a partial value whose field '%s' is None", "AB"),
+    ("integer overflow: %s", "A")]
 
 // -- whether locations are laid down --------------------------------------------------------------
 
@@ -242,6 +244,20 @@ field_unset(e: *Emit, made: string, field: string, site: Span) -> Val =
 // What the default prints for it, which is also what an evaluation while compiling says.
 field_unset_text(made: string, field: string) -> string =
     s"'$made' was made from a partial value whose field '$field' is None"
+
+// **An integer operation that overflowed** -- a checked `+`, `-`, `*`, negation or written conversion
+// (`build_mode.sysl`, and a ranged type's arithmetic in every build) -- reports through the same
+// function, the operation and its types handed over as one text (`int + int`, `-i8`, `u8(int)`),
+// and stops the program. Traps unless `ok` holds.
+overflow_unless(e: *Emit, ok: Val, what: string, site: Span)
+    val ok_l = fresh_label(e, "overflow.ok")
+    val bad_l = fresh_label(e, "overflow.bad")
+
+    emit_term(e, InCondBr(ok, ok_l, bad_l))
+    emit_label(e, bad_l)
+    two_texts_fail(e, BoundsOverflow, c_text_of(e, what), VNull, site)
+    emit_label(e, ok_l)
+end overflow_unless
 
 // A failure whose two values are the addresses of NUL-terminated texts.
 private two_texts_fail(e: *Emit, kind: int, first: Val, second: Val, site: Span) -> Val

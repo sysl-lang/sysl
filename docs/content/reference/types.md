@@ -89,33 +89,39 @@ the literal 4294967295 does not fit int
 
 ### Arithmetic wraps
 
-Integer arithmetic wraps at the **declared** width, and this is defined behaviour rather than a
-checked error. `i5` wraps mod 2⁵ exactly as `i32` wraps mod 2³².
+**What a plain `+`, `-` or `*` does when the answer does not fit is the build mode's.** In a
+[release build](/getting-started/cli/#debug-and-release) — what `sysl build` makes — integer
+arithmetic wraps at the **declared** width, and this is defined behaviour, never undefined: `i5`
+wraps mod 2⁵ exactly as `i32` wraps mod 2³². In a debug build — what `sysl run` and `sysl test` make
+— the same overflow is a bug, and it stops the program with a report naming the operation, its types
+and the line. The same holds of a unary `-` (negating `i8`'s −128) and of a written conversion that
+cannot hold its value (`u8(n)` with `n` at 300). The mode is never the reason a program is right:
+code that means to wrap says so.
 
 ```sysl
 var small: byte = 250
 
-print(small + 10)
+print(small +% 10, small +| 10)
 ```
 
 ```output
-4
+4 255
 ```
-
-Overflow is therefore **not** a trap source. See [errors and traps](/reference/errors/) for what is.
 
 Where the wrap is the point — a hash, a checksum, a counter that rolls over — `+%`, `-%` and `*%` say
 so in the spelling, and where the edge of the range is the right answer instead, `+|`, `-|` and `*|`
-stop there: `small +| 10` is 255. Both families are defined in every build, at every width
-([wrapping and saturating operators](/reference/expressions/#wrapping-and-saturating-operators)).
+stop there. Both families mean the same in every build, at every width
+([wrapping and saturating operators](/reference/expressions/#wrapping-and-saturating-operators)). A
+plain `small + 10` prints `4` from a release build and stops a debug one with `integer overflow: byte
++ byte`. See [errors and traps](/reference/errors/#what-traps) for every trap source.
 
 ### Arithmetic over literals is exact
 
 An expression written out of integer literals alone — `65536 * 65536`, `(1 << 16) - 1`,
 `200 + 100` — is a constant the compiler computes with no width at all, and **the value it comes to
-must fit the type it is read at**, exactly as a single literal's must. Wrapping is what happens to a
-value held in a variable; a value nobody has stored yet has nothing to wrap in, so a constant that
-does not fit is a mistake in what was written.
+must fit the type it is read at**, exactly as a single literal's must. Overflow is something that
+happens to a value held in a variable; a value nobody has stored yet has nothing to overflow, so a
+constant that does not fit is a mistake in what was written — refused in every build mode alike.
 
 ```sysl
 val b: u32 = 65536 * 65536
@@ -185,18 +191,22 @@ val z = 1 + 10 / (3 - 3)
 a constant divided by zero
 ```
 
-**A name anywhere in the expression makes it ordinary arithmetic**, which wraps. A `const` is a
-name, so the arithmetic built on it is the arithmetic of its type:
+**A name anywhere in the expression makes it ordinary arithmetic**, which overflows as the build
+mode says. A `const` is a name, so the arithmetic built on it is the arithmetic of its type:
 
 ```sysl
 const Base: u8 = 200
 
+print(Base +% 100)
 print(Base + 100)
 ```
 
-```output
+```output trap
 44
 ```
+
+The first line wraps in every build; the second is plain `+` at `u8`, which a debug run — the one
+above — stops, and a release build prints as `44`.
 
 A literal read as a float is not an integer constant at all: `val r: f64 = 1 / 0` is IEEE 754's
 division, and is infinity.

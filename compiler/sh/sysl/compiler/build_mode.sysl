@@ -1,0 +1,83 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.Span
+import sysl.container.{Set, set}
+
+// **The two build modes**, which decide one thing: what a plain integer `+`, `-`, `*`, a unary `-`
+// and a written conversion `u8(x)` do where the answer does not fit the type.
+//
+// - **debug** -- each of them is checked, and an overflow stops the program through the same report a
+//   failed bounds check makes (`bounds_fail.sysl`'s `BoundsOverflow`): what was computed, at which
+//   types, and where.
+// - **release** -- each of them wraps: the two's-complement answer at the width, which is defined
+//   behaviour. Nothing is emitted that would make an overflow undefined -- no `nsw` or `nuw` except
+//   where the operands are proved not to overflow.
+//
+// **The mode is not the optimization level.** `sysl test` and `sysl run` build in debug and `sysl
+// build` (with every other command that lowers anything) in release; `--debug` and `--release` say
+// otherwise for any of them, and either is compiled at whatever `-O` the build asks for. Nothing else
+// depends on the mode: bounds checks, contracts, invariants and a ranged type's checks are in every
+// build, and the operators that answer overflow in their spelling -- `+%` and `+|` and the rest --
+// do the same in both.
+//
+// **A body is compiled in the mode of the build that compiled it.** The standard module's artifact
+// is built once per mode and keyed by it (`build_mode_key`), so a program and its standard library
+// agree. A `.syslib` records the mode it was built in (`syslib_metadata`); a program linking one built
+// in the other mode is linked, not refused, and the library's compiled bodies keep the mode they were
+// compiled in -- both behaviours are defined, so the mix is sound, and a generic the program
+// instantiates from it is the program's and follows the program's mode.
+
+// -- the mode --------------------------------------------------------------------------------------
+
+// Settled once per command by the driver, beside the bounds locations and for the same reason: every
+// body in the build, the standard module's artifact included, has to agree.
+private var debug_on: bool = false
+
+// What the command defaults to where neither flag was given: `run` and `test` are debug, everything
+// else release. Set by the CLI before each command's flags are read.
+private var command_debug: bool = false
+
+// Whether plain integer arithmetic and written conversions are checked in this build.
+overflow_checks() -> bool = debug_on
+
+use_overflow_checks(on: bool)
+    debug_on = on
+end use_overflow_checks
+
+// The default a command line starts from, said by the command's name.
+use_command_mode(command: string)
+    command_debug = command == "run" || command == "test"
+end use_command_mode
+
+// The mode a command builds in: the flag where one was given, the command's default otherwise.
+settled_debug(flag: Option[bool]) -> bool = flag.unwrap_or(command_debug)
+
+// The mode's name, as `--verbose` and a library's metadata say it.
+build_mode_name() -> string = if debug_on then "debug" else "release"
+
+// What the mode adds to an artifact's key: nothing for release, so the path of every artifact made
+// before the modes existed is unchanged for the builds that still make it.
+build_mode_key() -> string = if debug_on then "-dbg" else ""
+
+// -- which conversions were written -----------------------------------------------------------------
+
+// **Only a conversion the program wrote is checked**: the analyzer also makes conversions of its
+// own -- a value widened to its renderer, an address read as a word -- and those say nothing about
+// the program's intent. A written one is recorded by where it was written, the file and the span of
+// the call, which no conversion the analyzer makes shares with a lossy one.
+private var written: Set[string] = set()
+
+private written_key(file: string, at: Span) -> string = s"$file:${at.start}-${at.end}"
+
+// Records the conversion written at `at` in `file`.
+note_written_conversion(file: string, at: Span)
+    written.add(written_key(file, at))
+end note_written_conversion
+
+// Whether the conversion at `at` in `file` was written by the program.
+is_written_conversion(file: string, at: Span) -> bool = written.has(written_key(file, at))
+
+// Forgets every recorded conversion, as each command line starts.
+forget_written_conversions()
+    written = set()
+end forget_written_conversions

@@ -1,5 +1,6 @@
 module sh.sysl.compiler
 
+import sh.sysl.parsing.Span
 import sysl.buf.{Buf, buf}
 import sysl.math.bigint.{BigInt, add, cmp, from_int, mul, negate, pow, sub}
 
@@ -9,10 +10,10 @@ import sysl.math.bigint.{BigInt, add, cmp, from_int, mul, negate, pow, sub}
 // and computes as its base -- the subtype names a set of values, not a second way to add -- so
 // `a += e` and `a = a + e` reach the same instruction by different routes and must agree about it.
 //
-// The second is that overflow checking is **opt-in and narrow**. Arithmetic on raw integers is
-// defined to wrap, so the checked form is in play only when an operand came through a ranged
-// (`within`) type, and only then when the exact interval the operands allow can fall outside the
-// base width.
+// The second is that overflow checking is **the build mode's** (`build_mode.sysl`). A debug build
+// checks every plain integer `+`, `-` and `*`; a release build wraps them, which is defined. In every
+// build, the checked form is also in play where an operand came through a ranged (`within`) type and
+// the exact interval the operands allow can fall outside the base width.
 
 // The names LLVM reserves that a scalar lowering writes down, each read from `llvm_registry.sysl`.
 llvm_trap() -> string = llvm_trap_entry().base
@@ -428,9 +429,12 @@ base_max(bits: int, signed: bool) -> BigInt =
     if signed then sub(pow(from_int(2), usize(bits - 1)), from_int(1))
     else sub(pow(from_int(2), usize(bits)), from_int(1))
 
-// Integer `+`, `-`, `*` where the operands' declared ranges allow a result the base width cannot
-// hold, so a plain instruction would wrap before the range check at the produce site could see it.
-checked_arith(e: *Emit, op: string, bits: int, signed: bool, lv: Val, rv: Val) -> Val
+// Integer `+`, `-`, `*` where an overflow is to stop the program: every one in a debug build, and in
+// any build one whose operands' declared ranges allow a result the base width cannot hold, so a plain
+// instruction would wrap before the range check at the produce site could see it. `what` is the
+// operation as the report names it, and `site` where it was written.
+checked_arith(e: *Emit, op: string, bits: int, signed: bool, lv: Val, rv: Val, what: string,
+              site: Span) -> Val
     val name = op match
         "+" -> "add"
         "-" -> "sub"
@@ -472,9 +476,74 @@ checked_arith(e: *Emit, op: string, bits: int, signed: bool, lv: Val, rv: Val) -
     val ok = fresh_reg(e)
 
     emit(e, InBin(ok, OpXor, l_i1(), ovf, VBool(true)))
-    trap_unless(e, ok, "overflow")
+    overflow_unless(e, ok, what, site)
     v
 end checked_arith
+
+// Whether a debug build checks this `+`, `-` or `*`: a plain one at a scalar integer type. A register
+// of lanes wraps lane by lane in every build, as the machine's own vector instructions do.
+plain_checked(op: string, ty: Type) -> bool
+    if !overflow_checks() || (op != "+" && op != "-" && op != "*") then return false
+
+    underlying(ty) match
+        Integer(_, _, _) -> true
+        _ -> false
+end plain_checked
+
+// The report's name for an operation over two operands: `int + int`.
+arith_text(op: string, lt: Type, rt: Type) -> string = s"${type_show(lt)} $op ${type_show(rt)}"
+
+// A written integer conversion in a debug build: the value converted, and a stop where the target
+// cannot hold it. Only a conversion that can lose a value -- narrowing, or changing the sign -- is
+// checked; the check is that converting back gives the value that went in, with the sign read
+// where it changes.
+checked_narrow(e: *Emit, from_bits: int, from_signed: bool, to_bits: int, to_signed: bool, v: Val,
+               what: string, site: Span) -> Val
+    val out = convert_int(e, from_bits, from_signed, to_bits, v)
+    val back = convert_int(e, to_bits, to_signed, from_bits, out)
+    val same = fresh_reg(e)
+
+    emit(e, InIntCmp(same, IEq, LInt(from_bits), back, v))
+
+    // A conversion between widths of one size that changes the sign keeps every bit, so the round
+    // trip always agrees: what can be wrong is the sign. A value the target reads as negative where
+    // the source did not, or the other way round, is the overflow.
+    var ok = same
+
+    if from_signed != to_signed
+        val src_neg = fresh_reg(e)
+        val dst_neg = fresh_reg(e)
+        val agree = fresh_reg(e)
+
+        emit(e, InIntCmp(src_neg, ISlt, LInt(from_bits), v, VInt(from_int(0))))
+        emit(e, InIntCmp(dst_neg, ISlt, LInt(to_bits), out, VInt(from_int(0))))
+
+        val src_says = if from_signed then src_neg else VBool(false)
+        val dst_says = if to_signed then dst_neg else VBool(false)
+
+        emit(e, InIntCmp(agree, IEq, l_i1(), src_says, dst_says))
+
+        val both = fresh_reg(e)
+
+        emit(e, InBin(both, OpAnd, l_i1(), same, agree))
+        ok = both
+    end if
+
+    overflow_unless(e, ok, what, site)
+    out
+end checked_narrow
+
+// Whether a conversion from one integer type to another can lose a value: the target is narrower
+// than the source holds, or the sign changes and the target cannot hold every value of the source.
+lossy_int(from_bits: int, from_signed: bool, to_bits: int, to_signed: bool) -> bool
+    if from_signed == to_signed then return to_bits < from_bits
+
+    // Unsigned into signed holds every value only where the target has a bit more; signed into
+    // unsigned never does, since the negatives have nowhere to go.
+    if !from_signed then return to_bits <= from_bits
+
+    true
+end lossy_int
 
 // A saturating `+|`, `-|` or `*|` at an integer width. A sum or a difference is LLVM's own saturating
 // intrinsic -- one `QADD` or `UQADD` where the machine has it, an inline expansion at any other width.

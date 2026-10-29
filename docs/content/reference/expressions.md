@@ -301,8 +301,12 @@ Unary `-` needs a type with a sign, so it applies to the signed integers and the
 unsigned value is written as the subtraction it actually is. Unary `~` is defined on every integer
 type, signed or not.
 
-Integer arithmetic **wraps** at the declared width; see [types](/reference/types/). Integer division
-by zero traps. Arithmetic written out of literals alone is the exception to both: it is computed
+Integer overflow of a plain `+`, `-`, `*` or unary `-` is the **build mode's**: a release build
+wraps at the declared width, which is defined, and a debug build — `sysl run` and `sysl test` — stops
+the program with `integer overflow: int + int (main.sysl:4:9)`; see
+[types](/reference/types/#arithmetic-wraps) and [debug and
+release](/getting-started/cli/#debug-and-release). A compound assignment (`+=`, `*=`) and `++`/`--`
+are the same operation and are checked the same way. Integer division by zero traps in every build. Arithmetic written out of literals alone is the exception to both: it is computed
 exactly, a value that does not fit its type is refused, and so is a division by a literal zero —
 see [arithmetic over literals](/reference/types/#arithmetic-over-literals-is-exact).
 
@@ -529,8 +533,8 @@ print(b >> 8, b << 8, b >> 200)
 0 0 0
 ```
 
-This follows from integer arithmetic wrapping rather than trapping: plain arithmetic is total, and
-`within` is where checking is opted into, so a plain over-width shift has to be *defined* — a trap
+This follows from a shift being a bit operation in every build mode, rather than arithmetic that
+can overflow: `within` is where checking a shift is opted into, so a plain over-width shift has to be *defined* — a trap
 would break the contract of a type that promises none. **A `within`-typed
 left shift is the exception and does trap**, on its own terms and not the shift operator's; see
 [errors](/reference/errors/#the-operations-are-the-base-s-their-overflow-is-not).
@@ -1596,7 +1600,7 @@ conversions are implicit](#which-conversions-are-implicit)); writing it as a cal
 
 | from → to | written | behaviour |
 |---|---|---|
-| integer → integer | `u16(n)`, `byte(n)` | truncates or extends; sign-extends only when the *source* is signed |
+| integer → integer | `u16(n)`, `byte(n)` | extends; one that cannot hold the value truncates in a release build and [stops a debug one](#a-conversion-that-cannot-hold-its-value); sign-extends only when the *source* is signed |
 | integer → float | `real(n)`, `f32(n)` | rounds to nearest; signed and unsigned sources differ |
 | float → integer | `int(x)`, `u8(x)` | truncates toward zero, **saturating** — past either end it is that end; a NaN is `0` |
 | float → float | `f32(x)`, `real(x)` | rounds to nearest |
@@ -1610,12 +1614,35 @@ conversions are implicit](#which-conversions-are-implicit)); writing it as a cal
 var n = 300
 var c = 'A'
 
-print(byte(n), real(n), u32(c), int(3.9))
+print(byte(n & 0xff), real(n), u32(c), int(3.9))
 ```
 
 ```output
 44 300 65 3
 ```
+
+### A conversion that cannot hold its value
+
+**An integer conversion that can lose a value — to a narrower width, or across the sign — keeps the
+value where the target holds it.** Where the target does not, a release build keeps the low bits
+(`byte(300)` is 44, `u32` of −1 is 4294967295), which is defined, and a debug build stops the
+program, as an overflowing `+` does: `integer overflow: byte(int) (main.sysl:3:7)`. To keep the low
+bits in every build, say so with a mask, which makes the value fit — `byte(n & 0xff)` above.
+
+```sysl
+var n = 300
+
+print(i16(n))
+print(u8(n))
+```
+
+```output trap
+300
+```
+
+**A conversion of a constant is worked out by the compiler, the same in every build**: `u32(-1)` is
+the bit pattern written down, and is 4294967295 in a debug build as in a `const`. A widening, which
+holds every value, is never checked.
 
 **A float read as an integer saturates.** The value is truncated toward zero, and where that does not
 fit the width it comes to the width's nearest end: anything above `i32::Max` is `i32::Max`, anything
