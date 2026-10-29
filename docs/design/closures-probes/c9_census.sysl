@@ -1,0 +1,151 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.{Source, Span}
+import sysl.buf.{Buf, buf}
+import sysl.env.{get as env_var}
+import sysl.text.Search
+
+// The C9 census (`closures-c9-census.md`), kept as a record and not compiled: dropped into
+// `compiler/sh/sysl/compiler/`, with `c9_census(a, funcs)` as the last line of `closure_mode.sysl`'s
+// `decide_closure_modes` and `|| census_c9()` beside `explaining_drops()` in `driver.sysl`'s
+// `run_cache_key_for`, a stage 1 run under `SYSL_C9_CENSUS=1` says, on standard error, every
+// closure literal held by reference whose by-reference capture could make it read or write
+// something other than what a by-value capture did.
+
+census_c9() -> bool = env_var("SYSL_C9_CENSUS").unwrap_or("") == "1"
+
+private struct C9Site
+    base: string
+    at: Span
+    args: Buf[TExpr]
+end C9Site
+
+private struct C9Body
+    sites: Buf[C9Site]
+    writes: Buf[(string, Span)]
+    addressed: Buf[(string, Span)]
+    loops: Buf[(string, Span)]
+end C9Body
+
+c9_census(a: &Analysis, funcs: Buf[TFunc])
+    if !census_c9() then return
+
+    for f in funcs
+        f.src match
+            Some(src) -> c9_body(a, src.name, src, f)
+            None -> ()
+end c9_census
+
+private c9_root(e: TExpr) -> Option[string] = *e.kind match
+    TLoad(name, _) -> Some(name)
+    TField(r, _, _) -> c9_root(r)
+    TIndex(r, _, _) -> c9_root(r)
+    TSlice(r, _, _, _, _) -> c9_root(r)
+    TLane(r, _, _) -> c9_root(r)
+    _ -> None
+
+private c9_note(into: *Buf[(string, Span)], place: TExpr)
+    c9_root(place) match
+        Some(n) -> into.push((n, place.span))
+        None -> ()
+
+private c9_body(a: &Analysis, file: string, src: Source, f: TFunc)
+    val body: &C9Body = C9Body(buf(), buf(), buf(), buf())
+    val whole = TExpr(f.span, TBlockExpr(f.body))
+
+    walk_texpr(whole, TWalk(true, x -> c9_expr(a, body, x), w -> c9_note(&body.writes, w.place), s -> ()))
+
+    for site in body.sites
+        val written = a.closure_env_writes.get(site.base).unwrap_or(buf())
+
+        for i in 0..<site.args.len()
+            if !holds_by_reference(a, site.base, i) then continue
+
+            val name = c9_root(site.args.at(i)).unwrap_or("?")
+            var flags = ""
+
+            var writes_it = false
+
+            for w in written
+                if w == i then writes_it = true
+
+            if writes_it then flags += " writes"
+
+            var in_loop = false
+
+            for l in body.loops
+                if l.0 == site.base then in_loop = true
+
+            if in_loop then flags += " in-loop"
+
+            for ad in body.addressed
+                if ad.0 == name
+                    flags += s" addressed@${src.locate(ad.1.start).line}"
+                    break
+                end if
+            end for
+
+            for w in body.writes
+                if w.0 != name then continue
+
+                var later = w.1.start > site.at.end
+
+                for l in body.loops
+                    if l.0 == site.base && l.1.start <= w.1.start && w.1.end <= l.1.end then later = true
+
+                if later
+                    flags += s" written-after@${src.locate(w.1.start).line}"
+                    break
+                end if
+            end for
+
+            for other in body.sites
+                if other.base == site.base then continue
+
+                val ow = a.closure_env_writes.get(other.base).unwrap_or(buf())
+
+                for j in 0..<other.args.len()
+                    if c9_root(other.args.at(j)).unwrap_or("") != name then continue
+                    if !holds_by_reference(a, other.base, j) then continue
+
+                    var w2 = false
+
+                    for k in ow
+                        if k == j then w2 = true
+
+                    if w2 then flags += s" shared-with-writer@${src.locate(other.at.start).line}"
+                end for
+            end for
+
+            if flags == "" || flags == " in-loop" then continue
+
+            eprints(s"C9|$file:${src.locate(site.at.start).line}|${c9_shown(name)}|${flags.trim()}\n")
+        end for
+    end for
+end c9_body
+
+// A unique local name is the written one with a suffix; the written part is what a reader looks for.
+private c9_shown(name: string) -> string = name
+
+private c9_expr(a: &Analysis, body: &C9Body, x: TExpr)
+    *x.kind match
+        TStructNew(st, args) ->
+            if is_closure_literal(Struct(st)) && a.by_ref_closures.has(st.base)
+                body.sites.push(C9Site(st.base, x.span, args))
+        TStore(place, _, _, _) -> c9_note(&body.writes, place)
+        TUpdate(place, _, _, _, _, _, _) -> c9_note(&body.writes, place)
+        TIncDec(place, _, _, _, _) -> c9_note(&body.writes, place)
+        TVecStore(recv, _, _) -> c9_note(&body.writes, recv)
+        TAddrOf(place, _) -> c9_note(&body.addressed, place)
+        TWhile(_, _, _, _) -> c9_loop(body, x)
+        TDoWhile(_, _, _, _) -> c9_loop(body, x)
+        TLoop(_, _) -> c9_loop(body, x)
+        TFor(_, _, _, _, _, _, _, _) -> c9_loop(body, x)
+        TCFor(_, _, _, _, _, _) -> c9_loop(body, x)
+        TForEach(_, _, _, _, _, _) -> c9_loop(body, x)
+        _ -> ()
+
+private c9_loop(body: &C9Body, x: TExpr)
+    walk_texpr(x, expr_walk(true, y -> *y.kind match
+        TStructNew(st, _) -> if is_closure_literal(Struct(st)) then body.loops.push((st.base, x.span))
+        _ -> ()))
