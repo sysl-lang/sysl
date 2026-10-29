@@ -326,7 +326,12 @@ private call_read(cx: &Analyzer, span: Span, callee: Expr, args: Buf[Expr],
 
             val tr = unwrapped_associated(cx, receiver, member, args, expected) match
                 Some(read) -> read
-                None -> sum_receiver(cx, receiver, member, args, expected)
+                None ->
+                    // `val n: int = parse().unwrap()` -- a member that hands back what the wrapper
+                    // carries says what a generic receiver's success half is, as `?` does.
+                    if unwraps_payload(member) then want_payload(cx, expected)
+
+                    sum_receiver(cx, receiver, member, args, expected)
 
             if texpr_type(tr) == Unknown then return tr
 
@@ -4267,6 +4272,10 @@ end declared_result
 // **The enclosing function's return type must be able to carry the failure**, and the two channels
 // do not cross: an `Option`'s `?` cannot early-return from a `Result`-returning function.
 try_expr(cx: &Analyzer, span: Span, inner: Expr, expected: Option[Type]) -> TExpr
+    // What `?` yields is the success half, so what this position wants it as is what a generic
+    // operand's success half is solved from -- `val n: int = parse()?`, as rustc reads it.
+    want_payload(cx, expected)
+
     val t = type_expr_bare(cx, inner)
     val ty = texpr_type(t)
 
@@ -4507,6 +4516,10 @@ private carried(v: EnumVariant) -> Type =
 private base_of(t: Type) -> string = repr(t) match
     Enum(d) -> d.base
     _ -> ""
+
+// The members of `Option` and `Result` whose value is the success half itself.
+private unwraps_payload(member: string) -> bool =
+    member == "unwrap" || member == "expect" || member == "unwrap_or" || member == "unwrap_or_else"
 
 private option_key() -> string = module_qualify("sysl", "Option")
 private result_key() -> string = module_qualify("sysl", "Result")
