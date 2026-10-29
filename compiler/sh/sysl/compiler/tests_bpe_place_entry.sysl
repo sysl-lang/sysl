@@ -1,0 +1,633 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.text.{Search, str_builder}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// A function whose answer is a place of one of its parameters -- `quad(self) -> Kids =
+// self.kids.unwrap()` -- is given a place entry, `<symbol>$place`, that answers the address of the place
+// (`place_entry.sysl`). A caller holding the argument in storage it can name reads the value out of
+// that address, and the count the copy would have taken is dropped with its release wherever nothing
+// between the call and the last use could release or write it. Where something could -- a write, a
+// release, an `await`, a lock, a call into an unknown body -- the count stays, taken at the call, and
+// the program sees exactly the value the ordinary entry would have answered.
+//
+// Every program here is run at `-O0` and `-O2` on the counted heap, and must give back everything.
+
+private struct BpeRun
+    ok: bool
+    out: string
+    err: string
+
+private bpe_ready() -> bool
+    if std_root().is_err() || !clang_available()
+        print("skipped: the library or the toolchain is not on this machine")
+        return false
+    end if
+
+    true
+end bpe_ready
+
+private bpe_ir(text: string) -> string
+    val root = make_temp_dir("sysl-bpe").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    val out = emit_llvm_text(src, None) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> if made.report.is_empty() then made.text else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end bpe_ir
+
+// One function's emitted text, from its `define` to the brace that closes it: a root function's own
+// symbol, or one the module's storage turned into a method of its environment (`$env0.read`).
+private bpe_body(out: string, name: string) -> string
+    var b = str_builder()
+    var inside = false
+
+    for line in lines_of(out)
+        val named = mentions_as_written(line, name) || line.contains("@$env0." + name + "(")
+
+        if !inside && line.starts_with("define ") && named then inside = true
+
+        if inside
+            if line == "}" then return b.finish()
+
+            b.push(line)
+            b.push_char('\n')
+
+    if inside then b.finish() else s"no definition of '$name' in:\n$out"
+end bpe_body
+
+// Whether the module defines a function whose symbol holds `symbol`.
+private bpe_defines(out: string, symbol: string) -> bool
+    for line in lines_of(out)
+        if line.starts_with("define ") && line.contains("@" + symbol + "(") then return true
+
+    false
+end bpe_defines
+
+// Whether a body takes or gives back a count of anything.
+private bpe_counts(body: string) -> bool =
+    body.contains("@arc.copy.") || body.contains("@arc.dispose.") || body.contains("@arc.retain(") ||
+        body.contains("@arc.release(")
+
+// Built at `level` on the counted heap, and run.
+private bpe_run_at(text: string, level: string) -> BpeRun
+    val root = make_temp_dir("sysl-bpe").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    force_alloc_counting(true)
+
+    val built = build_native_program(s"$root/main.sysl", None, None, level, Some(s"$root/built"))
+
+    force_alloc_counting(false)
+
+    built match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return BpeRun(false, failure_text(why), "")
+        Ok(_) -> ()
+
+    val said = capture(s"$root/built", [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> BpeRun(false, "could not be started", "")
+        Ok(o) -> BpeRun(o.status.ok(), o.text, o.err.unwrap_or(""))
+end bpe_run_at
+
+// Printed exactly `expected` at both ends of the optimizer, exited cleanly, and gave everything back.
+private bpe_prints(text: string, expected: string)
+    if !bpe_ready() then return
+
+    for level in ["0", "2"]
+        val run = bpe_run_at(text, level)
+
+        assert(run.ok, s"-O$level: ${run.out}${run.err}")
+        assert_eq(run.out, expected)
+        assert(alloc_count_reported(run.err) == 0, s"-O$level: ${run.err}")
+end bpe_prints
+
+// Printed `printed` and was then ended by a panic saying `said`, at both ends of the optimizer. A
+// panic's report follows what the program printed on standard output; a failed check's goes to
+// standard error.
+private bpe_panics(text: string, printed: string, said: string)
+    if !bpe_ready() then return
+
+    for level in ["0", "2"]
+        val run = bpe_run_at(text, level)
+
+        assert(!run.ok, s"-O$level ran to the end: ${run.out}")
+        assert(run.out.starts_with(printed), s"-O$level: ${run.out}")
+        assert((run.out + run.err).contains(said), s"-O$level: ${run.out}${run.err}")
+end bpe_panics
+
+// The two kinds every program here is made of: a pair of counted references, and the record it sits in.
+private bpe_kinds() -> string = raw"""
+    struct Item
+        v: int
+
+    struct Pair
+        a: &Item
+        b: &Item
+
+    struct Node
+        level: int
+        kids: Pair
+
+        quad(self) -> Pair = self.kids
+
+    """
+
+// -- the motivating shape ---------------------------------------------------------------------------
+
+// HashLife's `quad`, through `Option.unwrap`: a place of a place, so the entry calls `unwrap`'s own.
+private bpe_hashlife() -> string = raw"""
+    struct Node
+        level: int
+        kids: Option[Kids]
+
+        quad(self) -> Kids = self.kids.unwrap()
+
+    struct Kids
+        nw: &Node
+        ne: &Node
+        sw: &Node
+        se: &Node
+
+    leaf() -> &Node = Node(0, None)
+
+    walk(n: &Node) -> int
+        if n.level == 0 then return 1
+
+        val q = n.quad()
+
+        walk(q.nw) + walk(q.ne) + walk(q.sw) + walk(q.se)
+
+    val l = leaf()
+    val top: &Node = Node(1, Some(Kids(l, l, l, l)))
+
+    print(walk(top))
+    """
+
+@test("a method answering a place of its receiver is read through its place entry, with no count taken")
+bpe_hashlife_takes_no_count()
+    if !bpe_ready() then return
+
+    val out = bpe_ir(bpe_hashlife())
+    val walk = bpe_body(out, "walk")
+
+    assert(walk.contains("call ptr @Node.quad$place(ptr"), walk)
+    assert(!bpe_counts(walk), walk)
+    assert(bpe_body(out, "Node.quad$place").contains("@sysl$Option.unwrap.Kids$place(ptr"), out)
+end bpe_hashlife_takes_no_count
+
+@test("and the walk still counts four leaves, giving everything back")
+bpe_hashlife_runs()
+    bpe_prints(bpe_hashlife(), "4\n")
+
+@test("two answers held across each other's place entries take no count either")
+bpe_two_answers_take_no_count()
+    if !bpe_ready() then return
+
+    val out = bpe_ir(raw"""
+        struct Item
+            v: int
+
+        struct Pair
+            a: &Item
+            b: &Item
+
+        struct Node
+            kids: Option[Pair]
+
+            quad(self) -> Pair = self.kids.unwrap()
+
+        both(n: &Node, m: &Node) -> int
+            val x = n.quad()
+            val y = m.quad()
+
+            x.a.v + y.b.v
+
+        val p = Pair(Item(3), Item(4))
+
+        print(both(Node(Some(p)), Node(Some(p))))
+        """)
+    val both = bpe_body(out, "both")
+
+    assert(both.contains("@Node.quad$place("), both)
+    assert(!bpe_counts(both), both)
+end bpe_two_answers_take_no_count
+
+// -- what ends the stretch: the count stays, and the old value is the one seen ------------------------
+
+@test("a write to the receiver between the call and the last use keeps the count, and the old value")
+bpe_write_between()
+    val text = bpe_kinds() + raw"""
+        reset(n: &Node)
+            n.kids = Pair(Item(9), Item(9))
+
+        read(n: &Node) -> int
+            val q = n.quad()
+
+            reset(n)
+            q.a.v + q.b.v
+
+        val top: &Node = Node(1, Pair(Item(3), Item(4)))
+
+        print(read(top))
+        print(top.kids.a.v)
+        """
+
+    if bpe_ready()
+        val read = bpe_body(bpe_ir(text), "read")
+
+        assert(read.contains("@Node.quad$place("), read)
+        assert(read.contains("@arc.copy.Pair("), read)
+    end if
+
+    bpe_prints(text, "7\n9\n")
+end bpe_write_between
+
+@test("a write in the same body keeps the count too")
+bpe_write_in_body()
+    bpe_prints(bpe_kinds() + raw"""
+        read(n: &Node) -> int
+            val q = n.quad()
+
+            n.kids = Pair(Item(9), Item(9))
+            q.a.v + n.kids.b.v
+
+        print(read(Node(1, Pair(Item(3), Item(4)))))
+        """, "12\n")
+
+@test("a release of the receiver itself between keeps what the answer holds alive")
+bpe_release_between()
+    bpe_prints(bpe_kinds() + raw"""
+        struct Holder
+            node: &Node
+
+        read(h: &Holder) -> int
+            val q = h.node.quad()
+
+            h.node = Node(2, Pair(Item(9), Item(9)))
+            q.a.v + q.b.v + h.node.level
+
+        print(read(Holder(Node(1, Pair(Item(3), Item(4))))))
+        """, "9\n")
+
+@test("an await between keeps the count, and the old value")
+bpe_await_between()
+    bpe_prints(bpe_kinds() + raw"""
+        async reset(n: &Node) -> int
+            n.kids = Pair(Item(9), Item(9))
+            0
+
+        async read(n: &Node) -> int
+            val q = n.quad()
+            val z = await reset(n)
+
+            q.a.v + z
+
+        print(block_on(read(Node(1, Pair(Item(3), Item(4))))))
+        """, "3\n")
+
+@test("a lock taken and given back between keeps the count")
+bpe_lock_between()
+    val text = bpe_kinds() + raw"""
+        import sysl.threads.Mutex
+
+        static var m: Mutex[int] = Mutex.new(1)
+
+        read(n: &Node) -> int
+            val q = n.quad()
+            val k = m.with((x) -> *x + 1)
+
+            q.a.v + k
+
+        print(read(Node(1, Pair(Item(3), Item(4)))))
+        """
+
+    if bpe_ready()
+        val read = bpe_body(bpe_ir(text), "read")
+
+        assert(read.contains("@Node.quad$place("), read)
+        assert(read.contains("@arc.copy.Pair("), read)
+    end if
+
+    bpe_prints(text, "5\n")
+end bpe_lock_between
+
+@test("a closure capturing the answer keeps the value it captured")
+bpe_closure_captures()
+    bpe_prints(bpe_kinds() + raw"""
+        read(n: &Node) -> int
+            val q = n.quad()
+            val f = () -> q.a.v
+
+            n.kids = Pair(Item(9), Item(9))
+            f()
+
+        print(read(Node(1, Pair(Item(3), Item(4)))))
+        """, "3\n")
+
+@test("an answer stored and returned keeps its count past the receiver's end")
+bpe_stored_and_returned()
+    bpe_prints(bpe_kinds() + raw"""
+        struct Box
+            p: Option[Pair]
+
+        take(n: &Node) -> Pair = n.quad()
+
+        keep(n: &Node, b: &Box)
+            b.p = Some(n.quad())
+
+        val b: &Box = Box(None)
+        var q = take(Node(1, Pair(Item(3), Item(4))))
+
+        keep(Node(2, Pair(Item(5), Item(6))), b)
+        print(q.a.v + b.p.unwrap().b.v)
+        """, "9\n")
+
+// -- which calls use the entry --------------------------------------------------------------------------
+
+@test("a temporary receiver is called through the ordinary entry")
+bpe_temporary_receiver()
+    val text = bpe_kinds() + raw"""
+        make(k: int) -> &Node = Node(k, Pair(Item(k), Item(k + 1)))
+
+        read(k: int) -> int = make(k).quad().b.v
+
+        print(read(3))
+        """
+
+    if bpe_ready()
+        val read = bpe_body(bpe_ir(text), "read")
+
+        assert(!read.contains("$place"), read)
+        assert(read.contains("@Node.quad"), read)
+    end if
+
+    bpe_prints(text, "4\n")
+end bpe_temporary_receiver
+
+@test("a receiver in module storage, a local, and a field of a parameter all use the entry")
+bpe_nameable_receivers()
+    val text = bpe_kinds() + raw"""
+        struct Holder
+            node: Node
+
+        val top: Node = Node(1, Pair(Item(3), Item(4)))
+
+        read(h: &Holder) -> int
+            val local = Node(2, Pair(Item(5), Item(6)))
+
+            top.quad().a.v + local.quad().b.v + h.node.quad().a.v
+
+        print(read(Holder(Node(3, Pair(Item(7), Item(8))))))
+        """
+
+    if bpe_ready()
+        val read = bpe_body(bpe_ir(text), "read")
+        var calls = 0
+
+        for line in lines_of(read)
+            if line.contains("@Node.quad$place(") then calls += 1
+
+        assert_eq(calls, 3)
+    end if
+
+    bpe_prints(text, "16\n")
+end bpe_nameable_receivers
+
+@test("a large answer is copied out of the place into the storage that receives it")
+bpe_large_answer()
+    val text = raw"""
+        struct Item
+            v: int
+
+        struct Wide
+            a: &Item
+            n: [16]i64
+
+        struct Node
+            w: Wide
+
+            wide(self) -> Wide = self.w
+
+        read(n: &Node) -> i64
+            val w = n.wide()
+
+            n.w.a = Item(9)
+            i64(w.a.v) + w.n[15] + i64(n.w.a.v)
+
+        print(read(Node(Wide(Item(3), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]))))
+        """
+
+    if bpe_ready()
+        val read = bpe_body(bpe_ir(text), "read")
+
+        assert(read.contains("@Node.wide$place("), read)
+        assert(read.contains("@llvm.memcpy"), read)
+    end if
+
+    bpe_prints(text, "28\n")
+end bpe_large_answer
+
+@test("an argument lent by address beside the place is handed to the entry as the ordinary entry takes it")
+bpe_lent_beside_the_place()
+    val text = bpe_kinds() + raw"""
+        struct Wide
+            i: int
+            j: int
+            k: int
+
+        struct Grid
+            cells: [3]Pair
+
+            pick(self, w: Wide) -> Pair = self.cells[w.i]
+
+        read(g: &Grid) -> int
+            val w = Wide(1, 0, 0)
+            val p = g.pick(w)
+
+            p.a.v + p.b.v
+
+        val p = Pair(Item(1), Item(2))
+
+        print(read(Grid([p, Pair(Item(3), Item(4)), p])))
+        """
+
+    if bpe_ready()
+        val out = bpe_ir(text)
+
+        assert(bpe_body(out, "read").contains("@Grid.pick$place("), out)
+        assert(bpe_defines(out, "Grid.pick$place"), out)
+    end if
+
+    bpe_prints(text, "7\n")
+end bpe_lent_beside_the_place
+
+// -- the forms a place entry answers ---------------------------------------------------------------------
+
+@test("a fixed array's element is a place, and an index past its end still stops the program")
+bpe_array_element()
+    val text = bpe_kinds() + raw"""
+        struct Grid
+            cells: [3]Pair
+
+            at(self, i: int) -> Pair = self.cells[i]
+
+        read(g: &Grid, i: int) -> int
+            val p = g.at(i)
+
+            p.a.v
+
+        val p = Pair(Item(1), Item(2))
+        val g: &Grid = Grid([p, Pair(Item(3), Item(4)), p])
+
+        print(read(g, 1))
+        print(read(g, 7))
+        """
+
+    if bpe_ready() then assert(bpe_body(bpe_ir(text), "read").contains("@Grid.at$place("), text)
+
+    bpe_panics(text, "3\n", "index 7 out of bounds for length 3 (main.sysl:17:")
+end bpe_array_element
+
+@test("a place through a reference the receiver holds is answered at the referent")
+bpe_through_a_reference()
+    val text = bpe_kinds() + raw"""
+        struct Holder
+            node: &Node
+
+            kids(self) -> Pair = self.node.kids
+
+        read(h: &Holder) -> int
+            val k = h.kids()
+
+            k.a.v * 10 + k.b.v
+
+        print(read(Holder(Node(1, Pair(Item(3), Item(4))))))
+        """
+
+    if bpe_ready() then assert(bpe_body(bpe_ir(text), "read").contains("@Holder.kids$place("), text)
+
+    bpe_prints(text, "34\n")
+end bpe_through_a_reference
+
+@test("a match payload whose other arm ends the program is a place")
+bpe_match_payload()
+    val text = bpe_kinds() + raw"""
+        enum Slot
+            Full(p: Pair)
+            Empty
+
+        struct Cell
+            s: Slot
+
+            pair(self) -> Pair = self.s match
+                Full(p) -> p
+                Empty -> panic("empty cell")
+
+        read(c: &Cell) -> int
+            val p = c.pair()
+
+            p.a.v + p.b.v
+
+        print(read(Cell(Full(Pair(Item(3), Item(4))))))
+        print(read(Cell(Empty)))
+        """
+
+    if bpe_ready() then assert(bpe_body(bpe_ir(text), "read").contains("@Cell.pair$place("), text)
+
+    bpe_panics(text, "7\n", "empty cell")
+end bpe_match_payload
+
+// -- what keeps the ordinary entry -------------------------------------------------------------------
+
+@test("a body that is not one place expression is given no place entry")
+bpe_not_one_place()
+    val text = bpe_kinds() + raw"""
+        struct Two
+            x: Pair
+            y: Pair
+
+            either(self, c: bool) -> Pair = if c then self.x else self.y
+
+            fresh(self) -> Pair = Pair(self.x.a, self.y.b)
+
+            stepped(self) -> Pair
+                val k = self.x
+                k
+
+        read(t: &Two) -> int
+            val e = t.either(true)
+            val f = t.fresh()
+            val s = t.stepped()
+
+            e.a.v + f.b.v + s.b.v
+
+        val t: &Two = Two(Pair(Item(1), Item(2)), Pair(Item(3), Item(4)))
+
+        print(read(t))
+        """
+
+    if bpe_ready()
+        val out = bpe_ir(text)
+
+        assert(!out.contains("$place"), out)
+    end if
+
+    bpe_prints(text, "7\n")
+end bpe_not_one_place
+
+// -- a tracked caller ------------------------------------------------------------------------------------
+
+private bpe_unwrapping() -> string = raw"""
+    struct Item
+        v: int
+
+    struct Pair
+        a: &Item
+        b: &Item
+
+    struct Node
+        kids: Option[Pair]
+
+        @track_caller
+        tracked(self) -> Pair = self.kids.unwrap()
+
+        plain(self) -> Pair = self.kids.unwrap()
+
+    val n: &Node = Node(None)
+
+    """
+
+@test("a tracked place function's None still names its caller's line")
+bpe_tracked_unwrap()
+    val text = bpe_unwrapping() + "print(n.tracked().a.v)\n"
+
+    if bpe_ready() then assert(bpe_ir(text).contains("@Node.tracked$place("), text)
+
+    bpe_panics(text, "", "unwrap of a None value (main.sysl:18:")
+end bpe_tracked_unwrap
+
+@test("an untracked one names its own")
+bpe_untracked_unwrap()
+    val text = bpe_unwrapping() + "print(n.plain().a.v)\n"
+
+    if bpe_ready() then assert(bpe_ir(text).contains("@Node.plain$place("), text)
+
+    bpe_panics(text, "", "unwrap of a None value (main.sysl:14:")
+end bpe_untracked_unwrap
