@@ -1,0 +1,214 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_temp_dir, remove_dir_all, write_text}
+
+// **A call through a trait object hands its receiver over as surely as an argument**, and answers
+// with it as readily: `reactive(() -> …).on_tap(f)` gives the object that holds the closure to a
+// default method that keeps `self` in what it returns. The escape analysis that decides where a
+// closure's box lives (`keeps.sysl`'s `probe_frame`, `keeps_block.sysl`'s `probe_blocks`) asks a
+// `TVCall` the same two questions it asks a direct call -- what each body its slot lands in keeps
+// (`vcall_keeps`) and answers with (`vcall_answers`), the receiver numbered first. Where it did not,
+// a closure built into an object and handed back through a method was boxed in a frame that had
+// ended, and a program built against syslUI faulted on its first frame.
+//
+// The cells: what carries the closure out of the frame (the receiver answered, an argument answered,
+// the receiver kept in module storage, the answer kept in an outer local by a loop) and, against
+// them, a call through an object whose bodies answer with neither, whose closure stays in the frame.
+// The same hole in the rule that refuses a frame address handed out is the last cell: the address of
+// a local returned through an object's method.
+//
+// Skipped: a `&sync Fn` and an `async` body are boxed on the heap before any of this is asked
+// (`tests_cfb_closure_frame_box.sysl`); a generic's bound is dispatched statically, a `TCall`.
+
+// What `--explain-escapes` reports for a program, each line with the directory taken out.
+private vob_explained(text: string) -> Buf[string]
+    var notes: Buf[string] = buf()
+
+    if xvr_no_library() then return notes
+
+    val root = make_temp_dir("sysl-vob").unwrap()
+
+    write_text(s"$root/main.sysl", forms_imported(text)).unwrap()
+
+    var lines: Buf[string] = buf()
+    val sink = &lines
+    val noted = &notes
+    var args: Buf[string] = buf()
+
+    args.push("sysl")
+    args.push("emit-llvm")
+    args.push("--explain-escapes")
+    args.push(s"$root/main.sysl")
+
+    run_cli_noted(args.view(), (line) -> sink.push(line), (line) -> noted.push(vob_local(root, line)))
+    remove_dir_all(root).unwrap_or(())
+    notes
+end vob_explained
+
+private vob_local(root: string, line: string) -> string =
+    if line.starts_with(s"$root/") then line[s"$root/".bytes.len..<line.bytes.len] else line
+
+// The program prints `want`, and `--explain-escapes` says exactly `notes`.
+private vob_boxed(text: string, want: string, notes: []const string)
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(text), want)
+
+    val got = vob_explained(text)
+
+    assert_eq(got.len(), notes.len, got.join("\n"))
+
+    for i in 0..<notes.len
+        assert_eq(got.at(i), notes[i])
+end vob_boxed
+
+// The views of syslUI's `button`: a closure built into a `Reactive`, erased to a `&View`, and handed
+// to `on_tap`, a default method that wraps `self` in a `Tappable` it hands back.
+private const vob_views: string = raw"""
+    trait View
+        measure(&self) -> int
+        on_tap(&self, f: &Fn() -> unit) -> &View = Tappable(self, f)
+
+    struct Reactive
+        body: &Fn(int) -> int
+
+    impl View for Reactive
+        measure(&self) -> int = self.body(1)
+
+    struct Tappable
+        inner: &View
+        f: &Fn() -> unit
+
+    impl View for Tappable
+        measure(&self) -> int = self.inner.measure()
+
+    reactive(body: &Fn(int) -> int) -> &View = Reactive(body)
+    """
+
+@test("a closure built into an object a default method hands back is boxed on the heap, not in the frame")
+vob_receiver_answered_is_returned()
+    vob_boxed(vob_views + raw"""
+
+        button(label: string, role: int, g: &Fn() -> unit) -> &View =
+            reactive((i) -> int(label.len) + i + role).on_tap(g)
+
+        main()
+            val v = button("hello", 2, () -> ())
+
+            print(v.measure())
+        """, "8\n",
+        ["main.sysl:21:14: a closure erased to '&Fn(int) -> int' is boxed on the heap, because it is returned from 'button' on line 21"])
+
+@test("one handed as an argument to a method that answers with it is boxed on the heap")
+vob_argument_answered_is_returned()
+    vob_boxed(raw"""
+        trait Wraps
+            wrap(&self, f: &Fn(int) -> int) -> &Holder
+
+        struct Holder
+            f: &Fn(int) -> int
+
+        struct Plain
+            n: int
+
+        impl Wraps for Plain
+            wrap(&self, f: &Fn(int) -> int) -> &Holder = Holder(f)
+
+        make(w: &Wraps, k: int) -> &Holder = w.wrap((x) -> x + k)
+
+        main()
+            val w: &Wraps = Plain(0)
+
+            print(make(w, 2).f(1))
+        """, "3\n",
+        ["main.sysl:13:45: a closure erased to '&Fn(int) -> int' is boxed on the heap, because it is returned from 'make' on line 13"])
+
+@test("one in an object a default method keeps through 'self' is boxed on the heap, and says so")
+vob_receiver_kept_in_module_storage()
+    vob_boxed(raw"""
+        trait View
+            measure(&self) -> int
+
+            register(&self) -> int
+                kept = Some(self)
+                0
+
+        struct Reactive
+            body: &Fn(int) -> int
+
+        impl View for Reactive
+            measure(&self) -> int = self.body(1)
+
+        var kept: Option[&View] = None
+
+        reactive(body: &Fn(int) -> int) -> &View = Reactive(body)
+
+        setup(k: int)
+            reactive((i) -> i + k).register()
+
+        main()
+            setup(2)
+
+            kept match
+                Some(v) -> print(v.measure())
+                None -> print(0)
+        """, "3\n",
+        ["main.sysl:19:14: a closure erased to '&Fn(int) -> int' is boxed on the heap, because it is handed to 'register' on line 19, which keeps its parameter 'self' (it is stored in 'kept')"])
+
+@test("one whose object a method answers into an outer local, turn after turn, is boxed on the heap")
+vob_answer_kept_in_an_outer_local()
+    vob_boxed(vob_views + raw"""
+
+        last() -> int
+            var v = reactive((x) -> x).on_tap(() -> ())
+
+            for i in 0..<3
+                val k = i * 10
+                v = reactive((x) -> x + k).on_tap(() -> ())
+
+            v.measure()
+
+        main()
+            print(last())
+        """, "21\n",
+        ["main.sysl:25:22: a closure erased to '&Fn(int) -> int' is boxed on the heap, because it is kept in 'v' on line 25, which outlives the turn of the 'for' body that builds it",
+         "main.sysl:25:43: a closure erased to '&Fn() -> unit' is boxed on the heap, because it is kept in 'v' on line 25, which outlives the turn of the 'for' body that builds it"])
+
+@test("a call through an object whose bodies answer with neither leaves the closure's box in the frame")
+vob_unanswered_stays_in_the_frame()
+    vob_boxed(vob_views + raw"""
+
+        size(k: int) -> int = reactive((i) -> i + k).measure()
+
+        main()
+            print(size(2))
+        """, "3\n", ["no arrays were promoted to the heap"])
+
+@test("the address of a local returned through an object's method is refused")
+vob_local_address_answered_is_refused()
+    if !enm_ready() then return
+
+    val said = enm_err(raw"""
+        trait Picks
+            pick(&self, p: *int) -> *int
+
+        struct First
+            n: int
+
+        impl Picks for First
+            pick(&self, p: *int) -> *int = p
+
+        bad(o: &Picks) -> *int
+            var n = 1
+
+            o.pick(&n)
+
+        main()
+            val o: &Picks = First(0)
+
+            print(*bad(o))
+        """)
+
+    assert(said.contains("holds the address of a local of 'bad', whose storage ends when 'bad' returns"), said)
