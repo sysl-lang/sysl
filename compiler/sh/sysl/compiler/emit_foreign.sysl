@@ -36,8 +36,13 @@ call_form(ret: LType, ret_attrs: Buf[IrAttr]) -> CallForm = CallForm(ret, ret_at
 
 plain_form(ret: LType) -> CallForm = CallForm(ret, no_ir_attrs(), None)
 
-form_call(f: CallForm, dest: Option[Val], callee: Val, args: Buf[IrArg]) -> Inst =
-    InCall(dest, f.ret, callee, args, f.ret_attrs, f.whole, no_fast_math(), false)
+form_call(f: CallForm, dest: Option[Val], callee: Val, args: Buf[IrArg], twice: bool = false) -> Inst
+    var fast: Buf[FastMath] = buf()
+
+    if twice then fast.push(FmReturnsTwice)
+
+    InCall(dest, f.ret, callee, args, f.ret_attrs, f.whole, fast, false)
+end form_call
 
 // The type a foreign declaration and every call to it name.
 //
@@ -103,7 +108,7 @@ end align_attrs
 // callee -- the result type, or the callee's whole function type where it is variadic. `abandons`
 // is a callee declared `@abandons`, before which the frame gives back what it holds.
 gen_foreign_call(e: *Emit, what: CallForm, callee: Val, args: Buf[TExpr], ty: Type,
-                 abandons: bool) -> Val
+                 abandons: bool, twice: bool = false) -> Val
     val result = c_result(e.layout, ty, e.target)
 
     // The storage a big result is written into is the caller's, so it exists before the call, and it
@@ -141,7 +146,7 @@ gen_foreign_call(e: *Emit, what: CallForm, callee: Val, args: Buf[TExpr], ty: Ty
 
     result match
         CrSret(coerced, _) ->
-            emit(e, form_call(what, None, callee, arguments))
+            emit(e, form_call(what, None, callee, arguments, twice))
 
             val r = fresh_reg(e)
 
@@ -151,7 +156,7 @@ gen_foreign_call(e: *Emit, what: CallForm, callee: Val, args: Buf[TExpr], ty: Ty
         CrCoerced(coerced) ->
             val r = fresh_reg(e)
 
-            emit(e, form_call(what, Some(r), callee, arguments))
+            emit(e, form_call(what, Some(r), callee, arguments, twice))
 
             // A homogeneous floating aggregate comes back under its own type, so there is nothing to
             // reinterpret and the round trip through memory would be a copy for its own sake.
@@ -163,7 +168,7 @@ gen_foreign_call(e: *Emit, what: CallForm, callee: Val, args: Buf[TExpr], ty: Ty
             if no_value(ty)
                 if abandons then release_all(e)
 
-                emit(e, form_call(what, None, callee, arguments))
+                emit(e, form_call(what, None, callee, arguments, twice))
 
                 if ty == Never then emit_term(e, InUnreachable)
 
@@ -171,7 +176,7 @@ gen_foreign_call(e: *Emit, what: CallForm, callee: Val, args: Buf[TExpr], ty: Ty
             else
                 val r = fresh_reg(e)
 
-                emit(e, form_call(what, Some(r), callee, arguments))
+                emit(e, form_call(what, Some(r), callee, arguments, twice))
                 own_temp(e, r, ty)
 end gen_foreign_call
 
