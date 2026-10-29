@@ -585,13 +585,16 @@ private run_arity(cx: &Analyzer, span: Span, name: string, n: usize, form: strin
 end run_arity
 
 // The index, held to what a subscript holds one to -- this *is* a subscript, of `W` elements.
-private run_start(cx: &Analyzer, e: Expr) -> TExpr
+//
+// Inside an `@unchecked` block the index is wrapped as an unchecked subscript's is, and the lowering
+// of the run's address leaves its test out (`unchecked.sysl`).
+private run_start(cx: &Analyzer, tr: TExpr, e: Expr) -> TExpr
     not_fixing_at(cx, e)
 
     val ti = type_expr(cx, e, Some(usize_type(word_bits(cx))))
 
     repr(texpr_type(ti)) match
-        Integer(_, _, _) -> ti
+        Integer(_, _, _) -> unchecked_wrap(cx, tr, ti)
         other -> cx.err(e.span, s"the index a run starts at must be an integer, not " +
                         s"${type_show(other)}")
 end run_start
@@ -639,7 +642,7 @@ private vector_load(cx: &Analyzer, span: Span, rty: Type, tr: TExpr, elem: Type,
 
     lanes_or_err(cx, span, rty, elem, v)
 
-    TExpr(span, TVecLoad(tr, run_start(cx, args.at(0)), v))
+    TExpr(span, TVecLoad(tr, run_start(cx, tr, args.at(0)), v))
 end vector_load
 
 private vector_store(cx: &Analyzer, span: Span, rty: Type, tr: TExpr, elem: Type,
@@ -666,7 +669,7 @@ private vector_store(cx: &Analyzer, span: Span, rty: Type, tr: TExpr, elem: Type
     if written_once_place(cx, probe) then
         return cx.err(span, "a 'val' is written once, so 'store' has nothing to write through")
 
-    val index = run_start(cx, args.at(0))
+    val index = run_start(cx, tr, args.at(0))
     val value = type_expr(cx, args.at(1), None)
     val vt = repr(texpr_type(value))
 

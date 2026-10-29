@@ -1,0 +1,405 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_temp_dir, remove_dir_all, write_text}
+import sysl.process.{capture, Status}
+
+// A vector load or store inside an `@unchecked` block (`unchecked.sysl`, `vectors.sysl`): a run of
+// elements is a subscript of `W` elements, so the block removes its test as it removes a scalar
+// subscript's. The helpers are `tests_enm_enum_run.sysl`'s.
+//
+// **What is asserted is the IR of one function at a time**, the unchecked function beside a checked
+// twin that still reaches `sysl_bounds_fail`. A run past the end is not executed inside the block,
+// since what it reads is whatever the memory holds. The API has one contiguous form (`xs.load(i)`,
+// `xs.store(i, v)`); it has no strided or gather form, so there is no such cell.
+
+private ucv_fn(ir: string, name: string) -> string
+    val at = ir.index_of("@" + name + "$$sysl(")
+
+    assert(at.is_some(), s"no function '$name' in the IR")
+
+    val head = ir[0..<at.unwrap()]
+    val start = head.last_index_of("define ").unwrap_or(0)
+    val rest = ir[start..<ir.len]
+    val close = rest.index_of("\n}").unwrap_or(rest.len)
+
+    rest[0..<close]
+
+private ucv_checks(body: string) -> bool = body.contains("sysl_bounds_fail")
+
+// The text of the function whose symbol is `sym` (a closure's or an instantiation's, which has no
+// `$$sysl` suffix).
+private ucv_def(ir: string, sym: string) -> string
+    // The definition's own line: a call to the symbol earlier in the text is not it.
+    val marker = "@" + sym + "("
+    var from = 0
+    var start = 0
+    var found = false
+
+    loop
+        val rest = ir[from..<ir.len]
+        val at = rest.index_of(marker)
+
+        if at.is_none() then break
+
+        val here = from + at.unwrap()
+        val line = ir[0..<here].last_index_of("\n").unwrap_or(0)
+
+        if ir[line..<here].contains("define ")
+            start = line
+            found = true
+            break
+        end if
+
+        from = here + marker.len
+    end loop
+
+    assert(found, s"no definition of '$sym' in the IR")
+
+    val rest = ir[start..<ir.len]
+    val close = rest.index_of("\n}").unwrap_or(rest.len)
+
+    rest[0..<close]
+
+// `text` built in the build mode `flag` names (`--release`, or none for debug) and run.
+private ucv_run(text: string, flag: string) -> (Status, string, string)
+    val root = make_temp_dir("sysl-ucv").unwrap()
+
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    if flag != ""
+        var flags: [1]string = [flag]
+
+        assert_eq(took_search_flag(flags[..], 0), 1)
+    end if
+
+    val exe = s"$root/built"
+    val built = build_native_program(root, None, None, DefaultOptimization, Some(exe))
+
+    reset_search_paths()
+
+    built match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (Status.Exited(-1), "", failure_text(why))
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> (Status.Exited(-1), "", "the program could not be run")
+        Ok(out) -> (out.status, out.text, out.err.unwrap_or(""))
+end ucv_run
+
+// -- load and store, each lane type, on an array and a slice
+
+@test("a load in the block has no bounds check, at every lane type, on an array and a slice")
+ucv_load_matrix()
+    if !enm_ready() then return
+
+    val ir = enm_ir(raw"""
+        @noinline
+        f32_slice(xs: []f32, i: int) -> f32
+            @unchecked
+                val v: <4>f32 = xs.load(i)
+                v[0]
+
+        @noinline
+        f32_array(i: int) -> f32
+            val xs: [8]f32 = [1, 2, 3, 4, 5, 6, 7, 8]
+            @unchecked
+                val v: <4>f32 = xs.load(i)
+                v[1]
+
+        @noinline
+        i32_slice(xs: []i32, i: int) -> i32
+            @unchecked
+                val v: <4>i32 = xs.load(i)
+                v[2]
+
+        @noinline
+        u8_slice(xs: []u8, i: int) -> u8
+            @unchecked
+                val v: <16>u8 = xs.load(i)
+                v[3]
+
+        @noinline
+        f64_slice(xs: []f64, i: int) -> f64
+            @unchecked
+                val v: <2>f64 = xs.load(i)
+                v[1]
+
+        @noinline
+        f32_checked(xs: []f32, i: int) -> f32
+            val v: <4>f32 = xs.load(i)
+            v[0]
+
+        val a: []f32 = [1, 2, 3, 4, 5]
+        val b: []i32 = [1, 2, 3, 4, 5]
+        val c: []u8 = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+        val d: []f64 = [1, 2, 3]
+        print(f32_slice(a, 0), f32_array(0), i32_slice(b, 0), u8_slice(c, 0), f64_slice(d, 0), f32_checked(a, 0))
+        """)
+
+    for name in ["f32_slice", "f32_array", "i32_slice", "u8_slice", "f64_slice"]
+        assert(!ucv_checks(ucv_fn(ir, name)), ucv_fn(ir, name))
+
+    assert(ucv_checks(ucv_fn(ir, "f32_checked")), ucv_fn(ir, "f32_checked"))
+
+@test("a store in the block has no bounds check, at every lane type, on an array and a slice")
+ucv_store_matrix()
+    if !enm_ready() then return
+
+    val ir = enm_ir(raw"""
+        @noinline
+        f32_slice(xs: []f32, i: int, v: <4>f32)
+            @unchecked
+                xs.store(i, v)
+
+        @noinline
+        i32_array(i: int, v: <4>i32) -> i32
+            var xs: [8]i32 = [0; 8]
+            @unchecked
+                xs.store(i, v)
+                xs.get_unchecked(0)
+
+        @noinline
+        u8_slice(xs: []u8, i: int, v: <16>u8)
+            @unchecked
+                xs.store(i, v)
+
+        @noinline
+        f64_slice(xs: []f64, i: int, v: <2>f64)
+            @unchecked
+                xs.store(i, v)
+
+        @noinline
+        f32_checked(xs: []f32, i: int, v: <4>f32)
+            xs.store(i, v)
+
+        var a: [8]f32 = [0; 8]
+        var c: [16]u8 = [0; 16]
+        var d: [4]f64 = [0; 4]
+        val v: <4>f32 = [1, 2, 3, 4]
+        f32_slice(a[..], 0, v)
+        f32_checked(a[..], 4, v)
+        u8_slice(c[..], 0, [0; 16])
+        f64_slice(d[..], 0, [1, 2])
+        print(i32_array(0, [5, 6, 7, 8]))
+        """)
+
+    for name in ["f32_slice", "i32_array", "u8_slice", "f64_slice"]
+        assert(!ucv_checks(ucv_fn(ir, name)), ucv_fn(ir, name))
+
+    assert(ucv_checks(ucv_fn(ir, "f32_checked")), ucv_fn(ir, "f32_checked"))
+
+// -- the block's extent
+
+@test("a load after the block ends is checked again, and a load in a nested block is not")
+ucv_extent()
+    if !enm_ready() then return
+
+    val ir = enm_ir(raw"""
+        @noinline
+        after(xs: []f32, i: int) -> f32
+            var a: f32 = 0
+            @unchecked
+                val v: <4>f32 = xs.load(i)
+                a = v[0]
+            val w: <4>f32 = xs.load(i + 1)
+            a + w[0]
+
+        @noinline
+        nested(xs: []f32, i: int) -> f32
+            var a: f32 = 0
+            @unchecked
+                @unchecked
+                    val v: <4>f32 = xs.load(i)
+                    a = v[0]
+                val w: <4>f32 = xs.load(i + 1)
+                a += w[0]
+            a
+
+        val xs: []f32 = [1, 2, 3, 4, 5, 6]
+        print(after(xs, 0), nested(xs, 0))
+        """)
+
+    assert(ucv_checks(ucv_fn(ir, "after")), ucv_fn(ir, "after"))
+    assert(!ucv_checks(ucv_fn(ir, "nested")), ucv_fn(ir, "nested"))
+
+@test("a closure and a nested function written inside the block are inside it")
+ucv_closure_and_nested_function()
+    if !enm_ready() then return
+
+    val ir = enm_ir(raw"""
+        first(v: <4>f32) -> f32 = v[0]
+
+        @noinline
+        apply(f: &Fn(int) -> f32, i: int) -> f32 = f(i)
+
+        @noinline
+        outer(xs: []f32) -> f32
+            var r: f32 = 0
+            @unchecked
+                pick(i: int) -> f32 = first(xs.load(i))
+                r = apply(i -> first(xs.load(i)), 1) + pick(0)
+            r
+
+        val xs: []f32 = [1, 2, 3, 4, 5, 6]
+        print(outer(xs))
+        """)
+
+    assert(!ucv_checks(ucv_fn(ir, "outer")), ucv_fn(ir, "outer"))
+    assert(!ucv_checks(ucv_def(ir, "$closure0.call")), ucv_def(ir, "$closure0.call"))
+    assert(!ucv_checks(ucv_def(ir, "$env0.pick")), ucv_def(ir, "$env0.pick"))
+
+@test("a closure written outside the block and called inside keeps its check")
+ucv_closure_written_outside()
+    if !enm_ready() then return
+
+    val ir = enm_ir(raw"""
+        first(v: <4>f32) -> f32 = v[0]
+
+        @noinline
+        apply(f: &Fn(int) -> f32, i: int) -> f32 = f(i)
+
+        @noinline
+        outer(xs: []f32) -> f32
+            val g = (i: int) -> first(xs.load(i))
+            var r: f32 = 0
+            @unchecked
+                r = apply(g, 1)
+            r
+
+        val xs: []f32 = [1, 2, 3, 4, 5, 6]
+        print(outer(xs))
+        """)
+
+    assert(ucv_checks(ucv_def(ir, "$closure0.call")), ucv_def(ir, "$closure0.call"))
+    assert(!ucv_checks(ucv_fn(ir, "outer")), ucv_fn(ir, "outer"))
+
+@test("a generic body with a block loads unchecked at two element types, with a const width")
+ucv_generic()
+    if !enm_ready() then return
+
+    val ir = enm_ir(raw"""
+        grab[const W: usize](xs: []f32, i: int) -> <W>f32
+            @unchecked
+                xs.load(i)
+
+        @noinline
+        a(xs: []f32, i: int) -> f32 = grab[4](xs, i)[0]
+
+        @noinline
+        b(xs: []f32, i: int) -> f32 = grab[2](xs, i)[1]
+
+        val xs: []f32 = [1, 2, 3, 4, 5, 6]
+        print(a(xs, 0), b(xs, 0))
+        """)
+
+    assert(!ucv_checks(ucv_def(ir, "grab.c4")), ucv_def(ir, "grab.c4"))
+    assert(!ucv_checks(ucv_def(ir, "grab.c2")), ucv_def(ir, "grab.c2"))
+
+    val checked = enm_ir(raw"""
+        grab[const W: usize](xs: []f32, i: int) -> <W>f32 = xs.load(i)
+
+        @noinline
+        a(xs: []f32, i: int) -> f32 = grab[4](xs, i)[0]
+
+        val xs: []f32 = [1, 2, 3, 4, 5, 6]
+        print(a(xs, 0))
+        """)
+
+    assert(ucv_checks(ucv_def(checked, "grab.c4")), ucv_def(checked, "grab.c4"))
+
+// -- what runs
+
+private ucv_program() -> string = raw"""
+    first(v: <4>f32) -> f32 = v[0]
+
+    var xs: [8]f32 = [1, 2, 3, 4, 5, 6, 7, 8]
+    var ys: [8]f32 = [0; 8]
+    var v: <4>f32 = xs.load(0)
+    var w: <4>f32 = xs.load(0)
+
+    @unchecked
+        v = xs.load(2)
+        w = xs[..].load(4)
+        ys.store(4, v * 10)
+        ys[..].store(0, w)
+
+    print(ys[0], ys[3], ys[4], ys[7], first(v))
+    """
+
+@test("a load and a store in the block move the right lanes, in a debug build")
+ucv_runs_in_debug()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(ucv_program()), "5 8 30 60 3\n")
+
+@test("and in a release build")
+ucv_runs_in_release()
+    if !enm_ready() then return
+
+    val out = ucv_run(ucv_program(), "--release")
+
+    assert(out.0.ok(), out.2)
+    assert_eq(out.1, "5 8 30 60 3\n")
+
+// -- outside the block a run past the end still traps, with its message
+
+@test("a load past the end outside the block traps in debug and release")
+ucv_traps_outside()
+    if !enm_ready() then return
+
+    val text = raw"""
+        var xs: [5]f32 = [1, 2, 3, 4, 5]
+        @unchecked
+            val ok: <4>f32 = xs.load(1)
+            print(ok[0])
+        val v: <4>f32 = xs.load(3)
+        print(v[0])
+        """
+
+    for flag in ["", "--release"]
+        val out = ucv_run(text, flag)
+
+        assert(!out.0.ok(), "it exited cleanly")
+        assert(out.1.contains("2\n"), out.1)
+        assert((out.1 + out.2).contains("out of bounds"), out.1 + out.2)
+
+@test("a store past the end outside the block traps")
+ucv_store_traps_outside()
+    if !enm_ready() then return
+
+    val said = enm_panic_text(raw"""
+        var xs: [5]f32 = [1, 2, 3, 4, 5]
+        val v: <4>f32 = [0, 0, 0, 0]
+        @unchecked
+            xs.store(1, v)
+        print(xs[1])
+        xs.store(2, v)
+        """)
+
+    assert(said.contains("0\n"), said)
+    assert(said.contains("out of bounds"), said)
+
+// -- compile time still checks
+
+@test("a constant run past the end is refused while compiling, block or not")
+ucv_compile_time_still_checks()
+    if !enm_ready() then return
+
+    val said = enm_err(raw"""
+        const f() -> f32
+            val xs: [5]f32 = [1, 2, 3, 4, 5]
+            @unchecked
+                val v: <4>f32 = xs.load(3)
+                v[0]
+
+        val r = f()
+        """)
+
+    assert(said.contains("out of bounds"), said)

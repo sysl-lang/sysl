@@ -248,7 +248,7 @@ builtin_attr_word(w: string) -> bool
                  "section", "crossing", "domain", "keeps", "answers", "disjoint", "guards", "needs",
                  "noinline", "inline", "cold", "thread_local", "abandons", "per_cpu", "main_thread",
                  "pinned", "pins", "relocates", "views", "consumes", "blocks", "scoped", "joined",
-                 "strict_fp", "track_caller"]
+                 "strict_fp", "track_caller", "returns_twice"]
         if word == w then return true
 
     false
@@ -398,6 +398,7 @@ parse_attribute(p: *Parser) -> Option[Attr]
     // `@thread_local` takes no parentheses for `@packed`'s reason: which thread-local model the
     // object gets is the back end's answer for the target, not something a program picks.
     if word == "thread_local" then return Some(ThreadLocal)
+    if word == "returns_twice" then return no_inlining_args(p, ReturnsTwice, "a call either returns a second time or it does not, and this says it may")
     if word == "abandons" then return no_inlining_args(p, Abandons, "a call to the function either comes back or it does not, and this says it does not")
 
     // `@per_cpu` takes none either: which register finds the core's copy is the manifest's
@@ -1146,7 +1147,7 @@ private parse_attributed_decl(p: *Parser, start: Span) -> Stmt
         return from_first(start, parse_extern_decl(p, at, vis, capabilities_of(attrs),
                                                    any_is(attrs, "blocks"),
                                                    any_is(attrs, "abandons"), kept_names(attrs),
-                                                   answered_names(attrs)))
+                                                   answered_names(attrs), any_is(attrs, "returns_twice")))
     end if
 
     // A `type` names a scalar or a pointer for a generated header, which is the struct's request made
@@ -1220,9 +1221,10 @@ private may_carry(form: string, a: Attr) -> bool
 
     if form == "binding" then return is_storage(a) || attr_word(a) == "export"
     if form == "extern" then return attr_word(a) == "needs" || attr_word(a) == "blocks" ||
-        attr_word(a) == "abandons" || attr_word(a) == "keeps" || attr_word(a) == "answers"
+        attr_word(a) == "abandons" || attr_word(a) == "keeps" || attr_word(a) == "answers" ||
+        attr_word(a) == "returns_twice"
 
-    !is_layout(a) && attr_word(a) != "keeps" && attr_word(a) != "answers" && attr_word(a) != "guards" &&
+    !is_layout(a) && attr_word(a) != "keeps" && attr_word(a) != "returns_twice" && attr_word(a) != "answers" && attr_word(a) != "guards" &&
         attr_word(a) != "relocates" && attr_word(a) != "views" && attr_word(a) != "consumes" &&
         !is_user(a) && !is_annotation_mark(a)
 end may_carry
@@ -1291,6 +1293,9 @@ private attributed_refusal(attrs: Buf[Attr]) -> string
 
     if all_are(attrs, "needs")
         return "'@needs(...)' names what reaching a declaration requires, so it marks a function or an 'extern' — and this declares neither"
+
+    if any_is(attrs, "returns_twice")
+        return "'@returns_twice' says a call may return a second time, as C's setjmp does, and a body the compiler can read has no such return — it marks an 'extern' function"
 
     if all_are(attrs, "abandons")
         return "'@abandons' says a call never comes back and the program goes on without the caller's frame, so it marks a function or an 'extern' — and this declares neither"

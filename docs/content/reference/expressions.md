@@ -2279,10 +2279,12 @@ of what it holds, and the closure. **Where nothing reaches the closure after the
 closure to `each`, `sort_by` or a callback that only calls it allocates nothing, `@no_alloc` accepts
 it, and so does a target with no allocator. A callee may still take a share and give it back; the
 count is the slot's. The question is the one a closure's capture mode asks, about the same flows: a
-closure returned, stored where it outlives the frame, handed to a parameter its function keeps, kept
-in a local outside the loop body that builds it, built in an `async` body, or erased into a `&sync
-Fn` is boxed on the heap, as it always was. Nothing is written for either, and `--explain-escapes`
-names each heap box and why:
+closure returned, stored anywhere but storage the frame can show is its own (a module variable,
+through a parameter, through the pointer a call answers as in `current().sink = f`, into a `Buf`),
+handed to a parameter its function keeps, kept in a local outside the loop body that builds it, built
+in an `async` body, or erased into a `&sync Fn` is boxed on the heap, as it always was. A named
+function used as a `&Fn` is a closure with nothing captured and is boxed the same way. Nothing is
+written for either, and `--explain-escapes` names each heap box and why:
 
 ```sysl
 apply(f: &Fn() -> int) -> int = f()
