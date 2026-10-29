@@ -202,7 +202,13 @@ end fixed_by_position
 // one use whose type nothing else would hold the literal to: there an integer literal is fixed at an
 // integer type whether or not it fits, so `var s = 300; s + b` over a `u8` is refused at the 300
 // rather than read as an `int` sum. A float literal beside an integer operand fixes nothing.
-note_var_fix(cx: &Analyzer, unique: string, ty: Type, beside: bool = false)
+//
+// **Arithmetic fixes the binding at the type it computes in**, which for a transparent subtype with
+// a range or predicate is its base (`reference/errors.md`): `var sum = 0; sum + i` with `i` a
+// `Prob` (`int within 0..<10`) makes `sum` an `int`, not a `Prob` that traps when the total passes 9.
+note_var_fix(cx: &Analyzer, unique: string, fixing: Type, beside: bool = false)
+    val ty = if beside then computed_in(fixing) else fixing
+
     for o in cx.open_vars
         if o.unique != unique then continue
 
@@ -220,6 +226,12 @@ note_var_fix(cx: &Analyzer, unique: string, ty: Type, beside: bool = false)
         cx.var_fix_log.push(VarFix(o.at, ty))
         return
 end note_var_fix
+
+// The type arithmetic on a `t` computes in: a transparent subtype that checks something is read at
+// its base, while a derived one, and one that is only a name, stays itself.
+private computed_in(t: Type) -> Type = t match
+    Constrained(d) -> if d.derived || name_only(d) then t else computed_in(d.base)
+    _ -> t
 
 private numeric_scalar(t: Type) -> bool = repr(t) match
     Integer(_, _, _) -> true
