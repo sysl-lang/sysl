@@ -1,0 +1,514 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.{cstring, Search}
+
+// A closure boxed behind a `&Fn` is laid in its frame only where nothing reaches it after the frame
+// (`closure_mode.sysl`, `tests_cfb_closure_frame_box.sysl`). These are the ways a closure reaches past
+// its frame through what holds it rather than by itself: a callee that keeps it in its answer, where
+// the answer then goes into a heap object a local holds and that object is returned; a struct, a
+// variant, a field store, a `Buf` in a field, a tuple, a `with` update, a generic keeper, a nested
+// keeper, a keeper through a trait object, a loop, and a closure capturing the holder; and a slice
+// literal handed to a callee that copies its elements into what it answers (`column([...])`). Each
+// cell is run twice with different captures, so a box left in a dead frame prints the second call's
+// capture, or garbage, for the first.
+//
+// The negative cells keep the frame box: the same keepers, with the answer and the heap object used
+// only in the frame, are `alloca`s in the IR.
+//
+// Skipped cells, and why: `@no_alloc` and a board with no heap cannot build the escaping cells at all,
+// since the heap object holding the closure is itself allocated; separate compilation asks the same
+// keeps of a `.syslib` callee as of the program's own (`tests_cfb_closure_frame_box.sysl`). A closure
+// in a local whose ADDRESS is handed to a callee that copies it out (`install(&s)`) is not covered:
+// what a callee does with a pointer read through its parameter is not a question the keeps summary
+// asks.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private extern "setenv" fbe_c_setenv(name: *u8, value: *u8, overwrite: int) -> int
+private extern "unsetenv" fbe_c_unsetenv(name: *u8) -> int
+
+private struct FbeRun
+    out: string
+    err: string
+    hooks: usize
+end FbeRun
+
+// The program built and run: on the counted heap, or with `flags` handed to clang.
+private fbe_run(text: string, counted: bool, flags: string) -> FbeRun
+    val root = make_temp_dir("sysl-fbe").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", forms_imported(text)).unwrap()
+
+    val exe = s"$root/built"
+
+    if flags != ""
+        val n = cstring("SYSL_EXTRA_CFLAGS")
+        val v = cstring(flags)
+
+        fbe_c_setenv(n.ptr, v.ptr, 1)
+    end if
+
+    force_alloc_counting(counted)
+
+    val made = build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe))
+
+    force_alloc_counting(false)
+
+    if flags != ""
+        val n = cstring("SYSL_EXTRA_CFLAGS")
+
+        fbe_c_unsetenv(n.ptr)
+    end if
+
+    made match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return FbeRun(failure_text(why), "", 0)
+        Ok(_) -> ()
+
+    val hooks = capture("nm", ["-u", exe], "", [], true) match
+        Ok(o) -> o.text.count_of("__asan_report")
+        Err(_) -> 0
+
+    val ran = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    ran match
+        Err(_) -> FbeRun("could not be started", "", hooks)
+        Ok(o) -> FbeRun(o.text, o.err.unwrap_or(""), hooks)
+end fbe_run
+
+// The program printed `want` on the counted heap, and gave back everything it took.
+private fbe_prints(text: string, want: string)
+    if !enm_ready() then return
+
+    val got = fbe_run(text, true, "")
+
+    assert_eq(got.out, want)
+    assert_eq(got.err, "")
+end fbe_prints
+
+// The program printed `want` under AddressSanitizer, instrumented, and nothing was reported.
+private fbe_asan(text: string, want: string)
+    if !enm_ready() then return
+
+    val got = fbe_run(text, false, "-fsanitize=address -g")
+
+    assert(got.hooks > 0, s"not instrumented: ${got.out}")
+    assert_eq(got.out, want)
+    assert_eq(got.err, "")
+end fbe_asan
+
+// The LLVM text of a program, or its report.
+private fbe_ir(text: string) -> string
+    val root = make_temp_dir("sysl-fbe").unwrap()
+
+    write_text(s"$root/main.sysl", forms_imported(text)).unwrap()
+
+    val out = emit_llvm_text(s"$root/main.sysl", None) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> if made.report.is_empty() then made.text else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end fbe_ir
+
+// How many lines of `ir` say `part`.
+private fbe_lines_with(ir: string, part: string) -> int
+    var n = 0
+
+    for line in lines_of(ir).view()
+        if line.contains(part) then n += 1
+
+    n
+end fbe_lines_with
+
+// What `--explain-escapes` reports for a program, one line each.
+private fbe_explained(text: string) -> string
+    if xvr_no_library() then return ""
+
+    val root = make_temp_dir("sysl-fbe").unwrap()
+
+    write_text(s"$root/main.sysl", forms_imported(text)).unwrap()
+
+    var lines: Buf[string] = buf()
+    var notes: Buf[string] = buf()
+    val sink = &lines
+    val noted = &notes
+    var args: Buf[string] = buf()
+
+    args.push("sysl")
+    args.push("emit-llvm")
+    args.push("--explain-escapes")
+    args.push(s"$root/main.sysl")
+
+    run_cli_noted(args.view(), (line) -> sink.push(line), (line) -> noted.push(line))
+    remove_dir_all(root).unwrap_or(())
+
+    var said = ""
+
+    for line in notes
+        said = said + line + "\n"
+
+    said
+end fbe_explained
+
+// -- the regression -------------------------------------------------------------------------------
+
+// llhttp's `r.p = Some(request_parser((e) -> …))`: the closure is kept in `keep`'s answer, which is
+// wrapped in `Some` and stored into the heap object `r` holds, and `r` is returned.
+private const fbe_reduction: string = raw"""
+    struct P
+        handler: &Fn(int) -> unit
+
+    keep(on: &Fn(int) -> unit) -> &P = P(on)
+
+    struct R
+        p: Option[&P]
+
+    make(tag: int) -> &R
+        var r: &R = R(None)
+        r.p = Some(keep((e) -> print(tag + e)))
+        r
+
+    main()
+        val a = make(10)
+        val junk = make(70)
+        a.p.unwrap().handler(5)
+        junk.p.unwrap().handler(5)
+    """
+
+@test("a closure kept in an answer stored into a returned heap object is boxed on the heap, and answers its own capture")
+fbe_kept_answer_stored_in_a_returned_object()
+    fbe_prints(fbe_reduction, "15\n75\n")
+
+@test("and under AddressSanitizer: instrumented, and nothing read outside a live frame")
+fbe_kept_answer_stored_in_a_returned_object_under_asan()
+    fbe_asan(fbe_reduction, "15\n75\n")
+
+@test("--explain-escapes says the closure goes on the heap because the object holding it is returned")
+fbe_kept_answer_is_explained()
+    val said = fbe_explained(fbe_reduction)
+
+    if xvr_no_library() then return
+
+    assert(said.contains("is boxed on the heap, because it is returned from 'make' on line 12"), said)
+
+@test("its IR has no frame box for the closure")
+fbe_kept_answer_has_no_frame_box()
+    if xvr_no_library() then return
+
+    assert_eq(fbe_lines_with(fbe_ir(fbe_reduction), "= alloca %arc.$closure"), 0)
+
+// -- the matrix -----------------------------------------------------------------------------------
+
+private const fbe_matrix: string = raw"""
+    import sysl.buf.{Buf, buf}
+
+    struct P
+        handler: &Fn(int) -> unit
+
+    keep(on: &Fn(int) -> unit) -> &P = P(on)
+    keep2(p: &P) -> &P = p
+
+    struct R
+        items: Buf[&P]
+        one: Option[&P]
+
+    struct Q
+        q: &P
+
+    struct Pair
+        a: int
+        p: Option[&P]
+
+    struct G[T]
+        v: T
+
+    gkeep[T](v: T) -> &G[T] = G(v)
+
+    trait Holder
+        hold(self, on: &Fn(int) -> unit) -> &P
+
+    struct H
+        n: int
+
+    impl Holder for H
+        hold(self, on: &Fn(int) -> unit) -> &P = P(on)
+
+    trait View
+        show(self) -> int
+        restyle(&self, f: &Fn(int) -> int) -> &View = Themed(self, f)
+
+    struct Themed
+        inner: &View
+        f: &Fn(int) -> int
+
+    impl View for Themed
+        show(self) -> int = self.f(self.inner.show())
+
+    struct Rule
+        n: int
+
+    impl View for Rule
+        show(self) -> int = self.n
+
+    struct Col
+        kids: Buf[&View]
+
+    impl View for Col
+        show(self) -> int
+            var s = 0
+            for k in self.kids
+                s += k.show()
+            s
+
+    column(children: []&View) -> &View
+        var b: Buf[&View] = buf()
+        b.extend(children)
+        Col(b)
+
+    rule(n: int) -> &View = Rule(n)
+
+    var kept: Buf[&Fn(int) -> unit] = buf()
+
+    install_all(fs: []&Fn(int) -> unit)
+        for f in fs
+            kept.push(f)
+
+    fresh() -> &R = R(buf(), None)
+
+    some_of_keeper(tag: int) -> &R
+        val r = fresh()
+        r.one = Some(keep((e) -> print(tag + e)))
+        r
+
+    some_of_struct(tag: int) -> &R
+        val r = fresh()
+        r.one = Some(P((e) -> print(tag + e)))
+        r
+
+    field_store(tag: int) -> &Q
+        val r: &Q = Q(keep((e) -> print(0)))
+        r.q = keep((e) -> print(tag + e))
+        r
+
+    array_literal(tag: int) -> [1]&P = [keep((e) -> print(tag + e))]
+
+    pushed_into_field(tag: int) -> &R
+        val r = fresh()
+        r.items.push(keep((e) -> print(tag + e)))
+        r
+
+    nested_keepers(tag: int) -> &R
+        val r = fresh()
+        r.one = Some(keep2(keep((e) -> print(tag + e))))
+        r
+
+    tuple_held(tag: int) -> (int, &P)
+        val t = (1, keep((e) -> print(tag + e)))
+        t
+
+    through_an_object(tag: int) -> &R
+        val h: &Holder = H(0)
+        val r = fresh()
+        r.one = Some(h.hold((e) -> print(tag + e)))
+        r
+
+    generic_keeper(tag: int) -> &R
+        val r = fresh()
+        r.one = Some(gkeep(keep((e) -> print(tag + e))).v)
+        r
+
+    with_update(tag: int) -> Pair = Pair(0, None) with { p = Some(keep((e) -> print(tag + e))) }
+
+    in_a_loop(tag: int) -> &R
+        val r = fresh()
+        for i in 0..<2
+            r.items.push(keep((e) -> print(tag + e + i)))
+        r
+
+    captured_holder(tag: int) -> &Fn(int) -> unit
+        val r = fresh()
+        r.one = Some(keep((e) -> print(tag + e)))
+        (e) -> r.one.unwrap().handler(e)
+
+    restyled(bar: int) -> &View = rule(1).restyle(th -> th + bar)
+
+    in_a_slice(bar: int) -> &View = column([rule(1), rule(2).restyle(th -> th + bar)])
+
+    slice_to_a_keeper(tag: int)
+        install_all([(e) -> print(tag + e)])
+
+    main()
+        val a = some_of_keeper(10)
+        val aj = some_of_keeper(70)
+        a.one.unwrap().handler(5)
+        aj.one.unwrap().handler(5)
+        val b = some_of_struct(10)
+        val bj = some_of_struct(70)
+        b.one.unwrap().handler(5)
+        bj.one.unwrap().handler(5)
+        val c = field_store(10)
+        val cj = field_store(70)
+        c.q.handler(5)
+        cj.q.handler(5)
+        val d = array_literal(10)
+        val dj = array_literal(70)
+        d[0].handler(5)
+        dj[0].handler(5)
+        val f = pushed_into_field(10)
+        val fj = pushed_into_field(70)
+        f.items[0].handler(5)
+        fj.items[0].handler(5)
+        val g = nested_keepers(10)
+        val gj = nested_keepers(70)
+        g.one.unwrap().handler(5)
+        gj.one.unwrap().handler(5)
+        val h = tuple_held(10)
+        val hj = tuple_held(70)
+        h.1.handler(5)
+        hj.1.handler(5)
+        val k = through_an_object(10)
+        val kj = through_an_object(70)
+        k.one.unwrap().handler(5)
+        kj.one.unwrap().handler(5)
+        val m = generic_keeper(10)
+        val mj = generic_keeper(70)
+        m.one.unwrap().handler(5)
+        mj.one.unwrap().handler(5)
+        val w = with_update(10)
+        val wj = with_update(70)
+        w.p.unwrap().handler(5)
+        wj.p.unwrap().handler(5)
+        val l = in_a_loop(10)
+        val lj = in_a_loop(70)
+        l.items[0].handler(5)
+        l.items[1].handler(5)
+        lj.items[1].handler(5)
+        val x = captured_holder(10)
+        val xj = captured_holder(70)
+        x(5)
+        xj(5)
+        val s = restyled(10)
+        val sj = restyled(70)
+        print(s.show(), sj.show())
+        val v = in_a_slice(10)
+        val vj = in_a_slice(70)
+        print(v.show(), vj.show())
+        slice_to_a_keeper(20)
+        slice_to_a_keeper(80)
+        for fk in kept
+            fk(5)
+        kept = buf()
+    """
+
+private const fbe_matrix_output: string =
+    "15\n75\n15\n75\n15\n75\n15\n75\n15\n75\n15\n75\n15\n75\n15\n75\n15\n75\n15\n75\n15\n16\n76\n15\n75\n" +
+    "11 71\n13 73\n25\n85\n"
+
+@test("every way a kept closure reaches past its frame through what holds it prints its own capture, and frees all")
+fbe_matrix_runs_on_the_counted_heap()
+    fbe_prints(fbe_matrix, fbe_matrix_output)
+
+@test("and under AddressSanitizer: instrumented, and nothing read outside a live frame")
+fbe_matrix_runs_clean_under_asan()
+    fbe_asan(fbe_matrix, fbe_matrix_output)
+
+@test("no closure of the matrix is boxed in its frame")
+fbe_matrix_has_no_frame_box()
+    if xvr_no_library() then return
+
+    assert_eq(fbe_lines_with(fbe_ir(fbe_matrix), "= alloca %arc.$closure"), 0)
+
+@test("--explain-escapes says a closure in a slice literal goes on the heap because the callee may keep its elements")
+fbe_slice_literal_is_explained()
+    val said = fbe_explained(fbe_matrix)
+
+    if xvr_no_library() then return
+
+    assert(said.contains("it is reached through a pointer handed to 'column' on line 133, which may keep what it reads through it"), said)
+    assert(said.contains("it is handed to 'install_all' on line 136, which keeps its parameter 'fs'"), said)
+    assert(said.contains("it is returned from 'through_an_object'"), said)
+    assert(said.contains("it is returned from 'captured_holder'"), said)
+
+// -- what stays in the frame ----------------------------------------------------------------------
+
+// The same keepers, with the answer and the heap object holding it used only while the frame lives:
+// each is still boxed in its frame. The two pushed into a `Buf` are on the heap whatever becomes of
+// the `Buf`, since `push` keeps what it is handed in the buffer's own storage -- as before frame
+// boxes; they are here so the run covers them beside the framed ones.
+private const fbe_local: string = raw"""
+    import sysl.buf.{Buf, buf}
+
+    struct P
+        handler: &Fn(int) -> unit
+
+    keep(on: &Fn(int) -> unit) -> &P = P(on)
+    keep2(p: &P) -> &P = p
+
+    struct R
+        items: Buf[&P]
+        one: Option[&P]
+
+    trait Holder
+        hold(self, on: &Fn(int) -> unit) -> &P
+
+    struct H
+        n: int
+
+    impl Holder for H
+        hold(self, on: &Fn(int) -> unit) -> &P = P(on)
+
+    run_all(fs: []&P)
+        for f in fs
+            f.handler(1)
+
+    in_a_local_object(tag: int) -> int
+        val r: &R = R(buf(), None)
+        r.one = Some(keep((e) -> print(tag + e)))
+        r.items.push(keep((e) -> print(tag + e + 1)))
+        r.one.unwrap().handler(1)
+        r.items[0].handler(1)
+        0
+
+    answer_in_a_local(tag: int)
+        val p = keep((e) -> print(tag + e))
+        p.handler(1)
+
+    nested_in_a_local(tag: int)
+        val p = keep2(keep((e) -> print(tag + e)))
+        p.handler(1)
+
+    through_an_object(tag: int)
+        val h: &Holder = H(0)
+        h.hold((e) -> print(tag + e)).handler(1)
+
+    pushed_into_a_local(tag: int)
+        var fs: Buf[&P] = buf()
+        fs.push(keep((e) -> print(tag + e)))
+        run_all(fs.view())
+
+    main()
+        in_a_local_object(10)
+        answer_in_a_local(20)
+        nested_in_a_local(30)
+        through_an_object(40)
+        pushed_into_a_local(50)
+    """
+
+@test("a kept closure whose holder is used only in its frame prints what it would on the heap, and frees all")
+fbe_local_holders_run()
+    fbe_prints(fbe_local, "11\n12\n21\n31\n41\n51\n")
+
+@test("and each closure not pushed into a 'Buf' is boxed in its frame")
+fbe_local_holders_stay_in_the_frame()
+    if xvr_no_library() then return
+
+    assert_eq(fbe_lines_with(fbe_ir(fbe_local), "= alloca %arc.$closure"), 4)

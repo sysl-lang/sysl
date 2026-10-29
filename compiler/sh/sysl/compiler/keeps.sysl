@@ -2160,8 +2160,35 @@ private frame_bind_expr(ft: &FrameTrack, e: TExpr)
         TStore(place, v, _, _) -> frame_bind_store(ft, place, v)
         TCall(name, args, _, _) -> frame_bind_call(ft, name, args)
         TCallPtr(callee, args, _, _) -> frame_bind_ptr_call(ft, callee, args)
+        TVCall(recv, slot, args, _, _) -> frame_bind_vcall(ft, recv, slot, args)
         _ -> if ft.probe then probe_bind_patterns(ft, e)
 end frame_bind_expr
+
+// For a probe, a call through an object that keeps what it is handed (the receiver first) in what
+// another of them points at, where that one points into this frame or is reached through its local.
+private frame_bind_vcall(ft: &FrameTrack, recv: TExpr, slot: int, args: Buf[TExpr])
+    if !ft.probe then return
+
+    val all = with_receiver(recv, args)
+
+    for k in 0..<all.len()
+        val arg = all.at(k)
+
+        if !may_hold_pointer(ft.cx, texpr_type(arg)) then continue
+
+        val core = frame_core(ft, arg)
+
+        if core.is_none() then continue
+
+        for item in vcall_keeps(ft.cx, recv, slot, k)
+            if item.1.loc == "j" then continue
+
+            val loc = translate_loc(ft.org, all, item.1.loc)
+
+            if loc.starts_with("l:") then frame_hold(ft, local_of(loc), core.unwrap())
+            else probe_hold_kept(ft, all, item.1.loc, core.unwrap())
+    end for
+end frame_bind_vcall
 
 // **A name a pattern binds holds what its subject holds**, for a probe: a closure matched out of an
 // `Option` and handed on is the closure literal going there (`Some(g) -> install(g)`). The forms are
@@ -2213,6 +2240,7 @@ private frame_bind_ptr_call(ft: &FrameTrack, callee: TExpr, args: Buf[TExpr])
             val loc = translate_loc(ft.org, args, item.1.loc)
 
             if loc.starts_with("l:") then frame_hold(ft, local_of(loc), core.unwrap())
+            else if ft.probe then probe_hold_kept(ft, args, item.1.loc, core.unwrap())
 end frame_bind_ptr_call
 
 // A store into this frame's own storage -- by name, or through a pointer that points into it.
@@ -2223,7 +2251,36 @@ private frame_bind_store(ft: &FrameTrack, place: TExpr, v: TExpr)
             val loc = place_loc(ft.org, place)
 
             if loc.starts_with("l:") then frame_bind(ft, local_of(loc), v)
+            else if ft.probe then probe_hold_through(ft, place, v)
 end frame_bind_store
+
+// **For a probe, a closure stored into what a local points at is held by that local**: a heap object
+// this frame made (`r.p = Some(keep(f))`), an element of a `Buf` it holds. Where the object goes, the
+// closure goes -- returned, stored, handed to a keeper -- so the local is followed as holding it. A
+// parameter's pointee is storage that outlasts the frame already (`frame_stored`).
+private probe_hold_through(ft: &FrameTrack, place: TExpr, v: TExpr)
+    val root = pointee_root(ft, place)
+
+    if root.is_some() then frame_bind(ft, root.unwrap(), v)
+end probe_hold_through
+
+// The local whose pointer a place is reached through, past fields, elements and dereferences; not a
+// parameter.
+private pointee_root(ft: &FrameTrack, place: TExpr) -> Option[string]
+    *place.kind match
+        TLoad(n, _) ->
+            for item in ft.refs
+                if item.0 == n then return pointee_root(ft, item.1)
+
+            for p in ft.params
+                if p.0 == n then return None
+
+            Some(n)
+        TField(r, _, _) -> pointee_root(ft, r)
+        TIndex(r, _, _) -> pointee_root(ft, r)
+        TDeref(x, _) -> pointee_root(ft, x)
+        _ -> None
+end pointee_root
 
 // A callee that stores an argument into what another argument points at, where that one points into
 // this frame: the local it points into holds the first.
@@ -2241,7 +2298,20 @@ private frame_bind_call(ft: &FrameTrack, name: string, args: Buf[TExpr])
             val loc = translate_loc(ft.org, args, item.loc)
 
             if loc.starts_with("l:") then frame_hold(ft, local_of(loc), core.unwrap())
+            else if ft.probe then probe_hold_kept(ft, args, item.loc, core.unwrap())
 end frame_bind_call
+
+// **For a probe, a callee keeping an argument in what another argument points at, where that one is
+// reached through a local, makes the local hold it** (`r.items.push(f)`, `install(r, f)`).
+private probe_hold_kept(ft: &FrameTrack, args: Buf[TExpr], callee_loc: string, core: string)
+    for k in 0..<args.len()
+        if !callee_loc.starts_with(s"p$k:") && !callee_loc.starts_with(s"d:p$k:") then continue
+
+        pointee_root(ft, args.at(k)) match
+            Some(n) -> frame_hold(ft, n, core)
+            None -> ()
+    end for
+end probe_hold_kept
 
 // What one statement does with this frame's storage: the locations it overwrites at its top, and
 // every location outside the frame an address of its storage is handed to.
@@ -2304,9 +2374,15 @@ private frame_event_at(ft: &FrameTrack, evs: &EvBuf, e: TExpr)
         TStore(place, v, _, _) -> frame_stored(ft, evs, place, v)
         TAwait(task, _) -> await_clear(ft.hs, evs, task, e.span)
         TBlockOn(task, _) -> await_clear(ft.hs, evs, task, e.span)
-        TCall(_, _, _, _) -> call_at(ft, evs, e)
-        TVCall(_, _, _, _, _) -> call_at(ft, evs, e)
-        TCallPtr(_, _, _, _) -> call_at(ft, evs, e)
+        TCall(_, _, _, _) ->
+            call_at(ft, evs, e)
+            probe_reached(ft, e)
+        TVCall(_, _, _, _, _) ->
+            call_at(ft, evs, e)
+            probe_reached(ft, e)
+        TCallPtr(_, _, _, _) ->
+            call_at(ft, evs, e)
+            probe_reached(ft, e)
         TStep(_, wake) -> step_waker_at(ft, wake)
         TErase(v, _, ty) -> if ft.probe then probe_synced(ft, e.span, v, ty)
         TBox(v, ty) -> if ft.probe then probe_synced(ft, e.span, v, ty)
@@ -2605,6 +2681,75 @@ private probe_kept(ft: &FrameTrack, core: string, arg: TExpr, callee: string, pa
     probe_why(core, s"it is handed to '${shown_name(ft.cx.an, callee)}' ${probe_line(ft.scope, arg.span)}, " +
               s"which keeps its parameter '$param' ($how)")
 
+// **A closure in a slice literal handed to a call is taken to escape** (for a probe). What a callee
+// keeps and answers is asked of the slice itself, not of what it reads out of it: `column([a,
+// b.restyle(f)])` copies each element into the view it answers, and nothing says so. So the closures
+// of a slice literal (or a value made in place whose address is handed) go on the heap, as they did
+// before boxes were laid in the frame. They are gathered after what the call's keeps say, so a
+// closure the callee is known to keep is said with that reason.
+private probe_reached(ft: &FrameTrack, e: TExpr)
+    if !ft.probe then return
+
+    var callee = "a call through a function pointer"
+    var args: Buf[TExpr] = buf()
+
+    *e.kind match
+        TCall(name, handed, _, _) ->
+            callee = s"'${shown_name(ft.cx.an, name)}'"
+            args = handed
+        TVCall(recv, _, handed, _, _) ->
+            callee = "a call through an object"
+            args = with_receiver(recv, handed)
+        TCallPtr(_, handed, _, _) -> args = handed
+        _ -> ()
+
+    for arg in args
+        val core = sliced_text(ft, arg)
+
+        if core == "" then continue
+
+        ft.faults.items.push((ft.scope, arg.span, probe_why(core,
+            s"it is reached through a pointer handed to $callee ${probe_line(ft.scope, arg.span)}, which " +
+            "may keep what it reads through it")))
+    end for
+end probe_reached
+
+// The closures a value reaches through a pointer it is, or is built around: a slice literal's
+// elements, a local's whose address it is.
+private sliced_text(ft: &FrameTrack, e: TExpr) -> string = *e.kind match
+    TBufLit(elems, _) -> probe_all(ft, elems)
+    TBufFill(v, _, _) -> probe_text(ft, v)
+    TTempAddr(v, _) -> probe_text(ft, v)
+    TStructNew(_, args) -> sliced_all(ft, args)
+    TEnumNew(_, _, args) -> sliced_all(ft, args)
+    TArrayLit(elems, _) -> sliced_all(ft, elems)
+    TCast(v, _) -> sliced_text(ft, v)
+    TErase(v, _, _) -> sliced_text(ft, v)
+    TSeq(exprs) -> if exprs.is_empty() then "" else sliced_text(ft, exprs.at(exprs.len() - 1))
+    TBlockExpr(b) -> sliced_block(ft, b)
+    TIf(_, then_block, else_block, _) ->
+        sliced_block(ft, then_block) + (if else_block.is_some() then sliced_block(ft, else_block.unwrap()) else "")
+    TMatch(_, arms, _) ->
+        var all = ""
+
+        for arm in arms
+            all = all + sliced_block(ft, arm.body)
+
+        all
+    _ -> ""
+
+private sliced_all(ft: &FrameTrack, es: Buf[TExpr]) -> string
+    var all = ""
+
+    for item in es
+        all = all + sliced_text(ft, item)
+
+    all
+end sliced_all
+
+private sliced_block(ft: &FrameTrack, b: TBlock) -> string =
+    if b.result.is_some() then sliced_text(ft, b.result.unwrap()) else ""
+
 // What a conversion to `&sync` makes of a closure: one held by value, as every closure that crosses
 // a domain is.
 private probe_synced(ft: &FrameTrack, at: Span, v: TExpr, ty: Type)
@@ -2692,6 +2837,9 @@ private probe_text(ft: &FrameTrack, e: TExpr) -> string = *e.kind match
         None -> ""
     TEnumNew(_, _, args) -> probe_all(ft, args)
     TArrayLit(elems, _) -> probe_all(ft, elems)
+    TArrayFill(v, _) -> probe_text(ft, v)
+    TBufLit(elems, _) -> probe_all(ft, elems)
+    TBufFill(v, _, _) -> probe_text(ft, v)
     TBox(v, _) -> probe_text(ft, v)
     TErase(v, _, _) -> probe_text(ft, v)
     TCast(v, _) -> probe_text(ft, v)
