@@ -267,6 +267,58 @@ Both implementations are needed for [`assert_eq`](/library/core/) to accept thes
 bounded by `Eq + Display`, so either one alone would still be refused, and the diagnostic names the
 trait that is missing.
 
+### A dropped `Result` is a warning
+
+**A call whose `Result` nobody reads produces a warning, and the program still builds.** A failure
+that is never looked at is a failure that goes unseen, so a `Result` written as a statement — its
+value used for nothing — is almost certainly a mistake:
+
+```
+save(path: string) -> Result[unit, IoError] = …
+
+save("out.txt")
+```
+
+```
+warning: this 'sysl.Result[unit, sysl.fs.IoError]' is dropped unread, so a failure it carries goes
+unseen — handle it ('?', 'match', '.unwrap()'), or write '_ = …' to drop it on purpose
+```
+
+**Reading the value in any way is what silences it**: `?`, a `match`, a binding, a method call such as
+`.unwrap()` or `.is_ok()`, passing it to a function, returning it. Where dropping it really is
+meant — a temporary file removed on the way out, where a removal that fails changes nothing — **`_ =`
+drops it on purpose** ([`_` discards a part](/reference/expressions/#discards-a-part)), and the call
+still runs:
+
+```sysl
+import sysl.fs.remove_file
+
+count(n: int) -> Result[int, string]
+    print(s"count $n")
+    if n < 0 then Err("negative") else Ok(n)
+
+_ = count(-1)
+
+for i in 0..<2
+    _ = count(i)
+
+// Already gone or not, there is nothing left to do about it.
+_ = remove_file("no-such-scratch-file.tmp")
+```
+
+```output
+count -1
+count 0
+count 1
+```
+
+The rule follows the position, not the form, as [statement position](/reference/expressions/#statement-position-discards-a-block-s-value)
+does: a branch of an `if` or an arm of a `match` in statement position, a loop body, a `defer`ed
+call and the last line of a function returning nothing each drop what they compute, and each is
+told at the call. A generic body is told once, where it is written, when what it drops is a
+`Result` there — `Result[T, E]` included — and never because a caller instantiated its `T` as one.
+There is no switch to silence the warning; `_ =` is the spelling for meaning it.
+
 ## `?`
 
 The [expressions page](/reference/expressions/) gives `?` its place in the grammar: postfix, at the
