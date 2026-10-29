@@ -289,7 +289,7 @@ associated_on(cx: &Analyzer, span: Span, ty: Type, name: string, args: Buf[Expr]
         wants.push(want)
 
         slots.unwrap().at(i) match
-            Some(e) -> ts.push(type_expr(cx, e, Some(want)))
+            Some(e) -> ts.push(argument_told(cx, e, decl.params.at(i), decl.tparams, want))
             None ->
                 val inner = default_reader(cx, span, member_default_scope(cx, fname), fname,
                                            decl.bounds)
@@ -1382,7 +1382,7 @@ private call_generic_member(cx: &Analyzer, span: Span, receiver: Option[TExpr], 
                     t = prov.kept.at(i).unwrap()
 
                     if disagree(texpr_type(t), want) then t = coerce(cx, t, want)
-                else t = type_expr(cx, e, Some(want))
+                else t = argument_told(cx, e, m.params.at(i), m.tparams, want)
 
                 given.push(t)
             None ->
@@ -1492,7 +1492,7 @@ private member_dispatch(cx: &Analyzer, span: Span, receiver: TExpr, rty: Type, b
         wants.push(want)
 
         slots.unwrap().at(i) match
-            Some(e) -> given.push(type_expr(cx, e, Some(want)))
+            Some(e) -> given.push(argument_told(cx, e, m.params.at(i), m.tparams, want))
             None ->
                 val inner = default_reader(cx, span, member_default_scope(cx, fname), fname, m.bounds)
                 val read = default_at(inner, m.params.at(i).default.unwrap(), want)
@@ -2597,6 +2597,31 @@ private erased_slot(cx: &Analyzer, rty: Type, name: string) -> Option[(int, Meth
     None
 end erased_slot
 
+// The names a trait member's written types may use for something else: its own type parameters and
+// the trait's, which a call through the table reads at the object's arguments.
+private trait_names(d: Option[TraitDecl], m: MethodDecl) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for n in m.tparams
+        out.push(n)
+
+    if d.is_some()
+        for n in d.unwrap().tparams
+            out.push(n)
+
+    out
+end trait_names
+
+// An argument read at the type its parameter declared, a literal that does not fit it being told that
+// type as the declaration wrote it.
+private argument_told(cx: &Analyzer, e: Expr, p: Param, tparams: Buf[string], want: Type) -> TExpr
+    val saved = told_by(cx, Some(p.typ), Some(want), tparams)
+    val t = type_expr(cx, e, Some(want))
+
+    cx.declared = saved
+    t
+end argument_told
+
 // The call itself, with the member's signature read in the object's own terms: `Self` is the object,
 // which is what an object writes its bindings down for.
 private erased_call(cx: &Analyzer, span: Span, receiver: TExpr, rty: Type, slot: int,
@@ -2635,7 +2660,11 @@ private erased_call(cx: &Analyzer, span: Span, receiver: TExpr, rty: Type, slot:
 
         slots.unwrap().at(i) match
             Some(e) ->
+                val saved = if want.is_some() && i < m.params.len()
+                            then told_by(cx, Some(m.params.at(i).typ), want, trait_names(d, m)) else cx.declared
                 val t = type_expr(cx, e, want)
+
+                cx.declared = saved
 
                 if by_position && want.is_some() && disagree(texpr_type(t), want.unwrap()) then
                     cx.fault(e.span, s"the ${ordinal(i + 1)} argument of this callable is " +

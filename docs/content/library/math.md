@@ -1138,7 +1138,7 @@ print(pow(2, -1))
 ```
 
 ```error
-the literal -1 does not fit uint
+the literal -1 does not fit u32
 ```
 
 **An overflowing power wraps**, as every other integer operation in the language does. `pow(2, 64)`
