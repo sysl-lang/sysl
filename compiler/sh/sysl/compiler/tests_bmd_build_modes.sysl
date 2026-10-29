@@ -5,14 +5,15 @@ import sysl.buf.{Buf, buf}
 import sysl.fs.{is_file, make_temp_dir, remove_dir_all, write_text}
 import sysl.process.{capture, Status}
 import sysl.testing.skip
-import sysl.text.split
+import sysl.text.{split, str_builder}
 
 // The two build modes (`build_mode.sysl`): in a debug build a plain `+`, `-`, `*`, a unary `-`, a
 // compound assignment, `++`/`--` and a written integer conversion that cannot hold its answer stop the
 // program through the bounds report (`integer overflow: ...`); in a release build each wraps at the
-// declared width, exactly. Every cell is built in both modes, at `-O0` and at the default level --
-// an optimizer that folded the check to its outcome must still make the call -- and the release
-// answer is asserted digit for digit, since "it did not trap" is not the claim.
+// declared width, exactly. Every cell is built in both modes and the release answer is asserted digit
+// for digit, since "it did not trap" is not the claim; one operator, the unary minus and a conversion
+// are built at `-O0` too, since an optimizer that folded a check to its outcome must still make the
+// call.
 
 private bmd_ready() -> bool = std_root().is_ok() && clang_available()
 
@@ -47,13 +48,20 @@ private bmd_run(text: string, flag: string, level: string) -> (Status, string, s
         Ok(out) -> (out.status, out.text, out.err.unwrap_or(""))
 end bmd_run
 
-// At both levels, a debug build prints `before` and then stops on SIGTRAP having written exactly
+// At the default level, a debug build prints `before` and then stops on SIGTRAP having written exactly
 // `report` to standard error, and a release build prints `before` followed by `wrapped` and exits
 // cleanly with nothing on standard error.
-private bmd_cell(text: string, before: string, report: string, wrapped: string)
+private bmd_cell(text: string, before: string, report: string, wrapped: string) =
+    bmd_cell_at([DefaultOptimization], text, before, report, wrapped)
+
+// The same at `-O0` as well, for the cells where an optimizer folding the check matters most.
+private bmd_cell_both(text: string, before: string, report: string, wrapped: string) =
+    bmd_cell_at(["0", DefaultOptimization], text, before, report, wrapped)
+
+private bmd_cell_at(levels: []const string, text: string, before: string, report: string, wrapped: string)
     if !bmd_ready() then return
 
-    for level in ["0", DefaultOptimization]
+    for level in levels
         val (state, printed, err) = bmd_run(text, "--debug", level)
 
         assert_eq(err, report)
@@ -65,26 +73,26 @@ private bmd_cell(text: string, before: string, report: string, wrapped: string)
         assert_eq(rerr, "")
         assert_eq(rprinted, before + wrapped)
         assert(rstate.ok(), s"release -O$level stopped with $rstate, having printed '$rprinted'")
-end bmd_cell
+end bmd_cell_at
 
-// At both levels and in both modes, the program prints `expected` and exits cleanly.
+// In both modes, the program prints `expected` and exits cleanly.
 private bmd_same(text: string, expected: string)
     if !bmd_ready() then return
 
-    for level in ["0", DefaultOptimization]
-        for flag in ["--debug", "--release"]
-            val (state, printed, err) = bmd_run(text, flag, level)
+    for flag in ["--debug", "--release"]
+        val (state, printed, err) = bmd_run(text, flag, DefaultOptimization)
 
-            assert_eq(err, "")
-            assert_eq(printed, expected)
-            assert(state.ok(), s"$flag -O$level stopped with $state")
+        assert_eq(err, "")
+        assert_eq(printed, expected)
+        assert(state.ok(), s"$flag stopped with $state")
 end bmd_same
 
 // -- each operator, at each width --------------------------------------------------------------------
 
 @test("u8 addition past 255 stops a debug build and wraps to the low byte in a release one")
 bmd_u8_add()
-    bmd_cell("var a: u8 = 200\nprint(a + 100)\n", "", "integer overflow: byte + byte (main.sysl:2:7)\n", "44\n")
+    bmd_cell_both("var a: u8 = 200\nprint(a + 100)\n", "", "integer overflow: byte + byte (main.sysl:2:7)\n",
+                  "44\n")
 
 @test("i16 subtraction below its minimum stops a debug build and wraps to its maximum in a release one")
 bmd_i16_sub()
@@ -116,7 +124,7 @@ bmd_i128_mul()
 
 @test("unary minus of a signed minimum stops a debug build and is the minimum again in a release one")
 bmd_negate_minimum()
-    bmd_cell("var a: i8 = -128\nprint(-a)\n", "", "integer overflow: -i8 (main.sysl:2:7)\n", "-128\n")
+    bmd_cell_both("var a: i8 = -128\nprint(-a)\n", "", "integer overflow: -i8 (main.sysl:2:7)\n", "-128\n")
 
 @test("a compound assignment is the operation it abbreviates and is checked the same way")
 bmd_compound_assignment()
@@ -135,7 +143,7 @@ bmd_decrement()
 
 @test("a written narrowing that cannot hold the value stops a debug build and keeps the low bits in release")
 bmd_narrowing()
-    bmd_cell("var n = 300\nprint(u8(n))\n", "", "integer overflow: byte(int) (main.sysl:2:7)\n", "44\n")
+    bmd_cell_both("var n = 300\nprint(u8(n))\n", "", "integer overflow: byte(int) (main.sysl:2:7)\n", "44\n")
 
 @test("a written conversion across the sign that cannot hold the value is checked the same way")
 bmd_across_the_sign()

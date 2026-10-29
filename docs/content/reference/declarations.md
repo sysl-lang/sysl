@@ -338,15 +338,15 @@ for i in 0..<256
 the literal 256 does not fit byte
 ```
 
-A comparison with a narrow value is a use that fixes the variable, so arithmetic on it wraps at that
-width, as it would with the type written on a bound:
+A comparison with a narrow value is a use that fixes the variable, so arithmetic on it is at that
+width, as it would be with the type written on a bound — here `+%`, which wraps:
 
 ```sysl
 val limit: u8 = 252
 
 for i in 250..<255
     if i == limit then print("at the limit")
-    print(i + 10)
+    print(i +% 10)
 ```
 
 ```output

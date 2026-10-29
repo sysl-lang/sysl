@@ -1116,13 +1116,16 @@ undefined function 'gcd'
 import sysl.math.pow
 
 print(pow(2, 10), pow(-3, 3))
-print(pow(2, 64), pow(2u8, 9))
+print(pow(2, 64))
 ```
 
-```output
+```output trap
 1024 -27
-0 0
 ```
+
+**An overflowing power overflows as the `*` inside it does**: the run above — the site runs its
+examples as `sysl run` does, in debug — stops at `pow(2, 64)` with `integer overflow: int * int`, and
+a release build prints `0`, the doubling wrapped at the width.
 
 **The exponent is a `u32` and not a `T`**, because how many times to multiply is a *count* rather
 than a value of the type being multiplied — the same reason `rotate_left` takes one. A negative
