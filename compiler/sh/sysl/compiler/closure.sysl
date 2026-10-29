@@ -526,13 +526,17 @@ private refuse_lost_writes(cx: &Analyzer, span: Span, st: &StructType, captured:
 
         if scan.uses.at(i) == scan.writes.at(i)
             lost_write_owed(cx, scan.at.at(i), name, scan.form.at(i), shown,
-                            "and nothing in the closure reads it back", st.base, i)
+                            "and nothing in the closure reads it back", here, st.base, i, buf())
             continue
         end if
 
         if outer.is_some()
+            var chain: Buf[(string, usize)] = buf()
+
+            chain.push((st.base, i))
             cx.copy_writes.push(CopyWrite(outer.unwrap().unique, name, span, scan.at.at(i),
-                                          scan.form.at(i), shown, st.base, i))
+                                          scan.form.at(i), shown, chain))
+        end if
     end for
 end refuse_lost_writes
 
@@ -542,14 +546,25 @@ end refuse_lost_writes
 //
 // The refusal is in the words the pattern binding's is said in: what was copied, where the write
 // lands instead, and the two ways to say what was meant.
+//
+// **A write made through a closure written inside the one that holds the copy** names both: the
+// closure the write is in, and the one around it that captures by value.
 private lost_write_owed(cx: &Analyzer, at: Span, name: string, form: string, shown: string, why: string,
-                        base: string, capture: usize) =
-    cx.an.lost_writes.push(OwedWrite(cx.scope, at, "this closure captures by value", ", since ",
+                        head: string, base: string, capture: usize, via: Buf[(string, usize)]) =
+    cx.an.lost_writes.push(OwedWrite(cx.scope, at, head, ", since ",
         s", so it holds a copy of '$name' — so $form would reach that copy rather than the variable it " +
         s"came from, $why. Where you mean to change '$name', hold it as a '&$shown' and write through " +
-        "it, or have the closure return the value", base, capture))
+        "it, or have the closure return the value", base, capture, via))
+
+private const here: string = "this closure captures by value"
+
+private const around: string =
+    "this closure writes through to a closure it is written in, and that one captures by value"
 
 // A binding a closure wrote its copy of, kept until the enclosing body reads the binding again.
+// `chain` is the closure the write is in and its capture, then each closure around it the record
+// was handed up through: the write reaches the variable only if every one of them holds that
+// capture by reference.
 struct CopyWrite
     unique: string
     name: string
@@ -557,8 +572,7 @@ struct CopyWrite
     write: Span
     form: string
     shown: string
-    base: string
-    capture: usize
+    chain: Buf[(string, usize)]
 end CopyWrite
 
 // **A read of a binding after a closure wrote its own copy of it** is a program expecting the write
@@ -573,8 +587,17 @@ read_after_copy_write(cx: &Analyzer, span: Span, unique: string)
         if w.unique != unique then continue
         if span.start >= w.closure.start && span.end <= w.closure.end then continue
 
-        lost_write_owed(cx, w.write, w.name, w.form, w.shown,
-                        "and the variable is used afterwards as though it had", w.base, w.capture)
+        // One owed refusal for each closure of the chain, said only for the nearest to hold its
+        // capture by value: the ones before it are its `via`, every one held by reference.
+        var via: Buf[(string, usize)] = buf()
+
+        for link in w.chain
+            lost_write_owed(cx, w.write, w.name, w.form, w.shown,
+                            "and the variable is used afterwards as though it had",
+                            if via.is_empty() then here else around, link.0, link.1, via.copy())
+            via.push(link)
+        end for
+
         cx.copy_writes.remove(i)
         return
     end for
@@ -585,7 +608,12 @@ end read_after_copy_write
 // inner one, so the record is handed to the enclosing body as a write of ITS variable: a read there
 // after the outer closure is a program expecting the write to have reached it, refused as it is for
 // a closure written directly in that body. A record of the outer closure's own local stays behind.
-private hand_up_copy_writes(cx: &Analyzer, inner: &Analyzer, span: Span, captured: Buf[string])
+//
+// **The outer closure joins the record's chain**: an inner closure holding the capture by reference
+// writes the outer closure's copy, which is lost in its turn where the outer closure holds the
+// variable by value.
+private hand_up_copy_writes(cx: &Analyzer, inner: &Analyzer, span: Span, base: string,
+                            captured: Buf[string])
     if inner.copy_writes.is_empty() then return
 
     for w in inner.copy_writes
@@ -595,8 +623,12 @@ private hand_up_copy_writes(cx: &Analyzer, inner: &Analyzer, span: Span, capture
             val outer = cx.lookup(captured.at(i))
 
             if outer.is_some()
+                val chain = w.chain.copy()
+
+                chain.push((base, i))
                 cx.copy_writes.push(CopyWrite(outer.unwrap().unique, w.name, span, w.write, w.form,
-                                              w.shown, w.base, w.capture))
+                                              w.shown, chain))
+            end if
         end for
     end for
 end hand_up_copy_writes
@@ -915,7 +947,7 @@ private closure_body(cx: &Analyzer, span: Span, st: &StructType, fname: string,
 
     check_consumes(inner, block)
     check_counted_pointers(inner, block)
-    hand_up_copy_writes(cx, inner, span, captured)
+    hand_up_copy_writes(cx, inner, span, st.base, captured)
 
     var ret = Unit
 
