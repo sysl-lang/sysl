@@ -17,6 +17,7 @@ These pages are generated from the library's own doc comments: every declaration
 | [`sysl.buf`](sysl-buf/) | The growable sequence and the sink built on it. |
 | [`sysl.c`](sysl-c/) | The C variadic forms: `va_start`, `va_arg`, `va_copy` and `va_end`. |
 | [`sysl.checksum`](sysl-checksum/) | Checksums that detect accidental corruption and nothing else. |
+| [`sysl.codec`](sysl-codec/) | Turning a value into a format and back, written once for every type and every format. |
 | [`sysl.container`](sysl-container/) | Five containers, each with a shape a slice and a `Buf` cannot give you. |
 | [`sysl.container.ring`](sysl-container-ring/) | A queue of a **fixed** capacity, laid over storage the caller supplies, cheap to take from at either end and needing no allocator at all. |
 | [`sysl.crypto`](sysl-crypto/) | Cryptographic hashing: the SHA-2 family, SHA-1 and MD5, HMAC over any of them, and PBKDF2. |

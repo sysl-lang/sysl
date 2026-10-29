@@ -235,16 +235,18 @@ element_addr(e: *Emit, receiver: TExpr, index: TExpr, site: Span) -> Val
 
     val i = widen_index(e, index, site)
 
-    parts.1 match
-        Some(l) -> bounds_check(e, i, l, signed_index(index), site)
-        None -> ()
+    // Inside `@unchecked` the subscript is the address and nothing else (`unchecked.sysl`).
+    if !unchecked_index(index)
+        parts.1 match
+            Some(l) -> bounds_check(e, i, l, signed_index(index), site)
+            None -> ()
 
     val r = fresh_reg(e)
 
     var idx: Buf[IrArg] = buf()
 
     idx.push(ir_arg(word_lty(e), i))
-    emit(e, InGep(r, lty(e, parts.2), parts.0, idx))
+    emit(e, InGep(r, stride_lty(e, parts.2), parts.0, idx))
     r
 end element_addr
 
@@ -293,7 +295,7 @@ run_addr(e: *Emit, receiver: TExpr, index: TExpr, lanes: int, site: Span) -> Val
     var idx: Buf[IrArg] = buf()
 
     idx.push(ir_arg(wty, i))
-    emit(e, InGep(r, lty(e, parts.2), parts.0, idx))
+    emit(e, InGep(r, stride_lty(e, parts.2), parts.0, idx))
     r
 end run_addr
 
@@ -321,10 +323,15 @@ end index_list
 // An index brought to the address width. A wider one is checked to fit first, since truncating it
 // would turn an index past the end into one inside. `site` is what a failure names, and `kind` says
 // whether the value is an index or a count.
-widen_index(e: *Emit, index: TExpr, site: Span, kind: int = BoundsTooWide) -> Val =
+//
+// Inside `@unchecked` it is brought there with no test at all (`unchecked.sysl`).
+widen_index(e: *Emit, index: TExpr, site: Span, kind: int = BoundsTooWide) -> Val
+    if unchecked_index(index) then return unchecked_index_val(e, unchecked_inner(index))
+
     underlying(texpr_type(index)) match
         Integer(bits, signed, _) -> widen_index_val(e, gen_expr(e, index), bits, signed, site, kind)
         other -> gap_at(e, s"index of type ${type_show(other)}")
+end widen_index
 
 // `widen_index` over an index already generated: `v`, an integer of `bits` bits.
 private widen_index_val(e: *Emit, v: Val, bits: int, signed: bool, site: Span, kind: int) -> Val
@@ -822,14 +829,15 @@ private address_under(e: *Emit, place: TExpr, root: TExpr, at: Val) -> Val
             val base = address_under(e, r, root, at)
             val i = widen_index(e, index, place.span)
 
-            bounds_check(e, i, VInt(from_int(parts.0)), signed_index(index), place.span)
+            if !unchecked_index(index) then
+                bounds_check(e, i, VInt(from_int(parts.0)), signed_index(index), place.span)
 
             val x = fresh_reg(e)
 
             var idx: Buf[IrArg] = buf()
 
             idx.push(ir_arg(word_lty(e), i))
-            emit(e, InGep(x, lty(e, parts.1), base, idx))
+            emit(e, InGep(x, stride_lty(e, parts.1), base, idx))
             x
 
         _ -> address(e, place)
@@ -964,7 +972,7 @@ private gen_slice_of(e: *Emit, parts: (Val, Val, Option[Val]), lo: Option[TExpr]
     var idx: Buf[IrArg] = buf()
 
     idx.push(ir_arg(word_lty(e), start))
-    emit(e, InGep(p, lty(e, elem), first, idx))
+    emit(e, InGep(p, stride_lty(e, elem), first, idx))
 
     val n = fresh_reg(e)
 

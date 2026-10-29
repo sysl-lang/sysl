@@ -1,0 +1,460 @@
+module sysl.encoding.json
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.container.{Map, Set, map, set}
+import sysl.codec.{Codec, CodecError, Decode, Decoder, Default, rename, skip, default, flatten, tag, content,
+                   deny_unknown}
+
+// `sysl.codec` read and written through JSON: what a derived type looks like on the wire, that it
+// reads back as itself, and what a refusal says. Each refusal is pinned whole -- the path, the fault
+// and the byte.
+
+private rt[T](v: T) -> T = from_json[T](to_json(v).unwrap()).unwrap()
+
+private refused[T](text: string) -> string = from_json[T](text) match
+    Ok(_) -> "accepted"
+    Err(e) -> e.to_string()
+
+private json_of[T](v: T) -> string = to_json(v).unwrap()
+
+// -- the types the tests read and write ------------------------------------------------------------
+
+struct Scalars derives Codec, Eq
+    b: bool
+    small: i8
+    byte: u8
+    big: u64
+    neg: i64
+    odd: u24
+    r: real
+    f: f32
+    c: char
+    s: string
+
+struct Inner derives Codec, Eq
+    z: int
+
+struct Outer derives Codec
+    @rename("id") outer_id: u32
+    inner: Inner
+    items: Buf[Inner]
+    grid: Buf[Buf[int]]
+    pair: (int, string)
+    three: [3]u8
+    note: Option[string]
+    maybe: Option[Inner]
+
+enum Shape derives Codec, Eq
+    Dot
+    Circle(r: int)
+    Rect(w: int, h: int)
+    @rename("tri") Triangle(a: int, b: int, c: int)
+
+enum Expr derives Codec
+    Lit(n: int)
+    Add(a: &Expr, b: &Expr)
+    Neg(e: &Expr)
+
+private eval(e: &Expr) -> int = *e match
+    Lit(n) -> n
+    Add(a, b) -> eval(a) + eval(b)
+    Neg(x) -> 0 - eval(x)
+
+struct Config derives Codec
+    @default(8080) port: u16
+    @default("localhost") host: string
+    @default(Shape.Dot) shape: Shape
+    name: string
+    @skip cache: Buf[int]
+    @skip @default(7) seven: int
+    tags: Option[Buf[string]]
+
+@deny_unknown
+struct Strict derives Codec
+    a: int
+    @rename("bee") b: int
+
+struct Meta derives Codec
+    version: int
+    author: string
+
+@deny_unknown
+struct Doc derives Codec
+    title: string
+    @flatten meta: Meta
+    body: string
+
+@tag("type")
+enum Event derives Codec, Eq
+    Login(user: string)
+    @rename("logout") Leave(user: string, after_ms: u32)
+    Ping
+
+@tag("t") @content("c")
+enum Msg derives Codec, Eq
+    Text(body: string)
+    Move(x: int, y: int)
+    Quit
+
+struct Tables derives Codec
+    by_name: Map[string, int]
+    by_id: Map[int, string]
+    seen: Set[string]
+
+struct Gain derives Codec
+    g: q15
+
+struct Deep derives Codec
+    next: Option[&Deep]
+    v: int
+
+struct Lookup
+    hits: int
+
+impl Default for Lookup
+    default() -> Lookup = Lookup(42)
+
+struct Session derives Codec
+    @rename("id") session_id: u64
+    events: Buf[Event]
+    @skip cache: Lookup
+
+// -- scalars and strings ---------------------------------------------------------------------------
+
+@test("every scalar a struct holds writes as JSON's own and reads back as itself")
+cdc_scalars_round_trip()
+    val v = Scalars(true, -128, 255, 18446744073709551615, -9223372036854775807 - 1, 16777215, 0.1, 1.5,
+                    'é', "plain")
+
+    assert_eq(json_of(v), "{\"b\":true,\"small\":-128,\"byte\":255,\"big\":18446744073709551615," +
+              "\"neg\":-9223372036854775808,\"odd\":16777215,\"r\":0.1,\"f\":1.5,\"c\":\"é\",\"s\":\"plain\"}")
+    assert(rt(v) == v)
+end cdc_scalars_round_trip
+
+@test("a string's quote, backslash and control bytes are escaped, and come back, with UTF-8 as itself")
+cdc_string_escapes()
+    val s = "q\"b\\n\nt\tz\u{1}é😀/"
+
+    assert_eq(json_of(s), "\"q\\\"b\\\\n\\nt\\tz\\u0001é😀/\"")
+    assert_eq(rt(s), s)
+    assert_eq(from_json[string]("\"\\u00e9\\ud83d\\ude00\\/\"").unwrap(), "é😀/")
+    assert_eq(rt(""), "")
+
+@test("a real is written shortest, with a point, and reads back as the same value")
+cdc_reals()
+    assert_eq(json_of(1.0), "1.0")
+    assert_eq(json_of(-2.5e-300), "-2.5e-300")
+    assert_eq(rt(1e300), 1e300)
+    assert_eq(rt(0.1 + 0.2), 0.1 + 0.2)
+    assert_eq(from_json[real]("3").unwrap(), 3.0)
+    assert_eq(from_json[f32]("0.25").unwrap(), 0.25)
+
+@test("a NaN or an infinity is refused, latched at the byte it would have gone at")
+cdc_not_finite()
+    val bad = Scalars(false, 0, 0, 0, 0, 0, 0.0 / 0.0, 1.0, 'x', "")
+
+    assert_eq(to_json(bad).unwrap_err().to_string(),
+              "a NaN or an infinity, which the format has no spelling for (byte 58)")
+    assert_eq(to_json(1.0 / 0.0).unwrap_err().to_string(),
+              "a NaN or an infinity, which the format has no spelling for (byte 0)")
+
+@test("an integer is held to its type's range, at every width")
+cdc_integer_ranges()
+    assert_eq(from_json[u8]("255").unwrap(), 255)
+    // A width with a name of its own is called by it, as every diagnostic calls it.
+    assert_eq(refused[u8]("256"), "out of range for byte (byte 0)")
+    assert_eq(refused[u8]("-1"), "out of range for byte (byte 0)")
+    assert_eq(refused[i8](" -129"), "out of range for i8 (byte 1)")
+    assert_eq(from_json[u64]("18446744073709551615").unwrap(), 18446744073709551615)
+    assert_eq(refused[u64]("18446744073709551616"), "out of range for ulong (byte 0)")
+    assert_eq(refused[i64]("-9223372036854775809"), "out of range for long (byte 0)")
+    assert_eq(refused[int]("123456789012345678901234567890123456789012345"), "out of range for int (byte 0)")
+    assert_eq(refused[u24]("16777216"), "out of range for u24 (byte 0)")
+    assert_eq(refused[int]("1.0"), "an integer expected (byte 0)")
+    assert_eq(refused[int]("1e2"), "an integer expected (byte 0)")
+end cdc_integer_ranges
+
+@test("a char is a string of exactly one character")
+cdc_chars()
+    assert_eq(rt('😀'), '😀')
+    assert_eq(refused[char]("\"ab\""), "one character expected (byte 0)")
+    assert_eq(refused[char]("\"\""), "one character expected (byte 0)")
+
+@test("a fixed-point value is its real value, and reads back only where it is exact")
+cdc_fixed_point()
+    val g = Gain(0.5)
+
+    assert_eq(json_of(g), "{\"g\":0.5}")
+    assert(real(rt(g).g) == 0.5)
+    assert(real(from_json[Gain]("{\"g\":-0.25}").unwrap().g) == -0.25)
+    assert_eq(refused[Gain]("{\"g\":0.1}"), "g: not exactly representable as q15 (byte 5)")
+    assert_eq(refused[Gain]("{\"g\":3}"), "g: not exactly representable as q15 (byte 5)")
+
+// -- structs, containers, enums --------------------------------------------------------------------
+
+private outer() -> Outer
+    var items: Buf[Inner] = buf()
+    var row: Buf[int] = buf()
+    var grid: Buf[Buf[int]] = buf()
+
+    items.push(Inner(1))
+    items.push(Inner(2))
+    row.push(5)
+    grid.push(row)
+    grid.push(buf())
+
+    Outer(9, Inner(3), items, grid, (4, "four"), [7, 8, 9], Some("n"), None)
+end outer
+
+@test("a struct nests, renames, and holds Bufs, tuples, arrays and Options")
+cdc_nested_struct()
+    val text = json_of(outer())
+
+    assert_eq(text, "{\"id\":9,\"inner\":{\"z\":3},\"items\":[{\"z\":1},{\"z\":2}],\"grid\":[[5],[]]," +
+              "\"pair\":[4,\"four\"],\"three\":[7,8,9],\"note\":\"n\",\"maybe\":null}")
+
+    val back = from_json[Outer](text).unwrap()
+
+    assert_eq(back.outer_id, 9)
+    assert(back.inner == Inner(3))
+    assert(back.items.len() == 2 && back.items[1] == Inner(2))
+    assert(back.grid.len() == 2 && back.grid[0][0] == 5 && back.grid[1].is_empty())
+    assert(back.pair.0 == 4 && back.pair.1 == "four")
+    assert(back.three[2] == 9)
+    assert_eq(back.note, Some("n"))
+    assert(back.maybe.is_none())
+    assert_eq(json_of(back), text)
+end cdc_nested_struct
+
+@test("an enum is its name, or an object of one member holding its fields; a renamed variant its new name")
+cdc_enums()
+    assert_eq(json_of(Shape.Dot), "\"Dot\"")
+    assert_eq(json_of(Shape.Circle(5)), "{\"Circle\":{\"r\":5}}")
+    assert_eq(json_of(Shape.Rect(2, 3)), "{\"Rect\":{\"w\":2,\"h\":3}}")
+    assert_eq(json_of(Shape.Triangle(1, 2, 3)), "{\"tri\":{\"a\":1,\"b\":2,\"c\":3}}")
+
+    for s in [Shape.Dot, Shape.Circle(5), Shape.Rect(2, 3), Shape.Triangle(1, 2, 3)]
+        assert(rt(s) == s)
+
+    assert(from_json[Shape]("{\"Dot\":null}").unwrap() == Shape.Dot)
+    assert(from_json[Shape]("{\"Dot\":{}}").unwrap() == Shape.Dot)
+    assert(from_json[Shape](" { \"Rect\" : { \"h\" : 3 , \"w\" : 2 } } ").unwrap() == Shape.Rect(2, 3))
+end cdc_enums
+
+@test("a recursive enum reads its references back as a tree of its own")
+cdc_recursive_refs()
+    val e: &Expr = Expr.Add(Expr.Lit(2), Expr.Neg(Expr.Lit(5)))
+    val text = json_of(e)
+
+    assert_eq(text, "{\"Add\":{\"a\":{\"Lit\":{\"n\":2}},\"b\":{\"Neg\":{\"e\":{\"Lit\":{\"n\":5}}}}}}")
+    assert_eq(eval(from_json[&Expr](text).unwrap()), -3)
+
+@test("a map with string keys is an object, any other a list of pairs, and a set a list")
+cdc_maps_and_sets()
+    val t = Tables(map(), map(), set())
+
+    t.by_name.put("b", 2)
+    t.by_name.put("a", 1)
+    t.by_id.put(7, "seven")
+    t.seen.add("x")
+
+    val text = json_of(t)
+
+    assert_eq(text, "{\"by_name\":{\"b\":2,\"a\":1},\"by_id\":[[7,\"seven\"]],\"seen\":[\"x\"]}")
+
+    val back = from_json[Tables](text).unwrap()
+
+    assert_eq(back.by_name.get("a"), Some(1))
+    assert_eq(back.by_name.get("b"), Some(2))
+    assert_eq(back.by_id.get(7), Some("seven"))
+    assert(back.seen.has("x") && back.seen.len() == 1)
+    assert_eq(json_of(back), text)
+    assert_eq(refused[Map[string, int]]("{\"a\":1,\"a\":2}"), "'a' is written twice (byte 7)")
+end cdc_maps_and_sets
+
+// -- missing, defaulted, skipped and unknown fields ------------------------------------------------
+
+@test("a missing field takes its @default, an Option reads None, and a @skip is never written")
+cdc_defaults_and_skips()
+    val c = from_json[Config]("{\"name\":\"n\"}").unwrap()
+
+    assert_eq(c.port, 8080)
+    assert_eq(c.host, "localhost")
+    assert(c.shape == Shape.Dot)
+    assert(c.cache.is_empty())
+    assert_eq(c.seven, 7)
+    assert(c.tags.is_none())
+
+    var cache: Buf[int] = buf()
+
+    cache.push(1)
+
+    val given = Config(1, "h", Shape.Circle(2), "m", cache, 99, None)
+
+    assert_eq(json_of(given), "{\"port\":1,\"host\":\"h\",\"shape\":{\"Circle\":{\"r\":2}},\"name\":\"m\",\"tags\":null}")
+
+    val back = rt(given)
+
+    assert_eq(back.port, 1)
+    assert(back.shape == Shape.Circle(2))
+    assert(back.cache.is_empty())
+    assert_eq(back.seven, 7)
+    // A skipped field written in the input anyway is an unknown key, and passed over.
+    assert_eq(from_json[Config]("{\"name\":\"n\",\"seven\":1,\"cache\":[1]}").unwrap().seven, 7)
+end cdc_defaults_and_skips
+
+@test("a skipped field with no @default takes its type's Default")
+cdc_skip_takes_default()
+    val s = from_json[Session]("{\"id\":5,\"events\":[{\"type\":\"Ping\"}]}").unwrap()
+
+    assert_eq(s.session_id, 5)
+    assert_eq(s.cache.hits, 42)
+    assert(s.events[0] == Event.Ping)
+
+@test("an unknown key is skipped whatever its value holds, and refused under @deny_unknown")
+cdc_unknown_fields()
+    assert_eq(from_json[Inner]("{\"x\":{\"y\":[1,{\"z\":\"no\"}],\"w\":null},\"z\":4,\"q\":true}").unwrap().z, 4)
+    assert_eq(from_json[Strict]("{\"a\":1,\"bee\":2}").unwrap().b, 2)
+    assert_eq(refused[Strict]("{\"a\":1,\"b\":2}"), "'b' is not a field of Strict (byte 7)")
+    // The byte is the key's own, past the comma and the blanks around it.
+    assert_eq(refused[Strict]("{\"a\":1 ,\n \"b\":2}"), "'b' is not a field of Strict (byte 10)")
+    assert_eq(refused[Inner]("{ }"), "the field 'z' is missing (byte 2)")
+    // A skipped value is still read, and refused where it is not JSON.
+    assert_eq(refused[Inner]("{\"x\":[1,],\"z\":4}"), "a value expected (byte 8)")
+
+@test("a missing field without a default is named, at the end of its object")
+cdc_missing_field()
+    assert_eq(refused[Inner]("{}"), "the field 'z' is missing (byte 1)")
+    assert_eq(refused[Outer]("{\"id\":1,\"inner\":{ }}"), "inner: the field 'z' is missing (byte 18)")
+    assert_eq(refused[Shape]("{\"Rect\":{\"w\":1}}"), "Rect: the field 'h' is missing (byte 14)")
+
+@test("a flattened struct's fields are written at its level, and read from there")
+cdc_flatten()
+    val d = Doc("t", Meta(2, "ann"), "b")
+    val text = json_of(d)
+
+    assert_eq(text, "{\"title\":\"t\",\"version\":2,\"author\":\"ann\",\"body\":\"b\"}")
+
+    val back = from_json[Doc]("{\"author\":\"bob\",\"body\":\"x\",\"title\":\"y\",\"version\":3}").unwrap()
+
+    assert_eq(back.meta.author, "bob")
+    assert_eq(back.meta.version, 3)
+    assert_eq(back.body, "x")
+    assert_eq(refused[Doc]("{\"title\":\"t\",\"version\":2,\"author\":\"a\",\"body\":\"b\",\"x\":1}"),
+              "'x' is not a field of Doc (byte 49)")
+    assert_eq(refused[Doc]("{\"title\":\"t\",\"author\":\"a\",\"body\":\"b\"}"), "the field 'version' is missing (byte 36)")
+end cdc_flatten
+
+// -- tagged enums ----------------------------------------------------------------------------------
+
+@test("an internally tagged enum writes its tag among the fields and finds it wherever it stands")
+cdc_internal_tag()
+    assert_eq(json_of(Event.Login("ann")), "{\"type\":\"Login\",\"user\":\"ann\"}")
+    assert_eq(json_of(Event.Leave("ann", 5)), "{\"type\":\"logout\",\"user\":\"ann\",\"after_ms\":5}")
+    assert_eq(json_of(Event.Ping), "{\"type\":\"Ping\"}")
+
+    for e in [Event.Login("a"), Event.Leave("b", 7), Event.Ping]
+        assert(rt(e) == e)
+
+    assert(from_json[Event]("{\"after_ms\":9,\"user\":\"c\",\"type\":\"logout\"}").unwrap() == Event.Leave("c", 9))
+    assert(from_json[Event]("{\"x\":[1],\"type\":\"Ping\"}").unwrap() == Event.Ping)
+    assert_eq(refused[Event]("{\"user\":\"c\"}"), "no 'type' member says which variant this is (byte 0)")
+    assert_eq(refused[Event]("{\"type\":\"Leave\"}"), "'Leave' is not a variant of Event (byte 8)")
+    assert_eq(refused[Event]("{\"type\":7}"), "type: a string expected (byte 8)")
+    assert_eq(refused[Event]("{\"type\":\"logout\",\"user\":\"c\"}"), "logout: the field 'after_ms' is missing (byte 27)")
+    assert_eq(refused[Event]("[]"), "an object expected (byte 0)")
+end cdc_internal_tag
+
+@test("an adjacently tagged enum writes the tag and the payload side by side")
+cdc_adjacent_tag()
+    assert_eq(json_of(Msg.Text("hi")), "{\"t\":\"Text\",\"c\":{\"body\":\"hi\"}}")
+    assert_eq(json_of(Msg.Move(1, 2)), "{\"t\":\"Move\",\"c\":{\"x\":1,\"y\":2}}")
+    assert_eq(json_of(Msg.Quit), "{\"t\":\"Quit\"}")
+
+    for m in [Msg.Text("hi"), Msg.Move(1, 2), Msg.Quit]
+        assert(rt(m) == m)
+
+    assert(from_json[Msg]("{\"c\":{\"y\":4,\"x\":3},\"t\":\"Move\"}").unwrap() == Msg.Move(3, 4))
+    assert_eq(refused[Msg]("{\"t\":\"Move\"}"), "Move: the field 'c' is missing (byte 11)")
+    assert_eq(refused[Msg]("{\"t\":\"Move\",\"c\":{\"x\":\"1\"}}"), "Move.x: an integer expected (byte 21)")
+
+// -- errors ----------------------------------------------------------------------------------------
+
+@test("a value of the wrong shape is refused with the path to it and the byte it starts at")
+cdc_wrong_shape()
+    assert_eq(refused[Outer]("{\"id\":1,\"inner\":{\"z\":\"q\"}}"), "inner.z: an integer expected (byte 21)")
+    assert_eq(refused[Outer]("{\"id\":1,\"items\":[{\"z\":1},{\"z\":true}]}"), "items[1].z: an integer expected (byte 30)")
+    assert_eq(refused[Tables]("{\"by_name\":{\"k\":\"v\"}}"), "by_name[\"k\"]: an integer expected (byte 16)")
+    assert_eq(refused[Inner]("[1]"), "an object expected (byte 0)")
+    assert_eq(refused[Buf[int]]("{}"), "an array expected (byte 0)")
+    assert_eq(refused[string]("1"), "a string expected (byte 0)")
+    assert_eq(refused[bool]("null"), "true or false expected (byte 0)")
+    assert_eq(refused[(int, int)]("[1]"), "a tuple of 2 expected (byte 2)")
+    assert_eq(refused[(int, int)]("[1,2,3]"), "the end of a tuple of 2 expected (byte 5)")
+    assert_eq(refused[[3]u8]("[1,2]"), "an array of 3, and it has 2 expected (byte 4)")
+    assert_eq(refused[[2]u8]("[1,2,3]"), "the end of an array of 2 expected (byte 5)")
+    assert_eq(refused[Shape]("\"Square\""), "'Square' is not a variant of Shape (byte 0)")
+    assert_eq(refused[Shape]("\"Circle\""), "Circle: an object holding its fields expected (byte 0)")
+    assert_eq(refused[Shape]("{\"Dot\":null,\"Rect\":null}"), "one member, naming the variant, and no other expected (byte 12)")
+    assert_eq(refused[Shape]("{ }"), "a variant's name expected (byte 2)")
+    assert_eq(refused[Shape]("{\"Dot\":{\"x\":1}}"), "Dot: no fields expected (byte 8)")
+    assert_eq(refused[Shape]("7"),"a variant: its name, or an object of one member expected (byte 0)")
+    assert_eq(refused[Inner]("{\"z\":1,\"z\":2}"), "'z' is written twice (byte 7)")
+end cdc_wrong_shape
+
+@test("text that is not JSON is refused in the tree parser's own words")
+cdc_malformed()
+    assert_eq(refused[Inner]("{\"z\":1,}"), "a member name expected (byte 7)")
+    assert_eq(refused[Inner]("{\"z\":1"), "the text ends where ',' or '}' was expected (byte 6)")
+    assert_eq(refused[Inner]("{\"z\" 1}"), "':' expected (byte 5)")
+    // A fault inside a member is told with the path to it, like any other.
+    assert_eq(refused[Inner]("{\"z\":01}"), "z: a number may not have a leading zero (byte 5)")
+    assert_eq(refused[Inner]("{\"z\":1} x"), "more text after the value (byte 8)")
+    assert_eq(refused[Inner](""), "the text ends where an object was expected (byte 0)")
+    assert_eq(refused[string]("\"abc"), "this string is never closed (byte 0)")
+    assert_eq(refused[Buf[int]]("[1 2]"), "',' or ']' expected (byte 3)")
+    // A comma before the close is the grammar's fault, whatever was being read.
+    assert_eq(refused[Buf[int]]("[1, ]"), "a value expected (byte 4)")
+    assert_eq(refused[(int, int)]("[1,]"), "a value expected (byte 3)")
+    assert_eq(refused[[2]u8]("[1,]"), "a value expected (byte 3)")
+    assert_eq(from_json_bytes[string]([u8('"'), 0xFF, u8('"')]).unwrap_err().to_string(), "this string is not UTF-8 (byte 1)")
+end cdc_malformed
+
+@test("a path deeper than sixteen keeps the innermost steps and opens with an ellipsis")
+cdc_deep_path()
+    var text = ""
+
+    for _ in 0..<20 do text = text + "{\"v\":0,\"next\":"
+
+    text = text + "{\"v\":\"x\"}"
+
+    for _ in 0..<20 do text = text + "}"
+
+    val e = from_json[Deep](text).unwrap_err()
+
+    assert_eq(e.path.len, 16)
+    assert(e.path.cut)
+    assert_eq(e.to_string(), "…next.next.next.next.next.next.next.next.next.next.next.next.next.next.next.v: an integer expected (byte 285)")
+end cdc_deep_path
+
+// Anything at all, read and thrown away -- the pull reader's view of a whole document.
+struct Anything
+    n: int
+
+impl Decode for Anything
+    decode[D: Decoder](d: *D) -> Result[Anything, CodecError]
+        d.skip_value()?
+        Ok(Anything(0))
+
+@test("the tree parser and the pull reader are one reader: what parse refuses, from_json refuses alike")
+cdc_tree_parser_shared()
+    for text in ["{\"z\":1,}", "[1,]", "{\"a\" 1}", "01", "\"\\x\"", "[1] 2", "", "{\"a\":[[[", "tru"]
+        val tree = parse(text).unwrap_err()
+        val pulled = from_json[Anything](text).unwrap_err()
+
+        assert_eq(pulled.at, tree.offset)
+        assert_eq(pulled.to_string(), s"${tree.fault} (byte ${tree.offset})")
+
+    assert_eq(from_json[Anything](" {\"a\":[1,{\"b\":null}]} ").unwrap().n, 0)
+end cdc_tree_parser_shared

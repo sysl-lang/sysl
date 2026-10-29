@@ -858,7 +858,7 @@ print(b.len())
 ```
 
 ```error
-'len' is a property of 'sysl.text.StrBuilder' — read it as 'value.len', without '()'
+'len' is a property of 'StrBuilder' — read it as 'value.len', without '()'
 ```
 
 ## Reading a value back: the parsers
@@ -1069,7 +1069,7 @@ print(parse_int("41") + 1)
 ```
 
 ```error
-'+' needs matching types, got sysl.Result[int, sysl.text.ParseError] and int
+'+' needs matching types, got Result[int, ParseError] and int
 ```
 
 That is the type doing its job. The usual shape is to let `?` carry the refusal outward:

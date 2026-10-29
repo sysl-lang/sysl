@@ -125,6 +125,8 @@ the caller's line.
 | `is_empty` | `const is_empty(self) -> bool` |  |
 | `at` | `const at(self, i: usize) -> T` |  |
 | `set` | `const set(self, i: usize, v: T)` |  |
+| `get_unchecked` | `const get_unchecked(self, i: usize) -> T` | `at` and `set` with no bounds check: the element at `i`, read or written where it lives, with nothing comparing `i` to the count. |
+| `set_unchecked` | `const set_unchecked(self, i: usize, v: T)` |  |
 | `push` | `const push(self, v: T)` |  |
 | `extend` | `const extend(self, xs: []const T)` |  |
 | `pop` | `const pop(self) -> Option[T]` |  |

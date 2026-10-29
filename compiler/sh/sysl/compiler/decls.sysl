@@ -556,6 +556,11 @@ struct Tables
     // `reached_through_bound`). It outlives that walk's rewind: it is a fact about the source.
     bound_sites: Map[string, bool]
 
+    // The place each `-> ref` member's body comes to, by the name the member was lowered to, written
+    // over its parameters (`ref_result.sysl`'s `PlaceTemplate`). A caller's walks out of a call of
+    // one carry on through it.
+    place_templates: &Table[&PlaceTemplate]
+
     // Whether a key is one this compilation has a declaration for, whatever kind.
     declares_type(self, key: string) -> bool = self.types.has(key)
 
@@ -600,7 +605,8 @@ tables_for(t: Target) -> &Tables =
            table(),
            map(),
            map(),
-           map())
+           map(),
+           table())
 
 // The source path of the body lowered under `key`: a nested function's own (`outer.bump`), the body a
 // closure was written in, the generic an instantiation was made from, or the declaration's qualified
@@ -1037,6 +1043,12 @@ struct Analysis
     // reference, since a call then writes through the closure rather than into it.
     closure_env_writes: Map[string, Buf[usize]]
 
+    // For each closure literal with captures, its captures and the places it writes, keyed as
+    // `place.sysl`'s `place_key` keys them in the body that builds it (`closure.sysl`'s
+    // `note_write_keys`): held by reference, a call of it writes those places of that body, and a
+    // `ref` live there is asked about them (`checks.sysl`'s `ref_call`).
+    closure_write_keys: Map[string, &ClosureWrites]
+
     // The closure literals the program puts behind a counted reference -- a `&Fn` -- and, of those,
     // the ones that box is built in the frame of the function that builds it, since nothing reaches
     // the box after that frame, or after the turn of a loop that builds it, has ended
@@ -1047,6 +1059,16 @@ struct Analysis
 
     // Why each other one is boxed on the heap, as `--explain-escapes` says it: the file, and the line.
     closure_box_notes: Buf[(string, string)]
+
+    // Every function whose answer is a place of one of its parameters, and that parameter's position
+    // (`borrow_summary.sysl`'s `note_places`), for the lowering's place entries (`place_entry.sysl`).
+    place_answers: Map[string, usize]
+
+    // Whether the body being read is one instantiation of a generic, set around each one the pending
+    // list drains (`analyze_body.sysl`'s `drain_pending`) and so true for every closure and nested
+    // function read inside it. A warning about what a body WROTE is told at the body's definition,
+    // never once per type a caller chose (`expr_flow.sysl`'s `warn_dropped_result`).
+    reading_instance: bool
 
     // Records a name as produced. The set is what matters and not the order, but the order is what
     // a walk over it reads, so a name is kept once.
@@ -1087,7 +1109,7 @@ struct Analysis
     bound_fault(*self, scope: Scope, span: Span, message: string)
         if self.poison.is_some() then return
 
-        val d = placed_error(scope.src, span, bodies_shown(self.tables, message))
+        val d = placed_error(scope.src, span, names_shown(self.tables, scope, bodies_shown(self.tables, message)))
 
         if !already_said(self.kept, d) && !already_said(self.found, d) then self.kept.push(d)
     end bound_fault
@@ -1098,7 +1120,7 @@ struct Analysis
     said_through_bound(self, scope: Scope, span: Span, rest: string) -> bool
         for d in self.kept
             if d.src.name == scope.src.name && d.diag.span.start == span.start &&
-                    d.diag.message.ends_with(rest) then return true
+                    d.diag.message.ends_with(names_shown(self.tables, scope, rest)) then return true
 
         false
     end said_through_bound
@@ -1109,7 +1131,7 @@ struct Analysis
     // recorded, and so is anything after it, because a trial reading counts complaints to learn
     // whether it failed -- but `close_region` takes back everything the region said after it.
     fault(*self, scope: Scope, span: Span, message: string)
-        val d = placed_error(scope.src, span, bodies_shown(self.tables, message))
+        val d = placed_error(scope.src, span, names_shown(self.tables, scope, bodies_shown(self.tables, message)))
         val before = self.found.len()
 
         if !already_said(self.found, d) then self.found.push(d)
@@ -1129,14 +1151,14 @@ struct Analysis
     // Records an error about the program as a whole, which is printed with no position: `span`
     // orders it in the report and is never shown. Nothing that calls it is inside a region.
     fault_unplaced(*self, scope: Scope, span: Span, message: string)
-        val d = unplaced_error(scope.src, span, bodies_shown(self.tables, message))
+        val d = unplaced_error(scope.src, span, names_shown(self.tables, scope, bodies_shown(self.tables, message)))
 
         if !already_said(self.found, d) then self.found.push(d)
 
     // Records a mistake about where something was WRITTEN rather than about what it means, which
     // abandons nothing: the region carries on reading, so a second such clause in it is told too.
     fault_in_place(*self, scope: Scope, span: Span, message: string)
-        val d = placed_error(scope.src, span, bodies_shown(self.tables, message))
+        val d = placed_error(scope.src, span, names_shown(self.tables, scope, bodies_shown(self.tables, message)))
 
         if !already_said(self.found, d) then self.found.push(d)
 
@@ -1193,7 +1215,7 @@ struct Analysis
 
     // The same, for something that is not a reason to stop.
     caution(*self, scope: Scope, span: Span, message: string)
-        val d = placed_warning(scope.src, span, bodies_shown(self.tables, message))
+        val d = placed_warning(scope.src, span, names_shown(self.tables, scope, bodies_shown(self.tables, message)))
 
         if !already_said(self.warned, d) then self.warned.push(d)
 
@@ -1205,7 +1227,7 @@ struct Analysis
     // one thing, at the declaration, rather than the same sentence twice.
     said_around(self, scope: Scope, span: Span, message: string) -> bool
         for f in self.found
-            if f.src.name == scope.src.name && f.diag.message == message &&
+            if f.src.name == scope.src.name && f.diag.message == names_shown(self.tables, scope, message) &&
                     f.diag.span.start <= span.start && span.end <= f.diag.span.end then return true
 
         false
@@ -1284,7 +1306,8 @@ analysis_producing(t: Target, producing: Buf[string]) -> &Analysis =
              set(), reached_none(), producing, reached_none(), reached_none(), 0, buf(), 0, None,
              false, buf(), false, None, buf(), buf(), buf(), table(), const_evaluation(), false,
              None, buf(), buf(), "", buf(), buf(), buf(), buf(), buf(), result_sites(), set(), map(), buf(),
-             buf(), reach_sites_none(), map(), map(), set(), buf(), map(), set(), set(), buf())
+             buf(), reach_sites_none(), map(), map(), set(), buf(), map(), map(), set(), set(), buf(), map(),
+             false)
 
 // -- how far a declaration reaches ---------------------------------------------------------------
 

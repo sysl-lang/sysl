@@ -7,7 +7,12 @@ module sh.sysl.compiler
 // a closure written directly in the body. A counter the inner closure reads back, with the variable
 // outside left alone, is accepted, and so is the outer closure's own local.
 //
-// The helpers are `tests_enm_enum_run.sysl`'s.
+// An inner closure that holds the variable by reference (a local closure called where it is
+// written) writes the OUTER closure's copy instead, which is lost in its turn where the outer
+// closure is kept: refused naming both closures, and accepted where every closure on the way holds
+// the variable by reference, where nothing reads it afterwards, or where what is captured is a `&T`.
+//
+// The helpers are `tests_enm_enum_run.sysl`'s, and `crm_counted` from `tests_crm_closure_ref_mode.sysl`.
 
 private const cwn_calls: string = "var kept: Option[&Fn() -> unit] = None\n\nshare(f: &Fn() -> unit)\n    kept = Some(f)\n    f()\n\ncall(f: &Fn() -> unit)\n    kept = Some(f)\n    f()\n\n"
 
@@ -53,10 +58,7 @@ cwn_three_deep()
         """, cwn_used_after("n"))
 end cwn_three_deep
 
-// TODO: un-ignore when a write by a by-reference inner closure to an outer closure's by-value copy is
-// handed up under the outer closure's mode (it prints 1 then 0 today).
-@test("the inner closure held in the outer one's 'val', the variable read after: refused",
-      ignore: "an inner closure that holds the variable by reference writes the outer closure's copy, and that is not handed up")
+@test("the inner closure held in the outer one's 'val', the variable read after: refused")
 cwn_inner_in_a_val()
     if !enm_ready() then return
 
@@ -121,3 +123,149 @@ cwn_accepted()
             print(*p)
         """), "0\n1\n11\n5\n")
 end cwn_accepted
+
+// -- an inner closure that holds the variable by reference ------------------------------------------
+
+private const cwn_once: string = "once(f: &Fn() -> unit) = f()\n\n"
+
+private const cwn_around: string =
+    "this closure writes through to a closure it is written in, and that one captures by value, since "
+
+// The program runs on the counted heap, printing `want` and leaving no count behind.
+private cwn_prints(text: string, want: string)
+    if !enm_ready() then return
+
+    val out = crm_counted(text)
+
+    assert_eq(out.0, want)
+    assert_eq(out.1, "")
+end cwn_prints
+
+@test("an inner closure's write to the kept outer closure's copy names both closures, and is said once")
+cwn_names_both()
+    if !enm_ready() then return
+
+    cwn_refused_once(cwn_calls + raw"""
+        main()
+            var n = 0
+            share(() ->
+                var g = () ->
+                    n += 1
+                    print(n)
+                g())
+            print(n)
+        """, cwn_around)
+end cwn_names_both
+
+@test("the outer closure borrowed too: the write reaches the variable, which reads 1 after")
+cwn_outer_by_ref()
+    cwn_prints(cwn_once + raw"""
+        main()
+            var n = 0
+            once(() ->
+                var g = () ->
+                    n += 1
+                    print(n)
+                g())
+            print(n)
+        """, "1\n1\n")
+end cwn_outer_by_ref
+
+@test("three deep, only the outermost kept: refused once, naming the closures around the write")
+cwn_three_deep_outermost_kept()
+    if !enm_ready() then return
+
+    val text = cwn_calls + cwn_once + raw"""
+        main()
+            var n = 0
+            share(() -> once(() ->
+                var g = () ->
+                    n += 1
+                    print(n)
+                g()))
+            print(n)
+        """
+
+    cwn_refused_once(text, cwn_used_after("n"))
+    cwn_refused_once(text, cwn_around)
+end cwn_three_deep_outermost_kept
+
+@test("three deep, only the middle one kept: refused once")
+cwn_three_deep_middle_kept()
+    if !enm_ready() then return
+
+    val text = cwn_calls + cwn_once + raw"""
+        main()
+            var n = 0
+            once(() -> share(() ->
+                var g = () ->
+                    n += 1
+                    print(n)
+                g()))
+            print(n)
+        """
+
+    cwn_refused_once(text, cwn_used_after("n"))
+    cwn_refused_once(text, cwn_around)
+end cwn_three_deep_middle_kept
+
+@test("three deep, every closure borrowed: the write reaches the variable")
+cwn_three_deep_all_by_ref()
+    cwn_prints(cwn_once + raw"""
+        main()
+            var n = 0
+            once(() -> once(() ->
+                var g = () ->
+                    n += 1
+                    print(n)
+                g()))
+            print(n)
+        """, "1\n1\n")
+end cwn_three_deep_all_by_ref
+
+@test("the inner closure writes in a loop, the outer closure kept, the variable read after: refused")
+cwn_write_in_a_loop()
+    if !enm_ready() then return
+
+    cwn_refused_once(cwn_calls + raw"""
+        main()
+            var n = 0
+            share(() ->
+                var g = () ->
+                    for i in 0..<3
+                        n += i
+                    print(n)
+                g())
+            print(n)
+        """, cwn_used_after("n"))
+end cwn_write_in_a_loop
+
+@test("the outer closure kept, but nothing reads the variable after it: accepted, a counter")
+cwn_not_read_after()
+    cwn_prints(cwn_calls + raw"""
+        main()
+            var n = 0
+            print(n)
+            share(() ->
+                var g = () ->
+                    n += 1
+                    print(n)
+                g())
+            kept = None
+        """, "0\n1\n")
+end cwn_not_read_after
+
+@test("a '&int' captured, written through by the inner closure, the outer one kept: accepted")
+cwn_through_a_reference()
+    cwn_prints(cwn_calls + raw"""
+        main()
+            val n: &int = 0
+            share(() ->
+                var g = () ->
+                    *n += 1
+                    print(*n)
+                g())
+            print(*n)
+            kept = None
+        """, "1\n1\n")
+end cwn_through_a_reference

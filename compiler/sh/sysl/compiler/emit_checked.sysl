@@ -1,0 +1,193 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+import sysl.math.bigint.from_int
+
+// `a.checked_add(b)` and the five members beside it (`library/sysl/checked.sysl`): the operation, and
+// an `Option` of the receiver's type that is `None` exactly where the plain operator would have
+// wrapped -- or, for a quotient, trapped.
+//
+// **The test is the machine's own wherever it has one.** A sum, a difference and a product are LLVM's
+// `with.overflow` intrinsics, which answer the result and the flag together and are the instruction
+// and its carry or overflow bit on every machine that has one. A quotient and a remainder have no
+// such intrinsic, and need none: the two refusals are a comparison of the operands made **before**
+// the divide, which is what keeps the divide from ever being reached with the operands it traps on.
+//
+// **The option is built the way `Colour.try(n)` builds one** (`gen_enum_try`): a slot, `Some(v)`
+// stored on one arm and `None` on the other, and the slot read back. Every value of an integer is a
+// payload with no count, so neither arm owes any ownership bookkeeping.
+gen_checked(e: *Emit, op: string, width: Type, ty: Type, v: Val, rhs: Option[Val]) -> Val
+    val (bits, signed) = width match
+        Integer(b, s, _) -> (b, s)
+        _ -> return gap_at(e, s"'$op' on ${type_show(width)}")
+
+    val d = enum_decl(ty)
+
+    if d.is_none() then return gap_at(e, s"'$op' whose answer is not an option")
+
+    val ll = LInt(bits)
+
+    op match
+        "checked_add" -> overflowed(e, ty, d.unwrap(), "add", bits, signed, v, rhs.unwrap_or(VZero))
+        "checked_sub" -> overflowed(e, ty, d.unwrap(), "sub", bits, signed, v, rhs.unwrap_or(VZero))
+        "checked_mul" -> overflowed(e, ty, d.unwrap(), "mul", bits, signed, v, rhs.unwrap_or(VZero))
+
+        "checked_div" | "checked_rem" ->
+            val r = rhs.unwrap_or(VZero)
+            val ok = divisible(e, ll, bits, signed, v, r)
+            val open = option_open(e, ty, d.unwrap(), ok)
+            val q = fresh_reg(e)
+            val inst =
+                if op == "checked_div" then (if signed then OpSDiv else OpUDiv)
+                else if signed then OpSRem
+                else OpURem
+
+            emit(e, InBin(q, inst, ll, v, r))
+            option_close(e, ty, d.unwrap(), open, q)
+
+        // A signed negation fails at the most negative value alone, whose magnitude is one past the
+        // largest; an unsigned one has an answer only at zero, which is its own negation.
+        "checked_neg" ->
+            val ok = fresh_reg(e)
+
+            if signed then emit(e, InIntCmp(ok, INe, ll, v, VInt(base_min(bits, true))))
+            else emit(e, InIntCmp(ok, IEq, ll, v, VInt(from_int(0))))
+
+            val open = option_open(e, ty, d.unwrap(), ok)
+            val n = fresh_reg(e)
+
+            emit(e, InBin(n, OpSub, ll, VInt(from_int(0)), v))
+            option_close(e, ty, d.unwrap(), open, n)
+
+        _ -> gap_at(e, s"the integer operation '$op'")
+end gen_checked
+
+// Whether `checked_*` applies to this member name.
+is_checked_member(op: string) -> bool =
+    op == "checked_add" || op == "checked_sub" || op == "checked_mul" || op == "checked_div" ||
+    op == "checked_rem" || op == "checked_neg"
+
+// A sum, difference or product through its `with.overflow` intrinsic: the wrapped result and the flag,
+// and the option chosen by the flag.
+private overflowed(e: *Emit, ty: Type, d: &EnumType, name: string, bits: int, signed: bool, lv: Val,
+                   rv: Val) -> Val
+    val (result, flag) = with_overflow(e, name, bits, signed, lv, rv)
+    val ok = fresh_reg(e)
+
+    emit(e, InBin(ok, OpXor, l_i1(), flag, VBool(true)))
+
+    val open = option_open(e, ty, d, ok)
+
+    option_close(e, ty, d, open, result)
+end overflowed
+
+// Whether `l / r` has an answer: the divisor is not zero, and -- at a signed width -- the operands are
+// not the most negative value over `-1`, the one quotient one past the largest.
+private divisible(e: *Emit, ll: LType, bits: int, signed: bool, l: Val, r: Val) -> Val
+    val nonzero = fresh_reg(e)
+
+    emit(e, InIntCmp(nonzero, INe, ll, r, VInt(from_int(0))))
+
+    if !signed then return nonzero
+
+    val at_min = fresh_reg(e)
+
+    emit(e, InIntCmp(at_min, IEq, ll, l, VInt(base_min(bits, true))))
+
+    val minus_one = fresh_reg(e)
+
+    emit(e, InIntCmp(minus_one, IEq, ll, r, VInt(from_int(-1))))
+
+    val both = fresh_reg(e)
+
+    emit(e, InBin(both, OpAnd, l_i1(), at_min, minus_one))
+
+    val fits = fresh_reg(e)
+
+    emit(e, InBin(fits, OpXor, l_i1(), both, VBool(true)))
+
+    val ok = fresh_reg(e)
+
+    emit(e, InBin(ok, OpAnd, l_i1(), nonzero, fits))
+    ok
+end divisible
+
+// The `with.overflow` call for `name` (`add`, `sub`, `mul`) at `bits`, taken apart into the wrapped
+// result and the overflow flag.
+with_overflow(e: *Emit, name: string, bits: int, signed: bool, lv: Val, rv: Val) -> (Val, Val)
+    val ity = LInt(bits)
+    val fn = llvm_with_overflow(name, signed, ity)
+
+    var pair_fields: Buf[LType] = buf()
+
+    pair_fields.push(ity)
+    pair_fields.push(l_i1())
+
+    val both = LStruct(pair_fields)
+
+    var params: Buf[IrParam] = buf()
+
+    params.push(ir_param(ity))
+    params.push(ir_param(ity))
+    request_intrinsic(e, ir_sig(fn, ir_fn_type(both, params)))
+
+    var args: Buf[IrArg] = buf()
+
+    args.push(ir_arg(ity, lv))
+    args.push(ir_arg(ity, rv))
+
+    val pair = fresh_reg(e)
+
+    emit(e, ir_call(Some(pair), both, VGlobal(fn), args))
+
+    val v = fresh_reg(e)
+
+    emit(e, InExtract(v, both, pair, one_index(0)))
+
+    val flag = fresh_reg(e)
+
+    emit(e, InExtract(flag, both, pair, one_index(1)))
+    (v, flag)
+end with_overflow
+
+// The slot an option is built in, and the label its two arms meet at.
+private struct OptionArms
+    slot: Val
+    end_l: string
+end OptionArms
+
+// Branches on `ok`: the `None` arm is written and closed here, and emission is left on the `Some`
+// arm, where the caller computes the value and hands it to `option_close`.
+private option_open(e: *Emit, ty: Type, d: &EnumType, ok: Val) -> OptionArms
+    val slot = alloca(e, fresh_reg(e), lty(e, ty))
+    val some_l = fresh_label(e, "checked.some")
+    val none_l = fresh_label(e, "checked.none")
+    val end_l = fresh_label(e, "checked.end")
+
+    emit_term(e, InCondBr(ok, some_l, none_l))
+    emit_label(e, none_l)
+
+    var empty: Buf[Val] = buf()
+
+    emit(e, InStore(lty(e, ty), enum_value(e, ty, d, d.variant("None").unwrap(), empty), slot,
+                    AccPlain, None))
+    emit_term(e, InBr(end_l))
+    emit_label(e, some_l)
+    OptionArms(slot, end_l)
+end option_open
+
+// The `Some` arm finished with `value`, and the option read back where the arms meet.
+private option_close(e: *Emit, ty: Type, d: &EnumType, arms: OptionArms, value: Val) -> Val
+    var carried: Buf[Val] = buf()
+
+    carried.push(value)
+    emit(e, InStore(lty(e, ty), enum_value(e, ty, d, d.variant("Some").unwrap(), carried), arms.slot,
+                    AccPlain, None))
+    emit_term(e, InBr(arms.end_l))
+    emit_label(e, arms.end_l)
+
+    val r = fresh_reg(e)
+
+    emit(e, InLoad(r, lty(e, ty), arms.slot, AccPlain, None))
+    r
+end option_close

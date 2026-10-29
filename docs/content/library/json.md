@@ -99,6 +99,40 @@ print(quoted("say \"hi\"\n"))
 
 What is written reads back equal to what was held, for every value but a non-finite `Real`.
 
+## Reading and writing your own types
+
+**`to_json(v)` and `from_json[T](text)` read and write any type that derives
+[`Codec`](/library/codec/)**, with no tree in the middle: `from_json` reads the text through
+`JsonDecoder`, a pull reader over the bytes, straight into the fields of a `T`. `JsonDecoder` is the
+reader `parse` builds its tree with, so the two accept exactly the same texts and refuse a malformed
+one in the same words; `from_json_bytes` is the same over bytes that may not be text.
+
+```sysl
+import sysl.codec.Codec
+import sysl.encoding.json.{to_json, from_json}
+
+struct Server derives Codec
+    host: string
+    port: u16
+    tls: Option[bool]
+
+val s = from_json[Server]("{\"port\": 8443, \"host\": \"example.org\"}").unwrap()
+
+print(s.host, s.port, s.tls)
+print(to_json(Server("a\"b", 80, Some(true))).unwrap())
+print(from_json[Server]("{\"host\": \"h\", \"port\": 70000}").unwrap_err())
+```
+
+```output
+example.org 8443 None
+{"host":"a\"b","port":80,"tls":true}
+port: out of range for ushort (byte 22)
+```
+
+`JsonEncoder` writes into any `Writer` as it goes, compactly, with a real in its shortest form. A
+NaN or an infinity has no JSON spelling: the encoder writes `null` in its place and latches the fault,
+and `to_json` answers it as an error rather than text that would not read back.
+
 ## What a refusal says
 
 A malformed document is refused with a `JsonError` (which has `==`, as its `Fault` does): the `line` and `col` (both from one; a column

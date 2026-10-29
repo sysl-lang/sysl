@@ -536,6 +536,45 @@ in another, so what an import records is which path a name stands for; which of 
 settled by what that position asks for. One import therefore serves a type, a function, a trait, and
 an enum variant without saying which it expected to be.
 
+### How a diagnostic names a library type
+
+**A diagnostic names a type or trait the library declares by its simple name** — `Option[int]`,
+`Buf[byte]`, `Display` — whether or not the file imported it:
+
+```sysl
+import sysl.buf.{Buf, buf}
+
+val b: Buf[Option[u8]] = buf()
+val n: int = b
+```
+
+```error
+cannot initialize 'n': declared int but the value is Buf[Option[byte]]
+```
+
+**It keeps its path where the simple name could mean something else in the file the diagnostic is
+reported in**: a type of that name the file's own module declares, one it imported by name, or one a
+wildcard of it offers. Only the clashing name keeps its path; the rest of the type is still said
+simply:
+
+```sysl
+struct Option
+    v: int
+
+val r: Result[sysl.Option[int], string] = Ok(sysl.None)
+val n: int = r
+```
+
+```error
+cannot initialize 'n': declared int but the value is Result[sysl.Option[int], string]
+```
+
+**A diagnostic that names two types of one simple name keeps both paths**, whatever the file sees —
+the hint for a name that fell through to the library because a file forgot an import is the usual
+case. A path that goes on past the type names a member of it (`'sysl.buf.Buf.push.int'`), and a type
+of the program's own other modules keeps its module (`geom.Point`), which is how a reader tells two of
+their own modules' types apart.
+
 ### Where an import may stand
 
 Imports normally sit just below the `module` header, but — following Scala — **an import may also

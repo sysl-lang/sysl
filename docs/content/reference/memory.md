@@ -10,9 +10,11 @@ reference is made, when storage moves without being asked, and where the guarant
 
 **If you do not write `*T`, you cannot segfault.** The safe subset — values, references, weak
 references, arrays, and slices — has no use-after-free, no null dereference, no out-of-bounds access,
-and no dangling pointer. The single unsafe primitive is the raw pointer, and it is **greppable**: a
-program's exposure to C's hazards is exactly the lines with a `*` in the type. A driver has them and
-an application does not, and you can tell which by looking.
+and no dangling pointer. The single unsafe primitive over memory is the raw pointer, and it is
+**greppable**: a program's exposure to C's hazards is exactly the lines with a `*` in the type, plus
+the subscripts it has asked by name not to check — `get_unchecked`, `set_unchecked` and an
+[`@unchecked`](/reference/arrays/#unchecked-access) block. A driver has them and an application does
+not, and you can tell which by looking.
 
 ## The three modes
 
@@ -1214,8 +1216,9 @@ The out-of-bounds hazard is governed by whether a value **carries its length**, 
 where it was allocated:
 
 - **arrays and slices carry their length**, so indexing is bounds-checked in every context — hosted
-  or allocator-free, over static, stack, or heap memory;
-- **`*T` carries no length**, so it is the one unchecked primitive. `p[i]` reads the `i`th element
+  or allocator-free, over static, stack, or heap memory — except where the program has asked by name
+  for the check to be left out ([unchecked access](/reference/arrays/#unchecked-access));
+- **`*T` carries no length**, so it is the one primitive that cannot be checked. `p[i]` reads the `i`th element
   and `p[0..<n]` views `n` of them, both exactly as C does and both unchecked, because there is no
   length to check against and supplying one is the programmer's assertion. A pointer to something
   with a subscript of its own — a `*[N]T`, or a `*Buf[T]` and any other type indexed through a trait
@@ -1638,9 +1641,12 @@ no check and would silently make `t` follow a later change to `i`.
 ### It is a declaration, never a type
 
 This is the whole of why it can exist in a language with no borrow checker. `ref` may be written
-**only as a local declaration**. There is no `ref` type, so a ref cannot be a field, a parameter, a
-return type, an element, or a type argument; it cannot be re-pointed at a second place once bound; it
-cannot be captured by a closure; and it does not outlive the block that declares it.
+**only as a local declaration**. There is no `ref` type, so a ref cannot be a field, a parameter, an
+element, or a type argument; it cannot be re-pointed at a second place once bound; it cannot be
+captured by a closure; and it does not outlive the block that declares it. The one place `ref` is
+written beside a type is a method's result, `-> ref T`, and that is not a type either: it says the
+call **is a place**, which the caller names with a `ref` of its own or writes through at once
+([A member that answers a place](#a-member-that-answers-a-place)).
 
 A ref *of* a ref is not a re-pointing and is ordinary — one more name for the place the first one
 stands for, with the walks following through it:
@@ -1729,6 +1735,30 @@ print(items[0].block)
 42
 ```
 
+**The place must lie in storage something holds past the statement** — a local, a parameter, module
+storage, or what a `*T` points at. A place inside a call's answer is inside a temporary, released at
+the end of the statement while the name would live on:
+
+```sysl
+import sysl.buf.{Buf, buf}
+
+fresh() -> Buf[int]
+    val b: Buf[int] = buf()
+
+    b.push(5)
+    b
+
+ref t = fresh()[0]
+
+t += 1
+```
+
+```error
+'t' would stand on a place inside a value nothing holds — a temporary, released at the end of this statement while the name lives on
+```
+
+Bind the answer with `val` first and the `ref` to a place inside that.
+
 ### The one rule: what may move underneath it
 
 A stored address is only as good as the storage staying where it is. C# has ref locals and needs no
@@ -1809,6 +1839,37 @@ e = 5
 Deciding otherwise would mean reading the callee's body, and a module compiles against its imports'
 signatures and never their bodies. The cost is one refusal in a program that could have written the
 ref one line later.
+
+**A closure that holds the variable by reference writes it when it runs, so a call that runs one
+writes it too.** The closure's own body is in hand wherever it is built, so here the check reads it:
+a call that is handed the closure — directly, through a local, a `&Fn` or a struct holding one, or
+inside another closure — or that calls it is refused while a ref stands through an owning step the
+closure writes:
+
+```sysl
+struct Node
+    v: int
+
+struct Holder
+    node: &Node
+    count: int
+
+call(f: &Fn() -> unit) = f()
+
+main()
+    var h = Holder(Node(1), 0)
+    ref r = h.node.v
+
+    call(() -> h = Holder(Node(2), 0))
+    print(r)
+```
+
+```error
+'r' is a 'ref' standing on storage this call could release, since a closure it runs writes 'h'
+```
+
+A closure that writes only storage the ref does not stand through — `h.count += 1`, or `h.node.v`
+itself — is run without complaint, and so is one called after the ref's block has closed.
 
 **A container's storage moves under a `@relocates` member, whatever its receiver mode.** A `Buf`
 is a handle, so its `push` takes `self` and still reallocates what the handle points at. Each member
@@ -2028,6 +2089,104 @@ field would.
 The distinction matters because the other reading is available and wrong: if binding retained, a ref
 would be a `&T` with extra steps, and the count it took would keep an object alive past the write
 that replaced it.
+
+### A member that answers a place
+
+A method can say its call **is a place**: `-> ref T`. Its body comes to a place reached through a
+parameter, and every call of it is that place in the caller — written through at once, named by a
+`ref`, or read, which reads a copy:
+
+```sysl
+struct Task
+    state: int
+    prio: int
+
+    bump(*self) = self.prio += 100
+
+struct Kernel
+    tasks: [4]Task
+
+    task(*self, i: usize) -> ref Task = self.tasks[i]
+
+var k = Kernel([Task(0, 7); 4])
+
+k.task(2).state = 2
+
+ref t = k.task(1)
+
+t.prio += 1
+k.task(0).bump()
+
+val copy = k.task(2)
+
+k.task(2).state = 9
+
+print(k.tasks[2].state, t.prio, k.tasks[0].prio, copy.state)
+```
+
+```output
+9 8 107 2
+```
+
+**It is the same `ref`, written in the callee.** The compiler keeps the body's place as a template over
+the member's parameters, and a caller's walks go on through it with the call's arguments put in: a
+`ref` bound to `b.at(0)` holds `b.items` still exactly as a `ref` bound to `b.items[0]` does, so every
+hazard of [the one rule](#the-one-rule-what-may-move-underneath-it) is refused through a method too:
+
+```sysl
+import sysl.buf.{Buf, buf}
+
+struct Bag
+    items: Buf[int]
+
+    at(*self, i: usize) -> ref int = self.items[i]
+
+var b = Bag(buf())
+
+b.items.push(1)
+
+ref first = b.at(0)
+
+b.items.push(2)
+first = 5
+```
+
+```error
+'first' is a 'ref' standing on an element whose storage 'push' could move or give up
+```
+
+A second `*self` call of the member while such a `ref` stands is a `*self` call like any other, and is
+refused when the `ref`'s path goes through storage the receiver owns (a `Buf`'s, a `&T`'s).
+
+**What the body may be.** Its last expression and nothing else is the answer — a field chain, an
+element, a dereference — reached from a parameter or module storage, and leaving the parameter's own
+bytes on the way: through a `*self` receiver, a reference, a view, a container's element, a `*T`.
+Each of these is refused, with what to write instead:
+
+- a field of a by-value `self`, or a local: the storage is the call's, gone when it returns;
+- a value (`self.a + 1`), or a place chosen by an `if`: there is no one address to answer;
+- a `return` or a `?` in the body: they leave with a value;
+- a place inside a struct with an `invariant`: a write through the answer lands in the caller,
+  where nothing walks out to the clause.
+
+```sysl
+struct Pair
+    a: int
+
+    get(self) -> ref int = self.a
+```
+
+```error
+'Pair.get' would answer a place in storage of its own call — a by-value parameter or a local — which is gone when it returns
+```
+
+**Where it may be written.** On a type's own member, inherent or generic (`Grid[T].at(x, y) -> ref T`
+answers an element at every instantiation, `&Node` slots included). Not on a free function, not in a
+trait, and not on an `impl` member a trait declares: a call through a trait object names no body to
+read the place from.
+
+**The address is never a value.** `&k.task(0)` and `&Kernel.task` are refused — either would carry the
+address where the compiler has lost the place.
 
 ### Where it comes from
 
@@ -3019,7 +3178,7 @@ release(h.names)
 ```
 
 ```error
-'release' gives back what a '&T' place holds, and sysl.buf.Buf[string] gives its share back through its own member — call '.release()' on it
+'release' gives back what a '&T' place holds, and Buf[string] gives its share back through its own member — call '.release()' on it
 ```
 
 Like `is_null`, it is a form the compiler answers only where nothing else claims the name: a function
@@ -3599,7 +3758,7 @@ print("ready")
 ```
 
 ```error
-'open' hands back 'Encoder' by value, inside 'sysl.Result[Encoder, string]', and 'Encoder' has a 'Drop' — a type with a destructor is a reference type, and building one makes a '&Encoder'. Write '&Encoder' in its place
+'open' hands back 'Encoder' by value, inside 'Result[Encoder, string]', and 'Encoder' has a 'Drop' — a type with a destructor is a reference type, and building one makes a '&Encoder'. Write '&Encoder' in its place
 ```
 
 **The rule is the type at every level that owns a resource, not the outermost one**, so a field is
@@ -3933,7 +4092,7 @@ print(nest.with((b) ->
 ```
 
 ```error
-but this answers a 'sysl.buf.Buf[byte]', whose 'core' reaches a '&sysl.buf.BufCore[byte]', whose count is not atomic. Answer what the caller needs from it — a count, a flag, a '.copy()' of a string, a value built fresh inside the closure — rather than the value itself
+but this answers a 'Buf[byte]', whose 'core' reaches a '&BufCore[byte]', whose count is not atomic. Answer what the caller needs from it — a count, a flag, a '.copy()' of a string, a value built fresh inside the closure — rather than the value itself
 ```
 
 A struct of a program's own opts in the same way — `@guards(items)` above
@@ -4001,7 +4160,7 @@ job()
 ```
 
 ```error
-the module storage 'table' it reaches, which 'touch' reads, holds a 'sysl.buf.Buf[int]' in its 'log', which is shared through a count that is not atomic
+the module storage 'table' it reaches, which 'touch' reads, holds a 'Buf[int]' in its 'log', which is shared through a count that is not atomic
 ```
 
 **`with` hands the closure the record in place** — its address, lent for the call — so a field
@@ -4022,7 +4181,7 @@ val b = cell.with((r) -> r.log)
 ```
 
 ```error
-'sysl.sync.Guarded.with' answers a value out of the 'value' it guards, and once the guard is let go that value is shared with whoever holds it next, so every count it reaches has to be atomic — but this answers a 'sysl.buf.Buf[int]'
+'sysl.sync.Guarded.with' answers a value out of the 'value' it guards, and once the guard is let go that value is shared with whoever holds it next, so every count it reaches has to be atomic — but this answers a 'Buf[int]'
 ```
 
 A slice or a `Buf` of guarded records is asked the same way: what is in the way is the view's or the
@@ -4161,7 +4320,7 @@ val f = b.freeze()
 ```
 
 ```error
-'&sync sysl.buf.Frozen[&Cell]' may be reached from two domains at once, so every count inside it has to be atomic — but it holds a '&Cell', whose count is not. Hold it as a '&sync Cell' ('06')
+'&sync Frozen[&Cell]' may be reached from two domains at once, so every count inside it has to be atomic — but it holds a '&Cell', whose count is not. Hold it as a '&sync Cell' ('06')
 ```
 
 Held as a `Buf[&sync Cell]`, it freezes. A `Buf[string]` or a `Buf[Buf[u8]]` is refused the same way,

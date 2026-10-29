@@ -1001,7 +1001,7 @@ print(1)
 ```
 
 ```error
-already implements 'sysl.math.Magnitude', which declares an associated type 'Size'
+already implements 'Magnitude', which declares an associated type 'Size'
 ```
 
 That is the price of the name and it is worth knowing before picking one: a library trait covering a
@@ -1091,7 +1091,7 @@ print(is_power_of_two(8.0))
 ```
 
 ```error
-'sysl.math.is_power_of_two' requires its type parameter 'T' to implement 'sysl.math.Bits', but real does not
+'sysl.math.is_power_of_two' requires its type parameter 'T' to implement 'Bits', but real does not
 ```
 
 And these are ordinary names in the module, so they are reached the way `pi` is — by importing them,
@@ -1182,6 +1182,12 @@ honest sum of two other operands.
 that has somewhere else to go — an interpreter reaching for a wider representation wants to know it
 overflowed and does not want the narrow answer at all, while a checksum wants both.
 
+**For the `Option` answer, the methods come first.** Every plain integer type, signed and unsigned,
+has `a.checked_add(b)`, `checked_sub`, `checked_mul`, `checked_div`, `checked_rem` and `checked_neg`
+from the prelude trait `Checked` ([types](/reference/types/#asking-whether-it-fit)), lowered to the
+machine's own overflow flag. The functions here are the written-out tests, and the
+`overflowing_*` pair the methods do not offer.
+
 ```sysl
 import sysl.math.{checked_add, checked_mul, overflowing_add, overflowing_mul}
 
@@ -1211,7 +1217,7 @@ true
 two's-complement sign bit: an addition overflows exactly when the operands agree in sign and the
 result does not, a subtraction exactly when they disagree and the result disagrees with the minuend.
 The unsigned widths overflow by a different rule — a sum below either operand, a difference above the
-minuend — so they would need their own bodies, and nothing has needed them yet.
+minuend — so they would need their own bodies; the `Checked` methods cover them.
 
 **Multiplication takes whichever of three routes settles it.** Where the leading-zero counts of the
 two magnitudes already prove the product fits, nothing is divided at all. Where one operand is `-1`

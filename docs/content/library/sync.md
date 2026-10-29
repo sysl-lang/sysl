@@ -667,7 +667,7 @@ l.unlock()
 ```
 
 ```error
-'IrqLock' masks interrupts through a Cortex-M core's PRIMASK, and 'aarch64-macos' has none — it is for an Armv6-M, Armv7-M or Armv8-M core; elsewhere use a 'SpinLock', or a 'sysl.threads.Mutex[T]' where there are threads
+'IrqLock' masks interrupts through a Cortex-M core's PRIMASK, and 'aarch64-macos' has none — it is for an Armv6-M, Armv7-M or Armv8-M core; elsewhere use a 'SpinLock', or a 'Mutex[T]' where there are threads
 ```
 
 ## `spin_hint`

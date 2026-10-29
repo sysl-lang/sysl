@@ -1,0 +1,417 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.source_of
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.{cstring, Search}
+
+// Ownership of what a closure holds by reference (`docs/design/closures.md` §7): the capture is the
+// variable itself, so building the closure takes no count; the variable stays live until the
+// closure's last call, so no inferred move takes it before then; a `@pinned` local may be captured,
+// since nothing is copied, and one a closure would copy is refused with the way out that works; and a
+// call that runs such a closure writes what the closure writes, so a `ref` standing through an
+// owning step of it is refused the call (`checks.sysl`'s `ref_call`) -- the program that dangled
+// under AddressSanitizer before the check.
+//
+// The cells cross what is captured (`&T`, a `Drop` value, a counted string, a pinned `var` and
+// `val`) with how the closure is reached by a call (written at the argument, a local called, a local
+// handed on, a `&Fn` local, inside another closure, a struct field, a `*self` call inside) and what
+// the closure writes (the whole variable, an owning field, a plain field, the place itself); each
+// accepted program runs on the counted heap and under AddressSanitizer.
+//
+// Skipped cells, and why: a by-value closure is ownership as it always was (`tests_imv_inferred_moves`,
+// `tests_crm_closure_ref_mode`); a `&sync Fn` never holds by reference; a trait object's method is a
+// call whose body the check asks already (`tests_rfb_ref_binding`), and the closure handed to it is
+// the argument cell here.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private extern "setenv" cwo_c_setenv(name: *u8, value: *u8, overwrite: int) -> int
+private extern "unsetenv" cwo_c_unsetenv(name: *u8) -> int
+
+// The program built and run -- on the counted heap, or with AddressSanitizer -- and what it printed
+// on standard output and standard error, and how many ASan report hooks the binary calls.
+private cwo_run(text: string, asan: bool) -> (string, string, usize)
+    val root = make_temp_dir("sysl-cwo").unwrap()
+    val exe = s"$root/built"
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", forms_imported(text)).unwrap()
+
+    if asan
+        val n = cstring("SYSL_EXTRA_CFLAGS")
+        val v = cstring("-fsanitize=address -g")
+
+        cwo_c_setenv(n.ptr, v.ptr, 1)
+
+    force_alloc_counting(!asan)
+
+    val built = build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe))
+
+    force_alloc_counting(false)
+
+    if asan
+        val n = cstring("SYSL_EXTRA_CFLAGS")
+
+        cwo_c_unsetenv(n.ptr)
+
+    built match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (failure_text(why), "", 0)
+        Ok(_) -> ()
+
+    val hooks = capture("nm", ["-u", exe], "", [], true) match
+        Ok(o) -> o.text.count_of("__asan_report")
+        Err(_) -> 0
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> ("could not be started", "", hooks)
+        Ok(o) -> (o.text, o.err.unwrap_or(""), hooks)
+end cwo_run
+
+// The program printed `want` and gave back everything it took, and printed it again under
+// AddressSanitizer, instrumented, with nothing read after it was freed.
+private cwo_prints(text: string, want: string)
+    if !enm_ready() then return
+
+    val counted = cwo_run(text, false)
+
+    assert_eq(counted.0, want)
+    assert_eq(counted.1, "")
+
+    val checked = cwo_run(text, true)
+
+    assert(checked.2 > 0, s"not instrumented: ${checked.0}")
+    assert_eq(checked.0, want)
+    assert_eq(checked.1, "")
+end cwo_prints
+
+// The program is refused, saying each of `parts`.
+private cwo_refused(text: string, parts: []const string)
+    if !enm_ready() then return
+
+    val said = enm_err(text)
+
+    assert(said != "", "it was accepted")
+
+    for part in parts
+        assert(said.index_of(part).is_some(), s"$part\n--- in ---\n$said")
+end cwo_refused
+
+// The text of one function of `text`, lowered with the standard module beside it.
+private cwo_ir(text: string, symbol: string) -> string
+    val root = std_root()
+
+    if root.is_err() then return "skipped"
+
+    val std = std_units(root.unwrap(), host_target())
+
+    if std.is_err() then return "skipped"
+
+    var units: Buf[Program] = buf()
+
+    for item in std.unwrap()
+        units.push(item)
+
+    units.push(parse(source_of("test.sysl", text)).program)
+
+    val done = analyze_bodies(units, host_target())
+
+    if !done.reported.is_empty() then return done.reported.at(0).diag.message
+
+    val whole = program_of(done, "")
+    val lowered = codegen_with_gaps(strip_tests(whole), host_target(),
+                                    post_analysis_checks(done.an, whole, buf()))
+
+    for item in func_texts(ir_print_module(lowered.0))
+        if names_as_written(item.0, symbol) then return item.1
+
+    s"no function '$symbol'"
+end cwo_ir
+
+// How many counts a body takes: a reference's retain, or an aggregate's copy helper.
+private cwo_takes(ir: string) -> usize
+    assert(ir.starts_with("define"), ir)
+    ir.count_of("call void @arc.retain(") + ir.count_of("call void @arc.copy.")
+end cwo_takes
+
+private const cwo_node: string = "struct Node\n    v: int\n\ncall(f: &Fn() -> unit) = f()\n\n"
+
+// A holder whose `node` is an owning step and whose `count` is not.
+private const cwo_holder: string = cwo_node + "struct H\n    node: &Node\n    count: int\n\n"
+
+private const cwo_hazard: string = "'r' is a 'ref' standing on storage this call could release, " +
+    "since a closure it runs writes 'h' — so the name could be left pointing at freed memory. Make " +
+    "the call before the 'ref', or put the 'ref' in a block that closes first"
+
+// -- no count ---------------------------------------------------------------------------------------
+
+@test("a by-reference capture of a '&T' and a string takes no count; one held by value does")
+cwo_no_count()
+    if !enm_ready() then return
+
+    val text = cwo_node + raw"""
+        each(xs: []int, f: int -> unit)
+            for x in xs
+                f(x)
+
+        byref(k: int) -> int
+            var a: &Node = Node(k)
+            var s = "x"
+            each([1, 2][..], n -> print(a.v + n, s))
+            a.v
+
+        byval(k: int) -> &Fn() -> unit
+            val a: &Node = Node(k)
+            val f: &Fn() -> unit = () -> print(a.v)
+            print(a.v)
+            f
+
+        main()
+            print(byref(1))
+            byval(3)()
+        """
+    val by_ref = cwo_ir(text, "byref")
+
+    if by_ref == "skipped" then return
+
+    assert_eq(cwo_takes(by_ref), 0)
+    assert(cwo_takes(cwo_ir(text, "byval")) > 0, cwo_ir(text, "byval"))
+    cwo_prints(text, "2 x\n3 x\n1\n3\n3\n")
+end cwo_no_count
+
+// -- liveness and release ---------------------------------------------------------------------------
+
+@test("a captured '&T' is not moved by a call that looks like its last use before the closure's call")
+cwo_live_until_last_call()
+    cwo_prints(cwo_node + raw"""
+        keep_it(n: &Node) -> &Node = n
+
+        moved(k: int) -> int
+            var a: &Node = Node(k)
+            var g = () -> print(a.v)
+            val m = keep_it(a)
+            g()
+            m.v
+
+        main()
+            print(moved(2))
+        """, "2\n2\n")
+
+@test("a '&T', a 'Drop' value and a string reassigned inside: each old value released once")
+cwo_reassigned_inside()
+    cwo_prints(cwo_node + raw"""
+        struct Noisy
+            n: int
+
+        impl Drop for Noisy
+            drop(self) = print("drop", self.n)
+
+        each(xs: []int, f: int -> unit)
+            for x in xs
+                f(x)
+
+        main()
+            var b: &Node = Node(2)
+            call(() -> b = Node(3))
+            print(b.v)
+
+            var d: &Noisy = Noisy(7)
+            call(() -> print(d.n))
+            call(() -> d = Noisy(8))
+            print("end")
+
+            var s = "x"
+            var total = 0
+            each([1, 2][..], n ->
+                s = s + "y"
+                total += n)
+            print(s, total)
+        """, "3\n7\ndrop 7\nend\nxyy 3\ndrop 8\n")
+
+@test("a closure in a 'Drop' guard's field writes the variables when the guard's block closes")
+cwo_guard_field()
+    cwo_prints(raw"""
+        struct Guard
+            on_exit: &Fn() -> unit
+
+        impl Drop for Guard
+            drop(self) = self.on_exit()
+
+        guarded() -> int
+            var closed = 0
+            var label = "a"
+            if true
+                val g: &Guard = Guard(() ->
+                    closed += 1
+                    label = label + "b")
+                print("in", closed)
+            print(closed, label)
+            closed
+
+        main()
+            print(guarded())
+        """, "in 0\n1 ab\n1\n")
+
+// -- @pinned ----------------------------------------------------------------------------------------
+
+private const cwo_fs: string = "@pinned\nstruct Fs\n    n: int\n\n    bump(*self) = self.n += 1\n\n"
+
+@test("a pinned 'var' and 'val' captured by reference are the locals themselves")
+cwo_pinned_by_reference()
+    cwo_prints(cwo_fs + raw"""
+        call(f: &Fn() -> unit) = f()
+
+        main()
+            var p = Fs(1)
+            val q = Fs(10)
+            call(() -> p.bump())
+            call(() -> print(q.n))
+            print(p.n, q.n)
+        """, "10\n2 10\n")
+
+@test("a pinned 'var' and 'val' in a closure that is kept are refused, naming why and the box")
+cwo_pinned_by_value()
+    val program = cwo_fs + raw"""
+        import sysl.buf.{Buf, buf}
+
+        var kept: Buf[&Fn() -> unit] = buf()
+
+        keep_var()
+            var p = Fs(1)
+            kept.push(() -> print(p.n))
+
+        keep_val()
+            val q = Fs(2)
+            kept.push(() -> print(q.n))
+
+        main()
+            keep_var()
+            keep_val()
+        """
+    val head = "'Fs' is '@pinned' — C may hold pointers into a value of it, so a value is never copied " +
+        "or moved once it is built, and this closure captures "
+    val why = "by value, since it is handed to 'push' on line "
+
+    cwo_refused(program, [s"$head'p' $why", s"$head'q' $why",
+                          ". Build it behind a counted reference instead ('val p: &Fs = …')",
+                          ". Build it behind a counted reference instead ('val q: &Fs = …'), which the " +
+                          "closure keeps without copying the value"])
+end cwo_pinned_by_value
+
+@test("the box the refusal names works: a kept closure counts a '&Fs' and writes through it")
+cwo_pinned_box()
+    cwo_prints(cwo_fs + raw"""
+        import sysl.buf.{Buf, buf}
+
+        main()
+            val kept: Buf[&Fn() -> unit] = buf()
+            val p: &Fs = Fs(1)
+            kept.push(() ->
+                p.bump()
+                print(p.n))
+            kept[0]()
+            kept[0]()
+        """, "2\n3\n")
+
+// -- a ref and a call that runs a closure writing what it stands on ---------------------------------
+
+@test("the program that read freed memory: a closure argument replaces what a 'ref' stands on")
+cwo_ref_hazard_argument()
+    cwo_refused(cwo_holder + raw"""
+        main()
+            var h = H(Node(1), 0)
+            ref r = h.node.v
+            call(() -> h = H(Node(2), 0))
+            print(r)
+        """, [cwo_hazard])
+
+@test("the hazard however the closure is reached: a local called, handed on, a '&Fn', in a closure")
+cwo_ref_hazard_reached()
+    val tail = "    print(r)\n\nmain()\n    run()\n"
+
+    cwo_refused(cwo_holder + "run()\n    var h = H(Node(1), 0)\n    var g = () -> h = H(Node(2), 0)\n" +
+                "    ref r = h.node.v\n    g()\n" + tail, [cwo_hazard])
+    cwo_refused(cwo_holder + "go(f: () -> unit) = f()\n\nrun()\n    var h = H(Node(1), 0)\n" +
+                "    var g = () -> h = H(Node(2), 0)\n    ref r = h.node.v\n    go(g)\n" + tail,
+                [cwo_hazard])
+    cwo_refused(cwo_holder + "run()\n    var h = H(Node(1), 0)\n" +
+                "    val f: &Fn() -> unit = () -> h.node = Node(2)\n    ref r = h.node.v\n    f()\n" +
+                tail, [cwo_hazard])
+    cwo_refused(cwo_holder + "run()\n    var h = H(Node(1), 0)\n    var g = () -> h = H(Node(2), 0)\n" +
+                "    ref r = h.node.v\n    call(() -> g())\n" + tail, [cwo_hazard])
+end cwo_ref_hazard_reached
+
+@test("the hazard through a struct holding the closure, and a '*self' call inside the closure")
+cwo_ref_hazard_holder_and_method()
+    cwo_refused(cwo_holder + raw"""
+        struct Keeper
+            f: &Fn() -> unit
+
+        fire(k: Keeper) = k.f()
+
+        main()
+            var h = H(Node(1), 0)
+            val k = Keeper(() -> h = H(Node(2), 0))
+            ref r = h.node.v
+            fire(k)
+            print(r)
+        """, [cwo_hazard])
+    cwo_refused(cwo_node + raw"""
+        struct H
+            node: &Node
+            count: int
+
+            reset(*self) = self.node = Node(0)
+
+        main()
+            var h = H(Node(1), 0)
+            ref r = h.node.v
+            call(() -> h.reset())
+            print(r)
+        """, [cwo_hazard])
+end cwo_ref_hazard_holder_and_method
+
+@test("no hazard: a plain field, the place itself, a ref on a plain field, or a ref whose block closed")
+cwo_ref_harmless()
+    cwo_prints(cwo_holder + raw"""
+        harmless()
+            var h = H(Node(1), 0)
+            ref r = h.node.v
+            call(() -> h.count += 1)
+            print(r, h.count)
+
+        leaf()
+            var h = H(Node(1), 0)
+            ref r = h.node.v
+            call(() -> h.node.v = 9)
+            print(r)
+
+        plain()
+            var h = H(Node(1), 0)
+            ref c = h.count
+            call(() -> h = H(Node(2), 5))
+            print(c)
+
+        after()
+            var h = H(Node(1), 0)
+            var g = () -> h = H(Node(2), 0)
+            if true
+                ref r = h.node.v
+                print(r)
+            g()
+            print(h.node.v)
+
+        main()
+            harmless()
+            leaf()
+            plain()
+            after()
+        """, "1 1\n9\n5\n1\n2\n")

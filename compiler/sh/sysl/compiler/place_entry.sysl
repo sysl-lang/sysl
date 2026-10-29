@@ -1,0 +1,480 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.Span
+import sysl.buf.{Buf, buf}
+import sysl.container.{Map, map, Set, set}
+import sysl.math.bigint.from_int
+
+// **A method's answer read where it lies** (`docs/design/borrowed-return.md § 5.2`).
+//
+// A function whose answer is a place of one of its parameters (`borrow_summary.sysl`) -- `quad(self)
+// -> Kids = self.kids.unwrap()` -- answers, through its ordinary entry, a copy of that storage with a
+// count taken for every reference in it, and its caller gives the counts back when it is done. The
+// caller could have read the field itself for nothing (`memory.md § A share of something read out of
+// storage takes no count while nothing can move`). So such a function is given a second entry, its
+// **place entry** (`<symbol>$place`): it takes that parameter by the address of the caller's storage,
+// takes the others as the ordinary entry does, and answers the address of the place, with no count
+// taken and nothing copied.
+//
+// **The caller reads the value out of that address at once and takes its counts there**, exactly as
+// it would for a field read out of storage, and the call's value is then an ordinary owned temporary
+// -- so nothing downstream of the call can tell the two entries apart. Where the value's uses until
+// its last one lie in a stretch that can release nothing, the counts are dropped again with their
+// releases by the pass that drops every such share (`arc_cover.sysl`): that is the inert stretch read
+// through. Where the stretch ends first -- a write that may reach the storage, a release, a call that
+// might do either, an `await`, a lock -- the counts stay, taken at the call; the value is the one
+// the ordinary entry would have answered, since nothing ran between the call and the read. A use that
+// stores, returns, captures or keeps the value keeps the count it was handed, as for any field read.
+//
+// **What is given a place entry is a body that is one place expression and nothing else**: a field
+// chain, an element of a fixed array, what a reference read out of it refers to, the payload a
+// `match` binds (each other arm ending the program), or a call to another such function on such a
+// place -- every index and every other argument worked out with no call and no write. A body like that
+// can write nothing at all, so the caller's storage is the same when the entry returns as when it was
+// called. Anything else the summary calls a place keeps the ordinary entry. So does a callee no body
+// of which is in sight, which the summary never calls a place.
+//
+// **The caller uses it where the argument is storage it can name**: a local, a module `val`, what a
+// reference refers to, or a field or array element of one of those, with every other argument
+// changing nothing. A temporary receiver (`make().quad()`) keeps the ordinary entry.
+//
+// The entry is a private helper of the module that calls it, written from the body the program
+// carries, so a library artifact and its user never have to agree about it.
+
+// The functions of `p` given a place entry, read from what the whole-program check found
+// (`answers`, `Promotions.place_answers`), with the symbols of those that release nothing added to
+// what the count elision may cross.
+place_entries(e: *Emit, p: TProgram, answers: Map[string, usize])
+    if answers.is_empty() then return
+
+    var cands: Buf[(TFunc, usize)] = buf()
+
+    for f in p.funcs
+        answers.get(f.name) match
+            Some(k) -> if place_candidate(e, f, k) then cands.push((f, k))
+            None -> ()
+
+    // The smallest set closed under the rule: a body joins once every place call in it is to a member.
+    // A recursion never joins, which the summary already says of it.
+    var grew = true
+
+    while grew
+        grew = false
+
+        for c in cands
+            if e.places.has(c.0.name) then continue
+
+            val roots = one_root(c.0.params.at(c.1).0)
+
+            if place_shape(e, c.0.body.result.unwrap(), roots)
+                e.places.put(c.0.name, c)
+                grew = true
+
+    if e.places.is_empty() then return
+
+    // **A place entry owns nothing**, so it is judged as its body would be were it handed its
+    // parameters rather than owning them: `quad(self)` owns `self` and gives it back, and so releases
+    // something, but `quad$place` is handed an address and releases nothing -- and a share read before
+    // it may be held across it. The rest of the program is judged as `inert` judged it.
+    var owning: Set[string] = set()
+
+    for name in e.owning_funcs
+        if !e.places.has(name) then owning.add(name)
+
+    val quiet = if owning.len() == e.owning_funcs.len() then e.inert else inert_callees(p, owning)
+
+    for c in cands
+        val name = c.0.name
+
+        if e.places.has(name) && quiet.has(name) then e.inert_symbols.add(place_symbol(e, name))
+end place_entries
+
+// The symbol a function's place entry is defined and called at.
+place_symbol(e: *Emit, name: string) -> string = symbol_of(e, name) + "$place"
+
+// Whether a symbol is a place entry's. No other symbol holds a `$` followed by `place` at its end: a
+// function's own carries its module, and a helper's names what it is for.
+is_place_symbol(symbol: string) -> bool = symbol.ends_with("$place")
+
+// Whether `f`'s declaration lets it have a second entry at all: an ordinary sysl function, called only
+// as one, whose body is an expression answering a value and whose parameter `k` takes room.
+private place_candidate(e: *Emit, f: TFunc, k: usize) -> bool
+    if f.marks.is_async() || f.exported.is_some() || f.section.is_some() || f.conv.is_some() then return false
+    if f.variadic || f.ghost || f.variant.is_some() then return false
+    if !f.requires.is_empty() || !f.ensures.is_empty() || !f.olds.is_empty() then return false
+    if !f.body.stmts.is_empty() || f.body.result.is_none() then return false
+    if no_value(f.ret_ty) || zero_sized(f.ret_ty) then return false
+
+    for p in f.params
+        if underlying(p.1) == VaList then return false
+
+    !zero_sized(f.params.at(k).1)
+end place_candidate
+
+private one_root(name: string) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    out.push(name)
+    out
+end one_root
+
+private has_root(roots: Buf[string], name: string) -> bool
+    for r in roots
+        if r == name then return true
+
+    false
+end has_root
+
+// Whether `x` is a place this lowering can answer the address of, rooted at one of `roots`.
+private place_shape(e: *Emit, x: TExpr, roots: Buf[string]) -> bool = *x.kind match
+    TLoad(name, _) -> has_root(roots, name)
+    TField(r, index, _) ->
+        val rty = texpr_type(r)
+
+        if bitfield_ranges_of(rty).is_some() || c_bit_field(rty, index) then false
+        else place_shape(e, r, roots)
+    TIndex(r, index, _) -> nameless(texpr_type(r)) match
+        Array(_, _) -> changes_nothing(index) && place_shape(e, r, roots)
+        _ -> false
+    TDeref(operand, _) -> place_shape(e, operand, roots)
+    TBlockExpr(b) -> b.stmts.is_empty() && b.result.is_some() && place_shape(e, b.result.unwrap(), roots)
+    TCall(name, args, _, _) -> e.places.get(name) match
+        Some(c) -> others_quiet(args, c.1) && place_shape(e, args.at(c.1), roots)
+        None -> false
+    TMatch(scrutinee, arms, _) ->
+        if !place_shape(e, scrutinee, roots) then return false
+
+        for arm in arms
+            if !arm_shape(e, arm, roots) then return false
+
+        !arms.is_empty()
+    _ -> false
+
+// Whether every argument but the one at `k` can be worked out with no call and no write.
+private others_quiet(args: Buf[TExpr], k: usize) -> bool
+    for j in 0..<args.len()
+        if j != k && !changes_nothing(args.at(j)) then return false
+
+    true
+end others_quiet
+
+// One arm of a `match` the place is taken out of: a single pattern with no guard, which either ends
+// the program binding nothing, or binds names to parts of the subject -- the whole of it, or the
+// fields of one variant's payload -- and answers a place rooted at one of them.
+private arm_shape(e: *Emit, arm: TArm, roots: Buf[string]) -> bool
+    if arm.guard.is_some() || arm.patterns.len() != 1 then return false
+
+    val pat = arm.patterns.at(0)
+
+    if is_never_type(arm.body.ty) then return !binds_any(pat) && flat_pattern(pat)
+    if !arm.body.stmts.is_empty() || arm.body.result.is_none() || !flat_pattern(pat) then return false
+
+    var inner: Buf[string] = buf()
+
+    for r in roots
+        inner.push(r)
+
+    pat match
+        TBindPattern(name, ty) -> if !zero_sized(ty) then inner.push(name)
+        TVariantPattern(_, _, args) ->
+            for a in args
+                a match
+                    TBindPattern(name, ty) -> if !zero_sized(ty) then inner.push(name)
+                    _ -> ()
+        _ -> ()
+
+    place_shape(e, arm.body.result.unwrap(), inner)
+end arm_shape
+
+// A pattern whose only test is the subject's variant: a `_`, a name, or a variant of an enum with a
+// payload whose fields are each a `_` or a name.
+private flat_pattern(p: TPattern) -> bool = p match
+    TWildPattern(_) -> true
+    TBindPattern(_, _) -> true
+    TVariantPattern(enum_ty, _, args) ->
+        val d = enum_decl(enum_ty) match
+            Some(found) -> found
+            None -> return false
+
+        if d.simple && !args.is_empty() then return false
+
+        for a in args
+            a match
+                TWildPattern(_) -> ()
+                TBindPattern(_, _) -> ()
+                _ -> return false
+
+        true
+    _ -> false
+
+private is_never_type(t: Type) -> bool = t match
+    Never -> true
+    _ -> false
+
+// -- the caller ---------------------------------------------------------------------------------------
+
+// A call to `name` made through its place entry, where it has one and the call can use it: the value
+// read out of the place, with its counts taken, owned by the statement as a call's result is. `None`
+// where the ordinary entry is called instead.
+gen_place_call(e: *Emit, name: string, args: Buf[TExpr], ty: Type, span: Span) -> Option[Val]
+    val at = place_call_at(e, name, args, span)?
+    val r = fresh_reg(e)
+
+    emit(e, InLoad(r, lty(e, ty), at, AccPlain, None))
+
+    if contains_counted(ty) then retain_value(e, ty, r)
+
+    Some(own_temp(e, r, ty))
+end gen_place_call
+
+// The same for a large result written into `dest`: the bytes copied out of the place, and the counts
+// taken at `dest`, which owns them as it would own what the ordinary entry wrote there.
+gen_place_call_into(e: *Emit, dest: Val, name: string, args: Buf[TExpr], ty: Type, span: Span) -> bool
+    val at = place_call_at(e, name, args, span) match
+        Some(v) -> v
+        None -> return false
+
+    emit_memcpy(e, dest, at, int(e.layout.size(ty)), int(e.layout.claim(ty)))
+    retain_at(e, ty, dest)
+    true
+end gen_place_call_into
+
+// The address the place entry answers, where the call may use it.
+private place_call_at(e: *Emit, name: string, args: Buf[TExpr], span: Span) -> Option[Val]
+    val c = e.places.get(name)?
+    val k = c.1
+
+    if k >= args.len() || e.abandoning.has(name) then return None
+    if !nameable(e, args.at(k)) || !others_quiet(args, k) then return None
+
+    Some(call_place(e, name, args, address(e, args.at(k)), span))
+end place_call_at
+
+// Whether `x` is storage the caller can hand over by address as it stands: a local or module `val`
+// with a slot, what a reference or a pointer refers to, or a field or array element of one of those.
+private nameable(e: *Emit, x: TExpr) -> bool = *x.kind match
+    TLoad(name, ty) ->
+        if zero_sized(ty) then return false
+
+        for item in e.ref_places
+            if item.0 == name then return false
+
+        true
+    TGlobal(_, _, _) -> true
+    TDeref(operand, _) -> changes_nothing(operand)
+    TField(r, index, _) ->
+        val rty = texpr_type(r)
+
+        !(bitfield_ranges_of(rty).is_some() || c_bit_field(rty, index)) && nameable(e, r)
+    TIndex(r, index, _) -> nameless(texpr_type(r)) match
+        Array(_, _) -> changes_nothing(index) && nameable(e, r)
+        _ -> false
+    _ -> false
+
+// The call itself: the place argument as the address `at`, the others as the ordinary entry takes
+// them, the caller's location where the function is tracked.
+private call_place(e: *Emit, name: string, args: Buf[TExpr], at: Val, span: Span) -> Val
+    val k = e.places.get(name).unwrap().1
+    var arg_vals: Buf[IrArg] = buf()
+
+    for j in 0..<args.len()
+        if j == k then arg_vals.push(ir_arg(LPtr, at))
+        else arg_value(e, args.at(j), &arg_vals, set())
+
+    push_caller_arg(e, name, span, &arg_vals)
+
+    val symbol = request_helper(e, place_symbol(e, name), HrPlace(name))
+    val r = fresh_reg(e)
+
+    emit(e, InCall(Some(r), LPtr, VGlobal(symbol), arg_vals, no_ir_attrs(), None, no_fast_math(), false))
+    r
+end call_place
+
+// -- the entry ------------------------------------------------------------------------------------------
+
+// The place entry's signature: the ordinary one's parameters, the place parameter as an address, and
+// an address answered.
+place_entry_sig(e: *Emit, name: string, target: string) -> IrFuncSig
+    val c = e.places.get(target).unwrap()
+    var ps: Buf[IrParam] = buf()
+
+    for j in 0..<c.0.params.len()
+        val p = c.0.params.at(j)
+
+        if zero_sized(p.1) then continue
+
+        val l = if j == c.1 then LPtr else sysl_param_lty(e, p.1)
+
+        ps.push(IrParam(l, no_ir_attrs(), Some(VReg(s"${p.0}.param"))))
+
+    if e.tracked.has(target) then ps.push(caller_ir_param(true))
+
+    ir_sig(name, IrFnType(LPtr, ps, false, no_ir_attrs())) with { linkage = LinkInternal }
+end place_entry_sig
+
+// The place entry's body: the place parameter named at the caller's storage, the others in slots as
+// the ordinary entry has them, and the place's address worked out and answered.
+gen_place_entry(e: *Emit, target: string)
+    val c = e.places.get(target).unwrap()
+    val f = c.0
+
+    e.src = f.src
+    e.in_tracked = e.tracked.has(target)
+
+    for j in 0..<f.params.len()
+        val p = f.params.at(j)
+
+        if zero_sized(p.1) then continue
+
+        val slot = VReg(s"${p.0}.addr")
+        val param = VReg(s"${p.0}.param")
+
+        if j == c.1
+            var idx: Buf[IrArg] = buf()
+
+            idx.push(ir_arg(l_i32(), VInt(from_int(0))))
+            emit(e, InGep(slot, LInt(8), param, idx))
+        else
+            alloca(e, slot, lty(e, p.1))
+
+            if e.layout.indirect(p.1) then
+                emit_memcpy(e, slot, param, int(e.layout.size(p.1)), int(e.layout.claim(p.1)))
+            else
+                emit(e, InStore(lty(e, p.1), param, slot, AccPlain, None))
+        end if
+
+    var env: Buf[(string, Val)] = buf()
+
+    env.push((f.params.at(c.1).0, VReg(s"${f.params.at(c.1).0}.addr")))
+
+    val at = place_at(e, f.body.result.unwrap(), env)
+
+    emit_term(e, InRet(Some(LPtr), Some(at)))
+end gen_place_entry
+
+private env_get(env: Buf[(string, Val)], name: string) -> Val
+    var i = env.len()
+
+    while i > 0
+        i -= 1
+
+        if env.at(i).0 == name then return env.at(i).1
+
+    VUndef
+end env_get
+
+// The address of a place `place_shape` admitted, with the names in `env` standing at theirs.
+private place_at(e: *Emit, x: TExpr, env: Buf[(string, Val)]) -> Val = *x.kind match
+    TLoad(name, _) -> env_get(env, name)
+    TField(r, index, ty) ->
+        if zero_sized(ty) then return place_at(e, r, env)
+
+        val rty = texpr_type(r)
+        val base = place_at(e, r, env)
+        val out = fresh_reg(e)
+        var idx: Buf[IrArg] = buf()
+
+        idx.push(ir_arg(l_i32(), VInt(from_int(0))))
+        idx.push(ir_arg(l_i32(), VInt(from_int(long(field_index_of(e, rty, index))))))
+        emit(e, InGep(out, lty(e, rty), base, idx))
+        out
+    TIndex(r, index, _) -> nameless(texpr_type(r)) match
+        Array(n, elem) ->
+            val base = place_at(e, r, env)
+            val i = widen_index(e, index, x.span)
+
+            bounds_check(e, i, VInt(from_int(long(n))), signed_index(index), x.span)
+
+            val out = fresh_reg(e)
+            var idx: Buf[IrArg] = buf()
+
+            idx.push(ir_arg(word_lty(e), i))
+            emit(e, InGep(out, lty(e, *elem), base, idx))
+            out
+        _ -> gap_at(e, "a place entry indexing something that is not an array")
+    TDeref(operand, _) ->
+        val oty = texpr_type(operand)
+        val held = place_at(e, operand, env)
+        val p = fresh_reg(e)
+
+        emit(e, InLoad(p, lty(e, oty), held, AccPlain, None))
+        box_payload_addr(e, p, oty)
+    TBlockExpr(b) -> place_at(e, b.result.unwrap(), env)
+    TCall(name, args, _, _) ->
+        val k = e.places.get(name).unwrap().1
+
+        call_place(e, name, args, place_at(e, args.at(k), env), x.span)
+    TMatch(scrutinee, arms, _) -> match_place(e, scrutinee, arms, env)
+    _ -> gap_at(e, "a place entry over a form it does not answer")
+
+// A `match` answering a place: each arm tested in turn against the subject's value, the first that
+// holds either ending the program or answering the place it names, with its bindings standing at the
+// parts of the subject they name.
+private match_place(e: *Emit, scrutinee: TExpr, arms: Buf[TArm], env: Buf[(string, Val)]) -> Val
+    val sty = texpr_type(scrutinee)
+    val base = place_at(e, scrutinee, env)
+    val whole = fresh_reg(e)
+
+    emit(e, InLoad(whole, lty(e, sty), base, AccPlain, None))
+
+    val answer = alloca(e, fresh_reg(e), LPtr)
+    val done = fresh_label(e, "place.done")
+
+    for arm in arms
+        val pat = arm.patterns.at(0)
+        val taken = fresh_label(e, "place.arm")
+        val next = fresh_label(e, "place.next")
+
+        emit_term(e, InCondBr(pattern_test(e, pat, whole), taken, next))
+        emit_label(e, taken)
+
+        if is_never_type(arm.body.ty)
+            gen_block_void(e, arm.body)
+
+            if !e.terminated then emit_term(e, InUnreachable)
+        else
+            var inner: Buf[(string, Val)] = buf()
+
+            for item in env
+                inner.push(item)
+
+            bind_at(e, pat, base, &inner)
+            emit(e, InStore(LPtr, place_at(e, arm.body.result.unwrap(), inner), answer, AccPlain, None))
+            emit_term(e, InBr(done))
+        end if
+
+        emit_label(e, next)
+
+    // Every arm was tried, and a `match` is exhaustive.
+    emit_term(e, InUnreachable)
+    emit_label(e, done)
+
+    val r = fresh_reg(e)
+
+    emit(e, InLoad(r, LPtr, answer, AccPlain, None))
+    r
+end match_place
+
+// The names a flat pattern binds, each at the part of the subject at `base` it names.
+private bind_at(e: *Emit, pat: TPattern, base: Val, env: *Buf[(string, Val)])
+    pat match
+        TBindPattern(name, _) -> env.push((name, base))
+        TVariantPattern(enum_ty, variant, args) ->
+            val d = enum_decl(enum_ty).unwrap()
+
+            for i in 0..<args.len()
+                args.at(i) match
+                    TBindPattern(name, ty) ->
+                        if zero_sized(ty) then continue
+
+                        val out = fresh_reg(e)
+                        var idx: Buf[IrArg] = buf()
+
+                        idx.push(ir_arg(l_i32(), VInt(from_int(0))))
+                        idx.push(ir_arg(l_i32(), VInt(from_int(long(variant_field_index(e.layout, variant,
+                                                                                         variant.slot(i)))))))
+                        emit(e, InGep(out, variant_lty(d, variant), payload_ptr(e, d, base), idx))
+                        env.push((name, out))
+                    _ -> ()
+        _ -> ()
+end bind_at
