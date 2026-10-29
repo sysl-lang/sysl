@@ -477,8 +477,8 @@ fixed-point vector has no `abs` and is refused.
 scalar [`mul_add`](/library/math/#mul-add-a-multiply-and-an-add-rounded-once) is. Either `b` or `c`
 may be a scalar, which broadcasts. It is defined for `f32` and `f64` lanes only: a half-width lane
 cannot keep the single rounding, so `f16` and `bf16` are refused, as the scalar methods are absent.
-It is not available inside a `@strict_fp` body, where `*` and `+` are the strict forms. Neither
-method is evaluated while compiling.
+Inside a `@strict_fp` body it is the constrained multiply-add, as the scalar one is, rounded in the
+mode in force. Neither method is evaluated while compiling.
 
 ```sysl
 val e = 1.0 / 1073741824.0
