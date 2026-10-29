@@ -49,6 +49,9 @@ parse_at_stmt(p: *Parser, start: Span) -> Stmt
 
     if word == "assert" then return parse_assert_decl(p, start)
 
+    // `@unchecked` marks the block under it rather than a declaration (`unchecked.sysl`).
+    if word == "unchecked" then return parse_unchecked_block(p, start)
+
     parse_attributed_decl(p, start)
 end parse_at_stmt
 
@@ -134,6 +137,8 @@ parse_member_attrs(p: *Parser, in_trait: bool) -> Buf[Attr]
                 p.fault(at, "'@assert' stands where a declaration stands, and a type's body holds its members — write it beside the type rather than inside it, where 'sizeof' and 'offsetof' still name what it is about")
             else if word == "align" || word == "packed" || word == "byte_order"
                 p.fault(at, layout_attr_on_member(word))
+            else if word == "unchecked"
+                p.fault(at, unchecked_not_a_block())
             else
                 p.fault(at, member_attr_refusal())
 
@@ -425,6 +430,13 @@ parse_attribute(p: *Parser) -> Option[Attr]
     // something a test is, so it is an argument to `@test` rather than an annotation of its own.
     if word == "ignore"
         p.fault(p.here(), "an ignored test is written '@test(ignore: \"why it is not run\")' — ignoring is something a test is, so it goes inside '@test' beside the description and 'should_trap', and a function that is not a test has no run to withhold")
+        skip_line(p)
+        return None
+    end if
+
+    // `@unchecked` among a declaration's annotations, or above a member: it marks a block.
+    if word == "unchecked"
+        p.fault(at, unchecked_not_a_block())
         skip_line(p)
         return None
     end if

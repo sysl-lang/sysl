@@ -127,6 +127,47 @@ so in the spelling, and where the edge of the range is the right answer instead,
 stop there: `small +| 10` is 255. Both families are defined in every build, at every width
 ([wrapping and saturating operators](/reference/expressions/#wrapping-and-saturating-operators)).
 
+### Asking whether it fit
+
+Where an overflow means the input was wrong — a number read out of a document, a total over
+untrusted data — the question is whether the operation fit, and the wrapped result cannot answer it
+afterwards. Every plain integer type answers it with the prelude trait `Checked`: `checked_add`,
+`checked_sub`, `checked_mul`, `checked_div`, `checked_rem` and `checked_neg`, each returning
+`Option[Self]` — the result, or `None` where the plain operator would have wrapped or trapped.
+
+```sysl
+var small: byte = 250
+
+print(small.checked_add(5), small.checked_add(6))
+print(0u8.checked_sub(1), i8(-128).checked_neg(), i8(-128).checked_div(-1), 7.checked_rem(0))
+```
+
+```output
+Some(255) None
+None None None None
+```
+
+They are defined at every width, odd ones and those past a machine word included, and lower to the
+machine's own overflow flag (`llvm.sadd.with.overflow` and its siblings) rather than to a test
+written after the fact. The operand is the receiver's type: a literal takes it, and a value of
+another type is refused rather than converted.
+
+```sysl
+val a: byte = 1
+val b: int = 2
+
+print(a.checked_add(b))
+```
+
+```error
+'rhs' of method 'Checked.checked_add' is byte, but int was given
+```
+
+A generic body asks for them with the bound `[T: Checked]`. The members are the plain `iN` and `uN`
+types only: a [ranged type](/reference/errors/#constrained-types)'s overflow is a breach of its range and already
+traps, and a float has no overflow to report. There is no `checked_shl` or `checked_shr`, because a
+shift by the width or more is [defined](/reference/expressions/#shifting-by-the-width-or-more).
+
 ### Arithmetic over literals is exact
 
 An expression written out of integer literals alone — `65536 * 65536`, `(1 << 16) - 1`,

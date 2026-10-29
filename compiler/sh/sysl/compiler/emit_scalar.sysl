@@ -561,7 +561,7 @@ saturating(e: *Emit, op: string, bits: int, signed: bool, lv: Val, rv: Val) -> V
     r
 end saturating
 
-private one_index(n: int) -> Buf[int]
+private[compiler] one_index(n: int) -> Buf[int]
     var out: Buf[int] = buf()
 
     out.push(n)
@@ -641,6 +641,9 @@ gen_int_op(e: *Emit, op: string, operand: TExpr, amount: Option[TExpr], width: T
     // A container subscript's index, checked and brought to a `usize` (`emit_place.sysl`).
     if op == SubscriptIndexOp then return subscript_index_val(e, operand)
 
+    // The same inside `@unchecked`: brought to a `usize` with neither test (`unchecked.sysl`).
+    if op == UncheckedSubscriptIndexOp then return unchecked_index_val(e, operand)
+
     val v = gen_expr(e, operand)
     val n = amount match
         Some(a) -> Some(gen_expr(e, a))
@@ -656,6 +659,13 @@ gen_int_op(e: *Emit, op: string, operand: TExpr, amount: Option[TExpr], width: T
     // the type's `-` does, and `signum` answers the nearest value to one the format holds.
     if is_fixed(width) && op == "abs" then return fixed_abs(e, width, fixed_wraps(ty), v)
     if is_fixed(width) && op == "signum" then return fixed_signum(e, width, v)
+
+    // `checked_add` and its siblings answer an option rather than an integer (`emit_checked.sysl`).
+    if is_checked_member(op) then return gen_checked(e, op, width, ty, v, n)
+
+    // An array's or a slice's index inside `@unchecked`: the index itself, its check left to nobody
+    // (`unchecked.sysl`). Reached here only where the subscript's lowering did not take it first.
+    if op == UncheckedIndexOp then return v
 
     op match
         // `x.bits` and `T::Bits(n)`: a fixed-point value and the integer it is stored as are the same

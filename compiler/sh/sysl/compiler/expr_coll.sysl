@@ -477,7 +477,7 @@ private index_non_vector(cx: &Analyzer, span: Span, raw: TExpr, tr: TExpr, index
         val place_key = catalog_key(cx.an, "IndexPlace")
 
         if place_key.is_some() && indexes_through(cx.an, place_key.unwrap(), texpr_type(tr))
-            val call = call_member(cx, span, raw, "index_place", args, None)
+            val call = call_member(cx, span, raw, place_member(cx), args, None)
 
             *call.kind match
                 TCall(name, _, _, _) -> cx.an.tables.place_calls.put(name, true)
@@ -500,7 +500,7 @@ private index_non_vector(cx: &Analyzer, span: Span, raw: TExpr, tr: TExpr, index
         texpr_type(tr) match
             Abstract(_, bounds) ->
                 if bound_member(cx.an, texpr_type(tr), bounds, "index_place").is_some()
-                    val call = call_member(cx, span, raw, "index_place", args, None)
+                    val call = call_member(cx, span, raw, place_member(cx), args, None)
 
                     return repr(texpr_type(call)) match
                         Ptr(inner) -> TExpr(span, TDeref(call, *inner))
@@ -532,7 +532,7 @@ private index_non_vector(cx: &Analyzer, span: Span, raw: TExpr, tr: TExpr, index
     repr(texpr_type(ti)) match
         // The element's qualifier stays on the receiver's type and comes off the value read out of
         // it, exactly as a field's does.
-        Integer(_, _, _) -> TExpr(span, TIndex(tr, ti, unqualified(elem.unwrap())))
+        Integer(_, _, _) -> TExpr(span, TIndex(tr, unchecked_wrap(cx, tr, ti), unqualified(elem.unwrap())))
         other ->
             if other == Unknown then return bad_expr(span)
 
@@ -585,7 +585,11 @@ subscript_index_form(cx: &Analyzer, span: Span, args: Buf[Expr], expected: Optio
     repr(texpr_type(ti)) match
         Integer(bits, signed, pw) ->
             if !signed && pw && bits == word_bits(cx) then ti
-            else TExpr(span, TIntOp(SubscriptIndexOp, ti, None, texpr_type(ti), expected.unwrap()))
+            else
+                // Inside `@unchecked` neither the sign nor the width is tested (`unchecked.sysl`).
+                val op = if cx.unchecked > 0 then UncheckedSubscriptIndexOp else SubscriptIndexOp
+
+                TExpr(span, TIntOp(op, ti, None, texpr_type(ti), expected.unwrap()))
         // Said as an array's subscript says it, rather than as an argument of the wrong type to a
         // method the reader never named.
         other ->
