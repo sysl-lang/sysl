@@ -1843,14 +1843,17 @@ private scale_operands(cx: &Analyzer, op: string, l: Expr, r: Expr,
     None
 end scale_operands
 
-// The type an integer literal beside a scalar operand of `*` or `/` is read at: the operand's own
-// where the literal fits it, and otherwise `int`, where the operand widens to it -- the operand
-// rule of `literal_widened`, for the pairs read here rather than there. A shift's count is never
+// The type an integer literal beside a scalar operand of `*` or `/` is read at -- the operand rule
+// of `literal_widened`, for the pairs read here rather than there: an integer operand's own, fitting
+// or not, so `b * 1000` over a `byte` is told the 1000 does not fit; any other operand's own where
+// the literal fits it, and otherwise `int`, where the operand widens to it. A shift's count is never
 // widened into.
 private scale_literal_type(cx: &Analyzer, op: string, t: Type, lit: Expr, numeric: Option[Type]) -> Type
     val own = repr(t)
 
-    if op != "*" && op != "/" || own == Char || own == Unknown || literal_fits(cx, lit, own) then return own
+    if op != "*" && op != "/" || own == Char || own == Unknown || integer_operand(own) ||
+            literal_fits(cx, lit, own) then
+        return own
 
     if reaches_position(int_type(), numeric) && literal_fits(cx, lit, int_type()) &&
             implicitly_widens(own, int_type()) then int_type()
@@ -2052,7 +2055,15 @@ analyze_operands(cx: &Analyzer, operands: Buf[Expr], expected: Option[Type],
 
                     val widens = widen && !keeps && repr(texpr_type(t)) != Char
 
-                    out.push(reread(cx, t, operands.at(i), ty.unwrap(), widens))
+                    val again = reread(cx, t, operands.at(i), ty.unwrap(), widens)
+
+                    // **An operand in the literal's tier is read at an integer pair's type, fitting
+                    // or not** (`literal_widened`), so where the re-reading was refused its own
+                    // complaint is the one kept: `b | (if c then 300 else 1)` is told the 300 does not
+                    // fit a byte, not that a byte and an `int` do not match.
+                    if soft.at(i) && integer_operand(ty.unwrap()) && disagree(texpr_type(again), ty.unwrap())
+                        out.push(analyze_expected(cx, operands.at(i), ty))
+                    else out.push(again)
                 else out.push(t)
             None -> out.push(held_literal(cx, operands.at(i), ty, held, any_typed(operands, firm)))
 

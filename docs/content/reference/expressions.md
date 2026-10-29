@@ -160,7 +160,7 @@ promoted to a third type: two `int`s add as `int` wherever the sum goes, so `val
 overflows at `int`'s width before the sum is widened.
 
 ```sysl
-var a = 1
+var a: int = 1
 var b: long = 2
 var r = 0.5
 
@@ -173,11 +173,12 @@ print(a + b, b - a, a + r)
 
 **Where neither type holds the other, the expression is a diagnostic asking for the conversion.** A
 `u32` and an `int` are both 32 bits: neither holds every value of the other, so the program says which
-side it means.
+side it means. (Written `var i = 2`, `i` would be a `u32`: a literal binding takes the type of the
+first operand it meets — [declarations](/reference/declarations/#a-literal-binding-takes-its-type-from-its-first-use).)
 
 ```sysl
 var n: u32 = 1
-var i = 2
+var i: int = 2
 
 print(n + i)
 ```
@@ -335,9 +336,9 @@ print(level)
 ```
 
 **A literal beside a typed operand is a value of that operand's type, and one the type does not hold
-is refused.** Where `b + 300` over a `u8` is an `int` sum of 555, the 300 of `b +| 300` is a `u8`
-that does not exist: saturating to 255 would hide the mistake, and widening to `int` first would leave
-nothing to saturate. A literal that fits exactly (`b +| 255`) is taken, on either side, and so is one
+is refused.** As in `b + 300` over a `u8`, the 300 of `b +| 300` is a `u8` that does not exist:
+saturating to 255 would hide the mistake, and widening to `int` first would leave nothing to
+saturate. A literal that fits exactly (`b +| 255`) is taken, on either side, and so is one
 the compound and yielding forms add to their place; one that does not fit the place is refused the
 same way.
 
@@ -1790,44 +1791,77 @@ print(ints[0] + ints[2], ints[1], wide[1] - wide[0])
 14 2147483646 2
 ```
 
-**A bare literal beside a typed operand is read at that operand's type where it fits there** — `h *
-0.5` over an `f32` is an `f32` product, `b + 3` over a `byte` a byte sum. **Where it does not fit, it
-takes its own default, `int` or `real`, and the typed operand widens to that** wherever the table
-above allows it, so `1.0 / k` over an `int` is a `real` quotient, `k < 1.5` compares as reals and
-`b + 300` over a `byte` is an `int` sum, in either order. The same holds for comparisons, range
-bounds, the elements of an unannotated array literal and the arms of an `if` or a `match`. Where the
-operand does not widen to the literal's default — a `long` beside `2.0`, a `char` beside anything —
-or the literal does not fit even that, or the position the pair stands in does not take the default
-(`val z: u8 = b + 300` is told the literal does not fit a byte) — the pair is refused.
+**An integer literal beside an operand of an integer type is read at that type, fitting or not**, as
+Rust reads one: `b + 3` over a `byte` is a byte sum, and `b + 300`, `300 + b`, `b < 300` and `b + -1`
+are each refused at the literal for not fitting a byte. What the pair is for does not change it —
+`val z: int = b + 300` is the same mistake, and `int(b) + 300` is the sum it meant. The same holds
+for range bounds, the elements of an unannotated array literal and the arms of an `if` or a `match`.
+Only two operands that each have a type of their own widen to each other (`u8 + u16` is a `u16`).
+
+```sysl
+var b: byte = 200
+
+print(b + 100, int(b) + 100)
+```
+
+```output
+44 300
+```
+
+```sysl
+var b: byte = 2
+
+print(b + 300)
+```
+
+```error
+the literal 300 does not fit byte
+```
+
+**A float literal is read at a typed operand's type where it fits there** — `h * 0.5` over an `f32`
+is an `f32` product. **Where it does not, it takes its own default, `real`, and the typed operand
+widens to that** wherever the table above allows it, so `1.0 / k` over an `int` is a `real`
+quotient and `k < 1.5` compares as reals, in either order. Where the operand does not widen to
+`real` — a `long` beside `2.0`, a `char` beside anything — the pair is refused.
 
 ```sysl
 var k = 4
-var b: byte = 2
 var h: f32 = 1.5
 
 val x: f32 = h * 0.5
 
-print(1.0 / k, k / 2.0, k < 1.5, b + 300, x)
+print(1.0 / k, k / 2.0, k < 1.5, x)
 ```
 
 ```output
-0.25 2 false 302 0.75
+0.25 2 false 0.75
 ```
 
 **An operand that comes to a literal on every path is a literal here too**: an `if` or a `match`
 whose every arm is one, a literal shifted by any count, and arithmetic over them. Each is read at
-the typed operand's type where it fits there, on either side, and otherwise at its default, as a
-single literal is.
+the typed operand's type, on either side, as a single literal is, so an arm that does not fit is
+refused where it is written.
 
 ```sysl
 val c = true
 var b: byte = 16
 
-print((if c then 0x15 else 5) | 7u32, b | (if c then 1 else 2), b | (if c then 300 else 1))
+print((if c then 0x15 else 5) | 7u32, b | (if c then 1 else 2), b | (if c then 255 else 1))
 ```
 
 ```output
-23 17 316
+23 17 255
+```
+
+```sysl
+val c = true
+var b: byte = 16
+
+print(b | (if c then 300 else 1))
+```
+
+```error
+the literal 300 does not fit byte
 ```
 
 ```sysl

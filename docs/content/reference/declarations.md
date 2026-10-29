@@ -232,6 +232,24 @@ the literal — `300` handed to a `u8` — fixes nothing either, and is refused 
 `int` written. An integer literal is fixed at a float type where it holds the value exactly. A use
 inside a closure or a nested function is a use like any other.
 
+**A generic call reads such a binding as it reads the literal itself**, as Rust's integer variables
+unify: it decides no type parameter while an argument with a type of its own is there, and is fixed
+at the parameter the call arrives at. In `pick(k, b)` with `b` a `u8`, the call is a `u8` call, in
+either order, and `k` a `u8`; with no typed argument beside it, it is an `int`.
+
+```sysl
+pick[T](a: T, b: T) -> T = b
+
+val b: u8 = 10
+val k = 250
+
+print(pick(b, k) + 10)
+```
+
+```output
+4
+```
+
 **A compound assignment is the same arithmetic written back**, so `s += b` fixes `s` at `b`'s type
 just as `s + b` does, and `total += k` fixes an undecided `k` at `total`'s:
 
@@ -252,8 +270,9 @@ print(sum + b, s, half(h), h / 2)
 ```
 
 The sum wraps at the byte's width, as it would with `u8` written on `sum`. Arithmetic beside a typed
-operand is the one use that **holds the literal to the type even where it does not fit**: `300`
-beside a `u8` is a mistake in what was written, not an `int` sum, and is refused at the literal. A
+integer operand **holds the literal to the type even where it does not fit**, as it holds a literal
+written there: `300` beside a `u8` is a mistake in what was written, not an `int` sum, and is refused
+at the literal. A
 float literal beside an integer operand fixes nothing, and the integer widens to `real`:
 
 ```sysl

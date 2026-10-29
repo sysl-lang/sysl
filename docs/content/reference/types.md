@@ -87,6 +87,32 @@ val big = 4294967295
 the literal 4294967295 does not fit int
 ```
 
+**Beside an operand of an integer type, an integer literal takes that type**, fitting or not, as in
+Rust: `b + 200` over a `u8` is a `u8` sum that wraps, and `b + 300`, `b < 300` and `b + -1` are
+refused at the literal, whatever the sum is for. `int(b) + 300` is the `int` sum. Two operands that
+each have a type of their own still widen to each other, so `u8 + u16` is a `u16`
+([expressions](/reference/expressions/#which-conversions-are-implicit)).
+
+```sysl
+val b: u8 = 100
+val w: u16 = 1000
+
+print(b + 200, int(b) + 300, b + w)
+```
+
+```output
+44 400 1100
+```
+
+```sysl
+val b: u8 = 100
+val z: int = b + 300
+```
+
+```error
+the literal 300 does not fit byte
+```
+
 **A binding given a bare literal takes its type from its first use that fixes one**, not from the
 literal: a comparison, an argument, a result, or arithmetic beside an operand of a type of its own.
 In `var sum = 250` followed by `sum + b` over a `u8`, `sum` is a `u8` — and `var s = 300` beside the
