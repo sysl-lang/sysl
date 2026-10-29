@@ -413,6 +413,48 @@ e match
 none
 ```
 
+**The expected type reaches through a form that unwraps.** What `?`, `.unwrap()`, `.expect(msg)`,
+`.unwrap_or(d)` and `.unwrap_or_else(f)` yield is the success half of an `Option` or `Result`, so
+what their position wants is what that half is solved as. A `match` whose arm is `Some(v) -> v` or
+`Ok(v) -> v` hands the payload on as it is, and says the same:
+
+```sysl
+parse[T: Zero]() -> Result[T, string] = Ok(T.zero())
+none[T]() -> Option[T] = None
+
+run() -> Result[int, string]
+    val n: u8 = parse()?
+    val d: u8 = none().unwrap_or(250)
+    val m: u8 = none() match
+        Some(v) -> v
+        None -> 5
+
+    print(n, d, m)
+    Ok(0)
+
+run().unwrap()
+```
+
+```output
+0 250 5
+```
+
+Only the success half is read. The error half is what `?` propagates and `.unwrap()` traps on, and
+nothing about unwrapping says what it is, so `both[T, E]() -> Result[T, E]` behind a `?` still asks
+for `E`. A `?` with nothing expected (a statement, or the receiver of `g()?.h()`) asks for `T` too:
+
+```sysl
+both[T: Zero, E]() -> Result[T, E] = Ok(T.zero())
+
+run() -> Result[int, string]
+    val n: int = both()?
+    Ok(n)
+```
+
+```error
+cannot infer the type argument 'E' of 'both' here — annotate the expected type
+```
+
 **An argument is read against what its parameter already knows.** `Ok(1)` alone says nothing of its
 error type, but at a parameter written `Result[T, Fault]` the `Fault` is fixed by the declaration, so
 the variant takes it and its value settles `T`. The same holds for a closure's result where the

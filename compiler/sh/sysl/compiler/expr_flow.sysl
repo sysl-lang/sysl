@@ -494,6 +494,12 @@ end any_pattern_binds
 
 match_expr(cx: &Analyzer, span: Span, scrut: Expr, arms: Buf[MatchArm], expected: Option[Type],
            discarded: bool) -> TExpr
+    // `val n: int = parse() match { Some(v) -> v, None -> 0 }` -- an arm that yields the payload as
+    // it is says the payload is what the match is wanted as, so a generic scrutinee's success half
+    // is solved from it, as `?` and `.unwrap()` solve it. Only that arm says so: an arm that does
+    // anything else with `v` says nothing about its type.
+    if arms_yield_payload(arms) then want_payload(cx, expected)
+
     val ts = type_expr_bare(cx, scrut)
 
     // A name an arm binds out of a borrowed view is borrowed from the same receiver.
@@ -513,6 +519,35 @@ match_expr(cx: &Analyzer, span: Span, scrut: Expr, arms: Buf[MatchArm], expected
     TExpr(span, TMatch(ts, met, match_result_type(cx, ts.span, texpr_type(ts), met)))
 end match_expr
 
+// Whether an arm is `Some(v) -> v` or `Ok(v) -> v`: the success variant binding one name, with no
+// guard, whose body is that name alone.
+private arms_yield_payload(arms: Buf[MatchArm]) -> bool
+    for arm in arms
+        if arm.guard.is_some() || arm.patterns.len() != 1 || arm.body.len() != 1 then continue
+
+        val bound = *arm.patterns.at(0).kind match
+            VariantPattern(name, args) ->
+                if args.len() != 1 || !success_variant(name) then continue
+
+                *args.at(0).kind match
+                    IdentPattern(v) -> v
+                    _ -> continue
+            _ -> continue
+
+        val yielded = *arm.body.at(0).kind match
+            ExprStmt(inner) -> *inner.kind match
+                Ident(n) -> n
+                _ -> continue
+            _ -> continue
+
+        if yielded == bound then return true
+    end for
+
+    false
+end arms_yield_payload
+
+private success_variant(name: string) -> bool =
+    name == "Some" || name == "Ok" || name.ends_with(".Some") || name.ends_with(".Ok")
 // **Branches meet at the widest of their types where it holds every value of the others** -- the
 // operand rule, so `if c then n else b` over an `int` and a `byte` is an `int`, and two branches
 // neither of which holds the other still disagree. A branch that is converted has its value widened
