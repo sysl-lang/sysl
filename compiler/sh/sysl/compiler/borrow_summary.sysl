@@ -31,8 +31,9 @@ import sysl.container.{Map, map, Set, set}
 // or release anything else is `borrowing.sysl`'s `inert_callees`, asked once per report
 // (`explain_borrow_notes`), not part of the summary.
 //
-// Nothing is lowered from this yet. `--explain-borrows` prints it, one line per function of the
-// program's own files.
+// `--explain-borrows` prints it, one line per function of the program's own files, and the lowering
+// reads the places from it (`note_places`): a function whose answer is a place of a parameter may be
+// given a second entry answering that place's address (`place_entry.sysl`).
 
 // What an expression's value is, asked of one parameter.
 enum BKind
@@ -569,6 +570,36 @@ struct BorrowNote
 end BorrowNote
 
 private var bs_notes: Buf[BorrowNote] = buf()
+
+// The functions whose answer is a place of a parameter, by name, with the first such parameter's
+// position: what the last whole-program check found, for the lowering to take once.
+private var bs_places: Map[string, usize] = map()
+
+// Every function of the program whose answer is a place of a parameter, the first such one recorded.
+note_places(cx: &KeepsCx)
+    var out: Map[string, usize] = map()
+
+    for f in cx.funcs
+        if f.params.is_empty() || is_closure_body(f) then continue
+
+        for k in 0..<f.params.len()
+            val w = borrow_of(cx, f.name, k)
+
+            if w.kept && w.how == "place"
+                out.put(f.name, k)
+                break
+
+    bs_places = out
+end note_places
+
+// The places the last whole-program check found, handed over once: a lowering that follows no check
+// of its own finds none, rather than another program's.
+take_place_answers() -> Map[string, usize]
+    val out = bs_places
+
+    bs_places = map()
+    out
+end take_place_answers
 
 // The notes the last whole-program check gathered, handed over once.
 take_borrow_notes() -> Buf[BorrowNote]
