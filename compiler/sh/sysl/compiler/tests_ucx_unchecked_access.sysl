@@ -1,0 +1,417 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.text.Search
+
+// A subscript with no bounds check (`unchecked.sysl`): `@unchecked` over a block, and
+// `get_unchecked` / `set_unchecked` on an array, a slice and a `Buf`. The helpers are
+// `tests_enm_enum_run.sysl`'s.
+//
+// **What is asserted is the IR of one function at a time**: an unchecked read reaches no
+// `sysl_bounds_fail`, and the checked read beside it still does. A read past the end is not run,
+// since what it gives is whatever the memory holds. The cells skipped, with the reason: separate
+// compilation (the wrapper is gone by the time a body is lowered, so a `.syslib` sees a plain GEP),
+// and bare metal (the block removes a check and adds nothing to link).
+
+// The text of the function `name` defines, so a check the library or `main` makes cannot answer for it.
+private ucx_fn(ir: string, name: string) -> string
+    val at = ir.index_of(s"@$name(").unwrap_or(0)
+    val head = ir[0..<at]
+    val start = head.last_index_of("define ").unwrap_or(0)
+    val rest = ir[start..<ir.len]
+    val close = rest.index_of("\n}").unwrap_or(rest.len)
+
+    rest[0..<close]
+
+// Whether a function's text reports a failed bounds check anywhere.
+private ucx_checks(body: string) -> bool = body.contains("sysl_bounds_fail")
+
+// -- the two spellings reach no check
+
+@test("get_unchecked on a slice reads with no bounds check, where the subscript beside it has one")
+ucx_get_unchecked_on_a_slice()
+    if !enm_ready() then return
+
+    val ir = enm_ir(raw"""
+        @noinline
+        fast(xs: []int, i: int) -> int = xs.get_unchecked(i)
+
+        @noinline
+        safe(xs: []int, i: int) -> int = xs[i]
+
+        val xs: []int = [1, 2, 3]
+        print(fast(xs, 1), safe(xs, 2))
+        """)
+
+    assert(!ucx_checks(ucx_fn(ir, "fast")), ucx_fn(ir, "fast"))
+    assert(ucx_checks(ucx_fn(ir, "safe")), ucx_fn(ir, "safe"))
+
+@test("set_unchecked on an array writes with no bounds check")
+ucx_set_unchecked_on_an_array()
+    if !enm_ready() then return
+
+    val ir = enm_ir(raw"""
+        @noinline
+        fill(i: int, v: int) -> int
+            var xs: [4]int = [0; 4]
+            xs.set_unchecked(i, v)
+            xs.get_unchecked(i)
+
+        print(fill(2, 7))
+        """)
+
+    assert(!ucx_checks(ucx_fn(ir, "fill")), ucx_fn(ir, "fill"))
+
+@test("an @unchecked block reads and writes with no bounds check")
+ucx_a_block_has_no_check()
+    if !enm_ready() then return
+
+    val ir = enm_ir(raw"""
+        @noinline
+        sum(xs: []int, n: int) -> int
+            var total = 0
+            var ys: [8]int = [0; 8]
+            @unchecked
+                for i in 0..<n
+                    total += xs[i]
+                    ys[i] = xs[i]
+            total + ys[0]
+
+        val xs: []int = [1, 2, 3]
+        print(sum(xs, 3))
+        """)
+
+    assert(!ucx_checks(ucx_fn(ir, "sum")), ucx_fn(ir, "sum"))
+
+@test("a subscript after the block ends is checked again")
+ucx_after_the_block_is_checked()
+    if !enm_ready() then return
+
+    val ir = enm_ir(raw"""
+        @noinline
+        after(xs: []int, i: int) -> int
+            var a = 0
+            @unchecked
+                a = xs[i]
+            a + xs[i + 1]
+
+        val xs: []int = [1, 2, 3]
+        print(after(xs, 0))
+        """)
+
+    assert(ucx_checks(ucx_fn(ir, "after")), ucx_fn(ir, "after"))
+
+@test("and traps where it is out of range, the block before it notwithstanding")
+ucx_after_the_block_traps()
+    if !enm_ready() then return
+
+    val said = enm_panic_text(raw"""
+        val xs: []int = [1, 2, 3]
+        var a = 0
+        @unchecked
+            a = xs[1]
+        print(a)
+        print(xs[a + 5])
+        """)
+
+    assert(said.contains("2\n"), said)
+    assert(said.contains("out of bounds"), said)
+
+@test("nested blocks: the outer one is still unchecked after the inner ends")
+ucx_nested_blocks()
+    if !enm_ready() then return
+
+    val ir = enm_ir(raw"""
+        @noinline
+        nest(xs: []int, i: int) -> int
+            var a = 0
+            @unchecked
+                @unchecked
+                    a = xs[i]
+                a += xs[i + 1]
+            a
+
+        val xs: []int = [1, 2, 3]
+        print(nest(xs, 0))
+        """)
+
+    assert(!ucx_checks(ucx_fn(ir, "nest")), ucx_fn(ir, "nest"))
+
+@test("a value read out of the block at the end of a function body")
+ucx_the_block_has_a_value()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        first(xs: []int) -> int
+            @unchecked
+                xs[0] + xs[2]
+
+        val xs: []int = [4, 5, 6]
+        print(first(xs))
+        """), "10\n")
+
+@test("an assignment may be the block's last line")
+ucx_an_assignment_ends_the_block()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        var xs: [3]int = [0; 3]
+        var i = 0
+        @unchecked
+            xs[i] = 9
+        print(xs[0])
+        """), "9\n")
+
+@test("an index expression's own subscript is inside the block too")
+ucx_a_wide_index_and_a_string()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        val s = "hello"
+        val xs: []int = [0, 4, 1]
+        val w: i128 = 1
+        var b: u8 = 0
+        var c = 0
+        @unchecked
+            b = s[xs[w]]
+            c = xs[xs[2]]
+        print(b, c)
+        """), "111 4\n")
+
+// -- lexical: what is written inside is inside
+
+@test("a closure written inside the block is inside it")
+ucx_a_closure_inside_the_block()
+    if !enm_ready() then return
+
+    val ir = enm_ir(raw"""
+        @noinline
+        apply(f: &Fn(int) -> int, i: int) -> int = f(i)
+
+        @noinline
+        outer(xs: []int) -> int
+            var r = 0
+            @unchecked
+                r = apply(i -> xs[i] * 2, 1)
+            r
+
+        val xs: []int = [1, 2, 3]
+        print(outer(xs))
+        """)
+
+    // Every subscript in the program is the closure's, so the module as a whole lowers none.
+    val start = ir.index_of("@outer(").unwrap_or(0)
+
+    assert(!ucx_checks(ucx_fn(ir, "outer")), ucx_fn(ir, "outer"))
+    assert(!ir[start..<ir.len].contains("call void @sysl_bounds_fail"), ir)
+
+@test("and so is a nested function")
+ucx_a_nested_function_inside_the_block()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        outer(xs: []int) -> int
+            var r = 0
+            @unchecked
+                pick(i: int) -> int = xs[i]
+                r = pick(0) + pick(2)
+            r
+
+        val xs: []int = [1, 2, 3]
+        print(outer(xs))
+        """), "4\n")
+
+@test("a closure written outside, called inside, keeps its check")
+ucx_a_closure_written_outside()
+    if !enm_ready() then return
+
+    val said = enm_panic_text(raw"""
+        val xs: []int = [1, 2, 3]
+        val f = (i: int) -> xs[i]
+        var r = 0
+        @unchecked
+            r = f(7)
+        print(r)
+        """)
+
+    assert(said.contains("out of bounds"), said)
+
+@test("a generic body with a block, at two element types")
+ucx_a_generic_body()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        last[T](xs: []T) -> T
+            @unchecked
+                xs[xs.len - 1]
+
+        val a: []int = [1, 2, 3]
+        val b: []string = ["x", "y"]
+        print(last(a), last(b))
+        """), "3 y\n")
+
+// -- a Buf
+
+@test("a Buf's get_unchecked and set_unchecked, and its subscript inside the block")
+ucx_a_buf()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        import sysl.buf.{Buf, buf}
+
+        var b: Buf[int] = buf()
+        b.push(1)
+        b.push(2)
+        b.push(3)
+        b.set_unchecked(0, 10)
+        @unchecked
+            b[1] = b[1] + b.get_unchecked(0)
+            b[2] += 1
+        print(b.get_unchecked(0), b[1], b[2])
+        """), "10 12 4\n")
+
+@test("a Buf's subscript inside the block reads through the unchecked place")
+ucx_a_buf_subscript_lowers_unchecked()
+    if !enm_ready() then return
+
+    val ir = enm_ir(raw"""
+        import sysl.buf.{Buf, buf}
+
+        @noinline
+        at(b: Buf[int], i: int) -> int
+            @unchecked
+                b[i]
+
+        var b: Buf[int] = buf()
+        b.push(1)
+        print(at(b, 0))
+        """)
+
+    assert(ir.contains("index_place_unchecked"), ir)
+
+@test("a Buf of counted values keeps its counts through set_unchecked")
+ucx_a_buf_of_strings()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        import sysl.buf.{Buf, buf}
+
+        var b: Buf[string] = buf()
+        b.push("a" + "b")
+        b.set_unchecked(0, "c" + "d")
+        @unchecked
+            b[0] = b[0] + "e"
+        print(b.get_unchecked(0))
+        """), "cde\n")
+
+// -- compile-time evaluation keeps the check
+
+@test("a constant read past the end is refused while compiling, block or not")
+ucx_compile_time_still_checks()
+    val msg = enm_err(raw"""
+        const at(xs: [3]int, i: int) -> int
+            @unchecked
+                xs[i]
+
+        @assert(at([1, 2, 3], 5) == 0)
+        """)
+
+    assert(msg.contains("out of bounds") || msg.contains("index 5"), msg)
+
+// -- what is refused
+
+@test("@unchecked over a line rather than a block")
+ucx_not_a_block()
+    val msg = enm_err(raw"""
+        val xs: []int = [1, 2]
+        @unchecked
+        print(xs[0])
+        """)
+
+    assert(msg.contains("'@unchecked' marks a block"), msg)
+
+@test("@unchecked with something after it on the line")
+ucx_not_a_block_on_the_line()
+    val msg = enm_err(raw"""
+        val xs: []int = [1, 2]
+        @unchecked print(xs[0])
+        """)
+
+    assert(msg.contains("'@unchecked' marks a block"), msg)
+
+@test("@unchecked above a function")
+ucx_not_on_a_function()
+    val msg = enm_err(raw"""
+        @unchecked
+        f(xs: []int) -> int = xs[0]
+
+        print(f([1]))
+        """)
+
+    assert(msg.contains("'@unchecked' marks a block"), msg)
+
+@test("@unchecked among a function's annotations")
+ucx_not_among_annotations()
+    val msg = enm_err(raw"""
+        @noinline
+        @unchecked
+        f(xs: []int) -> int = xs[0]
+
+        print(f([1]))
+        """)
+
+    assert(msg.contains("'@unchecked' marks a block"), msg)
+
+@test("@unchecked above a member")
+ucx_not_on_a_member()
+    val msg = enm_err(raw"""
+        struct S
+            n: int
+
+            @unchecked
+            get(self, xs: []int) -> int = xs[self.n]
+
+        print(S(0).get([1]))
+        """)
+
+    assert(msg.contains("'@unchecked' marks a block"), msg)
+
+@test("set_unchecked on a val array is a write to a val")
+ucx_set_on_a_val()
+    val msg = enm_err(raw"""
+        val xs: [3]int = [1, 2, 3]
+        xs.set_unchecked(0, 5)
+        """)
+
+    assert(msg.contains("'set_unchecked' has nothing to write through"), msg)
+
+@test("set_unchecked through a read-only view")
+ucx_set_through_a_read_only_view()
+    val msg = enm_err(raw"""
+        f(xs: []const int) = xs.set_unchecked(0, 5)
+        """)
+
+    assert(msg.contains("may not"), msg)
+
+@test("get_unchecked takes one argument and set_unchecked two")
+ucx_argument_counts()
+    val get = enm_err(raw"""
+        val xs: []int = [1]
+        print(xs.get_unchecked(0, 1))
+        """)
+    val set = enm_err(raw"""
+        var xs: [1]int = [1]
+        xs.set_unchecked(0)
+        """)
+
+    assert(get.contains("'get_unchecked' takes one argument"), get)
+    assert(set.contains("'set_unchecked' takes two arguments"), set)
+
+@test("the value set must be the element's type")
+ucx_set_of_the_wrong_type()
+    val msg = enm_err(raw"""
+        var xs: [1]int = [1]
+        xs.set_unchecked(0, "no")
+        """)
+
+    assert(msg.contains("in an element of type int"), msg)

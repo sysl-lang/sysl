@@ -4,7 +4,8 @@ import sh.sysl.parsing.*
 import sysl.buf.{Buf, buf, ByteSink, byte_sink}
 import sysl.container.{Map, map}
 import sysl.math.bigint.{BigInt, add, cmp, from_int, negate, sub, to_string,
-                         not as big_not, shl as big_shl, shr as big_shr}
+                         not as big_not, shl as big_shl, shr as big_shr, mul as big_mul,
+                         div_rem as big_div_rem}
 import sysl.text.{Search, from_utf8_unchecked}
 import sysl.fmt.{format_int, format_str, format_fixed, format_real, format_f32, format_f128, format_real_plain,
                  format_f32_plain, format_f128_plain}
@@ -1798,6 +1799,13 @@ private eval_rest(r: &EvRun, e: TExpr) -> Flow
         TIntOp(op, operand, amount, width, ty) ->
             if op == "fixed_bits" || op == "fixed_from_bits" then fixed_bits(r, operand, ty)
             else if op == SubscriptIndexOp then subscript_index(r, operand, ty)
+            // **`@unchecked` is checked here all the same**: the index is the one it holds, and the
+            // element read keeps its own test, so a constant never evaluates past the end.
+            else if op == UncheckedSubscriptIndexOp then subscript_index(r, operand, ty)
+            else if op == UncheckedIndexOp then eval_value(r, operand) match
+                Ok(v) -> EvGave(v)
+                Err(f) -> f
+            else if is_checked_member(op) then checked_member(r, e.span, op, operand, amount, width, ty)
             else bit_operation(r, e.span, op, operand, amount, width)
         _ -> refuse_form(r, e.span, s"'${texpr_kind_name(e)}' is not evaluated while compiling yet")
 end eval_rest
@@ -3112,6 +3120,58 @@ private subscript_index(r: &EvRun, operand: TExpr, ty: Type) -> Flow
 
     EvGave(ConstInt(n))
 end subscript_index
+
+// `a.checked_add(b)` and its siblings (`library/sysl/checked.sysl`), evaluated exactly: the true
+// answer is computed at no width at all and the option says whether it fits the receiver's.
+@noinline
+private checked_member(r: &EvRun, at: Span, op: string, operand: TExpr, amount: Option[TExpr],
+                       width: Type, ty: Type) -> Flow
+    val (bits, signed) = width match
+        Integer(b, s, _) -> (b, s)
+        _ -> return refuse_form(r, at, s"'$op' is not evaluated while compiling yet")
+
+    val a = eval_value(r, operand) match
+        Ok(ConstInt(n)) -> n
+        Ok(_) -> return refuse_form(r, at, s"'$op' is not evaluated while compiling yet")
+        Err(f) -> return f
+
+    var b = from_int(0)
+
+    if amount.is_some()
+        eval_value(r, amount.unwrap()) match
+            Ok(ConstInt(n)) -> b = n
+            Ok(_) -> return refuse_form(r, at, s"'$op' is not evaluated while compiling yet")
+            Err(f) -> return f
+    end if
+
+    val zero = from_int(0)
+    val divides = cmp(b, zero) != 0
+    val exact: Option[BigInt] = op match
+        "checked_add" -> Some(add(a, b))
+        "checked_sub" -> Some(sub(a, b))
+        "checked_mul" -> Some(big_mul(a, b))
+        "checked_div" -> if divides then Some(big_div_rem(a, b).0) else None
+        "checked_rem" -> if divides then Some(big_div_rem(a, b).1) else None
+        _ -> Some(negate(a))
+
+    // The remainder's one refusal is the divide's: `min % -1` is zero, but no machine computes it.
+    val min = base_min(bits, signed)
+    val traps = op == "checked_rem" && signed && cmp(a, min) == 0 && cmp(b, from_int(-1)) == 0
+    val fits = exact.is_some() && !traps && cmp(exact.unwrap(), min) >= 0 &&
+        cmp(exact.unwrap(), base_max(bits, signed)) <= 0
+
+    var parts: Buf[Const] = buf()
+
+    if fits then parts.push(ConstInt(exact.unwrap()))
+
+    val variant = underlying(ty) match
+        Enum(d) -> d.variant(if fits then "Some" else "None")
+        _ -> None
+
+    if variant.is_none() then return refuse_form(r, at, s"'$op' is not evaluated while compiling yet")
+
+    EvGave(ConstRecord(variant_position(ty, variant.unwrap()), parts))
+end checked_member
 
 // `x.bits` and `T::Bits(n)`: the same integer, read at the other type.
 @noinline

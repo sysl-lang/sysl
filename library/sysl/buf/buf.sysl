@@ -65,6 +65,21 @@ private[buf] struct BufCore[T]
 
         &self.elems[i]
 
+    // The three above with no test at all: `get_unchecked`, `set_unchecked`, and the address an
+    // `@unchecked` block's `b[i]` reads through. An index at or past the count is the caller's to have
+    // ruled out, and one past the storage reads whatever is there.
+    get_unchecked(self, i: usize) -> T
+        @unchecked
+            self.elems[i]
+
+    set_unchecked(*self, i: usize, v: T)
+        @unchecked
+            self.elems[i] = v
+
+    place_unchecked(self, i: usize) -> *T
+        @unchecked
+            &self.elems[i]
+
     /** One element appended, after growing the storage where there is no room left for it.
      *
      * **The three parts of the shape below are what let a caller absorb the whole member**, which is
@@ -356,6 +371,16 @@ struct Buf[T]
     @track_caller
     const set(self, i: usize, v: T) = self.reading().set(i, v)
 
+    /** `at` and `set` with no bounds check: the element at `i`, read or written where it lives, with
+     * nothing comparing `i` to the count. **The caller owes the proof that `i < len()`**, and an index
+     * past it reads or writes whatever the storage holds there, or memory that is not the buffer's at
+     * all. This is the unchecked tier, and the name is how a reader finds it -- the same access an
+     * `@unchecked` block gives `b[i]` (`reference/arrays.md § Unchecked access`).
+     */
+    const get_unchecked(self, i: usize) -> T = self.reading().get_unchecked(i)
+
+    const set_unchecked(self, i: usize, v: T) = self.reading().set_unchecked(i, v)
+
     /** The core an index reads through: this handle's own, or the empty one a handle naming nothing
      * reads as -- whose count of zero refuses every index with the same report a buffer's own would.
      *
@@ -575,6 +600,9 @@ impl[T] IndexSet[usize, T] for Buf[T]
 impl[T] IndexPlace[usize, T] for Buf[T]
     @track_caller
     index_place(self, i: usize) -> *T = self.reading().place(i)
+
+    // An `@unchecked` block's `b[i]`: the same address, with no test against the count.
+    override index_place_unchecked(self, i: usize) -> *T = self.reading().place_unchecked(i)
 
 /** `for x in b` walks `view()`: the elements the buffer held when the loop began, read by index as a
  * slice's are, rather than through a cursor that would cost a call apiece. An element pushed during

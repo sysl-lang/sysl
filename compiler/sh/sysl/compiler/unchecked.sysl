@@ -1,0 +1,171 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+
+// `@unchecked` and `get_unchecked` / `set_unchecked`: a subscript with no bounds check
+// (`reference/arrays.md § Unchecked access`).
+//
+// **There is one mechanism, and both spellings reach it.** A subscript read inside an `@unchecked`
+// block -- lexically, so a closure or a nested function written there is inside it too -- has its
+// index wrapped in a form only the compiler writes (`UncheckedIndexOp`), and the lowering of an
+// element's address reads the wrapper as "no test": the index is brought to the address width and
+// used. `xs.get_unchecked(i)` and `xs.set_unchecked(i, v)` on an array or a slice are that subscript
+// written as a call, with only the one subscript unchecked -- `i` and `v` are read as anywhere else.
+//
+// **A container someone wrote answers for its own subscript.** Inside the block `b[i]` is
+// `*b.index_place_unchecked(i)`, a member of `IndexPlace` whose default is the checked `index_place`
+// -- so a container that has not said how to skip its test keeps it, and `Buf` says how. Its index is
+// brought to a `usize` with neither the sign nor the width tested (`UncheckedSubscriptIndexOp`).
+//
+// **What marks the unchecked tier is the spelling, as it is for `from_utf8_unchecked`.** There is no
+// `unsafe` block in the language: a raw pointer's `*` and a long name ending in `_unchecked` are what a
+// reader greps for, and `@unchecked` is one more such word. So neither form asks for a marker of
+// its own beyond being written.
+//
+// **Compile-time evaluation still checks.** The evaluator reads the wrapper as the index it holds and
+// keeps its own test, so a constant that reads past the end is refused rather than evaluated into
+// whatever the bytes would have held.
+
+// The form `@unchecked` and its block are parsed into: a call no program can spell, its one argument
+// the block.
+const UncheckedBlock: string = "unchecked block"
+
+// The integer operation an array's, a slice's or a string's index is wrapped in inside the block.
+const UncheckedIndexOp: string = "unchecked_index"
+
+// The same for a container's subscript index, where the lowering also brings it to a `usize`.
+const UncheckedSubscriptIndexOp: string = "unchecked_subscript_index"
+
+// -- parsing ------------------------------------------------------------------------------------------
+
+// `@unchecked` and the block indented under it. The `@` is the cursor.
+parse_unchecked_block(p: *Parser, start: Span) -> Stmt
+    p.bump()
+    p.bump()
+
+    if !p.block_ahead()
+        p.fault(start, unchecked_not_a_block())
+        skip_line(p)
+        return stmt(start.to(p.just_taken()), Bad)
+    end if
+
+    val body = parse_suite(p)
+    val span = start.to(p.just_taken())
+    var one: Buf[Expr] = buf()
+
+    one.push(expr(span, Block(body)))
+    stmt(span, ExprStmt(expr(span, Call(expr(start, Ident(UncheckedBlock)), one))))
+end parse_unchecked_block
+
+// The refusal for `@unchecked` anywhere but above a block of its own.
+unchecked_not_a_block() -> string =
+    "'@unchecked' marks a block: write it on a line of its own and indent the statements it covers " +
+    "under it. Every subscript inside the block is then read with no bounds check; a declaration " +
+    "or a single statement is not something it marks, and an argument is not something it takes"
+
+// Whether a call's head is the form `@unchecked` was parsed into.
+is_unchecked_block(head: Expr) -> bool = *head.kind match
+    Ident(n) -> n == UncheckedBlock
+    _ -> false
+
+// -- reading ------------------------------------------------------------------------------------------
+
+// The block, read one level deeper, with the position's permissions handed to it as a block written
+// bare would have them: in statement position its last line may be an assignment.
+unchecked_block_form(cx: &Analyzer, span: Span, args: Buf[Expr], expected: Option[Type]) -> TExpr
+    if args.len() != 1 then return cx.err(span, unchecked_not_a_block())
+
+    cx.tail_carry = cx.unit_tail
+    cx.unchecked += 1
+
+    val t = type_expr(cx, args.at(0), expected)
+
+    cx.unchecked -= 1
+    t
+end unchecked_block_form
+
+// `ti`, the index of a subscript on `tr`, wrapped where the subscript is inside the block. A raw
+// pointer has no length and so no test to skip, and is left as it was.
+unchecked_wrap(cx: &Analyzer, tr: TExpr, ti: TExpr) -> TExpr
+    if cx.unchecked == 0 then return ti
+
+    unchecked_index_of(tr, ti)
+end unchecked_wrap
+
+private unchecked_index_of(tr: TExpr, ti: TExpr) -> TExpr = repr(texpr_type(tr)) match
+    Ptr(_) -> ti
+    _ -> TExpr(ti.span, TIntOp(UncheckedIndexOp, ti, None, texpr_type(ti), texpr_type(ti)))
+
+// The member a container's subscript is read through: the unchecked one inside the block.
+place_member(cx: &Analyzer) -> string =
+    if cx.unchecked > 0 then "index_place_unchecked" else "index_place"
+
+// Whether `name` is one of the two members an array and a slice have here.
+is_unchecked_member(name: string) -> bool = name == "get_unchecked" || name == "set_unchecked"
+
+// `xs.get_unchecked(i)` and `xs.set_unchecked(i, v)` on an array or a slice, `receiver` already read
+// through its reference. The one subscript is unchecked and nothing else is: `i` and `v` are read
+// with whatever checks they would have anywhere.
+unchecked_member(cx: &Analyzer, span: Span, receiver: TExpr, name: string, args: Buf[Expr]) -> TExpr
+    val want = if name == "get_unchecked" then 1 else 2
+
+    if args.len() != want then
+        return cx.err(span, if want == 1 then "'get_unchecked' takes one argument, the index — 'xs.get_unchecked(i)'"
+                            else "'set_unchecked' takes two arguments, the index and the value — 'xs.set_unchecked(i, v)'")
+
+    val elem = element(texpr_type(receiver))
+
+    if elem.is_none() then return cx.err(span, s"cannot index ${type_show(texpr_type(receiver))}")
+
+    // Any integer indexes, as it does in a subscript (`expr_coll.sysl`'s `index_non_vector`).
+    not_fixing_at(cx, args.at(0))
+
+    val ti = type_expr(cx, args.at(0), Some(usize_type(word_bits(cx))))
+
+    repr(texpr_type(ti)) match
+        Integer(_, _, _) -> ()
+        other ->
+            if other == Unknown then return bad_expr(span)
+
+            return cx.err(args.at(0).span, s"an index must be an integer, not ${type_show(other)}")
+
+    val ety = unqualified(elem.unwrap())
+    val place = TExpr(span, TIndex(receiver, unchecked_index_of(receiver, ti), ety))
+
+    if name == "get_unchecked" then return place
+
+    // The write is held to everything `xs[i] = v` is: a `val` array, a read-only view and a string's
+    // bytes are refused in the words an assignment's refusal uses.
+    val target = expr(span, Index(expr(span, Ident("")), args.at(0), span))
+    val checked = require_place(cx, place, target, "'set_unchecked'", true, Some(span))
+
+    if texpr_type(checked) == Unknown then return bad_expr(span)
+
+    val tv = type_expr(cx, args.at(1), Some(texpr_type(place)))
+
+    if texpr_type(tv) == Never || disagree(texpr_type(tv), texpr_type(place)) then
+        cx.fault(args.at(1).span, s"cannot store ${type_show(texpr_type(tv))} in an element of type " +
+                 type_show(texpr_type(place)))
+
+    note_view_store(cx, span, place, tv)
+    rechecked(cx, span, place, TExpr(span, TStore(place, tv, texpr_type(place), false)))
+end unchecked_member
+
+// -- lowering -----------------------------------------------------------------------------------------
+
+// Whether a subscript's index is wrapped as unchecked.
+unchecked_index(index: TExpr) -> bool = *index.kind match
+    TIntOp(op, _, _, _, _) -> op == UncheckedIndexOp
+    _ -> false
+
+// The index a wrapper holds.
+unchecked_inner(index: TExpr) -> TExpr = *index.kind match
+    TIntOp(_, inner, _, _, _) -> inner
+    _ -> index
+
+// An index brought to the address width with no test: extended by its own sign, or cut where it is
+// wider -- which is the one thing the block gives up.
+unchecked_index_val(e: *Emit, index: TExpr) -> Val = underlying(texpr_type(index)) match
+    Integer(bits, signed, _) -> convert_int(e, bits, signed, e.word_bits, gen_expr(e, index))
+    other -> gap_at(e, s"index of type ${type_show(other)}")
