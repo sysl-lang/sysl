@@ -113,6 +113,139 @@ lfs_wrapping_operator()
                 "a wrapping or saturating operator takes two values of one type", "2:12")
 end lfs_wrapping_operator
 
+// -- the place a literal is written in, rather than an operand beside it ------------------------------
+
+@test("a binding's initializer names the type the binding declared")
+lfs_binding_initializer()
+    lfs_refused("val z: u8 = 300\nprint(z)\n", "the literal 300 does not fit u8", "1:13")
+    lfs_refused("var z: u8 = 300\nprint(z)\n", "the literal 300 does not fit u8", "1:13")
+    lfs_refused("val z: byte = 300\nprint(z)\n", "the literal 300 does not fit byte", "1:15")
+    lfs_refused("val z: u16 = 70000\nprint(z)\n", "the literal 70000 does not fit u16", "1:14")
+    lfs_refused("f()\n    val z: u8 = -1\n    print(z)\n\nf()\n", "the literal -1 does not fit u8", "2:17")
+end lfs_binding_initializer
+
+@test("a module binding that nothing reads names its declared type too")
+lfs_unread_module_binding()
+    lfs_refused("val z: u8 = 300\n", "the literal 300 does not fit u8", "1:13")
+    lfs_refused("var z: u8 = 300\n", "the literal 300 does not fit u8", "1:13")
+    lfs_refused("type Small = u8\n\nval z: Small = 300\n", "the literal 300 does not fit Small (aka byte)", "3:16")
+end lfs_unread_module_binding
+
+@test("a compound assignment's nested literal names the place's declared type")
+lfs_compound_nested()
+    lfs_refused("var c: u8 = 1\nc += (1 + 300)\nprint(c)\n", "the literal 300 does not fit u8", "2:11")
+    lfs_refused("type Small = u8\n\nvar c: Small = 1\nc += (1 + 300)\nprint(c)\n",
+                "the literal 300 does not fit Small (aka byte)", "4:11")
+end lfs_compound_nested
+
+@test("a binding's initializer names an alias with aka")
+lfs_binding_initializer_alias()
+    lfs_refused("type Small = u8\n\nval z: Small = 300\nprint(z)\n",
+                "the literal 300 does not fit Small (aka byte)", "3:16")
+    lfs_refused("type Small = u8\n\nvar z: Small = 300\nprint(z)\n",
+                "the literal 300 does not fit Small (aka byte)", "3:16")
+    lfs_refused("type Small = u8\n\nf()\n    val z: Small = 300\n    print(z)\n\nf()\n",
+                "the literal 300 does not fit Small (aka byte)", "4:20")
+end lfs_binding_initializer_alias
+
+@test("a parameter default names the parameter's declared type")
+lfs_parameter_default()
+    lfs_refused("pd(x: u8 = 300) -> u8 = x\nprint(pd())\n", "the literal 300 does not fit u8", "1:12")
+    lfs_refused("type Small = u8\n\npd(x: Small = 300) -> u8 = x\nprint(pd())\n",
+                "the literal 300 does not fit Small (aka byte)", "3:15")
+end lfs_parameter_default
+
+@test("a return names the function's declared result")
+lfs_return_value()
+    lfs_refused("f() -> u8\n    return 300\n\nprint(f())\n", "the literal 300 does not fit u8", "2:12")
+    lfs_refused("type Small = u8\n\nf() -> Small\n    return 300\n\nprint(f())\n",
+                "the literal 300 does not fit Small (aka byte)", "4:12")
+end lfs_return_value
+
+@test("an argument names the parameter's declared type, plain and generic")
+lfs_argument()
+    lfs_refused("take(x: u8) -> u8 = x\nprint(take(300))\n", "the literal 300 does not fit u8", "2:12")
+    lfs_refused("type Small = u8\n\ntake(x: Small) -> u8 = x\nprint(take(300))\n",
+                "the literal 300 does not fit Small (aka byte)", "4:12")
+    lfs_refused("gen[T](x: T, b: u8) -> u8 = b\nprint(gen(1, 300))\n", "the literal 300 does not fit u8", "2:14")
+    lfs_refused("type Small = u8\n\ngen[T](x: T, b: Small) -> u8 = b\nprint(gen(1, 300))\n",
+                "the literal 300 does not fit Small (aka byte)", "4:14")
+end lfs_argument
+
+@test("a parameter that names a type parameter is shown as what it stood for")
+lfs_argument_type_parameter()
+    lfs_refused("gen[T](x: T) -> T = x\nprint(gen(1u8))\nprint(gen[u8](300))\n",
+                "the literal 300 does not fit byte", "3:15")
+end lfs_argument_type_parameter
+
+@test("a literal nested in an operand of a typed one names the typed one's declared type")
+lfs_nested_literal()
+    lfs_refused("val b: u8 = 10\nprint(b + (1 + 300))\n", "the literal 300 does not fit u8", "2:16")
+    lfs_refused("type Small = u8\n\nval b: Small = 10\nprint(b + (1 + 300))\n",
+                "the literal 300 does not fit Small (aka byte)", "4:16")
+    lfs_refused("val b: u8 = 10\nprint(b + (b + 300))\n", "the literal 300 does not fit u8", "2:16")
+    lfs_refused("val b: u8 = 10\nprint((1 + 300) + b)\n", "the literal 300 does not fit u8", "2:12")
+end lfs_nested_literal
+
+@test("a literal of another type read inside a binding does not quote the binding's type")
+lfs_other_type_inside()
+    lfs_refused("take(x: u16) -> u8 = u8(x)\nval z: u8 = take(70000)\nprint(z)\n",
+                "the literal 70000 does not fit u16", "2:18")
+end lfs_other_type_inside
+
 @test("a literal that fits the declared type is accepted, alias or not")
 lfs_fits_accepted() =
     lfs_clean("type Small = u8\n\nval a: u8 = 10\nval b: Small = 20\nprint(a + 245, b * 12, 255 - a)\n")
+
+@test("a shifted literal that does not fit names the declared type, the count and the value alike")
+lfs_shift()
+    lfs_refused("val z: u32 = (65536 * 65536) << 1\n", "the value 4294967296 does not fit u32", "1:15")
+    lfs_refused("val z: u32 = 1 << 32\n", "a constant shifted by 32 places, at or past the 32 bits of u32", "1:14")
+    lfs_refused("type Small = u8\n\nval z: Small = 1 << 8\n",
+                "a constant shifted by 8 places, at or past the 8 bits of Small (aka byte)", "3:16")
+    lfs_refused("val z: u8 = 300 +| 1\n", "the literal 300 does not fit u8", "1:13")
+    lfs_refused("val z: u8 = (200 + 100) +| 1\n", "the value 300 does not fit u8", "1:14")
+    lfs_refused("val big = 1 << 40\n", "a constant shifted by 40 places, at or past the 32 bits of int", "1:11")
+end lfs_shift
+
+@test("a method's argument that does not fit names the parameter's declared type")
+lfs_method_argument()
+    val head = "struct O\n    n: int\n\nimpl O\n    m(self, b: u8) -> u8 = b\n    s(b: u8) -> u8 = b\n" +
+               "    t[T](self, x: T, b: u8) -> u8 = b\n\n"
+
+    lfs_refused(head + "val o = O(1)\nprint(o.m(300))\n", "the literal 300 does not fit u8", "10:11")
+    lfs_refused(head + "print(O.s(300))\n", "the literal 300 does not fit u8", "9:11")
+    lfs_refused(head + "val o = O(1)\nprint(o.t(1, 300))\n", "the literal 300 does not fit u8", "10:14")
+    lfs_clean(head + "val o = O(1)\nprint(o.m(200), O.s(1))\n")
+end lfs_method_argument
+
+@test("a method parameter written as an alias is quoted with aka")
+lfs_method_alias()
+    val head = "type Small = u8\n\nstruct O\n    n: int\n\nimpl O\n    m(self, b: Small) -> u8 = b\n\n"
+
+    lfs_refused(head + "val o = O(1)\nprint(o.m(300))\n", "the literal 300 does not fit Small (aka byte)", "10:11")
+end lfs_method_alias
+
+@test("a trait method's argument, called through the type or through an object, names the declared type")
+lfs_trait_method()
+    val head = "trait Put\n    put(self, b: u8) -> u8\n\nstruct O\n    n: int\n\nimpl Put for O\n    put(self, b: u8) -> u8 = b\n\n"
+
+    lfs_refused(head + "val o = O(1)\nprint(o.put(300))\n", "the literal 300 does not fit u8", "11:13")
+    lfs_refused(head + "val o = O(1)\nval p: &Put = o\nprint(p.put(300))\n", "the literal 300 does not fit u8", "12:13")
+end lfs_trait_method
+
+@test("a closure call's argument is never told the call trait's own parameter name")
+lfs_closure_argument()
+    lfs_refused("run(f: &Fn(u8) -> unit) = f(300)\n", "the literal 300 does not fit byte", "1:29")
+    lfs_refused("val f: &Fn(u8) -> unit = (b: u8) -> print(b)\nf(300)\n", "the literal 300 does not fit byte", "2:3")
+end lfs_closure_argument
+
+@test("a literal assigned to a place that does not hold it names the place's declared type")
+lfs_plain_assignment()
+    lfs_refused("var b: u8 = 1\nb = 300\nprint(b)\n", "the literal 300 does not fit u8", "2:5")
+    lfs_refused("type Small = u8\n\nvar b: Small = 1\nb = 300\nprint(b)\n",
+                "the literal 300 does not fit Small (aka byte)", "4:5")
+    lfs_refused("var level: u32 = 0\nlevel = 1 << 40\nprint(level)\n",
+                "a constant shifted by 40 places, at or past the 32 bits of u32", "2:9")
+    lfs_clean("var b: u8 = 1\nb = 200\nprint(b)\n")
+end lfs_plain_assignment

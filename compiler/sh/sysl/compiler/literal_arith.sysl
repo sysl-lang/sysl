@@ -42,7 +42,7 @@ literal_arithmetic(cx: &Analyzer, outermost: bool, t: TExpr) -> TExpr
 
     if zero.is_some() then return cx.err(zero.unwrap(), "a constant divided by zero")
 
-    val shift = bad_shift(t)
+    val shift = bad_shift(cx, t)
 
     if shift.is_some() then return cx.err(shift.unwrap().0, shift.unwrap().1)
 
@@ -55,7 +55,7 @@ literal_arithmetic(cx: &Analyzer, outermost: bool, t: TExpr) -> TExpr
     underlying(ty) match
         Integer(bits, signed, _) ->
             if !fits(value.unwrap(), bits, signed) then
-                return cx.err(node.span, s"the value${shown(value.unwrap())} does not fit ${type_show(ty)}")
+                return cx.err(node.span, s"the value${shown(value.unwrap())} does not fit ${declared_show(cx, ty)}")
         _ -> return t
 
     val folded = TExpr(node.span, TIntLit(value.unwrap(), ty))
@@ -87,19 +87,19 @@ private zero_divisor(t: TExpr) -> Option[Span] = *t.kind match
 
 // The first left shift inside that has no value at the type it is read at: a count below zero or at
 // or past the width, or a shifted value the type does not hold, which dropping bits would hide.
-private bad_shift(t: TExpr) -> Option[(Span, string)] = *t.kind match
-    TConstrainedCheck(inner, _) -> bad_shift(inner)
-    TCast(inner, _) -> bad_shift(inner)
-    TUnary(_, x, _) -> bad_shift(x)
+private bad_shift(cx: &Analyzer, t: TExpr) -> Option[(Span, string)] = *t.kind match
+    TConstrainedCheck(inner, _) -> bad_shift(cx, inner)
+    TCast(inner, _) -> bad_shift(cx, inner)
+    TUnary(_, x, _) -> bad_shift(cx, x)
     TBinary(op, l, r, ty) ->
-        val left = bad_shift(l)
+        val left = bad_shift(cx, l)
 
         if left.is_some() then return left
 
-        val right = bad_shift(r)
+        val right = bad_shift(cx, r)
 
         if right.is_some() then return right
-        if is_wrap_sat_op(op) then return unheld_operand(l, r, ty)
+        if is_wrap_sat_op(op) then return unheld_operand(cx, l, r, ty)
         if op != "<<" then return None
 
         val count = exact_value(r)
@@ -114,12 +114,12 @@ private bad_shift(t: TExpr) -> Option[(Span, string)] = *t.kind match
             Integer(bits, signed, _) ->
                 if cmp(n, from_int(long(bits))) >= 0 then
                     return Some((t.span, s"a constant shifted by ${to_string(n)} places, " +
-                                         s"at or past the $bits bits of ${type_show(ty)}"))
+                                         s"at or past the $bits bits of ${declared_show(cx, ty)}"))
 
                 val x = exact_value(l)
 
                 if x.is_some() && !fits(x.unwrap(), bits, signed) then
-                    return Some((l.span, s"the value${shown(x.unwrap())} does not fit ${type_show(ty)}"))
+                    return Some((l.span, s"the value${shown(x.unwrap())} does not fit ${declared_show(cx, ty)}"))
 
                 None
             _ -> None
@@ -128,13 +128,13 @@ private bad_shift(t: TExpr) -> Option[(Span, string)] = *t.kind match
 // The operand of a wrapping or saturating step that its type does not hold. The step is defined on
 // two values of the type, so `300 +| 1` at `u8` is the 300 that does not fit -- not a 255 that
 // pretends the operand was clamped first.
-private unheld_operand(l: TExpr, r: TExpr, ty: Type) -> Option[(Span, string)] = underlying(ty) match
+private unheld_operand(cx: &Analyzer, l: TExpr, r: TExpr, ty: Type) -> Option[(Span, string)] = underlying(ty) match
     Integer(bits, signed, _) ->
         for side in [l, r]
             val v = exact_value(side)
 
             if v.is_some() && !fits(v.unwrap(), bits, signed) then
-                return Some((side.span, s"the value${shown(v.unwrap())} does not fit ${type_show(ty)}"))
+                return Some((side.span, s"the value${shown(v.unwrap())} does not fit ${declared_show(cx, ty)}"))
 
         None
     _ -> None
