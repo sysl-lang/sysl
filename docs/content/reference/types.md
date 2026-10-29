@@ -122,7 +122,7 @@ val z: int = b + 300
 ```
 
 ```error
-the literal 300 does not fit byte
+the literal 300 does not fit u8
 ```
 
 **A binding given a bare literal takes its type from its first use that fixes one**, not from the

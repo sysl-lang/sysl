@@ -1844,7 +1844,7 @@ private scale_operands(cx: &Analyzer, op: string, l: Expr, r: Expr,
         val at = scale_literal_type(cx, op, texpr_type(tl), r, numeric)
         val wl = widened(tl, Some(at))
 
-        return Some((wl, operand_rhs(cx, op, wl, r, type_expr(cx, r, Some(at)))))
+        return Some((wl, operand_rhs(cx, op, wl, r, held_literal(cx, r, Some(at), "", Some(tl)))))
     end if
 
     if op == "*" && bare_int_literal(l) && !is_literal(r)
@@ -1858,7 +1858,7 @@ private scale_operands(cx: &Analyzer, op: string, l: Expr, r: Expr,
 
         val at = scale_literal_type(cx, op, texpr_type(tr), l, numeric)
 
-        return Some((type_expr(cx, l, Some(at)), widened(tr, Some(at))))
+        return Some((held_literal(cx, l, Some(at), "", Some(tr)), widened(tr, Some(at))))
     end if
 
     None
@@ -2086,7 +2086,7 @@ analyze_operands(cx: &Analyzer, operands: Buf[Expr], expected: Option[Type],
                         out.push(analyze_expected(cx, operands.at(i), ty))
                     else out.push(again)
                 else out.push(t)
-            None -> out.push(held_literal(cx, operands.at(i), ty, held, any_typed(operands, firm)))
+            None -> out.push(held_literal(cx, operands.at(i), ty, held, typed_beside(operands, firm, ty)))
 
     out
 end analyze_operands
@@ -2119,12 +2119,17 @@ private one_type_held(cx: &Analyzer, operands: Buf[Expr], told: Buf[Option[TExpr
     true
 end one_type_held
 
-// A bare literal operand read at the pair's type -- told, where a wrapping or saturating operator
-// holds it to its typed neighbour's type (or, in a compound form, to its place's) and it does not fit
-// there, which operator held it.
-held_literal(cx: &Analyzer, e: Expr, ty: Option[Type], held: string, beside_typed: bool) -> TExpr
-    if held == "" || !beside_typed || ty.is_none() || !is_literal(e) || literal_fits(cx, e, ty.unwrap()) then
+// A bare literal operand read at the pair's type -- told, where its typed neighbour holds it to that
+// type (or, in a compound form, its place does) and it does not fit there, with the type named as the
+// neighbour's declaration wrote it: `b + 300` over a `val b: u8` does not fit `u8`, over a
+// `val b: Byte` it does not fit `Byte (aka byte)`. A wrapping or saturating operator also says which
+// operator held it. A literal of another kind, or an integer at a non-integer type, is read as it
+// always was, and its own refusal stands.
+held_literal(cx: &Analyzer, e: Expr, ty: Option[Type], held: string, beside: Option[TExpr]) -> TExpr
+    if beside.is_none() || ty.is_none() || !is_literal(e) || literal_fits(cx, e, ty.unwrap()) then
         return type_expr(cx, e, ty)
+
+    if held == "" && (!integer_operand(ty.unwrap()) || !int_literal_text(e)) then return type_expr(cx, e, ty)
 
     val shown = *e.kind match
         Unary(_, operand) -> held_text(operand).map(t -> "-" + t)
@@ -2132,9 +2137,40 @@ held_literal(cx: &Analyzer, e: Expr, ty: Option[Type], held: string, beside_type
 
     if shown.is_none() then return type_expr(cx, e, ty)
 
-    cx.err(e.span, s"the literal ${shown.unwrap()} does not fit ${type_show(ty.unwrap())}, the type of " +
+    val named = if type_eq(texpr_type(beside.unwrap()), ty.unwrap()) then expr_type_show(cx, beside.unwrap())
+                else type_show(ty.unwrap())
+
+    if held == "" then return cx.err(e.span, s"the literal ${shown.unwrap()} does not fit $named")
+
+    cx.err(e.span, s"the literal ${shown.unwrap()} does not fit $named, the type of " +
            s"the other operand of '$held' — a wrapping or saturating operator takes two values of one type")
 end held_literal
+
+// Whether a bare literal is an integer one, negated or not.
+private int_literal_text(e: Expr) -> bool = *e.kind match
+    IntLit(_, _, _) -> true
+    Unary(_, operand) -> *operand.kind match
+        IntLit(_, _, _) -> true
+        _ -> false
+    _ -> false
+
+// The operand with a type of its own that a literal beside it is held to: the first of the pair's
+// type, else the first typed one; none where every operand is open, and the literals are read at what
+// the position asked for.
+private typed_beside(operands: Buf[Expr], told: Buf[Option[TExpr]], ty: Option[Type]) -> Option[TExpr]
+    var first: Option[TExpr] = None
+
+    for i in 0..<operands.len()
+        told.at(i) match
+            Some(t) ->
+                if !adaptable(operands.at(i), t)
+                    if ty.is_some() && type_eq(texpr_type(t), ty.unwrap()) then return Some(t)
+
+                    if first.is_none() then first = Some(t)
+            None -> ()
+
+    first
+end typed_beside
 
 // A numeric literal as a refusal shows it: an integer by its value, a float as written.
 private held_text(e: Expr) -> Option[string] = *e.kind match

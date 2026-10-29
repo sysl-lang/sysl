@@ -352,7 +352,7 @@ print(b +| 300)
 ```
 
 ```error
-the literal 300 does not fit byte, the type of the other operand of '+|' — a wrapping or saturating operator takes two values of one type
+the literal 300 does not fit u8, the type of the other operand of '+|' — a wrapping or saturating operator takes two values of one type
 ```
 
 **The two operands are one type, as in Rust, and neither widens to the other.** Where `a + b` over a

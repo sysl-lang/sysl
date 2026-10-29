@@ -1,0 +1,118 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.text.replace_all
+
+// A literal held to the type of the typed operand beside it, and refused because it does not fit, is
+// told the type as that operand's declaration wrote it (`type_spelling.sysl`), as every other
+// diagnostic names a type: `u8` where the binding says `u8`, `byte` where it says `byte`, and an
+// alias with `aka`. Where the operand has no declaration to quote, the type is shown canonically.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private lfs_ready() -> bool = std_root().is_ok() && clang_available()
+
+// The report a one-file program is refused with, its locations relative to its directory.
+private lfs_report(text: string) -> string
+    val root = replace_all(make_temp_dir("sysl-lfs").unwrap(), "//", "/")
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val out = emit_llvm_text(s"$root/main.sysl", None) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> if made.report.is_empty() then "" else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    replace_all(out, s"$root/", "")
+end lfs_report
+
+// Refused with exactly `message` first, at `at` (`line:col`).
+private lfs_refused(text: string, message: string, at: string)
+    if !lfs_ready() then return
+
+    val said = lfs_report(text)
+    val head = s"error: $message\n"
+    val place = s"--> main.sysl:$at\n"
+
+    assert(said.starts_with(head) && said.contains(place),
+           s"expected a report starting\n$head\nlocated at $place\ngot\n$said")
+end lfs_refused
+
+// Accepted with no report at all.
+private lfs_clean(text: string)
+    if !lfs_ready() then return
+
+    assert_eq(lfs_report(text), "")
+end lfs_clean
+
+// -- the spelling a binding wrote -----------------------------------------------------------------
+
+@test("a byte binding declared u8 is named u8, on either side of the literal")
+lfs_declared_u8()
+    lfs_refused("val b: u8 = 10\nprint(b + 300)\n", "the literal 300 does not fit u8", "2:11")
+    lfs_refused("val b: u8 = 10\nprint(300 + b)\n", "the literal 300 does not fit u8", "2:7")
+end lfs_declared_u8
+
+@test("a width declared by its built-in name is named by that name, with no aka")
+lfs_declared_builtin_name()
+    lfs_refused("val b: byte = 10\nprint(b + 300)\n", "the literal 300 does not fit byte", "2:11")
+    lfs_refused("val w: ushort = 1\nprint(w + 70000)\n", "the literal 70000 does not fit ushort", "2:11")
+    lfs_refused("val w: u16 = 1\nprint(w + 70000)\n", "the literal 70000 does not fit u16", "2:11")
+end lfs_declared_builtin_name
+
+@test("an alias of a byte is named with aka")
+lfs_declared_alias()
+    lfs_refused("type Small = u8\n\nval b: Small = 10\nprint(b + 300)\n",
+                "the literal 300 does not fit Small (aka byte)", "4:11")
+    lfs_refused("type Small = u8\n\nval b: Small = 10\nprint(b < 256)\n",
+                "the literal 256 does not fit Small (aka byte)", "4:11")
+    lfs_clean("type Small = u8\n\nval b: Small = 10\nprint(b + 200)\n")
+end lfs_declared_alias
+
+@test("an unannotated binding is named as the value it was read from")
+lfs_unannotated()
+    lfs_refused("val a: u8 = 10\nval b = a\nprint(b + 300)\n", "the literal 300 does not fit u8", "3:11")
+    lfs_refused("type Small = u8\n\nval a: Small = 10\nval b = a\nprint(b + 300)\n",
+                "the literal 300 does not fit Small (aka byte)", "5:11")
+end lfs_unannotated
+
+// -- other declarations a value is read from --------------------------------------------------------
+
+@test("a parameter, a field and a call are named as their declarations wrote them")
+lfs_other_declarations()
+    lfs_refused("bump(b: u8) -> u8 = b + 300\nprint(bump(1))\n", "the literal 300 does not fit u8", "1:25")
+    lfs_refused("struct S\n    x: u8\n\nval s = S(1)\nprint(s.x * 1000)\n",
+                "the literal 1000 does not fit u8", "5:13")
+    lfs_refused("one() -> u8 = 1\n\nprint(one() - 300)\n", "the literal 300 does not fit u8", "3:15")
+end lfs_other_declarations
+
+@test("a generic body names a parameter of a written type as written, in each operator path")
+lfs_generic_body()
+    lfs_refused("bump[T](x: T, b: u8) -> u8 = b + 300\nprint(bump(1, 2u8))\n", "the literal 300 does not fit u8", "1:34")
+    lfs_refused("bump[T](x: T, b: u8) -> u8 = b * 300\nprint(bump(1, 2u8))\n", "the literal 300 does not fit u8", "1:34")
+end lfs_generic_body
+
+// -- the other shapes the literal is held in --------------------------------------------------------
+
+@test("a comparison, a negative literal and a compound assignment name the declared type too")
+lfs_other_shapes()
+    lfs_refused("val b: u8 = 10\nprint(b == 256)\n", "the literal 256 does not fit u8", "2:12")
+    lfs_refused("val b: u8 = 10\nprint(b + -1)\n", "the literal -1 does not fit u8", "2:11")
+    lfs_refused("var c: u8 = 1\nc += 300\nprint(c)\n", "the literal 300 does not fit u8", "2:6")
+end lfs_other_shapes
+
+@test("a wrapping or saturating operator names the declared type and the operator")
+lfs_wrapping_operator()
+    lfs_refused("type Small = u8\n\nval b: Small = 10\nprint(b +% 300)\n",
+                "the literal 300 does not fit Small (aka byte), the type of the other operand of '+%' — " +
+                "a wrapping or saturating operator takes two values of one type", "4:12")
+    lfs_refused("val b: u8 = 10\nprint(b *| 300)\n",
+                "the literal 300 does not fit u8, the type of the other operand of '*|' — " +
+                "a wrapping or saturating operator takes two values of one type", "2:12")
+end lfs_wrapping_operator
+
+@test("a literal that fits the declared type is accepted, alias or not")
+lfs_fits_accepted() =
+    lfs_clean("type Small = u8\n\nval a: u8 = 10\nval b: Small = 20\nprint(a + 245, b * 12, 255 - a)\n")
