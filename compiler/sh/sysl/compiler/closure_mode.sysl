@@ -31,9 +31,11 @@ import sysl.container.{Map, map, Set, set}
 // Decides every closure literal's mode once the keeps answers are settled, and says the writes that
 // reach only a copy of a capture the literal holds by value.
 //
-// A closure built in an `async` body holds its captures by value: the body's locals live in its
-// frame only between suspensions. One built in a module value's initializer does too, since nothing
-// follows that frame.
+// A closure built in an `async` body is decided as any other is: a variable it holds by reference
+// has its address taken, so the coroutine lowering lays it in the task's promise, which lives as long
+// as the frame and across every `await` (`emit_async.sysl`'s `frame_locals`). Its box, if it is
+// handed on as a `&Fn`, stays on the heap (`async_box_why`). One built in a module
+// value's initializer holds its captures by value, since nothing follows that frame.
 //
 // **What keeps a closure is remembered with it**, the first reason found, in words that follow
 // "since" -- `it is returned from 'make' on line 4` -- so the refusal of a write that reaches only its
@@ -64,18 +66,6 @@ decide_closure_modes(cx: &KeepsCx, funcs: Buf[TFunc], vals: Buf[TVal])
 
         if !probing then continue
 
-        if f.marks.is_async()
-            for base in here
-                val why = s"it is built in the 'async' body of '${shown_name(a, f.name)}', " +
-                    "whose variables live in its frame only between suspensions"
-
-                escape(escaped, base, why)
-                escape(unframed, base, why)
-            end for
-
-            continue
-        end if
-
         for item in probe_frame(cx, f)
             if is_probe_candidate(a, item.0) then escape(escaped, item.0, item.1)
 
@@ -92,6 +82,10 @@ decide_closure_modes(cx: &KeepsCx, funcs: Buf[TFunc], vals: Buf[TVal])
 
         for item in blocks.1
             escape(unframed, item.0, item.1)
+
+        if f.marks.is_async()
+            for base in here
+                escape(unframed, base, async_box_why(a, f))
     end for
 
     // **A generic's own body answers for its boxes too**: `@no_alloc` holds the body a generic was
@@ -109,8 +103,7 @@ decide_closure_modes(cx: &KeepsCx, funcs: Buf[TFunc], vals: Buf[TVal])
 
         if f.marks.is_async()
             for base in closures_built_in(walk_body_of(f))
-                escape(unframed, base, s"it is built in the 'async' body of '${shown_name(a, f.name)}', " +
-                       "whose variables live in its frame only between suspensions")
+                escape(unframed, base, async_box_why(a, f))
 
             continue
         end if
@@ -226,6 +219,13 @@ private frame_boxes(a: &Analysis, boxes: Buf[BoxSite], unframed: Map[string, str
                     s"${scope.src.name}:${at.line}:${at.col + literate_shift(scope.src)}: $what is " +
                     s"boxed on the heap, because $why"))
 end frame_boxes
+
+// **A box built in an `async` body is on the heap**: the coroutine lowering lays a declared local in
+// the task's promise when its address is taken (`emit_async.sysl`'s `frame_locals`), but a box's slot
+// is no declared local, and a slot left to LLVM's coroutine split is not sure to outlive an `await`.
+private async_box_why(a: &Analysis, f: TFunc) -> string
+    s"it is built in the 'async' body of '${shown_name(a, f.name)}', whose frame keeps no box " +
+        "across an 'await'"
 
 // Whether the emitter lays this box in the frame: one built around a closure literal that the probes
 // found nothing keeps past its frame, or past the turn of a loop that builds it.
