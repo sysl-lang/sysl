@@ -174,10 +174,15 @@ its frame, a nested function may not"*); by value, a copy. A capture is then rea
 - **Stored where it outlives the captured variables' block** — returned, put in a `static`, a field
   through a pointer, a buffer, a local of an outer block (p26): by value, and today's lost-write rule
   applies to it, with the reason named.
-- **A `&Fn` of a non-escaping closure** is built in the caller's frame with an immortal count (the
-  form a view of a frame's own array already has: a null owner), so neither a retain nor a release in
-  a callee that borrows it touches anything, and `@no_alloc` accepts it (decision 8). An escaping one
-  is boxed as today.
+- **A `&Fn` of a non-escaping closure** is built in the caller's frame (decision 8): the heap box's
+  header and payload in a slot of the frame, counted as a heap box is, with a hook that lets go of
+  what the payload holds and frees no storage (none at all for a payload holding nothing). A retain
+  and a release in a borrowing callee touch only the slot's count, and `@no_alloc` accepts it. A count
+  rather than an immortal mark, because a by-value capture (a `val` string) still needs its release
+  at the last use. "Non-escaping" is the probe's answer for the literal **plus** one more root: the
+  literal's own site, judged against the innermost loop body around it, since a literal built again
+  next turn builds into the same slot (`gs[i] = () -> k` in a loop is on the heap). An escaping one
+  is boxed as today, and `--explain-escapes` names why.
 
 ## 5. Threads
 

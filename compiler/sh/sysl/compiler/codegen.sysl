@@ -58,6 +58,7 @@ private codegen_into(e: *Emit, p: TProgram, t: Target, pr: Promotions,
 
     record_symbols(e, p)
     note_raised_types(e, p)
+    e.framed_closures = pr.framed_closures
     note_type_shapes(e, p)
 
     for v in p.vals
@@ -82,15 +83,32 @@ private codegen_into(e: *Emit, p: TProgram, t: Target, pr: Promotions,
     e.dropping = dropping_types(e, p)
     e.untouched = untouched_summary(p, e.dropping, e.owning_funcs)
 
+    for name in e.owning_funcs
+        e.split_funcs.add(name)
+
     for i in 0..<p.funcs.len()
         val f = p.funcs.at(i)
-        val names = reads_in_place(e, f, pr.for_func(f.name))
+        val promoted = pr.for_func(f.name)
+        val names = reads_in_place(e, f, promoted)
 
         for item in names
             e.in_place.add(f.name + "\n" + item)
 
         if !names.is_empty() && !f.params.is_empty() && names.at(0) == f.params.at(0).0 then
             e.in_place_receivers.add(f.name)
+
+        // A parameter lent by address is read where it was lent unless the body promotes it, which
+        // copies it into its box at entry instead (`gen_function`).
+        val lent = read_by_address(e, f, e.owned_params)
+
+        for j in 0..<f.params.len()
+            val n = f.params.at(j).0
+
+            if holds_string(lent, n)
+                e.lent_params.add(owned_key(f.name, j))
+                e.split_funcs.add(f.name)
+
+                if !holds_string(promoted, n) then e.in_place.add(f.name + "\n" + n)
 
     // The `@ghost` functions of this program, read once: nothing emitted may name one, and a clause
     // that does is dropped whole rather than laid down against a symbol that will not be there.
@@ -660,8 +678,13 @@ private imported_sigs(e: *Emit, p: TProgram, copied: Set[string]) -> Buf[IrFuncS
 
             out.push(declared_sig(e,symbol_of(e, f.name), fnty))
 
-            // An owning function's body has a symbol of its own, which a direct call names.
-            if e.owning_funcs.has(f.name) then out.push(declared_sig(e, owned_symbol(symbol_of(e, f.name)), fnty))
+            // A split function's body has a symbol of its own, which a direct call names, and takes
+            // the parameters it is lent as addresses.
+            if e.split_funcs.has(f.name)
+                val body_ty = sysl_fn_type(e, defined_result(f), f.params, f.variadic, None,
+                                           f.marks.track_caller, lent_names(e, f))
+
+                out.push(declared_sig(e, owned_symbol(symbol_of(e, f.name)), body_ty))
 
     out
 end imported_sigs

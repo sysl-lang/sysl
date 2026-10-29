@@ -1512,7 +1512,9 @@ written `*extern(A) -> R` and is covered under the [foreign interface](/referenc
 **A parameter written with a bare arrow is a type parameter.** `f: A -> B` is shorthand for
 `[$F: Fn(A) -> B](f: $F)`: the closure's type is a *type argument*, so the function is monomorphized
 and calls the closure directly, with nothing on the heap. `f: &Fn(A) -> B` is a counted reference to
-a trait object, so the closure is boxed at the call and dispatched through a table. Both accept the
+a trait object, so the closure is boxed at the call — in the caller's frame where nothing keeps it
+past the frame ([closures](/reference/expressions/#a-closure-handed-on-as-a-fn-is-boxed-in-the-frame)),
+on the heap otherwise — and dispatched through a table. Both accept the
 same closures; they differ in what the call costs and in what the declaration compiles to.
 
 **Parentheses before the arrow are its parameter list**, whatever its length: `(string) -> usize`

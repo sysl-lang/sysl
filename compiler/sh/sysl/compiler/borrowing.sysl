@@ -1095,6 +1095,57 @@ reads_in_place(e: *Emit, f: TFunc, promoted: Buf[string]) -> Buf[string]
     out
 end reads_in_place
 
+// The parameters of `f` below the indirect boundary that a direct call hands over **by address**:
+// each one a by-value aggregate wider than two machine words (`Layout.lent_by_address`) that the body
+// only reads, so the caller lends its own storage instead of loading the value into registers.
+//
+// It is `reads_in_place` brought below the boundary, with one difference that is the whole design:
+// **a large parameter crosses by address because of its type, and one of these because of the body.**
+// Two callers of the same function must agree on which, so the answer reads nothing but the body --
+// never which addresses the program takes, which only the whole program knows. A function with one
+// is emitted as two symbols, exactly as an owning one is (`owned_params.sysl`): the body, which takes
+// the address, under `<symbol>.owned`, and under its own symbol an entry with the ordinary convention
+// that puts the value in a slot of its own and lends the body that. A table, a function value, a hook
+// and C reach the entry; only a direct call written in the program reaches the body.
+//
+// Where the body changes its copy, takes a writable view inside it, or is a kind of body nothing but
+// the ordinary convention may enter (`may_own`'s list, which is the same list), the parameter crosses
+// in registers as before. A parameter the body owns (`owned_params`) arrives with a count in registers
+// and stays that way. **Promotion is not asked**: it is the body's own business, and one promoted
+// copies what it was lent into its box at entry (`gen_function`), so the convention never turns on an
+// answer the escape analysis gives.
+read_by_address(e: *Emit, f: TFunc, owned: Set[string]) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    if f.ghost || f.variadic || f.exported.is_some() || f.section.is_some() || f.conv.is_some() ||
+       f.marks.is_async() || f.variant.is_some() || is_closure_body(f) || !tail_calls_of(f).is_empty() then
+        return out
+
+    var any = false
+
+    for param in f.params
+        if e.layout.lent_by_address(param.1) then any = true
+
+    if !any then return out
+
+    val bound = rebound(f)
+
+    if bound.has(OPAQUE) then return out
+
+    val viewed = name_sink()
+
+    walk_block_stmts(f.body, expr_walk(true, x -> viewed_root(viewed, x)))
+
+    for j in 0..<f.params.len()
+        val n = f.params.at(j).0
+
+        if e.layout.lent_by_address(f.params.at(j).1) && !bound.has(n) && !viewed.names.has(n) &&
+           !owned.has(owned_key(f.name, j)) then
+            out.push(n)
+
+    out
+end read_by_address
+
 // The local a writable view is taken inside of. A view of a slice or a string reaches storage the
 // local does not hold, so only an array's counts; and a `[]const T` writes nothing, so it lets nothing
 // out.

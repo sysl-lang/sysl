@@ -43,6 +43,13 @@ decide_closure_modes(cx: &KeepsCx, funcs: Buf[TFunc], vals: Buf[TVal])
     var built: Buf[string] = buf()
     var escaped: Map[string, string] = map()
 
+    // What keeps each boxed closure's box out of the frame, the same questions asked of it.
+    var unframed: Map[string, string] = map()
+    var boxes: Buf[BoxSite] = buf()
+
+    for f in funcs
+        gather_boxes(a, f, &boxes)
+
     for f in funcs
         val here = closures_built_in(walk_body_of(f))
 
@@ -52,24 +59,72 @@ decide_closure_modes(cx: &KeepsCx, funcs: Buf[TFunc], vals: Buf[TVal])
 
         for base in here
             if !holds_string(built, base) then built.push(base)
-            if is_probe_candidate(a, base) then probing = true
+            if is_followed(a, base) then probing = true
         end for
 
         if !probing then continue
 
         if f.marks.is_async()
             for base in here
-                escape(escaped, base, s"it is built in the 'async' body of '${shown_name(a, f.name)}', " +
+                val why = s"it is built in the 'async' body of '${shown_name(a, f.name)}', " +
+                    "whose variables live in its frame only between suspensions"
+
+                escape(escaped, base, why)
+                escape(unframed, base, why)
+            end for
+
+            continue
+        end if
+
+        for item in probe_frame(cx, f)
+            if is_probe_candidate(a, item.0) then escape(escaped, item.0, item.1)
+
+            escape(unframed, item.0, item.1)
+        end for
+
+        val blocks = probe_blocks(cx, f)
+
+        for item in blocks.0
+            if is_probe_candidate(a, item.0) then escape(escaped, item.0, item.1)
+
+            escape(unframed, item.0, item.1)
+        end for
+
+        for item in blocks.1
+            escape(unframed, item.0, item.1)
+    end for
+
+    // **A generic's own body answers for its boxes too**: `@no_alloc` holds the body a generic was
+    // written as (`no_alloc.sysl`), which no instantiation is, so its closures are probed for their
+    // box alone -- that body is never emitted, and its closures' modes are no question.
+    for f in a.tables.abstracts
+        var any = false
+
+        for b in boxes_of(a, f)
+            boxes.push(b)
+            any = true
+        end for
+
+        if !any then continue
+
+        if f.marks.is_async()
+            for base in closures_built_in(walk_body_of(f))
+                escape(unframed, base, s"it is built in the 'async' body of '${shown_name(a, f.name)}', " +
                        "whose variables live in its frame only between suspensions")
 
             continue
         end if
 
         for item in probe_frame(cx, f)
-            escape(escaped, item.0, item.1)
+            escape(unframed, item.0, item.1)
 
-        for item in probe_blocks(cx, f)
-            escape(escaped, item.0, item.1)
+        val blocks = probe_blocks(cx, f)
+
+        for item in blocks.0
+            escape(unframed, item.0, item.1)
+
+        for item in blocks.1
+            escape(unframed, item.0, item.1)
     end for
 
     for v in vals
@@ -78,16 +133,105 @@ decide_closure_modes(cx: &KeepsCx, funcs: Buf[TFunc], vals: Buf[TVal])
         for base in closures_built_in(v.init.unwrap())
             if !holds_string(built, base) then built.push(base)
 
-            escape(escaped, base, s"it is built in the initializer of '${shown_name(a, v.symbol)}', " +
-                   "whose frame nothing follows")
+            val why = s"it is built in the initializer of '${shown_name(a, v.symbol)}', whose frame " +
+                "nothing follows"
+
+            escape(escaped, base, why)
+            escape(unframed, base, why)
         end for
     end for
 
     for base in built
         if is_probe_candidate(a, base) && !escaped.has(base) then a.by_ref_closures.add(base)
 
+    frame_boxes(a, boxes, unframed)
     say_lost_writes(a, built, escaped)
 end decide_closure_modes
+
+// -- the box of a `&Fn` -----------------------------------------------------------------------------
+
+// A closure literal put behind a counted reference: the closure, the function that builds it, and
+// where.
+private struct BoxSite
+    base: string
+    func: string
+    at: Span
+    shown: string
+end BoxSite
+
+// The boxes a body builds around a closure literal -- the `&Fn` a literal is erased to, or a `&` of
+// its own type. A `&sync` one is not among them: another domain may hold it, and the box is counted
+// atomically on the heap (decision 9).
+//
+// The walk is outermost first, so an erasure is met before the box inside it, and names the type the
+// closure is handed on as.
+private gather_boxes(a: &Analysis, f: TFunc, into: *Buf[BoxSite])
+    val name = f.name
+
+    walk_block_stmts(f.body, expr_walk(true, x -> *x.kind match
+        TErase(v, _, ty) -> *v.kind match
+            TBox(inner, ref_ty) -> note_box(a, into, inner, ref_ty, name, x.span, type_show(ty))
+            _ -> ()
+        TBox(v, ref_ty) -> note_box(a, into, v, ref_ty, name, x.span, "")
+        _ -> ()))
+end gather_boxes
+
+private boxes_of(a: &Analysis, f: TFunc) -> Buf[BoxSite]
+    var out: Buf[BoxSite] = buf()
+
+    gather_boxes(a, f, &out)
+    out
+end boxes_of
+
+private note_box(a: &Analysis, into: *Buf[BoxSite], v: TExpr, ref_ty: Type, func: string, at: Span,
+                 shown: string)
+    val base = boxed_closure(v, ref_ty)
+
+    if base.is_none() then return
+
+    for b in *into
+        if b.base == base.unwrap() then return
+
+    a.boxed_closures.add(base.unwrap())
+    into.push(BoxSite(base.unwrap(), func, at, shown))
+end note_box
+
+// The closure literal a box is built around, unless the box is counted for another domain.
+private boxed_closure(v: TExpr, ref_ty: Type) -> Option[string]
+    val shared = ref_ty match
+        Ref(_, sync) -> sync
+        _ -> true
+
+    if shared then return None
+
+    *v.kind match
+        TStructNew(st, _) -> if is_closure_literal(Struct(st)) then Some(st.base) else None
+        _ -> None
+end boxed_closure
+
+// **A boxed closure nothing reaches after its frame -- or after the turn of a loop that builds it --
+// is boxed in that frame** (`docs/design/closures.md` decision 8): the probes answer the question for
+// the box exactly as for the captures, since the box goes wherever the closure does. Every other box
+// is on the heap, and `--explain-escapes` says why.
+private frame_boxes(a: &Analysis, boxes: Buf[BoxSite], unframed: Map[string, string])
+    for b in boxes
+        unframed.get(b.base) match
+            None -> a.frame_closures.add(b.base)
+            Some(why) ->
+                val scope = func_home(a, b.func)
+                val at = scope.src.locate(b.at.start)
+                val what = if b.shown == "" then "a closure" else s"a closure erased to '${b.shown}'"
+
+                a.closure_box_notes.push((scope.src.name,
+                    s"${scope.src.name}:${at.line}:${at.col + literate_shift(scope.src)}: $what is " +
+                    s"boxed on the heap, because $why"))
+end frame_boxes
+
+// Whether the emitter lays this box in the frame: one built around a closure literal that the probes
+// found nothing keeps past its frame, or past the turn of a loop that builds it.
+framed_box(a: &Analysis, v: TExpr, ref_ty: Type) -> bool = boxed_closure(v, ref_ty) match
+    Some(base) -> a.frame_closures.has(base)
+    None -> false
 
 // A closure found to escape, with the first reason found.
 private escape(escaped: Map[string, string], base: string, why: string) =
