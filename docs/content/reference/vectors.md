@@ -462,6 +462,61 @@ A float sum is computed as a **tree** rather than left to right, so that it maps
 instructions; it may therefore differ in the last bit from adding the lanes in order. An integer sum
 wraps at the lane width, exactly as scalar integer arithmetic does.
 
+## Magnitude, and a fused multiply-add
+
+Two methods apply a single machine operation to every lane at once and answer a vector. Each is one
+instruction over the whole register where the target has one, and never a loop over the lanes.
+
+**`v.abs()`** is the magnitude of each lane. A float lane has its sign bit cleared, so `-0.0` answers
+`0.0`, a NaN stays a NaN and an infinity stays an infinity, at every width including `f16` and
+`bf16`. A signed integer lane answers as the scalar `abs` does: **the most negative value answers
+itself**, in every build, because its magnitude does not fit the width. An unsigned, `bool` or
+fixed-point vector has no `abs` and is refused.
+
+**`a.mul_add(b, c)`** is `a * b + c` in every lane with the product never rounded on its own, as the
+scalar [`mul_add`](/library/math/#mul-add-a-multiply-and-an-add-rounded-once) is. Either `b` or `c`
+may be a scalar, which broadcasts. It is defined for `f32` and `f64` lanes only: a half-width lane
+cannot keep the single rounding, so `f16` and `bf16` are refused, as the scalar methods are absent.
+It is not available inside a `@strict_fp` body, where `*` and `+` are the strict forms. Neither
+method is evaluated while compiling.
+
+```sysl
+val e = 1.0 / 1073741824.0
+val a: <2>f64 = [1.0 + e, 2.0]
+val b: <2>f64 = [1.0 - e, 3.0]
+val c: <2>f64 = [-1.0, 1.0]
+
+val product = a * b
+val twice = product + c
+val once = a.mul_add(b, c)
+
+val i: <4>i32 = [-5, 5, -2147483648, 0]
+val m = i.abs()
+val f: <4>f32 = [-0.0, -1.5, 2.0, -3.0]
+val g = f.abs()
+
+print(twice[0] == 0.0, once[0] < 0.0, once[1])
+print(m[0], m[1], m[2], m[3])
+print(1.0 / g[0], g[1], g[3])
+```
+
+```output
+true true 7
+5 5 -2147483648 0
+inf 1.5 3
+```
+
+```sysl
+val a: <4>f16 = [1.0, 2.0, 3.0, 4.0]
+
+f() -> unit
+    val r = a.mul_add(a, a)
+```
+
+```error
+'mul_add' rounds the product and the sum once, which only a float of 32 or 64 bits can promise
+```
+
 ## Loading and storing
 
 A vector holds the lanes a kernel computes with; an [array or a slice](/reference/arrays/) holds the
