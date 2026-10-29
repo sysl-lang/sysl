@@ -84,7 +84,7 @@ val z: u8 = 300
 ```
 
 ```error
-the literal 300 does not fit byte
+the literal 300 does not fit u8
 ```
 
 A literal with no type from its context is an `int`, and one too large for `int` is refused rather
@@ -214,7 +214,7 @@ val b: u32 = 65536 * 65536
 ```
 
 ```error
-the value 4294967296 does not fit uint
+the value 4294967296 does not fit u32
 ```
 
 Only the **whole** expression is held to the type. The steps on the way are plain numbers, so a step

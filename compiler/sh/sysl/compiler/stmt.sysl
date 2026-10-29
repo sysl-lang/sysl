@@ -761,7 +761,11 @@ private var_decl(cx: &Analyzer, span: Span, name: string, typ: Option[TypeRef],
 
     // A bare literal is read at the type a use fixed, where an earlier reading found one.
     val fixed = fixed_type(cx, span, name, typ, init.unwrap())
+    val saved = told_by(cx, typ, declared, subst_names(cx))
     val ti = type_expr(cx, init.unwrap(), if fixed.is_some() then fixed else declared)
+
+    cx.declared = saved
+
     val decl_ty = settled_binding_type(declared, ti)
     val spelled = binding_spelling(cx, typ, decl_ty, ti)
 
@@ -788,7 +792,11 @@ private val_decl(cx: &Analyzer, span: Span, name: string, typ: Option[TypeRef], 
 
     val declared = typ.map(w -> resolve_type(cx.an, cx.scope, w, cx.subst))
     val fixed = fixed_type(cx, span, name, typ, value)
+    val saved = told_by(cx, typ, declared, subst_names(cx))
     val ti = type_expr(cx, value, if fixed.is_some() then fixed else declared)
+
+    cx.declared = saved
+
     val decl_ty = settled_binding_type(declared, ti)
     val spelled = binding_spelling(cx, typ, decl_ty, ti)
 
@@ -816,7 +824,11 @@ end val_decl
 private const_decl(cx: &Analyzer, span: Span, name: string, typ: Option[TypeRef],
                    value: Expr) -> Buf[TStmt]
     val written = typ.map(t -> resolve_type(cx.an, cx.scope, t, cx.subst))
+    val saved = told_by(cx, typ, written, subst_names(cx))
     val ti = type_expr(cx, value, written)
+
+    cx.declared = saved
+
     val declared = written.unwrap_or(texpr_type(ti))
     val read = body_binding_read(cx, ti)
 
@@ -1098,8 +1110,13 @@ private return_stmt(cx: &Analyzer, span: Span, value: Option[Expr]) -> Buf[TStmt
         return one(TReturn(None))
     end if
 
+    val saved = cx.declared
+
+    cx.declared = if cx.ret_is_list then None else cx.ret_spelled.map(s -> Declared(want, s))
+
     val tv = returned_value(cx, value.unwrap(), want)
 
+    cx.declared = saved
     note_view_return(cx, span, tv)
 
     // **A unit expression is no value to hand back**, so `return f()` from a unit function is the
