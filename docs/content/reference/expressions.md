@@ -1124,7 +1124,32 @@ drop 7
 4
 ```
 
-Every place may be `_`, which evaluates the right side for its effects alone. Only a **whole** place
+Every place may be `_`, which evaluates the right side for its effects alone — **a single one
+included: `_ = f()` runs `f` and drops what it answers**, whatever that is: a `Result`, a reference
+with a `Drop` (let go of when the statement ends), `unit`, a tuple.
+
+```sysl
+struct Tag
+    n: int
+
+impl Drop for Tag
+    drop(self)
+        print(s"drop ${self.n}")
+
+make(n: int) -> &Tag = Tag(n)
+
+_ = make(1)
+print("after")
+_ = (make(2), 3)
+```
+
+```output
+drop 1
+after
+drop 2
+```
+
+Only a **whole** place
 may be `_` — one inside a place, as in `xs[_], a = 1, 2`, would stand for a closure's parameter — and
 only `=` discards: a compound form reads every place before writing it, and `_` has nothing to read.
 

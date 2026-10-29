@@ -1,0 +1,137 @@
+module sh.sysl.compiler
+@tests
+
+// **A trait's requirement is read where the trait was written**: `trait Codec: Encode` in `wire`
+// asks for `wire.Encode`. Read in the implementing file instead, it named nothing there, so a block
+// written by hand with every requirement met was refused -- and a trait of the file's own with the
+// required one's name would have answered for it.
+
+private tsq_wire() -> (string, string, string) = ("wire", "w.sysl", raw"""
+    module wire
+
+    trait Encode
+        encode(self) -> string
+
+    trait Codec: Encode
+    """)
+
+@test("a hand-written impl of a trait from another module meets a requirement the file never imports")
+tsq_requirement_read_in_the_trait()
+    if !azb_ready() then return
+
+    azb_prints([("", "main.sysl", raw"""
+        struct P
+            x: int
+
+        impl wire.Encode for P
+            encode(self) -> string = s"p${self.x}"
+
+        impl wire.Codec for P
+
+        shown[T: wire.Codec](v: T) -> string = v.encode()
+
+        print(shown(P(3)))
+        """), tsq_wire()], "p3\n")
+end tsq_requirement_read_in_the_trait
+
+@test("the requirement met with the trait imported by name, and through a generic block")
+tsq_requirement_imported_and_generic()
+    if !azb_ready() then return
+
+    azb_prints([("", "main.sysl", raw"""
+        import wire.Codec
+
+        struct P
+            x: int
+
+        struct Box[T]
+            v: T
+
+        impl wire.Encode for P
+            encode(self) -> string = s"p${self.x}"
+
+        impl Codec for P
+
+        impl[T: wire.Encode] wire.Encode for Box[T]
+            encode(self) -> string = "[" + self.v.encode() + "]"
+
+        impl[T: wire.Encode] Codec for Box[T]
+
+        shown[T: Codec](v: T) -> string = v.encode()
+
+        print(shown(P(3)), shown(Box(P(4))))
+        """), tsq_wire()], "p3 [p4]\n")
+end tsq_requirement_imported_and_generic
+
+@test("a trait of the implementing file's own with a required trait's name does not meet it")
+tsq_requirement_not_shadowed()
+    if !azb_ready() then return
+
+    azb_refused([("", "main.sysl", raw"""
+        trait Encode
+            encode(self) -> string
+
+        struct P
+            x: int
+
+        impl Encode for P
+            encode(self) -> string = "mine"
+
+        impl wire.Codec for P
+
+        print(1)
+        """), tsq_wire()], ["'wire.Codec' requires 'wire.Encode', so 'P' has to implement that too — write " +
+                            "'impl wire.Encode for P'"])
+end tsq_requirement_not_shadowed
+
+@test("a requirement left unmet across modules is still refused, naming the trait where it lives")
+tsq_requirement_unmet()
+    if !azb_ready() then return
+
+    azb_refused([("", "main.sysl", raw"""
+        struct P
+            x: int
+
+        impl wire.Codec for P
+
+        print(1)
+        """), tsq_wire()], ["'wire.Codec' requires 'wire.Encode', so 'P' has to implement that too"])
+end tsq_requirement_unmet
+
+@test("a requirement in the file's own module still reads as it did")
+tsq_requirement_same_module()
+    if !azb_ready() then return
+
+    azb_prints(azb_main(raw"""
+        trait Encode
+            encode(self) -> string
+
+        trait Codec: Encode
+
+        struct P
+            x: int
+
+        impl Encode for P
+            encode(self) -> string = s"p${self.x}"
+
+        impl Codec for P
+
+        shown[T: Codec](v: T) -> string = v.encode()
+
+        print(shown(P(5)))
+        """), "p5\n")
+
+    azb_refused(azb_main(raw"""
+        trait Encode
+            encode(self) -> string
+
+        trait Codec: Encode
+
+        struct P
+            x: int
+
+        impl Codec for P
+
+        print(1)
+        """), ["'Codec' requires 'Encode', so 'P' has to implement that too — write 'impl Encode for P'"])
+end tsq_requirement_same_module
