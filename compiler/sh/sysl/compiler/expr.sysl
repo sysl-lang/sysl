@@ -202,8 +202,14 @@ analyze_value(cx: &Analyzer, e: Expr, expected: Option[Type]) -> TExpr = *e.kind
         TypeAttr(subject, attr, _, _) ->
             if attr == "Annotation" then annotation_query(cx, anchor_of(receiver), subject, index)
             else index_expr(cx, anchor_of(e), receiver, index, expected)
-        _ -> index_expr(cx, anchor_of(e), receiver, index, expected)
-    // A list in brackets reaches here only where it is neither a call's nor an address's.
+        _ ->
+            if applied_function_wanted(cx, receiver, expected) then
+                applied_function_value(cx, e, receiver, expected.unwrap())
+            else index_expr(cx, anchor_of(e), receiver, index, expected)
+    // `pair[int, string]` where a callable is wanted.
+    TypeArgs(head, _, _) if applied_function_wanted(cx, head, expected) ->
+        applied_function_value(cx, e, head, expected.unwrap())
+    // A list in brackets reaches here only where it is neither a call's, an address's nor a callable's.
     TypeArgs(_, args, _) ->
         cx.err(anchor_of(e), s"a subscript takes one index, and ${args.len()} were written — a list of " +
                "types in brackets is a type-argument list, and one is written after a generic's " +
@@ -684,6 +690,39 @@ name_expr(cx: &Analyzer, span: Span, name: string, expected: Option[Type]) -> TE
 
     variant_expr(cx, span, name, expected)
 end name_expr
+
+// Whether `head[…]` is a generic function named with its type arguments where a callable is wanted
+// -- `echo[int]` as a `&Fn(int) -> int`. It is asked of the name exactly as a bare `echo` is, so a
+// local, storage or a variant of the spelling is what is indexed instead. It reports nothing.
+applied_function_wanted(cx: &Analyzer, head: Expr, expected: Option[Type]) -> bool
+    if expected.is_none() || callable_signature(cx.an, expected.unwrap()).is_none() then return false
+
+    val name = written_name_of(cx, head)
+
+    name.is_some() && !reads_before_a_function(cx, name.unwrap()) && names_a_function(cx, name.unwrap())
+
+// `echo[int]` where `applied_function_wanted` said so: the capture-free closure a bare `echo` would
+// be, whose body calls the application as it was written -- so the instantiation is the one the
+// reader named, and arguments the brackets cannot take are refused as the call `echo[int](x)` is.
+//
+// **A function no declaration of which is generic is told so in a value's words**: the call's
+// refusal would advise 'inc(…)', and what this position wants is the bare name.
+private applied_function_value(cx: &Analyzer, e: Expr, head: Expr, expected: Type) -> TExpr
+    val want = callable_signature(cx.an, expected).unwrap()
+    val name = written_name_of(cx, head).unwrap()
+    var generic = false
+
+    for key in function_keys(cx, name)
+        val f = cx.an.tables.funcs.get(key)
+
+        if f.is_some() && !f.unwrap().decl.tparams.is_empty() then generic = true
+
+    if !generic then
+        return cx.err(anchor_of(e), s"'$name' is not generic, so it has no type arguments to write — " +
+                      s"the function is a value as it stands: '$name'")
+
+    function_as_callable(cx, anchor_of(e), name, want.0, want.1, Some(e))
+end applied_function_value
 
 // What a name bound to a value parameter stands for, where it is bound to one.
 //
