@@ -176,33 +176,67 @@ written_once_place(cx: &Analyzer, t: TExpr) -> bool = root_local(cx, t) match
 // only reads its captures is called on a `val`**, the address `call` takes being used for nothing but
 // reading (`Analysis.read_only_closures`); asked of the concrete receiver, since a call through
 // `&Fn(...)` is dispatched on the trait, where the box supplies the place.
+//
+// **A closure whose every write reaches a capture it may hold by reference is asked once its mode is
+// known** (`closure_mode.sysl`): held by reference, its call writes through the closure to the
+// variables and leaves the `val` as it was; held by value, the refusal is said then, naming what keeps
+// the closure.
 refuse_written_once_receiver(cx: &Analyzer, span: Span, place: TExpr, member: string)
+    var closure = ""
+
     if member == "call"
         texpr_type(place) match
-            Struct(st) -> if cx.an.read_only_closures.has(st.base) then return
+            Struct(st) ->
+                if cx.an.read_only_closures.has(st.base) then return
+
+                closure = st.base
             _ -> ()
     end if
 
     val root = root_local(cx, place)
+    val writes = s"'$member' takes '*self', so it writes through what it is called on"
+    var head = s"$writes, and a 'val' is written once"
+    var lead = " — this closure captures by value, since "
+    var tail = var_fix(place)
 
     if root.is_some() && root.unwrap().read_only
         if root.unwrap().from_pattern
-            cx.fault(span, s"'$member' takes '*self', so it writes through what it is called on — " +
-                     "and a pattern binding holds a copy of what it matched, so the write would " +
-                     "reach that copy rather than the value it came from. Copy it into a 'var' and " +
-                     "call this on that")
-            return
+            head = writes
+            lead = ", and this closure captures by value, since "
+            tail = " — and a pattern binding holds a copy of what it matched, so the write would " +
+                "reach that copy rather than the value it came from. Copy it into a 'var' and call " +
+                "this on that"
         end if
-
-        cx.fault(span, s"'$member' takes '*self', so it writes through what it is called on, and a " +
-                 s"'val' is written once${var_fix(place)}")
+    else if !global_written_once(place)
         return
     end if
 
-    if global_written_once(place)
-        cx.fault(span, s"'$member' takes '*self', so it writes through what it is called on, and a " +
-                 s"'val' is written once${var_fix(place)}")
+    if closure != "" && owe_closure_call(cx, span, closure, head, lead, tail) then return
+
+    cx.fault(span, head + tail)
 end refuse_written_once_receiver
+
+// A call of a closure whose writes all reach captures it may hold by reference, owed until its mode
+// is known: once for each capture it writes, said where any of them is held by value. **Without a
+// reason to give, the refusal is the one any other `*self` member gets.**
+private owe_closure_call(cx: &Analyzer, span: Span, base: string, head: string, lead: string,
+                         tail: string) -> bool
+    val writes = cx.an.closure_env_writes.get(base)
+
+    if writes.is_none() then return false
+
+    val refs = cx.an.closure_refs.get(base)
+
+    if refs.is_none() then return false
+
+    for i in writes.unwrap()
+        if i >= refs.unwrap().len() || !refs.unwrap().at(i) then return false
+
+    for i in writes.unwrap()
+        cx.an.lost_writes.push(OwedWrite(cx.scope, span, head, lead, tail, base, i))
+
+    true
+end owe_closure_call
 
 // The advice, naming the binding where the receiver IS one -- one `val` produces one of these per
 // mutating call, and naming it is what makes the fix findable from any of them.

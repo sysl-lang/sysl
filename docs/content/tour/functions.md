@@ -176,10 +176,11 @@ print("the total is", total)
 ```
 
 ```error
-a closure captures by value, so it holds a copy of 'total' — so '+=' would reach that copy rather than the variable it came from, and nothing in the closure reads it back
+this closure captures by value, since it is handed to 'keep' on line 7, which keeps its parameter 'f' (it is stored in 'later'), so it holds a copy of 'total' — so '+=' would reach that copy rather than the variable it came from, and nothing in the closure reads it back
 ```
 
-The compiler works out which one a closure is from the bodies; nothing is written for either. A
+The compiler works out which one a closure is from the bodies, and the refusal says what keeps it;
+nothing is written for either. A
 closure that copies and reads back what it wrote keeps its copy as state of its own between calls,
 and that is allowed.
 

@@ -261,9 +261,9 @@ private struct BlockTrack
     checking: bool
 
     // Whether this is the probe deciding closures' capture modes (`probe_blocks`), and the closures
-    // it found kept past the block of a variable they capture.
+    // it found kept past the block of a variable they capture, each with why.
     probe: bool
-    escaped: Buf[string]
+    escaped: Buf[(string, string)]
 end BlockTrack
 
 // Every place one body keeps the address of a block's local where it outlives the block. The entry
@@ -275,7 +275,7 @@ check_blocks(cx: &KeepsCx, faults: &KeepFaults, f: TFunc)
 // reference: in a local of an enclosing block, or what a keeping callee stores in one
 // (`docs/design/closures.md` decision 6). **This is the rule's own walk with the closure followed**:
 // a closure is built around each variable it may hold the address of, `«closure»n` as a root.
-probe_blocks(cx: &KeepsCx, f: TFunc) -> Buf[string]
+probe_blocks(cx: &KeepsCx, f: TFunc) -> Buf[(string, string)]
     val faults: &KeepFaults = KeepFaults(buf())
 
     block_walk(cx, faults, f, true).escaped
@@ -317,8 +317,52 @@ private block_expr_event(bt: &BlockTrack, e: TExpr)
             for j in 0..<args.len()
                 for item in pointer_keeps(bt.cx, callee, j)
                     kept_by_call(bt, args, j, item.1.loc, "the call")
-        _ -> ()
+        _ -> if bt.probe && !bt.checking then probe_bind_patterns(bt, e)
 end block_expr_event
+
+// **A name a pattern binds holds what its subject holds**, for a probe: a closure matched out of an
+// `Option` and kept in an outer local is the closure literal kept there. The forms are `keeps.sysl`'s
+// `bind_expr`'s.
+private probe_bind_patterns(bt: &BlockTrack, e: TExpr)
+    *e.kind match
+        TMatch(scrutinee, arms, _) ->
+            for arm in arms
+                for p in arm.patterns
+                    probe_bind_pattern(bt, p, scrutinee)
+        TIf(cond, _, _, _) -> probe_bind_terms(bt, cond)
+        TWhile(cond, _, _, _) -> probe_bind_terms(bt, cond)
+        TForEach(name, _, seq, _, _, _) -> probe_bind_roots(bt, name, seq)
+        TIterate(cursor, _, init, _, pat, _, _, _) ->
+            probe_bind_roots(bt, cursor, init)
+            probe_bind_pattern(bt, pat, init)
+        _ -> ()
+end probe_bind_patterns
+
+private probe_bind_terms(bt: &BlockTrack, cond: Buf[TCondTerm])
+    for term in cond
+        term match
+            TCondIs(subject, patterns, _) ->
+                for p in patterns
+                    probe_bind_pattern(bt, p, subject)
+            _ -> ()
+
+private probe_bind_pattern(bt: &BlockTrack, p: TPattern, subject: TExpr)
+    var names: Buf[string] = buf()
+
+    pattern_names(p, &names)
+
+    for n in names
+        probe_bind_roots(bt, n, subject)
+end probe_bind_pattern
+
+private probe_bind_roots(bt: &BlockTrack, name: string, subject: TExpr)
+    var roots: Buf[string] = buf()
+
+    roots_of(bt, subject, &roots)
+
+    for r in roots
+        hold(bt, name, r)
+end probe_bind_roots
 
 private kept_by_call(bt: &BlockTrack, args: Buf[TExpr], j: usize, callee_loc: string, by: string)
     val arg = args.at(j)
@@ -355,9 +399,7 @@ private kept_in(bt: &BlockTrack, holder: string, v: TExpr, by: string)
         if bt.checking
             if bt.sc.ends_within(bt.sc.home_of(root_local(r)), home)
                 if bt.probe
-                    val base = root_closure(r)
-
-                    if !holds_string(bt.escaped, base) then bt.escaped.push(base)
+                    probe_escaped(bt, root_closure(r), holder, r, v, by)
                     continue
                 end if
 
@@ -368,6 +410,17 @@ private kept_in(bt: &BlockTrack, holder: string, v: TExpr, by: string)
             hold(bt, holder, r)
         end if
 end kept_in
+
+// A closure a probe found kept past the block of `r`'s variable, with the reason, once.
+private probe_escaped(bt: &BlockTrack, base: string, holder: string, r: string, v: TExpr, by: string)
+    for item in bt.escaped
+        if item.0 == base then return
+
+    val keeps = if by == "" then "it is kept in" else s"$by keeps it in"
+
+    bt.escaped.push((base, s"$keeps '${shown_local(holder)}' ${probe_line(bt.scope, v.span)}, which " +
+                           s"outlives the block declaring '${shown_local(root_local(r))}'"))
+end probe_escaped
 
 // A probe's root is a variable a closure may hold the address of, `«closure»n`; the rule's is the
 // local itself. These are its two halves.

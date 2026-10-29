@@ -1947,22 +1947,45 @@ private check_calls(cx: &KeepsCx, faults: &KeepFaults, f: TFunc) = frame_walk(cx
 //
 // **The entry file's statements are walked too**: their frame outlives every call, but a closure
 // stored where something may run it after them is still one that escapes.
-probe_frame(cx: &KeepsCx, f: TFunc) -> Buf[string]
+//
+// **Each closure comes back with the reason it escapes**, in words that follow "since": what a probe
+// gathers is the closures it followed, each by its marker, and then the reason (`probe_why`).
+probe_frame(cx: &KeepsCx, f: TFunc) -> Buf[(string, string)]
     val faults: &KeepFaults = KeepFaults(buf())
 
     frame_walk(cx, faults, f, true)
 
-    var out: Buf[string] = buf()
+    var out: Buf[(string, string)] = buf()
 
     for item in faults.items
+        val why = probe_reason(item.2)
+
         for base in closure_markers_in(item.2)
-            if !holds_string(out, base) then out.push(base)
+            var again = false
+
+            for o in out
+                if o.0 == base then again = true
+
+            if !again then out.push((base, why))
+        end for
+    end for
 
     out
 end probe_frame
 
 // How a probe names a closure literal in what it gathers: brackets no identifier can hold.
 closure_marker(base: string) -> string = s"«$base»"
+
+// What a probe gathers about the closures `core` names: their markers, then why they escape.
+probe_why(core: string, why: string) -> string = core + why
+
+// The reason in what a probe gathered: everything after its last marker.
+probe_reason(text: string) -> string = text.last_index_of("»") match
+    Some(at) -> text[at + "»".bytes.len..<text.bytes.len]
+    None -> text
+
+// Where a probe found a closure escaping, as its reason says it.
+probe_line(scope: Scope, at: Span) -> string = s"on line ${scope.src.locate(at.start).line}"
 
 // Every closure a probe's text names.
 closure_markers_in(text: string) -> Buf[string]
@@ -2058,6 +2081,12 @@ private returned_core(ft: &FrameTrack, v: TExpr, image: bool)
 
     if core.is_none() then return
 
+    if ft.probe
+        ft.faults.items.push((ft.scope, v.span, probe_why(core.unwrap(),
+            s"it is returned from '${ft.owner}' ${probe_line(ft.scope, v.span)}")))
+        return
+    end if
+
     if !image
         ft.faults.items.push((ft.scope, v.span,
             s"'${value_text(ft.scope, v)}' is returned, but it holds ${core.unwrap()}, whose storage ends " +
@@ -2094,8 +2123,44 @@ private frame_bind_expr(ft: &FrameTrack, e: TExpr)
         TStore(place, v, _, _) -> frame_bind_store(ft, place, v)
         TCall(name, args, _, _) -> frame_bind_call(ft, name, args)
         TCallPtr(callee, args, _, _) -> frame_bind_ptr_call(ft, callee, args)
-        _ -> ()
+        _ -> if ft.probe then probe_bind_patterns(ft, e)
 end frame_bind_expr
+
+// **A name a pattern binds holds what its subject holds**, for a probe: a closure matched out of an
+// `Option` and handed on is the closure literal going there (`Some(g) -> install(g)`). The forms are
+// the ones `bind_expr` reads -- a `match`'s arms, an `is` test, a `for` over a sequence, an
+// iteration's cursor -- and each name is taken to hold every closure the subject does.
+private probe_bind_patterns(ft: &FrameTrack, e: TExpr)
+    *e.kind match
+        TMatch(scrutinee, arms, _) ->
+            for arm in arms
+                for p in arm.patterns
+                    probe_bind_pattern(ft, p, scrutinee)
+        TIf(cond, _, _, _) -> probe_bind_terms(ft, cond)
+        TWhile(cond, _, _, _) -> probe_bind_terms(ft, cond)
+        TForEach(name, _, seq, _, _, _) -> frame_bind(ft, name, seq)
+        TIterate(cursor, _, init, _, pat, _, _, _) ->
+            frame_bind(ft, cursor, init)
+            probe_bind_pattern(ft, pat, init)
+        _ -> ()
+end probe_bind_patterns
+
+private probe_bind_terms(ft: &FrameTrack, cond: Buf[TCondTerm])
+    for term in cond
+        term match
+            TCondIs(subject, patterns, _) ->
+                for p in patterns
+                    probe_bind_pattern(ft, p, subject)
+            _ -> ()
+
+private probe_bind_pattern(ft: &FrameTrack, p: TPattern, subject: TExpr)
+    var names: Buf[string] = buf()
+
+    pattern_names(p, &names)
+
+    for n in names
+        frame_bind(ft, n, subject)
+end probe_bind_pattern
 
 private frame_bind_ptr_call(ft: &FrameTrack, callee: TExpr, args: Buf[TExpr])
     for j in 0..<args.len()
@@ -2240,9 +2305,14 @@ private frame_stored(ft: &FrameTrack, evs: &EvBuf, place: TExpr, v: TExpr)
     end if
 
     val back = if image then s" and '${shown_name(ft.cx.an, turned)}' turns back into a pointer with 'ptr_cast'" else ""
-    val said = s"${argument_said(ft, v, core.unwrap())}, and it is stored in " +
+    var said = s"${argument_said(ft, v, core.unwrap())}, and it is stored in " +
         s"'${place_said(ft.scope, place)}', which outlives '${ft.owner}'$back — store the value itself, or " +
         "storage that lasts"
+
+    if ft.probe
+        said = probe_why(core.unwrap(), s"it is stored in '${place_said(ft.scope, place)}' " +
+                         s"${probe_line(ft.scope, v.span)}, which outlives '${ft.owner}'")
+    end if
 
     if loc.index_of("?").is_some() then ft.faults.items.push((ft.scope, v.span, said))
     else evs.items.push(FlowEv(false, loc, said, v.span))
@@ -2320,9 +2390,15 @@ private call_at(ft: &FrameTrack, evs: &EvBuf, e: TExpr)
 
                 if core.is_none() then continue
 
-                if ft.probe && probe_held_apart(ft, e, name, j)
-                    ft.faults.items.push((ft.scope, arg.span, core.unwrap()))
-                    continue
+                if ft.probe
+                    val apart = probe_held_apart(ft, e, name, j)
+
+                    if apart.is_some()
+                        ft.faults.items.push((ft.scope, arg.span, probe_why(core.unwrap(),
+                            s"it is handed to '${shown_name(ft.cx.an, name)}' ${probe_line(ft.scope, arg.span)}, " +
+                            apart.unwrap())))
+                        continue
+                    end if
                 end if
 
                 for item in keeps_of(ft.cx, name, j).locs
@@ -2343,9 +2419,11 @@ private call_at(ft: &FrameTrack, evs: &EvBuf, e: TExpr)
                     val ending = if task_result(texpr_type(e)).is_some() then "await that task" else "join that thread"
                     val cure = if item.loc == "j" then s" — $ending on every way out of '${ft.owner}', " +
                         s"or hand it storage that lasts${ft.hs.why}" else ""
-                    val said = s"'${shown_name(ft.cx.an, name)}' keeps its parameter " +
+                    var said = s"'${shown_name(ft.cx.an, name)}' keeps its parameter " +
                         s"'${param_name(ft.cx, name, j)}' (${item.how}), and " +
                         argument_said(ft, arg, core.unwrap()) + cure
+
+                    if ft.probe then said = probe_kept(ft, core.unwrap(), arg, name, param_name(ft.cx, name, j), item.how)
 
                     if loc == "" || (loc.index_of("?").is_some() && !loc.starts_with("j?"))
                         ft.faults.items.push((ft.scope, arg.span, said))
@@ -2380,9 +2458,14 @@ private call_at(ft: &FrameTrack, evs: &EvBuf, e: TExpr)
                     // An async method's task holds it until that task is awaited.
                     val cure = if item.1.loc == "j" then s" — await that task on every way out of '${ft.owner}', " +
                         s"or hand it storage that lasts" else ""
-                    val said = s"'${shown_name(ft.cx.an, item.0)}' keeps its parameter " +
+                    var said = s"'${shown_name(ft.cx.an, item.0)}' keeps its parameter " +
                         s"'${param_name(ft.cx, item.0, j + 1)}' (${item.1.how}), and " +
                         argument_said(ft, arg, core.unwrap()) + cure
+
+                    if ft.probe
+                        said = probe_kept(ft, core.unwrap(), arg, item.0, param_name(ft.cx, item.0, j + 1),
+                                          item.1.how)
+                    end if
 
                     if loc == "" || loc.index_of("?").is_some()
                         ft.faults.items.push((ft.scope, arg.span, said))
@@ -2405,9 +2488,13 @@ private call_at(ft: &FrameTrack, evs: &EvBuf, e: TExpr)
 
                     if loc.starts_with("l:") then continue
 
-                    val said = s"a call through '${type_show(texpr_type(callee))}' may reach " +
+                    var said = s"a call through '${type_show(texpr_type(callee))}' may reach " +
                         s"'${shown_name(ft.cx.an, item.0)}', which keeps its parameter " +
                         s"'${param_name(ft.cx, item.0, j)}' (${item.1.how}), and " + argument_said(ft, arg, core.unwrap())
+
+                    if ft.probe
+                        said = probe_kept(ft, core.unwrap(), arg, item.0, param_name(ft.cx, item.0, j), item.1.how)
+                    end if
 
                     if loc == "" || loc.index_of("?").is_some()
                         ft.faults.items.push((ft.scope, arg.span, said))
@@ -2423,7 +2510,9 @@ end call_at
 // domain or as a child whose captures were settled where it was written -- and one a thread the call
 // starts holds. A task the call answers is not one: it is driven in this domain, and an `await` of it
 // takes it back.
-private probe_held_apart(ft: &FrameTrack, call: TExpr, name: string, j: usize) -> bool
+//
+// The answer is the reason, in words that follow the call's: `whose parameter 'f' is '@scoped'`.
+private probe_held_apart(ft: &FrameTrack, call: TExpr, name: string, j: usize) -> Option[string]
     val found = ft.cx.find(name)
 
     if found.is_some()
@@ -2432,17 +2521,25 @@ private probe_held_apart(ft: &FrameTrack, call: TExpr, name: string, j: usize) -
         if j < f.params.len()
             val p = f.params.at(j).0
 
-            if scoped_at(f, j) || holds_string(f.marks.copies, p) || holds_string(f.marks.joined, p) then return true
+            if scoped_at(f, j) then return Some(s"whose parameter '$p' is '@scoped'")
+            if holds_string(f.marks.copies, p) then return Some(s"whose parameter '$p' is '@crossing'")
+            if holds_string(f.marks.joined, p) then return Some(s"whose parameter '$p' is '@joined'")
         end if
     end if
 
-    if task_result(texpr_type(call)).is_some() then return false
+    if task_result(texpr_type(call)).is_some() then return None
 
     for item in keeps_of(ft.cx, name, j).locs
-        if item.loc == "j" then return true
+        if item.loc == "j" then return Some("which runs it on a thread of its own")
 
-    false
+    None
 end probe_held_apart
+
+// A closure handed to a parameter its callee keeps, as a probe gathers it.
+private probe_kept(ft: &FrameTrack, core: string, arg: TExpr, callee: string, param: string,
+                   how: string) -> string =
+    probe_why(core, s"it is handed to '${shown_name(ft.cx.an, callee)}' ${probe_line(ft.scope, arg.span)}, " +
+              s"which keeps its parameter '$param' ($how)")
 
 // What a conversion to `&sync` makes of a closure: one held by value, as every closure that crosses
 // a domain is.
@@ -2455,7 +2552,10 @@ private probe_synced(ft: &FrameTrack, at: Span, v: TExpr, ty: Type)
 
     val core = frame_core(ft, v)
 
-    if core.is_some() then ft.faults.items.push((ft.scope, at, core.unwrap()))
+    if core.is_none() then return
+
+    ft.faults.items.push((ft.scope, at, probe_why(core.unwrap(),
+        s"it becomes a '${type_show(ty)}' ${probe_line(ft.scope, at)}, which another thread may run")))
 end probe_synced
 
 // **An address as an integer handed to a callee** is refused only where the callee may put it in
@@ -2469,6 +2569,13 @@ private image_passed(ft: &FrameTrack, call: TExpr, name: string, j: usize, arg: 
     val cast = cast_reach_arg(ft.cx, ft.func, call, name, j)
 
     if cast.is_none() then return
+
+    if ft.probe
+        ft.faults.items.push((ft.scope, arg.span, probe_why(core.unwrap(),
+            s"it is handed as an integer to '${shown_name(ft.cx.an, name)}' ${probe_line(ft.scope, arg.span)}, " +
+            s"which may store it where it outlives the call")))
+        return
+    end if
 
     ft.faults.items.push((ft.scope, arg.span,
         s"'${shown_name(ft.cx.an, name)}' may store its parameter '${param_name(ft.cx, name, j)}' where it " +

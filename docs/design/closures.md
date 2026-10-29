@@ -169,7 +169,8 @@ its frame, a nested function may not"*); by value, a copy. A capture is then rea
 - **`val g = () -> n += 1`** becomes legal when `g` is by reference: a call writes through the
   closure's pointer, not into the closure, so `Fn::call` no longer needs the binding to be mutable. The
   refusal *'call' takes '\*self' … write 'var bump'* stays for a writing closure that is by value.
-  (Implementation: such a closure's `call` takes `self` by value, or the `val` check asks the mode.)
+  (Implementation: the `val` check asks the mode — the refusal is owed at the call and said once the
+  mode is known, naming what keeps the closure.)
 - **Stored where it outlives the captured variables' block** — returned, put in a `static`, a field
   through a pointer, a buffer, a local of an outer block (p26): by value, and today's lost-write rule
   applies to it, with the reason named.

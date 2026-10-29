@@ -171,15 +171,52 @@ sce_no_walk_for_the_closure()
     assert(ir.index_of("@arc.drop.$closure1borrows").is_none(), ir)
 
 // The disagreement half: the lender's own closure captures the same view without being a scoped
-// child, and keeps its owner and the count traffic that goes with it.
-@test("a view captured by a closure that is not a scoped child is still counted")
-sce_unscoped_view_counted()
+// child. It does not escape `scope`, so it captures by reference — it holds the address of the
+// view's slot, takes no count, and has no copy walk.
+@test("a view captured by a closure that is not a scoped child and does not escape takes no count")
+sce_unscoped_view_by_reference()
     if xvr_no_library() then return
 
     val ir = xvr_ir([("main.sysl", sce_reader())])
+
+    assert(ir.index_of("%struct.$closure0 = type { ptr }").is_some(), ir)
+    assert(ir.index_of("@arc.copy.$closure0").is_none(), ir)
+    assert(sce_define(ir, "@$closure0.call(").index_of("retain_maybe").is_none(), ir)
+
+// The same view captured by a closure that ESCAPES the function holding the view is captured by
+// value: the closure holds the view itself, and copying the closure takes a share of its owner.
+private sce_escaping_view() -> string = sce_scope("@scoped(f)") + raw"""
+    later(v: []int) -> &Fn() -> int
+        val g = () -> v[0] + v[1] + int(v.len)
+
+        print(v[2])
+        g
+
+    var b: Buf[int] = buf()
+
+    b.push(3)
+    b.push(4)
+    b.push(5)
+
+    val f = later(b.view())
+
+    b = buf()
+    print(f())
+    """
+
+@test("a view captured by an escaping closure that is not a scoped child is still counted")
+sce_escaping_view_counted()
+    if xvr_no_library() then return
+
+    val ir = xvr_ir([("main.sysl", sce_escaping_view())])
     val copy = sce_define(ir, "@arc.copy.$closure0(")
 
+    assert(ir.index_of("%struct.$closure0 = type { { ptr, ptr, i64 } }").is_some(), ir)
     assert(copy.index_of("call void @arc.retain_maybe").is_some(), copy)
+
+@test("an escaping closure's view outlives the buffer's name being given a new buffer")
+sce_escaping_view_runs()
+    sce_prints(sce_escaping_view(), "5\n10\n")
 
 // -- what runs ------------------------------------------------------------------------------------
 

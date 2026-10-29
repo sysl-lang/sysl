@@ -78,8 +78,11 @@ end crm_refused
 private const crm_call: string = "call(f: &Fn() -> unit) = f()\n\n"
 
 private crm_lost(name: string, form: string, shown: string, why: string) -> string =
-    s"a closure captures by value, so it holds a copy of '$name' — so $form would reach that copy " +
+    s", so it holds a copy of '$name' — so $form would reach that copy " +
     s"rather than the variable it came from, $why"
+
+// The reason a refusal gives for the closure holding its captures by value.
+private crm_since(why: string) -> string = s"this closure captures by value, since $why, so it holds a copy"
 
 private crm_unread(name: string, form: string, shown: string) -> string =
     crm_lost(name, form, shown, "and nothing in the closure reads it back")
@@ -372,7 +375,9 @@ crm_stored_is_refused()
 
             install(() -> hit = true)
             print(hit)
-        """, [crm_unread("hit", "assignment", "bool")])
+        """, [crm_unread("hit", "assignment", "bool"),
+              "this closure captures by value, since it is handed to 'install' on line 8, which keeps " +
+              "its parameter 'f'"])
 
 // Module storage still holds the box at exit, so only the output is asserted.
 @test("a counter stored in module storage keeps its own copy")
@@ -443,7 +448,9 @@ crm_pushed_is_refused()
             hold(&fs, () -> hit = true)
             fs[0]()
             print(hit)
-        """, [crm_unread("hit", "assignment", "bool")])
+        """, [crm_unread("hit", "assignment", "bool"),
+              "this closure captures by value, since it is handed to 'hold' on line 9, which keeps its " +
+              "parameter 'f' (it is passed to 'push', which keeps it)"])
 
 @test("a closure kept in a local of an enclosing block holds the inner variable by value")
 crm_outer_block()
@@ -473,7 +480,8 @@ crm_outer_block_refused()
                 g = () -> hit = true
                 g()
                 print(hit)
-        """, [crm_unread("hit", "assignment", "bool")])
+        """, [crm_unread("hit", "assignment", "bool"),
+              crm_since("it is kept in 'g' on line 7, which outlives the block declaring 'hit'")])
 
 @test("a writing closure built in an 'async' body is refused")
 crm_async_body_refused()
@@ -486,7 +494,9 @@ crm_async_body_refused()
 
         main()
             print(block_on(run()))
-        """, [crm_unread("hit", "assignment", "bool")])
+        """, [crm_unread("hit", "assignment", "bool"),
+              crm_since("it is built in the 'async' body of 'run', whose variables live in its frame " +
+                        "only between suspensions")])
 
 @test("a write to a 'val' capture reaches a copy even in a closure holding a 'var' by reference")
 crm_val_write_refused()

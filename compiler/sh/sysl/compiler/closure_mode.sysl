@@ -34,10 +34,14 @@ import sysl.container.{Map, map, Set, set}
 // A closure built in an `async` body holds its captures by value: the body's locals live in its
 // frame only between suspensions. One built in a module value's initializer does too, since nothing
 // follows that frame.
+//
+// **What keeps a closure is remembered with it**, the first reason found, in words that follow
+// "since" -- `it is returned from 'make' on line 4` -- so the refusal of a write that reaches only its
+// copy says why it holds one.
 decide_closure_modes(cx: &KeepsCx, funcs: Buf[TFunc], vals: Buf[TVal])
     val a = cx.an
     var built: Buf[string] = buf()
-    var escaped: Set[string] = set()
+    var escaped: Map[string, string] = map()
 
     for f in funcs
         val here = closures_built_in(walk_body_of(f))
@@ -55,16 +59,17 @@ decide_closure_modes(cx: &KeepsCx, funcs: Buf[TFunc], vals: Buf[TVal])
 
         if f.marks.is_async()
             for base in here
-                escaped.add(base)
+                escape(escaped, base, s"it is built in the 'async' body of '${shown_name(a, f.name)}', " +
+                       "whose variables live in its frame only between suspensions")
 
             continue
         end if
 
-        for base in probe_frame(cx, f)
-            escaped.add(base)
+        for item in probe_frame(cx, f)
+            escape(escaped, item.0, item.1)
 
-        for base in probe_blocks(cx, f)
-            escaped.add(base)
+        for item in probe_blocks(cx, f)
+            escape(escaped, item.0, item.1)
     end for
 
     for v in vals
@@ -73,15 +78,20 @@ decide_closure_modes(cx: &KeepsCx, funcs: Buf[TFunc], vals: Buf[TVal])
         for base in closures_built_in(v.init.unwrap())
             if !holds_string(built, base) then built.push(base)
 
-            escaped.add(base)
+            escape(escaped, base, s"it is built in the initializer of '${shown_name(a, v.symbol)}', " +
+                   "whose frame nothing follows")
         end for
     end for
 
     for base in built
         if is_probe_candidate(a, base) && !escaped.has(base) then a.by_ref_closures.add(base)
 
-    say_lost_writes(a, built)
+    say_lost_writes(a, built, escaped)
 end decide_closure_modes
+
+// A closure found to escape, with the first reason found.
+private escape(escaped: Map[string, string], base: string, why: string) =
+    if !escaped.has(base) then escaped.put(base, why)
 
 // A body as one expression, for a walk that takes one.
 private walk_body_of(f: TFunc) -> TExpr = TExpr(f.span, TBlockExpr(f.body))
@@ -100,26 +110,51 @@ end closures_built_in
 
 // **A lost write is said where the closure holds that capture by value** -- and only for a closure the
 // program builds: one a reading lowered and then threw away is no closure of the program's, and the
-// reading the program got owes its own. Two readings of one closure owe one write twice; it is said
-// once.
-private say_lost_writes(a: &Analysis, built: Buf[string])
+// reading the program got owes its own. Two readings of one closure owe one write twice, and a call
+// of a closure held in a `val` owes one for each capture it writes; each is said once.
+//
+// **The reason is named where one was found**: a scoped child that borrows views is held by value
+// whatever becomes of it, and any other closure no probe decides -- one with no capture it could hold
+// by reference -- is held by value for no reason but that.
+private say_lost_writes(a: &Analysis, built: Buf[string], escaped: Map[string, string])
     var said: Buf[(Span, string)] = buf()
 
     for item in a.lost_writes
-        if !holds_string(built, item.3) then continue
-        if holds_by_reference(a, item.3, item.4) then continue
+        if !holds_string(built, item.base) then continue
+        if holds_by_reference(a, item.base, item.capture) then continue
 
         var again = false
 
         for s in said
-            if s.0 == item.1 && s.1 == item.2 then again = true
+            if s.0 == item.at && s.1 == item.head then again = true
 
         if again then continue
 
-        said.push((item.1, item.2))
-        a.fault(item.0, item.1, item.2)
+        said.push((item.at, item.head))
+
+        val why = escaped.get(item.base) match
+            Some(w) -> item.lead + w
+            None -> if item.base.ends_with(borrowing_closure_suffix()) then item.lead + scoped_child else ""
+
+        a.fault(item.scope, item.at, item.head + why + item.tail)
     end for
 end say_lost_writes
+
+private const scoped_child: string =
+    "it is a child written at a '@scoped' parameter, which settles its captures there"
+
+// A refusal owed until the closure's mode is known (`Analysis.lost_writes`): where it is said, and
+// its words around the reason the closure holds its captures by value -- `head`, then `lead` and
+// the reason where one is known, then `tail`.
+struct OwedWrite
+    scope: Scope
+    at: Span
+    head: string
+    lead: string
+    tail: string
+    base: string
+    capture: usize
+end OwedWrite
 
 // Whether a closure holds its capture at `i` by reference.
 holds_by_reference(a: &Analysis, base: string, i: usize) -> bool
@@ -149,6 +184,7 @@ apply_closure_modes(a: &Analysis, funcs: Buf[TFunc], vals: Buf[TVal])
     if a.by_ref_closures.is_empty() then return
 
     var turned: Map[string, &Turned] = map()
+    var seen: Set[usize] = set()
 
     for i in 0..<a.tables.struct_insts.len()
         val base = a.tables.struct_insts.key_at(i)
@@ -156,9 +192,17 @@ apply_closure_modes(a: &Analysis, funcs: Buf[TFunc], vals: Buf[TVal])
         if !a.by_ref_closures.has(base) then continue
 
         a.tables.struct_insts.at(i) match
-            Struct(st) -> turned.put(base, turn_fields(a, st))
+            Struct(st) ->
+                turned.put(base, turn_fields(a, st))
+                seen.add(record_address(st))
             _ -> ()
     end for
+
+    for i in 0..<a.tables.struct_insts.len()
+        turn_stale(a, seen, a.tables.struct_insts.at(i))
+
+    for i in 0..<a.tables.enum_insts.len()
+        turn_stale(a, seen, a.tables.enum_insts.at(i))
 
     for f in funcs
         turn_body(a, turned, f)
@@ -184,6 +228,47 @@ private turn_fields(a: &Analysis, st: &StructType) -> &Turned
 
     t
 end turn_fields
+
+private record_address(st: &StructType) -> usize
+    val p: *StructType = &*st
+
+    usize(p)
+end record_address
+
+// **A closure literal a trial typed has a record of its own**, under the same name as the one the
+// reading kept: the trial is thrown away, but an instantiation it made around the closure's type --
+// `Option[$closure0]` for `Some(() -> …)` handed to a call -- outlives it and still holds that record,
+// which a layout measures. Every such record reached from an instantiation is turned too, so the
+// payload holds the addresses the struct now does.
+private turn_stale(a: &Analysis, seen: Set[usize], t: Type)
+    t match
+        Struct(st) ->
+            val at = record_address(st)
+
+            if seen.has(at) then return
+
+            seen.add(at)
+
+            if a.by_ref_closures.has(st.base) then turn_fields(a, st)
+
+            for item in st.fields
+                turn_stale(a, seen, item.1)
+        Results(st) -> turn_stale(a, seen, Struct(st))
+        Enum(e) ->
+            val p: *EnumType = &*e
+            val at = usize(p)
+
+            if seen.has(at) then return
+
+            seen.add(at)
+
+            for v in e.variants
+                for item in v.fields
+                    turn_stale(a, seen, item.1)
+        Array(_, elem) -> turn_stale(a, seen, *elem)
+        Vector(_, elem) -> turn_stale(a, seen, *elem)
+        _ -> ()
+end turn_stale
 
 private turn_body(a: &Analysis, turned: Map[string, &Turned], f: TFunc)
     turn_constructions(a, turned, walk_body_of(f))
