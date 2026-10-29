@@ -347,6 +347,7 @@ gen_borrowed_into(e: *Emit, dest: Val, x: TExpr)
                             idx.push(ir_arg(l_i32(), VInt(from_int(long(struct_field_index(e.layout, decl,
                                                                                             decl.slot(i)))))))
                             emit(e, InGep(p, struct_lty(decl), dest, idx))
+                            inherit_zeroed(e, dest, p)
 
                             val ft = decl.fields.at(i).1
                             val bits = reversed_width(decl, ft, e.target.little_endian())
@@ -369,6 +370,9 @@ gen_borrowed_into(e: *Emit, dest: Val, x: TExpr)
                 return
             end if
 
+            // Zeros over zeroed storage are already there, and literals have nothing to run.
+            if is_zeroed(e, dest) && zero_bit_expr(x) then return
+
             if is_constant_table(elems)
                 emit_memcpy(e, dest, constant_table(e, x, array_ty), int(e.layout.size(array_ty)),
                             int(e.layout.claim(array_ty)))
@@ -383,6 +387,7 @@ gen_borrowed_into(e: *Emit, dest: Val, x: TExpr)
 
                 idx.push(ir_arg(word_lty(e), VInt(from_int(long(i)))))
                 emit(e, InGep(p, lty(e, elem), dest, idx))
+                inherit_zeroed(e, dest, p)
                 part_into(e, p, elems.at(i), written)
 
         // The tag, and then the variant's own fields written into the region every variant shares.
@@ -416,11 +421,12 @@ gen_borrowed_into(e: *Emit, dest: Val, x: TExpr)
 
         // The value is generated once, above the loop, exactly as the value form does -- every
         // element is a copy of that one evaluation. It is generated even where there are no
-        // elements, because one evaluation is what the form promises.
+        // elements, because one evaluation is what the form promises. A fill of zero bits into storage
+        // that is zeroed already writes nothing (`gen_box`).
         TArrayFill(value, array_ty) ->
-            val v = gen_expr(e, value)
+            val v = fill_value(e, value)
 
-            fill_at(e, dest, array_ty, v)
+            if !(is_zeroed(e, dest) && is_zero_const(v)) then fill_at(e, dest, array_ty, v)
 
         // A copy from one place to another is a copy of bytes. Reading the value out first would
         // make a first-class aggregate of it for the length of one instruction, which is the cost.
@@ -453,7 +459,7 @@ end part_into
 private store_through_value(e: *Emit, dest: Val, x: TExpr, ty: Type)
     val v = gen_expr(e, x)
 
-    emit(e, InStore(lty(e, ty), v, dest, AccPlain, None))
+    if !(is_zeroed(e, dest) && is_zero_const(v)) then emit(e, InStore(lty(e, ty), v, dest, AccPlain, None))
 
 // `x` built where a value of it is wanted, for a caller that asked for a register rather than
 // offering somewhere to put one. The load is the very thing the destination forms avoid, so this is

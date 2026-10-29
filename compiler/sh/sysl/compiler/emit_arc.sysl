@@ -696,8 +696,29 @@ end each_element_release
 
 // Puts one value in every one of `n` slots, taking a share for each -- the elements belong to the
 // buffer, and it is the hook that eventually lets them go.
+//
+// A value whose bytes are all one byte is laid with one `memset` over `n` strides (`fill_array`). Zero
+// bits take no share of anything -- a null holds nothing -- so a zero fill does so whatever the
+// element holds; any other byte is claimed only for an element that holds nothing counted.
 fill_elements(e: *Emit, elem: Type, data: Val, n: Val, v: Val)
     if zero_sized(elem) then return
+
+    val b = fill_byte(e, elem, v).unwrap_or(-1)
+
+    if b == 0 || (b > 0 && !contains_counted(elem))
+        val past = fresh_reg(e)
+
+        var idx: Buf[IrArg] = buf()
+
+        idx.push(ir_arg(word_lty(e), n))
+        emit(e, InGep(past, lty(e, elem), VNull, idx))
+
+        val bytes = fresh_reg(e)
+
+        emit(e, InCast(bytes, CastPtrToInt, LPtr, past, word_lty(e)))
+        emit_memset(e, data, b, bytes, int(e.layout.align(elem)))
+        return
+    end if
 
     val ep = each_element_begin(e, elem, data, n)
 
@@ -1299,6 +1320,16 @@ private var heap_alloc: string = "malloc"
 private var heap_free: string = "free"
 
 malloc_symbol() -> string = heap_alloc
+
+// The call that answers zeroed storage from the same heap, where the pair has one: libc's `calloc`
+// beside libc's pair, and the counting runtime's twin of it beside that runtime's. A pair a package
+// named has no zeroing half anyone promised, so a zeroed block from it is taken and then cleared.
+calloc_symbol() -> Option[string]
+    if heap_alloc == counted_allocator().0 then return Some(counted_calloc_symbol())
+    if heap_alloc == "malloc" && heap_free == "free" then return Some("calloc")
+
+    None
+end calloc_symbol
 
 free_symbol() -> string = heap_free
 

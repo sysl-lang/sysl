@@ -24,19 +24,127 @@ gen_box(e: *Emit, value: TExpr, ref_ty: Type) -> Val
     // the one destination that cannot be handed over before the expression runs.
     val large = e.layout.indirect(inner)
     val v = if large then VNothing else gen_expr(e, value)
-    val opened = open_box(e, inner)
+    val zeroed = large && lays_bytes(e) && worth_zeroing(e, value, inner)
+    val opened = open_box_zeroed(e, inner, zeroed)
     val slot = opened.1
 
     // **A payload that occupies nothing is not stored at all** -- a closure that captures nothing, an
     // empty struct. Its slot is one past the header, which is one past the end of the allocation, and
     // a zero-byte store there is one AddressSanitizer reports at `-O0`.
-    if large then gen_into(e, slot, value)
+    //
+    // A payload written into zeroed storage writes none of its zeros: the slot is marked for as long
+    // as the payload is being written, and only for that long, since the same register name means
+    // nothing once this body moves on.
+    if large
+        val mark = e.zeroed.len()
+
+        if zeroed
+            slot match
+                VReg(n) -> e.zeroed.push(n)
+                _ -> ()
+
+        gen_into(e, slot, value)
+        e.zeroed.truncate(mark)
     else if e.layout.size(inner) > 0
         retain_moving(e, value, inner, v, false)
         emit(e, InStore(lty(e, inner), v, slot, AccPlain, None))
 
     own_temp(e, opened.0, ref_ty)
 end gen_box
+
+// **Whether a box is worth taking zeroed**: where its payload's zeros fill at least a page, or are the
+// whole of it. A zeroing call costs a small block what writing its zeros would have, so below a page
+// only a payload with nothing else in it is taken that way; at a page and over, the block's zeros are
+// pages the system has not yet handed over, and writing them is what hands them over.
+private worth_zeroing(e: *Emit, value: TExpr, inner: Type) -> bool
+    val zeros = zero_bytes(e, value)
+
+    zeros > 0 && (zeros >= 4096 || zeros >= e.layout.size(inner))
+end worth_zeroing
+
+// How many of the bytes a value built in place writes are zeros the building leaves alone when its
+// storage is zeroed already: the parts `gen_borrowed_into` walks into, down to the ones that are zero
+// bits whole.
+private zero_bytes(e: *Emit, x: TExpr) -> usize
+    if zero_bit_expr(x) then return e.layout.size(texpr_type(x))
+
+    *x.kind match
+        TStructNew(decl, args) if plain_layout(decl) ->
+            var n: usize = 0
+
+            for a in args
+                n += zero_bytes(e, a)
+
+            n
+        TArrayLit(elems, _) ->
+            var n: usize = 0
+
+            for a in elems
+                n += zero_bytes(e, a)
+
+            n
+        _ -> 0
+end zero_bytes
+
+// A struct whose fields each have storage of their own, written one by one: not a union, and with no
+// bits packed into a shared container.
+private plain_layout(decl: &StructType) -> bool =
+    !decl.union_layout && decl.c_bits.is_empty() && bitfield_ranges_of(Struct(decl)).is_none()
+
+// Whether a value is zero bits whole, read off the tree before anything is generated: a zero of any
+// scalar -- `+0.0` and not `-0.0`, whose sign bit is set -- `null`, `false`, a type's zero value, and
+// fills, arrays and plain structs of nothing else.
+zero_bit_expr(x: TExpr) -> bool = *x.kind match
+    TIntLit(v, ty) ->
+        underlying(ty) match
+            Integer(_, _, _) -> v == from_int(0)
+            _ -> false
+    TBoolLit(b) -> !b
+    TFloatLit(bits, _) -> bits == 0
+    TNullLit(_) -> true
+    TZero(_) -> true
+    TArrayFill(v, _) -> zero_bit_expr(v)
+    TArrayLit(elems, _) ->
+        for item in elems
+            if !zero_bit_expr(item) then return false
+
+        true
+    TStructNew(decl, args) ->
+        if !plain_layout(decl) then return false
+
+        for item in args
+            if !zero_bit_expr(item) then return false
+
+        true
+    _ -> false
+
+// A fill's value, generated once as the form promises, and answered as `zeroinitializer` where the
+// tree says it is zero bits whole -- which a value that reached its type through an instruction (an
+// `f32` literal is a `double` truncated) does not say of itself.
+fill_value(e: *Emit, value: TExpr) -> Val
+    val v = gen_expr(e, value)
+
+    // Only where the fill is laid as bytes: an element-by-element store needs the value in its own
+    // type, which `zeroinitializer` is not for a scalar.
+    if lays_bytes(e) && zero_bit_expr(value) then VZero else v
+end fill_value
+
+// Whether the storage `dest` addresses is known to be zero bytes (`Emit.zeroed`).
+is_zeroed(e: *Emit, dest: Val) -> bool = dest match
+    VReg(n) ->
+        for item in e.zeroed
+            if item == n then return true
+
+        false
+    _ -> false
+
+// Marks `p` -- a field or an element of `dest` -- as zeroed where `dest` is.
+inherit_zeroed(e: *Emit, dest: Val, p: Val)
+    if !is_zeroed(e, dest) then return
+
+    p match
+        VReg(n) -> e.zeroed.push(n)
+        _ -> ()
 
 // Whether a box is one the analysis laid in the frame: around a closure literal nothing reaches
 // after the frame, or after the turn of a loop that builds it (`closure_mode.sysl`'s `framed_box`).
@@ -86,9 +194,13 @@ end gen_frame_box
 // payload goes at. `gen_box` fills it from an expression; a `match` arm moving a large payload out of
 // its scrutinee fills it straight from that storage (`payload_move`). Whoever fills it owns the box
 // with `own_temp`.
-open_box(e: *Emit, inner: Type) -> (Val, Val)
+open_box(e: *Emit, inner: Type) -> (Val, Val) = open_box_zeroed(e, inner, false)
+
+// The same, over storage that is all zero bytes before the header is written where `zeroed` asks
+// (`heap_call`).
+private open_box_zeroed(e: *Emit, inner: Type, zeroed: bool) -> (Val, Val)
     val bn = box_lty(e, inner)
-    val p = allocate_box(e, bn, inner)
+    val p = allocate_box(e, bn, inner, zeroed)
 
     emit(e, InStore(word_lty(e), VInt(from_int(1)), p, AccPlain, None))
     store_header_word(e, bn, p, 1, LPtr, drop_fn(e, inner))
@@ -105,11 +217,11 @@ open_box(e: *Emit, inner: Type) -> (Val, Val)
     idx.push(ir_arg(l_i32(), VInt(from_int(long(box_payload_field(e, inner))))))
     emit(e, InGep(slot, bn, p, idx))
     (p, slot)
-end open_box
+end open_box_zeroed
 
 // The bytes one box occupies, asked of LLVM rather than computed here: a `getelementptr` one past
 // null, read back as an integer, is the size of what was stepped over.
-private allocate_box(e: *Emit, bn: LType, inner: Type) -> Val
+private allocate_box(e: *Emit, bn: LType, inner: Type, zeroed: bool) -> Val
     val end = fresh_reg(e)
 
     var idx: Buf[IrArg] = buf()
@@ -121,11 +233,12 @@ private allocate_box(e: *Emit, bn: LType, inner: Type) -> Val
 
     emit(e, InCast(size, CastPtrToInt, LPtr, end, word_lty(e)))
 
-    val p = heap_call(e, size, inner, "a box")
+    val p = heap_call(e, size, inner, "a box", zeroed)
     val got = fresh_reg(e)
 
     emit(e, InIntCmp(got, INe, LPtr, p, VNull))
     trap_unless(e, got, "alloc")
+    clear_unless_zeroed(e, p, size, inner, zeroed)
     p
 end allocate_box
 
@@ -136,10 +249,27 @@ end allocate_box
 //
 // `what` is how the refusal names the storage, where there is no aligned hook to call
 // (`unaligned_heap`).
-private heap_call(e: *Emit, size: Val, t: Type, what: string) -> Val
+//
+// **`zeroed` asks for storage that is all zero bytes**, which is the heap's zeroing call where it has
+// one (`calloc_symbol`): a large block comes from pages the system has not yet handed over, and a fill
+// of zeros written into them would hand every one of them over. Beside a pair a package named, which
+// promises no zeroing half, the block is taken as usual and cleared with one `memset`. Only a target
+// with a C library under it asks (`lays_bytes`): a bare machine's `malloc` may be the program's own,
+// with neither `calloc` nor `memset` beside it.
+private heap_call(e: *Emit, size: Val, t: Type, what: string, zeroed: bool) -> Val
     val p = fresh_reg(e)
 
     var args: Buf[IrArg] = buf()
+
+    val zeroing = if zeroed then zeroing_call(e, t) else None
+
+    if zeroing.is_some()
+        e.uses_calloc = true
+        args.push(ir_arg(word_lty(e), VInt(from_int(1))))
+        args.push(ir_arg(word_lty(e), size))
+        emit(e, ir_call(Some(p), LPtr, VGlobal(zeroing.unwrap()), args))
+        return p
+    end if
 
     args.push(ir_arg(word_lty(e), size))
 
@@ -155,6 +285,16 @@ private heap_call(e: *Emit, size: Val, t: Type, what: string) -> Val
 
     p
 end heap_call
+
+// The zeroing call a block for `t` is taken with, where there is one to take it with: not for storage
+// the aligned hook makes, and not on a machine with no C library promised under it.
+private zeroing_call(e: *Emit, t: Type) -> Option[string] =
+    if e.layout.beyond_heap(t) || !os_hosted(e.target.os) then None else calloc_symbol()
+
+// What a block asked for zeroed still needs once the heap answered it and the answer was checked: one
+// `memset` where it was not taken with the zeroing call.
+private clear_unless_zeroed(e: *Emit, p: Val, size: Val, t: Type, zeroed: bool)
+    if zeroed && zeroing_call(e, t).is_none() then emit_memset(e, p, 0, size, int(e.layout.align(t)))
 
 // Records the first storage this module took from the aligned hook: what the refusal says about it,
 // the function that made it, and the boundary.
@@ -185,7 +325,11 @@ ref_inner(t: Type) -> Type = underlying(t) match
 // The size is computed with the checked forms: a count the program worked out can be anything, and
 // a multiplication that wrapped would ask for a block far smaller than the elements written into
 // it.
-gen_buffer(e: *Emit, elem: Type, n: Val) -> (Val, Val)
+gen_buffer(e: *Emit, elem: Type, n: Val) -> (Val, Val) = gen_buffer_zeroed(e, elem, n, false)
+
+// The same, with every element's bytes zero before anything is written into them where `zeroed`
+// asks (`heap_call`): a fill of zeros, which then writes nothing.
+gen_buffer_zeroed(e: *Emit, elem: Type, n: Val, zeroed: bool) -> (Val, Val)
     val bn = buf_lty(e, elem)
 
     e.checked = true
@@ -224,11 +368,12 @@ gen_buffer(e: *Emit, elem: Type, n: Val) -> (Val, Val)
     emit(e, InBin(fits, OpXor, l_i1(), over, VBool(true)))
     trap_unless(e, fits, "size")
 
-    val p = heap_call(e, total.0, elem, "a buffer")
+    val p = heap_call(e, total.0, elem, "a buffer", zeroed)
     val got = fresh_reg(e)
 
     emit(e, InIntCmp(got, INe, LPtr, p, VNull))
     trap_unless(e, got, "alloc")
+    clear_unless_zeroed(e, p, total.0, elem, zeroed)
     emit(e, InStore(word_lty(e), VInt(from_int(1)), p, AccPlain, None))
     store_header_word(e, bn, p, 1, LPtr, drop_buf_fn(e, elem))
     store_header_word(e, bn, p, 2, word_lty(e), VInt(from_int(1)))
@@ -242,7 +387,7 @@ gen_buffer(e: *Emit, elem: Type, n: Val) -> (Val, Val)
     didx.push(ir_arg(l_i32(), VInt(from_int(long(buf_elems_field(e, elem))))))
     emit(e, InGep(data, bn, p, didx))
     (p, data)
-end gen_buffer
+end gen_buffer_zeroed
 
 // One step of a size computation, with the overflow flag beside the answer. The intrinsic carries
 // its width in the **name** as well as in the signature, so a size computed at the machine's own

@@ -379,6 +379,17 @@ struct Emit
     // one of those entries.
     zeros: Set[string]
     zero_body: bool
+
+    // Whether anything laid one byte over a block (`emit_memset`), and whether anything took zeroed
+    // storage from the heap's zeroing call (`emit_box.sysl`'s `heap_call`): each is what its
+    // declaration is written for.
+    uses_memset: bool
+    uses_calloc: bool
+
+    // The registers addressing storage known to hold nothing but zero bytes -- a box the heap handed
+    // over zeroed, and every field and element of it -- while its payload is being written. A zero
+    // written there is already there, so it is not written (`emit_box.sysl`'s `gen_box`).
+    zeroed: Buf[string]
 end Emit
 
 // What a runtime helper is built from. A helper is asked for by name while a body is being written
@@ -556,7 +567,7 @@ emitter_for(t: Target, destructors: Buf[(string, string)]) -> Emit
          set(), set(), set(), set(), map(), map(), false, None, set(), buf(), None, None, false,
          None, false, buf(), map(), map(), map(), set(), buf(), set(), set(), set(), false, untouched_none(), set(),
          no_wrap_none(), map(), buf(), Leaving, false, "", set(), buf(), map(), map(), 0, moves_none(), set(), set(), set(), set(),
-         set(), map(), 0, map(), set(), map(), false, set(), map(), set(), false)
+         set(), map(), 0, map(), set(), map(), false, set(), map(), set(), false, false, false, buf())
 end emitter_for
 
 // -- what a body could not say --------------------------------------------------------------------
@@ -765,6 +776,66 @@ memcpy_inst(e: *Emit, dst: Val, src: Val, bytes: int, align: int) -> Inst
     args.push(ir_arg(LInt(1), VBool(false)))
     InCall(None, LVoid, VGlobal(memcpy_symbol()), args, no_ir_attrs(), None, no_fast_math(), false)
 end memcpy_inst
+
+// Whether this target has a C library's `memset` and `calloc` under it, which a fill of one byte and
+// a zeroed heap block are lowered to.
+lays_bytes(e: *Emit) -> bool = os_hosted(e.target.os)
+
+// The one overload of `llvm.memset` this compiler emits: the length is the machine's word, since a
+// fill's count is a run-time word as often as it is a constant.
+memset_symbol(e: *Emit) -> string = llvm_memset_entry().at([LPtr, word_lty(e)])
+
+// `bytes` bytes at `dst` set to `byte`, at a boundary `dst` is known to satisfy. One call is what
+// LLVM lowers to the target's own fill, and what a fill of zeros on fresh pages ought to cost.
+emit_memset(e: *Emit, dst: Val, byte: int, bytes: Val, align: int)
+    e.uses_memset = true
+
+    var args: Buf[IrArg] = buf()
+    var dst_attrs: Buf[IrAttr] = buf()
+
+    dst_attrs.push(AttrAlign(align))
+    args.push(IrArg(LPtr, dst, dst_attrs))
+    // The byte is written signed, which is how LLVM reads an `i8` constant back.
+    args.push(ir_arg(LInt(8), VInt(from_int(long(if byte > 127 then byte - 256 else byte)))))
+    args.push(ir_arg(word_lty(e), bytes))
+    args.push(ir_arg(LInt(1), VBool(false)))
+    emit(e, InCall(None, LVoid, VGlobal(memset_symbol(e)), args, no_ir_attrs(), None, no_fast_math(), false))
+end emit_memset
+
+// The byte every byte of `v` is, where it is one value repeated -- which is what lets a fill of it be
+// one `memset`. Zero bits in any shape are byte 0; an integer whose width is a whole number of bytes,
+// with nothing in its slot beyond them, is its own low byte when every other byte matches it. A
+// float other than `+0.0` is not claimed: `-0.0` has its sign bit set, and is not zero bits.
+//
+// **Only where a C library is under the program** (`lays_bytes`): `llvm.memset` past a few bytes is
+// a call to `memset`, and a freestanding image need not have one -- an archive linked into a C `main`
+// with a plain linker has nothing to resolve it. There a fill stays the loop it always was.
+fill_byte(e: *Emit, elem: Type, v: Val) -> Option[int]
+    if !lays_bytes(e) then return None
+    if is_zero_const(v) then return Some(0)
+
+    val n = v match
+        VInt(n) -> n
+        _ -> return None
+
+    val w = lty(e, elem) match
+        LInt(w) -> w
+        _ -> return None
+
+    if w % 8 != 0 || w > 64 || int(e.layout.size(elem)) * 8 != w then return None
+
+    // A `u64` past `i64`'s range does not read back as a `long`; its bytes are not checked here.
+    val x = n.to_long() match
+        Some(x) -> x
+        None -> return None
+
+    val b = x & 255
+
+    for k in 1..<w / 8
+        if (x >> (8 * k)) & 255 != b then return None
+
+    Some(int(b))
+end fill_byte
 
 // Emits a block terminator, marks the block closed, and records wherever it sends control -- which
 // is what makes the labels it names reachable.
