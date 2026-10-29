@@ -227,7 +227,7 @@ note_var_fix(cx: &Analyzer, unique: string, fixing: Type, beside: bool = false)
         return
 end note_var_fix
 
-// The type arithmetic on a `t` computes in: a transparent subtype that checks something is read at
+// The type arithmetic or a comparison on a `t` computes in: a transparent subtype that checks something is read at
 // its base, while a derived one, and one that is only a name, stays itself.
 private computed_in(t: Type) -> Type = t match
     Constrained(d) -> if d.derived || name_only(d) then t else computed_in(d.base)
@@ -343,6 +343,10 @@ private fixes_a_neighbour(cx: &Analyzer, e: Expr, t: TExpr) -> bool =
 // `i + 1 < xs.len`, `sum + b` and `(sum + 1) * b` each fix the binding, as rustc's integer variables
 // are. `own` holds each operand's reading alone, before the pair settles anything. `arithmetic` marks
 // the second reading, under which a literal the type does not hold is fixed there to be refused.
+//
+// **A comparison fixes at the type it compares in, as arithmetic does**: beside a transparent subtype
+// with a range or predicate that is its base, so `var x = 0; if x < p …` with `p` a `Prob` makes `x`
+// an `int`, and a later `x += 100` does not trap -- whichever of the two uses comes first.
 compare_fixes(cx: &Analyzer, operands: Buf[Expr], own: Buf[Option[TExpr]], arithmetic: bool = false)
     for i in 0..<operands.len()
         val opens = opens_of(cx, operands.at(i))
@@ -356,7 +360,7 @@ compare_fixes(cx: &Analyzer, operands: Buf[Expr], own: Buf[Option[TExpr]], arith
                 Some(t) ->
                     if fixes_a_neighbour(cx, operands.at(j), t)
                         for unique in opens
-                            note_var_fix(cx, unique, texpr_type(t), arithmetic)
+                            note_var_fix(cx, unique, computed_in(texpr_type(t)), arithmetic)
 
                         break
                     end if

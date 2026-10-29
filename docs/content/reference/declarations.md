@@ -219,9 +219,10 @@ while i + 1 < xs.len
 70
 ```
 
-**The type fixed is the one the arithmetic computes in.** Arithmetic on a subtype that checks a
-range or a predicate happens at its base ([errors](/reference/errors/)), so such an operand fixes the
-binding at the base, and a total over a narrow range is free to pass it:
+**The type fixed is the one the arithmetic or the comparison computes in.** Arithmetic on a subtype
+that checks a range or a predicate happens at its base ([errors](/reference/errors/)), and so does a
+comparison with one, so such an operand fixes the binding at the base, and a total over a narrow
+range is free to pass it:
 
 ```sysl
 type Digit = int within 0..9
@@ -237,8 +238,26 @@ print(sum)
 45
 ```
 
-A derived subtype is a type of its own, so it fixes nothing at its base: `sum + d` over a
-`new int within 0..9` is refused for mixing an `int` with it, as it is with `int` written.
+A comparison fixes the binding the same way, whichever use comes first, so `x` here is an `int`
+and passing 9 is no trap; written `var x: Digit = 0`, it would stop the program at the `+=`:
+
+```sysl
+type Digit = int within 0..9
+
+val limit: Digit = 9
+var x = 0
+
+while x <= limit do x += 4
+
+print(x)
+```
+
+```output
+12
+```
+
+A derived subtype is a type of its own, so it fixes nothing at its base: `sum + d` or `sum < d`
+over a `new int within 0..9` is refused for mixing an `int` with it, as it is with `int` written.
 
 **A conversion fixes nothing**: `u8(n)` converts `n` from what it is rather than deciding it.
 **Nor does an index**, nor a slice's bounds: an array, a

@@ -101,3 +101,100 @@ asb_store_into_the_subtype_traps()
     val src = asb_prob() + "var sum = 0\nfor i in Prob::Range do sum += i\nvar p: Prob = 0\np = sum\nprint(p)\n"
 
     assert_eq(enm_exits(src), "")
+
+// A comparison beside such a subtype fixes the binding at the base too, and the type does not
+// depend on which use comes first: a later `x += 100` must not trap.
+
+private asb_compared(cond: string) -> string =
+    asb_prob() + s"val p: Prob = 3\nvar x = 0\nif $cond then print(\"yes\")\nx += 100\nprint(x)\n"
+
+@test("a comparison before the arithmetic fixes the binding at the base")
+asb_compare_first()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(asb_compared("x < p")), "yes\n100\n")
+
+@test("a comparison after the arithmetic fixes the binding at the base")
+asb_compare_after()
+    if !enm_ready() then return
+
+    val src = asb_prob() + "val p: Prob = 3\nvar x = 0\nx += 100\nif x < p then print(\"yes\")\nprint(x)\n"
+
+    assert_eq(enm_ran(src), "100\n")
+
+@test("every comparison operator fixes the binding at the base")
+asb_each_comparison()
+    if !enm_ready() then return
+
+    for op in ["==", "!=", "<", "<=", ">", ">="]
+        val report = asb_type_of(asb_prob() + s"val p: Prob = 3\nvar x = 0\nprint(x $op p)\n", "x")
+
+        assert(asb_is(report, "int"), s"$op: $report")
+
+@test("the subtype on the left of a comparison fixes the binding at the base")
+asb_compare_subtype_on_the_left()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(asb_compared("p > x")), "yes\n100\n")
+    assert_eq(enm_ran(asb_compared("p == x")), "100\n")
+
+@test("a comparison with a predicate subtype fixes the binding at the base")
+asb_compare_predicate()
+    if !enm_ready() then return
+
+    val src = "type Pos = int where value > 0\nval p: Pos = 3\nvar x = 0\nif x < p then x -= 5\nprint(x)\n"
+
+    assert_eq(enm_ran(src), "-5\n")
+
+@test("a comparison with a subtype of a subtype fixes the binding at the innermost base")
+asb_compare_subtype_of_a_subtype()
+    if !enm_ready() then return
+
+    val src = "type Wide = int within 0..<100\ntype Narrow = Wide within 0..<10\n" +
+              "val p: Narrow = 3\nvar x = 0\nif x < p then x += 500\nprint(x)\n"
+
+    assert_eq(enm_ran(src), "500\n")
+
+@test("a comparison with a u8-based subtype fixes the binding at u8")
+asb_compare_narrow_base()
+    if !enm_ready() then return
+
+    val src = "type Small = u8 within 0..<10\nval p: Small = 3\nvar x = 0\nprint(x < p)\n"
+    val report = asb_type_of(src, "x")
+
+    assert(asb_is(report, "byte"), report)
+    assert_eq(enm_ran(src + "x += 200\nprint(x)\n"), "true\n200\n")
+
+@test("a comparison in a match guard fixes the binding at the base")
+asb_compare_in_a_match_guard()
+    if !enm_ready() then return
+
+    val src = asb_prob() + "val p: Prob = 3\nvar x = 0\n" +
+              "val said = p match\n    _ if x < p -> \"below\"\n    _ -> \"not\"\n" +
+              "x += 100\nprint(said)\nprint(x)\n"
+
+    assert_eq(enm_ran(src), "below\n100\n")
+
+@test("a comparison in a while condition fixes the binding at the base")
+asb_compare_in_a_while()
+    if !enm_ready() then return
+
+    val src = asb_prob() + "val p: Prob = 9\nvar x = 0\nwhile x <= p do x += 4\nprint(x)\n"
+
+    assert_eq(enm_ran(src), "12\n")
+
+@test("a binding written as the subtype still traps on leaving its range after a comparison")
+asb_compare_annotated_still_traps()
+    if !enm_ready() then return
+
+    val src = asb_prob() + "val p: Prob = 3\nvar x: Prob = 0\nif x < p then print(\"yes\")\nx += 100\nprint(x)\n"
+
+    assert_eq(enm_exits(src), "")
+
+@test("a derived subtype in a comparison is not read at its base: an open binding beside it is refused")
+asb_compare_derived_refused()
+    if !enm_ready() then return
+
+    val report = enm_err("type Slot = new u8 within 0..<8\nval s = Slot(3u8)\nvar n = 0\nprint(n < s)\n")
+
+    assert(enm_says(report, "error: cannot compare int with Slot"), report)
