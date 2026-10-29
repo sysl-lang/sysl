@@ -1,0 +1,284 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+
+// A `Result` nobody reads is a warning (`reference/errors.md § A dropped Result is a warning`): a call
+// answering one, written as a statement, says so at the call, and the program still builds. Reading the
+// value in any way silences it, and `_ = f()` drops it on purpose. `_ = f()` is the list of one place
+// that discards (`reference/expressions.md § _ discards a part`), so it compiles for every kind of
+// value -- a `Result`, a reference with a `Drop`, `unit`, a generic's answer.
+//
+// The harness is `tests_xvr_extern_var.sysl`'s: `xvr_ran` builds, links and runs a program; the
+// warnings are read off an in-process analysis, as `tests_pan_print_anything.sysl` reads them.
+
+private mus_prelude() -> string = raw"""
+    fallible(ok: bool) -> Result[int, string] = if ok then Ok(1) else Err("no")
+
+    gen_res[T](x: T) -> Result[T, string] = Ok(x)
+
+    pick[T](x: T) -> T = x
+
+    struct Probe
+        n: int
+
+        check(self) -> Result[int, string] = Ok(self.n)
+
+    """
+
+private mus_message() -> string =
+    "is dropped unread, so a failure it carries goes unseen — handle it ('?', 'match', '.unwrap()'), " +
+    "or write '_ = …' to drop it on purpose"
+
+// The warnings the program's own file is given, as `line: message`, in source order. The prelude is
+// counted in, so a line number is the line of the whole text.
+private mus_warnings(text: string) -> Buf[string]
+    var units: Buf[Program] = buf()
+
+    for item in mus_library()
+        units.push(item)
+
+    units.push(parse(source_of("main.sysl", forms_imported(mus_prelude() + text))).program)
+
+    val done = analyze_bodies(units, host_target())
+    var out: Buf[string] = buf()
+
+    assert(errors_of(done.an.diagnostics()).is_empty(), analysis_report(errors_of(done.an.diagnostics())))
+
+    for item in done.an.warnings()
+        if item.src.name == "main.sysl" then
+            out.push(s"${line_of(item.src, item.diag.span.start)}: ${item.diag.message}")
+
+    out
+end mus_warnings
+
+// The line a byte offset stands on, counted from 1.
+private line_of(src: Source, at: usize) -> usize = src.locate(at).line
+
+// The lines warned about, in order, as the offsets from the program's first line after the prelude,
+// each followed by a space.
+private mus_lines(text: string) -> string
+    var out = ""
+
+    for w in mus_warnings(text)
+        out = out + s"${parse_line(w) - mus_first()} "
+
+    out
+
+private parse_line(w: string) -> usize
+    var n: usize = 0
+
+    for b in w.bytes
+        if b == u8(':') then break
+
+        n = n * 10 + usize(b - u8('0'))
+
+    n
+
+private var mus_library_cache: Buf[Program] = buf()
+private var mus_library_read: bool = false
+
+private mus_library() -> Buf[Program]
+    if mus_library_read then return mus_library_cache
+
+    mus_library_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> mus_library_cache = units
+
+    mus_library_cache
+end mus_library
+
+// The first line of the program after the prelude.
+private mus_first() -> usize
+    var n: usize = 1
+
+    for b in mus_prelude().bytes
+        if b == u8('\n') then n += 1
+
+    n
+
+private mus_ran(body: string) -> string = xvr_ran([("main.sysl", mus_prelude() + body)])
+
+@test("a call answering a Result, written as a statement, warns once at the call")
+mus_bare_call()
+    if xvr_no_library() then return
+
+    val got = mus_warnings("fallible(true)\n")
+
+    assert_eq(got.len(), 1)
+    assert_eq(got.at(0), s"${mus_first()}: this 'sysl.Result[int, string]' ${mus_message()}")
+
+@test("a method call, a generic call and a call in a function body each warn")
+mus_shapes()
+    if xvr_no_library() then return
+
+    val text = "Probe(1).check()\ngen_res(3)\nrun()\n    fallible(false)\n\nrun()\n"
+
+    assert_eq(mus_lines(text), "0 1 3 ")
+
+@test("every statement position warns: a loop body, a defer, a branch, a match arm, a unit body's last line")
+mus_positions()
+    if xvr_no_library() then return
+
+    // Each line's offset from the first is on its right.
+    val text = "run(flag: bool)\n" +                         // 0
+               "    defer fallible(false)\n" +               // f + 1
+               "    for i in 0..<2\n" +                      // f + 2
+               "        fallible(i == 0)\n" +                // f + 3
+               "    var k = 0\n" +                           // f + 4
+               "    while k < 1\n" +                         // f + 5
+               "        k += 1\n" +                          // f + 6
+               "        fallible(true)\n" +                  // f + 7
+               "    if flag then fallible(true) else fallible(false)\n" + // f + 8, twice
+               "    k match\n" +                             // f + 9
+               "        1 ->\n" +                            // f + 10
+               "            print(k)\n" +                    // f + 11
+               "            fallible(true)\n" +              // f + 12
+               "        _ -> fallible(false)\n" +            // f + 13
+               "    if flag\n" +                             // f + 14
+               "        fallible(true)\n" +                  // f + 15
+               "        return\n" +                          // f + 16
+               "    fallible(true)\n" +                      // f + 17
+               "\nrun(true)\n"
+
+    assert_eq(mus_lines(text), "1 3 7 8 8 12 13 15 17 ")
+
+@test("a member body, a trait member and a destructor's body warn like any other body")
+mus_member_bodies()
+    if xvr_no_library() then return
+
+    val text = "trait Poke\n    poke(self)\n\n" +                       // f, f + 1, f + 2
+               "struct Held\n    n: int\n\n    own(self)\n        fallible(true)\n\n" + // f + 3 .. f + 8
+               "impl Poke for Held\n    poke(self)\n        fallible(false)\n\n" +   // f + 9 .. f + 12
+               "impl Drop for Held\n    drop(self)\n        fallible(true)\n\n" +    // f + 13 .. f + 16
+               "val h = Held(1)\nh.own()\nh.poke()\n"
+
+    assert_eq(mus_lines(text), "7 11 15 ")
+
+@test("a generic body is told once, at its definition, whatever it is instantiated at")
+mus_generic_once()
+    if xvr_no_library() then return
+
+    val f = mus_first()
+    val text = "inside[T](x: T)\n    gen_res(x)\n\ninside(1)\ninside(\"a\")\ninside(true)\n"
+    val got = mus_warnings(text)
+
+    assert_eq(got.len(), 1)
+    assert_eq(got.at(0), s"${f + 1}: this 'sysl.Result[T, string]' ${mus_message()}")
+
+@test("a generic whose T a caller makes a Result is not told: the body dropped a T")
+mus_generic_t_is_not_a_result()
+    if xvr_no_library() then return
+
+    val text = "twice[T](g: &Fn() -> T)\n    g()\n    g()\n\ntwice(() -> fallible(true))\npick(fallible(true))\n"
+
+    // `pick(...)` as a statement answers the `Result` it was handed, which the call site dropped.
+    assert_eq(mus_lines(text), "5 ")
+
+@test("reading the value in any way, or dropping it with '_ =', says nothing")
+mus_silenced()
+    if xvr_no_library() then return
+
+    val text = "run() -> Result[int, string]\n" +
+               "    fallible(true)?\n" +
+               "    _ = fallible(false)\n" +
+               "    defer _ = fallible(true)\n" +
+               "    val r = fallible(true)\n" +
+               "    r match\n" +
+               "        Ok(v) -> print(v)\n" +
+               "        Err(e) -> print(e)\n" +
+               "    print(fallible(true).is_ok())\n" +
+               "    fallible(true).unwrap()\n" +
+               "    var a = 0\n" +
+               "    a, _ = 3, fallible(true)\n" +
+               "    if a > 0 then _ = fallible(true)\n" +
+               "    for i in 0..<2\n" +
+               "        _ = fallible(i == 0)\n" +
+               "    fallible(false)\n" +
+               "\n_ = run()\n_ = Probe(2).check()\n"
+
+    assert_eq(mus_warnings(text).len(), 0)
+
+@test("what does not answer a Result says nothing: unit, an Option, an integer")
+mus_other_types()
+    if xvr_no_library() then return
+
+    val text = "unit_fn() = ()\nopt() -> Option[int] = Some(1)\nnum() -> int = 1\n\n" +
+               "unit_fn()\nopt()\nnum()\npick(3)\n"
+
+    assert_eq(mus_warnings(text).len(), 0)
+
+@test("'_ = f()' compiles for every kind of value and runs the call for its effects")
+mus_discard_runs()
+    if xvr_no_library() then return
+
+    val text = "struct Thing\n    n: int\n\nimpl Drop for Thing\n    drop(self) = print(s\"drop ${self.n}\")\n\n" +
+               "make(n: int) -> &Thing = Thing(n)\n" +
+               "noisy() -> int\n    print(\"noisy\")\n    7\n\n" +
+               "unit_fn() = print(\"unit\")\n\n" +
+               "_ = fallible(false)\n" +
+               "_ = make(1)\n" +
+               "print(\"after 1\")\n" +
+               "_ = unit_fn()\n" +
+               "_ = pick(noisy())\n" +
+               "_ = pick(make(2))\n" +
+               "_ = gen_res(make(3))\n" +
+               "_ = (noisy(), 2)\n" +
+               "print(\"done\")\n"
+
+    assert_eq(mus_ran(text), "drop 1\nafter 1\nunit\nnoisy\ndrop 2\ndrop 3\nnoisy\ndone\n")
+
+@test("'_ = f()' inside a function, a loop, a branch and a defer runs each call once")
+mus_discard_positions()
+    if xvr_no_library() then return
+
+    val text = "count(n: int) -> Result[int, string]\n    print(s\"count $n\")\n    Ok(n)\n\n" +
+               "run(flag: bool)\n" +
+               "    defer _ = count(9)\n" +
+               "    for i in 0..<2\n" +
+               "        _ = count(i)\n" +
+               "    if flag then _ = count(5) else _ = count(6)\n" +
+               "    print(\"end\")\n" +
+               "\nrun(true)\nrun(false)\n"
+
+    assert_eq(mus_ran(text), "count 0\ncount 1\ncount 5\nend\ncount 9\ncount 0\ncount 1\ncount 6\nend\ncount 9\n")
+
+@test("'_' still refuses a compound operator, and a place holding '_' is still a closure's parameter")
+mus_discard_refusals()
+    if xvr_no_library() then return
+
+    val e = xvr_ir([("main.sysl", "var a = 0\n_ += 1\n")])
+
+    assert(e.contains("'+=' reads every place before writing it, and '_' has nothing to read"), e)
+
+    val n = xvr_ir([("main.sysl", "_ = 1, 2\n")])
+
+    assert(n.contains("this assignment has 1 places on the left and 2 values on the right"), n)
+
+@test("the standard library, every body of it typed as its own build types it, drops no Result")
+mus_std_drops_none()
+    if xvr_no_library() then return
+
+    val units = mus_library()
+    val done = analyze_produced(units, host_target(), file_names(units), false)
+    var said = ""
+
+    for item in done.an.warnings()
+        if item.diag.message.contains("is dropped unread") then
+            said = said + s"${item.src.name}:${line_of(item.src, item.diag.span.start)}\n"
+
+    assert_eq(said, "")
+
+@test("a value that never returns cannot be dropped by '_ ='")
+mus_discard_never()
+    if xvr_no_library() then return
+
+    val e = xvr_ir([("main.sysl", "stop() -> never\n    loop\n        ()\n\n_ = stop()\n")])
+
+    assert(e.contains("'_' drops the value it is given, and this expression never returns one"), e)

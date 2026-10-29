@@ -51,7 +51,36 @@ private analyze_discarded(cx: &Analyzer, e: Expr) -> TExpr = *e.kind match
     ConstIf(cond, then_body, else_body) -> const_if_expr(cx, e.span, cond, then_body, else_body, None, true)
     _ ->
         cx.assign_here = is_assignment(e)
-        analyze_value(cx, e, None)
+
+        val t = analyze_value(cx, e, None)
+
+        warn_dropped_result(cx, e, t)
+        t
+
+// **A `Result` nobody reads is told, as a warning**: the failure it may carry goes unseen, which is
+// almost never what the line meant. Reading it in any way -- `?`, a `match`, a binding, an argument
+// -- is what silences it, and `_ = f()` drops it on purpose. Only the branching forms carry the
+// discard into their branches, so an `if` whose branches answer `Result`s is told once per branch, at
+// the line that dropped each.
+//
+// **A generic body is told at its definition**, where its own `Result[T, E]` is already a `Result`; an
+// instantiation that makes a `T` one is the caller's choice of type, not a value this body dropped.
+private warn_dropped_result(cx: &Analyzer, e: Expr, t: TExpr)
+    if is_assignment(e) || cx.an.reading_instance then return
+
+    val ty = texpr_type(t)
+
+    if !is_library_result(ty) then return
+
+    cx.an.caution(cx.scope, e.span, s"this '${type_show(ty)}' is dropped unread, so a failure it " +
+                  "carries goes unseen — handle it ('?', 'match', '.unwrap()'), or write '_ = …' to " +
+                  "drop it on purpose")
+end warn_dropped_result
+
+// Whether a type is the library's `Result`.
+private is_library_result(t: Type) -> bool = repr(t) match
+    Enum(d) -> d.base == module_qualify("sysl", "Result")
+    _ -> false
 
 // -- `if` ------------------------------------------------------------------------------------------
 

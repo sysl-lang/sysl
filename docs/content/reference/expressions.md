@@ -1126,7 +1126,8 @@ drop 7
 
 Every place may be `_`, which evaluates the right side for its effects alone — **a single one
 included: `_ = f()` runs `f` and drops what it answers**, whatever that is: a `Result`, a reference
-with a `Drop` (let go of when the statement ends), `unit`, a tuple.
+with a `Drop` (let go of when the statement ends), `unit`, a tuple. It is how a `Result` is dropped
+on purpose, which a bare `f()` [warns about](/reference/errors/#a-dropped-result-is-a-warning).
 
 ```sysl
 struct Tag
