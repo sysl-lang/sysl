@@ -4655,7 +4655,7 @@ The same sentence ends differently for each form:
 | `take(f: Fs)`, `take(fs)` | parameter 'f' of 'take' takes it by value / passes it by value |
 | `peek(self)` in the struct | receiver of 'Fs.peek' is taken as '(self)', which is a copy |
 | `give() -> Fs = fs` | returns it by value — only a value built right there may be handed back |
-| `() -> here.open` over a local | captures 'here' by value in a closure |
+| `() -> here.open` returned or stored | this closure captures 'here' by value — a closure that does not outlive the local holds it by reference, and is accepted |
 | `val Fs(n) = fs`, `fs match` | takes it apart / matches on it, which reads it whole into a copy first |
 | `(Fs(3), 1)`, `Option[Fs]` | puts it in a tuple / carries it by value in variant 'Some' |
 | `for item in all` over `[2]Fs` | copies each element into the loop variable |

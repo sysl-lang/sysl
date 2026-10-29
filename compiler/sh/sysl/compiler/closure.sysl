@@ -397,19 +397,38 @@ refuse_ref_captures(cx: &Analyzer, span: Span, captured: Buf[string]) -> bool
     false
 end refuse_ref_captures
 
-// A capture is a copy, so a local whose type is `@pinned` cannot be captured: the closure would carry
-// a second value of it, which nothing C holds a pointer into. A pointer to it can be.
-private refuse_pinned_captures(cx: &Analyzer, span: Span, captured: Buf[string]) -> bool
+// A capture held by value is a copy, so a local whose type is `@pinned` cannot be captured by a
+// closure that holds it so: the closure would carry a second value of it, which nothing C holds a
+// pointer into. **One held by reference is the variable itself**, so whether the capture is refused
+// waits for the closure's mode, and the refusal then names what keeps the closure
+// (`closure_mode.sysl`). A capture no closure could hold by reference -- one a scoped child makes --
+// is refused here.
+private refuse_pinned_captures(cx: &Analyzer, span: Span, captured: Buf[string], refs: Buf[bool],
+                               base: string) -> bool
     for i in 0..<captured.len()
         val local = cx.lookup(captured.at(i))
 
-        if local.is_some() && pinned_type(cx.an, local.unwrap().ty)
-            val held = type_show(local.unwrap().ty)
+        if local.is_none() || !pinned_type(cx.an, local.unwrap().ty) then continue
 
-            cx.fault(span, pinned_refusal(held, s"captures '${captured.at(i)}' by value in a closure",
-                                          s"Capture a pointer to it instead ('val p = &${captured.at(i)}')"))
-            return true
+        val name = captured.at(i)
+        val held = type_show(local.unwrap().ty)
+
+        // A closure that outlives the frame cannot keep a pointer into it either, so the way out is
+        // a box the closure counts.
+        if i < refs.len() && refs.at(i)
+            val head = s"'$held' is '@pinned' — C may hold pointers into a value of it, so a value is " +
+                s"never copied or moved once it is built, and this closure captures '$name' by value"
+            val boxed = s". Build it behind a counted reference instead ('val $name: &$held = …'), " +
+                "which the closure keeps without copying the value"
+
+            cx.an.lost_writes.push(OwedWrite(cx.scope, span, head, ", since ", boxed, base, i))
+            continue
         end if
+
+        cx.fault(span, pinned_refusal(held, s"captures '$name' by value in a closure",
+                                      s"Capture a pointer to it instead ('val p = &$name')"))
+        return true
+    end for
 
     false
 end refuse_pinned_captures
@@ -422,7 +441,6 @@ lower_closure(cx: &Analyzer, span: Span, names: Buf[string], ptypes: Buf[Type],
     val captured = captures(cx, body, names)
 
     if refuse_ref_captures(cx, span, captured) then return bad_expr(span)
-    if refuse_pinned_captures(cx, span, captured) then return bad_expr(span)
 
     var fields: Buf[(string, Type)] = buf()
 
@@ -437,7 +455,10 @@ lower_closure(cx: &Analyzer, span: Span, names: Buf[string], ptypes: Buf[Type],
     // **A scoped child holds its captures by value** whatever else is true of it, so it is no
     // candidate; any other closure may hold each `var` it captures by reference, decided once every
     // body has been typed (`closure_mode.sysl`).
-    if !lends && !captured.is_empty() then cx.an.closure_refs.put(base, referable_captures(cx, captured))
+    val refs = if lends then buf() else referable_captures(cx, captured)
+
+    if !lends && !captured.is_empty() then cx.an.closure_refs.put(base, refs)
+    if refuse_pinned_captures(cx, span, captured, refs, base) then return bad_expr(span)
 
     val st = StructType(base, buf(), fields, false, None, None, false, None, buf(), false, buf())
 
@@ -463,6 +484,8 @@ lower_closure(cx: &Analyzer, span: Span, names: Buf[string], ptypes: Buf[Type],
     for item in captured
         args.push(capture_source(cx, span, item))
 
+    note_write_keys(cx, st, args, lowered.body)
+
     // Asked after the captures are read, so the closure's own reading of a name is not a read
     // "after" it.
     refuse_lost_writes(cx, span, st, captured, lowered.body)
@@ -477,10 +500,13 @@ end lower_closure
 private referable_captures(cx: &Analyzer, captured: Buf[string]) -> Buf[bool]
     var out: Buf[bool] = buf()
 
+    // A `@pinned` `val` is the exception: a copy of it is not the value C points into, so it is held
+    // by reference where the closure allows, read-only as every `val` is.
     for item in captured
         val local = cx.lookup(item).unwrap()
+        val addressed = !local.read_only || (pinned_type(cx.an, local.ty) && !local.from_pattern)
 
-        out.push(!local.read_only && local.stands_for.is_none() &&!reads_by_name(cx, item) &&
+        out.push(addressed && local.stands_for.is_none() && !reads_by_name(cx, item) &&
                  !holds_waker(cx, item) && !zero_sized(local.ty))
     end for
 
@@ -770,6 +796,87 @@ private note_env_writes(a: &Analysis, st: &StructType, n: usize, body: TBlock)
         a.closure_env_writes.put(st.base, at)
     end if
 end note_env_writes
+
+// **The places of the building body a closure writes when it holds its captures by reference**
+// (`Analysis.closure_write_keys`): each write to a capture's own storage, keyed as `place_key` keys
+// a place -- from the capture's construction argument, which is the variable as that body names it,
+// down the by-value steps the write takes inside it. A write whose steps cannot be followed (through
+// a slice of a captured array) is a write of the whole variable.
+//
+// A `ref` live in that body where the closure is called, or handed to a call, stands on storage the
+// write may release (`checks.sysl`'s `ref_call`). Each capture's own key is kept beside the writes,
+// so a closure the capture holds -- one this closure calls -- can be followed to what it writes.
+private note_write_keys(cx: &Analyzer, st: &StructType, args: Buf[TExpr], body: TBlock)
+    var places: Buf[TExpr] = buf()
+    val into = &places
+
+    walk_block_stmts(body, TWalk(true, e -> written_place(cx.an, into, e), w -> into.push(w.place),
+                                 s -> ()))
+
+    val out: &ClosureWrites = ClosureWrites(buf(), buf(), buf())
+
+    for i in 0..<args.len()
+        out.captures.push(place_key(cx, args.at(i)).unwrap_or(""))
+
+    for place in places
+        val slot = env_capture(place)
+
+        if slot.is_none() then continue
+
+        for i in 0..<args.len()
+            if int(st.slot(i)) != slot.unwrap() || out.captures.at(i) == "" then continue
+
+            val steps = if copy_root(place).is_some() then copy_steps(place) else ""
+            val key = if steps == "" then out.captures.at(i) else s"${out.captures.at(i)}/$steps"
+
+            if !holds_string(out.keys, key)
+                out.keys.push(key)
+                out.names.push(st.fields.at(i).0)
+            end if
+        end for
+    end for
+
+    cx.an.closure_write_keys.put(st.base, out)
+end note_write_keys
+
+// What a closure writes of the body that builds it: each place by its key, beside the name of the
+// variable it is a part of, and each capture's own key ("" where it has none).
+struct ClosureWrites
+    keys: Buf[string]
+    names: Buf[string]
+    captures: Buf[string]
+end ClosureWrites
+
+// The place a node writes of the closure's own storage, as `env_roots_at` finds one.
+private written_place(a: &Analysis, into: *Buf[TExpr], e: TExpr)
+    *e.kind match
+        TStore(place, _, _, _) -> into.push(place)
+        TUpdate(place, _, _, _, _, _, _) -> into.push(place)
+        TIncDec(place, _, _, _, _) -> into.push(place)
+        TVecStore(recv, _, _) -> into.push(recv)
+        TCall(_, _, _, _) -> self_receiver(a, e) match
+            Some(place) -> into.push(place)
+            None -> ()
+        _ -> ()
+end written_place
+
+// The steps from a capture down to the part of it a write lands on, in `place_key`'s spelling: a
+// field by its index (a union's fields all `u`, being the same bytes), an element `[]`.
+private copy_steps(place: TExpr) -> string = *place.kind match
+    TField(recv, slot, _) ->
+        if env_root(recv) then return ""
+
+        val step = underlying(texpr_type(recv)) match
+            Struct(d) -> if d.union_layout then "u" else s"$slot"
+            _ -> s"$slot"
+        val above = copy_steps(recv)
+
+        if above == "" then step else s"$above/$step"
+    TIndex(recv, _, _) ->
+        val above = copy_steps(recv)
+
+        if above == "" then "[]" else s"$above/[]"
+    _ -> ""
 
 private env_roots_at(a: &Analysis, seen: *Buf[usize], slots: Buf[int], e: TExpr)
     *e.kind match
