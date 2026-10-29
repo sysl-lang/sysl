@@ -1,0 +1,229 @@
+module sh.sysl.compiler
+@tests
+
+// A generic function named with its type arguments, `echo[int]`, is a function value wherever a bare
+// `echo` would be one: the capture-free closure, whose body calls the instantiation the reader named.
+// Every position a callable is wanted in is tried, each program is run and its answer read, and the
+// refusals are pinned in their own words -- an application the brackets cannot take is refused as the
+// call `echo[int](x)` would be, and a function that is not generic is told its value is its name.
+
+private eta_main(text: string) -> []const (string, string) = [("main.sysl", text)]
+
+private eta_ran(text: string) -> string = xvr_ran(eta_main(text))
+
+private eta_ir(text: string) -> string = xvr_ir(eta_main(text))
+
+// A refusal carries this message, anchored at this `file:line:column`.
+private eta_refused(said: string, message: string, at: string) =
+    assert(said.contains(s"error: $message\n --> $at\n"), said)
+
+// The generic every program here names.
+private eta_echo() -> string = "echo[T](x: T) -> T = x\n\n"
+
+// The import a program holding a buffer begins with.
+private eta_buf() -> string = "import sysl.buf.{Buf, buf}\n\n"
+
+// -- the positions a callable is wanted in -------------------------------------------------------
+
+@test("a binding typed '&Fn' takes 'echo[int]' and calling it gives the argument back")
+eta_a_binding()
+    if xvr_no_library() then return
+
+    assert_eq(eta_ran(eta_echo() + raw"""
+        val f: &Fn(int) -> int = echo[int]
+
+        print(f(41) + 1)
+        """), "42\n")
+end eta_a_binding
+
+@test("an argument where the parameter is a '&Fn'")
+eta_an_argument()
+    if xvr_no_library() then return
+
+    assert_eq(eta_ran(eta_echo() + raw"""
+        apply(f: &Fn(int) -> int, x: int) -> int = f(x) * 2
+
+        print(apply(echo[int], 7))
+        """), "14\n")
+end eta_an_argument
+
+@test("an argument where the parameter is a bare arrow")
+eta_a_bare_arrow_argument()
+    if xvr_no_library() then return
+
+    assert_eq(eta_ran(eta_echo() + raw"""
+        apply(f: (string) -> string, x: string) -> string = f(x) + "!"
+
+        print(apply(echo[string], "hi"))
+        """), "hi!\n")
+end eta_a_bare_arrow_argument
+
+@test("an argument to a generic that solves its own parameter from the callable")
+eta_a_generic_argument()
+    if xvr_no_library() then return
+
+    assert_eq(eta_ran(eta_echo() + raw"""
+        twice[T](f: &Fn(T) -> T, x: T) -> T = f(f(x))
+
+        print(twice(echo[u8], 200), twice(echo[string], "s"))
+        """), "200 s\n")
+end eta_a_generic_argument
+
+@test("a function's result where the result type is a '&Fn'")
+eta_a_return_value()
+    if xvr_no_library() then return
+
+    assert_eq(eta_ran(eta_echo() + raw"""
+        make() -> &Fn(string) -> string = echo[string]
+
+        print(make()("made"))
+        """), "made\n")
+end eta_a_return_value
+
+@test("a struct field typed '&Fn'")
+eta_a_struct_field()
+    if xvr_no_library() then return
+
+    assert_eq(eta_ran(eta_echo() + raw"""
+        struct Holder
+            f: &Fn(int) -> int
+
+        val h = Holder(echo[int])
+
+        print(h.f(9))
+        """), "9\n")
+end eta_a_struct_field
+
+@test("pushed onto a buffer of closures")
+eta_a_buf_push()
+    if xvr_no_library() then return
+
+    assert_eq(eta_ran(eta_buf() + eta_echo() + raw"""
+        var fs: Buf[&Fn(int) -> int] = buf()
+
+        fs.push(echo[int])
+        fs.push(echo[int])
+        print(fs.len(), fs[0](5) + fs[1](6))
+        """), "2 11\n")
+end eta_a_buf_push
+
+@test("two type parameters, written as a list")
+eta_two_type_parameters()
+    if xvr_no_library() then return
+
+    assert_eq(eta_ran(raw"""
+        pair[A, B](a: A, b: B) -> (A, B) = (a, b)
+
+        val g: &Fn(int, string) -> (int, string) = pair[int, string]
+        val p = g(3, "x")
+
+        print(p.0, p.1)
+        """), "3 x\n")
+end eta_two_type_parameters
+
+@test("a nested generic type as the argument")
+eta_a_nested_type_argument()
+    if xvr_no_library() then return
+
+    assert_eq(eta_ran(eta_echo() + raw"""
+        val o: &Fn(Option[int]) -> Option[int] = echo[Option[int]]
+
+        print(o(Some(4)).unwrap(), o(None).is_none())
+        """), "4 true\n")
+end eta_a_nested_type_argument
+
+@test("a generic named through its module")
+eta_through_its_module()
+    if xvr_no_library() then return
+
+    assert_eq(xvr_ran([("shapes/shapes.sysl", "module shapes\n\necho[T](x: T) -> T = x\n\n" +
+                        "pair[A, B](a: A, b: B) -> (A, B) = (a, b)\n"), ("main.sysl", raw"""
+        import shapes
+
+        val f: &Fn(int) -> int = shapes.echo[int]
+        val g: &Fn(string, int) -> (string, int) = shapes.pair[string, int]
+
+        print(f(8), g("y", 2).0)
+        """)]), "8 y\n")
+end eta_through_its_module
+
+// -- what stays as it was ------------------------------------------------------------------------
+
+// A local of the spelling shadows the function, exactly as it does for a bare name, so the brackets
+// are a subscript of the local even where a callable is wanted.
+@test("a local of the function's spelling is indexed, not applied")
+eta_a_local_shadows_it()
+    if xvr_no_library() then return
+
+    assert_eq(eta_ran(eta_buf() + eta_echo() + raw"""
+        double(x: int) -> int = x * 2
+
+        run()
+            var echo: Buf[&Fn(int) -> int] = buf()
+
+            echo.push(double)
+
+            val f: &Fn(int) -> int = echo[0]
+
+            print(f(21))
+        end run
+
+        run()
+        """), "42\n")
+end eta_a_local_shadows_it
+
+@test("where nothing wants a callable, 'echo[int]' is still the mistake a bare 'echo' is")
+eta_nothing_wants_one()
+    if xvr_no_library() then return
+
+    eta_refused(eta_ir(eta_echo() + "val d = echo[int]\n"),
+                "'echo' is a function, and a function becomes a value only where a callable is " +
+                "wanted — a bare-arrow parameter, or a '&Fn' where a concrete type is required. " +
+                "Nothing here asks for one; where the address of code is what is wanted, that is " +
+                "written '&echo'",
+                "main.sysl:3:9")
+end eta_nothing_wants_one
+
+// -- the refusals --------------------------------------------------------------------------------
+
+@test("too many type arguments are refused as the call's are")
+eta_wrong_arity()
+    if xvr_no_library() then return
+
+    eta_refused(eta_ir(eta_echo() + "val a: &Fn(int) -> int = echo[int, int]\n"),
+                "'echo' takes 1 type argument ('T'), and 2 were written", "main.sysl:3:30")
+end eta_wrong_arity
+
+@test("a type argument the expected parameter contradicts")
+eta_contradicts_the_parameter()
+    if xvr_no_library() then return
+
+    eta_refused(eta_ir(eta_echo() + "val b: &Fn(int) -> int = echo[string]\n"),
+                "'x' of 'echo' is string, but int was given", "main.sysl:3:30")
+end eta_contradicts_the_parameter
+
+@test("a type argument the expected result contradicts")
+eta_contradicts_the_result()
+    if xvr_no_library() then return
+
+    eta_refused(eta_ir(eta_echo() + "val e: &Fn(string) -> int = echo[string]\n"),
+                "the function 'echo' should yield int here, but it yields string", "main.sysl:3:33")
+end eta_contradicts_the_result
+
+@test("a non-generic function given type arguments is told its value is its name")
+eta_not_generic()
+    if xvr_no_library() then return
+
+    eta_refused(eta_ir("inc(x: int) -> int = x + 1\n\nval c: &Fn(int) -> int = inc[int]\n"),
+                "'inc' is not generic, so it has no type arguments to write — the function is a " +
+                "value as it stands: 'inc'", "main.sysl:3:29")
+end eta_not_generic
+
+@test("a non-generic function given a list of type arguments is told the same")
+eta_not_generic_list()
+    if xvr_no_library() then return
+
+    eta_refused(eta_ir("inc(x: int) -> int = x + 1\n\nval c: &Fn(int) -> int = inc[int, int]\n"),
+                "'inc' is not generic, so it has no type arguments to write — the function is a " +
+                "value as it stands: 'inc'", "main.sysl:3:29")
+end eta_not_generic_list
