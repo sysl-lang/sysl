@@ -126,15 +126,19 @@ lro_read_only_is_readonly()
 
         assert(lro_define(out, "first").contains("ptr noalias readonly %x.param"), lro_define(out, "first"))
 
+// `edge` writes its copy, so the type alone decides how it crosses; `lent` only reads one, so it is
+// lent by address below the boundary (`read_by_address`) and makes the same promise.
 @test("a struct exactly at the boundary is still a value, and one word past it a readonly pointer")
 lro_the_boundary()
     if !lro_ready() then return
 
-    val out = lro_ir("edge(x: Edge) -> i64 = x.cells[0]\nover(x: Over) -> i64 = x.cells[0]\n" +
-                     "main()\n    print(edge(Edge([1; 16])) + over(Over([2; 17])))\n", None)
+    val out = lro_ir("edge(x: Edge) -> i64\n    x.cells[0] += 1\n    x.cells[0]\n" +
+                     "over(x: Over) -> i64 = x.cells[0]\nlent(x: Edge) -> i64 = x.cells[1]\n" +
+                     "main()\n    print(edge(Edge([1; 16])) + over(Over([2; 17])) + lent(Edge([3; 16])))\n", None)
 
     assert(lro_define(out, "edge").contains("%struct.Edge %x.param"), lro_define(out, "edge"))
     assert(lro_define(out, "over").contains("ptr noalias readonly %x.param"), lro_define(out, "over"))
+    assert(lro_define(out, "lent.owned").contains("ptr noalias readonly %x.param"), lro_define(out, "lent.owned"))
 
 @test("a generic instantiation over a large struct promises the same")
 lro_generic_instance()

@@ -3091,6 +3091,44 @@ original could change during the call — through a `*T` aliasing it, say — or
 writes to its own `self`. So a `self` method on a struct of kilobytes costs no more stack than a
 `*self` one, and the choice between them is about what the method may do, never about size.
 
+**The same holds for every by-value parameter, and "large" starts past two machine words** — sixteen
+bytes on a 64-bit target, eight on a 32-bit one, the line past which C's own conventions stop passing
+a struct in registers. A struct, an array or an enum with a payload wider than that, which the body
+only reads, is lent by address: the caller hands over its own storage, or a snapshot where the
+original could change, instead of loading the whole value into registers. A body that writes its
+parameter, takes its address, or keeps it takes it by value as before, and so does everything
+narrower, which costs nothing to read where it is. The choice is the function's, made from its body
+alone, so a call through a trait object, a function value or a closure reaches it all the same:
+
+```sysl
+struct P
+    a: i64
+    b: i64
+    c: i64
+
+var g = P(1, 2, 3)
+
+bump()
+    g.a = 10
+
+look(p: P) -> i64
+    val before = p.a
+    bump()
+    before * 100 + p.a
+
+total(p: P) -> i64 = p.a + p.b + p.c
+
+apply(f: &Fn(P) -> i64, p: P) -> i64 = f(p)
+
+print(look(g), g.a)
+print(apply(total, g))
+```
+
+```output
+101 10
+15
+```
+
 **What "could change" means is decided by type, and conservatively.** A receiver of type `T` is
 handed over in place, with no copy and no count taken on what it holds, when nothing the method
 does before it returns — itself or anything it calls — writes storage that could be part of a `T`:
