@@ -325,7 +325,9 @@ writes a capture and compiles today — which is a superset of what changes.
   covers them. The compiler's own tree and `library/` are among the 140.
 
 M2 is not something a single fault can list (it needs the address-taken set of the enclosing body);
-implementation item C9 adds it as a one-release diagnostic, run over the census before the switch.
+implementation item C9 lists it with M1 and M3 in a census run once over the org, with no diagnostic
+shipped. [`closures-c9-census.md`](closures-c9-census.md) has the result: 11 literals matched a shape,
+none changes meaning, no repository needed a fix.
 
 ## 12. Open questions — the user decides
 
