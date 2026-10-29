@@ -3142,7 +3142,8 @@ inside a strict body it is refused, and the lanes are read and combined one by o
 
 `@unchecked` is the one annotation that marks a **block** rather than a declaration: written on a
 line of its own, it covers the statements indented under it, and every subscript written there — of
-an array, a slice, or a container such as `Buf` that says how — is read with no bounds check.
+an array, a slice, or a container such as `Buf` that says how — is read with no bounds check, and so
+is a vector `load` or `store` of a run of elements.
 
 ```sysl
 var squares = [0; 5]
