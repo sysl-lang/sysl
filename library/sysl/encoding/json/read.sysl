@@ -2,6 +2,8 @@ module sysl.encoding.json
 
 import sysl.buf.{Buf, buf}
 import sysl.text.{from_utf8, from_utf8_unchecked, parse_real}
+import sysl.codec as codec
+import sysl.codec.{CodecError, Decoder, Token}
 
 // Reading: RFC 8259's grammar, exactly -- no comments, no trailing commas, no single quotes, no
 // leading `+` or leading zero, no `NaN`. Every refusal names the byte it happened at.
@@ -83,7 +85,7 @@ parse(text: string) -> Result[Json, JsonError] = parse_bytes(text.bytes)
  * holding bytes that are not UTF-8 is refused with `NotUtf8` rather than taken.
  */
 parse_bytes(b: []const u8) -> Result[Json, JsonError]
-    var r = Reader(b, 0, 0)
+    var r = json_decoder(b)
 
     blank(&r)
 
@@ -96,13 +98,22 @@ parse_bytes(b: []const u8) -> Result[Json, JsonError]
     Ok(v)
 end parse_bytes
 
-private struct Reader
-    b: []const u8
-    at: usize
-    depth: usize
+/** A pull reader over one JSON text: `sysl.codec`'s `Decoder` for JSON, which `from_json` reads a
+ * value through, and the reader `parse` builds its tree with. It reads the bytes it is given in
+ * place and allocates only for a string it hands back.
+ */
+struct JsonDecoder
+    private b: []const u8
+    private at: usize
+    private depth: usize
+    // Whether the next member or element is the first of its object or array, so no comma is due.
+    private first: bool
+
+/** A decoder at the start of `b`. */
+json_decoder(b: []const u8) -> JsonDecoder = JsonDecoder(b, 0, 0, true)
 
 // The error at a byte offset, with its line and column counted from the start.
-private fail(r: *Reader, at: usize, fault: Fault) -> JsonError
+private fail(r: *JsonDecoder, at: usize, fault: Fault) -> JsonError
     var line: usize = 1
     var col: usize = 1
 
@@ -119,10 +130,10 @@ private fail(r: *Reader, at: usize, fault: Fault) -> JsonError
 end fail
 
 // `what` expected at the reader's position, told apart from the text having ended there.
-private missing(r: *Reader, what: string) -> JsonError =
+private missing(r: *JsonDecoder, what: string) -> JsonError =
     fail(r, r.at, if r.at >= r.b.len then Ended(what) else Expected(what))
 
-private blank(r: *Reader)
+private blank(r: *JsonDecoder)
     while r.at < r.b.len
         val c = r.b[r.at]
 
@@ -131,11 +142,11 @@ private blank(r: *Reader)
         r.at += 1
 end blank
 
-private peek_is(r: *Reader, c: u8) -> bool = r.at < r.b.len && r.b[r.at] == c
+private peek_is(r: *JsonDecoder, c: u8) -> bool = r.at < r.b.len && r.b[r.at] == c
 
 private is_digit(c: u8) -> bool = c >= u8('0') && c <= u8('9')
 
-private value(r: *Reader) -> Result[Json, JsonError]
+private value(r: *JsonDecoder) -> Result[Json, JsonError]
     if r.at >= r.b.len then return Err(missing(r, "a value"))
 
     val c = r.b[r.at]
@@ -151,7 +162,7 @@ private value(r: *Reader) -> Result[Json, JsonError]
 end value
 
 // Whether `w` is written at the reader's position, stepping over it where it is.
-private word(r: *Reader, w: string) -> bool
+private word(r: *JsonDecoder, w: string) -> bool
     if r.at + w.bytes.len > r.b.len then return false
 
     for i in 0..<w.bytes.len
@@ -161,7 +172,7 @@ private word(r: *Reader, w: string) -> bool
     true
 end word
 
-private digits(r: *Reader, what: string) -> Result[unit, JsonError]
+private digits(r: *JsonDecoder, what: string) -> Result[unit, JsonError]
     if r.at >= r.b.len || !is_digit(r.b[r.at]) then return Err(missing(r, what))
 
     while r.at < r.b.len && is_digit(r.b[r.at]) do r.at += 1
@@ -169,7 +180,7 @@ private digits(r: *Reader, what: string) -> Result[unit, JsonError]
     Ok(())
 end digits
 
-private number(r: *Reader) -> Result[Json, JsonError]
+private number(r: *JsonDecoder) -> Result[Json, JsonError]
     val start = r.at
     val negative = peek_is(r, u8('-'))
 
@@ -220,7 +231,7 @@ end number
 
 // A quoted string, decoded. A run with no escape in it is copied out whole; an escape writes the
 // bytes of the character it names. The gathered bytes are checked as UTF-8 once, at the end.
-private text(r: *Reader) -> Result[string, JsonError]
+private text(r: *JsonDecoder) -> Result[string, JsonError]
     val open = r.at
 
     r.at += 1
@@ -259,7 +270,7 @@ private bad_byte(raw: []const u8, fallback: usize) -> usize
         Ok(_) -> fallback
 
 // One escape, the backslash under the reader; its character's bytes go into `out`.
-private escape(r: *Reader, out: *Buf[u8]) -> Result[unit, JsonError]
+private escape(r: *JsonDecoder, out: *Buf[u8]) -> Result[unit, JsonError]
     val at = r.at
 
     if at + 1 >= r.b.len then return Err(fail(r, at, BadEscape))
@@ -301,7 +312,7 @@ private escape(r: *Reader, out: *Buf[u8]) -> Result[unit, JsonError]
 end escape
 
 // The four hexadecimal digits after a `\u` whose backslash is at `at`.
-private hex4(r: *Reader, at: usize) -> Result[u32, JsonError]
+private hex4(r: *JsonDecoder, at: usize) -> Result[u32, JsonError]
     if r.at + 4 > r.b.len then return Err(fail(r, at, BadHex))
 
     var v: u32 = 0
@@ -338,14 +349,14 @@ private simple_escape(e: u8) -> u8
     0
 end simple_escape
 
-private enter(r: *Reader) -> Result[unit, JsonError]
+private enter(r: *JsonDecoder) -> Result[unit, JsonError]
     if r.depth >= max_depth then return Err(fail(r, r.at, TooDeep))
 
     r.depth += 1
     r.at += 1
     Ok(())
 
-private array(r: *Reader) -> Result[Json, JsonError]
+private array(r: *JsonDecoder) -> Result[Json, JsonError]
     enter(r)?
     blank(r)
 
@@ -371,7 +382,7 @@ private array(r: *Reader) -> Result[Json, JsonError]
     Ok(Arr(items))
 end array
 
-private object(r: *Reader) -> Result[Json, JsonError]
+private object(r: *JsonDecoder) -> Result[Json, JsonError]
     enter(r)?
     blank(r)
 
@@ -406,3 +417,217 @@ private object(r: *Reader) -> Result[Json, JsonError]
     r.depth -= 1
     Ok(Obj(members))
 end object
+
+// -- reading into a caller's type -----------------------------------------------------------------
+
+/** A value of type `T` read from one JSON text, through `T`'s `Decode` (derived, or the library's
+ * own for a scalar, a string, an `Option`, a `Buf`, a `Map` or a `Set`).
+ *
+ * Whitespace may surround the value; anything else after it is refused. Every refusal names the
+ * byte it was found at and the path to it, `users[3].home.zip: an integer expected (byte 214)`;
+ * where the text breaks JSON's grammar, the words are the ones `parse` uses.
+ */
+from_json[T](text: string) -> Result[T, CodecError] = from_json_bytes[T](text.bytes)
+
+/** The same over bytes that may not be text: a string that is not UTF-8 is refused. */
+from_json_bytes[T](b: []const u8) -> Result[T, CodecError]
+    var d = json_decoder(b)
+    val v = codec.decode[T, JsonDecoder](&d)?
+
+    blank(&d)
+
+    if d.at < b.len then return Err(lift(fail(&d, d.at, Trailing)))
+
+    Ok(v)
+end from_json_bytes
+
+// A refusal of JSON's grammar, in the codec's terms: the same words, at the same byte.
+private lift(e: JsonError) -> CodecError = codec.refusal(codec.Fault.Syntax(e.fault.to_string()), e.offset)
+
+// `what` expected where the reader stands: JSON's own refusal where the text has ended there, the
+// codec's `Expected` where a value of another shape stands.
+private wanted(r: *JsonDecoder, what: string) -> CodecError =
+    if r.at >= r.b.len then lift(missing(r, what)) else codec.refusal(codec.Fault.Expected(what), r.at)
+
+private starts_number(r: *JsonDecoder) -> bool = r.at < r.b.len && (r.b[r.at] == u8('-') || is_digit(r.b[r.at]))
+
+// The digits of a number too large for a `long`, held to the range of an `i128`: past it, the
+// nearest end, which every type the codec reads into refuses as out of range.
+private big_int(digits: string) -> i128
+    val bs = digits.bytes
+    val neg = bs[0] == u8('-')
+    var v: i128 = 0
+
+    for i in (if neg then 1 else 0)..<bs.len
+        if v > 1000000000000000000000000000000000000 then return if neg then i128::Min else i128::Max
+
+        v = v * 10 + i128(bs[i] - u8('0'))
+
+    if neg then -v else v
+end big_int
+
+impl Decoder for JsonDecoder
+    type Mark = (usize, usize, bool)
+
+    mark(*self) -> (usize, usize, bool) = (self.at, self.depth, self.first)
+
+    rewind(*self, m: (usize, usize, bool))
+        self.at = m.0
+        self.depth = m.1
+        self.first = m.2
+
+    // A comma still to be read belongs to no one, so the offset is the key or item after it, which
+    // is looked at without being read.
+    offset(*self) -> usize
+        blank(self)
+
+        if self.first || self.depth == 0 || !peek_is(self, u8(',')) then return self.at
+
+        val m = self.mark()
+
+        self.at += 1
+        blank(self)
+
+        val at = self.at
+
+        self.rewind(m)
+        at
+    end offset
+
+    peek(*self) -> Result[Token, CodecError]
+        blank(self)
+
+        if self.at >= self.b.len then return Err(wanted(self, "a value"))
+
+        val c = self.b[self.at]
+
+        if c == u8('{') then Ok(Token.Struct)
+        elif c == u8('[') then Ok(Token.Seq)
+        elif c == u8('"') then Ok(Token.Text)
+        elif starts_number(self) then Ok(Token.Number)
+        elif c == u8('t') || c == u8('f') then Ok(Token.Bool)
+        elif c == u8('n') then Ok(Token.Null)
+        else Err(lift(missing(self, "a value")))
+    end peek
+
+    none(*self) -> Result[bool, CodecError]
+        blank(self)
+        Ok(word(self, "null"))
+
+    bool(*self) -> Result[bool, CodecError]
+        blank(self)
+
+        if word(self, "true") then Ok(true)
+        elif word(self, "false") then Ok(false)
+        else Err(wanted(self, "true or false"))
+
+    int(*self) -> Result[i128, CodecError]
+        blank(self)
+
+        if !starts_number(self) then return Err(wanted(self, "an integer"))
+
+        val at = self.at
+
+        number(self) match
+            Ok(Int(n)) -> Ok(i128(n))
+            Ok(Big(digits)) -> Ok(big_int(digits))
+            Ok(_) ->
+                self.at = at
+                Err(codec.refusal(codec.Fault.Expected("an integer"), at))
+            Err(e) -> Err(lift(e))
+    end int
+
+    real(*self) -> Result[real, CodecError]
+        blank(self)
+
+        if !starts_number(self) then return Err(wanted(self, "a number"))
+
+        number(self) match
+            Ok(Int(n)) -> Ok(real(n))
+            Ok(Real(x)) -> Ok(x)
+            Ok(Big(digits)) -> Ok(parse_real(digits.bytes).unwrap())
+            Ok(_) -> Err(wanted(self, "a number"))
+            Err(e) -> Err(lift(e))
+    end real
+
+    str(*self) -> Result[string, CodecError]
+        blank(self)
+
+        if !peek_is(self, u8('"')) then return Err(wanted(self, "a string"))
+
+        text(self).map_err(lift)
+
+    begin_seq(*self) -> Result[unit, CodecError]
+        blank(self)
+
+        if !peek_is(self, u8('[')) then return Err(wanted(self, "an array"))
+
+        enter(self).map_err(lift)?
+        self.first = true
+        Ok(())
+
+    next_item(*self) -> Result[bool, CodecError]
+        blank(self)
+
+        if peek_is(self, u8(']'))
+            self.at += 1
+            self.depth -= 1
+            self.first = false
+            return Ok(false)
+
+        if !self.first
+            if !peek_is(self, u8(',')) then return Err(lift(missing(self, "',' or ']'")))
+
+            self.at += 1
+            blank(self)
+
+            // A comma promises an item, so a close after one breaks the grammar rather than the shape.
+            if peek_is(self, u8(']')) then return Err(lift(missing(self, "a value")))
+
+        self.first = false
+        Ok(true)
+    end next_item
+
+    begin_struct(*self) -> Result[unit, CodecError]
+        blank(self)
+
+        if !peek_is(self, u8('{')) then return Err(wanted(self, "an object"))
+
+        enter(self).map_err(lift)?
+        self.first = true
+        Ok(())
+
+    next_key(*self) -> Result[Option[string], CodecError]
+        blank(self)
+
+        if peek_is(self, u8('}'))
+            self.at += 1
+            self.depth -= 1
+            self.first = false
+            return Ok(None)
+
+        if !self.first
+            if !peek_is(self, u8(',')) then return Err(lift(missing(self, "',' or '}'")))
+
+            self.at += 1
+            blank(self)
+
+        if !peek_is(self, u8('"')) then return Err(lift(missing(self, "a member name")))
+
+        val key = text(self).map_err(lift)?
+
+        blank(self)
+
+        if !peek_is(self, u8(':')) then return Err(lift(missing(self, "':'")))
+
+        self.at += 1
+        self.first = false
+        Ok(Some(key))
+    end next_key
+
+    /** Reads the value and throws it away, refusing it where it is not JSON. */
+    skip_value(*self) -> Result[unit, CodecError]
+        blank(self)
+        value(self).map_err(lift)?
+        Ok(())
+end JsonDecoder

@@ -1,0 +1,1000 @@
+/** Turning a value into a format and back, written once for every type and every format.
+ *
+ * **A type says how it is built; a format says how things are spelled; neither knows the other.**
+ * A type takes `derives Codec` (or `Encode`, or `Decode`, alone), and the library's derivation walks
+ * its fields at compile time. A format implements `Encoder` and `Decoder`, which spell a handful of
+ * shapes — null, a bool, an integer, a real, a string, a sequence, a struct — and every derived type
+ * reads and writes through it. Each pair of a type and a format is one function, monomorphized, with
+ * a direct call to each of the format's members: nothing is looked up while the program runs.
+ *
+ * `sysl.encoding.json` is the first format (`to_json`, `from_json`).
+ *
+ * **Encoding latches; decoding answers.** An encoder that cannot write something — a full buffer, a
+ * NaN where the format has no spelling for one — remembers the first fault and says so through
+ * `failed()`, as a `Writer` does. A decoder answers a `Result`, and its error says what was wrong,
+ * the byte it was found at, and the path of fields, variants and indexes that led there:
+ * `users[3].home.zip: an integer expected (byte 214)`.
+ *
+ * What the annotations here change is in the library page, `library/codec.md`.
+ */
+module sysl.codec
+
+import sysl.buf.{Buf, buf}
+import sysl.container.{Map, Set, map, set}
+
+// -- the annotations ------------------------------------------------------------------------------
+
+/** The key a field, or the name a variant, is written under, in place of its own. */
+@annotation
+struct rename
+    name: string
+
+/** A field never written, and given its `@default` — or its type's `Default` — when decoded. */
+@annotation
+struct skip
+end skip
+
+/** The value a field takes when the input does not mention it. */
+@annotation
+struct default[F]
+    v: F
+
+/** A struct field whose own fields are written at this level, as if they were this struct's. */
+@annotation
+struct flatten
+end flatten
+
+/** An enum written **internally tagged**: the variant's name is one more member of its payload's
+ * object, under this key — `{"type":"Circle","r":5}`. With `@content` beside it, **adjacently
+ * tagged**: `{"t":"Circle","c":{"r":5}}`.
+ */
+@annotation
+struct tag
+    field: string
+
+/** With `@tag`, the key the payload is written under, beside the tag. */
+@annotation
+struct content
+    field: string
+
+/** A struct that refuses a key none of its fields is written under, rather than skipping it. */
+@annotation
+struct deny_unknown
+end deny_unknown
+
+// -- the traits ------------------------------------------------------------------------------------
+
+/** A format's writing half. The derived `encode` calls these in the order the value is laid out:
+ *
+ * - a struct is `begin_struct`, then `field(key)` and the field's value for each field, then
+ *   `end_struct`; a map with `string` keys is written the same way;
+ * - a sequence (a `Buf`, a `Set`, an array, a tuple) is `begin_seq`, then `item()` and the element
+ *   for each, then `end_seq`.
+ *
+ * An encoder that cannot write something records it with `fail` and goes on quietly; the first
+ * fault is the one kept.
+ */
+trait Encoder: Fallible
+    /** The format's null: `None`, and `unit`. */
+    none(*self)
+    bool(*self, v: bool)
+    int(*self, v: i128)
+    real(*self, v: real)
+    str(*self, v: string)
+    begin_seq(*self, n: usize)
+    item(*self)
+    end_seq(*self)
+    begin_struct(*self, name: string, n: usize)
+    field(*self, key: string)
+    end_struct(*self)
+    fail(*self, fault: Fault)
+
+/** What the next value in a decoder's input is, without reading it. */
+enum Token
+    Null
+    Bool
+    Number
+    Text
+    Seq
+    Struct
+
+/** A format's reading half: a pull reader the derived `decode` asks for one shape at a time.
+ *
+ * A struct is `begin_struct`, then `next_key` until it answers `None`, with each key's value read
+ * (or skipped) in between; a sequence is `begin_seq`, then `next_item` until it answers `false`. A
+ * member that reads a value refuses one of another shape with `Expected`, and leaves the input where
+ * it was.
+ *
+ * `mark` and `rewind` return to an earlier place in the input: a decoder reading an internally
+ * tagged enum looks ahead for the tag, and one with a `@flatten` field reads the object twice.
+ */
+trait Decoder
+    type Mark
+
+    mark(*self) -> Self::Mark
+    rewind(*self, m: Self::Mark)
+
+    /**
+     * The byte offset the next thing read starts at: a value, a key, or the close of the sequence
+     * or struct being read -- past any separator still to be read before it.
+     */
+    offset(*self) -> usize
+
+    peek(*self) -> Result[Token, CodecError]
+
+    /** Reads the format's null and answers `true` where one is next; otherwise reads nothing. */
+    none(*self) -> Result[bool, CodecError]
+
+    bool(*self) -> Result[bool, CodecError]
+    int(*self) -> Result[i128, CodecError]
+    real(*self) -> Result[real, CodecError]
+    str(*self) -> Result[string, CodecError]
+    begin_seq(*self) -> Result[unit, CodecError]
+    next_item(*self) -> Result[bool, CodecError]
+    begin_struct(*self) -> Result[unit, CodecError]
+    next_key(*self) -> Result[Option[string], CodecError]
+    skip_value(*self) -> Result[unit, CodecError]
+end Decoder
+
+/** A value that can be written to any format. Derived for a struct or an enum. */
+trait Encode
+    encode[E: Encoder](self, e: *E)
+
+    derive[T] encode[E: Encoder](self: T, e: *E)
+        if const T::Kind == Kind.Struct
+            e.begin_struct(T::BaseName, written[T]())
+            encode_fields(self, e)
+            e.end_struct()
+        elif const T::Kind == Kind.DataEnum || T::Kind == Kind.SimpleEnum
+            encode_enum(self, e)
+        else
+            @assert(false, s"Encode is derived for a struct or an enum, and ${T::Name} is a ${Kind::Image(T::Kind)}")
+
+/** A value that can be read from any format. Derived for a struct or an enum. */
+trait Decode
+    decode[D: Decoder](d: *D) -> Result[Self, CodecError]
+
+    /** What a field of this type is when the input leaves it out: `None` here, which makes that a
+     * `Missing` error. `Option` answers `Some(None)`, so an absent optional field reads as `None`.
+     */
+    when_missing() -> Option[Self] = None
+
+    derive[T] decode[D: Decoder](d: *D) -> Result[T, CodecError]
+        if const T::Kind == Kind.Struct
+            decode_object[T, D](d, T::Annotation[deny_unknown].is_some())
+        elif const T::Kind == Kind.DataEnum || T::Kind == Kind.SimpleEnum
+            decode_enum[T, D](d)
+        else
+            @assert(false, s"Decode is derived for a struct or an enum, and ${T::Name} is a ${Kind::Image(T::Kind)}")
+            Err(refusal(Expected("a value"), 0))
+end Decode
+
+/** Both directions: `derives Codec` derives `Encode` and `Decode`. */
+trait Codec: Encode + Decode
+
+/** The value a skipped field is given when it is decoded and carries no `@default`. */
+trait Default
+    default() -> Self
+
+// -- errors ----------------------------------------------------------------------------------------
+
+/** What was wrong with the input, or with the value being written. */
+enum Fault derives Eq
+    /** The format's own grammar refused the text; the words are the format's. */
+    Syntax(what: string)
+    /** A value of another shape stood where this was expected. */
+    Expected(what: string)
+    /** A field with no `Option` type and no `@default` was not in the input. */
+    Missing(field: string)
+    /** A key no field is written under, in a `@deny_unknown` struct. */
+    Unknown(key: string, of: string)
+    /** One key twice in one object. */
+    Duplicate(key: string)
+    /** A name that is no variant of the enum. */
+    UnknownVariant(name: string, of: string)
+    /** An internally or adjacently tagged object without its tag. */
+    NoTag(key: string)
+    /** A number outside the range of the type it is read into. */
+    OutOfRange(of: string)
+    /** A number a fixed-point type cannot hold exactly. */
+    Inexact(of: string)
+    /** A NaN or an infinity, where the format has no spelling for one. */
+    NotFinite
+end Fault
+
+impl Display for Fault
+    display(self, out: *Writer, fmt: FormatSpec)
+        val text = self match
+            Syntax(what) -> what
+            Expected(what) -> s"$what expected"
+            Missing(field) -> s"the field '$field' is missing"
+            Unknown(key, of) -> s"'$key' is not a field of $of"
+            Duplicate(key) -> s"'$key' is written twice"
+            UnknownVariant(name, of) -> s"'$name' is not a variant of $of"
+            NoTag(key) -> s"no '$key' member says which variant this is"
+            OutOfRange(of) -> s"out of range for $of"
+            Inexact(of) -> s"not exactly representable as $of"
+            NotFinite -> "a NaN or an infinity, which the format has no spelling for"
+
+        display_str(text, out, fmt)
+    end display
+
+/** One step of the way from the whole value to where a fault was found. */
+struct Step
+    /** 0: a field, 1: a variant, 2: an index, 3: a map key. */
+    kind: u8
+    name: string
+    index: usize
+
+/** How deep a path is kept: the innermost steps, which say the most. */
+const path_room: usize = 16
+
+/** The fields, variants, indexes and keys from the outside in. Built on the way out of a failed
+ * decode, on the failure path only; past `path_room` steps the outermost are dropped, and the path
+ * opens with `…`.
+ */
+struct Path
+    steps: [path_room]Step
+    len: usize
+    cut: bool
+
+impl Display for Path
+    display(self, out: *Writer, fmt: FormatSpec)
+        var s = if self.cut then "…" else ""
+        var i = self.len
+
+        while i > 0
+            i -= 1
+
+            val st = self.steps[i]
+
+            if st.kind == 2 then s = s + s"[${st.index}]"
+            elif st.kind == 3 then s = s + s"[\"${st.name}\"]"
+            elif s == "" || s == "…" then s = s + st.name
+            else s = s + s".${st.name}"
+
+        display_str(s, out, fmt)
+    end display
+
+/** Why a value could not be read (or written): the fault, the byte offset it was found at, and the
+ * path to it. Shown as `path: fault (byte n)`.
+ */
+struct CodecError
+    fault: Fault
+    at: usize
+    path: Path
+
+impl Display for CodecError
+    display(self, out: *Writer, fmt: FormatSpec)
+        if self.path.len == 0 && !self.path.cut
+            display_str(s"${self.fault} (byte ${self.at})", out, fmt)
+        else
+            display_str(s"${self.path}: ${self.fault} (byte ${self.at})", out, fmt)
+
+impl Eq for CodecError
+    eq(self, rhs: CodecError) -> bool = self.to_string() == rhs.to_string()
+
+/** An error with no path yet: a fault at byte `at`. */
+refusal(fault: Fault, at: usize) -> CodecError
+    var path: Path
+
+    CodecError(fault, at, path)
+
+/** The error with one more step outside the ones it has. */
+private within(e: CodecError, kind: u8, name: string, index: usize) -> CodecError
+    var out = e
+
+    if out.path.len == path_room
+        out.path.cut = true
+    else
+        out.path.steps[out.path.len] = Step(kind, name, index)
+        out.path.len += 1
+
+    out
+end within
+
+// -- the free entry points -------------------------------------------------------------------------
+
+/** Writes any value: one that implements `Encode`, or a tuple, an array, a fixed-point number, a
+ * reference (as what it refers to) or `unit` (as null), which need no `impl`.
+ */
+encode[T, E: Encoder](v: T, e: *E)
+    if const T::Kind == Kind.Ref
+        encode(*v, e)
+    elif const T: Encode
+        v.encode(e)
+    elif const T::Kind == Kind.Tuple
+        e.begin_seq(T::Fields.len)
+
+        for const f in T::Fields
+            e.item()
+            encode(v.(f), e)
+
+        e.end_seq()
+    elif const T::Kind == Kind.Array
+        e.begin_seq(v.len)
+
+        for i in 0..<v.len
+            e.item()
+            encode(v[i], e)
+
+        e.end_seq()
+    elif const T::Kind == Kind.Fixed
+        e.real(real(v))
+    elif const T::Kind == Kind.Unit
+        e.none()
+    else
+        @assert(false, s"${T::Name} cannot be encoded: it implements no Encode, and a ${Kind::Image(T::Kind)} has no encoding of its own")
+end encode
+
+/** Reads any value `encode` writes. An integer of any width up to 64 bits is read here, with its
+ * range checked, rather than through an `impl`: a blanket `impl` over `Integer` may not declare a
+ * member with no receiver, which `Decode.decode` is.
+ */
+decode[T, D: Decoder](d: *D) -> Result[T, CodecError]
+    if const T::Kind == Kind.Ref
+        decode_ref(d)
+    elif const T::Kind == Kind.Int
+        @assert(sizeof(T) <= 8, s"${T::Name} is wider than 64 bits, which the codec does not carry")
+
+        val at = d.offset()
+        val x = d.int()?
+
+        if x < i128(T::Min) || x > i128(T::Max) then Err(refusal(OutOfRange(T::Name), at)) else Ok(T(x))
+    elif const T: Decode
+        T.decode(d)
+    elif const T::Kind == Kind.Tuple
+        var p: T::Partial
+
+        d.begin_seq()?
+
+        for const f in T::Fields
+            val at = d.offset()
+
+            if !d.next_item()? then return Err(refusal(Expected(s"a tuple of ${T::Fields.len}"), at))
+
+            p.(f) = Some(decode[f::Type, D](d) match
+                Ok(v) -> v
+                Err(e) -> return Err(within(e, 2, "", f.index)))
+
+        if d.next_item()? then return Err(refusal(Expected(s"the end of a tuple of ${T::Fields.len}"), d.offset()))
+
+        Ok(T::Make(p))
+    elif const T::Kind == Kind.Array
+        var out: T
+        var i: usize = 0
+
+        d.begin_seq()?
+
+        loop
+            val at = d.offset()
+
+            if !d.next_item()?
+                if i < out.len then return Err(refusal(Expected(s"an array of ${out.len}, and it has $i"), at))
+
+                break
+
+            if i == out.len then return Err(refusal(Expected(s"the end of an array of ${out.len}"), d.offset()))
+
+            out[i] = decode_like(d, out[i]) match
+                Ok(v) -> v
+                Err(e) -> return Err(within(e, 2, "", i))
+            i += 1
+
+        Ok(out)
+    elif const T::Kind == Kind.Fixed
+        val at = d.offset()
+        val x = d.real()?
+        val q = T(x)
+
+        if real(q) != x then Err(refusal(Inexact(T::Name), at)) else Ok(q)
+    elif const T::Kind == Kind.Unit
+        if d.none()? then Ok(()) else Err(refusal(Expected("null"), d.offset()))
+    else
+        @assert(false, s"${T::Name} cannot be decoded: it implements no Decode, and a ${Kind::Image(T::Kind)} has no decoding of its own")
+        Err(refusal(Expected("a value"), 0))
+end decode
+
+// An array's element type has no spelling inside a function generic over the array, and the
+// expected type of `out[i] = decode(d)?` does not reach through the `?` or a `match`, so the element
+// already in the slot names the type for the call.
+private decode_like[U, D: Decoder](d: *D, witness: U) -> Result[U, CodecError] = decode[U, D](d)
+
+// A reference is read as what it refers to, which is then boxed.
+private decode_ref[U, D: Decoder](d: *D) -> Result[&U, CodecError] = Ok(decode[U, D](d)?)
+
+// What a field of type `T` is when the input leaves it out, if anything.
+private when_missing_of[T]() -> Option[T]
+    if const T: Decode
+        T.when_missing()
+    else
+        None
+
+// -- structs ---------------------------------------------------------------------------------------
+
+// How many keys a struct writes: its fields, less the skipped, with a flattened one's own counted in.
+private written[T]() -> usize
+    var n: usize = 0
+
+    for const f in T::Fields
+        if const f::Annotation[flatten].is_some()
+            n += written[f::Type]()
+        elif const f::Annotation[skip].is_none()
+            n += 1
+
+    n
+
+private encode_fields[T, E: Encoder](v: T, e: *E)
+    for const f in T::Fields
+        if const f::Annotation[flatten].is_some()
+            @assert(f::Type::Kind == Kind.Struct, s"'@flatten' is written on '${f.name}', and only a struct field can be flattened")
+            encode_fields(v.(f), e)
+        elif const f::Annotation[skip].is_none()
+            e.field(f::Annotation[rename].map(r -> r.name).unwrap_or(f.name))
+            encode(v.(f), e)
+
+// Whether `key` is written by one of `T`'s fields, a flattened one's included.
+private knows_key[T](key: string) -> bool
+    for const f in T::Fields
+        if const f::Annotation[flatten].is_some()
+            if knows_key[f::Type](key) then return true
+        elif const f::Annotation[skip].is_none()
+            if key == f::Annotation[rename].map(r -> r.name).unwrap_or(f.name) then return true
+
+    false
+
+// One object read into a `T`. `strict` refuses a key no field (flattened ones included) is written
+// under; a flattened struct is read leniently, since the keys of the struct around it are its
+// unknowns.
+private decode_object[T, D: Decoder](d: *D, strict: bool) -> Result[T, CodecError]
+    val start = d.mark()
+    var p: T::Partial
+
+    d.begin_struct()?
+
+    // Where the struct closes, which is where a field it leaves out is reported.
+    var end: usize = 0
+
+    loop
+        val at = d.offset()
+        val k = d.next_key()?
+
+        if k.is_none()
+            end = at
+            break
+
+        val key = k.unwrap()
+        var known = false
+
+        for const f in T::Fields
+            if const f::Annotation[skip].is_none() && f::Annotation[flatten].is_none()
+                val name = f::Annotation[rename].map(r -> r.name).unwrap_or(f.name)
+
+                if key == name
+                    if p.(f).is_some() then return Err(refusal(Duplicate(key), at))
+
+                    known = true
+                    p.(f) = Some(decode[f::Type, D](d) match
+                        Ok(v) -> v
+                        Err(e) -> return Err(within(e, 0, name, 0)))
+
+        if !known
+            if strict && !knows_key[T](key) then return Err(refusal(Unknown(key, T::BaseName), at))
+
+            d.skip_value()?
+
+    for const f in T::Fields
+        if const f::Annotation[flatten].is_some()
+            val after = d.mark()
+
+            d.rewind(start)
+            p.(f) = Some(decode_object[f::Type, D](d, false)?)
+            d.rewind(after)
+
+    for const f in T::Fields
+        if const f::Annotation[flatten].is_none()
+            if p.(f).is_none()
+                if const f::Annotation[default].is_some()
+                    p.(f) = Some(f::Annotation[default].unwrap().v)
+                elif const f::Annotation[skip].is_some() && f::Type: Default
+                    p.(f) = Some(f::Type.default())
+                elif const f::Annotation[skip].is_some()
+                    @assert(false, s"'@skip' field '${f.name}' of ${T::Name} is decoded as its '@default', and it has none, nor does ${f::Type::Name} implement Default")
+                else
+                    p.(f) = when_missing_of[f::Type]()
+
+                    if p.(f).is_none() then return Err(refusal(Missing(f.name), end))
+
+    Ok(T::Make(p))
+end decode_object
+
+// -- enums -----------------------------------------------------------------------------------------
+
+private variant_name[T](i: usize) -> string
+    for const c in T::Variants
+        if c.index == i then return c::Annotation[rename].map(r -> r.name).unwrap_or(c.name)
+
+    ""
+
+private encode_enum[T, E: Encoder](v: T, e: *E)
+    val tagged = T::Annotation[tag]
+    val content = T::Annotation[content]
+
+    for const c in T::Variants
+        if v is c
+            val name = c::Annotation[rename].map(r -> r.name).unwrap_or(c.name)
+
+            if const T::Annotation[tag].is_none()
+                if const c::Fields.len == 0
+                    e.str(name)
+                else
+                    e.begin_struct(T::BaseName, 1)
+                    e.field(name)
+                    e.begin_struct(c.name, c::Fields.len)
+                    encode_payload(v, e, c.index)
+                    e.end_struct()
+                    e.end_struct()
+            elif const T::Annotation[content].is_none()
+                e.begin_struct(T::BaseName, c::Fields.len + 1)
+                e.field(tagged.unwrap().field)
+                e.str(name)
+                encode_payload(v, e, c.index)
+                e.end_struct()
+            else
+                e.begin_struct(T::BaseName, if c::Fields.len == 0 then 1 else 2)
+                e.field(tagged.unwrap().field)
+                e.str(name)
+
+                if const c::Fields.len > 0
+                    e.field(content.unwrap().field)
+                    e.begin_struct(c.name, c::Fields.len)
+                    encode_payload(v, e, c.index)
+                    e.end_struct()
+
+                e.end_struct()
+end encode_enum
+
+// The fields of the payload of `v`, which holds variant `which`, each as a key and its value.
+private encode_payload[T, E: Encoder](v: T, e: *E, which: usize)
+    for const c in T::Variants
+        if c.index == which
+            val p = v.(c)
+
+            for const f in c::Fields
+                if const f::Annotation[skip].is_none()
+                    e.field(f::Annotation[rename].map(r -> r.name).unwrap_or(f.name))
+
+                    if const c::Fields.len == 1
+                        encode(p, e)
+                    else
+                        encode(p.(f), e)
+
+private decode_enum[T, D: Decoder](d: *D) -> Result[T, CodecError]
+    if const T::Annotation[tag].is_some()
+        decode_tagged[T, D](d)
+    else
+        val at = d.offset()
+
+        d.peek()? match
+            Text ->
+                val name = d.str()?
+
+                for const c in T::Variants
+                    if name == variant_name[T](c.index)
+                        if const c::Fields.len == 0
+                            return Ok(T::Make(c, ()))
+                        else
+                            return Err(within(refusal(Expected("an object holding its fields"), at), 1, name, 0))
+
+                Err(refusal(UnknownVariant(name, T::BaseName), at))
+            Struct ->
+                d.begin_struct()?
+
+                val close = d.offset()
+                val k = d.next_key()?
+
+                if k.is_none() then return Err(refusal(Expected("a variant's name"), close))
+
+                val name = k.unwrap()
+                val v = decode_named[T, D](d, name, at)?
+                val past = d.offset()
+
+                if d.next_key()?.is_some() then return Err(refusal(Expected(s"one member, naming the variant, and no other"), past))
+
+                Ok(v)
+            _ -> Err(refusal(Expected("a variant: its name, or an object of one member"), at))
+end decode_enum
+
+// The variant called `name`, whose payload is the next value: an object of its fields (`{}` or
+// `null` for a variant with none).
+private decode_named[T, D: Decoder](d: *D, name: string, at: usize) -> Result[T, CodecError]
+    for const c in T::Variants
+        if name == variant_name[T](c.index)
+            if const c::Fields.len == 0
+                if !d.none()?
+                    d.begin_struct()?
+
+                    val key_at = d.offset()
+
+                    if d.next_key()?.is_some() then return Err(within(refusal(Expected("no fields"), key_at), 1, name, 0))
+
+                return Ok(T::Make(c, ()))
+            else
+                return decode_payload[T, D](d, c.index, "") match
+                    Ok(v) -> Ok(v)
+                    Err(e) -> Err(within(e, 1, name, 0))
+
+    Err(refusal(UnknownVariant(name, T::BaseName), at))
+end decode_named
+
+// The payload of variant `which` as an object of its fields, with `extra` (a tag's key) passed over.
+private decode_payload[T, D: Decoder](d: *D, which: usize, extra: string) -> Result[T, CodecError]
+    for const c in T::Variants
+        if const c::Fields.len > 0
+            if c.index == which
+                var p: c::Partial
+
+                d.begin_struct()?
+
+                var end: usize = 0
+
+                loop
+                    val at = d.offset()
+                    val k = d.next_key()?
+
+                    if k.is_none()
+                        end = at
+                        break
+
+                    val key = k.unwrap()
+                    var known = false
+
+                    for const f in c::Fields
+                        if const f::Annotation[skip].is_none()
+                            val name = f::Annotation[rename].map(r -> r.name).unwrap_or(f.name)
+
+                            if key == name
+                                if p.(f).is_some() then return Err(refusal(Duplicate(key), at))
+
+                                known = true
+                                p.(f) = Some(decode[f::Type, D](d) match
+                                    Ok(v) -> v
+                                    Err(e) -> return Err(within(e, 0, name, 0)))
+
+                    if !known
+                        if const T::Annotation[deny_unknown].is_some()
+                            if key != extra then return Err(refusal(Unknown(key, c.name), at))
+
+                        d.skip_value()?
+
+                for const f in c::Fields
+                    if p.(f).is_none()
+                        if const f::Annotation[default].is_some()
+                            p.(f) = Some(f::Annotation[default].unwrap().v)
+                        elif const f::Annotation[skip].is_some() && f::Type: Default
+                            p.(f) = Some(f::Type.default())
+                        elif const f::Annotation[skip].is_some()
+                            @assert(false, s"'@skip' field '${f.name}' of ${T::Name}.${c.name} is decoded as its '@default', and it has none, nor does ${f::Type::Name} implement Default")
+                        else
+                            p.(f) = when_missing_of[f::Type]()
+
+                            if p.(f).is_none() then return Err(refusal(Missing(f.name), end))
+
+                return Ok(T::Make(c, p))
+
+    Err(refusal(Expected("a variant with fields"), d.offset()))
+end decode_payload
+
+// An internally (`@tag`) or adjacently (`@tag` + `@content`) tagged enum: the tag is found first,
+// wherever it stands in the object, and the object is then read again as that variant.
+private decode_tagged[T, D: Decoder](d: *D) -> Result[T, CodecError]
+    val key = T::Annotation[tag].unwrap().field
+    val at = d.offset()
+    val start = d.mark()
+
+    if d.peek()? != Token.Struct then return Err(refusal(Expected("an object"), at))
+
+    d.begin_struct()?
+
+    var name: Option[string] = None
+
+    loop
+        val k = d.next_key()?
+
+        if k.is_none() then break
+
+        if k.unwrap() == key
+            val tag_at = d.offset()
+
+            name = Some(d.str() match
+                Ok(s) -> s
+                Err(e) -> return Err(within(e, 0, key, 0)))
+
+            if !has_variant[T](name.unwrap()) then return Err(refusal(UnknownVariant(name.unwrap(), T::BaseName), tag_at))
+
+            break
+
+        d.skip_value()?
+
+    if name.is_none() then return Err(refusal(NoTag(key), at))
+
+    d.rewind(start)
+
+    val which = variant_index[T](name.unwrap())
+
+    if const T::Annotation[content].is_none()
+        if variant_fields[T](which) == 0
+            d.begin_struct()?
+
+            loop
+                val k = d.next_key()?
+
+                if k.is_none() then break
+
+                val kat = d.offset()
+
+                if k.unwrap() != key && T::Annotation[deny_unknown].is_some()
+                    return Err(refusal(Unknown(k.unwrap(), name.unwrap()), kat))
+
+                d.skip_value()?
+
+            return Ok(unit_variant[T](which))
+
+        decode_payload[T, D](d, which, key) match
+            Ok(v) -> Ok(v)
+            Err(e) -> Err(within(e, 1, name.unwrap(), 0))
+    else
+        val body = T::Annotation[content].unwrap().field
+        var out: Option[T] = None
+        var end: usize = 0
+
+        d.begin_struct()?
+
+        loop
+            val kat = d.offset()
+            val k = d.next_key()?
+
+            if k.is_none()
+                end = kat
+                break
+
+            if k.unwrap() == body
+                out = Some(decode_named[T, D](d, name.unwrap(), kat)?)
+            else
+                if k.unwrap() != key && T::Annotation[deny_unknown].is_some()
+                    return Err(refusal(Unknown(k.unwrap(), T::BaseName), kat))
+
+                d.skip_value()?
+
+        if out.is_some() then return Ok(out.unwrap())
+        if variant_fields[T](which) == 0 then return Ok(unit_variant[T](which))
+
+        Err(within(refusal(Missing(body), end), 1, name.unwrap(), 0))
+end decode_tagged
+
+private has_variant[T](name: string) -> bool
+    for const c in T::Variants
+        if name == variant_name[T](c.index) then return true
+
+    false
+
+private variant_index[T](name: string) -> usize
+    for const c in T::Variants
+        if name == variant_name[T](c.index) then return c.index
+
+    0
+
+private variant_fields[T](which: usize) -> usize
+    for const c in T::Variants
+        if c.index == which then return c::Fields.len
+
+    0
+
+// The variant `which`, which has no fields.
+private unit_variant[T](which: usize) -> T
+    for const c in T::Variants
+        if const c::Fields.len == 0
+            if c.index == which then return T::Make(c, ())
+
+    panic(s"${T::BaseName} has no variant $which without fields")
+end unit_variant
+
+// -- the library's own types -----------------------------------------------------------------------
+
+impl Encode for bool
+    encode[E: Encoder](self, e: *E) = e.bool(self)
+
+impl Decode for bool
+    decode[D: Decoder](d: *D) -> Result[bool, CodecError] = d.bool()
+
+/** Every integer width up to 64 bits, signed or not, read with its range checked. */
+impl[T: Integer] Encode for T
+    encode[E: Encoder](self, e: *E)
+        @assert(sizeof(T) <= 8, s"${T::Name} is wider than 64 bits, which the codec does not carry")
+        e.int(i128(self))
+
+
+impl Encode for real
+    encode[E: Encoder](self, e: *E) = e.real(self)
+
+impl Decode for real
+    decode[D: Decoder](d: *D) -> Result[real, CodecError] = d.real()
+
+impl Encode for f32
+    encode[E: Encoder](self, e: *E) = e.real(real(self))
+
+impl Decode for f32
+    decode[D: Decoder](d: *D) -> Result[f32, CodecError] = Ok(f32(d.real()?))
+
+impl Encode for string
+    encode[E: Encoder](self, e: *E) = e.str(self)
+
+impl Decode for string
+    decode[D: Decoder](d: *D) -> Result[string, CodecError] = d.str()
+
+/** A character is a string of one. */
+impl Encode for char
+    encode[E: Encoder](self, e: *E) = e.str(s"$self")
+
+impl Decode for char
+    decode[D: Decoder](d: *D) -> Result[char, CodecError]
+        val at = d.offset()
+        val s = d.str()?
+        var out: Option[char] = None
+        var n: usize = 0
+
+        for c in s.chars
+            out = Some(c)
+            n += 1
+
+        if n != 1 then Err(refusal(Expected("one character"), at)) else Ok(out.unwrap())
+end char
+
+/** `None` is the format's null; a field left out of the input reads as `None`. */
+impl[T] Encode for Option[T]
+    encode[E: Encoder](self, e: *E) = self match
+        Some(v) -> encode(v, e)
+        None -> e.none()
+
+impl[T] Decode for Option[T]
+    decode[D: Decoder](d: *D) -> Result[Option[T], CodecError] =
+        if d.none()? then Ok(None) else Ok(Some(decode[T, D](d)?))
+
+    override when_missing() -> Option[Option[T]] = Some(None)
+
+impl[T] Encode for Buf[T]
+    encode[E: Encoder](self, e: *E)
+        e.begin_seq(self.len())
+
+        for i in 0..<self.len()
+            e.item()
+            encode(self.at(i), e)
+
+        e.end_seq()
+
+impl[T] Decode for Buf[T]
+    decode[D: Decoder](d: *D) -> Result[Buf[T], CodecError]
+        var out: Buf[T] = buf()
+
+        d.begin_seq()?
+
+        while d.next_item()?
+            out.push(decode[T, D](d) match
+                Ok(v) -> v
+                Err(e) -> return Err(within(e, 2, "", out.len())))
+
+        Ok(out)
+
+impl[K: Hash + Eq] Encode for Set[K]
+    encode[E: Encoder](self, e: *E)
+        e.begin_seq(self.len())
+
+        var w = self.walk()
+
+        loop
+            val k = w.next()
+
+            if k.is_none() then break
+
+            e.item()
+            encode(k.unwrap(), e)
+
+        e.end_seq()
+
+impl[K: Hash + Eq] Decode for Set[K]
+    decode[D: Decoder](d: *D) -> Result[Set[K], CodecError]
+        val out: Set[K] = set()
+        var i: usize = 0
+
+        d.begin_seq()?
+
+        while d.next_item()?
+            out.add(decode[K, D](d) match
+                Ok(v) -> v
+                Err(e) -> return Err(within(e, 2, "", i)))
+            i += 1
+
+        Ok(out)
+
+/** A map with `string` keys is an object; with any other key, a sequence of `[key, value]` pairs. */
+impl[K: Hash + Eq, V] Encode for Map[K, V]
+    encode[E: Encoder](self, e: *E)
+        var w = self.walk()
+
+        if const K::Kind == Kind.String
+            e.begin_struct("", self.len())
+        else
+            e.begin_seq(self.len())
+
+        loop
+            val kv = w.next()
+
+            if kv.is_none() then break
+
+            val pair = kv.unwrap()
+
+            if const K::Kind == Kind.String
+                e.field(pair.0)
+                encode(pair.1, e)
+            else
+                e.item()
+                encode(pair, e)
+
+        if const K::Kind == Kind.String then e.end_struct() else e.end_seq()
+
+impl[K: Hash + Eq, V] Decode for Map[K, V]
+    decode[D: Decoder](d: *D) -> Result[Map[K, V], CodecError]
+        val out: Map[K, V] = map()
+
+        if const K::Kind == Kind.String
+            d.begin_struct()?
+
+            loop
+                val at = d.offset()
+                val k = d.next_key()?
+
+                if k.is_none() then break
+
+                val key = k.unwrap()
+
+                if out.has(key) then return Err(refusal(Duplicate(key), at))
+
+                out.put(key, decode[V, D](d) match
+                    Ok(v) -> v
+                    Err(e) -> return Err(within(e, 3, key, 0)))
+        else
+            var i: usize = 0
+
+            d.begin_seq()?
+
+            while d.next_item()?
+                val pair = decode[(K, V), D](d) match
+                    Ok(v) -> v
+                    Err(e) -> return Err(within(e, 2, "", i))
+
+                out.put(pair.0, pair.1)
+                i += 1
+
+        Ok(out)
+    end decode
+
+impl Default for bool
+    default() -> bool = false
+
+impl Default for real
+    default() -> real = 0.0
+
+impl Default for string
+    default() -> string = ""
+
+impl[T] Default for Option[T]
+    default() -> Option[T] = None
+
+impl[T] Default for Buf[T]
+    default() -> Buf[T] = buf()
+
+impl[K: Hash + Eq] Default for Set[K]
+    default() -> Set[K] = set()
+
+impl[K: Hash + Eq, V] Default for Map[K, V]
+    default() -> Map[K, V] = map()

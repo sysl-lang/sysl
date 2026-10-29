@@ -60,7 +60,8 @@ without asking; everything below it is [imported](/reference/modules/) by name.
 | [`sysl.slices`](/library/slices/) | what a program does *to* a `[]T` — searching, comparing, `reverse`, `copy`, two sorts that neither allocate, `binary_search`, and `as_ptr` for a C binding | — |
 | [`sysl.seq`](/library/seq/) | what a program asks *of* a sequence — `map`, `filter`, `fold`, `any`, `all`, `find`, `position`, `count_where`, `each`, `flat_map`, on a slice or a `Buf` alike | — |
 | [`sysl.encoding`](/library/encoding/) | hexadecimal and base64 both ways, fixed-width integers to and from bytes at either byte order, and `DecodeError` | — |
-| [`sysl.encoding.json`](/library/json/) | JSON read into a `Json` tree that keeps its order and its integers, written back compactly or `pretty`, and refused with a `JsonError` naming line and column | — |
+| [`sysl.encoding.json`](/library/json/) | JSON read into a `Json` tree that keeps its order and its integers, written back compactly or `pretty`, and refused with a `JsonError` naming line and column; `to_json`/`from_json` for any type that derives `Codec` | — |
+| [`sysl.codec`](/library/codec/) | `derives Codec` on a struct or an enum, read and written by any format — the `Encode`/`Decode` traits, a format's `Encoder`/`Decoder`, `@rename`, `@default`, `@skip`, `@flatten`, `@tag`, and a `CodecError` naming the path and the byte | — |
 | [`sysl.crypto`](/library/crypto/) | the SHA-2 family, SHA-1 and HMAC over any of them — digests as bytes, a hasher that streams, and no allocator | — |
 | [`sysl.checksum`](/library/checksum/) | CRC-32 (the zip, PNG and Ethernet one) — `crc32` in one call, or `Crc32` fed in pieces; for accidental corruption, not security | — |
 | [`sysl.hint`](/library/hint/) | `black_box`, an identity the optimizer must treat as opaque, so a test or a benchmark keeps a value of any type from being folded or dropped | — |

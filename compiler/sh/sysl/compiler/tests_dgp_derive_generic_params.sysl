@@ -265,6 +265,94 @@ dgp_trait_in_another_module()
         """)], " x=3 y=4\n")
 end dgp_trait_in_another_module
 
+// The bound a derived member's own parameter names is the trait module's, as the rest of its
+// signature is: a program deriving `Show` imports only `Show`, and its own `Sink` -- here a struct, a
+// name that is no trait at all -- is not what `S: Sink` means.
+private dgp_fmt_module() -> (string, string, string) = ("fmt", "f.sysl", raw"""
+    module fmt
+
+    trait Sink
+        put(*self, s: string)
+        next(*self) -> int
+
+    trait Show
+        show[S: Sink](self, s: *S)
+
+        derive[T] show[S: Sink](self: T, s: *S)
+            for const f in T::Fields
+                s.put(s" ${f.name}=")
+                self.(f).show(s)
+
+    trait Read
+        read[S: Sink](s: *S) -> Self
+
+        derive[T] read[S: Sink](s: *S) -> T
+            var out: T
+
+            for const f in T::Fields
+                out.(f) = f::Type.read(s)
+
+            out
+
+    impl Show for int
+        show[S: Sink](self, s: *S) = s.put(s"$self")
+
+    impl Read for int
+        read[S: Sink](s: *S) -> int = s.next()
+
+    struct Text
+        out: string
+        n: int
+
+    impl Sink for Text
+        put(*self, s: string) = self.out = self.out + s
+        next(*self) -> int
+            self.n += 1
+            self.n
+
+    text() -> Text = Text("", 0)
+    """)
+
+@test("a derived member's own bound is named in the trait's module, not the deriving program's")
+dgp_bound_read_in_the_trait_module()
+    if !azb_ready() then return
+
+    azb_prints([("", "main.sysl", raw"""
+        import fmt.{Show, text}
+
+        struct Sink
+            unrelated: int
+
+        struct Pt derives Show
+            x: int
+            y: int
+
+        var t = text()
+        Pt(3, 4).show(&t)
+        print(t.out, Sink(1).unrelated)
+        """), dgp_fmt_module()], " x=3 y=4 1\n")
+end dgp_bound_read_in_the_trait_module
+
+@test("and so is a receiverless derived member's, with the program's own 'Sink' a trait of its own")
+dgp_receiverless_bound_read_in_the_trait_module()
+    if !azb_ready() then return
+
+    azb_prints([("", "main.sysl", raw"""
+        import fmt.{Read, text}
+
+        trait Sink
+            other(self) -> int
+
+        struct Pt derives Read
+            x: int
+            y: int
+
+        var t = text()
+        val p = Pt.read(&t)
+        print(p.x, p.y)
+        """), dgp_fmt_module()], "1 2\n")
+end dgp_receiverless_bound_read_in_the_trait_module
+
 @test("the trait-object form, 'e: *Encoder', still derives (the codec probe p11)")
 dgp_trait_object_form()
     if !azb_ready() then return
