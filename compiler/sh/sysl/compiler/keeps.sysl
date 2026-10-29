@@ -2656,7 +2656,14 @@ private frame_stored(ft: &FrameTrack, evs: &EvBuf, place: TExpr, v: TExpr)
 
     val loc = place_loc(ft.org, place)
 
-    if !frame_lasting(ft, loc, 0) then return
+    if !frame_lasting(ft, loc, 0)
+        if !ft.probe || image || loc.starts_with("l:") || probe_own_place(ft, place) then return
+
+        ft.faults.items.push((ft.scope, v.span, probe_why(core.unwrap(),
+            s"it is stored in '${place_written(ft.scope, place)}' ${probe_line(ft.scope, v.span)}, which " +
+            s"'${ft.owner}' cannot show is its own storage")))
+        return
+    end if
 
     // **An address as an integer stored where it outlives the frame is a number** -- a stack's top
     // remembered to measure its depth by -- **until a `ptr_cast` may turn it back into a pointer**.
@@ -2684,6 +2691,75 @@ private frame_stored(ft: &FrameTrack, evs: &EvBuf, place: TExpr, v: TExpr)
     if loc.index_of("?").is_some() then ft.faults.items.push((ft.scope, v.span, said))
     else evs.items.push(FlowEv(false, loc, said, v.span))
 end frame_stored
+
+// **For a probe, a closure stored anywhere but this frame's own storage outlives the frame**: through
+// a pointer a call answered (`current().sink = f`), one read out of a field or a global, a `Buf` or a
+// slice -- storage that someone else may hold, whatever the frame does next. A place is the frame's
+// own when it is reached, by fields and array elements only, from a local bound once to an object
+// this frame made (`val r: &R = R(…)`), which `probe_hold_through` follows as holding what is stored.
+private probe_own_place(ft: &FrameTrack, place: TExpr) -> bool
+    *place.kind match
+        TField(r, _, _) -> probe_own_place(ft, r)
+        TIndex(r, _, _) -> is_array_type(texpr_type(r)) && probe_own_place(ft, r)
+        TDeref(x, _) -> *x.kind match
+            TLoad(_, _) -> probe_own_place(ft, x)
+            _ -> false
+        TLoad(n, _) ->
+            for item in ft.refs
+                if item.0 == n then return probe_own_place(ft, item.1)
+
+            for item in ft.inits
+                if item.0 == n
+                    return *item.1.kind match
+                        TBox(_, _) -> true
+                        TStructNew(_, _) -> true
+                        _ -> false
+                end if
+            end for
+
+            false
+        _ -> false
+end probe_own_place
+
+// A place reached through calls as the reader wrote it, with the bracket closing a subscript that
+// ends it.
+private place_written(scope: Scope, place: TExpr) -> string
+    val at = written_through(place)
+    val closes = at.end < scope.src.bytes.len && scope.src.bytes[at.end] == u8(']')
+
+    source_text(scope, if closes then Span(at.start, at.end + 1) else at)
+end place_written
+
+// Where a place reached through calls is written in full: a field's span is its name, a method call's
+// is its name and arguments, and a `Buf` element's is its subscript, so the receiver each is reached
+// through is joined in (`world().vm_of().sink`, `current().fs[0]`).
+private written_through(place: TExpr) -> Span
+    var parts: Buf[TExpr] = buf()
+
+    *place.kind match
+        TField(r, _, _) -> parts.push(r)
+        TIndex(r, i, _) ->
+            parts.push(r)
+            parts.push(i)
+        TDeref(x, _) -> parts.push(x)
+        TCall(_, args, _, _) -> parts.extend(args.view())
+        TVCall(recv, _, args, _, _) ->
+            parts.push(recv)
+            parts.extend(args.view())
+        _ -> ()
+
+    var start = place.span.start
+    var stop = place.span.end
+
+    for part in parts
+        val at = written_through(part)
+
+        if at.start < start then start = at.start
+        if at.end > stop then stop = at.end
+    end for
+
+    Span(start, stop)
+end written_through
 
 // **Storage outlives the frame when it is module storage or reached through a parameter** -- by a
 // path the body names (`p0:.next`), or through a pointer read out of one (`d:p0:.vm>{*M}.con`), the
