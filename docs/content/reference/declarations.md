@@ -358,7 +358,7 @@ print(narrow(i))
 ```
 
 ```error
-'n' of 'narrow' is byte, but usize was given
+'n' of 'narrow' is u8, but usize was given
 ```
 
 **A `for` over a range whose bounds are both bare literals follows the same rule.** In `for s in

@@ -1582,6 +1582,62 @@ Because an alias is a name and not a type, everything the base has is available 
 of one name is accepted where the other is expected, a struct is constructed and read through the
 alias, and a method or trait implementation declared on the base applies to the alias unchanged.
 
+### How a diagnostic names a type
+
+**A diagnostic names a type the way the declaration it points at wrote it.** The spelling is carried
+beside the type rather than in it, so `u16` and `ushort`, or `MaybeInt` and `Option[int]`, stay one
+type to every check; only the message differs. Where the spelling names an alias that reads
+differently from the type it stands for, the message adds the real type after `aka`:
+
+```sysl
+type Celsius = real
+
+val boiling: Celsius = 100.0
+val s: string = boiling
+```
+
+```error
+declared string but the value is Celsius (aka real)
+```
+
+Which spelling a message shows:
+
+- **A declared type** — a binding's annotation, a parameter, a struct field, a function's result —
+  is quoted as that declaration wrote it: `val x: u16` is called `u16`, and `val y: ushort` is called
+  `ushort`.
+- **A value** is quoted as the declaration it was read from wrote it: a local by its binding, a call
+  by its function's declared result, a field by the struct's declaration of it, module storage by
+  its annotation. A local binding with no annotation takes the spelling of the value it was
+  initialised from.
+- **Where two spellings meet** — `a: u16` given to `b: ushort`, a `Buf[P]` where a `Buf[Point]` is
+  wanted — each side keeps its own: the expected side is the declaration's, the given side the
+  value's.
+- **Everything else is shown canonically**: a value with no declaration behind it (a literal, an
+  arithmetic result, a method's result, module storage written with no type), and a written type that names a type parameter, so a generic's `T` at a call
+  is shown as the type it was instantiated with. The canonical name of a width that has a built-in
+  alias is that alias (`int`, `ushort`, `real`).
+
+`aka` is shown only for an alias declared with `type`, and only where its expansion is spelled
+differently: `P (aka Point)`, `Cb (aka Fn(int) -> int)`, an alias of an alias by the type at the
+bottom of the chain. **A built-in width name is never an alias for this purpose** — `ushort` and
+`u16` are both the type's own names, so neither earns an `aka`.
+
+```sysl
+type P = Point
+
+struct Point
+    x: int
+
+takes(p: P) -> int = p.x
+
+val q: u16 = 1
+val r = takes(q)
+```
+
+```error
+'p' of 'takes' is P (aka Point), but u16 was given
+```
+
 A distinct type — one the compiler will not let you confuse with its base — is a **constrained
 type**, written with `new` and covered under [contracts](/tour/contracts/). A `new` type may take
 type parameters that change which type it is but not how it is laid out: `UserPtr[Frame]` and

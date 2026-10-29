@@ -647,6 +647,7 @@ analyze_body(a: &Analysis, scope: Scope, span: Span, d: FuncDecl, key: string = 
         if holds_string(d.marks.copies, p.name) then cx.copied.push(unique)
 
         params.push((unique, ty))
+        cx.spell_binding(unique, spelling_of(p.typ, ty, d.tparams))
 
     // **A function that declares no result hands nothing back**, so its body is read with nothing
     // expected and the value it comes to is discarded. A body written `= value` with no result
@@ -659,6 +660,7 @@ analyze_body(a: &Analysis, scope: Scope, span: Span, d: FuncDecl, key: string = 
     cx.decl_name = d.name
     cx.views_self = d.marks.views
     cx.ret_ty = Some(ret)
+    cx.ret_spelled = if d.marks.is_async() then None else spelling_of_opt(d.ret_type, ret, d.tparams)
     cx.await_site = await_site_of(d)
     cx.ret_is_list = written.is_some() && is_result_list(written.unwrap())
     cx.result_chain = cx.ret_is_list
@@ -676,7 +678,8 @@ analyze_body(a: &Analysis, scope: Scope, span: Span, d: FuncDecl, key: string = 
     // unless the body is an `if` of literals one of which disagrees with the rest (`misfit_literal`).
     if ret != Unit && body.result.is_some() && disagree(body.ty, ret) then
         cx.fault(misfit_literal(body.result.unwrap(), ret).map(l -> l.span).unwrap_or(span),
-                 body_disagreement(name, ret, body.ty, cx.ret_is_list))
+                 body_disagreement(name, ret, body.ty, cx.ret_is_list, cx.ret_spelled,
+                                   spelling_at(cx, body.result.unwrap(), body.ty)))
 
     a.tables.homes.put(name, scope)
 
@@ -916,7 +919,10 @@ private check_abstract_body(a: &Analysis, scope: Scope, d: FuncDecl, keep: bool 
     remember_bounds(cx, d)
 
     for p in d.params
-        val unique = cx.bind(p.name, resolve_type(a, scope, p.typ, subst), written_name(cx, p.span.start, p.name))
+        val pty = resolve_type(a, scope, p.typ, subst)
+        val unique = cx.bind(p.name, pty, written_name(cx, p.span.start, p.name))
+
+        cx.spell_binding(unique, spelling_of(p.typ, pty, d.tparams))
 
         if p.by_name then cx.by_name.push(unique)
         if holds_string(d.marks.copies, p.name) then cx.copied.push(unique)
@@ -931,6 +937,7 @@ private check_abstract_body(a: &Analysis, scope: Scope, d: FuncDecl, keep: bool 
     cx.decl_name = d.name
     cx.views_self = d.marks.views
     cx.ret_ty = Some(ret)
+    cx.ret_spelled = if d.marks.is_async() then None else spelling_of_opt(d.ret_type, ret, d.tparams)
     cx.await_site = await_site_of(d)
     cx.ret_is_list = written_result_list(d.ret_type)
     cx.result_chain = cx.ret_is_list
@@ -1036,7 +1043,10 @@ opaque_body_type(a: &Analysis, scope: Scope, d: FuncDecl) -> Type
     remember_bounds(cx, d)
 
     for p in d.params
-        val unique = cx.bind(p.name, resolve_type(a, scope, p.typ, subst), written_name(cx, p.span.start, p.name))
+        val pty = resolve_type(a, scope, p.typ, subst)
+        val unique = cx.bind(p.name, pty, written_name(cx, p.span.start, p.name))
+
+        cx.spell_binding(unique, spelling_of(p.typ, pty, d.tparams))
 
         if p.by_name then cx.by_name.push(unique)
         if holds_string(d.marks.copies, p.name) then cx.copied.push(unique)
@@ -1260,7 +1270,8 @@ end declared_key
 //
 // **A result list is quoted as it was written** -- `int, int`, not the tuple it lays out as -- since
 // the declaration is what the reader is being pointed at.
-body_disagreement(name: string, ret: Type, got: Type, listed: bool) -> string
+body_disagreement(name: string, ret: Type, got: Type, listed: bool, ret_spelled: Option[Spelling] = None,
+                  got_spelled: Option[Spelling] = None) -> string
     if name.ends_with("$pred") then
         return s"a 'where' predicate must be a 'bool', but this one is ${type_show(got)}"
 
@@ -1269,8 +1280,8 @@ body_disagreement(name: string, ret: Type, got: Type, listed: bool) -> string
 
     val declared = if listed then as_written_results(ret) else ret
 
-    s"function '$name' should return ${type_show(declared)}, but its body yields " +
-        s"${type_show(got)}${await_hint(got, ret)}"
+    s"function '$name' should return ${spelled_show(declared, if listed then None else ret_spelled)}, " +
+        s"but its body yields ${spelled_show(got, got_spelled)}${await_hint(got, ret)}"
 end body_disagreement
 
 // The tuple a result list lays out as, given back its written shape for a diagnostic.
@@ -1864,8 +1875,9 @@ private module_storage(a: &Analysis) -> Buf[TVal]
 
                     if disagree(got, ty) then
                         cx.fault(misfit_literal(init.unwrap(), ty).map(l -> l.span).unwrap_or(d.span),
-                                 s"cannot initialize $what: declared ${type_show(ty)} but " +
-                                 s"the value is ${type_show(got)}${await_hint(got, ty)}")
+                                 s"cannot initialize $what: declared " +
+                                 s"${spelled_show(ty, spelling_of_opt(d.typ, ty, buf()))} but " +
+                                 s"the value is ${expr_type_show(cx, init.unwrap())}${await_hint(got, ty)}")
 
                     refuse_storage_slots(cx, init.unwrap())
                 else if !mentions_unknown(ty) && !has_zero(ty)

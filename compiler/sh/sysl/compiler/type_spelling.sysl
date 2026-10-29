@@ -1,0 +1,239 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+
+// How a diagnostic names a type the way the program wrote it.
+//
+// **A `Type` is canonical and stays so**: `u16` and `ushort` are one type, and an alias dissolves into
+// what it names, so `MaybeInt` and `Option[int]` are one type too. Unification, equality and every
+// table key see only that. What the reader wrote is carried BESIDE the type, as a `Spelling` held by
+// the declaration that wrote it -- a local's binding, a parameter, a field, a function's result -- and
+// it is asked for only when a diagnostic is composed. Nothing that decides anything ever reads one.
+//
+// **Which spelling a diagnostic shows** is the spelling of the declaration each side of it comes
+// from: the declared side quotes its own annotation, and a value quotes the declaration it was read
+// from -- a local by its binding (or, for one with no annotation, by the value it was inferred from),
+// a call by its function's written result, a field by the struct's field. A value with no such
+// declaration, and a written type that names a type parameter, is shown canonically (`type_show`).
+//
+// **`aka` is shown when the spelling names an alias and reads differently from the canonical type**,
+// as clang does: `MaybeInt (aka Option[int])`. A built-in width name is never an alias for this
+// purpose -- `ushort` and `u16` are both the type's own names, so either is shown as written and
+// neither earns an `aka`.
+
+// A type as a declaration wrote it: the text, and whether the text names an alias anywhere in it.
+struct Spelling
+    text: string
+    aliased: bool
+end Spelling
+
+// The type as a diagnostic quotes it, where the spelling is shown bare and the message supplies
+// any quotes: `MaybeInt (aka Option[int])`, `u16`, or the canonical name where nothing was written.
+spelled_show(t: Type, s: Option[Spelling]) -> string = s match
+    None -> type_show(t)
+    Some(sp) ->
+        val canonical = type_show(t)
+
+        if sp.aliased && sp.text != canonical then s"${sp.text} (aka $canonical)" else sp.text
+
+// What a written type is a spelling of, checked against the type it resolved to: `None` where the
+// two cannot be told apart part for part, or where the text names one of `tparams` standing for
+// something else -- a generic's `T` read at an instantiation is not what the reader of the call wrote.
+spelling_of(written: TypeRef, t: Type, tparams: Buf[string]) -> Option[Spelling] =
+    spell_verdict(written, t, tparams) match
+        SpellUntrusted -> None
+        SpellPlain -> Some(Spelling(type_text(written), false))
+        SpellAliased -> Some(Spelling(type_text(written), true))
+
+// The same where the written type may be absent.
+spelling_of_opt(written: Option[TypeRef], t: Type, tparams: Buf[string]) -> Option[Spelling] =
+    written match
+        Some(w) -> spelling_of(w, t, tparams)
+        None -> None
+
+private enum SpellVerdict
+    SpellUntrusted
+    SpellPlain
+    SpellAliased
+end SpellVerdict
+
+// Two parts' verdicts as one: a part that cannot be trusted spoils the whole, and an alias anywhere
+// makes the whole an alias's spelling.
+private spell_join(a: SpellVerdict, b: SpellVerdict) -> SpellVerdict = a match
+    SpellUntrusted -> SpellUntrusted
+    SpellAliased -> if b == SpellUntrusted then SpellUntrusted else SpellAliased
+    SpellPlain -> b
+
+private spell_list(ws: Buf[TypeRef], ts: Buf[Type], tparams: Buf[string]) -> SpellVerdict
+    if ws.len() > ts.len() then return SpellUntrusted
+
+    var v = SpellPlain
+
+    for i in 0..<ws.len()
+        v = spell_join(v, spell_verdict(ws.at(i), ts.at(i), tparams))
+
+    v
+end spell_list
+
+private spell_verdict(w: TypeRef, t: Type, tparams: Buf[string]) -> SpellVerdict = *w.kind match
+    NamedType(n, args) -> spell_named(n, args, t, tparams)
+    PtrType(wi) -> t match
+        Ptr(ti) -> spell_verdict(wi, *ti, tparams)
+        _ -> SpellUntrusted
+    RefType(wi, ws) -> t match
+        Ref(ti, ts) -> if ws == ts then spell_verdict(wi, *ti, tparams) else SpellUntrusted
+        _ -> SpellUntrusted
+    WeakType(wi) -> t match
+        Weak(ti) -> spell_verdict(wi, *ti, tparams)
+        _ -> SpellUntrusted
+    VolatileType(wi) -> t match
+        Volatile(ti) -> spell_verdict(wi, *ti, tparams)
+        _ -> SpellUntrusted
+    ArrayType(length, we, ro) -> t match
+        Slice(te, tro) -> if length.is_none() && ro == tro then spell_verdict(we, *te, tparams) else SpellUntrusted
+        Array(_, te) -> if length.is_some() then spell_verdict(we, *te, tparams) else SpellUntrusted
+        _ -> SpellUntrusted
+    VectorType(_, we) -> t match
+        Vector(_, te) -> spell_verdict(we, *te, tparams)
+        _ -> SpellUntrusted
+    TupleType(parts, results) -> t match
+        Struct(d) -> if !results && is_tuple(d) && parts.len() == d.targs.len() then spell_list(parts, d.targs, tparams)
+                     else SpellUntrusted
+        _ -> SpellUntrusted
+    FnType(params, ret, _) -> t match
+        Trait(n, targs, _) -> fn_parts(n, targs) match
+            Some(parts) ->
+                if parts.0.len() != params.len() then SpellUntrusted
+                else spell_join(spell_list(params, parts.0, tparams), spell_verdict(ret, parts.1, tparams))
+            None -> SpellUntrusted
+        _ -> SpellUntrusted
+    CFnType(params, ret) -> t match
+        CFn(ps, r) -> if ps.len() != params.len() then SpellUntrusted
+                      else spell_join(spell_list(params, ps, tparams), spell_verdict(ret, *r, tparams))
+        _ -> SpellUntrusted
+    _ -> SpellUntrusted
+
+// A name, written with or without its module: the type's own name, a built-in name for a scalar, or
+// an alias -- anything else that resolved to this type. A type parameter and `Self` are neither the
+// type's name nor an alias of it, so the spelling is not trusted.
+private spell_named(n: string, args: Buf[TypeRef], t: Type, tparams: Buf[string]) -> SpellVerdict
+    if n == "Self" then return SpellUntrusted
+
+    t match
+        Abstract(_, _) -> return if args.is_empty() && n == type_show(t) then SpellPlain else SpellUntrusted
+        _ -> ()
+
+    for p in tparams
+        if p == n then return SpellUntrusted
+
+    if args.is_empty() && scalar_named(n, 64).is_some()
+        // A built-in name that resolved to something other than a scalar was wrapped on the way (an
+        // `async` result), so it is not this type's spelling.
+        return if is_scalar_shape(t) then SpellPlain else SpellUntrusted
+
+    if args.is_empty() && is_scalar_shape(t) && n == canonical_text(t) then return SpellPlain
+
+    own_name(t) match
+        Some(own) ->
+            if last_segment(n) == own.0
+                return if args.is_empty() then SpellPlain else spell_list(args, own.1, tparams)
+        None -> ()
+
+    // An alias's own arguments are what the alias takes, not what the type it names takes, so they
+    // are shown as written and not paired with anything.
+    SpellAliased
+end spell_named
+
+// The name a nominal type is declared under, and its type arguments.
+private own_name(t: Type) -> Option[(string, Buf[Type])] = t match
+    Struct(d) ->
+        if is_tuple(d) || is_closure_literal(t) then None
+        else if d.base == TaskBase then Some(("Task", d.targs))
+        else Some((module_bare(d.base), d.targs))
+    Enum(d) -> Some((module_bare(d.base), d.targs))
+    Constrained(d) ->
+        if d.targs.is_empty() then Some((module_bare(d.name), d.targs))
+        else Some((module_bare(d.generic), d.targs))
+    Trait(n, targs, assocs) -> if assocs.is_empty() then Some((module_bare(n), targs)) else None
+    _ -> None
+
+// Whether a type is one the language names with a word rather than declares.
+private is_scalar_shape(t: Type) -> bool = t match
+    Integer(_, _, _) -> true
+    Floating(_, _) -> true
+    Fixed(_, _, _) -> true
+    Bool -> true
+    Char -> true
+    Str -> true
+    Unit -> true
+    VaList -> true
+    _ -> false
+
+// What a typed value was read from, as that declaration wrote its type: a local by its binding, a
+// call by its function's declared result, a field by the struct's declaration of it. Anything else
+// has no declaration to quote, and is shown canonically.
+texpr_spelling(cx: &Analyzer, e: TExpr) -> Option[Spelling] = *e.kind match
+    TLoad(unique, _) ->
+        var i = cx.locals.len()
+
+        while i > 0
+            i -= 1
+
+            if cx.locals.at(i).unique == unique then return cx.locals.at(i).spelled
+
+        None
+    TCall(key, _, ty, results) ->
+        if results then return None
+
+        cx.an.tables.funcs.get(key) match
+            Some(f) ->
+                if f.decl.marks.is_async() || !f.decl.tparams.is_empty() then None
+                else spelling_of_opt(f.decl.ret_type, ty, f.decl.tparams)
+            None -> None
+    // Module storage, by its declaration's annotation; storage that wrote none is shown canonically.
+    TGlobal(symbol, ty, _) -> cx.an.tables.vals.get(symbol) match
+        Some(d) -> spelling_of_opt(d.typ, ty, buf())
+        None -> None
+    TField(receiver, index, ty) -> texpr_type(receiver) match
+        Struct(d) -> field_spelling(cx, d, index, ty)
+        Ref(inner, _) -> *inner match
+            Struct(d) -> field_spelling(cx, d, index, ty)
+            _ -> None
+        _ -> None
+    _ -> None
+
+// A typed value's type as a diagnostic quotes it: its declaration's spelling where it has one.
+expr_type_show(cx: &Analyzer, e: TExpr) -> string = spelled_show(texpr_type(e), texpr_spelling(cx, e))
+
+// A value's spelling where the type a message quotes is the value's own, and nothing where the
+// message quotes something it became.
+spelling_at(cx: &Analyzer, e: TExpr, t: Type) -> Option[Spelling] =
+    if type_eq(texpr_type(e), t) then texpr_spelling(cx, e) else None
+
+// The type parameters a body is being read under, by name -- what a type written inside it may
+// name that is not a type of its own.
+subst_names(cx: &Analyzer) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for b in cx.subst
+        out.push(b.name)
+
+    out
+end subst_names
+
+// How a local binding names its type: its annotation where it wrote one, and otherwise the
+// spelling of the value it was inferred from.
+binding_spelling(cx: &Analyzer, written: Option[TypeRef], ty: Type, value: TExpr) -> Option[Spelling] =
+    written match
+        Some(w) -> spelling_of(w, ty, subst_names(cx))
+        None -> if type_eq(texpr_type(value), ty) then texpr_spelling(cx, value) else None
+
+// A struct's field as its declaration wrote it, at the type it has in this struct.
+field_spelling(cx: &Analyzer, d: &StructType, index: int, ty: Type) -> Option[Spelling] =
+    cx.an.tables.types.get(d.base) match
+        Some(decl) -> decl.kind match
+            StructOf(sd) ->
+                if index < 0 || usize(index) >= sd.fields.len() then None
+                else spelling_of(sd.fields.at(usize(index)).typ, ty, sd.tparams)
+            _ -> None
+        None -> None

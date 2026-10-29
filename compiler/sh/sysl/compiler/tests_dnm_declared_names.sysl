@@ -1,0 +1,252 @@
+module sh.sysl.compiler
+@tests
+
+// A diagnostic names a type the way the declaration it points at wrote it (`type_spelling.sysl`),
+// with `aka` and the canonical type where the spelling is an alias that reads differently.
+//
+// The axes: the spelling (a width name, a built-in alias of one, a user alias of each kind of type,
+// an alias of an alias, an alias inside a type argument, a generic alias); the declaration it comes
+// from (a local's annotation, an inferred local, a parameter, a function's result, a struct field,
+// a module's alias reached through an import); the diagnostic's side (declared or given) and form
+// (initialisation, argument, constructor field, assignment, `return`, a body's yield); and the type
+// parameter that must NOT be quoted as written. Types stay equal whatever they were spelled, which the
+// clean programs here pin. A canonical name in an `aka` is matched loosely, since how a library type
+// is qualified is the business of the short-names change, not of this one.
+
+// Each diagnostic the program gives, as `line:col message`.
+private dnm_diags(text: string) -> string = isc_diags(text)
+
+// The program is refused, and something it says contains `part`.
+private dnm_says(text: string, part: string)
+    val said = dnm_diags(text)
+
+    assert(said.contains(part), s"expected '$part', got: $said")
+end dnm_says
+
+// The program is refused, says `part`, and never says `absent`.
+private dnm_says_not(text: string, part: string, absent: string)
+    val said = dnm_diags(text)
+
+    assert(said.contains(part), s"expected '$part', got: $said")
+    assert(!said.contains(absent), s"did not expect '$absent', got: $said")
+end dnm_says_not
+
+// The program compiles without a word.
+private dnm_clean(text: string)
+    val said = dnm_diags(text)
+
+    assert(said == "", s"expected no diagnostic, got: $said")
+end dnm_clean
+
+private dnm_ready() -> bool = std_root().is_ok()
+
+// -- built-in width names ---------------------------------------------------------------------------
+
+@test("a width written 'u16' is called 'u16', not by its built-in alias")
+dnm_width_name_as_written()
+    if !dnm_ready() then return
+
+    dnm_says_not("val a: u16 = 1\nval s: string = a\n", "declared string but the value is u16", "aka")
+
+@test("a width written by its built-in alias is called by that alias, with no aka")
+dnm_builtin_alias_as_written()
+    if !dnm_ready() then return
+
+    dnm_says_not("val b: ushort = 2\nval s: string = b\n", "declared string but the value is ushort", "aka")
+    dnm_says_not("val i: i32 = 2\nval s: string = i\n", "declared string but the value is i32", "aka")
+    dnm_says_not("val r: f64 = 2.0\nval s: string = r\n", "declared string but the value is f64", "aka")
+
+@test("the declared side of an initialisation is quoted as its annotation wrote it")
+dnm_declared_side()
+    if !dnm_ready() then return
+
+    dnm_says("val a: u16 = \"x\"\n", "declared u16 but the value is string")
+    dnm_says("val a: ushort = \"x\"\n", "declared ushort but the value is string")
+
+@test("a value with no declaration behind it is shown canonically")
+dnm_literal_is_canonical()
+    if !dnm_ready() then return
+
+    dnm_says("val s: string = 1\n", "declared string but the value is int")
+
+// -- user aliases, by what they name ---------------------------------------------------------------
+
+@test("an alias of an Option is named, and aka gives the type it stands for")
+dnm_alias_of_option()
+    if !dnm_ready() then return
+
+    val src = "type MaybeInt = Option[int]\n\nval m: MaybeInt = None\nval s: string = m\n"
+
+    dnm_says(src, "value is MaybeInt (aka ")
+    dnm_says(src, "Option[int])")
+
+@test("an alias of a struct is named with aka")
+dnm_alias_of_struct()
+    if !dnm_ready() then return
+
+    dnm_says("struct Point\n    x: int\n\ntype P = Point\n\nval p: P = Point(1)\nval s: string = p\n",
+             "declared string but the value is P (aka Point)")
+
+@test("an alias of an enum is named with aka")
+dnm_alias_of_enum()
+    if !dnm_ready() then return
+
+    dnm_says("enum Color\n    Red\n    Green\n\ntype Hue = Color\n\nval h: Hue = Color.Red\nval s: string = h\n",
+             "declared string but the value is Hue (aka Color)")
+
+@test("an alias of an array is named with aka")
+dnm_alias_of_array()
+    if !dnm_ready() then return
+
+    dnm_says("type Triple = [3]int\n\nval t: Triple = [1, 2, 3]\nval s: string = t\n",
+             "declared string but the value is Triple (aka [3]int)")
+
+@test("an alias of a function type is named with aka")
+dnm_alias_of_function()
+    if !dnm_ready() then return
+
+    dnm_says("type Cmp = *extern(*u8, *u8) -> i32\n\nval c: Cmp = null\nval s: string = c\n",
+             "declared string but the value is Cmp (aka *extern(*byte, *byte) -> int)")
+
+@test("an alias of a scalar is named with aka, and is still the scalar")
+dnm_alias_of_scalar()
+    if !dnm_ready() then return
+
+    dnm_says("type Meters = int\n\nval m: Meters = 1\nval s: string = m\n",
+             "declared string but the value is Meters (aka int)")
+    dnm_clean("type Meters = int\n\nval m: Meters = 1\nval n: int = m\nval k: Meters = n\nprint(k)\n")
+
+@test("a generic alias is named with its arguments as written")
+dnm_generic_alias()
+    if !dnm_ready() then return
+
+    dnm_says("type Pair[A, B] = (A, B)\n\nval p: Pair[u16, int] = (1, 2)\nval s: string = p\n",
+             "declared string but the value is Pair[u16, int] (aka (ushort, int))")
+
+@test("an alias of an alias is named by the outer name, and aka is the type at the bottom")
+dnm_alias_of_alias()
+    if !dnm_ready() then return
+
+    val src = "type A = Option[int]\ntype B = A\n\nval b: B = None\nval s: string = b\n"
+
+    dnm_says(src, "value is B (aka ")
+    dnm_says(src, "Option[int])")
+
+@test("an alias inside a type argument makes the whole spelling an alias's")
+dnm_alias_in_type_argument()
+    if !dnm_ready() then return
+
+    val src = "struct Point\n    x: int\n\ntype P = Point\n\nval o: Option[P] = None\nval s: string = o\n"
+
+    dnm_says(src, "value is Option[P] (aka ")
+    dnm_says(src, "Option[Point])")
+
+@test("a type argument written as a width keeps its spelling, with no aka")
+dnm_width_in_type_argument()
+    if !dnm_ready() then return
+
+    dnm_says_not("val o: Option[u16] = None\nval s: string = o\n", "value is Option[u16]", "aka")
+
+@test("a struct's own name is never given an aka")
+dnm_own_name_has_no_aka()
+    if !dnm_ready() then return
+
+    dnm_says_not("struct Point\n    x: int\n\nval p: Point = Point(1)\nval s: string = p\n",
+                 "declared string but the value is Point", "aka")
+
+// -- where the spelling comes from -------------------------------------------------------------------
+
+@test("a local with no annotation takes the spelling of the value it was initialised from")
+dnm_inferred_local()
+    if !dnm_ready() then return
+
+    dnm_says("f() -> int\n    val a: u16 = 1\n    val c = a\n    val s: string = c\n    0\n",
+             "declared string but the value is u16")
+
+@test("a parameter is quoted inside its function as it was written")
+dnm_parameter_in_body()
+    if !dnm_ready() then return
+
+    dnm_says("f(n: u16) -> int\n    val s: string = n\n    0\n", "declared string but the value is u16")
+
+@test("a call's value is quoted as the function's declared result")
+dnm_call_result()
+    if !dnm_ready() then return
+
+    dnm_says("struct Point\n    x: int\n\ntype P = Point\n\ngives() -> P = Point(1)\n\nval s: string = gives()\n",
+             "declared string but the value is P (aka Point)")
+
+@test("a field read is quoted as the struct declared the field")
+dnm_field_read()
+    if !dnm_ready() then return
+
+    dnm_says("struct Box\n    w: u16\n\nval b = Box(1)\nval s: string = b.w\n", "declared string but the value is u16")
+
+@test("a constructor's field is quoted as the struct declared it")
+dnm_constructor_field()
+    if !dnm_ready() then return
+
+    dnm_says("struct Box\n    w: u16\n\nval b = Box(\"x\")\n", "'w' of 'Box' is u16, but string was given")
+
+@test("a parameter's mismatch quotes both sides as each was declared")
+dnm_argument_both_sides()
+    if !dnm_ready() then return
+
+    dnm_says("struct Point\n    x: int\n\ntype P = Point\n\ntakes(n: u16) -> int = 0\n\n" +
+             "val p: P = Point(1)\nval r = takes(p)\n",
+             "'n' of 'takes' is u16, but P (aka Point) was given")
+
+@test("an assignment quotes the place and the value as each was declared")
+dnm_assignment()
+    if !dnm_ready() then return
+
+    dnm_says("var v: u16 = 1\nval b: ushort = 2\nval t: bool = true\nv = t\n",
+             "cannot assign bool to")
+    dnm_says("var v: u16 = 1\nval b: ushort = 2\nval t: bool = true\nv = t\n", "of type u16")
+
+@test("a returned value and the declared result are quoted as written")
+dnm_return()
+    if !dnm_ready() then return
+
+    val src = "type MaybeInt = Option[int]\n\nf(n: ushort) -> MaybeInt\n    return n\n\nprint(1)\n"
+
+    dnm_says(src, "return type mismatch: expected MaybeInt (aka ")
+    dnm_says(src, ", got ushort")
+
+@test("a body's yield against its declared result is quoted as written")
+dnm_body_yield()
+    if !dnm_ready() then return
+
+    dnm_says("g() -> u16 = \"x\"\n\nprint(1)\n", "should return u16, but its body yields string")
+
+// -- where spellings meet, and where they are not trusted ---------------------------------------------
+
+@test("two spellings of one type are one type: u16 and ushort, P and Point, Buf[P] and Buf[Point]")
+dnm_spellings_are_one_type()
+    if !dnm_ready() then return
+
+    dnm_clean("struct Point\n    x: int\n\ntype P = Point\n\nval a: u16 = 1\nval b: ushort = a\n" +
+              "val p: P = Point(1)\nval q: Point = p\nval o: Option[P] = Some(q)\n" +
+              "val w: Option[Point] = o\nprint(b, w.unwrap().x)\n")
+
+@test("a generic's type parameter is not quoted at a call: the instantiation is shown canonically")
+dnm_generic_call_is_canonical()
+    if !dnm_ready() then return
+
+    dnm_says_not("id[T](x: T) -> T = x\n\nval a: u16 = 1\nval s: string = id(a)\n",
+                 "declared string but the value is ushort", "T")
+
+@test("a generic struct's field written as its parameter is shown canonically")
+dnm_generic_field_is_canonical()
+    if !dnm_ready() then return
+
+    dnm_says("struct G[T]\n    x: T\n\nval g: G[u16] = G(1)\nval s: string = g.x\n",
+             "declared string but the value is ushort")
+
+@test("an alias imported from another module is named as written, with aka")
+dnm_imported_alias()
+    if !rng_ready() then return
+
+    azc_says([("main.sysl", "import b\n\nval q: b.P = b.Point(1)\nval s: string = q\n"),
+              ("b/b.sysl", "module b\n\nstruct Point\n    x: int\n\ntype P = Point\n")],
+             "declared string but the value is b.P (aka b.Point)")
