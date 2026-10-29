@@ -1336,7 +1336,7 @@ impl Hash for int
 ```
 
 ```error
-error: an 'impl' block in a file that said '@tests' has to be for a type that file declares, and 'int' is not declared in it — a test build would keep this block and every other build would drop it, so a trait would answer one way while the tests ran and another way in the program that ships. Write the block beside the type's own declaration, or declare a type for the tests in this file
+error: an 'impl' block in a file that said '@tests' has to be for a type that file declares, or of a trait that file declares, and 'int' is not declared in it — a test build would keep this block and every other build would drop it, so a trait would answer one way while the tests ran and another way in the program that ships. Write the block beside the type's own declaration, or declare a type for the tests in this file
 ```
 
 A closure is the one exception the compiler makes for itself, and it is not a hole: the table it
