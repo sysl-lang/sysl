@@ -317,6 +317,22 @@ side as an unresolved sysl symbol, which looks like a missing definition rather 
 archive, so `build-c` lists them up front. With `--no-std-lib` the standard library is folded into
 the object, and the archive is self-contained.
 
+`--emit-llvm <out.ll>` also writes the LLVM text the archive is compiled from, and the archive and
+the header are still built:
+
+```bash
+sysl build-c mylib -o libmylib.a --emit-llvm mylib.ll
+```
+
+The text is the module as `build-c` reads it, which is not always what `emit-llvm` would print for
+the same path. A file with no `module` line is an archive's module to `build-c` and a program's entry
+body to every other command, so `private var count = 0` beside a `private` function that writes it
+is module storage here and is refused by `emit-llvm`, `build` and `run`. It is the text clang is
+handed, carrying the target's `target datalayout` as well as its `target triple`, before any
+optimization: it is the same at every `-O` level and under `--lto`. The file is written before clang
+runs, so a module clang rejects can still be read; a directory that is not there is made, as it is for
+the archive and the header, and given twice the last `--emit-llvm` is the one written.
+
 Like `build-lib`, `build-c` needs `llvm-ar` as well as `clang`. [FFI](/reference/ffi/) covers
 `@export` itself: what may be exported, how a symbol is named, and how module storage with a computed
 initializer is initialized when there is no entry point to do it.
