@@ -763,10 +763,13 @@ private var_decl(cx: &Analyzer, span: Span, name: string, typ: Option[TypeRef],
     val fixed = fixed_type(cx, span, name, typ, init.unwrap())
     val ti = type_expr(cx, init.unwrap(), if fixed.is_some() then fixed else declared)
     val decl_ty = settled_binding_type(declared, ti)
+    val spelled = binding_spelling(cx, typ, decl_ty, ti)
 
-    check_binding(cx, span, name, declared, decl_ty, ti)
+    check_binding(cx, span, name, declared, decl_ty, ti, spelled)
 
     val unique = cx.bind(name, decl_ty, name_after_keyword(cx, span.start, name))
+
+    cx.spell_binding(unique, spelled)
 
     if fixed.is_none() then open_binding(cx, span, typ, init.unwrap(), unique)
 
@@ -787,10 +790,13 @@ private val_decl(cx: &Analyzer, span: Span, name: string, typ: Option[TypeRef], 
     val fixed = fixed_type(cx, span, name, typ, value)
     val ti = type_expr(cx, value, if fixed.is_some() then fixed else declared)
     val decl_ty = settled_binding_type(declared, ti)
+    val spelled = binding_spelling(cx, typ, decl_ty, ti)
 
-    check_binding(cx, span, name, declared, decl_ty, ti)
+    check_binding(cx, span, name, declared, decl_ty, ti, spelled)
 
     val unique = cx.bind_read_only(name, decl_ty, name_after_keyword(cx, span.start, name))
+
+    cx.spell_binding(unique, spelled)
 
     if fixed.is_none() then open_binding(cx, span, typ, value, unique)
 
@@ -814,9 +820,13 @@ private const_decl(cx: &Analyzer, span: Span, name: string, typ: Option[TypeRef]
     val declared = written.unwrap_or(texpr_type(ti))
     val read = body_binding_read(cx, ti)
 
-    check_binding(cx, span, name, Some(declared), declared, ti)
+    val spelled = binding_spelling(cx, typ, declared, ti)
+
+    check_binding(cx, span, name, Some(declared), declared, ti, spelled)
 
     val unique = cx.bind_read_only(name, declared, name_after_keyword(cx, span.start, name))
+
+    cx.spell_binding(unique, spelled)
 
     if cx.at_definition || declared == Unknown || texpr_type(ti) == Unknown then
         return one(TVarDecl(unique, declared, ti, boundary(cx, name, None)))
@@ -924,7 +934,7 @@ end settled_binding_type
 // Both refusals are the declaration's and are reported at the statement, as the reference does: the
 // value is not wrong on its own, only as the thing a name is bound to.
 private check_binding(cx: &Analyzer, at: Span, name: string, declared: Option[Type], decl_ty: Type,
-                      ti: TExpr)
+                      ti: TExpr, spelled: Option[Spelling])
     // A declared type that could not be read has refused the statement already.
     if declared.is_some() && declared.unwrap() == Unknown then return
 
@@ -935,8 +945,8 @@ private check_binding(cx: &Analyzer, at: Span, name: string, declared: Option[Ty
     // An `if` of literals is wrong only at the one literal the others disagree with (`misfit_literal`).
     if declared.is_some() && disagree(texpr_type(ti), decl_ty) then
         cx.fault(misfit_literal(ti, decl_ty).map(l -> l.span).unwrap_or(at),
-                 s"cannot initialize '$name': declared ${type_show(decl_ty)} but the value is " +
-                 s"${type_show(texpr_type(ti))}${await_hint(texpr_type(ti), decl_ty)}" +
+                 s"cannot initialize '$name': declared ${spelled_show(decl_ty, spelled)} but the value is " +
+                 s"${spelled_show(texpr_type(ti), texpr_spelling(cx, ti))}${await_hint(texpr_type(ti), decl_ty)}" +
                  mismatch_hint(cx, texpr_type(ti), decl_ty))
 
 // `ref name = place` -- another name for storage that already exists. The place is read once, here,
@@ -1103,8 +1113,8 @@ private return_stmt(cx: &Analyzer, span: Span, value: Option[Expr]) -> Buf[TStmt
         cx.fault(span, "cannot return a value from a function with no return type")
     else if disagree(texpr_type(tv), want) then
         cx.fault(misfit_literal(tv, want).map(l -> l.span).unwrap_or(span),
-                 s"return type mismatch: expected ${type_show(want)}, got " +
-                 s"${type_show(texpr_type(tv))}${await_hint(texpr_type(tv), want)}" +
+                 s"return type mismatch: expected ${spelled_show(want, cx.ret_spelled)}, got " +
+                 s"${spelled_show(texpr_type(tv), texpr_spelling(cx, tv))}${await_hint(texpr_type(tv), want)}" +
                  mismatch_hint(cx, texpr_type(tv), want))
 
     one(TReturn(Some(tv)))

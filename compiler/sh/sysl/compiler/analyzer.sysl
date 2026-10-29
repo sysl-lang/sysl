@@ -51,6 +51,10 @@ struct Local
     // build: carried in the binding rather than in a table keyed by the unique name, because a
     // unique name is unique within one function and a table keyed by it collides across functions.
     declared: Option[Span]
+
+    // The binding's type as its declaration wrote it (`type_spelling.sysl`), for a diagnostic to
+    // quote, and nothing where it wrote none. Never read by anything that decides.
+    spelled: Option[Spelling]
 end Local
 
 // One loop, while its body is being read.
@@ -459,6 +463,10 @@ struct Analyzer
     // gives (`closure.sysl`'s `closure_body`), so `at` is filled in there.
     yield_seed: Option[VariantSeed]
 
+    // The function's result as its declaration wrote it (`type_spelling.sysl`), for a diagnostic
+    // about a returned value to quote; nothing where none was written or it cannot be trusted.
+    ret_spelled: Option[Spelling]
+
     // The body a `RefWatch` filed now belongs to.
     watch_key(self) -> string = if self.body != "" then self.body else self.func_name
 
@@ -629,9 +637,28 @@ struct Analyzer
 
         val unique = self.fresh_name(name)
 
-        self.locals.push(Local(name, unique, ty, false, false, None, self.declared_at(named)))
+        self.locals.push(Local(name, unique, ty, false, false, None, self.declared_at(named), None))
         unique
     end bind
+
+    // Records how the binding `unique` names wrote its type, for diagnostics to quote.
+    spell_binding(*self, unique: string, s: Option[Spelling])
+        if s.is_none() then return
+
+        var i = self.locals.len()
+
+        while i > 0
+            i -= 1
+
+            if self.locals.at(i).unique == unique
+                var l = self.locals.at(i)
+
+                l.spelled = s
+                self.locals.set(i, l)
+                return
+            end if
+        end while
+    end spell_binding
 
     // Binds a name that may not be assigned to again -- what a local `val` declares.
     bind_read_only(*self, name: string, ty: Type, named: Option[Span] = None) -> string
@@ -640,7 +667,7 @@ struct Analyzer
 
         val unique = self.fresh_name(name)
 
-        self.locals.push(Local(name, unique, ty, true, false, None, self.declared_at(named)))
+        self.locals.push(Local(name, unique, ty, true, false, None, self.declared_at(named), None))
         unique
     end bind_read_only
 
@@ -654,7 +681,7 @@ struct Analyzer
         val unique = self.fresh_name(name)
 
         self.locals.push(Local(name, unique, texpr_type(place), read_only, false, Some(place),
-                               self.declared_at(named)))
+                               self.declared_at(named), None))
         unique
     end bind_ref
 
@@ -665,7 +692,7 @@ struct Analyzer
 
         val unique = self.fresh_name(name)
 
-        self.locals.push(Local(name, unique, ty, true, true, None, self.declared_at(named)))
+        self.locals.push(Local(name, unique, ty, true, true, None, self.declared_at(named), None))
         unique
     end bind_pattern
 
@@ -673,7 +700,7 @@ struct Analyzer
     // parameter is loaded by the name its declaration gave it.
     bind_as(*self, name: string, unique: string, ty: Type)
         self.refuse_reserved_binding(name)
-        self.locals.push(Local(name, unique, ty, false, false, None, self.bind_site))
+        self.locals.push(Local(name, unique, ty, false, false, None, self.bind_site, None))
 
     // A name nothing else in this **function** holds, which is what a slot of the frame is.
     //
@@ -766,7 +793,7 @@ analyzer_for(an: &Analysis, scope: Scope) -> &Analyzer =
              empty_names(), false, buf(), buf(), buf(), "", buf(), None, None, None, buf(), 0, buf(),
              false, false, false, AwaitOutside, false, buf(), "", buf(), buf(), 0, 0, "", buf(), buf(), buf(),
              false, buf(), buf(), map(), map(), buf(), false, buf(), buf(), buf(), buf(), buf(), false,
-             false, false, false, None, buf(), buf(), buf(), None, buf(), None, None, None)
+             false, false, false, None, buf(), buf(), buf(), None, buf(), None, None, None, None)
 
 // **The known half of a parameter like `Result[T, E]`, handed to the variant standing at it.** In
 // `keep[T](o: Result[T, E])` called as `keep(Ok(1))`, the `Ok` settles the enum's `T` from its value

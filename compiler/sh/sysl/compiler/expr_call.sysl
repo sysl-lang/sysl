@@ -1521,7 +1521,7 @@ private struct_call(cx: &Analyzer, span: Span, key: string, written: string, arg
                 ts.push(if unnamed_c_bit(d, i) then unnamed_zero(span, d.fields.at(i).1)
                         else type_expr(cx, given.at(i), Some(d.fields.at(i).1)))
 
-            val refused = refused_field(cx, span, built, d.fields, given, ts, before)
+            val refused = refused_field(cx, span, built, d.fields, given, ts, before, Some(d))
 
             if refused.is_some() then return refused.unwrap()
 
@@ -2412,7 +2412,8 @@ end variant_call
 // The same as `refused_argument`, for the values a constructor or a variant was given: `None` where
 // every one is what its field declared, and otherwise the node with no type to disagree with.
 refused_field(cx: &Analyzer, span: Span, shown: string, fields: Buf[(string, Type)],
-              given: Buf[Expr], ts: Buf[TExpr], before: usize) -> Option[TExpr]
+              given: Buf[Expr], ts: Buf[TExpr], before: usize,
+              every_field_of: Option[&StructType] = None) -> Option[TExpr]
     if cx.an.complaints() > before
         for i in 0..<ts.len()
             if texpr_type(ts.at(i)) == Unknown then return Some(bad_expr(span))
@@ -2421,8 +2422,13 @@ refused_field(cx: &Analyzer, span: Span, shown: string, fields: Buf[(string, Typ
         val got = texpr_type(ts.at(i))
 
         if disagree(got, fields.at(i).1) then
+            // Where `fields` is every field of a struct in its declared order, each is quoted as the
+            // struct's declaration wrote it.
+            val wanted = every_field_of.and_then(d -> field_spelling(cx, d, int(i), fields.at(i).1))
+
             return Some(cx.err(given.at(i).span, s"'${fields.at(i).0}' of '$shown' is " +
-                               s"${type_show(fields.at(i).1)}, but ${type_show(got)} was given" +
+                               s"${spelled_show(fields.at(i).1, wanted)}, but " +
+                               s"${spelled_show(got, texpr_spelling(cx, ts.at(i)))} was given" +
                                mismatch_hint(cx, got, fields.at(i).1)))
 
         // A field is held to what a parameter is: one inferred from a diverging argument would be
@@ -3620,7 +3626,8 @@ private call_key(cx: &Analyzer, span: Span, written: string, key: string, args: 
             // A parameter's default, spliced in where the argument was not written.
             None -> ts.push(fill_default(cx, span, key, f.scope, p, want))
 
-    val refused = refused_argument(cx, span, s"'$shown'", f.decl.params, slots, ts, wants, before)
+    val refused = refused_argument(cx, span, s"'$shown'", f.decl.params, slots, ts, wants, before,
+                                   true, buf(), Some(f.decl.tparams))
 
     if refused.is_some() then return refused.unwrap()
 
@@ -3664,7 +3671,8 @@ end call_key
 // there, so a second bad argument, and a result the call never had, are consequences.
 refused_argument(cx: &Analyzer, span: Span, quoted: string, params: Buf[Param],
                  slots: Buf[Option[Expr]], ts: Buf[TExpr], wants: Buf[Type],
-                 before: usize, report: bool = true, unread: Buf[usize] = buf()) -> Option[TExpr]
+                 before: usize, report: bool = true, unread: Buf[usize] = buf(),
+                 spelled_under: Option[Buf[string]] = None) -> Option[TExpr]
     // Every caller quotes the declaration it reached, which for an overload or a second
     // implementation is the slot it was filed under and not the name anybody wrote.
     val shown = unslotted_quote(quoted)
@@ -3687,8 +3695,14 @@ refused_argument(cx: &Analyzer, span: Span, quoted: string, params: Buf[Param],
                 if disagree(got, wants.at(i))
                     val at = misfit_literal(ts.at(i), wants.at(i)).map(l -> l.span).unwrap_or(e.span)
 
+                    // The parameter is quoted as its declaration wrote it where the caller can vouch
+                    // that the written type is the one it stands for (`spelled_under`, the
+                    // callee's type parameters), and canonically otherwise.
+                    val wanted = spelled_under.and_then(tps -> spelling_of(params.at(i).typ, wants.at(i), tps))
+
                     return Some(cx.err(at, s"'${params.at(i).name}' of $shown is " +
-                                       s"${type_show(wants.at(i))}, but ${type_show(got)} was given" +
+                                       s"${spelled_show(wants.at(i), wanted)}, but " +
+                                       s"${spelled_show(got, texpr_spelling(cx, ts.at(i)))} was given" +
                                        await_hint(got, wants.at(i)) + mismatch_hint(cx, got, wants.at(i))))
 
                 // **`never` cannot be a parameter, and inference is the one place it could become
