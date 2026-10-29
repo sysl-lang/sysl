@@ -515,6 +515,7 @@ gen_helper(e: *Emit, what: HelperReq, name: string) -> Option[IrFunc]
         HrDrop(_) -> helper_sig(name, hook_params())
         HrDropBuf(_) -> helper_sig(name, hook_params())
         HrPlainDrop -> helper_sig(name, hook_params())
+        HrFrameDrop(_) -> helper_sig(name, hook_params())
         HrTaskDrop(_) -> helper_sig(name, hook_params())
         HrSlotBuf(_) -> bound_sig(helper_sig(name, hook_params()) with { linkage = LinkWeakOdr }, binds_locally(e))
         HrSlotPlace(elem) -> helper_sig(name, slot_place_params(e, elem)) with { bare = rarely() }
@@ -534,9 +535,10 @@ gen_helper(e: *Emit, what: HelperReq, name: string) -> Option[IrFunc]
         HrSlot(ty, retain) ->
             walk_slot(e, ty, VReg("p"), retain)
             emit_term(e, InRet(None, None))
-        HrDrop(payload) -> gen_drop_hook(e, payload)
+        HrDrop(payload) -> gen_drop_hook(e, payload, true)
         HrDropBuf(elem) -> gen_drop_buf_hook(e, elem)
         HrPlainDrop -> gen_plain_hook(e)
+        HrFrameDrop(payload) -> gen_drop_hook(e, payload, false)
         HrTaskDrop(result) -> gen_task_hook(e, result)
         HrSlotBuf(elem) -> gen_drop_buf_hook(e, elem)
         HrSlotPlace(elem) -> gen_slot_place_rest(e, elem)
@@ -564,7 +566,8 @@ private gen_plain_hook(e: *Emit)
     emit_term(e, InRet(None, None))
 end gen_plain_hook
 
-private gen_drop_hook(e: *Emit, payload: Type)
+// `frees` is false for a box laid in a frame, whose storage is the frame's and goes nowhere.
+private gen_drop_hook(e: *Emit, payload: Type, frees: bool)
     val bn = box_lty(e, payload)
     val give = fresh_label(e, "arc.give")
     val over = fresh_label(e, "arc.over")
@@ -576,7 +579,9 @@ private gen_drop_hook(e: *Emit, payload: Type)
     if !contains_counted(payload) && destructor_of(e, payload).is_none()
         emit_term(e, InRet(None, None))
         emit_label(e, give)
-        emit_free(e, payload)
+
+        if frees then emit_free(e, payload)
+
         emit_term(e, InRet(None, None))
         return
     end if
@@ -611,7 +616,9 @@ private gen_drop_hook(e: *Emit, payload: Type)
     release_value(e, payload, v)
     emit_term(e, InRet(None, None))
     emit_label(e, give)
-    emit_free(e, payload)
+
+    if frees then emit_free(e, payload)
+
     emit_term(e, InRet(None, None))
 end gen_drop_hook
 

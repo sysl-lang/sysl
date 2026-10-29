@@ -1,0 +1,161 @@
+module sh.sysl.compiler
+@tests
+
+// Every closure literal is a struct of its own, and a generic type applied to one is filed under a
+// key: the key has to tell two closures apart, or the second `Option` of a closure asked for in a
+// program is handed the first one's, and a call that is fine is refused as *"a closure, but a
+// closure was given"*. Run here at every shape that applies a generic type to a closure -- an enum,
+// a generic struct, a nested application, a generic function reached through another -- in both
+// orders, since which one asked first decided which one was refused.
+//
+// Beside it: two closures that genuinely differ are still refused, and the refusal now says what
+// differs, since a reader is shown both as "a closure".
+
+// What a refused program said, or nothing where it built.
+private wcl_refusal(text: string) -> string
+    rng_ran(text) match
+        Err(why) -> why
+        Ok(_) -> ""
+
+// `text` is refused with exactly one complaint, and that complaint is `message`.
+private wcl_refused(text: string, message: string)
+    if !rng_ready() then return
+
+    val said = wcl_refusal(text)
+
+    assert(said.contains(s"error: $message\n"), s"no '$message' in:\n$said")
+
+    val first = said.index_of("error: ").unwrap() + 7
+
+    assert(!said[first..<said.bytes.len].contains("error: "), s"more than one complaint in:\n$said")
+end wcl_refused
+
+private const WclWrap: string = "wrap[T](x: T) -> Option[T] = Some(x)\n\n"
+
+@test("a generic function's Option of a closure and a variant's Option of another closure both build")
+wcl_wrap_then_some()
+    if !rng_ready() then return
+
+    rng_prints(WclWrap + "val a = wrap(() -> 1).unwrap()\nval b = Some(() -> 2).unwrap()\n\n" +
+               "print(a())\nprint(b())\n", "1\n2\n")
+end wcl_wrap_then_some
+
+@test("and in the other order, where the variant asks first and the generic body is refused")
+wcl_some_then_wrap()
+    if !rng_ready() then return
+
+    rng_prints(WclWrap + "val b = Some(() -> 2).unwrap()\nval a = wrap(() -> 1).unwrap()\n\n" +
+               "print(a())\nprint(b())\n", "1\n2\n")
+end wcl_some_then_wrap
+
+@test("two variants of two closures, one capturing, are two instantiations")
+wcl_two_variants_one_capturing()
+    if !rng_ready() then return
+
+    rng_prints("val n = 40\nval a = Some(() -> n + 1).unwrap()\nval b = Some(() -> 2).unwrap()\n\n" +
+               "print(a())\nprint(b())\n", "41\n2\n")
+end wcl_two_variants_one_capturing
+
+@test("the same with Result, through a generic function and a variant")
+wcl_result()
+    if !rng_ready() then return
+
+    rng_prints("ok_of[T](x: T) -> Result[T, string] = Ok(x)\n\n" +
+               "val a = ok_of(() -> 3).unwrap()\nval b: Result[int, string] = Ok(4)\n" +
+               "val c = ok_of(() -> 5).unwrap()\n\nprint(a())\nprint(b.unwrap())\nprint(c())\n",
+               "3\n4\n5\n")
+end wcl_result
+
+@test("the same with a user generic struct, through a generic function and its constructor")
+wcl_generic_struct()
+    if !rng_ready() then return
+
+    rng_prints("struct Holder[T]\n    item: T\n\nhold[T](x: T) -> Holder[T] = Holder(x)\n\n" +
+               "val e = hold(() -> 5)\nval f = Holder(() -> 6)\n\nprint(e.item())\nprint(f.item())\n",
+               "5\n6\n")
+end wcl_generic_struct
+
+@test("nested generics: an Option of an Option of a closure, from a generic and from variants")
+wcl_nested()
+    if !rng_ready() then return
+
+    rng_prints("nest[T](x: T) -> Option[Option[T]] = Some(Some(x))\n\n" +
+               "val h = nest(() -> 8).unwrap().unwrap()\nval i = Some(Some(() -> 9)).unwrap().unwrap()\n\n" +
+               "print(h())\nprint(i())\n", "8\n9\n")
+end wcl_nested
+
+@test("a closure passed through two generic calls, beside a variant of another")
+wcl_through_two_generics()
+    if !rng_ready() then return
+
+    rng_prints(WclWrap + "twice[T](x: T) -> Option[T] = wrap(x)\n\n" +
+               "val g = twice(() -> 7).unwrap()\nval b = Some(() -> 2).unwrap()\n" +
+               "val a = wrap(() -> 1).unwrap()\n\nprint(g())\nprint(b())\nprint(a())\n", "7\n2\n1\n")
+end wcl_through_two_generics
+
+@test("closures of two different signatures through one generic are two instantiations")
+wcl_two_signatures_build()
+    if !rng_ready() then return
+
+    rng_prints(WclWrap + "val a = wrap(() -> 1).unwrap()\nval j = wrap((x: int) -> x + 10).unwrap()\n\n" +
+               "print(a())\nprint(j(1))\n", "1\n11\n")
+end wcl_two_signatures_build
+
+@test("an Option of a boxed callable holds either closure, which is what the refusal advises")
+wcl_boxed_holds_either()
+    if !rng_ready() then return
+
+    rng_prints("var o: Option[&Fn() -> int] = Some(() -> 11)\no = Some(() -> 12)\nval k = o.unwrap()\n\n" +
+               "print(k())\n", "12\n")
+end wcl_boxed_holds_either
+
+// ---- the refusals that remain, and what they now say ----
+
+@test("a second closure of the same shape is still not the first one's type, and the variant says why")
+wcl_same_shape_variant_refused()
+    wcl_refused("var o = Some(() -> 1)\no = Some(() -> 2)\n",
+                "'value' of 'Some' is a closure, but a closure was given — each closure literal is a " +
+                "type of its own, so this one is not the '() -> int' the type was made from; to hold " +
+                "either, write the type as '&Fn() -> int'")
+end wcl_same_shape_variant_refused
+
+@test("and so does a generic function's parameter")
+wcl_same_shape_generic_refused()
+    wcl_refused(WclWrap + "var o = wrap(() -> 1)\no = wrap(() -> 2)\n",
+                "'x' of 'wrap' is a closure, but a closure was given — each closure literal is a type " +
+                "of its own, so this one is not the '() -> int' the type was made from; to hold either, " +
+                "write the type as '&Fn() -> int'")
+end wcl_same_shape_generic_refused
+
+@test("and so does an assignment of one closure to another's variable")
+wcl_same_shape_assign_refused()
+    wcl_refused("var f = (a: int, b: int) -> a + b\nf = (a: int, b: int) -> a * b\n",
+                "cannot assign a closure to 'f' of type a closure — each closure literal is a type of " +
+                "its own, so this one is not the '(int, int) -> int' the type was made from; to hold " +
+                "either, write the type as '&Fn(int, int) -> int'")
+end wcl_same_shape_assign_refused
+
+@test("a closure of another shape, already a value, is refused naming both shapes")
+wcl_other_shape_value_refused()
+    wcl_refused("val f = (x: int) -> x\nvar o = Some(() -> 1)\no = Some(f)\n",
+                "'value' of 'Some' is a closure, but a closure was given — the closure asked for is " +
+                "'() -> int', and the one given is '(int) -> int'")
+end wcl_other_shape_value_refused
+
+@test("a closure literal of another arity is refused at the literal")
+wcl_other_arity_literal_refused()
+    wcl_refused("var o = Some(() -> 1)\no = Some((x: int) -> x)\n",
+                "this closure takes 1 parameter, and what it is being used as takes 0")
+end wcl_other_arity_literal_refused
+
+@test("a closure literal yielding another type is refused at the literal")
+wcl_other_result_literal_refused()
+    wcl_refused("var o = Some(() -> 1)\no = Some(() -> true)\n",
+                "this closure should yield int, but its body yields bool")
+end wcl_other_result_literal_refused
+
+@test("two different types that differ outside the closure are named by the sentence alone")
+wcl_other_outer_type_refused()
+    wcl_refused("var o = Some(() -> 1)\no = Some(3)\n",
+                "'value' of 'Some' is a closure, but int was given")
+end wcl_other_outer_type_refused

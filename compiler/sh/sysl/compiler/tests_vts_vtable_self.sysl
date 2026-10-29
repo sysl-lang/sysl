@@ -212,7 +212,10 @@ vts_the_slot_is_the_body()
     assert(!ir.contains("@vt.adapt.ref.Ball.hit("), ir)
     assert(!ir.contains("@vt.adapt.ref.Ball.wide("), ir)
 
-@test("the body steps over the box header and loads its receiver once, ahead of everything else")
+// `Ball` is three words, so a method that only reads it is lent its receiver by address
+// (`read_by_address`): the table's body copies the receiver out of the box into a slot of its own --
+// the snapshot -- and lends the method that.
+@test("the body steps over the box header and snapshots its receiver once, ahead of everything else")
 vts_the_body_loads_the_receiver_at_entry()
     val ir = vts_ir(vts_ball)
 
@@ -223,20 +226,24 @@ vts_the_body_loads_the_receiver_at_entry()
     assert(body.contains("(ptr %self.object, double %lo.param, double %hi.param)"), body)
     assert(body.starts_with("define internal "), body)
     assert(body.contains("entry:\n  %self.payload = getelementptr %arc.Ball, ptr %self.object, i32 0, i32 3\n" +
-                         "  %self.param = load %struct.Ball, ptr %self.payload\n"), body)
+                         "  %self.lent = alloca %struct.Ball\n" +
+                         "  %self.value = load %struct.Ball, ptr %self.payload\n" +
+                         "  store %struct.Ball %self.value, ptr %self.lent\n"), body)
+    assert(body.contains("@Ball.hit.owned(ptr %self.lent, double %lo.param, double %hi.param)"), body)
 
+// `count` calls itself last, so it is not lent and keeps the register convention.
 @test("the method keeps its symbol and signature, and calls the body with the receiver stored in a box's shape")
 vts_the_method_keeps_its_signature()
     val ir = vts_ir(vts_ball)
 
     if ir == "skipped" then return
 
-    val m = cgz_body(ir, "Ball.hit")
+    val m = cgz_body(ir, "Ball.count")
 
-    assert(m.contains("@Ball.hit(%struct.Ball %self.param, double %lo.param, double %hi.param)"), m)
+    assert(m.contains("@Ball.count(%struct.Ball %self.param, i32 %n.param)"), m)
     assert(m.contains("%self.object = alloca %arc.Ball\n"), m)
     assert(m.contains("store %struct.Ball %self.param, ptr %self.payload\n"), m)
-    assert(m.contains("@Ball.hit.self(ptr %self.object, double %lo.param, double %hi.param)"), m)
+    assert(m.contains("@Ball.count.self(ptr %self.object, i32 %n.param)"), m)
 
 @test("a narrow result keeps its extension on both halves")
 vts_a_narrow_result_keeps_its_extension()
@@ -244,7 +251,7 @@ vts_a_narrow_result_keeps_its_extension()
 
     if ir == "skipped" then return
 
-    assert(ir.contains("define zeroext i8 @Ball.tag(%struct.Ball %self.param)"), ir)
+    assert(ir.contains("define zeroext i8 @Ball.tag.owned(ptr noalias readonly %self.param)"), ir)
     assert(ir.contains("define internal zeroext i8 @Ball.tag.self(ptr %self.object)"), ir)
     assert(ir.contains("define internal zeroext i1 @Ball.small.self(ptr %self.object)"), ir)
 
@@ -257,8 +264,8 @@ vts_a_large_result_goes_through_the_out_pointer()
     assert(ir.contains("define internal void @Ball.wide.self(ptr noalias sret([40 x i32]) align 4 " +
                        "dead_on_unwind writable %sret.out, " +
                        "ptr %self.object)"), ir)
-    assert(cgz_body(ir, "Ball.wide").contains("call void @Ball.wide.self(ptr noalias sret([40 x i32]) align 4 " +
-                                               "dead_on_unwind writable %sret.out, ptr %self.object)"), ir)
+    assert(cgz_body(ir, "Ball.wide.self").contains("call void @Ball.wide.owned(ptr noalias sret([40 x i32]) align 4 " +
+                                                    "dead_on_unwind writable %sret.out, ptr %self.lent)"), ir)
 
 @test("a zero-sized parameter is in neither half, as it is in no slot")
 vts_a_zero_sized_parameter_is_dropped()

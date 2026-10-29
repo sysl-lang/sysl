@@ -14,6 +14,8 @@ import sysl.math.bigint.from_int
 // Puts a value on the heap: one count for the reference this yields, the hook that will destroy it,
 // and a copy of the payload -- whose own references the box now holds a share of.
 gen_box(e: *Emit, value: TExpr, ref_ty: Type) -> Val
+    if frame_boxed(e, value) then return gen_frame_box(e, value, ref_ty)
+
     val inner = ref_inner(ref_ty)
 
     // A large payload is written into the box rather than produced and then stored into it, for the
@@ -35,6 +37,50 @@ gen_box(e: *Emit, value: TExpr, ref_ty: Type) -> Val
 
     own_temp(e, opened.0, ref_ty)
 end gen_box
+
+// Whether a box is one the analysis laid in the frame: around a closure literal nothing reaches
+// after the frame, or after the turn of a loop that builds it (`closure_mode.sysl`'s `framed_box`).
+private frame_boxed(e: *Emit, value: TExpr) -> bool = *value.kind match
+    TStructNew(st, _) -> e.framed_closures.has(st.base)
+    _ -> false
+
+// **A box laid in the frame** (`docs/design/closures.md` decision 8): the header and the payload a
+// heap box has, in a slot of the frame, so a `&Fn` handed to a callee that only calls it allocates
+// nothing. It is counted exactly as a heap box is -- a callee that takes a share and gives it back
+// touches the slot's count -- and the last release runs the hook, which lets go of what the payload
+// holds and gives no storage back: a payload holding nothing has no hook at all, which the runtime
+// reads as nothing to do. Nothing reaches the box after the frame, nor after the turn of a loop that
+// built it, so the slot is never asked about once it has been reused or given up.
+private gen_frame_box(e: *Emit, value: TExpr, ref_ty: Type) -> Val
+    val inner = ref_inner(ref_ty)
+    val bn = box_lty(e, inner)
+    val p = alloca(e, fresh_reg(e), bn)
+    val holds = contains_counted(inner) || destructor_of(e, inner).is_some()
+    val hook = if holds then VGlobal(request_helper(e, s"arc.dropframe.${mangle(inner)}", HrFrameDrop(inner)))
+               else VNull
+
+    emit(e, InStore(word_lty(e), VInt(from_int(1)), p, AccPlain, None))
+    store_header_word(e, bn, p, 1, LPtr, hook)
+    store_header_word(e, bn, p, 2, word_lty(e), VInt(from_int(1)))
+
+    val slot = fresh_reg(e)
+
+    var idx: Buf[IrArg] = buf()
+
+    idx.push(ir_arg(l_i32(), VInt(from_int(0))))
+    idx.push(ir_arg(l_i32(), VInt(from_int(long(box_payload_field(e, inner))))))
+    emit(e, InGep(slot, bn, p, idx))
+
+    if e.layout.indirect(inner) then gen_into(e, slot, value)
+    else if e.layout.size(inner) > 0
+        val v = gen_expr(e, value)
+
+        retain_moving(e, value, inner, v, false)
+        emit(e, InStore(lty(e, inner), v, slot, AccPlain, None))
+    end if
+
+    own_temp(e, p, ref_ty)
+end gen_frame_box
 
 // A box for `inner` with its header written and its payload not yet: the box, and the address its
 // payload goes at. `gen_box` fills it from an expression; a `match` arm moving a large payload out of
