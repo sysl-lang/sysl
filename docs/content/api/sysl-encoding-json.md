@@ -20,7 +20,7 @@ into any `Writer`. It needs a heap and nothing else, so it builds for a board th
 
 ## Index
 
-[`max_depth`](#max_depth) [`parse`](#parse) [`parse_bytes`](#parse_bytes) [`pretty`](#pretty) [`quoted`](#quoted) [`write_pretty`](#write_pretty) [`Fault`](#fault) [`Json`](#json) [`JsonError`](#jsonerror) [`Member`](#member) [Display for Fault](#display-for-fault) [Display for Json](#display-for-json) [Display for JsonError](#display-for-jsonerror) [Eq for Json](#eq-for-json) [Eq for Member](#eq-for-member)
+[`max_depth`](#max_depth) [`from_json`](#from_json) [`from_json_bytes`](#from_json_bytes) [`json_decoder`](#json_decoder) [`json_encoder`](#json_encoder) [`parse`](#parse) [`parse_bytes`](#parse_bytes) [`pretty`](#pretty) [`quoted`](#quoted) [`to_json`](#to_json) [`write_pretty`](#write_pretty) [`Fault`](#fault) [`Json`](#json) [`JsonDecoder`](#jsondecoder) [`JsonEncoder`](#jsonencoder) [`JsonError`](#jsonerror) [`Member`](#member) [Decoder for JsonDecoder](#decoder-for-jsondecoder) [Display for Fault](#display-for-fault) [Display for Json](#display-for-json) [Display for JsonError](#display-for-jsonerror) [Encoder for JsonEncoder](#encoder-for-jsonencoder) [Eq for Json](#eq-for-json) [Eq for Member](#eq-for-member) [Fallible for JsonEncoder](#fallible-for-jsonencoder) [Writer for JsonEncoder](#writer-for-jsonencoder)
 
 ## Constants
 
@@ -37,6 +37,43 @@ exhaust the stack. 128 is far past what a real document nests and small enough f
 stack.
 
 ## Functions
+
+### `from_json`
+
+```sysl
+from_json[T](text: string) -> Result[T, CodecError]
+```
+
+A value of type `T` read from one JSON text, through `T`'s `Decode` (derived, or the library's
+own for a scalar, a string, an `Option`, a `Buf`, a `Map` or a `Set`).
+
+Whitespace may surround the value; anything else after it is refused. Every refusal names the
+byte it was found at and the path to it, `users[3].home.zip: an integer expected (byte 214)`;
+where the text breaks JSON's grammar, the words are the ones `parse` uses.
+
+### `from_json_bytes`
+
+```sysl
+from_json_bytes[T](b: []const u8) -> Result[T, CodecError]
+```
+
+The same over bytes that may not be text: a string that is not UTF-8 is refused.
+
+### `json_decoder`
+
+```sysl
+json_decoder(b: []const u8) -> JsonDecoder
+```
+
+A decoder at the start of `b`.
+
+### `json_encoder`
+
+```sysl
+json_encoder(out: *Writer) -> JsonEncoder
+```
+
+An encoder writing into `out`.
 
 ### `parse`
 
@@ -76,6 +113,15 @@ quoted(s: string) -> string
 A string as a JSON string literal, quotes and escapes included -- for a program that assembles
 JSON by hand. The quote, the backslash and every byte below a space are escaped; everything else
 stands for itself, since JSON text is UTF-8.
+
+### `to_json`
+
+```sysl
+to_json[T](v: T) -> Result[string, CodecError]
+```
+
+`v` as compact JSON, through its `Encode`; refused only where `v` holds a NaN or an infinity, with
+the byte it would have been written at.
 
 ### `write_pretty`
 
@@ -150,6 +196,38 @@ reference anywhere, so every walk over a document is a plain `match`.
 | `member` | `member(self, i: usize) -> Option[Member]` | The member at a position, for an object, in the order the document wrote them -- how an object is walked when its names are not known in advance. |
 | `get` | `get(self, key: string) -> Option[Json]` | The value written under a name, or `None` where there is none. |
 
+### `JsonDecoder`
+
+```sysl
+struct JsonDecoder
+    private b: []const u8
+    private at: usize
+    private depth: usize
+    private first: bool
+```
+
+A pull reader over one JSON text: `sysl.codec`'s `Decoder` for JSON, which `from_json` reads a
+value through, and the reader `parse` builds its tree with. It reads the bytes it is given in
+place and allocates only for a string it hands back.
+
+### `JsonEncoder`
+
+```sysl
+struct JsonEncoder
+    private out: *Writer
+    private first: bool
+    private written: usize
+    private fault: Option[codec.Fault]
+    private fault_at: usize
+```
+
+`sysl.codec`'s `Encoder` for JSON: compact JSON, written into any `Writer` as it goes.
+
+A struct is an object, a sequence an array, `None` and `unit` are `null`. A real is written as the
+shortest text that reads back as the same value. **A NaN or an infinity is refused** — JSON has no
+spelling for one — by latching `NotFinite` and writing `null` in its place, so the text stays
+well-formed and `failed()` says it is not the value.
+
 ### `JsonError`
 
 ```sysl
@@ -177,6 +255,12 @@ One member of an object: the name it was written under, and what was written the
 
 ## Implementations
 
+### Decoder for JsonDecoder
+
+```sysl
+impl Decoder for JsonDecoder
+```
+
 ### Display for Fault
 
 ```sysl
@@ -200,6 +284,12 @@ impl Display for JsonError
 
 `line:col: what`, the shape a compiler's diagnostic has.
 
+### Encoder for JsonEncoder
+
+```sysl
+impl Encoder for JsonEncoder
+```
+
 ### Eq for Json
 
 ```sysl
@@ -219,3 +309,15 @@ impl Eq for Member
 ```
 
 Two members are equal when they were written under the same name and hold equal values.
+
+### Fallible for JsonEncoder
+
+```sysl
+impl Fallible for JsonEncoder
+```
+
+### Writer for JsonEncoder
+
+```sysl
+impl Writer for JsonEncoder
+```

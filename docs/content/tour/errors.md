@@ -112,7 +112,7 @@ count(n: int) -> int
 ```
 
 ```error
-'?' may only be used in a function returning sysl.Result, not int
+'?' may only be used in a function returning Result, not int
 ```
 
 Where the callee's error type differs from the caller's, `?` converts it through `From`. A function

@@ -222,6 +222,9 @@ check_keeps(a: &Analysis, funcs: Buf[TFunc], vtables: Buf[TVtable], vals: Buf[TV
 
     if explaining_borrows() then note_borrows(cx)
 
+    // The answers a call may read through a place entry (`place_entry.sysl`), handed to the lowering.
+    note_places(cx)
+
     // Each closure literal's capture mode is the same question asked about the literal
     // (`closure_mode.sysl`).
     decide_closure_modes(cx, funcs, vals)
@@ -688,8 +691,7 @@ private ask_every_question(cx: &KeepsCx, f: TFunc)
         keeps_of(cx, f.name, i)
         answers_of(cx, f.name, i)
         raw_answers_of(cx, f.name, i)
-
-        if explaining_borrows() then borrow_of(cx, f.name, i)
+        borrow_of(cx, f.name, i)
 end ask_every_question
 
 // The functions `f`'s body calls by name, in the order they are written, a name once for each call.
@@ -716,8 +718,8 @@ private assumed_answer(key: string) -> KeptWhy = if key.starts_with("!") then cl
 
 // -- the summaries --------------------------------------------------------------------------------
 
-// The five questions asked of a body, by the mark its answers are filed under. The last is asked
-// only where `--explain-borrows` was given (`borrow_summary.sysl`).
+// The five questions asked of a body, by the mark its answers are filed under. The last is the
+// borrow summary (`borrow_summary.sysl`), which the lowering reads to choose a place entry.
 private val KeepsQ = ""
 private val AnswersQ = "="
 private val RawAnswersQ = "~"
@@ -2546,7 +2548,8 @@ end call_at
 // starts holds. A task the call answers is not one: it is driven in this domain, and an `await` of it
 // takes it back.
 //
-// The answer is the reason, in words that follow the call's: `whose parameter 'f' is '@scoped'`.
+// The answer is the reason, in words that follow the call's, naming the domain the closure goes to:
+// `whose parameter 'f' is '@crossing', so another domain may run it`.
 private probe_held_apart(ft: &FrameTrack, call: TExpr, name: string, j: usize) -> Option[string]
     val found = ft.cx.find(name)
 
@@ -2556,9 +2559,13 @@ private probe_held_apart(ft: &FrameTrack, call: TExpr, name: string, j: usize) -
         if j < f.params.len()
             val p = f.params.at(j).0
 
-            if scoped_at(f, j) then return Some(s"whose parameter '$p' is '@scoped'")
-            if holds_string(f.marks.copies, p) then return Some(s"whose parameter '$p' is '@crossing'")
-            if holds_string(f.marks.joined, p) then return Some(s"whose parameter '$p' is '@joined'")
+            val how =
+                if scoped_at(f, j) then "'@scoped', so another domain may run it before the scope ends"
+                else if holds_string(f.marks.copies, p) then "'@crossing', so another domain may run it"
+                else if holds_string(f.marks.joined, p) then "'@joined', so a thread of its own runs it"
+                else ""
+
+            if how != "" then return Some(s"whose parameter '$p' is $how")
         end if
     end if
 

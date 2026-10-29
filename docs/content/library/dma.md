@@ -67,7 +67,7 @@ print(r.len())
 ```
 
 ```error
-the constructor names every field of 'sysl.dma.Region' in order, and 'base' is private to 'library/sysl/dma/dma.sysl', the file that declares it
+the constructor names every field of 'Region' in order, and 'base' is private to 'library/sysl/dma/dma.sysl', the file that declares it
 ```
 
 and a function that hands memory to a device takes a `Region`, so the stack buffer that would have
@@ -84,7 +84,7 @@ read_sector(1, buf[..])
 ```
 
 ```error
-'into' of 'read_sector' is sysl.dma.Region, but []byte was given
+'into' of 'read_sector' is Region, but []byte was given
 ```
 
 **The region does not own its memory**, the bargain [`Ring`](/library/ring/) and a `*T` make: whoever

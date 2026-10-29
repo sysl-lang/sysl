@@ -1,0 +1,151 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+import sysl.text.from_utf8_unchecked
+
+// How a diagnostic names a type or trait the library declares: by its simple name -- `Option[int]`,
+// `Buf[u8]`, `Display` -- unless that name could mean something else where the diagnostic is reported.
+// A type of the program's own other modules keeps its path, which is how a reader tells two of their
+// own modules' types apart.
+//
+// **Where is the file the diagnostic is reported in.** A name is kept qualified when that file can
+// see another type of the same simple name: one its own module declares (its own file-private one
+// first), one it imported by name, one a wildcard of it offers, or one the library offers every
+// file. The diagnostic itself is the second place a reader looks, so a message naming two types of
+// one simple name -- `'Option' here is sysl.Option; did you mean geom.Option?` -- keeps both
+// qualified, whatever the file sees.
+//
+// **Only a type's own path is shortened.** A path continuing past the type names a member of it
+// (`sysl.buf.Buf.set_len`) and is left as written, and so is a path an `import` the message
+// suggests spells out, since that one has to be pasted whole.
+//
+// The rewrite is on the finished sentence rather than inside `type_show`, because `type_show` is
+// also what a symbol, a reflected type name and the typed tree's printer are spelled with, and none
+// of them is said somewhere a reader stands.
+names_shown(t: &Tables, scope: Scope, message: string) -> string
+    val runs = type_paths(t, message)
+
+    if runs.is_empty() then return message
+
+    val bytes = message.bytes
+    var out: Buf[u8] = buf()
+    var at: usize = 0
+
+    for run in runs
+        if !shortened(t, scope, runs, run) then continue
+
+        out.extend(bytes[at..<run.from])
+        out.extend(run.name.bytes)
+        at = run.to
+
+    if at == 0 then return message
+
+    out.extend(bytes[at..<bytes.len])
+    from_utf8_unchecked(out.view())
+end names_shown
+
+// One qualified path in a message that ends at a type: where it is, the simple name it ends in, the
+// key of the type it names, and whether it is one this rewrite may shorten -- the library's, and not
+// spelled out for an `import`. The rest are kept because they are what a shortened name would be
+// mistaken for.
+private struct TypePath
+    from: usize
+    to: usize
+    name: string
+    key: string
+    library: bool
+end TypePath
+
+// Every qualified path in a message that ends at a declared type, in the order they are written.
+private type_paths(t: &Tables, message: string) -> Buf[TypePath]
+    var runs: Buf[TypePath] = buf()
+
+    if !message.contains(".") && !message.contains("$") then return runs
+
+    val b = message.bytes
+    var i: usize = 0
+
+    while i < b.len
+        if !name_byte(b[i])
+            i += 1
+            continue
+
+        val from = i
+        var last = i
+
+        // A dot belongs to the path only between two names, so a sentence's full stop is not one. A
+        // message may still hold a key as it was filed (`sysl.text$StrBuilder`), which the report
+        // spells with a dot later (`readable_keys`), so the separator counts as one here.
+        while i < b.len && (name_byte(b[i]) || (joins(b[i]) && i + 1 < b.len && name_byte(b[i + 1])))
+            if joins(b[i]) then last = i + 1
+
+            i += 1
+
+        if last == from || !upper(b[last]) then continue
+
+        val name = from_utf8_unchecked(b[last..<i])
+        val home = from_utf8_unchecked(b[from..<last - 1])
+        val key = module_qualify(home, name)
+
+        if t.types.has(key) then
+            runs.push(TypePath(from, i, name, key,
+                               starts_with_module(home, AutoImportedModule) && !imported_after(b, from)))
+
+    runs
+end type_paths
+
+// Whether a path in a message may be said by its simple name.
+private shortened(t: &Tables, scope: Scope, runs: Buf[TypePath], run: TypePath) -> bool
+    if !run.library then return false
+
+    for other in runs
+        if other.name == run.name && other.key != run.key then return false
+
+    !another_in_scope(t, scope, run.name, run.key)
+end shortened
+
+// Whether a file can see a type called `name` other than the one `key` names.
+another_in_scope(t: &Tables, scope: Scope, name: string, key: string) -> bool
+    val plain = module_qualify(scope.module_name, name)
+
+    if other_visible(t, scope, plain, key) then return true
+
+    t.file_private.get(file_slot_key(scope.src.name, plain)) match
+        Some(own) -> if other_visible(t, scope, own, key) then return true
+        None -> ()
+
+    for pair in scope.imports.names
+        if pair.0 == name && other_visible(t, scope, pair.1, key) then return true
+
+    for at in scope.imports.wildcards
+        if other_visible(t, scope, module_qualify(at, name), key) then return true
+
+    other_visible(t, scope, module_qualify(AutoImportedModule, name), key)
+end another_in_scope
+
+// Whether a candidate is a type, not the one `key` names, that the file may name.
+private other_visible(t: &Tables, scope: Scope, candidate: string, key: string) -> bool
+    if candidate == key || !t.types.has(candidate) then return false
+
+    t.access.get(candidate) match
+        Some(acc) -> reachable(acc, scope)
+        None -> true
+end other_visible
+
+// Whether the path starting at `from` is the one an `import` the message suggests spells.
+private imported_after(b: []const u8, from: usize) -> bool
+    val word = "import ".bytes
+
+    if from < word.len then return false
+
+    for i in 0..<word.len
+        if b[from - word.len + i] != word[i] then return false
+
+    true
+end imported_after
+
+private name_byte(c: u8) -> bool = upper(c) || (c >= u8('a') && c <= u8('z')) || (c >= u8('0') && c <= u8('9')) || c == u8('_')
+
+private upper(c: u8) -> bool = c >= u8('A') && c <= u8('Z')
+
+private joins(c: u8) -> bool = c == u8('.') || c == u8(ModuleSep)

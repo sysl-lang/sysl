@@ -140,7 +140,7 @@ print(same_size(Flagged(1, true)))
 ```
 
 ```error
-'same_size' requires its type parameter 'T' to implement 'sysl.AnyBits', but Flagged does not — storage nobody wrote would not hold a valid value of it: its field 'on' is bool — a 'bool' is 0 or 1, and its byte can hold 254 numbers that are neither
+'same_size' requires its type parameter 'T' to implement 'AnyBits', but Flagged does not — storage nobody wrote would not hold a valid value of it: its field 'on' is bool — a 'bool' is 0 or 1, and its byte can hold 254 numbers that are neither
 ```
 
 **Nothing implements it**, as nothing implements `Integer`: a type is one or it is not.
@@ -153,7 +153,7 @@ impl AnyBits for Flag
 ```
 
 ```error
-'sysl.AnyBits' names a family of types the compiler settles, so nothing implements it — a type is one of them or it is not, and 'Flag' is not
+'AnyBits' names a family of types the compiler settles, so nothing implements it — a type is one of them or it is not, and 'Flag' is not
 ```
 
 Unlike `Integer` it is not a family a blanket `impl` is written over: it holds every integer, and a
@@ -1181,7 +1181,7 @@ print(1)
 ```
 
 ```error
-every slice already implements 'sysl.Eq', so '[]N' has an implementation and cannot be given a second one — write 'override impl' to say that replacing it for this one type is what was meant
+every slice already implements 'Eq', so '[]N' has an implementation and cannot be given a second one — write 'override impl' to say that replacing it for this one type is what was meant
 ```
 
 Say it and the block is yours, for `[]N` and for nothing else:
@@ -1513,7 +1513,7 @@ g[0] += 1
 ```
 
 ```error
-'+=' on an element read through 'sysl.Index' would evaluate the receiver and the index twice — write it out as 'b[i] = b[i] + …'
+'+=' on an element read through 'Index' would evaluate the receiver and the index twice — write it out as 'b[i] = b[i] + …'
 ```
 
 The expansion would be `g.index_set(0, g.index(0) + 1)`, which evaluates `g` twice and the index
