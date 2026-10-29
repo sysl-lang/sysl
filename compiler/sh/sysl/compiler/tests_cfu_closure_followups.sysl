@@ -125,10 +125,11 @@ cfu_unfit_annotation_refused() =
         print(xs.fold(0, (a: string, n) -> 1))
         """, "this closure's 'a' is declared string, but 'slice.fold' passes it int", 2, 19)
 
-    // A seed with a type of its own is no literal to adapt: it settles `A`.
+    // A seed with a type of its own is no literal to adapt: it settles `A`. (A binding whose type is
+    // still open is read as its literal; `cob_` below.)
     cfu_refused(raw"""
         val xs: []int = [1, 2, 3]
-        val z = 0
+        val z: int = 0
         print(xs.fold(z, (a: i64, n) -> 1))
         """, "this closure's 'a' is declared long, but 'slice.fold' passes it int", 3, 19)
 
@@ -188,3 +189,48 @@ cfu_array_flat_map() =
         print(arr.flat_map(n -> arr[0..<n]))
         """, "[1, 1, 2, 2, 3, 3]\n[1, 10, 2, 20, 3, 30]\n[1, 1, 1, 2, 3, 3, 3]\n[one, 2, !, 3, !]\n" +
              "[1, 1, 2, 1, 2, 3]\n")
+
+// -- a seed that is a binding whose type is still open -----------------------------------------------
+
+// A generic call reads a literal binding whose type no use has fixed yet as it reads the literal
+// itself (`reference/declarations.md`), so a closure's annotation settles `val y = 240` as a seed
+// exactly as it settles a `240` written there -- at a byte as at a long or a real -- and a binding
+// that cannot be read there is refused at the closure, as the literal is.
+
+@test("an open binding as a seed takes the closure's annotation, as its literal would, at every width")
+cob_open_seed_takes_the_annotation() =
+    if !rng_ready() then return
+
+    rng_prints(raw"""
+        run[A](init: A, f: (A, int) -> A) -> A = f(f(init, 1), 2)
+        val xs: []int = [1, 2, 3]
+        val arr = [1, 2, 3]
+        val y = 240
+        val z = 0
+        val h = 0
+        val k = 1
+        print(xs.fold(y, (a: u8, n) -> a + u8(n)), arr.fold(z, (a: i64, n) -> a + i64(n)),
+              xs.fold(h, (a: f64, n) -> a + f64(n) / 2), run(k, (a: u16, n) -> a + u16(n)))
+        """, "246 6 3 4\n")
+
+@test("an open binding the annotation cannot take, or one already fixed at int, is refused at the closure")
+cob_open_seed_refused() =
+    cfu_refused(raw"""
+        val xs: []int = [1, 2, 3]
+        val y = 300
+        print(xs.fold(y, (a: u8, n) -> a))
+        """, "this closure's 'a' is declared byte, but 'slice.fold' passes it int", 3, 19)
+
+    cfu_refused(raw"""
+        val xs: []int = [1, 2, 3]
+        val z = 0
+        val m: int = z
+        print(xs.fold(z, (a: i64, n) -> 1), m)
+        """, "this closure's 'a' is declared long, but 'slice.fold' passes it int", 4, 19)
+
+    // The annotation is taken and the body is not: the closure is told what it should yield.
+    cfu_refused(raw"""
+        val xs: []int = [1, 2, 3]
+        val z = 0
+        print(xs.fold(z, (a: i64, n) -> "x"))
+        """, "this closure should yield long, but its body yields string", 3, 18)

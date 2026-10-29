@@ -294,7 +294,25 @@ private arithmetic_op(op: string) -> bool =
 // reads a literal: it decides no type parameter while an argument with a type of its own is there,
 // and is read at the parameter the solve arrives at, which fixes it -- `val k = 5; pick(k, b)` over
 // a `u8` is a `u8` call, as rustc's integer variables unify.
-open_argument(cx: &Analyzer, e: Expr) -> bool = open_name(cx, e).is_some()
+// A binding an earlier use already fixed has a type of its own, and is read as any typed value is.
+open_argument(cx: &Analyzer, e: Expr) -> bool = waiting_open(cx, e).is_some()
+
+// The open binding `e` names, where no use has fixed its type yet.
+private waiting_open(cx: &Analyzer, e: Expr) -> Option[OpenVar]
+    val unique = open_name(cx, e)
+
+    if unique.is_none() then return None
+
+    for o in cx.open_vars
+        if o.unique != unique.unwrap() then continue
+
+        for k in o.since..<cx.var_fix_log.len()
+            if cx.var_fix_log.at(k).at == o.at then return None
+
+        return Some(o)
+
+    None
+end waiting_open
 
 // **An open binding read at the parameter a generic call arrived at is fixed there, fitting or not**,
 // as arithmetic beside a typed operand fixes it: `val k = 300; pick(k, b)` over a `u8` is told the
@@ -304,6 +322,15 @@ fix_open_argument(cx: &Analyzer, e: Expr, want: Type)
 
     if unique.is_some() then note_var_fix(cx, unique.unwrap(), want, true)
 end fix_open_argument
+
+// **The literal an open binding stands for, where a call asks whether it can be read at a type**: a
+// closure's annotation settles a seed `val k = 5` exactly as it settles the `5` written there, so
+// `xs.fold(k, (a: u8, n) -> …)` is a byte fold and `val k = 300` there is not. Nothing where `e` is
+// no open binding, is one already fixed, or is a counted `for`'s variable, which no one literal
+// stands for.
+open_literal(cx: &Analyzer, e: Expr) -> Option[Expr] = waiting_open(cx, e) match
+    Some(o) -> if o.counted then None else Some(o.init)
+    None -> None
 
 // The open binding an expression names, if it is one.
 private open_name(cx: &Analyzer, e: Expr) -> Option[string]
