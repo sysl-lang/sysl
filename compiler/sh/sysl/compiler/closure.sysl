@@ -465,6 +465,27 @@ read_after_copy_write(cx: &Analyzer, span: Span, unique: string)
     end for
 end read_after_copy_write
 
+// **A closure written inside another writes a copy of the outer closure's capture**, and that capture
+// is itself a copy of the enclosing body's variable. Nothing in the outer closure read it after the
+// inner one, so the record is handed to the enclosing body as a write of ITS variable: a read there
+// after the outer closure is a program expecting the write to have reached it, refused as it is for
+// a closure written directly in that body. A record of the outer closure's own local stays behind.
+private hand_up_copy_writes(cx: &Analyzer, inner: &Analyzer, span: Span, captured: Buf[string])
+    if inner.copy_writes.is_empty() then return
+
+    for w in inner.copy_writes
+        for i in 0..<inner.captured.len()
+            if inner.captured.at(i).0 != w.unique then continue
+
+            val outer = cx.lookup(captured.at(i))
+
+            if outer.is_some()
+                cx.copy_writes.push(CopyWrite(outer.unwrap().unique, w.name, span, w.write, w.form,
+                                              w.shown))
+        end for
+    end for
+end hand_up_copy_writes
+
 // What one closure body does with each capture: how often it names it, how many of those are the
 // place of a write to the closure's copy, and the first such write and its form.
 private struct CopyScan
@@ -756,6 +777,7 @@ private closure_body(cx: &Analyzer, span: Span, st: &StructType, fname: string,
 
     check_consumes(inner, block)
     check_counted_pointers(inner, block)
+    hand_up_copy_writes(cx, inner, span, captured)
 
     var ret = Unit
 
