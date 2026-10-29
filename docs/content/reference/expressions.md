@@ -2848,7 +2848,7 @@ print(first(a))
 ```
 
 ```error
-'first' requires its type parameter 'T' to implement 'sysl.Zero', but Age does not
+'first' requires its type parameter 'T' to implement 'Zero', but Age does not
 ```
 
 ```sysl
@@ -3092,7 +3092,7 @@ print(Srgb == Srgb)
 ```
 
 ```error
-'Colorspace' already implements 'sysl.Eq' — no variant of it carries anything, so its value is its discriminant and '==' is that comparison. Delete the block; a variant that needs an equality of its own has to carry something for it to be about
+'Colorspace' already implements 'Eq' — no variant of it carries anything, so its value is its discriminant and '==' is that comparison. Delete the block; a variant that needs an equality of its own has to carry something for it to be about
 ```
 
 ### Why the token set is closed

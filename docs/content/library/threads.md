@@ -115,7 +115,7 @@ print(c.is_some())
 ```
 
 ```error
-'body' of 'sysl.threads.spawn' is *extern(*sysl.sync.Atomic[int]) -> unit, but a closure was given
+'body' of 'sysl.threads.spawn' is *extern(*Atomic[int]) -> unit, but a closure was given
 ```
 
 Two reasons, and neither is a limitation waiting to be lifted. A closure would have to be **boxed**
@@ -339,7 +339,7 @@ print(m.inner)
 ```
 
 ```error
-field 'inner' of 'sysl.threads.Mutex' is private to 'library/sysl/threads/mutex.sysl', the file that declares it
+field 'inner' of 'Mutex' is private to 'library/sysl/threads/mutex.sysl', the file that declares it
 ```
 
 Private is the entirety of what "owns" means here. With the value public, reading it would be an
@@ -359,7 +359,7 @@ built.with((p) -> print(*p))
 ```
 
 ```error
-the constructor names every field of 'sysl.threads.Mutex' in order, and 'inner' is private to 'library/sysl/threads/mutex.sysl', the file that declares it — build it through an associated function of its own
+the constructor names every field of 'Mutex' in order, and 'inner' is private to 'library/sysl/threads/mutex.sysl', the file that declares it — build it through an associated function of its own
 ```
 
 ### `with` lends the value for one call

@@ -177,7 +177,7 @@ print(Complex(1.0, 0.0) < Complex(2.0, 0.0))
 ```
 
 ```error
-'<' is not defined for sysl.math.complex.Complex[real]
+'<' is not defined for Complex[real]
 ```
 
 sysl keeps `Eq` and `Ord` independent traits precisely so a type can have the one without the other.

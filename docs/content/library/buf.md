@@ -326,7 +326,7 @@ print(b.len)
 ```
 
 ```error
-'len' is a method of 'sysl.buf.Buf[int]' — call it with 'len(…)'
+'len' is a method of 'Buf[int]' — call it with 'len(…)'
 ```
 
 A `for` walks a `Buf` directly. A `Buf` is not a cursor — it implements `Index`, not `Iterate` — but
@@ -755,7 +755,7 @@ flags.set_len(0)
 ```
 
 ```error
-'sysl.buf.Buf.set_len' requires its type parameter 'T' to implement 'sysl.AnyBits', but bool does not — storage nobody wrote would not hold a valid value of it: a 'bool' is 0 or 1, and its byte can hold 254 numbers that are neither
+'sysl.buf.Buf.set_len' requires its type parameter 'T' to implement 'AnyBits', but bool does not — storage nobody wrote would not hold a valid value of it: a 'bool' is 0 or 1, and its byte can hold 254 numbers that are neither
 ```
 
 A buffer of such a type is filled with `push` or `extend`, or with `buf_filled` and then written in

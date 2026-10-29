@@ -1546,7 +1546,7 @@ trait Pad[T]
 ```
 
 ```error
-'zero' needs 'T: sysl.Zero'
+'zero' needs 'T: Zero'
 ```
 
 ```sysl
@@ -3680,7 +3680,7 @@ print(Pair(Tag(1), Tag(2)).larger().n)
 ```
 
 ```error
-'Pair.larger' requires its type parameter 'T' to implement 'sysl.Ord', but Tag does not
+'Pair.larger' requires its type parameter 'T' to implement 'Ord', but Tag does not
 ```
 
 **Another module may not add members**: a type's own members are part of what its declaration
@@ -3694,7 +3694,7 @@ print(1)
 ```
 
 ```error
-'sysl.Option' is the library's, and an 'impl' naming no trait adds members to a type only in a file of the module that declares it
+'Option' is the library's, and an 'impl' naming no trait adds members to a type only in a file of the module that declares it
 ```
 
 ## Enums
