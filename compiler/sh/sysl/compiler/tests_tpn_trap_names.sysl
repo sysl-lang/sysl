@@ -1,0 +1,124 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_temp_dir, remove_dir_all, write_text}
+import sysl.process.{capture, Status}
+
+// The debug build's overflow report names its types as the program declared them
+// (`type_spelling.sysl`'s `trap_operand`, `build_mode.sysl`'s `note_trap_name`): `u8 + u8` where the
+// binding says `u8`, `byte + byte` where it says `byte`, an alias by its name alone, and the
+// canonical name where no declaration is there to quote. Every kind of checked operation is built at
+// a width with a built-in word of its own (`u8`), at one with none (`u12`), and through an alias.
+
+private tpn_ready() -> bool = std_root().is_ok() && clang_available()
+
+// `text` as `main.sysl`, built in debug and run: its status and what it wrote to standard error.
+private tpn_run(text: string) -> (Status, string)
+    val root = make_temp_dir("sysl-tpn").unwrap()
+
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    var flags: [1]string = ["--debug"]
+
+    assert_eq(took_search_flag(flags[..], 0), 1)
+
+    val built = build_native_program(root, None, None, DefaultOptimization, Some(exe))
+
+    reset_search_paths()
+
+    built match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (Status.Exited(-1), failure_text(why))
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> (Status.Exited(-1), "the program that was built could not be run")
+        Ok(out) -> (out.status, out.err.unwrap_or(""))
+end tpn_run
+
+// The program traps with exactly `what` at `at` (`line:col`) as its report.
+private tpn_cell(text: string, what: string, at: string)
+    if !tpn_ready() then return
+
+    val (state, err) = tpn_run(text)
+
+    assert_eq(err, s"integer overflow: $what (main.sysl:$at)\n")
+    assert(state == Status.Signalled(5), s"stopped with $state")
+end tpn_cell
+
+// -- addition, subtraction, multiplication ------------------------------------------------------------
+
+@test("a sum at u8, byte, u12 and an alias is named as declared")
+tpn_add()
+    tpn_cell("var a: u8 = 200\nprint(a + 100)\n", "u8 + u8", "2:7")
+    tpn_cell("var a: byte = 200\nprint(a + 100)\n", "byte + byte", "2:7")
+    tpn_cell("var a: u12 = 4095\nprint(a + 1)\n", "u12 + u12", "2:7")
+    tpn_cell("type Small = u8\nval a: Small = 200\nprint(a + 100)\n", "Small + Small", "3:7")
+    tpn_cell("var a: u8 = 200\nprint(100 + a)\n", "u8 + u8", "2:7")
+end tpn_add
+
+@test("a difference at u16, ushort, u12 and an alias is named as declared")
+tpn_sub()
+    tpn_cell("var a: u16 = 0\nprint(a - 1)\n", "u16 - u16", "2:7")
+    tpn_cell("var a: ushort = 0\nprint(a - 1)\n", "ushort - ushort", "2:7")
+    tpn_cell("var a: u12 = 0\nprint(a - 1)\n", "u12 - u12", "2:7")
+    tpn_cell("type Level = u16\nval a: Level = 0\nprint(a - 1)\n", "Level - Level", "3:7")
+end tpn_sub
+
+@test("a product at u32, uint, u12 and an alias is named as declared")
+tpn_mul()
+    tpn_cell("var a: u32 = 65536\nprint(a * 65536)\n", "u32 * u32", "2:7")
+    tpn_cell("var a: uint = 65536\nprint(a * 65536)\n", "uint * uint", "2:7")
+    tpn_cell("var a: u12 = 4000\nprint(a * 2)\n", "u12 * u12", "2:7")
+    tpn_cell("type Count = u32\nval a: Count = 65536\nprint(a * 65536)\n", "Count * Count", "3:7")
+end tpn_mul
+
+@test("a value with no declaration is named canonically")
+tpn_undeclared()
+    tpn_cell("val a = u8(200)\nprint(a + 100)\n", "byte + byte", "2:7")
+end tpn_undeclared
+
+// -- negation, steps, compound assignment ---------------------------------------------------------------
+
+@test("a negation at i8, i16, i12 and an alias is named as declared")
+tpn_neg()
+    tpn_cell("var a: i8 = -128\nprint(-a)\n", "-i8", "2:7")
+    tpn_cell("var a: i16 = -32768\nprint(-a)\n", "-i16", "2:7")
+    tpn_cell("var a: i12 = -2048\nprint(-a)\n", "-i12", "2:7")
+    tpn_cell("type Delta = i16\nval a: Delta = -32768\nprint(-a)\n", "-Delta", "3:7")
+end tpn_neg
+
+@test("a step at u8, u12 and an alias is named as declared")
+tpn_step()
+    tpn_cell("var a: u8 = 255\na++\n", "u8++", "2:1")
+    tpn_cell("var a: u16 = 0\na--\n", "u16--", "2:1")
+    tpn_cell("var a: u12 = 4095\na++\n", "u12++", "2:1")
+    tpn_cell("type Small = u8\nvar a: Small = 255\na++\n", "Small++", "3:1")
+end tpn_step
+
+@test("a compound assignment at u8, u12 and an alias is named as declared")
+tpn_compound()
+    tpn_cell("var a: u8 = 250\na += 10\n", "u8 += u8", "2:1")
+    tpn_cell("var a: byte = 250\na += 10\n", "byte += byte", "2:1")
+    tpn_cell("var a: u12 = 4000\na *= 2\n", "u12 *= u12", "2:1")
+    tpn_cell("type Small = u8\nvar a: Small = 250\na += 10\n", "Small += Small", "3:1")
+    tpn_cell("var a: u8 = 5\nvar b: u8 = 10\na -= b\n", "u8 -= u8", "3:1")
+end tpn_compound
+
+// -- written conversions ----------------------------------------------------------------------------------
+
+@test("a narrowing conversion names its target as written and its operand as declared")
+tpn_narrow()
+    tpn_cell("var n = 300\nprint(u8(n))\n", "u8(int)", "2:7")
+    tpn_cell("var n = 300\nprint(byte(n))\n", "byte(int)", "2:7")
+    tpn_cell("var n = 5000\nprint(u12(n))\n", "u12(int)", "2:7")
+    tpn_cell("var n: i64 = -1\nprint(u32(n))\n", "u32(i64)", "2:7")
+    tpn_cell("type Small = u8\nvar n = 300\nprint(Small(n))\n", "Small(int)", "3:7")
+end tpn_narrow

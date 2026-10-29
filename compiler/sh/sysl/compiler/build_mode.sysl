@@ -1,7 +1,7 @@
 module sh.sysl.compiler
 
 import sh.sysl.parsing.Span
-import sysl.container.{Set, set}
+import sysl.container.{Map, Set, map, set}
 
 // **The two build modes**, which decide one thing: what a plain integer `+`, `-`, `*`, a unary `-`
 // and a written conversion `u8(x)` do where the answer does not fit the type.
@@ -80,4 +80,29 @@ is_written_conversion(file: string, at: Span) -> bool = written.has(written_key(
 // Forgets every recorded conversion, as each command line starts.
 forget_written_conversions()
     written = set()
+    trap_names = map()
 end forget_written_conversions
+
+// -- how an overflow report names its types ------------------------------------------------------------
+
+// **A report names its types as the program declared them** (`u8 + u8`, not `byte + byte`), the way
+// a diagnostic at compile time does, but the text is baked into the image at emission, which sees
+// canonical types only. The analyzer records the declared spelling of each checked operation by where
+// it was written and the canonical text the emitter will compose for it; the emitter asks with that
+// text, so a record from another instantiation of the same source (different canonical types) is
+// never mistaken for this one. An alias is shown by its name alone -- a report is read at a
+// terminal, not compared with a declaration, so it stays short.
+private var trap_names: Map[string, string] = map()
+
+private trap_key(file: string, at: Span, canonical: string) -> string = s"$file:${at.start}-${at.end}|$canonical"
+
+// Records that the operation at `at` in `file`, which the emitter names `canonical`, is named
+// `shown` by the program.
+note_trap_name(file: string, at: Span, canonical: string, shown: string)
+    if shown != canonical then trap_names.put(trap_key(file, at, canonical), shown)
+end note_trap_name
+
+// The text a report for the operation at `at` carries: the declared spelling where one was recorded,
+// and the canonical text otherwise.
+trap_name(file: string, at: Span, canonical: string) -> string =
+    trap_names.get(trap_key(file, at, canonical)).unwrap_or(canonical)

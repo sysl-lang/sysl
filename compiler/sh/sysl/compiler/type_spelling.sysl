@@ -22,9 +22,14 @@ import sysl.buf.{Buf, buf}
 // neither earns an `aka`.
 
 // A type as a declaration wrote it: the text, and whether the text names an alias anywhere in it.
+//
+// **`params` is what a written callable type (`Fn(u8)`, also behind `&`) spelled each of its
+// parameters as**, empty for every other type: a call through the call trait reads its parameters as
+// `A`, so the receiver's own written type is where a literal argument's declared type is found.
 struct Spelling
     text: string
     aliased: bool
+    params: Buf[Spelling]
 end Spelling
 
 // A type a position declared, with the spelling its declaration wrote.
@@ -72,8 +77,47 @@ spelled_show(t: Type, s: Option[Spelling]) -> string = s match
 spelling_of(written: TypeRef, t: Type, tparams: Buf[string]) -> Option[Spelling] =
     spell_verdict(written, t, tparams) match
         SpellUntrusted -> None
-        SpellPlain -> Some(Spelling(type_text(with_paths(written, t)), false))
-        SpellAliased -> Some(Spelling(type_text(with_paths(written, t)), true))
+        SpellPlain -> Some(Spelling(type_text(with_paths(written, t)), false, callable_params(written, t, tparams)))
+        SpellAliased -> Some(Spelling(type_text(with_paths(written, t)), true, callable_params(written, t, tparams)))
+
+// What each parameter of a written callable type was spelled as, looking through the references
+// around it; empty for any other type.
+private callable_params(w: TypeRef, t: Type, tparams: Buf[string]) -> Buf[Spelling]
+    var out: Buf[Spelling] = buf()
+
+    *w.kind match
+        RefType(wi, _) ->
+            t match
+                Ref(ti, _) -> return callable_params(wi, *ti, tparams)
+                _ -> ()
+        FnType(params, _, _) ->
+            t match
+                Trait(n, targs, _) ->
+                    fn_parts(n, targs) match
+                        Some(parts) ->
+                            for i in 0..<params.len()
+                                if i < parts.0.len()
+                                    spelling_of(params.at(i), parts.0.at(i), tparams) match
+                                        Some(s) -> out.push(s)
+                                        None -> return buf()
+                        None -> ()
+                _ -> ()
+        _ -> ()
+
+    out
+end callable_params
+
+// The spelling of the `i`th parameter of the callable `receiver` was declared as, where it was.
+callable_param_spelling(cx: &Analyzer, receiver: TExpr, i: usize) -> Option[Spelling]
+    var sp = texpr_spelling(cx, receiver)
+
+    if sp.is_none()
+        *receiver.kind match
+            TDeref(inner, _) -> sp = texpr_spelling(cx, inner)
+            _ -> ()
+
+    if sp.is_some() && i < sp.unwrap().params.len() then Some(sp.unwrap().params.at(i)) else None
+end callable_param_spelling
 
 // The written type with every name of a declared type put back on its full path, so that the
 // sentence's shortening (`short_names.sysl`) decides how it reads, as it does for a type nothing
@@ -327,3 +371,17 @@ field_spelling(cx: &Analyzer, d: &StructType, index: int, ty: Type) -> Option[Sp
                 else spelling_of(sd.fields.at(usize(index)).typ, ty, sd.tparams)
             _ -> None
         None -> None
+
+// -- how an overflow report names a type ---------------------------------------------------------------
+
+// An operand's type as an overflow report names it (`build_mode.sysl`'s `note_trap_name`): the
+// spelling of the declaration it was read from, an alias by its name alone, and -- for an operand with
+// no declaration of its own, such as a literal -- the spelling of `beside` when that is the same type.
+trap_operand(cx: &Analyzer, e: TExpr, beside: TExpr) -> string
+    val own = texpr_spelling(cx, e)
+    val sp = if own.is_none() && type_eq(texpr_type(e), texpr_type(beside)) then texpr_spelling(cx, beside) else own
+
+    sp match
+        Some(s) -> s.text
+        None -> type_show(texpr_type(e))
+end trap_operand

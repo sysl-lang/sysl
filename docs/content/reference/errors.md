@@ -868,8 +868,9 @@ main()
 ```
 
 `+%` says the wrap in its spelling, so it wraps in every build; the plain `+=` is checked, and the run
-above — the site runs its examples as `sysl run` does, in debug — stops with `integer overflow: byte
-+= byte (main.sysl:5:5)` on standard error. Built with `sysl build` it prints `4` twice. Where the wrap
+above — the site runs its examples as `sysl run` does, in debug — stops with `integer overflow: u8
++= u8 (main.sysl:5:5)` on standard error — the types are named as the program declared them (`u8`
+here, `byte` where the binding says `byte`, an alias by its own name). Built with `sysl build` it prints `4` twice. Where the wrap
 is the point, `+%` `-%` `*%` say so; where the answer should stop at the end of the range, `+|` `-|`
 `*|` ([wrapping and saturating operators](/reference/expressions/#wrapping-and-saturating-operators)).
 
@@ -970,7 +971,7 @@ hold; it goes through the same function, which receives the two names as NUL-ter
 does [`T::Make(p)`](/reference/reflection/#building-a-value-a-field-at-a-time) made from a partial
 value with a field still `None`: `'P' was made from a partial value whose field 'P.y' is None
 (main.sysl:8:8)`. So does an integer overflow, naming the operation and its types — `integer
-overflow: int * int (main.sysl:3:13)`, `integer overflow: -i8`, `integer overflow: byte(int)`; inside
+overflow: int * int (main.sysl:3:13)`, `integer overflow: -i8`, `integer overflow: u8(int)`; inside
 a [`@track_caller`](/reference/attributes/#track-caller-a-function-that-reports-its-caller-s-line)
 function it names the caller's line, as a bounds check there does. On a freestanding target the
 report needs no allocator and no formatter: the text is a constant, and the trap follows.
