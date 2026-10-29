@@ -1,0 +1,229 @@
+module sh.sysl.compiler
+@tests
+
+// The expected type reaches a generic call through a form that unwraps it
+// (`reference/generics.md § From the expected type`): `?`, `.unwrap()`, `.expect(msg)`,
+// `.unwrap_or(d)`, `.unwrap_or_else(f)`, and a `match` whose arm yields the payload as it is. What
+// the position wants is what the success half of the `Option` or `Result` is solved as -- never the
+// error half, which no unwrapping says anything about.
+
+private ett_gens() -> string = raw"""
+    ok[T: Zero]() -> Result[T, string] = Ok(T.zero())
+    some[T: Zero]() -> Option[T] = Some(T.zero())
+    none[T]() -> Option[T] = None
+
+    """
+
+// ---- `?` -----------------------------------------------------------------------------------------
+
+@test("'?' on a generic Result solves its success half from the binding's type")
+ett_try_result()
+    if !aza_ready() then return
+
+    twp_prints(ett_gens() + raw"""
+        run() -> Result[int, string]
+            val n: u8 = ok()?
+
+            print(n + 1)
+            Ok(0)
+
+        run().unwrap()
+        """, "1\n")
+
+@test("'?' on a generic Option solves its success half from the binding's type")
+ett_try_option()
+    if !aza_ready() then return
+
+    twp_prints(ett_gens() + raw"""
+        run() -> Option[int]
+            val n: i64 = some()?
+
+            print(n - 1)
+            Some(0)
+
+        run().unwrap()
+        """, "-1\n")
+
+@test("'?' in an element assignment is solved at the element's type")
+ett_try_element_assignment()
+    if !aza_ready() then return
+
+    twp_prints(ett_gens() + raw"""
+        run() -> Result[int, string]
+            var a: [2]u8 = [5, 6]
+
+            a[0] = ok()?
+            print(a[0] + a[1])
+            Ok(0)
+
+        run().unwrap()
+        """, "6\n")
+
+@test("'?' as a statement has no expected type, and still asks for one")
+ett_try_statement_refused()
+    if !aza_ready() then return
+
+    aza_refuses(ett_gens() + raw"""
+        run() -> Result[int, string]
+            ok()?
+            Ok(0)
+
+        run().unwrap()
+        """, "cannot infer the type argument 'T' of 'ok' here — annotate the expected type")
+
+@test("a member read off '?' is not what the payload is wanted as, and still asks for one")
+ett_try_then_member_refused()
+    if !aza_ready() then return
+
+    aza_refuses(ett_gens() + raw"""
+        run() -> Result[int, string]
+            val n: int = ok()?.zz()
+
+            print(n)
+            Ok(0)
+
+        run().unwrap()
+        """, "cannot infer the type argument 'T' of 'ok' here — annotate the expected type")
+
+@test("the error half is never solved from the function's own result")
+ett_try_error_half_not_inferred()
+    if !aza_ready() then return
+
+    aza_refuses(raw"""
+        both[T: Zero, E]() -> Result[T, E] = Ok(T.zero())
+
+        run() -> Result[int, string]
+            val n: int = both()?
+
+            print(n)
+            Ok(0)
+
+        run().unwrap()
+        """, "cannot infer the type argument 'E' of 'both' here — annotate the expected type")
+
+// ---- the unwrapping members ----------------------------------------------------------------------
+
+@test("'.unwrap()' on a generic Option solves its success half from the binding's type")
+ett_unwrap()
+    if !aza_ready() then return
+
+    twp_prints(ett_gens() + "val n: u8 = some().unwrap()\nprint(n + 2)\n", "2\n")
+
+@test("'.expect(msg)' on a generic Result solves its success half from the binding's type")
+ett_expect()
+    if !aza_ready() then return
+
+    twp_prints(ett_gens() + "val n: u16 = ok().expect(\"none\")\nprint(n + 3)\n", "3\n")
+
+@test("'.unwrap_or(d)' solves the success half from the binding's type, not from the literal")
+ett_unwrap_or()
+    if !aza_ready() then return
+
+    twp_prints(ett_gens() + "val n: u8 = none().unwrap_or(250)\nprint(n + 5)\n", "255\n")
+
+@test("'.unwrap_or_else(f)' solves the success half from the binding's type")
+ett_unwrap_or_else()
+    if !aza_ready() then return
+
+    twp_prints(ett_gens() + "val n: i8 = none().unwrap_or_else(() -> 4)\nprint(n - 5)\n", "-1\n")
+
+@test("an argument the position reads, too: a call's parameter is what the payload is wanted as")
+ett_unwrap_at_argument()
+    if !aza_ready() then return
+
+    twp_prints(ett_gens() + "twice(x: u8) -> u8 = x + x\nprint(twice(none().unwrap_or(100)))\n",
+               "200\n")
+
+@test("a generic METHOD's result is solved through '.unwrap()' as a free function's is")
+ett_unwrap_generic_method()
+    if !aza_ready() then return
+
+    twp_prints(raw"""
+        struct Src
+            k: int
+
+        impl Src
+            get[T: Zero](self) -> Option[T] = Some(T.zero())
+
+        val s = Src(1)
+        val n: u8 = s.get().unwrap()
+
+        print(n + 7)
+        """, "7\n")
+
+@test("a generic struct is what the payload is wanted as")
+ett_generic_struct_payload()
+    if !aza_ready() then return
+
+    twp_prints(ett_gens() + raw"""
+        struct Box[T]
+            v: T
+
+        val b: Box[u8] = none().unwrap_or(Box(9))
+
+        print(b.v)
+        """, "9\n")
+
+@test("'.unwrap()' with nothing expected still asks for an annotation")
+ett_unwrap_unexpected_refused()
+    if !aza_ready() then return
+
+    aza_refuses(ett_gens() + "print(some().unwrap())\n",
+                "cannot infer the type argument 'T' of 'some' here — annotate the expected type")
+
+@test("an argument that settles the parameter wins, and a disagreement is told as one")
+ett_unwrap_argument_settles()
+    if !aza_ready() then return
+
+    aza_refuses("wrap[T](x: T) -> Option[T] = Some(x)\nval n: u8 = wrap(\"s\").unwrap()\n",
+                "cannot initialize 'n': declared byte but the value is string")
+
+// ---- a `match` whose arm yields the payload --------------------------------------------------------
+
+@test("a match whose 'Some(v) -> v' arm yields the payload solves it from the binding's type")
+ett_match_option()
+    if !aza_ready() then return
+
+    twp_prints(ett_gens() + raw"""
+        val n: u8 = some() match
+            Some(v) -> v
+            None -> 9
+
+        print(n + 1)
+        """, "1\n")
+
+@test("a match whose 'Ok(v) -> v' arm yields the payload solves it from the binding's type")
+ett_match_result()
+    if !aza_ready() then return
+
+    twp_prints(ett_gens() + raw"""
+        val n: i16 = ok() match
+            Ok(v) -> v
+            Err(_) -> 9
+
+        print(n - 2)
+        """, "-2\n")
+
+@test("an arm that does something else with 'v' says nothing, and the match still asks")
+ett_match_arm_not_the_payload()
+    if !aza_ready() then return
+
+    aza_refuses(ett_gens() + raw"""
+        val n: u8 = some() match
+            Some(v) -> v + 1
+            None -> 9
+
+        print(n)
+        """, "cannot infer the type argument 'T' of 'some' here — annotate the expected type")
+
+@test("arms that disagree are refused, the payload having been solved at the binding's type")
+ett_match_arms_disagree()
+    if !aza_ready() then return
+
+    aza_refuses(ett_gens() + raw"""
+        val n: u8 = some() match
+            Some(v) -> v
+            None -> "none"
+
+        print(n)
+        """, "match arms have different types: byte and string")
