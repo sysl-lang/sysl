@@ -2169,6 +2169,19 @@ private plain_ahead(cx: &Analyzer, ty: Type, base: string, mname: string, via: B
         for item in alts.unwrap()
             if member_reachable(cx, base, item, via) then return false
 
+    // **A receiver that is not a written `x` -- `T.decode(n).encode()` -- still has the bounds of the
+    // parameter it was made from**: the instantiation knows `T` is this type, and its signature said
+    // which traits it promised.
+    for item in cx.subst
+        if type_eq(item.ty, ty)
+            val promised = bound_traits(cx, item.name)
+
+            if member_at(cx.an, base, mname).is_some() && member_reachable(cx, base, mname, promised) then return false
+
+            if alts.is_some()
+                for filed in alts.unwrap()
+                    if member_reachable(cx, base, filed, promised) then return false
+
     true
 end plain_ahead
 
@@ -2265,10 +2278,32 @@ bound_traits(cx: &Analyzer, written: string) -> Buf[string]
     for i in 0..<bounds.unwrap().len()
         val key = lookup_trait_key(cx.an, cx.scope, bounds.unwrap().at(i).name)
 
-        if key.is_some() then keys.push(key.unwrap())
+        if key.is_some() then push_with_required(cx, key.unwrap(), &keys)
 
     keys
 end bound_traits
+
+// A bound's trait and every trait it requires, each once. **A bound promises what the trait it names
+// requires**: `[T: wire.Codec]` with `trait Codec: Encode` reaches `Encode`'s members through the
+// signature alone, so a member the compiler supplies under the same name does not answer ahead of it.
+private push_with_required(cx: &Analyzer, key: string, keys: *Buf[string])
+    if holds_string(*keys, key) then return
+
+    keys.push(key)
+
+    val d = trait_decl_at(cx.an, key)
+
+    if d.is_none() then return
+
+    val home = cx.an.tables.types.get(key)
+
+    if home.is_none() then return
+
+    for s in d.unwrap().supers
+        val sk = lookup_trait_key(cx.an, home.unwrap().scope, s.name)
+
+        if sk.is_some() then push_with_required(cx, sk.unwrap(), keys)
+end push_with_required
 
 // No bound at all, named so that a default argument can say which kind of run of names it means.
 no_bound_traits() -> Buf[string] = buf()
