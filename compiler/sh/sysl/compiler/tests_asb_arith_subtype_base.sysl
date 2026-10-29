@@ -1,0 +1,200 @@
+module sh.sysl.compiler
+@tests
+
+// An open literal binding is fixed by arithmetic beside an operand of a type of its own at the type
+// that arithmetic computes in (`var_first_use.sysl`, `reference/errors.md`): for a transparent
+// subtype with a range or a predicate, its base. `var sum = 0; sum = sum + i` with `i` of
+// `int within 0..<10` keeps `sum` an `int`, where it once became the subtype and trapped as soon as
+// the total passed 9. A derived subtype is a type of its own and is not read at its base.
+// The helpers are `tests_enm_enum_run.sysl`'s; `val z: bool = <name>` shows a binding's type.
+
+private asb_prob() -> string = "type Prob = int within 0..<10\n"
+
+private asb_type_of(text: string, name: string) -> string =
+    enm_err(text + s"val z: bool = $name\n")
+
+private asb_is(report: string, ty: string) -> bool =
+    enm_says(report, s"declared bool but the value is $ty\n")
+
+@test("a sum over a subtype's Range is an int, not the subtype")
+asb_range_sum_is_an_int()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(asb_prob() + "var sum = 0\nfor i in Prob::Range do\n    sum = sum + i\nprint(sum)\n"),
+              "45\n")
+
+@test("a compound assignment from a subtype operand keeps the place at the base")
+asb_compound_keeps_the_base()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(asb_prob() + "var sum = 0\nfor i in Prob::Range do sum += i\nprint(sum)\n"), "45\n")
+
+@test("the subtype operand on the left fixes the binding at the base too")
+asb_subtype_on_the_left()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(asb_prob() + "var sum = 0\nfor i in Prob::Range do sum = i + sum\nprint(sum)\n"),
+              "45\n")
+
+@test("the binding a subtype operand fixes is of the base type")
+asb_binding_is_the_base()
+    if !enm_ready() then return
+
+    val report = asb_type_of(asb_prob() + "val x: Prob = 3\nvar sum = 0\nsum = sum + x\n", "sum")
+
+    assert(asb_is(report, "int"), report)
+
+@test("a subtype of a subtype fixes the binding at the innermost base")
+asb_subtype_of_a_subtype()
+    if !enm_ready() then return
+
+    val src = "type Wide = int within 0..<100\ntype Narrow = Wide within 0..<10\n" +
+              "val x: Narrow = 3\nvar sum = 0\nsum = sum + x\n"
+
+    assert(asb_is(asb_type_of(src, "sum"), "int"), asb_type_of(src, "sum"))
+
+@test("a subtype with a predicate fixes the binding at its base")
+asb_predicate_subtype()
+    if !enm_ready() then return
+
+    val src = "type Pos = int where value > 0\nval x: Pos = 3\nvar sum = 0\nsum = sum - x\nprint(sum)\n"
+
+    assert_eq(enm_ran(src), "-3\n")
+
+@test("a subtype of a narrow base fixes the binding at that base")
+asb_narrow_base()
+    if !enm_ready() then return
+
+    val src = "type Small = u8 within 0..<10\nval x: Small = 3\nvar sum = 0\nsum = sum + x\n"
+    val report = asb_type_of(src, "sum")
+
+    assert(asb_is(report, "byte"), report)
+
+@test("a literal its base cannot hold is refused at the literal, naming the base")
+asb_literal_refused_at_the_base()
+    if !enm_ready() then return
+
+    val report = enm_err("type Small = u8 within 0..<10\nval x: Small = 3\nvar sum = 300\nprint(sum + x)\n")
+
+    assert(enm_says(report, "error: the literal 300 does not fit byte"), report)
+
+@test("a derived subtype is not read at its base: a binding of the base beside it is refused")
+asb_derived_is_not_the_base()
+    if !enm_ready() then return
+
+    val report = enm_err("type Slot = new u8 within 0..<8\nval x = Slot(3u8)\nvar n = 0\nn = n + x\n")
+
+    assert(enm_says(report, "error: '+' needs matching types, got int and Slot"), report)
+
+@test("a counted for variable beside a subtype operand walks the whole literal range")
+asb_counted_for_variable()
+    if !enm_ready() then return
+
+    val src = asb_prob() + "val t: Prob = 1\nvar last = 0\nfor k in 0..<20 do last = k + t\nprint(last)\n"
+
+    assert_eq(enm_ran(src), "20\n")
+
+@test("a value stored back into the subtype is still checked there")
+asb_store_into_the_subtype_traps()
+    if !enm_ready() then return
+
+    val src = asb_prob() + "var sum = 0\nfor i in Prob::Range do sum += i\nvar p: Prob = 0\np = sum\nprint(p)\n"
+
+    assert_eq(enm_exits(src), "")
+
+// A comparison beside such a subtype fixes the binding at the base too, and the type does not
+// depend on which use comes first: a later `x += 100` must not trap.
+
+private asb_compared(cond: string) -> string =
+    asb_prob() + s"val p: Prob = 3\nvar x = 0\nif $cond then print(\"yes\")\nx += 100\nprint(x)\n"
+
+@test("a comparison before the arithmetic fixes the binding at the base")
+asb_compare_first()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(asb_compared("x < p")), "yes\n100\n")
+
+@test("a comparison after the arithmetic fixes the binding at the base")
+asb_compare_after()
+    if !enm_ready() then return
+
+    val src = asb_prob() + "val p: Prob = 3\nvar x = 0\nx += 100\nif x < p then print(\"yes\")\nprint(x)\n"
+
+    assert_eq(enm_ran(src), "100\n")
+
+@test("every comparison operator fixes the binding at the base")
+asb_each_comparison()
+    if !enm_ready() then return
+
+    for op in ["==", "!=", "<", "<=", ">", ">="]
+        val report = asb_type_of(asb_prob() + s"val p: Prob = 3\nvar x = 0\nprint(x $op p)\n", "x")
+
+        assert(asb_is(report, "int"), s"$op: $report")
+
+@test("the subtype on the left of a comparison fixes the binding at the base")
+asb_compare_subtype_on_the_left()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(asb_compared("p > x")), "yes\n100\n")
+    assert_eq(enm_ran(asb_compared("p == x")), "100\n")
+
+@test("a comparison with a predicate subtype fixes the binding at the base")
+asb_compare_predicate()
+    if !enm_ready() then return
+
+    val src = "type Pos = int where value > 0\nval p: Pos = 3\nvar x = 0\nif x < p then x -= 5\nprint(x)\n"
+
+    assert_eq(enm_ran(src), "-5\n")
+
+@test("a comparison with a subtype of a subtype fixes the binding at the innermost base")
+asb_compare_subtype_of_a_subtype()
+    if !enm_ready() then return
+
+    val src = "type Wide = int within 0..<100\ntype Narrow = Wide within 0..<10\n" +
+              "val p: Narrow = 3\nvar x = 0\nif x < p then x += 500\nprint(x)\n"
+
+    assert_eq(enm_ran(src), "500\n")
+
+@test("a comparison with a u8-based subtype fixes the binding at u8")
+asb_compare_narrow_base()
+    if !enm_ready() then return
+
+    val src = "type Small = u8 within 0..<10\nval p: Small = 3\nvar x = 0\nprint(x < p)\n"
+    val report = asb_type_of(src, "x")
+
+    assert(asb_is(report, "byte"), report)
+    assert_eq(enm_ran(src + "x += 200\nprint(x)\n"), "true\n200\n")
+
+@test("a comparison in a match guard fixes the binding at the base")
+asb_compare_in_a_match_guard()
+    if !enm_ready() then return
+
+    val src = asb_prob() + "val p: Prob = 3\nvar x = 0\n" +
+              "val said = p match\n    _ if x < p -> \"below\"\n    _ -> \"not\"\n" +
+              "x += 100\nprint(said)\nprint(x)\n"
+
+    assert_eq(enm_ran(src), "below\n100\n")
+
+@test("a comparison in a while condition fixes the binding at the base")
+asb_compare_in_a_while()
+    if !enm_ready() then return
+
+    val src = asb_prob() + "val p: Prob = 9\nvar x = 0\nwhile x <= p do x += 4\nprint(x)\n"
+
+    assert_eq(enm_ran(src), "12\n")
+
+@test("a binding written as the subtype still traps on leaving its range after a comparison")
+asb_compare_annotated_still_traps()
+    if !enm_ready() then return
+
+    val src = asb_prob() + "val p: Prob = 3\nvar x: Prob = 0\nif x < p then print(\"yes\")\nx += 100\nprint(x)\n"
+
+    assert_eq(enm_exits(src), "")
+
+@test("a derived subtype in a comparison is not read at its base: an open binding beside it is refused")
+asb_compare_derived_refused()
+    if !enm_ready() then return
+
+    val report = enm_err("type Slot = new u8 within 0..<8\nval s = Slot(3u8)\nvar n = 0\nprint(n < s)\n")
+
+    assert(enm_says(report, "error: cannot compare int with Slot"), report)
