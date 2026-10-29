@@ -208,9 +208,10 @@ Which behaviour you get depends on the *type* of the captured variable, not on a
 it is captured. It is the same question the [memory chapter](/tour/memory/) answers, and that chapter
 explains this rule in full.
 
-The compiler also determines how long a closure must live. A closure that does not outlive its frame
-is inlined and needs no allocation. One that escapes, by being stored in a field or returned, is
-placed in a counted heap box. The compiler makes this choice for you.
+The same question decides where a closure lives. A closure that does not outlive its frame holds its
+variables by reference and is built in that frame, so handing it to `each` allocates nothing. One that
+escapes, by being stored in a field or returned, holds copies and is placed in a counted heap box.
+The compiler makes this choice for you.
 
 ---
 

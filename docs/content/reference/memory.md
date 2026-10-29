@@ -2748,12 +2748,50 @@ if it is:
 2. **stored into anything that outlives the frame** — a global, a field reached through a `&T`, or an
    aggregate that is itself stored somewhere that outlives the frame;
 3. **passed as an argument the callee keeps**;
-4. **captured by a closure that itself escapes**;
+4. **captured by a closure that itself escapes** — a closure that does not escape holds the array
+   [by reference](#a-closure-is-asked-the-same-question);
 5. **assigned into a local that escapes** — the rule is transitive, resolved as a fixpoint over the
    function's own locals.
 
 Everything else needs no allocation: indexing, iterating, sub-slicing into a local that stays local,
 comparing, and passing to a callee that only reads.
+
+### A closure is asked the same question
+
+A closure is a value that can be kept, so the variables it names are asked about the same flows: is
+the closure returned, stored where it outlives the block, handed to a parameter its function keeps,
+built in an `async` body, or erased into a `&sync Fn`? **Where none of them applies, the closure holds
+each variable by reference**, and a write in it is a write to the variable. Where one does, it holds a
+copy, taken when the closure is built.
+
+```sysl
+import sysl.buf.{Buf, buf}
+
+each(xs: []int, f: int -> unit)
+    for x in xs
+        f(x)
+
+var best = 0
+var xs = [3, 9, 2]
+each(xs[..], n -> if n > best then best = n)
+
+var n = 1
+val peek = () -> n
+var kept: &Buf[&Fn() -> int] = buf()
+kept.push(() -> n)
+n = 5
+
+print(best, peek(), kept[0]())
+```
+
+```output
+9 5 1
+```
+
+`peek` is called in the block that declares `n`, so it reads the variable; the closure pushed into
+`kept` may outlive it, so it carries the `1` it was built with. A reference to a local costs a pointer
+and takes no count, and a closure that does not outlive its frame and is handed on as a `&Fn` is built
+in that frame, so `each` above allocates nothing.
 
 ### Crossing a call
 
@@ -5216,7 +5254,7 @@ C programs already live by — **a pointer handed to a call is borrowed for the 
 |---|---|
 | a sysl function | what its body keeps |
 | a method through a trait object | no pointer it is handed — an implementation reached through an object that keeps one is refused where it is written; an object it is handed, a callback among them, is kept wherever any implementation keeps it |
-| a closure | nothing — a closure that keeps what it is handed is refused where it is written |
+| a closure | nothing — a closure that keeps what it is handed is refused where it is written; the variables it captures are judged at the closure literal, where its body is in hand |
 | a function through a pointer | what any function whose address is taken at that pointer's type holds in what another of its parameters points at — one that keeps a pointer anywhere else is refused where it is written, and so is every one whose pointer type C can reach |
 | an `extern` | nothing, unless its declaration says [`@keeps(p)`](/reference/ffi/#keeps-a-c-function-that-holds-on-to-a-pointer) |
 
