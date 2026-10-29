@@ -600,20 +600,22 @@ private env_root(recv: TExpr) -> bool = *recv.kind match
     _ -> false
 
 
-// Whether a closure's body writes through its own environment -- a store, a compound assignment, an
-// increment or a lane store whose place reaches `self`. **Asked of the typed tree**, since a write is
-// a node and these four are all of them. A closure written inside this one is a body of its own with
-// its own `self`, reached here only as the struct that builds it, so its writes are its own.
+// Whether a closure's body writes its own environment -- a store, a compound assignment, an
+// increment or a lane store whose place is a capture or a part of it held by value. **Asked of the
+// typed tree**, since a write is a node and these four are all of them. A closure written inside this
+// one is a body of its own with its own `self`, reached here only as the struct that builds it, so its
+// writes are its own.
 //
 // A `*self` method called on the closure's own copy of a capture, or a part of it held by value, is
-// a write too (`c.bump()`). One called on what a capture refers to -- a `&T`, a `*T` -- writes
-// storage the closure shares rather than its environment.
+// a write too (`c.bump()`). A write through what a capture refers to -- a `&T`, a `*T`, a slice's
+// element -- by a store or by a method writes storage the closure shares rather than its environment,
+// so a closure doing only that is one a `val` may hold.
 private writes_environment(a: &Analysis, body: TBlock) -> bool
     val seen: &EnvWrites = EnvWrites(false)
 
     // `a, b = b, a` writes its places as a statement rather than as expressions.
     walk_block_stmts(body, TWalk(true, e -> note_env_write(a, seen, e),
-                                 w -> if reaches_self(w.place) then seen.found = true, s -> ()))
+                                 w -> if env_capture(w.place).is_some() then seen.found = true, s -> ()))
     seen.found
 end writes_environment
 
@@ -626,10 +628,10 @@ private note_read_only(a: &Analysis, base: string, reads_only: bool)
 
 private note_env_write(a: &Analysis, seen: &EnvWrites, e: TExpr)
     val hit = *e.kind match
-        TStore(place, _, _, _) -> reaches_self(place)
-        TUpdate(place, _, _, _, _, _, _) -> reaches_self(place)
-        TIncDec(place, _, _, _, _) -> reaches_self(place)
-        TVecStore(recv, _, _) -> reaches_self(recv)
+        TStore(place, _, _, _) -> env_capture(place).is_some()
+        TUpdate(place, _, _, _, _, _, _) -> env_capture(place).is_some()
+        TIncDec(place, _, _, _, _) -> env_capture(place).is_some()
+        TVecStore(recv, _, _) -> env_capture(recv).is_some()
         TCall(_, _, _, _) -> self_receiver(a, e) match
             Some(place) -> copy_root(place).is_some()
             None -> false
@@ -637,13 +639,19 @@ private note_env_write(a: &Analysis, seen: &EnvWrites, e: TExpr)
 
     if hit then seen.found = true
 
-private reaches_self(place: TExpr) -> bool = *place.kind match
-    TLoad(name, _) -> name == "self"
-    TDeref(inner, _) -> reaches_self(inner)
-    TField(recv, _, _) -> reaches_self(recv)
-    TIndex(recv, _, _) -> reaches_self(recv)
-    TSlice(base, _, _, _, _) -> reaches_self(base)
-    _ -> false
+// The capture a place writes the closure's own storage of: the capture itself, a field or an element
+// of it held by value, or an element of a slice taken of a captured array. A write through what a
+// capture refers to -- a `&T`, a `*T`, a slice's element -- writes storage the closure shares.
+private env_capture(place: TExpr) -> Option[int] = *place.kind match
+    TSlice(base, _, _, _, _) -> texpr_type(base) match
+        Array(_, _) -> env_capture(base)
+        _ -> None
+    TIndex(recv, _, _) -> texpr_type(recv) match
+        Slice(_, _) -> *recv.kind match
+            TSlice(_, _, _, _, _) -> env_capture(recv)
+            _ -> None
+        _ -> copy_root(place)
+    _ -> copy_root(place)
 
 // The body itself, read in a frame of its own.
 //
