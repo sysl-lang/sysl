@@ -216,7 +216,15 @@ private mentions_tuple(e: Expr) -> bool = *e.kind match
 private tuple_parts_meet(cx: &Analyzer, es: Buf[Expr]) -> Option[Type]
     val tried = begin_trial(cx)
     val met = parts_meet(cx, es)
-    var clean = met.is_some() && !refused_since(cx, tried)
+
+    // **Columns that met at a type a literal among them does not fit are that literal's mistake**, as
+    // `[b, 300]` is: the elements are read at the meeting, so `[(1u8, 0), (300, 0)]` is told the 300
+    // does not fit a byte rather than that the literal holds two types.
+    if met.is_some() && refused_since(cx, tried)
+        discard_trial(cx, tried)
+        return met
+
+    var clean = met.is_some()
 
     if clean
         for e in es
@@ -272,12 +280,17 @@ private parts_meet(cx: &Analyzer, es: Buf[Expr]) -> Option[Type]
 
     if ts.is_empty() then return None
 
-    val first = texpr_type(ts.at(0))
+    // A part that was refused (`Unknown`) agrees with the column, so the column still meets where
+    // its other parts do and the refusal is told at the part rather than as a mismatch.
+    var first: Type = Unknown
+
+    for t in ts
+        if first == Unknown then first = texpr_type(t)
 
     if first == Unknown || no_value(first) then return None
 
     for t in ts
-        if !type_eq(texpr_type(t), first) then return None
+        if texpr_type(t) != Unknown && !type_eq(texpr_type(t), first) then return None
 
     Some(first)
 end parts_meet

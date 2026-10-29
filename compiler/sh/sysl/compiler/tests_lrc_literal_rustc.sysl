@@ -1,0 +1,188 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.replace_all
+
+// An integer literal beside an operand of an integer type is read at that type, as rustc reads one,
+// and a literal binding whose type is still open is read by a generic call as the literal itself is
+// (`reference/types.md § Integers are an open family`, `reference/expressions.md § Which conversions
+// are implicit`). Each cell was checked against rustc 1.94: where rustc accepts, the value printed is
+// the one the typed width gives; where it refuses, the refusal is at the literal. Two typed operands
+// still widen losslessly to each other, and an integer beside a float literal is still a `real`.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private lrc_ready() -> bool = std_root().is_ok() && clang_available()
+
+private lrc_root(text: string) -> string
+    val root = replace_all(make_temp_dir("sysl-lrc").unwrap(), "//", "/")
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+    root
+end lrc_root
+
+// What a one-file program prints, or the report it was refused with.
+private lrc_ran(text: string) -> string
+    val root = lrc_root(text)
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            val said = replace_all(failure_text(why), s"$root/", "")
+
+            remove_dir_all(root).unwrap_or(())
+            return said
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end lrc_ran
+
+// The report a one-file program is refused with, its locations relative to its directory.
+private lrc_report(text: string) -> string
+    val root = lrc_root(text)
+
+    val out = emit_llvm_text(s"$root/main.sysl", None) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> if made.report.is_empty() then "" else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    replace_all(out, s"$root/", "")
+end lrc_report
+
+private lrc_prints(text: string, want: string)
+    if !lrc_ready() then return
+
+    assert_eq(lrc_ran(text), want)
+end lrc_prints
+
+// Refused with exactly `message`, first, at `at` (`line:col`).
+private lrc_refused(text: string, message: string, at: string)
+    if !lrc_ready() then return
+
+    val said = lrc_report(text)
+    val head = s"error: $message"
+    val place = s"--> main.sysl:$at\n"
+
+    assert(said.starts_with(head) && said.contains(place),
+           s"expected a report starting\n$head\nlocated at$place\ngot\n$said")
+end lrc_refused
+
+// -- a literal beside a typed integer operand -----------------------------------------------------
+
+@test("a literal that fits is read at the byte beside it, on either side, and the sum wraps there")
+lrc_fits_either_side() =
+    lrc_prints("val b: u8 = 100\nprint(b + 200, 200 + b, b * 3, b - 1, 255 - b)\n", "44 44 44 99 155\n")
+
+@test("a literal that does not fit the byte beside it is refused at the literal, on either side")
+lrc_does_not_fit_either_side()
+    lrc_refused("val b: u8 = 10\nprint(b + 300)\n", "the literal 300 does not fit byte", "2:11")
+    lrc_refused("val b: u8 = 10\nprint(300 + b)\n", "the literal 300 does not fit byte", "2:7")
+end lrc_does_not_fit_either_side
+
+@test("every operator holds the literal: a product and a quotient, read apart from the rest, too")
+lrc_every_operator()
+    for op in ["-", "*", "/", "%", "&", "|", "^"]
+        lrc_refused(s"var b: u8 = 2\nprint(b $op 300)\n", "the literal 300 does not fit byte", "2:11")
+
+    lrc_refused("var b: u8 = 2\nprint(1000 * b)\n", "the literal 1000 does not fit byte", "2:7")
+    lrc_refused("var b: u8 = 2\nval z: int = b * 1000\nprint(z)\n", "the literal 1000 does not fit byte", "2:18")
+    lrc_prints("var b: u8 = 2\nprint(b * 200, 200 * b, b / 255, b % 255)\n", "144 144 0 2\n")
+end lrc_every_operator
+
+@test("a comparison holds the literal to the byte too, and one that fits compares as bytes")
+lrc_comparison()
+    lrc_refused("val b: u8 = 10\nprint(b < 300)\n", "the literal 300 does not fit byte", "2:11")
+    lrc_refused("val b: u8 = 10\nprint(b == 256)\n", "the literal 256 does not fit byte", "2:12")
+    lrc_prints("val b: u8 = 10\nprint(b == 255, b < 200, 255 > b)\n", "false true true\n")
+end lrc_comparison
+
+@test("a negative literal beside an unsigned operand is refused, and beside a signed one is taken")
+lrc_negative_literal()
+    lrc_refused("val b: u8 = 10\nprint(b + -1)\n", "the literal -1 does not fit byte", "2:11")
+    lrc_prints("val i: i8 = -3\nprint(i + -1, i * -2)\n", "-4 6\n")
+end lrc_negative_literal
+
+@test("what the sum is for does not widen it: an int position or a compound assignment still refuses")
+lrc_position_does_not_widen()
+    lrc_refused("val b: u8 = 10\nval z: int = b + 300\nprint(z)\n", "the literal 300 does not fit byte", "2:18")
+    lrc_refused("var c: u8 = 1\nc += 300\nprint(c)\n", "the literal 300 does not fit byte", "2:6")
+    lrc_prints("var c: u8 = 200\nc += 100\nval z: int = c + 1\nprint(c, z)\n", "44 45\n")
+end lrc_position_does_not_widen
+
+@test("an if of literals and literal arithmetic are read at the byte, and refused at the literal")
+lrc_literal_tier_operands()
+    lrc_refused("val b: u8 = 16\nval c = true\nprint(b | (if c then 300 else 1))\n",
+                "the literal 300 does not fit byte", "3:22")
+    lrc_refused("val b: u8 = 16\nprint(b + (1 + 300))\n", "the literal 300 does not fit byte", "2:16")
+    lrc_prints("val b: u8 = 16\nval c = true\nprint(b | (if c then 255 else 1), b + (100 + 140))\n",
+               "255 0\n")
+end lrc_literal_tier_operands
+
+@test("other integer widths hold the literal the same way")
+lrc_other_widths()
+    lrc_refused("val w: u16 = 1\nprint(w + 70000)\n", "the literal 70000 does not fit ushort", "2:11")
+    lrc_refused("val i: i8 = 1\nprint(i + 128)\n", "the literal 128 does not fit i8", "2:11")
+    lrc_refused("val n: usize = 1\nprint(n + -1)\n", "the literal -1 does not fit usize", "2:11")
+    lrc_prints("val w: u16 = 65000\nval i: i8 = 100\nprint(w + 1000, i + 100)\n", "464 -56\n")
+end lrc_other_widths
+
+@test("two typed operands still widen losslessly to each other")
+lrc_typed_operands_widen() =
+    lrc_prints("val b: u8 = 10\nval w: u16 = 1000\nval n: long = 5\nprint(b + w, w + 1, b * n)\n", "1010 1001 50\n")
+
+@test("an integer beside a float literal is still a real quotient, as decided, and a long still is not")
+lrc_float_literal()
+    lrc_prints("val n = 7\nval b: u8 = 10\nprint(n / 2.0, b + 2.5)\n", "3.5 12.5\n")
+    lrc_refused("val q: long = 3\nprint(q / 2.0)\n", "'/' needs matching types, got long and real", "2:11")
+end lrc_float_literal
+
+@test("a constant over a typed constant is held to its type, and one that fits wraps nothing")
+lrc_constants()
+    lrc_refused("const B: u8 = 200\nconst C = B + 100\nprint(C)\n", "'C' does not fit byte: 300", "2:11")
+    lrc_prints("const B: u8 = 200\nconst C = B + 50\nprint(C)\n", "250\n")
+end lrc_constants
+
+@test("a body in a generic function holds a literal to its concrete byte")
+lrc_generic_body()
+    lrc_prints("bump[T](x: T, b: u8) -> u8 = b + 250\nprint(bump(\"x\", 10u8), bump(1.5, 6u8))\n", "4 0\n")
+    lrc_refused("bump[T](x: T, b: u8) -> u8 = b + 300\nprint(bump(1, 2u8))\n",
+                "the literal 300 does not fit byte", "1:34")
+end lrc_generic_body
+
+@test("the arms of an if meeting a byte hold a literal arm to it")
+lrc_if_arms()
+    lrc_prints("val b: u8 = 200\nval c = true\nval x = if c then b else 255\nprint(x + 100)\n", "44\n")
+    lrc_refused("val b: u8 = 200\nval c = true\nval x = if c then b else 300\nprint(x)\n",
+                "the literal 300 does not fit byte", "3:26")
+end lrc_if_arms
+
+// -- an open literal binding passed to a generic -------------------------------------------------
+
+@test("a literal binding beside a typed argument takes that argument's type, first or second")
+lrc_generic_binding_either_side() =
+    lrc_prints("pick[T](a: T, b: T) -> T = b\nval b: u8 = 10\nval k = 250\nval j = 250\n" +
+               "print(pick(k, b) + 250, pick(b, j) + 10)\n", "4 4\n")
+
+@test("a literal binding too wide for the argument beside it is refused at its literal")
+lrc_generic_binding_does_not_fit() =
+    lrc_refused("pick[T](a: T, b: T) -> T = b\nval b: u8 = 10\nval k = 300\nprint(pick(k, b))\n",
+                "the literal 300 does not fit byte", "3:9")
+
+@test("two open bindings, or one beside a literal, settle at int")
+lrc_generic_bindings_open() =
+    lrc_prints("pick[T](a: T, b: T) -> T = b\nval j = 5\nval k = 6\nval m = 7\n" +
+               "print(pick(j, k) * 1000000000, pick(m, 300))\n", "1705032704 300\n")
+
+@test("a binding an earlier use already fixed at int is no longer open, and the call is refused")
+lrc_generic_binding_fixed_earlier() =
+    lrc_refused("pick[T](a: T, b: T) -> T = b\nval b: u8 = 10\nval k = 5\nval m: int = k\nprint(pick(k, b), m)\n",
+                "'a' of 'pick' is byte, but int was given", "5:12")

@@ -1864,14 +1864,17 @@ private scale_operands(cx: &Analyzer, op: string, l: Expr, r: Expr,
     None
 end scale_operands
 
-// The type an integer literal beside a scalar operand of `*` or `/` is read at: the operand's own
-// where the literal fits it, and otherwise `int`, where the operand widens to it -- the operand
-// rule of `literal_widened`, for the pairs read here rather than there. A shift's count is never
+// The type an integer literal beside a scalar operand of `*` or `/` is read at -- the operand rule
+// of `literal_widened`, for the pairs read here rather than there: an integer operand's own, fitting
+// or not, so `b * 1000` over a `byte` is told the 1000 does not fit; any other operand's own where
+// the literal fits it, and otherwise `int`, where the operand widens to it. A shift's count is never
 // widened into.
 private scale_literal_type(cx: &Analyzer, op: string, t: Type, lit: Expr, numeric: Option[Type]) -> Type
     val own = repr(t)
 
-    if op != "*" && op != "/" || own == Char || own == Unknown || literal_fits(cx, lit, own) then return own
+    if op != "*" && op != "/" || own == Char || own == Unknown || integer_operand(own) ||
+            literal_fits(cx, lit, own) then
+        return own
 
     if reaches_position(int_type(), numeric) && literal_fits(cx, lit, int_type()) &&
             implicitly_widens(own, int_type()) then int_type()
@@ -2073,7 +2076,15 @@ analyze_operands(cx: &Analyzer, operands: Buf[Expr], expected: Option[Type],
 
                     val widens = widen && !keeps && repr(texpr_type(t)) != Char
 
-                    out.push(reread(cx, t, operands.at(i), ty.unwrap(), widens))
+                    val again = reread(cx, t, operands.at(i), ty.unwrap(), widens)
+
+                    // **An operand in the literal's tier is read at an integer pair's type, fitting
+                    // or not** (`literal_widened`), so where the re-reading was refused its own
+                    // complaint is the one kept: `b | (if c then 300 else 1)` is told the 300 does not
+                    // fit a byte, not that a byte and an `int` do not match.
+                    if soft.at(i) && integer_operand(ty.unwrap()) && disagree(texpr_type(again), ty.unwrap())
+                        out.push(analyze_expected(cx, operands.at(i), ty))
+                    else out.push(again)
                 else out.push(t)
             None -> out.push(held_literal(cx, operands.at(i), ty, held, any_typed(operands, firm)))
 
@@ -2131,19 +2142,20 @@ private held_text(e: Expr) -> Option[string] = *e.kind match
     FloatLit(text, _) -> Some(text)
     _ -> None
 
-// **A literal is read at the typed operand's type where it fits there, and otherwise at its own
-// default**, to which the typed operands then widen: `h * 0.5` over an `f32` stays `f32` and `b + 3`
-// over a `byte` stays a byte, but `1.0 / k` over an `int` is a `real` quotient and `b + 300` an `int`
-// sum. Where a typed operand does not widen losslessly to the literal's default (a `long` beside
-// `2.0`), or the literal does not fit its default either (a `byte` beside a literal no `int` holds),
-// the type settled on stands, and the literal is told it does not fit, as it always was.
+// **An integer literal beside an operand of an integer type is read at that type, as rustc reads
+// one**: `b + 200` over a `byte` is a byte sum, and `b + 300`, `b < 300` and `b + -1` are each told
+// the literal does not fit a byte -- whatever the position asks of the sum, so `val z: int = b + 300`
+// is the same mistake. Only two TYPED operands widen losslessly to each other (`u8 + u16`).
 //
-// **So does a position whose type the default would not reach**: `val z: u8 = b + 300` is told the
-// literal does not fit a byte, which is the mistake, rather than that an `int` sum is no byte.
+// **Any other literal is read at the typed operand's type where it fits there, and otherwise at its
+// own default**, to which the typed operands then widen: `h * 0.5` over an `f32` stays `f32`, but
+// `1.0 / k` over an `int` is a `real` quotient. Where a typed operand does not widen losslessly to
+// the literal's default (a `long` beside `2.0`), the type settled on stands, and the literal is told
+// it does not fit, as it always was.
 //
 // **An operand in the literal's tier that is not a bare literal** (`firm` holds `None` there, `told`
-// its reading) is the same case: `b | (if c then 300 else 1)` is an `int` as `b | 300` is, its
-// reading at its default standing for the literal's default.
+// its reading) is the same case: `b | (if c then 300 else 1)` is told the 300 does not fit a byte as
+// `b | 300` is, its reading at its default standing for the literal's default.
 private literal_widened(cx: &Analyzer, operands: Buf[Expr], firm: Buf[Option[TExpr]],
                         told: Buf[Option[TExpr]], settled: Option[Type], expected: Option[Type],
                         widen: bool, rescales: bool) -> Option[Type]
@@ -2157,19 +2169,26 @@ private literal_widened(cx: &Analyzer, operands: Buf[Expr], firm: Buf[Option[TEx
         if firm.at(i).is_none() && is_literal(e)
             val own = literal_default(e)
 
-            if own.is_some() && !type_eq(own.unwrap(), ty) && reaches_position(own.unwrap(), expected) &&
+            if own.is_some() && own.unwrap() == int_type() && integer_operand(ty) then ()
+            else if own.is_some() && !type_eq(own.unwrap(), ty) && reaches_position(own.unwrap(), expected) &&
                     !literal_fits(cx, e, ty) && literal_fits(cx, e, own.unwrap()) &&
                     holds_every_operand(operands, firm, own.unwrap(), rescales) then
                 ty = own.unwrap()
         else if firm.at(i).is_none() && told.at(i).is_some()
             val own = repr(texpr_type(told.at(i).unwrap()))
 
-            if own != Unknown && !type_eq(own, ty) && reaches_position(own, expected) &&
+            if own == int_type() && integer_operand(ty) then ()
+            else if own != Unknown && !type_eq(own, ty) && reaches_position(own, expected) &&
                     !reads_at(cx, e, ty) && holds_every_operand(operands, firm, own, rescales) then
                 ty = own
 
     Some(ty)
 end literal_widened
+
+// Whether the pair settled on an integer type, at which an integer literal beside it is read.
+private integer_operand(t: Type) -> bool = repr(t) match
+    Integer(_, _, _) -> true
+    _ -> false
 
 // The readings with every operand in the literal's tier taken out, as the pair's type is worked out
 // from the rest.
