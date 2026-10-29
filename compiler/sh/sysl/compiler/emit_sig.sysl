@@ -111,8 +111,12 @@ sysl_param_lty(e: *Emit, ty: Type) -> LType =
 //
 // `tracked` adds the one parameter a `@track_caller` function takes past its declared ones
 // (`track_caller.sysl`).
+//
+// `lent` names the parameters that cross as an address though their type would cross in registers:
+// a split function's body takes them so (`borrowing.sysl`'s `read_by_address`), and its entry -- the
+// ordinary convention every other caller reaches -- is built with none.
 sysl_fn_type(e: *Emit, ret_ty: Type, params: Buf[(string, Type)], variadic: bool,
-             defining: Option[TFunc], tracked: bool = false) -> IrFnType
+             defining: Option[TFunc], tracked: bool = false, lent: Buf[string] = buf()) -> IrFnType
     var out: Buf[IrParam] = buf()
 
     val named = defining.is_some()
@@ -123,18 +127,30 @@ sysl_fn_type(e: *Emit, ret_ty: Type, params: Buf[(string, Type)], variadic: bool
 
     for p in params
         if !zero_sized(p.1)
+            val by_address = holds_string(lent, p.0)
             val attrs = defining match
-                Some(f) -> frame_attrs(e, f, p.1, p.0)
+                Some(f) -> frame_attrs(e, f, p.1, p.0, by_address)
                 None -> no_ir_attrs()
 
             val name = if named then Some(VReg(s"${p.0}.param")) else None
 
-            out.push(IrParam(sysl_param_lty(e, p.1), attrs, name))
+            out.push(IrParam(if by_address then LPtr else sysl_param_lty(e, p.1), attrs, name))
 
     if tracked then out.push(caller_ir_param(named))
 
     IrFnType(sysl_result_lty(e, ret_ty), out, variadic, c_extension_of_result(e, ret_ty))
 end sysl_fn_type
+
+// The parameters of `f` its body takes as addresses though their type crosses in registers
+// (`Emit.lent_params`), by name.
+lent_names(e: *Emit, f: TFunc) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for j in 0..<f.params.len()
+        if e.lent_params.has(owned_key(f.name, j)) then out.push(f.params.at(j).0)
+
+    out
+end lent_names
 
 // What a call to a **sysl** function names as its result: the type, and the convention's extension
 // where the result is a narrow scalar the callee widened.
@@ -150,10 +166,10 @@ private c_extension_of_result(e: *Emit, ret_ty: Type) -> Buf[IrAttr] =
 // `emit_disjoint.sysl` instead, being two pointers and a count in one value), and `byval` on an
 // x86-64 interrupt handler's frame parameter, which the ABI requires. Nothing else carries one, so
 // an ordinary parameter's answer is the empty list.
-private frame_attrs(e: *Emit, f: TFunc, ty: Type, name: string) -> Buf[IrAttr]
+private frame_attrs(e: *Emit, f: TFunc, ty: Type, name: string, lent: bool) -> Buf[IrAttr]
     var out: Buf[IrAttr] = buf()
 
-    val pointer = sysl_param_lty(e, ty) match
+    val pointer = if lent then true else sysl_param_lty(e, ty) match
         LPtr -> true
         _ -> false
 

@@ -1,0 +1,660 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.text.{Search, str_builder}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// A by-value parameter below the indirect boundary -- an aggregate wider than two machine words -- that
+// the body only reads is lent by address (`borrowing.sysl`'s `read_by_address`): the caller hands over
+// its own storage instead of loading the whole value into registers. The body takes the address under
+// `<symbol>.owned`, and every caller that is not a direct call reaches an entry under the function's
+// own symbol that takes the value as before and lends the body a slot of its own.
+//
+// What a reader sees does not change: where the callee writes its copy, takes its address, or could
+// reach the caller's storage through something it calls, the program prints what a copy would, and a
+// destructor runs exactly when it did.
+
+private lba_ready() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+
+    true
+end lba_ready
+
+private lba_ir(text: string, target: Option[string] = None) -> string
+    val root = make_temp_dir("sysl-lba").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, forms_imported(text)).unwrap()
+
+    val out = emit_llvm_text(src, target) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> if made.report.is_empty() then made.text else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end lba_ir
+
+// Whether a line defines `name` as a program writes it: a root function's own symbol, its body's
+// (`keep.owned`), or a function the module's storage turned into a method of its environment
+// (`$env0.look`).
+private lba_defines(line: string, name: string) -> bool =
+    line.starts_with("define ") && (mentions_as_written(line, name) || line.contains("@$env0." + name + "("))
+
+// One function's emitted text, from its `define` to the brace that closes it.
+private lba_body(out: string, name: string) -> string
+    var b = str_builder()
+    var inside = false
+
+    for line in lines_of(out)
+        if !inside && lba_defines(line, name) then inside = true
+
+        if inside
+            if line == "}" then return b.finish()
+
+            b.push(line)
+            b.push_char('\n')
+
+    if inside then b.finish() else s"no definition of '$name' in:\n$out"
+end lba_body
+
+// The `define` line of a function, or the empty string.
+private lba_define(out: string, name: string) -> string
+    for line in lines_of(out)
+        if lba_defines(line, name) then return line
+
+    ""
+end lba_define
+
+// The first call of a symbol ending in `tail`, or the empty string.
+private lba_call_line(out: string, tail: string) -> string
+    for line in lines_of(out)
+        if line.contains(" call ") && line.contains(tail) then return line
+
+    ""
+end lba_call_line
+
+// Built at `level` and run: what it printed, which must be `expected`, and a clean exit.
+private lba_prints_at(text: string, expected: string, level: string)
+    if !lba_ready() then return
+
+    val root = make_temp_dir("sysl-lba").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", forms_imported(text)).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, level, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            assert(false, failure_text(why))
+            return
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> assert(false, "the program that was built could not be run")
+        Ok(out) ->
+            assert_eq(out.text, expected)
+            assert(out.status.ok(), "the program printed what was expected and did not exit cleanly")
+end lba_prints_at
+
+// Both ends of the optimizer: `-O0` runs the convention as written, `-O2` after inlining has had it.
+private lba_prints(text: string, expected: string)
+    lba_prints_at(text, expected, "0")
+    lba_prints_at(text, expected, "2")
+end lba_prints
+
+// -- the motivating shapes --------------------------------------------------------------------------
+
+// HashLife's `quad`: a node of six words whose by-value receiver the method only reads.
+private lba_quad() -> string = raw"""
+    struct Node
+        level: int
+        kids: Option[Kids]
+
+        quad(self) -> Kids = self.kids.unwrap()
+
+    struct Kids
+        nw: &Node
+        ne: &Node
+        sw: &Node
+        se: &Node
+
+    leaf() -> &Node = Node(0, None)
+
+    walk(n: &Node) -> i64
+        if n.level == 0 then return 1
+
+        val q = n.quad()
+
+        walk(q.nw) + walk(q.ne) + walk(q.sw) + walk(q.se)
+
+    val l = leaf()
+    val top: &Node = Node(1, Some(Kids(l, l, l, l)))
+
+    print(walk(top))
+    """
+
+@test("a by-value receiver the method only reads is lent by address, with no whole-struct load")
+lba_quad_is_lent()
+    if !lba_ready() then return
+
+    val out = lba_ir(lba_quad())
+    val walk = lba_body(out, "walk")
+
+    // The one whole-node load left is `n.level`'s, a field read through a reference at `-O0`; the
+    // call hands over the node where it lies.
+    var loads = 0
+
+    for line in lines_of(walk)
+        if line.contains("load %struct.Node") then loads += 1
+
+    assert(walk.contains("@Node.quad.owned(ptr"), walk)
+    assert_eq(loads, 1)
+    assert(lba_define(out, "Node.quad.owned").contains("ptr noalias readonly %self.param"), out)
+end lba_quad_is_lent
+
+@test("and the walk still counts four leaves")
+lba_quad_runs()
+    lba_prints(lba_quad(), "4\n")
+
+// The pre-0.7.5 HashLife: a six-field `Universe` handed by value to `node` and `population`.
+private lba_universe() -> string = raw"""
+    import sysl.buf.{Buf, buf}
+
+    struct Node
+        level: int
+        nw: int
+        ne: int
+        sw: int
+        se: int
+        bits: u64
+        pop: i64
+        result: int
+
+    struct Universe
+        nodes: Buf[Node]
+        root: int
+        a: int
+        b: int
+        c: int
+        d: int
+
+        node(self, n: int) -> Node = self.nodes[usize(n)]
+
+        population(self) -> i64 = self.node(self.root).pop
+
+    var u = Universe(buf(), 0, 0, 0, 0, 0)
+
+    u.nodes.push(Node(0, -1, -1, -1, -1, 0, 7, -1))
+    print(u.population())
+    """
+
+@test("a receiver passed on to another reading method is lent all the way down")
+lba_universe_is_lent()
+    if !lba_ready() then return
+
+    val out = lba_ir(lba_universe())
+    val pop = lba_body(out, "Universe.population.owned")
+
+    assert(lba_define(out, "Universe.population.owned").contains("ptr noalias readonly %self.param"), out)
+    assert(pop.contains("@Universe.node.owned(ptr"), pop)
+    assert(!pop.contains("load %struct.Universe"), pop)
+end lba_universe_is_lent
+
+@test("and the population is read through it")
+lba_universe_runs()
+    lba_prints(lba_universe(), "7\n")
+
+// -- what keeps the ordinary convention ---------------------------------------------------------------
+
+// A body that writes its copy, and one that takes its address, keep the value in registers: the copy
+// is theirs to change.
+private lba_writers() -> string = raw"""
+    struct P
+        a: i64
+        b: i64
+        c: i64
+
+    bumped(p: P) -> i64
+        p.a += 1
+        p.a + p.b + p.c
+
+    first(q: *P) -> i64 = q.a
+
+    pointed(p: P) -> i64 = first(&p)
+
+    var g = P(1, 2, 3)
+
+    print(bumped(g), g.a)
+    print(pointed(g))
+    """
+
+@test("a callee that writes its copy keeps the parameter by value")
+lba_a_writer_keeps_by_value()
+    if !lba_ready() then return
+
+    val out = lba_ir(lba_writers())
+
+    assert(lba_define(out, "bumped").contains("%struct.P %p.param"), out)
+    assert(lba_define(out, "bumped.owned") == "", out)
+end lba_a_writer_keeps_by_value
+
+@test("a callee that takes its parameter's address keeps it by value")
+lba_an_address_keeps_by_value()
+    if !lba_ready() then return
+
+    val out = lba_ir(lba_writers())
+
+    assert(lba_define(out, "pointed").contains("%struct.P %p.param"), out)
+    assert(lba_define(out, "pointed.owned") == "", out)
+end lba_an_address_keeps_by_value
+
+@test("and the caller's value does not move")
+lba_writers_run()
+    lba_prints(lba_writers(), "7 1\n1\n")
+
+// Two words cross in registers, as C passes them; nothing is lent.
+private lba_narrow() -> string = raw"""
+    struct Two
+        a: i64
+        b: i64
+
+    sum2(t: Two) -> i64 = t.a + t.b
+
+    print(sum2(Two(3, 4)))
+    """
+
+@test("an aggregate of two words stays in registers")
+lba_two_words_stay_in_registers()
+    if !lba_ready() then return
+
+    val out = lba_ir(lba_narrow())
+
+    assert(lba_define(out, "sum2").contains("%struct.Two %t.param"), out)
+    assert(lba_define(out, "sum2.owned") == "", out)
+end lba_two_words_stay_in_registers
+
+@test("and it adds up")
+lba_narrow_runs()
+    lba_prints(lba_narrow(), "7\n")
+
+// A counted parameter the body keeps on every way out is owned (`owned_params.sysl`): it arrives with
+// a count, in registers, and is moved into the buffer.
+private lba_kept() -> string = raw"""
+    import sysl.buf.{Buf, buf}
+
+    struct Pair
+        k: string
+        v: string
+        n: int
+
+    keep(b: *Buf[Pair], p: Pair) = b.push(p)
+
+    var all: Buf[Pair] = buf()
+
+    keep(&all, Pair("a", "b", 1))
+    keep(&all, Pair("c", "d", 2))
+
+    for p in all
+        print(p.k, p.v, p.n)
+    """
+
+@test("a parameter the body keeps is owned and crosses by value, not lent")
+lba_an_owned_parameter_is_not_lent()
+    if !lba_ready() then return
+
+    val out = lba_ir(lba_kept())
+
+    assert(lba_define(out, "keep.owned").contains("%struct.Pair %p.param"), out)
+end lba_an_owned_parameter_is_not_lent
+
+@test("and what it kept is all there")
+lba_kept_runs()
+    lba_prints(lba_kept(), "a b 1\nc d 2\n")
+
+// -- what the caller lends --------------------------------------------------------------------------
+
+// `look` reads its parameter after calling `bump`, which writes the global the parameter was read
+// out of: the caller lends a snapshot, and the callee sees the value from before the call.
+private lba_written_original() -> string = raw"""
+    struct P
+        a: i64
+        b: i64
+        c: i64
+
+    var g = P(1, 2, 3)
+
+    bump()
+        g.a = 10
+
+    look(p: P) -> i64
+        val before = p.a
+        bump()
+        before * 100 + p.a
+
+    print(look(g), g.a)
+    """
+
+@test("a callee that may write the original is lent a snapshot")
+lba_a_writer_of_the_original_gets_a_snapshot()
+    if !lba_ready() then return
+
+    val out = lba_ir(lba_written_original())
+    val call = lba_call_line(out, "look.owned(")
+
+    assert(lba_define(out, "look.owned").contains("ptr noalias readonly %p.param"), out)
+    assert(call != "" && !call.contains("%g.addr"), call)
+end lba_a_writer_of_the_original_gets_a_snapshot
+
+@test("and the snapshot is what it reads")
+lba_written_original_runs()
+    lba_prints(lba_written_original(), "101 10\n")
+
+// `look` calls something that writes an `int` and no `P`: the global is lent as it stands.
+private lba_untouched() -> string = raw"""
+    struct P
+        a: i64
+        b: i64
+        c: i64
+
+    var g = P(1, 2, 3)
+    var n: i64 = 0
+
+    tick()
+        n += 1
+
+    look(p: P) -> i64
+        tick()
+        p.a + p.b + p.c + n
+
+    print(look(g))
+    """
+
+@test("a callee that can reach no storage of the parameter's type is lent the original")
+lba_an_untouching_callee_is_lent_the_original()
+    if !lba_ready() then return
+
+    val call = lba_call_line(lba_ir(lba_untouched()), "look.owned(")
+
+    assert(call.contains(", ptr %g.addr)"), call)
+end lba_an_untouching_callee_is_lent_the_original
+
+@test("and it reads it")
+lba_untouched_runs()
+    lba_prints(lba_untouched(), "7\n")
+
+// A later argument writes the global between the first argument and the call.
+private lba_later() -> string = raw"""
+    struct P
+        a: i64
+        b: i64
+        c: i64
+
+    var g = P(1, 2, 3)
+
+    poke() -> i64
+        g.a = 5
+        0
+
+    look(p: P, k: i64) -> i64 = p.a * 10 + k
+
+    print(look(g, poke()), g.a)
+    """
+
+@test("an argument after the lent one that writes it leaves the callee the value from before")
+lba_a_later_argument_reads_the_copy()
+    lba_prints(lba_later(), "10 5\n")
+
+// A counted field in a lent value whose original is replaced during the call: the snapshot's count
+// keeps the old handle alive for the callee, and it is given back with the statement's temporaries --
+// where the copy it replaces gave it back.
+private lba_counted() -> string = raw"""
+    struct Handle
+        id: i64
+
+    impl Drop for Handle
+        drop(self) = print("drop", self.id)
+
+    struct R
+        h: &Handle
+        a: i64
+        b: i64
+
+    var gr = R(Handle(1), 2, 3)
+
+    replace()
+        gr = R(Handle(2), 0, 0)
+
+    peek(r: R) -> i64
+        replace()
+        r.h.id * 100 + r.a
+
+    print(peek(gr))
+    print("end")
+    """
+
+@test("a lent snapshot holds its counts for the call and gives them back at the statement's end")
+lba_counted_snapshot_runs()
+    lba_prints(lba_counted(), "102\ndrop 1\nend\ndrop 2\n")
+
+// A held local is lent where it is, and its destructor runs once, at the end of its scope.
+private lba_local() -> string = raw"""
+    struct Handle
+        id: i64
+
+    impl Drop for Handle
+        drop(self) = print("drop", self.id)
+
+    struct R
+        h: &Handle
+        a: i64
+        b: i64
+
+    peek(r: R) -> i64 = r.h.id * 100 + r.a + r.b
+
+    run()
+        val r = R(Handle(4), 2, 3)
+        print(peek(r))
+        print(peek(r))
+        print("leaving")
+
+    run()
+    print("end")
+    """
+
+@test("a local lent twice is destroyed once, where its scope ends")
+lba_local_runs()
+    lba_prints(lba_local(), "405\n405\nleaving\ndrop 4\nend\n")
+
+// -- reached some other way than a direct call --------------------------------------------------------
+
+// A trait object's table, a function value and a closure all reach the entry, which takes the value
+// as the ordinary convention does and lends the body a slot of its own.
+private lba_indirect() -> string = raw"""
+    struct P
+        a: i64
+        b: i64
+        c: i64
+
+    trait Sum
+        sum(self) -> i64
+
+    impl Sum for P
+        sum(self) -> i64 = self.a + self.b + self.c
+
+    total(p: P) -> i64 = p.a * 100 + p.b * 10 + p.c
+
+    apply(f: &Fn(P) -> i64, p: P) -> i64 = f(p)
+
+    val s: &Sum = P(1, 2, 3)
+
+    print(s.sum())
+    print(apply(total, P(4, 5, 6)))
+    print(apply((p) -> total(p) + 1, P(7, 8, 9)))
+    """
+
+@test("a table takes its word to a body that snapshots the object and lends the method that slot")
+lba_a_table_lends_a_snapshot_of_the_object()
+    if !lba_ready() then return
+
+    val out = lba_ir(lba_indirect())
+    val taken = lba_body(out, "P.sum.self")
+
+    assert(lba_define(out, "P.sum.owned").contains("ptr noalias readonly %self.param"), out)
+    assert(taken.contains("(ptr %self.object)"), taken)
+    assert(taken.contains("store %struct.P %self.value, ptr %self.lent"), taken)
+    assert(taken.contains("@P.sum.owned(ptr %self.lent)"), taken)
+    assert(out.contains("ptr @P.sum.self"), out)
+end lba_a_table_lends_a_snapshot_of_the_object
+
+// The same object reached through its table while the method changes it: the receiver is the
+// snapshot taken when the call began.
+private lba_table_snapshot() -> string = raw"""
+    struct Ball
+        r: f64
+        left: int
+        right: int
+        top: int
+
+    trait Probe
+        seen(self, other: &Probe) -> int
+        bump(*self)
+
+    impl Probe for Ball
+        seen(self, other: &Probe) -> int
+            other.bump()
+            self.left
+        bump(*self) = self.left += 1
+
+    val o: &Probe = Ball(2.5, 7, 0, 0)
+
+    print(o.seen(o), o.seen(o))
+    """
+
+@test("a method reached through its table reads the snapshot, not the object it changed")
+lba_a_table_call_reads_the_snapshot()
+    lba_prints(lba_table_snapshot(), "7 8\n")
+
+@test("a function value's thunk and a closure call the body directly, lending their own parameter")
+lba_a_thunk_lends_its_parameter()
+    if !lba_ready() then return
+
+    val out = lba_ir(lba_indirect())
+
+    assert(lba_define(out, "total.owned").contains("ptr noalias readonly %p.param"), out)
+    assert(lba_body(out, "$closure0.call").contains("@total$$sysl.owned(ptr %$a0.addr)"), out)
+    assert(lba_body(out, "$closure1.call").contains("@total$$sysl.owned(ptr %p.addr)"), out)
+end lba_a_thunk_lends_its_parameter
+
+@test("and each answers what a direct call would")
+lba_indirect_runs()
+    lba_prints(lba_indirect(), "6\n456\n790\n")
+
+// -- shapes ---------------------------------------------------------------------------------------------
+
+// An array, an enum with a payload, a generic instantiated wide and narrow, and recursion.
+private lba_shapes() -> string = raw"""
+    struct P
+        a: i64
+        b: i64
+        c: i64
+
+    struct Wrap[T]
+        n: i64
+        t: T
+
+    sum4(xs: [5]int) -> int = xs[0] + xs[1] + xs[2] + xs[3] + xs[4]
+
+    first(o: Option[P]) -> i64 = o match
+        Some(p) -> p.a
+        None -> 0
+
+    get[T](w: Wrap[T]) -> i64 = w.n
+
+    depth(p: P, k: int) -> i64 = if k == 0 then p.a else depth(p, k - 1) + 1
+
+    print(sum4([1, 2, 3, 4, 0]), first(Some(P(5, 6, 7))), first(None))
+    print(get(Wrap(1, u8(2))), get(Wrap(3, [1, 2, 3, 4])))
+    print(depth(P(1, 2, 3), 3))
+    """
+
+@test("an array and an enum with a payload are lent")
+lba_an_array_and_an_enum_are_lent()
+    if !lba_ready() then return
+
+    val out = lba_ir(lba_shapes())
+
+    assert(lba_define(out, "sum4.owned").contains("ptr noalias readonly %xs.param"), out)
+    assert(lba_define(out, "first.owned").contains("ptr noalias readonly %o.param"), out)
+end lba_an_array_and_an_enum_are_lent
+
+@test("a generic is decided per instantiation: the narrow one in registers, the wide one lent")
+lba_a_generic_is_decided_per_instantiation()
+    if !lba_ready() then return
+
+    val out = lba_ir(lba_shapes())
+    var narrow = false
+    var wide = false
+
+    for line in lines_of(out)
+        if line.starts_with("define ") && line.contains("@get")
+            if line.contains(".owned(ptr noalias readonly %w.param") then wide = true
+            elif line.contains("%w.param") && !line.contains("ptr") then narrow = true
+
+    assert(narrow, out)
+    assert(wide, out)
+end lba_a_generic_is_decided_per_instantiation
+
+@test("a recursive reader is lent by address too")
+lba_recursion_is_lent()
+    if !lba_ready() then return
+
+    val out = lba_ir(lba_shapes())
+
+    assert(lba_body(out, "depth.owned").contains("@depth$$sysl.owned(ptr %p.addr"), out)
+end lba_recursion_is_lent
+
+@test("and every shape answers what a copy would")
+lba_shapes_run()
+    lba_prints(lba_shapes(), "10 5 0\n1 3\n4\n")
+
+// -- the line moves with the machine word ---------------------------------------------------------------
+
+// Three `u32`s are twelve bytes: two words on a 64-bit machine is sixteen, so they stay in registers;
+// on a 32-bit one it is eight, so they are lent.
+private lba_word() -> string = raw"""
+    struct T3
+        a: u32
+        b: u32
+        c: u32
+
+    sum3(t: T3) -> u32 = t.a + t.b + t.c
+
+    @export("probe")
+    probe(x: u32) -> u32 = sum3(T3(x, 2, 3))
+    """
+
+@test("twelve bytes stay in registers on a 64-bit machine and are lent on a 32-bit one")
+lba_the_line_is_two_machine_words()
+    if !lba_ready() then return
+
+    val host = lba_ir(lba_word())
+    val board = lba_ir(lba_word(), Some("thumb-freestanding"))
+
+    assert(lba_define(host, "sum3.owned") == "", host)
+    assert(lba_define(board, "sum3.owned").contains("ptr noalias readonly %t.param"), board)
+end lba_the_line_is_two_machine_words
