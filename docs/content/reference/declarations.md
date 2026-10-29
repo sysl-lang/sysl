@@ -243,7 +243,7 @@ pick[T](a: T, b: T) -> T = b
 val b: u8 = 10
 val k = 250
 
-print(pick(b, k) + 10)
+print(pick(b, k) +% 10)
 ```
 
 ```output
@@ -262,7 +262,7 @@ var s = 3
 var h = 3
 
 s += b
-print(sum + b, s, half(h), h / 2)
+print(sum +% b, s, half(h), h / 2)
 ```
 
 ```output

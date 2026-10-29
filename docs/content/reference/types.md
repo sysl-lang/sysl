@@ -100,7 +100,7 @@ the literal 4294967295 does not fit int
 ```
 
 **Beside an operand of an integer type, an integer literal takes that type**, fitting or not, as in
-Rust: `b + 200` over a `u8` is a `u8` sum that wraps, and `b + 300`, `b < 300` and `b + -1` are
+Rust: `b + 200` over a `u8` is a `u8` sum (which `+%` wraps), and `b + 300`, `b < 300` and `b + -1` are
 refused at the literal, whatever the sum is for. `int(b) + 300` is the `int` sum. Two operands that
 each have a type of their own still widen to each other, so `u8 + u16` is a `u16`
 ([expressions](/reference/expressions/#which-conversions-are-implicit)).
@@ -109,7 +109,7 @@ each have a type of their own still widen to each other, so `u8 + u16` is a `u16
 val b: u8 = 100
 val w: u16 = 1000
 
-print(b + 200, int(b) + 300, b + w)
+print(b +% 200, int(b) + 300, b + w)
 ```
 
 ```output

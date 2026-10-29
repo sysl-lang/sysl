@@ -1890,7 +1890,7 @@ Only two operands that each have a type of their own widen to each other (`u8 + 
 ```sysl
 var b: byte = 200
 
-print(b + 100, int(b) + 100)
+print(b +% 100, int(b) + 100)
 ```
 
 ```output
