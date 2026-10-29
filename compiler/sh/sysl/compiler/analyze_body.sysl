@@ -526,6 +526,12 @@ private drain_pending(a: &Analysis, funcs: *Buf[TFunc])
 
     queue_generic_drops(a)
 
+    val outer_instance = a.reading_instance
+
+    a.reading_instance = true
+
+    defer a.reading_instance = outer_instance
+
     while !a.tables.members.pending.is_empty() && guard < 4096
         val work = a.tables.members.pending
 
@@ -1218,6 +1224,11 @@ analyze_instance_in(a: &Analysis, cx: &Analyzer, name: string, d: FuncDecl) -> T
         cx.fault(misfit_literal(body.result.unwrap(), ret).map(l -> l.span).unwrap_or(span),
                  body_disagreement(declared_key(a, cx.scope, d), ret, body.ty, cx.ret_is_list))
 
+    // A `-> ref` member answers its place's address (`ref_result.sysl`).
+    val answered = if d.marks.answers_place then answer_place(cx, decl_anchor(d), name, params, body, ret)
+                   else body
+    val answers = if d.marks.answers_place then Ptr(ret) else ret
+
     // **An instantiation whose name carries a closure's is internal on the same ground the closure
     // itself is.** `sysl.time$resolve.$closure4` is a symbol only the unit that lowered that closure
     // can mean anything by, since the number in it is that unit's counter -- so it may not cross a
@@ -1231,7 +1242,7 @@ analyze_instance_in(a: &Analysis, cx: &Analyzer, name: string, d: FuncDecl) -> T
     // instantiation, declared nowhere under its own name, keeps its body's.
     val declared = a.tables.members.decl_spans.get(name).unwrap_or(span)
 
-    TFunc(declared, name, params, ret, body, d.variadic, contract.0, contract.1, contract.2,
+    TFunc(declared, name, params, answers, answered, d.variadic, contract.0, contract.1, contract.2,
           file_local(d.vis) || mentions_closure(name),
           d.conv, d.tailrec, contract.3, d.pure, d.ghost,
           frame_symbols(cx, span, name, d.reads, "reads"),

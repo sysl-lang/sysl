@@ -298,6 +298,9 @@ associated_on(cx: &Analyzer, span: Span, ty: Type, name: string, args: Buf[Expr]
     check_crossings(cx, decl.crossing, decl.marks.copies, shown, sig.unwrap().params, ts)
     check_shared_result(cx, span, sig.unwrap().ret)
     cx.an.uses(fname)
+
+    if decl.marks.answers_place then return Some(placed_call(cx, span, fname, ts, sig.unwrap().ret))
+
     Some(TExpr(span, TCall(fname, ts, sig.unwrap().ret, false)))
 end associated_on
 
@@ -893,12 +896,17 @@ call_member(cx: &Analyzer, span: Span, receiver: TExpr, name: string, args: Buf[
         // The two that move lanes between a register and memory. They are the slice's rather than
         // the vector's because the receiver is what supplies the address and the length -- a vector
         // has neither, which is the whole reason these had to exist.
+        //
+        // `get_unchecked` and `set_unchecked` are the subscript with no bounds check, written as a
+        // call (`unchecked.sysl`).
         Array(_, _) ->
-            if claims_lanes(cx, rty, name) then
+            if is_unchecked_member(name) then unchecked_member(cx, span, auto_deref(cx, receiver), name, args)
+            else if claims_lanes(cx, rty, name) then
                 vector_memory(cx, span, rty, auto_deref(cx, receiver), name, args, expected)
             else call_declared(cx, span, receiver, rty, name, args, expected, via, targs)
         Slice(_, _) ->
-            if claims_lanes(cx, rty, name) then
+            if is_unchecked_member(name) then unchecked_member(cx, span, auto_deref(cx, receiver), name, args)
+            else if claims_lanes(cx, rty, name) then
                 vector_memory(cx, span, rty, auto_deref(cx, receiver), name, args, expected)
             else call_declared(cx, span, receiver, rty, name, args, expected, via, targs)
         _ ->
@@ -1378,6 +1386,8 @@ private call_generic_member(cx: &Analyzer, span: Span, receiver: Option[TExpr], 
     check_shared_result(cx, span, sig.unwrap().ret)
     cx.an.uses(name)
 
+    if m.marks.answers_place then return placed_call(cx, span, name, ts, sig.unwrap().ret)
+
     val call = TExpr(span, TCall(name, ts, sig.unwrap().ret, false))
 
     if receiver.is_none() then return call
@@ -1483,6 +1493,12 @@ private member_dispatch(cx: &Analyzer, span: Span, receiver: TExpr, rty: Type, b
     check_crossings(cx, m.crossing, m.marks.copies, shown, params, ts)
     check_shared_result(cx, span, sig.unwrap().ret)
     cx.an.uses(fname)
+
+    // A `-> ref` member's call is the place it answers (`ref_result.sysl`). It writes nothing of its
+    // own, so there is nothing to re-check after it; a write through the place is checked where it
+    // is written.
+    if m.marks.answers_place then return placed_call(cx, span, fname, ts, sig.unwrap().ret)
+
     recheck_after(cx, span, ts.at(0), TExpr(span, TCall(fname, ts, sig.unwrap().ret, false)))
 end member_dispatch
 
@@ -2751,7 +2767,18 @@ private builtin_method(cx: &Analyzer, span: Span, written: TExpr, rty: Type,
     if !decl.params.is_empty() && slots.unwrap().at(0).is_some()
         val want = resolve_type(cx.an, scope, decl.params.at(0).typ, subst)
 
-        amount = Some(type_expr(cx, slots.unwrap().at(0).unwrap(), Some(want)))
+        val given = type_expr(cx, slots.unwrap().at(0).unwrap(), Some(want))
+        val got = texpr_type(given)
+
+        // **A `Checked` operand is the receiver's own type**, as an operator's is: the lowering is one
+        // instruction at one width, with nothing to bring a second width to it. A rotation's count
+        // is any integer, which its lowering converts, so it is not held to this.
+        if numeric.unwrap() == "Checked" && got != Unknown && disagree(got, want) then
+            return Some(cx.err(slots.unwrap().at(0).unwrap().span,
+                               s"'${decl.params.at(0).name}' of method '${module_bare(tr_name)}.$name' " +
+                               s"is ${type_show(want)}, but ${type_show(got)} was given"))
+
+        amount = Some(given)
     end if
 
     val ret =

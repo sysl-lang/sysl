@@ -250,6 +250,9 @@ gen_into(e: *Emit, dest: Val, x: TExpr)
             // This is the case the whole mechanism is for: `val k = kernel()` writes the callee's
             // work straight into `k`'s slot, and no aggregate is ever an LLVM value.
             if !is_foreign(e, name)
+                // Read through the place entry, where the callee has one (`place_entry.sysl`).
+                if gen_place_call_into(e, dest, name, args, ty, x.span) then return
+
                 var arg_vals: Buf[IrArg] = buf()
                 val staged = staged_args(e, args, &arg_vals, name)
 
@@ -359,6 +362,12 @@ gen_borrowed_into(e: *Emit, dest: Val, x: TExpr)
 
         TArrayLit(elems, array_ty) ->
             val elem = element(array_ty).unwrap_or(int_type())
+
+            if zero_sized(elem)
+                for item in elems do gen_expr(e, item)
+
+                return
+            end if
 
             if is_constant_table(elems)
                 emit_memcpy(e, dest, constant_table(e, x, array_ty), int(e.layout.size(array_ty)),

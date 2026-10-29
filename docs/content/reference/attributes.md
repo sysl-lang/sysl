@@ -3138,6 +3138,42 @@ operations are refused there. On a vector, lane-wise operations are strict, but 
 `v.sum()`, `v.min()` — combines the lanes in an order the target chooses and has no strict form, so
 inside a strict body it is refused, and the lanes are read and combined one by one instead.
 
+## `@unchecked` — a block whose subscripts are not bounds-checked
+
+`@unchecked` is the one annotation that marks a **block** rather than a declaration: written on a
+line of its own, it covers the statements indented under it, and every subscript written there — of
+an array, a slice, or a container such as `Buf` that says how — is read with no bounds check.
+
+```sysl
+var squares = [0; 5]
+
+@unchecked
+    for i in 0..<5
+        squares[i] = i * i
+
+print(squares)
+```
+
+```output
+[0, 1, 4, 9, 16]
+```
+
+The block is lexical: a closure or a nested function written inside it is inside it, and one called
+from inside but written elsewhere is not. It takes no argument, and it does not mark a function, a
+member or a single statement on the same line:
+
+```sysl
+@unchecked
+first(xs: []int) -> int = xs[0]
+```
+
+```error
+'@unchecked' marks a block
+```
+
+What it does to a subscript, `get_unchecked` and `set_unchecked` for one subscript at a time, and what
+stays checked are in [arrays](/reference/arrays/#unchecked-access).
+
 ## `@disjoint` — parameters whose memory nothing else reaches
 
 A kernel that writes through one view and reads through another is the loop a vectorizer exists
@@ -4655,7 +4691,7 @@ The same sentence ends differently for each form:
 | `take(f: Fs)`, `take(fs)` | parameter 'f' of 'take' takes it by value / passes it by value |
 | `peek(self)` in the struct | receiver of 'Fs.peek' is taken as '(self)', which is a copy |
 | `give() -> Fs = fs` | returns it by value — only a value built right there may be handed back |
-| `() -> here.open` over a local | captures 'here' by value in a closure |
+| `() -> here.open` returned or stored | this closure captures 'here' by value — a closure that does not outlive the local holds it by reference, and is accepted |
 | `val Fs(n) = fs`, `fs match` | takes it apart / matches on it, which reads it whole into a copy first |
 | `(Fs(3), 1)`, `Option[Fs]` | puts it in a tuple / carries it by value in variant 'Some' |
 | `for item in all` over `[2]Fs` | copies each element into the loop variable |

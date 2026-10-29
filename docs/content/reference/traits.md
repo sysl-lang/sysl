@@ -738,7 +738,7 @@ print(1)
 ```
 
 ```error
-an 'impl' may be written only in the module that declares the trait or in one that declares a type the block names, and 'sysl.Mul' is the library's while nothing this block names is declared outside the library — so this one has no home
+an 'impl' may be written only in the module that declares the trait or in one that declares a type the block names, and 'Mul' is the library's while nothing this block names is declared outside the library — so this one has no home
 ```
 
 The built-in implementation is unaffected. `real` implements `Mul` regardless, and only the argument
@@ -3184,7 +3184,7 @@ var d: &Display = o
 ```
 
 ```error
-a &Shape has forgotten which type it holds, so there is nothing for a &sysl.Display to be built from
+a &Shape has forgotten which type it holds, so there is nothing for a &Display to be built from
 ```
 
 The members of `Display` are in that table, laid out inline so that a required trait's method costs

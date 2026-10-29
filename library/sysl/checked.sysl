@@ -1,0 +1,55 @@
+module sysl
+
+/** Integer arithmetic that answers `None` where the plain operator would have wrapped or trapped.
+ *
+ * `a + b` wraps at the declared width, which is what the machine does and what a program that has
+ * proved its values fit wants. A program that cannot prove it -- a parser reading a count off the
+ * wire, a total over input it did not write -- asks a different question: *did that fit?* These are
+ * that question, and the answer is the result or nothing: `250u8.checked_add(5)` is `Some(255)`,
+ * and `250u8.checked_add(6)` is `None`.
+ *
+ * **The membership is every integer type, signed and unsigned, at every width** -- `u12` and `i128`
+ * as surely as `int` -- and it is the compiler's, for the reason `sysl.math`'s `Bits` is: the integers
+ * are an open family, so there is no finite list of widths to write an `impl` for. A body bounded by
+ * `[T: Checked]` is written once and reaches every width.
+ *
+ * **Each one is the machine's own test, not arithmetic after the fact.** A sum, a difference and a
+ * product are LLVM's `with.overflow` intrinsics, which on most machines are the instruction and the
+ * flag it already set; a quotient and a remainder are one comparison of the divisor before the divide.
+ *
+ * **A ranged or derived integer type is not a member.** Its overflow is its range's, which a width's
+ * test does not see -- a sum that fits `int` can still leave `int within 0..100` -- so the member it
+ * would get answers a question the type does not ask. Convert to the base first.
+ *
+ * **There is no `checked_shl` or `checked_shr`.** A shift by the width or more is defined in sysl
+ * (`reference/expressions.md § Shifting by the width or more`): it gives zero, or the sign, and never
+ * an answer that needs refusing. **Nor are there wrapping or saturating members**: those are the
+ * operators `+%` and `+|`, which say the same thing in the expression itself.
+ */
+trait Checked
+
+    /** `self + rhs`, or `None` where the sum does not fit the type. */
+    checked_add(self, rhs: Self) -> Option[Self]
+
+    /** `self - rhs`, or `None` where the difference does not fit -- for an unsigned type, wherever
+     * `rhs` is the larger.
+     */
+    checked_sub(self, rhs: Self) -> Option[Self]
+
+    /** `self * rhs`, or `None` where the product does not fit. */
+    checked_mul(self, rhs: Self) -> Option[Self]
+
+    /** `self / rhs`, or `None` where `rhs` is zero -- and, for a signed type, at the one quotient that
+     * does not fit: the most negative value over `-1`.
+     */
+    checked_div(self, rhs: Self) -> Option[Self]
+
+    /** `self % rhs`, or `None` exactly where `checked_div` is: a zero divisor, or the most negative
+     * value over `-1`, whose remainder is zero but whose divide is the one a machine traps on.
+     */
+    checked_rem(self, rhs: Self) -> Option[Self]
+
+    /** `-self`, or `None` where the negation does not fit: the most negative value of a signed type,
+     * and every value of an unsigned type but zero.
+     */
+    checked_neg(self) -> Option[Self]

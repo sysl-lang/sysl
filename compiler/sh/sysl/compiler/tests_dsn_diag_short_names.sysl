@@ -1,0 +1,199 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+
+// A diagnostic names a type or trait the library declares by its simple name -- `Option[int]`, not
+// `sysl.Option[int]` -- unless the file it is reported in can see another type of that name, or the
+// diagnostic itself names one (`short_names.sysl`). The axes: which library type (the auto-imported
+// root's, a submodule's imported by name, one never imported), where it sits (alone, as a type
+// argument, around a clashing one, as a bound), what the file sees under the same name (its own
+// declaration, a file-private one, one imported by name, one a wildcard offers, nothing), which file
+// of several the diagnostic is in, and what is not a type's own path (a member's path, a program
+// module's type).
+
+private var dsn_library_cache: Buf[Program] = buf()
+private var dsn_library_read: bool = false
+
+private dsn_library() -> Buf[Program]
+    if dsn_library_read then return dsn_library_cache
+
+    dsn_library_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> dsn_library_cache = units
+
+    dsn_library_cache
+end dsn_library
+
+private dsn_no_library() -> bool
+    if dsn_library().is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return true
+
+    false
+end dsn_no_library
+
+// Every error a program of these files is refused with, as the report prints them.
+private dsn_err(files: []const (string, string)) -> string
+    var units: Buf[Program] = buf()
+
+    for item in dsn_library()
+        units.push(item)
+
+    for i in 0..<files.len
+        val parsed = parse(source_of(files[i].0, files[i].1))
+
+        if !parsed.ok() then return parsed.report.render(parsed.src)
+
+        units.push(parsed.program)
+
+    val done = analyze_bodies(units, host_target())
+
+    post_analysis_checks(done.an, program_of(done, ""), buf())
+    analysis_report(errors_of(done.an.diagnostics()))
+end dsn_err
+
+// The first line of the report for one file.
+private dsn_first(text: string) -> string
+    val all = lines_of(dsn_err([("main.sysl", text)]))
+
+    if all.is_empty() then "" else all.at(0)
+
+// A module `geom` declaring a struct called `Option`, which is what a library name is mistaken for.
+private const DsnGeom: string = "module geom\nstruct Option\n    v: int\n"
+
+// -- the simple name ------------------------------------------------------------------------------
+
+@test("an auto-imported library type is named without its module")
+dsn_auto_imported_type()
+    if dsn_no_library() then return
+
+    assert_eq(dsn_first("val o: Option[int] = Some(1)\nval x: int = o\n"),
+              "error: cannot initialize 'x': declared int but the value is Option[int]")
+
+@test("a library type with two type arguments is named without its module")
+dsn_two_type_arguments()
+    if dsn_no_library() then return
+
+    assert_eq(dsn_first("val r: Result[int, string] = Ok(1)\nval x: int = r\n"),
+              "error: cannot initialize 'x': declared int but the value is Result[int, string]")
+
+@test("a submodule's type nested around another library type is named without either module")
+dsn_nested_library_types()
+    if dsn_no_library() then return
+
+    assert_eq(dsn_first("import sysl.buf.{Buf, buf}\nval b: Buf[Option[byte]] = buf()\nval x: int = b\n"),
+              "error: cannot initialize 'x': declared int but the value is Buf[Option[byte]]")
+
+@test("a library type the file never imported is named without its module too")
+dsn_type_never_imported()
+    if dsn_no_library() then return
+
+    assert_eq(dsn_first("import sysl.buf.buf\nval b = buf[int]()\nval x: int = b\n"),
+              "error: cannot initialize 'x': declared int but the value is Buf[int]")
+
+@test("a library trait a bound asks for is named without its module")
+dsn_trait_in_a_bound()
+    if dsn_no_library() then return
+
+    assert(dsn_first("f[T](x: T) = print(x)\n").starts_with("error: 'print' needs 'T: Display'"),
+           dsn_first("f[T](x: T) = print(x)\n"))
+
+@test("a refusal about an enum's variants names the library's enum by its simple name")
+dsn_enum_without_the_variant()
+    if dsn_no_library() then return
+
+    assert_eq(dsn_first("val x = Option.nope\nprint(\"hi\")"), "error: enum 'Option' has no variant 'nope'")
+
+// A refusal that quotes the type by the key it was filed under (`sysl$Result`) is shortened the same
+// way, before the report spells the key with a dot.
+@test("a refusal quoting the library type's filed key names it by its simple name too")
+dsn_filed_key()
+    if dsn_no_library() then return
+
+    assert_eq(dsn_first("val r: Result[int, string] = Ok(1)\nr.close()\n"),
+              "error: type 'Result' has no method 'close'")
+
+// -- what keeps its path --------------------------------------------------------------------------
+
+@test("a member's path through a library type keeps the type's module")
+dsn_member_path_kept()
+    if dsn_no_library() then return
+
+    assert_eq(dsn_first("import sysl.buf.{Buf, buf}\nvar b: Buf[int] = buf()\nb.push(\"x\")"),
+              "error: 'v' of 'sysl.buf.Buf.push.int' is int, but string was given")
+
+@test("a type of the program's own other module keeps its module")
+dsn_program_module_type_kept()
+    if dsn_no_library() then return
+
+    val said = dsn_err([("main.sysl", "import geom.Option\nval x: int = Option(1)\n"), ("geom/geom.sysl", DsnGeom)])
+
+    assert(said.starts_with("error: cannot initialize 'x': declared int but the value is geom.Option\n"), said)
+
+// -- another type of the same name ----------------------------------------------------------------
+
+// The file wrote the library's path itself, so the hint for a name that fell through to the library
+// by a forgotten import has nothing to say: the whole line is the refusal.
+@test("a type the file's own module declares under the name keeps the library's qualified, unhinted")
+dsn_own_declaration_clashes()
+    if dsn_no_library() then return
+
+    assert_eq(dsn_first("struct Option\n    v: int\nval o: sysl.Option[int] = sysl.Some(1)\nval x: int = o\n"),
+              "error: cannot initialize 'x': declared int but the value is sysl.Option[int]")
+
+@test("a file-private declaration under the name keeps the library's qualified, unhinted")
+dsn_file_private_clashes()
+    if dsn_no_library() then return
+
+    assert_eq(dsn_first("private struct Option\n    v: int\nval o: sysl.Option[int] = sysl.Some(1)\nval x: int = o\n"),
+              "error: cannot initialize 'x': declared int but the value is sysl.Option[int]")
+
+@test("a type imported by the name keeps the library's qualified, and only that one")
+dsn_imported_by_name_clashes()
+    if dsn_no_library() then return
+
+    val main = "import geom.Option\nval r: Result[sysl.Option[int], string] = Ok(sysl.None)\nval x: int = r\n"
+    val said = dsn_err([("main.sysl", main), ("geom/geom.sysl", DsnGeom)])
+
+    assert(said.starts_with("error: cannot initialize 'x': declared int but the value is " +
+                            "Result[sysl.Option[int], string]\n"), said)
+
+@test("a type a wildcard offers under the name keeps the library's qualified")
+dsn_wildcard_clashes()
+    if dsn_no_library() then return
+
+    val main = "import geom.*\nval o: sysl.Option[int] = sysl.Some(1)\nval x: int = o\n"
+    val said = dsn_err([("main.sysl", main), ("geom/geom.sysl", DsnGeom)])
+
+    assert(said.starts_with("error: cannot initialize 'x': declared int but the value is sysl.Option[int]\n"),
+           said)
+
+@test("the clash is judged in the file the diagnostic is in, not in the program")
+dsn_judged_per_file()
+    if dsn_no_library() then return
+
+    val main = "import geom.Option\nimport other.oops\nval o: sysl.Option[int] = sysl.Some(1)\nval x: int = o\n"
+    val other = "module other\noops()\n    val v = Option.nope\n"
+    val said = dsn_err([("main.sysl", main), ("geom/geom.sysl", DsnGeom), ("other/other.sysl", other)])
+
+    assert(said.contains("error: cannot initialize 'x': declared int but the value is sysl.Option[int]\n"), said)
+    assert(said.contains("error: enum 'Option' has no variant 'nope'\n --> other/other.sysl:3:20"), said)
+
+@test("a diagnostic that names a second type of the name keeps both qualified")
+dsn_message_names_two()
+    if dsn_no_library() then return
+
+    val main = "import geom.Option\nimport other.oops\nprint(Option(1).v)\n"
+    val other = "module other\noops()\n    val o: Option[int] = None\n    val y: int = o\n"
+    val said = dsn_err([("main.sysl", main), ("geom/geom.sysl", DsnGeom), ("other/other.sysl", other)])
+
+    assert(said.starts_with("error: cannot initialize 'y': declared int but the value is sysl.Option[int] — " +
+                            "'Option' here is sysl.Option; did you mean geom.Option? Add 'import geom.Option'"),
+           said)

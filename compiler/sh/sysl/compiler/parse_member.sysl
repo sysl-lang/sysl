@@ -1656,7 +1656,10 @@ private parse_method_tail(p: *Parser, start: Span, name: string, params: TypePar
 
     p.expect_kw(")")
 
-    if p.accept_kw("->") then decl.ret_type = Some(parse_result_type(p))
+    if p.accept_kw("->")
+        decl.marks.answers_place = accept_place_result(p, signatures)
+        decl.ret_type = Some(parse_result_type(p))
+    end if
 
     tp = parse_where_on(p, tp)
     decl.tparams = tp.names
@@ -1689,6 +1692,7 @@ private parse_property_tail(p: *Parser, start: Span, name: string,
     var decl = blank_method(start, name)
 
     decl.is_property = true
+    decl.marks.answers_place = accept_place_result(p, signatures)
     decl.ret_type = Some(parse_single_result(p))
 
     if !signatures || p.at_kw("=") || p.block_ahead()
@@ -1699,6 +1703,27 @@ private parse_property_tail(p: *Parser, start: Span, name: string,
     decl.span = start.to(p.just_taken())
     decl
 end parse_property_tail
+
+// `-> ref T` -- a member answering a place rather than a value (`ref_result.sysl`). The word is taken
+// here, before the type, since everywhere else `parse_core_type` refuses it.
+//
+// **A trait's member may not declare one**: a call through a trait object names no body, and the
+// place a call answers is held still by what the body's place goes through -- with no body there is
+// nothing to hold.
+private accept_place_result(p: *Parser, signatures: bool) -> bool
+    if !p.at_kw("ref") then return false
+
+    val at = p.here()
+
+    p.bump()
+
+    if signatures then
+        p.fault(at, "a trait's member cannot answer a place with '-> ref' — a call through a trait " +
+                "object names no body, and what a caller's 'ref' must hold still is read off the " +
+                "body's place. Declare it on the type, or answer a value")
+
+    true
+end accept_place_result
 
 // `count = self.n` -- a property whose type is its body's, read exactly as a function's `= value` is
 // (`inferred_unless_written`). **Only where a body is owed**: a trait's property is a signature every

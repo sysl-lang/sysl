@@ -87,7 +87,7 @@ print(since(a + b, a))
 ```
 
 ```error
-'+' between sysl.time.Instant and sysl.time.Instant needs 'sysl.Add' — it implements 'sysl.Add[sysl.time.Duration]'
+'+' between Instant and Instant needs 'Add' — it implements 'Add[Duration]'
 ```
 
 That diagnostic is exact about what went wrong: `Instant` *does* implement `Add`, at `Duration`, and
@@ -458,7 +458,7 @@ print(date_text(d + days(1i64)))
 ```
 
 ```error
-'+' needs matching types, got sysl.time.LocalDate and sysl.time.Duration
+'+' needs matching types, got LocalDate and Duration
 ```
 
 `on_or_after` is the first date on or after a given one falling on a given weekday, which is what
@@ -857,7 +857,7 @@ print(instant_text(monotonic()))
 ```
 
 ```error
-error: 't' of 'sysl.time.instant_text' is sysl.time.Instant, but sysl.time.Duration was given
+error: 't' of 'sysl.time.instant_text' is Instant, but Duration was given
 ```
 
 Both require `posix`.

@@ -369,6 +369,10 @@ struct Emit
     // The closure literals whose `&Fn` box is laid in the frame that builds it
     // (`Promotions.framed_closures`, `emit_box.sysl`'s `gen_frame_box`).
     framed_closures: Set[string]
+
+    // The functions given a place entry, by key: the body, and the parameter whose storage the answer
+    // is a place of (`place_entry.sysl`).
+    places: Map[string, (TFunc, usize)]
 end Emit
 
 // What a runtime helper is built from. A helper is asked for by name while a body is being written
@@ -417,6 +421,10 @@ enum HelperReq
     // What a function pointer to a `@track_caller` function holds: a stand-in calling it with the
     // location of its own declaration (`track_caller.sysl`).
     HrCallerShim(target: string)
+
+    // A function's place entry: its parameters, the one its answer is a place of taken by address,
+    // and the address of that place answered (`place_entry.sysl`).
+    HrPlace(target: string)
 end HelperReq
 
 // What a definition and every call to it name.
@@ -542,7 +550,7 @@ emitter_for(t: Target, destructors: Buf[(string, string)]) -> Emit
          set(), set(), set(), set(), map(), map(), false, None, set(), buf(), None, None, false,
          None, false, buf(), map(), map(), map(), set(), buf(), set(), set(), set(), false, untouched_none(), set(),
          no_wrap_none(), map(), buf(), Leaving, false, "", set(), buf(), map(), map(), 0, moves_none(), set(), set(), set(), set(),
-         set(), map(), 0, map(), set(), map(), false, set())
+         set(), map(), 0, map(), set(), map(), false, set(), map())
 end emitter_for
 
 // -- what a body could not say --------------------------------------------------------------------
@@ -933,6 +941,10 @@ lty(e: *Emit, t: Type) -> LType = type_lty(t, e.word_bits) match
     None ->
         gap_here(e, s"type ${type_show(t)}")
         LVoid
+
+// The type an address is stepped over by: an element's own, except that one occupying nothing is
+// the empty struct, which LLVM can step over by zero bytes where `void` is no type to step by.
+stride_lty(e: *Emit, t: Type) -> LType = if zero_sized(t) then LStruct(buf()) else lty(e, t)
 
 // The type a `load` or a `store` names, which is the same question.
 lty_of(e: *Emit, x: TExpr) -> LType = lty(e, texpr_type(x))

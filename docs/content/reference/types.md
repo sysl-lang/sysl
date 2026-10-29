@@ -7,7 +7,19 @@ weight: 20
 sysl's types fall into four groups: **scalars** (numbers, `bool`, `char`), the built-in **`string`**,
 the **aggregates** you build (arrays, slices, structs, enums, tuples), and the **modes** that decide
 where a value lives (`T`, `&T`, `*T`). This page covers the first three. The modes have a
-[page of their own](/reference/memory/), because they are about storage rather than shape.
+[page of their own](/reference/memory/), because they are about storage rather than shape. **`ref`
+is not a type** and is refused wherever a type is written: it declares a local name for a place, and
+a method's `-> ref T` says its call is a place
+([A member that answers a place](/reference/memory/#a-member-that-answers-a-place)).
+
+```sysl
+struct Holder
+    r: ref int
+```
+
+```error
+'ref' is a declaration, never a type, so it cannot be a field's, a parameter's, an element's or a type argument's type
+```
 
 **A conversion is implicit exactly when it cannot lose information**: where every value of one
 numeric type is exactly a value of another — a `byte` into an `int`, an `int` into a `long` or a
@@ -114,6 +126,47 @@ Where the wrap is the point — a hash, a checksum, a counter that rolls over �
 so in the spelling, and where the edge of the range is the right answer instead, `+|`, `-|` and `*|`
 stop there: `small +| 10` is 255. Both families are defined in every build, at every width
 ([wrapping and saturating operators](/reference/expressions/#wrapping-and-saturating-operators)).
+
+### Asking whether it fit
+
+Where an overflow means the input was wrong — a number read out of a document, a total over
+untrusted data — the question is whether the operation fit, and the wrapped result cannot answer it
+afterwards. Every plain integer type answers it with the prelude trait `Checked`: `checked_add`,
+`checked_sub`, `checked_mul`, `checked_div`, `checked_rem` and `checked_neg`, each returning
+`Option[Self]` — the result, or `None` where the plain operator would have wrapped or trapped.
+
+```sysl
+var small: byte = 250
+
+print(small.checked_add(5), small.checked_add(6))
+print(0u8.checked_sub(1), i8(-128).checked_neg(), i8(-128).checked_div(-1), 7.checked_rem(0))
+```
+
+```output
+Some(255) None
+None None None None
+```
+
+They are defined at every width, odd ones and those past a machine word included, and lower to the
+machine's own overflow flag (`llvm.sadd.with.overflow` and its siblings) rather than to a test
+written after the fact. The operand is the receiver's type: a literal takes it, and a value of
+another type is refused rather than converted.
+
+```sysl
+val a: byte = 1
+val b: int = 2
+
+print(a.checked_add(b))
+```
+
+```error
+'rhs' of method 'Checked.checked_add' is byte, but int was given
+```
+
+A generic body asks for them with the bound `[T: Checked]`. The members are the plain `iN` and `uN`
+types only: a [ranged type](/reference/errors/#constrained-types)'s overflow is a breach of its range and already
+traps, and a float has no overflow to report. There is no `checked_shl` or `checked_shr`, because a
+shift by the width or more is [defined](/reference/expressions/#shifting-by-the-width-or-more).
 
 ### Arithmetic over literals is exact
 
@@ -602,8 +655,9 @@ Ok(()) Err(Low)
 unit` may hold one, as at every zero-sized type: the address is non-null and aligned, a load through
 it is `()` and a store writes nothing, so neither touches memory. This is what lets a generic body
 that takes the address of a `T` compile at `unit` like at any other type. C sees a `*unit` as a
-`void *`. An array or a slice of `unit` is still refused: `unit` is the type the compiler drops, so
-there would be nothing to index.
+`void *`. An array, a slice or a `Buf` of `unit` is accepted and takes no storage: `[(); 1000000]`
+has length one million and occupies zero bytes, an element reads as `()`, and indexing is still
+bounds-checked. An array of `never` is refused, as there is no value to fill it with.
 
 ```sysl
 through[T](x: T) -> T
@@ -1297,7 +1351,7 @@ print(1)
 ```
 
 ```error
-an 'impl' may be written only in the module that declares the trait or in one that declares a type the block names, and 'sysl.Eq' is the library's while nothing in '(int, string)' is declared outside the library — so this one has no home. A trait of your own, or a type of your own in what it is written for or in the trait's arguments, gives it one
+an 'impl' may be written only in the module that declares the trait or in one that declares a type the block names, and 'Eq' is the library's while nothing in '(int, string)' is declared outside the library — so this one has no home. A trait of your own, or a type of your own in what it is written for or in the trait's arguments, gives it one
 ```
 
 ## Enums

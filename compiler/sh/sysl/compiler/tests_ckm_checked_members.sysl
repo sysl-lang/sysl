@@ -1,0 +1,219 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.text.Search
+
+// `a.checked_add(b)` and its five siblings (`library/sysl/checked.sysl`, `emit_checked.sysl`): the
+// answer, or `None` where the plain operator would have wrapped or trapped -- at every width, at both
+// signednesses, through a bound, and evaluated while compiling. The helpers are
+// `tests_enm_enum_run.sysl`'s.
+//
+// The cells skipped, with the reason: a module-level `val` initialised by one (an option built at
+// run time like any other call's; nothing here is new to module storage), and separate compilation
+// (the member lowers in the caller's unit, as `count_ones` does, so there is no symbol to cross).
+
+// Each answer as `-` for `None` and the value for `Some`, so a whole row of boundaries is one line.
+private ckm_shown() -> string = raw"""
+    show[T: Display](o: Option[T]) -> string = o match
+        Some(v) -> s"$v"
+        None -> "-"
+    """
+
+// -- the boundaries of each width
+
+@test("an unsigned byte at its top and its bottom")
+ckm_an_unsigned_byte()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(ckm_shown() + raw"""
+        val a: u8 = 250
+        val z: u8 = 0
+        print(show(a.checked_add(5)), show(a.checked_add(6)), show(z.checked_sub(1)), show(a.checked_sub(250)))
+        print(show(a.checked_mul(1)), show(a.checked_mul(2)), show(a.checked_div(0)), show(a.checked_rem(0)))
+        print(show(a.checked_div(7)), show(a.checked_rem(7)), show(z.checked_neg()), show(a.checked_neg()))
+        """), "255 - - 0\n250 - - -\n35 5 0 -\n")
+
+@test("a signed byte at MIN and MAX, and MIN over -1")
+ckm_a_signed_byte()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(ckm_shown() + raw"""
+        val hi: i8 = 127
+        val lo: i8 = -128
+        val m: i8 = -1
+        print(show(hi.checked_add(1)), show(lo.checked_add(m)), show(lo.checked_add(hi)), show(lo.checked_sub(1)))
+        print(show(lo.checked_mul(m)), show(hi.checked_mul(m)), show(lo.checked_div(m)), show(lo.checked_rem(m)))
+        print(show(lo.checked_neg()), show(hi.checked_neg()), show(lo.checked_div(2)), show(hi.checked_rem(-10)))
+        """), "- - -1 -\n- -127 - -\n- -127 -64 7\n")
+
+@test("an odd unsigned width, u12, whose top is 4095")
+ckm_an_odd_unsigned_width()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(ckm_shown() + raw"""
+        val top: u12 = 4095
+        val sq: u12 = 64
+        print(show(top.checked_add(1)), show(sq.checked_mul(sq)), show(sq.checked_mul(63)), show(top.checked_sub(top)))
+        """), "- - 4032 0\n")
+
+@test("an odd signed width, i5, whose range is -16 to 15")
+ckm_an_odd_signed_width()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(ckm_shown() + raw"""
+        val lo: i5 = -16
+        val hi: i5 = 15
+        print(show(hi.checked_add(1)), show(lo.checked_div(-1)), show(lo.checked_neg()), show(hi.checked_mul(-1)))
+        """), "- - - -15\n")
+
+@test("i128 and u128, past a machine word")
+ckm_the_128_bit_widths()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(ckm_shown() + raw"""
+        val hi: i128 = 170141183460469231731687303715884105727
+        val lo: i128 = -170141183460469231731687303715884105728
+        val top: u128 = 340282366920938463463374607431768211455
+        val two: u128 = 2
+        print(show(hi.checked_add(1)), show(lo.checked_div(-1)), show(lo.checked_rem(-1)), show(hi.checked_sub(hi)))
+        print(show(top.checked_mul(two)), show(top.checked_add(0)), show((top / 2).checked_mul(two)))
+        """), "- - - 0\n- 340282366920938463463374607431768211455 340282366920938463463374607431768211454\n")
+
+@test("a 256-bit width")
+ckm_a_256_bit_width()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(ckm_shown() + raw"""
+        val big: u256 = 1 << 255
+        print(show(big.checked_mul(2)), show(big.checked_add(big - 1)), show(big.checked_add(big)))
+        """), "- 115792089237316195423570985008687907853269984665640564039457584007913129639935 -\n")
+
+@test("int and long, the plain widths, with a literal operand taking the receiver's type")
+ckm_the_plain_widths()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(ckm_shown() + raw"""
+        val top = 2147483647
+        val seven = 7
+        val big: long = 9223372036854775807
+        val root: long = 3037000500
+        print(show(top.checked_add(1)), show(seven.checked_div(2)), show((-seven).checked_rem(2)))
+        print(show(big.checked_add(1)), show(big.checked_mul(-1)), show(root.checked_mul(root)))
+        print(show((root - 1).checked_mul(root - 1)))
+        """), "- 3 -1\n- -9223372036854775807 -\n9223372030926249001\n")
+
+// -- what it composes with
+
+@test("through a bound, one body at two widths")
+ckm_through_a_bound()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(ckm_shown() + raw"""
+        total[T: Checked + Display](start: T, xs: []T) -> Option[T]
+            var acc = start
+            for x in xs
+                acc = acc.checked_add(x)?
+            Some(acc)
+
+        val small: []u12 = [4000, 95]
+        val over: []u12 = [4000, 96]
+        val wide: []long = [9223372036854775806, 1]
+        print(show(total(small[0], small[1..<2])), show(total(over[0], over[1..<2])), show(total(wide[0], wide[1..<2])))
+        """), "4095 - 9223372036854775807\n")
+
+@test("as a match scrutinee, a running total stopped at the first overflow")
+ckm_in_a_match()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        var acc: u8 = 0
+        var n = 0
+        loop
+            acc.checked_add(60) match
+                Some(v) -> acc = v
+                None -> break
+            n += 1
+        print(acc, n)
+        """), "240 4\n")
+
+@test("evaluated while compiling, where the answer is a constant")
+ckm_while_compiling()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        const safe(a: u8, b: u8) -> bool = a.checked_add(b).is_some()
+        const quot(a: i8, b: i8) -> i8 = a.checked_div(b).unwrap_or(99)
+
+        @assert(safe(250, 5))
+        @assert(!safe(250, 6))
+        @assert(quot(-128, -1) == 99)
+        @assert(quot(-128, 2) == -64)
+        @assert(quot(1, 0) == 99)
+
+        print("folded")
+        """), "folded\n")
+
+// -- what it lowers to
+
+@test("a sum is the overflow intrinsic at the receiver's width")
+ckm_a_sum_is_the_intrinsic()
+    if !enm_ready() then return
+
+    val ir = enm_ir(raw"""
+        val a: int = 5
+        val b: u12 = 7
+        print(a.checked_add(1).is_some(), b.checked_mul(3).is_some(), a.checked_sub(2).is_some())
+        """)
+
+    assert(ir.contains("@llvm.sadd.with.overflow.i32"), ir)
+    assert(ir.contains("@llvm.umul.with.overflow.i12"), ir)
+    assert(ir.contains("@llvm.ssub.with.overflow.i32"), ir)
+
+// -- what is refused
+
+@test("a ranged type is not a member: its overflow is its range's")
+ckm_a_ranged_type_is_refused()
+    val msg = enm_err(raw"""
+        type Pct = int within 0..100
+        val p: Pct = 90
+        print(p.checked_add(20))
+        """)
+
+    assert(msg.contains("checked_add"), msg)
+
+@test("a float is not a member")
+ckm_a_float_is_refused()
+    val msg = enm_err(raw"""
+        val x = 1.5
+        print(x.checked_add(1.0))
+        """)
+
+    assert(msg.contains("checked_add"), msg)
+
+@test("the operand is the receiver's type, and a wider one is refused")
+ckm_the_operand_is_the_receivers_type()
+    val msg = enm_err(raw"""
+        val a: u8 = 1
+        val b: int = 2
+        print(a.checked_add(b))
+        """)
+
+    assert(msg.contains("'rhs' of method 'Checked.checked_add' is byte, but int was given"), msg)
+
+@test("checked_neg takes no operand")
+ckm_neg_takes_no_operand()
+    val msg = enm_err(raw"""
+        val a = 1
+        print(a.checked_neg(2))
+        """)
+
+    assert(msg != "", "checked_neg took an operand")
+
+@test("there is no checked_shl: a shift by the width is defined")
+ckm_there_is_no_checked_shift()
+    val msg = enm_err(raw"""
+        val a = 1
+        print(a.checked_shl(40))
+        """)
+
+    assert(msg.contains("checked_shl"), msg)

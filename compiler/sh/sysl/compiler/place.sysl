@@ -109,7 +109,7 @@ require_place(cx: &Analyzer, t: TExpr, target: Expr, what: string, writes: bool,
 
     // Module storage bound by a `val` is written once for the same reason a local one is: the
     // promise is about the name, and the name is the module's.
-    if root.is_none() && global_written_once(t) then
+    if root.is_none() && global_written_once(cx, t) then
         cx.fault(at, s"a 'val' is written once, so $what has nothing to write through")
 
     // Only a write is asked about: `&` produces a pointer and takes nothing away, so the storage a
@@ -207,7 +207,7 @@ refuse_written_once_receiver(cx: &Analyzer, span: Span, place: TExpr, member: st
                 "reach that copy rather than the value it came from. Copy it into a 'var' and call " +
                 "this on that"
         end if
-    else if !global_written_once(place)
+    else if !global_written_once(cx, place)
         return
     end if
 
@@ -233,7 +233,7 @@ private owe_closure_call(cx: &Analyzer, span: Span, base: string, head: string, 
         if i >= refs.unwrap().len() || !refs.unwrap().at(i) then return false
 
     for i in writes.unwrap()
-        cx.an.lost_writes.push(OwedWrite(cx.scope, span, head, lead, tail, base, i))
+        cx.an.lost_writes.push(OwedWrite(cx.scope, span, head, lead, tail, base, i, buf()))
 
     true
 end owe_closure_call
@@ -251,7 +251,7 @@ private var_fix(place: TExpr) -> string = *place.kind match
 // Whether a place is storage the program may not write -- a `val`, a pattern binding, module storage
 // bound by a `val`, or a part of one. A view taken of such storage is read-only whatever the position
 // asked for, or `x[..]` would be the way around the `val`.
-read_only_storage(cx: &Analyzer, t: TExpr) -> bool = written_once_place(cx, t) || global_written_once(t)
+read_only_storage(cx: &Analyzer, t: TExpr) -> bool = written_once_place(cx, t) || global_written_once(cx, t)
 
 // Whether the elements a view of this place would see are storage the program may not write. **Only
 // an array or a vector holds its elements**, so only there is the view a view of the binding's own
@@ -263,10 +263,16 @@ read_only_elements(cx: &Analyzer, t: TExpr) -> bool =
 
 // Whether a place bottoms out in module storage bound by a `val`. An `extern` variable is the one
 // global that is not, its storage belonging to whoever laid it down.
-private global_written_once(t: TExpr) -> bool = *t.kind match
+//
+// **A place a `-> ref` member answered is as writable as the place its body came to**, read in the
+// caller's terms (`ref_result.sysl`'s `ref_call_place`) -- the same for `root_local` below.
+private global_written_once(cx: &Analyzer, t: TExpr) -> bool = *t.kind match
     TGlobal(_, _, writable) -> !writable
-    TField(recv, _, _) -> !holds_an_address(texpr_type(recv)) && global_written_once(recv)
-    TIndex(recv, _, _) -> owns_its_elements(texpr_type(recv)) && global_written_once(recv)
+    TField(recv, _, _) -> !holds_an_address(texpr_type(recv)) && global_written_once(cx, recv)
+    TIndex(recv, _, _) -> owns_its_elements(texpr_type(recv)) && global_written_once(cx, recv)
+    TDeref(_, _) -> ref_call_place(cx, t) match
+        Some(v) -> global_written_once(cx, v)
+        None -> false
     _ -> false
 
 // The local a place bottoms out in, where it bottoms out in one at all -- the same descent
@@ -287,6 +293,9 @@ private root_local(cx: &Analyzer, t: TExpr) -> Option[Local] = *t.kind match
     TLoad(name, _) -> local_named(cx, name)
     TField(recv, _, _) -> if holds_an_address(texpr_type(recv)) then None else root_local(cx, recv)
     TIndex(recv, _, _) -> if owns_its_elements(texpr_type(recv)) then root_local(cx, recv) else None
+    TDeref(_, _) -> ref_call_place(cx, t) match
+        Some(v) -> root_local(cx, v)
+        None -> None
     _ -> None
 
 // Whether a value of this type is an address of storage kept elsewhere -- a counted box, a weak
@@ -379,7 +388,11 @@ place_key(cx: &Analyzer, t: TExpr) -> Option[string] = *t.kind match
 
         if stood.is_some() then stood else Some(name)
     TGlobal(symbol, _, _) -> Some(s"@$symbol")
-    TDeref(operand, _) -> key_step(place_key(cx, operand), "*")
+    // A place a `-> ref` member answered is spelled as the place its body came to, in the caller's
+    // terms: `t.cell_at(0)` and `t.cell[0]` are one key.
+    TDeref(operand, _) -> ref_call_place(cx, t) match
+        Some(v) -> place_key(cx, v)
+        None -> key_step(place_key(cx, operand), "*")
     // Every field of a union is the same bytes, so all of them are one place: a view of one and a
     // write through another overlap.
     TField(recv, index, _) ->
@@ -440,7 +453,11 @@ private owning_step(t: Type) -> bool = t match
 step_before(cx: &Analyzer, place: TExpr) -> Option[TExpr] = *place.kind match
     TField(recv, _, _) -> Some(recv)
     TIndex(recv, _, _) -> Some(recv)
-    TDeref(operand, _) -> Some(operand)
+    // A place a `-> ref` member answered was reached from wherever its body's place was, in the
+    // caller's terms (`ref_result.sysl`).
+    TDeref(operand, _) -> ref_call_place(cx, place) match
+        Some(v) -> step_before(cx, v)
+        None -> Some(operand)
     TCall(_, _, _, _) -> placed_by(cx, place)
     _ -> None
 
@@ -577,6 +594,11 @@ struct RefWatch
     // Where the name is not a `ref` but a local holding a view borrowed from a receiver
     // (`view_borrow.sysl`): the receiver's name, which is what a refusal names. Empty for a `ref`.
     view_of: string
+
+    // The owning steps the `ref` stands through, by `place_key` (`ref_hazards`): a closure held by
+    // reference that writes one of them, or a value holding one, is a write of the ref's own path
+    // made where the closure is called (`checks.sysl`'s `ref_call`). Empty for a view.
+    keys: Buf[string]
 end RefWatch
 
 // Files a `ref` just bound, where anything another name could reach holds the storage it stands in.
@@ -600,7 +622,7 @@ watch_ref(cx: &Analyzer, span: Span, name: string, place: TExpr)
     if types.is_empty() then return
 
     cx.an.ref_watches.push(RefWatch(cx.watch_key(), name, types, span.end, None, cx.locals.len() - 1,
-                                    ""))
+                                    "", ref_hazards(cx, place)))
 end watch_ref
 
 // The types whose values hold the owning steps a `ref` over `place` goes through: for a field the

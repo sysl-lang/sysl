@@ -1,0 +1,290 @@
+module sh.sysl.compiler
+@tests
+
+// **A closure another domain may run captures by value** -- one that becomes a `&sync Fn`, one handed
+// to a `@crossing` or a `@scoped` parameter, one a thread of its own runs. A read of a capture is a
+// snapshot taken where the closure is formed; a write to one would reach the closure's copy, and is
+// refused with the reason the closure is held apart. **A closure written inside such a closure
+// writes the outer one's copy** where it holds the capture by reference, so its write is refused too,
+// at the inner write; where the inner closure holds its own copy, the write is the inner closure's and
+// is said in its own terms.
+//
+// The helpers are `tests_enm_enum_run.sysl`'s.
+
+private const cdm_sync: string = "share(f: &sync Fn() -> unit) = f()\n\ncall(f: () -> unit) = f()\n\n"
+
+private const cdm_thread: string = raw"""
+    import sysl.threads.{spawn, Thread}
+
+    struct Job
+        f: &sync Fn() -> unit
+
+    entry(j: *Job) = j.f()
+
+    go(f: &sync Fn() -> unit)
+        var j = Job(f)
+        var t = spawn(&entry, &j).unwrap()
+
+        t.join()
+
+    """
+
+private const cdm_scope: string = raw"""
+    import sysl.buf.{Buf, buf}
+
+    struct Scope
+        jobs: Buf[&sync Fn() -> unit]
+
+        @scoped(f)
+        spawn(*self, f: &sync Fn() -> unit)
+            self.jobs.push(f)
+
+    struct Runner
+        n: int
+
+        scope[R](self, body: *Scope -> R) -> R
+            var s = Scope(buf())
+            val r = body(&s)
+
+            for j in s.jobs do j()
+            r
+
+    """
+
+private const cdm_unread: string = "rather than the variable it came from, and nothing in the closure reads it back"
+
+private const cdm_after: string = "rather than the variable it came from, and the variable is used afterwards as though it had"
+
+private cdm_refused(text: string, parts: []string)
+    val said = enm_err(text)
+
+    for p in parts do assert(enm_says(said, p), said)
+end cdm_refused
+
+@test("a read of a capture by a '&sync Fn' is a snapshot taken where the closure is formed")
+cdm_sync_read()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        share(f: &sync Fn() -> int) -> int = f()
+
+        main()
+            var n = 1
+            val f: &sync Fn() -> int = () -> n
+
+            n = 5
+            print(f())
+            print(share(() -> n + 1))
+        """), "1\n6\n")
+end cdm_sync_read
+
+@test("a write to a capture by a closure handed to a '&sync Fn' parameter: refused, naming the thread")
+cdm_sync_write()
+    if !enm_ready() then return
+
+    cdm_refused(cdm_sync + raw"""
+        main()
+            var hit = false
+            share(() -> hit = true)
+        """, ["this closure captures by value, since it becomes a '&sync Fn() -> unit' on line 7, " +
+                 "which another thread may run, so it holds a copy of 'hit'", cdm_unread,
+                 "hold it as a '&bool' and write through it"])
+end cdm_sync_write
+
+@test("a read of a capture by a '@crossing' closure is a snapshot")
+cdm_crossing_read()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        @crossing(f)
+        run(f: () -> int) -> int = f()
+
+        main()
+            var n = 1
+            val g = () -> n
+
+            n = 5
+            print(run(g))
+            print(run(() -> n + 1))
+        """), "1\n6\n")
+end cdm_crossing_read
+
+@test("a write by a closure nested in a '@crossing' one: refused at the inner write, naming the domain")
+cdm_crossing_nested_write()
+    if !enm_ready() then return
+
+    cdm_refused(raw"""
+        call(f: () -> unit) = f()
+
+        @crossing(f)
+        run(f: () -> unit) = f()
+
+        main()
+            var hit = false
+            run(() -> call(() -> hit = true))
+        """, ["since it is handed to 'run' on line 8, whose parameter 'f' is '@crossing', so another " +
+                 "domain may run it, so it holds a copy of 'hit' — so assignment would reach that copy",
+                 cdm_unread, "8:26"])
+end cdm_crossing_nested_write
+
+@test("a write by a closure handed to a '@scoped' parameter: refused, naming the scope")
+cdm_scoped_write()
+    if !enm_ready() then return
+
+    cdm_refused(cdm_scope + raw"""
+        main()
+            var hit = 0
+
+            Runner(0).scope((s) ->
+                s.spawn(() -> hit = 1)
+                0)
+            print(hit)
+        """, ["whose parameter 'f' is '@scoped', so another domain may run it before the scope ends, " +
+                 "so it holds a copy of 'hit'", cdm_unread])
+end cdm_scoped_write
+
+@test("a closure a thread of its own runs reads its snapshot there; a write there is refused")
+cdm_thread_read_and_write()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(cdm_thread + raw"""
+        main()
+            var n = 1
+            val f: &sync Fn() -> unit = () -> print(n * 10)
+
+            n = 2
+            go(f)
+            go(() -> print(n * 10))
+            print(n)
+        """), "10\n20\n2\n")
+
+    cdm_refused(cdm_thread + raw"""
+        main()
+            var hit = 0
+
+            go(() -> hit = 1)
+            print(hit)
+        """, ["this closure captures by value, since it becomes a '&sync Fn() -> unit' on line 17, " +
+                 "which another thread may run, so it holds a copy of 'hit'"])
+end cdm_thread_read_and_write
+
+@test("a closure nested in a '&sync Fn' argument writes the outer copy: refused at the inner write")
+cdm_nested_direct()
+    if !enm_ready() then return
+
+    cdm_refused(cdm_sync + raw"""
+        main()
+            var n = 0
+            share(() -> call(() -> n += 1))
+            print(n)
+        """, ["since it becomes a '&sync Fn() -> unit' on line 7, which another thread may run, so it " +
+                 "holds a copy of 'n' — so '+=' would reach that copy", "7:28"])
+end cdm_nested_direct
+
+@test("a closure held in a 'val' inside a '&sync Fn' writes the outer copy: refused")
+cdm_nested_in_a_val()
+    if !enm_ready() then return
+
+    cdm_refused(cdm_sync + raw"""
+        main()
+            var n = 0
+
+            share(() ->
+                val g = () -> n += 1
+                g())
+        """, ["since it becomes a '&sync Fn() -> unit' on line 8, which another thread may run, so it " +
+                 "holds a copy of 'n'", cdm_unread, "9:23"])
+end cdm_nested_in_a_val
+
+@test("a closure nested in a returned closure writes the outer copy: refused, naming the return")
+cdm_nested_returned()
+    if !enm_ready() then return
+
+    cdm_refused(raw"""
+        make() -> &Fn() -> unit
+            var n = 0
+
+            () ->
+                val g = () -> n += 1
+                g()
+
+        main()
+            val f = make()
+
+            f()
+        """, ["since it is returned from 'make' on line 4, so it holds a copy of 'n'", cdm_unread, "5:23"])
+end cdm_nested_returned
+
+@test("a nested write the outer closure reads back, the variable read after it: refused as used after")
+cdm_nested_used_after()
+    if !enm_ready() then return
+
+    cdm_refused(raw"""
+        share(f: &sync Fn() -> int) -> int = f()
+
+        call(f: () -> unit) = f()
+
+        main()
+            var n = 0
+
+            print(share(() ->
+                call(() -> n += 1)
+                n))
+            print(n)
+        """, ["becomes a '&sync Fn() -> int' on line 8, which another thread may run, so it holds a " +
+                 "copy of 'n'", cdm_after, "9:20"])
+end cdm_nested_used_after
+
+@test("a nested counter read back inside, and the variable read again in another closure: refused")
+cdm_nested_counter_read_elsewhere()
+    if !enm_ready() then return
+
+    cdm_refused(cdm_sync + raw"""
+        main()
+            var n = 0
+            val f: &sync Fn() -> unit = () -> call(() ->
+                n += 1
+                print(n))
+
+            share(f)
+            call(() -> call(() -> n += 10))
+            print(n)
+        """, ["becomes a '&sync Fn() -> unit' on line 7, which another thread may run, so it holds a " +
+                 "copy of 'n'", cdm_after, "8:9"])
+end cdm_nested_counter_read_elsewhere
+
+@test("a nested closure that holds its own copy writes that copy: the outer closure's is untouched")
+cdm_nested_inner_by_value()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        import sysl.buf.{Buf, buf}
+
+        share(f: &sync Fn() -> int) -> int = f()
+
+        main()
+            var n = 1
+
+            print(share(() ->
+                var keep: Buf[&Fn() -> int] = buf()
+
+                keep.push(() ->
+                    n += 1
+                    n)
+                keep.at(0)() + keep.at(0)()))
+        """), "5\n")
+end cdm_nested_inner_by_value
+
+@test("a nested write through a '&sync T' capture reaches the variable on every path, threads included")
+cdm_nested_through_a_reference()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(cdm_thread + cdm_sync + raw"""
+        main()
+            val p: &sync int = 0
+
+            share(() -> call(() -> *p += 1))
+            go(() -> call(() -> *p += 10))
+            print(*p)
+        """), "11\n")
+end cdm_nested_through_a_reference

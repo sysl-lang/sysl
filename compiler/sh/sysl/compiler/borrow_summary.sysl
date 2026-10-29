@@ -31,8 +31,9 @@ import sysl.container.{Map, map, Set, set}
 // or release anything else is `borrowing.sysl`'s `inert_callees`, asked once per report
 // (`explain_borrow_notes`), not part of the summary.
 //
-// Nothing is lowered from this yet. `--explain-borrows` prints it, one line per function of the
-// program's own files.
+// `--explain-borrows` prints it, one line per function of the program's own files, and the lowering
+// reads the places from it (`note_places`): a function whose answer is a place of a parameter may be
+// given a second entry answering that place's address (`place_entry.sysl`).
 
 // What an expression's value is, asked of one parameter.
 enum BKind
@@ -569,6 +570,26 @@ struct BorrowNote
 end BorrowNote
 
 private var bs_notes: Buf[BorrowNote] = buf()
+
+// Every function of the program whose answer is a place of a parameter, the first such one recorded,
+// kept on the analysis (`Analysis.place_answers`) so the lowering of this program -- and no other --
+// reads them: a build that checks a second program before lowering the first (the standard module
+// built on a cold cache) must not hand the first one the second one's answers.
+note_places(cx: &KeepsCx)
+    var out: Map[string, usize] = map()
+
+    for f in cx.funcs
+        if f.params.is_empty() || is_closure_body(f) then continue
+
+        for k in 0..<f.params.len()
+            val w = borrow_of(cx, f.name, k)
+
+            if w.kept && w.how == "place"
+                out.put(f.name, k)
+                break
+
+    cx.an.place_answers = out
+end note_places
 
 // The notes the last whole-program check gathered, handed over once.
 take_borrow_notes() -> Buf[BorrowNote]

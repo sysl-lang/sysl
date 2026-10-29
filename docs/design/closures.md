@@ -227,12 +227,13 @@ broken; noted for whoever writes the trait-bound pages.)
   that holds the view, which owns its backing.
 - **`ref`.** `ref` names may not be captured (`memory.md` 1515), and stay so. But a `ref` live in the
   caller across a call whose closure argument **writes** the variable the `ref` stands in is exactly
-  the hazard of `memory.md § The one rule: what may move underneath it`: the call must be counted as
-  writing that variable. Today the check asks the callee's body; it must also ask the by-reference
-  closures among the arguments.
-- **`@pinned`.** A pinned value cannot be captured today (`refuse_pinned_captures`), because capture
-  copies it. By reference nothing is relocated, so a non-escaping closure may capture one — a small
-  pleasantness win that falls out.
+  the hazard of `memory.md § The one rule: what may move underneath it`: the call is counted as
+  writing that variable. The check asks the callee's body and also the by-reference closures the call
+  runs or is handed (`checks.sysl`'s `ref_call`).
+- **`@pinned`.** By reference nothing is relocated, so a non-escaping closure captures a pinned
+  local, `var` or `val`. One that holds it by value — returned, stored, kept by a callee — would copy
+  it, and is refused (`refuse_pinned_captures`, said once the mode is decided) with the way out that
+  works: build the value behind a `&T`, which the closure counts.
 
 ## 8. `defer`, and the order of releases
 

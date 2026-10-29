@@ -386,6 +386,29 @@ print(f +| 1.0)
 A register of lanes is refused too (`'+|' is not defined for <4>int`); a lane's saturating `+` is a
 fixed-point lane's own `+`.
 
+The third answer to an overflow — that there is no result, and the caller must decide — is a method
+rather than an operator: `a.checked_add(b)` and its siblings return an `Option`
+([types](/reference/types/#asking-whether-it-fit)).
+
+```sysl
+val parts: []byte = [100, 100, 100]
+var total: byte = 0
+
+for x in parts
+    total = total.checked_add(x) match
+        Some(t) -> t
+        None ->
+            print("overflow")
+            break
+
+print(total)
+```
+
+```output
+overflow
+200
+```
+
 ### A multiply feeding an add is fused where the machine fuses
 
 **A float multiply whose result is added or subtracted in the same expression is one fused
@@ -1126,7 +1149,8 @@ drop 7
 
 Every place may be `_`, which evaluates the right side for its effects alone — **a single one
 included: `_ = f()` runs `f` and drops what it answers**, whatever that is: a `Result`, a reference
-with a `Drop` (let go of when the statement ends), `unit`, a tuple.
+with a `Drop` (let go of when the statement ends), `unit`, a tuple. It is how a `Result` is dropped
+on purpose, which a bare `f()` [warns about](/reference/errors/#a-dropped-result-is-a-warning).
 
 ```sysl
 struct Tag
@@ -2824,7 +2848,7 @@ print(first(a))
 ```
 
 ```error
-'first' requires its type parameter 'T' to implement 'sysl.Zero', but Age does not
+'first' requires its type parameter 'T' to implement 'Zero', but Age does not
 ```
 
 ```sysl
@@ -3068,7 +3092,7 @@ print(Srgb == Srgb)
 ```
 
 ```error
-'Colorspace' already implements 'sysl.Eq' — no variant of it carries anything, so its value is its discriminant and '==' is that comparison. Delete the block; a variant that needs an equality of its own has to carry something for it to be about
+'Colorspace' already implements 'Eq' — no variant of it carries anything, so its value is its discriminant and '==' is that comparison. Delete the block; a variant that needs an equality of its own has to carry something for it to be about
 ```
 
 ### Why the token set is closed
