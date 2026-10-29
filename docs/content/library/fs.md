@@ -1307,7 +1307,7 @@ write_bytes("/tmp/sysl-fs-doc-x.txt", "text")
 ```
 
 ```error
-'bytes' of 'sysl.fs.write_bytes' is []const byte, but string was given
+'bytes' of 'sysl.fs.write_bytes' is []const u8, but string was given
 ```
 
 `write_bytes` wants bytes and `s.bytes` is how a `string` supplies them — free, since a `string`

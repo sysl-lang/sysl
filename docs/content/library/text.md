@@ -1258,7 +1258,7 @@ print(from_utf8("hi").unwrap())
 ```
 
 ```error
-'b' of 'sysl.text.from_utf8' is []const byte, but string was given
+'b' of 'sysl.text.from_utf8' is []const u8, but string was given
 ```
 
 `from_utf8` goes **bytes to text**. The other direction is `s.bytes`, is free, and needs no function

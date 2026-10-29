@@ -957,7 +957,7 @@ print(b)
 ```
 
 ```error
-cannot initialize 'b': declared byte but the value is char
+cannot initialize 'b': declared u8 but the value is char
 ```
 
 ### Strings

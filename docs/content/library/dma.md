@@ -84,7 +84,7 @@ read_sector(1, buf[..])
 ```
 
 ```error
-'into' of 'read_sector' is Region, but []byte was given
+'into' of 'read_sector' is dma.Region, but []byte was given
 ```
 
 **The region does not own its memory**, the bargain [`Ring`](/library/ring/) and a `*T` make: whoever
