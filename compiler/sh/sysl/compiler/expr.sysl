@@ -30,7 +30,10 @@ private typed_at(cx: &Analyzer, e: Expr, expected: Option[Type], widen: bool) ->
 
     val outer_tail = cx.unit_tail
     val outer_box = cx.boxing
+    val outer_payload = cx.payload_here
 
+    cx.payload_here = cx.payload_next
+    cx.payload_next = None
     cx.boxing = None
     cx.multi_ok = false
     cx.assign_here = cx.assign_ok && is_assignment(e)
@@ -55,8 +58,25 @@ private typed_at(cx: &Analyzer, e: Expr, expected: Option[Type], widen: bool) ->
     cx.result_chain = outer
     cx.unit_tail = outer_tail
     cx.boxing = outer_box
+    cx.payload_here = outer_payload
     unwrap_results(cx, e, raw, allowed)
 end typed_at
+
+// Hands the NEXT expression read the type its `Option` or `Result` success half is wanted as, for a
+// form that unwraps it (`?`, `.unwrap()`, a `match` arm yielding the payload). Nothing is handed
+// where nothing is wanted: a statement's `g()?` has no expected type and stays a question for the
+// reader, and a unit or unknown one says nothing about a value.
+want_payload(cx: &Analyzer, expected: Option[Type])
+    cx.payload_next = None
+
+    if expected.is_none() then return
+
+    val t = expected.unwrap()
+
+    if t == Unit || mentions_unknown(t) then return
+
+    cx.payload_next = expected
+end want_payload
 
 // The same, with nothing expected.
 type_expr_bare(cx: &Analyzer, e: Expr) -> TExpr = type_expr(cx, e, None)
