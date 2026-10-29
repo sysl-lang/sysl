@@ -347,6 +347,97 @@ asd_early_return()
         print(early(Tag(3)))
         """, "1\ndrop 3\n")
 
+// -- one place: `_ = f()` ----------------------------------------------------------------------------
+//
+// A whole left side of `_` is the list of one discarding place, so it means what `_, _ = f(), g()`
+// means for each part: the value is evaluated for its effects and let go of at the end of the
+// statement. Read as an expression it would close a closure over the assignment instead.
+
+private asd_one() -> string = asd_common() + """
+    fallible(ok: bool) -> Result[int, string] = if ok then Ok(1) else Err("no")
+
+    gen_res[T](x: T) -> Result[T, string] = Ok(x)
+
+    pick[T](x: T) -> T = x
+
+    make(n: int) -> &Tag = Tag(n)
+
+    unit_fn() = print("unit")
+
+    count(n: int) -> Result[int, string]
+        print(s"count $n")
+        Ok(n)
+
+    """
+
+@test("'_ = f()' compiles for every kind of value and runs the call for its effects")
+asd_one_every_kind()
+    asd_prints(asd_one() + """
+        _ = fallible(false)
+        _ = make(1)
+        print("after 1")
+        _ = unit_fn()
+        _ = pick(noisy(7))
+        _ = pick(make(2))
+        _ = gen_res(make(3))
+        _ = (noisy(8), 2)
+        _ = pair(4)
+        _ = name(5)
+        print("done")
+        """, "drop 1\nafter 1\nunit\nnoisy 7\ndrop 2\ndrop 3\nnoisy 8\npair\ndone\n")
+
+@test("'_ = f()' inside a function, a loop, a branch, a match arm and a defer runs each call once")
+asd_one_positions()
+    asd_prints(asd_one() + """
+        run(flag: bool)
+            defer _ = count(9)
+            for i in 0..<2
+                _ = count(i)
+            if flag then _ = count(5) else _ = count(6)
+            flag match
+                true -> _ = count(7)
+                false ->
+                    _ = make(8)
+                    print("arm")
+            print("end")
+
+        run(true)
+        run(false)
+        """, "count 0\ncount 1\ncount 5\ncount 7\nend\ncount 9\ncount 0\ncount 1\ncount 6\ndrop 8\narm\n" +
+             "end\ncount 9\n")
+
+// The `Tag` handed to `drop_it` is the caller's temporary, so it outlives the call: the `Result` the
+// body discards shares it rather than owning it.
+@test("'_ = f()' in a closure body, a nested function and a generic body")
+asd_one_closure_generic()
+    asd_prints(asd_one() + """
+        drop_it[T](x: T)
+            _ = gen_res(x)
+            print("dropped")
+
+        outer()
+            inner()
+                _ = count(2)
+
+            inner()
+
+        val g = () ->
+            _ = count(1)
+        g()
+        outer()
+        drop_it(make(4))
+        drop_it("s")
+        """, "count 1\ncount 2\ndropped\ndrop 4\ndropped\n")
+
+@test("a single '_' still refuses a compound operator, a second value and a value that never returns")
+asd_one_refusals()
+    asd_refused(asd_one() + "_ += 1\n", "'+=' reads every place before writing it, and '_' has nothing to read",
+                "36:1")
+    asd_refused(asd_one() + "_ = 1, 2\n", "this assignment has 1 places on the left and 2 values on the right",
+                "36:1")
+    asd_refused(asd_one() + "_ = panic(\"x\")\n",
+                "'_' drops the value it is given, and this expression never returns one", "36:5")
+
 // -- what is refused --------------------------------------------------------------------------------
 
 @test("a compound operator does not discard, bare or parenthesised")
