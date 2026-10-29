@@ -1,0 +1,251 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.buf
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.testing.skip
+
+// An array, a slice or a buffer of `unit` (`reference/types.md § unit and never`): the elements
+// occupy nothing, so the length is kept, no storage is touched, an element read is `()` and a walk
+// runs `len` times -- as Rust treats `[(); N]`, `&[()]` and `Vec<()>`.
+
+// What a program does: what it printed, and whether it exited zero.
+private uar_outcome(text: string) -> (string, bool)
+    val root = make_temp_dir("sysl-uar").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (failure_text(why), false)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> ("the program that was built could not be run", false)
+        Ok(out) -> (out.text + out.err.unwrap_or(""), out.status.ok())
+end uar_outcome
+
+private uar_prints(text: string, want: string)
+    if xvr_no_library() then return
+
+    val out = uar_outcome(text)
+
+    assert(out.1, s"it did not exit zero: ${out.0}")
+    assert_eq(out.0, want)
+end uar_prints
+
+private uar_emit(text: string) -> (string, bool)
+    val root = make_temp_dir("sysl-uar").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    val out = emit_llvm_text(src, None) match
+        Err(why) -> (why.message, false)
+        Ok(made) ->
+            if !made.report.is_empty() then (analysis_report(made.report), false)
+            else (made.text, true)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end uar_emit
+
+// The text a program lowers to holds each of the first and none of the second.
+private uar_ir(text: string, wants: []string, never: []string)
+    if xvr_no_library() then return
+
+    val out = uar_emit(text)
+
+    assert(out.1, s"did not compile: ${out.0}")
+
+    for w in wants
+        assert(out.0.contains(w), s"no '$w' in:\n${out.0}")
+
+    for w in never
+        assert(!out.0.contains(w), s"'$w' in:\n${out.0}")
+end uar_ir
+
+private val UarBuf: string = "import sysl.buf.{Buf, buf}\n\n"
+
+// -- arrays -----------------------------------------------------------------------------------------
+
+@test("a literal of units has its length, and an element reads as ()")
+uar_literal() = uar_prints("val xs = [(), (), ()]\nprint(xs.len)\nprint(xs[1] == ())\nprint(xs[2])\n", "3\ntrue\n()\n")
+
+@test("a fill of a million units takes no storage")
+uar_million()
+    uar_prints("val big = [(); 1000000]\nprint(big.len)\nprint(big[999999] == ())\n", "1000000\ntrue\n")
+    uar_ir("val big = [(); 1000000]\nprint(big.len)\n", ["[1000000 x {}]"], ["x void", "x i8]"])
+end uar_million
+
+@test("an array of units annotated, returned, nested and held in a struct")
+uar_shapes() =
+    uar_prints(raw"""
+        struct H
+            xs: [3]unit
+            n: usize
+
+        ret() -> [5]unit = [(); 5]
+        take(a: [2][3]unit) -> usize = a.len + a[1].len
+
+        val a: [4]unit = [(); 4]
+        val h = H([(), (), ()], 7)
+
+        print(a.len, ret().len, take([[(); 3]; 2]), h.xs.len + h.n)
+        """, "4 5 5 10\n")
+
+@test("an element is assigned, and arrays of units compare equal")
+uar_assign_and_compare() =
+    uar_prints("var m = [(), ()]\nm[1] = ()\nprint(m[0] == m[1])\nprint([(), ()] == [(), ()])\n", "true\ntrue\n")
+
+@test("each element is evaluated once, in order, and a fill once whatever its length")
+uar_effects() =
+    uar_prints("val a = [print(1), print(2)]\nval b = [print(3); 4]\nprint(a.len, b.len)\n", "1\n2\n3\n2 4\n")
+
+@test("an index past the end traps with the usual message")
+uar_bounds()
+    if xvr_no_library() then return
+
+    val out = uar_outcome("var m = [(), ()]\nvar i = 5\nprint(m[i])\n")
+
+    assert(!out.1, out.0)
+    assert(out.0.contains("index 5 out of bounds for length 2"), out.0)
+end uar_bounds
+
+@test("an array of an empty struct, beside the array of units")
+uar_empty_struct() =
+    uar_prints(UarBuf + raw"""
+        struct E
+        end E
+
+        val a = [E(), E(), E()]
+        val f = [E(); 5]
+        var b: Buf[E] = buf()
+
+        b.push(E())
+        b.push(E())
+        print(a.len, f.len, b.len())
+        """, "3 5 2\n")
+
+// -- slices and walks -------------------------------------------------------------------------------
+
+@test("a slice of units has its length, and a sub-slice its own")
+uar_slices() =
+    uar_prints(raw"""
+        mm(xs: []unit) -> usize = xs.len
+
+        var a = [(); 10]
+
+        print(mm(a), mm(a[2..<5]), a[1..<4].len, mm(a[10..<10]))
+        """, "10 3 3 0\n")
+
+@test("a walk runs len times, over an array, a slice and a generic slice")
+uar_walks() =
+    uar_prints(raw"""
+        count[T](xs: []T) -> int
+            var k = 0
+
+            for _ in xs do k += 1
+
+            k
+
+        var a = [(); 7]
+        var n = 0
+
+        for u in a
+            n += 1
+            assert(u == ())
+
+        print(n, count(a), count(a[1..<3]), count([(), ()]))
+        """, "7 7 2 2\n")
+
+// -- buffers ----------------------------------------------------------------------------------------
+
+@test("a Buf[unit] pushes, pops, counts, clears and is walked")
+uar_buf()
+    uar_prints(UarBuf + raw"""
+        var u: Buf[unit] = buf()
+        var k = 0
+
+        for i in 0..<5 do u.push(())
+
+        for _ in u do k += 1
+
+        print(u.len(), k, u.pop().is_some(), u.len())
+        u.clear()
+        print(u.len(), u.pop().is_none())
+        """, "5 5 true 4\n0 true\n")
+end uar_buf
+
+@test("a generic over Buf[T] instantiated at unit, and a buffer of buffers of unit")
+uar_generic_buf() =
+    uar_prints(UarBuf + raw"""
+        first[T](v: Buf[T]) -> T = v[0]
+        total[T](v: Buf[T]) -> usize = v.len()
+
+        var u: Buf[unit] = buf()
+        var outer: Buf[Buf[unit]] = buf()
+
+        u.push(())
+        u.push(())
+        outer.push(u)
+        print(first(u) == (), total(u), outer.len(), outer[0].len())
+        """, "true 2 1 2\n")
+
+@test("a Buf[unit] holds no element storage and its box is laid out with an empty element")
+uar_buf_layout() =
+    uar_ir(UarBuf + "var u: Buf[unit] = buf()\nu.push(())\nprint(u.len())\n",
+           ["%arc.buf.unit = type { i64, ptr, i64, i64, [0 x {}] }"], ["x void", "store void"])
+
+// -- never, and the bare-metal build ----------------------------------------------------------------
+
+@test("an array of never is still refused: it has no values at all")
+uar_never() =
+    if !xvr_no_library()
+        val out = uar_emit("f(a: [4]never) -> int = 1\nprint(1)")
+
+        assert(!out.1, out.0)
+        assert(out.0.contains("'never' is the type of an expression that does not finish"), out.0)
+
+@test("on a 32-bit core with no OS the array compiles to an object")
+uar_bare_metal()
+    if xvr_no_library() then return
+
+    val t = target_named("thumb-freestanding-softfp").unwrap()
+    val cc = find_backend_clang(t) match
+        Err(why) ->
+            skip(why)
+            return
+        Ok(found) -> found
+
+    val dir = make_temp_dir("sysl-uar").unwrap()
+
+    write_text(s"$dir/main.sysl", "@export(\"main\")\nentry() -> i32\n    val xs = [(); 1000]\n    var k: i32 = 0\n\n" +
+               "    for _ in xs do k += 1\n\n    k\n").unwrap()
+
+    val text = emit_llvm_text(dir, Some("thumb-freestanding-softfp"), DefaultOptimization, buf(), Some(buf())) match
+        Err(why) -> s"did not compile: ${failure_text(why)}"
+        Ok(e) -> if e.report.is_empty() then e.text else s"did not compile: ${analysis_report(e.report)}"
+
+    assert(!text.starts_with("did not compile"), text)
+    assert(!text.contains("x void") && !text.contains("store void"), text)
+
+    val obj = s"$dir/probe.o"
+    val made = compile_object(cc, text, obj, t, "2")
+
+    remove_dir_all(dir).unwrap_or(())
+
+    made match
+        Err(why) -> assert(false, why)
+        Ok(_) -> ()
+end uar_bare_metal

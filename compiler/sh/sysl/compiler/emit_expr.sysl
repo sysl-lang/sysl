@@ -155,6 +155,10 @@ private gen_expr_kind(e: *Emit, x: TExpr) -> Val = *x.kind match
 
     TIndex(receiver, index, ty) ->
         val p = element_addr(e, receiver, index, x.span)
+
+        // The index is still checked; the element is the one value its type has.
+        if zero_sized(ty) then return VNothing
+
         val r = fresh_reg(e)
 
         if read_under_union(x) then emit_union_check(e, p, ty, x.span)
@@ -298,6 +302,13 @@ private gen_expr_kind(e: *Emit, x: TExpr) -> Val = *x.kind match
     // constants fold to one in the object file. A large one is built in storage instead and read
     // back, since an aggregate that crosses by address has no business being a register at all.
     TArrayLit(elems, array_ty) ->
+        // An array of elements that occupy nothing has a length and no bytes: each element is run
+        // for its effect and the array is the zero of its type.
+        if zero_sized_elements(array_ty)
+            gen_parts(e, elems)
+            return VZero
+        end if
+
         if e.layout.indirect(array_ty) then return through_slot(e, x)
 
         // **Every element is produced before any of them is laid in.** The two phases are what the
@@ -324,7 +335,7 @@ private gen_expr_kind(e: *Emit, x: TExpr) -> Val = *x.kind match
     // what makes `[0; 4096]` four instructions instead of four thousand, and there is no length at
     // which the two forms would want to swap.
     TArrayFill(value, array_ty) ->
-        if array_len_of(array_ty) == 0
+        if array_len_of(array_ty) == 0 || zero_sized_elements(array_ty)
             gen_expr(e, value)
             return VZero
         end if
@@ -610,6 +621,8 @@ private gen_buf_lit(e: *Emit, elems: Buf[TExpr], slice_ty: Type) -> Val
     val made = gen_buffer(e, elem, n)
 
     for i in 0..<vals.len()
+        if zero_sized(elem) then continue
+
         retain_value(e, elem, vals.at(i))
 
         val ep = fresh_reg(e)
@@ -655,6 +668,9 @@ private gen_promoted_slice(e: *Emit, base: TExpr, slice_ty: Type) -> Val
     emit(e, InStore(lty(e, base_ty), v, made.1, AccPlain, None))
     buffer_view(e, slice_ty, made.0, made.1, n)
 end gen_promoted_slice
+
+// Whether an array's elements occupy nothing, so that it holds a length and no storage.
+zero_sized_elements(ty: Type) -> bool = element(ty).map(t -> zero_sized(t)).unwrap_or(false)
 
 private array_len_of(ty: Type) -> int = underlying(ty) match
     Array(n, _) -> n
@@ -2045,7 +2061,7 @@ end gen_conversion
 // The same, for storage a value is being written into rather than a slot made for it. An array of no
 // elements has nothing to walk, and the one evaluation the form promises has already happened.
 fill_at(e: *Emit, base: Val, array_ty: Type, v: Val)
-    if array_len_of(array_ty) > 0 then fill_array(e, base, array_ty, v)
+    if array_len_of(array_ty) > 0 && !zero_sized_elements(array_ty) then fill_array(e, base, array_ty, v)
 
 fill_array(e: *Emit, base: Val, array_ty: Type, v: Val)
     val elem = element(array_ty).unwrap_or(int_type())

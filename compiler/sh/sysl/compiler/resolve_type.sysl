@@ -191,16 +191,6 @@ private storage_aggregate(t: Type, inner: TypeRef, written: string) -> string = 
     Vector(_, _) -> "a vector is several lanes. Declare a struct whose fields are volatile, as 'n: volatile u64'"
     _ -> ""
 
-// **An array or a slice of `unit` has nothing to be an array of**: `unit` is the type the compiler
-// drops, so its elements would have no layout to index. A `*unit`, a `&unit` and a `weak unit` are
-// admitted, as at every other zero-sized type: the address is non-null and aligned, and a load or a
-// store through it touches no memory. `what` names the form, quoted as the refusal quotes it.
-private addressable(a: &Analysis, scope: Scope, span: Span, t: Type, what: string) -> Type = t match
-    Unit ->
-        a.fault(scope, span, s"unit occupies no storage, so there is nothing for $what to point at")
-        Unknown
-    _ -> t
-
 // Whether a `volatile` may qualify this type. The qualifier promises exactly the one load or the one
 // store the source wrote, so it means something only where an access is one instruction; a register
 // block is qualified one field at a time, and anything counted is refused outright.
@@ -398,8 +388,7 @@ private resolve_array(a: &Analysis, scope: Scope, span: Span, length: Option[Exp
     // A fixed array HOLDS its elements and a slice POINTS at them, which is the whole of why one is
     // an indirection and the other is not.
     if length.is_none() then
-        return Slice(addressable(a, scope, span, under_indirection(a, () -> resolve_qualified(a, scope, elem, subst)),
-                                 "a slice"), read_only)
+        return Slice(under_indirection(a, () -> resolve_qualified(a, scope, elem, subst)), read_only)
 
     val written = length.unwrap()
 
@@ -455,7 +444,7 @@ private resolve_array(a: &Analysis, scope: Scope, span: Span, length: Option[Exp
         return Unknown
     end if
 
-    Array(int(const_extent(a, scope, span, written, subst)), addressable(a, scope, span, e, "an array"))
+    Array(int(const_extent(a, scope, span, written, subst)), e)
 end resolve_array
 
 // Whether a written length is a bare name standing for a **type** -- `[T]int` where `T` is a type
