@@ -14,7 +14,7 @@ rendering itself through `Display` is handed the `FormatSpec` the same count mak
 
 ## Index
 
-[`f128_scratch_len`](#f128_scratch_len) [`float_scratch_len`](#float_scratch_len) [`binary`](#binary) [`fixed_scratch_len`](#fixed_scratch_len) [`format_bf16_plain`](#format_bf16_plain) [`format_count`](#format_count) [`format_f128`](#format_f128) [`format_f128_plain`](#format_f128_plain) [`format_f128_shortest`](#format_f128_shortest) [`format_f16_plain`](#format_f16_plain) [`format_f32`](#format_f32) [`format_f32_plain`](#format_f32_plain) [`format_fixed`](#format_fixed) [`format_fixed_wide`](#format_fixed_wide) [`format_int`](#format_int) [`format_real`](#format_real) [`format_real_plain`](#format_real_plain) [`format_spec_of`](#format_spec_of) [`format_str`](#format_str) [`hex`](#hex) [`octal`](#octal) [`shortest`](#shortest) [`shortest`](#shortest-1) [`shortest`](#shortest-2) [`write_f128`](#write_f128) [`write_f32`](#write_f32) [`write_fixed`](#write_fixed) [`write_fixed_wide`](#write_fixed_wide) [`write_real`](#write_real) [`FormatError`](#formaterror) [Display for FormatError](#display-for-formaterror)
+[`f128_scratch_len`](#f128_scratch_len) [`float_scratch_len`](#float_scratch_len) [`binary`](#binary) [`fixed_scratch_len`](#fixed_scratch_len) [`format_bf16_plain`](#format_bf16_plain) [`format_count`](#format_count) [`format_f128`](#format_f128) [`format_f128_plain`](#format_f128_plain) [`format_f128_shortest`](#format_f128_shortest) [`format_f16_plain`](#format_f16_plain) [`format_f32`](#format_f32) [`format_f32_plain`](#format_f32_plain) [`format_fixed`](#format_fixed) [`format_fixed_wide`](#format_fixed_wide) [`format_int`](#format_int) [`format_real`](#format_real) [`format_real_plain`](#format_real_plain) [`format_spec_of`](#format_spec_of) [`format_str`](#format_str) [`hex`](#hex) [`octal`](#octal) [`real_digits`](#real_digits) [`real_digits`](#real_digits-1) [`shortest`](#shortest) [`shortest`](#shortest-1) [`shortest`](#shortest-2) [`write_f128`](#write_f128) [`write_f32`](#write_f32) [`write_fixed`](#write_fixed) [`write_fixed_wide`](#write_fixed_wide) [`write_real`](#write_real) [`FormatError`](#formaterror) [`RealDigits`](#realdigits) [`RealKind`](#realkind) [Display for FormatError](#display-for-formaterror)
 
 ## Constants
 
@@ -262,6 +262,24 @@ octal[T: Integer](v: T, width: int = 0) -> string
 An integer in base eight, as `f"$v%o"` makes it: `width` zero-pads, and a negative value reads at
 its own width, so `octal(i8(-6))` is `"372"`.
 
+### `real_digits`
+
+```sysl
+real_digits(x: real) -> RealDigits
+```
+
+The fewest digits that read back as `x`, and the decimal exponent of the first -- the same digits
+`shortest(x)` spells in `%g` style, for a program that writes reals its own way (Java's `1.0E20`,
+say). See `RealDigits` for how to read the answer.
+
+### `real_digits`
+
+```sysl
+real_digits(x: f32) -> RealDigits
+```
+
+The fewest digits that read back as the same `f32`: `real_digits(f32(0.1))` is `"1"`, exponent -1.
+
 ### `shortest`
 
 ```sysl
@@ -371,6 +389,36 @@ enum FormatError
 ```
 
 Why `write_real`, `write_f32` or `write_f128` wrote nothing.
+
+### `RealDigits`
+
+```sysl
+struct RealDigits
+    kind: RealKind
+    negative: bool
+    digits: string
+    exponent: int
+```
+
+A float's shortest round-trip decimal, taken apart so a program can lay it out in its own style.
+
+For a `Finite` value the number is `-`(if `negative`) then `d.ddd` times ten to the `exponent`,
+where `digits` is `"dddd"` -- ASCII digits, the first non-zero, no trailing zero: `1e20` is digits
+`"1"`, exponent 20; `123.456` is `"123456"`, exponent 2; `0.001` is `"1"`, exponent -3. A `Zero`
+has digits `"0"` and exponent 0, and `Infinite` and `NaN` have no digits. `negative` is the sign
+bit, so it is set for `-0` and `-inf`.
+
+### `RealKind`
+
+```sysl
+enum RealKind
+    Finite
+    Zero
+    Infinite
+    NaN
+```
+
+What kind of number a `RealDigits` describes.
 
 ## Implementations
 
