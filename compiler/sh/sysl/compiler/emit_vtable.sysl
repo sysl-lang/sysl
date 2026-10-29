@@ -247,18 +247,45 @@ private lent_self(e: *Emit, f: TFunc, body: IrFuncSig, boxed: bool) -> IrFunc
     val shape = if boxed then box_lty(e, ty) else lty(e, ty)
     val value = VReg(s"${recv.0}.value")
 
+    // **Every other parameter the body is lent arrives from the table as the value it crosses as**, the
+    // way the method's own entry takes it, and is lent a slot of this function's own.
+    var others: Map[string, (Type, string)] = map()
+
+    for j in 1..<f.params.len()
+        val q = f.params.at(j)
+
+        if e.lent_params.has(owned_key(f.name, j)) then others.put(s"${q.0}.param", (q.1, s"${q.0}.lent"))
+
     var params: Buf[IrParam] = buf()
     var args: Buf[IrArg] = buf()
+    var lends: Buf[Inst] = buf()
 
     for p in body.ty.params
+        val other = p.name match
+            Some(VReg(n)) -> others.get(n)
+            _ -> None
+
         if names_reg(p.name, param)
             params.push(IrParam(LPtr, no_ir_attrs(), Some(object)))
             args.push(ir_arg(LPtr, slot))
+        else if other.is_some()
+            val shape_of = lty(e, other.unwrap().0)
+            val at = VReg(other.unwrap().1)
+
+            params.push(IrParam(shape_of, no_ir_attrs(), p.name))
+            lends.push(InAlloca(at, shape_of, None))
+            lends.push(InStore(shape_of, p.name.unwrap_or(VUndef), at, AccPlain, None))
+            args.push(ir_arg(LPtr, at))
         else
             params.push(p)
             args.push(IrArg(p.ty, p.name.unwrap_or(VUndef), p.attrs))
+        end if
+    end for
 
     var instrs: Buf[Inst] = buf()
+
+    for item in lends
+        instrs.push(item)
     var step: Buf[IrArg] = buf()
 
     step.push(ir_arg(l_i32(), VInt(from_int(0))))

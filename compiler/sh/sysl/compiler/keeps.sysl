@@ -1376,6 +1376,9 @@ private kept_at(t: &Track, evs: &EvBuf, e: TExpr)
                 if carries(t, op) then kept_hard(evs, "it is stored through a pointer by an atomic", op.span)
         TAwait(task, _) -> await_clear(t.hs, evs, task, e.span)
         TBlockOn(task, _) -> await_clear(t.hs, evs, task, e.span)
+        TStep(_, wake) ->
+            if !t.promised && hands_on(t, wake)
+                kept_hard(evs, "it is the waker handed to 'step', which the task keeps for its parks", wake.span)
         TCall(name, args, _, _) ->
             join_clear(t.hs, evs, name, args, e.span)
 
@@ -2282,10 +2285,30 @@ private frame_event_at(ft: &FrameTrack, evs: &EvBuf, e: TExpr)
         TCall(_, _, _, _) -> call_at(ft, evs, e)
         TVCall(_, _, _, _, _) -> call_at(ft, evs, e)
         TCallPtr(_, _, _, _) -> call_at(ft, evs, e)
+        TStep(_, wake) -> step_waker_at(ft, wake)
         TErase(v, _, ty) -> if ft.probe then probe_synced(ft, e.span, v, ty)
         TBox(v, ty) -> if ft.probe then probe_synced(ft, e.span, v, ty)
         _ -> ()
 end frame_event_at
+
+// **The waker handed to `step` is kept by the task**: every `park` in it, this step's or one woken
+// long after the step returned, calls that waker, so it outlives the frame that built it whatever
+// becomes of the step's answer.
+private step_waker_at(ft: &FrameTrack, wake: TExpr)
+    val core = frame_core(ft, wake)
+
+    if core.is_none() then return
+
+    var said = s"'step' keeps its waker for the task's parks, and ${argument_said(ft, wake, core.unwrap())} — " +
+        "hand it storage that lasts"
+
+    if ft.probe
+        said = probe_why(core.unwrap(), s"it is handed to 'step' ${probe_line(ft.scope, wake.span)} as the " +
+                         "waker, which the task keeps for its parks")
+    end if
+
+    ft.faults.items.push((ft.scope, wake.span, said))
+end step_waker_at
 
 // **An address of this frame's storage written through a parameter or into module storage outlives
 // the frame**, unless it is overwritten before every way out. Anywhere else -- a heap object, a

@@ -1,0 +1,267 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.cstring
+
+// **The waker handed to `step` is kept by the task** (`keeps.sysl`'s `step_waker_at`, and the
+// `TStep` arm of `kept_at` for a parameter handed on to it): every `park` in the task calls it, one
+// woken long after the step returned among them. So a closure literal handed to `step` -- directly,
+// through a callee's parameter, through a local, a struct field or a generic -- is boxed on the heap
+// and holds its captures by value, never boxed in the frame that built it. Boxed in the frame, a
+// timer firing after the executor's loop has returned calls a waker on a dead frame and pushes a
+// garbage task number (`reference/async.md`'s executor).
+//
+// Skipped cells, and why: an `async` body's closures are on the heap already (they live in its frame
+// only between suspensions); a `&sync Fn` waker is refused by `step`'s own type; a `Buf` of wakers is
+// a callee keeping it (`push`), the same question as the `drive` cell.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private extern "setenv" skw_c_setenv(name: *u8, value: *u8, overwrite: int) -> int
+private extern "unsetenv" skw_c_unsetenv(name: *u8) -> int
+
+// The program built and run, on the counted heap or with `flags` handed to clang: what it printed,
+// what it said on stderr, and how many AddressSanitizer report hooks its binary carries.
+private skw_run(text: string, counted: bool, flags: string) -> (string, string, usize)
+    val root = make_temp_dir("sysl-skw").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", forms_imported(text)).unwrap()
+
+    val exe = s"$root/built"
+
+    if flags != ""
+        val n = cstring("SYSL_EXTRA_CFLAGS")
+        val v = cstring(flags)
+
+        skw_c_setenv(n.ptr, v.ptr, 1)
+    end if
+
+    force_alloc_counting(counted)
+
+    val made = build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe))
+
+    force_alloc_counting(false)
+
+    if flags != ""
+        val n = cstring("SYSL_EXTRA_CFLAGS")
+
+        skw_c_unsetenv(n.ptr)
+    end if
+
+    made match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (failure_text(why), "", 0)
+        Ok(_) -> ()
+
+    val hooks = capture("nm", ["-u", exe], "", [], true) match
+        Ok(o) -> o.text.count_of("__asan_report")
+        Err(_) -> 0
+
+    val ran = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    ran match
+        Err(_) -> ("could not be started", "", hooks)
+        Ok(o) -> (o.text, o.err.unwrap_or(""), hooks)
+end skw_run
+
+// What `--explain-escapes` reports for a program, each line with the directory taken out.
+private skw_explained(text: string) -> Buf[string]
+    var notes: Buf[string] = buf()
+
+    if xvr_no_library() then return notes
+
+    val root = make_temp_dir("sysl-skw").unwrap()
+
+    write_text(s"$root/main.sysl", forms_imported(text)).unwrap()
+
+    var lines: Buf[string] = buf()
+    val sink = &lines
+    val noted = &notes
+    var args: Buf[string] = buf()
+
+    args.push("sysl")
+    args.push("emit-llvm")
+    args.push("--explain-escapes")
+    args.push(s"$root/main.sysl")
+
+    run_cli_noted(args.view(), (line) -> sink.push(line),
+                  (line) -> noted.push(if line.starts_with(s"$root/") then line[s"$root/".bytes.len..<line.bytes.len] else line))
+    remove_dir_all(root).unwrap_or(())
+    notes
+end skw_explained
+
+// -- the matrix -----------------------------------------------------------------------------------
+
+// One task, parked on a waker `keep` stores, stepped through each way a waker reaches `step`; the
+// waker is called only after the executor's loop -- and the frame that built the closure -- is gone.
+private const skw_matrix: string = raw"""
+    import sysl.buf.{Buf, buf}
+
+    var tasks: [1]Option[Task[unit]] = [None]
+    var ready: Buf[usize] = buf()
+    var held: Buf[&Fn() -> unit] = buf()
+
+    struct Waker
+        f: &Fn() -> unit
+
+    keep(wake: &Fn() -> unit)
+        held.push(wake)
+
+    fire()
+        val now = held
+
+        held = buf()
+
+        for w in now do w()
+
+    drive(t: Task[unit], w: &Fn() -> unit) -> bool = step(t, w)
+
+    drive_tagged[T](t: Task[unit], tag: T, w: &Fn() -> unit) -> bool = step(t, w)
+
+    turn(mode: int, id: usize, t: Task[unit]) -> bool
+        mode match
+            0 -> step(t, () -> ready.push(id))
+            1 -> drive(t, () -> ready.push(id))
+            2 ->
+                val w: &Fn() -> unit = () -> ready.push(id)
+                step(t, w)
+            3 ->
+                val k = Waker(() -> ready.push(id))
+                step(t, k.f)
+            _ -> drive_tagged(t, "tag", () -> ready.push(id))
+
+    run(mode: int)
+        var i: usize = 0
+
+        while i < ready.len()
+            val id = ready[i]
+
+            i += 1
+
+            tasks[id] match
+                Some(t) -> if turn(mode, id, t) then tasks[id] = None
+                None -> ()
+
+        ready.clear()
+    end run
+
+    async waits(n: int)
+        print(s"task $n parks")
+        await park(keep)
+        print(s"task $n woke")
+
+    main()
+        for mode in 0..<5
+            tasks[0] = Some(waits(mode))
+            ready.push(0)
+            run(mode)
+            fire()
+            run(mode)
+
+        ready = buf()
+    """
+
+private const skw_matrix_output: string =
+    "task 0 parks\ntask 0 woke\ntask 1 parks\ntask 1 woke\ntask 2 parks\ntask 2 woke\n" +
+    "task 3 parks\ntask 3 woke\ntask 4 parks\ntask 4 woke\n"
+
+@test("a waker handed to 'step' outlives the loop that built it, each way it gets there, on the counted heap")
+skw_wakers_outlive_their_frame()
+    if !enm_ready() then return
+
+    val got = skw_run(skw_matrix, true, "")
+
+    assert_eq(got.0, skw_matrix_output)
+    assert_eq(got.1, "")
+
+@test("and under AddressSanitizer: instrumented, and no waker read from a dead frame")
+skw_wakers_run_clean_under_asan()
+    if !enm_ready() then return
+
+    val got = skw_run(skw_matrix, false, "-fsanitize=address -g")
+
+    assert(got.2 > 0, s"not instrumented: ${got.0}")
+    assert_eq(got.0, skw_matrix_output)
+    assert_eq(got.1, "")
+
+@test("--explain-escapes says each waker is on the heap because 'step' keeps it, directly or through a callee")
+skw_explain_names_step()
+    val notes = skw_explained(skw_matrix)
+
+    if xvr_no_library() then return
+
+    var said = ""
+
+    for line in notes
+        said = said + line + "\n"
+
+    val direct = "because it is handed to 'step' on line 26 as the waker, which the task keeps for its parks"
+
+    assert(said.contains(s"main.sysl:26:22: a closure erased to '&Fn() -> unit' is boxed on the heap, $direct"), said)
+    assert(said.contains("main.sysl:27:23: a closure erased to '&Fn() -> unit' is boxed on the heap, because it is " +
+                         "handed to 'drive' on line 27, which keeps its parameter 'w' (it is the waker handed to " +
+                         "'step', which the task keeps for its parks)"), said)
+    assert(said.contains("main.sysl:29:36: a closure erased to '&Fn() -> unit' is boxed on the heap, because it is " +
+                         "handed to 'step' on line 30 as the waker"), said)
+    assert(said.contains("main.sysl:32:27: a closure erased to '&Fn() -> unit' is boxed on the heap, because it is " +
+                         "handed to 'step' on line 33 as the waker"), said)
+    assert(said.contains("main.sysl:34:37: a closure erased to '&Fn() -> unit' is boxed on the heap, because it is " +
+                         "handed to 'drive_tagged' on line 34, which keeps its parameter 'w'"), said)
+
+// -- the error path -------------------------------------------------------------------------------
+
+@test("a waker that writes a 'var' it captures is refused: 'step' keeps it, so it holds a copy")
+skw_waker_write_is_refused()
+    if !enm_ready() then return
+
+    val said = enm_err(raw"""
+        keep(wake: &Fn() -> unit) = ()
+
+        async waits()
+            await park(keep)
+
+        main()
+            var woke = 0
+            val t = waits()
+
+            step(t, () -> woke += 1)
+            print(woke)
+        """)
+
+    assert(said.contains("this closure captures by value, since it is handed to 'step' on line 10 as the waker, " +
+                         "which the task keeps for its parks, so it holds a copy of 'woke'"), said)
+
+@test("a waker that only reads a 'var' is accepted, and sees the value it had when 'step' was called")
+skw_waker_reading_a_var_runs()
+    if !enm_ready() then return
+
+    val got = skw_run(raw"""
+        var held: Option[&Fn() -> unit] = None
+
+        keep(wake: &Fn() -> unit)
+            held = Some(wake)
+
+        async waits()
+            await park(keep)
+
+        main()
+            var n = 1
+            val t = waits()
+
+            step(t, () -> print(n))
+            n = 2
+            held match
+                Some(w) -> w()
+                None -> ()
+            held = None
+        """, true, "")
+
+    assert_eq(got.0, "1\n")
+    assert_eq(got.1, "")
