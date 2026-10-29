@@ -102,7 +102,8 @@ wraps mod 2⁵ exactly as `i32` wraps mod 2³². In a debug build — what `sysl
 — the same overflow is a bug, and it stops the program with a report naming the operation, its types
 and the line. The same holds of a unary `-` (negating `i8`'s −128) and of a written conversion that
 cannot hold its value (`u8(n)` with `n` at 300). The mode is never the reason a program is right:
-code that means to wrap says so.
+code that means to wrap says so — and a conversion that means the bit pattern is
+[`u8.wrap(n)`](/reference/expressions/#a-wrapping-conversion-keeps-the-bit-pattern), unchecked in every build.
 
 ```sysl
 var small: byte = 250

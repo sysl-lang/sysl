@@ -181,6 +181,103 @@ bmd_const_operand_is_checked()
     bmd_cell("const Base: u8 = 200\nprint(Base + 100)\n", "", "integer overflow: byte + byte (main.sysl:2:7)\n",
              "44\n")
 
+// -- `T.wrap(x)`, the conversion that keeps the bit pattern ------------------------------------------
+
+@test("u64.wrap of a negative value is its two's-complement pattern in both modes, where u64() of it is checked")
+bmd_wrap_beside_the_checked_conversion()
+    bmd_cell("var n = -1\nprint(u64.wrap(n))\nprint(u64(n))\n", "18446744073709551615\n",
+             "integer overflow: ulong(int) (main.sysl:3:7)\n", "18446744073709551615\n")
+
+@test("wrap narrows to the low bits, at every pairing of the two signs")
+bmd_wrap_narrows()
+    bmd_same("var n = 300\nvar m = 200\nvar k = -1\nvar big: u64 = 18446744073709551615\n" +
+             "print(u8.wrap(n), i8.wrap(m), u8.wrap(k), i8.wrap(big), u32.wrap(big), i16.wrap(k))\n",
+             "44 -56 255 -1 4294967295 -1\n")
+
+@test("wrap widens by the source's signedness: a signed source sign-extends, an unsigned one zero-extends")
+bmd_wrap_widens_by_the_source()
+    bmd_same("var s: i8 = -1\nvar u: u8 = 255\n" +
+             "print(u64.wrap(s), i64.wrap(u), u16.wrap(s), i64.wrap(s), u64.wrap(u))\n",
+             "18446744073709551615 255 65535 -1 255\n")
+
+@test("wrap at the same width reinterprets the sign, both ways")
+bmd_wrap_same_width()
+    bmd_same("var a: i64 = -1\nvar b: u64 = 18446744073709551615\nvar c: u32 = 2147483648\nvar d: i8 = -128\n" +
+             "print(u64.wrap(a), i64.wrap(b), i32.wrap(c), u8.wrap(d))\n",
+             "18446744073709551615 -1 -2147483648 128\n")
+
+@test("wrap at widths no machine has: u1, i1, u12, i12 and the 128-bit pair")
+bmd_wrap_odd_widths()
+    bmd_same("var three = 3\nvar k = -1\nvar f: u12 = 4095\nvar big: u128 = 18446744073709551615\n" +
+             "print(u1.wrap(three), i1.wrap(three), u12.wrap(k), i12.wrap(f), u12.wrap(5000))\n" +
+             "val all = u128.wrap(i128(-2))\nprint(all, i128.wrap(all), i128.wrap(big), u8.wrap(i128(-1)))\n",
+             "1 -1 4095 -1 904\n340282366920938463463374607431768211454 -2 18446744073709551615 255\n")
+
+@test("wrap over a constant folds to the reduced number, in a const, a module val and an expression")
+bmd_wrap_constants()
+    bmd_same("const K: u8 = u8.wrap(300)\nconst N: i16 = i16.wrap(65535)\nval J = i8.wrap(200)\n" +
+             "print(K, N, J, u12.wrap(-1), u64.wrap(-1))\n",
+             "44 -1 -56 4095 18446744073709551615\n")
+
+@test("wrap in a generic body, as the target and as the source, at each instantiation")
+bmd_wrap_generic()
+    bmd_same("low[T: Integer](x: T) -> u64 = u64.wrap(x)\nback[T: Integer](x: u64) -> T = T.wrap(x)\n\n" +
+             "print(low(i8(-3)), low(u128.wrap(-1)), back[i16](65535), back[u8](511), back[i128](7))\n",
+             "18446744073709551613 18446744073709551615 -1 255 7\n")
+
+@test("a type's own associated wrap is not taken over: the form is the integer types' alone")
+bmd_wrap_a_types_own()
+    bmd_same("struct S\n    n: int\n\nimpl S\n    wrap(n: int) -> int = n * 2\n\nprint(S.wrap(3))\n", "6\n")
+
+@test("wrap is refused without exactly one integer argument, at the instantiation that is not one, and on a float")
+bmd_wrap_refused()
+    if !bmd_ready() then return
+
+    val cases = [("print(u8.wrap())\n", "error: 'byte.wrap' takes exactly one integer argument"),
+                 ("print(u8.wrap(1, 2))\n", "error: 'byte.wrap' takes exactly one integer argument"),
+                 ("print(u8.wrap(1.5))\n", "error: 'byte.wrap' takes an integer, but the value has type real"),
+                 ("print(i16.wrap(true))\n", "error: 'short.wrap' takes an integer, but the value has type bool"),
+                 ("print(f64.wrap(1))\n", "error: real has no associated function 'wrap'"),
+                 ("bad[T](x: T) -> u8 = u8.wrap(x)\nprint(bad(\"s\"))\n",
+                  "error: 'byte.wrap' takes an integer, but the value has type string")]
+
+    for (text, said) in cases
+        val (state, _, err) = bmd_run(text, "--debug", DefaultOptimization)
+
+        assert(err.contains(said), s"$text: $err")
+        assert(!state.ok(), text)
+end bmd_wrap_refused
+
+@test("wrap's IR is the same instruction in a debug module as in a release one, with no check")
+bmd_wrap_ir_is_the_same_in_both_modes()
+    if !bmd_ready() then return
+
+    val program = [("main.sysl", "wide_to_u64(a: i64) -> u64 = u64.wrap(a)\n" +
+                    "narrow_to_i8(a: u128) -> i8 = i8.wrap(a)\nbyte_to_i64(a: u8) -> i64 = i64.wrap(a)\n" +
+                    "odd_to_i12(a: u64) -> i12 = i12.wrap(a)\nchecked_to_u8(a: int) -> u8 = u8(a)\n\n" +
+                    "print(wide_to_u64(-1), narrow_to_i8(255), byte_to_i64(1), odd_to_i12(1), checked_to_u8(1))\n")]
+
+    use_overflow_checks(false)
+
+    val release = xvr_ir(program)
+
+    use_overflow_checks(true)
+
+    val debug = xvr_ir(program)
+
+    use_overflow_checks(false)
+
+    for name in ["wide_to_u64", "narrow_to_i8", "byte_to_i64", "odd_to_i12"]
+        val r = bmd_body_of(release, name)
+
+        assert_eq(bmd_body_of(debug, name), r)
+        assert(!r.contains("with.overflow") && !r.contains("call "), r)
+
+    assert(bmd_body_of(release, "narrow_to_i8").contains("trunc i128"), release)
+    assert(bmd_body_of(release, "byte_to_i64").contains("zext i8"), release)
+    assert(bmd_body_of(debug, "checked_to_u8") != bmd_body_of(release, "checked_to_u8"), debug)
+end bmd_wrap_ir_is_the_same_in_both_modes
+
 // -- where the operation is written ------------------------------------------------------------------
 
 @test("a generic body instantiated twice is checked at each instantiation, the one that overflows stopping")

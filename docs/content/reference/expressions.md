@@ -1652,7 +1652,8 @@ print(byte(n & 0xff), real(n), u32(c), int(3.9))
 value where the target holds it.** Where the target does not, a release build keeps the low bits
 (`byte(300)` is 44, `u32` of −1 is 4294967295), which is defined, and a debug build stops the
 program, as an overflowing `+` does: `integer overflow: byte(int) (main.sysl:3:7)`. To keep the low
-bits in every build, say so with a mask, which makes the value fit — `byte(n & 0xff)` above.
+bits in every build, say so — with `u8.wrap(n)` below, or with a mask, which makes the value fit
+(`byte(n & 0xff)` above).
 
 ```sysl
 var n = 300
@@ -1668,6 +1669,43 @@ print(u8(n))
 **A conversion of a constant is worked out by the compiler, the same in every build**: `u32(-1)` is
 the bit pattern written down, and is 4294967295 in a debug build as in a `const`. A widening, which
 holds every value, is never checked.
+
+### A wrapping conversion keeps the bit pattern
+
+**`T.wrap(x)` converts an integer to the integer type `T` by its bit pattern, and is never checked, in
+any build.** Where `T` is narrower it keeps the low bits; where it is wider the value is extended as
+**the source's** signedness says — a signed source copies its sign bit up, an unsigned one fills with
+zeros; at the same width it reads the same bits at the other sign. It is what a hash, a checksum or
+a two's-complement trick means by a conversion, where the plain `u64(x)` means "this value, which
+fits". Any width and sign go either way — `u12`, `i128` — and the argument is any integer.
+
+```sysl
+var n = 300
+var k = -1
+var s: i8 = -1
+var u: u8 = 255
+
+print(u8.wrap(n), u64.wrap(k), i8.wrap(u))
+print(u16.wrap(s), i64.wrap(u), u12.wrap(k))
+```
+
+```output
+44 18446744073709551615 -1
+65535 255 4095
+```
+
+Over a constant it folds, so `const Mask: u8 = u8.wrap(300)` is 44. In a generic body the target may
+be the parameter, `T.wrap(x)` where `T: Integer`, and the row is chosen at the instantiation. The
+argument has to be an integer — a float is converted by the plain call, which saturates — and the
+name in front has to be an integer type:
+
+```sysl
+print(u8.wrap(1.5))
+```
+
+```error
+'byte.wrap' takes an integer, but the value has type real
+```
 
 **A float read as an integer saturates.** The value is truncated toward zero, and where that does not
 fit the width it comes to the width's nearest end: anything above `i32::Max` is `i32::Max`, anything
