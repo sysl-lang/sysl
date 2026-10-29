@@ -1285,7 +1285,8 @@ print(Lamp(1, Pin(true)).to_json())
 **A derivation reaches the type's private fields.** `self.(f)` on a private field is otherwise
 refused outside the type's own file; naming the trait in `derives` is the type author's opt-in.
 
-A trait with no `derive` member cannot be derived, and is implemented with an `impl` block:
+A trait with no `derive` member — and none among the traits it requires (§ "A trait that joins
+others derives what it requires") — cannot be derived, and is implemented with an `impl` block:
 
 ```sysl
 trait Show
@@ -1482,6 +1483,108 @@ print(1)
 
 A body with no receiver has no `self` to read; naming one is refused at the `derives` that asked for
 the copy, as any mistake in a derived body is.
+
+### A trait that joins others derives what it requires
+
+A trait with no `derive` member of its own may still be named in `derives` when **what it requires
+does** carry them: `trait Codec: Encode + Decode` asks for both, so `derives Codec` derives `Encode`
+and `Decode` and gives `Codec` the empty `impl` a reader would have written. Requirements are
+followed through every trait that only joins others, and each trait is derived once however many
+paths reach it:
+
+```sysl
+trait Encode
+    encode(self) -> string
+
+    derive[T] encode(self: T) -> string
+        var out = T::BaseName
+
+        for const f in T::Fields
+            out = out + " " + self.(f).encode()
+
+        out
+
+impl Encode for int
+    encode(self) -> string = s"$self"
+
+trait Decode
+    decode(n: *int) -> Self
+
+    derive[T] decode(n: *int) -> T
+        var out: T
+
+        for const f in T::Fields
+            out.(f) = field[f::Type](n)
+
+        out
+
+field[U: Decode](n: *int) -> U = U.decode(n)
+
+impl Decode for int
+    decode(n: *int) -> int
+        *n += 1
+        *n
+
+trait Codec: Encode + Decode
+
+struct Pt derives Codec
+    x: int
+    y: int
+
+struct Box[T] derives Codec
+    v: T
+
+round[T: Codec](v: T, n: *int) -> string = v.encode() + " /" + T.decode(n).encode()
+
+var n = 0
+print(round(Pt(5, 6), &n))
+print(Box(Pt(7, 8)).encode(), Box[int].decode(&n).v)
+```
+
+```output
+Pt 5 6 /Pt 1 2
+Box Pt 7 8 3
+```
+
+A generic type's parameters are bound by each trait's own block — `Box[int]` is `Encode` and `Decode`
+though `int` is never `Codec`. A required trait that reaches no `derive` member is the type's to
+implement, and the supertrait check names it (`Debug` is never asked for: every type has one). A
+joining trait that reaches none at all is refused as any trait without a `derive` member is.
+
+**A type has one implementation of a trait**, so a trait the joining one would derive and the type
+also implements by hand is refused at the clause, which names what is left to derive:
+
+```sysl
+trait Encode
+    encode(self) -> string
+
+    derive[T] encode(self: T) -> string = T::BaseName
+
+trait Decode
+    decode() -> Self
+
+    derive[T] decode() -> T
+        var out: T
+
+        out
+
+trait Codec: Encode + Decode
+
+struct H derives Codec
+    x: int
+
+impl Encode for H
+    encode(self) -> string = "by hand"
+
+print(1)
+```
+
+```error
+'Codec' would derive 'Encode' for H, which already has an 'impl Encode' written by hand — a type has one implementation of a trait. To derive the rest, name the others instead ('derives Decode') and keep the 'impl'
+```
+
+A trait the clause names outright and also reaches through a joining one is refused at its name,
+as a trait named twice is — `derives Codec, Encode` is told to drop `Encode`.
 
 ### Order is declaration order
 
