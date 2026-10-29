@@ -1,0 +1,305 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_temp_dir, remove_dir_all, write_text}
+import sysl.process.{capture, Status}
+import sysl.text.Search
+
+// A `Buf` read through a pointer takes no snapshot of the buffer's storage, even in a program whose
+// callbacks release -- so a small accessor over one stays small enough for LLVM to inline
+// (`borrowing.sysl`'s `sealed_callees`).
+//
+// What this pins down is slate's `peek_on(vm: *Machine, back: usize) -> Value =
+// vm.stack.at(vm.stack.len() - 1 - back)`. `Buf.at` reaches the bounds failure through `index_past`,
+// which a program with an `@export` that releases used to distrust -- and then `Buf.at` copied its
+// `BufCore` (a count taken and given back on the storage, and a call to the reaper) around the read.
+// That put `peek_on` at an inline cost of 250, one call argument over the line once `@track_caller`
+// handed `index_past` a location, and slate's dispatch loop called it 54 times instead of 21.
+// `index_past` answers `never` and is handed two counts, so it needs no trust: the copy is gone and
+// the accessor costs 155.
+//
+// The axes: what C can reach (an export that releases, or none); how the buffer is read (`at`, `b[i]`,
+// and the writes `set`, `insert`, `remove` beside them); where it lies (behind a pointer, in a global);
+// and what is asked (the lowered text, what clang's `-O2` inliner leaves, and what a built program
+// prints when the index is past the end). Not written: `Frozen`, `Deque` and `Ring` report through the
+// same `index_past`, so `Buf` is the cell for all four; the build mode moves no count operation.
+
+private var sea_library_cache: Buf[Program] = buf()
+private var sea_library_read: bool = false
+
+private sea_library() -> Buf[Program]
+    if sea_library_read then return sea_library_cache
+
+    sea_library_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> sea_library_cache = units
+
+    sea_library_cache
+end sea_library
+
+// The LLVM text of the whole program, or the first thing it was refused with; "skipped" where the
+// standard module's source is not here.
+private sea_ir(text: string) -> string
+    if sea_library().is_empty() then return "skipped"
+
+    val parsed = parse(source_of("t.sysl", text))
+
+    if !parsed.ok() then return parsed.first().message
+
+    var units: Buf[Program] = buf()
+
+    for item in sea_library()
+        units.push(item)
+
+    units.push(parsed.program)
+
+    val done = analyze_bodies(units, host_target())
+
+    if !done.reported.is_empty() then return done.reported.at(0).diag.message
+
+    val whole = program_of(done, "")
+    val promotions = post_analysis_checks(done.an, whole, buf())
+    val kept = prune(strip_tests(whole), program_own(units))
+
+    ir_print_module(codegen_with_gaps(kept, host_target(), promotions).0)
+end sea_ir
+
+// The text of the function laid down as `symbol` (as written, or as a root function's symbol).
+private sea_func(ir: string, symbol: string) -> string
+    for item in func_texts(ir)
+        if names_as_written(item.0, symbol) then return item.1
+
+    s"no function '$symbol'"
+end sea_func
+
+// The program's IR through clang at `-O2`, or `None` where there is no clang.
+private sea_at_o2(ir: string) -> Option[string]
+    if !clang_available() then return None
+
+    val dir = make_temp_dir("sysl-sea").unwrap()
+    val file = s"$dir/t.ll"
+
+    write_text(file, ir).unwrap()
+
+    val got = capture("clang", ["-O2", "-S", "-emit-llvm", "-o", "-", file], "", [], true).unwrap()
+
+    remove_dir_all(dir).unwrap_or(())
+    assert(got.status.ok(), s"clang refused the emitted IR:\n${got.err.unwrap_or("")}")
+    Some(got.text)
+end sea_at_o2
+
+// Every line of `text` that calls something named `part`.
+private sea_calls(text: string, part: string) -> int
+    var n = 0
+
+    for line in lines_of(text)
+        if line.contains("call ") && line.contains(part) then n += 1
+
+    n
+end sea_calls
+
+// The body of the `define` whose line names `part`, in clang's output.
+private sea_body(text: string, part: string) -> string
+    var body = ""
+    var inside = false
+
+    for line in lines_of(text)
+        if !inside && line.starts_with("define") && line.contains(part) then inside = true
+
+        if inside
+            if line == "}" then return body
+
+            body = body + line + "\n"
+
+    body
+end sea_body
+
+// An interpreter's stack, read through a pointer the way slate's `peek_on` reads it. `extra` is
+// appended: an `@export` that releases, or nothing.
+private sea_program(extra: string) -> string = raw"""
+    import sysl.buf.{Buf, buf}
+
+    enum Value
+        Null
+        Int(v: long)
+
+    struct Machine
+        stack: Buf[Value]
+        n: int
+
+    var The: Machine = Machine(buf(), 0)
+
+    peek_on(vm: *Machine, back: usize) -> Value = vm.stack.at(vm.stack.len() - 1 - back)
+
+    @noinline
+    run(vm: *Machine, code: Buf[int]) -> long
+        var s: long = 0
+
+        for pc in 0..<code.len()
+            val k = usize(code.at(pc))
+
+            peek_on(vm, k) match
+                Int(v) -> s += v
+                Null -> s += 1
+            peek_on(vm, 0) match
+                Int(v) -> s ^= v
+                Null -> s += 3
+            peek_on(vm, 1) match
+                Int(v) -> s |= v
+                Null -> s += 4
+
+        s
+
+    third(vm: *Machine) -> Value = vm.stack[2]
+
+    poke(vm: *Machine, v: Value)
+        vm.stack.set(0, v)
+        vm.stack.insert(1, v)
+        _ = vm.stack.remove(2)
+
+    main()
+        The.stack.push(Int(3))
+        The.stack.push(Int(4))
+        The.stack.push(Null)
+
+        var code: Buf[int] = buf()
+
+        for i in 0..<4
+            code.push(i % 2)
+
+        poke(&The, Int(5))
+        print(run(&The, code))
+
+        third(&The) match
+            Int(v) -> print(v)
+            Null -> print("null")
+    """ + extra
+
+private sea_releasing() -> string = raw"""
+
+    var Spare: Buf[int] = buf()
+
+    @export("sea_reset")
+    reset()
+        Spare = buf()
+    """
+
+// Each member a read or a write of a `Buf[Value]` goes through, and `at` on the `Buf[int]` of codes,
+// takes no count on the storage it reads: no copy of its `BufCore`, no dispose.
+private sea_no_snapshots(ir: string)
+    for name in ["sysl.buf$Buf.at.Value", "sysl.buf$Buf.at.int", "sysl.buf$Buf.index_place.Value",
+                 "sysl.buf$Buf.set.Value", "sysl.buf$Buf.insert.Value", "sysl.buf$Buf.remove.Value"]
+        val body = sea_func(ir, name)
+
+        assert(body.starts_with("define"), body)
+        assert_eq(body.count_of("@arc.copy."), 0, body)
+        assert_eq(body.count_of("@arc.dispose."), 0, body)
+
+@test("a Buf read through a pointer copies none of its storage, beside an export that releases")
+sea_no_storage_snapshot()
+    val ir = sea_ir(sea_program(sea_releasing()))
+
+    if ir == "skipped" then return
+
+    // `at`, `b[i]`, `set`, `insert` and `remove` all reach `index_past` and nothing else that could
+    // release. `at` used to copy its `BufCore` around the read here.
+    sea_no_snapshots(ir)
+
+@test("with no export, the same program copies no storage either")
+sea_no_export_no_snapshot()
+    val ir = sea_ir(sea_program(""))
+
+    if ir == "skipped" then return
+
+    sea_no_snapshots(ir)
+
+@test("clang's -O2 inliner absorbs the stack accessor at every call, beside an export that releases")
+sea_accessor_inlined()
+    val ir = sea_ir(sea_program(sea_releasing()))
+
+    if ir == "skipped" then return
+
+    sea_at_o2(ir) match
+        None -> print("skipped: clang is not installed, so there is no optimizer to ask")
+        Some(out) ->
+            val run = sea_body(out, "run$$sysl")
+
+            assert(run.starts_with("define"), out)
+            assert_eq(sea_calls(run, "peek_on"), 0, run)
+
+@test("and with no export, where it always was")
+sea_accessor_inlined_no_export()
+    val ir = sea_ir(sea_program(""))
+
+    if ir == "skipped" then return
+
+    sea_at_o2(ir) match
+        None -> print("skipped: clang is not installed, so there is no optimizer to ask")
+        Some(out) ->
+            val run = sea_body(out, "run$$sysl")
+
+            assert(run.starts_with("define"), out)
+            assert_eq(sea_calls(run, "peek_on"), 0, run)
+
+// -- what a built program says ---------------------------------------------------------------------------
+
+// What a program prints on standard error and the status it ends with, built at `-O2`.
+private sea_run(program: string) -> (string, int)
+    val root = make_temp_dir("sysl-sea").unwrap()
+
+    write_text(s"$root/main.sysl", program).unwrap()
+
+    val exe = s"$root/built"
+    val made = build_native_program(s"$root/main.sysl", None, None, "2", Some(exe))
+
+    made match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (s"it did not build: ${failure_text(why)}", -1)
+        Ok(_) -> ()
+
+    val ran = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    ran match
+        Err(_) -> ("the program that was built could not be run", -1)
+        Ok(o) -> o.status match
+            Status.Exited(c) -> (o.err.unwrap_or(""), c)
+            _ -> (o.err.unwrap_or(""), -2)
+end sea_run
+
+@test("an index past the end, through the inlined accessor, still names the accessor's line and traps")
+sea_past_the_end_names_the_line()
+    if !std_root().is_ok() || !clang_available() then return
+
+    val program = raw"""
+        import sysl.buf.{Buf, buf}
+
+        struct Machine
+            stack: Buf[int]
+
+        var The: Machine = Machine(buf())
+
+        peek_on(vm: *Machine, back: usize) -> int = vm.stack.at(back)
+
+        @export("sea_reset")
+        reset()
+            The = Machine(buf())
+
+        main()
+            The.stack.push(1)
+            print(peek_on(&The, 0))
+            print(peek_on(&The, 5))
+        """
+    val got = sea_run(program)
+
+    assert(got.0.contains("main.sysl:8:"), got.0)
+    assert(got.0.contains("5"), got.0)
+    assert_eq(got.1, -2, got.0)
