@@ -280,7 +280,7 @@ save("out.txt")
 ```
 
 ```
-warning: this 'sysl.Result[unit, sysl.fs.IoError]' is dropped unread, so a failure it carries goes
+warning: this 'Result[unit, IoError]' is dropped unread, so a failure it carries goes
 unseen — handle it ('?', 'match', '.unwrap()'), or write '_ = …' to drop it on purpose
 ```
 
