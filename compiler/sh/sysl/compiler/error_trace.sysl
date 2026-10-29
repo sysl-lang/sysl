@@ -23,9 +23,10 @@ import sysl.math.bigint.from_int
 //   once the value is built, wherever the constructor is lowered (`gen_expr`, `gen_into`, and
 //   `gen_around` for a result built in the caller's storage).
 //
-// **A handled failure leaves the trace -- pruning.** A statement that calls something answering a
-// `Result` (or awaits a task that does) without handing the answer on with `?` reads the trace's
-// length before it runs and writes it back when it completes. A `return` from inside it is not
+// **A handled failure leaves the trace -- pruning.** The innermost statement holding a call to
+// something answering a `Result` (or an await of a task that does) whose answer it neither hands on
+// with `?` nor returns reads the trace's length before it runs and writes it back when it completes;
+// the statements around it, finding the trace as it was, do nothing. A `return` from inside it is not
 // completing it, so `Err(e) -> return Err(Wrap(e))` keeps the inner chain; a `break` or `continue` is,
 // and puts the trace back to where the first statement it leaves found it. This is the one cost on a
 // success path: a call that reads the length and one that writes it, per such statement.
@@ -257,13 +258,22 @@ private reset_to(e: *Emit, n: Val)
     emit(e, ir_call(None, LVoid, VGlobal(ResetSymbol), args))
 end reset_to
 
-// What a walk of one statement found: an answer that may have failed and is not handed on by a `?`.
-// The operands of the `?`s are noted as the walk passes them, which is before it reaches them.
+// What a walk of one statement found: every call in it answering a `Result`, those of them a `?` hands
+// on, and the stretch of text its expressions cover. The operands of the `?`s are noted as the walk
+// passes them, which is before it reaches them.
 struct Handled
-    found: bool
     passed: Set[string]
+    answers: Buf[string]
+    lo: usize
+    hi: usize
+    any: bool
 
     note(*self, x: TExpr)
+        if !self.any || x.span.start < self.lo then self.lo = x.span.start
+        if !self.any || x.span.end > self.hi then self.hi = x.span.end
+
+        self.any = true
+
         *x.kind match
             TTry(operand, _, _, _, _, _, _) -> self.passed.add(site_key(operand.span))
             TCall(_, _, ty, _) -> self.answer(x, ty)
@@ -274,23 +284,96 @@ struct Handled
             _ -> ()
 
     answer(*self, x: TExpr, ty: Type)
-        if is_result_type(ty) && !self.passed.has(site_key(x.span)) then self.found = true
+        if is_result_type(ty) then self.answers.push(site_key(x.span))
 end Handled
 
-// Whether `s` handles a failure: it is one that completes, and it calls something answering a
-// `Result` whose answer no `?` hands on. A `return` never completes; a `defer` runs its statements
+private fresh_handled() -> &Handled = Handled(set(), buf(), 0, 0, false)
+
+// The calls that belong to a statement nested in the one being asked about rather than to it. The
+// first statement the walk is told of is the one asked about itself.
+//
+// **Each expression is walked here once.** The walk tells of a statement before the ones inside it,
+// so a statement lying within the text of the last one walked here is inside it, and its calls are
+// already kept. Asking every nested statement afresh made a body cost its depth squared. Text is
+// only ever the test for skipping, so a statement whose spans mislead is walked, never lost.
+struct InnerCalls
+    entered: bool
+    keys: Set[string]
+    lo: usize
+    hi: usize
+
+    note(*self, t: TStmt)
+        if !self.entered
+            self.entered = true
+            return
+
+        // A `break` or `continue` completes the statements it leaves, so what it calls is theirs.
+        t match
+            TBreak(_, _) -> return
+            TContinue(_) -> return
+            _ -> ()
+
+        val lead = lead_expr(t)
+
+        if lead.is_some() && lead.unwrap().span.start >= self.lo && lead.unwrap().span.end <= self.hi
+            return
+
+        val h = fresh_handled()
+
+        walk_stmt(t, expr_walk(false, x -> h.note(x)))
+
+        for key in h.answers
+            self.keys.add(key)
+
+        if h.any
+            self.lo = h.lo
+            self.hi = h.hi
+    end note
+end InnerCalls
+
+// The first expression a walk of `s` reaches, where it has one.
+private lead_expr(s: TStmt) -> Option[TExpr] = s match
+    TVarDecl(_, _, init, _) -> Some(init)
+    TExprStmt(x) -> Some(x)
+    TInvariant(cond, _) -> Some(cond)
+    TVariantCheck(_, _, x) -> Some(x)
+    TRefDecl(_, _, place) -> Some(place)
+    TWriteStmt(w) -> Some(w.place)
+    TReturn(value) -> value
+    TBecome(call) -> Some(call)
+    _ -> None
+
+// Whether `s` is a statement that completes: a `return` never does, nor a `break` or `continue`
+// (each puts the trace back to its loop's first mark itself), and a `defer` runs its statements
 // elsewhere, each pruned there.
+private completes(s: TStmt) -> bool = s match
+    TReturn(_) -> false
+    TBecome(_) -> false
+    TBreak(_, _) -> false
+    TContinue(_) -> false
+    TDefer(_, _) -> false
+    _ -> true
+
+// Whether `s` handles a failure: it is one that completes, and it HOLDS a call answering a `Result`
+// whose answer no `?` hands on -- holds it itself, not inside a statement nested in it.
+//
+// **A call belongs to the innermost statement holding it**, which is the one that prunes it. That
+// statement puts the trace back when it completes, so the statements around it find the trace as long
+// as it was when it began and have nothing of that call's to prune: a dispatch `match` whose one
+// handling arm handles in a statement of its own pays nothing on the arms that do not, and a loop
+// whose body handles pays per handling statement, never per turn for the loop as a whole. A call in a
+// `return` or `become` is the function's answer, handed on and never pruned. A `break` or `continue`
+// is the exception: it completes the statements it leaves, so a call in its value is theirs.
 private handles_failure(s: TStmt) -> bool
-    s match
-        TReturn(_) -> return false
-        TBecome(_) -> return false
-        TBreak(_, _) -> return false
-        TContinue(_) -> return false
-        TDefer(_, _) -> return false
-        _ -> ()
+    if !completes(s) then return false
 
-    val h: &Handled = Handled(false, set())
+    val h = fresh_handled()
+    val n: &InnerCalls = InnerCalls(false, set(), 1, 0)
 
-    walk_stmt(s, expr_walk(false, x -> h.note(x)))
-    h.found
+    walk_stmt(s, TWalk(false, x -> h.note(x), w -> (), t -> n.note(t)))
+
+    for key in h.answers
+        if !h.passed.has(key) && !n.keys.has(key) then return true
+
+    false
 end handles_failure

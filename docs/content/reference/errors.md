@@ -595,9 +595,9 @@ prints on a board with nothing to symbolize it against.
 
 ### A failure that is handled leaves the trace
 
-A statement that calls something answering a `Result`, and does not hand the answer on with `?` or
-`return`, **puts the trace back as it found it when it completes**. The failure it handled is gone
-before the next one starts:
+The innermost statement holding a call to something answering a `Result`, where the answer is not
+handed on with `?` or `return`, **puts the trace back as it found it when it completes**. The failure
+it handled is gone before the next one starts:
 
 ```sysl
 import sysl.debug.error_trace
@@ -626,6 +626,11 @@ A `return` from inside such a statement is not completing it, so
 `Err(e) -> return Err(Wrapped(e))` keeps the chain it is wrapping and adds its own origin to it. A
 `break` or a `continue` does complete it. The one gap the rule leaves is a result put in a `val` on
 one line and returned on a later one: the statement holding the call completed in between.
+
+**That is the whole cost on a path that succeeds**: a read of the trace's length before such a
+statement and a write after it. A `?` whose answer is `Ok` costs nothing, and neither do the
+statements around a handling one -- a loop over instructions whose one handling arm handles in a
+statement of its own pays on that arm alone, never once a turn.
 
 ### Thirty-two sites, per thread
 
