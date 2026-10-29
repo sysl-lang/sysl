@@ -10,9 +10,11 @@ reference is made, when storage moves without being asked, and where the guarant
 
 **If you do not write `*T`, you cannot segfault.** The safe subset — values, references, weak
 references, arrays, and slices — has no use-after-free, no null dereference, no out-of-bounds access,
-and no dangling pointer. The single unsafe primitive is the raw pointer, and it is **greppable**: a
-program's exposure to C's hazards is exactly the lines with a `*` in the type. A driver has them and
-an application does not, and you can tell which by looking.
+and no dangling pointer. The single unsafe primitive over memory is the raw pointer, and it is
+**greppable**: a program's exposure to C's hazards is exactly the lines with a `*` in the type, plus
+the subscripts it has asked by name not to check — `get_unchecked`, `set_unchecked` and an
+[`@unchecked`](/reference/arrays/#unchecked-access) block. A driver has them and an application does
+not, and you can tell which by looking.
 
 ## The three modes
 
@@ -1214,8 +1216,9 @@ The out-of-bounds hazard is governed by whether a value **carries its length**, 
 where it was allocated:
 
 - **arrays and slices carry their length**, so indexing is bounds-checked in every context — hosted
-  or allocator-free, over static, stack, or heap memory;
-- **`*T` carries no length**, so it is the one unchecked primitive. `p[i]` reads the `i`th element
+  or allocator-free, over static, stack, or heap memory — except where the program has asked by name
+  for the check to be left out ([unchecked access](/reference/arrays/#unchecked-access));
+- **`*T` carries no length**, so it is the one primitive that cannot be checked. `p[i]` reads the `i`th element
   and `p[0..<n]` views `n` of them, both exactly as C does and both unchecked, because there is no
   length to check against and supplying one is the programmer's assertion. A pointer to something
   with a subscript of its own — a `*[N]T`, or a `*Buf[T]` and any other type indexed through a trait

@@ -3138,6 +3138,42 @@ operations are refused there. On a vector, lane-wise operations are strict, but 
 `v.sum()`, `v.min()` — combines the lanes in an order the target chooses and has no strict form, so
 inside a strict body it is refused, and the lanes are read and combined one by one instead.
 
+## `@unchecked` — a block whose subscripts are not bounds-checked
+
+`@unchecked` is the one annotation that marks a **block** rather than a declaration: written on a
+line of its own, it covers the statements indented under it, and every subscript written there — of
+an array, a slice, or a container such as `Buf` that says how — is read with no bounds check.
+
+```sysl
+var squares = [0; 5]
+
+@unchecked
+    for i in 0..<5
+        squares[i] = i * i
+
+print(squares)
+```
+
+```output
+[0, 1, 4, 9, 16]
+```
+
+The block is lexical: a closure or a nested function written inside it is inside it, and one called
+from inside but written elsewhere is not. It takes no argument, and it does not mark a function, a
+member or a single statement on the same line:
+
+```sysl
+@unchecked
+first(xs: []int) -> int = xs[0]
+```
+
+```error
+'@unchecked' marks a block
+```
+
+What it does to a subscript, `get_unchecked` and `set_unchecked` for one subscript at a time, and what
+stays checked are in [arrays](/reference/arrays/#unchecked-access).
+
 ## `@disjoint` — parameters whose memory nothing else reaches
 
 A kernel that writes through one view and reads through another is the loop a vectorizer exists

@@ -643,6 +643,71 @@ it is. **A generic decides by the bound, not by the instantiation**: in `nth[T](
 while a `[C: Index[usize, int]](p: *C)` reads `p[i]` as the container's element at every
 instantiation.
 
+### Unchecked access
+
+Where a program has proved an index is inside and the optimizer cannot see the proof, the check can
+be left out by name. `xs.get_unchecked(i)` reads the `i`th element and `xs.set_unchecked(i, v)`
+writes it, on an array or a slice, with no test of `i` at all; everything else about the call —
+the element type, a `val` that may not be written, a [read-only view](#const-t-a-view-that-may-not-be-written) — is checked as a subscript is.
+
+```sysl
+val xs = [10, 20, 30]
+var ys = [0; 3]
+
+ys.set_unchecked(2, xs.get_unchecked(1))
+print(ys)
+```
+
+```output
+[0, 0, 20]
+```
+
+For a stretch of code rather than one subscript, `@unchecked` on a line of its own marks the block
+indented under it: every subscript written inside it is read with no bounds check.
+
+```sysl
+dot(a: []int, b: []int) -> int
+    var sum = 0
+    val n = if a.len < b.len then a.len else b.len
+
+    @unchecked
+        for i in 0..<n
+            sum += a[i] * b[i]
+
+    sum
+
+print(dot([1, 2, 3], [4, 5, 6, 7]))
+```
+
+```output
+32
+```
+
+**The block is lexical.** A closure or a nested function written inside it is inside it; one written
+outside and called from inside keeps its checks, and so does every subscript after the block ends. A
+[`Buf`](#growing-one), and any container whose subscript is its own, takes part through its
+`IndexPlace` implementation: inside the block `b[i]` is `b.index_place_unchecked(i)`, whose default
+is the checked `index_place`, so a container that has not said how to skip its test keeps it. `Buf`
+says how, and has `get_unchecked` and `set_unchecked` of its own.
+
+An index out of range in either form is not a trap: the read or write lands wherever the address
+falls, as it does through a [raw pointer](#a-raw-pointer-is-indexed-anyway). What the compiler
+evaluates while compiling still checks, so a constant that reads past the end is refused, block or
+not. `@unchecked` marks a block and nothing else:
+
+```sysl
+val xs = [1, 2, 3]
+
+@unchecked print(xs[0])
+```
+
+```error
+'@unchecked' marks a block: write it on a line of its own and indent the statements it covers under it
+```
+
+There is no `unsafe` block to stand them in: like `from_utf8_unchecked` and a raw pointer's `*`, the
+spelling is the marker a reader searches for.
+
 ### A type with no elements of its own is indexed through a trait
 
 Everything above is about the built-in subscript rather than about `[]` as a token. A user type — the
@@ -1394,8 +1459,6 @@ count cannot be made out of a non-atomic one at all: it is fixed when the object
 view claiming it would be reporting on another object's storage rather than describing itself. Rust
 divides the same properties the same way — `&[T]` carries writability in the reference, while
 `Rc<[T]>` against `Arc<[T]>` carries count discipline in the *owner's* type.
-
-**There is no unchecked index** for a hot loop. A `*T` is the way to write one.
 
 **There is no rectangular multi-dimensional type.** `[3][3]f64` is an array of arrays and works;
 there is no distinct type with one bounds check for two indexes.

@@ -20,7 +20,7 @@ were the middle.
 
 ## Index
 
-[`DebugDepth`](#debugdepth) [`esink`](#esink) [`sink`](#sink) [`assert`](#assert) [`assert_eq`](#assert_eq) [`assert_slice_eq`](#assert_slice_eq) [`cpu`](#cpu) [`cpu_count`](#cpu_count) [`debug_address`](#debug_address) [`debug_enter`](#debug_enter) [`debug_leave`](#debug_leave) [`debug_padded`](#debug_padded) [`debug_quoted`](#debug_quoted) [`debug_union`](#debug_union) [`display_bf16`](#display_bf16) [`display_bool`](#display_bool) [`display_char`](#display_char) [`display_digits`](#display_digits) [`display_f128`](#display_f128) [`display_f128_shortest`](#display_f128_shortest) [`display_f16`](#display_f16) [`display_f32`](#display_f32) [`display_f32_shortest`](#display_f32_shortest) [`display_fill`](#display_fill) [`display_int`](#display_int) [`display_pad`](#display_pad) [`display_real`](#display_real) [`display_real_shortest`](#display_real_shortest) [`display_str`](#display_str) [`display_uint`](#display_uint) [`encode_utf8`](#encode_utf8) [`eprints`](#eprints) [`eputbytes`](#eputbytes) [`flush`](#flush) [`hash_bool`](#hash_bool) [`hash_str`](#hash_str) [`hash_u128`](#hash_u128) [`hash_u64`](#hash_u64) [`os`](#os) [`panic`](#panic) [`printb`](#printb) [`printbf16`](#printbf16) [`printc`](#printc) [`printf16`](#printf16) [`printf32`](#printf32) [`printi`](#printi) [`printq`](#printq) [`printr`](#printr) [`prints`](#prints) [`printu`](#printu) [`putbytes`](#putbytes) [`stderr`](#stderr) [`stdout`](#stdout) [`trap`](#trap) [`exit`](#exit) [`ByAddress`](#byaddress) [`Counting`](#counting) [`Cpu`](#cpu-1) [`FormatSpec`](#formatspec) [`Kind`](#kind) [`Option`](#option) [`Os`](#os-1) [`Range`](#range) [`Result`](#result) [`Rounding`](#rounding) [`Stderr`](#stderr-1) [`Stdout`](#stdout-1) [`Add`](#add) [`AnyBits`](#anybits) [`BitAnd`](#bitand) [`BitOr`](#bitor) [`BitXor`](#bitxor) [`Debug`](#debug) [`Display`](#display) [`Div`](#div) [`Drop`](#drop) [`Eq`](#eq) [`Fallible`](#fallible) [`FloatBits`](#floatbits) [`Fn0`](#fn0) [`Fn1`](#fn1) [`Fn2`](#fn2) [`Fn3`](#fn3) [`Fn4`](#fn4) [`From`](#from) [`Hash`](#hash) [`Index`](#index) [`IndexPlace`](#indexplace) [`IndexSet`](#indexset) [`Integer`](#integer) [`Iterate`](#iterate) [`Mul`](#mul) [`Neg`](#neg) [`Not`](#not) [`One`](#one) [`Ord`](#ord) [`Rem`](#rem) [`Shl`](#shl) [`Shr`](#shr) [`Sub`](#sub) [`Walk`](#walk) [`Writer`](#writer) [`Zero`](#zero) [Debug for (..A)](#debug-for-a) [Debug for []T](#debug-for-t) [Debug for [N]T](#debug-for-nt) [Debug for bf16](#debug-for-bf16) [Debug for bool](#debug-for-bool) [Debug for char](#debug-for-char) [Debug for f128](#debug-for-f128) [Debug for f16](#debug-for-f16) [Debug for f32](#debug-for-f32) [Debug for Option[T]](#debug-for-optiont) [Debug for real](#debug-for-real) [Debug for Result[T, E]](#debug-for-resultt-e) [Debug for string](#debug-for-string) [Debug for T](#debug-for-t-1) [Debug for unit](#debug-for-unit) [Display for (..A)](#display-for-a) [Display for []T](#display-for-t) [Display for [N]T](#display-for-nt) [Display for bf16](#display-for-bf16) [Display for bool](#display-for-bool) [Display for char](#display-for-char) [Display for f128](#display-for-f128) [Display for f16](#display-for-f16) [Display for f32](#display-for-f32) [Display for Option[T]](#display-for-optiont) [Display for real](#display-for-real) [Display for Result[T, E]](#display-for-resultt-e) [Display for string](#display-for-string) [Display for T](#display-for-t-1) [Display for unit](#display-for-unit) [Eq for (..A)](#eq-for-a) [Eq for []T](#eq-for-t) [Eq for [N]T](#eq-for-nt) [Eq for ByAddress[T]](#eq-for-byaddresst) [Eq for Option[T]](#eq-for-optiont) [Eq for Result[T, E]](#eq-for-resultt-e) [Eq for unit](#eq-for-unit) [Fallible for Counting](#fallible-for-counting) [Fallible for Stderr](#fallible-for-stderr) [Fallible for Stdout](#fallible-for-stdout) [FloatBits for bf16](#floatbits-for-bf16) [FloatBits for f128](#floatbits-for-f128) [FloatBits for f16](#floatbits-for-f16) [FloatBits for f32](#floatbits-for-f32) [FloatBits for real](#floatbits-for-real) [Hash for (..A)](#hash-for-a) [Hash for [N]T](#hash-for-nt) [Hash for bool](#hash-for-bool) [Hash for ByAddress[T]](#hash-for-byaddresst) [Hash for char](#hash-for-char) [Hash for string](#hash-for-string) [Hash for T](#hash-for-t) [Hash for unit](#hash-for-unit) [Iterate for Range[T]](#iterate-for-ranget) [One for bf16](#one-for-bf16) [One for f16](#one-for-f16) [One for f32](#one-for-f32) [One for real](#one-for-real) [Ord for (..A)](#ord-for-a) [Ord for []T](#ord-for-t) [Ord for [N]T](#ord-for-nt) [Ord for unit](#ord-for-unit) [Writer for Counting](#writer-for-counting) [Writer for Stderr](#writer-for-stderr) [Writer for Stdout](#writer-for-stdout) [Zero for bf16](#zero-for-bf16) [Zero for f16](#zero-for-f16) [Zero for f32](#zero-for-f32) [Zero for real](#zero-for-real)
+[`DebugDepth`](#debugdepth) [`esink`](#esink) [`sink`](#sink) [`assert`](#assert) [`assert_eq`](#assert_eq) [`assert_slice_eq`](#assert_slice_eq) [`caller_location`](#caller_location) [`cpu`](#cpu) [`cpu_count`](#cpu_count) [`debug_address`](#debug_address) [`debug_enter`](#debug_enter) [`debug_leave`](#debug_leave) [`debug_padded`](#debug_padded) [`debug_quoted`](#debug_quoted) [`debug_union`](#debug_union) [`display_bf16`](#display_bf16) [`display_bool`](#display_bool) [`display_char`](#display_char) [`display_digits`](#display_digits) [`display_f128`](#display_f128) [`display_f128_shortest`](#display_f128_shortest) [`display_f16`](#display_f16) [`display_f32`](#display_f32) [`display_f32_shortest`](#display_f32_shortest) [`display_fill`](#display_fill) [`display_int`](#display_int) [`display_pad`](#display_pad) [`display_real`](#display_real) [`display_real_shortest`](#display_real_shortest) [`display_str`](#display_str) [`display_uint`](#display_uint) [`encode_utf8`](#encode_utf8) [`eprints`](#eprints) [`eputbytes`](#eputbytes) [`flush`](#flush) [`hash_bool`](#hash_bool) [`hash_str`](#hash_str) [`hash_u128`](#hash_u128) [`hash_u64`](#hash_u64) [`os`](#os) [`panic`](#panic) [`printb`](#printb) [`printbf16`](#printbf16) [`printc`](#printc) [`printf16`](#printf16) [`printf32`](#printf32) [`printi`](#printi) [`printq`](#printq) [`printr`](#printr) [`prints`](#prints) [`printu`](#printu) [`putbytes`](#putbytes) [`stderr`](#stderr) [`stdout`](#stdout) [`trap`](#trap) [`exit`](#exit) [`ByAddress`](#byaddress) [`Counting`](#counting) [`Cpu`](#cpu-1) [`FormatSpec`](#formatspec) [`Kind`](#kind) [`Location`](#location) [`Option`](#option) [`Os`](#os-1) [`Range`](#range) [`Result`](#result) [`Rounding`](#rounding) [`Stderr`](#stderr-1) [`Stdout`](#stdout-1) [`Add`](#add) [`AnyBits`](#anybits) [`BitAnd`](#bitand) [`BitOr`](#bitor) [`BitXor`](#bitxor) [`Checked`](#checked) [`Debug`](#debug) [`Display`](#display) [`Div`](#div) [`Drop`](#drop) [`Eq`](#eq) [`Fallible`](#fallible) [`FloatBits`](#floatbits) [`Fn0`](#fn0) [`Fn1`](#fn1) [`Fn2`](#fn2) [`Fn3`](#fn3) [`Fn4`](#fn4) [`From`](#from) [`Hash`](#hash) [`Index`](#index) [`IndexPlace`](#indexplace) [`IndexSet`](#indexset) [`Integer`](#integer) [`Iterate`](#iterate) [`Mul`](#mul) [`Neg`](#neg) [`Not`](#not) [`One`](#one) [`Ord`](#ord) [`Rem`](#rem) [`Shl`](#shl) [`Shr`](#shr) [`Sub`](#sub) [`Walk`](#walk) [`Writer`](#writer) [`Zero`](#zero) [Debug for (..A)](#debug-for-a) [Debug for []T](#debug-for-t) [Debug for [N]T](#debug-for-nt) [Debug for bf16](#debug-for-bf16) [Debug for bool](#debug-for-bool) [Debug for char](#debug-for-char) [Debug for f128](#debug-for-f128) [Debug for f16](#debug-for-f16) [Debug for f32](#debug-for-f32) [Debug for never](#debug-for-never) [Debug for Option[T]](#debug-for-optiont) [Debug for real](#debug-for-real) [Debug for Result[T, E]](#debug-for-resultt-e) [Debug for string](#debug-for-string) [Debug for T](#debug-for-t-1) [Debug for unit](#debug-for-unit) [Display for (..A)](#display-for-a) [Display for []T](#display-for-t) [Display for [N]T](#display-for-nt) [Display for bf16](#display-for-bf16) [Display for bool](#display-for-bool) [Display for char](#display-for-char) [Display for f128](#display-for-f128) [Display for f16](#display-for-f16) [Display for f32](#display-for-f32) [Display for Location](#display-for-location) [Display for never](#display-for-never) [Display for Option[T]](#display-for-optiont) [Display for real](#display-for-real) [Display for Result[T, E]](#display-for-resultt-e) [Display for string](#display-for-string) [Display for T](#display-for-t-1) [Display for unit](#display-for-unit) [Eq for (..A)](#eq-for-a) [Eq for []T](#eq-for-t) [Eq for [N]T](#eq-for-nt) [Eq for ByAddress[T]](#eq-for-byaddresst) [Eq for never](#eq-for-never) [Eq for Option[T]](#eq-for-optiont) [Eq for Result[T, E]](#eq-for-resultt-e) [Eq for unit](#eq-for-unit) [Fallible for Counting](#fallible-for-counting) [Fallible for Stderr](#fallible-for-stderr) [Fallible for Stdout](#fallible-for-stdout) [FloatBits for bf16](#floatbits-for-bf16) [FloatBits for f128](#floatbits-for-f128) [FloatBits for f16](#floatbits-for-f16) [FloatBits for f32](#floatbits-for-f32) [FloatBits for real](#floatbits-for-real) [Hash for (..A)](#hash-for-a) [Hash for [N]T](#hash-for-nt) [Hash for bool](#hash-for-bool) [Hash for ByAddress[T]](#hash-for-byaddresst) [Hash for char](#hash-for-char) [Hash for never](#hash-for-never) [Hash for string](#hash-for-string) [Hash for T](#hash-for-t) [Hash for unit](#hash-for-unit) [Iterate for Range[T]](#iterate-for-ranget) [One for bf16](#one-for-bf16) [One for f16](#one-for-f16) [One for f32](#one-for-f32) [One for real](#one-for-real) [Ord for (..A)](#ord-for-a) [Ord for []T](#ord-for-t) [Ord for [N]T](#ord-for-nt) [Ord for never](#ord-for-never) [Ord for unit](#ord-for-unit) [Writer for Counting](#writer-for-counting) [Writer for Stderr](#writer-for-stderr) [Writer for Stdout](#writer-for-stdout) [Zero for bf16](#zero-for-bf16) [Zero for f16](#zero-for-f16) [Zero for f32](#zero-for-f32) [Zero for real](#zero-for-real)
 
 ## Constants
 
@@ -54,21 +54,18 @@ val sink: *Stdout = ptr_cast(0)
 ### `assert`
 
 ```sysl
-assert(cond: bool, msg: string = "", file: string = __FILE__, line: long = __LINE__)
+assert(cond: bool, msg: string = "", file: string = "", line: long = 0)
 ```
 
 The condition is checked and nothing else is: a false one names where it was written, and the
 message if it was given one.
 
-**`file` and `line` are passed on explicitly**, which is the one thing about this that is easy to
-get wrong: letting `panic` fill its own defaults would report *this* line, in this file, for every
-assertion in every program -- the call that fills them would be the one three lines down rather
-than the reader's. Forwarding them is how a location travels through a helper.
+`panic` is tracked as this is, so the location travels to it with nothing written here.
 
 ### `assert_eq`
 
 ```sysl
-assert_eq[T: Eq + Debug](got: T, want: T, msg: string = "", file: string = __FILE__, line: long = __LINE__)
+assert_eq[T: Eq + Debug](got: T, want: T, msg: string = "", file: string = "", line: long = 0)
 ```
 
 `got` and `want` in that order, which is Go's and the order a failure is read in: what happened,
@@ -77,12 +74,22 @@ then what was meant to.
 ### `assert_slice_eq`
 
 ```sysl
-assert_slice_eq[T: Eq + Debug](got: []const T, want: []const T, msg: string = "", file: string = __FILE__, line: long = __LINE__)
+assert_slice_eq[T: Eq + Debug](got: []const T, want: []const T, msg: string = "", file: string = "", line: long = 0)
 ```
 
 The same for a slice, which needs more than `==` to be useful: a report saying two slices differ
 sends its reader to find out where, and finding out where is a loop nobody wants to write at each
 call. Length first, since a length mismatch explains every index after the shorter one.
+
+### `caller_location`
+
+```sysl
+caller_location() -> Location
+```
+
+Where the function this is written in was called from -- the line of the call, where that
+function is `@track_caller`, and the line of this call otherwise. A chain of tracked functions
+answers the outermost call that is not itself in one.
 
 ### `cpu`
 
@@ -470,7 +477,7 @@ something else.
 ### `panic`
 
 ```sysl
-panic(msg: string, file: string = __FILE__, line: long = __LINE__) -> never
+panic(msg: string, file: string = "", line: long = 0) -> never
 ```
 
 The location is **streamed** rather than interpolated, and that is not a style choice: an
@@ -730,6 +737,35 @@ struct is a `Struct`. A function pointer of any convention is a `Fn`; a closure 
 through a reference, so it is a `Ref`. A struct a C header declares with no body, and the C
 variadic cursor, are `Opaque`.
 
+### `Location`
+
+```sysl
+struct Location
+    at: *u8
+```
+
+Where a call was written, as `file:line:column`.
+
+**What `caller_location()` answers, and what a `@track_caller` function reports**
+(`reference/attributes.md § @track_caller`). The file is named as it sits in what was built --
+`main.sysl`, `src/parse.sysl` -- which is the name a failed bounds check gives too, and the column
+counts from one.
+
+It is one pointer: the address of the NUL-terminated text the compiler laid down for the call,
+which is the very text a failed check hands `sysl_bounds_fail` as `at`. A build that dropped
+locations (`bounds_locations = false`) lays down none, and a location there is *unknown*: `known`
+is false, the file is empty and the line and column are zero. Nothing about it allocates, so a
+`@no_alloc` module can ask for one and print it.
+
+| Member | Signature | Description |
+|---|---|---|
+| `known` | `known(self) -> bool` | Whether the build laid a location down for this call. |
+| `text` | `text(self) -> []const u8` | The whole of it, `file:line:column`, or nothing where it is unknown. |
+| `file` | `file(self) -> string` | The file, as the build names it -- a copy, so it allocates; `print(loc)` does not. |
+| `file_bytes` | `file_bytes(self) -> []const u8` | The file's bytes where the location holds them, which costs nothing. |
+| `line` | `line(self) -> u32` | The line, from one; zero where the location is unknown. |
+| `column` | `column(self) -> u32` | The column, from one; zero where the location is unknown. |
+
 ### `Option`
 
 ```sysl
@@ -743,7 +779,8 @@ builds: what the compiler knows is that `?` unwraps it and which variant means w
 `Library.tryVariants` for that rather than spelling the names.
 
 `unwrap` and `expect` stop the program through `exit`, which is what `11-error-handling.md` says a
-trap does under the `os` capability -- so neither needs compiler support of its own.
+trap does under the `os` capability -- so neither needs compiler support of its own beyond
+`@track_caller`, which is what lets the panic name the line that called them.
 
 `None` is written `= 0`, so it is the zero value: a `var x: Option[T]` with no initializer, a
 zeroed array of them and a struct field left to its zero all start out `None`.
@@ -753,8 +790,8 @@ zeroed array of them and a struct field left to its zero all start out `None`.
 | `is_some` | `is_some(self) -> bool` |  |
 | `is_none` | `is_none(self) -> bool` |  |
 | `unwrap_or` | `unwrap_or(self, default: T) -> T` |  |
-| `unwrap` | `unwrap(self) -> T` |  |
-| `expect` | `expect(self, msg: string) -> T` |  |
+| `unwrap` | `unwrap(self) -> T` | The value, or -- on `None` -- a panic naming the line that called `unwrap`. |
+| `expect` | `expect(self, msg: string) -> T` | `unwrap` with the panic line saying `msg`. |
 | `unwrap_or_else` | `unwrap_or_else(self, f: () -> T) -> T` | The default computed rather than passed, for a default that costs something to make. |
 | `map` | `map[U](self, f: T -> U) -> Option[U]` | The payload transformed, absence carried through. |
 | `and_then` | `and_then[U](self, f: T -> Option[U]) -> Option[U]` | The same for a function that may itself answer nothing, which is what keeps the two from nesting: `map` of an `Option`-returning function is an `Option[Option[U]]` and this is not. |
@@ -956,6 +993,53 @@ trait BitXor[Rhs = Self, Out = Self]
 | Member | Signature | Description |
 |---|---|---|
 | `bitxor` | `bitxor(self, rhs: Rhs) -> Out` |  |
+
+### `Checked`
+
+```sysl
+trait Checked
+    checked_add(self, rhs: Self) -> Option[Self]
+    checked_sub(self, rhs: Self) -> Option[Self]
+    checked_mul(self, rhs: Self) -> Option[Self]
+    checked_div(self, rhs: Self) -> Option[Self]
+    checked_rem(self, rhs: Self) -> Option[Self]
+    checked_neg(self) -> Option[Self]
+```
+
+Integer arithmetic that answers `None` where the plain operator would have wrapped or trapped.
+
+`a + b` wraps at the declared width, which is what the machine does and what a program that has
+proved its values fit wants. A program that cannot prove it -- a parser reading a count off the
+wire, a total over input it did not write -- asks a different question: *did that fit?* These are
+that question, and the answer is the result or nothing: `250u8.checked_add(5)` is `Some(255)`,
+and `250u8.checked_add(6)` is `None`.
+
+**The membership is every integer type, signed and unsigned, at every width** -- `u12` and `i128`
+as surely as `int` -- and it is the compiler's, for the reason `sysl.math`'s `Bits` is: the integers
+are an open family, so there is no finite list of widths to write an `impl` for. A body bounded by
+`[T: Checked]` is written once and reaches every width.
+
+**Each one is the machine's own test, not arithmetic after the fact.** A sum, a difference and a
+product are LLVM's `with.overflow` intrinsics, which on most machines are the instruction and the
+flag it already set; a quotient and a remainder are one comparison of the divisor before the divide.
+
+**A ranged or derived integer type is not a member.** Its overflow is its range's, which a width's
+test does not see -- a sum that fits `int` can still leave `int within 0..100` -- so the member it
+would get answers a question the type does not ask. Convert to the base first.
+
+**There is no `checked_shl` or `checked_shr`.** A shift by the width or more is defined in sysl
+(`reference/expressions.md § Shifting by the width or more`): it gives zero, or the sign, and never
+an answer that needs refusing. **Nor are there wrapping or saturating members**: those are the
+operators `+%` and `+|`, which say the same thing in the expression itself.
+
+| Member | Signature | Description |
+|---|---|---|
+| `checked_add` | `checked_add(self, rhs: Self) -> Option[Self]` | `self + rhs`, or `None` where the sum does not fit the type. |
+| `checked_sub` | `checked_sub(self, rhs: Self) -> Option[Self]` | `self - rhs`, or `None` where the difference does not fit -- for an unsigned type, wherever `rhs` is the larger. |
+| `checked_mul` | `checked_mul(self, rhs: Self) -> Option[Self]` | `self * rhs`, or `None` where the product does not fit. |
+| `checked_div` | `checked_div(self, rhs: Self) -> Option[Self]` | `self / rhs`, or `None` where `rhs` is zero -- and, for a signed type, at the one quotient that does not fit: the most negative value over `-1`. |
+| `checked_rem` | `checked_rem(self, rhs: Self) -> Option[Self]` | `self % rhs`, or `None` exactly where `checked_div` is: a zero divisor, or the most negative value over `-1`, whose remainder is zero but whose divide is the one a machine traps on. |
+| `checked_neg` | `checked_neg(self) -> Option[Self]` | `-self`, or `None` where the negation does not fit: the most negative value of a signed type, and every value of an unsigned type but zero. |
 
 ### `Debug`
 
@@ -1265,6 +1349,7 @@ that computes its elements has an `Index` and no `IndexSet` to give.
 ```sysl
 trait IndexPlace[I, E]
     index_place(*self, i: I) -> *E
+    index_place_unchecked(*self, i: I) -> *E
 ```
 
 What makes a subscript on a type someone wrote a **place**, as an array's element is.
@@ -1284,6 +1369,7 @@ from seeing the call.
 | Member | Signature | Description |
 |---|---|---|
 | `index_place` | `index_place(*self, i: I) -> *E` |  |
+| `index_place_unchecked` | `index_place_unchecked(*self, i: I) -> *E` | What `b[i]` reads through inside an `@unchecked` block: the same address, with the bounds test left out where the container knows how to leave it out (`reference/arrays.md § Unchecked access`). |
 
 ### `IndexSet`
 
@@ -1566,6 +1652,12 @@ impl Debug for f16
 impl Debug for f32
 ```
 
+### Debug for never
+
+```sysl
+impl Debug for never
+```
+
 ### Debug for Option[T]
 
 ```sysl
@@ -1691,6 +1783,20 @@ Every float renders at its own width, in the fewest digits that read back as the
 that type -- what Rust's `{}` writes -- so `f32(0.1)` and `f16(0.1)` both print `0.1`, the digits
 their own width needs, rather than the longer reading of the value widened to a `real`.
 
+### Display for Location
+
+```sysl
+impl Display for Location
+```
+
+`file:line:column`, or `<unknown>` where the build laid no location down.
+
+### Display for never
+
+```sysl
+impl Display for never
+```
+
 ### Display for Option[T]
 
 ```sysl
@@ -1781,6 +1887,12 @@ slice would have walked, so this is a delegation rather than a second copy of th
 
 ```sysl
 impl[T] Eq for ByAddress[T]
+```
+
+### Eq for never
+
+```sysl
+impl Eq for never
 ```
 
 ### Eq for Option[T]
@@ -1904,6 +2016,12 @@ impl[T] Hash for ByAddress[T]
 impl Hash for char
 ```
 
+### Hash for never
+
+```sysl
+impl Hash for never
+```
+
 ### Hash for string
 
 ```sysl
@@ -2010,6 +2128,12 @@ impl[const N: usize, T: Ord] Ord for [N]T
 
 Every array of an orderable element, delegating to the slice exactly as `Eq` does. Two arrays of
 one type have one length, so the length test the slice ends on can never decide here.
+
+### Ord for never
+
+```sysl
+impl Ord for never
+```
 
 ### Ord for unit
 

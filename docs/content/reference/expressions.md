@@ -386,6 +386,29 @@ print(f +| 1.0)
 A register of lanes is refused too (`'+|' is not defined for <4>int`); a lane's saturating `+` is a
 fixed-point lane's own `+`.
 
+The third answer to an overflow — that there is no result, and the caller must decide — is a method
+rather than an operator: `a.checked_add(b)` and its siblings return an `Option`
+([types](/reference/types/#asking-whether-it-fit)).
+
+```sysl
+val parts: []byte = [100, 100, 100]
+var total: byte = 0
+
+for x in parts
+    total = total.checked_add(x) match
+        Some(t) -> t
+        None ->
+            print("overflow")
+            break
+
+print(total)
+```
+
+```output
+overflow
+200
+```
+
 ### A multiply feeding an add is fused where the machine fuses
 
 **A float multiply whose result is added or subtracted in the same expression is one fused
