@@ -1,0 +1,390 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{is_file, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.{capture, Status}
+import sysl.testing.skip
+import sysl.text.split
+
+// The two build modes (`build_mode.sysl`): in a debug build a plain `+`, `-`, `*`, a unary `-`, a
+// compound assignment, `++`/`--` and a written integer conversion that cannot hold its answer stop the
+// program through the bounds report (`integer overflow: ...`); in a release build each wraps at the
+// declared width, exactly. Every cell is built in both modes, at `-O0` and at the default level --
+// an optimizer that folded the check to its outcome must still make the call -- and the release
+// answer is asserted digit for digit, since "it did not trap" is not the claim.
+
+private bmd_ready() -> bool = std_root().is_ok() && clang_available()
+
+// `text` as `main.sysl`, built in the mode `flag` names at `level`, and run: its status, its standard
+// output and its standard error.
+private bmd_run(text: string, flag: string, level: string) -> (Status, string, string)
+    val root = make_temp_dir("sysl-bmd").unwrap()
+
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    var flags: [1]string = [flag]
+
+    assert_eq(took_search_flag(flags[..], 0), 1)
+
+    val exe = s"$root/built"
+    val built = build_native_program(root, None, None, level, Some(exe))
+
+    reset_search_paths()
+
+    built match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (Status.Exited(-1), "", failure_text(why))
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> (Status.Exited(-1), "", "the program that was built could not be run")
+        Ok(out) -> (out.status, out.text, out.err.unwrap_or(""))
+end bmd_run
+
+// At both levels, a debug build prints `before` and then stops on SIGTRAP having written exactly
+// `report` to standard error, and a release build prints `before` followed by `wrapped` and exits
+// cleanly with nothing on standard error.
+private bmd_cell(text: string, before: string, report: string, wrapped: string)
+    if !bmd_ready() then return
+
+    for level in ["0", DefaultOptimization]
+        val (state, printed, err) = bmd_run(text, "--debug", level)
+
+        assert_eq(err, report)
+        assert_eq(printed, before)
+        assert(state == Status.Signalled(5), s"debug -O$level stopped with $state, having printed '$printed'")
+
+        val (rstate, rprinted, rerr) = bmd_run(text, "--release", level)
+
+        assert_eq(rerr, "")
+        assert_eq(rprinted, before + wrapped)
+        assert(rstate.ok(), s"release -O$level stopped with $rstate, having printed '$rprinted'")
+end bmd_cell
+
+// At both levels and in both modes, the program prints `expected` and exits cleanly.
+private bmd_same(text: string, expected: string)
+    if !bmd_ready() then return
+
+    for level in ["0", DefaultOptimization]
+        for flag in ["--debug", "--release"]
+            val (state, printed, err) = bmd_run(text, flag, level)
+
+            assert_eq(err, "")
+            assert_eq(printed, expected)
+            assert(state.ok(), s"$flag -O$level stopped with $state")
+end bmd_same
+
+// -- each operator, at each width --------------------------------------------------------------------
+
+@test("u8 addition past 255 stops a debug build and wraps to the low byte in a release one")
+bmd_u8_add()
+    bmd_cell("var a: u8 = 200\nprint(a + 100)\n", "", "integer overflow: byte + byte (main.sysl:2:7)\n", "44\n")
+
+@test("i16 subtraction below its minimum stops a debug build and wraps to its maximum in a release one")
+bmd_i16_sub()
+    bmd_cell("var a: i16 = -32768\nprint(a - 1)\n", "", "integer overflow: short - short (main.sysl:2:7)\n",
+             "32767\n")
+
+@test("int multiplication past 32 bits stops a debug build and wraps in a release one")
+bmd_int_mul()
+    bmd_cell("var a = 65536\nprint(a * 65536)\n", "", "integer overflow: int * int (main.sysl:2:7)\n", "0\n")
+
+@test("i64 addition past its maximum wraps to its minimum in a release build")
+bmd_i64_add()
+    bmd_cell("var a: i64 = 9223372036854775807\nprint(a + 1)\n", "",
+             "integer overflow: long + long (main.sysl:2:7)\n", "-9223372036854775808\n")
+
+@test("u64 subtraction below zero wraps to its maximum in a release build")
+bmd_u64_sub()
+    bmd_cell("var a: u64 = 0\nprint(a - 1)\n", "", "integer overflow: ulong - ulong (main.sysl:2:7)\n",
+             "18446744073709551615\n")
+
+@test("a width no machine has, u12, is checked at its own width and wraps at it")
+bmd_u12_add()
+    bmd_cell("var a: u12 = 4095\nprint(a + 1)\n", "", "integer overflow: u12 + u12 (main.sysl:2:7)\n", "0\n")
+
+@test("i128 multiplication, an inline expansion, is checked and wraps exactly")
+bmd_i128_mul()
+    bmd_cell("var a: i128 = 170141183460469231731687303715884105727\nprint(a * 2)\n", "",
+             "integer overflow: i128 * i128 (main.sysl:2:7)\n", "-2\n")
+
+@test("unary minus of a signed minimum stops a debug build and is the minimum again in a release one")
+bmd_negate_minimum()
+    bmd_cell("var a: i8 = -128\nprint(-a)\n", "", "integer overflow: -i8 (main.sysl:2:7)\n", "-128\n")
+
+@test("a compound assignment is the operation it abbreviates and is checked the same way")
+bmd_compound_assignment()
+    bmd_cell("var a: u8 = 250\na += 10\nprint(a)\n", "", "integer overflow: byte += byte (main.sysl:2:1)\n",
+             "4\n")
+
+@test("an increment past the maximum is checked and wraps to zero")
+bmd_increment()
+    bmd_cell("var a: u8 = 255\na++\nprint(a)\n", "", "integer overflow: byte++ (main.sysl:2:1)\n", "0\n")
+
+@test("a decrement below zero is checked and wraps to the maximum")
+bmd_decrement()
+    bmd_cell("var a: u16 = 0\na--\nprint(a)\n", "", "integer overflow: ushort-- (main.sysl:2:1)\n", "65535\n")
+
+// -- written conversions -------------------------------------------------------------------------------
+
+@test("a written narrowing that cannot hold the value stops a debug build and keeps the low bits in release")
+bmd_narrowing()
+    bmd_cell("var n = 300\nprint(u8(n))\n", "", "integer overflow: byte(int) (main.sysl:2:7)\n", "44\n")
+
+@test("a written conversion across the sign that cannot hold the value is checked the same way")
+bmd_across_the_sign()
+    bmd_cell("var n = -1\nprint(u32(n))\n", "", "integer overflow: uint(int) (main.sysl:2:7)\n", "4294967295\n")
+
+@test("a conversion of a wider signed value to an unsigned one of the same width is checked")
+bmd_same_width_sign()
+    bmd_cell("var n = -1\nvar x: i64 = n\nprint(u64(x))\n", "", "integer overflow: ulong(long) (main.sysl:3:7)\n",
+             "18446744073709551615\n")
+
+@test("a narrowing to a signed width holding the value runs, and one past it is checked")
+bmd_signed_narrowing()
+    bmd_cell("var n = 200\nprint(i16(n))\nprint(i8(n))\n", "200\n", "integer overflow: i8(int) (main.sysl:3:7)\n",
+             "-56\n")
+
+// -- what is never checked -------------------------------------------------------------------------
+
+@test("values that fit, widenings, masked narrowings and the wrapping and saturating operators never stop")
+bmd_what_fits_never_stops()
+    bmd_same("var n = 255\nvar m = -128\nvar b: u8 = 200\nvar big: u64 = 4294967295\n" +
+             "print(u8(n), i8(m), int(b), u32(big), b +% 100, b -% 201, b *% 2, b +| 100, u8(n & 0xff))\n",
+             "255 -128 200 4294967295 44 255 144 255 255\n")
+
+@test("a shift is a bit operation in both modes, and is never an overflow")
+bmd_shift_is_not_checked()
+    bmd_same("var b: u8 = 200\nprint(b << 1, b >> 9)\n", "144 0\n")
+
+@test("a constant is folded the same in both modes: a literal conversion is the bit pattern written")
+bmd_constants_fold_the_same()
+    bmd_same("const Base: u8 = 200\nval k: u8 = 200 + 55\nprint(k, Base +% 100, u8(-1), i8(200), u32(-1))\n",
+             "255 44 255 -56 4294967295\n")
+
+@test("arithmetic on a const is ordinary arithmetic at its type, and is checked")
+bmd_const_operand_is_checked()
+    bmd_cell("const Base: u8 = 200\nprint(Base + 100)\n", "", "integer overflow: byte + byte (main.sysl:2:7)\n",
+             "44\n")
+
+// -- where the operation is written ------------------------------------------------------------------
+
+@test("a generic body instantiated twice is checked at each instantiation, the one that overflows stopping")
+bmd_generic_twice()
+    bmd_cell("pick[T: Add](a: T, b: T) -> T = a + b\n\nvar x: u8 = 200\nprint(pick(1, 2))\nprint(pick(x, x))\n",
+             "3\n", "integer overflow: byte + byte (main.sysl:1:33)\n", "144\n")
+
+@test("a @no_alloc function is checked, the report needing no allocation")
+bmd_no_alloc()
+    bmd_cell("@no_alloc\nbump(n: i8) -> i8 = n + 1\n\nvar x: i8 = 127\nprint(bump(x))\n", "",
+             "integer overflow: i8 + i8 (main.sysl:2:21)\n", "-128\n")
+
+@test("inside a @track_caller function the report names the caller's line")
+bmd_track_caller()
+    bmd_cell("@track_caller\ngrow(n: u16) -> u16 = n * 1000\n\nvar x: u16 = 70\nprint(grow(x))\n", "",
+             "integer overflow: ushort * ushort (main.sysl:5:7)\n", "4464\n")
+
+@test("a method body is checked like a function's")
+bmd_method()
+    bmd_cell("struct Counter\n    n: u8\n\n    next(self) -> u8 = self.n + 1\n\n" +
+             "val c = Counter(255)\nprint(c.next())\n", "", "integer overflow: byte + byte (main.sysl:4:24)\n",
+             "0\n")
+
+// -- what the mode is ----------------------------------------------------------------------------------
+
+@test("run and test default to debug, every other command to release, and the last flag given wins")
+bmd_the_default_and_the_flags()
+    for (command, debug) in [("run", true), ("test", true), ("build", false), ("build-c", false), ("build-lib", false)]
+        use_command_mode(command)
+        assert_eq(settled_debug(build_mode_flag()), debug)
+
+    use_command_mode("build")
+
+    var flags: [2]string = ["--debug", "--release"]
+
+    assert_eq(took_search_flag(flags[..], 0), 1)
+    assert_eq(settled_debug(build_mode_flag()), true)
+    assert_eq(took_search_flag(flags[..], 1), 1)
+    assert_eq(settled_debug(build_mode_flag()), false)
+
+    use_command_mode("run")
+    assert_eq(settled_debug(build_mode_flag()), false)
+
+    reset_search_paths()
+    assert_eq(settled_debug(build_mode_flag()), true)
+    use_command_mode("")
+end bmd_the_default_and_the_flags
+
+// The text of the first `define` in `ir` whose head names `name`, through its closing brace.
+private bmd_body_of(ir: string, name: string) -> string
+    val lines = split(ir, "\n")
+    var b = str_builder()
+    var inside = false
+
+    for line in lines
+        if !inside && line.starts_with("define") && line.contains(name) then inside = true
+
+        if inside
+            b.push(line)
+            b.push("\n")
+
+            if line == "}" then return b.finish()
+    end for
+
+    s"no define of $name in:\n$ir"
+end bmd_body_of
+
+@test("a release module carries no overflow check and no nsw or nuw on plain arithmetic; a debug one checks it")
+bmd_release_ir_is_plain()
+    if !bmd_ready() then return
+
+    val program = [("main.sysl", "step(a: i32, b: i32) -> i32 = a + b * a\n\nprint(step(3, 4))\n")]
+
+    use_overflow_checks(false)
+
+    val release = bmd_body_of(xvr_ir(program), "step")
+
+    use_overflow_checks(true)
+
+    val debug = bmd_body_of(xvr_ir(program), "step")
+
+    use_overflow_checks(false)
+
+    assert(release.contains("add i32"), release)
+    assert(release.contains("mul i32"), release)
+
+    assert(!release.contains("with.overflow"), release)
+    assert(!release.contains(" nsw "), release)
+    assert(!release.contains(" nuw "), release)
+    assert(debug.contains("llvm.sadd.with.overflow.i32"), debug)
+    assert(debug.contains("llvm.smul.with.overflow.i32"), debug)
+end bmd_release_ir_is_plain
+
+@test("a library's metadata records the mode its bodies were compiled in")
+bmd_library_records_its_mode()
+    use_overflow_checks(true)
+
+    val debug = syslib_metadata(host_target(), "feedfacecafebeef", buf())
+
+    use_overflow_checks(false)
+
+    val release = syslib_metadata(host_target(), "feedfacecafebeef", buf())
+
+    assert(debug.ends_with("mode debug\n"), debug)
+    assert(release.ends_with("mode release\n"), release)
+    assert_eq(syslib_mode(debug), "debug")
+    assert_eq(syslib_mode(release), "release")
+    assert_eq(syslib_mode("thumb-freestanding\n"), "release")
+end bmd_library_records_its_mode
+
+@test("the mode is part of the run cache's key and the standard module artifact's path")
+bmd_the_mode_is_keyed()
+    var parts: Buf[string] = buf()
+
+    use_overflow_checks(true)
+    settings_parts(&parts, ".")
+
+    val path_debug = std_artifact_path(host_target(), "feedfacecafebeef")
+
+    use_overflow_checks(false)
+
+    var release_parts: Buf[string] = buf()
+
+    settings_parts(&release_parts, ".")
+
+    val path_release = std_artifact_path(host_target(), "feedfacecafebeef")
+
+    assert(bmd_any(parts, "mode:debug"), "debug parts lack the mode")
+    assert(!bmd_any(release_parts, "mode:debug"), "release parts name the debug mode")
+    assert(path_debug != path_release, path_debug)
+    assert(path_debug.contains("-dbg"), path_debug)
+    assert(!path_release.contains("-dbg"), path_release)
+end bmd_the_mode_is_keyed
+
+// -- bare metal ----------------------------------------------------------------------------------------
+
+private val BmdNm: string = "/opt/homebrew/opt/llvm/bin/llvm-nm"
+
+private val BmdThumb: string = "@export(\"bump8\")\nbump8(n: i8) -> i8 = n + 1\n\n" +
+    "@export(\"mul64\")\nmul64(a: u64, b: u64) -> u64 = a * b\n\n" +
+    "@export(\"narrow\")\nnarrow(n: int) -> u8 = u8(n)\n\n" +
+    "@export(\"neg\")\nneg(n: i32) -> i32 = -n\n\nvar sink = 0\n\n" +
+    "@export(\"main\")\nmain()\n    sink = int(bump8(1)) + int(mul64(2, 3)) + int(narrow(4)) + neg(5)\n"
+
+// What `llvm-nm` lists of the Thumb archive `BmdThumb` builds to in the mode `flag` names: every
+// symbol with `-u` false, the undefined ones with it true.
+private bmd_thumb_symbols(flag: string, undefined: bool) -> Result[Buf[string], string]
+    val root = make_temp_dir("sysl-bmd-thumb").unwrap()
+
+    write_text(s"$root/main.sysl", BmdThumb).unwrap()
+
+    var flags: [1]string = [flag]
+
+    assert_eq(took_search_flag(flags[..], 0), 1)
+
+    val archive = s"$root/probe.a"
+    val built = build_c_archive(root, Some("thumb-freestanding-softfp"), None, DefaultOptimization, Some(archive),
+                                None, (m) -> ())
+
+    reset_search_paths()
+
+    built match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return Err(failure_text(why))
+        Ok(_) -> ()
+
+    val ran = if undefined then capture(BmdNm, ["-u", archive]) else capture(BmdNm, [archive])
+    val listing = ran.map((o) -> o.text).unwrap_or("llvm-nm could not be run")
+
+    remove_dir_all(root).unwrap_or(())
+
+    var out: Buf[string] = buf()
+
+    for line in split(listing, "\n")
+        val t = line.trim()
+
+        if t != "" && !t.ends_with(":") then out.push(t)
+
+    Ok(out)
+end bmd_thumb_symbols
+
+private bmd_any(names: Buf[string], part: string) -> bool
+    for n in names
+        if n.contains(part) then return true
+
+    false
+end bmd_any
+
+@test("on a freestanding Thumb target a debug build checks through the weak report and needs no allocator")
+bmd_thumb_freestanding()
+    if !is_file(BmdNm) then skip(s"there is no llvm-nm at $BmdNm to read the archive")
+
+    find_backend_clang(target_named("thumb-freestanding-softfp").unwrap()) match
+        Err(why) ->
+            skip(why)
+            return
+        Ok(_) -> ()
+
+    for flag in ["--debug", "--release"]
+        bmd_thumb_symbols(flag, true) match
+            Err(why) -> assert(false, s"$flag: $why")
+            Ok(names) ->
+                for n in names
+                    assert(n == "U memcpy" || n == "U memset", s"$flag leaves $n undefined")
+
+    val debug = bmd_thumb_symbols("--debug", false).unwrap()
+    val release = bmd_thumb_symbols("--release", false).unwrap()
+
+    for name in ["bump8.cold", "mul64.cold", "narrow.cold", "neg.cold"]
+        assert(bmd_any(debug, name), s"debug has no failure path $name")
+        assert(!bmd_any(release, name), s"release has a failure path $name")
+
+    assert(bmd_any(debug, "W sysl_bounds_fail"), "debug has no weak report")
+end bmd_thumb_freestanding

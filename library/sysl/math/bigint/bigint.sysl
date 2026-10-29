@@ -75,6 +75,17 @@ private[bigint] type Wide = u64
 /** How many bits a limb holds. */
 private[bigint] val limb_bits: usize = sizeof(Limb) * 8
 
+/** Every bit of a limb, as a `Wide`. */
+private[bigint] val limb_mask: Wide = (Wide(1) << limb_bits) - 1
+
+/** The low limb of a double-width step -- the digit it leaves behind, the rest being the carry. */
+private[bigint] low_limb(w: Wide) -> Limb = Limb(w & limb_mask)
+
+/** How far `n` is from zero, as a `u64`, which holds it at every value -- `long`'s minimum included,
+ * whose distance no `long` holds.
+ */
+private[bigint] distance_u64(n: long) -> u64 = if n < 0 then u64(-(n + 1)) + 1 else u64(n)
+
 /** How many limbs a `u64` takes, which is how many a value that fits a machine integer can have. */
 private[bigint] val u64_limbs: usize = 64 / limb_bits
 
@@ -151,14 +162,14 @@ one() -> BigInt = from_int(1)
 /** The value `n` names.
  *
  * The most negative `long` is the case worth knowing about: its magnitude cannot be reached by
- * negating it, since that value has no positive counterpart, so the conversion goes through the
- * unsigned reading of the bits.
+ * negating it, since that value has no positive counterpart, so the magnitude is taken one short of
+ * it and made up in a `u64` (`distance_u64`).
  */
 from_int(n: long) -> BigInt
     if n == 0 then return zero()
 
     val negative = n < 0
-    BigInt(negative, mag_of_u64(if negative then 0u64 - u64(n) else u64(n)))
+    BigInt(negative, mag_of_u64(distance_u64(n)))
 
 impl From[long] for BigInt
     from(value: long) -> BigInt = from_int(value)
@@ -234,7 +245,7 @@ impl Hash for BigInt
         var h = if self.minus then 0xcbf29ce484222326u64 else 0xcbf29ce484222325u64
 
         for limb in self.mag
-            h = (h ^ u64(limb)) * 0x100000001b3u64
+            h = (h ^ u64(limb)) *% 0x100000001b3u64
 
         h
     end hash
@@ -341,7 +352,7 @@ private[bigint] add_mag(a: []const Limb, b: []const Limb) -> []const Limb
 
         if i < short_side.len then s += Wide(short_side[i])
 
-        out.push(Limb(s))
+        out.push(low_limb(s))
         carry = s >> limb_bits
 
     if carry != 0 then out.push(Limb(carry))
@@ -363,7 +374,7 @@ private[bigint] sub_mag(a: []const Limb, b: []const Limb) -> []const Limb
         val take = (if i < b.len then Wide(b[i]) else 0) + borrow
         val cur = Wide(a[i])
 
-        out.push(Limb(cur - take))
+        out.push(low_limb(cur -% take))
         borrow = if cur >= take then 0 else 1
 
     trimmed(out)
@@ -389,7 +400,7 @@ private[bigint] mul_mag(a: []const Limb, b: []const Limb) -> []const Limb
             val at = i + j
             val t = ai * Wide(b[j]) + Wide(out.at(at)) + carry
 
-            out.set(at, Limb(t))
+            out.set(at, low_limb(t))
             carry = t >> limb_bits
 
         out.set(i + b.len, Limb(carry))
@@ -405,7 +416,7 @@ private[bigint] mag_of_u64(n: u64) -> []const Limb
     // A shift by the whole width of `m` is a full shift and leaves zero, so on a 64-bit target the
     // loop takes one limb and stops.
     while m != 0
-        out.push(Limb(m))
+        out.push(low_limb(Wide(m)))
         m = m >> limb_bits
 
     out.view()
