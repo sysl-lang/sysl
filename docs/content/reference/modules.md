@@ -549,7 +549,7 @@ val n: int = b
 ```
 
 ```error
-cannot initialize 'n': declared int but the value is Buf[Option[byte]]
+cannot initialize 'n': declared int but the value is Buf[Option[u8]]
 ```
 
 **It keeps its path where the simple name could mean something else in the file the diagnostic is

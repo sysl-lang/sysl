@@ -90,13 +90,30 @@ opm_string_temp_moves()
         assert_eq(opm_takes(ir), 0)
         assert_eq(opm_count(ir, "call void @arc.release_maybe("), 0)
 
-@test("a local used again after the call is retained for it, and released at the scope's end")
+// A call whose argument is not at its last use would retain it for the owned body; `wrap` answers at
+// +0 from its parameter, so the call goes through its +0 entry instead (`zero_entry.sysl`), lending
+// the local, and the answer's count, read in a stretch that releases nothing, is dropped with its
+// release. The scope's end gives the local back.
+@test("a local used again after the call is lent to the +0 entry, and released at the scope's end")
 opm_not_last_use_retains()
     val ir = opm_ir("again(v: int) -> int\n    val x: &Node = Node(v)\n    val w = wrap(x)\n    w.n.v + x.v\n",
                     "again")
 
-    assert_eq(opm_count(ir, "call void @arc.retain("), 1)
+    assert(ir.contains("@wrap$$sysl-zero("), ir)
+    assert_eq(opm_takes(ir), 0)
     assert_eq(opm_count(ir, "call void @arc.release("), 1)
+
+// The same function, handed a local at its last use, takes the owned body: the count moves over for
+// nothing, where the +0 entry would take one for the answer and give the local's back.
+@test("a local at its last use still moves into the owned body rather than through the +0 entry")
+opm_last_use_prefers_owned()
+    for body in ["mk(v: int) -> W\n    val x: &Node = Node(v)\n    wrap(x)\n", "mk(v: int) -> W = wrap(Node(v))\n",
+                 "mk(n: &Node) -> W = wrap(n)\n"]
+        val ir = opm_ir(body, if body.starts_with("mk(n") then "mk.owned" else "mk")
+
+        assert(ir.contains("@wrap$$sysl.owned("), ir)
+        assert(!ir.contains("-zero("), ir)
+        opm_no_traffic(ir)
 
 // A local named twice in one statement is not at its last use at either argument, so neither hands
 // it over: each argument is retained, and the scope's end gives the local's own count back.
@@ -139,12 +156,16 @@ opm_aggregates_move()
         assert_eq(opm_count(ir, "call void @arc.release("), 0)
         assert_eq(opm_count(ir, "call void @arc.dispose."), 1)
 
-@test("a struct argument whose field is read after the call is not at its last use, so it is copied")
+// Not at its last use, so it is not handed over; `keep_bag` answering its parameter itself, the call
+// reads the answer where it lies through the place entry (`place_entry.sysl`), and the answer read in
+// an inert stretch takes no count either.
+@test("a struct argument whose field is read after the call is not at its last use, so it is lent")
 opm_partial_use_copies()
     val ir = opm_ir("keep_bag(b: Bag) -> Bag = b\n\ngo(v: int) -> int\n    val b = Bag(Node(v), W(Node(1)))\n" +
                     "    val k = keep_bag(b)\n    k.n.v + b.n.v\n", "go")
 
-    assert_eq(opm_count(ir, "call void @arc.copy.Bag("), 1)
+    assert(ir.contains("@keep_bag$$sysl-place("), ir)
+    assert_eq(opm_count(ir, "call void @arc.copy.Bag("), 0)
 
 @test("a parameter only a projection of which is kept stays borrowed")
 opm_projection_borrowed()
@@ -152,18 +173,22 @@ opm_projection_borrowed()
 
 // -- control flow ----------------------------------------------------------------------------------------
 
-@test("a local a defer names is retained for the call, since the deferred statement reads it at the exit")
+// Each of these calls is not one the local can be handed over at, so it is lent to `wrap`'s +0
+// entry rather than retained for the owned body (`zero_entry.sysl`).
+@test("a local a defer names is not handed over, since the deferred statement reads it at the exit")
 opm_defer_retains()
     val ir = opm_ir("go(v: int) -> int\n    val x: &Node = Node(v)\n    defer touch(x.v)\n    wrap(x).n.v\n", "go")
 
-    assert_eq(opm_count(ir, "call void @arc.retain("), 1)
+    assert(ir.contains("@wrap$$sysl-zero("), ir)
+    assert_eq(opm_count(ir, "call void @arc.retain("), 0)
 
-@test("a last use in one arm of a match is retained there, the scope's end giving the local back")
+@test("a last use in one arm of a match is not handed over there, the scope's end giving the local back")
 opm_match_arm_retains()
     val ir = opm_ir("go(c: int) -> int\n    val x: &Node = Node(c)\n    c match\n        0 -> wrap(x).n.v\n" +
                     "        _ -> 0\n", "go")
 
-    assert_eq(opm_count(ir, "call void @arc.retain("), 1)
+    assert(ir.contains("@wrap$$sysl-zero("), ir)
+    assert_eq(opm_count(ir, "call void @arc.retain("), 0)
 
 @test("a local whose life ends in an if with an else is handed into each arm, so the call there moves it")
 opm_branch_hand_in()
@@ -173,12 +198,13 @@ opm_branch_hand_in()
     assert_eq(opm_takes(ir), 0)
     assert_eq(opm_count(ir, "call void @arc.release("), 1)
 
-@test("a call that is not a last use inside a loop body retains every round")
+@test("a call that is not a last use inside a loop body lends the local every round")
 opm_loop_outer_local_retains()
     val ir = opm_ir("go(v: int) -> int\n    val x: &Node = Node(v)\n    var t = 0\n    for i in 0..<3\n" +
                     "        t += wrap(x).n.v\n    t\n", "go")
 
-    assert_eq(opm_count(ir, "call void @arc.retain("), 1)
+    assert(ir.contains("@wrap$$sysl-zero("), ir)
+    assert_eq(opm_count(ir, "call void @arc.retain("), 0)
 
 // -- recursion and generics -------------------------------------------------------------------------------
 
@@ -339,14 +365,16 @@ opm_vtable_borrows()
     assert(ir.contains("call %struct.W @K.keep("), ir)
     assert(!ir.contains(".owned"), ir)
 
-@test("a function value's thunk is a borrowed body: it retains, then calls the owned body")
+// The thunk borrows its argument, so it never hands `wrap` a count of its own: it lends the
+// argument to `wrap`'s +0 entry and takes the one count it answers with.
+@test("a function value's thunk is a borrowed body: it takes one count, for what it answers")
 opm_function_value_retains()
     val ir = opm_program_ir(opm_indirect, "$closure0.call")
 
     if ir == "skipped" then return
 
-    assert_eq(opm_count(ir, "call void @arc.retain("), 1)
-    assert(ir.contains("@wrap$$sysl.owned("), ir)
+    assert_eq(opm_takes(ir), 1)
+    assert(ir.contains("@wrap$$sysl-zero("), ir)
 
 // -- the counted heap ---------------------------------------------------------------------------------------
 

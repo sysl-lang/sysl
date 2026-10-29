@@ -149,6 +149,15 @@ associated_on(cx: &Analyzer, span: Span, ty: Type, name: string, args: Buf[Expr]
         _ -> ()
 
     val found = member_key(cx.an, ty, name)
+
+    // `Plain.decode` the compiler supplies answers ahead of a `decode` reached only implicitly
+    // (`plain_ahead`).
+    if name == "decode" && derived_trait_key(cx, name).is_none() && plain_ahead(cx, ty, found.0, name, via)
+        val decoded = plain_decode_call(cx, span, ty, name, args)
+
+        if decoded.is_some() then return decoded
+    end if
+
     var picked = name
 
     // **A trait's member may be filed only under a suffix** -- a block whose trait shares some other
@@ -1100,6 +1109,13 @@ private call_declared(cx: &Analyzer, span: Span, receiver: TExpr, rty: Type, nam
 
     if deriving.is_some() && !offered_by(cx, found.0, name, deriving.unwrap()) then
         return not_derived_there(cx, span, found.0, name, deriving.unwrap())
+
+    // A derivation reaches its own trait's `encode` alone, so `Plain`'s is asked only outside one.
+    if name == "encode" && deriving.is_none() && plain_ahead(cx, rty, found.0, name, via)
+        val encoded = plain_encode_call(cx, span, auto_deref(cx, receiver), rty, name, args)
+
+        if encoded.is_some() then return encoded.unwrap()
+    end if
 
     if !has_member_at(cx.an, found.0, name) &&
        !cx.an.tables.members.alts.has(member_key_of(found.0, name)) then
@@ -2136,6 +2152,26 @@ end member_func_name_quiet
 // Whether a member a trait brought is one this file may name. A trait's member is reachable only
 // where the trait can be named, which is what keeps the first library to implement a wide trait for
 // a built-in from claiming those names from everybody.
+// **`Plain`'s `encode` and `decode` -- members the compiler supplies to every plain-data type --
+// answer ahead of a member of the name that the file reaches only implicitly** (`reference/traits.md
+// § Two traits may declare a member of one name`): what the file names answers first, and a file
+// importing `sysl.encoding.Plain` has named that trait, while `sysl.codec`'s `Encode`, given to every
+// integer by a blanket `impl` the program can see, it has not. A trait the file or a bound does name
+// that gives the type the member keeps it, and a type that is not plain data is left to the lookup.
+private plain_ahead(cx: &Analyzer, ty: Type, base: string, mname: string, via: Buf[string]) -> bool
+    if !is_plain(ty) then return false
+
+    if member_at(cx.an, base, mname).is_some() && member_reachable(cx, base, mname, via) then return false
+
+    val alts = cx.an.tables.members.alts.get(member_key_of(base, mname))
+
+    if alts.is_some()
+        for item in alts.unwrap()
+            if member_reachable(cx, base, item, via) then return false
+
+    true
+end plain_ahead
+
 member_reachable(cx: &Analyzer, base: string, filed: string,
                  via: Buf[string] = no_bound_traits(), implicit: bool = false) -> bool
     val from = cx.an.tables.members.from_trait.get(member_key_of(base, filed))

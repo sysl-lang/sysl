@@ -127,7 +127,7 @@ when a writer adds a field; `@deny_unknown` refuses one. An internally tagged ob
 anywhere among its members: the decoder looks ahead for it and then reads the object as that variant.
 
 `@default` takes a value of the field's own type — `@default(8080)` on a `u16`, `@default("localhost")`
-on a `string` — because the annotation's [type parameter](/reference/reflection/#an-annotation-of-the-fields-type)
+on a `string` — because the annotation's [type parameter](/reference/reflection/#an-annotation-of-the-field-s-type)
 is bound to each field it is written on. A `@skip` field with no `@default` is given its type's
 **`Default`**, a trait of one receiverless member that `bool`, `real`, `string`, `Option`, `Buf`,
 `Set` and `Map` implement, and that a program implements for its own types; a skipped field whose

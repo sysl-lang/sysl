@@ -1028,7 +1028,7 @@ A function keeps the ordinary call — an answer with its count — where:
 A generic is decided per instantiation: `get(self) -> Option[T]` answers `+0` for `T = &Item` and
 holds nothing to count for `T = int`. Nothing about any function's type changes, so none of this is
 visible except in the time it saves and in what `--explain-borrows` reports
-([the CLI](../getting-started/cli.md#--explain-borrows)):
+([the CLI](/getting-started/cli/#explain-borrows)):
 
 ```
 $ sysl build --explain-borrows table.sysl
@@ -2718,7 +2718,7 @@ A view of a `*T` region that no member marked stays the programmer's problem, as
 The mark is about memory a *destructor* frees, which is why it is declared. A member whose answer is
 simply read out of its receiver's storage — a field, an element, a `Some` of one — needs no mark at
 all: the compiler works that out from the body and reads the answer where it lies (see
-[a method's answer borrowed from its receiver](#a-methods-answer-borrowed-from-its-receiver)).
+[a method's answer borrowed from its receiver](#a-method-s-answer-borrowed-from-its-receiver)).
 
 ## Escape analysis
 

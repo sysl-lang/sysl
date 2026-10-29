@@ -126,8 +126,11 @@ private has_root(roots: Buf[string], name: string) -> bool
     false
 end has_root
 
-// Whether `x` is a place this lowering can answer the address of, rooted at one of `roots`.
-private place_shape(e: *Emit, x: TExpr, roots: Buf[string]) -> bool = *x.kind match
+// Whether `x` is a place this lowering can answer the address of, rooted at one of `roots`. A union
+// field whose read checks its bytes is not one: the body reads it, and that read is the check.
+private place_shape(e: *Emit, x: TExpr, roots: Buf[string]) -> bool = !checked_union_place(x) && shaped(e, x, roots)
+
+private shaped(e: *Emit, x: TExpr, roots: Buf[string]) -> bool = *x.kind match
     TLoad(name, _) -> has_root(roots, name)
     TField(r, index, _) ->
         val rty = texpr_type(r)
@@ -253,7 +256,11 @@ end place_call_at
 
 // Whether `x` is storage the caller can hand over by address as it stands: a local or module `val`
 // with a slot, what a reference or a pointer refers to, or a field or array element of one of those.
-private nameable(e: *Emit, x: TExpr) -> bool = *x.kind match
+// **A union field whose read checks its bytes is not** (`union_fields.sysl`): the ordinary entry is
+// handed it by value, which is the read that checks, and the place entry would read past the check.
+private nameable(e: *Emit, x: TExpr) -> bool = !checked_union_place(x) && named_storage(e, x)
+
+private named_storage(e: *Emit, x: TExpr) -> bool = *x.kind match
     TLoad(name, ty) ->
         if zero_sized(ty) then return false
 
@@ -294,7 +301,9 @@ end call_place
 // -- the entry ------------------------------------------------------------------------------------------
 
 // The place entry's signature: the ordinary one's parameters, the place parameter as an address, and
-// an address answered.
+// an address answered. It is a second entry of the same declaration, so it carries the declaration's
+// inlining marks and `cold` as the ordinary entry does (`reference/attributes.md § @noinline, @inline
+// and @cold`).
 place_entry_sig(e: *Emit, name: string, target: string) -> IrFuncSig
     val c = e.places.get(target).unwrap()
     var ps: Buf[IrParam] = buf()
@@ -310,7 +319,9 @@ place_entry_sig(e: *Emit, name: string, target: string) -> IrFuncSig
 
     if e.tracked.has(target) then ps.push(caller_ir_param(true))
 
-    ir_sig(name, IrFnType(LPtr, ps, false, no_ir_attrs())) with { linkage = LinkInternal }
+    val marks = bare_attributes(c.0.marks)
+
+    ir_sig(name, IrFnType(LPtr, ps, false, no_ir_attrs())) with { linkage = LinkInternal, bare = marks }
 end place_entry_sig
 
 // The place entry's body: the place parameter named at the caller's storage, the others in slots as

@@ -1518,7 +1518,7 @@ function is called the ordinary way, its answer carrying a count of its own.
 
 Nothing in the build changes with the flag. The report is what the build decides from: a call to a
 function whose answer is a place or +0 is read where the answer lies, with no copy or count
-([a method's answer borrowed from its receiver](../reference/memory.md#a-methods-answer-borrowed-from-its-receiver)).
+([a method's answer borrowed from its receiver](/reference/memory/#a-method-s-answer-borrowed-from-its-receiver)).
 When no function answers a borrow, the flag says so.
 
 ### `-O2` is written the way clang writes it

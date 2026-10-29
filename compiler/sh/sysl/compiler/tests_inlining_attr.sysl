@@ -260,10 +260,53 @@ ia_on_a_generic_method()
         """)
     val lines = define_lines(out, "Box.grow")
 
-    assert_eq(lines.len(), 2)
+    // Each instantiation has its ordinary entry and, its body being a field of `self`, its place
+    // entry (`place_entry.sysl`); every one of the four carries the marks.
+    assert_eq(lines.len(), 4)
 
     for item in lines
         assert(item.contains("noinline cold"), item)
+
+// A method whose answer is a field of `self` has a second entry the caller reads the field through
+// (`place_entry.sysl`); it is the same declaration, so it carries the same marks.
+@test("a method's place entry carries its marks as its ordinary entry does")
+ia_place_entry_carries_marks()
+    if inl_no_library() then return
+
+    val out = inl_ir(raw"""
+        struct Box
+            value: int
+
+            @noinline
+            @cold
+            grow(self) -> int = self.value
+
+            @inline
+            read(self) -> int = self.value
+
+            plain(self) -> int = self.value
+
+        var a = Box(1)
+        print(a.grow(), a.read(), a.plain())
+        """)
+
+    val grows = define_lines(out, "Box.grow")
+    val reads = define_lines(out, "Box.read")
+    val plains = define_lines(out, "Box.plain")
+
+    assert_eq(grows.len(), 2)
+    assert_eq(reads.len(), 2)
+    assert_eq(plains.len(), 2)
+
+    for item in grows
+        assert(item.contains("noinline cold"), item)
+
+    for item in reads
+        assert(item.contains("inlinehint"), item)
+
+    for item in plains
+        assert(!item.contains("noinline") && !item.contains("inlinehint") && !item.contains("cold"), item)
+end ia_place_entry_carries_marks
 
 @test("and '@inline' on a generic method, at each instantiation")
 ia_inline_on_a_generic_method()
@@ -282,7 +325,7 @@ ia_inline_on_a_generic_method()
         """)
     val lines = define_lines(out, "Box.read")
 
-    assert_eq(lines.len(), 2)
+    assert_eq(lines.len(), 4)
 
     for item in lines
         assert(item.contains("inlinehint"), item)

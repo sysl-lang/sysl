@@ -413,6 +413,29 @@ private temp_at(e: *Emit, v: Val, ty: Type) -> Option[usize]
     None
 end temp_at
 
+// Whether a direct call's argument, handed to an owned parameter, would hand over a count this frame
+// holds -- a local at its last use, or a value a call or a construction made for this one -- rather
+// than take one for the callee, asked before the argument is worked out. Anything else (a read out
+// of storage, a borrowed parameter, a literal) takes its count either way, or has none to take.
+hands_count_over(e: *Emit, x: TExpr) -> bool
+    val ty = texpr_type(x)
+
+    if !e.moves.ready || e.layout.indirect(ty) || !contains_counted(ty) then return false
+
+    *x.kind match
+        TLoad(name, _) -> local_at(e, name, ty, false).is_some()
+        TCall(_, _, _, _) -> true
+        TCallPtr(_, _, _, _) -> true
+        TVCall(_, _, _, _, _) -> true
+        TStructNew(_, _) -> true
+        TEnumNew(_, _, _) -> true
+        TBinary(_, _, _, _) -> true
+        TFormat(_, _, _) -> true
+        TStr(_) -> true
+        TBox(_, _) -> true
+        _ -> false
+end hands_count_over
+
 // Where a local at its last use sits among the slots the innermost scope owns. A destination that
 // is not `lasting` takes no local whose release can run a destructor: that one lives to its scope's
 // end.
