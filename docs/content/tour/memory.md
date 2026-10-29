@@ -243,7 +243,8 @@ storage that something other than the program also writes.
 ## What this costs
 
 The compiler avoids counting where it is unnecessary. A local that never escapes its frame is not
-heap-allocated; a closure that does not outlive its frame is inlined rather than boxed; a slice of a
+heap-allocated; a closure that does not outlive its frame holds its variables by reference and is boxed in the frame
+rather than on the heap; a slice of a
 local array stays on the stack when no view of it escapes. None of this needs an annotation, and the
 compiler rejects the unsafe cases: returning a view of a local buffer is an error.
 
