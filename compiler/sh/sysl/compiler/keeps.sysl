@@ -770,15 +770,29 @@ through_answers_of(cx: &KeepsCx, name: string, i: usize) -> bool = summary(cx, n
 // where the callee keeps it. Where no body is in sight the answer is the rule's own default for the
 // pointer: an `extern` borrows unless its `@keeps` names the parameter, and a call through an object
 // of no known trait, or a function pointer C may call, is held to the default (`vcall_reads`,
-// `pointer_reads`). Asked for one to four steps.
-read_of(cx: &KeepsCx, name: string, i: usize, steps: int) -> KeptWhy = summary(cx, name, i, s"$ReadQ$steps")
+// `pointer_reads`). **Past `MaxReadSteps` it is what the body lets out of anything it reads through
+// the parameter** (`through_of`), which holds everything read that deep and more: a question deeper
+// than the summaries tell apart is answered conservatively, never let through.
+read_of(cx: &KeepsCx, name: string, i: usize, steps: int) -> KeptWhy =
+    if steps > MaxReadSteps then through_of(cx, name, i) else summary(cx, name, i, s"$ReadQ$steps")
 
-// Whether what `name` answers can be made of a value it read `steps` steps through the parameter at `i`.
+// Whether what `name` answers can be made of a value it read `steps` steps through the parameter at
+// `i` -- past `MaxReadSteps`, of anything it read through it.
 read_answers_of(cx: &KeepsCx, name: string, i: usize, steps: int) -> bool =
-    summary(cx, name, i, s"$ReadAnswersQ$steps").kept
+    if steps > MaxReadSteps then through_answers_of(cx, name, i) else summary(cx, name, i, s"$ReadAnswersQ$steps").kept
+
+// The deepest step a read question tells apart from the ones around it.
+private val MaxReadSteps = 8
 
 // The steps a read question asks about, out of its mark (`#2` is two).
-private steps_of(q: string) -> int = int(q.bytes[1]) - int(u8('0'))
+private steps_of(q: string) -> int
+    var n = 0
+
+    for b in q.bytes[1..<q.bytes.len]
+        n = n * 10 + int(b) - int(u8('0'))
+
+    n
+end steps_of
 
 private summary(cx: &KeepsCx, name: string, i: usize, q: string) -> KeptWhy
     val key = s"$q$name|$i"
@@ -1759,8 +1773,14 @@ private track_call_locs(t: &Track, name: string, j: usize, arg: TExpr) -> Buf[Ke
     for item in kept
         out.push(item)
 
-    for item in (if t.steps > 0 then read_of(t.cx, name, j, steps_left(t, arg)) else through_of(t.cx, name, j)).locs
-        out.push(item)
+    if t.steps == 0
+        for item in through_of(t.cx, name, j).locs
+            out.push(item)
+    end if
+
+    for k in steps_left(t, arg)
+        for item in read_of(t.cx, name, j, k).locs
+            out.push(item)
 
     out
 end track_call_locs
@@ -1775,9 +1795,14 @@ private track_vcall_locs(t: &Track, recv: TExpr, slot: int, k: usize, arg: TExpr
     for item in kept
         out.push(item)
 
-    for item in (if t.steps > 0 then vcall_reads(t.cx, recv, slot, k, steps_left(t, arg))
-                 else vcall_through(t.cx, recv, slot, k))
-        out.push(item)
+    if t.steps == 0
+        for item in vcall_through(t.cx, recv, slot, k)
+            out.push(item)
+    end if
+
+    for left in steps_left(t, arg)
+        for item in vcall_reads(t.cx, recv, slot, k, left)
+            out.push(item)
 
     out
 end track_vcall_locs
@@ -1792,9 +1817,14 @@ private track_pointer_locs(t: &Track, callee: TExpr, j: usize, arg: TExpr) -> Bu
     for item in kept
         out.push(item)
 
-    for item in (if t.steps > 0 then pointer_reads(t.cx, callee, j, steps_left(t, arg))
-                 else pointer_through(t.cx, callee, j))
-        out.push(item)
+    if t.steps == 0
+        for item in pointer_through(t.cx, callee, j)
+            out.push(item)
+    end if
+
+    for left in steps_left(t, arg)
+        for item in pointer_reads(t.cx, callee, j, left)
+            out.push(item)
 
     out
 end track_pointer_locs
@@ -1804,50 +1834,157 @@ end track_pointer_locs
 // what is read `steps` in, only a pointer on the way handed on, of which the callee is asked the steps
 // left (`steps_left`); a value read `steps` in and handed on is followed by what the callee keeps of it.
 private reads_on(t: &Track, arg: TExpr) -> bool =
-    t.through && asks_through(t.cx, texpr_type(arg)) && (t.steps == 0 || ptr_step(t, arg, 0) >= 0)
+    t.through && asks_through(t.cx, texpr_type(arg)) && (t.steps == 0 || !ptr_steps(t, arg).is_empty())
 
-private steps_left(t: &Track, arg: TExpr) -> int = t.steps - ptr_step(t, arg, 0)
+// The steps a callee handed `arg` is asked about: what is still to be read past each step it may
+// have been read at -- more than the walk's own where it points at a pointer on the way (`&q`, `q`
+// bound to the parameter, reads two steps to what the parameter reads one).
+private steps_left(t: &Track, arg: TExpr) -> Buf[int]
+    var out: Buf[int] = buf()
 
-// **How many steps through the parameter a pointer on the way was read** in a walk of what is read
-// `steps` in, or -1 for a value that is no such pointer: 0 for the parameter and a name bound to it,
-// one more for each step through one (`p.s`, `p[i]` of a view), the same for a field or element in
-// place, a view or a cast of it, and one fewer for an address taken into what one points at (`&p.x`
-// reads, a step in, what `p` does). A value read `steps` in is what is followed, not a pointer on the
-// way.
-private ptr_step(t: &Track, e: TExpr, depth: int) -> int
-    if t.steps == 0 || depth > 12 then return -1
+    for s in ptr_steps(t, arg)
+        push_step(&out, t.steps - s)
+
+    out
+end steps_left
+
+// **Every step through the parameter a pointer on the way may have been read at** in a walk of what is
+// read `steps` in, or none for a value that is no such pointer: 0 for the parameter and a name bound
+// to it, one more for each step through one (`p.s`, `p[i]` of a view), the same for a field or
+// element in place, a view or a cast of it, and one fewer for an address taken of a place holding one
+// (`&p.x` reads, a step in, what `p` does; `&q`, where `q` is bound to the parameter, is a step
+// further out than the parameter). The address of a place holding the value read `steps` in is a
+// pointer on the way one step short of it. A local given values read at different steps has them all
+// (`ptrs`); so does a branch, and a call answering a value it read through a pointer on the way
+// (`call_steps`). A value read `steps` in is what is followed, not a pointer on the way.
+private ptr_steps(t: &Track, e: TExpr) -> Buf[int]
+    var out: Buf[int] = buf()
+
+    if t.steps > 0 then gather_steps(t, e, &out, 0)
+
+    out
+end ptr_steps
+
+private gather_steps(t: &Track, e: TExpr, out: *Buf[int], depth: int)
+    // An expression nested past what is followed may be a pointer at any step on the way.
+    if depth > 64
+        for s in 0..<t.steps
+            push_step(out, s)
+
+        return
+    end if
 
     *e.kind match
         TLoad(n, _) ->
             for item in t.ptrs
-                if item.0 == n then return item.1
-
-            -1
+                if item.0 == n then push_step(out, item.1)
         TAddrOf(place, _) ->
-            val s = ptr_step(t, place, depth + 1)
+            var inner: Buf[int] = buf()
 
-            if s >= 1 then s - 1 else -1
-        TDeref(x, _) -> step_on(t, ptr_step(t, x, depth + 1))
-        TField(r, _, _) -> ptr_step(t, r, depth + 1)
+            gather_steps(t, place, &inner, depth + 1)
+
+            for s in inner
+                push_step(out, s - 1)
+
+            if carries(t, place) then push_step(out, t.steps - 1)
+        TDeref(x, _) -> steps_on(t, x, out, depth)
+        TField(r, _, _) -> gather_steps(t, r, out, depth + 1)
         TIndex(r, _, _) -> texpr_type(r) match
-            Array(_, _) -> ptr_step(t, r, depth + 1)
-            _ -> step_on(t, ptr_step(t, r, depth + 1))
-        TCast(v, _) -> ptr_step(t, v, depth + 1)
-        TSlice(base, _, _, _, _) -> ptr_step(t, base, depth + 1)
-        TConstView(v) -> ptr_step(t, v, depth + 1)
-        TViewAs(v, _) -> ptr_step(t, v, depth + 1)
-        TSeq(exprs) -> if exprs.is_empty() then -1 else ptr_step(t, exprs.at(exprs.len() - 1), depth + 1)
-        TBlockExpr(b) -> if b.result.is_some() then ptr_step(t, b.result.unwrap(), depth + 1) else -1
-        _ -> -1
-end ptr_step
+            Array(_, _) -> gather_steps(t, r, out, depth + 1)
+            _ -> steps_on(t, r, out, depth)
+        TCast(v, _) -> gather_steps(t, v, out, depth + 1)
+        TSlice(base, _, _, _, _) -> gather_steps(t, base, out, depth + 1)
+        TConstView(v) -> gather_steps(t, v, out, depth + 1)
+        TViewAs(v, _) -> gather_steps(t, v, out, depth + 1)
+        TSeq(exprs) -> if !exprs.is_empty() then gather_steps(t, exprs.at(exprs.len() - 1), out, depth + 1)
+        TBlockExpr(b) -> if b.result.is_some() then gather_steps(t, b.result.unwrap(), out, depth + 1)
+        TIf(_, then_block, else_block, _) ->
+            if then_block.result.is_some() then gather_steps(t, then_block.result.unwrap(), out, depth + 1)
 
-// One step further through a pointer read `s` steps in: still a pointer on the way short of `steps`.
-private step_on(t: &Track, s: int) -> int = if s >= 0 && s + 1 < t.steps then s + 1 else -1
+            if else_block.is_some() && else_block.unwrap().result.is_some()
+                gather_steps(t, else_block.unwrap().result.unwrap(), out, depth + 1)
+        TMatch(_, arms, _) ->
+            for arm in arms
+                if arm.body.result.is_some() then gather_steps(t, arm.body.result.unwrap(), out, depth + 1)
+        TCall(name, args, ty, _) -> if may_hold_pointer(t.cx, ty) then call_steps(t, name, args, ty, out, depth)
+        TVCall(recv, _, args, ty, _) -> if may_hold_pointer(t.cx, ty) then any_steps(t, with_receiver(recv, args), out, depth)
+        TCallPtr(_, args, _, ty) -> if may_hold_pointer(t.cx, ty) then any_steps(t, args, out, depth)
+        _ -> ()
+end gather_steps
+
+// One step further through a pointer read some steps in: still a pointer on the way short of `steps`.
+private steps_on(t: &Track, x: TExpr, out: *Buf[int], depth: int)
+    var inner: Buf[int] = buf()
+
+    gather_steps(t, x, &inner, depth + 1)
+
+    for s in inner
+        if s + 1 < t.steps then push_step(out, s + 1)
+end steps_on
+
+// **What a call answers, read through a pointer on the way**: the pointer itself where the answer is
+// made of the argument, and a pointer `k` steps further in where the callee answers what it reads
+// `k` steps through it (`read_answers_of`) -- `get_s(w)` answering `w.s` hands back what the walk
+// reads one step through `w`.
+private call_steps(t: &Track, name: string, args: Buf[TExpr], ty: Type, out: *Buf[int], depth: int)
+    for i in 0..<args.len()
+        var inner: Buf[int] = buf()
+
+        gather_steps(t, args.at(i), &inner, depth + 1)
+
+        if inner.is_empty() then continue
+
+        val itself = answers_arg(t.cx, name, args, i, ty, false)
+
+        for s in inner
+            if itself then push_step(out, s)
+
+            if !asks_through(t.cx, texpr_type(args.at(i))) then continue
+
+            var k = 1
+
+            while s + k < t.steps
+                if read_answers_of(t.cx, name, i, k)
+                    // An answer read past the steps a summary tells apart may be any of them.
+                    if k > MaxReadSteps
+                        for m in s + k..<t.steps
+                            push_step(out, m)
+                    else
+                        push_step(out, s + k)
+                    end if
+                end if
+
+                k += 1
+            end while
+        end for
+    end for
+end call_steps
+
+// A call through an object or a function pointer may answer any pointer on the way it was handed, or
+// anything further in.
+private any_steps(t: &Track, args: Buf[TExpr], out: *Buf[int], depth: int)
+    for a in args
+        var inner: Buf[int] = buf()
+
+        gather_steps(t, a, &inner, depth + 1)
+
+        for s in inner
+            for m in s..<t.steps
+                push_step(out, m)
+    end for
+end any_steps
+
+private push_step(out: *Buf[int], s: int)
+    for item in *out
+        if item == s then return
+
+    out.push(s)
+end push_step
 
 // A step through `x` reads what is followed: anything for a walk of what is read through the
 // parameter; for a walk of what is read `steps` in, the last step, or one that reads a pointer on the
 // way.
-private steps_in(t: &Track, x: TExpr) -> bool = t.through && (t.steps == 0 || ptr_step(t, x, 0) >= 0)
+private steps_in(t: &Track, x: TExpr) -> bool = t.through && (t.steps == 0 || !ptr_steps(t, x).is_empty())
 
 // A store: into this frame's own storage it binds the local (`track_locals`); anywhere else it is
 // held at the location the place names.
@@ -2018,18 +2155,51 @@ private bind_expr(t: &Track, e: TExpr)
         TCallPtr(callee, args, _, _) -> bind_ptr_call(t, callee, args)
         TMatch(scrutinee, arms, _) ->
             if carries(t, scrutinee)
+                val steps = ptr_steps(t, scrutinee)
+
                 for arm in arms
                     for p in arm.patterns
-                        bind_pattern(t, p)
+                        bind_pattern(t, p, steps)
+            end if
         TIf(cond, _, _, _) -> bind_terms(t, cond)
         TWhile(cond, _, _, _) -> bind_terms(t, cond)
-        TForEach(name, _, seq, _, _, _) -> if carries(t, seq) then bind_name(t, name)
+        TForEach(name, _, seq, _, _, _) ->
+            if carries(t, seq)
+                bind_steps(t, name, element_steps(t, seq))
+                bind_name(t, name)
+            end if
         TIterate(cursor, _, init, _, pat, _, _, _) ->
             if carries(t, init)
+                val steps = ptr_steps(t, init)
+
+                bind_steps(t, cursor, steps)
                 bind_name(t, cursor)
-                bind_pattern(t, pat)
+
+                // What the cursor hands out may sit in it, or be read through it.
+                var each = element_steps(t, init)
+
+                for s in steps
+                    push_step(&each, s)
+
+                bind_pattern(t, pat, each)
+            end if
         _ -> ()
 end bind_expr
+
+// The steps an element of a sequence is read at: those of an array itself, one further through a view
+// or a pointer.
+private element_steps(t: &Track, seq: TExpr) -> Buf[int]
+    val steps = ptr_steps(t, seq)
+
+    if is_array_type(texpr_type(seq)) then return steps
+
+    var out: Buf[int] = buf()
+
+    for s in steps
+        if s + 1 < t.steps then push_step(&out, s + 1)
+
+    out
+end element_steps
 
 private bind_terms(t: &Track, cond: Buf[TCondTerm])
     for term in cond
@@ -2037,32 +2207,46 @@ private bind_terms(t: &Track, cond: Buf[TCondTerm])
             TCondIs(subject, patterns, _) ->
                 if carries(t, subject)
                     for p in patterns
-                        bind_pattern(t, p)
+                        bind_pattern(t, p, ptr_steps(t, subject))
             _ -> ()
 end bind_terms
 
-private bind_pattern(t: &Track, p: TPattern)
+// A name a pattern binds holds what its subject does, at the steps the subject was read at: a payload
+// sits in place in the value matched.
+private bind_pattern(t: &Track, p: TPattern, steps: Buf[int])
     var names: Buf[string] = buf()
 
     pattern_names(p, &names)
 
     for n in names
+        bind_steps(t, n, steps)
         bind_name(t, n)
 end bind_pattern
 
 private bind(t: &Track, name: string, value: TExpr)
     if !carries(t, value) then return
 
-    // A name bound to a pointer on the way is read through as that pointer is.
-    val s = ptr_step(t, value, 0)
-
-    if s >= 0 && !bound_step(t, name)
-        t.ptrs.push((name, s))
-        t.changed = true
-    end if
-
+    bind_steps(t, name, ptr_steps(t, value))
     bind_name(t, name)
 end bind
+
+// **A name bound to a pointer on the way is read through as that pointer is** -- at every step it may
+// have been read at, since a local given a pointer read one step in and then one read two steps in
+// holds either afterwards.
+private bind_steps(t: &Track, name: string, steps: Buf[int])
+    for s in steps
+        if !has_step(t, name, s)
+            t.ptrs.push((name, s))
+            t.changed = true
+        end if
+end bind_steps
+
+private has_step(t: &Track, name: string, s: int) -> bool
+    for item in t.ptrs
+        if item.0 == name && item.1 == s then return true
+
+    false
+end has_step
 
 private bound_step(t: &Track, name: string) -> bool
     for item in t.ptrs
@@ -2145,9 +2329,11 @@ private carries(t: &Track, e: TExpr) -> bool = *e.kind match
     // What a call answers may be made of what it was handed. A callee with a body here says which of
     // its arguments its answer is made of; one through an object or a pointer may be made of any. An
     // integer is followed only through a body: a C function's number is not made of an address.
+    // An answer that is a pointer on the way, read further in than what the walk follows, carries it
+    // too (`call_steps`).
     TCall(name, args, ty, _) ->
         (may_hold_pointer(t.cx, ty) || (is_integer_type(ty) && t.cx.find(name).is_some())) &&
-            call_carries(t, name, args, ty)
+            (call_carries(t, name, args, ty) || (t.steps > 0 && !ptr_steps(t, e).is_empty()))
     TVCall(recv, _, args, ty, _) ->
         may_hold_pointer(t.cx, ty) && (carries(t, recv) || any_carries(t, args))
     TCallPtr(callee, args, _, ty) ->
@@ -2235,9 +2421,14 @@ private call_carries(t: &Track, name: string, args: Buf[TExpr], ty: Type) -> boo
     false
 end call_carries
 
-private answers_read(t: &Track, name: string, args: Buf[TExpr], i: usize) -> bool =
-    if t.steps > 0 then read_answers_of(t.cx, name, i, steps_left(t, args.at(i)))
-    else through_answers_of(t.cx, name, i)
+private answers_read(t: &Track, name: string, args: Buf[TExpr], i: usize) -> bool
+    if t.steps == 0 then return through_answers_of(t.cx, name, i)
+
+    for k in steps_left(t, args.at(i))
+        if read_answers_of(t.cx, name, i, k) then return true
+
+    false
+end answers_read
 
 private any_carries(t: &Track, es: Buf[TExpr]) -> bool
     for item in es
@@ -2381,10 +2572,20 @@ struct FrameTrack
     // The locals bound once to a pointer, each with what it was bound to (`frame_lasting`).
     inits: Buf[(string, TExpr)]
 
-    // Every value put into a local's own storage that may hold an address -- its initializer and each
-    // store into it or a field or element of it -- for what a read through its address reaches
-    // (`read_cores`).
-    bound: Buf[(string, TExpr)]
+    // **What a read through an argument reaches of this frame** (`read_cores`, `frame_closed`): every
+    // value put into a local's own storage -- its initializer, each store into it or a field or element
+    // of it, a name a pattern or a loop binds (`true`: an element of the value, or one read through it)
+    // -- every store through a pointer, and every call, which may store what it reads through one
+    // argument into what another reaches. `points` is what they come to, worked out the first time a
+    // walk asks (`settle_points`): each local's storage, with every local whose address it may hold
+    // and how the refusal says that address -- `?` for an address from anywhere else. `flat` is the
+    // locals whose type holds no address, which nothing is put into.
+    binds: Buf[(string, TExpr, bool)]
+    flat: Buf[string]
+    stores: Buf[(TExpr, TExpr)]
+    calls: Buf[TExpr]
+    points: Buf[(string, string, string)]
+    pointed: bool
 
     // Whether this walk is the probe that decides closures' capture modes (`probe_frame`): what it
     // follows is the closure literals rather than the frame's addresses.
@@ -2491,7 +2692,7 @@ private frame_walk(cx: &KeepsCx, faults: &KeepFaults, f: TFunc, probe: bool)
     val org = origins_of(cx, f)
     val ft: &FrameTrack = FrameTrack(cx, faults, func_home(cx.an, f.name), shown_name(cx.an, f.name),
                                      f.params, buf(), buf(), false, org, round_handles(cx, org, f), f, buf(),
-                                     buf(), probe)
+                                     buf(), buf(), buf(), buf(), buf(), false, probe)
 
     walk_block_stmts(f.body, stmt_walk(false, s -> s match
         TRefDecl(n, _, place) -> ft.refs.push((n, place))
@@ -2499,9 +2700,14 @@ private frame_walk(cx: &KeepsCx, faults: &KeepFaults, f: TFunc, probe: bool)
         _ -> ()))
 
     if !probe
-        walk_block_stmts(f.body, TWalk(false, e -> (), w -> frame_note_bound(ft, w.place, w.value), s -> s match
-            TVarDecl(n, ty, init, _) -> if may_hold_pointer(cx, ty) then ft.bound.push((n, init))
+        walk_block_stmts(f.body, TWalk(false, e -> note_point_expr(ft, e), w -> note_point_store(ft, w.place, w.value),
+                                       s -> s match
+            TVarDecl(n, ty, init, _) ->
+                if may_hold_pointer(cx, ty) then ft.binds.push((n, init, false)) else ft.flat.push(n)
             _ -> ()))
+
+        for p in f.params
+            if !may_hold_pointer(cx, p.1) then ft.flat.push(p.0)
     end if
 
     ft.changed = true
@@ -2688,15 +2894,6 @@ private frame_bind_ptr_call(ft: &FrameTrack, callee: TExpr, args: Buf[TExpr])
             if loc.starts_with("l:") then frame_hold(ft, local_of(loc), core.unwrap())
             else if ft.probe then probe_hold_kept(ft, args, item.1.loc, core.unwrap())
 end frame_bind_ptr_call
-
-// A value stored into a local's own storage, noted for what a read through its address reaches.
-private frame_note_bound(ft: &FrameTrack, place: TExpr, v: TExpr)
-    if !may_hold_pointer(ft.cx, texpr_type(v)) then return
-
-    local_root(ft.refs, place) match
-        Some(n) -> ft.bound.push((n, v))
-        None -> ()
-end frame_note_bound
 
 // A store into this frame's own storage -- by name, or through a pointer that points into it.
 private frame_bind_store(ft: &FrameTrack, place: TExpr, v: TExpr)
@@ -3297,59 +3494,29 @@ end frame_pread_locs
 private put_back(loc: string, j: usize) -> bool = loc.starts_with(s"p$j:") || loc.starts_with(s"d:p$j:")
 
 // **Whether everything a pointer argument reaches is this frame's own storage**: the locals it points
-// at, and every local whose address what they were given holds, with no address in any of it that came
-// from anywhere else -- a parameter, a call, module storage, a pointer read out of something.
+// at, and everything their storage holds the address of, at any depth, with no address in any of it
+// that came from anywhere else -- a parameter, a call, module storage, a heap object (`points`).
 private frame_closed(ft: &FrameTrack, arg: TExpr) -> bool
-    var reached = pointed_locals(ft, arg, 0)
-    var seen: Buf[string] = buf()
+    settle_points(ft)
 
-    if reached.is_empty() then return false
+    var first: Buf[(string, string)] = buf()
 
-    while !reached.is_empty()
-        var next: Buf[string] = buf()
+    addrs(ft, arg, &first, 0)
 
-        for n in reached
-            if holds_string(seen, n) then continue
+    if first.is_empty() then return false
 
-            seen.push(n)
+    for p in first
+        if !own_point(p.0) then return false
 
-            for p in ft.params
-                if p.0 == n then return false
-
-            for item in ft.bound
-                if item.0 == n && !frame_only(ft, item.1, &next, 0) then return false
-        end for
-
-        reached = next
-    end while
+    for p in reach(ft, first)
+        if !own_point(p.0) then return false
 
     true
 end frame_closed
 
-// Whether a value holds no address but those of this frame's locals, each gathered into `out`.
-private frame_only(ft: &FrameTrack, e: TExpr, out: *Buf[string], depth: int) -> bool
-    if depth > 8 then return false
-    if !may_hold_pointer(ft.cx, texpr_type(e)) then return true
-
-    *e.kind match
-        TAddrOf(place, _) -> local_root(ft.refs, place) match
-            Some(n) ->
-                out.push(n)
-                true
-            None -> false
-        TStructNew(_, args) -> all_frame_only(ft, args, out, depth)
-        TEnumNew(_, _, args) -> all_frame_only(ft, args, out, depth)
-        TArrayLit(elems, _) -> all_frame_only(ft, elems, out, depth)
-        TCast(v, _) -> frame_only(ft, v, out, depth + 1)
-        _ -> false
-end frame_only
-
-private all_frame_only(ft: &FrameTrack, es: Buf[TExpr], out: *Buf[string], depth: int) -> bool
-    for item in es
-        if !frame_only(ft, item, out, depth + 1) then return false
-
-    true
-end all_frame_only
+// Whether a point is storage of this frame: a local, a parameter's copy, or a value made in place --
+// not an address from anywhere else, nor a heap object.
+private own_point(name: string) -> bool = name != "?" && !name.starts_with("%b")
 
 // What a conversion to `&sync` makes of a closure: one held by value, as every closure that crosses
 // a domain is.
@@ -3586,118 +3753,578 @@ private answer_core(ft: &FrameTrack, name: string, args: Buf[TExpr], ty: Type) -
     None
 end answer_core
 
-// **What a read through a pointer or a view reaches of this frame**, for the rule's walk: the
-// address of this frame's storage that the storage it points at holds. `&h`, where `h` holds `&x`,
-// reaches `&x`; so does a local bound once to `&h`, a view of an array of such addresses, and the
-// address of a value made in place around one. A pointer read out of a field, or one a parameter
-// brought, reaches nothing this walk follows. A probe asks what a value reaches in `probe_text`.
-private read_core(ft: &FrameTrack, e: TExpr, depth: int) -> Option[string]
-    if ft.probe || depth > 8 then return None
-
-    *e.kind match
-        TAddrOf(place, _) -> local_root(ft.refs, place) match
-            Some(n) -> ft.core_of(n)
-            None -> None
-        TTempAddr(v, _) -> frame_core(ft, v)
-        TLoad(n, _) ->
-            for item in ft.inits
-                if item.0 == n then return read_core(ft, item.1, depth + 1)
-
-            None
-        TSlice(base, _, _, _, _) -> texpr_type(base) match
-            Array(_, _) -> local_root(ft.refs, base) match
-                Some(n) -> ft.core_of(n)
-                None -> frame_core(ft, base)
-            _ -> read_core(ft, base, depth + 1)
-        TBufLit(elems, _) -> first_core(ft, elems)
-        TCast(v, _) -> read_core(ft, v, depth + 1)
-        TViewAs(v, _) -> read_core(ft, v, depth + 1)
-        TSeq(exprs) -> if exprs.is_empty() then None else read_core(ft, exprs.at(exprs.len() - 1), depth + 1)
-        TBlockExpr(b) -> if b.result.is_some() then read_core(ft, b.result.unwrap(), depth + 1) else None
-        _ -> None
-end read_core
-
 // **Every address of this frame's storage that a read through an argument reaches, with the steps it
-// takes** (the rule's walk): one step, what `read_core` says; then, where what it points at is a local
-// given a value holding `&s` (`var w = W(&s)`, `w.s = &s`), what `s` holds, a step further -- up to
-// four.
+// takes** (the rule's walk). The argument points at some of this frame's storage (`addrs`); what that
+// storage holds the address of is read one step in, what THAT storage holds two steps in, and so on
+// (`points`, which follows a value however it got there -- built in place, copied out of a field into
+// a local, read through a pointer, stored by a callee). `&h`, where `h` holds `&x`, reaches `&x` one
+// step in; `&w`, where `w` holds `&h`, reaches it two steps in. What this frame's own walk says a local
+// holds (`core_of`) is read at the same step as the rest of its storage. **Past `MaxReadSteps`
+// everything still reachable is gathered at one step further**, which the callee answers for anything
+// it reads that deep or deeper (`read_of`) -- so a chain longer than the summaries tell apart, or a
+// cycle, is never let through.
 private read_cores(ft: &FrameTrack, arg: TExpr) -> Buf[(int, string)]
     var out: Buf[(int, string)] = buf()
 
     if ft.probe then return out
 
-    val first = read_core(ft, arg, 0)
+    settle_points(ft)
 
-    if first.is_some() then out.push((1, first.unwrap()))
+    var level: Buf[(string, string)] = buf()
 
-    var reached = pointed_locals(ft, arg, 0)
-    var steps = 1
+    addrs(ft, arg, &level, 0)
 
-    while steps < 4 && !reached.is_empty()
-        var next: Buf[string] = buf()
+    var k = 1
 
-        for n in reached
-            for item in ft.bound
-                if item.0 == n then addressed_locals(ft, item.1, &next, 0)
+    while k <= MaxReadSteps + 1 && !level.is_empty()
+        var next = deref_level(ft, level)
 
-        steps += 1
+        for p in level
+            held_core(ft, &out, k, p.0)
 
-        for n in next
-            val c = ft.core_of(n)
+        if k > MaxReadSteps
+            for p in reach(ft, next)
+                push_point(&next, p)
 
-            if c.is_some() then out.push((steps, c.unwrap()))
+            for p in next
+                held_core(ft, &out, k, p.0)
+        end if
 
-        reached = next
+        for p in next
+            if own_point(p.0) && p.1 != "" then push_core(&out, k, p.1)
+
+        level = next
+        k += 1
     end while
 
     out
 end read_cores
 
-// The locals whose own storage a pointer or a view points at.
-private pointed_locals(ft: &FrameTrack, e: TExpr, depth: int) -> Buf[string]
-    var out: Buf[string] = buf()
+// What this frame's own walk says the storage of `name` holds, read `k` steps in.
+private held_core(ft: &FrameTrack, out: *Buf[(int, string)], k: int, name: string)
+    if !own_point(name) then return
 
-    if depth > 8 then return out
+    val c = ft.core_of(name)
+
+    if c.is_some() then push_core(out, k, c.unwrap())
+end held_core
+
+private push_core(out: *Buf[(int, string)], k: int, core: string)
+    for item in *out
+        if item.0 == k && item.1 == core then return
+
+    out.push((k, core))
+end push_core
+
+// -- what this frame's storage holds the address of ----------------------------------------------
+
+// A value stored into storage that may hold an address: into a local's own, a binding; anywhere else,
+// a store through a pointer, which may land in this frame's storage (`store_targets`).
+private note_point_store(ft: &FrameTrack, place: TExpr, v: TExpr)
+    if !may_hold_pointer(ft.cx, texpr_type(v)) then return
+
+    local_root(ft.refs, place) match
+        Some(n) -> ft.binds.push((n, v, false))
+        None -> ft.stores.push((place, v))
+end note_point_store
+
+// The forms that put a value somewhere this frame's storage can be read: a store, a call, a pattern's
+// names, a loop's, and storage made in place -- a value whose address is taken, a box, a view's
+// elements -- named by where it is written (`made_point`).
+private note_point_expr(ft: &FrameTrack, e: TExpr)
+    *e.kind match
+        TStore(place, v, _, _) -> note_point_store(ft, place, v)
+        TCall(_, _, _, _) -> ft.calls.push(e)
+        TVCall(_, _, _, _, _) -> ft.calls.push(e)
+        TCallPtr(_, _, _, _) -> ft.calls.push(e)
+        TMatch(scrutinee, arms, _) ->
+            for arm in arms
+                for p in arm.patterns
+                    note_pattern(ft, p, scrutinee, false)
+        TIf(cond, _, _, _) -> note_terms(ft, cond)
+        TWhile(cond, _, _, _) -> note_terms(ft, cond)
+        TForEach(name, _, seq, _, _, _) -> ft.binds.push((name, seq, true))
+        TIterate(cursor, _, init, _, pat, _, _, _) ->
+            ft.binds.push((cursor, init, false))
+            note_pattern(ft, pat, init, true)
+        TTempAddr(v, _) -> ft.binds.push((made_point("%t", e), v, false))
+        TBox(v, _) -> ft.binds.push((made_point("%b", e), v, false))
+        TBufLit(elems, _) ->
+            for item in elems
+                ft.binds.push((made_point("%l", e), item, false))
+        TBufFill(v, _, _) -> ft.binds.push((made_point("%l", e), v, false))
+        TSlice(base, _, _, _, _) -> note_made_array(ft, base)
+        TConstView(v) -> note_made_array(ft, v)
+        TViewAs(v, _) -> note_made_array(ft, v)
+        _ -> ()
+end note_point_expr
+
+// An array made in place to be seen as a view holds its elements where the view points.
+private note_made_array(ft: &FrameTrack, v: TExpr)
+    if is_array_type(texpr_type(v)) && !is_place(ft, v) then ft.binds.push((made_point("%a", v), v, false))
+
+private note_terms(ft: &FrameTrack, cond: Buf[TCondTerm])
+    for term in cond
+        term match
+            TCondIs(subject, patterns, _) ->
+                for p in patterns
+                    note_pattern(ft, p, subject, false)
+            _ -> ()
+end note_terms
+
+private note_pattern(ft: &FrameTrack, p: TPattern, subject: TExpr, element: bool)
+    var names: Buf[string] = buf()
+
+    pattern_names(p, &names)
+
+    for n in names
+        ft.binds.push((n, subject, element))
+end note_pattern
+
+// The name of storage made in place where `e` is written.
+private made_point(kind: string, e: TExpr) -> string = s"$kind${e.span.start}"
+
+// Whether an expression names storage -- a local, a field or element of one, what a pointer points at
+// -- rather than making a value.
+private is_place(ft: &FrameTrack, e: TExpr) -> bool = *e.kind match
+    TLoad(_, _) -> true
+    TGlobal(_, _, _) -> true
+    TDeref(_, _) -> true
+    TField(r, _, _) -> is_place(ft, r)
+    TIndex(r, _, _) -> !is_array_type(texpr_type(r)) || is_place(ft, r)
+    _ -> false
+
+// **What every local's storage may hold the address of**, worked out once a walk asks: a fixpoint over
+// every value put into it, every store through a pointer, and every call, which only adds, so it
+// settles. A parameter's storage holds what its caller handed over, which is `?`.
+private settle_points(ft: &FrameTrack)
+    if ft.pointed then return
+
+    ft.pointed = true
+
+    for p in ft.params
+        if may_hold_pointer(ft.cx, p.1) then add_point(ft, p.0, ("?", ""))
+
+    var changed = true
+
+    while changed
+        changed = false
+
+        for b in ft.binds
+            var vals: Buf[(string, string)] = buf()
+
+            addrs(ft, b.1, &vals, 0)
+
+            if b.2
+                for p in deref_level(ft, vals)
+                    push_point(&vals, p)
+            end if
+
+            for v in vals
+                if add_point(ft, b.0, v) then changed = true
+        end for
+
+        for s in ft.stores
+            var vals: Buf[(string, string)] = buf()
+
+            addrs(ft, s.1, &vals, 0)
+
+            for target in store_targets(ft, s.0)
+                for v in vals
+                    if add_point(ft, target, v) then changed = true
+        end for
+
+        for c in ft.calls
+            if call_points(ft, c) then changed = true
+    end while
+end settle_points
+
+private add_point(ft: &FrameTrack, holder: string, p: (string, string)) -> bool
+    for item in ft.points
+        if item.0 == holder && item.1 == p.0 then return false
+
+    ft.points.push((holder, p.0, p.1))
+    true
+end add_point
+
+private push_point(out: *Buf[(string, string)], p: (string, string))
+    for item in *out
+        if item.0 == p.0 then return
+
+    out.push(p)
+end push_point
+
+// What the storage of each point holds the address of: one step further in. An address from anywhere
+// else reaches somewhere else again.
+private deref_level(ft: &FrameTrack, level: Buf[(string, string)]) -> Buf[(string, string)]
+    var out: Buf[(string, string)] = buf()
+
+    for p in level
+        if p.0 == "?"
+            push_point(&out, p)
+            continue
+        end if
+
+        for item in ft.points
+            if item.0 == p.0 then push_point(&out, (item.1, item.2))
+    end for
+
+    out
+end deref_level
+
+// Everything reachable from what the points hold, at any depth past them.
+private reach(ft: &FrameTrack, start: Buf[(string, string)]) -> Buf[(string, string)]
+    var out: Buf[(string, string)] = buf()
+    var level = start
+
+    while !level.is_empty()
+        var next: Buf[(string, string)] = buf()
+
+        for p in deref_level(ft, level)
+            var seen = false
+
+            for item in out
+                if item.0 == p.0 then seen = true
+
+            if !seen
+                out.push(p)
+                next.push(p)
+            end if
+        end for
+
+        level = next
+    end while
+
+    out
+end reach
+
+// **The storage a value may hold the address of** -- this frame's, by local, with how the refusal
+// says it, and `?` for an address from anywhere else. A field or element in place holds what its
+// value does; a read through a pointer holds what the storage it points at does; a call answers what
+// its summaries say it answers (`answer_points`).
+private addrs(ft: &FrameTrack, e: TExpr, out: *Buf[(string, string)], depth: int)
+    if depth > 32
+        push_point(out, ("?", ""))
+        return
+    end if
 
     *e.kind match
-        TAddrOf(place, _) -> local_root(ft.refs, place) match
-            Some(n) -> out.push(n)
-            None -> ()
+        TAddrOf(place, _) -> place_points(ft, place, out, depth + 1)
+        TTempAddr(_, _) -> push_point(out, (made_point("%t", e), s"the address of a value made in place in '${ft.owner}'"))
+        TBox(_, _) -> push_point(out, (made_point("%b", e), ""))
+        TBufLit(_, _) -> push_point(out, (made_point("%l", e), s"the address of a value made in place in '${ft.owner}'"))
+        TBufFill(_, _, _) -> push_point(out, (made_point("%l", e), s"the address of a value made in place in '${ft.owner}'"))
+        TLoad(n, ty) ->
+            if !may_hold_pointer(ft.cx, ty) then return
+
+            for item in ft.refs
+                if item.0 == n
+                    val root = local_root(ft.refs, e)
+
+                    if root.is_some() then contents_into(ft, root.unwrap(), out) else addrs(ft, item.1, out, depth + 1)
+
+                    return
+                end if
+            end for
+
+            contents_into(ft, n, out)
+        TGlobal(_, ty, _) -> if may_hold_pointer(ft.cx, ty) then push_point(out, ("?", ""))
+        TField(r, _, ty) -> if may_hold_pointer(ft.cx, ty) then addrs(ft, r, out, depth + 1)
+        TIndex(r, _, ty) ->
+            if !may_hold_pointer(ft.cx, ty) then return
+
+            if is_array_type(texpr_type(r)) then addrs(ft, r, out, depth + 1) else read_points(ft, r, out, depth)
+        TDeref(x, ty) -> if may_hold_pointer(ft.cx, ty) then read_points(ft, x, out, depth)
+        TSlice(base, _, _, _, _) -> view_points(ft, base, out, depth)
+        TConstView(v) -> view_points(ft, v, out, depth)
+        TViewAs(v, _) -> view_points(ft, v, out, depth)
+        TStructNew(_, args) -> all_addrs(ft, args, out, depth)
+        TEnumNew(_, _, args) -> all_addrs(ft, args, out, depth)
+        TArrayLit(elems, _) -> all_addrs(ft, elems, out, depth)
+        TArrayFill(v, _) -> addrs(ft, v, out, depth + 1)
+        TDowngrade(v, _) -> addrs(ft, v, out, depth + 1)
+        TUpgrade(v, _, _, _) -> addrs(ft, v, out, depth + 1)
+        TErase(v, _, _) -> addrs(ft, v, out, depth + 1)
+        TCast(v, _) -> addrs(ft, v, out, depth + 1)
+        TFloorCast(v, _) -> addrs(ft, v, out, depth + 1)
+        TTry(operand, _, _, _, _, _, _) -> addrs(ft, operand, out, depth + 1)
+        TRecheck(after, _, _, _) -> addrs(ft, after, out, depth + 1)
+        TStore(_, v, _, _) -> addrs(ft, v, out, depth + 1)
+        TSeq(exprs) -> if !exprs.is_empty() then addrs(ft, exprs.at(exprs.len() - 1), out, depth + 1)
+        TBlockExpr(b) -> block_addrs(ft, b, out, depth)
+        TIf(_, then_block, else_block, _) ->
+            block_addrs(ft, then_block, out, depth)
+
+            if else_block.is_some() then block_addrs(ft, else_block.unwrap(), out, depth)
+        TMatch(_, arms, _) ->
+            for arm in arms
+                block_addrs(ft, arm.body, out, depth)
+        TBinary(_, left, right, ty) ->
+            if may_hold_pointer(ft.cx, ty)
+                addrs(ft, left, out, depth + 1)
+                addrs(ft, right, out, depth + 1)
+            end if
+        TCall(name, args, ty, _) -> if may_hold_pointer(ft.cx, ty) then answer_points(ft, name, args, ty, out, depth)
+        TVCall(recv, _, args, ty, _) -> if may_hold_pointer(ft.cx, ty) then any_points(ft, with_receiver(recv, args), out, depth)
+        TCallPtr(_, args, _, ty) -> if may_hold_pointer(ft.cx, ty) then any_points(ft, args, out, depth)
+        TIntLit(_, _) -> ()
+        TStrLit(_) -> ()
+        TCStrLit(_) -> ()
+        TBoolLit(_) -> ()
+        TNullLit(_) -> ()
+        TZero(_) -> ()
+        TFuncAddr(_, _, _) -> ()
+        _ -> if may_hold_pointer(ft.cx, texpr_type(e)) then push_point(out, ("?", ""))
+end addrs
+
+private all_addrs(ft: &FrameTrack, es: Buf[TExpr], out: *Buf[(string, string)], depth: int)
+    for item in es
+        addrs(ft, item, out, depth + 1)
+
+private block_addrs(ft: &FrameTrack, b: TBlock, out: *Buf[(string, string)], depth: int) =
+    if b.result.is_some() then addrs(ft, b.result.unwrap(), out, depth + 1)
+
+private contents_into(ft: &FrameTrack, name: string, out: *Buf[(string, string)])
+    for item in ft.points
+        if item.0 == name then push_point(out, (item.1, item.2))
+
+// What is read through a pointer or a view: what the storage it points at holds.
+private read_points(ft: &FrameTrack, x: TExpr, out: *Buf[(string, string)], depth: int)
+    var ps: Buf[(string, string)] = buf()
+
+    addrs(ft, x, &ps, depth + 1)
+
+    for p in deref_level(ft, ps)
+        push_point(out, p)
+end read_points
+
+// A view of an array points at the array's storage; one of a view or a pointer, where that points.
+private view_points(ft: &FrameTrack, v: TExpr, out: *Buf[(string, string)], depth: int)
+    if !is_array_type(texpr_type(v)) then addrs(ft, v, out, depth + 1)
+    else if is_place(ft, v) then place_points(ft, v, out, depth + 1)
+    else push_point(out, (made_point("%a", v), s"the address of a value made in place in '${ft.owner}'"))
+end view_points
+
+// The storage an address taken of a place is: a local's own (as the refusal says it), what a pointer
+// the place is reached through points at, or module storage.
+private place_points(ft: &FrameTrack, place: TExpr, out: *Buf[(string, string)], depth: int)
+    local_root(ft.refs, place) match
+        Some(n) ->
+            push_point(out, (n, frame_place(ft, place).unwrap_or(s"the address of a local of '${ft.owner}'")))
+            return
+        None -> ()
+
+    *place.kind match
         TLoad(n, _) ->
-            for item in ft.inits
-                if item.0 == n then return pointed_locals(ft, item.1, depth + 1)
-        TSlice(base, _, _, _, _) -> texpr_type(base) match
-            Array(_, _) -> local_root(ft.refs, base) match
-                Some(n) -> out.push(n)
-                None -> ()
-            _ -> return pointed_locals(ft, base, depth + 1)
-        TCast(v, _) -> return pointed_locals(ft, v, depth + 1)
-        TViewAs(v, _) -> return pointed_locals(ft, v, depth + 1)
+            for item in ft.refs
+                if item.0 == n
+                    place_points(ft, item.1, out, depth + 1)
+                    return
+                end if
+            end for
+
+            push_point(out, ("?", ""))
+        TField(r, _, _) -> place_points(ft, r, out, depth + 1)
+        TIndex(r, _, _) -> if is_array_type(texpr_type(r)) then place_points(ft, r, out, depth + 1) else addrs(ft, r, out, depth + 1)
+        TDeref(x, _) -> addrs(ft, x, out, depth + 1)
+        _ -> push_point(out, ("?", ""))
+end place_points
+
+// The locals a store through a pointer may land in.
+private store_targets(ft: &FrameTrack, place: TExpr) -> Buf[string]
+    var ps: Buf[(string, string)] = buf()
+    var out: Buf[string] = buf()
+
+    place_points(ft, place, &ps, 0)
+
+    for p in ps
+        if p.0 != "?" then out.push(p.0)
+
+    out
+end store_targets
+
+// **What a call answers**: an argument, where the callee answers with it, and what is read some steps
+// through an argument, where the callee answers with what it reads that far in (`read_answers_of`).
+// A callee with no body here answers only what it is said to; an object's or a function pointer's
+// answers anything it was handed (`any_points`).
+private answer_points(ft: &FrameTrack, name: string, args: Buf[TExpr], ty: Type, out: *Buf[(string, string)],
+                      depth: int)
+    for i in 0..<args.len()
+        val arg = args.at(i)
+        var level: Buf[(string, string)] = buf()
+
+        addrs(ft, arg, &level, depth + 1)
+
+        if answers_arg(ft.cx, name, args, i, ty, false)
+            for p in level
+                push_point(out, p)
+        end if
+
+        if !asks_through(ft.cx, texpr_type(arg)) || ft.cx.find(name).is_none() then continue
+
+        var k = 1
+
+        while k <= MaxReadSteps + 1 && !level.is_empty()
+            var next = deref_level(ft, level)
+
+            if k > MaxReadSteps
+                for p in reach(ft, next)
+                    next.push(p)
+            end if
+
+            if read_answers_of(ft.cx, name, i, k)
+                for p in next
+                    push_point(out, p)
+            end if
+
+            level = next
+            k += 1
+        end while
+    end for
+end answer_points
+
+private any_points(ft: &FrameTrack, args: Buf[TExpr], out: *Buf[(string, string)], depth: int)
+    push_point(out, ("?", ""))
+
+    for a in args
+        var level: Buf[(string, string)] = buf()
+
+        addrs(ft, a, &level, depth + 1)
+
+        for p in level
+            push_point(out, p)
+
+        for p in reach(ft, level)
+            push_point(out, p)
+    end for
+end any_points
+
+// **What a call may store into this frame's storage**: where a callee keeps an argument in what
+// another one -- or the same one -- reaches (`into.p = from`), or puts what it reads some steps
+// through one there (`into.p = from.p`, `w.a = w.b.c`), everything the second reaches may hold the
+// first, or what was read that far in (`read_of`). Coarse about where it lands -- any of the storage
+// the argument reaches -- but it only adds.
+private call_points(ft: &FrameTrack, c: TExpr) -> bool
+    var handed: Buf[TExpr] = buf()
+
+    *c.kind match
+        TCall(_, args, _, _) -> handed = args
+        TVCall(recv, _, args, _, _) -> handed = with_receiver(recv, args)
+        TCallPtr(_, args, _, _) -> handed = args
+        _ -> return false
+
+    var changed = false
+
+    for j in 0..<handed.len()
+        val arg = handed.at(j)
+
+        if !may_hold_pointer(ft.cx, texpr_type(arg)) then continue
+
+        var level: Buf[(string, string)] = buf()
+
+        addrs(ft, arg, &level, 0)
+
+        if level.is_empty() then continue
+
+        for loc in call_locs(ft, c, j, 0)
+            if into_handed(ft, handed, loc, level) then changed = true
+
+        if !asks_through(ft.cx, texpr_type(arg)) then continue
+
+        var k = 1
+
+        while k <= MaxReadSteps + 1 && !level.is_empty()
+            var next = deref_level(ft, level)
+
+            if k > MaxReadSteps
+                for p in reach(ft, next)
+                    push_point(&next, p)
+            end if
+
+            for loc in call_locs(ft, c, j, k)
+                if into_handed(ft, handed, loc, next) then changed = true
+
+            level = next
+            k += 1
+        end while
+    end for
+
+    changed
+end call_points
+
+// Where a call holds its argument at `j` (`steps` 0), or what it reads `steps` steps through it.
+private call_locs(ft: &FrameTrack, c: TExpr, j: usize, steps: int) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    *c.kind match
+        TCall(name, _, _, _) ->
+            for item in (if steps == 0 then keeps_of(ft.cx, name, j) else read_of(ft.cx, name, j, steps)).locs
+                out.push(item.loc)
+        TVCall(recv, slot, _, _, _) ->
+            for item in (if steps == 0 then vcall_keeps(ft.cx, recv, slot, j) else vcall_reads(ft.cx, recv, slot, j, steps))
+                out.push(item.1.loc)
+        TCallPtr(callee, _, _, _) ->
+            for item in (if steps == 0 then pointer_keeps(ft.cx, callee, j) else pointer_reads(ft.cx, callee, j, steps))
+                out.push(item.1.loc)
         _ -> ()
 
     out
-end pointed_locals
+end call_locs
 
-// The locals whose addresses a value is built of: `W(&s)`, `[&a, &b]`, `Some(&s)`.
-private addressed_locals(ft: &FrameTrack, e: TExpr, out: *Buf[string], depth: int)
-    if depth > 8 then return
+// Every value given lands in all the storage of this frame the argument a callee location is reached
+// through reaches.
+private into_handed(ft: &FrameTrack, handed: Buf[TExpr], loc: string, vals: Buf[(string, string)]) -> bool
+    val i = param_of_loc(loc)
 
-    *e.kind match
-        TAddrOf(place, _) -> local_root(ft.refs, place) match
-            Some(n) -> out.push(n)
-            None -> ()
-        TStructNew(_, args) ->
-            for a in args
-                addressed_locals(ft, a, out, depth + 1)
-        TEnumNew(_, _, args) ->
-            for a in args
-                addressed_locals(ft, a, out, depth + 1)
-        TArrayLit(elems, _) ->
-            for a in elems
-                addressed_locals(ft, a, out, depth + 1)
-        TCast(v, _) -> addressed_locals(ft, v, out, depth + 1)
-        _ -> ()
-end addressed_locals
+    if i < 0 || usize(i) >= handed.len() || vals.is_empty() then return false
+
+    var first: Buf[(string, string)] = buf()
+
+    addrs(ft, handed.at(usize(i)), &first, 0)
+
+    var targets = reach(ft, first)
+
+    for p in first
+        targets.push(p)
+
+    var changed = false
+
+    for t in targets
+        if t.0 == "?" || flat_local(ft, t.0) then continue
+
+        for v in vals
+            if add_point(ft, t.0, v) then changed = true
+    end for
+
+    changed
+end into_handed
+
+// A local whose type holds no address -- unless a local of the same name elsewhere in the body does.
+private flat_local(ft: &FrameTrack, name: string) -> bool
+    if !holds_string(ft.flat, name) then return false
+
+    for b in ft.binds
+        if b.0 == name then return false
+
+    true
+end flat_local
+
+// The parameter a callee location is reached through (`p2:.f`, `d:p0:.s>{*S}.f`), or -1.
+private param_of_loc(loc: string) -> int
+    val rest = if loc.starts_with("d:") then loc["d:".bytes.len..<loc.bytes.len] else loc
+
+    if !rest.starts_with("p") then return -1
+
+    var n = 0
+    var at = 1
+    val bytes = rest.bytes
+
+    while at < bytes.len && bytes[at] >= u8('0') && bytes[at] <= u8('9')
+        n = n * 10 + int(bytes[at]) - int(u8('0'))
+        at += 1
+
+    if at == 1 || at >= bytes.len || bytes[at] != u8(':') then -1 else n
+end param_of_loc
 
 // A refusal of a call that lets out what it reads through an argument whose pointee holds the
 // address of this frame's storage, in the words of the rule's other refusals.

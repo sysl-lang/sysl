@@ -4869,6 +4869,43 @@ print(run())
 7
 ```
 
+**How the address got there does not matter.** One copied out of a field into a local, read through a
+pointer, chosen by a branch, stored after the struct was made, or answered by another call is
+followed into whatever is handed over, at whatever depth it ends up — an address two steps in is
+asked of what the callee lets out of what it reads two steps through its parameter. Here `hs` is
+`&h`, read out of `w0`, and `&n` sits two steps through `&w`:
+
+```sysl
+var last: *int = null
+
+struct Holder
+    p: *int
+
+struct Wrap
+    h: *Holder
+
+keep_deep(w: *Wrap)
+    last = w.h.p
+
+run()
+    var n = 5
+    var h = Holder(&n)
+    var w0 = Wrap(&h)
+    val hs = w0.h
+    var w = Wrap(hs)
+    keep_deep(&w)
+```
+
+```error
+'keep_deep' lets what it reads through its parameter 'w' outlive the call (it is stored in 'last'), and what is read through '&w' holds the address of a local of 'run'
+```
+
+The callee is followed the same way: a pointer it copies out of its parameter into a local, gets back
+from another call, or hands on by the address of a local holding it is still read through as the
+parameter is. Each step is told apart up to eight steps in; past that, a callee is asked what it lets
+out of anything it reads through the pointer, which cannot tell the steps apart, so it is refused if it
+lets out anything read that deep — conservatively — and accepted if it only reads.
+
 As with the pointer itself, a call with no body in sight borrows what it reads for the call: an
 `extern` lets nothing out unless its `@keeps` names the parameter, and neither does a call through an
 object of no known trait or through a function pointer C may call.
