@@ -54,15 +54,17 @@ end fpo_ir_of
 private fpo_ir(text: string, target: Option[string] = Some("aarch64-macos")) -> string =
     fpo_ir_of([("main.sysl", fpo_vec + text)], target)
 
-// The body of the function `name` in `ir`.
+// The body of the function `name` in `ir`. A function whose by-value parameters are lent by address
+// is emitted as `name$$sysl.owned`, and that is where its operators live.
 private fpo_body(ir: string, name: string) -> string
     val parts = split(ir, "\n}\n")
 
-    for i in 0..<parts.len
-        val lines = split(parts[i], "\n")
+    for written in [name, s"$name.owned"]
+        for i in 0..<parts.len
+            val lines = split(parts[i], "\n")
 
-        for j in 0..<lines.len
-            if lines[j].starts_with("define") && mentions_as_written(lines[j], name) then return parts[i]
+            for j in 0..<lines.len
+                if lines[j].starts_with("define") && mentions_as_written(lines[j], written) then return parts[i]
 
     assert(false, ir)
     ""
@@ -146,7 +148,7 @@ fpo_each_operator_form_fuses()
         val body = fpo_body(ir, name)
 
         assert_eq(fpo_count(body, "call double @llvm.fma.f64("), 3)
-        assert(!body.contains("@V.add(") && !body.contains("@V.sub(") && !body.contains("@V.mul("), body)
+        assert(!body.contains("@V.add") && !body.contains("@V.sub") && !body.contains("@V.mul"), body)
 
     // A subtracted product negates its first factor, as clang's `c - a * b` does.
     assert_eq(fpo_count(fpo_body(ir, "sb"), " = fneg double "), 3)
@@ -309,8 +311,8 @@ fpo_blocking_forms_stay_calls()
         assert(!fpo_body(ir, name).contains("@llvm.fma."), fpo_body(ir, name))
 
     assert(fpo_body(ir, "statements").contains("@W.add("), fpo_body(ir, "statements"))
-    assert(fpo_body(ir, "held").contains("@V.add("), fpo_body(ir, "held"))
-    assert(fpo_body(ir, "named").contains("@plus$$sysl("), fpo_body(ir, "named"))
+    assert(fpo_body(ir, "held").contains("@V.add.owned("), fpo_body(ir, "held"))
+    assert(fpo_body(ir, "named").contains("@plus$$sysl.owned("), fpo_body(ir, "named"))
 end fpo_blocking_forms_stay_calls
 
 @test("an Armv6-M, which fuses at no width, keeps every operator a call")
@@ -326,7 +328,7 @@ fpo_non_fusing_target_unchanged()
 
     val body = fpo_body(ir, "step")
 
-    assert(body.contains("@V.add(") && body.contains("@V.mul("), body)
+    assert(body.contains("@V.add") && body.contains("@V.mul"), body)
     assert(!ir.contains("@llvm.fma."), ir)
 end fpo_non_fusing_target_unchanged
 
