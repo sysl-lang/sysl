@@ -1662,6 +1662,25 @@ A named function used where a callable is expected is the capture-free case of t
 is no separate function-pointer concept. A raw C function pointer, for a foreign boundary, is
 written `*extern(A) -> R` and is covered under the [foreign interface](/reference/ffi/).
 
+A generic function may be named with its type arguments there too, as at a call: `echo[int]` is the
+copy for `int`, and its arguments are checked against the callable's as the call `echo[int](x)`
+would check them.
+
+```sysl
+echo[T](x: T) -> T = x
+pair[A, B](a: A, b: B) -> (A, B) = (a, b)
+
+apply(f: &Fn(int) -> int, x: int) -> int = f(x)
+
+val g: &Fn(string, int) -> (string, int) = pair[string, int]
+
+print(apply(echo[int], 7), g("x", 2).0)
+```
+
+```output
+7 x
+```
+
 **A parameter written with a bare arrow is a type parameter.** `f: A -> B` is shorthand for
 `[$F: Fn(A) -> B](f: $F)`: the closure's type is a *type argument*, so the function is monomorphized
 and calls the closure directly, with nothing on the heap. `f: &Fn(A) -> B` is a counted reference to

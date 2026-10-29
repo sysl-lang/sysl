@@ -1230,10 +1230,50 @@ private stated_types(cx: &Analyzer, e: Expr) -> Buf[Type]
 
             for p in f.decl.params
                 out.push(param_type(cx, f, p))
+        Index(head, one, _) ->
+            var targs: Buf[Expr] = buf()
+
+            targs.push(one)
+            return applied_stated_types(cx, head, targs)
+        TypeArgs(head, targs, _) -> return applied_stated_types(cx, head, targs)
         _ -> ()
 
     out
 end stated_types
+
+// The parameter types `echo[u8]` states: the one generic of the name with every type parameter
+// written, its parameters with the written arguments put in. A shorter list leaves parameters the
+// call has still to solve, so it states nothing, as a bare generic name does.
+private applied_stated_types(cx: &Analyzer, head: Expr, targs: Buf[Expr]) -> Buf[Type]
+    var out: Buf[Type] = buf()
+
+    if !applied_function_arg(cx, head) then return out
+
+    val keys = function_keys(cx, written_name_of(cx, head).unwrap())
+
+    if keys.len() != 1 then return out
+
+    val f = cx.an.tables.funcs.get(keys.at(0)).unwrap()
+
+    val authored = authored_tparams(f.decl.tparams)
+
+    if authored.is_empty() || authored.len() != f.decl.tparams.len() || targs.len() != authored.len() then
+        return out
+
+    var known: Buf[Binding] = buf()
+
+    for i in 0..<targs.len()
+        val t = written_arg_for(cx, f, authored.at(i), targs.at(i))
+
+        if t == Unknown then return out
+
+        known.push(Binding(authored.at(i), t))
+
+    for p in f.decl.params
+        out.push(subst_params(cx.an, param_type(cx, f, p), known))
+
+    out
+end applied_stated_types
 
 // Who reads an argument: the caller for one a program wrote, and an analyzer in the declaration's
 // own terms for a default -- which is what makes a default mean the same thing from every module
@@ -1443,7 +1483,17 @@ callable_arg(cx: &Analyzer, e: Expr) -> bool = *written_arg(e).kind match
     BlockArg(_) -> true
     Ident(n) ->
         cx.lookup(n).is_none() && !function_keys(cx, n).is_empty()
+    // `echo[int]` is the same callable with its copy named.
+    Index(head, _, _) -> applied_function_arg(cx, head)
+    TypeArgs(head, _, _) -> applied_function_arg(cx, head)
     _ -> false
+
+// Whether `head[…]` names a declared function rather than indexing something nearer of its spelling.
+private applied_function_arg(cx: &Analyzer, head: Expr) -> bool
+    val name = written_name_of(cx, head)
+
+    name.is_some() && !reads_before_a_function(cx, name.unwrap()) &&
+        !function_keys(cx, name.unwrap()).is_empty()
 
 // What was actually written at an argument position, which for a filled default is inside the
 // wrapper the binding put around it: a default stands exactly where the argument would have been,
