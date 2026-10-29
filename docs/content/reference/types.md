@@ -7,7 +7,19 @@ weight: 20
 sysl's types fall into four groups: **scalars** (numbers, `bool`, `char`), the built-in **`string`**,
 the **aggregates** you build (arrays, slices, structs, enums, tuples), and the **modes** that decide
 where a value lives (`T`, `&T`, `*T`). This page covers the first three. The modes have a
-[page of their own](/reference/memory/), because they are about storage rather than shape.
+[page of their own](/reference/memory/), because they are about storage rather than shape. **`ref`
+is not a type** and is refused wherever a type is written: it declares a local name for a place, and
+a method's `-> ref T` says its call is a place
+([A member that answers a place](/reference/memory/#a-member-that-answers-a-place)).
+
+```sysl
+struct Holder
+    r: ref int
+```
+
+```error
+'ref' is a declaration, never a type, so it cannot be a field's, a parameter's, an element's or a type argument's type
+```
 
 **A conversion is implicit exactly when it cannot lose information**: where every value of one
 numeric type is exactly a value of another — a `byte` into an `int`, an `int` into a `long` or a

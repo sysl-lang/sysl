@@ -81,6 +81,22 @@ parse_core_type(p: *Parser) -> TypeRef
         return type_ref(start.to(p.just_taken()), FnType(buf(), ret, true))
     end if
 
+    // `ref T` is a member's result and nothing else (`parse_place_result`): a `ref` is a declaration,
+    // never a type, so a field, a parameter, an element or a type argument written with one is told
+    // where the word belongs, and the type after it is read so the rest of the line still parses.
+    if p.at_kw("ref")
+        p.bump()
+
+        val inner = parse_core_type(p)
+
+        p.fault(start.to(p.just_taken()), "'ref' is a declaration, never a type, so it cannot be a " +
+                "field's, a parameter's, an element's or a type argument's type — the one place it " +
+                "is written beside a type is a method's result, '-> ref T', which answers a place " +
+                "for the caller to name with 'ref' or to write through at once")
+
+        return inner
+    end if
+
     if p.at_kw("*") then return parse_pointer_type(p, start)
     if p.at_kw("&") then return parse_ref_type(p, start)
     if p.at_kw("weak") then return parse_weak_type(p, start)
@@ -401,7 +417,9 @@ private parse_type_arg(p: *Parser) -> TypeRef
             None -> "", t))
     end if
 
-    if !begins_type(p.peek())
+    // `ref` begins no type, but read as a type it is refused with what it is instead of as a value
+    // that does not parse.
+    if !begins_type(p.peek()) && !p.at_kw("ref")
         val v = parse_expr(p)
 
         return type_ref(start.to(p.just_taken()), ValueArgType(v))

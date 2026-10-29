@@ -1,0 +1,505 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.Search
+
+// `-> ref T`: a member that answers a place (`reference/memory.md § A member that answers a place`).
+// A call of one is a place exactly as `*p` is -- written through at once, named by a `ref`, read as a
+// copy -- and the compiler keeps hold of the place behind it, so every hazard a `ref` is guarded
+// against is still refused when the place came out of a method. The legal programs run on the
+// counted heap and must give everything back.
+
+private arp_ready() -> bool
+    if std_root().is_err() || !clang_available()
+        print("skipped: the library or the toolchain is not on this machine")
+        return false
+
+    true
+
+// The program -- with `lib/m/m.sysl` beside it when `lib` is given -- built on the counted heap and
+// run: what it printed and what it said on stderr, or the compiler's complaint.
+private arp_ran(main: string, lib: Option[string]) -> string
+    val root = make_temp_dir("sysl-arp").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", main).unwrap()
+
+    if lib.is_some()
+        make_dir_all(s"$root/lib/m").unwrap()
+        write_text(s"$root/lib/m/m.sysl", lib.unwrap()).unwrap()
+
+    force_alloc_counting(true)
+
+    val built = build_native_program(if lib.is_some() then root else s"$root/main.sysl", None, None,
+                                     DefaultOptimization, Some(s"$root/built"))
+
+    force_alloc_counting(false)
+
+    built match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(s"$root/built", [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text + out.err.unwrap_or("")
+end arp_ran
+
+// A legal program printed exactly `want` and gave every allocation back.
+private arp_runs(main: string, want: string)
+    val out = arp_ran(main, None)
+
+    assert(out == want, s"expected '$want', got: $out")
+    assert_eq(alloc_count_reported(out), 0)
+
+// What analysing a program said, all of it.
+private arp_said(text: string) -> string
+    val root = make_temp_dir("sysl-arp").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val out = emit_llvm_text(s"$root/main.sysl", None) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end arp_said
+
+private arp_refused(text: string, part: string)
+    val out = arp_said(text)
+
+    assert(out.contains(part), s"expected '$part' in: $out")
+
+private arp_kernel() -> string = raw"""
+    struct Task
+        state: int
+        prio: int
+
+        bump(*self) = self.prio += 100
+
+    struct Kernel
+        tasks: [4]Task
+
+        task(*self, i: usize) -> ref Task = self.tasks[i]
+
+    """
+
+private arp_bag() -> string = raw"""
+    import sysl.buf.{Buf, buf}
+
+    struct Node
+        v: int
+        cell: []int
+
+    struct Bag
+        items: Buf[int]
+        nodes: Buf[&Node]
+
+        at(*self, i: usize) -> ref int = self.items[i]
+        node(*self, i: usize) -> ref &Node = self.nodes[i]
+    end Bag
+
+    """
+
+private arp_declaration_msg() -> string =
+    "'ref' is a declaration, never a type, so it cannot be a field's, a parameter's, an element's " +
+    "or a type argument's type — the one place it is written beside a type is a method's result"
+
+private arp_storage_msg(member: string) -> string =
+    s"'$member' would answer a place in storage of its own call — a by-value parameter or a local — " +
+    "which is gone when it returns"
+
+private arp_not_place_msg(member: string) -> string =
+    s"'$member' is declared '-> ref int', so its body must come to a place — a field, an element or " +
+    "a dereference reached through a parameter — and this expression has no address for a caller " +
+    "to name"
+
+private arp_unheld_msg(name: string) -> string =
+    s"'$name' would stand on a place inside a value nothing holds — a temporary, released at the " +
+    "end of this statement while the name lives on"
+
+// -- what a call of one is ---------------------------------------------------------------------------
+
+@test("a '-> ref' call is written through at once, named by 'ref', read as a copy and called on")
+arp_the_four_uses()
+    if !arp_ready() then return
+
+    arp_runs(arp_kernel() + raw"""
+        var k = Kernel([Task(0, 7); 4])
+
+        k.task(2).state = 2
+
+        ref t = k.task(1)
+
+        t.prio += 1
+        k.task(3).prio = k.task(2).state + 10
+        k.task(0).bump()
+
+        val copy = k.task(3)
+
+        k.task(3).prio = 0
+
+        print(k.tasks[2].state, k.tasks[1].prio, k.tasks[3].prio, k.task(0).prio, copy.prio, t.prio)
+        """, "2 8 0 107 12 8\n")
+
+@test("a '-> ref' call inside a function, a loop body and a branch reaches the caller's storage")
+arp_in_a_function_and_a_loop()
+    if !arp_ready() then return
+
+    arp_runs(arp_kernel() + raw"""
+        settle(k: *Kernel, n: usize)
+            for i in 0..<n
+                if i % 2 == 0 then k.task(i).state = 1 else k.task(i).bump()
+
+                ref t = k.task(i)
+
+                t.prio += 1
+            end for
+        end settle
+
+        var k = Kernel([Task(0, 0); 4])
+
+        settle(&k, 4)
+        print(k.tasks[0].state, k.tasks[1].prio, k.tasks[2].state, k.tasks[3].prio, k.tasks[0].prio)
+        """, "1 101 1 101 1\n")
+
+@test("a '-> ref' element of a 'Buf' and a '&Node' slot are written, rebound and given back")
+arp_buf_and_node_slots()
+    if !arp_ready() then return
+
+    arp_runs(arp_bag() + raw"""
+        struct Outer
+            bag: Bag
+
+            first(*self) -> ref int = self.bag.at(0)
+
+        var g = Bag(buf(), buf())
+
+        g.items.push(41)
+        g.nodes.push(Node(1, [1]))
+        g.nodes.push(Node(2, [2, 2]))
+
+        if true
+            ref first = g.at(0)
+
+            first += 1
+
+        g.items.push(7)
+        g.at(1) = g.at(0) * 2
+
+        if true
+            ref slot = g.node(0)
+
+            slot = Node(30, [3, 3, 3])
+
+        g.node(1).v = g.node(0).v + 3
+        g.node(1).cell = [9; 4]
+
+        var o = Outer(g)
+
+        o.first() += 100
+
+        print(g.items[0], g.items[1], g.nodes[0].v, g.nodes[1].v, g.nodes[1].cell.len, o.bag.items[0])
+        """, "142 84 30 33 4 142\n")
+
+@test("a generic type's '-> ref' member answers its element at two instantiations, one of them '&Node'")
+arp_generic_member()
+    if !arp_ready() then return
+
+    arp_runs(raw"""
+        import sysl.buf.{Buf, buf}
+
+        struct Node
+            v: int
+
+        struct Grid[T]
+            cells: Buf[T]
+            w: usize
+
+            at(*self, x: usize, y: usize) -> ref T = self.cells[y * self.w + x]
+
+        var g = Grid[int](buf(), 2)
+
+        for i in 0..<4
+            g.cells.push(i)
+
+        g.at(1, 1) += 10
+
+        var h = Grid[&Node](buf(), 1)
+
+        h.cells.push(Node(1))
+        h.cells.push(Node(2))
+        h.at(0, 1) = Node(7)
+        h.at(0, 0).v += 4
+
+        ref first = h.at(0, 0)
+
+        first.v *= 2
+        print(g.cells[3], h.cells[1].v, h.cells[0].v)
+        """, "13 7 10\n")
+
+@test("a '-> ref' member of another module, over its fields and its module storage, is a place here")
+arp_from_another_module()
+    if !arp_ready() then return
+
+    val lib = raw"""
+        module lib.m
+
+        var counts = [0; 3]
+
+        struct Pair
+            a: int
+            b: int
+
+            second(*self) -> ref int = self.b
+            count(*self) -> ref int = counts[self.a]
+
+        tally(i: usize) -> int = counts[i]
+        """
+
+    val out = arp_ran(raw"""
+        import lib.m.{Pair, tally}
+
+        var p = Pair(1, 2)
+
+        p.second() = 20
+
+        ref b = p.second()
+
+        b += 1
+        p.count() += 4
+
+        ref c = p.count()
+
+        c *= 10
+        print(p.a, p.b, tally(1), tally(0))
+        """, Some(lib))
+
+    assert(out == "1 21 40 0\n", out)
+    assert_eq(alloc_count_reported(out), 0)
+
+@test("a '-> ref' member answering through a raw pointer answers the place the pointer names")
+arp_through_a_pointer()
+    if !arp_ready() then return
+
+    arp_runs(raw"""
+        struct Meter
+            other: *int
+
+            theirs(*self) -> ref int = *self.other
+
+        var spare = 5
+        var m = Meter(&spare)
+
+        m.theirs() *= 3
+
+        ref s = m.theirs()
+
+        s += 1
+        print(spare)
+        """, "16\n")
+
+// -- the body ----------------------------------------------------------------------------------------
+
+@test("a '-> ref' body over a by-value 'self' or a local is refused: the storage dies with the call")
+arp_storage_of_the_call_refused()
+    if !arp_ready() then return
+
+    arp_refused("struct Pair\n    a: int\n\n    get(self) -> ref int = self.a\n",
+                arp_storage_msg("Pair.get"))
+    arp_refused("struct Pair\n    a: int\n\n    get(*self) -> ref int\n        var x = self.a\n\n" +
+                "        x\n", arp_storage_msg("Pair.get"))
+
+@test("a '-> ref' body that is a value, or a place chosen by an 'if', has no address to answer")
+arp_not_a_place_refused()
+    if !arp_ready() then return
+
+    arp_refused("struct Pair\n    a: int\n    b: int\n\n    get(*self) -> ref int = self.a + 1\n",
+                arp_not_place_msg("Pair.get"))
+    arp_refused("struct Pair\n    a: int\n    b: int\n\n" +
+                "    get(*self, f: bool) -> ref int = if f then self.a else self.b\n",
+                arp_not_place_msg("Pair.get"))
+
+@test("a '-> ref' body that leaves by 'return' or '?' is refused")
+arp_jumps_refused()
+    if !arp_ready() then return
+
+    val msg = "'Pair.get' answers a place, so its body comes to that place as its last expression — " +
+              "a 'return' or a '?' would leave with a value"
+
+    arp_refused("struct Pair\n    a: int\n    b: int\n\n    get(*self) -> ref int\n" +
+                "        if self.a > 0 then return self.b\n\n        self.a\n", msg)
+    arp_refused("enum E\n    Bad\n\nstruct Pair\n    a: Result[int, E]\n\n" +
+                "    get(*self, r: Result[int, E]) -> ref Result[int, E]\n" +
+                "        r?\n\n        self.a\n", msg)
+
+@test("a '-> ref' member answering a field of a struct with an 'invariant' is refused")
+arp_invariant_refused()
+    if !arp_ready() then return
+
+    arp_refused("struct G\n    lo: int\n    hi: int\n\n    invariant lo <= hi\n\n" +
+                "    low(*self) -> ref int = self.lo\nend G\n",
+                "'G.low' answers a place inside a 'G', whose 'invariant' a write through the answer " +
+                "would not re-check")
+
+// -- where '-> ref' may be written -------------------------------------------------------------------
+
+@test("'ref' as a field's, a parameter's, an element's, a type argument's or a free function's type is refused")
+arp_ref_is_not_a_type()
+    if !arp_ready() then return
+
+    arp_refused("struct H\n    r: ref int\n", arp_declaration_msg())
+    arp_refused("take(x: ref int) = ()\n", arp_declaration_msg())
+    arp_refused("var a: [2]ref int\n", arp_declaration_msg())
+    arp_refused("import sysl.buf.Buf\n\nvar b: Buf[ref int]\n", arp_declaration_msg())
+    arp_refused("free(p: *int) -> ref int = *p\n", arp_declaration_msg())
+
+@test("a trait's member, and an impl's member a trait declares, cannot answer a place")
+arp_traits_refused()
+    if !arp_ready() then return
+
+    arp_refused("trait Has\n    get(*self) -> ref int\n",
+                "a trait's member cannot answer a place with '-> ref' — a call through a trait object " +
+                "names no body")
+    arp_refused("struct T\n    v: int\n\ntrait Read\n    read(*self) -> int\n\n" +
+                "impl Read for T\n    read(*self) -> ref int = self.v\n",
+                "'read' of 'impl Read for T' answers a place with '-> ref', but trait 'Read' declares " +
+                "'read' to answer a value")
+
+// -- the address is never a value --------------------------------------------------------------------
+
+@test("'&' of an answered place or of a field inside one, and a pointer to the member, are refused")
+arp_no_address_refused()
+    if !arp_ready() then return
+
+    val pair = "struct Pair\n    a: int\n\n    get(*self) -> ref int = self.a\n\nvar p = Pair(1)\n\n"
+
+    arp_refused(pair + "val q = &p.get()\n",
+                "a place a '-> ref' member answers has no address a program may keep")
+    arp_refused(arp_kernel() + "var k = Kernel([Task(0, 7); 4])\n\nval q = &k.task(0).state\n",
+                "a place a '-> ref' member answers has no address a program may keep")
+    arp_refused(pair + "val f = &Pair.get\n",
+                "'Pair.get' answers a place with '-> ref', and a place is named by calling the member " +
+                "where it is used")
+
+@test("a '-> ref' member on a 'val' or on a temporary receiver is refused by '*self' itself")
+arp_receivers_refused()
+    if !arp_ready() then return
+
+    val pair = "struct Pair\n    a: int\n\n    get(*self) -> ref int = self.a\n\n"
+
+    arp_refused(pair + "val q = Pair(3)\n\nq.get() = 9\n",
+                "'get' takes '*self', so it writes through what it is called on, and a 'val' is " +
+                "written once")
+    arp_refused(pair + "make() -> Pair = Pair(1)\n\nref r = make().get()\n",
+                "'*self' needs a variable, field, or dereference to point at")
+
+// -- the hazards a 'ref' is guarded against, through a method ----------------------------------------
+
+@test("assigning the storage an answered 'ref' stands on is refused while the 'ref' is live")
+arp_assignment_release_refused()
+    if !arp_ready() then return
+
+    arp_refused("struct Table\n    cell: []int\n\n    at(*self, i: usize) -> ref int = self.cell[i]\n\n" +
+                "var t = Table([1, 2, 3])\n\nref e = t.at(0)\n\nt.cell = [0; 8]\ne = 5\n",
+                "'e' is a 'ref' standing on storage this assignment would release")
+
+@test("a '@relocates' push under an answered 'ref' is refused")
+arp_relocating_push_refused()
+    if !arp_ready() then return
+
+    arp_refused(arp_bag() + "var g = Bag(buf(), buf())\n\ng.items.push(1)\n\nref first = g.at(0)\n\n" +
+                "g.items.push(2)\nfirst = 5\n",
+                "'first' is a 'ref' standing on an element whose storage 'push' could move or give up")
+
+@test("a second '*self' call of the member is refused while an answered 'ref' stands on an owning step")
+arp_second_self_call_refused()
+    if !arp_ready() then return
+
+    arp_refused(arp_bag() + "var g = Bag(buf(), buf())\n\ng.nodes.push(Node(1, [1]))\n" +
+                "g.nodes.push(Node(2, [2]))\n\nref slot = g.node(0)\n\nslot = Node(3, [3])\n" +
+                "g.node(1).v = slot.v\n",
+                "'slot' is a 'ref' standing on storage this call could release, since a '*self' " +
+                "method may write its receiver")
+
+@test("a second name, or a callee, writing the node an answered 'ref' stands in is refused")
+arp_second_name_refused()
+    if !arp_ready() then return
+
+    val setup = arp_bag() + "alias(n: &Node) = n.cell = [0; 8]\n\nvar g = Bag(buf(), buf())\n\n" +
+                "g.nodes.push(Node(1, [1, 2]))\n\nref e = g.node(0).cell[1]\n\n"
+
+    arp_refused(setup + "val n = g.nodes[0]\n\nn.cell = [7; 8]\ne = 5\n",
+                "'e' is a 'ref' standing on storage held in a 'Node', and this assignment writes one " +
+                "that may be the same object by another name")
+    arp_refused(setup + "alias(g.nodes[0])\ne = 5\n",
+                "'e' is a 'ref' standing on storage held in a 'Node', and 'alias' may write a 'Node'")
+
+@test("a member answering a place through another member carries the hazard along")
+arp_wrapper_hazard_refused()
+    if !arp_ready() then return
+
+    arp_refused(arp_bag() + "struct Outer\n    bag: Bag\n\n    first(*self) -> ref int = self.bag.at(0)\n\n" +
+                "var o = Outer(Bag(buf(), buf()))\n\no.bag.items.push(1)\n\nref f = o.first()\n\n" +
+                "o.bag.items.push(2)\nf = 5\n",
+                "'f' is a 'ref' standing on an element whose storage 'push' could move or give up")
+
+@test("once the answered 'ref''s block has closed, the storage may be written again")
+arp_hazard_ends_with_the_block()
+    if !arp_ready() then return
+
+    arp_runs(arp_bag() + raw"""
+        var g = Bag(buf(), buf())
+
+        g.items.push(1)
+
+        if true
+            ref first = g.at(0)
+
+            first = 5
+
+        g.items.push(2)
+        g.at(1) += g.at(0)
+        print(g.items[0], g.items[1])
+        """, "5 7\n")
+
+// -- a 'ref' over a temporary ------------------------------------------------------------------------
+
+@test("a 'ref' over an element of a call's answer is refused: the answer is released at the statement's end")
+arp_ref_over_a_temporary_refused()
+    if !arp_ready() then return
+
+    val bag = arp_bag() + "fresh() -> Bag\n    val b = Bag(buf(), buf())\n\n    b.items.push(5)\n" +
+              "    b.nodes.push(Node(1, [1]))\n    b\nend fresh\n\n"
+
+    arp_refused(bag + "ref t = fresh().items[0]\n\nt += 1\n", arp_unheld_msg("t"))
+    arp_refused(bag + "ref n = fresh().nodes[0].v\n\nn += 1\n", arp_unheld_msg("n"))
+    arp_refused("make() -> [3]int = [1, 2, 3]\n\nref e = make()[1]\n\ne += 1\n", arp_unheld_msg("e"))
+
+@test("a 'ref' through a raw pointer a call answered stands on storage the program holds")
+arp_ref_through_a_returned_pointer()
+    if !arp_ready() then return
+
+    arp_runs(raw"""
+        struct Pair
+            a: int
+            b: int
+
+        var p = Pair(1, 2)
+
+        where() -> *Pair = &p
+
+        ref b = where().b
+
+        b += 40
+        print(p.b)
+        """, "42\n")

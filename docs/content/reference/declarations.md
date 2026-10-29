@@ -3318,6 +3318,41 @@ box on.
 holds no box for a share to be taken of. `reference/traits.md` says so where it lists what a `*Trait`
 may carry.
 
+### A method may answer a place: `-> ref T`
+
+A member whose result is written `-> ref T` answers **a place** rather than a value: its call can be
+assigned to, compound-assigned, called a `*self` method on, or named with `ref`, and each reaches the
+storage the body came to.
+
+```sysl
+struct Grid
+    cells: [6]int
+    w: usize
+
+    at(*self, x: usize, y: usize) -> ref int = self.cells[y * self.w + x]
+
+var g = Grid([0; 6], 3)
+
+g.at(2, 1) = 7
+g.at(2, 1) += 1
+
+ref corner = g.at(0, 0)
+
+corner = 4
+
+print(g.cells[5], g.cells[0], g.at(2, 1))
+```
+
+```output
+8 4 8
+```
+
+The body is one place reached through a parameter — a `*self` receiver, a reference, a container's
+element, a `*T`, or module storage — and the compiler keeps it, so a `ref` bound to the call is held
+to every rule a `ref` bound to the place itself is. `-> ref` is written only on a type's own member,
+never on a free function or in a trait; [memory](/reference/memory/#a-member-that-answers-a-place)
+has the whole of it.
+
 ### A static property
 
 **A property has nowhere to say `self`.** A member's receiver is written in its parameter list, and

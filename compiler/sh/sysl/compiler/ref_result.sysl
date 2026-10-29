@@ -1,0 +1,404 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+
+// `-> ref T` -- a member that answers a **place** rather than a value
+// (`docs/design/borrowed-return.md` decision 8, `reference/memory.md § A member that answers a place`).
+//
+// `k.task(i).state = 2` has to reach the receiver, so value semantics cannot infer it: the program
+// says it wants a place. The member's body comes to a place reached through a parameter -- a field
+// chain, an element, a dereference -- and is lowered to a function answering that place's ADDRESS;
+// every call of it is a dereference of what it answered, so a call is a place exactly as `*p` is: a
+// `ref` may name it, a statement may write through it, and a read of it reads the storage.
+//
+// **What keeps it sound is the same thing that keeps a `ref` sound: the compiler still holds the
+// place.** The body's place is kept as a template over the member's parameters, and a caller's
+// walks out of a call -- the steps a live `ref` holds still, the key two places are compared by, the
+// binding a write lands in -- carry on through the template with the call's arguments put in for the
+// parameters (`ref_call_place`). So `ref e = t.cell_at(0)` holds `t.cell` still exactly as
+// `ref e = t.cell[0]` does. The template is read where the first call asks for it, on demand and
+// taken back as an inferred result is (`read_template`), or kept from the body's own reading where
+// that came first.
+//
+// A `ref` is a declaration and never a type, and this keeps it so: the address is never a value the
+// program holds. The parser refuses `ref` in every type but a member's result; the call cannot be
+// handed to `&`, so nothing can keep the address; a member reached through a trait object has no
+// body to read a place off, so a trait cannot declare one.
+
+// One `-> ref` member's place, by the name the member was lowered to.
+struct PlaceTemplate
+    // The body's place, with every `ref` the body bound read through to the place it stood for --
+    // `None` until a reading of the body settles it, and for a body that came to no place at all.
+    place: Option[TExpr]
+
+    // The unique names the body bound its parameters under, in order, which the template is written
+    // over.
+    params: Buf[string]
+
+    // The body is being read for its place: a call reached while it is (a member answering a place
+    // of itself) finds none rather than reading it again.
+    reading: bool
+end PlaceTemplate
+
+// -- the body ------------------------------------------------------------------------------------
+
+// The body of a `-> ref` member, checked and turned into the answer of its address.
+//
+// **The place must outlive the call.** It has to be reached from a parameter or from module storage
+// -- never a local of the body -- and it has to leave the parameter's own bytes on the way: through a
+// `*self` receiver, a reference, a view, a container's element. A field of a by-value `self` is a
+// field of the callee's copy, gone when it returns.
+//
+// **A place lying inside a struct with an `invariant` is refused**, since a write through the answer
+// lands in the caller, where nothing walks out to the struct's clause: the place a `ref` local names
+// keeps that walk (`expr_assign.sysl`'s `inv_checks_for`), and an answered place would lose it.
+//
+// **The answer is the body's last expression and nothing else**: a `return` or a `?` leaves with a
+// value, and a value has no address.
+answer_place(cx: &Analyzer, at: Span, name: string, params: Buf[(string, Type)], body: TBlock,
+             ret: Type) -> TBlock
+    if body.ty == Unknown || body.result.is_none() then return body
+
+    val shown = shown_member(name)
+    val jumps: Buf[bool] = buf()
+    val w = TWalk(false, e -> if is_try(e) then jumps.push(true), w -> (),
+                  s -> if is_return(s) then jumps.push(true))
+
+    walk_stmts(body.stmts, w)
+    walk_texpr(body.result.unwrap(), w)
+
+    if !jumps.is_empty()
+        cx.fault(at, s"'$shown' answers a place, so its body comes to that place as its last " +
+                 "expression — a 'return' or a '?' would leave with a value, and a value has no " +
+                 "address for the caller to name")
+        return body
+    end if
+
+    val place = body.result.unwrap()
+
+    if !is_place(place)
+        cx.fault(place.span, s"'$shown' is declared '-> ref ${type_show(ret)}', so its body must come " +
+                 "to a place — a field, an element or a dereference reached through a parameter — " +
+                 "and this expression has no address for a caller to name. Answer a value with " +
+                 s"'-> ${type_show(ret)}'")
+        return body
+    end if
+
+    if !rooted_in(place_root(cx, place), params) || !leaves_frame(cx, place)
+        cx.fault(place.span, s"'$shown' would answer a place in storage of its own call — a " +
+                 "by-value parameter or a local — which is gone when it returns. A '-> ref' member " +
+                 "answers a place its caller still holds: reached through a '*self' receiver, a " +
+                 "reference, a view, a container's element, or module storage")
+        return body
+    end if
+
+    val owed = inv_checks_for(cx, place)
+
+    if !owed.is_empty()
+        cx.fault(place.span, s"'$shown' answers a place inside a '${type_show(Struct(owed.at(0).1))}', " +
+                 "whose 'invariant' a write through the answer would not re-check — the write lands " +
+                 "in the caller, where nothing walks out to the clause. Write a member that makes " +
+                 "the write itself")
+        return body
+    end if
+
+    var uniques: Buf[string] = buf()
+
+    for p in params
+        uniques.push(p.0)
+
+    val t = template_for(cx.an, name)
+
+    t.place = Some(read_through(cx, place))
+    t.params = uniques
+
+    val ptr = Ptr(ret)
+
+    TBlock(body.stmts, Some(TExpr(place.span, TAddrOf(place, ptr))), ptr)
+end answer_place
+
+private is_return(s: TStmt) -> bool = s match
+    TReturn(_) -> true
+    _ -> false
+
+private is_try(e: TExpr) -> bool = *e.kind match
+    TTry(_, _, _, _, _, _, _) -> true
+    _ -> false
+
+// A member's lowered name as its declaration reads: `Kernel.task`, without the module.
+private shown_member(name: string) -> string
+    var start = 0
+    val b = name.bytes
+
+    for k in 0..<b.len
+        if b[k] == u8(ModuleSep) then start = k + 1
+
+    name[start..<b.len]
+end shown_member
+
+// The step a place bottoms out in: the walk out of it, through every `ref` it names to the place that
+// `ref` stood for, until there is no step further out.
+private place_root(cx: &Analyzer, place: TExpr) -> TExpr
+    var at = place
+
+    loop
+        val stood = *at.kind match
+            TLoad(n, _) -> ref_place(cx, n)
+            _ -> None
+
+        if stood.is_some()
+            at = stood.unwrap()
+        else
+            val next = step_before(cx, at)
+
+            if next.is_none() then return at
+
+            at = next.unwrap()
+        end if
+end place_root
+
+// Whether a place's root is one of the body's parameters or module storage.
+private rooted_in(root: TExpr, params: Buf[(string, Type)]) -> bool = *root.kind match
+    TGlobal(_, _, _) -> true
+    TLoad(n, _) ->
+        for p in params
+            if p.0 == n then return true
+
+        false
+    _ -> false
+
+// Whether the walk out of a place leaves the bytes of the binding it starts in -- through a reference,
+// a pointer, a view or a container's element -- or lands in module storage. Where it never does, the
+// place is part of a parameter's or a local's own bytes, which the call's frame holds.
+private leaves_frame(cx: &Analyzer, t: TExpr) -> bool = *t.kind match
+    TLoad(n, _) -> ref_place(cx, n) match
+        Some(p) -> leaves_frame(cx, p)
+        None -> false
+    TGlobal(_, _, _) -> true
+    TDeref(_, _) -> true
+    TField(recv, _, _) -> holds_address(texpr_type(recv)) || leaves_frame(cx, recv)
+    TIndex(recv, _, _) -> !holds_elements(texpr_type(recv)) || leaves_frame(cx, recv)
+    _ -> false
+
+private holds_address(t: Type) -> bool = repr(t) match
+    Ref(_, _) -> true
+    Weak(_) -> true
+    Ptr(_) -> true
+    _ -> false
+
+private holds_elements(t: Type) -> bool = repr(t) match
+    Array(_, _) -> true
+    Vector(_, _) -> true
+    _ -> false
+
+// A place with every `ref` it names replaced by the place that `ref` stood for, so the template
+// means something once the body's locals are gone.
+private read_through(cx: &Analyzer, t: TExpr) -> TExpr = *t.kind match
+    TLoad(n, _) -> ref_place(cx, n) match
+        Some(p) -> read_through(cx, p)
+        None -> t
+    TField(recv, i, ty) -> TExpr(t.span, TField(read_through(cx, recv), i, ty))
+    TIndex(recv, ix, ty) -> TExpr(t.span, TIndex(read_through(cx, recv), ix, ty))
+    TDeref(op, ty) -> TExpr(t.span, TDeref(read_through(cx, op), ty))
+    TAddrOf(p, ty) -> TExpr(t.span, TAddrOf(read_through(cx, p), ty))
+    TCall(n, args, ty, r) ->
+        var out: Buf[TExpr] = buf()
+
+        for item in args
+            out.push(read_through(cx, item))
+
+        TExpr(t.span, TCall(n, out, ty, r))
+    _ -> t
+
+// -- the call ------------------------------------------------------------------------------------
+
+// The template filed under a member's lowered name, made empty where there is none yet.
+private template_for(a: &Analysis, name: string) -> &PlaceTemplate
+    val found = a.tables.place_templates.get(name)
+
+    if found.is_some() then return found.unwrap()
+
+    val made = PlaceTemplate(None, buf(), false)
+
+    a.tables.place_templates.put(name, made)
+    made
+end template_for
+
+// A call of a `-> ref` member: the function answers the place's address, and the call is the place
+// it addresses. The template the caller's walks follow is read here, where the call first needs it.
+placed_call(cx: &Analyzer, span: Span, name: string, args: Buf[TExpr], ret: Type) -> TExpr
+    read_template(cx.an, name)
+
+    TExpr(span, TDeref(TExpr(span, TCall(name, args, Ptr(ret), false)), ret))
+end placed_call
+
+// Reads a `-> ref` member's body for its place, where no reading has settled it yet, and takes back
+// everything the reading said and registered -- the body is read again, for real, wherever it is
+// typed, exactly as a result read off a body is (`inferred_results.sysl`'s `body_result_type`).
+//
+// A member of a concrete type is among the lowered members; an instantiation of a generic one is the
+// job its call just queued.
+private read_template(a: &Analysis, name: string)
+    val t = template_for(a, name)
+
+    if t.place.is_some() || t.reading then return
+
+    var job: Option[PendingInst] = None
+
+    for item in a.tables.members.pending
+        if item.name == name then job = Some(item)
+
+    var concrete: Option[FuncDecl] = None
+
+    if job.is_none()
+        for m in a.tables.members.lowered
+            if m.name == name then concrete = Some(m)
+    end if
+
+    if job.is_none() && concrete.is_none() then return
+
+    t.reading = true
+
+    val mark = a.complaints()
+    val trial = a.sandboxed()
+    val queued = a.tables.members.pending.len()
+    val tables = a.tables.members.vtables.len()
+    val structs = a.tables.struct_insts.len()
+    val enums = a.tables.enum_insts.len()
+    val constrained = a.tables.constrained_insts.len()
+    val closures = a.closure_funcs.len()
+    val counted = a.closure_count
+
+    if job.is_some()
+        val cx = analyzer_for(a, job.unwrap().scope)
+
+        cx.subst = job.unwrap().subst
+        analyze_instance_in(a, cx, name, job.unwrap().decl)
+    else
+        analyze_instance(a, name, concrete.unwrap())
+    end if
+
+    a.release(trial)
+    a.restore_complaints(mark)
+    rewind_instantiations(a, queued, tables, structs, enums, constrained)
+    a.closure_funcs.truncate(closures)
+    a.closure_count = closure_rewind(a, counted)
+    t.reading = false
+end read_template
+
+// The place a call of a `-> ref` member stands for, in the caller's terms: the body's place with the
+// call's arguments put in for the parameters. `None` where `t` is not such a call, or where its body
+// came to no place.
+//
+// A `*self` receiver arrives as the address of the caller's place, and the body reached its fields
+// through a dereference of it -- so `*(&k)` is put back as `k`, and the walk goes on through the place
+// the caller wrote.
+ref_call_place(cx: &Analyzer, t: TExpr) -> Option[TExpr] = *t.kind match
+    TDeref(op, _) -> *op.kind match
+        TCall(name, args, _, _) -> cx.an.tables.place_templates.get(name) match
+            Some(found) -> found.place.map(p -> with_args(p, found.params, args))
+            None -> None
+        _ -> None
+    _ -> None
+
+private with_args(t: TExpr, params: Buf[string], args: Buf[TExpr]) -> TExpr = *t.kind match
+    TLoad(n, _) ->
+        for i in 0..<params.len()
+            if params.at(i) == n && i < args.len() then return args.at(i)
+
+        t
+    TField(recv, i, ty) -> TExpr(t.span, TField(with_args(recv, params, args), i, ty))
+    TIndex(recv, ix, ty) -> TExpr(t.span, TIndex(with_args(recv, params, args), ix, ty))
+    TDeref(op, ty) ->
+        val o = with_args(op, params, args)
+
+        *o.kind match
+            TAddrOf(inner, _) -> inner
+            _ -> TExpr(t.span, TDeref(o, ty))
+    TAddrOf(p, ty) -> TExpr(t.span, TAddrOf(with_args(p, params, args), ty))
+    TCall(n, given, ty, r) ->
+        var out: Buf[TExpr] = buf()
+
+        for item in given
+            out.push(with_args(item, params, args))
+
+        TExpr(t.span, TCall(n, out, ty, r))
+    _ -> t
+
+// `ref name = …` over a place inside a value nothing holds -- a call's answer, a receiver built for a
+// `-> ref` call, a view made on the spot -- which is released at the end of the statement while the
+// name lives on. Used at once, in the statement that made it, the same place is fine.
+//
+// The walk goes out from the place, through every `ref` it names and every `-> ref` call's template,
+// to where its storage is held: a name (a local, a parameter, module storage) holds it, and so does
+// a **raw pointer** -- what a `*T` points at is the program's to keep alive, as it is for `ref x = *p`.
+// Anything else at the root is a temporary.
+refuse_unheld_ref(cx: &Analyzer, at: Span, name: string, place: TExpr)
+    if held(cx, place) then return
+
+    cx.fault(at, s"'$name' would stand on a place inside a value nothing holds — a temporary, " +
+             "released at the end of this statement while the name lives on. Bind the value to a " +
+             "name first, and the 'ref' to a place inside that")
+end refuse_unheld_ref
+
+// Whether the storage a place lies in outlives the statement (`refuse_unheld_ref`).
+private held(cx: &Analyzer, place: TExpr) -> bool
+    var at = place
+
+    loop
+        val stood = *at.kind match
+            TLoad(n, _) -> ref_place(cx, n)
+            _ -> None
+
+        if stood.is_some()
+            at = stood.unwrap()
+        else
+            val here = *at.kind match
+                TLoad(_, _) -> true
+                TGlobal(_, _, _) -> true
+                TDeref(op, _) -> raw_target(cx, op)
+                _ -> false
+
+            if here then return true
+
+            val next = step_before(cx, at)
+
+            if next.is_none() then return false
+
+            at = next.unwrap()
+        end if
+end held
+
+// Whether a dereferenced operand is a `*T` the program holds -- not an element's address a subscript
+// made, nor a place a `-> ref` member answered, both of which lie inside their receiver.
+private raw_target(cx: &Analyzer, op: TExpr) -> bool
+    if !(texpr_type(op) is Ptr(_)) then return false
+
+    if placed_by(cx, op).is_some() then return false
+
+    *op.kind match
+        TCall(name, _, _, _) -> !cx.an.tables.place_templates.has(name)
+        _ -> true
+end raw_target
+
+// Whether a place is, or lies inside, what a `-> ref` member's call answered.
+reaches_ref_call(cx: &Analyzer, t: TExpr) -> bool = *t.kind match
+    TDeref(op, _) -> *op.kind match
+        TCall(name, _, _, _) -> cx.an.tables.place_templates.has(name)
+        _ -> false
+    TField(recv, _, _) -> reaches_ref_call(cx, recv)
+    TIndex(recv, _, _) -> reaches_ref_call(cx, recv)
+    _ -> false
+
+// `&` of a place a `-> ref` member answered. The answer is a place for a `ref` to name or a statement
+// to use at once, and an address taken of it would be a `*T` carried where the compiler has lost the
+// place it came from -- which is the one thing the form exists not to make.
+refuse_ref_call_address(cx: &Analyzer, at: Span, place: TExpr)
+    if !reaches_ref_call(cx, place) then return
+
+    cx.fault(at, "a place a '-> ref' member answers has no address a program may keep — it is for a " +
+             "'ref' to name or a statement to use at once, and a pointer would carry it where its " +
+             "receiver is no longer held still. Bind it with 'ref', or take the address of the " +
+             "storage itself")
+end refuse_ref_call_address
