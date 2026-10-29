@@ -933,7 +933,10 @@ defer_stmts(e: *Emit, stmts: Buf[TStmt], when: TDeferWhen)
         TEveryExit ->
             for stmt in stmts
                 e.defers.push(stmt)
-        TFailureExit(_) -> e.defers.push(TDefer(stmts, when))
+                e.defer_at.push(e.owned_slots.len())
+        TFailureExit(_) ->
+            e.defers.push(TDefer(stmts, when))
+            e.defer_at.push(e.owned_slots.len())
 end defer_stmts
 
 // Emits the releases for the innermost scope without popping it -- the guard-failure path out of a
@@ -958,16 +961,20 @@ private scope_slots(e: *Emit, k: usize) -> Buf[(Val, Type)]
     out
 end scope_slots
 
-// The statements one scope deferred, read the same way.
-private scope_defers(e: *Emit, k: usize) -> Buf[TStmt]
-    var out: Buf[TStmt] = buf()
+// The statements one scope deferred, read the same way, each with the number of that scope's own
+// slots written above it.
+private scope_defers(e: *Emit, k: usize) -> Buf[(TStmt, usize)]
+    var out: Buf[(TStmt, usize)] = buf()
 
     if e.defer_marks.is_empty() || k >= e.defer_marks.len() then return out
 
     val stop = if k + 1 < e.defer_marks.len() then e.defer_marks.at(k + 1) else e.defers.len()
+    val first = e.owned_marks.at(k)
 
     for i in e.defer_marks.at(k)..<stop
-        out.push(e.defers.at(i))
+        val at = e.defer_at.at(i)
+
+        out.push((e.defers.at(i), if at > first then at - first else 0))
 
     out
 end scope_defers
@@ -983,64 +990,87 @@ release_slots(e: *Emit, slots: Buf[(Val, Type)])
         release_at(e, s.1, s.0)
 end release_slots
 
-// Leaves the innermost scope: what it deferred, then what it owns.
+// Leaves the innermost scope.
 pop_owned(e: *Emit)
-    val k = e.owned_marks.len() - 1
-
-    run_deferrals(e, k)
-    release_owned(e)
+    leave_scope(e, e.owned_marks.len() - 1)
 
     val slot_mark = e.owned_marks.pop().unwrap_or(0)
     val defer_mark = e.defer_marks.pop().unwrap_or(0)
 
     e.owned_slots.truncate(slot_mark)
     e.defers.truncate(defer_mark)
+    e.defer_at.truncate(defer_mark)
 end pop_owned
 
-// Runs one scope's deferred statements, last registered first.
+// **Leaving a block undoes it in reverse.** Each statement the scope deferred and each slot it owns
+// is undone in the reverse order of where it was written, the last first: a `defer` runs after every
+// local written below it is let go of, and before every one written above it. So every local a
+// deferred statement can name -- only those above it are in its scope -- is still alive while it
+// runs, and a lock taken, then `defer`-unlocked, stays held while every local made under it is given
+// back. This is the order Rust, C++ and D give destructors and scope guards.
 //
-// They go **before** that scope's releases, so every local the statement names is still alive while
-// it runs -- including the one holding the resource it is closing, which is the whole point of the
-// form. Registration order is written order, so the walk backwards is the LIFO a `defer` promises.
+// **An `errdefer` takes its place in the same order.** What it adds is a question about the way out
+// (`ExitMode`): every run of them back to back -- with no slot written between -- is laid down whole on
+// a failing exit, left out on any other, and laid under one test of the returned value's tag where
+// only the value can say.
 //
-// **An `errdefer` takes its place in the same stack**, so the two kinds interleave in written order.
-// What it adds is a question about the way out (`ExitMode`): every run of them back to back is laid
-// down whole on a failing exit, left out on any other, and laid under one test of the returned
-// value's tag where only the value can say.
-private run_deferrals(e: *Emit, k: usize)
+// What the scope holds is read before anything is laid down: a deferred statement containing an `if`
+// or a `match` pushes and pops scopes of its own above this one.
+private leave_scope(e: *Emit, k: usize)
+    val slots = scope_slots(e, k)
     val ds = scope_defers(e, k)
-
-    // Laid down at an exit, out of the order a guard was proved in (`nowrap.sysl`).
-    nowrap_suspend(e)
-
-    // A deferred statement is read as a block of its own while it runs, so a scope it opens and
-    // closes is an ordinary way out -- the exit being taken is the one asked here, once.
-    val exit = e.exit
-
-    e.exit = Leaving
-
+    var upper = slots.len()
     var i = ds.len()
 
     while i > 0
         i -= 1
 
-        if !on_failure(ds.at(i))
-            gen_stmt(e, ds.at(i))
-            continue
+        val at = ds.at(i).1
+
+        release_range(e, slots, at, upper)
+
+        if at < upper then upper = at
 
         var run: Buf[TStmt] = buf()
 
-        run.push(ds.at(i))
+        run.push(ds.at(i).0)
 
-        while i > 0 && on_failure(ds.at(i - 1))
-            i -= 1
-            run.push(ds.at(i))
+        if on_failure(ds.at(i).0)
+            while i > 0 && on_failure(ds.at(i - 1).0) && ds.at(i - 1).1 == at
+                i -= 1
+                run.push(ds.at(i).0)
 
-        failure_run(e, exit, run)
+        lay_deferred(e, run)
+
+    release_range(e, slots, 0, upper)
+end leave_scope
+
+// The slots `[from, upto)` of a scope's list, let go of last written first.
+private release_range(e: *Emit, slots: Buf[(Val, Type)], from: usize, upto: usize)
+    var j = upto
+
+    while j > from
+        j -= 1
+        release_at(e, slots.at(j).1, slots.at(j).0)
+end release_range
+
+// Lays down one deferred statement, or one run of `errdefer`s, on the way out being taken.
+//
+// A deferred statement is read as a block of its own while it runs, so a scope it opens and closes is
+// an ordinary way out -- the exit being taken is the one asked here, once. It is laid down at an exit,
+// out of the order a guard was proved in (`nowrap.sysl`).
+private lay_deferred(e: *Emit, run: Buf[TStmt])
+    nowrap_suspend(e)
+
+    val exit = e.exit
+
+    e.exit = Leaving
+
+    if on_failure(run.at(0)) then failure_run(e, exit, run) else gen_stmt(e, run.at(0))
 
     e.exit = exit
     nowrap_resume(e)
-end run_deferrals
+end lay_deferred
 
 // Whether a scheduled statement is an `errdefer`, which a scope holds whole -- with its binder --
 // rather than as the statements it schedules.
@@ -1176,12 +1206,11 @@ private release_down_to(e: *Emit, owned_depth: usize, temp_depth: usize)
 
         if k >= owned_depth then scopes.push(k)
 
-    // Outward, one scope at a time, each running what it deferred before giving up its counts -- so
-    // a statement deferred in an inner block still sees the outer block's locals, which are let go
-    // only once the scope that owns them is itself being left.
+    // Outward, one scope at a time, each undone whole before the next -- so a statement deferred in
+    // an inner block still sees the outer block's locals, which are let go only once the scope that
+    // owns them is itself being left.
     for item in scopes
-        run_deferrals(e, item)
-        release_slots(e, scope_slots(e, item))
+        leave_scope(e, item)
 end release_down_to
 
 // -- what a name's storage is -----------------------------------------------------------------------

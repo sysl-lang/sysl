@@ -1,0 +1,282 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.{Source, Span}
+import sysl.buf.{Buf, buf}
+import sysl.container.{Set, set}
+
+// **`--explain-drop-order`: every block whose way out would change under the interleaved order**
+// (`docs/design/borrowed-return.md § 7`).
+//
+// Leaving a block today runs every deferred statement it reached, last written first, and only then
+// gives back the counts of the locals it declared. The order the design settles on undoes the block
+// in reverse of where each thing was written, so a local declared **below** a `defer` is let go before
+// that `defer` runs rather than after it. That is the whole difference, and it is visible only where
+// both are in one block: a `defer`/`errdefer`, and, written after it in the same statement list, a
+// local whose type carries a count. A local declared above the `defer`, a local in a block nested
+// inside, and a temporary (given back where its statement ends) are undone in the same order either
+// way.
+//
+// The report reads the typed tree of every body the program's own files wrote, reachable or not, so
+// a function nothing calls yet is in it. A generic body is read at each instantiation the program
+// made, which is where its local's type is known. What it cannot see is said in the line, not
+// guessed: a local the body hands back from its last line, or moves into a keeping callee, is not
+// released by the block at all, and is still listed -- every line is meant to be read.
+//
+// Each line says whether the release can run a destructor (a `Drop` the type reaches through its
+// references, fields or payloads), which is the case that changes what a program prints or when a
+// resource is let go, or only gives a count back.
+
+// The report, where `--explain-drop-order` asked for it, about the files of the modules a compilation
+// declared (`own`) -- every build that analyzes a program's bodies asks it: a program's, a test
+// build's, an archive's and a library's. A compilation that failed reports nothing.
+explain_drop_census(an: &Analysis, whole: TProgram, units: Buf[Program], own: Buf[string])
+    if !explaining_drops() || !errors_of(an.diagnostics()).is_empty() then return
+
+    var files: Buf[string] = buf()
+
+    for unit in units
+        if names_file(own, module_written(unit)) then files.push(unit.src.name)
+
+    explain_drop_order_lines(drop_order_census(an, whole, files))
+end explain_drop_census
+
+// Every line of the report, for the bodies written in `files`, in the order the bodies were read
+// and with each line once (a body read at two instantiations reports its line once).
+drop_order_census(a: &Analysis, p: TProgram, files: Buf[string]) -> Buf[string]
+    var lines: Buf[string] = buf()
+    var said: Set[string] = set()
+
+    for f in p.funcs
+        f.src match
+            Some(src) -> if names_file(files, src.name) then census_body(a, src, f.body, &lines, &said)
+            None -> ()
+
+    val entry = entry_home(a)
+
+    if entry.src.name != "" && names_file(files, entry.src.name)
+        census_body(a, entry.src, TBlock(p.main, None, Unit), &lines, &said)
+
+    lines
+end drop_order_census
+
+private names_file(files: Buf[string], name: string) -> bool
+    for item in files
+        if item == name then return true
+
+    false
+end names_file
+
+// One body: its own statement list, then every list an expression inside it holds.
+private census_body(a: &Analysis, src: Source, body: TBlock, lines: *Buf[string], said: *Set[string])
+    var found: Buf[(string, string)] = buf()
+    val sink: *Buf[(string, string)] = &found
+
+    census_block(a, src, body, sink)
+
+    val w = expr_walk(false, (e) -> census_expr(a, src, e, sink))
+
+    walk_stmts(body.stmts, w)
+
+    if body.result.is_some() then walk_texpr(body.result.unwrap(), w)
+
+    // One line per local of the source: a generic body read at two instantiations says its line once,
+    // as the first instantiation read saw it.
+    for item in found
+        if !said.has(item.0)
+            said.add(item.0)
+            lines.push(item.1)
+end census_body
+
+// The statement lists an expression holds, each of which is a block with a way out of its own.
+private census_expr(a: &Analysis, src: Source, e: TExpr, sink: *Buf[(string, string)]) = *e.kind match
+    TIf(_, then_block, else_block, _) ->
+        census_block(a, src, then_block, sink)
+        census_opt(a, src, else_block, sink)
+    TMatch(_, arms, _) ->
+        for arm in arms
+            census_block(a, src, arm.body, sink)
+    TBlockExpr(block) -> census_block(a, src, block, sink)
+    TWhile(_, body, else_block, _) ->
+        census_list(a, src, body, sink)
+        census_opt(a, src, else_block, sink)
+    TDoWhile(body, _, else_block, _) ->
+        census_list(a, src, body, sink)
+        census_opt(a, src, else_block, sink)
+    TLoop(body, _) -> census_list(a, src, body, sink)
+    TFor(_, _, _, _, _, body, else_block, _) ->
+        census_list(a, src, body, sink)
+        census_opt(a, src, else_block, sink)
+    TCFor(_, _, _, body, else_block, _) ->
+        census_list(a, src, body, sink)
+        census_opt(a, src, else_block, sink)
+    TForEach(_, _, _, body, else_block, _) ->
+        census_list(a, src, body, sink)
+        census_opt(a, src, else_block, sink)
+    TIterate(_, _, _, _, _, body, else_block, _) ->
+        census_list(a, src, body, sink)
+        census_opt(a, src, else_block, sink)
+    _ -> ()
+
+private census_opt(a: &Analysis, src: Source, b: Option[TBlock], sink: *Buf[(string, string)])
+    if b.is_some() then census_block(a, src, b.unwrap(), sink)
+
+private census_block(a: &Analysis, src: Source, b: TBlock, sink: *Buf[(string, string)]) =
+    census_list(a, src, b.stmts, sink, b.result)
+
+// One block: after its first `defer`, every counted local it declares is a line, naming the nearest
+// deferred statement above it. Each line goes with the key that says which local of the source it
+// is about: the file, the line, and the name. `result` is the block's last line where it yields a
+// value, which is still the block's own and so still below every `defer` in it.
+private census_list(a: &Analysis, src: Source, stmts: Buf[TStmt], sink: *Buf[(string, string)],
+                    result: Option[TExpr] = None)
+    var last: Option[(string, Option[Span])] = None
+
+    for s in stmts
+        s match
+            TDefer(inner, when) ->
+                val word = when match
+                    TEveryExit -> "defer"
+                    TFailureExit(_) -> "errdefer"
+
+                last = Some((word, first_span(inner)))
+            TVarDecl(name, ty, init, _) ->
+                if last.is_some() && contains_counted(ty) && !name.starts_with("$discard")
+                    sink.push((s"${src.name}:${src.locate(init.span.start).line}:$name",
+                               census_line(a, src, name, ty, init.span, last.unwrap())))
+            _ -> ()
+
+        // **A `&value` is a slot the block owns too** (`emit_expr.sysl`'s `TTempAddr`): it keeps
+        // the count of the value it materialised until the block ends, not the statement, so one
+        // written below a `defer` moves as a local does. One inside a nested block is listed as
+        // well, which overstates and never misses.
+        if last.is_some() && !is_defer(s) then walk_stmt(s, temp_walk(a, src, last.unwrap(), sink))
+
+    if last.is_some() && result.is_some() then walk_texpr(result.unwrap(), temp_walk(a, src, last.unwrap(), sink))
+end census_list
+
+// The walk that lists each counted `&value` slot below the deferred statement `above`.
+private temp_walk(a: &Analysis, src: Source, above: (string, Option[Span]),
+                  sink: *Buf[(string, string)]) -> &TWalk =
+    expr_walk(false, (e) -> *e.kind match
+        TTempAddr(value, _) ->
+            if contains_counted(texpr_type(value))
+                val line = src.locate(e.span.start).line
+
+                sink.push((s"${src.name}:$line:&", census_line(a, src, "$&", texpr_type(value), e.span,
+                                                              above)))
+        _ -> ())
+
+private is_defer(s: TStmt) -> bool = s match
+    TDefer(_, _) -> true
+    _ -> false
+
+// `file:line: 'h' (&Host) is declared after the defer at line 31: leaving the block will release it
+// before that defer runs, not after -- a release that can run Host's Drop`. The line is the one the
+// local's value starts on, which is the declaration's for every local written on one line; no column
+// is given, since the typed tree keeps the value's span and not the name's.
+private census_line(a: &Analysis, src: Source, name: string, ty: Type, at: Span,
+                    deferred: (string, Option[Span])) -> string
+    val here = src.locate(at.start)
+    val where = deferred.1 match
+        Some(span) -> s"the ${deferred.0} at line ${src.locate(span.start).line}"
+        None -> s"a ${deferred.0} above it"
+
+    val what = if name == "$&" then "the slot a '&value' made"
+    else if name.starts_with("$") then "a value the compiler holds for this statement"
+    else s"'${written_name(name)}'"
+
+    val effect = reaches_drop(a, ty) match
+        Some(d) -> s"a release that can run ${type_show(d)}'s Drop"
+        None -> "a count given back, no destructor"
+
+    s"${src.name}:${here.line}: $what (${type_show(ty)}) is declared " +
+        s"after $where: leaving the block will release it before that ${deferred.0} runs, not after " +
+        s"-- $effect"
+end census_line
+
+// The name a local was written with: the analyzer's unique name less the `.k` it adds to a second
+// local of the same name in one function.
+private written_name(unique: string) -> string
+    var cut = unique.len
+
+    var i = unique.len
+
+    while i > 0
+        i -= 1
+
+        val c = unique[i]
+
+        if c == u8('.')
+            if i + 1 < unique.len then cut = i
+            break
+
+        if c < u8('0') || c > u8('9') then return unique
+
+    unique[0..<cut]
+end written_name
+
+// Where a deferred statement was written: the first expression it holds.
+private first_span(stmts: Buf[TStmt]) -> Option[Span]
+    for s in stmts
+        val at: Option[Span] = s match
+            TVarDecl(_, _, init, _) -> Some(init.span)
+            TExprStmt(e) -> Some(e.span)
+            TInvariant(cond, _) -> Some(cond.span)
+            TRefDecl(_, _, place) -> Some(place.span)
+            TWriteStmt(w) -> Some(w.place.span)
+            TMultiAssign(writes) -> if writes.is_empty() then None else Some(writes.at(0).place.span)
+            TReturn(value) -> if value.is_some() then Some(value.unwrap().span) else None
+            TBecome(call) -> Some(call.span)
+            TDefer(inner, _) -> first_span(inner)
+            TAsm(_, _, _, span) -> Some(span)
+            _ -> None
+
+        if at.is_some() then return at
+
+    None
+end first_span
+
+// The first type with a `Drop` a value of `t` reaches through what it counts: a reference's target,
+// a field, a payload, an element. A cycle through a recursive type is walked once.
+reaches_drop(a: &Analysis, t: Type) -> Option[Type]
+    var seen: Set[string] = set()
+
+    drop_through(a, t, &seen)
+
+private drop_through(a: &Analysis, t: Type, seen: *Set[string]) -> Option[Type]
+    val key = type_show(t)
+
+    if seen.has(key) then return None
+
+    seen.add(key)
+
+    t match
+        Ref(inner, _) -> drop_through(a, *inner, seen)
+        Weak(_) -> None
+        Array(_, e) -> drop_through(a, *e, seen)
+        Slice(e, _) -> drop_through(a, *e, seen)
+        Volatile(inner) -> drop_through(a, *inner, seen)
+        Struct(d) ->
+            if has_drop(a, t) then return Some(t)
+
+            drop_in_fields(a, d.fields, seen)
+        Enum(d) ->
+            if has_drop(a, t) then return Some(t)
+
+            for v in d.variants
+                val held = drop_in_fields(a, v.fields, seen)
+
+                if held.is_some() then return held
+
+            None
+        _ -> None
+end drop_through
+
+private drop_in_fields(a: &Analysis, fields: Buf[(string, Type)], seen: *Set[string]) -> Option[Type]
+    for item in fields
+        val held = drop_through(a, item.1, seen)
+
+        if held.is_some() then return held
+
+    None
+end drop_in_fields

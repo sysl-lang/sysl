@@ -71,10 +71,11 @@ end LibraryBuild
 // thunk, so an export compiled here would lose the very symbol C links against; left out, the program
 // compiles it from the root's source as it always did.
 library_build(given: Buf[Program], own: Buf[string], t: Target,
-              producing: Option[Buf[string]] = None, entries_left: bool = false) -> LibraryBuild
+              producing: Option[Buf[string]] = None, entries_left: bool = false,
+              census: bool = false) -> LibraryBuild
     val units = without_tests(given)
 
-    library_build_of(units, own, t, producing.unwrap_or(file_names(units)), entries_left)
+    library_build_of(units, own, t, producing.unwrap_or(file_names(units)), entries_left, census)
 end library_build
 
 // The files of a compilation that are not the standard module's: what a build of a package root
@@ -117,7 +118,7 @@ without_tests(units: Buf[Program]) -> Buf[Program]
 end without_tests
 
 private library_build_of(units: Buf[Program], own: Buf[string], t: Target,
-                         producing: Buf[string], entries_left: bool) -> LibraryBuild
+                         producing: Buf[string], entries_left: bool, census: bool) -> LibraryBuild
     // **A library's tests are parsed and never analyzed** (`reference/attributes.md § @tests — a file
     // of scaffolding`): analysis is not a passive reading, and a test naming `Buf[int]` makes `Buf` at
     // `int` -- an instantiation that is an ordinary library function afterwards, with nothing in it
@@ -126,6 +127,10 @@ private library_build_of(units: Buf[Program], own: Buf[string], t: Target,
     val done = analyze_produced(units, t, producing)
     val checked = program_of(done, done.main_module)
     val promotions = post_analysis_checks(done.an, checked, own)
+
+    // Only `build-lib <root>` asks (`census`): the standard module and a `--lib` root are built on the
+    // way to some other program, whose own files are what that report is about.
+    if census then explain_drop_census(done.an, checked, units, own)
 
     // What a test body made would still be dropped here, had anything been left to make it.
     val whole = strip_tests(checked)

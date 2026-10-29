@@ -1,0 +1,590 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.text.{cstring, Search}
+import sysl.fs.{make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// The order a block lets go in (`emit_arc.sysl`'s `leave_scope`, `reference/memory.md § Where defer
+// sits`): each deferred statement the block reached and each counted local it declared are undone in
+// one reverse order by where each was written. A `defer` runs after everything declared below it is
+// released and before everything declared above it.
+//
+// Almost everything here is a program built and run, because the order is the whole content and a
+// block is undone at every edge that leaves it -- one edge read says nothing about the others. The
+// probes d01-d05 of `docs/design/borrowed-return.md` come first, then every way out (the end, a
+// `return`, a `break`, a `continue`, a `?`, an `errdefer`'s failing and succeeding paths, a trap, a
+// task dropped at its `await`), then every block form (an `if` arm, a `match` arm with a binding, a
+// loop body, a block after `=`, a closure's body, a generic body per instantiation, a statement a
+// `defer` opens a scope in), then the counted heap and AddressSanitizer over one program that takes
+// every way out, and last the counted-pointer check, which follows the same order.
+//
+// Cells skipped, with the reason: a thread contending for a real lock while the release runs (d02
+// under TSan) -- the order is what d02's output pins, and a race the order removes cannot be shown to
+// be absent by one run; `-O2` -- the order is settled before LLVM sees the body, and the counted-heap
+// run below is built at the default level.
+
+private extern "setenv" dor_c_setenv(name: *u8, value: *u8, overwrite: int) -> int
+private extern "unsetenv" dor_c_unsetenv(name: *u8) -> int
+
+private struct DorRun
+    out: string
+    err: string
+    code: int
+    hooks: usize
+end DorRun
+
+// What a program prints, on standard output and standard error, and exits with -- built on a counted
+// heap or with extra C flags where asked -- and how many ASan report hooks it calls. A build that
+// failed is its message and `-1`.
+private dor_run(program: string, counted: bool, flags: string) -> DorRun
+    val root = make_temp_dir("sysl-dor").unwrap()
+
+    write_text(s"$root/main.sysl", program).unwrap()
+
+    val exe = s"$root/built"
+
+    if flags != ""
+        val n = cstring("SYSL_EXTRA_CFLAGS")
+        val v = cstring(flags)
+
+        dor_c_setenv(n.ptr, v.ptr, 1)
+
+    force_alloc_counting(counted)
+
+    val made = build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe))
+
+    force_alloc_counting(false)
+
+    if flags != ""
+        val n = cstring("SYSL_EXTRA_CFLAGS")
+
+        dor_c_unsetenv(n.ptr)
+
+    made match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return DorRun(failure_text(why), "", -1, 0)
+        Ok(_) -> ()
+
+    val hooks = capture("nm", ["-u", exe], "", [], true) match
+        Ok(o) -> o.text.count_of("__asan_report")
+        Err(_) -> 0
+
+    val ran = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    ran match
+        Err(_) -> DorRun("the program that was built could not be run", "", -1, hooks)
+        Ok(o) -> DorRun(o.text, o.err.unwrap_or(""), shell_status(o.status), hooks)
+end dor_run
+
+// The program runs to the end, prints exactly this and says nothing on standard error.
+private dor_prints(program: string, want: string)
+    if xvr_no_library() then return
+
+    val got = dor_run(dor_noisy() + program, false, "")
+
+    assert_eq(got.out, want)
+    assert_eq(got.err, "")
+    assert_eq(got.code, 0)
+end dor_prints
+
+// A value whose release prints, so the order of releases is the program's output.
+private dor_noisy() -> string = raw"""
+    import sysl.buf.{Buf, buf}
+
+    struct Noisy
+        name: string
+
+    impl Drop for Noisy
+        drop(self) = print("drop " + self.name)
+
+    """
+
+// -- the probes ---------------------------------------------------------------------------------------
+
+@test("d01: two defers between three locals interleave with them, last written first")
+dor_d01_interleaved()
+    dor_prints(raw"""
+        run()
+            val a: &Noisy = Noisy("a")
+            defer print("defer 1")
+            val b: &Noisy = Noisy("b")
+            defer print("defer 2")
+            val c: &Noisy = Noisy("c")
+
+            print("body " + a.name + b.name + c.name)
+
+        run()
+        """, "body abc\ndrop c\ndefer 2\ndrop b\ndefer 1\ndrop a\n")
+
+@test("d02: a reference read out under a deferred unlock is given back while the lock is held")
+dor_d02_under_the_lock()
+    dor_prints(raw"""
+        static var held = false
+
+        struct Host
+            name: string
+
+        impl Drop for Host
+            drop(self) = print("release " + self.name + (if held then " under the lock" else " after unlock"))
+
+        struct Shared
+            host: Option[&Host]
+
+        var shared = Shared(None)
+
+        lock()
+            held = true
+            print("lock")
+
+        unlock()
+            held = false
+            print("unlock")
+
+        write()
+            lock()
+            defer unlock()
+
+            val h = shared.host.unwrap()
+
+            shared.host = None
+            print("use " + h.name)
+
+        shared.host = Some(Host("dsi"))
+        write()
+        """, "lock\nuse dsi\nrelease dsi under the lock\nunlock\n")
+
+@test("d03: a 'break' and a 'return' out of a loop body undo the innermost block first, each in the one order")
+dor_d03_loop_exits()
+    dor_prints(raw"""
+        run(stop: bool) -> int
+            val a: &Noisy = Noisy("a")
+            defer print("defer outer")
+
+            for i in 0..<3
+                val b: &Noisy = Noisy(s"b$i")
+                defer print("defer loop")
+                val c: &Noisy = Noisy(s"c$i")
+
+                if i == 1 then break
+                if stop then return i
+
+            print(a.name)
+            0
+
+        print(run(false))
+        print("--")
+        print(run(true))
+        """, "drop c0\ndefer loop\ndrop b0\ndrop c1\ndefer loop\ndrop b1\na\ndefer outer\ndrop a\n0\n--\n" +
+             "drop c0\ndefer loop\ndrop b0\ndefer outer\ndrop a\n0\n")
+
+@test("d04: a local declared above a defer and assigned below it is still alive when the defer reads it")
+dor_d04_assigned_later()
+    dor_prints(raw"""
+        run()
+            var late: Option[&Noisy] = None
+            defer print("defer sees " + (late match
+                Some(n) -> n.name
+                None -> "nothing"))
+            val b: &Noisy = Noisy("b")
+
+            late = Some(Noisy("late"))
+            print(b.name)
+
+        run()
+        """, "b\ndrop b\ndefer sees late\ndrop late\n")
+
+@test("d05: a local handed to a function that keeps it is let go of by its keeper, not by the block")
+dor_d05_kept()
+    dor_prints(raw"""
+        var kept: Buf[&Noisy] = buf()
+
+        keep(n: &Noisy)
+            kept.push(n)
+
+        run()
+            val a: &Noisy = Noisy("a")
+            defer print("defer")
+            val b: &Noisy = Noisy("b")
+
+            keep(b)
+            print(a.name + b.name)
+
+        run()
+        print("kept " + kept.at(0).name)
+        kept.clear()
+        print("end")
+        """, "ab\ndefer\ndrop a\nkept b\ndrop b\nend\n")
+
+// -- every way out ------------------------------------------------------------------------------------
+
+@test("a 'continue' undoes the iteration in the one order, as the iteration's end does")
+dor_continue()
+    dor_prints(raw"""
+        run()
+            var i = 0
+
+            while i < 2
+                i += 1
+
+                val b: &Noisy = Noisy(s"b$i")
+                defer print(s"defer $i")
+                val c: &Noisy = Noisy(s"c$i")
+
+                if i == 1 then continue
+
+                print("last " + b.name + c.name)
+
+        run()
+        """, "drop c1\ndefer 1\ndrop b1\nlast b2c2\ndrop c2\ndefer 2\ndrop b2\n")
+
+@test("a '?' that fails undoes the block in the one order, an errdefer in its written place")
+dor_try_and_errdefer()
+    dor_prints(raw"""
+        step(ok: bool) -> Result[int, string] = if ok then Ok(1) else Err("bad")
+
+        build(ok: bool) -> Result[int, string]
+            val a: &Noisy = Noisy("a")
+            errdefer print("undo a")
+            val b: &Noisy = Noisy("b")
+            defer print("defer b")
+            val c: &Noisy = Noisy("c")
+            val n = step(ok)?
+
+            print("built " + a.name + b.name + c.name)
+            Ok(n)
+
+        print(build(true))
+        print("--")
+        print(build(false))
+        """, "built abc\ndrop c\ndefer b\ndrop b\ndrop a\nOk(1)\n--\n" +
+             "drop c\ndefer b\ndrop b\nundo a\ndrop a\nErr(bad)\n")
+
+@test("a body's last value told apart by its tag runs the errdefers between the locals only on failure")
+dor_errdefer_by_tag()
+    dor_prints(raw"""
+        step(ok: bool) -> Result[int, string] = if ok then Ok(1) else Err("bad")
+
+        build(ok: bool) -> Result[int, string]
+            val a: &Noisy = Noisy("a")
+            errdefer print("undo a")
+            val b: &Noisy = Noisy("b")
+            errdefer print("undo b, first")
+            errdefer print("undo b, second")
+            val c: &Noisy = Noisy("c")
+
+            print("try " + a.name + b.name + c.name)
+            step(ok)
+
+        print(build(true))
+        print("--")
+        print(build(false))
+        """, "try abc\ndrop c\ndrop b\ndrop a\nOk(1)\n--\n" +
+             "try abc\ndrop c\nundo b, second\nundo b, first\ndrop b\nundo a\ndrop a\nErr(bad)\n")
+
+@test("a 'return' of a failure written out runs each errdefer in its place; a 'return' of success none")
+dor_return_failure()
+    dor_prints(raw"""
+        lookup(key: int) -> Option[int]
+            val a: &Noisy = Noisy("a")
+            errdefer print(s"no entry for $key")
+            val b: &Noisy = Noisy("b")
+
+            if key < 0 then return None
+
+            print(a.name + b.name)
+            Some(key)
+
+        print(lookup(4))
+        print(lookup(-1))
+        """, "ab\ndrop b\ndrop a\nSome(4)\ndrop b\nno entry for -1\ndrop a\nNone\n")
+
+@test("a trap undoes nothing: no defer runs and no local below it is released")
+dor_trap()
+    if xvr_no_library() then return
+
+    val got = dor_run(dor_noisy() + raw"""
+        f()
+            var xs = [1, 2, 3]
+            var i = 5
+            val a: &Noisy = Noisy("a")
+            defer print("never")
+            val b: &Noisy = Noisy("b")
+
+            print(a.name + b.name)
+            print(xs[i])
+
+        f()
+        """, false, "")
+
+    assert_eq(got.out, "ab\n")
+    assert_eq(got.err, "index 5 out of bounds for length 3 (main.sysl:17:13)\n")
+    assert_eq(got.code, 133)
+end dor_trap
+
+@test("a task dropped at its 'await' undoes its body in the one order, as one that finishes does")
+dor_async()
+    dor_prints(raw"""
+        async work(id: int)
+            val a: &Noisy = Noisy(s"a$id")
+            defer print(s"defer $id")
+            val b: &Noisy = Noisy(s"b$id")
+
+            await yield_now()
+            print(s"finished $id " + a.name + b.name)
+
+        dropped()
+            val t = work(1)
+
+            step(t, () -> ())
+            print("dropping 1")
+
+        dropped()
+        block_on(work(2))
+        """, "dropping 1\ndrop b1\ndefer 1\ndrop a1\nfinished 2 a2b2\ndrop b2\ndefer 2\ndrop a2\n")
+
+// -- every block form ---------------------------------------------------------------------------------
+
+@test("an 'if' arm and an 'else' arm are blocks of their own")
+dor_if_arms()
+    dor_prints(raw"""
+        run(flag: bool)
+            if flag
+                val a: &Noisy = Noisy("if-a")
+                defer print("if defer")
+                val b: &Noisy = Noisy("if-b")
+
+                print(a.name + " " + b.name)
+            else
+                val a: &Noisy = Noisy("else-a")
+                defer print("else defer")
+                val b: &Noisy = Noisy("else-b")
+
+                print(a.name + " " + b.name)
+
+        run(true)
+        run(false)
+        """, "if-a if-b\ndrop if-b\nif defer\ndrop if-a\nelse-a else-b\ndrop else-b\nelse defer\ndrop else-a\n")
+
+@test("a match arm's binding is written above the arm's defer, so it is let go of after it")
+dor_match_arm()
+    dor_prints(raw"""
+        made(name: string) -> Option[&Noisy] = Some(Noisy(name))
+
+        run(o: Option[&Noisy])
+            o match
+                Some(x) ->
+                    defer print("arm defer " + x.name)
+                    val b: &Noisy = Noisy("arm-b")
+
+                    print("arm " + b.name)
+                None -> print("none")
+
+        run(made("bound"))
+        run(None)
+        """, "arm arm-b\ndrop arm-b\narm defer bound\ndrop bound\nnone\n")
+
+@test("a block after '=' computes its value before it is undone")
+dor_value_block()
+    dor_prints(raw"""
+        run()
+            val n =
+                val a: &Noisy = Noisy("blk-a")
+                defer print("block defer")
+                val b: &Noisy = Noisy("blk-b")
+
+                a.name.len + b.name.len
+
+            print(n)
+
+        run()
+        """, "drop blk-b\nblock defer\ndrop blk-a\n10\n")
+
+@test("a closure's body is a block like any other")
+dor_closure()
+    dor_prints(raw"""
+        run()
+            val f = (tag: string) ->
+                val a: &Noisy = Noisy(tag + "a")
+                defer print("closure defer " + tag)
+                val b: &Noisy = Noisy(tag + "b")
+
+                print("closure " + a.name + b.name)
+
+            f("x")
+            f("y")
+
+        run()
+        """, "closure xaxb\ndrop xb\nclosure defer x\ndrop xa\nclosure yayb\ndrop yb\nclosure defer y\ndrop ya\n")
+
+@test("each instantiation of a generic body keeps the order, whether its T counts or not")
+dor_generic()
+    dor_prints(raw"""
+        hold[T](mk: () -> T, label: string)
+            val a: &Noisy = Noisy(label + "-a")
+            defer print("generic defer " + label)
+            val held = mk()
+            val b: &Noisy = Noisy(label + "-b")
+
+            print("generic " + a.name + " " + b.name)
+
+        hold(() -> 1, "int")
+        hold(() -> Noisy("made"), "noisy")
+        """, "generic int-a int-b\ndrop int-b\ngeneric defer int\ndrop int-a\n" +
+             "generic noisy-a noisy-b\ndrop noisy-b\ndrop made\ngeneric defer noisy\ndrop noisy-a\n")
+
+@test("a scope a deferred statement opens is undone inside it, between the locals around the defer")
+dor_scope_inside_a_defer()
+    dor_prints(raw"""
+        run()
+            val a: &Noisy = Noisy("a")
+            defer for i in 0..<2
+                val t: &Noisy = Noisy(s"t$i")
+                print("in defer " + t.name + " sees " + a.name)
+            val b: &Noisy = Noisy("b")
+
+            print(a.name + b.name)
+
+        run()
+        """, "ab\ndrop b\nin defer t0 sees a\ndrop t0\nin defer t1 sees a\ndrop t1\ndrop a\n")
+
+@test("a parameter the body owns is let go of after every defer, as the outermost thing written")
+dor_owned_parameter()
+    dor_prints(raw"""
+        var kept: Buf[&Noisy] = buf()
+
+        take(n: &Noisy)
+            defer print("defer in take")
+            val b: &Noisy = Noisy("b")
+
+            kept.push(n)
+            print(n.name + b.name)
+
+        take(Noisy("p"))
+        print(kept.len())
+        kept.clear()
+        """, "pb\ndrop b\ndefer in take\n1\ndrop p\n")
+
+// -- the counted heap and AddressSanitizer --------------------------------------------------------------
+
+// One program that leaves blocks every way there is, with strings, buffers and references of its own
+// below and above its defers, and a local moved into a keeper -- nothing it holds is given back
+// twice, and nothing is left.
+private dor_every_exit() -> string = dor_noisy() + raw"""
+    var kept: Buf[&Noisy] = buf()
+
+    keep(n: &Noisy)
+        kept.push(n)
+
+    step(ok: bool) -> Result[string, string] = if ok then Ok("ok" + "!") else Err("bad" + "!")
+
+    run(stop: int) -> Result[int, string]
+        val a: &Noisy = Noisy("a")
+        val s = s"s$stop"
+        defer print("defer " + s)
+        val b: Buf[string] = buf()
+        errdefer print("undo " + s)
+
+        b.push(s + "x")
+
+        for i in 0..<3
+            val c = s"c$i"
+            defer print("loop " + c)
+            val d: &Noisy = Noisy(c)
+
+            keep(Noisy(c + "-kept"))
+
+            if i == stop then break
+            if i + 10 == stop then continue
+            if i + 20 == stop then return Ok(i)
+
+            val got = step(i + 30 != stop)?
+
+            print(got + d.name)
+
+        Ok(int(b.len() + a.name.len))
+
+    for stop in [0, 11, 20, 30, 9]
+        print(run(stop))
+
+    kept.clear()
+    """
+
+private dor_every_exit_output() -> string =
+    "drop c0\nloop c0\ndefer s0\ndrop a\nOk(2)\n" +
+    "ok!c0\ndrop c0\nloop c0\ndrop c1\nloop c1\nok!c2\ndrop c2\nloop c2\ndefer s11\ndrop a\nOk(2)\n" +
+    "drop c0\nloop c0\ndefer s20\ndrop a\nOk(0)\n" +
+    "drop c0\nloop c0\nundo s30\ndefer s30\ndrop a\nErr(bad!)\n" +
+    "ok!c0\ndrop c0\nloop c0\nok!c1\ndrop c1\nloop c1\nok!c2\ndrop c2\nloop c2\ndefer s9\ndrop a\nOk(2)\n" +
+    "drop c0-kept\ndrop c0-kept\ndrop c1-kept\ndrop c2-kept\ndrop c0-kept\ndrop c0-kept\n" +
+    "drop c0-kept\ndrop c1-kept\ndrop c2-kept\n"
+
+@test("every way out on a counted heap: the output in the one order, and nothing left at exit")
+dor_counted_heap()
+    if xvr_no_library() then return
+
+    val got = dor_run(dor_every_exit(), true, "")
+
+    assert_eq(got.out, dor_every_exit_output())
+    assert_eq(got.err, "")
+    assert_eq(got.code, 0)
+end dor_counted_heap
+
+@test("every way out under AddressSanitizer: instrumented, and nothing read after it was freed")
+dor_asan()
+    if xvr_no_library() then return
+
+    val got = dor_run(dor_every_exit(), false, "-fsanitize=address -g")
+
+    assert(got.hooks > 0, s"not instrumented: ${got.out}")
+    assert_eq(got.out, dor_every_exit_output())
+    assert_eq(got.err, "")
+    assert_eq(got.code, 0)
+end dor_asan
+
+// -- the counted-pointer check follows the same order ---------------------------------------------------
+
+// What the analysis says about a program: "accepted", or its report.
+private dor_report(program: string) -> string
+    val root = make_temp_dir("sysl-dor").unwrap()
+
+    write_text(s"$root/main.sysl", program).unwrap()
+
+    val out = emit_llvm_text(s"$root/main.sysl", None) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> if made.report.is_empty() then "accepted" else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end dor_report
+
+private dor_stranded(name: string, owner: string) -> string =
+    s"'$name' points into storage '$owner' holds, and '$owner' was let go of where its block ended — " +
+    s"so this would read freed memory. Use the pointer inside that block, or declare '$owner' in a " +
+    "block that holds the pointer's uses too"
+
+// A buffer declared below a `defer` is let go of before the deferred statement runs, so a pointer into
+// it that the statement reads is stranded -- at the block's end and on a `return` alike. Declared
+// above the `defer`, it is still alive, and the program runs.
+@test("a defer reading a pointer into a buffer declared below it is refused; one declared above runs")
+dor_pointer_below_a_defer()
+    if xvr_no_library() then return
+
+    val head = "import sysl.buf.*\n\nrun(c: bool) -> int\n    val a: Buf[int] = buf()\n\n    a.push(1)\n\n" +
+               "    var p = &a[0]\n"
+    val below = "    defer print(*p)\n    val b: Buf[int] = buf()\n\n    b.push(7)\n    p = &b[0]\n"
+    val above = "    val b: Buf[int] = buf()\n\n    b.push(7)\n    defer print(*p)\n    p = &b[0]\n"
+    val tail = "    if c then return 1\n\n    2\n\nprint(run(false))\nprint(run(true))\n"
+
+    val refused = dor_report(head + below + tail)
+
+    assert(refused.contains(dor_stranded("p", "b")), refused)
+
+    val got = dor_run(head + above + tail, false, "")
+
+    assert_eq(got.out, "7\n2\n7\n1\n")
+    assert_eq(got.code, 0)
+end dor_pointer_below_a_defer

@@ -3399,16 +3399,57 @@ those.
 
 Three facts place it against everything above:
 
-- **A deferred statement runs before the block's ARC releases**, so every local it names is still
-  alive when it runs — including the one holding the resource it is closing. Leaving from the middle
-  unwinds outward: the innermost block runs its deferred statements and then gives up its counts, then
-  the block outside it does the same.
+- **Leaving a block undoes it in reverse.** Each deferred statement the block reached and each local
+  it declared is undone in the reverse order of where it was written, the last one first: a `defer`
+  runs after every local declared below it has been released, and before every local declared above
+  it. A deferred statement can name only the locals above it, so every one it names is still alive
+  when it runs — including the one holding the resource it is closing. Leaving from the middle unwinds
+  outward: the innermost block is undone whole, then the block outside it.
 - **It owns nothing and allocates nothing.** `defer` takes no count, makes no box, and adds no word to
   any value; a program that does not use it emits nothing for it. That is what keeps it available
   under `no alloc`, where the resources it releases are the only ones there are.
 - **A trap runs nothing.** A trap aborts without stack cleanup, and `defer` does not qualify that: a
   broken invariant means the program's model of itself is already wrong, and running cleanup against
   that state is how a corrupt program writes its corruption to disk on the way down.
+
+The order is what makes a lock taken, then `defer`-unlocked, stay held while everything made under
+it is given back — a destructor that runs on the last count runs inside the lock, not after it:
+
+```sysl
+struct Conn
+    name: string
+
+impl Drop for Conn
+    drop(self) = print(s"close ${self.name}")
+
+serve()
+    val a: &Conn = Conn("a")
+    print("lock")
+    defer print("unlock")
+    val b: &Conn = Conn("b")
+    defer print("flush")
+    val c: &Conn = Conn("c")
+
+    print(s"serve ${a.name}${b.name}${c.name}")
+
+serve()
+```
+
+```output
+lock
+serve abc
+close c
+flush
+close b
+unlock
+close a
+```
+
+This is the order Rust, C++ and D give destructors and scope guards, and Zig's `defer`s, which are its
+only cleanup, run in it trivially. A `return`, a `break`, a `continue` and a `?` undo the blocks they
+leave in the same order; an [`errdefer`](/reference/statements/#errdefer) takes its written place
+when the function is failing and is skipped otherwise. A temporary is still released at the end of
+its statement.
 
 **What it is not is a destructor.** A destructor belongs to a *type* and runs wherever a value of that
 type dies; `defer` belongs to one place in one body and runs for the resource that body took. Both

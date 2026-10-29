@@ -267,8 +267,10 @@ enclosing module and everything under it. The bracket takes a **simple name, not
 finishes normally, and a value-carrying `break` without one is refused. Loops take `'label`s.
 
 **`defer <statement>` runs on the way out of its block** by any ordinary route — falling off the end,
-`return`, `break`, `continue`, or a `?` taking its failure arm — in reverse order. A **trap runs no
-deferred statement**.
+`return`, `break`, `continue`, or a `?` taking its failure arm — in reverse order. **Its releases
+interleave with them**: leaving a block undoes each `defer` and each local in reverse order of where
+it was written, so a `defer` runs after the locals declared below it are released and before those
+above it. A **trap runs no deferred statement**.
 
 **`errdefer <statement>` runs only when the function fails** — returns `Err` (a `Result`) or `None`
 (an `Option`), by `?`, `return` or its last value — and is discarded on every other way out of its

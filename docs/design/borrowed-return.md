@@ -301,3 +301,78 @@ with R1.
 
 Cells skipped, with the reason: a `-> ref T` answer through a trait object (R6 refuses it, as
 `@views(self)` requires the trait to declare it — a later item if wanted).
+
+## Appendix — the D1 drop-order census (2026-10-28)
+
+**How it was taken.** `--explain-drop-order` (`compiler/sh/sysl/compiler/drop_census.sysl`) reads
+the typed tree of every body in the project's own files, including bodies nothing calls and each
+generic instantiation the build made. It prints one line per local that a `defer` or `errdefer`
+written above it, in the same block, would come to follow under §7.2. The flag is taken by
+`build`, `run`, `test`, `build-c`, `build-lib` and `emit-llvm`. The probes d01–d05 are its tests
+(`tests_dce_drop_census.sysl`). The org was swept with this branch's stage 1, one repo at a time,
+under `nice`, choosing each repo's command the way `scripts/org_build_census.sh` does: `test .`
+with a filter that matches nothing, `build .`, `build-lib .` or `build-c <dir>`, and board targets
+for the board repos. Each repo was taken at the commit checked out in `~/dev/sysl-lang/<repo>`.
+
+**Coverage.** 128 repos, plus this repository's `library/` (run as `test ../library --std`) and
+`compiler/` (run as `build .`), which the org census script leaves out. Every repo with a `defer` in
+it (benchtop, httpd, kairos, keel, repl, sysl) was swept a second time after the census also learned
+to list `&value` slots and a block's last line; the result did not change. 115 repos produced a
+report. The other 13 stopped before analysis: duckdb,
+quickjs-ng, freertos and orbits need headers that are not on this machine; pico2, musicbox-pico,
+ogol-pico2 and solder-pico2 need the SDK's generated headers; forth, kfs, libpq and skiff-old use a
+bare `ptr_cast` from before 0.7; skiff has a member attribute. **None of the 13 has a `defer` or
+`errdefer` in any file**, so none can change order.
+
+**Result: 14 locals in 3 org repos and 57 in sysl itself. None is risky, and none is d02's race.**
+keel and repl have `defer`s but no local below one. The 57 in sysl itself are listed by site at the
+end. benchtop's `dsi_write`
+race (`d72cffd`) no longer has the shape: the fix replaced `lock(); defer unlock()` with
+`machine.devices.dsi.host.with(h -> …)`, and nothing on benchtop's dev takes a lock and then defers
+its release. Two kinds of change appear:
+
+- **A count given back earlier** (12 of 14). The local's memory is freed before the deferred
+  statement runs instead of after it. Nothing prints differently and no destructor runs.
+- **A release that can reach a `Drop`** (2 of 14). Both are read below. Only one is the last count.
+
+| repo | file:line | local (type) | below the `defer` at | what changes | matters? |
+|---|---|---|---|---|---|
+| benchtop | `ui/window.sysl:111` | `active` (`&Signal[Buf[byte]]`) | 110 `close_instruments(d)` | count given back before `close_instruments` | no |
+| benchtop | `ui/window.sysl:132` | `path` (`string`) | 115 `close_workflow(d)` | count | no |
+| benchtop | `ui/window.sysl:133` | `count` (`&Signal[u64]`) | 115 | count | no |
+| benchtop | `ui/window.sysl:135` | `player` (`&AudioPlayer`, reaches SDL `AudioStream`'s `Drop`) | 115 | `close_audio(player)` (136) still runs first. The stream is then destroyed straight after it, **before** `close_workflow` and `close_instruments`; today it is destroyed after both. The `on_frame` closure's share ended with `driver.run`'s statement, so this is the last count. | **Reordered destructor, benign.** The stream is let go in reverse order of acquisition, after `stop_workers`. Worth one look in D2's benchtop run |
+| benchtop | `ui/window.sysl:146` | `rates` (`Option[&CpuRateTrace]`) | 145 `virt.stop_workers()` | count released before the workers stop. Any closure a worker holds keeps its own share | no |
+| benchtop | `ui/window.sysl:147` | `pacing` (`&GuestPacer`) | 145 | count | no |
+| benchtop | `ui/window.sysl:162` | `final` (`State`) | 145 | count | no |
+| httpd | `server.sysl:169` | `conn` (`&Connection`, has a `Drop`) | 167 `srv.forget(p)` | a share of `p.conn` given back before `forget`. `p`, a parameter, still holds the connection, so its `Drop` does not run here in either order | no |
+| httpd | `server.sysl:170` | `inbox` (`&Inbox`) | 167 | count | no |
+| httpd | `server.sysl:171` | `rq` (`&Requests`) | 167 | count | no |
+| kairos | `uv/file.sysl:24` | `out` (`Buf[byte]`) | 22 `if open then libuv.close(f, …)` | buffer freed before the close | no |
+| kairos | `uv/ipc.sysl:144` | `got` (`Result[[]byte, Error]`) | 142 `stop_reading(s, r)` | count | no |
+| kairos | `uv/net.sysl:117` | `p` (`&Pending[…]`) | 115 `if !connected then s.close()` | on the failure path, `p` is released before the socket closes. The callback handed to `connect` holds its own share | no |
+| kairos | `uv/stream_tests.sysl:338` (a test) | `diagnostic` (`StreamDiagnostic`, holds a `Pipe`, which has a `Drop`) | 337 `b.close()` | a share of `a` given back before `b.close()` and `a.close()`. `a` still holds the pipe, so its `Drop` does not run here | no |
+
+Commits read: benchtop `cda454b` (dev), httpd `bd7a0bd`, kairos `89059f8`. The census is
+conservative. It also lists a local the block does not release in the end (one moved into a keeping
+callee, d05's `b`, or one the body returns), and every line here was read by hand. A `&value`
+slot also belongs to its block's scope (`TTempAddr`), so one written below a `defer` is listed too.
+The only owned slot the census cannot see is the emitter's snapshot of a large by-value argument
+(`indirect_arg`). Its count is an extra share taken from an owner that outlives the call, so it is
+never the last count, and the order of its release cannot be observed.
+
+**sysl itself: 57 locals. Every one only gives a count back** (no type reaches a `Drop`), so nothing
+prints differently. They are grouped below by the `defer` they follow.
+
+| where | the `defer` | locals below it | matters? |
+|---|---|---|---|
+| `compiler/…/analyze_body.sysl:612, 871, 1000`, `inferred_results.sysl:292`, `nested.sysl:386` | `leave_reaching(a, reaching)` | 30 locals: `cx`, `params`, `body`, `subst`, `ret`, … | no. The analyzer state is given back before the reach stack is popped, and `leave_reaching` does not read those locals |
+| `compiler/…/analyze_body.sysl:620` | `a.sites.reading = outer_reading` | `params`, `written`, `ret`, `contract`, `rest`, `body` | no |
+| `compiler/…/analyze_body.sysl:1154` | `told_at_derives(…)` | `sig`, `params`, `ret`, `contract`, `rest`, `body` | no |
+| `compiler/…/std_artifact.sysl:200` | `phase_mute(false)` | `units` | no |
+| `library/sysl/fs/path.sysl:96` | `fsys.closedir(d)` | `names` | no. The buffer is freed before the directory is closed |
+| `library/sysl/fs/whole.sysl:43, 139, 143` | `f.close()`, `src.close()`, `dst.close()` | `out`, `dst` (a `File`, which has no `Drop`), `chunk` | no |
+| `library/sysl/fs/buffer_tests.sysl:126`, `publish_tests.sysl:54, 68, 98, 122, 147` (tests) | `f.close()`, `remove_dir_all(dir)` | strings and a byte slice (10) | no |
+
+**Conclusion for D2:** no program in the org depends on today's order. The one destructor that
+moves (benchtop's audio stream) moves to the order Rust and C++ would give it. D2 can land as
+designed, with the change listed under **Behaviour change** in the 0.8.0 notes.

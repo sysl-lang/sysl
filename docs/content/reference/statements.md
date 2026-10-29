@@ -936,10 +936,52 @@ scope `defer` to the block.
 
 ### Where it sits against the rest of the model
 
-**A deferred statement runs before the block's reference-count releases**, so every local it names is
-still alive when it runs, including the one holding the resource being closed. Leaving from the
-middle unwinds outward: the innermost block runs its deferred statements and then releases its
-references, then the enclosing block does the same, up to the function's own.
+**Leaving a block undoes it in reverse.** Each deferred statement the block reached and each local it
+declared is undone in the reverse order of where it was written: a `defer` runs after every local
+declared below it is released, and before every local declared above it. A deferred statement can
+name only the locals above it, so every one it names is still alive when it runs, including the one
+holding the resource being closed. Leaving from the middle unwinds outward: the innermost block is
+undone whole, then the enclosing block, up to the function's own.
+
+```sysl
+struct Res
+    name: string
+
+impl Drop for Res
+    drop(self) = print(s"release ${self.name}")
+
+work(fail: bool) -> Result[int, string]
+    val a: &Res = Res("a")
+    defer print("defer 1")
+    val b: &Res = Res("b")
+    errdefer print("undo b")
+    val c: &Res = Res("c")
+
+    if fail then return Err(a.name + b.name + c.name)
+
+    Ok(1)
+
+print(work(false))
+print(work(true))
+```
+
+```output
+release c
+release b
+defer 1
+release a
+Ok(1)
+release c
+undo b
+release b
+defer 1
+release a
+Err(abc)
+```
+
+This is the order of Rust's and C++'s destructors and scope guards, and of D's `scope(exit)`. An
+`errdefer` takes its written place on a failing way out and is skipped on any other. A temporary is
+released at the end of its statement, as everywhere.
 
 **It owns nothing and allocates nothing.** `defer` takes no reference count, creates no box, and adds
 no word to any value; a program that does not use it emits nothing for it. It is therefore available
