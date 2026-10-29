@@ -1,0 +1,164 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.remove_dir_all
+import sysl.text.join
+
+// `@tests` -- an `impl` of a trait THAT SAME FILE declares, for any type. No other build has the
+// trait, so the block has no second answer to disagree with; the file is dropped everywhere but a
+// test build (`reference/attributes.md § @tests`). An `impl` of any other trait is still only for a
+// type the file declares (`tests_tfx_test_file.sysl`).
+
+private tti_ready() -> bool = std_root().is_ok() && clang_available()
+
+private tti_tree(files: [](string, string)) -> string
+    var b: Buf[(string, string)] = buf()
+
+    for i in 0..<files.len
+        b.push(files[i])
+
+    lbr_project(b)
+end tti_tree
+
+// The names of the tests a `sysl test` build of the tree holds, and whether it was refused.
+private tti_tested(root: string) -> string
+    reset_search_paths()
+
+    val names = test_build_of(root, None) match
+        Err(why) -> s"refused: ${failure_text(why)}"
+        Ok(built) ->
+            var out: Buf[string] = buf()
+
+            for item in built.tests
+                out.push(item.display)
+
+            join(out.view(), ", ")
+
+    remove_dir_all(root).unwrap_or(())
+    names
+
+private tti_refused(root: string, reason: string, line: int, text: string) -> bool
+    val got = lbr_cli(["sysl", "test", root])
+
+    remove_dir_all(root).unwrap_or(())
+
+    val out = got.1
+
+    got.0 == 1 && out.contains("error: an 'impl' block in a file that said '@tests' has to be for a type " +
+                               s"that file declares, and $reason — a test build would keep this block and " +
+                               "every other build would drop it, so a trait would answer one way while the " +
+                               "tests ran and another way in the program that ships. Write the block " +
+                               "beside the type's own declaration, or declare a type for the tests in " +
+                               "this file") && out.contains(s"tests.sysl:$line:1") && out.contains(text)
+
+private tti_module() -> string =
+    "module m\n\nstruct P\n    n: int\n\ntrait Scale\n    scale(self, k: int) -> int\n"
+
+// The trait, and an `impl` of it for a builtin, a generic type and another file's struct.
+private tti_tests() -> string =
+    "module m\n@tests\n\ntrait Approx\n    near(self, other: Self) -> bool\n\n" +
+    "impl Approx for f64\n    near(self, other: f64) -> bool = self - other < 0.5 && other - self < 0.5\n\n" +
+    "impl Approx for int\n    near(self, other: int) -> bool = self - other < 2 && other - self < 2\n\n" +
+    "impl Approx for Buf[int]\n    near(self, other: Buf[int]) -> bool = self.len() == other.len()\n\n" +
+    "impl Approx for P\n    near(self, other: P) -> bool = self.n == other.n\n\n" +
+    "agree[T: Approx](a: T, b: T) -> bool = a.near(b)\n\n" +
+    "@test\nbuiltin()\n    assert(1.0.near(1.2))\n    assert(!1.0.near(3.0))\n    assert(3.near(4))\n\n" +
+    "@test\ngeneric_type()\n    var a: Buf[int] = buf()\n    var b: Buf[int] = buf()\n\n" +
+    "    a.push(1)\n    b.push(2)\n    assert(a.near(b))\n\n" +
+    "@test\nforeign_struct()\n    assert(P(1).near(P(1)))\n    assert(!P(1).near(P(2)))\n\n" +
+    "@test\nas_a_bound()\n    assert(agree(P(3), P(3)))\n    assert(agree(1.0, 1.1))\n    assert(!agree(10, 1))\n"
+
+@test("a trait the file declares may be implemented for a builtin, a generic type and another file's struct")
+tti_impl_of_a_local_trait()
+    if !tti_ready() then return
+
+    val names = tti_tested(tti_tree([("main.sysl", "import m.*\nprint(1)"), ("m/m.sysl", tti_module()),
+                                     ("m/tests.sysl", tti_tests())]))
+
+    assert_eq(names, "builtin, generic_type, foreign_struct, as_a_bound")
+
+@test("a blanket impl of a trait the file declares is fine too")
+tti_blanket_impl_of_a_local_trait()
+    if !tti_ready() then return
+
+    val names = tti_tested(tti_tree([
+        ("main.sysl", "import m.*\nprint(1)"), ("m/m.sysl", tti_module()),
+        ("m/tests.sysl", "module m\n@tests\n\ntrait Tag\n    tag(self) -> int\n\n" +
+                         "impl[T] Tag for T\n    tag(self) -> int = 7\n\n" +
+                         "@test\nblanket()\n    assert_eq(P(1).tag(), 7)\n    assert_eq(3.tag(), 7)\n")]))
+
+    assert_eq(names, "blanket")
+
+@test("a program built beside such a file never sees the trait or its impls")
+tti_the_program_drops_the_local_trait()
+    if !tti_ready() then return
+
+    val root = tti_tree([("main.sysl", "import m.*\nprint(1.near(2))"), ("m/m.sysl", tti_module()),
+                         ("m/tests.sysl", tti_tests())])
+    val got = lbr_cli(["sysl", "build", root])
+
+    remove_dir_all(root).unwrap_or(())
+    assert_eq(got.0, 1, got.1)
+    assert(got.1.contains("near"), got.1)
+
+@test("an impl of a trait another module declares is still refused for a builtin")
+tti_a_trait_from_elsewhere_for_a_builtin()
+    if !tti_ready() then return
+
+    assert(tti_refused(tti_tree([("main.sysl", "import m.*\nprint(1)"), ("m/m.sysl", tti_module()),
+                                 ("m/tests.sysl", "module m\n@tests\n\ntrait Approx\n    near(self) -> bool\n\n" +
+                                                  "impl Scale for f64\n    scale(self, k: int) -> int = k\n")]),
+                       "'f64' is not declared in it", 7, "impl Scale for f64"))
+
+@test("and so is one of a trait another '@tests' file declares")
+tti_a_trait_from_another_test_file()
+    if !tti_ready() then return
+
+    assert(tti_refused(tti_tree([("main.sysl", "import m.*\nprint(1)"), ("m/m.sysl", tti_module()),
+                                 ("m/fixtures.sysl", "module m\n@tests\n\ntrait Approx\n    near(self) -> bool\n"),
+                                 ("m/tests.sysl", "module m\n@tests\n\nimpl Approx for int\n" +
+                                                  "    near(self) -> bool = true\n")]),
+                       "'int' is not declared in it", 4, "impl Approx for int"))
+
+@test("and a blanket-style impl of the module's trait for a generic builtin type")
+tti_a_blanket_impl_of_a_foreign_trait()
+    if !tti_ready() then return
+
+    assert(tti_refused(tti_tree([("main.sysl", "import m.*\nprint(1)"), ("m/m.sysl", tti_module()),
+                                 ("m/tests.sysl", "module m\n@tests\n\ntrait Approx\n    near(self) -> bool\n\n" +
+                                                  "impl[T] Scale for Buf[T]\n    scale(self, k: int) -> int = k\n")]),
+                       "'Buf' is not declared in it", 7, "impl[T] Scale for Buf[T]"))
+
+// -- a library whose '@tests' file does it -------------------------------------------------------------
+
+private tti_lib() -> string = tti_tree([
+    ("demo/lib.sysl", "module demo\n\ndouble(n: int) -> int = n * 2\n"),
+    ("demo/tests.sysl", "module demo\n@tests\n\ntrait Approx\n    near(self, other: Self) -> bool\n\n" +
+                        "impl Approx for int\n    near(self, other: int) -> bool = self == other\n\n" +
+                        "@test\ndoubles()\n    assert(double(2).near(4))\n")])
+
+@test("a library's tests run with the impl, and build-lib neither keeps nor exports it")
+tti_a_library_strips_the_impl()
+    if !tti_ready() then return
+
+    val lib = tti_lib()
+    val ran = lbr_cli(["sysl", "test", lib])
+
+    assert_eq(ran.0, 0, ran.1)
+
+    val built = lbr_cli(["sysl", "build-lib", lib])
+
+    assert_eq(built.0, 0, built.1)
+
+    val prog = tti_tree([("main.sysl", "import demo.*\nprint(double(2).near(4))\n")])
+    val refused = lbr_cli(["sysl", "build", prog, "--lib", lib])
+
+    assert_eq(refused.0, 1, refused.1)
+    assert(refused.1.contains("near"), refused.1)
+
+    val ok = tti_tree([("main.sysl", "import demo.*\nprint(double(2))\n")])
+
+    assert(!lbr_text(s"$ok/main.sysl", [lib]).contains("Approx"))
+    assert_eq(lbr_run(s"$ok/main.sysl", [lib]), "4\n")
+    lbr_drop([lib, prog, ok])

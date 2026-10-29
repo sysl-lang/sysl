@@ -1299,19 +1299,40 @@ a_square_measures()
     assert_eq(s.described(), "area 9")
 ```
 
-Where the trait is declared does not enter into it: a trait of the module and a trait of the test file
-are equally fine. What is still refused is an `impl` for any type the file did not declare — one of
-the module's, a builtin, a blanket `impl[T] … for T`, and a type another `@tests` file declares, since
-which files a build keeps is decided file by file:
+Where the trait is declared does not enter into the first half of the rule: a trait of the module and
+a trait of the test file are equally fine for a type the file declares. **The other half is a trait the
+file declares: its `impl` may be for any type** — a builtin, a generic type, another file's struct, a
+blanket `impl[T] … for T` — because no other build has the trait, so there is no second answer for the
+block to disagree with. A test file can give the types it tests a helper trait of its own:
 
 ```sysl
 @tests
 
-trait Area
-    area(self) -> int
+trait Approx
+    near(self, other: Self) -> bool
 
-impl Area for int
-    area(self) -> int = self
+impl Approx for f64
+    near(self, other: f64) -> bool = self - other < 0.5 && other - self < 0.5
+
+agree[T: Approx](a: T, b: T) -> bool = a.near(b)
+
+@test("a trait of the file's own, implemented for a builtin")
+floats_are_near()
+    assert(1.0.near(1.2))
+    assert(agree(1.0, 1.1))
+```
+
+The trait and its `impl` go with the file: a library built from the module exports neither, and no
+code outside the test build can name them. What is still refused is an `impl` of any other trait — the
+module's, another module's, or one another `@tests` file declares — for a type the file did not
+declare: one of the module's, a builtin, a blanket `impl[T] … for T`, and a type another `@tests` file
+declares, since which files a build keeps is decided file by file:
+
+```sysl
+@tests
+
+impl Hash for int
+    hash(self) -> u64 = 1
 ```
 
 ```error
