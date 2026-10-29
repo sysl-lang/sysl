@@ -4,8 +4,8 @@ import sh.sysl.parsing.*
 import sysl.buf.{Buf, buf}
 import sysl.math.bigint.{BigInt, from_int, to_string}
 
-// The six methods a vector answers to, the two a run of them in memory does, and the comparison
-// that yields a mask.
+// The eight methods a vector answers to (the two lane-wise ones, `abs` and `mul_add`, among them),
+// the two a run of them in memory does, and the comparison that yields a mask.
 //
 // None of it is a *lookup*: nothing declares `select` or `sum`, so there is no member to find and no
 // overload set to narrow -- the name is recognised, the lanes are checked, and one node is built.
@@ -17,7 +17,7 @@ import sysl.math.bigint.{BigInt, from_int, to_string}
 // here and answered with a list.
 is_vector_method(name: string) -> bool =
     name == "select" || name == "shuffle" || name == "sum" || name == "min" || name == "max" ||
-        name == "any" || name == "all"
+        name == "any" || name == "all" || name == "abs" || name == "mul_add"
 
 // The two names a slice or an array answers with a vector's lanes. They are the *receiver's* methods
 // and not the vector's, because what a load needs is an address and a length and a vector has
@@ -146,6 +146,9 @@ vector_method(cx: &Analyzer, span: Span, v: Type, tr: TExpr, name: string,
         return vector_select(cx, span, v, parts.0, tr, args)
     end if
 
+    if name == "abs" then return vector_abs(cx, span, v, lane, tr, args)
+    if name == "mul_add" then return vector_mul_add(cx, span, v, elem, lane, tr, args)
+
     if !args.is_empty() then
         cx.fault(span, s"'$name' takes no arguments — it reduces the ${type_show(v)} it is read off")
 
@@ -185,6 +188,80 @@ vector_method(cx: &Analyzer, span: Span, v: Type, tr: TExpr, name: string,
 
     TExpr(span, TReduce(op, tr, elem))
 end vector_method
+
+// `v.abs()` -- the magnitude of every lane, one `llvm.fabs` or `llvm.abs` over the register.
+//
+// A float lane's sign bit is cleared, so `-0.0` answers `0.0`, a NaN stays a NaN and an infinity
+// stays one, at every width including `f16` and `bf16`. A signed integer lane answers as the scalar
+// `abs` does: the most negative value answers itself, in every build. An unsigned lane has no `abs`
+// (the scalar one is `Signed`'s), and a fixed-point lane's would saturate where the register's does
+// not, so both are refused.
+private vector_abs(cx: &Analyzer, span: Span, v: Type, lane: Type, tr: TExpr,
+                   args: Buf[Expr]) -> TExpr
+    if !args.is_empty() then
+        cx.fault(span, s"'abs' takes no arguments — it takes the magnitude of each lane of the " +
+                 s"${type_show(v)} it is read off")
+
+    val op = lane match
+        Floating(_, _) -> "fabs"
+        Integer(_, signed, _) -> if signed then "abs" else ""
+        _ -> ""
+
+    if op == "" then
+        return cx.err(span, s"'abs' is the magnitude of a signed integer or a float, and ${type_show(v)} " +
+                      "is neither")
+
+    TExpr(span, TVecOp(op, one_operand(tr), v))
+end vector_abs
+
+private one_operand(x: TExpr) -> Buf[TExpr]
+    var out: Buf[TExpr] = buf()
+
+    out.push(x)
+    out
+end one_operand
+
+// `a.mul_add(b, c)` -- `a * b + c` in every lane with the product never rounded on its own, one
+// `llvm.fma` over the register. The name and meaning are the scalar `mul_add`'s, and the widths are
+// the scalar's too: **an `f16` or `bf16` lane is refused**, because the half widths cannot keep the
+// single rounding the method promises. Either of `b` and `c` may be a scalar, which is the same
+// value in every lane.
+private vector_mul_add(cx: &Analyzer, span: Span, v: Type, elem: Type, lane: Type,
+                       tr: TExpr, args: Buf[Expr]) -> TExpr
+    val wide = lane match
+        Floating(bits, brain) -> !brain && (bits == 32 || bits == 64)
+        _ -> false
+
+    if !wide then
+        return cx.err(span, s"'mul_add' rounds the product and the sum once, which only a float of " +
+                      s"32 or 64 bits can promise, and ${type_show(v)} is not one")
+
+    if args.len() != 2 then
+        return cx.err(span, "'mul_add' takes the vector to multiply by and the one to add — " +
+                      s"'a.mul_add(b, c)', and ${quantity(args.len(), "argument")} " +
+                      s"${if args.len() == 1 then "was" else "were"} given")
+
+    var b = type_expr(cx, args.at(0), None)
+    var c = type_expr(cx, args.at(1), None)
+
+    if !is_vector(repr(texpr_type(b))) then b = type_expr(cx, args.at(0), Some(elem))
+    if !is_vector(repr(texpr_type(c))) then c = type_expr(cx, args.at(1), Some(elem))
+
+    if !is_vector(repr(texpr_type(b))) then b = TExpr(span, TSplat(b, v))
+    if !is_vector(repr(texpr_type(c))) then c = TExpr(span, TSplat(c, v))
+
+    for x in [b, c]
+        if !type_eq(repr(texpr_type(x)), repr(v)) then
+            return cx.err(span, s"'mul_add' multiplies and adds vectors of one type, and the receiver is " +
+                          s"${type_show(v)} where this argument is ${type_show(texpr_type(x))}")
+
+    var ops: Buf[TExpr] = buf()
+
+    ops.push(tr)
+    ops.push(b)
+    ops.push(c)
+    TExpr(span, TVecOp("fma", ops, v))
+end vector_mul_add
 
 // `m.select(a, b)` -- the lane-wise `if`, and the one vector method whose answer is a vector.
 //
