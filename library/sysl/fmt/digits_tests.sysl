@@ -1,0 +1,185 @@
+module sysl.fmt
+@tests
+
+// `real_digits`: the shortest round-trip digits and exponent, taken apart.
+
+private extern "strtof" digits_strtof(p: *u8, end: **u8) -> f32
+private extern "strtod" digits_strtod(p: *u8, end: **u8) -> real
+
+private struct DigitsBits
+    state: u64
+
+    next(*self) -> u64
+        self.state ^= self.state >> 12
+        self.state ^= self.state << 25
+        self.state ^= self.state >> 27
+        self.state * 0x2545f4914f6cdd1d
+end DigitsBits
+
+// The digits laid out as Java's `Double.toString` does: positional between 1e-3 and 1e7, else
+// `d.dddE<exp>`, always with at least one digit after the point.
+private java_style(d: RealDigits) -> string
+    if d.kind == RealKind.NaN then return "NaN"
+
+    val sign = if d.negative then "-" else ""
+
+    if d.kind == RealKind.Infinite then return sign + "Infinity"
+    if d.kind == RealKind.Zero then return sign + "0.0"
+
+    val digits = d.digits
+    val rest = if digits.bytes.len > 1 then digits[1..] else "0"
+
+    if d.exponent >= -3 && d.exponent < 7
+        if d.exponent < 0
+            var zeros = ""
+
+            for _ in 0..<-d.exponent - 1
+                zeros += "0"
+
+            return sign + "0." + zeros + digits
+
+        val whole = usize(d.exponent) + 1
+        var padded = digits
+
+        while padded.bytes.len < whole
+            padded += "0"
+
+        val tail = if padded.bytes.len > whole then padded[whole..] else "0"
+
+        return sign + padded[0..<whole] + "." + tail
+
+    sign + digits[0..<1] + "." + rest + "E" + d.exponent.to_string()
+end java_style
+
+// The digits written in exponent form, for C to read back.
+private as_text(d: RealDigits) -> string = (if d.negative then "-" else "") + d.digits + "e" + (d.exponent - int(d.digits.bytes.len) + 1).to_string()
+
+private reads_real(text: string) -> real
+    var b: [48]u8 = [0; 48]
+
+    for i in 0..<text.bytes.len
+        b[i] = text.bytes[i]
+
+    var end: *u8 = null
+
+    digits_strtod(&b[0], &end)
+
+private reads_f32(text: string) -> f32
+    var b: [48]u8 = [0; 48]
+
+    for i in 0..<text.bytes.len
+        b[i] = text.bytes[i]
+
+    var end: *u8 = null
+
+    digits_strtof(&b[0], &end)
+
+@test("real_digits names the digits and exponent of an ordinary real")
+real_digits_ordinary()
+    val a = real_digits(0.1)
+
+    assert_eq(a.kind, RealKind.Finite)
+    assert_eq(a.negative, false)
+    assert_eq(a.digits, "1")
+    assert_eq(a.exponent, -1)
+
+    assert_eq(real_digits(1e20).digits, "1")
+    assert_eq(real_digits(1e20).exponent, 20)
+    assert_eq(real_digits(5e-324).digits, "5")
+    assert_eq(real_digits(5e-324).exponent, -324)
+    assert_eq(real_digits(123.456).digits, "123456")
+    assert_eq(real_digits(123.456).exponent, 2)
+    assert_eq(real_digits(1.7976931348623157e308).digits, "17976931348623157")
+    assert_eq(real_digits(1.7976931348623157e308).exponent, 308)
+    assert_eq(real_digits(-2.5).negative, true)
+    assert_eq(real_digits(-2.5).digits, "25")
+    assert_eq(real_digits(100.0).digits, "1")
+    assert_eq(real_digits(100.0).exponent, 2)
+    assert_eq(real_digits(0.001).exponent, -3)
+end real_digits_ordinary
+
+@test("real_digits tells zero, the infinities and NaN apart")
+real_digits_special()
+    val z = real_digits(0.0)
+    val nz = real_digits(-0.0)
+    val inf = real_digits(real.infinity)
+    val ninf = real_digits(-real.infinity)
+    val nan = real_digits(real.nan)
+
+    assert_eq(z.kind, RealKind.Zero)
+    assert_eq(z.negative, false)
+    assert_eq(z.digits, "0")
+    assert_eq(z.exponent, 0)
+    assert_eq(nz.kind, RealKind.Zero)
+    assert_eq(nz.negative, true)
+    assert_eq(inf.kind, RealKind.Infinite)
+    assert_eq(inf.negative, false)
+    assert_eq(inf.digits, "")
+    assert_eq(ninf.kind, RealKind.Infinite)
+    assert_eq(ninf.negative, true)
+    assert_eq(nan.kind, RealKind.NaN)
+    assert_eq(nan.digits, "")
+end real_digits_special
+
+@test("real_digits of an f32 uses the digits an f32 needs")
+real_digits_f32()
+    val a = real_digits(f32(0.1))
+
+    assert_eq(a.digits, "1")
+    assert_eq(a.exponent, -1)
+    assert_eq(real_digits(real(f32(0.1))).digits, "10000000149011612")
+    assert_eq(real_digits(f32(3.4028235e38)).digits, "34028235")
+    assert_eq(real_digits(f32(3.4028235e38)).exponent, 38)
+    assert_eq(real_digits(f32(1.0e-45)).digits, "1")
+    assert_eq(real_digits(f32(1.0e-45)).exponent, -45)
+    assert_eq(real_digits(f32(-0.0)).kind, RealKind.Zero)
+    assert_eq(real_digits(f32(-0.0)).negative, true)
+    assert_eq(real_digits(f32(real.infinity)).kind, RealKind.Infinite)
+    assert_eq(real_digits(f32(-real.infinity)).negative, true)
+    assert_eq(real_digits(f32(real.nan)).kind, RealKind.NaN)
+end real_digits_f32
+
+@test("real_digits is enough to write Java's Double.toString style")
+real_digits_java_style()
+    assert_eq(java_style(real_digits(1e20)), "1.0E20")
+    assert_eq(java_style(real_digits(0.1)), "0.1")
+    assert_eq(java_style(real_digits(1e-5)), "1.0E-5")
+    assert_eq(java_style(real_digits(100.0)), "100.0")
+    assert_eq(java_style(real_digits(123.456)), "123.456")
+    assert_eq(java_style(real_digits(0.001)), "0.001")
+    assert_eq(java_style(real_digits(1e7)), "1.0E7")
+    assert_eq(java_style(real_digits(9999999.0)), "9999999.0")
+    assert_eq(java_style(real_digits(-1.5e300)), "-1.5E300")
+    assert_eq(java_style(real_digits(5e-324)), "5.0E-324")
+    assert_eq(java_style(real_digits(-0.0)), "-0.0")
+    assert_eq(java_style(real_digits(real.nan)), "NaN")
+    assert_eq(java_style(real_digits(-real.infinity)), "-Infinity")
+    assert_eq(java_style(real_digits(f32(0.1))), "0.1")
+    assert_eq(java_style(real_digits(f32(1e10))), "1.0E10")
+end real_digits_java_style
+
+@test("real_digits agrees with shortest on the digits, and reads back")
+real_digits_round_trip()
+    var g = DigitsBits(424242)
+
+    for _ in 0..<5000
+        val r = g.next()
+        val x = f32.from_bits(u32(r >> 32))
+        val y = real.from_bits(r)
+
+        if x == x && x - x == 0.0
+            val d = real_digits(x)
+
+            if d.kind == RealKind.Finite
+                assert_eq(reads_f32(as_text(d)).bits(), x.bits())
+                assert_eq(d.digits.bytes[d.digits.bytes.len - 1] == u8('0'), false)
+
+        if y == y && y - y == 0.0
+            val d = real_digits(y)
+
+            if d.kind == RealKind.Finite
+                assert_eq(reads_real(as_text(d)).bits(), y.bits())
+                assert_eq(d.digits.bytes[d.digits.bytes.len - 1] == u8('0'), false)
+                assert_eq(d.digits.bytes.len <= 17, true)
+    end for
+end real_digits_round_trip
