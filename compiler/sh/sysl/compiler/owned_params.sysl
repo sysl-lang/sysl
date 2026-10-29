@@ -1,7 +1,7 @@
 module sh.sysl.compiler
 
 import sysl.buf.{Buf, buf}
-import sysl.container.{Set, set}
+import sysl.container.{Map, map, Set, set}
 
 // **Owned parameters**: a counted parameter a function keeps is handed over with a count of its own
 // (`reference/memory.md § T — values`).
@@ -488,7 +488,7 @@ owned_symbol(symbol: string) -> string = s"$symbol.owned"
 // It runs after the last argument is worked out, so a later argument that leaves early -- a `?` --
 // finds every count still where the frame gives it back.
 hand_over_args(e: *Emit, name: string, args: Buf[TExpr], staged: Buf[(int, Val)]) -> string
-    if !e.owning_funcs.has(name) then return symbol_of(e, name)
+    if !e.split_funcs.has(name) then return symbol_of(e, name)
 
     for k in 0..<args.len()
         if e.owned_params.has(owned_key(name, k)) && k < staged.len()
@@ -520,17 +520,22 @@ end PendingEntry
 // function value, a closure's thunk, a table slot, a hook the compiler calls, storage holding its
 // address. Only direct calls reach most owning functions, and those name the body. **An artifact
 // keeps every entry**, since the program that links it may take the address of any of its functions.
+//
+// **A function lent a parameter by address (`borrowing.sysl`'s `read_by_address`) is split the same
+// way**, for the same reason: its body's signature takes the address, and the entry is built with the
+// ordinary one, taking the value and lending the body a slot of its own.
 owned_split(e: *Emit, f: TFunc, built: IrFunc, lazy: bool, copy: bool, pending: Buf[PendingEntry]) -> Buf[IrFunc]
     var out: Buf[IrFunc] = buf()
 
-    if !e.owning_funcs.has(f.name)
+    if !e.split_funcs.has(f.name)
         out.push(built)
         return out
     end if
 
     val body = built with { sig = built.sig with { name = owned_symbol(built.sig.name) } }
+    val entry_sig = built.sig with { ty = entry_type(e, f, built.sig.ty) }
 
-    if lazy then pending.push(PendingEntry(f, built.sig, copy)) else out.push(owned_entry(e, f, built.sig))
+    if lazy then pending.push(PendingEntry(f, entry_sig, copy)) else out.push(owned_entry(e, f, entry_sig))
 
     out.push(body)
     out
@@ -676,22 +681,62 @@ private text_names(text: string, names: Buf[string], hits: *Set[string])
         if !hits.has(n) && text.contains(n) then hits.add(n)
 end text_names
 
+// The ordinary convention's function type for a split function's entry, made from its body's: each
+// parameter the body is lent by address taken back as the value its type crosses as, with none of the
+// attributes the body's address carries.
+private entry_type(e: *Emit, f: TFunc, body: IrFnType) -> IrFnType
+    var by_name: Map[string, Type] = map()
+
+    for j in 0..<f.params.len()
+        if e.lent_params.has(owned_key(f.name, j)) then by_name.put(s"${f.params.at(j).0}.param", f.params.at(j).1)
+
+    if by_name.is_empty() then return body
+
+    var params: Buf[IrParam] = buf()
+
+    for p in body.params
+        val ty = p.name match
+            Some(VReg(n)) -> by_name.get(n)
+            _ -> None
+
+        if ty.is_some() then params.push(IrParam(lty(e, ty.unwrap()), no_ir_attrs(), p.name))
+        else params.push(p)
+
+    body with { params = params }
+end entry_type
+
 // The entry a borrowing caller reaches: a count taken for each owned parameter, then the owned body
-// called with everything exactly as it arrived.
+// called with everything exactly as it arrived, but for a parameter the body is lent, which it lends.
 private owned_entry(e: *Emit, f: TFunc, sig: IrFuncSig) -> IrFunc
     start_function(e)
     push_temps(e)
     push_owned(e)
+
+    // A parameter the body is lent by address arrives here as a value, and is put in a slot of the
+    // entry's own -- storage nothing else can name, which is all the body's reading in place needs.
+    var lent: Map[string, Val] = map()
 
     for j in 0..<f.params.len()
         val p = f.params.at(j)
 
         if e.owned_params.has(owned_key(f.name, j)) then retain_value(e, p.1, VReg(s"${p.0}.param"))
 
+        if e.lent_params.has(owned_key(f.name, j))
+            val slot = alloca(e, VReg(s"${p.0}.lent"), lty(e, p.1))
+
+            emit(e, InStore(lty(e, p.1), VReg(s"${p.0}.param"), slot, AccPlain, None))
+            lent.put(s"${p.0}.param", slot)
+        end if
+
     var args: Buf[IrArg] = buf()
 
     for p in sig.ty.params
-        args.push(IrArg(p.ty, p.name.unwrap_or(VUndef), p.attrs))
+        val slot = p.name match
+            Some(VReg(n)) -> lent.get(n)
+            _ -> None
+
+        if slot.is_some() then args.push(ir_arg(LPtr, slot.unwrap()))
+        else args.push(IrArg(p.ty, p.name.unwrap_or(VUndef), p.attrs))
 
     val callee = VGlobal(owned_symbol(sig.name))
     val nothing = sig.ty.ret match
