@@ -596,8 +596,9 @@ Ok(()) Err(Low)
 unit` may hold one, as at every zero-sized type: the address is non-null and aligned, a load through
 it is `()` and a store writes nothing, so neither touches memory. This is what lets a generic body
 that takes the address of a `T` compile at `unit` like at any other type. C sees a `*unit` as a
-`void *`. An array or a slice of `unit` is still refused: `unit` is the type the compiler drops, so
-there would be nothing to index.
+`void *`. An array, a slice or a `Buf` of `unit` is accepted and takes no storage: `[(); 1000000]`
+has length one million and occupies zero bytes, an element reads as `()`, and indexing is still
+bounds-checked. An array of `never` is refused, as there is no value to fill it with.
 
 ```sysl
 through[T](x: T) -> T
