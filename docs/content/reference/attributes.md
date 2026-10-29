@@ -4575,7 +4575,7 @@ print(n)
 ```
 
 ```error
-'@byte_order(...)' is the order a struct's integer fields keep their bytes in, so it can only mark a struct — and this declares none. A lone value is put in an order with 'to_be' and 'from_be', the members 'ByteOrder' gives every whole-byte integer
+'@byte_order(...)' is the order a struct's integer fields keep their bytes in, so it can only mark a struct — and this declares none. A lone value is put in an order with 'to_be' and 'from_be', the members 'sysl.math.ByteOrder' gives every whole-byte integer
 ```
 
 A value that is not in a struct is put in an order with
