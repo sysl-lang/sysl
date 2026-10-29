@@ -646,14 +646,14 @@ do all along. One program and one `sysl build` settle it.
 
 | it says | change |
 |---|---|
-| `'+' needs 'T: sysl.Add'` | add the bound the message names to the type parameter |
+| `'+' needs 'T: Add'` | add the bound the message names to the type parameter |
 | `'T' is a type parameter, so it has no fields to read` | no bound can supply a field; take a property through a trait instead |
-| `'?' may only be used in a function returning sysl.Result, not int` | give the enclosing function the channel it early-returns into |
+| `'?' may only be used in a function returning Result, not int` | give the enclosing function the channel it early-returns into |
 | `this loop breaks with a int but has no 'else'` | add the `else` block that says what a normal finish is worth |
 | `a 'for' names one thing, and a pattern is what takes it apart` | `for (k, v) in …`, with the parentheses |
 | `this pattern binds a name, and an 'is' that binds stands only in the condition of an 'if' or a 'while'` | take the value apart with `if` or `match`, or write `_` for the parts you do not name |
 | `a pattern under '\|\|' cannot bind a name` | write `_` for the parts you do not name, chain with `&&`, or write a `match` |
-| `already implements 'sysl.Eq' — no variant of it carries anything` | delete the block; a bare enum compares already |
+| `already implements 'Eq' — no variant of it carries anything` | delete the block; a bare enum compares already |
 | `'&Cell' and '&sync Cell' are distinct types` | allocate it as the one you need where it is constructed |
 | `'require'/'ensure' clauses must come before any other statement` | move the whole contract block to the top of the body |
 | `a program starts in one place, and this 'main' is a second` | put the top-level statements inside `main` |

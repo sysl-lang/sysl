@@ -1291,7 +1291,7 @@ print(1)
 ```
 
 ```error
-an 'impl' may be written only in the module that declares the trait or in one that declares a type the block names, and 'sysl.Eq' is the library's while nothing in '(int, string)' is declared outside the library — so this one has no home. A trait of your own, or a type of your own in what it is written for or in the trait's arguments, gives it one
+an 'impl' may be written only in the module that declares the trait or in one that declares a type the block names, and 'Eq' is the library's while nothing in '(int, string)' is declared outside the library — so this one has no home. A trait of your own, or a type of your own in what it is written for or in the trait's arguments, gives it one
 ```
 
 ## Enums

@@ -3019,7 +3019,7 @@ release(h.names)
 ```
 
 ```error
-'release' gives back what a '&T' place holds, and sysl.buf.Buf[string] gives its share back through its own member — call '.release()' on it
+'release' gives back what a '&T' place holds, and Buf[string] gives its share back through its own member — call '.release()' on it
 ```
 
 Like `is_null`, it is a form the compiler answers only where nothing else claims the name: a function
@@ -3599,7 +3599,7 @@ print("ready")
 ```
 
 ```error
-'open' hands back 'Encoder' by value, inside 'sysl.Result[Encoder, string]', and 'Encoder' has a 'Drop' — a type with a destructor is a reference type, and building one makes a '&Encoder'. Write '&Encoder' in its place
+'open' hands back 'Encoder' by value, inside 'Result[Encoder, string]', and 'Encoder' has a 'Drop' — a type with a destructor is a reference type, and building one makes a '&Encoder'. Write '&Encoder' in its place
 ```
 
 **The rule is the type at every level that owns a resource, not the outermost one**, so a field is
@@ -3933,7 +3933,7 @@ print(nest.with((b) ->
 ```
 
 ```error
-but this answers a 'sysl.buf.Buf[byte]', whose 'core' reaches a '&sysl.buf.BufCore[byte]', whose count is not atomic. Answer what the caller needs from it — a count, a flag, a '.copy()' of a string, a value built fresh inside the closure — rather than the value itself
+but this answers a 'Buf[byte]', whose 'core' reaches a '&BufCore[byte]', whose count is not atomic. Answer what the caller needs from it — a count, a flag, a '.copy()' of a string, a value built fresh inside the closure — rather than the value itself
 ```
 
 A struct of a program's own opts in the same way — `@guards(items)` above
@@ -4001,7 +4001,7 @@ job()
 ```
 
 ```error
-the module storage 'table' it reaches, which 'touch' reads, holds a 'sysl.buf.Buf[int]' in its 'log', which is shared through a count that is not atomic
+the module storage 'table' it reaches, which 'touch' reads, holds a 'Buf[int]' in its 'log', which is shared through a count that is not atomic
 ```
 
 **`with` hands the closure the record in place** — its address, lent for the call — so a field
@@ -4022,7 +4022,7 @@ val b = cell.with((r) -> r.log)
 ```
 
 ```error
-'sysl.sync.Guarded.with' answers a value out of the 'value' it guards, and once the guard is let go that value is shared with whoever holds it next, so every count it reaches has to be atomic — but this answers a 'sysl.buf.Buf[int]'
+'sysl.sync.Guarded.with' answers a value out of the 'value' it guards, and once the guard is let go that value is shared with whoever holds it next, so every count it reaches has to be atomic — but this answers a 'Buf[int]'
 ```
 
 A slice or a `Buf` of guarded records is asked the same way: what is in the way is the view's or the
@@ -4161,7 +4161,7 @@ val f = b.freeze()
 ```
 
 ```error
-'&sync sysl.buf.Frozen[&Cell]' may be reached from two domains at once, so every count inside it has to be atomic — but it holds a '&Cell', whose count is not. Hold it as a '&sync Cell' ('06')
+'&sync Frozen[&Cell]' may be reached from two domains at once, so every count inside it has to be atomic — but it holds a '&Cell', whose count is not. Hold it as a '&sync Cell' ('06')
 ```
 
 Held as a `Buf[&sync Cell]`, it freezes. A `Buf[string]` or a `Buf[Buf[u8]]` is refused the same way,

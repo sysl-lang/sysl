@@ -260,7 +260,7 @@ main()
 ```
 
 ```error
-error: '==' between sysl.Option[Opaque] needs 'sysl.Eq' — the 'impl' that covers it asks 'sysl.Eq' of Opaque, which does not implement it
+error: '==' between Option[Opaque] needs 'Eq' — the 'impl' that covers it asks 'Eq' of Opaque, which does not implement it
 ```
 
 Both implementations are needed for [`assert_eq`](/library/core/) to accept these types: it is
@@ -287,7 +287,7 @@ count(n: int) -> int
 ```
 
 ```error
-'?' may only be used in a function returning sysl.Result, not int
+'?' may only be used in a function returning Result, not int
 ```
 
 **The two channels do not cross.** An `Option`'s `?` cannot early-return from a `Result`-returning
@@ -304,7 +304,7 @@ cross(n: int) -> Result[int, string]
 ```
 
 ```error
-'?' may only be used in a function returning sysl.Option, not sysl.Result[int, string]
+'?' may only be used in a function returning Option, not Result[int, string]
 ```
 
 **An early return by `?` runs the block's deferred statements**, as any `return` does, and is a
@@ -425,7 +425,7 @@ other(n: int) -> Result[int, bool]
 ```
 
 ```error
-a '?' converts through 'sysl.From', so 'impl From[string] for bool' is what joins the two layers
+a '?' converts through 'From', so 'impl From[string] for bool' is what joins the two layers
 ```
 
 An `Option`'s `?` has nothing to convert: `None` carries nothing, so the two enums must still be the
@@ -1427,7 +1427,7 @@ impl Add for Stamp
 ```
 
 ```error
-'Stamp' already implements 'sysl.Add' — the compiler provides it
+'Stamp' already implements 'Add' — the compiler provides it
 ```
 
 ```sysl
@@ -1438,7 +1438,7 @@ impl Display for Span
 ```
 
 ```error
-'Span' already implements 'sysl.Display' — every 'sysl.Integer' does, through one block written over the family, and a subtype has its base's memberships
+'Span' already implements 'Display' — every 'Integer' does, through one block written over the family, and a subtype has its base's memberships
 ```
 
 The two refusals come from different sources, as the messages say. `Add` is an implementation the

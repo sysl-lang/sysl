@@ -525,7 +525,7 @@ print(f(3) == s)
 ```
 
 ```error
-'==' needs matching types, got sysl.Option[int] and sysl.Option[usize]
+'==' needs matching types, got Option[int] and Option[usize]
 ```
 
 **A parameter is solved to the type that was *written*.** Where that is a
@@ -776,7 +776,7 @@ print(sum(2, 3))
 ```
 
 ```error
-'+' needs 'T: sysl.Add'
+'+' needs 'T: Add'
 ```
 
 A subscript is among them, because a subscript *is* the single method of `Index`, so it is checked
@@ -976,7 +976,7 @@ main()
 ```
 
 ```error
-'least' requires its type parameter 'T' to implement 'sysl.Ord', but &N does not — N implements it, but 'sysl.Ord' is an operator's, and an operator does not see through a reference
+'least' requires its type parameter 'T' to implement 'Ord', but &N does not — N implements it, but 'Ord' is an operator's, and an operator does not see through a reference
 ```
 
 `Display` and `Debug` are reached through, so `v.display(…)` on a `T` at `*P` is `P`'s. What
@@ -1274,7 +1274,7 @@ print(1)
 ```
 
 ```error
-'SortedPair' requires its type parameter 'T' to implement 'sysl.Ord', but P does not
+'SortedPair' requires its type parameter 'T' to implement 'Ord', but P does not
 ```
 
 Where the argument is itself a type parameter, its own bounds decide, so a function taking a
@@ -1599,7 +1599,7 @@ describe() -> string
 ```
 
 ```error
-'shown' requires its type parameter 'T' to implement 'sysl.Display', but Point does not
+'shown' requires its type parameter 'T' to implement 'Display', but Point does not
 ```
 
 ## Variance does not arise

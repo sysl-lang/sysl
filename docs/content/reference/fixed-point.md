@@ -692,7 +692,7 @@ print(g.abs())
 ```
 
 ```error
-type 'u16q16' has no method 'abs' — 'abs' is 'sysl.math.Signed''s, and an unsigned value has no sign to take off
+type 'u16q16' has no method 'abs' — 'abs' is 'Signed''s, and an unsigned value has no sign to take off
 ```
 
 ## A range

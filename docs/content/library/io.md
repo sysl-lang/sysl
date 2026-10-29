@@ -132,7 +132,7 @@ impl Reader for Memory
 ```
 
 ```error
-'sysl.io.Reader' requires 'sysl.Fallible', so 'Memory' has to implement that too — write 'impl sysl.Fallible for Memory'
+'Reader' requires 'Fallible', so 'Memory' has to implement that too — write 'impl Fallible for Memory'
 ```
 
 `failed` **defaults to `false`**, so a source that cannot fail — an in-memory buffer, a fixed device —
@@ -316,7 +316,7 @@ for line in lines(r)
 ```
 
 ```error
-a *sysl.io.Reader points at a value, so it needs an address — write '&' in front of the sysl.io.FdReader to take one
+a *Reader points at a value, so it needs an address — write '&' in front of the FdReader to take one
 ```
 
 **A `for` iterates a *copy* of its iterator.** A `Lines` that owned its reader would latch a failure

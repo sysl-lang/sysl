@@ -1188,7 +1188,7 @@ print(pick(1))
 ```
 
 ```error
-'errdefer' binds the error 'pick' fails with, and 'pick' returns sysl.Option[int], whose 'None' carries none — leave the binder out
+'errdefer' binds the error 'pick' fails with, and 'pick' returns Option[int], whose 'None' carries none — leave the binder out
 ```
 
 A closure whose result its context does not fix has no result to ask yet, so an `errdefer` in one is

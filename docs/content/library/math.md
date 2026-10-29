@@ -1001,7 +1001,7 @@ print(1)
 ```
 
 ```error
-already implements 'sysl.math.Magnitude', which declares an associated type 'Size'
+already implements 'Magnitude', which declares an associated type 'Size'
 ```
 
 That is the price of the name and it is worth knowing before picking one: a library trait covering a
@@ -1091,7 +1091,7 @@ print(is_power_of_two(8.0))
 ```
 
 ```error
-'sysl.math.is_power_of_two' requires its type parameter 'T' to implement 'sysl.math.Bits', but real does not
+'sysl.math.is_power_of_two' requires its type parameter 'T' to implement 'Bits', but real does not
 ```
 
 And these are ordinary names in the module, so they are reached the way `pi` is — by importing them,
