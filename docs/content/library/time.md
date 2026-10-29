@@ -825,7 +825,7 @@ var t0 = monotonic()
 var n: long = 1
 
 for i in 0..<200000
-    n = n * 31 + long(i)
+    n = n *% 31 +% long(i)
 
 var took = monotonic() - t0
 
@@ -880,7 +880,7 @@ val p0 = cpu_time()
 var n: long = 1
 
 for i in 0..<2000000
-    n = n * 31 + long(i)
+    n = n *% 31 +% long(i)
 
 val busy = (thread_cpu_time() - c0).us
 

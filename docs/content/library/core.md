@@ -1394,7 +1394,7 @@ struct Key
     n: int
 
 impl Hash for Key
-    hash(self) -> u64 = hash_u64(hash_str(self.name) * 0x100000001b3 ^ hash_u64(u64(self.n)))
+    hash(self) -> u64 = hash_u64(hash_str(self.name) *% 0x100000001b3 ^ self.n.hash())
 
 print(Key("a", 1).hash() != Key("a", 2).hash())
 ```
@@ -1404,7 +1404,8 @@ true
 ```
 
 The multiply-then-xor is the shape to copy: `0x100000001b3` is FNV's prime, and mixing with it before
-the xor is what makes **order** matter. A plain xor of the field hashes would give `Key("a", 1)` and
+the xor is what makes **order** matter. The multiply is `*%` because the wrap is the point — a plain
+`*` that overflows stops a debug build. A plain xor of the field hashes would give `Key("a", 1)` and
 a hypothetical `Key` with the fields swapped the same bucket.
 
 Because the memberships are `impl`s, a built-in can be **erased** to a trait object — a method table

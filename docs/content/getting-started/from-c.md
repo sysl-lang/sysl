@@ -122,14 +122,16 @@ var small: byte = 200
 
 var wide: int = small
 
-print(small + 100, wide + 100)
+print(small +% 100, wide + 100)
 ```
 
 ```output
 44 300
 ```
 
-The first sum wraps at 256 because both operands are `byte`. The second is `int` arithmetic because
+The first sum wraps at 256 because both operands are `byte` and `+%` is the wrapping `+`; a plain
+`small + 100` is the same `byte` arithmetic, and stops a debug build — `sysl run`, `sysl test` — with
+`integer overflow: byte + byte` where C would wrap silently (a release build wraps). The second is `int` arithmetic because
 `wide` is an `int`; assigning `small` to it widened the value implicitly, since every `byte` fits in
 an `int`. The opposite direction can lose information, so it is refused:
 

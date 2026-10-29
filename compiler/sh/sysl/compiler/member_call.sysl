@@ -116,6 +116,14 @@ associated_on(cx: &Analyzer, span: Span, ty: Type, name: string, args: Buf[Expr]
               targs: Buf[Expr] = no_written_members()) -> Option[TExpr]
     if ty == Unknown then return Some(bad_expr(span))
 
+    // `u64.wrap(x)` -- the integer conversion that keeps the bit pattern, asked before the type's
+    // own members so the spelling means one thing on every integer type.
+    if name == "wrap"
+        val wrapped = integer_wrap(cx, span, ty, args)
+
+        if wrapped.is_some() then return wrapped
+    end if
+
     // A parameter standing in for itself answers off the bounds it carries, exactly as a value of it
     // does -- and this is the half that has no value to be read off.
     ty match
@@ -2614,6 +2622,50 @@ private erased_call(cx: &Analyzer, span: Span, receiver: TExpr, rty: Type, slot:
 
     TExpr(span, TVCall(receiver, slot, ts, ret, false))
 end erased_call
+
+// `u64.wrap(x)` -- an integer read at another width or signedness by its bit pattern: the low bits
+// where the target is narrower, sign- or zero-extended as the SOURCE's signedness says where it is
+// wider. **It is never checked, in any build**, where the plain conversion `u64(x)` is checked in a
+// debug one (`build_mode.sysl`); it is the conversion the compiler makes when nobody wrote one, which
+// is why it is the lowering's unchecked `TCast` and is not recorded as written.
+//
+// Nothing where the receiver is not an integer type, or a parameter bounded by `Integer`, so any
+// other type's own `wrap` is left to the member lookup.
+private integer_wrap(cx: &Analyzer, span: Span, ty: Type, args: Buf[Expr]) -> Option[TExpr]
+    if !wraps_as_integer(ty) then return None
+
+    val shown = type_show(ty)
+
+    if args.len() != 1
+        cx.fault(span, s"'$shown.wrap' takes exactly one integer argument")
+        return Some(bad_expr(span))
+    end if
+
+    val t = type_expr(cx, args.at(0), None)
+    val from = repr(texpr_type(t))
+
+    if from == Unknown then return Some(bad_expr(span))
+
+    if !wraps_as_integer(from)
+        cx.fault(span, s"'$shown.wrap' takes an integer, but the value has type ${type_show(texpr_type(t))}")
+        return Some(bad_expr(span))
+    end if
+
+    Some(TExpr(span, TCast(t, ty)))
+end integer_wrap
+
+// Whether `ty` is an integer at every instantiation: an integer type, or a parameter bounded by the
+// `Integer` family.
+private wraps_as_integer(ty: Type) -> bool = ty match
+    Integer(_, _, _) -> true
+    Abstract(_, bounds) ->
+        for b in bounds
+            val spelling = library_spelling(b.name)
+
+            if spelling.is_some() && core_closed(spelling.unwrap()) then return true
+
+        false
+    _ -> false
 
 // `Colour.try(n)` — an integer read as a simple enum, answering `None` where it is not one of the
 // discriminants.

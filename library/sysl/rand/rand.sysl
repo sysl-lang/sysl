@@ -53,14 +53,15 @@ struct Rng
     next_u32(*self) -> u32
         val old = self.state
 
-        self.state = old * MULTIPLIER + self.inc
+        self.state = old *% MULTIPLIER +% self.inc
 
-        val xorshifted = u32((old >> 18 ^ old) >> 27)
+        // The output is the low 32 bits of the folded state, which the mask says outright.
+        val xorshifted = u32((old >> 18 ^ old) >> 27 & 0xffffffff)
         val rot = u32(old >> 59)
 
         // The rotation amount is masked to the width, so a rotation of zero shifts by zero rather
         // than by 32, which is undefined.
-        xorshifted >> rot | xorshifted << (0 - rot & 31)
+        xorshifted >> rot | xorshifted << (0 -% rot & 31)
     end next_u32
 
     /** Sixty-four bits, as two draws with the first taken as the high half. Written down because the
@@ -82,7 +83,7 @@ struct Rng
      * invisible in a handful of draws and is a real defect in a simulation or a shuffle.
      *
      * The fix is to reject the unfair part of the range. `threshold` is `2^64 mod n`, computed as
-     * `(0 - n) % n` because unsigned arithmetic wraps (`01`) and `0 - n` is exactly `2^64 - n`.
+     * `(0 -% n) % n`, since `0 -% n` is exactly `2^64 - n`.
      * Draws below it are discarded, leaving a span that `n` divides evenly. It terminates with
      * probability one and takes under two draws on average -- and for the overwhelmingly common case
      * of a small `n` the threshold is tiny and the first draw is nearly always taken.
@@ -93,7 +94,7 @@ struct Rng
     below(*self, n: u64) -> u64
         if n == 0 then return 0
 
-        val threshold = (0 - n) % n
+        val threshold = (0 -% n) % n
         var r = self.next_u64()
 
         while r < threshold
@@ -102,9 +103,11 @@ struct Rng
         r % n
     end below
 
-    /** A uniform value in `[lo, hi)`, empty when `hi` is not above `lo`. */
+    /** A uniform value in `[lo, hi)`, empty when `hi` is not above `lo`. The span is worked out at
+     * twice the width, where `i64::Min` to `i64::Max` is a `u64` like any other.
+     */
     range(*self, lo: i64, hi: i64) -> i64 =
-        if hi <= lo then lo else lo + i64(self.below(u64(hi - lo)))
+        if hi <= lo then lo else i64(i128(lo) + i128(self.below(u64(i128(hi) - i128(lo)))))
 
     /** A uniform value in `[0, 1)`, from **53** bits.
      *
@@ -154,7 +157,7 @@ rng(seed: u64, seq: u64) -> Rng
     var g = Rng(0, seq << 1 | 1)
 
     g.next_u32()
-    g.state = g.state + seed
+    g.state = g.state +% seed
     g.next_u32()
 
     g

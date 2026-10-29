@@ -631,6 +631,7 @@ private const_conversion(cx: &Analyzer, span: Span, callee: Expr, args: Buf[Expr
 
     val written = *callee.kind match
         Ident(n) -> Some(n)
+        Field(receiver, "wrap", _) -> return const_wrap(cx, receiver, args.at(0))
         _ -> None
 
     if written.is_none() || cx.lookup(written.unwrap()).is_some() then return None
@@ -646,6 +647,27 @@ private const_conversion(cx: &Analyzer, span: Span, callee: Expr, args: Buf[Expr
 
     converted(cx, span, value.unwrap(), target.unwrap())
 end const_conversion
+
+// `u8.wrap(300)` -- an integer read at an integer type by its bit pattern, which over a constant is
+// the number reduced to the width, as the running conversion keeps it. Only an integer folds: the
+// call's own typing says what is wrong with anything else.
+private const_wrap(cx: &Analyzer, receiver: Expr, arg: Expr) -> Option[Const]
+    val name = *receiver.kind match
+        Ident(n) -> n
+        _ -> return None
+
+    if cx.lookup(name).is_some() then return None
+
+    val target = scalar_named(name, word_bits(cx)).or_else(() -> width_of(cx, name))
+
+    if target.is_none() then return None
+
+    target.unwrap() match
+        Integer(bits, signed, _) -> const_fold(cx, arg) match
+            Some(ConstInt(n)) -> Some(ConstInt(wrap(n, bits, signed)))
+            _ -> None
+        _ -> None
+end const_wrap
 
 // `Ip(0x0a00_020f)` -- a `new` type made from its base. **The value is the base's, unchanged**: the
 // wrap is a change of name and not of number, so nothing narrows here, and the constant's declared

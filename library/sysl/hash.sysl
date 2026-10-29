@@ -19,16 +19,16 @@ trait Hash
 
         if const T::Kind == Kind.SimpleEnum
             for const c in T::Variants
-                if self is c then h = h * 0x100000001b3u64 ^ hash_u64(u64(c.index))
+                if self is c then h = h *% 0x100000001b3u64 ^ hash_u64(u64(c.index))
         elif const T::Kind == Kind.DataEnum
             for const c in T::Variants
                 if self is c
-                    h = h * 0x100000001b3u64 ^ hash_u64(u64(c.index))
+                    h = h *% 0x100000001b3u64 ^ hash_u64(u64(c.index))
 
                     val p = self.(c)
 
                     for const f in c::Fields
-                        h = h * 0x100000001b3u64 ^ p.(f).hash()
+                        h = h *% 0x100000001b3u64 ^ p.(f).hash()
                 end if
         else
             // An anonymous `struct` or `union` block is no field, so `T::Fields` would pass over it
@@ -43,7 +43,7 @@ trait Hash
                         s"no Hash — write 'impl Hash for ${T::Name}'")
 
             for const f in T::Fields
-                h = h * 0x100000001b3u64 ^ self.(f).hash()
+                h = h *% 0x100000001b3u64 ^ self.(f).hash()
 
         hash_u64(h)
     end hash
@@ -57,15 +57,15 @@ trait Hash
  * hash is what makes them collide in a row.
  */
 hash_u64(v: u64) -> u64
-    var h = v + 0x9e3779b97f4a7c15u64
-    h = (h ^ (h >> 30u64)) * 0xbf58476d1ce4e5b9u64
-    h = (h ^ (h >> 27u64)) * 0x94d049bb133111ebu64
+    var h = v +% 0x9e3779b97f4a7c15u64
+    h = (h ^ (h >> 30u64)) *% 0xbf58476d1ce4e5b9u64
+    h = (h ^ (h >> 27u64)) *% 0x94d049bb133111ebu64
     h ^ (h >> 31)
 
 /** Past 64 bits the two halves are mixed separately and combined, because the finalizer above is
  * defined on a word and a wider integer has no single one.
  */
-hash_u128(v: u128) -> u64 = hash_u64(u64(v)) * 0x100000001b3u64 ^ hash_u64(u64(v >> 64))
+hash_u128(v: u128) -> u64 = hash_u64(u64(v & 0xffffffffffffffff)) *% 0x100000001b3u64 ^ hash_u64(u64(v >> 64))
 
 /** A `bool` is one bit, and one bit does not widen to a number in this language -- the same reason
  * `display_bool` exists rather than a widening into the integer renderer.
@@ -78,7 +78,7 @@ hash_bool(b: bool) -> u64 = hash_u64(if b then 1 else 0)
 hash_str(s: string) -> u64
     var h = 0xcbf29ce484222325u64
     for b in s.bytes
-        h = (h ^ u64(b)) * 0x100000001b3u64
+        h = (h ^ u64(b)) *% 0x100000001b3u64
     h
 
 // The built-ins that hash, written as blocks rather than provided by rule.
@@ -113,7 +113,7 @@ impl Hash for string
  * top half would bucket every one of them together.
  */
 impl[T: Integer] Hash for T
-    hash(self) -> u64 = if sizeof(T) > 8 then hash_u128(u128(self)) else hash_u64(u64(self))
+    hash(self) -> u64 = if sizeof(T) > 8 then hash_u128(u128.wrap(self)) else hash_u64(u64.wrap(self))
 
 /** A reference keyed by the object it names rather than by its value. A `&T` compares and
  * hashes as its referent does wherever `T` defines `Eq` and `Hash` (`reference/memory.md §

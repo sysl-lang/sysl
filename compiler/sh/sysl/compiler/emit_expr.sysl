@@ -80,7 +80,7 @@ private gen_expr_kind(e: *Emit, x: TExpr) -> Val = *x.kind match
     TQuadLit(hi, lo, _) -> VQuad(hi, lo)
 
     // A constrained operand converts from its base representation.
-    TCast(operand, ty) -> convert(e, underlying(texpr_type(operand)), ty, gen_expr(e, operand))
+    TCast(operand, ty) -> gen_cast(e, operand, ty, x.span)
     TFloorCast(operand, ty) ->
         fixed_floor_convert(e, underlying(texpr_type(operand)), underlying(ty), gen_expr(e, operand))
 
@@ -176,8 +176,8 @@ private gen_expr_kind(e: *Emit, x: TExpr) -> Val = *x.kind match
 
     TBinary(op, l, r, ty) -> expansion_at(e, x) match
         Some(t) -> gen_expr(e, t)
-        None -> gen_binary(e, op, l, r, ty)
-    TUnary(op, operand, ty) -> gen_unary(e, op, operand, ty)
+        None -> gen_binary(e, op, l, r, ty, x.span)
+    TUnary(op, operand, ty) -> gen_unary(e, op, operand, ty, x.span)
     TLogical(op, l, r) -> gen_logical(e, op, l, r)
     TCompare(operands, cmps) -> gen_compare(e, operands, cmps)
 
@@ -187,7 +187,7 @@ private gen_expr_kind(e: *Emit, x: TExpr) -> Val = *x.kind match
 
         if ex.is_some() then gen_expr(e, ex.unwrap())
         else yielded(yields, gen_update(e, place, op, value, ty, dispatch, check))
-    TIncDec(place, op, pre, ty, check) -> gen_inc_dec(e, place, op, pre, ty, check)
+    TIncDec(place, op, pre, ty, check) -> gen_inc_dec(e, place, op, pre, ty, check, x.span)
 
     TCall(name, args, ty, _) ->
         if e.tail_target != "" && is_tail_call(e.tail_calls, x.span) then return gen_tail_self_call(e, args)
@@ -698,7 +698,7 @@ end view_len
 
 // -- arithmetic ---------------------------------------------------------------------------------
 
-private gen_binary(e: *Emit, op: string, l: TExpr, r: TExpr, ty: Type) -> Val
+private gen_binary(e: *Emit, op: string, l: TExpr, r: TExpr, ty: Type, site: Span) -> Val
     if underlying(ty) == Str
         var both: Buf[TExpr] = buf()
 
@@ -749,9 +749,14 @@ private gen_binary(e: *Emit, op: string, l: TExpr, r: TExpr, ty: Type) -> Val
     bt match
         Integer(bits, signed, _) ->
             if op == "<<" && is_ranged(texpr_type(l)) then return checked_shl(e, bits, signed, lv, rv)
-            if overflow_checked(op, l, r, bits, signed) then return checked_arith(e, op, bits, signed, lv, rv)
 
-            if op == "+" && nowrap_add(e, l, r, bt)
+            // A sum proved not to wrap is the `nuw` add in either mode: there is nothing to check.
+            val proved = op == "+" && nowrap_add(e, l, r, bt)
+
+            if overflow_checked(op, l, r, bits, signed) || (!proved && plain_checked(op, bt))
+                return checked_arith(e, op, bits, signed, lv, rv, arith_text(op, texpr_type(l), texpr_type(r)), site)
+
+            if proved
                 val sum = fresh_reg(e)
 
                 emit(e, InBin(sum, OpAddNuw, lty(e, bt), lv, rv))
@@ -863,7 +868,7 @@ private gen_ptr_diff(e: *Emit, l: TExpr, r: TExpr, lt: Type) -> Val
     n
 end gen_ptr_diff
 
-private gen_unary(e: *Emit, op: string, operand: TExpr, ty: Type) -> Val
+private gen_unary(e: *Emit, op: string, operand: TExpr, ty: Type, site: Span) -> Val
     val v = gen_expr(e, operand)
     val ety = lty(e, ty)
     val r = fresh_reg(e)
@@ -886,10 +891,16 @@ private gen_unary(e: *Emit, op: string, operand: TExpr, ty: Type) -> Val
         if is_fixed(vector_lane_of(ty)) then return fixed_neg(e, ty, v)
 
         vector_lane_of(ty) match
-            Integer(_, _, _) ->
+            Integer(bits, signed, _) ->
                 underlying(ty) match
                     Vector(_, _) -> emit(e, InBin(r, OpSub, ety, VZero, v))
-                    _ -> emit(e, InBin(r, OpSub, ety, VInt(from_int(0)), v))
+                    _ ->
+                        // In a debug build, negating the most negative value is the overflow it is.
+                        if overflow_checks()
+                            return checked_arith(e, "-", bits, signed, VInt(from_int(0)), v,
+                                                 s"-${type_show(ty)}", site)
+
+                        emit(e, InBin(r, OpSub, ety, VInt(from_int(0)), v))
             Floating(_, _) -> emit(e, InNeg(r, ety, v))
             other -> gap_here(e, s"negation of ${type_show(other)}")
 
@@ -1137,7 +1148,7 @@ private gen_update(e: *Emit, place: TExpr, op: string, value: TExpr, ty: Type,
     else if k.is_some() then updated = contracted_onto(e, k.unwrap(), ty, cur)
     else if dot.is_some() then updated = dot.unwrap()
     else updated = combine(e, op, ty, texpr_type(value), dispatch, cur,
-                           if early.is_some() then early.unwrap() else gen_expr(e, value))
+                           if early.is_some() then early.unwrap() else gen_expr(e, value), place.span)
 
     check match
         Some(c) -> emit_constraint_checks(e, updated, c)
@@ -1158,12 +1169,19 @@ private reaches_through_call(place: TExpr) -> bool = *place.kind match
     _ -> false
 
 private gen_inc_dec(e: *Emit, place: TExpr, op: string, pre: bool, ty: Type,
-                    check: Option[Type]) -> Val
+                    check: Option[Type], site: Span) -> Val
     val p = place_addr(e, place)
     val cur = load_place(e, place, p)
-    val nv = fresh_reg(e)
+    val bin = if op == "++" then "+" else "-"
 
-    emit(e, InBin(nv, if op == "++" then OpAdd else OpSub, lty(e, ty), cur, VInt(from_int(1))))
+    val nv = underlying(ty) match
+        Integer(bits, signed, _) if plain_checked(bin, ty) ->
+            checked_arith(e, bin, bits, signed, cur, VInt(from_int(1)), s"${type_show(ty)}$op", site)
+        _ ->
+            val r = fresh_reg(e)
+
+            emit(e, InBin(r, if op == "++" then OpAdd else OpSub, lty(e, ty), cur, VInt(from_int(1))))
+            r
 
     check match
         Some(c) -> emit_constraint_checks(e, nv, c)
@@ -1177,7 +1195,7 @@ end gen_inc_dec
 // value on the right. A constrained slot is arithmetic at the type it is laid out as, and it detects
 // overflow on the same terms, so `a += e` computes what `a = a + e` computes.
 combine(e: *Emit, op: string, ty: Type, value_ty: Type, dispatch: Option[TDispatch], cur: Val,
-        v: Val) -> Val
+        v: Val, site: Span) -> Val
     // The dispatched call owns its own result, the way every other call to sysl does -- an
     // `own_temp` here as well would put one value in the region twice and release it twice.
     dispatch match
@@ -1199,8 +1217,8 @@ combine(e: *Emit, op: string, ty: Type, value_ty: Type, dispatch: Option[TDispat
         Integer(bits, signed, _) ->
             if bin == "<<" && is_ranged(ty) then return checked_shl(e, bits, signed, cur, rv)
 
-            if (bin == "+" || bin == "-" || bin == "*") && is_ranged(ty)
-                return checked_arith(e, bin, bits, signed, cur, rv)
+            if ((bin == "+" || bin == "-" || bin == "*") && is_ranged(ty)) || plain_checked(bin, bt)
+                return checked_arith(e, bin, bits, signed, cur, rv, arith_text(op, ty, value_ty), site)
         _ -> ()
 
     arith(e, bin, bt, cur, rv)
@@ -1773,6 +1791,35 @@ no_fast_math() -> Buf[FastMath]
 end no_fast_math
 
 // -- conversions and zeros ----------------------------------------------------------------------------
+
+// A conversion in the tree. **A written integer conversion that can lose a value is checked in a
+// debug build** (`build_mode.sysl`) -- unless what it converts is a constant, which is the bit
+// pattern written down (`u32(-1)`) and converts as it does in a `const`, the same in every build.
+private gen_cast(e: *Emit, operand: TExpr, ty: Type, site: Span) -> Val
+    val from = underlying(texpr_type(operand))
+    val v = gen_expr(e, operand)
+
+    if !overflow_checks() then return convert(e, from, ty, v)
+
+    val constant = *operand.kind match
+        TIntLit(_, _) -> true
+        _ -> false
+
+    if constant then return convert(e, from, ty, v)
+
+    (from, underlying(ty)) match
+        (Integer(a_bits, a_signed, _), Integer(b_bits, b_signed, _)) ->
+            val file = e.src match
+                Some(s) -> s.name
+                None -> ""
+
+            if lossy_int(a_bits, a_signed, b_bits, b_signed) && is_written_conversion(file, site)
+                return checked_narrow(e, a_bits, a_signed, b_bits, b_signed, v,
+                                      s"${type_show(ty)}(${type_show(texpr_type(operand))})", site)
+        _ -> ()
+
+    convert(e, from, ty, v)
+end gen_cast
 
 // One scalar type read as another.
 convert(e: *Emit, from: Type, to: Type, v: Val) -> Val

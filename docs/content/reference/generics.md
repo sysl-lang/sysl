@@ -1546,7 +1546,7 @@ make[T](b: u8) -> T = T(b)
 
 var n: int = make(7)
 
-print(low(321), n)
+print(low(65), n)
 ```
 
 ```output

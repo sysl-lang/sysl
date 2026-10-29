@@ -65,7 +65,7 @@ value changes width on its own:
 var small: byte = 200
 var wide: u64 = 18446744073709551615
 
-print("byte:", small + 100, small >> 3)
+print("byte:", small +% 100, small >> 3)
 print("u64 max:", wide)
 ```
 
@@ -74,9 +74,12 @@ byte: 44 25
 u64 max: 18446744073709551615
 ```
 
-`small + 100` is `byte` arithmetic, so it wraps at 256 and gives 44. It is not promoted to `int`
+`small +% 100` is `byte` arithmetic, so it wraps at 256 and gives 44. It is not promoted to `int`
 because the result would not fit; the type is `byte`, and so is the arithmetic. An unsuffixed literal
 such as `100` takes its type from the surrounding expression, which is why the line needs no suffixes.
+The `%` says the wrap is meant: a plain `small + 100` is the same arithmetic, and one that does not
+fit stops a debug build — `sysl run` and `sysl test` — with `integer overflow: byte + byte`, where a
+release build wraps ([debug and release](/getting-started/cli/#debug-and-release)).
 
 ### Any bit width is a type
 
@@ -94,7 +97,7 @@ var p = Pixel(31, 40, 17)
 
 var counter: u12 = 4000
 
-print("wraps at 4096:", counter + 100)
+print("wraps at 4096:", counter +% 100)
 print("and divides:", counter / 7)
 print("packed:", p.red, p.green, p.blue)
 ```
