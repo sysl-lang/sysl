@@ -927,6 +927,18 @@ private declares(e: *Emit, p: TProgram) -> Buf[IrFuncSig]
             free_params.push(ir_param(LPtr))
             out.push(declared_sig(e, free_symbol(), ir_fn_type(LVoid, free_params)))
 
+    // The zeroing half, on the same terms: `calloc(count, size)`, or the counting runtime's twin of it
+    // where that runtime is defined elsewhere.
+    if e.uses_calloc && !defines_alloc_count(e)
+        val zeroing = calloc_symbol().unwrap_or("calloc")
+
+        if !emits_export(p, zeroing)
+            var zero_params: Buf[IrParam] = buf()
+
+            zero_params.push(ir_param(word_lty(e)))
+            zero_params.push(ir_param(word_lty(e)))
+            out.push(declared_sig(e, zeroing, ir_fn_type(LPtr, zero_params)))
+
     // The aligned pair, on the same terms -- and not where this module writes its default or the
     // counting runtime defines it.
     if aligned_hook_declared(e, p, aligned_alloc_symbol())
@@ -1002,6 +1014,15 @@ private declares(e: *Emit, p: TProgram) -> Buf[IrFuncSig]
         copy_params.push(ir_param(l_i1()))
         out.push(declared_sig(e,memcpy_symbol(), ir_fn_type(LVoid, copy_params)))
 
+    if e.uses_memset
+        var set_params: Buf[IrParam] = buf()
+
+        set_params.push(ir_param(LPtr))
+        set_params.push(ir_param(LInt(8)))
+        set_params.push(ir_param(word_lty(e)))
+        set_params.push(ir_param(l_i1()))
+        out.push(declared_sig(e, memset_symbol(e), ir_fn_type(LVoid, set_params)))
+
     // What a call site was told its callee's `ensure` established (`contract_assume.sysl`).
     if e.uses_assume
         var fact_params: Buf[IrParam] = buf()
@@ -1031,6 +1052,8 @@ private declares(e: *Emit, p: TProgram) -> Buf[IrFuncSig]
     if e.heap
         seen.push(malloc_symbol())
         seen.push(free_symbol())
+
+    if e.uses_calloc then seen.push(calloc_symbol().unwrap_or("calloc"))
 
     if !e.aligned_heap.is_empty()
         seen.push(aligned_alloc_symbol())

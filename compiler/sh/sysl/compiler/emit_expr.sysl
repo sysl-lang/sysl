@@ -341,7 +341,7 @@ private gen_expr_kind(e: *Emit, x: TExpr) -> Val = *x.kind match
         end if
 
         val slot = alloca(e, fresh_reg(e), lty(e, array_ty))
-        val v = gen_expr(e, value)
+        val v = fill_value(e, value)
 
         fill_array(e, slot, array_ty, v)
 
@@ -376,11 +376,16 @@ private gen_expr_kind(e: *Emit, x: TExpr) -> Val = *x.kind match
     // result lands in n places -- and the reason the count may be zero and the call still happen.
     TBufFill(value, count, slice_ty) ->
         val elem = element(slice_ty).unwrap_or(int_type())
-        val v = gen_expr(e, value)
+        val v = fill_value(e, value)
         val n = widen_index(e, count, x.span, BoundsCountTooWide)
-        val made = gen_buffer(e, elem, n)
 
-        fill_elements(e, elem, made.1, n, v)
+        // A fill of zeros is storage taken zeroed, and nothing written into it (`heap_call`), where
+        // the target has the C library that is lowered to (`lays_bytes`).
+        val zeros = lays_bytes(e) && is_zero_const(v)
+        val made = gen_buffer_zeroed(e, elem, n, zeros)
+
+        if !zeros then fill_elements(e, elem, made.1, n, v)
+
         buffer_view(e, slice_ty, made.0, made.1, n)
 
     // **A view of some of what a place holds.** A temporary array whose view *outlives it* is the
@@ -661,11 +666,13 @@ private gen_promoted_slice(e: *Emit, base: TExpr, slice_ty: Type) -> Val
         TArrayLit(elems, _) -> return gen_buf_lit(e, elems, slice_ty)
         TArrayFill(value, array_ty) ->
             val elem = element(slice_ty).unwrap_or(int_type())
-            val v = gen_expr(e, value)
+            val v = fill_value(e, value)
             val n = VInt(from_int(long(array_len_of(array_ty))))
-            val made = gen_buffer(e, elem, n)
+            val zeros = lays_bytes(e) && is_zero_const(v)
+            val made = gen_buffer_zeroed(e, elem, n, zeros)
 
-            fill_elements(e, elem, made.1, n, v)
+            if !zeros then fill_elements(e, elem, made.1, n, v)
+
             return buffer_view(e, slice_ty, made.0, made.1, n)
         _ -> ()
 
@@ -2144,8 +2151,19 @@ end gen_conversion
 fill_at(e: *Emit, base: Val, array_ty: Type, v: Val)
     if array_len_of(array_ty) > 0 && !zero_sized_elements(array_ty) then fill_array(e, base, array_ty, v)
 
+//
+// **A value whose bytes are all one byte is laid with one `memset`** -- zeros of every kind, and an
+// integer such as `0xFFFF_FFFF` -- which is what the target's own fill does best and what an array of
+// megabytes ought to cost. Anything else is stored element by element.
 fill_array(e: *Emit, base: Val, array_ty: Type, v: Val)
     val elem = element(array_ty).unwrap_or(int_type())
+
+    fill_byte(e, elem, v) match
+        Some(b) ->
+            emit_memset(e, base, b, VInt(from_int(long(e.layout.size(array_ty)))), int(e.layout.claim(array_ty)))
+            return
+        None -> ()
+
     val i = alloca(e, fresh_reg(e), word_lty(e))
     val cond_l = fresh_label(e, "fill.test")
     val body_l = fresh_label(e, "fill.elem")

@@ -46,6 +46,10 @@ alloc_counting_asked() -> bool =
 // The pair a counted build allocates through.
 counted_allocator() -> (string, string) = ("sysl_count_alloc", "sysl_count_free")
 
+// The zeroing call of a counted build (`emit_arc.sysl`'s `calloc_symbol`), counted as the pair's
+// allocation is and given back through the same `sysl_count_free`.
+counted_calloc_symbol() -> string = "sysl_count_calloc"
+
 // Whether the pair this compilation settled on is the counting one.
 alloc_counting_active() -> bool = malloc_symbol() == counted_allocator().0
 
@@ -65,6 +69,7 @@ alloc_count_text(word: string) -> string
     @sysl.count.said = private constant [${said.bytes.len + 2} x i8] c"$said\\0A\\00"
 
     declare ptr @malloc($word)
+    declare ptr @calloc($word, $word)
     declare void @free(ptr)
     declare i32 @dprintf(i32, ptr, ...)
     declare i32 @atexit(ptr)
@@ -99,6 +104,18 @@ alloc_count_text(word: string) -> string
     define ptr @sysl_count_alloc($word %n) {
     entry:
       %p = call ptr @malloc($word %n)
+      %got = icmp ne ptr %p, null
+      br i1 %got, label %count, label %done
+    count:
+      %was = atomicrmw add ptr @sysl.count.live, i64 1 monotonic
+      br label %done
+    done:
+      ret ptr %p
+    }
+
+    define ptr @${counted_calloc_symbol()}($word %k, $word %n) {
+    entry:
+      %p = call ptr @calloc($word %k, $word %n)
       %got = icmp ne ptr %p, null
       br i1 %got, label %count, label %done
     count:
@@ -158,7 +175,7 @@ defines_alloc_count(e: *Emit) -> bool = e.requested_set.has("sysl.count")
 
 // The symbols the counting runtime states.
 alloc_count_symbols() -> []const string =
-    [counted_allocator().0, counted_allocator().1, counted_aligned_symbol(), counted_aligned_free_symbol(), "malloc", "free", "dprintf",
+    [counted_allocator().0, counted_allocator().1, counted_aligned_symbol(), counted_aligned_free_symbol(), counted_calloc_symbol(), "malloc", "calloc", "free", "dprintf",
      "atexit", "posix_memalign"]
 
 // What a counted program said about its heap: the net count it reported, or zero where it said

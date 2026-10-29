@@ -1,0 +1,464 @@
+module sh.sysl.compiler
+
+@tests
+
+import sh.sysl.parsing.source_of
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.{cstring, Search, str_builder}
+
+// **A fill of zeros costs one call, and on the heap not even that.** `[v; n]` whose value is one byte
+// repeated -- zero bits of any kind, or an integer such as `-1` -- is laid with one `llvm.memset`
+// wherever it lands: a frame slot, a field written in place, a buffer. A box whose payload is mostly
+// zeros (a page of them, or nothing else) is taken from the heap's zeroing call, `calloc` -- or the
+// counting runtime's twin of it -- and its zeros are not written at all, so the pages they occupy are
+// never touched. A bare machine has neither `calloc` nor `memset` promised -- an archive linked into
+// a C `main` with a plain linker has nothing to resolve them -- so there every fill stays a loop.
+//
+// The axes and the cells skipped:
+// - **the value**: `0`, `0.0`, `null`, `false`, a type's zero, a plain struct of zeros, a simple enum
+//   at tag 0, a byte-repeating `-1`; and the ones that are not claimed -- `-0.0` (its sign bit is set),
+//   `300` (its bytes differ), `true`.
+// - **where it lands**: a local, a field of a box, a buffer of a run-time count, a box below and above
+//   a page. A module `val`/`var` of a constant fill is `zeroinitializer` data already (`emit_static`),
+//   so it is not repeated here.
+// - **the build**: the default heap, the counted heap (net 0), AddressSanitizer, and a freestanding
+//   Thumb archive. A generic payload is skipped: emission runs after instantiation, on the same nodes.
+//   A pair a package named (the `memset` after a plain allocation) is skipped: the pair is settled
+//   per command from a manifest, which these in-process builds do not have.
+
+private zfl_ready() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+    end if
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+    end if
+
+    true
+end zfl_ready
+
+private extern "setenv" zfl_c_setenv(name: *u8, value: *u8, overwrite: int) -> int
+private extern "unsetenv" zfl_c_unsetenv(name: *u8) -> int
+
+// The LLVM text of the module a program lowers to on this machine, or what its analysis said.
+private zfl_ir(text: string) -> string
+    val root = make_temp_dir("sysl-zfl").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    val out = emit_llvm_text(src, None) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> if made.report.is_empty() then made.text else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end zfl_ir
+
+// One function's text, from its `define` to the brace that closes it.
+private zfl_body(out: string, name: string) -> string
+    var b = str_builder()
+    var inside = false
+
+    for line in lines_of(out)
+        if !inside && line.starts_with("define ") &&
+           (line.contains("@" + name + "$$sysl(") || line.contains("@" + name + "(")) then inside = true
+
+        if inside
+            if line == "}" then return b.finish()
+
+            b.push(line)
+            b.push_char('\n')
+
+    s"no definition of '$name' in:\n$out"
+end zfl_body
+
+// What the program prints, built with `flags` in `SYSL_EXTRA_CFLAGS` (none where empty) and against
+// the counted heap where `counted` asks: its stdout, with what stopped it or what it left live after.
+private zfl_run(text: string, flags: string, counted: bool) -> string
+    val root = make_temp_dir("sysl-zfl").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    if flags != ""
+        val n = cstring("SYSL_EXTRA_CFLAGS")
+        val v = cstring(flags)
+
+        zfl_c_setenv(n.ptr, v.ptr, 1)
+    end if
+
+    force_alloc_counting(counted)
+
+    val exe = s"$root/built"
+    val built = build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe))
+
+    force_alloc_counting(false)
+
+    if flags != ""
+        val n = cstring("SYSL_EXTRA_CFLAGS")
+
+        zfl_c_unsetenv(n.ptr)
+    end if
+
+    if built.is_err()
+        remove_dir_all(root).unwrap_or(())
+        return s"it did not build: ${failure_text(built.unwrap_err())}"
+    end if
+
+    val hooks = capture("nm", ["-u", exe], "", [], true) match
+        Ok(out) -> out.text.count_of("__asan_report")
+        Err(_) -> 0
+
+    val ran = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    if flags.contains("address") && hooks < 2 then return s"the binary calls $hooks ASan report hooks"
+
+    ran match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) ->
+            val err = out.err.unwrap_or("")
+
+            if !out.status.ok() then s"it did not run to the end: ${out.text}$err"
+            else if err.contains("still live") then s"${out.text}$err"
+            else out.text
+end zfl_run
+
+private zfl_has(text: string, part: string) -> bool = text.index_of(part).is_some()
+
+// -- one memset, for every zero ---------------------------------------------------------------------
+
+// `fill` binds `xs` to a fill; `decl` declares what it needs.
+private zfl_local(decl: string, fill: string) -> string = s"""
+$decl
+fill() -> usize
+    $fill
+    xs.len
+print(fill())
+"""
+
+private zfl_says_memset(decl: string, fill: string, byte: string)
+    val body = zfl_body(zfl_ir(zfl_local(decl, fill)), "fill")
+
+    assert(zfl_has(body, s"call void @llvm.memset.p0.i64(ptr align") && zfl_has(body, s"i8 $byte,"), s"$fill:\n$body")
+    assert(!zfl_has(body, "fill.elem"), s"$fill:\n$body")
+
+@test("a zero fill of a local is one memset of byte 0, for every kind of zero")
+zfl_every_zero_is_a_memset()
+    if !zfl_ready() then return
+
+    zfl_says_memset("", "var xs = [0; 4096]", "0")
+    zfl_says_memset("", "var xs = [0u8; 4096]", "0")
+    zfl_says_memset("", "var xs = [0.0; 4096]", "0")
+    zfl_says_memset("", "var xs: [4096]f32 = [0.0; 4096]", "0")
+    zfl_says_memset("", "var xs = [false; 4096]", "0")
+    zfl_says_memset("type H = *extern(u64) -> unit", "var xs: [4096]H = [null; 4096]", "0")
+    zfl_says_memset("struct P\n    x: int\n    y: real", "var xs = [P(0, 0.0); 4096]", "0")
+    zfl_says_memset("enum Color\n    Red\n    Green", "var xs = [Red; 4096]", "0")
+
+@test("a fill whose bytes are all one byte is one memset of that byte")
+zfl_a_repeated_byte_is_a_memset()
+    if !zfl_ready() then return
+
+    zfl_says_memset("", "var xs = [-1; 4096]", "-1")
+    zfl_says_memset("", "var xs: [4096]u8 = [7; 4096]", "7")
+    zfl_says_memset("", "var xs: [4096]u16 = [0x2A2A; 4096]", "42")
+    zfl_says_memset("", "var xs: [4096]u8 = [200; 4096]", "-56")
+
+@test("-0.0, true, and a value whose bytes differ are still stored element by element")
+zfl_the_rest_is_a_loop()
+    if !zfl_ready() then return
+
+    for fill in ["var xs = [-0.0; 4096]", "var xs = [300; 4096]", "var xs = [true; 4096]",
+                 "var xs: [4096]u64 = [0xFFFF_FFFF_FFFF_FFFF; 4096]"]
+        val body = zfl_body(zfl_ir(zfl_local("", fill)), "fill")
+
+        assert(zfl_has(body, "fill.elem"), s"$fill:\n$body")
+        assert(!zfl_has(body, "llvm.memset"), s"$fill:\n$body")
+
+// -- the heap --------------------------------------------------------------------------------------
+
+private zfl_big() -> string = raw"""
+type H = *extern(u64) -> unit
+
+struct Big
+    tag: u32
+    small: [1048576]u8
+    hs: [262144]H
+    ws: [262144]u64
+end Big
+
+make(t: u32) -> &Big = Big(t, [0; 1048576], [null; 262144], [0; 262144])
+"""
+
+@test("a box whose payload is mostly zeros is taken zeroed, and none of its zeros are written")
+zfl_a_zero_box_is_calloc()
+    if !zfl_ready() then return
+
+    val body = zfl_body(zfl_ir(zfl_big() + "print(make(7).tag)\n"), "make")
+
+    assert(zfl_has(body, "call ptr @calloc(i64 1, i64 "), body)
+    assert(!zfl_has(body, "@malloc"), body)
+    assert(!zfl_has(body, "llvm.memset"), body)
+    assert(!zfl_has(body, "fill.elem"), body)
+
+@test("a box with a non-zero fill beside the zeros writes only the non-zero one")
+zfl_a_mixed_box_writes_what_is_not_zero()
+    if !zfl_ready() then return
+
+    val body = zfl_body(zfl_ir(raw"""
+        struct Mixed
+            a: [262144]u64
+            b: [1024]int
+            c: [1024]real
+        end Mixed
+
+        make() -> &Mixed = Mixed([0; 262144], [300; 1024], [-0.0; 1024])
+        print(make().b[3])
+        """), "make")
+
+    assert(zfl_has(body, "@calloc("), body)
+    assert(zfl_asq_count(body, "fill.elem") == 2, body)
+    assert(!zfl_has(body, "llvm.memset"), body)
+
+private zfl_asq_count(text: string, needle: string) -> usize
+    var n: usize = 0
+
+    for line in lines_of(text)
+        if line.starts_with(needle) then n += 1
+
+    n
+end zfl_asq_count
+
+@test("a small box whose zeros are not the whole of it is taken from the plain heap")
+zfl_a_small_mixed_box_is_malloc()
+    if !zfl_ready() then return
+
+    val body = zfl_body(zfl_ir(raw"""
+        struct Small
+            a: [64]u64
+            tag: int
+        end Small
+
+        make() -> &Small = Small([0; 64], 9)
+        print(make().tag)
+        """), "make")
+
+    assert(zfl_has(body, "@malloc("), body)
+    assert(!zfl_has(body, "@calloc("), body)
+    assert(zfl_has(body, "llvm.memset"), body)
+
+@test("a small box of nothing but zeros is taken zeroed")
+zfl_a_small_zero_box_is_calloc()
+    if !zfl_ready() then return
+
+    val body = zfl_body(zfl_ir(raw"""
+        struct Small
+            a: [64]u64
+            tag: int
+        end Small
+
+        make() -> &Small = Small([0; 64], 0)
+        print(make().tag)
+        """), "make")
+
+    assert(zfl_has(body, "@calloc("), body)
+    assert(!zfl_has(body, "store i64 0") && !zfl_has(body, "llvm.memset"), body)
+
+@test("a buffer of zeros at a run-time count is taken zeroed; a repeated byte is one memset; the rest a loop")
+zfl_a_buffer_fill()
+    if !zfl_ready() then return
+
+    val zeros = zfl_body(zfl_ir("zs(n: usize) -> []int = [0; n]\nprint(zs(3usize).len)\n"), "zs")
+
+    assert(zfl_has(zeros, "@calloc("), zeros)
+    assert(!zfl_has(zeros, "buf.elem") && !zfl_has(zeros, "llvm.memset"), zeros)
+
+    // An `f32` zero is a `double` truncated by an instruction, and still a zero fill.
+    val floats = zfl_body(zfl_ir("zs(n: usize) -> []f32 = [0.0; n]\nprint(zs(3usize).len)\n"), "zs")
+
+    assert(zfl_has(floats, "@calloc(") && !zfl_has(floats, "buf.elem"), floats)
+
+    val ones = zfl_body(zfl_ir("zs(n: usize) -> []u8 = [u8(1); n]\nprint(zs(3usize).len)\n"), "zs")
+
+    assert(zfl_has(ones, "@malloc(") && zfl_has(ones, "llvm.memset") && zfl_has(ones, "i8 1,"), ones)
+    assert(!zfl_has(ones, "buf.elem"), ones)
+
+    val other = zfl_body(zfl_ir("zs(n: usize) -> []int = [300; n]\nprint(zs(3usize).len)\n"), "zs")
+
+    assert(zfl_has(other, "buf.elem") && !zfl_has(other, "llvm.memset"), other)
+
+// -- what the program holds, under every heap ---------------------------------------------------------
+
+private zfl_values() -> string = zfl_big() + raw"""
+struct Mixed
+    a: [262144]u64
+    b: [1024]int
+    c: [1024]real
+    s: string
+end Mixed
+
+struct Node
+    v: int
+
+mixed() -> &Mixed = Mixed([0; 262144], [300; 1024], [-0.0; 1024], "kept")
+
+zs(n: usize) -> []int = [0; n]
+ones(n: usize) -> []u8 = [255; n]
+nodes(n: usize) -> []Option[&Node] = [None; n]
+
+main()
+    val b = make(7)
+    print(b.tag, b.small[1048575], b.ws[262143], b.hs[5] == null)
+
+    val m = mixed()
+    print(m.a[100], m.b[1023], 1.0 / m.c[17] < 0.0, m.s)
+
+    var local = [-1; 512]
+    var flags = [false; 512]
+    print(local[511], flags[3])
+
+    val z = zs(1000usize)
+    val o = ones(1000usize)
+    val ns = nodes(10usize)
+    print(z[999], o[999], ns[9].is_none(), z.len, o.len)
+"""
+
+private zfl_values_said() -> string = "7 0 0 true\n0 300 true kept\n-1 false\n0 255 true 1000 1000\n"
+
+@test("the values are right on the default heap")
+zfl_values_default()
+    if !zfl_ready() then return
+
+    assert_eq(zfl_run(zfl_values(), "", false), zfl_values_said())
+
+@test("the values are right on the counted heap, and everything comes back")
+zfl_values_counted()
+    if !zfl_ready() then return
+
+    assert_eq(zfl_run(zfl_values(), "", true), zfl_values_said())
+
+@test("the counted heap's zeroing call is its own, counted twin of calloc")
+zfl_counted_calloc_is_counted()
+    if !zfl_ready() then return
+
+    force_alloc_counting(true)
+
+    val out = zfl_ir(zfl_big() + "print(make(7).tag)\n")
+
+    force_alloc_counting(false)
+
+    assert(zfl_has(zfl_body(out, "make"), "call ptr @sysl_count_calloc(i64 1, i64 "), out)
+    assert(zfl_has(out, "define ptr @sysl_count_calloc("), out)
+
+@test("the values are right under AddressSanitizer")
+zfl_values_asan()
+    if !zfl_ready() then return
+
+    assert_eq(zfl_run(zfl_values(), "-fsanitize=address -g", false), zfl_values_said())
+
+// -- the pages are never touched ----------------------------------------------------------------------
+
+// About 64 MB of zeros in one box; the peak resident size the program reports of itself stays a small
+// fraction of it, which it could not if any of the zeros had been written.
+private zfl_rss() -> string = raw"""
+type H = *extern(u64) -> unit
+
+struct Huge
+    tag: u32
+    bytes: [16777216]u8
+    hs: [2097152]H
+    ws: [2097152]u64
+    rs: [2097152]real
+end Huge
+
+extern "getrusage" c_getrusage(who: i32, usage: *i64) -> i32
+
+make() -> &Huge = Huge(3, [0; 16777216], [null; 2097152], [0; 2097152], [0.0; 2097152])
+
+#if macos
+megabytes(raw: i64) -> i64 = raw / 1048576
+#else
+megabytes(raw: i64) -> i64 = raw / 1024
+#endif
+
+main()
+    val h = make()
+    var usage: [18]i64 = [0; 18]
+
+    c_getrusage(0, &usage[0])
+
+    val mb = megabytes(usage[4])
+    print(h.tag, h.bytes[16777215], if mb < 24 then "small" else s"$mb MB")
+"""
+
+@test("a box of 64 MB of zeros leaves the program's peak resident size far below 64 MB")
+zfl_the_zeros_are_never_touched()
+    if !zfl_ready() then return
+
+    assert_eq(zfl_run(zfl_rss(), "", false), "3 0 small\n")
+
+// -- a bare machine -----------------------------------------------------------------------------------
+
+@test("on a freestanding thumb archive nothing calls calloc or memset: a zero box and a local fill stay loops")
+zfl_thumb_has_no_calloc()
+    if !zfl_ready() then return
+
+    val t = target_named("thumb-freestanding-softfp").unwrap()
+    var units: Buf[Program] = buf()
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, t) match
+            Err(_) -> ()
+            Ok(found) -> units = found
+
+    val parsed = parse(source_of("main.sysl", raw"""
+        struct Big
+            tag: u32
+            ws: [4096]u32
+        end Big
+
+        make(n: u32) -> &Big = Big(n, [0; 4096])
+
+        zs(n: usize) -> []f32 = [0.0; n]
+
+        @export("probe")
+        probe(n: u32) -> u32
+            val b = make(n)
+            var xs = [0u8; 256]
+            xs[1] = u8(n)
+            b.tag + b.ws[17] + u32(xs[1]) + u32(zs(usize(n)).len)
+        end probe
+        """), t)
+
+    assert(parsed.ok())
+    units.push(parsed.program)
+
+    val done = analyze_produced(units, t, buf(), false)
+    val whole = program_of(done, done.main_module) with { entry_point = false, c_artifact = true }
+    var own: Buf[string] = buf()
+
+    own.push("")
+
+    val pr = post_analysis_checks(done.an, whole, own)
+    val out = ir_print_module(codegen_with_gaps(prune(strip_tests(whole), own), t, pr).0)
+    val made = zfl_body(out, "make")
+    val probe = zfl_body(out, "probe")
+
+    assert(!zfl_has(out, "calloc") && !zfl_has(out, "llvm.memset"), out)
+    assert(zfl_has(made, "@malloc(") && zfl_has(made, "fill.elem"), made)
+    assert(zfl_has(probe, "fill.elem"), probe)
+
+    // An `f32` zero is stored as the `float` it is, not as `zeroinitializer`.
+    val zs = zfl_body(out, "zs")
+
+    assert(zfl_has(zs, "buf.elem") && zfl_has(zs, "store float %"), zs)
