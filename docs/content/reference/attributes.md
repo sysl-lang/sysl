@@ -1937,6 +1937,49 @@ print(shown(42))
 the string a value renders as needs an allocator, and 'shown' declared '@no_alloc'
 ```
 
+**A closure handed on as a `&Fn` makes nothing when nothing keeps it past the frame.** Its box is
+built in the frame of the function that writes the closure — the header a heap box has, in a slot of
+the frame — so a callee that only calls it, or takes a share and gives it back, allocates nothing
+([closures](/reference/expressions/#a-closure-handed-on-as-a-fn-is-boxed-in-the-frame)):
+
+```sysl
+call(f: &Fn() -> unit) = f()
+
+@no_alloc
+counted() -> int
+    var n = 0
+
+    call(() -> n += 1)
+    call(() -> n += 1)
+    n
+
+print(counted())
+```
+
+```output
+2
+```
+
+One a callee keeps, one returned, one kept past a turn of the loop that builds it, and a `&sync Fn`
+still go on the heap, and are refused here at the closure:
+
+```sysl
+var later: Option[&Fn() -> int] = None
+
+install(f: &Fn() -> int)
+    later = Some(f)
+
+@no_alloc
+setup()
+    install(() -> 1)
+
+setup()
+```
+
+```error
+a reference needs an allocator, and 'setup' declared '@no_alloc'
+```
+
 **Directly under the header the word is still the module's clause.** The header is read first, and
 blank lines do not end it, so a file whose first declaration is the promised function has the
 module's clause instead; an `import` or another declaration above the function is what makes it the

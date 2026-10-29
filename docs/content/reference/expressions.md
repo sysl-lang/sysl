@@ -1124,7 +1124,32 @@ drop 7
 4
 ```
 
-Every place may be `_`, which evaluates the right side for its effects alone. Only a **whole** place
+Every place may be `_`, which evaluates the right side for its effects alone — **a single one
+included: `_ = f()` runs `f` and drops what it answers**, whatever that is: a `Result`, a reference
+with a `Drop` (let go of when the statement ends), `unit`, a tuple.
+
+```sysl
+struct Tag
+    n: int
+
+impl Drop for Tag
+    drop(self)
+        print(s"drop ${self.n}")
+
+make(n: int) -> &Tag = Tag(n)
+
+_ = make(1)
+print("after")
+_ = (make(2), 3)
+```
+
+```output
+drop 1
+after
+drop 2
+```
+
+Only a **whole** place
 may be `_` — one inside a place, as in `xs[_], a = 1, 2`, would stand for a closure's parameter — and
 only `=` discards: a compound form reads every place before writing it, and `_` has nothing to read.
 
@@ -2119,9 +2144,47 @@ print(make()())
 'call' takes '*self', so it writes through what it is called on, and a 'val' is written once — this closure captures by value, since it is returned from 'make' on line 8 — write 'var bump' if it is meant to change
 ```
 
-`&Fn(int) -> int` holds a closure behind a reference, which a program without an allocator cannot
-use, since a `&T` is a box. A reading closure in a `val` is how freestanding code binds a closure to
-an immutable name.
+`&Fn(int) -> int` holds a closure behind a reference, a box — built in the frame where nothing keeps
+the closure past it, and on the heap otherwise (below). A reading closure in a `val` is how
+freestanding code binds a closure to an immutable name without asking that question.
+
+### A closure handed on as a `&Fn` is boxed in the frame
+
+A closure erased to `&Fn` is a counted reference, so it has a box: the counts, the hook that lets go
+of what it holds, and the closure. **Where nothing reaches the closure after the frame that builds it
+— nor, in a loop, after the turn that builds it — the box is a slot of that frame**, so handing a
+closure to `each`, `sort_by` or a callback that only calls it allocates nothing, `@no_alloc` accepts
+it, and so does a target with no allocator. A callee may still take a share and give it back; the
+count is the slot's. The question is the one a closure's capture mode asks, about the same flows: a
+closure returned, stored where it outlives the frame, handed to a parameter its function keeps, kept
+in a local outside the loop body that builds it, built in an `async` body, or erased into a `&sync
+Fn` is boxed on the heap, as it always was. Nothing is written for either, and `--explain-escapes`
+names each heap box and why:
+
+```sysl
+apply(f: &Fn() -> int) -> int = f()
+
+main()
+    var gs: [3]&Fn() -> int = [() -> 0, () -> 0, () -> 0]
+    var total = 0
+
+    for i in 0..<3
+        val k = i * 10
+
+        total += apply(() -> k + 1)
+        gs[i] = () -> k
+
+    print(total, gs[0](), gs[1](), gs[2]())
+```
+
+```output
+33 0 10 20
+```
+
+The closure handed to `apply` is boxed in the frame, once per turn; each one kept in `gs` outlives
+its turn, so each is boxed on the heap and holds its own `k` — `sysl build --explain-escapes` says
+*a closure erased to '&Fn() -> int' is boxed on the heap, because it is kept in 'gs' on line 11,
+which outlives the turn of the 'for' body that builds it*.
 
 ### A write to a copy that nothing will see is refused
 
