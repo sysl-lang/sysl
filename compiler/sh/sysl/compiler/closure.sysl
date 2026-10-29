@@ -412,17 +412,21 @@ private refuse_pinned_captures(cx: &Analyzer, span: Span, captured: Buf[string],
 
         val name = captured.at(i)
         val held = type_show(local.unwrap().ty)
-        val instead = s"Capture a pointer to it instead ('val p = &$name')"
 
+        // A closure that outlives the frame cannot keep a pointer into it either, so the way out is
+        // a box the closure counts.
         if i < refs.len() && refs.at(i)
             val head = s"'$held' is '@pinned' — C may hold pointers into a value of it, so a value is " +
                 s"never copied or moved once it is built, and this closure captures '$name' by value"
+            val boxed = s". Build it behind a counted reference instead ('val $name: &$held = …'), " +
+                "which the closure keeps without copying the value"
 
-            cx.an.lost_writes.push(OwedWrite(cx.scope, span, head, ", since ", s". $instead", base, i))
+            cx.an.lost_writes.push(OwedWrite(cx.scope, span, head, ", since ", boxed, base, i))
             continue
         end if
 
-        cx.fault(span, pinned_refusal(held, s"captures '$name' by value in a closure", instead))
+        cx.fault(span, pinned_refusal(held, s"captures '$name' by value in a closure",
+                                      s"Capture a pointer to it instead ('val p = &$name')"))
         return true
     end for
 

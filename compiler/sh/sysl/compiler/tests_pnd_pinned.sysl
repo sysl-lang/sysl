@@ -138,13 +138,21 @@ pnd_unmarked_holder()
                 "moves. Mark 'Holder' '@pinned' too, or hold a '&Fs' or a '*Fs'")
 end pnd_unmarked_holder
 
-@test("capturing a pinned local by value in a closure is refused")
+// Whether a closure holds its captures by value is decided over the whole program, after the bodies,
+// so the refusal is read off a whole build. A closure that does not escape holds the local by
+// reference and is accepted (`tests_cwo_closure_ownership.sysl`).
+@test("capturing a pinned local in a closure that escapes is refused, and names the box that works")
 pnd_capture()
-    if pnd_skip() then return
+    if !enm_ready() then return
 
-    pnd_refused(pnd_fs + "main()\n    var here = Fs(5)\n    val f = () -> here.open\n    print(f())\n",
-                "and this captures 'here' by value in a closure. Capture a pointer to it instead " +
-                "('val p = &here')")
+    val said = enm_err(pnd_fs + "make() -> &Fn() -> int\n    var here = Fs(5)\n    () -> here.open\n\n" +
+                       "main()\n    print(make()())\n")
+
+    assert(said.contains("'Fs' is '@pinned' — C may hold pointers into a value of it, so a value is " +
+                         "never copied or moved once it is built, and this closure captures 'here' by " +
+                         "value, since it is returned"), said)
+    assert(said.contains(". Build it behind a counted reference instead ('val here: &Fs = …'), which " +
+                         "the closure keeps without copying the value"), said)
 end pnd_capture
 
 @test("destructuring a pinned value is refused, at a binding and in a match")

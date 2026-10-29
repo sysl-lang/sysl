@@ -1810,6 +1810,37 @@ Deciding otherwise would mean reading the callee's body, and a module compiles a
 signatures and never their bodies. The cost is one refusal in a program that could have written the
 ref one line later.
 
+**A closure that holds the variable by reference writes it when it runs, so a call that runs one
+writes it too.** The closure's own body is in hand wherever it is built, so here the check reads it:
+a call that is handed the closure — directly, through a local, a `&Fn` or a struct holding one, or
+inside another closure — or that calls it is refused while a ref stands through an owning step the
+closure writes:
+
+```sysl
+struct Node
+    v: int
+
+struct Holder
+    node: &Node
+    count: int
+
+call(f: &Fn() -> unit) = f()
+
+main()
+    var h = Holder(Node(1), 0)
+    ref r = h.node.v
+
+    call(() -> h = Holder(Node(2), 0))
+    print(r)
+```
+
+```error
+'r' is a 'ref' standing on storage this call could release, since a closure it runs writes 'h'
+```
+
+A closure that writes only storage the ref does not stand through — `h.count += 1`, or `h.node.v`
+itself — is run without complaint, and so is one called after the ref's block has closed.
+
 **A container's storage moves under a `@relocates` member, whatever its receiver mode.** A `Buf`
 is a handle, so its `push` takes `self` and still reallocates what the handle points at. Each member
 that can move the storage or give an element up is marked, and the mark is what the check asks:
