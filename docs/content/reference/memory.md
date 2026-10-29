@@ -1638,9 +1638,12 @@ no check and would silently make `t` follow a later change to `i`.
 ### It is a declaration, never a type
 
 This is the whole of why it can exist in a language with no borrow checker. `ref` may be written
-**only as a local declaration**. There is no `ref` type, so a ref cannot be a field, a parameter, a
-return type, an element, or a type argument; it cannot be re-pointed at a second place once bound; it
-cannot be captured by a closure; and it does not outlive the block that declares it.
+**only as a local declaration**. There is no `ref` type, so a ref cannot be a field, a parameter, an
+element, or a type argument; it cannot be re-pointed at a second place once bound; it cannot be
+captured by a closure; and it does not outlive the block that declares it. The one place `ref` is
+written beside a type is a method's result, `-> ref T`, and that is not a type either: it says the
+call **is a place**, which the caller names with a `ref` of its own or writes through at once
+([A member that answers a place](#a-member-that-answers-a-place)).
 
 A ref *of* a ref is not a re-pointing and is ordinary — one more name for the place the first one
 stands for, with the walks following through it:
@@ -1728,6 +1731,30 @@ print(items[0].block)
 ```output
 42
 ```
+
+**The place must lie in storage something holds past the statement** — a local, a parameter, module
+storage, or what a `*T` points at. A place inside a call's answer is inside a temporary, released at
+the end of the statement while the name would live on:
+
+```sysl
+import sysl.buf.{Buf, buf}
+
+fresh() -> Buf[int]
+    val b: Buf[int] = buf()
+
+    b.push(5)
+    b
+
+ref t = fresh()[0]
+
+t += 1
+```
+
+```error
+'t' would stand on a place inside a value nothing holds — a temporary, released at the end of this statement while the name lives on
+```
+
+Bind the answer with `val` first and the `ref` to a place inside that.
 
 ### The one rule: what may move underneath it
 
@@ -2028,6 +2055,104 @@ field would.
 The distinction matters because the other reading is available and wrong: if binding retained, a ref
 would be a `&T` with extra steps, and the count it took would keep an object alive past the write
 that replaced it.
+
+### A member that answers a place
+
+A method can say its call **is a place**: `-> ref T`. Its body comes to a place reached through a
+parameter, and every call of it is that place in the caller — written through at once, named by a
+`ref`, or read, which reads a copy:
+
+```sysl
+struct Task
+    state: int
+    prio: int
+
+    bump(*self) = self.prio += 100
+
+struct Kernel
+    tasks: [4]Task
+
+    task(*self, i: usize) -> ref Task = self.tasks[i]
+
+var k = Kernel([Task(0, 7); 4])
+
+k.task(2).state = 2
+
+ref t = k.task(1)
+
+t.prio += 1
+k.task(0).bump()
+
+val copy = k.task(2)
+
+k.task(2).state = 9
+
+print(k.tasks[2].state, t.prio, k.tasks[0].prio, copy.state)
+```
+
+```output
+9 8 107 2
+```
+
+**It is the same `ref`, written in the callee.** The compiler keeps the body's place as a template over
+the member's parameters, and a caller's walks go on through it with the call's arguments put in: a
+`ref` bound to `b.at(0)` holds `b.items` still exactly as a `ref` bound to `b.items[0]` does, so every
+hazard of [the one rule](#the-one-rule-what-may-move-underneath-it) is refused through a method too:
+
+```sysl
+import sysl.buf.{Buf, buf}
+
+struct Bag
+    items: Buf[int]
+
+    at(*self, i: usize) -> ref int = self.items[i]
+
+var b = Bag(buf())
+
+b.items.push(1)
+
+ref first = b.at(0)
+
+b.items.push(2)
+first = 5
+```
+
+```error
+'first' is a 'ref' standing on an element whose storage 'push' could move or give up
+```
+
+A second `*self` call of the member while such a `ref` stands is a `*self` call like any other, and is
+refused when the `ref`'s path goes through storage the receiver owns (a `Buf`'s, a `&T`'s).
+
+**What the body may be.** Its last expression and nothing else is the answer — a field chain, an
+element, a dereference — reached from a parameter or module storage, and leaving the parameter's own
+bytes on the way: through a `*self` receiver, a reference, a view, a container's element, a `*T`.
+Each of these is refused, with what to write instead:
+
+- a field of a by-value `self`, or a local: the storage is the call's, gone when it returns;
+- a value (`self.a + 1`), or a place chosen by an `if`: there is no one address to answer;
+- a `return` or a `?` in the body: they leave with a value;
+- a place inside a struct with an `invariant`: a write through the answer lands in the caller,
+  where nothing walks out to the clause.
+
+```sysl
+struct Pair
+    a: int
+
+    get(self) -> ref int = self.a
+```
+
+```error
+'Pair.get' would answer a place in storage of its own call — a by-value parameter or a local — which is gone when it returns
+```
+
+**Where it may be written.** On a type's own member, inherent or generic (`Grid[T].at(x, y) -> ref T`
+answers an element at every instantiation, `&Node` slots included). Not on a free function, not in a
+trait, and not on an `impl` member a trait declares: a call through a trait object names no body to
+read the place from.
+
+**The address is never a value.** `&k.task(0)` and `&Kernel.task` are refused — either would carry the
+address where the compiler has lost the place.
 
 ### Where it comes from
 

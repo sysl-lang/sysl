@@ -326,21 +326,61 @@ private with_args(t: TExpr, params: Buf[string], args: Buf[TExpr]) -> TExpr = *t
         TExpr(t.span, TCall(n, out, ty, r))
     _ -> t
 
-// `ref name = …` over a place a `-> ref` member answered, where the place lies inside a value nothing
-// holds -- a receiver built for the call, released at the end of the statement while the name lives
-// on. Used at once, in the statement that made it, the same place is fine.
+// `ref name = …` over a place inside a value nothing holds -- a call's answer, a receiver built for a
+// `-> ref` call, a view made on the spot -- which is released at the end of the statement while the
+// name lives on. Used at once, in the statement that made it, the same place is fine.
+//
+// The walk goes out from the place, through every `ref` it names and every `-> ref` call's template,
+// to where its storage is held: a name (a local, a parameter, module storage) holds it, and so does
+// a **raw pointer** -- what a `*T` points at is the program's to keep alive, as it is for `ref x = *p`.
+// Anything else at the root is a temporary.
 refuse_unheld_ref(cx: &Analyzer, at: Span, name: string, place: TExpr)
-    if !reaches_ref_call(cx, place) then return
+    if held(cx, place) then return
 
-    *place_root(cx, place).kind match
-        TLoad(_, _) -> return
-        TGlobal(_, _, _) -> return
-        _ -> ()
-
-    cx.fault(at, s"'$name' would stand on a place inside a value nothing holds — what this call " +
-             "answers a place of is a temporary, released at the end of the statement while the " +
-             "name lives on. Bind it to a name first, and the place to that")
+    cx.fault(at, s"'$name' would stand on a place inside a value nothing holds — a temporary, " +
+             "released at the end of this statement while the name lives on. Bind the value to a " +
+             "name first, and the 'ref' to a place inside that")
 end refuse_unheld_ref
+
+// Whether the storage a place lies in outlives the statement (`refuse_unheld_ref`).
+private held(cx: &Analyzer, place: TExpr) -> bool
+    var at = place
+
+    loop
+        val stood = *at.kind match
+            TLoad(n, _) -> ref_place(cx, n)
+            _ -> None
+
+        if stood.is_some()
+            at = stood.unwrap()
+        else
+            val here = *at.kind match
+                TLoad(_, _) -> true
+                TGlobal(_, _, _) -> true
+                TDeref(op, _) -> raw_target(cx, op)
+                _ -> false
+
+            if here then return true
+
+            val next = step_before(cx, at)
+
+            if next.is_none() then return false
+
+            at = next.unwrap()
+        end if
+end held
+
+// Whether a dereferenced operand is a `*T` the program holds -- not an element's address a subscript
+// made, nor a place a `-> ref` member answered, both of which lie inside their receiver.
+private raw_target(cx: &Analyzer, op: TExpr) -> bool
+    if !(texpr_type(op) is Ptr(_)) then return false
+
+    if placed_by(cx, op).is_some() then return false
+
+    *op.kind match
+        TCall(name, _, _, _) -> !cx.an.tables.place_templates.has(name)
+        _ -> true
+end raw_target
 
 // Whether a place is, or lies inside, what a `-> ref` member's call answered.
 reaches_ref_call(cx: &Analyzer, t: TExpr) -> bool = *t.kind match
