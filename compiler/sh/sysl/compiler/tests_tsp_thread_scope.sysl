@@ -1,0 +1,235 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.cstring
+
+// `sysl.threads.scope` and `Barrier`, seen from a program: the scope's `spawn` is the library's own
+// `@scoped(f)` member (`reference/attributes.md § @scoped(f)`), so what a closure written at it may
+// borrow, and what it is refused, is the existing `@scoped` and crossing analysis, asked through the
+// library rather than through a scope a test declares. The library's own suite checks the behaviour
+// (`library/sysl/threads/tests.sysl`); this file checks the diagnostics a user meets, a matrix split
+// into phases the way a threaded gemm splits one, and a ThreadSanitizer run of all of it.
+
+private extern "setenv" tsp_c_setenv(name: *u8, value: *u8, overwrite: int) -> int
+private extern "unsetenv" tsp_c_unsetenv(name: *u8) -> int
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private tsp_outcome(text: string, flags: string) -> (string, int, string)
+    val root = make_temp_dir("sysl-tsp").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+    val name = cstring("SYSL_EXTRA_CFLAGS")
+    val value = cstring(flags)
+
+    if flags != "" then tsp_c_setenv(name.ptr, value.ptr, 1)
+
+    val made = build_native_program(root, None, None, DefaultOptimization, Some(exe))
+
+    if flags != "" then tsp_c_unsetenv(name.ptr)
+
+    made match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (failure_text(why), -1, "")
+        Ok(_) -> ()
+
+    val undefined = capture("nm", ["-u", exe], "", [], true) match
+        Ok(out) -> out.text
+        Err(_) -> ""
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> ("the program that was built could not be run", -1, undefined)
+        Ok(out) -> (out.text + out.err.unwrap_or(""), shell_status(out.status), undefined)
+end tsp_outcome
+
+private tsp_prints(text: string, want: string)
+    if xvr_no_library() then return
+
+    val out = tsp_outcome(text, "")
+
+    assert_eq(out.0, want)
+    assert_eq(out.1, 0)
+
+private tsp_refused(text: string, part: string)
+    if xvr_no_library() then return
+
+    val out = tsp_outcome(text, "")
+
+    assert_eq(out.1, -1, out.0)
+    assert(out.0.index_of(part).is_some(), out.0)
+
+// A gemm's shape: phase one has each thread fill its own rows of `a`, the barrier holds them until
+// every row is written, and phase two has each thread read rows other threads wrote to fill its rows
+// of `c`. The leader of each phase counts itself, and each thread answers its rows' sum through join.
+private tsp_gemm() -> string = raw"""
+    import sysl.buf.{Buf, buf}
+    import sysl.sync.{Atomic, Relaxed}
+    import sysl.threads.{ScopedThread, barrier, scope}
+
+    struct Matrix
+        data: []int
+        rows: usize
+        cols: usize
+
+    phases(a: Matrix, c: Matrix, workers: usize) -> int
+        val b = barrier(workers)
+        val leaders: &sync Atomic[int] = Atomic(0)
+        val per = a.rows / workers
+
+        val total = scope((s) ->
+            var hs: Buf[ScopedThread[int]] = buf()
+
+            for w in 0..<workers
+                hs.push(s.spawn(() ->
+                    for r in w * per..<(w + 1) * per
+                        for k in 0..<a.cols do a.data[r * a.cols + k] = int(r + k)
+
+                    if b.wait() then leaders.add(1, Relaxed)
+
+                    var mine = 0
+
+                    for r in w * per..<(w + 1) * per
+                        for k in 0..<c.cols
+                            val other = (r + per) % a.rows
+
+                            c.data[r * c.cols + k] = a.data[other * a.cols + k] * 2
+                            mine += c.data[r * c.cols + k]
+
+                    if b.wait() then leaders.add(1, Relaxed)
+                    mine))
+
+            var sum = 0
+
+            for h in hs do sum += h.join()
+            sum)
+
+        total * 10 + leaders.load(Relaxed)
+
+    var a = [0; 32]
+    var c = [0; 32]
+
+    print(phases(Matrix(a[..], 8, 4), Matrix(c[..], 8, 4), 1))
+    print(phases(Matrix(a[..], 8, 4), Matrix(c[..], 8, 4), 4))
+    print(c[0] + c[31])
+    """
+
+// -- what runs ------------------------------------------------------------------------------------
+
+// Each phase's sum is twice the sum of `a`, whose rows the second phase only permutes, and each of
+// the two phases has one leader: 2 * 160 * 10 + 2. A thread that read a row before its writer reached
+// the barrier would read a zero and lose from the sum. The handles are joined after the loop: joining
+// each as it is started would hold the first worker at a barrier its siblings never reach.
+
+@test("a matrix filled and read in two phases on scoped threads meets at a barrier")
+tsp_gemm_phases()
+    tsp_prints(tsp_gemm(), "3202\n3202\n12\n")
+
+// -- what is refused ------------------------------------------------------------------------------
+
+@test("a scoped thread that stores a borrowed view in module storage is refused, naming it")
+tsp_view_into_module_storage_refused()
+    tsp_refused(raw"""
+        import sysl.threads.scope
+
+        static var kept: []int = []
+
+        keep(v: []int) -> int
+            scope((s) ->
+                s.spawn(() -> kept = v)
+                0)
+
+        var a = [1, 2, 3]
+
+        print(keep(a[..]))
+        """, "the module storage 'kept' it reaches is a '[]int'")
+
+@test("the scope stored where it outlives the scope's body is refused")
+tsp_scope_escapes_refused()
+    tsp_refused(raw"""
+        import sysl.threads.{Scope, scope}
+
+        static var idle: Option[*Scope] = None
+
+        run() -> int
+            scope((s) ->
+                idle = Some(s)
+                0)
+
+        print(run())
+        """, "this one keeps its parameter 's' (it is stored in 'idle')")
+
+@test("a closure made before the call and handed to spawn does not borrow, and is refused")
+tsp_closure_made_earlier_refused()
+    tsp_refused(raw"""
+        import sysl.threads.scope
+
+        total(v: []int) -> int
+            val f: &sync Fn() -> int = () -> v[0]
+
+            scope((s) -> s.spawn(f).join())
+
+        var a = [1, 2, 3]
+
+        print(total(a[..]))
+        """, "the 'v' it captures reaches a '[]int'")
+
+@test("a lent struct with a string beside its view is refused at the scope's spawn")
+tsp_string_field_refused()
+    tsp_refused(raw"""
+        import sysl.threads.scope
+
+        struct Named
+            data: []int
+            name: string
+
+        show(x: Named) -> int
+            scope((s) -> s.spawn(() -> x.data[0]).join())
+
+        var a = [1, 2, 3]
+
+        print(show(Named(a[..], "m")))
+        """, "the 'x.name' it captures reaches a 'string'")
+
+// -- under ThreadSanitizer ------------------------------------------------------------------------
+
+// The gemm's phases, threads started on the scope by scoped threads, and a handle joined on a sibling:
+// every way a scope's records and a barrier's lock are touched from two threads at once.
+@test("scoped threads and a barrier are a clean ThreadSanitizer run")
+tsp_tsan_is_clean()
+    if xvr_no_library() then return
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return
+    end if
+
+    val text = tsp_gemm() + raw"""
+        val count: &sync Atomic[int] = Atomic(0)
+
+        scope((s) ->
+            for _ in 0..<4
+                s.spawn(() ->
+                    for _ in 0..<4
+                        s.spawn(() -> count.add(1, Relaxed))))
+        print(count.load(Relaxed))
+
+        print(scope((s) ->
+            val h = s.spawn(() -> 20)
+            val k = s.spawn(() -> h.join() + 1)
+
+            h.join() + k.join()))
+        """
+    val out = tsp_outcome(text, "-fsanitize=thread -g")
+
+    assert(out.2.contains("__tsan_"), out.2)
+    assert_eq(out.0, "3202\n3202\n12\n16\n41\n")
+    assert_eq(out.1, 0)

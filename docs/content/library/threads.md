@@ -49,6 +49,9 @@ had when it was pthreads by symbol, kept for the programs that import it.
 | `spawn(body, arg)` | starts a thread, answering `Option[Thread]` |
 | `spawn_on(stack, body, arg)` | the same, on storage the program owns |
 | `Thread.join` | waits for one, answering whether it waited |
+| `scope(body)`, `Scope.spawn(f)` | threads that borrow the caller's frame, all joined before `scope` returns |
+| `ScopedThread[R].join` | waits for a scoped thread, answering what its closure answered |
+| `barrier(n)`, `Barrier.wait` | `n` threads meeting phase by phase, one leader each phase |
 | `current()` | the calling thread's own handle |
 | `yield_now()` | offers the processor away — a hint, not a wait |
 | `SleepLock` | a sleeping lock that guards nothing of its own, and implements `sysl.sync.Lock` |
@@ -153,7 +156,8 @@ asking for the type rather than a guess.
 It answers a `bool` — whether it waited — and nothing else. That is the crossing rule rather than an
 oversight: **a result coming out of another domain is a value crossing a boundary**, which is what a
 [channel](#channel-t) is for. So a body that has something to say writes it through the address it was
-given, or sends it, which is what the `Job` above does.
+given, or sends it, which is what the `Job` above does. A [scoped thread](#scoped-threads) is the
+exception, because its scope holds the caller until it is joined: its `join` answers the closure's value.
 
 The `Thread` value is a **handle rather than the thread**. Copying one copies the handle, and
 joining either copy joins the one thread; joining **twice** is not checked — the second join would give
@@ -749,6 +753,155 @@ What the elements hold is still asked: a view of `&Node`s is copied as a view, b
 same `&Node`s, whose counts are not atomic, so it is refused in the words above. A view of `&sync
 Node`s crosses. **The copy allocates**, so a module that declared `@no_alloc` is told so at the call,
 and sends values that hold no view.
+
+## Scoped threads
+
+**`scope(body)` lends `body` a `Scope`, and every thread started on it with `s.spawn(f)` is joined
+before `scope` returns.** Because none of them outlives the call, a closure written at `spawn` may
+borrow the caller's frame — a view of its array, a struct of views and the scalars that read them —
+where `spawn(body, arg)` would need an address and a join on every way out. It is the shape of a
+threaded loop over one array: split the work, let each thread write its own part, and read the whole
+once `scope` has answered.
+
+```sysl
+import sysl.threads.scope
+
+struct Matrix
+    data: []int
+    rows: usize
+    cols: usize
+
+fill(m: Matrix)
+    scope((s) ->
+        for r in 0..<m.rows
+            s.spawn(() ->
+                for c in 0..<m.cols do m.data[r * m.cols + c] = int(r * 10 + c)))
+
+var cells = [0; 6]
+
+fill(Matrix(cells[..], 2, 3))
+print(cells[0], cells[2], cells[3], cells[5])
+```
+
+```output
+0 2 10 12
+```
+
+`s.spawn(f)` answers a `ScopedThread[R]`, and **its `join` carries back what `f` answered** — the
+value comes out of the thread the scope was holding anyway, so nothing crosses that a scoped closure
+could not already have reached. A handle joined twice answers the same value without waiting again,
+and the scope does not join a thread that is already joined. `scope` answers what `body` answered:
+
+```sysl
+import sysl.threads.scope
+
+sum(v: []const int) -> int
+    var t = 0
+
+    for x in v do t += x
+    t
+
+halves(v: []const int) -> int
+    scope((s) ->
+        val lo = s.spawn(() -> sum(v[..<v.len / 2]))
+        val hi = s.spawn(() -> sum(v[v.len / 2..]))
+
+        lo.join() + hi.join())
+
+val xs = [1, 2, 3, 4, 5, 6, 7, 8]
+
+print(halves(xs[..]))
+```
+
+```output
+36
+```
+
+**What a scoped closure may capture is what `@scoped(f)` allows**
+([attributes § `@scoped(f)`](/reference/attributes/#scoped-f-a-member-that-finishes-what-it-starts-before-its-scope-closes)):
+scalars, arrays, `&sync T`, raw pointers, the scope itself, and views. A `string`, a `&T` or a `Buf`
+is refused by name, and so is a closure made earlier and handed in — only one written at the call
+borrows. Storing a borrowed view where it outlives the scope is refused the way module storage reached
+from another domain always is:
+
+```sysl
+import sysl.threads.scope
+
+static var kept: []int = []
+
+keep(v: []int)
+    scope((s) -> s.spawn(() -> kept = v))
+
+var a = [1, 2, 3]
+
+keep(a[..])
+```
+
+```error
+the module storage 'kept' it reaches is a '[]int'
+```
+
+The scope is lent to `body` for the call, so it cannot be kept either:
+
+```sysl
+import sysl.threads.{Scope, scope}
+
+static var idle: Option[*Scope] = None
+
+scope((s) -> idle = Some(s))
+```
+
+```error
+this one keeps its parameter 's' (it is stored in 'idle')
+```
+
+**Every way out of `body` joins.** An early `return` leaves the body's closure and lands back in
+`scope` like any other answer, so the threads already started are joined and their writes are the
+caller's. A trap or a `panic` ends the program — sysl does not unwind — so no thread outlives the frame
+it borrows on that path either. A scoped thread may be handed `s` and start threads of its own on it;
+the scope joins those too, and a handle may be joined from a sibling. Where the system will not start
+another thread, `spawn` stops the program with a message rather than answer `None`: running a child
+inline instead could leave its siblings waiting at a barrier for ever.
+
+## `Barrier`
+
+**`barrier(n)` answers a `&sync Barrier` that holds each caller of `wait` until `n` have arrived**,
+then lets all of them go together, and can be met again at once. `wait` answers `true` to exactly one
+caller per phase — the leader, which is where work that only one thread should do between phases goes.
+It is a `Mutex` and a `Condvar` underneath, and it is shared the way any `&sync` object is, so a scoped
+thread captures it directly:
+
+```sysl
+import sysl.sync.{Atomic, Relaxed}
+import sysl.threads.{barrier, scope}
+
+val b = barrier(4)
+val leaders: &sync Atomic[int] = Atomic(0)
+val total: &sync Atomic[int] = Atomic(0)
+var slots = [0; 4]
+val v = slots[..]
+
+scope((s) ->
+    for me in 0..<4
+        s.spawn(() ->
+            v[me] = int(me) + 1
+
+            if b.wait() then leaders.add(1, Relaxed)
+
+            total.add(v[(me + 1) % 4], Relaxed)
+
+            if b.wait() then leaders.add(1, Relaxed)))
+
+print(leaders.load(Relaxed), total.load(Relaxed))
+```
+
+```output
+2 10
+```
+
+The second phase reads a slot another thread wrote in the first, which is safe only because no thread
+leaves the first `wait` until every slot is written. A barrier of one never waits, and its every
+caller leads.
 
 ## `yield_now` and `current`
 

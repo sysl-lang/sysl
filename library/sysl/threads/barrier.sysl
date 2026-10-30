@@ -1,0 +1,60 @@
+module sysl.threads
+@requires(os)
+
+/** A meeting point for a fixed number of threads: each `wait` sleeps until that many have arrived,
+ * then all of them go on together.
+ *
+ * It can be met again at once -- the threads that leave one phase may arrive at the next before the
+ * slowest has woken from the last -- because a wait sleeps on the phase it arrived in, not on the
+ * count. **Exactly one of each phase's waiters is told it is the leader**: the one whose arrival
+ * completed the phase, and the one a program has do the work between phases that only one thread
+ * should do.
+ *
+ * It is shared as a `&sync Barrier`, which is what `barrier` answers, so a scoped thread captures it
+ * as it would any other atomically counted object.
+ */
+struct Barrier
+
+    // How many threads each phase waits for.
+    private n: usize
+
+    // How many have arrived in the current phase, and which phase it is.
+    private gate: Mutex[Gate]
+
+    // Where the early arrivals sleep until the phase changes.
+    private turn: Condvar
+
+    /** Sleeps until `n` threads, this one included, have called `wait` in this phase, and answers
+     * whether this caller is the phase's leader: `true` for exactly one of them.
+     */
+    @blocks
+    wait(*self) -> bool
+        val g = self.gate.lock_raw()
+        val phase = g.phase
+
+        g.arrived += 1
+
+        if g.arrived < self.n
+            while g.phase == phase
+                self.turn.wait(&self.gate)
+
+            self.gate.unlock_raw()
+            return false
+
+        g.arrived = 0
+        g.phase = g.phase +% 1
+        self.gate.unlock_raw()
+        self.turn.notify_all()
+        true
+    end wait
+
+end Barrier
+
+/** A barrier that waits for `n` threads in each phase. A barrier of one -- or of none -- never waits,
+ * and every caller of its `wait` is the leader.
+ */
+barrier(n: usize) -> &sync Barrier = Barrier(n, Mutex.new(Gate(0, 0)), Condvar.new())
+
+private struct Gate
+    arrived: usize
+    phase: u64
