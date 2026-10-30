@@ -81,6 +81,8 @@ trait Float: Zero + One + Eq + Ord + Neg + Add + Sub + Mul + Div
     cbrt(self) -> Self
     exp(self) -> Self
     exp2(self) -> Self
+    expm1(self) -> Self
+    ln1p(self) -> Self
     ln(self) -> Self
     log2(self) -> Self
     log10(self) -> Self
@@ -222,6 +224,31 @@ infinity when the answer itself is perfectly representable; libm's does the scal
 **`cos(tau/4)` is `6.12e-17` and not zero**, which is not a bug in anything — a quarter turn is not
 exactly representable in binary, so the argument handed to `cos` is not exactly π/2. This is the
 ordinary floating-point fact, and the page shows it rather than choosing an example that hides it.
+
+### `expm1` and `ln1p` — accurate near zero
+
+`expm1` is `exp(x) - 1` and `ln1p` is `ln(1 + x)`, each computed without forming the sum that
+ruins it. For a tiny `x` the sum `1 + x` is rounded to a multiple of the spacing of numbers near
+one, so `x`'s own low digits are gone before `ln` ever sees them; `exp(x) - 1` cancels the same
+way. libm's `expm1` and `log1p` keep them, and these are those functions at every width (the
+sixteen-bit ones compute at `f32`). The names follow `ln` — `ln1p`, not C's bare `log1p`.
+
+```sysl
+import sysl.math.Float
+
+var tiny = 1.0e-10
+var minus_one = -1.0
+
+print(tiny.exp() - 1.0 == tiny.expm1(), (1.0 + tiny).ln() == tiny.ln1p())
+print((tiny.expm1() / tiny - 1.0).abs() < 1.0e-9, (tiny.ln1p() / tiny - 1.0).abs() < 1.0e-9)
+print(minus_one.ln1p(), (minus_one - 1.0).ln1p().is_nan())
+```
+
+```output
+false false
+true true
+-inf true
+```
 
 ### Rounding, sign, and the rest
 

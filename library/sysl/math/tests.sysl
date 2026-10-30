@@ -271,6 +271,89 @@ exp_ln_inverse()
     assert_approx_eq(1.0.exp(), e, 1.0e-12)
     assert_approx_eq(5.0.ln().exp(), 5.0, 1.0e-12)
 
+// The expected bit patterns are the C library's own answers for the same inputs, taken from clang's
+// `expm1` / `log1p` / `expm1f` / `log1pf`, so each assertion is bit-exact rather than approximate.
+@test("expm1 and ln1p keep the digits of a tiny argument that exp and ln lose, bit for bit")
+expm1_ln1p_tiny_f64()
+    val x = black_box(1.0e-10)
+
+    assert_eq(x.expm1().bits(), 0x3DDB7CDFD9DDA4E3)
+    assert_eq(x.ln1p().bits(), 0x3DDB7CDFD9D1D693)
+    assert_eq((-x).expm1().bits(), 0xBDDB7CDFD9D1D693)
+    assert_eq((-x).ln1p().bits(), 0xBDDB7CDFD9DDA4E3)
+
+    // The longhand is wrong: the sum rounds `x` to a multiple of 2^-53 or so.
+    assert(x.exp() - 1.0 != x.expm1())
+    assert((1.0 + x).ln() != x.ln1p())
+
+    assert_eq(0.5.expm1().bits(), 0x3FE4C2531C3C0D38)
+    assert_eq(0.5.ln1p().bits(), 0x3FD9F323ECBF984C)
+    assert_eq((-0.5).expm1().bits(), 0xBFD92E9A0720D3EC)
+    assert_eq((-0.5).ln1p().bits(), 0xBFE62E42FEFA39EF)
+    assert_eq(black_box(40.0).expm1().bits(), 0x438A220D397972EB)
+    assert_eq(black_box(1.0).ln1p().bits(), 0x3FE62E42FEFA39EF)
+
+@test("expm1 and ln1p at f32 are libm's f32 answers, bit for bit")
+expm1_ln1p_f32()
+    val x = black_box(1.0e-10f32)
+
+    assert_eq(x.expm1().bits(), 0x2EDBE6FF)
+    assert_eq(x.ln1p().bits(), 0x2EDBE6FF)
+    assert_eq((-x).expm1().bits(), 0xAEDBE6FF)
+    assert_eq(black_box(0.5f32).expm1().bits(), 0x3F261299)
+    assert_eq(black_box(0.5f32).ln1p().bits(), 0x3ECF991F)
+    assert_eq(black_box(-0.5f32).expm1().bits(), 0xBEC974D0)
+    assert_eq(black_box(-0.5f32).ln1p().bits(), 0xBF317218)
+
+@test("expm1 and ln1p answer zero with its sign, and the special values as C does")
+expm1_ln1p_special_values()
+    val zero = black_box(0.0)
+    val negzero = black_box(-0.0)
+    val inf = black_box(real.infinity())
+
+    assert_eq(zero.expm1().bits(), 0)
+    assert_eq(negzero.expm1().bits(), 0x8000000000000000)
+    assert_eq(zero.ln1p().bits(), 0)
+    assert_eq(negzero.ln1p().bits(), 0x8000000000000000)
+
+    assert_eq(black_box(-1.0).ln1p(), -inf)
+    assert(black_box(-1.0000001).ln1p().is_nan())
+    assert(black_box(-inf).ln1p().is_nan())
+    assert_eq(inf.ln1p(), inf)
+    assert_eq(inf.expm1(), inf)
+    assert_eq((-inf).expm1(), -1.0)
+    assert(black_box(real.nan()).expm1().is_nan())
+    assert(black_box(real.nan()).ln1p().is_nan())
+
+    // Overflow goes to infinity rather than trapping; the far end of the range is finite for ln1p.
+    assert_eq(black_box(710.0).expm1(), inf)
+    assert_eq(black_box(710.0).ln1p().bits(), 0x401A4445C70632F8)
+    assert_eq(black_box(1.0e308).ln1p().bits(), 0x40862991D5D62A5E)
+    assert_eq(black_box(-0.9999).ln1p().bits(), 0xC0226BB1BBB55554)
+
+@test("expm1 and ln1p special values at f32")
+expm1_ln1p_special_values_f32()
+    val inf = black_box(f32.infinity())
+
+    assert_eq(black_box(0.0f32).expm1().bits(), 0)
+    assert_eq(black_box(-0.0f32).expm1().bits(), 0x80000000)
+    assert_eq(black_box(-0.0f32).ln1p().bits(), 0x80000000)
+    assert_eq(black_box(-1.0f32).ln1p(), -inf)
+    assert(black_box(-2.0f32).ln1p().is_nan())
+    assert(black_box(f32.nan()).expm1().is_nan())
+    assert_eq(black_box(100.0f32).expm1().bits(), 0x7F800000)
+    assert_eq(black_box(100.0f32).ln1p().bits(), 0x4093AF11)
+    assert_eq((-inf).expm1(), -1.0f32)
+
+@test("expm1 and ln1p reach both sixteen-bit widths through f32")
+expm1_ln1p_sixteen_bit()
+    assert_approx_eq(f32(black_box(0.5f16).expm1()), 0.6487213f32, 1.0e-3f32)
+    assert_approx_eq(f32(black_box(0.5f16).ln1p()), 0.4054651f32, 1.0e-3f32)
+    assert_approx_eq(f32(black_box(0.5bf16).expm1()), 0.6487213f32, 1.0e-2f32)
+    assert_approx_eq(f32(black_box(0.5bf16).ln1p()), 0.4054651f32, 1.0e-2f32)
+    assert_eq(black_box(-0.0f16).expm1().bits(), 0x8000)
+    assert(black_box(-2.0bf16).ln1p().is_nan())
+
 @test("the circle constants agree with the trigonometry")
 trig_at_the_constants()
     assert_approx_eq(pi.sin(), 0.0, 1.0e-12)
