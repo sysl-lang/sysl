@@ -13,7 +13,7 @@ has a name and a spelling of its own:
 | `@test`, `@tailrec`, `@pure`, `@ghost`, `@export`, `@reads`, `@writes`, `@crossing`, `@joined`, `@domain`, `@noinline`, `@inline`, `@cold`, `@disjoint`, `@no_alloc`, `@no_block`, `@blocks`, `@abandons`, `@track_caller` | an **annotation** — a fact about the free function under it | the grammar |
 | `@setup`, `@teardown`, `@setup_all`, `@teardown_all` | an **annotation** — a hook `sysl test` runs around a module's tests | the grammar |
 | `@keeps(...)` | an **annotation** on an `extern` — the parameters the C function holds on to past the call; see [`@keeps`](/reference/ffi/#keeps-a-c-function-that-holds-on-to-a-pointer) | the grammar |
-| `@returns_twice` | an **annotation** on an `extern` — the C function can return a second time, as `setjmp` does; see [`@returns_twice`](/reference/ffi/#returns_twice-a-c-function-that-returns-a-second-time) | the grammar |
+| `@returns_twice` | an **annotation** on an `extern` — the C function can return a second time, as `setjmp` does; see [`@returns_twice`](/reference/ffi/#returns-twice-a-c-function-that-returns-a-second-time) | the grammar |
 | `@needs(...)` | an **annotation** — the capabilities reaching the declaration under it requires; with `@abandons` and `@keeps`, one of the three an `extern` takes | the grammar |
 | `@packed`, `@align(n)`, `@section("...")` | an **annotation** — where the declaration under it is laid out, or where it lands | the grammar |
 | `@export("...", weak)`, `@export(weak)` on a function | an **annotation** — the export is a default a strong definition of the symbol replaces at the link; see [a weak export](/reference/ffi/#a-weak-export) | the grammar |
