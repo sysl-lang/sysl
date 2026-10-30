@@ -508,8 +508,9 @@ private lba_indirect() -> string = raw"""
     print(apply((p) -> total(p) + 1, P(7, 8, 9)))
     """
 
-@test("a table takes its word to a body that snapshots the object and lends the method that slot")
-lba_a_table_lends_a_snapshot_of_the_object()
+// `sum` can change no `P`, so the object cannot be told from a copy of it and is lent as it stands.
+@test("a table takes its word to a body that lends a method that writes nothing the object itself")
+lba_a_table_lends_the_object_to_a_reader()
     if !lba_ready() then return
 
     val out = lba_ir(lba_indirect())
@@ -517,9 +518,22 @@ lba_a_table_lends_a_snapshot_of_the_object()
 
     assert(lba_define(out, "P.sum.owned").contains("ptr noalias readonly %self.param"), out)
     assert(taken.contains("(ptr %self.object)"), taken)
-    assert(taken.contains("store %struct.P %self.value, ptr %self.lent"), taken)
-    assert(taken.contains("@P.sum.owned(ptr %self.lent)"), taken)
+    assert(!taken.contains("%self.lent"), taken)
+    assert(taken.contains("@P.sum.owned(ptr %self.payload)"), taken)
     assert(out.contains("ptr @P.sum.self"), out)
+end lba_a_table_lends_the_object_to_a_reader
+
+// `seen` calls `bump` through the other object's table, which writes a `Ball`: the body snapshots the
+// object and lends the method that slot.
+@test("a table takes its word to a body that snapshots the object for a method that could change it")
+lba_a_table_lends_a_snapshot_of_the_object()
+    if !lba_ready() then return
+
+    val out = lba_ir(lba_table_snapshot())
+    val taken = lba_body(out, "Ball.seen.self")
+
+    assert(taken.contains("store %struct.Ball %self.value, ptr %self.lent"), taken)
+    assert(taken.contains("@Ball.seen.owned(ptr %self.lent"), taken)
 end lba_a_table_lends_a_snapshot_of_the_object
 
 // The same object reached through its table while the method changes it: the receiver is the

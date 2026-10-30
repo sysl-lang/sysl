@@ -1,0 +1,589 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.text.{Search, join, str_builder}
+import sysl.fs.{make_dir_all, make_temp_dir, read_text, remove_dir_all, write_text}
+import sysl.process.capture
+
+// **A `(self)` method that only reads its receiver costs no copy of it, however the caller reaches the
+// receiver** (`borrowing.sysl`'s `untouched_by` and `reads_in_place`). Past the indirect boundary a
+// receiver crosses as an address, and the caller lends its own storage wherever nothing the callee
+// does can write a value of the receiver's type or give back a count one holds; the callee reads it
+// where it lies unless it changes its copy.
+//
+// Three things used to cost a whole-struct copy on every call of a reader: a string made in the
+// body (`str` of a number, a string out of bytes), a `?`, and a call through a trait object or a
+// closure -- each refused outright, so the caller staged a snapshot. And a reader that asked a field
+// for something through a `*self` method (`self.usb.irq()`) copied itself at entry, as if the method
+// had written it. In a program's own build a call through a table is now judged as a call to every
+// method that slot holds; an `&` of part of the receiver handed straight to a call that writes no
+// value of its type, and answers no address, leaves the receiver as it was.
+//
+// What a reader sees does not change: where the callee, a closure, a table's method or a conversion
+// could write the caller's storage, the snapshot is still taken, and a callee that writes or keeps its
+// copy still copies.
+
+private slr_ready() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+
+    true
+end slr_ready
+
+// `Chip` is past the indirect boundary on every target, at 336 bytes: the size a snapshot copies.
+private slr_prelude() -> string = raw"""
+    import sysl.buf.{Buf, buf}
+    import sysl.fmt.hex
+
+    struct Usb
+        inte: u32
+        intr: u32
+
+        irq(*self) -> bool = self.inte & self.intr != 0
+        ack(*self) = self.intr = 0
+        me(*self) -> *Usb = self
+
+    struct Chip
+        mem: [40]i64
+        held: u32
+        usb: Usb
+
+        @noinline
+        placed(self, a: u32) -> Result[u32, string]
+            if self.held & a != 0 then return Err(s"0x${hex(a, 8)} is held ($a)")
+            Ok(a % 40)
+
+        @noinline
+        tried(self, a: u32) -> Result[i64, string]
+            val p = self.placed(a)?
+            Ok(self.mem[usize(p)])
+
+        @noinline
+        mapped(self, a: u32) -> Result[u32, string] = self.placed(a).map_err(f -> f + "!")
+
+        @noinline
+        pending(self) -> i64 = if self.usb.irq() then self.mem[1] else 0
+
+        @noinline
+        acked(self) -> u32
+            self.usb.ack()
+            self.usb.intr
+
+        @noinline
+        answered(self) -> u32
+            val u = self.usb.me()
+            u.intr = 0
+            self.usb.intr
+
+    trait Reader
+        read(self, i: int) -> i64
+
+    impl Reader for Chip
+        @noinline
+        read(self, i: int) -> i64 = self.mem[usize(i) % 40]
+
+    fresh() -> Chip = Chip([3; 40], 1, Usb(1, 1))
+
+    """
+
+// Every way a caller reaches a receiver: a field behind `*self`, a field of a `&T`, a `ref`, an
+// element of a `Buf`, a local, a generic's `*T` and a trait object.
+private slr_callers() -> string = raw"""
+    struct Board
+        chip: Chip
+
+        @noinline
+        run(*self) -> i64 =
+            i64(self.chip.placed(2).unwrap_or(0)) + self.chip.tried(4).unwrap_or(0) +
+                i64(self.chip.mapped(6).unwrap_or(0)) + self.chip.pending()
+
+    @noinline
+    by_ref_t(b: &Board) -> u32 = b.chip.placed(2).unwrap_or(0)
+
+    @noinline
+    by_ref(b: *Board) -> u32
+        ref c = b.chip
+        c.placed(2).unwrap_or(0)
+
+    @noinline
+    by_buf(cs: Buf[Chip]) -> u32 = cs[0].placed(2).unwrap_or(0)
+
+    @noinline
+    by_local() -> u32
+        var c = fresh()
+        c.placed(2).unwrap_or(0)
+
+    @noinline
+    by_generic[T: Reader](x: *T) -> i64 = x.read(3)
+
+    @noinline
+    by_object(r: &Reader) -> i64 = r.read(3)
+
+    main()
+        var b = Board(fresh())
+        val hb: &Board = Board(fresh())
+        var cs: Buf[Chip] = buf()
+        cs.push(fresh())
+        val r: &Reader = fresh()
+        print(b.run(), by_ref_t(hb), by_ref(&b), by_buf(cs), by_local(), by_generic(&b.chip), by_object(r))
+    """
+
+private slr_ir(text: string, target: Option[string] = None) -> string
+    val root = make_temp_dir("sysl-slr").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, forms_imported(text)).unwrap()
+
+    val out = emit_llvm_text(src, target) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> if made.report.is_empty() then made.text else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end slr_ir
+
+// What clang's `-O2` leaves of the emitted module.
+private slr_optimized(text: string) -> string
+    val dir = make_temp_dir("sysl-slr").unwrap()
+    val file = s"$dir/t.ll"
+
+    write_text(file, slr_ir(text)).unwrap()
+
+    val got = capture("clang", ["-O2", "-S", "-emit-llvm", "-Wno-override-module", "-o", "-", file], "", [], true).unwrap()
+
+    remove_dir_all(dir).unwrap_or(())
+    assert(got.status.ok(), s"clang refused the emitted IR:\n${got.err.unwrap_or("")}")
+    got.text
+end slr_optimized
+
+// One function's text, from its `define` to the brace that closes it. clang quotes a name holding a
+// `$`, so a name is matched by what follows its sigil.
+private slr_body(out: string, name: string) -> string
+    var b = str_builder()
+    var inside = false
+
+    for line in lines_of(out)
+        if !inside && line.starts_with("define ") && (line.contains("@" + name + "(") || line.contains(name + "\"("))
+            inside = true
+
+        if inside
+            if line == "}" then return b.finish()
+
+            b.push(line)
+            b.push_char('\n')
+
+    s"no definition of '$name' in:\n$out"
+end slr_body
+
+// How many copies of a whole `Chip` -- 336 bytes -- a function's text makes.
+private slr_copies(body: string) -> int
+    var n = 0
+
+    for line in lines_of(body)
+        if line.contains("llvm.memcpy") && line.contains(" 336,") then n += 1
+
+    n
+end slr_copies
+
+private slr_prints_at(text: string, expected: string, level: string, counted: bool)
+    if !slr_ready() then return
+
+    val root = make_temp_dir("sysl-slr").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", forms_imported(text)).unwrap()
+
+    if counted then force_alloc_counting(true)
+
+    val built = build_native_program(s"$root/main.sysl", None, None, level, Some(s"$root/built"))
+
+    force_alloc_counting(false)
+
+    if built.is_err()
+        remove_dir_all(root).unwrap_or(())
+        assert(false, failure_text(built.unwrap_err()))
+        return
+    end if
+
+    val said = capture(s"$root/built", [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> assert(false, "the program that was built could not be run")
+        Ok(out) ->
+            assert_eq(out.text, expected)
+            assert(out.status.ok(), "the program printed what was expected and did not exit cleanly")
+            if counted then assert(!out.err.unwrap_or("").contains("still live"), out.err.unwrap_or(""))
+end slr_prints_at
+
+// Both ends of the optimizer.
+private slr_prints(text: string, expected: string, counted: bool = true)
+    slr_prints_at(text, expected, "0", counted)
+    slr_prints_at(text, expected, "2", counted)
+end slr_prints
+
+// -- what the caller lends -------------------------------------------------------------------------
+
+@test("a reader that formats an error, uses '?' and a closure is lent the caller's storage from every caller shape")
+slr_every_caller_shape_lends()
+    if !slr_ready() then return
+
+    val out = slr_ir(slr_prelude() + slr_callers())
+
+    for name in ["Board.run", "by_ref_t$$sysl", "by_ref$$sysl", "by_buf$$sysl", "by_local$$sysl",
+                 "by_generic.Chip"]
+        val body = slr_body(out, name)
+
+        assert(slr_copies(body) == 0, s"$name copies the receiver:\n$body")
+        assert(!body.contains("alloca %struct.Chip") || name == "by_local$$sysl", s"$name stages a snapshot:\n$body")
+end slr_every_caller_shape_lends
+
+@test("and at -O2 no caller shape copies it either")
+slr_every_caller_shape_lends_optimized()
+    if !slr_ready() then return
+
+    val out = slr_optimized(slr_prelude() + slr_callers())
+
+    for name in ["Board.run", "by_ref_t$$sysl", "by_ref$$sysl", "by_buf$$sysl", "by_local$$sysl",
+                 "by_generic.Chip", "vt.adapt.ref.Chip.read"]
+        val body = slr_body(out, name)
+
+        assert(slr_copies(body) == 0, s"$name copies the receiver:\n$body")
+end slr_every_caller_shape_lends_optimized
+
+@test("a trait object's table hands a reading method the object as it stands")
+slr_a_table_lends_the_object()
+    if !slr_ready() then return
+
+    val body = slr_body(slr_ir(slr_prelude() + slr_callers()), "vt.adapt.ref.Chip.read")
+
+    assert(slr_copies(body) == 0, body)
+    assert(!body.contains("alloca %struct.Chip"), body)
+end slr_a_table_lends_the_object
+
+@test("and it all answers what a copy would")
+slr_callers_run()
+    slr_prints(slr_prelude() + slr_callers(), "14 2 2 2 2 3 3\n")
+
+// -- what the callee reads in place ----------------------------------------------------------------
+
+@test("a reader that asks a field through a '*self' method reads its receiver in place")
+slr_a_star_self_reader_reads_in_place()
+    if !slr_ready() then return
+
+    val out = slr_ir(slr_prelude() + slr_callers())
+    val body = slr_body(out, "Chip.pending")
+
+    assert(body.contains("ptr noalias readonly %self.param"), body)
+    assert(slr_copies(body) == 0, body)
+end slr_a_star_self_reader_reads_in_place
+
+@test("a method whose '*self' call writes the field, or answers its address, still copies at entry")
+slr_a_writer_through_a_field_copies()
+    if !slr_ready() then return
+
+    val out = slr_ir(slr_prelude() + "main()\n    val c = fresh()\n    print(c.acked(), c.answered(), c.usb.intr)\n")
+
+    for name in ["Chip.acked", "Chip.answered"]
+        val body = slr_body(out, name)
+
+        assert(slr_copies(body) == 1, s"$name:\n$body")
+        assert(!body.contains("noalias readonly %self.param"), s"$name:\n$body")
+end slr_a_writer_through_a_field_copies
+
+@test("and the caller's receiver keeps its value")
+slr_a_writer_through_a_field_runs()
+    slr_prints(slr_prelude() + "main()\n    var c = fresh()\n    print(c.acked(), c.answered(), c.usb.intr, c.pending())\n",
+               "0 0 1 3\n")
+
+// -- where the snapshot is still taken -------------------------------------------------------------
+
+// Each callee reads its receiver after something that writes the caller's storage: a function value,
+// a closure, a trait object's method holding a pointer to it, a conversion `?` runs, and a `*Big`
+// handed alongside. The caller lends a snapshot every time, and the callee sees the value from before.
+private slr_writers() -> string = raw"""
+    struct Big
+        cells: [40]i64
+        k: i64
+
+    var g = Big([1; 40], 0)
+
+    poke() = g.cells[0] = 9
+
+    look(b: Big, f: &Fn() -> unit) -> i64
+        val before = b.cells[0]
+        f()
+        before * 100 + b.cells[0]
+
+    trait Poker
+        poke(*self)
+
+    struct ViaPointer
+        target: *Big
+
+    impl Poker for ViaPointer
+        poke(*self) = self.target.cells[0] = 7
+
+    struct Quiet
+        k: i64
+
+    impl Poker for Quiet
+        poke(*self) = self.k += 1
+
+    through(b: Big, p: *Poker) -> i64
+        val before = b.cells[0]
+        p.poke()
+        before * 100 + b.cells[0]
+
+    struct Low
+        why: i64
+
+    struct High
+        why: i64
+
+    impl From[Low] for High
+        from(e: Low) -> High
+            g.cells[0] = 5
+            High(e.why)
+
+    fails(n: i64) -> Result[i64, Low] = if n > 0 then Err(Low(n)) else Ok(n)
+
+    tried(b: Big, n: i64) -> Result[i64, High]
+        val before = b.cells[0]
+        val r = fails(n)?
+        Ok(before * 100 + b.cells[0] + r)
+
+    late(b: Big, n: i64) -> i64
+        val tail = tried(b, n) match
+            Ok(v) -> v
+            Err(e) -> e.why
+        tail * 1000 + b.cells[0]
+
+    beside(b: Big, p: *Big) -> i64
+        p.cells[0] = 4
+        b.cells[0]
+
+    var last = Big([0; 40], 0)
+
+    keep(b: Big) -> i64
+        last = b
+        b.cells[0]
+
+    main()
+        print(look(g, poke), g.cells[0])
+        g.cells[0] = 1
+        print(look(g, () -> poke()), g.cells[0])
+        g.cells[0] = 1
+        var v = ViaPointer(&g)
+        print(through(g, &v), g.cells[0])
+        g.cells[0] = 1
+        var q = Quiet(0)
+        print(through(g, &q), q.k)
+        print(late(g, 3), g.cells[0])
+        g.cells[0] = 1
+        print(beside(g, &g), g.cells[0])
+        g.cells[0] = 1
+        print(keep(g), last.cells[0])
+        g.cells[0] = 2
+        print(last.cells[0], g.cells[0])
+    """
+
+@test("a callee that a function value, a closure, a table's method, a conversion or a pointer can write through is lent a snapshot")
+slr_writers_get_a_snapshot()
+    slr_prints(slr_writers(), "101 9\n101 9\n101 7\n101 1\n3001 5\n1 4\n1 1\n1 2\n")
+
+@test("and the IR shows the snapshot at each of those calls")
+slr_writers_snapshot_ir()
+    if !slr_ready() then return
+
+    val out = slr_ir(slr_writers())
+    val main_body = slr_body(out, "$$main")
+    var staged = 0
+
+    for line in lines_of(main_body)
+        if line.contains("llvm.memcpy") && line.contains(" 328,") then staged += 1
+
+    // look twice, through twice, late, beside: six snapshots; keep owns its argument instead.
+    assert(staged >= 6, main_body)
+end slr_writers_snapshot_ir
+
+// A reader holding a counted field, whose caller's field is replaced by a closure while the callee
+// runs: the snapshot holds the old string, and every count comes back.
+private slr_counted() -> string = raw"""
+    struct Named
+        cells: [40]i64
+        name: string
+
+        said(self, f: &Fn() -> unit) -> string
+            f()
+            self.name
+
+    struct Holder
+        n: Named
+
+    main()
+        var h = Holder(Named([1; 40], "first" + "!"))
+        val p = &h
+        print(h.n.said(() -> p.n.name = "second" + "!"), h.n.name)
+    """
+
+@test("a counted field replaced through a closure during the call is still the old one in the callee, and nothing leaks")
+slr_counted_snapshot()
+    slr_prints(slr_counted(), "first! second!\n")
+
+// -- the closed world --------------------------------------------------------------------------------
+
+// A call through a table is judged by every method the slot holds only where the build sees every
+// table there is: an archive C links can be handed an object whose table it never saw.
+private slr_table_callee() -> string = raw"""
+    struct Big
+        cells: [40]i64
+
+    trait Poker
+        poke(*self)
+
+    struct Quiet
+        k: i64
+
+    impl Poker for Quiet
+        poke(*self) = self.k += 1
+
+    through(b: Big, p: *Poker) -> i64
+        p.poke()
+        b.cells[0]
+
+    struct Holder
+        big: Big
+
+        @noinline
+        run(*self, p: *Poker) -> i64 = through(self.big, p)
+
+        use(*self) -> i64
+            var q = Quiet(0)
+            self.run(&q)
+
+    """
+
+@test("a program lends a caller's storage to a callee whose table calls write nothing of its type")
+slr_a_program_sees_every_table()
+    if !slr_ready() then return
+
+    val body = slr_body(slr_ir(slr_table_callee() + "main()\n    var h = Holder(Big([1; 40]))\n    print(h.use())\n"),
+                        "Holder.run")
+
+    assert(!body.contains("llvm.memcpy"), body)
+end slr_a_program_sees_every_table
+
+@test("an archive C links still stages the snapshot")
+slr_an_archive_keeps_the_snapshot()
+    if !slr_ready() then return
+
+    val root = make_temp_dir("sysl-slr-").unwrap()
+
+    write_text(s"$root/package.hocon", "package {\n  name = \"probe\"\n}\n").unwrap()
+    write_text(s"$root/main.sysl", slr_table_callee() +
+               "@export(\"use_it\")\nuse_it() -> i64\n    var h = Holder(Big([1; 40]))\n    h.use()\n").unwrap()
+
+    var lines: Buf[string] = buf()
+    val sink = &lines
+    var args: [7]string = ["sysl", "build-c", "--emit-llvm", s"$root/out.ll", "-o", s"$root/out.a", root]
+    val code = run_cli(args[..], (line) -> sink.push(line))
+
+    reset_search_paths()
+    assert(code == 0, join(lines.view(), "\n"))
+
+    val body = slr_body(read_text(s"$root/out.ll").unwrap(), "Holder.run")
+
+    remove_dir_all(root).unwrap_or(())
+    assert(body.contains("llvm.memcpy") && body.contains(" 320,"), body)
+end slr_an_archive_keeps_the_snapshot
+
+// -- a 32-bit target, and a generic instantiated twice ----------------------------------------------
+
+private slr_thumb() -> string = raw"""
+    struct Usb
+        inte: u32
+        intr: u32
+
+        irq(*self) -> bool = self.inte & self.intr != 0
+
+    struct Chip
+        mem: [40]i64
+        held: u32
+        usb: Usb
+
+        @noinline
+        pending(self) -> i64 = if self.usb.irq() then self.mem[1] else 0
+
+    trait Reader
+        read(self, i: int) -> i64
+
+    impl Reader for Chip
+        read(self, i: int) -> i64 = self.mem[usize(i) % 40]
+
+    struct Board
+        chip: Chip
+
+        @noinline
+        tick(*self, r: &Reader) -> i64 = self.chip.pending() + r.read(2)
+
+    main()
+        var b = Board(Chip([3; 40], 0, Usb(1, 1)))
+        val r: &Reader = Chip([4; 40], 0, Usb(0, 0))
+        print(b.tick(r))
+    """
+
+@test("on thumb the reader is read in place and lent, and the table lends the object")
+slr_thumb_lends()
+    if !slr_ready() then return
+
+    val out = slr_ir(slr_thumb(), Some("thumb-freestanding"))
+
+    assert(slr_body(out, "Chip.pending").contains("ptr noalias readonly %self.param"), out)
+    assert(slr_copies(slr_body(out, "Chip.pending")) == 0, slr_body(out, "Chip.pending"))
+    assert(slr_copies(slr_body(out, "Board.tick")) == 0, slr_body(out, "Board.tick"))
+    assert(slr_copies(slr_body(out, "vt.adapt.ref.Chip.read")) == 0, slr_body(out, "vt.adapt.ref.Chip.read"))
+end slr_thumb_lends
+
+private slr_generic() -> string = raw"""
+    struct Wide
+        cells: [50]i64
+
+    impl Reader for Wide
+        read(self, i: int) -> i64 = self.cells[usize(i) % 50]
+
+    struct Pair
+        a: Chip
+        w: Wide
+
+    @noinline
+    sum_of[T: Reader](x: T) -> i64 = x.read(1) + x.read(2)
+
+    @noinline
+    both(p: *Pair) -> i64 = sum_of(p.a) + sum_of(p.w)
+
+    main()
+        var p = Pair(fresh(), Wide([5; 50]))
+        print(both(&p))
+    """
+
+@test("a generic reader instantiated at two large types is lent both from behind a pointer")
+slr_generic_twice()
+    if !slr_ready() then return
+
+    val body = slr_body(slr_ir(slr_prelude() + slr_generic()), "both$$sysl")
+
+    assert(!body.contains("llvm.memcpy"), body)
+end slr_generic_twice
+
+@test("and it adds up")
+slr_generic_twice_runs()
+    slr_prints(slr_prelude() + slr_generic(), "16\n")
