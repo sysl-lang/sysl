@@ -798,6 +798,12 @@ inert_leaf(x: TExpr) -> bool = *x.kind match
     TSlice(_, _, _, _, _) -> true
     TStrView(_) -> true
 
+    // `str` of a scalar, and a string copied out of bytes (`str_cast`), each fill a fresh buffer
+    // through a helper the compiler writes (`emit_str.sysl`'s `gen_str`, `gen_from_bytes`) that writes
+    // nothing else and gives back no count -- the same way `TBinary` makes a concatenation.
+    TStr(_) -> true
+    TFromBytes(_) -> true
+
     TIf(_, _, _, _) -> true
     TMatch(_, _, _) -> true
     TBlockExpr(_) -> true
@@ -978,10 +984,16 @@ end freed_clear
 
 // Every body of `p` summarised for `untouched_by`. `dropping` is the program's types with a destructor,
 // and `owning` the functions that give back a count they were handed (`inert_callees`).
-untouched_summary(p: TProgram, dropping: Buf[Type], owning: Set[string] = set()) -> Untouched
+//
+// **`closed` is a program's own build, which can see every table there is**: a call through a trait
+// object is then a call to the method in that slot of every table of the trait (`slot_callees`), each
+// judged as a direct call is. Anything else -- a library, an archive C links -- can be handed an
+// object whose table it never saw, so there a call through one is refused.
+untouched_summary(p: TProgram, dropping: Buf[Type], owning: Set[string] = set(), closed: bool = false) -> Untouched
     var u = untouched_none()
     val laundered = cast_sink()
     val quiet = quiet_callees(p, call_summary(p, owning))
+    val tables: Option[Buf[TVtable]] = if closed && p.entry_point then Some(p.vtables) else None
 
     for i in 0..<p.funcs.len()
         val f = p.funcs.at(i)
@@ -993,7 +1005,7 @@ untouched_summary(p: TProgram, dropping: Buf[Type], owning: Set[string] = set())
         val ending = exit_kinds(f.body)
         val gives = type_sink()
         val walk = TWalk(true, x -> touch_node(v, calls, exits, ending, roots, gives, laundered, dropping,
-                                               locals, x),
+                                               locals, tables, x),
                          w -> touch_write(v, calls, roots, gives, locals, w),
                          s -> if !touch_stmt(s) then v.refuse())
 
@@ -1037,7 +1049,6 @@ untouched_by(u: *Untouched, t: Type) -> Set[string]
     if known.is_some() then return known.unwrap()
 
     var parts: Buf[Type] = buf()
-
     by_value_parts(t, &parts)
 
     var alive: Buf[bool] = buf()
@@ -1079,7 +1090,6 @@ untouched_by(u: *Untouched, t: Type) -> Set[string]
                     alive.set(i, false)
                     out.remove(u.names.at(i))
                     moved = true
-
     u.answers.put(key, out)
     out
 end untouched_by
@@ -1167,7 +1177,7 @@ private touch_stmt(s: TStmt) -> bool = s match
 
 private touch_node(v: &Verdict, calls: &CallSink, exits: &CallSink, ending: &KindSink,
                    roots: &TypeSink, gives: &TypeSink, laundered: &CastSink, dropping: Buf[Type],
-                   locals: Set[string], x: TExpr)
+                   locals: Set[string], tables: Option[Buf[TVtable]], x: TExpr)
     note_laundered(laundered, x)
 
     if makes_dropping(x, dropping) then v.refuse()
@@ -1176,6 +1186,10 @@ private touch_node(v: &Verdict, calls: &CallSink, exits: &CallSink, ending: &Kin
         // A call on a path that ends the program is `quiet_callees`' question, which a call that never
         // returns and is handed nothing a caller could have lent passes whatever it does (`sealed_callees`).
         TCall(name, _, _, _) -> if ending.has(x.kind) then exits.add(name) else calls.add(name)
+
+        TVCall(recv, slot, _, _, _) -> tables match
+            Some(all) -> slot_callees(v, calls, all, recv, slot)
+            None -> v.refuse()
 
         TStore(place, _, _, _) -> touch_place(v, roots, gives, locals, place)
         TIncDec(place, _, _, _, _) -> touch_place(v, roots, gives, locals, place)
@@ -1189,6 +1203,11 @@ private touch_node(v: &Verdict, calls: &CallSink, exits: &CallSink, ending: &Kin
                 if cmp.dispatch.is_some() then calls.add(cmp.dispatch.unwrap().name)
 
         TSlots(op, _, elem, _) -> touch_slots(v, roots, gives, op, elem)
+
+        // **A `?` is a `return` on its failing edge** (`inert_stmt` lets a `return` by): the failure
+        // is handed back as the caller's error, through the conversion where one is named -- a call
+        // like any other.
+        TTry(_, _, _, _, _, _, convert) -> if convert.is_some() then calls.add(convert.unwrap())
 
         // A struct's invariant, checked after a write to it or where a value of it is made, is a call
         // of its `$inv` function on the fields; the write and the value are nodes of their own.
@@ -1208,6 +1227,24 @@ private touch_node(v: &Verdict, calls: &CallSink, exits: &CallSink, ending: &Kin
 
         _ -> if !inert_leaf(x) then v.refuse()
 end touch_node
+
+// A call through slot `slot` of a trait object, in a program that sees every table: a call to what
+// that slot holds in each table of the trait. A receiver whose trait cannot be named is refused.
+private slot_callees(v: &Verdict, calls: &CallSink, tables: Buf[TVtable], recv: TExpr, slot: int)
+    val name = erased_trait(texpr_type(recv)) match
+        Some(Trait(n, _, _)) -> n
+        _ -> ""
+
+    if name == "" || slot < 0
+        v.refuse()
+        return
+    end if
+
+    for vt in tables
+        if vt.trait_name == name
+            if usize(slot) < vt.slots.len() then calls.add(vt.slots.at(usize(slot)).target)
+            else v.refuse()
+end slot_callees
 
 // The slot forms (`slots.sysl`), which are how a growable container writes its storage: `slot_storage`
 // makes new storage and writes nothing; every other one writes a slot of storage of the element type,
@@ -1421,7 +1458,7 @@ reads_in_place(e: *Emit, f: TFunc, promoted: Buf[string]) -> Buf[string]
        f.conv.is_some() || !tail_calls_of(f).is_empty() || f.variant.is_some() then
         return out
 
-    val bound = rebound(f)
+    val bound = rebound_lending(e, f)
 
     if bound.has(OPAQUE) then return out
 
@@ -1546,8 +1583,13 @@ end owning
 // a place stops at a dereference.
 rebound(f: TFunc) -> Set[string]
     val out = name_sink()
-    val v = rebound_walk(out)
 
+    walk_whole(f, rebound_walk(out))
+    out.names
+end rebound
+
+// A body and the clauses around it, each walked as the body is.
+private walk_whole(f: TFunc, v: &TWalk)
     walk_block_stmts(f.body, v)
 
     for item in f.requires
@@ -1560,9 +1602,91 @@ rebound(f: TFunc) -> Set[string]
         walk_texpr(item, v)
 
     if f.variant.is_some() then walk_texpr(f.variant.unwrap(), v)
+end walk_whole
 
+// `rebound`, less every address of part of a large parameter that is handed straight to a call which
+// can do nothing with it (`lent_addresses`): `self.usb.irq()` in a `(self)` method, where `irq` takes
+// `*self` and only reads it.
+private rebound_lending(e: *Emit, f: TFunc) -> Set[string]
+    val lent = lent_addresses(e, f)
+    val out = name_sink()
+
+    walk_whole(f, TWalk(true, x -> if !lent.has(x.kind) then rebound_node(out, x), w -> add_root(out, w.place),
+                        s -> rebound_stmt(out, s)))
     out.names
-end rebound
+end rebound_lending
+
+// The `&` of part of a large parameter that leaves the body's storage as it was: an argument of a call
+// that can write no value of the parameter's type and give back no count one holds (`lends_in_place`),
+// and whose answer holds no address (`address_free`). Nothing can be done with the address after the
+// call either: a callee that keeps an address it is handed is refused where a parameter's is handed to
+// it (`keeps.sysl`), and the answer cannot carry it out.
+private lent_addresses(e: *Emit, f: TFunc) -> &KindSink
+    val sink: &KindSink = KindSink(buf())
+    var large: Map[string, Type] = map()
+
+    for param in f.params
+        if e.layout.indirect(param.1) then large.put(param.0, param.1)
+
+    if large.is_empty() then return sink
+
+    walk_whole(f, expr_walk(true, x -> lent_address(e, sink, large, x)))
+    sink
+end lent_addresses
+
+private lent_address(e: *Emit, sink: &KindSink, large: Map[string, Type], x: TExpr) = *x.kind match
+    TCall(name, args, ty, _) ->
+        if address_free(ty)
+            for a in args
+                *a.kind match
+                    TAddrOf(place, _) ->
+                        val root = name_sink()
+
+                        add_root(root, place)
+
+                        for n in root.names
+                            large.get(n) match
+                                Some(t) -> if lends_in_place(e, name, t) then sink.add(a.kind)
+                                None -> ()
+                    _ -> ()
+    _ -> ()
+
+// Whether a value of type `t` can hold no address a write could go through: nothing but numbers,
+// flags, characters, strings, read-only views and references to objects of their own, in any
+// arrangement of structs, enums and arrays.
+private address_free(t: Type) -> bool
+    var parts: Buf[Type] = buf()
+
+    by_value_parts(t, &parts)
+
+    for item in parts
+        val ok = item match
+            Integer(_, _, _) -> true
+            Floating(_, _) -> true
+            Fixed(_, _, _) -> true
+            Char -> true
+            Bool -> true
+            Unit -> true
+            Never -> true
+            Str -> true
+            Slice(_, read_only) -> read_only
+            Ref(inner, _) -> underlying(*inner) match
+                Trait(_, _, _) -> false
+                Abstract(_, _) -> false
+                Unknown -> false
+                _ -> true
+            Weak(_) -> true
+            Struct(_) -> true
+            Results(_) -> true
+            Enum(_) -> true
+            Array(_, _) -> true
+            Vector(_, _) -> true
+            _ -> false
+
+        if !ok then return false
+
+    true
+end address_free
 
 // The same over the body alone, which is what a postcondition repeated at a call site asks
 // (`contract_assume.sysl`): the clauses are what is being repeated, and they read the parameters
