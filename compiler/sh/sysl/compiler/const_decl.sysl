@@ -23,14 +23,16 @@ import sysl.container.{Map, map}
 // declaration its call is written in is a cycle** -- that declaration cannot be read without the value,
 // and the value cannot be had without reading it -- and it is refused naming both.
 
-// A call a declaration is read in terms of: where it was written, the terms it was written in, and the
-// declaration it stands in.
+// A call a declaration is read in terms of: where it was written, the terms it was written in, the
+// declaration it stands in, and whether it was admitted whole -- a variant, a comparison of two, a
+// conversion of one -- rather than as a call (`const_run`).
 struct DeclSite
     key: string
     scope: Scope
     subst: Buf[Binding]
     call: Expr
     owner: string
+    whole: bool
 end DeclSite
 
 // What the readings of one compilation settled about those calls, by where each was written: a value,
@@ -47,8 +49,9 @@ private const DeclReadings: usize = 16
 
 // The value a declaration needs of a call, before every declaration has been read: a settled answer,
 // the call run where it stands, or `None` while it waits -- counted as a refused fold, so the length
-// or argument it stands in says nothing of its own.
-declared_value(cx: &Analyzer, e: Expr) -> Option[Const]
+// or argument it stands in says nothing of its own. `whole` is `const_run`'s: an expression admitted
+// whole is run as one here too, so a declaration reads `u8(Op.C)` as a body does.
+declared_value(cx: &Analyzer, e: Expr, whole: bool) -> Option[Const]
     val ev = cx.an.evaluation
     val key = call_site_key(cx, e.span)
     val answer = ev.answers.values.get(key)
@@ -73,7 +76,7 @@ declared_value(cx: &Analyzer, e: Expr) -> Option[Const]
     // **Run where it stands only while nothing in this reading waits**: a waiting call's value stands
     // as unknown, and a run that read it would answer in terms of the stand-in.
     if ev.pending.is_empty()
-        val here = run_aside(cx.an, cx.scope, cx.subst, e, false)
+        val here = run_aside(cx.an, cx.scope, cx.subst, e, false, whole)
 
         if here.0.is_some()
             ev.done.put(key, here.0)
@@ -90,7 +93,7 @@ declared_value(cx: &Analyzer, e: Expr) -> Option[Const]
         if item.key == key then waiting = true
 
     if !waiting then
-        ev.pending.push(DeclSite(key, cx.scope, cx.subst, e, owner_of(ev.units, cx.scope, e.span)))
+        ev.pending.push(DeclSite(key, cx.scope, cx.subst, e, owner_of(ev.units, cx.scope, e.span), whole))
 
     cx.an.const_refusals += 1
     None
@@ -119,7 +122,7 @@ end settled_value
 // run made there outlives it, and everything it said taken back: what it came to, what it said where
 // it did not come to a value, and -- `watched` -- the declarations it reached.
 private run_aside(a: &Analysis, scope: Scope, subst: Buf[Binding], e: Expr,
-                  watched: bool) -> (Option[Const], string, Buf[string])
+                  watched: bool, whole: bool) -> (Option[Const], string, Buf[string])
     val kept = a.evaluation
     val fresh = const_evaluation()
 
@@ -135,7 +138,7 @@ private run_aside(a: &Analysis, scope: Scope, subst: Buf[Binding], e: Expr,
 
     val mark = a.complaints()
     val refusals = a.const_refusals
-    val out = const_call(cx, e)
+    val out = if whole then const_run(cx, e, true) else const_call(cx, e)
     var why = ""
 
     if out.is_none() && a.found.len() > mark then why = a.found.at(mark).diag.message
@@ -242,7 +245,7 @@ private settle_waiting(a: &Analysis) -> bool
     var stuck: Buf[(DeclSite, string)] = buf()
 
     for p in ev.pending
-        val run = run_aside(a, p.scope, p.subst, p.call, true)
+        val run = run_aside(a, p.scope, p.subst, p.call, true, p.whole)
         val reached = reached_decls(a, run.2)
         val own = if p.owner == "" then "" else qualified_name(p.owner)
 
