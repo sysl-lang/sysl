@@ -868,8 +868,9 @@ inline instead could leave its siblings waiting at a barrier for ever.
 **`barrier(n)` answers a `&sync Barrier` that holds each caller of `wait` until `n` have arrived**,
 then lets all of them go together, and can be met again at once. `wait` answers `true` to exactly one
 caller per phase — the leader, which is where work that only one thread should do between phases goes.
-It is a `Mutex` and a `Condvar` underneath, and it is shared the way any `&sync` object is, so a scoped
-thread captures it directly:
+An early arrival spins on the phase for about as long as sleeping and being woken would cost, then
+sleeps on it, so threads that arrive close together never make a system call and a long wait does
+not burn a core. It is shared the way any `&sync` object is, so a scoped thread captures it directly:
 
 ```sysl
 import sysl.sync.{Atomic, Relaxed}
