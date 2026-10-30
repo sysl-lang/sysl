@@ -64,7 +64,7 @@ without asking; everything below it is [imported](/reference/modules/) by name.
 | [`sysl.codec`](/library/codec/) | `derives Codec` on a struct or an enum, read and written by any format — the `Encode`/`Decode` traits, a format's `Encoder`/`Decoder`, `@rename`, `@default`, `@skip`, `@flatten`, `@tag`, and a `CodecError` naming the path and the byte | — |
 | [`sysl.crypto`](/library/crypto/) | the SHA-2 family, SHA-1 and HMAC over any of them — digests as bytes, a hasher that streams, and no allocator | — |
 | [`sysl.checksum`](/library/checksum/) | CRC-32 (the zip, PNG and Ethernet one) — `crc32` in one call, or `Crc32` fed in pieces; for accidental corruption, not security | — |
-| [`sysl.hint`](/library/hint/) | `black_box`, an identity the optimizer must treat as opaque, so a test or a benchmark keeps a value of any type from being folded or dropped | — |
+| [`sysl.hint`](/library/hint/) | `black_box`, an identity the optimizer must treat as opaque, so a test or a benchmark keeps a value of any type from being folded or dropped; `prefetch`, which asks for memory to be brought into the cache before it is read | — |
 | [`sysl.rand`](/library/rand/) | PCG32, seeded by the caller and reproducible — `below` without modulo bias, `range`, `unit`, `shuffle` | — |
 | [`sysl.posix.rand`](/library/rand/#taking-a-seed-from-the-host-sysl-posix-rand) | `seed_from_os` and `entropy_from_os`, kept apart so the generator stays freestanding | `posix` |
 | [`sysl.args`](/library/args/) | command-line options — `Scan`, `Cli`, and `args_of` for a raw `argv` | — |

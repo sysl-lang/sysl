@@ -1,0 +1,650 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_temp_dir, remove_dir_all, write_text}
+import sysl.process.{capture, Status}
+
+// **`sysl.hint.prefetch` is one `llvm.prefetch` call, with the two enums as its immediates**
+// (`prefetch.sysl`). The axes: each access and locality, every spelling of the arguments (default,
+// positional, bare and qualified variants, named, a generic's `const` parameter, a call settled while
+// compiling) and every refusal of one that is not a constant; every place an address comes from (a
+// `*T`, a slice element, a `Buf` element, a field, a module `var` array, a raw pointer past the end,
+// `@unchecked`, `null`); the contexts (a generic instantiated twice, a loop, `@no_alloc`, `@pure`,
+// `const`, a user function of the same name); the machines (the instruction in x86-64's and
+// AArch64's assembly, none on a Cortex-M0, and a build for every bare target); and the program's own
+// answer at both levels, with the past-the-end prefetch not trapping and a checked subscript past the
+// end still trapping.
+//
+// Skipped: `craft-freestanding`, whose out-of-tree back end is not on this machine -- LLVM's generic
+// legalizer drops the intrinsic there as it does on every target without one.
+
+private var hpf_library_cache: Buf[Program] = buf()
+private var hpf_library_read: bool = false
+
+private hpf_library() -> Buf[Program]
+    if hpf_library_read then return hpf_library_cache
+
+    hpf_library_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> hpf_library_cache = units
+
+    hpf_library_cache
+end hpf_library
+
+private hpf_no_library() -> bool
+    if hpf_library().is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return true
+
+    false
+end hpf_no_library
+
+// The LLVM text a source lowers to for `target`, or the first thing it was refused with.
+private hpf_ir_for(text: string, target: Target, library: Buf[Program]) -> string
+    val parsed = parse(source_of("t.sysl", text))
+
+    if !parsed.ok() then return parsed.first().message
+
+    var units: Buf[Program] = buf()
+
+    for item in library
+        units.push(item)
+
+    units.push(parsed.program)
+
+    val done = analyze_bodies(units, target)
+
+    if !done.reported.is_empty() then return done.reported.at(0).diag.message
+
+    val whole = program_of(done, "")
+    val promotions = post_analysis_checks(done.an, whole, buf())
+    val said = errors_of(done.an.diagnostics())
+
+    if !said.is_empty() then return analysis_report(said)
+
+    val kept = prune(strip_tests(whole), program_own(units))
+
+    ir_print_module(codegen_with_gaps(kept, target, promotions).0)
+end hpf_ir_for
+
+private hpf_ir(text: string) -> string = hpf_ir_for(text, host_target(), hpf_library())
+
+// How many lines of `text` hold `what`.
+private hpf_count(text: string, what: string) -> int
+    var n = 0
+
+    for l in lines_of(text)
+        if l.contains(what) then n += 1
+
+    n
+end hpf_count
+
+// The call each access and locality lowers to.
+private hpf_call(rw: int, locality: int) -> string = s", i32 $rw, i32 $locality, i32 1)"
+
+private val hpf_intrinsic = "call void @llvm.prefetch.p0(ptr "
+
+// -- the IR ---------------------------------------------------------------------------------------------
+
+@test("each access and each locality is its own pair of immediates, and the data cache")
+hpf_every_combination()
+    if hpf_no_library() then return
+
+    val ir = hpf_ir(raw"""
+        module demo
+
+        import sysl.hint.{prefetch, Access, Locality}
+
+        @export("main")
+        probe(p: *u32)
+            prefetch(p, Read, None)
+            prefetch(p, Read, Low)
+            prefetch(p, Read, Medium)
+            prefetch(p, Read, High)
+            prefetch(p, Write, None)
+            prefetch(p, Write, Low)
+            prefetch(p, Write, Medium)
+            prefetch(p, Write, High)
+        """)
+
+    assert_eq(hpf_count(ir, hpf_intrinsic), 8)
+    assert_eq(hpf_count(ir, "declare void @llvm.prefetch.p0(ptr, i32, i32, i32)"), 1)
+
+    for rw in 0..<2
+        for locality in 0..<4
+            assert_eq(hpf_count(ir, hpf_call(rw, locality)), 1)
+end hpf_every_combination
+
+@test("every spelling of the arguments: default, positional, qualified, named, a const parameter, a call settled while compiling")
+hpf_spellings()
+    if hpf_no_library() then return
+
+    val ir = hpf_ir(raw"""
+        module demo
+
+        import sysl.hint
+        import sysl.hint.{prefetch, Access, Locality}
+
+        settled() -> Access = Access.Write
+
+        chosen[const A: Access, const L: Locality](p: *u32) = prefetch(p, A, L)
+
+        @export("main")
+        probe(p: *u32)
+            prefetch(p)
+            prefetch(p, Access.Write)
+            prefetch(p, locality = Locality.Low)
+            prefetch(p, locality = Medium, access = Write)
+            prefetch(p, settled(), None)
+            hint.prefetch(p, Write, Low)
+            sysl.hint.prefetch(p, Read, Medium)
+            chosen[Write, None](p)
+            chosen[Read, Low](p)
+        """)
+
+    assert_eq(hpf_count(ir, hpf_intrinsic), 9)
+    assert_eq(hpf_count(ir, hpf_call(0, 3)), 1)
+    assert_eq(hpf_count(ir, hpf_call(1, 3)), 1)
+    assert_eq(hpf_count(ir, hpf_call(0, 1)), 2)
+    assert_eq(hpf_count(ir, hpf_call(1, 2)), 1)
+    assert_eq(hpf_count(ir, hpf_call(1, 0)), 2)
+    assert_eq(hpf_count(ir, hpf_call(1, 1)), 1)
+    assert_eq(hpf_count(ir, hpf_call(0, 2)), 1)
+
+    // The library's body is never called: every call is the intrinsic.
+    assert_eq(hpf_count(ir, "@sysl.hint$prefetch"), 0)
+end hpf_spellings
+
+@test("every place an address comes from, in a generic instantiated twice and in a loop")
+hpf_addresses()
+    if hpf_no_library() then return
+
+    val ir = hpf_ir(raw"""
+        module demo
+
+        import sysl.buf.{Buf, buf}
+        import sysl.hint.{prefetch, Access, Locality}
+
+        struct Pair
+            a: u32
+            b: u64
+
+        var table: [8]u32 = [1, 2, 3, 4, 5, 6, 7, 8]
+
+        warm[T](xs: []T, i: usize) = prefetch(&xs[i], Write, Low)
+
+        ahead(xs: []u32) -> u32
+            var sum: u32 = 0
+            val base = &xs[0]
+
+            for i in 0..<xs.len
+                prefetch(&base[i + 64], Read, None)
+                sum += xs[i]
+
+            sum
+
+        @export("main")
+        probe(p: *u32, n: usize) -> u32
+            val v = p[0..<n]
+            var b: Buf[u64] = buf()
+            var pair = Pair(1, 2)
+
+            b.push(5)
+            prefetch(&v[1])
+            prefetch(&b[0])
+            prefetch(&pair.b)
+            prefetch(&table[3])
+            warm(v, 0)
+            warm(b.view(), 0)
+            ahead(v)
+        """)
+
+    assert(!ir.contains("error"), ir)
+    assert_eq(hpf_count(ir, hpf_intrinsic), 7)
+    assert_eq(hpf_count(ir, hpf_call(0, 3)), 4)
+    assert_eq(hpf_count(ir, hpf_call(1, 1)), 2)
+    assert_eq(hpf_count(ir, hpf_call(0, 0)), 1)
+end hpf_addresses
+
+@test("an address past the end is a plain getelementptr, never inbounds, so it is defined as well as harmless")
+hpf_past_the_end_ir()
+    if hpf_no_library() then return
+
+    val ir = hpf_ir(raw"""
+        module demo
+
+        import sysl.hint.prefetch
+
+        @export("main")
+        probe(base: *u32, i: usize) = prefetch(&base[i + 64])
+        """)
+
+    assert_eq(hpf_count(ir, hpf_intrinsic), 1)
+    assert_eq(hpf_count(ir, "getelementptr inbounds i32"), 0)
+    assert_eq(hpf_count(ir, "getelementptr i32"), 1)
+end hpf_past_the_end_ir
+
+@test("@no_alloc and @pure functions may prefetch: it allocates nothing and changes nothing a program sees")
+hpf_promises()
+    if hpf_no_library() then return
+
+    val ir = hpf_ir(raw"""
+        module demo
+
+        import sysl.hint.prefetch
+
+        @no_alloc
+        alloc_free(xs: []u32) -> u32
+            prefetch(&xs[0])
+            xs[0]
+
+        @pure
+        pure_sum(xs: []u32) -> u32
+            var sum: u32 = 0
+
+            for i in 0..<xs.len
+                prefetch(&xs[i])
+                sum += xs[i]
+
+            sum
+
+        @export("main")
+        probe(p: *u32, n: usize) -> u32 = alloc_free(p[0..<n]) + pure_sum(p[0..<n])
+        """)
+
+    assert(!ir.contains("error"), ir)
+    assert_eq(hpf_count(ir, hpf_intrinsic), 2)
+end hpf_promises
+
+@test("a function of the program's own named prefetch is called, not the hint")
+hpf_own_name_wins()
+    if hpf_no_library() then return
+
+    val ir = hpf_ir(raw"""
+        module demo
+
+        import sysl.hint.Access
+
+        prefetch(p: *u32, a: Access) -> u32 = 7
+
+        @export("main")
+        probe(p: *u32) -> u32 = prefetch(p, Access.Write)
+        """)
+
+    assert_eq(hpf_count(ir, hpf_intrinsic), 0)
+    assert_eq(hpf_count(ir, "@demo$prefetch"), 2)
+end hpf_own_name_wins
+
+// -- the refusals ---------------------------------------------------------------------------------------
+
+private val hpf_access_said: string =
+    "'prefetch' takes its 'access' as a constant — it chooses the instruction, so it is settled while " +
+    "compiling: write a variant (Read, Write), a module 'val' holding one, or a generic's 'const' parameter"
+
+private val hpf_locality_said: string =
+    "'prefetch' takes its 'locality' as a constant — it chooses the instruction, so it is settled while " +
+    "compiling: write a variant (None, Low, Medium, High), a module 'val' holding one, or a generic's " +
+    "'const' parameter"
+
+@test("an access read from a parameter is refused, at the argument")
+hpf_refuses_parameter_access()
+    if hpf_no_library() then return
+
+    val said = hpf_ir(raw"""
+        module demo
+
+        import sysl.hint.{prefetch, Access}
+
+        @export("main")
+        probe(p: *u32, a: Access) = prefetch(p, a)
+        """)
+
+    assert_eq(said, hpf_access_said)
+
+@test("a locality named from a parameter is refused, at the argument")
+hpf_refuses_parameter_locality()
+    if hpf_no_library() then return
+
+    val said = hpf_ir(raw"""
+        module demo
+
+        import sysl.hint.{prefetch, Locality}
+
+        @export("main")
+        probe(p: *u32, l: Locality) = prefetch(p, locality = l)
+        """)
+
+    assert_eq(said, hpf_locality_said)
+
+@test("a module val holding a variant is a constant, and a module var is not")
+hpf_module_storage()
+    if hpf_no_library() then return
+
+    val ir = hpf_ir(raw"""
+        module demo
+
+        import sysl.hint.{prefetch, Access}
+
+        val how = Access.Write
+
+        @export("main")
+        probe(p: *u32) = prefetch(p, how)
+        """)
+
+    assert_eq(hpf_count(ir, hpf_call(1, 3)), 1)
+
+    val said = hpf_ir(raw"""
+        module demo
+
+        import sysl.hint.{prefetch, Access}
+
+        var how = Access.Write
+
+        @export("main")
+        probe(p: *u32) = prefetch(p, how)
+        """)
+
+    assert_eq(said, hpf_access_said)
+end hpf_module_storage
+
+@test("an access held in a local is refused: it is read when the program runs")
+hpf_refuses_local()
+    if hpf_no_library() then return
+
+    val local_said = hpf_ir(raw"""
+        module demo
+
+        import sysl.hint.{prefetch, Locality}
+
+        @export("main")
+        probe(p: *u32, far: bool)
+            var l = Locality.High
+
+            if far then l = Locality.None
+
+            prefetch(p, locality = l)
+        """)
+
+    assert_eq(local_said, hpf_locality_said)
+end hpf_refuses_local
+
+@test("a const function may not prefetch, since it runs while compiling")
+hpf_refused_while_compiling()
+    if hpf_no_library() then return
+
+    val said = hpf_ir(raw"""
+        module demo
+
+        import sysl.hint.prefetch
+
+        const warmed(n: int) -> int
+            var x = n
+            prefetch(&x)
+            x
+
+        @export("main")
+        probe() -> int = warmed(3)
+        """)
+
+    assert(said.contains("'demo.warmed' is 'const', so it runs while compiling, and it runs 'prefetch' — " +
+                         "the processor it asks exists only when the program runs"), said)
+end hpf_refused_while_compiling
+
+@test("a value that is not a raw pointer is refused, as any '*T' parameter refuses one")
+hpf_refuses_non_pointer()
+    if hpf_no_library() then return
+
+    val said = hpf_ir(raw"""
+        module demo
+
+        import sysl.hint.prefetch
+
+        @export("main")
+        probe(x: u32) = prefetch(x)
+        """)
+
+    assert(said.contains("cannot infer the type argument 'T' of 'sysl.hint.prefetch'"), said)
+end hpf_refuses_non_pointer
+
+// -- the machines ---------------------------------------------------------------------------------------
+
+private val hpf_machine_text: string = raw"""
+    module demo
+
+    import sysl.hint.{prefetch, Access, Locality}
+
+    @export("hpf_read_high")
+    read_high(p: *u32) = prefetch(p)
+
+    @export("hpf_write_high")
+    write_high(p: *u32) = prefetch(p, Write)
+
+    @export("hpf_read_none")
+    read_none(p: *u32) = prefetch(p, Read, None)
+    """
+
+// The assembly clang makes of the IR for `name`, or `None` where no clang here has its back end.
+private hpf_assembly(name: string) -> Option[string]
+    val t = target_named(name).unwrap()
+    val root = std_root()
+
+    if root.is_err() then return None
+
+    val library = std_units(root.unwrap(), t) match
+        Ok(units) -> units
+        Err(_) -> return None
+
+    val clang = find_backend_clang(t) match
+        Ok(p) -> p
+        Err(_) ->
+            print(s"skipped: no clang here has the back end for $name")
+            return None
+
+    val dir = make_temp_dir("sysl-hpf").unwrap()
+    val file = s"$dir/t.ll"
+
+    write_text(file, for_clang(hpf_ir_for(hpf_machine_text, t, library), t)).unwrap()
+
+    var args: Buf[string] = buf()
+
+    args.push("-target")
+    args.push(t.triple)
+
+    for f in machine_flags(t)
+        args.push(f)
+
+    for a in ["-O1", "-S", "-x", "ir", file, "-o", "-"]
+        args.push(a)
+
+    val got = capture(clang, args.view(), "", [], true).unwrap()
+
+    remove_dir_all(dir).unwrap_or(())
+    assert(got.status.ok(), s"$name: clang refused the emitted IR:\n${got.err.unwrap_or("")}")
+    Some(got.text)
+end hpf_assembly
+
+@test("AArch64 prefetches with prfm: pldl1keep, pstl1keep, pldl1strm")
+hpf_aarch64_prfm()
+    for name in ["aarch64-linux", "aarch64-macos"]
+        hpf_assembly(name) match
+            None -> ()
+            Some(s) ->
+                assert(s.contains("prfm\tpldl1keep"), s)
+                assert(s.contains("prfm\tpstl1keep"), s)
+                assert(s.contains("prfm\tpldl1strm"), s)
+end hpf_aarch64_prfm
+
+@test("x86-64 prefetches with prefetcht0 and prefetchnta")
+hpf_x86_64_prefetch()
+    hpf_assembly("x86_64-linux") match
+        None -> ()
+        Some(s) ->
+            assert(s.contains("prefetcht0"), s)
+            assert(s.contains("prefetchnta"), s)
+end hpf_x86_64_prefetch
+
+@test("a Cortex-M0 has no prefetch instruction, so it is nothing; a Cortex-M4 has pld")
+hpf_thumb()
+    hpf_assembly("thumbv6m-freestanding") match
+        None -> ()
+        Some(s) ->
+            assert(s.contains("hpf_read_high"), s)
+            assert(!s.contains("pld"), s)
+
+    hpf_assembly("thumbv7em-freestanding") match
+        None -> ()
+        Some(s) -> assert(s.contains("pld"), s)
+end hpf_thumb
+
+private hpf_ready() -> bool = std_root().is_ok() && clang_available()
+
+private hpf_build_c(text: string, target: string) -> (int, string)
+    val root = make_temp_dir("sysl-hpf-c").unwrap()
+
+    write_text(s"$root/sysl.hocon","package {\n  name = \"probe\"\n}\n").unwrap()
+    write_text(s"$root/main.sysl", forms_imported(text)).unwrap()
+
+    var said: Buf[string] = buf()
+    val sink = &said
+    var args: [7]string = ["sysl", "build-c", "--target", target, "-o", s"$root/probe.a", root]
+    val code = run_cli(args[..], piece -> sink.push(piece))
+
+    reset_search_paths()
+    remove_dir_all(root).unwrap_or(())
+
+    var text_out = ""
+
+    for piece in said
+        text_out = text_out + piece
+
+    (code, text_out)
+end hpf_build_c
+
+private val hpf_bare: string = raw"""
+    import sysl.hint.{prefetch, Access, Locality}
+
+    var table: [16]u32 = [0; 16]
+
+    warm[T](xs: []T) = prefetch(&xs[0], Write, Low)
+
+    @no_alloc
+    @export("main")
+    probe() -> u32
+        var sum: u32 = 0
+        val base = &table[0]
+
+        for i in 0..<table.len
+            prefetch(&base[i + 16], Read, None)
+            sum += table[i]
+
+        warm(table[..])
+        prefetch(&table[1])
+        sum
+    """
+
+@test("it builds with no C library for Thumb, the M0, RV32 and wasm32")
+hpf_builds_bare()
+    if !hpf_ready() then return
+
+    for target in ["thumb-freestanding", "thumb-freestanding-softfp", "thumbv6m-freestanding",
+                   "riscv32-freestanding", "wasm32-freestanding"]
+        val (code, said) = hpf_build_c(hpf_bare, target)
+
+        assert(!said.contains("error"), s"$target: $said")
+        assert_eq(code, 0)
+    end for
+end hpf_builds_bare
+
+// -- the program's own answer ---------------------------------------------------------------------------
+
+private hpf_run(text: string, level: string) -> (Status, string, string)
+    val root = make_temp_dir("sysl-hpf-run").unwrap()
+
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, level, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (Status.Exited(-1), "", failure_text(why))
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> (Status.Exited(-1), "", "the program that was built could not be run")
+        Ok(out) -> (out.status, out.text, out.err.unwrap_or(""))
+end hpf_run
+
+private val hpf_program: string = raw"""
+    import sysl.buf.{Buf, buf}
+    import sysl.hint.{prefetch, Access, Locality}
+
+    ahead(xs: []int) -> int
+        var sum = 0
+        val base = &xs[0]
+
+        for i in 0..<xs.len
+            prefetch(&base[i + 1000000], Read, None)
+            sum += xs[i]
+
+        sum
+
+    twice(xs: []int) -> int
+        var sum = 0
+
+        @unchecked
+            for i in 0..<xs.len
+                prefetch(&xs[i + 4096], Write)
+                sum += 2 * xs[i]
+
+        sum
+
+    var xs = [1, 2, 3, 4, 5]
+    var b: Buf[int] = buf()
+    val nothing: *u8 = null
+
+    b.push(10)
+    prefetch(nothing)
+    prefetch(&b[0], Write, Medium)
+    print(ahead(xs[..]), twice(xs[..]), b[0])
+    """
+
+@test("the program answers what it would without the hints, at both levels, past the end and through null")
+hpf_runs()
+    if !hpf_ready() then return
+
+    for level in ["0", DefaultOptimization]
+        val (state, out, err) = hpf_run(hpf_program, level)
+
+        assert_eq(err, "")
+        assert_eq(out, "15 30 10\n")
+        assert(state.ok(), s"level $level")
+end hpf_runs
+
+@test("a checked subscript past the end still traps in debug: the hint changes no rule about '&xs[i]'")
+hpf_checked_subscript_traps()
+    if !hpf_ready() then return
+
+    val (state, out, err) = hpf_run(raw"""
+        import sysl.hint.prefetch
+
+        var xs = [1, 2, 3]
+
+        prefetch(&xs[3])
+        print("unreached")
+        """, "0")
+
+    assert(!state.ok())
+    assert_eq(out, "")
+    assert(err.contains("index 3 out of bounds for length 3"), err)
+end hpf_checked_subscript_traps

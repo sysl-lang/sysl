@@ -2288,6 +2288,8 @@ private gen_sysop(e: *Emit, op: string, name: string, args: Buf[TExpr]) -> Val
     val wide = LInt(64)
     val meta = LNamed("metadata")
 
+    if op == "prefetch" then return gen_prefetch(e, name, args.at(0))
+
     if op == "read_sysreg"
         var params: Buf[IrParam] = buf()
 
@@ -2333,6 +2335,30 @@ private gen_sysop(e: *Emit, op: string, name: string, args: Buf[TExpr]) -> Val
     emit(e, ir_call(None, LVoid, VGlobal(symbol), ops))
     VNothing
 end gen_sysop
+
+// `sysl.hint.prefetch` (`prefetch.sysl`): the address, then the two numbers the analyzer settled --
+// `codes` is read-or-write and locality, one digit each -- and `1`, the data cache. All three are
+// immediates, which is why they were constants before they got here.
+private gen_prefetch(e: *Emit, codes: string, address: TExpr) -> Val
+    val p = gen_expr(e, address)
+    val symbol = llvm_prefetch_entry().at([LPtr])
+    var params: Buf[IrParam] = buf()
+
+    params.push(ir_param(LPtr))
+
+    for _ in 0..<3 do params.push(ir_param(LInt(32)))
+
+    request_intrinsic(e, ir_sig(symbol, ir_fn_type(LVoid, params)))
+
+    var ops: Buf[IrArg] = buf()
+
+    ops.push(ir_arg(LPtr, p))
+    ops.push(ir_arg(LInt(32), VInt(from_int(long(codes.bytes[0] - u8('0'))))))
+    ops.push(ir_arg(LInt(32), VInt(from_int(long(codes.bytes[1] - u8('0'))))))
+    ops.push(ir_arg(LInt(32), VInt(from_int(1))))
+    emit(e, ir_call(None, LVoid, VGlobal(symbol), ops))
+    VNothing
+end gen_prefetch
 
 // A maintenance instruction -- `tlbi`, `dc`, `ic`, `at` -- as one block of inline assembly, LLVM having
 // no intrinsic for most of them. The block is `sideeffect` and clobbers memory, so it is neither moved

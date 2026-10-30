@@ -1,6 +1,6 @@
 ---
 title: The hint module
-summary: "`sysl.hint` — `black_box`, an identity the optimizer must treat as opaque, for a value of any type and on every machine."
+summary: "`sysl.hint` — `black_box`, an identity the optimizer must treat as opaque, and `prefetch`, a request to bring memory into the cache before it is read."
 weight: 62
 ---
 
@@ -94,3 +94,131 @@ const folded() -> int = black_box(3)
 ```error
 'folded' is 'const', so it runs while compiling, and it calls 'sysl.hint.black_box', which holds an 'asm' block
 ```
+
+## `prefetch`
+
+```sysl
+enum Access
+    Read
+    Write
+
+enum Locality
+    None
+    Low
+    Medium
+    High
+
+prefetch[T](p: *T, access: Access = Read, locality: Locality = High)
+```
+
+`prefetch(p)` asks the machine to start bringing the memory at `p` into its cache, so that a read of
+it a little later does not wait for memory. A loop over data too large for the cache prefetches a
+fixed distance ahead of the element it is working on:
+
+```sysl
+import sysl.hint.{prefetch, Access, Locality}
+
+sum_ahead(xs: []int) -> int
+    var sum = 0
+    val base = &xs[0]
+
+    for i in 0..<xs.len
+        prefetch(&base[i + 16])
+        sum += xs[i]
+
+    sum
+
+scale(xs: []int, k: int)
+    for i in 0..<xs.len
+        prefetch(&xs[i], Write, Low)
+        xs[i] *= k
+
+var xs = [1, 2, 3, 4, 5, 6]
+
+scale(xs, 10)
+print(sum_ahead(xs))
+```
+
+```output
+210
+```
+
+**It reads nothing and changes nothing**, so what the program computes is the same with or without
+it. Each call is one instruction and no call: `prfm pldl1keep` on AArch64, `prefetcht0` on x86-64,
+`pld` on an Armv7-M or Armv8-M core. A processor that has no prefetch instruction (a Cortex-M0, a
+RISC-V core without Zicbop, wasm32) compiles it to nothing, so a program that prefetches builds for
+every target, and a function marked
+[`@no_alloc`](/reference/attributes/#no-alloc-on-a-function-one-entry-point-that-makes-no-heap-storage)
+or `@pure` may call it.
+
+**`access` says what the line is wanted for**: `Read`, or `Write`, which on a machine that has one
+asks for the line in a state it may be written in. **`locality` says how long it is wanted**: `High`,
+the default, keeps it in every level of the cache; `Medium` and `Low` keep it further out; `None` is
+for data read once, which should not push anything else out. They are the four levels LLVM's
+`llvm.prefetch` takes, in the same order.
+
+### It takes a raw pointer, and never faults
+
+The address is any `*T`: `&x` of a local or a module `var`, `&xs[i]` of an array, a slice or a `Buf`
+element, `&s.field`, or a pointer a C function handed back. **A prefetch never faults**, whatever the
+address holds: one past the end of a buffer, one nothing is mapped at, or `null`, is prefetched as
+harmlessly as any other, because the machine's prefetch instructions are defined to ignore an address
+they cannot reach.
+
+**Reaching past the end is written through a raw pointer**, and that is the ordinary case: the loop
+above prefetches sixteen elements ahead, which runs off the end for its last sixteen. `&xs[i]` keeps
+its bounds check here as everywhere, since it is the same expression a store goes through; `&base[i]`
+on a `*T` is C's unchecked address, as it always is
+([memory.md](/reference/memory/#arithmetic-two-directions-one-spelling-each)), and an
+[`@unchecked`](/reference/arrays/#unchecked-access) block leaves the check out of `&xs[i]` too.
+Neither address is ever read, so neither can trap or fault. A checked subscript past the end traps
+before there is an address to prefetch:
+
+```sysl
+import sysl.hint.prefetch
+
+var xs = [1, 2, 3]
+
+prefetch(&xs[3])
+print("unreached")
+```
+
+```output trap
+```
+
+### The two choices are constants
+
+`access` and `locality` choose the instruction, so they are settled while compiling: a variant written
+at the call, a module `val` holding one, or a generic's `const` parameter. A value read while the
+program runs — a parameter, a local — is refused at the argument:
+
+```sysl
+import sysl.hint.{prefetch, Access}
+
+warm(p: *int, how: Access) = prefetch(p, how)
+```
+
+```error
+'prefetch' takes its 'access' as a constant — it chooses the instruction, so it is settled while compiling: write a variant (Read, Write), a module 'val' holding one, or a generic's 'const' parameter
+```
+
+A function that passes the choice on takes it as a `const` parameter, so each instantiation is a
+constant:
+
+```sysl
+import sysl.hint.{prefetch, Access, Locality}
+
+warm[const A: Access, const L: Locality](p: *int) = prefetch(p, A, L)
+
+var n = 7
+
+warm[Write, None](&n)
+print(n)
+```
+
+```output
+7
+```
+
+**It cannot run while compiling**, for the same reason `black_box` cannot: a `const` function that
+prefetches is refused, since the processor it asks exists only when the program runs.

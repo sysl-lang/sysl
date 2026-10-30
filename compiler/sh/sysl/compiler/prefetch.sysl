@@ -1,0 +1,63 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+
+// **`sysl.hint.prefetch(p, access, locality)` is answered by the compiler, as LLVM's `llvm.prefetch`.**
+//
+// The library declares it as an ordinary generic function, so a call is read the way every call is:
+// `p` is any `*T`, the two enums take their defaults and may be named, and the instantiation is
+// checked against its signature. What the declaration cannot say is that the intrinsic takes its
+// read-or-write flag and its locality as immediates -- they choose the instruction, `prfm pldl1keep`
+// or `prefetchw` -- so a call whose `access` or `locality` is anything but a constant has no
+// instruction to become. That is refused here, at the argument, and a call that passes is replaced by
+// the `prefetch` system operation, which `gen_sysop` lowers to one intrinsic call and no call of the
+// library's body.
+//
+// **It is never a fault and never a trap.** The address is not read: a prefetch past the end of a
+// buffer, or of nothing mapped at all, does nothing, so `p` is taken as it comes and is checked
+// against nothing. A processor without a prefetch instruction (a Cortex-M0, a RISC-V core without
+// Zicbop, wasm32) has its back end drop the intrinsic.
+
+// Whether a declaration's key is the one function this form replaces.
+is_prefetch_key(key: string) -> bool = key == module_qualify("sysl.hint", "prefetch")
+
+// A call already read against the declaration, as the operation it lowers to -- or the refusal of an
+// argument that is not a constant.
+prefetch_form(cx: &Analyzer, call: TExpr) -> TExpr
+    val (args, ok) = *call.kind match
+        TCall(_, xs, _, _) -> (xs, xs.len() == 3)
+        _ -> (buf(), false)
+
+    // A call the reading refused is already reported; it is left as it came.
+    if !ok then return call
+
+    val rw = prefetch_constant(cx, args.at(1), "access", "Read, Write")
+    val locality = prefetch_constant(cx, args.at(2), "locality", "None, Low, Medium, High")
+
+    if rw.is_none() || locality.is_none() then return bad_expr(call.span)
+
+    var p: Buf[TExpr] = buf()
+
+    p.push(args.at(0))
+    TExpr(call.span, TSysOp("prefetch", s"${rw.unwrap()}${locality.unwrap()}", p))
+end prefetch_form
+
+// The variant an argument comes to while compiling, as its position in the enum -- which is the
+// intrinsic's own number for it: `Read` 0 and `Write` 1, `None` 0 to `High` 3.
+private prefetch_constant(cx: &Analyzer, arg: TExpr, name: string, variants: string) -> Option[int]
+    val got = const_argument(cx, s"'$name'", arg) match
+        Some(ConstRecord(v, _)) -> Some(v)
+        Some(ConstInt(n)) -> n.to_long() match
+            Some(k) -> Some(int(k))
+            None -> None
+        _ -> None
+
+    if got.is_none()
+        cx.err(arg.span, s"'prefetch' takes its '$name' as a constant — it chooses the instruction, " +
+               s"so it is settled while compiling: write a variant ($variants), a module 'val' holding one, " +
+               "or a generic's 'const' parameter")
+    end if
+
+    got
+end prefetch_constant
