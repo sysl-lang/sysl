@@ -2220,6 +2220,27 @@ Nothing is written for either: the compiler works it out from the bodies, as it 
 pointer a function is handed. **A `val` is copied either way**, since nothing can tell a copy of it
 from the variable, and so are a pattern's binding and a by-name parameter.
 
+**The copy of a `val` is read-only exactly as the `val` is**: the closure may read it, index it and
+view it as a `[]const T`, but a write to it, a `*self` method called on it, or a `[]T` view of an
+array it holds is refused, since every such write would reach only the closure's copy.
+
+```sysl
+fill(xs: []real) = xs[0] = 9.0
+
+first() -> real
+    val a = [1.0, 2.0, 3.0]
+    val f = () -> fill(a)
+
+    f()
+    a[0]
+
+print(first())
+```
+
+```error
+a '[]const real' views elements it may not write, and a '[]real' is a licence to write them — so the one does not become the other. Copy what you need into a '[]real' of your own, or take the parameter as '[]const real' if it is only read
+```
+
 ### A `val` may hold a closure that writes only through to its variables
 
 Calling a closure that writes a capture it holds by value writes into the closure itself. That is why

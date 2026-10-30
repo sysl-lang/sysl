@@ -65,7 +65,7 @@ around to remember it.
 ## `Float`
 
 ```sysl
-trait Float: Zero + One + Eq + Ord + Neg + Add + Sub + Mul + Div
+trait Float: Zero + One + Eq + Ord + Neg + Add + Sub + Mul + Div + Display + Debug
 
     // The type's own values, asked without a receiver. The two identities are *required* rather
     // than declared: `Zero` and `One` are core traits, and a required trait's members are reached
@@ -431,6 +431,11 @@ and `one` are the core traits [`Zero` and `One`](/reference/traits/), which `Flo
 live in the standard module beside the operators whose identities they are, so nothing imports them,
 and a body bounded by `[T: Add + Zero]` reaches `T.zero()` for a `real`, an `f32` and a
 [`Complex`](/library/complex/) alike without asking for the rest of `Float`.
+
+**`Float` also requires `Display` and `Debug`**, so a body bounded by `[T: Float]` can interpolate
+its value (`s"${x}"`) and debug-print it (`f"${x}%?"`, `x.debug_string()`) without adding
+`+ Display` to the bound. Every width implements both, so an `impl Float` for a type of a program's
+own now has to implement `Display` too (`Debug` every type has already).
 
 **The integers are among them too, and no block below says so.** An `impl` can only name types that
 exist and the `iN`/`uN` families are open — a program may write `u256` — so no list of blocks covers

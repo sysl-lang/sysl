@@ -1,0 +1,177 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_temp_dir, remove_dir_all, write_text, is_file}
+import sysl.process.capture
+import sysl.testing.skip
+import sysl.text.{split, join}
+
+// A `build-c` archive is one object, because the whole program is compiled together, but every
+// function and data item in it is in a section of its own (an atom, on Mach-O). A C project that
+// links it with the linker's dead-strip flag therefore drops the functions its program never calls,
+// together with the undefined references that only those functions made. The case that matters is a
+// binding: the archive's sysl calls a library in one function, and a C program that never reaches
+// that function must not need the library.
+
+private val bds_objdump: string = "/opt/homebrew/opt/llvm/bin/llvm-objdump"
+
+// `used` calls the foreign function, `plain` does not.
+private bds_program() -> string =
+    "@link(\"bds\")\n\n" +
+    "extern \"bds_double\" bds_double(x: int) -> int\n\n" +
+    "@export(\"bds_used\")\nbds_used(x: int) -> int = bds_double(x) + 1\n\n" +
+    "@export(\"bds_plain\")\nbds_plain(x: int) -> int = x + 2\n"
+
+private val bds_lib_c: string = "int bds_double(int x) { return x * 2; }\n"
+
+private val bds_main_plain: string =
+    "int bds_plain(int);\nint main(void) { return bds_plain(40) == 42 ? 0 : 1; }\n"
+
+private val bds_main_used: string =
+    "int bds_used(int);\nint main(void) { return bds_used(20) == 41 ? 0 : 1; }\n"
+
+private bds_project(text: string) -> string
+    val root = make_temp_dir("sysl-bds").unwrap()
+
+    write_text(s"$root/package.hocon", "package {\n  name = \"probe\"\n}\n").unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+    root
+end bds_project
+
+// Runs `sysl build-c` and answers its exit status and everything it said.
+private bds_build(root: string, extra: []string, archive: string) -> (int, string)
+    var said: Buf[string] = buf()
+    val sink = &said
+    var args: Buf[string] = buf()
+
+    for item in ["sysl", "build-c"]
+        args.push(item)
+
+    for item in extra
+        args.push(item)
+
+    for item in ["-o", archive, root]
+        args.push(item)
+
+    val code = run_cli(args.view(), piece -> sink.push(piece))
+
+    reset_search_paths()
+    (code, join(said.view(), "\n"))
+end bds_build
+
+private bds_ok(cc: string, args: []string) -> bool = capture(cc, args, "", [], true) match
+    Ok(o) -> o.status.ok()
+    Err(_) -> false
+
+// The host's archive, the C library it binds, and a directory to link in.
+private bds_host() -> Option[string]
+    if !std_root().is_ok() || !clang_available() then return None
+
+    val root = bds_project(bds_program())
+    val built = bds_build(root, [], s"$root/probe.a")
+
+    if built.0 != 0
+        assert(false, built.1)
+        return None
+
+    write_text(s"$root/bds.c", bds_lib_c).unwrap()
+    write_text(s"$root/plain.c", bds_main_plain).unwrap()
+    write_text(s"$root/used.c", bds_main_used).unwrap()
+    assert(bds_ok("clang", ["-c", s"$root/bds.c", "-o", s"$root/bds.o"]), "cannot compile the C library")
+    assert(bds_ok("ar", ["rcs", s"$root/libbds.a", s"$root/bds.o"]), "cannot archive the C library")
+    Some(root)
+end bds_host
+
+private bds_flag() -> string = if host_target().os == MacOS then "-Wl,-dead_strip" else "-Wl,--gc-sections"
+
+@test("a program that never calls the function needing a library links without it, under the dead-strip flag")
+bds_dead_strip_drops_the_unreached()
+    if !bds_host().is_some() then skip("no clang or no standard library")
+
+    val root = bds_host().unwrap()
+    val flag = bds_flag()
+
+    // The library is absent from the link line, so this links only because `bds_used` is dropped.
+    assert(bds_ok("clang", [s"$root/plain.c", s"$root/probe.a", flag, "-o", s"$root/plain"]),
+           "did not link under the dead-strip flag")
+    assert(bds_ok(s"$root/plain", []), "the program linked and did not run")
+    remove_dir_all(root).unwrap_or(())
+end bds_dead_strip_drops_the_unreached
+
+@test("without the dead-strip flag the same link fails on the library's symbol")
+bds_without_the_flag_fails()
+    if !bds_host().is_some() then skip("no clang or no standard library")
+
+    val root = bds_host().unwrap()
+
+    // The proof the test above can fail: the reference to `bds_double` is real.
+    assert(!bds_ok("clang", [s"$root/plain.c", s"$root/probe.a", "-o", s"$root/plain"]),
+           "linked without the flag, so the reduction does not reduce")
+    remove_dir_all(root).unwrap_or(())
+end bds_without_the_flag_fails
+
+@test("a program that calls the function needing the library links and runs with the library present")
+bds_used_function_still_works()
+    if !bds_host().is_some() then skip("no clang or no standard library")
+
+    val root = bds_host().unwrap()
+
+    assert(bds_ok("clang", [s"$root/used.c", s"$root/probe.a", s"-L$root", "-lbds", bds_flag(), "-o",
+                            s"$root/used"]), "did not link with the library present")
+    assert(bds_ok(s"$root/used", []), "the program linked and answered wrongly")
+
+    // Calling it with the library absent is still an error: the flag keeps what is reached.
+    assert(!bds_ok("clang", [s"$root/used.c", s"$root/probe.a", bds_flag(), "-o", s"$root/used2"]),
+           "the called function's library was dropped")
+    remove_dir_all(root).unwrap_or(())
+end bds_used_function_still_works
+
+// The section names of an ELF object `llvm-objdump -h` lists.
+private bds_sections(object: string) -> string = capture(bds_objdump, ["-h", object]) match
+    Ok(o) -> o.text
+    Err(_) -> ""
+
+private bds_section_cases() -> []string = ["aarch64-freestanding", "thumbv7m-freestanding", "thumb-freestanding"]
+
+@test("every function of a freestanding archive is in a section of its own")
+bds_elf_sections_per_function()
+    if !std_root().is_ok() || !clang_available() then skip("no clang or no standard library")
+    if !is_file(bds_objdump) then skip(s"there is no llvm-objdump at $bds_objdump")
+
+    for name in bds_section_cases()
+        val root = bds_project(bds_program())
+        val built = bds_build(root, ["--target", name], s"$root/probe.a")
+
+        assert(built.0 == 0, built.1)
+
+        val unpacked = make_temp_dir("sysl-bds-x").unwrap()
+
+        assert(bds_ok("/opt/homebrew/opt/llvm/bin/llvm-ar", ["x", s"--output=$unpacked", s"$root/probe.a",
+                                                              "sysl.code.o"]), "llvm-ar could not unpack")
+
+        val listing = bds_sections(s"$unpacked/sysl.code.o")
+
+        assert(listing.contains(".text.bds_used "), s"$name: no section for bds_used:\n$listing")
+        assert(listing.contains(".text.bds_plain "), s"$name: no section for bds_plain:\n$listing")
+        remove_dir_all(unpacked).unwrap_or(())
+        remove_dir_all(root).unwrap_or(())
+end bds_elf_sections_per_function
+
+@test("build-c names the dead-strip flag when the archive binds a library, and only then")
+bds_hint_names_the_flag()
+    if !bds_host().is_some() then skip("no clang or no standard library")
+
+    val root = bds_host().unwrap()
+    val built = bds_build(root, [], s"$root/again.a")
+
+    assert(built.1.contains(s"sysl: pass ${bds_flag()} when linking"), built.1)
+    remove_dir_all(root).unwrap_or(())
+
+    val bare = bds_project("@export(\"bds_two\")\nbds_two(x: int) -> int = x * 2\n")
+    val said = bds_build(bare, [], s"$bare/p.a")
+
+    assert(said.0 == 0, said.1)
+    assert(!said.1.contains("when linking"), said.1)
+    remove_dir_all(bare).unwrap_or(())
+end bds_hint_names_the_flag

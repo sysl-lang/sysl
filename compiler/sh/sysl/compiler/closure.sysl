@@ -551,7 +551,12 @@ private refuse_lost_writes(cx: &Analyzer, span: Span, st: &StructType, captured:
 
         val name = captured.at(i)
         val outer = cx.lookup(name)
-        val shown = if outer.is_some() then type_show(outer.unwrap().ty) else "T"
+
+        // A `val`'s copy is read-only as the `val` is, and the write was refused at the place in
+        // the binding's own words (`bind_capture`); there is no copy-write to speak of as well.
+        if outer.is_some() && outer.unwrap().read_only then continue
+
+        val shown =if outer.is_some() then type_show(outer.unwrap().ty) else "T"
         val via: Buf[(string, usize)] =
             if scan.direct.at(i) == 0 then scan.via.at(i).copy() else buf()
 
@@ -1072,8 +1077,8 @@ private closure_body(cx: &Analyzer, span: Span, st: &StructType, fname: string,
         val read = TExpr(span, TField(TExpr(span, TDeref(TExpr(span, TLoad("self", self_ty)),
                                                          Struct(st))), int(st.slot(i)), stored))
 
-        val unique = inner.bind(captured.at(i), stored)
         val outer = cx.lookup(captured.at(i))
+        val unique = bind_capture(inner, outer, captured.at(i), stored)
 
         // A capture of a binding whose type its first use fixes is that binding, for the use.
         if outer.is_some() then carry_open(cx, inner, outer.unwrap().unique, unique)

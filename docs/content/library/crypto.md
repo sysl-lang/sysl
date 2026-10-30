@@ -360,6 +360,56 @@ zero key the standard names.
 At most 255 digests' worth of key can be asked for, which HKDF's one-byte counter fixes; asking for
 more is refused rather than answered with a short key.
 
+## The compression function on its own
+
+A program that owns the padding and the chaining -- an emulator of a hardware SHA-256 block, a
+Merkle-Damgard construction of its own -- wants the compression function and nothing around it.
+`sha256_compress(state, block)` folds one 64-byte block into an eight-word state, **in place**, with no
+buffering, no padding and no finalisation. `sha256_init` is the state SHA-256 starts from, and
+`sha224_init` the state SHA-224 starts from; SHA-224 is the same compression, and keeps seven of the
+eight words.
+
+A block of any other length **traps**: a short one is a bug in the caller, and a long one would have
+its tail ignored without a word.
+
+```sysl
+import sysl.crypto.{sha256_compress, sha256_init}
+
+var block: []u8 = [0; 64]
+
+block[0] = 0x61
+block[1] = 0x62
+block[2] = 0x63
+block[3] = 0x80
+block[63] = 0x18
+
+var state = sha256_init
+
+sha256_compress(&state, block)
+
+print(state[0], state[7])
+```
+
+```output
+3128432319 4060091821
+```
+
+Those are the first and last words of `ba7816bf ... f20015ad`, the digest of `"abc"` that
+FIPS 180-4 works through: the block is the message, the one bit, zeroes, and the length 24 in the last
+word.
+
+```sysl
+import sysl.crypto.sha256_compress
+
+var state = [0u32; 8]
+var block: []u8 = [0; 63]
+
+sha256_compress(&state, block)
+```
+
+```output trap
+```
+
 ## What is not here
 
 **No cipher, no signature, and no key exchange** — and no password hash built for the purpose, which
