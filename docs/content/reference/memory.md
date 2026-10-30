@@ -2956,7 +2956,45 @@ print(first_two([1, 2, 3, 4]).len)
 ```
 
 ```error
-a slice of an array this frame owns is returned, so it would outlive the array, and the storage is not this body's to move — it is a field of a value or an array a caller passed by value, which has no declaration to move. Declare it as a '[]T', which makes a buffer of its own and owns it, or as a '&[N]T' where the length is fixed
+a slice of an array this frame owns is returned, so it would outlive the array, and the storage is not this body's to move — 'a' is an array this body holds by value without having declared it, such as a parameter, so there is no declaration to move. Declare it as a '[]T', which makes a buffer of its own and owns it, or as a '&[N]T' where the length is fixed
+```
+
+A field of a struct value is refused the same way, and the diagnostic says which of the two it met:
+
+```sysl
+struct Pair
+    xs: [2]int
+
+firsts(p: Pair) -> []int = p.xs[..]
+
+print(firsts(Pair([1, 2])).len)
+```
+
+```error
+it is a field of 'p', a struct value, and a field moves only with its struct
+```
+
+**An element of a view or of a `Buf` is not the frame's storage.** `rows[i][..]` lives in the storage
+`rows` views, and `b[i][..]` in the buffer's, so the view's owner is that storage's owner. It may be
+returned, stored, captured or pushed like any other slice of a `Buf`, and it keeps the storage alive
+after the buffer grows or is dropped. Where `rows` is itself a view of an array on the frame, that
+array is promoted, as it would be for `rows[1..]`.
+
+```sysl
+import sysl.buf.{Buf, buf}
+
+row(rows: [][4]int, i: usize) -> []int = rows[i][..]
+
+var b: Buf[[4]int] = buf()
+b.push([1, 2, 3, 4])
+val first = row(b.view(), 0)
+val tail = b[0][2..]
+b = buf()
+print(first[3], tail.len)
+```
+
+```output
+4 2
 ```
 
 **Module storage is never a root, whatever the path to it.** It lasts the whole run, so a view of it

@@ -182,10 +182,14 @@ end EscapeSite
 // has somewhere to move the storage to, and so does one rooted at a **temporary** -- a value the
 // frame computed and nobody named, which is nobody else's to move either. One rooted at a field of a
 // **named** local struct, or at an array parameter the caller passed by value, does not.
+//
+// `why` says, for the refusal, what the unmovable storage is -- the first reason a value met, since
+// one is enough to tell a reader what to change.
 struct EView
     named: Buf[string]
     anonymous: bool
     temps: Buf[(Span, string)]
+    why: string
 
     non_empty(self) -> bool = !self.named.is_empty() || self.anonymous || !self.temps.is_empty()
 end EView
@@ -194,13 +198,14 @@ private no_view() -> EView
     var named: Buf[string] = buf()
     var temps: Buf[(Span, string)] = buf()
 
-    EView(named, false, temps)
+    EView(named, false, temps, "")
 end no_view
 
-private unnamed_view() -> EView
+private unnamed_view(why: string) -> EView
     var v = no_view()
 
     v.anonymous = true
+    v.why = why
     v
 end unnamed_view
 
@@ -237,6 +242,7 @@ private join_views(a: EView, b: EView) -> EView
         if !holds_temp_span(out.temps, temp.0) then out.temps.push(temp)
 
     out.anonymous = a.anonymous || b.anonymous
+    out.why = if a.why.is_empty() then b.why else a.why
     out
 end join_views
 
@@ -416,7 +422,7 @@ end settle_cost
 private kepts(p: TProgram, keeps: &KeptParams, f: TFunc, param: string) -> bool
     var seeds: Buf[(string, EView)] = buf()
 
-    seeds.push((param, unnamed_view()))
+    seeds.push((param, unnamed_view("")))
 
     val w = walk_seeded(p, keeps, seeds, f.body.stmts, f.body.result, false, false)
 
@@ -809,8 +815,7 @@ private gets_out(p: TProgram, keeps: &KeptParams, w: &EscapeWalk, at: TExpr, how
         // slice, and the function around it is fine.
         w.refusal = Some((view_anchor(at),
             s"a slice of an array this frame owns $how, so it would outlive the array, and the " +
-            "storage is not this body's to move — it is a field of a value or an array a caller " +
-            "passed by value, which has no declaration to move. " +
+            s"storage is not this body's to move — ${v.why}. " +
             "Declare it as a '[]T', which makes a buffer of its own and owns it, or as a '&[N]T' " +
             "where the length is fixed"))
 end gets_out
@@ -952,11 +957,18 @@ private views_value(p: TProgram, keeps: &KeptParams, w: &EscapeWalk, e: TExpr) -
         if is_array(texpr_type(base)) && !is_place(base)
             join_views(views(p, keeps, w, base), temp_view(e.span, describe_temp(base)))
         else if is_array(texpr_type(base))
-            // A view of a `*T` region is the programmer's problem, like every `*T`. Storage inside a
-            // counted object is not the frame's either: it is on the heap already, and the view
-            // names the box that holds it as its owner.
-            if via_pointer(base) || via_reference(base) then no_view()
-            else array_root(w, base)
+            // Whether the storage is the frame's is the question emission answers when it picks the
+            // view's owner (`spine_root`), so it is asked here the same way. An **element of a view**
+            // (`rows[i][..]`) lives in that view's storage and takes its owner, so the slice views
+            // exactly what the view does: nothing, if the view is counted, and the frame's arrays, if
+            // it is a view of them. A **dereference** is a counted box, a `Buf`'s storage or a `*T`
+            // region: the first two are on the heap and named as the owner, and the last is the
+            // programmer's problem, like every `*T`.
+            spine_root(base) match
+                Some(root) -> *root.kind match
+                    TIndex(r, _, _) -> views(p, keeps, w, r)
+                    _ -> no_view()
+                None -> array_root(w, base)
         else views(p, keeps, w, base)
 
     TLoad(name, _) -> confined_of(w, name)
@@ -1051,25 +1063,49 @@ end loop_views
 // storage belongs to a struct and moving it would be a promotion of aggregates, which is not
 // specified. An array the caller passed **by value** is storage this frame was handed rather than
 // storage it made, so it is not this body's to move either.
+//
+// Only a place with no owner root (`spine_root`) comes here: an element of a view, a counted box's
+// field and a `Buf`'s element have one, and their views are counted.
 private array_root(w: &EscapeWalk, base: TExpr) -> EView = *base.kind match
     TLoad(name, _) ->
         if holds_string(w.locals, name) then named_view(name)
         else ref_place(w, name) match
             // A `ref` declares no storage, so it is never itself a root -- the array it names is
             // whatever its place was rooted at.
-            Some(place) -> array_root(w, place)
-            None -> unnamed_view()
+            //
+            // A `ref` to storage with an owner root names the storage but not its owner, so a view
+            // taken through it is not counted (`promoted_owner`) and stays the frame's.
+            Some(place) ->
+                if spine_root(place).is_some()
+                    unnamed_view(s"'$name' is a 'ref' to an element or a field reached through a " +
+                                 "view, a 'Buf' or a reference, and a view taken through a 'ref' " +
+                                 "carries no owner of the storage")
+                else array_root(w, place)
+            None -> unnamed_view(s"'$name' is an array this body holds by value without having " +
+                                 "declared it, such as a parameter, so there is no declaration to move")
 
     // **Module storage is not this frame's and never dies with it**, so a slice of one views nothing
     // here: it is static for the whole run, and both answers this pass could otherwise give are
     // wrong for it.
     TGlobal(_, _, _) -> no_view()
-    TIndex(r, _, _) -> array_root(w, r)
+
+    // An element of an array is part of it; an element of anything else is storage this walk cannot
+    // name.
+    TIndex(r, _, _) ->
+        if is_array(texpr_type(r)) then array_root(w, r)
+        else unnamed_view("it is storage this body did not declare, so there is no declaration to move")
 
     // A field of module storage -- `rows[i].words` -- is module storage too, and lasts the whole run
     // as its record does. A field of anything else is a value's, and is refused as before.
-    TField(r, _, _) -> if in_module_storage(r) then no_view() else unnamed_view()
-    _ -> unnamed_view()
+    TField(r, _, _) ->
+        if in_module_storage(r) then no_view()
+        else unnamed_view(s"it is a field of ${struct_value_named(r)}, and a field moves only with " +
+                          "its struct")
+    _ -> unnamed_view("it is storage this body did not declare, so there is no declaration to move")
+
+private struct_value_named(r: TExpr) -> string = *r.kind match
+    TLoad(name, _) -> s"'$name', a struct value"
+    _ -> "a struct value"
 
 // Whether a place is rooted at module storage through fields and elements alone. A step through a
 // pointer or a reference leaves it, since what is reached then is wherever the address points.
@@ -1085,31 +1121,6 @@ private ref_place(w: &EscapeWalk, name: string) -> Option[TExpr]
 
     None
 end ref_place
-
-// Whether the storage an array place names is reached through a raw pointer, and so is not this
-// frame's to lose. The question is about the *root* of the place rather than about its last step.
-private via_pointer(e: TExpr) -> bool = *e.kind match
-    TDeref(operand, _) -> is_raw_pointer(texpr_type(operand))
-    TField(r, _, _) -> via_pointer(r)
-    TIndex(r, _, _) -> via_pointer(r)
-    _ -> false
-
-// Whether the storage lives inside a **counted object** -- a fixed array that is a field of a
-// `&Struct`, or an element of one. Such storage is on the heap already, so there is nothing to
-// promote and nothing to refuse.
-private via_reference(e: TExpr) -> bool = *e.kind match
-    TDeref(operand, _) -> is_counted_ref(texpr_type(operand))
-    TField(r, _, _) -> via_reference(r)
-    TIndex(r, _, _) -> via_reference(r)
-    _ -> false
-
-private is_raw_pointer(t: Type) -> bool = t match
-    Ptr(_) -> true
-    _ -> false
-
-private is_counted_ref(t: Type) -> bool = t match
-    Ref(_, _) -> true
-    _ -> false
 
 private is_array(t: Type) -> bool = t match
     Array(_, _) -> true

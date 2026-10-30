@@ -1,0 +1,542 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.text.cstring
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// **A view of an array that is an element of a view or of a `Buf` may leave the frame**, because it is
+// counted: its owner is the owner of the storage it lives in (`emit_place.sysl`'s `address_owned`),
+// and escape analysis asks the same question emission does (`spine_root`) before calling storage the
+// frame's. So `rows[i][..]`, `b[i][..]`, `b[i].f[..]`, `b[i][j][..]` and `made()[i][..]` are returned,
+// stored in a module var, captured by a heap closure, pushed into a `Buf` and stored in a struct that
+// escapes, exactly as `b[..]` is. Where the view element is itself a view of the frame's own array,
+// that array is promoted.
+//
+// Every route below runs each base, then grows the buffer 100 times and drops it before reading what
+// escaped -- at -O0 and -O2 on the counted heap (net 0) and once under AddressSanitizer.
+//
+// What stays refused is storage that genuinely is the frame's and has no declaration to move: an
+// array held by value without a declaration (a parameter), a field of a struct value, and a view
+// taken through a `ref` (whose views carry no owner). Each is pinned with its own reason.
+//
+// Cells not written: `*T` regions -- a view of one owns nothing by design, and was never refused;
+// a `&Struct` field -- already counted and accepted before this change; `&sync`, bare metal and
+// separate compilation -- no emission changed, only which views the analyzer lets out.
+
+private extern "setenv" rvr_c_setenv(name: *u8, value: *u8, overwrite: int) -> int
+private extern "unsetenv" rvr_c_unsetenv(name: *u8) -> int
+
+private struct RvrRun
+    ok: bool
+    out: string
+    err: string
+    hooks: usize
+
+private rvr_ready() -> bool
+    if std_root().is_err() || !clang_available()
+        print("skipped: the library or the toolchain is not on this machine")
+        return false
+    end if
+
+    true
+end rvr_ready
+
+private rvr_ir(text: string) -> string
+    val root = make_temp_dir("sysl-rvr").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    val out = emit_llvm_text(src, None) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> if made.report.is_empty() then made.text else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end rvr_ir
+
+private rvr_refused(text: string, said: string)
+    if !rvr_ready() then return
+
+    val out = rvr_ir(text)
+
+    assert(out.contains(said), out)
+end rvr_refused
+
+private rvr_run(text: string, level: string, counted: bool, flags: string) -> RvrRun
+    val root = make_temp_dir("sysl-rvr").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    if counted then force_alloc_counting(true)
+
+    if flags != ""
+        val n = cstring("SYSL_EXTRA_CFLAGS")
+        val v = cstring(flags)
+
+        rvr_c_setenv(n.ptr, v.ptr, 1)
+    end if
+
+    val built = build_native_program(s"$root/main.sysl", None, None, level, Some(exe))
+
+    if flags != ""
+        val n = cstring("SYSL_EXTRA_CFLAGS")
+
+        rvr_c_unsetenv(n.ptr)
+
+    if counted then force_alloc_counting(false)
+
+    built match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return RvrRun(false, failure_text(why), "", 0)
+        Ok(_) -> ()
+
+    val hooks = capture("nm", ["-u", exe], "", [], true) match
+        Ok(o) -> o.text.count_of("__asan_report")
+        Err(_) -> 0
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> RvrRun(false, "could not be started", "", hooks)
+        Ok(o) -> RvrRun(o.status.ok(), o.text, o.err.unwrap_or(""), hooks)
+end rvr_run
+
+// Printed exactly `expected` at both ends of the optimizer on the counted heap, giving everything
+// back, and again under AddressSanitizer with the instrumentation in the binary.
+private rvr_prints(text: string, expected: string)
+    if !rvr_ready() then return
+
+    for level in ["0", "2"]
+        val run = rvr_run(text, level, true, "")
+
+        assert(run.ok, s"-O$level: ${run.out}${run.err}")
+        assert_eq(run.out, expected)
+        assert(alloc_count_reported(run.err) == 0, s"-O$level: ${run.err}")
+
+    val asan = rvr_run(text, "0", false, "-fsanitize=address -g")
+
+    assert(asan.hooks > 0, "the AddressSanitizer build carries no instrumentation")
+    assert(asan.ok, s"asan: ${asan.out}${asan.err}")
+    assert_eq(asan.out, expected)
+end rvr_prints
+
+// The storage every route escapes from: a buffer of rows, of records with an array field, and of 2-D
+// grids, each filled with one element, and `churn`, which grows each 100 times and then drops it.
+private rvr_prelude() -> string = raw"""
+    import sysl.buf.{Buf, buf}
+
+    struct Rec
+        tag: i32
+        f: [4]i32
+
+    struct Holder
+        rows: Buf[[4]i32]
+        recs: Buf[Rec]
+        grid: Buf[[2][4]i32]
+
+    fill() -> &Holder
+        val h = Holder(buf(), buf(), buf())
+        h.rows.push([1, 2, 3, 4])
+        h.recs.push(Rec(0, [5, 6, 7, 8]))
+        h.grid.push([[9, 10, 11, 12], [13, 14, 15, 16]])
+        h
+
+    churn(h: &Holder)
+        for k in 0..<100
+            h.rows.push([k, k, k, k])
+            h.recs.push(Rec(k, [k, k, k, k]))
+            h.grid.push([[k, k, k, k], [k, k, k, k]])
+        h.rows = buf()
+        h.recs = buf()
+        h.grid = buf()
+
+    made(h: &Holder) -> [][4]i32 = h.rows.view()
+
+    fresh() -> Buf[[4]i32]
+        var b: Buf[[4]i32] = buf()
+        b.push([17, 18, 19, 20])
+        b
+
+    total(v: []i32) -> i32 = v[0] + v[3]
+
+    """
+
+// The ten printed totals, in the order every route prints them: an element of a view, of a Buf, a
+// field of a view's record, of a Buf's record, a 2-D row of a view's grid, of a Buf's grid, an
+// element of a view a call answered, of a Buf a call made, and two views of the frame's own array.
+private rvr_expected() -> string = "5 5 13 13 29 29 5 37 5 13\n"
+
+// -- returned ---------------------------------------------------------------------------------------
+
+@test("a view of an element of a view or a Buf is returned, and outlives the buffer's growth and drop")
+rvr_returned()
+    rvr_prints(rvr_prelude() + raw"""
+        of_view(rows: [][4]i32, i: usize) -> []i32 = rows[i][..]
+        of_buf(h: &Holder) -> []i32 = h.rows[0][..]
+        of_view_field(recs: []Rec) -> []i32 = recs[0].f[..]
+        of_buf_field(h: &Holder) -> []i32 = h.recs[0].f[..]
+        of_view_grid(grid: [][2][4]i32) -> []i32 = grid[0][1][..]
+        of_buf_grid(h: &Holder) -> []i32 = h.grid[0][1][..]
+        of_call(h: &Holder) -> []i32 = made(h)[0][..]
+        of_buf_call() -> []i32 = fresh()[0][..]
+
+        // A view element of the frame's own array: the array is promoted.
+        frame_row() -> []i32
+            var a = [[1, 2, 3, 4], [5, 6, 7, 8]]
+            val rows = a[..]
+            rows[0][..]
+
+        frame_through_a_call() -> []i32
+            var a = [[1, 2, 3, 4], [5, 6, 7, 8]]
+            of_view(a[..], 1)[0..]
+
+        main()
+            val h = fill()
+            val a = of_view(h.rows.view(), 0)
+            val b = of_buf(h)
+            val c = of_view_field(h.recs.view())
+            val d = of_buf_field(h)
+            val e = of_view_grid(h.grid.view())
+            val f = of_buf_grid(h)
+            val g = of_call(h)
+            val k = of_buf_call()
+            churn(h)
+            val m = frame_row()
+            val n = frame_through_a_call()
+            print(total(a), total(b), total(c), total(d), total(e), total(f), total(g), total(k),
+                  total(m), total(n))
+        """, rvr_expected())
+
+// -- stored in a module var -------------------------------------------------------------------------
+
+@test("a view of an element of a view or a Buf is stored in a module var and outlives the buffer")
+rvr_module_var()
+    rvr_prints(rvr_prelude() + raw"""
+        var kept: []i32 = []
+
+        keep_view(rows: [][4]i32) = kept = rows[0][..]
+        keep_buf(h: &Holder) = kept = h.rows[0][..]
+        keep_view_field(recs: []Rec) = kept = recs[0].f[..]
+        keep_buf_field(h: &Holder) = kept = h.recs[0].f[..]
+        keep_view_grid(grid: [][2][4]i32) = kept = grid[0][1][..]
+        keep_buf_grid(h: &Holder) = kept = h.grid[0][1][..]
+        keep_call(h: &Holder) = kept = made(h)[0][..]
+        keep_buf_call() = kept = fresh()[0][..]
+
+        // The callee keeps its view parameter, so the caller's array is promoted.
+        keep_frame()
+            var a = [[1, 2, 3, 4], [5, 6, 7, 8]]
+            keep_view(a[..])
+
+        keep_frame_row()
+            var a = [[1, 2, 3, 4], [5, 6, 7, 8]]
+            val rows = a[..]
+            kept = rows[1][..]
+
+        after(h: &Holder) -> i32
+            churn(h)
+            total(kept)
+
+        main()
+            var h = fill()
+            keep_view(h.rows.view())
+            val a = after(h)
+            h = fill()
+            keep_buf(h)
+            val b = after(h)
+            h = fill()
+            keep_view_field(h.recs.view())
+            val c = after(h)
+            h = fill()
+            keep_buf_field(h)
+            val d = after(h)
+            h = fill()
+            keep_view_grid(h.grid.view())
+            val e = after(h)
+            h = fill()
+            keep_buf_grid(h)
+            val f = after(h)
+            h = fill()
+            keep_call(h)
+            val g = after(h)
+            keep_buf_call()
+            val k = total(kept)
+            keep_frame()
+            val m = total(kept)
+            keep_frame_row()
+            val n = total(kept)
+            kept = []
+            print(a, b, c, d, e, f, g, k, m, n)
+        """, rvr_expected())
+
+// -- captured by a heap closure ---------------------------------------------------------------------
+
+@test("a view of an element of a view or a Buf is captured by a heap closure and outlives the buffer")
+rvr_captured()
+    rvr_prints(rvr_prelude() + raw"""
+        cap(v: []i32) -> &Fn() -> i32 = () -> total(v)
+
+        cap_view(rows: [][4]i32) -> &Fn() -> i32
+            val v = rows[0][..]
+            () -> total(v)
+
+        cap_buf(h: &Holder) -> &Fn() -> i32
+            val v = h.rows[0][..]
+            () -> total(v)
+
+        cap_view_field(recs: []Rec) -> &Fn() -> i32
+            val v = recs[0].f[..]
+            () -> total(v)
+
+        cap_buf_field(h: &Holder) -> &Fn() -> i32
+            val v = h.recs[0].f[..]
+            () -> total(v)
+
+        cap_view_grid(grid: [][2][4]i32) -> &Fn() -> i32
+            val v = grid[0][1][..]
+            () -> total(v)
+
+        cap_buf_grid(h: &Holder) -> &Fn() -> i32
+            val v = h.grid[0][1][..]
+            () -> total(v)
+
+        cap_call(h: &Holder) -> &Fn() -> i32
+            val v = made(h)[0][..]
+            () -> total(v)
+
+        cap_buf_call() -> &Fn() -> i32
+            val v = fresh()[0][..]
+            () -> total(v)
+
+        cap_frame_row() -> &Fn() -> i32
+            var a = [[1, 2, 3, 4], [5, 6, 7, 8]]
+            val rows = a[..]
+            val v = rows[0][..]
+            () -> total(v)
+
+        cap_frame_through_a_call() -> &Fn() -> i32
+            var a = [[1, 2, 3, 4], [5, 6, 7, 8]]
+            cap(a[..][1][..])
+
+        main()
+            val h = fill()
+            val a = cap_view(h.rows.view())
+            val b = cap_buf(h)
+            val c = cap_view_field(h.recs.view())
+            val d = cap_buf_field(h)
+            val e = cap_view_grid(h.grid.view())
+            val f = cap_buf_grid(h)
+            val g = cap_call(h)
+            val k = cap_buf_call()
+            churn(h)
+            val m = cap_frame_row()
+            val n = cap_frame_through_a_call()
+            print(a(), b(), c(), d(), e(), f(), g(), k(), m(), n())
+        """, rvr_expected())
+
+// -- pushed into a Buf ------------------------------------------------------------------------------
+
+@test("a view of an element of a view or a Buf is pushed into a Buf and outlives the buffer")
+rvr_pushed()
+    rvr_prints(rvr_prelude() + raw"""
+        push_view(out: Buf[[]i32], rows: [][4]i32) = out.push(rows[0][..])
+        push_buf(out: Buf[[]i32], h: &Holder) = out.push(h.rows[0][..])
+        push_view_field(out: Buf[[]i32], recs: []Rec) = out.push(recs[0].f[..])
+        push_buf_field(out: Buf[[]i32], h: &Holder) = out.push(h.recs[0].f[..])
+        push_view_grid(out: Buf[[]i32], grid: [][2][4]i32) = out.push(grid[0][1][..])
+        push_buf_grid(out: Buf[[]i32], h: &Holder) = out.push(h.grid[0][1][..])
+        push_call(out: Buf[[]i32], h: &Holder) = out.push(made(h)[0][..])
+        push_buf_call(out: Buf[[]i32]) = out.push(fresh()[0][..])
+
+        push_frame(out: Buf[[]i32])
+            var a = [[1, 2, 3, 4], [5, 6, 7, 8]]
+            push_view(out, a[..])
+
+        push_frame_row(out: Buf[[]i32])
+            var a = [[1, 2, 3, 4], [5, 6, 7, 8]]
+            val rows = a[..]
+            out.push(rows[1][..])
+
+        main()
+            val h = fill()
+            var out: Buf[[]i32] = buf()
+            push_view(out, h.rows.view())
+            push_buf(out, h)
+            push_view_field(out, h.recs.view())
+            push_buf_field(out, h)
+            push_view_grid(out, h.grid.view())
+            push_buf_grid(out, h)
+            push_call(out, h)
+            push_buf_call(out)
+            churn(h)
+            push_frame(out)
+            push_frame_row(out)
+            print(total(out[0]), total(out[1]), total(out[2]), total(out[3]), total(out[4]),
+                  total(out[5]), total(out[6]), total(out[7]), total(out[8]), total(out[9]))
+        """, rvr_expected())
+
+// -- stored in a struct that escapes ----------------------------------------------------------------
+
+@test("a view of an element of a view or a Buf is stored in an escaping struct and outlives the buffer")
+rvr_struct()
+    rvr_prints(rvr_prelude() + raw"""
+        struct Keep
+            v: []i32
+
+        struct Slot
+            v: []i32
+
+        // Returned inside a struct value.
+        keep_view(rows: [][4]i32) -> Keep = Keep(rows[0][..])
+        keep_buf_field(h: &Holder) -> Keep = Keep(h.recs[0].f[..])
+        keep_view_grid(grid: [][2][4]i32) -> Keep = Keep(grid[0][1][..])
+        keep_buf_call() -> Keep = Keep(fresh()[0][..])
+        keep_frame_row() -> Keep
+            var a = [[1, 2, 3, 4], [5, 6, 7, 8]]
+            val rows = a[..]
+            Keep(rows[0][..])
+
+        // Stored into a field of a counted struct the caller holds.
+        stash_buf(s: &Slot, h: &Holder) = s.v = h.rows[0][..]
+        stash_view_field(s: &Slot, recs: []Rec) = s.v = recs[0].f[..]
+        stash_buf_grid(s: &Slot, h: &Holder) = s.v = h.grid[0][1][..]
+        stash_call(s: &Slot, h: &Holder) = s.v = made(h)[0][..]
+        stash_frame(s: &Slot)
+            var a = [[1, 2, 3, 4], [5, 6, 7, 8]]
+            val rows = a[..]
+            s.v = rows[1][..]
+
+        main()
+            val h = fill()
+            val a = keep_view(h.rows.view())
+            val b: &Slot = Slot([])
+            stash_buf(b, h)
+            val c: &Slot = Slot([])
+            stash_view_field(c, h.recs.view())
+            val d = keep_buf_field(h)
+            val e = keep_view_grid(h.grid.view())
+            val f: &Slot = Slot([])
+            stash_buf_grid(f, h)
+            val g: &Slot = Slot([])
+            stash_call(g, h)
+            val k = keep_buf_call()
+            churn(h)
+            val m = keep_frame_row()
+            val n: &Slot = Slot([])
+            stash_frame(n)
+            print(total(a.v), total(b.v), total(c.v), total(d.v), total(e.v), total(f.v), total(g.v),
+                  total(k.v), total(m.v), total(n.v))
+        """, rvr_expected())
+
+// -- what stays refused, with its reason ------------------------------------------------------------
+
+private rvr_tail() -> string =
+    ". Declare it as a '[]T', which makes a buffer of its own and owns it, or as a '&[N]T' where the " +
+    "length is fixed"
+
+private rvr_by_value(name: string) -> string =
+    s"'$name' is an array this body holds by value without having declared it, such as a parameter, " +
+    "so there is no declaration to move" + rvr_tail()
+
+private rvr_field(name: string) -> string =
+    s"it is a field of '$name', a struct value, and a field moves only with its struct" + rvr_tail()
+
+private rvr_through_ref(name: string) -> string =
+    s"'$name' is a 'ref' to an element or a field reached through a view, a 'Buf' or a reference, and " +
+    "a view taken through a 'ref' carries no owner of the storage" + rvr_tail()
+
+private rvr_head(how: string) -> string =
+    s"a slice of an array this frame owns $how, so it would outlive the array, and the storage is " +
+    "not this body's to move — "
+
+@test("an array parameter held by value, stored in a module var, is still refused with its reason")
+rvr_refused_by_value_module_var()
+    rvr_refused(raw"""
+        var kept: []i32 = []
+
+        keep(a: [4]i32) = kept = a[..]
+
+        main()
+            keep([1, 2, 3, 4])
+            print(kept[0])
+        """, rvr_head("is stored somewhere the frame does not own") + rvr_by_value("a"))
+
+@test("a row of a 2-D array parameter held by value, pushed into a Buf, is still refused")
+rvr_refused_by_value_row_pushed()
+    rvr_refused(raw"""
+        import sysl.buf.{Buf, buf}
+
+        push_row(out: Buf[[]i32], grid: [2][4]i32) = out.push(grid[1][..])
+
+        main()
+            var out: Buf[[]i32] = buf()
+            push_row(out, [[1, 2, 3, 4], [5, 6, 7, 8]])
+            print(out[0][0])
+        """, "is passed to 'sysl.buf.Buf.push.slice.int', which holds on to it, so it would outlive the array, " +
+             "and the storage is not this body's to move — " + rvr_by_value("grid"))
+
+@test("a field of a struct parameter held by value, returned, is still refused with its reason")
+rvr_refused_field_of_a_parameter()
+    rvr_refused(raw"""
+        struct Rec
+            f: [4]i32
+
+        first(r: Rec) -> []i32 = r.f[..]
+
+        main()
+            print(first(Rec([1, 2, 3, 4]))[0])
+        """, rvr_head("is returned") + rvr_field("r"))
+
+@test("a field of a local struct, captured by a heap closure, is still refused with its reason")
+rvr_refused_field_of_a_local_captured()
+    rvr_refused(raw"""
+        struct Rec
+            f: [4]i32
+
+        make() -> &Fn() -> i32
+            val r = Rec([1, 2, 3, 4])
+            val v = r.f[..]
+            () -> v[0]
+
+        main()
+            print(make()())
+        """, rvr_head("is put on the heap") + rvr_field("r"))
+
+@test("a view taken through a 'ref' to an element of a view, returned, is still refused")
+rvr_refused_through_a_ref_to_a_view_element()
+    rvr_refused(raw"""
+        row(rows: [][4]i32) -> []i32
+            ref first = rows[0]
+            first[..]
+
+        main()
+            var a = [[1, 2, 3, 4]]
+            print(row(a[..])[0])
+        """, rvr_head("is returned") + rvr_through_ref("first"))
+
+@test("a view taken through a 'ref' to an element of a Buf, stored in a struct that escapes, is refused")
+rvr_refused_through_a_ref_to_a_buf_element()
+    rvr_refused(raw"""
+        import sysl.buf.{Buf, buf}
+
+        struct Keep
+            v: []i32
+
+        keep(b: Buf[[4]i32]) -> Keep
+            ref first = b[0]
+            Keep(first[..])
+
+        main()
+            var b: Buf[[4]i32] = buf()
+            b.push([1, 2, 3, 4])
+            print(keep(b).v[0])
+        """, rvr_head("is returned") + rvr_through_ref("first"))
