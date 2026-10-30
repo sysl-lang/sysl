@@ -1,0 +1,419 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.source_of
+import sysl.buf.{Buf, buf}
+import sysl.text.{Search, join, split}
+import sysl.fs.{make_temp_dir, remove_dir_all, write_text, is_file}
+import sysl.process.capture
+import sysl.testing.skip
+
+// **An address read as an integer of the machine's word is constant data**, as C's
+// `(uint32_t)(uintptr_t)&f` is: `u32(usize(&f))` on a 32-bit target, `u64(usize(&f))` on a 64-bit
+// one, and either moved by a constant (`+ 1`, `- 4`) are laid into the object file as a `ptrtoint`
+// constant expression -- a word the linker fills in -- and nothing runs to fill them.
+//
+// **A placed object nothing will fill is constant data or it is refused.** What reads a section is
+// outside the program, so on a build that never runs an initializer -- a freestanding C archive, or a
+// bare image entered where `main` never runs -- storage an initializer would fill is refused rather
+// than left as the zeros it used to carry silently. A bare image whose `main` runs fills it there, as
+// before. A conversion of an address to an integer that
+// is not the machine's word, and a word inside a struct whose fields are packed or reversed, are not
+// relocations any linker writes, so they stay code and the refusal says why.
+//
+// Axes: target word (32 thumb / 64 host) x what the address is of (an exported function, a plain
+// function of any signature, module storage, an element of it) x where the word sits (array element,
+// struct field, a struct that rewrites its bits) x the integer (word, narrower, wider, moved by a
+// constant) x placement and build (section in a freestanding archive or an image entered elsewhere:
+// refused if code; in a bare image whose `main` runs, or on a hosted machine: filled at startup). Not covered: an enum payload holding such a word stays code (its image
+// takes only the address itself), and a hosted placed object is still filled before `main`.
+
+private pai_library_for(t: Target) -> Buf[Program]
+    var out: Buf[Program] = buf()
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, t) match
+            Err(_) -> ()
+            Ok(units) -> out = units
+
+    out
+end pai_library_for
+
+private pai_first_of(said: Buf[Placed]) -> string
+    for item in said
+        if !item.src.name.starts_with("library/") then return item.diag.message
+
+    ""
+end pai_first_of
+
+// An archive for a machine, as `build-c` makes one: the first thing the compilation had to say, or
+// the LLVM text it lowered to.
+private pai_archive(text: string, t: Target) -> string
+    var units = pai_library_for(t)
+    val parsed = parse(source_of("main.sysl", text), t)
+
+    if !parsed.ok() then return parsed.report.at(0).message
+
+    units.push(parsed.program)
+
+    val done = analyze_produced(units, t, buf(), false)
+    val early = pai_first_of(done.reported)
+
+    if early != "" then return early
+
+    val whole = program_of(done, done.main_module) with { entry_point = false, c_artifact = true }
+    var own: Buf[string] = buf()
+
+    own.push("")
+
+    val pr = post_analysis_checks(done.an, whole, own)
+    val late = pai_first_of(done.an.diagnostics())
+
+    if late != "" then return late
+
+    ir_print_module(codegen_with_gaps(prune(strip_tests(whole), own), t, pr).0)
+end pai_archive
+
+private pai_thumb() -> Target = target_named("thumbv6m-freestanding").unwrap()
+
+private pai_skip()
+    if pai_library_for(pai_thumb()).is_empty() then skip("the standard module's source is not on this machine")
+
+// The storage is the constant the object file carries, and nothing runs to fill it.
+private pai_laid_down(out: string, global: string)
+    assert(out.contains(global), out)
+    assert(!out.contains("module_init"), out)
+    assert(!out.contains("llvm.global_ctors"), out)
+end pai_laid_down
+
+private val pai_rom: string =
+    "@export(\"rom_popcount32\")\npopcount(x: u32) -> u32 = x.count_ones()\n\n"
+
+// Why a call to an `extern` does not fold, as a refusal's reason ends.
+private val pai_outside: string = "which is outside the program — nothing outside the program exists while compiling"
+
+// The refusal of placed storage nothing will fill, on a build `nothing` describes, followed by why the
+// initializer did not fold.
+private pai_unfilled(name: string, section: string, nothing: string, why: string) -> string =
+    s"'$name' is placed in section \"$section\", so what reads it is outside the program and reads the " +
+    "bytes the image carries — but it is module storage an initializer fills before the program's own " +
+    s"statements run. $nothing, so the section would hold whatever the image left. Make the initializer " +
+    "constant data, which is laid straight into the object file — a literal, a 'const', the address of " +
+    "a function or of module storage, that address as an integer of the machine's word, and the arrays " +
+    s"and structs built from those. $why"
+
+// The same for a freestanding archive, which has no entry point.
+private pai_placed(name: string, section: string, why: string) -> string =
+    pai_unfilled(name, section, "This artifact has no entry point to run that initializer, and " +
+                 "'thumbv6m-freestanding' is freestanding — there is no loader to run a constructor either", why)
+
+// A linked image for a bare machine entered at `entry`: what the compilation refused first, or the LLVM
+// text it lowered to.
+private pai_image(text: string, entry: string) -> string
+    val t = pai_thumb()
+    var units = pai_library_for(t)
+    val parsed = parse(source_of("main.sysl", text), t)
+
+    if !parsed.ok() then return parsed.report.at(0).message
+
+    units.push(parsed.program)
+
+    val done = analyze_produced(units, t, buf(), false)
+    val early = pai_first_of(done.reported)
+
+    if early != "" then return early
+
+    val whole = program_of(done, done.main_module) with { entry_point = true, c_artifact = false }
+    var own: Buf[string] = buf()
+
+    own.push("")
+
+    val pr = post_analysis_checks(done.an, whole, own)
+
+    check_image_storage(done.an, whole, own, entry)
+
+    val late = pai_first_of(done.an.diagnostics())
+
+    if late != "" then return late
+
+    ir_print_module(codegen_with_gaps(prune(strip_tests(whole), own), t, pr).0)
+end pai_image
+
+private val pai_ram: string =
+    "extern \"rom_next\" next() -> u32\n\n@section(\".ram2\")\nvar buf: u32 = next()\n\n"
+
+@test("a placed 'var' an initializer fills is accepted in a bare image whose 'main' runs, and filled there")
+pai_image_with_main_fills_placed_storage()
+    pai_skip()
+
+    val out = pai_image(pai_ram + "@export(\"main\")\nmain_entry() -> int = int(buf)\n", "reset")
+
+    assert(out.contains("@buf = private global i32 zeroinitializer, section \".ram2\"\n"), out)
+
+    var stored = false
+
+    for line in split(out, "\n")
+        if line.contains("store i32") && line.contains("ptr @buf") then stored = true
+
+    assert(stored, out)
+end pai_image_with_main_fills_placed_storage
+
+@test("a placed 'var' an initializer fills is refused in a bare image entered where 'main' never runs")
+pai_image_entered_elsewhere_refused()
+    pai_skip()
+
+    assert_eq(pai_image(pai_ram + "@export(\"reset\")\nreset() -> int = 0\n", "reset"),
+              pai_unfilled("buf", ".ram2", "This image starts at 'reset' ('targets.thumbv6m-freestanding." +
+                           "entry'), which never calls 'main', and 'main' is what runs that initializer",
+                           s"'buf' calls 'next', $pai_outside"))
+end pai_image_entered_elsewhere_refused
+
+@test("a placed table holding a literal and a function's address as a u32 is laid down on thumb")
+pai_the_rom_table_on_thumb()
+    pai_skip()
+
+    pai_laid_down(pai_archive(pai_rom + "@section(\".rom.a\")\nval A: [2]u32 = [7, u32(usize(&popcount))]\n",
+                              pai_thumb()),
+                  "@A = private constant [2 x i32] [i32 7, i32 ptrtoint (ptr @rom_popcount32 to i32)], " +
+                  "section \".rom.a\"\n")
+end pai_the_rom_table_on_thumb
+
+@test("an unplaced 'val' over a function's address as a u32 is laid down on thumb as well")
+pai_unplaced_word_on_thumb()
+    pai_skip()
+
+    pai_laid_down(pai_archive(pai_rom + "val A: u32 = u32(usize(&popcount))\n\n@export(\"rom_a\")\n" +
+                              "rom_a() -> u32 = A\n", pai_thumb()),
+                  "@A = private constant i32 ptrtoint (ptr @rom_popcount32 to i32)\n")
+end pai_unplaced_word_on_thumb
+
+@test("a 'u64' of a function's address is laid down on a 64-bit target")
+pai_a_u64_word_on_a_64_bit_host()
+    val t = host_target()
+
+    if pai_library_for(t).is_empty() then skip("the standard module's source is not on this machine")
+    if t.pointer_bits() != 64 then skip("this machine's word is not 64 bits")
+
+    pai_laid_down(pai_archive("@export(\"pai_f\")\npai_f() -> int = 1\n\n" +
+                              "val H: [2]u64 = [u64(usize(&pai_f)), usize(&pai_f) + 16]\n\n" +
+                              "@export(\"pai_h\")\npai_h() -> u64 = H[0] + H[1]\n", t),
+                  "@H = private constant [2 x i64] [i64 ptrtoint (ptr @pai_f to i64), i64 add (i64 " +
+                  "ptrtoint (ptr @pai_f to i64), i64 16)]\n")
+end pai_a_u64_word_on_a_64_bit_host
+
+@test("a table of functions of different signatures, moved by constants, is laid down")
+pai_a_mixed_table()
+    pai_skip()
+
+    val text = pai_rom + "idle() = ()\n\npick(p: *u8, n: usize) -> bool = n > 0\n\n" +
+               "@section(\".rom.b\")\nval B: [4]u32 = [u32(usize(&idle)), u32(usize(&pick)) + 1, " +
+               "u32(usize(&popcount)) - 4, u32(usize(&popcount) +% 2)]\n"
+
+    pai_laid_down(pai_archive(text, pai_thumb()),
+                  "@B = private constant [4 x i32] [i32 ptrtoint (ptr @idle$$sysl to i32), i32 add (i32 " +
+                  "ptrtoint (ptr @pick$$sysl to i32), i32 1), i32 sub (i32 ptrtoint (ptr @rom_popcount32 " +
+                  "to i32), i32 4), i32 add (i32 ptrtoint (ptr @rom_popcount32 to i32), i32 2)], " +
+                  "section \".rom.b\"\n")
+end pai_a_mixed_table
+
+@test("the address of module storage and of an element of it, as u32 words, is laid down")
+pai_storage_addresses()
+    pai_skip()
+
+    pai_laid_down(pai_archive("var BUF: [4]u8\n\n@section(\".rom.s\")\nval S: [2]u32 = " +
+                              "[u32(usize(&BUF)), u32(usize(&BUF[2]))]\n", pai_thumb()),
+                  "@S = private constant [2 x i32] [i32 ptrtoint (ptr @BUF to i32), i32 ptrtoint (ptr " +
+                  "getelementptr inbounds (i8, ptr @BUF, i32 2) to i32)], section \".rom.s\"\n")
+end pai_storage_addresses
+
+@test("a placed struct holding a function's address as a u32 field is laid down")
+pai_a_placed_struct()
+    pai_skip()
+
+    pai_laid_down(pai_archive(pai_rom + "struct Entry\n    tag: u32\n    at: u32\n\n@section(\".rom.e\")\n" +
+                              "val E: Entry = Entry(3, u32(usize(&popcount)))\n", pai_thumb()),
+                  "@E = private constant %struct.Entry { i32 3, i32 ptrtoint (ptr @rom_popcount32 to " +
+                  "i32) }, section \".rom.e\"\n")
+end pai_a_placed_struct
+
+@test("a placed 'val' an initializer would fill is refused in a freestanding archive, not left as zeros")
+pai_placed_code_refused()
+    pai_skip()
+
+    assert_eq(pai_archive("extern \"rom_next\" next() -> u32\n\n@section(\".rom.g\")\nval G: u32 = next()\n",
+                          pai_thumb()),
+              pai_placed("G", ".rom.g", s"'G' calls 'next', $pai_outside"))
+end pai_placed_code_refused
+
+@test("a placed 'var' an initializer would fill is refused the same way")
+pai_placed_var_refused()
+    pai_skip()
+
+    assert_eq(pai_archive("extern \"rom_next\" next() -> u32\n\n@section(\".ram.v\")\nvar V: u32 = next()\n",
+                          pai_thumb()),
+              pai_placed("V", ".ram.v", s"'V' calls 'next', $pai_outside"))
+end pai_placed_var_refused
+
+@test("a placed 'var' with no initializer, and one over a literal, are not refused")
+pai_placed_data_accepted()
+    pai_skip()
+
+    val out = pai_archive("@section(\".noinit\")\nvar Z: u32\n\n@section(\".ram.w\")\nvar W: u32 = 5\n",
+                          pai_thumb())
+
+    pai_laid_down(out, "@W = private global i32 5, section \".ram.w\"\n")
+    assert(out.contains("@Z = private global i32 zeroinitializer, section \".noinit\"\n"), out)
+end pai_placed_data_accepted
+
+@test("a placed 'val' an initializer would fill is not refused on a hosted machine, whose loader fills it")
+pai_placed_code_hosted()
+    val t = host_target()
+
+    if pai_library_for(t).is_empty() then skip("the standard module's source is not on this machine")
+
+    val out = pai_archive("extern \"rom_next\" next() -> u32\n\n@section(\".pai.g\")\nval G: u32 = next()\n", t)
+
+    assert(out.contains("section \".pai.g\""), out)
+end pai_placed_code_hosted
+
+@test("an address cut to a u16 in placed storage is refused, naming the conversion")
+pai_a_narrowed_address_refused()
+    pai_skip()
+
+    assert_eq(pai_archive(pai_rom + "@section(\".rom.n\")\nval N: [2]u16 = [7, u16(usize(&popcount))]\n",
+                          pai_thumb()),
+              pai_placed("N", ".rom.n", "'N' converts an address to ushort, and an address is a word the " +
+                         "linker fills in at the machine's 32 bits — no relocation writes one at 16, so " +
+                         "the conversion is code that runs when the program starts"))
+end pai_a_narrowed_address_refused
+
+@test("an address widened past the machine's word in placed storage is refused the same way")
+pai_a_widened_address_refused()
+    pai_skip()
+
+    assert_eq(pai_archive(pai_rom + "@section(\".rom.w\")\nval W: u64 = u64(usize(&popcount))\n", pai_thumb()),
+              pai_placed("W", ".rom.w", "'W' converts an address to ulong, and an address is a word the " +
+                         "linker fills in at the machine's 32 bits — no relocation writes one at 64, so " +
+                         "the conversion is code that runs when the program starts"))
+end pai_a_widened_address_refused
+
+@test("an address word inside a '@byte_order' struct is refused when placed, naming the struct")
+pai_a_word_in_a_reversed_struct_refused()
+    pai_skip()
+
+    val text = pai_rom + "@byte_order(big)\nstruct Wire\n    tag: u32\n    at: u32\n\n@section(\".rom.r\")\n" +
+               "val R: Wire = Wire(1, u32(usize(&popcount)))\n"
+
+    assert_eq(pai_archive(text, pai_thumb()),
+              pai_placed("R", ".rom.r", "'R' holds an address as an integer in 'Wire', whose fields are " +
+                         "laid down as bits the compiler packs or reverses — and an address is no number " +
+                         "until the linker fills it in"))
+end pai_a_word_in_a_reversed_struct_refused
+
+@test("an address multiplied is not an addend, so it stays code, and placed it is refused")
+pai_other_arithmetic_refused()
+    pai_skip()
+
+    val out = pai_archive(pai_rom + "@section(\".rom.o\")\nval O: u32 = u32(usize(&popcount)) * 2\n", pai_thumb())
+
+    assert(out.starts_with("'O' is placed in section \".rom.o\""), out)
+end pai_other_arithmetic_refused
+
+@test("a function a section places, reaching storage an initializer fills, is refused in a freestanding archive")
+pai_a_placed_function_reaching_code()
+    pai_skip()
+
+    val text = "extern \"rom_next\" next() -> u32\n\nval COUNT: u32 = next()\n\n" +
+               "@section(\".ramfunc\")\ntick() -> u32 = COUNT + 1\n"
+
+    assert_eq(pai_archive(text, pai_thumb()),
+              "'tick' is placed for code outside the program to enter and reaches 'COUNT', which is " +
+              "module storage an initializer fills before the program's own statements run. This " +
+              "artifact has no entry point to fill it in, and 'thumbv6m-freestanding' is freestanding — " +
+              "there is no loader to run a constructor either, so the function would read whatever the " +
+              "image left. Build for a hosted target, where the storage is filled before any export can " +
+              "run, or make the initializer constant data, which is laid straight into the object file. " +
+              s"'COUNT' calls 'next', $pai_outside")
+end pai_a_placed_function_reaching_code
+
+// The archive `build-c` writes for the probe, unpacked, as `arm-none-eabi-objdump` shows its sections.
+private pai_objdump(text: string) -> string
+    val root = make_temp_dir("sysl-pai").unwrap()
+
+    write_text(s"$root/sysl.hocon", "package {\n  name = \"probe\"\n}\n").unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    var said: Buf[string] = buf()
+    val sink = &said
+    var args: Buf[string] = buf()
+
+    for item in ["sysl", "build-c", "--target", "thumbv6m-freestanding", "-o", s"$root/probe.a", root]
+        args.push(item)
+
+    val code = run_cli(args.view(), piece -> sink.push(piece))
+
+    reset_search_paths()
+
+    if code != 0
+        remove_dir_all(root).unwrap_or(())
+        return join(said.view(), "\n")
+    end if
+
+    capture("/opt/homebrew/opt/llvm/bin/llvm-ar", ["x", s"--output=$root", s"$root/probe.a", "sysl.code.o"]).unwrap()
+
+    val out = capture("arm-none-eabi-objdump", ["-r", "-s", "-j", ".rom.a", s"$root/sysl.code.o"]) match
+        Ok(o) -> o.text
+        Err(_) -> "arm-none-eabi-objdump could not be run"
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end pai_objdump
+
+@test("the placed table's object carries an R_ARM_ABS32 for the address and the literal beside it")
+pai_the_rom_table_object()
+    if !std_root().is_ok() || !clang_available() then skip("no clang or no standard library")
+    if !is_file("/opt/homebrew/opt/llvm/bin/llvm-ar") then skip("there is no llvm-ar")
+    if !is_file("/opt/homebrew/bin/arm-none-eabi-objdump") then skip("there is no arm-none-eabi-objdump")
+
+    val out = pai_objdump(pai_rom + "@section(\".rom.a\")\nval A: [3]u32 = [7, u32(usize(&popcount)), " +
+                          "u32(usize(&popcount)) + 1]\n")
+
+    assert(out.contains("00000004 R_ARM_ABS32       rom_popcount32"), out)
+    assert(out.contains("00000008 R_ARM_ABS32       rom_popcount32"), out)
+    assert(out.contains(" 0000 07000000 00000000 01000000"), out)
+end pai_the_rom_table_object
+
+// What a project of one file prints when it is built and run on this machine.
+private pai_prints(text: string) -> string
+    val root = make_temp_dir("sysl-pai-run").unwrap()
+
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return s"did not build: ${failure_text(why)}"
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end pai_prints
+
+@test("on a hosted machine the laid-down words are the addresses, and storage that stays code is still filled")
+pai_hosted_values()
+    if !std_root().is_ok() || !clang_available() then skip("no clang or no standard library")
+
+    val text = "f() -> int = 1\n\nval T: [2]usize = [usize(&f), usize(&f) + 8]\n\n" +
+               "val L: u16 = u16(usize(&f) & 0xffff)\n\n" +
+               "print(T[0] == usize(&f), T[1] - T[0], L == u16(usize(&f) & 0xffff), L != 0 || T[0] != 0)\n"
+
+    assert_eq(pai_prints(text), "true 8 true true\n")
+end pai_hosted_values
