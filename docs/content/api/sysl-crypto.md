@@ -19,7 +19,21 @@ comparison, and a program checking a tag should reach for it rather than `==`.
 
 ## Index
 
-[`hkdf1`](#hkdf1) [`hkdf1_expand`](#hkdf1_expand) [`hkdf224`](#hkdf224) [`hkdf224_expand`](#hkdf224_expand) [`hkdf256`](#hkdf256) [`hkdf256_expand`](#hkdf256_expand) [`hkdf384`](#hkdf384) [`hkdf384_expand`](#hkdf384_expand) [`hkdf512`](#hkdf512) [`hkdf512_expand`](#hkdf512_expand) [`hmac1`](#hmac1) [`hmac224`](#hmac224) [`hmac256`](#hmac256) [`hmac384`](#hmac384) [`hmac512`](#hmac512) [`hmacmd5`](#hmacmd5) [`md5`](#md5) [`new_md5`](#new_md5) [`new_sha1`](#new_sha1) [`new_sha224`](#new_sha224) [`new_sha256`](#new_sha256) [`new_sha384`](#new_sha384) [`new_sha512`](#new_sha512) [`pbkdf2_hmac1`](#pbkdf2_hmac1) [`pbkdf2_hmac224`](#pbkdf2_hmac224) [`pbkdf2_hmac256`](#pbkdf2_hmac256) [`pbkdf2_hmac384`](#pbkdf2_hmac384) [`pbkdf2_hmac512`](#pbkdf2_hmac512) [`sha1`](#sha1) [`sha224`](#sha224) [`sha256`](#sha256) [`sha384`](#sha384) [`sha512`](#sha512) [`verify`](#verify) [`Fault`](#fault) [`Md5`](#md5-1) [`Sha1`](#sha1-1) [`Sha224`](#sha224-1) [`Sha256`](#sha256-1) [`Sha384`](#sha384-1) [`Sha512`](#sha512-1) [Compression for Md5C](#compression-for-md5c) [Compression for Sha1C](#compression-for-sha1c) [Compression for Sha2Narrow](#compression-for-sha2narrow) [Compression for Sha2Wide](#compression-for-sha2wide) [Word for u32](#word-for-u32) [Word for u64](#word-for-u64)
+[`sha224_init`](#sha224_init) [`sha256_init`](#sha256_init) [`hkdf1`](#hkdf1) [`hkdf1_expand`](#hkdf1_expand) [`hkdf224`](#hkdf224) [`hkdf224_expand`](#hkdf224_expand) [`hkdf256`](#hkdf256) [`hkdf256_expand`](#hkdf256_expand) [`hkdf384`](#hkdf384) [`hkdf384_expand`](#hkdf384_expand) [`hkdf512`](#hkdf512) [`hkdf512_expand`](#hkdf512_expand) [`hmac1`](#hmac1) [`hmac224`](#hmac224) [`hmac256`](#hmac256) [`hmac384`](#hmac384) [`hmac512`](#hmac512) [`hmacmd5`](#hmacmd5) [`md5`](#md5) [`new_md5`](#new_md5) [`new_sha1`](#new_sha1) [`new_sha224`](#new_sha224) [`new_sha256`](#new_sha256) [`new_sha384`](#new_sha384) [`new_sha512`](#new_sha512) [`pbkdf2_hmac1`](#pbkdf2_hmac1) [`pbkdf2_hmac224`](#pbkdf2_hmac224) [`pbkdf2_hmac256`](#pbkdf2_hmac256) [`pbkdf2_hmac384`](#pbkdf2_hmac384) [`pbkdf2_hmac512`](#pbkdf2_hmac512) [`sha1`](#sha1) [`sha224`](#sha224) [`sha256`](#sha256) [`sha256_compress`](#sha256_compress) [`sha384`](#sha384) [`sha512`](#sha512) [`verify`](#verify) [`Fault`](#fault) [`Md5`](#md5-1) [`Sha1`](#sha1-1) [`Sha224`](#sha224-1) [`Sha256`](#sha256-1) [`Sha384`](#sha384-1) [`Sha512`](#sha512-1) [Compression for Md5C](#compression-for-md5c) [Compression for Sha1C](#compression-for-sha1c) [Compression for Sha2Narrow](#compression-for-sha2narrow) [Compression for Sha2Wide](#compression-for-sha2wide) [Word for u32](#word-for-u32) [Word for u64](#word-for-u64)
+
+## Values
+
+### `sha224_init`
+
+```sysl
+val sha224_init: [8]u32 = iv224
+```
+
+### `sha256_init`
+
+```sysl
+val sha256_init: [8]u32 = iv256
+```
 
 ## Functions
 
@@ -304,6 +318,12 @@ sha224(data: []const u8) -> [28]u8
 
 ```sysl
 sha256(data: []const u8) -> [32]u8
+```
+
+### `sha256_compress`
+
+```sysl
+sha256_compress(state: *[8]u32, block: []const u8)
 ```
 
 ### `sha384`
