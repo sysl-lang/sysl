@@ -284,6 +284,19 @@ private ic_reach(m: *IcModel, k: usize, alias: string) -> string
     m.records.set(k, r)
     r.sysl
 
+// An enum of a followed header that something generated here uses, named the first time as a record
+// is; its `c type` and constants are written with the header's own (`ic_render`).
+private ic_reach_enum(m: *IcModel, k: usize) -> string
+    if !m.reach_on then return "?"
+
+    var e = m.enums.at(k)
+
+    if e.sysl == "" then e.sysl = ic_unique(&m.used, ic_type_name(if e.named != "" then e.named else e.tag, m.prefix))
+
+    e.reached = true
+    m.enums.set(k, e)
+    e.sysl
+
 // **A record named in a declaration, as sysl writes it there**, or why it cannot be. `shown` is the
 // C spelling a refusal quotes, and `alias` the typedef another header names the record by, which a
 // record only pointed at is named for.
@@ -353,6 +366,7 @@ private ic_map_named(spec: string, pos: int, m: *IcModel, depth: int) -> Result[
                 val e = m.enums.at(k)
 
                 if e.main && e.sysl != "" then return Ok(e.sysl)
+                if e.followed && (e.named != "" || e.tag != "") then return Ok(ic_reach_enum(m, k))
             None -> ()
 
         return Err(s"'$spec', an enum declared by another header")
@@ -969,6 +983,18 @@ ic_render(m: *IcModel, spelled: string, opts: IcOptions, macros: Buf[string], ba
                 ic_emit_record(m, r, r.sysl, IcPlace(ic_c_record(r), ""), followed_sinks)
             else
                 followed.push(s"opaque struct ${r.sysl}\n\n")
+
+    // The followed headers' enums that something above uses -- a record just laid out among them --
+    // each a `c type` with its constants, after the header's own.
+    for e in m.enums
+        if e.main || !e.reached then continue
+
+        val c_name = if e.named != "" then e.named else s"enum ${e.tag}"
+
+        ctypes.push(s"    ${e.sysl} = \"$c_name\"\n")
+
+        for c in e.consts
+            consts.push(s"    ${ic_unique(&used_consts, ic_const_name(c, m.prefix))}: ${e.sysl} = \"$c\"\n")
 
     // Only now, since a macro's type may be the first to need one.
     if m.clong then ctypes.push("    CLong = \"long\"\n")

@@ -1,0 +1,635 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.{capture, Var}
+import sysl.text.{cstring, Join, Search}
+
+// **A closure the compiler supplies as a default argument is kept as often as it is passed**
+// (`keeps_flow.sysl`'s `has_site`). A default is spanned at the callee's declaration, so every call
+// that takes it hands its own closure over at ONE span. The frame probe told two keeps apart by
+// location and span only, so a second call keeping the default at the same location -- `a.close()`
+// on an early way out and again at the end, the shape libuv's `Handle.close(cb = noop)` takes -- was
+// read as the first one again: its closure was laid in the frame, the handle kept it, and the release
+// when the handle closed ran a destructor slot out of a frame that had gone ("faulted on an address
+// it does not own", found by funl on 0.8.1, debug and release alike).
+//
+// The cells cross the way out the cleanup takes (`return` from a `match` arm, `break` and `continue`
+// in a loop, a failing `?`, the early `if` of an unwrapped value), the arm order, whether the cleanup
+// touches the value kept before, an `Option` match, a nested match, an `is` condition, a match as an
+// argument, both arms producing a value, a `var` binding, and the default's shape (a closure literal,
+// a function name, a trait's default method passing it on). Every value is handed out of its frame
+// and its closure run after, and each is dropped exactly once; the build modes are debug, release,
+// the counted heap and AddressSanitizer with stack-use-after-return on.
+//
+// A default that is overwritten before every way out, or only called, still costs nothing: those
+// stay in the frame.
+
+private extern "setenv" dak_c_setenv(name: *u8, value: *u8, overwrite: int) -> int
+private extern "unsetenv" dak_c_unsetenv(name: *u8) -> int
+
+private struct DakRun
+    out: string
+    err: string
+    hooks: usize
+end DakRun
+
+// The program built in `debug` or release and run: on the counted heap, or with `flags` handed to
+// clang and AddressSanitizer told to catch a frame read after its return.
+private dak_run(text: string, debug: bool, counted: bool, flags: string) -> DakRun
+    val root = make_temp_dir("sysl-dak").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", forms_imported(text)).unwrap()
+
+    val exe = s"$root/built"
+    val was = overflow_checks()
+
+    if flags != ""
+        val n = cstring("SYSL_EXTRA_CFLAGS")
+        val v = cstring(flags)
+
+        dak_c_setenv(n.ptr, v.ptr, 1)
+    end if
+
+    use_overflow_checks(debug)
+    force_alloc_counting(counted)
+
+    val made = build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe))
+
+    force_alloc_counting(false)
+    use_overflow_checks(was)
+
+    if flags != ""
+        val n = cstring("SYSL_EXTRA_CFLAGS")
+
+        dak_c_unsetenv(n.ptr)
+    end if
+
+    made match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return DakRun(failure_text(why), "", 0)
+        Ok(_) -> ()
+
+    val hooks = capture("nm", ["-u", exe], "", [], true) match
+        Ok(o) -> o.text.count_of("__asan_report")
+        Err(_) -> 0
+
+    val ran = capture(exe, [], "", [Var("ASAN_OPTIONS", "detect_stack_use_after_return=1")], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    ran match
+        Err(_) -> DakRun("could not be started", "", hooks)
+        Ok(o) -> DakRun(o.text, o.err.unwrap_or(""), hooks)
+end dak_run
+
+private dak_ir(text: string) -> string
+    val root = make_temp_dir("sysl-dak").unwrap()
+
+    write_text(s"$root/main.sysl", forms_imported(text)).unwrap()
+
+    val out = emit_llvm_text(s"$root/main.sysl", None) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> if made.report.is_empty() then made.text else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end dak_ir
+
+// One function's emitted text, from its `define` to the brace that closes it.
+private dak_body(ir: string, symbol: string) -> string
+    var out: Buf[string] = buf()
+    var inside = false
+
+    for line in lines_of(ir).view()
+        if !inside && line.starts_with("define ") && line.contains(s"@$symbol(") then inside = true
+
+        if inside
+            out.push(line)
+
+            if line == "}" then break
+
+    if out.is_empty() then s"no definition of '$symbol'" else out.join("\n")
+end dak_body
+
+private dak_lines_with(text: string, part: string) -> int
+    var n = 0
+
+    for line in lines_of(text).view()
+        if line.contains(part) then n += 1
+
+    n
+end dak_lines_with
+
+// What `--explain-escapes` reports for a program.
+private dak_explained(text: string) -> Buf[string]
+    var notes: Buf[string] = buf()
+    val root = make_temp_dir("sysl-dak").unwrap()
+
+    write_text(s"$root/main.sysl", forms_imported(text)).unwrap()
+
+    var lines: Buf[string] = buf()
+    val sink = &lines
+    val noted = &notes
+    var args: Buf[string] = buf()
+
+    args.push("sysl")
+    args.push("emit-llvm")
+    args.push("--explain-escapes")
+    args.push(s"$root/main.sysl")
+
+    run_cli_noted(args.view(), (line) -> sink.push(line), (line) -> noted.push(line))
+    remove_dir_all(root).unwrap_or(())
+    notes
+end dak_explained
+
+// -- the matrix -----------------------------------------------------------------------------------
+
+private const dak_matrix: string = raw"""
+    struct Res
+        id: int
+        cb: &Fn() -> unit
+
+        close(*self, cb: &Fn() -> unit = () -> print("closed")) = self.cb = cb
+
+        shut(*self, cb: &Fn() -> unit = quiet) = self.cb = cb
+
+    impl Drop for Res
+        drop(self) = print("drop", self.id)
+
+    quiet() -> unit = print("quiet")
+
+    trait Handle
+        finish(*self, cb: &Fn() -> unit)
+
+        end_it(*self, cb: &Fn() -> unit = () -> print("ended")) = self.finish(cb)
+
+    impl Handle for Res
+        finish(*self, cb: &Fn() -> unit) = self.cb = cb
+
+    open(id: int, ok: bool) -> Result[&Res, string] = if ok then Ok(Res(id, quiet)) else Err("refused")
+
+    find(id: int, ok: bool) -> Option[&Res] = if ok then Some(Res(id, quiet)) else None
+
+    pair(a: &Res, b: &Res) -> (&Res, &Res) = (a, b)
+
+    reported(base: int, ok: bool) -> (&Res, &Res)
+        val a = open(base, true).unwrap()
+        val b = open(base + 1, ok) match
+            Ok(x) -> x
+            Err(_) ->
+                a.close()
+                return (a, a)
+
+        a.close()
+        b.close()
+        (a, b)
+
+    swapped(base: int, ok: bool) -> (&Res, &Res)
+        val a = open(base, true).unwrap()
+        val b = open(base + 1, ok) match
+            Err(_) ->
+                a.close()
+                return (a, a)
+            Ok(x) -> x
+
+        a.close()
+        b.close()
+        (a, b)
+
+    untouched(base: int, ok: bool) -> (&Res, &Res)
+        val a = open(base, true).unwrap()
+        val b = open(base + 1, ok) match
+            Ok(x) -> x
+            Err(_) -> return (a, a)
+
+        a.close()
+        b.close()
+        (a, b)
+
+    looped(base: int, ok: bool, stop: bool) -> (&Res, &Res)
+        val a = open(base, true).unwrap()
+        var last = a
+
+        for i in 1..<3
+            val b = open(base + i, ok) match
+                Ok(x) -> x
+                Err(_) ->
+                    a.close()
+                    if stop then break
+                    continue
+
+            b.close()
+            last = b
+
+        (a, last)
+
+    tried(base: int, ok: bool) -> Result[(&Res, &Res), string]
+        val a = open(base, true)?
+        val b = open(base + 1, ok)?
+
+        a.close()
+        b.close()
+        Ok((a, b))
+
+    optional(base: int, ok: bool) -> (&Res, &Res)
+        val a = open(base, true).unwrap()
+        val b = find(base + 1, ok) match
+            Some(x) -> x
+            None ->
+                a.close()
+                return (a, a)
+
+        a.close()
+        b.close()
+        (a, b)
+
+    nested(base: int, ok: bool, inner: bool) -> (&Res, &Res)
+        val a = open(base, true).unwrap()
+        val b = open(base + 1, ok) match
+            Ok(x) -> find(base + 2, inner) match
+                Some(y) ->
+                    x.close()
+                    y
+                None ->
+                    a.close()
+                    x.close()
+                    return (a, x)
+            Err(_) ->
+                a.close()
+                return (a, a)
+
+        a.close()
+        b.close()
+        (a, b)
+
+    tested(base: int, ok: bool) -> (&Res, &Res)
+        val a = open(base, true).unwrap()
+
+        if open(base + 1, ok) is Ok(x)
+            a.close()
+            x.close()
+            return (a, x)
+
+        a.close()
+        (a, a)
+
+    operand(base: int, ok: bool) -> (&Res, &Res)
+        val a = open(base, true).unwrap()
+        a.close()
+
+        val p = pair(a, open(base + 1, ok) match
+            Ok(x) -> x
+            Err(_) ->
+                a.close()
+                return (a, a))
+
+        p.1.close()
+        p
+
+    both(base: int, ok: bool) -> (&Res, &Res)
+        val a = open(base, true).unwrap()
+        val b = open(base + 1, ok) match
+            Ok(x) -> x
+            Err(_) -> open(base + 2, true).unwrap()
+
+        a.close()
+        b.close()
+        (a, b)
+
+    variable(base: int, ok: bool) -> (&Res, &Res)
+        var a = open(base, true).unwrap()
+        var b = open(base + 1, ok) match
+            Ok(x) -> x
+            Err(_) ->
+                a.close()
+                return (a, a)
+
+        a.close()
+        b.close()
+        (a, b)
+
+    others(base: int, ok: bool) -> (&Res, &Res)
+        val a = open(base, true).unwrap()
+        val b = open(base + 1, ok) match
+            Ok(x) -> x
+            Err(_) ->
+                a.shut()
+                return (a, a)
+
+        a.shut()
+        b.end_it()
+        a.end_it()
+        b.shut()
+        (a, b)
+
+    unwrapped(base: int, ok: bool) -> (&Res, &Res)
+        val a = open(base, true).unwrap()
+
+        if !ok
+            a.close()
+            return (a, a)
+
+        val b = open(base + 1, true).unwrap()
+
+        a.close()
+        b.close()
+        (a, b)
+
+    show(p: (&Res, &Res))
+        print("ids", p.0.id, p.1.id)
+        p.0.cb()
+        p.1.cb()
+
+    show(reported(10, true))
+    show(reported(20, false))
+    show(swapped(30, true))
+    show(swapped(40, false))
+    show(untouched(50, true))
+    show(untouched(60, false))
+    show(looped(70, true, false))
+    show(looped(80, false, false))
+    show(looped(90, false, true))
+    tried(100, true) match
+        Ok(p) -> show(p)
+        Err(e) -> print(e)
+    tried(110, false) match
+        Ok(p) -> show(p)
+        Err(e) -> print(e)
+    show(optional(120, true))
+    show(optional(130, false))
+    show(nested(140, true, true))
+    show(nested(150, true, false))
+    show(nested(160, false, true))
+    show(tested(170, true))
+    show(tested(180, false))
+    show(operand(190, true))
+    show(operand(200, false))
+    show(both(210, true))
+    show(both(220, false))
+    show(variable(230, true))
+    show(variable(240, false))
+    show(others(250, true))
+    show(others(260, false))
+    show(unwrapped(270, true))
+    show(unwrapped(280, false))
+    print("done")
+    """
+
+// Every value is dropped once, and a value whose default was never kept answers `quiet`.
+private const dak_matrix_output: string = raw"""
+    ids 10 11
+    closed
+    closed
+    drop 10
+    drop 11
+    ids 20 20
+    closed
+    closed
+    drop 20
+    ids 30 31
+    closed
+    closed
+    drop 30
+    drop 31
+    ids 40 40
+    closed
+    closed
+    drop 40
+    ids 50 51
+    closed
+    closed
+    drop 50
+    drop 51
+    ids 60 60
+    quiet
+    quiet
+    drop 60
+    drop 71
+    ids 70 72
+    quiet
+    closed
+    drop 70
+    drop 72
+    ids 80 80
+    closed
+    closed
+    drop 80
+    ids 90 90
+    closed
+    closed
+    drop 90
+    ids 100 101
+    closed
+    closed
+    drop 100
+    drop 101
+    drop 110
+    refused
+    ids 120 121
+    closed
+    closed
+    drop 120
+    drop 121
+    ids 130 130
+    closed
+    closed
+    drop 130
+    drop 141
+    ids 140 142
+    closed
+    closed
+    drop 140
+    drop 142
+    ids 150 151
+    closed
+    closed
+    drop 150
+    drop 151
+    ids 160 160
+    closed
+    closed
+    drop 160
+    ids 170 171
+    closed
+    closed
+    drop 170
+    drop 171
+    ids 180 180
+    closed
+    closed
+    drop 180
+    ids 190 191
+    closed
+    closed
+    drop 190
+    drop 191
+    ids 200 200
+    closed
+    closed
+    drop 200
+    ids 210 211
+    closed
+    closed
+    drop 210
+    drop 211
+    ids 220 222
+    closed
+    closed
+    drop 220
+    drop 222
+    ids 230 231
+    closed
+    closed
+    drop 230
+    drop 231
+    ids 240 240
+    closed
+    closed
+    drop 240
+    ids 250 251
+    ended
+    quiet
+    drop 250
+    drop 251
+    ids 260 260
+    quiet
+    quiet
+    drop 260
+    ids 270 271
+    closed
+    closed
+    drop 270
+    drop 271
+    ids 280 280
+    closed
+    closed
+    drop 280
+    done
+    """
+
+@test("a default kept by a call on every way out: each value dropped once, in debug, on the counted heap")
+dak_matrix_debug()
+    if !enm_ready() then return
+
+    val got = dak_run(dak_matrix, true, true, "")
+
+    assert_eq(got.out, dak_matrix_output)
+    assert_eq(got.err, "")
+
+@test("a default kept by a call on every way out: each value dropped once, in release, on the counted heap")
+dak_matrix_release()
+    if !enm_ready() then return
+
+    val got = dak_run(dak_matrix, false, true, "")
+
+    assert_eq(got.out, dak_matrix_output)
+    assert_eq(got.err, "")
+
+@test("a default kept by a call on every way out: under AddressSanitizer, no frame read after its return")
+dak_matrix_asan()
+    if !enm_ready() then return
+
+    for debug in [true, false]
+        val got = dak_run(dak_matrix, debug, false, "-fsanitize=address -g")
+
+        assert(got.hooks > 0, s"not instrumented: ${got.out}")
+        assert_eq(got.out, dak_matrix_output)
+        assert_eq(got.err, "")
+
+// Only `others` lays a default in its frame: `a.shut()` and `b.end_it()` are overwritten by
+// `a.end_it()` and `b.shut()` before the one way out they reach, so nothing holds them past it.
+@test("every default a call keeps is boxed on the heap, the second at one span as much as the first")
+dak_matrix_heap_boxes()
+    if xvr_no_library() then return
+
+    val ir = dak_ir(dak_matrix)
+
+    assert_eq(dak_lines_with(ir, "= alloca %arc.$closure"), 2)
+    assert_eq(dak_lines_with(dak_body(ir, "others$$sysl"), "= alloca %arc.$closure"), 2)
+
+    for name in ["reported", "swapped", "untouched", "looped", "tried", "optional", "nested", "tested",
+                 "operand", "both", "variable", "unwrapped"]
+        val f = dak_body(ir, name + "$$sysl")
+
+        assert(f.starts_with("define "), f)
+        assert_eq(dak_lines_with(f, "= alloca %arc.$closure"), 0)
+end dak_matrix_heap_boxes
+
+@test("--explain-escapes names every call that hands 'close' its default, not only the first")
+dak_matrix_explained()
+    if xvr_no_library() then return
+
+    val notes = dak_explained(dak_matrix)
+    var closes = 0
+    var shuts = 0
+    var ends = 0
+
+    for line in notes
+        if line.contains("because it is handed to 'close' on line 5, which keeps its parameter 'cb'") then closes += 1
+        if line.contains("because it is handed to 'shut' on line 7") then shuts += 1
+        if line.contains("because it is handed to 'end_it' on line 17") then ends += 1
+
+    assert_eq(closes, 35)
+    assert_eq(shuts, 2)
+    assert_eq(ends, 1)
+end dak_matrix_explained
+
+// -- what still stays in the frame ----------------------------------------------------------------
+
+private const dak_framed: string = raw"""
+    struct Res
+        id: int
+        cb: &Fn() -> unit
+
+        close(*self, cb: &Fn() -> unit = () -> print("closed")) = self.cb = cb
+
+    impl Drop for Res
+        drop(self) = print("drop", self.id)
+
+    quiet() -> unit = print("quiet")
+
+    run(f: &Fn() -> unit = () -> print("ran")) = f()
+
+    twice(ok: bool)
+        run()
+        if !ok
+            run()
+            return
+        run()
+        run()
+
+    twice(true)
+    twice(false)
+    print("done")
+    """
+
+@test("a default only called, at one span from every call, is boxed in the frame each time")
+dak_called_default_framed()
+    if xvr_no_library() then return
+
+    val ir = dak_ir(dak_framed)
+    val f = dak_body(ir, "twice$$sysl")
+
+    assert_eq(dak_lines_with(f, "= alloca %arc.$closure"), 4)
+    assert_eq(dak_lines_with(f, "@malloc"), 0)
+
+@test("and the frame-boxed defaults run clean, on the counted heap and under AddressSanitizer")
+dak_called_default_runs_clean()
+    if !enm_ready() then return
+
+    val want = "ran\nran\nran\nran\nran\ndone\n"
+    val counted = dak_run(dak_framed, true, true, "")
+
+    assert_eq(counted.out, want)
+    assert_eq(counted.err, "")
+
+    val sanitized = dak_run(dak_framed, true, false, "-fsanitize=address -g")
+
+    assert(sanitized.hooks > 0, s"not instrumented: ${sanitized.out}")
+    assert_eq(sanitized.out, want)
+    assert_eq(sanitized.err, "")
+end dak_called_default_runs_clean

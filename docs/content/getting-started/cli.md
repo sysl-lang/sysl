@@ -904,10 +904,12 @@ unnamed record type (`union { … } v;`) gets a type of its own named for both (
 its bytes, `_ld: [SIZEOF_ALT_LD]u8`, with the union's boundary said by `@align(ALIGNOF_ALT)`. A plain
 `char` is `i8` as a value and `u8` behind a pointer.
 
-**`--follow <header>`** lays out the records another header declares where this header uses them by
-value — `struct timespec` passed to a function, say — with the same checks as its own; a header is
-matched by its path or by the end of it (`--follow _timespec.h`). Only what is used is written. Without
-it such a declaration is refused, and the refusal names the `--follow` that would lay it out.
+**`--follow <header>`** brings across the records and enums another header declares where this header
+uses them — `struct timespec` passed to a function by value, say, laid out with the same checks as its
+own, or an enum a function takes, written as a `c type` with its enumerators at it whether it is
+tagged, typedef'd or an anonymous enum named by a typedef. A header is matched by its path or by the
+end of it (`--follow _timespec.h`). Only what is used is written. Without it such a declaration is
+refused, and the refusal of a record names the `--follow` that would lay it out.
 
 **`--shim <file.c>`** writes a C wrapper for each `static inline` function and each function-like
 macro, which have no symbol to link against, and an `extern` for it in the module:
@@ -947,8 +949,8 @@ the first `-I` holding it, or its file name. `--module` and `--link-lib` put a `
 again in a comment at the foot of the module. A record with a flexible array member, one laid out
 under `#pragma pack`, one with an `aligned` whose value is not a literal, and one with a bitfield
 whose unit is not an integer of 8 to 64 bits (`long x : 3`) stay `opaque`, with `SIZEOF_`/`ALIGNOF_`
-constants so a caller can still allocate one. A string macro and a record from another header passed by
-value without `--follow` are refused by name. The command still succeeds: a header with one unbindable macro is worth the
+constants so a caller can still allocate one. A string macro, and a record passed by value or an enum
+from another header without `--follow`, are refused by name. The command still succeeds: a header with one unbindable macro is worth the
 rest.
 
 ### `targets`

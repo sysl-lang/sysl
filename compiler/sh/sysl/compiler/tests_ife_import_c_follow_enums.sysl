@@ -1,0 +1,132 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.{join, split}
+
+// `sysl import-c --follow` brings a followed header's enums across exactly as it brings its records:
+// an enum a function or a laid-out record uses is written once, as a `c type` with its enumerators at
+// it, under the name a record of that header would take -- tagged, typedef'd under its own tag's name
+// (Manifold's `typedef enum ManifoldOpType {...} ManifoldOpType`), or anonymous and named only by a
+// typedef. Without `--follow` the same functions are refused as before. The module is then built and
+// called against C that hands back a different enumerator than it was given, so a constant read at
+// the wrong value cannot pass.
+
+// The followed header: a tagged enum, a typedef'd one, an anonymous one named by its typedef, an enum
+// whose constant only sizes an array, one nothing uses, and a record holding two of them.
+private val ife_types: string = raw"""
+    enum fe_op { FE_ADD, FE_SUB = 5, FE_MUL };
+    typedef enum fe_fill { FE_EVEN_ODD, FE_NON_ZERO = 3 } fe_fill;
+    typedef enum { FE_ROUND = 2, FE_SQUARE = 7 } fe_join;
+    enum fe_size { FE_N = 3 };
+    enum fe_unused { FE_NEVER = 9 };
+    struct fe_box { enum fe_op op; float v[FE_N]; fe_join j; };
+    """
+
+private val ife_header: string = raw"""
+    #include "fe_types.h"
+    enum fe_op fe_apply(enum fe_op op);
+    fe_fill fe_flip(fe_fill f);
+    fe_join fe_join_of(fe_join j);
+    int fe_box_sum(struct fe_box b);
+    """
+
+private val ife_c: string = raw"""
+    #include "fe.h"
+    enum fe_op fe_apply(enum fe_op op) { return op == FE_SUB ? FE_MUL : FE_ADD; }
+    fe_fill fe_flip(fe_fill f) { return f == FE_EVEN_ODD ? FE_NON_ZERO : FE_EVEN_ODD; }
+    fe_join fe_join_of(fe_join j) { return j == FE_ROUND ? FE_SQUARE : FE_ROUND; }
+    int fe_box_sum(struct fe_box b) { return (int)b.op * 100 + (int)b.j * 10 + (int)b.v[2]; }
+    """
+
+private ife_ready() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+    end if
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+    end if
+
+    true
+end ife_ready
+
+private ife_fixture() -> string
+    val dir = make_temp_dir("sysl-ife").unwrap()
+
+    write_text(s"$dir/fe.h", ife_header).unwrap()
+    write_text(s"$dir/fe_types.h", ife_types).unwrap()
+    dir
+
+private ife_generated(dir: string, follow: bool) -> IcOutput
+    var followed: Buf[string] = buf()
+
+    if follow then followed.push("fe_types.h")
+
+    import_c_generate(s"$dir/fe.h", IcOptions("fe_", "", "", "", None, followed, "")).unwrap()
+
+@test("without '--follow' a function taking another header's enum is still refused, as before")
+ife_unfollowed_refused()
+    if !ife_ready() then return
+
+    val dir = ife_fixture()
+    val out = ife_generated(dir, false)
+    val refused = join(out.refused.view(), "\n")
+
+    remove_dir_all(dir).unwrap_or(())
+    assert(refused.contains("fe_apply: 'enum fe_op', an enum declared by another header"), refused)
+    assert(refused.contains("fe_flip: 'enum fe_fill', an enum declared by another header"), refused)
+    // clang spells the anonymous enum by the typedef that names it.
+    assert(refused.contains("fe_join_of: 'enum fe_join', an enum declared by another header"), refused)
+    assert(!out.text.contains("c type"), out.text)
+end ife_unfollowed_refused
+
+@test("'--follow' writes a followed header's enums -- tagged, typedef'd, anonymous -- and types the functions")
+ife_follow_enums_text()
+    if !ife_ready() then return
+
+    val dir = ife_fixture()
+    val out = ife_generated(dir, true)
+
+    remove_dir_all(dir).unwrap_or(())
+    assert_eq(join(out.refused.view(), "\n"), "")
+    assert(out.text.contains("c type\n    Op = \"enum fe_op\"\n    Fill = \"fe_fill\"\n    Join = \"fe_join\"\n\n"), out.text)
+    assert(out.text.contains("    ADD: Op = \"FE_ADD\"\n    SUB: Op = \"FE_SUB\"\n    MUL: Op = \"FE_MUL\"\n"), out.text)
+    assert(out.text.contains("    EVEN_ODD: Fill = \"FE_EVEN_ODD\"\n    NON_ZERO: Fill = \"FE_NON_ZERO\"\n"), out.text)
+    assert(out.text.contains("    ROUND: Join = \"FE_ROUND\"\n    SQUARE: Join = \"FE_SQUARE\"\n"), out.text)
+    assert(out.text.contains("extern \"fe_apply\" apply(op: Op) -> Op\n"), out.text)
+    assert(out.text.contains("extern \"fe_flip\" flip(f: Fill) -> Fill\n"), out.text)
+    assert(out.text.contains("extern \"fe_join_of\" join_of(j: Join) -> Join\n"), out.text)
+    assert(out.text.contains("struct Box\n    op: Op\n    v: [3]f32\n    j: Join\n"), out.text)
+
+    // Written once each, and only what is used: the enum sizing an array is folded into the array's
+    // length by C, and the unused one is left out.
+    assert_eq(split(out.text, "= \"enum fe_op\"").len, 2)
+    assert(!out.text.contains("FE_N\""), out.text)
+    assert(!out.text.contains("FE_NEVER"), out.text)
+    assert(!out.text.contains("Unused"), out.text)
+end ife_follow_enums_text
+
+@test("the followed enums build, read back C's numbers, and cross into C and back as the enum")
+ife_follow_enums_run()
+    if !ife_ready() then return
+
+    val dir = ife_fixture()
+    val out = ife_generated(dir, true)
+
+    write_text(s"$dir/fe.c", ife_c).unwrap()
+    write_text(s"$dir/package.hocon", "package {\n  name = \"fe\"\n  version = \"0.0.1\"\n}\n").unwrap()
+    write_text(s"$dir/main.sysl", out.text + "\n" +
+               "print(ADD, SUB, MUL, NON_ZERO, ROUND, SQUARE, sizeof(Op), sizeof(Join))\n" +
+               "print(apply(SUB), apply(MUL), flip(EVEN_ODD), join_of(ROUND), box_sum(Box(MUL, [0.0, 0.0, 4.0], SQUARE)))\n").unwrap()
+
+    val (code, _, err) = clx_ran(["sysl", "build", dir, "-o", s"$dir/fe"])
+    val ran = if code == Fine then capture(s"$dir/fe", [], "", [], true).unwrap().text else err
+
+    remove_dir_all(dir).unwrap_or(())
+    assert_eq(ran, "0 5 6 3 2 7 4 4\n6 0 3 7 674\n")
+end ife_follow_enums_run
