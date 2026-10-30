@@ -544,7 +544,7 @@ is not in a struct, or a struct whose fields disagree.
 ### `Float`
 
 ```sysl
-trait Float: Zero + One + Eq + Ord + Neg + Add + Sub + Mul + Div
+trait Float: Zero + One + Eq + Ord + Neg + Add + Sub + Mul + Div + Display + Debug
     max_value() -> Self
     epsilon() -> Self
     infinity() -> Self
