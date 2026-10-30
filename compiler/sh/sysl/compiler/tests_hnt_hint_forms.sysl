@@ -370,6 +370,27 @@ private hnt_body(listing: string, name: string) -> string
     out
 end hnt_body
 
+// Every function body of a listing that holds this mnemonic.
+private hnt_bodies_with(listing: string, mnemonic: string) -> Buf[string]
+    var out: Buf[string] = buf()
+    var body = ""
+    var inside = false
+
+    for line in lines_of(listing)
+        if line.ends_with(">:")
+            inside = true
+            body = ""
+        elif inside && line.trim() == ""
+            inside = false
+            if hnt_count(body, mnemonic) > 0 then out.push(body)
+        elif inside
+            body = body + line + "\n"
+
+    if inside && hnt_count(body, mnemonic) > 0 then out.push(body)
+
+    out
+end hnt_bodies_with
+
 // How many lines of a body hold this mnemonic, tab-delimited as both disassemblers print it.
 private hnt_count(body: string, mnemonic: string) -> int
     var n = 0
@@ -654,6 +675,12 @@ hnt_wfe_loop_not_hoisted()
                         wfe()
                 """, machine, opt).unwrap()
 
-            hnt_waits_in_the_loop(hnt_body(text, "wait"))
-            hnt_waits_in_the_loop(hnt_body(text, "spin"))
+            // At -Oz an export can stay a call of the function it exports, so every function body
+            // holding a `wfe` is the loop asked about -- two of them at least, one per function.
+            val bodies = hnt_bodies_with(text, "wfe")
+
+            assert(bodies.len() >= 2, s"expected wait and spin to hold a wfe each, in:\n$text")
+
+            for body in bodies
+                hnt_waits_in_the_loop(body)
 end hnt_wfe_loop_not_hoisted
