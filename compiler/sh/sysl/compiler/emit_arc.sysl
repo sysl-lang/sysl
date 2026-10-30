@@ -137,16 +137,51 @@ end view_owner
 // borrowed -- with its owner word set to null. **Null is the form of a view of a frame's own array**,
 // which every view operation already handles, so the child takes no share of the caller's count and
 // gives none back, and nothing else about the view changes (`borrowed_capture`).
+//
+// **A struct or tuple holding a view is borrowed the same way**: every view in its own storage, at any
+// depth `holds_lent_view` looks through, has its owner nulled, so a child that copies the struct out
+// of its closure, or a field out of the struct, touches no count the caller keeps.
 captured_value(e: *Emit, decl: &StructType, i: usize, v: Val) -> Val
     val fty = decl.fields.at(i).1
 
     if !borrowed_capture(decl, fty) then return v
 
-    val r = fresh_reg(e)
-
-    emit(e, InInsert(r, lty(e, fty), v, LPtr, VNull, index_list(0)))
-    r
+    lent_value(e, fty, v)
 end captured_value
+
+// `v` with the owner of every view `holds_lent_view` finds in it set to null.
+private lent_value(e: *Emit, ty: Type, v: Val) -> Val = underlying(ty) match
+    Slice(_, _) ->
+        val r = fresh_reg(e)
+
+        emit(e, InInsert(r, lty(e, ty), v, LPtr, VNull, index_list(0)))
+        r
+    Struct(d) -> if holds_lent_view(ty) then lent_fields(e, d, v) else v
+    _ -> v
+
+private lent_fields(e: *Emit, d: &StructType, v: Val) -> Val
+    val aggregate = struct_lty(d)
+    val gaps = struct_gaps(e.layout, d)
+    var acc = v
+
+    for i in 0..<d.fields.len()
+        val fty = d.fields.at(i).1
+
+        if !holds_lent_view(fty) then continue
+
+        val at = index_list(llvm_index(gaps, field_slot(d.fields, i)))
+        val f = fresh_reg(e)
+
+        emit(e, InExtract(f, aggregate, acc, at))
+
+        val nulled = lent_value(e, fty, f)
+        val r = fresh_reg(e)
+
+        emit(e, InInsert(r, aggregate, acc, lty(e, fty), nulled, at))
+        acc = r
+
+    acc
+end lent_fields
 
 // Takes a share of everything the value **at an address** refers to, and gives one back.
 //

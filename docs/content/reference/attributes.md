@@ -245,6 +245,55 @@ print(total(b.view()))
 3
 ```
 
+**A struct or tuple holding a view is lent the same way**, whether the child captures it whole or
+reads a field of it: every view in its own storage, at any depth, is stored with a null owner, and
+every other field is asked as anything a `&sync Fn` captures is. So a matrix — a view of its elements
+and the scalars that say how to read them — goes to a child as the bare view does, and the child's
+writes through it are the caller's once the scope closes. A `string` or a `&T` beside the view is
+still refused, by its field's name.
+
+```sysl
+import sysl.buf.{Buf, buf}
+
+struct Scope
+    jobs: Buf[&sync Fn() -> unit]
+
+    @scoped(f)
+    spawn(*self, f: &sync Fn() -> unit) = self.jobs.push(f)
+
+struct Runner
+    n: int
+
+    scope[R](self, body: *Scope -> R) -> R
+        var s = Scope(buf())
+        val r = body(&s)
+
+        for j in s.jobs do j()
+        r
+
+struct Matrix
+    data: []int
+    rows: usize
+    cols: usize
+
+scale(m: Matrix, k: int) -> int
+    Runner(0).scope((s) ->
+        s.spawn(() ->
+            for i in 0..<m.rows * m.cols do m.data[i] *= k)
+        int(m.rows))
+
+var b: Buf[int] = buf()
+
+for i in 1..4 do b.push(i)
+print(scale(Matrix(b.view(), 2, 2), 10))
+print(b.view()[0] + b.view()[3])
+```
+
+```output
+2
+50
+```
+
 Only a closure written at the argument borrows; the same capture anywhere else — a `&sync Fn`
 parameter, a member that is only `@crossing`, a closure made earlier and handed in — is refused as it
 always was. So are a `&T`, a `string`, a `Buf`, and a view whose elements cannot be shared:

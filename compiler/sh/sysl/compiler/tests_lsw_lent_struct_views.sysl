@@ -1,0 +1,384 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// A struct or tuple holding a view, captured by a closure written at a `@scoped` parameter
+// (`reference/attributes.md § @scoped(f)`). It is lent exactly as a bare view is: every view in its own
+// storage is stored with a null owner word, and every other field is asked as anything crossing is
+// (`type_queries.sysl`'s `holds_lent_view`, `sharing.sysl`'s `lent_walk_fields`, `emit_arc.sysl`'s
+// `captured_value`). The shape is a BLAS matrix: a view of the elements and the scalars that say how
+// to read it.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private lsw_outcome(text: string) -> (string, int)
+    val root = make_temp_dir("sysl-lsw").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (failure_text(why), -1)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> ("the program that was built could not be run", -1)
+        Ok(out) -> (out.text + out.err.unwrap_or(""), shell_status(out.status))
+end lsw_outcome
+
+private lsw_prints(text: string, want: string)
+    if xvr_no_library() then return
+
+    val out = lsw_outcome(text)
+
+    assert_eq(out.0, want)
+    assert_eq(out.1, 0)
+end lsw_prints
+
+private lsw_refused(text: string, part: string)
+    if xvr_no_library() then return
+
+    val out = lsw_outcome(text)
+
+    assert_eq(out.1, -1, out.0)
+    assert(out.0.index_of(part).is_some(), out.0)
+end lsw_refused
+
+// A scope that queues each job and runs them once the lender's body is done, and a matrix.
+private lsw_scope() -> string = raw"""
+    import sysl.buf.{Buf, buf}
+
+    struct Scope
+        jobs: Buf[&sync Fn() -> unit]
+
+        @scoped(f)
+        spawn(*self, f: &sync Fn() -> unit) = self.jobs.push(f)
+
+    struct Runner
+        n: int
+
+        scope[R](self, body: *Scope -> R) -> R
+            var s = Scope(buf())
+            val r = body(&s)
+
+            for j in s.jobs do j()
+            r
+
+    struct Matrix
+        data: []int
+        rows: usize
+        cols: usize
+
+    struct Thing
+        n: int
+
+    numbers(n: int) -> Buf[int]
+        var b: Buf[int] = buf()
+
+        for i in 1..n do b.push(i)
+        b
+
+    """
+
+private lsw_head(what: string) -> string =
+    "a closure shared between two domains may be called from either, so every count it captures " +
+    s"has to be atomic — but the $what"
+
+// -- what is lent ---------------------------------------------------------------------------------
+
+@test("a struct holding a view is captured through a field at a scoped parameter")
+lsw_through_a_field()
+    lsw_prints(lsw_scope() + raw"""
+        total(m: Matrix) -> int
+            Runner(0).scope((s) ->
+                s.spawn(() -> print(m.data[0] + m.data[1] + m.data[2]))
+                int(m.rows))
+
+        val b = numbers(3)
+
+        print(total(Matrix(b.view(), 3, 1)))
+        print(b.len())
+        """, "6\n3\n3\n")
+
+@test("a struct holding a view is captured whole and handed on inside the child")
+lsw_captured_whole()
+    lsw_prints(lsw_scope() + raw"""
+        sum(m: Matrix) -> int
+            var n = 0
+
+            for i in 0..<m.rows * m.cols do n += m.data[i]
+            n
+
+        total(m: Matrix) -> int
+            Runner(0).scope((s) ->
+                s.spawn(() ->
+                    val copy = m
+
+                    print(sum(copy)))
+                0)
+
+        val b = numbers(6)
+
+        print(total(Matrix(b.view(), 2, 3)))
+        print(b.view()[5])
+        """, "21\n0\n6\n")
+
+@test("writes through a lent struct's view are seen by the caller after the scope")
+lsw_writes_seen_after()
+    lsw_prints(lsw_scope() + raw"""
+        scale(m: Matrix, k: int) -> int
+            Runner(0).scope((s) ->
+                s.spawn(() ->
+                    for i in 0..<m.rows * m.cols do m.data[i] *= k)
+                0)
+
+        val b = numbers(4)
+
+        print(scale(Matrix(b.view(), 2, 2), 10))
+        print(b.view()[0] + b.view()[3])
+        """, "0\n50\n")
+
+@test("a tuple holding a view is lent as a struct is")
+lsw_tuple()
+    lsw_prints(lsw_scope() + raw"""
+        first(t: ([]int, int)) -> int
+            Runner(0).scope((s) ->
+                s.spawn(() -> print(t.0[0] * t.1))
+                0)
+
+        val b = numbers(2)
+
+        print(first((b.view(), 7)))
+        """, "7\n0\n")
+
+@test("a struct holding a struct holding a view is lent at every depth")
+lsw_nested()
+    lsw_prints(lsw_scope() + raw"""
+        struct Band
+            m: Matrix
+            lower: int
+
+        diag(band: Band) -> int
+            Runner(0).scope((s) ->
+                s.spawn(() -> print(band.m.data[band.lower] + band.m.data[3]))
+                0)
+
+        val b = numbers(4)
+
+        print(diag(Band(Matrix(b.view(), 2, 2), 1)))
+        print(b.len())
+        """, "6\n0\n4\n")
+
+@test("a generic struct holding a view is lent at its instantiation")
+lsw_generic()
+    lsw_prints(lsw_scope() + raw"""
+        struct Grid[T]
+            data: []T
+            rows: usize
+
+        corner[T](g: Grid[T]) -> T
+            var out = g.data[0]
+            val p = &out
+
+            Runner(0).scope((s) ->
+                s.spawn(() -> *p = g.data[g.rows - 1])
+                0)
+            out
+
+        val b = numbers(3)
+        var f: Buf[f64] = buf()
+
+        f.push(1.5)
+        f.push(2.5)
+        print(corner(Grid(b.view(), 3)))
+        print(corner(Grid(f.view(), 2)))
+        """, "3\n2.5\n")
+
+@test("a struct holding a view and an atomic reference is lent, the reference shared")
+lsw_view_and_sync_ref()
+    lsw_prints(lsw_scope() + raw"""
+        struct Shared
+            data: []int
+            label: &sync Thing
+
+        read(x: Shared) -> int
+            Runner(0).scope((s) ->
+                s.spawn(() -> print(x.data[1] + x.label.n))
+                0)
+
+        val b = numbers(2)
+
+        print(read(Shared(b.view(), Thing(40))))
+        """, "42\n0\n")
+
+@test("a struct holding a view wider than the register boundary is lent")
+lsw_large_struct()
+    lsw_prints(lsw_scope() + raw"""
+        struct Wide
+            data: []int
+            pad: [20]int
+
+        last(w: Wide) -> int
+            Runner(0).scope((s) ->
+                s.spawn(() -> print(w.data[2] + w.pad[19]))
+                0)
+
+        val b = numbers(3)
+
+        print(last(Wide(b.view(), [1; 20])))
+        """, "4\n0\n")
+
+@test("a struct captured through a pointer is shared as a pointer is")
+lsw_through_a_pointer()
+    lsw_prints(lsw_scope() + raw"""
+        total(m: *Matrix) -> int
+            Runner(0).scope((s) ->
+                s.spawn(() -> print(m.data[0] + m.data[1]))
+                0)
+
+        val b = numbers(2)
+        var m = Matrix(b.view(), 1, 2)
+
+        print(total(&m))
+        """, "3\n0\n")
+
+@test("a scoped child's closure stores a lent struct's view with a null owner and walks nothing")
+lsw_owner_stored_null()
+    if xvr_no_library() then return
+
+    val ir = xvr_ir([("main.sysl", lsw_scope() + raw"""
+        total(m: Matrix) -> int
+            Runner(0).scope((s) ->
+                s.spawn(() -> print(m.data[0]))
+                0)
+
+        val b = numbers(1)
+
+        print(total(Matrix(b.view(), 1, 1)))
+        """)])
+
+    assert(ir.index_of("%struct.$closure1borrows = type").is_some(), ir)
+    assert(ir.index_of("@arc.copy.$closure1borrows").is_none(), ir)
+    assert(ir.index_of("@arc.dispose.$closure1borrows").is_none(), ir)
+    assert(ir.index_of("ptr null, 0\n").is_some(), ir)
+
+// Two children on threads of their own each write one half of one matrix, and the scope joins them
+// before the lender returns.
+@test("scoped children on real threads write disjoint halves of one lent matrix")
+lsw_threads_write_halves()
+    lsw_prints(raw"""
+        import sysl.buf.{Buf, buf}
+        import sysl.threads.{Thread, spawn}
+
+        struct Job
+            f: Option[&sync Fn() -> unit]
+
+        run_job(j: *Job) -> unit = j.f.unwrap()()
+
+        struct Scope
+            jobs: [4]Job
+            threads: Buf[Thread]
+
+            @scoped(f)
+            spawn(*self, f: &sync Fn() -> unit)
+                val i = self.threads.len()
+
+                self.jobs[i] = Job(Some(f))
+                self.threads.push(spawn(&run_job, &self.jobs[i]).unwrap())
+
+        struct Runner
+            n: int
+
+            scope[R](self, body: *Scope -> R) -> R
+                var s = Scope([Job(None); 4], buf())
+                val r = body(&s)
+
+                for t in s.threads do t.join()
+                r
+
+        struct MatrixMut
+            data: []int
+            rows: usize
+            cols: usize
+
+        fill(m: MatrixMut) -> int
+            val half = m.rows / 2
+
+            Runner(0).scope((s) ->
+                s.spawn(() ->
+                    for i in 0..<half * m.cols do m.data[i] = 1)
+                s.spawn(() ->
+                    for i in half * m.cols..<m.rows * m.cols do m.data[i] = 2)
+                0)
+
+        var b: Buf[int] = buf()
+
+        for i in 0..<100 do b.push(0)
+
+        print(fill(MatrixMut(b.view(), 10, 10)))
+
+        var n = 0
+
+        for x in b.view() do n += x
+        print(n)
+        print(b.view()[49] * 10 + b.view()[50])
+        """, "0\n150\n12\n")
+
+// -- what is still refused ------------------------------------------------------------------------
+
+@test("a lent struct with a string beside its view is refused, naming the string")
+lsw_string_field_refused()
+    lsw_refused(lsw_scope() + raw"""
+        struct Named
+            data: []int
+            name: string
+
+        show(x: Named) -> int
+            Runner(0).scope((s) ->
+                s.spawn(() -> print(x.data[0]))
+                0)
+        """, lsw_head("'x.name' it captures reaches a 'string'"))
+
+@test("a lent struct with a plain reference beside its view is refused, naming the reference")
+lsw_ref_field_refused()
+    lsw_refused(lsw_scope() + raw"""
+        struct Owned
+            data: []int
+            owner: &Thing
+
+        show(x: Owned) -> int
+            Runner(0).scope((s) ->
+                s.spawn(() -> print(x.data[0]))
+                0)
+        """, lsw_head("'x.owner' it captures reaches a '&Thing', whose count is not"))
+
+@test("a lent struct whose view holds references is refused, naming the view")
+lsw_view_of_refs_refused()
+    lsw_refused(lsw_scope() + raw"""
+        struct Things
+            items: []&Thing
+            n: int
+
+        show(x: Things) -> int
+            Runner(0).scope((s) ->
+                s.spawn(() -> print(x.items[0].n))
+                0)
+        """, lsw_head("'x.items' it captures reaches a '[]&Thing'"))
+
+@test("the same struct captured for a plain '&sync Fn' parameter is still refused")
+lsw_unscoped_refused()
+    lsw_refused(lsw_scope() + raw"""
+        keep(f: &sync Fn() -> int) -> int = f()
+
+        a(m: Matrix) -> int = keep(() -> m.data[0])
+        """, lsw_head("'m.data' it captures reaches a '[]int'"))
