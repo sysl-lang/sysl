@@ -5302,6 +5302,39 @@ run()
 'relay' keeps its parameter 'p' (it is passed to 'collect', which keeps it), and '&n' is the address of a local of 'run'
 ```
 
+**A buffer the function made itself keeps nothing past the call.** A value pushed onto a `Buf` is held
+as long as that buffer is, so a local buffer used as a worklist ends with its frame, and pushing onto
+it is not keeping — unless the buffer itself gets out: returned, stored, captured by a closure that
+is, handed to a callee that keeps it, or something read back out of it is kept. A buffer the function
+was handed, reached through a `ref`, or copied from module storage is not its own:
+
+```sysl
+import sysl.buf.{Buf, buf}
+
+larger(a: *int, b: *int) -> int
+    var work: Buf[*int] = buf()
+    work.push(a)
+    work.push(b)
+
+    var best = 0
+
+    while work.pop() is Some(p)
+        if *p > best then best = *p
+
+    best
+
+run() -> int
+    var x = 3
+    var y = 8
+    larger(&x, &y)
+
+print(run())
+```
+
+```output
+8
+```
+
 Storage that outlives the call — module storage, a box's — is the program's to give away, and so is
 storage reached through a pointer the function was handed. **The entry file's own statements** are
 the one body passed over: their frame is the program's, laid down before anything else runs and given

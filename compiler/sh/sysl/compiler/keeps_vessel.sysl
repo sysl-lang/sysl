@@ -1,0 +1,318 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.Span
+import sysl.buf.{Buf, buf}
+
+// **A buffer the frame made, that nothing else names, ends with the frame** (`reference/memory.md §
+// Taken back before it returns`). A value put in a buffer's slots is held as long as the buffer is
+// (`keeps.sysl`'s `slot_loc`), and a buffer is a handle to a box every copy of it shares -- so where a
+// function pushes what it was handed into a buffer of its own, the question is the one asked of any
+// local holding it: does the local outlive the call? The keeps walk already answers that of a local
+// (`track_locals`): returned, stored, captured, handed to a callee that keeps it. What this file adds
+// is when a local's buffer is the frame's OWN, so that its slots are the local's:
+//
+// - the local is declared in the body, and is neither a parameter nor a `ref`;
+// - every value it is ever given is MADE there -- a constructor, a buffer literal, `slot_storage`,
+//   another such local, or a call whose every answer is made the same way (`buf()`);
+// - nothing else can give it one: no field of it is written, no pattern or loop binds it, no `ref`
+//   aliases it, no closure captures it, and its address is taken only to be handed straight to a
+//   callee that leaves the buffer it points at in place (`leaves_handle`) -- `compound_order(&work,
+//   x, y)`, which pushes onto it.
+//
+// A local given a module's buffer (`var work = held`), a parameter's, or one read out of memory
+// shares that buffer's box, and its slots are held wherever that box is.
+//
+// The answers are read off the bodies alone, so each is worked out once (`KeepsCx.made`); a question
+// met again while it is open is answered no, which only refuses more.
+
+// What a body does with one local, gathered in one walk.
+private struct LocalUses
+    name: string
+    values: Buf[TExpr]
+    declared: bool
+    other: bool
+
+    // Where the local's address is handed straight to a callee that leaves the buffer it points at
+    // in place (`leaves_handle`), by the span of the `&`.
+    lent: Buf[Span]
+end LocalUses
+
+// Whether local `n` of `f`, holding a value of type `ty`, holds a buffer `f` made and shares with
+// nothing else.
+frame_buffer(cx: &KeepsCx, f: TFunc, ty: Type, n: string) -> bool = ty match
+    Struct(_) -> made_local(cx, f, n, 0)
+    _ -> false
+
+private made_local(cx: &KeepsCx, f: TFunc, n: string, depth: int) -> bool
+    for p in f.params
+        if p.0 == n then return false
+
+    val key = s"${f.name}|$n"
+
+    cx.made.get(key) match
+        Some(v) -> return v
+        None -> ()
+
+    cx.made.put(key, false)
+
+    val refs = refs_of(f)
+    val u: &LocalUses = LocalUses(n, buf(), false, false, buf())
+
+    walk_block_stmts(f.body, TWalk(false, e -> use_expr(cx, u, refs, e), w -> use_store(u, refs, w.place, w.value),
+                                   s -> use_stmt(u, refs, s)))
+
+    var ok = u.declared && !u.other
+
+    for v in u.values
+        if ok && !made_value(cx, f, v, depth + 1) then ok = false
+
+    cx.made.put(key, ok)
+    ok
+end made_local
+
+private refs_of(f: TFunc) -> Buf[(string, TExpr)]
+    val out: Buf[(string, TExpr)] = buf()
+
+    walk_block_stmts(f.body, stmt_walk(false, s -> s match
+        TRefDecl(n, _, place) -> out.push((n, place))
+        _ -> ()))
+
+    out
+end refs_of
+
+private use_stmt(u: &LocalUses, refs: Buf[(string, TExpr)], s: TStmt)
+    s match
+        TVarDecl(name, _, init, _) ->
+            if name == u.name
+                u.declared = true
+                u.values.push(init)
+            end if
+        TRefDecl(name, _, place) ->
+            if name == u.name || roots_at(refs, place, u.name) then u.other = true
+        _ -> ()
+end use_stmt
+
+private use_store(u: &LocalUses, refs: Buf[(string, TExpr)], place: TExpr, v: TExpr)
+    *place.kind match
+        TLoad(n, _) -> if n == u.name then u.values.push(v)
+        _ -> if roots_at(refs, place, u.name) then u.other = true
+end use_store
+
+private use_expr(cx: &KeepsCx, u: &LocalUses, refs: Buf[(string, TExpr)], e: TExpr)
+    *e.kind match
+        TStore(place, v, _, _) -> use_store(u, refs, place, v)
+
+        // The walk meets a call before its arguments, so an address handed straight to a callee that
+        // leaves the buffer in place is known to be lent by the time the `&` itself is met.
+        TCall(name, args, _, _) ->
+            for k in 0..<args.len()
+                *args.at(k).kind match
+                    TAddrOf(place, _) ->
+                        *place.kind match
+                            TLoad(m, _) -> if m == u.name && leaves_handle(cx, name, k, 0) then u.lent.push(args.at(k).span)
+                            _ -> ()
+                    _ -> ()
+        TAddrOf(place, _) -> if roots_at(refs, place, u.name) && !has_span(u.lent, e.span) then u.other = true
+        TMatch(_, arms, _) ->
+            for arm in arms
+                for p in arm.patterns
+                    use_pattern(u, p)
+        TIf(cond, _, _, _) -> use_terms(u, cond)
+        TWhile(cond, _, _, _) -> use_terms(u, cond)
+        TFor(name, _, _, _, _, _, _, _) -> if name == u.name then u.other = true
+        TForEach(name, _, _, _, _, _) -> if name == u.name then u.other = true
+        TIterate(cursor, _, _, _, p, _, _, _) ->
+            if cursor == u.name then u.other = true
+
+            use_pattern(u, p)
+        TStructNew(decl, args) ->
+            if is_closure_literal(Struct(decl))
+                for a in args
+                    *a.kind match
+                        TLoad(n, _) -> if n == u.name then u.other = true
+                        _ -> ()
+            end if
+        _ -> ()
+end use_expr
+
+private use_terms(u: &LocalUses, cond: Buf[TCondTerm])
+    for term in cond
+        term match
+            TCondIs(_, patterns, _) ->
+                for p in patterns
+                    use_pattern(u, p)
+            _ -> ()
+end use_terms
+
+private use_pattern(u: &LocalUses, p: TPattern)
+    var names: Buf[string] = buf()
+
+    pattern_names(p, &names)
+
+    if holds_string(names, u.name) then u.other = true
+end use_pattern
+
+private roots_at(refs: Buf[(string, TExpr)], place: TExpr, n: string) -> bool = local_root(refs, place) match
+    Some(m) -> m == n
+    None -> false
+
+// **Whether a function handed a pointer at its parameter `k` leaves what it points at in place** --
+// reads it, calls the buffer's own members on it, hands the pointer on to a callee that does the same
+// -- but never writes it, a field of it, or the parameter itself, and never lets the pointer go
+// anywhere else. A callee that could point the caller's buffer at another box could make the caller
+// push into storage it does not own.
+private struct PointerUses
+    name: string
+    lent: Buf[Span]
+    other: bool
+end PointerUses
+
+private leaves_handle(cx: &KeepsCx, name: string, k: usize, depth: int) -> bool
+    if depth > 8 then return false
+
+    val found = cx.find(name)
+
+    if found.is_none() then return false
+
+    val g = found.unwrap()
+
+    if k >= g.params.len() then return false
+
+    val is_ptr = g.params.at(k).1 match
+        Ptr(_) -> true
+        _ -> false
+
+    if !is_ptr then return false
+
+    val key = s"*$name|$k"
+
+    cx.made.get(key) match
+        Some(v) -> return v
+        None -> ()
+
+    cx.made.put(key, false)
+
+    val u: &PointerUses = PointerUses(g.params.at(k).0, buf(), false)
+
+    walk_block_stmts(g.body, TWalk(false, e -> pointer_use(cx, u, e, depth), w -> pointer_write(u, w.place),
+                                   s -> pointer_stmt(u, s)))
+
+    cx.made.put(key, !u.other)
+    !u.other
+end leaves_handle
+
+private pointer_stmt(u: &PointerUses, s: TStmt)
+    s match
+        TRefDecl(_, _, place) -> if mentions(place, u.name) then u.other = true
+        _ -> ()
+end pointer_stmt
+
+private pointer_write(u: &PointerUses, place: TExpr) = if mentions(place, u.name) then u.other = true
+
+// Every use of the parameter is one of the three the rule allows; any other -- a copy, a store of
+// it, an object or a pointer call handed it -- is not followed, and refuses.
+private pointer_use(cx: &KeepsCx, u: &PointerUses, e: TExpr, depth: int)
+    *e.kind match
+        TStore(place, _, _, _) -> pointer_write(u, place)
+        TCall(name, args, _, _) ->
+            for k in 0..<args.len()
+                if is_param_load(args.at(k), u.name) && leaves_handle(cx, name, k, depth + 1)
+                    u.lent.push(args.at(k).span)
+                end if
+        TDeref(x, _) -> if is_param_load(x, u.name) then u.lent.push(x.span)
+        TAddrOf(place, _) ->
+            *place.kind match
+                TDeref(x, _) -> if is_param_load(x, u.name) then u.other = true
+                _ -> ()
+        TLoad(n, _) -> if n == u.name && !has_span(u.lent, e.span) then u.other = true
+        _ -> ()
+end pointer_use
+
+private is_param_load(e: TExpr, n: string) -> bool = *e.kind match
+    TLoad(m, _) -> m == n
+    _ -> false
+
+// Whether a place is reached through the named pointer: `*p`, `p.f`, `p.f[i]`.
+private mentions(place: TExpr, n: string) -> bool = *place.kind match
+    TLoad(m, _) -> m == n
+    TDeref(x, _) -> mentions(x, n)
+    TField(r, _, _) -> mentions(r, n)
+    TIndex(r, _, _) -> mentions(r, n)
+    _ -> false
+
+// Whether a value is storage made where it is written: a constructor whose parts are, a box, a buffer
+// or array literal, `slot_storage`, a local holding such a buffer, or a call answering one. A plain
+// pointer among a constructor's parts names storage the value does not own, and nothing is held
+// through it (`keeps_flow.sysl`'s `handle_origin` follows box handles alone), so it is passed over.
+private made_value(cx: &KeepsCx, f: TFunc, e: TExpr, depth: int) -> bool
+    if depth > 8 then return false
+    if !may_hold_pointer(cx, texpr_type(e)) then return true
+
+    *e.kind match
+        TStructNew(_, args) -> made_parts(cx, f, args, depth)
+        TEnumNew(_, _, args) -> made_parts(cx, f, args, depth)
+        TStructInvCheck(v, _, _) -> made_value(cx, f, v, depth + 1)
+        TBox(v, _) -> made_value(cx, f, v, depth + 1)
+        TBufLit(_, _) -> true
+        TBufFill(_, _, _) -> true
+        TArrayLit(_, _) -> true
+        TSlots(op, _, _, _) -> op == "slot_storage"
+        TCall(name, _, _, _) -> made_answer(cx, name, depth + 1)
+        TLoad(n, _) -> made_local(cx, f, n, depth + 1)
+        TSeq(exprs) -> !exprs.is_empty() && made_value(cx, f, exprs.at(exprs.len() - 1), depth + 1)
+        TBlockExpr(b) -> made_block(cx, f, b, depth)
+        TIf(_, then_block, else_block, _) ->
+            else_block.is_some() && made_block(cx, f, then_block, depth) && made_block(cx, f, else_block.unwrap(), depth)
+        TMatch(_, arms, _) ->
+            for arm in arms
+                if !made_block(cx, f, arm.body, depth) then return false
+
+            true
+        _ -> false
+end made_value
+
+private made_parts(cx: &KeepsCx, f: TFunc, args: Buf[TExpr], depth: int) -> bool
+    for a in args
+        val plain = texpr_type(a) match
+            Ptr(_) -> true
+            _ -> false
+
+        if !plain && !made_value(cx, f, a, depth + 1) then return false
+
+    true
+end made_parts
+
+private made_block(cx: &KeepsCx, f: TFunc, b: TBlock, depth: int) -> bool =
+    b.result.is_some() && made_value(cx, f, b.result.unwrap(), depth + 1)
+
+// Whether every answer a function hands back is storage it made.
+private made_answer(cx: &KeepsCx, name: string, depth: int) -> bool
+    val found = cx.find(name)
+
+    if found.is_none() then return false
+
+    val g = found.unwrap()
+    val key = s"=$name"
+
+    cx.made.get(key) match
+        Some(v) -> return v
+        None -> ()
+
+    cx.made.put(key, false)
+
+    val answers: Buf[TExpr] = buf()
+
+    walk_block_stmts(g.body, stmt_walk(false, s -> s match
+        TReturn(v) -> if v.is_some() then answers.push(v.unwrap())
+        _ -> ()))
+
+    if g.body.result.is_some() then answers.push(g.body.result.unwrap())
+
+    var ok = !answers.is_empty()
+
+    for v in answers
+        if ok && !made_value(cx, g, v, depth + 1) then ok = false
+
+    cx.made.put(key, ok)
+    ok
+end made_answer
