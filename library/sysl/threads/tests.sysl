@@ -396,3 +396,199 @@ thk_room_is_checked()
 @test("yield_now is answered")
 yield_answers() -> unit
     assert(yield_now())
+
+// -- scoped threads ---------------------------------------------------------------------------------
+
+// Two children each write one half of the caller's array through a view of it; the writes are the
+// caller's once `scope` has answered, which is the join it promises.
+@test("scoped threads write disjoint halves of the caller's array through a view")
+scope_writes_halves() -> unit
+    var a = [0; 64]
+    val v = a[..]
+    val half = v.len / 2
+
+    scope((s) ->
+        s.spawn(() -> for i in 0..<half do v[i] = 1)
+        s.spawn(() -> for i in half..<v.len do v[i] = 2))
+
+    var n = 0
+
+    for x in a do n += x
+    assert_eq(n, 96)
+    assert_eq(a[31] * 10 + a[32], 12)
+
+private struct Grid
+    data: []int
+    rows: usize
+    cols: usize
+
+// A struct of a view and the scalars that read it is lent as the bare view is: one thread per row.
+@test("scoped threads borrow a struct of views, one row each")
+scope_borrows_a_struct_of_views() -> unit
+    var cells = [0; 12]
+    val g = Grid(cells[..], 4, 3)
+
+    scope((s) ->
+        for r in 0..<g.rows
+            s.spawn(() ->
+                for c in 0..<g.cols do g.data[r * g.cols + c] = int(r) * 10 + int(c)))
+
+    assert_eq(cells[0], 0)
+    assert_eq(cells[5], 12)
+    assert_eq(cells[11], 32)
+
+@test("a scoped thread's join answers what its closure answered")
+scope_join_answers() -> unit
+    val xs = [1, 2, 3, 4, 5, 6]
+    val v = xs[..]
+
+    val total = scope((s) ->
+        val lo = s.spawn(() ->
+            var t = 0
+            for i in 0..<3 do t += v[i]
+            t)
+        val hi = s.spawn(() ->
+            var t = 0
+            for i in 3..<6 do t += v[i]
+            t)
+        lo.join() * 100 + hi.join())
+
+    assert_eq(total, 615)
+
+// Joining a second time answers the same value without waiting on the thread again, and the scope
+// does not join a thread its body already joined -- a second system join of one thread would be a
+// use of a handle the first had given back.
+@test("a scoped thread joined twice, and then by its scope, answers once and is joined once")
+scope_join_twice() -> unit
+    val r = scope((s) ->
+        val h = s.spawn(() -> (7, true))
+
+        assert_eq(h.join().0, 7)
+        assert(h.is_finished())
+        h.join())
+
+    assert_eq(r.0, 7)
+    assert(r.1)
+
+@test("a scope that starts nothing answers its body's value")
+scope_with_no_threads() -> unit
+    assert_eq(scope((s) -> 41) + 1, 42)
+
+@test("a scope inside a scoped thread, and one inside a scope's body, both join")
+scope_nested() -> unit
+    var a = [0; 4]
+    val v = a[..]
+
+    val got = scope((s) ->
+        val outer = s.spawn(() ->
+            scope((t) ->
+                t.spawn(() -> v[0] = 1)
+                t.spawn(() -> v[1] = 2)
+                3))
+        val inner = scope((t) ->
+            val h = t.spawn(() ->
+                v[2] = 4
+                4)
+
+            h.join() + 1)
+
+        outer.join() * 10 + inner)
+
+    assert_eq(got, 35)
+    assert_eq(a[0] + a[1] + a[2], 7)
+
+// A scoped thread may start threads on the scope it was handed; the scope joins those too, including
+// ones started while it was already joining their parent.
+@test("threads started on the scope by scoped threads are joined by the scope")
+scope_spawned_from_a_thread() -> unit
+    val count: &sync Atomic[int] = Atomic(0)
+
+    scope((s) ->
+        for _ in 0..<8
+            s.spawn(() ->
+                for _ in 0..<8
+                    s.spawn(() -> count.add(1, Relaxed))))
+
+    assert_eq(count.load(Relaxed), 64)
+
+// A handle crosses to a sibling, which joins it there; the body's own join then answers without a
+// second system join, and so does the scope's.
+@test("a scoped thread's handle joined on another scoped thread is joined once")
+scope_handle_joined_by_a_sibling() -> unit
+    val got = scope((s) ->
+        val h = s.spawn(() -> 20)
+        val k = s.spawn(() -> h.join() + 1)
+
+        h.join() + k.join())
+
+    assert_eq(got, 41)
+
+private scope_leaves_early(stop: bool, v: []int) -> int =
+    scope((s) ->
+        s.spawn(() -> v[0] = 7)
+        s.spawn(() -> v[1] = 8)
+
+        if stop then return 1
+
+        s.spawn(() -> v[2] = 9)
+        2)
+
+// An early `return` leaves the body's closure and lands back in `scope`, which joins the two threads
+// already started; their writes are visible, and the third was never started.
+@test("an early return from the scope's body still joins every thread it started")
+scope_early_return_joins() -> unit
+    var a = [0; 3]
+
+    assert_eq(scope_leaves_early(true, a[..]), 1)
+    assert_eq(a[0] * 100 + a[1] * 10 + a[2], 780)
+
+    var b = [0; 3]
+
+    assert_eq(scope_leaves_early(false, b[..]), 2)
+    assert_eq(b[0] * 100 + b[1] * 10 + b[2], 789)
+
+// -- the barrier ------------------------------------------------------------------------------------
+
+// Each round every thread writes its own slot, meets the others, reads every slot, and meets them
+// again before the next round writes. A barrier that let one thread through early shows as a slot
+// read with the last round's value; one that named two leaders, or none, shows in the phase counts.
+@test("a barrier holds N threads phase by phase, with exactly one leader each phase")
+barrier_phases() -> unit
+    val n = 4
+    val rounds = 6
+    val b = barrier(usize(n))
+    var slots = [0; 4]
+    val v = slots[..]
+    var leaders = [Atomic(0); 12]
+    val per_phase = leaders[..]
+    val stale: &sync Atomic[int] = Atomic(0)
+
+    scope((s) ->
+        for me in 0..<n
+            s.spawn(() ->
+                for r in 0..<rounds
+                    v[me] = r + 1
+
+                    if b.wait() then per_phase[2 * r].add(1, Relaxed)
+
+                    for j in 0..<n
+                        if v[j] != r + 1 then stale.add(1, Relaxed)
+
+                    if b.wait() then per_phase[2 * r + 1].add(1, Relaxed)))
+
+    assert_eq(stale.load(Relaxed), 0)
+
+    for p in 0..<2 * rounds
+        assert_eq(leaders[p].load(Relaxed), 1)
+
+@test("a barrier of one never waits, and its every caller leads")
+barrier_of_one() -> unit
+    val b = barrier(1)
+
+    for _ in 0..<3
+        assert(b.wait())
+
+    val led = scope((s) -> s.spawn(() -> b.wait() && b.wait()).join())
+
+    assert(led)
+    assert(barrier(0).wait())
