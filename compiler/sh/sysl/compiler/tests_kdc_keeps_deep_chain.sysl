@@ -92,3 +92,33 @@ kdc_recursion_at_the_bottom()
     val let_go = kdc_said(kdc_chain(head, link, replace_all(bottom, "store(p)", "read(p)")))
 
     assert_eq(let_go, "")
+
+// Whether a body may repoint what its parameter points at (`writes_of`) is asked of every call handed a
+// local's address, and of every callee a body hands its parameter on to: asked on demand from the top,
+// it nested a walk per link and overflowed the stack. A write at the bottom makes every link answer
+// yes, and the local whose address went down is given up -- with nothing of it kept, nothing is refused.
+@test("a write through a local's address at the bottom of a thirty-two-thousand-call chain is answered up it")
+kdc_written_at_the_bottom()
+    val link = (i: usize, j: usize) -> s"f$i(p: *int)\n    f$j(p)\n\n"
+    val head = kdc_store + "main()\n    var n = 1\n    f0(&n)\n    read(&n)\n\n"
+
+    assert_eq(kdc_said(kdc_chain(head, link, "(p: *int)\n    *p = 2\n\n")), "")
+
+    val kept = kdc_said(kdc_chain(head, link, "(p: *int)\n    *p = *p + 1\n    store(p)\n\n"))
+
+    assert(kept.contains("'f0' keeps its parameter 'p' (it is passed to 'f1', which keeps it)"), kept)
+
+// The same chain handing a pointer to a pointer down: a parameter something is read through asks the
+// read questions of each callee on demand, a walk per link, and overflows the stack (as 0.8.3 did).
+@test(ignore: "the read questions of a pointer-to-pointer parameter nest a walk per link of a call chain")
+kdc_repointed_at_the_bottom()
+    val link = (i: usize, j: usize) -> s"f$i(pp: ***int)\n    f$j(pp)\n\n"
+    val head = "var slot: *int = null\n\nkey(a: *int)\n    var arr: [1]*int = [null]\n" +
+               "    var p: **int = &arr[0]\n    f0(&p)\n    *p = a\n\nmain()\n    var x = 5\n    key(&x)\n\n"
+    val kept = kdc_said(kdc_chain(head, link, "(pp: ***int)\n    *pp = &slot\n\n"))
+
+    assert(kept.contains("'key' keeps its parameter 'a' (it is stored in '*p')"), kept)
+
+    val read = kdc_said(kdc_chain(head, link, "(pp: ***int)\n    if *pp == null then slot = null\n\n"))
+
+    assert_eq(read, "")
