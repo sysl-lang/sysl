@@ -1,0 +1,529 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.text.{cstring, str_builder}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// A view of part of an element of a container someone wrote -- `c[i][..]`, `c[i].cells[..]`,
+// `c[i][j][..]` on a type implementing `IndexPlace` -- is taken through the container's `index_view`
+// (`expr_coll.sysl`'s `viewed_through_storage`): the element is read as an element of a one-element
+// view whose owner is the storage's, so the view keeps that storage alive past a growth or a drop of
+// the container. `Buf` is one such container and has no rule of its own (`tests_vel_view_elem_owner`
+// pins its cells). Before, a container's element view owned nothing and read freed storage (ASan
+// heap-use-after-free) once the container grew or was dropped.
+//
+// The shapes: an element, a field of a struct element, a row of a 2-D element, a container a call
+// made, a container held through a reference and dropped by a callee, `@unchecked`, a container
+// generic over its element, a container reached through a bound, and a container over a view rather
+// than a `Buf`. Routes: kept across growth and drop (counted), lent to a borrowing callee (no count
+// where the callee can reach neither the container nor a view of its elements), and the analyzer's
+// refusals. A container that answers no `index_view` keeps the default -- an owner of nothing -- which
+// is right for elements in its own bytes or in static storage, pinned here too. Every runnable cell
+// is run at -O0 and -O2 on the counted heap and once under AddressSanitizer.
+//
+// Also here: a generic body's `p[0..<n]` over `*T` views `T`s at every instantiation -- at
+// `T = [4]int` it read as a view of the first array's `int`s, which is what the default `index_view`
+// tripped on.
+//
+// Cells not written: separate compilation -- `index_view` is an ordinary trait member, called as any
+// member is; bare metal -- no new runtime call, only the existing `arc.retain_maybe`; `&sync` -- a view
+// may not cross a domain.
+
+private extern "setenv" cvo_c_setenv(name: *u8, value: *u8, overwrite: int) -> int
+private extern "unsetenv" cvo_c_unsetenv(name: *u8) -> int
+
+private struct CvoRun
+    ok: bool
+    out: string
+    err: string
+    hooks: usize
+
+private cvo_ready() -> bool
+    if std_root().is_err() || !clang_available()
+        print("skipped: the library or the toolchain is not on this machine")
+        return false
+    end if
+
+    true
+end cvo_ready
+
+private cvo_ir(text: string) -> string
+    val root = make_temp_dir("sysl-cvo").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    val out = emit_llvm_text(src, None) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> if made.report.is_empty() then made.text else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end cvo_ir
+
+// One function's emitted text, from its `define` to the brace that closes it.
+private cvo_body(out: string, name: string) -> string
+    var b = str_builder()
+    var inside = false
+
+    for line in lines_of(out)
+        if !inside && line.starts_with("define ") && line.contains("@" + name + "$") then inside = true
+
+        if inside
+            if line == "}" then return b.finish()
+
+            b.push(line)
+            b.push_char('\n')
+
+    if inside then b.finish() else s"no definition of '$name' in:\n$out"
+end cvo_body
+
+private cvo_none(text: string, name: string)
+    if !cvo_ready() then return
+
+    val f = cvo_body(cvo_ir(text), name)
+
+    assert(f.starts_with("define"), f)
+    assert(!f.contains("@arc.retain_maybe(") && !f.contains("@arc.release_maybe("), f)
+end cvo_none
+
+private cvo_kept(text: string, name: string)
+    if !cvo_ready() then return
+
+    val f = cvo_body(cvo_ir(text), name)
+
+    assert(f.starts_with("define"), f)
+    assert(f.contains("@arc.retain_maybe("), f)
+end cvo_kept
+
+private cvo_refused(text: string, said: string)
+    if !cvo_ready() then return
+
+    val out = cvo_ir(text)
+
+    assert(out.contains(said), out)
+end cvo_refused
+
+private cvo_run(text: string, level: string, counted: bool, flags: string) -> CvoRun
+    val root = make_temp_dir("sysl-cvo").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    if counted then force_alloc_counting(true)
+
+    if flags != ""
+        val n = cstring("SYSL_EXTRA_CFLAGS")
+        val v = cstring(flags)
+
+        cvo_c_setenv(n.ptr, v.ptr, 1)
+    end if
+
+    val built = build_native_program(s"$root/main.sysl", None, None, level, Some(exe))
+
+    if flags != ""
+        val n = cstring("SYSL_EXTRA_CFLAGS")
+
+        cvo_c_unsetenv(n.ptr)
+
+    if counted then force_alloc_counting(false)
+
+    built match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return CvoRun(false, failure_text(why), "", 0)
+        Ok(_) -> ()
+
+    val hooks = capture("nm", ["-u", exe], "", [], true) match
+        Ok(o) -> o.text.count_of("__asan_report")
+        Err(_) -> 0
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> CvoRun(false, "could not be started", "", hooks)
+        Ok(o) -> CvoRun(o.status.ok(), o.text, o.err.unwrap_or(""), hooks)
+end cvo_run
+
+// Printed exactly `expected` at both ends of the optimizer on the counted heap, giving everything
+// back, and again under AddressSanitizer with the instrumentation in the binary.
+private cvo_prints(text: string, expected: string)
+    if !cvo_ready() then return
+
+    for level in ["0", "2"]
+        val run = cvo_run(text, level, true, "")
+
+        assert(run.ok, s"-O$level: ${run.out}${run.err}")
+        assert_eq(run.out, expected)
+        assert(alloc_count_reported(run.err) == 0, s"-O$level: ${run.err}")
+
+    val asan = cvo_run(text, "0", false, "-fsanitize=address -g")
+
+    assert(asan.hooks > 0, "the AddressSanitizer build carries no instrumentation")
+    assert(asan.ok, s"asan: ${asan.out}${asan.err}")
+    assert_eq(asan.out, expected)
+end cvo_prints
+
+// A container whose elements live in a `Buf`, and that says so by answering the `Buf`'s own view. Its
+// elements are behind the handle, so its members take `self`, as `Buf`'s do.
+private cvo_rows() -> string = raw"""
+    import sysl.buf.{Buf, buf}
+
+    struct Rows[T]
+        items: Buf[T]
+
+    impl[T] IndexPlace[usize, T] for Rows[T]
+        index_place(self, i: usize) -> *T = self.items.index_place(i)
+        override index_view(self, i: usize) -> []T = self.items.index_view(i)
+        override index_view_unchecked(self, i: usize) -> []T = self.items.index_view_unchecked(i)
+
+    rows[T]() -> Rows[T] = Rows(buf())
+
+    """
+
+// -- kept across a growth and a drop -----------------------------------------------------------------
+
+@test("a view of an element of a container, kept across its growth and its drop, keeps the storage")
+cvo_element_kept_across_growth_and_drop()
+    cvo_prints(cvo_rows() + raw"""
+        main()
+            var r: Rows[[4]i32] = rows()
+            r.items.push([1, 2, 3, 4])
+            val v = r[0][..]
+            for k in 0..<100
+                r.items.push([k, k, k, k])
+            r = rows()
+            print(v[0] + v[3])
+        """, "5\n")
+
+@test("a view of an array field of a struct element of a container, and of a 2-D row, keep the storage")
+cvo_field_and_row()
+    cvo_prints(cvo_rows() + raw"""
+        struct Row
+            tag: i32
+            cells: [4]i32
+
+        main()
+            var r: Rows[Row] = rows()
+            r.items.push(Row(9, [1, 2, 3, 4]))
+            var g: Rows[[2][4]i32] = rows()
+            g.items.push([[0, 0, 0, 0], [5, 6, 7, 8]])
+            val v = r[0].cells[..]
+            val w = g[0][1][1..<3]
+            for k in 0..<100
+                r.items.push(Row(k, [k, k, k, k]))
+                g.items.push([[k, k, k, k], [k, k, k, k]])
+            r = rows()
+            g = rows()
+            print(v[0] + v[3], w[0] + w[1])
+        """, "5 13\n")
+
+@test("a view stored in a struct and one carried out of a loop by break both keep the storage")
+cvo_stored_and_broken_out()
+    cvo_prints(cvo_rows() + raw"""
+        struct Keep
+            v: []i32
+
+        main()
+            var r: Rows[[4]i32] = rows()
+            r.items.push([1, 2, 3, 4])
+            r.items.push([5, 6, 7, 8])
+            val k = Keep(r[0][..])
+            var found: []i32 = []
+            for i in 0..<2
+                if r[i][0] == 5
+                    found = r[i][1..]
+                    break
+            for n in 0..<100
+                r.items.push([n, n, n, n])
+            r = rows()
+            print(k.v[0] + k.v[3], found[0] + found[2])
+        """, "5 14\n")
+
+@test("a view of an element of a container a call made outlives the statement that dropped it")
+cvo_element_of_a_call_result()
+    cvo_prints(cvo_rows() + raw"""
+        make() -> Rows[[4]i32]
+            var r: Rows[[4]i32] = rows()
+            r.items.push([1, 2, 3, 4])
+            r
+
+        main()
+            val v = make()[0][..]
+            var junk: Rows[[4]i32] = rows()
+            for k in 0..<100
+                junk.items.push([k, k, k, k])
+            print(v[0] + v[3])
+        """, "5\n")
+
+@test("a view of an element of a container held through a reference, dropped by a callee, keeps it")
+cvo_through_a_ref_dropped_by_a_callee()
+    cvo_prints(cvo_rows() + raw"""
+        struct Holder
+            rows: Rows[[4]i32]
+
+        drop_rows(h: &Holder)
+            h.rows = rows()
+
+        main()
+            val h = Holder(rows())
+            h.rows.items.push([1, 2, 3, 4])
+            val v = h.rows[0][..]
+            drop_rows(h)
+            print(v[0] + v[3])
+        """, "5\n")
+
+@test("a view of an element of a container reached @unchecked, kept across growth, keeps the storage")
+cvo_unchecked()
+    cvo_prints(cvo_rows() + raw"""
+        main()
+            var r: Rows[[4]i32] = rows()
+            r.items.push([1, 2, 3, 4])
+            var v: []i32 = []
+            @unchecked
+                v = r[0][..]
+            for k in 0..<100
+                r.items.push([k, k, k, k])
+            r = rows()
+            print(v[0] + v[3])
+        """, "5\n")
+
+@test("a view of an element taken through a bound keeps the storage across a drop the caller makes")
+cvo_through_a_bound()
+    cvo_prints(cvo_rows() + raw"""
+        first_and_last[C: IndexPlace[usize, [4]i32]](c: *C, reset: (*C) -> unit) -> i32
+            val v = c[0][..]
+            reset(c)
+            v[0] + v[3]
+
+        clear(r: *Rows[[4]i32])
+            *r = rows()
+
+        main()
+            var r: Rows[[4]i32] = rows()
+            r.items.push([1, 2, 3, 4])
+            print(first_and_last(&r, clear))
+        """, "5\n")
+
+@test("a container over a view, answering a part of it, keeps the storage when the view is replaced")
+cvo_view_backed_container()
+    cvo_prints(raw"""
+        struct Grid
+            cells: [][4]i32
+
+        impl IndexPlace[usize, [4]i32] for Grid
+            index_place(*self, i: usize) -> *[4]i32 = &self.cells[i]
+            override index_view(*self, i: usize) -> [][4]i32 = self.cells[i..<i + 1]
+
+        main()
+            var g = Grid([[1, 2, 3, 4], [5, 6, 7, 8]])
+            val v = g[1][1..]
+            g.cells = [[0, 0, 0, 0]]
+            print(v[0] + v[2], g[0][0])
+        """, "14 0\n")
+
+@test("an element past a container's count still traps, at the subscript")
+cvo_bounds()
+    if !cvo_ready() then return
+
+    val run = cvo_run(cvo_rows() + raw"""
+        main()
+            var r: Rows[[4]i32] = rows()
+            r.items.push([1, 2, 3, 4])
+            val i = r.items.len() + 2
+            val v = r[i][..]
+            print(v[0])
+        """, "0", true, "")
+
+    assert(!run.ok, run.out)
+    assert(run.err.contains("3") && run.err.contains("main.sysl"), run.err)
+
+// -- a container that answers no index_view ----------------------------------------------------------
+
+@test("a container whose elements are its own bytes or static storage keeps the default, owning nothing")
+cvo_default_own_bytes_and_static()
+    cvo_prints(raw"""
+        var table: [3][4]i32 = [[1, 2, 3, 4], [5, 6, 7, 8], [9, 10, 11, 12]]
+
+        struct Ring
+            cells: [2][4]i32
+            head: usize
+
+        impl IndexPlace[usize, [4]i32] for Ring
+            index_place(*self, i: usize) -> *[4]i32 = &self.cells[(self.head + i) % 2]
+
+        struct Static
+            base: usize
+
+        impl IndexPlace[usize, [4]i32] for Static
+            index_place(*self, i: usize) -> *[4]i32 = &table[self.base + i]
+
+        main()
+            var r = Ring([[1, 2, 3, 4], [5, 6, 7, 8]], 1)
+            var s = Static(1)
+            val v = r[0][1..]
+            val w = s[1][..]
+            r.head = 0
+            print(v[0] + v[2], w[0] + w[3], s[0][..].len)
+        """, "14 21 4\n")
+
+@test("a container taking self whose index_view is written for it is read so, a temporary one included")
+cvo_default_self_container_on_a_temporary()
+    cvo_prints(raw"""
+        import sysl.buf.{Buf, buf}
+
+        struct Plain[T]
+            items: Buf[T]
+
+        impl[T] IndexPlace[usize, T] for Plain[T]
+            index_place(self, i: usize) -> *T = self.items.index_place(i)
+
+        make() -> Plain[[4]i32]
+            val p: Plain[[4]i32] = Plain(buf())
+            p.items.push([1, 2, 3, 4])
+            p
+
+        main()
+            val p = make()
+            val v = p[0][1..]
+            print(v[0] + v[2], make()[0][..].len)
+        """, "6 4\n")
+
+@test("the default view of an element counts nothing, as the element's address owned nothing")
+cvo_default_counts_nothing()
+    if !cvo_ready() then return
+
+    val f = cvo_body(cvo_ir(raw"""
+        struct Ring
+            cells: [2][4]i32
+
+        impl IndexPlace[usize, [4]i32] for Ring
+            index_place(*self, i: usize) -> *[4]i32 = &self.cells[i]
+
+        peek(r: *Ring) -> i32
+            val v = r[1][..]
+            v[0] + v[3]
+
+        main()
+            var r = Ring([[1, 2, 3, 4], [5, 6, 7, 8]])
+            print(peek(&r))
+        """), "peek")
+
+    assert(f.contains("call ptr @Ring.index_place("), f)
+    assert(!f.contains("index_view"), f)
+    assert(!f.contains("@arc.retain_maybe(ptr %"), f)
+
+// -- the routes the analyzer refuses ----------------------------------------------------------------
+
+@test("returning a view of an element of a container parameter is refused")
+cvo_refused_return()
+    cvo_refused(cvo_rows() + raw"""
+        row(r: *Rows[[4]i32]) -> []i32 = r[0][..]
+
+        main()
+            var r: Rows[[4]i32] = rows()
+            r.items.push([1, 2, 3, 4])
+            print(row(&r)[0])
+        """, "a slice of an array this frame owns is returned, so it would outlive the array")
+
+@test("storing a view of an element of a container parameter in a module var is refused")
+cvo_refused_module_var()
+    cvo_refused(cvo_rows() + raw"""
+        var kept: []i32 = []
+
+        keep(r: *Rows[[4]i32])
+            kept = r[0][..]
+
+        main()
+            var r: Rows[[4]i32] = rows()
+            r.items.push([1, 2, 3, 4])
+            keep(&r)
+            print(kept[0])
+        """, "a slice of an array this frame owns is stored somewhere the frame does not own")
+
+@test("capturing a view of an element of a container in a heap closure is refused")
+cvo_refused_capture()
+    cvo_refused(cvo_rows() + raw"""
+        main()
+            var r: Rows[[4]i32] = rows()
+            r.items.push([1, 2, 3, 4])
+            val v = r[0][..]
+            val f: &Fn() -> i32 = () -> v[0] + v[3]
+            print(f())
+        """, "a slice of an array this frame owns is put on the heap")
+
+@test("pushing a view of an element of a container into a Buf is refused")
+cvo_refused_push()
+    cvo_refused(cvo_rows() + raw"""
+        main()
+            var r: Rows[[4]i32] = rows()
+            r.items.push([1, 2, 3, 4])
+            var views: Buf[[]i32] = buf()
+            views.push(r[0][..])
+            print(views[0][0])
+        """, "which holds on to it, so it would outlive the array")
+
+// -- lending to a borrowing callee ------------------------------------------------------------------
+
+private cvo_lending() -> string = cvo_rows() + raw"""
+    struct Holder
+        rows: Rows[[4]i32]
+
+    sum(xs: []i32) -> i32
+        var t = 0
+        for x in xs
+            t += x
+        t
+
+    total(r: *Rows[[4]i32]) -> i32 = sum(r[0][1..])
+
+    // The callee can drop the container it was lent an element of, so the view keeps its count.
+    drop_then_read(h: &Holder, xs: []i32) -> i32
+        val first = xs[0]
+        h.rows = rows()
+        first + xs[3]
+
+    lent_to_a_dropper(h: &Holder) -> i32 = drop_then_read(h, h.rows[0][..])
+
+    main()
+        var r: Rows[[4]i32] = rows()
+        r.items.push([1, 2, 3, 4])
+        val h = Holder(rows())
+        h.rows.items.push([5, 6, 7, 8])
+        print(total(&r), lent_to_a_dropper(h))
+    """
+
+@test("an element of a container lent to a callee that can reach neither it nor its view takes no count")
+cvo_lent_takes_no_count()
+    cvo_none(cvo_lending(), "total")
+
+@test("an element of a container lent to a callee that can drop the container keeps its count")
+cvo_lent_to_a_dropper_keeps_its_count()
+    cvo_kept(cvo_lending(), "lent_to_a_dropper")
+
+@test("every lending cell prints what it should and gives everything back")
+cvo_lending_runs()
+    cvo_prints(cvo_lending(), "9 13\n")
+
+// -- a generic body's view of a *T region ------------------------------------------------------------
+
+@test("a generic view of a *T region views Ts at every instantiation, an array among them")
+cvo_generic_pointer_region()
+    cvo_prints(raw"""
+        first[T](p: *T, n: usize) -> []T = p[0..<n]
+
+        main()
+            var a = [[1, 2, 3, 4], [5, 6, 7, 8]]
+            var xs = [10, 20, 30]
+            val v = first(&a[0], 2)
+            val w = first(&xs[0], 3)
+            val p = &a[1]
+            val inner = p[1..<3]
+            print(v.len, v[1][3], w[2], inner.len, inner[0] + inner[1])
+        """, "2 8 30 2 13\n")

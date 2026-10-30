@@ -801,6 +801,94 @@ print(r.cells)
 [1, 2, 30, 0]
 ```
 
+**A view of part of an element keeps the storage the element lives in.** Where the element is an
+array, `c[i][..]`, `c[i].cells[1..]` and `c[i][j][..]` are taken through the trait's `index_view`
+rather than `index_place`: `c[i][..]` is `c.index_view(i)[0][..]`, the element read as the one element
+of a view, so the view taken carries that view's owner and stays good after the container grows or is
+dropped. A container whose elements live in a `Buf` or a view says so by answering a part of it —
+`Buf` does, which is all that makes `b[i][..]` safe.
+
+**A container whose `index_place` forwards to such a field has that answer written for it.** Where
+the block leaves `index_view` out and the last expression of `index_place` is one of these, `f` a field
+of `self` and `e` any index expression, the compiler writes `index_view` as the same forwarding, the
+statements before that expression kept:
+
+| `index_place` ends in | `index_view` is written as |
+|---|---|
+| `self.f.index_place(e)` | `self.f.index_view(e)` |
+| `self.f.index_place_unchecked(e)` | `self.f.index_view_unchecked(e)` |
+| `&self.f[e]`, `f` a container | `self.f.index_view(e)` |
+| `&self.f[e]`, `f` a view | `self.f[e..][0..<1]` |
+
+`index_view_unchecked` is written the same way, from `index_place_unchecked` where the block wrote
+one. A member the block wrote itself is never replaced. So `Rows` needs no more than its
+`index_place`:
+
+```sysl
+import sysl.buf.{Buf, buf}
+
+struct Rows
+    items: Buf[[4]int]
+
+impl IndexPlace[usize, [4]int] for Rows
+    index_place(self, i: usize) -> *[4]int = self.items.index_place(i)
+
+var r = Rows(buf())
+
+r.items.push([1, 2, 3, 4])
+
+val v = r[0][1..]
+
+for k in 0..<100 do r.items.push([k, k, k, k])
+
+r = Rows(buf())
+
+print(v)
+```
+
+```output
+[2, 3, 4]
+```
+
+**The default `index_view` answers a view whose owner is nothing**, which is exactly right for elements
+that are the container's own bytes, like `Ring`'s above, or static storage: those live as long as
+the container or the program. A container that keeps its elements behind a `*T` is in the raw-pointer
+tier, where nothing is kept alive for it, as nothing is for `p[0..<n]`. The default is kept where
+`index_place` ends in `&` of a place reached through `*self` by fields and fixed arrays' subscripts,
+of a module variable written as a fixed array, or of anything reached through a raw pointer.
+
+**Anywhere else, a view of part of an element taken through the default is refused**, since it would
+own nothing and could outlive the storage once the container grows or is dropped; so is a call of
+the default `index_view` itself. The diagnostic gives the one line that answers it:
+
+```sysl
+import sysl.buf.{Buf, buf}
+
+struct Hidden
+    items: Buf[[4]int]
+
+    slot(*self, i: usize) -> *[4]int = self.items.index_place(i)
+
+impl IndexPlace[usize, [4]int] for Hidden
+    index_place(*self, i: usize) -> *[4]int = self.slot(i)
+
+var h = Hidden(buf())
+
+h.items.push([1, 2, 3, 4])
+
+val v = h[0][1..]
+
+print(v)
+```
+
+```error
+a view of part of an element of 'Hidden' is taken through the default 'index_view', but its 'index_place' does not reach the element in the container's own bytes through '*self', in static storage or through a raw pointer, so the view would own nothing and could outlive the storage once the container grows or is dropped — answer the view from the storage: 'override index_view(*self, i: usize) -> [][4]int = <storage>.index_view(i)'
+```
+
+`override index_view(*self, i: usize) -> [][4]int = self.items.index_view(i)` in the block is the
+answer here. `index_view_unchecked` is the same member inside an `@unchecked` block, defaulting to
+`index_view`'s answer over `index_place_unchecked`.
+
 **Where the method takes a `usize`, the subscript takes any integer**, exactly as an array's does: the
 compiler brings the index to a `usize` before the call, so `b[i]` with `i` an `int`, an `i8` or a
 `u64` needs no conversion written, and the index fixes no literal binding's type. This holds for

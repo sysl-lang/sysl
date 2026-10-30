@@ -622,7 +622,7 @@ private slice_expr(cx: &Analyzer, span: Span, receiver: Expr, lo: Option[Expr], 
     // **An array literal is the one receiver with no type of its own**, so a view of one is the one
     // place the view's expectation has to reach through to the elements.
     val hint = elem_hint(receiver, expected)
-    val tr = type_expr(cx, receiver, hint)
+    val tr = type_expr(cx, viewed_through_storage(cx, receiver).unwrap_or(receiver), hint)
     val rt = texpr_type(tr)
 
     if rt == Unknown then return tr
@@ -651,6 +651,85 @@ private slice_expr(cx: &Analyzer, span: Span, receiver: Expr, lo: Option[Expr], 
                        inclusive, view_ty))
 end slice_expr
 
+// **A view of part of an element of a container someone wrote is taken through the container's
+// `index_view`**: `c[i][..]` is read as `c.index_view(i)[0][..]`, so the element is an element of a
+// view whose owner is the storage's, and the view taken keeps that storage alive past a growth or a
+// drop of the container -- the rule a view of part of an element of a view already has. The walk
+// follows the steps a view of an array can sit at the end of, a field and a subscript, down to the
+// first subscript `IndexPlace` reads; `None` where there is none, and the receiver is read as written.
+private viewed_through_storage(cx: &Analyzer, receiver: Expr) -> Option[Expr] = *receiver.kind match
+    Field(r, name, at) -> viewed_through_storage(cx, r).map(x -> expr(receiver.span, Field(x, name, at)))
+    Index(r, index, open) ->
+        *index.kind match
+            RangeExpr(_, _, _) -> return None
+            _ -> ()
+
+        if !subscripted_in_place(cx, r)
+            return viewed_through_storage(cx, r).map(x -> expr(receiver.span, Index(x, index, open)))
+
+        var one: Buf[Expr] = buf()
+
+        one.push(subscript_index_arg(index))
+
+        val member = if cx.unchecked > 0 then "index_view_unchecked" else "index_view"
+        val call = expr(receiver.span, Call(expr(receiver.span, Field(r, member, receiver.span)), one))
+
+        Some(expr(receiver.span, Index(call, expr(receiver.span, IntLit("0", 10, "")), open)))
+    _ -> None
+
+// Whether a subscript of `container` is read through `IndexPlace` -- by an implementation, or by a
+// bound that promises it -- asked of the written container before anything has committed to it, as
+// `indexes_written` asks. A pointer to such a container is indexed as the container.
+private subscripted_in_place(cx: &Analyzer, container: Expr) -> bool
+    val key = catalog_key(cx.an, "IndexPlace")
+
+    if key.is_none() then return false
+
+    val tried = begin_trial(cx)
+    val t = type_expr_bare(cx, container)
+
+    discard_trial(cx, tried)
+
+    val ty = receiver_type(texpr_type(t))
+
+    repr(ty) match
+        Unknown -> false
+        Abstract(_, bounds) -> bound_member(cx.an, repr(ty), bounds, "index_view").is_some()
+        _ ->
+            if !indexes_through(cx.an, key.unwrap(), ty) then return false
+
+            if answers_own_view(cx, ty) then return true
+
+            // **A default whose view would own nothing it should is refused here**, where the view of
+            // part of an element is taken (`index_view_infer.sysl`).
+            val member = if cx.unchecked > 0 then "index_view_unchecked" else "index_view"
+            val why = ownerless_view_refusal(cx.an, view_member_name(cx, ty, member))
+
+            if why.is_some() then
+                cx.fault(container.span, s"a view of part of an element of '${type_show(ty)}' is " +
+                         s"taken through the default '$member', but ${why.unwrap()}")
+            false
+end subscripted_in_place
+
+// Whether a container answers `index_view` itself rather than inheriting the trait's default. The
+// default's view owns nothing, as the element's address does, so a container that keeps it is read
+// through `index_place` exactly as before -- the same code, and the same receiver: the default takes
+// `*self` where the container's own `index_place` may take `self`.
+private answers_own_view(cx: &Analyzer, ty: Type) -> bool
+    val name = view_member_name(cx, ty, "index_view")
+
+    name != "" && !cx.an.tables.members.default_origin.has(name)
+end answers_own_view
+
+// The name a container's view member was lowered under, or empty where it has none.
+view_member_name(cx: &Analyzer, ty: Type, member: string) -> string
+    val key = member_key_of(member_key(cx.an, ty, member).0, member)
+
+    cx.an.tables.members.generic.get(key) match
+        Some(fd) -> fd.name
+        None -> cx.an.tables.members.funcs.get(key).unwrap_or("")
+end view_member_name
+
 // Part of a string is a string, not a `[]u8` -- the bytes between two character boundaries are
 // still well-formed UTF-8, which is what the check at those boundaries is for.
 private view_of(receiver: Type, elem: Type, read_only: bool) -> Type
@@ -668,6 +747,17 @@ private elem_hint(receiver: Expr, expected: Option[Type]) -> Option[Type]
             _ -> None
         _ -> None
 end elem_hint
+
+// The element type of the array a pointer points at, where it is sliced as that array: never where a
+// type parameter stands for the pointee.
+private pointee_array(cx: &Analyzer, inner: Type) -> Option[Type]
+    for b in cx.subst
+        if b.name != "Self" && repr(b.ty) == repr(inner) then return None
+
+    inner match
+        Array(_, e) -> Some(*e)
+        _ -> None
+end pointee_array
 
 private slice_elem(cx: &Analyzer, span: Span, rt: Type, hi: Option[Expr]) -> Option[Type]
     // An exported alias of a pointer is sliced as the pointer it names.
@@ -687,10 +777,14 @@ private slice_elem(cx: &Analyzer, span: Span, rt: Type, hi: Option[Expr]) -> Opt
         Slice(e, _) -> return Some(*e)
         // A view of a `*T` region -- the shape every C function that fills a buffer hands back. The
         // pointer carries no length, so the end must be written and is taken on trust.
+        //
+        // **A pointee a type parameter stands for is decided by the parameter**, as a subscript's is
+        // (`pointee_indexes`): the body was read with `*T` a region of `T`s, so an instantiation at
+        // `T = [4]int` views `[4]int`s rather than the first one's `int`s.
         Ptr(inner) ->
-            *inner match
-                Array(_, e) -> return Some(*e)
-                _ ->
+            pointee_array(cx, *inner) match
+                Some(e) -> return Some(e)
+                None ->
                     if hi.is_none() then
                         cx.fault(span, s"a ${type_show(rt)} carries no length, so a view of one " +
                                  "needs its end written — 'p[0..<n]' with the number of elements " +
