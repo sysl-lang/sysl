@@ -54,6 +54,39 @@ gen_splat(e: *Emit, value: TExpr, vec_ty: Type) -> Val
     r
 end gen_splat
 
+// A vector's lanes laid into an array, or an array's elements gathered into a vector: one
+// `extractelement` and one `insertvalue` per lane, or the other way about. It is never a store of the
+// whole register and a load of the array: a `<N>bool` is packed into bits in memory and a `[N]bool`
+// is not, and a vector of three lanes is stored as four. Lane by lane says what the conversion is,
+// and LLVM merges the chain into whatever moves the machine has.
+gen_lanes_as(e: *Emit, value: TExpr, ty: Type) -> Val
+    val from = texpr_type(value)
+    val v = gen_expr(e, value)
+    val to_vector = repr(ty) match
+        Vector(_, _) -> true
+        _ -> false
+    val n = if to_vector then vector_lanes(ty) else vector_lanes(from)
+    val (fty, tty) = (lty(e, from), lty(e, ty))
+    val ety = lty(e, element(repr(ty)).unwrap_or(Unknown))
+    var acc: Val = VZero
+
+    for i in 0..<n
+        val lane = fresh_reg(e)
+        val r = fresh_reg(e)
+
+        if to_vector
+            emit(e, InExtract(lane, fty, v, index_list(i)))
+            emit(e, InInsertElement(r, tty, acc, ety, lane, ir_arg(l_i32(), VInt(from_int(long(i))))))
+        else
+            emit(e, InExtractElement(lane, fty, v, ir_arg(l_i32(), VInt(from_int(long(i))))))
+            emit(e, InInsert(r, tty, acc, ety, lane, index_list(i)))
+        end if
+
+        acc = r
+
+    acc
+end gen_lanes_as
+
 // One lane, read straight out of the register. There is no address and so no bounds test: the index
 // was held to a constant in range where it was written.
 gen_lane(e: *Emit, receiver: TExpr, lane: int) -> Val

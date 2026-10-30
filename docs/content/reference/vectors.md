@@ -76,7 +76,119 @@ print(v[4])
 ```
 
 A lane is written by the same constant index, `v[1] = 9`, and by [letter](#swizzles): `v.y = 9`. For
-a computed index, store the values in an array, whose subscript is checked at run time.
+a computed index, [convert the vector to an array](#a-vector-and-an-array), whose subscript is
+checked at run time.
+
+### Every lane, one at a time
+
+**A loop over the lanes is a [`for const`](/reference/generics/#a-parameter-may-stand-for-a-list-of-types).**
+It is unrolled while compiling into one copy of its body per value, and in each copy the variable is
+a constant, so `v[j]` is a lane index like `v[2]`. The range may be bounded by literals, `const`s or a
+value parameter, so one kernel walks every width it is instantiated at:
+
+```sysl
+dot[const N: usize](a: <N>f64, b: <N>f64) -> f64
+    var s = 0.0
+
+    for const j in 0..<N
+        s += a[j] * b[j]
+
+    s
+
+val a: <4>f64 = [1, 2, 3, 4]
+var scaled: <4>f64 = 0
+
+for const j in 0..<4
+    scaled[j] = a[j] * real(j)
+
+print(dot(a, a), scaled[3])
+```
+
+```output
+30 12
+```
+
+Each lane read in the copies is one `extractelement` at a constant lane, exactly what `a[0] * b[0] +
+a[1] * b[1] + …` written out would give, and the optimizer is free to keep a lane in its register:
+AArch64's `fmla v0.2d, v1.2d, v2.d[1]` multiplies by one lane of another register in place. Copies
+nest, so `acc[i][j]` over an array of vectors is two `for const` loops.
+
+The rules are the `for const`'s own: the range is known at compile time, it is unrolled to at most
+65 copies, a `return` in a copy leaves the function, and `break` and `continue` are refused, since
+no loop is left at run time for them to act on. **An ordinary `for` is a loop at run time**, its
+variable different on each turn, so it cannot pick a lane:
+
+```sysl
+const NR = 4
+
+total(v: <NR>f64) -> f64
+    var s = 0.0
+
+    for j in 0..<NR
+        s += v[j]
+
+    s
+
+print(total(1))
+```
+
+```error
+a lane index is part of the instruction that reads it, so it has to be a constant — a literal, a 'const' naming one, or the variable of a 'for const', which is unrolled
+```
+
+### A vector and an array
+
+**A vector converts to an array of the same element and length, and an array to such a vector.**
+`<N>T` and `[N]T` hold the same values in the same order, so nothing is rounded or reinterpreted,
+and the conversion is made by the position as every [lossless
+conversion](/reference/expressions/#which-conversions-are-implicit) is: a declared `val` or `var`, an
+assignment, an argument, a returned value, a field, an element.
+
+```sysl
+largest[const N: usize](v: <N>f64) -> f64
+    val xs: [N]f64 = v
+    var best = xs[0]
+
+    for x in xs
+        if x > best then best = x
+
+    best
+
+val v: <4>f64 = [3, 9, 2, 6]
+val doubled: [4]f64 = v * 2
+var i = 1
+
+val back: <4>f64 = doubled
+
+print(largest(v), doubled[i], (back + 1)[3])
+```
+
+```output
+9 18 13
+```
+
+The array is storage, so it is subscripted by a computed index, walked by an ordinary `for`, and
+checked at run time; the vector is a register, computed with lane-wise. The conversion moves the
+lanes one by one (an `extractelement` and an `insertvalue` each), which the optimizer merges into
+the machine's own moves; it is never a store of the whole register, because a `<4>bool` is packed
+into bits in memory and a `[4]bool` is not. For moving a run of a *larger* array, use
+[`load` and `store`](#loading-and-storing).
+
+The two must agree in element and in length. **Nothing converts through anything else**, so a
+`<4>f32` is not a `[4]f64`; and a different length is refused naming both:
+
+```sysl
+val v: <4>f32 = [1, 2, 3, 4]
+val a: [3]f32 = v
+```
+
+```error
+a vector converts to an array, and an array to a vector, only at one length: <4>f32 has 4 lanes and [3]f32 has 3 elements
+```
+
+An operator does not mix the two, in either order: two operands meeting is not a position that names
+the type it wants, so `v + a` with `a` an array is refused as two different vector types are.
+Convert one side first, with a declared `val`.
 
 ## What the operators do
 
