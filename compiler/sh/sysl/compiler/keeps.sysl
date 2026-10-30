@@ -1971,6 +1971,7 @@ end image_kept
 private kept_at(t: &Track, evs: &EvBuf, e: TExpr)
     *e.kind match
         TStore(place, v, _, _) -> stored(t, evs, place, v)
+        TStructNew(st, args) -> captures_kept(t, evs, st, args)
         TSlots(op, args, _, _) ->
             if t.promised then return
 
@@ -1990,6 +1991,7 @@ private kept_at(t: &Track, evs: &EvBuf, e: TExpr)
                 kept_hard(evs, "it is the waker handed to 'step', which the task keeps for its parks", wake.span)
         TCall(name, args, _, _) ->
             join_clear(t.hs, evs, name, args, e.span)
+            handed_closures_kept(t, evs, args)
 
             for j in 0..<args.len()
                 if image_kept(t, evs, e, name, j, args.at(j)) then continue
@@ -2000,7 +2002,7 @@ private kept_at(t: &Track, evs: &EvBuf, e: TExpr)
 
                 for at in 0..<held.len()
                     val item = held.at(at)
-                    val how = s"it is passed to '${shown_name(t.cx.an, name)}', which " +
+                    val how = s"it is passed to ${callee_said(t.cx.an, name)}, which " +
                         (if at < kept_n then "keeps it" else "lets what it reads through it out")
 
                     if item.loc == "j" && has_span(t.hs.chained, e.span) then continue
@@ -2028,6 +2030,8 @@ private kept_at(t: &Track, evs: &EvBuf, e: TExpr)
                 end if
         TVCall(recv, slot, args, _, _) ->
             val all = with_receiver(recv, args)
+
+            handed_closures_kept(t, evs, all)
 
             for k in 0..<all.len()
                 if !hands_on(t, all.at(k)) then continue
@@ -2070,13 +2074,21 @@ end kept_at
 // through it -- the argument may be the pointer itself, handed on, or one read out of it.
 private track_call_locs(t: &Track, name: string, j: usize, arg: TExpr) -> Buf[KeptAt]
     val kept = keeps_of(t.cx, name, j).locs
+    val lent = lends_held(t, name, arg)
 
-    if !reads_on(t, arg) then return kept
+    if !reads_on(t, arg) && !lent then return kept
 
     var out: Buf[KeptAt] = buf()
 
     for item in kept
         out.push(item)
+
+    if lent
+        for item in read_of(t.cx, name, j, 1).locs
+            out.push(item)
+
+        return out
+    end if
 
     if t.steps == 0
         for item in (if t.deep then deep_path_of(t.cx, name, j, hand_path(t, arg, 0)) else through_of(t.cx, name, j)).locs
@@ -2133,6 +2145,78 @@ private track_pointer_locs(t: &Track, callee: TExpr, j: usize, arg: TExpr) -> Bu
 
     out
 end track_pointer_locs
+
+// **The address of a local holding what a keeps walk follows lends it one step in**, so the callee is
+// asked what it lets out of what it reads one step through that pointer: `relay(h: H) = keep_it(&h)`
+// keeps whatever `keep_it` keeps of `h.p`. A buffer lent by address is asked on its own terms
+// (`lends_vessel`). **A closure's body is not asked here** -- `f()` hands it `&f` -- since what it
+// lets out is told capture by capture at the literal, where the body is in hand (`captures_kept`):
+// asked here, every capture would go with whichever one the body keeps.
+private lends_held(t: &Track, name: string, arg: TExpr) -> bool
+    if t.through || t.steps != 0 || lends_vessel(t, arg) || closure_call(name) then return false
+
+    *arg.kind match
+        TAddrOf(place, _) -> holds_local(t, place)
+        _ -> false
+end lends_held
+
+private closure_call(name: string) -> bool = name.ends_with(".call") && mentions_closure(name)
+
+// **What a closure's body lets out of a capture leaves with what the capture holds**, wherever the
+// closure goes next -- run where it is handed, behind a `&Fn`, by a `@scoped` member -- so a walk
+// meeting a closure literal built around what it follows asks the body, capture by capture, what it
+// lets out of that field of its environment: one step in for a capture held by value, two for one
+// held by reference, whose field is the address of the variable.
+private captures_kept(t: &Track, evs: &EvBuf, st: &StructType, args: Buf[TExpr])
+    if t.raw || !is_closure_literal(Struct(st)) then return
+
+    val body = s"${st.base}.call"
+
+    if t.cx.find(body).is_none() then return
+
+    for c in 0..<args.len()
+        if c >= st.fields.len() then break
+
+        val arg = args.at(c)
+
+        if !carries(t, arg) then continue
+
+        for item in read_path_of(t.cx, body, 0, capture_steps(arg), s".${st.fields.at(c).0}").locs
+            val loc = outlasting_loc(item.loc)
+
+            if loc.is_some()
+                evs.items.push(FlowEv(false, loc.unwrap(), s"it is captured by a closure, which lets it out (${item.how})",
+                                      arg.span))
+        end for
+    end for
+end captures_kept
+
+// The same at a call handed the closure, after whatever the call overwrites (`closures_handed`).
+private handed_closures_kept(t: &Track, evs: &EvBuf, args: Buf[TExpr])
+    for a in args
+        closure_literal_of(a, t.decls, 0) match
+            Some(lit) ->
+                *lit.kind match
+                    TStructNew(st, captured) -> captures_kept(t, evs, st, captured)
+                    _ -> ()
+            None -> ()
+end handed_closures_kept
+
+// The steps from a closure's environment to what a capture holds: the field itself for one held by
+// value, the variable its field points at for one held by reference.
+private capture_steps(arg: TExpr) -> int = *arg.kind match
+    TAddrOf(_, _) -> 2
+    _ -> 1
+
+// Where a closure's body holds a capture, as its maker says it: module storage, or anywhere nobody can
+// name. One through the body's own parameters is somewhere its caller decides, and that call is asked.
+private outlasting_loc(loc: string) -> Option[string]
+    if loc == "" then return Some("")
+    if loc.index_of("?").is_some() && !loc.starts_with("j?") then return Some("")
+    if loc.starts_with("g:") || loc.starts_with("d:g:") then return Some(loc)
+
+    None
+end outlasting_loc
 
 // Whether a callee handed `arg` is asked what it lets out of what it reads through it: in a walk of
 // what is read through the parameter, an argument something can be read through -- and in a walk of
@@ -3512,14 +3596,102 @@ private frame_event_at(ft: &FrameTrack, evs: &EvBuf, e: TExpr)
         TStore(place, v, _, _) -> frame_stored(ft, evs, place, v)
         TAwait(task, _) -> await_clear(ft.hs, evs, task, e.span)
         TBlockOn(task, _) -> await_clear(ft.hs, evs, task, e.span)
-        TCall(_, _, _, _) -> call_at(ft, evs, e)
-        TVCall(_, _, _, _, _) -> call_at(ft, evs, e)
+        TCall(_, args, _, _) ->
+            call_at(ft, evs, e)
+            closures_handed(ft, evs, args)
+        TVCall(recv, _, args, _, _) ->
+            call_at(ft, evs, e)
+            closures_handed(ft, evs, with_receiver(recv, args))
         TCallPtr(_, _, _, _) -> call_at(ft, evs, e)
         TStep(_, wake) -> step_waker_at(ft, wake)
         TErase(v, _, ty) -> if ft.probe then probe_synced(ft, e.span, v, ty)
         TBox(v, ty) -> if ft.probe then probe_synced(ft, e.span, v, ty)
+        TStructNew(st, args) -> if !ft.probe then captures_let_out(ft, evs, st, args)
         _ -> ()
 end frame_event_at
+
+// **A closure handed to a call is judged again there**, after whatever the call overwrites: the call
+// may run it, and a body storing its capture overwrites the very place it lets it out to, which
+// would otherwise read as taking back what the literal let out (`frame_top_clears`).
+private closures_handed(ft: &FrameTrack, evs: &EvBuf, args: Buf[TExpr])
+    if ft.probe then return
+
+    for a in args
+        closure_literal_of(a, ft.inits, 0) match
+            Some(lit) ->
+                *lit.kind match
+                    TStructNew(st, captured) -> captures_let_out(ft, evs, st, captured)
+                    _ -> ()
+            None -> ()
+end closures_handed
+
+// The closure literal a value is, behind a box or an address, or a local bound once to one.
+private closure_literal_of(e: TExpr, inits: Buf[(string, TExpr)], depth: int) -> Option[TExpr]
+    if depth > 4 then return None
+
+    *e.kind match
+        TStructNew(st, _) -> if is_closure_literal(Struct(st)) then Some(e) else None
+        TBox(v, _) -> closure_literal_of(v, inits, depth + 1)
+        TErase(v, _, _) -> closure_literal_of(v, inits, depth + 1)
+        TAddrOf(place, _) -> closure_literal_of(place, inits, depth + 1)
+        TLoad(n, _) ->
+            for item in inits
+                if item.0 == n then return closure_literal_of(item.1, inits, depth + 1)
+
+            None
+        _ -> None
+end closure_literal_of
+
+// **A closure is judged where it is written, where its body is in hand**: a capture holding the
+// address of this frame's storage, which the body lets out of what it reads through its environment
+// -- into module storage, or anywhere -- outlives the frame however the closure is reached later: by
+// value, behind a `&Fn`, run by a `@scoped` member, or called long after the call that was handed it.
+// What it puts through a pointer it captured or was handed is asked where that pointer is.
+private captures_let_out(ft: &FrameTrack, evs: &EvBuf, st: &StructType, args: Buf[TExpr])
+    if !is_closure_literal(Struct(st)) then return
+
+    val body = s"${st.base}.call"
+
+    if ft.cx.find(body).is_none() then return
+
+    for c in 0..<args.len()
+        if c >= st.fields.len() then break
+
+        val arg = args.at(c)
+        val field = st.fields.at(c).0
+
+        // The capture's field, and for one held by reference the variable it points at.
+        var held: Buf[(int, string)] = buf()
+
+        rule_core(ft, arg) match
+            Some(core) -> held.push((1, core))
+            None -> ()
+
+        *arg.kind match
+            TAddrOf(place, _) -> local_root(ft.refs, place) match
+                Some(n) -> if ft.core_of(n).is_some() then held.push((2, ft.core_of(n).unwrap()))
+                None -> ()
+            _ -> ()
+
+        for h in held
+            for item in read_path_of(ft.cx, body, 0, h.0, s".$field").locs
+                val loc = outlasting_loc(item.loc)
+
+                if loc.is_none() then continue
+
+                val said = s"a closure lets its capture '$field' outlive the call (${item.how}), and '$field' " +
+                    s"holds ${h.1} — capture the value itself, or storage that lasts"
+
+                if loc.unwrap() == ""
+                    ft.faults.items.push((ft.scope, arg.span, said))
+                    break
+                end if
+
+                evs.items.push(FlowEv(false, loc.unwrap(), said, arg.span))
+            end for
+        end for
+    end for
+end captures_let_out
 
 // **The waker handed to `step` is kept by the task**: every `park` in it, this step's or one woken
 // long after the step returned, calls that waker, so it outlives the frame that built it whatever
