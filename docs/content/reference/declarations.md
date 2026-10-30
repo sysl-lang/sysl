@@ -3781,6 +3781,78 @@ print(1)
 'Option' is the library's, and an 'impl' naming no trait adds members to a type only in a file of the module that declares it
 ```
 
+#### Members of one instance
+
+**A block whose header declares no parameters and whose subject fixes every argument adds members to
+that one instance** and to no other — what a board's methods for the one chip only it carries look
+like. The body is compiled once, for that instance; another instance, or a body written for every
+instance, does not have the member. An alias works as an argument, and a type whose parameters all
+have defaults may be written bare, naming its default instance:
+
+```sysl
+struct Rp2040
+    id: int
+
+struct Rp2350
+    id: int
+
+struct Board[C = Rp2350]
+    n: int
+    chip: C
+
+impl[C] Board[C]
+    count(self) -> int = self.n
+
+impl Board[Rp2350]
+    static FLASH -> int = 4096
+
+    boot(*self)
+        self.n += 1
+
+    otp(self) -> int = self.chip.id * 100
+
+impl Board[Rp2040]
+    otp(self) -> int = 0
+
+var pico2 = Board(1, Rp2350(3))
+
+pico2.boot()
+print(pico2.count(), pico2.otp(), Board(0, Rp2040(1)).otp(), Board.FLASH)
+```
+
+```output
+2 300 0 4096
+```
+
+**A name is the generic block's or one instance's, never both** — the instance's would hide the
+other from that instance and nothing written would say so — while two instances may each have one,
+as `otp` does above. A body written for every `Board` is checked once, for all of them, so it cannot
+reach a member only one has:
+
+```sysl
+struct Rp2350
+    id: int
+
+struct Board[C]
+    n: int
+
+impl Board[Rp2350]
+    otp(self) -> int = 7
+
+impl[C] Board[C]
+    report(self) -> int = self.otp()
+
+print(Board[Rp2350](1).report())
+```
+
+```error
+type 'Board[C]' has no method 'otp' — 'otp' belongs to 'Board[Rp2350]' alone, and this body is written for every 'Board'
+```
+
+A block fixing some arguments and leaving others to its parameters — `impl[T] Pair[T, int]` — is
+refused, and a trait is still implemented for a generic type as a whole
+([§ An `impl` covers a generic type as a whole](/reference/traits/#an-impl-covers-a-generic-type-as-a-whole)).
+
 ## Enums
 
 Two shapes under one keyword. A **simple** enum is a set of named discriminants over an underlying

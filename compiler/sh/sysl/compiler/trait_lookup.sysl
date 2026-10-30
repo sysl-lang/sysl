@@ -76,6 +76,14 @@ member_owner(t: Type) -> (string, Buf[Type]) = t match
     Constrained(d) -> if d.generic != "" then (d.generic, d.targs) else (type_show(t), buf())
     _ -> (type_show(t), buf())
 
+// The key one **instance** of a generic struct or enum files its own members under -- what
+// `impl Board[Rp2350]` adds to `Board[Rp2350]` and to no other `Board`. A tuple is already filed
+// under the whole of itself, and a type with no arguments has no instances to tell apart.
+instance_owner(t: Type) -> Option[string] = t match
+    Struct(d) -> if is_tuple(d) || d.targs.is_empty() then None else Some(instance_key(d.base, d.targs))
+    Enum(d) -> if d.targs.is_empty() then None else Some(instance_key(d.base, d.targs))
+    _ -> None
+
 // The key alone -- what an `impl` is filed under, and what a trait bound looks up.
 owner_key(t: Type) -> string = member_owner(t).0
 
@@ -192,6 +200,14 @@ widened_type(t: Type) -> Option[Type] = t match
 // may give one name to one type only where the written-out one says `override`, and then asking the
 // type's key before the shape's is exactly the "written-out beats a parameter" half of the ordering.
 member_key(a: &Analysis, t: Type, mname: string) -> (string, Buf[Type])
+    // **One instance's own members are asked before the generic type's**, and the two never answer
+    // one name: `impl Board[Rp2350]` and `impl[C] Board[C]` are refused the same member together, so
+    // the order only decides where the lookup finds it, never which of two it finds.
+    val instance = instance_owner(t)
+
+    if instance.is_some() && has_member_at(a, instance.unwrap(), mname) then
+        return (instance.unwrap(), buf())
+
     val own = member_owner(t)
 
     if has_member_at(a, own.0, mname) then return own

@@ -597,6 +597,11 @@ hoist_inherent(a: &Analysis, im: Impl)
         return
     end if
 
+    if fixes_one_instance(a, key.unwrap(), nom.unwrap(), block)
+        hoist_instance(a, im, key.unwrap(), nom.unwrap())
+        return
+    end if
+
     val asked = a.complaints()
     val target = named_target(a, scope, span, block, block.for_type, key.unwrap(), nom.unwrap())
 
@@ -610,6 +615,102 @@ hoist_inherent(a: &Analysis, im: Impl)
         for fd in lowered
             a.tables.members.block_bounds.put(fd.name, block.bounds)
 end hoist_inherent
+
+// Whether a block naming no trait is for **one instance** of a generic type -- `impl Board[Rp2350]`,
+// or `impl ArmBoard` where every parameter has a default -- rather than for all of them. A block with
+// parameters of its own covers every instance it matches and is read by `named_target`; so is a
+// bare generic name with a parameter left to fix, which that reading refuses.
+private fixes_one_instance(a: &Analysis, key: string, nom: (Buf[string], Buf[string], string),
+                           block: ImplDecl) -> bool
+    if nom.0.is_empty() then return false
+    if !block.tparams.is_empty() || !block.tvalues.is_empty() || !block.tpacks.is_empty() then
+        return false
+
+    *block.for_type.kind match
+        NamedType(_, args) -> !args.is_empty() || every_parameter_defaulted(a, key)
+        _ -> false
+end fixes_one_instance
+
+private every_parameter_defaulted(a: &Analysis, key: string) -> bool
+    val decl = a.tables.types.get(key)
+
+    if decl.is_none() then return false
+
+    decl.unwrap().kind match
+        StructOf(d) -> d.tdefaults.len() == d.tparams.len()
+        EnumOf(d) -> d.tdefaults.len() == d.tparams.len()
+        _ -> false
+end every_parameter_defaulted
+
+// `impl Board[Rp2350]`: members of that one instance of a generic type, and of no other.
+//
+// **They are the members of a concrete type**, filed under the instance's own key
+// (`instance_owner`) with `Self` bound to the instance, so each body is lowered once, for it, and a
+// receiver of any other instance never reaches one. The lookup asks the instance's key ahead of the
+// generic type's (`member_key`), which is why a name may belong to one or the other but not both:
+// the generic block's member would be unreachable from this instance, and nothing written would say
+// so. Two instances may each have a member of one name, since no receiver is both.
+private hoist_instance(a: &Analysis, im: Impl, key: string, nom: (Buf[string], Buf[string], string))
+    val scope = im.scope
+    val block = im.decl
+    val asked = a.complaints()
+    val ty = resolve_type(a, scope, block.for_type, buf())
+
+    if a.complaints() > asked then return
+
+    val owner = instance_owner(ty)
+
+    if owner.is_none() then return
+
+    val ikey = owner.unwrap()
+    val label = type_show(ty)
+    val whole = module_show(key)
+
+    for m in block.methods
+        val name = source_member_name(m.name)
+
+        if has_member_at(a, key, m.name) || a.tables.members.alts.has(member_key_of(key, m.name)) then
+            a.fault(scope, m.span, s"'$whole' already has a member named '$name' for every " +
+                    s"instantiation, so '$label' cannot declare one of its own")
+
+    if a.complaints() > asked then return
+
+    note_instance(a, key, ikey, label)
+
+    // The instance's members reach as far as the type does, unless one is marked narrower.
+    val reach = a.tables.access.get(key)
+
+    if reach.is_some() then a.tables.access.put(ikey, reach.unwrap())
+
+    record_impl_members_access(a, scope, ikey, label, block.methods)
+    hoist_member_list(a, MemberHome(ikey, label, member_symbol(ty), None, block.for_type, buf(), buf(),
+                                    nom.1, nom.2, self_binding(ty), buf(), "", None, false, buf(),
+                                    buf(), scope, buf()),
+                      block.methods)
+end hoist_instance
+
+private note_instance(a: &Analysis, key: string, ikey: string, label: string)
+    var held = a.tables.members.instances.get(key).unwrap_or(buf())
+
+    for item in held
+        if item.0 == ikey then return
+
+    held.push((ikey, label))
+    a.tables.members.instances.put(key, held)
+end note_instance
+
+// The instance of the generic type filed under `key` that already has a member `name` of its own,
+// as a diagnostic shows it.
+instance_holding(a: &Analysis, key: string, name: string) -> Option[string]
+    val held = a.tables.members.instances.get(key)
+
+    if held.is_none() then return None
+
+    for item in held.unwrap()
+        if has_member_at(a, item.0, name) then return Some(item.1)
+
+    None
+end instance_holding
 
 // Which associated type each `some` member settles, read off the **trait's** declaration of that
 // member. A member whose trait counterpart is not a projection has already been refused by
@@ -1258,8 +1359,10 @@ impl_args(a: &Analysis, scope: Scope, span: Span, block: ImplDecl, key: string,
         _ -> ()
 
     val written = type_text(block.for_type)
-    val spelled = s"impl[${joined(tparams, ", ")}] ${module_show(block.trait_name)} for " +
-                  s"${module_show(key)}[${joined(tparams, ", ")}]"
+    // A block naming no trait has no `for` to write: `impl[T] Box[T]`.
+    val implemented = if block.trait_name == "" then "" else s"${module_show(block.trait_name)} for "
+    val spelled = s"impl[${joined(tparams, ", ")}] $implemented${module_show(key)}" +
+                  s"[${joined(tparams, ", ")}]"
 
     // **The first thing wrong with the subject is the only one told**, and the block ends with it
     // (`hoist_impl`): each question below is asked of a subject the one above it found well formed,
@@ -1284,7 +1387,7 @@ impl_args(a: &Analysis, scope: Scope, span: Span, block: ImplDecl, key: string,
             _ -> None
 
         if own.is_none()
-            fix_refused(a, scope, span, arg_ref, module_show(key))
+            fix_refused(a, scope, span, arg_ref, module_show(key), block.trait_name == "")
             return names
 
         names.push(own.unwrap())
@@ -1293,10 +1396,22 @@ impl_args(a: &Analysis, scope: Scope, span: Span, block: ImplDecl, key: string,
     names
 end impl_args
 
-private fix_refused(a: &Analysis, scope: Scope, span: Span, at: TypeRef, written: string)
+//
+// **A block naming no trait may fix every argument** -- `impl Pair[int, int]` gives that one instance
+// members of its own (`hoist_instance`) -- but not some of them: `impl[T] Pair[T, int]` would be
+// members of a family of instances, each lowered per receiver and each asked against both the
+// generic block and the single instances, and nothing a receiver needs is missing without it.
+private fix_refused(a: &Analysis, scope: Scope, span: Span, at: TypeRef, written: string,
+                    inherent: bool)
+    var instead = ""
+
+    if inherent then
+        instead = s", or fix every argument of '$written' and none with a parameter, for members " +
+                  "of that one instance alone"
+
     a.fault(scope, span, s"'${type_text(at)}' fixes an argument of '$written' to one type, and " +
             "an 'impl' covers the whole of a generic type — write one of the block's own parameters " +
-            "here")
+            s"here$instead")
 
 private check_argument_names(a: &Analysis, scope: Scope, span: Span, block: ImplDecl,
                              names: Buf[string], written: string)

@@ -1,0 +1,414 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.text.Search
+
+// An `impl` naming no trait for ONE instance of a generic type -- `impl Board[Rp2350]` -- whose
+// members belong to that instance and to no other (`reference/declarations.md § Members of one
+// instance`). Each claim is a whole program, built and run or refused, through the `azb_` helpers.
+//
+// The axes: the receiver (`self`, `*self`, `&self`, a `&T` value), how the instance is spelled (the
+// arguments written out, an alias as an argument, an alias of the instance, a defaulted parameter),
+// the member kind (method, generic method, static fn, `const` fn, static property), where the block
+// is (the struct's file, another file of its module, another module), and every refusal: the generic
+// block and an instance sharing a name in either order, one instance twice, a trait's member, a
+// field, another instance's receiver, a generic body, a partial instance, and a trait for one
+// instance. Not crossed: a `.syslib` build -- an instance's members are a concrete type's members,
+// lowered eagerly like any other -- and bare metal, since nothing new is emitted.
+
+private val sii_board: string = raw"""
+    trait ArmChip
+        cores(self) -> int
+
+    struct Rp2040
+        id: int
+
+    struct Rp2350
+        id: int
+
+    impl ArmChip for Rp2040
+        cores(self) -> int = 2
+
+    impl ArmChip for Rp2350
+        cores(self) -> int = 2
+
+    type Pico2 = Rp2350
+    type PicoBoard = ArmBoard[Rp2350]
+
+    struct ArmBoard[C: ArmChip = Rp2350]
+        n: int
+        chip: C
+
+    impl[C: ArmChip] ArmBoard[C]
+        count(self) -> int = self.n
+
+    """
+
+private val sii_two: string = raw"""
+    struct A
+        id: int
+
+    struct B
+        id: int
+
+    struct Board[C]
+        n: int
+
+    """
+
+private sii_says(text: string, part: string) -> bool = text.index_of(part).is_some()
+
+// -- what an instance's block gives it ---------------------------------------------------------------
+
+@test("its members reach every receiver: self, *self and &self, and a value held as &T")
+sii_receivers()
+    if !azb_ready() then return
+
+    azb_prints(azb_main(sii_board + raw"""
+        impl ArmBoard[Rp2350]
+            load(self) -> int = self.n + self.chip.id
+            bump(*self)
+                self.n += 1
+            tenfold(&self) -> int = self.n * 10
+
+        via(b: &ArmBoard[Rp2350]) -> int = b.load()
+
+        var b = ArmBoard(1, Rp2350(5))
+        b.bump()
+
+        val r: &ArmBoard[Rp2350] = ArmBoard(4, Rp2350(1))
+
+        print(b.load(), b.count(), via(r), r.load(), r.tenfold())
+        """), "7 2 5 5 40\n")
+
+@test("an alias as the argument, an alias of the instance, and a defaulted parameter are one instance")
+sii_spellings_are_one_instance()
+    if !azb_ready() then return
+
+    azb_prints(azb_main(sii_board + raw"""
+        impl ArmBoard[Pico2]
+            load(self) -> int = self.n + 100
+
+        val plain: ArmBoard = ArmBoard(1, Rp2350(0))
+        val named: PicoBoard = ArmBoard(2, Rp2350(0))
+        val written: ArmBoard[Rp2350] = ArmBoard(3, Rp2350(0))
+
+        print(plain.load(), named.load(), written.load())
+        """), "101 102 103\n")
+
+@test("a block written for the bare name of a fully defaulted type is for the default instance")
+sii_bare_defaulted_name()
+    if !azb_ready() then return
+
+    azb_prints(azb_main(sii_board + raw"""
+        impl ArmBoard
+            load(self) -> int = self.n + 1
+
+        print(ArmBoard(1, Rp2350(0)).load())
+        """), "2\n")
+
+@test("its generic methods, static functions, const functions and static properties")
+sii_member_kinds()
+    if !azb_ready() then return
+
+    azb_prints(azb_main(sii_board + raw"""
+        impl ArmBoard[Rp2350]
+            static PAGE -> int = 4096
+
+            make(n: int) -> Self = ArmBoard(n, Rp2350(7))
+            const zero() -> Self = ArmBoard(0, Rp2350(0))
+            pick[T](self, a: T, b: T) -> T = if self.n > 0 then a else b
+
+        val b = PicoBoard.make(3)
+
+        print(PicoBoard.PAGE, ArmBoard.PAGE, ArmBoard.make(4).n, PicoBoard.zero().n, b.pick("a", "b"))
+        """), "4096 4096 4 0 a\n")
+
+@test("two instances may each have a member of one name, each its own")
+sii_two_instances_one_name()
+    if !azb_ready() then return
+
+    azb_prints(azb_main(sii_board + raw"""
+        impl ArmBoard[Rp2350]
+            load(self) -> int = 2350
+
+        impl ArmBoard[Rp2040]
+            load(self) -> int = 2040
+
+        print(ArmBoard(0, Rp2350(0)).load(), ArmBoard(0, Rp2040(0)).load())
+        """), "2350 2040\n")
+
+@test("a body is lowered for its own instance and for no other")
+sii_body_only_for_its_instance()
+    if !azb_ready() then return
+
+    val ir = azb_ir(sii_two + raw"""
+        impl Board[A]
+            marker(self) -> int = 41
+
+        print(Board[A](1).marker(), Board[B](2).n)
+        """)
+
+    assert(sii_says(ir, "define i32 @Board.A.marker("), ir)
+    assert(!sii_says(ir, "Board.B.marker"), ir)
+
+@test("from another file of the struct's module, an enum's instance too")
+sii_another_file_of_the_module()
+    if !azb_ready() then return
+
+    azb_prints([("", "main.sysl", raw"""
+                    import chips.{Board, Rp2350, Pin}
+
+                    val b: Board[Rp2350] = Board(4)
+                    val p: Pin[int] = Pin.High(3)
+
+                    print(b.load(), b.peek(), p.level())
+                    """),
+                ("chips", "c.sysl", raw"""
+                    module chips
+
+                    struct Rp2350
+                        id: int
+
+                    struct Board[C]
+                        n: int
+
+                    enum Pin[T]
+                        Low
+                        High(v: T)
+                    """),
+                ("chips", "d.sysl", raw"""
+                    module chips
+
+                    impl Board[Rp2350]
+                        load(self) -> int = self.n + 1
+                        private secret(self) -> int = 9
+                        peek(self) -> int = self.secret()
+
+                    impl Pin[int]
+                        level(self) -> int = self match
+                            Pin.Low -> 0
+                            Pin.High(v) -> v
+                    """)], "5 9 3\n")
+
+// -- what it is refused --------------------------------------------------------------------------------
+
+@test("from another module, as any block naming no trait is")
+sii_another_module_refused()
+    if !azb_ready() then return
+
+    azb_refused([("", "main.sysl", raw"""
+                     import chips.{Board, Rp2350}
+
+                     impl Board[Rp2350]
+                         load(self) -> int = 1
+                     """),
+                 ("chips", "c.sysl", raw"""
+                     module chips
+
+                     struct Rp2350
+                         id: int
+
+                     struct Board[C]
+                         n: int
+                     """)],
+                ["'chips.Board' is declared in module 'chips', and an 'impl' naming no trait adds " +
+                 "members to a type only in a file of the module that declares it"])
+
+@test("a private member stays private to its file")
+sii_private_member()
+    if !azb_ready() then return
+
+    azb_refused([("", "main.sysl", raw"""
+                     import chips.{Board, Rp2350}
+
+                     print(Board[Rp2350](4).secret())
+                     """),
+                 ("chips", "c.sysl", raw"""
+                     module chips
+
+                     struct Rp2350
+                         id: int
+
+                     struct Board[C]
+                         n: int
+
+                     impl Board[Rp2350]
+                         private secret(self) -> int = 9
+                     """)],
+                ["method 'secret' of 'chips.Board[chips.Rp2350]' is private to"])
+
+@test("a name the generic block already has")
+sii_generic_first()
+    if !azb_ready() then return
+
+    azb_refused(azb_main(sii_two + raw"""
+        impl[C] Board[C]
+            load(self) -> int = 1
+
+        impl Board[A]
+            load(self) -> int = 2
+        """), ["'Board' already has a member named 'load' for every instantiation, so 'Board[A]' " +
+               "cannot declare one of its own"])
+
+@test("and the generic block taking a name an instance already has")
+sii_instance_first()
+    if !azb_ready() then return
+
+    azb_refused(azb_main(sii_two + raw"""
+        impl Board[A]
+            load(self) -> int = 2
+
+        impl[C] Board[C]
+            load(self) -> int = 1
+        """), ["'Board[A]' already has a member named 'load' of its own, so 'Board' cannot declare " +
+               "one for every instantiation"])
+
+@test("and a member of the struct's own body")
+sii_struct_body_member()
+    if !azb_ready() then return
+
+    azb_refused(azb_main(raw"""
+        struct A
+            id: int
+
+        struct Board[C]
+            n: int
+
+            load(self) -> int = 1
+
+        impl Board[A]
+            load(self) -> int = 2
+        """), ["'Board' already has a member named 'load' for every instantiation"])
+
+@test("and one instance's two blocks declaring one member alike")
+sii_one_instance_twice()
+    if !azb_ready() then return
+
+    azb_refused(azb_main(sii_two + raw"""
+        impl Board[A]
+            load(self) -> int = 2
+
+        impl Board[A]
+            load(self) -> int = 3
+        """), ["type 'Board[A]' already has a member named 'load' with parameters this one could " +
+               "not be told from"])
+
+@test("and a trait's member the generic type has, which the instance's would shadow")
+sii_shadowing_a_trait_member()
+    if !azb_ready() then return
+
+    azb_refused(azb_main(sii_two + raw"""
+        trait Named
+            name(self) -> string
+
+        impl Board[A]
+            name(self) -> string = "own"
+
+        impl[C] Named for Board[C]
+            name(self) -> string = "trait"
+        """), ["'Board[A]' already has a member named 'name' of its own, so 'Board' cannot declare " +
+               "one for every instantiation"])
+
+@test("and a field's name")
+sii_field_name()
+    if !azb_ready() then return
+
+    azb_refused(azb_main(sii_two + "impl Board[A]\n    n(self) -> int = 1\n"),
+                ["type 'Board[A]' has both a field and a member named 'n'"])
+
+@test("another instance has no such member")
+sii_another_instance()
+    if !azb_ready() then return
+
+    azb_refused(azb_main(sii_two + raw"""
+        impl Board[A]
+            only(self) -> int = 3
+
+        print(Board[B](1).only())
+        """), ["type 'Board[B]' has no method 'only' — 'only' belongs to 'Board[A]' alone"])
+
+@test("nor does a body generic over the instance, even where it is instantiated at that instance")
+sii_generic_body()
+    if !azb_ready() then return
+
+    azb_refused(azb_main(sii_two + raw"""
+        impl Board[A]
+            only(self) -> int = 3
+
+        impl[C] Board[C]
+            twice(self) -> int = self.only() * 2
+
+        print(Board[A](1).twice())
+        """), ["type 'Board[C]' has no method 'only' — 'only' belongs to 'Board[A]' alone, and this " +
+               "body is written for every 'Board'"])
+
+@test("nor a generic function's")
+sii_generic_function()
+    if !azb_ready() then return
+
+    azb_refused(azb_main(sii_two + raw"""
+        impl Board[A]
+            only(self) -> int = 3
+
+        g[C](b: Board[C]) -> int = b.only()
+
+        print(g(Board[A](1)))
+        """), ["has no method 'only' — 'only' belongs to 'Board[A]' alone, and this body is written " +
+               "for every 'Board'"])
+
+@test("a static property two instances have is asked of one of them")
+sii_ambiguous_static()
+    if !azb_ready() then return
+
+    azb_refused(azb_main(sii_two + raw"""
+        impl Board[A]
+            static PAGE -> int = 1
+
+        impl Board[B]
+            static PAGE -> int = 2
+
+        print(Board.PAGE)
+        """), ["'PAGE' belongs to 'Board[A]', 'Board[B]' alike, and nothing here says which"])
+
+// The partial form is refused: members of a family of instances would be lowered per receiver and
+// asked against both the generic block and the single instances.
+@test("a block fixing some arguments and not others is refused, and says what to write")
+sii_partial_instance()
+    if !azb_ready() then return
+
+    azb_refused(azb_main(raw"""
+        struct Pair[A, B]
+            a: A
+            b: B
+
+        impl[T] Pair[T, int]
+            one(self) -> int = 1
+        """), ["'int' fixes an argument of 'Pair' to one type, and an 'impl' covers the whole of a " +
+               "generic type — write one of the block's own parameters here, or fix every argument " +
+               "of 'Pair' and none with a parameter, for members of that one instance alone"])
+
+// The advice used to read `impl[T]  for Box[T]` -- a `for` with no trait in front of it.
+@test("a bare generic name with no defaults is told the generic block, with no 'for'")
+sii_bare_generic_advice()
+    if !azb_ready() then return
+
+    azb_refused_without(azb_main("struct Box[T]\n    v: T\n\nimpl Box\n    two(self) -> int = 2\n"),
+                        ["'Box' is generic, so an 'impl' for it covers every instantiation at once " +
+                         "— write 'impl[T] Box[T]'"], ["  for", "] for "])
+
+@test("and a trait for one instance is still refused")
+sii_trait_for_one_instance()
+    if !azb_ready() then return
+
+    azb_refused(azb_main(raw"""
+        trait Show
+            show(self) -> string
+
+        struct Box[T]
+            v: T
+
+        impl Show for Box[int]
+            show(self) -> string = "b"
+        """), ["'Box' is generic, so an 'impl' for it covers every instantiation at once — write " +
+               "'impl[T] Show for Box[T]'"])

@@ -361,6 +361,11 @@ private type_member(cx: &Analyzer, span: Span, receiver: Expr, name: string,
     if key.is_some() && static_property_at(cx.an, key.unwrap(), name) then
         return associated_call(cx, span, receiver, name, buf(), expected)
 
+    // So is one that a single instance has of its own (`impl Board[Rp2350]`), read through a name
+    // that stands for that instance: an alias of it, or the generic name whose parameters all default.
+    if key.is_some() && instance_static(cx, receiver, key.unwrap(), name) then
+        return associated_call(cx, span, receiver, name, buf(), expected)
+
     if key.is_some()
         val decl = cx.an.tables.types.get(key.unwrap())
 
@@ -412,6 +417,25 @@ private static_property_at(a: &Analysis, key: string, name: string) -> bool
 
     m.is_some() && m.unwrap().is_static
 end static_property_at
+
+// Whether the name in front of the dot stands for an instance with a static property of that name of
+// its own: an alias of the instance, or the generic type's bare name where an instance has it (which
+// `associated_call` settles the instance of).
+private instance_static(cx: &Analyzer, receiver: Expr, key: string, name: string) -> bool
+    val named = subject_named(cx, receiver)
+    val instance = if named.is_some() then instance_owner(named.unwrap()) else None
+
+    if instance.is_some() then return static_property_at(cx.an, instance.unwrap(), name)
+
+    val held = cx.an.tables.members.instances.get(key)
+
+    if held.is_none() then return false
+
+    for item in held.unwrap()
+        if static_property_at(cx.an, item.0, name) then return true
+
+    false
+end instance_static
 
 // A struct's name with a member selected from it. What a type offers under its own name is an
 // associated function, so each of the other three readings is told where it is reached from.
