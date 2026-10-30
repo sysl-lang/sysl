@@ -323,8 +323,15 @@ private scan_terms(a: &Analysis, cx: &Abandoning, terms: Buf[TCondTerm], held: s
 end scan_terms
 
 // What the frame holds once `x` has been evaluated: a counted value read straight out of a local is
-// the local's own count, which the block already says, and a string literal is static data with no
-// count to give back; anything else counted is a temporary.
+// the local's own count, which the block already says; a string literal is static data with no count
+// to give back; and so is a module `val`. Reading one takes a share for the call, but what it shares
+// is either laid down as data with no owner (the share is no count at all) or computed once at startup
+// and never released (`emit_entry.sysl`'s `gen_computed_vals`), so a share stranded on it strands
+// nothing that was ever going to be freed. A module `var` is not: assigning it gives its share back,
+// and a share stranded across the abandoning call would keep the old value alive for good. Anything
+// else counted is a temporary. A field of a struct or an element of an array held IN a module `val`
+// is part of that same storage; one reached through a reference or a `Buf` is not, since what the
+// handle points at can be assigned while the `val` itself never changes.
 private with_temp(held: string, x: TExpr) -> string
     if held != "" then return held
     if !contains_counted(texpr_type(x)) then return ""
@@ -332,8 +339,21 @@ private with_temp(held: string, x: TExpr) -> string
     *x.kind match
         TLoad(_, _) -> ""
         TStrLit(_) -> ""
-        _ -> "a counted temporary the enclosing expression is still holding"
+        TGlobal(symbol, _, true) -> s"a share of the module 'var' '${qualified_name(symbol)}'"
+        _ -> if in_module_val(x) then "" else "a counted temporary the enclosing expression is still holding"
 end with_temp
+
+// Whether `x` names a module `val`, or a field or element laid inside one by value -- storage nothing
+// assigns and nothing releases.
+private in_module_val(x: TExpr) -> bool = *x.kind match
+    TGlobal(_, _, writable) -> !writable
+    TField(receiver, _, _) -> underlying(texpr_type(receiver)) match
+        Struct(_) -> in_module_val(receiver)
+        _ -> false
+    TIndex(base, _, _) -> underlying(texpr_type(base)) match
+        Array(_, _) -> in_module_val(base)
+        _ -> false
+    _ -> false
 
 // Whether a pattern binds anything that carries a count, read against the type of what it matches.
 private binds_counted(p: TPattern, ty: Type) -> bool = p match

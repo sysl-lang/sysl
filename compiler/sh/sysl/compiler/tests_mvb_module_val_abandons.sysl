@@ -1,0 +1,300 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.{capture, Status}
+
+// A module `val` or `var` read by name and handed to a call that can reach an `@abandons` call
+// (`reference/declarations.md § A frame further down holds nothing across the call`): the read is a
+// load out of the module's storage that takes no count, so the frame holds nothing the abandoning
+// call would strand -- as a string literal holds nothing. What the expression BUILDS from the module
+// value (an interpolation, a concatenation) is still a counted temporary and still refused. nex found
+// this with `trap_with(INDEX_OUT_OF_BOUNDS)` refused where `trap_with("index out of bounds")` was not.
+
+private val mvb_leave: string = """
+    @abandons
+    leave(code: int) -> never
+        exit(code)
+
+    trap_with(s: string)
+        print(s)
+        if s.bytes.len > 0 then leave(3)
+    """
+
+private mvb_ir(text: string) -> string = xvr_ir([("main.sysl", mvb_leave + text)])
+
+private mvb_refusal(callee: string) -> string =
+    s"'$callee' can reach a call that abandons every frame below it and never comes back, and this frame holds a counted temporary the enclosing expression is still holding across the call"
+
+@test("a module 'val' string handed to a call that can abandon the frame is not a temporary, as a literal is not")
+mvb_module_val_same_file()
+    val said = mvb_ir(raw"""
+        val MSG = "index out of bounds"
+
+        run()
+            trap_with(MSG)
+
+        run2()
+            trap_with("index out of bounds")
+
+        main()
+            run()
+            run2()
+        """)
+
+    assert(!said.contains("error:"), said)
+
+@test("a module 'val' string from another file of the module is not a temporary either")
+mvb_module_val_other_file()
+    val said = xvr_ir([("consts.sysl", "val INDEX_OUT_OF_BOUNDS = \"index out of bounds\"\n"),
+                       ("main.sysl", mvb_leave + raw"""
+        run()
+            trap_with(INDEX_OUT_OF_BOUNDS)
+
+        main()
+            run()
+        """)])
+
+    assert(!said.contains("error:"), said)
+
+@test("a module 'val' computed while starting is never released, so a share stranded on it strands nothing")
+mvb_computed_val()
+    val said = mvb_ir(raw"""
+        val JOINED = (1).to_string() + " joined"
+
+        run()
+            trap_with(JOINED)
+
+        main()
+            run()
+        """)
+
+    assert(!said.contains("error:"), said)
+
+// The call takes a share of what a module `var` holds (`arc.retain_maybe` before it), and assigning
+// the `var` gives the storage's own share back -- so a share stranded across the abandoning call
+// would keep the old value alive for good.
+@test("a module 'var' string is a share the frame holds across the call, and is refused by name")
+mvb_module_var_is_refused()
+    val said = mvb_ir(raw"""
+        var NOTE = "mutable"
+
+        run()
+            trap_with(NOTE)
+
+        main()
+            run()
+        """)
+
+    assert(said.contains("'trap_with' can reach a call that abandons every frame below it and never comes back, and this frame holds a share of the module 'var' 'NOTE' across the call"), said)
+
+@test("a field reached through a reference a module 'val' holds can be assigned, so it is still a temporary")
+mvb_through_a_reference_is_refused()
+    val said = mvb_ir(raw"""
+        struct Node
+            name: string
+
+        impl Drop for Node
+            drop(self)
+                print("dropped")
+
+        val NODE: &Node = Node("n")
+
+        run()
+            trap_with(NODE.name)
+
+        main()
+            run()
+        """)
+
+    assert(said.contains(mvb_refusal("trap_with")), said)
+
+@test("an interpolation or a concatenation of a module 'val' is a temporary, and is still refused")
+mvb_built_from_module_val_is_refused()
+    val interpolated = mvb_ir(raw"""
+        val MSG = "index out of bounds"
+
+        run()
+            trap_with(s"${MSG}: x")
+
+        main()
+            run()
+        """)
+
+    assert(interpolated.contains(mvb_refusal("trap_with")), interpolated)
+
+    val joined = mvb_ir(raw"""
+        val MSG = "index out of bounds"
+
+        run()
+            trap_with(MSG + "!")
+
+        main()
+            run()
+        """)
+
+    assert(joined.contains(mvb_refusal("trap_with")), joined)
+
+@test("a module 'val' array of strings and a struct holding one are read without a count")
+mvb_module_val_array_and_struct()
+    val said = mvb_ir(raw"""
+        struct Pair
+            name: string
+            n: int
+
+        val NAMES = ["a", "b"]
+        val PAIR = Pair("p", 1)
+
+        pick(names: [2]string)
+            if names[1].bytes.len == 0 then leave(1)
+
+        show(p: Pair)
+            if p.n == 0 then leave(1)
+
+        run()
+            pick(NAMES)
+            show(PAIR)
+            trap_with(PAIR.name)
+            trap_with(NAMES[1])
+
+        main()
+            run()
+        """)
+
+    assert(!said.contains("error:"), said)
+
+@test("a local copy of a module 'val' string is a counted local held across the call, as any is")
+mvb_local_copy_is_held()
+    val said = mvb_ir(raw"""
+        val MSG = "index out of bounds"
+
+        run()
+            val m = MSG
+
+            trap_with(m)
+
+        main()
+            run()
+        """)
+
+    assert(said.contains("'trap_with' can reach a call that abandons every frame below it and never comes back, and this frame holds 'm' across the call"), said)
+
+// What the checks of a TEST build say of `text`, as `tests_drp_drop`'s `drp_test_ir` asks them.
+private mvb_test_checks(text: string) -> string
+    var units: Buf[Program] = buf()
+
+    std_root() match
+        Err(_) -> return "the standard module's source is not on this machine"
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> return "the standard module could not be read"
+            Ok(read) ->
+                for item in read
+                    units.push(item)
+
+    val parsed = parse(source_of("test.sysl", text))
+
+    if !parsed.ok() then return parsed.report.at(0).message
+
+    units.push(parsed.program)
+
+    val done = analyze_produced(units, host_target(), buf(), true)
+
+    if any_errors(done.reported) then return analysis_report(done.reported)
+
+    var own: Buf[string] = buf()
+
+    own.push("")
+
+    val promoted = post_analysis_checks_of_tests(done.an, program_of(done, done.main_module), own)
+
+    if any_errors(done.an.diagnostics()) then return analysis_report(done.an.diagnostics())
+
+    ""
+end mvb_test_checks
+
+@test("a module 'val' handed on from a '@test' function is accepted as from an ordinary one, and a 'var' refused")
+mvb_test_position()
+    val vals = mvb_test_checks(mvb_leave + raw"""
+        val MSG = "index out of bounds"
+
+        @test("leaves")
+        leaves()
+            trap_with(MSG)
+
+        main()
+            print("main")
+        """)
+
+    assert(vals == "", vals)
+
+    val vars = mvb_test_checks(mvb_leave + raw"""
+        var NOTE = "mutable"
+
+        @test("leaves")
+        leaves()
+            trap_with(NOTE)
+
+        main()
+            print("main")
+        """)
+
+    assert(vars.contains("this frame holds a share of the module 'var' 'NOTE' across the call"), vars)
+
+// The program built with the counted heap and run, as `tests_nfc_abandons` runs one.
+private mvb_run(text: string) -> (bool, string, string)
+    val root = make_temp_dir("sysl-mvb").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+    force_alloc_counting(true)
+
+    val built = build_native_program(s"$root/main.sysl", None, None, DefaultOptimization,
+                                     Some(s"$root/built"))
+
+    force_alloc_counting(false)
+
+    built match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (false, failure_text(why), "")
+        Ok(_) -> ()
+
+    val said = capture(s"$root/built", [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> (false, "could not be started", "")
+        Ok(o) -> (o.status == Status.Exited(3), o.text, o.err.unwrap_or(""))
+end mvb_run
+
+@test("the abandoning call taken with a module 'val', a computed one, and a field of one in hand leaves no count behind")
+mvb_abandoning_run_leaks_nothing()
+    if std_root().is_err() || !clang_available()
+        print("skipped: the library or the toolchain is not on this machine")
+        return
+    end if
+
+    for name in ["MSG", "JOINED", "PAIR.name", "NAMES[1]"]
+        val run = mvb_run(mvb_leave + s"""
+            struct Pair
+                name: string
+                n: int
+
+            val MSG = "index out of bounds"
+            val JOINED = (1).to_string() + " joined"
+            val PAIR = Pair((2).to_string() + " paired", 1)
+            val NAMES = ["a", (3).to_string()]
+
+            run()
+                trap_with($name)
+
+            main()
+                run()
+            """)
+
+        assert(run.0, s"$name: ${run.1}${run.2}")
+        assert(alloc_count_reported(run.2) == 0, run.2)
+end mvb_abandoning_run_leaks_nothing

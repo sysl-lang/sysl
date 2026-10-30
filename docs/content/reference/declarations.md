@@ -1393,6 +1393,31 @@ run()
 done
 ```
 
+**A string literal and a module `val` are not temporaries.** A literal is static data with no count,
+and a module `val` — laid down as data, or computed once at startup — is storage nothing ever
+releases, so a share of it stranded by the abandoning call strands nothing; the same holds for a
+field or element laid inside one by value. A module `var` is different: assigning it gives its share
+back, so a frame passing one is refused as holding *a share of the module 'var'*.
+
+```sysl
+@abandons
+leave(code: int) -> never
+    exit(code)
+
+val OUT_OF_BOUNDS = "index out of bounds"
+
+trap_with(message: string)
+    print(message)
+    if message.bytes.len == 0 then leave(1)
+
+main()
+    trap_with(OUT_OF_BOUNDS)
+```
+
+```output
+index out of bounds
+```
+
 **A call through a value or a trait object cannot be followed**, so nothing that can arrive at an
 `@abandons` call may become one — not the function's address, not a closure or function that reaches
 it, and not a type whose table for a trait object holds one:
