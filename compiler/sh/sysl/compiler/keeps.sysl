@@ -3063,8 +3063,9 @@ private step_waker_at(ft: &FrameTrack, wake: TExpr)
 end step_waker_at
 
 // **An address of this frame's storage written through a parameter or into module storage outlives
-// the frame**, unless it is overwritten before every way out. Anywhere else -- a heap object, a
-// pointer nobody here can name -- is the keeps of whoever owns that storage.
+// the frame**, unless it is overwritten before every way out. **Written anywhere the frame cannot show
+// is its own** -- through a pointer a call answered, one read out of a `Buf` or a heap object someone
+// else made -- it may outlive the frame whatever the frame does next, so it is refused at the store.
 private frame_stored(ft: &FrameTrack, evs: &EvBuf, place: TExpr, v: TExpr)
     val image = is_integer_type(texpr_type(v))
 
@@ -3077,11 +3078,25 @@ private frame_stored(ft: &FrameTrack, evs: &EvBuf, place: TExpr, v: TExpr)
     val loc = place_loc(ft.org, place)
 
     if !frame_lasting(ft, loc, 0)
-        if !ft.probe || image || loc.starts_with("l:") || probe_own_place(ft, place) then return
+        if image || probe_own_place(ft, place) then return
 
-        ft.faults.items.push((ft.scope, v.span, probe_why(core.unwrap(),
-            s"it is stored in '${place_written(ft.scope, place)}' ${probe_line(ft.scope, v.span)}, which " +
-            s"'${ft.owner}' cannot show is its own storage")))
+        if ft.probe
+            if loc.starts_with("l:") then return
+
+            ft.faults.items.push((ft.scope, v.span, probe_why(core.unwrap(),
+                s"it is stored in '${place_written(ft.scope, place)}' ${probe_line(ft.scope, v.span)}, which " +
+                s"'${ft.owner}' cannot show is its own storage")))
+            return
+        end if
+
+        // The rule asks the place's shape, not its location: a location names a call's answer by the
+        // argument it may be made of (`pick(&s).p` is `l:s.p`), which says nothing of what else it may
+        // answer.
+        if rule_own_place(ft, place) then return
+
+        ft.faults.items.push((ft.scope, v.span, s"${argument_said(ft, v, core.unwrap())}, and it is stored in " +
+            s"'${place_written(ft.scope, place)}', which '${ft.owner}' cannot show is its own storage — store " +
+            "the value itself, or storage that lasts"))
         return
     end if
 
@@ -3141,10 +3156,50 @@ private probe_own_place(ft: &FrameTrack, place: TExpr) -> bool
         _ -> false
 end probe_own_place
 
+// **For the rule, a place is also the frame's own when it is reached through a pointer the frame
+// took to its own storage**: a local, a field or element of one in place, or what a local bound once
+// to `&place` of such storage points at (`val q = &s` then `q.p = &n`), at any depth of such locals.
+// A call's answer is not -- even one answering its argument, since what else it may answer is no
+// question the summaries ask -- nor a parameter's contents, module storage, or a `Buf`'s elements.
+private rule_own_place(ft: &FrameTrack, place: TExpr) -> bool
+    *place.kind match
+        TLoad(n, _) ->
+            for item in ft.refs
+                if item.0 == n then return rule_own_place(ft, item.1)
+
+            true
+        TField(r, _, _) -> rule_own_place(ft, r)
+        TIndex(r, _, _) -> is_array_type(texpr_type(r)) && rule_own_place(ft, r)
+        TDeref(x, _) -> rule_own_through(ft, x, 0)
+        _ -> false
+end rule_own_place
+
+private rule_own_through(ft: &FrameTrack, x: TExpr, depth: int) -> bool
+    if depth > 8 then return false
+
+    *x.kind match
+        TAddrOf(place, _) -> rule_own_place(ft, place)
+        TLoad(n, _) ->
+            for item in ft.refs
+                if item.0 == n then return rule_own_place(ft, item.1)
+
+            for item in ft.inits
+                if item.0 == n
+                    return *item.1.kind match
+                        TBox(_, _) -> true
+                        TStructNew(_, _) -> true
+                        _ -> rule_own_through(ft, item.1, depth + 1)
+                end if
+            end for
+
+            false
+        _ -> false
+end rule_own_through
+
 // A place reached through calls as the reader wrote it, with the bracket closing a subscript that
 // ends it.
 private place_written(scope: Scope, place: TExpr) -> string
-    val at = written_through(place)
+    val at = written_through(scope, place)
     val closes = at.end < scope.src.bytes.len && scope.src.bytes[at.end] == u8(']')
 
     source_text(scope, if closes then Span(at.start, at.end + 1) else at)
@@ -3153,7 +3208,7 @@ end place_written
 // Where a place reached through calls is written in full: a field's span is its name, a method call's
 // is its name and arguments, and a `Buf` element's is its subscript, so the receiver each is reached
 // through is joined in (`world().vm_of().sink`, `current().fs[0]`).
-private written_through(place: TExpr) -> Span
+private written_through(scope: Scope, place: TExpr) -> Span
     var parts: Buf[TExpr] = buf()
 
     *place.kind match
@@ -3162,17 +3217,17 @@ private written_through(place: TExpr) -> Span
             parts.push(r)
             parts.push(i)
         TDeref(x, _) -> parts.push(x)
-        TCall(_, args, _, _) -> parts.extend(args.view())
+        TCall(_, args, _, _) -> written_args(scope, place.span, args, &parts)
         TVCall(recv, _, args, _, _) ->
             parts.push(recv)
-            parts.extend(args.view())
+            written_args(scope, place.span, args, &parts)
         _ -> ()
 
     var start = place.span.start
     var stop = place.span.end
 
     for part in parts
-        val at = written_through(part)
+        val at = written_through(scope, part)
 
         if at.start < start then start = at.start
         if at.end > stop then stop = at.end
@@ -3180,6 +3235,35 @@ private written_through(place: TExpr) -> Span
 
     Span(start, stop)
 end written_through
+
+// **The arguments a call's text holds**: those overlapping its span, and those written against it -- a
+// receiver just before (`world().items` before `[`) or a subscript just after (`0` after `[`), joined
+// by nothing, a dot or spaces. One the compiler supplies is neither -- a call in a file with no `main`
+// is handed a `self` spanning the callee's declaration -- and is no part of the place as written.
+private written_args(scope: Scope, call: Span, args: Buf[TExpr], parts: *Buf[TExpr])
+    for a in args
+        val written = written_through(scope, a)
+
+        val inside = written.start < call.end && written.end > call.start
+        val before = written.end <= call.start && only_joiners(scope, written.end, call.start)
+        val after = written.start >= call.end && only_joiners(scope, call.end, written.start)
+
+        if inside || before || after then parts.push(a)
+    end for
+end written_args
+
+// Whether the source between two offsets holds nothing but what joins a receiver to its member, or a
+// call's name to its arguments: dots, parentheses and spaces (a call's span is its name alone, so
+// `world` is joined to `.s_of` by `().`).
+private only_joiners(scope: Scope, from: usize, to: usize) -> bool
+    for at in from..<to
+        val b = scope.src.bytes[at]
+
+        if b != u8('.') && b != u8(' ') && b != u8('(') && b != u8(')') then return false
+    end for
+
+    true
+end only_joiners
 
 // **Storage outlives the frame when it is module storage or reached through a parameter** -- by a
 // path the body names (`p0:.next`), or through a pointer read out of one (`d:p0:.vm>{*M}.con`), the

@@ -4819,6 +4819,59 @@ leak(out: **int)
 '&n' is the address of a local of 'leak', and it is stored in '*out', which outlives 'leak' — store the value itself, or storage that lasts
 ```
 
+**Storage the frame cannot show is its own is held to the same rule.** A place reached through what a
+call answered — `current().p`, a chain of calls, a trait object's answer, a local bound to any of
+them, an element of a `Buf` — may be storage someone else holds long after the frame is gone, and
+nothing the frame does next can change that, so the address of its local stored there is refused at
+the store. A call that answers its argument is no exception: what else it may answer is not
+something its signature says.
+
+```sysl
+struct Slot
+    p: *int
+
+var the_slot = Slot(null)
+
+current() -> *Slot = &the_slot
+
+remember()
+    var n = 1
+    current().p = &n
+```
+
+```error
+'&n' is the address of a local of 'remember', and it is stored in 'current().p', which 'remember' cannot show is its own storage — store the value itself, or storage that lasts
+```
+
+The frame's own places stay open: a local, a field or element of one, and what a local bound once
+to the address of such storage — or to an object the frame made — points at. An address that lasts
+(module storage's, or one a parameter brought) may go anywhere:
+
+```sysl
+struct Slot
+    p: *int
+
+var the_slot = Slot(null)
+var spare = 3
+
+current() -> *Slot = &the_slot
+
+run() -> int
+    var n = 4
+    var s = Slot(null)
+    val q = &s
+
+    q.p = &n
+    current().p = &spare
+    *s.p + *current().p
+
+print(run())
+```
+
+```output
+7
+```
+
 ### An address held inside what is handed over
 
 **A function may let out what it reads through a pointer as well as the pointer itself.** `keep`
