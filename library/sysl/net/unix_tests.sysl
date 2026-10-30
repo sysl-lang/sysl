@@ -1,0 +1,285 @@
+module sysl.net
+@requires(posix)
+@tests
+
+import sysl.fs.{IoError, exists, make_temp_dir, metadata, remove_dir_all, remove_file,
+                set_permissions, write_text}
+import sysl.path.join
+import sysl.process.pid
+import sysl.threads.spawn
+
+// Unix domain sockets, and non-blocking mode on every kind of socket.
+//
+// **Every test makes its own directory**, named for the test and this process, because the suite
+// runs tests in parallel and a socket file is a fixed path: two tests sharing one would each find the
+// other's socket in the way.
+
+private ignore(r: Result[unit, IoError]) = ()
+
+/** A fresh directory of this test's own, and the socket path inside it. */
+private scratch(name: string) -> (string, UnixAddress)
+    val dir = make_temp_dir(f"sysl-uds-${pid()}-${name}-").unwrap()
+
+    (dir, unix(join(dir, "s.sock")).unwrap())
+end scratch
+
+// `EADDRINUSE` and `ECONNREFUSED`, which no named `IoError` case covers.
+#if bsd
+private in_use() -> int = 48
+private refused() -> int = 61
+#else
+private in_use() -> int = 98
+private refused() -> int = 111
+#endif
+
+// ## A connection between two threads
+
+private struct Serve
+    l: UnixListener
+    heard: bool
+
+private serve(s: *Serve) -> unit
+    var c = s.l.accept().unwrap()
+    var into: []u8 = [0; 8]
+    val n = c.recv(into).unwrap()
+
+    s.heard = n == 4 && into[0] == u8('p') && into[3] == u8('g')
+    c.send_all("pong".bytes).unwrap()
+    c.close().unwrap()
+end serve
+
+@test("uds_ a Unix listener and a client exchange bytes across two threads")
+uds_exchange()
+    val (dir, at) = scratch("exchange")
+    var s = Serve(unix_listen(at).unwrap(), false)
+    var running = spawn(&serve, &s) match
+        Some(t) -> t
+        None -> return
+
+    var c = unix_connect(at).unwrap()
+
+    c.send_all("ping".bytes).unwrap()
+
+    var into: []u8 = [0; 8]
+    var got: usize = 0
+
+    while got < 4
+        val n = c.recv(into[got..<into.len]).unwrap()
+
+        if n == 0 then break
+        got += n
+
+    assert(running.join())
+    assert(s.heard, "the server read what the client wrote")
+    assert_eq(got, 4)
+    assert_eq(into[0], u8('p'))
+    assert_eq(into[1], u8('o'))
+
+    c.close().unwrap()
+    s.l.close().unwrap()
+    ignore(remove_dir_all(dir))
+end uds_exchange
+
+// ## Non-blocking mode
+
+@test("uds_ a non-blocking accept with nobody waiting would block, then answers once a client connects")
+uds_non_blocking_accept()
+    val (dir, at) = scratch("accept")
+    var l = unix_listen(at).unwrap()
+
+    l.non_blocking().unwrap()
+
+    val e = l.accept().unwrap_err()
+
+    assert(would_block(e), "nobody connecting is would-block")
+    assert(!timed_out(e), "would-block is not a timeout")
+
+    var c = unix_connect(at).unwrap()
+    var s = l.accept().unwrap()
+
+    // The connection is blocking although its listener is not: a read with nothing sent waits out
+    // its timeout rather than answering would-block.
+    s.read_timeout(50).unwrap()
+
+    var into: []u8 = [0; 4]
+    val waited = s.recv(into).unwrap_err()
+
+    assert(timed_out(waited), "an accepted connection is blocking")
+    assert(!would_block(waited), "a timeout is not would-block")
+
+    s.close().unwrap()
+    c.close().unwrap()
+    l.close().unwrap()
+    ignore(remove_dir_all(dir))
+end uds_non_blocking_accept
+
+@test("uds_ a non-blocking read with nothing arrived would block, and reads once something has")
+uds_non_blocking_read()
+    val (dir, at) = scratch("read")
+    var l = unix_listen(at).unwrap()
+    var c = unix_connect(at).unwrap()
+    var s = l.accept().unwrap()
+    var into: []u8 = [0; 4]
+
+    s.non_blocking().unwrap()
+    assert(would_block(s.recv(into).unwrap_err()))
+
+    c.send_all([7, 8]).unwrap()
+
+    // A Unix stream delivers within the kernel, so what was sent is there before `send_all` returns.
+    assert_eq(s.recv(into).unwrap(), 2)
+    assert_eq(into[1], 8)
+
+    // And blocking again: the empty read now waits out a timeout.
+    s.non_blocking(false).unwrap()
+    s.read_timeout(30).unwrap()
+    assert(timed_out(s.recv(into).unwrap_err()))
+
+    s.close().unwrap()
+    c.close().unwrap()
+    l.close().unwrap()
+    ignore(remove_dir_all(dir))
+end uds_non_blocking_read
+
+@test("uds_ a TCP listener and its connection poll the same way")
+uds_tcp_non_blocking()
+    val here = ipv4(127, 0, 0, 1, 0)
+    var l = socket(here).unwrap()
+
+    l.bind(here).unwrap()
+    l.listen().unwrap()
+    l.non_blocking().unwrap()
+    assert(would_block(l.accept().unwrap_err()))
+
+    val to = l.local().unwrap()
+    var c = socket(to).unwrap()
+
+    c.connect(to).unwrap()
+
+    var (s, _) = l.accept().unwrap()
+    var into: []u8 = [0; 4]
+
+    s.non_blocking().unwrap()
+    assert(would_block(s.recv(into).unwrap_err()))
+
+    c.send_all([1, 2, 3]).unwrap()
+    s.non_blocking(false).unwrap()
+    assert_eq(s.recv(into).unwrap(), 3)
+
+    s.close().unwrap()
+    c.close().unwrap()
+    l.close().unwrap()
+end uds_tcp_non_blocking
+
+@test("uds_ a non-blocking UDP receive with no datagram would block")
+uds_udp_non_blocking()
+    val here = ipv4(127, 0, 0, 1, 0)
+    var u = udp_socket(here).unwrap()
+
+    u.bind(here).unwrap()
+    u.non_blocking().unwrap()
+
+    var into: []u8 = [0; 4]
+
+    assert(would_block(u.recv_from(into).unwrap_err()))
+    u.close().unwrap()
+
+// ## Addresses
+
+@test("uds_ a path longer than the platform's address can carry is refused, and the longest is not")
+uds_path_too_long()
+    var long = ""
+
+    for _ in 0..<max_unix_path do long += "a"
+
+    assert_eq(unix(long).unwrap().path().bytes.len, max_unix_path)
+
+    val e = unix(long + "a").unwrap_err()
+
+    assert(e != IoError.NotFound)
+    assert_eq(e.code(), name_too_long_code())
+
+@test("uds_ an empty path, or one holding a zero byte, is not an address")
+uds_path_malformed()
+    assert_eq(unix("").unwrap_err().code(), 22)
+    assert_eq(unix("a\0b").unwrap_err().code(), 22)
+
+@test("uds_ an address prints as its path")
+uds_address_prints()
+    assert_eq(unix("/tmp/x.sock").unwrap().to_string(), "/tmp/x.sock")
+    assert(unix("/tmp/x.sock").unwrap() == unix("/tmp/x.sock").unwrap())
+
+// ## The socket file
+
+@test("uds_ connecting to a path with nothing there is NotFound")
+uds_connect_missing()
+    val (dir, at) = scratch("missing")
+
+    assert_eq(unix_connect(at).unwrap_err(), IoError.NotFound)
+    ignore(remove_dir_all(dir))
+
+@test("uds_ connecting to a socket file nobody listens on any more is refused")
+uds_connect_stale()
+    val (dir, at) = scratch("stale")
+    var l = unix_listen(at).unwrap()
+
+    l.close().unwrap()
+    assert(exists(at.path()), "closing the listener leaves the socket file")
+    assert_eq(unix_connect(at).unwrap_err().code(), refused())
+    ignore(remove_dir_all(dir))
+
+@test("uds_ listening where something already is, is refused rather than replacing it")
+uds_bind_over_existing()
+    val (dir, at) = scratch("existing")
+    var l = unix_listen(at).unwrap()
+
+    assert_eq(unix_listen(at).unwrap_err().code(), in_use())
+
+    // The first listener is untouched: it still answers.
+    var c = unix_connect(at).unwrap()
+    var s = l.accept().unwrap()
+
+    s.close().unwrap()
+    c.close().unwrap()
+    l.close().unwrap()
+
+    val file = unix(join(dir, "plain")).unwrap()
+
+    write_text(file.path(), "not a socket").unwrap()
+    assert_eq(unix_listen(file).unwrap_err().code(), in_use())
+    ignore(remove_dir_all(dir))
+end uds_bind_over_existing
+
+@test("uds_ the socket file is removed after, and the path can be listened on again")
+uds_unlink_after()
+    val (dir, at) = scratch("unlink")
+    var l = unix_listen(at).unwrap()
+
+    l.close().unwrap()
+    remove_file(at.path()).unwrap()
+    assert(!exists(at.path()), "remove_file took the socket file away")
+
+    var relisten = unix_listen(at).unwrap()
+    var c = unix_connect(at).unwrap()
+
+    c.close().unwrap()
+    relisten.close().unwrap()
+    remove_file(at.path()).unwrap()
+    ignore(remove_dir_all(dir))
+end uds_unlink_after
+
+@test("uds_ the socket file takes mode 0600 and reads it back")
+uds_mode_0600()
+    val (dir, at) = scratch("mode")
+    var l = unix_listen(at).unwrap()
+
+    set_permissions(at.path(), 0o600).unwrap()
+    assert_eq(metadata(at.path()).unwrap().permissions(), 0o600)
+
+    // The owner may still connect through it.
+    var c = unix_connect(at).unwrap()
+
+    c.close().unwrap()
+    l.close().unwrap()
+    ignore(remove_dir_all(dir))
+end uds_mode_0600

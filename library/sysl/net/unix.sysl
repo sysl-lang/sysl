@@ -1,0 +1,133 @@
+module sysl.net
+@requires(os)
+
+import sysl.fs.{IoError, from_status}
+import sysl.net.sys as nsys
+import sysl.slices.as_ptr
+
+// Unix domain sockets: a stream between two processes on one machine, addressed by a path in the
+// filesystem rather than by an IP address and a port.
+//
+// **The connection is a `Socket`**, the type a TCP connection already is, so `send`, `send_all`,
+// `recv`, `shutdown`, the timeouts and `non_blocking` are the calls a TCP program already makes. Only
+// the two ends that differ get names of their own: `UnixAddress`, which is a path, and `UnixListener`,
+// whose `accept` answers the connection alone -- a Unix client is ordinarily unnamed, so there is no
+// peer address worth handing back.
+
+/** Where a Unix domain socket is: a path in the filesystem, which `unix` checks the platform's
+ * address can carry.
+ *
+ * The socket file it names is made by `unix_listen` and **is not removed by anything here** --
+ * `sysl.fs.remove_file` is the call, before listening again at the same path and after the listener
+ * is closed. Who may connect is the file's permission bits, which `sysl.fs.set_permissions` sets.
+ */
+struct UnixAddress derives Eq, Hash
+    private at: string
+
+    /** The path, exactly as it was given. */
+    path(self) -> string = self.at
+
+/** So that printing one prints the path. */
+impl Display for UnixAddress
+    display(self, out: *Writer, fmt: FormatSpec) = display_str(self.at, out, fmt)
+
+/** The Unix domain address at `path`, absolute or relative to the working directory.
+ *
+ * **A path the platform's `sockaddr_un` cannot carry is refused here** rather than at the `bind`:
+ * one longer than `max_unix_path` bytes (103 on a BSD, 107 elsewhere -- the rest of `sun_path` is its
+ * terminator) is `ENAMETOOLONG`'s code, and an empty one or one holding a zero byte is `EINVAL`'s.
+ * Linux's abstract namespace, a path starting with a zero byte, is not offered.
+ */
+unix(path: string) -> Result[UnixAddress, IoError]
+    if path.bytes.len > max_unix_path then return Err(from_status(-name_too_long_code()))
+    if path.bytes.len == 0 then return Err(from_status(-22))
+
+    for b in path.bytes do if b == 0 then return Err(from_status(-22))
+
+    Ok(UnixAddress(path))
+end unix
+
+/** The longest path, in bytes, a Unix domain address can hold on this target: `sun_path` less its
+ * terminator.
+ */
+#if bsd
+const max_unix_path: usize = 103
+#else
+const max_unix_path: usize = 107
+#endif
+
+// `ENAMETOOLONG`: 63 on a BSD, 36 under Linux's numbering.
+#if bsd
+private[net] name_too_long_code() -> int = 63
+#else
+private[net] name_too_long_code() -> int = 36
+#endif
+
+/** A Unix domain socket listening for connections. Not closed by going out of scope, for the reason
+ * `Socket` is not.
+ */
+struct UnixListener
+    private fd: i32
+
+    /** Wait for a connection, and answer it.
+     *
+     * **The connection is blocking even when this listener is not**, on every platform: a program
+     * that polls its listener once a frame and then serves the request in a straight line wants
+     * exactly that, and one that wants the connection non-blocking says so with `non_blocking`.
+     */
+    @blocks
+    accept(*self) -> Result[Socket, IoError]
+        var peer = unspecified()
+        val s = nsys.accept(int(self.fd), &peer)
+
+        if s < 0 then Err(failure(s)) else Ok(Socket(i32(s)))
+    end accept
+
+    /** Put this listener in non-blocking mode, or take it out again. A non-blocking `accept` with
+     * nobody waiting answers an error `would_block` recognises instead of waiting.
+     */
+    non_blocking(*self, on: bool = true) -> Result[unit, IoError] =
+        told(nsys.option(int(self.fd), nsys.non_blocking, if on then 1 else 0))
+
+    /** Give the descriptor back. The socket file stays where it is. */
+    close(*self) -> Result[unit, IoError] = told(nsys.close(int(self.fd)))
+end UnixListener
+
+/** Make the socket file at `at` and listen on it, with `backlog` connections allowed to queue.
+ *
+ * **A path that already holds something is refused** -- `EADDRINUSE`'s code, 48 on a BSD and 98
+ * under Linux -- rather than replaced, because what is there may be another program's live socket or
+ * not a socket at all. A server that owns its path removes it first with `sysl.fs.remove_file`.
+ */
+unix_listen(at: UnixAddress, backlog: int = 128) -> Result[UnixListener, IoError]
+    val s = nsys.socket(nsys.unix_domain, nsys.stream)
+
+    if s < 0 then return Err(failure(s))
+
+    val bound = nsys.bind_path(s, as_ptr(at.at.bytes), at.at.bytes.len)
+    val answer = if bound < 0 then bound else nsys.listen(s, backlog)
+
+    if answer < 0
+        val _ = nsys.close(s)
+        return Err(failure(answer))
+
+    Ok(UnixListener(i32(s)))
+end unix_listen
+
+/** A stream connected to the Unix domain socket at `to`. Nothing listening there is `NotFound` when
+ * there is no file, and refused (`ECONNREFUSED`) when the file is a socket nobody is listening on.
+ */
+@blocks
+unix_connect(to: UnixAddress) -> Result[Socket, IoError]
+    val s = nsys.socket(nsys.unix_domain, nsys.stream)
+
+    if s < 0 then return Err(failure(s))
+
+    val answer = nsys.connect_path(s, as_ptr(to.at.bytes), to.at.bytes.len)
+
+    if answer < 0
+        val _ = nsys.close(s)
+        return Err(failure(answer))
+
+    Ok(Socket(i32(s)))
+end unix_connect

@@ -6,8 +6,10 @@
  *     hold *different numbers* on the two platforms this builds for -- `AF_INET6` is 30 on Darwin and
  *     10 under glibc, and `SO_RCVTIMEO` is 0x1006 against 20. A transcription would compile
  *     everywhere and connect nowhere;
- *   - `struct sockaddr_in` and `sockaddr_in6` are layouts, and Darwin's carry a length byte that
- *     Linux's do not, so the two are not the same bytes in the same order;
+ *   - `struct sockaddr_in`, `sockaddr_in6` and `sockaddr_un` are layouts, and Darwin's carry a length
+ *     byte that Linux's do not, so the two are not the same bytes in the same order -- and
+ *     `sockaddr_un`'s `sun_path` is 104 bytes on Darwin and 108 under glibc;
+ *   - non-blocking mode is a bit in `fcntl`'s flags, and `O_NONBLOCK` is another macro;
  *   - `getaddrinfo` answers a linked list of allocations that have to be freed with a call of its
  *     own, which is the one ownership shape the library has nowhere to put;
  *   - a timeout is a `struct timeval` handed to `setsockopt` by address, which is a layout again.
@@ -18,6 +20,7 @@
  */
 
 #include <errno.h>
+#include <fcntl.h>
 #include <netdb.h>
 #include <netinet/in.h>
 #include <stdint.h>
@@ -25,6 +28,7 @@
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <sys/types.h>
+#include <sys/un.h>
 #include <unistd.h>
 
 struct sysl_endpoint {
@@ -45,14 +49,52 @@ _Static_assert(sizeof(struct sysl_endpoint) == 24, "sysl.net.sys.Endpoint is 24 
  */
 #define SYSL_NET_UNRESOLVED ENOENT
 
-/* The `errno` a failed call left, with a timed-out blocking call's `EAGAIN` reported as what it is:
- * `ETIMEDOUT`, which is the one code `sysl.net.timed_out` recognises on every target.
+/* Whether `fd` is in non-blocking mode. */
+static int is_non_blocking(int fd) {
+    int flags = fcntl(fd, F_GETFL);
+
+    return flags >= 0 && (flags & O_NONBLOCK) != 0;
+}
+
+/* The `errno` a failed call on `fd` left (`fd` negative where there is no socket yet).
+ *
+ * **`EAGAIN` means two different things**, and which one is decided by the socket's mode. On a
+ * blocking socket it is a call its timeout stopped, and is reported as what it is: `ETIMEDOUT`, the
+ * one code `sysl.net.timed_out` recognises on every target. On a non-blocking socket it is a call that
+ * would have had to wait, and is reported as `EAGAIN` itself, which `sysl.net.would_block` asks for.
+ * The mode is read *after* the call, with `errno` saved first, because `fcntl` may overwrite it.
  */
-static int failed(void) {
+static int failed(int fd) {
     int e = errno;
 
-    if (e == EAGAIN || e == EWOULDBLOCK) return ETIMEDOUT;
+    if (e == EAGAIN || e == EWOULDBLOCK) return fd >= 0 && is_non_blocking(fd) ? EAGAIN : ETIMEDOUT;
     return e ? e : EIO;
+}
+
+/* A path of `len` bytes as the platform's Unix domain address. Answers the used length, or 0 with
+ * `*err` set for a path no `sockaddr_un` can carry: an empty one or one holding a zero (`EINVAL`), or
+ * one that leaves no room for the terminator `sun_path` needs (`ENAMETOOLONG`).
+ */
+static socklen_t to_sockaddr_un(const unsigned char *path, size_t len, struct sockaddr_un *out,
+                                int *err) {
+    memset(out, 0, sizeof *out);
+
+    if (len == 0 || memchr(path, 0, len) != NULL) {
+        *err = EINVAL;
+        return 0;
+    }
+
+    if (len >= sizeof out->sun_path) {
+        *err = ENAMETOOLONG;
+        return 0;
+    }
+
+    out->sun_family = AF_UNIX;
+    memcpy(out->sun_path, path, len);
+#ifdef __APPLE__
+    out->sun_len = sizeof *out;
+#endif
+    return sizeof *out;
 }
 
 /* An endpoint as the platform's address. Answers the used length, or 0 for a family it is not. */
@@ -114,10 +156,17 @@ static int from_sockaddr(const struct sockaddr *sa, struct sysl_endpoint *e) {
 }
 
 int sysl_net_posix_socket(int family, int kind, int *fd) {
-    int f = family == 6 ? AF_INET6 : AF_INET;
-    int s = kind == 1 ? socket(f, SOCK_DGRAM, IPPROTO_UDP) : socket(f, SOCK_STREAM, IPPROTO_TCP);
+    int s;
 
-    if (s < 0) return failed();
+    if (family == 1)
+        s = socket(AF_UNIX, kind == 1 ? SOCK_DGRAM : SOCK_STREAM, 0);
+    else {
+        int f = family == 6 ? AF_INET6 : AF_INET;
+
+        s = kind == 1 ? socket(f, SOCK_DGRAM, IPPROTO_UDP) : socket(f, SOCK_STREAM, IPPROTO_TCP);
+    }
+
+    if (s < 0) return failed(-1);
 
     *fd = s;
     return 0;
@@ -128,7 +177,30 @@ int sysl_net_posix_connect(int fd, const struct sysl_endpoint *to) {
     socklen_t n = to_sockaddr(to, &a);
 
     if (n == 0) return EAFNOSUPPORT;
-    if (connect(fd, (const struct sockaddr *) &a, n) != 0) return failed();
+    if (connect(fd, (const struct sockaddr *) &a, n) != 0) return failed(fd);
+    return 0;
+}
+
+int sysl_net_posix_connect_path(int fd, const unsigned char *path, size_t len) {
+    struct sockaddr_un a;
+    int err = 0;
+    socklen_t n = to_sockaddr_un(path, len, &a, &err);
+
+    if (n == 0) return err;
+    if (connect(fd, (const struct sockaddr *) &a, n) != 0) return failed(fd);
+    return 0;
+}
+
+/* Binding a path creates the socket file, so one already there -- a socket a stopped server left, or
+ * anything else -- answers `EADDRINUSE` rather than being replaced: removing it is the caller's call.
+ */
+int sysl_net_posix_bind_path(int fd, const unsigned char *path, size_t len) {
+    struct sockaddr_un a;
+    int err = 0;
+    socklen_t n = to_sockaddr_un(path, len, &a, &err);
+
+    if (n == 0) return err;
+    if (bind(fd, (const struct sockaddr *) &a, n) != 0) return failed(fd);
     return 0;
 }
 
@@ -137,22 +209,31 @@ int sysl_net_posix_bind(int fd, const struct sysl_endpoint *at) {
     socklen_t n = to_sockaddr(at, &a);
 
     if (n == 0) return EAFNOSUPPORT;
-    if (bind(fd, (const struct sockaddr *) &a, n) != 0) return failed();
+    if (bind(fd, (const struct sockaddr *) &a, n) != 0) return failed(fd);
     return 0;
 }
 
 int sysl_net_posix_listen(int fd, int backlog) {
-    if (listen(fd, backlog) != 0) return failed();
+    if (listen(fd, backlog) != 0) return failed(fd);
     return 0;
 }
 
+/* **The connection answered is blocking, whatever the listener is.** A BSD hands an accepted socket
+ * its listener's `O_NONBLOCK` and Linux does not, so a program that polls its listener once a frame
+ * would get a connection in one mode on a Mac and the other under Linux. It is cleared here, so the
+ * two agree and a caller that wants the connection non-blocking says so.
+ */
 int sysl_net_posix_accept(int fd, struct sysl_endpoint *peer, int *out_fd) {
     struct sockaddr_storage from;
     socklen_t n = sizeof from;
 
     int s = accept(fd, (struct sockaddr *) &from, &n);
 
-    if (s < 0) return failed();
+    if (s < 0) return failed(fd);
+
+    int flags = fcntl(s, F_GETFL);
+
+    if (flags >= 0 && (flags & O_NONBLOCK) != 0) fcntl(s, F_SETFL, flags & ~O_NONBLOCK);
 
     from_sockaddr((const struct sockaddr *) &from, peer);
     *out_fd = s;
@@ -166,7 +247,7 @@ int sysl_net_posix_local(int fd, struct sysl_endpoint *at) {
     struct sockaddr_storage here;
     socklen_t n = sizeof here;
 
-    if (getsockname(fd, (struct sockaddr *) &here, &n) != 0) return failed();
+    if (getsockname(fd, (struct sockaddr *) &here, &n) != 0) return failed(fd);
     if (from_sockaddr((const struct sockaddr *) &here, at) != 0) return EAFNOSUPPORT;
     return 0;
 }
@@ -177,7 +258,7 @@ int sysl_net_posix_local(int fd, struct sysl_endpoint *at) {
 int sysl_net_posix_send(int fd, const unsigned char *buf, size_t n, size_t *sent) {
     ssize_t k = send(fd, buf, n, 0);
 
-    if (k < 0) return failed();
+    if (k < 0) return failed(fd);
 
     *sent = (size_t) k;
     return 0;
@@ -186,7 +267,7 @@ int sysl_net_posix_send(int fd, const unsigned char *buf, size_t n, size_t *sent
 int sysl_net_posix_recv(int fd, unsigned char *buf, size_t n, size_t *got) {
     ssize_t k = recv(fd, buf, n, 0);
 
-    if (k < 0) return failed();
+    if (k < 0) return failed(fd);
 
     *got = (size_t) k;
     return 0;
@@ -201,7 +282,7 @@ int sysl_net_posix_send_to(int fd, const unsigned char *buf, size_t n,
 
     ssize_t k = sendto(fd, buf, n, 0, (const struct sockaddr *) &a, len);
 
-    if (k < 0) return failed();
+    if (k < 0) return failed(fd);
 
     *sent = (size_t) k;
     return 0;
@@ -214,7 +295,7 @@ int sysl_net_posix_recv_from(int fd, unsigned char *buf, size_t n, struct sysl_e
 
     ssize_t k = recvfrom(fd, buf, n, 0, (struct sockaddr *) &a, &len);
 
-    if (k < 0) return failed();
+    if (k < 0) return failed(fd);
 
     from_sockaddr((const struct sockaddr *) &a, from);
     *got = (size_t) k;
@@ -228,17 +309,18 @@ int sysl_net_posix_recv_from(int fd, unsigned char *buf, size_t n, struct sysl_e
 int sysl_net_posix_shutdown(int fd, int how) {
     int h = how == 0 ? SHUT_RD : how == 1 ? SHUT_WR : SHUT_RDWR;
 
-    if (shutdown(fd, h) != 0) return failed();
+    if (shutdown(fd, h) != 0) return failed(fd);
     return 0;
 }
 
 int sysl_net_posix_close(int fd) {
-    if (close(fd) != 0) return failed();
+    if (close(fd) != 0) return failed(fd);
     return 0;
 }
 
-/* A timeout in milliseconds (`which` 0 for receiving, 1 for sending; zero is none), or the address
- * reuse a listener needs (`which` 2), numbered as `sysl.net.sys` numbers them.
+/* A timeout in milliseconds (`which` 0 for receiving, 1 for sending; zero is none), the address
+ * reuse a listener needs (`which` 2), or non-blocking mode (`which` 3), numbered as `sysl.net.sys`
+ * numbers them.
  *
  * `SO_RCVTIMEO` rather than a non-blocking socket and a `select`, because this is the blocking tier:
  * a timeout is the one thing a program needs so that "when the work is done" cannot be "never".
@@ -251,14 +333,25 @@ int sysl_net_posix_option(int fd, int which, long long value) {
         tv.tv_usec = (suseconds_t) ((value % 1000) * 1000);
 
         if (setsockopt(fd, SOL_SOCKET, which == 0 ? SO_RCVTIMEO : SO_SNDTIMEO, &tv, sizeof tv) != 0)
-            return failed();
+            return failed(fd);
         return 0;
     }
 
     if (which == 2) {
         int flag = value ? 1 : 0;
 
-        if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &flag, sizeof flag) != 0) return failed();
+        if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &flag, sizeof flag) != 0) return failed(fd);
+        return 0;
+    }
+
+    if (which == 3) {
+        int flags = fcntl(fd, F_GETFL);
+
+        if (flags < 0) return failed(fd);
+
+        int want = value ? flags | O_NONBLOCK : flags & ~O_NONBLOCK;
+
+        if (want != flags && fcntl(fd, F_SETFL, want) != 0) return failed(fd);
         return 0;
     }
 

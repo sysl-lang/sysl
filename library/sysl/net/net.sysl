@@ -2,12 +2,12 @@ module sysl.net
 @requires(os)
 
 import sysl.buf.{Buf, buf}
-import sysl.fs.{IoError, from_status}
+import sysl.fs.{IoError, again, from_status}
 import sysl.net.sys as nsys
 import sysl.net.sys.Endpoint
 import sysl.slices.{as_mut_ptr, as_ptr}
 
-/** Blocking sockets -- a TCP stream, a UDP socket -- and the names a host resolves to.
+/** Sockets -- a TCP stream, a UDP socket, a Unix domain stream -- and the names a host resolves to.
  *
  * **Everything here goes through `sysl.net.sys` and through nothing else.** On a hosted POSIX target
  * the library answers those hooks over the platform's sockets; on a target with no C library -- a
@@ -20,21 +20,31 @@ import sysl.slices.{as_mut_ptr, as_ptr}
  * `send`, `recv`, `shutdown`, `close` -- because forty years of programs and of documentation are
  * written in it, and a reader who knows it should not have to translate.
  *
- * ## Blocking, and only blocking
+ * ## Blocking, unless asked
  *
- * Every call here returns when its work is done. There is no event loop, no non-blocking mode and no
- * readiness notification, and that is the line Rust draws too -- `std::net` is blocking and every
- * async runtime is a package outside it. `sysl-lang/libuv` is where the event-loop story lives.
+ * Every call here returns when its work is done. There is no event loop and no readiness
+ * notification, and that is the line Rust draws too -- `std::net` is blocking and every async runtime
+ * is a package outside it. `sysl-lang/libuv` is where the event-loop story lives.
  *
  * **A timeout is the one thing a blocking call cannot do without**, because otherwise "returns when
  * the work is done" can mean never. `read_timeout` and `write_timeout` are what bound it, and a call
  * that hits one answers an error `timed_out` recognises.
  *
+ * **`non_blocking` is for a program that already has a loop of its own** -- a frame, a tick -- and
+ * polls a socket once per turn: a call that would have had to wait answers an error `would_block`
+ * recognises instead, as Rust's `set_nonblocking` does.
+ *
+ * ## Unix domain sockets
+ *
+ * `unix(path)` is an address, `unix_listen` makes the socket file and listens on it, and
+ * `unix_connect` answers a `Socket`, so a connection between two processes on one machine is read and
+ * written exactly as a TCP one is.
+ *
  * ## What is deliberately out
  *
- * Multicast, broadcast, unix domain sockets, non-blocking mode, and every socket option beyond the
- * timeouts and the one a listener needs. All of them are **additive**, so leaving them out costs a
- * later release nothing.
+ * Multicast, broadcast, Unix datagram sockets and Linux's abstract namespace, and every socket option
+ * beyond the timeouts, non-blocking mode and the one a listener needs. All of them are **additive**,
+ * so leaving them out costs a later release nothing.
  */
 
 /** Which version of the protocol an address is for. */
@@ -96,7 +106,7 @@ end resolved
  * the idiom.
  */
 struct Socket
-    private fd: i32
+    private[net] fd: i32
 
     /** Connect to somewhere. The address must be of the family this socket was made for, which it
      * is whenever the two came from the same `resolve`.
@@ -201,6 +211,14 @@ struct Socket
      */
     reuse_address(*self, on: bool = true) -> Result[unit, IoError] =
         told(nsys.option(int(self.fd), nsys.reuse_address, if on then 1 else 0))
+
+    /** Put this socket in non-blocking mode, or take it out again. An `accept`, `recv` or `send` that
+     * would have had to wait then answers an error `would_block` recognises instead of waiting --
+     * which is how a program with a loop of its own, a frame or a tick, polls a listener once per
+     * turn. A connection `accept` answers is blocking whatever its listener is.
+     */
+    non_blocking(*self, on: bool = true) -> Result[unit, IoError] =
+        told(nsys.option(int(self.fd), nsys.non_blocking, if on then 1 else 0))
 end Socket
 
 /** A stream socket of the family an address belongs to, ready to be connected or bound.
@@ -281,6 +299,12 @@ struct UdpSocket
     write_timeout(*self, ms: int) -> Result[unit, IoError] =
         told(nsys.option(int(self.fd), nsys.write_timeout, i64(ms)))
 
+    /** Put this socket in non-blocking mode, or take it out again: a receive with no datagram waiting
+     * then answers an error `would_block` recognises instead of waiting.
+     */
+    non_blocking(*self, on: bool = true) -> Result[unit, IoError] =
+        told(nsys.option(int(self.fd), nsys.non_blocking, if on then 1 else 0))
+
     /** Give the descriptor back. */
     close(*self) -> Result[unit, IoError] = told(nsys.close(int(self.fd)))
 end UdpSocket
@@ -298,6 +322,13 @@ end udp_socket
  * error type every module in the library shares, for a condition only this one can produce.
  */
 timed_out(e: IoError) -> bool = e.code() == timed_out_code()
+
+/** Whether an error is a call on a non-blocking socket that would have had to wait -- an `accept`
+ * with nobody connecting, a `recv` with nothing arrived, a `send` with the buffer full -- rather than
+ * one that failed. It is `EAGAIN`'s code, 35 on a BSD and 11 elsewhere, and only a socket in
+ * non-blocking mode answers it: a blocking one whose timeout ran out answers `timed_out` instead.
+ */
+would_block(e: IoError) -> bool = e.code() == again()
 
 // `ETIMEDOUT`, which every hook answers for a call its timeout stopped (`sysl.net.sys`): 60 on a BSD,
 // 110 under Linux's numbering, which is also what a kernel without a C library writes.
@@ -317,10 +348,10 @@ end local_of
 /** A hook's negative answer as the error it stands for: `UNSUPPORTED` is "not supported on this
  * target", and anything else is the code negated.
  */
-private failure(answer: int) -> IoError = from_status(answer)
+private[net] failure(answer: int) -> IoError = from_status(answer)
 
 /** A hook's answer as success or the error it stands for. */
-private told(answer: int) -> Result[unit, IoError] =
+private[net] told(answer: int) -> Result[unit, IoError] =
     if answer < 0 then Err(failure(answer)) else Ok(())
 
 /** A hook's count as the count or the error it stands for. */

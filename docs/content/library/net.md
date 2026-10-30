@@ -1,13 +1,13 @@
 ---
 title: The net module
-summary: "`sysl.net` — blocking TCP and UDP and the names they resolve: `socket`, `bind`, `listen`, `accept`, `connect`, `send`, `recv`, `send_to`, `recv_from`, `shutdown`, `close`; addresses as sysl values; and the hooks a target without a C library answers."
+summary: "`sysl.net` — TCP, UDP and Unix domain sockets and the names they resolve: `socket`, `bind`, `listen`, `accept`, `connect`, `send`, `recv`, `send_to`, `recv_from`, `shutdown`, `close`; `unix_listen` and `unix_connect`; `non_blocking` and `would_block`; addresses as sysl values; and the hooks a target without a C library answers."
 weight: 76
 ---
 
 **Every declaration in `sysl.net`, with its signature:** [the generated API page](/api/sysl-net/#index). This page is the argument — what the module is for, and how its pieces fit; that one is the list.
 
-`sysl.net` is blocking sockets: a TCP stream, a UDP socket, an address to give either, and the calls
-that move bytes. It requires `os`.
+`sysl.net` is sockets: a TCP stream, a UDP socket, a Unix domain stream, an address to give each,
+and the calls that move bytes. It requires `os`.
 
 ```sysl
 import sysl.net.{ipv4, resolve}
@@ -43,10 +43,11 @@ a program is its `import` line.
 are written in it, and a reader who knows it should not have to translate. It is deliberately **not**
 a `TcpStream` and a `TcpListener`: the sockets API has one type for both, and so does this.
 
-## Blocking, and only blocking
+## Blocking, unless asked
 
-Every call here returns when its work is done. There is no event loop, no non-blocking mode and no
-readiness notification.
+Every call here returns when its work is done, unless the socket was put in non-blocking mode (the
+section on polling, below). There is no event loop and no readiness
+notification.
 
 **That is the line Rust draws too**, and for the same reason: `std::net` is blocking and every async
 runtime, tokio included, is a package outside the standard library. `sysl-lang/libuv` is where the
@@ -260,6 +261,122 @@ more than that. An empty datagram is a datagram, and `recv_from` answers zero fo
 `recv` takes datagrams from there and from nowhere else. A lost datagram is waited for forever
 unless `read_timeout` says otherwise, which is the reason a UDP client sets one.
 
+## Polling: `non_blocking` and `would_block`
+
+A program that already has a loop of its own — a frame, a tick — cannot sit in `accept` waiting for
+a client that may never come. **`non_blocking()` puts a socket in non-blocking mode**, and then an
+`accept`, `recv` or `send` that would have had to wait answers an error `would_block` recognises
+instead of waiting, as Rust's `set_nonblocking` does. `non_blocking(false)` takes it out again. It is
+on `Socket`, `UdpSocket` and `UnixListener`.
+
+```sysl
+import sysl.net.{ipv4, socket, timed_out, would_block}
+
+val here = ipv4(127, 0, 0, 1, 0)
+var server = socket(here).unwrap()
+
+server.bind(here).unwrap()
+server.listen().unwrap()
+server.non_blocking().unwrap()
+
+// Nobody has connected yet: once a frame, this is all the loop learns.
+val e = server.accept().unwrap_err()
+
+print(would_block(e), timed_out(e))
+
+val at = server.local().unwrap()
+var client = socket(at).unwrap()
+
+client.connect(at).unwrap()
+
+var (accepted, _) = server.accept().unwrap()
+
+accepted.close().unwrap()
+client.close().unwrap()
+server.close().unwrap()
+```
+
+```output
+true false
+```
+
+**A connection `accept` answers is blocking, whatever its listener is.** A BSD hands an accepted
+socket its listener's mode and Linux does not; here the two agree, so a program that polls its
+listener and then serves the request in a straight line gets the same connection on a Mac as under
+Linux, and one that wants the connection non-blocking says so.
+
+**`would_block` and `timed_out` are different answers.** Both come from the kernel's `EAGAIN`, and
+the socket's mode decides which: a blocking socket whose timeout ran out is `timed_out`, and a
+non-blocking one with nothing ready is `would_block` — `EAGAIN`'s own code, 35 on a BSD and 11
+elsewhere.
+
+## Unix domain sockets
+
+A Unix domain socket is a stream between two processes on one machine, addressed by a path in the
+filesystem. **`unix(path)` is the address, `unix_listen` makes the socket file and listens on it, and
+`unix_connect` answers a `Socket`** — the type a TCP connection is — so the connection is read and
+written exactly as a TCP one is. `UnixListener.accept` answers the connection alone: a Unix client is
+ordinarily unnamed, so there is no peer address worth handing back.
+
+```sysl
+import sysl.fs.{make_temp_dir, metadata, remove_dir_all, remove_file, set_permissions}
+import sysl.net.{unix, unix_connect, unix_listen}
+import sysl.path.join
+
+val dir = make_temp_dir("net-doc-").unwrap()
+val at = unix(join(dir, "control.sock")).unwrap()
+var server = unix_listen(at).unwrap()
+
+// Only this user may connect: who may is the socket file's permission bits.
+set_permissions(at.path(), 0o600).unwrap()
+print(f"${metadata(at.path()).unwrap().permissions()}%o")
+
+var client = unix_connect(at).unwrap()
+var accepted = server.accept().unwrap()
+
+client.send_all("ping".bytes).unwrap()
+
+var into: []u8 = [0; 8]
+
+print(accepted.recv(into).unwrap())
+
+accepted.close().unwrap()
+client.close().unwrap()
+server.close().unwrap()
+
+// The socket file outlives its listener; removing it is the program's.
+remove_file(at.path()).unwrap()
+remove_dir_all(dir).unwrap()
+```
+
+```output
+600
+4
+```
+
+**The socket file is not removed by anything in the module.** `unix_listen` refuses a path that
+already holds something — `EADDRINUSE`'s code, 48 on a BSD and 98 under Linux — rather than replacing
+it, because what is there may be another program's live socket or not a socket at all; a server that
+owns its path removes it with `sysl.fs.remove_file` first, and again after closing. Connecting to a
+path with nothing there is `NotFound`.
+
+**A path the platform's address cannot carry is refused by `unix` itself**, not at the `bind`:
+`sockaddr_un`'s `sun_path` is 104 bytes on Darwin and 108 under glibc, one of them the terminator, so
+`max_unix_path` is 103 or 107 and a longer path is `ENAMETOOLONG`'s code:
+
+```sysl
+import sysl.net.{max_unix_path, unix}
+
+var long = ""
+
+for _ in 0..<max_unix_path + 1 do long += "a"
+
+print(unix(long).is_err(), unix(long[0..<max_unix_path]).is_ok(), unix("").is_err())
+```
+
+```output
+true true true
+```
 
 ## An address is a sysl value
 
@@ -298,20 +415,21 @@ carry a length byte glibc's do not — stay in that answer's C, where the header
 
 ## Answering the network on a target with no C library
 
-**Everything above reaches the network through `sysl.net.sys` and through nothing else**: fourteen
+**Everything above reaches the network through `sysl.net.sys` and through nothing else**: sixteen
 hooks, each an `extern` no module of the library defines.
 
 | hook | what it answers |
 |---|---|
-| `sysl_net_socket(family, kind) -> int` | a descriptor; `family` 4 or 6, `kind` `stream` (0) or `datagram` (1) |
+| `sysl_net_socket(family, kind) -> int` | a descriptor; `family` 4, 6 or `unix_domain` (1), `kind` `stream` (0) or `datagram` (1) |
 | `sysl_net_bind(fd, at) -> int`, `sysl_net_connect(fd, to) -> int` | zero |
+| `sysl_net_bind_path(fd, path, path_len) -> int`, `sysl_net_connect_path(fd, path, path_len) -> int` | zero; a Unix domain socket's filesystem path |
 | `sysl_net_listen(fd, backlog) -> int` | zero |
 | `sysl_net_accept(fd, peer) -> int` | the new connection's descriptor, the peer written into `peer` |
 | `sysl_net_local(fd, at) -> int` | zero, the bound address written into `at` |
 | `sysl_net_send(fd, from, len) -> isize`, `sysl_net_recv(fd, into, room) -> isize` | a count of bytes |
 | `sysl_net_send_to(fd, from, len, to) -> isize`, `sysl_net_recv_from(fd, into, room, from) -> isize` | a count of bytes, the sender written into `from` |
 | `sysl_net_shutdown(fd, how) -> int`, `sysl_net_close(fd) -> int` | zero |
-| `sysl_net_option(fd, which, value) -> int` | zero; `read_timeout`, `write_timeout` (milliseconds) or `reuse_address` |
+| `sysl_net_option(fd, which, value) -> int` | zero; `read_timeout`, `write_timeout` (milliseconds), `reuse_address` or `non_blocking` |
 | `sysl_net_resolve(host, host_len, port, passive, out, room) -> int` | how many addresses it wrote |
 
 **Each answers zero or more for success and the `IoError` code negated for a failure** — the contract
@@ -319,7 +437,8 @@ of every `*.sys` module (`sysl.fs.sys`, `sysl.io.sys`, `sysl.process.sys`) — a
 (-38 on every platform, not the host's `ENOSYS`) for a call the target cannot make at all, which
 reaches the caller as *not supported on this target*. A call its timeout
 stopped answers `ETIMEDOUT` negated (60 on a BSD, 110 everywhere else), which is what `timed_out`
-asks. **An address crosses as `sysl.net.sys.Endpoint`**: sixteen bytes in network order (an IPv4
+asks, and one on a non-blocking socket that would have had to wait answers `EAGAIN` negated (35 on a
+BSD, 11 everywhere else), which is what `would_block` asks. **An address crosses as `sysl.net.sys.Endpoint`**: sixteen bytes in network order (an IPv4
 address in the first four), a scope, a port as the number itself, and the family — 24 bytes laid out
 as C lays out the same four fields, so a supplier reads it without knowing anybody's `sockaddr`.
 
@@ -358,8 +477,8 @@ The question is asked only of what the program reaches, so a freestanding progra
 
 ## What is deliberately absent
 
-Multicast, broadcast, unix domain sockets, non-blocking mode, and every socket option beyond the two
-timeouts and `reuse_address`, which is here because a listener that has just been stopped cannot
+Multicast, broadcast, Unix datagram sockets, Linux's abstract namespace, and every socket option
+beyond the two timeouts, `non_blocking` and `reuse_address`, which is here because a listener that has just been stopped cannot
 otherwise be started again until `TIME_WAIT` runs out — a minute or two, during which the program
 looks broken.
 
