@@ -1,0 +1,164 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+
+// Which annotation sets a declaration may carry is decided by the KIND of declaration, so the pair
+// refusal for a layout beside a function mark has to know whether a binding, a struct or a function
+// stands below. A module binding takes `@export`, `@section` and `@align(n)` in any combination
+// (`reference/attributes.md § @section`, `§ @align(n) on a binding`); a struct and a function keep
+// their own refusals.
+
+// The LLVM text of a one-file program for a named machine (the host when `None`), or the refusal
+// prefixed with `REFUSED:`.
+private abp_ir(machine: Option[string], text: string) -> string
+    val root = make_temp_dir("sysl-abp").unwrap()
+
+    make_dir_all(root).unwrap()
+    make_dir_all(s"$root/abp").unwrap()
+    write_text(s"$root/package.hocon", "package {\n  name = \"probe\"\n}\n").unwrap()
+    write_text(s"$root/abp/abp.sysl", "module abp\n\n" + text).unwrap()
+
+    val out = emit_llvm_text(root, machine) match
+        Err(why) -> "REFUSED:" + failure_text(why)
+        Ok(made) ->
+            if made.report.is_empty() then made.text
+            else "REFUSED:" + analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end abp_ir
+
+private abp_thumb() -> Option[string] = Some("thumbv6m-freestanding")
+
+private abp_refused(said: string) -> bool = said.starts_with("REFUSED:")
+
+// The attribute lines of a subset, in the order the issue wrote them.
+private abp_lines(export: bool, section: bool, align: bool) -> string
+    var out = ""
+
+    if export then out = out + "@export(\"b\")\n"
+    if section then out = out + "@section(\".x\")\n"
+    if align then out = out + "@align(4)\n"
+    out
+end abp_lines
+
+private abp_repro(kind: string) -> string =
+    abp_lines(true, true, true) + kind + " B: u32 = 7\n\n@export(\"c\")\nf() -> u32 = B\n"
+
+// -- the reported program ------------------------------------------------------------------------------
+
+@test("abp: export, section and align together on a val build on a bare machine")
+abp_the_repro_on_thumb()
+    val said = abp_ir(abp_thumb(), abp_repro("val"))
+
+    assert(!abp_refused(said), said)
+    assert(said.contains("section \".x\""), said)
+    assert(said.contains("align 4"), said)
+    assert(said.contains("@b"), said)
+end abp_the_repro_on_thumb
+
+@test("abp: and on a var")
+abp_the_repro_on_a_var()
+    val said = abp_ir(abp_thumb(), abp_repro("var"))
+
+    assert(!abp_refused(said), said)
+    assert(said.contains("section \".x\""), said)
+    assert(said.contains("align 4"), said)
+    assert(said.contains("@b"), said)
+end abp_the_repro_on_a_var
+
+@test("abp: and on the host, where the section is spelled for Mach-O or ELF")
+abp_the_repro_on_the_host()
+    val text = "@export(\"b\")\n@section(\"__DATA,x\")\n@align(4)\nval B: u32 = 7\n\n@export(\"c\")\nf() -> u32 = B\n"
+    val said = abp_ir(None, text)
+
+    assert(!abp_refused(said), said)
+    assert(said.contains("section \"__DATA,x\""), said)
+    assert(said.contains("align 4"), said)
+    assert(said.contains("@b"), said)
+end abp_the_repro_on_the_host
+
+// -- every subset ----------------------------------------------------------------------------------------
+
+@test("abp: every non-empty subset of export, section and align is accepted on a val and on a var")
+abp_every_subset_of_a_binding()
+    for kind in ["val", "var"]
+        for mask in 1..<8
+            val export = mask % 2 == 1
+            val section = (mask / 2) % 2 == 1
+            val align = (mask / 4) % 2 == 1
+            val head = abp_lines(export, section, align)
+            val text = head + kind + " B: u32 = 7\n\n@export(\"c\")\nf() -> u32 = B\n"
+            val said = abp_ir(abp_thumb(), text)
+
+            assert(!abp_refused(said), s"$kind with ${head}was refused: $said")
+            assert_eq(said.contains("section \".x\""), section, s"$kind with $head")
+            assert_eq(said.contains("@b "), export, s"$kind with $head")
+        end for
+    end for
+end abp_every_subset_of_a_binding
+
+// -- a function --------------------------------------------------------------------------------------------
+
+@test("abp: a function takes export and section, in either combination")
+abp_a_function_takes_export_and_section()
+    for head in ["@export(\"g\")\n", "@section(\".x\")\n", "@export(\"g\")\n@section(\".x\")\n"]
+        val said = abp_ir(abp_thumb(), head + "g() -> u32 = 7\n\n@export(\"c\")\nf() -> u32 = g()\n")
+
+        assert(!abp_refused(said), s"$head was refused: $said")
+    end for
+end abp_a_function_takes_export_and_section
+
+@test("abp: a function has no layout, so align is refused whatever stands beside it, naming a function")
+abp_a_function_refuses_align()
+    for head in ["@align(4)\n", "@align(4)\n@section(\".x\")\n", "@export(\"g\")\n@section(\".x\")\n@align(4)\n"]
+        val said = abp_ir(abp_thumb(), head + "g() -> u32 = 7\n\n@export(\"c\")\nf() -> u32 = g()\n")
+
+        assert(abp_refused(said), s"$head was accepted")
+    end for
+
+    val three = abp_ir(abp_thumb(), abp_lines(true, true, true) + "g() -> u32 = 7\n")
+
+    assert(three.contains("cannot stand above one declaration"), three)
+    assert(three.contains("a function has no fields to lay out"), three)
+end abp_a_function_refuses_align
+
+// -- a struct -----------------------------------------------------------------------------------------------
+
+@test("abp: a struct still refuses a function mark beside its layout")
+abp_a_struct_refuses_function_marks()
+    for mark in ["@pure", "@tailrec", "@noinline"]
+        val said = abp_ir(abp_thumb(), s"@align(8)\n$mark\nstruct S\n    a: u32\n")
+
+        assert(abp_refused(said), s"$mark accepted: $said")
+        assert(said.contains("describe a layout and the rest mark a function"), said)
+    end for
+
+    val packed = abp_ir(abp_thumb(), "@packed\n@section(\".x\")\nstruct S\n    a: u32\n")
+
+    assert(abp_refused(packed), packed)
+    assert(packed.contains("'@packed' lays out a struct's fields"), packed)
+end abp_a_struct_refuses_function_marks
+
+@test("abp: a struct still takes layout beside export")
+abp_a_struct_takes_layout_and_export()
+    val said = abp_ir(abp_thumb(), "@export(\"S\")\n@align(8)\nstruct S\n    a: u32\n\nf(s: S) -> u32 = s.a\n")
+
+    assert(!abp_refused(said), said)
+end abp_a_struct_takes_layout_and_export
+
+// -- an impossible pair on a binding --------------------------------------------------------------------------
+
+@test("abp: a binding given a function mark is refused without the sentence about functions")
+abp_a_binding_with_a_function_mark()
+    for mark in ["@pure", "@noinline", "@tailrec"]
+        for head in [s"@align(4)\n$mark\n", s"@export(\"b\")\n@section(\".x\")\n@align(4)\n$mark\n"]
+            val said = abp_ir(abp_thumb(), head + "val B: u32 = 7\n\n@export(\"c\")\nf() -> u32 = B\n")
+
+            assert(abp_refused(said), s"$head was accepted")
+            assert(!said.contains("describe a layout and the rest mark a function"), said)
+            assert(!said.contains("a function has no fields to lay out"), said)
+        end for
+    end for
+end abp_a_binding_with_a_function_mark
