@@ -299,6 +299,25 @@ resolve_bound(a: &Analysis, scope: Scope, span: Span, b: BoundRef, subst: Buf[Bi
             AssocArgType(n, inner) -> named.push((n, resolve_type(a, scope, inner, subst)))
             _ -> positional.push(item)
 
+    // A bare arrow's parameters arrive here as a callable bound's arguments, each `@keeps` with them;
+    // the marks ride beside what the bound fixes by name, and the last argument is the result, which
+    // nothing keeps.
+    var marks: Buf[(string, Type)] = buf()
+
+    if fn_is_call(b.name) && !positional.is_empty()
+        var ps: Buf[TypeRef] = buf()
+
+        for i in 0..<positional.len() - 1
+            ps.push(positional.at(i))
+
+        val kept = kept_params(a, scope, ps)
+        var stripped = kept.0
+
+        stripped.push(positional.at(positional.len() - 1))
+        positional = stripped
+        marks = kept.1
+    end if
+
     var written = trait_args_read(a, scope, span, key.unwrap(), positional, subst)
 
     // **A bound names a type as much as a parameter's own written type does.** It is checked here
@@ -330,7 +349,10 @@ resolve_bound(a: &Analysis, scope: Scope, span: Span, b: BoundRef, subst: Buf[Bi
 
     // A refused name has been told, and the bound stands as the trait alone.
     if !named.is_empty() && check_assoc_args(a, scope, span, key.unwrap(), declared, named, "", args)
-        return plain_bound(key.unwrap(), args)
+        return Bound(key.unwrap(), args, marks)
+
+    for item in marks
+        named.push(item)
 
     Bound(key.unwrap(), args, named)
 end resolve_bound
@@ -673,6 +695,9 @@ assoc_disagreement(a: &Analysis, tr: Bound, t: Type) -> Option[(string, Type, Op
 
     for item in tr.assocs
         if item.1 == Unknown then continue
+        // A callable's `@keeps` mark is no associated type: it licenses the body that meets the bound
+        // (`closure_keeps`), and every callable meets it.
+        if is_keeps_assoc(item.0) then continue
 
         val got = assoc_type_opt(a, subject, item.0)
 

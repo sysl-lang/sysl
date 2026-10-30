@@ -1,0 +1,426 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// `@keeps` on a parameter of a callable's type (`&Fn(@keeps *T) -> R`, a bare arrow's `@keeps *T -> R`):
+// a closure made at that type may keep that argument -- store it, push it, hand it to something that
+// keeps it -- and every call through a value of the type is held to the mark the way a call of an
+// `extern` is held to its `@keeps(p)` (`keeps.sysl`'s `object_marks_kept`, `refuse_promised`). The
+// mark is part of the type: a callable that keeps nothing stands where a marked one is asked for, and
+// a marked one never stands where the parameter is borrowed (`analyzer.sysl`'s `callable_within`,
+// `erase.sysl`'s `callable_retyped`). `reference/memory.md § A callable that keeps what it is handed`
+// is the specification.
+//
+// The matrix crosses where the type is written (an alias, a parameter, a struct field, a generic
+// function and a generic struct, a `Buf` element, a function's result, a bare-arrow bound) with what
+// stands at it (a closure literal that keeps, one that does not, a named function, a value of the
+// other marking) and with the call (an address of module storage, of a local, a pointer handed on
+// from a parameter). It adds the parameter shapes (`*T`, `[]u8`, `&T`, `int`), two parameters with
+// one marked, a nested closure capturing the parameter, and the misplaced and doubled mark.
+//
+// Skipped cells, and why: a raw `*extern(...)` pointer is not a callable trait and takes no mark (its
+// calls are already held to the bodies taken at its type); `async` closures are held by the task
+// rule (`tests_atk_async_task_keeps.sysl`); separate compilation reads the same typed tree.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private ftk_outcome(text: string) -> (string, int)
+    val root = make_temp_dir("sysl-ftk").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", ftk_prelude + text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (failure_text(why), -1)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> ("the program that was built could not be run", -1)
+        Ok(out) -> (out.text + out.err.unwrap_or(""), shell_status(out.status))
+end ftk_outcome
+
+private ftk_prints(text: string, want: string)
+    if xvr_no_library() then return
+
+    val out = ftk_outcome(text)
+
+    assert_eq(out.0, want)
+    assert_eq(out.1, 0)
+end ftk_prints
+
+private ftk_refused(text: string, part: string)
+    if xvr_no_library() then return
+
+    val out = ftk_outcome(text)
+
+    assert_eq(out.1, -1, out.0)
+    assert(out.0.index_of(part).is_some(), out.0)
+end ftk_refused
+
+private const ftk_prelude: string = raw"""
+    import sysl.buf.{Buf, buf}
+
+    struct Handle
+        n: int
+
+    struct Term
+        h: *Handle
+
+    type Step = &Fn(@keeps *Handle) -> int
+    type Loose = &Fn(*Handle) -> int
+
+    var kept: Buf[*Handle] = buf()
+    var spare = Handle(5)
+    var other = Handle(9)
+
+    """
+
+private const ftk_closure_keeps: string =
+    "a closure borrows what it is handed for the call, and this one keeps its parameter 'h' (it is passed to 'push', which keeps it)"
+
+// -- the two shapes that asked for it ------------------------------------------------------------------
+
+@test("a closure at a marked type stores its argument into collected objects, which read it back")
+ftk_vm_error_terms()
+    ftk_prints(raw"""
+        struct Vm
+            terms: Buf[Term]
+
+        var the_vm = Vm(buf())
+
+        make() -> Step = (h) ->
+            the_vm.terms.push(Term(h))
+            h.n
+
+        main()
+            val f = make()
+            print(f(&spare))
+            print(f(&other))
+            print(the_vm.terms.len())
+            print(the_vm.terms.at(1).h.n)
+        """, "5\n9\n2\n9\n")
+
+@test("a closure handed to a marked parameter pushes what it is called with")
+ftk_zip_with_turn()
+    ftk_prints(raw"""
+        var out: Buf[*int] = buf()
+        var a = 1
+        var b = 2
+
+        zip_with_turn(f: &Fn(@keeps *int, bool) -> unit, x: *int, y: *int)
+            f(x, true)
+            f(y, false)
+
+        main()
+            zip_with_turn((x, turn) -> out.push(x), &a, &b)
+            print(out.len())
+            print(*out.at(0) + *out.at(1))
+        """, "2\n3\n")
+
+// -- the call site ---------------------------------------------------------------------------------
+
+@test("the address of a local handed to a marked parameter is refused as an extern's would be")
+ftk_local_refused()
+    ftk_refused(raw"""
+        g(f: Step) -> int
+            var mine = Handle(3)
+            f(&mine)
+
+        main()
+            print(g((h) -> h.n))
+        """, "a call through '&Fn(@keeps *Handle) -> int' keeps its parameter 1 (its type says '@keeps'), " +
+            "and '&mine' is the address of a local of 'g'")
+
+@test("storage that lasts handed to a marked parameter is accepted")
+ftk_lasting_accepted()
+    ftk_prints(raw"""
+        struct Holder
+            h: Handle
+
+        g(f: Step, hb: &Holder) -> int = f(&hb.h) + f(&spare)
+
+        main()
+            val hb: &Holder = Holder(Handle(30))
+            print(g((h) ->
+                kept.push(h)
+                h.n, hb))
+            print(kept.len())
+        """, "35\n2\n")
+
+@test("a function that hands its parameter to a marked call keeps it, and its callers are held to that")
+ftk_passed_on()
+    ftk_refused(raw"""
+        struct Hook
+            on: Step
+
+        relay(hk: Hook, h: *Handle) -> int = hk.on(h)
+
+        g(hk: Hook) -> int
+            var mine = Handle(2)
+            relay(hk, &mine)
+
+        main()
+            val hk = Hook((h) ->
+                kept.push(h)
+                h.n)
+            print(relay(hk, &spare))
+            print(g(hk))
+        """, "'relay' keeps its parameter 'h' (it is passed to a call through '&Fn(@keeps *Handle) -> int', " +
+            "which keeps it), and '&mine' is the address of a local of 'g'")
+
+@test("a struct field of a marked type is called with storage that lasts")
+ftk_field()
+    ftk_prints(raw"""
+        struct Hook
+            on: Step
+
+        main()
+            val hk = Hook((h) ->
+                kept.push(h)
+                h.n + 1)
+            print(hk.on(&spare))
+            print(kept.at(0).n)
+        """, "6\n5\n")
+
+@test("a call through an unmarked type is not held to a keeping closure elsewhere in the program")
+ftk_unmarked_calls_unaffected()
+    ftk_prints(raw"""
+        g(f: Loose) -> int
+            var mine = Handle(3)
+            f(&mine)
+
+        main()
+            val keeper: Step = (h) ->
+                kept.push(h)
+                h.n
+            print(keeper(&spare))
+            print(g((h) -> h.n + 1))
+        """, "5\n4\n")
+
+// -- the type ----------------------------------------------------------------------------------------
+
+@test("a closure that keeps what it is handed at an unmarked type is refused, and told the mark")
+ftk_unmarked_refused()
+    ftk_refused(raw"""
+        make() -> Loose = (h) ->
+            kept.push(h)
+            h.n
+
+        main()
+            print(make()(&spare))
+        """, ftk_closure_keeps + " — whoever calls it may hand it the address of their own storage. Copy " +
+            "what this needs into storage of its own, or let it keep it by marking the parameter '@keeps' " +
+            "in the type it is made at: 'Fn(@keeps *Handle) -> int'")
+
+@test("a marked value does not stand where the parameter is borrowed")
+ftk_marked_into_unmarked()
+    ftk_refused(raw"""
+        narrow(f: Step) -> Loose = f
+
+        main()
+            val f: Step = (h) -> h.n
+            print(narrow(f)(&spare))
+        """, "a '&Fn(@keeps *Handle) -> int' may keep its parameter 1 past the call, and a " +
+            "'&Fn(*Handle) -> int' borrows what it is handed for the call")
+
+@test("a callable that keeps nothing stands where a marked one is asked for")
+ftk_unmarked_into_marked()
+    ftk_prints(raw"""
+        widen(f: Loose) -> Step = f
+
+        main()
+            val f: Loose = (h) -> h.n + 1
+            print(widen(f)(&spare))
+            val s: Step = (h) -> h.n * 2
+            print(s(&spare))
+        """, "6\n10\n")
+
+@test("a named function that keeps its parameter is a value at a marked type")
+ftk_named_marked()
+    ftk_prints(raw"""
+        keep_it(h: *Handle) -> int
+            kept.push(h)
+            h.n + 10
+
+        run(f: Step) -> int = f(&spare)
+
+        main()
+            print(run(keep_it))
+            print(kept.len())
+        """, "15\n1\n")
+
+@test("a named function that keeps its parameter is refused at an unmarked type")
+ftk_named_unmarked()
+    ftk_refused(raw"""
+        keep_it(h: *Handle) -> int
+            kept.push(h)
+            h.n
+
+        run(f: Loose) -> int = f(&spare)
+
+        main()
+            print(run(keep_it))
+        """, "this one keeps what it is handed (it is passed to 'keep_it', which keeps it)")
+
+@test("a generic function and a generic struct take the mark over a type parameter")
+ftk_generic()
+    ftk_prints(raw"""
+        struct Hook[T]
+            on: &Fn(@keeps *T) -> unit
+
+        apply[T](f: &Fn(@keeps *T) -> unit, p: *T) = f(p)
+
+        var ints: Buf[*int] = buf()
+        var seven = 7
+
+        main()
+            apply((h) -> kept.push(h), &spare)
+            apply((x) -> ints.push(x), &seven)
+            val hk = Hook((x: *int) -> ints.push(x))
+            hk.on(&seven)
+            print(kept.len())
+            print(ints.len())
+            print(*ints.at(1))
+        """, "1\n2\n7\n")
+
+@test("a generic function's marked call is refused the address of its own local")
+ftk_generic_local()
+    ftk_refused(raw"""
+        apply[T](f: &Fn(@keeps *T) -> unit, v: T)
+            var mine = v
+            f(&mine)
+
+        main()
+            apply((h) -> kept.push(h), Handle(1))
+        """, "a call through '&Fn(@keeps *Handle) -> unit' keeps its parameter 1 (its type says '@keeps'), " +
+            "and '&mine' is the address of a local of 'apply'")
+
+@test("a bare arrow marks its parameter, and the body it lands in is what a call is held to")
+ftk_bare_arrow()
+    ftk_prints(raw"""
+        each(body: @keeps *Handle -> unit)
+            body(&spare)
+
+        main()
+            each((h) -> kept.push(h))
+            print(kept.at(0).n)
+        """, "5\n")
+
+@test("a bare arrow's keeping closure is refused the address of the caller's local")
+ftk_bare_arrow_local()
+    ftk_refused(raw"""
+        each(body: @keeps *Handle -> unit)
+            var mine = Handle(1)
+            body(&mine)
+
+        main()
+            each((h) -> kept.push(h))
+        """, "a closure keeps its parameter 'h' (it is passed to 'push', which keeps it), and '&mine' is " +
+            "the address of a local of 'each'")
+
+@test("a Buf of marked callables, one of whose closures captures the parameter in another closure")
+ftk_buf_and_nested()
+    ftk_prints(raw"""
+        var later: Buf[&Fn() -> int] = buf()
+
+        main()
+            var steps: Buf[Step] = buf()
+            steps.push((h) -> h.n)
+            steps.push((h) ->
+                later.push(() -> h.n + 100)
+                0)
+            for s in steps
+                print(s(&spare))
+            print(later.at(0)())
+        """, "5\n0\n105\n")
+
+@test("a closure capturing an unmarked parameter in a stored closure is refused")
+ftk_nested_unmarked()
+    ftk_refused(raw"""
+        var later: Buf[&Fn() -> int] = buf()
+
+        main()
+            val f: Loose = (h) ->
+                later.push(() -> h.n + 100)
+                0
+            print(f(&spare))
+        """, "a closure borrows what it is handed for the call, and this one keeps its parameter 'h'")
+
+@test("with two parameters, only the marked one may be kept")
+ftk_two_params()
+    ftk_refused(raw"""
+        type Two = &Fn(@keeps *Handle, *Handle) -> unit
+
+        main()
+            val f: Two = (a, b) ->
+                kept.push(a)
+                kept.push(b)
+            f(&spare, &spare)
+        """, "this one keeps its parameter 'b' (it is passed to 'push', which keeps it) — whoever calls " +
+            "it may hand it the address of their own storage. Copy what this needs into storage of its " +
+            "own, or let it keep it by marking the parameter '@keeps' in the type it is made at: " +
+            "'Fn(*Handle, @keeps *Handle) -> unit'")
+
+@test("with two parameters, keeping the marked one alone is accepted")
+ftk_two_params_marked_only()
+    ftk_prints(raw"""
+        type Two = &Fn(*Handle, @keeps *Handle) -> int
+
+        main()
+            val f: Two = (a, b) ->
+                kept.push(b)
+                a.n + b.n
+            print(f(&spare, &other))
+            print(kept.at(0).n)
+        """, "14\n9\n")
+
+@test("a view and a counted reference may be marked, and a mark on a number changes nothing")
+ftk_param_shapes()
+    ftk_prints(raw"""
+        struct Box
+            v: int
+
+        var views: Buf[[]u8] = buf()
+        var boxes: Buf[&Box] = buf()
+        var text: [3]u8 = [1, 2, 3]
+
+        main()
+            val s: &Fn(@keeps []u8) -> unit = (b) -> views.push(b)
+            s(text[..])
+            val r: &Fn(@keeps &Box) -> unit = (b) -> boxes.push(b)
+            r(Box(4))
+            val n: &Fn(@keeps int) -> int = (x) -> x + 1
+            print(views.at(0)[2])
+            print(boxes.at(0).v)
+            print(n(4))
+        """, "3\n4\n5\n")
+
+@test("'@keeps' outside a callable's parameters is refused")
+ftk_misplaced()
+    ftk_refused(raw"""
+        var p: @keeps *Handle = &spare
+
+        main()
+            print(p.n)
+        """, "'@keeps' marks a parameter of a callable's type that the callable may hold past the call — " +
+            "'Fn(@keeps *Handle) -> …' — and this '*Handle' is no callable's parameter")
+
+@test("'@keeps' written twice on one parameter is refused")
+ftk_twice()
+    ftk_refused(raw"""
+        type Twice = &Fn(@keeps @keeps *Handle) -> unit
+
+        main()
+            val f: Twice = (h) -> kept.push(h)
+            f(&spare)
+        """, "'@keeps' is written twice on one parameter, and a parameter is kept or it is not")

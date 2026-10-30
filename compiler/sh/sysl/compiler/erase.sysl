@@ -23,6 +23,10 @@ erase_to(cx: &Analyzer, t: TExpr, want: Type) -> TExpr
 
     if type_eq(got, want) then return t
 
+    val callable = callable_retyped(cx, t, got, want, tr)
+
+    if callable.is_some() then return callable.unwrap()
+
     // The value is **already an object**, over some other trait. It gets here because a bound on one
     // trait is satisfied by an object over a trait that requires it -- and it would be a short step
     // from there to reading the second as the same kind of thing. The two questions are not the same
@@ -138,6 +142,47 @@ private erase(cx: &Analyzer, t: TExpr, tr: Type, inner: Type, want: Type, boxed:
 
     TExpr(t.span, TErase(t, vtable_for(cx, t.span, tr, inner, boxed), want))
 end erase
+
+// **A callable object where another callable object differing only in its `@keeps` marks is asked
+// for** (`callable_within`): one that keeps nothing more than the slot lets it is the same object --
+// the same table, the same box -- and stands as it is; one that may keep a parameter the slot borrows
+// is refused, since every call through the slot may hand that parameter the address of its own
+// storage. `None` for any other pair.
+private callable_retyped(cx: &Analyzer, t: TExpr, got: Type, want: Type, tr: Type) -> Option[TExpr]
+    val fits = callable_within(got, want)
+
+    if fits.is_none() then return None
+    if fits.unwrap() then return Some(t)
+
+    val g = erased_trait(got).unwrap()
+    var i: usize = 0
+    var shown = ""
+
+    g match
+        Trait(_, args, assocs) ->
+            for k in 0..<args.len() - 1
+                if marks_kept(assocs, k) && !marks_kept(trait_assocs_of(tr), k)
+                    i = k
+                    break
+        _ -> ()
+
+    tr match
+        Trait(n, args, assocs) ->
+            var marks: Buf[(string, Type)] = buf()
+
+            for item in assocs
+                marks.push(item)
+
+            marks.push(fn_keeps_assoc(i))
+            shown = type_show(Trait(n, args, marks))
+        _ -> ()
+
+    Some(cx.err(t.span, s"a '${type_show(got)}' may keep its parameter ${i + 1} past the call, and a " +
+                s"'${type_show(want)}' borrows what it is handed for the call — whoever calls it may " +
+                "hand it the address of their own storage. Mark the parameter '@keeps' where the " +
+                s"type it goes into is written, '$shown', or copy what the callable keeps into " +
+                "storage of its own"))
+end callable_retyped
 
 // The associated types an object wrote down.
 private trait_assocs_of(t: Type) -> Buf[(string, Type)] = t match

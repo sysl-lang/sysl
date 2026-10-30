@@ -846,8 +846,44 @@ end guarded
 // that produced it has been reported, and a second complaint about what it fails to match is noise
 // about a consequence. A `never` agrees in one direction only -- it may stand anywhere, because
 // control does not reach the place the value would have been used, and nothing may stand for it.
+//
+// **A callable that keeps nothing stands where one that may keep is asked for** (`callable_within`):
+// the two are one trait and one table, and the marks say only what a call through the slot is held to.
 disagree(got: Type, want: Type) -> bool =
-    !type_eq(repr(got), repr(want)) && got != Unknown && want != Unknown && got != Never
+    !type_eq(repr(got), repr(want)) && got != Unknown && want != Unknown && got != Never &&
+        callable_within(got, want) != Some(true)
+
+// **Whether a callable object of one type stands where one of another is asked for**, where the two
+// differ only in their `@keeps` marks: yes where every parameter `got` may keep is one `want` lets it
+// keep, no where `got` may keep one `want` borrows, and `None` where the two are not that pair.
+callable_within(got: Type, want: Type) -> Option[bool]
+    val g = callable_object(got)
+    val w = callable_object(want)
+
+    if g.is_none() || w.is_none() then return None
+
+    val gx = g.unwrap()
+    val wx = w.unwrap()
+
+    if gx.0 != wx.0 || gx.3 != wx.3 || !types_eq(gx.1, wx.1) then return None
+    if !type_eq(Trait(gx.0, buf(), without_keeps(gx.2)), Trait(wx.0, buf(), without_keeps(wx.2))) then return None
+
+    Some(keeps_within(gx.2, wx.2))
+end callable_within
+
+// A callable object's trait, arguments, marks and the mode it is held by.
+private callable_object(t: Type) -> Option[(string, Buf[Type], Buf[(string, Type)], string)]
+    val mode = t match
+        Ref(_, sync) -> if sync then "&sync" else "&"
+        Ptr(_) -> "*"
+        _ -> ""
+
+    if mode == "" then return None
+
+    erased_trait(t) match
+        Some(Trait(n, args, assocs)) -> if fn_is_call(n) then Some((n, args, assocs, mode)) else None
+        _ -> None
+end callable_object
 
 // The one type two alternatives meet at -- the branches of an `if`, the arms of a `match` -- or
 // none where they have none.
