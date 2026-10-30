@@ -1,0 +1,137 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, remove_dir_all, write_text}
+import sysl.text.join
+
+// A closure handed to another library's generic makes an instance of that generic at the closure's
+// own type: `o.map(x -> reads(x))` makes `Option.map` at `$closure0`, whose body calls
+// `$closure0.call` directly. A library half drops an `internal` function reaching storage the
+// program fills, and every caller goes with it -- but only where the library declared the caller, so
+// the `Option.map` instance stayed in the half, defined, calling a `call` nothing defined: "compiled
+// half would name 1 symbol(s) it neither defines nor declares, the first of them '$closure0.call'".
+// `sysl build` and `sysl test` of the same tree compiled, having no half to split.
+
+private bcs_run(args: []string) -> (int, string)
+    var lines: Buf[string] = buf()
+    val sink = &lines
+    val code = run_cli(args, (line) -> sink.push(line))
+
+    (code, join(lines.view(), "\n"))
+end bcs_run
+
+private bcs_ready() -> bool = std_root().is_ok() && clang_available()
+
+// `sysl build-lib` over a root holding one module, `demo`, written as `src`, answers "checked".
+private bcs_checked(src: string)
+    val root = lbr_temp("sysl-bcs-")
+
+    make_dir_all(s"$root/demo").unwrap()
+    write_text(s"$root/demo/demo.sysl", src).unwrap()
+
+    val got = bcs_run(["sysl", "build-lib", root])
+
+    assert_eq(got.0, Fine, got.1)
+    assert_eq(got.1, s"checked $root")
+    remove_dir_all(root).unwrap_or(())
+end bcs_checked
+
+// What a program prints, built against `src` as a `--lib` root whose compiled half is made for the
+// build, and how the root came to the build.
+private bcs_ran(src: string, program: string) -> (string, string)
+    val cache = lbr_temp("sysl-bcs-cache")
+
+    use_root_cache_dir(Some(cache))
+    use_c_object_cache_dir(Some(cache))
+    clear_root_artifact_counts()
+
+    val lib = lbr_tree(lbr_one("demo/demo.sysl", src))
+    val prog = lbr_program(program)
+    val said = lbr_run(prog, [lib])
+    val c = root_artifact_counts()
+
+    use_root_cache_dir(None)
+    use_c_object_cache_dir(None)
+    lbr_drop([lib, prog, cache])
+    (said, s"hits ${c.0}, built ${c.1}, from source ${c.2}")
+end bcs_ran
+
+// The half builds on its own, and a program linking it prints `want` from a half that was compiled
+// rather than one that fell back to source.
+private bcs_both(src: string, program: string, want: string)
+    bcs_checked(src)
+
+    val got = bcs_ran(src, program)
+
+    assert_eq(got.0, want)
+    assert_eq(got.1, "hits 0, built 1, from source 0")
+end bcs_both
+
+// Storage filled when the program starts, and a function reading it.
+private val bcs_storage: string = "module demo\n\nvar base: u64 = 1\n\nval bump: u64 = base + 1\n\n" +
+    "reads(x: u64) -> u64 = x + bump\n\n"
+
+@test("a closure over a storage-reading function handed to Option.map builds as a library and runs")
+bcs_the_reduction()
+    if !bcs_ready() then return
+
+    bcs_both(bcs_storage + "go(o: Option[u64]) -> Option[u64] = o.map(x -> reads(x))\n",
+             "import demo.*\n\nprint(go(Some(5)).unwrap(), go(None).is_none())\n", "7 true\n")
+
+@test("the same map inside a generic the program instantiates")
+bcs_inside_a_generic()
+    if !bcs_ready() then return
+
+    bcs_both(bcs_storage + "tagged[T](t: T, o: Option[u64]) -> Option[u64] = o.map(x -> reads(x))\n",
+             "import demo.*\n\nprint(tagged(\"s\", Some(1)).unwrap(), tagged(3, Some(2)).unwrap())\n",
+             "3 4\n")
+
+@test("the same map in a module val's initializer, read by a public function")
+bcs_in_a_module_val()
+    if !bcs_ready() then return
+
+    bcs_both(bcs_storage + "val mapped: Option[u64] = Some(base).map(x -> reads(x))\n\n" +
+             "mapped_value() -> u64 = mapped.unwrap()\n",
+             "import demo.*\n\nprint(mapped_value())\n", "3\n")
+
+@test("a map whose closure maps again, the inner closure reaching storage")
+bcs_nested_closures()
+    if !bcs_ready() then return
+
+    bcs_both(bcs_storage + "twice(o: Option[u64]) -> Option[u64] = " +
+             "o.map(x -> Some(x).map(y -> reads(y)).unwrap() * 2)\n",
+             "import demo.*\n\nprint(twice(Some(1)).unwrap())\n", "6\n")
+
+@test("a closure returned from a public function, its body mapping through a storage closure")
+bcs_returned_from_a_function()
+    if !bcs_ready() then return
+
+    bcs_both(bcs_storage + "maker() -> &Fn(Option[u64]) -> Option[u64] = (o) -> o.map(x -> reads(x))\n",
+             "import demo.*\n\nval f = maker()\nprint(f(Some(10)).unwrap())\n", "12\n")
+
+@test("a closure stored in a field of a public struct, its body mapping through a storage closure")
+bcs_in_a_struct_field()
+    if !bcs_ready() then return
+
+    bcs_both(bcs_storage + "struct Hook\n    f: &Fn(Option[u64]) -> Option[u64]\n\n" +
+             "make_hook() -> Hook = Hook((o) -> o.map(x -> reads(x)))\n",
+             "import demo.*\n\nval h = make_hook()\nprint(h.f(Some(4)).unwrap())\n", "6\n")
+
+@test("a storage closure captured by another closure and handed to map from there")
+bcs_captured_by_a_closure()
+    if !bcs_ready() then return
+
+    bcs_both(bcs_storage + "outer(k: u64) -> &Fn(u64) -> u64\n" +
+             "    val inner = (x: u64) -> reads(x) + k\n\n" +
+             "    (a) -> Some(a).map(x -> inner(x)).unwrap()\n",
+             "import demo.*\n\nprint(outer(10)(1))\n", "13\n")
+
+@test("a map over a closure reading no storage stays in the half beside one that does, and both run")
+bcs_a_plain_map_beside()
+    if !bcs_ready() then return
+
+    bcs_both(bcs_storage + "plain(o: Option[u64], k: u64) -> Option[u64] = o.map(x -> x * k)\n\n" +
+             "stored(o: Option[u64]) -> Option[u64] = o.map(x -> reads(x))\n",
+             "import demo.*\n\nprint(plain(Some(3), 4).unwrap(), stored(Some(3)).unwrap())\n",
+             "12 5\n")

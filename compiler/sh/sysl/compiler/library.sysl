@@ -148,6 +148,7 @@ private library_build_of(units: Buf[Program], own: Buf[string], t: Target,
     var foreign: Buf[string] = buf()
     var kept: Buf[TFunc] = buf()
     var dropped: Buf[string] = buf()
+    val gone = dropped_internals(whole, own, defers)
 
     for i in 0..<whole.funcs.len()
         val f = whole.funcs.at(i)
@@ -158,7 +159,7 @@ private library_build_of(units: Buf[Program], own: Buf[string], t: Target,
         // or a closure that reads a module `val` would be defined in the library after all, naming
         // deferred callees this object never defines. Every caller of a deferred function is
         // deferred too, so nothing emitted here names it.
-        if !(f.internal && holds_string(own, f.declared_in) && holds_string(defers, f.name))
+        if !(f.internal && holds_string(gone, f.name))
             kept.push(f)
         else
             dropped.push(f.name)
@@ -214,6 +215,30 @@ private library_build_of(units: Buf[Program], own: Buf[string], t: Target,
     LibraryBuild(library, promotions, sorted_names(determined), errors_of(done.an.diagnostics()),
                  foreign)
 end library_build_of
+
+// The `internal` functions a library half leaves out: its own that reach storage the program fills,
+// and every `internal` function calling one of those, however far back.
+//
+// **The second set is not only the library's own**: a closure handed to another library's generic
+// makes an instance of that generic at the closure's type -- `o.map(x -> reads(x))` makes
+// `Option.map` at `$closure0` -- and that instance is `internal` here and calls the closure's `call`
+// directly. Kept because `Option` is not this library's, it was defined calling a body the half had
+// dropped. Another package's own private functions are not seeds, though they reach that package's
+// storage: a precompiled function of its half is copied in here to be inlined
+// (`available_externally`), and the private callee it names has to be defined beside it.
+private dropped_internals(whole: TProgram, own: Buf[string], defers: Buf[string]) -> Buf[string]
+    var seeds: Buf[string] = buf()
+
+    for i in 0..<whole.funcs.len()
+        val f = whole.funcs.at(i)
+
+        if f.internal && holds_string(own, f.declared_in) && holds_string(defers, f.name)
+            seeds.push(f.name)
+
+    if seeds.is_empty() then return seeds
+
+    gap_closure(whole, seeds)
+end dropped_internals
 
 // The storage a library build lays down once or names from the artifact that does, rather than
 // leaving every function reaching it to the program: what the object file carries as an image and

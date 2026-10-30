@@ -160,12 +160,16 @@ associated_on(cx: &Analyzer, span: Span, ty: Type, name: string, args: Buf[Expr]
 
     var picked = name
 
+    // A bound whose member the compiler supplies for this type is answered by the compiler, whatever
+    // other trait gave the type a member of the name.
+    val by_bound = bound_supplied_by_compiler(cx, ty, found.0, name, via)
+
     // **A trait's member may be filed only under a suffix** -- a block whose trait shares some other
     // member's name with a trait the type already implements files ALL of its members suffixed --
     // so the table of alternatives is asked as well as the plain name, exactly as a call through a
     // receiver asks it.
-    if member_at(cx.an, found.0, name).is_some() ||
-       cx.an.tables.members.alts.has(member_key_of(found.0, name))
+    if !by_bound && (member_at(cx.an, found.0, name).is_some() ||
+                     cx.an.tables.members.alts.has(member_key_of(found.0, name)))
         val chosen = chosen_member(cx, ty, found.0, name, span, args, via)
 
         if chosen.is_none() then return Some(bad_expr(span))
@@ -173,7 +177,7 @@ associated_on(cx: &Analyzer, span: Span, ty: Type, name: string, args: Buf[Expr]
         picked = chosen.unwrap()
     end if
 
-    val m = member_at(cx.an, found.0, picked)
+    val m = if by_bound then None else member_at(cx.an, found.0, picked)
 
     if m.is_none()
         // `Header.decode(bytes)` -- the one receiverless member the compiler provides that takes an
@@ -2317,6 +2321,50 @@ private push_with_required(cx: &Analyzer, key: string, keys: *Buf[string])
 
         if sk.is_some() then push_with_required(cx, sk.unwrap(), keys)
 end push_with_required
+
+// Whether the member a bound promised is one the **compiler** supplies for this type, so that nothing
+// in the type's tables is what the generic body meant.
+//
+// At an instantiation the parameter has become an ordinary type, and its tables may hold a member of
+// the same name that some other trait gave it -- a private trait in the instantiating module, or one
+// beside the generic body itself. Neither is what `[T: Zero]` promised: `int`'s `Zero` has no block,
+// its `zero()` being the compiler's. So where a trait in force through the bound declares the member,
+// the compiler supplies it for this type, and no filed candidate comes from a bound trait, the table
+// is not consulted at all -- the lookup answers through the bound, as it did at the definition.
+bound_supplied_by_compiler(cx: &Analyzer, rty: Type, base: string, name: string,
+                           via: Buf[string]) -> bool
+    if via.is_empty() then return false
+
+    // Only the receiverless ones can meet a block of the same name: a block declaring an operator's
+    // method for a type the compiler already answers it for is refused where it is written.
+    val spelling = core_constant(name) match
+        Some(row) -> Some(row.0)
+        None -> core_measure_trait(name)
+
+    if spelling.is_none() || !core_builtin(spelling.unwrap(), rty) then return false
+
+    val key = catalog_key(cx.an, spelling.unwrap())
+
+    if key.is_none() || !holds_string(via, key.unwrap()) then return false
+
+    // A block the bound's own trait filed for the type answers through the table as it always did.
+    var filed: Buf[string] = buf()
+
+    if has_member_at(cx.an, base, name) then filed.push(name)
+
+    val alts = cx.an.tables.members.alts.get(member_key_of(base, name))
+
+    if alts.is_some()
+        for item in alts.unwrap()
+            filed.push(item)
+
+    for item in filed
+        val tr = cx.an.tables.members.from_trait.get(member_key_of(base, item))
+
+        if tr.is_none() || holds_string(via, tr.unwrap()) then return false
+
+    true
+end bound_supplied_by_compiler
 
 // No bound at all, named so that a default argument can say which kind of run of names it means.
 no_bound_traits() -> Buf[string] = buf()
