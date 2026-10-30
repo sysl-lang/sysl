@@ -1,0 +1,335 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+
+// An argument whose shape no type argument could make fit its generic parameter: `g[T](p: *T)`
+// called as `g(5)`. The call is told the mismatch at the argument, in the words a non-generic
+// parameter's mismatch uses ("'p' of 'f' is *int, but int was given"), with the parameter quoted as
+// its declaration wrote it -- never "cannot infer the type argument", which sent the reader to
+// annotate a type that was never the problem. Where another argument settles the parameter, the
+// instantiated signature speaks as before; and a call that genuinely says nothing about a type
+// argument is still told it cannot be inferred.
+
+private var gsc_library_cache: Buf[Program] = buf()
+private var gsc_library_read: bool = false
+
+private gsc_library() -> Buf[Program]
+    if gsc_library_read then return gsc_library_cache
+
+    gsc_library_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> gsc_library_cache = units
+
+    gsc_library_cache
+end gsc_library
+
+private gsc_ready() -> bool
+    if gsc_library().is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+    end if
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+    end if
+
+    true
+end gsc_ready
+
+private gsc_says(text: string, part: string) -> bool = text.index_of(part).is_some()
+
+// The report a source earns, taken through the lowering.
+private gsc_err(text: string) -> string
+    val root = make_temp_dir("sysl-gsc").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    val out = emit_llvm_text(src, None) match
+        Err(why) -> why.message
+        Ok(made) -> if made.report.is_empty() then "" else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end gsc_err
+
+// The one diagnostic a source earns: its message, where it points, and nothing about inference.
+private gsc_one(text: string, message: string, at: string)
+    val said = gsc_err(text)
+
+    assert(gsc_says(said, s"error: $message\n"), said)
+    assert(gsc_says(said, s"main.sysl:$at\n"), said)
+    assert(!gsc_says(said, "cannot infer"), said)
+    assert(said.index_of("error:") == said.last_index_of("error:"), s"one error, not several: $said")
+end gsc_one
+
+// A source the analysis accepts.
+private gsc_clean(text: string)
+    val said = gsc_err(text)
+
+    assert(said.is_empty(), said)
+
+private gsc_decls() -> string = raw"""
+    import sysl.buf.*
+
+    struct S
+        x: int
+
+    g[T](p: *T) -> unit = ()
+    hs[T](p: []T) -> unit = ()
+    arr3[T](p: [3]T) -> unit = ()
+    sized[T, const N: usize](p: [N]T) -> unit = ()
+    ap[T](f: &Fn(T) -> T) -> unit = ()
+    rf[T](p: &T) -> unit = ()
+    nest[T](p: *[]T) -> unit = ()
+    two[T, U](a: T, p: *U) -> unit = ()
+    same[T](a: T, p: *T) -> unit = ()
+    open[T, U: Zero](p: *T) -> U = U.zero()
+    """
+
+// Line 16 is the first a test writes after the declarations.
+private gsc(lines: string) -> string = gsc_decls() + lines
+
+// -- a pointer parameter ---------------------------------------------------------------------------
+
+@test("a '*T' parameter given an int is the mismatch, not an inference failure")
+gsc_ptr_int()
+    if !gsc_ready() then return
+
+    gsc_one("g[T](p: *T) -> unit = ()\n\nmain()\n    g(5)\n", "'p' of 'g' is *T, but int was given", "4:7")
+
+@test("given a string")
+gsc_ptr_string()
+    if !gsc_ready() then return
+
+    gsc_one(gsc("g(\"ab\")\n"), "'p' of 'g' is *T, but string was given", "16:3")
+
+@test("given a struct value")
+gsc_ptr_struct()
+    if !gsc_ready() then return
+
+    gsc_one(gsc("g(S(1))\n"), "'p' of 'g' is *T, but S was given", "16:3")
+
+@test("given an array")
+gsc_ptr_array()
+    if !gsc_ready() then return
+
+    gsc_one(gsc("val xs = [1, 2, 3]\ng(xs)\n"), "'p' of 'g' is *T, but [3]int was given", "17:3")
+
+@test("given a reference, which is not a pointer either")
+gsc_ptr_ref()
+    if !gsc_ready() then return
+
+    gsc_one(gsc("val r: &int = 5\ng(r)\n"), "'p' of 'g' is *T, but &int was given", "17:3")
+
+@test("given a pointer, it still infers")
+gsc_ptr_positive()
+    if !gsc_ready() then return
+
+    gsc_clean(gsc("var n = 5\ng(&n)\nvar s = S(1)\ng(&s)\n"))
+
+// -- slices and arrays -----------------------------------------------------------------------------
+
+@test("a '[]T' parameter given a scalar")
+gsc_slice_scalar()
+    if !gsc_ready() then return
+
+    gsc_one(gsc("hs(5)\n"), "'p' of 'hs' is []T, but int was given", "16:4")
+
+@test("given a string, which is not a slice")
+gsc_slice_string()
+    if !gsc_ready() then return
+
+    gsc_one(gsc("hs(\"ab\")\n"), "'p' of 'hs' is []T, but string was given", "16:4")
+
+@test("given a Buf, which is not a slice")
+gsc_slice_buf()
+    if !gsc_ready() then return
+
+    gsc_one(gsc("var b: Buf[int] = buf()\nhs(b)\n"), "'p' of 'hs' is []T, but Buf[int] was given", "17:4")
+
+@test("given an array or a slice, it still infers")
+gsc_slice_positive()
+    if !gsc_ready() then return
+
+    gsc_clean(gsc("var xs = [1, 2, 3]\nhs(xs)\nval v: []int = xs\nhs(v)\n"))
+
+@test("a '[3]T' parameter given a scalar")
+gsc_array_scalar()
+    if !gsc_ready() then return
+
+    gsc_one(gsc("arr3(5)\n"), "'p' of 'arr3' is [3]T, but int was given", "16:6")
+
+@test("and given a slice, which no length can make an array")
+gsc_array_slice()
+    if !gsc_ready() then return
+
+    gsc_one(gsc("var xs = [1, 2, 3]\nval v: []int = xs\narr3(v)\n"),
+            "'p' of 'arr3' is [3]T, but []int was given", "18:6")
+
+// A string literal stands where a `[N]u8` is asked for, so the call is one whose element only the
+// reader can name.
+@test("and given a string, which a '[3]u8' would take, it is still uninferable")
+gsc_array_string()
+    if !gsc_ready() then return
+
+    val said = gsc_err(gsc("arr3(\"abc\")\n"))
+
+    assert(gsc_says(said, "error: cannot infer the type argument 'T' of 'arr3' here"), said)
+    assert(!gsc_says(said, "was given"), said)
+
+@test("a '[N]T' parameter given a scalar")
+gsc_sized_scalar()
+    if !gsc_ready() then return
+
+    gsc_one(gsc("sized(5.5)\n"), "'p' of 'sized' is [\u{2026}]T, but real was given", "16:7")
+
+@test("given an array, the length and the element still infer")
+gsc_array_positive()
+    if !gsc_ready() then return
+
+    gsc_clean(gsc("val xs = [1, 2, 3]\narr3(xs)\nsized(xs)\n"))
+
+// -- references and callables ----------------------------------------------------------------------
+
+@test("a '&T' parameter given a plain value is no mismatch: the call boxes it")
+gsc_ref_boxes()
+    if !gsc_ready() then return
+
+    gsc_clean(gsc("rf(5)\nrf(S(1))\n"))
+
+@test("a '&Fn(T) -> T' parameter given a value with no call")
+gsc_fn_struct()
+    if !gsc_ready() then return
+
+    gsc_one(gsc("ap(S(1))\n"), "'f' of 'ap' is &Fn(T) -> T, but S was given", "16:4")
+
+@test("and given an int")
+gsc_fn_int()
+    if !gsc_ready() then return
+
+    gsc_one(gsc("ap(5)\n"), "'f' of 'ap' is &Fn(T) -> T, but int was given", "16:4")
+
+@test("given a closure, it still infers")
+gsc_fn_positive()
+    if !gsc_ready() then return
+
+    gsc_clean(gsc("val k: &Fn(int) -> int = x -> x + 1\nap(k)\n"))
+
+// -- shapes inside shapes, and several parameters ---------------------------------------------------
+
+@test("a '*[]T' parameter given the slice rather than a pointer to it")
+gsc_nested_slice()
+    if !gsc_ready() then return
+
+    gsc_one(gsc("var xs = [1, 2]\nval v: []int = xs\nnest(v)\n"),
+            "'p' of 'nest' is *[]T, but []int was given", "18:6")
+
+@test("given a pointer to a slice, it still infers")
+gsc_nested_positive()
+    if !gsc_ready() then return
+
+    gsc_clean(gsc("var xs = [1, 2]\nvar v: []int = xs\nnest(&v)\n"))
+
+@test("two type parameters, the second's argument the wrong shape")
+gsc_two_params()
+    if !gsc_ready() then return
+
+    gsc_one(gsc("two(1, 5)\n"), "'p' of 'two' is *U, but int was given", "16:8")
+
+// A parameter another argument settles is the instantiated signature's to refuse, which can name the
+// type the call settled.
+@test("one the other argument settles is refused at the type it settled")
+gsc_settled_elsewhere()
+    if !gsc_ready() then return
+
+    gsc_one(gsc("same(1, 5)\n"), "'p' of 'same' is *int, but int was given", "16:9")
+
+@test("a type parameter only the result names is not reported a second time")
+gsc_result_only()
+    if !gsc_ready() then return
+
+    gsc_one(gsc("val n: int = open(5)\n"), "'p' of 'open' is *T, but int was given", "16:19")
+
+// -- methods ---------------------------------------------------------------------------------------
+
+@test("a generic method's '*T' parameter given an int")
+gsc_method()
+    if !gsc_ready() then return
+
+    gsc_one(raw"""
+        struct Box
+            v: int
+
+            put[T](self, p: *T) -> unit = ()
+        end Box
+
+        Box(1).put(5)
+        """, "'p' of 'Box.put' is *T, but int was given", "7:12")
+
+@test("and a generic type's own generic method, given a pointer, still infers")
+gsc_method_positive()
+    if !gsc_ready() then return
+
+    gsc_clean(raw"""
+        struct Box[V]
+            v: V
+
+            put[T](self, p: *T) -> unit = ()
+        end Box
+
+        var n = 5
+        Box(1.5).put(&n)
+        """)
+
+@test("a generic type's generic method given a non-slice")
+gsc_method_generic_type()
+    if !gsc_ready() then return
+
+    gsc_one(raw"""
+        struct Box[V]
+            v: V
+
+            each[T](self, xs: []T) -> unit = ()
+        end Box
+
+        Box(1.5).each(7)
+        """, "'xs' of 'Box.each' is []T, but int was given", "7:15")
+
+// -- what is still uninferable, and what was already told ------------------------------------------
+
+@test("a null at a pointer parameter is still told it has no context")
+gsc_null()
+    if !gsc_ready() then return
+
+    val said = gsc_err(gsc("g(null)\n"))
+
+    assert(gsc_says(said, "error: 'null' takes its type from its context, and there is none here\n"), said)
+    assert(!gsc_says(said, "was given"), said)
+
+@test("a call with nothing to read a type argument from is still uninferable")
+gsc_uninferable()
+    if !gsc_ready() then return
+
+    val said = gsc_err("z[T: Zero]() -> T = T.zero()\nprint(z())\n")
+
+    assert(gsc_says(said, "error: cannot infer the type argument 'T' of 'z' here — annotate the " +
+                          "expected type\n"), said)
+
+@test("an argument that is itself a mistake is told once, as that mistake")
+gsc_undefined_argument()
+    if !gsc_ready() then return
+
+    val said = gsc_err(gsc("g(nowhere)\n"))
+
+    assert(gsc_says(said, "error: undefined name 'nowhere'\n"), said)
+    assert(!gsc_says(said, "was given"), said)
+    assert(!gsc_says(said, "cannot infer"), said)
