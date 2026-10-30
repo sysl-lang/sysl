@@ -700,6 +700,25 @@ print(out[0], out[3])
 11 41
 ```
 
+**So does the receiver of a vector method.** The operands of `mul_add`, `select` and `shuffle` are
+the receiver's vector type (or, for `select`, the other side's), so a load in one takes its width as
+an operator's operand would:
+
+```sysl
+var xs: [4]f32 = [1, 2, 3, 4]
+var ys: [4]f32 = [1, 1, 2, 2]
+var acc: <2>f32 = 0
+val a: <2>f32 = xs.load(0)
+
+acc = a.mul_add(ys.load(2), acc)
+
+print(acc[0], acc[1])
+```
+
+```output
+2 4
+```
+
 **A position that accepts any width gives none.** A store accepts any width, so there is nothing to
 infer from:
 
