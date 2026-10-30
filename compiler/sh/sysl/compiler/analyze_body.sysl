@@ -1981,7 +1981,6 @@ private module_storage(a: &Analysis) -> Buf[TVal]
                 if d.main_thread then check_main_thread(cx, d.span, key)
 
                 if d.export.is_some() then check_exported_storage(cx, d, key, ty, computed)
-                else if computed && d.section.is_some() then check_placed_storage(cx, d, key)
 
                 out.push(TVal(key, stored, init, computed, writable, storage_align(cx, d), d.section,
                               d.thread_local, d.per_cpu, d.main_thread, exported_storage_symbol(d),
@@ -2249,31 +2248,6 @@ private check_exported_storage(cx: &Analyzer, d: ValueDecl, key: string, ty: Typ
                  "constant data — a literal, a 'const', the address of other module storage, and " +
                  s"the arrays and structs built from those${exported_zero_advice(ty)}")
 end check_exported_storage
-
-// **Placed storage on a bare machine is constant data or it is refused** (`reference/attributes.md §
-// A placed symbol is kept`). A placed object is a root in its own right: what reads it -- a boot ROM's
-// table, a linker script's gathering, a processor fetching a vector -- is outside the program and reads
-// the bytes the image carries, so a value filled by code that runs first is one it never sees. A hosted
-// machine's loader runs that code before anything else; a bare one has nothing to run it but `main`,
-// which an archive or an image entered elsewhere never calls, and which would in any case be writing
-// into a section that may be read-only flash. So on a freestanding target the storage would be left
-// as zeros -- a silent wrong answer -- and is refused instead, with why it did not fold.
-private check_placed_storage(cx: &Analyzer, d: ValueDecl, key: string)
-    val t = cx.an.tables.target
-
-    if t.runs_initializers() then return
-
-    val why = cx.an.evaluation.val_stops.get(key).map(s -> s". $s").unwrap_or("")
-
-    cx.fault(d.span, s"'${qualified_name(key)}' is placed in section \"${d.section.unwrap()}\", so what " +
-             "reads it is outside the program and reads the bytes the image carries — but it is module " +
-             "storage an initializer fills before the program's own statements run, and " +
-             s"'${t.name}' is freestanding: there is no loader to run that initializer, so the section " +
-             "would hold whatever the image left. Make the initializer constant data, which is laid " +
-             "straight into the object file — a literal, a 'const', the address of a function or of " +
-             "module storage, that address as an integer of the machine's word, and the arrays and " +
-             s"structs built from those$why")
-end check_placed_storage
 
 // Leaving an exported object's value off is advice only where its type has a zero to start at; one
 // with none (a simple enum) would be refused for needing a value in its turn.

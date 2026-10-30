@@ -3,7 +3,7 @@ module sh.sysl.compiler
 
 import sh.sysl.parsing.source_of
 import sysl.buf.{Buf, buf}
-import sysl.text.{Search, join}
+import sysl.text.{Search, join, split}
 import sysl.fs.{make_temp_dir, remove_dir_all, write_text, is_file}
 import sysl.process.capture
 import sysl.testing.skip
@@ -13,17 +13,19 @@ import sysl.testing.skip
 // one, and either moved by a constant (`+ 1`, `- 4`) are laid into the object file as a `ptrtoint`
 // constant expression -- a word the linker fills in -- and nothing runs to fill them.
 //
-// **A placed object on a bare machine is constant data or it is refused.** What reads a section is
-// outside the program, so storage an initializer would fill is refused there rather than left as the
-// zeros a freestanding archive used to carry silently. A conversion of an address to an integer that
+// **A placed object nothing will fill is constant data or it is refused.** What reads a section is
+// outside the program, so on a build that never runs an initializer -- a freestanding C archive, or a
+// bare image entered where `main` never runs -- storage an initializer would fill is refused rather
+// than left as the zeros it used to carry silently. A bare image whose `main` runs fills it there, as
+// before. A conversion of an address to an integer that
 // is not the machine's word, and a word inside a struct whose fields are packed or reversed, are not
 // relocations any linker writes, so they stay code and the refusal says why.
 //
 // Axes: target word (32 thumb / 64 host) x what the address is of (an exported function, a plain
 // function of any signature, module storage, an element of it) x where the word sits (array element,
 // struct field, a struct that rewrites its bits) x the integer (word, narrower, wider, moved by a
-// constant) x placement (section on a bare machine: refused if code; plain storage on a hosted machine:
-// still filled at startup). Not covered: an enum payload holding such a word stays code (its image
+// constant) x placement and build (section in a freestanding archive or an image entered elsewhere:
+// refused if code; in a bare image whose `main` runs, or on a hosted machine: filled at startup). Not covered: an enum payload holding such a word stays code (its image
 // takes only the address itself), and a hosted placed object is still filled before `main`.
 
 private pai_library_for(t: Target) -> Buf[Program]
@@ -91,15 +93,81 @@ private val pai_rom: string =
 // Why a call to an `extern` does not fold, as a refusal's reason ends.
 private val pai_outside: string = "which is outside the program — nothing outside the program exists while compiling"
 
-// The refusal of placed storage that would be filled by code, followed by why it did not fold.
-private pai_placed(name: string, section: string, why: string) -> string =
+// The refusal of placed storage nothing will fill, on a build `nothing` describes, followed by why the
+// initializer did not fold.
+private pai_unfilled(name: string, section: string, nothing: string, why: string) -> string =
     s"'$name' is placed in section \"$section\", so what reads it is outside the program and reads the " +
     "bytes the image carries — but it is module storage an initializer fills before the program's own " +
-    "statements run, and 'thumbv6m-freestanding' is freestanding: there is no loader to run that " +
-    "initializer, so the section would hold whatever the image left. Make the initializer constant " +
-    "data, which is laid straight into the object file — a literal, a 'const', the address of a " +
-    "function or of module storage, that address as an integer of the machine's word, and the arrays " +
+    s"statements run. $nothing, so the section would hold whatever the image left. Make the initializer " +
+    "constant data, which is laid straight into the object file — a literal, a 'const', the address of " +
+    "a function or of module storage, that address as an integer of the machine's word, and the arrays " +
     s"and structs built from those. $why"
+
+// The same for a freestanding archive, which has no entry point.
+private pai_placed(name: string, section: string, why: string) -> string =
+    pai_unfilled(name, section, "This artifact has no entry point to run that initializer, and " +
+                 "'thumbv6m-freestanding' is freestanding — there is no loader to run a constructor either", why)
+
+// A linked image for a bare machine entered at `entry`: what the compilation refused first, or the LLVM
+// text it lowered to.
+private pai_image(text: string, entry: string) -> string
+    val t = pai_thumb()
+    var units = pai_library_for(t)
+    val parsed = parse(source_of("main.sysl", text), t)
+
+    if !parsed.ok() then return parsed.report.at(0).message
+
+    units.push(parsed.program)
+
+    val done = analyze_produced(units, t, buf(), false)
+    val early = pai_first_of(done.reported)
+
+    if early != "" then return early
+
+    val whole = program_of(done, done.main_module) with { entry_point = true, c_artifact = false }
+    var own: Buf[string] = buf()
+
+    own.push("")
+
+    val pr = post_analysis_checks(done.an, whole, own)
+
+    check_image_storage(done.an, whole, own, entry)
+
+    val late = pai_first_of(done.an.diagnostics())
+
+    if late != "" then return late
+
+    ir_print_module(codegen_with_gaps(prune(strip_tests(whole), own), t, pr).0)
+end pai_image
+
+private val pai_ram: string =
+    "extern \"rom_next\" next() -> u32\n\n@section(\".ram2\")\nvar buf: u32 = next()\n\n"
+
+@test("a placed 'var' an initializer fills is accepted in a bare image whose 'main' runs, and filled there")
+pai_image_with_main_fills_placed_storage()
+    pai_skip()
+
+    val out = pai_image(pai_ram + "@export(\"main\")\nmain_entry() -> int = int(buf)\n", "reset")
+
+    assert(out.contains("@buf = private global i32 zeroinitializer, section \".ram2\"\n"), out)
+
+    var stored = false
+
+    for line in split(out, "\n")
+        if line.contains("store i32") && line.contains("ptr @buf") then stored = true
+
+    assert(stored, out)
+end pai_image_with_main_fills_placed_storage
+
+@test("a placed 'var' an initializer fills is refused in a bare image entered where 'main' never runs")
+pai_image_entered_elsewhere_refused()
+    pai_skip()
+
+    assert_eq(pai_image(pai_ram + "@export(\"reset\")\nreset() -> int = 0\n", "reset"),
+              pai_unfilled("buf", ".ram2", "This image starts at 'reset' ('targets.thumbv6m-freestanding." +
+                           "entry'), which never calls 'main', and 'main' is what runs that initializer",
+                           s"'buf' calls 'next', $pai_outside"))
+end pai_image_entered_elsewhere_refused
 
 @test("a placed table holding a literal and a function's address as a u32 is laid down on thumb")
 pai_the_rom_table_on_thumb()
@@ -169,7 +237,7 @@ pai_a_placed_struct()
                   "i32) }, section \".rom.e\"\n")
 end pai_a_placed_struct
 
-@test("a placed 'val' an initializer would fill is refused on a bare machine, not left as zeros")
+@test("a placed 'val' an initializer would fill is refused in a freestanding archive, not left as zeros")
 pai_placed_code_refused()
     pai_skip()
 

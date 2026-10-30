@@ -302,6 +302,7 @@ check_exports_emitted(a: &Analysis, p: TProgram, own: Buf[string])
     export_duplicates(a, exported)
     export_names(a, exported, storage_by_symbol(p.vals))
     export_storage(a, p, archive_ways_in(p, own, exported))
+    archive_placed_storage(a, p)
     stored_export_duplicates(a, p, exported)
     exports_answer_externs(a, p)
 end check_exports_emitted
@@ -524,6 +525,47 @@ private export_storage(a: &Analysis, p: TProgram, exported: Buf[TFunc])
     end for
 end export_storage
 
+// **Placed storage on a build that never runs its initializer is refused, not laid down as zeros**
+// (`reference/attributes.md § A placed symbol is kept`). A placed object is a root in its own right:
+// what reads it -- a boot ROM walking a table, a processor fetching a vector -- is outside the program,
+// so storage an initializer fills has to be filled by something. A hosted loader runs the initializer,
+// and so does a bare image's `main`; **what is left is a C archive for a freestanding target**, which
+// has no entry point and no loader, and an image entered somewhere that never calls `main`
+// (`check_image_storage`). There the section would carry zeros, and is refused with why the
+// initializer did not fold. Exported storage is refused on every build already, where it is declared.
+private archive_placed_storage(a: &Analysis, p: TProgram)
+    val t = a.tables.target
+
+    if !p.c_artifact || t.runs_initializers() then return
+    if p.c_runtime && runtime_init_called(p) then return
+
+    placed_unfilled(a, p, "This artifact has no entry point to run that initializer, and " +
+                    s"'${t.name}' is freestanding — there is no loader to run a constructor either")
+end archive_placed_storage
+
+// Refuses each piece of placed, unexported storage that an initializer fills, on a build `nothing`
+// says nothing will run that initializer in.
+private placed_unfilled(a: &Analysis, p: TProgram, nothing: string)
+    for v in p.vals
+        if v.section.is_none() || !v.computed || v.exported.is_some() then continue
+
+        val d = a.tables.vals.get(v.symbol)
+
+        if d.is_none() then continue
+
+        val why = a.evaluation.val_stops.get(v.symbol).map(s -> s". $s").unwrap_or("")
+
+        a.fault(d.unwrap().scope, d.unwrap().span,
+                s"'${qualified_name(v.symbol)}' is placed in section \"${v.section.unwrap()}\", so what " +
+                "reads it is outside the program and reads the bytes the image carries — but it is module " +
+                s"storage an initializer fills before the program's own statements run. $nothing, so the " +
+                "section would hold whatever the image left. Make the initializer constant data, which is " +
+                "laid straight into the object file — a literal, a 'const', the address of a function or " +
+                "of module storage, that address as an integer of the machine's word, and the arrays and " +
+                s"structs built from those$why")
+    end for
+end placed_unfilled
+
 // The ways into a C archive's sysl code: each export it contributes, then each function placed in a
 // section or marked with a calling convention that is not exported as well.
 private archive_ways_in(p: TProgram, own: Buf[string], exported: Buf[TFunc]) -> Buf[TFunc]
@@ -598,6 +640,9 @@ check_image_storage(a: &Analysis, p: TProgram, own: Buf[string], entry: string)
     if p.c_artifact || !image_storage_unfilled(entry, p) then return
 
     val t = a.tables.target
+
+    placed_unfilled(a, p, s"This image starts at '$entry' ('targets.${t.name}.entry'), which never calls " +
+                    "'main', and 'main' is what runs that initializer")
 
     for r in storage_reads(a, p, image_ways_in(p, own, entry))
         a.fault(func_home(a, r.way.name), r.way.span,
