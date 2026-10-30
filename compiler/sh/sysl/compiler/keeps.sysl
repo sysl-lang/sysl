@@ -2058,6 +2058,7 @@ end image_kept
 private kept_at(t: &Track, evs: &EvBuf, e: TExpr)
     *e.kind match
         TStore(place, v, _, _) -> stored(t, evs, place, v)
+        TStructNew(st, args) -> captured_reads(t, evs, e, st, args)
         TSlots(op, args, _, _) ->
             if t.promised then return
 
@@ -2091,6 +2092,13 @@ private kept_at(t: &Track, evs: &EvBuf, e: TExpr)
                         (if at < kept_n then "keeps it" else "lets what it reads through it out")
 
                     if item.loc == "j" && has_span(t.hs.chained, e.span) then continue
+
+                    // **A callee keeping the value read `steps` in only in what that value points at**,
+                    // in place (`launch(m)` pairing `&m.cores[0]` into `m.cores[1]`), keeps it no longer
+                    // than its own pointee lasts -- as a body keeping its parameter in what the
+                    // parameter points at does not keep it. Said here, because the caller, handed a
+                    // pointer read out of memory, could not name that storage again.
+                    if at < kept_n && in_place_of(item.loc, j) && value_read_in(t, args.at(j)) then continue
 
                     val loc = if item.loc == "j" then joined_loc(t.hs, true) else track_loc(t, args, item.loc)
 
@@ -2152,11 +2160,59 @@ private kept_at(t: &Track, evs: &EvBuf, e: TExpr)
         _ -> ()
 end kept_at
 
+// **A closure made around a copy of the value**, in a walk of the value itself: what its body lets out
+// of what it reads through its environment, along that capture's field, as many steps in as the copy
+// sits (`() -> f1(&b)`, `b` a copy, reads the value one step through the environment). What the body
+// puts back into storage reached through the environment stays there.
+private captured_reads(t: &Track, evs: &EvBuf, e: TExpr, st: &StructType, args: Buf[TExpr])
+    if !value_walk(t) || t.promised || !is_closure_literal(Struct(st)) then return
+
+    val body = s"${st.base}.call"
+    val how = "it is captured by a closure, which lets what it reads out"
+    var made: Buf[TExpr] = buf()
+
+    made.push(e)
+
+    for k in 0..<args.len()
+        if !carries(t, args.at(k)) then continue
+
+        for s in ptr_steps(t, args.at(k))
+            if s > 0 then continue
+
+            for item in read_path_of(t.cx, body, 0, 1 - s, field_step("", Struct(st), int(k))).locs
+                if in_place_of(item.loc, 0) then continue
+
+                // Held for good: the body runs whenever the closure is called, after anything this
+                // walk could see clear the storage it lets the value out to.
+                if !translate_loc(t.org, made, item.loc).starts_with("l:") then kept_hard(evs, how, args.at(k).span)
+        end for
+    end for
+end captured_reads
+
+// Whether an argument is the pointer a walk of what is read `steps` in follows, rather than a pointer on
+// the way to it.
+private value_read_in(t: &Track, arg: TExpr) -> bool =
+    t.steps > 0 && is_ptr_type(texpr_type(arg)) && ptr_steps(t, arg).is_empty()
+
 // **Where a call may hold what a walk follows in an argument**: what the callee keeps of it, and for a
 // walk of what is read through a parameter (`through_of`), what the callee lets out of what it reads
 // through it -- the argument may be the pointer itself, handed on, or one read out of it.
 private track_call_locs(t: &Track, name: string, j: usize, arg: TExpr) -> Buf[KeptAt]
     val kept = keeps_of(t.cx, name, j).locs
+    val reads = value_reads(t, arg)
+
+    if !reads.is_empty()
+        var out: Buf[KeptAt] = buf()
+
+        for item in kept
+            out.push(item)
+
+        for k in reads
+            for item in read_of(t.cx, name, j, k).locs
+                if !in_place_of(item.loc, j) then out.push(item)
+
+        return out
+    end if
 
     if !reads_on(t, arg) then return kept
 
@@ -2179,6 +2235,20 @@ end track_call_locs
 
 private track_vcall_locs(t: &Track, recv: TExpr, slot: int, k: usize, arg: TExpr) -> Buf[(string, KeptAt)]
     val kept = vcall_keeps(t.cx, recv, slot, k)
+    val reads = value_reads(t, arg)
+
+    if !reads.is_empty()
+        var out: Buf[(string, KeptAt)] = buf()
+
+        for item in kept
+            out.push(item)
+
+        for left in reads
+            for item in vcall_reads(t.cx, recv, slot, k, left, "")
+                if !in_place_of(item.1.loc, k) then out.push(item)
+
+        return out
+    end if
 
     if !reads_on(t, arg) then return kept
 
@@ -2201,6 +2271,20 @@ end track_vcall_locs
 
 private track_pointer_locs(t: &Track, callee: TExpr, j: usize, arg: TExpr) -> Buf[(string, KeptAt)]
     val kept = pointer_keeps(t.cx, callee, j)
+    val reads = value_reads(t, arg)
+
+    if !reads.is_empty()
+        var out: Buf[(string, KeptAt)] = buf()
+
+        for item in kept
+            out.push(item)
+
+        for left in reads
+            for item in pointer_reads(t.cx, callee, j, left, "")
+                if !in_place_of(item.1.loc, j) then out.push(item)
+
+        return out
+    end if
 
     if !reads_on(t, arg) then return kept
 
@@ -2249,13 +2333,38 @@ end steps_left
 // pointer on the way one step short of it. A local given values read at different steps has them all
 // (`ptrs`); so does a branch, and a call answering a value it read through a pointer on the way
 // (`call_steps`). A value read `steps` in is what is followed, not a pointer on the way.
+//
+// **A walk of the value itself** (not through it) counts the same way from 0: the parameter and every
+// copy of it are at 0, and the address of a place holding a copy is at −1, the address of a local
+// holding that address at −2 -- a pointer through which a callee reads the value itself one or two
+// steps in (`value_reads`).
 private ptr_steps(t: &Track, e: TExpr) -> Buf[int]
     var out: Buf[int] = buf()
 
-    if t.steps > 0 then gather_steps(t, e, &out, 0)
+    if t.steps > 0 || !t.through then gather_steps(t, e, &out, 0)
 
     out
 end ptr_steps
+
+// **How many steps through `arg` a callee reaches the value a walk of the value itself follows**: one
+// for `&b` where `b` holds a copy of the parameter, two for `&c` where `c` holds `&b`, and so on -- what
+// the callee lets out of what it reads that far in (`read_of`) holds the value as surely as what it
+// keeps of the value handed straight over.
+private value_reads(t: &Track, arg: TExpr) -> Buf[int]
+    var out: Buf[int] = buf()
+
+    if t.through || t.steps != 0 || !asks_through(t.cx, texpr_type(arg)) then return out
+
+    // A closure's environment is asked where the closure is made, capture by capture
+    // (`captured_reads`): asked of the whole environment at a call, everything the body lets out of
+    // any capture would be charged to each.
+    if is_closure_literal(env_type(texpr_type(arg))) then return out
+
+    for s in ptr_steps(t, arg)
+        if s < 0 then push_step(&out, -s)
+
+    out
+end value_reads
 
 private gather_steps(t: &Track, e: TExpr, out: *Buf[int], depth: int)
     // An expression nested past what is followed may be a pointer at any step on the way.
@@ -2855,9 +2964,11 @@ private carries(t: &Track, e: TExpr) -> bool = *e.kind match
     // that carries it is the box's own, and for a walk of what is read through a parameter, anything
     // read through what carries it is what is followed.
     TField(r, _, ty) -> may_hold_pointer(t.cx, ty) && path_ok(t, e) && carries(t, r)
-    TDeref(x, ty) -> may_hold_pointer(t.cx, ty) && (steps_in(t, x) || boxed(texpr_type(x))) && carries(t, x)
+    TDeref(x, ty) ->
+        may_hold_pointer(t.cx, ty) && (steps_in(t, x) || boxed(texpr_type(x)) || at_the_value(t, x)) && carries(t, x)
     TIndex(r, _, ty) ->
-        may_hold_pointer(t.cx, ty) && (steps_in(t, r) || is_array_type(texpr_type(r))) && path_ok(t, e) && carries(t, r)
+        may_hold_pointer(t.cx, ty) && (steps_in(t, r) || is_array_type(texpr_type(r)) || at_the_value(t, r)) &&
+            path_ok(t, e) && carries(t, r)
 
     // A view cut from, or seen as, what is read through is read through as well.
     TSlice(base, _, _, _, ty) -> t.through && may_hold_pointer(t.cx, ty) && carries(t, base)
@@ -2886,6 +2997,17 @@ private carries(t: &Track, e: TExpr) -> bool = *e.kind match
     TCFor(_, _, _, body, else_block, _) -> loop_carries(t, body, else_block)
     _ -> false
 
+// Whether a step through `x` reads the value a walk of the value itself follows: `*c`, where `c` holds
+// the address of a copy of the parameter.
+private at_the_value(t: &Track, x: TExpr) -> bool
+    if t.through || t.steps != 0 then return false
+
+    for s in ptr_steps(t, x)
+        if s == -1 then return true
+
+    false
+end at_the_value
+
 // A step through the tracked pointer into what it points at: `&p.x`, `&p[i]`, `&*p`.
 private into_pointee(t: &Track, place: TExpr) -> bool = *place.kind match
     TDeref(x, _) -> carries(t, x)
@@ -2911,9 +3033,19 @@ private hands_on(t: &Track, arg: TExpr) -> bool = !is_integer_type(texpr_type(ar
 // `usize(p)`, is a number like any other.
 private holds_it(t: &Track, e: TExpr) -> bool = t.raw || may_hold_pointer(t.cx, texpr_type(e))
 
+// In a walk of the value itself, a field or element in place of a local holding it may be the copy:
+// `h.p = a` then `&h.p`.
 private holds_local(t: &Track, place: TExpr) -> bool = *place.kind match
     TLoad(n, _) -> t.holds(n)
+    TField(_, _, _) -> value_walk(t) && part_held(t, place)
+    TIndex(_, _, _) -> value_walk(t) && part_held(t, place)
     _ -> false
+
+private value_walk(t: &Track) -> bool = !t.through && t.steps == 0
+
+private part_held(t: &Track, place: TExpr) -> bool = local_root(t.refs, place) match
+    Some(n) -> t.holds(n) && carries(t, place)
+    None -> false
 
 private boxed(ty: Type) -> bool = ty match
     Ref(_, _) -> true
@@ -2928,6 +3060,11 @@ private call_carries(t: &Track, name: string, args: Buf[TExpr], ty: Type) -> boo
         if !carries(t, args.at(i)) then continue
         if answers_arg(t.cx, name, args, i, ty, t.raw) then return true
         if reads_on(t, args.at(i)) && answers_read(t, name, args, i) then return true
+
+        // An answer read out as far in as the value sits is the value: `get(&b)` answering `*p`.
+        for k in value_reads(t, args.at(i))
+            if read_answers_of(t.cx, name, i, k) then return true
+    end for
 
     false
 end call_carries
@@ -4239,6 +4376,10 @@ end frame_pread_locs
 
 // Whether a callee's location is storage reached through its own parameter at `j`.
 private put_back(loc: string, j: usize) -> bool = loc.starts_with(s"p$j:") || loc.starts_with(s"d:p$j:")
+
+// Whether a callee's location is the storage its parameter at `j` points at, in place -- not storage
+// reached through a pointer read out of it, which may be anybody's.
+private in_place_of(loc: string, j: usize) -> bool = loc.starts_with(s"p$j:")
 
 // **Whether everything a pointer argument reaches is this frame's own storage**: the locals it points
 // at, and everything their storage holds the address of, at any depth, with no address in any of it

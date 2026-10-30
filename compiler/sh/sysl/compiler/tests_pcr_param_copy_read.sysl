@@ -1,0 +1,472 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// What a body keeps of its parameter (`keeps.sysl`'s `keeps_of`) when the parameter's value is copied
+// into a local and the local's ADDRESS goes to a callee that lets out what it reads through it: `var b
+// = a` then `f1(&b)`, where `f1(p: **int)` stores `*p` in module storage, keeps `a` as surely as
+// `held = a` does. The walk of the value counts the steps from the copy (`ptr_steps`: the copy at 0,
+// `&b` at −1, `&c` with `c = &b` at −2) and asks the callee what it lets out that many steps in
+// (`value_reads` → `read_of`), what it answers from there (`read_answers_of`), and takes `*c` as the
+// value. `reference/memory.md § An address held inside what is handed over` is the specification.
+//
+// The matrix crosses where the copy sits (a local, a second local, a field of a local, behind a second
+// address) with how it gets there (a loop, a branch) and who reads it out (a function, a closure, a
+// nested function, a closure called with it, a callee answering it, a plain `*`). The negatives are a
+// copy only read, compared or written through, a module address copied the same way, and a heap
+// object's address.
+//
+// Skipped cells, and why: a call through a trait object or a function pointer asks the same
+// `vcall_reads` / `pointer_reads` the borrow rule does (`tests_bth_borrow_through.sysl` covers those
+// callees); a copy made by a callee storing into a local is `bind_call`, the path the direct copy
+// takes. Known conservative refusal: a local's copies are gathered flow-insensitively, so a copy
+// overwritten with a module address before the call is still refused, as `held = b` after the same
+// overwrite always has been (`pcr_reassigned_before_the_call`, ignored).
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private pcr_outcome(text: string) -> (string, int)
+    val root = make_temp_dir("sysl-pcr").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", pcr_prelude + text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (failure_text(why), -1)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> ("the program that was built could not be run", -1)
+        Ok(out) -> (out.text + out.err.unwrap_or(""), shell_status(out.status))
+end pcr_outcome
+
+private pcr_prints(text: string, want: string)
+    if xvr_no_library() then return
+
+    val out = pcr_outcome(text)
+
+    assert_eq(out.0, want)
+    assert_eq(out.1, 0)
+end pcr_prints
+
+private pcr_refused(text: string, part: string)
+    if xvr_no_library() then return
+
+    val out = pcr_outcome(text)
+
+    assert_eq(out.1, -1, out.0)
+    assert(out.0.index_of(part).is_some(), out.0)
+end pcr_refused
+
+// Module storage to keep an address in, and a callee that keeps what it reads one step through its
+// parameter.
+private const pcr_prelude: string = raw"""
+    var spare = 7
+    var held: *int = &spare
+
+    f1(p: **int)
+        held = *p
+
+    """
+
+private pcr_kept(how: string) -> string =
+    s"'key' keeps its parameter 'a' ($how), and '&y' is the address of a local of 'other'"
+
+private pcr_lets_out(callee: string) -> string =
+    pcr_kept(s"it is passed to '$callee', which lets what it reads through it out")
+
+// -- refused: the copy's address reaches a callee that lets it out ----------------------------------
+
+@test("a parameter copied into a local whose address goes to a callee storing what it reads")
+pcr_copy_in_a_local()
+    pcr_refused(raw"""
+        key(a: *int)
+            var b = a
+            f1(&b)
+
+        other()
+            var y = 5
+            key(&y)
+
+        main()
+            other()
+            print(*held)
+        """, pcr_lets_out("f1"))
+
+@test("the parameter's own address, handed to the same callee")
+pcr_param_address()
+    pcr_refused(raw"""
+        key(a: *int)
+            f1(&a)
+
+        other()
+            var y = 5
+            key(&y)
+
+        main()
+            other()
+            print(*held)
+        """, pcr_lets_out("f1"))
+
+@test("a copy of a copy")
+pcr_copy_through_two_locals()
+    pcr_refused(raw"""
+        key(a: *int)
+            var b = a
+            var c = b
+            f1(&c)
+
+        other()
+            var y = 5
+            key(&y)
+
+        main()
+            other()
+            print(*held)
+        """, pcr_lets_out("f1"))
+
+@test("a copy stored into a field of a local, the field's address handed over")
+pcr_copy_in_a_field()
+    pcr_refused(raw"""
+        struct H
+            p: *int
+
+        key(a: *int)
+            var h = H(&spare)
+            h.p = a
+            f1(&h.p)
+
+        other()
+            var y = 5
+            key(&y)
+
+        main()
+            other()
+            print(*held)
+        """, pcr_lets_out("f1"))
+
+@test("the address of a local holding the copy's address, read two steps in")
+pcr_copy_behind_two_addresses()
+    pcr_refused(raw"""
+        f2(pp: ***int)
+            held = **pp
+
+        key(a: *int)
+            var b = a
+            var c = &b
+            f2(&c)
+
+        other()
+            var y = 5
+            key(&y)
+
+        main()
+            other()
+            print(*held)
+        """, pcr_lets_out("f2"))
+
+@test("a copy made in a loop")
+pcr_copy_in_a_loop()
+    pcr_refused(raw"""
+        key(a: *int)
+            var b = &spare
+
+            for i in 0..<3
+                if i == 2 then b = a
+
+            f1(&b)
+
+        other()
+            var y = 5
+            key(&y)
+
+        main()
+            other()
+            print(*held)
+        """, pcr_lets_out("f1"))
+
+@test("a copy made in one arm of a branch")
+pcr_copy_in_a_branch()
+    pcr_refused(raw"""
+        key(a: *int, n: int)
+            val b = if n > 0 then a else &spare
+            var c = b
+            f1(&c)
+
+        other()
+            var y = 5
+            key(&y, 1)
+
+        main()
+            other()
+            print(*held)
+        """, pcr_lets_out("f1"))
+
+@test("a closure handing the copy's address to the callee")
+pcr_closure_hands_it_on()
+    pcr_refused(raw"""
+        key(a: *int)
+            var b = a
+            val g = () -> f1(&b)
+            g()
+
+        other()
+            var y = 5
+            key(&y)
+
+        main()
+            other()
+            print(*held)
+        """, pcr_kept("it is captured by a closure, which lets what it reads out"))
+
+@test("a closure called with the copy's address, storing what it reads")
+pcr_closure_is_the_callee()
+    pcr_refused(raw"""
+        key(a: *int)
+            var b = a
+            val g = (p: **int) -> held = *p
+            g(&b)
+
+        other()
+            var y = 5
+            key(&y)
+
+        main()
+            other()
+            print(*held)
+        """, pcr_lets_out("call"))
+
+@test("a nested function called with the copy's address, storing what it reads")
+pcr_nested_function()
+    pcr_refused(raw"""
+        key(a: *int)
+            var b = a
+
+            stash(p: **int)
+                held = *p
+
+            stash(&b)
+
+        other()
+            var y = 5
+            key(&y)
+
+        main()
+            other()
+            print(*held)
+        """, pcr_lets_out("stash"))
+
+@test("a callee answering what it reads through the copy's address, the answer stored")
+pcr_answered()
+    pcr_refused(raw"""
+        get(p: **int) -> *int = *p
+
+        key(a: *int)
+            var b = a
+            held = get(&b)
+
+        other()
+            var y = 5
+            key(&y)
+
+        main()
+            other()
+            print(*held)
+        """, pcr_kept("it is stored in 'held'"))
+
+@test("the copy read back through its own address and stored")
+pcr_read_back_and_stored()
+    pcr_refused(raw"""
+        key(a: *int)
+            var b = a
+            val c = &b
+            held = *c
+
+        other()
+            var y = 5
+            key(&y)
+
+        main()
+            other()
+            print(*held)
+        """, pcr_kept("it is stored in 'held'"))
+
+@test("a parameter captured by a closure whose body stores it through another parameter")
+pcr_captured_param_stored()
+    pcr_refused(raw"""
+        struct Ds
+            via: *int
+
+        bring(ds: *Ds, p: *int)
+            ds.via = p
+
+        run(f: () -> unit)
+            f()
+
+        key(ds: *Ds, a: *int)
+            run(() -> bring(ds, a))
+
+        var dsg = Ds(&spare)
+
+        other()
+            var y = 5
+            key(&dsg, &y)
+
+        main()
+            other()
+            print(*dsg.via)
+        """, pcr_kept("it is captured by a closure, which lets what it reads out"))
+
+// -- accepted: nothing of the parameter outlives the call ---------------------------------------------
+
+@test("a closure capturing the copy whose body only reads it")
+pcr_closure_only_reads()
+    pcr_prints(raw"""
+        run(f: () -> int) -> int = f()
+
+        key(a: *int)
+            var b = a
+            print(run(() -> *b + 1))
+
+        other()
+            var y = 5
+            key(&y)
+
+        main()
+            other()
+            print(*held)
+        """, "6\n7\n")
+
+@test("a closure capturing a parameter, its body handing it to callees that put it back where it points")
+pcr_closure_puts_back()
+    pcr_prints(raw"""
+        import sysl.buf.{Buf, buf}
+
+        struct M
+            first: int
+            pair: *int
+
+        couple(m: *M)
+            m.pair = &m.first
+
+        inside(path: *Buf[int], go: () -> int) -> int
+            path.push(1)
+            val out = go()
+            path.pop()
+            out
+
+        key(m: *M, path: *Buf[int]) -> int
+            inside(path, () ->
+                couple(m)
+                path.push(*m.pair)
+                int(path.len()))
+
+        other()
+            var m = M(3, &spare)
+            var path: Buf[int] = buf()
+            print(key(&m, &path))
+            print(*m.pair)
+
+        main()
+            other()
+            print(*held)
+        """, "2\n3\n7\n")
+
+
+@test("a copy only read, compared and written through by the callees it is lent to")
+pcr_only_read()
+    pcr_prints(raw"""
+        look(p: **int) -> int = **p
+
+        same(p: **int, q: *int) -> bool = *p == q
+
+        poke(p: **int, v: int)
+            **p = v
+
+        key(a: *int)
+            var b = a
+            poke(&b, look(&b) + 1)
+            print(same(&b, a))
+            print(same(&b, &spare))
+
+        other()
+            var y = 5
+            key(&y)
+            print(y)
+
+        main()
+            other()
+            print(*held)
+        """, "true\nfalse\n6\n7\n")
+
+@test("a module address copied the same way, beside a parameter that is only read")
+pcr_module_address()
+    pcr_prints(raw"""
+        var other_spare = 9
+
+        key(a: *int)
+            var b = &other_spare
+            var c = b
+            f1(&c)
+            print(*a)
+
+        other()
+            var y = 5
+            key(&y)
+
+        main()
+            other()
+            print(*held)
+        """, "5\n9\n")
+
+@test("a heap object's address in a local, its address handed to a callee keeping what it reads")
+pcr_heap_address()
+    pcr_prints(raw"""
+        struct N
+            v: int
+
+        var kept: Option[&N] = None
+
+        f3(p: *&N)
+            kept = Some(*p)
+
+        key(a: *int)
+            var b: &N = N(*a)
+            f3(&b)
+
+        other()
+            var y = 5
+            key(&y)
+
+        main()
+            other()
+            print(kept.unwrap().v)
+        """, "5\n")
+
+@test("a copy overwritten with a module address before its address is handed over", ignore: "a local's copies are gathered flow-insensitively, as for 'held = b' after the same overwrite")
+pcr_reassigned_before_the_call()
+    pcr_prints(raw"""
+        key(a: *int)
+            var b = a
+            print(*b)
+            b = &spare
+            f1(&b)
+
+        other()
+            var y = 5
+            key(&y)
+
+        main()
+            other()
+            print(*held)
+        """, "5\n7\n")
