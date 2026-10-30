@@ -2,7 +2,7 @@ module sh.sysl.compiler
 @tests
 
 import sysl.buf.{Buf, buf}
-import sysl.fs.remove_dir_all
+import sysl.fs.{is_file, remove_dir_all}
 import sysl.process.capture
 import sysl.text.{join, Search}
 
@@ -236,3 +236,106 @@ pkc_the_probed_flags_reach_the_tools()
     remove_dir_all(root).unwrap_or(())
     remove_dir_all(lib).unwrap_or(())
     assert_eq(said, "true\n")
+
+// -- what only a C++ compiler means ----------------------------------------------------------------
+
+// A C++ library's `.pc` names its language standard (Manifold's says `-std=c++17`), and every
+// compilation the answer feeds is C, where clang refuses it outright. Each way of spelling a C++
+// standard is dropped, and so is `-stdlib=`; a C standard, `-I` and `-D` are not, in their order.
+@test("drops a C++ standard in every spelling and -stdlib, and keeps a C standard, -I and -D")
+pkc_cxx_flags_are_dropped_from_the_answer()
+    val tool = pkc_fake_tool("-I/x/inc -std=c++17 -DFOO=3 -std=gnu++20 --std=c++2b --std c++17 " +
+                             "-stdlib=libc++ -std=c11 --std gnu17 -std=gnu11 -Wall", "-L/x/lib -lx")
+    val got = pkc_config_query_text("pkcfake")
+
+    pkc_drop_tool(tool)
+    assert_eq(got, "cflags: -I/x/inc | -DFOO=3 | -std=c11 | --std | gnu17 | -std=gnu11 | -Wall; " +
+                   "ldflags: -L/x/lib | -lx")
+
+// The edges of the word rules, taken one at a time: a lone `-std` at the end has no standard after
+// it to judge and is left for clang to say what it makes of it, and a standard's name only counts
+// where it is a C++ one from its first letter.
+@test("judges a two-word standard by its second word, and keeps a trailing -std alone")
+pkc_cxx_flags_edges()
+    assert_eq(pkc_for_c(["-std", "c++17", "-DX"]), "-DX")
+    assert_eq(pkc_for_c(["--std", "gnu++14"]), "")
+    assert_eq(pkc_for_c(["-std", "c99"]), "-std | c99")
+    assert_eq(pkc_for_c(["-I/a", "-std"]), "-I/a | -std")
+    assert_eq(pkc_for_c(["-std=xc++17", "-std=", "-DSTD=c++17"]), "-std=xc++17 | -std= | -DSTD=c++17")
+    assert_eq(pkc_for_c([]), "")
+
+private pkc_for_c(words: []string) -> string
+    var given: Buf[string] = buf()
+
+    for i in 0..<words.len
+        given.push(words[i])
+
+    join(cflags_for_c(given).view(), " | ")
+end pkc_for_c
+
+// A header in a directory of its own, a `.pc` answer of `-I` that directory and then `flags`, and a
+// module that both measures `FOO` through a `c const` and calls a shim compiled under the same flags
+// -- the two compilations the answer feeds -- printing `FOO * 10 + FOO`.
+private pkc_cxx_built(flags: string, header: string) -> string
+    val lib = pkc_tree("sysl-pkc-cxxlib", ["pkcxx.h", header])
+    val tool = pkc_fake_tool(s"-I$lib $flags", "")
+    val root = pkc_tree("sysl-pkc-cxx", ["sysl.hocon",
+        "package { name = \"app\", version = \"0.1.0\" }\n" +
+        "requires { os = true, heap = true, pkg_config { pkcfake = \"pkcfake — a header this test writes\" } }\n",
+        "main.sysl", "print(demo.both())\n",
+        "demo/demo.sysl", "module demo\n\n@include(\"pkcxx.h\")\n\nc const\n    FOO_VAL: int = \"FOO\"\n\n" +
+                          "extern \"pkcxx_foo\" c_foo() -> int\n\nboth() -> int = FOO_VAL * 10 + c_foo()\n",
+        "demo/shim.c", "#include \"pkcxx.h\"\nint pkcxx_foo(void) { return FOO; }\n"])
+    val said = pkc_ran(root)
+
+    pkc_drop_tool(tool)
+    remove_dir_all(root).unwrap_or(())
+    remove_dir_all(lib).unwrap_or(())
+    said
+end pkc_cxx_built
+
+// A header that a C++ compilation of it would refuse, so the case also says the file was read as C.
+private const PkcCHeader: string = "#ifdef __cplusplus\n#error read as C++\n#endif\n"
+
+@test("so a C++ standard in --cflags no longer stops a c const or a shim compiling")
+pkc_cxx_standard_does_not_reach_clang()
+    if !pkc_ready() then return
+
+    assert_eq(pkc_cxx_built("-std=c++17 -DFOO=3", PkcCHeader), "33\n")
+
+@test("and nor does a GNU C++ standard, or one spelled as two words, or -stdlib")
+pkc_gnu_cxx_standard_does_not_reach_clang()
+    if !pkc_ready() then return
+
+    assert_eq(pkc_cxx_built("-std=gnu++20 -DFOO=3", PkcCHeader), "33\n")
+    assert_eq(pkc_cxx_built("--std c++17 -stdlib=libc++ -DFOO=3", PkcCHeader), "33\n")
+
+// **Kept, and proved to reach clang**: the header refuses anything but C11, which is not clang's
+// default, so the build only succeeds where `-std=c11` was on both command lines.
+@test("while a C standard in --cflags reaches both compilations")
+pkc_c_standard_reaches_clang()
+    if !pkc_ready() then return
+
+    val c11 = "#if !defined(__STDC_VERSION__) || __STDC_VERSION__ != 201112L\n#error not C11\n#endif\n"
+
+    assert_eq(pkc_cxx_built("-std=c11 -DFOO=3", c11), "33\n")
+    assert(pkc_cxx_built("-DFOO=3", c11).starts_with("build failed: "),
+           "the C11 header compiled without -std=c11, so it proves nothing")
+
+// The report that found it: Manifold's own `.pc`, asked of this machine's `pkg-config`, where it is
+// installed. Elsewhere the fake-tool cases above carry the claim.
+@test("and Manifold's C API is measured through its own .pc, where it is installed")
+pkc_manifold_c_api()
+    if !pkc_ready() then return
+
+    if !is_file("/opt/homebrew/opt/manifold/lib/pkgconfig/manifold.pc")
+        print("skipped: Manifold is not installed")
+        return
+
+    val root = pkc_project("manifold = \"Manifold — brew install manifold\"", "os = true, heap = true",
+        "@include(\"manifold/manifoldc.h\")\n\nc const\n    INTERSECT: int = \"MANIFOLD_INTERSECT\"\n\n" +
+        "print(INTERSECT)\n")
+    val said = pkc_ran(root)
+
+    remove_dir_all(root).unwrap_or(())
+    assert_eq(said, "2\n")

@@ -66,11 +66,49 @@ pkg_config_query(pc: string) -> Result[PkgAnswer, string]
 
     if ran(exists).is_none() then return Err(s"'$PkgTool' knows no '$pc'")
 
-    val c = flags_of(pc, "--cflags")?
+    val c = cflags_for_c(flags_of(pc, "--cflags")?)
     val l = flags_of(pc, "--libs")?
 
     Ok(PkgAnswer(c, l, buf()))
 end pkg_config_query
+
+// A module's `--cflags` less what only a C++ compilation means, since everything sysl hands clang is C.
+//
+// **A C++ library's `.pc` names its language standard**: Manifold's says `-std=c++17`, and clang
+// refuses that on a C file outright (`invalid argument '-std=c++17' not allowed with 'C'`), so a
+// package binding the library's C API could not compile one shim or measure one `c const`. Dropped:
+// a `-std=`/`--std=` naming `c++…` or `gnu++…`, the same as two words (`--std c++17`), and
+// `-stdlib=`, which clang calls unused on C and which `-Werror` turns into a refusal. **A C standard
+// is kept**, as is every `-I`, `-D` and anything else, since those mean the same to a C compilation.
+//
+// **Done here, where the answer is made, so there is one answer**: the compilation, the probe that
+// measures a `c const` and every cache keyed by the command line all see the same flags.
+cflags_for_c(words: Buf[string]) -> Buf[string]
+    var out: Buf[string] = buf()
+    var i: usize = 0
+
+    while i < words.len()
+        val w = words.at(i)
+
+        if (w == "-std" || w == "--std") && i + 1 < words.len() && names_cxx(words.at(i + 1))
+            i += 2
+        else
+            if !cxx_only(w) then out.push(w)
+
+            i += 1
+
+    out
+end cflags_for_c
+
+// Whether one word of a `--cflags` answer means something only to a C++ compilation.
+private cxx_only(w: string) -> bool
+    if w.starts_with("-std=") then return names_cxx(w[5..<w.bytes.len])
+    if w.starts_with("--std=") then return names_cxx(w[6..<w.bytes.len])
+
+    w.starts_with("-stdlib=") || w.starts_with("--stdlib=")
+
+// Whether a language standard's name is a C++ one: `c++17`, `gnu++20`, `c++2b`.
+private names_cxx(standard: string) -> bool = standard.starts_with("c++") || standard.starts_with("gnu++")
 
 // What a library that is to come from its archive needs besides `pkg_config_query`'s answer:
 // `--static --libs`, which adds the libraries it links **privately** -- a shared library carries

@@ -1909,6 +1909,13 @@ compile *and* its library to link, and having one of those is not a build. `--cf
 compilation in the tree and `--libs` feeds the link line — including the `-Wl,-rpath` that decides
 whether a dynamically-linked program finds its library at **run** time.
 
+**What `--cflags` says only to a C++ compiler is left out, because every compilation it feeds is C.**
+A C++ library with a C API names its own language standard: Manifold's `manifold.pc` says
+`Cflags: -I${includedir} -std=c++17`, and clang refuses `-std=c++17` on a C file outright. So a
+`-std=` or `--std=` naming a `c++…` or `gnu++…` standard (one word or two) is dropped, as is
+`-stdlib=`, which clang calls unused on C and `-Werror` makes a refusal. A C standard (`-std=c11`),
+every `-I`, every `-D` and everything else reach clang as `pkg-config` printed them.
+
 **A hand-written `--link-path` used to leave that last part out, and no longer does.** Until 0.0.104
 it emitted `-L` and nothing else, so a library whose install name is `@rpath/…` — what CMake writes
 for any library given a `SOVERSION` — linked cleanly and then failed to start, naming a library
