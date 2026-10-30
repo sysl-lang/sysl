@@ -2419,6 +2419,39 @@ print(half(10), half(7))
 ones: an early `return` that violates the postcondition traps exactly as the fall-through path
 would. Both take an optional message after a comma.
 
+**The message is any `string` the compiler can compute**, the same reading an `@assert`'s message
+gets: a literal, a `const`, a `val` that folds, a concatenation of them, a name from another module.
+`invariant` takes its message the same way.
+
+```sysl
+const Negative = "x must not be negative"
+
+half(x: int) -> int
+    require x >= 0, Negative
+    ensure result >= 0, "half of " + "a non-negative"
+
+    x / 2
+
+print(half(10))
+```
+
+```output
+5
+```
+
+A message that cannot be worked out while compiling is refused, naming the clause:
+
+```sysl
+check(x: int, why: string) -> int
+    require x >= 0, why
+
+    x
+```
+
+```error
+the message of this 'require' cannot be computed while compiling
+```
+
 **Both kinds form one block at the top of the body.** A clause of either kind after an ordinary
 statement is rejected: a precondition that runs after some of the work is not a precondition, and a
 postcondition is *written* there because that is where a reader looks for what the function
