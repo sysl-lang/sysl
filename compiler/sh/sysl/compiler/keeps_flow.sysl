@@ -650,6 +650,10 @@ struct Origins
     // from their binding on (`stable_name`).
     binders: Map[string, int]
     unstable: Map[string, bool]
+
+    // The locals and parameters a field of which is written in the body: one of their box handles may
+    // have been pointed at another box (`handle_origin`).
+    reshaped: Map[string, bool]
 end Origins
 
 origins_of(cx: &KeepsCx, f: TFunc) -> &Origins
@@ -662,7 +666,7 @@ origins_of(cx: &KeepsCx, f: TFunc) -> &Origins
         None -> ()
 
     val logged = cx.reads.len()
-    val o: &Origins = Origins(cx, f.params, buf(), map(), false, map(), map())
+    val o: &Origins = Origins(cx, f.params, buf(), map(), false, map(), map(), map())
 
     walk_block_stmts(f.body, stmt_walk(false, s -> s match
         TRefDecl(n, _, place) -> o.refs.push((n, place))
@@ -773,7 +777,10 @@ private bound(o: &Origins, n: string) = o.binders.put(n, o.binders.get(n).unwrap
 private written_name(o: &Origins, place: TExpr)
     *place.kind match
         TLoad(n, _) -> o.unstable.put(n, true)
-        _ -> ()
+        _ ->
+            local_root(o.refs, place) match
+                Some(n) -> o.reshaped.put(n, true)
+                None -> ()
 end written_name
 
 private origin_assign(o: &Origins, n: string, org: string)
@@ -829,6 +836,7 @@ origin_of(o: &Origins, x: TExpr) -> string
         TNullLit(_) -> "-"
         TCall(name, args, cty, _) -> if ptrish then call_origin(o, name, args, cty) else "-"
         TSeq(exprs) -> if exprs.is_empty() then "-" else origin_of(o, exprs.at(exprs.len() - 1))
+        TField(r, _, fty) -> handle_origin(o, r, fty)
         TBlockExpr(b) -> block_origin(o, b)
         TIf(_, then_block, else_block, _) ->
             if else_block.is_none() then return ""
@@ -843,6 +851,31 @@ origin_of(o: &Origins, x: TExpr) -> string
             out
         _ -> if ptrish then "" else "-"
 end origin_of
+
+// **A box handle held in a value points where that value's pointers do**: `self.core`, read out of a
+// `Buf` handed by value, names the box the caller's `Buf` names, so what a callee stores in the box is
+// held through the parameter -- and the caller says what that is (`keeps_vessel.sysl`). Only a handle
+// read straight out of a local or a parameter none of whose fields the body writes, since a written
+// field, a rebinding or a taken address may name another box.
+private handle_origin(o: &Origins, r: TExpr, fty: Type) -> string
+    val other = if may_hold_pointer(o.cx, fty) then "" else "-"
+    val is_ref = fty match
+        Ref(_, _) -> true
+        _ -> false
+    val held_in_value = texpr_type(r) match
+        Struct(_) -> true
+        _ -> false
+
+    if !is_ref || !held_in_value then return other
+
+    *r.kind match
+        TLoad(n, _) ->
+            for item in o.refs
+                if item.0 == n then return other
+
+            if o.reshaped.has(n) || o.unstable.has(n) then other else origin_of(o, r)
+        _ -> other
+end handle_origin
 
 private block_origin(o: &Origins, b: TBlock) -> string =
     if b.result.is_some() then origin_of(o, b.result.unwrap()) else "-"
@@ -1029,6 +1062,10 @@ private[compiler] field_label(t: Type, index: int) -> string = t match
     Struct(d) -> if index >= 0 && usize(index) < d.fields.len() then d.fields.at(usize(index)).0 else s"#$index"
     _ -> s"#$index"
 
+// The element a buffer's slots are held at (`keeps.sysl`'s `slot_loc`): one nobody can name, and one
+// that only a buffer the frame made itself makes the frame's (`keeps_vessel.sysl`).
+val SlotsMark = "[?slot]"
+
 // A callee's location said in the caller's terms: one through the callee's `j`th parameter is one
 // through what the caller handed it there.
 translate_loc(o: &Origins, args: Buf[TExpr], callee_loc: string) -> string
@@ -1052,7 +1089,13 @@ translate_loc(o: &Origins, args: Buf[TExpr], callee_loc: string) -> string
         val prefix = s"p$j:"
 
         if loc.starts_with(prefix)
-            var base = origin_of(o, args.at(j))
+            // A buffer read through a pointer (`w.push(v)`, `w: *Buf[T]`) holds its slots where the
+            // pointer points: the buffer's place, which the caller names.
+            val slots_through = *args.at(j).kind match
+                TDeref(x, _) -> if loc.index_of(SlotsMark).is_some() then Some(x) else None
+                _ -> None
+
+            var base = origin_of(o, slots_through.unwrap_or(args.at(j)))
 
             if base == "-" then return ""
 
@@ -1066,6 +1109,10 @@ translate_loc(o: &Origins, args: Buf[TExpr], callee_loc: string) -> string
             end if
 
             if base == "" then return ""
+
+            // **A slice's slots are the frame's only where the frame made the buffer** (`SlotsMark`):
+            // a slice in a local struct may view any storage at all, so its slots are held anywhere.
+            if base.starts_with("l:") && loc.index_of(SlotsMark).is_some() then return ""
 
             return bounded_loc(base + loc[prefix.bytes.len..<loc.bytes.len])
         end if

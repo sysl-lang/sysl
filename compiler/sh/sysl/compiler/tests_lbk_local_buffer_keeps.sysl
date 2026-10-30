@@ -1,0 +1,610 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// **A push into a buffer the frame made keeps nothing past the call** (`keeps_vessel.sysl`,
+// `reference/memory.md § Taken back before it returns`): a value placed in a buffer's slots is held as
+// long as the buffer is, and a local buffer no one else names ends with its frame. FunL's
+// `compare_terms` pushes its parameters onto a local worklist, and every closure calling it was
+// refused as keeping what it is handed.
+//
+// The matrix crosses where the buffer comes from (made here, a parameter by value, one by address,
+// a `ref`, a copy of module storage, one a callee may repoint), how it gets out (returned, stored in
+// module storage, a field, a parameter's pointee, pushed onto a kept buffer, captured by a closure that
+// is stored, handed to a callee that keeps it), what is read back out of it and kept (popped straight
+// into module storage, popped by a helper it is lent to, copied out whole by one, moved into another
+// local buffer that then escapes), and the shape of the code doing it (a buffer of pointers or of
+// structs holding one, a buffer nested in a buffer, a generic function, a method, a closure at an
+// unmarked and a `@keeps` type). Skipped: a buffer in a field of a local struct (`s.work.push(a)`) is
+// still held anywhere, since the slots are found only through a local holding the handle itself; a
+// closure capturing the buffer refuses even where the closure stays in the frame, since what a
+// by-reference capture may write is not followed.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private lbk_outcome(text: string) -> (string, int)
+    val root = make_temp_dir("sysl-lbk").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", lbk_prelude + text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (failure_text(why), -1)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> ("the program that was built could not be run", -1)
+        Ok(out) -> (out.text + out.err.unwrap_or(""), shell_status(out.status))
+end lbk_outcome
+
+private lbk_prints(text: string, want: string)
+    if xvr_no_library() then return
+
+    val out = lbk_outcome(text)
+
+    assert_eq(out.0, want)
+    assert_eq(out.1, 0)
+end lbk_prints
+
+private lbk_refused(text: string, part: string)
+    if xvr_no_library() then return
+
+    val out = lbk_outcome(text)
+
+    assert_eq(out.1, -1, out.0)
+    assert(out.0.index_of(part).is_some(), out.0)
+end lbk_refused
+
+private const lbk_prelude: string = raw"""
+    import sysl.buf.{Buf, buf}
+
+    struct P
+        p: *int
+
+    struct Holder
+        b: Buf[*int]
+
+    var held: Buf[*int] = buf()
+    var held_p: Buf[P] = buf()
+    var nest: Buf[Buf[*int]] = buf()
+    var holder = Holder(buf())
+    var g1 = 5
+    var g2 = 7
+
+    """
+
+private lbk_kept(callee: string, how: string, owner: string) -> string =
+    s"'$callee' keeps its parameter 'a' ($how), and '&x' is the address of a local of '$owner'"
+
+private val lbk_pushed = "it is passed to 'push', which keeps it"
+
+// -- the reduction --------------------------------------------------------------------------------
+
+@test("a parameter pushed onto a local buffer and popped back is not kept")
+lbk_reduction()
+    lbk_prints(raw"""
+        key(a: *int) -> int
+            var work: Buf[*int] = buf()
+            work.push(a)
+            *work.pop().unwrap()
+
+        f() -> int
+            var x = 5
+            key(&x)
+
+        main()
+            print(f())
+        """, "5\n")
+
+@test("a worklist comparison, lent to a helper that pushes onto it, is called from a sort's closure")
+lbk_worklist()
+    lbk_prints(raw"""
+        import sysl.slices.sort_by
+
+        push_parts(work: *Buf[*int], a: *int, b: *int)
+            work.push(b)
+            work.push(a)
+
+        compare(a: *int, b: *int) -> int
+            var work: Buf[*int] = buf()
+            work.push(b)
+            work.push(a)
+
+            while work.len() > 0
+                val x = work.pop().unwrap()
+                val y = work.pop().unwrap()
+
+                if *x != *y then return if *x < *y then -1 else 1
+                if *x > 100 then push_parts(&work, x, y)
+
+            0
+
+        main()
+            var x = 5
+            var y = 7
+            print(compare(&x, &y))
+            var xs = [&g2, &g1]
+            sort_by(xs[..], (a, b) -> compare(a, b) < 0)
+            print(*xs[0])
+        """, "-1\n5\n")
+
+// -- the shapes that stay in the frame ---------------------------------------------------------------
+
+@test("a buffer of structs holding the pointer is the frame's as well")
+lbk_values()
+    lbk_prints(raw"""
+        values(a: *int) -> int
+            var work: Buf[P] = buf()
+            work.push(P(a))
+            *work.pop().unwrap().p
+
+        main()
+            var x = 5
+            print(values(&x))
+        """, "5\n")
+
+@test("a local buffer pushed onto another local buffer is the frame's")
+lbk_nested()
+    lbk_prints(raw"""
+        nested(a: *int) -> int
+            var outer: Buf[Buf[*int]] = buf()
+            var inner: Buf[*int] = buf()
+            inner.push(a)
+            outer.push(inner)
+            *outer.pop().unwrap().pop().unwrap()
+
+        main()
+            var x = 5
+            print(nested(&x))
+        """, "5\n")
+
+@test("a local buffer handed to a helper that only reads it is the frame's")
+lbk_reading_helper()
+    lbk_prints(raw"""
+        count(b: Buf[*int]) -> usize = b.len()
+
+        helper(a: *int) -> usize
+            var work: Buf[*int] = buf()
+            work.push(a)
+            count(work)
+
+        main()
+            var x = 5
+            print(helper(&x))
+        """, "1\n")
+
+@test("a generic function's local buffer is the frame's")
+lbk_generic()
+    lbk_prints(raw"""
+        generic[T](a: T) -> T
+            var work: Buf[T] = buf()
+            work.push(a)
+            work.pop().unwrap()
+
+        main()
+            var x = 5
+            print(*generic(&x))
+        """, "5\n")
+
+@test("a method's local buffer is the frame's")
+lbk_method()
+    lbk_prints(raw"""
+        struct Walker
+            n: int
+
+            walk(self, a: *int) -> int
+                var work: Buf[*int] = buf()
+                work.push(a)
+                self.n + *work.pop().unwrap()
+
+        main()
+            var x = 5
+            print(Walker(1).walk(&x))
+        """, "6\n")
+
+@test("a closure at an unmarked type may push what it is handed onto a buffer of its own")
+lbk_closure_unmarked()
+    lbk_prints(raw"""
+        apply(f: &Fn(*int) -> int, p: *int) -> int = f(p)
+
+        main()
+            var x = 5
+            print(apply((p) ->
+                var work: Buf[*int] = buf()
+                work.push(p)
+                *work.pop().unwrap() + 1, &x))
+        """, "6\n")
+
+@test("a closure at a '@keeps' type may push onto a buffer of its own, and module storage is handed")
+lbk_closure_marked()
+    lbk_prints(raw"""
+        apply(f: &Fn(@keeps *int) -> int, p: *int) -> int = f(p)
+
+        main()
+            print(apply((p) ->
+                var work: Buf[*int] = buf()
+                work.push(p)
+                *work.pop().unwrap() + 2, &g1))
+        """, "7\n")
+
+@test("a '@keeps' type still keeps by what it says, whatever the closure does with a buffer of its own")
+lbk_closure_marked_says()
+    lbk_refused(raw"""
+        apply(f: &Fn(@keeps *int) -> int, p: *int) -> int = f(p)
+
+        run() -> int
+            var x = 5
+            apply((p) ->
+                var work: Buf[*int] = buf()
+                work.push(p)
+                *work.pop().unwrap() + 2, &x)
+
+        main()
+            print(run())
+        """, "'apply' keeps its parameter 'p' (it is passed to a call through '&Fn(@keeps *int) -> int', " +
+            "which keeps it), and '&x' is the address of a local of 'run'")
+
+// -- the ways the buffer gets out ------------------------------------------------------------------------
+
+@test("a local buffer returned is followed as the answer, and refused where it leaves the caller's frame")
+lbk_returned()
+    lbk_refused(raw"""
+        make(a: *int) -> Buf[*int]
+            var w: Buf[*int] = buf()
+            w.push(a)
+            w
+
+        run() -> Buf[*int]
+            var x = 1
+            make(&x)
+
+        main()
+            print(run().len())
+        """, "'make(&x)' is returned, but it holds the address of a local of 'run'")
+
+@test("a local buffer stored in module storage keeps what was pushed onto it")
+lbk_module()
+    lbk_refused(raw"""
+        to_module(a: *int)
+            var w: Buf[*int] = buf()
+            w.push(a)
+            held = w
+
+        run()
+            var x = 1
+            to_module(&x)
+
+        main()
+            run()
+        """, lbk_kept("to_module", "it is stored in 'held'", "run"))
+
+@test("a local buffer stored in a field of module storage keeps what was pushed onto it")
+lbk_field()
+    lbk_refused(raw"""
+        to_field(a: *int)
+            var w: Buf[*int] = buf()
+            w.push(a)
+            holder.b = w
+
+        run()
+            var x = 1
+            to_field(&x)
+
+        main()
+            run()
+        """, lbk_kept("to_field", "it is stored in 'holder.b'", "run"))
+
+@test("a local buffer stored through a parameter is held where the caller's pointer points")
+lbk_pointee()
+    lbk_refused(raw"""
+        to_pointee(out: *Holder, a: *int)
+            var w: Buf[*int] = buf()
+            w.push(a)
+            out.b = w
+
+        run()
+            var x = 1
+            to_pointee(&holder, &x)
+
+        main()
+            run()
+        """, "'to_pointee' keeps its parameter 'a' (it is stored in 'out.b'), and '&x' is the address of a local of 'run'")
+
+@test("a local buffer pushed onto a kept buffer keeps what was pushed onto it")
+lbk_onto_kept()
+    lbk_refused(raw"""
+        to_nest(a: *int)
+            var w: Buf[*int] = buf()
+            w.push(a)
+            nest.push(w)
+
+        run()
+            var x = 1
+            to_nest(&x)
+
+        main()
+            run()
+        """, lbk_kept("to_nest", lbk_pushed, "run"))
+
+@test("a local buffer captured by a closure that is stored keeps what was pushed onto it")
+lbk_captured()
+    lbk_refused(raw"""
+        var saved: &Fn() -> usize = () -> 0
+
+        to_closure(a: *int)
+            var w: Buf[*int] = buf()
+            w.push(a)
+            saved = () -> w.len()
+
+        run()
+            var x = 1
+            to_closure(&x)
+
+        main()
+            run()
+        """, lbk_kept("to_closure", lbk_pushed, "run"))
+
+@test("a local buffer handed to a callee that keeps it keeps what was pushed onto it")
+lbk_keeping_helper()
+    lbk_refused(raw"""
+        stash(b: Buf[*int]) = nest.push(b)
+
+        to_keeper(a: *int)
+            var w: Buf[*int] = buf()
+            w.push(a)
+            stash(w)
+
+        run()
+            var x = 1
+            to_keeper(&x)
+
+        main()
+            run()
+        """, lbk_kept("to_keeper", "it is passed to 'stash', which keeps it", "run"))
+
+// -- buffers that are not the frame's -------------------------------------------------------------------
+
+@test("a buffer handed in by value is the caller's to say, and module storage keeps")
+lbk_param_value()
+    lbk_refused(raw"""
+        fill(work: Buf[*int], a: *int) = work.push(a)
+
+        run()
+            var x = 1
+            fill(held, &x)
+
+        main()
+            run()
+        """, lbk_kept("fill", lbk_pushed, "run"))
+
+@test("a buffer handed in by address is the caller's to say, and module storage keeps")
+lbk_param_pointer()
+    lbk_refused(raw"""
+        fill(work: *Buf[*int], a: *int) = work.push(a)
+
+        run()
+            var x = 1
+            fill(&held, &x)
+
+        main()
+            run()
+        """, lbk_kept("fill", lbk_pushed, "run"))
+
+@test("a buffer reached through a 'ref' is the storage the 'ref' names")
+lbk_ref()
+    lbk_refused(raw"""
+        through_ref(a: *int)
+            ref w = held
+            w.push(a)
+
+        run()
+            var x = 1
+            through_ref(&x)
+
+        main()
+            run()
+        """, lbk_kept("through_ref", lbk_pushed, "run"))
+
+@test("a local given a copy of module storage's buffer shares its slots")
+lbk_aliased()
+    lbk_refused(raw"""
+        aliased(a: *int)
+            var w = held
+            w.push(a)
+
+        run()
+            var x = 1
+            aliased(&x)
+
+        main()
+            run()
+        """, lbk_kept("aliased", lbk_pushed, "run"))
+
+@test("a local buffer lent to a callee that may point it at another buffer is not the frame's")
+lbk_repointed()
+    lbk_refused(raw"""
+        repoint(w: *Buf[*int]) = *w = held
+
+        repointed(a: *int)
+            var w: Buf[*int] = buf()
+            repoint(&w)
+            w.push(a)
+
+        run()
+            var x = 1
+            repointed(&x)
+
+        main()
+            run()
+        """, lbk_kept("repointed", lbk_pushed, "run"))
+
+// -- what is read back out of it ------------------------------------------------------------------------
+
+@test("an element popped off a local buffer and kept is kept")
+lbk_popped_kept()
+    lbk_refused(raw"""
+        transit(a: *int)
+            var w: Buf[*int] = buf()
+            w.push(a)
+            held.push(w.pop().unwrap())
+
+        run()
+            var x = 1
+            transit(&x)
+
+        main()
+            run()
+        """, lbk_kept("transit", lbk_pushed, "run"))
+
+@test("an element a helper pops off a lent buffer and keeps is kept, through a relay too")
+lbk_popped_by_helper()
+    lbk_refused(raw"""
+        drain(w: *Buf[*int]) = held.push(w.pop().unwrap())
+
+        relay(w: *Buf[*int]) = drain(w)
+
+        relayed(a: *int)
+            var w: Buf[*int] = buf()
+            w.push(a)
+            relay(&w)
+
+        run()
+            var x = 1
+            relayed(&x)
+
+        main()
+            run()
+        """, lbk_kept("relayed", "it is passed to 'relay', which lets what it reads through it out", "run"))
+
+@test("a lent buffer a helper copies out whole is kept")
+lbk_copied_by_helper()
+    lbk_refused(raw"""
+        copy_out(w: *Buf[*int]) = held = *w
+
+        lent_copy(a: *int)
+            var w: Buf[*int] = buf()
+            w.push(a)
+            copy_out(&w)
+
+        run()
+            var x = 1
+            lent_copy(&x)
+
+        main()
+            run()
+        """, lbk_kept("lent_copy", "it is passed to 'copy_out', which lets what it reads through it out", "run"))
+
+@test("what a helper moves into a second local buffer goes wherever that buffer goes")
+lbk_moved()
+    lbk_refused(raw"""
+        move_all(src: *Buf[*int], dst: *Buf[*int])
+            while src.len() > 0
+                dst.push(src.pop().unwrap())
+
+        moved(a: *int)
+            var w: Buf[*int] = buf()
+            var v: Buf[*int] = buf()
+            w.push(a)
+            move_all(&w, &v)
+            held = v
+
+        run()
+            var x = 1
+            moved(&x)
+
+        main()
+            run()
+        """, lbk_kept("moved", "it is stored in 'held'", "run"))
+
+@test("a struct popped off a local buffer and kept is kept")
+lbk_values_kept()
+    lbk_refused(raw"""
+        values(a: *int)
+            var w: Buf[P] = buf()
+            w.push(P(a))
+            held_p.push(w.pop().unwrap())
+
+        run()
+            var x = 1
+            values(&x)
+
+        main()
+            run()
+        """, lbk_kept("values", lbk_pushed, "run"))
+
+@test("a buffer popped off a nested local buffer and kept is kept")
+lbk_nested_kept()
+    lbk_refused(raw"""
+        nested(a: *int)
+            var outer: Buf[Buf[*int]] = buf()
+            var inner: Buf[*int] = buf()
+            inner.push(a)
+            outer.push(inner)
+            nest.push(outer.pop().unwrap())
+
+        run()
+            var x = 1
+            nested(&x)
+
+        main()
+            run()
+        """, lbk_kept("nested", lbk_pushed, "run"))
+
+@test("a generic function popping off its local buffer into a kept one keeps")
+lbk_generic_kept()
+    lbk_refused(raw"""
+        generic[T](a: T, into: *Buf[T])
+            var w: Buf[T] = buf()
+            w.push(a)
+            into.push(w.pop().unwrap())
+
+        run()
+            var x = 1
+            generic(&x, &held)
+
+        main()
+            run()
+        """, lbk_kept("generic", lbk_pushed, "run"))
+
+@test("a method popping off its local buffer into a kept one keeps")
+lbk_method_kept()
+    lbk_refused(raw"""
+        struct Walker
+            n: int
+
+            walk(self, a: *int)
+                var w: Buf[*int] = buf()
+                w.push(a)
+                held.push(w.pop().unwrap())
+
+        run()
+            var x = 1
+            Walker(1).walk(&x)
+
+        main()
+            run()
+        """, "'walk' keeps its parameter 'a' (" + lbk_pushed + "), and '&x' is the address of a local of 'run'")
+
+@test("a closure at an unmarked type popping off its own buffer into a kept one is refused")
+lbk_closure_kept()
+    lbk_refused(raw"""
+        make() -> &Fn(*int) -> int = (p) ->
+            var w: Buf[*int] = buf()
+            w.push(p)
+            held.push(w.pop().unwrap())
+            1
+
+        main()
+            print(make()(&g1))
+        """, "a closure borrows what it is handed for the call, and this one keeps its parameter 'p' (" +
+            lbk_pushed + ")")
