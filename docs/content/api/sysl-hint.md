@@ -10,7 +10,7 @@ requires: "no alloc"
 
 ## Index
 
-[`black_box`](#black_box)
+[`black_box`](#black_box) [`prefetch`](#prefetch) [`Access`](#access) [`Locality`](#locality)
 
 ## Functions
 
@@ -36,3 +36,46 @@ instruction of its own, on every processor sysl builds for, with or without a C 
 
 It is a hint about optimization, not a guarantee of timing: it does not make code constant-time,
 and it orders nothing between threads.
+
+### `prefetch`
+
+```sysl
+prefetch[T](p: *T, access: Access = Read, locality: Locality = High)
+```
+
+Asks the machine to start bringing the memory at `p` into its cache, so that a read or write of
+it a little later does not wait for memory.
+
+It is a hint: it reads nothing, changes nothing and never faults, whatever `p` holds -- an address
+past the end of a buffer, or one nothing is mapped at, is prefetched as uselessly and as harmlessly
+as any other. On a processor with no prefetch instruction it is nothing at all.
+
+`access` and `locality` say which instruction to use, so they are constants: an enum's variant
+written at the call, a module `val` holding one, or a generic's `const` parameter. The compiler
+answers each call itself, so a
+prefetch costs the one instruction and no call.
+
+## Types
+
+### `Access`
+
+```sysl
+enum Access
+    Read
+    Write
+```
+
+What a prefetch readies a line of the cache for: reading it, or writing it.
+
+### `Locality`
+
+```sysl
+enum Locality
+    None
+    Low
+    Medium
+    High
+```
+
+How long the prefetched line is wanted, from `None` -- read once and not again, so it should not
+push anything out of the cache -- to `High`, kept in every level the machine has.
