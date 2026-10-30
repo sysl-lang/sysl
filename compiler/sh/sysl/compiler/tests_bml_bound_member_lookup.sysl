@@ -1,0 +1,241 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.text.Search
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// A member a generic body reaches through its BOUND stays the bound's member at every instantiation.
+//
+// `fresh[T: Zero]() -> T = T.zero()` promises `Zero`'s `zero`, and for `int` that one is the
+// compiler's -- `int` has no `impl Zero` block. Once the body is read at `T = int`, `int`'s tables may
+// still hold a `zero` that another trait gave it: a private trait in the instantiating module, one
+// beside the generic body, or a public one imported elsewhere. None of them is what the signature
+// asked for, so none is consulted; the answer is `Zero`'s. Where two BOUNDS declare the name, the
+// call is ambiguous as it always was.
+//
+// Two cells are not here because the language refuses them where they are declared: a block giving a
+// type an operator's method the compiler already supplies (`add` on `int` "would hide it"), and two
+// traits giving one type an associated type of one name ("one type cannot have two of one name").
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private bml_skip_run() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return true
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return true
+
+    false
+end bml_skip_run
+
+// A project holding `main.sysl` and up to two modules, each in `<name>/<name>.sysl`; an empty name
+// leaves that one out.
+private bml_write(main: string, a: string, a_text: string, b: string, b_text: string) -> string
+    val root = make_temp_dir("sysl-bml").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(root + "/package.hocon", "package {\n  name = \"probe\"\n}\n").unwrap()
+    write_text(root + "/main.sysl", main).unwrap()
+
+    if a != ""
+        make_dir_all(root + s"/$a").unwrap()
+        write_text(root + s"/$a/$a.sysl", a_text).unwrap()
+    end if
+
+    if b != ""
+        make_dir_all(root + s"/$b").unwrap()
+        write_text(root + s"/$b/$b.sysl", b_text).unwrap()
+    end if
+
+    root
+end bml_write
+
+// What the program PRINTS, or what the build had to say about it.
+private bml_ran(main: string, a: string, a_text: string, b: string, b_text: string) -> string
+    val root = bml_write(main, a, a_text, b, b_text)
+    val exe = root + "/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            val said = failure_text(why)
+
+            remove_dir_all(root).unwrap_or(())
+            return said
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end bml_ran
+
+private bml_prints(main: string, a: string, a_text: string, b: string, b_text: string,
+                   expected: string)
+    if bml_skip_run() then return
+
+    val out = bml_ran(main, a, a_text, b, b_text)
+
+    assert(out == expected, s"expected '$expected', got: $out")
+
+// The generic body every cell instantiates.
+private bml_zero() -> string = raw"""
+    module zero
+
+    fresh[T: Zero]() -> T = T.zero()
+    """
+
+// A trait private to the file that writes it, giving `int` a `zero` of its own.
+private bml_step() -> string = raw"""
+    private trait Step
+        zero() -> Self
+
+    impl Step for int
+        zero() -> int = 7
+    """
+
+// -- the bound answers, whoever else gave the type the name ----------------------------------------
+
+@test("a private trait in the instantiating module does not take a bound's member from another module")
+bml_private_elsewhere()
+    bml_prints("import zero.fresh\n\n" + bml_step() + raw"""
+
+        main()
+            print(fresh[int]())
+        """, "zero", bml_zero(), "", "", "0\n")
+
+@test("a private trait beside the generic body does not take the bound's member either")
+bml_private_same_module()
+    bml_prints(raw"""
+        import zero.fresh
+
+        main()
+            print(fresh[int]())
+        """, "zero", "module zero\n\n" + bml_step() + "\nfresh[T: Zero]() -> T = T.zero()\n",
+        "", "", "0\n")
+
+@test("a public trait imported where the body is instantiated is not consulted, and is no ambiguity")
+bml_public_elsewhere()
+    bml_prints(raw"""
+        import zero.fresh
+        import steps.Step
+
+        main()
+            print(fresh[int](), int.zero())
+        """, "zero", bml_zero(), "steps", raw"""
+        module steps
+
+        trait Step
+            zero() -> Self
+
+        impl Step for int
+            zero() -> int = 7
+        """, "0 7\n")
+
+@test("the instantiation may happen in a third module that holds the private trait")
+bml_third_module()
+    bml_prints(raw"""
+        import user.run
+
+        main()
+            print(run())
+        """, "zero", bml_zero(), "user", "module user\n\nimport zero.fresh\n\n" + bml_step() +
+        "\nrun() -> int = fresh[int]()\n", "0\n")
+
+@test("a generic block's bound answers the same way")
+bml_generic_block()
+    bml_prints("import zero.Box\n\n" + bml_step() + raw"""
+
+        main()
+            print(Box(3).cleared())
+        """, "zero", raw"""
+        module zero
+
+        struct Box[T]
+            v: T
+
+        impl[T: Zero] Box[T]
+            cleared(self) -> T = T.zero()
+        """, "", "", "0\n")
+
+@test("a measure the compiler supplies is the bound's too, against a public trait of the program's")
+bml_measure()
+    bml_prints(raw"""
+        import sysl.math.Bits
+
+        trait Wide
+            width() -> u32
+
+        impl Wide for u32
+            width() -> u32 = 99
+
+        bits_of[T: Bits](x: T) -> u32 = T.width()
+
+        main()
+            print(bits_of(1u32), u32.width())
+        """, "", "", "", "", "32 99\n")
+
+@test("a user trait as the bound reaches its own block, static and through a value")
+bml_user_trait_bound()
+    bml_prints(raw"""
+        import zr.{fresh, sized}
+
+        private trait Step
+            zero() -> Self
+            size(self) -> int
+
+        impl Step for int
+            zero() -> int = 7
+            size(self) -> int = 70
+
+        main()
+            print(fresh[int](), sized(1))
+        """, "zr", raw"""
+        module zr
+
+        trait Zr
+            zero() -> Self
+            size(self) -> int
+
+        impl Zr for int
+            zero() -> int = 5
+            size(self) -> int = 50
+
+        fresh[T: Zr]() -> T = T.zero()
+
+        sized[T: Zr](x: T) -> int = x.size()
+        """, "", "", "5 50\n")
+
+// -- what is still refused ------------------------------------------------------------------------
+
+@test("two bounds declaring one name are still ambiguous")
+bml_two_bounds_ambiguous()
+    if bml_skip_run() then return
+
+    val out = bml_ran(raw"""
+        trait A
+            pick() -> Self
+
+        trait B
+            pick() -> Self
+
+        impl A for int
+            pick() -> int = 1
+
+        impl B for int
+            pick() -> int = 2
+
+        both[T: A + B]() -> T = T.pick()
+
+        main()
+            print(both[int]())
+        """, "", "", "", "")
+
+    assert(out.index_of("'pick' on int comes from A and B, and each is in scope here — nothing in the " +
+                        "call says which was meant").is_some(), out)
