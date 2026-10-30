@@ -1,0 +1,228 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.text.replace_all
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// **A closure's capture of a `val` is read-only exactly as the `val` is.** A closure holds what it
+// captured of a `val` as a copy, and that copy was bound in the closure's body as an ordinary
+// writable name -- so a closure passed a `val` array at a `[]real`, took `a[..]` as a `[]real`, or
+// wrote `a[0] = ...`, and every write landed in the closure's copy, where nothing read it. A nested
+// function's capture was already bound under the frame's promise (`nested.sysl`'s `bind_capture`);
+// a closure's capture now is too, so each is refused in the words the `val` itself is refused in.
+//
+// Axes: the use (a write of an element, a whole-array write, `+=` of a scalar, a `[]real` argument, a
+// writable slice, a `*self` method), where the closure stands (a function body, a closure inside a
+// closure, a generic body, a `@scoped` parameter), where the array lives (a `val` local, a field of a
+// `val` struct), and the controls: reading by index, `[]const real` arguments, `a[..]` read, a `var`
+// captured and written, which are accepted and print the right values. Build modes, targets and the
+// counted heap are skipped: the change is in what analysis refuses, and nothing it reads reaches
+// lowering.
+
+private cvc_skipped() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return true
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return true
+
+    false
+end cvc_skipped
+
+private cvc_write(text: string) -> string
+    val root = make_temp_dir("sysl-cvc").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+    root
+end cvc_write
+
+private cvc_prints(text: string, printed: string)
+    val root = cvc_write(text)
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            assert_eq(s"did not build: ${failure_text(why)}", printed)
+            return
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> assert(false, "the program that was built could not be run")
+        Ok(out) ->
+            assert_eq(out.text, printed)
+            assert_eq(shell_status(out.status), 0)
+end cvc_prints
+
+private cvc_err(text: string) -> string
+    val root = cvc_write(text)
+
+    val out = emit_llvm_text(root, None) match
+        Err(why) -> why.message
+        Ok(made) -> if made.report.is_empty() then "" else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    replace_all(out, replace_all(root, "//", "/") + "/", "")
+end cvc_err
+
+private cvc_refused(text: string, words: string, at: string)
+    val said = cvc_err(text)
+
+    assert(said.contains(words), said)
+    assert(said.contains(s" --> main.sysl:$at\n"), said)
+
+private const cvc_const_view: string =
+    "a '[]const real' views elements it may not write, and a '[]real' is a licence to write them"
+
+private const cvc_assign: string = "a 'val' is written once, so assignment has nothing to write through"
+
+// Three lines, so `g` is on line 4 and its body starts on line 5.
+private const cvc_fill: string =
+    "sum(xs: []const real) -> real = xs[0] + xs[1] + xs[2]\nfill(xs: []real)\n    xs[0] = 9.0\n"
+
+@test("a closure passing its captured val array at []real is refused at the name")
+cvc_pass_slice_param()
+    if cvc_skipped() then return
+
+    cvc_refused(cvc_fill + "g() -> real\n    val a = [1.0, 2.0, 3.0]\n    val f = () -> fill(a)\n" +
+                "    f()\n    a[0]\n\nprint(g())\n", cvc_const_view, "6:24")
+end cvc_pass_slice_param
+
+@test("a closure writing an element of its captured val array is refused, said once")
+cvc_write_element()
+    if cvc_skipped() then return
+
+    val text = "g() -> real\n    val a = [1.0, 2.0, 3.0]\n    var f = () ->\n        a[0] = 9.0\n" +
+        "        a[0]\n    f()\n\nprint(g())\n"
+    val said = cvc_err(text)
+
+    assert(said.contains(cvc_assign), said)
+    assert(said.contains(" --> main.sysl:4:9\n"), said)
+    assert(!said.contains("captures by value"), said)
+end cvc_write_element
+
+@test("a closure assigning its captured val array whole is refused")
+cvc_write_whole()
+    if cvc_skipped() then return
+
+    cvc_refused("g() -> real\n    val a = [1.0, 2.0, 3.0]\n    var f = () ->\n        a = [4.0, 5.0, 6.0]\n" +
+                "        a[0]\n    f()\n\nprint(g())\n", cvc_assign, "4:9")
+end cvc_write_whole
+
+@test("a closure taking a writable view of its captured val array is refused")
+cvc_writable_slice()
+    if cvc_skipped() then return
+
+    cvc_refused("g() -> real\n    val a = [1.0, 2.0, 3.0]\n    val f = () ->\n        val s: []real = a[..]\n" +
+                "        s[0]\n    f()\n\nprint(g())\n", cvc_const_view, "4:26")
+end cvc_writable_slice
+
+@test("a closure counting in its copy of a val scalar is refused")
+cvc_scalar_counter()
+    if cvc_skipped() then return
+
+    cvc_refused("g() -> int\n    val n = 0\n    var f = () ->\n        n += 1\n        n\n    f()\n\n" +
+                "print(g())\n", "a 'val' is written once, so '+=' has nothing to write through", "4:9")
+end cvc_scalar_counter
+
+@test("a closure calling a *self method on its captured val struct is refused")
+cvc_self_method()
+    if cvc_skipped() then return
+
+    cvc_refused("struct C\n    n: int\n    bump(*self) = self.n += 1\ng() -> int\n    val c = C(0)\n" +
+                "    var f = () ->\n        c.bump()\n        c.n\n    f()\n\nprint(g())\n",
+                "'bump' takes '*self', so it writes through what it is called on", "7:11")
+end cvc_self_method
+
+@test("a closure inside a closure passing the captured val array at []real is refused")
+cvc_nested_closure()
+    if cvc_skipped() then return
+
+    cvc_refused(cvc_fill + "g() -> real\n    val a = [1.0, 2.0, 3.0]\n    val outer = () ->\n" +
+                "        val k = () -> fill(a)\n        k()\n    outer()\n    a[0]\n\nprint(g())\n",
+                cvc_const_view, "7:28")
+end cvc_nested_closure
+
+@test("a closure in a generic body writing its captured val array is refused")
+cvc_generic()
+    if cvc_skipped() then return
+
+    cvc_refused("pick[T](a: [2]T, v: T) -> T\n    val c = a\n    var f = () ->\n        c[0] = v\n" +
+                "        c[0]\n    f()\n\nprint(pick([7.0, 8.0], 1.0))\n", cvc_assign, "4:9")
+end cvc_generic
+
+// A scope that keeps each job and runs them when asked, so a `@scoped` parameter can be written to.
+private const cvc_scope: string =
+    "import sysl.buf.{Buf, buf}\nstruct Scope\n    jobs: Buf[&sync Fn() -> unit]\n    @scoped(f)\n" +
+    "    spawn(*self, f: &sync Fn() -> unit) = self.jobs.push(f)\n    run(*self)\n" +
+    "        for j in self.jobs do j()\n"
+
+@test("a closure at a @scoped parameter passing its captured val array at []real is refused")
+cvc_scoped_refused()
+    if cvc_skipped() then return
+
+    // `cvc_scope` is seven lines and `cvc_fill` three, so `g` is on line 11.
+    cvc_refused(cvc_scope + cvc_fill + "g()\n    val a = [1.0, 2.0, 3.0]\n    var s = Scope(buf())\n" +
+                "    s.spawn(() -> fill(a))\n    s.run()\n\ng()\n", cvc_const_view, "14:24")
+end cvc_scoped_refused
+
+@test("a closure at a @scoped parameter reads its captured val array")
+cvc_scoped_read()
+    if cvc_skipped() then return
+
+    cvc_prints(cvc_scope + cvc_fill + "g()\n    val a = [1.0, 2.0, 3.0]\n    var s = Scope(buf())\n" +
+               "    s.spawn(() -> print(sum(a) + a[2]))\n    s.run()\n\ng()\n", "9\n")
+end cvc_scoped_read
+
+@test("a closure passing an array field of its captured val struct at []real is refused")
+cvc_struct_field()
+    if cvc_skipped() then return
+
+    cvc_refused(cvc_fill + "struct Holder\n    vals: [3]real\ng() -> real\n" +
+                "    val h = Holder([4.0, 5.0, 6.0])\n    val m = () -> fill(h.vals)\n    m()\n" +
+                "    h.vals[0]\n\nprint(g())\n", cvc_const_view, "8:24")
+end cvc_struct_field
+
+@test("a closure reads its captured val array by index, at []const real and as a[..]")
+cvc_reads()
+    if cvc_skipped() then return
+
+    cvc_prints(cvc_fill + "struct Holder\n    vals: [3]real\ng() -> real\n    val a = [1.0, 2.0, 3.0]\n" +
+               "    val h = Holder([4.0, 5.0, 6.0])\n" +
+               "    val f = () -> a[1] + sum(a) + sum(a[..]) + sum(h.vals)\n" +
+               "    val outer = () ->\n        val k = () -> a[2]\n        k()\n" +
+               "    print(f())\n    print(outer())\n    a[0]\n\nprint(g())\n", "29\n3\n1\n")
+end cvc_reads
+
+@test("a closure capturing a val array in a generic body reads it")
+cvc_generic_read()
+    if cvc_skipped() then return
+
+    cvc_prints("pick[T](a: [2]T, i: usize) -> T\n    val c = a\n    val f = () -> c[i]\n    f()\n\n" +
+               "print(pick([7.0, 8.0], 1))\n", "8\n")
+end cvc_generic_read
+
+@test("a closure passes its captured var array at []real and writes it")
+cvc_var_control()
+    if cvc_skipped() then return
+
+    cvc_prints(cvc_fill + "g() -> real\n    var b = [1.0, 2.0, 3.0]\n    val w = () ->\n        fill(b)\n" +
+               "        b[1] = 7.0\n        b[0] + b[1]\n    print(w())\n    b[0]\n\nprint(g())\n",
+               "16\n9\n")
+end cvc_var_control
+
+@test("a closure counts in its own copy of a captured var")
+cvc_var_counter()
+    if cvc_skipped() then return
+
+    cvc_prints("make() -> &Fn() -> int\n    var n = 0\n    () ->\n        n += 1\n        n\n" +
+               "val f = make()\nf()\nprint(f())\n", "2\n")
+end cvc_var_counter
