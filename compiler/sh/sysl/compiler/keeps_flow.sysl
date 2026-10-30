@@ -654,6 +654,10 @@ struct Origins
     // The locals and parameters a field of which is written in the body: one of their box handles may
     // have been pointed at another box (`handle_origin`).
     reshaped: Map[string, bool]
+
+    // The integer locals whose address leaves the body's sight (`repoint_exposed`): one that holds an
+    // address may be handed another one there.
+    exposed: Map[string, bool]
 end Origins
 
 origins_of(cx: &KeepsCx, f: TFunc) -> &Origins
@@ -666,7 +670,7 @@ origins_of(cx: &KeepsCx, f: TFunc) -> &Origins
         None -> ()
 
     val logged = cx.reads.len()
-    val o: &Origins = Origins(cx, f.params, buf(), map(), false, map(), map(), map())
+    val o: &Origins = Origins(cx, f.params, buf(), map(), false, map(), map(), map(), map())
 
     walk_block_stmts(f.body, stmt_walk(false, s -> s match
         TRefDecl(n, _, place) -> o.refs.push((n, place))
@@ -674,6 +678,8 @@ origins_of(cx: &KeepsCx, f: TFunc) -> &Origins
 
     walk_block_stmts(f.body, TWalk(false, e -> binding_expr(o, e), w -> written_name(o, w.place),
                                    s -> binding_stmt(o, s)))
+
+    repoint_exposed(o, f)
 
     var rounds = 0
 
@@ -712,11 +718,127 @@ private origin_bind_expr(o: &Origins, e: TExpr)
         _ -> ()
 end origin_bind_expr
 
+// **A parameter written in the body points where everything it is given does** -- its own argument
+// to begin with (`p0:`), and then whatever the body stores in it: `n = n.next` may leave it anywhere.
 private origin_bind_store(o: &Origins, place: TExpr, v: TExpr)
     *place.kind match
-        TLoad(n, _) -> if !is_param(o, n) then origin_assign(o, n, origin_of(o, v))
+        TLoad(n, _) ->
+            if aliased(o, n) then return
+
+            seed_param(o, n)
+            origin_assign(o, n, origin_of(o, v))
         _ -> ()
 end origin_bind_store
+
+private aliased(o: &Origins, n: string) -> bool
+    for item in o.refs
+        if item.0 == n then return true
+
+    false
+end aliased
+
+// A parameter's origin before the body writes it: what the caller handed.
+private seed_param(o: &Origins, n: string)
+    if o.locals.has(n) then return
+
+    for j in 0..<o.params.len()
+        if o.params.at(j).0 == n then o.locals.put(n, s"p$j:")
+end seed_param
+
+// **A local whose address leaves the body's sight points anywhere at all**: whoever holds the
+// address may store a pointer there, `redirect(&p)` doing `*pp = &module_storage`, after which `*p = a`
+// stores into module storage, not into what `p` was bound to. The one hand-off told apart is an
+// argument to a call by name whose body neither writes through that parameter, keeps it nor answers
+// it (`writes_of`, `keeps_of`, `raw_answers_of`); one through a pointer or an object, one bound to another local, one
+// stored, one a `ref` aliases -- the address is somewhere a write can come from, and the local's
+// origin is given up from the start. An integer counts only while it holds an address.
+private repoint_exposed(o: &Origins, f: TFunc)
+    val benign: &Spans = Spans(buf())
+
+    walk_block_stmts(f.body, expr_walk(false, e -> handed_address(o, benign, e)))
+    walk_block_stmts(f.body, TWalk(false, e -> loose_address(o, benign, e), w -> (), s -> ref_address(o, s)))
+end repoint_exposed
+
+private struct Spans
+    items: Buf[Span]
+end Spans
+
+private handed_address(o: &Origins, benign: &Spans, e: TExpr)
+    *e.kind match
+        TCall(name, args, _, _) ->
+            for k in 0..<args.len()
+                val arg = args.at(k)
+                val held = exposed_local(o, arg)
+
+                if held.is_none() then continue
+
+                if writes_of(o.cx, name, k) || raw_answers_of(o.cx, name, k) || keeps_of(o.cx, name, k).kept
+                    repoint(o, held.unwrap())
+                else
+                    benign.items.push(arg.span)
+        _ -> ()
+end handed_address
+
+// An address taken anywhere but an argument told apart, and a capture a closure may hold by
+// reference (`closure_mode.sysl`), which its body may write or hand on as `&p`.
+private loose_address(o: &Origins, benign: &Spans, e: TExpr)
+    *e.kind match
+        TStructNew(st, args) ->
+            o.cx.an.closure_refs.get(st.base) match
+                Some(refs) ->
+                    for i in 0..<args.len()
+                        if i >= refs.len() || !refs.at(i) then continue
+
+                        val held = local_at(o, args.at(i))
+
+                        if held.is_some() then repoint(o, held.unwrap())
+                None -> ()
+        _ ->
+            val held = exposed_local(o, e)
+
+            if held.is_some() && !holds_span(benign.items, e.span) then repoint(o, held.unwrap())
+end loose_address
+
+private ref_address(o: &Origins, s: TStmt)
+    s match
+        TRefDecl(_, _, place) ->
+            val held = local_at(o, place)
+
+            if held.is_some() then repoint(o, held.unwrap())
+        _ -> ()
+end ref_address
+
+private holds_span(xs: Buf[Span], s: Span) -> bool
+    for x in xs
+        if x.start == s.start && x.end == s.end then return true
+
+    false
+end holds_span
+
+// The local `&local` hands out the address of, where a write through it may change what it points at.
+private exposed_local(o: &Origins, e: TExpr) -> Option[(string, Type)] = *e.kind match
+    TAddrOf(place, _) -> local_at(o, place)
+    _ -> None
+
+// The local a place is, whole or at an offset nobody can name, with its type.
+private local_at(o: &Origins, place: TExpr) -> Option[(string, Type)]
+    val loc = place_loc(o, place)
+
+    if !loc.starts_with("l:") then return None
+
+    val n = local_of(loc)
+    val rest = loc[(n.bytes.len + 2)..<loc.bytes.len]
+
+    if rest != "" && !rest.starts_with("?") then return None
+
+    Some((n, texpr_type(place)))
+end local_at
+
+// A pointer given up at once; an integer from the first address it is given (`origin_assign`).
+private repoint(o: &Origins, held: (string, Type))
+    if may_hold_pointer(o.cx, held.1) then o.locals.put(held.0, "")
+    else if is_integer_type(held.1) then o.exposed.put(held.0, true)
+end repoint
 
 private binding_stmt(o: &Origins, s: TStmt)
     s match
@@ -783,7 +905,10 @@ private written_name(o: &Origins, place: TExpr)
                 None -> ()
 end written_name
 
-private origin_assign(o: &Origins, n: string, org: string)
+// **One location at two offsets is that location at an offset nobody can name**: `s = s[(p + 1)..]`
+// leaves `s` inside what it was bound to (`p0:?`), not anywhere at all.
+private origin_assign(o: &Origins, n: string, given: string)
+    val org = if given != "-" && o.exposed.has(n) then "" else given
     val now = o.locals.get(n)
 
     if now.is_none()
@@ -796,7 +921,13 @@ private origin_assign(o: &Origins, n: string, org: string)
 
     if was == org || was == "" || org == "-" then return
 
-    o.locals.put(n, if was == "-" then org else "")
+    val merged = if was == "-" then org
+    else if unknown_offset(was) == unknown_offset(org) then unknown_offset(was)
+    else ""
+
+    if merged == was then return
+
+    o.locals.put(n, merged)
     o.changed = true
 end origin_assign
 
@@ -825,10 +956,16 @@ origin_of(o: &Origins, x: TExpr) -> string
                 if item.0 == n then return if ptrish then "" else "-"
 
             for j in 0..<o.params.len()
-                if o.params.at(j).0 == n then return if ptrish then s"p$j:" else "-"
+                if o.params.at(j).0 == n then return if ptrish then o.locals.get(n).unwrap_or(s"p$j:") else "-"
 
             o.locals.get(n).unwrap_or(if ptrish then "" else "-")
         TAddrOf(place, _) -> place_loc(o, place)
+        // A view cut from storage views that storage -- from its start where the cut has no lower
+        // bound, and at an offset nobody can name where it has one.
+        TSlice(base, lo, _, _, _) ->
+            val whole = if is_array_type(texpr_type(base)) then place_loc(o, base) else origin_of(o, base)
+
+            if lo.is_none() || whole == "" then whole else unknown_offset(whole)
         TCast(v, _) -> origin_of(o, v)
         TFloorCast(v, _) -> origin_of(o, v)
         TBinary(_, l, r, _) -> offset_origin(origin_of(o, l), origin_of(o, r))

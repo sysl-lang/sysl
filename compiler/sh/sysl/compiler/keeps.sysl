@@ -736,6 +736,14 @@ private val ReadQ = "#"
 private val ReadAnswersQ = "+"
 private val DeepQ = "@"
 private val VesselQ = "$"
+private val WritesQ = "*"
+
+// **Whether `name` may store an address in what the pointer at `i` points at** -- `redirect(pp) = *pp =
+// &slot` -- which a caller handing `&p` must take to leave `p` pointing anywhere (`keeps_flow.sysl`'s
+// `repoint_exposed`). A store through the parameter, or through a pointer nobody can name, writes; so
+// does handing the pointer to a callee that writes through it, or to C, an object or a function
+// pointer. An integer stored counts, since it may be an address.
+writes_of(cx: &KeepsCx, name: string, i: usize) -> bool = summary(cx, name, i, WritesQ).kept
 
 // Whether `name` keeps the argument at position `i`, why, and every location it may be held at.
 keeps_of(cx: &KeepsCx, name: string, i: usize) -> KeptWhy = summary(cx, name, i, KeepsQ)
@@ -874,6 +882,7 @@ private summary(cx: &KeepsCx, name: string, i: usize, q: string) -> KeptWhy
         if q == ThroughQ then return extern_through(cx, name, i)
         if reading || deep then return extern_kept(cx, name, i)
         if q == ClearsQ then return not_kept()
+        if q == WritesQ then return unseen_answer()
         if q == BorrowQ then return KeptWhy(false, s"'$name' has no body in sight", span_zero(), buf())
 
         val said = extern_answers(cx, name, i)
@@ -920,6 +929,7 @@ private summary(cx: &KeepsCx, name: string, i: usize, q: string) -> KeptWhy
     else if q == ClearsQ then walk_clears(cx, f)
     else if q == BorrowQ then walk_borrow(cx, f, i)
     else if q == VesselQ then walk_vessel(cx, f, i)
+    else if q == WritesQ then walk_writes(cx, f, i)
     else if q == ThroughQ then walk_through(cx, f, i)
     else if deep then walk_deep(cx, f, i, path_of(q))
     else if q == ThroughAnswersQ then walk_answers_through(cx, f, i)
@@ -1650,6 +1660,55 @@ private walk_vessel(cx: &KeepsCx, f: TFunc, i: usize) -> KeptWhy
     track_locals(t, f.body)
     walk_track(t, i)
 end walk_vessel
+
+// Whether `f` may store an address through its parameter at `i` (`writes_of`): the first store or
+// call that may, by where it is.
+private walk_writes(cx: &KeepsCx, f: TFunc, i: usize) -> KeptWhy
+    val w: &Writes = Writes(cx, origins_of(cx, f), s"p$i:", None)
+
+    walk_block_stmts(f.body, expr_walk(false, e -> if w.at.is_none() then write_through(w, e)))
+
+    if w.at.is_none() then not_kept() else KeptWhy(true, "it may write through it", w.at.unwrap(), buf())
+end walk_writes
+
+private struct Writes
+    cx: &KeepsCx
+    org: &Origins
+    prefix: string
+    at: Option[Span]
+end Writes
+
+private write_through(w: &Writes, e: TExpr)
+    *e.kind match
+        TStore(place, v, _, _) ->
+            val ty = texpr_type(v)
+
+            if !may_hold_pointer(w.cx, ty) && !is_integer_type(ty) then return
+
+            val loc = place_loc(w.org, place)
+
+            if loc == "" || loc.starts_with(w.prefix) || loc.starts_with("d:") then w.at = Some(e.span)
+        TCall(name, args, _, _) ->
+            for k in 0..<args.len()
+                if handed_on(w, args.at(k)) && writes_of(w.cx, name, k)
+                    w.at = Some(e.span)
+                    return
+                end if
+        TCallPtr(_, args, _, _) ->
+            for arg in args
+                if handed_on(w, arg) then w.at = Some(e.span)
+        TVCall(recv, _, args, _, _) ->
+            for arg in with_receiver(recv, args)
+                if handed_on(w, arg) then w.at = Some(e.span)
+        _ -> ()
+end write_through
+
+// Whether an argument may be the parameter's pointer, or one nobody can tell from it.
+private handed_on(w: &Writes, arg: TExpr) -> bool
+    val org = origin_of(w.org, arg)
+
+    org == "" || org.starts_with(w.prefix)
+end handed_on
 
 // Every location a value `f` reads through its parameter at `i` may still be held at once it returns.
 private walk_through(cx: &KeepsCx, f: TFunc, i: usize) -> KeptWhy =
