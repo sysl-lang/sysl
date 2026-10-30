@@ -424,3 +424,117 @@ ftk_twice()
             val f: Twice = (h) -> kept.push(h)
             f(&spare)
         """, "'@keeps' is written twice on one parameter, and a parameter is kept or it is not")
+
+// -- the mark meets field-sensitive keeps ------------------------------------------------------------
+//
+// A call through an unmarked callable or a function pointer asks the bodies it may reach which field
+// of the argument they let out (`read_path_of`, `deep_path_of`). A marked parameter is answered as an
+// extern's is, so it is never narrowed by field: whatever is reachable from it may be kept.
+
+private const ftk_cpu: string = raw"""
+    struct Cpu
+        peer: *Cpu
+        bus: *int
+
+    var the_bus = 7
+    var last: *int = null
+    var last_cpu: *Cpu = null
+
+    keep_bus(c: *Cpu)
+        last = c.bus
+
+    keep_peer(c: *Cpu)
+        last_cpu = c.peer
+
+    """
+
+@test("a marked callable is refused the address of a local whose other field it never reads")
+ftk_marked_not_narrowed()
+    ftk_refused(ftk_cpu + raw"""
+        run(f: &Fn(@keeps *Cpu) -> unit) -> int
+            var a: Cpu
+            var b: Cpu
+            a.bus = &the_bus
+            a.peer = &b
+            f(&a)
+            *last
+
+        main()
+            print(run((c) -> last = c.bus))
+        """, "a call through '&Fn(@keeps *Cpu) -> unit' keeps its parameter 1 (its type says '@keeps'), " +
+            "and '&a' is the address of a local of 'run'")
+
+@test("a marked callable is refused a value one field of which holds a local's address")
+ftk_marked_value_field()
+    ftk_refused(ftk_cpu + raw"""
+        run(f: &Fn(@keeps Cpu) -> unit) -> int
+            var a: Cpu
+            var b: Cpu
+            a.bus = &the_bus
+            a.peer = &b
+            f(a)
+            *last
+
+        main()
+            print(run((c) -> last = c.bus))
+        """, "a call through '&Fn(@keeps Cpu) -> unit' keeps its parameter 1 (its type says '@keeps'), " +
+            "and 'a' holds the address of a local of 'run'")
+
+@test("an unmarked callable letting out only the field that holds no local is accepted")
+ftk_unmarked_field_sensitive()
+    ftk_prints(ftk_cpu + raw"""
+        run(f: &Fn(*Cpu) -> unit) -> int
+            var a: Cpu
+            var b: Cpu
+            a.bus = &the_bus
+            a.peer = &b
+            f(&a)
+            *last
+
+        main()
+            print(run((c) -> last = c.bus))
+            print(run(keep_bus))
+        """, "7\n7\n")
+
+@test("a function pointer is asked the field: letting out the other one is accepted, this one refused")
+ftk_pointer_field_sensitive()
+    ftk_prints(ftk_cpu + raw"""
+        run(f: *extern(*Cpu) -> unit) -> int
+            var a: Cpu
+            var b: Cpu
+            a.bus = &the_bus
+            a.peer = &b
+            f(&a)
+            *last
+
+        main()
+            print(run(&keep_bus))
+        """, "7\n")
+
+    ftk_refused(ftk_cpu + raw"""
+        run(f: *extern(*Cpu) -> unit) -> int
+            var a: Cpu
+            var b: Cpu
+            a.bus = &the_bus
+            a.peer = &b
+            f(&a)
+            *last
+
+        main()
+            print(run(&keep_bus))
+            print(run(&keep_peer))
+        """, "a call through '*extern(*Cpu) -> unit' may reach 'keep_peer', which lets what it reads through " +
+            "its parameter 'c' outlive the call (it is stored in 'last_cpu'), and what is read through '&a' " +
+            "holds the address of a local of 'run'")
+
+@test("a function pointer's parameter takes no '@keeps', so a call through one has no mark to answer")
+ftk_pointer_unmarked()
+    ftk_refused(ftk_cpu + raw"""
+        run(f: *extern(@keeps *Cpu) -> unit)
+            var a: Cpu
+            f(&a)
+
+        main()
+            run(&keep_bus)
+        """, "'@keeps' marks a parameter of a callable's type that the callable may hold past the call — " +
+            "'Fn(@keeps *Cpu) -> …' — and this '*Cpu' is no callable's parameter")

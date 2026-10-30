@@ -774,8 +774,22 @@ through_answers_of(cx: &KeepsCx, name: string, i: usize) -> bool = summary(cx, n
 // `pointer_reads`). **Past `MaxReadSteps` it is what the body lets out of anything it reads through
 // the parameter** (`deep_of`), which holds everything read that deep and more: a question deeper
 // than the summaries tell apart is answered conservatively, never let through.
-read_of(cx: &KeepsCx, name: string, i: usize, steps: int) -> KeptWhy =
-    if steps > MaxReadSteps then deep_of(cx, name, i) else summary(cx, name, i, s"$ReadQ$steps")
+read_of(cx: &KeepsCx, name: string, i: usize, steps: int) -> KeptWhy = read_path_of(cx, name, i, steps, "")
+
+// **The same, where the first step goes through one field of the pointee** (`path`: `.bus`,
+// `.inner.bus`, `.cells[]`; empty for every field): `keep_bus(c: *Cpu) = last = c.bus` lets out what
+// it reads one step in along `.bus`, and nothing along `.peer`. A read along a field the path does not
+// overlap is not followed (`path_ok`); one the body cannot place -- through a copy of the pointer, the
+// pointee whole -- is followed whatever field it may be along, so the answer only narrows.
+read_path_of(cx: &KeepsCx, name: string, i: usize, steps: int, path: string) -> KeptWhy =
+    if steps > MaxReadSteps then deep_path_of(cx, name, i, path)
+    else if path == "" then summary(cx, name, i, s"$ReadQ$steps")
+    else summary(cx, name, i, s"$ReadQ$steps<$path>")
+
+// `deep_of` along one field of the pointee (`read_path_of`): a cycle along `.peer` reaches past
+// `MaxReadSteps`, and what the body lets out of anything it reads along `.mem` is no part of it.
+deep_path_of(cx: &KeepsCx, name: string, i: usize, path: string) -> KeptWhy =
+    if path == "" then deep_of(cx, name, i) else summary(cx, name, i, s"$DeepQ<$path>")
 
 // **What a body lets out of anything it reads through the parameter at `i`, as the borrow rule asks
 // it**: `through_of`'s walk, where a callee with no body in sight is held to the rule's own default --
@@ -800,17 +814,29 @@ private steps_of(q: string) -> int
     var n = 0
 
     for b in q.bytes[1..<q.bytes.len]
+        if b < u8('0') || b > u8('9') then break
+
         n = n * 10 + int(b) - int(u8('0'))
+    end for
 
     n
 end steps_of
+
+// The field a read question asks about, out of its mark (`#1<.bus>` is `.bus`), or every field.
+private path_of(q: string) -> string
+    val at = q.index_of("<")
+
+    if at.is_none() || !q.ends_with(">") then return ""
+
+    q[at.unwrap() + 1..<q.bytes.len - 1]
+end path_of
 
 private summary(cx: &KeepsCx, name: string, i: usize, q: string) -> KeptWhy
     val key = s"$q$name|$i"
     val keeping = q == KeepsQ
     val reading = q.starts_with(ReadQ)
     val read_answering = q.starts_with(ReadAnswersQ)
-    val deep = q == DeepQ
+    val deep = q.starts_with(DeepQ)
     val through = q == ThroughQ || q == ThroughAnswersQ || reading || read_answering || deep
 
     cx.settled.get(key) match
@@ -884,9 +910,9 @@ private summary(cx: &KeepsCx, name: string, i: usize, q: string) -> KeptWhy
     else if q == ClearsQ then walk_clears(cx, f)
     else if q == BorrowQ then walk_borrow(cx, f, i)
     else if q == ThroughQ then walk_through(cx, f, i)
-    else if deep then walk_deep(cx, f, i)
+    else if deep then walk_deep(cx, f, i, path_of(q))
     else if q == ThroughAnswersQ then walk_answers_through(cx, f, i)
-    else if reading then walk_track(track_as(cx, f, i, false, true, steps_of(q)), i)
+    else if reading then walk_track(read_track(cx, f, i, q), i)
     else if read_answering then answered(track_as(cx, f, i, false, true, steps_of(q)), f)
     else walk_answers(cx, f, i, q == RawAnswersQ)
 
@@ -1086,7 +1112,7 @@ vcall_through(cx: &KeepsCx, recv: TExpr, slot: int, k: usize) -> Buf[(string, Ke
 end vcall_through
 
 // The same as the borrow rule asks it (`deep_of`): nothing where the receiver's type names no trait.
-private vcall_deep(cx: &KeepsCx, recv: TExpr, slot: int, k: usize) -> Buf[(string, KeptAt)]
+private vcall_deep(cx: &KeepsCx, recv: TExpr, slot: int, k: usize, path: string) -> Buf[(string, KeptAt)]
     var out: Buf[(string, KeptAt)] = buf()
     val tr = erased_trait(texpr_type(recv))
 
@@ -1104,7 +1130,7 @@ private vcall_deep(cx: &KeepsCx, recv: TExpr, slot: int, k: usize) -> Buf[(strin
 
         if licensed_elsewhere(cx, recv, target, k) then continue
 
-        for item in deep_of(cx, target, k).locs
+        for item in deep_path_of(cx, target, k, path).locs
             out.push((target, item))
 
     out
@@ -1112,7 +1138,7 @@ end vcall_deep
 
 // What a call through an object lets out of what it reads `steps` steps through its argument at `k`
 // (`read_of`): nothing where the receiver's type names no trait, which the rule holds to the default.
-vcall_reads(cx: &KeepsCx, recv: TExpr, slot: int, k: usize, steps: int) -> Buf[(string, KeptAt)]
+vcall_reads(cx: &KeepsCx, recv: TExpr, slot: int, k: usize, steps: int, path: string) -> Buf[(string, KeptAt)]
     var out: Buf[(string, KeptAt)] = buf()
     val tr = erased_trait(texpr_type(recv))
 
@@ -1130,7 +1156,7 @@ vcall_reads(cx: &KeepsCx, recv: TExpr, slot: int, k: usize, steps: int) -> Buf[(
 
         if licensed_elsewhere(cx, recv, target, k) then continue
 
-        for item in read_of(cx, target, k, steps).locs
+        for item in read_path_of(cx, target, k, steps, path).locs
             out.push((target, item))
 
     out
@@ -1177,7 +1203,7 @@ pointer_through(cx: &KeepsCx, callee: TExpr, j: usize) -> Buf[(string, KeptAt)]
 end pointer_through
 
 // The same as the borrow rule asks it (`deep_of`): nothing where C may call through the type.
-private pointer_deep(cx: &KeepsCx, callee: TExpr, j: usize) -> Buf[(string, KeptAt)]
+private pointer_deep(cx: &KeepsCx, callee: TExpr, j: usize, path: string) -> Buf[(string, KeptAt)]
     var out: Buf[(string, KeptAt)] = buf()
     val key = fn_key(texpr_type(callee))
 
@@ -1186,7 +1212,7 @@ private pointer_deep(cx: &KeepsCx, callee: TExpr, j: usize) -> Buf[(string, Kept
     for item in cx.by_type
         if item.0 != key then continue
 
-        for k in deep_of(cx, item.1, j).locs
+        for k in deep_path_of(cx, item.1, j, path).locs
             out.push((item.1, k))
 
     out
@@ -1194,7 +1220,7 @@ end pointer_deep
 
 // What a call through a function pointer lets out of what it reads `steps` steps through its argument
 // at `j` (`read_of`): nothing where C may call through the type, which the rule holds to the default.
-pointer_reads(cx: &KeepsCx, callee: TExpr, j: usize, steps: int) -> Buf[(string, KeptAt)]
+pointer_reads(cx: &KeepsCx, callee: TExpr, j: usize, steps: int, path: string) -> Buf[(string, KeptAt)]
     var out: Buf[(string, KeptAt)] = buf()
     val key = fn_key(texpr_type(callee))
 
@@ -1203,7 +1229,7 @@ pointer_reads(cx: &KeepsCx, callee: TExpr, j: usize, steps: int) -> Buf[(string,
     for item in cx.by_type
         if item.0 != key then continue
 
-        for k in read_of(cx, item.1, j, steps).locs
+        for k in read_path_of(cx, item.1, j, steps, path).locs
             out.push((item.1, k))
 
     out
@@ -1500,26 +1526,42 @@ struct Track
     // handed what is read is asked `deep_of` in its turn rather than `through_of`.
     deep: bool
 
+    // **Which field of the parameter's pointee the first step goes through**, for a walk of what is read
+    // `steps` in (`read_of` with a path): `.bus`, `.inner.bus`, `.cells[]` -- or empty, for every field.
+    // A read straight through the parameter along a field the path does not overlap is somebody else's
+    // storage, as far as the question goes (`path_ok`). `param` is the parameter's name.
+    path: string
+    param: string
+
     holds(self, name: string) -> bool = holds_string(self.held, name)
 end Track
+
+// A walk of what is read through the parameter at `i` as a read question asks it: its steps, and the
+// field the first one goes through (`read_path_of`).
+private read_track(cx: &KeepsCx, f: TFunc, i: usize, q: string) -> &Track =
+    track_along(cx, f, i, false, true, steps_of(q), path_of(q))
 
 // A walk following the parameter at `i`, or nothing at all where `i` is past the parameters -- which
 // is how what a body overwrites is asked.
 private track(cx: &KeepsCx, f: TFunc, i: usize, raw: bool) -> &Track = track_as(cx, f, i, raw, false, 0)
 
-private track_as(cx: &KeepsCx, f: TFunc, i: usize, raw: bool, through: bool, steps: int) -> &Track
+private track_as(cx: &KeepsCx, f: TFunc, i: usize, raw: bool, through: bool, steps: int) -> &Track =
+    track_along(cx, f, i, raw, through, steps, "")
+
+private track_along(cx: &KeepsCx, f: TFunc, i: usize, raw: bool, through: bool, steps: int, path: string) -> &Track
     val org = origins_of(cx, f)
     val t: &Track = Track(cx, func_home(cx.an, f.name), buf(), buf(), false, not_kept(), org, raw, through,
-                          steps, buf(), buf(), false, round_handles(cx, org, f), f, false)
+                          steps, buf(), buf(), false, round_handles(cx, org, f), f, false, path, "")
 
     if i < f.params.len()
         t.held.push(f.params.at(i).0)
         t.ptrs.push((f.params.at(i).0, 0))
+        t.param = f.params.at(i).0
     end if
 
     track_locals(t, f.body)
     t
-end track_as
+end track_along
 
 // Where `f` binds its thread handles, gathered once a round rather than once a question.
 //
@@ -1589,8 +1631,8 @@ private walk_through(cx: &KeepsCx, f: TFunc, i: usize) -> KeptWhy =
     walk_track(track_as(cx, f, i, false, true, 0), i)
 
 // The same, as the borrow rule asks it (`deep_of`).
-private walk_deep(cx: &KeepsCx, f: TFunc, i: usize) -> KeptWhy
-    val t = track_as(cx, f, i, false, true, 0)
+private walk_deep(cx: &KeepsCx, f: TFunc, i: usize, path: string) -> KeptWhy
+    val t = track_along(cx, f, i, false, true, 0, path)
 
     t.deep = true
     walk_track(t, i)
@@ -1919,12 +1961,12 @@ private track_call_locs(t: &Track, name: string, j: usize, arg: TExpr) -> Buf[Ke
         out.push(item)
 
     if t.steps == 0
-        for item in (if t.deep then deep_of(t.cx, name, j) else through_of(t.cx, name, j)).locs
+        for item in (if t.deep then deep_path_of(t.cx, name, j, hand_path(t, arg, 0)) else through_of(t.cx, name, j)).locs
             out.push(item)
     end if
 
     for k in steps_left(t, arg)
-        for item in read_of(t.cx, name, j, k).locs
+        for item in read_path_of(t.cx, name, j, k, hand_path(t, arg, k)).locs
             out.push(item)
 
     out
@@ -1941,12 +1983,12 @@ private track_vcall_locs(t: &Track, recv: TExpr, slot: int, k: usize, arg: TExpr
         out.push(item)
 
     if t.steps == 0
-        for item in (if t.deep then vcall_deep(t.cx, recv, slot, k) else vcall_through(t.cx, recv, slot, k))
+        for item in (if t.deep then vcall_deep(t.cx, recv, slot, k, hand_path(t, arg, 0)) else vcall_through(t.cx, recv, slot, k))
             out.push(item)
     end if
 
     for left in steps_left(t, arg)
-        for item in vcall_reads(t.cx, recv, slot, k, left)
+        for item in vcall_reads(t.cx, recv, slot, k, left, hand_path(t, arg, left))
             out.push(item)
 
     out
@@ -1963,12 +2005,12 @@ private track_pointer_locs(t: &Track, callee: TExpr, j: usize, arg: TExpr) -> Bu
         out.push(item)
 
     if t.steps == 0
-        for item in (if t.deep then pointer_deep(t.cx, callee, j) else pointer_through(t.cx, callee, j))
+        for item in (if t.deep then pointer_deep(t.cx, callee, j, hand_path(t, arg, 0)) else pointer_through(t.cx, callee, j))
             out.push(item)
     end if
 
     for left in steps_left(t, arg)
-        for item in pointer_reads(t.cx, callee, j, left)
+        for item in pointer_reads(t.cx, callee, j, left, hand_path(t, arg, left))
             out.push(item)
 
     out
@@ -2033,9 +2075,9 @@ private gather_steps(t: &Track, e: TExpr, out: *Buf[int], depth: int)
 
             if carries(t, place) then push_step(out, t.steps - 1)
         TDeref(x, _) -> steps_on(t, x, out, depth)
-        TField(r, _, _) -> gather_steps(t, r, out, depth + 1)
+        TField(r, _, _) -> if path_ok(t, e) then gather_steps(t, r, out, depth + 1)
         TIndex(r, _, _) -> texpr_type(r) match
-            Array(_, _) -> gather_steps(t, r, out, depth + 1)
+            Array(_, _) -> if path_ok(t, e) then gather_steps(t, r, out, depth + 1)
             _ -> steps_on(t, r, out, depth)
         TCast(v, _) -> gather_steps(t, v, out, depth + 1)
         TSlice(base, _, _, _, _) -> gather_steps(t, base, out, depth + 1)
@@ -2130,6 +2172,77 @@ end push_step
 // parameter; for a walk of what is read `steps` in, the last step, or one that reads a pointer on the
 // way.
 private steps_in(t: &Track, x: TExpr) -> bool = t.through && (t.steps == 0 || !ptr_steps(t, x).is_empty())
+
+// **Whether a read may be along the field the walk asks about** (`Track.path`): anything, where it asks
+// about every field; otherwise a read straight through the parameter -- `c.bus`, `c.inner.bus`,
+// `c.cells[i]` -- only where its field and the asked one overlap, one lying inside the other. Any other
+// read (through a copy of the pointer, a pointer moved into the pointee, the pointee whole) may be
+// along any field, so it is followed.
+private path_ok(t: &Track, e: TExpr) -> bool
+    if t.path == "" then return true
+
+    first_path(t, e) match
+        Some(p) -> paths_overlap(p, t.path)
+        None -> true
+end path_ok
+
+// The field of the parameter's pointee a place reached straight through the parameter names: `""`
+// for the pointee itself, `.bus`, `.inner.bus`, `.cells[]` (any element alike) -- or nothing, for a
+// place reached any other way. Only a parameter the body never rebinds, writes or takes the address
+// of names its pointee.
+private first_path(t: &Track, e: TExpr) -> Option[string]
+    *e.kind match
+        TDeref(x, _) -> return if param_load(t, x) then Some("") else None
+        TField(r, index, _) ->
+            val p = first_path(t, r)
+
+            if p.is_some() then return Some(field_step(p.unwrap(), pointee_or(texpr_type(r)), index))
+        TIndex(r, _, _) ->
+            val p = if is_array_type(texpr_type(r)) then first_path(t, r) else None
+
+            if p.is_some() then return Some(element_step(p.unwrap()))
+        _ -> ()
+
+    None
+end first_path
+
+private param_load(t: &Track, x: TExpr) -> bool = *x.kind match
+    TLoad(n, _) -> t.param != "" && n == t.param && !t.org.unstable.has(n) && t.org.binders.get(n).unwrap_or(0) == 0 &&
+        !holds_ref(t.refs, n)
+    _ -> false
+
+private holds_ref(refs: Buf[(string, TExpr)], n: string) -> bool
+    for item in refs
+        if item.0 == n then return true
+
+    false
+end holds_ref
+
+// Whether two field paths overlap: one is the other, or lies inside it (`.inner` and `.inner.bus`;
+// `""`, the pointee whole, and anything).
+paths_overlap(a: string, b: string) -> bool
+    val x = unfrozen(a)
+    val y = unfrozen(b)
+
+    path_within(x, y) || path_within(y, x)
+end paths_overlap
+
+// A path that stopped at a union (`.u#`) overlaps everything in the union (`.u`).
+private unfrozen(p: string) -> string = if p.ends_with("#") then p[0..<p.bytes.len - 1] else p
+
+private path_within(inner: string, outer: string) -> bool
+    if !inner.starts_with(outer) then return false
+    if inner.bytes.len == outer.bytes.len then return true
+
+    val next = inner.bytes[outer.bytes.len]
+
+    next == u8('.') || next == u8('[')
+end path_within
+
+// The field a callee handed `arg` is asked about, for a walk asking about one: the same, where the
+// argument is the parameter itself and the callee is asked the walk's own steps; every field otherwise.
+private hand_path(t: &Track, arg: TExpr, left: int) -> string =
+    if t.path != "" && left == t.steps && param_load(t, arg) then t.path else ""
 
 // A store: into this frame's own storage it binds the local (`track_locals`); anywhere else it is
 // held at the location the place names.
@@ -2489,9 +2602,10 @@ private carries(t: &Track, e: TExpr) -> bool = *e.kind match
     // body. A field read through a pointer is somebody else's storage -- but one read out of a box
     // that carries it is the box's own, and for a walk of what is read through a parameter, anything
     // read through what carries it is what is followed.
-    TField(r, _, ty) -> may_hold_pointer(t.cx, ty) && carries(t, r)
+    TField(r, _, ty) -> may_hold_pointer(t.cx, ty) && path_ok(t, e) && carries(t, r)
     TDeref(x, ty) -> may_hold_pointer(t.cx, ty) && (steps_in(t, x) || boxed(texpr_type(x))) && carries(t, x)
-    TIndex(r, _, ty) -> may_hold_pointer(t.cx, ty) && (steps_in(t, r) || is_array_type(texpr_type(r))) && carries(t, r)
+    TIndex(r, _, ty) ->
+        may_hold_pointer(t.cx, ty) && (steps_in(t, r) || is_array_type(texpr_type(r))) && path_ok(t, e) && carries(t, r)
 
     // A view cut from, or seen as, what is read through is read through as well.
     TSlice(base, _, _, _, ty) -> t.through && may_hold_pointer(t.cx, ty) && carries(t, base)
@@ -2736,6 +2850,22 @@ struct FrameTrack
     // follows is the closure literals rather than the frame's addresses.
     probe: bool
 
+    // **Which field of a local holds each address** (`read_cores_along`): a store into a field of a
+    // local's own storage (`a.peer = &b`), or a callee's into a field of what `&a` points at, puts the
+    // value in `field_binds` with the field (`.peer`) rather than in `binds`; `fields` is every point
+    // with the field of its holder it sits in, or `""` where that is not known. `points` holds them
+    // all, whatever the field.
+    field_binds: Buf[(string, string, TExpr)]
+    fields: Buf[(string, string, string, string)]
+
+    // The field of a local whose store made what the rule's walk says it holds (`held`), where a store
+    // into a field of its own storage did (`a.peer = &b` holds `&b` at `.peer`).
+    held_fields: Buf[(string, string)]
+
+    // Every local's declared type, as shown (`arg_bases`): a pointer whose pointee is that type, at a
+    // local, points at the local whole.
+    local_types: Buf[(string, string)]
+
     // What a local holds. **A probe joins everything it was bound to**, since each closure a local
     // may hold is decided on its own; the rule's own walk names the first thing, as its refusal does.
     core_of(self, name: string) -> Option[string]
@@ -2837,11 +2967,14 @@ private frame_walk(cx: &KeepsCx, faults: &KeepFaults, f: TFunc, probe: bool)
     val org = origins_of(cx, f)
     val ft: &FrameTrack = FrameTrack(cx, faults, func_home(cx.an, f.name), shown_name(cx.an, f.name),
                                      f.params, buf(), buf(), false, org, round_handles(cx, org, f), f, buf(),
-                                     buf(), buf(), buf(), buf(), buf(), false, probe)
+                                     buf(), buf(), buf(), buf(), buf(), false, probe, buf(), buf(), buf(), buf())
 
     walk_block_stmts(f.body, stmt_walk(false, s -> s match
         TRefDecl(n, _, place) -> ft.refs.push((n, place))
-        TVarDecl(n, ty, init, _) -> if may_hold_pointer(cx, ty) && stable_name(org, n) != "" then ft.inits.push((n, init))
+        TVarDecl(n, ty, init, _) ->
+            ft.local_types.push((n, type_show(ty)))
+
+            if may_hold_pointer(cx, ty) && stable_name(org, n) != "" then ft.inits.push((n, init))
         _ -> ()))
 
     if !probe
@@ -2982,7 +3115,7 @@ private frame_bind_vcall(ft: &FrameTrack, recv: TExpr, slot: int, args: Buf[TExp
 
             val loc = translate_loc(ft.org, all, item.1.loc)
 
-            if loc.starts_with("l:") then frame_hold(ft, local_of(loc), core.unwrap())
+            if loc.starts_with("l:") then frame_hold_at(ft, loc, core.unwrap())
             else probe_hold_kept(ft, all, item.1.loc, core.unwrap())
     end for
 end frame_bind_vcall
@@ -3036,14 +3169,19 @@ private frame_bind_ptr_call(ft: &FrameTrack, callee: TExpr, args: Buf[TExpr])
         for item in frame_pointer_locs(ft, callee, j, arg)
             val loc = translate_loc(ft.org, args, item.1.loc)
 
-            if loc.starts_with("l:") then frame_hold(ft, local_of(loc), core.unwrap())
+            if loc.starts_with("l:") then frame_hold_at(ft, loc, core.unwrap())
             else if ft.probe then probe_hold_kept(ft, args, item.1.loc, core.unwrap())
 end frame_bind_ptr_call
 
 // A store into this frame's own storage -- by name, or through a pointer that points into it.
 private frame_bind_store(ft: &FrameTrack, place: TExpr, v: TExpr)
     local_root(ft.refs, place) match
-        Some(n) -> frame_bind(ft, n, v)
+        Some(n) ->
+            val had = ft.core_of(n).is_some()
+
+            frame_bind(ft, n, v)
+
+            if !ft.probe && !had && ft.core_of(n).is_some() then ft.held_fields.push((n, local_path(ft.refs, place)))
         None ->
             val loc = place_loc(ft.org, place)
 
@@ -3093,7 +3231,7 @@ private frame_bind_call(ft: &FrameTrack, name: string, args: Buf[TExpr])
             for pair in frame_call_locs(ft, name, j, arg)
                 val loc = translate_loc(ft.org, args, pair.0.loc)
 
-                if loc.starts_with("l:") then frame_hold(ft, local_of(loc), core.unwrap())
+                if loc.starts_with("l:") then frame_hold_at(ft, loc, core.unwrap())
                 else if ft.probe then probe_hold_kept(ft, args, pair.0.loc, core.unwrap())
         end if
 
@@ -3102,7 +3240,7 @@ private frame_bind_call(ft: &FrameTrack, name: string, args: Buf[TExpr])
         for r in frame_read_locs(ft, name, j, arg)
             val loc = translate_loc(ft.org, args, r.1.loc)
 
-            if loc.starts_with("l:") then frame_hold(ft, local_of(loc), r.2)
+            if loc.starts_with("l:") then frame_hold_at(ft, loc, r.2)
     end for
 end frame_bind_call
 
@@ -3440,6 +3578,21 @@ private frame_bind(ft: &FrameTrack, name: string, v: TExpr)
         None -> ()
 end frame_bind
 
+// The local a location of this frame's storage names (`l:c.peer`) holds `core`, in the field the
+// location names (`held_fields`) where that is what first made it hold anything.
+private frame_hold_at(ft: &FrameTrack, loc: string, core: string)
+    val n = local_of(loc)
+    val had = ft.core_of(n).is_some()
+
+    frame_hold(ft, n, core)
+
+    if ft.probe || had || ft.core_of(n).is_none() then return
+
+    val rest = loc_path(loc["l:".bytes.len + n.bytes.len..<loc.bytes.len])
+
+    if rest.is_some() && rest.unwrap() != "" then ft.held_fields.push((n, rest.unwrap()))
+end frame_hold_at
+
 // `name` holds `core`. The rule's walk keeps the first thing a local holds; a probe keeps each closure
 // it may hold, and stops once a round adds none.
 private frame_hold(ft: &FrameTrack, name: string, core: string)
@@ -3767,8 +3920,8 @@ private frame_read_locs(ft: &FrameTrack, name: string, j: usize, arg: TExpr) -> 
 
     val closed = frame_closed(ft, arg)
 
-    for r in read_cores(ft, arg)
-        for item in read_of(ft.cx, name, j, r.0).locs
+    for r in read_cores_along(ft, arg)
+        for item in read_path_of(ft.cx, name, j, r.0, r.2).locs
             if !(closed && put_back(item.loc, j)) then out.push((name, item, r.1))
 
     out
@@ -3781,8 +3934,8 @@ private frame_vread_locs(ft: &FrameTrack, recv: TExpr, slot: int, k: usize, arg:
 
     val closed = frame_closed(ft, arg)
 
-    for r in read_cores(ft, arg)
-        for item in vcall_reads(ft.cx, recv, slot, k, r.0)
+    for r in read_cores_along(ft, arg)
+        for item in vcall_reads(ft.cx, recv, slot, k, r.0, r.2)
             if !(closed && put_back(item.1.loc, k)) then out.push((item.0, item.1, r.1))
 
     out
@@ -3795,8 +3948,8 @@ private frame_pread_locs(ft: &FrameTrack, callee: TExpr, j: usize, arg: TExpr) -
 
     val closed = frame_closed(ft, arg)
 
-    for r in read_cores(ft, arg)
-        for item in pointer_reads(ft.cx, callee, j, r.0)
+    for r in read_cores_along(ft, arg)
+        for item in pointer_reads(ft.cx, callee, j, r.0, r.2)
             if !(closed && put_back(item.1.loc, j)) then out.push((item.0, item.1, r.1))
 
     out
@@ -4114,6 +4267,92 @@ private read_cores(ft: &FrameTrack, arg: TExpr) -> Buf[(int, string)]
     out
 end read_cores
 
+// **The same, with the field of the argument's pointee each address is reached along** -- the third of
+// each: `&a`, where `a.peer` holds `&b` and `a.bus` module storage, reaches `&b` one step in along
+// `.peer` only, and a callee that lets out `c.bus` alone lets out nothing of it (`read_path_of`). Told
+// apart only for the address of a local, or of a field of one (`&a.inner`, whose `.bus` is `a`'s
+// `.inner.bus`), or for a pointer held in a local that points at locals whole (`arg_bases`), and only by
+// the field of that local the address first sits in; everything further in is reached along that
+// field. An address whose field is not known (`a = other`, a store through a pointer, a pattern) is
+// reached along every field (`""`), as is anything for any other argument.
+private read_cores_along(ft: &FrameTrack, arg: TExpr) -> Buf[(int, string, string)]
+    var out: Buf[(int, string, string)] = buf()
+
+    if ft.probe then return out
+
+    settle_points(ft)
+
+    val bases = arg_bases(ft, arg)
+
+    if bases.is_none()
+        for r in read_cores(ft, arg)
+            push_along(&out, r.0, r.1, "")
+
+        return out
+    end if
+
+    for b in bases.unwrap()
+        var held_at = ""
+
+        for item in ft.held_fields
+            if item.0 == b.0 then held_at = along(item.1, b.1)
+
+        held_along(ft, &out, 1, b.0, held_at)
+    end for
+
+    for g in bases_groups(ft, bases.unwrap())
+        cores_along(ft, &out, g.1, g.0)
+
+    out
+end read_cores_along
+
+// A field of a local said from inside the field the argument points at (`at`): `.inner.bus` from
+// `.inner` is `.bus`. One the argument's field lies inside, or is no part of, is every field.
+private along(field: string, at: string) -> string =
+    if at == "" then field else if path_within(field, at) then field[at.bytes.len..<field.bytes.len] else ""
+
+// `read_cores`' walk from the storage a field holds the address of, one step in.
+private cores_along(ft: &FrameTrack, out: *Buf[(int, string, string)], first: Buf[(string, string)], f: string)
+    var level = first
+    var k = 1
+
+    while k <= MaxReadSteps + 1 && !level.is_empty()
+        if k > MaxReadSteps
+            for p in reach(ft, level)
+                push_point(&level, p)
+
+            for p in level
+                held_along(ft, out, k, p.0, f)
+        end if
+
+        for p in level
+            if own_point(p.0) && p.1 != "" then push_along(out, k, p.1, f)
+
+        if k <= MaxReadSteps
+            for p in level
+                held_along(ft, out, k + 1, p.0, f)
+        end if
+
+        level = deref_level(ft, level)
+        k += 1
+    end while
+end cores_along
+
+private held_along(ft: &FrameTrack, out: *Buf[(int, string, string)], k: int, name: string, f: string)
+    if !own_point(name) then return
+
+    val c = ft.core_of(name)
+
+    if c.is_some() then push_along(out, k, c.unwrap(), f)
+end held_along
+
+private push_along(out: *Buf[(int, string, string)], k: int, core: string, f: string)
+    for item in *out
+        if item.0 == k && item.1 == core && item.2 == f then return
+
+    out.push((k, core, f))
+end push_along
+
 // What this frame's own walk says the storage of `name` holds, read `k` steps in.
 private held_core(ft: &FrameTrack, out: *Buf[(int, string)], k: int, name: string)
     if !own_point(name) then return
@@ -4138,9 +4377,42 @@ private note_point_store(ft: &FrameTrack, place: TExpr, v: TExpr)
     if !may_hold_pointer(ft.cx, texpr_type(v)) then return
 
     local_root(ft.refs, place) match
-        Some(n) -> ft.binds.push((n, v, false))
+        Some(n) ->
+            val field = local_path(ft.refs, place)
+
+            if field == "" then ft.binds.push((n, v, false)) else ft.field_binds.push((n, field, v))
         None -> ft.stores.push((place, v))
 end note_point_store
+
+// The field of its local's own storage a place is (`local_root`): `.peer`, `.inner.bus`, `.cells[]`
+// (any element alike), or `""` for the local whole.
+private local_path(refs: Buf[(string, TExpr)], place: TExpr) -> string
+    *place.kind match
+        TLoad(n, _) ->
+            for item in refs
+                if item.0 == n then return local_path(refs, item.1)
+        TField(r, index, _) -> return field_step(local_path(refs, r), texpr_type(r), index)
+        TIndex(r, _, _) -> return element_step(local_path(refs, r))
+        _ -> ()
+
+    ""
+end local_path
+
+// One field further along a path. **A union's fields share its storage**, so every one of them is the
+// union whole: the path stops at it, marked `#` so that nothing further in is told apart either -- as
+// it does at a field of anything but a plain struct.
+private field_step(path: string, t: Type, index: int) -> string
+    if path.ends_with("#") then return path
+
+    t match
+        Struct(d) -> if !d.union_layout && index >= 0 then return s"$path.${field_label(t, index)}"
+        _ -> ()
+
+    s"$path#"
+end field_step
+
+// One element further along a path: every element alike.
+private element_step(path: string) -> string = if path.ends_with("#") then path else s"$path[]"
 
 // The forms that put a value somewhere this frame's storage can be read: a store, a call, a pattern's
 // names, a loop's, and storage made in place -- a value whose address is taken, a box, a view's
@@ -4238,6 +4510,15 @@ private settle_points(ft: &FrameTrack)
                 if add_point(ft, b.0, v) then changed = true
         end for
 
+        for b in ft.field_binds
+            var vals: Buf[(string, string)] = buf()
+
+            addrs(ft, b.2, &vals, 0)
+
+            for v in vals
+                if add_point_at(ft, b.0, b.1, v) then changed = true
+        end for
+
         for s in ft.stores
             var vals: Buf[(string, string)] = buf()
 
@@ -4253,13 +4534,24 @@ private settle_points(ft: &FrameTrack)
     end while
 end settle_points
 
-private add_point(ft: &FrameTrack, holder: string, p: (string, string)) -> bool
+private add_point(ft: &FrameTrack, holder: string, p: (string, string)) -> bool = add_point_at(ft, holder, "", p)
+
+// A point, with the field of its holder it sits in (`FrameTrack.fields`). What changes is only whether
+// the holder may hold the address at all, which is what the fixpoint works out.
+private add_point_at(ft: &FrameTrack, holder: string, field: string, p: (string, string)) -> bool
+    var seen = false
+
+    for item in ft.fields
+        if item.0 == holder && item.1 == field && item.2 == p.0 then seen = true
+
+    if !seen then ft.fields.push((holder, field, p.0, p.1))
+
     for item in ft.points
         if item.0 == holder && item.1 == p.0 then return false
 
     ft.points.push((holder, p.0, p.1))
     true
-end add_point
+end add_point_at
 
 private push_point(out: *Buf[(string, string)], p: (string, string))
     for item in *out
@@ -4540,45 +4832,153 @@ private call_points(ft: &FrameTrack, c: TExpr) -> bool
 
         if level.is_empty() then continue
 
-        for loc in call_locs(ft, c, j, 0)
+        for loc in call_locs(ft, c, j, 0, "")
             if into_handed(ft, handed, loc, level) then changed = true
 
         if !asks_through(ft.cx, texpr_type(arg)) then continue
 
-        var k = 1
+        // **What is read through the address of a local is asked field by field** (`read_cores_along`):
+        // what a callee puts somewhere of what it reads along `.mem` is only what `.mem` reaches.
+        val bases = arg_bases(ft, arg)
 
-        while k <= MaxReadSteps + 1 && !level.is_empty()
-            var next = deref_level(ft, level)
+        if bases.is_none()
+            if read_into_handed(ft, c, handed, j, deref_level(ft, level), "") then changed = true
 
-            if k > MaxReadSteps
-                for p in reach(ft, next)
-                    push_point(&next, p)
-            end if
+            continue
+        end if
 
-            for loc in call_locs(ft, c, j, k)
-                if into_handed(ft, handed, loc, next) then changed = true
+        for g in bases_groups(ft, bases.unwrap())
+            if read_into_handed(ft, c, handed, j, g.1, g.0) then changed = true
 
-            level = next
-            k += 1
-        end while
+        // What is read through storage from anywhere else is from anywhere else (`arg_bases`).
+        var foreign: Buf[(string, string)] = buf()
+
+        for p in level
+            if p.0 == "?" then push_point(&foreign, p)
+
+        if read_into_handed(ft, c, handed, j, foreign, "") then changed = true
     end for
 
     changed
 end call_points
 
-// Where a call holds its argument at `j` (`steps` 0), or what it reads `steps` steps through it.
-private call_locs(ft: &FrameTrack, c: TExpr, j: usize, steps: int) -> Buf[string]
+// What a callee reads `k` steps through its argument at `j` along a field (`path`), from `first`, the
+// storage one step in, lands where the callee puts it (`read_path_of`), step by step.
+private read_into_handed(ft: &FrameTrack, c: TExpr, handed: Buf[TExpr], j: usize, first: Buf[(string, string)],
+                         path: string) -> bool
+    var changed = false
+    var next = first
+    var k = 1
+
+    while k <= MaxReadSteps + 1 && !next.is_empty()
+        if k > MaxReadSteps
+            for p in reach(ft, next)
+                push_point(&next, p)
+        end if
+
+        for loc in call_locs(ft, c, j, k, path)
+            if into_handed(ft, handed, loc, next) then changed = true
+
+        next = deref_level(ft, next)
+        k += 1
+    end while
+
+    changed
+end read_into_handed
+
+// **The locals an argument points into, each with the field it points at** -- `&a` is `a` whole (`""`),
+// `&a.inner` is `a`'s `.inner` -- or nothing, where that is not known: a field inside a union, storage
+// from anywhere else, a value made in place. A pointer held in a local (`for k in [&c, &peer]`) points
+// at the locals it may hold the address of, each whole where its pointee's type is the local's own,
+// since nothing inside a value has the value's own type.
+private arg_bases(ft: &FrameTrack, arg: TExpr) -> Option[Buf[(string, string)]]
+    var out: Buf[(string, string)] = buf()
+
+    *arg.kind match
+        TAddrOf(place, _) ->
+            local_root(ft.refs, place) match
+                Some(n) ->
+                    val at = local_path(ft.refs, place)
+
+                    if at.ends_with("#") then return None
+
+                    out.push((n, at))
+                    return Some(out)
+                None -> return None
+        _ -> ()
+
+    val pointee = texpr_type(arg) match
+        Ptr(inner) -> type_show(*inner)
+        _ -> return None
+
+    var level: Buf[(string, string)] = buf()
+
+    addrs(ft, arg, &level, 0)
+
+    if level.is_empty() then return None
+
+    // Storage from anywhere else holds no address of this frame's (`deref_level`), so it adds nothing.
+    for p in level
+        if p.0 == "?" then continue
+        if !own_point(p.0) || !whole_of(ft, p.0, pointee) then return None
+
+        out.push((p.0, ""))
+    end for
+
+    if out.is_empty() then None else Some(out)
+end arg_bases
+
+// Whether a local is declared, everywhere it is declared, with this type.
+private whole_of(ft: &FrameTrack, n: string, shown: string) -> bool
+    var any = false
+
+    for item in ft.local_types
+        if item.0 != n then continue
+        if item.1 != shown then return false
+
+        any = true
+    end for
+
+    any
+end whole_of
+
+// What the storage of the locals an argument points into holds the address of, by the field it sits
+// in, said from inside the field each argument points at (`along`) -- the same field of each joined.
+private bases_groups(ft: &FrameTrack, bases: Buf[(string, string)]) -> Buf[(string, Buf[(string, string)])]
+    var out: Buf[(string, Buf[(string, string)])] = buf()
+    var fields: Buf[string] = buf()
+
+    for b in bases
+        for item in ft.fields
+            if item.0 == b.0 && !holds_string(fields, along(item.1, b.1)) then fields.push(along(item.1, b.1))
+
+    for f in fields
+        var level: Buf[(string, string)] = buf()
+
+        for b in bases
+            for item in ft.fields
+                if item.0 == b.0 && along(item.1, b.1) == f then push_point(&level, (item.2, item.3))
+
+        out.push((f, level))
+    end for
+
+    out
+end bases_groups
+
+// Where a call holds its argument at `j` (`steps` 0), or what it reads `steps` steps through it along
+// a field (`path`, empty for every field).
+private call_locs(ft: &FrameTrack, c: TExpr, j: usize, steps: int, path: string) -> Buf[string]
     var out: Buf[string] = buf()
 
     *c.kind match
         TCall(name, _, _, _) ->
-            for item in (if steps == 0 then keeps_of(ft.cx, name, j) else read_of(ft.cx, name, j, steps)).locs
+            for item in (if steps == 0 then keeps_of(ft.cx, name, j) else read_path_of(ft.cx, name, j, steps, path)).locs
                 out.push(item.loc)
         TVCall(recv, slot, _, _, _) ->
-            for item in (if steps == 0 then vcall_keeps(ft.cx, recv, slot, j) else vcall_reads(ft.cx, recv, slot, j, steps))
+            for item in (if steps == 0 then vcall_keeps(ft.cx, recv, slot, j) else vcall_reads(ft.cx, recv, slot, j, steps, path))
                 out.push(item.1.loc)
         TCallPtr(callee, _, _, _) ->
-            for item in (if steps == 0 then pointer_keeps(ft.cx, callee, j) else pointer_reads(ft.cx, callee, j, steps))
+            for item in (if steps == 0 then pointer_keeps(ft.cx, callee, j) else pointer_reads(ft.cx, callee, j, steps, path))
                 out.push(item.1.loc)
         _ -> ()
 
@@ -4596,28 +4996,111 @@ private into_handed(ft: &FrameTrack, handed: Buf[TExpr], loc: string, vals: Buf[
 
     addrs(ft, handed.at(usize(i)), &first, 0)
 
-    var targets = reach(ft, first)
-
-    for p in first
-        targets.push(p)
-
+    val field = handed_field(ft, handed.at(usize(i)), loc, i)
     var changed = false
 
-    for t in targets
+    // A location in the pointee's own storage (`p0:.peer`) lands in what the argument points at and
+    // nowhere further in.
+    if !in_pointee(loc, i)
+        for t in reach(ft, first)
+            if t.0 == "?" || flat_local(ft, t.0) then continue
+
+            for v in vals
+                if add_point(ft, t.0, v) then changed = true
+        end for
+    end if
+
+    for t in first
         if t.0 == "?" || flat_local(ft, t.0) then continue
 
         for v in vals
-            if add_point(ft, t.0, v) then changed = true
+            if add_point_at(ft, t.0, field, v) then changed = true
     end for
 
     changed
 end into_handed
+
+// **The field of a local a callee's store lands in**, where the argument is the address of the local
+// or of a field of it (`&a`, `&a.inner`): the field of what that parameter points at the callee's
+// location names (`p0:.peer` is `.peer`, or `.inner.peer`), and where the location lies further in --
+// through a pointer read on the way, `w.list.push(&x)` -- the argument's own field, which is the only
+// way into it from the local. `""` -- the local whole -- for anything else.
+private handed_field(ft: &FrameTrack, arg: TExpr, loc: string, i: int) -> string
+    val head = s"p$i:"
+    val bases = arg_bases(ft, arg)
+
+    if bases.is_none() then return ""
+
+    for b in bases.unwrap()
+        if b.1 != bases.unwrap().at(0).1 then return ""
+
+    val base = Some(bases.unwrap().at(0).1)
+
+    val rest = if loc.starts_with(head) then loc_path(loc[head.bytes.len..<loc.bytes.len]) else None
+
+    if rest.is_none() then base.unwrap() else field_join(base.unwrap(), rest.unwrap())
+end handed_field
+
+// Whether a callee location is a field or element of the pointee of its parameter `i` itself, reached
+// through no other pointer (`p0:.peer`, `p0:.cells[=1]`).
+private in_pointee(loc: string, i: int) -> bool
+    val head = s"p$i:"
+
+    loc.starts_with(head) && loc_path(loc[head.bytes.len..<loc.bytes.len]).is_some()
+end in_pointee
+
+// A path inside a field: nothing further is told apart inside a union (`#`).
+private field_join(base: string, rest: string) -> string = if base.ends_with("#") then base else s"$base$rest"
+
+// A callee location's fields and elements as a path (`.inner.peer`, `.cells[]`), or nothing where it
+// steps through anything else -- a pointer read on the way, an offset nobody knows.
+private loc_path(s: string) -> Option[string]
+    var out = ""
+    var at = 0
+    val bytes = s.bytes
+
+    while at < bytes.len
+        val b = bytes[at]
+
+        if b == u8('.')
+            var end_at = at + 1
+
+            while end_at < bytes.len && !path_stop(bytes[end_at])
+                end_at += 1
+
+            if end_at == at + 1 then return None
+
+            out = out + s[at..<end_at]
+            at = end_at
+        else if b == u8('[')
+            var end_at = at + 1
+
+            while end_at < bytes.len && bytes[end_at] != u8(']')
+                end_at += 1
+
+            if end_at >= bytes.len then return None
+
+            out = out + "[]"
+            at = end_at + 1
+        else
+            return None
+        end if
+    end while
+
+    Some(out)
+end loc_path
+
+private path_stop(b: u8) -> bool =
+    b == u8('.') || b == u8('[') || b == u8('>') || b == u8('{') || b == u8('?') || b == u8('*') || b == u8(':')
 
 // A local whose type holds no address -- unless a local of the same name elsewhere in the body does.
 private flat_local(ft: &FrameTrack, name: string) -> bool
     if !holds_string(ft.flat, name) then return false
 
     for b in ft.binds
+        if b.0 == name then return false
+
+    for b in ft.field_binds
         if b.0 == name then return false
 
     true
