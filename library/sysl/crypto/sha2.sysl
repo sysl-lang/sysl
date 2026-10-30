@@ -91,6 +91,30 @@ impl Compression for Sha2Wide
 
     compress(h: *[8]u64, block: []const u8) = sha2_compress(h, block)
 
+// The state SHA-256 starts from (FIPS 180-4 § 5.3.3) and the state SHA-224 starts from (§ 5.3.2).
+//
+// They are what `sha256_compress` is chained from: copy one into an eight-word state, compress each
+// padded block into it, and the words are the digest (SHA-224 keeps the first seven).
+val sha256_init: [8]u32 = iv256
+val sha224_init: [8]u32 = iv224
+
+// One 64-byte block of SHA-256 into `state`, in place, and nothing more.
+//
+// This is the compression function alone, for a caller that owns the rest: it does no buffering, no
+// padding and no finalisation, so the caller pads the message (FIPS 180-4 § 5.1.1) and feeds the
+// blocks in order. The same function serves SHA-224, which differs only in its initial state and in
+// keeping seven of the eight result words. The words are big-endian numbers, as in the standard; the
+// block is read big-endian.
+//
+// **Traps unless `block.len == 64`**: a short block is a caller's bug and a long one would silently
+// ignore its tail.
+sha256_compress(state: *[8]u32, block: []const u8)
+    if block.len != 64
+        trap()
+
+    sha2_compress(state, block)
+end sha256_compress
+
 // A hasher for one of the four digests.
 //
 // **The genericity stops here, deliberately.** `Sha[C]` is one implementation serving every hash in

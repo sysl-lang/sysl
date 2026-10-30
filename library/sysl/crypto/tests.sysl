@@ -934,3 +934,165 @@ what_a_derivation_refuses()
     assert(hkdf256(pattern(0), repeated(0x0b, 22), pattern(0), the_most).is_ok(),
         "255 blocks is what the counter can reach")
 end what_a_derivation_refuses
+
+
+// -- the bare compression function ------------------------------------------------------------------
+//
+// `sha256_compress` is one block into eight words and nothing else, so everything around it -- the
+// padding, the chaining, the serialising -- is written here by hand and checked against the hashers,
+// which is the independent implementation of the same arithmetic.
+
+// A message with the padding FIPS 180-4 § 5.1.1 gives it: a one bit, zeroes, then the bit length as a
+// big-endian 64-bit number, filling a whole number of 64-byte blocks.
+private padded(m: []const u8) -> []u8
+    var total = (m.len + 9 + 63) / 64 * 64
+    var out: []u8 = [0; total]
+
+    for i in 0..<m.len do out[i] = m[i]
+
+    out[m.len] = 0x80
+
+    var bits = u64(m.len) * 8
+
+    for i in 0..<8usize do out[total - 1 - i] = u8((bits >> u64(i * 8)) & 255)
+
+    out
+end padded
+
+// The digest of `m` reached by feeding its padded blocks to the compression function one at a time.
+private digest_by_compress(m: []const u8) -> []u8
+    var blocks = padded(m)
+    var st = sha256_init
+    var at = 0usize
+
+    while at < blocks.len
+        sha256_compress(&st, blocks[at..<at + 64])
+        at += 64
+
+    var out: []u8 = [0; 32]
+
+    for i in 0..<8usize
+        for j in 0..<4usize do out[i * 4 + j] = u8((st[i] >> u32(24 - j * 8)) & 255)
+
+    out
+end digest_by_compress
+
+@test("one padded block of \"abc\" from the initial state is FIPS 180-4's worked example")
+compress_the_standard_example()
+    var block: []u8 = [0; 64]
+
+    block[0] = 0x61
+    block[1] = 0x62
+    block[2] = 0x63
+    block[3] = 0x80
+    block[63] = 0x18
+
+    var st = sha256_init
+
+    sha256_compress(&st, block)
+
+    var want: [8]u32 = [
+        0xba7816bf, 0x8f01cfea, 0x414140de, 0x5dae2223,
+        0xb00361a3, 0x96177a9c, 0xb410ff61, 0xf20015ad,
+    ]
+
+    for i in 0..<8usize do assert_eq(st[i], want[i])
+end compress_the_standard_example
+
+@test("the initial states are the standard's")
+compress_initial_states()
+    assert_eq(sha256_init[0], 0x6a09e667)
+    assert_eq(sha256_init[7], 0x5be0cd19)
+    assert_eq(sha224_init[0], 0xc1059ed8)
+    assert_eq(sha224_init[7], 0xbefa4fa4)
+end compress_initial_states
+
+@test("a padded empty message is one block, and gives the empty digest")
+compress_the_empty_message()
+    var block = padded("".bytes)
+
+    assert_eq(block.len, 64)
+    assert_eq(block[0], 0x80)
+
+    var st = sha256_init
+
+    sha256_compress(&st, block)
+
+    var want: [8]u32 = [
+        0xe3b0c442, 0x98fc1c14, 0x9afbf4c8, 0x996fb924,
+        0x27ae41e4, 0x649b934c, 0xa495991b, 0x7852b855,
+    ]
+
+    for i in 0..<8usize do assert_eq(st[i], want[i])
+end compress_the_empty_message
+
+@test("the state is updated in place, and any state works, not only the initial one")
+compress_updates_in_place()
+    var block = padded(abc())
+    var once = sha256_init
+
+    sha256_compress(&once, block)
+
+    assert(once[0] != sha256_init[0], "the state moved")
+
+    // The same block again from where the first left off is a different state from either, and equal
+    // to chaining it by hand a second time.
+    var twice = once
+
+    sha256_compress(&twice, block)
+
+    assert(twice[0] != once[0])
+
+    var again = sha256_init
+
+    sha256_compress(&again, block)
+    sha256_compress(&again, block)
+
+    for i in 0..<8usize do assert_eq(again[i], twice[i])
+
+    // A SHA-224 start is a different function of the same block.
+    var narrow = sha224_init
+
+    sha256_compress(&narrow, block)
+
+    assert_eq(hex_string(sha224(abc()))[0..<8], "23097d22")
+    assert_eq(narrow[0], 0x23097d22)
+    assert_eq(narrow[6], 0xe36c9da7)
+end compress_updates_in_place
+
+@test("chaining padded blocks gives the hasher's digest, across every padding boundary")
+compress_agrees_with_the_hasher()
+    // 55 pads into one block, 56 is the first that needs two, 119 the last that does; 120 needs three.
+    for n in [0usize, 1, 3, 55, 56, 57, 63, 64, 65, 100, 119, 120, 200]
+        var m = pattern(n)
+
+        assert_eq(hex_string(digest_by_compress(m)), hex_string(sha256(m)))
+end compress_agrees_with_the_hasher
+
+@test("two blocks chain: the 56-byte message FIPS 180-4 uses")
+compress_two_blocks()
+    assert_eq(hex_string(digest_by_compress(alpha448())),
+        "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1")
+    assert_eq(hex_string(digest_by_compress(alpha896())),
+        "cf5b16a778af8380036ce59e7b0492370b249b11e8f07a51afac45037afee9d1")
+end compress_two_blocks
+
+@test(should_trap)
+compress_refuses_a_short_block()
+    var st = sha256_init
+    var ok: []u8 = [0; 64]
+    var short: []u8 = [0; 63]
+
+    sha256_compress(&st, ok)
+    sha256_compress(&st, short)
+end compress_refuses_a_short_block
+
+@test(should_trap)
+compress_refuses_a_long_block()
+    var st = sha256_init
+    var ok: []u8 = [0; 64]
+    var long: []u8 = [0; 65]
+
+    sha256_compress(&st, ok)
+    sha256_compress(&st, long)
+end compress_refuses_a_long_block
