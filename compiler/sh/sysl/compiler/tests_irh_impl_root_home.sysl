@@ -1,0 +1,263 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, remove_dir_all, write_text}
+import sysl.text.{join, Search}
+
+// **A member of an `impl` for a BUILT-IN type answers to the module it was written in.** Such a member
+// is lowered under the receiver's symbol, and a built-in type has no module, so `impl E for i32` in a
+// dependency was filed under the key of the program's ROOT module. Asked of that key, the dependency's
+// impl read as the root's own code: a root that declared `@no_os` (or `@no_alloc`, or `@no_block`)
+// was told, once per member and pointing into the dependency, that every `impl E` member reached what
+// it gave up -- members of types it never instantiated among them (`checks.sysl`'s `home_module`).
+//
+// Its other half: with those spurious refusals gone, a call through a trait object was refused by
+// nobody, because the erasure that fills the table and the call through its slot are rarely one node
+// (`reaches.sysl`'s `reached_tables`). It is now refused at the call the `@no_os` module wrote.
+//
+// Every tree is two packages, `app` depending on `k` by `path`, so `k`'s modules are filed `k.k`.
+
+private irh_ready() -> bool = std_root().is_ok() && clang_available()
+
+// The library every case depends on: three traits, each implemented for `i32` and `i64`.
+private irh_lib_source() -> string =
+    "module k\n\n" +
+    "@needs(os)\nextern \"getpid\" c_pid() -> i32\n\n" +
+    "trait E\n    make() -> Self\n\n" +
+    "impl E for i32\n    make() -> i32 = c_pid()\n\n" +
+    "impl E for i64\n    make() -> i64 = i64(c_pid())\n\n" +
+    "fetch[T: E]() -> T = T.make()\n\n" +
+    "relay[T: E]() -> T = fetch[T]()\n\n" +
+    "trait P\n    plain() -> Self\n\n" +
+    "impl P for i32\n    plain() -> i32 = 7\n\n" +
+    "impl P for i64\n    plain() -> i64 = i64(c_pid())\n\n" +
+    "pick[T: P]() -> T = T.plain()\n\n" +
+    "trait D\n    get(self) -> i32\n\n" +
+    "impl D for i32\n    get(self) -> i32 = self + c_pid()\n\n" +
+    "impl D for i64\n    get(self) -> i32 = 1 + c_pid()\n"
+
+// A package `k` holding one module `k` written as `source`.
+private irh_package(source: string) -> string
+    val dir = lbr_temp("sysl-irh-k-")
+
+    make_dir_all(s"$dir/k").unwrap()
+    write_text(s"$dir/sysl.hocon", "package { name = \"k\", version = \"0.1.0\" }\n").unwrap()
+    write_text(s"$dir/k/k.sysl", source).unwrap()
+    dir
+end irh_package
+
+// A program depending on `lib` by path, with `files` written under its root.
+private irh_app(lib: string, files: []const (string, string)) -> string
+    val root = lbr_temp("sysl-irh-app-")
+
+    write_text(s"$root/sysl.hocon",
+               s"package { name = \"app\", version = \"0.1.0\" }\ndependencies { k { path = \"$lib\" } }\n").unwrap()
+
+    for i in 0..<files.len
+        val (name, text) = files[i]
+        val slash = name.index_of("/")
+
+        if slash.is_some() then make_dir_all(s"$root/${name[0..<slash.unwrap()]}").unwrap()
+        write_text(s"$root/$name", text).unwrap()
+
+    root
+end irh_app
+
+// What `sysl build-c` says about a tree: its status, every line, and how many lines are errors.
+private irh_built(root: string) -> (int, string, int)
+    var lines: Buf[string] = buf()
+    val sink = &lines
+    val code = run_cli(["sysl", "build-c", root, "-o", s"$root/out.a"], (line) -> sink.push(line))
+
+    reset_search_paths()
+
+    // Counted in the text rather than per line: one line handed to the sink can carry several reports.
+    val text = join(lines.view(), "\n")
+    var errors = 0
+    var rest = text
+
+    loop
+        val at = rest.index_of("error: ")
+
+        if at.is_none() then break
+
+        errors += 1
+        rest = rest[at.unwrap() + 7..<rest.bytes.len]
+
+    (code, text, errors)
+end irh_built
+
+// Builds `app` against the library and removes both trees.
+private irh_two(files: []const (string, string)) -> (int, string, int, string)
+    val lib = irh_package(irh_lib_source())
+    val root = irh_app(lib, files)
+    val (code, out, errors) = irh_built(root)
+
+    remove_dir_all(root).unwrap_or(())
+    remove_dir_all(lib).unwrap_or(())
+    (code, out, errors, root)
+end irh_two
+
+private irh_says(out: string, message: string, at: string, line: string) -> bool =
+    out.contains(s"error: $message") && out.contains(s" --> $at") && out.contains(line)
+
+private irh_no_os_through(who: string, seed: string) -> string =
+    s"this reaches '$who', which needs 'os' through '$seed', and this module declared '@no_os'"
+
+// -- the reduction ----------------------------------------------------------------------------------
+
+@test("a root that declared '@no_os' is refused once, at its own call, and never inside the dependency")
+irh_reduction()
+    if !irh_ready() then return
+
+    val (code, out, errors, root) =
+        irh_two([("main.sysl", "@no_os\n\nimport k.fetch\n\ntotal() -> i32 = fetch[i32]()\n")])
+
+    assert_eq(code, 1, out)
+    assert_eq(errors, 1, out)
+    assert(irh_says(out, irh_no_os_through("k.k.fetch.int", "k.k.c_pid"), s"$root/main.sysl:5:23",
+                    "5 | total() -> i32 = fetch[i32]()"), out)
+    assert(!out.contains("k/k.sysl"), out)
+end irh_reduction
+
+@test("a root that instantiates nothing of the dependency's is not told about its impls at all")
+irh_uninstantiated()
+    if !irh_ready() then return
+
+    val (code, out, errors, _) =
+        irh_two([("main.sysl", "@no_os\n\nimport k.fetch\n\ntotal() -> i32 = 3\n")])
+
+    assert_eq(code, 0, out)
+    assert_eq(errors, 0, out)
+end irh_uninstantiated
+
+@test("a generic two levels deep is refused at the root's call, naming the generic it called")
+irh_generic_chain()
+    if !irh_ready() then return
+
+    val (code, out, errors, root) =
+        irh_two([("main.sysl", "@no_os\n\nimport k.relay\n\ntotal() -> i32 = relay[i32]()\n")])
+
+    assert_eq(code, 1, out)
+    assert_eq(errors, 1, out)
+    assert(irh_says(out, irh_no_os_through("k.k.relay.int", "k.k.c_pid"), s"$root/main.sysl:5:23",
+                    "5 | total() -> i32 = relay[i32]()"), out)
+end irh_generic_chain
+
+@test("a root that instantiates only an impl needing nothing is accepted, beside one that needs 'os'")
+irh_pure_impl()
+    if !irh_ready() then return
+
+    val (code, out, errors, _) =
+        irh_two([("main.sysl", "@no_os\n\nimport k.pick\n\ntotal() -> i32 = pick[i32]()\n")])
+
+    assert_eq(code, 0, out)
+    assert_eq(errors, 0, out)
+end irh_pure_impl
+
+@test("a named '@no_os' module of the program is refused at its call, as it always was")
+irh_named_module()
+    if !irh_ready() then return
+
+    val (code, out, errors, root) =
+        irh_two([("app/core.sysl", "module app\n@no_os\n\nimport k.fetch\n\ntotal() -> i32 = fetch[i32]()\n"),
+                 ("main.sysl", "import app.total\n\nprint(total())\n")])
+
+    assert_eq(code, 1, out)
+    assert_eq(errors, 1, out)
+    assert(irh_says(out, "this reaches 'k.k.fetch.int', which needs 'os' through 'k.k.c_pid', and " +
+                         "'app' declared '@no_os'", s"$root/app/core.sysl:6:23",
+                    "6 | total() -> i32 = fetch[i32]()"), out)
+end irh_named_module
+
+// -- through a trait object ---------------------------------------------------------------------------
+
+// The table IS reached here: the root erases an `i32` into `&D` and calls through the slot, so the
+// `i32` member's `c_pid` runs on the root's behalf. It is refused at the root's calls -- `ask(5)`,
+// which erases and arrives at the slot in `ask`'s body, and `d.get()`, a statement after the erasure
+// that filled `d` -- and `ask` itself, whose `&D` is its caller's choice, is not.
+@test("a call through a trait object the root filled is refused at the root's call, not in the impl")
+irh_trait_object()
+    if !irh_ready() then return
+
+    val (code, out, errors, root) =
+        irh_two([("main.sysl", "@no_os\n\nimport k.D\n\nask(x: &D) -> i32 = x.get()\n\n" +
+                               "total() -> i32 = ask(5)\n\n" +
+                               "direct() -> i32\n    val d: &D = 6\n    d.get()\nend direct\n")])
+
+    val said = "this reaches 'k.k.c_pid', which needs 'os', and this module declared '@no_os'"
+
+    assert_eq(code, 1, out)
+    assert_eq(errors, 2, out)
+    assert(irh_says(out, said, s"$root/main.sysl:7:18", "7 | total() -> i32 = ask(5)"), out)
+    assert(irh_says(out, said, s"$root/main.sysl:11:7", "11 |     d.get()"), out)
+    assert(!out.contains("k/k.sysl"), out)
+end irh_trait_object
+
+@test("a root that only names the trait object's type, erasing nothing, is accepted")
+irh_trait_object_unfilled()
+    if !irh_ready() then return
+
+    val (code, out, errors, _) =
+        irh_two([("main.sysl", "@no_os\n\nimport k.D\n\nask(x: &D) -> i32 = x.get()\n")])
+
+    assert_eq(code, 0, out)
+    assert_eq(errors, 0, out)
+end irh_trait_object_unfilled
+
+// -- one package --------------------------------------------------------------------------------------
+
+@test("the same within one package: one refusal, at the root's call")
+irh_single_package()
+    if !irh_ready() then return
+
+    val root = lbr_temp("sysl-irh-one-")
+
+    make_dir_all(s"$root/k").unwrap()
+    write_text(s"$root/sysl.hocon", "package { name = \"app\", version = \"0.1.0\" }\n").unwrap()
+    write_text(s"$root/k/k.sysl", irh_lib_source()).unwrap()
+    write_text(s"$root/main.sysl", "@no_os\n\nimport k.fetch\n\ntotal() -> i32 = fetch[i32]()\n").unwrap()
+
+    val (code, out, errors) = irh_built(root)
+
+    remove_dir_all(root).unwrap_or(())
+    assert_eq(code, 1, out)
+    assert_eq(errors, 1, out)
+    assert(irh_says(out, irh_no_os_through("k.fetch.int", "k.c_pid"), s"$root/main.sysl:5:23",
+                    "5 | total() -> i32 = fetch[i32]()"), out)
+end irh_single_package
+
+// -- the other two clauses asked the same way ---------------------------------------------------------
+
+@test("a root that declared '@no_alloc' is not held to a dependency's allocating impl for i32")
+irh_no_alloc()
+    if !irh_ready() then return
+
+    val lib = irh_package("module k\n\ntrait E\n    make() -> Self\n\n" +
+                          "impl E for i32\n    make() -> i32 = i32(7.to_string().len)\n\n" +
+                          "impl E for i64\n    make() -> i64 = i64(8.to_string().len)\n")
+    val root = irh_app(lib, [("main.sysl", "@no_alloc\n\nimport k.E\n\ntotal() -> i32 = 3\n")])
+    val (code, out, errors) = irh_built(root)
+
+    remove_dir_all(root).unwrap_or(())
+    remove_dir_all(lib).unwrap_or(())
+    assert_eq(code, 0, out)
+    assert_eq(errors, 0, out)
+end irh_no_alloc
+
+@test("a root that declared '@no_block' is not held to a dependency's blocking impl for i32")
+irh_no_block()
+    if !irh_ready() then return
+
+    val lib = irh_package("module k\n\n@blocks\nextern \"usleep\" c_usleep(us: u32) -> i32\n\n" +
+                          "trait E\n    make() -> Self\n\n" +
+                          "impl E for i32\n    make() -> i32 = c_usleep(1)\n")
+    val root = irh_app(lib, [("main.sysl", "@no_block\n\nimport k.E\n\ntotal() -> i32 = 3\n")])
+    val (code, out, errors) = irh_built(root)
+
+    remove_dir_all(root).unwrap_or(())
+    remove_dir_all(lib).unwrap_or(())
+    assert_eq(code, 0, out)
+    assert_eq(errors, 0, out)
+end irh_no_block

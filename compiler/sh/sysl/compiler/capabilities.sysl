@@ -801,7 +801,7 @@ check_decl_capabilities(a: &Analysis, funcs: Buf[TFunc], vals: Buf[TVal], vtable
             // with no operating system would be refused for doing what its annotation says it does.
             if body_covers(a, f.name, cap) then continue
 
-            val module_name = module_of(f.name)
+            val module_name = home_module(a, f.name)
             val scope = func_home(a, f.name)
 
             // The file rather than the emitted name, for the reason `no_alloc.sysl` gives: an
@@ -830,22 +830,30 @@ check_decl_capabilities(a: &Analysis, funcs: Buf[TFunc], vals: Buf[TVal], vtable
                              why_lacking(a, scope, module_name, cap, scaffolding))
 end check_decl_capabilities
 
+// Each node is asked with the tables its whole body erases into (`reaches.sysl`'s `reached_tables`),
+// so a call through a trait object is refused where the module wrote it -- at the call whose slot
+// lands in a table this body filled, not inside the implementation, which is another module's code.
 private blame_needs(a: &Analysis, walk: &Reaches, scope: Scope, b: TBlock, cap: string, why: string)
-    walk_block_stmts(b, TWalk(false, e -> blame_needs_one(a, walk, scope, e, cap, why),
+    val tables = reached_tables(walk, refs_of_block(b))
+
+    walk_block_stmts(b, TWalk(false, e -> blame_needs_one(a, walk, tables, scope, e, cap, why),
                               w -> (), st -> ()))
 end blame_needs
 
 private blame_needs_expr(a: &Analysis, walk: &Reaches, scope: Scope, e: TExpr, cap: string,
                          why: string)
-    walk_texpr(e, TWalk(false, n -> blame_needs_one(a, walk, scope, n, cap, why), w -> (), st -> ()))
+    val tables = reached_tables(walk, refs_of_expr(e))
+
+    walk_texpr(e, TWalk(false, n -> blame_needs_one(a, walk, tables, scope, n, cap, why), w -> (),
+                        st -> ()))
 end blame_needs_expr
 
-private blame_needs_one(a: &Analysis, walk: &Reaches, scope: Scope, e: TExpr, cap: string,
-                        why: string)
-    val mine = named_reach(walk, own_refs(e))
+private blame_needs_one(a: &Analysis, walk: &Reaches, tables: Buf[string], scope: Scope, e: TExpr,
+                        cap: string, why: string)
+    val mine = named_reach(walk, with_tables(own_refs(e), tables))
 
     if mine.is_none() then return
-    if reaches_a_seed(walk, strict_refs(e)) then return
+    if reaches_a_seed(walk, with_tables(strict_refs(e), tables)) then return
     if refused_as_module(a, scope, e.span, cap) then return
 
     // What the reader's code reached is named, and the declaration that asked for the capability
@@ -1292,16 +1300,6 @@ private ref_terms(from: string, to: string, needs: Buf[string], scaffolding: boo
 
     out
 end ref_terms
-
-// The module a body was written in, which is not always the one its symbol names: a member of an
-// `impl` written for another module's type is lowered under the receiver's.
-private home_module(a: &Analysis, name: string) -> string
-    val home = a.tables.homes.get(name)
-
-    if home.is_some() && home.unwrap().src.name != "" then return home.unwrap().module_name
-
-    module_of(name)
-end home_module
 
 // What the declaration a body was read under covers, which is what reaching it is charged with.
 private body_needs(a: &Analysis, name: string) -> Buf[string]
