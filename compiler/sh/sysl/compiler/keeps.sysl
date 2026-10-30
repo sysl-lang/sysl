@@ -730,6 +730,7 @@ private val ThroughQ = "&"
 private val ThroughAnswersQ = "%"
 private val ReadQ = "#"
 private val ReadAnswersQ = "+"
+private val DeepQ = "@"
 
 // Whether `name` keeps the argument at position `i`, why, and every location it may be held at.
 keeps_of(cx: &KeepsCx, name: string, i: usize) -> KeptWhy = summary(cx, name, i, KeepsQ)
@@ -771,10 +772,20 @@ through_answers_of(cx: &KeepsCx, name: string, i: usize) -> bool = summary(cx, n
 // pointer: an `extern` borrows unless its `@keeps` names the parameter, and a call through an object
 // of no known trait, or a function pointer C may call, is held to the default (`vcall_reads`,
 // `pointer_reads`). **Past `MaxReadSteps` it is what the body lets out of anything it reads through
-// the parameter** (`through_of`), which holds everything read that deep and more: a question deeper
+// the parameter** (`deep_of`), which holds everything read that deep and more: a question deeper
 // than the summaries tell apart is answered conservatively, never let through.
 read_of(cx: &KeepsCx, name: string, i: usize, steps: int) -> KeptWhy =
-    if steps > MaxReadSteps then through_of(cx, name, i) else summary(cx, name, i, s"$ReadQ$steps")
+    if steps > MaxReadSteps then deep_of(cx, name, i) else summary(cx, name, i, s"$ReadQ$steps")
+
+// **What a body lets out of anything it reads through the parameter at `i`, as the borrow rule asks
+// it**: `through_of`'s walk, where a callee with no body in sight is held to the rule's own default --
+// an `extern` borrows what it reads unless its `@keeps` names the parameter, and a call through an
+// object of no known trait or a function pointer C may call lets nothing out -- as `read_of` holds it
+// at every step it tells apart. `through_of` itself takes C to keep what it reads, which is the
+// question a closure's placement asks: a closure handed to C inside a struct may be a callback C
+// registers. A self-referential value (one holding the address of its own storage) reaches past
+// `MaxReadSteps` at once, so asking `through_of` here refused it handed through a wrapper to C.
+deep_of(cx: &KeepsCx, name: string, i: usize) -> KeptWhy = summary(cx, name, i, DeepQ)
 
 // Whether what `name` answers can be made of a value it read `steps` steps through the parameter at
 // `i` -- past `MaxReadSteps`, of anything it read through it.
@@ -799,7 +810,8 @@ private summary(cx: &KeepsCx, name: string, i: usize, q: string) -> KeptWhy
     val keeping = q == KeepsQ
     val reading = q.starts_with(ReadQ)
     val read_answering = q.starts_with(ReadAnswersQ)
-    val through = q == ThroughQ || q == ThroughAnswersQ || reading || read_answering
+    val deep = q == DeepQ
+    val through = q == ThroughQ || q == ThroughAnswersQ || reading || read_answering || deep
 
     cx.settled.get(key) match
         Some(v) -> return v
@@ -824,7 +836,7 @@ private summary(cx: &KeepsCx, name: string, i: usize, q: string) -> KeptWhy
     if found.is_none()
         if keeping then return extern_kept(cx, name, i)
         if q == ThroughQ then return extern_through(cx, name, i)
-        if reading then return extern_kept(cx, name, i)
+        if reading || deep then return extern_kept(cx, name, i)
         if q == ClearsQ then return not_kept()
         if q == BorrowQ then return KeptWhy(false, s"'$name' has no body in sight", span_zero(), buf())
 
@@ -849,7 +861,7 @@ private summary(cx: &KeepsCx, name: string, i: usize, q: string) -> KeptWhy
     if keeping && lent_by_rule(cx, f, i) then return not_kept()
     if through && !read_through(f.params.at(i).1, 0) then return not_kept()
 
-    if q == KeepsQ || q == ThroughQ || reading
+    if q == KeepsQ || q == ThroughQ || reading || deep
         val crossed = crossing_kept(f, i)
 
         if crossed.is_some() then return crossed.unwrap()
@@ -872,12 +884,13 @@ private summary(cx: &KeepsCx, name: string, i: usize, q: string) -> KeptWhy
     else if q == ClearsQ then walk_clears(cx, f)
     else if q == BorrowQ then walk_borrow(cx, f, i)
     else if q == ThroughQ then walk_through(cx, f, i)
+    else if deep then walk_deep(cx, f, i)
     else if q == ThroughAnswersQ then walk_answers_through(cx, f, i)
     else if reading then walk_track(track_as(cx, f, i, false, true, steps_of(q)), i)
     else if read_answering then answered(track_as(cx, f, i, false, true, steps_of(q)), f)
     else walk_answers(cx, f, i, q == RawAnswersQ)
 
-    val held_on = keeping || q == ThroughQ || reading
+    val held_on = keeping || q == ThroughQ || reading || deep
     val out = if held_on && f.marks.is_async() then task_held(walked) else walked
 
     val leaned = cx.taint
@@ -1000,6 +1013,28 @@ vcall_through(cx: &KeepsCx, recv: TExpr, slot: int, k: usize) -> Buf[(string, Ke
     out
 end vcall_through
 
+// The same as the borrow rule asks it (`deep_of`): nothing where the receiver's type names no trait.
+private vcall_deep(cx: &KeepsCx, recv: TExpr, slot: int, k: usize) -> Buf[(string, KeptAt)]
+    var out: Buf[(string, KeptAt)] = buf()
+    val tr = erased_trait(texpr_type(recv))
+
+    if tr.is_none() || slot < 0 then return out
+
+    val name = tr.unwrap() match
+        Trait(n, _, _) -> n
+        _ -> ""
+
+    for vt in cx.vtables
+        if vt.trait_name != name || usize(slot) >= vt.slots.len() then continue
+
+        val target = vt.slots.at(usize(slot)).target
+
+        for item in deep_of(cx, target, k).locs
+            out.push((target, item))
+
+    out
+end vcall_deep
+
 // What a call through an object lets out of what it reads `steps` steps through its argument at `k`
 // (`read_of`): nothing where the receiver's type names no trait, which the rule holds to the default.
 vcall_reads(cx: &KeepsCx, recv: TExpr, slot: int, k: usize, steps: int) -> Buf[(string, KeptAt)]
@@ -1060,6 +1095,22 @@ pointer_through(cx: &KeepsCx, callee: TExpr, j: usize) -> Buf[(string, KeptAt)]
 
     out
 end pointer_through
+
+// The same as the borrow rule asks it (`deep_of`): nothing where C may call through the type.
+private pointer_deep(cx: &KeepsCx, callee: TExpr, j: usize) -> Buf[(string, KeptAt)]
+    var out: Buf[(string, KeptAt)] = buf()
+    val key = fn_key(texpr_type(callee))
+
+    if key == "" || cx.escaped.has(key) then return out
+
+    for item in cx.by_type
+        if item.0 != key then continue
+
+        for k in deep_of(cx, item.1, j).locs
+            out.push((item.1, k))
+
+    out
+end pointer_deep
 
 // What a call through a function pointer lets out of what it reads `steps` steps through its argument
 // at `j` (`read_of`): nothing where C may call through the type, which the rule holds to the default.
@@ -1363,6 +1414,10 @@ struct Track
     // The body walked, whose integers `keeps_cast.sysl` follows to a `ptr_cast`.
     func: TFunc
 
+    // A walk of what is read through the parameter as the borrow rule asks it (`deep_of`): a callee
+    // handed what is read is asked `deep_of` in its turn rather than `through_of`.
+    deep: bool
+
     holds(self, name: string) -> bool = holds_string(self.held, name)
 end Track
 
@@ -1373,7 +1428,7 @@ private track(cx: &KeepsCx, f: TFunc, i: usize, raw: bool) -> &Track = track_as(
 private track_as(cx: &KeepsCx, f: TFunc, i: usize, raw: bool, through: bool, steps: int) -> &Track
     val org = origins_of(cx, f)
     val t: &Track = Track(cx, func_home(cx.an, f.name), buf(), buf(), false, not_kept(), org, raw, through,
-                          steps, buf(), buf(), false, round_handles(cx, org, f), f)
+                          steps, buf(), buf(), false, round_handles(cx, org, f), f, false)
 
     if i < f.params.len()
         t.held.push(f.params.at(i).0)
@@ -1450,6 +1505,14 @@ end walk_kept_as
 // Every location a value `f` reads through its parameter at `i` may still be held at once it returns.
 private walk_through(cx: &KeepsCx, f: TFunc, i: usize) -> KeptWhy =
     walk_track(track_as(cx, f, i, false, true, 0), i)
+
+// The same, as the borrow rule asks it (`deep_of`).
+private walk_deep(cx: &KeepsCx, f: TFunc, i: usize) -> KeptWhy
+    val t = track_as(cx, f, i, false, true, 0)
+
+    t.deep = true
+    walk_track(t, i)
+end walk_deep
 
 // Whether what `f` answers can be made of a value it reads through its parameter at `i`.
 private walk_answers_through(cx: &KeepsCx, f: TFunc, i: usize) -> KeptWhy =
@@ -1774,7 +1837,7 @@ private track_call_locs(t: &Track, name: string, j: usize, arg: TExpr) -> Buf[Ke
         out.push(item)
 
     if t.steps == 0
-        for item in through_of(t.cx, name, j).locs
+        for item in (if t.deep then deep_of(t.cx, name, j) else through_of(t.cx, name, j)).locs
             out.push(item)
     end if
 
@@ -1796,7 +1859,7 @@ private track_vcall_locs(t: &Track, recv: TExpr, slot: int, k: usize, arg: TExpr
         out.push(item)
 
     if t.steps == 0
-        for item in vcall_through(t.cx, recv, slot, k)
+        for item in (if t.deep then vcall_deep(t.cx, recv, slot, k) else vcall_through(t.cx, recv, slot, k))
             out.push(item)
     end if
 
@@ -1818,7 +1881,7 @@ private track_pointer_locs(t: &Track, callee: TExpr, j: usize, arg: TExpr) -> Bu
         out.push(item)
 
     if t.steps == 0
-        for item in pointer_through(t.cx, callee, j)
+        for item in (if t.deep then pointer_deep(t.cx, callee, j) else pointer_through(t.cx, callee, j))
             out.push(item)
     end if
 
@@ -3675,8 +3738,10 @@ private frame_closed(ft: &FrameTrack, arg: TExpr) -> bool
 end frame_closed
 
 // Whether a point is storage of this frame: a local, a parameter's copy, or a value made in place --
-// not an address from anywhere else, nor a heap object.
-private own_point(name: string) -> bool = name != "?" && !name.starts_with("%b")
+// not an address from anywhere else, nor a heap object. A box (`%b`) and a buffer literal (`%l`) are
+// heap objects: a `[x; n]` is always a buffer of its own, and a `[a, b]` is laid in the frame only
+// where it is handed straight to a call that keeps nothing of it, so no address of it is ever kept.
+private own_point(name: string) -> bool = name != "?" && !name.starts_with("%b") && !name.starts_with("%l")
 
 // What a conversion to `&sync` makes of a closure: one held by value, as every closure that crosses
 // a domain is.
@@ -4172,8 +4237,8 @@ private addrs(ft: &FrameTrack, e: TExpr, out: *Buf[(string, string)], depth: int
         TAddrOf(place, _) -> place_points(ft, place, out, depth + 1)
         TTempAddr(_, _) -> push_point(out, (made_point("%t", e), s"the address of a value made in place in '${ft.owner}'"))
         TBox(_, _) -> push_point(out, (made_point("%b", e), ""))
-        TBufLit(_, _) -> push_point(out, (made_point("%l", e), s"the address of a value made in place in '${ft.owner}'"))
-        TBufFill(_, _, _) -> push_point(out, (made_point("%l", e), s"the address of a value made in place in '${ft.owner}'"))
+        TBufLit(_, _) -> push_point(out, (made_point("%l", e), ""))
+        TBufFill(_, _, _) -> push_point(out, (made_point("%l", e), ""))
         TLoad(n, ty) ->
             if !may_hold_pointer(ft.cx, ty) then return
 

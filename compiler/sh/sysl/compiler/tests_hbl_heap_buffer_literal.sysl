@@ -1,0 +1,415 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// A buffer literal (`[x; n]`, `[a, b]`) is a heap buffer of its own: the borrow rule's walk over what an
+// argument reaches (`keeps.sysl`'s `addrs`) follows what its elements hold, but never counts the buffer
+// itself as storage of the frame that wrote it. The thread pool that found it: `P.new` makes its workers
+// with `[W(0, &*sh); n]`, stores `&p.workers[0]` into the heap `Sh` every worker points at, and hands
+// `&p.workers[i]` to `spawn` -- nothing in it is frame storage, and it was refused as "the address of a
+// value made in place".
+//
+// The matrix crosses where the element address is stored (a pointer field of a heap object, a `Buf` it
+// holds, through a field chain), how the owning reference is bound (`val`, `var`), and which literal made
+// the buffer (a fill, a list). The refusals kept: the same store of an address of a local array, an
+// element address of a local array handed to `spawn`, and a buffer literal whose elements hold the address
+// of a local -- the walk still reads through the buffer.
+//
+// Skipped cells, and why: a list literal laid in the frame (`escape.sysl`'s `frame_literal`) is only ever
+// handed straight to a call that keeps nothing of it, so no address of it can be kept to test.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private hbl_outcome(text: string) -> (string, int)
+    val root = make_temp_dir("sysl-hbl").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", hbl_prelude + text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (failure_text(why), -1)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> ("the program that was built could not be run", -1)
+        Ok(out) -> (out.text + out.err.unwrap_or(""), shell_status(out.status))
+end hbl_outcome
+
+private hbl_prints(text: string, want: string)
+    if xvr_no_library() then return
+
+    val out = hbl_outcome(text)
+
+    assert_eq(out.0, want)
+    assert_eq(out.1, 0)
+end hbl_prints
+
+private hbl_refused(text: string, part: string)
+    if xvr_no_library() then return
+
+    val out = hbl_outcome(text)
+
+    assert_eq(out.1, -1, out.0)
+    assert(out.0.index_of(part).is_some(), out.0)
+end hbl_refused
+
+// A worker pointing at the state every worker shares, which points back at the first worker.
+private const hbl_prelude: string = raw"""
+    import sysl.threads as th
+    import sysl.buf.{Buf, buf}
+
+    struct W
+        n: int
+        sh: *Sh
+
+    struct Sh
+        workers: *W
+
+    run(w: *W)
+        w.n = 1
+
+    """
+
+private const hbl_spawn_refused: string = "'spawn' lets what it reads through its parameter 'arg' outlive the call"
+
+// -- the reduction ----------------------------------------------------------------------------------
+
+@test("a pool storing an element address of its heap workers into heap state, then spawning each")
+hbl_pool()
+    hbl_prints(raw"""
+        struct P
+            shared: &Sh
+            workers: []W
+            handles: []Option[th.Thread]
+
+            new(n: usize) -> &P
+                val sh: &Sh = Sh(null)
+                val p: &P = P(sh, [W(0, &*sh); n], [None; n])
+
+                sh.workers = &p.workers[0]
+
+                for i in 0..<n
+                    p.handles[i] = th.spawn(&run, &p.workers[i])
+
+                p
+            end new
+
+        main()
+            val p = P.new(4)
+            var total = 0
+
+            for h in p.handles
+                h.unwrap().join()
+
+            for w in p.workers
+                total += w.n
+
+            print(s"${p.workers.len} $total")
+        """, "4 4\n")
+
+@test("the pool with its reference bound by 'var'")
+hbl_pool_var()
+    hbl_prints(raw"""
+        struct P
+            shared: &Sh
+            workers: []W
+            handles: []Option[th.Thread]
+
+        make(n: usize) -> &P
+            var sh: &Sh = Sh(null)
+            var p: &P = P(sh, [W(0, &*sh); n], [None; n])
+
+            sh.workers = &p.workers[0]
+
+            for i in 0..<n
+                p.handles[i] = th.spawn(&run, &p.workers[i])
+
+            p
+
+        main()
+            val p = make(3)
+
+            for h in p.handles
+                h.unwrap().join()
+
+            print(p.workers[2].n)
+        """, "1\n")
+
+@test("the pool made with a list literal rather than a fill")
+hbl_pool_list()
+    hbl_prints(raw"""
+        struct P
+            shared: &Sh
+            workers: []W
+            handles: []Option[th.Thread]
+
+        make() -> &P
+            val sh: &Sh = Sh(null)
+            val p: &P = P(sh, [W(0, &*sh), W(0, &*sh)], [None, None])
+
+            sh.workers = &p.workers[0]
+
+            for i in 0..<2
+                p.handles[i] = th.spawn(&run, &p.workers[i])
+
+            p
+
+        main()
+            val p = make()
+
+            for h in p.handles
+                h.unwrap().join()
+
+            print(p.workers[0].n + p.workers[1].n)
+        """, "2\n")
+
+@test("the element address stored through a chain of fields")
+hbl_field_chain()
+    hbl_prints(raw"""
+        struct Q
+            workers: []W
+
+        struct P
+            shared: &Sh
+            q: Q
+            handles: []Option[th.Thread]
+
+        make(n: usize) -> &P
+            val sh: &Sh = Sh(null)
+            val p: &P = P(sh, Q([W(0, &*sh); n]), [None; n])
+
+            sh.workers = &p.q.workers[0]
+
+            for i in 0..<n
+                p.handles[i] = th.spawn(&run, &p.q.workers[i])
+
+            p
+
+        main()
+            val p = make(2)
+
+            for h in p.handles
+                h.unwrap().join()
+
+            print(p.q.workers[1].n)
+        """, "1\n")
+
+@test("the element address pushed into a Buf the shared state holds")
+hbl_buf_element()
+    hbl_prints(raw"""
+        struct Hub
+            all: Buf[*V]
+
+        struct V
+            n: int
+            hub: *Hub
+
+        go(v: *V)
+            v.n = 1
+
+        struct P
+            hub: &Hub
+            workers: []V
+            handles: []Option[th.Thread]
+
+        make(n: usize) -> &P
+            val hub: &Hub = Hub(buf())
+            val p: &P = P(hub, [V(0, &*hub); n], [None; n])
+
+            hub.all.push(&p.workers[0])
+
+            for i in 0..<n
+                p.handles[i] = th.spawn(&go, &p.workers[i])
+
+            p
+
+        main()
+            val p = make(2)
+
+            for h in p.handles
+                h.unwrap().join()
+
+            print(p.workers[0].hub.all.len())
+        """, "1\n")
+
+// -- the refusals kept ------------------------------------------------------------------------------
+
+@test("the same store of an element address of a local array is still refused")
+hbl_local_array_store()
+    hbl_refused(raw"""
+        struct P
+            workers: []W
+            handles: []Option[th.Thread]
+
+        make(n: usize) -> &P
+            val sh: &Sh = Sh(null)
+            val p: &P = P([W(0, &*sh); n], [None; n])
+            var local: [2]W = [W(0, &*sh), W(0, &*sh)]
+
+            sh.workers = &local[0]
+
+            for i in 0..<n
+                p.handles[i] = th.spawn(&run, &p.workers[i])
+
+            for h in p.handles
+                h.unwrap().join()
+
+            p
+
+        main()
+            print(make(2).workers.len)
+        """, hbl_spawn_refused)
+
+@test("an element address of a local array handed to spawn and never joined is still refused")
+hbl_local_array_spawn()
+    hbl_refused(raw"""
+        start() -> Option[th.Thread]
+            val sh: &Sh = Sh(null)
+            var ws: [2]W = [W(0, &*sh), W(0, &*sh)]
+
+            th.spawn(&run, &ws[1])
+
+        main()
+            start().unwrap().join()
+        """, "'spawn'")
+
+@test("an element address of a local array handed to spawn and joined is accepted")
+hbl_local_array_joined()
+    hbl_prints(raw"""
+        main()
+            val sh: &Sh = Sh(null)
+            var ws: [2]W = [W(0, &*sh), W(0, &*sh)]
+
+            for i in 0..<2
+                th.spawn(&run, &ws[i]).unwrap().join()
+
+            print(ws[0].n + ws[1].n)
+        """, "2\n")
+
+@test("a buffer literal whose elements hold the address of a local is still read through")
+hbl_literal_holds_local()
+    hbl_refused(raw"""
+        struct L
+            n: int
+            p: *int
+
+        poke(l: *L)
+            l.n = *l.p
+
+        start(n: usize) -> Option[th.Thread]
+            var x = 5
+            val ls: []L = [L(0, &x); n]
+
+            th.spawn(&poke, &ls[0])
+
+        main()
+            start(2).unwrap().join()
+        """, hbl_spawn_refused)
+
+// -- a value holding the address of its own storage, handed to C ------------------------------------
+
+// The second cause the census found (littlefs `open(&f, …)`, bearssl `init(&anchors)`): a value holding
+// the address of its own storage reaches past `MaxReadSteps` at once, and the question asked past it
+// (`deep_of`) must hold C to the rule's default -- an `extern` borrows what it reads unless `@keeps`
+// names the parameter (`reference/memory.md § An address held inside what is handed over`). `strlen`
+// reads the struct's first byte, a zero.
+private const hbl_c_prelude: string = raw"""
+    struct A
+        z: u8
+        p: *int
+        v: int
+
+    extern "strlen" c_len(a: *A) -> usize
+
+    """
+
+@test("a self-referential local handed through a wrapper to C, which borrows it")
+hbl_c_wrapper()
+    hbl_prints(hbl_c_prelude + raw"""
+        wrap(a: *A) -> usize = c_len(a)
+
+        main()
+            var a = A(0, null, 3)
+
+            a.p = &a.v
+            print(wrap(&a))
+        """, "0\n")
+
+@test("a self-referential local handed through two wrappers to C")
+hbl_c_two_wrappers()
+    hbl_prints(hbl_c_prelude + raw"""
+        inner(a: *A) -> usize = c_len(a)
+
+        outer(a: *A) -> usize = inner(a)
+
+        probe()
+            var a = A(0, null, 3)
+
+            a.p = &a.v
+            print(outer(&a))
+
+        main()
+            probe()
+        """, "0\n")
+
+@test("a self-referential local handed straight to C")
+hbl_c_direct()
+    hbl_prints(hbl_c_prelude + raw"""
+        main()
+            var a = A(0, null, 3)
+
+            a.p = &a.v
+            print(c_len(&a))
+        """, "0\n")
+
+@test("a self-referential local handed to a wrapper that also stores what it reads is still refused")
+hbl_c_wrapper_stores()
+    hbl_refused(hbl_c_prelude + raw"""
+        var last: *int = null
+
+        wrap(a: *A) -> usize
+            last = a.p
+            c_len(a)
+
+        probe()
+            var a = A(0, null, 3)
+
+            a.p = &a.v
+            print(wrap(&a))
+
+        main()
+            probe()
+        """, "'wrap' lets what it reads through its parameter 'a' outlive the call")
+
+@test("a self-referential local handed through a wrapper to C that says '@keeps' is still refused")
+hbl_c_keeps()
+    hbl_refused(raw"""
+        struct A
+            z: u8
+            p: *int
+            v: int
+
+        @keeps(a)
+        extern "strlen" c_len(a: *A) -> usize
+
+        wrap(a: *A) -> usize = c_len(a)
+
+        probe()
+            var a = A(0, null, 3)
+
+            a.p = &a.v
+            print(wrap(&a))
+
+        main()
+            probe()
+        """, "'wrap'")
