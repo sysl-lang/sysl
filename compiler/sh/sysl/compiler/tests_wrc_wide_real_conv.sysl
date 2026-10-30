@@ -1,0 +1,460 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{is_file, make_temp_dir, remove_dir_all, write_text}
+import sysl.math.bigint.{cmp, from_int, parse as big_parse, pow as big_pow, negate}
+import sysl.process.{capture, Status}
+import sysl.testing.skip
+import sysl.text.split
+
+// **An integer wider than 128 bits converted to or from a float** (`emit_wide_float.sysl`). LLVM hands
+// those conversions to a library routine nobody provides, so they are computed inline: an integer
+// becomes a float rounded once, ties to even, and a float becomes an integer truncated, saturating at
+// the width's ends, with a NaN as zero -- as at every narrower width.
+//
+// The axes and their cells: widths 129, 192, 200 (no multiple of 64), 256, 512, 1000 and 1100 (past
+// `real`'s range); signed and unsigned; `real` and `f32` both ways, `f16`, `bf16` and `f128` both ways
+// once; values on every rounding edge -- exact, a tie to even either way, a tie broken by a sticky bit
+// far below, an overflow to infinity and the largest finite value below it -- and the integer type's
+// own ends; a NaN, both infinities, both zeros, fractions of either sign; a constant against the
+// oracle; debug at `-O0` and release at `-O2`; fixed-point formats past 128 bits, which convert through
+// the same code; and a Thumb archive, which must call no library routine for any of it. The oracle is
+// CPython's `float(int)`, which rounds once to nearest even, and an exact integer rounding to `f32`.
+//
+// Skipped: a vector of wide integers (no vector of an integer past 128 bits reaches `convert`), and a
+// `@strict_fp` body, which refuses a conversion wider than 64 bits before lowering.
+
+private wrc_ready() -> bool = std_root().is_ok() && clang_available()
+
+private val WrcWidths: []const int = [129, 192, 200, 256, 512, 1000, 1100]
+
+// A magnitude, its bit length, and the bits of the nearest `real` and `f32`.
+private val WrcInts: []const (string, int, u64, u32) = [
+    ("1", 1, 4607182418800017408, 1065353216),
+    ("16777217", 25, 4715268810125344768, 1266679808),
+    ("16777219", 25, 4715268810662215680, 1266679810),
+    ("9007199254740991", 53, 4845873199050653695, 1509949440),
+    ("9007199254740993", 54, 4845873199050653696, 1509949440),
+    ("9007199254740995", 54, 4845873199050653698, 1509949440),
+    ("18446744073709551615", 64, 4895412794951729152, 1602224128),
+    ("1267650675786093127411026624512", 101, 5057542381805502464, 1904214016),
+    ("1267650675786093127411026624513", 101, 5057542381805502464, 1904214017),
+    ("1267650826901820579239673462784", 101, 5057542382342373376, 1904214018),
+    ("340282356779733661637539395458142568447", 128, 5183643170835005440, 2139095039),
+    ("340282356779733661637539395458142568448", 128, 5183643170835005440, 2139095040),
+    ("340282366920938463463374607431768211456", 129, 5183643171103440896, 2139095040),
+    ("340282366920938463463374607431768211457", 129, 5183643171103440896, 2139095040),
+    ("1606938044258990275541962092341162602522202993782792835301377", 201, 5507902344274116608, 2139095040),
+    ("1606938044258990453947923680586147734807949174969684883144704", 201, 5507902344274116608, 2139095040),
+    ("1606938044258990453947923680586147734807949174969684883144705", 201, 5507902344274116609, 2139095040),
+    ("1606938044258990810759846857076117999379441537343468978831360", 201, 5507902344274116610, 2139095040),
+    ("8988465674311580536566680721305029496276241413130815897397134275615404541548669375241369800602409693534988440311420212554162910536968453110861365728770536588474293813658984423817947455605142964741514869785743879768585906389085140739100883087476556302595159758251393665557815734802006636421015431653216170803" +
+     "2", 1024, 9214364837600034816, 2139095040),
+    ("1797693134862315807937289714053034150799341327100378269361737789804449682927647509466490179775872070963302864166928879109465555478519404026306574886715058206819089020007083836762738548458177115317644757302700698555713669596228429148198608349364752927190741684443655107043427115596995080930428801779041744977" +
+     "91", 1024, 9218868437227405311, 2139095040),
+    ("1797693134862315807937289714053034150799341327100378269361737789804449682927647509466490179775872070963302864166928879109465555478519404026306574886715058206819089020007083836762738548458177115317644757302700698555713669596228429148198608349364752927190741684443655107043427115596995080930428801779041744977" +
+     "92", 1024, 9218868437227405312, 2139095040)]
+
+// A width, then the bits of `real` and `f32` at `2^(W-1) - 1`, `2^(W-1)` and `2^W - 1`.
+private val WrcEnds: []const (int, u64, u32, u64, u32, u64, u32) = [
+    (129, 5183643171103440896, 2139095040, 5183643171103440896, 2139095040, 5188146770730811392, 2139095040),
+    (192, 5467369947627782144, 2139095040, 5467369947627782144, 2139095040, 5471873547255152640, 2139095040),
+    (200, 5503398744646746112, 2139095040, 5503398744646746112, 2139095040, 5507902344274116608, 2139095040),
+    (256, 5755600323779493888, 2139095040, 5755600323779493888, 2139095040, 5760103923406864384, 2139095040),
+    (512, 6908521828386340864, 2139095040, 6908521828386340864, 2139095040, 6913025428013711360, 2139095040),
+    (1000, 9106278446543142912, 2139095040, 9106278446543142912, 2139095040, 9110782046170513408, 2139095040),
+    (1100, 9218868437227405312, 2139095040, 9218868437227405312, 2139095040, 9218868437227405312, 2139095040)]
+
+// A float as written, and its value truncated toward zero as a `real` and as an `f32`.
+private val WrcFloats: []const (string, string, string) = [
+    ("0.0", "0", "0"),
+    ("-0.0", "0", "0"),
+    ("0.5", "0", "0"),
+    ("-0.5", "0", "0"),
+    ("2.9", "2", "2"),
+    ("-2.9", "-2", "-2"),
+    ("9007199254740993.0", "9007199254740992", "9007199254740992"),
+    ("1.0e30", "1000000000000000019884624838656", "1000000015047466219876688855040"),
+    ("-1.0e30", "-1000000000000000019884624838656", "-1000000015047466219876688855040"),
+    ("3.0e38", "300000000000000012135895401846682943488", "300000000549775575777803994281145270272"),
+    ("-3.4e38", "-339999999999999996123846586046231871488", "-339999995214436424907732413799364296704"),
+    ("1.0e40", "10000000000000000303786028427003666890752", "inf"),
+    ("6.0e57", "5999999999999999941631008966280967758674771065212437004288", "inf"),
+    ("1.0e60", "999999999999999949387135297074018866963645011013410073083904", "inf"),
+    ("-1.0e60", "-999999999999999949387135297074018866963645011013410073083904", "-inf"),
+    ("1.0e77", "99999999999999998278261272554585856747747644714015897553975120217811154108416", "inf"),
+    ("1.0e300", "1000000000000000052504760255204420248704468581108159154915854115511802457988908195786371375080447864043704443832883878176942523235360430575644792184786706982848387200926575803737830233794788090059368953234970799945081119038967640880074652742780142494579258788820056842838115669472196386865459400540160", "inf"),
+    ("-1.0e300", "-1000000000000000052504760255204420248704468581108159154915854115511802457988908195786371375080447864043704443832883878176942523235360430575644792184786706982848387200926575803737830233794788090059368953234970799945081119038967640880074652742780142494579258788820056842838115669472196386865459400540160", "-inf"),
+    ("real.infinity", "inf", "inf"),
+    ("-real.infinity", "-inf", "-inf"),
+    ("real.nan", "nan", "nan")]
+
+// The checking harness every generated program shares: it counts its cells, prints the ones that
+// disagree, and ends with the count and the number wrong.
+private val WrcHarness: string = raw"""
+    var cells = 0
+    var bad = 0
+
+    check(cell: string, got: u64, want: u64)
+        cells += 1
+
+        if got != want
+            bad += 1
+            print(s"$cell: got $got, want $want")
+
+    holds(cell: string, ok: bool)
+        cells += 1
+
+        if !ok
+            bad += 1
+            print(s"$cell: wrong")
+
+    two(k: int) -> real
+        var p = 1.0
+
+        for i in 0..<k
+            p *= 2.0
+
+        p
+    """
+
+private wrc_type(w: int, signed: bool) -> string = (if signed then "i" else "u") + s"$w"
+
+// `text` as `main.sysl`, built in the mode `flag` names at `level`, and run: its status and output.
+private wrc_run(text: string, flag: string, level: string) -> (Status, string)
+    val root = make_temp_dir("sysl-wrc").unwrap()
+
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    var flags: [1]string = [flag]
+
+    assert_eq(took_search_flag(flags[..], 0), 1)
+
+    val exe = s"$root/built"
+    val built = build_native_program(root, None, None, level, Some(exe))
+
+    reset_search_paths()
+
+    built match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (Status.Exited(-1), failure_text(why))
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> (Status.Exited(-1), "the program that was built could not be run")
+        Ok(out) -> (out.status, out.text)
+end wrc_run
+
+// Builds and runs a self-checking program of `cells` checks in debug at `-O0` and release at `-O2`,
+// and asserts each ran every check and found none wrong.
+private wrc_sweep(decls: string, body: string, cells: int)
+    if !wrc_ready() then return
+
+    val text = WrcHarness + "\n" + decls + "\nmain()\n" + body + "    print(s\"wrc $cells $bad\")\n"
+
+    for (flag, level) in [("--debug", "0"), ("--release", "2")]
+        val (state, out) = wrc_run(text, flag, level)
+
+        assert(state.ok(), s"$flag -O$level: $state\n$out")
+        assert_eq(out, s"wrc $cells 0\n")
+end wrc_sweep
+
+// The bits of the float nearest `-m`, from those of the float nearest `m`.
+private wrc_neg64(b: u64) -> u64 = b | (u64(1) << 63)
+
+private wrc_neg32(b: u32) -> u64 = u64(b | (u32(1) << 31))
+
+@test("an integer past 128 bits becomes a real and an f32 rounded once, ties to even, at every width")
+wrc_int_to_float()
+    var decls = ""
+    var body = ""
+    var cells = 0
+
+    for w in WrcWidths
+        for signed in [false, true]
+            val t = wrc_type(w, signed)
+
+            decls = decls + s"r_$t(x: $t) -> u64 = real(x).bits()\ns_$t(x: $t) -> u64 = u64(f32(x).bits())\n"
+            body = body + s"    check(\"r $t 0\", r_$t($t(0)), 0)\n    check(\"s $t 0\", s_$t($t(0)), 0)\n"
+            cells += 2
+
+            for (m, length, b64, b32) in WrcInts
+                if length > (if signed then w - 1 else w) then continue
+
+                body = body + s"    check(\"r $t $m\", r_$t($t($m)), $b64)\n    check(\"s $t $m\", s_$t($t($m)), $b32)\n"
+                cells += 2
+
+                if signed
+                    body = body + s"    check(\"r $t -$m\", r_$t($t(-$m)), ${wrc_neg64(b64)})\n" +
+                           s"    check(\"s $t -$m\", s_$t($t(-$m)), ${wrc_neg32(b32)})\n"
+                    cells += 2
+            end for
+
+            for (ew, max64, max32, pow64, pow32, umax64, umax32) in WrcEnds
+                if ew != w then continue
+
+                if signed
+                    body = body + s"    check(\"r $t Max\", r_$t($t::Max), $max64)\n" +
+                           s"    check(\"s $t Max\", s_$t($t::Max), $max32)\n" +
+                           s"    check(\"r $t Min\", r_$t($t::Min), ${wrc_neg64(pow64)})\n" +
+                           s"    check(\"s $t Min\", s_$t($t::Min), ${wrc_neg32(pow32)})\n"
+                    cells += 4
+                else
+                    body = body + s"    check(\"r $t Max\", r_$t($t::Max), $umax64)\n" +
+                           s"    check(\"s $t Max\", s_$t($t::Max), $umax32)\n"
+                    cells += 2
+            end for
+        end for
+    end for
+
+    wrc_sweep(decls, body, cells)
+end wrc_int_to_float
+
+// What converting a value whose truncation is `trunc` ("inf", "-inf", "nan" or a decimal) to `t`
+// answers, as a sysl expression of type `t`.
+private wrc_want(trunc: string, w: int, signed: bool, t: string) -> string
+    if trunc == "nan" then return s"$t(0)"
+    if trunc == "inf" then return s"$t::Max"
+    if trunc == "-inf" then return if signed then s"$t::Min" else s"$t(0)"
+
+    val n = big_parse(trunc).unwrap()
+    val zero = from_int(0)
+
+    if !signed
+        if cmp(n, zero) < 0 then return s"$t(0)"
+
+        return if cmp(n, big_pow(from_int(2), usize(w))) >= 0 then s"$t::Max" else s"$t($trunc)"
+
+    val half = big_pow(from_int(2), usize(w - 1))
+
+    if cmp(n, half) >= 0 then return s"$t::Max"
+    if cmp(n, negate(half)) < 0 then return s"$t::Min"
+
+    s"$t($trunc)"
+end wrc_want
+
+@test("a float becomes an integer past 128 bits truncated, saturating at either end, NaN as zero")
+wrc_float_to_int()
+    var decls = ""
+    var body = ""
+    var cells = 0
+
+    for w in WrcWidths
+        for signed in [false, true]
+            val t = wrc_type(w, signed)
+
+            decls = decls + s"h_$t(x: real) -> $t = $t(x)\nk_$t(x: f32) -> $t = $t(x)\n"
+
+            for (x, at64, at32) in WrcFloats
+                body = body + s"    holds(\"h $t $x\", h_$t($x) == ${wrc_want(at64, w, signed, t)})\n" +
+                       s"    holds(\"k $t $x\", k_$t(f32($x)) == ${wrc_want(at32, w, signed, t)})\n"
+                cells += 2
+
+            // The integer type's own ends, as powers of two: `2^(W-1)` is past a signed type and inside
+            // an unsigned one, `-2^(W-1)` is a signed type's least value exactly, the double just below
+            // `2^(W-1)` is exact in either, and `2^W` is past both. An `f32` holds none of them.
+            val top = if signed then s"$t::Max" else s"($t(1) << ${w - 1})"
+            val least = if signed then s"$t::Min" else s"$t(0)"
+
+            body = body + s"    holds(\"h $t 2^(W-1)\", h_$t(two(${w - 1})) == ${if w <= 1024 then top else s"$t::Max"})\n" +
+                   s"    holds(\"h $t -2^(W-1)\", h_$t(-two(${w - 1})) == $least)\n" +
+                   s"    holds(\"h $t 2^W\", h_$t(two($w)) == $t::Max)\n" +
+                   s"    holds(\"k $t 2^(W-1)\", k_$t(f32(two(${w - 1}))) == $t::Max)\n" +
+                   s"    holds(\"k $t -2^(W-1)\", k_$t(f32(-two(${w - 1}))) == $least)\n"
+            cells += 5
+
+            if w <= 1024
+                val below = if signed then s"$t::Max - (($t(1) << ${w - 53}) - $t(1))"
+                            else s"($t(1) << ${w - 1}) - ($t(1) << ${w - 53})"
+
+                body = body + s"    holds(\"h $t 2^(W-1) - ulp\", h_$t(two(${w - 1}) - two(${w - 53})) == $below)\n"
+                cells += 1
+        end for
+    end for
+
+    wrc_sweep(decls, body, cells)
+end wrc_float_to_int
+
+@test("a constant conversion between a wide integer and a float folds to the run-time answer")
+wrc_constants()
+    var decls = ""
+    var body = ""
+    var cells = 0
+    var k = 0
+
+    for w in [129, 256, 1100]
+        for signed in [false, true]
+            val t = wrc_type(w, signed)
+
+            for (m, length, b64, b32) in WrcInts
+                if length > (if signed then w - 1 else w) then continue
+
+                k += 1
+                decls = decls + s"const R$k: real = real($t($m))\nconst S$k: f32 = f32($t($m))\n"
+                body = body + s"    check(\"R$k $t $m\", R${k}.bits(), $b64)\n    check(\"S$k $t $m\", u64(S${k}.bits()), $b32)\n"
+                cells += 2
+
+                if signed
+                    k += 1
+                    decls = decls + s"const R$k: real = real($t(-$m))\nconst S$k: f32 = f32($t(-$m))\n"
+                    body = body + s"    check(\"R$k $t -$m\", R${k}.bits(), ${wrc_neg64(b64)})\n" +
+                           s"    check(\"S$k $t -$m\", u64(S${k}.bits()), ${wrc_neg32(b32)})\n"
+                    cells += 2
+            end for
+
+            for (x, at64, at32) in WrcFloats
+                k += 1
+                decls = decls + s"const H$k: $t = $t($x)\nconst K$k: $t = $t(f32($x))\n"
+                body = body + s"    holds(\"H$k $t $x\", H$k == ${wrc_want(at64, w, signed, t)})\n" +
+                       s"    holds(\"K$k $t $x\", K$k == ${wrc_want(at32, w, signed, t)})\n"
+                cells += 2
+        end for
+    end for
+
+    wrc_sweep(decls, body, cells)
+end wrc_constants
+
+// A constant converted to a narrower float is rounded to it before anything reads it again, at every
+// integer width -- an `f32` constant of `1.0e30` is `1000000015047466219876688855040`, and an `f32` of
+// `16777217` is `16777216` -- and an `f128` constant of an integer holds what a `real` would round.
+private val WrcNarrowConstants: string = raw"""
+    const A: i64 = i64(f32(16777217.0))
+    const B: f32 = f32(1.0e30)
+    const C: i128 = i128(B)
+    const D: i256 = i256(f32(1.0e30))
+    const E: f32 = f32(16777217)
+    const F: i64 = i64(f16(2049.0))
+    const G: f16 = f16(65519)
+    const H: i128 = i128(f128(i64(9007199254740993)))
+    const I: real = real(f128(i64(9007199254740993)))
+    const J: bf16 = bf16(259)
+    const K: u64 = u64(f32(18446744073709551615))
+    const L: f128 = f128(2.5)
+    const M: i32 = i32(f128(-2.9))
+    const N: f32 = f32(f128(i64(16777217)))
+
+    k(x: f32) -> i128 = i128(x)
+
+    main()
+        print(A, C, C == k(f32(1.0e30)), D, E.bits(), F, G, H, I, J, K)
+        print(real(L), M, N)
+    """
+
+@test("a constant converted to a narrower float is rounded to it before it is read again")
+wrc_narrow_constants()
+    if !wrc_ready() then return
+
+    val (state, out) = wrc_run(WrcNarrowConstants, "--debug", "0")
+
+    assert(state.ok(), s"$state\n$out")
+    assert_eq(out, "16777216 1000000015047466219876688855040 true 1000000015047466219876688855040 1266679808 2048 " +
+                   "65500 9007199254740993 9007199254740992 260 18446744073709551615\n2.5 -2 16777216\n")
+end wrc_narrow_constants
+
+// The two sixteen-bit formats and `f128` both ways, and fixed-point formats past 128 bits, whose raw
+// integer converts through the same code -- a `u200q190`'s raw `1.5` is `1.5 · 2^190`, past `f32`'s
+// range though the value is not.
+private val WrcOthers: string = raw"""
+    hf(a: i256) -> f16 = f16(a)
+    bf(a: u256) -> bf16 = bf16(a)
+    qf(a: i256) -> f128 = f128(a)
+    fh(x: f16) -> i256 = i256(x)
+    fb(x: bf16) -> u512 = u512(x)
+    fq(x: f128) -> i1000 = i1000(x)
+    fx(x: real) -> i256q100 = i256q100(x)
+    xf(x: i256q100) -> real = real(x)
+    fx32(x: f32) -> u200q190 = u200q190(x)
+    xf32(x: u200q190) -> f32 = f32(x)
+    xh(x: i300q20) -> f16 = f16(x)
+
+    main()
+        print(hf(i256(2049)), hf(i256(-2051)), hf(i256(65519)), hf(i256(65520)), hf(i256(1) << 200))
+        print(bf(u256(257)), bf(u256(259)), bf(u256(1) << 127), bf(u256(1) << 200), bf(u256(0)))
+        print(real(qf(i256(9007199254740993))), qf(i256(1) << 200) == f128(two(200)), qf(i256::Min) == -f128(two(255)))
+        print(fh(f16(65504.0)), fh(f16(-2.5)), fh(f16.infinity), fh(f16.nan))
+        print(fb(bf16(3.0e38)), fb(-bf16(1.0)), fb(bf16.infinity) == u512::Max)
+        print(fq(f128(1.0e30)), fq(f128(-2.9)), fq(f128.infinity) == i1000::Max, fq(-f128.infinity) == i1000::Min)
+        print(xf(fx(1.5)), xf(fx(-3.25)), xf(fx(1.0e40)), xf(fx(-1.0e60)) == real(i256q100::Min), xf(fx(real.nan)))
+        print(xf32(fx32(1.5)), xf32(fx32(-1.0)), xf32(fx32(1.0e30)), xf32(u200q190::Max), xf32(u200q190::Min))
+        print(xh(i300q20(1.5)), xh(i300q20(-70000.0)), xh(i300q20::Max))
+    """
+
+@test("f16, bf16 and f128 meet a wide integer both ways, and so does a fixed-point format past 128 bits")
+wrc_other_formats()
+    if !wrc_ready() then return
+
+    for (flag, level) in [("--debug", "0"), ("--release", "2")]
+        val (state, out) = wrc_run(WrcHarness + WrcOthers, flag, level)
+
+        assert(state.ok(), s"$flag -O$level: $state\n$out")
+        assert_eq(out, "2048 -2052 65500 inf inf\n" +
+                       "256 260 170000000000000000000000000000000000000 inf 0\n" +
+                       "9007199254740992 true true\n" +
+                       "65504 -2 57896044618658097711785492504343953926634992332820282019728792003956564819967 0\n" +
+                       "300405527047390987276260395623357874176 0 true\n" +
+                       "1000000000000000019884624838656 -2 true true\n" +
+                       "1.5 -3.25 10000000000000000000000000000000000000000 true 0\n" +
+                       "1.5 0 1024 1024 0\n" +
+                       "1.5 -inf inf\n")
+end wrc_other_formats
+
+private val WrcNm: string = "/opt/homebrew/opt/llvm/bin/llvm-nm"
+
+// Every conversion an `@export` of a Thumb archive can make between a wide integer and a float.
+private val WrcThumb: string = raw"""
+    @export("i_real")
+    i_real(a: i256) -> real = real(a)
+
+    @export("u_f32")
+    u_f32(a: u1000) -> f32 = f32(a)
+
+    @export("real_i")
+    real_i(x: real) -> i200 = i200(x)
+
+    @export("f32_u")
+    f32_u(x: f32) -> u512 = u512(x)
+
+    @export("f16_i")
+    f16_i(a: i256) -> f16 = f16(a)
+    """
+
+@test("on a freestanding Thumb target a wide conversion calls no library routine")
+wrc_thumb_freestanding()
+    if !is_file(WrcNm) then skip(s"there is no llvm-nm at $WrcNm to read the archive")
+
+    find_backend_clang(target_named("thumb-freestanding-softfp").unwrap()) match
+        Err(why) ->
+            skip(why)
+            return
+        Ok(_) -> ()
+
+    for level in ["0", "2"]
+        val root = make_temp_dir("sysl-wrc-thumb").unwrap()
+
+        write_text(s"$root/main.sysl", WrcThumb).unwrap()
+
+        val archive = s"$root/probe.a"
+        val built = build_c_archive(root, Some("thumb-freestanding-softfp"), None, level, Some(archive), None,
+                                    (m) -> ())
+
+        reset_search_paths()
+
+        val listing = built match
+            Err(why) -> failure_text(why)
+            Ok(_) -> capture(WrcNm, ["-u", archive]).map((o) -> o.text).unwrap_or("llvm-nm could not be run")
+
+        remove_dir_all(root).unwrap_or(())
+        assert(built.is_ok(), s"-O$level: $listing")
+
+        for line in split(listing, "\n")
+            val n = line.trim()
+
+            assert(n == "" || n.ends_with(":") || n == "U memcpy" || n == "U memset", s"-O$level leaves $n undefined")
+    end for
+end wrc_thumb_freestanding

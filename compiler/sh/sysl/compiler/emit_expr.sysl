@@ -1867,9 +1867,15 @@ convert(e: *Emit, from: Type, to: Type, v: Val) -> Val
     (from, ut) match
         (Integer(a_bits, a_signed, _), Integer(b_bits, _, _)) ->
             convert_int(e, a_bits, a_signed, b_bits, v)
-        (Integer(_, a_signed, _), Floating(_, _)) ->
+        // Past 128 bits neither direction is an LLVM conversion (`emit_wide_float.sysl`).
+        (Integer(a_bits, a_signed, _), Floating(_, _)) ->
+            if a_bits > 128 then return wide_int_to_float(e, a_bits, a_signed, v, ut, 0)
+
             cast_to(e, if a_signed then CastSIToFP else CastUIToFP, from, ut, v)
-        (Floating(_, _), Integer(_, b_signed, _)) -> saturating_to_int(e, from, ut, b_signed, v)
+        (Floating(_, _), Integer(b_bits, b_signed, _)) ->
+            if b_bits > 128 then return wide_float_to_int(e, from, b_bits, b_signed, v)
+
+            saturating_to_int(e, from, ut, b_signed, v)
         // `f16` and `bf16` are the one pair of floating types neither of which is wider, and LLVM
         // has no instruction turning one into the other -- `fptrunc` and `fpext` both require the
         // widths to differ. So the pair goes through `f32`, which holds both exactly: the

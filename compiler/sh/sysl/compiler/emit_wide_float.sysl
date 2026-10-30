@@ -1,0 +1,206 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+import sysl.math.bigint.{BigInt, from_int, pow as big_pow, sub as big_sub}
+
+// **An integer wider than 128 bits converted to or from a float, inline.**
+//
+// LLVM's `sitofp`, `uitofp`, `fptosi` and `fptoui` take an integer of any width, but past 128 bits
+// the back ends hand them to a library routine nobody provides, and clang stops with "unsupported
+// library call operation". So past 128 bits neither direction reaches those instructions with the
+// wide operand: each is computed from the integer's bits and from conversions at 64 bits (128 for
+// `f128`), which every target has.
+//
+// - **An integer becomes a float rounded once, to nearest with ties to even**, as `sitofp` rounds.
+//   The magnitude keeps its top 63 bits (127 for `f128`) and ORs every bit shifted out into the
+//   lowest one it kept -- a sticky bit, far below where the float rounds, so a tie stays a tie and
+//   anything past one is past it. The sign goes back on before the narrow conversion, which then
+//   does the one rounding, and the power of two the magnitude was shifted by is multiplied back in,
+//   exactly, or overflows to the infinity the value is past. `f16` and `bf16` are computed at `f32`
+//   and narrowed, which rounds twice but always lands where once would: 24 bits is at least twice
+//   their significands plus two.
+// - **A float becomes an integer as everywhere else** (`emit_expr.sysl`'s `saturating_to_int`):
+//   truncated toward zero, saturating at the width's ends, a negative value into an unsigned type
+//   is `0`, a NaN is `0`. Read from the float's fields -- the significand shifted by its exponent --
+//   it raises no floating-point exception, even in a `@strict_fp` body.
+
+// The fields of a binary format: its width, its stored significand bits, and its exponent bias.
+private wf_format(fbits: int) -> (int, int, int) = fbits match
+    32 -> (32, 23, 127)
+    128 -> (128, 112, 16383)
+    _ -> (64, 52, 1023)
+
+private wf_fbits(t: Type) -> int = t match
+    Floating(b, _) -> b
+    _ -> 64
+
+private wf_k(n: int) -> Val = VInt(from_int(n))
+
+// `2^n - 1`, at any size.
+private wf_ones(n: int) -> Val = VInt(big_sub(big_pow(from_int(2), usize(n)), from_int(1)))
+
+private wf_bin(e: *Emit, op: BinOp, t: LType, a: Val, b: Val) -> Val
+    val r = fresh_reg(e)
+
+    emit(e, InBin(r, op, t, a, b))
+    r
+
+private wf_cmp(e: *Emit, p: ICmp, t: LType, a: Val, b: Val) -> Val
+    val r = fresh_reg(e)
+
+    emit(e, InIntCmp(r, p, t, a, b))
+    r
+
+private wf_select(e: *Emit, c: Val, t: LType, a: Val, b: Val) -> Val
+    val r = fresh_reg(e)
+
+    emit(e, InSelect(r, c, t, a, b, l_i1()))
+    r
+
+private wf_cast(e: *Emit, op: CastOp, from: LType, v: Val, to: LType) -> Val
+    val r = fresh_reg(e)
+
+    emit(e, InCast(r, op, from, v, to))
+    r
+
+// The count of leading zero bits of `v`, at its own width; zero is defined, and is the width.
+private wf_ctlz(e: *Emit, t: LType, v: Val) -> Val
+    val name = llvm_bits_entry("ctlz").unwrap().at([t])
+
+    var params: Buf[IrParam] = buf()
+
+    params.push(ir_param(t))
+    params.push(ir_param(l_i1()))
+    request_intrinsic(e, ir_sig(name, ir_fn_type(t, params)))
+
+    var ops: Buf[IrArg] = buf()
+
+    ops.push(ir_arg(t, v))
+    ops.push(ir_arg(l_i1(), VBool(false)))
+
+    val r = fresh_reg(e)
+
+    emit(e, ir_call(Some(r), t, VGlobal(name), ops))
+    r
+end wf_ctlz
+
+// An integer of `bits` (more than 128) times `2^by` as the float type `to`, rounded once to nearest,
+// ties to even. `by` is zero for a conversion and a fixed-point format's `-F` for its raw integer, which
+// can be past the float's range on its own when the value is not.
+wide_int_to_float(e: *Emit, bits: int, signed: bool, v: Val, to: Type, by: int) -> Val
+    val fbits = wf_fbits(to)
+
+    if fbits == 16
+        val single = Floating(32, false)
+
+        return convert(e, single, to, wide_int_to_float(e, bits, signed, v, single, by))
+
+    val (width, mant, bias) = wf_format(fbits)
+    val n = LInt(bits)
+    // The narrow conversion's width, and how many bits of the magnitude it is given: one fewer, so
+    // that the signed value fits.
+    val w = if fbits == 128 then 128 else 64
+    val keep = w - 1
+    val wt = LInt(w)
+    var mag = v
+    var neg = VBool(false)
+
+    if signed
+        neg = wf_cmp(e, ISlt, n, v, wf_k(0))
+        mag = wf_select(e, neg, n, wf_bin(e, OpSub, n, wf_k(0), v), v)
+
+    val length = wf_bin(e, OpSub, n, wf_k(bits), wf_ctlz(e, n, mag))
+    val over = wf_cmp(e, IUgt, n, length, wf_k(keep))
+    val shift = wf_select(e, over, n, wf_bin(e, OpSub, n, length, wf_k(keep)), wf_k(0))
+    val kept = wf_bin(e, OpLShr, n, mag, shift)
+    val mask = wf_bin(e, OpSub, n, wf_bin(e, OpShl, n, wf_k(1), shift), wf_k(1))
+    val lost = wf_cmp(e, INe, n, wf_bin(e, OpAnd, n, mag, mask), wf_k(0))
+    val jammed = wf_bin(e, OpOr, n, kept, wf_cast(e, CastZExt, l_i1(), lost, n))
+    var narrow = wf_cast(e, CastTrunc, n, jammed, wt)
+
+    if signed then narrow = wf_select(e, neg, wt, wf_bin(e, OpSub, wt, wf_k(0), narrow), narrow)
+
+    val ft = lty(e, to)
+    val top = wf_cast(e, CastSIToFP, wt, narrow, ft)
+    val power = wf_bin(e, OpAdd, n, shift, wf_k(by))
+    val f = (width, mant, bias, ft)
+
+    // `top · 2^power` is one multiplication where every power the shift can reach is a normal float.
+    // Otherwise it is two, each by a power clamped to the normal range: the first leaves `top` normal
+    // and exact -- it is at least 2^62 wherever it was shifted, and at least 1 wherever it is not zero
+    // -- and the second overflows or underflows as the whole value does.
+    val most = by + (if bits > keep then bits - keep else 0)
+
+    if by >= 1 - bias && most <= bias then return wf_bin(e, OpFMul, ft, top, wf_pow2(e, n, power, f))
+
+    val first = wf_clamp(e, n, power, 1 - bias, bias)
+    val rest = wf_clamp(e, n, wf_bin(e, OpSub, n, power, first), 1 - bias, bias)
+
+    wf_bin(e, OpFMul, ft, wf_bin(e, OpFMul, ft, top, wf_pow2(e, n, first, f)), wf_pow2(e, n, rest, f))
+end wide_int_to_float
+
+// `x`, an integer of type `n` read as signed, held to `lo ..= hi`.
+private wf_clamp(e: *Emit, n: LType, x: Val, lo: int, hi: int) -> Val
+    val low = wf_select(e, wf_cmp(e, ISlt, n, x, wf_k(lo)), n, wf_k(lo), x)
+
+    wf_select(e, wf_cmp(e, ISgt, n, low, wf_k(hi)), n, wf_k(hi), low)
+
+// `2^p` as the float format `f` -- its width, stored significand bits, bias and type -- for a `p` of
+// type `n` in the format's normal range, built from its exponent field.
+private wf_pow2(e: *Emit, n: LType, p: Val, f: (int, int, int, LType)) -> Val
+    val (width, mant, bias, ft) = f
+    val bt = LInt(width)
+    val field = wf_bin(e, OpAdd, bt, wf_cast(e, CastTrunc, n, p, bt), wf_k(bias))
+
+    wf_cast(e, CastBitCast, bt, wf_bin(e, OpShl, bt, field, wf_k(mant)), ft)
+
+// A float as an integer of `bits` (more than 128): truncated toward zero, saturating at the width's
+// ends, a NaN as zero.
+wide_float_to_int(e: *Emit, from: Type, bits: int, signed: bool, v: Val) -> Val
+    if wf_fbits(from) == 16
+        val single = Floating(32, false)
+
+        return wide_float_to_int(e, single, bits, signed, convert(e, from, single, v))
+
+    val (width, mant, bias) = wf_format(wf_fbits(from))
+    val ft = lty(e, from)
+    val bt = LInt(width)
+    val n = LInt(bits)
+    val raw = wf_cast(e, CastBitCast, ft, v, bt)
+    val neg = wf_cmp(e, ISlt, bt, raw, wf_k(0))
+    val all_ones = wf_ones(width - 1 - mant)
+    val field = wf_bin(e, OpAnd, bt, wf_bin(e, OpLShr, bt, raw, wf_k(mant)), all_ones)
+    val stored = wf_bin(e, OpAnd, bt, raw, wf_ones(mant))
+    // The significand with its leading one; a subnormal is below one and comes to zero regardless.
+    val sig = wf_bin(e, OpOr, bt, stored, VInt(big_pow(from_int(2), usize(mant))))
+    // `|v| < 1`; `|v| >= 2^limit`, which an infinity is too; and whether the binary point is right of
+    // the significand's last bit, so that it shifts left.
+    val limit = if signed then bits - 1 else bits
+    val small = wf_cmp(e, IUlt, bt, field, wf_k(bias))
+    val past_end = wf_cmp(e, IUge, bt, field, wf_k(bias + limit))
+    val inf = wf_cmp(e, IEq, bt, field, all_ones)
+    val too_big = wf_bin(e, OpOr, l_i1(), past_end, inf)
+    val point = wf_k(bias + mant)
+    val left = wf_cmp(e, IUgt, bt, field, point)
+    // Right: by `bias + mant - field`, at most `mant` once `small` is ruled out.
+    val right_by = wf_select(e, wf_bin(e, OpOr, l_i1(), small, left), bt, wf_k(0),
+                             wf_bin(e, OpSub, bt, point, field))
+    val right = wf_cast(e, CastZExt, bt, wf_bin(e, OpLShr, bt, sig, right_by), n)
+    // Left: by `field - bias - mant`, less than `limit` once `too_big` is ruled out.
+    val left_raw = wf_bin(e, OpSub, bt, field, point)
+    val left_by = wf_select(e, too_big, bt, wf_k(0), wf_select(e, left, bt, left_raw, wf_k(0)))
+    val shifted_left = wf_bin(e, OpShl, n, wf_cast(e, CastZExt, bt, sig, n),
+                              wf_cast(e, CastZExt, bt, left_by, n))
+    val whole = wf_select(e, left, n, shifted_left, right)
+    val mag = wf_select(e, small, n, wf_k(0), whole)
+    val nan = fresh_reg(e)
+
+    emit(e, InFloatCmp(nan, FUno, ft, v, v))
+
+    val plus = wf_select(e, too_big, n, VInt(max_of(bits, signed)), mag)
+    var minus = wf_k(0)
+
+    if signed then minus = wf_select(e, too_big, n, VInt(min_of(bits, true)), wf_bin(e, OpSub, n, wf_k(0), mag))
+
+    wf_select(e, nan, n, wf_k(0), wf_select(e, neg, n, minus, plus))
+end wide_float_to_int
