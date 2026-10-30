@@ -1645,7 +1645,12 @@ staged_args(e: *Emit, args: Buf[TExpr], out: *Buf[IrArg], callee: string) -> Buf
         // A parameter the callee's body is lent by address (`read_by_address`) crosses as a large
         // one does, under the same promise; `callee` is a direct call's, which names that body.
         val lent = callee != "" && e.lent_params.has(owned_key(callee, i))
-        val v = guaranteed_arg(e, a, if quiet_after(args, i) then callee else "", written, lent)
+
+        // The callee is asked only about an argument whose count it could save (`guaranteed_arg`),
+        // and only where nothing after it can change the place (`quiet_after`).
+        val asks = callee != "" && (e.layout.indirect(aty) || lent || contains_counted(aty)) &&
+                   !held_unless(e, a, written)
+        val v = guaranteed_arg(e, a, if asks && quiet_after(e, args, i) then callee else "", written, lent)
 
         if e.layout.indirect(aty) || lent
             out.push(ir_arg(LPtr, v))
@@ -1706,15 +1711,28 @@ lends_in_place(e: *Emit, callee: string, ty: Type) -> bool
     e.inert.has(callee) || untouched_by(&e.untouched, ty).has(callee)
 end lends_in_place
 
-// Whether the arguments after the `i`th can change nothing while they are worked out: no call, no
-// write. A place lent to the callee is lent from the moment its address is taken, so a later argument
-// that writes it -- `f(*p, bump(p))` -- would otherwise reach the callee instead of the snapshot.
-private quiet_after(args: Buf[TExpr], i: usize) -> bool
+// Whether the arguments after the `i`th can change nothing while they are worked out that the `i`th
+// stands on: no write, and no call but to a function that may itself be lent a place of its type
+// (`lends_in_place`). A place lent to the callee is lent from the moment it is read, so a later argument
+// that writes it -- `f(*p, bump(p))` -- would otherwise reach the callee instead of the snapshot; one
+// that only reads, `vm.stack.push(vm.stack.at(i))`, leaves it where it was.
+private quiet_after(e: *Emit, args: Buf[TExpr], i: usize) -> bool
+    val ty = texpr_type(args.at(i))
+
     for j in i + 1..<args.len()
-        if !changes_nothing(args.at(j)) then return false
+        val v: &Verdict = Verdict(true)
+
+        walk_texpr(args.at(j), expr_walk(true, x -> if !reads_only_for(e, x, ty) then v.refuse()))
+
+        if !v.ok then return false
 
     true
 end quiet_after
+
+// One node of a later argument, as `quiet_after` judges it.
+private reads_only_for(e: *Emit, x: TExpr, ty: Type) -> bool = *x.kind match
+    TCall(name, _, _, _) -> lends_in_place(e, name, ty)
+    _ -> inert_leaf(x)
 
 // Whether working out this expression can change nothing: no call, no write.
 changes_nothing(a: TExpr) -> bool

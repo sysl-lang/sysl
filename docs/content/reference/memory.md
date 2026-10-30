@@ -834,9 +834,14 @@ for `get`, and the stored key each probe compares it with, are read and never co
   too: a function that never comes back counts by what it does before the end, not as nothing. What
   such a path may call besides is C — the report `unwrap` or a bounds check prints, `exit`, the trap —
   as long as nothing C could call back into (an `@export`, a `@section` function, one whose address
-  was taken) releases anything. A function that never comes back and is handed only numbers —
-  `exit`, `trap`, the report behind a `Buf`'s index — may be called whatever C can call back into:
-  whatever a callback releases, nothing that could look at it runs again;
+  was taken) releases anything. A function that never comes back and is handed **only numbers** —
+  or arrays, structs and enums made of them: `exit`, `trap`, the report behind a `Buf`'s index — is
+  not asked even that: whatever it, or C calling back, releases on the way out, no frame holding the
+  uncounted value ever runs again;
+- a call that may write memory is judged by **the type of what it writes**: a field read through a
+  pointer, `vm.stack` with `vm: *Machine`, is handed to `vm.stack.push(vm.stack.at(i))` with no count
+  of its own, since growing a `Buf[Value]` writes the buffer's storage and lets go of an array of
+  `Value`s, neither of which can hold a `Machine`;
 - an `await` keeps it too, since another task may run there and write the storage;
 - a value that is returned, stored, captured by a closure, or handed to a function that keeps it
   keeps its count. A tuple or struct built on the spot for such a call is **handed over whole**: the
