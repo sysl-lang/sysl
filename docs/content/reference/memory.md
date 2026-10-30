@@ -5504,7 +5504,7 @@ C programs already live by — **a pointer handed to a call is borrowed for the 
 |---|---|
 | a sysl function | what its body keeps |
 | a method through a trait object | no pointer it is handed — an implementation reached through an object that keeps one is refused where it is written; an object it is handed, a callback among them, is kept wherever any implementation keeps it |
-| a closure | nothing — a closure that keeps what it is handed is refused where it is written; the variables it captures are judged at the closure literal, where its body is in hand |
+| a closure | nothing — a closure that keeps what it is handed is refused where it is written; the variables it captures are judged at the closure literal, where its body is in hand. A parameter its type marks [`@keeps`](#a-callable-that-keeps-what-it-is-handed) is kept, as an `extern`'s is |
 | a function through a pointer | what any function whose address is taken at that pointer's type holds in what another of its parameters points at — one that keeps a pointer anywhere else is refused where it is written, and so is every one whose pointer type C can reach |
 | an `extern` | nothing, unless its declaration says [`@keeps(p)`](/reference/ffi/#keeps-a-c-function-that-holds-on-to-a-pointer) |
 
@@ -5594,6 +5594,81 @@ impl Bump for Keeper
 ```error
 'bump' keeps its parameter 'n' (it is stored in 'self.held'), but a method of 'Bump' borrows its parameters for the call
 ```
+
+### A callable that keeps what it is handed
+
+A callback that keeps what it is handed — an interpreter's primitive putting the handle it is called
+with into the term it builds, a visitor collecting the nodes it is shown — says so in its type, with
+[`@keeps`](/reference/types/#a-parameter-the-callable-may-keep-keeps) on the parameter:
+`&Fn(@keeps *Handle) -> Step`. A closure made at that type may keep that parameter; every other
+parameter is still borrowed. **A call through a value of the type is held to the mark the way a call
+of an `extern` is held to its `@keeps(p)`**: what is handed there may be kept anywhere, so the address
+of storage that ends — a local, a field of one, a parameter's copy — is refused, and a function that
+hands its own parameter on there keeps it, so its callers are held to that in turn.
+
+```sysl
+import sysl.buf.{Buf, buf}
+
+struct Handle
+    n: int
+
+type Visit = &Fn(@keeps *Handle) -> unit
+
+var seen: Buf[*Handle] = buf()
+var a = Handle(3)
+
+walk(f: Visit, h: *Handle) = f(h)
+
+walk(h -> seen.push(h), &a)
+print(seen.at(0).n)
+```
+
+```output
+3
+```
+
+```sysl
+import sysl.buf.{Buf, buf}
+
+struct Handle
+    n: int
+
+type Visit = &Fn(@keeps *Handle) -> unit
+
+var seen: Buf[*Handle] = buf()
+
+visit_one(f: Visit)
+    var mine = Handle(1)
+    f(&mine)
+```
+
+```error
+a call through '&Fn(@keeps *Handle) -> unit' keeps its parameter 1 (its type says '@keeps'), and '&mine' is the address of a local of 'visit_one'
+```
+
+Without the mark the closure is refused where it keeps the parameter, and told the type that would
+let it:
+
+```sysl
+import sysl.buf.{Buf, buf}
+
+struct Handle
+    n: int
+
+var seen: Buf[*Handle] = buf()
+
+val f: &Fn(*Handle) -> unit = (h) -> seen.push(h)
+```
+
+```error
+a closure borrows what it is handed for the call, and this one keeps its parameter 'h' (it is passed to 'push', which keeps it) — whoever calls it may hand it the address of their own storage. Copy what this needs into storage of its own, or let it keep it by marking the parameter '@keeps' in the type it is made at: 'Fn(@keeps *Handle) -> unit'
+```
+
+Every question a call through the object is asked about a marked parameter is answered as for an
+`extern`: what it reads through the pointer may be kept too, at any depth, and what it answers may be
+made of what it was handed. A call that sees the body — a closure handed to a bare-arrow parameter,
+which the function calls directly — is held to what that body keeps instead, as any call with a body
+in sight is.
 
 **Every call through a function pointer is in the program, unless C can reach the pointer.** So a
 function whose address is taken may hold what it is handed in what another of its parameters points

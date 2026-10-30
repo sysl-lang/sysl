@@ -290,18 +290,41 @@ end fields_counted
 // `lending_closure_base`). It follows the counter, so it cannot be mistaken for more digits of it.
 borrowing_closure_suffix() -> string = "borrows"
 
-// Whether a field of `d` is a view a scoped child **borrowed**: `d` is a closure written at a
-// `@scoped` parameter, and the field is a view it captured. Such a view is stored with a null owner,
-// since the frame it was taken from is blocked in the scope call until the child has finished; so it
-// is not counted -- no share is taken when the closure is built or copied and none is given back when
-// it is let go -- and it is not shared with the child either (`sharing.sysl`).
-borrowed_capture(d: &StructType, fty: Type) -> bool
-    if !is_closure_literal(Struct(d)) || !d.base.ends_with(borrowing_closure_suffix()) then return false
+// Whether a field of `d` is a value a scoped child **borrowed**: `d` is a closure written at a
+// `@scoped` parameter, and the field is a view it captured, or a struct or tuple holding one. Every
+// such view is stored with a null owner, since the frame it was taken from is blocked in the scope
+// call until the child has finished; so the field is not counted -- no share is taken when the
+// closure is built or copied and none is given back when it is let go -- and it is not shared with the
+// child either (`sharing.sysl`).
+borrowed_capture(d: &StructType, fty: Type) -> bool =
+    is_lending_closure(d) && holds_lent_view(fty)
 
-    fty match
-        Slice(_, _) -> true
-        _ -> false
-end borrowed_capture
+// Whether `d` is a scoped child's closure that borrows the views it captures.
+is_lending_closure(d: &StructType) -> bool =
+    is_closure_literal(Struct(d)) && d.base.ends_with(borrowing_closure_suffix())
+
+// Whether a captured value of this type holds a view **in its own storage**: the view itself, or a
+// field of a struct or tuple, at any depth, that is one. Those are the views a borrowing capture nulls
+// the owner of (`emit_arc.sysl`'s `captured_value`). The walk does not go through an array or a data
+// enum, whose views a capture does not lend, nor into a struct whose storage is the library's to keep:
+// a frozen buffer, a task, a struct with guarded fields, or another closure.
+holds_lent_view(t: Type) -> bool = t match
+    Slice(_, _) -> true
+    Constrained(d) -> holds_lent_view(d.base)
+    Struct(d) -> lends_through(d) && fields_lend(d.fields)
+    _ -> false
+
+private fields_lend(fields: Buf[(string, Type)]) -> bool
+    for item in fields
+        if holds_lent_view(item.1) then return true
+
+    false
+end fields_lend
+
+// Whether a borrowing capture looks through a struct's fields to the views among them.
+lends_through(d: &StructType) -> bool =
+    d.base != TaskBase && d.base != frozen_base() && d.guarded.is_empty() && !d.union_layout &&
+        d.c_bits.is_empty() && !is_closure_literal(Struct(d))
 
 private variants_counted(vs: Buf[EnumVariant]) -> bool
     for item in vs

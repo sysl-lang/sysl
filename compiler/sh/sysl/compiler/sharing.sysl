@@ -75,7 +75,8 @@ private share_walk(t: Type, path: Buf[string], holder: Option[Type],
     // element type in place of the fields, and nothing about the storage.
     Struct(d) ->
         if d.base == frozen_base() && d.targs.len() == 1 then share_walk(d.targs.at(0), path, Some(t), laid, false)
-        else share_walk_fields(unlent(d, unguarded(d)), path, "", t, laid, copied)
+        else if !laid && !copied && is_lending_closure(d) then lent_walk_fields(d.fields, path, t)
+        else share_walk_fields(unguarded(d), path, "", t, laid, copied)
 
     // A data enum shares one payload region, so every variant's fields are reachable from it.
     Enum(d) -> share_walk_variants(d.variants, path, t, laid, copied)
@@ -141,27 +142,34 @@ private unguarded(d: &StructType) -> Buf[(string, Type)]
     out
 end unguarded
 
-// The fields of `d` less the views a scoped child borrowed whose elements may be shared.
+// The captures of a scoped child's closure, asked as what they are: **lent, not shared**.
 //
 // **A borrowed view is not shared with the child; it is lent to it.** Its owner word is null, so the
 // child never touches the count the crossing rule protects, and the frame it was taken from is
 // blocked in the scope call until the child is done (`docs/design/scope.md` § 2). What the child can
 // still reach through it is the elements, so those are asked as anything crossing is: a view of
-// `&T`s, or of strings, is walked as before and refused in the words it always was.
-private unlent(d: &StructType, fields: Buf[(string, Type)]) -> Buf[(string, Type)]
-    var out: Buf[(string, Type)] = buf()
-
+// `&T`s, or of strings, is refused in the words it always was.
+//
+// **A struct or tuple holding a view is lent the same way** (`holds_lent_view`): every view in its
+// own storage has its owner nulled, so each is asked as a bare one would be, and every other field
+// as anything crossing is -- a `string` or a plain `&T` beside the view is still refused, by name.
+private lent_walk_fields(fields: Buf[(string, Type)], path: Buf[string], holder: Type) -> Option[Unshareable]
     for item in fields
-        val elem = item.1 match
-            Slice(inner, _) -> Some(*inner)
-            _ -> None
+        val at = if is_anonymous_field(item.0) then path else extended_path(path, item.0)
+        val found = lent_walk(item.1, at, holder)
 
-        if borrowed_capture(d, item.1) && unshareable(elem.unwrap()).is_none() then continue
+        if found.is_some() then return found
 
-        out.push(item)
+    None
+end lent_walk_fields
 
-    out
-end unlent
+private lent_walk(t: Type, path: Buf[string], holder: Type) -> Option[Unshareable] = t match
+    Slice(elem, _) -> if unshareable(*elem).is_none() then None else Some(Unshareable(path, t, Some(holder)))
+    Constrained(d) -> lent_walk(d.base, path, holder)
+    Struct(d) ->
+        if holds_lent_view(t) then lent_walk_fields(d.fields, path, t)
+        else share_walk(t, path, Some(holder), false, false)
+    _ -> share_walk(t, path, Some(holder), false, false)
 
 // The part of a guarded field that may not be shared, or nothing where every guarded field of `d`
 // reaches only atomic counts -- in which case nothing a member hands out of it can carry one.

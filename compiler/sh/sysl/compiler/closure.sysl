@@ -24,7 +24,7 @@ import sysl.text.str_builder
 closure_base(n: usize) -> string = s"${ModuleSep}closure$n"
 
 // The name a **scoped child's** closure is filed under: one written as the argument of a `@scoped`
-// parameter that captures a view. Such a view is borrowed from the frame blocked in the scope call
+// parameter that captures a view, or a struct or tuple holding one. Such a view is borrowed from the frame blocked in the scope call
 // rather than shared with the child, so it is stored with a null owner and never counted
 // (`type_queries.sysl`'s `borrowed_capture`). The difference is in the name because it is a fact
 // about the struct, read wherever the struct is -- the share walk, the construction, the ARC walks --
@@ -39,9 +39,7 @@ private borrows_its_views(cx: &Analyzer, span: Span, fields: Buf[(string, Type)]
     if !cx.an.scoped_args.has(scoped_arg_key(cx, span)) then return false
 
     for item in fields
-        item.1 match
-            Slice(_, _) -> return true
-            _ -> ()
+        if holds_lent_view(item.1) then return true
 
     false
 end borrows_its_views
@@ -131,7 +129,11 @@ closure_expr(cx: &Analyzer, span: Span, written: Buf[LambdaParam], body: Buf[Stm
             ptypes.push(Unknown)
 
     val result = if want.is_none() then None else want.unwrap().1
-    val lowered = lower_closure(cx, span, names, ptypes, result, body)
+    var kept: Buf[usize] = buf()
+
+    if expected.is_some() then kept = callable_marks(cx.an, expected.unwrap())
+
+    val lowered = lower_closure(cx, span, names, ptypes, result, body, "", kept)
 
     *lowered.kind match
         TStructNew(st, _) -> cx.an.closures_written.put(st.base, ClosureWritten(cx.scope, params, ptypes))
@@ -437,7 +439,7 @@ end refuse_pinned_captures
 // that *is* the closure -- its captures, in the order the fields hold them. `named` is the function a
 // program passed where the closure stands for one, and empty for a closure literal.
 lower_closure(cx: &Analyzer, span: Span, names: Buf[string], ptypes: Buf[Type],
-              result: Option[Type], body: Buf[Stmt], named: string = "") -> TExpr
+              result: Option[Type], body: Buf[Stmt], named: string = "", kept: Buf[usize] = buf()) -> TExpr
     val captured = captures(cx, body, names)
 
     if refuse_ref_captures(cx, span, captured) then return bad_expr(span)
@@ -451,6 +453,7 @@ lower_closure(cx: &Analyzer, span: Span, names: Buf[string], ptypes: Buf[Type],
     val base = if lends then lending_closure_base(cx.an.closure_count) else closure_base(cx.an.closure_count)
 
     cx.an.closure_count += 1
+    cx.an.closure_keeps.put(base, kept)
 
     // **A scoped child holds its captures by value** whatever else is true of it, so it is no
     // candidate; any other closure may hold each `var` it captures by reference, decided once every
@@ -1224,8 +1227,12 @@ end register_call_trait
 //
 // **With `on_first`, the callee is a method and the first parameter its receiver** -- `S.get` is
 // `a0.get(a1, …)` -- which is the function the member compiled to, its receiver first.
+//
+// `kept` is what the callable type it is made at marks `@keeps` (`callable_marks`): the function
+// behind it may keep those, and the closure passes them on, so it is licensed to as well.
 function_as_callable(cx: &Analyzer, span: Span, written: string, ptypes: Buf[Type],
-                     result: Option[Type], callee: Option[Expr] = None, on_first: bool = false) -> TExpr
+                     result: Option[Type], kept: Buf[usize], callee: Option[Expr] = None,
+                     on_first: bool = false) -> TExpr
     // The parameters are named where no program can name them, so nothing the function's own body
     // reaches is shadowed by one of them.
     var names: Buf[string] = buf()
@@ -1250,7 +1257,7 @@ function_as_callable(cx: &Analyzer, span: Span, written: string, ptypes: Buf[Typ
         body.push(stmt(span, ExprStmt(expr(span, Call(on_receiver(called, args.at(0)), rest)))))
     else body.push(stmt(span, ExprStmt(expr(span, Call(called, args)))))
 
-    lower_closure(cx, span, names, ptypes, result, body, written)
+    lower_closure(cx, span, names, ptypes, result, body, written, kept)
 end function_as_callable
 
 // `S.get`, `S.pick[int]` with the type's name replaced by the value the member is called on.

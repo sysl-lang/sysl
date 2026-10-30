@@ -1,0 +1,507 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{is_file, make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.split
+
+// IEEE 754-2019's `maximum` and `minimum` (`reference/vectors.md`, `library/math.md`): a NaN in either
+// operand wins and `-0` orders below `+0`. A float vector has them lane-wise (`a.maximum(b)`, one
+// `llvm.maximum` over the register) and as reductions (`a.maximum()`, one
+// `llvm.vector.reduce.fmaximum`); `f32`, `f64`, `f16` and `bf16` have them as `Float` methods. The
+// numbers are checked where `max_num`/`max()` answer differently -- a NaN on either side, both NaN,
+// two zeros of opposite sign in both orders -- and the contrast with those is asserted as it stands.
+
+private nmx_ready() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+    end if
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+    end if
+
+    true
+end nmx_ready
+
+private nmx_build(text: string, run: bool, disassemble: bool) -> string
+    val root = make_temp_dir("sysl-nmx").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+    var out = ""
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) -> out = failure_text(why)
+        Ok(_) ->
+            if run
+                capture(exe, [], "", [], true) match
+                    Err(_) -> out = "the program that was built could not be run"
+                    Ok(said) -> out = said.text
+            end if
+
+            if disassemble
+                capture("/usr/bin/otool", ["-tvV", exe], "", [], true) match
+                    Err(_) -> out = "otool did not run"
+                    Ok(said) -> out = said.text
+            end if
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end nmx_build
+
+private nmx_ran(text: string) -> string = nmx_build(text + "\n" + nmx_lanes(), true, false)
+
+// What every run program prints a lane with: a NaN as `nan` whatever its sign and payload, and a zero
+// with its sign, which `print` of `0.0` would not show.
+private nmx_lanes() -> string = raw"""
+    show(x: f64) -> string = if x != x then "nan" else if x == 0.0 then (if 1.0 / x < 0.0 then "-0" else "+0") else s"$x"
+    show32(x: f32) -> string = show(f64(x))
+
+    """
+
+private nmx_says(text: string, want: string)
+    val said = enm_err(text)
+
+    assert(said.contains(want), s"expected it to say: $want\nit said: $said")
+
+private nmx_count(text: string, needle: string) -> int
+    var n = 0
+
+    val lines = split(text, "\n")
+
+    for i in 0..<lines.len
+        if lines[i].contains(needle) then n += 1
+
+    n
+end nmx_count
+
+// -- lane-wise, f64 ---------------------------------------------------------------------------------
+
+@test("maximum and minimum propagate a NaN from either side, lane by lane, and leave the other lanes alone")
+nmx_lane_nan_either_side()
+    if !nmx_ready() then return
+
+    assert_eq(nmx_ran(raw"""
+        val a: <4>f64 = [nan, 1.0, 2.0, nan]
+        val b: <4>f64 = [1.0, nan, 3.0, nan]
+        val hi = a.maximum(b)
+        val lo = a.minimum(b)
+        val back = b.maximum(a)
+
+        print(show(hi[0]), show(hi[1]), show(hi[2]), show(hi[3]))
+        print(show(lo[0]), show(lo[1]), show(lo[2]), show(lo[3]))
+        print(show(back[0]), show(back[1]), show(back[2]), show(back[3]))
+        """), "nan nan 3 nan\nnan nan 2 nan\nnan nan 3 nan\n")
+
+@test("maximum answers +0 and minimum -0 for two zeros of opposite sign, whichever way round")
+nmx_lane_signed_zeros()
+    if !nmx_ready() then return
+
+    assert_eq(nmx_ran(raw"""
+        val a: <2>f64 = [-0.0, 0.0]
+        val b: <2>f64 = [0.0, -0.0]
+        val hi = a.maximum(b)
+        val lo = a.minimum(b)
+        val same = a.maximum(a)
+
+        print(show(hi[0]), show(hi[1]), show(lo[0]), show(lo[1]), show(same[0]), show(same[1]))
+        """), "+0 +0 -0 -0 -0 +0\n")
+
+@test("maximum and minimum at the infinities and at equal values")
+nmx_lane_infinities_and_ties()
+    if !nmx_ready() then return
+
+    assert_eq(nmx_ran(raw"""
+        val a: <4>f64 = [infinity, -infinity, infinity, 2.5]
+        val b: <4>f64 = [1.0, 1.0, -infinity, 2.5]
+        val hi = a.maximum(b)
+        val lo = a.minimum(b)
+
+        print(show(hi[0]), show(hi[1]), show(hi[2]), show(hi[3]))
+        print(show(lo[0]), show(lo[1]), show(lo[2]), show(lo[3]))
+        """), "inf 1 inf 2.5\n1 -inf -inf 2.5\n")
+
+@test("maximum takes a scalar, which is the same value in every lane, and a NaN scalar reaches every lane")
+nmx_lane_scalar_operand()
+    if !nmx_ready() then return
+
+    assert_eq(nmx_ran(raw"""
+        val a: <4>f64 = [-1.0, 2.0, nan, -0.0]
+        val hi = a.maximum(0.0)
+        val lo = a.minimum(0.0)
+        val all = a.maximum(nan)
+
+        print(show(hi[0]), show(hi[1]), show(hi[2]), show(hi[3]))
+        print(show(lo[0]), show(lo[1]), show(lo[2]), show(lo[3]))
+        print(show(all[0]), show(all[1]), show(all[3]))
+        """), "+0 2 nan +0\n-1 +0 nan -0\nnan nan nan\n")
+
+// -- lane-wise, every width ---------------------------------------------------------------------------
+
+@test("maximum and minimum across the f32 lane counts 2, 3, 4 and 8, the NaN in the last lane")
+nmx_lane_f32_widths()
+    if !nmx_ready() then return
+
+    assert_eq(nmx_ran(raw"""
+        val a2: <2>f32 = [1.0, f32(nan)]
+        val a3: <3>f32 = [1.0, -0.0, f32(nan)]
+        val a4: <4>f32 = [1.0, 5.0, -2.0, f32(nan)]
+        val a8: <8>f32 = [1.0, 5.0, -2.0, 0.0, 7.0, -0.0, 3.0, f32(nan)]
+        val m2 = a2.maximum(2.0)
+        val m3 = a3.minimum(0.0)
+        val m4 = a4.maximum(3.0)
+        val m8 = a8.minimum(0.0)
+
+        print(show32(m2[0]), show32(m2[1]))
+        print(show32(m3[0]), show32(m3[1]), show32(m3[2]))
+        print(show32(m4[0]), show32(m4[1]), show32(m4[2]), show32(m4[3]))
+        print(show32(m8[0]), show32(m8[2]), show32(m8[4]), show32(m8[5]), show32(m8[7]))
+        """), "2 nan\n+0 -0 nan\n3 5 3 nan\n+0 -2 +0 -0 nan\n")
+
+@test("maximum and minimum across the f64 lane counts 2, 3, 4 and 8")
+nmx_lane_f64_widths()
+    if !nmx_ready() then return
+
+    assert_eq(nmx_ran(raw"""
+        val a2: <2>f64 = [nan, 4.0]
+        val a3: <3>f64 = [nan, 4.0, -0.0]
+        val a8: <8>f64 = [1.0, 5.0, -2.0, 0.0, 7.0, -0.0, 3.0, nan]
+        val b8: <8>f64 = 2.0
+        val m2 = a2.minimum(1.0)
+        val m3 = a3.maximum(0.0)
+        val m8 = a8.maximum(b8)
+
+        print(show(m2[0]), show(m2[1]), show(m3[0]), show(m3[1]), show(m3[2]))
+        print(show(m8[0]), show(m8[1]), show(m8[2]), show(m8[4]), show(m8[7]))
+        """), "nan 1 nan 4 +0\n2 5 2 7 nan\n")
+
+// -- the reductions -----------------------------------------------------------------------------------
+
+@test("maximum() and minimum() reduce to a NaN when any lane is one, where max() and min() step over it")
+nmx_reduce_nan()
+    if !nmx_ready() then return
+
+    assert_eq(nmx_ran(raw"""
+        val a: <4>f64 = [1.0, nan, 3.0, -4.0]
+        val b: <8>f32 = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, f32(nan)]
+        val c: <4>f64 = [1.0, 9.0, 3.0, -4.0]
+
+        print(show(a.maximum()), show(a.minimum()), show32(b.maximum()), show32(b.minimum()))
+        print(show(a.max()), show(a.min()), show32(b.max()), show32(b.min()))
+        print(show(c.maximum()), show(c.minimum()))
+        """), "nan nan nan nan\n3 -4 7 1\n9 -4\n")
+
+@test("maximum() and minimum() of two zeros of opposite sign are +0 and -0, in either lane order")
+nmx_reduce_zeros()
+    if !nmx_ready() then return
+
+    assert_eq(nmx_ran(raw"""
+        val a: <2>f64 = [-0.0, 0.0]
+        val b: <2>f64 = [0.0, -0.0]
+        val c: <4>f32 = [-0.0, -0.0, 0.0, -0.0]
+
+        print(show(a.maximum()), show(b.maximum()), show(a.minimum()), show(b.minimum()))
+        print(show32(c.maximum()), show32(c.minimum()))
+        """), "+0 +0 -0 -0\n+0 -0\n")
+
+// An iamax-shaped kernel, as netlib's: the index of the largest magnitude, and the index of the FIRST
+// NaN when there is one. The vector pass is the whole of the work on clean data; a NaN anywhere makes
+// the running maximum a NaN, and only then is the scalar scan for the first one paid.
+@test("an iamax kernel over maximum finds the largest magnitude, and the first NaN where there is one")
+nmx_iamax_kernel()
+    if !nmx_ready() then return
+
+    assert_eq(nmx_ran(raw"""
+        iamax(x: []f64) -> usize
+            var best: <4>f64 = 0.0
+            var i = 0
+
+            while i + 4 <= x.len
+                val v: <4>f64 = x.load(i)
+
+                best = best.maximum(v.abs())
+                i += 4
+
+            var top = best.maximum()
+
+            while i < x.len
+                top = top.maximum(x[i].abs())
+                i += 1
+
+            for k in 0..<x.len
+                if top != top
+                    if x[k] != x[k] then return k
+                elif x[k].abs() == top then return k
+
+            0
+        end iamax
+
+        main()
+            var xs: [11]f64 = [1.0, -9.0, 3.0, 2.0, 9.0, 0.5, -1.0, 4.0, 8.0, 2.0, 1.0]
+
+            print(iamax(xs[..]))
+            xs[6] = nan
+            print(iamax(xs[..]))
+            xs[2] = nan
+            print(iamax(xs[..]))
+            xs[2] = 1.0
+            xs[6] = 1.0
+            xs[10] = nan
+            print(iamax(xs[..]))
+        """), "1\n6\n2\n10\n")
+
+// -- the scalar methods -------------------------------------------------------------------------------
+
+@test("the scalar maximum and minimum propagate a NaN from either side, where max_num and sysl.math.max do not")
+nmx_scalar_f64()
+    if !nmx_ready() then return
+
+    assert_eq(nmx_ran(raw"""
+        import sysl.math.{Float, max, min}
+
+        main()
+            var one = 1.0
+            val hole = nan
+
+            print(show(hole.maximum(one)), show(one.maximum(hole)), show(hole.minimum(one)), show(one.minimum(hole)))
+            print(show(hole.maximum(hole)), show(one.maximum(2.0)), show(one.minimum(2.0)), show(one.maximum(one)))
+            print(show(hole.max_num(one)), show(one.max_num(hole)), show(max(hole, one)), show(max(one, hole)))
+            print(show(min(hole, one)), show(min(one, hole)))
+            print(show((-0.0).maximum(0.0)), show(0.0.maximum(-0.0)), show((-0.0).minimum(0.0)), show(0.0.minimum(-0.0)))
+            print(show(infinity.minimum(one)), show((-infinity).maximum(one)))
+        """), "nan nan nan nan\nnan 2 1 1\n1 1 nan 1\nnan 1\n+0 +0 -0 -0\n1 1\n")
+
+@test("the scalar maximum and minimum at f32, f16 and bf16")
+nmx_scalar_narrow()
+    if !nmx_ready() then return
+
+    assert_eq(nmx_ran(raw"""
+        import sysl.math.Float
+
+        main()
+            var one = 1.0f32
+            val hole = f32(nan)
+            val h = f16(1.5)
+            val g = bf16(1.5)
+
+            print(show32(hole.maximum(one)), show32(one.minimum(hole)), show32((-0.0f32).maximum(0.0)))
+            print(show32(0.0f32.minimum(-0.0)), show32(one.maximum(2.0)))
+            print(show32(f32(h.maximum(f16(nan)))), show32(f32(h.minimum(f16(-2.0)))), show32(f32(f16(0.0).minimum(f16(-0.0)))))
+            print(show32(f32(g.maximum(bf16(nan)))), show32(f32(g.maximum(bf16(-2.0)))), show32(f32(bf16(-0.0).maximum(bf16(0.0)))))
+        """), "nan nan +0\n-0 2\nnan -2 -0\nnan 1.5 +0\n")
+
+// -- the IR and the machine code ----------------------------------------------------------------------
+
+@test("a float vector's maximum and minimum are one llvm.maximum or llvm.minimum over the register")
+nmx_ir_lanewise()
+    if !nmx_ready() then return
+
+    val main = cgz_main("val a: <4>f64 = [1.0, 2.0, 3.0, 4.0]\nval b = a.maximum(a)\nprint(b[0])\n")
+
+    assert_eq(nmx_count(main, "call <4 x double> @llvm.maximum.v4f64"), 1, main)
+    assert_eq(nmx_count(main, "fcmp"), 0, main)
+    assert_eq(nmx_count(main, "extractelement"), 1, main)
+
+    val narrow = cgz_main("val a: <8>f32 = 1.0\nval b = a.minimum(0.5)\nprint(b[0])\n")
+
+    assert_eq(nmx_count(narrow, "call <8 x float> @llvm.minimum.v8f32"), 1, narrow)
+
+@test("a float vector's maximum() and minimum() are one llvm.vector.reduce.fmaximum or fminimum")
+nmx_ir_reduce()
+    if !nmx_ready() then return
+
+    val main = cgz_main("val a: <4>f64 = [1.0, 2.0, 3.0, 4.0]\nprint(a.maximum(), a.max())\n")
+
+    assert_eq(nmx_count(main, "call double @llvm.vector.reduce.fmaximum.v4f64"), 1, main)
+    assert_eq(nmx_count(main, "call double @llvm.vector.reduce.fmax.v4f64"), 1, main)
+
+    val narrow = cgz_main("val a: <4>f32 = 1.0\nprint(a.minimum())\n")
+
+    assert_eq(nmx_count(narrow, "call float @llvm.vector.reduce.fminimum.v4f32"), 1, narrow)
+
+@test("the scalar maximum and minimum are llvm.maximum and llvm.minimum")
+nmx_ir_scalar()
+    if !nmx_ready() then return
+
+    val ir = cgz_ir("import sysl.math.Float\n\nvar a = 1.0\nprint(a.maximum(2.0), 1.0f32.minimum(2.0))\n")
+
+    assert(ir.contains("call double @llvm.maximum.f64("), ir)
+    assert(ir.contains("call float @llvm.minimum.f32("), ir)
+
+// AArch64's `fmax` and `fmin` ARE IEEE 754-2019's maximum and minimum, so the lane-wise method is one
+// instruction over the register -- no compare, no select, no NaN fix-up -- and the reduction over two
+// doubles is one pairwise `fmaxp`.
+@test("on AArch64 a lane-wise maximum is one fmax and a minimum one fmin")
+nmx_aarch64_fmax()
+    if !nmx_ready() then return
+
+    if !is_file("/usr/bin/otool") || !nmx_machine().starts_with("arm64")
+        print("skipped: this is not an AArch64 Mac, whose otool reads the machine code")
+        return
+    end if
+
+    val dis = nmx_build(raw"""
+        @noinline
+        nmx_hi(a: <2>f64, b: <2>f64) -> <2>f64 = a.maximum(b)
+
+        @noinline
+        nmx_lo(a: <4>f32, b: <4>f32) -> <4>f32 = a.minimum(b)
+
+        @noinline
+        nmx_top(a: <2>f64) -> f64 = a.maximum()
+
+        main(args: []string)
+            val x: <2>f64 = real(args.len)
+            val y: <4>f32 = f32(args.len)
+
+            print(nmx_hi(x, x)[0], nmx_lo(y, y)[0], nmx_top(x))
+        """, false, true)
+
+    val hi = nmx_body(dis, "nmx_hi")
+    val lo = nmx_body(dis, "nmx_lo")
+    val top = nmx_body(dis, "nmx_top")
+
+    assert_eq(nmx_count(hi, "fmax.2d"), 1, hi)
+    assert_eq(nmx_count(hi, "fcm"), 0, hi)
+    assert_eq(nmx_count(lo, "fmin.4s"), 1, lo)
+    assert_eq(nmx_count(lo, "fcm"), 0, lo)
+    assert_eq(nmx_count(top, "fmaxp"), 1, top)
+    assert_eq(nmx_count(top, "fmaxnm"), 0, top)
+
+private nmx_machine() -> string = capture("/usr/bin/uname", ["-m"], "", [], true) match
+    Ok(said) -> said.text
+    Err(_) -> ""
+
+// The lines of `otool -tvV` from the label naming `symbol` up to the next label.
+private nmx_body(dis: string, symbol: string) -> string
+    val lines = split(dis, "\n")
+    var out = ""
+    var inside = false
+
+    for i in 0..<lines.len
+        val line = lines[i]
+
+        if line.ends_with(":") && !line.starts_with("\t") && !line.starts_with(" ")
+            inside = line.contains(symbol)
+        elif inside
+            out = out + line + "\n"
+
+    assert(out != "", s"no '$symbol' in the disassembly:\n$dis")
+    out
+end nmx_body
+
+// -- what is refused ----------------------------------------------------------------------------------
+
+@test("maximum on an integer, a mask or a half-width vector is refused, and the refusal says what to write")
+nmx_refused_lanes()
+    if !enm_ready() then return
+
+    nmx_says("val a: <4>int = [1, 2, 3, 4]\nprint(a.maximum(a)[0])\n",
+             "'maximum' is IEEE 754's NaN-propagating maximum, defined for f32 and f64 lanes, and <4>int is not one")
+    nmx_says("val a: <4>i64 = [1, 2, 3, 4]\nprint(a.minimum())\n", "compare and choose: '(a > b).select(a, b)'")
+    nmx_says("val a: <4>u8 = [1, 2, 3, 4]\nprint(a.maximum(a)[0])\n", "'maximum' is IEEE 754's NaN-propagating")
+    nmx_says("val a: <4>f32 = 1.0\nprint((a < a).maximum())\n", "'maximum' is IEEE 754's NaN-propagating")
+    nmx_says("val a: <4>f16 = [f16(1.0), f16(2.0), f16(3.0), f16(4.0)]\nprint(f32(a.maximum(a)[0]))\n",
+             "widen the lanes to f32 first")
+    nmx_says("val a: <2>q15 = [q15(0.5), q15(-0.5)]\nprint(a.minimum(a)[0])\n",
+             "'minimum' is IEEE 754's NaN-propagating minimum")
+
+@test("maximum takes one operand of the receiver's type, or none")
+nmx_refused_arguments()
+    if !enm_ready() then return
+
+    nmx_says("val a: <4>f32 = 1.0\nprint(a.maximum(a, a)[0])\n",
+             "'maximum' takes the vector to compare with lane by lane — 'a.maximum(b)' — or nothing, to reduce the lanes, and 2 arguments were given")
+    nmx_says("val a: <4>f32 = 1.0\nval b: <2>f32 = 1.0\nprint(a.minimum(b)[0])\n",
+             "'minimum' compares vectors of one type, and the receiver is <4>f32 where the argument is <2>f32")
+    nmx_says("val a: <4>f32 = 1.0\nval b: <4>f64 = 1.0\nprint(a.maximum(b)[0])\n",
+             "'maximum' compares vectors of one type")
+
+@test("an integer has no scalar maximum, as Rust's have none")
+nmx_refused_scalar_int()
+    if !enm_ready() then return
+
+    nmx_says("import sysl.math.Float\n\nvar a = 3\nprint(a.maximum(4))\n", "type 'int' has no method 'maximum'")
+
+// The refusal is the general one, of any vector at a C or intrinsic boundary; the methods are the way.
+@test("an extern naming llvm.maximum at a vector type is refused")
+nmx_refused_extern_vector()
+    if !enm_ready() then return
+
+    val said = enm_err("extern \"llvm.maximum\" vmax(a: <2>f64, b: <2>f64) -> <2>f64\n\nval a: <2>f64 = 1.0\nprint(vmax(a, a)[0])\n")
+
+    assert(said.contains("how a vector reaches a C function differs by target"), said)
+    assert(said.contains("'llvm.maximum' takes and returns one floating-point type"), said)
+
+// -- while compiling, and in a strict body ------------------------------------------------------------
+
+@test("maximum() and minimum() reduce while compiling with the NaN and the signed zero the machine has")
+nmx_const_reduce()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        top(x: f64, y: f64) -> f64
+            val v: <4>f64 = [x, y, y, x]
+
+            v.maximum()
+
+        bottom(x: f64, y: f64) -> f64
+            val v: <4>f64 = [x, y, x, y]
+
+            v.minimum()
+
+        const A: f64 = top(nan, 2.0)
+        const B: f64 = top(5.0, 2.0)
+        const C: f64 = 1.0 / top(-0.0, 0.0)
+        const D: f64 = bottom(2.0, nan)
+        const E: f64 = 1.0 / bottom(0.0, -0.0)
+        const F: f64 = 1.0 / top(0.0, -0.0)
+        const G: f64 = 1.0 / bottom(-0.0, 0.0)
+
+        print(A != A, B, C, D != D, E, F, G)
+        print(top(nan, 2.0) != top(nan, 2.0), 1.0 / top(-0.0, 0.0), 1.0 / bottom(0.0, -0.0))
+        """), "true 5 inf true -inf inf -inf\ntrue inf -inf\n")
+
+@test("a vector's lane-wise maximum is not evaluated while compiling, and the refusal names the method")
+nmx_const_lanewise_refused()
+    if !enm_ready() then return
+
+    val said = enm_outcome(raw"""
+        hi(x: f64) -> f64
+            val v: <2>f64 = [x, 1.0]
+
+            v.maximum(v)[0]
+
+        const M: f64 = hi(2.0)
+
+        print(M)
+        """).0
+
+    assert(said.contains("a vector's lane-wise 'maximum' is known only where the program runs"), said)
+
+@test("a vector's maximum in a @strict_fp body is the constrained maximum, which raises invalid only for a signalling NaN")
+nmx_strict()
+    if !nmx_ready() then return
+
+    val program = raw"""
+        @strict_fp
+        hi(a: <2>f64, b: <2>f64) -> <2>f64 = a.maximum(b)
+
+        main()
+            val m = hi([nan, -0.0], [1.0, 0.0])
+
+            print(m[0] != m[0], 1.0 / m[1])
+        """
+
+    assert_eq(nmx_build(program, true, false), "true inf\n")
+
+    val ir = cgz_ir(program)
+
+    assert(ir.contains("@llvm.experimental.constrained.maximum.v2f64("), ir)
+    assert(!ir.contains("call <2 x double> @llvm.maximum."), ir)

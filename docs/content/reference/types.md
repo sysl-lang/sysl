@@ -1796,6 +1796,63 @@ print(N(20).apply(n -> n + 1), reach(N(21)))
 21 42
 ```
 
+### A parameter the callable may keep: `@keeps`
+
+A callable borrows what it is handed for the call, as a C function does, so a closure that stores a
+pointer it was handed is refused ([memory](/reference/memory/#where-no-body-is-in-sight-the-call-borrows)).
+**`@keeps` in front of a parameter of the type says the callable may keep it**, exactly as an
+`extern`'s [`@keeps(p)`](/reference/ffi/#keeps-a-c-function-that-holds-on-to-a-pointer) says it of a C
+function. It is written in `Fn(…)`, in a bare arrow's parameters, and through an alias, a generic
+type and a struct field like any other part of the type:
+
+```sysl
+import sysl.buf.{Buf, buf}
+
+struct Handle
+    n: int
+
+type Step = &Fn(@keeps *Handle) -> int
+
+var seen: Buf[*Handle] = buf()
+var a = Handle(4)
+var b = Handle(6)
+
+each(body: @keeps *Handle -> unit)
+    body(&b)
+
+val f: Step = (h) ->
+    seen.push(h)
+    h.n
+
+print(f(&a))
+each(h -> seen.push(h))
+print(seen.len(), seen.at(1).n)
+```
+
+```output
+4
+2 6
+```
+
+**The mark is part of the type.** A callable that keeps nothing stands wherever a marked one is
+asked for; a marked one never stands where the parameter is borrowed, since a call through that type
+may hand it the address of its own storage:
+
+```sysl
+type Step = &Fn(@keeps *int) -> int
+type Loose = &Fn(*int) -> int
+
+widen(f: Loose) -> Step = f
+narrow(f: Step) -> Loose = f
+```
+
+```error
+a '&Fn(@keeps *int) -> int' may keep its parameter 1 past the call, and a '&Fn(*int) -> int' borrows what it is handed for the call
+```
+
+A mark on a parameter that holds no address — an `int` — changes nothing, as it does on an `extern`.
+What a call through a marked type may be handed is in [memory](/reference/memory/#a-callable-that-keeps-what-it-is-handed).
+
 ### A parameter passed by name
 
 A parameter written with the arrow and **nothing on its left** takes an expression the call does not

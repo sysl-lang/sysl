@@ -4,8 +4,8 @@ import sh.sysl.parsing.*
 import sysl.buf.{Buf, buf}
 import sysl.math.bigint.{BigInt, from_int, to_string}
 
-// The eight methods a vector answers to (the two lane-wise ones, `abs` and `mul_add`, among them),
-// the two a run of them in memory does, and the comparison that yields a mask.
+// The ten methods a vector answers to (the lane-wise ones, `abs`, `mul_add`, `maximum` and `minimum`,
+// among them), the two a run of them in memory does, and the comparison that yields a mask.
 //
 // None of it is a *lookup*: nothing declares `select` or `sum`, so there is no member to find and no
 // overload set to narrow -- the name is recognised, the lanes are checked, and one node is built.
@@ -17,7 +17,8 @@ import sysl.math.bigint.{BigInt, from_int, to_string}
 // here and answered with a list.
 is_vector_method(name: string) -> bool =
     name == "select" || name == "shuffle" || name == "sum" || name == "min" || name == "max" ||
-        name == "any" || name == "all" || name == "abs" || name == "mul_add"
+        name == "any" || name == "all" || name == "abs" || name == "mul_add" || name == "maximum" ||
+        name == "minimum"
 
 // The two names a slice or an array answers with a vector's lanes. They are the *receiver's* methods
 // and not the vector's, because what a load needs is an address and a length and a vector has
@@ -148,6 +149,8 @@ vector_method(cx: &Analyzer, span: Span, v: Type, tr: TExpr, name: string,
 
     if name == "abs" then return vector_abs(cx, span, v, lane, tr, args)
     if name == "mul_add" then return vector_mul_add(cx, span, v, elem, lane, tr, args)
+    if name == "maximum" || name == "minimum" then
+        return vector_maximum(cx, span, v, elem, lane, tr, name, args)
 
     if !args.is_empty() then
         cx.fault(span, s"'$name' takes no arguments — it reduces the ${type_show(v)} it is read off")
@@ -164,9 +167,9 @@ vector_method(cx: &Analyzer, span: Span, v: Type, tr: TExpr, name: string,
         return cx.err(span, s"'$name' adds or orders its lanes, and a mask's are 'bool' — 'any()' " +
                       s"and 'all()' are what a ${type_show(v)} reduces with")
 
-    // The float minimum is `fmin` rather than `fminimum`: it is the one that matches `sysl.math`'s
-    // `min`, answering the other operand at a NaN instead of propagating it, so a program does not
-    // get two different answers depending on whether it reduced or folded.
+    // The float minimum is `fmin` rather than `fminimum`: it is the one that matches `max_num` and
+    // `min_num`, answering the other lane at a NaN instead of propagating it, so only a vector of
+    // nothing but NaNs reduces to one. `maximum()` and `minimum()` are the propagating reductions.
     // A fixed-point lane orders as the integer it is held as, so its `min` and `max` are the
     // integer's. **Its `sum` is refused**: a fixed-point `+` saturates, and saturation is not
     // associative -- `(max + max) + min` and `max + (max + min)` differ -- so a sum of lanes has no
@@ -272,6 +275,51 @@ private mul_add_operand(cx: &Analyzer, arg: Expr, v: Type, elem: Type) -> TExpr
 
     if is_vector(repr(texpr_type(t))) then t else type_expr(cx, arg, Some(elem))
 end mul_add_operand
+
+// `a.maximum(b)` and `a.minimum(b)` -- IEEE 754-2019's maximum and minimum in every lane, one
+// `llvm.maximum` or `llvm.minimum` over the register (AArch64's `fmax`/`fmin`); `a.maximum()` and
+// `a.minimum()` reduce the lanes the same way. **A NaN in either lane wins**, and `-0` orders below
+// `+0`, which is what sets them apart from `max_num`/`min_num` and from the `max()`/`min()`
+// reductions, where the NaN loses. `b` may be a scalar, which is the same value in every lane.
+//
+// The names and meaning are the scalar `Float`'s, so the widths follow the vector `mul_add`'s: `f32`
+// and `f64`. An integer lane has no NaN and no signed zero, so it has no `maximum` -- Rust's integers
+// have none either -- and is refused rather than given a second name for an ordinary maximum.
+private vector_maximum(cx: &Analyzer, span: Span, v: Type, elem: Type, lane: Type, tr: TExpr,
+                       name: string, args: Buf[Expr]) -> TExpr
+    val wide = lane match
+        Floating(bits, brain) -> !brain && (bits == 32 || bits == 64)
+        _ -> false
+
+    if !wide
+        val instead = lane match
+            Floating(_, _) -> "widen the lanes to f32 first"
+            _ -> "a lane with no NaN has none to propagate, so compare and choose: '(a > b).select(a, b)'"
+
+        return cx.err(span, s"'$name' is IEEE 754's NaN-propagating $name, defined for f32 and f64 " +
+                      s"lanes, and ${type_show(v)} is not one — $instead")
+    end if
+
+    if args.is_empty() then return TExpr(span, TReduce(s"f$name", tr, elem))
+
+    if args.len() != 1 then
+        return cx.err(span, s"'$name' takes the vector to compare with lane by lane — 'a.$name(b)' — " +
+                      s"or nothing, to reduce the lanes, and ${quantity(args.len(), "argument")} were given")
+
+    var b = mul_add_operand(cx, args.at(0), v, elem)
+
+    if !is_vector(repr(texpr_type(b))) then b = TExpr(span, TSplat(b, v))
+
+    if !type_eq(repr(texpr_type(b)), repr(v)) then
+        return cx.err(span, s"'$name' compares vectors of one type, and the receiver is ${type_show(v)} " +
+                      s"where the argument is ${type_show(texpr_type(b))}")
+
+    var ops: Buf[TExpr] = buf()
+
+    ops.push(tr)
+    ops.push(b)
+    TExpr(span, TVecOp(name, ops, v))
+end vector_maximum
 
 // `m.select(a, b)` -- the lane-wise `if`, and the one vector method whose answer is a vector.
 //

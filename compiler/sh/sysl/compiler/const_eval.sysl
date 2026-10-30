@@ -1792,9 +1792,8 @@ private eval_rest(r: &EvRun, e: TExpr) -> Flow
         TShuffle(receiver, second, lanes, _) -> shuffle_lanes(r, receiver, second, lanes)
         TLaneSet(receiver, lanes, value, _) -> lane_set(r, receiver, lanes, value)
         TReduce(op, receiver, ty) -> reduce(r, e.span, op, receiver, ty)
-        TVecOp(op, _, _) -> refuse_form(r, e.span, s"a vector's lane-wise " +
-                                        s"'${if op == "fma" then "mul_add" else "abs"}' is known only " +
-                                        "where the program runs")
+        TVecOp(op, _, _) -> refuse_form(r, e.span, s"a vector's lane-wise '${vec_op_method(op)}' is " +
+                                        "known only where the program runs")
         TVecLoad(receiver, index, vec_ty) -> vector_load(r, receiver, index, vec_ty)
         TVecStore(receiver, index, value) -> vector_store(r, receiver, index, value)
         TForEach(name, _, items, body, else_block, _) -> ev_for_each(r, e.span, name, items, body, else_block)
@@ -2430,7 +2429,8 @@ private reduce(r: &EvRun, at: Span, op: string, receiver: TExpr, ty: Type) -> Fl
 
                 if (op.ends_with("min") && smaller) || (op.ends_with("max") && cmp(b, a) > 0) then x else acc
             (_, ConstFloat(a), ConstFloat(b)) ->
-                if a != a then x
+                if op == "fmaximum" || op == "fminimum" then propagating(op == "fmaximum", acc, a, x, b)
+                else if a != a then x
                 else if b != b then acc
                 else if (op == "fmin" && b < a) || (op == "fmax" && b > a) then x
                 else acc
@@ -2439,6 +2439,29 @@ private reduce(r: &EvRun, at: Span, op: string, receiver: TExpr, ty: Type) -> Fl
 
     EvGave(acc)
 end reduce
+
+// The method a lane-wise vector operation was written as, for a refusal.
+private vec_op_method(op: string) -> string = op match
+    "fma" -> "mul_add"
+    "fabs" -> "abs"
+    _ -> op
+
+// One step of IEEE 754-2019's maximum or minimum, as `llvm.vector.reduce.fmaximum` takes it: a NaN
+// wins from either side, and of two zeros the maximum is the positive one and the minimum the
+// negative one, which no comparison can tell apart.
+private propagating(larger: bool, acc: Const, a: real, x: Const, b: real) -> Const
+    if a != a then return acc
+    if b != b then return x
+
+    if a == b
+        val a_neg = a.bits() >> 63 == 1
+        val b_neg = b.bits() >> 63 == 1
+
+        return if larger == a_neg && a_neg != b_neg then x else acc
+    end if
+
+    if larger == (b > a) then x else acc
+end propagating
 
 // The run of elements a vector is loaded from or stored to, `n` of them from `index`: where they are
 // held, and the position of the first. A run that does not fit traps, as it does where the program

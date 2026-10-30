@@ -574,6 +574,11 @@ A float sum is computed as a **tree** rather than left to right, so that it maps
 instructions; it may therefore differ in the last bit from adding the lanes in order. An integer sum
 wraps at the lane width, exactly as scalar integer arithmetic does.
 
+**A float `min()` or `max()` steps over a NaN**, as the scalar
+[`min_num` and `max_num`](/library/math/#rounding-sign-and-the-rest) do: a NaN lane loses to any
+number, and only a vector of nothing but NaNs reduces to one. Where a NaN must not be lost,
+[`maximum()` and `minimum()`](#nan-propagating-maximum-and-minimum) are the reductions that keep it.
+
 ## Magnitude, and a fused multiply-add
 
 Two methods apply a single machine operation to every lane at once and answer a vector. Each is one
@@ -628,6 +633,96 @@ f() -> unit
 ```error
 'mul_add' rounds the product and the sum once, which only a float of 32 or 64 bits can promise
 ```
+
+## NaN-propagating maximum and minimum
+
+**`a.maximum(b)` and `a.minimum(b)`** are IEEE 754-2019's maximum and minimum in every lane: **a NaN
+in either lane wins**, and `-0.0` orders below `0.0`, so the maximum of two zeros is the positive one
+and the minimum the negative one, whichever way round they are. `b` may be a scalar, which
+broadcasts. **`a.maximum()` and `a.minimum()`**, with no argument, reduce the lanes the same way: one
+NaN lane makes the answer a NaN, where [`max()` and `min()`](#reductions) would step over it. The
+names and the meaning are the scalar [`Float` methods'](/library/math/#rounding-sign-and-the-rest).
+
+Each is one instruction over the register where the target has one. On AArch64 that is `fmax` and
+`fmin`, which *are* these operations, and the reduction of two `f64` lanes is one `fmaxp`.
+
+```sysl
+val a: <4>f64 = [1.0, nan, -0.0, 5.0]
+val b: <4>f64 = [2.0, 3.0, 0.0, -1.0]
+
+val hi = a.maximum(b)
+val lo = a.minimum(b)
+
+print(hi[0], hi[1] != hi[1], 1.0 / hi[2], hi[3])
+print(lo[0], lo[1] != lo[1], 1.0 / lo[2], lo[3])
+print(a.max(), a.maximum() != a.maximum(), b.maximum())
+```
+
+```output
+2 true inf 5
+1 true -inf -1
+5 true 3
+```
+
+That is what a search that must not step over a NaN is built from. BLAS's `iamax` answers the index of
+the largest magnitude, and of the **first NaN** where there is one; a running lane-wise `maximum`
+carries a NaN to the end, so clean data costs nothing beyond the vector pass:
+
+```sysl
+iamax(x: []f64) -> usize
+    var best: <4>f64 = 0.0
+    var i = 0
+
+    while i + 4 <= x.len
+        val v: <4>f64 = x.load(i)
+
+        best = best.maximum(v.abs())
+        i += 4
+
+    var top = best.maximum()
+
+    for k in i..<x.len
+        top = top.maximum(x[k].abs())
+
+    for k in 0..<x.len
+        if top != top
+            if x[k] != x[k] then return k
+        elif x[k].abs() == top then return k
+
+    0
+end iamax
+
+var xs: [6]f64 = [1.0, -9.0, 3.0, 2.0, 9.0, 0.5]
+
+print(iamax(xs[..]))
+xs[3] = nan
+print(iamax(xs[..]))
+```
+
+```output
+1
+3
+```
+
+They are defined for `f32` and `f64` lanes. **An integer vector has no `maximum`**: it has no NaN to
+propagate and no signed zero, so the lane-wise maximum of integers is a comparison and a
+[`select`](#masks-and-the-lane-wise-if). A half-width lane is refused too; widen it first. Inside a
+`@strict_fp` body the lane-wise form is the constrained maximum or minimum, which raises invalid only
+for a signalling NaN.
+
+```sysl
+val a: <4>int = [1, 2, 3, 4]
+
+f() -> unit
+    val m = a.maximum(a)
+```
+
+```error
+'maximum' is IEEE 754's NaN-propagating maximum, defined for f32 and f64 lanes, and <4>int is not one
+```
+
+An `extern` naming `llvm.maximum` at a vector type is refused, as any vector at that boundary is
+([below](#what-a-vector-does-not-have)); the methods are the way to it.
 
 ## Loading and storing
 
