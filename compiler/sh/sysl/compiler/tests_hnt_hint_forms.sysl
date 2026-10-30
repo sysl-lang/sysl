@@ -1,0 +1,659 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.source_of
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.{parse_int_base, split, Search}
+
+// The hint forms (`reference/inline-assembly.md § Hints: waiting and signalling`): `wfe()`, `wfi()`,
+// `sev()`, `sevl()` and `nop()`, and the barriers `dsb(sy)`, `dmb(sy)` and `isb()` on an M-profile
+// Thumb core. The axes: each form on each processor family that has it (AArch64, Thumb v6-M / v7-M /
+// v7E-M / v8-M, RISC-V), read back as LLVM text and as the processor's own disassembly; each refused
+// where the instruction does not exist, naming where it does; the Thumb barriers held to `sy`; the
+// order kept around each at -O2 and -Oz, in straight-line code and in the loop a core waits in; and
+// the form inside a closure, a generic function, behind `#if`, under a function of the same name, and
+// in a `const` function. They exist only in this compiler, so the expectations are the design's and
+// the encodings are the Arm and RISC-V architectures', read off the disassemblers.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private var hnt_library_names: Buf[string] = buf()
+private var hnt_library_units: Buf[Buf[Program]] = buf()
+
+// The library as one machine reads it, read once per machine.
+private hnt_library(t: Target) -> Buf[Program]
+    for i in 0..<hnt_library_names.len()
+        if hnt_library_names.at(i) == t.name then return hnt_library_units.at(i)
+
+    var out: Buf[Program] = buf()
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, t) match
+            Err(_) -> ()
+            Ok(units) -> out = units
+
+    hnt_library_names.push(t.name)
+    hnt_library_units.push(out)
+    out
+end hnt_library
+
+private hnt_ready() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+
+    true
+
+// The program's own errors, leaving out anything the library had to say.
+private hnt_own(said: Buf[Placed]) -> Buf[Placed]
+    var out: Buf[Placed] = buf()
+    val errs = errors_of(said)
+
+    for err in errs
+        if !err.src.name.starts_with("library/") then out.push(err)
+
+    out
+end hnt_own
+
+// What a program came to on a machine: the whole report it was refused with, or nothing and its LLVM
+// text.
+private hnt_build(text: string, machine: string) -> (string, string)
+    val t = target_named(machine).unwrap()
+    var units: Buf[Program] = buf()
+    val library = hnt_library(t)
+
+    for item in library
+        units.push(item)
+
+    val parsed = parse(source_of("main.sysl", text), t)
+
+    if !parsed.ok() then return (parsed.report.at(0).message, "")
+
+    units.push(parsed.program)
+
+    val done = analyze_produced(units, t, buf(), true)
+    val early = hnt_own(done.reported)
+
+    if !early.is_empty() then return (analysis_report(early), "")
+
+    val whole = program_of(done, done.main_module)
+    var own: Buf[string] = buf()
+
+    own.push("")
+
+    val pr = post_analysis_checks(done.an, whole, own)
+    val late = hnt_own(done.an.diagnostics())
+
+    if !late.is_empty() then return (analysis_report(late), "")
+
+    ("", ir_print_module(codegen_with_gaps(prune(strip_tests(whole), own), t, pr).0))
+end hnt_build
+
+private hnt_ir(text: string, machine: string) -> string
+    val b = hnt_build(text, machine)
+
+    assert(b.0 == "", s"expected the program to compile for $machine, and it was refused:\n${b.0}")
+    b.1
+
+// The LLVM text of a program that reaches every Thumb hint and barrier, built for a Cortex-M0+
+// whatever the host is, or the refusal -- `tests_irp_llvm_registry.sysl`'s census of what the
+// compiler emits reads it.
+hnt_every_thumb_form_ir() -> string
+    val b = hnt_build("nop()\nwfe()\nwfi()\nsev()\ndsb(sy)\ndmb(sy)\nisb()\n", "thumbv6m-freestanding")
+
+    if b.0 != "" then b.0 else b.1
+end hnt_every_thumb_form_ir
+
+private hnt_says(text: string, part: string) = assert(text.contains(part), s"expected '$part' in:\n$text")
+
+// That a report holds this one diagnostic at this position.
+private hnt_refused(report: string, message: string, line: int, col: int)
+    val head = s"error: $message"
+    val at = s" --> main.sysl:$line:$col\n"
+
+    assert(report.contains(head), s"expected\n$head\nin\n$report")
+    assert(report.contains(at), s"expected\n$at\nin\n$report")
+    assert_eq(report.count_of("error: "), 1)
+
+// That a program is refused for this machine, with one diagnostic holding `part`.
+private hnt_refuses(machine: string, text: string, part: string)
+    val report = hnt_build(text, machine).0
+
+    assert(report.contains(part), s"expected a refusal holding\n$part\nin\n$report")
+    assert_eq(report.count_of("error: "), 1)
+
+private val hnt_every_hint = "nop()\nwfe()\nwfi()\nsev()\n"
+
+// -- what the forms become ------------------------------------------------------------------------
+
+@test("on AArch64 each hint is llvm.aarch64.hint with its number in the hint space, declared once")
+hnt_aarch64_ir()
+    if !hnt_ready() then return
+
+    val ir = hnt_ir(hnt_every_hint + "sevl()\n", "aarch64-freestanding")
+
+    for n in 0..<6
+        if n != 1 then hnt_says(ir, s"call void @llvm.aarch64.hint(i32 $n)")
+
+    assert_eq(ir.count_of("declare void @llvm.aarch64.hint(i32)"), 1)
+    assert(!ir.contains("asm sideeffect"), ir)
+end hnt_aarch64_ir
+
+@test("on every M-profile core each hint is llvm.arm.hint, and the barriers are llvm.arm.* with sy's 15")
+hnt_thumb_ir()
+    if !hnt_ready() then return
+
+    for machine in ["thumbv6m-freestanding", "thumbv7m-freestanding", "thumbv7em-freestanding",
+                    "thumb-freestanding"]
+        val ir = hnt_ir(hnt_every_hint + "dsb(sy)\ndmb(sy)\nisb()\n", machine)
+
+        hnt_says(ir, "call void @llvm.arm.hint(i32 0)")
+        hnt_says(ir, "call void @llvm.arm.hint(i32 2)")
+        hnt_says(ir, "call void @llvm.arm.hint(i32 3)")
+        hnt_says(ir, "call void @llvm.arm.hint(i32 4)")
+        hnt_says(ir, "call void @llvm.arm.dsb(i32 15)")
+        hnt_says(ir, "call void @llvm.arm.dmb(i32 15)")
+        hnt_says(ir, "call void @llvm.arm.isb(i32 15)")
+        assert(!ir.contains("llvm.aarch64"), ir)
+        assert(!ir.contains("asm sideeffect"), ir)
+end hnt_thumb_ir
+
+@test("on RISC-V wfi and nop are sideeffect assembly clobbering memory, LLVM having no intrinsic for either")
+hnt_riscv_ir()
+    if !hnt_ready() then return
+
+    for machine in ["riscv32-freestanding", "riscv64-freestanding", "riscv64-linux"]
+        val ir = hnt_ir("wfi()\nnop()\n", machine)
+
+        hnt_says(ir, "call void asm sideeffect \"wfi\", \"~{memory}\"()")
+        hnt_says(ir, "call void asm sideeffect \"nop\", \"~{memory}\"()")
+end hnt_riscv_ir
+
+@test("a hint inside a closure, a generic function and a method is the same instruction")
+hnt_in_other_shapes()
+    if !hnt_ready() then return
+
+    val ir = hnt_ir(raw"""
+        struct Core
+            id: u32
+
+        impl Core
+            signal(self) = sev()
+
+        idle[T](x: T) -> T
+            wfi()
+            x
+
+        val nap = () -> wfe()
+
+        nap()
+        print(idle(3))
+        Core(1).signal()
+        """, "thumbv6m-freestanding")
+
+    hnt_says(ir, "call void @llvm.arm.hint(i32 2)")
+    hnt_says(ir, "call void @llvm.arm.hint(i32 3)")
+    hnt_says(ir, "call void @llvm.arm.hint(i32 4)")
+end hnt_in_other_shapes
+
+@test("a function of the name is what a call reaches: the hint forms yield to a declaration")
+hnt_yields_to_a_declaration()
+    if !hnt_ready() then return
+
+    val ir = hnt_ir(raw"""
+        wfe() -> int = 7
+        nop(x: int) -> int = x + 1
+
+        print(wfe() + nop(2))
+        """, "thumbv6m-freestanding")
+
+    assert(!ir.contains("llvm.arm.hint"), ir)
+end hnt_yields_to_a_declaration
+
+@test("behind '#if thumb' a module that waits builds for every other processor")
+hnt_behind_the_conditional()
+    if !hnt_ready() then return
+
+    val text = raw"""
+        #if thumb
+        wfe()
+        sev()
+        #endif
+        #if aarch64
+        sevl()
+        #endif
+        print(1)
+        """
+
+    val host = hnt_build(text, "x86_64-linux")
+
+    assert(host.0 == "", host.0)
+    assert(!host.1.contains("llvm.arm") && !host.1.contains("llvm.aarch64"), host.1)
+
+    val m0 = hnt_build(text, "thumbv6m-freestanding")
+
+    assert(m0.0 == "", m0.0)
+    hnt_says(m0.1, "call void @llvm.arm.hint(i32 2)")
+    assert(!m0.1.contains("llvm.aarch64"), m0.1)
+end hnt_behind_the_conditional
+
+// -- refusals ---------------------------------------------------------------------------------------
+
+@test("a form is refused on a processor without its instruction, naming the processors that have it")
+hnt_wrong_target()
+    if !hnt_ready() then return
+
+    hnt_refused(hnt_build("wfe()\n", "x86_64-linux").0,
+                "'wfe' is an instruction of AArch64 and M-profile Thumb, and 'x86_64-linux' is x86_64 — put " +
+                "the code that uses it behind '#if aarch64' or '#if thumb'", 1, 1)
+    hnt_refused(hnt_build("print(1)\nwfi()\n", "x86_64-linux").0,
+                "'wfi' is an instruction of AArch64, M-profile Thumb and RISC-V, and 'x86_64-linux' is " +
+                "x86_64 — put the code that uses it behind '#if aarch64', '#if thumb', '#if riscv64' or " +
+                "'#if riscv32'", 2, 1)
+    hnt_refuses("wasm32-freestanding", "nop()\n", "'nop' is an instruction of AArch64, M-profile Thumb and RISC-V")
+    hnt_refuses("riscv64-freestanding", "sev()\n",
+                "'sev' is an instruction of AArch64 and M-profile Thumb, and 'riscv64-freestanding' is riscv64")
+    hnt_refuses("riscv32-freestanding", "wfe()\n", "'wfe' is an instruction of AArch64 and M-profile Thumb")
+    hnt_refuses("thumbv6m-freestanding", "sevl()\n",
+                "'sevl' is an AArch64 instruction, and 'thumbv6m-freestanding' is thumb — put the code " +
+                "that uses it behind '#if aarch64'")
+    hnt_refuses("riscv64-freestanding", "dsb(sy)\n", "'dsb' is an instruction of AArch64 and M-profile Thumb")
+    hnt_refuses("x86_64-linux", "isb()\n", "'isb' is an instruction of AArch64 and M-profile Thumb")
+end hnt_wrong_target
+
+@test("the system-register and maintenance forms stay AArch64's on Thumb")
+hnt_sysregs_stay_aarch64()
+    if !hnt_ready() then return
+
+    hnt_refuses("thumbv7em-freestanding", "print(read_sysreg(\"cntfrq_el0\"))\n",
+                "'read_sysreg' is an AArch64 instruction, and 'thumbv7em-freestanding' is thumb")
+    hnt_refuses("thumbv6m-freestanding", "tlbi(vmalle1is)\n", "'tlbi' is an AArch64 instruction")
+end hnt_sysregs_stay_aarch64
+
+@test("an M-profile barrier takes only sy, the one option the architecture defines there")
+hnt_thumb_barrier_only_sy()
+    if !hnt_ready() then return
+
+    hnt_refused(hnt_build("dsb(ish)\n", "thumbv6m-freestanding").0,
+                "an M-profile core's 'dsb' has only the option 'sy' — the architecture reserves every " +
+                "other one there — so it is written dsb(sy)", 1, 5)
+    hnt_refuses("thumbv7em-freestanding", "dmb(st)\n", "an M-profile core's 'dmb' has only the option 'sy'")
+    hnt_refuses("thumbv6m-freestanding", "dsb(full)\n", "'dsb' takes one of the architecture's options")
+    hnt_refuses("thumbv6m-freestanding", "isb(sy)\n", "'isb' takes no option")
+end hnt_thumb_barrier_only_sy
+
+@test("a hint takes nothing, and an argument is refused")
+hnt_arity()
+    if !hnt_ready() then return
+
+    hnt_refused(hnt_build("wfe(1)\n", "thumbv6m-freestanding").0,
+                "'wfe' takes nothing — the instruction has no operand, so it is written 'wfe()'", 1, 1)
+    hnt_refuses("aarch64-freestanding", "sevl(sy)\n", "'sevl' takes nothing")
+    hnt_refuses("riscv64-freestanding", "nop(0)\n", "'nop' takes nothing")
+end hnt_arity
+
+@test("a const function may not wait, since it runs while compiling")
+hnt_not_in_const()
+    if !hnt_ready() then return
+
+    val said = hnt_build(raw"""
+        const settle() -> int
+            wfe()
+            1
+
+        val x = settle()
+        print(x)
+        """, "thumbv6m-freestanding").0
+
+    assert(said.contains("it runs 'wfe'"), said)
+end hnt_not_in_const
+
+// -- what the machine runs ------------------------------------------------------------------------
+
+private hnt_tool(name: string, args: []const string) -> Option[string]
+    for d in [s"/opt/homebrew/opt/llvm/bin/$name", s"/usr/local/opt/llvm/bin/$name", s"/opt/homebrew/bin/$name",
+              name]
+        capture(d, args, "", [], true) match
+            Ok(r) -> if r.status.ok() then return Some(r.text)
+            Err(_) -> ()
+
+    None
+end hnt_tool
+
+// The disassembly of a freestanding archive built from `src` for `machine` at `opt`. A Thumb archive
+// is read by the board's own `arm-none-eabi-objdump`, and its absence is a failure, not a skip: the
+// runner shows nobody what a passing test printed. Any other is read by `llvm-objdump`, or `None`.
+private hnt_disassembly(src: string, machine: string, opt: string) -> Option[string]
+    val dir = make_temp_dir("sysl-hnt").unwrap()
+    val main = s"$dir/main.sysl"
+    val archive = s"$dir/libk.a"
+
+    write_text(main, src).unwrap()
+
+    build_c_archive(main, Some(machine), None, opt, Some(archive), None, (m) -> ()) match
+        Err(why) ->
+            remove_dir_all(dir).unwrap_or(())
+            assert(false, s"the archive did not build for $machine at -O$opt:\n${failure_text(why)}")
+        Ok(_) -> ()
+
+    val thumb = machine.starts_with("thumb")
+    val listing = if thumb then hnt_tool("arm-none-eabi-objdump", ["-d", archive])
+                  else hnt_tool("llvm-objdump", ["-d", archive])
+
+    remove_dir_all(dir).unwrap_or(())
+
+    if thumb then assert(listing.is_some(), "this test reads a board's code and there is no " +
+                         "arm-none-eabi-objdump on this machine (Homebrew's arm-none-eabi-binutils has one)")
+
+    if listing.is_none() then print("skipped: no llvm-objdump here")
+
+    listing
+end hnt_disassembly
+
+// The lines of one function's disassembly.
+private hnt_body(listing: string, name: string) -> string
+    val lines = lines_of(listing)
+    var out = ""
+    var inside = false
+
+    for line in lines
+        if line.ends_with(s"<$name>:")
+            inside = true
+        elif inside && line.trim() == ""
+            inside = false
+        elif inside
+            out = out + line + "\n"
+
+    out
+end hnt_body
+
+// How many lines of a body hold this mnemonic, tab-delimited as both disassemblers print it.
+private hnt_count(body: string, mnemonic: string) -> int
+    var n = 0
+
+    for line in lines_of(body)
+        if line.ends_with(s"\t$mnemonic") || line.contains(s"\t$mnemonic\t") || line.contains(s" $mnemonic\t") ||
+           line.ends_with(s" $mnemonic") then n += 1
+
+    n
+end hnt_count
+
+private val hnt_waits = raw"""
+    @export("hints")
+    hints()
+        nop()
+        wfe()
+        wfi()
+        sev()
+
+    @export("barriers")
+    barriers()
+        dsb(sy)
+        dmb(sy)
+        isb()
+    """
+
+@test("a Cortex-M0+ archive holds nop, wfe, wfi, sev, dsb sy, dmb sy and isb sy")
+hnt_thumbv6m_archive()
+    if !hnt_ready() then return
+
+    val text = hnt_disassembly(hnt_waits, "thumbv6m-freestanding", "z").unwrap()
+    val hints = hnt_body(text, "hints")
+    val barriers = hnt_body(text, "barriers")
+
+    for m in ["nop", "wfe", "wfi", "sev"]
+        assert_eq(hnt_count(hints, m), 1)
+
+    hnt_says(barriers, "dsb\tsy")
+    hnt_says(barriers, "dmb\tsy")
+    hnt_says(barriers, "isb\tsy")
+end hnt_thumbv6m_archive
+
+@test("a Cortex-M4 and a Cortex-M33 archive hold the same instructions")
+hnt_thumbv7em_archive()
+    if !hnt_ready() then return
+
+    for machine in ["thumbv7em-freestanding", "thumb-freestanding"]
+        val text = hnt_disassembly(hnt_waits, machine, "2").unwrap()
+        val hints = hnt_body(text, "hints")
+
+        for m in ["nop", "wfe", "wfi", "sev"]
+            assert_eq(hnt_count(hints, m), 1)
+
+        hnt_says(hnt_body(text, "barriers"), "dsb\tsy")
+        hnt_says(hnt_body(text, "barriers"), "isb\tsy")
+end hnt_thumbv7em_archive
+
+@test("an aarch64-freestanding archive holds nop, wfe, wfi, sev and sevl")
+hnt_aarch64_archive()
+    if !hnt_ready() then return
+
+    val listing = hnt_disassembly(raw"""
+        @export("hints")
+        hints()
+            nop()
+            wfe()
+            wfi()
+            sev()
+            sevl()
+        """, "aarch64-freestanding", "2")
+
+    if listing.is_none() then return
+
+    val body = hnt_body(listing.unwrap(), "hints")
+
+    for m in ["nop", "wfe", "wfi", "sev", "sevl"]
+        assert_eq(hnt_count(body, m), 1)
+end hnt_aarch64_archive
+
+@test("a riscv32 and a riscv64 archive hold wfi and nop")
+hnt_riscv_archive()
+    if !hnt_ready() then return
+
+    for machine in ["riscv32-freestanding", "riscv64-freestanding"]
+        val listing = hnt_disassembly(raw"""
+            @export("idle")
+            idle()
+                wfi()
+                nop()
+            """, machine, "2")
+
+        if listing.is_none() then return
+
+        val body = hnt_body(listing.unwrap(), "idle")
+
+        assert_eq(hnt_count(body, "wfi"), 1)
+        assert_eq(hnt_count(body, "nop"), 1)
+end hnt_riscv_archive
+
+@test("a repeated nop or sev is kept, each one, at -O2 and -Oz")
+hnt_hints_not_deleted()
+    if !hnt_ready() then return
+
+    for opt in ["2", "z"]
+        val text = hnt_disassembly(raw"""
+            @export("pulse")
+            pulse()
+                nop()
+                sev()
+                nop()
+                sev()
+            """, "thumbv6m-freestanding", opt).unwrap()
+        val body = hnt_body(text, "pulse")
+
+        assert_eq(hnt_count(body, "nop"), 2)
+        assert_eq(hnt_count(body, "sev"), 2)
+end hnt_hints_not_deleted
+
+// Where `part` first stands in `text` at or after `from`, or the length of `text` where it does not.
+private hnt_at(text: string, part: string, from: usize) -> usize = text[from..].index_of(part) match
+    Some(i) -> from + i
+    None -> text.len
+
+// That `body` is a store, then `op`, then a store -- each found after the one before it.
+private hnt_store_op_store(body: string, op: string)
+    val first = hnt_at(body, "str\t", 0)
+    val middle = hnt_at(body, op, first)
+    val last = hnt_at(body, "str\t", middle)
+
+    assert(first < body.len && middle < body.len && last < body.len,
+           s"expected a store, then '$op', then a store, in:\n$body")
+    assert_eq(body.count_of("str\t"), 2)
+
+private val hnt_ordered = raw"""
+    var flag: u32 = 0
+
+    @export("peek")
+    peek() -> u32 = flag
+
+    @export("waits")
+    waits(v: u32)
+        flag = v
+        wfe()
+        flag = v + 1
+
+    @export("signals")
+    signals(v: u32)
+        flag = v
+        sev()
+        flag = v + 1
+
+    @export("idles")
+    idles(v: u32)
+        flag = v
+        nop()
+        flag = v + 1
+    """
+
+@test("no store moves across a hint or a Thumb barrier, even at -O2 and -Oz")
+hnt_forms_keep_program_order()
+    if !hnt_ready() then return
+
+    val barrier = raw"""
+
+        @export("fences")
+        fences(v: u32)
+            flag = v
+            dmb(sy)
+            flag = v + 1
+        """
+
+    for opt in ["2", "z"]
+        val text = hnt_disassembly(hnt_ordered + barrier, "thumbv6m-freestanding", opt).unwrap()
+
+        hnt_store_op_store(hnt_body(text, "waits"), "wfe")
+        hnt_store_op_store(hnt_body(text, "signals"), "sev")
+        hnt_store_op_store(hnt_body(text, "idles"), "nop")
+        hnt_store_op_store(hnt_body(text, "fences"), "dmb\tsy")
+
+    val arm64 = hnt_disassembly(hnt_ordered, "aarch64-freestanding", "2")
+
+    if arm64.is_none() then return
+
+    hnt_store_op_store(hnt_body(arm64.unwrap(), "waits"), "wfe")
+    hnt_store_op_store(hnt_body(arm64.unwrap(), "signals"), "sev")
+end hnt_forms_keep_program_order
+
+// And the control: the same two stores with nothing between them are one, which is what makes the
+// test above able to fail.
+@test("two stores with nothing between them are one at -O2 on a Cortex-M0+")
+hnt_two_stores_alone_are_one()
+    if !hnt_ready() then return
+
+    val text = hnt_disassembly(raw"""
+        var flag: u32 = 0
+
+        @export("peek")
+        peek() -> u32 = flag
+
+        @export("plain")
+        plain(v: u32)
+            flag = v
+            flag = v + 1
+        """, "thumbv6m-freestanding", "2").unwrap()
+
+    assert_eq(hnt_body(text, "plain").count_of("str\t"), 1)
+end hnt_two_stores_alone_are_one
+
+// One instruction of an `arm-none-eabi-objdump` body: its address, mnemonic and operands.
+private hnt_insn(line: string) -> Option[(int, string, string)]
+    val fields = split(line, "\t")
+
+    if fields.len < 3 then return None
+
+    val head = fields[0].trim()
+
+    if !head.ends_with(":") then return None
+
+    parse_int_base(head[0..<head.len - 1], 16) match
+        Err(_) -> None
+        Ok(a) -> Some((a, fields[2].trim(), if fields.len > 3 then fields[3].trim() else ""))
+end hnt_insn
+
+// That the loop a core waits in keeps both its `wfe` and its load of the flag: some branch at or after
+// the `wfe` goes back to an address at or before it, and between that address and the branch the flag
+// is loaded (a load from the literal pool, `[pc, …]`, is the flag's address, not the flag). Were the
+// load hoisted out, the loop would be `wfe` and a branch to itself, holding no load.
+private hnt_waits_in_the_loop(body: string)
+    var insns: Buf[(int, string, string)] = buf()
+
+    for line in lines_of(body)
+        hnt_insn(line) match
+            Some(i) -> insns.push(i)
+            None -> ()
+
+    var at = -1
+
+    // LLVM may unroll the loop, so the first `wfe` is the one asked about.
+    for i in insns
+        if i.1 == "wfe" && at < 0 then at = i.0
+
+    assert(at >= 0, s"expected a wfe in:\n$body")
+
+    var held = false
+
+    for b in insns
+        val branch = b.1.starts_with("b") && !b.1.starts_with("bl") && !b.1.starts_with("bx")
+
+        if branch && b.0 >= at
+            parse_int_base(split(b.2, " ")[0], 16) match
+                Err(_) -> ()
+                Ok(target) ->
+                    if target <= at
+                        for i in insns
+                            if i.0 >= target && i.0 <= b.0 && i.1.starts_with("ldr") && !i.2.contains("pc")
+                                held = true
+
+    assert(held, s"expected the loop around wfe to load the flag on every round, in:\n$body")
+end hnt_waits_in_the_loop
+
+@test("a loop waiting on a flag with wfe keeps the wfe and the load in the loop, at -O2 and -Oz")
+hnt_wfe_loop_not_hoisted()
+    if !hnt_ready() then return
+
+    for machine in ["thumbv6m-freestanding", "thumbv7em-freestanding"]
+        for opt in ["2", "z"]
+            val text = hnt_disassembly(raw"""
+                var flag: u32 = 0
+
+                @export("raise")
+                raise() = flag = 1
+
+                @export("wait")
+                wait()
+                    while flag == 0
+                        wfe()
+
+                @export("spin")
+                spin()
+                    loop
+                        if flag != 0 then return
+                        wfe()
+                """, machine, opt).unwrap()
+
+            hnt_waits_in_the_loop(hnt_body(text, "wait"))
+            hnt_waits_in_the_loop(hnt_body(text, "spin"))
+end hnt_wfe_loop_not_hoisted
