@@ -1,0 +1,278 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// Where a vector `load` takes its width when it is an ARGUMENT (`reference/vectors.md`, "Where the
+// width comes from"). A load says what it reads but not how many lanes, so the position it sits in
+// has to say. A parameter of a written vector type always did; a vector method whose operand is the
+// receiver's vector -- `mul_add`, `select`, `shuffle` -- did not, and refused the load as though
+// nothing said which, though an operator in the same place (`a * y.load(i) + acc`) was accepted.
+//
+// The axes: which method (each of the three that take a vector operand), which operand position the
+// load is in, one load or two, a load reached through a nested call, a parameter that is written
+// (plain function), fixed by the binding (generic function) or `Self` (trait method), and the error
+// paths -- nothing fixes the width, the width disagrees, the lane type disagrees. The numbers are the
+// test: each program prints its lanes.
+
+private var vla_library_cache: Buf[Program] = buf()
+private var vla_library_read: bool = false
+
+private vla_library() -> Buf[Program]
+    if vla_library_read then return vla_library_cache
+
+    vla_library_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> vla_library_cache = units
+
+    vla_library_cache
+end vla_library
+
+private vla_ready() -> bool
+    if vla_library().is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+    end if
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+    end if
+
+    true
+end vla_ready
+
+// What a program printed, or why it could not be built or run.
+private vla_ran(text: string) -> string
+    val root = make_temp_dir("sysl-vector-load-arg").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end vla_ran
+
+// The first thing the compilation said contains `want`; otherwise the test fails showing all of it.
+private vla_says(text: string, want: string)
+    val said = enm_err(text)
+
+    assert(said.contains(want), s"expected it to say: $want\nit said: $said")
+
+private vla_no_width() -> string =
+    "'load' answers a vector, and how many lanes it takes is the vector type's to say — nothing " +
+        "here says which"
+
+// -- mul_add ---------------------------------------------------------------------------------------
+
+// The reduction: blas's axpy kernel, a load as the multiplier, the receiver giving the width.
+@test("a load as mul_add's multiplier takes the receiver's width")
+vla_mul_add_multiplier()
+    if !vla_ready() then return
+
+    assert_eq(vla_ran(raw"""
+        axpy(a: <2>f64, y: []const f64, i: usize, acc: <2>f64) -> <2>f64 = a.mul_add(y.load(i), acc)
+
+        val y = [1.0, 2.0, 3.0, 4.0]
+        val a: <2>f64 = [2.0, 3.0]
+        val acc: <2>f64 = [10.0, 20.0]
+        val r = axpy(a, y[..], 0, acc)
+        val s = axpy(a, y[..], 2, acc)
+        print(r[0], r[1], s[0], s[1])
+        """), "12 26 16 32\n")
+
+@test("a load as mul_add's addend takes the receiver's width")
+vla_mul_add_addend()
+    if !vla_ready() then return
+
+    assert_eq(vla_ran(raw"""
+        val y = [1.0, 2.0, 30.0, 4.0]
+        val a: <2>f64 = [2.0, 3.0]
+        val r = a.mul_add(2.0, y.load(2))
+        print(r[0], r[1])
+        """), "34 10\n")
+
+@test("two loads as mul_add's operands both take the receiver's width")
+vla_mul_add_two_loads()
+    if !vla_ready() then return
+
+    assert_eq(vla_ran(raw"""
+        val y = [1.0, 2.0, 30.0, 4.0]
+        val a: <2>f64 = [2.0, 3.0]
+        val r = a.mul_add(y.load(0), y.load(2))
+        print(r[0], r[1])
+        """), "32 10\n")
+
+// The width is the receiver's whatever it is: four lanes here, read from a running index.
+@test("a load in mul_add takes four lanes from a four-lane receiver, in a loop")
+vla_mul_add_four_lanes_in_a_loop()
+    if !vla_ready() then return
+
+    assert_eq(vla_ran(raw"""
+        dot(x: []const f32, y: []const f32) -> f32
+            var acc: <4>f32 = 0.0
+            var i = 0
+            while i < x.len
+                val v: <4>f32 = x.load(i)
+                acc = v.mul_add(y.load(i), acc)
+                i += 4
+            acc.sum()
+
+        val x: [8]f32 = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]
+        val y: [8]f32 = [1.0, 1.0, 1.0, 1.0, 2.0, 2.0, 2.0, 2.0]
+        print(dot(x[..], y[..]))
+        """), "62\n")
+
+// A load inside a call inside the argument takes its width from that call's parameter, and the
+// call's answer is the vector mul_add wants.
+@test("a load nested in a call in mul_add's argument takes the inner parameter's width")
+vla_mul_add_nested()
+    if !vla_ready() then return
+
+    assert_eq(vla_ran(raw"""
+        twice(v: <2>f64) -> <2>f64 = v + v
+
+        val y = [1.0, 2.0, 3.0, 4.0]
+        val a: <2>f64 = [2.0, 3.0]
+        val acc: <2>f64 = [10.0, 20.0]
+        val r = a.mul_add(twice(y.load(0)), acc)
+        print(r[0], r[1])
+        """), "14 32\n")
+
+// -- select and shuffle ----------------------------------------------------------------------------
+
+@test("a load on either side of select takes the other side's vector type")
+vla_select_either_side()
+    if !vla_ready() then return
+
+    assert_eq(vla_ran(raw"""
+        val y = [1.0, 2.0, 30.0, 40.0]
+        val a: <2>f64 = [5.0, 50.0]
+        val m = a > 10.0
+        val r = m.select(y.load(0), a)
+        val s = m.select(a, y.load(2))
+        print(r[0], r[1], s[0], s[1])
+        """), "5 2 30 50\n")
+
+@test("a load as shuffle's second vector takes the receiver's type")
+vla_shuffle_second()
+    if !vla_ready() then return
+
+    assert_eq(vla_ran(raw"""
+        val y = [1.0, 2.0, 30.0, 40.0]
+        val a: <2>f64 = [5.0, 50.0]
+        val r = a.shuffle(y.load(2), [0, 3])
+        print(r[0], r[1])
+        """), "5 40\n")
+
+// -- functions -------------------------------------------------------------------------------------
+
+@test("a load as a plain function's vector argument takes the parameter's width")
+vla_plain_function()
+    if !vla_ready() then return
+
+    assert_eq(vla_ran(raw"""
+        total(v: <4>f64) -> f64 = v.sum()
+
+        val y = [1.0, 2.0, 3.0, 4.0, 5.0]
+        print(total(y.load(1)))
+        """), "14\n")
+
+@test("a load as a generic function's argument takes the width the binding fixes")
+vla_generic_function_fixed()
+    if !vla_ready() then return
+
+    assert_eq(vla_ran(raw"""
+        same[T](v: T) -> T = v
+
+        val y = [1.0, 2.0, 3.0, 4.0]
+        val g: <2>f64 = same(y.load(2))
+        print(g[0], g[1])
+        """), "3 4\n")
+
+@test("a load as a trait method's Self argument takes the receiver's width")
+vla_trait_method_self()
+    if !vla_ready() then return
+
+    assert_eq(vla_ran(raw"""
+        trait Scale
+            scaled(self, other: Self) -> Self
+
+        impl Scale for <2>f64
+            scaled(self, other: Self) -> Self = self * other
+
+        val y = [1.0, 2.0, 3.0, 4.0]
+        val a: <2>f64 = [2.0, 3.0]
+        val r = a.scaled(y.load(2))
+        print(r[0], r[1])
+        """), "6 12\n")
+
+// -- what is still refused -------------------------------------------------------------------------
+
+@test("a load as a generic argument nothing fixes still says nothing gives its width")
+vla_generic_unfixed()
+    if !enm_ready() then return
+
+    vla_says("same[T](v: T) -> T = v\n\nvar xs: [4]f32 = [1.0, 2.0, 3.0, 4.0]\n" +
+             "val g = same(xs.load(0))\nprint(g[0])\n", vla_no_width())
+
+@test("two loads beside each other in select still say nothing about the width")
+vla_select_two_loads()
+    if !enm_ready() then return
+
+    vla_says("var xs: [4]f32 = [1.0, 2.0, 3.0, 4.0]\nval a: <2>f32 = [1.0, 2.0]\n" +
+             "val r = (a > 1.0).select(xs.load(0), xs.load(2))\nprint(r[0])\n", vla_no_width())
+
+// A mask says how many lanes but not what they hold, and a scalar beside the load is a lane rather
+// than a vector -- so nothing says which vector the load is.
+@test("a load beside a scalar in select still says nothing about the width")
+vla_select_load_and_scalar()
+    if !enm_ready() then return
+
+    vla_says("var xs: [4]f32 = [1.0, 2.0, 3.0, 4.0]\nval a: <2>f32 = [1.0, 2.0]\n" +
+             "val r = (a > 1.0).select(xs.load(0), 0.0)\nprint(r[0])\n", vla_no_width())
+
+@test("mul_add refuses an addend of another width than the receiver beside a load")
+vla_mul_add_width_mismatch()
+    if !enm_ready() then return
+
+    vla_says("var xs: [4]f32 = [1.0, 2.0, 3.0, 4.0]\nval a: <2>f32 = [1.0, 2.0]\n" +
+             "val c: <4>f32 = 0.0\nval r = a.mul_add(xs.load(0), c)\nprint(r[0])\n",
+             "'mul_add' multiplies and adds vectors of one type, and the receiver is <2>f32 where " +
+                 "this argument is <4>f32")
+
+@test("a load in mul_add from a run of another lane type is refused for it")
+vla_mul_add_lane_mismatch()
+    if !enm_ready() then return
+
+    vla_says("var xs: [4]u16 = [1, 2, 3, 4]\nval a: <2>f32 = [1.0, 2.0]\n" +
+             "val r = a.mul_add(xs.load(0), a)\nprint(r[0])\n",
+             ", and <2>f32 holds f32")
+
+// The load takes the other side's four lanes, and a mask of two cannot choose between them.
+@test("select refuses a load read at a width the mask does not have")
+vla_select_width_mismatch()
+    if !enm_ready() then return
+
+    vla_says("var xs: [8]f32 = [1.0; 8]\nval a: <2>f32 = [1.0, 2.0]\nval b: <4>f32 = 0.0\n" +
+             "val r = (a > 1.0).select(xs.load(0), b)\nprint(r[0])\n",
+             "a <2>bool chooses between 2 lanes, and <4>f32 has 4")

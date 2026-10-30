@@ -241,11 +241,8 @@ private vector_mul_add(cx: &Analyzer, span: Span, v: Type, elem: Type, lane: Typ
                       s"'a.mul_add(b, c)', and ${quantity(args.len(), "argument")} " +
                       s"${if args.len() == 1 then "was" else "were"} given")
 
-    var b = type_expr(cx, args.at(0), None)
-    var c = type_expr(cx, args.at(1), None)
-
-    if !is_vector(repr(texpr_type(b))) then b = type_expr(cx, args.at(0), Some(elem))
-    if !is_vector(repr(texpr_type(c))) then c = type_expr(cx, args.at(1), Some(elem))
+    var b = mul_add_operand(cx, args.at(0), v, elem)
+    var c = mul_add_operand(cx, args.at(1), v, elem)
 
     if !is_vector(repr(texpr_type(b))) then b = TExpr(span, TSplat(b, v))
     if !is_vector(repr(texpr_type(c))) then c = TExpr(span, TSplat(c, v))
@@ -263,6 +260,19 @@ private vector_mul_add(cx: &Analyzer, span: Span, v: Type, elem: Type, lane: Typ
     TExpr(span, TVecOp("fma", ops, v))
 end vector_mul_add
 
+// One of `mul_add`'s two operands. Either is the receiver's vector or a lane of it, so the receiver
+// decides its type exactly as an operator's other operand would: a form whose type its position
+// supplies -- `xs.load(i)` above all -- is read at the receiver's vector type, since nothing else
+// says how many lanes it takes; anything else is read as itself, and re-read at the lane type when
+// it turns out not to be a vector, so a literal `2.0` is a lane.
+private mul_add_operand(cx: &Analyzer, arg: Expr, v: Type, elem: Type) -> TExpr
+    if typed_by_position(cx, arg) then return type_expr(cx, arg, Some(v))
+
+    val t = type_expr(cx, arg, None)
+
+    if is_vector(repr(texpr_type(t))) then t else type_expr(cx, arg, Some(elem))
+end mul_add_operand
+
 // `m.select(a, b)` -- the lane-wise `if`, and the one vector method whose answer is a vector.
 //
 // **Either side may be a scalar, and nearly always one of them is** -- `(v > hi).select(hi, v)` is
@@ -277,17 +287,24 @@ private vector_select(cx: &Analyzer, span: Span, v: Type, lanes: int, tr: TExpr,
                       s"'m.select(whenTrue, whenFalse)', and ${quantity(args.len(), "argument")} " +
                       s"${if args.len() == 1 then "was" else "were"} given")
 
-    val first = type_expr(cx, args.at(0), None)
-    val second = type_expr(cx, args.at(1), None)
-    val found = vector_among(first, second)
+    // A side whose type its position supplies -- `xs.load(i)` above all -- is read after the other
+    // and at the other's vector type, as an operator's operand is: the mask says how many lanes, but
+    // not what they hold. With both sides of that kind, or the other a scalar, nothing says which
+    // vector, and the side is read as itself and refused for it.
+    val late0 = typed_by_position(cx, args.at(0))
+    val late1 = typed_by_position(cx, args.at(1))
+    val first = if late0 && !late1 then None else Some(type_expr(cx, args.at(0), None))
+    val second = if late1 then select_side(cx, args.at(1), first) else type_expr(cx, args.at(1), None)
+    val a0 = first.unwrap_or_else(() -> select_side(cx, args.at(0), Some(second)))
+    val found = vector_among(a0, second)
     val lane = found.and_then(v -> element(v))
 
-    var a = first
+    var a = a0
     var b = second
 
     if lane.is_some()
-        if !is_vector(repr(texpr_type(first))) then a = type_expr(cx, args.at(0), lane)
-        if !is_vector(repr(texpr_type(second))) then b = type_expr(cx, args.at(1), lane)
+        if !late0 && !is_vector(repr(texpr_type(a0))) then a = type_expr(cx, args.at(0), lane)
+        if !late1 && !is_vector(repr(texpr_type(second))) then b = type_expr(cx, args.at(1), lane)
 
     val pair = if lane.is_none() then (a, b) else balance_lanes(a, b)
 
@@ -310,6 +327,14 @@ private vector_select(cx: &Analyzer, span: Span, v: Type, lanes: int, tr: TExpr,
 
     TExpr(span, TSelect(tr, pair.0, pair.1, texpr_type(pair.0)))
 end vector_select
+
+// A side of `select` whose type its position supplies, read at the other side's type when that is a
+// vector, and as itself otherwise.
+private select_side(cx: &Analyzer, arg: Expr, other: Option[TExpr]) -> TExpr
+    val want = other.map(t -> repr(texpr_type(t))).filter(t -> is_vector(t))
+
+    type_expr(cx, arg, want)
+end select_side
 
 // `a.shuffle([3, 2, 1, 0])` and `a.shuffle(b, [0, 4, 1, 5])` -- lanes picked by number, the second
 // vector's numbered after the receiver's, into a vector as wide as the list is long.
@@ -336,10 +361,11 @@ private vector_shuffle(cx: &Analyzer, span: Span, v: Type, n: int, elem: Type, t
         val arg = args.at(0)
 
         // A written list of lanes is read as the vector it stands beside, as it would be bound to
-        // one; anything else is read as itself, so a scalar stays a scalar and is told so.
+        // one, and so is a form whose type its position supplies (`xs.load(i)`); anything else is
+        // read as itself, so a scalar stays a scalar and is told so.
         val literal = *arg.kind match
             ArrayLit(_) | ArrayFill(_, _) -> true
-            _ -> false
+            _ -> typed_by_position(cx, arg)
 
         val tb = type_expr(cx, arg, if literal then Some(v) else None)
         val bt = repr(texpr_type(tb))
