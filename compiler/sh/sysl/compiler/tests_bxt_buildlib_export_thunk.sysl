@@ -1,0 +1,116 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.join
+
+// The address of an `@export` is its thunk's -- the C-callable entry the artifact defining the
+// function emitted -- not its definition's. A package half copies a dependency's small function in to
+// be inlined (`available_externally`), and where that body takes such an address, `make() =
+// holder(&free_it)`, the half named `@dep_free` and declared nothing by that name: clang refused it
+// with "use of undefined value '@dep_free'". The precompiled export's thunk is now declared, at the C
+// signature it was defined with.
+
+private bxt_ready() -> bool = std_root().is_ok() && clang_available()
+
+private bxt_temp(prefix: string) -> string = absolute_path(make_temp_dir(prefix).unwrap())
+
+private bxt_write(root: string, rel: string, text: string)
+    val at = s"$root/$rel"
+
+    make_dir_all(parent_of(at).unwrap_or(root)).unwrap()
+    write_text(at, text).unwrap()
+end bxt_write
+
+private bxt_cli(args: []string) -> (int, string)
+    var lines: Buf[string] = buf()
+    val sink = &lines
+    val code = run_cli(args, (line) -> sink.push(line))
+
+    (code, join(lines.view(), "\n"))
+end bxt_cli
+
+// A workspace whose root package `lib` (module `lib`, written as `lib_src`) depends on its member
+// `dep` (module `dep`, `dep_src`), beside a member program `app` depending on both (`app_src`).
+private bxt_workspace(lib_src: string, dep_src: string, app_src: string) -> string
+    val ws = bxt_temp("sysl-bxt-")
+
+    bxt_write(ws, "sysl.hocon", "package { name = \"lib\", version = \"0.1.0\" }\n" +
+              "workspace = [\"dep\", \"app\"]\n" +
+              "dependencies { dep { workspace = true } }\n")
+    bxt_write(ws, "lib/lib.sysl", s"module lib\n\nimport dep.*\n\n$lib_src")
+    bxt_write(ws, "dep/sysl.hocon", "package { name = \"dep\", version = \"0.1.0\" }\n")
+    bxt_write(ws, "dep/dep/dep.sysl", s"module dep\n\n$dep_src")
+    bxt_write(ws, "app/sysl.hocon", "package { name = \"app\", version = \"0.1.0\" }\n" +
+              "dependencies { lib { workspace = true }, dep { workspace = true } }\n")
+    bxt_write(ws, "app/main.sysl", s"import lib.*\n\n$app_src")
+    ws
+end bxt_workspace
+
+// What the member program prints, built optimized so that what is small is copied in.
+private bxt_run(dir: string) -> string
+    val out_dir = bxt_temp("sysl-bxt-exe")
+
+    val said = build_native_program(dir, None, None, "2", Some(s"$out_dir/program")) match
+        Err(why) -> s"refused: ${failure_text(why)}"
+        Ok(made) ->
+            capture(made, [], "", [], true) match
+                Err(_) -> "the program that was built could not be run"
+                Ok(out) -> if out.status.ok() then out.text else s"exited badly: ${out.text}"
+
+    remove_dir_all(out_dir).unwrap_or(())
+    said
+end bxt_run
+
+// `build-lib` of the root says "checked", at -O0 and at -O2 (where the copies are made), and the
+// member program prints `want`.
+private bxt_both(lib_src: string, dep_src: string, app_src: string, want: string)
+    val ws = bxt_workspace(lib_src, dep_src, app_src)
+
+    for level in ["-O0", "-O2"]
+        val got = bxt_cli(["sysl", "build-lib", level, ws])
+
+        assert_eq(got.0, Fine, got.1)
+        assert_eq(got.1, s"checked $ws")
+
+    assert_eq(bxt_run(s"$ws/app"), want)
+    remove_dir_all(ws).unwrap_or(())
+end bxt_both
+
+// Nothing here reaches module storage, so every function is precompiled in `dep`'s half and small
+// enough to be copied into `lib`'s.
+private val bxt_dep: string = "@export(\"bxt_dep_free\")\nfree_it(p: *u8) = ()\n\n" +
+    "holder(f: *extern(*u8) -> unit) -> int\n    f(null)\n\n    1\n\n" +
+    "make() -> int = holder(&free_it)\n"
+
+@test("a dependency's function copied into a package half takes the address of the dependency's export")
+bxt_the_reduction()
+    if !bxt_ready() then return
+
+    bxt_both("use_it() -> int = make() + 10\n", bxt_dep, "print(use_it())\n", "11\n")
+
+@test("the export's address taken in the package's own body, and through the copied one, is one declaration")
+bxt_taken_here_and_there()
+    if !bxt_ready() then return
+
+    bxt_both("both() -> int = make() + holder(&free_it)\n", bxt_dep, "print(both())\n", "2\n")
+
+@test("an extern in the package naming the same symbol is declared once beside the thunk's address")
+bxt_an_extern_of_the_same_symbol()
+    if !bxt_ready() then return
+
+    bxt_both("extern \"bxt_dep_free\" ext_free(p: *u8)\n\n" +
+             "both() -> int = make() + holder(&ext_free)\n", bxt_dep, "print(both())\n", "2\n")
+
+@test("an export taking a struct by value: the thunk is declared at C's signature, not sysl's")
+bxt_an_aggregate_export()
+    if !bxt_ready() then return
+
+    bxt_both("use_pair() -> int = summed(3, 4)\n",
+             "struct Pair\n    a: int\n    b: int\n    c: long\n\n" +
+             "@export(\"bxt_pair_sum\")\npair_sum(p: Pair) -> int = p.a + p.b + int(p.c)\n\n" +
+             "apply(f: *extern(Pair) -> int, a: int, b: int) -> int = f(Pair(a, b, 10))\n\n" +
+             "summed(a: int, b: int) -> int = apply(&pair_sum, a, b)\n",
+             "print(use_pair())\n", "17\n")
