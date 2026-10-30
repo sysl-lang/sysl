@@ -1,0 +1,316 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.text.{Search, replace_all}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// **An argument refused at a parameter the solve had already settled is still refused when the
+// callee's type parameter could only come from the call's EXPECTED type.** `mk[T: Zero](xs: []real)
+// -> Box[T]` called as `same(Box(1.0), mk(TABLE))`: `same` reads `mk(TABLE)` on its own first, where
+// nothing says what `mk`'s `T` is. That reading read `TABLE` at `[]real` and refused the `val` array's
+// read-only view -- but the solve, seeing an argument it could not type, stays quiet and leaves the
+// argument to speak for itself, and it was then read again with NOTHING expected, where it is a
+// perfectly good array. So nothing was said, the call came to nothing, and the body holding it was
+// dropped from the build: a missing `main`, a call to a function never emitted, or a test that never
+// existed. The argument is now read again at the parameter it was refused at (`voice_unknown_args`).
+//
+// Axes: the position the call stands in (a run file's top level, a function body, a `@test`, a
+// `val` with a declared type, a nested generic call, a method), the refusal (the const view, a literal
+// that does not fit, the leftmost of two), and the controls: a sibling argument settling `T`, a
+// `[]const` parameter and a `var` array, which are accepted. Where the array lives is an axis too: a
+// function's own local, module storage in a library file, and a run file's `val` -- which a run file's
+// function reaches as a capture, the second bug below. Build modes, targets and the counted heap are
+// skipped: the change is in what analysis refuses, and nothing it reads reaches lowering. A closure's
+// capture of a `val` array is skipped: it is a copy, and what a view of the copy may do is a design
+// question, not this fix.
+
+private cvx_skipped() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return true
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return true
+
+    false
+end cvx_skipped
+
+private cvx_write(text: string) -> string
+    val root = make_temp_dir("sysl-cvx").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+    root
+end cvx_write
+
+private cvx_prints(text: string, printed: string)
+    val root = cvx_write(text)
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            assert_eq(s"did not build: ${failure_text(why)}", printed)
+            return
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> assert(false, "the program that was built could not be run")
+        Ok(out) ->
+            assert_eq(out.text, printed)
+            assert_eq(shell_status(out.status), 0)
+end cvx_prints
+
+private cvx_err(text: string) -> string
+    val root = cvx_write(text)
+
+    val out = emit_llvm_text(root, None) match
+        Err(why) -> why.message
+        Ok(made) -> if made.report.is_empty() then "" else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    replace_all(out, replace_all(root, "//", "/") + "/", "")
+end cvx_err
+
+private cvx_refused(text: string, words: string, at: string)
+    val said = cvx_err(text)
+
+    assert(said.contains(words), said)
+    assert(said.contains(s" --> main.sysl:$at\n"), said)
+
+private const cvx_const_view: string =
+    "a '[]const real' views elements it may not write, and a '[]real' is a licence to write them"
+
+// Five lines, so a statement after them is on line 6.
+private const cvx_head: string =
+    "struct Box[T]\n    v: T\nmk[T: Zero](xs: []real) -> Box[T] = Box(T.zero())\n" +
+    "same[T](a: Box[T], b: Box[T]) -> bool = true\nval TABLE: [2]real = [16.0, -120.0]\n"
+
+@test("a val array at []real is refused where the callee's T comes from the expected type, at a run file's top level")
+cvx_top_level()
+    if cvx_skipped() then return
+
+    cvx_refused(cvx_head + "print(same(Box(1.0), mk(TABLE)))\n", cvx_const_view, "6:25")
+end cvx_top_level
+
+@test("the same call inside a function body is refused, not built with the function left out")
+cvx_function_body()
+    if cvx_skipped() then return
+
+    cvx_refused(cvx_head + "f() -> bool\n    same(Box(1.0), mk(TABLE))\n\nprint(f())\n", cvx_const_view,
+                "7:23")
+end cvx_function_body
+
+@test("the same call over a val array local to the function is refused")
+cvx_function_local()
+    if cvx_skipped() then return
+
+    cvx_refused("struct Box[T]\n    v: T\nmk[T: Zero](xs: []real) -> Box[T] = Box(T.zero())\n" +
+                "same[T](a: Box[T], b: Box[T]) -> bool = true\nf() -> bool\n" +
+                "    val t: [2]real = [16.0, -120.0]\n    same(Box(1.0), mk(t))\nprint(f())\n",
+                cvx_const_view, "7:23")
+end cvx_function_local
+
+@test("the same call in a library file, over module storage, is refused")
+cvx_module_storage()
+    if cvx_skipped() then return
+
+    val root = cvx_write("print(f())\n")
+
+    write_text(s"$root/lib.sysl", cvx_head + "f() -> bool\n    same(Box(1.0), mk(TABLE))\n").unwrap()
+
+    val out = emit_llvm_text(root, None) match
+        Err(why) -> why.message
+        Ok(made) -> if made.report.is_empty() then "" else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    assert(out.contains(cvx_const_view), out)
+    assert(out.contains("lib.sysl:7:23\n"), out)
+end cvx_module_storage
+
+// **A run file's functions are nested functions of its body, and its `val`s are their captures**
+// (`compiler-notes.md § The entry file`). A capture is read as the place the environment reaches, and
+// that place was not asked whether it was a `val`'s -- so a run file's function took a writable view of
+// a `val` array it captured, and wrote its elements, with nothing said. These hold with no generic in
+// sight.
+
+@test("a run file's function passing a captured val array at []real is refused at the name")
+cvx_capture_plain()
+    if cvx_skipped() then return
+
+    cvx_refused("g(xs: []real) -> real = xs[0]\nval TABLE: [2]real = [16.0, -120.0]\nf() -> real\n" +
+                "    g(TABLE)\n\nprint(f())\n", cvx_const_view, "4:7")
+end cvx_capture_plain
+
+@test("a run file's function slicing a captured val array into a []real is refused")
+cvx_capture_slice()
+    if cvx_skipped() then return
+
+    cvx_refused("val TABLE: [2]real = [16.0, -120.0]\nf() -> real\n    val s: []real = TABLE[..]\n" +
+                "    s[0]\n\nprint(f())\n", cvx_const_view, "3:26")
+end cvx_capture_slice
+
+@test("a run file's function writing an element of a captured val array is refused")
+cvx_capture_write()
+    if cvx_skipped() then return
+
+    cvx_refused("val TABLE: [2]real = [16.0, -120.0]\nf()\n    TABLE[0] = 1.0\n\nf()\n",
+                "a 'val' is written once, so assignment has nothing to write through", "3:5")
+end cvx_capture_write
+
+@test("a nested function writing an element of its frame's val array is refused")
+cvx_nested_write()
+    if cvx_skipped() then return
+
+    cvx_refused("outer() -> int\n    val a: [2]int = [1, 2]\n    inner()\n        a[0] = 5\n    inner()\n" +
+                "    a[0]\n\nprint(outer())\n",
+                "a 'val' is written once, so assignment has nothing to write through", "4:9")
+end cvx_nested_write
+
+@test("a nested function writing an element of its frame's var array writes the frame's")
+cvx_nested_var_write()
+    if cvx_skipped() then return
+
+    cvx_prints("outer() -> int\n    var a: [2]int = [1, 2]\n    inner()\n        a[0] = 5\n    inner()\n" +
+               "    a[0]\n\nprint(outer())\n", "5\n")
+end cvx_nested_var_write
+
+@test("a run file's function passes a captured var array at []real")
+cvx_capture_var()
+    if cvx_skipped() then return
+
+    cvx_prints("g(xs: []real) -> real\n    xs[0] = 2.0\n    xs[0] + xs[1]\n" +
+               "var TABLE: [2]real = [16.0, -120.0]\nf() -> real\n    g(TABLE)\n\nprint(f())\n" +
+               "print(TABLE[0])\n", "-118\n2\n")
+end cvx_capture_var
+
+@test("a run file's function passes a captured val array at []const real")
+cvx_capture_const_param()
+    if cvx_skipped() then return
+
+    cvx_prints("g(xs: []const real) -> real = xs[0] + xs[1]\nval TABLE: [2]real = [16.0, -120.0]\n" +
+               "f() -> real\n    g(TABLE)\n\nprint(f())\n", "-104\n")
+end cvx_capture_const_param
+
+@test("the same call inside a @test is refused by sysl test")
+cvx_in_a_test()
+    if cvx_skipped() then return
+
+    val root = absolute_path(make_temp_dir("sysl-cvx-suite").unwrap())
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/prog.sysl", cvx_head + "@test\nt() =\n    assert(same(Box(1.0), mk(TABLE)), \"same\")\n").unwrap()
+
+    val (code, out, err) = clx_ran(["sysl", "test", s"$root/prog.sysl"])
+
+    remove_dir_all(root).unwrap_or(())
+    assert_eq(code, Failed)
+    assert(!out.contains("ok"), out)
+    assert(err.contains(cvx_const_view), err)
+    assert(!err.contains("undefined value"), err)
+end cvx_in_a_test
+
+@test("T settled by a declared val type is refused at the array, as before")
+cvx_declared_result()
+    if cvx_skipped() then return
+
+    cvx_refused(cvx_head + "val b: Box[int] = mk(TABLE)\nprint(b.v)\n", cvx_const_view, "6:22")
+end cvx_declared_result
+
+@test("T settled by a sibling argument is refused at the array, as before")
+cvx_sibling_argument()
+    if cvx_skipped() then return
+
+    cvx_refused("struct Box[T]\n    v: T\nfirst[T](n: T, xs: []real) -> Box[T] = Box(n)\n" +
+                "val TABLE: [2]real = [16.0, -120.0]\nprint(first(1, TABLE).v)\n", cvx_const_view, "5:16")
+end cvx_sibling_argument
+
+@test("a call nested in a second generic call is refused at the array")
+cvx_nested_generic()
+    if cvx_skipped() then return
+
+    cvx_refused(cvx_head + "wrap[T](b: Box[T]) -> Box[T] = b\nprint(same(Box(1.0), wrap(mk(TABLE))))\n",
+                cvx_const_view, "7:30")
+end cvx_nested_generic
+
+@test("a generic method settled by the expected type is refused at the array")
+cvx_method()
+    if cvx_skipped() then return
+
+    cvx_refused("struct Box[T]\n    v: T\nstruct Maker\n    n: int\nimpl Maker\n" +
+                "    mk[T: Zero](self, xs: []real) -> Box[T] = Box(T.zero())\n" +
+                "same[T](a: Box[T], b: Box[T]) -> bool = true\nval TABLE: [2]real = [16.0, -120.0]\n" +
+                "val m = Maker(1)\nprint(same(Box(1.0), m.mk(TABLE)))\n", cvx_const_view, "10:27")
+end cvx_method
+
+@test("a call no position settles is refused at the array, not left with nothing said")
+cvx_nothing_settles()
+    if cvx_skipped() then return
+
+    cvx_refused("struct Box[T]\n    v: T\nmk[T: Zero](xs: []real) -> Box[T] = Box(T.zero())\n" +
+                "one[T](b: Box[T]) -> bool = true\nval TABLE: [2]real = [16.0, -120.0]\n" +
+                "print(one(mk(TABLE)))\n", cvx_const_view, "6:14")
+end cvx_nothing_settles
+
+@test("over a var array, the call no position settles is told it cannot infer T")
+cvx_nothing_settles_var()
+    if cvx_skipped() then return
+
+    cvx_refused("struct Box[T]\n    v: T\nmk[T: Zero](xs: []real) -> Box[T] = Box(T.zero())\n" +
+                "one[T](b: Box[T]) -> bool = true\nvar TABLE: [2]real = [16.0, -120.0]\n" +
+                "print(one(mk(TABLE)))\n", "cannot infer the type argument 'T' of 'mk'", "6:11")
+end cvx_nothing_settles_var
+
+@test("a []const parameter takes the val array where T comes from the expected type")
+cvx_const_parameter()
+    if cvx_skipped() then return
+
+    cvx_prints("struct Box[T]\n    v: T\nmk[T: Zero](xs: []const real) -> Box[T] = Box(T.zero())\n" +
+               "same[T](a: Box[T], b: Box[T]) -> bool = true\nval TABLE: [2]real = [16.0, -120.0]\n" +
+               "print(same(Box(1.0), mk(TABLE)))\n", "true\n")
+end cvx_const_parameter
+
+@test("a var array is taken at []real where T comes from the expected type")
+cvx_var_array()
+    if cvx_skipped() then return
+
+    cvx_prints("struct Box[T]\n    v: T\nmk[T: Zero](xs: []real) -> Box[T] = Box(T.zero())\n" +
+               "same[T](a: Box[T], b: Box[T]) -> bool = true\nvar TABLE: [2]real = [16.0, -120.0]\n" +
+               "print(same(Box(1.0), mk(TABLE)))\n", "true\n")
+end cvx_var_array
+
+@test("a literal that does not fit its parameter is told where T comes from the expected type")
+cvx_literal_does_not_fit()
+    if cvx_skipped() then return
+
+    cvx_refused("struct Box[T]\n    v: T\nmk[T: Zero](n: u8) -> Box[T] = Box(T.zero())\n" +
+                "same[T](a: Box[T], b: Box[T]) -> bool = true\nprint(same(Box(1.0), mk(300)))\n",
+                "the literal 300 does not fit u8", "5:25")
+end cvx_literal_does_not_fit
+
+@test("the same literal inside a function body is told, not built with the function left out")
+cvx_literal_in_function()
+    if cvx_skipped() then return
+
+    cvx_refused("struct Box[T]\n    v: T\nmk[T: Zero](n: u8) -> Box[T] = Box(T.zero())\n" +
+                "same[T](a: Box[T], b: Box[T]) -> bool = true\nf() -> bool\n    same(Box(1.0), mk(300))\n\n" +
+                "print(f())\n", "the literal 300 does not fit u8", "6:23")
+end cvx_literal_in_function
+
+@test("of two refused arguments the leftmost is told")
+cvx_leftmost_of_two()
+    if cvx_skipped() then return
+
+    val said = cvx_err("struct Box[T]\n    v: T\nmk[T: Zero](xs: []real, n: int) -> Box[T] = Box(T.zero())\n" +
+                       "same[T](a: Box[T], b: Box[T]) -> bool = true\nval TABLE: [2]real = [16.0, -120.0]\n" +
+                       "print(same(Box(1.0), mk(TABLE, \"x\")))\n")
+
+    assert(said.contains(cvx_const_view), said)
+    assert(said.contains(" --> main.sysl:6:25\n"), said)
+end cvx_leftmost_of_two
