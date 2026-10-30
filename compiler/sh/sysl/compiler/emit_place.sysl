@@ -756,107 +756,18 @@ private spine_root(place: TExpr) -> Option[TExpr] = *place.kind match
     TDeref(_, _) -> Some(place)
     _ -> None
 
-// The `Buf` a subscript addressed an element of, where a dereference is one: `b[i]` is
-// `*b.index_place(i)`, and the pointer it answers says nothing about the storage it points into.
-private buf_subscript(operand: TExpr) -> Option[TExpr] = *operand.kind match
+// The container a view of one element was asked of, where a view is one: a view of part of an element
+// of a container someone wrote is taken through its `IndexPlace` member `index_view` (`expr_coll.sysl`'s
+// `viewed_through_storage`), whose answer carries the owner of the storage the element lives in.
+private container_view(r: TExpr) -> Option[TExpr] = *r.kind match
     TCall(name, args, _, _) ->
-        if !name.starts_with("sysl.buf$Buf.index_place") || args.is_empty() then return None
+        if args.len() != 2 then return None
 
-        if struct_base_is(texpr_type(args.at(0)), "Buf") then Some(args.at(0)) else None
+        if calls_member(name, "index_view") || calls_member(name, "index_view_unchecked") then
+            Some(args.at(0))
+        else
+            None
     _ -> None
-
-// Whether reading a place a second time reads what the first reading did, with nothing run: a name, a
-// global, and fields and dereferences of one.
-private rereadable(x: TExpr) -> bool = *x.kind match
-    TLoad(_, _) -> true
-    TGlobal(_, _, _) -> true
-    TField(r, _, _) -> rereadable(r)
-    TDeref(operand, _) -> rereadable(operand)
-    _ -> false
-
-// What keeps a `Buf`'s elements alive: the owner its storage view carries, read after the subscript
-// has checked the index -- so the buffer has storage -- and kept even if the buffer later grows into
-// new storage or is dropped. An empty buffer has no core; an `@unchecked` subscript of one reads past
-// its count, and the owner is then nothing rather than a read through null.
-private buf_storage_owner(e: *Emit, container: TExpr) -> Val
-    val bty = texpr_type(container)
-
-    val bd = underlying(bty) match
-        Struct(d) -> d
-        _ -> return VNull
-
-    val core_at = field_named(bd, "core")
-    val core_ty = bd.fields.at(usize(core_at)).1
-
-    val core_d = underlying(pointee(core_ty).unwrap_or(core_ty)) match
-        Struct(d) -> d
-        _ -> return VNull
-
-    val elems_at = field_named(core_d, "elems")
-    val core = gen_expr(e, TExpr(container.span, TField(container, core_at, core_ty)))
-    val payload = box_payload_addr(e, core, core_ty)
-    val elems = fresh_reg(e)
-
-    var idx: Buf[IrArg] = buf()
-
-    idx.push(ir_arg(l_i32(), VInt(from_int(0))))
-    idx.push(ir_arg(l_i32(), VInt(from_int(long(field_index_of(e, Struct(core_d), elems_at))))))
-    emit(e, InGep(elems, lty(e, Struct(core_d)), payload, idx))
-
-    val nothing = alloca(e, fresh_reg(e), LPtr)
-
-    emit(e, InStore(LPtr, VNull, nothing, AccPlain, None))
-
-    val absent = fresh_reg(e)
-
-    emit(e, InIntCmp(absent, IEq, LPtr, core, VNull))
-
-    // The owner is the view's first word, so the view's own address is where it is read from.
-    val from = fresh_reg(e)
-
-    emit(e, InSelect(from, absent, LPtr, nothing, elems, l_i1()))
-
-    val owner = fresh_reg(e)
-
-    emit(e, InLoad(owner, LPtr, from, AccPlain, None))
-    owner
-end buf_storage_owner
-
-// A buffer worked out by running something (`make()[i]`) is worked out once, into a slot of this
-// frame, so the subscript and the read of its storage's owner see the same buffer. The value keeps
-// whatever count it arrived with, given back with the statement's temporaries as before.
-private spilled(e: *Emit, x: TExpr) -> TExpr
-    val ty = texpr_type(x)
-    val v = gen_expr(e, x)
-
-    e.temp += 1
-
-    val name = s"bufsub.${e.temp}"
-    val slot = named_alloca(e, s"$name.addr", lty(e, ty), None)
-
-    emit(e, InStore(lty(e, ty), v, slot, AccPlain, None))
-    TExpr(x.span, TLoad(name, ty))
-end spilled
-
-// The subscript call again, addressing the buffer through `held`.
-private subscript_of(call: TExpr, held: TExpr) -> TExpr = *call.kind match
-    TCall(name, args, ty, results) ->
-        var again: Buf[TExpr] = buf()
-
-        again.push(held)
-
-        for i in 1..<args.len()
-            again.push(args.at(i))
-
-        TExpr(call.span, TCall(name, again, ty, results))
-    _ -> call
-
-private field_named(d: &StructType, name: string) -> int
-    for i in 0..<d.fields.len()
-        if d.fields.at(i).0 == name then return int(i)
-
-    -1
-end field_named
 
 // Whatever keeps an array place's storage alive where the place is not rooted at a reference: the
 // buffer a promotion moved it to, or nothing at all for storage on the frame.
@@ -890,9 +801,10 @@ private promoted_owner(e: *Emit, base: TExpr) -> Val = *base.kind match
 // honest: the box that owns the storage is the **innermost** one on the chain, and the ordinary walk
 // evaluates the outermost first.
 //
-// A place rooted at an **element of a view** (`rows[i][..]`) or of a **`Buf`** (`b[i][..]`) lives in
-// that view's or that buffer's storage, so its owner is the storage's: without it a view kept past a
-// growth or a drop of the buffer would point into storage already given back.
+// A place rooted at an **element of a view** (`rows[i][..]`) lives in that view's storage, so its
+// owner is the view's: without it a view kept past a growth or a drop of the buffer would point into
+// storage already given back. An element of a **container someone wrote** -- a `Buf` among them -- is
+// one: a view of part of it is taken through the container's `index_view` (`c.index_view(i)[0][..]`).
 address_owned(e: *Emit, place: TExpr) -> (Val, Val)
     val root = spine_root(place)
 
@@ -909,17 +821,6 @@ address_owned(e: *Emit, place: TExpr) -> (Val, Val)
                     idx.push(ir_arg(l_i32(), VInt(from_int(long(box_payload_field(e, inner))))))
                     emit(e, InGep(at, box_lty(e, inner), box, idx))
                     return (box, address_under(e, place, root.unwrap(), at))
-
-                // An element of a `Buf` lives in the buffer's storage, which a growth or a drop of the
-                // buffer gives up: what keeps it is the owner of that storage, not nothing.
-                buf_subscript(operand) match
-                    Some(container) ->
-                        val held = if rereadable(container) then container else spilled(e, container)
-                        val call = if same_node(held, container) then operand else subscript_of(operand, held)
-                        val at = gen_expr(e, call)
-
-                        return (buf_storage_owner(e, held), address_under(e, place, root.unwrap(), at))
-                    None -> ()
 
             // An element of a view lives in the view's storage, so the view's owner is the element's:
             // the view is read once, and the element is reached from the pointer it carries.
@@ -1011,7 +912,7 @@ private same_node(a: TExpr, b: TExpr) -> bool = a.span == b.span && texpr_kind_n
 // first.
 gen_slice(e: *Emit, base: TExpr, lo: Option[TExpr], hi: Option[TExpr], inclusive: bool,
           slice_ty: Type, site: Span) -> Val
-    gen_slice_of(e, slice_base(e, base), lo, hi, inclusive, slice_ty, site, true)
+    gen_slice_of(e, slice_base(e, base, slice_ty), lo, hi, inclusive, slice_ty, site, true)
 end gen_slice
 
 // A slice of a view already made: what keeps its elements alive, where the first is, and how many.
@@ -1047,7 +948,7 @@ gen_lent_view(e: *Emit, x: TExpr, callee: string, written: Set[string]) -> Val =
         val parts = if lent_view(e, base, callee, written) then
             view_parts(e, gen_lent_view(e, base, callee, written), texpr_type(base))
         else
-            slice_base(e, base)
+            slice_base(e, base, slice_ty)
 
         gen_slice_of(e, parts, lo, hi, inclusive, slice_ty, x.span, false)
     TConstView(arg) -> gen_lent_view(e, arg, callee, written)
@@ -1079,17 +980,18 @@ private view_base_stands(e: *Emit, base: TExpr, callee: string, written: Set[str
 
             if root.is_none() then return true
 
-            // An element of a view stands where the view does. An element of a `Buf` stands only where
-            // the callee can reach no buffer of its type: holding the buffer's name does not hold its
-            // storage, which a growth through any other name for the same buffer gives up.
+            // An element of a view stands where the view does. An element of a container's storage,
+            // reached through `index_view`, stands only where the callee can reach neither a container
+            // of its type nor a view of its elements: holding the container's name does not hold its
+            // storage, which a growth through any other name for the same container gives up.
             *root.unwrap().kind match
                 TDeref(operand, _) ->
-                    if is_counted_ref(texpr_type(operand)) then return stands_for_call(e, operand, callee, written)
-
-                    buf_subscript(operand) match
-                        Some(container) -> lends_in_place(e, callee, texpr_type(container))
-                        None -> true
-                TIndex(r, _, _) -> stands_for_call(e, r, callee, written)
+                    !is_counted_ref(texpr_type(operand)) || stands_for_call(e, operand, callee, written)
+                TIndex(r, _, _) -> container_view(r) match
+                    Some(container) ->
+                        lends_in_place(e, callee, receiver_type(texpr_type(container))) &&
+                            lends_in_place(e, callee, texpr_type(r))
+                    None -> stands_for_call(e, r, callee, written)
                 _ -> true
         _ -> false
 end view_base_stands
@@ -1222,7 +1124,10 @@ end gen_slice_of
 // many there are -- which a `*T` region does not know.
 //
 // An exported name for a pointer or an array is sliced as what it stands for.
-private slice_base(e: *Emit, base: TExpr) -> (Val, Val, Option[Val]) = nameless(texpr_type(base)) match
+//
+// A pointer to an array is sliced as the array unless the view is of the arrays themselves: a generic
+// body's `p[0..<n]` over `*T` views `T`s, whatever `T` stands for this time.
+private slice_base(e: *Emit, base: TExpr, slice_ty: Type) -> (Val, Val, Option[Val]) = nameless(texpr_type(base)) match
     Ref(inner, _) -> underlying(*inner) match
         Array(n, _) ->
             val r = gen_expr(e, base)
@@ -1251,7 +1156,10 @@ private slice_base(e: *Emit, base: TExpr) -> (Val, Val, Option[Val]) = nameless(
         (owned.0, owned.1, Some(VInt(from_int(long(n)))))
 
     Ptr(inner) -> underlying(*inner) match
-        Array(n, _) -> (VNull, gen_expr(e, base), Some(VInt(from_int(long(n)))))
+        Array(n, _) ->
+            if views_pointees(slice_ty, *inner) then return (VNull, gen_expr(e, base), None)
+
+            (VNull, gen_expr(e, base), Some(VInt(from_int(long(n)))))
 
         // A `*T` region: no owner to count and no length to check the end against. The analyzer has
         // already insisted the end be written, since there is nothing here to supply one.
@@ -1260,6 +1168,11 @@ private slice_base(e: *Emit, base: TExpr) -> (Val, Val, Option[Val]) = nameless(
     other ->
         gap_here(e, s"slice of ${type_show(other)}")
         (VNull, VUndef, None)
+
+// Whether a view's elements are the pointee itself rather than the pointee's elements.
+private views_pointees(slice_ty: Type, pointee: Type) -> bool = element(slice_ty) match
+    Some(x) -> underlying(unqualified(x)) == underlying(unqualified(pointee))
+    None -> false
 
 private view_base(e: *Emit, base: TExpr) -> (Val, Val, Option[Val])
     val wty = lty(e, texpr_type(base))

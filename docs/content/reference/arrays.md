@@ -801,6 +801,48 @@ print(r.cells)
 [1, 2, 30, 0]
 ```
 
+**A view of part of an element keeps the storage the element lives in.** Where the element is an
+array, `c[i][..]`, `c[i].cells[1..]` and `c[i][j][..]` are taken through the trait's `index_view`
+rather than `index_place`: `c[i][..]` is `c.index_view(i)[0][..]`, the element read as the one element
+of a view, so the view taken carries that view's owner and stays good after the container grows or is
+dropped. A container whose elements live in a `Buf` or a view says so by answering a part of it —
+`Buf` does, which is all that makes `b[i][..]` safe:
+
+```sysl
+import sysl.buf.{Buf, buf}
+
+struct Rows
+    items: Buf[[4]int]
+
+impl IndexPlace[usize, [4]int] for Rows
+    index_place(self, i: usize) -> *[4]int = self.items.index_place(i)
+    override index_view(self, i: usize) -> [][4]int = self.items.index_view(i)
+
+var r = Rows(buf())
+
+r.items.push([1, 2, 3, 4])
+
+val v = r[0][1..]
+
+for k in 0..<100 do r.items.push([k, k, k, k])
+
+r = Rows(buf())
+
+print(v)
+```
+
+```output
+[2, 3, 4]
+```
+
+**The default `index_view` answers a view whose owner is nothing**, which is exactly right for elements
+that are the container's own bytes, like `Ring`'s above, or static storage: those live as long as
+the container or the program. A container that keeps its elements behind a `*T` is in the raw-pointer
+tier, where nothing is kept alive for it; one that keeps them in a `Buf` or a view and does not answer
+`index_view` hands out views that own nothing, and a view kept past a growth reads freed storage.
+`index_view_unchecked` is the same member inside an `@unchecked` block, defaulting to `index_view`'s
+answer over `index_place_unchecked`.
+
 **Where the method takes a `usize`, the subscript takes any integer**, exactly as an array's does: the
 compiler brings the index to a `usize` before the call, so `b[i]` with `i` an `int`, an `i8` or a
 `u64` needs no conversion written, and the index fixes no literal binding's type. This holds for

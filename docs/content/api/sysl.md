@@ -1350,6 +1350,8 @@ that computes its elements has an `Index` and no `IndexSet` to give.
 trait IndexPlace[I, E]
     index_place(*self, i: I) -> *E
     index_place_unchecked(*self, i: I) -> *E
+    index_view(*self, i: I) -> []E
+    index_view_unchecked(*self, i: I) -> []E
 ```
 
 What makes a subscript on a type someone wrote a **place**, as an array's element is.
@@ -1370,6 +1372,8 @@ from seeing the call.
 |---|---|---|
 | `index_place` | `index_place(*self, i: I) -> *E` |  |
 | `index_place_unchecked` | `index_place_unchecked(*self, i: I) -> *E` | What `b[i]` reads through inside an `@unchecked` block: the same address, with the bounds test left out where the container knows how to leave it out (`reference/arrays.md § Unchecked access`). |
+| `index_view` | `index_view(*self, i: I) -> []E` | The element as a view of one, **carrying the owner of the storage it lives in** -- what a view of part of the element (`c[i][..]`, `c[i].cells[1..]`) is taken through, so that the view keeps that storage alive past a growth or a drop of the container, as a view of part of a `Buf`'s element does. |
+| `index_view_unchecked` | `index_view_unchecked(*self, i: I) -> []E` | `index_view` inside an `@unchecked` block, as `index_place_unchecked` is `index_place` there. |
 
 ### `IndexSet`
 
