@@ -109,8 +109,10 @@ kdc_written_at_the_bottom()
     assert(kept.contains("'f0' keeps its parameter 'p' (it is passed to 'f1', which keeps it)"), kept)
 
 // The same chain handing a pointer to a pointer down: a parameter something is read through asks the
-// read questions of each callee on demand, a walk per link, and overflows the stack (as 0.8.3 did).
-@test(ignore: "the read questions of a pointer-to-pointer parameter nest a walk per link of a call chain")
+// read questions of each callee -- keyed by the steps and the field path the CALLER reads at, so no
+// warming knows to ask them -- and asked on demand they nested a walk per link and overflowed the stack
+// (as 0.8.3 did). A question asked `MaxNesting` walks deep is put off and answered from the top.
+@test("a pointer to a pointer repointed at the bottom of a thirty-two-thousand-call chain is answered up it")
 kdc_repointed_at_the_bottom()
     val link = (i: usize, j: usize) -> s"f$i(pp: ***int)\n    f$j(pp)\n\n"
     val head = "var slot: *int = null\n\nkey(a: *int)\n    var arr: [1]*int = [null]\n" +
@@ -122,3 +124,40 @@ kdc_repointed_at_the_bottom()
     val read = kdc_said(kdc_chain(head, link, "(pp: ***int)\n    if *pp == null then slot = null\n\n"))
 
     assert_eq(read, "")
+
+// The steps a callee is asked change down the chain: the first half hands `***int` on, the link at the
+// middle hands what it reads one step in, and the second half hands that `**int` on. What the bottom
+// reads two steps through the top's argument is the address of the top's own local.
+@test("a read two steps in, then one, down a thirty-two-thousand-call chain is held to what the bottom lets out")
+kdc_steps_change_down_the_chain()
+    val half = KdcDepth / 2
+    val link = (i: usize, j: usize) ->
+        if j < half then s"f$i(pp: ***int)\n    f$j(pp)\n\n"
+        else if j == half then s"f$i(pp: ***int)\n    f$j(*pp)\n\n"
+        else s"f$i(p: **int)\n    f$j(p)\n\n"
+    val head = kdc_store + "key()\n    var x = 5\n    var arr: [1]*int = [&x]\n    var p: **int = &arr[0]\n    f0(&p)\n\n" +
+               "main()\n    key()\n\n"
+    val kept = kdc_said(kdc_chain(head, link, "(p: **int)\n    held = *p\n\n"))
+
+    assert(kept.contains("'f0' lets what it reads through its parameter 'pp' outlive the call"), kept)
+    assert(kept.contains("what is read through '&p' holds the address of a local of 'key'"), kept)
+
+    val read = kdc_said(kdc_chain(head, link, "(p: **int)\n    if *p == null then spare = 1\n\n"))
+
+    assert_eq(read, "")
+
+// The same through a struct whose field holds the local's address: the bottom letting a field out is
+// refused at the top, and one that only compares it lets nothing out.
+@test("a field read through a struct pointer at the bottom of a thirty-two-thousand-call chain is answered up it")
+kdc_field_read_down_the_chain()
+    val link = (i: usize, j: usize) -> s"f$i(w: *H)\n    f$j(w)\n\n"
+    val head = kdc_store + "struct H\n    p: *int\n    q: *int\n\nkey()\n    var x = 5\n    var h = H(&x, &spare)\n" +
+               "    f0(&h)\n\nmain()\n    key()\n\n"
+    val kept = kdc_said(kdc_chain(head, link, "(w: *H)\n    held = w.p\n\n"))
+
+    assert(kept.contains("'f0' lets what it reads through its parameter 'w' outlive the call"), kept)
+    assert(kept.contains("what is read through '&h' holds the address of a local of 'key'"), kept)
+
+    val other = kdc_said(kdc_chain(head, link, "(w: *H)\n    if w.p == null then spare = 1\n\n"))
+
+    assert_eq(other, "")
