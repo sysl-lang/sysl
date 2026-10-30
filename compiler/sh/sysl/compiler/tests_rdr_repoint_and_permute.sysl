@@ -1,0 +1,523 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// **Where a pointer points is given up once something out of sight may change it, and a view cut from
+// storage still views that storage** (`keeps_flow.sysl`'s `repoint_exposed`, `origin_assign`, the
+// `TSlice` arm of `origin_of`; `keeps.sysl`'s `writes_of`).
+//
+// The first half is a soundness hole: `redirect(&p)` pointing `p` at module storage, then `*p = a`,
+// was taken to store `a` where `p` was bound to, and `&x` reached module storage. The matrix crosses how
+// the local is repointed (a callee by name, a helper chain, C, the callee's answer, a pointer the callee
+// stashed, a second local holding `&p`, a `ref`, a nested function, a closure, the body writing its own
+// parameter, a parameter stepped along a link) with the order (redirect then write, write then
+// redirect, in a `for` and a `while` loop) and what is stored (a parameter: refused; module storage or
+// nothing: accepted). Write-then-redirect is refused too: where a pointer points is worked out over
+// the whole body, not statement by statement, so a write before the redirect is not told apart.
+//
+// The second half is a false refusal: a sort permutes the slice it is handed, but `intro_sort`'s
+// `s = s[(p + 1)..]` made `s` point anywhere, so everything it handed on was held anywhere. Covered:
+// every in-place permutation in the library over pointers to locals (`sort_by`, `sort` of a struct
+// holding one, `sort_stable_by` with local scratch, `reverse`, `swap`, `shuffle`), a sub-slice sorted,
+// a user permutation, a generic one, a parameter slice stepped through by a loop; still refused: the
+// elements copied into module storage. **Two slices exchanging elements** are accepted exactly when
+// the caller's frame owns both: a value moved into the other slice is held where that slice's storage
+// is, so one viewing module storage keeps it.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private rdr_outcome(text: string) -> (string, int)
+    val root = make_temp_dir("sysl-rdr").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", rdr_prelude + text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (failure_text(why), -1)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> ("the program that was built could not be run", -1)
+        Ok(out) -> (out.text + out.err.unwrap_or(""), shell_status(out.status))
+end rdr_outcome
+
+private rdr_prints(text: string, want: string)
+    if xvr_no_library() then return
+
+    val out = rdr_outcome(text)
+
+    assert_eq(out.0, want)
+    assert_eq(out.1, 0)
+end rdr_prints
+
+private rdr_refused(text: string, part: string)
+    if xvr_no_library() then return
+
+    val out = rdr_outcome(text)
+
+    assert_eq(out.1, -1, out.0)
+    assert(out.0.index_of(part).is_some(), out.0)
+end rdr_refused
+
+private const rdr_prelude: string = raw"""
+    import sysl.buf.{Buf, buf}
+    import sysl.slices.{sort, sort_by, sort_stable_by, swap, reverse}
+    import sysl.rand.rng
+
+    var slot: *int = null
+    var other = 7
+    var held: Buf[*int] = buf()
+
+    redirect(pp: ***int)
+        *pp = &slot
+
+    peek(pp: ***int) -> bool = *pp == null
+
+    show(xs: []*int)
+        for p in xs
+            print(*p)
+
+    """
+
+private rdr_kept(owner: string) -> string =
+    s"'key' keeps its parameter 'a' (it is stored in '*p'), and '&x' is the address of a local of '$owner'"
+
+// -- a pointer repointed out of sight -------------------------------------------------------------
+
+@test("a local pointer a callee repoints at module storage, then written through, is refused")
+rdr_redirect_then_write()
+    rdr_refused(raw"""
+        key(a: *int)
+            var arr: [1]*int = [null]
+            var p: **int = &arr[0]
+            redirect(&p)
+            *p = a
+
+        main()
+            var x = 5
+            key(&x)
+            print(*slot)
+        """, rdr_kept("main"))
+
+@test("a write before the redirect is refused as well: where a pointer points is one answer per body")
+rdr_write_then_redirect()
+    rdr_refused(raw"""
+        key(a: *int)
+            var arr: [1]*int = [null]
+            var p: **int = &arr[0]
+            *p = a
+            redirect(&p)
+            *p = &other
+
+        main()
+            var x = 5
+            key(&x)
+        """, rdr_kept("main"))
+
+@test("a redirect two helpers down, through a copy of the pointer, is followed")
+rdr_helper_chain()
+    rdr_refused(raw"""
+        hop(pp: ***int) = redirect(pp)
+
+        hop2(pp: ***int)
+            val q = pp
+            hop(q)
+
+        key(a: *int)
+            var arr: [1]*int = [null]
+            var p: **int = &arr[0]
+            hop2(&p)
+            *p = a
+
+        main()
+            var x = 5
+            key(&x)
+        """, rdr_kept("main"))
+
+@test("a local's address handed to C may be repointed anywhere")
+rdr_extern()
+    rdr_refused(raw"""
+        extern zap(pp: ***int)
+
+        key(a: *int)
+            var arr: [1]*int = [null]
+            var p: **int = &arr[0]
+            zap(&p)
+            *p = a
+
+        main()
+            var x = 5
+            key(&x)
+        """, rdr_kept("main"))
+
+@test("a redirect followed only by module storage stored through it, and a callee that only reads, are accepted")
+rdr_module_only()
+    rdr_prints(raw"""
+        key(a: *int)
+            var arr: [1]*int = [null]
+            var p: **int = &arr[0]
+            redirect(&p)
+            *p = &other
+            var q: **int = &arr[0]
+            print(peek(&q))
+            *q = a
+            print(*arr[0])
+
+        main()
+            var x = 5
+            key(&x)
+            print(*slot)
+        """, "false\n5\n7\n")
+
+@test("a repointed local through which nothing of the caller's is stored is accepted")
+rdr_never_escapes()
+    rdr_prints(raw"""
+        key(a: *int) -> int
+            var arr: [1]*int = [a]
+            var p: **int = &arr[0]
+            redirect(&p)
+            *arr[0] + (if *p == null then 0 else 1)
+
+        main()
+            var x = 5
+            print(key(&x))
+        """, "5\n")
+
+@test("a redirect inside a for loop, with the write on every pass, is refused")
+rdr_for_loop()
+    rdr_refused(raw"""
+        key(a: *int, n: int)
+            var arr: [1]*int = [null]
+            var p: **int = &arr[0]
+
+            for i in 0..<n
+                *p = a
+                if i == 1 then redirect(&p)
+
+        main()
+            var x = 5
+            key(&x, 3)
+        """, "'key' keeps its parameter 'a' (it is stored in '*p')")
+
+@test("a redirect inside a while loop, with the write on every pass, is refused")
+rdr_while_loop()
+    rdr_refused(raw"""
+        key(a: *int)
+            var arr: [1]*int = [null]
+            var p: **int = &arr[0]
+            var n = 0
+
+            while n < 3
+                *p = a
+                n += 1
+                if n == 2 then redirect(&p)
+
+        main()
+            var x = 5
+            key(&x)
+        """, rdr_kept("main"))
+
+@test("a redirect through a ref to the local is a redirect of the local")
+rdr_through_ref()
+    rdr_refused(raw"""
+        key(a: *int)
+            var arr: [1]*int = [null]
+            var p: **int = &arr[0]
+            ref r = p
+            redirect(&r)
+            *p = a
+
+        main()
+            var x = 5
+            key(&x)
+        """, rdr_kept("main"))
+
+@test("a second local holding the address, written through, repoints the first")
+rdr_alias_local()
+    rdr_refused(raw"""
+        key(a: *int)
+            var arr: [1]*int = [null]
+            var p: **int = &arr[0]
+            var pp = &p
+            *pp = &slot
+            *p = a
+
+        main()
+            var x = 5
+            key(&x)
+        """, rdr_kept("main"))
+
+@test("a callee answering the address it was handed lets the caller repoint through the answer")
+rdr_answer_alias()
+    rdr_refused(raw"""
+        ident(pp: ***int) -> ***int = pp
+
+        key(a: *int)
+            var arr: [1]*int = [null]
+            var p: **int = &arr[0]
+            val q = ident(&p)
+            *q = &slot
+            *p = a
+
+        main()
+            var x = 5
+            key(&x)
+        """, rdr_kept("main"))
+
+@test("a callee stashing the address in a local struct lets a later call repoint through it")
+rdr_stashed()
+    rdr_refused(raw"""
+        struct H
+            pp: ***int
+
+        stash(h: *H, pp: ***int)
+            h.pp = pp
+
+        key(a: *int)
+            var arr: [1]*int = [null]
+            var p: **int = &arr[0]
+            var h = H(null)
+            stash(&h, &p)
+            redirect(h.pp)
+            *p = a
+
+        main()
+            var x = 5
+            key(&x)
+        """, rdr_kept("main"))
+
+@test("a nested function writing the enclosing local repoints it")
+rdr_nested_function()
+    rdr_refused(raw"""
+        key(a: *int)
+            var arr: [1]*int = [null]
+            var p: **int = &arr[0]
+
+            inner()
+                p = &slot
+
+            inner()
+            *p = a
+
+        main()
+            var x = 5
+            key(&x)
+        """, rdr_kept("main"))
+
+@test("a closure that may hold the local by reference may repoint it")
+rdr_closure()
+    rdr_refused(raw"""
+        key(a: *int)
+            var arr: [1]*int = [null]
+            var p: **int = &arr[0]
+            val set = () -> redirect(&p)
+            set()
+            *p = a
+
+        main()
+            var x = 5
+            key(&x)
+        """, rdr_kept("main"))
+
+@test("a parameter the body points elsewhere no longer stores into what the caller handed")
+rdr_parameter_reassigned()
+    rdr_refused(raw"""
+        key(a: *int, p: **int)
+            p = &slot
+            *p = a
+
+        main()
+            var x = 5
+            var arr: [1]*int = [null]
+            key(&x, &arr[0])
+        """, "'key' keeps its parameter 'a' (it is stored in '*p'), and '&x' is the address of a local of 'main'")
+
+@test("a parameter stepped along a link stores into the next node, not the caller's")
+rdr_parameter_link()
+    rdr_refused(raw"""
+        struct Node
+            v: *int
+            next: *Node
+
+        var far = Node(null, null)
+
+        put(n: *Node, a: *int)
+            n = n.next
+            n.v = a
+
+        f()
+            var x = 5
+            var near = Node(null, &far)
+            put(&near, &x)
+
+        main()
+            f()
+        """, "'put' keeps its parameter 'a' (it is stored in 'n.v'), and '&x' is the address of a local of 'f'")
+
+// -- a permutation in place -----------------------------------------------------------------------
+
+@test("the library's in-place permutations over pointers to locals are accepted")
+rdr_library_permutations()
+    rdr_prints(raw"""
+        f()
+            var a = 3
+            var b = 1
+            var c = 2
+            var xs: [3]*int = [&a, &b, &c]
+            var scratch: [3]*int = [null, null, null]
+
+            sort_by(xs[..], (p, q) -> *p < *q)
+            show(xs[..])
+            reverse(xs[..])
+            show(xs[..])
+            swap(xs[..], 0, 2)
+            show(xs[..])
+            print(sort_stable_by(xs[..], scratch[..], (p, q) -> *p > *q))
+            show(xs[..])
+            var g = rng(42, 54)
+            g.shuffle(xs[..])
+            print(*xs[0] + *xs[1] + *xs[2])
+
+        main()
+            f()
+        """, "1\n2\n3\n3\n2\n1\n1\n2\n3\ntrue\n3\n2\n1\n6\n")
+
+@test("an Ord sort of structs holding pointers to locals is accepted")
+rdr_ord_sort()
+    rdr_prints(raw"""
+        struct P
+            p: *int
+
+        impl Ord for P
+            lt(self, rhs: P) -> bool = *self.p < *rhs.p
+
+        f()
+            var a = 3
+            var b = 1
+            var c = 2
+            var xs = [P(&a), P(&b), P(&c)]
+
+            sort(xs[..])
+
+            for x in xs
+                print(*x.p)
+
+        main()
+            f()
+        """, "1\n2\n3\n")
+
+@test("a sub-slice sorted, a user permutation and a generic one are accepted")
+rdr_user_permutations()
+    rdr_prints(raw"""
+        perm(xs: []*int)
+            val t = xs[0]
+            xs[0] = xs[2]
+            xs[2] = t
+
+        gen_swap[T](xs: []T)
+            val t = xs[0]
+            xs[0] = xs[1]
+            xs[1] = t
+
+        f()
+            var a = 3
+            var b = 1
+            var c = 2
+            var xs: [3]*int = [&a, &b, &c]
+
+            perm(xs[..])
+            show(xs[..])
+            gen_swap(xs[..])
+            show(xs[..])
+            var v = xs[1..]
+            sort_by(v, (p, q) -> *p > *q)
+            show(xs[..])
+
+        main()
+            f()
+        """, "2\n1\n3\n1\n2\n3\n1\n3\n2\n")
+
+@test("a parameter slice stepped through by a loop stores into the caller's storage")
+rdr_stepped_slice()
+    rdr_prints(raw"""
+        fill(s: []*int, a: *int)
+            while s.len > 0
+                s[0] = a
+                s = s[1..]
+
+        f()
+            var x = 5
+            var arr: [3]*int = [null, null, null]
+            fill(arr[..], &x)
+            print(*arr[2])
+
+        main()
+            f()
+        """, "5\n")
+
+@test("elements copied out of the slice into module storage are still kept")
+rdr_copied_out()
+    rdr_refused(raw"""
+        save(xs: []*int)
+            for p in xs
+                held.push(p)
+
+        f()
+            var a = 3
+            var xs: [1]*int = [&a]
+            save(xs[..])
+
+        main()
+            f()
+        """, "'save' lets what it reads through its parameter 'xs' outlive the call (it is passed to 'push', which keeps it)")
+
+@test("two slices exchanging elements are accepted when the frame owns both")
+rdr_two_local_slices()
+    rdr_prints(raw"""
+        xchg(a: []*int, b: []*int)
+            val t = a[0]
+            a[0] = b[0]
+            b[0] = t
+
+        f()
+            var a = 3
+            var d = 9
+            var xs: [1]*int = [&a]
+            var ys: [1]*int = [&d]
+            xchg(xs[..], ys[..])
+            print(*xs[0])
+            print(*ys[0])
+
+        main()
+            f()
+        """, "9\n3\n")
+
+@test("two slices exchanging elements are refused when one views module storage")
+rdr_one_module_slice()
+    rdr_refused(raw"""
+        var gv = 4
+        var gs: [1]*int = [&gv]
+
+        xchg(a: []*int, b: []*int)
+            val t = a[0]
+            a[0] = b[0]
+            b[0] = t
+
+        f()
+            var a = 3
+            var xs: [1]*int = [&a]
+            xchg(xs[..], gs[..])
+
+        main()
+            f()
+        """, "'xchg' lets what it reads through its parameter 'a' outlive the call (it is stored in 'b[…]')")
