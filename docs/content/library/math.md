@@ -111,6 +111,8 @@ trait Float: Zero + One + Eq + Ord + Neg + Add + Sub + Mul + Div
     copysign(self, sign: Self) -> Self
     max_num(self, other: Self) -> Self
     min_num(self, other: Self) -> Self
+    maximum(self, other: Self) -> Self
+    minimum(self, other: Self) -> Self
     to_radians(self) -> Self
     to_degrees(self) -> Self
 
@@ -301,6 +303,28 @@ print(max(hole, one).is_nan(), hole.max_num(hole).is_nan())
 ```output
 1 1 -1
 true true
+```
+
+**`maximum` and `minimum` let a NaN win.** These are IEEE 754-2019's maximum and minimum: a NaN on
+either side is the answer, and `-0.0` orders below `0.0`, so of two zeros the maximum is the positive
+one and the minimum the negative one, whichever way round they are given. They are what a search
+that must not step over a NaN wants — BLAS's `iamax` answers the first NaN — and on AArch64 each is
+the one instruction `fmax` or `fmin`. A float [vector](/reference/vectors/#nan-propagating-maximum-and-minimum)
+has them lane by lane and as reductions. The integers have no `maximum`: there is no NaN to propagate.
+
+```sysl
+import sysl.math.Float
+
+var one = 1.0
+val hole = 0.0 / 0.0
+
+print(hole.maximum(one).is_nan(), one.minimum(hole).is_nan(), one.maximum(2.0))
+print(1.0 / (-0.0).maximum(0.0), 1.0 / 0.0.minimum(-0.0))
+```
+
+```output
+true true 2
+inf -inf
 ```
 
 **`fmod` is not `%`.** The integer types have `Rem` and the floats do not, because a float remainder is
