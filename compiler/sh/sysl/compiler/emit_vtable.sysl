@@ -247,6 +247,10 @@ private lent_self(e: *Emit, f: TFunc, body: IrFuncSig, boxed: bool) -> IrFunc
     val shape = if boxed then box_lty(e, ty) else lty(e, ty)
     val value = VReg(s"${recv.0}.value")
 
+    // **A method that can change no value of the type, and give back no count one holds, is lent the
+    // object as it stands** (`lends_in_place`): nothing can tell it from the snapshot.
+    val as_is = lends_in_place(e, f.name, ty)
+
     // **Every other parameter the body is lent arrives from the table as the value it crosses as**, the
     // way the method's own entry takes it, and is lent a slot of this function's own.
     var others: Map[string, (Type, string)] = map()
@@ -267,7 +271,7 @@ private lent_self(e: *Emit, f: TFunc, body: IrFuncSig, boxed: bool) -> IrFunc
 
         if names_reg(p.name, param)
             params.push(IrParam(LPtr, no_ir_attrs(), Some(object)))
-            args.push(ir_arg(LPtr, slot))
+            args.push(ir_arg(LPtr, if as_is then payload else slot))
         else if other.is_some()
             val shape_of = lty(e, other.unwrap().0)
             val at = VReg(other.unwrap().1)
@@ -293,9 +297,11 @@ private lent_self(e: *Emit, f: TFunc, body: IrFuncSig, boxed: bool) -> IrFunc
 
     if boxed then instrs.push(InGep(payload, shape, object, step))
 
-    instrs.push(InAlloca(slot, lty(e, ty), None))
-    instrs.push(InLoad(value, lty(e, ty), payload, AccPlain, None))
-    instrs.push(InStore(lty(e, ty), value, slot, AccPlain, None))
+    if !as_is
+        instrs.push(InAlloca(slot, lty(e, ty), None))
+        instrs.push(InLoad(value, lty(e, ty), payload, AccPlain, None))
+        instrs.push(InStore(lty(e, ty), value, slot, AccPlain, None))
+    end if
 
     val nothing = body.ty.ret match
         LVoid -> true
@@ -461,13 +467,16 @@ end gen_adapter
 
 // A large receiver the implementation reads in place (`reads_in_place`) is the object itself unless
 // a copy is made here, and the object is storage the call may change -- so the adapter stages the
-// snapshot a caller would have, holding what it refers to for the length of the call.
+// snapshot a caller would have, holding what it refers to for the length of the call. **Where the
+// implementation can change no value of the type and give back no count one holds**
+// (`lends_in_place`), the object cannot be told from a copy of it, and is handed over as it stands.
 private adapter_snapshot(e: *Emit, vt: TVtable, slot: TVSlot, payload: Val) -> Option[Val]
     val by_value = slot.recv match
         ByValue -> true
         _ -> false
 
-    if !by_value || !e.layout.indirect(vt.for_type) || !e.in_place_receivers.has(slot.target) then
+    if !by_value || !e.layout.indirect(vt.for_type) || !e.in_place_receivers.has(slot.target) ||
+       lends_in_place(e, slot.target, vt.for_type) then
         return None
 
     val copy = alloca(e, fresh_reg(e), lty(e, vt.for_type))

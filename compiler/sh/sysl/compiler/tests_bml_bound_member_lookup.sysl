@@ -239,3 +239,181 @@ bml_two_bounds_ambiguous()
 
     assert(out.index_of("'pick' on int comes from A and B, and each is in scope here — nothing in the " +
                         "call says which was meant").is_some(), out)
+
+// -- a bound the compiler supplies is a rival like any other --------------------------------------
+
+// Builds `main` and asserts the build says `want`.
+private bml_refuses(main: string, want: string)
+    if bml_skip_run() then return
+
+    val out = bml_ran(main, "", "", "", "")
+
+    assert(out.index_of(want).is_some(), out)
+
+@test("zero: a user bound declaring it beside Zero is ambiguous, in either order")
+bml_zero_nil_ambiguous()
+    val want = "'zero' on int comes from Zero and Nil, and each is in scope here — nothing in the " +
+               "call says which was meant"
+    val decls = raw"""
+        trait Nil
+            zero() -> Self
+
+        impl Nil for int
+            zero() -> int = 7
+
+        """
+
+    bml_refuses(decls + raw"""
+        both[T: Zero + Nil]() -> T = T.zero()
+
+        main()
+            print(both[int]())
+        """, want)
+
+    bml_refuses(decls + raw"""
+        both[T: Nil + Zero]() -> T = T.zero()
+
+        main()
+            print(both[int]())
+        """, want)
+
+@test("one: a user bound declaring it beside One is ambiguous")
+bml_one_ambiguous()
+    bml_refuses(raw"""
+        trait Unit
+            one() -> Self
+
+        impl Unit for int
+            one() -> int = 9
+
+        both[T: One + Unit]() -> T = T.one()
+
+        main()
+            print(both[int]())
+        """, "'one' on int comes from One and Unit, and each is in scope here — nothing in the " +
+             "call says which was meant")
+
+@test("width: a user bound declaring it beside Bits is ambiguous")
+bml_width_ambiguous()
+    bml_refuses(raw"""
+        import sysl.math.Bits
+
+        trait Wide
+            width() -> u32
+
+        impl Wide for u32
+            width() -> u32 = 99
+
+        both[T: Bits + Wide]() -> u32 = T.width()
+
+        main()
+            print(both[u32]())
+        """, "'width' on uint comes from Bits and Wide, and each is in scope here — nothing in the " +
+             "call says which was meant")
+
+@test("a bound reached through a supertrait is a rival as well")
+bml_supertrait_ambiguous()
+    val want = "'zero' on int comes from Zero and Nil, and each is in scope here — nothing in the " +
+               "call says which was meant"
+
+    bml_refuses(raw"""
+        trait Nil
+            zero() -> Self
+
+        trait Sub: Nil
+            tag() -> int
+
+        impl Nil for int
+            zero() -> int = 7
+
+        impl Sub for int
+            tag() -> int = 1
+
+        both[T: Zero + Sub]() -> T = T.zero()
+
+        main()
+            print(both[int]())
+        """, want)
+
+    bml_refuses(raw"""
+        trait Nil
+            zero() -> Self
+
+        trait Zed: Zero
+            tag() -> int
+
+        impl Nil for int
+            zero() -> int = 7
+
+        impl Zed for int
+            tag() -> int = 1
+
+        both[T: Zed + Nil]() -> T = T.zero()
+
+        main()
+            print(both[int]())
+        """, want)
+
+@test("a single bound, and a user bound without the colliding member, are not ambiguous")
+bml_not_ambiguous()
+    val decls = raw"""
+        trait Nil
+            zero() -> Self
+            tag(self) -> int
+
+        impl Nil for int
+            zero() -> int = 7
+            tag(self) -> int = 1
+
+        trait Plain
+            tag(self) -> int
+
+        impl Plain for int
+            tag(self) -> int = 3
+
+        """
+
+    bml_prints(decls + raw"""
+        only_nil[T: Nil]() -> T = T.zero()
+        only_zero[T: Zero]() -> T = T.zero()
+        tagged[T: Zero + Plain](x: T) -> int = x.tag()
+        plain_zero[T: Zero + Plain]() -> T = T.zero()
+
+        main()
+            print(only_nil[int](), only_zero[int](), tagged(5), plain_zero[int]())
+        """, "", "", "", "", "7 0 3 0\n")
+
+@test("Zero alone at int is the compiler's zero beside a user trait of the program that has one")
+bml_zero_alone_stays_zero()
+    bml_prints(raw"""
+        trait Nil
+            zero() -> Self
+
+        impl Nil for int
+            zero() -> int = 7
+
+        zeroed[T: Zero]() -> T = T.zero()
+
+        main()
+            print(zeroed[int](), zeroed[i64]())
+        """, "", "", "", "", "0 0\n")
+
+@test("the refusal is also made where the bounds are on an impl block")
+bml_block_bounds_ambiguous()
+    bml_refuses(raw"""
+        trait Nil
+            zero() -> Self
+
+        impl Nil for int
+            zero() -> int = 7
+
+        struct Box[T]
+            v: T
+
+        impl[T: Zero + Nil] Box[T]
+            cleared(self) -> T = T.zero()
+
+        main()
+            print(Box(1).cleared())
+        """, "'zero' on int comes from Zero and Nil, and each is in scope here — nothing in the " +
+             "call says which was meant")

@@ -43,7 +43,7 @@ compiler says so at the call (`reference/memory.md § @crossing`).
 
 ## Index
 
-[`DEFAULT_STACK`](#default_stack) [`channel`](#channel) [`current`](#current) [`spawn`](#spawn) [`spawn_on`](#spawn_on) [`tls_place`](#tls_place) [`tls_room`](#tls_room) [`yield_now`](#yield_now) [`Channel`](#channel-1) [`Condvar`](#condvar) [`Mutex`](#mutex) [`SleepLock`](#sleeplock) [`Thread`](#thread) [Lock for SleepLock](#lock-for-sleeplock)
+[`DEFAULT_STACK`](#default_stack) [`barrier`](#barrier) [`channel`](#channel) [`current`](#current) [`scope`](#scope) [`spawn`](#spawn) [`spawn_on`](#spawn_on) [`tls_place`](#tls_place) [`tls_room`](#tls_room) [`yield_now`](#yield_now) [`Barrier`](#barrier-1) [`Channel`](#channel-1) [`Condvar`](#condvar) [`Mutex`](#mutex) [`Scope`](#scope-1) [`ScopedThread`](#scopedthread) [`SleepLock`](#sleeplock) [`Thread`](#thread) [Lock for SleepLock](#lock-for-sleeplock)
 
 ## Constants
 
@@ -56,6 +56,15 @@ const DEFAULT_STACK: usize = 65536
 The stack `spawn` gives a thread where nothing else is asked for: 64 KiB.
 
 ## Functions
+
+### `barrier`
+
+```sysl
+barrier(n: usize) -> &sync Barrier
+```
+
+A barrier that waits for `n` threads in each phase. A barrier of one -- or of none -- never waits,
+and every caller of its `wait` is the leader.
 
 ### `channel`
 
@@ -80,6 +89,23 @@ current() -> Thread
 
 The calling thread's own handle, which is what a body compares against to learn it is not the
 thread that spawned it. It cannot be joined: a thread waiting for itself would wait for ever.
+
+### `scope`
+
+```sysl
+scope[R](body: *Scope -> R) -> R
+```
+
+Runs `body` with a `Scope`, joins every thread started on it, and answers what `body` answered.
+
+The threads may borrow anything the caller can see -- a view of its array, a struct of views --
+because none of them outlives this call:
+
+```
+scope((s) ->
+    s.spawn(() -> for i in 0..<half do v[i] = 1)
+    s.spawn(() -> for i in half..<v.len do v[i] = 2))
+```
 
 ### `spawn`
 
@@ -177,6 +203,31 @@ This is a **hint**, not a wait: a thread that yields is still runnable and may b
 processor straight back.
 
 ## Types
+
+### `Barrier`
+
+```sysl
+struct Barrier
+    private n: usize
+    private gate: Mutex[Gate]
+    private turn: Condvar
+```
+
+A meeting point for a fixed number of threads: each `wait` sleeps until that many have arrived,
+then all of them go on together.
+
+It can be met again at once -- the threads that leave one phase may arrive at the next before the
+slowest has woken from the last -- because a wait sleeps on the phase it arrived in, not on the
+count. **Exactly one of each phase's waiters is told it is the leader**: the one whose arrival
+completed the phase, and the one a program has do the work between phases that only one thread
+should do.
+
+It is shared as a `&sync Barrier`, which is what `barrier` answers, so a scoped thread captures it
+as it would any other atomically counted object.
+
+| Member | Signature | Description |
+|---|---|---|
+| `wait` | `wait(*self) -> bool` | Sleeps until `n` threads, this one included, have called `wait` in this phase, and answers whether this caller is the phase's leader: `true` for exactly one of them. |
 
 ### `Channel`
 
@@ -321,6 +372,48 @@ program reaches for, and the one that picks the lock for it.
 | `lock_raw` | `lock_raw(*self) -> *T` | Takes the lock, waiting until it is free, and answers the address of what it protects. |
 | `try_lock_raw` | `try_lock_raw(*self) -> Option[*T]` | Takes the lock if it is free, and answers what it protects where it did. |
 | `unlock_raw` | `unlock_raw(*self)` | Releases the lock a `lock_raw` or `try_lock_raw` took. |
+
+### `Scope`
+
+```sysl
+struct Scope
+    private jobs: Mutex[Buf[&sync Job]]
+```
+
+The handle `scope` lends its body, through which the body starts threads that may borrow the
+caller's frame.
+
+**Every thread started through it is joined before `scope` returns**, whichever way the body
+ends: by running off its end or by an early `return`, which leaves the body's closure and lands
+back in `scope` like any other answer. A trap or a `panic` ends the whole program -- sysl does not
+unwind -- so no thread outlives the frame it borrows on that path either.
+
+The body is lent the scope as a `*Scope` for the call, so the compiler refuses storing it anywhere
+that outlives the body (`reference/memory.md § A borrowed pointer cannot escape`). A scoped thread
+may be handed it and start threads of its own on it; those are joined by the same `scope` call.
+
+| Member | Signature | Description |
+|---|---|---|
+| `spawn` | `spawn[R](*self, f: &sync Fn() -> R) -> ScopedThread[R]` | Starts `f` on a thread of its own, and answers the handle that waits for it and carries back what `f` answered. |
+
+### `ScopedThread`
+
+```sysl
+struct ScopedThread[R]
+    private job: &sync Job
+    private out: &sync Out[R]
+```
+
+A thread started by `Scope.spawn`, and the value its closure answers.
+
+Copying one copies the handle, and it may be handed to another scoped thread; joining any copy
+waits for the one thread. Joining **is** checked here, unlike `Thread.join`: a second join answers
+the same value without waiting again, and the scope does not join a thread that is already joined.
+
+| Member | Signature | Description |
+|---|---|---|
+| `join` | `join(self) -> R` | Waits for the thread to finish, and answers what its closure answered. |
+| `is_finished` | `is_finished(self) -> bool` | Whether the thread's closure has answered, without waiting for it. |
 
 ### `SleepLock`
 

@@ -1,0 +1,471 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// A closure whose body stores a captured address of its frame's storage into module storage is held to
+// the rule a direct store is (`keeps.sysl`): every closure literal is judged where it is written,
+// capture by capture, by what its body lets out of that field of its environment -- in a frame
+// (`captures_let_out`) and in a walk of what a body keeps (`captures_kept`) -- and again at each call
+// handed it, after what the call overwrites (`closures_handed`), so a call that runs it, a `&Fn`, a
+// `@scoped` member that runs it later and a relay through a parameter all reach it. The relay that
+// is no closure -- `&h` of a parameter handed to a callee that keeps what it reads through it -- is
+// the same cause (`lends_held`). `reference/memory.md § Where no body is in sight, the call borrows`
+// is the specification.
+//
+// Skipped cells, and why: `Scope.spawn` of `sysl.threads` is not on this line (the local `@scoped`
+// scope below is its shape); a closure passed through a raw function pointer cannot be, since a
+// closure is not a function pointer; a nested function passed as a value is refused on its own.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private cca_outcome(text: string) -> (string, int)
+    val root = make_temp_dir("sysl-cca").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (failure_text(why), -1)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> ("the program that was built could not be run", -1)
+        Ok(out) -> (out.text + out.err.unwrap_or(""), shell_status(out.status))
+end cca_outcome
+
+private cca_prints(text: string, want: string)
+    if xvr_no_library() then return
+
+    val out = cca_outcome(text)
+
+    assert_eq(out.0, want)
+    assert_eq(out.1, 0)
+end cca_prints
+
+private cca_refused(text: string, part: string)
+    if xvr_no_library() then return
+
+    val out = cca_outcome(text)
+
+    assert_eq(out.1, -1, out.0)
+    assert(out.0.index_of(part).is_some(), out.0)
+end cca_refused
+
+// Module storage, and a function that runs what it is handed.
+private cca_head() -> string = raw"""
+    var idle = 0
+    var kept: *int = &idle
+
+    run(f: () -> unit) = f()
+
+    """
+
+// A scope that queues each job and runs them when told, whose `spawn` promises '@scoped(f)'.
+private cca_scope() -> string = raw"""
+    import sysl.buf.{Buf, buf}
+
+    var idle = 0
+    var kept: *int = &idle
+
+    struct Scope
+        jobs: Buf[&sync Fn() -> unit]
+
+        @scoped(f)
+        spawn(*self, f: &sync Fn() -> unit)
+            self.jobs.push(f)
+
+        finish(*self)
+            for j in self.jobs do j()
+
+    """
+
+private cca_lets_out(field: string, how: string = "it is stored in 'kept'") -> string =
+    s"a closure lets its capture '$field' outlive the call ($how), and '$field' holds the address of a " +
+        "local of 'closure' — capture the value itself, or storage that lasts"
+
+// -- refused: a captured address of the frame kept past it ----------------------------------------
+
+@test("a closure handed to a call stores a captured address of a local in module storage")
+cca_captured_pointer_refused()
+    cca_refused(cca_head() + raw"""
+        closure() -> int
+            var n = 5
+            val p = &n
+            run(() -> kept = p)
+            0
+
+        main()
+            print(closure())
+        """, cca_lets_out("p"))
+
+@test("a closure that takes the address of a captured 'var' inside its body and keeps it")
+cca_address_taken_inside_refused()
+    cca_refused(cca_head() + raw"""
+        closure() -> int
+            var n = 5
+            run(() -> kept = &n)
+            n
+
+        main()
+            print(closure())
+        """, "a closure keeps its parameter 'self' (it is stored in 'kept'), and 'f' is the parameter 'f' " +
+        "of 'run', a copy in its frame")
+
+@test("a captured struct holding the address of a local, its field kept by the closure")
+cca_captured_struct_refused()
+    cca_refused(cca_head() + raw"""
+        struct H
+            p: *int
+
+        closure() -> int
+            var n = 5
+            val h = H(&n)
+            run(() -> kept = h.p)
+            0
+
+        main()
+            print(closure())
+        """, cca_lets_out("h"))
+
+@test("a nested function handing a closure over its own capture to a call that keeps it")
+cca_nested_function_refused()
+    cca_refused(cca_head() + raw"""
+        closure() -> int
+            var n = 5
+            val p = &n
+
+            go()
+                run(() -> kept = p)
+
+            go()
+            0
+
+        main()
+            print(closure())
+        """, "'go' lets what it reads through its parameter 'self' outlive the call (it is captured by a " +
+        "closure, which lets it out (it is stored in 'kept')), and what is read through 'go()")
+
+@test("a nested function storing its capture in module storage directly")
+cca_nested_function_direct_refused()
+    cca_refused(cca_head() + raw"""
+        closure() -> int
+            var n = 5
+            val p = &n
+
+            keep()
+                kept = p
+
+            keep()
+            0
+
+        main()
+            print(closure())
+        """, "'keep' lets what it reads through its parameter 'self' outlive the call (it is stored in " +
+        "'kept'), and what is read through 'keep()")
+
+@test("a closure pushing the captured address into a module buffer")
+cca_module_buffer_refused()
+    cca_refused(raw"""
+        import sysl.buf.{Buf, buf}
+
+        var later: Buf[*int] = buf()
+
+        run(f: () -> unit) = f()
+
+        closure() -> int
+            var n = 5
+            val p = &n
+            run(() -> later.push(p))
+            0
+
+        main()
+            print(closure())
+        """, cca_lets_out("p", "it is passed to 'push', which keeps it"))
+
+@test("a closure storing the captured address in a field of module storage")
+cca_module_field_refused()
+    cca_refused(raw"""
+        var idle = 0
+
+        struct Holder
+            p: *int
+
+        var holder = Holder(&idle)
+
+        run(f: () -> unit) = f()
+
+        closure() -> int
+            var n = 5
+            val p = &n
+            run(() -> holder.p = p)
+            0
+
+        main()
+            print(closure())
+        """, cca_lets_out("p", "it is stored in 'holder.p'"))
+
+@test("a closure kept in a local and handed to the call later")
+cca_stored_then_called_refused()
+    cca_refused(cca_head() + raw"""
+        closure() -> int
+            var n = 5
+            val p = &n
+            val f = () -> kept = p
+            n += 1
+            run(f)
+            0
+
+        main()
+            print(closure())
+        """, cca_lets_out("p"))
+
+// A call that runs the closure overwrites the very place its body lets the capture out to, which
+// must not read as taking back what the literal let out.
+@test("a closure in a local handed to the call that runs it, its body storing through a helper")
+cca_stored_then_called_through_helper_refused()
+    cca_refused(cca_head() + raw"""
+        set(x: *int) = kept = x
+
+        closure() -> int
+            var n = 5
+            val p = &n
+            val f = () -> set(p)
+            run(f)
+            0
+
+        main()
+            print(closure())
+        """, cca_lets_out("p", "it is passed to 'set', which keeps it"))
+
+@test("a parameter captured by a closure that keeps it is kept by the function making the closure")
+cca_parameter_relay_refused()
+    cca_refused(cca_head() + raw"""
+        relay(p: *int) = run(() -> kept = p)
+
+        direct() -> int
+            var n = 5
+            relay(&n)
+            0
+
+        main()
+            print(direct())
+        """, "'relay' keeps its parameter 'p' (it is captured by a closure, which lets it out (it is stored " +
+        "in 'kept')), and '&n' is the address of a local of 'direct'")
+
+@test("a closure behind a '&Fn' parameter stores its captured address")
+cca_boxed_parameter_refused()
+    cca_refused(raw"""
+        var idle = 0
+        var kept: *int = &idle
+
+        run(f: &Fn() -> unit) = f()
+
+        closure() -> int
+            var n = 5
+            val p = &n
+            run(() -> kept = p)
+            0
+
+        main()
+            print(closure())
+        """, cca_lets_out("p"))
+
+@test("a closure in a '&Fn' local, called in the frame that made it, stores its captured address")
+cca_boxed_local_refused()
+    cca_refused(raw"""
+        var idle = 0
+        var kept: *int = &idle
+
+        closure() -> int
+            var n = 5
+            val p = &n
+            val f: &Fn() -> unit = () -> kept = p
+            f()
+            0
+
+        main()
+            print(closure())
+        """, cca_lets_out("p"))
+
+@test("a closure a '@scoped' member runs later stores its captured address")
+cca_scoped_spawn_refused()
+    cca_refused(cca_scope() + raw"""
+        closure() -> int
+            var n = 5
+            val p = &n
+            var s = Scope(buf())
+
+            s.spawn(() -> kept = p)
+            s.finish()
+            0
+
+        main()
+            print(closure())
+        """, cca_lets_out("p"))
+
+// -- the same cause with no closure ---------------------------------------------------------------
+
+@test("a by-value parameter whose address is handed to a callee that keeps what it reads through it")
+cca_value_relay_refused()
+    cca_refused(raw"""
+        var idle = 0
+        var kept: *int = &idle
+
+        struct H
+            p: *int
+
+        keep_it(h: *H) = kept = h.p
+
+        relay(h: H) = keep_it(&h)
+
+        direct() -> int
+            var n = 5
+            relay(H(&n))
+            0
+
+        main()
+            print(direct())
+        """, "'relay' keeps its parameter 'h' (it is passed to 'keep_it', which lets what it reads through " +
+        "it out), and 'H(&n)' holds the address of a local of 'direct'")
+
+@test("a pointer parameter whose address is handed to a callee that keeps what it points at")
+cca_pointer_relay_refused()
+    cca_refused(raw"""
+        var idle = 0
+        var kept: *int = &idle
+
+        keep_pp(pp: **int) = kept = *pp
+
+        relay(p: *int) = keep_pp(&p)
+
+        direct() -> int
+            var n = 5
+            relay(&n)
+            0
+
+        main()
+            print(direct())
+        """, "'relay' keeps its parameter 'p' (it is passed to 'keep_pp', which lets what it reads through " +
+        "it out), and '&n' is the address of a local of 'direct'")
+
+// -- accepted: nothing of the frame is kept past it -----------------------------------------------
+
+@test("a captured address of module storage may be kept")
+cca_module_address_accepted()
+    cca_prints(cca_head() + raw"""
+        closure() -> int
+            val p = &idle
+            run(() -> kept = p)
+            *kept
+
+        main()
+            print(closure())
+        """, "0\n")
+
+@test("a captured heap address may be kept")
+cca_heap_address_accepted()
+    cca_prints(cca_head() + raw"""
+        extern "malloc" c_malloc(n: usize) -> *int
+
+        closure() -> int
+            val p = c_malloc(8)
+            *p = 4
+            run(() -> kept = p)
+            *kept
+
+        main()
+            print(closure())
+        """, "4\n")
+
+// Each capture is asked on its own: the heap address kept says nothing of the frame address beside it.
+@test("a closure keeping one capture, a heap address, beside another holding a local's address")
+cca_one_capture_kept_accepted()
+    cca_prints(cca_head() + raw"""
+        extern "malloc" c_malloc(n: usize) -> *int
+
+        closure() -> int
+            var n = 5
+            val p = &n
+            val h = c_malloc(8)
+
+            *h = 3
+            run(() ->
+                kept = h
+                *p = *h)
+            n + *kept
+
+        main()
+            print(closure())
+        """, "6\n")
+
+@test("a closure writing through a captured address without keeping it")
+cca_write_through_accepted()
+    cca_prints(cca_head() + raw"""
+        closure() -> int
+            var n = 5
+            val p = &n
+            run(() -> *p = 7)
+            n
+
+        main()
+            print(closure())
+        """, "7\n")
+
+@test("a closure a '@scoped' member runs writes through a captured address without keeping it")
+cca_scoped_write_through_accepted()
+    cca_prints(cca_scope() + raw"""
+        closure() -> int
+            var n = 5
+            val p = &n
+            var s = Scope(buf())
+
+            s.spawn(() -> *p = 9)
+            s.finish()
+            n
+
+        main()
+            print(closure())
+        """, "9\n")
+
+@test("a captured address kept by a closure and overwritten before every way out")
+cca_cleared_accepted()
+    cca_prints(cca_head() + raw"""
+        closure() -> int
+            var n = 5
+            val p = &n
+            run(() -> kept = p)
+            val seen = *kept
+            kept = &idle
+            seen
+
+        main()
+            print(closure())
+        """, "5\n")
+
+@test("a closure a '@scoped' member runs keeps a captured address the frame overwrites before it returns")
+cca_scoped_cleared_accepted()
+    cca_prints(cca_scope() + raw"""
+        closure() -> int
+            var n = 5
+            val p = &n
+            var s = Scope(buf())
+
+            s.spawn(() -> kept = p)
+            s.finish()
+            val seen = *kept
+            kept = &idle
+            seen
+
+        main()
+            print(closure())
+        """, "5\n")

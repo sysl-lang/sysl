@@ -1,0 +1,132 @@
+module sysl.threads
+@requires(os)
+
+import sysl.buf.{Buf, buf}
+
+/** The handle `scope` lends its body, through which the body starts threads that may borrow the
+ * caller's frame.
+ *
+ * **Every thread started through it is joined before `scope` returns**, whichever way the body
+ * ends: by running off its end or by an early `return`, which leaves the body's closure and lands
+ * back in `scope` like any other answer. A trap or a `panic` ends the whole program -- sysl does not
+ * unwind -- so no thread outlives the frame it borrows on that path either.
+ *
+ * The body is lent the scope as a `*Scope` for the call, so the compiler refuses storing it anywhere
+ * that outlives the body (`reference/memory.md § A borrowed pointer cannot escape`). A scoped thread
+ * may be handed it and start threads of its own on it; those are joined by the same `scope` call.
+ */
+struct Scope
+
+    // One record per thread started on this scope, in the order they were started. Behind a lock
+    // because a scoped thread may start threads on the scope too.
+    private jobs: Mutex[Buf[&sync Job]]
+
+    /** Starts `f` on a thread of its own, and answers the handle that waits for it and carries back
+     * what `f` answered.
+     *
+     * **`@scoped(f)` is the promise this member keeps**: `f` runs in another domain and is finished
+     * before the `scope` call that lent `self` returns. So a closure written at `f` may capture what a
+     * `&sync Fn` may, and a view as well -- `[]T`, or a struct or tuple of views and scalars -- which
+     * it borrows from the caller's frame rather than sharing (`reference/attributes.md § @scoped(f)`).
+     * A `string`, a `&T` or a `Buf` is refused, as for any `&sync Fn`.
+     *
+     * Where the system will not start another thread the program stops with a message, since a
+     * scope's children are the work the caller is waiting on and running one of them inline could
+     * leave its siblings waiting at a barrier for ever.
+     */
+    @scoped(f)
+    spawn[R](*self, f: &sync Fn() -> R) -> ScopedThread[R]
+        val out: &sync Out[R] = Out(Mutex.new(None))
+        val job: &sync Job = Job(() -> out.value.with((v) -> *v = Some(f())), Mutex.new(Joint(None, false)))
+        val started = spawn(&run_job, &*job)
+
+        if started.is_none() then panic("sysl.threads: the system would not start another thread")
+
+        job.joint.with((j) -> j.thread = started)
+        self.jobs.with((b) -> b.push(job))
+        ScopedThread(job, out)
+    end spawn
+
+    // Joins every thread not joined yet, in the order they were started -- and any a scoped thread
+    // started while this was waiting, since the list is read again after every join.
+    private join_all(*self)
+        var i: usize = 0
+
+        loop
+            val next = self.jobs.with((b) -> if i < b.len() then Some(b.at(i)) else None)
+
+            next match
+                Some(j) -> j.join()
+                None -> return
+
+            i += 1
+    end join_all
+
+end Scope
+
+/** A thread started by `Scope.spawn`, and the value its closure answers.
+ *
+ * Copying one copies the handle, and it may be handed to another scoped thread; joining any copy
+ * waits for the one thread. Joining **is** checked here, unlike `Thread.join`: a second join answers
+ * the same value without waiting again, and the scope does not join a thread that is already joined.
+ */
+struct ScopedThread[R]
+
+    private job: &sync Job
+    private out: &sync Out[R]
+
+    /** Waits for the thread to finish, and answers what its closure answered. */
+    @blocks
+    join(self) -> R
+        self.job.join()
+        self.out.value.with((v) -> v.unwrap())
+
+    /** Whether the thread's closure has answered, without waiting for it. */
+    is_finished(self) -> bool = self.out.value.with((v) -> v.is_some())
+
+end ScopedThread
+
+/** Runs `body` with a `Scope`, joins every thread started on it, and answers what `body` answered.
+ *
+ * The threads may borrow anything the caller can see -- a view of its array, a struct of views --
+ * because none of them outlives this call:
+ *
+ * ```
+ * scope((s) ->
+ *     s.spawn(() -> for i in 0..<half do v[i] = 1)
+ *     s.spawn(() -> for i in half..<v.len do v[i] = 2))
+ * ```
+ */
+@blocks
+scope[R](body: *Scope -> R) -> R
+    var s = Scope(Mutex.new(buf()))
+    val r = body(&s)
+
+    s.join_all()
+    r
+end scope
+
+// One scoped thread: what it runs, which is all the thread itself reads, and the system's handle for
+// it with whether it has been joined, behind a lock so that two joiners -- the scope and a handle, or
+// two handles on two threads -- join it once between them.
+private struct Job
+    run: &sync Fn() -> unit
+    joint: Mutex[Joint]
+
+    @blocks
+    join(*self)
+        self.joint.with((j) ->
+            if !j.joined
+                j.thread.unwrap().join()
+                j.joined = true)
+
+private struct Joint
+    thread: Option[Thread]
+    joined: bool
+
+private run_job(j: *Job) -> unit = j.run()
+
+// Where a thread's closure leaves its answer for `ScopedThread.join`, shared by the handle and the
+// closure the thread runs.
+private struct Out[R]
+    value: Mutex[Option[R]]

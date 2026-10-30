@@ -213,23 +213,30 @@ vts_the_slot_is_the_body()
     assert(!ir.contains("@vt.adapt.ref.Ball.wide("), ir)
 
 // `Ball` is three words, so a method that only reads it is lent its receiver by address
-// (`read_by_address`): the table's body copies the receiver out of the box into a slot of its own --
-// the snapshot -- and lends the method that.
+// (`read_by_address`). `seen` calls `bump` through a table, which writes a `Ball`, so the table's body
+// copies the receiver out of the box into a slot of its own -- the snapshot -- and lends the method
+// that. `hit` can change no `Ball`, so it is lent the box's payload as it stands.
 @test("the body steps over the box header and snapshots its receiver once, ahead of everything else")
 vts_the_body_loads_the_receiver_at_entry()
     val ir = vts_ir(vts_ball)
 
     if ir == "skipped" then return
 
-    val body = cgz_body(ir, "Ball.hit.self")
+    val body = cgz_body(ir, "Ball.seen.self")
 
-    assert(body.contains("(ptr %self.object, double %lo.param, double %hi.param)"), body)
     assert(body.starts_with("define internal "), body)
     assert(body.contains("entry:\n  %self.payload = getelementptr %arc.Ball, ptr %self.object, i32 0, i32 3\n" +
                          "  %self.lent = alloca %struct.Ball\n" +
                          "  %self.value = load %struct.Ball, ptr %self.payload\n" +
                          "  store %struct.Ball %self.value, ptr %self.lent\n"), body)
-    assert(body.contains("@Ball.hit.owned(ptr %self.lent, double %lo.param, double %hi.param)"), body)
+    assert(body.contains("@Ball.seen.owned(ptr %self.lent, "), body)
+
+    val reader = cgz_body(ir, "Ball.hit.self")
+
+    assert(reader.contains("(ptr %self.object, double %lo.param, double %hi.param)"), reader)
+    assert(reader.contains("entry:\n  %self.payload = getelementptr %arc.Ball, ptr %self.object, i32 0, i32 3\n"), reader)
+    assert(!reader.contains("%self.lent"), reader)
+    assert(reader.contains("@Ball.hit.owned(ptr %self.payload, double %lo.param, double %hi.param)"), reader)
 
 // `count` calls itself last, so it is not lent and keeps the register convention.
 @test("the method keeps its symbol and signature, and calls the body with the receiver stored in a box's shape")
@@ -265,7 +272,7 @@ vts_a_large_result_goes_through_the_out_pointer()
                        "dead_on_unwind writable %sret.out, " +
                        "ptr %self.object)"), ir)
     assert(cgz_body(ir, "Ball.wide.self").contains("call void @Ball.wide.owned(ptr noalias sret([40 x i32]) align 4 " +
-                                                    "dead_on_unwind writable %sret.out, ptr %self.lent)"), ir)
+                                                    "dead_on_unwind writable %sret.out, ptr %self.payload)"), ir)
 
 @test("a zero-sized parameter is in neither half, as it is in no slot")
 vts_a_zero_sized_parameter_is_dropped()

@@ -162,6 +162,8 @@ associated_on(cx: &Analyzer, span: Span, ty: Type, name: string, args: Buf[Expr]
 
     // A bound whose member the compiler supplies for this type is answered by the compiler, whatever
     // other trait gave the type a member of the name.
+    if refuse_bound_clash(cx, ty, found.0, name, span, via) then return Some(bad_expr(span))
+
     val by_bound = bound_supplied_by_compiler(cx, ty, found.0, name, via)
 
     // **A trait's member may be filed only under a suffix** -- a block whose trait shares some other
@@ -1138,6 +1140,8 @@ private call_declared(cx: &Analyzer, span: Span, receiver: TExpr, rty: Type, nam
 
     val declaring = core_declaring(name)
     val provided = declaring.is_some() && core_builtin(declaring.unwrap(), rty) && deriving.is_none()
+    if refuse_bound_clash(cx, rty, found.0, name, span, via) then return bad_expr(span)
+
     val chosen = chosen_member(cx, rty, found.0, name, span, args, through, provided)
 
     if chosen.is_none() then return bad_expr(span)
@@ -2365,6 +2369,52 @@ bound_supplied_by_compiler(cx: &Analyzer, rty: Type, base: string, name: string,
 
     true
 end bound_supplied_by_compiler
+
+// **Two bounds that both declare a member are ambiguous whichever of them the compiler supplies.**
+// `[T: Zero + Nil]` with a user trait `Nil` that also declares `zero()` promises two `zero`s at
+// `int`, one of them the compiler's, which has no block and so is no rival among the filed
+// candidates. The refusal is the one two written traits get, naming the compiler's trait first.
+// True where it was refused.
+private refuse_bound_clash(cx: &Analyzer, rty: Type, base: string, name: string, span: Span,
+                           via: Buf[string]) -> bool
+    if via.is_empty() then return false
+
+    val spelling = core_constant(name) match
+        Some(row) -> Some(row.0)
+        None -> core_measure_trait(name)
+
+    if spelling.is_none() || !core_builtin(spelling.unwrap(), rty) then return false
+
+    val key = catalog_key(cx.an, spelling.unwrap())
+
+    if key.is_none() || !holds_string(via, key.unwrap()) then return false
+
+    var filed: Buf[string] = buf()
+
+    if has_member_at(cx.an, base, name) then filed.push(name)
+
+    val alts = cx.an.tables.members.alts.get(member_key_of(base, name))
+
+    if alts.is_some()
+        for item in alts.unwrap()
+            filed.push(item)
+
+    var traits: Buf[string] = buf()
+
+    traits.push(module_show(key.unwrap()))
+
+    for item in filed
+        val tr = cx.an.tables.members.from_trait.get(member_key_of(base, item))
+
+        if tr.is_some() && holds_string(via, tr.unwrap()) && !holds_string(traits, module_show(tr.unwrap())) then
+            traits.push(module_show(tr.unwrap()))
+
+    if traits.len() < 2 then return false
+
+    cx.fault(span, s"'$name' on ${type_show(rty)} comes from ${conjoin(traits)}, and each is in " +
+             "scope here — nothing in the call says which was meant")
+    true
+end refuse_bound_clash
 
 // No bound at all, named so that a default argument can say which kind of run of names it means.
 no_bound_traits() -> Buf[string] = buf()

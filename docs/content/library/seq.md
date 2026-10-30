@@ -46,7 +46,7 @@ trait Sequence[T]
     each(self, f: T -> unit)
     map[U](self, f: T -> U) -> []U
     filter(self, p: T -> bool) -> []T
-    flat_map[U](self, f: T -> []U) -> []U
+    flat_map[U](self, f: T -> []const U) -> []U
 ```
 
 **`map` and `flat_map` declare a type parameter of their own**, which is a thing a trait's member may
