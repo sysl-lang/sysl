@@ -5,6 +5,8 @@ module sysl.threads
 import sysl.raw.ptr_cast
 import sysl.slices.as_mut_ptr
 import sysl.sync.*
+import sysl.math.min
+import sysl.time.{millis, monotonic, sleep}
 
 // What a channel promises, checked where it can be checked deterministically — which is most of it,
 // since the ring and the closing rule are single-threaded facts and only the blocking is not.
@@ -592,3 +594,113 @@ barrier_of_one() -> unit
 
     assert(led)
     assert(barrier(0).wait())
+
+// -- the barrier's two ways of waiting ---------------------------------------------------------------
+//
+// An early arrival spins on the phase word for a while and then sleeps on it, so each case below
+// steers the waits down one path or the other: threads that keep pace stay in the spin, a thread held
+// back by a sleep sends the others to the futex, and more threads than cores mixes the two. A lost
+// wake shows as a test that never ends; a phase let through early, or led twice, shows in the counts.
+
+// `n` threads meet `rounds` times twice. The leader of each round's second meeting checks that the
+// first meeting had exactly one leader, and the leader of each first meeting checks the same of the
+// last second meeting, so every phase's leader count is checked while the run is still in progress.
+// `late` is how many milliseconds thread `round % n` sleeps before its first meeting, zero for none.
+bsw_meet(n: int, rounds: int, late: int) -> int
+    val b = barrier(usize(n))
+    var slots = [0; 256]
+    val v = slots[..]
+    val first: &sync Atomic[int] = Atomic(0)
+    val second: &sync Atomic[int] = Atomic(0)
+    val wrong: &sync Atomic[int] = Atomic(0)
+
+    scope((s) ->
+        for me in 0..<n
+            s.spawn(() ->
+                for r in 0..<rounds
+                    v[me] = r + 1
+
+                    if late > 0 && r % n == me then sleep(millis(late))
+
+                    if b.wait()
+                        if second.load() != r then wrong.add(1)
+                        first.add(1)
+
+                    for j in 0..<n
+                        if v[j] != r + 1 then wrong.add(1)
+
+                    if b.wait()
+                        if first.load() != r + 1 then wrong.add(1)
+                        second.add(1)))
+
+    if first.load() != rounds || second.load() != rounds then wrong.add(1)
+    wrong.load()
+end bsw_meet
+
+@test("bsw_ ten thousand phases among 2 to 8 threads, one leader each and none let through early")
+bsw_many_phases() -> unit
+    for n in 2..<9
+        assert_eq(bsw_meet(n, 5000, 0), 0)
+
+@test("bsw_ twice as many threads as cores still meet, one leader each phase")
+bsw_oversubscribed() -> unit
+    // Capped at the slots `bsw_meet` has, which only a machine of more than 128 cores reaches.
+    assert_eq(bsw_meet(min(int(2 * cpu_count()), 256), 200, 0), 0)
+
+@test("bsw_ a thread arriving long after the others wakes them from their sleep, and it leads")
+bsw_late_arrival() -> unit
+    val b = barrier(3)
+    val late_led: &sync Atomic[int] = Atomic(0)
+    val early_led: &sync Atomic[int] = Atomic(0)
+    val t0 = monotonic()
+
+    scope((s) ->
+        for me in 0..<3
+            s.spawn(() ->
+                if me == 2
+                    sleep(millis(50))
+                    if b.wait() then late_led.add(1)
+                else if b.wait()
+                    early_led.add(1)))
+
+    assert_eq(late_led.load(), 1)
+    assert_eq(early_led.load(), 0)
+    assert(monotonic() - t0 >= millis(50))
+
+@test("bsw_ a late thread each round, the leader meeting again at once while the others are asleep")
+bsw_late_each_round() -> unit
+    // Every first meeting has a sleeper in it, so the others are on the futex when it ends; the
+    // second meeting follows with nothing between, so the leader arrives at the next phase before
+    // the sleepers it woke have left the last.
+    assert_eq(bsw_meet(3, 12, 5), 0)
+    assert_eq(bsw_meet(2, 12, 5), 0)
+
+@test("bsw_ reused at once: the leader of one phase arrives first at the next")
+bsw_reuse_after_release() -> unit
+    val b = barrier(2)
+    val led: &sync Atomic[int] = Atomic(0)
+
+    scope((s) ->
+        s.spawn(() ->
+            for _ in 0..<1000
+                if b.wait() then led.add(1))
+
+        for i in 0..<1000
+            if i % 100 == 0 then sleep(millis(2))
+            if b.wait() then led.add(1))
+
+    assert_eq(led.load(), 1000)
+
+@test("bsw_ a barrier of one leads every time without waiting, on any number of threads at once")
+bsw_barrier_of_one() -> unit
+    val b = barrier(1)
+    val led: &sync Atomic[int] = Atomic(0)
+
+    scope((s) ->
+        for _ in 0..<4
+            s.spawn(() ->
+                for _ in 0..<10000
+                    if b.wait() then led.add(1)))
+
+    assert_eq(led.load(), 40000)
+    assert(barrier(0).wait() && barrier(0).wait())

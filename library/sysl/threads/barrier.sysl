@@ -1,14 +1,22 @@
 module sysl.threads
 @requires(os)
 
-/** A meeting point for a fixed number of threads: each `wait` sleeps until that many have arrived,
- * then all of them go on together.
+import sysl.sync.*
+import sysl.threads.sys as tsys
+
+/** A meeting point for a fixed number of threads: each `wait` holds its caller until that many have
+ * arrived, then all of them go on together.
  *
  * It can be met again at once -- the threads that leave one phase may arrive at the next before the
- * slowest has woken from the last -- because a wait sleeps on the phase it arrived in, not on the
- * count. **Exactly one of each phase's waiters is told it is the leader**: the one whose arrival
- * completed the phase, and the one a program has do the work between phases that only one thread
- * should do.
+ * slowest has woken from the last -- because a wait watches the phase it arrived in, not the count.
+ * **Exactly one of each phase's waiters is told it is the leader**: the one whose arrival completed
+ * the phase, and the one a program has do the work between phases that only one thread should do.
+ *
+ * **An early arrival spins first and sleeps only after that.** It watches the phase word for about
+ * as long as going to sleep and being woken would have cost -- where the others are close behind,
+ * which is what a barrier between rounds of evenly divided work usually sees, they arrive while it
+ * is still watching and nobody makes a system call -- and then sleeps on that same word, so a long
+ * wait, or more threads than cores, does not burn a core waiting.
  *
  * It is shared as a `&sync Barrier`, which is what `barrier` answers, so a scoped thread captures it
  * as it would any other atomically counted object.
@@ -18,43 +26,70 @@ struct Barrier
     // How many threads each phase waits for.
     private n: usize
 
-    // How many have arrived in the current phase, and which phase it is.
-    private gate: Mutex[Gate]
+    // How many have arrived in the current phase.
+    private arrived: Atomic[usize]
 
-    // Where the early arrivals sleep until the phase changes.
-    private turn: Condvar
+    // Which phase it is, bumped by each phase's leader: the word an early arrival spins on and then
+    // sleeps on.
+    private phase: Atomic[u32]
 
-    /** Sleeps until `n` threads, this one included, have called `wait` in this phase, and answers
-     * whether this caller is the phase's leader: `true` for exactly one of them.
+    // How many early arrivals have stopped spinning and may be asleep, so that the leader makes the
+    // wake call only where somebody might need it.
+    private sleepers: Atomic[u32]
+
+    /** Holds the caller until `n` threads, this one included, have called `wait` in this phase, and
+     * answers whether this caller is the phase's leader: `true` for exactly one of them.
      */
     @blocks
     wait(*self) -> bool
-        val g = self.gate.lock_raw()
-        val phase = g.phase
+        // The phase cannot move before this arrival is counted, so this is the phase it arrives in.
+        val p = self.phase.load(Acquire)
 
-        g.arrived += 1
+        if self.arrived.add(1, AcqRel) + 1 < self.n
+            var spins = 0
 
-        if g.arrived < self.n
-            while g.phase == phase
-                self.turn.wait(&self.gate)
+            while self.phase.load(Acquire) == p
+                if spins == SPINS
+                    self.park(p)
+                    break
 
-            self.gate.unlock_raw()
+                spin_hint()
+                spins += 1
+
             return false
+        end if
 
-        g.arrived = 0
-        g.phase = g.phase +% 1
-        self.gate.unlock_raw()
-        self.turn.notify_all()
+        // Reset before the bump: an arrival at the next phase is one that saw the bump.
+        self.arrived.store(0, Relaxed)
+        self.phase.store(p +% 1)
+
+        // Both sides of this are sequentially consistent: a waiter counts itself a sleeper before
+        // it compares the phase in `futex_wait`, and the leader bumps the phase before it reads the
+        // count, so either the leader sees the sleeper or the sleeper sees the new phase.
+        if self.sleepers.load() != 0 then tsys.futex_wake(&self.phase.v, tsys.WAKE_ALL)
         true
     end wait
+
+    // Sleeps until the phase is no longer `p`.
+    @blocks
+    private park(*self, p: u32)
+        self.sleepers.add(1)
+
+        while self.phase.load(Acquire) == p
+            tsys.futex_wait(&self.phase.v, p, -1)
+
+        self.sleepers.sub(1)
+    end park
 
 end Barrier
 
 /** A barrier that waits for `n` threads in each phase. A barrier of one -- or of none -- never waits,
  * and every caller of its `wait` is the leader.
  */
-barrier(n: usize) -> &sync Barrier = Barrier(n, Mutex.new(Gate(0, 0)), Condvar.new())
+barrier(n: usize) -> &sync Barrier = Barrier(n, Atomic(0), Atomic(0), Atomic(0))
 
-private struct Gate
-    arrived: usize
-    phase: u64
+// How many rounds an early arrival watches the phase before it sleeps. A round is a quarter of a
+// nanosecond on an Apple M5 while the word is unchanged, so this is about 8 µs: what a sleep and a
+// wake cost there, from about 1.3 µs for one sleeper to about 12 µs for five woken at once. Spinning
+// for that long and then sleeping costs at most twice what sleeping at once would have.
+private const SPINS: int = 32000
