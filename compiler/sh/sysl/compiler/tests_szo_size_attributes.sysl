@@ -1,0 +1,181 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_temp_dir, read_text, remove_dir_all, write_text, exists}
+import sysl.process.capture
+import sysl.text.{join, replace_all, split}
+
+// `-Os` and `-Oz` mark every emitted `define` `optsize` (and `-Oz` also `minsize`), as clang does for
+// the C it compiles at those levels. LLVM's unroller and inliner read the attributes off the
+// function, never the `-O` level, so IR without them is unrolled as at `-O2`: a 32-round restoring
+// division came out at 143 Thumb-1 instructions where clang's `-Oz` on the same C gives 23.
+
+private szo_main() -> string = raw"""
+@export("div")
+div(r0: u32, den: u32) -> u32
+    var r = r0
+    var q: u32 = 0
+    for k in 0..<32
+        q <<= 1
+        if r >= den
+            r -= den
+            q |= 1
+        r <<= 1
+    q | (if r != 0 then 1 else 0)
+"""
+
+private szo_root(main: string) -> string
+    val root = replace_all(make_temp_dir("sysl-szo").unwrap(), "//", "/")
+
+    write_text(s"$root/sysl.hocon", "package { name = \"szo\" }\n").unwrap()
+    write_text(s"$root/main.sysl", main).unwrap()
+    root
+end szo_root
+
+private szo_attrs(level: string) -> string =
+    join(function_attributes(target_named("thumbv6m-freestanding").unwrap(), buf(), false, level).view(), " ")
+
+// The attribute group clang is handed for `level`.
+@test("the attribute group carries optsize at -Os, optsize minsize at -Oz, and neither elsewhere")
+szo_group()
+    assert_eq(szo_attrs("s"), "nounwind optsize \"no-builtins\"")
+    assert_eq(szo_attrs("z"), "nounwind optsize minsize \"no-builtins\"")
+    assert_eq(szo_attrs("0"), "nounwind \"no-builtins\"")
+    assert_eq(szo_attrs("2"), "nounwind \"no-builtins\"")
+    assert_eq(szo_attrs("3"), "nounwind \"no-builtins\"")
+    assert_eq(szo_attrs("fast"), "nounwind \"no-builtins\"")
+    assert_eq(szo_attrs(""), "nounwind \"no-builtins\"")
+end szo_group
+
+@test("a hosted target keeps its own attributes beside the size ones")
+szo_hosted()
+    val t = target_named("x86_64-linux").unwrap()
+    val z = join(function_attributes(t, buf(), false, "z").view(), " ")
+    val plain = join(function_attributes(t, buf(), false, "2").view(), " ")
+
+    assert(z.starts_with("nounwind optsize minsize"), z)
+    assert_eq(z, "nounwind optsize minsize" + plain["nounwind".len..<plain.len])
+end szo_hosted
+
+@test("for_clang and for_clang_unit mark every define at the size levels and keep #99 one group")
+szo_for_clang()
+    val t = target_named("thumbv6m-freestanding").unwrap()
+    val ir = "define i32 @a() {\n  ret i32 0\n}\n\ndefine i32 @b() {\n  ret i32 1\n}\n"
+
+    for text in [for_clang(ir, t, "s"), for_clang_unit(ir, t, false, "s"), for_clang(ir, t, "z"), for_clang_unit(ir, t, false, "z")]
+        assert_eq(split(text, "attributes #99").len, 2, text)
+        assert_eq(split(text, " #99 {").len, 3, text)
+        assert(!text.contains("optnone"), text)
+        assert(text.contains("optsize"), text)
+
+    assert(for_clang(ir, t, "s").contains("attributes #99 = { nounwind optsize \"no-builtins\" }"))
+    assert(for_clang(ir, t, "z").contains("attributes #99 = { nounwind optsize minsize \"no-builtins\" }"))
+    assert(!for_clang(ir, t, "2").contains("optsize"))
+    assert(!for_clang(ir, t).contains("optsize"))
+end szo_for_clang
+
+// The IR `emit-llvm` prints is the text clang is handed, so it shows the level's attributes.
+@test("emit-llvm shows the size attributes at -Os and -Oz, and none at -O0, -O2 or the default")
+szo_emit_llvm()
+    if !clx_ready() then return
+
+    val root = szo_root(szo_main())
+
+    for case in [("-O0", false, false), ("-O2", false, false), ("-Os", true, false), ("-Oz", true, true)]
+        val (code, out, err) = clx_ran(["sysl", "emit-llvm", s"$root/main.sysl", case.0, "--target", "thumbv6m-freestanding"])
+
+        assert_eq(code, Fine, err)
+        assert_eq(out.contains("optsize"), case.1, s"${case.0}\n$out")
+        assert_eq(out.contains("minsize"), case.2, s"${case.0}\n$out")
+
+    val (code, out, err) = clx_ran(["sysl", "emit-llvm", s"$root/main.sysl", "--target", "thumbv6m-freestanding"])
+
+    assert_eq(code, Fine, err)
+    assert(!out.contains("optsize"), out)
+    remove_dir_all(root).unwrap_or(())
+end szo_emit_llvm
+
+private szo_objdump() -> Option[string]
+    for tool in ["/opt/homebrew/bin/arm-none-eabi-objdump", "/usr/local/bin/arm-none-eabi-objdump"]
+        if exists(tool) then return Some(tool)
+
+    None
+end szo_objdump
+
+// How many instructions the disassembly of `symbol` (the export and the definition it calls) holds.
+private szo_instructions(level: string) -> usize
+    val tool = szo_objdump()
+
+    assert(tool.is_some(), "this test reads a board's code and there is no arm-none-eabi-objdump here")
+
+    val root = szo_root(szo_main())
+    val target = "thumbv6m-freestanding"
+
+    write_text(s"$root/sysl.hocon", s"package { name = \"szo\" }\ntargets {\n  default = \"$target\"\n" +
+               s"  $target { capabilities { os = false, posix = false } }\n}\n").unwrap()
+
+    val (code, out, err) = clx_ran(["sysl", "build-c", root, level, "--target", target, "-o", s"$root/app.a"])
+
+    assert_eq(code, Fine, out + err)
+
+    val dis = capture(tool.unwrap(), ["-d", s"$root/app.a"], "", [], true) match
+        Ok(o) -> o.text
+        Err(_) -> ""
+
+    remove_dir_all(root).unwrap_or(())
+
+    var n: usize = 0
+    var inside = false
+
+    for line in split(dis, "\n")
+        if line.contains(">:") then inside = line.contains("<div$$sysl>:") || line.contains("<div>:")
+        else if inside && line.contains(":\t") then n += 1
+
+    n
+end szo_instructions
+
+// clang's `-Oz` on the same C gives 23 instructions; sysl gave 143 (146 with the exported thunk) with
+// the loop unrolled, and now gives 26 at `-Oz` and 42 at `-Os`. `-O2` unrolls it (about 400).
+@test("the restoring-division loop is kept at -Os and -Oz on thumbv6m and unrolled at -O2")
+szo_loop_kept()
+    if !clx_ready() then return
+
+    val oz = szo_instructions("-Oz")
+    val os = szo_instructions("-Os")
+    val o2 = szo_instructions("-O2")
+
+    assert(oz > 0 && oz < 60, s"-Oz: $oz instructions")
+    assert(os > 0 && os < 60, s"-Os: $os instructions")
+    assert(o2 > oz, s"-O2 ($o2) should be larger than -Oz ($oz)")
+end szo_loop_kept
+
+// The test build goes through the same marking and the same level.
+@test("a test build at -Os runs")
+szo_test_build()
+    if !clx_ready() then return
+
+    val root = szo_root("add(a: int, b: int) -> int = a + b\n\n@test(\"adds\")\nszo_adds()\n    assert_eq(add(2, 3), 5)\n")
+    val (code, out, err) = clx_ran(["sysl", "test", root, "-Os"])
+
+    assert_eq(code, Fine, out + err)
+    assert(out.contains("1 passed") || out.contains("ok"), out)
+    remove_dir_all(root).unwrap_or(())
+end szo_test_build
+
+// The text `build-c --emit-llvm` writes is what the archive's objects are compiled from.
+@test("build-c writes the same attributes into its text at each level")
+szo_build_c_text()
+    if !clx_ready() then return
+
+    val root = szo_root(szo_main())
+
+    for case in [("-O2", false), ("-Os", true), ("-Oz", true)]
+        val (code, out, err) = clx_ran(["sysl", "build-c", root, case.0, "--target", "thumbv6m-freestanding", "-o",
+                                        s"$root/a.a", "--emit-llvm", s"$root/a.ll"])
+
+        assert_eq(code, Fine, out + err)
+        assert_eq(read_text(s"$root/a.ll").unwrap_or("").contains("optsize"), case.1, case.0)
+
+    remove_dir_all(root).unwrap_or(())
+end szo_build_c_text

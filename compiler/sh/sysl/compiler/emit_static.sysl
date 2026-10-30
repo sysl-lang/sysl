@@ -292,6 +292,12 @@ private constant_bits(v: Val) -> Option[BigInt] = v match
     VPackedAgg(parts) -> if parts.len() == 1 then constant_bits(parts.at(0).value) else None
     _ -> None
 
+// Whether a constant's type is an address: a pointer or a function pointer.
+private is_word_address(t: Type) -> bool = underlying(t) match
+    Ptr(_) -> true
+    CFn(_, _) -> true
+    _ -> false
+
 // A `val`'s initializer as a **constant expression**.
 constant_value(e: *Emit, t: TExpr) -> Val = *t.kind match
     TIntLit(v, _) -> VInt(v)
@@ -400,7 +406,22 @@ constant_value(e: *Emit, t: TExpr) -> Val = *t.kind match
 
     // A device address written as a number: `inttoptr` is a constant expression, so the pointer is in
     // the object file rather than stored into it by a prologue.
-    TCast(v, _) -> VIntToPtr(lty_of(e, v), constant_value(e, v))
+    //
+    // **An address read as an integer** is the other way round, `ptrtoint`, and a relocation as the
+    // address is. The integer is the machine's word (`analyze_body.sysl`'s `word_image`), so a
+    // conversion of one integer word to another is the same bits and writes nothing of its own.
+    TCast(v, to) -> underlying(to) match
+        Integer(_, _, _) ->
+            if is_word_address(texpr_type(v)) then VPtrToInt(lty(e, to), constant_value(e, v))
+            else constant_value(e, v)
+        _ -> VIntToPtr(lty_of(e, v), constant_value(e, v))
+
+    // An address moved by a constant: a relocation with an addend, LLVM's constant `add` or `sub`
+    // (`analyze_body.sysl`'s `offset_image`).
+    TBinary(op, l, r, ty) ->
+        val word = if op == "+" || op == "+%" then "add" else "sub"
+
+        VConstArith(word, lty(e, ty), constant_value(e, l), constant_value(e, r))
 
     // The address of module storage, or of a place inside it: a relocation the linker fills in,
     // written as a constant `getelementptr` over the global (`analyze_body.sysl`'s `place_image`).
