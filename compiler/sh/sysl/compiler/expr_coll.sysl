@@ -694,7 +694,20 @@ private subscripted_in_place(cx: &Analyzer, container: Expr) -> bool
     repr(ty) match
         Unknown -> false
         Abstract(_, bounds) -> bound_member(cx.an, repr(ty), bounds, "index_view").is_some()
-        _ -> indexes_through(cx.an, key.unwrap(), ty) && answers_own_view(cx, ty)
+        _ ->
+            if !indexes_through(cx.an, key.unwrap(), ty) then return false
+
+            if answers_own_view(cx, ty) then return true
+
+            // **A default whose view would own nothing it should is refused here**, where the view of
+            // part of an element is taken (`index_view_infer.sysl`).
+            val member = if cx.unchecked > 0 then "index_view_unchecked" else "index_view"
+            val why = ownerless_view_refusal(cx.an, view_member_name(cx, ty, member))
+
+            if why.is_some() then
+                cx.fault(container.span, s"a view of part of an element of '${type_show(ty)}' is " +
+                         s"taken through the default '$member', but ${why.unwrap()}")
+            false
 end subscripted_in_place
 
 // Whether a container answers `index_view` itself rather than inheriting the trait's default. The
@@ -702,13 +715,19 @@ end subscripted_in_place
 // through `index_place` exactly as before -- the same code, and the same receiver: the default takes
 // `*self` where the container's own `index_place` may take `self`.
 private answers_own_view(cx: &Analyzer, ty: Type) -> bool
-    val key = member_key_of(member_key(cx.an, ty, "index_view").0, "index_view")
-    val name = cx.an.tables.members.generic.get(key) match
-        Some(fd) -> fd.name
-        None -> cx.an.tables.members.funcs.get(key).unwrap_or("")
+    val name = view_member_name(cx, ty, "index_view")
 
     name != "" && !cx.an.tables.members.default_origin.has(name)
 end answers_own_view
+
+// The name a container's view member was lowered under, or empty where it has none.
+view_member_name(cx: &Analyzer, ty: Type, member: string) -> string
+    val key = member_key_of(member_key(cx.an, ty, member).0, member)
+
+    cx.an.tables.members.generic.get(key) match
+        Some(fd) -> fd.name
+        None -> cx.an.tables.members.funcs.get(key).unwrap_or("")
+end view_member_name
 
 // Part of a string is a string, not a `[]u8` -- the bytes between two character boundaries are
 // still well-formed UTF-8, which is what the check at those boundaries is for.

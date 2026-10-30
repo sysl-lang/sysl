@@ -442,6 +442,14 @@ hoist_impl(a: &Analysis, im: Impl) -> Impl
                                                       resolve_bound(a, tscope, b.span, b, assoc_subst),
                                                       supplied.unwrap(), bind.span, scope, ad.name))
 
+    // **An `IndexPlace` block whose `index_place` forwards to a field that answers views has its
+    // `index_view` written for it**, as the same forwarding (`index_view_infer.sysl`), so a view of
+    // part of an element keeps the field's storage alive without the block having to say so.
+    val index_place = catalog_key(a, "IndexPlace")
+    val places = index_place.is_some() && index_place.unwrap() == key.unwrap()
+
+    if places then block.methods = infer_index_views(a, scope, subject, block)
+
     // A default the block left out is hoisted for this type exactly as a written method is, from the
     // body the trait supplied -- so everything downstream finds an ordinary member and needs to know
     // nothing about where it came from.
@@ -460,6 +468,15 @@ hoist_impl(a: &Analysis, im: Impl) -> Impl
         a.tables.members.default_origin.put(
             s"${home.symbol}.${item.name}${home.alt}",
             s"${key.unwrap()}.${item.name}")
+
+    // An `index_view` default kept where the container's elements are not where its view, which owns
+    // nothing, is right: a view of part of an element taken through it is refused at the use.
+    if places && bound.args.len() == 2
+        for item in inherited
+            if item.name == "index_view" || item.name == "index_view_unchecked" then
+                note_ownerless_views(a, scope, subject, block, bound.args.at(0), bound.args.at(1),
+                                     s"${home.symbol}.${item.name}${home.alt}", item.name)
+    end if
 
     // A member a `derives` clause wrote from a `derive` body is an inherited default with three
     // differences (`derive_members.sysl`), recorded under the name the copy lowers to.

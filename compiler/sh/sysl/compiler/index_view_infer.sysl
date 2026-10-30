@@ -1,0 +1,326 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+
+// **Where a container's elements live decides what a view of part of one may own**, and the
+// container's `index_place` is what says where they live. A view of part of an element (`c[i][..]`)
+// is taken through `index_view` (`expr_coll.sysl`'s `viewed_through_storage`), whose trait default
+// answers a view that owns nothing. That is right for elements in the container's own bytes or in
+// static storage, and is the `*T` tier for elements reached through a raw pointer; anywhere else the
+// view outlives the storage once the container grows or is dropped. So an `impl IndexPlace` block
+// that leaves `index_view` out is read here, against the last expression of its `index_place`:
+//
+// - **It forwards to a field that answers views of its own**, and `index_view` is written for it as
+//   the same forwarding, so the view carries the field's owner. The shapes, with `f` a field of
+//   `self` and `e` any index expression (`i`, `i + self.start`), the statements before the last one
+//   kept as written:
+//     `self.f.index_place(e)`            -> `self.f.index_view(e)`
+//     `self.f.index_place_unchecked(e)`  -> `self.f.index_view_unchecked(e)`
+//     `&self.f[e]`, `f` a container      -> `self.f.index_view(e)`
+//     `&self.f[e]`, `f` a view `[]T`      -> `self.f[e..][0..<1]`
+//   `index_view_unchecked` is written the same way from `index_place_unchecked` where the block wrote
+//   one, and from `index_place` where it did not, reaching the field's `index_view_unchecked`.
+// - **It reaches its element where the default's view is right**: a place through `*self` whose every
+//   step is a field or a fixed array's subscript (the container's own bytes), a module variable whose
+//   written type is a fixed array (static storage), or any place that passes through a raw pointer
+//   (the `*T` tier, taken on trust as `p[0..<n]` is). The default is kept.
+// - **Anything else** keeps the default, which is recorded as owning nothing it should: a view of
+//   part of an element taken through it is refused at the use, telling the reader the one-line
+//   override (`ownerless_view_refusal`).
+
+// What a written `index_place` says about where the container's elements live.
+private enum ViewReach
+    // The member, written as the forwarding the body's last expression is.
+    Inferred(member: MethodDecl)
+    // The default's view, owning nothing, is right.
+    Ownerless
+    // The default's view would own nothing it should.
+    Unproven
+end ViewReach
+
+// The block's members with `index_view` and `index_view_unchecked` written in, wherever the block
+// left one out and its `index_place` forwards to a field that answers views.
+infer_index_views(a: &Analysis, scope: Scope, subject: Type, block: ImplDecl) -> Buf[MethodDecl]
+    var out: Buf[MethodDecl] = buf()
+
+    for m in block.methods
+        out.push(m)
+
+    for member in ["index_view", "index_view_unchecked"]
+        if written_member(block, member).is_some() then continue
+
+        view_reach(a, scope, subject, block, member) match
+            Inferred(m) -> out.push(m)
+            _ -> ()
+
+    out
+end infer_index_views
+
+// The members the block kept the default of whose view would own nothing it should, recorded by the
+// name the copy is lowered to with the refusal a use of one is told.
+note_ownerless_views(a: &Analysis, scope: Scope, subject: Type, block: ImplDecl, index: Type,
+                     elem: Type, lowered: string, member: string)
+    view_reach(a, scope, subject, block, member) match
+        Unproven ->
+            val place = written_member(block, "index_place")
+            val param = if place.is_some() && place.unwrap().params.len() == 1 then
+                place.unwrap().params.at(0).name
+            else
+                "i"
+
+            a.tables.members.ownerless_views.put(
+                lowered,
+                s"its 'index_place' does not reach the element in the container's own bytes through " +
+                "'*self', in static storage or through a raw pointer, so the view would own nothing " +
+                "and could outlive the storage once the container grows or is dropped — answer the " +
+                s"view from the storage: 'override $member(*self, $param: ${type_show(index)}) -> " +
+                s"[]${type_show(elem)} = <storage>.$member($param)'")
+        _ -> ()
+end note_ownerless_views
+
+// The refusal for a view of part of an element read through a container's default `index_view`, or
+// a call of that default, where the container's elements are not where the default's view is right.
+ownerless_view_refusal(an: &Analysis, name: string) -> Option[string] =
+    an.tables.members.ownerless_views.get(name)
+
+private written_member(block: ImplDecl, name: string) -> Option[MethodDecl]
+    for m in block.methods
+        if m.name == name then return Some(m)
+
+    None
+end written_member
+
+private view_reach(a: &Analysis, scope: Scope, subject: Type, block: ImplDecl,
+                   member: string) -> ViewReach
+    val unchecked = member == "index_view_unchecked"
+    val own_unchecked = if unchecked then written_member(block, "index_place_unchecked") else None
+    val written = if own_unchecked.is_some() then own_unchecked else written_member(block, "index_place")
+
+    if written.is_none() then return Unproven
+
+    val m = written.unwrap()
+
+    if m.body.is_empty() then return Unproven
+
+    val last = *m.body.at(m.body.len() - 1).kind match
+        ExprStmt(x) -> x
+        _ -> return Unproven
+
+    val forwarded = forwarding(subject, last, unchecked)
+
+    if forwarded.is_some()
+        val ret = m.ret_type match
+            Some(t) -> *t.kind match
+                PtrType(inner) -> Some(type_ref(t.span, ArrayType(None, inner, false)))
+                _ -> None
+            None -> None
+
+        if ret.is_some() then return Inferred(view_member(m, member, forwarded.unwrap(), ret))
+    end if
+
+    if ownerless(a, scope, subject, m, last) then Ownerless else Unproven
+end view_reach
+
+// The forwarding the last expression of `index_place` is, written as the view member's.
+private forwarding(subject: Type, e: Expr, unchecked: bool) -> Option[Expr]
+    val member = if unchecked then "index_view_unchecked" else "index_view"
+
+    *e.kind match
+        Call(callee, args) ->
+            if args.len() != 1 then return None
+
+            *callee.kind match
+                Field(base, name, _) ->
+                    if self_field(base).is_none() then return None
+
+                    if name == "index_place_unchecked"
+                        Some(call_on(base, "index_view_unchecked", args.at(0)))
+                    else if name == "index_place"
+                        Some(call_on(base, member, args.at(0)))
+                    else
+                        None
+                _ -> None
+        Unary(op, p) ->
+            if op != "&" then return None
+
+            *p.kind match
+                Index(r, index, open) ->
+                    val f = self_field(r)
+
+                    if f.is_none() then return None
+
+                    *index.kind match
+                        RangeExpr(_, _, _) -> return None
+                        _ -> ()
+
+                    val ft = field_type(subject, f.unwrap())
+
+                    if ft.is_none() then return None
+
+                    repr(ft.unwrap()) match
+                        Slice(_, _) ->
+                            // `lo..` is the inclusive spelling of a range with no end.
+                            val rest = expr(p.span, Index(r, expr(index.span, RangeExpr(Some(index), None,
+                                                                                         true)), open))
+                            val one = expr(p.span, RangeExpr(Some(expr(p.span, IntLit("0", 10, ""))),
+                                                             Some(expr(p.span, IntLit("1", 10, ""))), false))
+
+                            Some(expr(p.span, Index(rest, one, open)))
+                        Array(_, _) -> None
+                        Ptr(_) -> None
+                        Unknown -> None
+                        _ -> Some(call_on(r, member, index))
+                _ -> None
+        _ -> None
+end forwarding
+
+private call_on(base: Expr, member: string, arg: Expr) -> Expr
+    var args: Buf[Expr] = buf()
+
+    args.push(arg)
+    expr(base.span, Call(expr(base.span, Field(base, member, base.span)), args))
+end call_on
+
+// `index_place` again, under the view member's name and result, its last expression the forwarding.
+private view_member(m: MethodDecl, name: string, last: Expr, ret: Option[TypeRef]) -> MethodDecl
+    var body: Buf[Stmt] = buf()
+
+    for i in 0..<m.body.len() - 1
+        body.push(m.body.at(i))
+
+    body.push(stmt(last.span, ExprStmt(last)))
+
+    var made = m
+
+    made.name = name
+    made.body = body
+    made.ret_type = ret
+    made.overrides = true
+    made
+end view_member
+
+// The field `self.f` names.
+private self_field(e: Expr) -> Option[string] = *e.kind match
+    Field(base, name, _) -> *base.kind match
+        Ident(n) -> if n == "self" then Some(name) else None
+        _ -> None
+    _ -> None
+
+private field_type(t: Type, name: string) -> Option[Type] = repr(t) match
+    Struct(d) ->
+        for f in d.fields
+            if f.0 == name then return Some(f.1)
+
+        None
+    _ -> None
+
+// -- where the default's view is right ------------------------------------------------------------
+
+// How a place was reached: through `*self` into the container's own bytes, into static storage,
+// through a raw pointer, through a copy of `self`, or somewhere else.
+private const OWN_BYTES: int = 1
+private const STATIC_STORAGE: int = 2
+private const RAW: int = 3
+private const SELF_COPY: int = 4
+private const ELSEWHERE: int = 0
+
+private struct Reached
+    how: int
+    ty: Type
+
+// `&` of a place reached where the default's view is right, or a raw pointer read as it is.
+private ownerless(a: &Analysis, scope: Scope, subject: Type, m: MethodDecl, e: Expr) -> bool =
+    *e.kind match
+        Unary(op, p) -> op == "&" && settled(reach(a, scope, subject, m, p))
+        _ -> reach(a, scope, subject, m, e).how == RAW
+
+private settled(r: Reached) -> bool = r.how == OWN_BYTES || r.how == STATIC_STORAGE || r.how == RAW
+
+private reach(a: &Analysis, scope: Scope, subject: Type, m: MethodDecl, p: Expr) -> Reached
+    val nowhere = Reached(ELSEWHERE, Unknown)
+
+    *p.kind match
+        Ident(n) ->
+            if n == "self"
+                val by_ptr = m.receiver match
+                    Some(ByPtr) -> true
+                    _ -> false
+
+                return Reached(if by_ptr then OWN_BYTES else SELF_COPY, subject)
+            end if
+
+            if bound_here(m, n) then return nowhere
+
+            if static_array(a, scope, n) then Reached(STATIC_STORAGE, Unknown) else nowhere
+        Field(r, name, _) ->
+            val base = reach(a, scope, subject, m, r)
+
+            if base.how == ELSEWHERE then return nowhere
+
+            repr(base.ty) match
+                Struct(_) -> field_type(base.ty, name).map(ft -> Reached(base.how, ft)).unwrap_or(nowhere)
+                Ptr(inner) -> field_type(*inner, name).map(ft -> Reached(RAW, ft)).unwrap_or(nowhere)
+                Unknown -> if base.how == STATIC_STORAGE then base else nowhere
+                _ -> nowhere
+        Index(r, index, _) ->
+            *index.kind match
+                RangeExpr(_, _, _) -> return nowhere
+                _ -> ()
+
+            val base = reach(a, scope, subject, m, r)
+
+            if base.how == ELSEWHERE then return nowhere
+
+            repr(base.ty) match
+                Array(_, el) -> Reached(base.how, *el)
+                Ptr(inner) -> repr(*inner) match
+                    Array(_, el) -> Reached(RAW, *el)
+                    _ -> Reached(RAW, *inner)
+                Unknown -> if base.how == STATIC_STORAGE then base else nowhere
+                _ -> nowhere
+        Unary(op, r) ->
+            if op != "*" then return nowhere
+
+            val base = reach(a, scope, subject, m, r)
+
+            repr(base.ty) match
+                Ptr(inner) -> Reached(RAW, *inner)
+                _ -> nowhere
+        _ -> nowhere
+end reach
+
+// Whether the body's own words bind the name: a parameter, or a local its top level declares.
+private bound_here(m: MethodDecl, n: string) -> bool
+    for p in m.params
+        if p.name == n then return true
+
+    for s in m.body
+        *s.kind match
+            ValDecl(name, _, _, _, _, _, _, _) -> if name == n then return true
+            VarDecl(name, _, _, _, _, _, _, _) -> if name == n then return true
+            RefDecl(name, _) -> if name == n then return true
+            _ -> ()
+
+    false
+end bound_here
+
+// Whether a name the file reaches is a module variable written as a fixed array.
+private static_array(a: &Analysis, scope: Scope, n: string) -> bool
+    val plain = module_qualify(scope.module_name, n)
+
+    for key in [file_private_key(a, scope.src.name, plain), plain]
+        val found = a.tables.vals.get(key)
+
+        if found.is_some()
+            val typ = found.unwrap().typ
+
+            if typ.is_none() then return false
+
+            return *typ.unwrap().kind match
+                ArrayType(length, _, _) -> length.is_some()
+                _ -> false
+        end if
+
+    false
+end static_array
