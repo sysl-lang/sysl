@@ -144,7 +144,7 @@ this file already names, one indirection later.
 
 | on the machine | in libm |
 |---|---|
-| `sqrt`, `fabs`, `copysign` | `cbrt`, `exp`, `exp2`, `log`, `log2`, `log10` |
+| `sqrt`, `fabs`, `copysign` | `cbrt`, `exp`, `exp2`, `expm1`, `log`, `log1p`, `log2`, `log10` |
 | `floor`, `ceil`, `round`, `trunc` | `pow`, `hypot`, `fmod` |
 | | `sin`, `cos`, `tan`, `asin`, `acos`, `atan`, `atan2` |
 | | `sinh`, `cosh`, `tanh`, `asinh`, `acosh`, `atanh` |
