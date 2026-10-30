@@ -1,0 +1,417 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.text.{Search, str_builder}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// A large value the callee only reads is lent by address (`borrowing.sysl`'s `read_by_address`), and
+// the caller hands over its own storage wherever nothing can write that storage during the call
+// (`held_unless`). What can is a call reaching it through an address the caller let out
+// (`exposed_in`).
+//
+// A block of assembly in the caller lets nothing out: it reaches the frame only through its operands,
+// each a local it loads or stores where it runs. So a function with a `dsb`/`isb` in it -- a firmware's
+// entry, polling a touch panel in its idle loop -- lends a held value where it lies, with no snapshot
+// stored before every call, exactly as it would without the block. Where the original could be written
+// during the call -- through an address the caller took, by a closure the callee runs, or as a global --
+// the snapshot stays.
+
+private las_ready() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+
+    true
+end las_ready
+
+private las_ir(text: string, target: Option[string] = None) -> string
+    val root = make_temp_dir("sysl-las").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, forms_imported(text)).unwrap()
+
+    val out = emit_llvm_text(src, target) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> if made.report.is_empty() then made.text else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end las_ir
+
+// One function's emitted text, from its `define` to the brace that closes it.
+private las_body(out: string, name: string) -> string
+    var b = str_builder()
+    var inside = false
+
+    for line in lines_of(out)
+        if !inside && line.starts_with("define ") && mentions_as_written(line, name) then inside = true
+
+        if inside
+            if line == "}" then return b.finish()
+
+            b.push(line)
+            b.push_char('\n')
+
+    if inside then b.finish() else s"no definition of '$name' in:\n$out"
+end las_body
+
+// The first call in `body` of a symbol containing `tail`, or the empty string.
+private las_call(body: string, tail: string) -> string
+    for line in lines_of(body)
+        if line.contains(" call ") && line.contains(tail) then return line
+
+    ""
+end las_call
+
+// How many slots of `ty` a function's text makes.
+private las_slots(body: string, ty: string) -> int
+    var n = 0
+
+    for line in lines_of(body)
+        if line.contains(s"= alloca $ty") && line.ends_with(ty) then n += 1
+
+    n
+end las_slots
+
+// Built at `level` and run: what it printed, which must be `expected`, and a clean exit.
+private las_prints_at(text: string, expected: string, level: string)
+    if !las_ready() then return
+
+    val root = make_temp_dir("sysl-las").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", forms_imported(text)).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, level, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            assert(false, failure_text(why))
+            return
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> assert(false, "the program that was built could not be run")
+        Ok(out) ->
+            assert_eq(out.text, expected)
+            assert(out.status.ok(), "the program printed what was expected and did not exit cleanly")
+end las_prints_at
+
+private las_prints(text: string, expected: string)
+    las_prints_at(text, expected, "0")
+    las_prints_at(text, expected, "2")
+end las_prints
+
+// -- held: lent where it lies, with a block of assembly beside the call --------------------------------
+
+// Five words, every one a caller with a fence in it: a local `val`, a `var` the loop rewrites between
+// calls, a field of a parameter that is itself lent, a parameter passed on, and a caller whose block
+// has operands of its own.
+private las_held() -> string = raw"""
+    struct P
+        a: int
+        b: int
+        c: int
+        d: int
+        e: int
+
+    struct W
+        tag: int
+        p: P
+
+    @noinline
+    look(p: P) -> int = p.a * 10000 + p.b * 1000 + p.c * 100 + p.d * 10 + p.e
+
+    with_val() -> int
+        asm
+            [aarch64, x86_64, thumb, riscv64, riscv32]
+                "nop"
+                clobbers "memory"
+            [craft, wasm32] unavailable "a fence for the host and the board"
+        val p = P(1, 2, 3, 4, 5)
+        look(p)
+
+    with_var() -> int
+        asm
+            [aarch64, x86_64, thumb, riscv64, riscv32]
+                "nop"
+                clobbers "memory"
+            [craft, wasm32] unavailable "a fence for the host and the board"
+        var p = P(0, 0, 0, 0, 0)
+        var total = 0
+        for i in 0..<3
+            p = P(i, i, i, i, i)
+            total += look(p)
+        total
+
+    with_field(w: W) -> int
+        asm
+            [aarch64, x86_64, thumb, riscv64, riscv32]
+                "nop"
+                clobbers "memory"
+            [craft, wasm32] unavailable "a fence for the host and the board"
+        look(w.p) + w.tag
+
+    forwarded(p: P) -> int
+        asm
+            [aarch64, x86_64, thumb, riscv64, riscv32]
+                "nop"
+                clobbers "memory"
+            [craft, wasm32] unavailable "a fence for the host and the board"
+        look(p)
+
+    field_lent(w: W) -> int = look(w.p) + w.tag
+
+    forward_lent(p: P) -> int = look(p)
+
+    with_operand() -> int
+        val p = P(5, 4, 3, 2, 1)
+        var v = 0
+        val n = 7
+        asm
+            [aarch64, thumb]
+                "mov {v}, {n}"
+                in n : reg
+                out v : reg
+            [x86_64]
+                "mov {n}, {v}"
+                in n : reg
+                out v : reg
+            [riscv64, riscv32]
+                "mv {v}, {n}"
+                in n : reg
+                out v : reg
+            [craft, wasm32] unavailable "a fence for the host and the board"
+        look(p) * 10 + v
+
+    print(with_val(), with_var(), with_field(W(9, P(6, 7, 8, 9, 1))), forwarded(P(2, 2, 2, 2, 2)), with_operand())
+    print(field_lent(W(1, P(1, 1, 1, 1, 1))), forward_lent(P(3, 1, 4, 1, 5)))
+    """
+
+@test("a local val in a function with an asm block is lent where it lies")
+las_val_is_lent_in_place()
+    if !las_ready() then return
+
+    val body = las_body(las_ir(las_held()), "with_val")
+
+    assert(las_slots(body, "%struct.P") == 1, body)
+    assert(las_call(body, "look").contains(".owned(ptr %p.addr)"), body)
+end las_val_is_lent_in_place
+
+@test("a var the loop rewrites between calls is lent where it lies, with no snapshot per call")
+las_var_is_lent_in_place()
+    if !las_ready() then return
+
+    val body = las_body(las_ir(las_held()), "with_var")
+
+    assert(las_slots(body, "%struct.P") == 1, body)
+    assert(las_call(body, "look").contains(".owned(ptr %p.addr)"), body)
+end las_var_is_lent_in_place
+
+// A function with a block of assembly in it takes its own parameters by value (the callee side still
+// reads the block as able to rebind anything: `rebound_stmt`), so its parameter lands in a slot of its
+// frame. That slot is lent as it stands: no second slot for a snapshot.
+@test("a field of a parameter in a function with an asm block is lent where it lies")
+las_field_is_lent_in_place()
+    if !las_ready() then return
+
+    val body = las_body(las_ir(las_held()), "with_field")
+
+    assert(las_slots(body, "%struct.P") == 0, body)
+    assert(las_call(body, "look").contains(".owned(ptr %t"), body)
+    assert(body.contains("getelementptr %struct.W, ptr %w.addr, i32 0, i32 1"), body)
+end las_field_is_lent_in_place
+
+@test("a parameter in a function with an asm block is passed on from its own slot")
+las_parameter_is_forwarded()
+    if !las_ready() then return
+
+    val body = las_body(las_ir(las_held()), "forwarded")
+
+    assert(las_slots(body, "%struct.P") == 1, body)
+    assert(las_call(body, "look").contains(".owned(ptr %p.addr)"), body)
+end las_parameter_is_forwarded
+
+@test("a field of a parameter that came by address is lent at that address")
+las_lent_field_is_lent_on()
+    if !las_ready() then return
+
+    val out = las_ir(las_held())
+    val body = las_body(out, "field_lent.owned")
+
+    assert(las_define_has(out, "field_lent.owned", "ptr noalias readonly %w.param"), out)
+    assert(las_slots(body, "%struct.P") == 0, body)
+    assert(las_call(body, "look") != "", body)
+end las_lent_field_is_lent_on
+
+@test("a parameter that came by address is passed on at the same address")
+las_lent_parameter_is_forwarded()
+    if !las_ready() then return
+
+    val out = las_ir(las_held())
+    val body = las_body(out, "forward_lent.owned")
+
+    assert(las_define_has(out, "forward_lent.owned", "ptr noalias readonly %p.param"), out)
+    assert(las_slots(body, "%struct.P") == 0, body)
+    assert(las_call(body, "look").contains(".owned(ptr %p.addr)"), body)
+end las_lent_parameter_is_forwarded
+
+@test("a block with operands of its own leaves a local it does not name lent where it lies")
+las_operands_leave_the_rest_in_place()
+    if !las_ready() then return
+
+    val body = las_body(las_ir(las_held()), "with_operand")
+
+    assert(las_slots(body, "%struct.P") == 1, body)
+    assert(las_call(body, "look").contains(".owned(ptr %p.addr)"), body)
+end las_operands_leave_the_rest_in_place
+
+@test("and every held shape reads what a copy would")
+las_held_runs()
+    las_prints(las_held(), "12345 33333 67900 22222 543217\n11112 31415\n")
+
+// Whether the `define` line of `name` contains `text`.
+private las_define_has(out: string, name: string, text: string) -> bool
+    for line in lines_of(out)
+        if line.starts_with("define ") && mentions_as_written(line, name) then return line.contains(text)
+
+    false
+end las_define_has
+
+// -- kept: a snapshot wherever the original can change during the call ------------------------------------
+
+// Each callee writes the original while it holds its parameter: through a pointer the caller handed it,
+// through a closure that assigns the caller's `var`, and through a closure that assigns a global. Each
+// caller has a fence; each callee must still read the value from before the call.
+private las_kept() -> string = raw"""
+    struct P
+        a: int
+        b: int
+        c: int
+        d: int
+        e: int
+
+    var g = P(1, 2, 3, 4, 5)
+
+    @noinline
+    peek(p: P, q: *P) -> int
+        q.a = 9
+        p.a * 10 + q.a
+
+    @noinline
+    show(p: P, f: () -> unit) -> int
+        f()
+        p.a * 10 + p.e
+
+    through_pointer() -> int
+        asm
+            [aarch64, x86_64, thumb, riscv64, riscv32]
+                "nop"
+                clobbers "memory"
+            [craft, wasm32] unavailable "a fence for the host and the board"
+        var p = P(1, 2, 3, 4, 5)
+        peek(p, &p) * 10 + p.a
+
+    through_closure() -> int
+        asm
+            [aarch64, x86_64, thumb, riscv64, riscv32]
+                "nop"
+                clobbers "memory"
+            [craft, wasm32] unavailable "a fence for the host and the board"
+        var p = P(1, 2, 3, 4, 5)
+        show(p, () -> p = P(9, 9, 9, 9, 9)) * 10 + p.a
+
+    through_global() -> int
+        asm
+            [aarch64, x86_64, thumb, riscv64, riscv32]
+                "nop"
+                clobbers "memory"
+            [craft, wasm32] unavailable "a fence for the host and the board"
+        show(g, () -> g = P(9, 9, 9, 9, 9)) * 10 + g.a
+
+    print(through_pointer(), through_closure(), through_global())
+    """
+
+@test("a local whose address the caller hands over is lent a snapshot")
+las_pointer_keeps_the_snapshot()
+    if !las_ready() then return
+
+    val body = las_body(las_ir(las_kept()), "through_pointer")
+    val call = las_call(body, "peek")
+
+    assert(call != "" && !call.contains(".owned(ptr %p.addr"), body)
+    assert(las_slots(body, "%struct.P") == 2, body)
+end las_pointer_keeps_the_snapshot
+
+@test("a var a closure the callee runs assigns is lent a snapshot")
+las_closure_keeps_the_snapshot()
+    if !las_ready() then return
+
+    val body = las_body(las_ir(las_kept()), "through_closure")
+    val call = las_call(body, "show")
+
+    assert(call != "" && !call.contains(".owned(ptr %p.addr"), body)
+end las_closure_keeps_the_snapshot
+
+@test("and each callee reads the value from before the call")
+las_kept_runs()
+    las_prints(las_kept(), "199 159 159\n")
+
+// -- the board: the touch panel's idle loop ---------------------------------------------------------------
+
+// The shape that showed it: a firmware entry fences, then polls a five-word input in a loop and keeps
+// the answer only when it changed. On a 32-bit machine that is lent; the loop lends `input` itself.
+private las_board() -> string = raw"""
+    struct Input
+        x: int
+        y: int
+        down: bool
+        pressed: bool
+        id: int
+
+    extern read_sensor() -> int
+
+    @noinline
+    poll(last: Input) -> Option[Input]
+        val r = read_sensor()
+        if r == last.x then return None
+        Some(Input(r, last.y + 1, !last.down, last.pressed, last.id))
+
+    @export("main")
+    run() -> int
+        asm
+            [thumb]
+                "dsb"
+                "isb"
+                clobbers "memory"
+            [aarch64, x86_64, riscv64, riscv32, craft, wasm32] unavailable "Cortex-M firmware"
+        var input = Input(0, 0, false, false, 0)
+        loop
+            poll(input) match
+                Some(next) -> input = next
+                None -> ()
+    """
+
+@test("a firmware entry with a fence lends its polled input where it lies")
+las_board_lends_in_place()
+    if !las_ready() then return
+
+    val out = las_ir(las_board(), Some("thumb-freestanding-softfp"))
+    val body = las_body(out, "run")
+
+    assert(las_define_has(out, "poll.owned", "ptr noalias readonly %last.param"), out)
+    assert(las_slots(body, "%struct.Input") == 2, body)
+    assert(las_call(body, "poll").contains(".owned(ptr %input.addr)"), body)
+end las_board_lends_in_place
