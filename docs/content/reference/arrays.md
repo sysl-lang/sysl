@@ -855,7 +855,10 @@ that are the container's own bytes, like `Ring`'s above, or static storage: thos
 the container or the program. A container that keeps its elements behind a `*T` is in the raw-pointer
 tier, where nothing is kept alive for it, as nothing is for `p[0..<n]`. The default is kept where
 `index_place` ends in `&` of a place reached through `*self` by fields and fixed arrays' subscripts,
-of a module variable written as a fixed array, or of anything reached through a raw pointer.
+of a module variable written as a fixed array, or of anything reached through a raw pointer. A view
+of part of an element in the container's own bytes leaves a frame only where the container lives
+outside it — in module storage, or reached through a `*T` — and is refused where the container is
+the frame's own ([Memory](memory.md)).
 
 **Anywhere else, a view of part of an element taken through the default is refused**, since it would
 own nothing and could outlive the storage once the container grows or is dropped; so is a call of

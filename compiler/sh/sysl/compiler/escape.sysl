@@ -483,7 +483,8 @@ private walk_seeded(p: TProgram, keeps: &KeptParams, seeds: Buf[(string, EView)]
     while changed
         val before: &Counted = Counted(0)
 
-        walk_stmts(stmts, stmt_walk(false, s -> bind_one(prog, kp, w, before, s)))
+        walk_stmts(stmts, TWalk(false, e -> bind_stored(prog, kp, w, before, e), x -> (),
+                                s -> bind_one(prog, kp, w, before, s)))
         changed = before.n > 0
 
     walk_stmts(stmts, stmt_walk(false, s -> check_one(prog, kp, w, s)))
@@ -514,6 +515,15 @@ private bind_one(p: TProgram, keeps: &KeptParams, w: &EscapeWalk, changed: &Coun
                 TLoad(name, _) -> bind_view(p, keeps, w, changed, name, write.value)
                 _ -> ()
     _ -> ()
+
+// A store that is not a statement of its own -- the value of a block, as the one line of an
+// `@unchecked` block or of a one-line `if` is -- binds the local it lands in all the same.
+private bind_stored(p: TProgram, keeps: &KeptParams, w: &EscapeWalk, changed: &Counted, e: TExpr) =
+    *e.kind match
+        TStore(place, v, _, _) -> *place.kind match
+            TLoad(name, _) -> bind_view(p, keeps, w, changed, name, v)
+            _ -> ()
+        _ -> ()
 
 private bind_view(p: TProgram, keeps: &KeptParams, w: &EscapeWalk, changed: &Counted, name: string,
                   from: TExpr)
@@ -963,16 +973,19 @@ private views_value(p: TProgram, keeps: &KeptParams, w: &EscapeWalk, e: TExpr) -
             // exactly what the view does: nothing, if the view is counted, and the frame's arrays, if
             // it is a view of them. A **dereference** is a counted box, a `Buf`'s storage or a `*T`
             // region: the first two are on the heap and named as the owner, and the last is the
-            // programmer's problem, like every `*T`.
+            // programmer's problem, like every `*T` -- except an element a container's `index_place`
+            // answered in the container's **own bytes**, which lives where the container does
+            // (`container_bytes`).
             spine_root(base) match
                 Some(root) -> *root.kind match
                     TIndex(r, _, _) -> views(p, keeps, w, r)
+                    TDeref(operand, _) -> container_bytes(p, keeps, w, operand)
                     _ -> no_view()
                 None -> array_root(w, base)
         else views(p, keeps, w, base)
 
     TLoad(name, _) -> confined_of(w, name)
-    TCall(_, args, _, _) -> any_view(p, keeps, w, args)
+    TCall(_, args, _, _) -> join_views(any_view(p, keeps, w, args), container_bytes(p, keeps, w, e))
     TVCall(_, _, args, _, _) -> any_view(p, keeps, w, args)
     TCallPtr(_, args, _, _) -> any_view(p, keeps, w, args)
     TStructNew(_, args) -> any_view(p, keeps, w, args)
@@ -1106,6 +1119,102 @@ private array_root(w: &EscapeWalk, base: TExpr) -> EView = *base.kind match
 private struct_value_named(r: TExpr) -> string = *r.kind match
     TLoad(name, _) -> s"'$name', a struct value"
     _ -> "a struct value"
+
+// -- an element in a container's own bytes ------------------------------------------------------------
+
+// What a container's element answer views, where the container keeps its elements in **its own
+// bytes** -- `&self.cells[i]` in `index_place`, `self.cells[i..<i + 1]` in `index_view`, or a
+// forwarding to a member of a field that does. Such a view owns nothing (the default `index_view`'s
+// answer, or a view of an array inside the container), so it lasts exactly as long as the container:
+// it views the container's storage, and that is the frame's when the container is. A container
+// reached through a raw pointer is the `*T` tier, and one in module storage lives for the run. An
+// element in static storage, behind a raw pointer or in a counted buffer is not the container's bytes
+// and views nothing here.
+private container_bytes(p: TProgram, keeps: &KeptParams, w: &EscapeWalk, call: TExpr) -> EView =
+    *call.kind match
+        TCall(name, args, _, _) ->
+            if args.is_empty() || !element_member(name) || !answers_own_bytes(p, keeps, name, 0)
+                return no_view()
+
+            *args.at(0).kind match
+                TAddrOf(place, _) -> container_storage(w, place)
+                _ ->
+                    if is_raw_pointer(texpr_type(args.at(0))) then no_view()
+                    else unnamed_view(own_bytes_why("a container this body reached"))
+        _ -> no_view()
+
+private element_member(name: string) -> bool =
+    calls_member(name, "index_place") || calls_member(name, "index_place_unchecked") ||
+    calls_member(name, "index_view") || calls_member(name, "index_view_unchecked")
+
+// Whether the storage a container lives in is the frame's: module storage is not, and neither is a
+// container reached through a raw pointer. A `ref` names the place it was bound to.
+private container_storage(w: &EscapeWalk, place: TExpr) -> EView
+    if in_module_storage(place) || through_raw_pointer(place) then return no_view()
+
+    *place.kind match
+        TLoad(name, _) -> ref_place(w, name) match
+            Some(bound) -> container_storage(w, bound)
+            None -> unnamed_view(own_bytes_why(s"'$name'"))
+        _ -> unnamed_view(own_bytes_why("a container this body reached"))
+end container_storage
+
+private own_bytes_why(what: string) -> string =
+    s"it is an element of $what, a container whose elements are its own bytes, so a view of part of " +
+    "one owns nothing and lasts only as long as the container does"
+
+private through_raw_pointer(e: TExpr) -> bool = *e.kind match
+    TDeref(operand, _) -> is_raw_pointer(texpr_type(operand))
+    TField(r, _, _) -> through_raw_pointer(r)
+    TIndex(r, _, _) -> is_array(texpr_type(r)) && through_raw_pointer(r)
+    _ -> false
+
+private is_raw_pointer(t: Type) -> bool = t match
+    Ptr(_) -> true
+    _ -> false
+
+// Whether an element member's answer is an address in, or a view of, its receiver's own bytes: read
+// from its body's last expression, through a forwarding to another element member of a part of the
+// receiver. A body that is not here (a library compiled already) answers no.
+private answers_own_bytes(p: TProgram, keeps: &KeptParams, name: string, depth: int) -> bool
+    if depth > 8 then return false
+
+    val f = keeps.index.get(name) match
+        Some(id) -> p.funcs.at(id)
+        None -> return false
+
+    if f.params.is_empty() then return false
+
+    f.body.result match
+        Some(last) -> self_answer(p, keeps, f.params.at(0).0, last, depth)
+        None -> false
+end answers_own_bytes
+
+private self_answer(p: TProgram, keeps: &KeptParams, me: string, e: TExpr, depth: int) -> bool =
+    *e.kind match
+        TAddrOf(place, _) -> in_self(me, place)
+        TSlice(base, _, _, _, _) ->
+            if is_array(texpr_type(base)) then in_self(me, base) else self_answer(p, keeps, me, base, depth)
+        TCall(name, args, _, _) ->
+            !args.is_empty() && element_member(name) && passes_self(me, args.at(0)) &&
+                answers_own_bytes(p, keeps, name, depth + 1)
+        _ -> false
+
+// Whether a place is part of the receiver's own bytes: reached from it by fields and fixed arrays'
+// subscripts alone.
+private in_self(me: string, place: TExpr) -> bool = *place.kind match
+    TLoad(name, _) -> name == me
+    TDeref(operand, _) -> *operand.kind match
+        TLoad(name, _) -> name == me
+        _ -> false
+    TField(r, _, _) -> in_self(me, r)
+    TIndex(r, _, _) -> is_array(texpr_type(r)) && in_self(me, r)
+    _ -> false
+
+private passes_self(me: string, arg: TExpr) -> bool = *arg.kind match
+    TLoad(name, _) -> name == me
+    TAddrOf(place, _) -> in_self(me, place)
+    _ -> false
 
 // Whether a place is rooted at module storage through fields and elements alone. A step through a
 // pointer or a reference leaves it, since what is reached then is wherever the address points.

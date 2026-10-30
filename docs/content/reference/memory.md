@@ -2997,6 +2997,31 @@ print(first[3], tail.len)
 4 2
 ```
 
+**An element of a program's own container is the same where the container answers its storage's
+view** ([Arrays § A type with no elements of its own](arrays.md)): `c[i][..]` carries the owner of the `Buf` or view the
+elements live in, and leaves the frame by any route. **A container whose elements are its own bytes
+is the frame's where it is**: a view of part of one owns nothing and lasts as long as the container,
+so it may leave a frame only when the container lives outside it — in module storage, or reached
+through a `*T`.
+
+```sysl
+struct Ring
+    cells: [2][4]int
+
+impl IndexPlace[usize, [4]int] for Ring
+    index_place(*self, i: usize) -> *[4]int = &self.cells[i]
+
+row() -> []int
+    var r = Ring([[1, 2, 3, 4], [5, 6, 7, 8]])
+    r[1][..]
+
+print(row()[0])
+```
+
+```error
+it is an element of 'r', a container whose elements are its own bytes, so a view of part of one owns nothing and lasts only as long as the container does
+```
+
 **Module storage is never a root, whatever the path to it.** It lasts the whole run, so a view of it
 outlives every frame without moving anywhere: a field of a module array's element is as static as the
 array, and a slice of it goes through a trait object, or anywhere else, with nothing promoted.
