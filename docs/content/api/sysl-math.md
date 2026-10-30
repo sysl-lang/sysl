@@ -581,6 +581,8 @@ trait Float: Zero + One + Eq + Ord + Neg + Add + Sub + Mul + Div
     rint(self) -> Self
     max_num(self, other: Self) -> Self
     min_num(self, other: Self) -> Self
+    maximum(self, other: Self) -> Self
+    minimum(self, other: Self) -> Self
     fmod(self, divisor: Self) -> Self
     abs(self) -> Self
     copysign(self, sign: Self) -> Self
@@ -665,6 +667,8 @@ conversions, whose factor is pi over 180.
 | `rint` | `rint(self) -> Self` |  |
 | `max_num` | `max_num(self, other: Self) -> Self` | The larger and the smaller of two, IEEE 754-2008's maxNum and minNum: **a NaN loses to a number**, so `nan.max_num(1.0)` and `1.0.max_num(nan)` are both `1.0`, and only two NaNs answer a NaN. |
 | `min_num` | `min_num(self, other: Self) -> Self` |  |
+| `maximum` | `maximum(self, other: Self) -> Self` | The larger and the smaller of two, IEEE 754-2019's maximum and minimum: **a NaN wins**, so `nan.maximum(1.0)` and `1.0.maximum(nan)` are both a NaN, and `-0.0` orders below `0.0` -- `(-0.0).maximum(0.0)` is `0.0` and `(-0.0).minimum(0.0)` is `-0.0`, whichever way round. |
+| `minimum` | `minimum(self, other: Self) -> Self` |  |
 | `fmod` | `fmod(self, divisor: Self) -> Self` | The remainder of a division that truncates, keeping the sign of the receiver. |
 | `abs` | `abs(self) -> Self` | Sign, taken two ways because the two answer differently at the edges. |
 | `copysign` | `copysign(self, sign: Self) -> Self` |  |
