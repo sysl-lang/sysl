@@ -341,6 +341,21 @@ int main(void) { return mylib_add(2, 3); }
 $ clang main.c libmylib.a -o app
 ```
 
+**The archive is one object, but every function and data item is in a section of its own** (an atom,
+on macOS), so the linker can drop what your program never calls. That matters when the sysl code
+binds a library: `sysl build-c` names it (`sysl: link this against: …`), and a C program that calls
+none of the functions needing it would otherwise still have to link the library. Pass the linker's
+dead-strip flag and the unreached functions go, together with their undefined references:
+
+```text
+$ clang main.c libmylib.a -Wl,-dead_strip -o app
+$ clang main.c libmylib.a -Wl,--gc-sections -o app
+```
+
+The first is for macOS, the second for Linux, Android and freestanding targets. A program that does
+call a function needing the library still links it, and still needs it on the link line. `build-c`
+prints the flag for your target whenever the archive names a library other than `m`.
+
 Exported signatures use C-compatible types — scalars, pointers, function pointers — because those
 are what a C prototype can express. The usual structure is a **boundary file**: one module that
 holds the handful of functions the C side calls, with everything behind it written in idiomatic
