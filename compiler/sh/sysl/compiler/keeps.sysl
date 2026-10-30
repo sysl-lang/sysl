@@ -152,6 +152,14 @@ struct KeepsCx
     // (`keeps_vessel.sysl`): read off the bodies alone, so worked out once.
     made: Map[string, bool]
 
+    // **A question asked `MaxNesting` walks deep is put off, not walked** (`answer_from_the_top`): how
+    // many have been, the ones the walk under way put off, and the questions still waiting under the
+    // one being worked out, which are asked as their own recursion would be.
+    cuts: int
+    cutting: bool
+    deferred: Buf[(string, usize, string)]
+    pending: Map[string, bool]
+
     find(self, name: string) -> Option[TFunc] = self.index.get(name) match
         Some(i) -> Some(self.funcs.at(i))
         None -> None
@@ -173,7 +181,8 @@ check_keeps(a: &Analysis, funcs: Buf[TFunc], vtables: Buf[TVtable], vals: Buf[TV
 
     val cx: &KeepsCx = KeepsCx(a, funcs, index, map(), map(), map(), buf(), buf(), false, 0, map(),
                                map(), buf(), map(), buf(), map(), map(), map(), vtables, cast_graph_new(),
-                               map(), buf(), map(), map(), map(), map(), buf(), false, map(), false, map())
+                               map(), buf(), map(), map(), map(), map(), buf(), false, map(), false, map(),
+                               0, false, buf(), map())
 
     for i in 0..<a.tables.extern_vars.len()
         cx.c_vars.push(extern_var_symbol(a.tables.extern_vars.at(i)))
@@ -853,6 +862,61 @@ private path_of(q: string) -> string
 end path_of
 
 private summary(cx: &KeepsCx, name: string, i: usize, q: string) -> KeptWhy
+    if cx.busy.len() > 0 then return answer(cx, name, i, q)
+
+    val cuts = cx.cuts
+    val first = answer(cx, name, i, q)
+
+    if cx.cuts == cuts then first else answer_from_the_top(cx, name, i, q)
+end summary
+
+// **How deep the walks of questions may nest before the next fresh one is put off.** Each question a
+// walk asks of a callee is a walk of its own, so a chain of calls as long as the program -- a pointer to
+// a pointer handed down thirty-two thousand bodies, each asked what it lets out of what it reads
+// through it -- nests a walk per link and overflows the compiler's stack. The questions `warm_callees_first`
+// asks are answered before any caller reads them; the ones it cannot know to ask (a read question's
+// steps and field path are the caller's) meet the limit instead.
+private val MaxNesting: usize = 256
+
+// **A question whose walk put one off is worked out from the top, callees first**: the questions put
+// off are kept on a stack of their own and each is asked with no walk under way -- putting off, in its
+// turn, what it reaches `MaxNesting` deeper -- until every one is answered; then the one asked is walked
+// again, reading them from the memo. Nothing a walk worked out over a question put off is kept
+// (`answer`), since it read a stand-in. A question still waiting on the stack, asked again, is the
+// recursion `answer` takes by assumption, as it would be were the walks still nested.
+private answer_from_the_top(cx: &KeepsCx, name: string, i: usize, q: string) -> KeptWhy
+    var stack: Buf[(string, usize, string)] = buf()
+
+    stack.push((name, i, q))
+
+    loop
+        for d in cx.deferred
+            stack.push(d)
+
+        cx.deferred = buf()
+        cx.cutting = false
+        cx.pending = map()
+
+        for at in 0..<stack.len() - 1
+            val s = stack.at(at)
+
+            cx.pending.put(s"${s.2}${s.0}|${s.1}", true)
+
+        val top = stack.at(stack.len() - 1)
+        val cuts = cx.cuts
+        val out = answer(cx, top.0, top.1, top.2)
+
+        if cx.cuts == cuts
+            stack.truncate(stack.len() - 1)
+
+            if stack.is_empty()
+                cx.pending = map()
+                return out
+            end if
+        end if
+end answer_from_the_top
+
+private answer(cx: &KeepsCx, name: string, i: usize, q: string) -> KeptWhy
     val key = s"$q$name|$i"
     val keeping = q == KeepsQ
     val reading = q.starts_with(ReadQ)
@@ -871,7 +935,7 @@ private summary(cx: &KeepsCx, name: string, i: usize, q: string) -> KeptWhy
             return v
         None -> ()
 
-    if holds_string(cx.busy, key)
+    if holds_string(cx.busy, key) || cx.pending.has(key)
         cx.taint = true
         cx.busy_reads += 1
         leaned_on(cx, key)
@@ -919,11 +983,23 @@ private summary(cx: &KeepsCx, name: string, i: usize, q: string) -> KeptWhy
     // first round never saw a walk lean on.
     if cx.resolving && !cx.members.has(key) then cx.strayed = true
 
+    // Once a question has been put off, every walk under way is thrown away, so the rest of them asks
+    // nothing new: walked without the memo, each would ask its callees afresh, and theirs, to the limit.
+    if cx.cutting then return assumed_answer(key)
+
+    if cx.busy.len() >= MaxNesting
+        cx.cuts += 1
+        cx.cutting = true
+        cx.deferred.push((name, i, q))
+        return assumed_answer(key)
+    end if
+
     cx.busy.push(key)
 
     val outer = cx.taint
     val reads = cx.busy_reads
     val logged = cx.reads.len()
+    val cuts = cx.cuts
 
     cx.taint = false
 
@@ -948,6 +1024,13 @@ private summary(cx: &KeepsCx, name: string, i: usize, q: string) -> KeptWhy
     cx.busy_reads = reads
     cx.busy.truncate(cx.busy.len() - 1)
 
+    // A walk that read a question put off read a stand-in: its answer is worked out again from the top.
+    if cx.cuts != cuts
+        cx.reads.truncate(logged)
+        cx.taint = outer
+        return out
+    end if
+
     if leaned
         cx.round.put(key, out)
         cx.assumed.push(key)
@@ -965,7 +1048,7 @@ private summary(cx: &KeepsCx, name: string, i: usize, q: string) -> KeptWhy
 
     cx.taint = outer || leaned
     out
-end summary
+end answer
 
 // A read of an answer still open, logged against every walk under way: what each one leaned on is
 // what the log gained while it ran.
@@ -1618,13 +1701,14 @@ private round_handles(cx: &KeepsCx, org: &Origins, f: TFunc) -> &Handles
     val outer = cx.taint
     val reads = cx.busy_reads
     val logged = cx.reads.len()
+    val cuts = cx.cuts
 
     cx.taint = false
 
     val hs = handles_of(org, f)
     val leaned = cx.taint
 
-    if cx.busy_reads == reads
+    if cx.busy_reads == reads && cx.cuts == cuts
         cx.handles.put(f.name, (handles_copy(hs), leaned))
 
         val deps = logged_since(cx, logged)
