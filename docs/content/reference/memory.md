@@ -5029,6 +5029,40 @@ parameter is. Each step is told apart up to eight steps in; past that, a callee 
 out of anything it reads through the pointer, which cannot tell the steps apart, so it is refused if it
 lets out anything read that deep — conservatively — and accepted if it only reads.
 
+**The fields are told apart too.** What the callee lets out is asked of the field the address sits
+in: here `&b` sits in `a.peer`, and `keep_bus` lets out only `c.bus`, so the call is accepted — a
+callee letting out `c.peer`, `c` itself, or anything read through `c.peer` is refused. The field is
+the one of the local the address is stored in (a field of a field, an array field's elements all
+alike, a field a callee stores into), and on the callee's side the field it reads straight through
+its parameter; a read it cannot place that way — through a copy of the pointer, or the pointee whole —
+counts for every field, and a union's members are one field.
+
+```sysl
+struct Cpu
+    peer: *Cpu
+    bus: *int
+
+var the_bus = 7
+var last: *int = null
+
+keep_bus(c: *Cpu)
+    last = c.bus
+
+run() -> int
+    var a: Cpu
+    var b: Cpu
+    a.bus = &the_bus
+    a.peer = &b
+    keep_bus(&a)
+    *last
+
+print(run())
+```
+
+```output
+7
+```
+
 As with the pointer itself, a call with no body in sight borrows what it reads for the call: an
 `extern` lets nothing out unless its `@keeps` names the parameter, and neither does a call through an
 object of no known trait or through a function pointer C may call.
