@@ -1222,7 +1222,7 @@ grammars.
 | `--include-path <dir>` | where to look for a header the C beside a module includes; may be given more than once |
 | `--include-path <name>=<dir>` | the same, and it answers the header requirement a package declared under that name |
 | `-D NAME` or `-D NAME=value` | a macro the C beside a module is compiled with; may be given more than once |
-| `-O <level>` | the optimization level handed to clang |
+| `-O <level>` | the optimization level handed to clang; `-Os` also marks every function `optsize` and `-Oz` marks it `optsize minsize`, as clang does for C, so the optimizer keeps fixed-count loops rolled |
 | `--debug`, `--release` | the [build mode](#debug-and-release): whether integer overflow of a plain operator stops the program or wraps |
 | `--lto <mode>` | optimize across every object at the link: `thin` or `full` |
 | `--link <how>` | link `pkg_config` libraries from their static archives: `static`, `dynamic`, or a comma-separated list of their names |
