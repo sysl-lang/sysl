@@ -609,6 +609,9 @@ element 3 exists, because elements 3 through 6 do not. This is the only vector o
 run-time check; every other operation is a register operation that cannot fail, so a vector cannot
 read or write past the end of an array.
 
+**Inside an [`@unchecked`](/reference/arrays/#unchecked-access) block that one test is left out**, as
+a scalar subscript's is: the load or store is the address and nothing else.
+
 **A partial run at the end traps too, and the scalar tail is written by hand.** An array whose length
 is not a multiple of the width ends with fewer elements than lanes; the kernel below shows how to
 handle it.

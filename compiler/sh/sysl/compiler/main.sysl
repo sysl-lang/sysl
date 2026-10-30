@@ -671,8 +671,9 @@ refused_features(note: string -> unit) -> bool = feature_conflict() match
         true
     None -> false
 
-// `sysl build-c [--target <name>] [--cc <path>] [-O<level>] [-o <archive>] [--header <path>] <path>`
-// -- a module compiled to a static archive and a C header, for a C project to link against.
+// `sysl build-c [--target <name>] [--cc <path>] [-O<level>] [-o <archive>] [--header <path>]
+// [--emit-llvm <out.ll>] <path>` -- a module compiled to a static archive and a C header, for a C
+// project to link against, and with `--emit-llvm` the LLVM text the archive was compiled from.
 //
 // **It is what CMake and Gradle call**, which is why the two paths it writes are both reported: a
 // build script names one of them and has to be able to find the other.
@@ -681,6 +682,7 @@ private build_c_command(args: []string, note: string -> unit) -> int
     var cc: Option[string] = None
     var out: Option[string] = None
     var header: Option[string] = None
+    var ll: Option[string] = None
     var level: Option[string] = None
     var file = ""
     var mistakes: Buf[string] = buf()
@@ -703,7 +705,7 @@ private build_c_command(args: []string, note: string -> unit) -> int
         else if featured > 0
             if featured == 2 then i += 1
         else if args[i] == "--target" || args[i] == "--cc" || args[i] == "-o" || args[i] == "--output" ||
-                args[i] == "--header"
+                args[i] == "--header" || args[i] == "--emit-llvm"
             if i + 1 >= args.len
                 mistakes.push(missing_value(args[i]))
                 break
@@ -713,9 +715,11 @@ private build_c_command(args: []string, note: string -> unit) -> int
 
             i += 1
 
+            // Each of these is a value, so the last one given is the one taken, as `-o` twice is.
             if flag == "--target" then named = Some(args[i])
             else if flag == "--cc" then cc = Some(args[i])
             else if flag == "--header" then header = Some(args[i])
+            else if flag == "--emit-llvm" then ll = Some(args[i])
             else out = Some(args[i])
         else if took_level(args, i).0 != 0
             val given = took_level(args, i)
@@ -756,7 +760,7 @@ private build_c_command(args: []string, note: string -> unit) -> int
         Ok(resolved) -> resolved
 
     // The two paths written are said by the build, ahead of the advice about what to link them with.
-    build_c_archive(file, named, cc, at, out, header, note, lto_flag()) match
+    build_c_archive(file, named, cc, at, out, header, note, lto_flag(), ll) match
         Err(why) ->
             say_failure(why, note)
             Failed
@@ -765,7 +769,10 @@ end build_c_command
 
 private build_c_usage() -> string =
     "usage: sysl build-c [--target <name>] [--cc <path>] [-O<level>] [-o <archive>] " +
-    "[--header <path>] [--lto thin|full] " + where_flags() + " " + feature_flags() + " <path>\n" +
+    "[--header <path>] [--emit-llvm <out.ll>] [--lto thin|full] " + where_flags() + " " + feature_flags() +
+    " <path>\n" +
+    "  --emit-llvm <out.ll>  also write the LLVM text the archive is compiled from, exactly as clang " +
+    "is handed it, to <out.ll>; the archive and the header are still built\n" +
     "  --lto <mode>  make the archive's members LLVM bitcode for this mode of link-time " +
     "optimization, 'thin' or 'full', so a host linking with clang and lld can optimize across the " +
     "boundary. Without it the members are native objects any C toolchain links, and the project's " +
@@ -1659,7 +1666,7 @@ usage() -> string = "usage: sysl --version | --help | emit-ast [--no-spans] <fil
     "emit-llvm [--target <name>] [-O<level>] <path> | " +
     "build [--target <name>] [--cc <path>] [-O<level>] [-o <exe>] <path> | " +
     "build-c [--target <name>] [--cc <path>] [-O<level>] [-o <archive>] [--header <path>] " +
-    "[--lto thin|full] <path> | emit-header [--target <name>] <path> | " +
+    "[--emit-llvm <out.ll>] [--lto thin|full] <path> | emit-header [--target <name>] <path> | " +
     "run [--target <name>] [--cc <path>] [-O<level>] <path> [-- <args>] | " +
     "test [--filter <text>] [--file <name>] [--fail-fast] [--jobs <n>] [--timeout <seconds>] [--target <name>] [--cc <path>] [-O<level>] <path> | " +
     "add <coordinate>[@<version>] [<path>] | config <command> [--dry-run] [-C <dir>] | deps <path> | vendor <path> | tidy [--check] [<path>] | init [<dir>] | " +

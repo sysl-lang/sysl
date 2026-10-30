@@ -23,12 +23,16 @@ import sysl.math.bigint.from_int
 //   once the value is built, wherever the constructor is lowered (`gen_expr`, `gen_into`, and
 //   `gen_around` for a result built in the caller's storage).
 //
-// **A handled failure leaves the trace -- pruning.** A statement that calls something answering a
-// `Result` (or awaits a task that does) without handing the answer on with `?` reads the trace's
-// length before it runs and writes it back when it completes. A `return` from inside it is not
+// **A handled failure leaves the trace -- pruning.** The innermost statement holding a call to
+// something answering a `Result` (or an await of a task that does) whose answer it neither hands on
+// with `?` nor returns reads the trace's length before it runs and writes it back when it completes;
+// the statements around it, finding the trace as it was, do nothing. A `return` from inside it is not
 // completing it, so `Err(e) -> return Err(Wrap(e))` keeps the inner chain; a `break` or `continue` is,
-// and puts the trace back to where the first statement it leaves found it. This is the one cost on a
-// success path: a call that reads the length and one that writes it, per such statement.
+// and puts the trace back to where the first statement it leaves found it. A way out of the function
+// that is not a failure -- a `return` from inside such a statement, or a last expression that handles
+// one -- puts it back to where the function's first open mark found it, so the function leaves the
+// trace as it found it (`trace_answer`). This is the one cost on a success path: a call that reads
+// the length and one that writes it, per such statement, and a write per way out taken from inside one.
 //
 // **Off is free**: with `error_traces = false` or `--no-error-traces` nothing is recorded, no site is
 // laid down, nothing is pruned, and the library's reads of the trace are answered here without a
@@ -219,23 +223,39 @@ end record
 trace_enter(e: *Emit, s: TStmt) -> Option[Val]
     if !traces_on || e.terminated || !handles_failure(s) then return None
 
+    take_mark(e)
+end trace_enter
+
+private take_mark(e: *Emit) -> Option[Val]
     val n = fresh_reg(e)
 
     e.traces = true
     emit(e, ir_call(Some(n), l_i32(), VGlobal(MarkSymbol), no_ir_args()))
     e.trace_marks.push(n)
     Some(n)
-end trace_enter
+end take_mark
 
-// Before a body's last expression, in a function answering `ret`. Where that is no `Result`, the
-// function has no failure to hand on, so the expression is completed as a statement is and a failure
-// it handles leaves the trace with it -- `parse(s) match` ending a function that answers `unit` or an
-// `int`. One answering a `Result` hands its last expression back as a `return` hands its value, and
-// keeps the chain.
-trace_enter_tail(e: *Emit, r: TExpr, ret: Type) -> Option[Val] =
-    if is_result_type(ret) then None else trace_enter(e, TExprStmt(r))
+// Before a value the function answers with -- its body's last expression or a `return`'s -- in a
+// function answering `ret`: where the value handles a failure, the trace's length, saved for the way
+// out (`trace_answer`). Where `ret` is no `Result`, the function has no failure to hand on, so the
+// value is completed as a statement is -- `parse(s) match` ending a function that answers `unit` or an
+// `int`. Where it is, a call that IS the answer -- the value itself, or an arm's or a block's value as
+// deep as they nest -- is handed on rather than handled, so `return load(k)` and a body ending in
+// `load(k)` take no mark, and `load(k) match` does.
+trace_enter_answer(e: *Emit, r: TExpr, ret: Type) -> Option[Val]
+    if !traces_on || e.terminated then return None
+    if !is_result_type(ret) then return trace_enter(e, TExprStmt(r))
 
-// After it: the length written back, on the path that completed it.
+    var handed: Set[string] = set()
+
+    value_calls(r, handed)
+
+    if !holds_handled(TExprStmt(r), handed) then return None
+
+    take_mark(e)
+end trace_enter_answer
+
+// After a statement: the length written back, on the path that completed it.
 trace_leave(e: *Emit, mark: Option[Val])
     if mark.is_none() then return
 
@@ -243,6 +263,73 @@ trace_leave(e: *Emit, mark: Option[Val])
 
     if !e.terminated then reset_to(e, mark.unwrap())
 end trace_leave
+
+// After an answered value: its mark let go of. The trace was already put back, or kept, by
+// `trace_answer` on the way out.
+trace_close(e: *Emit, mark: Option[Val])
+    if mark.is_some() then e.trace_marks.pop()
+end trace_close
+
+// **A way out of the function that is not a failure leaves the trace as the function found it.** Every
+// statement the function completed put the trace back, so outside its open marks the trace is as long
+// as it was at entry, and the first open mark holds that length: a `return` from inside a handling
+// statement, or a last expression that handles, writes it back. With no mark open the function has
+// nothing of its own to prune and pays nothing.
+//
+// What leaves is `r`, as the value `v` or, built in the caller's storage, at `dest`, in a function
+// answering `ret`. One answering no `Result` never fails. One answering a `Result` keeps the trace
+// where it fails -- `Err(e) -> return Err(Wrap(e))` keeps the chain it handled -- so a value that is
+// neither variant written out is told apart by its tag.
+trace_answer(e: *Emit, r: Option[TExpr], v: Option[Val], dest: Option[Val], ret: Type)
+    if !traces_on || e.terminated || e.trace_marks.is_empty() then return
+
+    val first = e.trace_marks.at(0)
+
+    if !is_result_type(ret)
+        reset_to(e, first)
+        return
+    end if
+
+    if r.is_some()
+        *r.unwrap().kind match
+            TEnumNew(_, variant, _) ->
+                if variant.name != "Err" then reset_to(e, first)
+
+                return
+            _ -> ()
+
+    val parts = fallible_parts(ret)
+    val d = enum_decl(ret)
+
+    if parts.is_none() || d.is_none() then return
+
+    val tag = fresh_reg(e)
+
+    if v.is_some()
+        emit(e, InExtract(tag, enum_lty(d.unwrap()), v.unwrap(), index_list(0)))
+    else if dest.is_some()
+        emit(e, InLoad(tag, l_i32(), dest.unwrap(), AccPlain, None))
+    else
+        return
+
+    val failed = fresh_reg(e)
+    val reset_l = fresh_label(e, "trace.answered")
+    val past_l = fresh_label(e, "trace.past")
+
+    emit(e, InIntCmp(failed, IEq, l_i32(), tag, VInt(parts.unwrap().1.tag)))
+    emit_term(e, InCondBr(failed, past_l, reset_l))
+    emit_label(e, reset_l)
+    reset_to(e, first)
+    emit_term(e, InBr(past_l))
+    emit_label(e, past_l)
+end trace_answer
+
+// A tail call -- a self-call made a jump, or a `become` -- leaves the frame without coming back to it,
+// so before it the trace goes back to where the function's first open mark found it: the failure being
+// handled is not the callee's.
+trace_jump(e: *Emit)
+    if traces_on && !e.terminated && !e.trace_marks.is_empty() then reset_to(e, e.trace_marks.at(0))
+end trace_jump
 
 // A `break` or `continue` completes every statement opened inside the loop it leaves, so the trace
 // goes back to where the first of them found it.
@@ -257,13 +344,22 @@ private reset_to(e: *Emit, n: Val)
     emit(e, ir_call(None, LVoid, VGlobal(ResetSymbol), args))
 end reset_to
 
-// What a walk of one statement found: an answer that may have failed and is not handed on by a `?`.
-// The operands of the `?`s are noted as the walk passes them, which is before it reaches them.
+// What a walk of one statement found: every call in it answering a `Result`, those of them a `?` hands
+// on, and the stretch of text its expressions cover. The operands of the `?`s are noted as the walk
+// passes them, which is before it reaches them.
 struct Handled
-    found: bool
     passed: Set[string]
+    answers: Buf[string]
+    lo: usize
+    hi: usize
+    any: bool
 
     note(*self, x: TExpr)
+        if !self.any || x.span.start < self.lo then self.lo = x.span.start
+        if !self.any || x.span.end > self.hi then self.hi = x.span.end
+
+        self.any = true
+
         *x.kind match
             TTry(operand, _, _, _, _, _, _) -> self.passed.add(site_key(operand.span))
             TCall(_, _, ty, _) -> self.answer(x, ty)
@@ -274,23 +370,121 @@ struct Handled
             _ -> ()
 
     answer(*self, x: TExpr, ty: Type)
-        if is_result_type(ty) && !self.passed.has(site_key(x.span)) then self.found = true
+        if is_result_type(ty) then self.answers.push(site_key(x.span))
 end Handled
 
-// Whether `s` handles a failure: it is one that completes, and it calls something answering a
-// `Result` whose answer no `?` hands on. A `return` never completes; a `defer` runs its statements
+private fresh_handled() -> &Handled = Handled(set(), buf(), 0, 0, false)
+
+// The calls that belong to a statement nested in the one being asked about rather than to it. The
+// first statement the walk is told of is the one asked about itself.
+//
+// **Each expression is walked here once.** The walk tells of a statement before the ones inside it,
+// so a statement lying within the text of the last one walked here is inside it, and its calls are
+// already kept. Asking every nested statement afresh made a body cost its depth squared. Text is
+// only ever the test for skipping, so a statement whose spans mislead is walked, never lost.
+struct InnerCalls
+    entered: bool
+    keys: Set[string]
+    lo: usize
+    hi: usize
+
+    note(*self, t: TStmt)
+        if !self.entered
+            self.entered = true
+            return
+
+        // A `break` or `continue` completes the statements it leaves, so what it calls is theirs.
+        t match
+            TBreak(_, _) -> return
+            TContinue(_) -> return
+            _ -> ()
+
+        val lead = lead_expr(t)
+
+        if lead.is_some() && lead.unwrap().span.start >= self.lo && lead.unwrap().span.end <= self.hi
+            return
+
+        val h = fresh_handled()
+
+        walk_stmt(t, expr_walk(false, x -> h.note(x)))
+
+        for key in h.answers
+            self.keys.add(key)
+
+        if h.any
+            self.lo = h.lo
+            self.hi = h.hi
+    end note
+end InnerCalls
+
+// The first expression a walk of `s` reaches, where it has one.
+private lead_expr(s: TStmt) -> Option[TExpr] = s match
+    TVarDecl(_, _, init, _) -> Some(init)
+    TExprStmt(x) -> Some(x)
+    TInvariant(cond, _) -> Some(cond)
+    TVariantCheck(_, _, x) -> Some(x)
+    TRefDecl(_, _, place) -> Some(place)
+    TWriteStmt(w) -> Some(w.place)
+    TReturn(value) -> value
+    TBecome(call) -> Some(call)
+    _ -> None
+
+// Whether `s` is a statement that completes: a `return` never does, nor a `break` or `continue`
+// (each puts the trace back to its loop's first mark itself), and a `defer` runs its statements
 // elsewhere, each pruned there.
-private handles_failure(s: TStmt) -> bool
-    s match
-        TReturn(_) -> return false
-        TBecome(_) -> return false
-        TBreak(_, _) -> return false
-        TContinue(_) -> return false
-        TDefer(_, _) -> return false
-        _ -> ()
+private completes(s: TStmt) -> bool = s match
+    TReturn(_) -> false
+    TBecome(_) -> false
+    TBreak(_, _) -> false
+    TContinue(_) -> false
+    TDefer(_, _) -> false
+    _ -> true
 
-    val h: &Handled = Handled(false, set())
+// Whether `s` handles a failure: it is one that completes, and it HOLDS a call answering a `Result`
+// whose answer no `?` hands on -- holds it itself, not inside a statement nested in it.
+//
+// **A call belongs to the innermost statement holding it**, which is the one that prunes it. That
+// statement puts the trace back when it completes, so the statements around it find the trace as long
+// as it was when it began and have nothing of that call's to prune: a dispatch `match` whose one
+// handling arm handles in a statement of its own pays nothing on the arms that do not, and a loop
+// whose body handles pays per handling statement, never per turn for the loop as a whole. A call in a
+// `return` or `become` is the function's answer, handed on and never pruned. A `break` or `continue`
+// is the exception: it completes the statements it leaves, so a call in its value is theirs.
+private handles_failure(s: TStmt) -> bool = completes(s) && holds_handled(s, set())
 
-    walk_stmt(s, expr_walk(false, x -> h.note(x)))
-    h.found
-end handles_failure
+// Whether `s` holds a call answering a `Result` whose answer neither a `?` nor `handed` hands on, and
+// that no statement nested in `s` holds.
+private holds_handled(s: TStmt, handed: Set[string]) -> bool
+    val h = fresh_handled()
+    val n: &InnerCalls = InnerCalls(false, set(), 1, 0)
+
+    walk_stmt(s, TWalk(false, x -> h.note(x), w -> (), t -> n.note(t)))
+
+    for key in h.answers
+        if !h.passed.has(key) && !n.keys.has(key) && !handed.has(key) then return true
+
+    false
+end holds_handled
+
+// The calls `x` hands back as a function's answer: `x` itself, or the value of an arm of an `if` or a
+// `match` it is, or the value of a block it is -- as deep as they nest, as `tail_expr_origins` reads
+// the failures it can be.
+private value_calls(x: TExpr, out: Set[string]) = *x.kind match
+    TCall(_, _, _, _) -> out.add(site_key(x.span))
+    TVCall(_, _, _, _, _) -> out.add(site_key(x.span))
+    TCallPtr(_, _, _, _) -> out.add(site_key(x.span))
+    TAwait(_, _) -> out.add(site_key(x.span))
+    TBlockOn(_, _) -> out.add(site_key(x.span))
+    TIf(_, then_block, else_block, _) ->
+        block_value_calls(then_block, out)
+
+        if else_block.is_some() then block_value_calls(else_block.unwrap(), out)
+    TMatch(_, arms, _) ->
+        for arm in arms
+            block_value_calls(arm.body, out)
+    TBlockExpr(b) -> block_value_calls(b, out)
+    _ -> ()
+
+private block_value_calls(b: TBlock, out: Set[string])
+    if b.result.is_some() then value_calls(b.result.unwrap(), out)
+end block_value_calls

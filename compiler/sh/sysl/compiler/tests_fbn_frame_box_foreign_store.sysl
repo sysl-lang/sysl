@@ -1,0 +1,521 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.process.{capture, Var}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.text.{cstring, Search}
+
+// A closure boxed behind a `&Fn` is laid in its frame only where nothing reaches it after the frame
+// (`tests_cfb_closure_frame_box.sysl`). These are the stores into storage the frame cannot show is its
+// own: a field of what a call answers (`current().sink = f`), what a method's `*self` points at, a
+// global pointer, an `Option` or a `Buf` element or a struct literal stored there, a chain of calls,
+// a trait object's answer, a local bound to a call's answer, a local object made here around a
+// pointer or a `Buf` it was handed, and a local object made here then kept in module storage. Each
+// cell is crossed with what is stored: a closure literal with a capture, a named function, and a
+// generic function given its type by the `&Fn`. Each closure is called after another frame has
+// overwritten the one that stored it, so a box left in a dead frame prints garbage or faults.
+//
+// The negative cells keep the frame box: the same three kinds, held in a local, a local object made
+// here (a field, an `Option`, a struct literal), a local struct value and a local array.
+//
+// Skipped cells, and why: a method value and a nested function cannot be stored at all (`t.say` and
+// a nested `inner` are refused as values); a generic function named with its type arguments
+// (`echo[int]`) is refused as a value, so the generic cell is the inferred `echo`. `@no_alloc` and a
+// board with no heap cannot build the escaping cells, since they need the heap box this fix gives.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private extern "setenv" fbn_c_setenv(name: *u8, value: *u8, overwrite: int) -> int
+private extern "unsetenv" fbn_c_unsetenv(name: *u8) -> int
+
+private struct FbnRun
+    out: string
+    err: string
+    hooks: usize
+end FbnRun
+
+// The program built and run: on the counted heap, or with `flags` handed to clang. Under a sanitizer
+// the run asks AddressSanitizer to keep every returned frame, so a box in a dead frame is reported.
+private fbn_run(text: string, counted: bool, flags: string) -> FbnRun
+    val root = make_temp_dir("sysl-fbn").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", forms_imported(text)).unwrap()
+
+    val exe = s"$root/built"
+
+    if flags != ""
+        val n = cstring("SYSL_EXTRA_CFLAGS")
+        val v = cstring(flags)
+
+        fbn_c_setenv(n.ptr, v.ptr, 1)
+    end if
+
+    force_alloc_counting(counted)
+
+    val made = build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe))
+
+    force_alloc_counting(false)
+
+    if flags != ""
+        val n = cstring("SYSL_EXTRA_CFLAGS")
+
+        fbn_c_unsetenv(n.ptr)
+    end if
+
+    made match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return FbnRun(failure_text(why), "", 0)
+        Ok(_) -> ()
+
+    val hooks = capture("nm", ["-u", exe], "", [], true) match
+        Ok(o) -> o.text.count_of("__asan_report")
+        Err(_) -> 0
+
+    val ran = capture(exe, [], "", [Var("ASAN_OPTIONS", "detect_stack_use_after_return=1")], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    ran match
+        Err(_) -> FbnRun("could not be started", "", hooks)
+        Ok(o) -> FbnRun(o.text, o.err.unwrap_or(""), hooks)
+end fbn_run
+
+// The program printed `want` on the counted heap, and gave back everything it took.
+private fbn_prints(text: string, want: string)
+    if !enm_ready() then return
+
+    val got = fbn_run(text, true, "")
+
+    assert_eq(got.out, want)
+    assert_eq(got.err, "")
+end fbn_prints
+
+// The program printed `want` under AddressSanitizer, instrumented, and nothing was reported.
+private fbn_asan(text: string, want: string)
+    if !enm_ready() then return
+
+    val got = fbn_run(text, false, "-fsanitize=address -g")
+
+    assert(got.hooks > 0, s"not instrumented: ${got.out}")
+    assert_eq(got.out, want)
+    assert_eq(got.err, "")
+end fbn_asan
+
+// How many closures a program's IR boxes in a frame, or its report.
+private fbn_frame_boxes(text: string) -> int
+    val root = make_temp_dir("sysl-fbn").unwrap()
+
+    write_text(s"$root/main.sysl", forms_imported(text)).unwrap()
+
+    val ir = emit_llvm_text(s"$root/main.sysl", None) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> if made.report.is_empty() then made.text else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+
+    var n = 0
+
+    for line in lines_of(ir).view()
+        if line.contains("= alloca %arc.$closure") then n += 1
+
+    n
+end fbn_frame_boxes
+
+// What `--explain-escapes` reports for a program, one line each.
+private fbn_explained(text: string) -> string
+    if xvr_no_library() then return ""
+
+    val root = make_temp_dir("sysl-fbn").unwrap()
+
+    write_text(s"$root/main.sysl", forms_imported(text)).unwrap()
+
+    var lines: Buf[string] = buf()
+    var notes: Buf[string] = buf()
+    val sink = &lines
+    val noted = &notes
+    var args: Buf[string] = buf()
+
+    args.push("sysl")
+    args.push("emit-llvm")
+    args.push("--explain-escapes")
+    args.push(s"$root/main.sysl")
+
+    run_cli_noted(args.view(), (line) -> sink.push(line), (line) -> noted.push(line))
+    remove_dir_all(root).unwrap_or(())
+
+    var said = ""
+
+    for line in notes
+        said = said + line + "\n"
+
+    said
+end fbn_explained
+
+// -- the regression -------------------------------------------------------------------------------
+
+// slate's: a named function stored through the pointer a call answers, then replaced. The replaced
+// box was a dead frame's, and releasing it jumped to garbage.
+private const fbn_reduction: string = raw"""
+    struct Vm
+        sink: &Fn(string) -> unit
+
+    quiet(line: string) = ()
+
+    loud(line: string) = print(line)
+
+    static var the_vm = Vm(loud)
+
+    current() -> *Vm = &the_vm
+
+    reset() = current().sink = quiet
+
+    scribble(n: int) -> int
+        var xs: [64]int = [0; 64]
+
+        for i in 0..<64
+            xs[i] = n * 1000003 + i
+
+        xs[63]
+
+    reset()
+    print(scribble(7))
+    current().sink("still alive")
+    current().sink = loud
+    print("released")
+    """
+
+@test("a named function stored through what a call answers is boxed on the heap, and survives its frame")
+fbn_named_through_a_call()
+    fbn_prints(fbn_reduction, "7000084\nreleased\n")
+
+@test("and under AddressSanitizer, keeping returned frames: instrumented, and nothing reported")
+fbn_named_through_a_call_under_asan()
+    fbn_asan(fbn_reduction, "7000084\nreleased\n")
+
+@test("its IR boxes no closure in a frame")
+fbn_named_through_a_call_has_no_frame_box()
+    if xvr_no_library() then return
+
+    assert_eq(fbn_frame_boxes(fbn_reduction), 0)
+
+@test("--explain-escapes says the place stored into is not the frame's own")
+fbn_named_through_a_call_is_explained()
+    val said = fbn_explained(fbn_reduction)
+
+    if xvr_no_library() then return
+
+    assert(said.contains("is boxed on the heap, because it is stored in 'current().sink' on line 12, " +
+                         "which 'reset' cannot show is its own storage"), said)
+
+// The same with the `Vm` a local of the entry file's body, so `reset` is a function nested in it: the
+// store through `current()` still reaches storage `reset` cannot show is its own, and the one box
+// left in a frame is `Vm(loud)`'s, in the entry body's frame, which lasts as long as the program.
+private const fbn_entry_local: string = raw"""
+    struct Vm
+        sink: &Fn(string) -> unit
+
+    quiet(line: string) = ()
+
+    loud(line: string) = print(line)
+
+    var the_vm = Vm(loud)
+
+    current() -> *Vm = &the_vm
+
+    reset() = current().sink = quiet
+
+    scribble(n: int) -> int
+        var xs: [64]int = [0; 64]
+
+        for i in 0..<64
+            xs[i] = n * 1000003 + i
+
+        xs[63]
+
+    reset()
+    print(scribble(7))
+    current().sink("still alive")
+    current().sink = loud
+    print("released")
+    """
+
+@test("a nested function storing a named function through what a call answers survives its frame")
+fbn_entry_local_runs()
+    fbn_prints(fbn_entry_local, "7000084\nreleased\n")
+
+@test("and under AddressSanitizer, keeping returned frames: instrumented, and nothing reported")
+fbn_entry_local_under_asan()
+    fbn_asan(fbn_entry_local, "7000084\nreleased\n")
+
+@test("and only the entry body's own box is in a frame")
+fbn_entry_local_frame_boxes()
+    if xvr_no_library() then return
+
+    assert_eq(fbn_frame_boxes(fbn_entry_local), 1)
+
+// -- the matrix -----------------------------------------------------------------------------------
+
+private const fbn_matrix: string = raw"""
+    import sysl.buf.{Buf, buf}
+
+    struct Holder
+        f: &Fn(int) -> unit
+
+    struct Vm
+        sink: &Fn(int) -> unit
+        opt: Option[&Fn(int) -> unit]
+        fs: Buf[&Fn(int) -> unit]
+        holder: Holder
+
+    impl Vm
+        install(*self, tag: int) = self.sink = (n) -> print(tag + n)
+        install_named(*self) = self.sink = quiet
+
+    struct World
+        vm: Vm
+
+    impl World
+        vm_of(*self) -> *Vm = &self.vm
+
+    trait Host
+        state(self) -> *Vm
+
+    struct Plain
+        n: int
+
+    impl Host for Plain
+        state(self) -> *Vm = &the_world.vm
+
+    quiet(n: int) = print(n + 1)
+
+    echo[T: Display](n: T) = print(n)
+
+    var the_world = World(Vm(quiet, None, buf(), Holder(quiet)))
+
+    var the_ptr: *Vm = &the_world.vm
+
+    current() -> *Vm = &the_world.vm
+
+    world() -> *World = &the_world
+
+    scribble(n: int) -> int
+        var xs: [64]int = [0; 64]
+
+        for i in 0..<64
+            xs[i] = n * 1000003 + i
+
+        xs[63]
+
+    lit_call(tag: int) = current().sink = (n) -> print(tag + n)
+    named_call() = current().sink = quiet
+    generic_call() = current().sink = echo
+    lit_self(tag: int) = current().install(tag)
+    named_self() = current().install_named()
+    lit_global(tag: int) = the_ptr.sink = (n) -> print(tag + n)
+    named_global() = the_ptr.sink = quiet
+    lit_some(tag: int) = current().opt = Some((n) -> print(tag + n))
+    named_some() = current().opt = Some(quiet)
+    lit_elem(tag: int) = current().fs[0] = (n) -> print(tag + n)
+    named_elem() = current().fs[0] = quiet
+    lit_chain(tag: int) = world().vm_of().sink = (n) -> print(tag + n)
+    named_chain() = world().vm_of().sink = quiet
+
+    lit_trait(tag: int)
+        val h: &Host = Plain(0)
+        h.state().sink = (n) -> print(tag + n)
+
+    named_trait()
+        val h: &Host = Plain(0)
+        h.state().sink = quiet
+
+    lit_struct(tag: int) = current().holder = Holder((n) -> print(tag + n))
+    named_struct() = current().holder = Holder(quiet)
+
+    lit_local(tag: int)
+        val v = current()
+        v.sink = (n) -> print(tag + n)
+
+    named_local()
+        val v = current()
+        v.sink = quiet
+
+    struct Wrap
+        vm: *Vm
+
+    struct Bag
+        fs: Buf[&Fn(int) -> unit]
+
+    var the_kept: Option[&Holder] = None
+
+    lit_wrap(tag: int)
+        val w: &Wrap = Wrap(current())
+        w.vm.sink = (n) -> print(tag + n)
+
+    lit_bag(tag: int)
+        val b: &Bag = Bag(current().fs)
+        b.fs[0] = (n) -> print(tag + n)
+
+    lit_kept(tag: int)
+        val r: &Holder = Holder(quiet)
+        r.f = (n) -> print(tag + n)
+        the_kept = Some(r)
+
+    run(n: int)
+        print(scribble(n) - scribble(n))
+        current().sink(n)
+
+    main()
+        current().fs.push(quiet)
+        lit_call(100)
+        run(1)
+        named_call()
+        run(2)
+        generic_call()
+        run(3)
+        lit_self(200)
+        run(4)
+        named_self()
+        run(5)
+        lit_global(300)
+        run(6)
+        named_global()
+        run(7)
+        lit_some(400)
+        print(scribble(8) - scribble(8))
+        current().opt.unwrap()(8)
+        named_some()
+        current().opt.unwrap()(9)
+        lit_elem(500)
+        print(scribble(10) - scribble(10))
+        current().fs[0](10)
+        named_elem()
+        current().fs[0](11)
+        lit_chain(600)
+        run(12)
+        named_chain()
+        run(13)
+        lit_trait(700)
+        run(14)
+        named_trait()
+        run(15)
+        lit_struct(800)
+        print(scribble(16) - scribble(16))
+        current().holder.f(16)
+        named_struct()
+        current().holder.f(17)
+        lit_local(900)
+        run(18)
+        named_local()
+        run(19)
+        lit_wrap(1000)
+        run(20)
+        lit_bag(1100)
+        print(scribble(21) - scribble(21))
+        current().fs[0](21)
+        lit_kept(1200)
+        print(scribble(22) - scribble(22))
+        the_kept.unwrap().f(22)
+        the_kept = None
+        current().sink = quiet
+        current().opt = None
+        current().fs = buf()
+        current().holder = Holder(quiet)
+    """
+
+private const fbn_matrix_out: string = "0\n101\n0\n3\n0\n3\n0\n204\n0\n6\n0\n306\n0\n8\n0\n408\n10\n" +
+    "0\n510\n12\n0\n612\n0\n14\n0\n714\n0\n16\n0\n816\n18\n0\n918\n0\n20\n0\n1020\n0\n1121\n0\n1222\n"
+
+@test("every closure stored where its frame cannot show the storage is its own prints its own capture, and frees all")
+fbn_matrix_runs()
+    fbn_prints(fbn_matrix, fbn_matrix_out)
+
+@test("and under AddressSanitizer, keeping returned frames: instrumented, and nothing reported")
+fbn_matrix_under_asan()
+    fbn_asan(fbn_matrix, fbn_matrix_out)
+
+@test("no closure of the matrix is boxed in its frame")
+fbn_matrix_has_no_frame_box()
+    if xvr_no_library() then return
+
+    assert_eq(fbn_frame_boxes(fbn_matrix), 0)
+
+@test("--explain-escapes names each foreign place as it was written")
+fbn_matrix_is_explained()
+    val said = fbn_explained(fbn_matrix)
+
+    if xvr_no_library() then return
+
+    for place in ["'current().sink'", "'current().opt'", "'current().fs[0]'", "'world().vm_of().sink'",
+                  "'h.state().sink'", "'current().holder'", "'v.sink'", "'w.vm.sink'", "'b.fs[0]'"]
+        assert(said.contains(s"stored in $place"), s"$place: $said")
+
+    for owner in ["'lit_global'", "'named_global'", "'install'", "'install_named'", "'lit_kept'"]
+        assert(said.contains(s"which outlives $owner"), s"$owner: $said")
+
+// -- what stays in the frame ----------------------------------------------------------------------
+
+// The same three kinds, kept only in storage the frame owns: each is still boxed in its frame.
+private const fbn_local: string = raw"""
+    struct Holder
+        f: &Fn(int) -> unit
+
+    struct Vm
+        sink: &Fn(int) -> unit
+        opt: Option[&Fn(int) -> unit]
+        holder: Holder
+
+    struct Pair
+        f: &Fn(int) -> unit
+        n: int
+
+    quiet(n: int) = print(n + 1)
+
+    echo[T: Display](n: T) = print(n)
+
+    in_a_local(tag: int)
+        val f: &Fn(int) -> unit = (n) -> print(tag + n)
+        val g: &Fn(int) -> unit = quiet
+        val h: &Fn(int) -> unit = echo
+        f(1)
+        g(2)
+        h(3)
+
+    in_a_local_object(tag: int)
+        val r: &Vm = Vm(quiet, None, Holder(quiet))
+        r.sink = (n) -> print(tag + n)
+        r.opt = Some((n) -> print(tag + n + 1))
+        r.holder = Holder(echo)
+        r.sink(10)
+        r.opt.unwrap()(10)
+        r.holder.f(12)
+
+    in_a_value(tag: int)
+        var p = Pair(quiet, 0)
+        p.f = (n) -> print(tag + n)
+        p.f(20)
+        var a: [2]&Fn(int) -> unit = [quiet, quiet]
+        a[1] = (n) -> print(tag + n + 1)
+        a[1](20)
+
+    main()
+        in_a_local(100)
+        in_a_local_object(200)
+        in_a_value(300)
+    """
+
+@test("a closure kept only in storage its frame owns prints what it would on the heap, and frees all")
+fbn_local_runs()
+    fbn_prints(fbn_local, "101\n3\n3\n210\n211\n12\n320\n321\n")
+
+@test("and under AddressSanitizer, keeping returned frames: instrumented, and nothing reported")
+fbn_local_under_asan()
+    fbn_asan(fbn_local, "101\n3\n3\n210\n211\n12\n320\n321\n")
+
+@test("and all thirteen are boxed in their frames")
+fbn_local_stays_in_the_frame()
+    if xvr_no_library() then return
+
+    assert_eq(fbn_frame_boxes(fbn_local), 13)

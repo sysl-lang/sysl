@@ -1,0 +1,130 @@
+module sh.sysl.compiler
+@tests
+
+// **A bound promises what the trait it names requires**: `[T: wire.Codec]` with `trait Codec:
+// Encode` reaches `wire.Encode`'s `encode` through the signature, so the `Plain.encode` the compiler
+// supplies to every plain-data type does not answer ahead of it -- whether or not the file names
+// `Plain`, `sysl.codec`, or the required trait.
+
+private cpf_wire() -> (string, string, string) = ("wire", "w.sysl", raw"""
+    module wire
+
+    trait Encode
+        encode(self) -> string
+
+    trait Decode
+        decode(n: int) -> Self
+
+    trait Codec: Encode + Decode
+
+    trait Deep: Codec
+
+    impl Encode for int
+        encode(self) -> string = s"i${self}"
+
+    impl Decode for int
+        decode(n: int) -> int = n
+
+    impl Codec for int
+    """)
+
+@test("a bound's required trait answers for a plain struct's encode through a method call")
+cpf_method_through_required()
+    if !azb_ready() then return
+
+    azb_prints([("", "main.sysl", raw"""
+        struct P
+            x: int
+
+        impl wire.Encode for P
+            encode(self) -> string = s"p${self.x}"
+
+        impl wire.Decode for P
+            decode(n: int) -> P = P(n)
+
+        impl wire.Codec for P
+
+        shown[T: wire.Codec](v: T) -> string = v.encode()
+
+        print(shown(P(3)))
+        """), cpf_wire()], "p3\n")
+end cpf_method_through_required
+
+@test("the same through an associated call, and through two levels of requirement")
+cpf_associated_and_deep()
+    if !azb_ready() then return
+
+    azb_prints([("", "main.sysl", raw"""
+        struct P
+            x: int
+
+        impl wire.Encode for P
+            encode(self) -> string = s"p${self.x}"
+
+        impl wire.Decode for P
+            decode(n: int) -> P = P(n)
+
+        impl wire.Codec for P
+
+        impl wire.Deep for P
+
+        again[T: wire.Deep](n: int) -> string = T.decode(n).encode()
+
+        print(again[P](7))
+        """), cpf_wire()], "p7\n")
+end cpf_associated_and_deep
+
+@test("with Plain imported by the file, the bound's trait still answers")
+cpf_plain_imported()
+    if !azb_ready() then return
+
+    azb_prints([("", "main.sysl", raw"""
+        import sysl.encoding.Plain
+
+        struct P
+            x: int
+
+        impl wire.Encode for P
+            encode(self) -> string = s"p${self.x}"
+
+        impl wire.Decode for P
+            decode(n: int) -> P = P(n)
+
+        impl wire.Codec for P
+
+        shown[T: wire.Codec](v: T) -> string = v.encode()
+
+        print(shown(P(3)))
+        """), cpf_wire()], "p3\n")
+end cpf_plain_imported
+
+@test("an integer receiver, with sysl.codec imported, meets the bound's trait")
+cpf_integer_receiver()
+    if !azb_ready() then return
+
+    azb_prints([("", "main.sysl", raw"""
+        import sysl.codec
+
+        shown[T: wire.Codec](v: T) -> string = v.encode()
+
+        print(shown(5))
+        """), cpf_wire()], "i5\n")
+end cpf_integer_receiver
+
+@test("with no bound, a plain struct's encode is still Plain's")
+cpf_unbound_stays_plain()
+    if !azb_ready() then return
+
+    azb_prints([("", "main.sysl", raw"""
+        import sysl.encoding.Plain
+
+        struct P
+            x: int
+
+        impl wire.Encode for P
+            encode(self) -> string = "wire"
+
+        var out: [8]u8
+        print(P(3).encode(out[0..<8]))
+        """), cpf_wire()], "true\n")
+end cpf_unbound_stays_plain

@@ -4,7 +4,7 @@ module sh.sysl.compiler
 import sysl.buf.{Buf, buf}
 import sysl.fs.{exists, make_dir_all, make_temp_dir, remove_dir_all, write_text}
 import sysl.process.{capture, Status}
-import sysl.text.{replace_all, Search}
+import sysl.text.{replace_all, Search, split, str_builder}
 
 // The error return trace (`error_trace.sysl`, `library/sysl/sys/trace.c`, `sysl.debug`): each rule of
 // `docs/design/error-traces.md`, read off a program built as a child and run -- its standard error
@@ -687,3 +687,564 @@ ert_freestanding_has_no_tls()
     assert(symbols.contains(".data.sysl_error_trace_current\t00000004 sysl_error_trace_current"), symbols)
     assert(symbols.contains(" w    F .text.sysl_error_trace_report"), symbols)
 end ert_freestanding_has_no_tls
+
+// -- the statement that prunes is the innermost one holding the call -------------------------------------
+//
+// A handled call is pruned by the innermost statement holding it, so the statements around it -- a
+// dispatch loop's `while` and its `match` -- pay nothing, and a `?` that succeeds pays nothing
+// wherever it sits. The trace each program ends with is the one it had before.
+
+// An interpreter's shape: a loop over instructions, one arm that hands a failure on, one that handles
+// one in a statement of its own, and one that returns a failure. From line 3 of a file beginning with
+// an import and a blank line.
+private etk_dispatch() -> string = raw"""
+    enum Op
+        Add(n: int)
+        Check(n: int)
+        Probe(n: int)
+        Halt
+
+    probe(n: int) -> Result[int, string] = if n % 2 == 0 then Ok(n) else Err("odd")
+    check(n: int) -> Result[unit, string] = if n < 0 then Err("negative") else Ok(())
+    fault(why: string) -> Result[int, string] = Err(why)
+
+    run(ops: []const Op) -> Result[int, string]
+        var total = 0
+        var pc = 0
+
+        while pc < ops.len
+            val op = ops[pc]
+
+            pc += 1
+
+            op match
+                Add(n) -> total += n
+                Check(n) ->
+                    check(n)?
+                    total += 1
+                Probe(n) ->
+                    val v = probe(n) match
+                        Ok(v) -> v
+                        Err(_) -> -1
+
+                    total += v
+                Halt -> return fault("halted")
+
+        Ok(total)
+
+    """
+
+// The text of the `define` whose line names `name`, up to its closing brace.
+private etk_body_of(ir: string, name: string) -> string
+    var b = str_builder()
+    var inside = false
+
+    for line in split(ir, "\n")
+        if !inside && line.starts_with("define") && line.contains(name) then inside = true
+
+        if inside
+            b.push(line)
+            b.push("\n")
+
+            if line == "}" then return b.finish()
+    end for
+
+    s"no define of $name in:\n$ir"
+end etk_body_of
+
+@test("a dispatch loop marks and resets once, in the statement that handles, never per turn")
+etk_a_dispatch_loop_pays_only_where_it_handles()
+    if xvr_no_library() then return
+
+    val ir = xvr_ir(ert_main("import sysl.debug.error_trace\n\n" + etk_dispatch() +
+                             "print(run([Op.Probe(3)]).unwrap_or(0))\n"))
+    val run = etk_body_of(ir, " @run$$")
+
+    assert_eq(run.count_of("call i32 @sysl_error_trace_mark()"), 1)
+    assert_eq(run.count_of("call void @sysl_error_trace_reset(i32 %"), 1)
+    assert_eq(ir.count_of("call i32 @sysl_error_trace_mark()"), 2)
+end etk_a_dispatch_loop_pays_only_where_it_handles
+
+@test("a '?' and a returned failure inside a loop and a match lay down no mark, no reset and no TLS")
+etk_a_try_that_succeeds_costs_nothing()
+    if xvr_no_library() then return
+
+    val ir = xvr_ir(ert_main(raw"""
+        check(n: int) -> Result[unit, string] = if n < 0 then Err("negative") else Ok(())
+        fault(why: string) -> Result[int, string] = Err(why)
+
+        walk(xs: []const int) -> Result[int, string]
+            var total = 0
+
+            for x in xs
+                x match
+                    0 -> return fault("zero")
+                    _ ->
+                        check(x)?
+                        total += x
+
+            Ok(total)
+
+        print(walk([1, 2]).is_ok())
+        """))
+    val walk = etk_body_of(ir, " @walk$$")
+
+    assert(walk.contains("call void @sysl_error_trace_push(ptr @.loc"), walk)
+    assert(!walk.contains("sysl_error_trace_mark") && !walk.contains("sysl_error_trace_reset"), walk)
+    assert(!walk.contains("threadlocal") && !walk.contains("_tlv"), walk)
+end etk_a_try_that_succeeds_costs_nothing
+
+@test("a dispatch loop that handles leaves the trace empty, and its failure keeps every frame")
+etk_a_dispatch_loop_keeps_its_trace()
+    ert_says(ert_main("import sysl.debug.error_trace\n\n" + etk_dispatch() + raw"""
+        main() -> Result[unit, string]
+            print(run([Op.Add(1), Op.Check(2), Op.Probe(2), Op.Probe(3)])?, error_trace().len())
+            print(run([Op.Halt]).is_err(), error_trace().len())
+            print(error_trace().len())
+            print(run([Op.Add(1), Op.Check(-1)])?)
+            Ok(())
+        """), Status.Exited(1), "3 0\ntrue 1\n0\n",
+        "error: negative\nerror return trace (origin first):\n  main.sysl:10:55 in check\n" +
+        "  main.sysl:25:25 in run\n  main.sysl:41:41 in main\n")
+
+@test("an error handled and the call retried leaves no frame, so the last failure's trace is its own")
+etk_handled_then_retried()
+    ert_says(ert_main(raw"""
+        import sysl.debug.error_trace
+
+        attempt(n: int) -> Result[int, string] = if n < 3 then Err("busy") else Ok(n)
+
+        retry(limit: int) -> Result[int, string]
+            var i = 0
+
+            while i < limit
+                attempt(i) match
+                    Ok(v) -> return Ok(v)
+                    Err(_) -> i += 1
+
+            val last = attempt(0)?
+            Ok(last)
+
+        main() -> Result[unit, string]
+            print(retry(5)?, error_trace().len())
+            print(retry(2)?)
+            Ok(())
+        """), Status.Exited(1), "3 0\n",
+        "error: busy\nerror return trace (origin first):\n  main.sysl:3:56 in attempt\n" +
+        "  main.sysl:13:26 in retry\n  main.sysl:18:19 in main\n")
+
+@test("a '?' in nested loops beside a handled call fails with its own frames and nothing handled")
+etk_nested_try_in_loops()
+    ert_says(ert_main(raw"""
+        import sysl.debug.error_trace
+
+        probe(n: int) -> Result[int, string] = if n == 7 then Err("seven") else Ok(n)
+
+        sum(rows: int) -> Result[int, string]
+            var total = 0
+
+            for r in 0..<rows
+                for c in 0..<3
+                    if c == 1
+                        total += probe(r * 3 + c)?
+                    else
+                        probe(r * 3 + c + 7) match
+                            Ok(v) -> total += v
+                            Err(_) -> continue
+
+            Ok(total)
+
+        main() -> Result[unit, string]
+            print(sum(2)?, error_trace().len())
+            print(sum(3)?)
+            Ok(())
+        """), Status.Exited(1), "36 0\n",
+        "error: seven\nerror return trace (origin first):\n  main.sysl:3:55 in probe\n" +
+        "  main.sysl:11:42 in sum\n  main.sysl:21:17 in main\n")
+
+@test("a closure and a generic body prune in the statement that handles, at every instantiation")
+etk_closures_and_generics()
+    ert_says(ert_main(raw"""
+        import sysl.debug.error_trace
+
+        probe(n: int) -> Result[int, string] = if n % 2 == 0 then Ok(n) else Err("odd")
+
+        tally[T](xs: []const T, f: &Fn(T) -> int) -> int
+            var total = 0
+
+            for x in xs
+                val n = f(x)
+
+                if n >= -10
+                    probe(n) match
+                        Ok(v) -> total += v
+                        Err(_) -> total -= 1
+
+            total
+
+        val step = (n: int) ->
+            var k = 0
+
+            if n > 0
+                probe(n) match
+                    Ok(v) -> k = v
+                    Err(_) -> k = -n
+
+            k
+
+        print(tally([1, 2, 3], step), error_trace().len())
+        print(tally(["ab", "abc"], (s: string) -> int(s.len)), error_trace().len())
+        """), Status.Exited(0), "0 0\n1 0\n", "")
+
+@test("a thread that handles in a loop prunes its own trace and leaves another thread's alone")
+etk_a_thread_prunes_its_own()
+    ert_says(ert_main(raw"""
+        import sysl.debug.error_trace
+        import sysl.threads.spawn
+
+        probe(n: int) -> Result[int, string] = if n % 2 == 0 then Ok(n) else Err("odd")
+
+        churn(out: *usize)
+            var total = 0
+
+            for i in 0..<100
+                if i >= 0
+                    probe(i) match
+                        Ok(v) -> total += v
+                        Err(_) -> total -= 1
+
+            *out = error_trace().len()
+
+        var theirs: usize = 9
+
+        probe(1) match
+            Ok(_) -> ()
+            Err(_) ->
+                val t = spawn(&churn, &theirs).unwrap()
+
+                t.join()
+                print(theirs, error_trace().len())
+        """), Status.Exited(0), "0 1\n", "")
+
+@test("an await handled inside a loop of an async body is pruned by its own statement")
+etk_an_await_prunes_in_its_statement()
+    ert_says(ert_main(raw"""
+        import sysl.debug.error_trace
+
+        async read(n: int) -> Result[int, string] = if n > 2 then Err("big") else Ok(n)
+
+        async total(xs: []const int) -> int
+            var sum = 0
+
+            for x in xs
+                if x >= 0
+                    val r = await read(x)
+
+                    sum += r.unwrap_or(-1)
+
+            sum
+
+        print(block_on(total([1, 5, 2])), error_trace().len())
+        """), Status.Exited(0), "2 0\n", "")
+
+@test("a break's handled value belongs to the statements it leaves, and a continue resets as before")
+etk_break_value_and_continue()
+    ert_says(ert_main(raw"""
+        import sysl.debug.error_trace
+
+        probe(n: int) -> Result[int, string] = if n % 2 == 0 then Ok(n) else Err("odd")
+
+        val first = loop
+            if 1 > 0
+                break probe(1)
+
+        print(first.is_err(), error_trace().len())
+
+        val second = loop
+            break probe(3)
+
+        print(second.is_err(), error_trace().len())
+
+        for i in 0..<4
+            if i >= 0
+                probe(i) match
+                    Ok(_) -> ()
+                    Err(_) -> continue
+
+        print(error_trace().len())
+        """), Status.Exited(0), "true 0\ntrue 0\n0\n", "")
+
+// -- a function that answers without failing leaves the trace as it found it ---------------------------
+//
+// A failure a function handled is pruned when the statement handling it completes, but a function may
+// answer before that: from inside the statement, or with a last expression that handles one. Every way
+// out that is not a failure puts the trace back to where the function's first open mark found it, so
+// the caller -- passing the answer on with `?`, which prunes nothing -- finds the trace as it was.
+
+// Each way out of a handling statement, or of a handling last expression, that answers without
+// failing. From line 3 of a file beginning with an import and a blank line.
+private stl_answers() -> string = raw"""
+    probe(n: int) -> Result[int, string] = if n % 2 == 0 then Ok(n) else Err("odd")
+    fault(why: string) -> Result[int, string] = Err(why)
+
+    tail_ok(n: int) -> Result[int, string] = probe(n) match
+        Ok(v) -> Ok(v)
+        Err(_) -> Ok(0)
+
+    arm_ok(n: int) -> Result[int, string]
+        val v = probe(n) match
+            Ok(v) -> v
+            Err(_) -> return Ok(-1)
+
+        Ok(v)
+
+    arm_int(n: int) -> int
+        val v = probe(n) match
+            Ok(v) -> v
+            Err(_) -> return -1
+
+        v
+
+    returned(n: int) -> bool
+        if n < 0 then return false
+
+        return probe(n).is_ok()
+
+    nested(n: int) -> Result[int, string]
+        probe(n) match
+            Ok(_) -> ()
+            Err(_) ->
+                probe(n + 2) match
+                    Ok(_) -> ()
+                    Err(_) -> return Ok(-2)
+
+        Ok(n)
+
+    computed(n: int, k: int) -> Result[int, string]
+        val v = probe(n) match
+            Ok(v) -> v
+            Err(_) -> return probe(k)
+
+        Ok(v)
+
+    scan(xs: []const int) -> Result[int, string]
+        for x in xs
+            probe(x) match
+                Ok(v) -> return Ok(v)
+                Err(_) -> continue
+
+        Ok(-1)
+
+    spin(n: int) -> Result[int, string]
+        var i = n
+
+        while probe(i).is_err()
+            i += 2
+
+            if i > 9 then return Ok(i)
+
+        Ok(i)
+
+    settle(n: int) -> Result[int, string]
+        val v = probe(n) match
+            Ok(v) -> v
+            Err(_) -> return settle(n - 1)
+
+        Ok(v)
+
+    """
+
+private stl_answers_main() -> string = "import sysl.debug.error_trace\n\n" + stl_answers() + raw"""
+    main() -> Result[unit, string]
+        print(tail_ok(1)?, error_trace().len())
+        print(arm_ok(1)?, error_trace().len())
+        print(arm_int(1), error_trace().len())
+        print(returned(1), error_trace().len())
+        print(nested(1)?, error_trace().len())
+        print(computed(1, 2)?, error_trace().len())
+        print(computed(1, 3).is_err(), error_trace().len())
+        print(scan([1, 3, 4])?, error_trace().len())
+        print(spin(1)?, error_trace().len())
+        print(settle(3)?, error_trace().len())
+        print(fault("late")?)
+        Ok(())
+    """
+
+private stl_answers_printed() -> string = "0 0\n-1 0\n-1 0\nfalse 0\n-2 0\n2 0\ntrue 2\n4 0\n11 0\n2 0\n"
+
+@test("a function answering without failing leaves no frame of what it handled, however it answers")
+stl_every_answer_leaves_the_trace()
+    ert_says(ert_main(stl_answers_main()), Status.Exited(1), stl_answers_printed(),
+             "error: late\nerror return trace (origin first):\n  main.sysl:4:45 in fault\n" +
+             "  main.sysl:82:24 in main\n")
+
+@test("with traces off, the same answers lay down nothing and the failure prints alone")
+stl_off_is_unaffected()
+    var flags: [1]string = ["--no-error-traces"]
+
+    assert_eq(took_search_flag(flags[..], 0), 1)
+    ert_says(ert_main(stl_answers_main()), Status.Exited(1),
+             "0 0\n-1 0\n-1 0\nfalse 0\n-2 0\n2 0\ntrue 0\n4 0\n11 0\n2 0\n", "error: late\n")
+
+    if !xvr_no_library()
+        val ir = xvr_ir(ert_main(stl_answers_main()))
+
+        assert(ir.contains("define"), ir)
+        assert(!ir.contains("sysl_error_trace"), ir)
+    end if
+
+    reset_search_paths()
+    use_error_traces(true)
+end stl_off_is_unaffected
+
+@test("a closure, a generic body at two instantiations and a thread each answer with the trace as found")
+stl_closures_generics_threads()
+    ert_says(ert_main(raw"""
+        import sysl.debug.error_trace
+        import sysl.threads.spawn
+
+        probe(n: int) -> Result[int, string] = if n % 2 == 0 then Ok(n) else Err("odd")
+
+        first[T](xs: []const T, f: &Fn(T) -> int) -> Result[int, string]
+            for x in xs
+                probe(f(x)) match
+                    Ok(v) -> return Ok(v)
+                    Err(_) -> ()
+
+            Ok(-1)
+
+        arm_int(n: int) -> int
+            val v = probe(n) match
+                Ok(v) -> v
+                Err(_) -> return -1
+
+            v
+
+        worker(out: *usize)
+            val v = arm_int(3)
+
+            *out = error_trace().len() + usize(v + 1)
+
+        main() -> Result[unit, string]
+            val pick = (n: int) ->
+                val v = probe(n) match
+                    Ok(v) -> v
+                    Err(_) -> return -1
+
+                v
+
+            print(pick(5), error_trace().len())
+            print(first([1, 3, 6], (n: int) -> n)?, error_trace().len())
+            print(first(["a", "abc", "ab"], (s: string) -> int(s.len))?, error_trace().len())
+
+            var theirs: usize = 9
+
+            print(arm_int(1), error_trace().len())
+
+            val t = spawn(&worker, &theirs).unwrap()
+
+            t.join()
+            print(theirs, error_trace().len())
+            Ok(())
+        """), Status.Exited(0), "-1 0\n6 0\n2 0\n-1 0\n0 0\n", "")
+
+@test("an async body answering Ok from a handling statement or a handling tail leaves the trace")
+stl_async_answers()
+    ert_says(ert_main(raw"""
+        import sysl.debug.error_trace
+
+        async read(n: int) -> Result[int, string] = if n > 2 then Err("big") else Ok(n)
+
+        async settle(n: int) -> Result[int, string]
+            val v = (await read(n)) match
+                Ok(v) -> v
+                Err(_) -> return Ok(0)
+
+            Ok(v)
+
+        async tail(n: int) -> Result[int, string] = (await read(n)) match
+            Ok(v) -> Ok(v)
+            Err(_) -> Ok(-1)
+
+        async kept(n: int) -> Result[int, string]
+            val v = (await read(n)) match
+                Ok(v) -> v
+                Err(_) -> return await read(n + 1)
+
+            Ok(v)
+
+        main() -> Result[unit, string]
+            print(block_on(settle(5))?, error_trace().len())
+            print(block_on(tail(5))?, error_trace().len())
+            print(block_on(kept(5)).is_err(), error_trace().len())
+            Ok(())
+        """), Status.Exited(0), "0 0\n-1 0\ntrue 2\n", "")
+
+@test("an errdefer, a result built in the caller's storage and a become answer with the trace as found")
+stl_errdefer_indirect_become()
+    ert_says(ert_main(raw"""
+        import sysl.debug.error_trace
+
+        probe(n: int) -> Result[int, string] = if n % 2 == 0 then Ok(n) else Err("odd")
+
+        guarded(n: int, k: int) -> Result[int, string]
+            errdefer print("undo", error_trace().len())
+
+            val v = probe(n) match
+                Ok(v) -> v
+                Err(_) -> return probe(k)
+
+            Ok(v)
+
+        big(n: int) -> Result[(int, int, int, int, int), string] = probe(n) match
+            Ok(v) -> Ok((v, v, v, v, v))
+            Err(_) -> Ok((0, 1, 2, 3, 4))
+
+        big_arm(n: int) -> Result[(int, int, int, int, int), string]
+            val v = probe(n) match
+                Ok(v) -> v
+                Err(_) -> return Ok((5, 6, 7, 8, 9))
+
+            Ok((v, v, v, v, v))
+
+        hop(n: int) -> Result[int, string]
+            probe(n) match
+                Ok(_) -> ()
+                Err(_) -> become hop(n - 1)
+
+            Ok(n)
+
+        main() -> Result[unit, string]
+            print(guarded(1, 2)?, error_trace().len())
+            print(guarded(1, 3).is_err(), error_trace().len())
+            print(big(1)?.4, error_trace().len())
+            print(big_arm(1)?.4, error_trace().len())
+            print(hop(5)?, error_trace().len())
+            Ok(())
+        """), Status.Exited(0), "2 0\nundo 2\ntrue 2\n4 0\n9 0\n4 0\n", "")
+
+@test("only a function that answers from a handling statement or a handling tail pays a reset there")
+stl_the_cost_stays_where_it_was()
+    if xvr_no_library() then return
+
+    val ir = xvr_ir(ert_main("import sysl.debug.error_trace\n\n" + stl_answers() + raw"""
+        plain(n: int) -> Result[int, string]
+            val a = probe(n)?
+
+            if a > 3 then return probe(a)
+
+            probe(a + 1)
+
+        print(plain(2).is_ok(), tail_ok(1).is_ok(), arm_ok(1).is_ok(), arm_int(1))
+        """))
+    val plain = etk_body_of(ir, " @plain$$")
+    val tail = etk_body_of(ir, " @tail_ok$$")
+    val arm = etk_body_of(ir, " @arm_ok$$")
+
+    assert(!plain.contains("sysl_error_trace_mark") && !plain.contains("sysl_error_trace_reset"), plain)
+    assert(!plain.contains("threadlocal") && !plain.contains("_tlv"), plain)
+    assert_eq(tail.count_of("call i32 @sysl_error_trace_mark()"), 1)
+    assert_eq(tail.count_of("call void @sysl_error_trace_reset(i32 %"), 1)
+    assert_eq(arm.count_of("call i32 @sysl_error_trace_mark()"), 1)
+    assert_eq(arm.count_of("call void @sysl_error_trace_reset(i32 %"), 2)
+end stl_the_cost_stays_where_it_was

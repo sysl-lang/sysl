@@ -684,6 +684,28 @@ print(dot([1, 2, 3], [4, 5, 6, 7]))
 32
 ```
 
+**A vector load or store is a subscript of several elements, and the block covers it.** Inside
+`@unchecked`, `xs.load(i)` and `xs.store(i, v)` on an array or a slice (see
+[vectors](/reference/vectors/#what-a-load-or-store-guarantees)) leave out the test that the whole run
+fits, exactly as `xs[i]` leaves out its test; outside the block the run is still checked. Like the
+scalar subscript, a run that does not fit is not a trap: it reads or writes whatever the memory
+holds.
+
+```sysl
+var xs: [8]f32 = [1, 2, 3, 4, 5, 6, 7, 8]
+var ys: [8]f32 = [0; 8]
+
+@unchecked
+    val v: <4>f32 = xs.load(4)
+    ys.store(0, v * 2)
+
+print(ys[0], ys[3])
+```
+
+```output
+10 16
+```
+
 **The block is lexical.** A closure or a nested function written inside it is inside it; one written
 outside and called from inside keeps its checks, and so does every subscript after the block ends. A
 [`Buf`](#growing-one), and any container whose subscript is its own, takes part through its

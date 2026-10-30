@@ -595,9 +595,9 @@ prints on a board with nothing to symbolize it against.
 
 ### A failure that is handled leaves the trace
 
-A statement that calls something answering a `Result`, and does not hand the answer on with `?` or
-`return`, **puts the trace back as it found it when it completes**. The failure it handled is gone
-before the next one starts:
+The innermost statement holding a call to something answering a `Result`, where the answer is not
+handed on with `?` or `return`, **puts the trace back as it found it when it completes**. The failure
+it handled is gone before the next one starts:
 
 ```sysl
 import sysl.debug.error_trace
@@ -626,6 +626,47 @@ A `return` from inside such a statement is not completing it, so
 `Err(e) -> return Err(Wrapped(e))` keeps the chain it is wrapping and adds its own origin to it. A
 `break` or a `continue` does complete it. The one gap the rule leaves is a result put in a `val` on
 one line and returned on a later one: the statement holding the call completed in between.
+
+**A function that answers without failing leaves the trace as it found it**, however it answers: a
+`return` of `Ok` -- or of anything, from a function answering no `Result` -- from inside a handling
+statement, a last expression that handles a failure and answers `Ok`, and a tail call made from inside
+a handling statement. A caller handing the answer on with `?` prunes nothing, so a failure the callee
+handled never reaches the trace of a later, unrelated one:
+
+```sysl
+import sysl.debug.error_trace
+
+parse(s: string) -> Result[int, string] = if s == "" then Err("empty") else Ok(1)
+
+or_zero(s: string) -> Result[int, string] = parse(s) match
+    Ok(n) -> Ok(n)
+    Err(_) -> Ok(0)
+
+total(a: string, b: string) -> Result[int, string]
+    val x = parse(a) match
+        Ok(n) -> n
+        Err(_) -> return Ok(-1)
+
+    Ok(x + or_zero(b)?)
+
+main() -> Result[unit, string]
+    print(or_zero("")?, error_trace().len())
+    print(total("", "x")?, error_trace().len())
+    print(total("x", "")?, error_trace().len())
+    Ok(())
+```
+
+```output
+0 0
+-1 0
+1 0
+```
+
+**That is the whole cost on a path that succeeds**: a read of the trace's length before such a
+statement and a write after it, and a write at each way out of the function taken from inside one. A
+`?` whose answer is `Ok` costs nothing, and neither do the statements around a handling one -- a loop
+over instructions whose one handling arm handles in a statement of its own pays on that arm alone,
+never once a turn.
 
 ### Thirty-two sites, per thread
 

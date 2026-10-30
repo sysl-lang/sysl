@@ -652,12 +652,18 @@ private gen_return(e: *Emit, opt: Option[TExpr])
         Some(t) ->
             val ty = texpr_type(t)
 
+            // A value that handles a failure, or a `return` from inside a statement that does, puts the
+            // trace back on the way out unless it fails (`error_trace.sysl`).
+            val mark = trace_enter_answer(e, t, ty)
+
             if e.layout.indirect(ty)
-                gen_indirect_return(e, t)
+                gen_indirect_return(e, t, mark)
                 return
 
             val v = gen_expr(e, t)
 
+            trace_answer(e, Some(t), Some(v), None, ty)
+            trace_close(e, mark)
             answer_count(e, t, ty, v)
             emit_ensures(e, Some(v))
 
@@ -674,6 +680,7 @@ private gen_return(e: *Emit, opt: Option[TExpr])
             release_all_as(e, exit)
             emit_term(e, InRet(Some(lty(e, ty)), Some(v)))
         None ->
+            trace_answer(e, None, None, None, Unit)
             emit_ensures(e, None)
 
             if e.coro.is_some()
@@ -746,6 +753,7 @@ private gen_become(e: *Emit, call: TExpr)
         return
     end if
 
+    trace_jump(e)
     release_all(e)
 
     if no_value(ty)

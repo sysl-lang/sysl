@@ -1,0 +1,1063 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// The borrow rule (`keeps.sysl`'s `call_at`) asked of what a callee READS through a pointer or a view:
+// the address of a local stored inside a struct, an array or a view whose address goes to a callee
+// that copies the stored address out -- into module storage, a heap object, a `Buf`, its answer --
+// outlives the frame as surely as `&x` handed to a keeping parameter does. `read_of` and
+// `read_answers_of` are the summaries -- what a callee lets out of what it reads EXACTLY so many steps
+// through the pointer -- and `read_cores` is every address of this frame the argument reaches, with
+// the steps it takes; each is asked of its own step, so a callee letting out what sits at another
+// step (a closure read through the address, a copy) is not refused. What a callee puts back into
+// storage reached through the same argument stays there where all of that is the frame's own
+// (`frame_closed`). `reference/memory.md § An address held inside what is handed over` is the
+// specification.
+//
+// The matrix crosses the shape the address sits in (struct, nested struct, array, view written and
+// coerced, a value made in place, a local bound to the pointer, a local the callee copied it into) with
+// the way out (a push, module storage, a heap object, an answer pushed or returned) and the way the
+// call is made (direct, a callee chain, recursion, a `*self` method, a trait object, a function
+// pointer). The negatives are a callee that only reads, one that copies out a number, an address of
+// module storage, an answer read at once, a pointer a parameter brought, and C, which borrows for the
+// call unless `@keeps` says otherwise -- as the rule says of the pointer itself.
+//
+// Skipped cells, and why: a call through an object of no known trait, or a function pointer C may call,
+// holds its bodies to the default and is not asked (the same as `vcall_keeps` / `pointer_keeps`);
+// an async callee answers `through_of` through `task_held`, which `tests_atk_async_task_keeps.sysl`
+// covers for the pointer itself; separate compilation asks a `.syslib` callee the same summaries.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private bth_outcome(text: string) -> (string, int)
+    val root = make_temp_dir("sysl-bth").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", bth_prelude + text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (failure_text(why), -1)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> ("the program that was built could not be run", -1)
+        Ok(out) -> (out.text + out.err.unwrap_or(""), shell_status(out.status))
+end bth_outcome
+
+private bth_prints(text: string, want: string)
+    if xvr_no_library() then return
+
+    val out = bth_outcome(text)
+
+    assert_eq(out.0, want)
+    assert_eq(out.1, 0)
+end bth_prints
+
+private bth_refused(text: string, part: string)
+    if xvr_no_library() then return
+
+    val out = bth_outcome(text)
+
+    assert_eq(out.1, -1, out.0)
+    assert(out.0.index_of(part).is_some(), out.0)
+end bth_refused
+
+// A struct holding an address, module storage to keep one in, and a callee that pushes the address it
+// reads through its parameter.
+private const bth_prelude: string = raw"""
+    import sysl.buf.{Buf, buf}
+
+    struct H
+        p: *int
+
+    var kept: Buf[*int] = buf()
+    var spare = 7
+
+    stash(h: *H)
+        kept.push(h.p)
+
+    """
+
+private bth_pushed(param: string, written: string, owner: string) -> string =
+    s"lets what it reads through its parameter '$param' outlive the call (it is passed to 'push', which " +
+        s"keeps it), and what is read through '$written' holds the address of a local of '$owner'"
+
+// -- the design's example ---------------------------------------------------------------------------
+
+@test("a callee that pushes the address a struct holds is refused the struct's address")
+bth_design_example()
+    bth_refused(raw"""
+        f()
+            var x = 1
+            var h = H(&x)
+            stash(&h)
+
+        main()
+            f()
+        """, "'stash' " + bth_pushed("h", "&h", "f"))
+
+// -- the shape the address sits in ----------------------------------------------------------------
+
+@test("an array of addresses whose address goes to a callee that pushes an element")
+bth_array()
+    bth_refused(raw"""
+        stash_all(a: *[2]*int)
+            kept.push(a[1])
+
+        f()
+            var x = 1
+            var a = [&spare, &x]
+            stash_all(&a)
+
+        main()
+            f()
+        """, "'stash_all' " + bth_pushed("a", "&a", "f"))
+
+@test("a view of an array of addresses, written as a slice")
+bth_view_written()
+    bth_refused(raw"""
+        stash_first(v: []*int)
+            kept.push(v[0])
+
+        f()
+            var x = 1
+            var a = [&x]
+            stash_first(a[..])
+
+        main()
+            f()
+        """, "'stash_first' " + bth_pushed("v", "a[..]", "f"))
+
+@test("a view of an array of addresses, the array standing where the view is wanted")
+bth_view_coerced()
+    bth_refused(raw"""
+        stash_first(v: []*int)
+            kept.push(v[0])
+
+        f()
+            var x = 1
+            var a = [&x]
+            stash_first(a)
+
+        main()
+            f()
+        """, "'stash_first' " + bth_pushed("v", "a", "f"))
+
+@test("a struct nested in the one whose address is handed over")
+bth_nested()
+    bth_refused(raw"""
+        struct O
+            h: H
+
+        stash_o(o: *O)
+            kept.push(o.h.p)
+
+        f()
+            var x = 1
+            var o = O(H(&x))
+            stash_o(&o)
+
+        main()
+            f()
+        """, "'stash_o' " + bth_pushed("o", "&o", "f"))
+
+@test("a local bound to the struct's address, handed over in its place")
+bth_pointer_local()
+    bth_refused(raw"""
+        f()
+            var x = 1
+            var h = H(&x)
+            val hp = &h
+            stash(hp)
+
+        main()
+            f()
+        """, "'stash' " + bth_pushed("h", "hp", "f"))
+
+@test("an address a callee copied into another local, whose address then goes to the keeper")
+bth_copied_into_a_local()
+    bth_refused(raw"""
+        copy(into: *H, from: *H)
+            into.p = from.p
+
+        f()
+            var x = 1
+            var h = H(&x)
+            var d = H(&spare)
+            copy(&d, &h)
+            stash(&d)
+
+        main()
+            f()
+        """, "'stash' " + bth_pushed("h", "&d", "f"))
+
+@test("an address stored into the struct after it was made")
+bth_stored_after()
+    bth_refused(raw"""
+        f()
+            var x = 1
+            var h = H(&spare)
+            h.p = &x
+            stash(&h)
+
+        main()
+            f()
+        """, "'stash' " + bth_pushed("h", "&h", "f"))
+
+// -- the way out --------------------------------------------------------------------------------------
+
+@test("a callee that stores what it reads into module storage")
+bth_module_storage()
+    bth_refused(raw"""
+        var gp: Option[*int] = None
+
+        store(h: *H)
+            gp = Some(h.p)
+
+        f()
+            var x = 1
+            var h = H(&x)
+            store(&h)
+
+        main()
+            f()
+        """, "'store' lets what it reads through its parameter 'h' outlive the call (it is stored in " +
+             "'gp'), and what is read through '&h' holds the address of a local of 'f'")
+
+@test("a callee that stores what it reads into a heap object module storage holds")
+bth_heap_object()
+    bth_refused(raw"""
+        struct Holder
+            p: Option[*int]
+
+        val holder: &Holder = Holder(None)
+
+        put(h: *H, o: &Holder)
+            o.p = Some(h.p)
+
+        f()
+            var x = 1
+            var h = H(&x)
+            put(&h, holder)
+
+        main()
+            f()
+        """, "'put' lets what it reads through its parameter 'h' outlive the call (it is stored in " +
+             "'o.p'), and what is read through '&h' holds the address of a local of 'f'")
+
+@test("a callee answering the address it reads, the answer pushed")
+bth_answer_pushed()
+    bth_refused(raw"""
+        get(h: *H) -> *int = h.p
+
+        f()
+            var x = 1
+            var h = H(&x)
+            kept.push(get(&h))
+
+        main()
+            f()
+        """, "'get(&h)' holds the address of a local of 'f'")
+
+@test("a callee answering the address it reads, the answer returned")
+bth_answer_returned()
+    bth_refused(raw"""
+        get(h: *H) -> *int = h.p
+
+        f() -> *int
+            var x = 1
+            var h = H(&x)
+            get(&h)
+
+        main()
+            print(*f())
+        """, "'get(&h)' is returned, but it holds the address of a local of 'f', whose storage ends when " +
+             "'f' returns")
+
+// -- the way the call is made -------------------------------------------------------------------
+
+@test("a callee that hands the pointer on to one that pushes what it reads")
+bth_callee_chain()
+    bth_refused(raw"""
+        outer(h: *H)
+            stash(h)
+
+        f()
+            var x = 1
+            var h = H(&x)
+            outer(&h)
+
+        main()
+            f()
+        """, "'outer' lets what it reads through its parameter 'h' outlive the call (it is passed to " +
+             "'stash', which lets what it reads through it out), and what is read through '&h' holds " +
+             "the address of a local of 'f'")
+
+@test("a recursive callee that pushes what it reads at the bottom")
+bth_recursion()
+    bth_refused(raw"""
+        rec(h: *H, n: int)
+            if n == 0 then kept.push(h.p) else rec(h, n - 1)
+
+        f()
+            var x = 1
+            var h = H(&x)
+            rec(&h, 3)
+
+        main()
+            f()
+        """, "'rec' " + bth_pushed("h", "&h", "f"))
+
+@test("a '*self' method that pushes the address its receiver holds")
+bth_self_method()
+    bth_refused(raw"""
+        impl H
+            keep(*self)
+                kept.push(self.p)
+
+        f()
+            var x = 1
+            var h = H(&x)
+            h.keep()
+
+        main()
+            f()
+        """, "'keep' " + bth_pushed("self", "h", "f"))
+
+@test("a call through a trait object whose implementation pushes what it reads")
+bth_trait_object()
+    bth_refused(raw"""
+        trait Keeper
+            take(self, h: *H)
+
+        struct K
+            n: int
+
+        impl Keeper for K
+            take(self, h: *H) = kept.push(h.p)
+
+        f(k: &Keeper)
+            var x = 1
+            var h = H(&x)
+            k.take(&h)
+
+        main()
+            f(K(1))
+        """, "'take' " + bth_pushed("h", "&h", "f"))
+
+@test("a call through a function pointer that may reach a body pushing what it reads")
+bth_function_pointer()
+    bth_refused(raw"""
+        f(g: *extern(*H) -> unit)
+            var x = 1
+            var h = H(&x)
+            g(&h)
+
+        main()
+            f(&stash)
+        """, "a call through '*extern(*H) -> unit' may reach 'stash', which " + bth_pushed("h", "&h", "f"))
+
+@test("the address of a struct made in place around the address")
+bth_made_in_place()
+    bth_refused(raw"""
+        f()
+            var x = 1
+            stash(&H(&x))
+
+        main()
+            f()
+        """, "'stash' lets what it reads through its parameter 'h' outlive the call")
+
+@test("a callee's own name for the pointer is read through one step as the parameter is")
+bth_alias_in_callee()
+    bth_refused(raw"""
+        stash_alias(h: *H)
+            val q = h
+            kept.push(q.p)
+
+        f()
+            var x = 1
+            var h = H(&x)
+            stash_alias(&h)
+
+        main()
+            f()
+        """, "'stash_alias' " + bth_pushed("h", "&h", "f"))
+
+@test("the address one step in is refused where the callee lets it out, a step further is not asked")
+bth_one_step_out()
+    bth_refused(raw"""
+        struct W
+            s: *H
+
+        var shelves: Buf[*H] = buf()
+
+        shelve(w: *W)
+            shelves.push(w.s)
+
+        f()
+            var h = H(&spare)
+            var w = W(&h)
+            shelve(&w)
+
+        main()
+            f()
+        """, "'shelve' lets what it reads through its parameter 'w' outlive the call (it is passed to " +
+             "'push', which keeps it), and what is read through '&w' holds the address of a local of 'f'")
+
+@test("an address two steps in -- held by a local whose address the handed struct holds -- is refused")
+bth_two_steps_out()
+    bth_refused(raw"""
+        struct W
+            s: *H
+
+        deep(w: *W)
+            kept.push(w.s.p)
+
+        f()
+            var x = 1
+            var h = H(&x)
+            var w = W(&h)
+            deep(&w)
+
+        main()
+            f()
+        """, "'deep' " + bth_pushed("w", "&w", "f"))
+
+@test("an address two steps in, answered by the callee and returned")
+bth_two_steps_answered()
+    bth_refused(raw"""
+        struct W
+            s: *H
+
+        get_deep(w: *W) -> *int = w.s.p
+
+        f() -> *int
+            var x = 1
+            var h = H(&x)
+            var w = W(&h)
+            get_deep(&w)
+
+        main()
+            print(*f())
+        """, "'get_deep(&w)' is returned, but it holds the address of a local of 'f'")
+
+@test("an address put back through the same argument into storage the frame does not own is refused")
+bth_put_back_elsewhere()
+    bth_refused(raw"""
+        struct Sink
+            q: *int
+
+        struct H3
+            p: *int
+            g: *Sink
+
+        var sink = Sink(&spare)
+
+        put(h: *H3)
+            h.g.q = h.p
+
+        f()
+            var x = 1
+            var h = H3(&x, &sink)
+            put(&h)
+
+        main()
+            f()
+        """, "'put' lets what it reads through its parameter 'h' outlive the call (it is stored in " +
+             "'h.g.q'), and what is read through '&h' holds the address of a local of 'f'")
+    bth_refused(raw"""
+        struct Sink
+            q: *int
+
+        struct H3
+            p: *int
+            g: *Sink
+
+        var sink = Sink(&spare)
+
+        put(h: *H3)
+            val g = h.g
+
+            g.q = h.p
+
+        f()
+            var x = 1
+            var h = H3(&x, &sink)
+            put(&h)
+
+        main()
+            f()
+        """, "'put' lets what it reads through its parameter 'h' outlive the call (it is stored in " +
+             "'g.q'), and what is read through '&h' holds the address of a local of 'f'")
+
+// -- what stays accepted --------------------------------------------------------------------------
+
+@test("a callee letting out only what it reads two steps in -- through the frame's address -- is accepted")
+bth_two_steps_accepted()
+    bth_prints(raw"""
+        struct W
+            s: *H
+
+        deep(w: *W)
+            kept.push(w.s.p)
+
+        f() -> int
+            var h = H(&spare)
+            var w = W(&h)
+            deep(&w)
+            *kept[0]
+
+        main()
+            print(f())
+        """, "7\n")
+
+@test("an address read through a pointer read out of the parameter, saved and put back, is accepted")
+bth_saved_and_restored()
+    bth_prints(raw"""
+        struct Con
+            n: int
+
+        struct VM
+            con: *Con
+
+        struct Session
+            vm: *VM
+
+        run(s: *Session) -> int
+            val vm = s.vm
+            val old = vm.con
+            var local = Con(1)
+
+            vm.con = &local
+
+            val n = vm.con.n
+
+            vm.con = old
+            n
+
+        swap(h: *W2)
+            val a = h.a
+
+            h.a = h.b
+            h.b = a
+
+        struct W2
+            a: *int
+            b: *int
+
+        main()
+            var c = Con(5)
+            var vm = VM(&c)
+            var s = Session(&vm)
+            var x = 1
+            var y = 2
+            var w = W2(&x, &y)
+
+            swap(&w)
+            print(run(&s), vm.con.n, *w.a, *w.b)
+        """, "1 5 2 1\n")
+
+@test("a callee that only reads through the pointer, a number copied out, and module addresses stay accepted")
+bth_accepted()
+    bth_prints(raw"""
+        struct G
+            p: *int
+            n: int
+
+        var counts: Buf[int] = buf()
+
+        peek(h: *H) -> int = *h.p
+
+        count(g: *G)
+            counts.push(g.n)
+
+        get(h: *H) -> *int = h.p
+
+        reads_only(h: *H) -> int = peek(h)
+
+        f() -> int
+            var x = 1
+            var h = H(&x)
+            var g = G(&x, 3)
+            count(&g)
+            peek(&h) + *get(&h) + reads_only(&h) + counts[0]
+
+        module_address()
+            var h = H(&spare)
+            stash(&h)
+
+        relay(h: *H)
+            stash(h)
+
+        main()
+            module_address()
+            relay(&H(&spare))
+            print(f(), *kept[0], kept.len())
+        """, "6 7 2\n")
+
+@test("C borrows what it reads through a pointer for the call, as it borrows the pointer")
+bth_c_borrows()
+    bth_prints(raw"""
+        struct IoVec
+            base: *u8
+            len: usize
+
+        extern "writev" c_writev(fd: i32, iov: *IoVec, count: i32) -> isize
+
+        f()
+            var b = [u8('h'), u8('i'), u8('\n')]
+            var v = IoVec(&b[0], 3)
+            c_writev(1, &v, 1)
+
+        main()
+            f()
+        """, "hi\n")
+
+// -- a value read through a pointer, copied into a local ------------------------------------------
+//
+// What a frame's storage holds the address of is followed however the value got there (`points`):
+// copied out of a field into a local, read through a pointer, stored after the fact, chosen by a
+// branch, given in a loop. Each cell would have let `&x` out silently before.
+
+private const bth_w: string = raw"""
+    struct W
+        s: *H
+
+    deep(w: *W)
+        kept.push(w.s.p)
+
+    """
+
+@test("an address copied out of a field into a local, then into the struct handed over")
+bth_copied_out_of_a_field()
+    bth_refused(bth_w + raw"""
+        f()
+            var x = 1
+            var h = H(&x)
+            var w0 = W(&h)
+            val hs = w0.s
+            var w = W(hs)
+            deep(&w)
+
+        main()
+            f()
+        """, "'deep' " + bth_pushed("w", "&w", "f"))
+
+@test("an address read out through a local pointer, then into the struct handed over")
+bth_read_through_a_local_pointer()
+    bth_refused(bth_w + raw"""
+        f()
+            var x = 1
+            var h = H(&x)
+            var w = W(&h)
+            val wp = &w
+            val s = wp.s
+            var w2 = W(s)
+            deep(&w2)
+
+        main()
+            f()
+        """, "'deep' " + bth_pushed("w", "&w2", "f"))
+
+@test("a local given a module address first and an address read out of a field after")
+bth_reassigned_local()
+    bth_refused(bth_w + raw"""
+        var mh = H(&spare)
+
+        f()
+            var x = 1
+            var h = H(&x)
+            var w0 = W(&h)
+            var hs = &mh
+            hs = w0.s
+            var w = W(hs)
+            deep(&w)
+
+        main()
+            f()
+        """, "'deep' " + bth_pushed("w", "&w", "f"))
+
+@test("an address read out of a field in one branch of a conditional")
+bth_read_in_a_branch()
+    bth_refused(bth_w + raw"""
+        var mh = H(&spare)
+
+        f(flag: bool)
+            var x = 1
+            var h = H(&x)
+            var w0 = W(&h)
+            val hs = if flag then w0.s else &mh
+            var w = W(hs)
+            deep(&w)
+
+        main()
+            f(true)
+        """, "'deep' " + bth_pushed("w", "&w", "f"))
+
+@test("an address read out of an array element in a loop")
+bth_read_in_a_loop()
+    bth_refused(bth_w + raw"""
+        var mh = H(&spare)
+
+        f()
+            var x = 1
+            var h = H(&x)
+            var ws = [W(&mh), W(&h)]
+            var w = W(&mh)
+
+            for item in ws
+                w.s = item.s
+
+            deep(&w)
+
+        main()
+            f()
+        """, "'deep' " + bth_pushed("w", "&w", "f"))
+
+@test("an address a callee answers out of a field, put in a local and handed over")
+bth_answered_into_a_local()
+    bth_refused(bth_w + raw"""
+        get_s(w: *W) -> *H = w.s
+
+        f()
+            var x = 1
+            var h = H(&x)
+            var w0 = W(&h)
+            val hs = get_s(&w0)
+            var w = W(hs)
+            deep(&w)
+
+        main()
+            f()
+        """, "'deep' " + bth_pushed("w", "&w", "f"))
+
+@test("an address only a module address was copied out of stays accepted")
+bth_copied_module_address()
+    bth_prints(bth_w + raw"""
+        var mh = H(&spare)
+
+        f()
+            var x = 1
+            var w0 = W(&mh)
+            val hs = w0.s
+            var w = W(hs)
+            val n = *hs.p + x
+            deep(&w)
+            print(n)
+
+        main()
+            f()
+            print(*kept[0])
+        """, "8\n7\n")
+
+// -- inside the callee: a pointer on the way in a local ---------------------------------------------
+
+@test("a callee that copies a pointer out of a field into a local and pushes what it reads through it")
+bth_callee_copies_out()
+    bth_refused(bth_w + raw"""
+        deep_local(w: *W)
+            val hp = w.s
+            kept.push(hp.p)
+
+        f()
+            var x = 1
+            var h = H(&x)
+            var w = W(&h)
+            deep_local(&w)
+
+        main()
+            f()
+        """, "'deep_local' " + bth_pushed("w", "&w", "f"))
+
+@test("a callee that gets the pointer on the way from another callee's answer")
+bth_callee_answered_pointer()
+    bth_refused(bth_w + raw"""
+        get_s(w: *W) -> *H = w.s
+
+        deep_get(w: *W)
+            val hp = get_s(w)
+            kept.push(hp.p)
+
+        f()
+            var x = 1
+            var h = H(&x)
+            var w = W(&h)
+            deep_get(&w)
+
+        main()
+            f()
+        """, "'deep_get' " + bth_pushed("w", "&w", "f"))
+
+@test("a callee walking a list, its local given pointers read at every step")
+bth_callee_walks_a_list()
+    bth_refused(raw"""
+        struct N
+            p: *int
+            next: Option[*N]
+
+        walk(n: *N)
+            var c = n
+
+            loop
+                kept.push(c.p)
+
+                c = c.next match
+                    Some(m) -> m
+                    None -> return
+
+        f()
+            var x = 1
+            var b = N(&x, None)
+            var a = N(&spare, Some(&b))
+            walk(&a)
+
+        main()
+            f()
+        """, "'walk' lets what it reads through its parameter 'n' outlive the call (it is passed to 'push', " +
+             "which keeps it), and what is read through '&a' holds the address of a local of 'f'")
+
+@test("a callee matching the pointer on the way out of an option")
+bth_callee_matches_out()
+    bth_refused(raw"""
+        struct O
+            h: Option[*H]
+
+        deep_opt(o: *O)
+            o.h match
+                Some(hp) -> kept.push(hp.p)
+                None -> ()
+
+        f()
+            var x = 1
+            var h = H(&x)
+            var o = O(Some(&h))
+            deep_opt(&o)
+
+        main()
+            f()
+        """, "'deep_opt' " + bth_pushed("o", "&o", "f"))
+
+// -- the address of a local holding a value read through the argument --------------------------------
+
+@test("the caller's local given a copy of what a pointer reads, its address handed over")
+bth_copy_read_through()
+    bth_refused(bth_w + raw"""
+        f()
+            var x = 1
+            var h = H(&x)
+            var w = W(&h)
+            var q = *w.s
+            stash(&q)
+
+        main()
+            f()
+        """, "'stash' " + bth_pushed("h", "&q", "f"))
+
+@test("the caller's local overwritten with a copy of what a pointer reads")
+bth_copy_stored_read_through()
+    bth_refused(bth_w + raw"""
+        f()
+            var x = 1
+            var h = H(&x)
+            var w = W(&h)
+            var q = H(&spare)
+            q = *w.s
+            stash(&q)
+
+        main()
+            f()
+        """, "'stash' " + bth_pushed("h", "&q", "f"))
+
+@test("a callee handing on the address of its local holding what it read")
+bth_callee_addr_of_read()
+    bth_refused(raw"""
+        keep_at(pp: **int)
+            kept.push(*pp)
+
+        stash_q(h: *H)
+            var q = h.p
+            keep_at(&q)
+
+        f()
+            var x = 1
+            var h = H(&x)
+            stash_q(&h)
+
+        main()
+            f()
+        """, "'stash_q' lets what it reads through its parameter 'h' outlive the call (it is passed to " +
+             "'keep_at', which lets what it reads through it out), and what is read through '&h' holds " +
+             "the address of a local of 'f'")
+
+@test("a callee handing on the address of its local holding an element of an array it reads")
+bth_callee_addr_of_element()
+    bth_refused(raw"""
+        keep_at(pp: **int)
+            kept.push(*pp)
+
+        stash_arr(a: *[2]*int)
+            var q = a[1]
+            keep_at(&q)
+
+        f()
+            var x = 1
+            var a = [&spare, &x]
+            stash_arr(&a)
+
+        main()
+            f()
+        """, "'stash_arr' lets what it reads through its parameter 'a' outlive the call (it is passed to " +
+             "'keep_at', which lets what it reads through it out), and what is read through '&a' holds " +
+             "the address of a local of 'f'")
+
+@test("a callee handing on the address of its own name for the parameter, read two steps in")
+bth_callee_addr_of_alias()
+    bth_refused(raw"""
+        keep_in(pp: **H)
+            kept.push((*pp).p)
+
+        relay(h: *H)
+            var q = h
+            keep_in(&q)
+
+        f()
+            var x = 1
+            var h = H(&x)
+            relay(&h)
+
+        main()
+            f()
+        """, "'relay' lets what it reads through its parameter 'h' outlive the call (it is passed to " +
+             "'keep_in', which lets what it reads through it out), and what is read through '&h' holds " +
+             "the address of a local of 'f'")
+
+@test("a callee taking the address of its local holding a read number stays accepted")
+bth_callee_addr_of_number()
+    bth_prints(raw"""
+        struct G
+            p: *int
+            n: int
+
+        bump(pn: *int)
+            *pn += 1
+
+        twice(g: *G) -> int
+            var n = g.n
+            bump(&n)
+            n
+
+        f() -> int
+            var x = 1
+            var g = G(&x, 4)
+            twice(&g)
+
+        main()
+            print(f())
+        """, "5\n")
+
+// -- deeper than the summaries tell apart -----------------------------------------------------------
+
+// A chain of `depth` structs, each holding the address of the next, the last holding `&x` (when `own`)
+// or a module address, and a callee `go` whose body is `before`, the path down to the last, and `after`.
+private bth_chain(depth: int, own: bool, before: string, after: string) -> string
+    var text = "struct L0\n    p: *int\n\n"
+
+    for i in 1..depth
+        text = text + s"struct L$i\n    n: *L${i - 1}\n\n"
+
+    var path = "c"
+
+    for i in 1..depth
+        path = path + ".n"
+
+    text = text + s"go(c: *L$depth)$before$path$after\n\nf()\n    var x = 1\n"
+    text = text + (if own then "    var l0 = L0(&x)\n" else "    var l0 = L0(&spare)\n")
+
+    for i in 1..depth
+        text = text + s"    var l$i = L$i(&l${i - 1})\n"
+
+    text + s"    go(&l$depth)\n    print(x)\n\nmain()\n    f()\n"
+end bth_chain
+
+private bth_chain_pushed(depth: int) -> string =
+    s"'go' lets what it reads through its parameter 'c' outlive the call (it is passed to 'push', which " +
+        s"keeps it), and what is read through '&l$depth' holds the address of a local of 'f'"
+
+@test("an address five, six and eight steps in, pushed, is refused")
+bth_deep_steps()
+    for depth in [4, 5, 7]
+        bth_refused(bth_chain(depth, true, "\n    kept.push(", ".p)"), bth_chain_pushed(depth))
+
+@test("an address nine and twelve steps in, past what the summaries tell apart, is refused")
+bth_past_the_steps()
+    for depth in [8, 11]
+        bth_refused(bth_chain(depth, true, "\n    kept.push(", ".p)"), bth_chain_pushed(depth))
+
+@test("a chain within the steps the summaries tell apart, holding a module address or only read, stays accepted")
+bth_deep_steps_accepted()
+    bth_prints(bth_chain(7, false, "\n    kept.push(", ".p)"), "1\n")
+    bth_prints(bth_chain(5, true, "\n    if *", ".p > 0 then kept.push(&spare)"), "1\n")
+
+// Past `MaxReadSteps` the callee is asked what it lets out of anything it reads through the pointer,
+// which cannot tell the module address at the bottom from the frame's addresses on the way down: a
+// callee that lets out anything read that deep is refused, conservatively; one that only reads is not.
+@test("a chain deeper than the summaries tell apart is accepted where only read, refused where anything read is let out")
+bth_past_the_steps_conservative()
+    bth_prints(bth_chain(11, true, " -> int = *", ".p"), "1\n")
+    bth_refused(bth_chain(11, false, "\n    kept.push(", ".p)"), bth_chain_pushed(11))
+
+@test("a ring of the frame's own nodes, walked and read, stays accepted; one pushing what it reads is refused")
+bth_ring()
+    val ring = raw"""
+        struct R
+            p: *int
+            next: Option[*R]
+
+        f()
+            var x = 1
+            var a = R(&x, None)
+            var b = R(&spare, Some(&a))
+            a.next = Some(&b)
+            print(go(&a))
+
+        main()
+            f()
+        """
+
+    bth_prints(ring + raw"""
+        go(r: *R) -> int
+            var c = r
+            var sum = 0
+
+            for _ in 0..<12
+                sum += *c.p
+
+                c = c.next match
+                    Some(m) -> m
+                    None -> c
+
+            sum
+        """, "48\n")
+    bth_refused(ring + raw"""
+        go(r: *R) -> int
+            var c = r
+
+            for _ in 0..<12
+                c = c.next match
+                    Some(m) -> m
+                    None -> c
+
+            kept.push(c.p)
+            0
+        """, "'go' lets what it reads through its parameter 'r' outlive the call")

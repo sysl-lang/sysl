@@ -97,35 +97,18 @@ end Verdict
 inert_callees(p: TProgram, owning: Set[string] = set()) -> Set[string]
     val s = call_summary(p, owning)
     val quiet = quiet_callees(p, s)
-    val abandoning = abandoning_set(p)
     var seed: Buf[bool] = buf()
 
     for i in 0..<p.funcs.len()
         var ok = s.ok.at(i)
 
         for site in s.exit_sites.at(i)
-            val sealed = site.sealed && !abandoning.has(site.name)
-
-            if !sealed && !quiet_admits(quiet, p, site) then ok = false
+            if !quiet_admits(quiet, p, site) then ok = false
 
         seed.push(ok)
 
     greatest(p, s.calls, seed, set())
 end inert_callees
-
-// The `@abandons` functions and externs of a program, whose calls `seals_the_frame` leaves to
-// `quiet_callees`: the frames such a call gives back are given back while the program goes on.
-private abandoning_set(p: TProgram) -> Set[string]
-    var out: Set[string] = set()
-
-    for f in p.funcs
-        if f.marks.abandons then out.add(f.name)
-
-    for x in p.externs
-        if x.abandons then out.add(x.name)
-
-    out
-end abandoning_set
 
 // What every body of a program does that `inert_callees` and `quiet_callees` judge it by, each list
 // indexed as `p.funcs`:
@@ -151,13 +134,11 @@ end CallSummary
 
 // One call, for `quiet_callees`: the callee, and for each argument whether it is a view or address of
 // the caller's own local (`own`), or else which of the caller's view or pointer parameters it passes
-// on (`pass`, -1 for none). `sealed` says the call does not come back and is handed nothing a caller
-// could have lent (`seals_the_frame`).
+// on (`pass`, -1 for none).
 private struct Site
     name: string
     own: Buf[bool]
     pass: Buf[int]
-    sealed: bool
 end Site
 
 // What `call_summary`'s walk of one body gathers for `quiet_callees`.
@@ -287,7 +268,7 @@ private passed_arg(a: TExpr, b: Body) -> int = *a.kind match
     TSlice(base, _, _, _, _) -> param_view(base, b)
     _ -> param_view(a, b)
 
-private site_of(name: string, args: Buf[TExpr], b: Body, ty: Type) -> Site
+private site_of(name: string, args: Buf[TExpr], b: Body) -> Site
     var own: Buf[bool] = buf()
     var pass: Buf[int] = buf()
 
@@ -295,37 +276,12 @@ private site_of(name: string, args: Buf[TExpr], b: Body, ty: Type) -> Site
         own.push(own_arg(item, b))
         pass.push(passed_arg(item, b))
 
-    Site(name, own, pass, seals_the_frame(args, ty))
+    Site(name, own, pass)
 end site_of
-
-// **A call that does not come back, handed nothing that could hold what a caller lent, seals every
-// frame that holds a lent value**, so what it does on its way to the end of the program is nobody's
-// business here.
-//
-// A lent value -- a parameter read through its caller's count, a place handed over with no snapshot --
-// lives only in the frames of the call chain it was lent down, and only code running in one of them
-// can read it without a count of its own. Such a call does not return, so none of them runs again; and
-// it is handed scalars only, so no frame IT makes holds one either. Whatever runs from there -- the
-// report of a failed bounds check, an exported function C calls back, a destructor that frees the very
-// object the caller lent -- reads storage through counts that storage holds, and the lent copies are
-// never looked at again. That is the difference from `die(t)` in `quiet_callees`' account: `die` is
-// handed `t`, and reads it after the write that frees it.
-//
-// This is what keeps `Buf.at` inert in a program that exports a function that releases: its bounds
-// failure is `index_past(i, n)`, two integers and a hidden location. An `@abandons` callee is left to
-// `quiet_callees` (`inert_callees` asks); a call through a value is no `TCall` and is never a site.
-private seals_the_frame(args: Buf[TExpr], ty: Type) -> bool
-    if ty != Never then return false
-
-    for item in args
-        if !lends_nothing(texpr_type(item)) then return false
-
-    true
-end seals_the_frame
 
 // Whether a value of this type can hold nothing a caller could have lent: no count, no address, no view
 // -- numbers, and the arrays, structs and enums made only of numbers.
-lends_nothing(t: Type) -> bool
+private lends_nothing(t: Type) -> bool
     var parts: Buf[Type] = buf()
 
     by_value_parts(t, &parts)
@@ -366,6 +322,8 @@ end lends_nothing
 // computed again with no foreign function in it. The program's entry is left out: C calls it once,
 // before anything this asks about runs. An `@abandons` function is never in it, either side of the
 // boundary: its caller's frame is given back before the call, and the program goes on afterwards.
+// What needs no trust at all is a call that never returns and is handed only plain values
+// (`sealed_callees`), which is in the set either way.
 //
 // **Trust is a fact about a whole program, so only a program has it.** A library artifact (a
 // `.syslib`, a C archive) cannot know what the program it is linked into exports, so it trusts no
@@ -385,12 +343,77 @@ private quiet_callees(p: TProgram, s: CallSummary) -> Quiet
     for item in p.externs
         if !item.abandons then foreign.add(item.name)
 
+    val sealed = sealed_callees(p)
+
+    for item in sealed
+        foreign.add(item)
+
     val trusting = quiet_fix(p, s, foreign)
 
-    if !p.entry_point || !c_reaches_quiet(p, trusting.names) then return quiet_fix(p, s, set())
+    if !p.entry_point || !c_reaches_quiet(p, trusting.names) then return quiet_fix(p, s, sealed)
 
     trusting
 end quiet_callees
+
+// The functions a path ending the program may call whatever they do, foreign or not: those that never
+// return and are handed nothing a caller could have lent (`lends_nothing`): numbers, and the arrays,
+// structs and enums made only of numbers.
+//
+// **What the rest of this guards against is a release under a reader.** A call on a dying path may
+// reach code that gives back the count a borrowed argument rests on -- a foreign function by calling
+// back into the program, a sysl one directly -- and that matters to whatever reads the argument
+// afterwards: the callee itself, through what it was handed, or the body it returns to. A lent value
+// -- a parameter read through its caller's count, a place handed over with no snapshot -- lives only in
+// the frames of the call chain it was lent down. One answering `never` returns to nothing, so none of
+// them runs again, and one handed only plain values makes no frame that holds one either. Whatever runs
+// from there -- the report of a failed bounds check, an exported function C calls back, a destructor
+// that frees the very object the caller lent -- reads storage through counts that storage holds, and
+// the lent copies are never looked at again. Its own reads are its own body's business, judged where
+// that body is. That is the difference from `die(t)` above: `die` is handed `t`, and reads it after the
+// write that frees it.
+//
+// **This is what keeps a `Buf` read free of a snapshot in a program that hands C a callback**: the
+// standard library's `index_past` -- the report behind every `at`, `set` and `b[i]` -- takes two
+// counts and answers `never`; the location `@track_caller` adds is a pointer to constant text that the
+// typed signature does not carry. Without it, a program whose callbacks release anything distrusts
+// `sysl_bounds_fail` under `index_past`, and every element read through a pointer takes and gives
+// back a count on the buffer and another on its storage. An `@abandons` function returns into an
+// earlier frame, so it is never one of these. Being in the set makes such a callee trusted wherever
+// `quiet_callees` is asked -- an exit site in `inert_callees`, and a path ending the program in
+// `untouched_by` -- so neither needs a rule of its own.
+sealed_callees(p: TProgram) -> Set[string]
+    var out: Set[string] = set()
+
+    for item in p.externs
+        if !item.abandons && !item.variadic && is_never(item.ret_ty) && lend_nothing(item.params) then
+            out.add(item.name)
+
+    for f in p.funcs
+        if !f.marks.abandons && is_never(f.ret_ty) && lend_nothing(param_types(f.params)) then
+            out.add(f.name)
+
+    out
+end sealed_callees
+
+private lend_nothing(ts: Buf[Type]) -> bool
+    for t in ts
+        if !lends_nothing(t) then return false
+
+    true
+end lend_nothing
+
+private param_types(ps: Buf[(string, Type)]) -> Buf[Type]
+    var out: Buf[Type] = buf()
+
+    for item in ps
+        out.push(item.1)
+
+    out
+end param_types
+
+private is_never(t: Type) -> bool = underlying(t) match
+    Never -> true
+    _ -> false
 
 // What `quiet_callees` answers: the functions alive, the parameters each writes through (`through_key`),
 // the index of each name in `p.funcs`, the foreign functions trusted (`also`), and `names` -- the
@@ -690,8 +713,8 @@ private inert_stmt(s: TStmt) -> bool = s match
 // ends the program (`ending`), in `calls` otherwise.
 private inert_node(v: &Verdict, calls: &CallSink, exits: &CallSink, q: &QuietSink, b: Body, x: TExpr) =
     *x.kind match
-        TCall(name, args, ty, _) ->
-            val site = site_of(name, args, b, ty)
+        TCall(name, args, _, _) ->
+            val site = site_of(name, args, b)
 
             if b.ending.has(x.kind)
                 exits.add(name)
@@ -958,7 +981,6 @@ untouched_summary(p: TProgram, dropping: Buf[Type], owning: Set[string] = set())
     var u = untouched_none()
     val laundered = cast_sink()
     val quiet = quiet_callees(p, call_summary(p, owning))
-    val abandoning = abandoning_set(p)
 
     for i in 0..<p.funcs.len()
         val f = p.funcs.at(i)
@@ -969,8 +991,8 @@ untouched_summary(p: TProgram, dropping: Buf[Type], owning: Set[string] = set())
         val locals = own_locals(f)
         val ending = exit_kinds(f.body)
         val gives = type_sink()
-        val walk = TWalk(true, x -> touch_node(v, calls, exits, ending, abandoning, roots, gives, laundered,
-                                               dropping, locals, x),
+        val walk = TWalk(true, x -> touch_node(v, calls, exits, ending, roots, gives, laundered, dropping,
+                                               locals, x),
                          w -> touch_write(v, calls, roots, gives, locals, w),
                          s -> if !touch_stmt(s) then v.refuse())
 
@@ -1143,18 +1165,16 @@ private touch_stmt(s: TStmt) -> bool = s match
     _ -> inert_stmt(s)
 
 private touch_node(v: &Verdict, calls: &CallSink, exits: &CallSink, ending: &KindSink,
-                   abandoning: Set[string], roots: &TypeSink, gives: &TypeSink, laundered: &CastSink,
-                   dropping: Buf[Type], locals: Set[string], x: TExpr)
+                   roots: &TypeSink, gives: &TypeSink, laundered: &CastSink, dropping: Buf[Type],
+                   locals: Set[string], x: TExpr)
     note_laundered(laundered, x)
 
     if makes_dropping(x, dropping) then v.refuse()
 
     *x.kind match
-        // A call that seals the frame (`seals_the_frame`) is no question for `quiet_callees` here
-        // either: what it reaches before the program ends is read by nobody this answers for.
-        TCall(name, args, ty, _) ->
-            if !ending.has(x.kind) then calls.add(name)
-            else if !seals_the_frame(args, ty) || abandoning.has(name) then exits.add(name)
+        // A call on a path that ends the program is `quiet_callees`' question, which a call that never
+        // returns and is handed nothing a caller could have lent passes whatever it does (`sealed_callees`).
+        TCall(name, _, _, _) -> if ending.has(x.kind) then exits.add(name) else calls.add(name)
 
         TStore(place, _, _, _) -> touch_place(v, roots, gives, locals, place)
         TIncDec(place, _, _, _, _) -> touch_place(v, roots, gives, locals, place)

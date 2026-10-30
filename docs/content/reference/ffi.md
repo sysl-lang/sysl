@@ -651,6 +651,64 @@ extern "strlen" c_strlen(s: *u8) -> usize
 catches it**: the answer is taken to be fresh, and the address of a local can leave its frame inside
 it unseen. The standard library's own `memchr`, `memmove`, `getcwd` and directory reading carry it.
 
+### `@returns_twice` — a C function that returns a second time
+
+`setjmp` returns once when it saves the context and again, with the value given to `longjmp`, when
+the context is restored. An optimiser that does not know this may keep a value in a register across
+the call, move a store past it, or turn the call into a tail call — and the second return then sees
+what the first did not. **`@returns_twice` above an `extern` tells the back end**: the declaration
+and every call to it carry LLVM's `returns_twice`, and no call to it is a tail call.
+
+**The C functions clang marks by name are marked without being asked**, by the symbol the `extern`
+links to: `setjmp`, `_setjmp`, `_setjmpex`, `sigsetjmp`, `__sigsetjmp`, `savectx`, `vfork` and
+`getcontext`. The annotation is for any other function with the same behaviour — a library's own
+`save_context`, say — and writing it beside one of those names changes nothing.
+
+```sysl
+@needs(os)
+extern setjmp(env: *u64) -> int
+
+@abandons
+@needs(os)
+extern longjmp(env: *u64, v: int) -> never
+
+private var env: [64]u64 = [0; 64]
+private var count = 0
+
+main()
+    val got = setjmp(&env[0])
+
+    print(s"returned $got after $count jumps")
+
+    if got < 2
+        count += 1
+        longjmp(&env[0], got + 1)
+```
+
+```output
+returned 0 after 0 jumps
+returned 1 after 1 jumps
+returned 2 after 2 jumps
+```
+
+**What sysl guarantees across the second return is what C does.** Storage the program owns in memory
+— module storage, or what a pointer reaches — holds exactly what the last write left. A plain local
+that is modified between `setjmp` and `longjmp` is indeterminate when read after the second return,
+as C says of a non-`volatile` local; keep such a value in module storage or behind a pointer. The
+function that calls `setjmp` is an ordinary function, and is not marked.
+
+The annotation marks a function that can return twice, which only C code does, so it is for an
+`extern` and for nothing else:
+
+```sysl
+@returns_twice
+f() -> int = 1
+```
+
+```error
+'@returns_twice' says a call may return a second time, as C's setjmp does, and a body the compiler can read has no such return — it marks an 'extern' function
+```
+
 ## `@export` — a definition C can call
 
 `@export` is `extern` read the other way. An `extern` names a symbol the linker has and states the

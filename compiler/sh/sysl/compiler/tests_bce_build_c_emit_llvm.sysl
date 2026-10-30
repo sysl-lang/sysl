@@ -1,0 +1,282 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{is_file, make_dir_all, make_temp_dir, read_text, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.replace_all
+
+// `sysl build-c --emit-llvm <out.ll>`: the LLVM text an archive is compiled from, written beside the
+// archive and the header. `emit-llvm` cannot show it, since it reads a headerless file as a program's
+// entry body where `build-c` reads it as an archive's module -- a `private var` and the `private`
+// function that bumps it are an archive's storage and an entry body's local function, which may not
+// be declared there.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private bce_ready() -> bool = std_root().is_ok() && clang_available()
+
+// A headerless archive: module storage, a private function that writes it, and the export that calls
+// that function.
+private bce_main() -> string =
+    "private var ticks = 0\n\nprivate bump() -> int\n    ticks += 1\n    ticks\n\n" +
+    "@export(\"bce_next\")\nnext() -> int = bump()\n"
+
+private bce_root(main: string) -> string
+    val root = replace_all(make_temp_dir("sysl-bce").unwrap(), "//", "/")
+
+    write_text(s"$root/sysl.hocon", "package { name = \"bce\" }\n").unwrap()
+    write_text(s"$root/main.sysl", main).unwrap()
+    root
+end bce_root
+
+private bce_read(file: string) -> string = read_text(file).unwrap_or("")
+
+// The external symbols an object or archive defines, one name to a line.
+private bce_defined(file: string) -> string = capture("nm", ["-g", "--defined-only", "-j", file], "", [], true) match
+    Err(_) -> ""
+    Ok(o) -> o.text
+
+// The text, compiled on its own by the clang `build-c` would use, into `obj`; the status and what
+// clang said.
+private bce_compile(ll: string, obj: string, target: Option[string]) -> (bool, string)
+    val t = target_for(ll, target).unwrap()
+    val clang = find_clang(t, None).unwrap()
+
+    // clang takes its own default triple over the module's unless it is named, as `compile_object` does.
+    capture(clang, [s"--target=${t.triple}", "-c", "-x", "ir", ll, "-o", obj], "", [], true) match
+        Err(_) -> (false, "clang could not be run")
+        Ok(o) -> (o.status.ok(), o.text)
+end bce_compile
+
+// Every external symbol the object compiled from the text defines is one the archive defines, and the
+// export is among them.
+private bce_same_symbols(ll: string, archive: string, target: Option[string])
+    val obj = s"$ll.o"
+    val (ok, said) = bce_compile(ll, obj, target)
+
+    assert(ok, said)
+
+    val alone = bce_defined(obj)
+    val archived = bce_defined(archive)
+
+    assert(alone.contains("bce_next"), alone)
+
+    for name in lines_of(alone)
+        if name != "" && !name.ends_with(":") then assert(archived.contains(name), s"$name\n---\n$archived")
+end bce_same_symbols
+
+// -- the text is written, and is the archive's ----------------------------------------------------
+
+@test("a private var archive's text holds the storage, the private function and the export")
+bce_private_var_archive()
+    if !bce_ready() then return
+
+    val root = bce_root(bce_main())
+    val ll = s"$root/out.ll"
+    val (code, out, err) = clx_ran(["sysl", "build-c", root, "-o", s"$root/bce.a", "--emit-llvm", ll])
+    val text = bce_read(ll)
+    val archived = is_file(s"$root/bce.a") && is_file(s"$root/bce.a.h")
+
+    remove_dir_all(root).unwrap_or(())
+    assert_eq(code, Fine, s"$out$err")
+    assert(err.contains(s"wrote $ll\n"), err)
+    assert(archived)
+    assert(text.contains("define") && text.contains("@bce_next("), text)
+    assert(text.contains("ticks"), text)
+    assert(text.contains("bump"), text)
+end bce_private_var_archive
+
+@test("the same file is still refused by emit-llvm, which reads it as an entry body")
+bce_emit_llvm_still_refuses()
+    if !bce_ready() then return
+
+    val root = bce_root(bce_main())
+    val (code, out, err) = clx_ran(["sysl", "emit-llvm", root])
+
+    remove_dir_all(root).unwrap_or(())
+    assert_eq(code, Failed, s"$out$err")
+    assert(err.contains("is declared inside a function body"), err)
+end bce_emit_llvm_still_refuses
+
+@test("the text compiles alone to the symbols the archive defines")
+bce_text_is_the_archive()
+    if !bce_ready() then return
+
+    val root = bce_root(bce_main())
+    val (code, out, err) = clx_ran(["sysl", "build-c", root, "-o", s"$root/bce.a", "--emit-llvm", s"$root/out.ll"])
+
+    assert_eq(code, Fine, s"$out$err")
+    bce_same_symbols(s"$root/out.ll", s"$root/bce.a", None)
+    remove_dir_all(root).unwrap_or(())
+end bce_text_is_the_archive
+
+@test("for a bare-metal target the text is that target's, and compiles to the archive's symbols")
+bce_thumb()
+    if !bce_ready() then return
+
+    val root = bce_root(bce_main())
+    val (code, out, err) = clx_ran(["sysl", "build-c", root, "--target", "thumb-freestanding", "-o",
+                                    s"$root/bce.a", "--emit-llvm", s"$root/out.ll"])
+    val text = bce_read(s"$root/out.ll")
+
+    assert_eq(code, Fine, s"$out$err")
+    assert(text.contains("target triple = \"thumb"), text)
+    bce_same_symbols(s"$root/out.ll", s"$root/bce.a", Some("thumb-freestanding"))
+    remove_dir_all(root).unwrap_or(())
+end bce_thumb
+
+@test("the text is the one clang is handed at every level, which optimizes it")
+bce_levels()
+    if !bce_ready() then return
+
+    val root = bce_root(bce_main())
+    var texts: Buf[string] = buf()
+
+    for level in ["-O0", "-O1", "-O2", "-O3", "-Os", "-Oz"]
+        val (code, out, err) = clx_ran(["sysl", "build-c", root, level, "-o", s"$root/bce.a", "--emit-llvm",
+                                        s"$root/out.ll"])
+
+        assert_eq(code, Fine, s"$level: $out$err")
+        texts.push(bce_read(s"$root/out.ll"))
+
+    remove_dir_all(root).unwrap_or(())
+
+    for j in 1..<texts.len()
+        assert_eq(texts.at(j), texts.at(0))
+end bce_levels
+
+@test("a --lib root's code is in the text, as it is in the archive")
+bce_lib_root()
+    if !bce_ready() then return
+
+    val root = bce_root("import bcelib.twice\n\n@export(\"bce_next\")\nnext() -> int = twice(21)\n")
+    val lib = s"$root/lib"
+
+    make_dir_all(s"$lib/bcelib").unwrap()
+    write_text(s"$lib/bcelib/twice.sysl", "module bcelib\n\ntwice(n: int) -> int = n * 2\n").unwrap()
+
+    val (code, out, err) = clx_ran(["sysl", "build-c", s"$root/main.sysl", "--lib", lib, "-o", s"$root/bce.a",
+                                    "--emit-llvm", s"$root/out.ll"])
+    val text = bce_read(s"$root/out.ll")
+
+    assert_eq(code, Fine, s"$out$err")
+    assert(text.contains("twice"), text)
+    bce_same_symbols(s"$root/out.ll", s"$root/bce.a", None)
+    remove_dir_all(root).unwrap_or(())
+end bce_lib_root
+
+@test("with --lto the text is the same, and the archive is bitcode made from it")
+bce_lto()
+    if !bce_ready() then return
+
+    val root = bce_root(bce_main())
+    val (c1, o1, e1) = clx_ran(["sysl", "build-c", root, "-o", s"$root/a.a", "--emit-llvm", s"$root/a.ll"])
+    val (c2, o2, e2) = clx_ran(["sysl", "build-c", root, "-o", s"$root/b.a", "--emit-llvm", s"$root/b.ll",
+                                "--lto", "thin"])
+    val plain = bce_read(s"$root/a.ll")
+    val bitcode = bce_read(s"$root/b.ll")
+
+    remove_dir_all(root).unwrap_or(())
+    assert_eq(c1, Fine, s"$o1$e1")
+    assert_eq(c2, Fine, s"$o2$e2")
+    assert(e2.contains("this archive is LLVM bitcode"), e2)
+    assert(plain != "")
+    assert_eq(bitcode, plain)
+end bce_lto
+
+// -- where it is written --------------------------------------------------------------------------
+
+@test("a directory that is not there is made, as the archive's and the header's are")
+bce_new_directory()
+    if !bce_ready() then return
+
+    val root = bce_root(bce_main())
+    val ll = s"$root/new/deeper/out.ll"
+    val (code, out, err) = clx_ran(["sysl", "build-c", root, "-o", s"$root/bce.a", "--emit-llvm", ll])
+    val written = is_file(ll)
+
+    remove_dir_all(root).unwrap_or(())
+    assert_eq(code, Fine, s"$out$err")
+    assert(written)
+end bce_new_directory
+
+@test("a file where the directory has to be is refused, naming it")
+bce_under_a_file()
+    if !bce_ready() then return
+
+    val root = bce_root(bce_main())
+    val (code, out, err) = clx_ran(["sysl", "build-c", root, "-o", s"$root/bce.a", "--emit-llvm",
+                                    s"$root/main.sysl/out.ll"])
+
+    remove_dir_all(root).unwrap_or(())
+    assert_eq(code, Failed, s"$out$err")
+    assert_eq(err, s"sysl: error: cannot make the directory '$root/main.sysl': a file is already there, " +
+                   "and a directory is needed")
+end bce_under_a_file
+
+@test("a directory standing at the path is refused, naming the path")
+bce_path_is_a_directory()
+    if !bce_ready() then return
+
+    val root = bce_root(bce_main())
+
+    make_dir_all(s"$root/out.ll").unwrap()
+
+    val (code, out, err) = clx_ran(["sysl", "build-c", root, "-o", s"$root/bce.a", "--emit-llvm", s"$root/out.ll"])
+    val archived = is_file(s"$root/bce.a")
+
+    remove_dir_all(root).unwrap_or(())
+    assert_eq(code, Failed, s"$out$err")
+    assert(err.starts_with(s"sysl: error: '$root/out.ll': "), err)
+    // The text is written first, so a refused one builds nothing.
+    assert(!archived)
+end bce_path_is_a_directory
+
+@test("a program the analysis refuses writes no text")
+bce_refused_writes_nothing()
+    if !bce_ready() then return
+
+    val root = bce_root("@export(\"bce_next\")\nnext() -> int = \"no\"\n")
+    val (code, out, err) = clx_ran(["sysl", "build-c", root, "-o", s"$root/bce.a", "--emit-llvm", s"$root/out.ll"])
+    val written = is_file(s"$root/out.ll")
+
+    remove_dir_all(root).unwrap_or(())
+    assert_eq(code, Failed, s"$out$err")
+    assert(!written)
+end bce_refused_writes_nothing
+
+// -- the command line -----------------------------------------------------------------------------
+
+@test("--emit-llvm with nothing after it is a mistake in the command line")
+bce_missing_value()
+    val (code, out, err) = clx_ran(["sysl", "build-c", "/somewhere", "--emit-llvm"])
+
+    assert_eq(code, Misused, s"$out$err")
+    assert(err.starts_with("Error: Missing value after --emit-llvm\nusage: sysl build-c "), err)
+
+@test("--emit-llvm given twice writes the last one only, as -o given twice does")
+bce_given_twice()
+    if !bce_ready() then return
+
+    val root = bce_root(bce_main())
+    val (code, out, err) = clx_ran(["sysl", "build-c", root, "-o", s"$root/bce.a", "--emit-llvm", s"$root/a.ll",
+                                    "--emit-llvm", s"$root/b.ll"])
+    val first = is_file(s"$root/a.ll")
+    val last = is_file(s"$root/b.ll")
+
+    remove_dir_all(root).unwrap_or(())
+    assert_eq(code, Fine, s"$out$err")
+    assert(!first)
+    assert(last)
+end bce_given_twice
+
+@test("the usage names the flag")
+bce_usage()
+    val (code, out, err) = clx_ran(["sysl", "build-c"])
+
+    assert_eq(code, Misused, s"$out$err")
+    assert(err.contains("[--emit-llvm <out.ll>]"), err)
+    assert(err.contains("  --emit-llvm <out.ll>  also write the LLVM text"), err)
+    assert(usage().contains("[--header <path>] [--emit-llvm <out.ll>]"))
+end bce_usage
