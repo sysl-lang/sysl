@@ -410,6 +410,46 @@ private generic_subject(cx: &Analyzer, span: Span, receiver: Expr, name: string,
     generic_subject_of(cx, span, key, name, args, expected)
 end generic_subject
 
+// `Board.make()` where `make` is a member one **instance** has of its own (`impl Board[Rp2350]`):
+// that instance, where it is the only one with the name -- the generic type's own members have none
+// of that name, so there is no other type the call could be about. Where several instances each have
+// one, the instance the position expects decides, and with none expected the call is refused rather
+// than guessed. Nothing where no instance has the name.
+private instance_subject(cx: &Analyzer, span: Span, key: string, name: string,
+                         expected: Option[Type]) -> Option[Type]
+    val held = cx.an.tables.members.instances.get(key)
+
+    if held.is_none() then return None
+
+    var found: Buf[Type] = buf()
+    var shown: Buf[string] = buf()
+
+    for item in held.unwrap()
+        if has_member_at(cx.an, item.0, name)
+            val ty = concrete_instance(cx.an, item.0)
+
+            if ty.is_some()
+                found.push(ty.unwrap())
+                shown.push(item.1)
+        end if
+
+    if found.is_empty() then return None
+    if found.len() == 1 then return Some(found.at(0))
+
+    if expected.is_some()
+        val want = instance_owner(repr(expected.unwrap()))
+
+        for ty in found
+            val got = instance_owner(ty)
+
+            if want.is_some() && got.is_some() && got.unwrap() == want.unwrap() then return Some(ty)
+    end if
+
+    cx.fault(span, s"'$name' belongs to '${joined(shown, "', '")}' alike, and nothing here says " +
+             s"which — write the type on what receives the result, or call it through an alias of one")
+    Some(Unknown)
+end instance_subject
+
 // **A generic alias that only renames answers for the type it names** -- `type Mutex[T] = m.Mutex[T]`,
 // every parameter handed through in the order it was declared -- so `Mutex.new(0)` is `m.Mutex.new(0)`
 // (`reference/declarations.md § Type declarations`: the two spellings are interchangeable). The key of
@@ -470,6 +510,10 @@ generic_subject_of(cx: &Analyzer, span: Span, k: string, name: string, args: Buf
     // and `of` is what is missing. An enum's is told by `generic_enum_stranger`, which names its
     // variants too.
     if m.is_none()
+        val instance = instance_subject(cx, span, k, name, expected)
+
+        if instance.is_some() then return instance
+
         val declared = cx.an.tables.types.get(key.unwrap())
 
         if declared.is_none() then return None
@@ -2557,6 +2601,12 @@ private no_such_member(cx: &Analyzer, span: Span, rty: Type, name: string) -> TE
     // fields and properties, an enum only properties, and a type with neither has no field of any
     // name for the read to have missed -- so that one is told what it tried to read and of what,
     // there being no declaration to name.
+    val alone = instance_only(cx, rty, name)
+
+    if alone != "" then
+        return alone_refused(cx, span, rty,
+                             s"'${type_show(rty)}' has no field or property '$name'$alone")
+
     underlying(rty) match
         Struct(_) -> cx.err(span, hinted(cx, rty, s"'${type_show(rty)}' has no field or property '$name'"))
         Enum(_) -> cx.err(span, hinted(cx, rty, s"'${type_show(rty)}' has no property '$name'"))
@@ -2605,8 +2655,54 @@ private no_such_method(cx: &Analyzer, span: Span, receiver: TExpr, rty: Type, ba
 
     if deriving.is_some() then return not_derived_there(cx, span, base, name, deriving.unwrap())
 
+    val alone = instance_only(cx, rty, name)
+
+    if alone != "" then
+        return alone_refused(cx, span, rty, s"type '${type_show(rty)}' has no method '$name'$alone")
+
     cx.err(span, hinted(cx, rty, s"type '$base' has no method '$name'"))
 end no_such_method
+
+// What a refusal adds where the member is one **instance** of the receiver's generic type has of its
+// own (`impl Board[Rp2350]`) and the receiver is another instance -- or, inside a body written for
+// every instance, any instance at all, since the body is checked once for all of them. Nothing where
+// no instance has it.
+private instance_only(cx: &Analyzer, rty: Type, name: string) -> string
+    val holder = instance_holding(cx.an, member_owner(rty).0, name)
+
+    if holder.is_none() then return ""
+
+    val alone = s" — '$name' belongs to '${holder.unwrap()}' alone"
+
+    if !open_arguments(rty) then return alone
+
+    s"$alone, and this body is written for every '${module_bare(member_owner(rty).0)}'"
+end instance_only
+
+// The refusal itself. **A receiver still naming a parameter is the walk over a generic body at its
+// definition**, whose complaints are thrown away -- and every instantiation but the one instance's
+// would raise this one again while that instance's would compile, so the body is told once, here,
+// the way a call its bounds do not license is.
+private alone_refused(cx: &Analyzer, span: Span, rty: Type, message: string) -> TExpr
+    if open_arguments(rty) then cx.an.bound_fault(cx.scope, span, message)
+
+    cx.err(span, message)
+end alone_refused
+
+// Whether a struct's or an enum's arguments still name a parameter of the body being checked.
+private open_arguments(t: Type) -> bool = t match
+    Struct(d) -> any_abstract(d.targs)
+    Enum(d) -> any_abstract(d.targs)
+    _ -> false
+
+private any_abstract(ts: Buf[Type]) -> bool
+    for item in ts
+        item match
+            Abstract(_, _) -> return true
+            _ -> ()
+
+    false
+end any_abstract
 
 // A part of the deriving type whose own type does not implement the trait being derived, asked for
 // that trait's member: the refusal a bound would have made at the call.

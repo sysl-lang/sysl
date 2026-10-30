@@ -465,6 +465,17 @@ hoist_member_list(a: &Analysis, home: MemberHome, members: Buf[MethodDecl],
         // property it writes rather than the name it is filed under.
         val written = source_member_name(m.name)
 
+        // A name one instance already has of its own (`impl Board[Rp2350]`) is not also every
+        // instance's: the instance's member is asked first, so this one would be unreachable there.
+        val instance = instance_holding(a, home.key, m.name)
+
+        if instance.is_some()
+            a.fault(home.scope, m.span, s"'${instance.unwrap()}' already has a member named " +
+                    s"'$written' of its own, so '${home.label}' cannot declare one for every " +
+                    "instantiation")
+            continue
+        end if
+
         if has_member_at(a, home.key, filed)
             if is_setter_name(m.name)
                 a.fault(home.scope, m.span, s"type '${home.label}' already has a setter for " +
@@ -748,6 +759,10 @@ private commas_in(text: string) -> usize
 // receiver** needs and what one with a receiver never asks for.
 reachable_member_name(a: &Analysis, key: string) -> bool
     if a.tables.types.has(key) then return true
+
+    // One instance of a generic type, whose own members (`impl Board[Rp2350]`) are reached through
+    // the instance written out or through an alias of it.
+    if a.tables.struct_insts.has(key) || a.tables.enum_insts.has(key) then return true
 
     val scalar = scalar_named(key, word_bits_of(a))
 
