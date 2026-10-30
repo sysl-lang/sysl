@@ -94,7 +94,7 @@ trait Sequence[T]
     each(self, f: T -> unit)
     map[U](self, f: T -> U) -> []U
     filter(self, p: T -> bool) -> []T
-    flat_map[U](self, f: T -> []U) -> []U
+    flat_map[U](self, f: T -> []const U) -> []U
 ```
 
 The ten operations a sequence of `T` answers: seven that walk it and answer something, and three
@@ -111,7 +111,7 @@ that build a new sequence.
 | `each` | `each(self, f: T -> unit)` | Every element, in order, handed to something that returns nothing. |
 | `map` | `map[U](self, f: T -> U) -> []U` | Every element, transformed, in a slice of its own. |
 | `filter` | `filter(self, p: T -> bool) -> []T` | The elements satisfying the predicate, in a slice of their own. |
-| `flat_map` | `flat_map[U](self, f: T -> []U) -> []U` | Every element turned into a sequence, and all of those laid end to end. |
+| `flat_map` | `flat_map[U](self, f: T -> []const U) -> []U` | Every element turned into a sequence, and all of those laid end to end. |
 
 ## Implementations
 
