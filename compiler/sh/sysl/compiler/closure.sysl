@@ -1221,8 +1221,11 @@ end register_call_trait
 // `callee` is what the body calls where it is more than the name: `echo[int]` is called as written,
 // so the instantiation the reader named is the one the closure makes, and an application the call
 // would refuse is refused in the call's own words.
+//
+// **With `on_first`, the callee is a method and the first parameter its receiver** -- `S.get` is
+// `a0.get(a1, …)` -- which is the function the member compiled to, its receiver first.
 function_as_callable(cx: &Analyzer, span: Span, written: string, ptypes: Buf[Type],
-                     result: Option[Type], callee: Option[Expr] = None) -> TExpr
+                     result: Option[Type], callee: Option[Expr] = None, on_first: bool = false) -> TExpr
     // The parameters are named where no program can name them, so nothing the function's own body
     // reaches is shadowed by one of them.
     var names: Buf[string] = buf()
@@ -1238,9 +1241,24 @@ function_as_callable(cx: &Analyzer, span: Span, written: string, ptypes: Buf[Typ
 
     val called = callee.unwrap_or(expr(span, Ident(written)))
 
-    body.push(stmt(span, ExprStmt(expr(span, Call(called, args)))))
+    if on_first && !args.is_empty()
+        var rest: Buf[Expr] = buf()
+
+        for i in 1..<args.len()
+            rest.push(args.at(i))
+
+        body.push(stmt(span, ExprStmt(expr(span, Call(on_receiver(called, args.at(0)), rest)))))
+    else body.push(stmt(span, ExprStmt(expr(span, Call(called, args)))))
+
     lower_closure(cx, span, names, ptypes, result, body, written)
 end function_as_callable
+
+// `S.get`, `S.pick[int]` with the type's name replaced by the value the member is called on.
+private on_receiver(e: Expr, recv: Expr) -> Expr = *e.kind match
+    Field(_, name, at) -> expr(e.span, Field(recv, name, at))
+    Index(head, one, open) -> expr(e.span, Index(on_receiver(head, recv), one, open))
+    TypeArgs(head, list, open) -> expr(e.span, TypeArgs(on_receiver(head, recv), list, open))
+    _ -> e
 
 // -- what a body reads from around it ------------------------------------------------------------
 

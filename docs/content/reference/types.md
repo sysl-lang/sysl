@@ -1681,6 +1681,52 @@ print(apply(echo[int], 7), g("x", 2).0)
 7 x
 ```
 
+A type's member named through the type is a value there too. An associated function, `S.make`, is
+the function it is; `Box[int].make` and `S.pick[int]` name a copy as the call would. **A method's
+receiver becomes its first parameter**, taken exactly as the method declares it — `S.get` over
+`get(self)` takes an `S`, `S.bump` over `bump(*self, …)` a `*S`, a `&self` method an `&S` — so a
+callable giving that parameter another form or another type is refused rather than calling some other
+member of the name. A type parameter's member is reached the same way, `T.make`, through its bound.
+A trait's own name reaches nothing: its member is reached through a type that implements it.
+
+```sysl
+struct Counter
+    n: int
+
+impl Counter
+    start(n: int) -> Counter = Counter(n)
+    get(self) -> int = self.n
+    bump(*self, by: int) -> int
+        self.n += by
+        self.n
+
+apply[T](f: &Fn(T) -> int, x: T) -> int = f(x)
+
+val make: &Fn(int) -> Counter = Counter.start
+val bump: &Fn(*Counter, int) -> int = Counter.bump
+var c = make(1)
+
+print(bump(&c, 4), apply(Counter.get, c))
+```
+
+```output
+5 5
+```
+
+```sysl
+struct Counter
+    n: int
+
+impl Counter
+    bump(*self, by: int) -> int = self.n + by
+
+val f: &Fn(Counter, int) -> int = Counter.bump
+```
+
+```error
+'Counter.bump' takes its receiver as '*Counter', and as a value the receiver is its first parameter
+```
+
 **A parameter written with a bare arrow is a type parameter.** `f: A -> B` is shorthand for
 `[$F: Fn(A) -> B](f: $F)`: the closure's type is a *type argument*, so the function is monomorphized
 and calls the closure directly, with nothing on the heap. `f: &Fn(A) -> B` is a counted reference to
