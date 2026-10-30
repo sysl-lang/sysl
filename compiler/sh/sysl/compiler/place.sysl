@@ -289,8 +289,17 @@ private global_written_once(cx: &Analyzer, t: TExpr) -> bool = *t.kind match
 //
 // Getting it wrong the other way is what a `val` is *for*: `val s = S(1)` refuses `s.f = 3`, since
 // nothing else holds that struct and the write would be a second writing of the binding.
-private root_local(cx: &Analyzer, t: TExpr) -> Option[Local] = *t.kind match
-    TLoad(name, _) -> local_named(cx, name)
+private root_local(cx: &Analyzer, t: TExpr) -> Option[Local]
+    val captured = captured_local(cx, t)
+
+    if captured.is_some() then return captured
+
+    *t.kind match
+        TLoad(name, _) -> local_named(cx, name)
+        _ -> root_local_step(cx, t)
+end root_local
+
+private root_local_step(cx: &Analyzer, t: TExpr) -> Option[Local] = *t.kind match
     TField(recv, _, _) -> if holds_an_address(texpr_type(recv)) then None else root_local(cx, recv)
     TIndex(recv, _, _) -> if owns_its_elements(texpr_type(recv)) then root_local(cx, recv) else None
     TDeref(_, _) -> ref_call_place(cx, t) match
@@ -358,6 +367,46 @@ private local_named(cx: &Analyzer, unique: string) -> Option[Local]
 
     None
 end local_named
+
+// **A name a nested function or a closure captured is read as the place the environment reaches** --
+// `self.slot`, or `*self.slot` where the environment holds the frame variable's address -- and not as
+// a load of the name, so the walk out of it meets a dereference and would stop there, taking a
+// captured `val` array for storage nobody promised anything about. A view of it then came out
+// writable, `fill(TABLE)` was accepted at a `[]real`, and a run file's function wrote the elements of
+// a `val` it captured. The capture was bound under the frame's promise (`nested.sysl`'s
+// `bind_capture`), so the place answers the binding it was bound as.
+private captured_local(cx: &Analyzer, t: TExpr) -> Option[Local]
+    if cx.captured.is_empty() then return None
+
+    for item in cx.captured
+        if same_capture_place(item.1, t) then return local_named(cx, item.0)
+
+    None
+end captured_local
+
+// Whether two places are the same capture's: both a field of the environment at one slot, or both a
+// dereference of one.
+private same_capture_place(a: TExpr, b: TExpr) -> bool = *a.kind match
+    TDeref(x, _) -> *b.kind match
+        TDeref(y, _) -> env_slot_eq(x, y)
+        _ -> false
+    _ -> env_slot_eq(a, b)
+
+private env_slot_eq(a: TExpr, b: TExpr) -> bool
+    val sa = env_slot(a)
+    val sb = env_slot(b)
+
+    sa.is_some() && sb.is_some() && sa.unwrap() == sb.unwrap()
+end env_slot_eq
+
+// The slot of the environment a place is, where it is `self.slot` over the environment's own pointer.
+private env_slot(t: TExpr) -> Option[int] = *t.kind match
+    TField(recv, slot, _) -> *recv.kind match
+        TDeref(inner, _) -> *inner.kind match
+            TLoad(name, _) -> if name == "self" then Some(slot) else None
+            _ -> None
+        _ -> None
+    _ -> None
 
 // -- what a live `ref` holds still ---------------------------------------------------------------
 //
