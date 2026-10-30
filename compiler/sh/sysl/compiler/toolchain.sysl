@@ -497,10 +497,17 @@ end last_section
 // `b _memset`, because LLVM recognises a function as the routine it is implementing by its *LLVM*
 // name (`mylib$c_strlen`), never by the symbol the export publishes. A compilation defining no such
 // name keeps every builtin.
-function_attributes(t: Target, flags: Buf[string] = extra_cflags(), libcalls: bool = false) -> Buf[string]
+function_attributes(t: Target, flags: Buf[string] = extra_cflags(), libcalls: bool = false,
+                    level: string = "") -> Buf[string]
     var out: Buf[string] = buf()
 
     out.push("nounwind")
+
+    // **The size levels are the attributes clang gives every function at them**: LLVM's unroller and
+    // inliner read `optsize`/`minsize` off the function, never the `-O` level, so `-Os`/`-Oz` over IR
+    // without them still unrolls a fixed-count loop. `-Os` is `optsize`, `-Oz` is both.
+    for item in size_attributes(level)
+        out.push(item)
 
     unwind_table(t) match
         Some(u) -> out.push(u)
@@ -525,6 +532,18 @@ function_attributes(t: Target, flags: Buf[string] = extra_cflags(), libcalls: bo
 
     out
 end function_attributes
+
+// The function attributes `-O<level>` implies for size: `optsize` at `s`, `optsize minsize` at `z`,
+// nothing at any other level.
+size_attributes(level: string) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    if level == "s" || level == "z" then out.push("optsize")
+
+    if level == "z" then out.push("minsize")
+
+    out
+end size_attributes
 
 // The `uwtable` attribute clang gives a function on `t`, or nothing where it gives none. `sync` on
 // Apple's arm64, whose compact unwind needs only call-site accuracy; the plain (asynchronous) form
@@ -558,11 +577,11 @@ frame_pointer(t: Target) -> Option[string] = if !os_hosted(t.os) then None else 
 //
 // `libcalls` is asked of the WHOLE text: a codegen unit is a part of it, and a helper in one unit
 // doing a byte loop for a `memset` defined in another recurses just the same.
-for_clang(ir: string, t: Target) -> string = for_clang_unit(ir, t, defines_libcall(ir))
+for_clang(ir: string, t: Target, level: string = "") -> string = for_clang_unit(ir, t, defines_libcall(ir), level)
 
 // `for_clang` over one codegen unit, with `libcalls` asked of the text the unit was cut from.
-for_clang_unit(ir: string, t: Target, libcalls: bool) -> string =
-    sanitized(ir, function_attributes(t, extra_cflags(), libcalls))
+for_clang_unit(ir: string, t: Target, libcalls: bool, level: string = "") -> string =
+    sanitized(ir, function_attributes(t, extra_cflags(), libcalls, level))
 
 // Whether `ir` defines a function under a name LLVM may synthesise a call to (`is_libcall_name`) --
 // an `@export` publishing one, or a root-module function whose own symbol is one.
@@ -940,7 +959,7 @@ compile_object(cc: string, ir: string, obj: string, target: Target,
                level: string, piped: bool = true) -> Result[unit, string]
     val ll = s"$obj.ll"
 
-    write_text(ll, laid_out(cc, target, in_coro_dialect(cc, for_clang(ir, target)))) match
+    write_text(ll, laid_out(cc, target, in_coro_dialect(cc, for_clang(ir, target, level)))) match
         Err(_) -> return Err(s"cannot write $ll")
         Ok(_) -> ()
 
@@ -1104,7 +1123,7 @@ build_native(cc: string, ir: string, objects: Buf[string], exe: string, target: 
 
     val ll = s"$exe.ll"
 
-    write_text(ll, laid_out(cc, target, in_coro_dialect(cc, for_clang(ir, target)))) match
+    write_text(ll, laid_out(cc, target, in_coro_dialect(cc, for_clang(ir, target, level)))) match
         Err(_) -> return Err(s"cannot write $ll")
         Ok(_) -> ()
 
