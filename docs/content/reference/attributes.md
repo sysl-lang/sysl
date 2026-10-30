@@ -4867,6 +4867,101 @@ definition kept for want of the rule is bytes in your image that no optimizer wi
 region the attribute exists to manage. A package whose placed definition you want is one you name —
 an `import` is enough.
 
+### Where nothing runs an initializer, placed storage holds what the image carries
+
+Whatever reads a placed object reads the bytes the image carries: a boot ROM walking a table, a
+processor fetching a vector. Storage whose initializer has to *compute* something is filled when the
+program starts, by a hosted machine's loader or by a bare image's `main`. Two builds never run that
+code: a C archive for a freestanding target, and a bare image whose entry never calls `main`. There a
+placed `val` or `var` has to be **constant data**, laid straight into the object file, as C's
+`static const` initializer is.
+
+An address is constant data, because the linker fills it in. That holds for the address of a
+function or of module storage, and for that address read as an integer of exactly the machine's word:
+`usize(&f)`, and `u32(usize(&f))` on a 32-bit target, are C's `(uint32_t)(uintptr_t)&f`. A constant
+added to or subtracted from that word is constant data too. All of these are relocations, an
+`R_ARM_ABS32` here, and the `+ 1` is its addend:
+
+```sysl build=c target=thumbv6m-freestanding
+@export("rom_popcount32")
+popcount(x: u32) -> u32 = x.count_ones()
+
+idle() = ()
+
+struct Entry
+    tag: u32
+    at: u32
+
+@section(".rom.table")
+val TABLE: [3]u32 = [7, u32(usize(&popcount)), u32(usize(&idle)) + 1]
+
+@section(".rom.entry")
+val ENTRY: Entry = Entry(2, u32(usize(&popcount)))
+```
+
+In those two builds, storage that something has to compute is refused rather than placed, because
+nothing would ever fill it and the section would hold zeros:
+
+```sysl build=c target=thumbv6m-freestanding
+extern "rom_next" next() -> u32
+
+@section(".rom.g")
+val G: u32 = next()
+```
+
+```error
+'G' is placed in section ".rom.g", so what reads it is outside the program and reads the bytes the image carries
+```
+
+An address cut to a narrower integer, or widened past the machine's word, is not something any
+relocation writes. It stays code, so in those builds it is refused when placed, and the refusal says
+why:
+
+```sysl build=c target=thumbv6m-freestanding
+@export("rom_popcount32")
+popcount(x: u32) -> u32 = x.count_ones()
+
+@section(".rom.n")
+val N: u16 = u16(usize(&popcount))
+```
+
+```error
+'N' converts an address to ushort, and an address is a word the linker fills in at the machine's 32 bits — no relocation writes one at 16
+```
+
+A function placed in a section is a way in from outside the program, as an `@export` is. In a
+freestanding archive it may not reach storage that an initializer fills, for the same reason:
+
+```sysl build=c target=thumbv6m-freestanding
+extern "rom_next" next() -> u32
+
+val COUNT: u32 = next()
+
+@section(".ramfunc")
+tick() -> u32 = COUNT + 1
+```
+
+```error
+'tick' is placed for code outside the program to enter and reaches 'COUNT'
+```
+
+A bare image whose `main` runs fills computed placed storage there, before the program's own
+statements, as a hosted machine's loader does. A buffer in a second RAM bank may therefore start
+at a value worked out when the program starts:
+
+```sysl
+extern "rom_next" next() -> u32
+
+@section(".ram2")
+var buf: u32 = next()
+
+@export("main")
+main_entry() -> int = int(buf)
+```
+
+Placed in flash, the same storage would be written by `main`, so a table meant for ROM is one that
+folds.
+
 ### What it may not mark
 
 A `const` is folded into every use and has no storage; a type is not an object. Neither takes a

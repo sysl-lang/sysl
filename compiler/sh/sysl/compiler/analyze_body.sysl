@@ -2467,9 +2467,18 @@ private static_image(cx: &Analyzer, name: string, t: TExpr) -> Option[TExpr] = *
     TBufLit(elems, ty) -> static_images(cx, name, elems).map(xs -> TExpr(t.span, TBufLit(xs, ty)))
     // A union is data as a struct is: its one value laid down at its first byte, and the rest of its
     // bytes zero (`emit_static.sysl`'s `union_image`).
+    //
+    // **An address read as an integer stays out of a struct that rewrites its fields' bits**: a union,
+    // a bitfield container and a `@byte_order` struct all lay their fields down as numbers the
+    // compiler computes, and a word the linker fills in is not a number yet (`linked_word`).
     TStructNew(decl, args) ->
-        if decl.union_layout then written_images(cx, name, args).map(xs -> TExpr(t.span, TStructNew(decl, xs)))
-        else static_images(cx, name, args).map(xs -> TExpr(t.span, TStructNew(decl, xs)))
+        val parts = if decl.union_layout then written_images(cx, name, args) else static_images(cx, name, args)
+
+        if parts.is_none() then return None
+
+        if bits_rewritten(decl) && any_linked_word(parts.unwrap()) then return None
+
+        Some(TExpr(t.span, TStructNew(decl, parts.unwrap())))
     // A box written out is laid down as one, as a box a `const` call answers is (`builds_box`).
     TBox(value, ty) -> static_image(cx, name, value).map(x -> TExpr(t.span, TBox(x, ty)))
     TCast(inner, to) -> cast_image(cx, name, t, inner, to)
@@ -2509,7 +2518,72 @@ private static_image(cx: &Analyzer, name: string, t: TExpr) -> Option[TExpr] = *
         underlying(ty) match
             Struct(d) -> bits_literal(t.span, d, n).and_then(x -> static_image(cx, name, x))
             _ -> None
+    TBinary(op, left, right, ty) -> offset_image(cx, name, t, op, left, right, ty)
     _ -> leaf_image(cx, name, t)
+
+// **An address moved by a constant is constant data**: `usize(&f) + 1` is a relocation with an addend,
+// as `(uintptr_t)&f + 1` is in C, written as LLVM's constant `add` over the `ptrtoint`. Only `+` and
+// `-` (wrapping or not) with the address on the left, and a constant on the right, are an addend; any
+// other arithmetic over an address is code. Arithmetic over two constants folds as it always did.
+private offset_image(cx: &Analyzer, name: string, t: TExpr, op: string, left: TExpr, right: TExpr,
+                     ty: Type) -> Option[TExpr]
+    if (op != "+" && op != "-" && op != "+%" && op != "-%") || !written_address(left) then
+        return leaf_image(cx, name, t)
+
+    val base = static_image(cx, name, left)
+
+    if base.is_none() || !linked_word(base.unwrap()) then return None
+
+    val addend = leaf_image(cx, name, right)
+
+    if addend.is_none() then return None
+
+    *addend.unwrap().kind match
+        TIntLit(_, _) -> Some(TExpr(t.span, TBinary(op, base.unwrap(), addend.unwrap(), ty)))
+        _ -> None
+end offset_image
+
+// **Whether an image is a word the linker fills in, read as an integer**: a function's or module
+// storage's address converted to an integer of the machine's word (`word_image`), or such a word
+// moved by a constant (`offset_image`). An address still typed as a pointer counts as well, being the
+// same word before its conversion.
+private linked_word(t: TExpr) -> bool = *t.kind match
+    TFuncAddr(_, _, _) -> true
+    TAddrOf(_, _) -> true
+    TCast(inner, to) -> !is_pointerish(to) && linked_word(inner)
+    TBinary(_, left, _, _) -> linked_word(left)
+    _ -> false
+
+// Whether an expression is written over an address -- `&f`, `&table[2]`, converted or moved by
+// arithmetic -- so that it is imaged as one rather than handed to the fold, which has no number for it.
+private written_address(t: TExpr) -> bool = *t.kind match
+    TFuncAddr(_, _, _) -> true
+    TAddrOf(_, _) -> true
+    TCast(inner, _) -> written_address(inner)
+    TBinary(_, left, _, _) -> written_address(left)
+    _ -> false
+
+// The same asked of the parts as written, before imaging.
+private any_written_word(xs: Buf[TExpr]) -> bool
+    for item in xs
+        if written_address(item) && !is_pointerish(texpr_type(item)) then return true
+
+    false
+end any_written_word
+
+// Whether a struct's parts hold an address as an integer; one held as a pointer is laid as it always was.
+private any_linked_word(xs: Buf[TExpr]) -> bool
+    for item in xs
+        if linked_word(item) && !is_pointerish(texpr_type(item)) then return true
+
+    false
+end any_linked_word
+
+// Whether a struct's constant is written as numbers the compiler works out from its fields -- a
+// union's bytes, a bitfield container, a C bit-field, a `@byte_order` reversal -- rather than as the
+// fields themselves.
+private bits_rewritten(d: &StructType) -> bool =
+    d.union_layout || bitfield_ranges_of(Struct(d)).is_some() || !d.c_bits.is_empty() || d.big_endian.is_some()
 
 // **A trait object over the address of module storage is constant data**: it is two addresses, the
 // object's and its type's table for the trait, and the linker fills in both. Anything else erased --
@@ -2733,8 +2807,25 @@ private cast_image(cx: &Analyzer, name: string, t: TExpr, inner: TExpr, to: Type
 
     if is_fixed(to) then return fixed_image(t, from.unwrap(), to)
 
+    if linked_word(from.unwrap()) then return word_image(cx, t, from.unwrap(), to)
+
     scalar_image(TExpr(t.span, TCast(from.unwrap(), to)), m)
 end cast_image
+
+// **An address read as an integer of exactly the machine's word is constant data**: `usize(&f)`, and
+// `u32(usize(&f))` on a 32-bit target, are C's `(uint32_t)(uintptr_t)&f` -- a word the linker fills in
+// (an `R_ARM_ABS32`, an `R_X86_64_64`), written as a constant `ptrtoint`. A narrower or a wider
+// integer is not a word any relocation writes, so it stays code, and `fold_stop` says why.
+private word_image(cx: &Analyzer, t: TExpr, from: TExpr, to: Type) -> Option[TExpr]
+    if integer_width(to) != int(cx.an.tables.layout.word_bits) then return None
+
+    Some(TExpr(t.span, TCast(from, to)))
+end word_image
+
+// The width of an integer type, or `0` for anything else.
+private integer_width(to: Type) -> int = underlying(to) match
+    Integer(bits, _, _) -> bits
+    _ -> 0
 
 // A device address: the integer folded, the conversion kept.
 private address_image(t: TExpr, inner: TExpr, from: TExpr, to: Type, m: FoldMachine) -> Option[TExpr] =
@@ -2789,6 +2880,26 @@ private fold_stop(cx: &Analyzer, key: string, d: ValueDecl, init: TExpr, writabl
     val whole = part.span.start == init.span.start && part.span.end == init.span.end
     val at = if whole && d.init.is_some() then d.init.unwrap().span else part.span
     val written = from_utf8_unchecked(cx.scope.src.text(at))
+    val word = int(cx.an.tables.layout.word_bits)
+
+    // An address cut or widened is not a word a relocation writes (`word_image`).
+    *part.kind match
+        TCast(inner, to) ->
+            val bits = integer_width(to)
+
+            if bits != 0 && bits != word && written_address(inner)
+                return s"$shown converts an address to ${type_show(to)}, and an address is a word the " +
+                       s"linker fills in at the machine's $word bits — no relocation writes one at $bits, " +
+                       "so the conversion is code that runs when the program starts"
+            end if
+        // A struct whose fields are laid down as bits the compiler works out (`bits_rewritten`).
+        TStructNew(decl, args) ->
+            if bits_rewritten(decl) && any_written_word(args)
+                return s"$shown holds an address as an integer in '${type_show(Struct(decl))}', whose fields are laid " +
+                       "down as bits the compiler packs or reverses — and an address is no number until " +
+                       "the linker fills it in"
+            end if
+        _ -> ()
 
     first_runtime_read(part) match
         Some(symbol) ->
