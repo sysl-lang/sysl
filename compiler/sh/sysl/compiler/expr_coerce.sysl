@@ -197,6 +197,14 @@ analyze_unwidened(cx: &Analyzer, e: Expr, expected: Option[Type]) -> TExpr
             return TExpr(v.span, TConstrainedCheck(v, want))
         Slice(_, _) -> return coerce(cx, analyze_value(cx, e, expected), want)
         Vector(_, _) -> return coerce(cx, analyze_value(cx, e, expected), want)
+        // An array is wanted from a vector only where its lanes are being laid out; every other value
+        // takes the path below, which is the one an array has always taken.
+        Array(_, _) ->
+            val v = analyze_value(cx, e, expected)
+
+            if is_vector(repr(texpr_type(v))) then return coerce(cx, v, want)
+
+            return held_by_reference(cx, v, expected)
         // A raw object is a pointer with a table beside it, so a pointer at a type that implements
         // the trait is what goes into one. Only that shape is asked about here: every other pointer
         // position is an exact match already, and reading one through this would put a coercion
@@ -319,9 +327,48 @@ coerce(cx: &Analyzer, t: TExpr, expected: Type) -> TExpr
                 Some(view) -> coerce(cx, view, expected)
                 None -> t
         Vector(_, elem) ->
-            if type_eq(repr(got), repr(*elem)) then TExpr(t.span, TSplat(t, expected)) else t
+            if type_eq(repr(got), repr(*elem)) then TExpr(t.span, TSplat(t, expected))
+            else lanes_as(cx, t, expected)
+        Array(_, _) -> lanes_as(cx, t, expected)
         _ -> t
 end coerce
+
+// **A vector and an array of its lanes are one list of values**, so either is written where the other
+// is wanted: the same values, in the same order, with nothing rounded or reinterpreted -- which is
+// the rule every implicit conversion meets. The two must agree in element and in length. A different
+// element is left for the caller, whose words name the position, as any other mismatch is; a different
+// length is said here, because which side is shorter is what the reader needs to see.
+private lanes_as(cx: &Analyzer, t: TExpr, expected: Type) -> TExpr
+    val (from, to) = (repr(texpr_type(t)), repr(expected))
+    val pair = (from, to) match
+        (Vector(n, a), Array(m, b)) -> Some((n, m, *a, *b, true))
+        (Array(n, a), Vector(m, b)) -> Some((n, m, *a, *b, false))
+        _ -> None
+
+    if pair.is_none() then return t
+
+    val (n, m, a, b, from_vector) = pair.unwrap()
+
+    if !type_eq(repr(a), repr(b)) then return t
+
+    if n != m
+        val (lanes, elems) = if from_vector then (from, to) else (to, from)
+
+        return cx.err(t.span, s"a vector converts to an array, and an array to a vector, only at " +
+                      s"one length: ${type_show(lanes)} has ${lane_count_of(lanes)} lanes and " +
+                      s"${type_show(elems)} has ${array_len_of_type(elems)} elements")
+    end if
+
+    TExpr(t.span, TLanesAs(t, expected))
+end lanes_as
+
+private lane_count_of(t: Type) -> int = t match
+    Vector(n, _) -> n
+    _ -> 0
+
+private array_len_of_type(t: Type) -> int = t match
+    Array(n, _) -> n
+    _ -> 0
 
 // The whole-array view an array coerces to, where its elements are the ones the slice wants.
 //

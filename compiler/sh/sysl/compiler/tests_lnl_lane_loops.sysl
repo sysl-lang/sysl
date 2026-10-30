@@ -1,0 +1,604 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// **Walking a vector's lanes, and moving them to and from an array** (`reference/vectors.md` § "Every
+// lane, one at a time" and § "A vector and an array"). The helpers are `tests_enm_enum_run.sysl`'s.
+//
+// A lane index is part of the instruction that reads it, so a loop over the lanes is a `for const`:
+// unrolled, its variable a constant in each copy. The cells here hold that walk at every lane type,
+// in a generic over the width, nested, beside a `return`, and on a bare target, and pin what an
+// ordinary `for` is told. The other half is the conversion: a vector converts to an array of the same
+// element and length, and back, at every position that converts -- and never at another length or
+// element.
+
+// `text` built in debug, or in release where `release` says so, and run: what it printed, or why not.
+private lnl_run(text: string, release: bool) -> string
+    val root = make_temp_dir("sysl-lnl").unwrap()
+
+    write_text(s"$root/main.sysl", forms_imported(text)).unwrap()
+
+    if release
+        var flags: [1]string = ["--release"]
+
+        assert_eq(took_search_flag(flags[..], 0), 1)
+    end if
+
+    val exe = s"$root/built"
+    val built = build_native_program(root, None, None, DefaultOptimization, Some(exe))
+
+    reset_search_paths()
+
+    built match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return s"it did not build: ${failure_text(why)}"
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program could not be run"
+        Ok(out) -> if out.status.ok() then out.text else s"it did not exit zero: ${out.text}"
+end lnl_run
+
+// The same output in a debug and a release build.
+private lnl_both(text: string, want: string)
+    assert_eq(lnl_run(text, false), want)
+    assert_eq(lnl_run(text, true), want)
+
+// The first thing the compilation said contains `want`.
+private lnl_says(text: string, want: string)
+    val said = enm_err(text)
+
+    assert(said.contains(want), s"expected it to say: $want\nit said: $said")
+
+// The lines of the definition of the function `name` in `ir`.
+private lnl_fn(ir: string, name: string) -> string
+    val at = ir.index_of("@" + name + "$$sysl(")
+
+    assert(at.is_some(), s"no function '$name' in the IR:\n$ir")
+
+    val head = ir[0..<at.unwrap()]
+    val start = head.last_index_of("define ").unwrap_or(0)
+    val rest = ir[start..<ir.len]
+    val close = rest.index_of("\n}").unwrap_or(rest.len)
+
+    rest[0..<close]
+end lnl_fn
+
+// How many `extractelement`s in `body` take their lane from a register rather than a constant.
+private lnl_variable_lanes(body: string) -> int
+    var n = 0
+
+    for l in lines_of(body)
+        if !l.contains("extractelement") && !l.contains("insertelement") then continue
+
+        val comma = l.last_index_of(", ")
+
+        if comma.is_none() then continue
+
+        val ix = l[comma.unwrap() + 2..<l.len]
+
+        if ix.contains("%") then n += 1
+    end for
+
+    n
+end lnl_variable_lanes
+
+// How many lines of `text` hold `what`.
+private lnl_count(text: string, what: string) -> int
+    var n = 0
+
+    for l in lines_of(text)
+        if l.contains(what) then n += 1
+
+    n
+end lnl_count
+
+// What clang's `-O2` makes of the module `text` lowers to.
+private lnl_optimized(text: string) -> string
+    val dir = make_temp_dir("sysl-lnl-o2").unwrap()
+    val file = s"$dir/t.ll"
+
+    write_text(file, enm_ir(text)).unwrap()
+
+    val got = capture("clang", ["-O2", "-S", "-emit-llvm", "-o", "-", file], "", [], true).unwrap()
+
+    remove_dir_all(dir).unwrap_or(())
+    assert(got.status.ok(), s"clang refused the emitted IR:\n${got.err.unwrap_or("")}")
+    got.text
+end lnl_optimized
+
+// `sysl build-c` of `text` for a target with no C library: the exit code and what it said.
+private lnl_build_c(text: string, target: string) -> (int, string)
+    val root = make_temp_dir("sysl-lnl-c").unwrap()
+
+    write_text(s"$root/sysl.hocon", "package {\n  name = \"probe\"\n}\n").unwrap()
+    write_text(s"$root/main.sysl", forms_imported(text)).unwrap()
+
+    var said: Buf[string] = buf()
+    val sink = &said
+    var args: [7]string = ["sysl", "build-c", "--target", target, "-o", s"$root/probe.a", root]
+    val code = run_cli(args[..], piece -> sink.push(piece))
+
+    reset_search_paths()
+    remove_dir_all(root).unwrap_or(())
+
+    var out = ""
+
+    for piece in said
+        out = out + piece
+
+    (code, out)
+end lnl_build_c
+
+// -- walking the lanes: `for const` ---------------------------------------------------------------
+
+@test("a 'for const' reads every lane, at each lane type, in debug and release")
+lnl_reads_every_lane_type()
+    if !enm_ready() then return
+
+    lnl_both(raw"""
+        const NR = 4
+
+        main()
+            val d: <NR>f64 = [1.5, 2, 3, 4]
+            val f: <4>f32 = [0.5, 1, 2, 4]
+            val i: <4>i32 = [-1, 20, -300, 4000]
+            val b: <8>u8 = [1, 2, 3, 4, 5, 6, 7, 250]
+            val m = i > 0
+            var (sd, sf, si, sb, sm) = (0.0, 0.0f32, 0i32, 0u32, 0)
+
+            for const j in 0..<NR
+                sd += d[j]
+                sf += f[j]
+                si += i[j]
+
+                if m[j] then sm += 1
+
+            for const j in 0..<8
+                sb += b[j]
+
+            print(sd, sf, si, sb, sm)
+        """, "10.5 7.5 3719 278 2\n")
+
+@test("a 'for const' writes every lane, and its variable is an ordinary value too")
+lnl_writes_every_lane()
+    if !enm_ready() then return
+
+    lnl_both(raw"""
+        main()
+            var w: <4>i32 = 0
+            var g: <4>f64 = 0
+            var m: <4>bool = false
+
+            for const j in 0..<4
+                w[j] = i32(j) * 10 + 1
+                g[j] = real(j) / 2
+                m[j] = j % 2 == 1
+
+            print(w[0], w[3], g[1], g[3], m[0], m[1], (w * 2)[2])
+        """, "1 31 0.5 1.5 false true 42\n")
+
+@test("an inclusive range, and a range that starts past zero, walk the lanes they name")
+lnl_other_ranges()
+    if !enm_ready() then return
+
+    lnl_both(raw"""
+        main()
+            val v: <8>int = [1, 2, 3, 4, 5, 6, 7, 8]
+            var a = 0
+            var b = 0
+
+            for const j in 0..3
+                a += v[j]
+
+            for const j in 5..<8
+                b += v[j]
+
+            print(a, b)
+        """, "10 21\n")
+
+@test("a generic over the width walks its own lanes, at two widths and two lane types")
+lnl_generic_width()
+    if !enm_ready() then return
+
+    lnl_both(raw"""
+        total[const N: usize, T: Integer](v: <N>T) -> long
+            var s: long = 0
+
+            for const j in 0..<N
+                s += long(v[j])
+
+            s
+
+        dot[const N: usize](a: <N>f64, b: <N>f64) -> f64
+            var s = 0.0
+
+            for const j in 0..<N
+                s += a[j] * b[j]
+
+            s
+
+        main()
+            val two: <2>f64 = [1, 2]
+            val four: <4>f64 = [1, 2, 3, 4]
+            val small: <4>i32 = [1, -2, 3, -4]
+            val bytes: <16>u8 = 7
+
+            print(dot(two, two), dot(four, four), total(small), total(bytes))
+        """, "5 30 -2 112\n")
+
+@test("nested walks reach a lane of each vector in an array of them, read and written")
+lnl_nested()
+    if !enm_ready() then return
+
+    lnl_both(raw"""
+        const MR = 3
+        const NR = 4
+
+        main()
+            var acc: [MR]<NR>f64 = [0; MR]
+            val a: <MR>f64 = [1, 2, 3]
+            val b: <NR>f64 = [10, 20, 30, 40]
+
+            for const i in 0..<MR
+                for const j in 0..<NR
+                    acc[i][j] = a[i] * b[j]
+
+            var s = 0.0
+
+            for const i in 0..<MR
+                for const j in 0..<NR
+                    s += acc[i][j]
+
+            print(acc[2][3], acc[1][0], s)
+        """, "120 20 600\n")
+
+@test("a 'return' inside a walk leaves the function from the copy it is in")
+lnl_return_inside()
+    if !enm_ready() then return
+
+    lnl_both(raw"""
+        first_negative(v: <4>int) -> int
+            for const j in 0..<4
+                if v[j] < 0 then return int(j)
+
+            -1
+
+        main()
+            print(first_negative([1, 2, -3, -4]), first_negative([1, 2, 3, 4]),
+                  first_negative([-9, 0, 0, 0]))
+        """, "2 -1 0\n")
+
+@test("a walk's lane reads are constant lanes in the IR, and the copies fold into whole-vector moves at -O2")
+lnl_constant_lanes_in_ir()
+    if !enm_ready() then return
+
+    val text = raw"""
+        const NR = 4
+
+        @noinline
+        kernel(acc: <NR>f64, a: f64, b: <NR>f64) -> [NR]f64
+            var out: [NR]f64 = [0; NR]
+
+            for const j in 0..<NR
+                out[j] = acc[j] + a * b[j]
+
+            out
+
+        main()
+            val r = kernel([1, 2, 3, 4], 2, [1, 1, 1, 1])
+            print(r[0], r[3])
+        """
+    val ir = enm_ir(text)
+    val body = lnl_fn(ir, "kernel")
+
+    assert_eq(lnl_variable_lanes(body), 0)
+    assert_eq(lnl_count(body, "extractelement <4 x double>"), 8)
+
+    // An ordinary `for` over the same range keeps a loop, so its control is a counted branch; the
+    // unrolled one has none.
+    assert(!body.contains("for.cond"), body)
+    assert_eq(lnl_run(text, false), "3 6\n")
+
+@test("an ordinary 'for' over a constant range keeps the constant-lane refusal, naming 'for const'")
+lnl_plain_for_refused()
+    if !enm_ready() then return
+
+    lnl_says(raw"""
+        const NR = 4
+
+        f(v: <NR>f32) -> f32
+            var s: f32 = 0
+
+            for j in 0..<NR
+                s += v[j]
+
+            s
+
+        print(f(1))
+        """, "a lane index is part of the instruction that reads it, so it has to be a constant — " +
+            "a literal, a 'const' naming one, or the variable of a 'for const', which is unrolled. " +
+            "To index <4>f32 by a computed number, keep the values in a '[4]f32'")
+
+@test("and so does a write by an ordinary 'for' variable")
+lnl_plain_for_write_refused()
+    if !enm_ready() then return
+
+    lnl_says(raw"""
+        f() -> int
+            var v: <4>int = 0
+
+            for j in 0..<4
+                v[j] = 1
+
+            v[0]
+
+        print(f())
+        """, "a lane index is part of the instruction that reads it, so it has to be a constant — " +
+            "a literal, a 'const' naming one, or the variable of a 'for const'")
+
+@test("a 'break' or a 'continue' in a walk is refused, since no loop is left to act on")
+lnl_break_continue_refused()
+    if !enm_ready() then return
+
+    for keyword in ["break", "continue"]
+        lnl_says(s"f(v: <4>int) -> int\n    var s = 0\n\n    for const j in 0..<4\n" +
+                 s"        if v[j] < 0 then $keyword\n\n        s += v[j]\n\n    s\n\nprint(f(1))\n",
+                 s"a 'for const' is unrolled into one copy of its body per value, so there is no " +
+                 s"loop for '$keyword' to act on — a loop that is walked at run time is the ordinary " +
+                 "'for'")
+    end for
+
+@test("a range computed at run time is not walked, and one too long is refused by its count")
+lnl_range_refusals()
+    if !enm_ready() then return
+
+    lnl_says("f(v: <4>int, n: usize) -> int\n    var s = 0\n\n    for const j in 0..<n\n" +
+             "        s += v[j]\n\n    s\n\nprint(f(1, 4))\n", "must be known at compile time")
+    lnl_says("f(v: <128>u8) -> int\n    var s = 0\n\n    for const j in 0..<128\n        s += v[j]\n\n" +
+             "    s\n\nprint(f(1))\n",
+             "a 'for const' over 128 values would emit that many copies of its body, and 64 is the " +
+             "most one is unrolled to")
+
+@test("a walk past the last lane is refused at the copy that reaches it")
+lnl_walk_past_the_end()
+    if !enm_ready() then return
+
+    lnl_says("f(v: <4>int) -> int\n    var s = 0\n\n    for const j in 0..5\n        s += v[j]\n\n" +
+             "    s\n\nprint(f(1))\n", "<4>int has lanes 0 to 3, and this is 4")
+
+// -- a vector and an array ------------------------------------------------------------------------
+
+@test("a vector converts to an array of its lanes, at each lane type, and the array is indexed at run time")
+lnl_vector_to_array()
+    if !enm_ready() then return
+
+    lnl_both(raw"""
+        main()
+            val d: <4>f64 = [1.5, 2, 3, 4]
+            val f: <4>f32 = [0.5, 1, 2, 4]
+            val i: <4>i32 = [-1, 20, -300, 4000]
+            val b: <8>u8 = [1, 2, 3, 4, 5, 6, 7, 250]
+            val m: <4>bool = i > 0
+            val ad: [4]f64 = d
+            val af: [4]f32 = f
+            val ai: [4]i32 = i
+            val ab: [8]u8 = b
+            val am: [4]bool = m
+            var k = 3
+
+            print(ad[k], af[k - 1], ai[k - 2], ab[k + 4], am[0], am[1], am[k])
+        """, "4 2 20 250 false true true\n")
+
+@test("an array converts to a vector of its elements, at each lane type, and computes lane-wise")
+lnl_array_to_vector()
+    if !enm_ready() then return
+
+    lnl_both(raw"""
+        main()
+            val ad: [4]f64 = [1.5, 2, 3, 4]
+            val ai: [4]i32 = [-1, 20, -300, 4000]
+            val ab: [8]u8 = [1, 2, 3, 4, 5, 6, 7, 250]
+            val am: [4]bool = [true, false, true, false]
+            val d: <4>f64 = ad
+            val i: <4>i32 = ai
+            val b: <8>u8 = ab
+            val m: <4>bool = am
+
+            print((d * 2)[3], (i + 1)[2], (b + 1)[7], (m ^ true)[1], (d + d).sum())
+        """, "8 -299 251 true 21\n")
+
+@test("every converting position converts: an argument, a return, an assignment, a field, an element")
+lnl_positions()
+    if !enm_ready() then return
+
+    lnl_both(raw"""
+        struct Row
+            xs: [4]f64
+
+        mean(xs: [4]f64) -> f64 = (xs[0] + xs[1] + xs[2] + xs[3]) / 4
+        lanes(xs: [4]f64) -> <4>f64 = xs
+        spread(v: <4>f64) -> [4]f64 = v * 2
+
+        main()
+            val v: <4>f64 = [1, 2, 3, 4]
+            var a: [4]f64 = [0; 4]
+
+            a = v
+            a[0] = 10
+
+            val back: <4>f64 = a
+            val row = Row(v)
+            val rows: [2][4]f64 = [v, v + 1]
+
+            print(mean(v), lanes(a)[0], spread(v)[3], back[0], back[3], row.xs[2], rows[1][3])
+        """, "2.5 10 8 10 4 3 5\n")
+
+@test("a generic over the width converts both ways at the width it was given")
+lnl_generic_conversion()
+    if !enm_ready() then return
+
+    lnl_both(raw"""
+        out[const N: usize](v: <N>f64) -> [N]f64 = v
+        into[const N: usize](a: [N]f64) -> <N>f64 = a
+
+        largest[const N: usize](v: <N>f64) -> f64
+            val xs: [N]f64 = v
+            var best = xs[0]
+
+            for x in xs
+                if x > best then best = x
+
+            best
+
+        main()
+            val two: <2>f64 = [1, 2]
+            val eight: <8>f64 = [3, 1, 4, 1, 5, 9, 2, 6]
+
+            print(out(two)[1], into(out(eight))[5], largest(eight), largest(two))
+        """, "2 9 9 2\n")
+
+@test("a wide vector converts through an array that crosses by address, both ways")
+lnl_wide()
+    if !enm_ready() then return
+
+    lnl_both(raw"""
+        @noinline
+        bump(xs: [16]f64) -> [16]f64
+            var ys = xs
+
+            for i in 0..<16
+                ys[i] += real(i)
+
+            ys
+
+        main()
+            val v: <16>f64 = 1
+            val back: <16>f64 = bump(v)
+
+            print(back[0], back[15], back.sum())
+        """, "1 16 136\n")
+
+@test("a conversion is the same list of values in a 'const' as at run time")
+lnl_const_context()
+    if !enm_ready() then return
+
+    lnl_both(raw"""
+        const third() -> f64
+            val v: <4>f64 = [1, 2, 3, 4]
+            val xs: [4]f64 = v * 10
+            val w: <4>f64 = xs
+
+            w[2]
+
+        const THIRD = third()
+
+        main()
+            print(THIRD)
+        """, "30\n")
+
+@test("the conversion moves lanes one by one, never through a store of the whole register")
+lnl_conversion_ir()
+    if !enm_ready() then return
+
+    val ir = enm_ir(raw"""
+        @noinline
+        out(v: <4>f32) -> [4]f32 = v
+
+        @noinline
+        into(a: [4]f32) -> <4>f32 = a
+
+        main()
+            print(out([1, 2, 3, 4])[0], into([1, 2, 3, 4])[3])
+        """)
+    val o = lnl_fn(ir, "out")
+    val i = lnl_fn(ir, "into")
+
+    assert_eq(lnl_count(o, "extractelement <4 x float>"), 4)
+    assert_eq(lnl_count(o, "insertvalue [4 x float]"), 4)
+    assert_eq(lnl_count(i, "extractvalue [4 x float]"), 4)
+    assert_eq(lnl_count(i, "insertelement <4 x float>"), 4)
+    assert_eq(lnl_variable_lanes(o) + lnl_variable_lanes(i), 0)
+
+    // The one store of the register is the parameter's own home, which every parameter has at -O0.
+    assert_eq(lnl_count(o, "store <4 x float>"), 1)
+    assert_eq(lnl_count(i, "load <4 x float>"), 0)
+
+    // At -O2 the chain is not left as eight moves of single lanes.
+    val opt = lnl_optimized(raw"""
+        @noinline
+        out(v: <4>f32) -> [4]f32 = v
+
+        main()
+            print(out([1, 2, 3, 4])[0])
+        """)
+
+    assert(lnl_count(opt, "extractelement") <= 4, opt)
+
+@test("a vector and an array of another length are refused, in either direction, naming both")
+lnl_length_mismatch()
+    if !enm_ready() then return
+
+    lnl_says("val v: <4>f32 = [1, 2, 3, 4]\nval a: [3]f32 = v\nprint(a[0])\n",
+             "a vector converts to an array, and an array to a vector, only at one length: <4>f32 " +
+             "has 4 lanes and [3]f32 has 3 elements")
+    lnl_says("val a: [8]i16 = [0; 8]\nval v: <4>i16 = a\nprint(v[0])\n",
+             "a vector converts to an array, and an array to a vector, only at one length: <4>i16 " +
+             "has 4 lanes and [8]i16 has 8 elements")
+    lnl_says("f(xs: [2]f32) -> f32 = xs[0]\nval v: <4>f32 = 1\nprint(f(v))\n",
+             "<4>f32 has 4 lanes and [2]f32 has 2 elements")
+
+@test("a vector and an array of another element are refused, nothing converting on the way")
+lnl_element_mismatch()
+    if !enm_ready() then return
+
+    lnl_says("val v: <4>f32 = [1, 2, 3, 4]\nval a: [4]f64 = v\nprint(a[0])\n",
+             "declared [4]f64 but the value is <4>f32")
+    lnl_says("val a: [4]i32 = [1, 2, 3, 4]\nval v: <4>i64 = a\nprint(v[0])\n",
+             "declared <4>i64 but the value is [4]i32")
+
+@test("an operator still does not mix a vector and an array")
+lnl_operator_does_not_convert()
+    if !enm_ready() then return
+
+    val decls = "val v: <4>f32 = 1\nval a: [4]f32 = [1, 2, 3, 4]\n\nmain()\n"
+
+    lnl_says(decls + "    val c = v + a\n    print(c[0])\n", "'+' needs matching types, got <4>f32 and [4]f32")
+    lnl_says(decls + "    val c = a * v\n    print(c[0])\n", "[4]f32")
+    lnl_says(decls + "    print((v < a)[0])\n", "[4]f32")
+
+@test("a walk and both conversions build for a target with no C library")
+lnl_bare_target()
+    if !enm_ready() then return
+
+    val text = raw"""
+        const NR = 4
+
+        @export("main")
+        probe() -> u32
+            val v: <NR>f32 = [1, 2, 3, 4]
+            var s: f32 = 0
+
+            for const j in 0..<NR
+                s += v[j]
+
+            val xs: [NR]f32 = v * 2
+            val w: <NR>f32 = xs
+
+            u32(s) + u32(xs[3]) + u32(w[1])
+        """
+
+    for target in ["thumb-freestanding-softfp", "thumbv6m-freestanding"]
+        val (code, said) = lnl_build_c(text, target)
+
+        assert(!said.contains("error"), s"$target: $said")
+        assert_eq(code, 0)
+    end for

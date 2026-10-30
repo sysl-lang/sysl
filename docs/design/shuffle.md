@@ -37,8 +37,9 @@ The user accepted every row (2026-10-22, §8); the recommendation is §7.
 
 ```
 <4>f32 has lanes 0 to 3, and this is 4
-a lane index is part of the instruction that reads it, so it has to be a constant — a literal, or a
-'const' naming one. To index <4>f32 by a computed number, keep the values in a '[4]f32'
+a lane index is part of the instruction that reads it, so it has to be a constant — a literal, a
+'const' naming one, or the variable of a 'for const', which is unrolled. To index <4>f32 by a
+computed number, keep the values in a '[4]f32'
 ```
 
 A value parameter is a constant there: `pick[const K: usize](v: <4>f32) -> f32 = v[K]` and

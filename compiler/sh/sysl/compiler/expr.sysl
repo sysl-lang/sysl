@@ -2383,6 +2383,12 @@ sandboxed_read(cx: &Analyzer, e: Expr, expected: Option[Type]) -> TExpr
     t
 end sandboxed_read
 
+// Whether one of two types is a vector and the other an array.
+private storage_beside_register(a: Type, b: Type) -> bool = (a, b) match
+    (Vector(_, _), Array(_, _)) -> true
+    (Array(_, _), Vector(_, _)) -> true
+    _ -> false
+
 // A last reading of an expression at the type its position turned out to have, taken only where the
 // reading it already has is about to be reported as a mismatch.
 //
@@ -2392,6 +2398,12 @@ end sandboxed_read
 // was going to report it.
 reread(cx: &Analyzer, t: TExpr, src: Expr, want: Type, widen: bool = true) -> TExpr
     if !disagree(texpr_type(t), want) then return t
+
+    // **An operator does not move lanes between storage and a register.** A vector and an array of
+    // its lanes convert where a position names the one it wants (`expr_coerce.sysl`'s `lanes_as`),
+    // but two operands meeting is not such a position: `v + a` would compute lane-wise or fail to
+    // according to which side was the vector.
+    if storage_beside_register(repr(texpr_type(t)), repr(want)) then return t
 
     // A character literal beside a byte is that byte or a mistake with its own name, so its reading
     // at `u8` is the one kept either way -- `b == 'é'` is told the character is not ASCII, rather
