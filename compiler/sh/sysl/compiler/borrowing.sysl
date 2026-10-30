@@ -279,6 +279,34 @@ private site_of(name: string, args: Buf[TExpr], b: Body) -> Site
     Site(name, own, pass)
 end site_of
 
+// Whether a value of this type can hold nothing a caller could have lent: no count, no address, no view
+// -- numbers, and the arrays, structs and enums made only of numbers.
+private lends_nothing(t: Type) -> bool
+    var parts: Buf[Type] = buf()
+
+    by_value_parts(t, &parts)
+
+    for item in parts
+        val plain = item match
+            Integer(_, _, _) -> true
+            Floating(_, _) -> true
+            Fixed(_, _, _) -> true
+            Char -> true
+            Bool -> true
+            Unit -> true
+            Never -> true
+            Array(_, _) -> true
+            Vector(_, _) -> true
+            Struct(d) -> d.base != TaskBase
+            Results(_) -> true
+            Enum(_) -> true
+            _ -> false
+
+        if !plain then return false
+
+    true
+end lends_nothing
+
 // The functions that release nothing at all, whether or not they come back, together with the
 // foreign functions a path ending the program may call: the names a call on such a path may reach.
 //
@@ -294,7 +322,7 @@ end site_of
 // computed again with no foreign function in it. The program's entry is left out: C calls it once,
 // before anything this asks about runs. An `@abandons` function is never in it, either side of the
 // boundary: its caller's frame is given back before the call, and the program goes on afterwards.
-// What needs no trust at all is a call that never returns and is handed only numbers
+// What needs no trust at all is a call that never returns and is handed only plain values
 // (`sealed_callees`), which is in the set either way.
 //
 // **Trust is a fact about a whole program, so only a program has it.** A library artifact (a
@@ -328,16 +356,21 @@ private quiet_callees(p: TProgram, s: CallSummary) -> Quiet
 end quiet_callees
 
 // The functions a path ending the program may call whatever they do, foreign or not: those that never
-// return and are handed nothing but numbers.
+// return and are handed nothing a caller could have lent (`lends_nothing`): numbers, and the arrays,
+// structs and enums made only of numbers.
 //
 // **What the rest of this guards against is a release under a reader.** A call on a dying path may
 // reach code that gives back the count a borrowed argument rests on -- a foreign function by calling
 // back into the program, a sysl one directly -- and that matters to whatever reads the argument
-// afterwards: the callee itself, through what it was handed, or the body it returns to. One answering
-// `never` returns to nothing, so no frame below it runs again, and one whose parameters are all
-// numbers, booleans and characters was handed nothing a release could pull out from under it. Its own
-// reads are its own body's business, judged where that body is. So nothing that can observe a release
-// it causes ever runs again.
+// afterwards: the callee itself, through what it was handed, or the body it returns to. A lent value
+// -- a parameter read through its caller's count, a place handed over with no snapshot -- lives only in
+// the frames of the call chain it was lent down. One answering `never` returns to nothing, so none of
+// them runs again, and one handed only plain values makes no frame that holds one either. Whatever runs
+// from there -- the report of a failed bounds check, an exported function C calls back, a destructor
+// that frees the very object the caller lent -- reads storage through counts that storage holds, and
+// the lent copies are never looked at again. Its own reads are its own body's business, judged where
+// that body is. That is the difference from `die(t)` above: `die` is handed `t`, and reads it after the
+// write that frees it.
 //
 // **This is what keeps a `Buf` read free of a snapshot in a program that hands C a callback**: the
 // standard library's `index_past` -- the report behind every `at`, `set` and `b[i]` -- takes two
@@ -345,20 +378,29 @@ end quiet_callees
 // typed signature does not carry. Without it, a program whose callbacks release anything distrusts
 // `sysl_bounds_fail` under `index_past`, and every element read through a pointer takes and gives
 // back a count on the buffer and another on its storage. An `@abandons` function returns into an
-// earlier frame, so it is never one of these.
+// earlier frame, so it is never one of these. Being in the set makes such a callee trusted wherever
+// `quiet_callees` is asked -- an exit site in `inert_callees`, and a path ending the program in
+// `untouched_by` -- so neither needs a rule of its own.
 sealed_callees(p: TProgram) -> Set[string]
     var out: Set[string] = set()
 
     for item in p.externs
-        if !item.abandons && !item.variadic && is_never(item.ret_ty) && all_numbers(item.params) then
+        if !item.abandons && !item.variadic && is_never(item.ret_ty) && lend_nothing(item.params) then
             out.add(item.name)
 
     for f in p.funcs
-        if !f.marks.abandons && is_never(f.ret_ty) && all_numbers(param_types(f.params)) then
+        if !f.marks.abandons && is_never(f.ret_ty) && lend_nothing(param_types(f.params)) then
             out.add(f.name)
 
     out
 end sealed_callees
+
+private lend_nothing(ts: Buf[Type]) -> bool
+    for t in ts
+        if !lends_nothing(t) then return false
+
+    true
+end lend_nothing
 
 private param_types(ps: Buf[(string, Type)]) -> Buf[Type]
     var out: Buf[Type] = buf()
@@ -372,21 +414,6 @@ end param_types
 private is_never(t: Type) -> bool = underlying(t) match
     Never -> true
     _ -> false
-
-private all_numbers(ts: Buf[Type]) -> bool
-    for t in ts
-        val plain = underlying(t) match
-            Integer(_, _, _) -> true
-            Floating(_, _) -> true
-            Fixed(_, _, _) -> true
-            Bool -> true
-            Char -> true
-            _ -> false
-
-        if !plain then return false
-
-    true
-end all_numbers
 
 // What `quiet_callees` answers: the functions alive, the parameters each writes through (`through_key`),
 // the index of each name in `p.funcs`, the foreign functions trusted (`also`), and `names` -- the
@@ -744,6 +771,11 @@ inert_leaf(x: TExpr) -> bool = *x.kind match
     TGlobal(_, _, _) -> true
     TFuncAddr(_, _, _) -> true
 
+    // What a postcondition reads: the value about to be returned, and an entry snapshot in a slot of
+    // the body's own.
+    TResult(_) -> true
+    TOld(_, _) -> true
+
     TCast(_, _) -> true
     TFloorCast(_, _) -> true
     TDeref(_, _) -> true
@@ -830,23 +862,124 @@ inert_leaf(x: TExpr) -> bool = *x.kind match
 // not itself cleared (a foreign function, a closure, a trait object), a node not on the `inert_leaf`
 // list, a contract, and a write that gives back a count -- plus making a value that holds a type with
 // a destructor, whose `drop` could run any code at all when the value is let go.
+//
+// **A write that gives back a count is judged by what letting go of the old value could free**
+// (`gives_back_clear`), not refused outright: growing a `Buf[Value]` lets go of the old `[]Value`
+// storage, which frees an array of `Value`s and nothing a `Machine` holding that buffer is part of.
 struct Untouched
     names: Buf[string]
     calls: Buf[Buf[string]]
     roots: Buf[Buf[Type]]
+    gives: Buf[Buf[Type]]
     open: Buf[bool]
-    laundered: Buf[Type]
+    laundered: Casts
+    dropping: Buf[Type]
     answers: Map[string, Set[string]]
 end Untouched
 
 // An empty summary, for an emitter that has not read a program yet.
-untouched_none() -> Untouched = Untouched(buf(), buf(), buf(), buf(), buf(), map())
+untouched_none() -> Untouched =
+    Untouched(buf(), buf(), buf(), buf(), buf(), Casts(buf(), buf(), buf()), buf(), map())
+
+// Whether a body that gives back the count of a value of type `given` -- the old value of a place it
+// overwrites -- leaves every value of type `t` it does not write where it was: nothing it lets go of
+// can run code nobody can see (a destructor, a task's frame, an object behind a trait), and no object
+// it may free holds a `t` by value, is of a type a `t` points at, or is one a pointer was cast to. A
+// count given back on an object that stays alive frees nothing, so what matters is only what COULD be
+// freed: the referent of every reference and the storage of every view in the old value, and all
+// those reach in turn.
+//
+// **What a `t` points at is the other half**, because the place a lent value was read from is not
+// the only thing holding its referents: `(n.kids.a, n.kids.b)` is a tuple built on the spot whose
+// `Node`s are held by `n.kids`, and a callee overwriting `n.kids` frees them under it while writing
+// nothing a tuple is part of. What a `t`'s referents themselves hold is reached through them at its
+// current value, so only the objects a `t` points at directly are asked about.
+private gives_back_clear(given: Type, t: Type, dropping: Buf[Type], laundered: Casts) -> bool
+    var seen: Buf[Type] = buf()
+    var parts: Buf[Type] = buf()
+
+    by_value_parts(t, &parts)
+
+    var direct: Buf[Type] = buf()
+
+    for item in parts
+        item match
+            Ref(inner, _) -> direct.push(underlying(*inner))
+            Weak(inner) -> direct.push(underlying(*inner))
+            Slice(elem, _) -> direct.push(underlying(*elem))
+            Str -> direct.push(byte_type())
+            _ -> ()
+
+    frees_clear(given, Freed(underlying(t), parts, direct, dropping, laundered), &seen)
+end gives_back_clear
+
+// What `frees_clear` asks of every object it may free: whether it holds a `t` by value, is of a type a
+// `t` points at (`direct`), or could be storage a cast pointer reaches one through, and which types
+// have a destructor.
+private struct Freed
+    t: Type
+    parts: Buf[Type]
+    direct: Buf[Type]
+    dropping: Buf[Type]
+    laundered: Casts
+
+// The counts a value of type `w` holds, each followed to what it could free.
+private frees_clear(w: Type, q: Freed, seen: *Buf[Type]) -> bool
+    var parts: Buf[Type] = buf()
+
+    by_value_parts(w, &parts)
+
+    for item in parts
+        if has_type(q.dropping, item) then return false
+
+        val clear = item match
+            Ref(inner, _) -> freed_clear(*inner, q, seen)
+            Slice(elem, _) -> freed_clear(*elem, q, seen)
+            // A string's bytes, and a weak reference's allocation once the object is gone, are
+            // freed with nothing in them to follow.
+            Str -> !has_type(q.direct, byte_type())
+            Weak(inner) -> !has_type(q.direct, underlying(*inner))
+            Struct(d) -> d.base != TaskBase
+            Trait(_, _, _) -> false
+            Abstract(_, _) -> false
+            Unknown -> false
+            _ -> true
+
+        if !clear then return false
+
+    true
+end frees_clear
+
+// An object of type `x` that may be freed -- a referent, or the elements of a view's storage.
+private freed_clear(x: Type, q: Freed, seen: *Buf[Type]) -> bool
+    val u = underlying(x)
+
+    if has_type(*seen, u) then return true
+
+    seen.push(u)
+
+    val known = u match
+        Trait(_, _, _) -> false
+        Abstract(_, _) -> false
+        Unknown -> false
+        _ -> true
+
+    if !known || has_type(q.direct, u) || cast_reaches(q.laundered, u, q.t, q.parts) then return false
+
+    var inside: Buf[Type] = buf()
+
+    by_value_parts(u, &inside)
+
+    if has_type(inside, q.t) then return false
+
+    frees_clear(u, q, seen)
+end freed_clear
 
 // Every body of `p` summarised for `untouched_by`. `dropping` is the program's types with a destructor,
 // and `owning` the functions that give back a count they were handed (`inert_callees`).
 untouched_summary(p: TProgram, dropping: Buf[Type], owning: Set[string] = set()) -> Untouched
     var u = untouched_none()
-    val laundered = type_sink()
+    val laundered = cast_sink()
     val quiet = quiet_callees(p, call_summary(p, owning))
 
     for i in 0..<p.funcs.len()
@@ -854,15 +987,30 @@ untouched_summary(p: TProgram, dropping: Buf[Type], owning: Set[string] = set())
         val calls: &CallSink = CallSink(buf())
         val exits: &CallSink = CallSink(buf())
         val roots = type_sink()
-        val v: &Verdict = Verdict(f.requires.is_empty() && f.ensures.is_empty() && f.olds.is_empty() &&
-                                  f.variant.is_none())
+        val v: &Verdict = Verdict(true)
         val locals = own_locals(f)
         val ending = exit_kinds(f.body)
+        val gives = type_sink()
+        val walk = TWalk(true, x -> touch_node(v, calls, exits, ending, roots, gives, laundered, dropping,
+                                               locals, x),
+                         w -> touch_write(v, calls, roots, gives, locals, w),
+                         s -> if !touch_stmt(s) then v.refuse())
 
-        walk_block_stmts(f.body, TWalk(true, x -> touch_node(v, calls, exits, ending, roots, laundered,
-                                                             dropping, locals, x),
-                                       w -> touch_write(v, calls, roots, locals, w),
-                                       s -> if !touch_stmt(s) then v.refuse()))
+        walk_block_stmts(f.body, walk)
+
+        // **A contract clause is code that runs around the body, so it is judged as the body is**: its
+        // reads are reads, a call in it is a call this function makes, and a failed clause is a trap.
+        // An `old(e)` is a snapshot in a slot of the body's own, given back at the return.
+        for item in f.requires
+            walk_texpr(item.cond, walk)
+
+        for item in f.ensures
+            walk_texpr(item.cond, walk)
+
+        for item in f.olds
+            walk_texpr(item, walk)
+
+        if f.variant.is_some() then walk_texpr(f.variant.unwrap(), walk)
 
         // A call on a path that ends the program is held to `quiet_callees`, as in `inert_callees`.
         for item in exits.names
@@ -871,9 +1019,11 @@ untouched_summary(p: TProgram, dropping: Buf[Type], owning: Set[string] = set())
         u.names.push(f.name)
         u.calls.push(calls.names)
         u.roots.push(roots.types)
+        u.gives.push(gives.types)
         u.open.push(!v.ok || owning.has(f.name))
 
-    u.laundered = laundered.types
+    u.laundered = laundered.c
+    u.dropping = dropping
     u
 end untouched_summary
 
@@ -892,11 +1042,26 @@ untouched_by(u: *Untouched, t: Type) -> Set[string]
     var alive: Buf[bool] = buf()
     var out: Set[string] = set()
 
+    // The same few root and given types recur across thousands of bodies, so each is judged once.
+    var root_hits: Map[string, bool] = map()
+    var given_clear: Map[string, bool] = map()
+
     for i in 0..<u.names.len()
         var ok = !u.open.at(i)
 
         for root in u.roots.at(i)
-            if ok && overlaps(root, t, parts, u.laundered) then ok = false
+            if ok
+                val k = mangle(root)
+
+                if !root_hits.has(k) then root_hits.put(k, overlaps(root, t, parts, u.laundered))
+                if root_hits.get(k).unwrap() then ok = false
+
+        for given in u.gives.at(i)
+            if ok
+                val k = mangle(given)
+
+                if !given_clear.has(k) then given_clear.put(k, gives_back_clear(given, t, u.dropping, u.laundered))
+                if !given_clear.get(k).unwrap() then ok = false
 
         alive.push(ok)
 
@@ -919,17 +1084,35 @@ untouched_by(u: *Untouched, t: Type) -> Set[string]
 end untouched_by
 
 // Whether an object of type `root` can share storage with a value of type `t`, whose by-value parts
-// are `parts`: one holds the other, or `root` is a type a pointer was made to by a cast.
-private overlaps(root: Type, t: Type, parts: Buf[Type], laundered: Buf[Type]) -> bool
+// are `parts`: one holds the other, or `root` is a type a pointer was made to by a cast -- from
+// anything, or from the address of a named object that can (`cast_reaches`).
+private overlaps(root: Type, t: Type, parts: Buf[Type], laundered: Casts) -> bool
     val r = underlying(root)
 
-    if has_type(parts, r) || has_type(laundered, r) then return true
+    held_with(r, t, parts) || cast_reaches(laundered, r, t, parts)
+end overlaps
+
+// Whether one of an object of type `r` and a value of type `t` holds the other by value.
+private held_with(r: Type, t: Type, parts: Buf[Type]) -> bool
+    if has_type(parts, r) then return true
 
     var inside: Buf[Type] = buf()
 
     by_value_parts(r, &inside)
     has_type(inside, underlying(t))
-end overlaps
+end held_with
+
+// Whether a pointer to `r` made by a cast may reach storage holding a `t`: always where it was made
+// from something that is not the address of a named object, and otherwise where one of the objects it
+// was made from holds one.
+private cast_reaches(c: Casts, r: Type, t: Type, parts: Buf[Type]) -> bool
+    if has_type(c.anywhere, r) then return true
+
+    for i in 0..<c.into.len()
+        if c.into.at(i) == r && held_with(c.from.at(i), t, parts) then return true
+
+    false
+end cast_reaches
 
 // Every type a value of `t` holds by value, itself included: its fields, elements and payloads, all the
 // way down, but not what a pointer, a reference or a view inside it reaches.
@@ -982,19 +1165,21 @@ private touch_stmt(s: TStmt) -> bool = s match
     _ -> inert_stmt(s)
 
 private touch_node(v: &Verdict, calls: &CallSink, exits: &CallSink, ending: &KindSink,
-                   roots: &TypeSink, laundered: &TypeSink, dropping: Buf[Type], locals: Set[string],
-                   x: TExpr)
+                   roots: &TypeSink, gives: &TypeSink, laundered: &CastSink, dropping: Buf[Type],
+                   locals: Set[string], x: TExpr)
     note_laundered(laundered, x)
 
     if makes_dropping(x, dropping) then v.refuse()
 
     *x.kind match
+        // A call on a path that ends the program is `quiet_callees`' question, which a call that never
+        // returns and is handed nothing a caller could have lent passes whatever it does (`sealed_callees`).
         TCall(name, _, _, _) -> if ending.has(x.kind) then exits.add(name) else calls.add(name)
 
-        TStore(place, _, _, _) -> touch_place(v, roots, locals, place)
-        TIncDec(place, _, _, _, _) -> touch_place(v, roots, locals, place)
+        TStore(place, _, _, _) -> touch_place(v, roots, gives, locals, place)
+        TIncDec(place, _, _, _, _) -> touch_place(v, roots, gives, locals, place)
         TUpdate(place, _, _, _, dispatch, _, _) ->
-            touch_place(v, roots, locals, place)
+            touch_place(v, roots, gives, locals, place)
 
             if dispatch.is_some() then calls.add(dispatch.unwrap().name)
 
@@ -1002,22 +1187,60 @@ private touch_node(v: &Verdict, calls: &CallSink, exits: &CallSink, ending: &Kin
             for cmp in cmps
                 if cmp.dispatch.is_some() then calls.add(cmp.dispatch.unwrap().name)
 
+        TSlots(op, _, elem, _) -> touch_slots(v, roots, gives, op, elem)
+
+        // A struct's invariant, checked after a write to it or where a value of it is made, is a call
+        // of its `$inv` function on the fields; the write and the value are nodes of their own.
+        TRecheck(_, _, _, inv_fn) -> calls.add(inv_fn)
+        TStructInvCheck(_, _, inv_fn) -> calls.add(inv_fn)
+
+        // Boxing a value makes a new object holding shares of what went into it, and gives back
+        // nothing; one whose type has a destructor is `makes_dropping`'s, above. A box behind a trait
+        // or a type parameter hides its type, and with it any destructor.
+        TBox(_, rty) -> underlying(rty) match
+            Ref(inner, _) -> underlying(*inner) match
+                Trait(_, _, _) -> v.refuse()
+                Abstract(_, _) -> v.refuse()
+                Unknown -> v.refuse()
+                _ -> ()
+            _ -> v.refuse()
+
         _ -> if !inert_leaf(x) then v.refuse()
 end touch_node
 
-private touch_write(v: &Verdict, calls: &CallSink, roots: &TypeSink, locals: Set[string], w: TWrite)
-    touch_place(v, roots, locals, w.place)
+// The slot forms (`slots.sysl`), which are how a growable container writes its storage: `slot_storage`
+// makes new storage and writes nothing; every other one writes a slot of storage of the element type,
+// which is that write's object. `slot_place` over a live slot is an assignment, `slot_vacate` lets go
+// of slots, and the value `slot_take` moves out is let go of where the body is done with it -- each a
+// count of the element given back. `slot_put` fills an empty slot and gives back nothing.
+private touch_slots(v: &Verdict, roots: &TypeSink, gives: &TypeSink, op: string, elem: Type)
+    if op == "slot_storage" then return
+
+    if op != "slot_place" && op != "slot_vacate" && op != "slot_take" && op != "slot_put"
+        v.refuse()
+        return
+
+    roots.add(underlying(elem))
+
+    if op != "slot_put" && contains_counted(elem) then gives.add(underlying(elem))
+end touch_slots
+
+private touch_write(v: &Verdict, calls: &CallSink, roots: &TypeSink, gives: &TypeSink, locals: Set[string],
+                    w: TWrite)
+    touch_place(v, roots, gives, locals, w.place)
 
     if w.dispatch.is_some() then calls.add(w.dispatch.unwrap().name)
 end touch_write
 
 // One write: nothing to note where it lands in a local of the body's own; otherwise the object it
-// lands in, and a refusal where the place holds a count the write would give back or where the object
-// cannot be named.
-private touch_place(v: &Verdict, roots: &TypeSink, locals: Set[string], place: TExpr)
+// lands in, the type of the old value where the place holds a count the write gives back (judged per
+// asked type by `gives_back_clear`), and a refusal where the object cannot be named.
+private touch_place(v: &Verdict, roots: &TypeSink, gives: &TypeSink, locals: Set[string], place: TExpr)
     if own_place(place, locals) then return
 
-    if contains_counted(place_type(place)) then v.refuse()
+    val pty = place_type(place)
+
+    if contains_counted(pty) then gives.add(underlying(pty))
 
     write_root(place) match
         Some(t) -> roots.add(t)
@@ -1039,22 +1262,72 @@ private write_root(place: TExpr) -> Option[Type] = *place.kind match
 
 // The types a pointer was made to by something other than taking an address: a cast from another
 // pointer or from an integer, a view read at another element type, and the bytes of any value.
-private note_laundered(out: &TypeSink, x: TExpr) = *x.kind match
+//
+// **A cast of the address of a named object is not a pointer that can point anywhere**: it points into
+// that object, so a write through it lands in storage of the object's type, and that is what it is
+// recorded as (`cast_into`) -- `Buf.reading`'s `ptr_cast(&NoCore[0])` makes a `*BufCore[T]` that can
+// only ever reach a `[4]usize`, which holds no buffer of anybody's.
+private note_laundered(out: &CastSink, x: TExpr) = *x.kind match
     TCast(operand, ty) -> repr(ty) match
         Ptr(inner) ->
             val from = pointee(texpr_type(operand))
 
             if from.is_none() || underlying(from.unwrap()) != underlying(*inner) then
-                out.add(underlying(*inner))
+                named_object(operand) match
+                    Some(obj) -> out.add(underlying(*inner), underlying(obj))
+                    None -> out.anywhere(underlying(*inner))
         _ -> ()
     TViewAs(arg, ty) ->
         val a = view_elem(texpr_type(arg))
         val b = view_elem(ty)
 
-        if a.is_some() then out.add(underlying(a.unwrap()))
-        if b.is_some() then out.add(underlying(b.unwrap()))
-    TBytes(_) -> out.add(byte_type())
+        if a.is_some() then out.anywhere(underlying(a.unwrap()))
+        if b.is_some() then out.anywhere(underlying(b.unwrap()))
+    TBytes(_) -> out.anywhere(byte_type())
     _ -> ()
+
+// The type of the object an address names where it is the address of a local or a global, or of a
+// field or array element of one held by value: an object nothing but this name reaches through.
+private named_object(x: TExpr) -> Option[Type] = *x.kind match
+    TAddrOf(place, _) -> direct_root(place)
+    _ -> None
+
+private direct_root(place: TExpr) -> Option[Type] = *place.kind match
+    TLoad(_, ty) -> Some(ty)
+    TGlobal(_, declared, _) -> Some(declared)
+    TField(r, _, _) -> underlying(texpr_type(r)) match
+        Struct(_) -> direct_root(r)
+        _ -> None
+    TIndex(r, _, _) -> repr(texpr_type(r)) match
+        Array(_, _) -> direct_root(r)
+        _ -> None
+    _ -> None
+
+// The types pointers were made to by something other than taking an address: `anywhere` where the
+// pointer could reach any storage at all, and `into`/`from` pairs where it was made from the address
+// of a named object of the `from` type.
+struct Casts
+    anywhere: Buf[Type]
+    into: Buf[Type]
+    from: Buf[Type]
+end Casts
+
+// The same, gathered through the box a walk captured.
+private struct CastSink
+    c: Casts
+
+    anywhere(*self, t: Type)
+        if !has_type(self.c.anywhere, t) then self.c.anywhere.push(t)
+
+    add(*self, t: Type, obj: Type)
+        for i in 0..<self.c.into.len()
+            if self.c.into.at(i) == t && self.c.from.at(i) == obj then return
+
+        self.c.into.push(t)
+        self.c.from.push(obj)
+end CastSink
+
+private cast_sink() -> &CastSink = CastSink(Casts(buf(), buf(), buf()))
 
 // Whether this node makes a value that holds a type with a destructor -- one the body will let go,
 // so the destructor may run before it returns. Reading a value that is already somewhere makes
