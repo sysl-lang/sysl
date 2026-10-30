@@ -750,33 +750,17 @@ private float_to_fixed(e: *Emit, from: Type, bits: int, frac: int, signed: bool,
     val work = if single then Floating(32, false) else real_type()
     val fty = lty(e, work)
     val wide = if type_eq(from, work) then v else convert(e, from, work, v)
-    val y = fresh_reg(e)
+    val y = fx_scaled(e, fty, wide, frac)
 
-    emit(e, InBin(y, OpFMul, fty, wide, pow2_double(frac)))
-
+    // Two bits wider than the format, read saturating and converted back as `convert` does both, which
+    // past 128 bits is no single instruction (`emit_wide_float.sysl`).
     val k = bits + 2
-    val kt = LInt(k)
-    val sat = llvm_fptosi_sat_entry().at([kt, fty])
-
-    var params: Buf[IrParam] = buf()
-
-    params.push(ir_param(fty))
-    request_intrinsic(e, ir_sig(sat, ir_fn_type(kt, params)))
-
-    var ops: Buf[IrArg] = buf()
-
-    ops.push(ir_arg(fty, y))
-
-    val t = fresh_reg(e)
-
-    emit(e, ir_call(Some(t), kt, VGlobal(sat), ops))
-
+    val kty = Integer(k, true, false)
+    val t = convert(e, work, kty, y)
     val lo = big_sub(min_of(bits, signed), from_int(1))
     val hi = big_add(max_of(bits, signed), from_int(1))
     val tc = fx_clamp(e, k, t, lo, hi)
-    val back = fresh_reg(e)
-
-    emit(e, InCast(back, CastSIToFP, kt, tc, fty))
+    val back = convert(e, kty, work, tc)
 
     val fr = fresh_reg(e)
 
@@ -820,21 +804,45 @@ private fixed_to_float(e: *Emit, bits: int, frac: int, signed: bool, to: Type, v
 
     val target = if fbits >= 32 then to else real_type()
     val ft = lty(e, target)
-    val f = fresh_reg(e)
+    // Past 128 bits the raw integer is no single instruction, and it may be past the float's range
+    // where the value is not -- a `u200q190`'s raw `1.5` is `1.5 · 2^190` -- so the scale goes into the
+    // conversion (`emit_wide_float.sysl`).
+    var r = VNothing
 
-    emit(e, InCast(f, if signed then CastSIToFP else CastUIToFP, LInt(bits), v, ft))
-
-    val r = fresh_reg(e)
-
-    // A power of two is exact at every width, binary128 included, which writes its constants as itself.
-    val scale = if fbits == 128 then quad_val(pow2_double(-frac)) else pow2_double(-frac)
-
-    emit(e, InBin(r, OpFMul, ft, f, scale))
+    if bits > 128
+        r = wide_int_to_float(e, bits, signed, v, target, -frac)
+    else
+        r = fx_scaled(e, ft, convert(e, Integer(bits, signed, false), target, v), -frac)
 
     if fbits >= 32 then return r
 
     convert(e, real_type(), to, r)
 end fixed_to_float
+
+// `v · 2^k` at the float type `ft`. A power of two is exact at every width, binary128 included, which
+// writes its constants as itself; one past the type's normal range -- `2^-190` at `f32`, which a format
+// as wide as `u200q190` scales by -- is not a constant of the type at all, so it is applied in steps
+// that each are.
+private fx_scaled(e: *Emit, ft: LType, v: Val, k: int) -> Val
+    val (step, quad) = ft match
+        LFloat(32, _) -> (126, false)
+        LFloat(128, _) -> (1022, true)
+        _ -> (1022, false)
+    var left = k
+    var r = v
+
+    loop
+        val part = if left > step then step else if left < -step then -step else left
+        val next = fresh_reg(e)
+        val scale = if quad then quad_val(pow2_double(part)) else pow2_double(part)
+
+        emit(e, InBin(next, OpFMul, ft, r, scale))
+        r = next
+        left -= part
+
+        if left == 0 then return r
+    end loop
+end fx_scaled
 
 // -- rendering -----------------------------------------------------------------------------------
 

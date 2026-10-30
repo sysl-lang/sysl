@@ -327,6 +327,25 @@ print(wide)
 1606938044258990275541962092341162602522202993782792835301376
 ```
 
+A conversion between a wide integer and a float is inline as well, by the rules every width follows:
+an integer becomes the float nearest it, ties to even, rounded once, and one past the float's range is
+an infinity; a float becomes an integer truncated toward zero, saturating at the width's ends, with a
+NaN as `0` ([conversions are calls](/reference/expressions/#conversions-are-calls)).
+
+```sysl
+var big: i256 = 9007199254740993
+var wide = u1000(1) << 999
+var x = 1.0e30
+
+print(real(big), real(big + 2), real(-big), f32(wide))
+print(i256(x), u256(-x), i200(real.nan), i200(real.infinity) == i200::Max)
+```
+
+```output
+9007199254740992 9007199254740996 -9007199254740992 inf
+1000000000000000019884624838656 0 0 true
+```
+
 Extreme widths have two costs, neither of which is diagnosed: the digit buffer is stack space
 proportional to the width, so printing a value near the maximum width overflows the stack frame, and
 sizing the buffer evaluates 2^N at compile time. Only a program that names such a width is
