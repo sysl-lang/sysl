@@ -2,6 +2,7 @@ module sh.sysl.compiler
 
 import sh.sysl.parsing.Span
 import sysl.buf.{Buf, buf}
+import sysl.container.Set
 import sysl.math.bigint.{BigInt, from_int, mul, pow, sub}
 
 // **Where a value lives**, and the walks that reach it.
@@ -862,15 +863,19 @@ private same_node(a: TExpr, b: TExpr) -> bool = a.span == b.span && texpr_kind_n
 // first.
 gen_slice(e: *Emit, base: TExpr, lo: Option[TExpr], hi: Option[TExpr], inclusive: bool,
           slice_ty: Type, site: Span) -> Val
-    gen_slice_of(e, slice_base(e, base), lo, hi, inclusive, slice_ty, site)
+    gen_slice_of(e, slice_base(e, base), lo, hi, inclusive, slice_ty, site, true)
 end gen_slice
 
 // A slice of a view already made: what keeps its elements alive, where the first is, and how many.
 // A temporary promoted for a part of it is this -- the whole array moved into a buffer, and the
 // part narrowed over that buffer.
 gen_slice_of_view(e: *Emit, whole: Val, lo: Option[TExpr], hi: Option[TExpr], inclusive: bool,
-                  slice_ty: Type, site: Span) -> Val
-    val wty = lty(e, slice_ty)
+                  slice_ty: Type, site: Span) -> Val =
+    gen_slice_of(e, view_parts(e, whole, slice_ty), lo, hi, inclusive, slice_ty, site, true)
+
+// A view taken apart: what keeps its elements alive, where the first is, and how many.
+private view_parts(e: *Emit, whole: Val, ty: Type) -> (Val, Val, Option[Val])
+    val wty = lty(e, ty)
     val o = fresh_reg(e)
 
     emit(e, InExtract(o, wty, whole, index_list(0)))
@@ -882,11 +887,62 @@ gen_slice_of_view(e: *Emit, whole: Val, lo: Option[TExpr], hi: Option[TExpr], in
     val l = fresh_reg(e)
 
     emit(e, InExtract(l, wty, whole, index_list(2)))
-    gen_slice_of(e, (o, p, Some(l)), lo, hi, inclusive, slice_ty, site)
-end gen_slice_of_view
+    (o, p, Some(l))
+end view_parts
+
+// **A view of part of a place, LENT to a call** (`lent_view`): narrowed exactly as `gen_slice` narrows
+// it, with no count of its own and nothing for the statement to give back. What keeps the elements
+// alive is already held for the length of the call, which is all the callee's borrowed parameter asks.
+// A base that is itself such a view is lent the same way, so `a[i..<j][k..<l]` takes no count either.
+gen_lent_view(e: *Emit, x: TExpr, callee: string, written: Set[string]) -> Val = *x.kind match
+    TSlice(base, lo, hi, inclusive, slice_ty) ->
+        val parts = if lent_view(e, base, callee, written) then
+            view_parts(e, gen_lent_view(e, base, callee, written), texpr_type(base))
+        else
+            slice_base(e, base)
+
+        gen_slice_of(e, parts, lo, hi, inclusive, slice_ty, x.span, false)
+    TConstView(arg) -> gen_lent_view(e, arg, callee, written)
+    _ -> gen_expr(e, x)
+
+// Whether a view of part of a place may cross to `callee` with no count of its own: what keeps its
+// elements alive stands for the whole of the call. That is a base the frame already holds a count for
+// (`held_unless`), or one of a type `callee` can neither write nor give back (`lends_in_place`) -- the
+// two rules a whole view handed over as it stands is judged by -- or a frame array, whose owner is the
+// frame's own (or nothing), or a view lent the same way. An array inside a box stands where the
+// reference to the box does. A part of a promoted temporary is the buffer it moved into, which only the
+// view itself holds, so it keeps its count. A read-only view of a writable one (`TConstView`, what
+// handing `[]T` to a `[]const T` parameter makes) is the same value, and is seen through.
+lent_view(e: *Emit, x: TExpr, callee: string, written: Set[string]) -> bool = *x.kind match
+    TSlice(base, _, _, _, _) -> !is_promoted_temp(e, x.span) && view_base_stands(e, base, callee, written)
+    TConstView(arg) -> lent_view(e, arg, callee, written)
+    _ -> false
+
+private view_base_stands(e: *Emit, base: TExpr, callee: string, written: Set[string]) -> bool
+    if lent_view(e, base, callee, written) then return true
+
+    nameless(texpr_type(base)) match
+        Slice(_, _) -> stands_for_call(e, base, callee, written)
+        Str -> stands_for_call(e, base, callee, written)
+        Ref(_, _) -> stands_for_call(e, base, callee, written)
+        Ptr(_) -> true
+        Array(_, _) ->
+            val root = spine_root(base)
+
+            if root.is_none() then return true
+
+            *root.unwrap().kind match
+                TDeref(operand, _) ->
+                    !is_counted_ref(texpr_type(operand)) || stands_for_call(e, operand, callee, written)
+                _ -> true
+        _ -> false
+end view_base_stands
+
+private stands_for_call(e: *Emit, x: TExpr, callee: string, written: Set[string]) -> bool =
+    held_unless(e, x, written) || lends_in_place(e, callee, texpr_type(x))
 
 private gen_slice_of(e: *Emit, parts: (Val, Val, Option[Val]), lo: Option[TExpr], hi: Option[TExpr],
-                     inclusive: bool, slice_ty: Type, site: Span) -> Val
+                     inclusive: bool, slice_ty: Type, site: Span, counted: bool) -> Val
     val elem = element(slice_ty).unwrap_or(byte_type())
     val owner = parts.0
     val first = parts.1
@@ -981,13 +1037,14 @@ private gen_slice_of(e: *Emit, parts: (Val, Val, Option[Val]), lo: Option[TExpr]
 
     emit(e, InBin(n, OpSub, word_lty(e), end, start))
 
-    var args: Buf[IrArg] = buf()
+    if counted
+        var args: Buf[IrArg] = buf()
 
-    args.push(ir_arg(LPtr, owner))
-    emit(e, ir_call(None, LVoid, VGlobal("arc.retain_maybe"), args))
+        args.push(ir_arg(LPtr, owner))
+        emit(e, ir_call(None, LVoid, VGlobal("arc.retain_maybe"), args))
 
-    e.maybe_heap = true
-    e.heap = true
+        e.maybe_heap = true
+        e.heap = true
 
     val lt = lty(e, slice_ty)
     val with_owner = fresh_reg(e)
@@ -1001,7 +1058,8 @@ private gen_slice_of(e: *Emit, parts: (Val, Val, Option[Val]), lo: Option[TExpr]
     val whole = fresh_reg(e)
 
     emit(e, InInsert(whole, lt, with_ptr, word_lty(e), n, index_list(2)))
-    own_temp(e, whole, slice_ty)
+
+    if counted then own_temp(e, whole, slice_ty) else whole
 end gen_slice_of
 
 // What a slice's base gives up: what keeps the elements alive, where the first of them is, and how
