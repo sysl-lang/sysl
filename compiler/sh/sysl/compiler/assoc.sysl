@@ -562,6 +562,33 @@ callable_of(a: &Analysis, t: Type) -> Option[Bound]
         _ -> None
 end callable_of
 
+// **The parameters a type asking for a callable lets it keep** -- the ones its `Fn(…)`, its bare
+// arrow or its bound marks `@keeps` -- in the shapes `callable_of` reads. A closure made at that type
+// is licensed to keep them (`keeps.sysl`'s `refuse_promised`).
+callable_marks(a: &Analysis, t: Type) -> Buf[usize]
+    var out: Buf[usize] = buf()
+    var assocs: Buf[(string, Type)] = buf()
+    var arity: usize = 0
+
+    receiver_type(t) match
+        Abstract(_, bounds) ->
+            for item in bounds
+                if fn_parts(item.name, item.args).is_some()
+                    assocs = item.assocs
+                    arity = item.args.len() - 1
+                    break
+        Trait(n, args, written) ->
+            if fn_parts(n, args).is_some()
+                assocs = written
+                arity = args.len() - 1
+        _ -> ()
+
+    for i in 0..<arity
+        if marks_kept(assocs, i) then out.push(i)
+
+    out
+end callable_marks
+
 private callable_impl_of(a: &Analysis, base: string) -> Option[Bound]
     for n in 0..<(FnMaxArity + 1)
         val key = library_key(fn_base(n))
