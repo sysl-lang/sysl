@@ -41,21 +41,29 @@ import sysl.text.Search
 // **The thunk of a program's entry** (`enters`: the function exported as `main`) first calls the
 // prologue the compiler's own `@main` would otherwise have run (`gen_entry_prologue`), so the export's
 // body starts with the computed storage filled.
+// The parameter types an export's thunk takes, in C's convention.
+//
+// A `va_list` parameter arrives as the one pointer C's convention names for it, and the definition
+// takes it as that same pointer (`emit_func.sysl`'s `receive_walk`), so it is handed on untouched.
+thunk_param_types(f: TFunc) -> Buf[Type]
+    var types: Buf[Type] = buf()
+
+    for item in stored_fields(f.params)
+        types.push(if underlying(item.1) == VaList then Ptr(VaList) else item.1)
+
+    types
+end thunk_param_types
+
+// The C signature of an export's thunk: what the artifact defining it emitted, and what a module
+// naming its address from elsewhere declares.
+export_thunk_type(e: *Emit, f: TFunc) -> IrFnType = foreign_signature(e, f.ret_ty, thunk_param_types(f), false)
+
 gen_export_thunk(e: *Emit, f: TFunc, symbol: string, enters: bool) -> Option[IrFunc]
     start_function(e)
 
     if enters then emit(e, ir_call(None, LVoid, VGlobal(entry_prologue_symbol()), no_ir_args()))
 
-    val stored = stored_fields(f.params)
-
-    var types: Buf[Type] = buf()
-
-    // A `va_list` parameter arrives as the one pointer C's convention names for it, and the
-    // definition takes it as that same pointer (`emit_func.sysl`'s `receive_walk`), so it is handed on
-    // untouched.
-    for item in stored
-        types.push(if underlying(item.1) == VaList then Ptr(VaList) else item.1)
-
+    val types = thunk_param_types(f)
     val c_type = foreign_signature(e, f.ret_ty, types, false)
 
     // The out-pointer is in front of every declared parameter, so the names run one behind wherever
@@ -85,7 +93,7 @@ gen_export_thunk(e: *Emit, f: TFunc, symbol: string, enters: bool) -> Option[IrF
 
     var passed: Buf[IrArg] = buf()
 
-    for i in 0..<stored.len()
+    for i in 0..<types.len()
         passed.push(thunk_argument(e, types.at(i), incoming.at(i)))
 
     gen_thunk_call(e, f, symbol, passed, sret)
