@@ -1,0 +1,554 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.text.{cstring, str_builder}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// A view of an array that is an ELEMENT of a view or of a `Buf` -- `rows[i][..]` where `rows: [][4]T`,
+// `b[i][..]` where `b: Buf[[4]T]` -- lives in the storage of that view or buffer, and is kept alive by
+// what keeps that storage alive (`emit_place.sysl`'s `address_owned`). It used to own nothing: a view
+// kept past a growth or a drop of the buffer pointed into storage already given back.
+//
+// The routes a view escapes by, and how each is answered:
+// - kept in a local, or in a local struct, across a growth or a drop of the buffer: counted (the cells
+//   below, every one a use-after-free before);
+// - returned, stored in a module var, captured by a heap closure, pushed into a `Buf`: refused by the
+//   analyzer, pinned here with their diagnostics;
+// - lent to a borrowing callee: no count where the storage stands for the call -- a view parameter
+//   that holds its own count, or a buffer of a type the callee cannot reach -- and a count where the
+//   callee can grow or drop the buffer.
+//
+// The shapes: an element of a view, a field of a struct element, a row of a 2-D element, through a
+// view, through a `Buf` subscript (checked and `@unchecked`), and a `Buf` a call made. Every runnable
+// cell is run at -O0 and -O2 on the counted heap and once under AddressSanitizer.
+//
+// Cells not written: a `*[N]T` element -- a view of a `*T` region owns nothing by design (`*T` is the
+// unsafe form); an element of a `&Struct` held in a `Buf` -- the box is the owner and was already counted
+// (`vel_boxed_element_was_already_counted` pins it); `&sync` -- a view may not cross a domain; separate
+// compilation -- only the caller's lowering changed, and the library's view of its parameter is the
+// same borrowed convention; bare metal -- no new runtime call, only the existing `arc.retain_maybe`.
+
+private extern "setenv" vel_c_setenv(name: *u8, value: *u8, overwrite: int) -> int
+private extern "unsetenv" vel_c_unsetenv(name: *u8) -> int
+
+private struct VelRun
+    ok: bool
+    out: string
+    err: string
+    hooks: usize
+
+private vel_ready() -> bool
+    if std_root().is_err() || !clang_available()
+        print("skipped: the library or the toolchain is not on this machine")
+        return false
+    end if
+
+    true
+end vel_ready
+
+private vel_ir(text: string) -> string
+    val root = make_temp_dir("sysl-vel").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    val out = emit_llvm_text(src, None) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> if made.report.is_empty() then made.text else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end vel_ir
+
+// One function's emitted text, from its `define` to the brace that closes it.
+private vel_body(out: string, name: string) -> string
+    var b = str_builder()
+    var inside = false
+
+    for line in lines_of(out)
+        if !inside && line.starts_with("define ") && line.contains("@" + name + "$") then inside = true
+
+        if inside
+            if line == "}" then return b.finish()
+
+            b.push(line)
+            b.push_char('\n')
+
+    if inside then b.finish() else s"no definition of '$name' in:\n$out"
+end vel_body
+
+private vel_none(text: string, name: string)
+    if !vel_ready() then return
+
+    val f = vel_body(vel_ir(text), name)
+
+    assert(f.starts_with("define"), f)
+    assert(!f.contains("@arc.retain_maybe(") && !f.contains("@arc.release_maybe("), f)
+end vel_none
+
+private vel_kept(text: string, name: string)
+    if !vel_ready() then return
+
+    val f = vel_body(vel_ir(text), name)
+
+    assert(f.starts_with("define"), f)
+    assert(f.contains("@arc.retain_maybe("), f)
+end vel_kept
+
+private vel_refused(text: string, said: string)
+    if !vel_ready() then return
+
+    val out = vel_ir(text)
+
+    assert(out.contains(said), out)
+end vel_refused
+
+private vel_run(text: string, level: string, counted: bool, flags: string) -> VelRun
+    val root = make_temp_dir("sysl-vel").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    if counted then force_alloc_counting(true)
+
+    if flags != ""
+        val n = cstring("SYSL_EXTRA_CFLAGS")
+        val v = cstring(flags)
+
+        vel_c_setenv(n.ptr, v.ptr, 1)
+    end if
+
+    val built = build_native_program(s"$root/main.sysl", None, None, level, Some(exe))
+
+    if flags != ""
+        val n = cstring("SYSL_EXTRA_CFLAGS")
+
+        vel_c_unsetenv(n.ptr)
+
+    if counted then force_alloc_counting(false)
+
+    built match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return VelRun(false, failure_text(why), "", 0)
+        Ok(_) -> ()
+
+    val hooks = capture("nm", ["-u", exe], "", [], true) match
+        Ok(o) -> o.text.count_of("__asan_report")
+        Err(_) -> 0
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> VelRun(false, "could not be started", "", hooks)
+        Ok(o) -> VelRun(o.status.ok(), o.text, o.err.unwrap_or(""), hooks)
+end vel_run
+
+// Printed exactly `expected` at both ends of the optimizer on the counted heap, giving everything
+// back, and again under AddressSanitizer with the instrumentation in the binary.
+private vel_prints(text: string, expected: string)
+    if !vel_ready() then return
+
+    for level in ["0", "2"]
+        val run = vel_run(text, level, true, "")
+
+        assert(run.ok, s"-O$level: ${run.out}${run.err}")
+        assert_eq(run.out, expected)
+        assert(alloc_count_reported(run.err) == 0, s"-O$level: ${run.err}")
+
+    val asan = vel_run(text, "0", false, "-fsanitize=address -g")
+
+    assert(asan.hooks > 0, "the AddressSanitizer build carries no instrumentation")
+    assert(asan.ok, s"asan: ${asan.out}${asan.err}")
+    assert_eq(asan.out, expected)
+end vel_prints
+
+// -- an element of a view ---------------------------------------------------------------------------
+
+@test("a view of an element of a view, kept across a call that grows and drops the buffer, keeps it")
+vel_view_element_kept_across_a_growing_call()
+    vel_prints(raw"""
+        import sysl.buf.{Buf, buf}
+
+        struct Holder
+            rows: Buf[[4]i32]
+
+        grow(h: &Holder)
+            for k in 0..<100
+                h.rows.push([k, k, k, k])
+            h.rows = buf()
+
+        main()
+            val h = Holder(buf())
+            h.rows.push([1, 2, 3, 4])
+            val v = h.rows.view()[0][..]
+            grow(h)
+            print(v[0] + v[3])
+        """, "5\n")
+
+@test("a view of an element of a view, stored in a struct, outlives the buffer's storage")
+vel_view_element_stored_in_a_struct()
+    vel_prints(raw"""
+        import sysl.buf.{Buf, buf}
+
+        struct Keep
+            v: []i32
+
+        main()
+            var b: Buf[[4]i32] = buf()
+            b.push([1, 2, 3, 4])
+            val k = Keep(b.view()[0][..])
+            for i in 0..<100
+                b.push([i, i, i, i])
+            b = buf()
+            print(k.v[0] + k.v[3])
+        """, "5\n")
+
+@test("a view of an array field of a struct element of a view, and of a row of a 2-D element, keep it")
+vel_view_element_field_and_row()
+    vel_prints(raw"""
+        import sysl.buf.{Buf, buf}
+
+        struct Row
+            tag: i32
+            cells: [4]i32
+
+        main()
+            var b: Buf[Row] = buf()
+            b.push(Row(9, [1, 2, 3, 4]))
+            var g: Buf[[2][4]i32] = buf()
+            g.push([[0, 0, 0, 0], [5, 6, 7, 8]])
+            val v = b.view()[0].cells[..]
+            val w = g.view()[0][1][..]
+            for k in 0..<100
+                b.push(Row(k, [k, k, k, k]))
+                g.push([[k, k, k, k], [k, k, k, k]])
+            b = buf()
+            g = buf()
+            print(v[0] + v[3], w[0] + w[3])
+        """, "5 13\n")
+
+@test("a view of an element of a view, carried out of a loop by break, keeps the storage")
+vel_view_element_out_of_a_loop()
+    vel_prints(raw"""
+        import sysl.buf.{Buf, buf}
+
+        main()
+            var b: Buf[[4]i32] = buf()
+            for k in 0..<4
+                b.push([k, k + 1, k + 2, k + 3])
+            var found: []i32 = []
+            for i in 0..<4
+                val rows = b.view()
+                if rows[i][0] == 2
+                    found = rows[i][1..<3]
+                    break
+            b = buf()
+            print(found[0] + found[1])
+        """, "7\n")
+
+@test("a view of an element of a view, generic over the element type, keeps the storage")
+vel_view_element_generic()
+    vel_prints(raw"""
+        import sysl.buf.{Buf, buf}
+
+        struct Holder[T]
+            rows: Buf[[2]T]
+
+        read_after_drop[T](h: &Holder[T]) -> T
+            val v = h.rows.view()[0][..]
+            h.rows = buf()
+            v[1]
+
+        main()
+            val a: &Holder[i32] = Holder(buf())
+            a.rows.push([3, 4])
+            val b: &Holder[u64] = Holder(buf())
+            b.rows.push([10, 20])
+            print(read_after_drop(a), read_after_drop(b))
+        """, "4 20\n")
+
+@test("an element of a view whose index is past its length still traps")
+vel_view_element_bounds()
+    if !vel_ready() then return
+
+    val run = vel_run(raw"""
+        import sysl.buf.{Buf, buf}
+
+        main()
+            var b: Buf[[4]i32] = buf()
+            b.push([1, 2, 3, 4])
+            val rows = b.view()
+            val i = rows.len + 2
+            val v = rows[i][..]
+            print(v[0])
+        """, "0", true, "")
+
+    assert(!run.ok, run.out)
+    assert(run.err.contains("index 3 out of bounds for length 1"), run.err)
+
+// -- an element of a Buf ----------------------------------------------------------------------------
+
+@test("a view of an element of a Buf, kept across growth and a drop, keeps the storage")
+vel_buf_element_kept_across_growth()
+    vel_prints(raw"""
+        import sysl.buf.{Buf, buf}
+
+        main()
+            var b: Buf[[4]i32] = buf()
+            b.push([1, 2, 3, 4])
+            val v = b[0][..]
+            for k in 0..<100
+                b.push([k, k, k, k])
+            b = buf()
+            print(v[0] + v[3])
+        """, "5\n")
+
+@test("a view of an element of a Buf, stored in a struct, outlives the buffer's storage")
+vel_buf_element_stored_in_a_struct()
+    vel_prints(raw"""
+        import sysl.buf.{Buf, buf}
+
+        struct Keep
+            v: []i32
+
+        main()
+            var b: Buf[[4]i32] = buf()
+            b.push([1, 2, 3, 4])
+            val k = Keep(b[0][..])
+            for i in 0..<100
+                b.push([i, i, i, i])
+            b = buf()
+            print(k.v[0] + k.v[3])
+        """, "5\n")
+
+@test("a view of an array field of a struct element of a Buf, and of a row of a 2-D element, keep it")
+vel_buf_element_field_and_row()
+    vel_prints(raw"""
+        import sysl.buf.{Buf, buf}
+
+        struct Row
+            tag: i32
+            cells: [4]i32
+
+        main()
+            var b: Buf[Row] = buf()
+            b.push(Row(9, [1, 2, 3, 4]))
+            var g: Buf[[2][4]i32] = buf()
+            g.push([[0, 0, 0, 0], [5, 6, 7, 8]])
+            val v = b[0].cells[..]
+            val w = g[0][1][1..<3]
+            for k in 0..<100
+                b.push(Row(k, [k, k, k, k]))
+                g.push([[k, k, k, k], [k, k, k, k]])
+            b = buf()
+            g = buf()
+            print(v[0] + v[3], w[0] + w[1])
+        """, "5 13\n")
+
+@test("a view of an element of a Buf a call made outlives the statement that dropped the buffer")
+vel_buf_element_of_a_call_result()
+    vel_prints(raw"""
+        import sysl.buf.{Buf, buf}
+
+        make() -> Buf[[4]i32]
+            var b: Buf[[4]i32] = buf()
+            b.push([1, 2, 3, 4])
+            b
+
+        main()
+            val v = make()[0][..]
+            var junk: Buf[[4]i32] = buf()
+            for k in 0..<100
+                junk.push([k, k, k, k])
+            print(v[0] + v[3])
+        """, "5\n")
+
+@test("a view of an element of a Buf reached @unchecked, kept across growth, keeps the storage")
+vel_buf_element_unchecked()
+    vel_prints(raw"""
+        import sysl.buf.{Buf, buf}
+
+        main()
+            var b: Buf[[4]i32] = buf()
+            b.push([1, 2, 3, 4])
+            var v: []i32 = []
+            @unchecked
+                v = b[0][..]
+            for k in 0..<100
+                b.push([k, k, k, k])
+            b = buf()
+            print(v[0] + v[3])
+        """, "5\n")
+
+@test("a view of an element of a Buf held through a reference, dropped by a callee, keeps the storage")
+vel_buf_element_through_a_ref()
+    vel_prints(raw"""
+        import sysl.buf.{Buf, buf}
+
+        struct Holder
+            rows: Buf[[4]i32]
+
+        drop_rows(h: &Holder)
+            h.rows = buf()
+
+        main()
+            val h = Holder(buf())
+            h.rows.push([1, 2, 3, 4])
+            val v = h.rows[0][..]
+            drop_rows(h)
+            print(v[0] + v[3])
+        """, "5\n")
+
+@test("a fixed array inside a boxed struct held in a Buf was already the box's")
+vel_boxed_element_was_already_counted()
+    vel_prints(raw"""
+        import sysl.buf.{Buf, buf}
+
+        struct Row
+            cells: [4]i32
+
+        main()
+            var b: Buf[&Row] = buf()
+            b.push(Row([1, 2, 3, 4]))
+            val v = b[0].cells[..]
+            for k in 0..<100
+                b.push(Row([k, k, k, k]))
+            b = buf()
+            print(v[0] + v[3])
+        """, "5\n")
+
+@test("a view of an element of a Buf takes a count of the storage")
+vel_buf_element_is_counted()
+    vel_kept(raw"""
+        import sysl.buf.{Buf, buf}
+
+        struct Holder
+            rows: Buf[[4]i32]
+
+        peek(h: &Holder) -> i32
+            val v = h.rows[0][..]
+            h.rows = buf()
+            v[0]
+
+        main()
+            val h = Holder(buf())
+            h.rows.push([1, 2, 3, 4])
+            print(peek(h))
+        """, "peek")
+
+// -- the routes the analyzer refuses ----------------------------------------------------------------
+
+@test("returning a view of an element of a view parameter is refused")
+vel_refused_return()
+    vel_refused(raw"""
+        row(rows: [][4]i32, i: usize) -> []i32 = rows[i][..]
+
+        main()
+            var a = [[1, 2, 3, 4]]
+            print(row(a[..], 0)[0])
+        """, "a slice of an array this frame owns is returned, so it would outlive the array")
+
+@test("storing a view of an element of a view in a module var is refused")
+vel_refused_module_var()
+    vel_refused(raw"""
+        var kept: []i32 = []
+
+        keep(rows: [][4]i32)
+            kept = rows[0][..]
+
+        main()
+            var a = [[1, 2, 3, 4]]
+            keep(a[..])
+            print(kept[0])
+        """, "a slice of an array this frame owns is stored somewhere the frame does not own")
+
+@test("capturing a view of an element of a view in a heap closure is refused")
+vel_refused_capture()
+    vel_refused(raw"""
+        import sysl.buf.{Buf, buf}
+
+        main()
+            var b: Buf[[4]i32] = buf()
+            b.push([1, 2, 3, 4])
+            val rows = b.view()
+            val v = rows[0][..]
+            val f: &Fn() -> i32 = () -> v[0] + v[3]
+            print(f())
+        """, "a slice of an array this frame owns is put on the heap")
+
+@test("pushing a view of an element of a view into a Buf is refused")
+vel_refused_push()
+    vel_refused(raw"""
+        import sysl.buf.{Buf, buf}
+
+        main()
+            var b: Buf[[4]i32] = buf()
+            b.push([1, 2, 3, 4])
+            var views: Buf[[]i32] = buf()
+            val rows = b.view()
+            views.push(rows[0][..])
+            print(views[0][0])
+        """, "which holds on to it, so it would outlive the array")
+
+// -- lending to a borrowing callee ------------------------------------------------------------------
+
+private vel_lending() -> string = raw"""
+    import sysl.buf.{Buf, buf}
+
+    struct Holder
+        rows: Buf[[4]i32]
+
+    sum(xs: []i32) -> i32
+        var t = 0
+        for x in xs
+            t += x
+        t
+
+    total(rows: [][4]i32) -> i32 = sum(rows[0][..])
+
+    total_buf(b: Buf[[4]i32]) -> i32 = sum(b[0][1..])
+
+    // The callee can drop the buffer it was lent an element of, so the view keeps its count.
+    drop_then_read(h: &Holder, xs: []i32) -> i32
+        val first = xs[0]
+        h.rows = buf()
+        first + xs[3]
+
+    lent_to_a_dropper(h: &Holder) -> i32 = drop_then_read(h, h.rows[0][..])
+
+    // The same through a view of the buffer the callee drops: the view argument holds its own count.
+    lent_through_a_view(h: &Holder) -> i32 = drop_then_read(h, h.rows.view()[0][..])
+
+    main()
+        var b: Buf[[4]i32] = buf()
+        b.push([1, 2, 3, 4])
+        val h = Holder(buf())
+        h.rows.push([1, 2, 3, 4])
+        val g = Holder(buf())
+        g.rows.push([5, 6, 7, 8])
+        print(total(b.view()), total_buf(b), lent_to_a_dropper(h), lent_through_a_view(g))
+    """
+
+
+@test("an element of a view parameter lent to a borrowing callee takes no count")
+vel_lent_view_element_takes_no_count()
+    vel_none(vel_lending(), "total")
+
+@test("an element of a Buf lent to a callee that cannot reach the buffer takes no count")
+vel_lent_buf_element_takes_no_count()
+    vel_none(vel_lending(), "total_buf")
+
+@test("an element of a Buf lent to a callee that can drop the buffer keeps its count")
+vel_lent_to_a_dropper_keeps_its_count()
+    vel_kept(vel_lending(), "lent_to_a_dropper")
+
+@test("every lending cell prints what it should and gives everything back")
+vel_lending_runs()
+    vel_prints(vel_lending(), "10 9 5 13\n")
