@@ -1,0 +1,522 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// The borrow rule asked of what a callee reads through a pointer, FIELD BY FIELD (`keeps.sysl`'s
+// `read_path_of`, `read_cores_along`): `&a`, where `a.peer` holds `&b` and `a.bus` module storage,
+// reaches `&b` one step in along `.peer` only, so a callee that lets out `c.bus` alone lets out nothing
+// of this frame. `reference/memory.md § An address held inside what is handed over` refuses a call only
+// where the callee lets out what it read; these tests hold it to that per field, and hold the refusal
+// wherever the callee lets out the field holding the address, the pointer itself, or anything read
+// further along that field.
+//
+// The matrix crosses where the address sits (a field stored here, a nested struct's field, an array
+// field, a field a callee stores into, a `Buf` beside it) with what the callee lets out (the other
+// field, the field, the pointer, a read through the field) and the way the call is made (direct, a
+// wrapper handing the parameter on, a generic, a closure, a trait object with one or two kinds of
+// body). Skipped cells, and why: a union's fields share their storage, so the path stops at the union
+// and nothing inside it is told apart (`field_step`) -- the analysis is the field-insensitive one
+// there; a parameter reached through a copy of the pointer (`val q = c`) is followed along every field,
+// which only refuses more.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private kfs_outcome(text: string) -> (string, int)
+    val root = make_temp_dir("sysl-kfs").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", kfs_prelude + text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (failure_text(why), -1)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> ("the program that was built could not be run", -1)
+        Ok(out) -> (out.text + out.err.unwrap_or(""), shell_status(out.status))
+end kfs_outcome
+
+private kfs_prints(text: string, want: string)
+    if xvr_no_library() then return
+
+    val out = kfs_outcome(text)
+
+    assert_eq(out.0, want)
+    assert_eq(out.1, 0)
+end kfs_prints
+
+private kfs_refused(text: string, part: string)
+    if xvr_no_library() then return
+
+    val out = kfs_outcome(text)
+
+    assert_eq(out.1, -1, out.0)
+    assert(out.0.index_of(part).is_some(), out.0)
+end kfs_refused
+
+// Two cores, one pointing at the other, with a bus in module storage -- and somewhere to keep things.
+private const kfs_prelude: string = raw"""
+    import sysl.buf.{Buf, buf}
+
+    struct Cpu
+        peer: *Cpu
+        bus: *int
+
+    var the_bus = 7
+    var last: *int = null
+    var last_cpu: *Cpu = null
+
+    keep_bus(c: *Cpu)
+        last = c.bus
+
+    """
+
+private kfs_read(callee: string, param: string, how: string, written: string, owner: string) -> string =
+    s"'$callee' lets what it reads through its parameter '$param' outlive the call ($how), and what is " +
+        s"read through '$written' holds the address of a local of '$owner'"
+
+// -- the reduction --------------------------------------------------------------------------------
+
+@test("a callee letting out one field is not refused the address another field holds")
+kfs_other_field()
+    kfs_prints(raw"""
+        run() -> int
+            var a: Cpu
+            var b: Cpu
+            a.bus = &the_bus
+            a.peer = &b
+            keep_bus(&a)
+            *last
+
+        main()
+            print(run())
+        """, "7\n")
+
+// -- what the callee lets out -----------------------------------------------------------------------
+
+@test("a callee letting out the field that holds the address is refused")
+kfs_the_field()
+    kfs_refused(raw"""
+        keep_peer(c: *Cpu)
+            last_cpu = c.peer
+
+        run()
+            var a: Cpu
+            var b: Cpu
+            a.bus = &the_bus
+            a.peer = &b
+            keep_peer(&a)
+
+        main()
+            run()
+        """, kfs_read("keep_peer", "c", "it is stored in 'last_cpu'", "&a", "run"))
+
+@test("a callee keeping the pointer itself is refused")
+kfs_the_pointer()
+    kfs_refused(raw"""
+        keep_all(c: *Cpu)
+            last_cpu = c
+
+        run()
+            var a: Cpu
+            var b: Cpu
+            a.bus = &the_bus
+            a.peer = &b
+            keep_all(&a)
+
+        main()
+            run()
+        """, "'keep_all' keeps its parameter 'c' (it is stored in 'last_cpu'), and '&a' is the address of a local of 'run'")
+
+@test("a callee letting out what it reads further along the field is refused")
+kfs_through_the_field()
+    kfs_refused(raw"""
+        keep_deep(c: *Cpu)
+            last = c.peer.bus
+
+        run()
+            var x = 5
+            var a: Cpu
+            var b: Cpu
+            a.bus = &the_bus
+            b.bus = &x
+            a.peer = &b
+            keep_deep(&a)
+
+        main()
+            run()
+        """, kfs_read("keep_deep", "c", "it is stored in 'last'", "&a", "run"))
+
+@test("a callee letting out the field it reads is refused where that field holds a local's address")
+kfs_the_read_field_holds_a_local()
+    kfs_refused(raw"""
+        run()
+            var x = 5
+            var a: Cpu
+            var b: Cpu
+            a.bus = &x
+            a.peer = &b
+            keep_bus(&a)
+
+        main()
+            run()
+        """, kfs_read("keep_bus", "c", "it is stored in 'last'", "&a", "run"))
+
+@test("a parameter rebound inside the callee is followed along every field")
+kfs_rebound_parameter()
+    kfs_refused(raw"""
+        hop(c: *Cpu)
+            c = c.peer
+            last = c.bus
+
+        run()
+            var x = 5
+            var a: Cpu
+            var b: Cpu
+            a.bus = &the_bus
+            b.bus = &x
+            a.peer = &b
+            hop(&a)
+
+        main()
+            run()
+        """, kfs_read("hop", "c", "it is stored in 'last'", "&a", "run"))
+
+// -- where the address sits -------------------------------------------------------------------------
+
+@test("a nested struct's fields are told apart, and so is the address of the nested struct")
+kfs_nested()
+    kfs_prints(raw"""
+        struct Board
+            tag: int
+            cpu: Cpu
+
+        keep_board_bus(m: *Board)
+            last = m.cpu.bus
+
+        run() -> int
+            var b: Cpu
+            var m: Board
+            m.cpu.bus = &the_bus
+            m.cpu.peer = &b
+            keep_board_bus(&m)
+            val first = *last
+            keep_bus(&m.cpu)
+            first + *last
+
+        main()
+            print(run())
+        """, "14\n")
+
+@test("a nested struct's field holding the address is refused")
+kfs_nested_refused()
+    kfs_refused(raw"""
+        struct Board
+            tag: int
+            cpu: Cpu
+
+        keep_board_peer(m: *Board)
+            last_cpu = m.cpu.peer
+
+        run()
+            var b: Cpu
+            var m: Board
+            m.cpu.bus = &the_bus
+            m.cpu.peer = &b
+            keep_board_peer(&m)
+
+        main()
+            run()
+        """, kfs_read("keep_board_peer", "m", "it is stored in 'last_cpu'", "&m", "run"))
+
+@test("an array field holding a local's address does not refuse a callee letting out another field")
+kfs_array_field()
+    kfs_prints(raw"""
+        struct Slots
+            cells: [2]*int
+            bus: *int
+
+        keep_slots_bus(s: *Slots)
+            last = s.bus
+
+        run() -> int
+            var x = 5
+            var s: Slots
+            s.cells[0] = &x
+            s.bus = &the_bus
+            keep_slots_bus(&s)
+            *last + *s.cells[0]
+
+        main()
+            print(run())
+        """, "12\n")
+
+@test("an array field's elements are one field, so letting out any element is refused")
+kfs_array_element_refused()
+    kfs_refused(raw"""
+        struct Slots
+            cells: [2]*int
+            bus: *int
+
+        keep_cell(s: *Slots)
+            last = s.cells[1]
+
+        run()
+            var x = 5
+            var s: Slots
+            s.cells[0] = &x
+            s.bus = &the_bus
+            keep_cell(&s)
+
+        main()
+            run()
+        """, kfs_read("keep_cell", "s", "it is stored in 'last'", "&s", "run"))
+
+@test("a Buf field beside a field holding a local's address")
+kfs_buf_field()
+    kfs_prints(raw"""
+        struct Wired
+            list: Buf[*int]
+            peer: *int
+
+        keep_first(w: *Wired)
+            last = w.list[0]
+
+        run() -> int
+            var x = 5
+            var w = Wired(buf(), null)
+            w.list.push(&the_bus)
+            w.peer = &x
+            keep_first(&w)
+            *last + *w.peer
+
+        main()
+            print(run())
+        """, "12\n")
+
+@test("a Buf field letting the local's address out of the field beside it is refused")
+kfs_buf_field_refused()
+    kfs_refused(raw"""
+        struct Wired
+            list: Buf[*int]
+            peer: *int
+
+        keep_peer_of(w: *Wired)
+            last = w.peer
+
+        run()
+            var x = 5
+            var w = Wired(buf(), null)
+            w.list.push(&the_bus)
+            w.peer = &x
+            keep_peer_of(&w)
+
+        main()
+            run()
+        """, kfs_read("keep_peer_of", "w", "it is stored in 'last'", "&w", "run"))
+
+@test("a field a callee stores the address into is told apart from the others")
+kfs_callee_stores_the_field()
+    kfs_prints(raw"""
+        pair(first: *Cpu, second: *Cpu)
+            first.peer = second
+
+        run() -> int
+            var a: Cpu
+            var b: Cpu
+            a.bus = &the_bus
+            pair(&a, &b)
+            keep_bus(&a)
+            *last
+
+        main()
+            print(run())
+        """, "7\n")
+
+@test("a field a callee stores the address into is refused to a callee letting it out")
+kfs_callee_stores_the_field_refused()
+    kfs_refused(raw"""
+        pair(first: *Cpu, second: *Cpu)
+            first.peer = second
+
+        keep_peer(c: *Cpu)
+            last_cpu = c.peer
+
+        run()
+            var a: Cpu
+            var b: Cpu
+            a.bus = &the_bus
+            pair(&a, &b)
+            keep_peer(&a)
+
+        main()
+            run()
+        """, kfs_read("keep_peer", "c", "it is stored in 'last_cpu'", "&a", "run"))
+
+@test("two cores paired both ways, each handed to a callee letting out the other field, through a loop")
+kfs_paired_loop()
+    kfs_prints(raw"""
+        pair(first: *Cpu, second: *Cpu)
+            first.peer = second
+            second.peer = first
+
+        run() -> int
+            var a: Cpu
+            var b: Cpu
+            a.bus = &the_bus
+            b.bus = &the_bus
+            pair(&a, &b)
+            var sum = 0
+
+            for k in [&a, &b]
+                keep_bus(k)
+                sum += *last
+
+            sum
+
+        main()
+            print(run())
+        """, "14\n")
+
+@test("two cores paired both ways, through a loop, to a callee letting out the field holding the other")
+kfs_paired_loop_refused()
+    kfs_refused(raw"""
+        pair(first: *Cpu, second: *Cpu)
+            first.peer = second
+            second.peer = first
+
+        keep_peer(c: *Cpu)
+            last_cpu = c.peer
+
+        run()
+            var a: Cpu
+            var b: Cpu
+            a.bus = &the_bus
+            b.bus = &the_bus
+            pair(&a, &b)
+
+            for k in [&a, &b]
+                keep_peer(k)
+
+        main()
+            run()
+        """, kfs_read("keep_peer", "c", "it is stored in 'last_cpu'", "k", "run"))
+
+// -- the way the call is made -----------------------------------------------------------------------
+
+@test("a wrapper, a generic and a closure handing the parameter on keep the field")
+kfs_handed_on()
+    kfs_prints(raw"""
+        keep_tagged[T](c: *Cpu, tag: T)
+            last = c.bus
+
+        step(c: *Cpu)
+            keep_tagged(c, 1)
+
+        run() -> int
+            var a: Cpu
+            var b: Cpu
+            a.bus = &the_bus
+            a.peer = &b
+            step(&a)
+            val f = (c: *Cpu) -> keep_tagged(c, true)
+            f(&a)
+            *last
+
+        main()
+            print(run())
+        """, "7\n")
+
+@test("a wrapper handing the parameter on to a callee letting out the field is refused")
+kfs_handed_on_refused()
+    kfs_refused(raw"""
+        keep_peer_tagged[T](c: *Cpu, tag: T)
+            last_cpu = c.peer
+
+        step(c: *Cpu)
+            keep_peer_tagged(c, 1)
+
+        run()
+            var a: Cpu
+            var b: Cpu
+            a.bus = &the_bus
+            a.peer = &b
+            step(&a)
+
+        main()
+            run()
+        """, "lets what it reads through its parameter 'c' outlive the call")
+
+@test("a trait object whose every body lets out the other field is accepted")
+kfs_trait_object()
+    kfs_prints(raw"""
+        trait Device
+            write(self, c: *Cpu)
+
+        struct Uart
+            n: int
+
+        struct Dma
+            n: int
+
+        impl Device for Uart
+            write(self, c: *Cpu)
+                last = c.bus
+
+        impl Device for Dma
+            write(self, c: *Cpu)
+                last = c.bus
+
+        run_on(d: &Device) -> int
+            var a: Cpu
+            var b: Cpu
+            a.bus = &the_bus
+            a.peer = &b
+            d.write(&a)
+            *last
+
+        main()
+            print(run_on(Uart(1)) + run_on(Dma(2)))
+        """, "14\n")
+
+@test("a trait object with one body letting out the field that holds the address is refused")
+kfs_trait_object_refused()
+    kfs_refused(raw"""
+        trait Device
+            write(self, c: *Cpu)
+
+        struct Uart
+            n: int
+
+        struct Dma
+            n: int
+
+        impl Device for Uart
+            write(self, c: *Cpu)
+                last = c.bus
+
+        impl Device for Dma
+            write(self, c: *Cpu)
+                last_cpu = c.peer
+
+        run_on(d: &Device)
+            var a: Cpu
+            var b: Cpu
+            a.bus = &the_bus
+            a.peer = &b
+            d.write(&a)
+
+        main()
+            run_on(Uart(1))
+            run_on(Dma(2))
+        """, kfs_read("write", "c", "it is stored in 'last_cpu'", "&a", "run_on"))
