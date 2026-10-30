@@ -5541,6 +5541,30 @@ C programs already live by — **a pointer handed to a call is borrowed for the 
 | a function through a pointer | what any function whose address is taken at that pointer's type holds in what another of its parameters points at — one that keeps a pointer anywhere else is refused where it is written, and so is every one whose pointer type C can reach |
 | an `extern` | nothing, unless its declaration says [`@keeps(p)`](/reference/ffi/#keeps-a-c-function-that-holds-on-to-a-pointer) |
 
+A closure is judged where it is written, capture by capture, by what its body lets out of each — and
+again at every call it is handed to — so it makes no difference whether a call runs it, it is boxed
+behind a `&Fn`, or a `@scoped` member runs it later. A capture holding the address of the frame's own
+storage, stored by the body in module storage, outlives the frame:
+
+```sysl
+static var idle = 0
+static var kept: *int = &idle
+
+run(f: () -> unit) = f()
+
+closure() -> int
+    var n = 5
+    val p = &n
+    run(() -> kept = p)
+    0
+
+print(closure())
+```
+
+```error
+a closure lets its capture 'p' outlive the call (it is stored in 'kept'), and 'p' holds the address of a local of 'closure' — capture the value itself, or storage that lasts
+```
+
 **What a call with no body answers is asked the same way.** An `extern`'s answer is fresh — storage
 the library made, which is made of none of its arguments — unless its declaration says
 [`@answers(p)`](/reference/ffi/#answers-a-c-function-whose-answer-points-into-an-argument), and then
