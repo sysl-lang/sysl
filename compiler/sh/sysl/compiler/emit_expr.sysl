@@ -1650,7 +1650,14 @@ staged_args(e: *Emit, args: Buf[TExpr], out: *Buf[IrArg], callee: string) -> Buf
         // and only where nothing after it can change the place (`quiet_after`).
         val asks = callee != "" && (e.layout.indirect(aty) || lent || contains_counted(aty)) &&
                    !held_unless(e, a, written)
-        val v = guaranteed_arg(e, a, if asks && quiet_after(e, args, i) then callee else "", written, lent)
+
+        // A view of part of a place may cross with no count of its own (`lent_view`) only to a
+        // parameter the callee borrows: one it owns is handed a count, an `async` callee's task outlives
+        // the call, and an `@abandons` callee runs after the frame has given everything back.
+        val borrows = callee != "" && !e.owned_params.has(owned_key(callee, i)) &&
+                      !e.asyncs.has(callee) && !e.abandoning.has(callee)
+        val v = guaranteed_arg(e, a, if asks && quiet_after(e, args, i) then callee else "", written, lent,
+                               borrows)
 
         if e.layout.indirect(aty) || lent
             out.push(ir_arg(LPtr, v))
@@ -1752,11 +1759,18 @@ end changes_nothing
 //
 // A local a later argument assigns is held by neither: the write lands between this argument and the
 // call (`written`).
-private guaranteed_arg(e: *Emit, a: TExpr, callee: string, written: Set[string], lent: bool = false) -> Val
+//
+// **A view of part of a place a borrowed parameter takes is narrowed with no count at all** where what
+// keeps its elements alive already stands for the call (`emit_place.sysl`'s `lent_view`): the count
+// slicing takes would only be given back when the statement ends.
+private guaranteed_arg(e: *Emit, a: TExpr, callee: string, written: Set[string], lent: bool = false,
+                       borrows: bool = false) -> Val
     val ty = texpr_type(a)
     val big = e.layout.indirect(ty) || lent
     val still = held_unless(e, a, written) || (big || contains_counted(ty)) && lends_in_place(e, callee, ty)
     val guarantee = contains_counted(ty) && !still
+
+    if borrows && !big && lent_view(e, a, callee, written) then return gen_lent_view(e, a, callee, written)
 
     if big then return indirect_arg(e, a, still, lent && !e.layout.indirect(ty))
 

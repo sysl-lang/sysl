@@ -1,0 +1,400 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.text.{cstring, str_builder}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// A view of part of a place handed to a parameter the callee borrows -- `micro(a[i..<j])` in a gemm
+// loop -- is narrowed with no count of its own wherever what keeps its elements alive already stands
+// for the call (`emit_place.sysl`'s `lent_view`, reached from `emit_expr.sysl`'s `guaranteed_arg`).
+// Slicing took a count of the owner and the statement gave it back after the call, on every trip.
+//
+// What lets it go: a base the frame holds a count for (`held_unless`: a parameter, a local whose
+// address never got out, a field of either held by value, a call's result), a base of a type the
+// callee can neither write nor give back (`lends_in_place`), a frame array (whose owner is the frame's
+// or nothing), and a view of any of these -- `a[i..<j][k..<l]`.
+//
+// The count stays where the callee could outlive it or free what holds it: a parameter the callee
+// owns (it stores the view), a base reached through a pointer the callee writes -- growing the buffer
+// and repointing the field, or replacing it -- and a base a later argument replaces. Every runnable
+// cell is run at -O0 and -O2 on the counted heap and once under AddressSanitizer, and must print what
+// the counted form printed and give everything back.
+//
+// Cells not written: `&sync` -- a view may not cross a domain at all (a struct holding a `[]T` may not
+// cross, and a `&sync Fn` refuses a view capture), so no slice reaches a thread; an `async` callee and
+// an `@abandons` one are refused at the predicate by name (`staged_args`'s `borrows`), the task's
+// argument move and the abandoning release being paths of their own that no slice-lending change
+// touches; separate compilation -- a library function's view of its parameter is the same borrowed
+// convention, and the caller's side is all that changed.
+
+private extern "setenv" sal_c_setenv(name: *u8, value: *u8, overwrite: int) -> int
+private extern "unsetenv" sal_c_unsetenv(name: *u8) -> int
+
+private struct SalRun
+    ok: bool
+    out: string
+    err: string
+    hooks: usize
+
+private sal_ready() -> bool
+    if std_root().is_err() || !clang_available()
+        print("skipped: the library or the toolchain is not on this machine")
+        return false
+    end if
+
+    true
+end sal_ready
+
+private sal_ir(text: string) -> string
+    val root = make_temp_dir("sysl-sal").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    val out = emit_llvm_text(src, None) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> if made.report.is_empty() then made.text else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end sal_ir
+
+// One function's emitted text, from its `define` to the brace that closes it.
+private sal_body(out: string, name: string) -> string
+    var b = str_builder()
+    var inside = false
+
+    for line in lines_of(out)
+        if !inside && line.starts_with("define ") && sal_names(line, name) then inside = true
+
+        if inside
+            if line == "}" then return b.finish()
+
+            b.push(line)
+            b.push_char('\n')
+
+    if inside then b.finish() else s"no definition of '$name' in:\n$out"
+end sal_body
+
+private sal_names(line: string, name: string) -> bool =
+    line.contains("@" + name + "(") || line.contains("@" + name + "$") || line.contains("@" + name + ".")
+
+// Whether a body takes or gives back a count of a view's owner.
+private sal_counts(body: string) -> bool =
+    body.contains("@arc.retain_maybe(") || body.contains("@arc.release_maybe(")
+
+private sal_none(text: string, name: string)
+    if !sal_ready() then return
+
+    val f = sal_body(sal_ir(text), name)
+
+    assert(f.starts_with("define"), f)
+    assert(!sal_counts(f), f)
+end sal_none
+
+private sal_kept(text: string, name: string)
+    if !sal_ready() then return
+
+    val f = sal_body(sal_ir(text), name)
+
+    assert(f.starts_with("define"), f)
+    assert(f.contains("@arc.retain_maybe("), f)
+end sal_kept
+
+private sal_run(text: string, level: string, counted: bool, flags: string) -> SalRun
+    val root = make_temp_dir("sysl-sal").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    if counted then force_alloc_counting(true)
+
+    if flags != ""
+        val n = cstring("SYSL_EXTRA_CFLAGS")
+        val v = cstring(flags)
+
+        sal_c_setenv(n.ptr, v.ptr, 1)
+    end if
+
+    val built = build_native_program(s"$root/main.sysl", None, None, level, Some(exe))
+
+    if flags != ""
+        val n = cstring("SYSL_EXTRA_CFLAGS")
+
+        sal_c_unsetenv(n.ptr)
+
+    if counted then force_alloc_counting(false)
+
+    built match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return SalRun(false, failure_text(why), "", 0)
+        Ok(_) -> ()
+
+    val hooks = capture("nm", ["-u", exe], "", [], true) match
+        Ok(o) -> o.text.count_of("__asan_report")
+        Err(_) -> 0
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> SalRun(false, "could not be started", "", hooks)
+        Ok(o) -> SalRun(o.status.ok(), o.text, o.err.unwrap_or(""), hooks)
+end sal_run
+
+// Printed exactly `expected` at both ends of the optimizer on the counted heap, giving everything
+// back, and again under AddressSanitizer with the instrumentation in the binary.
+private sal_prints(text: string, expected: string)
+    if !sal_ready() then return
+
+    for level in ["0", "2"]
+        val run = sal_run(text, level, true, "")
+
+        assert(run.ok, s"-O$level: ${run.out}${run.err}")
+        assert_eq(run.out, expected)
+        assert(alloc_count_reported(run.err) == 0, s"-O$level: ${run.err}")
+
+    val asan = sal_run(text, "0", false, "-fsanitize=address -g")
+
+    assert(asan.hooks > 0, "the AddressSanitizer build carries no instrumentation")
+    assert(asan.ok, s"asan: ${asan.out}${asan.err}")
+    assert_eq(asan.out, expected)
+end sal_prints
+
+// -- what takes no count ----------------------------------------------------------------------------
+
+// The gemm shape and its neighbours: panels passed as parts of a parameter and of a field of a struct
+// lent by address, in a loop; a part of a part, in one expression and of a parameter; parts of a frame
+// array; parts of a string; and a generic callee at two element types.
+private sal_shapes() -> string = raw"""
+    import sysl.buf.{Buf, buf}
+    import sysl.math.Float
+
+    struct Work
+        a: []f64
+        b: []f64
+
+    kernel(n: usize, ap: []const f64, bp: []const f64, out: []f64)
+        var s = 0.0
+        for i in 0..<n
+            s += ap[i] * bp[i]
+        out[0] += s
+
+    drive(work: Work, n: usize, out: []f64)
+        var i: usize = 0
+        while i < n
+            kernel(4, work.a[i..<i + 4], work.b[i..<i + 4], out)
+            i += 4
+
+    plain(a: []f64, n: usize, out: []f64)
+        for i in 0..<n / 4
+            kernel(4, a[i * 4..<i * 4 + 4], a[i * 4..<i * 4 + 4], out)
+
+    nested(a: []f64, out: []f64)
+        for i in 0..<a.len / 8
+            kernel(4, a[i * 8..<i * 8 + 8][2..<6], a[i * 8..<i * 8 + 8][0..<8][4..<8], out)
+
+    of_param(s: []f64, out: []f64) = kernel(4, s[2..<6], s[0..<4], out)
+
+    framed(out: []f64)
+        var tile: [8]f64
+        for i in 0..<8
+            tile[i] = f64(i)
+        kernel(4, tile[0..<4], tile[4..<8], out)
+
+    letters(s: string) -> int
+        var n = 0
+        for c in s.bytes
+            if c == u8('e') then n += 1
+        n
+
+    texts(t: string) -> int = letters(t[1..<5]) + letters(t[2..<t.len])
+
+    first[T](xs: []const T) -> T = xs[0]
+
+    generic(a: []f64, k: []int) -> f64 = first(a[3..<5]) + f64(first(k[1..<3]))
+
+    struct Panels[T]
+        a: []T
+        b: []T
+
+    dot[T: Float](n: usize, ap: []const T, bp: []const T) -> T
+        var s = T.zero()
+        for i in 0..<n
+            s = s + ap[i] * bp[i]
+        s
+
+    blocked[T: Float](w: Panels[T], n: usize) -> T
+        var s = T.zero()
+        var j: usize = 0
+        while j < n
+            val bp = w.b[j..<j + 4]
+            var i: usize = 0
+            while i < n
+                s = s + dot[T](4, w.a[i..<i + 4], bp)
+                i += 4
+            j += 4
+        s
+
+    fill(n: usize, x: f64) -> Buf[f64]
+        var b: Buf[f64] = buf()
+        for i in 0..<n
+            b.push(x + f64(i))
+        b
+
+    main()
+        val a = fill(64, 1.0)
+        val b = fill(64, 2.0)
+        val out = fill(1, 0.0)
+        drive(Work(a.view(), b.view()), 64, out.view())
+        plain(a.view(), 64, out.view())
+        nested(a.view(), out.view())
+        of_param(b.view()[8..<24], out.view())
+        framed(out.view())
+        var ks: Buf[int] = buf()
+        ks.push(5)
+        ks.push(6)
+        ks.push(7)
+        print(out[0], texts("seventeen trees"), generic(a.view(), ks.view()))
+        print(blocked(Panels(a.view(), b.view()), 16), blocked(Panels([1f32, 2, 3, 4], [5f32, 6, 7, 8]), 4))
+    """
+
+@test("parts of a struct field lent by address, passed in a loop, take no count of the buffer")
+sal_parts_of_a_lent_field_take_no_count()
+    sal_none(sal_shapes(), "drive")
+
+@test("parts of a parameter passed in a loop take none")
+sal_parts_of_a_parameter_take_no_count()
+    sal_none(sal_shapes(), "plain")
+
+@test("a part of a part, in one expression, takes none")
+sal_a_part_of_a_part_takes_no_count()
+    sal_none(sal_shapes(), "nested")
+
+@test("parts of a view parameter take none")
+sal_parts_of_a_view_parameter_take_no_count()
+    sal_none(sal_shapes(), "of_param")
+
+@test("parts of a frame array take none")
+sal_parts_of_a_frame_array_take_no_count()
+    sal_none(sal_shapes(), "framed")
+
+@test("parts of a string take none")
+sal_parts_of_a_string_take_no_count()
+    sal_none(sal_shapes(), "texts")
+
+@test("parts handed to a generic callee at two element types take none")
+sal_parts_to_a_generic_callee_take_no_count()
+    sal_none(sal_shapes(), "generic")
+
+@test("in a generic body, a part and a local view handed to a read-only parameter take none")
+sal_read_only_parts_in_a_generic_body_take_no_count()
+    sal_none(sal_shapes(), "blocked")
+
+@test("and every shape prints what the counted form printed, giving everything back")
+sal_shapes_run()
+    sal_prints(sal_shapes(), "228296 7 10\n5248 70\n")
+
+// -- what keeps the count -----------------------------------------------------------------------------
+
+// `regrow` grows the buffer past its storage and points `h.s` at the new storage, so the old storage is
+// held by nothing but the argument's count when the callee reads it; `replace` points `h.s` at a buffer
+// of its own. `keep` stores the part it is handed, so it owns the parameter. `rewrites` replaces the
+// local a part was taken of in a later argument. A closure is handed parts of a captured view.
+private sal_kept_shapes() -> string = raw"""
+    import sysl.buf.{Buf, buf}
+
+    struct H
+        b: Buf[f64]
+        s: []f64
+
+    total(x: []const f64) -> f64
+        var t = 0.0
+        for v in x
+            t += v
+        t
+
+    regrow(h: *H, x: []const f64) -> f64
+        for i in 0..<100
+            h.b.push(f64(i))
+        h.s = h.b.view()
+        total(x)
+
+    replace(h: *H, x: []const f64) -> f64
+        var other: Buf[f64] = buf()
+        other.push(100.0)
+        h.s = other.view()
+        total(x)
+
+    struct Keeper
+        s: []f64
+
+    keep(k: *Keeper, x: []f64) = k.s = x
+
+    later(x: []const f64, n: f64) -> f64 = total(x) + n
+
+    reset(s: *[]f64) -> f64
+        var other: Buf[f64] = buf()
+        other.push(9.0)
+        *s = other.view()
+        0.0
+
+    fill(n: usize, x: f64) -> Buf[f64]
+        var b: Buf[f64] = buf()
+        for i in 0..<n
+            b.push(x + f64(i))
+        b
+
+    grows(h: *H) -> f64 = regrow(h, h.s[1..<4])
+    replaces(h: *H) -> f64 = replace(h, h.s[0..<2])
+    keeps(k: *Keeper, a: []f64) = keep(k, a[2..<5])
+
+    rewrites() -> f64
+        var s = fill(6, 1.0).view()
+        later(s[0..<3], reset(&s)) + total(s)
+
+    closure(a: []f64) -> f64
+        val f = () -> total(a[1..<3])
+        val g = (x: []const f64) -> total(x)
+        f() + g(a[0..<2])
+
+    main()
+        var h = H(fill(4, 1.0), [])
+        h.s = h.b.view()
+        print(grows(&h), h.s.len)
+        var h2 = H(fill(4, 1.0), [])
+        h2.s = h2.b.view()
+        print(replaces(&h2), h2.s[0])
+        var k = Keeper([])
+        keeps(&k, fill(8, 1.0).view())
+        print(total(k.s))
+        print(rewrites())
+        print(closure(fill(4, 1.0).view()))
+    """
+
+@test("a part of a field the callee grows the buffer of and repoints keeps its count")
+sal_a_regrown_field_keeps_the_count()
+    sal_kept(sal_kept_shapes(), "grows")
+
+@test("a part of a field the callee replaces keeps its count")
+sal_a_replaced_field_keeps_the_count()
+    sal_kept(sal_kept_shapes(), "replaces")
+
+@test("a part handed to a callee that stores it keeps its count")
+sal_a_stored_part_keeps_the_count()
+    sal_kept(sal_kept_shapes(), "keeps")
+
+@test("a part of a local a later argument replaces keeps its count")
+sal_a_part_of_a_rewritten_local_keeps_the_count()
+    sal_kept(sal_kept_shapes(), "rewrites")
+
+@test("and every one of them reads what it was handed, giving everything back")
+sal_kept_shapes_run()
+    sal_prints(sal_kept_shapes(), "9 104\n3 100\n12\n15\n8\n")
