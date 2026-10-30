@@ -1,0 +1,412 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// The borrow rule (`keeps.sysl`'s `frame_stored`) asked of a store the frame cannot show lands in its
+// own storage: the address of a local, a field of one, an element of a local array or a parameter's
+// copy, stored through a pointer a call answered (`current().p = &n`), a chain of calls, a trait
+// object's answer, a local bound to any of these, or a `Buf`'s element, may outlive the frame
+// whatever the frame does next, so it is refused at the store -- as it is in module storage or
+// through a parameter, which already outlive the frame. A place is the frame's own when it is a
+// local, a field or element of one in place, or reached through a local bound once to `&` of such
+// storage or to an object made here (`rule_own_place`). `reference/memory.md § A borrowed pointer
+// cannot escape` is the specification.
+//
+// The matrix crosses the destination (a call's answer, a chain, a trait object, a local bound to an
+// answer and one bound to that local, a foreign `Buf` element, a local `Buf`'s element, a call that
+// answers its argument, one that may answer its argument or module storage) with the source (`&local`,
+// `&local.field`, `&array[i]`, `&param`), and adds the shapes the store sits in: a generic function,
+// a `*self` method, a closure body, a store overwritten before the way out. The negatives are the
+// frame's own places, an address of module storage or one a parameter brought stored into a foreign
+// place, a view of a local array (promoted, `§ A view that outlives its scope is promoted too`), and
+// an address as an integer.
+//
+// Escape hatch: there is none for a pointer. `ptr_cast` of the address is followed as the address
+// (`bfs_ptr_cast_is_no_hatch`); an address stored as an INTEGER is a number until a `ptr_cast` may
+// turn it back (`bfs_address_as_integer`), as the rule says of module storage. `@unchecked` is an
+// array-bounds form and does not touch the rule.
+//
+// Skipped cells, and why: an `async` body is walked by the same `frame_stored`, and a thread or task
+// keep is its own rule (`tests_atk_async_task_keeps.sysl`); separate compilation does not change a
+// body's own walk; the entry file's statements are passed over by the rule (`check_calls`) and have
+// no locals of their own, a top-level `var` being module storage.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private bfs_outcome(text: string) -> (string, int)
+    val root = make_temp_dir("sysl-bfs").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", bfs_prelude + text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (failure_text(why), -1)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> ("the program that was built could not be run", -1)
+        Ok(out) -> (out.text + out.err.unwrap_or(""), shell_status(out.status))
+end bfs_outcome
+
+private bfs_prints(text: string, want: string)
+    if xvr_no_library() then return
+
+    val out = bfs_outcome(text)
+
+    assert_eq(out.0, want)
+    assert_eq(out.1, 0)
+end bfs_prints
+
+private bfs_refused(text: string, part: string)
+    if xvr_no_library() then return
+
+    val out = bfs_outcome(text)
+
+    assert_eq(out.1, -1, out.0)
+    assert(out.0.index_of(part).is_some(), out.0)
+end bfs_refused
+
+// A struct holding an address, module storage reached through calls, a method chain, a trait object
+// answering a pointer, and calls that answer their argument (or may answer module storage instead).
+private const bfs_prelude: string = raw"""
+    import sysl.buf.{Buf, buf}
+    import sysl.raw.ptr_cast
+
+    struct S
+        p: *int
+        addr: usize
+        v: []int
+
+    struct Pair
+        a: int
+        b: int
+
+    struct W
+        s: S
+        items: Buf[S]
+
+    impl W
+        s_of(*self) -> *S = &self.s
+
+    trait Host
+        at(self) -> *S
+
+    struct Plain
+        n: int
+
+    impl Host for Plain
+        at(self) -> *S = &the_world.s
+
+    var the_world = W(S(null, 0, []), buf())
+    var spare = 3
+    var flip = false
+
+    current() -> *S = &the_world.s
+    world() -> *W = &the_world
+    pick(s: *S) -> *S = s
+    pick2(s: *S) -> *S = if flip then s else &the_world.s
+
+    """
+
+private bfs_foreign(value: string, place: string, owner: string) -> string =
+    s"$value, and it is stored in '$place', which '$owner' cannot show is its own storage — store the " +
+        "value itself, or storage that lasts"
+
+private bfs_outlives(value: string, place: string, owner: string) -> string =
+    s"$value, and it is stored in '$place', which outlives '$owner' — store the value itself, or storage " +
+        "that lasts"
+
+// The four sources, each as a body that declares what it takes the address of, the expression, and
+// how the refusal says it. `{P}` in a destination's text is where the store goes.
+private bfs_sources(owner: string) -> [4](string, string, string) = [
+    ("    var n = 1\n", "&n", s"'&n' is the address of a local of '$owner'"),
+    ("    var pr = Pair(1, 2)\n", "&pr.b", s"'&pr.b' is the address of a field of 'pr', a local of '$owner'"),
+    ("    var xs = [1, 2, 3]\n", "&xs[1]", s"'&xs[1]' is the address of a field of 'xs', a local of '$owner'"),
+    ("", "&k", s"'&k' is the address of the parameter 'k' of '$owner', a copy in its frame")]
+
+// Every source stored into one destination: `setup` binds what the place is reached through, `place`
+// is the place as written, and `said` is how the refusal writes it.
+private bfs_each_source(setup: string, place: string, said: string)
+    for src in bfs_sources("f")
+        bfs_refused(s"f(k: int)\n${src.0}$setup    $place = ${src.1}\n\nmain()\n    f(1)\n",
+                    bfs_foreign(src.2, said, "f"))
+end bfs_each_source
+
+// -- the regression --------------------------------------------------------------------------------
+
+@test("the address of a local stored through what a call answered is refused")
+bfs_design_example()
+    bfs_refused(raw"""
+        f()
+            var n = 1
+            current().p = &n
+
+        main()
+            f()
+        """, bfs_foreign("'&n' is the address of a local of 'f'", "current().p", "f"))
+
+@test("in a file with no main, the place is still quoted as written")
+bfs_no_main()
+    bfs_refused(raw"""
+        f()
+            var n = 1
+            current().p = &n
+        """, bfs_foreign("'&n' is the address of a local of 'f'", "current().p", "f"))
+
+@test("in a file with no main, a chain of calls is quoted as written")
+bfs_no_main_chain()
+    bfs_refused(raw"""
+        f()
+            var n = 1
+            world().s_of().p = &n
+        """, bfs_foreign("'&n' is the address of a local of 'f'", "world().s_of().p", "f"))
+
+@test("in a file with no main, a Buf element reached through a call is quoted as written")
+bfs_no_main_buf()
+    bfs_refused(raw"""
+        f()
+            var n = 1
+            world().items[0].p = &n
+        """, bfs_foreign("'&n' is the address of a local of 'f'", "world().items[0].p", "f"))
+
+@test("in a file with no main, a call with an argument is quoted as written")
+bfs_no_main_argument()
+    bfs_refused(raw"""
+        f()
+            var n = 1
+            var s = S(null, 0, [])
+            pick(&s).p = &n
+        """, bfs_foreign("'&n' is the address of a local of 'f'", "pick(&s).p", "f"))
+
+// -- every destination, every source ---------------------------------------------------------------
+
+@test("each source stored through a call's answer")
+bfs_call_answer() = bfs_each_source("", "current().p", "current().p")
+
+@test("each source stored through a chain of calls")
+bfs_chain() = bfs_each_source("", "world().s_of().p", "world().s_of().p")
+
+@test("each source stored through a trait object's answer")
+bfs_trait_object() = bfs_each_source("    val h: &Host = Plain(0)\n", "h.at().p", "h.at().p")
+
+@test("each source stored through a local bound to a call's answer")
+bfs_local_bound() = bfs_each_source("    val c = current()\n", "c.p", "c.p")
+
+@test("each source stored through a local bound to a local bound to a call's answer")
+bfs_local_of_local() = bfs_each_source("    val c = current()\n    val d = c\n", "d.p", "d.p")
+
+@test("each source stored into a Buf element of storage a call answered")
+bfs_foreign_buf() = bfs_each_source("", "world().items[0].p", "world().items[0].p")
+
+@test("each source stored into a local Buf's element, as a push of it is")
+bfs_local_buf()
+    bfs_each_source("    var b: Buf[S] = buf()\n    b.push(S(null, 0, []))\n", "b[0].p", "b[0].p")
+
+@test("each source stored through a call that answers its argument")
+bfs_answers_argument() = bfs_each_source("    var s = S(null, 0, [])\n", "pick(&s).p", "pick(&s).p")
+
+@test("each source stored through a call that may answer module storage instead of its argument")
+bfs_answers_either() = bfs_each_source("    var s = S(null, 0, [])\n", "pick2(&s).p", "pick2(&s).p")
+
+@test("each source stored through a local bound to a call that answers its argument")
+bfs_bound_to_pick() = bfs_each_source("    var s = S(null, 0, [])\n    val q = pick(&s)\n", "q.p", "q.p")
+
+@test("each source stored in module storage outlives the frame, as before")
+bfs_module_storage()
+    for src in bfs_sources("f")
+        bfs_refused(s"f(k: int)\n${src.0}    the_world.s.p = ${src.1}\n\nmain()\n    f(1)\n",
+                    bfs_outlives(src.2, "the_world.s.p", "f"))
+end bfs_module_storage
+
+@test("each source stored through a pointer parameter outlives the frame, as before")
+bfs_pointer_parameter()
+    for src in bfs_sources("f")
+        bfs_refused(s"f(q: *S, k: int)\n${src.0}    q.p = ${src.1}\n\nmain()\n    f(current(), 1)\n",
+                    bfs_outlives(src.2, "q.p", "f"))
+end bfs_pointer_parameter
+
+// -- the shapes the store sits in -------------------------------------------------------------------
+
+@test("a generic function storing through a call's answer")
+bfs_generic()
+    bfs_refused(raw"""
+        f[T](x: T) -> T
+            var n = 1
+            current().p = &n
+            x
+
+        main()
+            print(f(4))
+        """, bfs_foreign("'&n' is the address of a local of 'f'", "current().p", "f"))
+
+@test("a *self method storing the address of its local into self")
+bfs_self_method()
+    bfs_refused(raw"""
+        impl S
+            set(*self)
+                var n = 1
+                self.p = &n
+
+        main()
+            current().set()
+        """, bfs_outlives("'&n' is the address of a local of 'set'", "self.p", "set"))
+
+@test("a *self method storing the address of its local through a call's answer")
+bfs_self_method_foreign()
+    bfs_refused(raw"""
+        impl S
+            set(*self)
+                var n = 1
+                current().p = &n
+
+        main()
+            var s = S(null, 0, [])
+            s.set()
+        """, bfs_foreign("'&n' is the address of a local of 'set'", "current().p", "set"))
+
+@test("a closure body storing the address of its own local through a call's answer")
+bfs_closure_body()
+    bfs_refused(raw"""
+        f()
+            val g = () ->
+                var n = 1
+                current().p = &n
+            g()
+
+        main()
+            f()
+        """, bfs_foreign("'&n' is the address of a local of 'call'", "current().p", "call"))
+
+@test("a store overwritten before the way out is still refused: the next answer may be other storage")
+bfs_overwritten()
+    bfs_refused(raw"""
+        f()
+            var n = 1
+            current().p = &n
+            current().p = null
+
+        main()
+            f()
+        """, bfs_foreign("'&n' is the address of a local of 'f'", "current().p", "f"))
+
+@test("a store in a branch of a loop is refused as one in a straight line")
+bfs_in_a_loop()
+    bfs_refused(raw"""
+        f(m: int)
+            var n = 1
+
+            for i in 0..<m
+                if i == 2 then current().p = &n
+
+        main()
+            f(4)
+        """, bfs_foreign("'&n' is the address of a local of 'f'", "current().p", "f"))
+
+@test("ptr_cast of the address is followed as the address: no hatch")
+bfs_ptr_cast_is_no_hatch()
+    bfs_refused(raw"""
+        f()
+            var n = 1
+            current().p = ptr_cast(&n)
+
+        main()
+            f()
+        """, bfs_foreign("'ptr_cast(&n)' holds the address of a local of 'f'", "current().p", "f"))
+
+@test("an address turned to an integer and back is followed as the address")
+bfs_integer_turned_back()
+    bfs_refused(raw"""
+        f()
+            var n = 1
+            current().p = ptr_cast(usize(&n))
+
+        main()
+            f()
+        """, bfs_foreign("'ptr_cast(usize(&n))' holds the address of a local of 'f'", "current().p", "f"))
+
+// -- the negatives ---------------------------------------------------------------------------------
+
+@test("the frame's own places take the address of its locals")
+bfs_own_places()
+    bfs_prints(raw"""
+        f() -> int
+            var n = 1
+            var s = S(null, 0, [])
+            var w = W(S(null, 0, []), buf())
+            var arr = [S(null, 0, []), S(null, 0, [])]
+            val q = &s
+            val q2 = q
+            val qa = &arr[0]
+            val r: &S = S(null, 0, [])
+            s.p = &n
+            q.p = &n
+            q2.p = &n
+            qa.p = &n
+            w.s.p = &n
+            arr[1].p = &n
+            r.p = &n
+            *s.p + *q.p + *q2.p + *w.s.p + *arr[0].p + *arr[1].p + *r.p
+
+        main()
+            print(f())
+        """, "7\n")
+
+@test("module storage's address and a pointer a parameter brought go into a foreign place")
+bfs_lasting_addresses()
+    bfs_prints(raw"""
+        passed(k: *int)
+            world().s_of().p = k
+
+        f()
+            current().p = &spare
+            val h: &Host = Plain(0)
+            h.at().p = &spare
+
+        main()
+            f()
+            passed(&spare)
+            print(*current().p)
+        """, "3\n")
+
+@test("a view of a local array stored through a call's answer is promoted and stays readable")
+bfs_view_promoted()
+    bfs_prints(raw"""
+        f()
+            var xs = [11, 22, 33]
+            current().v = xs[..]
+
+        scribble(n: int) -> int
+            var ys: [64]int = [0; 64]
+
+            for i in 0..<64
+                ys[i] = n + i
+
+            ys[63]
+
+        main()
+            f()
+            print(scribble(1000))
+            print(current().v[1])
+        """, "1063\n22\n")
+
+@test("an address stored as an integer through a call's answer is a number")
+bfs_address_as_integer()
+    bfs_prints(raw"""
+        f() -> bool
+            var n = 1
+            current().addr = usize(&n)
+            current().addr != 0
+
+        main()
+            print(f())
+        """, "true\n")
