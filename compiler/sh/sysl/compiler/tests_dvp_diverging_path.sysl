@@ -284,7 +284,8 @@ dvp_defer_on_the_path()
 
 @test("an exported function that releases, which C may call back, makes every foreign call untrusted")
 dvp_releasing_export_untrusts_foreign()
-    val callee = "peek(t: &Tag) -> int\n    if t.id < 0 then exit(1)\n\n    t.id\n"
+    // A foreign call that comes back, on the run before the exit, is untrusted.
+    val callee = "peek(t: &Tag) -> int\n    if t.id < 0\n        print(\"negative\")\n        exit(1)\n\n    t.id\n"
 
     dvp_not_inert(callee + raw"""
 
@@ -299,15 +300,65 @@ dvp_releasing_export_untrusts_foreign()
         look() -> int = 1
         """)
 
-@test("a library artifact cannot know what its program exports, so it trusts no foreign call")
+@test("a call that never comes back, handed only numbers, seals the lent frames whatever C may call back")
+dvp_a_sealing_call_is_trusted_under_a_releasing_export()
+    val export = raw"""
+
+        @export("dvp_reset")
+        reset()
+            G = Holder(Tag(3))
+        """
+
+    // `exit(1)` and `Buf.at`'s bounds failure are handed integers: nothing they reach can read `t`.
+    dvp_inert("peek(t: &Tag) -> int\n    if t.id < 0 then exit(1)\n\n    t.id\n" + export)
+    dvp_inert("halt(code: int) -> never\n    G = Holder(Tag(9))\n    exit(code)\n\n" +
+              "peek(t: &Tag) -> int\n    if t.id < 0 then halt(2)\n\n    t.id\n" + export)
+    // Handed the lent value itself, it is `die(t)` again.
+    dvp_not_inert("peek(t: &Tag) -> int\n    if t.id < 0 then die(t)\n\n    t.id\n" + export)
+    // Handed a pointer, it could read through it after a release.
+    dvp_not_inert("stop(p: *Holder) -> never\n    G = Holder(Tag(9))\n    print(p.tag.id)\n    exit(1)\n\n" +
+                  "peek(t: &Tag) -> int\n    if t.id < 0 then stop(&G)\n\n    t.id\n" + export)
+end dvp_a_sealing_call_is_trusted_under_a_releasing_export
+
+@test("a call that never comes back and releases, handed only numbers, still runs as with the count")
+dvp_a_sealing_call_runs()
+    val text = dvp_program_with("peek(t: &Tag) -> int\n    if t.id < 0 then halt(3)\n\n    t.id\n" +
+                                "halt(code: int) -> never\n    G = Holder(Tag(9))\n    print(\"halting\")\n" +
+                                "    exit(code)\n", "-1", "print(lend())", "")
+    val ir = dvp_lowered(text, "lend")
+
+    if ir == "skipped" || !dvp_runnable() then return
+
+    assert(ir.starts_with("define"), ir)
+    assert_eq(int(ir.count_of("@arc.retain(")) + int(ir.count_of("@arc.release(")), 0, ir)
+
+    // `halt` frees the tag `lend` handed `peek` with no count, and nothing reads it again.
+    val run = dvp_run(text, false, "-fsanitize=address -g")
+
+    assert(run.hooks > 1, s"the binary calls ${run.hooks} ASan report hooks, so it is not instrumented")
+    assert_eq(run.out, "drop 0\ndrop -1\nhalting\n")
+    assert_eq(run.code, 3, run.err)
+    assert(!run.err.contains("AddressSanitizer"), run.err)
+end dvp_a_sealing_call_runs
+
+@test("a library artifact cannot know what its program exports, so it trusts no foreign call that comes back")
 dvp_library_artifact_trusts_nothing()
-    val text = dvp_program("peek(t: &Tag) -> int\n    if t.id < 0 then exit(1)\n\n    t.id\n")
+    val text = dvp_program("peek(t: &Tag) -> int\n    if t.id < 0\n        print(\"negative\")\n        exit(1)\n\n" +
+                           "    t.id\n")
     val ir = dvp_lowered_as(text, "lend", false)
 
     if ir == "skipped" then return
 
     assert(ir.starts_with("define"), ir)
     assert_eq(int(ir.count_of("@arc.retain(")) + int(ir.count_of("@arc.release(")), 2, ir)
+
+    // A call that never comes back and is handed only numbers needs no trust: it seals the frames.
+    val sealed = dvp_program("peek(t: &Tag) -> int\n    if t.id < 0 then exit(1)\n\n    t.id\n")
+    val ir2 = dvp_lowered_as(sealed, "lend", false)
+
+    assert(ir2.starts_with("define"), ir2)
+    assert_eq(int(ir2.count_of("@arc.retain(")) + int(ir2.count_of("@arc.release(")), 0, ir2)
+end dvp_library_artifact_trusts_nothing
 
 // -- `Buf.at`, `unwrap`, `Map.get`: the shapes the rule was written for -------------------------------
 
@@ -387,7 +438,7 @@ dvp_unwrap_and_at_are_inert()
     assert(second.contains("-zero("), second)
     assert_eq(dvp_count_ops(second), 0, second)
 
-@test("a sysl_bounds_fail override that releases makes indexing non-inert; one that does not leaves it")
+@test("a sysl_bounds_fail override leaves indexing inert whether or not it releases: it is handed numbers and never comes back")
 dvp_bounds_fail_override()
     val releasing = dvp_container_program(raw"""
         var Spare: Option[&Leaf] = None
@@ -401,7 +452,7 @@ dvp_bounds_fail_override()
     if second == "skipped" then return
 
     assert(second.starts_with("define"), second)
-    assert(dvp_count_ops(second) > 1, second)
+    assert_eq(dvp_count_ops(second), 0, second)
 
     val quiet = dvp_container_program(raw"""
         @export("sysl_bounds_fail")
@@ -412,6 +463,31 @@ dvp_bounds_fail_override()
 
     assert(again.starts_with("define"), again)
     assert_eq(dvp_count_ops(again), 0, again)
+
+@test("an override that frees the very buffer a failed index was lent reads nothing freed under ASan")
+dvp_bounds_fail_override_frees_the_buffer()
+    if !dvp_runnable() then return
+
+    val program = dvp_containers("", raw"""
+        far() -> int = B.at(5).v
+
+        @export("sysl_bounds_fail")
+        report(kind: u32, a: usize, b: usize, n: usize, at: *u8)
+            B = buf()
+            print("reset", a, n)
+        """, "    print(far())\n")
+    val far = dvp_lowered(program, "far")
+
+    assert(far.starts_with("define"), far)
+    assert_eq(dvp_count_ops(far), 0, far)
+
+    val run = dvp_run(program, false, "-fsanitize=address -g")
+
+    assert(run.hooks > 1, s"the binary calls ${run.hooks} ASan report hooks, so it is not instrumented")
+    assert_eq(run.out, "2 2\nreset 5 2\n")
+    assert(run.code != 0, run.err)
+    assert(!run.err.contains("AddressSanitizer"), run.err)
+end dvp_bounds_fail_override_frees_the_buffer
 
 // -- programs: what runs, under AddressSanitizer and on a counted heap --------------------------------
 

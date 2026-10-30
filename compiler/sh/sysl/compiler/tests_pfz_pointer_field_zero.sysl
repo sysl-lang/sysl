@@ -1,0 +1,835 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.text.{cstring, str_builder}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// A counted field read through a pointer -- `vm.stack` with `vm: *Machine` -- is handed to a call with
+// no count of the caller's own wherever the callee cannot write the place or let go of what holds it
+// (`borrowing.sysl`'s `untouched_by`, `emit_expr.sysl`'s `lends_in_place`). Slate's dispatch loop is
+// the shape: `vm.stack.push(vm.stack.at(base + i))` took and gave back a count of the stack's buffer
+// for the push, and another for the read, on every instruction.
+//
+// What lets it go now, each judged by the callee's body:
+//
+// - a write that gives back a count is judged by what letting go of the old value could free
+//   (`gives_back_clear`): growing a `Buf[V]` lets go of `[]V` storage, which holds no `S`;
+// - the slot forms a container writes its storage with are writes to its element type, and a
+//   struct's invariant is a call of its `$inv` (`touch_slots`, `TRecheck`);
+// - a contract clause is walked as the body is;
+// - a pointer cast from the address of a named object reaches only that object (`Casts`);
+// - a call that never comes back and is handed only numbers seals every frame holding a lent value,
+//   whatever C may call back (`seals_the_frame`) -- `Buf.at`'s bounds failure, in a program that
+//   exports a function that releases;
+// - an argument after the lent one may call what may itself be lent the type (`quiet_after`).
+//
+// The counts stay wherever the callee, or a later argument, can write the place, free what holds it,
+// or run code nobody can see: a write to the same field, two pointers to one object, a destructor, a
+// closure or a trait object. Every runnable cell is run at -O0 and -O2 on the counted heap and once
+// under AddressSanitizer, and must print what a copy would and give everything back.
+//
+// Cells not written: `&sync` -- a `&sync T` may not hold a `Buf` at all (pinned below), and a
+// `&sync Frozen[T]` read is the `Frozen` cell; separate compilation -- a library's functions have no
+// body in the program's view, so a call into one is the unknown-function cell; bare metal -- nothing
+// here emits anything new, it only takes counts away.
+
+private extern "setenv" pfz_c_setenv(name: *u8, value: *u8, overwrite: int) -> int
+private extern "unsetenv" pfz_c_unsetenv(name: *u8) -> int
+
+private struct PfzRun
+    ok: bool
+    out: string
+    err: string
+    hooks: usize
+
+private pfz_ready() -> bool
+    if std_root().is_err() || !clang_available()
+        print("skipped: the library or the toolchain is not on this machine")
+        return false
+    end if
+
+    true
+end pfz_ready
+
+private pfz_ir(text: string) -> string
+    val root = make_temp_dir("sysl-pfz").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    val out = emit_llvm_text(src, None) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> if made.report.is_empty() then made.text else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end pfz_ir
+
+// One function's emitted text, from its `define` to the brace that closes it: the first whose symbol
+// starts `@<name>` and goes on with `(`, `$` or `.` -- an entry file's `$$sysl`, an instance's
+// arguments, an owned body.
+private pfz_body(out: string, name: string) -> string
+    var b = str_builder()
+    var inside = false
+
+    for line in lines_of(out)
+        if !inside && line.starts_with("define ") && pfz_names(line, name) then inside = true
+
+        if inside
+            if line == "}" then return b.finish()
+
+            b.push(line)
+            b.push_char('\n')
+
+    if inside then b.finish() else s"no definition of '$name' in:\n$out"
+end pfz_body
+
+private pfz_names(line: string, name: string) -> bool =
+    line.contains("@" + name + "(") || line.contains("@" + name + "$") || line.contains("@" + name + ".")
+
+// Whether a body takes or gives back a count of a buffer, or of anything.
+private pfz_counts(body: string) -> bool =
+    body.contains("@arc.copy.") || body.contains("@arc.dispose.") || body.contains("@arc.retain(") ||
+        body.contains("@arc.release(") || body.contains("@arc.retain_maybe(") ||
+        body.contains("@arc.release_maybe(")
+
+private pfz_none(text: string, name: string)
+    if !pfz_ready() then return
+
+    val f = pfz_body(pfz_ir(text), name)
+
+    assert(f.starts_with("define"), f)
+    assert(!pfz_counts(f), f)
+end pfz_none
+
+// Whether a body takes a count of a buffer handle.
+private pfz_buf_copied(body: string) -> bool = body.contains("@arc.copy.sysl.buf$Buf.")
+
+private pfz_kept(text: string, name: string)
+    if !pfz_ready() then return
+
+    val f = pfz_body(pfz_ir(text), name)
+
+    assert(f.starts_with("define"), f)
+    assert(pfz_buf_copied(f), f)
+end pfz_kept
+
+private pfz_run(text: string, level: string, counted: bool, flags: string) -> PfzRun
+    val root = make_temp_dir("sysl-pfz").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    if counted then force_alloc_counting(true)
+
+    if flags != ""
+        val n = cstring("SYSL_EXTRA_CFLAGS")
+        val v = cstring(flags)
+
+        pfz_c_setenv(n.ptr, v.ptr, 1)
+    end if
+
+    val built = build_native_program(s"$root/main.sysl", None, None, level, Some(exe))
+
+    if flags != ""
+        val n = cstring("SYSL_EXTRA_CFLAGS")
+
+        pfz_c_unsetenv(n.ptr)
+
+    if counted then force_alloc_counting(false)
+
+    built match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return PfzRun(false, failure_text(why), "", 0)
+        Ok(_) -> ()
+
+    val hooks = capture("nm", ["-u", exe], "", [], true) match
+        Ok(o) -> o.text.count_of("__asan_report")
+        Err(_) -> 0
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> PfzRun(false, "could not be started", "", hooks)
+        Ok(o) -> PfzRun(o.status.ok(), o.text, o.err.unwrap_or(""), hooks)
+end pfz_run
+
+// Printed exactly `expected` at both ends of the optimizer on the counted heap, giving everything
+// back, and again under AddressSanitizer with the instrumentation in the binary.
+private pfz_prints(text: string, expected: string)
+    if !pfz_ready() then return
+
+    for level in ["0", "2"]
+        val run = pfz_run(text, level, true, "")
+
+        assert(run.ok, s"-O$level: ${run.out}${run.err}")
+        assert_eq(run.out, expected)
+        assert(alloc_count_reported(run.err) == 0, s"-O$level: ${run.err}")
+
+    val asan = pfz_run(text, "0", false, "-fsanitize=address -g")
+
+    assert(asan.hooks > 0, "the AddressSanitizer build carries no instrumentation")
+    assert(asan.ok, s"asan: ${asan.out}${asan.err}")
+    assert_eq(asan.out, expected)
+end pfz_prints
+
+// -- the dispatch loop's shape ----------------------------------------------------------------------
+
+// A stack of values holding no count, read and pushed through a pointer to the machine that holds it,
+// grown past its first storage twice over.
+private pfz_machine() -> string = raw"""
+    import sysl.buf.{Buf, buf}
+
+    struct Obj
+        n: int
+
+    enum V
+        I(v: int)
+        P(p: *Obj)
+
+    struct Machine
+        stack: Buf[V]
+        other: Buf[V]
+
+    value_of(v: V) -> int = v match
+        I(n) -> n
+        P(p) -> p.n
+
+    dup(vm: *Machine, n: usize)
+        for i in 0..<n
+            vm.stack.push(vm.stack.at(i))
+
+    cross(vm: *Machine, n: usize)
+        for i in 0..<n
+            vm.other.push(vm.stack.at(i))
+
+    total(vm: *Machine) -> int
+        var t = 0
+
+        for i in 0..<vm.stack.len()
+            t += value_of(vm.stack.at(i))
+
+        t
+
+    var o = Obj(40)
+    var m = Machine(buf(), buf())
+
+    m.stack.push(I(1))
+    m.stack.push(P(&o))
+    dup(&m, 2)
+    dup(&m, 4)
+    dup(&m, 8)
+    cross(&m, 3)
+    print(total(&m), m.stack.len(), m.other.len())
+    """
+
+@test("a push of an element read through the same pointer takes no count of the buffer for either")
+pfz_push_of_a_read_takes_no_count()
+    pfz_none(pfz_machine(), "dup")
+
+@test("a push into one field of an element read from another takes none either")
+pfz_push_across_fields_takes_no_count()
+    pfz_none(pfz_machine(), "cross")
+
+@test("a read-only loop over a field through a pointer takes none")
+pfz_read_only_loop_takes_no_count()
+    pfz_none(pfz_machine(), "total")
+
+@test("and the machine's program prints what it did with every count kept, giving everything back")
+pfz_machine_runs()
+    pfz_prints(pfz_machine(), "328 16 3\n")
+
+// -- what keeps the count -----------------------------------------------------------------------------
+
+// `swap_out` replaces `s.items` while the push it is an argument of holds the old buffer: the old
+// one must outlive the call, so the push's receiver keeps its count. The push lands in the old buffer.
+private pfz_same_field() -> string = raw"""
+    import sysl.buf.{Buf, buf}
+
+    struct S
+        items: Buf[int]
+
+    swap_out(s: *S) -> int
+        val first = s.items.at(0)
+
+        s.items = buf()
+        first
+
+    grab(s: *S) = s.items.push(swap_out(s))
+
+    var s = S(buf())
+
+    for i in 0..<20
+        s.items.push(i + 1)
+
+    grab(&s)
+    print(s.items.len())
+    """
+
+@test("a later argument that writes the same field keeps the receiver's count")
+pfz_a_write_to_the_field_keeps_the_count()
+    pfz_kept(pfz_same_field(), "grab")
+
+@test("and the old buffer outlives the call")
+pfz_a_write_to_the_field_runs()
+    pfz_prints(pfz_same_field(), "0\n")
+
+// The same write made in the loop itself, between reads: each read is its own call, lent the buffer
+// as it then is.
+private pfz_loop_write() -> string = raw"""
+    import sysl.buf.{Buf, buf}
+
+    struct S
+        items: Buf[int]
+
+    churn(s: *S) -> int
+        var t = 0
+
+        for i in 0..<3
+            t += s.items.at(0)
+            s.items = buf()
+            s.items.push(i + 10)
+
+        t
+
+    var s = S(buf())
+
+    s.items.push(5)
+    print(churn(&s), s.items.at(0))
+    """
+
+@test("a write to the field in the loop leaves each read lent the buffer it then sees")
+pfz_a_write_in_the_loop_runs()
+    if !pfz_ready() then return
+
+    val f = pfz_body(pfz_ir(pfz_loop_write()), "churn")
+
+    assert(f.starts_with("define"), f)
+    assert(!pfz_buf_copied(f), f)
+    pfz_prints(pfz_loop_write(), "26 12\n")
+end pfz_a_write_in_the_loop_runs
+
+// Two pointers that may name one object: `refill(b)` replaces `b.items` while `a.items` is the push's
+// receiver, and here they are the same.
+private pfz_aliasing() -> string = raw"""
+    import sysl.buf.{Buf, buf}
+
+    struct S
+        items: Buf[int]
+
+    refill(b: *S) -> int
+        b.items = buf()
+        b.items.push(7)
+        3
+
+    both(a: *S, b: *S) = a.items.push(refill(b))
+
+    var s = S(buf())
+
+    for i in 0..<9
+        s.items.push(i)
+
+    both(&s, &s)
+    print(s.items.len(), s.items.at(0))
+    """
+
+@test("two pointers that may alias keep the count where a later argument writes through the other")
+pfz_two_pointers_keep_the_count()
+    pfz_kept(pfz_aliasing(), "both")
+
+@test("and the program sees the replaced buffer")
+pfz_two_pointers_run()
+    pfz_prints(pfz_aliasing(), "1 7\n")
+
+// A call through a closure that captured the pointer is a call nobody can see into.
+private pfz_closure() -> string = raw"""
+    import sysl.buf.{Buf, buf}
+
+    struct S
+        items: Buf[int]
+
+    feed(s: *S, f: &Fn() -> int) = s.items.push(f())
+
+    reset_to(p: *S, n: int) -> int
+        p.items = buf()
+        n
+
+    var s = S(buf())
+    val p = &s
+
+    for i in 0..<9
+        s.items.push(i)
+
+    feed(p, () -> reset_to(p, 4))
+    feed(p, () -> int(p.items.len()))
+    print(s.items.len(), s.items.at(0))
+    """
+
+@test("a closure called as a later argument keeps the count, whatever it captured")
+pfz_a_closure_keeps_the_count()
+    pfz_kept(pfz_closure(), "feed")
+
+@test("and the closure that replaces the buffer is survived")
+pfz_a_closure_runs()
+    pfz_prints(pfz_closure(), "1 0\n")
+
+// A call through a trait object is another.
+private pfz_trait_object() -> string = raw"""
+    import sysl.buf.{Buf, buf}
+
+    struct S
+        items: Buf[int]
+
+    trait Source
+        next(self) -> int
+
+    struct Resetter
+        s: *S
+
+    impl Source for Resetter
+        next(self) -> int
+            self.s.items = buf()
+            8
+
+    pull(s: *S, src: &Source) = s.items.push(src.next())
+
+    var s = S(buf())
+
+    for i in 0..<9
+        s.items.push(i)
+
+    pull(&s, Resetter(&s))
+    print(s.items.len())
+    """
+
+@test("a trait object called as a later argument keeps the count")
+pfz_a_trait_object_keeps_the_count()
+    pfz_kept(pfz_trait_object(), "pull")
+
+@test("and the program runs as with the count")
+pfz_a_trait_object_runs()
+    pfz_prints(pfz_trait_object(), "0\n")
+
+// A destructor in the element: letting go of a grown `Buf[&Item]`'s old storage could run `drop`, so
+// a push into one keeps its count.
+private pfz_dropping() -> string = raw"""
+    import sysl.buf.{Buf, buf}
+
+    struct Item
+        id: int
+
+    impl Drop for Item
+        drop(self) = print("drop", self.id)
+
+    struct S
+        items: Buf[&Item]
+
+    add(s: *S, id: int) = s.items.push(Item(id))
+
+    var s = S(buf())
+
+    for i in 0..<10
+        add(&s, i)
+
+    print(s.items.len())
+    s.items = buf()
+    print("end")
+    """
+
+@test("a push into a buffer of values with a destructor keeps the count")
+pfz_a_destructor_keeps_the_count()
+    pfz_kept(pfz_dropping(), "add")
+
+@test("and every item is dropped once")
+pfz_a_destructor_runs()
+    pfz_prints(pfz_dropping(),
+               "10\ndrop 9\ndrop 8\ndrop 7\ndrop 6\ndrop 5\ndrop 4\ndrop 3\ndrop 2\ndrop 1\ndrop 0\nend\n")
+
+// -- the places --------------------------------------------------------------------------------------
+
+// A field of a field held by value, a field reached through a reference, and an enum in a field.
+private pfz_places() -> string = raw"""
+    import sysl.buf.{Buf, buf}
+
+    struct Inner
+        b: Buf[int]
+
+    struct Mid
+        inner: Inner
+
+    enum E
+        Has(b: Buf[int])
+        Nothing
+
+    struct Outer
+        mid: Mid
+        r: &Inner
+        e: E
+
+    first(e: E) -> int = e match
+        Has(b) -> b.at(0)
+        Nothing -> -1
+
+    nested(p: *Outer)
+        for i in 0..<3
+            p.mid.inner.b.push(p.mid.inner.b.at(i))
+
+    referenced(p: *Outer) -> int
+        var t = 0
+
+        for i in 0..<p.r.b.len()
+            t += p.r.b.at(i)
+
+        t
+
+    payload(p: *Outer) -> int = first(p.e)
+
+    var o = Outer(Mid(Inner(buf())), Inner(buf()), Has(buf()))
+
+    for i in 0..<3
+        o.mid.inner.b.push(i + 1)
+        o.r.b.push(10 * i)
+
+    o.e match
+        Has(b) -> b.push(42)
+        Nothing -> ()
+
+    nested(&o)
+    print(o.mid.inner.b.len(), referenced(&o), payload(&o))
+    """
+
+@test("a field of a field held by value, through a pointer, takes no count")
+pfz_a_nested_field_takes_no_count()
+    pfz_none(pfz_places(), "nested")
+
+@test("a field reached through a reference behind a pointer takes no count")
+pfz_a_referenced_field_takes_no_count()
+    pfz_none(pfz_places(), "referenced")
+
+@test("an enum field holding a buffer, handed to a reader, takes no count")
+pfz_an_enum_field_takes_no_count()
+    pfz_none(pfz_places(), "payload")
+
+@test("and the places read what was put there")
+pfz_places_run()
+    pfz_prints(pfz_places(), "6 30 42\n")
+
+// A generic over `*Holder[T]`: lent at `int`, counted at `&Item`, whose old storage can run `drop`.
+private pfz_generic() -> string = raw"""
+    import sysl.buf.{Buf, buf}
+
+    struct Item
+        id: int
+
+    impl Drop for Item
+        drop(self) = print("drop", self.id)
+
+    struct Holder[T]
+        b: Buf[T]
+
+    again[T](h: *Holder[T], n: usize)
+        for i in 0..<n
+            h.b.push(h.b.at(i))
+
+    var hi: Holder[int] = Holder(buf())
+    var hr: Holder[&Item] = Holder(buf())
+
+    hi.b.push(1)
+    hr.b.push(Item(7))
+    again(&hi, 1)
+    again(&hi, 2)
+    again(&hi, 4)
+    again(&hi, 8)
+    again(&hr, 1)
+    print(hi.b.len(), hr.b.len())
+    hr.b = buf()
+    print("end")
+    """
+
+@test("a generic over a pointer takes no count at an element with none, and keeps it at one with a destructor")
+pfz_generic_per_instance()
+    if !pfz_ready() then return
+
+    val out = pfz_ir(pfz_generic())
+    val at_int = pfz_body(out, "again.int")
+    val at_item = pfz_body(out, "again.ref.Item")
+
+    assert(at_int.starts_with("define"), at_int)
+    assert(!pfz_counts(at_int), at_int)
+    assert(at_item.starts_with("define"), at_item)
+    assert(pfz_buf_copied(at_item), at_item)
+end pfz_generic_per_instance
+
+@test("and both instances run")
+pfz_generic_runs()
+    pfz_prints(pfz_generic(), "16 2\ndrop 7\nend\n")
+
+// A frozen buffer behind a `&sync` holder, read through a pointer to a struct holding the holder.
+private pfz_frozen() -> string = raw"""
+    import sysl.buf.{Buf, buf, Frozen}
+
+    struct Table
+        rows: &sync Frozen[int]
+
+    struct View
+        t: Table
+
+    sum(v: *View) -> int
+        var s = 0
+
+        for i in 0..<3
+            s += v.t.rows.at(i)
+
+        s
+
+    val b: Buf[int] = buf()
+
+    for i in 0..<3
+        b.push(i + 1)
+
+    var v = View(Table(b.freeze()))
+    print(sum(&v))
+    """
+
+@test("a frozen buffer shared across domains, read through a pointer, takes no atomic count")
+pfz_a_frozen_read_takes_no_count()
+    pfz_none(pfz_frozen(), "sum")
+    pfz_prints(pfz_frozen(), "6\n")
+
+@test("a '&sync' holder of a plain buffer is refused, so it is never lent across domains")
+pfz_a_sync_buffer_is_refused()
+    if !pfz_ready() then return
+
+    val out = pfz_ir(raw"""
+        import sysl.buf.{Buf, buf}
+
+        struct H
+            items: Buf[int]
+
+        look(h: &sync H, i: usize) -> int = h.items.at(i)
+        """)
+
+    assert(out.contains("'&sync H' may be reached from two domains at once, so every count inside it " +
+                        "has to be atomic — but its 'items' is a 'Buf[int]'"), out)
+end pfz_a_sync_buffer_is_refused
+
+// -- what the callee's body is judged by ---------------------------------------------------------------
+
+// A program exporting a function that releases, which C could call back: `Buf.at`'s bounds failure is
+// handed two integers and never returns, so it still lends.
+private pfz_exported() -> string = raw"""
+    import sysl.buf.{Buf, buf}
+
+    struct S
+        items: Buf[int]
+
+    var G = S(buf())
+
+    @export("pfz_reset")
+    reset()
+        G = S(buf())
+
+    read(s: *S, i: usize) -> int = s.items.at(i)
+
+    main()
+        G.items.push(5)
+        print(read(&G, 0))
+        reset()
+        print(G.items.len())
+    """
+
+@test("a releasing export does not cost a bounds-checked read its lending")
+pfz_an_export_keeps_the_read_lent()
+    pfz_none(pfz_exported(), "read")
+    pfz_prints(pfz_exported(), "5\n0\n")
+
+// A contract clause: one that only reads is judged as the body is; one that calls something writing
+// the place keeps the count.
+private pfz_contracts() -> string = raw"""
+    import sysl.buf.{Buf, buf}
+
+    struct S
+        items: Buf[int]
+
+    look(b: Buf[int], i: usize) -> int
+        require i < b.len()
+
+        b.at(i)
+
+    poke(s: *S) -> bool
+        s.items = buf()
+        true
+
+    guarded(b: Buf[int], s: *S) -> usize
+        require poke(s)
+
+        b.len()
+
+    reads(s: *S) -> int = look(s.items, 0)
+
+    writes(s: *S) -> usize = guarded(s.items, s)
+
+    var s = S(buf())
+
+    s.items.push(3)
+    print(reads(&s), writes(&s), s.items.len())
+    """
+
+@test("a callee whose contract only reads is lent the field")
+pfz_a_reading_contract_lends()
+    pfz_none(pfz_contracts(), "reads")
+
+@test("a callee whose contract writes the place keeps the count")
+pfz_a_writing_contract_keeps_the_count()
+    pfz_kept(pfz_contracts(), "writes")
+
+@test("and both run")
+pfz_contracts_run()
+    pfz_prints(pfz_contracts(), "3 1 0\n")
+
+// A cast from the address of a named object of another type reaches only that object; a cast from an
+// address reached through the pointer could reach the place itself.
+private pfz_casts() -> string = raw"""
+    import sysl.buf.{Buf, buf}
+    import sysl.raw.ptr_cast
+
+    struct S
+        items: Buf[int]
+        n: usize
+
+    struct Words
+        a: usize
+        b: usize
+
+    struct Word
+        a: usize
+
+    var Scratch: [4]usize = [0, 0, 0, 0]
+
+    scribble(b: Buf[int]) -> usize
+        val w: *Words = ptr_cast(&Scratch[0])
+
+        w.a = b.len()
+        w.a
+
+    stamp(b: Buf[int], at: *S) -> usize
+        val w: *Word = ptr_cast(&at.n)
+
+        w.a = 9
+        b.len()
+
+    named(s: *S) -> usize = scribble(s.items)
+
+    through(s: *S) -> usize = stamp(s.items, s)
+
+    main()
+        var s = S(buf(), 0)
+
+        s.items.push(1)
+        print(named(&s), through(&s), s.n, Scratch[0])
+    """
+
+@test("a callee writing through a pointer cast from a named object of another type is lent the field")
+pfz_a_named_cast_lends()
+    pfz_none(pfz_casts(), "named")
+
+@test("a callee writing through a pointer cast from an address behind a pointer keeps the count")
+pfz_an_unnamed_cast_keeps_the_count()
+    pfz_kept(pfz_casts(), "through")
+
+@test("and both write where they say")
+pfz_casts_run()
+    pfz_prints(pfz_casts(), "1 1 9 1\n")
+
+// A write giving back a count, judged by what it could free: an unrelated global of numbers is clear,
+// a box holding the very struct the place is in is not.
+private pfz_gives() -> string = raw"""
+    import sysl.buf.{Buf, buf}
+
+    struct S
+        items: Buf[int]
+
+    struct Box
+        s: S
+
+    struct Counts
+        n: int
+
+    var C: &Counts = Counts(0)
+    var B: &Box = Box(S(buf()))
+
+    swap_counts() -> int
+        C = Counts(1)
+        1
+
+    swap_box() -> int
+        B = Box(S(buf()))
+        2
+
+    clear(s: *S) = s.items.push(swap_counts())
+
+    hazard(s: *S) = s.items.push(swap_box())
+
+    main()
+        var s = S(buf())
+
+        clear(&s)
+        hazard(&B.s)
+        print(s.items.len(), B.s.items.len())
+    """
+
+@test("a later argument letting go of numbers elsewhere leaves the field lent")
+pfz_giving_back_numbers_lends()
+    pfz_none(pfz_gives(), "clear")
+
+@test("a later argument letting go of a box that holds the struct keeps the count")
+pfz_giving_back_the_holder_keeps_the_count()
+    pfz_kept(pfz_gives(), "hazard")
+
+@test("and the old box's buffer outlives the push into it")
+pfz_gives_runs()
+    pfz_prints(pfz_gives(), "1 0\n")
+
+// A tuple of references built on the spot from a field through a pointer: the callee overwrites the
+// field, which writes nothing a tuple is part of but frees the very nodes the tuple points at.
+private pfz_referents() -> string = raw"""
+    struct Node
+        v: int
+
+    struct Kids
+        a: &Node
+        b: &Node
+
+    struct Bag
+        kids: Kids
+
+    replace(n: *Bag, p: (&Node, &Node)) -> int
+        n.kids = Kids(Node(9), Node(10))
+        p.0.v + p.1.v
+
+    swapped(n: *Bag) -> int = replace(n, (n.kids.a, n.kids.b))
+
+    main()
+        var b = Bag(Kids(Node(1), Node(2)))
+
+        print(swapped(&b), b.kids.a.v)
+    """
+
+@test("a callee freeing what a lent value points at, through a place no part of it, keeps the count")
+pfz_freeing_the_referents_keeps_the_count()
+    if !pfz_ready() then return
+
+    val f = pfz_body(pfz_ir(pfz_referents()), "swapped")
+
+    assert(f.starts_with("define"), f)
+    assert(pfz_counts(f), f)
+    pfz_prints(pfz_referents(), "3 9\n")
+end pfz_freeing_the_referents_keeps_the_count
