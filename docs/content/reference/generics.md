@@ -2303,6 +2303,33 @@ Sub 9
 true 3
 ```
 
+**A simple enum's variant converted to an integer is its discriminant**, at the conversion's type, in
+every one of those positions and in a declaration's own — a field's length, an `@assert` beside it.
+It converts exactly as it does in a `const` body, so an explicit discriminant comes out as written:
+
+```sysl
+enum Op: u8
+    Nop
+    Load = 4
+    Store
+
+struct Slots
+    regs: [u8(Op.Store) - 1]int
+
+@assert(u8(Op.Load) == 4)
+
+opcode[const K: u8]() -> u8 = K
+
+const Next = u8(Op.Store) + 1
+
+if const u8(Op.Load) > u8(Op.Nop)
+    print(opcode[u8(Op.Store)](), Next, Slots([0, 0, 0, 0]).regs.len)
+```
+
+```output
+5 6 4
+```
+
 **A condition that does not type is refused for that**, not as a test made while the program runs. A
 `for const` variable over a range is a `usize`, and a function's parameter takes what any call to it
 takes, so a `uint` parameter wants it converted, `fast(uint(k))`, as it would anywhere else. (A value

@@ -1,0 +1,320 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{remove_dir_all}
+import sysl.process.capture
+
+// **A simple enum's variant converted to an integer is a constant wherever a constant is read**
+// (`reference/generics.md § Every constant position reads the same expressions`): `u8(Op.C)` is the
+// variant's discriminant at the conversion's type in a value argument, a `const`, an `if const`, an
+// array's length and an `@assert`, exactly as it is inside a `const` function's body. The fold holds a
+// variant by its position, so a conversion over one is run whole by the evaluator a `const` body runs
+// on -- one definition of what the conversion comes to, explicit discriminants, the enum's underlying
+// type and the narrowing included.
+
+private eci_ops() -> string = raw"""
+    enum Op: u8
+        A
+        B
+        C
+
+    enum Big: i16
+        Lo = -5
+        Hi = 300
+
+    h8[const K: u8]() -> u8 = K
+    hi8[const K: i8]() -> i8 = K
+    """
+
+@test("a variant converted to u8 is a value argument")
+eci_value_argument()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(eci_ops() + raw"""
+
+        print(h8[u8(Op.C)](), h8[u8(Op.A)]())
+        """), "2 0\n")
+end eci_value_argument
+
+@test("a variant converted to u8 initialises a 'const', alone and in arithmetic")
+eci_const_initializer()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(eci_ops() + raw"""
+
+        const k = u8(Op.C)
+        const n = u8(Op.C) + 1
+        const w: int = int(Op.B) * 10
+
+        print(k, n, w)
+        """), "2 3 10\n")
+end eci_const_initializer
+
+@test("'if const' over a converted variant chooses its branch, both ways")
+eci_if_const_chooses()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(eci_ops() + raw"""
+
+        if const u8(Op.C) == 2
+            print("two")
+        else
+            print("not two")
+
+        if const u8(Op.A) > u8(Op.B)
+            print("wrong")
+        else
+            print("A below B")
+
+        val s = if const u8(Op.C) + 1 == 3 then "three" else "not"
+        print(s)
+        """), "two\nA below B\nthree\n")
+end eci_if_const_chooses
+
+@test("an array's length and an '@assert' read a converted variant")
+eci_length_and_assert()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(eci_ops() + raw"""
+
+        @assert(u8(Op.C) == 2)
+        @assert(u8(Op.A) < u8(Op.C))
+
+        var lanes: [u8(Op.C) + 1]int = [7, 8, 9]
+        val many: [usize(Op.B)]u8 = [4]
+
+        print(lanes.len, many.len, lanes[2])
+        """), "3 1 9\n")
+end eci_length_and_assert
+
+@test("a declaration reads a converted variant: a field's length, a signature's value argument, a module '@assert'")
+eci_declaration_positions()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        enum Op: u8
+            A
+            B
+            C
+
+        struct H[const N: u8]
+            v: int
+
+        struct Row
+            cells: [u8(Op.C) + 1]int
+
+        @assert(Op.A != Op.B)
+        @assert(u8(Op.C) == 2, "C is the third")
+
+        h(x: H[u8(Op.B)]) -> int = x.v + 1
+
+        main()
+            val r = Row([1, 2, 3])
+            print(r.cells.len, h(H(10)))
+        """), "3 11\n")
+end eci_declaration_positions
+
+@test("'@align' folds a converted variant, alone and doubled")
+eci_align_argument()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        enum Line: u8
+            Small = 16
+            Cache = 64
+
+        @align(int(Line.Cache))
+        struct Head
+            tag: u8
+
+        @align(u8(Line.Small) * 2)
+        struct Pair
+            a: u8
+
+        main()
+            print(alignof(Head), alignof(Pair))
+        """), "64 32\n")
+end eci_align_argument
+
+@test("a module '@assert' over a converted variant that does not hold fails as an assertion")
+eci_declaration_assert_fails()
+    if !enm_ready() then return
+
+    val said = enm_outcome(raw"""
+        enum Op: u8
+            A
+            B
+
+        @assert(u8(Op.B) == 7)
+
+        main()
+            print(0)
+        """).0
+
+    assert(said.contains("assertion failed"), said)
+end eci_declaration_assert_fails
+
+@test("explicit discriminants over an i16 come out as written, negative ones into signed types")
+eci_explicit_discriminants()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(eci_ops() + raw"""
+
+        enum Wide: u16
+            Near = 1
+            Far = 40000
+
+        const lo = i16(Big.Lo)
+        const hi = int(Big.Hi) * 2
+        const far = u32(Wide.Far) + 1
+
+        print(lo, hi, far, hi8[i8(Big.Lo)](), h8[u8(Wide.Near)]())
+        """), "-5 600 40001 -5 1\n")
+end eci_explicit_discriminants
+
+@test("comparisons over converted variants fold in a 'const'")
+eci_comparisons()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(eci_ops() + raw"""
+
+        const above = u8(Op.C) > u8(Op.A)
+        const same = int(Big.Lo) == -5
+        const differ = u8(Op.B) != 1
+
+        print(above, same, differ)
+        """), "true true false\n")
+end eci_comparisons
+
+@test("a narrowing conversion of a variant keeps the low bits, as the same conversion does in a 'const' body")
+eci_narrowing_matches_const_body()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(eci_ops() + raw"""
+
+        const body() -> u8 = u8(u2(Big.Hi))
+
+        const k = u2(Big.Hi)
+        const j = i8(Big.Hi)
+
+        print(k, j, body(), h8[u8(i8(Big.Hi))]())
+        """), "0 44 0 44\n")
+end eci_narrowing_matches_const_body
+
+@test("a variant converted and handed to a value parameter is fit-checked at the parameter's type")
+eci_value_argument_fit_checked()
+    if !enm_ready() then return
+
+    val said = enm_outcome(eci_ops() + raw"""
+
+        print(h8[int(Big.Hi)]())
+        """).0
+
+    assert(said.contains("300"), said)
+    assert(!said.contains("must be a constant"), said)
+end eci_value_argument_fit_checked
+
+@test("a variant converted inside a 'for const' copy and by a const parameter is a value argument")
+eci_for_const_and_parameter()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(eci_ops() + raw"""
+
+        via[const OP: Op]() -> u8 = h8[u8(OP)]()
+
+        for const c in Op::Variants
+            print(h8[u8(Op::Make(c, ()))](), via[Op::Make(c, ())]())
+        """), "0 0\n1 1\n2 2\n")
+end eci_for_const_and_parameter
+
+@test("a variant carrying data is still no integer, in a 'const' and a value argument")
+eci_payload_refused()
+    if !enm_ready() then return
+
+    val decl = raw"""
+        enum Shape
+            Dot
+            Round(r: int)
+
+        h8[const K: u8]() -> u8 = K
+        """
+
+    val folded = enm_outcome(decl + raw"""
+
+        const k = u8(Shape.Dot)
+        print(k)
+        """)
+
+    assert(!folded.1, folded.0)
+    assert(folded.0.contains("only a simple enum converts to an integer — Shape carries data"), folded.0)
+
+    val argued = enm_outcome(decl + raw"""
+
+        print(h8[u8(Shape.Dot)]())
+        """)
+
+    assert(!argued.1, argued.0)
+    assert(argued.0.contains("error"), argued.0)
+end eci_payload_refused
+
+@test("an enum-typed 'const' is still refused: a constant is a scalar")
+eci_enum_const_still_refused()
+    if !enm_ready() then return
+
+    val said = enm_outcome(eci_ops() + raw"""
+
+        const X = Op.C
+        print(u8(X))
+        """).0
+
+    assert(said.contains("a constant is a scalar"), said)
+end eci_enum_const_still_refused
+
+// A variant of an enum declared in another module converts as one declared beside it.
+private eci_tree_out(files: Buf[(string, string, string)]) -> string
+    val root = im_write(files)
+    val exe = root + "/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            val said = failure_text(why)
+
+            remove_dir_all(root).unwrap_or(())
+            return said
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end eci_tree_out
+
+@test("a variant of an enum from another module is a constant integer in every position")
+eci_other_module()
+    if !enm_ready() then return
+
+    var fs: Buf[(string, string, string)] = buf()
+
+    fs.push(("lvl", "l.sysl", "module lvl\nenum Lvl: u8\n    Low = 3\n    High = 7\n"))
+    fs.push(("", "main.sysl", raw"""
+        import lvl.Lvl
+
+        h8[const K: u8]() -> u8 = K
+
+        const k = u8(Lvl.High) + 1
+
+        main()
+            var a: [u8(Lvl.Low)]int = [1, 2, 3]
+
+            if const u8(Lvl.High) > u8(Lvl.Low)
+                print(k, h8[u8(Lvl.Low)](), a.len)
+            else
+                print("wrong")
+        """))
+
+    assert_eq(eci_tree_out(fs), "8 3 3\n")
+end eci_other_module

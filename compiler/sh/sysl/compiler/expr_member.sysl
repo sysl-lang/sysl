@@ -902,7 +902,15 @@ private enum_member(cx: &Analyzer, span: Span, key: string, written: string, nam
         return type_member_refusal(cx, span, key, written, name,
                                    s"enum '${qualified_name(key)}' has no variant '$name'")
 
-    val inst = cx.an.tables.enum_insts.get(instance_key(key, buf()))
+    var inst = cx.an.tables.enum_insts.get(instance_key(key, buf()))
+
+    // **An enum that takes no arguments and is not laid out yet** -- its variant named while the
+    // declarations are still being read, `@assert(u8(Op.C) == 2)` beside them or a field's
+    // `[u8(Op.C)]int` -- is laid out now, exactly as naming it as a type there would lay it out.
+    if inst.is_none() && takes_no_arguments(cx, key) then
+        instantiate(cx.an, cx.scope, span, written, key, buf())
+        inst = cx.an.tables.enum_insts.get(instance_key(key, buf()))
+    end if
 
     if inst.is_none() then
         val generic = generic_variant_named(cx, key, name)
@@ -957,6 +965,12 @@ end enum_key_has_variant
 
 // A generic enum's variant of this name, as its first type parameter and whether it carries
 // anything -- what a variant written with no values and no position to settle it is told.
+private takes_no_arguments(cx: &Analyzer, key: string) -> bool = cx.an.tables.types.get(key) match
+    Some(decl) -> decl.kind match
+        EnumOf(ed) -> ed.tparams.is_empty() && ed.tvalues.is_empty()
+        _ -> false
+    None -> false
+
 private generic_variant_named(cx: &Analyzer, key: string, name: string) -> Option[(string, bool)]
     val decl = cx.an.tables.types.get(key)
 

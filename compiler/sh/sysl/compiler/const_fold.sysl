@@ -186,7 +186,7 @@ const_fold(cx: &Analyzer, e: Expr) -> Option[Const] = *e.kind match
         // `T::Annotation[A].is_some()` on a parameter standing for itself waits for the instance.
         if reflects(callee) && awaits_instantiation(cx, callee) then return None
 
-        val converted = const_conversion(cx, e.span, callee, args)
+        val converted = const_conversion(cx, e, callee, args)
 
         if converted.is_some() then return converted
 
@@ -626,7 +626,14 @@ private const_type_attr(cx: &Analyzer, receiver: Expr, attr: string) -> Option[C
 end const_type_attr
 
 // A written conversion to a scalar -- `u8(300)`, `real(3)`, `char(65)` -- over a value that folds.
-private const_conversion(cx: &Analyzer, span: Span, callee: Expr, args: Buf[Expr]) -> Option[Const]
+//
+// A variant converted -- `u8(Op.C)` -- is held by the fold as its position among the variants, not as
+// its discriminant, so the conversion is typed and run whole, as a `const` function's body runs it:
+// that is where the variant becomes the integer it is stored as, at the enum's underlying type, and
+// where a variant that carries data is refused by the conversion's own typing.
+private const_conversion(cx: &Analyzer, e: Expr, callee: Expr, args: Buf[Expr]) -> Option[Const]
+    val span = e.span
+
     if args.len() != 1 then return None
 
     val written = *callee.kind match
@@ -644,6 +651,8 @@ private const_conversion(cx: &Analyzer, span: Span, callee: Expr, args: Buf[Expr
     val value = const_fold(cx, args.at(0))
 
     if value.is_none() then return None
+
+    if is_record(value) then return const_run(cx, e, true)
 
     converted(cx, span, value.unwrap(), target.unwrap())
 end const_conversion
