@@ -142,6 +142,9 @@ stood_in_by(roots: &Buf[(string, Manifest)], dep: &Dependency) -> Option[usize]
         None -> return None
         Some(c) -> c
 
+    // A member is no repository's root, so no checkout's `package.name` says it is that member.
+    if !coordinate_member(coordinate).is_empty() then return None
+
     val repository = repository_name(coordinate)
 
     for i in 0..<roots.len()
@@ -622,7 +625,7 @@ private standing_local(state: &ResolveState, dep: &Dependency) -> Option[ReadPac
         None -> return None
         Some(c) -> c
 
-    if stand_in_for(state, dep).is_some() then return None
+    if stand_in_for(state, dep).is_some() || !coordinate_member(coordinate).is_empty() then return None
 
     val repository = repository_name(coordinate)
 
@@ -722,7 +725,9 @@ private select_versions(state: *ResolveState, cache: string) -> Result[unit, str
         val version = next.unwrap().1
         val dep = plain_dependency(coordinate, Git(coordinate, version), None)
         val got = fetch_ensure(dep, state.sums, cache)?
-        val read = manifest_of_package(got.root)?
+        val read = siblings_fetched(manifest_of_package(got.root)?,
+                                    absolute_path(fetch_directory(cache, coordinate, version)),
+                                    coordinate, version)
         val theirs = if state.everything then read
         else pruned_manifest(read, state.enabled, canonical_prefix(coordinate))
 
@@ -736,6 +741,45 @@ private select_versions(state: *ResolveState, cache: string) -> Result[unit, str
                                          got.root, theirs))
         demanding(state, coordinate, theirs.dependencies)?
 end select_versions
+
+// A fetched package's manifest with every edge to a directory **inside the repository it was fetched
+// from** made an edge to that directory's coordinate at the same version -- a `{ workspace = true }`
+// sibling member, or a `path = "../x"` that stays within the clone. So a member fetched as
+// `member = "pool-workers"` that names its repository's root package gets that root at the tag it was
+// fetched at, sharing the one clone, selected and summed as a package of its own: the sibling a
+// workspace resolves as a directory is, to a consumer, the same repository at the same version. An
+// edge that leaves the repository is left as it was, and refused as every fetched path dependency is.
+private siblings_fetched(m: Manifest, repository_dir: string, coordinate: string,
+                         version: Release) -> Manifest
+    var out = m
+
+    out.dependencies = siblings_in(m.dependencies, repository_dir, coordinate, version)
+    out.dev_dependencies = siblings_in(m.dev_dependencies, repository_dir, coordinate, version)
+    out
+end siblings_fetched
+
+private siblings_in(deps: &Buf[Dependency], repository_dir: string, coordinate: string,
+                    version: Release) -> Buf[Dependency]
+    var out: Buf[Dependency] = buf()
+    val repository = coordinate_repository(coordinate)
+
+    for dep in deps
+        val dir = dependency_dir(dep).unwrap_or("")
+        val inside = !dir.is_empty() &&
+            (dir == repository_dir || dir.starts_with(s"$repository_dir/"))
+
+        if !inside
+            out.push(dep)
+            continue
+        end if
+
+        val member = if dir == repository_dir then ""
+        else dir[(repository_dir.bytes.len + 1)..<dir.bytes.len]
+
+        out.push(dep with { origin = Git(member_coordinate(repository, member), version) })
+
+    out
+end siblings_in
 
 // The lowest coordinate whose selected version has no manifest read for it yet.
 private unread_pair(state: &ResolveState) -> Option[(string, Release)]

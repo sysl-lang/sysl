@@ -34,7 +34,8 @@ struct Asked
     label: string
 end Asked
 
-// Reads `github.com/owner/repo` or `github.com/owner/repo@1.2.3`.
+// Reads `github.com/owner/repo` or `github.com/owner/repo@1.2.3`, and a member of the repository as
+// `github.com/owner/repo//dir`, either way.
 //
 // **A leading `v` on the version is taken and dropped.** A repository's tag is `v1.2.3` and a
 // manifest writes `1.2.3`, so both spellings arrive from people reading the same page, and refusing
@@ -58,9 +59,17 @@ read_add_spec(spec: string) -> Result[Asked, string]
         return Err(s"'$coordinate' is a URL — a coordinate is an identity, so it carries no " +
             s"scheme: ${without_scheme(coordinate)}")
 
-    if slashes_in(coordinate) < 2
+    if slashes_in(coordinate_repository(coordinate)) < 2
         return Err(s"'$coordinate' is not a coordinate — it is a host and a path, as in " +
             "'github.com/sysl-lang/sdl3'")
+
+    // A member of the repository is written after `//`, as the coordinate it reads as is spelled.
+    val member = coordinate_member(coordinate)
+
+    if coordinate.index_of(MemberSeparator).is_some() && !is_member_dir(member)
+        return Err(s"'$coordinate' names the member '$member', which is not a directory below the " +
+            "repository — a member is written after '//', relative to the repository's root, as in " +
+            "'github.com/sysl-lang/sblas//pool-workers'")
 
     if wanted.is_some()
         release_of(wanted.unwrap()) match
@@ -89,9 +98,10 @@ end slashes_in
 //
 // The last segment of the coordinate, with a major-version suffix dropped -- `.../json/v2` is the
 // `json` package at its second major, and naming it `v2` would name the version rather than the
-// package.
+// package. A member is called by the last segment of its directory.
 label_of(coordinate: string) -> string
-    val bare = without_major(coordinate)
+    val member = coordinate_member(coordinate)
+    val bare = if member.is_empty() then without_major(coordinate) else member
     var at = bare.bytes.len
 
     for i in 0..<bare.bytes.len

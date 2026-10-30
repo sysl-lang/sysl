@@ -51,9 +51,17 @@ machine_cache_root() -> Result[string, string] =
             "or vendor the dependencies so that nothing has to be fetched")
         Some(dir) -> Ok(s"$dir/sysl/pkg")
 
-// Where this coordinate at this version sits, fetched or not.
+// Where this coordinate at this version sits, fetched or not: **the repository's clone**, which every
+// member of it at that version shares -- two members of one repository at one tag are one fetch and
+// one cache entry. The member's own directory inside it is `package_directory`.
 fetch_directory(cache: string, coordinate: string, version: Release) -> string =
-    s"$cache/$coordinate/@${release_tag(version)}"
+    s"$cache/${coordinate_repository(coordinate)}/@${release_tag(version)}"
+
+// Where the package a coordinate names sits once its repository is fetched: the clone itself, or the
+// member's directory inside it.
+package_directory(cache: string, coordinate: string, version: Release) -> string =
+    if coordinate_member(coordinate).is_empty() then fetch_directory(cache, coordinate, version)
+    else join_path(fetch_directory(cache, coordinate, version), coordinate_member(coordinate))
 
 // The package's source on disk, cloning it if this machine has not got it, and checked against
 // `sums` either way.
@@ -77,14 +85,40 @@ fetch_ensure(dep: &Dependency, sums: &Sums, cache: string) -> Result[Fetched, st
             if is_directory(dir) then Ok(Fetched(dir, None))
             else Err(s"'${dep.label}' is a workspace dependency that was never found in a workspace")
 
+        // **A member's line in `sysl.sum` pins the whole repository at the tag**, which is what was
+        // fetched and what the hash beside the cache entry covers, so it is checked exactly as the
+        // root package's line is; it is a line of its own because it is a package of its own.
         Git(coordinate, version) ->
             val dir = fetch_directory(cache, coordinate, version)
 
-            if is_directory(dir)
-                Ok(Fetched(dir, verify_cached(dep, coordinate, version, dir, sums)?))
-            else
-                Ok(Fetched(dir, Some(clone_at_tag(dep, coordinate, version, dir, sums)?)))
+            val hash =
+                if is_directory(dir) then verify_cached(dep, coordinate, version, dir, sums)?
+                else Some(clone_at_tag(dep, coordinate, version, dir, sums)?)
+
+            Ok(Fetched(member_root(coordinate, version, dir)?, hash))
 end fetch_ensure
+
+// The directory of the package a coordinate names inside its fetched repository, held to being one:
+// a member that is not there at that version, or is there and holds no manifest, is refused by name.
+private member_root(coordinate: string, version: Release, dir: string) -> Result[string, string]
+    val member = coordinate_member(coordinate)
+
+    if member.is_empty() then return Ok(dir)
+
+    val repository = coordinate_repository(coordinate)
+    val tag = release_tag(version)
+    val root = join_path(dir, member)
+
+    if !is_directory(root)
+        return Err(s"$repository $tag has no member '$member' — there is no directory '$member' in " +
+            "the repository at that version")
+
+    if !has_manifest(root)
+        return Err(s"$repository $tag has a directory '$member' and no $ManifestName in it — a " +
+            "member is a package, and a package is a directory holding one")
+
+    Ok(root)
+end member_root
 
 // A cache entry checked against `sysl.sum`, by way of the hash recorded when it was written.
 //
@@ -128,9 +162,10 @@ private clone_at_tag(dep: &Dependency, coordinate: string, version: Release, dir
     val partial = pending_name(dir)
     val url = clone_url(coordinate)
     val tag = release_tag(version)
+    val repository = coordinate_repository(coordinate)
 
     make_dir_all(parent_of(dir).unwrap_or(".")).unwrap_or(())
-    eprints(s"fetching $coordinate $tag\n")
+    eprints(s"fetching $repository $tag\n")
 
     // `--depth 1` at the tag: a package is read at one version and its history is not part of what
     // is compiled, so fetching the rest of it is bytes nobody asks for. It also keeps the clone out
@@ -138,7 +173,7 @@ private clone_at_tag(dep: &Dependency, coordinate: string, version: Release, dir
     //
     // A pinned commit is fetched by its sha the same way, one commit deep: `clone --branch` takes
     // only a ref, so the repository is begun empty and the one commit asked for by name.
-    val fetched = fetch_tree(coordinate, version, url, partial)
+    val fetched = fetch_tree(repository, version, url, partial)
 
     if fetched.is_err()
         remove_dir_all(partial).unwrap_or(())
@@ -162,7 +197,7 @@ private clone_at_tag(dep: &Dependency, coordinate: string, version: Release, dir
 
     publish_dir(partial, dir) match
         Err(_) ->
-            return Err(s"cannot fetch $coordinate $tag: what was cloned could not be moved into " +
+            return Err(s"cannot fetch $repository $tag: what was cloned could not be moved into " +
                 s"'$dir'")
         Ok(_) -> ()
 
