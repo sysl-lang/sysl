@@ -301,7 +301,7 @@ check_exports_emitted(a: &Analysis, p: TProgram, own: Buf[string])
 
     export_duplicates(a, exported)
     export_names(a, exported, storage_by_symbol(p.vals))
-    export_storage(a, p, exported)
+    export_storage(a, p, archive_ways_in(p, own, exported))
     stored_export_duplicates(a, p, exported)
     exports_answer_externs(a, p)
 end check_exports_emitted
@@ -488,6 +488,11 @@ end stored_export_duplicates
 // A `val` whose initializer is constant data is not looked at, being laid straight into the object
 // file -- the rule C already has for a static-storage initializer. The walk is the reachability one,
 // so the storage may be several calls down and the function that is named is the one exported.
+//
+// **Every way into the archive is held to it, not only an `@export`**: a function a `@section` places
+// or a calling convention marks (an interrupt handler) is a root in its own right
+// (`reference/attributes.md § A placed symbol is kept`), entered by code outside the program exactly as
+// an export is, so it reads the same unfilled storage (`archive_ways_in`).
 private export_storage(a: &Analysis, p: TProgram, exported: Buf[TFunc])
     val t = a.tables.target
 
@@ -496,10 +501,11 @@ private export_storage(a: &Analysis, p: TProgram, exported: Buf[TFunc])
 
     for r in storage_reads(a, p, exported)
         val f = r.way
+        val how = if f.exported.is_some() then "is exported" else "is placed for code outside the program to enter"
 
         if p.c_runtime
             a.fault(func_home(a, f.name), f.span,
-                    s"'${qualified_name(f.name)}' is exported and reaches ${r.named}, which is module " +
+                    s"'${qualified_name(f.name)}' $how and reaches ${r.named}, which is module " +
                     "storage an initializer fills before the program's own statements run. This archive " +
                     s"is a C runtime ('targets.${t.name}.entry'), and '${runtime_init_symbol()}' is what " +
                     "fills it — but nothing here calls it, so the function would read whatever the image " +
@@ -508,7 +514,7 @@ private export_storage(a: &Analysis, p: TProgram, exported: Buf[TFunc])
                     r.stops)
         else
             a.fault(func_home(a, f.name), f.span,
-                    s"'${qualified_name(f.name)}' is exported and reaches ${r.named}, which is module " +
+                    s"'${qualified_name(f.name)}' $how and reaches ${r.named}, which is module " +
                     "storage an initializer fills before the program's own statements run. This artifact " +
                     s"has no entry point to fill it in, and '${t.name}' is freestanding — there is no " +
                     "loader to run a constructor either, so the function would read whatever the image " +
@@ -517,6 +523,20 @@ private export_storage(a: &Analysis, p: TProgram, exported: Buf[TFunc])
                     "file" + r.stops)
     end for
 end export_storage
+
+// The ways into a C archive's sysl code: each export it contributes, then each function placed in a
+// section or marked with a calling convention that is not exported as well.
+private archive_ways_in(p: TProgram, own: Buf[string], exported: Buf[TFunc]) -> Buf[TFunc]
+    var out: Buf[TFunc] = buf()
+
+    for f in exported
+        out.push(f)
+
+    for f in entry_points(p, own)
+        if f.exported.is_none() && (f.section.is_some() || f.conv.is_some()) then out.push(f)
+
+    out
+end archive_ways_in
 
 // One way into a build's sysl code that reaches computed module storage: the function, the storage it
 // reaches as a refusal lists it, and why each piece is not constant data (`stops_text`).
