@@ -294,6 +294,8 @@ end site_of
 // computed again with no foreign function in it. The program's entry is left out: C calls it once,
 // before anything this asks about runs. An `@abandons` function is never in it, either side of the
 // boundary: its caller's frame is given back before the call, and the program goes on afterwards.
+// What needs no trust at all is a call that never returns and is handed only numbers
+// (`sealed_callees`), which is in the set either way.
 //
 // **Trust is a fact about a whole program, so only a program has it.** A library artifact (a
 // `.syslib`, a C archive) cannot know what the program it is linked into exports, so it trusts no
@@ -313,12 +315,78 @@ private quiet_callees(p: TProgram, s: CallSummary) -> Quiet
     for item in p.externs
         if !item.abandons then foreign.add(item.name)
 
+    val sealed = sealed_callees(p)
+
+    for item in sealed
+        foreign.add(item)
+
     val trusting = quiet_fix(p, s, foreign)
 
-    if !p.entry_point || !c_reaches_quiet(p, trusting.names) then return quiet_fix(p, s, set())
+    if !p.entry_point || !c_reaches_quiet(p, trusting.names) then return quiet_fix(p, s, sealed)
 
     trusting
 end quiet_callees
+
+// The functions a path ending the program may call whatever they do, foreign or not: those that never
+// return and are handed nothing but numbers.
+//
+// **What the rest of this guards against is a release under a reader.** A call on a dying path may
+// reach code that gives back the count a borrowed argument rests on -- a foreign function by calling
+// back into the program, a sysl one directly -- and that matters to whatever reads the argument
+// afterwards: the callee itself, through what it was handed, or the body it returns to. One answering
+// `never` returns to nothing, so no frame below it runs again, and one whose parameters are all
+// numbers, booleans and characters was handed nothing a release could pull out from under it. Its own
+// reads are its own body's business, judged where that body is. So nothing that can observe a release
+// it causes ever runs again.
+//
+// **This is what keeps a `Buf` read free of a snapshot in a program that hands C a callback**: the
+// standard library's `index_past` -- the report behind every `at`, `set` and `b[i]` -- takes two
+// counts and answers `never`; the location `@track_caller` adds is a pointer to constant text that the
+// typed signature does not carry. Without it, a program whose callbacks release anything distrusts
+// `sysl_bounds_fail` under `index_past`, and every element read through a pointer takes and gives
+// back a count on the buffer and another on its storage. An `@abandons` function returns into an
+// earlier frame, so it is never one of these.
+sealed_callees(p: TProgram) -> Set[string]
+    var out: Set[string] = set()
+
+    for item in p.externs
+        if !item.abandons && !item.variadic && is_never(item.ret_ty) && all_numbers(item.params) then
+            out.add(item.name)
+
+    for f in p.funcs
+        if !f.marks.abandons && is_never(f.ret_ty) && all_numbers(param_types(f.params)) then
+            out.add(f.name)
+
+    out
+end sealed_callees
+
+private param_types(ps: Buf[(string, Type)]) -> Buf[Type]
+    var out: Buf[Type] = buf()
+
+    for item in ps
+        out.push(item.1)
+
+    out
+end param_types
+
+private is_never(t: Type) -> bool = underlying(t) match
+    Never -> true
+    _ -> false
+
+private all_numbers(ts: Buf[Type]) -> bool
+    for t in ts
+        val plain = underlying(t) match
+            Integer(_, _, _) -> true
+            Floating(_, _) -> true
+            Fixed(_, _, _) -> true
+            Bool -> true
+            Char -> true
+            _ -> false
+
+        if !plain then return false
+
+    true
+end all_numbers
 
 // What `quiet_callees` answers: the functions alive, the parameters each writes through (`through_key`),
 // the index of each name in `p.funcs`, the foreign functions trusted (`also`), and `names` -- the

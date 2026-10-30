@@ -1,0 +1,471 @@
+module sh.sysl.compiler
+@tests
+
+// A type's member named through the type -- `S.same`, `S.pick[int]`, `Box[int].make`, `S.get` -- is a
+// function value wherever a callable is wanted, as Rust's `S::f` is: the capture-free closure whose
+// body is the call as written, and for a method the receiver is the first parameter, taken exactly as
+// the member declares it. Every position a callable is wanted in is tried and run; the refusals are
+// the call's own where the call would refuse, and a receiver the callable gives the wrong form or type
+// is told which one the member takes.
+
+private afv_main(text: string) -> []const (string, string) = [("main.sysl", text)]
+
+private afv_ran(text: string) -> string = xvr_ran(afv_main(text))
+
+private afv_ir(text: string) -> string = xvr_ir(afv_main(text))
+
+// A refusal carries this message, anchored at this `file:line:column` (the gutter widens with the
+// line number, so the arrow is matched on its own).
+private afv_refused(said: string, message: string, at: string) =
+    assert(said.contains(s"error: $message\n") && said.contains(s"--> $at\n"), said)
+
+// The type every program here names its members through.
+private afv_s() -> string = raw"""
+    struct S
+        n: int
+
+    impl S
+        same(x: int) -> int = x
+        half(x: u8) -> u8 = x / 2
+        pick[T](x: T) -> T = x
+        get(self) -> int = self.n
+        bump(*self, by: int) -> int
+            self.n += by
+            self.n
+
+
+    """
+
+// The generic type every program here names its members through.
+private afv_box() -> string = raw"""
+    struct Box[T]
+        v: T
+
+    impl[T] Box[T]
+        make(v: T) -> Box[T] = Box(v)
+        get(*self) -> T = self.v
+
+
+    """
+
+// The import a program holding a buffer begins with.
+private afv_buf() -> string = "import sysl.buf.{Buf, buf}\n\n"
+
+// -- an associated function, in every position a callable is wanted in ---------------------------
+
+@test("a binding typed '&Fn' takes 'S.same'")
+afv_assoc_binding()
+    if xvr_no_library() then return
+
+    assert_eq(afv_ran(afv_s() + raw"""
+        val f: &Fn(int) -> int = S.same
+
+        print(f(41) + 1)
+        """), "42\n")
+end afv_assoc_binding
+
+@test("'S.same' as an argument where the parameter is a '&Fn' and where it is a bare arrow")
+afv_assoc_arguments()
+    if xvr_no_library() then return
+
+    assert_eq(afv_ran(afv_s() + raw"""
+        boxed(f: &Fn(int) -> int, x: int) -> int = f(x) * 2
+        arrow(f: (int) -> int, x: int) -> int = f(x) + 1
+
+        print(boxed(S.same, 7), arrow(S.same, 7))
+        """), "14 8\n")
+end afv_assoc_arguments
+
+@test("'S.same' handed to a generic's callable parameter, which the other argument solves")
+afv_assoc_generic_parameter()
+    if xvr_no_library() then return
+
+    assert_eq(afv_ran(afv_s() + raw"""
+        apply[T](f: &Fn(T) -> T, x: T) -> T = f(x)
+
+        print(apply(S.same, 7))
+        """), "7\n")
+end afv_assoc_generic_parameter
+
+// The literal alone would read as an `int`; the member's own `u8` parameter is what settles `T`.
+@test("the member's stated parameter types solve the generic, as a module function's do")
+afv_assoc_states_the_parameter()
+    if xvr_no_library() then return
+
+    assert_eq(afv_ran(afv_s() + raw"""
+        twice[T](f: &Fn(T) -> T, x: T) -> T = f(f(x))
+
+        print(twice(S.half, 200))
+        """), "50\n")
+end afv_assoc_states_the_parameter
+
+@test("'S.same' as a function's result, a struct field and a buffer element")
+afv_assoc_result_field_buffer()
+    if xvr_no_library() then return
+
+    assert_eq(afv_ran(afv_buf() + afv_s() + raw"""
+        struct Holder
+            f: &Fn(int) -> int
+
+        make() -> &Fn(int) -> int = S.same
+
+        var fs: Buf[&Fn(int) -> int] = buf()
+
+        fs.push(S.same)
+        fs.push(S.same)
+        print(make()(10), Holder(S.same).f(11), fs.len(), fs[0](5) + fs[1](6))
+        """), "10 11 2 11\n")
+end afv_assoc_result_field_buffer
+
+@test("a member with type parameters of its own, named with them: 'S.pick[int]'")
+afv_assoc_own_type_arguments()
+    if xvr_no_library() then return
+
+    assert_eq(afv_ran(afv_s() + raw"""
+        apply(f: &Fn(string) -> string, x: string) -> string = f(x) + "!"
+
+        val p: &Fn(int) -> int = S.pick[int]
+
+        print(p(3), apply(S.pick[string], "hi"))
+        """), "3 hi!\n")
+end afv_assoc_own_type_arguments
+
+@test("a generic type's associated function, at written arguments and at the callable's")
+afv_generic_type_assoc()
+    if xvr_no_library() then return
+
+    assert_eq(afv_ran(afv_box() + raw"""
+        val m: &Fn(int) -> Box[int] = Box[int].make
+        val n: &Fn(string) -> Box[string] = Box.make
+
+        print(m(5).v, n("s").v)
+        """), "5 s\n")
+end afv_generic_type_assoc
+
+@test("an enum's associated function and its method")
+afv_enum_members()
+    if xvr_no_library() then return
+
+    assert_eq(afv_ran(raw"""
+        enum Colour
+            Red
+            Green
+
+        impl Colour
+            of(n: int) -> Colour = if n == 0 then Colour.Red else Colour.Green
+            code(self) -> int = if self == Colour.Red then 1 else 2
+
+        val o: &Fn(int) -> Colour = Colour.of
+        val c: &Fn(Colour) -> int = Colour.code
+
+        print(c(o(0)), c(o(1)))
+        """), "1 2\n")
+end afv_enum_members
+
+@test("an overloaded associated function is the one the callable's parameters choose")
+afv_overload_chosen()
+    if xvr_no_library() then return
+
+    assert_eq(afv_ran(raw"""
+        struct S
+            n: int
+
+        impl S
+            twice(x: int) -> int = x * 2
+            twice(x: string) -> string = x + x
+
+        val a: &Fn(int) -> int = S.twice
+        val b: &Fn(string) -> string = S.twice
+
+        print(a(4), b("ab"))
+        """), "8 abab\n")
+end afv_overload_chosen
+
+@test("'Self.same' inside the type's own member")
+afv_through_self()
+    if xvr_no_library() then return
+
+    assert_eq(afv_ran(raw"""
+        struct S
+            n: int
+
+        impl S
+            same(x: int) -> int = x + 1
+            run(self) -> int
+                val f: &Fn(int) -> int = Self.same
+
+                f(self.n)
+
+        print(S(5).run())
+        """), "6\n")
+end afv_through_self
+
+@test("a type named through its module")
+afv_through_its_module()
+    if xvr_no_library() then return
+
+    assert_eq(xvr_ran([("shapes/shapes.sysl", "module shapes\n\nstruct Sq\n    s: int\n\nimpl Sq\n" +
+                        "    area(s: int) -> int = s * s\n    side(self) -> int = self.s\n"),
+                       ("main.sysl", raw"""
+        import shapes
+
+        val a: &Fn(int) -> int = shapes.Sq.area
+        val s: &Fn(shapes.Sq) -> int = shapes.Sq.side
+
+        print(a(3), s(shapes.Sq(4)))
+        """)]), "9 4\n")
+end afv_through_its_module
+
+// A bound's associated function and method, named through the type parameter in a generic body --
+// Rust's `T::make` -- and each instantiation calls its own type's.
+@test("a type parameter's member, through its bound")
+afv_through_a_type_parameter()
+    if xvr_no_library() then return
+
+    assert_eq(afv_ran(raw"""
+        trait Made
+            make(n: int) -> Self
+            size(self) -> int
+
+        struct A
+            n: int
+
+        struct B
+            n: int
+
+        impl Made for A
+            make(n: int) -> A = A(n)
+            size(self) -> int = self.n
+
+        impl Made for B
+            make(n: int) -> B = B(n * 10)
+            size(self) -> int = self.n + 1
+
+        build[T: Made](n: int) -> int
+            val m: &Fn(int) -> T = T.make
+            val s: &Fn(T) -> int = T.size
+
+            s(m(n))
+        end build
+
+        print(build[A](2), build[B](2))
+        """), "2 21\n")
+end afv_through_a_type_parameter
+
+// -- a method: the receiver is the first parameter -----------------------------------------------
+
+@test("a 'self' method takes the value first")
+afv_method_by_value()
+    if xvr_no_library() then return
+
+    assert_eq(afv_ran(afv_s() + raw"""
+        val g: &Fn(S) -> int = S.get
+
+        print(g(S(3)))
+        """), "3\n")
+end afv_method_by_value
+
+@test("a '*self' method takes the address first, and a call through it writes the value")
+afv_method_by_pointer()
+    if xvr_no_library() then return
+
+    assert_eq(afv_ran(afv_s() + raw"""
+        var s = S(1)
+        val b: &Fn(*S, int) -> int = S.bump
+
+        print(b(&s, 4), b(&s, 2), s.n)
+        """), "5 7 7\n")
+end afv_method_by_pointer
+
+@test("a '&self' method takes the counted reference first")
+afv_method_by_reference()
+    if xvr_no_library() then return
+
+    assert_eq(afv_ran(raw"""
+        struct Node
+            v: int
+
+        impl Node
+            read(&self) -> int = self.v
+
+        val r: &Fn(&Node) -> int = Node.read
+        var nd: &Node = Node(4)
+
+        print(r(nd))
+        """), "4\n")
+end afv_method_by_reference
+
+@test("a generic type's method, its receiver at the instantiation the callable names")
+afv_generic_type_method()
+    if xvr_no_library() then return
+
+    assert_eq(afv_ran(afv_box() + raw"""
+        val g: &Fn(*Box[int]) -> int = Box.get
+        var b = Box(9)
+
+        print(g(&b))
+        """), "9\n")
+end afv_generic_type_method
+
+@test("a method handed to a generic, every position: argument, result, field, buffer")
+afv_method_positions()
+    if xvr_no_library() then return
+
+    assert_eq(afv_ran(afv_buf() + afv_s() + raw"""
+        on[T](f: &Fn(T) -> int, x: T) -> int = f(x)
+
+        struct Holder
+            f: &Fn(S) -> int
+
+        make() -> &Fn(S) -> int = S.get
+
+        var fs: Buf[&Fn(S) -> int] = buf()
+
+        fs.push(S.get)
+        print(on(S.get, S(2)), make()(S(3)), Holder(S.get).f(S(4)), fs[0](S(5)))
+        """), "2 3 4 5\n")
+end afv_method_positions
+
+// -- what stays as it was ------------------------------------------------------------------------
+
+@test("a local of the type's spelling is the value read, not the type")
+afv_a_local_shadows_the_type()
+    if xvr_no_library() then return
+
+    assert_eq(afv_ran(afv_s() + raw"""
+        struct Q
+            same: &Fn(int) -> int
+
+        run()
+            val S = Q(n -> n + 100)
+            val f: &Fn(int) -> int = S.same
+
+            print(f(1))
+        end run
+
+        run()
+        """), "101\n")
+end afv_a_local_shadows_the_type
+
+@test("where nothing wants a callable, 'S.same' is still told to be called")
+afv_nothing_wants_one()
+    if xvr_no_library() then return
+
+    afv_refused(afv_ir(afv_s() + "val d = S.same\n"),
+                "'same' is an associated function of 'S' — call it with 'S.same(…)'", "main.sysl:14:11")
+end afv_nothing_wants_one
+
+@test("a trait's member is still not reached through the trait's name")
+afv_trait_name_refused()
+    if xvr_no_library() then return
+
+    afv_refused(afv_ir(raw"""
+        trait Shape
+            area(self) -> int
+
+        struct Sq
+            s: int
+
+        impl Shape for Sq
+            area(self) -> int = self.s
+
+        val h: &Fn(Sq) -> int = Shape.area
+        """),
+                "'area' is a member of the trait 'Shape' — call it on a value of a type that " +
+                "implements 'Shape', or on a '&Shape'", "main.sysl:10:31")
+end afv_trait_name_refused
+
+// -- the refusals --------------------------------------------------------------------------------
+
+@test("too many parameters are refused as the call's arguments are")
+afv_wrong_arity()
+    if xvr_no_library() then return
+
+    afv_refused(afv_ir(afv_s() + "val a: &Fn(int, int) -> int = S.same\n"),
+                "associated function 'S.same' takes 1 argument, but 2 arguments were given",
+                "main.sysl:14:33")
+end afv_wrong_arity
+
+@test("a parameter type the member contradicts")
+afv_contradicts_the_parameter()
+    if xvr_no_library() then return
+
+    afv_refused(afv_ir(afv_s() + "val b: &Fn(string) -> int = S.same\n"),
+                "'x' of 'S.same' is int, but string was given", "main.sysl:14:31")
+end afv_contradicts_the_parameter
+
+@test("a result type the member contradicts")
+afv_contradicts_the_result()
+    if xvr_no_library() then return
+
+    afv_refused(afv_ir(afv_s() + "val c: &Fn(int) -> string = S.same\n"),
+                "the function 'S.same' should yield string here, but it yields int", "main.sysl:14:31")
+end afv_contradicts_the_result
+
+@test("a method wanted with no parameters has nowhere to take its receiver")
+afv_method_no_parameters()
+    if xvr_no_library() then return
+
+    afv_refused(afv_ir(afv_s() + "val d: &Fn() -> int = S.get\n"),
+                "'S.get' is a method, so as a value its first parameter is the receiver — the " +
+                "callable wanted here takes no parameters", "main.sysl:14:25")
+end afv_method_no_parameters
+
+@test("a '*self' method wanted with the value first")
+afv_pointer_receiver_given_a_value()
+    if xvr_no_library() then return
+
+    afv_refused(afv_ir(afv_s() + "val e: &Fn(S, int) -> int = S.bump\n"),
+                "'S.bump' takes its receiver as '*S', and as a value the receiver is its first " +
+                "parameter — the callable wanted here takes S there", "main.sysl:14:31")
+end afv_pointer_receiver_given_a_value
+
+@test("a 'self' method wanted with an address first")
+afv_value_receiver_given_a_pointer()
+    if xvr_no_library() then return
+
+    afv_refused(afv_ir(afv_s() + "val g: &Fn(*S) -> int = S.get\n"),
+                "'S.get' takes its receiver as 'S', and as a value the receiver is its first " +
+                "parameter — the callable wanted here takes *S there", "main.sysl:14:27")
+end afv_value_receiver_given_a_pointer
+
+// A member private to its file is refused from another as its call is, and is a value in its own.
+@test("a private associated function and method are refused from another file, in the call's words")
+afv_private_from_outside()
+    if xvr_no_library() then return
+
+    val said = xvr_ir([("other/other.sysl", "module other\n\nstruct S\n    n: int\n\nimpl S\n" +
+                         "    private secret(x: int) -> int = x\n" +
+                         "    private hidden(self) -> int = self.n\n\n" +
+                         "val inside: &Fn(int) -> int = S.secret\n"),
+                        ("main.sysl", raw"""
+        import other.{S}
+
+        val f: &Fn(int) -> int = S.secret
+        val g: &Fn(S) -> int = S.hidden
+        """)])
+
+    afv_refused(said, "associated function 'secret' of 'other.S' is private to 'other/other.sysl', " +
+                "the file that declares it", "main.sysl:3:28")
+    afv_refused(said, "method 'hidden' of 'other.S' is private to 'other/other.sysl', the file that " +
+                "declares it", "main.sysl:4:26")
+    assert(!said.contains("other.sysl:10"), said)
+end afv_private_from_outside
+
+// `T` has a `get` of its own, which a body calling `a0.get()` would have reached silently.
+@test("a first parameter of another type is no receiver, even where that type has the member")
+afv_receiver_of_another_type()
+    if xvr_no_library() then return
+
+    afv_refused(afv_ir(afv_s() + raw"""
+        struct T
+            n: int
+
+        impl T
+            get(self) -> int = self.n
+
+        val f: &Fn(T) -> int = S.get
+        """),
+                "'S.get' takes its receiver as 'S', and as a value the receiver is its first " +
+                "parameter — the callable wanted here takes T there", "main.sysl:20:26")
+end afv_receiver_of_another_type

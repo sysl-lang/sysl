@@ -18,7 +18,9 @@ import sysl.process.{Status, capture}
 // `putbytes`'s write, `exit`, `sysl_bounds_fail`, the trap -- and only while no sysl function C can
 // reach releases anything; otherwise foreign calls on those paths are untrusted too. A write through a
 // view parameter on such a path is judged at the call: `print`'s `printi` hands `digits_long` a view
-// of its own array, which is a write to storage the caller owns.
+// of its own array, which is a write to storage the caller owns. A call that answers `never` and is
+// handed only numbers -- `exit`, `trap`, `index_past` -- needs no trust at all: nothing that could read
+// what a callback freed runs after it (`sealed_callees`).
 //
 // The axes: how the path ends (`exit`, `trap`, `panic`, a user function every path of which diverges,
 // one that diverges on some paths); what the path does first (releases, or only prints); where it
@@ -282,16 +284,19 @@ dvp_defer_on_the_path()
             t.id
         """)
 
+private dvp_releasing_export() -> string = raw"""
+
+    @export("dvp_reset")
+    reset()
+        G = Holder(Tag(3))
+    """
+
 @test("an exported function that releases, which C may call back, makes every foreign call untrusted")
 dvp_releasing_export_untrusts_foreign()
-    val callee = "peek(t: &Tag) -> int\n    if t.id < 0 then exit(1)\n\n    t.id\n"
+    // `panic` hands `putbytes` a view of its message, so a callback during the write could matter.
+    val callee = "peek(t: &Tag) -> int\n    if t.id < 0 then panic(\"negative\")\n\n    t.id\n"
 
-    dvp_not_inert(callee + raw"""
-
-        @export("dvp_reset")
-        reset()
-            G = Holder(Tag(3))
-        """)
+    dvp_not_inert(callee + dvp_releasing_export())
     // One that only reads is no reason to distrust anything.
     dvp_inert(callee + raw"""
 
@@ -299,15 +304,67 @@ dvp_releasing_export_untrusts_foreign()
         look() -> int = 1
         """)
 
+@test("a never-returning call handed only numbers stays trusted beside an export that releases")
+dvp_sealed_calls_survive_distrust()
+    // `exit` and `trap` answer `never` and take nothing but numbers: a callback during either can free
+    // the tag, and nothing that could read it ever runs again (`borrowing.sysl`'s `sealed_callees`).
+    dvp_inert("peek(t: &Tag) -> int\n    if t.id < 0 then exit(1)\n\n    t.id\n" + dvp_releasing_export())
+    dvp_inert("peek(t: &Tag) -> int\n    if t.id < 0 then trap()\n\n    t.id\n" + dvp_releasing_export())
+    // A sysl function of that shape is sealed too, whatever its body does -- here it releases the
+    // very tag the caller was lent, which the ASan run below shows is never read again.
+    dvp_inert(dvp_stop() + "peek(t: &Tag) -> int\n    if t.id < 0 then stop(1)\n\n    t.id\n")
+    // Handed the tag itself, it is not: `die` reads what it released.
+    dvp_not_inert("peek(t: &Tag) -> int\n    if t.id < 0 then die(t)\n\n    t.id\n" + dvp_releasing_export())
+    // Nor is one that answers: the body it returns to may read the tag.
+    dvp_not_inert(raw"""
+        settle(code: int) -> int
+            G = Holder(Tag(7))
+            code
+
+        peek(t: &Tag) -> int
+            if t.id < 0 then exit(settle(1))
+
+            t.id
+        """)
+    // Nor one taking a pointer, even to a number: what it points at may be what a callback frees.
+    dvp_not_inert(raw"""
+        halt(code: *int) -> never
+            G = Holder(Tag(7))
+            exit(*code)
+
+        peek(t: &Tag) -> int
+            var c = 1
+
+            if t.id < 0 then halt(&c)
+
+            t.id
+        """)
+
+// A never-returning function handed only a number, which frees the tag a caller may have been lent.
+private dvp_stop() -> string = raw"""
+    stop(code: int) -> never
+        G = Holder(Tag(7))
+        print("stopping", code)
+        exit(code)
+
+    """
+
 @test("a library artifact cannot know what its program exports, so it trusts no foreign call")
 dvp_library_artifact_trusts_nothing()
-    val text = dvp_program("peek(t: &Tag) -> int\n    if t.id < 0 then exit(1)\n\n    t.id\n")
+    val text = dvp_program("peek(t: &Tag) -> int\n    if t.id < 0 then panic(\"negative\")\n\n    t.id\n")
     val ir = dvp_lowered_as(text, "lend", false)
 
     if ir == "skipped" then return
 
     assert(ir.starts_with("define"), ir)
     assert_eq(int(ir.count_of("@arc.retain(")) + int(ir.count_of("@arc.release(")), 2, ir)
+
+    // A never-returning call handed only numbers needs no trust, so a library lends past it too.
+    val sealed = dvp_lowered_as(dvp_program("peek(t: &Tag) -> int\n    if t.id < 0 then exit(1)\n\n    t.id\n"),
+                                "lend", false)
+
+    assert(sealed.starts_with("define"), sealed)
+    assert_eq(int(sealed.count_of("@arc.retain(")) + int(sealed.count_of("@arc.release(")), 0, sealed)
 
 // -- `Buf.at`, `unwrap`, `Map.get`: the shapes the rule was written for -------------------------------
 
@@ -387,21 +444,26 @@ dvp_unwrap_and_at_are_inert()
     assert(second.contains("-zero("), second)
     assert_eq(dvp_count_ops(second), 0, second)
 
-@test("a sysl_bounds_fail override that releases makes indexing non-inert; one that does not leaves it")
-dvp_bounds_fail_override()
-    val releasing = dvp_container_program(raw"""
-        var Spare: Option[&Leaf] = None
+private dvp_releasing_report() -> string = raw"""
+    var Spare: Option[&Leaf] = None
 
-        @export("sysl_bounds_fail")
-        report(kind: u32, a: usize, b: usize, n: usize, at: *u8)
-            Spare = None
-        """)
-    val second = dvp_lowered(releasing, "second")
+    @export("sysl_bounds_fail")
+    report(kind: u32, a: usize, b: usize, n: usize, at: *u8)
+        Spare = None
+        B = buf()
+    """
+
+@test("a sysl_bounds_fail override leaves indexing inert, releasing or not: index_past never comes back")
+dvp_bounds_fail_override()
+    // The override is reached only through `index_past`, which answers `never` and is handed two
+    // counts, so what the override releases is never read by anything that runs afterwards -- not
+    // `Buf.at`, not `second`. The ASan run below frees the very buffer being indexed.
+    val second = dvp_lowered(dvp_container_program(dvp_releasing_report()), "second")
 
     if second == "skipped" then return
 
     assert(second.starts_with("define"), second)
-    assert(dvp_count_ops(second) > 1, second)
+    assert_eq(dvp_count_ops(second), 0, second)
 
     val quiet = dvp_container_program(raw"""
         @export("sysl_bounds_fail")
@@ -517,6 +579,33 @@ dvp_async_clean_under_asan()
     assert(run.hooks > 1, s"the binary calls ${run.hooks} ASan report hooks, so it is not instrumented")
     assert_eq(run.out, "drop 0\nstill reading -1\n")
     assert_eq(run.code, 1, run.err)
+    assert(!run.err.contains("AddressSanitizer"), run.err)
+
+@test("a sealed function that frees the tag its caller was lent reads nothing freed under ASan")
+dvp_sealed_stop_clean_under_asan()
+    if !dvp_runnable() then return
+
+    val program = dvp_program_with(dvp_stop() + "peek(t: &Tag) -> int\n    if t.id < 0 then stop(1)\n\n    t.id\n",
+                                   "-1", "print(lend())", dvp_releasing_export())
+    val run = dvp_run(program, false, "-fsanitize=address -g")
+
+    assert(run.hooks > 1, s"the binary calls ${run.hooks} ASan report hooks, so it is not instrumented")
+    assert_eq(run.out, "drop 0\ndrop -1\nstopping 1\n")
+    assert_eq(run.code, 1, run.err)
+    assert(!run.err.contains("AddressSanitizer"), run.err)
+
+@test("an override of sysl_bounds_fail that frees the buffer being indexed reads nothing freed under ASan")
+dvp_releasing_report_clean_under_asan()
+    if !dvp_runnable() then return
+
+    val program = dvp_containers("", dvp_releasing_report() + "\npast() -> int = B.at(7).v\n",
+                                 "    print(past())\n")
+    val run = dvp_run(program, false, "-fsanitize=address -g")
+
+    assert(run.hooks > 1, s"the binary calls ${run.hooks} ASan report hooks, so it is not instrumented")
+    // `walk` and `second` print, then `past` reports through the override and traps.
+    assert_eq(run.out, "2 2\n")
+    assert_eq(run.code, -2, run.err)
     assert(!run.err.contains("AddressSanitizer"), run.err)
 
 private dvp_drops_program() -> string =

@@ -1397,9 +1397,15 @@ end settle_image_link
 // `lto` key is how the project's OWN link is done, and `build-c` does no link: the archive is for a C
 // project whose linker may be GNU ld, which refuses bitcode as "file format not recognized". So a
 // host linking with clang and lld opts in with `--lto`, and is told how the archive must be linked.
+//
+// **`ll_at` is where the LLVM text is written as well**, the very text the members are compiled from.
+// `emit-llvm` cannot show it: that command reads a headerless file as a program's entry body, and
+// `build-c` reads it as an archive's module, so a file one accepts the other may refuse. The text is
+// written before clang runs, so a lowering clang rejects can still be read.
 build_c_archive(path: string, named_target: Option[string], cc: Option[string], level: string,
                 out: Option[string], header_at: Option[string],
-                say: string -> unit, lto: Option[string] = None) -> Result[(string, string), Failure]
+                say: string -> unit, lto: Option[string] = None,
+                ll_at: Option[string] = None) -> Result[(string, string), Failure]
     val t = target_for(path, named_target).map_err(said)?
 
     if !t.builds_with_clang() then return Err(Said(Refusal(t.no_toolchain())))
@@ -1428,6 +1434,22 @@ build_c_archive(path: string, named_target: Option[string], cc: Option[string], 
     val clang = find_clang(t, cc) match
         Err(why) -> return Err(Said(Refusal(why)))
         Ok(found) -> found
+
+    // The module as `compile_object` hands it to this clang: marked for the target, in the clang's
+    // coroutine dialect, with its data layout. A build in codegen units hands clang the same text cut
+    // into parts.
+    ll_at match
+        Some(ll) ->
+            directory_refusal(parent_of(ll).unwrap_or(".")) match
+                Some(why) -> return Err(Said(Refusal(why)))
+                None -> ()
+
+            val text = laid_out(clang, t, in_coro_dialect(clang, for_clang(lowered.emitted.text, t)))
+
+            write_text(ll, text) match
+                Err(e) -> return Err(Said(Refusal(io_refusal(ll, e))))
+                Ok(_) -> say(s"wrote $ll")
+        None -> ()
 
     val probed = supplied_or_refused(path, t).map_err(said)?
 
