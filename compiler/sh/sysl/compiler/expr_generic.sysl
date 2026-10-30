@@ -499,9 +499,11 @@ generic_call_with(cx: &Analyzer, span: Span, written: string, key: string, f: Fu
     for param in decl.params
         param_refs.push(param.typ)
 
+    val screened = shape_screen(cx.an, decl.params, slots, prov.tys)
     val covered = enter_signature(cx.an, decl.needs)
-    val targs = solve(cx.an, f.scope, cx.scope, span, key, decl.tparams, param_refs, prov.tys, decl.ret_type,
-                      prov.expected, prov.soft, decl.bounds, known, left_to_default(slots), payload)
+    val targs = solve(cx.an, f.scope, cx.scope, span, key, decl.tparams, param_refs, screened.0,
+                      decl.ret_type, prov.expected, prov.soft, decl.bounds, known, left_to_default(slots),
+                      payload)
 
     leave_reaching(cx.an, covered)
 
@@ -517,6 +519,10 @@ generic_call_with(cx: &Analyzer, span: Span, written: string, key: string, f: Fu
     // inside the declaration, about a line the reader did not write.
     for targ in targs
         if targ == Unknown
+            if screened.1.is_some() then
+                return voice_shape_clash(cx, s"'$written'", decl.params, slots, prov.tys,
+                                         screened.1.unwrap())
+
             voice_unknown_args(cx, slots, prov)
             return bad_expr(span)
         end if
@@ -775,6 +781,74 @@ voice_unknown_args(cx: &Analyzer, slots: Buf[Option[Expr]], prov: Provisional)
             return
         end if
 end voice_unknown_args
+
+// **An argument whose shape no type argument could make fit says so, rather than leaving the solve to
+// say it found nothing.** `g[T](p: *T)` called as `g(5)` is a call whose `5` cannot become a pointer
+// whatever `T` is, so "cannot infer the type argument" would send the reader to annotate a type that
+// was never the problem. The argument is withheld from the solve -- as an unknown, which already
+// keeps the solve from complaining about what it then cannot settle -- and where a type argument is
+// left unsettled because of it, the mismatch is what the call is told, at the argument, in the words
+// a non-generic parameter's mismatch uses. Where another argument settles the parameter after all,
+// nothing here speaks: the instantiated signature names both types, which is the better message.
+//
+// The answer is the types the solve is to read, and the first argument that cannot fit.
+shape_screen(a: &Analysis, params: Buf[Param], slots: Buf[Option[Expr]],
+             tys: Buf[Type]) -> (Buf[Type], Option[usize])
+    var out: Buf[Type] = buf()
+    var first: Option[usize] = None
+
+    for i in 0..<tys.len()
+        if i < params.len() && i < slots.len() && slots.at(i).is_some() &&
+           shape_refuses(a, params.at(i).typ, tys.at(i))
+            if first.is_none() then first = Some(i)
+
+            out.push(Unknown)
+        else out.push(tys.at(i))
+
+    (out, first)
+end shape_screen
+
+// The refusal `shape_screen` found, quoted with the parameter as its declaration wrote it: the type
+// arguments it names are exactly what the call could not settle.
+voice_shape_clash(cx: &Analyzer, quoted: string, params: Buf[Param], slots: Buf[Option[Expr]],
+                  tys: Buf[Type], i: usize) -> TExpr =
+    cx.err(slots.at(i).unwrap().span, s"'${params.at(i).name}' of ${unslotted_quote(quoted)} is " +
+           s"${type_text(params.at(i).typ)}, but ${type_show(tys.at(i))} was given")
+
+// Whether a value of type `actual` can stand at a parameter written `want` under no type arguments at
+// all: a pointer parameter handed anything but a pointer, an array or slice parameter handed anything
+// but an array (or, for a slice, a slice; for an array, a string), a callable reference handed
+// something with no call. Only
+// these outer shapes are asked; whatever is inside them is the solve's to match and the
+// instantiation's to refuse. A type still being worked out, a type parameter's own placeholder and
+// `never` (which stands anywhere) are never refused here.
+private shape_refuses(a: &Analysis, want: TypeRef, actual: Type) -> bool
+    val t = nameless(unqualified(actual))
+
+    if t == Never || mentions_unknown(t) then return false
+
+    t match
+        Abstract(_, _) -> return false
+        _ -> ()
+
+    *want.kind match
+        PtrType(_) -> t match
+            Ptr(_) -> false
+            _ -> true
+        // A string literal stands wherever a `[N]u8` is asked for, so at an array parameter a string
+        // is a call whose element only the reader can name -- which is what "cannot infer" says.
+        ArrayType(length, _, _) -> t match
+            Array(_, _) -> false
+            Slice(_, _) -> length.is_some()
+            Str -> length.is_none()
+            _ -> true
+        RefType(inner, _) -> *inner.kind match
+            FnType(_, _, _) -> t match
+                CFn(_, _) -> false
+                _ -> callable_of(a, t).is_none()
+            _ -> false
+        _ -> false
+end shape_refuses
 
 // A written-out array where a view of it was asked for, which is the one conversion the analysis
 // performs rather than one the position repairs afterwards.
