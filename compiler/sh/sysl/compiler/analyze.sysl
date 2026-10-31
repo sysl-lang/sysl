@@ -624,6 +624,43 @@ answering_imports(a: &Analysis, scope: Scope, name: string, has: &Fn(string) -> 
     scope.imports
 end answering_imports
 
+// **How near a written name's answer is, as one number**, so answers found in different tables can be
+// compared: the reader's own module is 0, a name imported by name 1, a wildcard's offer 2, and each
+// block of imports further out than the innermost adds 2. The tables a name may live in (constants,
+// storage, functions, variants) are read one at a time, and an answer is only the nearest one when no
+// other table has a smaller number -- a wildcard's `const` is farther than the file's own `val`.
+// `NoAnswer` is larger than any real rank.
+const OwnModuleRank: int = 0
+const NoAnswer: int = 1000
+
+// The rank of a name an import answers: imported by name, or offered by a wildcard of the innermost
+// level that answers, `has` being the table the use asks. `NoAnswer` where no import does.
+import_rank(a: &Analysis, scope: Scope, name: string, has: &Fn(string) -> bool) -> int
+    if scope.imports.levels.is_empty()
+        if scope.imports.name_key(name).is_some() && has(scope.imports.name_key(name).unwrap())
+            return 1
+
+        for item in scope.imports.wildcards
+            if has(module_qualify(item, name)) && reachable_key(a, module_qualify(item, name), scope)
+                return 2
+
+        return NoAnswer
+    end if
+
+    for i in 0..<scope.imports.depth()
+        val im = scope.imports.level(i)
+        val bound = im.name_key(name)
+
+        if bound.is_some() && has(bound.unwrap()) then return 1 + 2 * int(i)
+
+        for item in im.wildcards
+            val key = module_qualify(item, name)
+
+            if has(key) && reachable_key(a, key, scope) then return 2 + 2 * int(i)
+
+    NoAnswer
+end import_rank
+
 // What an ambiguous wildcard offer is refused with, naming each wildcard it came through.
 ambiguous_offer(name: string, keys: Buf[string]) -> string
     var from = ""

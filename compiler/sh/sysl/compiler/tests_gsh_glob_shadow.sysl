@@ -1,0 +1,277 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// **The module's own declaration beats a wildcard's offer of the same spelling, whatever KIND each
+// one is** (`reference/modules.md § Resolution`: the three steps rank a name by where it was written,
+// not by what kind of thing it is).
+//
+// A name's constants, module storage, functions and types are looked up in separate tables, and a
+// table that held only the wildcard's offer used to answer before the table that held the file's own
+// declaration was asked: a glob-imported `const BLACK` beat the importing file's `private val BLACK`.
+//
+// Every cell hands a program of several files to the build and compares what it prints, or the exact
+// refusal it is given.
+
+private gsh_ran(files: []const (string, string)) -> string
+    val root = make_temp_dir("sysl-gsh").unwrap()
+
+    for i in 0..<files.len
+        val at = s"$root/${files[i].0}"
+
+        make_dir_all(parent_of(at).unwrap()).unwrap()
+        write_text(at, files[i].1).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end gsh_ran
+
+// What the wildcard's module offers under the name `X`, one declaration of each kind.
+private val gsh_pal_const = "module sh.pal\nconst X: u32 = 100\n"
+private val gsh_pal_val = "module sh.pal\nval X: (u8, u8) = (5, 6)\n"
+private val gsh_pal_fn = "module sh.pal\nX() -> string = \"glob\"\n"
+private val gsh_pal_type = "module sh.pal\nstruct X\n    s: string\n"
+
+// A program that imports `sh.pal.*`, declares `decl` itself and then runs `body`.
+private gsh_cell(pal: string, decl: string, body: string) -> string =
+    gsh_ran([("sh/pal/pal.sysl", pal),
+             ("main.sysl", s"import sh.pal.*\n$decl\n$body\n")])
+
+// -- the reported case ---------------------------------------------------------------------------
+
+@test("a private val beats a glob-imported const of its spelling")
+gsh_private_val_beats_const()
+    assert_eq(gsh_cell(gsh_pal_const, "private val X: (u8, u8) = (1, 2)",
+                       "val t: (u8, u8) = X\nprint(t.0)"), "1\n")
+
+@test("a private val beats a glob-imported val")
+gsh_private_val_beats_val()
+    assert_eq(gsh_cell(gsh_pal_val, "private val X: int = 1", "print(X)"), "1\n")
+
+@test("a private val beats a glob-imported function")
+gsh_private_val_beats_fn()
+    assert_eq(gsh_cell(gsh_pal_fn, "private val X: int = 1", "print(X)"), "1\n")
+
+@test("a private val beats a glob-imported type")
+gsh_private_val_beats_type()
+    assert_eq(gsh_cell(gsh_pal_type, "private val X: int = 1", "print(X)"), "1\n")
+
+// -- a public val -------------------------------------------------------------------------------
+
+@test("a public val beats a glob-imported const")
+gsh_val_beats_const()
+    assert_eq(gsh_cell(gsh_pal_const, "val X: int = 1", "print(X)"), "1\n")
+
+@test("a public val beats a glob-imported function")
+gsh_val_beats_fn()
+    assert_eq(gsh_cell(gsh_pal_fn, "val X: int = 1", "print(X)"), "1\n")
+
+// -- an own const -------------------------------------------------------------------------------
+
+@test("an own const beats a glob-imported val")
+gsh_const_beats_val()
+    assert_eq(gsh_cell(gsh_pal_val, "const X: int = 1", "print(X)"), "1\n")
+
+@test("an own const beats a glob-imported const")
+gsh_const_beats_const()
+    assert_eq(gsh_cell(gsh_pal_const, "const X: int = 1", "print(X)"), "1\n")
+
+@test("an own private const beats a glob-imported function")
+gsh_const_beats_fn()
+    assert_eq(gsh_cell(gsh_pal_fn, "private const X: int = 1", "print(X)"), "1\n")
+
+// -- an own var ---------------------------------------------------------------------------------
+
+@test("an own var beats a glob-imported const, and can be written")
+gsh_var_beats_const()
+    assert_eq(gsh_cell(gsh_pal_const, "var X: int = 1", "X += 1\nprint(X)"), "2\n")
+
+@test("an own var beats a glob-imported val")
+gsh_var_beats_val()
+    assert_eq(gsh_cell(gsh_pal_val, "var X: int = 1", "print(X)"), "1\n")
+
+@test("an own var beats a glob-imported function")
+gsh_var_beats_fn()
+    assert_eq(gsh_cell(gsh_pal_fn, "var X: int = 1", "print(X)"), "1\n")
+
+// -- an own function ----------------------------------------------------------------------------
+
+@test("an own function beats a glob-imported const")
+gsh_fn_beats_const()
+    assert_eq(gsh_cell(gsh_pal_const, "X() -> int = 1", "print(X())"), "1\n")
+
+@test("an own function beats a glob-imported val")
+gsh_fn_beats_val()
+    assert_eq(gsh_cell(gsh_pal_val, "X() -> int = 1", "print(X())"), "1\n")
+
+@test("an own function beats a glob-imported function of the same shape")
+gsh_fn_beats_fn()
+    assert_eq(gsh_cell(gsh_pal_fn, "X() -> int = 1", "print(X())"), "1\n")
+
+@test("an own private function beats a glob-imported const")
+gsh_private_fn_beats_const()
+    assert_eq(gsh_cell(gsh_pal_const, "private X() -> int = 1", "print(X())"), "1\n")
+
+@test("an own function passed as a value beats a glob-imported const")
+gsh_fn_value_beats_const()
+    assert_eq(gsh_cell(gsh_pal_const, "X() -> int = 1\napply(f: () -> int) -> int = f()",
+                       "print(apply(X))"), "1\n")
+
+// -- an own type --------------------------------------------------------------------------------
+
+@test("an own type beats a glob-imported const")
+gsh_type_beats_const()
+    assert_eq(gsh_cell(gsh_pal_const, "struct X\n    n: int", "print(X(1).n)"), "1\n")
+
+@test("an own type beats a glob-imported val")
+gsh_type_beats_val()
+    assert_eq(gsh_cell(gsh_pal_val, "struct X\n    n: int", "print(X(1).n)"), "1\n")
+
+@test("an own type beats a glob-imported type")
+gsh_type_beats_type()
+    assert_eq(gsh_cell(gsh_pal_type, "struct X\n    n: int", "val v: X = X(1)\nprint(v.n)"), "1\n")
+
+@test("an own type in a type position beats a glob-imported function")
+gsh_type_beats_fn()
+    assert_eq(gsh_cell(gsh_pal_fn, "struct X\n    n: int", "val v: X = X(1)\nprint(v.n)"), "1\n")
+
+// -- positions ----------------------------------------------------------------------------------
+
+@test("an own const sizes an array where a glob-imported one of the spelling does not")
+gsh_const_array_length()
+    assert_eq(gsh_cell(gsh_pal_const, "const X: int = 3", "val a: [X]u8 = [0; X]\nprint(a.len)"), "3\n")
+
+@test("an own const in a match pattern beats a glob-imported one")
+gsh_const_pattern()
+    assert_eq(gsh_cell(gsh_pal_const, "const X: u32 = 1",
+                       "val n: u32 = 1\nn match\n    X -> print(\"own\")\n    _ -> print(\"other\")"),
+              "own\n")
+
+@test("an own const in an 'if const' beats a glob-imported one")
+gsh_const_if_const()
+    assert_eq(gsh_cell(gsh_pal_const, "const X: bool = true",
+                       "if const X\n    print(\"own\")\nelse\n    print(\"glob\")"), "own\n")
+
+@test("an own const is what a default argument reads")
+gsh_default_argument()
+    assert_eq(gsh_cell(gsh_pal_const, "private const X: int = 1\nf(a: int = X) -> int = a",
+                       "print(f())"), "1\n")
+
+@test("an own private val is what a nested function reads")
+gsh_nested_function()
+    assert_eq(gsh_cell(gsh_pal_const, "private val X: int = 1",
+                       "inner() -> int = X\nprint(inner())"), "1\n")
+
+@test("an own private val is what a closure reads")
+gsh_closure()
+    assert_eq(gsh_cell(gsh_pal_const, "private val X: int = 1",
+                       "val f = () -> X\nprint(f())"), "1\n")
+
+@test("an own private val is what a function body reads")
+gsh_function_body()
+    assert_eq(gsh_cell(gsh_pal_const, "private val X: int = 1\nreads() -> int = X",
+                       "print(reads())"), "1\n")
+
+@test("a local val shadows both the own declaration and the wildcard's")
+gsh_local_shadows_both()
+    assert_eq(gsh_cell(gsh_pal_const, "private val X: int = 1", "val X: int = 7\nprint(X)"), "7\n")
+
+// -- another file of the same module -------------------------------------------------------------
+
+@test("a module-wide declaration in a sibling file beats a glob import")
+gsh_module_wide_sibling()
+    assert_eq(gsh_ran([("sh/pal/pal.sysl", gsh_pal_const),
+                       ("app/one.sysl", "module app\nimport sh.pal.*\nreads() -> int = X\n"),
+                       ("app/two.sysl", "module app\nprivate[app] val X: int = 1\n"),
+                       ("main.sysl", "print(app.reads())\n")]),
+              "1\n")
+
+@test("a public sibling val beats a glob import")
+gsh_public_sibling()
+    assert_eq(gsh_ran([("sh/pal/pal.sysl", gsh_pal_const),
+                       ("app/one.sysl", "module app\nimport sh.pal.*\nreads() -> int = X\n"),
+                       ("app/two.sysl", "module app\nval X: int = 1\n"),
+                       ("main.sysl", "print(app.reads())\n")]),
+              "1\n")
+
+// -- what stays refused --------------------------------------------------------------------------
+
+@test("two wildcards offering one const are still ambiguous")
+gsh_two_wildcards_ambiguous()
+    val said = gsh_ran([("sh/pal/pal.sysl", gsh_pal_const),
+                        ("sh/other/other.sysl", "module sh.other\nconst X: u32 = 200\n"),
+                        ("main.sysl", "import sh.pal.*\nimport sh.other.*\nprint(X)\n")])
+
+    assert(said.contains("X"))
+    assert(said.contains("sh.pal"))
+    assert(said.contains("sh.other"))
+
+@test("a const and a val offered by two wildcards are still not rivals: the const answers")
+gsh_two_wildcards_mixed_kinds()
+    assert_eq(gsh_ran([("sh/pal/pal.sysl", gsh_pal_const),
+                       ("sh/other/other.sysl", "module sh.other\nval X: int = 2\n"),
+                       ("main.sysl", "import sh.pal.*\nimport sh.other.*\nprint(X)\n")]),
+              "100\n")
+
+@test("an own declaration settles what two wildcards both offer")
+gsh_own_settles_two_wildcards()
+    assert_eq(gsh_ran([("sh/pal/pal.sysl", gsh_pal_const),
+                       ("sh/other/other.sysl", "module sh.other\nconst X: u32 = 200\n"),
+                       ("main.sysl", "import sh.pal.*\nimport sh.other.*\nprivate val X: int = 1\nprint(X)\n")]),
+              "1\n")
+
+@test("a name imported by name still beats a wildcard of another kind")
+gsh_selective_beats_wildcard()
+    assert_eq(gsh_ran([("sh/pal/pal.sysl", gsh_pal_const),
+                       ("sh/other/other.sysl", "module sh.other\nval X: int = 2\n"),
+                       ("main.sysl", "import sh.pal.*\nimport sh.other.{X}\nprint(X)\n")]),
+              "2\n")
+
+@test("a name imported by name beats a wildcard offering a const when it is a function")
+gsh_selective_function_beats_wildcard_const()
+    assert_eq(gsh_ran([("sh/pal/pal.sysl", gsh_pal_const),
+                       ("sh/other/other.sysl", "module sh.other\nX() -> int = 2\n"),
+                       ("main.sysl", "import sh.pal.*\nimport sh.other.{X}\nprint(X())\n")]),
+              "2\n")
+
+@test("a selective import of a name the file's own module declares is refused at the import")
+gsh_selective_against_own()
+    val said = gsh_ran([("sh/pal/pal.sysl", gsh_pal_const),
+                        ("app/a.sysl", "module app\nimport sh.pal.{X}\nprivate val X: int = 1\nreads() -> int = X\n"),
+                        ("main.sysl", "print(app.reads())\n")])
+
+    assert(said.contains("'X' is declared by this module as 'app.X', so importing 'sh.pal.X' under " +
+                         "that name would mean two things"))
+    assert(said.contains("a.sysl:2:16"))
+
+@test("the same refusal for an own const")
+gsh_selective_against_own_const()
+    val said = gsh_ran([("sh/pal/pal.sysl", gsh_pal_val),
+                        ("app/a.sysl", "module app\nimport sh.pal.{X}\nconst X: int = 1\nreads() -> int = X\n"),
+                        ("main.sysl", "print(app.reads())\n")])
+
+    assert(said.contains("'X' is declared by this module as 'app.X', so importing 'sh.pal.X' under " +
+                         "that name would mean two things"))
+
+@test("the refusal at the import is the only one: the own declaration still answers the use")
+gsh_selective_against_own_is_one_error()
+    val said = gsh_ran([("sh/pal/pal.sysl", gsh_pal_const),
+                        ("app/a.sysl", "module app\nimport sh.pal.{X}\nprivate val X: int = 1\nreads() -> int = X\n"),
+                        ("main.sysl", "print(app.reads())\n")])
+
+    assert(!said.contains("should return int"))

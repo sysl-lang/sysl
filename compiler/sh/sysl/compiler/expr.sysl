@@ -603,7 +603,7 @@ name_expr(cx: &Analyzer, span: Span, name: string, expected: Option[Type]) -> TE
         return const_expr(cx, span, ck.unwrap())
     end if
 
-    val c_rivals = ambiguous_value(cx, span, a_consts(cx), name)
+    val c_rivals = ambiguous_storage(cx, span, a_consts(cx), name)
 
     if c_rivals.is_some() then return c_rivals.unwrap()
 
@@ -618,7 +618,7 @@ name_expr(cx: &Analyzer, span: Span, name: string, expected: Option[Type]) -> TE
         return global_expr(cx, span, vk.unwrap(), a_vals(cx), is_writable_key(cx, vk.unwrap()))
     end if
 
-    val v_rivals = ambiguous_value(cx, span, a_vals(cx), name)
+    val v_rivals = ambiguous_storage(cx, span, a_vals(cx), name)
 
     if v_rivals.is_some() then return v_rivals.unwrap()
 
@@ -626,7 +626,7 @@ name_expr(cx: &Analyzer, span: Span, name: string, expected: Option[Type]) -> TE
     // so the storage is not this program's to promise anything about.
     val ek = lookup_value_key(cx, a_extern_vars(cx), name)
 
-    val e_rivals = if ek.is_some() then None else ambiguous_value(cx, span, a_extern_vars(cx), name)
+    val e_rivals = if ek.is_some() then None else ambiguous_storage(cx, span, a_extern_vars(cx), name)
 
     if e_rivals.is_some() then return e_rivals.unwrap()
 
@@ -760,7 +760,9 @@ private names_a_value_parameter(cx: &Analyzer, name: string) -> bool = bound_typ
 
 // Whether a table of storage holds the spelling as the file reaches it, or two wildcards offer it.
 private names_storage_of(cx: &Analyzer, from: &Table[ValueDecl], name: string) -> bool =
-    value_key_of(cx, from, name).is_some() || offered_by(cx.an, cx.scope, name, k -> from.has(k)).len() > 1
+    !outranked(cx, from, name) &&
+        (value_key_of(cx, from, name).is_some() ||
+         offered_by(cx.an, cx.scope, name, k -> from.has(k)).len() > 1)
 
 private const_parameter(cx: &Analyzer, span: Span, name: string,
                         expected: Option[Type]) -> Option[TExpr]
@@ -787,6 +789,8 @@ private a_extern_vars(cx: &Analyzer) -> &Table[ValueDecl] = cx.an.tables.extern_
 // Which declaration a written name reaches in a table of storage, in the terms of the file that
 // wrote it -- the same order `lookup_type_key` reads, over a different table.
 lookup_value_key(cx: &Analyzer, from: &Table[ValueDecl], name: string) -> Option[string]
+    if outranked(cx, from, name) then return None
+
     val found = value_key_of(cx, from, name)
 
     if found.is_some() then depends_on(cx.an, cx.scope, found.unwrap(), span_zero())
@@ -795,6 +799,14 @@ lookup_value_key(cx: &Analyzer, from: &Table[ValueDecl], name: string) -> Option
 end lookup_value_key
 
 private value_key_of(cx: &Analyzer, from: &Table[ValueDecl], name: string) -> Option[string]
+    val ranked = value_key_ranked(cx, from, name)
+
+    if ranked.is_none() then None else Some(ranked.unwrap().0)
+
+// Which declaration a written name reaches in one table, and how near it is (`import_rank`): the
+// module's own is `OwnModuleRank`, a declaration only found to be refused as private is `NoAnswer - 1`
+// so that any import is nearer.
+private value_key_ranked(cx: &Analyzer, from: &Table[ValueDecl], name: string) -> Option[(string, int)]
     // **A module written before the dot**, which is the value side of what a call already asked.
     // `raw.thing()` resolved and `raw.eof` did not, so a constant declared in a submodule -- which is
     // what every `c const` block in a binding is -- was an undefined name naming the module.
@@ -802,14 +814,14 @@ private value_key_of(cx: &Analyzer, from: &Table[ValueDecl], name: string) -> Op
 
     for item in qualified
         if from.has(item) && reachable_key(cx.an, item, cx.scope) then
-            return Some(item)
+            return Some((item, OwnModuleRank))
 
     // This file's own file-private declaration of the spelling comes before the module's plain key,
     // where a sibling file took that one first.
     val here = file_private_key(cx.an, cx.scope.src.name,
                                 module_qualify(cx.scope.module_name, name))
 
-    if from.has(here) && reachable_key(cx.an, here, cx.scope) then return Some(here)
+    if from.has(here) && reachable_key(cx.an, here, cx.scope) then return Some((here, OwnModuleRank))
 
     // **The reader's own module beats an import of the same name**, and a name imported by name beats
     // one a wildcard merely offers -- of which two offering the spelling is an ambiguity, not a pick.
@@ -817,7 +829,8 @@ private value_key_of(cx: &Analyzer, from: &Table[ValueDecl], name: string) -> Op
     val im = answering_imports(cx.an, cx.scope, name, k -> from.has(k))
     val bound = im.name_key(name)
 
-    if bound.is_some() && from.has(bound.unwrap()) then return bound
+    if bound.is_some() && from.has(bound.unwrap())
+        return Some((bound.unwrap(), import_rank(cx.an, cx.scope, name, k -> from.has(k))))
 
     if offered_by(cx.an, cx.scope, name, k -> from.has(k)).len() > 1 then return None
 
@@ -835,7 +848,7 @@ private value_key_of(cx: &Analyzer, from: &Table[ValueDecl], name: string) -> Op
     val imported = cx.scope.imports.name_key(name).is_some()
 
     if found.is_none() && from.has(here) && (!imported || reachable_key(cx.an, here, cx.scope)) then
-        return Some(here)
+        return Some((here, NoAnswer - 1))
 
     // This file's slot may hold a declaration that is no storage at all (its own private struct),
     // leaving a sibling's private value under the plain key -- which is still found, only to be
@@ -845,26 +858,81 @@ private value_key_of(cx: &Analyzer, from: &Table[ValueDecl], name: string) -> Op
 
     if found.is_none() && !own_storage && !imported && from.has(plain) &&
        !reachable_key(cx.an, plain, cx.scope) then
-        return Some(plain)
+        return Some((plain, NoAnswer - 1))
 
     // **A path to a declaration its file made private still names it**, so the reader is told it is
     // private rather than that the module in front of the dot is undefined.
     if found.is_none()
         for item in qualified
-            if from.has(item) then return Some(item)
+            if from.has(item) then return Some((item, NoAnswer - 1))
 
-    found
-end value_key_of
+    if found.is_none() then None
+    else Some((found.unwrap(), import_rank(cx.an, cx.scope, name, k -> from.has(k))))
+end value_key_ranked
+
+// **Where this table's answer stands against the other tables of storage**: the rank of what it
+// answers, or of the wildcards that offer the spelling twice, or `NoAnswer`.
+private storage_rank(cx: &Analyzer, from: &Table[ValueDecl], name: string) -> int
+    val ranked = value_key_ranked(cx, from, name)
+
+    if ranked.is_some() then return ranked.unwrap().1
+
+    if offered_by(cx.an, cx.scope, name, k -> from.has(k)).len() > 1 then
+        return import_rank(cx.an, cx.scope, name, k -> from.has(k))
+
+    NoAnswer
+end storage_rank
+
+// The nearest rank any table of storage answers at, and the same of the nearest function, variant or
+// type the file reaches by that spelling.
+private best_storage_rank(cx: &Analyzer, name: string) -> int
+    val c = storage_rank(cx, a_consts(cx), name)
+    val v = storage_rank(cx, a_vals(cx), name)
+    val e = storage_rank(cx, a_extern_vars(cx), name)
+
+    if c <= v && c <= e then c else if v <= e then v else e
+
+// **Whether a table's answer is passed over because another kind of declaration is nearer.** A
+// constant, a `val`, an `extern` variable, a function and a variant are different tables and a bare
+// name may be any of them; the page ranks a name by where it was written, so a wildcard's constant
+// does not answer where the file's own `val` -- or function, or variant -- stands.
+private outranked(cx: &Analyzer, from: &Table[ValueDecl], name: string) -> bool
+    val mine = storage_rank(cx, from, name)
+
+    if mine == NoAnswer || mine == OwnModuleRank then return false
+
+    mine > best_storage_rank(cx, name) || mine > callable_rank(cx, name)
+end outranked
+
+// How near the nearest declaration of a function or enum variant is by this spelling: the module's
+// own is `OwnModuleRank`, a name imported by name is 1 (a block's, nearer), a wildcard's is 2 or more,
+// as `import_rank` says.
+private callable_rank(cx: &Analyzer, name: string) -> int
+    if own_variant_name(cx, name) || own_function_name(cx, name) then return OwnModuleRank
+
+    var best = NoAnswer
+
+    if imported_variant(cx, name) then best = 1
+
+    if function_bound_by_name(cx, name) && best > 1 then best = 1
+
+    best
+end callable_rank
 
 // **Two wildcards offering one spelling in a table of storage refuse the use and name both**, as a
 // call's and a type's do, where falling through would report the name as undefined -- which the
 // reader has plainly defined twice.
-private ambiguous_value(cx: &Analyzer, span: Span, from: &Table[ValueDecl],
-                        name: string) -> Option[TExpr]
+//
+// **Only where wildcards are the nearest answer**: the module's own declaration, a name imported by
+// name, or a function or variant nearer than the offers settles the name before they are counted.
+private ambiguous_storage(cx: &Analyzer, span: Span, from: &Table[ValueDecl],
+                          name: string) -> Option[TExpr]
+    if outranked(cx, from, name) then return None
+
     val rivals = offered_by(cx.an, cx.scope, name, k -> from.has(k))
 
     if rivals.len() > 1 then Some(cx.err(span, ambiguous_offer(name, rivals))) else None
-end ambiguous_value
+end ambiguous_storage
 
 // The type a declaration of storage was written at.
 value_type(cx: &Analyzer, d: ValueDecl) -> Type =
