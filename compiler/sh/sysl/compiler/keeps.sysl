@@ -1144,11 +1144,29 @@ private licensed_elsewhere(cx: &KeepsCx, recv: TExpr, target: string, k: usize) 
     if k == 0 then return false
 
     erased_trait(texpr_type(recv)) match
-        Some(Trait(n, _, _)) -> if !fn_is_call(n) then return false
+        Some(Trait(n, args, _)) ->
+            if !fn_is_call(n) then return false
+            if closure_of_another_signature(cx, target, k, args) then return true
         _ -> return false
 
     closure_licensed(cx, target, k)
 end licensed_elsewhere
+
+// **The call traits are named by arity alone, so a table is told apart by its arguments**: a closure
+// taking something else at `k` is never reached through this type, whatever it keeps of what it takes.
+// Compared as the tables are named, which is blind to `@keeps` marks: a marked type and its unmarked
+// form share one table. `args` holds the parameters, then the result.
+private closure_of_another_signature(cx: &KeepsCx, target: string, k: usize, args: Buf[Type]) -> bool
+    val found = cx.find(target)
+
+    if found.is_none() then return false
+
+    val f = found.unwrap()
+
+    if !is_closure_body(f) || k >= f.params.len() || k > args.len() then return false
+
+    mangle(f.params.at(k).1) != mangle(args.at(k - 1))
+end closure_of_another_signature
 
 // Whether a closure's body is licensed to keep its parameter `i` (its environment is parameter 0): the
 // callable type it was made at marks the parameter `@keeps` (`Analysis.closure_keeps`).
@@ -1493,11 +1511,13 @@ private lent_by_rule(cx: &KeepsCx, f: TFunc, i: usize) -> bool
     if scoped_at(f, i) then return true
     // A closure made at a callable type that marks the parameter `@keeps` was promised nothing about
     // it, so a call that sees its body is held to what the body keeps.
-    if is_closure_body(f) then return i >= 1 && !closure_licensed(cx, f.name, i)
+    if is_closure_body(f) && (i == 0 || closure_licensed(cx, f.name, i)) then return false
 
     // An object -- a callback among them -- is not an address anyone lent, so a body that stores one
-    // says so to a call that sees it, whatever reaches it besides.
+    // says so to a call that sees it, whatever reaches it besides. A closure's body is no exception:
+    // the closure handed to it may live in the caller's frame, or hold its variables' addresses.
     if !holds_raw_pointer(f.params.at(i).1, 0) then return false
+    if is_closure_body(f) then return true
 
     // **A task cannot keep a trait's promise to borrow**: an async method's body runs after the call
     // that lent it a pointer has returned, so a call through the object is held to what the task
@@ -5799,9 +5819,8 @@ private refuse_promised(cx: &KeepsCx, faults: &KeepFaults, f: TFunc)
     for i in first..<f.params.len()
         if !may_hold_pointer(cx, f.params.at(i).1) || scoped_at(f, i) then continue
 
-        // **A stored callback keeps only what it captured**, and the call that made it is where that
-        // is checked: an object -- a closure behind a `&Fn` among them -- is not itself an address
-        // anyone lent.
+        // **A stored object is no broken promise**: it is not itself an address anyone lent, and a call
+        // handing over a closure behind a `&Fn` is held to what this body keeps (`lent_by_rule`).
         if !holds_raw_pointer(f.params.at(i).1, 0) then continue
 
         // **A closure made at a callable type that marks the parameter `@keeps` may keep it**: every
