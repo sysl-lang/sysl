@@ -1,0 +1,60 @@
+module sh.sysl.compiler
+@tests
+
+// A statement written where a one-line `=` or `->` takes an expression is named for what it is,
+// rather than refused as a missing expression
+// (`reference/declarations.md § Functions`: the body is `= expr` or an indented block).
+
+private const FnBody = "a function's '=' body"
+private const Value = "a binding's '=' value"
+private const Closure = "a closure's '->' body"
+
+private eqb_said(word: string, owner: string) -> string =
+    s"'${word}' begins a statement, and ${owner} is an expression \u{2014} put it in a block on the next line"
+
+@test("a val after a function's '=' is named a statement, at the word")
+eqb_val_in_a_function_body()
+    assert_eq(pf_err("f() = val _ = g()\n"), eqb_said("val", FnBody))
+    assert_eq(pf_at("f() = val _ = g()\n"), "1:7")
+
+@test("a var, a const and a return after a function's '=' are named too")
+eqb_the_other_words_in_a_function_body()
+    assert_eq(pf_err("f() = var x = 1\n"), eqb_said("var", FnBody))
+    assert_eq(pf_err("f() = const x = 1\n"), eqb_said("const", FnBody))
+    assert_eq(pf_err("f() = return 1\n"), eqb_said("return", FnBody))
+    assert_eq(pf_at("f() = return 1\n"), "1:7")
+
+@test("the same holds for a method, a typed result and a generic function")
+eqb_other_function_shapes()
+    assert_eq(pf_err("f() -> int = val x = 1\n"), eqb_said("val", FnBody))
+    assert_eq(pf_err("f[T](x: T) = val y = x\n"), eqb_said("val", FnBody))
+    assert_eq(pf_err("struct S\n    n: int\n\n    m(self) = val x = 1\n"), eqb_said("val", FnBody))
+
+@test("a statement word after a binding's '=' is named")
+eqb_binding_value()
+    assert_eq(pf_err("val k = val _ = 1\n"), eqb_said("val", Value))
+    assert_eq(pf_err("var k = return 1\n"), eqb_said("return", Value))
+    assert_eq(pf_at("val k = val _ = 1\n"), "1:9")
+
+@test("a statement word after a closure's '->' is named")
+eqb_closure_body()
+    assert_eq(pf_err("val h = (x: int) -> val _ = x\n"), eqb_said("val", Closure))
+    assert_eq(pf_at("val h = (x: int) -> val _ = x\n"), "1:21")
+    assert_eq(pf_err("val h = x -> return x\n"), eqb_said("return", Closure))
+
+@test("the legal neighbours still parse")
+eqb_legal_neighbours()
+    assert_eq(pf_err("f() = g()\n"), "")
+    assert_eq(pf_err("f(x: int) = if x > 0 then 1 else 2\n"), "")
+    assert_eq(pf_err("f(x: int) = x match\n    1 -> 2\n    _ -> 3\n"), "")
+    assert_eq(pf_err("f()\n    val _ = g()\n    var y = 1\n    return\n"), "")
+    assert_eq(pf_err("f() =\n    val x = 1\n    x\n"), "")
+    assert_eq(pf_err("val k =\n    val x = 1\n    x\n"), "")
+    assert_eq(pf_err("val h = (x: int) ->\n    val y = x\n    y\n"), "")
+    assert_eq(pf_err("val h = x -> x + 1\n"), "")
+    assert_eq(pf_err("f() = for i in 0..<3 do g()\n"), "")
+
+@test("a missing expression is still reported as one")
+eqb_missing_expression()
+    assert_eq(pf_err("f() =\nprint(1)\n"), "expression expected")
+    assert_eq(pf_err("val k = )\n"), "expression expected")

@@ -831,6 +831,21 @@ hi you
 `= ` may also open an indented block, so a body does not have to change shape when it outgrows a
 line.
 
+**A one-line `= body` is an expression, so a statement does not fit on it.** `val`, `var`, `const` and
+`return` begin statements; a function that needs one writes its body as a block. The same holds for
+the one-line value after a binding's `=` and the one-line body after a closure's `->`.
+
+```sysl
+copy_out(n: int) = val _ = print(n)
+```
+
+```error
+'val' begins a statement, and a function's '=' body is an expression — put it in a block on the next line
+```
+
+A call whose result is not wanted needs no `val _ =` to discard it: `copy_out(n: int) = print(n)` is
+already a body, and a block's statement line may be a bare call.
+
 ### The result type
 
 **A body written `= value` with no `-> T` takes the value's type**, exactly as a `val` written with
