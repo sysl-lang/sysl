@@ -1,0 +1,185 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.text.cstring
+
+// **`SYSL_EXTRA_CFLAGS` reaches every clang that reads C, not only the ones that compile it.** A
+// cross build from a host with no target SDK gives `--sysroot=` there, and the `c const` probe is
+// the first clang to meet the target's headers. The cases use `-isystem` on the fake tree, which
+// travels the same route and works on a Darwin host (whose clang ignores `--sysroot=`). The fixture is a fake sysroot holding one header,
+// `marker.h`, which defines a constant: the probe finds it only if the flag arrived.
+//
+// The variable is set through libc (`sysl.env` sets nothing) and unset before a case returns.
+
+private extern "setenv" xcp_c_setenv(name: *u8, value: *u8, overwrite: int) -> int
+private extern "unsetenv" xcp_c_unsetenv(name: *u8) -> int
+
+private xcp_setenv(name: string, value: string)
+    val n = cstring(name)
+    val v = cstring(value)
+
+    xcp_c_setenv(n.ptr, v.ptr, 1)
+end xcp_setenv
+
+private xcp_unsetenv(name: string)
+    val n = cstring(name)
+
+    xcp_c_unsetenv(n.ptr)
+end xcp_unsetenv
+
+// A fake sysroot whose `usr/include/marker.h` defines `XCP_MARK` as `value`.
+private xcp_sysroot(value: string) -> string
+    val root = absolute_path(make_temp_dir("sysl-xcp").unwrap())
+
+    make_dir_all(s"$root/usr/include").unwrap()
+    write_text(s"$root/usr/include/marker.h", s"#define XCP_MARK $value\n").unwrap()
+    root
+end xcp_sysroot
+
+// The diagnostics of a file whose `c const` reads `XCP_MARK` as a `u8`, so a value of 300 is
+// refused with its number and a value of 7 is not.
+private xcp_measured() -> Buf[string] =
+    stmt_diagnostics("@include(\"<marker.h>\")\n\nc const\n    N: u8 = \"XCP_MARK\"\n\nf() -> u8 = N\n")
+
+private xcp_skip() -> bool
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return true
+
+    false
+end xcp_skip
+
+@test("a --sysroot in SYSL_EXTRA_CFLAGS is how a 'c const' finds a header")
+xcp_the_sysroot_reaches_the_probe()
+    if xcp_skip() then return
+
+    val root = xcp_sysroot("7")
+
+    xcp_setenv("SYSL_EXTRA_CFLAGS", s"-isystem $root/usr/include")
+
+    val with_flag = xcp_measured()
+
+    xcp_unsetenv("SYSL_EXTRA_CFLAGS")
+
+    val without = xcp_measured()
+
+    remove_dir_all(root).unwrap_or(())
+    assert_eq(with_flag.len(), 0)
+    assert_eq(without.len(), 1)
+end xcp_the_sysroot_reaches_the_probe
+
+@test("-isystem there reaches the probe too, and the number read is the header's")
+xcp_isystem_reaches_the_probe()
+    if xcp_skip() then return
+
+    val root = xcp_sysroot("300")
+
+    xcp_setenv("SYSL_EXTRA_CFLAGS", s"-isystem $root/usr/include")
+
+    val said = xcp_measured()
+
+    xcp_unsetenv("SYSL_EXTRA_CFLAGS")
+    remove_dir_all(root).unwrap_or(())
+    assert_eq(said.len(), 1)
+    assert_eq(said.at(0), "'XCP_MARK' is 300 here, which 'u8' cannot hold — it holds 0 to 255")
+end xcp_isystem_reaches_the_probe
+
+@test("changing the flags changes the answer: nothing from another sysroot is reused")
+xcp_another_sysroot_is_another_answer()
+    if xcp_skip() then return
+
+    val small = xcp_sysroot("7")
+    val big = xcp_sysroot("300")
+
+    xcp_setenv("SYSL_EXTRA_CFLAGS", s"-isystem $small/usr/include")
+
+    val first = xcp_measured()
+
+    xcp_setenv("SYSL_EXTRA_CFLAGS", s"-isystem $big/usr/include")
+
+    val second = xcp_measured()
+
+    xcp_setenv("SYSL_EXTRA_CFLAGS", s"-isystem $small/usr/include")
+
+    val third = xcp_measured()
+
+    xcp_unsetenv("SYSL_EXTRA_CFLAGS")
+    remove_dir_all(small).unwrap_or(())
+    remove_dir_all(big).unwrap_or(())
+    assert_eq(first.len(), 0)
+    assert_eq(second.len(), 1)
+    assert_eq(third.len(), 0)
+end xcp_another_sysroot_is_another_answer
+
+@test("-fsanitize=address beside the sysroot leaves the probe measuring what the header says")
+xcp_a_sanitizer_flag_does_not_disturb_the_probe()
+    if xcp_skip() then return
+
+    val root = xcp_sysroot("7")
+
+    xcp_setenv("SYSL_EXTRA_CFLAGS", s"-fsanitize=address -isystem $root/usr/include")
+
+    val ok = xcp_measured()
+
+    xcp_setenv("SYSL_EXTRA_CFLAGS", "-fsanitize=address,undefined")
+
+    val sizes = stmt_diagnostics("@include(\"<stdint.h>\")\n\nc const\n    W: usize = \"sizeof(uint64_t)\"\n\n" +
+                                 "f() -> usize\n    var xs: [W]u8 = [0; W]\n\n    xs.len\n")
+
+    xcp_unsetenv("SYSL_EXTRA_CFLAGS")
+    remove_dir_all(root).unwrap_or(())
+    assert_eq(ok.len(), 0)
+    assert_eq(sizes.len(), 0)
+end xcp_a_sanitizer_flag_does_not_disturb_the_probe
+
+@test("measuring_cflags drops sanitizer words and keeps the rest in order")
+xcp_measuring_cflags_filters_sanitizers()
+    xcp_setenv("SYSL_EXTRA_CFLAGS", "--sysroot=/s -fsanitize=address -isystem /i -fno-sanitize=vptr -DX=1")
+
+    val got = measuring_cflags()
+
+    xcp_unsetenv("SYSL_EXTRA_CFLAGS")
+    assert_eq(got.len(), 4)
+    assert_eq(got.at(0), "--sysroot=/s")
+    assert_eq(got.at(1), "-isystem")
+    assert_eq(got.at(2), "/i")
+    assert_eq(got.at(3), "-DX=1")
+end xcp_measuring_cflags_filters_sanitizers
+
+@test("a C file compiled through the object cache finds a header in the sysroot, and another sysroot is another object")
+xcp_the_object_cache_sees_the_sysroot()
+    if xcp_skip() then return
+
+    val work = absolute_path(make_temp_dir("sysl-xcp-work").unwrap())
+    val cache = make_temp_dir("sysl-xcp-cache").unwrap()
+    val a = xcp_sysroot("7")
+    val b = xcp_sysroot("9")
+    val src = s"$work/m.c"
+    val clang = find_clang(host_target(), None).unwrap()
+
+    use_c_object_cache_dir(Some(cache))
+    sweep_c_objects()
+    clear_c_object_counts()
+    write_text(src, "#include <marker.h>\nint xcp_m(void) { return XCP_MARK; }\n").unwrap()
+
+    xcp_setenv("SYSL_EXTRA_CFLAGS", s"-isystem $a/usr/include")
+
+    val first = compile_c(clang, src, s"$work/one.o", host_target(), "1", no_probe(), buf())
+
+    xcp_setenv("SYSL_EXTRA_CFLAGS", s"-isystem $b/usr/include")
+
+    val second = compile_c(clang, src, s"$work/two.o", host_target(), "1", no_probe(), buf())
+    val counts = c_object_counts()
+
+    xcp_unsetenv("SYSL_EXTRA_CFLAGS")
+    use_c_object_cache_dir(None)
+    remove_dir_all(work).unwrap_or(())
+    remove_dir_all(cache).unwrap_or(())
+    remove_dir_all(a).unwrap_or(())
+    remove_dir_all(b).unwrap_or(())
+    assert(first.is_ok(), "the header is found through the first sysroot")
+    assert(second.is_ok(), "and through the second")
+    assert_eq(counts, (0, 2))
+end xcp_the_object_cache_sees_the_sysroot

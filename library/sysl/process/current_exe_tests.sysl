@@ -1,0 +1,86 @@
+module sysl.process
+@requires(posix)
+@tests
+
+import sysl.env.current_exe
+import sysl.fs.{canonicalize, exists, is_link, make_dir_all, make_temp_dir, remove_dir_all, symlink,
+                write_text}
+import sysl.path.{file_name, is_absolute}
+import sysl.testing.compiler
+
+// `sysl.env.current_exe`, asserted from here because `sysl.env` cannot import the process and file
+// modules without a cycle. A built program printing its own `current_exe()` is the only way to see
+// what the path was when it was started by a link, a relative path or a search path.
+
+// A program that prints `current_exe()`, built into a fresh temp dir of its own.
+private cex_program() -> string
+    val root = canonicalize(make_temp_dir("sysl-cex-").unwrap()).unwrap()
+
+    make_dir_all(s"$root/real").unwrap()
+    write_text(s"$root/real/main.sysl",
+               "import sysl.env.current_exe\n\nmain()\n    print(current_exe().unwrap())\n").unwrap()
+
+    val built = capture(compiler(), ["build", "-o", s"$root/real/prog", s"$root/real/main.sysl"],
+                        stderr = true).unwrap()
+
+    assert_eq(built.status, Status.Exited(0), built.err.unwrap_or(""))
+    root
+end cex_program
+
+@test("current_exe answers an absolute, existing, canonical path that is not a link")
+cex_is_absolute_existing_and_resolved()
+    val exe = current_exe().unwrap()
+
+    assert(is_absolute(exe), exe)
+    assert(exists(exe), exe)
+    assert(!is_link(exe), exe)
+    assert_eq(canonicalize(exe).unwrap(), exe)
+    assert(file_name(exe).unwrap().len > 0, exe)
+end cex_is_absolute_existing_and_resolved
+
+@test("current_exe through a symlink answers the file the link names")
+cex_through_a_symlink()
+    val root = cex_program()
+
+    symlink(s"$root/real/prog", s"$root/link").unwrap()
+
+    val o = capture(s"$root/link").unwrap()
+
+    remove_dir_all(root).unwrap()
+    assert_eq(o.status, Status.Exited(0))
+    assert_eq(o.text, s"$root/real/prog\n")
+end cex_through_a_symlink
+
+@test("current_exe from a program started by a relative path is still absolute and resolved")
+cex_from_a_relative_path()
+    val root = cex_program()
+    val o = capture("/bin/sh", ["-c", s"cd $root/real && ./prog"]).unwrap()
+
+    remove_dir_all(root).unwrap()
+    assert_eq(o.status, Status.Exited(0))
+    assert_eq(o.text, s"$root/real/prog\n")
+end cex_from_a_relative_path
+
+@test("current_exe from a program found on the search path answers the file, not the bare name")
+cex_from_the_search_path()
+    val root = cex_program()
+    val o = capture("/bin/sh", ["-c", s"PATH=$root/real:/usr/bin:/bin prog"]).unwrap()
+
+    remove_dir_all(root).unwrap()
+    assert_eq(o.status, Status.Exited(0))
+    assert_eq(o.text, s"$root/real/prog\n")
+end cex_from_the_search_path
+
+@test("current_exe through a relative symlink, run from the link's directory")
+cex_through_a_relative_symlink()
+    val root = cex_program()
+
+    make_dir_all(s"$root/bin").unwrap()
+    symlink("../real/prog", s"$root/bin/prog").unwrap()
+
+    val o = capture("/bin/sh", ["-c", s"cd $root/bin && ./prog"]).unwrap()
+
+    remove_dir_all(root).unwrap()
+    assert_eq(o.status, Status.Exited(0))
+    assert_eq(o.text, s"$root/real/prog\n")
+end cex_through_a_relative_symlink

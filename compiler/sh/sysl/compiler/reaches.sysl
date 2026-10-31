@@ -206,6 +206,55 @@ reached_seeds(r: &Reaches, root: &Refs) -> Buf[string]
 
     if r.seeds.is_empty() then return found
 
+    for item in reached_closure(r, root).0
+        if holds_string(r.seeds, item) then found.push(item)
+
+    found
+end reached_seeds
+
+// Every table a tree erases a value into, its own and those of everything it arrives at.
+//
+// **A dynamic call and the erasure that answers it are rarely one node**: `ask(5)` erases in its
+// argument and calls through the slot in `ask`'s body, and `val d: &D = 6` then `d.get()` are two
+// statements. Asked node by node, neither half arrives anywhere, so a body that put a table behind a
+// trait and called through it was never told what the slot reaches. A capability check hands each
+// node the tables its whole body erases into (`with_tables`), which is the set `reached_seeds`
+// answers the whole body's slots against.
+reached_tables(r: &Reaches, root: &Refs) -> Buf[string]
+    if r.seeds.is_empty() then return buf()
+
+    reached_closure(r, root).1
+end reached_tables
+
+// A node's own names with the tables of its body added, as fresh buffers -- a `Buf` handed over is a
+// second name for the same storage, and the node's own lists must not grow.
+with_tables(refs: &Refs, tables: Buf[string]) -> &Refs
+    val out = no_refs()
+
+    for item in refs.calls
+        out.call(item)
+
+    for item in refs.globals
+        out.global(item)
+
+    for item in refs.sites
+        out.site(item.0, item.1)
+
+    for item in refs.erased
+        out.erase(item)
+
+    for item in tables
+        out.erase(item)
+
+    out
+end with_tables
+
+// What a tree arrives at -- every function and storage it reaches, and every table it erases into --
+// in the order first reached.
+//
+// The dynamic sites are answered against the tables the walk saw a value erased into, as
+// `reached_seeds` says.
+private reached_closure(r: &Reaches, root: &Refs) -> (Buf[string], Buf[string])
     var called: Buf[string] = buf()
     var called_seen: Set[string] = set()
     var erased: Buf[string] = buf()
@@ -239,11 +288,8 @@ reached_seeds(r: &Reaches, root: &Refs) -> Buf[string]
 
         growing = called.len() != before
 
-    for item in called
-        if holds_string(r.seeds, item) then found.push(item)
-
-    found
-end reached_seeds
+    (called, erased)
+end reached_closure
 
 // Each of `called`, `erased` and `sites` keeps a set beside it, so a name already on the list
 // answers "seen" without a scan of the list itself -- the whole point of the sets: the list is what

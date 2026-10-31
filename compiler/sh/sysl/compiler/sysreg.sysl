@@ -9,7 +9,19 @@ import sysl.process.capture
 // AArch64's system registers and barriers, as five forms: `read_sysreg("cntfrq_el0")`,
 // `write_sysreg("daif", v)`, `dsb(sy)`, `dmb(ish)` and `isb()` -- and the cache, TLB and address
 // translation maintenance a kernel issues, as four more: `tlbi(vae1is, page)`, `dc(civac, addr)`,
-// `ic(iallu)` and `at(s1e1r, va)`.
+// `ic(iallu)` and `at(s1e1r, va)` -- and the hint instructions a core waits and signals with, as five
+// more: `wfe()`, `wfi()`, `sev()`, `sevl()` and `nop()`.
+//
+// **Most of them are AArch64's alone; the barriers and the hints are not.** An M-profile Thumb core
+// (Cortex-M0+ to M33) has `dsb`, `dmb` and `isb` with the one option `sy`, and `wfe`, `wfi`, `sev`
+// and `nop`; a RISC-V core has `wfi` and `nop`. `sevl` is AArch64's only. Each form is refused, naming
+// the processors it does exist on, wherever the instruction does not.
+//
+// **Every one of them keeps program order.** A hint is LLVM's `llvm.aarch64.hint` or `llvm.arm.hint`
+// and a Thumb barrier `llvm.arm.dsb`/`dmb`/`isb`, none of which LLVM knows to leave memory alone, so
+// no load or store is moved across one and none is deleted as unused; RISC-V's two are `sideeffect`
+// assembly clobbering memory, which is the same promise -- LLVM has no intrinsic for either. A `wfe`
+// in a loop waiting on a flag therefore stays in the loop, with the flag read on every round.
 //
 // **These are intrinsics, not assembly.** A register read is LLVM's `read_volatile_register`, a write
 // its `write_register`, a barrier `llvm.aarch64.dsb`/`dmb`/`isb` -- so the optimizer sees a call it
@@ -39,10 +51,43 @@ import sysl.process.capture
 sysreg_form(cx: &Analyzer, name: string) -> bool =
     sysreg_form_word(name) && cx.lookup(name).is_none() && function_keys(cx, name).is_empty()
 
-// The nine words, whether or not anything claims them.
+// The fourteen words, whether or not anything claims them.
 sysreg_form_word(name: string) -> bool =
     name == "read_sysreg" || name == "write_sysreg" || name == "dsb" || name == "dmb" ||
-    name == "isb" || maintenance_form(name)
+    name == "isb" || maintenance_form(name) || hint_form(name)
+
+// The five hint forms, each one instruction that takes nothing.
+hint_form(name: string) -> bool =
+    name == "wfe" || name == "wfi" || name == "sev" || name == "sevl" || name == "nop"
+
+// Whether the processor `here` (a `cpu_symbol`) has the form's instruction.
+private exists_on(name: string, here: string) -> bool
+    if here == "aarch64" then return true
+
+    if here == "thumb"
+        return name == "dsb" || name == "dmb" || name == "isb" || name == "wfe" || name == "wfi" ||
+               name == "sev" || name == "nop"
+
+    if here == "riscv64" || here == "riscv32" then return name == "wfi" || name == "nop"
+
+    false
+end exists_on
+
+// What a refusal says on a processor without the form's instruction: the ones that have it, and the
+// `#if` a module built for both puts the call behind.
+private missing_instruction(name: string, target: string, here: string) -> string
+    if !exists_on(name, "thumb")
+        return s"'$name' is an AArch64 instruction, and '$target' is $here — put the code that uses " +
+               "it behind '#if aarch64'"
+
+    if exists_on(name, "riscv64")
+        return s"'$name' is an instruction of AArch64, M-profile Thumb and RISC-V, and '$target' is " +
+               s"$here — put the code that uses it behind '#if aarch64', '#if thumb', '#if riscv64' " +
+               "or '#if riscv32'"
+
+    s"'$name' is an instruction of AArch64 and M-profile Thumb, and '$target' is $here — put the " +
+    "code that uses it behind '#if aarch64' or '#if thumb'"
+end missing_instruction
 
 // The four maintenance forms, each an instruction whose first operand is a word of a closed set.
 private maintenance_form(name: string) -> bool =
@@ -55,16 +100,24 @@ sysreg_call(cx: &Analyzer, span: Span, name: string, args: Buf[Expr]) -> TExpr
 
     // Refused before anything else is asked, since nothing else about the call can be right on a
     // machine without the instruction.
-    if here != "aarch64"
-        return cx.err(span, s"'$name' is an AArch64 instruction, and '${target.name}' is $here — put " +
-                      "the code that uses it behind '#if aarch64'")
+    if !exists_on(name, here) then return cx.err(span, missing_instruction(name, target.name, here))
 
     if name == "read_sysreg" then return read_call(cx, span, args)
     if name == "write_sysreg" then return write_call(cx, span, args)
     if maintenance_form(name) then return maintenance_call(cx, span, name, args)
+    if hint_form(name) then return hint_call(cx, span, name, args)
 
-    barrier_call(cx, span, name, args)
+    barrier_call(cx, span, name, args, here)
 end sysreg_call
+
+// `wfe()`, `wfi()`, `sev()`, `sevl()`, `nop()`. The instruction is the whole of the form: which
+// encoding it is on this processor is the emitter's (`gen_sysop`).
+private hint_call(cx: &Analyzer, span: Span, name: string, args: Buf[Expr]) -> TExpr
+    if !args.is_empty()
+        return cx.err(span, s"'$name' takes nothing — the instruction has no operand, so it is " +
+                      s"written '$name()'")
+
+    TExpr(span, TSysOp(name, "", buf()))
 
 // `read_sysreg("esr_el1")` -- the register's value, as a `u64`.
 private read_call(cx: &Analyzer, span: Span, args: Buf[Expr]) -> TExpr
@@ -196,8 +249,10 @@ private lower_byte(b: u8) -> u8 = if b >= u8('A') && b <= u8('Z') then b + 32 el
 
 // `dsb(sy)`, `dmb(ish)`, `isb()`. The option is a word of the instruction -- the shareability domain
 // and the accesses ordered -- read as written rather than as a value, so a run-time choice cannot
-// reach an encoding that has to be fixed when the instruction is.
-private barrier_call(cx: &Analyzer, span: Span, name: string, args: Buf[Expr]) -> TExpr
+// reach an encoding that has to be fixed when the instruction is. An M-profile core's barriers have
+// the one option `sy` -- the architecture reserves every other encoding there -- so on Thumb any
+// other word is refused rather than quietly built as `sy`.
+private barrier_call(cx: &Analyzer, span: Span, name: string, args: Buf[Expr], here: string) -> TExpr
     if name == "isb"
         if !args.is_empty()
             return cx.err(span, "'isb' takes no option — 'sy' is the only one the architecture " +
@@ -216,6 +271,10 @@ private barrier_call(cx: &Analyzer, span: Span, name: string, args: Buf[Expr]) -
     if barrier_option(word).is_none()
         return cx.err(args.at(0).span, s"'$name' takes one of the architecture's options written " +
                       s"here — ${barrier_words()} — and this is not one")
+
+    if here == "thumb" && word != "sy"
+        return cx.err(args.at(0).span, s"an M-profile core's '$name' has only the option 'sy' — the " +
+                      s"architecture reserves every other one there — so it is written $name(sy)")
 
     TExpr(span, TSysOp(name, word, buf()))
 end barrier_call

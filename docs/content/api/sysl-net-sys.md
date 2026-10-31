@@ -9,7 +9,7 @@ requires: "requires { os }"
 
 ## Index
 
-[`datagram`](#datagram) [`read_timeout`](#read_timeout) [`reuse_address`](#reuse_address) [`stream`](#stream) [`write_timeout`](#write_timeout) [`Endpoint`](#endpoint)
+[`datagram`](#datagram) [`non_blocking`](#non_blocking) [`read_timeout`](#read_timeout) [`reuse_address`](#reuse_address) [`stream`](#stream) [`unix_domain`](#unix_domain) [`write_timeout`](#write_timeout) [`Endpoint`](#endpoint)
 
 ## Constants
 
@@ -20,6 +20,16 @@ const datagram: int = 1
 ```
 
 `socket`'s `kind` for datagrams -- UDP.
+
+### `non_blocking`
+
+```sysl
+const non_blocking: int = 3
+```
+
+`option`'s `which` for non-blocking mode, `value` 1 or 0. A call on a non-blocking socket that would
+have had to wait answers the code of `EAGAIN` instead -- 35 on a BSD, 11 everywhere else -- and that
+is what `sysl.net.would_block` recognises.
 
 ### `read_timeout`
 
@@ -44,6 +54,15 @@ const stream: int = 0
 ```
 
 `socket`'s `kind` for a stream -- TCP.
+
+### `unix_domain`
+
+```sysl
+const unix_domain: int = 1
+```
+
+`socket`'s `family` for a Unix domain socket: a stream between processes on one machine, addressed
+by a path in the filesystem rather than by an `Endpoint`. Only `stream` is asked for with it.
 
 ### `write_timeout`
 

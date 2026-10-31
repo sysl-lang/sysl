@@ -1,0 +1,189 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.text.{Search, replace_all}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// The message of a `require`, `ensure` or `invariant` reads the same constant expressions an
+// `@assert`'s message does (`reference/errors.md`): a literal, a `const`, a `val` that folds, a
+// concatenation of them, a name from another module. One that cannot be worked out while compiling
+// is refused, saying which clause it belongs to. A message is carried in the program's text, so the
+// accepted cases read it out of the emitted program; a trap prints nothing, so it cannot be read
+// from a run.
+
+// A file of a program: the module it belongs to (a directory path), its name, and its text.
+private rqc_files() -> Buf[(string, string, string)] = buf()
+
+private rqc_root(files: Buf[(string, string, string)]) -> string
+    val root = replace_all(make_temp_dir("sysl-rqc").unwrap(), "//", "/")
+
+    make_dir_all(root).unwrap()
+    write_text(root + "/package.hocon", "package {\n  name = \"probe\"\n}\n").unwrap()
+
+    for f in files
+        val dir = if f.0 == "" then root else root + "/" + replace_all(f.0, ".", "/")
+
+        make_dir_all(dir).unwrap()
+        write_text(dir + "/" + f.1, f.2).unwrap()
+
+    root
+end rqc_root
+
+// The emitted program, or what the build had to say instead, with the project root written as `@`.
+private rqc_ir(files: Buf[(string, string, string)]) -> string
+    val root = rqc_root(files)
+
+    val out = emit_typed_text(root, None, false) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> if made.report.is_empty() then made.text else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    replace_all(out, root, "@")
+end rqc_ir
+
+private rqc_ir_of(text: string) -> string
+    var fs = rqc_files()
+
+    fs.push(("", "main.sysl", text))
+    rqc_ir(fs)
+
+// What the program prints.
+private rqc_run(text: string) -> string
+    var fs = rqc_files()
+
+    fs.push(("", "main.sysl", text))
+
+    val root = rqc_root(fs)
+    val exe = root + "/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            val said = failure_text(why)
+
+            remove_dir_all(root).unwrap_or(())
+            return said
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end rqc_run
+
+private rqc_has(said: string, part: string) =
+    assert(said.index_of(part).is_some(), s"expected '$part', got: $said")
+
+private rqc_fn(clause: string, message: string) -> string =
+    s"f(x: int) -> int\n    $clause, $message\n    x\nprint(f(1))\n"
+
+// -- require ----------------------------------------------------------------------------------
+
+@test("a require message may be a const string")
+rqc_const_string()
+    if xvr_no_library() then return
+
+    rqc_has(rqc_ir_of("const WHY = \"x must be positive\"\n" + rqc_fn("require x > 0", "WHY")),
+            "x must be positive")
+
+@test("a require message may be a val that folds")
+rqc_folding_val()
+    if xvr_no_library() then return
+
+    var fs = rqc_files()
+
+    fs.push(("texts", "a.sysl", "module texts\nval WHY = \"x must be \" + \"positive\"\n"))
+    fs.push(("", "main.sysl", "import texts.{WHY}\n" + rqc_fn("require x > 0", "WHY")))
+    rqc_has(rqc_ir(fs), "x must be positive")
+
+@test("a require message may be a concatenation of constants")
+rqc_concatenation()
+    if xvr_no_library() then return
+
+    rqc_has(rqc_ir_of("const A = \"bad \"\n" + rqc_fn("require x > 0", "A + \"input\"")), "bad input")
+
+@test("a require message written as a literal is unchanged")
+rqc_literal()
+    if xvr_no_library() then return
+
+    rqc_has(rqc_ir_of(rqc_fn("require x > 0", "\"literal words\"")), "literal words")
+
+@test("a satisfied require with a const message runs the body")
+rqc_satisfied()
+    if xvr_no_library() then return
+
+    assert_eq(rqc_run("const WHY = \"no\"\n" + rqc_fn("require x > 0", "WHY")), "1\n")
+
+@test("a require message may be a const from another module")
+rqc_other_module()
+    if xvr_no_library() then return
+
+    var fs = rqc_files()
+
+    fs.push(("texts", "a.sysl", "module texts\nconst WHY = \"from elsewhere\"\n"))
+    fs.push(("", "main.sysl", "import texts\n" + rqc_fn("require x > 0", "texts.WHY")))
+    rqc_has(rqc_ir(fs), "from elsewhere")
+
+@test("a require message may be a const imported by name")
+rqc_imported_name()
+    if xvr_no_library() then return
+
+    var fs = rqc_files()
+
+    fs.push(("texts", "a.sysl", "module texts\nconst WHY = \"imported by name\"\n"))
+    fs.push(("", "main.sysl", "import texts.{WHY}\n" + rqc_fn("require x > 0", "WHY")))
+    rqc_has(rqc_ir(fs), "imported by name")
+
+@test("a require message chosen by #if is the branch the build takes")
+rqc_conditional()
+    if xvr_no_library() then return
+
+    val said = rqc_ir_of("#if ptr64\nconst WHY = \"wide-branch\"\n#else\nconst WHY = \"narrow-branch\"\n#endif\n" +
+                         rqc_fn("require x > 0", "WHY"))
+
+    rqc_has(said, "wide-branch")
+    assert(said.index_of("narrow-branch").is_none(), "the branch not taken was emitted")
+
+@test("a require message that is not a constant is refused")
+rqc_not_constant()
+    if xvr_no_library() then return
+
+    rqc_has(rqc_ir_of("f(x: int, why: string) -> int\n    require x > 0, why\n    x\nprint(f(1, \"a\"))\n"),
+            "error: the message of this 'require' cannot be computed while compiling — it has to be a " +
+            "'string' made of constants, what a type answers and calls whose bodies run while compiling, " +
+            "and nothing read out of storage filled at run time")
+
+@test("a require message that is not a string is refused")
+rqc_not_a_string()
+    if xvr_no_library() then return
+
+    rqc_has(rqc_ir_of(rqc_fn("require x > 0", "5")),
+            "error: the message of this 'require' is of type 'int', and a message is a 'string' — " +
+            "interpolate the value into one")
+
+// -- ensure and invariant ---------------------------------------------------------------------
+
+@test("an ensure message may be a const string")
+rqc_ensure()
+    if xvr_no_library() then return
+
+    rqc_has(rqc_ir_of("const WHY = \"result must be positive\"\n" + rqc_fn("ensure result > 0", "WHY")),
+            "result must be positive")
+
+@test("an ensure message that is not a constant is refused, naming the ensure")
+rqc_ensure_not_constant()
+    if xvr_no_library() then return
+
+    rqc_has(rqc_ir_of("f(x: int, why: string) -> int\n    ensure result > 0, why\n    x\nprint(f(1, \"a\"))\n"),
+            "error: the message of this 'ensure' cannot be computed while compiling")
+
+@test("an invariant message may be a const string")
+rqc_invariant()
+    if xvr_no_library() then return
+
+    rqc_has(rqc_ir_of("const WHY = \"stays small\"\nvar i = 0\nwhile i < 3\n    invariant i <= 3, WHY\n    i += 1\nprint(i)\n"),
+            "stays small")

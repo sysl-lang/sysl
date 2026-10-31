@@ -9,7 +9,7 @@ requires: "requires { libc }, requires { posix }"
 
 ## Index
 
-[`net_accept`](#net_accept) [`net_bind`](#net_bind) [`net_close`](#net_close) [`net_connect`](#net_connect) [`net_listen`](#net_listen) [`net_local`](#net_local) [`net_option`](#net_option) [`net_recv`](#net_recv) [`net_recv_from`](#net_recv_from) [`net_resolve`](#net_resolve) [`net_send`](#net_send) [`net_send_to`](#net_send_to) [`net_shutdown`](#net_shutdown) [`net_socket`](#net_socket)
+[`net_accept`](#net_accept) [`net_bind`](#net_bind) [`net_bind_path`](#net_bind_path) [`net_close`](#net_close) [`net_connect`](#net_connect) [`net_connect_path`](#net_connect_path) [`net_listen`](#net_listen) [`net_local`](#net_local) [`net_option`](#net_option) [`net_recv`](#net_recv) [`net_recv_from`](#net_recv_from) [`net_resolve`](#net_resolve) [`net_send`](#net_send) [`net_send_to`](#net_send_to) [`net_shutdown`](#net_shutdown) [`net_socket`](#net_socket)
 
 ## Functions
 
@@ -25,6 +25,12 @@ net_accept(fd: int, peer: *Endpoint) -> int
 net_bind(fd: int, at: *Endpoint) -> int
 ```
 
+### `net_bind_path`
+
+```sysl
+net_bind_path(fd: int, path: *u8, path_len: usize) -> int
+```
+
 ### `net_close`
 
 ```sysl
@@ -35,6 +41,12 @@ net_close(fd: int) -> int
 
 ```sysl
 net_connect(fd: int, to: *Endpoint) -> int
+```
+
+### `net_connect_path`
+
+```sysl
+net_connect_path(fd: int, path: *u8, path_len: usize) -> int
 ```
 
 ### `net_listen`

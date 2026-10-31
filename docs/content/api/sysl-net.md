@@ -4,7 +4,7 @@ layout: api-module
 headingShift: 0
 slugStyle: github
 module: sysl.net
-summary: "Blocking sockets -- a TCP stream, a UDP socket -- and the names a host resolves to."
+summary: "Sockets -- a TCP stream, a UDP socket, a Unix domain stream -- and the names a host resolves to."
 requires: "requires { os }"
 ---
 
@@ -19,25 +19,43 @@ leaves unanswered is refused when it is compiled. So the module names no C funct
 `send`, `recv`, `shutdown`, `close` -- because forty years of programs and of documentation are
 written in it, and a reader who knows it should not have to translate.
 
-## Blocking, and only blocking
+## Blocking, unless asked
 
-Every call here returns when its work is done. There is no event loop, no non-blocking mode and no
-readiness notification, and that is the line Rust draws too -- `std::net` is blocking and every
-async runtime is a package outside it. `sysl-lang/libuv` is where the event-loop story lives.
+Every call here returns when its work is done. There is no event loop and no readiness
+notification, and that is the line Rust draws too -- `std::net` is blocking and every async runtime
+is a package outside it. `sysl-lang/libuv` is where the event-loop story lives.
 
 **A timeout is the one thing a blocking call cannot do without**, because otherwise "returns when
 the work is done" can mean never. `read_timeout` and `write_timeout` are what bound it, and a call
 that hits one answers an error `timed_out` recognises.
 
+**`non_blocking` is for a program that already has a loop of its own** -- a frame, a tick -- and
+polls a socket once per turn: a call that would have had to wait answers an error `would_block`
+recognises instead, as Rust's `set_nonblocking` does.
+
+## Unix domain sockets
+
+`unix(path)` is an address, `unix_listen` makes the socket file and listens on it, and
+`unix_connect` answers a `Socket`, so a connection between two processes on one machine is read and
+written exactly as a TCP one is.
+
 ## What is deliberately out
 
-Multicast, broadcast, unix domain sockets, non-blocking mode, and every socket option beyond the
-timeouts and the one a listener needs. All of them are **additive**, so leaving them out costs a
-later release nothing.
+Multicast, broadcast, Unix datagram sockets and Linux's abstract namespace, and every socket option
+beyond the timeouts, non-blocking mode and the one a listener needs. All of them are **additive**,
+so leaving them out costs a later release nothing.
 
 ## Index
 
-[`ipv4`](#ipv4) [`ipv6`](#ipv6) [`resolve`](#resolve) [`resolve_passive`](#resolve_passive) [`socket`](#socket) [`timed_out`](#timed_out) [`udp_socket`](#udp_socket) [`Address`](#address) [`Family`](#family) [`Shutdown`](#shutdown) [`Socket`](#socket-1) [`UdpSocket`](#udpsocket) [Display for Address](#display-for-address)
+[`max_unix_path`](#max_unix_path) [`ipv4`](#ipv4) [`ipv6`](#ipv6) [`resolve`](#resolve) [`resolve_passive`](#resolve_passive) [`socket`](#socket) [`timed_out`](#timed_out) [`udp_socket`](#udp_socket) [`unix`](#unix) [`unix_connect`](#unix_connect) [`unix_listen`](#unix_listen) [`would_block`](#would_block) [`Address`](#address) [`Family`](#family) [`Shutdown`](#shutdown) [`Socket`](#socket-1) [`UdpSocket`](#udpsocket) [`UnixAddress`](#unixaddress) [`UnixListener`](#unixlistener) [Display for Address](#display-for-address) [Display for UnixAddress](#display-for-unixaddress)
+
+## Constants
+
+### `max_unix_path`
+
+```sysl
+const max_unix_path: usize = 103
+```
 
 ## Functions
 
@@ -126,6 +144,51 @@ udp_socket(for_address: Address) -> Result[UdpSocket, IoError]
 
 A datagram socket of the family an address belongs to, ready to be bound or connected.
 
+### `unix`
+
+```sysl
+unix(path: string) -> Result[UnixAddress, IoError]
+```
+
+The Unix domain address at `path`, absolute or relative to the working directory.
+
+**A path the platform's `sockaddr_un` cannot carry is refused here** rather than at the `bind`:
+one longer than `max_unix_path` bytes (103 on a BSD, 107 elsewhere -- the rest of `sun_path` is its
+terminator) is `ENAMETOOLONG`'s code, and an empty one or one holding a zero byte is `EINVAL`'s.
+Linux's abstract namespace, a path starting with a zero byte, is not offered.
+
+### `unix_connect`
+
+```sysl
+unix_connect(to: UnixAddress) -> Result[Socket, IoError]
+```
+
+A stream connected to the Unix domain socket at `to`. Nothing listening there is `NotFound` when
+there is no file, and refused (`ECONNREFUSED`) when the file is a socket nobody is listening on.
+
+### `unix_listen`
+
+```sysl
+unix_listen(at: UnixAddress, backlog: int = 128) -> Result[UnixListener, IoError]
+```
+
+Make the socket file at `at` and listen on it, with `backlog` connections allowed to queue.
+
+**A path that already holds something is refused** -- `EADDRINUSE`'s code, 48 on a BSD and 98
+under Linux -- rather than replaced, because what is there may be another program's live socket or
+not a socket at all. A server that owns its path removes it first with `sysl.fs.remove_file`.
+
+### `would_block`
+
+```sysl
+would_block(e: IoError) -> bool
+```
+
+Whether an error is a call on a non-blocking socket that would have had to wait -- an `accept`
+with nobody connecting, a `recv` with nothing arrived, a `send` with the buffer full -- rather than
+one that failed. It is `EAGAIN`'s code, 35 on a BSD and 11 elsewhere, and only a socket in
+non-blocking mode answers it: a blocking one whose timeout ran out answers `timed_out` instead.
+
 ## Types
 
 ### `Address`
@@ -175,7 +238,7 @@ How much of a connection is being given up.
 
 ```sysl
 struct Socket
-    private fd: i32
+    private[net] fd: i32
 ```
 
 A connection, or something listening for one. One type, because the sockets API has one.
@@ -199,6 +262,7 @@ the idiom.
 | `read_timeout` | `read_timeout(*self, ms: int) -> Result[unit, IoError]` | How long a `recv` may wait before giving up, in milliseconds. |
 | `write_timeout` | `write_timeout(*self, ms: int) -> Result[unit, IoError]` | How long a `send` may wait before giving up, in milliseconds. |
 | `reuse_address` | `reuse_address(*self, on: bool = true) -> Result[unit, IoError]` | Let a listener take a port that a recently stopped one was using, so that a server just stopped can be started again without waiting out `TIME_WAIT`. |
+| `non_blocking` | `non_blocking(*self, on: bool = true) -> Result[unit, IoError]` | Put this socket in non-blocking mode, or take it out again. |
 
 ### `UdpSocket`
 
@@ -228,6 +292,41 @@ Not closed by going out of scope, for the reason `Socket` is not.
 | `local` | `local(self) -> Result[Address, IoError]` | Where this socket is bound. |
 | `read_timeout` | `read_timeout(*self, ms: int) -> Result[unit, IoError]` | How long a receive may wait before giving up, in milliseconds. |
 | `write_timeout` | `write_timeout(*self, ms: int) -> Result[unit, IoError]` | How long a send may wait before giving up, in milliseconds. |
+| `non_blocking` | `non_blocking(*self, on: bool = true) -> Result[unit, IoError]` | Put this socket in non-blocking mode, or take it out again: a receive with no datagram waiting then answers an error `would_block` recognises instead of waiting. |
+| `close` | `close(*self) -> Result[unit, IoError]` | Give the descriptor back. |
+
+### `UnixAddress`
+
+```sysl
+struct UnixAddress
+    private at: string
+```
+
+Where a Unix domain socket is: a path in the filesystem, which `unix` checks the platform's
+address can carry.
+
+The socket file it names is made by `unix_listen` and **is not removed by anything here** --
+`sysl.fs.remove_file` is the call, before listening again at the same path and after the listener
+is closed. Who may connect is the file's permission bits, which `sysl.fs.set_permissions` sets.
+
+| Member | Signature | Description |
+|---|---|---|
+| `path` | `path(self) -> string` | The path, exactly as it was given. |
+
+### `UnixListener`
+
+```sysl
+struct UnixListener
+    private fd: i32
+```
+
+A Unix domain socket listening for connections. Not closed by going out of scope, for the reason
+`Socket` is not.
+
+| Member | Signature | Description |
+|---|---|---|
+| `accept` | `accept(*self) -> Result[Socket, IoError]` | Wait for a connection, and answer it. |
+| `non_blocking` | `non_blocking(*self, on: bool = true) -> Result[unit, IoError]` | Put this listener in non-blocking mode, or take it out again. |
 | `close` | `close(*self) -> Result[unit, IoError]` | Give the descriptor back. |
 
 ## Implementations
@@ -241,3 +340,11 @@ impl Display for Address
 So that printing one says where it is rather than how it is stored: `127.0.0.1:8080`, and
 `[::1]:8080` -- the brackets are not decoration, a v6 address having colons in it, so `::1:8080`
 cannot be read apart. It is the form the URL syntax settled on.
+
+### Display for UnixAddress
+
+```sysl
+impl Display for UnixAddress
+```
+
+So that printing one prints the path.

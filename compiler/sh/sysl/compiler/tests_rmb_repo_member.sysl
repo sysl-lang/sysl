@@ -1,0 +1,448 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{entries, is_dir, make_dir_all, make_temp_dir, read_text, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.{cstring, join, Search}
+
+// A dependency on a MEMBER of a repository, `member = "<dir>"` beside `git`
+// (`reference/packages.md § A member of a repository`): what the manifest accepts and refuses, the
+// identity it reads as, the one clone two members share, the `sysl.sum` lines, a member's siblings
+// fetched at the same tag, and `sysl add`'s spelling of it.
+//
+// **The repository is a real one, made on this machine**, and `github.com` is redirected to it through
+// git's own `url.<base>.insteadOf` in the environment every `git` this process starts inherits, so
+// nothing reaches the network. At `v0.1.0` it is a workspace: the root package `rep`, a member `pool`
+// naming the root with `workspace = true`, a member `util` naming nothing, a member `sib` naming
+// `util` with `path = "../util"`, and a directory `notpkg` that is no package. `v0.2.0` adds `late`.
+
+private extern "setenv" rmb_c_setenv(name: *u8, value: *u8, overwrite: int) -> int
+
+private rmb_set(name: string, value: string)
+    val k = cstring(name)
+    val v = cstring(value)
+
+    rmb_c_setenv(k.ptr, v.ptr, 1)
+
+private rmb_read(entry: string) -> Result[Manifest, string] =
+    read_manifest(s"dependencies { $entry }")
+
+private rmb_v(minor: usize) -> Release = Release(0, minor, 0, "")
+
+private rmb_digest(c: string) -> string
+    var out = DigestPrefix
+
+    for i in 0..<64
+        out = out + c
+
+    out
+end rmb_digest
+
+private rmb_git(dir: string, args: []const string)
+    var all: Buf[string] = buf()
+
+    all.push("-C")
+    all.push(dir)
+    all.push("-c")
+    all.push("user.name=t")
+    all.push("-c")
+    all.push("user.email=t@t")
+
+    for a in args
+        all.push(a)
+
+    val o = capture("git", all.view(), "", [], true).unwrap()
+
+    assert(o.status.ok(), s"git ${args[0]} failed: ${o.err.unwrap_or("")}")
+end rmb_git
+
+private rmb_package(dir: string, name: string, deps: string, unit: string, body: string)
+    make_dir_all(s"$dir/$unit").unwrap()
+    write_text(s"$dir/sysl.hocon", s"package { name = \"$name\", version = \"0.1.0\" }\n$deps").unwrap()
+    write_text(s"$dir/$unit/$unit.sysl", s"module $unit\n\n$body\n").unwrap()
+end rmb_package
+
+// The repository at `<base>/e/rep.git`, tagged `v0.1.0` and `v0.2.0`; answers `<base>`.
+private rmb_repo() -> string
+    val base = absolute_path(make_temp_dir("sysl-rmb-git").unwrap())
+    val dir = s"$base/e/rep.git"
+
+    make_dir_all(dir).unwrap()
+    rmb_git(dir, ["init", "--quiet"])
+    rmb_package(dir, "rep", "workspace = [\"pool\", \"util\", \"sib\"]\n", "rep", "base() -> int = 40")
+    rmb_package(s"$dir/pool", "rep-pool", "dependencies { rep { workspace = true } }\n", "rep_pool",
+                "answer() -> int = rep.base() + 2")
+    rmb_package(s"$dir/util", "rep-util", "", "rep_util", "seven() -> int = 7")
+    rmb_package(s"$dir/sib", "rep-sib", "dependencies { util { path = \"../util\" } }\n", "rep_sib",
+                "twice() -> int = rep_util.seven() * 2")
+    make_dir_all(s"$dir/notpkg").unwrap()
+    write_text(s"$dir/notpkg/notes.txt", "not a package\n").unwrap()
+    rmb_git(dir, ["add", "-A"])
+    rmb_git(dir, ["commit", "--quiet", "-m", "one"])
+    rmb_git(dir, ["tag", "v0.1.0"])
+
+    rmb_package(dir, "rep", "workspace = [\"pool\", \"util\", \"sib\", \"late\"]\n", "rep",
+                "base() -> int = 40")
+    rmb_package(s"$dir/late", "rep-late", "", "rep_late", "late() -> int = 2")
+    rmb_git(dir, ["add", "-A"])
+    rmb_git(dir, ["commit", "--quiet", "-m", "two"])
+    rmb_git(dir, ["tag", "v0.2.0"])
+
+    rmb_set("GIT_CONFIG_COUNT", "1")
+    rmb_set("GIT_CONFIG_KEY_0", s"url.file://$base/.insteadOf")
+    rmb_set("GIT_CONFIG_VALUE_0", "https://github.com/")
+    base
+end rmb_repo
+
+private rmb_project(deps: string) -> string
+    val root = absolute_path(make_temp_dir("sysl-rmb-project").unwrap())
+
+    write_text(join_path(root, ManifestName),
+               s"package { name = \"app\", version = \"0.1.0\" }\ndependencies { $deps }\n").unwrap()
+    root
+end rmb_project
+
+private rmb_cache() -> string = absolute_path(make_temp_dir("sysl-rmb-cache").unwrap())
+
+private rmb_resolve(root: string, sums: Sums, cache: string) -> Result[Graph, string] =
+    resolve_graph(root, manifest_of_package(root).unwrap(), sums, cache)
+
+// Each package of a graph other than the root, as `<canonical>@<version>`, in the graph's order.
+private rmb_packages(g: &Graph) -> string
+    var out: Buf[string] = buf()
+
+    for p in g.packages
+        if !is_root_package(p) then out.push(s"${p.canonical}@${release_shown(p.version.unwrap())}")
+
+    join(out.view(), " ")
+end rmb_packages
+
+private rmb_dir_of(g: &Graph, canonical: string) -> string
+    for p in g.packages
+        if p.canonical == canonical then return p.root
+
+    "<none>"
+end rmb_dir_of
+
+// The coordinates `sysl.sum` records, in the order the file is written in.
+private rmb_recorded(sums: &Sums) -> string
+    var out: Buf[string] = buf()
+
+    for e in sums_read(sums_render(sums)).unwrap().entries
+        out.push(s"${e.coordinate} ${release_tag(e.version)}")
+
+    join(out.view(), ", ")
+end rmb_recorded
+
+private rmb_clean(dirs: []const string)
+    for d in dirs
+        remove_dir_all(d).unwrap_or(())
+
+// -- the manifest -----------------------------------------------------------------------------------
+
+@test("rmb: a member reads as the repository's coordinate, '//', and the directory")
+rmb_member_identity()
+    val m = rmb_read("pool { git = \"github.com/e/rep\", member = \"pool\", version = \"0.1.0\" }").unwrap()
+    val d = m.dependencies.at(0)
+
+    assert_eq(dependency_coordinate(d).unwrap(), "github.com/e/rep//pool")
+    assert_eq(dependency_canonical(d), "github.com.e.rep.pool")
+    assert_eq(coordinate_repository("github.com/e/rep//pool"), "github.com/e/rep")
+    assert_eq(coordinate_member("github.com/e/rep//pool"), "pool")
+    assert_eq(clone_url("github.com/e/rep//pool"), "https://github.com/e/rep.git")
+    assert_eq(fetch_directory("/c", "github.com/e/rep//pool", rmb_v(1)), "/c/github.com/e/rep/@v0.1.0")
+    assert_eq(package_directory("/c", "github.com/e/rep//pool", rmb_v(1)),
+              "/c/github.com/e/rep/@v0.1.0/pool")
+
+    // A nested member keeps its slashes in the coordinate and its dots in the prefix.
+    val nested = rmb_read("w { git = \"github.com/e/rep\", member = \"tools/w\", version = \"0.1.0\" }")
+        .unwrap()
+
+    assert_eq(dependency_canonical(nested.dependencies.at(0)), "github.com.e.rep.tools.w")
+
+@test("rmb: the root coordinate reads exactly as it did")
+rmb_root_coordinate_unchanged()
+    val m = rmb_read("rep { git = \"github.com/e/rep\", version = \"0.1.0\" }").unwrap()
+    val d = m.dependencies.at(0)
+
+    assert_eq(dependency_coordinate(d).unwrap(), "github.com/e/rep")
+    assert_eq(dependency_canonical(d), "github.com.e.rep")
+    assert_eq(coordinate_member("github.com/e/rep"), "")
+    assert_eq(package_directory("/c", "github.com/e/rep", rmb_v(1)), "/c/github.com/e/rep/@v0.1.0")
+
+@test("rmb: a member of a /vN coordinate keeps the major on the repository")
+rmb_member_of_a_major()
+    val m = rmb_read("p { git = \"github.com/e/rep/v2\", member = \"pool\", version = \"2.1.0\" }").unwrap()
+
+    assert_eq(dependency_canonical(m.dependencies.at(0)), "github.com.e.rep.v2.pool")
+    assert_eq(clone_url("github.com/e/rep/v2//pool"), "https://github.com/e/rep.git")
+    assert_eq(repository_name("github.com/e/rep/v2//pool"), "rep")
+    assert(rmb_read("p { git = \"github.com/e/rep/v2\", member = \"pool\", version = \"1.0.0\" }")
+               .unwrap_err().contains("ending '/v2'"))
+
+@test("rmb: a member with a pinned rev reads, and is pinned at the sha")
+rmb_member_with_rev()
+    val m = rmb_read("p { git = \"github.com/e/rep\", member = \"pool\", rev = \"0123456\" }").unwrap()
+
+    assert_eq(dependency_coordinate(m.dependencies.at(0)).unwrap(), "github.com/e/rep//pool")
+    assert(is_rev(dependency_version(m.dependencies.at(0)).unwrap()))
+
+@test("rmb: a member beside a path is refused, with the exact error")
+rmb_member_with_path_refused()
+    assert_eq(rmb_read("p { path = \"../rep\", member = \"pool\" }").unwrap_err(),
+              "'dependencies.p' names a 'path' and a 'member' — a member is a directory of the " +
+              "repository a 'git' coordinate fetches, and a path dependency names its directory " +
+              "itself: write the member's directory into the 'path'")
+
+@test("rmb: a member beside workspace = true is refused")
+rmb_member_with_workspace_refused()
+    assert(rmb_read("p { workspace = true, member = \"pool\" }").unwrap_err()
+               .starts_with("'dependencies.p' names 'workspace = true' and a 'git'"))
+
+@test("rmb: a member that is not a directory below the repository is refused, with the exact error")
+rmb_member_not_below_refused()
+    val want = "'dependencies.p.member' is '../x', which is not a directory below the repository — a " +
+               "member is written relative to the repository's root, as its workspace lists it; leave " +
+               "'member' out to name the root package"
+
+    assert_eq(rmb_read("p { git = \"github.com/e/rep\", member = \"../x\", version = \"0.1.0\" }")
+                  .unwrap_err(), want)
+
+    for bad in [".", "", "/abs", "a//b", "a/", "a/./b", "a/../b", "c:d", "a\\\\b"]
+        assert(rmb_read(s"p { git = \"github.com/e/rep\", member = \"$bad\", version = \"0.1.0\" }")
+                   .is_err(), bad)
+
+    assert(rmb_read("p { git = \"github.com/e/rep\", member = [x], version = \"0.1.0\" }").unwrap_err()
+               .starts_with("'dependencies.p.member' is not a string"))
+
+@test("rmb: the root and a member of one repository are two dependencies; one member twice is one too many")
+rmb_unique_by_member()
+    assert(rmb_read("rep { git = \"github.com/e/rep\", version = \"0.1.0\" }, " +
+                    "pool { git = \"github.com/e/rep\", member = \"pool\", version = \"0.1.0\" }").is_ok())
+    assert_eq(rmb_read("a { git = \"github.com/e/rep\", member = \"pool\", version = \"0.1.0\" }, " +
+                       "b { git = \"github.com/e/rep\", member = \"pool\", version = \"0.1.0\" }")
+                  .unwrap_err(),
+              "'github.com/e/rep//pool' is named by 'a' and 'b' — one package is one dependency, and " +
+              "a module gets one version of it")
+
+@test("rmb: a member's sysl.sum line reads back byte for byte beside the root's")
+rmb_sum_line_is_stable()
+    val text = s"github.com/e/rep v0.1.0 ${rmb_digest("a")}\n" +
+               s"github.com/e/rep//pool v0.1.0 ${rmb_digest("a")}\n"
+    val sums = sums_read(text).unwrap()
+
+    assert_eq(sum_of(sums, "github.com/e/rep//pool", rmb_v(1)).unwrap(), rmb_digest("a"))
+    assert_eq(sums_render(sums), text)
+
+// -- resolution, against the repository made here ---------------------------------------------------
+
+@test("rmb: a member is fetched, read from its directory, and recorded under its own coordinate")
+rmb_member_resolved()
+    val base = rmb_repo()
+    val cache = rmb_cache()
+    val root = rmb_project("util { git = \"github.com/e/rep\", member = \"util\", version = \"0.1.0\" }")
+    val g = rmb_resolve(root, empty_sums(), cache).unwrap()
+
+    assert_eq(rmb_packages(g), "github.com.e.rep.util@0.1.0")
+    assert_eq(rmb_dir_of(g, "github.com.e.rep.util"), s"$cache/github.com/e/rep/@v0.1.0/util")
+    assert_eq(rmb_recorded(g.sums), "github.com/e/rep//util v0.1.0")
+    assert_eq(sum_of(g.sums, "github.com/e/rep//util", rmb_v(1)).unwrap(),
+              recorded_hash(fetch_directory(cache, "github.com/e/rep", rmb_v(1))).unwrap())
+
+    // Again against what was recorded: the same answer, and the file unchanged.
+    val again = rmb_resolve(root, g.sums, cache).unwrap()
+
+    assert(!again.sums_changed)
+    assert_eq(rmb_packages(again), "github.com.e.rep.util@0.1.0")
+    rmb_clean([base, cache, root])
+
+@test("rmb: a member naming its root with workspace = true gets the root at the same tag")
+rmb_member_names_root_by_workspace()
+    val base = rmb_repo()
+    val cache = rmb_cache()
+    val root = rmb_project("pool { git = \"github.com/e/rep\", member = \"pool\", version = \"0.1.0\" }")
+    val g = rmb_resolve(root, empty_sums(), cache).unwrap()
+
+    assert_eq(rmb_packages(g), "github.com.e.rep@0.1.0 github.com.e.rep.pool@0.1.0")
+    assert_eq(rmb_dir_of(g, "github.com.e.rep"), s"$cache/github.com/e/rep/@v0.1.0")
+    assert_eq(rmb_recorded(g.sums), "github.com/e/rep v0.1.0, github.com/e/rep//pool v0.1.0")
+    rmb_clean([base, cache, root])
+
+@test("rmb: a member naming a sibling with path = \"../util\" gets the sibling at the same tag")
+rmb_member_names_sibling_by_path()
+    val base = rmb_repo()
+    val cache = rmb_cache()
+    val root = rmb_project("sib { git = \"github.com/e/rep\", member = \"sib\", version = \"0.1.0\" }")
+    val g = rmb_resolve(root, empty_sums(), cache).unwrap()
+
+    assert_eq(rmb_packages(g), "github.com.e.rep.sib@0.1.0 github.com.e.rep.util@0.1.0")
+    assert_eq(rmb_recorded(g.sums), "github.com/e/rep//sib v0.1.0, github.com/e/rep//util v0.1.0")
+    rmb_clean([base, cache, root])
+
+@test("rmb: two members of one repository at one tag share one clone and one cache entry")
+rmb_two_members_one_fetch()
+    val base = rmb_repo()
+    val cache = rmb_cache()
+    val root = rmb_project("pool { git = \"github.com/e/rep\", member = \"pool\", version = \"0.1.0\" }, " +
+                           "util { git = \"github.com/e/rep\", member = \"util\", version = \"0.1.0\" }")
+    val g = rmb_resolve(root, empty_sums(), cache).unwrap()
+
+    assert_eq(rmb_packages(g),
+              "github.com.e.rep@0.1.0 github.com.e.rep.pool@0.1.0 github.com.e.rep.util@0.1.0")
+    assert_eq(join(sort_names(entries(s"$cache/github.com/e/rep").unwrap()).view(), " "),
+              "@v0.1.0 @v0.1.0.hash")
+
+    // Three lines, one per package, each pinning the one tree that was fetched.
+    val tree = recorded_hash(fetch_directory(cache, "github.com/e/rep", rmb_v(1))).unwrap()
+
+    assert_eq(rmb_recorded(g.sums),
+              "github.com/e/rep v0.1.0, github.com/e/rep//pool v0.1.0, github.com/e/rep//util v0.1.0")
+
+    for e in g.sums.entries
+        assert_eq(e.hash, tree)
+
+    rmb_clean([base, cache, root])
+
+@test("rmb: a member at one tag and the root asked for at a later one are selected apart")
+rmb_member_and_newer_root()
+    val base = rmb_repo()
+    val cache = rmb_cache()
+    val root = rmb_project("rep { git = \"github.com/e/rep\", version = \"0.2.0\" }, " +
+                           "pool { git = \"github.com/e/rep\", member = \"pool\", version = \"0.1.0\" }")
+    val g = rmb_resolve(root, empty_sums(), cache).unwrap()
+
+    // The root is a package of its own, so its highest minimum wins; the member stays where asked.
+    assert_eq(rmb_packages(g), "github.com.e.rep@0.2.0 github.com.e.rep.pool@0.1.0")
+    assert_eq(rmb_dir_of(g, "github.com.e.rep.pool"), s"$cache/github.com/e/rep/@v0.1.0/pool")
+    rmb_clean([base, cache, root])
+
+@test("rmb: a member that exists only at a later tag is refused at the earlier one, with the exact error")
+rmb_missing_member_refused()
+    val base = rmb_repo()
+    val cache = rmb_cache()
+    val early = rmb_project("late { git = \"github.com/e/rep\", member = \"late\", version = \"0.1.0\" }")
+
+    assert_eq(rmb_resolve(early, empty_sums(), cache).unwrap_err(),
+              "github.com/e/rep v0.1.0 has no member 'late' — there is no directory 'late' in the " +
+              "repository at that version")
+
+    val later = rmb_project("late { git = \"github.com/e/rep\", member = \"late\", version = \"0.2.0\" }")
+
+    assert_eq(rmb_packages(rmb_resolve(later, empty_sums(), cache).unwrap()), "github.com.e.rep.late@0.2.0")
+    rmb_clean([base, cache, early, later])
+
+@test("rmb: a member directory that is no package is refused, with the exact error")
+rmb_non_package_refused()
+    val base = rmb_repo()
+    val cache = rmb_cache()
+    val root = rmb_project("n { git = \"github.com/e/rep\", member = \"notpkg\", version = \"0.1.0\" }")
+
+    assert_eq(rmb_resolve(root, empty_sums(), cache).unwrap_err(),
+              "github.com/e/rep v0.1.0 has a directory 'notpkg' and no sysl.hocon in it — a member is " +
+              "a package, and a package is a directory holding one")
+    rmb_clean([base, cache, root])
+
+@test("rmb: a member's sum line that disagrees is caught, on a fresh clone and on a warm cache")
+rmb_sum_mismatch_caught()
+    val base = rmb_repo()
+    val cache = rmb_cache()
+    val root = rmb_project("util { git = \"github.com/e/rep\", member = \"util\", version = \"0.1.0\" }")
+    val bad = sums_read(s"github.com/e/rep//util v0.1.0 ${rmb_digest("0")}\n").unwrap()
+    val want = "'github.com/e/rep//util' does not hash to what sysl.sum records for " +
+               "github.com/e/rep//util v0.1.0\n"
+
+    // Fresh: the clone is checked before it is put in place.
+    val fresh = rmb_resolve(root, bad, cache).unwrap_err()
+
+    assert(fresh.starts_with(want), fresh)
+    assert(!is_dir(fetch_directory(cache, "github.com/e/rep", rmb_v(1))))
+
+    // Warm: the root's clone is in the cache and agrees with its own line, and the member's is wrong.
+    val other = rmb_project("rep { git = \"github.com/e/rep\", version = \"0.1.0\" }")
+
+    rmb_resolve(other, empty_sums(), cache).unwrap()
+
+    val warm = rmb_resolve(root, bad, cache).unwrap_err()
+
+    assert(warm.starts_with(want), warm)
+    rmb_clean([base, cache, root, other])
+
+@test("rmb: vendoring two members of one repository copies the one clone")
+rmb_vendor_two_members()
+    val base = rmb_repo()
+    val cache = rmb_cache()
+    val root = rmb_project("pool { git = \"github.com/e/rep\", member = \"pool\", version = \"0.1.0\" }, " +
+                           "util { git = \"github.com/e/rep\", member = \"util\", version = \"0.1.0\" }")
+    val v = vendor_into(root, cache).unwrap()
+
+    assert_eq(v.selected, usize(3))
+    assert_eq(v.copied, usize(1))
+    assert(is_dir(s"$root/vendor/github.com/e/rep/@v0.1.0/pool"))
+
+    // And the project then builds its graph out of vendor/, with the network unreachable.
+    rmb_set("GIT_CONFIG_VALUE_0", "https://nowhere.invalid/")
+
+    val g = rmb_resolve(root, sums_at(root).unwrap(), cache_root(root).unwrap()).unwrap()
+
+    assert_eq(rmb_dir_of(g, "github.com.e.rep.util"), s"$root/vendor/github.com/e/rep/@v0.1.0/util")
+    rmb_clean([base, cache, root])
+
+// -- the build, and `sysl add` ----------------------------------------------------------------------
+
+private rmb_cli(args: []string) -> (int, string)
+    var lines: Buf[string] = buf()
+    val sink = &lines
+    val code = run_cli(args, (line) -> sink.push(line))
+
+    (code, join(lines.view(), "\n"))
+end rmb_cli
+
+@test("rmb: a library imports a fetched member, and through it the root the member names")
+rmb_member_imported()
+    if !(std_root().is_ok() && clang_available()) then return
+
+    val base = rmb_repo()
+    val lib = absolute_path(make_temp_dir("sysl-rmb-lib").unwrap())
+
+    make_dir_all(s"$lib/vendor").unwrap()
+    make_dir_all(s"$lib/rmb").unwrap()
+    write_text(s"$lib/sysl.hocon", "package { name = \"rmb\", version = \"1.0.0\" }\n" +
+               "dependencies {\n" +
+               "  pool { git = \"github.com/e/rep\", member = \"pool\", version = \"0.1.0\" }\n" +
+               "  sib { git = \"github.com/e/rep\", member = \"sib\", version = \"0.1.0\" }\n" +
+               "}\n").unwrap()
+    write_text(s"$lib/rmb/rmb.sysl",
+               "module rmb\n\nanswer() -> int = rep_pool.answer() + rep_sib.twice()\n").unwrap()
+
+    val got = rmb_cli(["sysl", "build-lib", lib])
+
+    assert_eq(got.0, Fine, got.1)
+    assert_eq(got.1, s"checked $lib")
+    assert(is_dir(s"$lib/vendor/github.com/e/rep/@v0.1.0"))
+    rmb_clean([base, lib])
+
+@test("rmb: sysl add writes a member as git and member, read back as the same coordinate")
+rmb_add_writes_member()
+    val asked = read_add_spec("github.com/e/rep//tools/w@v0.1.0").unwrap()
+
+    assert_eq(asked.coordinate, "github.com/e/rep//tools/w")
+    assert_eq(asked.label, "w")
+    assert_eq(asked.version.unwrap(), "0.1.0")
+    assert(read_add_spec("github.com/e/rep//../x@0.1.0").unwrap_err()
+               .starts_with("'github.com/e/rep//../x' names the member '../x', which is not a directory"))
+
+    val dir = absolute_path(make_temp_dir("sysl-rmb-add").unwrap())
+
+    write_text(s"$dir/sysl.hocon", "package { name = \"app\", version = \"0.1.0\" }\n").unwrap()
+
+    val got = rmb_cli(["sysl", "add", "github.com/e/rep//pool@0.1.0", dir])
+
+    assert_eq(got.0, Fine, got.1)
+
+    val text = read_text(s"$dir/sysl.hocon").unwrap()
+
+    assert(text.contains("pool { git = \"github.com/e/rep\", member = \"pool\", version = \"0.1.0\" }"), text)
+    assert_eq(dependency_coordinate(read_manifest(text).unwrap().dependencies.at(0)).unwrap(),
+              "github.com/e/rep//pool")
+    rmb_clean([dir])

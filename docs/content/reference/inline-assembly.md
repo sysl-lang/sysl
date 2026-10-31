@@ -899,15 +899,100 @@ hand_over(job: u64, target: u64)
 
 **The orderings and the barriers are therefore not two levels of one tool.** An `Ordering` is the
 portable answer between two threads accessing memory; a barrier is the answer wherever one side is
-not a memory access. Only AArch64 has these forms, which is why they are refused on every other
-processor. For the same reason the forms take no `Ordering` argument: the barrier is the instruction
+not a memory access. The forms take no `Ordering` argument for the same reason: the barrier is the instruction
 that does the ordering, and which barrier is right depends on what the register's effect observes,
 which no ordering expresses.
 
+### Barriers on an M-profile core
+
+A Cortex-M core (Thumb: `thumbv6m`, `thumbv7m`, `thumbv7em` and `thumbv8m` targets) has `dsb`,
+`dmb` and `isb` too, and the same three forms build them, as `llvm.arm.dsb`/`dmb`/`isb`. The
+architecture defines one option there, `sy`, so that is the only word a barrier takes on Thumb:
+
+```sysl build=c target=thumbv6m-freestanding
+var vectors: u32 = 0
+
+@export("relocate")
+relocate(table: u32)
+    vectors = table
+    dsb(sy)
+    isb()
+```
+
+```sysl target=thumbv6m-freestanding
+dmb(ish)
+```
+
+```error
+an M-profile core's 'dmb' has only the option 'sy' — the architecture reserves every other one there — so it is written dmb(sy)
+```
+
+## Hints: waiting and signalling
+
+Five more forms are the hint instructions a core uses to sleep until something happens and to wake
+the others. Each takes nothing:
+
+| form | instruction | AArch64 | M-profile Thumb | RISC-V |
+|---|---|---|---|---|
+| `wfe()` | wait for an event (or an interrupt) | yes | yes | — |
+| `wfi()` | wait for an interrupt | yes | yes | yes |
+| `sev()` | send an event to every core | yes | yes | — |
+| `sevl()` | send an event to this core only | yes | — | — |
+| `nop()` | nothing, taking one slot | yes | yes | yes |
+
+The busy-wait hint, `yield` on Arm and `pause` elsewhere, is
+[`sysl.sync.spin_hint()`](/library/sync/#spin-hint), which every processor has an answer for.
+
+On AArch64 each form is `llvm.aarch64.hint` and on Thumb `llvm.arm.hint`, with the instruction's
+number in the architecture's hint space (0 `nop`, 2 `wfe`, 3 `wfi`, 4 `sev`, 5 `sevl`). RISC-V's
+`wfi` and `nop` have no LLVM intrinsic, so each is the instruction as `sideeffect` assembly that
+clobbers memory. This is what clang's `__builtin_arm_wfe()` and Rust's `core::arch::arm::__wfe()` are
+too.
+
+**Each hint keeps program order, like a barrier.** No load or store is moved across one, and none is
+deleted because it looks unused; a `nop()` written twice is two `nop`s. That is what makes the loop
+a core waits in correct: the flag is read again after every `wfe`, rather than once before the loop.
+
+```sysl build=c target=thumbv6m-freestanding
+var ready: u32 = 0
+
+@export("wait_for_other_core")
+wait_for_other_core()
+    while ready == 0
+        wfe()
+
+@export("release_other_core")
+release_other_core()
+    ready = 1
+    dsb(sy)
+    sev()
+```
+
+The `dsb(sy)` there is the processor's half: it makes the store visible before the event goes out,
+which keeping program order in the compiler does not do on its own.
+
+```sysl build=c target=aarch64-freestanding
+@export("park")
+park()
+    sevl()
+    loop
+        wfe()
+        wfi()
+```
+
+```sysl build=c target=riscv32-freestanding
+@export("idle")
+idle()
+    loop
+        wfi()
+        nop()
+```
+
 ### On other processors
 
-**Every other processor refuses all nine forms**, naming the target, so a module that uses them on
-AArch64 and is also built for other processors puts those lines behind `#if aarch64`:
+**A processor without an instruction refuses its form**, naming the target and the processors that
+have it, so a module that uses one and is also built for other processors puts those lines behind an
+`#if` for one of them. The system registers and maintenance forms are AArch64's alone:
 
 ```sysl target=riscv64-freestanding
 print(read_sysreg("cntfrq_el0"))
@@ -917,8 +1002,24 @@ print(read_sysreg("cntfrq_el0"))
 'read_sysreg' is an AArch64 instruction, and 'riscv64-freestanding' is riscv64 — put the code that uses it behind '#if aarch64'
 ```
 
-The nine names apply only where nothing else claims them: if a function or a local is called `isb`
-or `at`, then `isb()` or `at(...)` calls it.
+```sysl target=riscv64-freestanding
+wfe()
+```
+
+```error
+'wfe' is an instruction of AArch64 and M-profile Thumb, and 'riscv64-freestanding' is riscv64 — put the code that uses it behind '#if aarch64' or '#if thumb'
+```
+
+```sysl target=thumbv6m-freestanding
+sevl()
+```
+
+```error
+'sevl' is an AArch64 instruction, and 'thumbv6m-freestanding' is thumb — put the code that uses it behind '#if aarch64'
+```
+
+The fourteen names apply only where nothing else claims them: if a function or a local is called
+`isb`, `at` or `nop`, then `isb()`, `at(...)` or `nop()` calls it.
 
 ## What is not here yet
 
