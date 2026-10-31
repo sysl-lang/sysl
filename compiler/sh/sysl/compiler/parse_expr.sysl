@@ -125,6 +125,24 @@ end is_compare_op
 // An expression, at the outermost level.
 parse_expr(p: *Parser) -> Expr = parse_expr_bp(p, 0)
 
+// The one-line expression after a `=` or a `->`. **A word that only a statement can begin is named
+// for what it is** rather than refused as a missing expression: the author wrote a statement where
+// the form takes a value, and the way out is a block under the `=`. `owner` is the form, as it is
+// spoken of in the sentence.
+parse_one_line(p: *Parser, owner: string) -> Expr
+    for word in ["val", "var", "const", "return"]
+        if p.at_kw(word)
+            val at = p.here()
+
+            p.fault(at, s"'${word}' begins a statement, and ${owner} is an expression \u{2014} put it in a block on the next line")
+
+            return expr(at, Bad)
+        end if
+    end for
+
+    parse_expr(p)
+end parse_one_line
+
 // An expression, at a given binding power.
 //
 // The two forms that are not operator expressions are read around the loop rather than inside it: a
@@ -312,7 +330,7 @@ private parse_lambda_body(p: *Parser) -> Buf[Stmt]
 
     var out: Buf[Stmt] = buf()
     val start = p.here()
-    val e = parse_expr(p)
+    val e = parse_one_line(p, "a closure's '->' body")
 
     out.push(stmt(start.to(p.just_taken()), ExprStmt(lift_placeholders(e))))
     out
