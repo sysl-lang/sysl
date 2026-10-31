@@ -1,0 +1,127 @@
+module sysl.math
+@tests
+@requires(heap)
+
+import sysl.hint.black_box
+
+// The `max`, `min` and `clamp` methods of every float width: Rust's semantics, which are IEEE
+// maxNum and minNum for the first two (a NaN loses to a number) and a panicking range for `clamp`.
+
+@test("fmm: max and min pick the right end at every width")
+fmm_ordinary()
+    assert_eq(black_box(1.0).max(2.0), 2.0)
+    assert_eq(black_box(1.0).min(2.0), 1.0)
+    assert_eq(black_box(2.0).max(1.0), 2.0)
+    assert_eq(black_box(2.0).min(1.0), 1.0)
+    assert_eq(black_box(-3.0f32).max(-4.0f32), -3.0f32)
+    assert_eq(black_box(-3.0f32).min(-4.0f32), -4.0f32)
+    assert_eq(1.5f16.max(2.5f16), 2.5f16)
+    assert_eq(1.5f16.min(2.5f16), 1.5f16)
+    assert_eq(1.5bf16.max(-2.5bf16), 1.5bf16)
+    assert_eq(1.5bf16.min(-2.5bf16), -2.5bf16)
+
+    val inf = black_box(real.infinity())
+
+    assert_eq(inf.max(1.0), inf)
+    assert_eq((-inf).min(1.0), -inf)
+    assert_eq(inf.min(1.0), 1.0)
+end fmm_ordinary
+
+@test("fmm: the type annotated as f64, the case a user wrote first")
+fmm_declared_f64()
+    val a: f64 = 1.0
+
+    assert_eq(a.max(2.0), 2.0)
+    assert_eq(a.min(2.0), 1.0)
+end fmm_declared_f64
+
+@test("fmm: a NaN on either side loses to the number, at every width")
+fmm_nan()
+    val nan = black_box(real.nan())
+    val fnan = black_box(f32.nan())
+
+    assert_eq(nan.max(1.0), 1.0)
+    assert_eq(black_box(1.0).max(nan), 1.0)
+    assert_eq(nan.min(-1.0), -1.0)
+    assert_eq(black_box(-1.0).min(nan), -1.0)
+    assert_eq(fnan.max(3.0f32), 3.0f32)
+    assert_eq(black_box(3.0f32).min(fnan), 3.0f32)
+    assert_eq(f16.nan().max(1.0f16), 1.0f16)
+    assert_eq(1.0bf16.min(bf16.nan()), 1.0bf16)
+
+    assert(nan.max(nan).is_nan())
+    assert(nan.min(nan).is_nan())
+    assert(fnan.max(fnan).is_nan())
+    assert(f16.nan().min(f16.nan()).is_nan())
+end fmm_nan
+
+// Two zeros of opposite sign compare equal, and the answer is whichever the platform's fmax/fmin
+// returns: only equality with zero is promised, and `maximum` / `minimum` are the ordered pair.
+@test("fmm: opposite zeros answer a zero")
+fmm_signed_zero()
+    val nz = black_box(-0.0)
+    val pz = black_box(0.0)
+
+    assert_eq(nz.max(pz), 0.0)
+    assert_eq(pz.max(nz), 0.0)
+    assert_eq(nz.min(pz), 0.0)
+    assert_eq(pz.min(nz), 0.0)
+end fmm_signed_zero
+
+@test("fmm: clamp holds a value to the range at every width")
+fmm_clamp()
+    assert_eq(black_box(5.0).clamp(0.0, 3.0), 3.0)
+    assert_eq(black_box(-5.0).clamp(0.0, 3.0), 0.0)
+    assert_eq(black_box(2.0).clamp(0.0, 3.0), 2.0)
+    assert_eq(black_box(0.0).clamp(0.0, 3.0), 0.0)
+    assert_eq(black_box(3.0).clamp(0.0, 3.0), 3.0)
+    assert_eq(black_box(7.0).clamp(2.0, 2.0), 2.0)
+    assert_eq(black_box(5.0f32).clamp(0.0f32, 3.0f32), 3.0f32)
+    assert_eq(black_box(-5.0f32).clamp(0.0f32, 3.0f32), 0.0f32)
+    assert_eq(5.0f16.clamp(0.0f16, 3.0f16), 3.0f16)
+    assert_eq((-5.0bf16).clamp(0.0bf16, 3.0bf16), 0.0bf16)
+
+    val inf = black_box(real.infinity())
+
+    assert_eq(inf.clamp(0.0, 3.0), 3.0)
+    assert_eq((-inf).clamp(0.0, 3.0), 0.0)
+    assert_eq(black_box(1.0).clamp(-inf, inf), 1.0)
+end fmm_clamp
+
+@test("fmm: a NaN receiver stays a NaN through clamp")
+fmm_clamp_nan_receiver()
+    assert(black_box(real.nan()).clamp(0.0, 1.0).is_nan())
+    assert(black_box(f32.nan()).clamp(0.0f32, 1.0f32).is_nan())
+end fmm_clamp_nan_receiver
+
+@test(should_trap)
+fmm_clamp_inverted_bounds()
+    print(black_box(1.0).clamp(3.0, 0.0))
+end fmm_clamp_inverted_bounds
+
+@test(should_trap)
+fmm_clamp_nan_low()
+    print(black_box(1.0).clamp(real.nan(), 3.0))
+end fmm_clamp_nan_low
+
+@test(should_trap)
+fmm_clamp_nan_high()
+    print(black_box(1.0f32).clamp(0.0f32, f32.nan()))
+end fmm_clamp_nan_high
+
+@test("fmm: the free functions agree with the methods wherever no NaN is involved")
+fmm_free_function_agrees()
+    for a in [-2.0, 0.0, 1.5, 9.0]
+        for b in [-2.0, 0.5, 1.5, 7.0]
+            assert_eq(max(a, b), a.max(b))
+            assert_eq(min(a, b), a.min(b))
+            assert_eq(clamp(a, -1.0, 8.0), a.clamp(-1.0, 8.0))
+
+    // Where a NaN is involved the free function is generic over `Ord` and answers its first argument
+    // whenever the comparison is false; the method is the one that drops the NaN.
+    val nan = black_box(real.nan())
+
+    assert(max(nan, 1.0).is_nan())
+    assert_eq(max(1.0, nan), 1.0)
+    assert_eq(nan.max(1.0), 1.0)
+end fmm_free_function_agrees

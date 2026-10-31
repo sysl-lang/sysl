@@ -113,6 +113,9 @@ trait Float: Zero + One + Eq + Ord + Neg + Add + Sub + Mul + Div + Display + Deb
     copysign(self, sign: Self) -> Self
     max_num(self, other: Self) -> Self
     min_num(self, other: Self) -> Self
+    max(self, other: Self) -> Self
+    min(self, other: Self) -> Self
+    clamp(self, lo: Self, hi: Self) -> Self
     maximum(self, other: Self) -> Self
     minimum(self, other: Self) -> Self
     to_radians(self) -> Self
@@ -330,6 +333,24 @@ print(max(hole, one).is_nan(), hole.max_num(hole).is_nan())
 ```output
 1 1 -1
 true true
+```
+
+**`max`, `min` and `clamp` are methods on every float.** `a.max(b)` and `a.min(b)` are `max_num` and
+`min_num` under the names Rust uses: a NaN loses to a number on either side. `x.clamp(lo, hi)` holds
+`x` to the closed range; a NaN `x` stays a NaN, and a `lo` above `hi`, or a NaN bound, panics. The
+free `max`, `min` and `clamp` are generic over `Ord` and agree with the methods except at a NaN.
+
+```sysl
+val a: f64 = 1.0
+val hole = 0.0 / 0.0
+
+print(a.max(2.0), a.min(2.0), a.clamp(2.0, 3.0))
+print(hole.max(a), a.min(hole), hole.clamp(0.0, 1.0).is_nan())
+```
+
+```output
+2 1 2
+1 1 true
 ```
 
 **`maximum` and `minimum` let a NaN win.** These are IEEE 754-2019's maximum and minimum: a NaN on
