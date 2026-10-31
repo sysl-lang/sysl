@@ -149,11 +149,19 @@ private[buf] struct BufCore[T]
      * **The `ensure` is what keeps that raise free.** Raising the count re-checks the clause, and on
      * this arm the promise is the only thing that can say there is room, repeated at the call as a
      * fact.
+     *
+     * **It is also where a push to a handle naming nothing is caught.** Such a handle pushes into the
+     * shared empty core (`Buf.reading`), whose storage is always full, so every push to it arrives
+     * here -- and the one test it needs costs nothing on the path a push normally takes.
      */
     @noinline
     @cold
     private grow_store(*self, v: T)
         ensure self.count < self.elems.len
+
+        val none: *BufCore[T] = ptr_cast(&NoCore[0])
+
+        if self == none then unassigned(BufUnassigned)
 
         self.grow(self.count + 1)
 
@@ -364,16 +372,16 @@ struct Buf[T]
      * as `&b.elems[i]` is. It is read-only as a field: the storage is replaced only by the buffer's
      * own growth, which is what keeps the count from passing it.
      */
-    elems -> []T = if !is_null(self.core) then self.core.elems else []
+    elems -> []T = self.reading().elems
 
     /** How many elements there are -- `len()` under the name the field had. Read-only: the count is
      * the buffer's to move.
      */
     count -> usize = self.len()
 
-    const len(self) -> usize = if !is_null(self.core) then self.core.count else 0
+    const len(self) -> usize = self.reading().count
 
-    const cap(self) -> usize = if !is_null(self.core) then self.core.elems.len else 0
+    const cap(self) -> usize = self.reading().elems.len
 
     const is_empty(self) -> bool = self.len() == 0
 
@@ -393,14 +401,17 @@ struct Buf[T]
 
     const set_unchecked(self, i: usize, v: T) = self.reading().set_unchecked(i, v)
 
-    /** The core an index reads through: this handle's own, or the empty one a handle naming nothing
-     * reads as -- whose count of zero refuses every index with the same report a buffer's own would.
+    /** The core every hot member works through: this handle's own, or the empty one a handle naming
+     * nothing reads as -- whose count of zero refuses every index with the same report a buffer's own
+     * would, answers `pop` with `None`, has nothing for `truncate` to give up, and sends `push` down
+     * its growth path, where `grow_store` recognises it and reports the buffer as never given storage.
      *
      * **It is a choice of address, not a branch around the read**, and that is what lets a loop of
      * reads keep the storage and the count in registers. Behind an `if` the core's fields are read
      * only on the arm where the handle names something, and a read the optimizer cannot prove happens
-     * on every turn is one it may not hoist; chosen this way, every turn reads the same address, and
-     * the trap that reports an index stays inside the loop where the index is.
+     * on every turn is one it may not hoist; chosen this way, every turn reads the same address, the
+     * trap that reports an index stays inside the loop where the index is, and a run of pushes and
+     * pops on one buffer reads the handle once.
      */
     private reading(self) -> *BufCore[T] = if is_null(self.core) then ptr_cast(&NoCore[0]) else &*self.core
 
@@ -408,9 +419,7 @@ struct Buf[T]
     // to an element is refused the call.
     @inline
     @relocates
-    const push(self, v: T)
-        if is_null(self.core) then unassigned(BufUnassigned)
-        self.core.push(v)
+    const push(self, v: T) = self.reading().push(v)
 
     @relocates
     const extend(self, xs: []const T)
@@ -418,15 +427,13 @@ struct Buf[T]
         self.core.extend(xs)
 
     @relocates
-    const pop(self) -> Option[T] = if !is_null(self.core) then self.core.pop() else None
+    const pop(self) -> Option[T] = self.reading().pop()
 
     @relocates
-    const truncate(self, n: usize)
-        if !is_null(self.core) then self.core.truncate(n)
+    const truncate(self, n: usize) = self.reading().truncate(n)
 
     @relocates
-    const clear(self)
-        if !is_null(self.core) then self.core.truncate(0)
+    const clear(self) = self.reading().truncate(0)
 
     @relocates
     @track_caller
@@ -473,7 +480,7 @@ struct Buf[T]
      * a view of the storage rather than a copy, so it is only valid while nothing pushes -- through
      * this name or any other for the same buffer.
      */
-    const view(self) -> []T = if !is_null(self.core) then self.core.view() else []
+    const view(self) -> []T = self.reading().view()
 
     /** This name's share of the buffer given back, and the handle left naming nothing -- the state
      * zeroed storage starts in, where every reader answers as an empty buffer does. Nothing is

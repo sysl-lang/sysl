@@ -333,6 +333,66 @@ bfa_buffer_of_buffers()
             exit(if sum == 780 + 4 * 45 && outer.at(3).at(9) == 48 then 42 else 1)
         """), 42)
 
+// A handle reached through a pointer among another buffer's elements is replaced by an element write,
+// and the next push has to go through the new handle and its core, not the one read before the write.
+@test("at -O2 a handle among another buffer's elements, replaced by an element write, is read again")
+bfa_handle_among_elements_replaced()
+    if !bfa_ready() then return
+
+    assert_eq(bfa_runs(raw"""
+        import sysl.buf.{Buf, buf}
+
+        main()
+            var outer: Buf[Buf[int]] = buf()
+
+            outer.push(buf())
+
+            val p: *Buf[int] = outer.index_place(0)
+            var seen = 0usize
+
+            for k in 0..<10
+                p.push(k)
+                p.push(k)
+                outer[0] = buf()
+                p.push(k)
+                seen += p.len()
+
+            exit(if seen == 10 && outer.at(0).len() == 1 && outer.at(0).at(0) == 9 then 42 else 1)
+        """), 42)
+
+// A handle in a struct, assigned a new buffer between pushes and pops and released to naming nothing:
+// every member reads the core the handle names now, the shared empty one included.
+@test("at -O2 a struct's Buf field reassigned and released between pushes and pops computes right")
+bfa_handle_reassigned_between_ops()
+    if !bfa_ready() then return
+
+    assert_eq(bfa_runs(raw"""
+        import sysl.buf.{Buf, buf}
+
+        struct Vm
+            stack: Buf[int]
+
+        main()
+            val vm: &Vm = Vm(buf())
+            var total = 0
+
+            for k in 0..<20
+                vm.stack.push(k)
+                vm.stack.push(k + 1)
+                total += vm.stack.pop().unwrap_or(-100)
+
+                if k % 3 == 0 then vm.stack = buf()
+
+                if k % 5 == 0
+                    vm.stack.release()
+                    total += int(vm.stack.len()) + vm.stack.pop().unwrap_or(1000)
+                    vm.stack = buf()
+
+                total += int(vm.stack.len()) + vm.stack.pop().unwrap_or(1000)
+
+            exit(if total == 13333 then 42 else 1)
+        """), 42)
+
 // A view handed out, and a pointer cast from an element's address, read and write the same storage
 // with no mark at all, so the optimizer has to assume they touch everything.
 @test("at -O2 storage written through a view and a reinterpreted pointer reads back through the Buf")
