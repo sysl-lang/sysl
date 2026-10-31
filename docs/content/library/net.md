@@ -289,7 +289,13 @@ var client = socket(at).unwrap()
 
 client.connect(at).unwrap()
 
-var (accepted, _) = server.accept().unwrap()
+// The connection may not be queued yet: ask again until it is.
+var got = server.accept()
+
+while got.is_err() && would_block(got.unwrap_err())
+    got = server.accept()
+
+var (accepted, _) = got.unwrap()
 
 accepted.close().unwrap()
 client.close().unwrap()

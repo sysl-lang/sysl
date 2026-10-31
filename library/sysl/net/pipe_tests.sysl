@@ -6,6 +6,7 @@ import sysl.fs.{IoError, make_temp_dir, remove_dir_all}
 import sysl.path.join
 import sysl.process.{pid, pipe}
 import sysl.signal.{PIPE, watch}
+import sysl.time.{millis, sleep}
 
 // A send to a peer that has gone answers an error; it never ends the process with `SIGPIPE`.
 //
@@ -53,11 +54,15 @@ private tcp_trio() -> (Socket, Socket, Socket)
     (l, c, a)
 end tcp_trio
 
-/** Sends `chunk` until a send is refused, at most a hundred times, and answers the refusal. */
+/**
+ * Sends `chunk` until a send is refused and answers the refusal. The peer's reset arrives some time
+ * after it closed, so a send that went is followed by a short sleep; the wait ends at the refusal, and
+ * only a reset that never comes (a failing test) runs it out, after about twenty seconds.
+ */
 private until_refused(s: *Socket, chunk: []const u8) -> Option[IoError]
-    for _ in 0..<100
+    for _ in 0..<4000
         s.send(chunk) match
-            Ok(_) -> ()
+            Ok(_) -> sleep(millis(5))
             Err(e) -> return Some(e)
 
     None
