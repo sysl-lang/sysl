@@ -561,6 +561,44 @@ can observe. Taking the first is what makes a fold over a sequence stable.
 bounds are the right way round: a bound is nearly always a constant or a length at the call site, and
 a [contract](/reference/errors/) is the tool for saying so where it is not.
 
+### The integers have them as methods too
+
+```sysl
+trait MinMax
+    max(self, other: Self) -> Self
+    min(self, other: Self) -> Self
+    clamp(self, lo: Self, hi: Self) -> Self
+```
+
+**`a.max(b)`, `a.min(b)` and `x.clamp(lo, hi)` are on every integer width**, `u12` and `i512` as surely
+as `int`, and each answers in the receiver's own type: a literal argument takes that type, so
+`a.max(300)` on a `u8` is refused as the literal that does not fit. They are written once, as one
+`impl` over the `Integer` family, so unlike `Signed` and `Bits` the membership is the library's and not
+the compiler's. A concrete value reaches them with no import; a generic body asks for them by name,
+`[T: MinMax]`.
+
+```sysl
+val a: u8 = 200
+val b: i8 = -128
+val wide: u256 = 1 << 200
+
+print(a.max(100), a.min(100), a.clamp(0, 150))
+print(b.max(-1), b.clamp(-50, 50))
+print(wide.max(1) == wide, wide.clamp(0, 9))
+```
+
+```output
+200 100 150
+-1 -50
+true 9
+```
+
+**The methods and the free functions agree except on an inverted range.** `clamp` the method treats
+the bounds as a contract: `lo` above `hi` panics. The free `clamp` answers `low` there, as above, and
+stays for types a program has written an `lt` for. A tie answers the receiver, which for an integer
+no one can tell apart from the other. A type with a `max` method of its own, or a trait of the
+program's own with that name, keeps it: the program's member is the one a call finds.
+
 ## Comparing floats that were computed
 
 Binary floating point does not hold `0.1 + 0.2 == 0.3`, so a program that checks a computation

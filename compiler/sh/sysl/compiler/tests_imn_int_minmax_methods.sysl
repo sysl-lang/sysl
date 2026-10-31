@@ -1,0 +1,125 @@
+module sh.sysl.compiler
+@tests
+
+// `max`, `min` and `clamp` as methods on every integer width (`library/sysl/math/integer.sysl`,
+// `MinMax`), reached from a whole program: with nothing imported, beside a trait of the program's own
+// that uses the same names, beside the float and vector members of those names, and refused when
+// misused. The values themselves are checked in `library/sysl/math/int_minmax_tests.sysl`. The helpers
+// are `tests_enm_enum_run.sysl`'s.
+
+@test("max, min and clamp are on an integer with nothing imported")
+imn_no_import()
+    if !enm_ready() then return
+
+    val out = enm_ran("main()\n    val a: u8 = 7\n    print(a.max(3), a.min(3), a.clamp(8, 9))\n")
+
+    assert(enm_says(out, "7 3 8"), out)
+
+@test("they answer at a width wider than a register and one narrower than a byte")
+imn_odd_widths()
+    if !enm_ready() then return
+
+    val out = enm_ran("main()\n    val a: u256 = 1 << 200\n    val b: i128 = -5\n    val c: u12 = 4000\n" +
+                      "    print(a.max(1) == a, b.min(2), c.clamp(0, 10))\n")
+
+    assert(enm_says(out, "true -5 10"), out)
+
+@test("a user trait of the same method name is still the program's own")
+imn_user_trait_same_module()
+    if !enm_ready() then return
+
+    val out = enm_ran("trait Biggest\n    max(self, other: Self) -> Self\n\nimpl Biggest for int\n" +
+                      "    max(self, other: int) -> int = 1000\n\nmain()\n    val a = 3\n    print(a.max(5))\n")
+
+    assert(enm_says(out, "1000"), out)
+
+@test("a user trait with the same name, imported with the library's math, is still the program's own")
+imn_user_trait_with_math_imported()
+    if !enm_ready() then return
+
+    val out = enm_ran("import sysl.math\n\ntrait Biggest\n    max(self, other: Self) -> Self\n    min(self, other: Self) -> Self\n\n" +
+                      "impl Biggest for u8\n    max(self, other: u8) -> u8 = 100\n    min(self, other: u8) -> u8 = 1\n\n" +
+                      "main()\n    val a: u8 = 3\n    val b: i8 = 3\n    print(a.max(5), a.min(5), b.max(5), b.min(5))\n")
+
+    assert(enm_says(out, "100 1 5 3"), out)
+
+@test("a user struct's own max is untouched")
+imn_struct_own_max()
+    if !enm_ready() then return
+
+    val out = enm_ran("struct P\n    v: int\n\nimpl P\n    max(self, other: P) -> P = if self.v < other.v then other else self\n\n" +
+                      "main()\n    print(P(4).max(P(9)).v)\n")
+
+    assert(enm_says(out, "9"), out)
+
+@test("a float keeps its NaN-losing max and a vector its reduction")
+imn_neighbours_unchanged()
+    if !enm_ready() then return
+
+    val out = enm_ran("main()\n    val f: f64 = 1.0\n    val hole = 0.0 / 0.0\n    val v: <4>i32 = [1, 9, 3, 4]\n" +
+                      "    print(hole.max(f), v.max(), v.min())\n")
+
+    assert(enm_says(out, "1 9 1"), out)
+
+@test("a subtype and an alias have the methods and answer in their own base")
+imn_subtype_and_alias()
+    if !enm_ready() then return
+
+    val out = enm_ran("type Level = int within 0..10\ntype Meters = i16\n\nmain()\n    val l: Level = 4\n" +
+                      "    val m: Meters = -4\n    print(l.max(7), l.clamp(5, 6), m.max(2), m.clamp(-9, -5))\n")
+
+    assert(enm_says(out, "7 5 2 -5"), out)
+
+@test("a literal that does not fit the receiver's width is refused")
+imn_literal_too_wide()
+    if !enm_ready() then return
+
+    val out = enm_err("main()\n    val a: u8 = 7\n    print(a.max(300))\n")
+
+    assert(enm_says(out, "the literal 300 does not fit"), out)
+
+@test("an argument of another integer type or of a float is refused")
+imn_argument_type_refused()
+    if !enm_ready() then return
+
+    val one = enm_err("main()\n    val a: u8 = 7\n    val b: i8 = 3\n    print(b.max(a))\n")
+    val two = enm_err("main()\n    val b: i8 = 3\n    print(b.max(2.5))\n")
+
+    assert(enm_says(one, "u8 was given"), one)
+    assert(enm_says(two, "real was given"), two)
+
+@test("a call with the wrong number of arguments is refused")
+imn_arity_refused()
+    if !enm_ready() then return
+
+    val one = enm_err("main()\n    val a: u8 = 7\n    print(a.max())\n")
+    val two = enm_err("main()\n    val a: u8 = 7\n    print(a.clamp(1))\n")
+
+    assert(enm_says(one, "takes 1 argument, but 0 arguments were given"), one)
+    assert(enm_says(two, "takes 2 arguments, but 1 argument was given"), two)
+
+@test("clamp with lo above hi stops the program, at a wide width too")
+imn_clamp_inverted_stops()
+    if !enm_ready() then return
+
+    val narrow = enm_panic_text("main()\n    val a: i8 = 5\n    print(a.clamp(9, 1))\n")
+    val wide = enm_panic_text("main()\n    val a: u256 = 5\n    print(a.clamp(9, 1))\n")
+
+    assert(enm_says(narrow, "clamp: the bounds must be ordered"), narrow)
+    assert(enm_says(wide, "clamp: the bounds must be ordered"), wide)
+
+@test("clamp with lo equal to hi is that value")
+imn_clamp_point()
+    if !enm_ready() then return
+
+    val out = enm_ran("main()\n    val a: i16 = -7\n    print(a.clamp(3, 3), a.clamp(-7, -7))\n")
+
+    assert(enm_says(out, "3 -7"), out)
+
+@test("a method still missing from an integer is named as written")
+imn_missing_method_still_named()
+    if !enm_ready() then return
+
+    val out = enm_err("main()\n    val a: u8 = 7\n    print(a.maxx(3))\n")
+
+    assert(enm_says(out, "type 'u8' has no method 'maxx'"), out)
