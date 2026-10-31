@@ -686,6 +686,14 @@ end storage_reaching
 //
 // The calls are summarized once and the closure is a sweep back along them, for the reason
 // `storage_reaching` gives.
+//
+// **A call through a trait object is not an edge here**, though it is one for what a program keeps.
+// It names no symbol -- it loads a slot of whichever table the value carries -- so a body making it
+// compiles beside a dropped slot target, whose table leaves the half (`tables_without`) and whose
+// erasers are deferred by the erase edge. Followed, it dropped every `internal` body that calls
+// through a `&Fn` or a `&View` the library's own dropped closure was erased into -- another package's
+// private method among them -- while that package's small public method, copied in to be inlined,
+// still named it.
 gap_closure(p: TProgram, gapped: Buf[string]) -> Buf[string]
     var index: Map[string, usize] = map()
 
@@ -703,7 +711,7 @@ gap_closure(p: TProgram, gapped: Buf[string]) -> Buf[string]
         deferred.push(gone)
         absent.push(gone && p.funcs.at(i).internal)
 
-        push_edges(p, index, tables, body_refs(p, p.funcs.at(i)), i, &edges)
+        push_edges(p, index, tables, body_refs(p, p.funcs.at(i), false), i, &edges)
 
     var moved = true
 
@@ -760,21 +768,24 @@ private push_edges(p: TProgram, index: Map[string, usize], tables: Map[string, u
                         Some(j) -> edges.push((i, j))
 end push_edges
 
-// What one body names, without following any of it.
-private body_refs(p: TProgram, f: TFunc) -> &Live
+// What one body names, without following any of it. With `dynamic`, a call through a trait object
+// names the target of that slot in every table of the trait, which is what a program has to keep;
+// without it, only what the body names as a symbol.
+private body_refs(p: TProgram, f: TFunc, dynamic: bool = true) -> &Live
     val out = no_reached()
+    val tables = if dynamic then Some(p.vtables) else None
 
-    walk_block_stmts(f.body, TWalk(true, e -> take_node_of(p, out, e), w -> take_write(out, w),
+    walk_block_stmts(f.body, TWalk(true, e -> node_names(out, e, tables), w -> take_write(out, w),
                                    s -> ()))
 
     for item in f.requires
-        walk_texpr(item.cond, expr_walk(true, e -> take_node_of(p, out, e)))
+        walk_texpr(item.cond, expr_walk(true, e -> node_names(out, e, tables)))
 
     for item in f.ensures
-        walk_texpr(item.cond, expr_walk(true, e -> take_node_of(p, out, e)))
+        walk_texpr(item.cond, expr_walk(true, e -> node_names(out, e, tables)))
 
     for item in f.olds
-        walk_texpr(item, expr_walk(true, e -> take_node_of(p, out, e)))
+        walk_texpr(item, expr_walk(true, e -> node_names(out, e, tables)))
 
     out
 end body_refs
