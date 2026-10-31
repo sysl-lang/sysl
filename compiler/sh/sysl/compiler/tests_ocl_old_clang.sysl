@@ -1,0 +1,182 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.fs.{exists, make_temp_dir, write_text}
+import sysl.math.bigint.from_int
+import sysl.process.capture
+import sysl.text.Search
+
+// sysl on an older clang: what it reads, what it is handed, and what it is told when it is too old.
+// A stand-in clang is a script that answers `--version` and refuses what the old one refuses, and
+// otherwise runs the real one. A real older LLVM is used where one is installed.
+
+private const OclSret: string = "dead_on_unwind writable"
+
+// A clang reporting `version`, refusing any IR file that holds a word of `refuses`.
+private ocl_fake(version: string, refuses: string) -> string
+    val dir = make_temp_dir("sysl-ocl").unwrap()
+    val path_to = s"$dir/clang"
+    val real = find_clang(host_target(), None).unwrap()
+    val check = if refuses == "" then "" else
+        "for a in \"$@\"; do case \"$a\" in *.ll) if grep -q '" + refuses + "' \"$a\"; then echo \"$a:1:1: error: expected ')'\" >&2; exit 1; fi;; esac; done\n"
+
+    write_text(path_to, "#!/bin/sh\n" +
+                        "if [ \"$1\" = --version ]; then echo '" + version + "'; echo 'Target: arm64'; exit 0; fi\n" +
+                        check +
+                        "exec " + real + " \"$@\"\n").unwrap()
+    capture("chmod", ["+x", path_to], "", [], true).unwrap()
+    path_to
+end ocl_fake
+
+@test("a version line is read as Apple's or LLVM's, at its major number")
+ocl_version_lines()
+    assert_eq(clang_version_of("Apple clang version 15.0.0 (clang-1500.3.9.4)\nTarget: arm64"), Some((true, 15)))
+    assert_eq(clang_version_of("Homebrew clang version 16.0.6\n"), Some((false, 16)))
+    assert_eq(clang_version_of("clang version 23.1.0\n"), Some((false, 23)))
+    assert_eq(clang_version_of("Ubuntu clang version 14.0.0-1ubuntu1\n"), Some((false, 14)))
+    assert_eq(clang_version_of("gcc (GCC) 13.2\nclang version 18"), None)
+    assert_eq(clang_version_of("clang version x"), None)
+    assert_eq(clang_version_of(""), None)
+
+@test("the minimum is Apple clang 15 and clang 16, each on its own numbering")
+ocl_minimum_by_numbering()
+    assert(clang_too_old("c", "Apple clang version 15.0.0\n").is_none(), "Xcode 15, what macos-14 ships")
+    assert(clang_too_old("c", "clang version 16.0.6\n").is_none(), "LLVM 16")
+    assert(clang_too_old("c", "gcc 4\n").is_none(), "not a clang, not refused here")
+    assert(clang_too_old("c", "Apple clang version 14.0.3\n").is_some(), "Xcode 14")
+    assert(clang_too_old("c", "clang version 15.0.7\n").is_some(), "LLVM 15")
+
+@test("the refusal names the clang found, the minimum and how to fix it")
+ocl_refusal_sentence()
+    assert_eq(clang_too_old("/usr/bin/clang", "Apple clang version 14.0.3\n").unwrap(),
+              "'/usr/bin/clang' is Apple clang 14, and sysl needs Apple clang 15 (Xcode 15) or clang 16 or newer: " +
+              "an older one cannot read the LLVM IR sysl emits. Update Xcode or its Command Line Tools, or " +
+              "install LLVM ('brew install llvm'), which sysl finds by itself, or name a newer clang with --cc")
+
+@test("a --cc naming a clang below the minimum is refused with that sentence")
+ocl_named_too_old()
+    val fake = ocl_fake("Apple clang version 14.0.3 (clang-1403)", "")
+
+    assert_eq(find_clang(host_target(), Some(fake)).unwrap_err(),
+              clang_too_old(fake, "Apple clang version 14.0.3\n").unwrap())
+
+@test("a clang at the minimum is found")
+ocl_named_at_minimum()
+    val fake = ocl_fake("Apple clang version 15.0.0 (clang-1500.3.9.4)", "")
+
+    assert_eq(find_clang(host_target(), Some(fake)).unwrap(), fake)
+
+@test("the attributes go only where the clang refuses them, and a clang reading them gets the text as it was")
+ocl_attributes_by_clang()
+    val ir = "define void @f(ptr noalias sret(i64) align 8 dead_on_unwind writable %o) {\n  ret void\n}\n"
+
+    assert_eq(in_clang_dialect(ocl_fake("clang version 23.0.0", ""), ir), ir)
+    assert(!in_clang_dialect(ocl_fake("Apple clang version 15.0.0", OclSret), ir).contains("dead_on_unwind"),
+           "an old clang still handed the attribute")
+
+@test("a string is never rewritten, in a constant, a quoted symbol or an asm template")
+ocl_strings_kept()
+    val attr = " dead_on_unwind writable"
+
+    assert_eq(outside_strings("@s = constant [3 x i8] c\" dead_on_unwind writable\"\n", attr, ""),
+              "@s = constant [3 x i8] c\" dead_on_unwind writable\"\n")
+    assert_eq(outside_strings("declare void @\"a dead_on_unwind writable\"(ptr dead_on_unwind writable)\n", attr, ""),
+              "declare void @\"a dead_on_unwind writable\"(ptr)\n")
+    assert_eq(outside_strings("call void asm \" dead_on_unwind writable\", \"\"()\n", attr, ""),
+              "call void asm \" dead_on_unwind writable\", \"\"()\n")
+    assert_eq(outside_strings("", attr, ""), "")
+    assert_eq(outside_strings("no such text", attr, ""), "no such text")
+    assert_eq(outside_strings(" dead_on_unwind writable", attr, ""), "")
+
+@test("an old clang's standard module has a cache path of its own, and a current one's has no addition")
+ocl_key_by_clang()
+    val old = ocl_fake("Apple clang version 15.0.0", OclSret)
+
+    assert_eq(clang_dialect_key(old), "-old-sret")
+
+    val current = ocl_fake("clang version 23.0.0", "")
+
+    assert_eq(clang_dialect_key(current), "")
+
+@test("a clang refusing the standard module's IR is named, without advice that cannot help")
+ocl_std_refusal()
+    val err = "clang failed (exit 1):\nx.ll:1:2: error: expected ')'\n"
+    val said = std_rebuild_failure(err, Ok(ocl_fake("Apple clang version 15.0.0", "")))
+
+    assert(said.contains("Apple clang version 15.0.0"), said)
+    assert(said.contains("refused the LLVM IR"), said)
+    assert(said.contains("x.ll:1:2: error: expected ')'"), said)
+    assert(said.contains("newer clang"), said)
+    assert(!said.contains("cannot find or build"), said)
+    assert(!said.contains("--no-std-lib"), said)
+
+@test("a splat is written out, lane by lane, at every width")
+ocl_splat_written_out()
+    assert_eq(v_render(VSplat(1, LInt(8), VInt(from_int(-1)))), "<i8 -1>")
+    assert_eq(v_render(VSplat(4, LInt(32), VInt(from_int(0)))), "<i32 0, i32 0, i32 0, i32 0>")
+
+// The real thing, where an older LLVM is installed: a program using what an older clang has trouble
+// with, built and run with it. Nothing is asserted where there is none.
+private ocl_real_program() -> string = raw"""
+    struct Big
+        a: [32]int
+
+    make(n: int) -> Big
+        var b = Big([0; 32])
+
+        b.a[3] = n
+        b
+
+    relay(n: int, ...) -> int
+        var ap: va_list
+
+        va_start(ap)
+
+        var sum = 0
+
+        for i in 0..<n do sum += va_arg(ap)
+
+        va_end(ap)
+        sum
+    end relay
+
+    async step(n: int) -> int = n + 1
+
+    async twice(n: int) -> int
+        val a = await step(n)
+
+        await step(a)
+
+    print(make(41).a[3] + 1)
+    print(relay(3, 4, 5, 6))
+    print(block_on(twice(40)))
+
+    val h: bf16 = 1.5
+
+    print(f32(h) * 2.0)
+    """
+
+private ocl_real_on(v: string)
+    val cc = s"/opt/homebrew/opt/llvm@$v/bin/clang"
+
+    if !aza_ready() || !exists(cc) then return
+
+    name_cc(Some(cc))
+    twp_prints(ocl_real_program(), "42\n15\n42\n3\n")
+    name_cc(None)
+end ocl_real_on
+
+@test("LLVM 16 builds and runs a program using all it has trouble with")
+ocl_real_llvm16()
+    ocl_real_on("16")
+
+@test("LLVM 17 does too")
+ocl_real_llvm17()
+    ocl_real_on("17")
+
+@test("the clang in use builds the same program, attributes and all")
+ocl_real_current()
+    if !aza_ready() then return
+
+    twp_prints(ocl_real_program(), "42\n15\n42\n3\n")

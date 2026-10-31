@@ -1,0 +1,214 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+import sysl.process.capture
+import sysl.fs.{make_temp_dir, read_text, remove_dir_all, write_text}
+import sysl.text.{str_builder, Search}
+
+// **Which clang reads which IR.** sysl emits one text, in the spelling of a current LLVM, and `sysl
+// emit-llvm` prints it. A clang shipped with an older Xcode refuses a word it has not heard of, however
+// little that word mattered, and a machine's clang is whatever its Xcode is. So the text is turned
+// into a form the older clang reads on its way in, the way `coro_dialect.sysl` does for one intrinsic.
+//
+// **The clang itself is asked, by handing it each form.** A version number would need a table from
+// Apple's numbering to LLVM's, which Apple does not publish and which is not a line: Apple clang 15 has
+// parts of two LLVM releases. The answer is kept per path, for the process.
+//
+// **A clang that reads everything gets the text untouched**, byte for byte.
+
+// LLVM 18. Both say only what an optimizer may assume about a result's out-pointer, so the code is
+// correct without them and merely copies a result it might have built in place.
+private const SretAttrs: string = " dead_on_unwind writable"
+private const SretProbe: string = "declare void @probe(ptr noalias sret(i64) align 8 dead_on_unwind writable)\n"
+
+// LLVM 19 made the three take their pointer's type as an overload. **An older clang does not refuse
+// the suffix**: it takes `llvm.va_start.p0` for an ordinary function, so the failure comes at the link,
+// and only what it compiles a call into tells the two apart.
+private const VaProbe: string = "define void @probe(...) {\n" +
+                                "  %v = alloca [64 x i8]\n" +
+                                "  call void @llvm.va_start.p0(ptr %v)\n" +
+                                "  ret void\n" +
+                                "}\n" +
+                                "\n" +
+                                "declare void @llvm.va_start.p0(ptr)\n"
+
+private var sret_answers: Buf[(string, bool)] = buf()
+private var va_answers: Buf[(string, bool)] = buf()
+
+// Whether this clang parses and verifies the two attributes. **It stops at bitcode, so nothing is asked
+// of a back end**; the probe is about the words. A clang that cannot be run at all is said to read
+// them, leaving the sentence about that to the step that goes on to need it.
+private clang_reads_sret(cc: string) -> bool
+    for row in sret_answers
+        if row.0 == cc then return row.1
+
+    var answer = true
+    val dir = make_temp_dir("sysl-dialect")
+
+    if dir.is_ok()
+        val d = dir.unwrap()
+        val ll = s"$d/probe.ll"
+
+        if write_text(ll, SretProbe).is_ok()
+            answer = capture(cc, ["-c", "-emit-llvm", "-x", "ir", ll, "-o", s"$d/probe.bc"], "", [], true) match
+                Ok(out) -> out.status.ok()
+                Err(_) -> true
+
+        remove_dir_all(d).unwrap_or(())
+
+    sret_answers.push((cc, answer))
+    answer
+end clang_reads_sret
+
+// Whether a call of the overloaded `llvm.va_start` comes out of this clang as anything but a call of
+// a function by that name.
+private clang_lowers_va(cc: string) -> bool
+    for row in va_answers
+        if row.0 == cc then return row.1
+
+    var answer = true
+    val dir = make_temp_dir("sysl-dialect")
+
+    if dir.is_ok()
+        val d = dir.unwrap()
+        val ll = s"$d/probe.ll"
+
+        if write_text(ll, VaProbe).is_ok()
+            answer = capture(cc, ["-S", "-x", "ir", "-Wno-override-module", ll, "-o", s"$d/probe.s"], "", [], true) match
+                Err(_) -> true
+                Ok(out) -> !out.status.ok() || !read_text(s"$d/probe.s").unwrap_or("").contains("llvm.va_start")
+
+        remove_dir_all(d).unwrap_or(())
+
+    va_answers.push((cc, answer))
+    answer
+end clang_lowers_va
+
+// The text a clang is handed, in the dialect that clang reads. It is applied after `toolchain.sysl`'s
+// `for_clang`, which marks the definitions for the target, and every text written for clang comes
+// through here.
+//
+// **Each question is asked only of a text that holds what it is about**, so a clang is asked nothing
+// about `va_start` on behalf of a program with no variadic function.
+in_clang_dialect(cc: string, ir: string) -> string
+    var text = in_coro_dialect(cc, ir)
+
+    if text.contains(SretAttrs) && !clang_reads_sret(cc)
+        text = outside_strings(text, SretAttrs, "")
+
+    if text.contains("@llvm.va_") && !clang_lowers_va(cc)
+        text = outside_strings(text, "@llvm.va_start.p0(", "@llvm.va_start(")
+        text = outside_strings(text, "@llvm.va_copy.p0(", "@llvm.va_copy(")
+        text = outside_strings(text, "@llvm.va_end.p0(", "@llvm.va_end(")
+
+    text
+end in_clang_dialect
+
+// What separates a build for this clang from one that reads a current LLVM's text: nothing where it
+// reads the attributes every standard module holds, so an ordinary cache path is unchanged. An artifact
+// made under `--lto` is bitcode, which an older clang cannot read back, and a `--cc` picks a clang
+// without changing the compiler's identity. **A clang lacking `bfloat` conversions lacks the attributes
+// too**, so this one word covers the module `soft_bf16.sysl` rewrites.
+clang_dialect_key(cc: string) -> string =
+    if clang_reads_sret(cc) then "" else "-old-sret"
+
+private var bfloat_answers: Buf[(string, bool)] = buf()
+
+// Whether the clang building for `t` stops at a `bfloat` conversion, which is not a word it cannot read
+// but a back end with nothing to select: "Cannot select: fp_extend". The module is then written without
+// one (`soft_bf16.sysl`). **A clang known to be recent is not asked**, since this one takes an object
+// out of the back end, on the way to every program's lowering. No clang at all has no back end to fail.
+clang_lacks_bfloat(t: Target) -> bool
+    val asking = s"${t.triple} ${named_cc().unwrap_or("")}"
+
+    for row in bfloat_answers
+        if row.0 == asking then return row.1
+
+    val answer = find_clang(t, named_cc()) match
+        Err(_) -> false
+        Ok(cc) -> !clang_known_recent(cc) && !clang_lowers_bfloat(cc, t)
+
+    bfloat_answers.push((asking, answer))
+    answer
+end clang_lacks_bfloat
+
+private clang_known_recent(cc: string) -> bool = clang_version_of(clang_version_line(cc)) match
+    Some((apple, major)) -> major >= (if apple then 17 else 19)
+    None -> false
+
+private clang_lowers_bfloat(cc: string, t: Target) -> bool
+    val dir = make_temp_dir("sysl-dialect") match
+        Ok(d) -> d
+        Err(_) -> return true
+
+    val ll = s"$dir/probe.ll"
+    val probe = "define double @probe(bfloat %x) {\n" +
+                "  %y = fpext bfloat %x to double\n" +
+                "  ret double %y\n" +
+                "}\n" +
+                "\n" +
+                "define float @probe2(bfloat %x) {\n" +
+                "  %y = fpext bfloat %x to float\n" +
+                "  ret float %y\n" +
+                "}\n"
+    var answer = true
+
+    if write_text(ll, probe).is_ok()
+        var args: Buf[string] = buf()
+
+        args.push(s"--target=${t.triple}")
+
+        val machine = machine_flags(t)
+
+        for item in machine
+            args.push(item)
+
+        for item in ["-fno-crash-diagnostics", "-Wno-override-module", "-O1", "-c", "-x", "ir", ll, "-o", s"$dir/probe.o"]
+            args.push(item)
+
+        answer = capture(cc, args.view(), "", [], true) match
+            Ok(out) -> out.status.ok()
+            Err(_) -> true
+
+    remove_dir_all(dir).unwrap_or(())
+    answer
+end clang_lowers_bfloat
+
+// The text with `old` replaced wherever it is IR rather than a string. **A constant, a quoted symbol
+// and an `asm` template are all between double quotes**, and a program printing the word
+// `dead_on_unwind` prints it through any clang. A string holds no raw quote and no raw newline: LLVM
+// writes them as `\22` and `\0A`.
+outside_strings(text: string, old: string, new: string) -> string
+    val bytes = text.bytes
+    val want = old.bytes
+    var b = str_builder()
+    var quoted = false
+    var copied: usize = 0
+    var i: usize = 0
+
+    while i < bytes.len
+        val c = bytes[i]
+
+        if c == u8('"')
+            quoted = !quoted
+        else if !quoted && c == want[0] && bytes_at(bytes, i, want)
+            b.push(text[copied..<i])
+            b.push(new)
+            i += want.len
+            copied = i
+            continue
+
+        i += 1
+
+    b.push(text[copied..<bytes.len])
+    b.finish()
+end outside_strings
+
+private bytes_at(bytes: []const u8, at: usize, want: []const u8) -> bool
+    if at + want.len > bytes.len then return false
+
+    for k in 0..<want.len
+        if bytes[at + k] != want[k] then return false
+
+    true
+end bytes_at

@@ -518,6 +518,9 @@ the printed module's header has only `target triple`, while the text clang compi
 the target's `target datalayout`, obtained from that clang. Without it, LLVM would treat every
 64-bit access the text leaves unannotated as four-byte aligned, which on a machine without
 unaligned access (riscv64) splits each one in two. Nothing is assembled, and no toolchain is needed.
+What is printed is a current LLVM's text: **an older clang is handed that text in a form it can read**
+([Installation](/getting-started/installation/) gives the oldest), and `build-c --emit-llvm` writes
+the form that clang was actually handed.
 
 ### `emit-ast`
 

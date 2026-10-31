@@ -114,7 +114,7 @@ find_clang(target: Target, named: Option[string]) -> Result[string, string]
                 return Err(s"'$path' has no '$want' back end, so it cannot build for " +
                            s"'${target.name}' — it registers ${shown_backends(path)}")
 
-            return Ok(path)
+            return not_too_old(path)
         None -> ()
 
     // **Two machines are not served by a clang picked for its back end**, and both fail at the first
@@ -123,12 +123,91 @@ find_clang(target: Target, named: Option[string]) -> Result[string, string]
     // where it says nothing this refuses with the variable to set rather than handing back a compiler
     // that will get further and fail worse.
     target.os match
-        Android -> return android_clang()
-        Wasi -> return wasi_clang()
+        Android -> return not_too_old(android_clang()?)
+        Wasi -> return not_too_old(wasi_clang()?)
         _ -> ()
 
     find_backend_clang(target)
 end find_clang
+
+// **The oldest clang sysl builds with: Apple clang 15 (Xcode 15), or clang 16 from LLVM.** Below it the
+// text sysl emits cannot be turned into anything the clang reads (`clang_dialect.sysl` covers what is
+// above it). Apple's numbers are their own: Apple clang 15 is what LLVM calls about 16.
+const MinAppleClang: int = 15
+const MinLlvmClang: int = 16
+
+// Whether a clang's `--version` text names an Apple clang, and its major version. Nothing where the
+// text is not a clang's: a `cc` that is really something else gets to fail on its own terms.
+clang_version_of(said: string) -> Option[(bool, int)]
+    val marker = "clang version "
+    val bytes = said.bytes
+    var at: usize = 0
+
+    while at + marker.bytes.len <= bytes.len && bytes[at] != u8('\n')
+        if said[at..<at + marker.bytes.len] == marker
+            var i = at + marker.bytes.len
+            var major = 0
+            var digits = 0
+
+            while i < bytes.len && bytes[i] >= u8('0') && bytes[i] <= u8('9') && digits < 6
+                major = major * 10 + int(bytes[i] - u8('0'))
+                digits += 1
+                i += 1
+
+            if digits == 0 then return None
+
+            return Some((said.starts_with("Apple "), major))
+
+        at += 1
+
+    None
+end clang_version_of
+
+// The sentence refusing a clang, or nothing where its `--version` text is one sysl can build with.
+clang_too_old(path: string, said: string) -> Option[string]
+    val (apple, major) = clang_version_of(said) match
+        None -> return None
+        Some(v) -> v
+
+    if major >= (if apple then MinAppleClang else MinLlvmClang) then return None
+
+    val found = if apple then s"Apple clang $major" else s"clang $major"
+
+    Some(s"'$path' is $found, and sysl needs Apple clang $MinAppleClang (Xcode 15) or clang $MinLlvmClang " +
+         "or newer: an older one cannot read the LLVM IR sysl emits. Update Xcode or its Command Line " +
+         "Tools, or install LLVM ('brew install llvm'), which sysl finds by itself, or name a newer " +
+         "clang with --cc")
+end clang_too_old
+
+// What a clang's `--version` said, first line only, or nothing where it could not be asked.
+clang_version_line(path: string) -> string = capture(path, ["--version"], "", [], true) match
+    Err(_) -> ""
+    Ok(out) -> first_line(out.text)
+
+private first_line(text: string) -> string
+    val lines = lines_of(text)
+
+    if lines.is_empty() then "" else lines.at(0)
+end first_line
+
+private var old_answers: Buf[(string, Option[string])] = buf()
+
+// The refusal of this clang, asked once per path.
+private refusal_of(path: string) -> Option[string]
+    for row in old_answers
+        if row.0 == path then return row.1
+
+    val answer = capture(path, ["--version"], "", [], true) match
+        Err(_) -> None
+        Ok(out) -> clang_too_old(path, out.text)
+
+    old_answers.push((path, answer))
+    answer
+end refusal_of
+
+private not_too_old(path: string) -> Result[string, string] = refusal_of(path) match
+    Some(why) -> Err(why)
+    None -> Ok(path)
 
 // A clang on this machine with the back end `target` needs, or the sentence saying why there is none.
 //
@@ -139,8 +218,14 @@ find_backend_clang(target: Target) -> Result[string, string]
     val want = cpu_backend(target.cpu)
     val candidates = clang_candidates()
 
+    // **A clang too old to use is passed over**, as one without the back end is: Xcode's being old is
+    // no reason to refuse a machine with a current LLVM installed beside it.
     for p in candidates
-        if clang_runs(p) && holds_string(clang_backends(p), want) then return Ok(p)
+        if clang_runs(p) && holds_string(clang_backends(p), want) && refusal_of(p).is_none() then return Ok(p)
+
+    for p in candidates
+        if clang_runs(p) && holds_string(clang_backends(p), want)
+            return not_too_old(p)
 
     for p in candidates
         if clang_runs(p)
@@ -977,7 +1062,7 @@ compile_object(cc: string, ir: string, obj: string, target: Target,
                level: string, piped: bool = true) -> Result[unit, string]
     val ll = s"$obj.ll"
 
-    write_text(ll, laid_out(cc, target, in_coro_dialect(cc, for_clang(ir, target, level)))) match
+    write_text(ll, laid_out(cc, target, in_clang_dialect(cc, for_clang(ir, target, level)))) match
         Err(_) -> return Err(s"cannot write $ll")
         Ok(_) -> ()
 
@@ -1141,7 +1226,7 @@ build_native(cc: string, ir: string, objects: Buf[string], exe: string, target: 
 
     val ll = s"$exe.ll"
 
-    write_text(ll, laid_out(cc, target, in_coro_dialect(cc, for_clang(ir, target, level)))) match
+    write_text(ll, laid_out(cc, target, in_clang_dialect(cc, for_clang(ir, target, level)))) match
         Err(_) -> return Err(s"cannot write $ll")
         Ok(_) -> ()
 
