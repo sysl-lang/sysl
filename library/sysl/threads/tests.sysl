@@ -704,3 +704,314 @@ bsw_barrier_of_one() -> unit
 
     assert_eq(led.load(), 40000)
     assert(barrier(0).wait() && barrier(0).wait())
+
+// -- the channel's two ways of waiting, and the condition variable's count of sleepers ---------------
+//
+// A full `send` and an empty `receive` watch the condition variable's number for a while and then
+// sleep on it, and a notification makes the wake call only where a waiter has counted itself asleep.
+// Each case below steers the waits down one path or the other: threads that keep pace hand over while
+// the other side is still watching, a side held back by a sleep sends the other to the futex, and more
+// threads than cores mixes the two. A lost wake shows as a test that never ends; an item lost, doubled
+// or reordered shows in the tallies.
+
+// What the consumers saw of each producer's items, added up under a lock as each consumer finishes.
+private struct ChsTally
+    count: [8]int
+    sum: [8]int
+    squares: [8]int
+    out_of_order: int
+
+private struct ChsMill
+    ch: Channel[int]
+    items: int
+    tally: Mutex[ChsTally]
+    // Hands each producer its number as it starts.
+    next: Atomic[int]
+
+// Sends `items` values, each its producer's number times a million plus its own index.
+private chs_produce(m: *ChsMill) -> unit
+    val me = m.next.add(1)
+
+    for i in 0..<m.items
+        assert(m.ch.send(me * 1000000 + i))
+
+// Takes values until the channel is closed and drained, checking that each producer's values arrive
+// in the order they were sent, and adds what it saw to the tally.
+private chs_consume(m: *ChsMill) -> unit
+    var count = [0; 8]
+    var sum = [0; 8]
+    var squares = [0; 8]
+    var last = [-1; 8]
+    var out_of_order = 0
+
+    loop
+        m.ch.receive() match
+            Some(v) ->
+                val p = v / 1000000
+                val i = v % 1000000
+
+                if i <= last[p] then out_of_order += 1
+                last[p] = i
+                count[p] += 1
+                sum[p] += i
+                squares[p] += i * i
+            None -> break
+
+    val t = m.tally.lock_raw()
+
+    for p in 0..<8
+        t.count[p] += count[p]
+        t.sum[p] += sum[p]
+        t.squares[p] += squares[p]
+
+    t.out_of_order += out_of_order
+    m.tally.unlock_raw()
+end chs_consume
+
+// `producers` threads send `items` values each through a channel of `cap` slots to `consumers`
+// threads, and the answer is how many checks failed: every value arrives exactly once -- the count,
+// the sum and the sum of squares of each producer's indices are what it sent -- and in its
+// producer's order.
+private chs_flow(producers: int, consumers: int, cap: int, items: int) -> int
+    var slots = [0; 64]
+    val m: &ChsMill = ChsMill(channel(slots[0..<cap]), items, Mutex.new(ChsTally([0; 8], [0; 8], [0; 8], 0)), Atomic(0))
+    var ps: [8]Option[Thread] = [None; 8]
+    var cs: [8]Option[Thread] = [None; 8]
+    var wrong = 0
+
+    for c in 0..<consumers
+        cs[c] = spawn(&chs_consume, &*m)
+
+    for p in 0..<producers
+        ps[p] = spawn(&chs_produce, &*m)
+
+    for p in 0..<producers
+        ps[p] match
+            Some(t) -> assert(t.join())
+            None -> wrong += 1
+
+    m.ch.close()
+
+    for c in 0..<consumers
+        cs[c] match
+            Some(t) -> assert(t.join())
+            None -> wrong += 1
+
+    val t = m.tally.lock_raw()
+
+    for p in 0..<producers
+        if t.count[p] != items then wrong += 1
+        if t.sum[p] != items * (items - 1) / 2 then wrong += 1
+        if t.squares[p] != (items - 1) * items * (2 * items - 1) / 6 then wrong += 1
+
+    wrong += t.out_of_order
+    m.tally.unlock_raw()
+    wrong
+end chs_flow
+
+@test("chs_ every value arrives once and in order, among 2 to 8 threads, through 1 slot and through 64")
+chs_many_threads() -> unit
+    // A thousand values a producer keeps the sum of their squares inside an `int`.
+    for n in 2..<9
+        for cap in [1, 64]
+            assert_eq(chs_flow(1, n - 1, cap, 1000), 0)
+            assert_eq(chs_flow(n - 1, 1, cap, 1000), 0)
+            assert_eq(chs_flow(n / 2, n - n / 2, cap, 1000), 0)
+
+@test("chs_ producers and consumers far past the cores still hand every value over once and in order")
+chs_oversubscribed() -> unit
+    // Sixteen threads to a channel, and a channel for every eight cores and two more, all at once, is
+    // more than twice as many threads as cores; `chs_flow` keeps a tally of eight producers, which
+    // caps one channel.
+    val busy = min(int(cpu_count()), 32)
+    val wrong: &sync Atomic[int] = Atomic(0)
+
+    scope((s) ->
+        for k in 0..<busy / 8 + 2
+            s.spawn(() ->
+                wrong.add(chs_flow(8, 8, if k % 2 == 0 then 1 else 64, 500))))
+
+    assert_eq(wrong.load(), 0)
+
+private struct ChsLate
+    ch: Channel[int]
+    wait_ms: int
+
+private chs_late_send(l: *ChsLate) -> unit
+    sleep(millis(l.wait_ms))
+    assert(l.ch.send(7))
+
+@test("chs_ a receiver that outwaits its watch sleeps, and the late send wakes it")
+chs_late_sender() -> unit
+    var slots = [0; 1]
+    var l = ChsLate(channel(slots[..]), 50)
+    val t0 = monotonic()
+    var t = spawn(&chs_late_send, &l) match
+        Some(t) -> t
+        None -> return
+
+    assert(l.ch.receive() == Some(7))
+    assert(monotonic() - t0 >= millis(50))
+    assert(t.join())
+
+private chs_late_receive(l: *ChsLate) -> unit
+    sleep(millis(l.wait_ms))
+    assert(l.ch.receive() == Some(1))
+    assert(l.ch.receive() == Some(2))
+
+@test("chs_ a sender at a full channel sleeps, and the late receive makes room and wakes it")
+chs_late_receiver() -> unit
+    var slots = [0; 1]
+    var l = ChsLate(channel(slots[..]), 50)
+    val t0 = monotonic()
+    var t = spawn(&chs_late_receive, &l) match
+        Some(t) -> t
+        None -> return
+
+    assert(l.ch.send(1))
+    assert(l.ch.send(2))
+    assert(monotonic() - t0 >= millis(50))
+    assert(t.join())
+
+private chs_drain(l: *ChsLate) -> unit
+    assert(l.ch.receive() == None)
+
+@test("chs_ closing a channel wakes every receiver asleep on it")
+chs_close_wakes_sleepers() -> unit
+    var slots = [0; 4]
+    val l: &ChsLate = ChsLate(channel(slots[..]), 0)
+    var ts: [4]Option[Thread] = [None; 4]
+
+    for i in 0..<4
+        ts[i] = spawn(&chs_drain, &*l)
+
+    // Long past their watch, so every one of them is on the futex when the close comes.
+    sleep(millis(50))
+    l.ch.close()
+
+    for i in 0..<4
+        ts[i] match
+            Some(t) -> assert(t.join())
+            None -> assert(false, "a thread did not start")
+
+private struct ChsVolley
+    there: Channel[int]
+    back: Channel[int]
+    rounds: int
+    pause_every: int
+
+// Answers each value with the next one, pausing past the other side's watch every `pause_every`
+// rounds, so the volley crosses between the watching path and the sleeping one.
+private chs_return(v: *ChsVolley) -> unit
+    loop
+        v.there.receive() match
+            Some(n) ->
+                if v.pause_every > 0 && n % v.pause_every == 0 then sleep(millis(1))
+                assert(v.back.send(n + 1))
+            None -> break
+
+@test("chs_ a volley through two one-slot channels, watched and slept through by turns, drops nothing")
+chs_volley() -> unit
+    for pause_every in [0, 97]
+        var a = [0; 1]
+        var b = [0; 1]
+        var v = ChsVolley(channel(a[..]), channel(b[..]), 20000, pause_every)
+        var t = spawn(&chs_return, &v) match
+            Some(t) -> t
+            None -> return
+
+        for i in 0..<v.rounds
+            assert(v.there.send(2 * i))
+            assert(v.back.receive() == Some(2 * i + 1))
+
+        v.there.close()
+        assert(t.join())
+
+// The condition variable's own waits do not watch: they count themselves asleep at once. A
+// notification checks that count, so these hand a turn back and forth with `notify_one` -- one wake
+// where it is needed and none where it is not -- and a wake skipped where a waiter had counted itself
+// hangs the test rather than slipping past it.
+
+private struct ChsRally
+    m: Mutex[int]
+    turn: Condvar
+    rounds: int
+    timed: bool
+
+private chs_wait_turn(r: *ChsRally, n: *int, parity: int)
+    while *n % 2 == parity
+        if r.timed
+            // A wait that times out uncounts itself as surely as one that is woken.
+            r.turn.wait_for(&r.m, 50000)
+        else
+            r.turn.wait(&r.m)
+
+private chs_return_turn(r: *ChsRally) -> unit
+    for _ in 0..<r.rounds
+        val n = r.m.lock_raw()
+
+        chs_wait_turn(r, n, 0)
+        *n += 1
+        r.m.unlock_raw()
+        r.turn.notify_one()
+
+@test("chs_ two threads take turns through a Condvar with notify_one, plain and timed, and no wake is lost")
+chs_condvar_notify_one() -> unit
+    for timed in [false, true]
+        var r = ChsRally(Mutex.new(0), Condvar.new(), 20000, timed)
+        var other = spawn(&chs_return_turn, &r) match
+            Some(t) -> t
+            None -> return
+
+        for _ in 0..<r.rounds
+            val n = r.m.lock_raw()
+
+            chs_wait_turn(&r, n, 1)
+            *n += 1
+            r.m.unlock_raw()
+            r.turn.notify_one()
+
+        assert(other.join())
+        assert_eq(r.m.with((n) -> *n), 40000)
+
+private struct ChsGate
+    m: Mutex[bool]
+    open: Condvar
+    woke: Atomic[int]
+
+private chs_wait_gate(g: *ChsGate) -> unit
+    val open = g.m.lock_raw()
+
+    while !*open
+        g.open.wait(&g.m)
+
+    g.m.unlock_raw()
+    g.woke.add(1)
+
+@test("chs_ notify_all wakes every sleeper, after notifications nobody was asleep for")
+chs_condvar_notify_all_sleepers() -> unit
+    val g: &ChsGate = ChsGate(Mutex.new(false), Condvar.new(), Atomic(0))
+
+    // Nobody waits yet: these find no sleeper and make no wake call, and must leave nothing behind
+    // that lets a later wait through.
+    g.open.notify_one()
+    g.open.notify_all()
+
+    var ts: [6]Option[Thread] = [None; 6]
+
+    for i in 0..<6
+        ts[i] = spawn(&chs_wait_gate, &*g)
+
+    sleep(millis(30))
+    assert_eq(g.woke.load(), 0)
+
+    g.m.with((open) -> *open = true)
+    g.open.notify_all()
+
+    for i in 0..<6
+        ts[i] match
+            Some(t) -> assert(t.join())
+            None -> assert(false, "a thread did not start")
+
+    assert_eq(g.woke.load(), 6)
+end chs_condvar_notify_all_sleepers

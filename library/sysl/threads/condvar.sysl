@@ -12,6 +12,15 @@ import sysl.threads.sys as tsys
  * the number, the futex finds it changed, and the waiter does not sleep through it. That is the whole
  * of what makes a condition variable correct, and it needs no queue of its own.
  *
+ * **A notification with nobody asleep makes no system call.** A waiter counts itself before it lets
+ * the lock go, and a notifier calls `sysl_futex_wake` only where the count is not zero, so a producer
+ * that notifies on every item costs one atomic add while its consumer is busy.
+ *
+ * **A waiter sleeps at once; it does not spin.** It has just let the lock go, and what it waits for
+ * is the work of a thread that has to take that lock first -- of no length the condition variable can
+ * know. A spinning waiter would also see every notification, so `notify_one` would rouse every
+ * spinner to fight over the lock.
+ *
  * **A wait can end with nothing having changed** -- a spurious wake, a notification meant for another
  * waiter -- so the condition is always re-checked in a loop, as with every condition variable:
  *
@@ -29,8 +38,12 @@ struct Condvar
     // The number every notification bumps, and the futex word a waiter sleeps on.
     private seq: Atomic[u32]
 
+    // How many waiters may be asleep on `seq`, so that a notification wakes only where somebody
+    // might need it.
+    private sleepers: Atomic[u32]
+
     /** A condition variable nobody is waiting on. */
-    new() -> Condvar = Condvar(Atomic(0))
+    new() -> Condvar = Condvar(Atomic(0), Atomic(0))
 
     /** Releases `m`, which the caller holds, sleeps until notified, and takes `m` again before
      * answering. The caller re-checks its condition: the wait may end with nothing changed.
@@ -39,8 +52,10 @@ struct Condvar
     wait[T](*self, m: *Mutex[T])
         val seen = self.seq.load(Relaxed)
 
+        self.sleepers.add(1)
         m.unlock_raw()
         tsys.futex_wait(&self.seq.v, seen, -1)
+        self.sleepers.sub(1)
         m.lock_raw()
     end wait
 
@@ -51,10 +66,12 @@ struct Condvar
     wait_for[T](*self, m: *Mutex[T], ns: i64) -> bool
         val seen = self.seq.load(Relaxed)
 
+        self.sleepers.add(1)
         m.unlock_raw()
 
         val r = tsys.futex_wait(&self.seq.v, seen, ns)
 
+        self.sleepers.sub(1)
         m.lock_raw()
         r != tsys.TIMED_OUT
     end wait_for
@@ -64,19 +81,54 @@ struct Condvar
     wait_raw(*self, l: *SleepLock)
         val seen = self.seq.load(Relaxed)
 
+        self.sleepers.add(1)
         l.unlock()
         tsys.futex_wait(&self.seq.v, seen, -1)
+        self.sleepers.sub(1)
         l.lock()
     end wait_raw
 
+    // `wait_raw` for a waiter that knows what it waits for is quick to come: it watches the number for
+    // about as long as a sleep and a wake would cost before it sleeps, and is not counted a sleeper
+    // while it watches, so a notification sent then makes no system call. `Channel[T]` waits this way:
+    // its other side is a `send` or `receive` -- a few dozen instructions under the lock -- whenever
+    // that side is running at all.
+    @blocks
+    private[threads] wait_raw_spinning(*self, l: *SleepLock)
+        val seen = self.seq.load(Relaxed)
+        var spins = 0
+
+        l.unlock()
+
+        while self.seq.load(Acquire) == seen
+            if spins == WAIT_SPINS
+                self.sleepers.add(1)
+                tsys.futex_wait(&self.seq.v, seen, -1)
+                self.sleepers.sub(1)
+                break
+
+            spin_hint()
+            spins += 1
+
+        l.lock()
+    end wait_raw_spinning
+
     /** Wakes one waiter, if there is one. */
     notify_one(*self)
-        self.seq.add(1, Release)
-        tsys.futex_wake(&self.seq.v, 1)
+        self.seq.add(1)
+        if self.sleepers.load() != 0 then tsys.futex_wake(&self.seq.v, 1)
 
     /** Wakes every waiter. */
     notify_all(*self)
-        self.seq.add(1, Release)
-        tsys.futex_wake(&self.seq.v, tsys.WAKE_ALL)
+        self.seq.add(1)
+        if self.sleepers.load() != 0 then tsys.futex_wake(&self.seq.v, tsys.WAKE_ALL)
+
+    // Both sides of the count are sequentially consistent: a waiter counts itself before the futex
+    // compares the number it read, and a notifier bumps the number before it reads the count, so
+    // either the notifier sees the waiter or the waiter's futex sees the new number.
 
 end Condvar
+
+// How many rounds `wait_raw_spinning` watches the number before it sleeps: about 8 µs on an Apple M5,
+// what a sleep and a wake cost there, as for `Barrier`.
+private const WAIT_SPINS: int = 32000

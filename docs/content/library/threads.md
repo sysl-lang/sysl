@@ -480,7 +480,10 @@ three-state lock**. The word is zero when free, one when held, and two when held
 on it; an uncontended take and release are one atomic operation each and never reach the system, a
 contended take marks the word two and sleeps in `sysl_futex_wait`, and only a release that finds a
 two calls `sysl_futex_wake`. **A waiter sleeps** — it neither spins nor yields — so a contended lock
-costs nothing while it waits.
+costs nothing while it waits. Spinning first was measured and loses here: with short sections the
+holder takes the lock again while the others sleep, which is what keeps a contended lock near 16 ns a
+section at 2 to 36 threads, and waiters that watch the word instead fight the holder for it — from
+1.3 to 7 times slower at four threads and more, however long they watch.
 
 A `pthread_mutex_t` was never the answer, and the reason is a **build property**: its size lives in
 a header and differs between two libcs on the *same* platform — 64 bytes on Darwin, 40 under glibc on
@@ -550,8 +553,13 @@ The table crosses because each record is `@guards(value)` and an array is shared
 **A place to sleep until another thread says something changed.** It is a sequence number every
 `notify_one` and `notify_all` bumps: a waiter reads it while it still holds the lock, lets the lock go
 and sleeps only while the number is still the one it read — so a notification sent between the release
-and the sleep is never slept through. A wait may end with nothing changed, so the condition is
-re-checked in a loop, as with every condition variable:
+and the sleep is never slept through. A waiter counts itself asleep before it lets the lock go, and a
+notification makes the wake call only where that count is not zero, so notifying a condition nobody
+waits on is one atomic add. **A waiter sleeps at once; it does not spin**: what it waits for is the
+work of a thread that must take the lock it just let go, for no length the condition variable can
+know, and a spinning waiter would see every notification, so `notify_one` would rouse every spinner
+to fight over the lock. A wait may end with nothing changed, so the condition is re-checked in a loop,
+as with every condition variable:
 
 ```sysl
 import sysl.threads.*
@@ -698,11 +706,18 @@ print(ch.send(Node(1)))
 reaches another concurrency domain, so every count inside it has to be atomic
 ```
 
-### A waiter sleeps
+### A waiter watches, then sleeps
 
-A full `send` sleeps on one `Condvar` and an empty `receive` on the other, each woken by the transfer
-that makes room or brings a value, and `close` wakes both — so a waiter costs nothing while it waits,
-and is not woken for a transfer that cannot help it.
+A full `send` waits on one `Condvar` and an empty `receive` on the other, each woken by the transfer
+that makes room or brings a value, and `close` wakes both — so a waiter is not woken for a transfer
+that cannot help it.
+
+**It watches for the transfer before it sleeps**, for about as long as a sleep and a wake would cost
+(some 8 µs on an Apple M5). The other side's `send` or `receive` is a few dozen instructions under the
+lock whenever that side is running, so between busy threads the hand-over happens while the waiter is
+still watching, and nobody makes a system call: a value bounced between two threads through one-slot
+channels goes round in about 0.2 µs where sleeping at once took about 3–4 µs. Past that it sleeps, so
+a long wait, or more threads than cores, does not burn a core waiting.
 
 ### The ring is a pointer, and that is the crossing rule
 

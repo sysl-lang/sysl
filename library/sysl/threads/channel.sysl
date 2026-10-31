@@ -30,8 +30,12 @@ import sysl.container.ring.{Ring, ring}
  *         None -> break
  * ```
  *
- * **A waiter sleeps**: a full `send` waits on one `Condvar` and an empty `receive` on the other, each
- * woken by the transfer that makes room or brings a value, and both woken by `close`.
+ * **A waiter spins first and sleeps only after that**: a full `send` waits on one `Condvar` and an
+ * empty `receive` on the other, each woken by the transfer that makes room or brings a value, and both
+ * woken by `close`. It watches for that transfer for about as long as a sleep and a wake would cost --
+ * where the other side is running, which is what a pipeline of busy threads sees, the hand-over
+ * happens while it watches and nobody makes a system call -- and then sleeps, so a long wait, or more
+ * threads than cores, does not burn a core waiting.
  *
  * **A view goes in as a copy.** `send` and `try_send` are `@crossing(value)`, and a value crossing by
  * value is a copy, so a `[]u8`, a
@@ -125,7 +129,7 @@ struct Channel[T]
                 self.has_value.notify_one()
                 return true
 
-            self.has_room.wait_raw(&self.lock)
+            self.has_room.wait_raw_spinning(&self.lock)
     end send
 
     /** Puts a value in if there is room, and answers whether it went. Never waits. */
@@ -162,7 +166,7 @@ struct Channel[T]
                         self.lock.unlock()
                         return None
 
-                    self.has_value.wait_raw(&self.lock)
+                    self.has_value.wait_raw_spinning(&self.lock)
     end receive
 
     /** Takes a value out if there is one, and answers nothing where there is not. Never waits. */
