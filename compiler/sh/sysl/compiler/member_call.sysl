@@ -20,6 +20,8 @@ lookup_trait_member(cx: &Analyzer, span: Span, receiver: TExpr, name: string, ar
                     expected: Option[Type], via: Buf[string] = no_bound_traits()) -> TExpr
     val rty = receiver_type(texpr_type(receiver))
 
+    if cx.at_definition then note_receiver_site(cx, span, rty, name)
+
     rty match
         // A parameter standing in for itself, during the walk that checks a generic body once at its
         // own definition: what it can promise is exactly what its bounds promise.
@@ -27,7 +29,19 @@ lookup_trait_member(cx: &Analyzer, span: Span, receiver: TExpr, name: string, ar
         // A trait object's property is a slot like any other member, dispatched through the table.
         Trait(_, _, _) -> read_erased(cx, span, receiver, rty, name)
         _ ->
-            val found = member_key(cx.an, rty, name)
+            // A property is the call with its parentheses dropped, so a bound means the same member.
+            val promised = promised_member(cx, span, rty, name, via)
+            val found = if promised.is_some() then promised.unwrap().found else member_key(cx.an, rty, name)
+            var reach: Buf[string] = buf()
+
+            for item in via
+                reach.push(item)
+
+            if promised.is_some()
+                for item in promised.unwrap().traits
+                    if !holds_string(reach, item) then reach.push(item)
+            end if
+
             // A name a type's own body overloads is a set of methods and never a property, so the
             // first of them answers the read with what a method read without a call is told.
             val first = member_at(cx.an, found.0, name)
@@ -35,7 +49,7 @@ lookup_trait_member(cx: &Analyzer, span: Span, receiver: TExpr, name: string, ar
                              cx.an.tables.members.from_trait.get(member_key_of(found.0, name)).is_none() &&
                              cx.an.tables.members.alts.has(member_key_of(found.0, name))
             val chosen = if overloaded then Some(name) else
-                chosen_member(cx, rty, found.0, name, span, buf(), via)
+                chosen_member(cx, rty, found.0, name, span, buf(), reach)
 
             if chosen.is_none() then return bad_expr(span)
 
@@ -56,7 +70,7 @@ lookup_trait_member(cx: &Analyzer, span: Span, receiver: TExpr, name: string, ar
 
             if decl.is_property then
                 return member_dispatch(cx, span, receiver, rty, found.0, chosen.unwrap(), decl,
-                                       buf(), expected, name, via)
+                                       buf(), expected, name, reach)
 
             if decl.recv_mode().is_some() then
                 return cx.err(span, s"'$name' is a method of '${type_show(rty)}' — call it " +
@@ -907,6 +921,8 @@ call_member(cx: &Analyzer, span: Span, receiver: TExpr, name: string, args: Buf[
 
     if rty == Unknown then return bad_expr(span)
 
+    if cx.at_definition then note_receiver_site(cx, span, rty, name)
+
     // **`Eq` and `Hash` at a reference are its referent's where the referent has them, and its
     // identity where it does not** (`reference/memory.md § References compare through their
     // referent`); at a `*T`, through a bound, they are the address's. So a `[K: Hash + Eq]` body
@@ -1150,7 +1166,7 @@ private call_declared(cx: &Analyzer, span: Span, receiver: TExpr, rty: Type, nam
                       args: Buf[Expr], expected: Option[Type],
                       via: Buf[string] = no_bound_traits(),
                       targs: Buf[Expr] = no_written_members()) -> TExpr
-    val promised = promised_member(cx, rty, name, via)
+    val promised = promised_member(cx, span, rty, name, via)
     val found = if promised.is_some() then promised.unwrap().found else member_key(cx.an, rty, name)
 
     // Inside a derivation, a member the derived trait declares is reached through that trait alone,
@@ -1260,12 +1276,22 @@ end PromisedMember
 // the receiver's type carries a bound in force, the traits that bound reaches are asked first: one the
 // bound names and that declares the member, else what a blanket over its family offers.
 //
-// A receiver that is not a written parameter (`(a + b).max(c)`) has no bound of its own to read, and
-// answers through the bounds of the parameters instantiated at its type.
-private promised_member(cx: &Analyzer, rty: Type, name: string, via: Buf[string]) -> Option[PromisedMember]
+// **The decision is the source's, not the instantiation's**, as `reached_through_bound`'s is: a local
+// `x: int` of a body instantiated at `T = int` has the type a `T` has, and is still an `int` the program
+// wrote, so its member is the one a non-generic body would reach at every instantiation. The walk at the
+// definition files which parameter each call's receiver was (`receiver_params`), which also answers
+// `(a + b).max(c)` and `val y = a`, neither of them a name a bound was written on. A body that walk never
+// read -- the library's, and a nested generic -- asks of the parameters instantiated at the receiver's
+// type instead.
+private promised_member(cx: &Analyzer, span: Span, rty: Type, name: string,
+                        via: Buf[string]) -> Option[PromisedMember]
     val owners = blanket_owners(cx.an, rty)
 
     if owners.is_empty() then return None
+
+    val filed = cx.an.tables.receiver_params.get(receiver_site_key(cx, span, name))
+
+    if filed.is_some() && filed.unwrap() == "" then return None
 
     var promised: Buf[string] = buf()
 
@@ -1274,11 +1300,14 @@ private promised_member(cx: &Analyzer, rty: Type, name: string, via: Buf[string]
 
     if via.is_empty()
         for item in cx.subst
-            if type_eq(item.ty, rty)
+            val mine = if filed.is_some() then item.name == filed.unwrap() else type_eq(item.ty, rty)
+
+            if mine
                 val keys = bound_traits(cx, item.name)
 
                 for key in keys
                     if !holds_string(promised, key) then promised.push(key)
+        end for
     end if
 
     if promised.is_empty() then return None
@@ -1319,6 +1348,19 @@ private promised_member(cx: &Analyzer, rty: Type, name: string, via: Buf[string]
 
     None
 end promised_member
+
+// Files a member call read at its generic definition: the type parameter its receiver was, if any.
+private note_receiver_site(cx: &Analyzer, span: Span, rty: Type, name: string)
+    val param = rty match
+        Abstract(n, _) -> n
+        _ -> ""
+
+    cx.an.tables.receiver_params.put(receiver_site_key(cx, span, name), param)
+
+// A member call, by its file, its whole span and its name: `a.max(b).max(c)` holds two that start at
+// one place.
+private receiver_site_key(cx: &Analyzer, span: Span, name: string) -> string =
+    s"${cx.scope.src.name}:${span.start}:${span.end}:$name"
 
 // What a message calls the place a member was found. A type's key is the name a reader knows it by;
 // a blanket's is a filing key no program wrote, and the trait it implements is what they know instead.
@@ -2667,6 +2709,9 @@ impl_condition_unmet(a: &Analysis, rty: Type, base: string, filed: string) -> Op
 
         val (packed, tr) = unmet.unwrap()
         val arg = first_unmet_part(a, tr, packed)
+
+        if condition_cycles(a, tr, arg) then return Some(s"it ${condition_cycle_phrase(tr, arg)}")
+
         val why = unmet_bound(a, tr, arg)
         val tail = if why.is_some() then s" — ${why.unwrap()}" else ""
 

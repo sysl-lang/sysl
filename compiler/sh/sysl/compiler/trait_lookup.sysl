@@ -1135,8 +1135,37 @@ conforms(a: &Analysis, tr: Bound, t: Type) -> bool
     for i in 0..<ti.tparams.len()
         subst.push(Binding(ti.tparams.at(i), targs.at(i)))
 
-    unmet_condition_of(a, ti, subst).is_none()
+    // **A condition that needs its own answer is not met**: `impl[T: Integer + X] X for T` gives `int`
+    // an `X` only once `int` has one, and nothing in the program starts that off. So a question met
+    // again while it is being answered answers no, and a block elsewhere that does give the trait
+    // (`impl Y for int` under a two-block cycle) still answers yes at the types it covers.
+    val asked = tr.key()
+
+    for item in a.tables.conditions_asked
+        if item.0 == asked && type_eq(item.1, t)
+            a.tables.condition_cycled = true
+            return false
+        end if
+
+    a.tables.conditions_asked.push((asked, t))
+
+    val met = unmet_condition_of(a, ti, subst).is_none()
+
+    a.tables.conditions_asked.pop()
+    met
 end conforms
+
+// Whether a type fails a trait because the conditions it would be given it by go round in a cycle.
+condition_cycles(a: &Analysis, tr: Bound, t: Type) -> bool
+    a.tables.condition_cycled = false
+
+    !satisfies(a, tr, t) && a.tables.condition_cycled
+end condition_cycles
+
+// What is wrong with such a condition, after the subject that asks it.
+condition_cycle_phrase(tr: Bound, t: Type) -> string =
+    s"asks '${tr.show()}' of ${type_show(t)}, and answering that comes back to the same question — " +
+    "a cycle of conditions is never met"
 
 // The first of a block's own conditions this subject's arguments do not meet: the argument, and the
 // bound it fails. Read **in the block's own terms**, because the condition is the block's -- a
@@ -1280,6 +1309,9 @@ unmet_bound(a: &Analysis, tr: Bound, t: Type) -> Option[string]
     if unmet.is_none() then return None
 
     val (packed, bound) = unmet.unwrap()
+
+    if condition_cycles(a, bound, packed) then
+        return Some(s"the 'impl' that covers it ${condition_cycle_phrase(bound, packed)}")
 
     Some(s"the 'impl' that covers it asks '${bound.show()}' of " +
          s"${type_show(first_unmet_part(a, bound, packed))}, which does not implement it")

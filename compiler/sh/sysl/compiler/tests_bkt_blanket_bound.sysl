@@ -287,3 +287,206 @@ bkt_concrete_call_unchanged()
                       "main()\n    print(3.max(5), f(3, 5), u8(3).max(5))\n")
 
     assert(enm_says(out, "1000 5 5"), out)
+
+// -- a receiver's written type decides, at every instantiation -------------------------------------------
+
+// A program whose `int` has its own `max`, beside one generic body under test, printed at `T = int` and
+// `T = u8`: the instantiation must not change what the body's receiver reaches.
+private bkt_int_has_max(body: string, at_int: string, at_u8: string) -> string =
+    enm_ran("trait Biggest\n    max(self, other: Self) -> Self\nimpl Biggest for int\n    max(self, other: int) -> int = 1000\n" +
+            "struct Holder\n    n: int\nwritten() -> int = 3\nid[T](a: T) -> T = a\n" + body +
+            s"main()\n    print($at_int, $at_u8)\n")
+
+@test("a local written 'int' answers as it would outside the generic, at T = int and at T = u8")
+bkt_written_local()
+    if !enm_ready() then return
+
+    val out = bkt_int_has_max("f[T: Integer](a: T) -> int\n    val x: int = 3\n    x.max(5)\n", "f(3)", "f(u8(3))")
+
+    assert(enm_says(out, "1000 1000"), out)
+
+@test("a field written 'int' answers as it would outside the generic")
+bkt_written_field()
+    if !enm_ready() then return
+
+    val out = bkt_int_has_max("f[T: Integer](a: T, s: Holder) -> int = s.n.max(5)\n", "f(3, Holder(3))", "f(u8(3), Holder(3))")
+
+    assert(enm_says(out, "1000 1000"), out)
+
+@test("a function result written 'int' answers as it would outside the generic")
+bkt_written_result()
+    if !enm_ready() then return
+
+    val out = bkt_int_has_max("f[T: Integer](a: T) -> int = written().max(5)\n", "f(3)", "f(u8(3))")
+
+    assert(enm_says(out, "1000 1000"), out)
+
+@test("a local inferred from a literal is an 'int' the source chose, not a T")
+bkt_literal_local()
+    if !enm_ready() then return
+
+    val out = bkt_int_has_max("f[T: Integer](a: T) -> int\n    val y = 3\n    y.max(5)\n", "f(3)", "f(u8(3))")
+
+    assert(enm_says(out, "1000 1000"), out)
+
+@test("an expression over T answers as a T, at T = int and at T = u8")
+bkt_expression_over_t()
+    if !enm_ready() then return
+
+    val out = bkt_int_has_max("f[T: Integer + Add](a: T, b: T, c: T) -> T = (a + b).max(c)\n", "f(3, 5, 1)", "f(u8(3), 5, 1)")
+
+    assert(enm_says(out, "8 8"), out)
+
+@test("a local inferred from a T answers as a T")
+bkt_local_from_t()
+    if !enm_ready() then return
+
+    val out = bkt_int_has_max("f[T: Integer](a: T, b: T) -> T\n    val y = a\n    y.max(b)\n", "f(3, 5)", "f(u8(3), 5)")
+
+    assert(enm_says(out, "5 5"), out)
+
+@test("a generic call's result at T answers as a T")
+bkt_generic_result_is_t()
+    if !enm_ready() then return
+
+    val out = bkt_int_has_max("f[T: Integer](a: T, b: T) -> T = id(a).max(b)\n", "f(3, 5)", "f(u8(3), 5)")
+
+    assert(enm_says(out, "5 5"), out)
+
+@test("a chain answers link by link: a T's 'max' and then a written int's")
+bkt_chain_mixes_receivers()
+    if !enm_ready() then return
+
+    val out = bkt_int_has_max("f[T: Integer](a: T, b: T) -> int\n    val x: int = 3\n    print(a.max(b).max(b))\n    x.max(5).max(7)\n",
+                              "f(3, 5)", "f(u8(3), 5)")
+
+    assert(enm_says(out, "1000 1000"), out)
+    assert(enm_says(out, "5\n5\n"), out)
+
+@test("a written int inside a closure of the body answers as outside the generic; a T as a T")
+bkt_closure_receivers()
+    if !enm_ready() then return
+
+    val out = bkt_int_has_max("f[T: Integer](a: T, b: T) -> int\n    val x: int = 3\n    val g = () -> x.max(5)\n    print(a.max(b))\n    g()\n",
+                              "f(3, 5)", "f(u8(3), 5)")
+
+    assert(enm_says(out, "1000 1000"), out)
+    assert(enm_says(out, "5\n5\n"), out)
+
+@test("two parameters at one type each keep their own bound")
+bkt_two_params_one_type()
+    if !enm_ready() then return
+
+    val out = bkt_int_has_max("f[T: Integer + Add, U: Integer + Add + Biggest](a: T, b: T, c: U, d: U) -> int\n" +
+                              "    print((a + a).max(b), (c + c).max(d))\n    0\n", "f(3, 5, 3, 5)", "f(u8(3), 5, 3, 5)")
+
+    assert(enm_says(out, "6 1000\n6 1000\n"), out)
+
+@test("a member of a generic type: a written int field and a T field differ at T = int")
+bkt_generic_struct_member()
+    if !enm_ready() then return
+
+    val out = bkt_int_has_max("struct Pair[T: Integer]\n    t: T\n    n: int\n    both(self, o: T) -> (T, int) = (self.t.max(o), self.n.max(5))\n",
+                              "Pair(3, 3).both(5)", "Pair(u8(3), 3).both(5)")
+
+    assert(enm_says(out, "(5, 1000) (5, 1000)"), out)
+
+@test("a body whose result is inferred, read ahead of the definition walks, keeps the same answers")
+bkt_inferred_result_body()
+    if !enm_ready() then return
+
+    val out = bkt_int_has_max("f[T: Integer](a: T) = written().max(5)\ng[T: Integer](a: T, b: T) = a.max(b)\n",
+                              "f(3), g(3, 5)", "f(u8(3)), g(u8(3), 5)")
+
+    assert(enm_says(out, "1000 5 1000 5"), out)
+
+@test("a local written 'int' that shadows a parameter written T answers as the 'int' it is")
+bkt_shadowing_local()
+    if !enm_ready() then return
+
+    val out = bkt_int_has_max("f[T: Integer](x: T, b: T) -> int\n    print(x.max(b))\n    val x: int = 3\n    x.max(5)\n",
+                              "f(3, 5)", "f(u8(3), 5)")
+
+    assert(enm_says(out, "1000 1000"), out)
+    assert(enm_says(out, "5\n5\n"), out)
+
+@test("a property reads as a method calls: a T's is the blanket's, a written int's its own")
+bkt_property_receivers()
+    if !enm_ready() then return
+
+    val out = enm_ran("trait Own\n    size -> int\nimpl Own for int\n    size -> int = 1\n" +
+                      "trait Blanket\n    size -> int\nimpl[T: Integer] Blanket for T\n    size -> int = 3\n" +
+                      "open[T: Integer](a: T) -> int = a.size\nclosed[T: Integer](a: T) -> int\n    val x: int = 3\n    x.size\n" +
+                      "main()\n    print(open(9), open(u8(9)), closed(9), closed(u8(9)))\n")
+
+    assert(enm_says(out, "3 3 1 1"), out)
+
+// -- a condition that asks for what it gives -------------------------------------------------------------
+
+private bkt_self_cycle() -> string = "trait X\n    x(self) -> int\nimpl[T: Integer + X] X for T\n    x(self) -> int = 1\n"
+
+private bkt_two_cycle() -> string =
+    "trait X\n    x(self) -> int\ntrait Y\n    y(self) -> int\n" +
+    "impl[T: Integer + Y] X for T\n    x(self) -> int = 1\nimpl[T: Integer + X] Y for T\n    y(self) -> int = 2\n"
+
+@test("a block whose condition asks the trait it gives is refused at a call, not a stack overflow")
+bkt_cycle_self_at_a_call()
+    if !enm_ready() then return
+
+    val out = enm_err(bkt_self_cycle() + "main()\n    print(5.x())\n")
+
+    assert(enm_says(out, "'x' is a member the 'impl' of 'X' gives 'int' only where its condition holds, and it asks 'X' of int, " +
+                         "and answering that comes back to the same question — a cycle of conditions is never met"), out)
+
+@test("two blocks asking each other's trait are refused at a call, whichever is called")
+bkt_cycle_two_blocks()
+    if !enm_ready() then return
+
+    val x = enm_err(bkt_two_cycle() + "main()\n    print(5.x())\n")
+    val y = enm_err(bkt_two_cycle() + "main()\n    print(5.y())\n")
+
+    assert(enm_says(x, "it asks 'Y' of int, and answering that comes back to the same question"), x)
+    assert(enm_says(y, "it asks 'X' of int, and answering that comes back to the same question"), y)
+
+@test("a cycle met through a generic body's bound is refused at the call of that body")
+bkt_cycle_through_a_bound()
+    if !enm_ready() then return
+
+    val self_cycle = enm_err(bkt_self_cycle() + "f[T: Integer + X](a: T) -> int = a.x()\nmain()\n    print(f(5))\n")
+    val two = enm_err(bkt_two_cycle() + "f[T: Integer + X](a: T) -> int = a.x()\nmain()\n    print(f(u8(5)))\n")
+
+    assert(enm_says(self_cycle, "comes back to the same question"), self_cycle)
+    assert(enm_says(two, "comes back to the same question"), two)
+
+@test("a body bounded by the family alone is not given a cycle's trait")
+bkt_cycle_family_bound()
+    if !enm_ready() then return
+
+    val out = enm_err(bkt_self_cycle() + "f[T: Integer](a: T) -> int = a.x()\nmain()\n    print(f(5))\n")
+
+    assert(enm_says(out, "'x' needs 'T: X'"), out)
+
+@test("a cycle nothing asks about is no error")
+bkt_cycle_unasked()
+    if !enm_ready() then return
+
+    val one = enm_ran(bkt_self_cycle() + "main()\n    print(5)\n")
+    val two = enm_ran(bkt_two_cycle() + "main()\n    print(6)\n")
+
+    assert(enm_says(one, "5"), one)
+    assert(enm_says(two, "6"), two)
+
+@test("a block that does give the trait breaks a cycle at the types it covers, and only there")
+bkt_cycle_broken_by_an_impl()
+    if !enm_ready() then return
+
+    val broken = "impl Y for int\n    y(self) -> int = 9\n"
+    val out = enm_ran("trait X\n    x(self) -> int\ntrait Y\n    y(self) -> int\n" + broken +
+                      "impl[T: Integer + Y] X for T\n    x(self) -> int = 1\nimpl[T: Integer + X] Y for T\n    y(self) -> int = 2\n" +
+                      "main()\n    print(5.x(), 5.y())\n")
+    val refused = enm_err("trait X\n    x(self) -> int\ntrait Y\n    y(self) -> int\n" + broken +
+                          "impl[T: Integer + Y] X for T\n    x(self) -> int = 1\nimpl[T: Integer + X] Y for T\n    y(self) -> int = 2\n" +
+                          "main()\n    print(u8(5).x())\n")
+
+    assert(enm_says(out, "1 9"), out)
+    assert(enm_says(refused, "comes back to the same question"), refused)
