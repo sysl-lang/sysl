@@ -130,6 +130,25 @@ private parse_named_pattern(p: *Parser, start: Span) -> Pattern
                 if p.at_kw(")") then break
 
         p.expect_kw(")")
+
+        // `u8('a')..u8('z')` -- a conversion of a literal opening a range. A variant's field is never
+        // followed by a range operator, so one here can only be the range.
+        val one = if args.len() == 1 then literal_of(args.at(0)) else None
+
+        if one.is_some() && !dotted
+            parse_range_op(p) match
+                Some(inclusive) ->
+                    val hi = parse_pattern_lit(p) match
+                        Some(e) -> e
+                        None ->
+                            p.want("expression")
+                            expr(p.here(), Bad)
+
+                    return pattern_of(start.to(p.just_taken()),
+                                      RangePattern(conversion_of(name, one.unwrap(), start), hi, inclusive))
+                None -> ()
+        end if
+
         return pattern_of(start.to(p.just_taken()), VariantPattern(name, args))
     end if
 
@@ -216,9 +235,41 @@ private parse_literal_pattern(p: *Parser, start: Span) -> Pattern
             pattern_of(start.to(p.just_taken()), RangePattern(lo, hi, inclusive))
 end parse_literal_pattern
 
+// The literal a one-part pattern holds, where it is one.
+literal_of(p: Pattern) -> Option[Expr] = *p.kind match
+    LitPattern(v) -> Some(v)
+    _ -> None
+
+// `u8(';')` as the expression it stands for: a conversion of a literal.
+conversion_of(name: string, lit: Expr, at: Span) -> Expr
+    var args: Buf[Expr] = buf()
+
+    args.push(lit)
+    expr(at, Call(expr(at, Ident(name)), args))
+end conversion_of
+
 // The literals a pattern may hold, and the negative form of a number.
 private parse_pattern_lit(p: *Parser) -> Option[Expr]
     val start = p.here()
+
+    // `u8('z')` -- a conversion of a literal, as the far end of a range.
+    p.peek() match
+        Ident(n) ->
+            if p.kw_at(1, "(")
+                p.bump()
+                p.bump()
+
+                val inner = parse_pattern_lit(p)
+
+                if inner.is_none()
+                    p.want("a literal")
+                    return Some(expr(start.to(p.just_taken()), Bad))
+                end if
+
+                p.expect_kw(")")
+                return Some(conversion_of(n, inner.unwrap(), start.to(p.just_taken())))
+            end if
+        _ -> ()
 
     if p.at_kw("-")
         p.bump()

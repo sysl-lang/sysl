@@ -321,6 +321,30 @@ private variant_pattern(cx: &Analyzer, span: Span, written: string, args: Buf[Pa
                         ty: Type) -> TPattern
     val name = last_segment(written)
 
+    // `u8(';')` -- a conversion of a literal is the constant it converts to, read as the expression
+    // it would be, so its range check and its meaning are the conversion's own.
+    if args.len() == 1 && written == name && scalar_subject(ty) && is_scalar_name(name)
+        val lit = literal_of(args.at(0))
+
+        // As an expression `u8(300)` wraps to 44; a pattern is a constant to compare with, and one
+        // that no value can equal is a mistake rather than a different number.
+        if lit.is_some()
+            val n = integer_literal_value(lit.unwrap())
+
+            underlying(ty) match
+                Integer(bits, signed, _) ->
+                    if n.is_some() && !fits(n.unwrap(), bits, signed) then
+                        cx.fault(span, s"${n.unwrap()} does not fit ${type_show(ty)}, so no value " +
+                                 s"matches '$name(${n.unwrap()})' — a pattern is a constant, not a " +
+                                 "conversion that wraps")
+
+                        return TWildPattern(ty)
+                _ -> ()
+        end if
+
+        if lit.is_some() then return literal_pattern(cx, span, conversion_of(name, lit.unwrap(), span), ty)
+    end if
+
     underlying(ty) match
         Enum(d) ->
             if enum_path_mismatch(cx, span, written, name, ty) then return TWildPattern(ty)
@@ -375,8 +399,12 @@ private variant_pattern(cx: &Analyzer, span: Span, written: string, args: Buf[Pa
         Unknown -> unknown_subject(cx, args, ty)
 
         other ->
-            cx.fault(span, s"'$name(…)' matches an enum variant or a struct, but the value is " +
-                     s"${type_show(other)}${held_behind(other)}")
+            if scalar_subject(other) && args.len() == 1 && written == name && is_scalar_name(name) then
+                cx.fault(span, s"'$name(…)' in a pattern converts a literal, as in $name(65) — a " +
+                         "name or an expression inside it is not a constant")
+            else
+                cx.fault(span, s"'$name(…)' matches an enum variant or a struct, but the value is " +
+                         s"${type_show(other)}${held_behind(other)}")
             TWildPattern(ty)
 
 // A tuple pattern is the positional struct pattern with the name off, which is why it ends as the
@@ -544,6 +572,32 @@ private held_behind(t: Type) -> string
     " — a pattern does not reach through a memory mode the way a field selection does, so match " +
         "what it holds: '*x match'"
 end held_behind
+
+// A value a conversion of a literal can stand for: the numbers, `char` and `bool`.
+private scalar_subject(t: Type) -> bool = underlying(t) match
+    Integer(_, _, _) -> true
+    Floating(_, _) -> true
+    Fixed(_, _, _) -> true
+    Char -> true
+    Bool -> true
+    _ -> false
+
+// Whether a name is one of the built-in scalar types a conversion is written with: `int`, `char`,
+// `bool`, `usize`, `f64`, and the width families `i8`, `u12`, `f32`.
+private is_scalar_name(name: string) -> bool
+    if name == "int" || name == "uint" || name == "char" || name == "bool" then return true
+    if name == "isize" || name == "usize" then return true
+
+    val b = name.bytes
+
+    if b.len < 2 then return false
+    if b[0] != u8('i') && b[0] != u8('u') && b[0] != u8('f') then return false
+
+    for i in 1..<b.len
+        if b[i] < u8('0') || b[i] > u8('9') then return false
+
+    true
+end is_scalar_name
 
 private matchable(t: Type) -> bool = t match
     Enum(_) -> true

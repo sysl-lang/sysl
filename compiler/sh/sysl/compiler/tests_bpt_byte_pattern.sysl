@@ -1,0 +1,119 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// A conversion of a literal is a constant pattern with the literal's own meaning: `u8(';')` in a
+// match on a `u8`, as a single value, as an alternative, and as either end of a range. The
+// conversion is read as the expression it would be, so its range check is the conversion's.
+
+private struct BptRun
+    ok: bool
+    out: string
+
+private bpt_run(text: string) -> BptRun
+    val root = make_temp_dir("sysl-bpt").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val built = build_native_program(s"$root/main.sysl", None, None, "0", Some(s"$root/built"))
+
+    built match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return BptRun(false, failure_text(why))
+        Ok(_) -> ()
+
+    val said = capture(s"$root/built", [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> BptRun(false, "could not be started")
+        Ok(o) -> BptRun(o.status.ok(), o.text)
+end bpt_run
+
+private bpt_prints(text: string, expected: string)
+    if std_root().is_err() || !clang_available()
+        print("skipped: the library or the toolchain is not on this machine")
+        return
+
+    val run = bpt_run(text)
+
+    assert(run.ok, run.out)
+    assert_eq(run.out, expected)
+end bpt_prints
+
+private bpt_first(text: string) -> string
+    val ds = stmt_diagnostics(text)
+
+    if ds.is_empty() then return ""
+
+    ds.at(0)
+end bpt_first
+
+private bpt_count(text: string) -> usize = stmt_diagnostics(text).len()
+
+@test("a conversion of a literal matches exactly what the bare literal matches, in every shape")
+bpt_conversions_match_like_literals()
+    bpt_prints("const Semi: u8 = u8(';')\n\ntype Byte = u8\n\n" +
+               "one(c: u8) -> real = c match\n    u8('t') -> 1e12\n    _ -> 1.0\n\n" +
+               "alias(c: Byte) -> int = c match\n    u8('t') -> 1\n    _ -> 0\n\n" +
+               "wide(c: u16) -> int = c match\n    u16('a') -> 1\n    u16(0x41) -> 2\n    _ -> 0\n\n" +
+               "signed(c: i32) -> int = c match\n    i32(-1) -> 1\n    i32(7) -> 2\n    _ -> 0\n\n" +
+               "u32s(c: u32) -> int = c match\n    u32(0x41) -> 1\n    _ -> 0\n\n" +
+               "alt(c: u8) -> int = c match\n    u8('a') | u8('b') -> 1\n    'c' | u8('d') -> 2\n    _ -> 0\n\n" +
+               "span(c: u8) -> int = c match\n    u8('a')..u8('z') -> 1\n    u8('0')..<u8('9') -> 2\n" +
+               "    u8('A')..'Z' -> 3\n    _ -> 0\n\n" +
+               "named(c: u8) -> int = c match\n    Semi -> 1\n    u8(';') -> 2\n    _ -> 0\n\n" +
+               "main()\n    print(one(u8('t')) > 1e11, one(u8('x')) > 1e11, alias(116), alias(1), wide(97), wide(65), " +
+               "wide(3))\n    print(signed(-1), signed(7), signed(0), u32s(65), u32s(66))\n" +
+               "    print(alt(97), alt(98), alt(99), alt(100), alt(101))\n" +
+               "    print(span(97), span(122), span(123), span(48), span(57), span(65), span(90), span(91))\n" +
+               "    print(named(59))\n",
+               "true false 1 0 1 2 0\n1 2 0 1 0\n1 1 2 2 0\n1 1 0 2 0 3 3 0\n1\n")
+
+@test("a conversion is accepted wherever the bare literal is, with a catch-all")
+bpt_conversion_and_literal_are_one_value()
+    assert_eq(bpt_count("f(c: u8) -> int = c match\n    u8('t') -> 1\n    _ -> 0\n"), 0)
+    assert_eq(bpt_count("f(c: u8) -> int = c match\n    u8('a')..u8('z') -> 1\n    u8(5) -> 2\n    _ -> 0\n"), 0)
+
+@test("a match on a byte with only conversions and no catch-all is still not exhaustive")
+bpt_conversions_are_not_exhaustive()
+    assert_eq(bpt_count("f(c: u8) -> int = c match\n    u8('t') -> 1\n"), 1)
+    assert_eq(bpt_count("f(c: u8) -> int = c match\n    't' -> 1\n"), 1)
+
+@test("a literal out of the converted type's range is refused, though the expression would wrap")
+bpt_out_of_range()
+    assert_eq(bpt_first("f(c: u8) -> int = c match\n    u8(300) -> 1\n    _ -> 0\n"),
+              "300 does not fit byte, so no value matches 'u8(300)' — a pattern is a constant, " +
+              "not a conversion that wraps")
+    assert_eq(bpt_first("f(c: i8) -> int = c match\n    i8(-129) -> 1\n    _ -> 0\n"),
+              "-129 does not fit i8, so no value matches 'i8(-129)' — a pattern is a constant, " +
+              "not a conversion that wraps")
+    assert_eq(bpt_count("f(c: u8) -> int = c match\n    u8(255) -> 1\n    _ -> 0\n"), 0)
+    assert_eq(bpt_count("f(c: i8) -> int = c match\n    i8(-128) -> 1\n    _ -> 0\n"), 0)
+
+@test("a conversion to another type than the value's is a mismatch")
+bpt_wrong_type()
+    assert_eq(bpt_first("f(c: u8) -> int = c match\n    u16(5) -> 1\n    _ -> 0\n"),
+              "pattern is ushort but the value is byte")
+    assert_eq(bpt_first("f(c: u8) -> int = c match\n    string(5) -> 1\n    _ -> 0\n").is_empty(), false)
+
+@test("a conversion of a name is not a constant, and the refusal says a literal is wanted")
+bpt_non_literal_argument()
+    assert_eq(bpt_first("f(c: u8, x: u8) -> int = c match\n    u8(x) -> 1\n    _ -> 0\n"),
+              "'u8(…)' in a pattern converts a literal, as in u8(65) — a name or an expression " +
+              "inside it is not a constant")
+
+@test("a variant or a struct pattern still reads as one, over its own type and over a scalar")
+bpt_variants_still_work()
+    assert_eq(bpt_count("enum E\n    A(n: int)\n    B\n\nf(e: E) -> int = e match\n    A(5) -> 1\n" +
+                        "    A(n) -> n\n    B -> 0\n"), 0)
+    assert_eq(bpt_count("struct P\n    x: int\n    y: int\n\nf(p: P) -> int = p match\n" +
+                        "    P(1, 2) -> 1\n    P(x, y) -> x\n"), 0)
+    assert_eq(bpt_first("struct Point\n    x: int\n\nf(n: int) -> int = n match\n    Point(5) -> 1\n" +
+                        "    else 0\n"),
+              "'Point(…)' matches an enum variant or a struct, but the value is int")

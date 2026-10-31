@@ -59,7 +59,8 @@ Two evaluation guarantees:
 | wildcard | `_` | anything, binds nothing |
 | `else` arm | `else …` | anything; the catch-all spelling in tail position |
 | literal | `0`, `'a'`, `"hi"`, `true` | a value equal to the literal |
-| range | `3..7`, `0..<10`, `'a'..'z'` | a value in the range |
+| literal, converted | `u8(';')`, `i32(-1)`, `u16(0x41)` | a value equal to the literal, converted as the expression `u8(';')` would be |
+| range | `3..7`, `0..<10`, `'a'..'z'`, `u8('a')..u8('z')` | a value in the range |
 | bind | `r`, `other` | anything, and binds it to the name |
 | variant | `Circle(r)`, `Empty`, `Shape.Empty` | that variant, binding each sub-pattern to a field |
 | nested | `Wrap(Val(v))` | a variant whose payload itself matches a sub-pattern |
