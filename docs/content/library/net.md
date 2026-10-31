@@ -310,6 +310,31 @@ the socket's mode decides which: a blocking socket whose timeout ran out is `tim
 non-blocking one with nothing ready is `would_block` — `EAGAIN`'s own code, 35 on a BSD and 11
 elsewhere.
 
+## A send to a peer that has gone is an error, not `SIGPIPE`
+
+A `send`, `send_all` or `send_to` to a peer that has closed answers an `IoError`, which
+**`peer_closed(e)`** recognises (`EPIPE`, 32 everywhere, or `ECONNRESET`, 54 on a BSD and 104
+elsewhere). It never raises `SIGPIPE`, whose default action ends the process silently with status
+141. This holds for Unix and TCP sockets, connecting and accepted, blocking and non-blocking. A
+stream's first send to a closed TCP peer can still succeed, because the peer's reset has not arrived;
+a later one is refused. Unix sockets refuse the first.
+
+It is done per socket on Darwin (`SO_NOSIGPIPE`, set on every socket made or accepted) and per call
+elsewhere (`MSG_NOSIGNAL`), so **the process's signal disposition is untouched**: a program that
+installs its own `SIGPIPE` handler with `sysl.signal` still hears it for a write to a pipe or file,
+and does not hear it for a socket.
+
+## Buffer sizes
+
+`set_send_buffer(bytes)` and `set_recv_buffer(bytes)` ask the kernel for a socket's buffers, and
+`send_buffer()` and `recv_buffer()` read what it granted, on `Socket` and `UdpSocket`. **The kernel
+may round the size** — Linux doubles it and both clamp to a system limit — so compare the answer
+with `>=`, not `==`. A size that is not positive is refused as `EINVAL` (22) and the buffer is left
+as it was. macOS gives a Unix stream socket 8 KB, so a 3 MB response takes 384 turns of a 8 KB-at-a-time
+loop; with 4 MB buffers on both ends the same transfer takes 48 turns, limited then by the 64 KB the
+reader takes per turn. Set the receiver's buffer too: the sender's buffer alone does not bound the
+turns.
+
 ## Unix domain sockets
 
 A Unix domain socket is a stream between two processes on one machine, addressed by a path in the
@@ -429,7 +454,7 @@ hooks, each an `extern` no module of the library defines.
 | `sysl_net_send(fd, from, len) -> isize`, `sysl_net_recv(fd, into, room) -> isize` | a count of bytes |
 | `sysl_net_send_to(fd, from, len, to) -> isize`, `sysl_net_recv_from(fd, into, room, from) -> isize` | a count of bytes, the sender written into `from` |
 | `sysl_net_shutdown(fd, how) -> int`, `sysl_net_close(fd) -> int` | zero |
-| `sysl_net_option(fd, which, value) -> int` | zero; `read_timeout`, `write_timeout` (milliseconds), `reuse_address` or `non_blocking` |
+| `sysl_net_option(fd, which, value) -> int` | zero; `read_timeout`, `write_timeout` (milliseconds), `reuse_address`, `non_blocking`, `send_buffer` or `recv_buffer` (bytes, positive); `send_buffer_size` and `recv_buffer_size` ignore `value` and answer the size in bytes |
 | `sysl_net_resolve(host, host_len, port, passive, out, room) -> int` | how many addresses it wrote |
 
 **Each answers zero or more for success and the `IoError` code negated for a failure** — the contract
@@ -478,7 +503,7 @@ The question is asked only of what the program reaches, so a freestanding progra
 ## What is deliberately absent
 
 Multicast, broadcast, Unix datagram sockets, Linux's abstract namespace, and every socket option
-beyond the two timeouts, `non_blocking` and `reuse_address`, which is here because a listener that has just been stopped cannot
+beyond the two timeouts, the two buffer sizes, `non_blocking` and `reuse_address`, which is here because a listener that has just been stopped cannot
 otherwise be started again until `TIME_WAIT` runs out — a minute or two, during which the program
 looks broken.
 

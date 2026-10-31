@@ -155,6 +155,29 @@ static int from_sockaddr(const struct sockaddr *sa, struct sysl_endpoint *e) {
     return 1;
 }
 
+/* **A send to a peer that has gone answers `EPIPE`; it never raises `SIGPIPE`.** The default action
+ * of that signal is to end the process silently, and a library call that can do that to its caller
+ * is not one that reports an error. Linux says so per call (`MSG_NOSIGNAL`); Darwin has no such
+ * flag and says so per socket (`SO_NOSIGPIPE`), set on every socket made here and every one
+ * accepted. Neither touches the process's signal disposition, so a program that handles `SIGPIPE`
+ * itself still hears it for a write to a pipe or file.
+ */
+#ifdef MSG_NOSIGNAL
+#define SEND_FLAGS MSG_NOSIGNAL
+#else
+#define SEND_FLAGS 0
+#endif
+
+static void quiet_pipe(int s) {
+#ifdef SO_NOSIGPIPE
+    int on = 1;
+
+    setsockopt(s, SOL_SOCKET, SO_NOSIGPIPE, &on, sizeof on);
+#else
+    (void) s;
+#endif
+}
+
 int sysl_net_posix_socket(int family, int kind, int *fd) {
     int s;
 
@@ -168,6 +191,7 @@ int sysl_net_posix_socket(int family, int kind, int *fd) {
 
     if (s < 0) return failed(-1);
 
+    quiet_pipe(s);
     *fd = s;
     return 0;
 }
@@ -235,6 +259,7 @@ int sysl_net_posix_accept(int fd, struct sysl_endpoint *peer, int *out_fd) {
 
     if (flags >= 0 && (flags & O_NONBLOCK) != 0) fcntl(s, F_SETFL, flags & ~O_NONBLOCK);
 
+    quiet_pipe(s);
     from_sockaddr((const struct sockaddr *) &from, peer);
     *out_fd = s;
     return 0;
@@ -256,7 +281,7 @@ int sysl_net_posix_local(int fd, struct sysl_endpoint *at) {
  * goes out by address and the answer stays an `errno` like everything else here.
  */
 int sysl_net_posix_send(int fd, const unsigned char *buf, size_t n, size_t *sent) {
-    ssize_t k = send(fd, buf, n, 0);
+    ssize_t k = send(fd, buf, n, SEND_FLAGS);
 
     if (k < 0) return failed(fd);
 
@@ -280,7 +305,7 @@ int sysl_net_posix_send_to(int fd, const unsigned char *buf, size_t n,
 
     if (len == 0) return EAFNOSUPPORT;
 
-    ssize_t k = sendto(fd, buf, n, 0, (const struct sockaddr *) &a, len);
+    ssize_t k = sendto(fd, buf, n, SEND_FLAGS, (const struct sockaddr *) &a, len);
 
     if (k < 0) return failed(fd);
 
@@ -355,7 +380,35 @@ int sysl_net_posix_option(int fd, int which, long long value) {
         return 0;
     }
 
+    /* The kernel's send (`which` 4) and receive (`which` 5) buffer, in bytes. A size that is not
+     * positive, or that an `int` cannot carry, is refused here: Linux would round zero up to its
+     * minimum and a BSD would take it, so the two would disagree about what an empty buffer is.
+     * The kernel rounds what it is given -- Linux doubles it -- so `sysl_net_posix_buffer` is what
+     * says what was granted.
+     */
+    if (which == 4 || which == 5) {
+        if (value <= 0 || value > 2147483647LL) return EINVAL;
+
+        int size = (int) value;
+
+        if (setsockopt(fd, SOL_SOCKET, which == 4 ? SO_SNDBUF : SO_RCVBUF, &size, sizeof size) != 0)
+            return failed(fd);
+        return 0;
+    }
+
     return EINVAL;
+}
+
+/* The send (`which` 0) or receive (`which` 1) buffer the kernel granted, in bytes. */
+int sysl_net_posix_buffer(int fd, int which, long long *size) {
+    int got = 0;
+    socklen_t n = sizeof got;
+
+    if (getsockopt(fd, SOL_SOCKET, which == 0 ? SO_SNDBUF : SO_RCVBUF, &got, &n) != 0)
+        return failed(fd);
+
+    *size = got;
+    return 0;
 }
 
 /* Every address a host and a port resolve to, in the resolver's own order.
