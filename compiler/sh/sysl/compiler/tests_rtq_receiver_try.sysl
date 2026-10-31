@@ -1,0 +1,464 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.text.{cstring, str_builder}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// A counted receiver read from a place -- `vm.stack` with `vm: *Vm` -- is lent to the call with no
+// count of the caller's own when a later argument is a `?` (`emit_expr.sysl`'s `reads_only_for`).
+// Slate's dispatch loop is the shape: `vm.stack.push(added(a, b, at)?)` took and gave back a count of
+// the stack's buffer on every arithmetic instruction, because a `?` was not on the list of nodes a
+// later argument may hold, while hoisting the same call into a `val` above it took none.
+//
+// What makes it sound: a `?` adds to its operand only the conversion and the early return, and both run
+// on the edge that leaves the function, where the call is never made and the receiver read before it is
+// dropped unused. Nothing was counted for it, so nothing is owed back on the way out. The operand is
+// judged as any later argument is: a call that may write the place or let go of what holds it keeps the
+// count, `?` or no `?`.
+//
+// The matrix: the receiver through a pointer parameter, a reference, a reference in a field behind a
+// pointer, `*self`, a global, a local, and a generic over its element type; a `?` that converts through
+// `From`, nested `?`s, a trait-object receiver (lent before and after); and the cells that keep the
+// count -- an operand that reassigns the receiver's field, one that drops the receiver's owner, and an
+// element type with a destructor -- beside one that pushes into the same buffer, which stays lent. Every program runs at -O0
+// and -O2 on the counted heap, taking both the `Ok` edge and the early return, and once under
+// AddressSanitizer.
+//
+// Cells not written: a `?` in a closure passed as a later argument -- the closure node itself keeps
+// the count (`tests_pfz_pointer_field_zero.sysl`); separate compilation -- a library callee has no body
+// here, so the operand's call keeps the count as any unknown call does.
+
+private extern "setenv" rtq_c_setenv(name: *u8, value: *u8, overwrite: int) -> int
+private extern "unsetenv" rtq_c_unsetenv(name: *u8) -> int
+
+private struct RtqRun
+    ok: bool
+    out: string
+    err: string
+    hooks: usize
+
+private rtq_ready() -> bool
+    if std_root().is_err() || !clang_available()
+        print("skipped: the library or the toolchain is not on this machine")
+        return false
+    end if
+
+    true
+end rtq_ready
+
+private rtq_ir(text: string) -> string
+    val root = make_temp_dir("sysl-rtq").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    val out = emit_llvm_text(src, None) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> if made.report.is_empty() then made.text else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end rtq_ir
+
+// One function's emitted text, from its `define` to the brace that closes it: the first whose symbol
+// starts `@<name>` and goes on with `(`, `$` or `.`.
+private rtq_body(out: string, name: string) -> string
+    var b = str_builder()
+    var inside = false
+
+    for line in lines_of(out)
+        if !inside && line.starts_with("define ") && rtq_names(line, name) then inside = true
+
+        if inside
+            if line == "}" then return b.finish()
+
+            b.push(line)
+            b.push_char('\n')
+
+    if inside then b.finish() else s"no definition of '$name' in:\n$out"
+end rtq_body
+
+private rtq_names(line: string, name: string) -> bool =
+    line.contains("@" + name + "(") || line.contains("@" + name + "$") || line.contains("@" + name + ".")
+
+// Whether a body takes a count of a buffer handle.
+private rtq_buf_copied(body: string) -> bool = body.contains("@arc.copy.sysl.buf$Buf.")
+
+private rtq_lent(out: string, name: string)
+    val f = rtq_body(out, name)
+
+    assert(f.starts_with("define"), f)
+    assert(!rtq_buf_copied(f), f)
+end rtq_lent
+
+private rtq_kept(out: string, name: string)
+    val f = rtq_body(out, name)
+
+    assert(f.starts_with("define"), f)
+    assert(rtq_buf_copied(f), f)
+end rtq_kept
+
+private rtq_run(text: string, level: string, counted: bool, flags: string) -> RtqRun
+    val root = make_temp_dir("sysl-rtq").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    if counted then force_alloc_counting(true)
+
+    if flags != ""
+        val n = cstring("SYSL_EXTRA_CFLAGS")
+        val v = cstring(flags)
+
+        rtq_c_setenv(n.ptr, v.ptr, 1)
+    end if
+
+    val built = build_native_program(s"$root/main.sysl", None, None, level, Some(exe))
+
+    if flags != ""
+        val n = cstring("SYSL_EXTRA_CFLAGS")
+
+        rtq_c_unsetenv(n.ptr)
+
+    if counted then force_alloc_counting(false)
+
+    built match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return RtqRun(false, failure_text(why), "", 0)
+        Ok(_) -> ()
+
+    val hooks = capture("nm", ["-u", exe], "", [], true) match
+        Ok(o) -> o.text.count_of("__asan_report")
+        Err(_) -> 0
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> RtqRun(false, "could not be started", "", hooks)
+        Ok(o) -> RtqRun(o.status.ok(), o.text, o.err.unwrap_or(""), hooks)
+end rtq_run
+
+// Printed exactly `expected` at both ends of the optimizer on the counted heap, giving everything
+// back, and again under AddressSanitizer with the instrumentation in the binary.
+private rtq_prints(text: string, expected: string)
+    if !rtq_ready() then return
+
+    for level in ["0", "2"]
+        val run = rtq_run(text, level, true, "")
+
+        assert(run.ok, s"-O$level: ${run.out}${run.err}")
+        assert_eq(run.out, expected)
+        assert(alloc_count_reported(run.err) == 0, s"-O$level: ${run.err}")
+
+    val asan = rtq_run(text, "0", false, "-fsanitize=address -g")
+
+    assert(asan.hooks > 0, "the AddressSanitizer build carries no instrumentation")
+    assert(asan.ok, s"asan: ${asan.out}${asan.err}")
+    assert_eq(asan.out, expected)
+end rtq_prints
+
+// -- lent ---------------------------------------------------------------------------------------------
+
+// Every place a receiver is read from, each pushed into with a `?` argument that succeeds for 1 and 2
+// and leaves the function for -1.
+private rtq_lent_program() -> string = raw"""
+    import sysl.buf.{Buf, buf}
+
+    struct Vm
+        stack: Buf[int]
+
+    struct Holder
+        vm: &Vm
+
+    struct Oops
+        why: string
+
+    impl From[string] for Oops
+        from(value: string) -> Oops = Oops(value)
+
+    static var g: Buf[int] = buf()
+
+    checked(x: int) -> Result[int, string]
+        if x < 0 then return Err(s"neg $x")
+
+        Ok(x + 1)
+
+    both(a: int, b: int) -> Result[int, string] = if a > b then Err("order") else Ok(a + b)
+
+    by_pointer(vm: *Vm, x: int) -> Result[unit, string]
+        vm.stack.push(checked(x)?)
+        Ok(())
+
+    by_ref(vm: &Vm, x: int) -> Result[unit, string]
+        vm.stack.push(checked(x)?)
+        Ok(())
+
+    by_field(h: *Holder, x: int) -> Result[unit, string]
+        h.vm.stack.push(checked(x)?)
+        Ok(())
+
+    impl Vm
+        step(*self, x: int) -> Result[unit, string]
+            self.stack.push(checked(x)?)
+            Ok(())
+
+    by_global(x: int) -> Result[unit, string]
+        g.push(checked(x)?)
+        Ok(())
+
+    by_local(x: int) -> Result[int, string]
+        var b: Buf[int] = buf()
+
+        b.push(checked(x)?)
+        Ok(b.at(0))
+
+    nested(vm: *Vm, x: int) -> Result[unit, string]
+        vm.stack.push(both(checked(x)?, checked(x + 1)?)?)
+        Ok(())
+
+    converted(vm: *Vm, x: int) -> Result[unit, Oops]
+        vm.stack.push(checked(x)?)
+        Ok(())
+
+    trait Sink
+        put(self, v: int)
+
+    struct Collect
+        items: Buf[int]
+
+    impl Sink for Collect
+        put(self, v: int) = self.items.push(v)
+
+    struct Fed
+        sink: &Sink
+
+    feed(f: *Fed, x: int) -> Result[unit, string]
+        f.sink.put(checked(x)?)
+        Ok(())
+
+    struct Item
+        id: int
+
+    impl Drop for Item
+        drop(self) = print("drop", self.id)
+
+    struct Holder2[T]
+        b: Buf[T]
+
+    put[T](h: *Holder2[T], v: Result[T, string]) -> Result[unit, string]
+        h.b.push(v?)
+        Ok(())
+
+    said(r: Result[unit, string]) -> string = r match
+        Ok(_) -> "ok"
+        Err(why) -> why
+
+    var vm = Vm(buf())
+    var h = Holder(Vm(buf()))
+
+    for x in [1, -1, 2]
+        print(said(by_pointer(&vm, x)), said(by_ref(h.vm, x)), said(by_field(&h, x)), said(vm.step(x)),
+              said(by_global(x)), said(nested(&vm, x)))
+        converted(&vm, x) match
+            Ok(_) -> print("ok")
+            Err(o) -> print(o.why)
+        by_local(x) match
+            Ok(n) -> print(n)
+            Err(why) -> print(why)
+
+    print(vm.stack.len(), h.vm.stack.len(), g.len())
+    print(vm.stack.at(0), vm.stack.at(vm.stack.len() - 1))
+    g = buf()
+
+    val fed: Buf[int] = buf()
+    var f = Fed(Collect(fed))
+
+    print(said(feed(&f, 4)), said(feed(&f, -4)), said(feed(&f, 5)), fed.len(), fed.at(1))
+
+    var hi: Holder2[int] = Holder2(buf())
+    var hr: Holder2[&Item] = Holder2(buf())
+
+    print(said(put(&hi, Ok(3))), said(put(&hi, Err("no int"))), hi.b.len())
+    print(said(put(&hr, Ok(Item(8)))), said(put(&hr, Err("no item"))), hr.b.len())
+    hr.b = buf()
+    print("end")
+    """
+
+@test("a receiver read through a pointer, a reference, a field or '*self' is lent across a '?' argument")
+rtq_places_are_lent()
+    if !rtq_ready() then return
+
+    val out = rtq_ir(rtq_lent_program())
+
+    rtq_lent(out, "by_pointer")
+    rtq_lent(out, "by_ref")
+    rtq_lent(out, "by_field")
+    rtq_lent(out, "Vm.step")
+end rtq_places_are_lent
+
+@test("a global receiver is lent across a '?' argument, and a local one takes no count either")
+rtq_global_and_local_are_lent()
+    if !rtq_ready() then return
+
+    val out = rtq_ir(rtq_lent_program())
+
+    rtq_lent(out, "by_global")
+    rtq_lent(out, "by_local")
+end rtq_global_and_local_are_lent
+
+@test("nested '?'s and a '?' that converts through 'From' leave the receiver lent")
+rtq_nested_and_converted_are_lent()
+    if !rtq_ready() then return
+
+    val out = rtq_ir(rtq_lent_program())
+
+    rtq_lent(out, "nested")
+    rtq_lent(out, "converted")
+end rtq_nested_and_converted_are_lent
+
+@test("a generic receiver is lent at an element with no destructor and counted at one with")
+rtq_generic_per_instance()
+    if !rtq_ready() then return
+
+    val out = rtq_ir(rtq_lent_program())
+
+    rtq_lent(out, "put.int")
+    rtq_kept(out, "put.ref.Item")
+end rtq_generic_per_instance
+
+@test("and every lent receiver takes both edges of its '?', giving everything back")
+rtq_lent_program_runs()
+    rtq_prints(rtq_lent_program(),
+               "ok ok ok ok ok ok\nok\n2\nneg -1 neg -1 neg -1 neg -1 neg -1 neg -1\nneg -1\nneg -1\n" +
+               "ok ok ok ok ok ok\nok\n3\n8 4 2\n2 3\nok neg -4 ok 2 6\nok no int 1\nok no item 1\n" +
+               "drop 8\nend\n")
+
+// -- kept ---------------------------------------------------------------------------------------------
+
+// The `?`'s operand can write the receiver's place, free the receiver's owner, or let go of storage
+// whose elements run `drop`: each keeps the count, on both edges. One that only grows the very buffer
+// is lent, and runs beside them.
+private rtq_kept_program() -> string = raw"""
+    import sysl.buf.{Buf, buf}
+
+    struct S
+        items: Buf[int]
+
+    struct Box
+        items: Buf[int]
+
+    struct Item
+        id: int
+
+    impl Drop for Item
+        drop(self) = print("drop", self.id)
+
+    struct Bag
+        items: Buf[&Item]
+
+    static var owner: &Box = Box(buf())
+
+    swap_out(s: *S) -> Result[int, string]
+        if s.items.len() == 0 then return Err("empty")
+
+        val first = s.items.at(0)
+
+        s.items = buf()
+        Ok(first)
+
+    grab(s: *S) -> Result[unit, string]
+        s.items.push(swap_out(s)?)
+        Ok(())
+
+    pushing(s: *S, n: int) -> Result[int, string]
+        if n < 0 then return Err("none")
+
+        for i in 0..<n
+            s.items.push(i)
+
+        Ok(99)
+
+    fill(s: *S, n: int) -> Result[unit, string]
+        s.items.push(pushing(s, n)?)
+        Ok(())
+
+    replace(n: int) -> Result[int, string]
+        owner = Box(buf())
+
+        if n < 0 then return Err("gone")
+
+        Ok(n)
+
+    into_owner(n: int) -> Result[unit, string]
+        owner.items.push(replace(n)?)
+        Ok(())
+
+    made(id: int) -> Result[&Item, string] = if id < 0 then Err("no item") else Ok(Item(id))
+
+    add(b: *Bag, id: int) -> Result[unit, string]
+        b.items.push(made(id)?)
+        Ok(())
+
+    said(r: Result[unit, string]) -> string = r match
+        Ok(_) -> "ok"
+        Err(why) -> why
+
+    var s = S(buf())
+
+    for i in 0..<20
+        s.items.push(i + 1)
+
+    print(said(grab(&s)), s.items.len(), said(grab(&s)), s.items.len())
+    print(said(fill(&s, 40)), s.items.len(), s.items.at(40), said(fill(&s, -1)), s.items.len())
+
+    owner.items.push(7)
+    print(said(into_owner(3)), owner.items.len(), said(into_owner(-1)), owner.items.len())
+
+    var b = Bag(buf())
+
+    for id in [1, -1, 2]
+        print(said(add(&b, id)), b.items.len())
+
+    b.items = buf()
+    owner = Box(buf())
+    print("end")
+    """
+
+@test("a '?' whose operand reassigns the receiver's field keeps the count")
+rtq_reassigning_operand_keeps_the_count()
+    if !rtq_ready() then return
+
+    rtq_kept(rtq_ir(rtq_kept_program()), "grab")
+
+// Growing the very buffer lets go of its old element storage, never of the buffer the receiver names,
+// so the operand may be lent it (`gives_back_clear`) -- and the push lands after the operand's own.
+@test("a '?' whose operand pushes into the same buffer leaves the receiver lent")
+rtq_pushing_operand_leaves_it_lent()
+    if !rtq_ready() then return
+
+    rtq_lent(rtq_ir(rtq_kept_program()), "fill")
+
+@test("a '?' whose operand drops the receiver's owner keeps the count")
+rtq_dropping_operand_keeps_the_count()
+    if !rtq_ready() then return
+
+    rtq_kept(rtq_ir(rtq_kept_program()), "into_owner")
+
+@test("a '?' argument pushed into a buffer of values with a destructor keeps the count")
+rtq_destructor_keeps_the_count()
+    if !rtq_ready() then return
+
+    rtq_kept(rtq_ir(rtq_kept_program()), "add")
+
+@test("and every kept receiver outlives what its argument did, on both edges")
+rtq_kept_program_runs()
+    rtq_prints(rtq_kept_program(),
+               "ok 0 empty 0\nok 41 99 none 41\nok 0 gone 0\nok 1\nno item 1\nok 2\ndrop 2\ndrop 1\nend\n")
