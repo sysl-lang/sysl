@@ -23,6 +23,32 @@ private scratch(name: string) -> (string, UnixAddress)
     (dir, unix(join(dir, "s.sock")).unwrap())
 end scratch
 
+/**
+ * Accepts on a non-blocking TCP listener once the connection is queued. A `connect` that has returned
+ * does not promise the listener already sees the connection, so a would-block is asked again; any
+ * other error, or a connection that never arrives, fails the test.
+ */
+private accept_when_queued(l: *Socket) -> (Socket, Address)
+    for _ in 0..<1_000_000
+        val got = l.accept()
+
+        if got.is_ok() || !would_block(got.unwrap_err())
+            return got.unwrap()
+
+    panic("the connection never reached the listener")
+end accept_when_queued
+
+/** The same wait on a non-blocking Unix listener. */
+private unix_accept_when_queued(l: *UnixListener) -> Socket
+    for _ in 0..<1_000_000
+        val got = l.accept()
+
+        if got.is_ok() || !would_block(got.unwrap_err())
+            return got.unwrap()
+
+    panic("the connection never reached the listener")
+end unix_accept_when_queued
+
 // `EADDRINUSE` and `ECONNREFUSED`, which no named `IoError` case covers.
 #if bsd
 private in_use() -> int = 48
@@ -95,7 +121,7 @@ uds_non_blocking_accept()
     assert(!timed_out(e), "would-block is not a timeout")
 
     var c = unix_connect(at).unwrap()
-    var s = l.accept().unwrap()
+    var s = unix_accept_when_queued(&l)
 
     // The connection is blocking although its listener is not: a read with nothing sent waits out
     // its timeout rather than answering would-block.
@@ -156,7 +182,7 @@ uds_tcp_non_blocking()
 
     c.connect(to).unwrap()
 
-    var (s, _) = l.accept().unwrap()
+    var (s, _) = accept_when_queued(&l)
     var into: []u8 = [0; 4]
 
     s.non_blocking().unwrap()

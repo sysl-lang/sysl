@@ -1,0 +1,123 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.replace_all
+
+// `()` written where a type goes is `unit`, the type whose one value is written `()` -- not a
+// separate empty-tuple type that no value could inhabit (`reference/types.md`, "unit and never").
+
+private upu_ready() -> bool = std_root().is_ok() && clang_available()
+
+private upu_root(text: string) -> string
+    val root = replace_all(make_temp_dir("sysl-upu").unwrap(), "//", "/")
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+    root
+end upu_root
+
+// What a one-file program prints, or the report it was refused with.
+private upu_ran(text: string) -> string
+    val root = upu_root(text)
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            val said = replace_all(failure_text(why), s"$root/", "")
+
+            remove_dir_all(root).unwrap_or(())
+            return said
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end upu_ran
+
+private upu_prints(text: string, want: string)
+    if !upu_ready() then return
+
+    assert_eq(upu_ran(text), want)
+end upu_prints
+
+// The program is refused, and the report contains `part`.
+private upu_refused(text: string, part: string)
+    if !upu_ready() then return
+
+    val said = upu_ran(text)
+
+    assert(said.starts_with("error:") && said.contains(part), s"expected a report containing\n$part\ngot\n$said")
+end upu_refused
+
+@test("Result[(), E] takes Ok(()) and propagates through ?")
+upu_result() =
+    upu_prints("f(n: int) -> Result[(), string] = if n > 0 then Ok(()) else Err(\"neg\")\n" +
+               "g(n: int) -> Result[(), string]\n    f(n)?\n    Ok(())\n" +
+               "print(f(1), g(0), g(2))\n",
+               "Ok(()) Err(neg) Ok(())\n")
+
+@test("-> () is a unit return type")
+upu_return() =
+    upu_prints("hello() -> () = print(\"hi\")\nval u: () = hello()\nprint(u == ())\n", "hi\ntrue\n")
+
+@test("a () parameter and a () field")
+upu_param_field() =
+    upu_prints("struct S\n    a: ()\n    n: int\nend S\n" +
+               "take(x: ()) -> int = 7\nval s = S((), 3)\nprint(take(()), take(s.a), s.n)\n",
+               "7 7 3\n")
+
+@test("Buf[()] and Option[()]")
+upu_containers() =
+    upu_prints("import sysl.buf.{Buf, buf}\nvar b: Buf[()] = buf()\nb.push(())\nb.push(())\nval o: Option[()] = Some(())\n" +
+               "print(b.len(), o, o == Some(()))\n",
+               "2 Some(()) true\n")
+
+@test("a closure type and a function pointer type over ()")
+upu_fn_types() =
+    upu_prints("run(f: &Fn() -> ()) -> () = f()\nsay() -> () = print(\"g\")\nval g: &Fn() -> () = say\n" +
+               "val h: &Fn(int) -> () = n -> print(n)\n" +
+               "apply(f: (int) -> (), n: int) -> () = f(n)\nshow4(n: int) -> () = print(n)\n" +
+               "apply(show4, 5)\n" +
+               "run(() -> print(\"f\"))\ng()\nh(4)\n",
+               "5\nf\ng\n4\n")
+
+@test("a generic instantiated at () and at unit is one instantiation")
+upu_same_instance() =
+    upu_prints("struct Box[T]\n    v: T\nend Box\n" +
+               "id[T](x: T) -> T = x\n" +
+               "val a: Box[()] = Box(())\nval b: Box[unit] = a\nval c: Box[()] = b\n" +
+               "val d: () = id[unit](())\nval e: unit = id(a.v)\n" +
+               "print(a.v == b.v, c.v == d, d == e)\n",
+               "true true true\n")
+
+@test("a trait impl for unit is reached through ()")
+upu_trait() =
+    upu_prints("trait Name\n    name(self) -> string\nend Name\n" +
+               "impl Name for unit\n    name(self) = \"unit\"\n" +
+               "show[T: Name](x: T) -> string = x.name()\n" +
+               "val u: () = ()\nprint(show(u), show(()), u.name())\n",
+               "unit unit unit\n")
+
+@test("a diagnostic naming the type prints unit")
+upu_diagnostic() =
+    upu_refused("val x: () = 1\n", "unit")
+
+@test("(()) is still refused as a type in parentheses")
+upu_one_paren() =
+    upu_refused("val x: (()) = ()\n", "a type in parentheses")
+
+@test("((), ()) is still a pair, of unit")
+upu_pair() =
+    upu_prints("val p: ((), ()) = ((), ())\nval a, b = p\nprint(a == b, p.0 == ())\n", "true true\n")
+
+@test("a unit in an array type and a nested position")
+upu_array() =
+    upu_prints("val a: [3]() = [(), (), ()]\nval o: Option[Option[()]] = Some(Some(()))\n" +
+               "print(a.len, o)\n",
+               "3 Some(Some(()))\n")

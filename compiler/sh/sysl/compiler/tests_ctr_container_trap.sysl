@@ -405,3 +405,53 @@ ctr_bare_metal()
 
         assert(name == "" || name == "U memcpy" || name == "U memset", s"left undefined: $listing")
 end ctr_bare_metal
+
+// Every push reaches `grow_store`, whose test for a handle naming nothing the optimizer cannot fold
+// away, so its report is in every image that pushes: on bare metal it has to be a trap, not a print
+// and an exit the board would then have to supply.
+@test("on a bare-metal target a Buf that pushes, given storage or not, references no putchar and no exit")
+ctr_bare_metal_push_prints_nothing()
+    if !is_file(CtrNm) then skip(s"there is no llvm-nm at $CtrNm to read the object")
+
+    val t = target_named("thumb-freestanding-softfp").unwrap()
+    val cc = find_backend_clang(t) match
+        Err(why) ->
+            skip(why)
+            return
+        Ok(found) -> found
+
+    val dir = make_temp_dir("sysl-ctr").unwrap()
+
+    write_text(s"$dir/main.sysl",
+               "import sysl.buf.{Buf, buf}\nimport sysl.raw.ptr_cast\n\n@export(\"main\")\nentry(n: usize) -> int\n" +
+               "    var b: Buf[int] = buf()\n    for i in 0..<n do b.push(int(i))\n\n" +
+               "    var raw: [1]usize = [0]\n    val p: *Buf[u8] = ptr_cast(&raw[0])\n\n" +
+               "    if n > 3 then p.push(1)\n    int(b.len() + p.len())\n").unwrap()
+
+    val text = emit_llvm_text(dir, Some("thumb-freestanding-softfp"), DefaultOptimization, buf(), Some(buf())) match
+        Err(why) -> s"did not compile: ${failure_text(why)}"
+        Ok(e) -> if e.report.is_empty() then e.text else s"did not compile: ${analysis_report(e.report)}"
+
+    assert(!text.starts_with("did not compile"), text)
+    assert(text.contains("grow_store"), text)
+    assert(text.contains("@llvm.trap"), text)
+
+    val obj = s"$dir/probe.o"
+
+    compile_object(cc, text, obj, t, "2") match
+        Err(why) ->
+            remove_dir_all(dir).unwrap_or(())
+            assert(false, why)
+            return
+        Ok(_) -> ()
+
+    val listing = capture(CtrNm, ["-u", obj]).map((o) -> o.text).unwrap_or("llvm-nm could not be run")
+
+    remove_dir_all(dir).unwrap_or(())
+
+    for line in split(listing, "\n")
+        val name = line.trim()
+
+        for c in ["putchar", "exit", "fwrite", "printf", "abort"]
+            assert(name != s"U $c", s"'$c' is referenced: $listing")
+end ctr_bare_metal_push_prints_nothing
