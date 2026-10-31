@@ -598,6 +598,32 @@ ba
 HÉLLO héllo
 ```
 
+**Every one of them but `join` is also a member of `string`**, through the `Text` trait, which is in
+scope without an import like `Search`: `s.split(",")`, `s.fields()`, `s.lines()`, `s.repeat(n)`,
+`s.replace_all(old, new)`, `s.to_upper()`, `s.to_lower()`, and the `_fold` family as `s.eq_fold(t)`,
+`s.starts_with_fold(p)`, `s.ends_with_fold(p)`, `s.contains_fold(n)`. A method answers what its free
+function answers, the free functions stay, and the calls chain. A program's own `split` function, or
+its own trait's `split` on `string`, is unaffected: a free function is not a member, and a trait the
+file declares or imports is searched before the library's.
+
+```sysl
+var line = "  alpha,beta,,gamma  "
+
+print(line.trim().split(",").len)
+print("one\r\ntwo\nthree\n".lines().len)
+print("  one   two  ".fields().join("|"))
+print("ab".repeat(2).to_upper(), "Straße".eq_fold("STRASSE"))
+print("xx a,b yy"[3..<6].split(",").join("+"))
+```
+
+```output
+4
+3
+one|two
+ABAB true
+a+b
+```
+
 **`join` is a member of any slice, array or `Buf` of printable elements**, through the `Join` trait,
 which is Scala's `mkString`: `parts.join(", ")` is `join(parts, ", ")` for strings, and every other
 element renders through its `Display` straight into the one buffer, with no string made per element:

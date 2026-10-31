@@ -1,0 +1,94 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.Search
+
+// `sysl.text` gives `string` the members `split`, `fields`, `lines`, `repeat`, `replace_all`,
+// `to_upper`, `to_lower` and the `_fold` family, with no import. A program that already had a
+// `split` of its own must be unaffected: the lookup names the traits the file can name first (its
+// own module's and its imports), and a free function is not a member at all. Each cell builds a
+// whole program, files and manifest included, and compares what it prints.
+
+private tmm_other() -> string =
+    "module other\n\n" +
+    "trait Splitter\n    split(self, n: int) -> int\n    fields(self) -> int\n\n" +
+    "impl Splitter for string\n    split(self, n: int) -> int = n * 10\n    fields(self) -> int = 99\n\n" +
+    "trait Hidden\n    to_upper(self) -> string\n\n" +
+    "impl Hidden for string\n    to_upper(self) -> string = \"hidden\"\n"
+
+// What a program prints, or why it did not build or run. `other` is a sibling module's text.
+private tmm_run(main: string, other: string) -> string
+    if !clang_available() then return "skipped"
+
+    val root = make_temp_dir("sysl-tmm").unwrap()
+
+    make_dir_all(s"$root/other").unwrap()
+    write_text(s"$root/sysl.hocon", "package { name = \"probe\", version = \"0.1.0\" }\n").unwrap()
+    write_text(s"$root/main.sysl", main).unwrap()
+    write_text(s"$root/other/other.sysl", other).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return s"did not build: ${failure_text(why)}"
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text + out.err.unwrap_or("")
+end tmm_run
+
+private tmm_ran(main: string, expected: string)
+    val got = tmm_run(main, tmm_other())
+
+    if got != "skipped" then assert_eq(got, expected)
+
+@test("text methods: a program's own trait with the same member name on string wins")
+tmm_own_trait_in_the_same_module()
+    tmm_ran(
+        "trait Own\n    lines(self) -> int\n    split(self, n: int) -> int\n\n" +
+        "impl Own for string\n    lines(self) -> int = 7\n    split(self, n: int) -> int = n + 1\n\n" +
+        "print(\"a b\".lines(), \"a b\".split(5))\n" +
+        "print(\"a\\nb\".to_lower().len)\n",
+        "7 6\n3\n")
+
+@test("text methods: a trait of an imported module wins the same way")
+tmm_imported_trait()
+    tmm_ran(
+        "import other.Splitter\n\nprint(\"a b\".split(5), \"a b\".fields())\n",
+        "50 99\n")
+
+@test("text methods: a trait imported by name does not take the members it does not have")
+tmm_imported_trait_leaves_the_rest()
+    tmm_ran(
+        "import other.Splitter\n\nprint(\"a,b\".lines().len, \"A,b\".to_lower())\n",
+        "1 a,b\n")
+
+@test("text methods: an own free function named split is not a member and changes nothing")
+tmm_own_free_function()
+    tmm_ran(
+        "split(n: int) -> int = n + 1\n\nprint(split(4), \"a,b,c\".split(\",\").len)\n",
+        "5 3\n")
+
+@test("text methods: an own free function named like a method, over a string, still leaves the method")
+tmm_own_free_function_over_string()
+    tmm_ran(
+        "lines(s: string) -> int = 42\n\nprint(lines(\"x\"), \"x\\ny\".lines().len)\n",
+        "42 2\n")
+
+@test("text methods: a trait that is visible but never named by the file is ambiguous with the library's")
+tmm_unnamed_trait_is_ambiguous()
+    val got = tmm_run("import other.Splitter\n\nprint(\"a b\".to_upper())\n", tmm_other())
+
+    if got != "skipped"
+        assert(got.contains("to_upper"), got)
+        assert(got.contains("other.Hidden"), got)
+        assert(got.contains("import the one that was meant"), got)
