@@ -39,7 +39,7 @@ sysl --version
 sysl --help
 ```
 
-**The formula supports macOS on Apple silicon only.** sysl 0.8.9 ships a single binary,
+**The formula supports macOS on Apple silicon only.** sysl 0.8.10 ships a single binary,
 `darwin-arm64`. On any other platform, build from source as described below.
 
 ## Your first compile
@@ -75,6 +75,13 @@ the tap has no binary for.
 
 Most systems already have `clang`. On macOS the Xcode command-line tools supply it; on Debian and
 Ubuntu it is the `clang` package. `pkg-config` is common on Linux and absent from a stock macOS.
+
+**The oldest clang sysl builds with is Apple clang 15 (Xcode 15) or clang 16 from LLVM**; an older one
+is passed over for a newer one if it can find one, and otherwise refused by name. On a clang older
+than Apple clang 17 or LLVM 19, sysl adapts what it emits, which leaves a program correct and copies
+some large results it could have built in place. **That covers building for the machine you are on.**
+Building for a bare-metal target or WebAssembly needs a current LLVM: older back ends stop on
+operations the standard module holds for those machines.
 
 `llvm-ar` must be LLVM's archiver. The standard module's archive holds objects for the machine it
 was built *for*, and a platform archiver indexes only its own object format and silently drops the

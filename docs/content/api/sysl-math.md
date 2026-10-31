@@ -20,7 +20,7 @@ name, and each says in its own header why it is not part of this one.
 
 ## Index
 
-[`e`](#e) [`ln10`](#ln10) [`ln2`](#ln2) [`pi`](#pi) [`sqrt2`](#sqrt2) [`tau`](#tau) [`approx_eq`](#approx_eq) [`approx_eq_rel`](#approx_eq_rel) [`assert_approx_eq`](#assert_approx_eq) [`assert_approx_eq_rel`](#assert_approx_eq_rel) [`checked_add`](#checked_add) [`checked_mul`](#checked_mul) [`checked_sub`](#checked_sub) [`clamp`](#clamp) [`div_floor`](#div_floor) [`divmod`](#divmod) [`gcd`](#gcd) [`infinity`](#infinity) [`is_power_of_two`](#is_power_of_two) [`lcm`](#lcm) [`max`](#max) [`min`](#min) [`mod_floor`](#mod_floor) [`nan`](#nan) [`next_power_of_two`](#next_power_of_two) [`nextafter`](#nextafter) [`nextafter`](#nextafter-1) [`overflowing_add`](#overflowing_add) [`overflowing_mul`](#overflowing_mul) [`overflowing_sub`](#overflowing_sub) [`pow`](#pow) [`ulp`](#ulp) [`ulp`](#ulp-1) [`Bits`](#bits) [`ByteOrder`](#byteorder) [`Float`](#float) [`Magnitude`](#magnitude) [`MulAdd`](#muladd) [`Signed`](#signed) [Float for bf16](#float-for-bf16) [Float for f16](#float-for-f16) [Float for f32](#float-for-f32) [Float for real](#float-for-real) [Magnitude for f32](#magnitude-for-f32) [Magnitude for real](#magnitude-for-real) [Magnitude for T](#magnitude-for-t) [MulAdd for f32](#muladd-for-f32) [MulAdd for real](#muladd-for-real)
+[`e`](#e) [`ln10`](#ln10) [`ln2`](#ln2) [`pi`](#pi) [`sqrt2`](#sqrt2) [`tau`](#tau) [`approx_eq`](#approx_eq) [`approx_eq_rel`](#approx_eq_rel) [`assert_approx_eq`](#assert_approx_eq) [`assert_approx_eq_rel`](#assert_approx_eq_rel) [`checked_add`](#checked_add) [`checked_mul`](#checked_mul) [`checked_sub`](#checked_sub) [`clamp`](#clamp) [`div_floor`](#div_floor) [`divmod`](#divmod) [`gcd`](#gcd) [`infinity`](#infinity) [`is_power_of_two`](#is_power_of_two) [`lcm`](#lcm) [`max`](#max) [`min`](#min) [`mod_floor`](#mod_floor) [`nan`](#nan) [`next_power_of_two`](#next_power_of_two) [`nextafter`](#nextafter) [`nextafter`](#nextafter-1) [`overflowing_add`](#overflowing_add) [`overflowing_mul`](#overflowing_mul) [`overflowing_sub`](#overflowing_sub) [`pow`](#pow) [`ulp`](#ulp) [`ulp`](#ulp-1) [`Bits`](#bits) [`ByteOrder`](#byteorder) [`Float`](#float) [`Magnitude`](#magnitude) [`MinMax`](#minmax) [`MulAdd`](#muladd) [`Signed`](#signed) [Float for bf16](#float-for-bf16) [Float for f16](#float-for-f16) [Float for f32](#float-for-f32) [Float for real](#float-for-real) [Magnitude for f32](#magnitude-for-f32) [Magnitude for real](#magnitude-for-real) [Magnitude for T](#magnitude-for-t) [MinMax for T](#minmax-for-t) [MulAdd for f32](#muladd-for-f32) [MulAdd for real](#muladd-for-real)
 
 ## Constants
 
@@ -427,9 +427,9 @@ A value raised to a whole power, by repeated squaring: `pow(2, 10)` is `1024`.
 than a value of the type being multiplied -- the same reason `rotate_left` takes one. A negative
 exponent has no answer among the integers, and saying so in the type is better than a trap.
 
-**An overflowing power wraps**, as every other integer operation in the language does (`01`).
-`pow(2, 64)` at `int` is `0`, arrived at honestly: the doubling that overflows is a `*` like any
-other. A program that needs to know writes the check it needs.
+**An overflowing power overflows as a `*` does**, since the doubling that overflows is a `*` like
+any other: a debug build stops at it and a release build wraps (`pow(2, 64)` at `int` is `0`). A
+program that needs to know writes the check it needs.
 
 ### `ulp`
 
@@ -556,6 +556,8 @@ trait Float: Zero + One + Eq + Ord + Neg + Add + Sub + Mul + Div + Display + Deb
     exp2(self) -> Self
     ln(self) -> Self
     log2(self) -> Self
+    expm1(self) -> Self
+    ln1p(self) -> Self
     log10(self) -> Self
     pow(self, exponent: Self) -> Self
     hypot(self, other: Self) -> Self
@@ -581,6 +583,9 @@ trait Float: Zero + One + Eq + Ord + Neg + Add + Sub + Mul + Div + Display + Deb
     rint(self) -> Self
     max_num(self, other: Self) -> Self
     min_num(self, other: Self) -> Self
+    max(self, other: Self) -> Self
+    min(self, other: Self) -> Self
+    clamp(self, lo: Self, hi: Self) -> Self
     maximum(self, other: Self) -> Self
     minimum(self, other: Self) -> Self
     fmod(self, divisor: Self) -> Self
@@ -642,6 +647,8 @@ conversions, whose factor is pi over 180.
 | `exp2` | `exp2(self) -> Self` |  |
 | `ln` | `ln(self) -> Self` |  |
 | `log2` | `log2(self) -> Self` |  |
+| `expm1` | `expm1(self) -> Self` | The two that stay accurate near zero. |
+| `ln1p` | `ln1p(self) -> Self` |  |
 | `log10` | `log10(self) -> Self` |  |
 | `pow` | `pow(self, exponent: Self) -> Self` | Raising to an arbitrary power, and the length of a two-dimensional vector. |
 | `hypot` | `hypot(self, other: Self) -> Self` |  |
@@ -667,6 +674,9 @@ conversions, whose factor is pi over 180.
 | `rint` | `rint(self) -> Self` |  |
 | `max_num` | `max_num(self, other: Self) -> Self` | The larger and the smaller of two, IEEE 754-2008's maxNum and minNum: **a NaN loses to a number**, so `nan.max_num(1.0)` and `1.0.max_num(nan)` are both `1.0`, and only two NaNs answer a NaN. |
 | `min_num` | `min_num(self, other: Self) -> Self` |  |
+| `max` | `max(self, other: Self) -> Self` | The larger and the smaller of two as a method, with `max_num`'s and `min_num`'s answers: **a NaN loses to a number**, so `nan.max(1.0)` and `1.0.max(nan)` are both `1.0`, and only two NaNs answer a NaN. |
+| `min` | `min(self, other: Self) -> Self` |  |
+| `clamp` | `clamp(self, lo: Self, hi: Self) -> Self` | The receiver held to `lo ..= hi`, inclusive at both ends. |
 | `maximum` | `maximum(self, other: Self) -> Self` | The larger and the smaller of two, IEEE 754-2019's maximum and minimum: **a NaN wins**, so `nan.maximum(1.0)` and `1.0.maximum(nan)` are both a NaN, and `-0.0` orders below `0.0` -- `(-0.0).maximum(0.0)` is `0.0` and `(-0.0).minimum(0.0)` is `-0.0`, whichever way round. |
 | `minimum` | `minimum(self, other: Self) -> Self` |  |
 | `fmod` | `fmod(self, divisor: Self) -> Self` | The remainder of a division that truncates, keeping the sign of the receiver. |
@@ -718,6 +728,33 @@ already imports `sysl.math` to reach.
 | Member | Signature | Description |
 |---|---|---|
 | `magnitude` | `magnitude(self) -> Self::Size` |  |
+
+### `MinMax`
+
+```sysl
+trait MinMax
+    max(self, other: Self) -> Self
+    min(self, other: Self) -> Self
+    clamp(self, lo: Self, hi: Self) -> Self
+```
+
+The larger and the smaller of two integers, and an integer held to a range, as methods:
+`a.max(b)`, `a.min(b)`, `x.clamp(lo, hi)`. These are Rust's `Ord::max`, `min` and `clamp`, and
+`Float` has the same three, so a program reaches for the one spelling whatever the number is.
+
+**The free functions `max`, `min` and `clamp` stay**, generic over `Ord`, and they agree with these
+on every integer except an inverted range. They are what a type of a program's own uses; these are
+what a receiver reads better as.
+
+Unlike `Signed` and `Bits`, the membership is written here rather than in the compiler: one block
+over `Integer`, the closed family, covers every width a program may name -- `u12` and `i512` as
+surely as `int` -- with the result always the receiver's own type, never a widening.
+
+| Member | Signature | Description |
+|---|---|---|
+| `max` | `max(self, other: Self) -> Self` | The larger and the smaller of two, and the receiver when they are equal. |
+| `min` | `min(self, other: Self) -> Self` |  |
+| `clamp` | `clamp(self, lo: Self, hi: Self) -> Self` | The receiver held to `lo ..= hi`, inclusive at both ends. |
 
 ### `MulAdd`
 
@@ -874,14 +911,20 @@ Every integer type, at every width and either signedness, in one block: the `iN`
 open (`01`), so no list of blocks covers them and a bound over `Integer` is what stands in for the
 list. It is the same shape `Display` is written in.
 
-**Negated as `T.zero() - self` rather than as `-self`, which is what keeps the unsigned widths
-in**: unary `-` requires `Neg`, which the language gives to the signed integers alone, while `Sub`
-is every integer's. On an unsigned type the branch is never taken and the subtraction is never
+**Negated as `T.zero() -% self` rather than as `-self`, which is what keeps the unsigned widths
+in**: unary `-` requires `Neg`, which the language gives to the signed integers alone, while a
+subtraction is every integer's. On an unsigned type the branch is never taken and the subtraction is never
 performed. `gcd` in `integer.sysl` takes the same route for the same reason.
 
 **At the most negative value this answers that value again**, exactly as `Signed.abs` does: the
-magnitude is one larger than the width can hold, and two's-complement negation wraps. Answering
+magnitude is one larger than the width can hold, and the negation is the wrapping one. Answering
 anything else would need a wider type to answer in, which is a promise a size cannot make.
+
+### MinMax for T
+
+```sysl
+impl[T: Integer] MinMax for T
+```
 
 ### MulAdd for f32
 

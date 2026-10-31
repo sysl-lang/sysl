@@ -223,11 +223,26 @@ std_artifact_at(root: string, path: string, fingerprint: string, t: Target,
 //
 // **The toolchain is asked rather than read off the message**, and the question is separate from the
 // build so both answers can be asserted on a machine where every target has a clang.
+//
+// **Nor where clang refused the text sysl gave it.** That is the two ways out failing the same way: the
+// one thing worth saying is which clang it was, and that the fault lies between it and this compiler
+// rather than in anything the reader wrote.
 std_rebuild_failure(err: string, toolchain: Result[string, string]) -> string = toolchain match
     Err(none) -> none
-    Ok(_) -> s"cannot find or build the standard module — build it with 'sysl build-lib library " +
-        s"--std', or pass --no-std-lib to compile against the copy built into the compiler " +
-        s"(${err.trim_end()})"
+    Ok(cc) ->
+        if err.contains(" failed (exit ") || err.starts_with("clang failed")
+            std_clang_refused(err, cc, clang_version_line(cc))
+        else s"cannot find or build the standard module — build it with 'sysl build-lib library " +
+            s"--std', or pass --no-std-lib to compile against the copy built into the compiler " +
+            s"(${err.trim_end()})"
+
+// A clang refusing the LLVM IR of the standard module, which `said` names when it can be asked.
+std_clang_refused(err: string, cc: string, said: string) -> string =
+    s"'$cc'${if said == "" then "" else s" ($said)"} refused the LLVM IR sysl emitted for the standard " +
+        "module, so nothing can be built with it. This is not a mistake in your program, and building " +
+        "the module by hand would hit the same refusal. Try a newer clang (update Xcode, or " +
+        "'brew install llvm' and name it with --cc); if this clang is current, please report it as a " +
+        s"sysl bug.\n${err.trim_end()}"
 
 // Whether this machine has a clang to build for the target with, or the sentence saying why not.
 private std_toolchain(t: Target) -> Result[string, string] =

@@ -51,13 +51,119 @@ bound_member(a: &Analysis, subject: Type, bounds: Buf[Bound],
     None
 end bound_member
 
+// The promises the blanket block filed under `key` makes about `subject` that carry a member of this
+// name: one for each block that applies. Two blocks of one trait at different arguments are two.
+blanket_offers_at(a: &Analysis, key: string, subject: Type, mname: string) -> Buf[Bound]
+    var out: Buf[Bound] = buf()
+    val members = a.tables.members
+    val alts = members.alts.get(member_key_of(key, mname))
+    var filed: Buf[string] = buf()
+
+    if alts.is_some()
+        for item in alts.unwrap()
+            filed.push(item)
+    else if has_member_at(a, key, mname)
+        filed.push(mname)
+
+    var targs: Buf[Type] = buf()
+
+    targs.push(subject)
+
+    for item in filed
+        val from = members.from_trait.get(member_key_of(key, item))
+
+        if from.is_some()
+            val rows = impls_of(a, from.unwrap(), key)
+
+            for row in rows
+                if blanket_condition_met(a, row, subject)
+                    val offer = supplied_bound(a, row, from.unwrap(), subject, targs)
+                    var seen = false
+
+                    for held in out
+                        if held.key() == offer.key() then seen = true
+
+                    if !seen then out.push(offer)
+
+    out
+end blanket_offers_at
+
+// Which of the offers this file reaches, by the rule a concrete receiver's member follows
+// (`reference/traits.md § Reaching a member through its trait`): what the file can name answers first,
+// and the impls the program can see only where it names none of them.
+blanket_in_reach(cx: &Analyzer, offers: Buf[Bound]) -> Buf[Bound]
+    var named: Buf[Bound] = buf()
+
+    for item in offers
+        if names_trait(cx, item.name) then named.push(item)
+
+    if !named.is_empty() then return named
+
+    var seen: Buf[Bound] = buf()
+
+    for item in offers
+        if reachable_key(cx.an, item.name, cx.scope) then seen.push(item)
+
+    seen
+end blanket_in_reach
+
+// What the blanket blocks over a parameter's family offer it under a member name, within reach.
+private blanket_offers(cx: &Analyzer, subject: Type, bounds: Buf[Bound], mname: string) -> Buf[Bound]
+    var out: Buf[Bound] = buf()
+    val keys = blanket_keys_of_bounds(cx.an, bounds, subject)
+
+    for key in keys
+        val offers = blanket_offers_at(cx.an, key, subject, mname)
+
+        for item in offers
+            out.push(item)
+
+    blanket_in_reach(cx, out)
+end blanket_offers
+
+// The member a parameter's bounds license: one they declare, or failing that the one a blanket block
+// over its family is the only offer of. **A bound written on the parameter answers ahead of a blanket**,
+// so `[T: Integer + MyMax]` means `MyMax`'s `max`, having asked for it by name.
+licensed_member(cx: &Analyzer, subject: Type, bounds: Buf[Bound],
+                mname: string) -> Option[(Bound, Buf[Binding], MethodDecl)]
+    val own = bound_member(cx.an, subject, bounds, mname)
+
+    if own.is_some() then return own
+
+    val offers = blanket_offers(cx, subject, bounds, mname)
+
+    if offers.len() != 1 then return None
+
+    bound_member(cx.an, subject, offers, mname)
+end licensed_member
+
+// The refusal of a member two blanket blocks both give a parameter: picking either would be a guess
+// about what the body meant, and the fix is a bound or an import naming one.
+private blanket_clash(cx: &Analyzer, span: Span, subject: Type, name: string, offers: Buf[Bound]) -> TExpr
+    var traits: Buf[string] = buf()
+
+    for item in offers
+        val shown = module_show(item.name)
+
+        if !holds_string(traits, shown) then traits.push(shown)
+
+    kept_error(cx, span, s"'$name' on ${type_show(subject)} comes from ${conjoin(traits)}, and each " +
+               "is in scope here — nothing in the call says which was meant")
+end blanket_clash
+
 // `x.m(…)` where `x` is a type parameter.
 call_bound_method(cx: &Analyzer, span: Span, receiver: TExpr, subject: Type, name: string,
                   bounds: Buf[Bound], args: Buf[Expr],
                   targs: Buf[Expr] = no_written_members()) -> TExpr
-    val found = bound_member(cx.an, subject, bounds, name)
+    val found = licensed_member(cx, subject, bounds, name)
 
-    if found.is_none() then return unlicensed(cx, span, subject, name)
+    if found.is_none()
+        val offers = blanket_offers(cx, subject, bounds, name)
+
+        if offers.len() > 1 then return blanket_clash(cx, span, subject, name, offers)
+
+        return unlicensed(cx, span, subject, name)
+    end if
 
     val tr = found.unwrap().0
     val m = found.unwrap().2
@@ -455,7 +561,7 @@ end unlicensed_associated
 // to be spelled like a field, so a trait can promise it.
 read_bound_property(cx: &Analyzer, span: Span, receiver: TExpr, subject: Type, name: string,
                     bounds: Buf[Bound]) -> TExpr
-    val found = bound_member(cx.an, subject, bounds, name)
+    val found = licensed_member(cx, subject, bounds, name)
 
     if found.is_none() then return unlicensed_property(cx, span, subject, name)
 

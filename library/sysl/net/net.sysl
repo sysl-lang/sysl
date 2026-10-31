@@ -219,6 +219,25 @@ struct Socket
      */
     non_blocking(*self, on: bool = true) -> Result[unit, IoError] =
         told(nsys.option(int(self.fd), nsys.non_blocking, if on then 1 else 0))
+
+    /** Ask the kernel for a send buffer of `bytes`. A size that is not positive is `InvalidInput`.
+     *
+     * **The kernel may grant more or less than asked** -- Linux doubles it and clamps it to a
+     * limit, a BSD clamps it -- so `send_buffer` says what it granted. A small buffer is why a
+     * large `send` to a slow reader takes many turns: macOS gives a Unix socket 8 KB.
+     */
+    set_send_buffer(*self, bytes: int) -> Result[unit, IoError] =
+        told(nsys.option(int(self.fd), nsys.send_buffer, i64(bytes)))
+
+    /** Ask the kernel for a receive buffer of `bytes`; see `set_send_buffer`. */
+    set_recv_buffer(*self, bytes: int) -> Result[unit, IoError] =
+        told(nsys.option(int(self.fd), nsys.recv_buffer, i64(bytes)))
+
+    /** The send buffer the kernel gave this socket, in bytes. */
+    send_buffer(self) -> Result[int, IoError] = sized(nsys.option(int(self.fd), nsys.send_buffer_size, 0))
+
+    /** The receive buffer the kernel gave this socket, in bytes. */
+    recv_buffer(self) -> Result[int, IoError] = sized(nsys.option(int(self.fd), nsys.recv_buffer_size, 0))
 end Socket
 
 /** A stream socket of the family an address belongs to, ready to be connected or bound.
@@ -305,6 +324,24 @@ struct UdpSocket
     non_blocking(*self, on: bool = true) -> Result[unit, IoError] =
         told(nsys.option(int(self.fd), nsys.non_blocking, if on then 1 else 0))
 
+    /** Ask the kernel for a send buffer of `bytes`; see `Socket.set_send_buffer`. A datagram longer
+     * than the send buffer is refused (`EMSGSIZE`), so this is what raises that limit.
+     */
+    set_send_buffer(*self, bytes: int) -> Result[unit, IoError] =
+        told(nsys.option(int(self.fd), nsys.send_buffer, i64(bytes)))
+
+    /** Ask the kernel for a receive buffer of `bytes`; see `Socket.set_send_buffer`. Datagrams that
+     * arrive faster than they are read are dropped once it is full, so a larger one drops fewer.
+     */
+    set_recv_buffer(*self, bytes: int) -> Result[unit, IoError] =
+        told(nsys.option(int(self.fd), nsys.recv_buffer, i64(bytes)))
+
+    /** The send buffer the kernel gave this socket, in bytes. */
+    send_buffer(self) -> Result[int, IoError] = sized(nsys.option(int(self.fd), nsys.send_buffer_size, 0))
+
+    /** The receive buffer the kernel gave this socket, in bytes. */
+    recv_buffer(self) -> Result[int, IoError] = sized(nsys.option(int(self.fd), nsys.recv_buffer_size, 0))
+
     /** Give the descriptor back. */
     close(*self) -> Result[unit, IoError] = told(nsys.close(int(self.fd)))
 end UdpSocket
@@ -330,6 +367,18 @@ timed_out(e: IoError) -> bool = e.code() == timed_out_code()
  */
 would_block(e: IoError) -> bool = e.code() == again()
 
+/** Whether an error is a `send` to a peer that has gone: `EPIPE` (32 on every hosted platform), or
+ * `ECONNRESET` (54 on a BSD, 104 elsewhere) when the peer reset rather than closed. **Such a send
+ * answers this error and never raises `SIGPIPE`**, so the process is not ended by it.
+ */
+peer_closed(e: IoError) -> bool = e.code() == 32 || e.code() == reset_code()
+
+#if bsd
+private reset_code() -> int = 54
+#else
+private reset_code() -> int = 104
+#endif
+
 // `ETIMEDOUT`, which every hook answers for a call its timeout stopped (`sysl.net.sys`): 60 on a BSD,
 // 110 under Linux's numbering, which is also what a kernel without a C library writes.
 #if bsd
@@ -353,6 +402,10 @@ private[net] failure(answer: int) -> IoError = from_status(answer)
 /** A hook's answer as success or the error it stands for. */
 private[net] told(answer: int) -> Result[unit, IoError] =
     if answer < 0 then Err(failure(answer)) else Ok(())
+
+/** A hook's size answer as the size or the error it stands for. */
+private sized(answer: int) -> Result[int, IoError] =
+    if answer < 0 then Err(failure(answer)) else Ok(answer)
 
 /** A hook's count as the count or the error it stands for. */
 private moved(answer: isize) -> Result[usize, IoError] =

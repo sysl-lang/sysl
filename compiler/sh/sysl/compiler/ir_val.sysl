@@ -46,8 +46,9 @@ enum Val
     // Undefined, and undefined in a way that poisons whatever reads it. Stronger than `VUndef`.
     VPoison
 
-    // One value in every lane -- LLVM's own spelling for a vector constant whose lanes agree.
-    VSplat(lane: LType, value: &Val)
+    // One value in every one of `count` lanes. **It is written out, never as LLVM's `splat (...)`**,
+    // which only LLVM 19 and newer can read and which parses to this very constant.
+    VSplat(count: int, lane: LType, value: &Val)
 
     // No operand at all: what a `ret void` writes after the type, which is nothing.
     VNothing
@@ -101,6 +102,21 @@ enum Val
 end Val
 
 // The LLVM text for an operand, and the only place any of it is written down.
+private splat_render(count: int, lane: LType, value: Val) -> string
+    val one = s"${l_render(lane)} ${v_render(value)}"
+    var b = str_builder()
+
+    b.push_char('<')
+
+    for i in 0..<count
+        if i > 0 then b.push(", ")
+
+        b.push(one)
+
+    b.push_char('>')
+    b.finish()
+end splat_render
+
 v_render(v: Val) -> string = v match
     VReg(name) -> s"%${llvm_safe(name)}"
     VGlobal(name) -> s"@${llvm_safe(name)}"
@@ -112,7 +128,7 @@ v_render(v: Val) -> string = v match
     VUndef -> "undef"
     VZero -> "zeroinitializer"
     VPoison -> "poison"
-    VSplat(lane, value) -> s"splat (${l_render(lane)} ${v_render(*value)})"
+    VSplat(count, lane, value) -> splat_render(count, lane, *value)
     VNothing -> ""
     VAgg(fields) -> args_between(fields, "{ ", ", ", " }")
     VPackedAgg(fields) -> args_between(fields, "<{ ", ", ", " }>")

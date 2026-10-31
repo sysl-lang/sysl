@@ -31,8 +31,9 @@ import sysl.text.Search
 // numbered and every instruction laid down in is the reference's, so the text is the same text.
 
 // Whether a `bf16` reaches this machine's back end as the `i16` of its bits rather than as a
-// `bfloat`. WebAssembly is the one back end that cannot convert a `bfloat`.
-bf16_as_bits(t: Target) -> bool = t.cpu == Wasm32
+// `bfloat`. WebAssembly's back end cannot convert a `bfloat`, and nor can AArch64's before LLVM 18,
+// which is every Xcode 15 and 16.0-16.2 (`clang_lacks_bfloat`).
+bf16_as_bits(t: Target) -> bool = t.cpu == Wasm32 || clang_lacks_bfloat(t)
 
 // The rewrite's state: the register counter of the function being rewritten, the block being
 // rebuilt, and -- across the whole module -- the intrinsics it declared and the ones it replaced.
@@ -224,7 +225,7 @@ private sb_value(v: Val, t: LType) -> Val = v match
 
             VInt(from_int(long(if b >= 0x8000 then b - 0x10000 else b)))
         else v
-    VSplat(lane, x) -> VSplat(sb_ty(lane), sb_value(*x, lane))
+    VSplat(n, lane, x) -> VSplat(n, sb_ty(lane), sb_value(*x, lane))
     VAgg(fs) -> VAgg(sb_args(fs))
     VPackedAgg(fs) -> VPackedAgg(sb_args(fs))
     VArray(es) -> VArray(sb_args(es))
@@ -251,12 +252,12 @@ private sb_same(a: LType, b: LType) -> bool = l_render(a) == l_render(b)
 
 // An integer constant in the shape of `t`.
 private sb_k(t: LType, c: int) -> Val = t match
-    LVec(_, lane) -> VSplat(*lane, VInt(from_int(long(c))))
+    LVec(n, lane) -> VSplat(n, *lane, VInt(from_int(long(c))))
     _ -> VInt(from_int(long(c)))
 
 // A floating constant in the shape of `t`, from a `real`'s bits.
 private sb_kf(t: LType, bits: long) -> Val = t match
-    LVec(_, lane) -> VSplat(*lane, VFloat(bits))
+    LVec(n, lane) -> VSplat(n, *lane, VFloat(bits))
     _ -> VFloat(bits)
 
 // The suffix an intrinsic overloaded on `t` is named with.

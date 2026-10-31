@@ -1,0 +1,197 @@
+module sysl.math
+@tests
+
+import sysl.hint.black_box
+
+// The `max`, `min` and `clamp` methods every integer width has through `MinMax`'s one block over the
+// `Integer` family: the ordinary widths, the pointer width, a width wider than any register and one
+// narrower than a byte, each answering in the receiver's own type.
+
+@test("imx: max and min pick the right end at the ordinary widths")
+imx_ordinary()
+    assert_eq(black_box(i8(3)).max(5), i8(5))
+    assert_eq(black_box(i8(3)).min(5), i8(3))
+    assert_eq(black_box(u8(200)).max(100), u8(200))
+    assert_eq(black_box(u8(200)).min(100), u8(100))
+    assert_eq(black_box(i32(7)).max(-7), i32(7))
+    assert_eq(black_box(u64(1) << 63).min(u64::Max), u64(1) << 63)
+    assert_eq(black_box(4).max(9), 9)
+    assert_eq(black_box(usize(4)).min(9), usize(4))
+end imx_ordinary
+
+@test("imx: a negative receiver and a negative argument order as signed values")
+imx_negatives()
+    val a = black_box(i8(-128))
+
+    assert_eq(a.max(-1), i8(-1))
+    assert_eq(a.min(-1), i8(-128))
+    assert_eq(black_box(-5).max(-9), -5)
+    assert_eq(black_box(-5).min(-9), -9)
+    assert_eq(black_box(i32::Min).max(i32::Max), i32::Max)
+end imx_negatives
+
+@test("imx: equal values answer that value")
+imx_equal()
+    assert_eq(black_box(u8(7)).max(7), u8(7))
+    assert_eq(black_box(u8(7)).min(7), u8(7))
+    assert_eq(black_box(-3).clamp(-3, -3), -3)
+end imx_equal
+
+@test("imx: clamp in range, below and above, and at either bound")
+imx_clamp()
+    val lo = black_box(10)
+    val hi = black_box(20)
+
+    assert_eq(black_box(15).clamp(lo, hi), 15)
+    assert_eq(black_box(3).clamp(lo, hi), 10)
+    assert_eq(black_box(99).clamp(lo, hi), 20)
+    assert_eq(black_box(10).clamp(lo, hi), 10)
+    assert_eq(black_box(20).clamp(lo, hi), 20)
+    assert_eq(black_box(i8(-100)).clamp(-50, 50), i8(-50))
+    assert_eq(black_box(u8(255)).clamp(0, 9), u8(9))
+end imx_clamp
+
+@test("imx: a width wider than a register, and one narrower than a byte")
+imx_odd_widths()
+    val big: u256 = black_box(u256(1) << 200)
+    val neg: i512 = black_box(-(i512(1) << 400))
+
+    assert_eq(big.max(1), big)
+    assert_eq(big.min(1), u256(1))
+    assert_eq(big.clamp(0, u256(1) << 100), u256(1) << 100)
+    assert_eq(neg.max(-1), i512(-1))
+    assert_eq(neg.min(-1), neg)
+    assert_eq(neg.clamp(-3, 3), i512(-3))
+
+    val w: u12 = black_box(u12(4000))
+
+    assert_eq(w.max(4095), u12::Max)
+    assert_eq(w.min(3), u12(3))
+    assert_eq(w.clamp(0, 10), u12(10))
+end imx_odd_widths
+
+@test("imx: the extremes of every signedness answer without overflow")
+imx_extremes()
+    assert_eq(black_box(i128::Min).max(i128::Max), i128::Max)
+    assert_eq(black_box(i128::Max).min(i128::Min), i128::Min)
+    assert_eq(black_box(u128::Max).min(0), u128(0))
+    assert_eq(black_box(u256::Max).max(0), u256::Max)
+    assert_eq(black_box(i64::Min).clamp(i64::Min, i64::Max), i64::Min)
+    assert_eq(black_box(u64::Max).clamp(0, u64::Max), u64::Max)
+    assert_eq(black_box(i8::Min).clamp(i8::Max, i8::Max), i8::Max)
+    assert_eq(black_box(u8::Max).clamp(u8::Max, u8::Max), u8::Max)
+    assert_eq(black_box(i512::Min).clamp(i512::Min, i512::Max), i512::Min)
+end imx_extremes
+
+type ImxLevel = int within 0..10
+type ImxMeters = i16
+
+@test("imx: a constrained subtype and an alias have the methods")
+imx_subtype_and_alias()
+    val l: ImxLevel = black_box(4)
+    val m: ImxMeters = black_box(-4)
+
+    assert_eq(l.max(7), 7)
+    assert_eq(l.min(7), 4)
+    assert_eq(l.clamp(5, 6), 5)
+    assert_eq(m.max(2), i16(2))
+    assert_eq(m.clamp(-9, -5), i16(-5))
+end imx_subtype_and_alias
+
+@test("imx: the free functions agree with the methods")
+imx_free_functions_agree()
+    for a in -3..3
+        for b in -3..3
+            assert_eq(max(black_box(a), b), black_box(a).max(b))
+            assert_eq(min(black_box(a), b), black_box(a).min(b))
+
+            for c in b..3
+                assert_eq(clamp(black_box(a), b, c), black_box(a).clamp(b, c))
+end imx_free_functions_agree
+
+private width_of[T: Bits](x: T) -> u32 = T.width()
+
+@test("imx: the result is the receiver's own type, never a widening")
+imx_no_widening()
+    val a: u8 = black_box(250)
+    val m = a.max(3)
+    val c = a.clamp(1, 2)
+    val w: u12 = black_box(9)
+
+    assert_eq(width_of(m), 8)
+    assert_eq(width_of(c), 8)
+    assert_eq(width_of(w.min(1)), 12)
+    assert_eq(width_of(black_box(i512(1)).max(2)), 512)
+end imx_no_widening
+
+@test("imx: a literal argument takes the receiver's type")
+imx_literal_argument()
+    val x: u8 = black_box(1)
+
+    // 255 is a `u8` here; as an `int` it would not fit the result.
+    val r: u8 = x.max(255)
+
+    assert_eq(r, u8(255))
+    assert_eq(x.clamp(3, 4), u8(3))
+end imx_literal_argument
+
+private const larger(a: int, b: int) -> int = a.max(b)
+private val folded = larger(3, 8)
+
+@test("imx: a const function may call the methods")
+imx_const_function()
+    assert_eq(folded, 8)
+    assert_eq(larger(black_box(-1), -2), -1)
+end imx_const_function
+
+private struct ImxScore
+    v: int
+
+impl ImxScore
+    max(self, other: ImxScore) -> ImxScore = if self.v < other.v then other else self
+
+@test("imx: a struct's own max is its own")
+imx_struct_unaffected()
+    assert_eq(ImxScore(4).max(ImxScore(9)).v, 9)
+    assert_eq(ImxScore(9).max(ImxScore(4)).v, 9)
+end imx_struct_unaffected
+
+private imx_top[T: MinMax](a: T, b: T, c: T) -> T = a.max(b).max(c)
+private imx_hold[T: MinMax](x: T, lo: T, hi: T) -> T = x.min(hi).max(lo).clamp(lo, hi)
+
+private imx_family_top[T: Integer](a: T, b: T, c: T) -> T = a.max(b).max(c)
+private imx_family_hold[T: Integer](x: T, lo: T, hi: T) -> T = x.min(hi).max(lo).clamp(lo, hi)
+private imx_family_handed[T: Integer](a: T, b: T) -> T = imx_top(a, b, b)
+
+@test("imx: a body bounded by MinMax or by Integer reaches the methods")
+imx_generic_body()
+    assert_eq(imx_top(black_box(u8(1)), 9, 4), u8(9))
+    assert_eq(imx_top(black_box(i8(-1)), -9, -4), i8(-1))
+    assert_eq(imx_top(black_box(u12(1)), 2, 3), u12(3))
+    assert_eq(imx_hold(black_box(i512(-7)), -2, 2), i512(-2))
+    assert_eq(imx_hold(black_box(usize(70)), 2, 50), usize(50))
+    assert_eq(imx_family_top(black_box(u8(1)), 9, 4), u8(9))
+    assert_eq(imx_family_top(black_box(i8(-1)), -9, -4), i8(-1))
+    assert_eq(imx_family_hold(black_box(i512(-7)), -2, 2), i512(-2))
+    assert_eq(imx_family_hold(black_box(u12(70)), 2, 50), u12(50))
+    assert_eq(imx_family_handed(black_box(i16(-3)), -9), i16(-3))
+end imx_generic_body
+
+@test(should_trap)
+imx_clamp_inverted()
+    val x = black_box(5)
+
+    print(x.clamp(9, 1))
+end imx_clamp_inverted
+
+@test(should_trap)
+imx_clamp_inverted_narrow()
+    val x = black_box(u12(5))
+
+    print(x.clamp(9, 1))
+end imx_clamp_inverted_narrow
+
+@test(should_trap)
+imx_clamp_inverted_generic()
+    print(imx_hold(black_box(i8(5)), 9, 1))
+end imx_clamp_inverted_generic
