@@ -6,7 +6,7 @@ weight: 72
 
 **Every declaration in `sysl.env`, with its signature:** [the generated API page](/api/sysl-env/#index). This page is the argument — what the module is for, and how its pieces fit; that one is the list.
 
-`sysl.env` reads the environment a program was started with. It is four functions and no state.
+`sysl.env` reads the environment a program was started with, and says where the program itself is. It is five functions and no state.
 
 ```sysl
 import sysl.env.{get, get_or, is_set}
@@ -68,6 +68,29 @@ kernel answering the two hooks lists its own environment with no POSIX and no C 
 `("VAR", "")`, a set-to-empty variable being set. An entry with no `=` names nothing and is passed
 over, and so is one that is not UTF-8 — `get`'s answer to the same bytes. Both halves are copied out of
 what the environment lends, whose storage a later `setenv` from C may move.
+
+## Where the running program is
+
+`current_exe` answers the absolute path of the running executable with every symbolic link resolved —
+the file itself, not the name it was started under, so a program run from the search path or through a
+Homebrew link can find what is installed beside it.
+
+```sysl
+import sysl.env.current_exe
+import sysl.path.is_absolute
+
+print(current_exe().is_some())
+print(is_absolute(current_exe().unwrap()))
+```
+
+```output
+true
+true
+```
+
+macOS asks the loader and Linux reads `/proc/self/exe`; both are then passed through `realpath`. It
+reads through the `sysl_env_exe` hook, answered by `sysl.env.hosted`, so a target the hosted supplier
+cannot answer for gets `None`, as does a path that is not UTF-8.
 
 ## Unset, empty, and not text are three different answers
 

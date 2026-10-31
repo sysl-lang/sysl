@@ -2,7 +2,7 @@ module sysl.env.hosted
 @requires(os, libc)
 
 import sysl.buf.{Buf, buf}
-import sysl.slices.as_ptr
+import sysl.slices.{as_ptr, as_mut_ptr}
 import sysl.sys.UNSUPPORTED
 
 // `sysl.env.sys`'s hooks answered over the platform's C library. **Call `sysl.env` instead** --
@@ -51,6 +51,46 @@ private lend(p: *u8, into: *u8, room: usize, got: *usize)
 
     *got = n
 end lend
+
+#if macos
+private const exe_max: usize = 4096
+
+@needs(os)
+private extern "_NSGetExecutablePath" c_exe_path(into: *u8, room: *u32) -> int
+
+@needs(os)
+private extern "realpath" c_realpath(name: *u8, into: *u8) -> *u8
+#elif linux
+private const exe_max: usize = 4096
+
+@needs(os)
+private extern "realpath" c_realpath(name: *u8, into: *u8) -> *u8
+#endif
+
+@export("sysl_env_exe")
+supply_exe(into: *u8, room: usize, got: *usize) -> int
+#if macos
+    // The loader's answer may name the binary through links and `..`; `realpath` settles both.
+    var raw: []u8 = [0; exe_max]
+    var resolved: []u8 = [0; exe_max]
+    var size: u32 = 4096
+
+    if c_exe_path(as_mut_ptr(raw), &size) != 0 then return 0
+    if c_realpath(as_mut_ptr(raw), as_mut_ptr(resolved)) == null then return 0
+
+    lend(as_mut_ptr(resolved), into, room, got)
+    1
+#elif linux
+    var resolved: []u8 = [0; exe_max]
+
+    if c_realpath("/proc/self/exe", as_mut_ptr(resolved)) == null then return 0
+
+    lend(as_mut_ptr(resolved), into, room, got)
+    1
+#else
+    UNSUPPORTED
+#endif
+end supply_exe
 
 @export("sysl_env_get")
 supply_get(name: *u8, name_len: usize, into: *u8, room: usize, got: *usize) -> int
