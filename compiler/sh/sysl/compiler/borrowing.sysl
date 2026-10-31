@@ -886,7 +886,7 @@ end Untouched
 
 // An empty summary, for an emitter that has not read a program yet.
 untouched_none() -> Untouched =
-    Untouched(buf(), buf(), buf(), buf(), buf(), Casts(buf(), buf(), buf()), buf(), map())
+    Untouched(buf(), buf(), buf(), buf(), buf(), no_casts(), buf(), map())
 
 // Whether a body that gives back the count of a value of type `given` -- the old value of a place it
 // overwrites -- leaves every value of type `t` it does not write where it was: nothing it lets go of
@@ -1119,8 +1119,11 @@ end held_with
 private cast_reaches(c: Casts, r: Type, t: Type, parts: Buf[Type]) -> bool
     if has_type(c.anywhere, r) then return true
 
-    for i in 0..<c.into.len()
-        if c.into.at(i) == r && held_with(c.from.at(i), t, parts) then return true
+    c.froms.get(mangle(r)) match
+        Some(objs) ->
+            for obj in objs
+                if held_with(obj, t, parts) then return true
+        None -> ()
 
     false
 end cast_reaches
@@ -1344,11 +1347,19 @@ private direct_root(place: TExpr) -> Option[Type] = *place.kind match
 // The types pointers were made to by something other than taking an address: `anywhere` where the
 // pointer could reach any storage at all, and `into`/`from` pairs where it was made from the address
 // of a named object of the `from` type.
+//
+// **`froms` is the same pairs keyed by the mangled `into` type**, which is how `cast_reaches` asks
+// them. The pairs grow with the program -- every instance of a generic that casts adds its own, and
+// `Buf.reading` is one per element type -- and a question asked of every type an object may free, for
+// every type a call lends, cannot afford to walk them all each time.
 struct Casts
     anywhere: Buf[Type]
     into: Buf[Type]
     from: Buf[Type]
+    froms: Map[string, Buf[Type]]
 end Casts
+
+private no_casts() -> Casts = Casts(buf(), buf(), buf(), map())
 
 // The same, gathered through the box a walk captured.
 private struct CastSink
@@ -1358,14 +1369,20 @@ private struct CastSink
         if !has_type(self.c.anywhere, t) then self.c.anywhere.push(t)
 
     add(*self, t: Type, obj: Type)
-        for i in 0..<self.c.into.len()
-            if self.c.into.at(i) == t && self.c.from.at(i) == obj then return
+        val key = mangle(t)
+
+        var objs: Buf[Type] = self.c.froms.get(key).unwrap_or(buf())
+
+        if has_type(objs, obj) then return
+
+        objs.push(obj)
+        self.c.froms.put(key, objs)
 
         self.c.into.push(t)
         self.c.from.push(obj)
 end CastSink
 
-private cast_sink() -> &CastSink = CastSink(Casts(buf(), buf(), buf()))
+private cast_sink() -> &CastSink = CastSink(no_casts())
 
 // Whether this node makes a value that holds a type with a destructor -- one the body will let go,
 // so the destructor may run before it returns. Reading a value that is already somewhere makes

@@ -749,6 +749,84 @@ pfz_an_unnamed_cast_keeps_the_count()
 pfz_casts_run()
     pfz_prints(pfz_casts(), "1 1 9 1\n")
 
+// Casts into one type from several named objects are all kept, looked up by the type cast into
+// (`Casts.froms`): one from numbers and one from a holder of the lent buffer make every write through
+// that type a hazard, in whichever order the program makes them; an instance of the same generic cast
+// into only from numbers is judged by its own casts, not by its sibling's.
+private pfz_two_froms(holder_first: bool) -> string
+    val head = raw"""
+        import sysl.buf.{Buf, buf}
+        import sysl.raw.ptr_cast
+
+        struct S
+            items: Buf[int]
+            n: usize
+
+        struct Holder
+            s: S
+
+        struct Pair[T]
+            a: T
+            b: T
+
+        var Scratch: [4]usize = [0, 0, 0, 0]
+
+        """
+    val holder = raw"""
+        peek(s: S) -> usize
+            var h = Holder(s)
+            val w: *Pair[usize] = ptr_cast(&h)
+
+            w.b
+
+        """
+    val numbers = raw"""
+        scribble(b: Buf[int]) -> usize
+            val w: *Pair[usize] = ptr_cast(&Scratch[0])
+
+            w.a = b.len()
+            w.a
+
+        narrow(b: Buf[int]) -> usize
+            val w: *Pair[u32] = ptr_cast(&Scratch[2])
+
+            w.a = u32(b.len())
+            usize(w.a)
+
+        """
+    val tail = raw"""
+        named(s: *S) -> usize = scribble(s.items)
+
+        narrowed(s: *S) -> usize = narrow(s.items)
+
+        main()
+            var s = S(buf(), 0)
+
+            s.items.push(1)
+            print(named(&s), narrowed(&s), peek(S(buf(), 7)))
+        """
+
+    if holder_first then head + holder + numbers + tail else head + numbers + holder + tail
+end pfz_two_froms
+
+@test("a cast from a holder of the buffer into a type also cast into from numbers keeps the count")
+pfz_a_second_from_keeps_the_count()
+    pfz_kept(pfz_two_froms(false), "named")
+
+@test("and so does one made first")
+pfz_a_first_from_keeps_the_count()
+    pfz_kept(pfz_two_froms(true), "named")
+
+@test("a sibling instance cast into only from numbers is still lent the field")
+pfz_a_sibling_instance_lends()
+    pfz_none(pfz_two_froms(false), "narrowed")
+    pfz_none(pfz_two_froms(true), "narrowed")
+
+@test("and the casts read and write where they say")
+pfz_two_froms_run()
+    pfz_prints(pfz_two_froms(false), "1 1 7\n")
+    pfz_prints(pfz_two_froms(true), "1 1 7\n")
+
 // A write giving back a count, judged by what it could free: an unrelated global of numbers is clear,
 // a box holding the very struct the place is in is not.
 private pfz_gives() -> string = raw"""
