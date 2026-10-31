@@ -1,0 +1,198 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.replace_all
+
+// A `|` may begin a line of an or-pattern, and may precede an arm's first alternative, as Rust and
+// rustfmt write them:
+//
+//     x match
+//         1
+//         | 2
+//         | 3 -> 10
+//
+// A line beginning with `|` continues the pattern above only while the arm has not reached its arrow.
+// After a finished arm it begins an arm of its own, whose optional leading `|` it is. Inside brackets
+// a line break was never significant, so a `|` there is the operator it always was.
+
+private olp_ready() -> bool = std_root().is_ok() && clang_available()
+
+private olp_ran(text: string) -> string
+    val root = replace_all(make_temp_dir("sysl-olp").unwrap(), "//", "/")
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            val said = replace_all(failure_text(why), s"$root/", "")
+
+            remove_dir_all(root).unwrap_or(())
+            return said
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end olp_ran
+
+private olp_prints(text: string, want: string)
+    if !olp_ready() then return
+
+    assert_eq(olp_ran(text), want)
+
+// The two texts parse, cleanly, to one tree.
+private olp_same(text: string, means: string)
+    assert_eq(pf_err(text), "")
+    assert_eq(pf(text), pf(means))
+
+// The text is refused by the parser, with some complaint.
+private olp_refuses(text: string)
+    assert(pf_err(text) != "", s"expected a parse error for\n$text")
+
+// -- the shape ------------------------------------------------------------------------------------
+
+@test("a leading '|' on continuation lines is the same tree as a trailing one")
+olp_shape_leading_is_trailing()
+    olp_same("f(x: int) -> int = x match\n    1\n    | 2\n    | 3 -> 10\n    _ -> 0\n",
+             "f(x: int) -> int = x match\n    1 |\n    2 |\n    3 -> 10\n    _ -> 0\n")
+    olp_same("f(x: int) -> int = x match\n    1\n    | 2 | 3 -> 10\n    _ -> 0\n",
+             "f(x: int) -> int = x match\n    1 | 2 | 3 -> 10\n    _ -> 0\n")
+
+@test("a leading '|' before the first alternative is the same tree as none")
+olp_shape_first_line()
+    olp_same("f(x: int) -> int = x match\n    | 1 | 2 -> 10\n    _ -> 0\n",
+             "f(x: int) -> int = x match\n    1 | 2 -> 10\n    _ -> 0\n")
+
+@test("mixed leading and trailing bars")
+olp_shape_mixed()
+    olp_same("f(x: int) -> int = x match\n    1 |\n    2\n    | 3 |\n    4 -> 10\n    _ -> 0\n",
+             "f(x: int) -> int = x match\n    1 | 2 | 3 | 4 -> 10\n    _ -> 0\n")
+
+// -- the values -----------------------------------------------------------------------------------
+
+@test("the example: a leading '|' on every continuation line")
+olp_example_value()
+    olp_prints("f(x: int) -> int = x match\n    1\n    | 2\n    | 3 -> 10\n    _ -> 0\n" +
+               "print(f(1), f(2), f(3), f(4))\n",
+               "10 10 10 0\n")
+
+@test("a leading '|' before the first alternative, and on the lines after it")
+olp_first_line_value()
+    olp_prints("f(x: int) -> int = x match\n    | 1\n    | 2 -> 10\n    | 3 -> 20\n    _ -> 0\n" +
+               "print(f(1), f(2), f(3), f(4))\n",
+               "10 10 20 0\n")
+
+@test("mixed leading and trailing bars, by value")
+olp_mixed_value()
+    olp_prints("f(x: int) -> int = x match\n    1 |\n    2\n    | 3 |\n    4 -> 10\n    _ -> 0\n" +
+               "print(f(1), f(3), f(4), f(5))\n",
+               "10 10 10 0\n")
+
+@test("ranges, a converted literal and a negative literal")
+olp_ranges_and_literals_value()
+    olp_prints("f(x: int) -> int = x match\n    1..3\n    | 10..<12\n    | -5 -> 1\n    _ -> 0\n" +
+               "g(c: u8) -> int = c match\n    'a'\n    | 'b'\n    | 'z' -> 1\n    _ -> 0\n" +
+               "print(f(2), f(11), f(12), f(-5), f(0))\n" +
+               "print(g(u8('a')), g(u8('b')), g(u8('z')), g(u8('c')))\n",
+               "1 1 0 1 0\n1 1 1 0\n")
+
+@test("enum variants and struct patterns")
+olp_variants_and_structs_value()
+    olp_prints("enum Color\n    Red\n    Green\n    Blue\n" +
+               "struct Point\n    x: int\n    y: int\n" +
+               "f(c: Color) -> int = c match\n    Red\n    | Green -> 1\n    Blue -> 2\n" +
+               "g(p: Point) -> int = p match\n    Point{x: 1}\n    | Point{x: 2} -> 1\n    _ -> 0\n" +
+               "print(f(Red), f(Green), f(Blue))\n" +
+               "print(g(Point(1, 9)), g(Point(2, 9)), g(Point(3, 9)))\n",
+               "1 1 2\n1 1 0\n")
+
+// Alternatives nested inside a variant (`Some(1 | 2)`) are refused by the parser even on one line,
+// leading bar or not; that is the language as it was and is reported rather than changed here.
+@test("whole variant patterns as alternatives across lines")
+olp_variants_with_payloads_value()
+    olp_prints("g(o: Option[int]) -> int = o match\n    Some(1)\n    | Some(2)\n    | None -> 10\n    _ -> 0\n" +
+               "print(g(Some(2)), g(None), g(Some(4)))\n",
+               "10 10 0\n")
+
+@test("an or-pattern nested in a variant is refused the same with or without a leading bar")
+olp_nested_or_unchanged()
+    assert_eq(pf_err("g(o: Option[int]) -> int = o match\n    Some(1 | 2) -> 1\n    _ -> 0\n"),
+              pf_err("g(o: Option[int]) -> int = o match\n    | Some(1 | 2) -> 1\n    _ -> 0\n"))
+
+@test("a guard after the last alternative, and after a leading first one")
+olp_guard_value()
+    olp_prints("f(x: int, big: bool) -> int = x match\n    1\n    | 2\n    | 3 if big -> 10\n    _ -> 0\n" +
+               "g(x: int) -> int = x match\n    | 1 | 2 if x > 1 -> 10\n    _ -> 0\n" +
+               "print(f(2, true), f(2, false), f(7, true))\n" +
+               "print(g(1), g(2))\n",
+               "10 0 0\n0 10\n")
+
+@test("a block body after '->'")
+olp_block_body_value()
+    olp_prints("f(x: int) -> int = x match\n    1\n    | 2 ->\n        val y = x * 10\n        y + 1\n    _ -> 0\n" +
+               "print(f(1), f(2), f(3))\n",
+               "11 21 0\n")
+
+@test("a match in statement position and as an argument")
+olp_positions_value()
+    olp_prints("val x = 2\n" +
+               "x match\n    1\n    | 2 -> print(\"low\")\n    _ -> print(\"high\")\n" +
+               "print(x match\n    1\n    | 2 -> 100\n    _ -> 0)\n" +
+               "val y = x match\n    1\n    | 2 -> 5\n    _ -> 6\n" +
+               "print(y)\n",
+               "low\n100\n5\n")
+
+@test("a match nested in an arm body takes its own leading bars")
+olp_nested_match_value()
+    olp_prints("f(a: int, b: int) -> int = a match\n    1\n    | 2 ->\n        b match\n            7\n" +
+               "            | 8 -> 1\n            _ -> 2\n    _ -> 3\n" +
+               "print(f(1, 7), f(2, 8), f(2, 9), f(5, 7))\n",
+               "1 1 2 3\n")
+
+// -- no change elsewhere --------------------------------------------------------------------------
+
+@test("a '|' line after a finished arm begins an arm and is never joined to its body")
+olp_after_a_body_value()
+    olp_prints("f(x: int) -> int = x match\n    1 -> 10\n    | 2 -> 5\n    _ -> 0\n" +
+               "print(f(1), f(2), f(3))\n",
+               "10 5 0\n")
+    olp_same("f(x: int) -> int = x match\n    1 -> 10\n    | 2 -> 5\n    _ -> 0\n",
+             "f(x: int) -> int = x match\n    1 -> 10\n    2 -> 5\n    _ -> 0\n")
+
+@test("a '|' inside brackets is still the bitwise operator across lines")
+olp_bitor_in_brackets_value()
+    olp_prints("val a = 1\nval b = 2\nprint((a\n    | b), 4 |\n    8)\n" +
+               "print(5 match\n    5 -> (a\n        | b)\n    _ -> 0)\n",
+               "3 12\n3\n")
+
+@test("a body line starting with '|' outside brackets is still not an expression continuation")
+olp_body_bar_line_refused()
+    olp_refuses("f(x: int) -> int = x match\n    1 -> x\n        | 2\n    _ -> 0\n")
+    olp_refuses("val a = 1\nval b = a\n| 2\n")
+
+// -- the refusals ---------------------------------------------------------------------------------
+
+@test("a '|' with nothing after it is a missing pattern")
+olp_bar_alone_refused()
+    assert_eq(pf_err("f(x: int) -> int = x match\n    1\n    | -> 10\n    _ -> 0\n"), "a pattern expected")
+    assert_eq(pf_err("f(x: int) -> int = x match\n    | -> 10\n    _ -> 0\n"), "a pattern expected")
+    assert_eq(pf_err("f(x: int) -> int = x match\n    1 |\n    -> 10\n    _ -> 0\n"), "a pattern expected")
+
+@test("'||' is never an alternative separator, leading or trailing")
+olp_double_bar_refused()
+    olp_refuses("f(x: int) -> int = x match\n    1\n    || 2 -> 10\n    _ -> 0\n")
+    olp_refuses("f(x: int) -> int = x match\n    || 1 -> 10\n    _ -> 0\n")
+    olp_refuses("f(x: int) -> int = x match\n    1 || 2 -> 10\n    _ -> 0\n")
+
+@test("a leading '|' line that never reaches an arrow is refused")
+olp_unfinished_refused()
+    olp_refuses("f(x: int) -> int = x match\n    1\n    | 2\n    _ -> 0\n")
