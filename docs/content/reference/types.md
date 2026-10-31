@@ -707,6 +707,19 @@ true true false
 Ok(()) Err(Low)
 ```
 
+`()` is also the type's spelling, wherever a type is written: `Result[(), E]` is `Result[unit, E]`, and `-> ()` returns `unit`.
+
+```sysl
+done() -> Result[(), string] = Ok(())
+
+val u: () = ()
+print(done(), u == ())
+```
+
+```output
+Ok(()) true
+```
+
 **A `unit` still has an address.** `&` of a `unit` binding is a `*unit`, and a `&unit` or a `weak
 unit` may hold one, as at every zero-sized type: the address is non-null and aligned, a load through
 it is `()` and a store writes nothing, so neither touches memory. This is what lets a generic body
@@ -1275,7 +1288,7 @@ where the parts alone do not determine it, as anywhere else.
 [tuple pattern](/reference/patterns/) in a `match`.
 
 **Arity starts at two.** There is no one-tuple: `(x)` is a parenthesized expression, since a
-one-element product is just the element. There is no zero-tuple either; `unit` fills that role.
+one-element product is just the element. There is no zero-tuple either; `unit` fills that role, and `()` in a type is `unit`.
 
 ### A nested part needs parentheses
 

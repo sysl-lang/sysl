@@ -518,6 +518,46 @@ fsh_io_error_message_needs_no_snprintf()
     lbr_drop([p, out])
 end fsh_io_error_message_needs_no_snprintf
 
+// A program pushing to a `Buf` it made and to one in zeroed memory, supplying no `putchar` and no
+// `exit`: a push's growth path reports a handle naming nothing, and on bare metal that report traps.
+private val fsh_pushes: string = raw"""
+    import sysl.buf.{Buf, buf}
+    import sysl.raw.ptr_cast
+
+    run() -> int
+        var b: Buf[int] = buf()
+
+        for i in 0..<40 do b.push(i)
+
+        var raw: [1]usize = [0]
+        val p: *Buf[u8] = ptr_cast(&raw[0])
+
+        if b.len() > 50 then p.push(1)
+
+        int(b.len() + p.len())
+    end run
+    """
+
+@test("a freestanding program pushing to a Buf links with no putchar, no exit and no C library symbol")
+fsh_buf_push_needs_no_libc()
+    if !fsh_link_ready() then return
+
+    val p = fsh_tree(fsh_pushes + fsh_runtime)
+    val (said, out) = fsh_build(p)
+
+    assert(said.0 == 0, said.1)
+
+    val elf = s"$out/img.elf"
+    val all = fsh_symbols(elf, false)
+
+    assert_eq(fsh_symbols(elf, true).trim(), "")
+
+    for name in ["putchar", "exit", "fwrite", "printf", "abort"]
+        assert(!fsh_names(all, name), s"'$name' is in the image")
+
+    lbr_drop([p, out])
+end fsh_buf_push_needs_no_libc
+
 // A program rendering integers through `sysl.fmt.hex`, `binary` and `octal` at three widths.
 private val fsh_hex_helpers: string = raw"""
     import sysl.fmt.hex
@@ -598,8 +638,7 @@ fsh_every_specifier_needs_no_libc()
             int(f"${1.5}%.2f".bytes.len) + int(f"${s}%5s".bytes.len) + int(f"${7}%03d".bytes.len)
         end run
 
-        // The text is written into a `Buf`, whose report of a container never given storage prints
-        // and exits, so the image says where a character goes and what ending the program is.
+        // The image says where a character goes and what ending the program is, as a kernel does.
         @export("putchar")
         put_char(c: int) -> int = c
 
@@ -641,9 +680,7 @@ private val fsh_floats: string = raw"""
         int(text.bytes.len)
     end run
 
-    // The digits are written into a `Buf`, whose report of a container never given storage prints
-    // and exits, so the image says where a character goes and what ending the program is -- as a
-    // kernel does.
+    // The image says where a character goes and what ending the program is, as a kernel does.
     @export("putchar")
     put_char(c: int) -> int = c
 
