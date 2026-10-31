@@ -47,7 +47,7 @@ The module is seven files, and the boundaries between them are arguments rather 
 | `utf8.sysl` | `from_utf8`, `from_utf8_lossy`, `Utf8Error`, `char_from_u32`, `from_cstring`, `is_char_boundary`, `Chars`, `CharIndices` | the validity seam — what turns bytes into text |
 | `ascii.sysl` | trait `Ascii`, implemented for `u8` **and** `char` | classification, **named for the range it answers over** |
 | `find.sysl` | trait `Search`, implemented for `string` **and** `[]const u8` | everything that makes **no new bytes** |
-| `edit.sysl` | `split`, `fields`, `join` (and trait `Join`, the same as a member of `[]const string`), `repeat`, `replace_all`, `to_upper`, `to_lower` | everything that **does** — so it needs an allocator |
+| `edit.sysl` | `split`, `fields`, `lines`, `join` (and trait `Join`, the same as a member of `[]const string`), `repeat`, `replace_all`, `to_upper`, `to_lower` | everything that **does** — so it needs an allocator |
 | `parse.sysl` | `ParseError`, `parse_bool`/`int`/`long`/`uint`/`ulong`/`real` and the `_base` forms, each over a `string` and over a `[]const u8` | the direction `x.to_string()` does not go |
 | `build.sysl` | `StrBuilder`, `CString`, `str_builder_with_capacity` | gathering text, and the copy C reads |
 | `width.sysl` | `char_columns`, `columns` | **data, not algorithm** — 499 ranges of the Unicode Character Database |
@@ -570,7 +570,7 @@ locale-sensitive in any case; casing is where that bites, and `to_upper` says so
 
 ## The half that allocates
 
-`split`, `fields`, `join`, `repeat`, `replace_all`, `to_upper` and `to_lower` are free functions over
+`split`, `fields`, `lines`, `join`, `repeat`, `replace_all`, `to_upper` and `to_lower` are free functions over
 `string`, not members of `Search`. **A trait default cannot write them** — it would have to build a
 `Self` out of new bytes, and there is no way for a trait to say how. That is the honest boundary of
 the write-it-once trick, and it falls exactly where the allocator does.
@@ -596,6 +596,32 @@ x-y-z
 ababab true
 ba
 HÉLLO héllo
+```
+
+**Every one of them but `join` is also a member of `string`**, through the `Text` trait, which is in
+scope without an import like `Search`: `s.split(",")`, `s.fields()`, `s.lines()`, `s.repeat(n)`,
+`s.replace_all(old, new)`, `s.to_upper()`, `s.to_lower()`, and the `_fold` family as `s.eq_fold(t)`,
+`s.starts_with_fold(p)`, `s.ends_with_fold(p)`, `s.contains_fold(n)`. A method answers what its free
+function answers, the free functions stay, and the calls chain. A program's own `split` function, or
+its own trait's `split` on `string`, is unaffected: a free function is not a member, and a trait the
+file declares or imports is searched before the library's.
+
+```sysl
+var line = "  alpha,beta,,gamma  "
+
+print(line.trim().split(",").len)
+print("one\r\ntwo\nthree\n".lines().len)
+print("  one   two  ".fields().join("|"))
+print("ab".repeat(2).to_upper(), "Straße".eq_fold("STRASSE"))
+print("xx a,b yy"[3..<6].split(",").join("+"))
+```
+
+```output
+4
+3
+one|two
+ABAB true
+a+b
 ```
 
 **`join` is a member of any slice, array or `Buf` of printable elements**, through the `Join` trait,
@@ -669,6 +695,28 @@ between them and a separator at either end yields an empty piece outside it, so 
 pieces of which the third is empty. `fields` is not `split` on a space: a run of whitespace separates
 two fields rather than producing empty ones between them, which is what reading a line of columns
 wants.
+
+**`lines` is the reader's split.** It cuts at `\n`, drops a `\r` just before it, yields a last line
+that has no terminator, and does not invent an empty line after a final terminator, so `"a\n"` is one
+line where `split("a\n", "\n")` is two. An empty string has no lines, and a lone `\r` not followed by
+`\n` stays in its line. The lines are views, as `split`'s pieces are.
+
+```sysl
+import sysl.text.lines
+
+for l in lines("one\r\ntwo\n\nlast")
+    print(l.len, l == "two")
+
+print(lines("a\n").len, lines("").len, lines("a\rb")[0].len)
+```
+
+```output
+3 false
+3 true
+0 false
+4 false
+1 0 3
+```
 
 **What splitting hands back are views.** A piece shares the bytes of the string it came from and
 costs a retain, so `split` allocates the *vector* and not the text. The older sysl copied every
