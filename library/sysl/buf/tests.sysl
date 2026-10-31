@@ -1084,3 +1084,160 @@ zeroed_spare_is_empty()
     assert_eq(p.spare().len, 0)
     p.set_len(0)
     assert_eq(p.len(), 0)
+
+// -- a handle naming nothing, through the members that read the shared empty core -------------------
+//
+// `len`, `cap`, `view`, `pop`, `truncate`, `clear` and `push` read through the shared empty core when
+// the handle names nothing, rather than branching around it. None of them may write it, and `push`
+// has to be refused on its growth path, at every kind of element.
+
+@test("truncate and clear of a handle naming nothing write nothing anywhere")
+zeroed_truncate_and_clear_write_nothing()
+    var raw = zeroed_word()
+    val p: *Buf[int] = ptr_cast(&raw[0])
+
+    p.truncate(0)
+    p.truncate(5)
+    p.clear()
+    assert_eq(p.len(), 0)
+    assert(p.pop().is_none())
+    assert_eq(raw[0], 0)
+    assert_eq(NoCore[0] + NoCore[1] + NoCore[2] + NoCore[3], 0)
+
+@test("a handle naming nothing, of counted elements, reads as empty")
+zeroed_counted_reads_empty()
+    var raw = zeroed_word()
+    val p: *Buf[&Probe] = ptr_cast(&raw[0])
+
+    assert(p.pop().is_none())
+    p.clear()
+    assert_eq(p.len(), 0)
+    assert_eq(p.cap(), 0)
+    assert_eq(p.view().len, 0)
+    assert_eq(NoCore[0] + NoCore[1] + NoCore[2] + NoCore[3], 0)
+
+@test(should_trap)
+zeroed_push_counted_panics()
+    var raw = zeroed_word()
+    val p: *Buf[&Probe] = ptr_cast(&raw[0])
+
+    p.push(Probe(1))
+
+private var dropped_count: int = 0
+
+struct Dropped
+    n: int
+
+impl Drop for Dropped
+    drop(self)
+        dropped_count += 1
+
+@test("a handle naming nothing, of elements with a destructor, reads as empty and runs none")
+zeroed_drop_elements()
+    var raw = zeroed_word()
+    val p: *Buf[&Dropped] = ptr_cast(&raw[0])
+    val before = dropped_count
+
+    assert(p.pop().is_none())
+    p.truncate(0)
+    p.clear()
+    assert_eq(p.len(), 0)
+    assert_eq(dropped_count, before)
+
+    *p = buf()
+    p.push(Dropped(1))
+    p.push(Dropped(2))
+    p.pop()
+    assert_eq(dropped_count, before + 1)
+    p.release()
+    assert_eq(dropped_count, before + 2)
+    assert_eq(raw[0], 0)
+
+@test(should_trap)
+zeroed_push_drop_panics()
+    var raw = zeroed_word()
+    val p: *Buf[&Dropped] = ptr_cast(&raw[0])
+
+    p.push(Dropped(1))
+
+@test(should_trap)
+zeroed_push_wide_panics()
+    var raw = zeroed_word()
+    val p: *Buf[(int, real, string)] = ptr_cast(&raw[0])
+
+    p.push((1, 2.5, "x"))
+
+@test(should_trap)
+released_push_panics()
+    var b: Buf[int] = buf()
+
+    b.push(1)
+    b.release()
+    b.push(2)
+
+struct HoldsBuf
+    tag: int
+    items: Buf[int]
+
+@test("a Buf field of a zeroed struct is empty until assigned, then takes pushes and pops")
+zeroed_struct_field()
+    var raw: [2]usize = [0, 0]
+    val h: *HoldsBuf = ptr_cast(&raw[0])
+
+    assert_eq(h.items.len(), 0)
+    assert(h.items.pop().is_none())
+    h.items.clear()
+
+    h.items = buf()
+    h.items.push(4)
+    h.items.push(5)
+    assert_eq(h.items.pop(), Some(5))
+    assert_eq(h.items.len(), 1)
+
+    h.items.release()
+    assert_eq(raw[1], 0)
+    assert_eq(h.items.len(), 0)
+
+@test("a buffer emptied by clear or truncate keeps its storage and takes pushes again")
+emptied_takes_pushes()
+    var b: Buf[&Probe] = buf()
+
+    for i in 0..<9 do b.push(Probe(i))
+
+    val room = b.cap()
+
+    b.clear()
+    b.push(Probe(10))
+    assert_eq(b.len(), 1)
+    b.truncate(0)
+    assert(b.pop().is_none())
+    b.push(Probe(11))
+    assert_eq(b.at(0).n, 11)
+    assert_eq(b.cap(), room)
+
+@test("a second name of a frozen buffer is empty and takes pushes")
+frozen_other_name_takes_pushes()
+    var b: Buf[int] = buf()
+    val other = b
+
+    b.push(1)
+
+    val f = b.freeze()
+
+    assert(other.pop().is_none())
+    other.push(2)
+    assert_eq(other.len(), 1)
+    assert_eq(f.len(), 1)
+
+private var module_buf: Buf[int] = buf()
+
+@test("a buffer in module storage pushes, pops and clears")
+module_storage_buffer()
+    module_buf.push(1)
+    module_buf.push(2)
+    assert_eq(module_buf.pop(), Some(2))
+    module_buf.clear()
+    assert_eq(module_buf.len(), 0)
+    module_buf.push(3)
+    assert_eq(module_buf.view(), [3])
+    module_buf.clear()

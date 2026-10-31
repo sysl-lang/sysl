@@ -314,6 +314,51 @@ end ctr_should_trap
 
 // -- bare metal -------------------------------------------------------------------------------------
 
+// A Buf's readers and `push` work through the shared empty core when a handle names nothing, so that
+// core has to be plain zeroed data on a target with no start-up code to fill it, and `push`'s refusal
+// on it has to compile there too.
+@test("on a bare-metal target a Buf's members over a zeroed handle compile, the empty core being zeroed data")
+ctr_bare_metal_buf()
+    val t = target_named("thumb-freestanding-softfp").unwrap()
+    val cc = find_backend_clang(t) match
+        Err(why) ->
+            skip(why)
+            return
+        Ok(found) -> found
+
+    val dir = make_temp_dir("sysl-ctr").unwrap()
+
+    write_text(s"$dir/main.sysl",
+               "import sysl.buf.Buf\nimport sysl.raw.ptr_cast\n\n@export(\"main\")\nentry(n: usize) -> int\n" +
+               "    var raw: [1]usize = [0]\n    val p: *Buf[int] = ptr_cast(&raw[0])\n\n" +
+               "    p.truncate(n)\n    p.clear()\n    var got = int(p.len() + p.cap() + p.view().len)\n\n" +
+               "    got += p.pop().unwrap_or(5)\n    if n > 3 then p.push(1)\n    got\n").unwrap()
+
+    val text = emit_llvm_text(dir, Some("thumb-freestanding-softfp"), DefaultOptimization, buf(), Some(buf())) match
+        Err(why) -> s"did not compile: ${failure_text(why)}"
+        Ok(e) -> if e.report.is_empty() then e.text else s"did not compile: ${analysis_report(e.report)}"
+
+    assert(!text.starts_with("did not compile"), text)
+
+    var core: Buf[string] = buf()
+
+    for l in split(text, "\n")
+        if l.contains("NoCore") && l.contains(" global ") then core.push(l)
+
+    assert_eq(core.len(), 1, text)
+    assert(core.at(0).contains("zeroinitializer") || core.at(0).contains("[i32 0, i32 0, i32 0, i32 0]"),
+           core.at(0))
+
+    val obj = s"$dir/probe.o"
+    val made = compile_object(cc, text, obj, t, "2")
+
+    remove_dir_all(dir).unwrap_or(())
+
+    made match
+        Err(why) -> assert(false, why)
+        Ok(_) -> ()
+end ctr_bare_metal_buf
+
 private val CtrNm: string = "/opt/homebrew/opt/llvm/bin/llvm-nm"
 
 @test("on a bare-metal target a Ring's index past the count reports through the weak default and traps, linking nothing more")

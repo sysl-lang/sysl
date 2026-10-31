@@ -205,6 +205,33 @@ zsh_growing_a_zeroed_container_panics()
         assert(said.ends_with("exit 1\n") && !said.contains("never\n"), said)
 end zsh_growing_a_zeroed_container_panics
 
+// A `Buf`'s `push` reads through the shared empty core when the handle names nothing, and is refused
+// on the growth path that core always sends it down -- so the refusal is asked for at every kind of
+// element `push` places differently, unoptimized and optimized, and after the reads that go through
+// the same core, which must leave it able to refuse.
+@test("pushing to a zeroed Buf panics, saying so, at every element kind and optimization level")
+zsh_zeroed_buf_push_every_element()
+    if !zsh_ready() then return
+
+    val kinds = [("int", "7"), ("&Node", "Node(7)"), ("&Noted", "Noted(7)"), ("(int, real, string)", "(7, 1.5, \"s\")")]
+
+    for i in 0..<kinds.len
+        val k = kinds[i]
+        val text = s"import sysl.buf.Buf\n\nextern \"calloc\" c_calloc(n: usize, size: usize) -> *u8\n\n" +
+                   s"struct Node\n    v: int\n\nstruct Noted\n    v: int\n\nimpl Drop for Noted\n" +
+                   s"    drop(self)\n        print(\"dropped\", self.v)\n\nstruct Holder\n    tag: int\n" +
+                   s"    c: Buf[${k.0}]\n\nval p: *Holder = ptr_cast(c_calloc(1, sizeof(Holder)))\n" +
+                   s"p.c.clear()\np.c.truncate(3)\nprint(p.c.len(), p.c.cap(), p.c.pop().is_none(), p.c.view().len)\n" +
+                   s"p.c.push(${k.1})\nprint(\"never\")\n"
+
+        for level in ["0", DefaultOptimization]
+            val said = zsh_ran_at(text, level)
+
+            assert(said.starts_with("0 0 true 0\n"), said)
+            assert(said.contains("panic: this Buf was never given storage -- assign `buf()` to it first"), said)
+            assert(said.ends_with("exit 1\n") && !said.contains("never\n"), said)
+end zsh_zeroed_buf_push_every_element
+
 // -- is_null --------------------------------------------------------------------------------------
 
 // The emitted text of a one-file program, or every diagnostic it earned, one to a line.
