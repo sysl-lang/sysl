@@ -2362,7 +2362,28 @@ private gen_sysop(e: *Emit, op: string, name: string, args: Buf[TExpr]) -> Val
 
     if op == "tlbi" || op == "dc" || op == "ic" || op == "at" then return gen_maintenance(e, op, name, args)
 
-    val symbol = llvm_aarch64_barrier_entry(op).unwrap().base
+    val arm = e.target.cpu == Thumb
+
+    if hint_form(op)
+        // RISC-V has no intrinsic for either of its two, so each is the instruction as `sideeffect`
+        // assembly clobbering memory -- the order every other processor's intrinsic keeps.
+        if e.target.cpu == Riscv64 || e.target.cpu == Riscv32
+            emit(e, InAsm(None, LVoid, op, "~{memory}", buf()))
+            return VNothing
+
+        val hint = if arm then llvm_arm_hint_entry().base else llvm_aarch64_hint_entry().base
+
+        return gen_immediate_call(e, hint, hint_number(op))
+
+    val barrier = if arm then llvm_arm_barrier_entry(op) else llvm_aarch64_barrier_entry(op)
+
+    gen_immediate_call(e, barrier.unwrap().base, barrier_option(name).unwrap_or(15))
+end gen_sysop
+
+// A call of an intrinsic whose one operand is an `i32` immediate: a barrier's option, or a hint's
+// number. The intrinsic is not one LLVM knows to leave memory alone, which is what keeps the
+// accesses around it in place.
+private gen_immediate_call(e: *Emit, symbol: string, n: int) -> Val
     var params: Buf[IrParam] = buf()
 
     params.push(ir_param(LInt(32)))
@@ -2370,10 +2391,18 @@ private gen_sysop(e: *Emit, op: string, name: string, args: Buf[TExpr]) -> Val
 
     var ops: Buf[IrArg] = buf()
 
-    ops.push(ir_arg(LInt(32), VInt(from_int(long(barrier_option(name).unwrap_or(15))))))
+    ops.push(ir_arg(LInt(32), VInt(from_int(long(n)))))
     emit(e, ir_call(None, LVoid, VGlobal(symbol), ops))
     VNothing
-end gen_sysop
+end gen_immediate_call
+
+// A hint's number in the architecture's hint space, the same on AArch64 and Thumb.
+private hint_number(op: string) -> int =
+    if op == "nop" then 0
+    else if op == "wfe" then 2
+    else if op == "wfi" then 3
+    else if op == "sev" then 4
+    else 5
 
 // `sysl.hint.prefetch` (`prefetch.sysl`): the address, then the two numbers the analyzer settled --
 // `codes` is read-or-write and locality, one digit each -- and `1`, the data cache. All three are
