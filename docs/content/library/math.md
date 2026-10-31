@@ -574,8 +574,9 @@ trait MinMax
 as `int`, and each answers in the receiver's own type: a literal argument takes that type, so
 `a.max(300)` on a `u8` is refused as the literal that does not fit. They are written once, as one
 `impl` over the `Integer` family, so unlike `Signed` and `Bits` the membership is the library's and not
-the compiler's. A concrete value reaches them with no import; a generic body asks for them by name,
-`[T: MinMax]`.
+the compiler's. A concrete value reaches them with no import, and so does a generic body bounded by
+`[T: Integer]`, the block covering every type `T` can stand for; `[T: MinMax]` asks for the methods
+alone.
 
 ```sysl
 val a: u8 = 200
@@ -591,6 +592,16 @@ print(wide.max(1) == wide, wide.clamp(0, 9))
 200 100 150
 -1 -50
 true 9
+```
+
+```sysl
+top[T: Integer](a: T, b: T, c: T) -> T = a.max(b).max(c)
+
+print(top(u8(1), 9, 4), top(i512(-1), -9, -4))
+```
+
+```output
+9 -1
 ```
 
 **The methods and the free functions agree except on an inverted range.** `clamp` the method treats

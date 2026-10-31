@@ -1,0 +1,289 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.Buf
+import sysl.fs.remove_dir_all
+import sysl.process.capture
+
+// A blanket `impl` over `Integer`, seen from two places: a refusal at a call, which names the method
+// and the receiver's type as a program knows them; and a generic body, whose `T: Integer` has what the
+// block gives every integer. The value checks matter as much as the acceptance: an instantiated body
+// must reach the member its definition licensed, at a type whose own table offers another of the name.
+//
+// Axes: whose trait (library, same module, imported module); receiver (named width, odd width, alias,
+// subtype, chained expression, local); how the parameter uses it (method, property, handed on);
+// what else offers the name (nothing, another blanket, a bound, a type's own impl).
+
+private bkt_big() -> string =
+    "trait Big\n    big(self, other: Self) -> Self\n    size -> int\n" +
+    "impl[T: Integer] Big for T\n    big(self, other: T) -> T = other\n    size -> int = 3\n"
+
+// What a program of a main file and one module prints, or what the build said.
+private bkt_modules(main: string, text: string) -> string
+    var fs = im_files()
+
+    fs.push(("", "main.sysl", main))
+    fs.push(("lib", "lib.sysl", text))
+
+    val root = im_write(fs)
+    val exe = root + "/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            val said = failure_text(why)
+
+            remove_dir_all(root).unwrap_or(())
+            return said
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true, 20000)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end bkt_modules
+
+// -- what a refusal says ------------------------------------------------------------------------------
+
+@test("an argument of the wrong type names the trait's method and the receiver's written type")
+bkt_mismatch_wording()
+    if !enm_ready() then return
+
+    val one = enm_err("main()\n    val a: i8 = 1\n    val b: u8 = 2\n    print(a.max(b))\n")
+    val two = enm_err("main()\n    val a: u8 = 1\n    val b: i8 = 2\n    print(a.max(b))\n")
+
+    assert(enm_says(one, "'other' of method 'MinMax.max' is i8, but u8 was given"), one)
+    assert(enm_says(two, "'other' of method 'MinMax.max' is u8, but i8 was given"), two)
+    assert(!enm_says(one, "bound."), one)
+
+@test("a literal too wide is told the receiver's type, never the block's parameter")
+bkt_literal_wording()
+    if !enm_ready() then return
+
+    val named = enm_err("main()\n    val a: u8 = 1\n    print(a.max(300))\n")
+    val byte_named = enm_err("main()\n    val a: byte = 1\n    print(a.clamp(0, 300))\n")
+    val alias = enm_err("type Tiny = u8\nmain()\n    val a: Tiny = 1\n    print(a.min(300))\n")
+
+    assert(enm_says(named, "the literal 300 does not fit u8"), named)
+    assert(enm_says(byte_named, "the literal 300 does not fit byte"), byte_named)
+    assert(enm_says(alias, "the literal 300 does not fit Tiny (aka byte)"), alias)
+
+@test("an odd width and an alias are named as written in a mismatch")
+bkt_odd_width_wording()
+    if !enm_ready() then return
+
+    val odd = enm_err("main()\n    val a: u12 = 1\n    val b: i8 = 2\n    print(a.max(b))\n")
+    val alias = enm_err("type Tiny = u8\nmain()\n    val a: Tiny = 1\n    val b: i8 = 2\n    print(a.clamp(b, b))\n")
+    val wide = enm_err("main()\n    val a: u256 = 1\n    print(a.max(-1))\n")
+
+    assert(enm_says(odd, "'other' of method 'MinMax.max' is u12, but i8 was given"), odd)
+    assert(enm_says(alias, "'lo' of method 'MinMax.clamp' is Tiny (aka byte), but i8 was given"), alias)
+    assert(enm_says(wide, "does not fit u256"), wide)
+
+@test("a user's blanket is named the same way")
+bkt_user_blanket_wording()
+    if !enm_ready() then return
+
+    val mismatch = enm_err(bkt_big() + "main()\n    val a: u8 = 1\n    val b: i8 = 2\n    print(a.big(b))\n")
+    val literal = enm_err(bkt_big() + "main()\n    val a: u8 = 1\n    print(a.big(300))\n")
+    val called = enm_err(bkt_big() + "main()\n    print(5.size())\n")
+
+    assert(enm_says(mismatch, "'other' of method 'Big.big' is u8, but i8 was given"), mismatch)
+    assert(enm_says(literal, "the literal 300 does not fit u8"), literal)
+    assert(enm_says(called, "'size' is a property of 'Big'"), called)
+
+@test("a blanket's member with parameters of its own is named by its trait too")
+bkt_generic_member_wording()
+    if !enm_ready() then return
+
+    val out = enm_err("trait G\n    g[U](self, n: Self, u: U) -> U\nimpl[T: Integer] G for T\n" +
+                      "    g[U](self, n: T, u: U) -> U = u\nmain()\n    val a: u8 = 1\n    val b: i8 = 2\n" +
+                      "    print(a.g(b, 3))\n")
+
+    assert(enm_says(out, "'n' of 'G.g' is"), out)
+    assert(!enm_says(out, "@bound"), out)
+
+@test("a literal at a generic type's own member no longer quotes the block's parameter")
+bkt_shape_literal_wording()
+    if !enm_ready() then return
+
+    val out = enm_err("struct Box[T]\n    v: T\nimpl[T] Box[T]\n    put(self, v: T) -> T = v\n" +
+                      "main()\n    print(Box[u8](1).put(300))\n")
+
+    assert(enm_says(out, "the literal 300 does not fit"), out)
+    assert(!enm_says(out, "fit T"), out)
+
+// -- a generic body ------------------------------------------------------------------------------------
+
+@test("a body bounded by Integer reaches max, min and clamp, by value")
+bkt_body_by_value()
+    if !enm_ready() then return
+
+    val out = enm_ran("f[T: Integer](a: T, b: T) -> T = a.max(b)\n" +
+                      "g[T: Integer](a: T, lo: T, hi: T) -> T = a.clamp(lo, hi).min(hi)\n" +
+                      "m[T: Integer](a: T, b: T) -> T = a.min(b)\n" +
+                      "main()\n    print(f(u8(3), 9), f(i8(-3), -9), f(i512(-7), -9) == -7)\n" +
+                      "    print(g(u12(4000), 1, 10), g(-5, 1, 10), m(u8(3), 9), m(-3, -9))\n")
+
+    assert(enm_says(out, "9 -3 true\n10 1 3 -9"), out)
+
+@test("a body's alias and subtype receivers answer as their base")
+bkt_body_alias_and_subtype()
+    if !enm_ready() then return
+
+    val out = enm_ran("type Level = int within 0..10\ntype Meters = i16\n" +
+                      "f[T: Integer](a: T, b: T) -> T = a.max(b)\n" +
+                      "main()\n    val m: Meters = -4\n    val l: Level = 3\n    print(f(m, 5), f(l, l))\n")
+
+    assert(enm_says(out, "5 3"), out)
+
+@test("a local copy and a chained result of a parameter reach the method too")
+bkt_body_other_receivers()
+    if !enm_ready() then return
+
+    val out = enm_ran("f[T: Integer](a: T, b: T) -> T\n    val c = a\n    c.max(b)\n" +
+                      "g[T: Integer + Add](a: T, b: T) -> T = (a + b).max(b)\n" +
+                      "main()\n    print(f(u8(3), 5), g(u8(3), 5))\n")
+
+    assert(enm_says(out, "5 8"), out)
+
+@test("a parameter bounded by Integer is handed to a function asking MinMax")
+bkt_handed_on()
+    if !enm_ready() then return
+
+    val out = enm_ran("import sysl.math.MinMax\nneed[U: MinMax](a: U, b: U) -> U = a.max(b)\n" +
+                      "f[T: Integer](a: T, b: T) -> T = need(a, b)\nmain()\n    print(f(u8(3), 9), f(-3, -9))\n")
+
+    assert(enm_says(out, "9 -3"), out)
+
+@test("a user's blanket reaches a body, as a method, a property and a bound")
+bkt_user_blanket_body()
+    if !enm_ready() then return
+
+    val out = enm_ran(bkt_big() + "need[U: Big](a: U, b: U) -> U = a.big(b)\n" +
+                      "f[T: Integer](a: T, b: T) -> T = a.big(b)\ng[T: Integer](a: T) -> int = a.size\n" +
+                      "h[T: Integer](a: T, b: T) -> T = need(a, b)\nmain()\n    print(f(u8(3), 5), g(9), h(i8(1), 2))\n")
+
+    assert(enm_says(out, "5 3 2"), out)
+
+@test("a blanket in an imported module reaches a body in the importer")
+bkt_imported_module()
+    val lib = "module lib\ntrait Far\n    far(self) -> int\nimpl[T: Integer] Far for T\n    far(self) -> int = 7\n"
+    val out = bkt_modules("import lib.Far\nf[T: Integer](a: T) -> int = a.far()\nprint(f(u8(1)))\n", lib)
+
+    assert_eq(out, "7\n")
+
+@test("a blanket the file does not import is reached as on a concrete receiver")
+bkt_module_not_imported()
+    val lib = "module lib\ntrait Far\n    far(self) -> int\nimpl[T: Integer] Far for T\n    far(self) -> int = 7\n"
+    val out = bkt_modules("f[T: Integer](a: T) -> int = a.far()\nprint(f(u8(1)), u8(1).far())\n", lib)
+
+    assert_eq(out, "7 7\n")
+
+@test("a body in the blanket's own module works at a type the importer chose")
+bkt_body_in_the_module()
+    val lib = "module lib\ntrait Far\n    far(self) -> int\nimpl[T: Integer] Far for T\n    far(self) -> int = 7\n" +
+              "pub_far[T: Integer](a: T) -> int = a.far()\n"
+    val out = bkt_modules("print(lib.pub_far(i16(1)))\n", lib)
+
+    assert_eq(out, "7\n")
+
+// -- what stays refused --------------------------------------------------------------------------------
+
+@test("a parameter with an unrelated bound is still refused, as a call and as an argument")
+bkt_unrelated_bound()
+    if !enm_ready() then return
+
+    val call = enm_err("f[T: Display](a: T, b: T) -> T = a.max(b)\nmain()\n    print(f(3, 4))\n")
+    val handed = enm_err("import sysl.math.MinMax\nneed[U: MinMax](a: U, b: U) -> U = a.max(b)\n" +
+                         "f[T: Display](a: T, b: T) -> T = need(a, b)\nmain()\n    print(f(3, 4))\n")
+
+    assert(enm_says(call, "'max' needs 'T: MinMax'"), call)
+    assert(enm_says(handed, "'need' requires its type parameter 'U' to implement 'MinMax'"), handed)
+
+@test("a blanket whose own condition the parameter does not meet is still refused")
+bkt_condition_unmet()
+    if !enm_ready() then return
+
+    val block = "trait Zed\n    zed(self) -> Self\ntrait Cond\n    cond(self) -> int\n" +
+                "impl[T: Integer + Zed] Cond for T\n    cond(self) -> int = 1\n"
+    val call = enm_err(block + "f[T: Integer](a: T) -> int = a.cond()\nmain()\n    print(f(3))\n")
+    val handed = enm_err(block + "need[U: Cond](a: U) -> int = 1\nf[T: Integer](a: T) -> int = need(a)\n" +
+                         "main()\n    print(f(3))\n")
+
+    assert(enm_says(call, "'cond' needs 'T: Cond'"), call)
+    assert(enm_says(handed, "to implement 'Cond'"), handed)
+
+@test("a blanket whose condition the parameter's own bounds meet applies")
+bkt_condition_met()
+    if !enm_ready() then return
+
+    val out = enm_ran("trait Cond\n    cond(self) -> int\nimpl[T: Integer + Zero] Cond for T\n    cond(self) -> int = 1\n" +
+                      "f[T: Integer + Zero](a: T) -> int = a.cond()\nmain()\n    print(f(3))\n")
+
+    assert(enm_says(out, "1"), out)
+
+@test("two blankets offering a body one name are refused, not picked between")
+bkt_two_blankets_refused()
+    if !enm_ready() then return
+
+    val out = enm_err("trait A\n    top(self) -> int\ntrait B\n    top(self) -> int\n" +
+                      "impl[T: Integer] A for T\n    top(self) -> int = 1\nimpl[T: Integer] B for T\n    top(self) -> int = 2\n" +
+                      "f[T: Integer](a: T) -> int = a.top()\nmain()\n    print(f(3))\n")
+
+    assert(enm_says(out, "'top' on T comes from A and B, and each is in scope here"), out)
+
+@test("a blanket beside an imported MinMax is refused, the file having named both")
+bkt_named_blanket_and_import()
+    if !enm_ready() then return
+
+    val out = enm_err("import sysl.math.MinMax\ntrait Biggest\n    max(self, other: Self) -> Self\n" +
+                      "impl[T: Integer] Biggest for T\n    max(self, other: T) -> T = 1000\n" +
+                      "f[T: Integer](a: T, b: T) -> T = a.max(b)\nmain()\n    print(f(3, 5))\n")
+
+    assert(enm_says(out, "'max' on T comes from MinMax and Biggest, and each is in scope here"), out)
+
+@test("a program's blanket answers ahead of one the file does not name, in a body as at a value")
+bkt_named_blanket_first()
+    if !enm_ready() then return
+
+    val out = enm_ran("trait Biggest\n    max(self, other: Self) -> Self\n" +
+                      "impl[T: Integer] Biggest for T\n    max(self, other: T) -> T = 1000\n" +
+                      "f[T: Integer](a: T, b: T) -> T = a.max(b)\nmain()\n    print(f(3, 5), 3.max(5))\n")
+
+    assert(enm_says(out, "1000 1000"), out)
+
+// -- which code it calls -------------------------------------------------------------------------------
+
+@test("a user's bound on the parameter answers ahead of the blanket")
+bkt_own_bound_first()
+    if !enm_ready() then return
+
+    val out = enm_ran("trait MyMax\n    max(self, other: Self) -> Self\nimpl MyMax for u8\n    max(self, other: u8) -> u8 = 77\n" +
+                      "f[T: Integer + MyMax](a: T, b: T) -> T = a.max(b)\ng[T: MyMax + Integer](a: T, b: T) -> T = a.max(b)\n" +
+                      "main()\n    print(f(u8(3), 4), g(u8(3), 4))\n")
+
+    assert(enm_says(out, "77 77"), out)
+
+@test("an instantiation keeps the blanket its body meant, at a type with its own member of the name")
+bkt_instantiation_keeps_the_blanket()
+    if !enm_ready() then return
+
+    val out = enm_ran("import sysl.math.MinMax\ntrait Biggest\n    max(self, other: Self) -> Self\n" +
+                      "impl Biggest for int\n    max(self, other: int) -> int = 1000\n" +
+                      "f[T: Integer](a: T, b: T) -> T = a.max(b)\ng[T: Integer + Add](a: T, b: T) -> T = (a + b).max(b)\n" +
+                      "h[T: MinMax](a: T, b: T) -> T = a.max(b)\nmain()\n    print(f(3, 5), f(u8(3), 5), g(3, 5), h(3, 5))\n")
+
+    assert(enm_says(out, "5 5 8 5"), out)
+
+@test("outside a generic body the type's own member still answers")
+bkt_concrete_call_unchanged()
+    if !enm_ready() then return
+
+    val out = enm_ran("trait Biggest\n    max(self, other: Self) -> Self\nimpl Biggest for int\n    max(self, other: int) -> int = 1000\n" +
+                      "f[T: Integer](a: T, b: T) -> T = a.max(b)\n" +
+                      "main()\n    print(3.max(5), f(3, 5), u8(3).max(5))\n")
+
+    assert(enm_says(out, "1000 5 5"), out)

@@ -736,7 +736,7 @@ assoc_disagreement(a: &Analysis, tr: Bound, t: Type) -> Option[(string, Type, Op
 end assoc_disagreement
 
 private implements_bound(a: &Analysis, tr: Bound, t: Type) -> bool = t match
-    Abstract(_, bounds) -> bound_promises(a, bounds, tr, t)
+    Abstract(_, bounds) -> bound_promises(a, bounds, tr, t) || blanket_promises(a, bounds, tr, t)
     // **A bound on a pack distributes over its members**, which is the whole of the bound syntax a
     // pack needs: `[..A: Display]` is the ordinary `[T: Display]` read over a list. It is what makes
     // the membership answerable before instantiation -- a tuple implements `Display` when every part
@@ -888,6 +888,81 @@ private bound_promises(a: &Analysis, bounds: Buf[Bound], tr: Bound, t: Type) -> 
 
     false
 end bound_promises
+
+// The blanket keys a **type parameter** is covered by: the family its bounds name, so that every type
+// it may stand for is one the block was written over.
+blanket_keys_of_bounds(a: &Analysis, bounds: Buf[Bound], t: Type) -> Buf[string]
+    var out: Buf[string] = buf()
+    val bs = a.tables.members.blankets
+
+    for i in 0..<bs.len()
+        var covered = false
+
+        for item in bounds
+            val closure = trait_closure(a, item, self_binding(t))
+
+            for j in 0..<closure.len()
+                if closure.at(j).name == bs.at(i) then covered = true
+
+        if covered then out.push(bs.key_at(i))
+
+    out
+end blanket_keys_of_bounds
+
+// Whether a blanket block's own conditions hold of this subject. A parameter meets `impl[T: Integer +
+// Zero] …` only where its own bounds also promise `Zero`: being in the family is not the whole of what
+// that block asked.
+//
+// **A parameter answers a block's condition from its own bounds alone, never through another blanket**,
+// which is what terminates: `impl[T: Integer + X] X for T` asks `X` of the very parameter it would be
+// giving `X` to.
+blanket_condition_met(a: &Analysis, ti: TraitImpl, t: Type) -> bool
+    if !ti.conditional then return true
+
+    if ti.tparams.len() != 1 then return false
+
+    t match
+        Abstract(_, own) ->
+            var terms: Buf[Binding] = buf()
+
+            terms.push(Binding(ti.tparams.at(0), t))
+
+            val wanted = ti.condition()
+
+            for nb in wanted
+                if nb.name == ti.tparams.at(0)
+                    for j in 0..<nb.bounds.len()
+                        val b = nb.bounds.at(j)
+                        val tr = resolve_bound(a, ti.scope, b.span, b, bound_terms(terms, nb.name, t))
+
+                        if !bound_promises(a, own, tr, t) then return false
+
+            return true
+        _ -> ()
+
+    var subst: Buf[Binding] = buf()
+
+    subst.push(Binding(ti.tparams.at(0), t))
+    unmet_condition_of(a, ti, subst).is_none()
+end blanket_condition_met
+
+// **A parameter implements what a blanket block over its family implements**, which is what the block
+// says: `impl[T: Integer] MinMax for T` covers every type `T: Integer` can stand for, so a body may hand
+// its `T` on to something asking `MinMax`. Each instantiation then meets the bound by the same block.
+private blanket_promises(a: &Analysis, bounds: Buf[Bound], tr: Bound, t: Type) -> bool
+    val keys = blanket_keys_of_bounds(a, bounds, t)
+
+    for key in keys
+        var targs: Buf[Type] = buf()
+
+        targs.push(t)
+
+        val row = impl_at(a, tr, key, t, targs)
+
+        if row.is_some() && blanket_condition_met(a, row.unwrap(), t) then return true
+
+    false
+end blanket_promises
 
 private every_satisfies(a: &Analysis, tr: Bound, elems: Buf[Type]) -> bool
     for item in elems
