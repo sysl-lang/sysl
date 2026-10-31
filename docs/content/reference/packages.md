@@ -2114,6 +2114,67 @@ the pinned commit is what every claimant gets — the decision a pin exists to m
 coordinate at different commits are refused**, naming both claimants, since nothing orders two
 commits and the build holds one copy of a package.
 
+### A member of a repository
+
+A coordinate fetches a repository and names its **root** package. A repository that is a
+[workspace](#workspaces) holds other packages too, and `member` names one of them by its directory:
+
+```hocon
+dependencies {
+  sblas-pool { git = "github.com/sysl-lang/sblas", member = "pool-workers", version = "0.5.0" }
+}
+```
+
+The version is the repository's tag — a member is read at the tag its repository is fetched at, so
+`v0.5.0` here — and `rev`, `features`, `optional`, `mount` and `if` read as they do on any other
+entry. The member's directory must hold a `sysl.hocon` at that tag; `member` is written relative to
+the repository's root, as the workspace's own list writes it, and may be nested (`"tools/probe"`).
+
+**A member is a package of its own, named by the repository's coordinate, `//`, and the
+directory**: `github.com/sysl-lang/sblas//pool-workers`. That is what `sysl.sum` records it under,
+what `sysl deps` lists, and what selection goes by, so the root package and each member are
+selected separately, and its modules carry the prefix `github.com.sysl-lang.sblas.pool-workers`. A
+workspace member that gives that coordinate as its `package.repository` is named the same inside its
+own workspace, so moving between the two renames nothing.
+
+**Members of one repository at one tag are one fetch.** The repository is cloned once into
+`<cache>/sysl/pkg/<coordinate>/@v<version>/` and every member is read from its directory there. Each
+member's `sysl.sum` line holds the hash of that whole clone — what was fetched, and what the line is
+checked against — so a member's line and the root's at one tag hold the same digest, and each is
+checked on its own:
+
+```text
+github.com/sysl-lang/sblas v0.5.0 h1:…
+github.com/sysl-lang/sblas//pool-workers v0.5.0 h1:…
+```
+
+**A member's siblings come from the same repository at the same tag.** Inside its workspace a member
+names another with `{ workspace = true }`, or with a `path` such as `"../util"`; fetched, each of those
+is the sibling's own coordinate at the version the member was fetched at — `sblas { workspace = true
+}` in `pool-workers` is `github.com/sysl-lang/sblas` 0.5.0, the root package. A sibling is then a
+dependency like any other: a consumer asking for `sblas` 0.6.0 itself gets 0.6.0, the highest minimum,
+while the member stays at the tag it was asked for. A `path` that leaves the repository is refused, as
+any fetched package's path dependency is.
+
+A member is only a `git` dependency's; beside a `path` or `workspace = true` it is refused, and so is
+a directory that is not below the repository:
+
+```text
+'dependencies.p' names a 'path' and a 'member' — a member is a directory of the repository a 'git' coordinate fetches, and a path dependency names its directory itself: write the member's directory into the 'path'
+'dependencies.p.member' is '../x', which is not a directory below the repository — a member is written relative to the repository's root, as its workspace lists it; leave 'member' out to name the root package
+```
+
+A member not in the repository at that tag, or a directory there that is no package, is refused when
+it is fetched:
+
+```text
+github.com/e/rep v0.1.0 has no member 'late' — there is no directory 'late' in the repository at that version
+github.com/e/rep v0.1.0 has a directory 'notpkg' and no sysl.hocon in it — a member is a package, and a package is a directory holding one
+```
+
+A `--lib` root or a path dependency stands in for a repository's root package by its `package.name`
+([below](#a-source-root-stands-in-for-the-package-it-is)), never for a member.
+
 ### Dependencies a test alone needs
 
 A package's own suite often reaches for something no consumer of it should have to install — a second
@@ -3092,7 +3153,11 @@ the newest tag is:
 ```text
 sysl add github.com/sysl-lang/sdl3
 sysl add github.com/sysl-lang/sdl3@0.3.1
+sysl add github.com/sysl-lang/sblas//pool-workers@0.5.0
 ```
+
+A [member of a repository](#a-member-of-a-repository) is written as its coordinate is, after `//`,
+and lands as `git` and `member`, labelled by the last segment of its directory.
 
 The version comes from `git ls-remote --tags`, so it works for any host a build can clone from. The
 manifest is rewritten one run of bytes at a time, which is why your comments and layout survive it,

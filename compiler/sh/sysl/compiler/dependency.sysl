@@ -2,7 +2,7 @@ module sh.sysl.compiler
 
 import sh.sysl.hocon.Value
 import sysl.buf.{Buf, buf}
-import sysl.text.{join, Search}
+import sysl.text.{join, split, Search}
 
 // Where a dependency's source comes from.
 //
@@ -14,6 +14,8 @@ enum Origin
     // A repository and the version to read it at. The coordinate carries the `/vN` suffix where
     // there is one, because a major version is *part of the identity* rather than a decoration on
     // it -- `github.com/e/json` and `github.com/e/json/v2` are two packages that may both be linked.
+    // A `member` of the repository rides in it too, after `//` (`member_coordinate`), being as much a
+    // different package as a different major is.
     Git(coordinate: string, version: Release)
 
     // A directory beside the consumer, for a package being developed alongside what uses it.
@@ -228,11 +230,41 @@ is_git_dependency(dep: &Dependency) -> bool = dependency_coordinate(dep).is_some
 // package should be fetchable by someone who has no account anywhere.
 clone_url(coordinate: string) -> string = s"https://${without_major(coordinate)}.git"
 
-// The coordinate with its `/vN` suffix removed, which is the repository itself.
-without_major(coordinate: string) -> string
-    major_suffix(coordinate) match
+// **A member of a repository is named by the repository's coordinate, `//`, and the member's
+// directory** -- `github.com/sysl-lang/sblas//pool-workers`, the spelling Terraform gives a
+// subdirectory of a module source. It is what `member = "pool-workers"` beside `git` reads as, and it
+// is the identity selection, `sysl.sum` and the canonical prefix go by. A written coordinate never
+// holds `//` (`check_coordinate`), so no coordinate is ever mistaken for a member and none is lost.
+val MemberSeparator: string = "//"
+
+// The repository part of a coordinate, a member's directory set aside.
+coordinate_repository(coordinate: string) -> string
+    coordinate.index_of(MemberSeparator) match
         None -> coordinate
-        Some(_) -> coordinate[0..<last_slash(coordinate)]
+        Some(at) -> coordinate[0..<at]
+end coordinate_repository
+
+// The member directory a coordinate names inside its repository, or the empty string for the
+// repository's root package.
+coordinate_member(coordinate: string) -> string
+    coordinate.index_of(MemberSeparator) match
+        None -> ""
+        Some(at) -> coordinate[(at + MemberSeparator.bytes.len)..<coordinate.bytes.len]
+end coordinate_member
+
+// A repository's coordinate and one of its members joined into the member's own identity; the
+// repository's root package is the coordinate itself.
+member_coordinate(repository: string, member: string) -> string =
+    if member.is_empty() || member == "." then repository else s"$repository$MemberSeparator$member"
+
+// The coordinate with its `/vN` suffix removed, which is the repository itself. A member's directory
+// is set aside first, since the suffix belongs to the repository and not to the directory.
+without_major(coordinate: string) -> string
+    val repository = coordinate_repository(coordinate)
+
+    major_suffix(repository) match
+        None -> repository
+        Some(_) -> repository[0..<last_slash(repository)]
 end without_major
 
 // The repository a coordinate names: its last path segment, with a `/vN` major suffix set aside, so
@@ -248,7 +280,8 @@ end repository_name
 // The major version a coordinate declares in its path, where it declares one. `v0` and `v1` are not
 // suffixes: the first two majors ride in the bare path, so a `github.com/e/json/v1` would be a
 // second spelling of a package that already has one.
-major_suffix(coordinate: string) -> Option[usize]
+major_suffix(written: string) -> Option[usize]
+    val coordinate = coordinate_repository(written)
     val at = last_slash(coordinate)
     val last = coordinate[(if at == coordinate.bytes.len then 0 else at + 1)..<coordinate.bytes.len]
 
@@ -397,7 +430,8 @@ end read_condition_key
 // Every key a dependency entry may write. A table rather than a test, so the cache census
 // (`tests_ckg_cache_key.sysl`) can walk it.
 val DependencyKeys: []const string = ["git", "version", "rev", "path", "mount", "optional", "features",
-                                      "default_features", "workspace", "c_include", "c_defines", "if", "options"]
+                                      "default_features", "workspace", "c_include", "c_defines", "if", "options",
+                                      "member"]
 
 private known_dependency_key(key: string) -> bool = holds_key(DependencyKeys, key)
 
@@ -487,7 +521,8 @@ private read_origin(sub: Value, where: string) -> Result[Origin, string]
             return Err(s"'$where.workspace' is only ever 'true' — leave it out and name a 'git' " +
                 "coordinate or a 'path' instead")
 
-        if has_git || has_path || sub.get("version").is_some() || sub.get("rev").is_some()
+        if has_git || has_path || sub.get("version").is_some() || sub.get("rev").is_some() ||
+           sub.get("member").is_some()
             return Err(s"'$where' names 'workspace = true' and a 'git', 'path' or 'version' as well " +
                 "— a workspace member is the directory the workspace lists, at no version, so it " +
                 "is named by the workspace alone")
@@ -513,13 +548,21 @@ private read_origin(sub: Value, where: string) -> Result[Origin, string]
             return Err(s"'$where' names a 'path' and a 'rev' — a path dependency is the " +
                 "directory as it is now, and there is no repository to pin a commit of")
 
+        // A member picks a directory of a fetched repository; a path already names its directory.
+        if sub.get("member").is_some()
+            return Err(s"'$where' names a 'path' and a 'member' — a member is a directory of the " +
+                "repository a 'git' coordinate fetches, and a path dependency names its directory " +
+                "itself: write the member's directory into the 'path'")
+
         val dir = scalar_text(sub, "path")
 
         if dir.is_empty() then return Err(s"'$where.path' is empty")
 
         return Ok(Local(dir))
 
-    val coordinate = scalar_text(sub, "git")
+    val written = scalar_text(sub, "git")
+    val member = read_member(sub, where)?
+    val coordinate = member_coordinate(written, member)
     val has_rev = sub.get("rev").is_some()
 
     if has_rev && sub.get("version").is_some()
@@ -536,7 +579,7 @@ private read_origin(sub: Value, where: string) -> Result[Origin, string]
             return Err(s"'$where.rev' is '$sha', which is not a commit — a pin is a commit's sha, " +
                 "in lowercase hex, whole or shortened to at least seven digits")
 
-        check_coordinate(coordinate, where)?
+        check_coordinate(written, where)?
         return Ok(Git(coordinate, release_at_rev(sha)))
     end if
 
@@ -548,10 +591,46 @@ private read_origin(sub: Value, where: string) -> Result[Origin, string]
         Err(why) -> return Err(s"'$where.version': $why")
         Ok(v) -> v
 
-    check_coordinate(coordinate, where)?
-    check_major(coordinate, version, where)?
+    check_coordinate(written, where)?
+    check_major(written, version, where)?
     Ok(Git(coordinate, version))
 end read_origin
+
+// An entry's `member`: a directory of the fetched repository, written relative to its root as a
+// workspace's list writes one, or the empty string where the entry names the repository's root
+// package. It may not climb out of the repository, and `.` is refused rather than read as the root,
+// since leaving the key out already says that.
+private read_member(sub: Value, where: string) -> Result[string, string]
+    if sub.get("member").is_none() then return Ok("")
+
+    val dir = sub.get("member").unwrap()
+
+    val text = text_of(dir) match
+        Some(s) -> s
+        None -> return Err(s"'$where.member' is not a string — it is a directory of the repository, " +
+            "in quotes: member = \"pool-workers\"")
+
+    if !is_member_dir(text)
+        return Err(s"'$where.member' is '$text', which is not a directory below the repository — a " +
+            "member is written relative to the repository's root, as its workspace lists it; leave " +
+            "'member' out to name the root package")
+
+    Ok(text)
+end read_member
+
+// Whether text names a directory strictly below a repository's root: segments joined by single `/`,
+// none of them empty, `.` or `..`, and no `:` or `\`, which a directory meant to be the same on
+// every machine has no use for.
+is_member_dir(text: string) -> bool
+    if text.is_empty() || text.index_of("\\").is_some() || text.index_of(":").is_some() then return false
+
+    val parts = split(text, "/")
+
+    for i in 0..<parts.len
+        if parts[i] == "" || parts[i] == "." || parts[i] == ".." then return false
+
+    true
+end is_member_dir
 
 // Whether text is a commit's sha as a pin writes one: lowercase hex, from git's usual seven-digit
 // abbreviation up to the whole forty.
