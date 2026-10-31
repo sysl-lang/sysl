@@ -402,6 +402,40 @@ that module by either tier.
 found for it: a `T` has the members its bounds provide and no others, and `x.sqrt()` there requires
 `T: Float`.
 
+**A bound on a family carries what a block over that family implements.** `impl[T: Integer] Twice for T`
+says every integer implements `Twice`, so a `[T: Integer]` body has its members and can hand its `T` to
+something asking `T: Twice`; nothing about the instantiation can fall outside the block.
+
+```sysl
+trait Twice
+    twice(self) -> Self
+
+impl[T: Integer + Add] Twice for T
+    twice(self) -> T = self + self
+
+doubled[U: Twice](x: U) -> U = x.twice()
+
+both[T: Integer + Add](x: T) -> (T, T) = (x.twice(), doubled(x))
+
+print(both(u8(21)))
+```
+
+```output
+(42, 42)
+```
+
+The lookup is the same two tiers, read at the parameter. A bound written on the parameter answers
+first, so `[T: Integer + Mine]` means `Mine`'s member of the name. Then come the blocks over its family
+whose traits the file names, then those it can only see, and two at one tier are refused rather than
+picked between:
+
+```text
+'top' on T comes from A and B, and each is in scope here — nothing in the call says which was meant
+```
+
+A block asking more than the family, `impl[T: Integer + Zed] Cond for T`, is reached only by a
+parameter whose own bounds promise the rest.
+
 ### Two traits may declare a member of one name
 
 The two members do not conflict, and a type may implement both traits. The type the call goes
