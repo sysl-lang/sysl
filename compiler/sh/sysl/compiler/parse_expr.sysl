@@ -1158,6 +1158,9 @@ private parse_match_arm(p: *Parser) -> MatchArm
         return MatchArm(start.to(p.just_taken()), pats, None, body)
     end if
 
+    // A `|` before the first alternative is optional, as in Rust: `| 1 | 2 -> 10`.
+    p.accept_kw("|")
+
     if !can_begin_pattern(p.peek()) && !at_reserved_pattern_name(p)
         p.want("a pattern")
 
@@ -1169,7 +1172,13 @@ private parse_match_arm(p: *Parser) -> MatchArm
 
     pats.push(parse_pattern(p))
 
+    // **A line that begins with `|` continues the pattern above it**, as in rustfmt's layout. It is
+    // only looked for here, between the alternatives of an arm that has not yet reached its arrow, so
+    // a `|` line after a finished arm's body is not joined to it: it begins an arm and is refused as
+    // a missing pattern.
     loop
+        if p.at(Newline) && p.kw_at(1, "|") then p.bump()
+
         if !p.accept_kw("|") then break
 
         pats.push(parse_pattern(p))

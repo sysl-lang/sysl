@@ -240,6 +240,35 @@ print(b)
 a binding cannot test a value
 ```
 
+### Alternatives across lines
+
+A long list of alternatives may be written one to a line, with the `|` either ending the line above
+or, as Rust and rustfmt write it, beginning the line below. A `|` may also precede an arm's first
+alternative. The leading bars are optional and mean nothing:
+
+```sysl
+classify(n: int) -> string
+    n match
+        1
+        | 2
+        | 3 -> "small"
+        | 4 | 5 -> "medium"
+        10 |
+        20 -> "round"
+        _ -> "other"
+
+print(classify(2), classify(5), classify(20), classify(7))
+```
+
+```output
+small medium round other
+```
+
+A line beginning with `|` continues the pattern above only until that arm's `->`. After a finished
+arm it begins an arm of its own, so `1 -> a` followed by `| 2 -> b` is two arms. The continuation
+lines are written at the arms' own margin, and a `|` inside brackets is the bitwise operator it
+always was.
+
 ### Alternatives may not bind
 
 `1 | 2 | 3` is one arm matching any of three literals. An arm whose alternatives **bind** is
