@@ -19,7 +19,7 @@ that `ẞ` lower-cases to `ß`, and it is the other module that does.
 
 ## Index
 
-[`char_columns`](#char_columns) [`char_from_u32`](#char_from_u32) [`char_indices`](#char_indices) [`chars_of`](#chars_of) [`cluster_columns`](#cluster_columns) [`columns`](#columns) [`contains_fold`](#contains_fold) [`cstring`](#cstring) [`ends_with_fold`](#ends_with_fold) [`eq_fold`](#eq_fold) [`f128_prefix`](#f128_prefix) [`f32_prefix`](#f32_prefix) [`fields`](#fields) [`from_cstring`](#from_cstring) [`from_utf8`](#from_utf8) [`from_utf8_lossy`](#from_utf8_lossy) [`from_utf8_unchecked`](#from_utf8_unchecked) [`grapheme_columns`](#grapheme_columns) [`is_char_boundary`](#is_char_boundary) [`join`](#join) [`parse_bool`](#parse_bool) [`parse_bool`](#parse_bool-1) [`parse_f128`](#parse_f128) [`parse_f128`](#parse_f128-1) [`parse_f32`](#parse_f32) [`parse_f32`](#parse_f32-1) [`parse_int`](#parse_int) [`parse_int`](#parse_int-1) [`parse_int_base`](#parse_int_base) [`parse_int_base`](#parse_int_base-1) [`parse_long`](#parse_long) [`parse_long`](#parse_long-1) [`parse_long_base`](#parse_long_base) [`parse_long_base`](#parse_long_base-1) [`parse_real`](#parse_real) [`parse_real`](#parse_real-1) [`parse_uint`](#parse_uint) [`parse_uint`](#parse_uint-1) [`parse_ulong`](#parse_ulong) [`parse_ulong`](#parse_ulong-1) [`parse_ulong_base`](#parse_ulong_base) [`parse_ulong_base`](#parse_ulong_base-1) [`real_prefix`](#real_prefix) [`repeat`](#repeat) [`replace_all`](#replace_all) [`split`](#split) [`starts_with_fold`](#starts_with_fold) [`str_builder`](#str_builder) [`str_builder_with_capacity`](#str_builder_with_capacity) [`str_view`](#str_view) [`to_lower`](#to_lower) [`to_upper`](#to_upper) [`CharIndices`](#charindices) [`Chars`](#chars) [`CString`](#cstring-1) [`ParseError`](#parseerror) [`StrBuilder`](#strbuilder) [`Utf8Error`](#utf8error) [`Ascii`](#ascii) [`Join`](#join-1) [`Search`](#search) [Ascii for char](#ascii-for-char) [Ascii for u8](#ascii-for-u8) [Display for ParseError](#display-for-parseerror) [Iterate for CharIndices](#iterate-for-charindices) [Iterate for Chars](#iterate-for-chars) [Join for []const T](#join-for-const-t) [Join for [N]T](#join-for-nt) [Join for Buf[T]](#join-for-buft) [Search for []const u8](#search-for-const-u8) [Search for string](#search-for-string)
+[`char_columns`](#char_columns) [`char_from_u32`](#char_from_u32) [`char_indices`](#char_indices) [`chars_of`](#chars_of) [`cluster_columns`](#cluster_columns) [`columns`](#columns) [`contains_fold`](#contains_fold) [`cstring`](#cstring) [`ends_with_fold`](#ends_with_fold) [`eq_fold`](#eq_fold) [`f128_prefix`](#f128_prefix) [`f32_prefix`](#f32_prefix) [`fields`](#fields) [`from_cstring`](#from_cstring) [`from_utf8`](#from_utf8) [`from_utf8_lossy`](#from_utf8_lossy) [`from_utf8_unchecked`](#from_utf8_unchecked) [`grapheme_columns`](#grapheme_columns) [`is_char_boundary`](#is_char_boundary) [`join`](#join) [`lines`](#lines) [`parse_bool`](#parse_bool) [`parse_bool`](#parse_bool-1) [`parse_f128`](#parse_f128) [`parse_f128`](#parse_f128-1) [`parse_f32`](#parse_f32) [`parse_f32`](#parse_f32-1) [`parse_int`](#parse_int) [`parse_int`](#parse_int-1) [`parse_int_base`](#parse_int_base) [`parse_int_base`](#parse_int_base-1) [`parse_long`](#parse_long) [`parse_long`](#parse_long-1) [`parse_long_base`](#parse_long_base) [`parse_long_base`](#parse_long_base-1) [`parse_real`](#parse_real) [`parse_real`](#parse_real-1) [`parse_uint`](#parse_uint) [`parse_uint`](#parse_uint-1) [`parse_ulong`](#parse_ulong) [`parse_ulong`](#parse_ulong-1) [`parse_ulong_base`](#parse_ulong_base) [`parse_ulong_base`](#parse_ulong_base-1) [`real_prefix`](#real_prefix) [`repeat`](#repeat) [`replace_all`](#replace_all) [`split`](#split) [`starts_with_fold`](#starts_with_fold) [`str_builder`](#str_builder) [`str_builder_with_capacity`](#str_builder_with_capacity) [`str_view`](#str_view) [`to_lower`](#to_lower) [`to_upper`](#to_upper) [`CharIndices`](#charindices) [`Chars`](#chars) [`CString`](#cstring-1) [`ParseError`](#parseerror) [`StrBuilder`](#strbuilder) [`Utf8Error`](#utf8error) [`Ascii`](#ascii) [`Join`](#join-1) [`Search`](#search) [`Text`](#text) [Ascii for char](#ascii-for-char) [Ascii for u8](#ascii-for-u8) [Display for ParseError](#display-for-parseerror) [Iterate for CharIndices](#iterate-for-charindices) [Iterate for Chars](#iterate-for-chars) [Join for []const T](#join-for-const-t) [Join for [N]T](#join-for-nt) [Join for Buf[T]](#join-for-buft) [Search for []const u8](#search-for-const-u8) [Search for string](#search-for-string) [Text for string](#text-for-string)
 
 ## Functions
 
@@ -316,6 +316,21 @@ separator is one `split` would have found.
 
 It sizes the buffer before it starts, since it can: the answer's length is the sum of the pieces
 plus the separators, and knowing it turns a series of doublings into one allocation.
+
+### `lines`
+
+```sysl
+lines(s: string) -> []string
+```
+
+The lines of a text, without their terminators.
+
+A line ends at `\n`, and a `\r` immediately before that `\n` is not part of it, so `\n` and
+`\r\n` files read alike. A lone `\r` not followed by `\n` stays in its line. A last line with no
+terminator is still a line, but a terminator at the very end does not start an empty one, and an
+empty string has no lines at all -- which is what separates this from `split(s, "\n")`.
+
+Each line is a view of `s`, so only the vector is allocated.
 
 ### `parse_bool`
 
@@ -958,6 +973,45 @@ A one-byte needle never builds a table at all -- it is a single byte scan, which
 | `trim_end_matches` | `trim_end_matches(self, cutset: Self) -> Self` |  |
 | `trim_matches` | `trim_matches(self, cutset: Self) -> Self` |  |
 
+### `Text`
+
+```sysl
+trait Text
+    split(self, sep: string) -> []string
+    fields(self) -> []string
+    lines(self) -> []string
+    repeat(self, n: usize) -> string
+    replace_all(self, old: string, new: string) -> string
+    to_upper(self) -> string
+    to_lower(self) -> string
+    eq_fold(self, other: string) -> bool
+    starts_with_fold(self, prefix: string) -> bool
+    ends_with_fold(self, suffix: string) -> bool
+    contains_fold(self, needle: string) -> bool
+```
+
+The functions above that take a `string` first, as members of it: `s.split(",")`,
+`s.lines()`, `s.to_upper()`, `s.replace_all("a", "b")`. Each is the free function of the same
+name and answers exactly what it does; the free functions stay. Like `Search` and `Join` the
+trait is in scope for every program without an import.
+
+A name the program declares itself wins over these, so a program with its own `split` function
+or its own trait's `split` on `string` is unaffected.
+
+| Member | Signature | Description |
+|---|---|---|
+| `split` | `split(self, sep: string) -> []string` |  |
+| `fields` | `fields(self) -> []string` |  |
+| `lines` | `lines(self) -> []string` |  |
+| `repeat` | `repeat(self, n: usize) -> string` |  |
+| `replace_all` | `replace_all(self, old: string, new: string) -> string` |  |
+| `to_upper` | `to_upper(self) -> string` |  |
+| `to_lower` | `to_lower(self) -> string` |  |
+| `eq_fold` | `eq_fold(self, other: string) -> bool` |  |
+| `starts_with_fold` | `starts_with_fold(self, prefix: string) -> bool` |  |
+| `ends_with_fold` | `ends_with_fold(self, suffix: string) -> bool` |  |
+| `contains_fold` | `contains_fold(self, needle: string) -> bool` |  |
+
 ## Implementations
 
 ### Ascii for char
@@ -1040,3 +1094,9 @@ Text, which is the receiver these are nearly always written on. `slice` goes thr
 language's own boundary-checked subscript, so a piece cut out of a string is a string with the
 same guarantee -- and the bounds every operation above hands it are ones the search or the trim
 already knows are boundaries.
+
+### Text for string
+
+```sysl
+impl Text for string
+```
