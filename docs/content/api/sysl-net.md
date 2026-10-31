@@ -47,7 +47,7 @@ so leaving them out costs a later release nothing.
 
 ## Index
 
-[`max_unix_path`](#max_unix_path) [`ipv4`](#ipv4) [`ipv6`](#ipv6) [`resolve`](#resolve) [`resolve_passive`](#resolve_passive) [`socket`](#socket) [`timed_out`](#timed_out) [`udp_socket`](#udp_socket) [`unix`](#unix) [`unix_connect`](#unix_connect) [`unix_listen`](#unix_listen) [`would_block`](#would_block) [`Address`](#address) [`Family`](#family) [`Shutdown`](#shutdown) [`Socket`](#socket-1) [`UdpSocket`](#udpsocket) [`UnixAddress`](#unixaddress) [`UnixListener`](#unixlistener) [Display for Address](#display-for-address) [Display for UnixAddress](#display-for-unixaddress)
+[`max_unix_path`](#max_unix_path) [`ipv4`](#ipv4) [`ipv6`](#ipv6) [`peer_closed`](#peer_closed) [`resolve`](#resolve) [`resolve_passive`](#resolve_passive) [`socket`](#socket) [`timed_out`](#timed_out) [`udp_socket`](#udp_socket) [`unix`](#unix) [`unix_connect`](#unix_connect) [`unix_listen`](#unix_listen) [`would_block`](#would_block) [`Address`](#address) [`Family`](#family) [`Shutdown`](#shutdown) [`Socket`](#socket-1) [`UdpSocket`](#udpsocket) [`UnixAddress`](#unixaddress) [`UnixListener`](#unixlistener) [Display for Address](#display-for-address) [Display for UnixAddress](#display-for-unixaddress)
 
 ## Constants
 
@@ -77,6 +77,16 @@ ipv6(groups: [8]u16, port: u16, scope: u32 = 0) -> Address
 The IPv6 address of eight 16-bit `groups`, as written left to right, at `port` -- `::1` is
 `[0, 0, 0, 0, 0, 0, 0, 1]`. `scope` is the interface a link-local address belongs to, and zero
 for none.
+
+### `peer_closed`
+
+```sysl
+peer_closed(e: IoError) -> bool
+```
+
+Whether an error is a `send` to a peer that has gone: `EPIPE` (32 on every hosted platform), or
+`ECONNRESET` (54 on a BSD, 104 elsewhere) when the peer reset rather than closed. **Such a send
+answers this error and never raises `SIGPIPE`**, so the process is not ended by it.
 
 ### `resolve`
 
@@ -263,6 +273,10 @@ the idiom.
 | `write_timeout` | `write_timeout(*self, ms: int) -> Result[unit, IoError]` | How long a `send` may wait before giving up, in milliseconds. |
 | `reuse_address` | `reuse_address(*self, on: bool = true) -> Result[unit, IoError]` | Let a listener take a port that a recently stopped one was using, so that a server just stopped can be started again without waiting out `TIME_WAIT`. |
 | `non_blocking` | `non_blocking(*self, on: bool = true) -> Result[unit, IoError]` | Put this socket in non-blocking mode, or take it out again. |
+| `set_send_buffer` | `set_send_buffer(*self, bytes: int) -> Result[unit, IoError]` | Ask the kernel for a send buffer of `bytes`. |
+| `set_recv_buffer` | `set_recv_buffer(*self, bytes: int) -> Result[unit, IoError]` | Ask the kernel for a receive buffer of `bytes`; see `set_send_buffer`. |
+| `send_buffer` | `send_buffer(self) -> Result[int, IoError]` | The send buffer the kernel gave this socket, in bytes. |
+| `recv_buffer` | `recv_buffer(self) -> Result[int, IoError]` | The receive buffer the kernel gave this socket, in bytes. |
 
 ### `UdpSocket`
 
@@ -293,6 +307,10 @@ Not closed by going out of scope, for the reason `Socket` is not.
 | `read_timeout` | `read_timeout(*self, ms: int) -> Result[unit, IoError]` | How long a receive may wait before giving up, in milliseconds. |
 | `write_timeout` | `write_timeout(*self, ms: int) -> Result[unit, IoError]` | How long a send may wait before giving up, in milliseconds. |
 | `non_blocking` | `non_blocking(*self, on: bool = true) -> Result[unit, IoError]` | Put this socket in non-blocking mode, or take it out again: a receive with no datagram waiting then answers an error `would_block` recognises instead of waiting. |
+| `set_send_buffer` | `set_send_buffer(*self, bytes: int) -> Result[unit, IoError]` | Ask the kernel for a send buffer of `bytes`; see `Socket.set_send_buffer`. |
+| `set_recv_buffer` | `set_recv_buffer(*self, bytes: int) -> Result[unit, IoError]` | Ask the kernel for a receive buffer of `bytes`; see `Socket.set_send_buffer`. |
+| `send_buffer` | `send_buffer(self) -> Result[int, IoError]` | The send buffer the kernel gave this socket, in bytes. |
+| `recv_buffer` | `recv_buffer(self) -> Result[int, IoError]` | The receive buffer the kernel gave this socket, in bytes. |
 | `close` | `close(*self) -> Result[unit, IoError]` | Give the descriptor back. |
 
 ### `UnixAddress`

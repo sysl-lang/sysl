@@ -1,0 +1,411 @@
+module sysl.net
+@requires(posix)
+@tests
+
+import sysl.fs.{IoError, make_temp_dir, remove_dir_all}
+import sysl.path.join
+import sysl.process.{pid, pipe}
+import sysl.signal.{PIPE, watch}
+
+// A send to a peer that has gone answers an error; it never ends the process with `SIGPIPE`.
+//
+// **Every test in this file would kill the test process if it failed**, so a regression here shows
+// as a crashed test (exit 141) rather than a red assertion -- which is what the bug looked like to
+// the program that found it. Every test runs in a process of its own.
+//
+// A Unix stream refuses the first send to a closed peer; a TCP one accepts it (the peer's reset has
+// not arrived yet) and refuses a later one, so the TCP tests send until one is refused.
+
+private ignore(r: Result[unit, IoError]) = ()
+
+/** A fresh directory of this test's own, and the socket path inside it. */
+private scratch(name: string) -> (string, UnixAddress)
+    val dir = make_temp_dir(f"sysl-nsp-${pid()}-${name}-").unwrap()
+
+    (dir, unix(join(dir, "s.sock")).unwrap())
+end scratch
+
+/** A Unix listener, its client, and the connection it accepted. */
+private unix_trio(at: UnixAddress) -> (UnixListener, Socket, Socket)
+    var l = unix_listen(at).unwrap()
+    var c = unix_connect(at).unwrap()
+    val a = l.accept().unwrap()
+
+    (l, c, a)
+end unix_trio
+
+/** A TCP listener on the loopback, its client, and the connection it accepted. */
+private tcp_trio() -> (Socket, Socket, Socket)
+    val addrs = resolve("127.0.0.1", 0).unwrap()
+    var l = socket(addrs.at(0)).unwrap()
+
+    l.reuse_address().unwrap()
+    l.bind(addrs.at(0)).unwrap()
+    l.listen().unwrap()
+
+    val at = l.local().unwrap()
+    var c = socket(at).unwrap()
+
+    c.connect(at).unwrap()
+
+    val (a, _) = l.accept().unwrap()
+
+    (l, c, a)
+end tcp_trio
+
+/** Sends `chunk` until a send is refused, at most a hundred times, and answers the refusal. */
+private until_refused(s: *Socket, chunk: []const u8) -> Option[IoError]
+    for _ in 0..<100
+        s.send(chunk) match
+            Ok(_) -> ()
+            Err(e) -> return Some(e)
+
+    None
+end until_refused
+
+// ## Unix
+
+@test("nsp_ the reporter's case: a Unix send to a closed peer is an error and not SIGPIPE")
+nsp_unix_accepted_send_to_closed_client()
+    val (dir, at) = scratch("accepted")
+    var (l, c, a) = unix_trio(at)
+
+    c.close().unwrap()
+
+    val first = a.send([0u8; 65536])
+
+    assert(first.is_err(), "a send to a closed peer succeeded")
+    assert(peer_closed(first.unwrap_err()), "the error was not a closed peer")
+    a.close().unwrap()
+    l.close().unwrap()
+    ignore(remove_dir_all(dir))
+end nsp_unix_accepted_send_to_closed_client
+
+@test("nsp_ a Unix connecting side sends to a closed accepted side")
+nsp_unix_connecting_side()
+    val (dir, at) = scratch("connecting")
+    var (l, c, a) = unix_trio(at)
+
+    a.close().unwrap()
+
+    val first = c.send("hello".bytes)
+
+    assert(first.is_err() && peer_closed(first.unwrap_err()), "not a closed-peer error")
+    c.close().unwrap()
+    l.close().unwrap()
+    ignore(remove_dir_all(dir))
+end nsp_unix_connecting_side
+
+@test("nsp_ a Unix send that worked is followed by one that is refused once the peer closes")
+nsp_unix_first_works_later_refused()
+    val (dir, at) = scratch("later")
+    var (l, c, a) = unix_trio(at)
+
+    assert(a.send("hi".bytes).unwrap() == 2, "the first send did not go")
+    c.close().unwrap()
+
+    val later = until_refused(&a, "more".bytes)
+
+    assert(later.is_some() && peer_closed(later.unwrap()), "no closed-peer error came")
+    a.close().unwrap()
+    l.close().unwrap()
+    ignore(remove_dir_all(dir))
+end nsp_unix_first_works_later_refused
+
+@test("nsp_ send_all to a closed Unix peer is an error, for a small and a large payload")
+nsp_unix_send_all()
+    val (dir, at) = scratch("all")
+    var (l, c, a) = unix_trio(at)
+
+    c.close().unwrap()
+
+    val small = a.send_all("x".bytes)
+    val large = a.send_all([1u8; 4194304])
+
+    assert(small.is_err() && peer_closed(small.unwrap_err()), "small send_all was not refused")
+    assert(large.is_err() && peer_closed(large.unwrap_err()), "large send_all was not refused")
+    a.close().unwrap()
+    l.close().unwrap()
+    ignore(remove_dir_all(dir))
+end nsp_unix_send_all
+
+@test("nsp_ an empty send to a closed Unix peer is a no-op, and the next real one is an error")
+nsp_unix_empty_payload()
+    val (dir, at) = scratch("empty")
+    var (l, c, a) = unix_trio(at)
+
+    c.close().unwrap()
+
+    val empty: []const u8 = []
+
+    assert(a.send(empty).unwrap() == 0, "an empty send moved bytes")
+    assert(a.send_all(empty).is_ok(), "an empty send_all failed")
+    assert(a.send("x".bytes).is_err(), "the real send was not refused")
+    a.close().unwrap()
+    l.close().unwrap()
+    ignore(remove_dir_all(dir))
+end nsp_unix_empty_payload
+
+@test("nsp_ a non-blocking Unix socket answers a closed peer, not would_block and not SIGPIPE")
+nsp_unix_non_blocking()
+    val (dir, at) = scratch("nonblock")
+    var (l, c, a) = unix_trio(at)
+
+    a.non_blocking().unwrap()
+    c.close().unwrap()
+
+    val first = a.send([0u8; 65536])
+
+    assert(first.is_err(), "a send to a closed peer succeeded")
+    assert(peer_closed(first.unwrap_err()), "not a closed-peer error")
+    assert(!would_block(first.unwrap_err()), "a closed peer read as would_block")
+    a.close().unwrap()
+    l.close().unwrap()
+    ignore(remove_dir_all(dir))
+end nsp_unix_non_blocking
+
+@test("nsp_ the listener serves another client after a send to a closed one failed")
+nsp_unix_serves_again()
+    val (dir, at) = scratch("again")
+    var (l, c, a) = unix_trio(at)
+
+    c.close().unwrap()
+    assert(a.send([0u8; 65536]).is_err(), "the closed peer was not refused")
+    a.close().unwrap()
+
+    var c2 = unix_connect(at).unwrap()
+    var a2 = l.accept().unwrap()
+    var into: []u8 = [0; 4]
+
+    a2.send_all("pong".bytes).unwrap()
+    assert(c2.recv(into).unwrap() == 4 && into[0] == u8('p'), "the second client was not served")
+    c2.close().unwrap()
+    a2.close().unwrap()
+    l.close().unwrap()
+    ignore(remove_dir_all(dir))
+end nsp_unix_serves_again
+
+// ## TCP
+
+@test("nsp_ a TCP accepted side sending to a closed client gets an error and not SIGPIPE")
+nsp_tcp_accepted_side()
+    var (l, c, a) = tcp_trio()
+
+    c.close().unwrap()
+
+    val refused = until_refused(&a, [0u8; 65536])
+
+    assert(refused.is_some(), "no send to a closed TCP peer was ever refused")
+    assert(peer_closed(refused.unwrap()), "the error was not a closed peer")
+    a.close().unwrap()
+    l.close().unwrap()
+end nsp_tcp_accepted_side
+
+@test("nsp_ a TCP connecting side sending to a closed accepted side gets an error")
+nsp_tcp_connecting_side()
+    var (l, c, a) = tcp_trio()
+
+    a.close().unwrap()
+
+    val refused = until_refused(&c, [0u8; 65536])
+
+    assert(refused.is_some() && peer_closed(refused.unwrap()), "not a closed-peer error")
+    c.close().unwrap()
+    l.close().unwrap()
+end nsp_tcp_connecting_side
+
+@test("nsp_ a TCP send that worked is followed by one refused; send_all and empty payloads")
+nsp_tcp_first_works_then_refused()
+    var (l, c, a) = tcp_trio()
+
+    assert(a.send("hi".bytes).unwrap() == 2, "the first send did not go")
+    c.close().unwrap()
+
+    val empty: []const u8 = []
+
+    assert(a.send(empty).unwrap() == 0, "an empty send moved bytes")
+
+    val refused = until_refused(&a, "more".bytes)
+
+    assert(refused.is_some(), "the later send was never refused")
+
+    val all = a.send_all([1u8; 4194304])
+
+    assert(all.is_err() && peer_closed(all.unwrap_err()), "send_all was not refused")
+    a.close().unwrap()
+    l.close().unwrap()
+end nsp_tcp_first_works_then_refused
+
+@test("nsp_ a non-blocking TCP socket answers a closed peer, and the listener serves another client")
+nsp_tcp_non_blocking_then_serves_again()
+    var (l, c, a) = tcp_trio()
+
+    a.non_blocking().unwrap()
+    c.close().unwrap()
+
+    val refused = until_refused(&a, [0u8; 65536])
+
+    assert(refused.is_some() && peer_closed(refused.unwrap()), "not a closed-peer error")
+    a.close().unwrap()
+
+    var c2 = socket(l.local().unwrap()).unwrap()
+
+    c2.connect(l.local().unwrap()).unwrap()
+
+    var (a2, _) = l.accept().unwrap()
+    var into: []u8 = [0; 4]
+
+    a2.send_all("pong".bytes).unwrap()
+    assert(c2.recv(into).unwrap() == 4 && into[0] == u8('p'), "the second client was not served")
+    c2.close().unwrap()
+    a2.close().unwrap()
+    l.close().unwrap()
+end nsp_tcp_non_blocking_then_serves_again
+
+// ## The process's own SIGPIPE policy is untouched
+
+@test("nsp_ a program watching SIGPIPE hears a pipe write but not a socket send to a closed peer")
+nsp_watched_sigpipe_policy_is_unchanged()
+    val w = watch(PIPE).unwrap()
+    val (dir, at) = scratch("watched")
+    var (l, c, a) = unix_trio(at)
+
+    c.close().unwrap()
+    assert(a.send([0u8; 65536]).is_err(), "the closed peer was not refused")
+    assert(!w.take(), "a socket send raised SIGPIPE")
+
+    var (r, wr) = pipe().unwrap()
+
+    r.close().unwrap()
+    wr.write("x".bytes)
+    ignore(wr.flush())
+
+    assert(w.take(), "a write to a pipe nobody reads no longer raises SIGPIPE")
+    ignore(wr.close())
+    a.close().unwrap()
+    l.close().unwrap()
+    ignore(remove_dir_all(dir))
+end nsp_watched_sigpipe_policy_is_unchanged
+
+// ## Buffer sizes
+
+@test("nsp_ a stream socket's buffers can be asked for and are at least what was asked")
+nsp_buffer_round_trip()
+    val (dir, at) = scratch("buffers")
+    var (l, c, a) = unix_trio(at)
+
+    c.set_send_buffer(65536).unwrap()
+    a.set_recv_buffer(65536).unwrap()
+    assert(c.send_buffer().unwrap() >= 65536, "the send buffer is smaller than asked")
+    assert(a.recv_buffer().unwrap() >= 65536, "the receive buffer is smaller than asked")
+
+    c.set_recv_buffer(131072).unwrap()
+    a.set_send_buffer(131072).unwrap()
+    assert(c.recv_buffer().unwrap() >= 131072, "the receive buffer is smaller than asked")
+    assert(a.send_buffer().unwrap() >= 131072, "the send buffer is smaller than asked")
+    c.close().unwrap()
+    a.close().unwrap()
+    l.close().unwrap()
+    ignore(remove_dir_all(dir))
+end nsp_buffer_round_trip
+
+@test("nsp_ a TCP socket's buffers round-trip, and a bigger ask is no smaller an answer")
+nsp_tcp_buffer_round_trip()
+    var (l, c, a) = tcp_trio()
+
+    c.set_send_buffer(262144).unwrap()
+    c.set_recv_buffer(262144).unwrap()
+
+    val s = c.send_buffer().unwrap()
+    val r = c.recv_buffer().unwrap()
+
+    assert(s >= 262144 && r >= 262144, "a buffer is smaller than asked")
+    assert(a.send_buffer().unwrap() > 0 && a.recv_buffer().unwrap() > 0, "an untouched buffer reads as empty")
+    c.close().unwrap()
+    a.close().unwrap()
+    l.close().unwrap()
+end nsp_tcp_buffer_round_trip
+
+@test("nsp_ a buffer size that is not positive is refused, and the old size stays")
+nsp_buffer_invalid_sizes()
+    val (dir, at) = scratch("invalid")
+    var (l, c, a) = unix_trio(at)
+    val before = c.send_buffer().unwrap()
+
+    assert(c.set_send_buffer(0).is_err(), "zero was accepted as a send buffer")
+    assert(c.set_send_buffer(-1).is_err(), "-1 was accepted as a send buffer")
+    assert(c.set_recv_buffer(0).is_err(), "zero was accepted as a receive buffer")
+    assert(c.set_recv_buffer(-4096).is_err(), "a negative size was accepted as a receive buffer")
+    assert(c.set_send_buffer(0).unwrap_err().code() == 22, "the refusal was not EINVAL")
+    assert(c.send_buffer().unwrap() == before, "a refused size changed the buffer")
+    c.close().unwrap()
+    a.close().unwrap()
+    l.close().unwrap()
+    ignore(remove_dir_all(dir))
+end nsp_buffer_invalid_sizes
+
+@test("nsp_ a closed socket's buffer calls are errors, not zero")
+nsp_buffer_on_a_closed_socket()
+    val (dir, at) = scratch("closedbuf")
+    var (l, c, a) = unix_trio(at)
+
+    c.close().unwrap()
+    assert(c.send_buffer().is_err(), "a closed socket answered a send buffer")
+    assert(c.recv_buffer().is_err(), "a closed socket answered a receive buffer")
+    assert(c.set_send_buffer(4096).is_err(), "a closed socket took a send buffer")
+    a.close().unwrap()
+    l.close().unwrap()
+    ignore(remove_dir_all(dir))
+end nsp_buffer_on_a_closed_socket
+
+@test("nsp_ a UDP socket's buffers round-trip and refuse a size that is not positive")
+nsp_udp_buffers()
+    val addrs = resolve("127.0.0.1", 0).unwrap()
+    var u = udp_socket(addrs.at(0)).unwrap()
+
+    u.set_recv_buffer(262144).unwrap()
+    u.set_send_buffer(65536).unwrap()
+    assert(u.recv_buffer().unwrap() >= 262144, "the receive buffer is smaller than asked")
+    assert(u.send_buffer().unwrap() >= 65536, "the send buffer is smaller than asked")
+    assert(u.set_recv_buffer(0).is_err(), "zero was accepted")
+    assert(u.set_send_buffer(-8).is_err(), "a negative size was accepted")
+    u.close().unwrap()
+end nsp_udp_buffers
+
+@test("nsp_ a bigger send buffer moves 3 MB across a Unix socket in fewer turns")
+nsp_bigger_buffer_means_fewer_turns()
+    val (dir, at) = scratch("turns")
+    var (l, c, a) = unix_trio(at)
+
+    c.set_send_buffer(4194304).unwrap()
+    a.set_recv_buffer(4194304).unwrap()
+    c.non_blocking().unwrap()
+    a.non_blocking().unwrap()
+
+    val total = 3145728
+    val payload: []u8 = [7; 3145728]
+    var sent = 0
+    var got = 0
+    var turns = 0
+    var into: []u8 = [0; 65536]
+
+    while got < total
+        turns += 1
+        assert(turns < 100000, "the transfer did not finish")
+
+        if sent < total
+            c.send(payload[sent..<total]) match
+                Ok(n) -> sent += n
+                Err(e) -> assert(would_block(e), "send failed")
+
+        a.recv(into) match
+            Ok(n) -> got += n
+            Err(e) -> assert(would_block(e), "recv failed")
+
+    assert(got == total, "bytes were lost")
+    assert(turns <= 64, "the transfer still took a turn per few KB")
+    c.close().unwrap()
+    a.close().unwrap()
+    l.close().unwrap()
+    ignore(remove_dir_all(dir))
+end nsp_bigger_buffer_means_fewer_turns

@@ -9,7 +9,7 @@ requires: "requires { os }"
 
 ## Index
 
-[`datagram`](#datagram) [`non_blocking`](#non_blocking) [`read_timeout`](#read_timeout) [`reuse_address`](#reuse_address) [`stream`](#stream) [`unix_domain`](#unix_domain) [`write_timeout`](#write_timeout) [`Endpoint`](#endpoint)
+[`datagram`](#datagram) [`non_blocking`](#non_blocking) [`read_timeout`](#read_timeout) [`recv_buffer`](#recv_buffer) [`recv_buffer_size`](#recv_buffer_size) [`reuse_address`](#reuse_address) [`send_buffer`](#send_buffer) [`send_buffer_size`](#send_buffer_size) [`stream`](#stream) [`unix_domain`](#unix_domain) [`write_timeout`](#write_timeout) [`Endpoint`](#endpoint)
 
 ## Constants
 
@@ -39,6 +39,22 @@ const read_timeout: int = 0
 
 `option`'s `which` for how long a receive may wait, `value` milliseconds and zero for no limit.
 
+### `recv_buffer`
+
+```sysl
+const recv_buffer: int = 5
+```
+
+`option`'s `which` for the size of the kernel's receive buffer, as `send_buffer`.
+
+### `recv_buffer_size`
+
+```sysl
+const recv_buffer_size: int = 7
+```
+
+`option`'s `which` for reading the receive buffer back, as `send_buffer_size`.
+
 ### `reuse_address`
 
 ```sysl
@@ -46,6 +62,24 @@ const reuse_address: int = 2
 ```
 
 `option`'s `which` for letting a listener take a port a recently stopped one held, `value` 1 or 0.
+
+### `send_buffer`
+
+```sysl
+const send_buffer: int = 4
+```
+
+`option`'s `which` for the size of the kernel's send buffer, `value` bytes and positive. The
+supplier may round what it is given, so `send_buffer_size` asks what it granted.
+
+### `send_buffer_size`
+
+```sysl
+const send_buffer_size: int = 6
+```
+
+`option`'s `which` for reading the send buffer back: `value` is ignored and the answer is the
+size in bytes -- positive, not zero -- or a negative status.
 
 ### `stream`
 
