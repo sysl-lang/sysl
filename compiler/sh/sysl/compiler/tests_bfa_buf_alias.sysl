@@ -118,10 +118,14 @@ private bfa_lines(body: string, parts: []string) -> Buf[string]
     found
 end bfa_lines
 
-private val HeaderScope: string = "!{!{!\"sysl.buf.header\", !{!\"sysl.buf\"}}}"
-private val ElementScope: string = "!{!{!\"sysl.buf.elements\", !{!\"sysl.buf\"}}}"
-private header_mark() -> string = s"!alias.scope $HeaderScope, !noalias $ElementScope"
-private element_mark() -> string = s"!alias.scope $ElementScope, !noalias $HeaderScope"
+private val HeaderNode: string = "!{!\"sysl.buf.header\", !{!\"sysl.buf\"}}"
+private val BoxNode: string = "!{!\"sysl.buf.box\", !{!\"sysl.buf\"}}"
+private val ElementNode: string = "!{!\"sysl.buf.elements\", !{!\"sysl.buf\"}}"
+private val HandleNode: string = "!{!\"sysl.buf.handle\", !{!\"sysl.buf\"}}"
+private header_mark() -> string = s"!alias.scope !{$HeaderNode}, !noalias !{$ElementNode, $HandleNode}"
+private box_mark() -> string = s"!alias.scope !{$BoxNode}, !noalias !{$ElementNode, $HeaderNode}"
+private element_mark() -> string = s"!alias.scope !{$ElementNode}, !noalias !{$HeaderNode, $BoxNode}"
+private handle_mark() -> string = s"!alias.scope !{$HandleNode}, !noalias !{$HeaderNode}"
 
 private bfa_matrix() -> string = raw"""
     module demo
@@ -184,13 +188,65 @@ bfa_members_mark_both_sides()
     assert(outer.contains("call double @sysl.buf$BufCore.at.real.owned(ptr "), outer)
     assert(!outer.contains("load %struct.sysl.buf$BufCore.real"), outer)
 
-@test("a program's read of a Buf through a counted reference is a header access")
-bfa_counted_reference_is_header()
+@test("a program's read of a Buf through a counted reference is a read of its box")
+bfa_counted_reference_is_box()
     if bfa_no_library() then return
 
     val body = bfa_body(bfa_ir(bfa_matrix()), "$M.at(")
 
-    assert(!bfa_lines(body, ["load %struct.sysl.buf$Buf.real, ptr", header_mark()]).is_empty(), body)
+    assert(!bfa_lines(body, ["load %struct.sysl.buf$Buf.real, ptr", box_mark()]).is_empty(), body)
+
+private bfa_stack_machine() -> string = raw"""
+    module demo
+
+    import sysl.buf.{Buf, buf}
+
+    struct Machine
+        stack: Buf[int]
+        depth: int
+
+    @noinline
+    popped_twice(vm: *Machine) -> int
+        val a = vm.stack.at(vm.stack.len() - 1)
+
+        vm.stack.truncate(vm.stack.len() - 1)
+
+        val b = vm.stack.at(vm.stack.len() - 1)
+
+        vm.stack.truncate(vm.stack.len() - 1)
+        a + b
+
+    @export("main")
+    entry() -> int
+        var m = Machine(buf(), 0)
+
+        m.stack.push(1)
+        m.stack.push(2)
+        popped_twice(&m)
+    """
+
+// A write to a count is the commonest thing between two reads of an interpreter's stack, and a
+// `BufCore` holds no handle: the handle in a struct's field is read alone, under its own mark, so the
+// optimizer can keep it across that write. A field beside it stays unmarked.
+@test("a Buf in a struct's field is read alone and marked as a handle")
+bfa_field_is_a_marked_handle()
+    if bfa_no_library() then return
+
+    val body = bfa_body(bfa_ir(bfa_stack_machine()), "@demo$popped_twice(")
+
+    assert(!bfa_lines(body, ["load %struct.sysl.buf$Buf.int, ptr", handle_mark()]).is_empty(), body)
+    assert(!body.contains("load %struct.demo$Machine"), body)
+
+@test("at -O2 a Buf's handle in a struct's field survives a write to the count")
+bfa_handle_kept_across_count_write()
+    if bfa_no_library() then return
+
+    bfa_optimized(bfa_stack_machine()) match
+        None -> ()
+        Some(out) ->
+            val body = bfa_body(out, "demo$popped_twice")
+
+            assert(bfa_lines(body, [" = load ptr, ptr %vm"]).len() == 1, body)
 
 // A view the program indexes may be anybody's storage, and a `*Buf` may point among another
 // buffer's elements, so neither says which side it is on.
@@ -358,6 +414,141 @@ bfa_handle_among_elements_replaced()
                 seen += p.len()
 
             exit(if seen == 10 && outer.at(0).len() == 1 && outer.at(0).at(0) == 9 then 42 else 1)
+        """), 42)
+
+// A handle among the elements of a buffer of structs, read through a `*Machine` while the element is
+// replaced whole: the element write is told nothing about handles.
+@test("at -O2 a handle in a struct among another buffer's elements, replaced whole, is read again")
+bfa_struct_handle_among_elements_replaced()
+    if !bfa_ready() then return
+
+    assert_eq(bfa_runs(raw"""
+        import sysl.buf.{Buf, buf}
+
+        struct Machine
+            stack: Buf[int]
+            depth: int
+
+        main()
+            var parked: Buf[Machine] = buf()
+
+            parked.push(Machine(buf(), 0))
+
+            val vm: *Machine = parked.index_place(0)
+            var seen = 0usize
+
+            for k in 0..<10
+                vm.stack.push(k)
+                vm.stack.push(k)
+                vm.stack.truncate(vm.stack.len() - 1)
+                parked[0] = Machine(buf(), k)
+                vm.stack.push(k)
+                seen += vm.stack.len()
+
+            exit(if seen == 10 && parked.at(0).stack.at(0) == 9 then 42 else 1)
+        """), 42)
+
+// Storage a program lays out itself: a handle written as bytes into a `Buf[usize]` and cleared by an
+// element write, so the handle reads as naming nothing. The two kinds are told nothing about each other.
+@test("at -O2 a handle in a Buf of words, cleared by an element write, reads as naming nothing")
+bfa_handle_in_words_cleared()
+    if !bfa_ready() then return
+
+    assert_eq(bfa_runs(raw"""
+        import sysl.buf.{Buf, buf}
+        import sysl.raw.ptr_cast
+
+        struct Holder
+            items: Buf[int]
+
+        main()
+            var words: Buf[usize] = buf()
+
+            words.push(0)
+
+            val h: *Holder = ptr_cast(words.index_place(0))
+            var seen = 0usize
+
+            seen += h.items.len()
+            words[0] = 0
+            seen += h.items.len()
+            exit(if seen == 0 then 42 else 1)
+        """), 42)
+
+// A handle in a box read through a pointer taken from the box, while the box is assigned: the box and
+// a handle are told nothing about each other.
+@test("at -O2 a Buf's box assigned while a pointer into it reads the handle computes right")
+bfa_box_assigned_through_pointer()
+    if !bfa_ready() then return
+
+    assert_eq(bfa_runs(raw"""
+        import sysl.buf.{Buf, buf}
+
+        @noinline
+        length_of(p: *Buf[int]) -> usize = p.len()
+
+        @noinline
+        swapped(c: &Buf[int], p: *Buf[int], next: Buf[int]) -> usize
+            val before = p.len()
+
+            *c = next
+            before + p.len()
+
+        main()
+            val c: &Buf[int] = buf()
+
+            c.push(1)
+
+            val other: Buf[int] = buf()
+
+            other.push(2)
+            other.push(3)
+            exit(if swapped(c, &*c, other) == 3 && length_of(&*c) == 2 then 42 else 1)
+        """), 42)
+
+// A pop writes the count and a further pop reads the handle it kept: a growth in between replaces the
+// storage behind the core, which the handle's being kept must not hide, and a field read off a returned
+// struct has no storage to read alone.
+@test("at -O2 pops, a growth and a field off a returned struct, through a kept handle, compute right")
+bfa_kept_handle_sees_growth()
+    if !bfa_ready() then return
+
+    assert_eq(bfa_runs(raw"""
+        import sysl.buf.{Buf, buf}
+
+        struct Machine
+            stack: Buf[int]
+            depth: int
+
+        @noinline
+        made() -> Machine
+            val m = Machine(buf(), 1)
+
+            m.stack.push(5)
+            m
+
+        @noinline
+        churn(vm: *Machine) -> int
+            var total = 0
+
+            for k in 0..<100
+                vm.stack.push(k)
+                vm.stack.push(k + 1)
+
+                val top = vm.stack.pop().unwrap()
+
+                for j in 0..<20 do vm.stack.push(j)
+
+                vm.stack.truncate(vm.stack.len() - 20)
+                total += top + vm.stack.pop().unwrap()
+
+            total
+
+        main()
+            var m = Machine(buf(), 0)
+            val got = churn(&m)
+
+            exit(if got == 10000 && m.stack.len() == 0 && made().stack.at(0) == 5 then 42 else 1)
         """), 42)
 
 // A handle in a struct, assigned a new buffer between pushes and pops and released to naming nothing:

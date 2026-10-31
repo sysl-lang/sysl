@@ -1494,6 +1494,11 @@ header is marked as one side, every access they make to an element as the other,
 may keep the header in registers across a loop that writes elements. A row operation over a matrix
 held in a `&Buf[real]` reads the length and the storage pointer once, not once per cell.
 
+A handle kept anywhere else, such as a field of a struct, is marked only as not being that record,
+since the record holds no handle: a `vm.stack.pop()` writes the count and the next one need not read
+the handle again. An element write says nothing about such a handle, because elements can hold
+handles themselves, so a handle is read again after one.
+
 It is a fact about where things are, not a rule a program has to keep. Every other access is
 unmarked: a view handed out by `view()` or `elems`, a reinterpreting view over the elements, a `ptr_cast`
 of an element's address, and C given the data pointer all read and write the elements with no mark

@@ -47,28 +47,45 @@ place_access(e: *Emit, x: TExpr) -> IrAccess = *x.kind match
 // Which side of a `Buf` a place is on, for the scopes a plain access carries (`ir_inst.sysl`,
 // `reference/arrays.md § Its elements are never its header`).
 //
-// **The header** is what is reached through a counted reference to a `Buf` or a `BufCore` -- a box,
-// which is an allocation of its own -- or through a `*BufCore`, and every field of a `BufCore`
-// wherever it sits: the type is private to `sysl.buf`, so a `BufCore` is only ever in a box or a
-// frame. A `Buf` reached any other way is NOT the header: a `Buf[Buf[T]]` keeps its handles among
-// its elements.
+// **The header** is what is reached through a counted reference to a `BufCore` -- a box, which is an
+// allocation of its own -- or through a `*BufCore`, and every field of a `BufCore` wherever it sits:
+// the type is private to `sysl.buf`, so a `BufCore` is only ever in a box or a frame.
+//
+// **The box** is what a counted reference to a `Buf` reaches, the handle alone in an allocation.
+//
+// **A handle** is any other `Buf`, or the `core` field of one, unless it is inside an element. All it
+// is told is that it is not a `BufCore`, which is what lets an interpreter's `vm.stack.pop()` write
+// the count and not read the handle again. A `Buf[Buf[T]]` keeps its handles among its elements, and
+// a program may lay handles out in a `Buf[usize]` of its own, so an element write is told nothing
+// about a handle and must be read again after one.
 //
 // **An element** is what `core.elems[i]` reaches for a `BufCore` `core`, and anything inside that
 // element. Indexing any other view, or reading through a pointer an element holds, is neither, and
 // keeps the plain access that says nothing.
 buf_side(x: TExpr) -> IrAccess = *x.kind match
-    TDeref(operand, _) -> if header_pointer(texpr_type(operand)) then AccBufHeader else AccPlain
-    TField(receiver, _, _) -> if is_buf_core(texpr_type(receiver)) then AccBufHeader else buf_side(receiver)
+    TDeref(operand, _) -> pointer_side(texpr_type(operand))
+    TField(receiver, _, ft) ->
+        if is_buf_core(texpr_type(receiver)) then AccBufHeader
+        else
+            buf_side(receiver) match
+                AccPlain ->
+                    if struct_base_is(ft, "Buf") || struct_base_is(texpr_type(receiver), "Buf") then AccBufHandle
+                    else AccPlain
+                other -> other
     TIndex(receiver, _, _) -> nameless(texpr_type(receiver)) match
         Array(_, _) -> buf_side(receiver)
         Slice(_, _) -> if is_core_elems(receiver) then AccBufElement else AccPlain
         _ -> AccPlain
     _ -> AccPlain
 
-header_pointer(t: Type) -> bool = underlying(t) match
-    Ref(inner, _) -> is_buf_core(*inner) || struct_base_is(*inner, "Buf")
-    Ptr(inner) -> is_buf_core(*inner)
-    _ -> false
+// The side a pointer of this type says its referent is on.
+pointer_side(t: Type) -> IrAccess = underlying(t) match
+    Ref(inner, _) ->
+        if is_buf_core(*inner) then AccBufHeader
+        else if struct_base_is(*inner, "Buf") then AccBufBox
+        else AccPlain
+    Ptr(inner) -> if is_buf_core(*inner) then AccBufHeader else AccPlain
+    _ -> AccPlain
 
 private is_buf_core(t: Type) -> bool = struct_base_is(t, "BufCore")
 
@@ -539,7 +556,7 @@ end store_into
 // A `Buf` access is a plain one with a scope beside it, and the scope is only ever a licence the
 // back end may decline, so the aggregate written at its address simply goes without.
 private is_plain(acc: IrAccess) -> bool = acc match
-    AccPlain | AccBufHeader | AccBufElement -> true
+    AccPlain | AccBufHeader | AccBufBox | AccBufElement | AccBufHandle -> true
     _ -> false
 
 // -- the bit ranges of a bitfield struct's container --------------------------------------------------

@@ -176,12 +176,24 @@ ord_on_failure(o: IrOrdering) -> IrOrdering = o match
 // its elements. A buffer's elements live in an allocation of their own, never inside a header, so
 // each kind is told the other is not what it touches (`reference/arrays.md § Its elements are never
 // its header`), and the optimizer can keep the header in registers across a loop that writes elements.
+//
+// **`AccBufBox` is the handle in a box of its own** (`&Buf[T]`), the box being an allocation neither
+// the `BufCore` nor the elements are in. `AccBufHeader` is the `BufCore`.
+//
+// **`AccBufHandle` is a `Buf` handle held anywhere else** -- a field of a struct, say -- and all it
+// and the `BufCore` are told is that they are not each other: a `BufCore` holds a view and a count and
+// no handle, and a handle is never inside a `BufCore`. So a write to the count does not make the
+// optimizer read the handle again. It says nothing about elements, which may hold handles themselves
+// (`Buf[Buf[T]]`) or, in storage a program lays out itself, any bytes at all; nor about a box, which a
+// `*Buf` taken from the box reads as this kind.
 enum IrAccess
     AccPlain
     AccVolatile
     AccAtomic(ordering: IrOrdering)
     AccBufHeader
+    AccBufBox
     AccBufElement
+    AccBufHandle
 end IrAccess
 
 // What a call says about floating point: a relaxation the back end is allowed (`reassoc`, written
@@ -429,11 +441,17 @@ private access_text(a: IrAccess) -> string = a match
 // artifact's copy of a member and the program that inlines it agree on what they mean -- and the text
 // needs no metadata table at the end of the module.
 private scope_text(a: IrAccess) -> string = a match
-    AccBufHeader -> s", !alias.scope ${buf_scope("header")}, !noalias ${buf_scope("elements")}"
-    AccBufElement -> s", !alias.scope ${buf_scope("elements")}, !noalias ${buf_scope("header")}"
+    AccBufHeader -> s", !alias.scope ${buf_scope("header")}, !noalias ${buf_scope_list("elements", "handle")}"
+    AccBufBox -> s", !alias.scope ${buf_scope("box")}, !noalias ${buf_scope_list("elements", "header")}"
+    AccBufElement -> s", !alias.scope ${buf_scope("elements")}, !noalias ${buf_scope_list("header", "box")}"
+    AccBufHandle -> s", !alias.scope ${buf_scope("handle")}, !noalias ${buf_scope("header")}"
     _ -> ""
 
-private buf_scope(side: string) -> string = s"!{!{!\"sysl.buf.$side\", !{!\"sysl.buf\"}}}"
+private buf_scope(side: string) -> string = s"!{${buf_scope_node(side)}}"
+
+private buf_scope_list(a: string, b: string) -> string = s"!{${buf_scope_node(a)}, ${buf_scope_node(b)}}"
+
+private buf_scope_node(side: string) -> string = s"!{!\"sysl.buf.$side\", !{!\"sysl.buf\"}}"
 
 private order_text(a: IrAccess) -> string = a match
     AccAtomic(o) -> s" ${ord_render(o)}"
