@@ -1,0 +1,225 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.{cstring, join}
+
+// A call through a trait object names no symbol: it loads a slot of whichever table the value
+// carries. The sweep that works out which `internal` bodies a library half drops treated it as a
+// call to the slot's target in every table of the trait, so once the library's own closure reading
+// module storage was erased into a `&Fn`, every `internal` body anywhere calling through a `&Fn` of
+// that type was dropped with it -- a dependency's private method among them. That dependency's small
+// public method, copied in to be inlined (`available_externally`), still called it: "'syslui-sdl''s
+// compiled half would name 4 symbol(s) it neither defines nor declares, the first of them
+// '...control$Control.read_requests'". Only an -O0 half, which copies nothing, built.
+
+private bdm_ready() -> bool = std_root().is_ok() && clang_available()
+
+private bdm_temp(prefix: string) -> string = absolute_path(make_temp_dir(prefix).unwrap())
+
+private bdm_write(root: string, rel: string, text: string)
+    val at = s"$root/$rel"
+
+    make_dir_all(parent_of(at).unwrap_or(root)).unwrap()
+    write_text(at, text).unwrap()
+end bdm_write
+
+private bdm_cli(args: []string) -> (int, string)
+    var lines: Buf[string] = buf()
+    val sink = &lines
+    val code = run_cli(args, (line) -> sink.push(line))
+
+    (code, join(lines.view(), "\n"))
+end bdm_cli
+
+// Storage filled when the program starts, and a private function of the library reading it: a
+// closure over it, or the function as a value, is dropped from the half.
+private val bdm_storage: string = "var base: int = 1\n\nval bump: int = base + 1\n\n" +
+    "private reads(x: int) -> int = x + bump\n\n"
+
+// `build-lib` of `root` says "checked", at -O0 and at -O2, where a dependency's small functions are
+// copied in.
+private bdm_checks(root: string)
+    for level in ["-O0", "-O2"]
+        val got = bdm_cli(["sysl", "build-lib", level, root])
+
+        assert_eq(got.0, Fine, got.1)
+        assert_eq(got.1, s"checked $root")
+end bdm_checks
+
+// A workspace whose root package `lib` depends on its member `dep`, beside a member program `app`
+// depending on both: both halves build, and the program, built optimized, prints `want`.
+private bdm_both(lib_src: string, dep_src: string, app_src: string, want: string)
+    val ws = bdm_temp("sysl-bdm-")
+
+    bdm_write(ws, "sysl.hocon", "package { name = \"lib\", version = \"0.1.0\" }\n" +
+              "workspace = [\"dep\", \"app\"]\n" +
+              "dependencies { dep { workspace = true } }\n")
+    bdm_write(ws, "lib/lib.sysl", s"module lib\n\nimport dep.*\n\n$bdm_storage$lib_src")
+    bdm_write(ws, "dep/sysl.hocon", "package { name = \"dep\", version = \"0.1.0\" }\n")
+    bdm_write(ws, "dep/dep/dep.sysl", s"module dep\n\nimport sysl.buf.{Buf, buf}\n\n$dep_src")
+    bdm_write(ws, "app/sysl.hocon", "package { name = \"app\", version = \"0.1.0\" }\n" +
+              "dependencies { lib { workspace = true }, dep { workspace = true } }\n")
+    bdm_write(ws, "app/main.sysl", s"import lib.*\nimport dep.*\n\n$app_src")
+
+    bdm_checks(ws)
+
+    val out_dir = bdm_temp("sysl-bdm-exe")
+
+    val said = build_native_program(s"$ws/app", None, None, "2", Some(s"$out_dir/program")) match
+        Err(why) -> s"refused: ${failure_text(why)}"
+        Ok(made) ->
+            capture(made, [], "", [], true) match
+                Err(_) -> "the program that was built could not be run"
+                Ok(out) -> if out.status.ok() then out.text else s"exited badly: ${out.text}"
+
+    assert_eq(said, want)
+    remove_dir_all(out_dir).unwrap_or(())
+    remove_dir_all(ws).unwrap_or(())
+end bdm_both
+
+// A box of `&Fn`s whose small public `run` calls a private method calling through each of them.
+private val bdm_box: string = "struct Box\n    fs: Buf[&Fn(int) -> int]\n\n" +
+    "    add(&self, f: &Fn(int) -> int) = self.fs.push(f)\n\n" +
+    "    run(&self) -> int = self.go()\n\n" +
+    "    private go(&self) -> int\n        var t = 0\n\n        for f in self.fs\n            t += f(1)\n\n" +
+    "        t\n    end go\nend Box\n\nbox() -> &Box = Box(buf())\n"
+
+@test("a dependency's small method calling its private one through a closure the library dropped")
+bdm_the_reduction()
+    if !bdm_ready() then return
+
+    bdm_both("total(b: &Box) -> int\n    b.add(x -> reads(x))\n    b.run()\nend total\n",
+             bdm_box, "print(total(box()))\n", "3\n")
+
+@test("the library's own function, not a closure, handed over as the value")
+bdm_a_function_value()
+    if !bdm_ready() then return
+
+    bdm_both("total(b: &Box) -> int\n    b.add(reads)\n    b.run()\nend total\n",
+             bdm_box, "print(total(box()))\n", "3\n")
+
+@test("through a trait object: a private type's method reading storage, called by the dependency")
+bdm_a_trait_object()
+    if !bdm_ready() then return
+
+    bdm_both("private struct Sq\n    k: int\n\nimpl Shape for Sq\n    area(self) -> int = self.k + bump\n\n" +
+             "fill(s: &Shapes) -> int\n    s.add(Sq(3))\n    s.total()\nend fill\n",
+             "trait Shape\n    area(self) -> int\n\nstruct Shapes\n    all: Buf[&Shape]\n\n" +
+             "    add(&self, s: &Shape) = self.all.push(s)\n\n    total(&self) -> int = self.sum()\n\n" +
+             "    private sum(&self) -> int\n        var t = 0\n\n        for s in self.all\n" +
+             "            t += s.area()\n\n        t\n    end sum\nend Shapes\n\n" +
+             "shapes() -> &Shapes = Shapes(buf())\n",
+             "print(fill(shapes()))\n", "5\n")
+
+@test("the dependency's type generic, instantiated by the library")
+bdm_a_generic_type()
+    if !bdm_ready() then return
+
+    bdm_both("pooled(p: &Pool[int]) -> int\n    p.add(x -> reads(x))\n    p.run(1)\nend pooled\n",
+             "struct Pool[T]\n    fs: Buf[&Fn(T) -> T]\n\n    add(&self, f: &Fn(T) -> T) = self.fs.push(f)\n\n" +
+             "    run(&self, x: T) -> T = self.go(x)\n\n    private go(&self, x: T) -> T\n        var v = x\n\n" +
+             "        for f in self.fs\n            v = f(v)\n\n        v\n    end go\nend Pool\n\n" +
+             "pool[T]() -> &Pool[T] = Pool(buf())\n",
+             "print(pooled(pool()))\n", "3\n")
+
+@test("the copied method passing the private one a default argument")
+bdm_a_default_argument()
+    if !bdm_ready() then return
+
+    bdm_both("total(b: &Box) -> int\n    b.add(x -> reads(x))\n    b.run() + b.run(2)\nend total\n",
+             "struct Box\n    fs: Buf[&Fn(int) -> int]\n\n    add(&self, f: &Fn(int) -> int) = self.fs.push(f)\n\n" +
+             "    run(&self, at: int = 1) -> int = self.go(at)\n\n    private go(&self, at: int) -> int\n" +
+             "        var t = 0\n\n        for f in self.fs\n            t += f(at)\n\n        t\n" +
+             "    end go\nend Box\n\nbox() -> &Box = Box(buf())\n",
+             "print(total(box()))\n", "7\n")
+
+@test("the call through the closure made in a nested function of the private method")
+bdm_a_nested_function()
+    if !bdm_ready() then return
+
+    bdm_both("total(b: &Box) -> int\n    b.add(x -> reads(x))\n    b.run()\nend total\n",
+             "struct Box\n    fs: Buf[&Fn(int) -> int]\n\n    add(&self, f: &Fn(int) -> int) = self.fs.push(f)\n\n" +
+             "    run(&self) -> int = self.go()\n\n    private go(&self) -> int\n" +
+             "        each(f: &Fn(int) -> int) -> int = f(1)\n\n        var t = 0\n\n" +
+             "        for f in self.fs\n            t += each(f)\n\n        t\n    end go\nend Box\n\n" +
+             "box() -> &Box = Box(buf())\n",
+             "print(total(box()))\n", "3\n")
+
+@test("the library's own private function calling through the closure stays in the half and runs")
+bdm_the_library_calls_through_it_too()
+    if !bdm_ready() then return
+
+    bdm_both("private each(f: &Fn(int) -> int) -> int = f(2)\n\n" +
+             "total(b: &Box) -> int\n    val f: &Fn(int) -> int = x -> reads(x)\n\n" +
+             "    b.add(f)\n    b.run() + each(f)\nend total\n",
+             bdm_box, "print(total(box()))\n", "7\n")
+
+@test("the dependency reached by a path rather than as a workspace member")
+bdm_a_path_dependency()
+    if !bdm_ready() then return
+
+    val ws = bdm_temp("sysl-bdm-path")
+
+    bdm_write(ws, "lib/sysl.hocon", "package { name = \"lib\", version = \"0.1.0\" }\n" +
+              "dependencies { dep { path = \"../dep\" } }\n")
+    bdm_write(ws, "lib/lib/lib.sysl", s"module lib\n\nimport dep.*\n\n$bdm_storage" +
+              "total(b: &Box) -> int\n    b.add(x -> reads(x))\n    b.run()\nend total\n")
+    bdm_write(ws, "dep/sysl.hocon", "package { name = \"dep\", version = \"0.1.0\" }\n")
+    bdm_write(ws, "dep/dep/dep.sysl", s"module dep\n\nimport sysl.buf.{Buf, buf}\n\n$bdm_box")
+
+    bdm_checks(s"$ws/lib")
+    remove_dir_all(ws).unwrap_or(())
+
+private extern "setenv" bdm_c_setenv(name: *u8, value: *u8, overwrite: int) -> int
+
+private bdm_set(name: string, value: string)
+    val k = cstring(name)
+    val v = cstring(value)
+
+    bdm_c_setenv(k.ptr, v.ptr, 1)
+
+private bdm_git(dir: string, args: []const string)
+    var all: Buf[string] = buf()
+
+    for a in ["-C", dir, "-c", "user.name=t", "-c", "user.email=t@t"]
+        all.push(a)
+
+    for a in args
+        all.push(a)
+
+    val o = capture("git", all.view(), "", [], true).unwrap()
+
+    assert(o.status.ok(), s"git ${args[0]} failed: ${o.err.unwrap_or("")}")
+end bdm_git
+
+@test("the dependency a git coordinate, fetched, its symbols under the coordinate's prefix")
+bdm_a_git_dependency()
+    if !bdm_ready() then return
+
+    val base = bdm_temp("sysl-bdm-git")
+    val repo = s"$base/e/bdmdep.git"
+
+    bdm_write(repo, "sysl.hocon", "package { name = \"bdmdep\", version = \"0.1.0\" }\n")
+    bdm_write(repo, "dep/dep.sysl", s"module dep\n\nimport sysl.buf.{Buf, buf}\n\n$bdm_box")
+    bdm_git(repo, ["init", "--quiet"])
+    bdm_git(repo, ["add", "-A"])
+    bdm_git(repo, ["commit", "--quiet", "-m", "one"])
+    bdm_git(repo, ["tag", "v0.1.0"])
+    bdm_set("GIT_CONFIG_COUNT", "1")
+    bdm_set("GIT_CONFIG_KEY_0", s"url.file://$base/.insteadOf")
+    bdm_set("GIT_CONFIG_VALUE_0", "https://github.com/")
+
+    val root = bdm_temp("sysl-bdm-lib")
+
+    make_dir_all(s"$root/vendor").unwrap()
+    bdm_write(root, "sysl.hocon", "package { name = \"lib\", version = \"0.1.0\" }\n" +
+              "dependencies { bdmdep { git = \"github.com/e/bdmdep\", version = \"0.1.0\" } }\n")
+    bdm_write(root, "lib/lib.sysl", s"module lib\n\nimport dep.*\n\n$bdm_storage" +
+              "total(b: &Box) -> int\n    b.add(x -> reads(x))\n    b.run()\nend total\n")
+
+    bdm_checks(root)
+    remove_dir_all(root).unwrap_or(())
+    remove_dir_all(base).unwrap_or(())
