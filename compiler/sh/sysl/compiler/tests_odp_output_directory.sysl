@@ -1,13 +1,13 @@
 module sh.sysl.compiler
 @tests
 
-import sysl.fs.{exists, make_dir_all, write_text}
+import sysl.fs.{exists, is_file, write_text}
 import sysl.text.Search
 
-// **A file named for output is refused up front when its directory is not there.** Left to the
-// toolchain the failure was clang's, naming an unrelated dependency's object file. The refusal names
-// the directory and is one shared check, so `build`, `build-c` and its `--header` / `--emit-llvm`
-// all say the same words. The directory is never made.
+// **`build -o` makes the directory of its output**, as `build-c` makes its archive's. Left to the
+// toolchain a missing directory failed as clang's error, naming an unrelated dependency's object
+// file. A file standing where the directory is needed is refused before anything is compiled, naming
+// that file.
 
 private odp_program() -> string = "main()\n    print(1)\n"
 
@@ -15,7 +15,7 @@ private odp_project() -> string = lbr_program(odp_program())
 
 private odp_cli(args: []string) -> (int, string) = lbr_cli(args)
 
-@test("odp: build -o into a directory that does not exist is refused, naming the directory")
+@test("odp: build -o into a directory that does not exist makes it and builds")
 odp_build_missing_directory()
     if !lbr_ready() then return
 
@@ -23,26 +23,26 @@ odp_build_missing_directory()
     val base = lbr_temp("sysl-odp")
     val got = odp_cli(["sysl", "build", "-o", s"$base/nope/program", p])
 
-    assert_eq(got.0, Failed)
-    assert_eq(got.1, s"sysl: error: the output directory $base/nope does not exist")
-    assert(!exists(s"$base/nope"), "the directory must not be made")
+    assert_eq(got.0, Fine)
+    assert(is_directory(s"$base/nope"), got.1)
+    assert(exists(s"$base/nope/program"), got.1)
     lbr_drop([p, base])
 end odp_build_missing_directory
 
-@test("odp: a missing directory several levels deep is refused as the same one directory")
+@test("odp: a missing directory several levels deep is made whole")
 odp_build_missing_nested()
     if !lbr_ready() then return
 
     val p = odp_project()
     val base = lbr_temp("sysl-odp")
-    val got = odp_cli(["sysl", "build", "-o", s"$base/a/b/program", p])
+    val got = odp_cli(["sysl", "build", "-o", s"$base/a/b/c/program", p])
 
-    assert_eq(got.0, Failed)
-    assert_eq(got.1, s"sysl: error: the output directory $base/a/b does not exist")
+    assert_eq(got.0, Fine)
+    assert(exists(s"$base/a/b/c/program"), got.1)
     lbr_drop([p, base])
 end odp_build_missing_nested
 
-@test("odp: a parent that is a regular file is refused")
+@test("odp: a parent that is a regular file is refused, naming it, before compiling")
 odp_build_parent_is_a_file()
     if !lbr_ready() then return
 
@@ -54,9 +54,49 @@ odp_build_parent_is_a_file()
     val got = odp_cli(["sysl", "build", "-o", s"$base/plain/program", p])
 
     assert_eq(got.0, Failed)
-    assert_eq(got.1, s"sysl: error: the output directory $base/plain is not a directory")
+    assert_eq(got.1, s"sysl: error: cannot make the directory '$base/plain': " +
+                     "a file is already there, and a directory is needed")
+    assert(is_file(s"$base/plain"), "the file must be left alone")
     lbr_drop([p, base])
 end odp_build_parent_is_a_file
+
+@test("odp: a file further up the way is the one named")
+odp_build_file_higher_up()
+    if !lbr_ready() then return
+
+    val p = odp_project()
+    val base = lbr_temp("sysl-odp")
+
+    write_text(s"$base/plain", "x").unwrap()
+
+    val got = odp_cli(["sysl", "build", "-o", s"$base/plain/deeper/program", p])
+
+    assert_eq(got.0, Failed)
+    assert(got.1.contains(s"'$base/plain'"), got.1)
+    lbr_drop([p, base])
+end odp_build_file_higher_up
+
+@test("odp: a program with a library beside it never gets a dependency's file named")
+odp_build_with_dependency()
+    if !lbr_ready() then return
+
+    val p = lbr_project(lbr_two("main.sysl", "print(odp_dep.one())\n",
+                                "odp_dep/lib.sysl", "module odp_dep\n\none() -> int = 1\n"))
+    val base = lbr_temp("sysl-odp")
+    write_text(s"$base/plain", "x").unwrap()
+
+    val refused = odp_cli(["sysl", "build", "-o", s"$base/plain/program", p])
+
+    assert_eq(refused.0, Failed)
+    assert(refused.1.contains("cannot make the directory"), refused.1)
+    assert(!refused.1.contains(".o"), refused.1)
+
+    val made = odp_cli(["sysl", "build", "-o", s"$base/fresh/program", p])
+
+    assert_eq(made.0, Fine)
+    assert(exists(s"$base/fresh/program"), made.1)
+    lbr_drop([p, base])
+end odp_build_with_dependency
 
 @test("odp: an existing directory still builds")
 odp_build_existing_directory()
@@ -71,43 +111,10 @@ odp_build_existing_directory()
     lbr_drop([p, base])
 end odp_build_existing_directory
 
-@test("odp: a bare name and a ./ name have the current directory for a parent and pass the check")
+@test("odp: a bare name, a ./ name and none need nothing made")
 odp_bare_names_pass()
-    assert(output_directory_present(Some("x")).is_ok())
-    assert(output_directory_present(Some("./x")).is_ok())
-    assert(output_directory_present(None).is_ok())
-    assert(output_directory_present(Some("/x")).is_ok())
+    assert(make_output_directory(Some("x")).is_ok())
+    assert(make_output_directory(Some("./x")).is_ok())
+    assert(make_output_directory(None).is_ok())
+    assert(make_output_directory(Some("/x")).is_ok())
 end odp_bare_names_pass
-
-@test("odp: a relative name with a missing parent is refused, a relative name with an existing one is not")
-odp_relative_names()
-    assert_eq(output_directory_present(Some("odp-no-such-dir/x")).err().unwrap().message,
-              "the output directory odp-no-such-dir does not exist")
-    assert(output_directory_present(Some("./x")).is_ok())
-end odp_relative_names
-
-@test("odp: build-c -o, --header and --emit-llvm each refuse a missing directory")
-odp_build_c_each_output()
-    if !lbr_ready() then return
-
-    val p = lbr_project(lbr_one("lib.sysl", "module odp_lib\n\nexport\nodp_one() -> int = 1\n"))
-    val base = lbr_temp("sysl-odp")
-
-    make_dir_all(s"$base/here").unwrap()
-
-    val archive = odp_cli(["sysl", "build-c", "-o", s"$base/gone/lib.a", p])
-
-    assert_eq(archive.0, Failed)
-    assert_eq(archive.1, s"sysl: error: the output directory $base/gone does not exist")
-
-    val header = odp_cli(["sysl", "build-c", "-o", s"$base/here/lib.a", "--header", s"$base/gone/lib.h", p])
-
-    assert_eq(header.0, Failed)
-    assert_eq(header.1, s"sysl: error: the output directory $base/gone does not exist")
-
-    val ll = odp_cli(["sysl", "build-c", "-o", s"$base/here/lib.a", "--emit-llvm", s"$base/gone/lib.ll", p])
-
-    assert_eq(ll.0, Failed)
-    assert_eq(ll.1, s"sysl: error: the output directory $base/gone does not exist")
-    lbr_drop([p, base])
-end odp_build_c_each_output
