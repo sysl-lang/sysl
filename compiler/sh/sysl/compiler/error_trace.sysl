@@ -31,8 +31,16 @@ import sysl.math.bigint.from_int
 // and puts the trace back to where the first statement it leaves found it. A way out of the function
 // that is not a failure -- a `return` from inside such a statement, or a last expression that handles
 // one -- puts it back to where the function's first open mark found it, so the function leaves the
-// trace as it found it (`trace_answer`). This is the one cost on a success path: a call that reads
-// the length and one that writes it, per such statement, and a write per way out taken from inside one.
+// trace as it found it (`trace_answer`). This is the one cost on a success path: a read of the length
+// and a write of it, per such statement, and a write per way out taken from inside one.
+//
+// **On a hosted target those are a load and a store** of the count of `sysl_error_trace_live`, the
+// thread's live store, reached through `llvm.threadlocal.address`. The store stays at one address for
+// the whole life of a thread (`sysl_error_trace_use` copies into it), so LLVM folds the address to
+// one per function and moves it out of a loop -- and, because it knows the intrinsic, never across a
+// coroutine's suspension, where a sync body inlined into an `async` one may resume on another thread.
+// **A coroutine's own pruning calls `mark` and `reset`**, and so does a freestanding target, because
+// the store its hook answers can change under a function (`pays_by_address`).
 //
 // **Off is free**: with `error_traces = false` or `--no-error-traces` nothing is recorded, no site is
 // laid down, nothing is pruned, and the library's reads of the trace are answered here without a
@@ -59,8 +67,29 @@ error_traces_key() -> string = if traces_on then "" else "-nt"
 private const PushSymbol: string = "sysl_error_trace_push"
 private const MarkSymbol: string = "sysl_error_trace_mark"
 private const ResetSymbol: string = "sysl_error_trace_reset"
+private const LiveSymbol: string = "sysl_error_trace_live"
+private const AddressIntrinsic: string = "llvm.threadlocal.address.p0"
 
-// The three functions a module recording into the trace calls, as it declares them.
+trace_address_intrinsic() -> string = AddressIntrinsic
+
+// `llvm.threadlocal.address` takes the global and answers this thread's copy of it.
+trace_address_type() -> IrFnType
+    var at: Buf[IrParam] = buf()
+
+    at.push(ir_param(LPtr))
+    ir_fn_type(LPtr, at)
+end trace_address_type
+
+// The hosted trace's live store, `sysl_error_trace_live` in the library's C, as a module reaching its
+// count declares it: thread-local, laid down by the C. Only its count, the first field, is read here,
+// so it is declared as that. Nothing on a freestanding target or with traces off.
+trace_live_global(e: *Emit) -> Option[IrGlobal]
+    if !traces_on || !e.traces || !os_hosted(e.target.os) then return None
+
+    Some(ir_extern_global(LiveSymbol, l_i32(), binds_locally(e)) with { thread_local = true })
+end trace_live_global
+
+// The three functions a module recording into the trace always may call, as it declares them.
 trace_signatures() -> Buf[(string, IrFnType)]
     var out: Buf[(string, IrFnType)] = buf()
     var at: Buf[IrParam] = buf()
@@ -227,13 +256,37 @@ trace_enter(e: *Emit, s: TStmt) -> Option[Val]
 end trace_enter
 
 private take_mark(e: *Emit) -> Option[Val]
+    e.traces = true
+
+    if pays_by_address(e)
+        val at = count_address(e)
+        val n = fresh_reg(e)
+
+        emit(e, InLoad(n, l_i32(), at, AccPlain, None))
+        e.trace_marks.push(n)
+        return Some(n)
+    end if
+
     val n = fresh_reg(e)
 
-    e.traces = true
     emit(e, ir_call(Some(n), l_i32(), VGlobal(MarkSymbol), no_ir_args()))
     e.trace_marks.push(n)
     Some(n)
 end take_mark
+
+// Whether the body being lowered reaches the length through the thread's count directly. It holds
+// where the trace is one thread-local object at one address (a hosted target) and the body stays on
+// one thread for as long as it runs (anything but a coroutine, which an `await` may resume elsewhere).
+private pays_by_address(e: *Emit) -> bool = os_hosted(e.target.os) && e.coro.is_none()
+
+private count_address(e: *Emit) -> Val
+    val at = fresh_reg(e)
+    var args: Buf[IrArg] = buf()
+
+    args.push(ir_arg(LPtr, VGlobal(LiveSymbol)))
+    emit(e, ir_call(Some(at), LPtr, VGlobal(AddressIntrinsic), args))
+    at
+end count_address
 
 // Before a value the function answers with -- its body's last expression or a `return`'s -- in a
 // function answering `ret`: where the value handles a failure, the trace's length, saved for the way
@@ -338,6 +391,11 @@ trace_unwind(e: *Emit, depth: usize)
 end trace_unwind
 
 private reset_to(e: *Emit, n: Val)
+    if pays_by_address(e)
+        emit(e, InStore(l_i32(), n, count_address(e), AccPlain, None))
+        return
+    end if
+
     var args: Buf[IrArg] = buf()
 
     args.push(ir_arg(l_i32(), n))

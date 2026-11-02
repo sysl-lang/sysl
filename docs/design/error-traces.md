@@ -120,10 +120,14 @@ strings, not addresses), because the second must work on a Pico with nothing to 
   on a freestanding one (`__STDC_HOSTED__`), with `sysl_error_trace_push`/`_mark`/`_reset` called by
   the emitted code and `_len`/`_site`/`_clear`/`_report` read by the library. With traces off the
   compiler answers each library read where it is called (`trace_seam_off`), so the C is never linked.
-- **Pruning is two calls per handling statement** (mark before, reset after), not an inline load and
-  store: a call reaches the right thread's ring inside a coroutine resumed on another thread, which a
-  thread-local address cached across an `await` would not. `break` and `continue` reset to the first
-  mark opened inside the loop they leave.
+- **Pruning is a read of the length before a handling statement and a write after it.** On a hosted
+  target, outside a coroutine, they are a load and a store through `sysl_error_trace_count()`, the
+  address of the thread's count, declared `memory(none)` and `speculatable` so LLVM folds it to one
+  call per function and lifts it out of a loop. It is one address for a thread's whole life
+  (`sysl_error_trace_use` copies into the live store rather than moving it). A coroutine calls
+  `sysl_error_trace_mark`/`_reset` instead, since an address read before an `await` may be another
+  thread's after it, and so does a freestanding target, whose hook may answer a different store
+  under a function. `break` and `continue` reset to the first mark opened inside the loop they leave.
 
 The plan as it was written:
 
