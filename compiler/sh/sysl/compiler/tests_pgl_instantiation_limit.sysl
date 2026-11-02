@@ -1,0 +1,255 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.join
+
+// A generic that asks for itself at a new type at every level is refused at the call that grows the
+// type (`instantiation_limit.sysl`, `reference/generics.md § Monomorphization`). Before, the build
+// never finished: `nest(n - 1, (x, x))` asked for `nest[(T, T)]`, whose body asked for the next, and
+// a by-name parameter forwarded as a new expression made a new thunk type at every level.
+//
+// Cells: a type that doubles (the name limit) and one that grows by one constructor (the depth
+// limit); a by-name parameter; a closure literal around the parameter; mutual recursion; a method; a
+// trait's generic impl; each in debug and release where the shape is the headline. Accepted: a
+// shrinking recursion 64 deep, which is the limit itself; a by-name parameter forwarded bare.
+// Skipped: the separate-compilation axis -- a `.syslib` carries no generic bodies to instantiate
+// across, so the chain is read in the program that uses it either way.
+
+// Built with the CLI under `flags` and run; a refusal answers with what was said.
+private pgl_built(text: string, flags: []string) -> string
+    val root = make_temp_dir("sysl-pgl").unwrap()
+    val exe = s"$root/built"
+
+    write_text(s"$root/main.sysl", forms_imported_in(s"$root/main.sysl", text)).unwrap()
+
+    var args: Buf[string] = buf()
+
+    args.push("sysl")
+    args.push("build")
+    args.push(s"$root/main.sysl")
+    args.push("-o")
+    args.push(exe)
+
+    for item in flags
+        args.push(item)
+
+    var lines: Buf[string] = buf()
+    val sink = &lines
+    val code = run_cli(args.view(), line -> sink.push(line))
+
+    if code != 0
+        remove_dir_all(root).unwrap_or(())
+        return s"refused: ${join(lines.view(), "\n")}"
+    end if
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end pgl_built
+
+private pgl_refused(text: string, flags: []string, fn_name: string, line_col: string)
+    val said = pgl_built(text, flags)
+
+    assert(said.starts_with("refused: "), said)
+    assert(said.contains("reached the instantiation limit while instantiating '"), said)
+    assert(said.contains(s"the call here asks for '$fn_name' at a new type at every level"), said)
+    assert(said.contains("so its instantiations would never end"), said)
+    assert(said.contains(s"main.sysl:$line_col"), said)
+end pgl_refused
+
+private val pgl_nest: string = raw"""
+    nest[T](n: int, x: T) -> int = if n == 0 then 0 else 1 + nest(n - 1, (x, x))
+
+    print(nest(3, 1))
+    """
+
+@test("a generic asking for itself at a doubling type is refused at the call, in debug and release")
+pgl_doubling_type()
+    if xvr_no_library() || !clang_available() then return
+
+    pgl_refused(pgl_nest, ["--debug"], "nest", "1:58")
+    pgl_refused(pgl_nest, ["--release"], "nest", "1:58")
+end pgl_doubling_type
+
+@test("the doubling type is shown cut short, and the refusal says where the chain began")
+pgl_doubling_shown()
+    if xvr_no_library() then return
+
+    val said = pgl_built(pgl_nest, [])
+
+    assert(said.contains("'nest[((((((("), said)
+    assert(said.contains("…'"), said)
+    assert(said.contains("(the chain began at "), said)
+    assert(said.contains("main.sysl:3)"), said)
+end pgl_doubling_shown
+
+private val pgl_grow: string = raw"""
+    grow(n: int, v: -> int) -> int = if n == 0 then v else grow(n - 1, v + 1)
+
+    print(grow(3, 0))
+    """
+
+@test("a by-name parameter forwarded as a new expression is refused, in debug and release")
+pgl_by_name_expression()
+    if xvr_no_library() || !clang_available() then return
+
+    pgl_refused(pgl_grow, ["--debug"], "grow", "1:56")
+    pgl_refused(pgl_grow, ["--release"], "grow", "1:56")
+    assert(pgl_built(pgl_grow, []).contains("65 levels deep"))
+end pgl_by_name_expression
+
+@test("a by-name parameter forwarded as itself still builds and runs")
+pgl_by_name_bare()
+    if xvr_no_library() then return
+
+    val text = raw"""
+        down(n: int, v: -> int) -> int = if n == 0 then 0 else v + down(n - 1, v)
+
+        print(down(3, 2))
+        """
+
+    assert_eq(pgl_built(text, []), "6\n")
+end pgl_by_name_bare
+
+@test("a closure literal around a closure parameter, passed recursively, is refused")
+pgl_closure_growth()
+    if xvr_no_library() then return
+
+    val text = raw"""
+        wrap(n: int, f: () -> int) -> int = if n == 0 then f() else wrap(n - 1, () -> f() + 1)
+
+        print(wrap(3, () -> 0))
+        """
+
+    pgl_refused(text, [], "wrap", "1:61")
+end pgl_closure_growth
+
+@test("two generics asking for each other at a growing type are refused at the call that closes the loop")
+pgl_mutual()
+    if xvr_no_library() then return
+
+    val text = raw"""
+        f[T](n: int, x: T) -> int = if n == 0 then 0 else 1 + g(n - 1, Some(x))
+        g[T](n: int, x: T) -> int = if n == 0 then 0 else 1 + f(n - 1, x)
+
+        print(f(3, 1))
+        """
+
+    pgl_refused(text, [], "f", "2:55")
+end pgl_mutual
+
+@test("a generic method asking for itself at a growing type is refused")
+pgl_method()
+    if xvr_no_library() then return
+
+    val text = raw"""
+        struct Walker
+            step: int
+
+        impl Walker
+            go[T](self, n: int, x: T) -> int = if n == 0 then self.step else self.go(n - 1, Some(x))
+
+        print(Walker(1).go(3, 1))
+        """
+
+    pgl_refused(text, [], "Walker.go", "5:75")
+end pgl_method
+
+@test("a trait's generic impl asking for itself at a growing receiver is refused")
+pgl_trait()
+    if xvr_no_library() then return
+
+    val text = raw"""
+        trait Deep
+            depth(self, n: int) -> int
+
+        impl Deep for int
+            depth(self, n: int) -> int = if n == 0 then self else Some(self).depth(n - 1)
+
+        impl[T: Deep] Deep for Option[T]
+            depth(self, n: int) -> int = if n == 0 then 0 else Some(self).depth(n - 1)
+
+        print(5.depth(3))
+        """
+
+    pgl_refused(text, [], "sysl.Option.depth", "8:67")
+end pgl_trait
+
+// A recursion over a type the program wrote out, `levels` constructors deep: each instantiation asks
+// for the one a level shallower, so the chain is as long as the type.
+private pgl_shrinking(levels: int) -> string
+    var value = "1"
+
+    for _ in 0..<levels
+        value = s"Some($value)"
+
+    s"""
+trait Count
+    count(self) -> int
+
+impl Count for int
+    count(self) -> int = 0
+
+impl[T: Count] Count for Option[T]
+    count(self) -> int = self match
+        Some(inner) -> 1 + inner.count()
+        None -> 0
+
+print(${value}.count())
+"""
+end pgl_shrinking
+
+@test("a recursion over a written type deeper than the limit builds and runs: a shrinking type is not counted")
+pgl_shrinking_past_the_limit()
+    if xvr_no_library() then return
+
+    assert_eq(pgl_built(pgl_shrinking(100), []), "100\n")
+end pgl_shrinking_past_the_limit
+
+// A type-level counter: each instance asks for the next at a type one `Option` larger, and the value
+// parameter stops it after `n + 1` instances.
+private pgl_counter(n: int) -> string = s"""
+deepen[const N: int, T](x: T) -> int
+    if const N == 0
+        0
+    else
+        1 + deepen[N - 1](Some(x))
+
+print(deepen[$n](1))
+"""
+
+@test("a growing chain bounded by a value parameter at 64 instances, the limit itself, builds and runs, in debug and release")
+pgl_counter_at_the_limit()
+    if xvr_no_library() || !clang_available() then return
+
+    assert_eq(pgl_built(pgl_counter(63), ["--debug"]), "63\n")
+    assert_eq(pgl_built(pgl_counter(63), ["--release"]), "63\n")
+end pgl_counter_at_the_limit
+
+@test("the same counter one instance past the limit is refused")
+pgl_counter_past_the_limit()
+    if xvr_no_library() then return
+
+    pgl_refused(pgl_counter(64), [], "deepen", "5:19")
+    assert(pgl_built(pgl_counter(64), []).contains("65 levels deep"))
+end pgl_counter_past_the_limit
+
+@test("a generic recursing at its own type, any depth at run time, is one instantiation")
+pgl_fixed_instantiation()
+    if xvr_no_library() then return
+
+    val text = raw"""
+        sum[T](n: int, x: T, f: T -> int) -> int = if n == 0 then 0 else f(x) + sum(n - 1, x, f)
+
+        print(sum(1000, 3, v -> v * 2))
+        """
+
+    assert_eq(pgl_built(text, []), "6000\n")
+end pgl_fixed_instantiation

@@ -1599,6 +1599,23 @@ no dictionary passed at run time.
   is preferable.
 - **Recursion is fine.** A recursive generic function recurses at a *fixed* instantiation, so it
   monomorphizes like any other.
+- **A recursion that asks for itself at a new type at every level is refused.** Its instantiations
+  would never end, whatever value stops it at run time, so one chain of calls may hold at most 64
+  instantiations of one function at types that do not shrink (a recursion down a type the program
+  wrote is bounded by it, and not counted), and an instantiation's name at most 32768 bytes, which a
+  type that doubles at every level reaches first. The same holds of a [by-name
+  parameter](/reference/types/#a-parameter-passed-by-name) forwarded as a new expression, each
+  level's thunk being a new callable; forwarding the parameter itself is fine.
+
+```sysl
+nest[T](n: int, x: T) -> int = if n == 0 then 0 else 1 + nest(n - 1, (x, x))
+
+print(nest(3, 1))
+```
+
+```error
+the call here asks for 'nest' at a new type at every level
+```
 
 ### A nested function may be generic
 

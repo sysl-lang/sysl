@@ -1,0 +1,93 @@
+module sh.sysl.compiler
+
+// **A generic that asks for itself at a new type at every level never finishes instantiating**, and
+// is refused instead of read until the machine runs out: `nest[T](n: int, x: T)` calling
+// `nest(n - 1, (x, x))` asks for `nest[(T, T)]`, whose body asks for `nest[((T, T), (T, T))]`, and the
+// value `n` that stops the recursion at run time stops nothing here. A by-name parameter forwarded as
+// a new expression (`grow(n - 1, v + 1)`) is the same thing, each level's thunk being a new callable.
+//
+// Two measures, both read along the chain of calls that asked for an instantiation
+// (`MemberTables.asked_from`) when its body is about to be read, so nothing is spent on a program that
+// never comes near them:
+//
+// - **how many instantiations of one declaration the chain holds at names no shorter than this
+//   one's** -- a recursion that shrinks its type (`show[Option[Option[int]]]` asking for
+//   `show[Option[int]]`) is bounded by what the program wrote, and is not counted; one that grows
+//   is not bounded, and a new callable at every level is a new name at least as long;
+// - **how long the instantiation's name is**, since a type that doubles at every level (`(x, x)`)
+//   costs twice as much to read at each one and would exhaust the machine long before the first
+//   limit is reached.
+//
+// The refusal points at the call that asked for the instantiation over the limit, which is the call
+// that makes the type grow.
+
+// The most instantiations of one declaration one chain may hold. The compiler's own build reaches 1,
+// the standard library's tests 3.
+val InstantiationDepthLimit = 64
+
+// The longest name an instantiation may go under, in bytes. The longest the compiler's own build and
+// the standard library's tests make is 171.
+val InstantiationNameLimit: usize = 32768
+
+// How far a chain is followed. A chain is acyclic -- a body asks only for instantiations that did not
+// exist before it was read -- and this is the bound that holds whatever a rewound reading left behind.
+private val ChainSteps = 4096
+
+// Whether the instantiation `job` stays within the limits, refusing it at the call that asked for it
+// when it does not. Records which declaration it was made from either way, for the chains of what
+// its body asks for.
+within_instantiation_limit(a: &Analysis, job: PendingInst) -> bool
+    val members = a.tables.members
+    val origin = members.func_origin.get(job.name).unwrap_or(job.decl.name)
+
+    members.inst_origin.put(job.name, origin)
+
+    var levels = 1
+    var at = job.name
+    var first = members.asked_from.get(job.name)
+    var steps = 0
+
+    while steps < ChainSteps
+        val from = members.asked_from.get(at)
+
+        if from.is_none() || from.unwrap().by == at then break
+
+        val by = from.unwrap().by
+
+        if by.len <= job.name.len && members.inst_origin.get(by) == Some(origin)
+            levels += 1
+            first = members.asked_from.get(by)
+
+        at = by
+        steps += 1
+    end while
+
+    if levels <= InstantiationDepthLimit && job.name.len <= InstantiationNameLimit then return true
+
+    val asked = members.asked_from.get(job.name)
+
+    // Nothing asked for it from a body (the entry's own instantiations): nothing to point at, and no
+    // chain to have grown.
+    if asked.is_none() then return true
+
+    val shown = clipped(instance_shown(a, job.name, job.subst), 120)
+    val began = if first.is_some() then s" (the chain began at ${first.unwrap().file}:${first.unwrap().line})" else ""
+
+    a.fault(asked.unwrap().site, asked.unwrap().at,
+            s"reached the instantiation limit while instantiating '$shown': the call here asks for " +
+            s"'${qualified_name(origin)}' at a new type at every level, $levels levels deep, so its " +
+            s"instantiations would never end$began")
+    false
+end within_instantiation_limit
+
+// `text` cut to at most `most` bytes at a character boundary, with an ellipsis where it was cut.
+private clipped(text: string, most: usize) -> string
+    if text.len <= most then return text
+
+    var cut = most
+
+    while cut > 0 && (text.bytes[cut] & 0xC0) == 0x80
+        cut -= 1
+
+    s"${text[0..<cut]}…"
+end clipped
