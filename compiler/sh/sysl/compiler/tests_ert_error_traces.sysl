@@ -617,8 +617,8 @@ ert_on_lays_down_the_three_calls()
 
     assert(ir.contains("call void @sysl_error_trace_push(ptr @.loc"), ir)
     assert(ir.contains("c\"main.sysl:12:22 in load\\00\""), ir)
-    assert(ir.contains("= call i32 @sysl_error_trace_mark()"), ir)
-    assert(ir.contains("call void @sysl_error_trace_reset(i32 %"), ir)
+    assert(ir.contains("= call ptr @llvm.threadlocal.address.p0(ptr @sysl_error_trace_live)"), ir)
+    assert(ir.contains("store i32 %"), ir)
 end ert_on_lays_down_the_three_calls
 
 @test("a failing chain allocates nothing: the counted heap ends where it began")
@@ -760,9 +760,10 @@ etk_a_dispatch_loop_pays_only_where_it_handles()
                              "print(run([Op.Probe(3)]).unwrap_or(0))\n"))
     val run = etk_body_of(ir, " @run$$")
 
-    assert_eq(run.count_of("call i32 @sysl_error_trace_mark()"), 1)
-    assert_eq(run.count_of("call void @sysl_error_trace_reset(i32 %"), 1)
-    assert_eq(ir.count_of("call i32 @sysl_error_trace_mark()"), 2)
+    // A mark and a reset each reach the count once: a load and a store through it.
+    assert_eq(run.count_of("(ptr @sysl_error_trace_live)"), 2)
+    assert_eq(ir.count_of("(ptr @sysl_error_trace_live)"), 4)
+    assert(!ir.contains("call i32 @sysl_error_trace_mark()"), ir)
 end etk_a_dispatch_loop_pays_only_where_it_handles
 
 @test("a '?' and a returned failure inside a loop and a match lay down no mark, no reset and no TLS")
@@ -1243,8 +1244,7 @@ stl_the_cost_stays_where_it_was()
 
     assert(!plain.contains("sysl_error_trace_mark") && !plain.contains("sysl_error_trace_reset"), plain)
     assert(!plain.contains("threadlocal") && !plain.contains("_tlv"), plain)
-    assert_eq(tail.count_of("call i32 @sysl_error_trace_mark()"), 1)
-    assert_eq(tail.count_of("call void @sysl_error_trace_reset(i32 %"), 1)
-    assert_eq(arm.count_of("call i32 @sysl_error_trace_mark()"), 1)
-    assert_eq(arm.count_of("call void @sysl_error_trace_reset(i32 %"), 2)
+    assert(!plain.contains("sysl_error_trace_live"), plain)
+    assert_eq(tail.count_of("(ptr @sysl_error_trace_live)"), 2)
+    assert_eq(arm.count_of("(ptr @sysl_error_trace_live)"), 3)
 end stl_the_cost_stays_where_it_was
