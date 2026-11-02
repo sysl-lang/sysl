@@ -90,6 +90,10 @@ end mentions_closure
 closure_expr(cx: &Analyzer, span: Span, written: Buf[LambdaParam], body: Buf[Stmt],
              implicit: bool, expected: Option[Type]) -> TExpr
     val want = if expected.is_none() then None else callable_signature(cx.an, expected.unwrap())
+    val forwarded = forwarded_by_name(cx, span, written, body, implicit, expected, want)
+
+    if forwarded.is_some() then return forwarded.unwrap()
+
     val params = if implicit then block_params(span, want) else written
 
     if want.is_some() && want.unwrap().0.len() != params.len()
@@ -141,6 +145,51 @@ closure_expr(cx: &Analyzer, span: Span, written: Buf[LambdaParam], body: Buf[Stm
 
     lowered
 end closure_expr
+
+// **A by-name parameter forwarded as itself is the callable it already is**, not a closure around a
+// call of it. `f(n - 1, value)` at a by-name `value` would otherwise thunk the read into a new
+// closure, whose type is a new instantiation of `f`, whose body makes another -- a recursion through
+// a by-name parameter that never stops instantiating. Passing the same callable keeps the
+// instantiation the same one, and changes nothing a program can see: calling the closure would have
+// called the callable once, which is exactly what a read of the forwarded one does.
+//
+// Only the bare name qualifies, only at a position generic in the callable (a bare arrow, a by-name
+// parameter) -- a trait object asked for is still built from a closure -- and only where nothing the
+// closure would have done is lost: no parameters, and a result the position asks for that the
+// callable already yields.
+private forwarded_by_name(cx: &Analyzer, span: Span, written: Buf[LambdaParam], body: Buf[Stmt],
+                          implicit: bool, expected: Option[Type],
+                          want: Option[(Buf[Type], Option[Type])]) -> Option[TExpr]
+    if implicit || !written.is_empty() || body.len() != 1 || expected.is_none() then return None
+
+    // A bounded parameter, or the bound itself, which is what a generic call reads a held-back
+    // callable against. A trait object is a `Trait` behind a reference, and is not this.
+    expected.unwrap() match
+        Abstract(_, _) -> ()
+        Trait(_, _, _) -> ()
+        _ -> return None
+
+    if want.is_none() || !want.unwrap().0.is_empty() then return None
+
+    val name = *body.at(0).kind match
+        ExprStmt(e) -> *e.kind match
+            Ident(n) -> n
+            _ -> return None
+        _ -> return None
+
+    if !reads_by_name(cx, name) then return None
+
+    val source = capture_source(cx, span, name)
+    val has = callable_signature(cx.an, texpr_type(source))
+
+    if has.is_none() || !has.unwrap().0.is_empty() then return None
+
+    if want.unwrap().1.is_some()
+        if has.unwrap().1.is_none() || has.unwrap().1.unwrap() != want.unwrap().1.unwrap() then return None
+    end if
+
+    Some(TExpr(span, source.kind))
+end forwarded_by_name
 
 // What a closure literal wrote for its parameters, and the types they were read at. A closure is
 // only ever refused a callable bound because a parameter's written type disagrees with what the

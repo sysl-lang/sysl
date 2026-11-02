@@ -1,0 +1,263 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.join
+
+// A by-name parameter forwarded to a recursive call (`reference/types.md § A parameter passed by
+// name`). A by-name parameter is a bounded type parameter, one specialised copy per callable, and
+// the call thunked its argument into a new closure: forwarding `value` as `repeat(n - 1, value)`
+// made a closure around a read of it, whose type was a new instantiation of `repeat`, whose body
+// made another -- the build never finished. Forwarding the parameter as itself now passes the same
+// callable, so the recursion reuses its own instantiation, and every read still evaluates the
+// argument the outermost call wrote.
+//
+// A method's by-name parameter was not thunked at all ("takes a callable () -> int here, but int is
+// not one"); its arguments are now bound as a function's are.
+//
+// Skipped cell: forwarding an EXPRESSION of the parameter (`grow(n - 1, value + 1)`) is a genuinely
+// new callable at every level -- polymorphic recursion, which a plain generic (`nest(n - 1, (x,
+// x))`) shows as well. Neither has a documented outcome, so it is reported rather than decided here.
+
+private bnr_ran(text: string) -> string = xvr_ran([("main.sysl", text)])
+
+// Built with the CLI under `flags` and run.
+private bnr_built(text: string, flags: []string) -> string
+    val root = make_temp_dir("sysl-bnr").unwrap()
+    val exe = s"$root/built"
+
+    write_text(s"$root/main.sysl", forms_imported_in(s"$root/main.sysl", text)).unwrap()
+
+    var args: Buf[string] = buf()
+
+    args.push("sysl")
+    args.push("build")
+    args.push(s"$root/main.sysl")
+    args.push("-o")
+    args.push(exe)
+
+    for item in flags
+        args.push(item)
+
+    var lines: Buf[string] = buf()
+    val sink = &lines
+    val code = run_cli(args.view(), line -> sink.push(line))
+
+    if code != 0
+        remove_dir_all(root).unwrap_or(())
+        return s"refused: ${join(lines.view(), "\n")}"
+    end if
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end bnr_built
+
+private val bnr_repeat: string = raw"""
+    repeat(n: int, value: -> int) -> int =
+        if n == 0 then 0 else value + repeat(n - 1, value)
+
+    print(repeat(3, 2))
+    """
+
+@test("a by-name parameter forwarded to a recursive call builds and reads the argument at every level")
+bnr_direct_recursion()
+    if xvr_no_library() then return
+
+    assert_eq(bnr_ran(bnr_repeat), "6\n")
+end bnr_direct_recursion
+
+@test("the forwarded by-name recursion runs alike in debug, release, -O0 and -O2")
+bnr_every_build_mode()
+    if xvr_no_library() || !clang_available() then return
+
+    val text = raw"""
+        static var calls: int = 0
+
+        tick() -> int
+            calls += 1
+            calls
+
+        down(n: int, v: -> int) -> int = if n == 0 then 0 else v + down(n - 1, v)
+
+        print(down(3, tick()))
+        print(calls)
+        """
+
+    assert_eq(bnr_built(text, ["--debug"]), "6\n3\n")
+    assert_eq(bnr_built(text, ["--release"]), "6\n3\n")
+    assert_eq(bnr_built(text, ["-O0"]), "6\n3\n")
+    assert_eq(bnr_built(text, ["-O2"]), "6\n3\n")
+end bnr_every_build_mode
+
+@test("two functions forwarding a by-name parameter to each other build and run")
+bnr_mutual_recursion()
+    if xvr_no_library() then return
+
+    assert_eq(bnr_ran(raw"""
+        even(n: int, v: -> int) -> int = if n == 0 then v else odd(n - 1, v)
+        odd(n: int, v: -> int) -> int = if n == 0 then v * 10 else even(n - 1, v)
+
+        print(even(3, 7))
+        print(even(4, 7))
+        """), "70\n7\n")
+end bnr_mutual_recursion
+
+@test("a by-name parameter forwarded through a non-recursive function into recursion")
+bnr_through_a_middle_function()
+    if xvr_no_library() then return
+
+    assert_eq(bnr_ran(raw"""
+        down(n: int, v: -> int) -> int = if n == 0 then 0 else v + down(n - 1, v)
+        middle(v: -> int) -> int = down(4, v)
+
+        print(middle(5))
+        """), "20\n")
+end bnr_through_a_middle_function
+
+@test("a forwarded by-name argument is evaluated once per read, at every level")
+bnr_effects_counted()
+    if xvr_no_library() then return
+
+    assert_eq(bnr_ran(raw"""
+        static var calls: int = 0
+
+        tick() -> int
+            calls += 1
+            calls
+
+        twice_down(n: int, v: -> int) -> int = if n == 0 then 0 else v + v + twice_down(n - 1, v)
+
+        print(twice_down(3, tick()))
+        print(calls)
+        """), "21\n6\n")
+end bnr_effects_counted
+
+@test("a forwarded by-name argument no level reads is never evaluated")
+bnr_never_read()
+    if xvr_no_library() then return
+
+    assert_eq(bnr_ran(raw"""
+        static var calls: int = 0
+
+        tick() -> int
+            calls += 1
+            print("evaluated")
+            calls
+
+        never(n: int, v: -> int) -> int = if n == 0 then 0 else never(n - 1, v)
+
+        print(never(5, tick()))
+        print(calls)
+        """), "0\n0\n")
+end bnr_never_read
+
+@test("a closure capturing a by-name parameter in a body that forwards it recursively")
+bnr_closure_capture()
+    if xvr_no_library() then return
+
+    assert_eq(bnr_ran(raw"""
+        static var calls: int = 0
+
+        tick() -> int
+            calls += 1
+            calls
+
+        via(n: int, v: -> int) -> int
+            val g = () -> v
+            if n == 0 then g() else g() + via(n - 1, v)
+
+        print(via(2, tick()))
+        print(calls)
+        """), "6\n3\n")
+end bnr_closure_capture
+
+@test("a generic by-name parameter forwarded recursively")
+bnr_generic()
+    if xvr_no_library() then return
+
+    assert_eq(bnr_ran(raw"""
+        sum[T](n: int, v: -> T, zero: T) -> T where T: Add =
+            if n == 0 then zero else v + sum(n - 1, v, zero)
+
+        print(sum(3, 2.5, 0.0))
+        print(sum(2, 4, 0))
+        """), "7.5\n8\n")
+end bnr_generic
+
+@test("a method's by-name parameter is thunked at the call")
+bnr_method_call()
+    if xvr_no_library() then return
+
+    assert_eq(bnr_ran(raw"""
+        static var calls: int = 0
+
+        tick() -> int
+            calls += 1
+            calls
+
+        struct Counter
+            step: int
+
+        impl Counter
+            twice(self, v: -> int) -> int = self.step + v + v
+            skip(self, v: -> int) -> int = self.step
+
+        print(Counter(100).twice(tick()))
+        print(Counter(100).skip(tick()))
+        print(calls)
+        """), "103\n100\n2\n")
+end bnr_method_call
+
+@test("a method forwarding its by-name parameter to itself recursively")
+bnr_method_recursion()
+    if xvr_no_library() then return
+
+    assert_eq(bnr_ran(raw"""
+        struct Counter
+            step: int
+
+        impl Counter
+            total(self, n: int, v: -> int) -> int =
+                if n == 0 then self.step else v + self.total(n - 1, v)
+
+        print(Counter(100).total(3, 1))
+        """), "103\n")
+end bnr_method_recursion
+
+@test("a forwarded by-name recursion 10000 deep builds and runs")
+bnr_deep()
+    if xvr_no_library() then return
+
+    assert_eq(bnr_ran(raw"""
+        down(n: int, v: -> int) -> int = if n == 0 then 0 else v + down(n - 1, v)
+
+        print(down(10000, 1))
+        """), "10000\n")
+end bnr_deep
+
+@test("a closure literal around a by-name read at a trait object still builds a closure")
+bnr_trait_object_unchanged()
+    if xvr_no_library() then return
+
+    assert_eq(bnr_ran(raw"""
+        static var calls: int = 0
+
+        tick() -> int
+            calls += 1
+            calls * 10
+
+        later(v: -> int) -> &Fn() -> int = () -> v
+
+        val f = later(tick())
+        print(calls)
+        print(f())
+        print(f())
+        """), "0\n10\n20\n")
+end bnr_trait_object_unchanged
