@@ -1,0 +1,648 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_temp_dir, remove_dir_all, write_text}
+import sysl.process.{capture, Status}
+import sysl.text.{join, split, str_builder}
+
+// **What a handling statement pays on a hosted target** (`error_trace.sysl`, `library/sysl/sys/trace.c`):
+// a load and a store through the address of the thread's count, not a call each. Everything a program
+// prints stays as it was, so these programs are the behaviour both ways of pruning have to agree on;
+// their expected text passes on a compiler that still calls `mark` and `reset`. Only the two IR tests
+// at the end tell the ways apart.
+//
+// The cells: `?` after a handled failure; a handled failure then a propagated one; handled Ok then
+// Err; every spelling of handling; a loop's `break`, `continue` and `return`; a closure, a trait
+// object and a generic; `defer`, `errdefer` and `Drop`; threads; a callee that clears the trace or
+// switches the store under a mark, which is why an Ok result cannot skip the reset; recursion and
+// `become`; more sites than are kept; async; traces off; debug, release and -O0.
+//
+// Skipped: a coroutine resuming on another thread, which `block_on` never does; the IR test pins that
+// a coroutine calls `mark` and `reset` regardless. Two codegen units: the compiler's own build is
+// that cell, since a unit missing the declaration fails to compile.
+
+private tca_ready() -> bool = std_root().is_ok() && clang_available()
+
+// The nine lines every program starts with, so its first own line is 10.
+private val TcaHead: string = raw"""
+    import sysl.debug.*
+
+    show(tag: string)
+        var b = str_builder()
+        for s in error_trace()
+            b.push(s" ${s.function}:${s.line}")
+        print(s"$tag:${b.finish()}")
+
+    """
+
+private val TcaBottom: string = "import sysl.text.str_builder\n" + TcaHead
+
+// Built with `flags` from the program's own file and run, answering what it printed and how it ended.
+private tca_run(program: string, flags: []const string) -> (string, string, Status)
+    val root = make_temp_dir("sysl-tca").unwrap()
+    val exe = s"$root/built"
+
+    write_text(s"$root/main.sysl", program).unwrap()
+
+    var args: Buf[string] = buf()
+
+    args.push("sysl")
+    args.push("build")
+    args.push(s"$root/main.sysl")
+
+    for f in flags
+        args.push(f)
+
+    args.push("-o")
+    args.push(exe)
+
+    var lines: Buf[string] = buf()
+    val sink = &lines
+    val code = run_cli(args.view(), (line) -> sink.push(line))
+
+    reset_search_paths()
+    use_error_traces(true)
+    assert(code == Fine, s"build failed: ${join(lines.view(), "\n")}")
+
+    val said = capture(exe, [], "", [], true).unwrap()
+
+    remove_dir_all(root).unwrap_or(())
+    (said.text, said.err.unwrap_or(""), said.status)
+end tca_run
+
+// In debug and release and at -O0, the program prints `printed`, writes `err` and exits 0 or as told.
+private tca_says(body: string, printed: string, err: string = "", state: Status = Status.Exited(0))
+    if !tca_ready() then return
+
+    for flag in ["--debug", "--release", "-O0"]
+        val (out, said, got) = tca_run(TcaBottom + body, [flag])
+
+        assert_eq(out, printed)
+        assert_eq(said, err)
+        assert(got == state, s"$flag ended with $got")
+    end for
+end tca_says
+
+@test("a '?' after a handled failure records only its own failure")
+tca_try_after_handled()
+    tca_says(raw"""
+        bottom(why: string) -> Result[int, string] = Err(why)
+
+        recover() -> Result[int, string]
+            val v = bottom("a") match
+                Ok(v) -> v
+                Err(_) -> 0
+            show("recover")
+            Ok(v + 1)
+
+        chain() -> Result[int, string]
+            val v = recover()?
+            val w = bottom("b")?
+            Ok(v + w)
+
+        chain() match
+            Ok(_) -> print("ok")
+            Err(e) ->
+                show("arm")
+                print(e)
+        show("after")
+        """, "recover:\narm: bottom:10 chain:21\nb\nafter:\n")
+end tca_try_after_handled
+
+@test("a handled failure's frames do not come back with a later propagated one, and main reports them so")
+tca_pruned_frames_stay_pruned()
+    tca_says(raw"""
+        bottom(why: string) -> Result[int, string] = Err(why)
+
+        mid(why: string) -> Result[int, string]
+            val v = bottom(why)?
+            Ok(v)
+
+        main() -> Result[unit, string]
+            val a = mid("handled").unwrap_or(0)
+            show("handled")
+            val b = mid("handed on")?
+            print(a + b)
+            Ok(())
+        """, "handled:\n",
+        "error: handed on\nerror return trace (origin first):\n  main.sysl:10:46 in bottom\n" +
+        "  main.sysl:13:24 in mid\n  main.sysl:19:29 in main\n", Status.Exited(1))
+end tca_pruned_frames_stay_pruned
+
+@test("a handled Ok then a failure: the failure is the whole trace")
+tca_ok_then_err()
+    tca_says(raw"""
+        probe(n: int) -> Result[int, string] = if n > 0 then Err("big") else Ok(n)
+
+        twice() -> Result[int, string]
+            val a = probe(0).unwrap_or(9)
+            show("ok")
+            val b = probe(1)?
+            Ok(a + b)
+
+        print(twice().is_err())
+        show("handled by print")
+        val r = twice()
+        show("kept in a val")
+        print(r.is_err())
+        """, "ok:\ntrue\nhandled by print:\nok:\nkept in a val:\ntrue\n")
+end tca_ok_then_err
+
+@test("every spelling of handling prunes at the statement's end, and a failure is visible inside it")
+tca_every_spelling()
+    tca_says(raw"""
+        fail() -> Result[int, string] = Err("no")
+        seen() -> int = int(error_trace().len())
+
+        val a = fail().ok()
+        show("ok")
+        val b = fail().unwrap_or(1)
+        show("unwrap_or")
+        val c = fail().is_err()
+        show("is_err")
+        val d = fail().map_err(e -> e.len)
+        show("map_err")
+        val e = fail().unwrap_or_else(_ -> seen())
+        show("unwrap_or_else")
+        val f = fail() match
+            Ok(v) -> v
+            Err(_) -> seen()
+        show("match")
+        fail().is_ok()
+        show("bare")
+        val g = if fail().is_err() then seen() else 0
+        show("if")
+        print(a.is_none(), b, c, d.is_err(), e, f, g)
+        """, "ok:\nunwrap_or:\nis_err:\nmap_err:\nunwrap_or_else:\nmatch:\nbare:\nif:\ntrue 1 true true 1 1 1\n")
+end tca_every_spelling
+
+@test("break, continue and return out of a handling statement in a loop")
+tca_loop_exits()
+    tca_says(raw"""
+        fail(n: int) -> Result[int, string] = if n % 2 == 1 then Err("odd") else Ok(n)
+
+        count() -> int
+            var n = 0
+
+            for i in 0..<6
+                val v = fail(i) match
+                    Ok(v) -> v
+                    Err(_) ->
+                        if i == 1 then continue
+                        if i == 5 then break
+                        -1
+
+                show("turn")
+                n += v
+
+            n
+
+        leave() -> int
+            for i in 0..<6
+                val v = fail(i) match
+                    Ok(v) -> v
+                    Err(_) -> return i
+
+                show("turn")
+            -1
+
+        keep() -> Result[int, string]
+            for i in 0..<6
+                val v = fail(i) match
+                    Ok(v) -> v
+                    Err(e) -> return Err(e + "!")
+
+                show("turn")
+            Ok(0)
+
+        print(count())
+        show("count")
+        print(leave())
+        show("leave")
+        print(keep().is_err())
+        show("keep")
+        """, "turn:\nturn:\nturn:\nturn:\n5\ncount:\nturn:\n1\nleave:\nturn:\ntrue\nkeep:\n")
+end tca_loop_exits
+
+@test("a closure, a trait object and a generic each prune for themselves")
+tca_indirect_calls()
+    tca_says(raw"""
+        trait Source
+            read(self) -> Result[int, string]
+
+        struct Bad
+            n: int
+
+        impl Source for Bad
+            read(self) -> Result[int, string] = if self.n > 0 then Err("bad") else Ok(self.n)
+
+        pull(s: &Source) -> int
+            val v = s.read() match
+                Ok(v) -> v
+                Err(_) ->
+                    show("pull arm")
+                    -1
+            show("pull")
+            v
+
+        twice[T](f: () -> Result[T, string], d: T) -> T
+            val v = f().unwrap_or(d)
+            show("generic")
+            v
+
+        val c = () -> if true then Err("closure") else Ok(1)
+        val r: Result[int, string] = c()
+        show("closure kept")
+        val s: &Source = Bad(1)
+        print(r.is_err(), pull(s), twice(() -> if true then Err("g") else Ok(1), 5))
+        print(twice(() -> if true then Err("h") else Ok("s"), "d"))
+        show("end")
+        """, "closure kept:\npull arm: Bad.read:17\npull:\ngeneric:\ntrue -1 5\ngeneric:\nd\nend:\n")
+end tca_indirect_calls
+
+@test("a defer, an errdefer and a Drop that handle a failure leave the frames being handed on alone")
+tca_defer_drop()
+    tca_says(raw"""
+        fail() -> Result[int, string] = Err("cleanup")
+
+        struct Noisy
+            id: int
+
+        tidy(tag: string)
+            val v = fail().unwrap_or(0)
+            show(tag)
+            print(v)
+
+        impl Drop for Noisy
+            drop(self) = tidy("drop")
+
+        lower() -> Result[int, string]
+            defer tidy("defer")
+            errdefer tidy("errdefer")
+            defer show("defer sees")
+            val n = Noisy(1)
+            val a = fail()?
+            Ok(a + n.id)
+
+        lower().is_err()
+        show("end")
+        """, "drop: fail:10 lower:28\n0\ndefer sees: fail:10 lower:28\nerrdefer: fail:10 lower:28\n0\n" +
+             "defer: fail:10 lower:28\n0\nend:\n")
+end tca_defer_drop
+
+@test("each thread prunes its own trace, in a body with one statement or many")
+tca_threads()
+    tca_says(raw"""
+        import sysl.threads.spawn
+
+        fail(n: int) -> Result[int, string] = if n > 0 then Err("no") else Ok(n)
+
+        keep(n: int) -> Result[int, string]
+            val v = fail(n)?
+            Ok(v)
+
+        worker(out: *int)
+            var total = 0
+
+            for i in 0..<5
+                total += keep(1).unwrap_or(1)
+                total += int(error_trace().len())
+
+            *out = total + (if keep(1).is_err() then 1 else 0)
+
+        keep(1) match
+            Ok(_) -> ()
+            Err(_) ->
+                var theirs = 0
+                val t = spawn(&worker, &theirs).unwrap()
+
+                t.join()
+                show("mine in the arm")
+                print(theirs)
+        show("mine after")
+        """, "mine in the arm: fail:12 keep:15\n6\nmine after:\n")
+end tca_threads
+
+@test("a callee that clears the trace or switches the store under a mark: the reset writes back what was read")
+tca_callee_changes_the_trace()
+    tca_says(raw"""
+        fail() -> Result[int, string] = Err("no")
+
+        keep() -> Result[int, string]
+            val v = fail()?
+            Ok(v)
+
+        clearing() -> Result[int, string]
+            clear_error_trace()
+            Ok(1)
+
+        var other = ErrorTraceStore.new()
+
+        switching() -> Result[int, string]
+            use_error_trace(&other)
+            Ok(2)
+
+        restoring(prev: *ErrorTraceStore) -> Result[int, string]
+            use_error_trace(prev)
+            Ok(3)
+
+        keep() match
+            Ok(_) -> ()
+            Err(_) ->
+                show("two")
+                print(clearing().unwrap_or(0))
+                show("put back after clearing")
+
+                val own = use_error_trace(&other)
+
+                show("other store")
+                print(restoring(own).unwrap_or(0))
+                show("restored and written back")
+                print(switching().unwrap_or(0))
+                show("switched and written back")
+        show("end")
+        """, "two: fail:10 keep:13\n1\nput back after clearing: fail:10 keep:13\nother store:\n3\n" +
+             "restored and written back:\n2\nswitched and written back:\nend:\n")
+end tca_callee_changes_the_trace
+
+@test("an Ok after an inner discarded failure, recursion, and a become")
+tca_ok_after_inner()
+    tca_says(raw"""
+        fail() -> Result[int, string] = Err("no")
+
+        swallow() -> Result[int, string]
+            fail().is_err()
+            Ok(1)
+
+        answer() -> Result[int, string]
+            val r = fail()
+            if r.is_err() then return Ok(2)
+            r
+
+        tail() -> Result[int, string] = fail() match
+            Ok(v) -> Ok(v)
+            Err(_) -> Ok(3)
+
+        down(n: int) -> Result[int, string]
+            if n == 0 then return fail()
+            val v = down(n - 1)?
+            Ok(v)
+
+        again(n: int) -> Result[int, string]
+            val x = fail().unwrap_or(n)
+            if x == 0 then return Ok(0)
+            become again(x - 1)
+
+        main() -> Result[unit, string]
+            print(swallow()?)
+            show("swallow")
+            print(answer()?)
+            show("answer")
+            print(tail()?)
+            show("tail")
+            print(again(3)?)
+            show("again")
+            print(down(2).is_err())
+            show("down handled")
+            down(1)?
+            Ok(())
+        """, "1\nswallow:\n2\nanswer:\n3\ntail:\n0\nagain:\ntrue\ndown handled:\n",
+        "error: no\nerror return trace (origin first):\n  main.sysl:10:33 in fail\n  main.sysl:27:24 in down\n" +
+        "  main.sysl:46:12 in main\n", Status.Exited(1))
+end tca_ok_after_inner
+
+@test("more sites than are kept: a handled deep chain puts the count back, and the report says the dropped")
+tca_past_the_kept_sites()
+    tca_says(raw"""
+        down(n: int) -> Result[int, string]
+            if n == 0 then return Err("deep")
+            val v = down(n - 1)?
+            Ok(v)
+
+        print(down(40).is_err())
+        print(error_trace().len())
+
+        down(40) match
+            Ok(_) -> ()
+            Err(_) ->
+                val t = error_trace()
+                print(t.len(), t.dropped())
+                print(down(1).is_err(), error_trace().len())
+        print(error_trace().len())
+        """, "true\n0\n32 9\ntrue 32\n0\n")
+end tca_past_the_kept_sites
+
+@test("async bodies prune the same, around a sync helper that handles")
+tca_async()
+    tca_says(raw"""
+        fail() -> Result[int, string] = Err("no")
+
+        @inline
+        helper() -> int
+            val v = fail().unwrap_or(4)
+            show("helper")
+            v
+
+        async read(n: int) -> Result[int, string] = if n > 2 then Err("big") else Ok(n)
+
+        async body(n: int) -> Result[int, string]
+            val a = helper()
+            await yield_now()
+            val b = helper()
+            val c = (await read(n)) match
+                Ok(v) -> v
+                Err(_) ->
+                    show("arm")
+                    -1
+            show("body")
+            val d = await read(n)?
+            Ok(a + b + c + d)
+
+        print(block_on(body(1)).unwrap_or(0))
+        show("ok")
+        print(block_on(body(5)).is_err())
+        show("failed")
+        """, "helper:\nhelper:\nbody:\n10\nok:\nhelper:\nhelper:\narm: read:18\nbody:\ntrue\nfailed:\n")
+end tca_async
+
+// A sync helper that handles, inlined into a task before and after an `await`, the task stepped on
+// this thread and finished on another: the second helper prunes the worker's own trace, so the
+// address of the count read before the suspension is not the one used after it.
+@test("a task stepped on one thread and finished on another prunes each thread's own trace")
+tca_task_crosses_threads()
+    tca_says(raw"""
+        import sysl.threads.spawn
+
+        fail() -> Result[int, string] = Err("no")
+
+        @inline
+        helper() -> int = fail().unwrap_or(1)
+
+        struct Job
+            t: Task[int]
+            out: int
+
+        finish(j: *Job)
+            j.out = block_on(j.t)
+
+        async body() -> int
+            val a = helper()
+            await yield_now()
+            val b = helper()
+            a + b + 10 * int(error_trace().len())
+
+        var job = Job(body(), 0)
+        print(step(job.t, () -> ()))
+        val w = spawn(&finish, &job).unwrap()
+        w.join()
+        print(job.out)
+        show("main")
+        """, "false\n2\nmain:\n")
+end tca_task_crosses_threads
+
+@test("with traces off, the same programs prune nothing and print an empty trace")
+tca_traces_off()
+    if !tca_ready() then return
+
+    val (out, err, got) = tca_run(TcaBottom + raw"""
+        fail() -> Result[int, string] = Err("no")
+
+        print(fail().unwrap_or(1))
+        show("off")
+        """, ["--no-error-traces"])
+
+    assert_eq(out, "1\noff:\n")
+    assert_eq(err, "")
+    assert(got == Status.Exited(0))
+end tca_traces_off
+
+// -- what is laid down ----------------------------------------------------------------------------------
+
+private val TcaDispatch: string = raw"""
+    enum Op
+        Add(n: int)
+        Probe(n: int)
+        Other(n: int)
+
+    probe(n: int) -> Result[int, string] = if n % 2 == 0 then Ok(n) else Err("odd")
+
+    @noinline
+    run(ops: []const Op) -> int
+        var total = 0
+
+        for op in ops
+            op match
+                Add(n) -> total += n
+                Probe(n) ->
+                    val v = probe(n).unwrap_or(-1)
+                    total += v
+                Other(n) ->
+                    val v = probe(n) match
+                        Ok(v) -> v
+                        Err(_) -> 0
+                    total += v
+
+        total
+
+    print(run([Op.Probe(3), Op.Add(1), Op.Other(1)]))
+    """
+
+private tca_body(ir: string, name: string) -> string
+    var b = str_builder()
+    var inside = false
+
+    for line in split(ir, "\n")
+        if !inside && line.starts_with("define") && line.contains(name) then inside = true
+
+        if inside
+            b.push(line)
+            b.push("\n")
+
+            if line == "}" then return b.finish()
+    end for
+
+    s"no define of $name in:\n$ir"
+end tca_body
+
+@test("a hosted body prunes by a load and a store through the count, with no mark or reset call")
+tca_hosted_lays_down_load_and_store()
+    if xvr_no_library() then return
+
+    val ir = xvr_ir([("main.sysl", TcaDispatch)])
+    val run = tca_body(ir, " @run$$")
+
+    assert(!run.contains("sysl_error_trace_mark") && !run.contains("sysl_error_trace_reset"), run)
+    assert_eq(run.count_of("call ptr @llvm.threadlocal.address.p0(ptr @sysl_error_trace_live)"), 4)
+    assert(ir.contains("@sysl_error_trace_live = external thread_local global i32") ||
+           ir.contains("@sysl_error_trace_live = external dso_local thread_local global i32"), ir)
+end tca_hosted_lays_down_load_and_store
+
+@test("the optimizer folds a loop's count calls into one, out of the loop")
+tca_optimized_loop_has_one_call()
+    if xvr_no_library() || !clang_available() then return
+
+    val root = make_temp_dir("sysl-tca").unwrap()
+
+    write_text(s"$root/m.ll", xvr_ir([("main.sysl", TcaDispatch)])).unwrap()
+
+    val said = capture("clang", ["-O2", "-S", "-emit-llvm", "-Wno-override-module", "-x", "ir", s"$root/m.ll", "-o", "-"],
+                       "", [], true).unwrap()
+
+    remove_dir_all(root).unwrap_or(())
+
+    // The optimizer's printer quotes a name holding a `$`.
+    val run = tca_body(said.text, "@\"run$$")
+
+    assert(run.starts_with("define"), run)
+    assert_eq(run.count_of("@llvm.threadlocal.address.p0(ptr"), 1)
+end tca_optimized_loop_has_one_call
+
+@test("a coroutine keeps the calls, since it may resume on another thread")
+tca_coroutine_keeps_the_calls()
+    if xvr_no_library() then return
+
+    val ir = xvr_ir([("main.sysl", raw"""
+        fail() -> Result[int, string] = Err("no")
+
+        async body() -> int
+            val v = fail().unwrap_or(1)
+            await yield_now()
+            v + fail().unwrap_or(2)
+
+        print(block_on(body()))
+        """)])
+    val body = tca_body(ir, " @body$$")
+
+    assert(body.contains("call i32 @sysl_error_trace_mark()"), body)
+    assert(body.contains("call void @sysl_error_trace_reset(i32 %"), body)
+    assert(!body.contains("sysl_error_trace_live"), body)
+end tca_coroutine_keeps_the_calls
+
+@test("a freestanding build lays down mark and reset and never names the thread's count")
+tca_freestanding_keeps_the_calls()
+    if xvr_no_library() || !tca_ready() then return
+
+    val root = make_temp_dir("sysl-tca").unwrap()
+
+    write_text(s"$root/main.sysl", raw"""
+        read(n: int) -> Result[int, string] = if n > 3 then Err("big") else Ok(n)
+
+        @export("main")
+        entry() -> int = read(9).unwrap_or(1)
+        """).unwrap()
+
+    var lines: Buf[string] = buf()
+    val sink = &lines
+    val code = run_cli(["sysl", "build-c", root, "--target", "thumb-freestanding-softfp", "-o", s"$root/app.a"],
+                       (line) -> sink.push(line))
+
+    assert(code == Fine, join(lines.view(), "\n"))
+
+    val symbols = capture("nm", [s"$root/app.a"], "", [], true).unwrap().text
+
+    remove_dir_all(root).unwrap_or(())
+    reset_search_paths()
+    assert(symbols.contains("sysl_error_trace_mark"), symbols)
+    assert(!symbols.contains("sysl_error_trace_live"), symbols)
+end tca_freestanding_keeps_the_calls

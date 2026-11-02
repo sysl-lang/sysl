@@ -846,8 +846,9 @@ The trace is on at every optimization level. `error_traces = false` in the
 [manifest](/reference/packages/#leaving-the-error-return-trace-out), or `--no-error-traces` for one
 build, removes it entirely: no site reaches the image, nothing is recorded or put back, and `main`,
 `unwrap` and `expect` report the error alone. With it on, the cost on a path that does not fail is
-two calls per statement that handles a failure — one to read the trace's length before it, one to
-put it back after; a `?` that succeeds and an `Option`'s `?` cost nothing.
+a read and a write per statement that handles a failure — the trace's length read before it and
+put back after, a load and a store on a hosted target; a `?` that succeeds and an `Option`'s `?`
+cost nothing.
 
 ## Traps
 

@@ -14,7 +14,9 @@
  *
  * **The compiler calls three of these**: `push` on every failure path that records, and `mark` and
  * `reset` around a statement that handles a failure, which takes the frames that failure left back
- * out. The library reads the rest. A build with traces switched off (`error_traces = false`,
+ * out -- in a coroutine and on a freestanding target. Elsewhere on a hosted one it reads and writes
+ * the count of `sysl_error_trace_live` itself, through `llvm.threadlocal.address`. The library reads
+ * the rest. A build with traces switched off (`error_traces = false`,
  * `--no-error-traces`) calls none of them and links none of this.
  *
  * **`sysl_error_trace_report` is a weak default**, as `sysl_bounds_fail` is: on a hosted target it
@@ -40,11 +42,15 @@ typedef struct sysl_trace_store {
  * (`sysl_error_trace_use`) copies the live trace out into the store that was current and the new one
  * in, so recording and pruning never pay for the indirection. `sysl_trace_owner` is the store whose
  * contents are live, or null while the thread's own are; `sysl_trace_own` holds the thread's own
- * while another is current. */
-static _Thread_local sysl_trace_store sysl_trace;
+ * while another is current.
+ *
+ * **The live store is external, and stays at one address for the thread's whole life**: the compiler
+ * reads and writes its count directly around a statement that handles a failure, outside a
+ * coroutine, so making a store current copies into it rather than moving it. */
+_Thread_local sysl_trace_store sysl_error_trace_live;
 static _Thread_local sysl_trace_store *sysl_trace_owner;
 static _Thread_local sysl_trace_store sysl_trace_own;
-#define SYSL_TRACE (sysl_trace)
+#define SYSL_TRACE (sysl_error_trace_live)
 #else
 /* **Freestanding: the trace is the store a hook answers**, `sysl_error_trace_here`, called on every
  * failure path that records or prunes and by every read -- never by a `?` that succeeds.
@@ -119,8 +125,8 @@ sysl_trace_store *sysl_error_trace_use(sysl_trace_store *next) {
     if (!next) next = &sysl_trace_own;
     if (next == prev) return prev;
 
-    *prev = sysl_trace;
-    sysl_trace = *next;
+    *prev = sysl_error_trace_live;
+    sysl_error_trace_live = *next;
     sysl_trace_owner = next == &sysl_trace_own ? 0 : next;
     return prev;
 #else
@@ -152,7 +158,7 @@ static void sysl_trace_text(const char *s) {
 }
 
 __attribute__((weak)) void sysl_error_trace_report(void) {
-    uint32_t n = sysl_trace.count;
+    uint32_t n = sysl_error_trace_live.count;
 
     if (n == 0) return;
 
@@ -160,7 +166,7 @@ __attribute__((weak)) void sysl_error_trace_report(void) {
 
     for (uint32_t i = 0; i < n && i < SYSL_TRACE_SITES; i++) {
         sysl_trace_text("  ");
-        sysl_trace_text(sysl_trace.sites[i]);
+        sysl_trace_text(sysl_error_trace_live.sites[i]);
         sysl_trace_text("\n");
     }
 
