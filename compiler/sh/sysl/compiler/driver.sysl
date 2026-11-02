@@ -177,27 +177,24 @@ private lib_roots_present() -> Result[unit, Failure]
     Ok(())
 end lib_roots_present
 
-// **A file named for output is refused up front when its directory is not there.** Left to the
-// toolchain the failure is clang's, from whichever object it happened to write first -- often a
-// dependency's -- and sends the reader to a file that is fine. The directory is not made: a command
-// writes where it was told. A bare name has the current directory for a parent, which exists.
-output_directory_present(given: Option[string]) -> Result[unit, Refusal]
+// **The directory of a file named for output is made before anything is compiled**, as `build-c`
+// makes the directory of its archive. Left to the toolchain a missing one fails as clang's error
+// from whichever object it happened to write first -- often a dependency's -- and sends the reader
+// to a file that is fine. A file standing where the directory is needed is refused, naming it. A
+// bare name has the current directory for a parent, which exists.
+make_output_directory(given: Option[string]) -> Result[unit, Refusal]
     given match
-        None -> return Ok(())
+        None -> Ok(())
         Some(file) ->
             parent_of(file) match
-                None -> return Ok(())
+                None -> Ok(())
                 Some(dir) ->
                     if dir == "" || dir == "." then return Ok(())
 
-                    if !exists(dir)
-                        return Err(Refusal(s"the output directory $dir does not exist"))
-
-                    if !is_directory(dir)
-                        return Err(Refusal(s"the output directory $dir is not a directory"))
-
-                    Ok(())
-end output_directory_present
+                    directory_refusal(dir) match
+                        Some(why) -> Err(Refusal(why))
+                        None -> Ok(())
+end make_output_directory
 
 // The modules a set of files declares, each once.
 private modules_written(units: Buf[Program]) -> Buf[string]
@@ -1248,7 +1245,7 @@ end emitted_body
 build_native_program(path: string, named_target: Option[string], cc: Option[string], level: string,
                      out: Option[string],
                      also_auto_imported: Buf[string] = buf()) -> Result[string, Failure]
-    output_directory_present(out).map_err(said)?
+    make_output_directory(out).map_err(said)?
 
     val t = target_for(path, named_target).map_err(said)?
 
@@ -1430,10 +1427,6 @@ build_c_archive(path: string, named_target: Option[string], cc: Option[string], 
                 out: Option[string], header_at: Option[string],
                 say: string -> unit, lto: Option[string] = None,
                 ll_at: Option[string] = None) -> Result[(string, string), Failure]
-    output_directory_present(out).map_err(said)?
-    output_directory_present(header_at).map_err(said)?
-    output_directory_present(ll_at).map_err(said)?
-
     val t = target_for(path, named_target).map_err(said)?
 
     if !t.builds_with_clang() then return Err(Said(Refusal(t.no_toolchain())))
