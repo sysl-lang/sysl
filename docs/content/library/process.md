@@ -516,9 +516,9 @@ is the program's own is one comparison:
 
 ```sysl
 import sysl.fs.{write_text, metadata, remove_file}
-import sysl.process.{user, group, real_user, real_group}
+import sysl.process.{pid, user, group, real_user, real_group}
 
-val path = "/tmp/sysl-process-doc-id.txt"
+val path = s"/tmp/sysl-process-doc-id-${pid()}.txt"
 
 write_text(path, "mine").unwrap()
 
