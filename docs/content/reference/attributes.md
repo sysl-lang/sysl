@@ -5683,6 +5683,7 @@ disturbs nothing.
 | storage | `thread_local` (a `@thread_local` is accepted on this build) |
 | address width | `ptr16` (an address is 16 bits), `ptr32` (it is 32 bits), `ptr64` (it is 64 bits) |
 | instrumentation | `sanitize_address` (the build is instrumented for AddressSanitizer), `sanitize_thread` (for ThreadSanitizer) |
+| build mode | `debug` (a debug build: plain integer overflow is checked) |
 
 That is the whole vocabulary. There is **no `#define`** and nothing a project can add, and only one
 symbol depends on a project config: `thread_local`, which also reads the root manifest's
@@ -5873,6 +5874,34 @@ A dependency's `if` cannot name either, because which packages a resolution take
 how one build of them is compiled. Every cache the build keeps is keyed on `SYSL_EXTRA_CFLAGS`, so
 an instrumented build never reuses what a plain one gated.
 
+**`debug` says the build is a debug build** — the build mode that checks plain integer overflow
+(`--debug`), and false in a release build (`--release`). It is read from that mode itself, so it is
+true under `sysl run` and `sysl test` with no flag, false under `sysl build`, `build-c` and
+`build-lib` with none, and `--debug` or `--release` settles it for any of them. A library can
+compile its own checks out of a release build:
+
+```sysl
+#if debug
+mode() -> string = "debug"
+#else
+mode() -> string = "release"
+#endif
+
+print(mode())
+```
+
+```output
+debug
+```
+
+The page's blocks are built in debug, which is what is printed; under `--release` the same program
+prints `release`. `#if !debug` reads as every other symbol does. **Code is gated in the mode of the
+build that compiles it**: the standard library's artifact is built once per mode, so its `#if debug`
+follows the program's, while a `.syslib` made by `build-lib` keeps the mode it was built in, as its
+integer arithmetic does (the mode is recorded in its metadata). A dependency's `if` cannot name
+`debug`, for the reason it cannot name the sanitizers, and a misspelling such as `debgu` is refused
+like any unknown symbol.
+
 **A symbol nobody knows is an error, not false:**
 
 ```sysl
@@ -5886,7 +5915,7 @@ print(say())
 ```
 
 ```error
-'darwin' is not something a target says about itself — sysl knows aarch64, android, bsd, craft, fma, fma_dp, fpu, fpu_dp, freestanding, hardfloat, hosted, linux, macos, posix, ptr16, ptr32, ptr64, riscv32, riscv64, sanitize_address, sanitize_thread, softfp, thread_local, thumb, wasi, wasm32, windows, x86, x86_64
+'darwin' is not something a target says about itself — sysl knows aarch64, android, bsd, craft, debug, fma, fma_dp, fpu, fpu_dp, freestanding, hardfloat, hosted, linux, macos, posix, ptr16, ptr32, ptr64, riscv32, riscv64, sanitize_address, sanitize_thread, softfp, thread_local, thumb, wasi, wasm32, windows, x86, x86_64
 ```
 
 The set is closed, so a name outside it is a mistake rather than a fact this build happens not to
