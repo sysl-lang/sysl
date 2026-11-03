@@ -1,0 +1,146 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.{from_utf8_unchecked, split}
+
+// `#if debug`: true where the build is a debug build (`build_mode.sysl` -- plain integer overflow is
+// checked), false in a release build. It is read from the same mode, so the two cannot disagree.
+
+private dbp_ready() -> bool = std_root().is_ok() && clang_available()
+
+// What `text` (as `main.sysl`) prints when built under the flag `flag` ("" for none, so the command's
+// own default) as the command `command` would build it, or the refusal.
+private dbp_run(command: string, flag: string, text: string) -> string
+    val root = make_temp_dir("sysl-dbp").unwrap()
+
+    write_text(s"$root/main.sysl", text).unwrap()
+    use_command_mode(command)
+
+    if flag != ""
+        var flags: [1]string = [flag]
+
+        assert_eq(took_search_flag(flags[..], 0), 1)
+
+    val exe = s"$root/built"
+    val built = build_native_program(root, None, None, DefaultOptimization, Some(exe))
+
+    reset_search_paths()
+    use_command_mode("")
+
+    built match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return s"!${failure_text(why)}"
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "!could not run"
+        Ok(out) -> out.text.trim()
+end dbp_run
+
+// A program that imports `mode()` from a path dependency whose own source says `#if debug`, built
+// under `flag`: the dependency sees the consumer's mode.
+private dbp_run_library(flag: string) -> string
+    val lib = make_temp_dir("sysl-dbp-lib").unwrap()
+    val app = make_temp_dir("sysl-dbp-app").unwrap()
+
+    write_text(s"$lib/sysl.hocon", "package { name = \"dbl\", version = \"0.1.0\" }\n").unwrap()
+    make_dir_all(s"$lib/dbl").unwrap()
+    write_text(s"$lib/dbl/m.sysl", "module dbl\n\n#if debug\nmode() -> string = \"debug\"\n#else\n" +
+               "mode() -> string = \"release\"\n#endif\n").unwrap()
+    write_text(s"$app/sysl.hocon", s"package { name = \"app\", version = \"0.1.0\" }\ndependencies { dbl { path = \"$lib\" } }\n").unwrap()
+    write_text(s"$app/main.sysl", "import dbl.mode\nprint(mode())\n").unwrap()
+
+    var flags: [1]string = [flag]
+
+    assert_eq(took_search_flag(flags[..], 0), 1)
+
+    val exe = s"$app/built"
+    val built = build_native_program(app, None, None, DefaultOptimization, Some(exe))
+
+    reset_search_paths()
+
+    var out = ""
+
+    built match
+        Err(why) -> out = s"!${failure_text(why)}"
+        Ok(_) ->
+            capture(exe, [], "", [], true) match
+                Err(_) -> out = "!could not run"
+                Ok(done) -> out = done.text.trim()
+
+    remove_dir_all(lib).unwrap_or(())
+    remove_dir_all(app).unwrap_or(())
+    out
+end dbp_run_library
+
+@test("dbp: a dependency compiled separately sees the consumer's build mode")
+dbp_a_library_follows_the_consumer()
+    if !dbp_ready() then return
+
+    assert_eq(dbp_run_library("--debug"), "debug")
+    assert_eq(dbp_run_library("--release"), "release")
+
+private val dbp_program ="#if debug\nprint(\"debug\")\n#else\nprint(\"release\")\n#endif\n"
+
+@test("dbp: #if debug is true under run and test and false under build, with no flag")
+dbp_follows_the_command_default()
+    if !dbp_ready() then return
+
+    assert_eq(dbp_run("run", "", dbp_program), "debug")
+    assert_eq(dbp_run("test", "", dbp_program), "debug")
+    assert_eq(dbp_run("build", "", dbp_program), "release")
+    assert_eq(dbp_run("build-c", "", dbp_program), "release")
+
+@test("dbp: --release makes it false and --debug makes it true, whatever the command")
+dbp_follows_the_flags()
+    if !dbp_ready() then return
+
+    assert_eq(dbp_run("run", "--release", dbp_program), "release")
+    assert_eq(dbp_run("build", "--debug", dbp_program), "debug")
+    assert_eq(dbp_run("build", "--release", dbp_program), "release")
+
+@test("dbp: it combines with the other symbols and can be negated")
+dbp_combines()
+    if !dbp_ready() then return
+
+    val text = "#if !debug\nprint(\"a\")\n#elif debug && posix\nprint(\"b\")\n#endif\n" +
+               "#if debug || sanitize_address\nprint(\"c\")\n#else\nprint(\"d\")\n#endif\n"
+
+    assert_eq(dbp_run("build", "--debug", text), "b\nc")
+    assert_eq(dbp_run("build", "--release", text), "a\nd")
+
+// -- the vocabulary and the refusals -------------------------------------------------------------------
+
+private dbp_sees(debugging: bool, text: string) -> string
+    gate(source_of("<input>", text), host_target(), buf(), buf(), debugging) match
+        Err(d) -> s"!${d.message}"
+        Ok(out) -> from_utf8_unchecked(out.bytes).trim()
+
+@test("dbp: the gate answers by the mode it is given")
+dbp_gate_by_mode()
+    assert_eq(dbp_sees(true, "#if debug\nx\n#else\ny\n#endif\n"), "x")
+    assert_eq(dbp_sees(false, "#if debug\nx\n#else\ny\n#endif\n"), "y")
+    assert_eq(dbp_sees(false, "#if !debug\nx\n#endif\n"), "x")
+
+@test("dbp: a misspelling is refused like any unknown symbol, and the vocabulary names debug")
+dbp_misspelling_refused()
+    val said = dbp_sees(true, "#if debgu\nx\n#endif\n")
+
+    assert(said.starts_with("!'debgu' is not something a target says about itself — sysl knows "), said)
+    assert(said.contains("craft, debug, fma"), said)
+
+@test("dbp: a dependency's condition cannot name it, and neither can a directory")
+dbp_not_for_dependencies()
+    assert(has(source_symbols(), "debug"), "source")
+    assert(!has(symbols(), "debug"), "the machine's vocabulary")
+    assert(!has(directory_symbols(), "debug"), "a directory")
+    assert(!has(dependency_symbols(), "debug"), "a dependency's if")
