@@ -268,6 +268,87 @@ thread_local_starts_fresh() -> unit
     assert_eq(per_thread, 99)
     per_thread = 41
 
+// -- the stack a hosted thread is asked for ---------------------------------------------------------
+
+private struct Deep
+    depth: int
+    answer: u64
+    stack: usize
+
+// A frame that holds a 4 KiB array and lends it to the next frame down, which writes into it. The
+// frame reads the array back after the call, so every array stays alive until the recursion unwinds
+// and the recursion cannot be folded into a loop: 1500 frames need 6 MiB, which a 512 KiB pthreads
+// default cannot give.
+private descend(n: int, up: []u8) -> u64
+    var pad: [4096]u8 = [0; 4096]
+
+    up[1] = 1
+    pad[0] = u8(n % 251)
+
+    if n == 0 then return 0
+
+    val below = descend(n - 1, pad[..])
+
+    below + u64(pad[0]) + u64(pad[1])
+end descend
+
+// The size pthreads reports for the running thread's stack; only macOS has a call that says it
+// plainly, so elsewhere it answers `usize.max` and every size check holds.
+#if macos
+private extern "pthread_get_stacksize_np" c_stacksize(t: u64) -> usize
+private extern "pthread_self" c_self() -> u64
+
+private own_stack() -> usize = c_stacksize(c_self())
+#else
+private own_stack() -> usize = usize.max
+#endif
+
+private run_deep(d: *Deep) -> unit
+    var top: [2]u8 = [0; 2]
+
+    d.answer = descend(d.depth, top[..])
+    d.stack = own_stack()
+
+// What `descend(n, _)` answers: each of the n frames above the last adds its own number and the 1 the
+// frame below wrote into its array.
+private deep_sum(n: int) -> u64
+    var total: u64 = 0
+
+    for i in 1..<n + 1 do total += u64(i % 251) + 1
+
+    total
+
+@test("a thread asked for 8 MiB recurses deeper than the 512 KiB default allows")
+spawn_big_stack_recurses() -> unit
+    var d = Deep(1500, 0, 0)
+    val t = spawn(&run_deep, &d, 8 * 1024 * 1024).unwrap()
+
+    assert(t.join())
+    assert_eq(d.answer, deep_sum(1500))
+    assert(d.stack >= 8 * 1024 * 1024)
+
+@test("the default stack still starts a thread")
+spawn_default_stack_runs() -> unit
+    var d = Deep(100, 0, 0)
+
+    assert(spawn(&run_deep, &d).unwrap().join())
+    assert_eq(d.answer, deep_sum(100))
+
+@test("a request below the system's default gets at least the default")
+spawn_small_stack_gets_the_default() -> unit
+    var d = Deep(50, 0, 0)
+
+    assert(spawn(&run_deep, &d, 4096).unwrap().join())
+    assert_eq(d.answer, deep_sum(50))
+    assert(d.stack >= 512 * 1024)
+
+@test("a request that is not a whole page is rounded up")
+spawn_odd_stack_is_rounded() -> unit
+    var d = Deep(1500, 0, 0)
+
+    assert(spawn(&run_deep, &d, 8 * 1024 * 1024 + 1).unwrap().join())
+    assert_eq(d.answer, deep_sum(1500))
+
 @test("spawn_on runs a thread on storage the program owns")
 spawn_on_a_given_stack() -> unit
     var room: [262144]u8 = [0; 262144]

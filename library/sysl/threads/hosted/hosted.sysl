@@ -49,6 +49,8 @@ private extern "pthread_self" c_pthread_self() -> u64
 private extern "sched_yield" c_sched_yield() -> int
 private extern "pthread_attr_init" c_attr_init(attr: *u8) -> int
 private extern "pthread_attr_destroy" c_attr_destroy(attr: *u8) -> int
+private extern "pthread_attr_getstacksize" c_attr_getstacksize(attr: *u8, size: *usize) -> int
+private extern "pthread_attr_setstacksize" c_attr_setstacksize(attr: *u8, size: usize) -> int
 private extern "pthread_attr_setstack" c_attr_setstack(attr: *u8, stack: *u8, size: usize) -> int
 
 // **A `pthread_attr_t` is a caller-allocated C struct whose size is in a header** -- 64 bytes on
@@ -69,13 +71,34 @@ supply_spawn(entry: *extern(*u8) -> unit, arg: *u8, stack: *u8, stack_len: usize
     // what it leaves in the register, `supply_join` passing no place for it.
     val body: *extern(*u8) -> *u8 = ptr_cast(entry)
 
-    if stack == null
+    if stack == null && stack_len == 0
         val e = c_pthread_create(tid, null, body, arg)
 
         return if e == 0 then 0 else host_status(e)
 
     var attr: [ATTR_WORDS]u64 = [0; ATTR_WORDS]
     val a: *u8 = ptr_cast(&attr[0])
+
+    if stack == null
+        // A size request: the system makes the stack and keeps its guard page, and the thread gets the
+        // larger of the request, in whole pages, and the system's default.
+        var e = c_attr_init(a)
+
+        if e != 0 then return host_status(e)
+
+        var size: usize = 0
+
+        e = c_attr_getstacksize(a, &size)
+
+        val want = (stack_len + STACK_PAGE - 1) / STACK_PAGE * STACK_PAGE
+
+        if e == 0 && want > size then e = c_attr_setstacksize(a, want)
+
+        if e == 0 then e = c_pthread_create(tid, a, body, arg)
+
+        c_attr_destroy(a)
+
+        return if e == 0 then 0 else host_status(e)
 
     val lo = (usize(stack) + STACK_PAGE - 1) / STACK_PAGE * STACK_PAGE
     val hi = (usize(stack) + stack_len) / STACK_PAGE * STACK_PAGE
