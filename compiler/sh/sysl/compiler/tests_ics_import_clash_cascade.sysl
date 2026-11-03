@@ -1,0 +1,105 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.remove_dir_all
+
+// **An import refused because the module already declares the name is the one diagnostic.** The
+// module's declaration answers the bare name, so a use of it used to be read against that
+// declaration and could complain about it -- a `@test` function called from another file said it
+// had no definition to reach -- though the file never named it. The clause is the line to change, so
+// the uses say nothing more.
+
+// A program whose module `q` has three files: `use` imports and uses, `t` is a tests file declaring
+// `layout`, and `p` supplies the name imported.
+private ics_out(p: string, use: string, tests: string) -> string
+    var fs = im_files()
+
+    fs.push(("", "main.sysl", "print(q.seven())\n"))
+    fs.push(("p", "a.sysl", "module p\n" + p))
+    fs.push(("q", "use.sysl", "module q\n" + use))
+    fs.push(("q", "t.sysl", "module q\n" + tests))
+
+    val root = im_write(fs)
+    val said = lbr_cli(["sysl", "test", root]).1
+
+    remove_dir_all(root).unwrap_or(())
+    said
+end ics_out
+
+private ics_a_test() -> string =
+    "@tests\n\n@test(\"seven is seven\")\nlayout()\n    assert(seven() == 7)\n"
+
+private ics_count(said: string, part: string) -> int
+    int(said.count_of(part))
+
+private ics_clash() -> string =
+    "'layout' is declared by this module as 'q.layout', so importing 'p.layout' under that name"
+
+@test("a call of the name after its import was refused for clashing with a test function says nothing more")
+ics_a_call_of_a_test_function()
+    if im_can_run() then return
+
+    val said = ics_out("layout() -> int = 7\n", "import p.layout\nseven() -> int = layout()\n", ics_a_test())
+
+    assert(said.contains(ics_clash()), said)
+    assert(!said.contains("'@test' function"), said)
+    assert_eq(ics_count(said, "q.layout"), 1, said)
+
+@test("so does the braces form")
+ics_the_braces_form()
+    if im_can_run() then return
+
+    val said = ics_out("layout() -> int = 7\n", "import p.{layout}\nseven() -> int = layout()\n", ics_a_test())
+
+    assert(said.contains(ics_clash()), said)
+    assert(!said.contains("'@test' function"), said)
+
+@test("a use as a value rather than a call does too")
+ics_a_use_as_a_value()
+    if im_can_run() then return
+
+    val said = ics_out("layout() -> int = 7\n",
+                       "import p.layout\nseven() -> int\n    val f = &layout\n    f()\nend seven\n", ics_a_test())
+
+    assert(said.contains(ics_clash()), said)
+    assert(!said.contains("'@test' function"), said)
+
+@test("a clash with an ordinary function is the one refusal too")
+ics_an_ordinary_function()
+    if im_can_run() then return
+
+    val said = ics_out("layout() -> int = 7\n", "import p.layout\nseven() -> int = layout()\n",
+                       "layout() -> int = 9\n")
+
+    assert(said.contains(ics_clash()), said)
+    assert_eq(ics_count(said, "so importing"), 1, said)
+
+@test("a clash with a type is the one refusal too")
+ics_a_type()
+    if im_can_run() then return
+
+    val said = ics_out("struct Layout\n    n: int\n",
+                       "import p.Layout\nseven() -> int = Layout(7).n\n", "struct Layout\n    n: int\n")
+
+    assert(said.contains("'Layout' is declared by this module as 'q.Layout', so importing 'p.Layout'"), said)
+    assert_eq(ics_count(said, "so importing"), 1, said)
+
+@test("a clash with a constant is the one refusal too")
+ics_a_constant()
+    if im_can_run() then return
+
+    val said = ics_out("const layout = 7\n", "import p.layout\nseven() -> int = layout\n", "const layout = 9\n")
+
+    assert(said.contains(ics_clash()), said)
+    assert_eq(ics_count(said, "so importing"), 1, said)
+
+@test("an unrelated error later in the same file is still reported")
+ics_an_unrelated_error_is_kept()
+    if im_can_run() then return
+
+    val said = ics_out("layout() -> int = 7\n",
+                       "import p.layout\nseven() -> int = layout()\nother() -> int = \"text\"\n", ics_a_test())
+
+    assert(said.contains(ics_clash()), said)
+    assert(!said.contains("'@test' function"), said)
+    assert(said.contains("other") || said.contains("string"), said)

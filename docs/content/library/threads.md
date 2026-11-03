@@ -170,7 +170,9 @@ program can hand to a POSIX call this module does not wrap, and the kernel's thr
 
 **`spawn` makes one allocation per thread** — its id word, its block of `@thread_local` storage, and
 its stack, 64 KiB unless the call asks for another size — and `join` gives it back. On a hosted target
-nothing is allocated: pthreads makes the stack and the C library the thread-local block. A program with
+nothing is allocated: pthreads makes the stack, with its guard page, and the C library the thread-local
+block. There `stack` is a request: the thread gets it rounded up to a page, or the system's default if
+that is larger, so a deep recursion on a worker asks for the room it needs. A program with
 no heap starts a thread on storage of its own with `spawn_on`, which lays the same three things out of
 a slice it is handed:
 
