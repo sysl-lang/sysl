@@ -21,7 +21,7 @@ b.push(2)
 b.push(3)
 
 print(b.len(), b.cap(), b.is_empty())
-print(b[0], b.at(2))
+print(b[0], b[2])
 
 b[1] = 20
 
@@ -33,6 +33,9 @@ print(b.view().len, b.view()[1])
 1 3
 3 20
 ```
+
+`b[i]` reads and writes an element, checked against the count and taking an index of any integer
+type; [Subscripting goes through the checked members](#subscripting-goes-through-the-checked-members) says what it is.
 
 Nothing in the language reaches it. An array literal makes a `[]T`, a `for` walks whatever implements
 `Iterate` or `Walk`, and neither of those is a growable sequence — so a program that wants one asks, and the
@@ -502,9 +505,9 @@ import sysl.buf.{Buf, buf}
 var outer: Buf[Buf[int]] = buf()
 
 outer.push(buf())
-outer.at(0).push(1)
+outer[0].push(1)
 
-print(outer.at(0).len())
+print(outer[0].len())
 ```
 
 ```output

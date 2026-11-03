@@ -142,7 +142,7 @@ var words = regex("[a-z]+").unwrap()
 var all = words.find_all("the quick brown fox")
 
 for i in 0..<all.len()
-    print(all.at(i).start(), all.at(i).text())
+    print(all[i].start(), all[i].text())
 ```
 
 ```output
@@ -213,7 +213,7 @@ import sysl.regex.regex
 var parts = regex(",").unwrap().split("a,b,,c")
 
 print(parts.len())
-for i in 0..<parts.len() do print(s"[${parts.at(i)}]")
+for i in 0..<parts.len() do print(s"[${parts[i]}]")
 ```
 
 ```output

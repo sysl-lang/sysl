@@ -1016,7 +1016,7 @@ write_text(dir + "/two.txt", "b").unwrap()
 var names = entries(dir).unwrap()
 
 print(names.len())
-print(names.at(0) == "one.txt" || names.at(0) == "two.txt")
+print(names[0] == "one.txt" || names[0] == "two.txt")
 
 remove_file(dir + "/one.txt").unwrap()
 remove_file(dir + "/two.txt").unwrap()

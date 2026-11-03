@@ -2394,7 +2394,7 @@ total(j: Json) -> int
             var sum = 0
 
             for i in 0..<items.len()
-                sum += total(items.at(i))
+                sum += total(items[i])
 
             sum
 end total
@@ -2433,7 +2433,7 @@ enum Json
 var members: Buf[Member] = buf()
 
 members.push(Member("answer", Num(42)))
-print(members.at(0).key)
+print(members[0].key)
 ```
 
 ```output
@@ -5677,7 +5677,7 @@ var a = Handle(3)
 walk(f: Visit, h: *Handle) = f(h)
 
 walk(h -> seen.push(h), &a)
-print(seen.at(0).n)
+print(seen[0].n)
 ```
 
 ```output

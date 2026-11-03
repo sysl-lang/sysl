@@ -1512,9 +1512,9 @@ var b: &Buf[int] = buf()
 
 b.push(1)
 
-for i in 0..<20 do b.push(b.at(usize(i)) + 1)
+for i in 0..<20 do b.push(b[i] + 1)
 
-print(b.len(), b.at(0), b.at(20), b.cap())
+print(b.len(), b[0], b[20], b.cap())
 ```
 
 ```output

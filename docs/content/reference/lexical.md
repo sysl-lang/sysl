@@ -906,7 +906,7 @@ for b in "a,b;c".bytes
 
 out.push('o')
 out.push('\n')
-print(sep, fields, digit('7'), digit('x'), out.len(), out.at(1))
+print(sep, fields, digit('7'), digit('x'), out.len(), out[1])
 ```
 
 ```output

@@ -1839,7 +1839,7 @@ val f: Step = (h) ->
 
 print(f(&a))
 each(h -> seen.push(h))
-print(seen.len(), seen.at(1).n)
+print(seen.len(), seen[1].n)
 ```
 
 ```output

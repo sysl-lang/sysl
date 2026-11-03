@@ -242,9 +242,9 @@ push_u32_le(out, 0x11223344)
 push_u64_be(out, 0x1122334455667788)
 
 print(out.len())
-print(out.at(1), out.at(2))
-print(out.at(3), out.at(6))
-print(out.at(7), out.at(14))
+print(out[1], out[2])
+print(out[3], out[6])
+print(out[7], out[14])
 ```
 
 ```output
