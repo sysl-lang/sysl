@@ -1,0 +1,134 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+
+// What a refusal says when a slice (or an array, or a string's bytes) is asked for a data pointer
+// by a name it does not have: it names `as_ptr` / `as_mut_ptr` from `sysl.slices`. Only the wording
+// of a refusal changes; what is accepted does not.
+
+private var sph_library_cache: Buf[Program] = buf()
+private var sph_library_read: bool = false
+
+private sph_library() -> Buf[Program]
+    if sph_library_read then return sph_library_cache
+
+    sph_library_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> sph_library_cache = units
+
+    sph_library_cache
+end sph_library
+
+private sph_refused(text: string) -> string
+    val parsed = parse(source_of("t.sysl", text))
+
+    if !parsed.ok() then return parsed.report.render(parsed.src)
+
+    var units: Buf[Program] = buf()
+
+    for item in sph_library()
+        units.push(item)
+
+    units.push(parsed.program)
+
+    val done = analyze_bodies(units, host_target())
+    val whole = program_of(done, "")
+
+    post_analysis_checks(done.an, whole, buf())
+
+    analysis_report(errors_of(done.an.diagnostics()))
+end sph_refused
+
+private sph_hinted(said: string)
+    assert(said.contains("`as_ptr(xs)` from `sysl.slices`"), said)
+    assert(said.contains("`as_mut_ptr(xs)`"), said)
+
+@test("sph: .ptr of a byte slice names as_ptr")
+sph_ptr_of_const_slice()
+    if sph_library().is_empty() then return
+
+    val said = sph_refused("val s = \"abc\"\nprint(s.bytes.ptr)\n")
+
+    assert(said.contains("cannot read field 'ptr' of []const byte"), said)
+    sph_hinted(said)
+
+@test("sph: .ptr of a writable slice names as_ptr")
+sph_ptr_of_mutable_slice()
+    if sph_library().is_empty() then return
+
+    sph_hinted(sph_refused("f(xs: []int)\n    print(xs.ptr)\n"))
+
+@test("sph: .data of a slice names as_ptr")
+sph_data_of_slice()
+    if sph_library().is_empty() then return
+
+    val said = sph_refused("f(xs: []int)\n    print(xs.data)\n")
+
+    assert(said.contains("cannot read field 'data'"), said)
+    sph_hinted(said)
+
+@test("sph: .as_ptr written as a field of a slice names the function")
+sph_as_ptr_field_of_slice()
+    if sph_library().is_empty() then return
+
+    sph_hinted(sph_refused("f(xs: []int)\n    print(xs.as_ptr)\n"))
+
+@test("sph: .as_ptr() written as a method of a slice names the function")
+sph_as_ptr_method_of_slice()
+    if sph_library().is_empty() then return
+
+    sph_hinted(sph_refused("f(xs: []const int)\n    print(xs.as_ptr())\n"))
+
+@test("sph: .as_ptr() of a string's bytes names the function")
+sph_as_ptr_method_of_bytes()
+    if sph_library().is_empty() then return
+
+    sph_hinted(sph_refused("val s = \"abc\"\nprint(s.bytes.as_ptr())\n"))
+
+@test("sph: .ptr of an array names as_ptr")
+sph_ptr_of_array()
+    if sph_library().is_empty() then return
+
+    sph_hinted(sph_refused("val a = [1, 2, 3]\nprint(a.ptr)\n"))
+
+@test("sph: .as_ptr() of an array names the function")
+sph_as_ptr_method_of_array()
+    if sph_library().is_empty() then return
+
+    sph_hinted(sph_refused("val a = [1, 2, 3]\nprint(a.as_ptr())\n"))
+
+@test("sph: an unrelated unknown field of a slice keeps the plain message")
+sph_unrelated_field_is_plain()
+    if sph_library().is_empty() then return
+
+    val said = sph_refused("f(xs: []int)\n    print(xs.foo)\n")
+
+    assert(said.contains("cannot read field 'foo' of []int"), said)
+    assert(!said.contains("as_ptr"), said)
+
+@test("sph: .len of a slice is untouched")
+sph_len_is_accepted()
+    if sph_library().is_empty() then return
+
+    assert(sph_refused("f(xs: []int)\n    print(xs.len)\n") == "")
+
+@test("sph: a Buf has no data pointer, so .ptr keeps its plain message")
+sph_buf_is_plain()
+    if sph_library().is_empty() then return
+
+    val said = sph_refused("import sysl.buf.{Buf, buf}\nval b: Buf[int] = buf()\nprint(b.ptr)\n")
+
+    assert(said.contains("ptr"), said)
+    assert(!said.contains("as_ptr"), said)
+
+@test("sph: as_ptr from sysl.slices is accepted")
+sph_as_ptr_function_is_accepted()
+    if sph_library().is_empty() then return
+
+    assert(sph_refused("import sysl.slices.as_ptr\nf(xs: []const int)\n    print(as_ptr(xs))\n") == "")
