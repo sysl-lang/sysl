@@ -800,6 +800,67 @@ A catch-all is a wildcard or a binding in tail position, in an unguarded arm. `e
 equivalent to the analyzer; `else` is the conventional form in tail position, and `_` the form used
 inside a `|` or a nested pattern.
 
+## Dead arms
+
+**A pattern that can never match is an error.** The arms are tried in order, so a pattern is dead
+when every value it matches is already matched by the arms above it. The refusal sits at the dead
+pattern and names the earlier arms that cover it between them. This is Rust's `unreachable_patterns`
+rule, made an error rather than a warning.
+
+```sysl
+enum Colour
+    Red
+    Green
+    Blue
+
+code(c: Colour) -> int = c match
+    Red -> 1
+    Green -> 2
+    Red -> 3
+    else 4
+
+print(code(Blue))
+```
+
+```error
+unreachable pattern 'Red': every value it matches is already matched by the arm on line 7
+```
+
+The same question is asked of every pattern:
+
+- **A catch-all ends the match.** Any arm after `_`, after a bare binding, or after an `else` is
+  dead. So is an `else` after arms that already cover every value.
+- **Literals and ranges are compared as the values they are.** `3` after `0..9` is dead, `TWO`
+  after `2` is dead when `const TWO = 2`, and `2..7` after `1..5` and `4..9` is dead, because the two
+  ranges cover it between them. `5` after `1..<5` is alive.
+- **Nested patterns, tuples and structs are read position by position.** `Some(Red)` twice is dead,
+  and so is `Some(_)` after `Some(Red)`, `Some(Green)` and `Some(Blue)`.
+- **Each `|` alternative is checked on its own.** It is dead if the earlier arms cover it, or the
+  alternatives before it in the same arm, or the two together. The same holds for the alternatives
+  of an `is` test.
+- **A guarded arm covers nothing**, just as it counts for nothing toward exhaustiveness. A guarded
+  arm can still be dead itself.
+
+```sysl
+pick(o: Option[bool]) -> int = o match
+    Some(true) -> 1
+    Some(false) | Some(_) -> 2
+    None -> 3
+
+print(pick(None))
+```
+
+```error
+unreachable pattern 'Some(_)': every value it matches is already matched by the arm on line 2 and an earlier alternative of this arm
+```
+
+**The answer agrees with exhaustiveness, so a match can always be written that is neither short nor
+dead.** Literals and ranges never complete an integer, a float or a string, so a wildcard after them
+is never dead. That holds even after `0..255` on a `u8`, where the wildcard is still required.
+Matching against storage, such as `` `limit` `` naming a `val`, compares with a value the compiler
+does not know. Such an arm covers nothing below it, and it is dead only after an arm that matches
+everything.
+
 ## The type of a match
 
 **A match used for a value takes the common type of its arms.** When every arm yields the same

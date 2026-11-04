@@ -1,0 +1,408 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+
+// Dead arms (`reference/patterns.md § Dead arms`): a pattern every value of which an earlier arm
+// already matches is refused -- Rust's `unreachable_patterns`, as an error. The refusal sits at the
+// dead pattern and names the earlier arms that between them cover it, the fewest that do.
+//
+// The axes: what makes it dead (a variant, a catch-all, a binding, a literal of every scalar kind, a
+// range or a union of ranges, a const, an earlier alternative of the same arm, a combination of an
+// earlier arm and an earlier alternative); where the pattern sits (an arm, an `|` alternative, a
+// payload, a tuple, a struct, an `is` test); what must NOT make it dead (a guard, storage compared
+// against, a range that stops one short, an open type's literals before a wildcard, a variant whose
+// payload holds no value); and where the match sits (value and statement position, a generic
+// function instantiated twice, a method, a closure). Cells skipped: build modes, separate
+// compilation and bare metal -- the check is the analyzer's alone and emits nothing.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private dam_ready() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+
+    true
+end dam_ready
+
+// What the compiler says about a program, as the command line prints it; empty for a clean one.
+private dam_err(text: string) -> string
+    val root = make_temp_dir("sysl-dam").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    val out = emit_llvm_text(src, None) match
+        Err(why) -> why.message
+        Ok(made) -> if made.report.is_empty() then "" else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end dam_err
+
+private dam_complaints(said: string) -> int
+    var rest = said
+    var n = 0
+
+    loop
+        rest.index_of("main.sysl:") match
+            None -> break
+            Some(at) ->
+                n += 1
+                rest = rest[at + 10..<rest.bytes.len]
+
+    n
+end dam_complaints
+
+// The one complaint a program earns: its whole message, and the `line:col` it is anchored at.
+private dam_only(text: string, message: string, at: string)
+    val said = dam_err(text)
+    val head = s"error: $message\n"
+
+    // The arrow is indented by the width of the line numbers the excerpt shows.
+    said.index_of(head) match
+        None -> assert(false, said)
+        Some(i) ->
+            val rest = said[i + head.bytes.len..<said.bytes.len]
+            val place = rest.index_of("\n") match
+                Some(n) -> rest[0..<n]
+                None -> rest
+
+            assert(place.trim_start().starts_with("--> "), said)
+            assert(place.ends_with(s"main.sysl:$at"), said)
+
+    assert_eq(dam_complaints(said), 1, said)
+end dam_only
+
+private dam_clean(text: string)
+    assert_eq(dam_err(text), "")
+
+// Five lines, so a program's own first line is line 6.
+private dam_color() -> string = "enum Color\n    Red\n    Green\n    Blue\n\n"
+
+private dam_dead(text: string, by: string) -> string =
+    s"unreachable pattern '$text': every value it matches is already matched by $by"
+
+// -- what makes an arm dead -----------------------------------------------------------------------
+
+@test("a variant matched twice is refused at the second, naming the first")
+dam_variant_twice()
+    if !dam_ready() then return
+
+    dam_only(dam_color() + "f(c: Color) -> int = c match\n    Red -> 1\n    Red -> 2\n    else 3\n",
+             dam_dead("Red", "the arm on line 7"), "8:5")
+
+@test("a statement-position match is checked too")
+dam_statement_position()
+    if !dam_ready() then return
+
+    dam_only(dam_color() + "f(c: Color)\n    c match\n        Red -> print(1)\n        Green -> print(2)\n" +
+             "        Blue -> print(3)\n        Green -> print(4)\n",
+             dam_dead("Green", "the arm on line 9"), "11:9")
+
+@test("only the arms that are needed are named: a variant listed again names its first arm alone")
+dam_names_the_fewest()
+    if !dam_ready() then return
+
+    dam_only(dam_color() + "f(c: Color) -> int = c match\n    Red -> 1\n    Green -> 2\n    Red -> 3\n" +
+             "    else 4\n",
+             dam_dead("Red", "the arm on line 7"), "9:5")
+
+@test("an arm after '_' is dead")
+dam_after_wildcard()
+    if !dam_ready() then return
+
+    dam_only("f(n: int) -> int = n match\n    _ -> 1\n    2 -> 5\n",
+             dam_dead("2", "the arm on line 2"), "3:5")
+
+@test("an arm after a binding is dead, and so is an 'else' after one")
+dam_after_binding()
+    if !dam_ready() then return
+
+    dam_only("f(n: int) -> int = n match\n    x -> x\n    3 -> 0\n",
+             dam_dead("3", "the arm on line 2"), "3:5")
+    dam_only("f(n: int) -> int = n match\n    x -> x\n    else 0\n",
+             "this 'else' arm can never run: every value is already matched by the arm on line 2", "3:5")
+
+@test("an 'else' after every variant is dead, naming the arms that cover them")
+dam_else_after_every_variant()
+    if !dam_ready() then return
+
+    dam_only(dam_color() + "f(c: Color) -> int = c match\n    Red -> 1\n    Green -> 2\n    Blue -> 3\n" +
+             "    else 4\n",
+             "this 'else' arm can never run: every value is already matched by the arms on lines 7, 8 " +
+             "and 9", "10:5")
+
+@test("past four covering arms the list is given by its ends")
+dam_long_list()
+    if !dam_ready() then return
+
+    dam_only("enum E\n    A\n    B\n    C\n    D\n    F\n\nf(e: E) -> int = e match\n    A -> 1\n" +
+             "    B -> 2\n    C -> 3\n    D -> 4\n    F -> 5\n    _ -> 6\n",
+             dam_dead("_", "the 5 arms above it, on lines 9 to 13"), "14:5")
+
+@test("an 'n @' binding tests what its inner pattern tests")
+dam_at_binding()
+    if !dam_ready() then return
+
+    dam_only(dam_color() + "f(c: Color) -> int = c match\n    Red -> 1\n    k @ Red -> 2\n    else 3\n",
+             dam_dead("k @ Red", "the arm on line 7"), "8:5")
+
+// -- literals, ranges and constants ---------------------------------------------------------------
+
+@test("a literal matched twice is dead: int, negative int, char, string, float, bool")
+dam_literal_twice()
+    if !dam_ready() then return
+
+    dam_only("f(n: int) -> int = n match\n    1 -> 1\n    1 -> 2\n    else 3\n",
+             dam_dead("1", "the arm on line 2"), "3:5")
+    dam_only("f(n: int) -> int = n match\n    -1 -> 1\n    -1 -> 2\n    else 3\n",
+             dam_dead("-1", "the arm on line 2"), "3:5")
+    dam_only("f(c: char) -> int = c match\n    'q' -> 1\n    'q' -> 2\n    else 3\n",
+             dam_dead("'q'", "the arm on line 2"), "3:5")
+    dam_only("f(s: string) -> int = s match\n    \"x\" -> 1\n    \"x\" -> 2\n    else 3\n",
+             dam_dead("\"x\"", "the arm on line 2"), "3:5")
+    dam_only("f(r: f64) -> int = r match\n    1.5 -> 1\n    1.5 -> 2\n    else 3\n",
+             dam_dead("1.5", "the arm on line 2"), "3:5")
+    dam_only("f(b: bool) -> int = b match\n    true -> 1\n    true -> 2\n    else 3\n",
+             dam_dead("true", "the arm on line 2"), "3:5")
+
+@test("different literals are not dead, and neither is the wildcard after them")
+dam_literals_alive()
+    if !dam_ready() then return
+
+    dam_clean("f(n: int) -> int = n match\n    1 -> 1\n    2 -> 2\n    -1 -> 3\n    else 4\n")
+    dam_clean("f(s: string) -> int = s match\n    \"x\" -> 1\n    \"y\" -> 2\n    else 3\n")
+    dam_clean("f(r: f64) -> int = r match\n    1.5 -> 1\n    2.5 -> 2\n    else 3\n")
+
+@test("a bool covered by both literals leaves the 'else' dead")
+dam_bool_else()
+    if !dam_ready() then return
+
+    dam_only("f(b: bool) -> int = b match\n    true -> 1\n    false -> 2\n    else 3\n",
+             "this 'else' arm can never run: every value is already matched by the arms on lines 2 " +
+             "and 3", "4:5")
+
+@test("a literal inside an earlier range is dead, and so is a char inside a char range")
+dam_literal_in_range()
+    if !dam_ready() then return
+
+    dam_only("f(n: int) -> int = n match\n    0..9 -> 1\n    3 -> 2\n    else 3\n",
+             dam_dead("3", "the arm on line 2"), "3:5")
+    dam_only("f(c: char) -> int = c match\n    'a'..'z' -> 1\n    'q' -> 2\n    else 3\n",
+             dam_dead("'q'", "the arm on line 2"), "3:5")
+
+@test("a range covered by two overlapping ranges together is dead, naming both")
+dam_ranges_together()
+    if !dam_ready() then return
+
+    dam_only("f(n: int) -> int = n match\n    1..5 -> 1\n    4..9 -> 2\n    2..7 -> 3\n    else 4\n",
+             dam_dead("2..7", "the arms on lines 2 and 3"), "4:5")
+    dam_only("f(n: int) -> int = n match\n    1..<5 -> 1\n    5..9 -> 2\n    3..7 -> 3\n    else 4\n",
+             dam_dead("3..7", "the arms on lines 2 and 3"), "4:5")
+
+@test("a range that stops one short leaves the value past it alive")
+dam_range_edges()
+    if !dam_ready() then return
+
+    dam_clean("f(n: int) -> int = n match\n    1..<5 -> 1\n    5 -> 2\n    else 3\n")
+    dam_clean("f(n: int) -> int = n match\n    1..5 -> 1\n    7..9 -> 2\n    0..10 -> 3\n    else 4\n")
+    dam_clean("f(n: int) -> int = n match\n    1..5 -> 1\n    4..9 -> 2\n    2..10 -> 3\n    else 4\n")
+
+@test("an open type is never completed by its literals: '_' after a u8's whole range is alive")
+dam_open_type_wildcard()
+    if !dam_ready() then return
+
+    dam_clean("f(n: u8) -> int = n match\n    0..255 -> 1\n    _ -> 2\n")
+    dam_clean("f(n: int) -> int = n match\n    0 -> 1\n    1 -> 2\n    _ -> 3\n")
+
+@test("a const pattern is the value it folds to, in either order and when computed")
+dam_const_pattern()
+    if !dam_ready() then return
+
+    dam_only("const TWO = 2\n\nf(n: int) -> int = n match\n    2 -> 1\n    TWO -> 2\n    else 3\n",
+             dam_dead("TWO", "the arm on line 4"), "5:5")
+    dam_only("const TWO = 2\n\nf(n: int) -> int = n match\n    TWO -> 1\n    2 -> 2\n    else 3\n",
+             dam_dead("2", "the arm on line 4"), "5:5")
+    dam_only("const LIMIT = 1 + 4\n\nf(n: int) -> int = n match\n    1..5 -> 1\n    LIMIT -> 2\n" +
+             "    else 3\n",
+             dam_dead("LIMIT", "the arm on line 4"), "5:5")
+
+@test("storage compared against covers nothing, but is dead after a wildcard")
+dam_storage_pattern()
+    if !dam_ready() then return
+
+    dam_clean("f(n: int, x: int) -> int = n match\n    `x` -> 1\n    `x` -> 2\n    else 3\n")
+    dam_only("f(n: int, x: int) -> int = n match\n    _ -> 1\n    `x` -> 2\n",
+             dam_dead("`x`", "the arm on line 2"), "3:5")
+
+// -- alternatives, guards ----------------------------------------------------------------------------
+
+@test("an alternative an earlier arm covers is refused at the alternative")
+dam_alternative_by_arm()
+    if !dam_ready() then return
+
+    dam_only(dam_color() + "f(c: Color) -> int = c match\n    Red | Green -> 1\n    Blue | Red -> 2\n",
+             dam_dead("Red", "the arm on line 7"), "8:12")
+
+@test("an alternative an earlier alternative of its own arm covers names the arm itself")
+dam_alternative_by_own_arm()
+    if !dam_ready() then return
+
+    dam_only(dam_color() + "f(c: Color) -> int = c match\n    Red | Red -> 1\n    else 2\n",
+             dam_dead("Red", "an earlier alternative of this arm"), "7:11")
+
+@test("a guard on the arm does not keep its own alternatives apart")
+dam_alternative_under_guard()
+    if !dam_ready() then return
+
+    dam_only(dam_color() + "f(c: Color, b: bool) -> int = c match\n    Red | Red if b -> 1\n    else 2\n",
+             dam_dead("Red", "an earlier alternative of this arm"), "7:11")
+
+@test("an earlier arm and an earlier alternative may cover a pattern together")
+dam_arm_and_alternative()
+    if !dam_ready() then return
+
+    dam_only("f(o: Option[bool]) -> int = o match\n    Some(true) -> 1\n    Some(false) | Some(_) -> 2\n" +
+             "    None -> 3\n",
+             dam_dead("Some(_)", "the arm on line 2 and an earlier alternative of this arm"), "3:19")
+
+@test("a guarded earlier arm covers nothing")
+dam_guard_covers_nothing()
+    if !dam_ready() then return
+
+    dam_clean(dam_color() + "f(c: Color, b: bool) -> int = c match\n    Red if b -> 1\n    Red -> 2\n" +
+              "    else 3\n")
+    dam_clean("f(n: int) -> int = n match\n    m if m > 3 -> 1\n    5 -> 2\n    x -> 3\n")
+
+@test("a guarded arm can itself be dead")
+dam_guarded_arm_dead()
+    if !dam_ready() then return
+
+    dam_only(dam_color() + "f(c: Color, b: bool) -> int = c match\n    _ -> 1\n    Red if b -> 2\n",
+             dam_dead("Red", "the arm on line 7"), "8:5")
+
+// -- nested patterns, tuples, structs ---------------------------------------------------------------
+
+@test("a nested pattern matched twice is dead")
+dam_nested_twice()
+    if !dam_ready() then return
+
+    dam_only(dam_color() + "f(o: Option[Color]) -> int = o match\n    Some(Red) -> 1\n    Some(Red) -> 2\n" +
+             "    else 3\n",
+             dam_dead("Some(Red)", "the arm on line 7"), "8:5")
+
+@test("a payload covered variant by variant leaves the payload wildcard dead")
+dam_nested_complete()
+    if !dam_ready() then return
+
+    dam_only(dam_color() + "f(o: Option[Color]) -> int = o match\n    Some(Red) -> 1\n    Some(Green) -> 2\n" +
+             "    Some(Blue) -> 3\n    Some(_) -> 4\n    None -> 5\n",
+             dam_dead("Some(_)", "the arms on lines 7, 8 and 9"), "10:5")
+    dam_clean(dam_color() + "f(o: Option[Color]) -> int = o match\n    Some(Red) -> 1\n    Some(_) -> 2\n" +
+              "    None -> 3\n")
+
+@test("a tuple pattern is dead when the earlier ones cover it, naming only the ones that do")
+dam_tuples()
+    if !dam_ready() then return
+
+    dam_only("f(a: bool, b: bool) -> int = (a, b) match\n    (true, _) -> 1\n    (_, true) -> 2\n" +
+             "    (false, false) -> 3\n    (false, true) -> 4\n",
+             dam_dead("(false, true)", "the arm on line 3"), "5:5")
+    dam_only("f(a: bool, b: bool) -> int = (a, b) match\n    (true, _) -> 1\n    (_, true) -> 2\n" +
+             "    (false, false) -> 3\n    _ -> 4\n",
+             dam_dead("_", "the arms on lines 2, 3 and 4"), "5:5")
+    dam_clean("f(a: bool, b: bool) -> int = (a, b) match\n    (true, _) -> 1\n    (_, true) -> 2\n" +
+              "    _ -> 3\n")
+
+@test("a struct pattern is dead when an earlier one matches every value it does")
+dam_struct_pattern()
+    if !dam_ready() then return
+
+    dam_only("struct P\n    x: int\n    y: int\n\nf(p: P) -> int = p match\n    P { x: 1, y } -> y\n" +
+             "    P { x: 1, y: 2 } -> 0\n    else 3\n",
+             dam_dead("P { x: 1, y: 2 }", "the arm on line 6"), "7:5")
+
+// -- 'is' ---------------------------------------------------------------------------------------------
+
+@test("an 'is' alternative the ones before it match is dead, in 'if' and in 'while'")
+dam_is_alternatives()
+    if !dam_ready() then return
+
+    dam_only(dam_color() + "f(o: Option[Color]) -> int\n    if o is Some(Red) | Some(Red) then return 1\n" +
+             "    0\n",
+             dam_dead("Some(Red)", "an earlier alternative of this arm"), "7:25")
+    dam_only(dam_color() + "f(o: Option[Color])\n    while o is Some(_) | Some(Red)\n        print(1)\n",
+             dam_dead("Some(Red)", "an earlier alternative of this arm"), "7:26")
+    dam_clean(dam_color() + "f(o: Option[Color]) -> bool = o is Some(Red) | Some(Green)\n")
+
+// -- where the match sits -------------------------------------------------------------------------
+
+@test("a dead arm in a generic function instantiated twice is reported once")
+dam_generic()
+    if !dam_ready() then return
+
+    dam_only("f[T](o: Option[T]) -> int = o match\n    Some(_) -> 1\n    Some(_) -> 2\n    None -> 3\n\n" +
+             "main()\n    print(f(Some(1)), f(Some(\"a\")))\n",
+             dam_dead("Some(_)", "the arm on line 2"), "3:5")
+
+@test("a dead arm in a method and in a closure")
+dam_method_and_closure()
+    if !dam_ready() then return
+
+    dam_only("enum Color\n    Red\n    Green\n\n    code(self) -> int = self match\n        Red -> 1\n" +
+             "        Red -> 2\n        Green -> 3\n",
+             dam_dead("Red", "the arm on line 6"), "7:9")
+    dam_only(dam_color() + "main()\n    val g = (c: Color) -> c match\n        Red -> 1\n        Red -> 2\n" +
+             "        else 3\n    print(g(Red))\n",
+             dam_dead("Red", "the arm on line 8"), "9:9")
+
+@test("a variant whose payload holds no value may still be named")
+dam_uninhabited_variant()
+    if !dam_ready() then return
+
+    dam_clean("f(r: Result[int, never]) -> int = r match\n    Ok(n) -> n\n    Err(_) -> 0\n")
+
+@test("a refused pattern is not blamed a second time as a dead arm")
+dam_no_cascade()
+    if !dam_ready() then return
+
+    val said = dam_err(dam_color() + "f(c: Color) -> int = c match\n    Some(_) -> 1\n    Red -> 2\n" +
+                       "    else 3\n")
+
+    assert(said.index_of("unreachable").is_none(), said)
+    assert(said != "", said)
+
+// -- the typed printer's calling convention (found by this check: the old arms bound the whole
+// convention under the name 'C', so every one printed as "C") ----------------------------------------
+
+private dam_conv_of(text: string, name: string) -> string
+    val root = make_temp_dir("sysl-dam-conv").unwrap()
+    val file = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(file, text).unwrap()
+
+    val (whole, _) = typed_program(typed_compilation(file, Some("riscv64-linux")).unwrap())
+
+    remove_dir_all(root).unwrap_or(())
+
+    for f in whole.funcs
+        if f.name == name then return show_typed_func(f)
+
+    ""
+end dam_conv_of
+
+@test("emit-typed prints an interrupt function's convention as written, with its mode")
+dam_typed_conv()
+    if !dam_ready() then return
+
+    val bare = dam_conv_of("interrupt timer()\n    print(1)\n\nmain()\n    print(2)\n", "timer")
+    val moded = dam_conv_of("interrupt(supervisor) timer()\n    print(1)\n\nmain()\n    print(2)\n", "timer")
+
+    assert(bare.index_of("conv: \"interrupt\"\n").is_some(), bare)
+    assert(moded.index_of("conv: \"interrupt(supervisor)\"\n").is_some(), moded)
