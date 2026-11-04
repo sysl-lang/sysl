@@ -77,14 +77,18 @@ private val elb_driver: string =
     "    if (b[0] != 'a' || b[1] != 'b' || b[2] != 0 || b[15] != 0) return 3;\n" +
     "    return 0;\n}\n"
 
-// The host archive built from `main` in `root`, and its disassembly, relocations included.
-private elb_disassembled(objdump: string, root: string) -> (string, string)
+// The host archive built from `main` in `root`, and the disassembly of the exports `symbols`,
+// relocations included. The exports are named outright: everything else in an archive is internal,
+// so an export's body can begin where the section does, and a plain listing labels it with the
+// section's local `ltmp0` rather than with the export.
+private elb_disassembled(objdump: string, root: string, symbols: string) -> (string, string)
     val archive = s"$root/probe.a"
     val built = elb_cli(["sysl", "build-c", "-o", archive, root])
 
     assert_eq(built.0, 0, built.1)
 
-    capture(objdump, ["-d", "-r", "--no-show-raw-insn", "--no-leading-addr", archive]) match
+    capture(objdump, ["-d", "-r", "--no-show-raw-insn", "--no-leading-addr",
+                      s"--disassemble-symbols=$symbols", archive]) match
         Err(_) ->
             assert(false, "llvm-objdump did not run")
             (archive, "")
@@ -202,11 +206,11 @@ elb_exported_runtime_is_real()
         None -> return
 
     val root = elb_project(elb_runtime)
-    val made = elb_disassembled(objdump, root)
+    val made = elb_disassembled(objdump, root, "_strlen,_memset,_strncpy")
     val dis = made.1
-    val len_body = elb_body(dis, "_strlen") + "\n" + elb_body(dis, "_c_strlen")
-    val set_body = elb_body(dis, "_memset") + "\n" + elb_body(dis, "_c_memset")
-    val cpy_body = elb_body(dis, "_strncpy") + "\n" + elb_body(dis, "_c_strncpy")
+    val len_body = elb_body(dis, "_strlen")
+    val set_body = elb_body(dis, "_memset")
+    val cpy_body = elb_body(dis, "_strncpy")
 
     assert(len_body.contains("ldrb"), s"strlen reads bytes:\n${elb_dump(dis, "strlen")}\n$len_body")
     assert(!elb_calls(len_body, ["_strlen"]), s"strlen calls no strlen:\n$len_body")
@@ -238,9 +242,8 @@ elb_ordinary_export_keeps_builtins()
         None -> return
 
     val root = elb_project(elb_ordinary)
-    val dis = elb_disassembled(objdump, root).1
-    val body = elb_body(dis, "_fill_bytes") + "\n" + elb_body(dis, "_$fill_bytes") + "\n" +
-               elb_body(dis, "_fill_bytes$$sysl")
+    val dis = elb_disassembled(objdump, root, "_fill_bytes").1
+    val body = elb_body(dis, "_fill_bytes")
 
     remove_dir_all(root).unwrap_or(())
     assert(elb_calls(body, ["_memset"]), s"the loop is LLVM's memset:\n${elb_dump(dis, "fill_bytes")}\n$body")

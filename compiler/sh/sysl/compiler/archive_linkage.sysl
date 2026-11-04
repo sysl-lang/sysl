@@ -1,0 +1,69 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+
+// **A `build-c` archive offers the C link the names C can spell, and nothing else.**
+//
+// The archive carries its own copy of every piece of the standard library it reaches, and a C project
+// may link two such archives -- or an archive and a sysl program -- into one image. Every sysl
+// definition is named under a spelling no C declaration can use (`sysl$prints`, `real.bits`,
+// `helper$$sysl`), so no C code can call one; left global, those names are what the two archives
+// collide on, as duplicate symbols.
+//
+// **Merging them instead would be wrong, not merely risky.** A name does not fix what it names
+// across two compilations: a root function `helper` is `helper$$sysl` in every archive whatever its
+// body, and `sysl.buf$Buf.push.P` is the same symbol over two root types `P` of different layouts. A
+// linker told to keep one copy (`linkonce_odr`, `weak_odr`) keeps one silently, and one archive then
+// runs the other's code. So every definition the C link cannot name is made `internal`, and each
+// archive keeps its own copy of the library code and the library's module storage.
+//
+// What stays global is what has a C spelling: the `@export` entries and storage the header declares,
+// and the runtime's C-named hooks (`sysl_bounds_fail`, `__sysl_arc_reaper`), which are `weak` so that
+// one answer wins. The `llvm.` lists are appending and are untouched.
+
+// The module with every definition C cannot name made internal.
+archive_internalized(m: IrModule) -> IrModule
+    var funcs: Buf[IrFunc] = buf()
+
+    for f in m.funcs
+        funcs.push(ai_func(f))
+
+    var thunks: Buf[IrFunc] = buf()
+
+    for f in m.thunks
+        thunks.push(ai_func(f))
+
+    var runtime: Buf[IrRuntime] = buf()
+
+    for item in m.runtime
+        runtime.push(item match
+            RtEmitted(f) -> RtEmitted(ai_func(f))
+            other -> other)
+
+    var globals: Buf[IrGlobal] = buf()
+
+    for g in m.globals
+        globals.push(if ai_hides(g.name, g.linkage) then g with { linkage = LinkInternal, hidden = false } else g)
+
+    val entry: Option[IrFunc] = m.entry.map(f -> ai_func(f))
+    val init: Option[IrInit] = m.init.map(it -> IrInit(ai_func(it.func), it.list))
+
+    m with { funcs = funcs, thunks = thunks, runtime = runtime, globals = globals, entry = entry,
+             init = init }
+end archive_internalized
+
+private ai_func(f: IrFunc) -> IrFunc =
+    if ai_hides(f.sig.name, f.sig.linkage) then
+        f with { sig = f.sig with { linkage = LinkInternal, hidden = false } }
+    else f
+
+// Whether a definition of `name` under `l` is one the archive keeps to itself: a linkage the linker
+// would resolve across objects, on a name no C declaration can spell.
+private ai_hides(name: string, l: IrLinkage) -> bool
+    if c_identifier(name) || name.starts_with("llvm.") then return false
+
+    l match
+        LinkDefault -> true
+        LinkWeakOdr -> true
+        LinkWeak -> true
+        _ -> false
