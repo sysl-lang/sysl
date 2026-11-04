@@ -1,6 +1,6 @@
 ---
 title: Patterns and matching
-summary: Every pattern form, how arms are chosen, what guards do to exhaustiveness, and why alternatives may not bind.
+summary: Every pattern form, how arms are chosen, what guards do to exhaustiveness, and what alternatives may bind.
 weight: 60
 ---
 
@@ -196,6 +196,9 @@ A qualified name can never be a
 *binding*, because no declared name contains a dot, so one that resolves to neither a variant nor a
 constant is a diagnostic rather than a new local.
 
+A `const` declared inside a function body is a constant here too, and is nearer than one at the top
+of a file: it is compared against, not bound.
+
 ### A backticked name references rather than binds
 
 The rule above resolves a bare name against a narrow set — the scrutinee's nullary variants, then the
@@ -269,30 +272,146 @@ arm it begins an arm of its own, so `1 -> a` followed by `| 2 -> b` is two arms.
 lines are written at the arms' own margin, and a `|` inside brackets is the bitwise operator it
 always was.
 
-### Alternatives may not bind
+### Alternatives bind the same names
 
-`1 | 2 | 3` is one arm matching any of three literals. An arm whose alternatives **bind** is
-rejected, because the body cannot know which alternative matched, and so which part of the value a
-binding refers to:
+`1 | 2 | 3` is one arm matching any of three literals. Alternatives may **bind**, as in Rust, when
+every one of them binds the same names at the same types. The body cannot know which alternative
+matched, so each name it reads has to stand for something whichever one did:
 
 ```sysl
 enum Box
     One(v: int)
     Two(v: int)
+    Pair(a: int, b: int)
 
 get(b: Box) -> int
     b match
-        One(v) | Two(v) -> v
+        One(v) | Two(v) | Pair(_, v) -> v
+
+print(get(One(1)), get(Two(2)), get(Pair(3, 4)))
+```
+
+```output
+1 2 4
+```
+
+The same holds of an `is` test, so `if b is One(v) | Two(v)` names `v` in its branch. A name one
+alternative binds and another does not is refused, and so is a name bound at two types:
+
+```sysl
+enum Box
+    One(v: int)
+    Two(v: int)
+    Empty
+
+get(b: Box) -> int
+    b match
+        One(v) | Empty -> v
+        Two(v) -> v
 
 print(get(One(1)))
 ```
 
 ```error
-alternative patterns joined by '|' cannot bind a name
+'v' is bound by one alternative joined by '|' and not by another
 ```
 
-This is stricter than Rust, which permits `A(x) | B(x)` when every alternative binds the same names
-at the same types. In sysl, an arm with `|` binds nothing.
+```sysl
+enum Cell
+    Num(v: int)
+    Text(v: string)
+
+show(c: Cell) -> string
+    c match
+        Num(v) | Text(v) -> s"$v"
+
+print(show(Num(1)))
+```
+
+```error
+'v' is bound as int by one alternative joined by '|' and as string by another
+```
+
+A pattern binds by copy, so there is no mutability or `ref` mode for the alternatives to disagree
+on.
+
+**A guard is asked once for each alternative that matches**, in order, with that alternative's
+bindings. `Pair(v, _) | Pair(_, v) if v > 10` takes `Pair(3, 40)` through its second alternative
+after the first one's guard said no:
+
+```sysl
+enum Box
+    One(v: int)
+    Pair(a: int, b: int)
+
+big(b: Box) -> string
+    b match
+        Pair(v, _) | Pair(_, v) if v > 10 -> s"big $v"
+        _ -> "small"
+
+print(big(Pair(3, 40)), big(Pair(50, 1)), big(Pair(1, 2)), big(One(99)))
+```
+
+```output
+big 40 big 50 small small
+```
+
+### Alternatives inside a pattern
+
+A `|` may stand at any position inside a pattern, not only between whole ones: in a variant's
+parentheses, in a tuple's part, in a struct field, after an `@` in parentheses. `Some(1 | 2)` is the
+arm `Some(1) | Some(2)`, and coverage counts it that way, so `Some(_)` and `None` still finish the
+match. Parentheses around alternatives group them, and the binding rule above applies to whatever
+alternatives the `|`s make:
+
+```sysl
+enum Shape
+    Circle(r: int)
+    Square(side: int)
+    Dot
+
+classify(o: Option[int]) -> string
+    o match
+        Some(1 | 2) -> "small"
+        Some(_) -> "other"
+        None -> "none"
+
+radius(o: Option[Shape]) -> int
+    o match
+        Some(Circle(r) | Square(r)) -> r
+        Some(Dot) | None -> 0
+
+grid(t: (int, char)) -> string
+    t match
+        (0 | 1, 'a' | 'b') -> "corner"
+        (n @ (5 | 6), _) -> s"edge $n"
+        _ -> "inside"
+
+print(classify(Some(2)), classify(Some(7)), classify(None))
+print(radius(Some(Square(4))), radius(None))
+print(grid((1, 'b')), grid((6, 'z')), grid((3, 'a')))
+```
+
+```output
+small other none
+4 0
+corner edge 6 inside
+```
+
+Each `|` multiplies: `(1 | 2, 3 | 4)` is four alternatives. A pattern that would spread into more
+than 1024 is refused. A `val` or a `for` takes one shape of a value apart, so a `|` in its pattern
+is refused, with no other arm to try:
+
+```sysl
+val o = Some(1)
+val Some(1 | 2) = o
+
+print(o)
+```
+
+```error
+alternatives joined by '|' are written in a 'match' arm or an 'is' test
+```
 
 ### A name may be bound twice in one match, but not in one pattern
 
@@ -799,6 +918,76 @@ result even for effect. For a single-variant test without a catch-all, use `is`;
 A catch-all is a wildcard or a binding in tail position, in an unguarded arm. `else` and `_` are
 equivalent to the analyzer; `else` is the conventional form in tail position, and `_` the form used
 inside a `|` or a nested pattern.
+
+## Dead arms
+
+**A pattern that can never match is an error.** The arms are tried in order, so a pattern is dead
+when every value it matches is already matched by the arms above it. The refusal sits at the dead
+pattern and names the earlier arms that cover it between them. This is Rust's `unreachable_patterns`
+rule, made an error rather than a warning.
+
+```sysl
+enum Colour
+    Red
+    Green
+    Blue
+
+code(c: Colour) -> int = c match
+    Red -> 1
+    Green -> 2
+    Red -> 3
+    else 4
+
+print(code(Blue))
+```
+
+```error
+unreachable pattern 'Red': every value it matches is already matched by the arm on line 7
+```
+
+The same question is asked of every pattern:
+
+- **A catch-all ends the match.** Any arm after `_`, after a bare binding, or after an `else` is
+  dead. So is an `else` after arms that already cover every value.
+- **Literals and ranges are compared as the values they are.** `3` after `0..9` is dead, `TWO`
+  after `2` is dead when `const TWO = 2`, and `2..7` after `1..5` and `4..9` is dead, because the two
+  ranges cover it between them. `5` after `1..<5` is alive. A `const` written inside the body is
+  compared the same way: it never binds.
+- **A constant of an enum is the variant it came to**, as a const pattern is in Rust. `W` after
+  `Write` is dead when `const W = Access.Write`, and so is `Write` after `W`; constants naming every
+  variant cover the enum with no `_`, and a `_` after only some of them is alive.
+- **Nested patterns, tuples and structs are read position by position.** `Some(Red)` twice is dead,
+  and so is `Some(_)` after `Some(Red)`, `Some(Green)` and `Some(Blue)`.
+- **Each `|` alternative is checked on its own.** It is dead if the earlier arms cover it, or the
+  alternatives before it in the same arm, or the two together. The same holds for the alternatives
+  of an `is` test, and for a `|` inside a pattern: in `Some(1 | 1)` the second `1` is dead, and it is
+  the one reported. A part written with a `|` is dead only when no value can reach it whichever
+  alternatives the other parts take, so `(1 | 2, 3 | 4)` after an arm `(2, 4)` is not dead.
+- **A guarded arm covers nothing**, just as it counts for nothing toward exhaustiveness. A guarded
+  arm can still be dead itself. Inside a guarded arm whose alternatives bind a name, an earlier
+  alternative does not cover a later one either: the guard is asked again with the later
+  alternative's bindings, so `Pair(v, _) | Pair(_, v) if v > 10` is two different questions. With
+  nothing bound, `Red | Red if b` asks the same one twice, and the second `Red` is dead.
+
+```sysl
+pick(o: Option[bool]) -> int = o match
+    Some(true) -> 1
+    Some(false) | Some(_) -> 2
+    None -> 3
+
+print(pick(None))
+```
+
+```error
+unreachable pattern 'Some(_)': every value it matches is already matched by the arm on line 2 and an earlier alternative of this arm
+```
+
+**The answer agrees with exhaustiveness, so a match can always be written that is neither short nor
+dead.** Literals and ranges never complete an integer, a float or a string, so a wildcard after them
+is never dead. That holds even after `0..255` on a `u8`, where the wildcard is still required.
+Matching against storage, such as `` `limit` `` naming a `val`, compares with a value the compiler
+does not know. Such an arm covers nothing below it, and it is dead only after an arm that matches
+everything.
 
 ## The type of a match
 

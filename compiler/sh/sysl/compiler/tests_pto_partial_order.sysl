@@ -1,0 +1,482 @@
+module sh.sysl.compiler
+@tests
+
+// **Ordering is split, as Rust splits it** (`reference/expressions.md § Operator dispatch`):
+// `PartialOrd` declares `lt` and `le`, which the four ordering operators call, and `Ord: PartialOrd`
+// declares nothing and promises the order is total. A float is `PartialOrd` alone, since a NaN is
+// unordered with every value; every other ordered built-in is `Ord`. `impl Ord for T` writing `lt` is
+// `T`'s `PartialOrd` too, with `le` answered `!rhs.lt(self)`; a hand-written `PartialOrd` writes both.
+// `derives Ord` derives `PartialOrd` and refuses a field that is not `Ord`.
+//
+// The axes these cells cover: the scalar families (signed, unsigned, wide, `real`, `f32`, a library
+// type, a user type); the four ways a type gets an order (derived partial, derived total, `impl Ord`
+// with `lt`, `impl PartialOrd` plus an empty `impl Ord`); the composed shapes (tuples, slices,
+// arrays, a generic struct) at a total and at a partial element; generic callers bounded by each
+// trait; NaN on either side of each operator and of each float method; the signed zeros; the
+// operators against the method spellings; const evaluation; and every new refusal. Not covered
+// here: a `&PartialOrd` object, which is refused as a `&Ord` was (its members take `Self`), and
+// separate compilation, which every run already crosses -- `Decimal`, the tuples and the slices are
+// the standard module's, read from its `.syslib`.
+
+@test("a float is ordered by IEEE rules through every operator, at either width and in a generic body")
+pto_float_operators()
+    if !azb_ready() then return
+
+    azb_prints(azb_main(raw"""
+        le[T: PartialOrd](a: T, b: T) -> bool = a <= b
+        ge[T: PartialOrd](a: T, b: T) -> bool = a >= b
+        lt[T: PartialOrd](a: T, b: T) -> bool = a < b
+
+        val n = 0.0 / 0.0
+        val m = f32(n)
+
+        print(n < 1.0, n > 1.0, n <= 1.0, n >= 1.0, 1.0 <= n, 1.0 >= n)
+        print(m < 1, m <= 1, f32(1) >= m)
+        print(le(n, 1.0), ge(n, 1.0), le(1.0, n), lt(n, n), le(n, n))
+        print(le(1.0, 1.0), ge(2.0, 1.0), le(m, m), le(f32(1), f32(2)))
+        print(-0.0 < 0.0, -0.0 <= 0.0, 0.0 >= -0.0, le(-0.0, 0.0), le(0.0, -0.0))
+        print(1.5.lt(2.0), 1.5.le(1.5), n.le(n), 2.0.le(1.0))
+        """), "false false false false false false\n" +
+              "false false false\n" +
+              "false false false false false\n" +
+              "true true false true\n" +
+              "false true true true true\n" +
+              "true true false false\n")
+end pto_float_operators
+
+@test("the integers, wide and unsigned, a string and a library type are totally ordered and meet an Ord bound")
+pto_total_scalars()
+    if !azb_ready() then return
+
+    azb_prints(azb_main(raw"""
+        import sysl.math.{max, min, clamp}
+        import sysl.math.decimal.{from_int}
+
+        tle[T: Ord](a: T, b: T) -> bool = a <= b
+        tge[T: Ord](a: T, b: T) -> bool = a >= b
+
+        print(tle(3, 4), tge(3, 4), tle(u8(200), u8(7)), tle(i256(-5), i256(5)), tle(u12(4), u12(4)))
+        print(max(3, 9), min(u8(3), u8(9)), clamp(i256(12), i256(0), i256(10)), max("b", "a"))
+        print(tle(from_int(2), from_int(3)), from_int(3) >= from_int(3), max(from_int(4), from_int(-4)))
+        print(from_int(2) < from_int(1), from_int(2).le(from_int(2)), 'a' <= 'b')
+        """), "true false false true true\n" +
+              "9 3 10 b\n" +
+              "true true 4\n" +
+              "false true true\n")
+end pto_total_scalars
+
+@test("a derived PartialOrd orders field by field, and a NaN field leaves every comparison false")
+pto_derived_partial()
+    if !azb_ready() then return
+
+    azb_prints(azb_main(raw"""
+        struct P derives Eq, PartialOrd
+            x: real
+            y: int
+
+        enum E derives PartialOrd
+            Dot
+            Disc(r: f32)
+
+        val n = 0.0 / 0.0
+
+        print(P(n, 0) < P(1.0, 1), P(n, 0) > P(1.0, 1), P(n, 0) <= P(1.0, 1), P(n, 0) >= P(1.0, 1))
+        print(P(1.0, 0) < P(n, 1), P(1.0, 0) <= P(n, 1), P(n, 1) <= P(n, 1))
+        print(P(1.0, 0) <= P(1.0, 0), P(1.0, 0) < P(1.0, 0), P(1.0, 0) < P(1.0, 1), P(2.0, 0) > P(1.0, 9))
+        print(P(-0.0, 1) <= P(0.0, 1), P(-0.0, 1) < P(0.0, 1), P(-0.0, 2) > P(0.0, 1))
+        print(Dot < Disc(f32(n)), Disc(f32(n)) <= Disc(f32(n)), Disc(1) < Disc(2), Disc(2) >= Disc(2))
+        print(P(1.0, 0).le(P(1.0, 0)), P(n, 0).lt(P(1.0, 0)))
+        """), "false false false false\n" +
+              "false false false\n" +
+              "true false true true\n" +
+              "true false true\n" +
+              "true false true true\n" +
+              "true false\n")
+end pto_derived_partial
+
+@test("a derived Ord, an impl Ord writing lt, and a hand PartialOrd beside an empty Ord all meet an Ord bound")
+pto_total_user_types()
+    if !azb_ready() then return
+
+    azb_prints(azb_main(raw"""
+        import sysl.math.{max, min}
+        import sysl.slices.{sort}
+
+        struct V derives Eq, Ord
+            a: int
+            b: string
+
+        enum Rank derives Eq, Ord
+            Low
+            High(n: int)
+
+        struct H
+            v: int
+
+        impl Ord for H
+            lt(self, rhs: Self) -> bool = self.v < rhs.v
+
+        struct W
+            v: int
+
+        impl PartialOrd for W
+            lt(self, rhs: Self) -> bool = self.v < rhs.v
+            le(self, rhs: Self) -> bool = self.v <= rhs.v
+
+        impl Ord for W
+
+        tle[T: Ord](a: T, b: T) -> bool = a <= b
+        tgt[T: Ord](a: T, b: T) -> bool = a > b
+
+        print(V(1, "a") <= V(1, "b"), tle(V(2, "a"), V(1, "z")), max(V(1, "a"), V(1, "b")).b)
+        print(Low < High(0), tle(High(2), High(2)), tgt(High(3), High(2)), High(1) >= Low)
+        print(H(1) <= H(2), H(3) >= H(2), tle(H(2), H(2)), max(H(4), H(3)).v, H(1).le(H(1)), H(2).le(H(1)))
+        print(W(1) <= W(2), tgt(W(1), W(2)), min(W(5), W(3)).v)
+
+        var hs = [H(3), H(1), H(2)]
+        var ws = [W(9), W(-1)]
+
+        sort(hs[..])
+        sort(ws[..])
+        print(hs[0].v, hs[1].v, hs[2].v, ws[0].v)
+        """), "true false b\n" +
+              "true true true true\n" +
+              "true true true 4 true false\n" +
+              "true false 3\n" +
+              "1 2 3 -1\n")
+end pto_total_user_types
+
+@test("tuples, slices, arrays and a generic struct are total over total parts and partial over a float")
+pto_composed_shapes()
+    if !azb_ready() then return
+
+    azb_prints(azb_main(raw"""
+        import sysl.math.{max}
+        import sysl.slices.{sort}
+
+        struct Box[T] derives Eq, Ord
+            v: T
+
+        ple[T: PartialOrd](a: T, b: T) -> bool = a <= b
+
+        val n = 0.0 / 0.0
+        val f: [2]real = [1.0, n]
+        val g: [2]real = [1.0, 2.0]
+
+        print((n, 1) <= (1.0, 1), (n, 1) >= (1.0, 1), (1.0, 1) <= (1.0, 1), (1.0, 1) < (1.0, 2))
+        print(ple((n, 1), (n, 1)), (1, "b") > (1, "a"), max((1, 2), (1, 3)).1)
+        print(f[..] < g[..], f[..] <= g[..], g[..] <= g[..], f <= g, g < [1.0, 3.0])
+        print([1, 2][..] < [1, 2, 3][..], [1, 2] <= [1, 2], [3][..] > [2, 9][..])
+        print(Box(n) <= Box(1.0), ple(Box(1.0), Box(1.0)), Box(1) < Box(2), max(Box(2), Box(7)).v)
+
+        var ts = [(2, "b"), (1, "z"), (2, "a")]
+        var bs = [Box(3), Box(1)]
+
+        sort(ts[..])
+        sort(bs[..])
+        print(ts[0].1, ts[1].1, ts[2].1, bs[0].v)
+        """), "false false true true\n" +
+              "false true 3\n" +
+              "false false true false true\n" +
+              "true true true\n" +
+              "false true true 7\n" +
+              "z a b 1\n")
+end pto_composed_shapes
+
+@test("floats sort by total_lt, which orders the signed zeros and puts each NaN at its own end")
+pto_total_lt()
+    if !azb_ready() then return
+
+    azb_prints(azb_main(raw"""
+        import sysl.slices.{sort_by}
+
+        val n = 0.0 / 0.0
+        val neg = -n
+
+        print((-0.0).total_lt(0.0), 0.0.total_lt(-0.0), 0.0.total_lt(0.0), n.total_lt(n))
+        print(1.0.total_lt(n), n.total_lt(1.0), neg.total_lt(-1.0e308), (-1.0 / 0.0).total_lt(neg))
+        print(f32(-0.0).total_lt(f32(0.0)), f32(2).total_lt(f32(n)), f16(1).total_lt(f16(2)))
+        print(bf16(-1).total_lt(bf16(-2)), bf16(-2).total_lt(bf16(-1)))
+
+        var xs = [3.0, n, -1.0, 0.0, -0.0, neg, 1.0 / 0.0]
+
+        sort_by(xs[..], (a, b) -> a.total_lt(b))
+        print(xs[0].is_nan(), xs[1..<6], xs[6].is_nan())
+
+        var ys = [f32(2), f32(-0.0), f32(0.0), f32(-3)]
+
+        sort_by(ys[..], (a, b) -> a.total_lt(b))
+        print(ys)
+        """), "true false false false\n" +
+              "true false true false\n" +
+              "true true true\n" +
+              "false true\n" +
+              "true [-1, -0, 0, 3, inf] true\n" +
+              "[-3, -0, 0, 2]\n")
+end pto_total_lt
+
+@test("a float's own max, min and clamp answer the same whichever side the NaN is on")
+pto_float_methods_nan()
+    if !azb_ready() then return
+
+    azb_prints(azb_main(raw"""
+        val n = 0.0 / 0.0
+
+        print(n.max(1.0), 1.0.max(n), n.min(1.0), 1.0.min(n), n.max(n).is_nan())
+        print(f32(n).max(2), f32(2).min(f32(n)), n.clamp(0.0, 1.0).is_nan(), 5.0.clamp(0.0, 1.0))
+        print(n.maximum(1.0).is_nan(), 1.0.minimum(n).is_nan(), (-0.0).maximum(0.0), (-0.0).minimum(0.0))
+        """), "1 1 1 1 true\n" +
+              "2 2 true 1\n" +
+              "true true 0 -0\n")
+end pto_float_methods_nan
+
+// A comparison dispatched to a written or derived implementation is not evaluated while compiling
+// (`'<' through an implementation is not evaluated while compiling yet`, as on 0.8.16 for `<`), so
+// the const cells are the built-ins', directly and through a generic body at each bound.
+@test("a float and an integer comparison fold in a const, directly and through a generic body at each bound")
+pto_const_evaluation()
+    if !azb_ready() then return
+
+    azb_prints(azb_main(raw"""
+        import sysl.math.{max}
+
+        const ple[T: PartialOrd](a: T, b: T) -> bool = a <= b
+        const tge[T: Ord](a: T, b: T) -> bool = a >= b
+
+        const NAN_LE: bool = (0.0 / 0.0) <= 1.0
+        const ZEROS: bool = -0.0 <= 0.0 && !(-0.0 < 0.0)
+        const GENERIC_NAN: bool = ple(0.0 / 0.0, 1.0)
+        const GENERIC_TIE: bool = ple(1.5, 1.5)
+        const TOTAL: bool = tge(3, 3) && !tge(2, 3)
+        const BIG: int = max(3, 9)
+
+        print(NAN_LE, ZEROS, GENERIC_NAN, GENERIC_TIE, TOTAL, BIG)
+        """), "false true false true true 9\n")
+end pto_const_evaluation
+
+// The fold read a NaN comparison off the sign of a difference, which is 0 for "unordered", so
+// `NaN <= 1.0`, `NaN >= 1.0` and `NaN == NaN` folded true and `NaN != NaN` false (0.8.16 too).
+@test("a NaN comparison folds as the machine compares: every one false but '!=', at each operator")
+pto_const_nan_every_operator()
+    if !azb_ready() then return
+
+    azb_prints(azb_main(raw"""
+        const N: real = 0.0 / 0.0
+        const LE: bool = N <= 1.0
+        const GE: bool = N >= 1.0
+        const LT: bool = 1.0 < N
+        const GT: bool = N > 1.0
+        const EQ: bool = N == N
+        const NE: bool = N != N
+        const NARROW: bool = f32(N) <= f32(1)
+        const JOINED: bool = !(N < 1.0) && !(N >= 1.0)
+
+        print(LE, GE, LT, GT, EQ, NE, NARROW, JOINED)
+        """), "false false false false false true false true\n")
+end pto_const_nan_every_operator
+
+// -- the refusals -----------------------------------------------------------------------------------
+
+@test("the free max, min and clamp refuse a float and name the float's own methods")
+pto_free_functions_refuse_a_float()
+    if !azb_ready() then return
+
+    azb_refused(azb_main(raw"""
+        import sysl.math.{max}
+
+        print(max(1.0, 2.0))
+        """), ["'sysl.math.max' requires its type parameter 'T' to implement 'Ord', but real does not",
+               "real is only 'PartialOrd'", "'x.max(y)'", "'x.clamp(lo, hi)'"])
+
+    azb_refused(azb_main(raw"""
+        import sysl.math.{clamp}
+
+        print(clamp(f32(1), f32(0), f32(2)))
+        """), ["'sysl.math.clamp' requires", "f32 is only 'PartialOrd'"])
+end pto_free_functions_refuse_a_float
+
+@test("sort refuses a float, a tuple holding one and a generic struct over one, and names total_lt for the float")
+pto_sort_refuses_partial()
+    if !azb_ready() then return
+
+    azb_refused(azb_main(raw"""
+        import sysl.slices.{sort}
+
+        var xs = [2.0, 1.0]
+
+        sort(xs[..])
+        """), ["'sysl.slices.sort' requires its type parameter 'T' to implement 'Ord', but real does not",
+               "'sort_by(xs, (a, b) -> a.total_lt(b))'"])
+
+    azb_refused(azb_main(raw"""
+        import sysl.slices.{sort}
+
+        var xs = [(2.0, 1), (1.0, 2)]
+
+        sort(xs[..])
+        """), ["but (real, int) does not", "(real, int) is only 'PartialOrd'"])
+
+    azb_refused(azb_main(raw"""
+        import sysl.slices.{sort}
+
+        struct Box[T] derives Ord
+            v: T
+
+        var xs = [Box(2.0), Box(1.0)]
+
+        sort(xs[..])
+        """), ["but Box[real] does not", "Box[real] is only 'PartialOrd'"])
+end pto_sort_refuses_partial
+
+@test("derives Ord refuses a float field, a variant's float field and a field only partially ordered, naming each")
+pto_derived_ord_refuses_a_partial_field()
+    if !azb_ready() then return
+
+    azb_refused(azb_main(raw"""
+        struct Reading derives Eq, Ord
+            at: int
+            value: real
+
+        print(1)
+        """), ["'Reading' cannot derive Ord: its field 'value' is real, which is only 'PartialOrd'",
+               "Derive 'PartialOrd' instead"])
+
+    azb_refused(azb_main(raw"""
+        enum Shape derives Ord
+            Dot
+            Circle(r: f32)
+
+        print(1)
+        """), ["'Shape' cannot derive Ord: its field 'Circle.r' is f32"])
+
+    azb_refused(azb_main(raw"""
+        struct Inner derives PartialOrd
+            v: int
+
+        struct Outer derives Ord
+            inner: Inner
+
+        print(1)
+        """), ["'Outer' cannot derive Ord: its field 'inner' is Inner, which is only 'PartialOrd'"])
+
+    azb_refused(azb_main(raw"""
+        struct Plain
+            v: int
+
+        struct Outer derives Ord
+            p: Plain
+
+        print(1)
+        """), ["'<' is not defined for Plain (in the copy for field 'Outer.p')"])
+end pto_derived_ord_refuses_a_partial_field
+
+@test("a generic struct deriving Ord over a float field of its own is refused, and one over its parameter is not")
+pto_generic_derive_field()
+    if !azb_ready() then return
+
+    azb_refused(azb_main(raw"""
+        struct Tagged[T] derives Ord
+            tag: T
+            weight: real
+
+        print(1)
+        """), ["'Tagged' cannot derive Ord: its field 'weight' is real"])
+
+    azb_prints(azb_main(raw"""
+        struct Pair[T] derives Ord
+            a: T
+            b: int
+
+        print(Pair(1, 2) < Pair(1, 3), Pair(1.0, 2) <= Pair(0.0 / 0.0, 2))
+        """), "true false\n")
+end pto_generic_derive_field
+
+@test("a hand-written PartialOrd must write le, and an impl Ord writing lt cannot stand beside one")
+pto_hand_partial_order_refusals()
+    if !azb_ready() then return
+
+    azb_refused(azb_main(raw"""
+        struct Span
+            lo: real
+
+        impl PartialOrd for Span
+            lt(self, rhs: Self) -> bool = self.lo < rhs.lo
+
+        print(Span(1.0) < Span(2.0))
+        """), ["'impl PartialOrd for Span' writes no 'le'", "write 'impl Ord for Span' with 'lt' alone"])
+
+    azb_refused(azb_main(raw"""
+        struct K
+            v: int
+
+        impl PartialOrd for K
+            lt(self, rhs: Self) -> bool = self.v < rhs.v
+            le(self, rhs: Self) -> bool = self.v <= rhs.v
+
+        impl Ord for K
+            lt(self, rhs: Self) -> bool = self.v < rhs.v
+
+        print(K(1) < K(2))
+        """), ["'impl Ord for K' writes 'lt', which makes it K's 'PartialOrd' too",
+               "Leave 'impl Ord for K' empty"])
+
+    azb_refused(azb_main(raw"""
+        struct K derives PartialOrd
+            v: int
+
+        impl Ord for K
+            lt(self, rhs: Self) -> bool = self.v < rhs.v
+
+        print(K(1) < K(2))
+        """), ["K already implements 'PartialOrd'"])
+end pto_hand_partial_order_refusals
+
+@test("a float cannot be made Ord by a block, with lt or without, and is told so once")
+pto_float_cannot_be_made_ord()
+    if !azb_ready() then return
+
+    azb_refused_without(azb_main(raw"""
+        impl Ord for real
+            lt(self, rhs: real) -> bool = self < rhs
+
+        print(1)
+        """), ["'real' is only 'PartialOrd', and no block can make it 'Ord'", "'total_lt'"],
+              ["already implements 'PartialOrd'"])
+
+    azb_refused(azb_main(raw"""
+        impl Ord for f32
+
+        print(1)
+        """), ["'f32' is only 'PartialOrd', and no block can make it 'Ord'"])
+
+    // An integer already has both, and the block writing `lt` is told about `Ord` alone.
+    azb_refused_without(azb_main(raw"""
+        impl Ord for int
+            lt(self, rhs: int) -> bool = self < rhs
+
+        print(1)
+        """), ["'int' already implements 'Ord' — the compiler provides it"],
+              ["already implements 'PartialOrd'"])
+end pto_float_cannot_be_made_ord
+
+@test("a generic body bounded by PartialOrd is refused a total-order call, and one bounded by Ord is not")
+pto_generic_bounds()
+    if !azb_ready() then return
+
+    azb_refused(azb_main(raw"""
+        import sysl.math.{max}
+
+        bigger[T: PartialOrd](a: T, b: T) -> T = max(a, b)
+
+        print(bigger(1, 2))
+        """), ["'sysl.math.max' requires its type parameter 'T' to implement 'Ord'", "'T' is not bounded by it"])
+
+    azb_prints(azb_main(raw"""
+        import sysl.math.{max}
+
+        bigger[T: Ord](a: T, b: T) -> T = if a >= b then a else max(a, b)
+        either[T: PartialOrd](a: T, b: T) -> bool = a < b || b < a || a <= b
+
+        print(bigger(1, 2), bigger("x", "y"), either(1.0, 0.0 / 0.0), either(1, 1))
+        """), "2 y false true\n")
+end pto_generic_bounds

@@ -157,25 +157,28 @@ hoist_all_members(a: &Analysis, units: Buf[Program])
     // trait's block does: a trait member colliding with one is then told so whichever was written
     // first, exactly as it is against a member of the body.
     for i in 0..<a.tables.impls.len()
-        if a.tables.impls.at(i).decl.trait_name == "" then hoist_inherent(a, a.tables.impls.at(i))
+        if a.tables.impls[i].decl.trait_name == "" then hoist_inherent(a, a.tables.impls[i])
 
     // A `derives` naming a trait that only joins others gains a block per trait it reaches, before
     // any trait's block is read: every trait is registered by now, so what one requires can be asked.
     expand_joined_derives(a)
 
+    // And an `impl Ord` that writes `lt` gains the `PartialOrd` block that `lt` belongs to.
+    expand_total_orders(a)
+
     for i in 0..<a.tables.impls.len()
-        if a.tables.impls.at(i).decl.trait_name != "" then
+        if a.tables.impls[i].decl.trait_name != "" then
             // **A block over a value parameter is read at that parameter's stand-in**, which is a
             // zero -- the same name a real `Lanes[0]` has. What the reading made real is the block's
             // shape rather than a type the program lays out, so it is taken back: left in, a
             // `Lanes[const W]` whose field is a `<W>f32` was laid out at no lanes, which no back end
             // accepts, and a real zero later looked already settled.
-            val shape = !a.tables.impls.at(i).decl.tvalues.is_empty()
+            val shape = !a.tables.impls[i].decl.tvalues.is_empty()
             val structs = a.tables.struct_insts.len()
             val enums = a.tables.enum_insts.len()
             val constrained = a.tables.constrained_insts.len()
 
-            a.tables.impls.set(i, hoist_impl(a, a.tables.impls.at(i)))
+            a.tables.impls[i] = hoist_impl(a, a.tables.impls[i])
 
             if shape
                 rewind_registered(a.tables.struct_insts, structs)
@@ -209,7 +212,7 @@ private drain_deferred_bounds(a: &Analysis)
     var refused: Buf[bool] = buf()
 
     for d in held
-        val quiet = d.after.is_some() && d.after.unwrap() < refused.len() && refused.at(d.after.unwrap())
+        val quiet = d.after.is_some() && d.after.unwrap() < refused.len() && refused[d.after.unwrap()]
 
         refused.push(!check_param_bounds(a, d.scope, d.span, d.what, d.tparams, d.bounds, d.targs,
                                          buf(), d.noun, d.at, quiet))
@@ -240,7 +243,7 @@ check_param_bounds(a: &Analysis, scope: Scope, span: Span, what: string, tparams
         subst.push(item)
 
     for i in 0..<tparams.len()
-        if i < targs.len() then subst.push(Binding(tparams.at(i), targs.at(i)))
+        if i < targs.len() then subst.push(Binding(tparams[i], targs[i]))
 
     var met = true
 
@@ -249,7 +252,7 @@ check_param_bounds(a: &Analysis, scope: Scope, span: Span, what: string, tparams
 
         if arg.is_some() && arg.unwrap() != Unknown
             for j in 0..<nb.bounds.len()
-                val want = nb.bounds.at(j)
+                val want = nb.bounds[j]
                 // The bound is resolved under the very arguments being checked, since one may name
                 // another of the parameters: `[T: From[U], U]` asks a different thing of `T` at every
                 // call, and `U`'s argument is what says which.
@@ -291,6 +294,25 @@ private report_unmet(a: &Analysis, scope: Scope, span: Span, what: string, tp: s
                    "that fixes an associated type is met only by a type that chose the same one"
 
         // A type parameter is asked during the walk over a generic body, which keeps what it says.
+        arg match
+            Abstract(_, _) -> a.bound_fault(scope, span, said)
+            _ -> a.fault(scope, span, said)
+
+        return
+    end if
+
+    // **The trait is implemented and an associated type it asks a trait of does not have it** --
+    // both named, the associated type by what the argument chose for it.
+    val open = if tr.bounded.is_empty() || !satisfies(a, fixing_bound(tr.name, tr.args, tr.assocs), arg) then None
+               else open_bound_unmet(a, tr, arg)
+
+    if open.is_some()
+        val (n, got, want) = open.unwrap()
+        val said = s"'${qualified_name(what)}' requires its $noun '$tp' to implement " +
+                   s"'${show_bound(a, tr, arg)}', which asks that '$n' implement " +
+                   s"'${show_bound(a, want, got)}', and ${type_show(arg)} supplies " +
+                   s"${type_show(got)} for it, which does not"
+
         arg match
             Abstract(_, _) -> a.bound_fault(scope, span, said)
             _ -> a.fault(scope, span, said)
@@ -450,9 +472,9 @@ hoist_member_list(a: &Analysis, home: MemberHome, members: Buf[MethodDecl],
         // used by both would leave the lowered function with two parameters of that name and nothing
         // to say which one a `T` in the body meant.
         for j in 0..<m.tparams.len()
-            if holds_string(home.tparams, m.tparams.at(j)) then
+            if holds_string(home.tparams, m.tparams[j]) then
                 a.fault(home.scope, m.span, s"'${home.label}' already declares a type parameter " +
-                        s"'${m.tparams.at(j)}', so member '${m.name}' cannot declare one of that name")
+                        s"'${m.tparams[j]}', so member '${m.name}' cannot declare one of that name")
 
         // An associated function is reached by naming its type -- so the type needs a name a call
         // can be written through. A composed type has none: `[]int` is a type an `impl` may be
@@ -596,8 +618,8 @@ hoist_member_list(a: &Analysis, home: MemberHome, members: Buf[MethodDecl],
             a.shares_asked_at_trait = home.from_trait.is_some()
 
             for j in 0..<fd.params.len()
-                params.push((fd.params.at(j).name,
-                             resolve_type(a, written_in, fd.params.at(j).typ, fixed)))
+                params.push((fd.params[j].name,
+                             resolve_type(a, written_in, fd.params[j].typ, fixed)))
 
             var ret = Unit
 
@@ -616,7 +638,7 @@ hoist_member_list(a: &Analysis, home: MemberHome, members: Buf[MethodDecl],
 
             // So is a setter's value, where the property it pairs with is such a result.
             for j in 0..<params.len()
-                if mentions_unknown(params.at(j).1) && !is_inferred_result(Some(fd.params.at(j).typ)) then
+                if mentions_unknown(params[j].1) && !is_inferred_result(Some(fd.params[j].typ)) then
                     resolved = false
 
             if resolved then a.tables.members.lowered.push(fd)
@@ -648,7 +670,7 @@ end hoist_member_list
 check_bound_names(a: &Analysis, scope: Scope, what: string, bounds: Buf[NamedBounds])
     for nb in bounds
         for j in 0..<nb.bounds.len()
-            val written = nb.bounds.at(j)
+            val written = nb.bounds[j]
             val key = lookup_trait_key(a, scope, written.name)
 
             if key.is_none() then
@@ -669,11 +691,17 @@ check_bound_names(a: &Analysis, scope: Scope, what: string, bounds: Buf[NamedBou
                 // worth saying at the declaration rather than at whatever first applied it.
                 val d = trait_decl_at(a, key.unwrap())
 
-                // An argument fixing an associated type is not one of the trait's own.
+                // An argument fixing or bounding an associated type is not one of the trait's own.
                 if d.is_some()
                     var unknown: Buf[Type] = buf()
+                    var open: usize = 0
 
-                    for k in 0..<(written.args.len() - written_bindings(a, scope, written).len())
+                    for arg in written.args
+                        *arg.kind match
+                            AssocBoundArgType(_, _) -> open += 1
+                            _ -> ()
+
+                    for k in 0..<(written.args.len() - open - written_bindings(a, scope, written).len())
                         unknown.push(Unknown)
 
                     check_trait_arity_at(a, scope, written.span, written.name, d.unwrap(), unknown)
@@ -807,7 +835,7 @@ pair_setters(a: &Analysis, scope: Scope, members: Buf[MethodDecl], label: string
     var out: Buf[MethodDecl] = buf()
 
     for i in 0..<members.len()
-        val m = members.at(i)
+        val m = members[i]
 
         if !is_setter_name(m.name) || !unpaired_setter(m)
             out.push(m)
@@ -1054,7 +1082,7 @@ private record_alt(a: &Analysis, key: string, written: string, filed: string)
 
     if held.is_some()
         for i in 0..<held.unwrap().len()
-            prior.push(held.unwrap().at(i))
+            prior.push(held.unwrap()[i])
     else if has_member_at(a, key, written) then prior.push(written)
 
     prior.push(filed)
@@ -1111,7 +1139,7 @@ private check_own_trait_args(a: &Analysis, scope: Scope, tparams: Buf[string],
         val refs = item.bounds
 
         for j in 0..<refs.len()
-            val r = refs.at(j)
+            val r = refs[j]
             val key = lookup_trait_key(a, scope, r.name)
             val d = if key.is_some() then trait_decl_at(a, key.unwrap()) else None
 
@@ -1120,7 +1148,7 @@ private check_own_trait_args(a: &Analysis, scope: Scope, tparams: Buf[string],
                 var any = false
 
                 for k in 0..<r.args.len()
-                    val own = own_param_named(r.args.at(k), tparams)
+                    val own = own_param_named(r.args[k], tparams)
 
                     if own.is_some() && bound_type(settled, own.unwrap()).is_some()
                         args.push(bound_type(settled, own.unwrap()).unwrap())
@@ -1183,7 +1211,7 @@ private bounds_at(a: &Analysis, scope: Scope, bounds: Buf[NamedBounds], tp: stri
             var here: Buf[Binding] = buf()
 
             for j in 0..<others.len()
-                if others.at(j).name != tp then here.push(others.at(j))
+                if others[j].name != tp then here.push(others[j])
 
             here.push(Binding(tp, Abstract(tp, buf())))
 
@@ -1191,7 +1219,7 @@ private bounds_at(a: &Analysis, scope: Scope, bounds: Buf[NamedBounds], tp: stri
             val refs = item.bounds
 
             for j in 0..<refs.len()
-                out.push(resolve_bound(a, scope, refs.at(j).span, refs.at(j), terms))
+                out.push(resolve_bound(a, scope, refs[j].span, refs[j], terms))
 
     out
 end bounds_at

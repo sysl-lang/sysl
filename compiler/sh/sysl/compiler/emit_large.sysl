@@ -38,10 +38,10 @@ lower_large_values(e: *Emit, whole: Buf[IrBlock]) -> Buf[IrBlock]
     var by_name: Map[string, usize] = map()
 
     for bi in 0..<blocks.len()
-        val b = blocks.at(bi)
+        val b = blocks[bi]
 
         for ii in 0..<b.instrs.len()
-            b.instrs.at(ii) match
+            b.instrs[ii] match
                 InLoad(VReg(n), ty, src, acc, align) ->
                     if plain_access(acc)
                         large_shape(e, ty) match
@@ -60,10 +60,10 @@ lower_large_values(e: *Emit, whole: Buf[IrBlock]) -> Buf[IrBlock]
 
     // Every use, sorted into the ones this pass rewrites and the ones that keep the load.
     for bi in 0..<blocks.len()
-        val b = blocks.at(bi)
+        val b = blocks[bi]
 
         for ii in 0..<b.instrs.len()
-            note_uses(e, b.instrs.at(ii), bi, ii, &cands, by_name)
+            note_uses(e, b.instrs[ii], bi, ii, &cands, by_name)
 
         b.terminator match
             Some(t) -> note_uses(e, t, bi, b.instrs.len(), &cands, by_name)
@@ -80,25 +80,25 @@ lower_large_values(e: *Emit, whole: Buf[IrBlock]) -> Buf[IrBlock]
 
             if stable
                 val sealed = v_is_reg(c.src) && private_slots.has(v_name(c.src))
-                val instrs = blocks.at(c.block).instrs
+                val instrs = blocks[c.block].instrs
 
                 for k in (c.at + 1)..<c.last
-                    if may_write(instrs.at(k), c.src, sealed, c.name) then stable = false
+                    if may_write(instrs[k], c.src, sealed, c.name) then stable = false
 
             if !stable
                 val slot = fresh_reg(e)
 
                 slots.push(InAlloca(slot, c.ty, Some(c.align)))
-                cands.set(ci, c with { backing = slot, copied = true })
+                cands[ci] = c with { backing = slot, copied = true }
 
     var out: Buf[IrBlock] = buf()
 
     for bi in 0..<blocks.len()
-        val b = blocks.at(bi)
+        val b = blocks[bi]
         var instrs: Buf[Inst] = buf()
 
         for ii in 0..<b.instrs.len()
-            rewrite_inst(e, b.instrs.at(ii), cands, by_name, &instrs, &slots)
+            rewrite_inst(e, b.instrs[ii], cands, by_name, &instrs, &slots)
 
         out.push(IrBlock(b.label, instrs, b.terminator))
 
@@ -112,7 +112,7 @@ lower_large_values(e: *Emit, whole: Buf[IrBlock]) -> Buf[IrBlock]
         for inst in out[0].instrs
             entry.push(inst)
 
-        out.set(0, IrBlock(out[0].label, entry, out[0].terminator))
+        out[0] = IrBlock(out[0].label, entry, out[0].terminator)
 
     out
 end lower_large_values
@@ -145,7 +145,7 @@ private members_read_in_place(e: *Emit, blocks: Buf[IrBlock]) -> Buf[IrBlock]
                                         var untouched = true
 
                                         for k in (found.1 + 1)..<instrs.len()
-                                            if may_write(instrs.at(k), found.0, sealed, n) then untouched = false
+                                            if may_write(instrs[k], found.0, sealed, n) then untouched = false
 
                                         if untouched
                                             val at = fresh_reg(e)
@@ -185,7 +185,7 @@ private note_uses(e: *Emit, inst: Inst, bi: usize, ii: usize, cands: *Buf[LargeL
             VReg(n) ->
                 by_name.get(n) match
                     Some(ci) ->
-                        var c = cands.at(ci)
+                        var c = cands[ci]
 
                         if rewritten_use(e, inst, n)
                             c.used = true
@@ -194,7 +194,7 @@ private note_uses(e: *Emit, inst: Inst, bi: usize, ii: usize, cands: *Buf[LargeL
                             else if ii > c.last then c.last = ii
                         else c.keep = true
 
-                        cands.set(ci, c)
+                        cands[ci] = c
                     None -> ()
             _ -> ()
 end note_uses
@@ -316,10 +316,10 @@ private field_type(e: *Emit, ty: LType, indices: Buf[int]) -> Option[LType]
     for i in indices
         val next = at match
             LNamed(_) -> e.shapes.get(l_render(at)) match
-                Some(s) -> if i >= 0 && usize(i) < s.fields.len() then Some(s.fields.at(usize(i))) else None
+                Some(s) -> if i >= 0 && usize(i) < s.fields.len() then Some(s.fields[usize(i)]) else None
                 None -> None
             LArr(_, elem) -> Some(*elem)
-            LStruct(fields) -> if i >= 0 && usize(i) < fields.len() then Some(fields.at(usize(i))) else None
+            LStruct(fields) -> if i >= 0 && usize(i) < fields.len() then Some(fields[usize(i)]) else None
             _ -> None
 
         next match
@@ -502,7 +502,7 @@ note_type_shapes(e: *Emit, p: TProgram)
 
                     e.shapes.put(l_render(enum_lty(d)),
                                  TypeShape(int(e.layout.size(item)), int(e.layout.align(item)),
-                                           defs.at(defs.len() - 1).fields))
+                                           defs[defs.len() - 1].fields))
 
                     // Each variant's payload is a named type of its own, read out of the region
                     // whole when a pattern binds it.

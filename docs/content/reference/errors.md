@@ -877,7 +877,7 @@ before the program stops. So `defer` is for releasing a resource, not for restor
 | source | example |
 |---|---|
 | an out-of-bounds array or slice index | `xs[5]` on a `[3]int` |
-| an index past a standard container's count | `b[5]`, `b.at(5)`, `b.remove(5)` on a three-element `Buf`; likewise `Frozen`, `Deque`, `Ring` |
+| an index past a standard container's count | `b[5]`, `b[5] = 0`, `b.remove(5)` on a three-element `Buf`; likewise `Frozen`, `Deque`, `Ring` |
 | an inverted or out-of-range slice range | `xs[3..1]`, `xs[0..9]` |
 | a checked cast that fails | `char(u)` on an invalid scalar, `Color(n)` on an undeclared discriminant, a bitfield's enum field holding one — each enum form has a fallible twin, `Color.try(n)` and `Color.try(s.field)`, [below](#turning-a-trap-back-into-a-value) |
 | an integer divide by zero | `n / 0`, `n % 0` |
@@ -1019,12 +1019,12 @@ function it names the caller's line, as a bounds check there does. On a freestan
 report needs no allocator and no formatter: the text is a constant, and the trap follows.
 
 **The standard containers report through it too.** An index past a `Buf`'s, `Frozen`'s, `Deque`'s or
-`Ring`'s count — by subscript, `at`, `set` or `remove` — is reported as an array's index is and then
+`Ring`'s count — by subscript or `remove` — is reported as an array's index is and then
 traps; an `insert` past the count says `insertion index 5 is past length 3`. **Their report names
 the caller's line, as an array's does**: the members are
 [`@track_caller`](/reference/attributes/#track-caller-a-function-that-reports-its-caller-s-line), so
 `b[5]` on line 4 reports `index 5 out of bounds for length 3 (main.sysl:4:6)`, the bracket's column
-as an array's report gives it, and `b.at(5)` names the call.
+as an array's report gives it.
 
 The location is the bracket's line and column, with the file named by its path inside the build (a
 fetched package's file by its coordinate), so no build directory appears in it. The exit status is
@@ -2371,11 +2371,11 @@ that looks like ordinary code and leaves a clause quietly false, is refused.
 
 A generic struct carries clauses like any other struct, and they are checked at every place the list
 above names. A clause is a generic body over the struct's own parameters, so what it may do with a
-`T` is what the struct's bounds allow: a comparison needs `Ord`, and is checked once, where the
+`T` is what the struct's bounds allow: a comparison needs `PartialOrd`, and is checked once, where the
 struct is declared, rather than once for every type it is instantiated at:
 
 ```sysl
-struct Span[T: Ord]
+struct Span[T: PartialOrd]
     lo: T
     hi: T
     invariant lo <= hi
@@ -2398,7 +2398,7 @@ type arguments: a `T` that is `int` is the struct's own bytes, and one that is a
 
 The standard library's `Buf[T]` relies on this. It declares `invariant count <= elems.len`, and every
 member is then [told so on entry](/reference/verification/#what-the-optimizer-is-told), which lets
-`at` compare the index with `count` once and fold the slice's own bounds test into that comparison.
+`b[i]` compare the index with `count` once and fold the slice's own bounds test into that comparison.
 
 ## Contracts on a function
 

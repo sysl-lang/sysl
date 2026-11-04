@@ -2,7 +2,7 @@ module sh.sysl.compiler
 @tests
 
 import sysl.buf.{Buf, buf}
-import sysl.fs.{is_file, make_dir_all, make_temp_dir, metadata, read_bytes, read_text, remove_dir_all, write_text}
+import sysl.fs.{is_file, make_dir_all, make_temp_dir, metadata, read_text, remove_dir_all, write_text}
 import sysl.process.capture
 import sysl.text.{replace_all, Search}
 
@@ -607,7 +607,7 @@ pkb_stray_c_is_named()
     val said = stray_c_warnings(root)
 
     assert_eq(said.len(), 1)
-    assert_eq(said.at(0),
+    assert_eq(said[0],
               s"'$root/thing/c' holds C and no sysl, so it is not a module and its '.c' files are " +
               "compiled by nothing — a directory becomes one by holding the '.sysl' that declares " +
               "those 'extern's; add \"thing/c\" to 'exclude' in sysl.hocon if that is intended")
@@ -1107,25 +1107,6 @@ pkb_lso_a_dependency_declaring_nothing_is_refused()
     pkb_drop([app, lib])
 end pkb_lso_a_dependency_declaring_nothing_is_refused
 
-// Whether `bytes` holds `needle` anywhere, which is how an archive's symbol table is read.
-private pkb_lso_holds(bytes: []u8, needle: string) -> bool
-    val n = needle.bytes
-
-    if n.len > bytes.len then return false
-
-    for i in 0..<(bytes.len - n.len + 1)
-        var same = true
-
-        for j in 0..<n.len
-            if bytes[i + j] != n[j]
-                same = false
-                break
-
-        if same then return true
-
-    false
-end pkb_lso_holds
-
 @test("and the same holds for build-c")
 pkb_lso_the_same_holds_for_build_c()
     if !pkb_ready() then return
@@ -1148,12 +1129,21 @@ pkb_lso_the_same_holds_for_build_c()
         Err(why) -> assert(false, failure_text(why))
         Ok(_) -> ()
 
-    // The archive's symbol table names which `double` was compiled: the fetched package's carries its
-    // canonical prefix, and the root's would be the bare `geom$double`.
-    val symbols = read_bytes(s"$dir/out.a").unwrap()
+    // Which `double` was compiled is what the export answers once linked: the fetched package's
+    // doubles (28), the `--lib` root's triples (42). The archive keeps both names to itself, so its
+    // symbol table cannot say.
+    write_text(s"$dir/main.c", "#include <stdio.h>\nlong mid_answer(void);\n" +
+               "int main(void) { printf(\"%ld\\n\", mid_answer()); return 0; }\n").unwrap()
 
-    assert(pkb_lso_holds(symbols, "github.com.e.geom.geom$double"), "the fetched geom was not compiled")
-    assert(!pkb_lso_holds(symbols, "_geom$double"), "the root's geom was compiled")
+    capture("clang", [s"$dir/main.c", s"$dir/out.a", "-o", s"$dir/app"], "", [], true) match
+        Ok(o) -> assert(o.status.ok(), s"the archive did not link:\n${o.err.unwrap_or("")}")
+        Err(_) -> assert(false, "clang could not be run")
+
+    val said = capture(s"$dir/app", [], "", [], true) match
+        Ok(o) -> o.text
+        Err(_) -> "the linked program could not be run"
+
+    assert_eq(said, "28\n")
     pkb_drop([dir, lib])
 end pkb_lso_the_same_holds_for_build_c
 

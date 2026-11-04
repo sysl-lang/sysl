@@ -29,6 +29,7 @@ check_object_written(a: &Analysis, scope: Scope, inner: TypeRef, made: Type, sig
             for arg in args
                 *arg.kind match
                     AssocArgType(_, _) -> ()
+                    AssocBoundArgType(_, _) -> ()
                     _ -> k += 1
 
             k
@@ -56,9 +57,9 @@ object_assocs(a: &Analysis, key: string) -> Buf[AssocDecl]
             val assocs = d.unwrap().assocs
 
             for j in 0..<assocs.len()
-                if !holds_string(seen, assocs.at(j).name)
-                    seen.push(assocs.at(j).name)
-                    out.push(assocs.at(j))
+                if !holds_string(seen, assocs[j].name)
+                    seen.push(assocs[j].name)
+                    out.push(assocs[j])
 
     out
 end object_assocs
@@ -112,7 +113,7 @@ check_assoc_args(a: &Analysis, scope: Scope, span: Span, key: string, declared: 
                 var listed: Buf[string] = buf()
 
                 for j in 0..<declared.len()
-                    listed.push(s"'${declared.at(j).name}'")
+                    listed.push(s"'${declared[j].name}'")
 
                 a.fault(scope, span, s"'$shown' declares no associated type '$n' — it declares " +
                         joined(listed, ", "))
@@ -124,11 +125,11 @@ check_assoc_args(a: &Analysis, scope: Scope, span: Span, key: string, declared: 
     var told: Buf[string] = buf()
 
     for i in 0..<supplied.len()
-        val n = supplied.at(i).0
+        val n = supplied[i].0
 
         if !holds_string(told, n)
             for j in (i + 1)..<supplied.len()
-                if supplied.at(j).0 == n && !holds_string(told, n)
+                if supplied[j].0 == n && !holds_string(told, n)
                     told.push(n)
                     a.fault(scope, span, s"$obj fixes '$n' more than once, and a type has one of each")
                     refused = true
@@ -142,14 +143,37 @@ check_assoc_args(a: &Analysis, scope: Scope, span: Span, key: string, declared: 
 
     for d in declared
         for j in 0..<supplied.len()
-            if supplied.at(j).0 == d.name && !holds_string(names, d.name)
+            if supplied[j].0 == d.name && !holds_string(names, d.name)
                 names.push(d.name)
-                types.push(supplied.at(j).1)
+                types.push(supplied[j].1)
 
                 if !d.bounds.is_empty() then bounds.push(NamedBounds(d.name, d.bounds))
 
     deferred_bounds(a, scope, span, key, names, bounds, types, "associated type")
-    false
+
+    // **What a requirement asks of an associated type is asked of the type fixed for it** too
+    // (`trait Scalar: Element[Real: Width]` and `&Scalar[Real = f32]`), as every `impl` of the
+    // trait is asked it -- now if every block is in, and with the requirements otherwise.
+    for c in trait_closure(a, plain_bound(key, args), self_binding(Abstract("Self", buf())))
+        for open in c.bounded
+            for item in supplied
+                if item.0 != open.0 || item.1 == Unknown then continue
+
+                val want = assoc_bound_at(a, open.1, item.1)
+
+                if a.tables.members.hoisted
+                    if !satisfies(a, want, item.1)
+                        a.fault(scope, span, s"trait '$shown' asks that its associated type '${item.0}' " +
+                                s"implement '${show_bound(a, want, item.1)}', and ${type_show(item.1)} " +
+                                "does not")
+                        refused = true
+                    end if
+                else
+                    a.tables.super_checks.push(SuperCheck("", shown, want, item.1, span, scope, item.0))
+                end if
+            end for
+
+    refused
 end check_assoc_args
 
 private bound_in(subst: Buf[Binding], name: string) -> bool
@@ -179,7 +203,7 @@ private check_object_safe(a: &Analysis, scope: Scope, span: Span, key: string, a
             val assocs = d.unwrap().assocs
 
             for j in 0..<assocs.len()
-                val an = assocs.at(j).name
+                val an = assocs[j].name
 
                 if !holds_string(fixed_names, an)
                     val from = qualified_name(item.name)
@@ -196,7 +220,7 @@ private check_object_safe(a: &Analysis, scope: Scope, span: Span, key: string, a
     var defaulted: Buf[string] = buf()
 
     for i in positional..<own.tparams.len()
-        defaulted.push(own.tparams.at(i))
+        defaulted.push(own.tparams[i])
 
     val members = trait_members(a, plain_bound(key, args), self_bind)
 
@@ -350,7 +374,7 @@ private equality_trait(key: string) -> bool = library_spelling(key) match
 // Whether a library trait is one an operator is written against -- `Eq` and `Ord` included.
 private operator_trait(spelling: string) -> bool = spelling match
     "Add" | "Sub" | "Mul" | "Div" | "Rem" | "BitAnd" | "BitOr" | "BitXor" | "Shl" | "Shr" -> true
-    "Neg" | "Not" | "Eq" | "Ord" -> true
+    "Neg" | "Not" | "Eq" | "PartialOrd" | "Ord" -> true
     _ -> false
 
 private takes_ref_self(m: MethodDecl) -> bool = m.receiver match
@@ -383,9 +407,9 @@ private params_bound_to_self(a: &Analysis, b: Bound, left_out: Buf[string]) -> B
     val tps = d.unwrap().tparams
 
     for i in 0..<tps.len()
-        if i < b.args.len() && !holds_string(left_out, tps.at(i))
-            b.args.at(i) match
-                Abstract(n, _) -> if n == "Self" then out.push(tps.at(i))
+        if i < b.args.len() && !holds_string(left_out, tps[i])
+            b.args[i] match
+                Abstract(n, _) -> if n == "Self" then out.push(tps[i])
                 _ -> ()
 
     out
@@ -419,9 +443,17 @@ private mentions_any(t: TypeRef, names: Buf[string], settled: Buf[string]) -> bo
             else mentions_any(base, names, settled)
         _ -> mentions_any(base, names, settled)
     AssocArgType(_, inner) -> mentions_any(inner, names, settled)
+    AssocBoundArgType(_, bounds) -> bound_args_mention(bounds, names, settled)
     KeptParamType(inner) -> mentions_any(inner, names, settled)
     SomeType(_) -> false
     InferredResult(_) -> false
+
+private bound_args_mention(bs: Buf[BoundRef], names: Buf[string], settled: Buf[string]) -> bool
+    for b in bs
+        if any_mentions(b.args, names, settled) then return true
+
+    false
+end bound_args_mention
 
 private any_mentions(ts: Buf[TypeRef], names: Buf[string], settled: Buf[string]) -> bool
     for item in ts

@@ -539,7 +539,7 @@ into it with nothing said twice.
 **A struct's [invariant](/reference/errors/#struct-invariants) is, at every member's entry, because
 there the fact is otherwise nowhere in sight.** Every value of the type got past a check — at its
 construction, its zero, and every write since — so a member is handed a receiver the clause holds of,
-and says so to the optimizer. `Buf[T]` declares `invariant count <= elems.len`, and `at` is the case
+and says so to the optimizer. `Buf[T]` declares `invariant count <= elems.len`, and the subscript is the case
 it pays for:
 
 ```sysl

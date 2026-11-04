@@ -69,8 +69,7 @@ struct Buf[T]
     cap(self) -> usize
     is_empty(self) -> bool
 
-    at(self, i: usize) -> T
-    set(self, i: usize, v: T)
+    get[I: Integer](self, i: I) -> Option[T]
 
     push(self, v: T)
     extend(self, xs: []const T)
@@ -105,7 +104,8 @@ print(names.len(), names[1])
 
 ## Bounds: a trap here, an `Option` there
 
-`at` and `set` **trap** on an index past the end, exactly as an array's subscript does. `pop` returns
+`b[i]` and `b[i] = v` **trap** on an index past the end, exactly as an array's subscript does, while
+`b.get(i)` answers an `Option` (`None` for an index past the end, or a negative one). `pop` returns
 an `Option`. That looks like two minds about the same question and is not:
 
 > An index past the end is a **mistake in the program**, not a value it meant to handle. Taking from
@@ -172,7 +172,7 @@ true
 count, and does nothing where `n` is a length the buffer does not have — a length past the end names
 no element, so unlike an index there is nothing for it to read and nothing to stop the program about.
 `clear()` is `truncate(0)`. `remove(i)` shifts the survivors down over element `i`, hands that element
-back, and ends at `truncate`; an `i` that names no element is `at`'s trap, for `at`'s reason.
+back, and ends at `truncate`; an `i` that names no element is `b[i]`'s trap, for `b[i]`'s reason.
 
 **`insert(i, v)` is `remove`'s other half**, putting an element at `i` and moving everything from
 there on up one. Inserting at `len` is a `push` and is allowed for that reason — a loop inserting at
@@ -207,10 +207,10 @@ above. The slots above the count hold nothing; what a removal gives up is let go
 
 ```sysl
 impl[T] Index[usize, T] for Buf[T]
-    index(self, i: usize) -> T = self.at(i)
+    index(self, i: usize) -> T = self.reading().at(i)
 
 impl[T] IndexSet[usize, T] for Buf[T]
-    index_set(self, i: usize, v: T) = self.set(i, v)
+    index_set(self, i: usize, v: T) = self.reading().set(i, v)
 ```
 
 ```sysl
@@ -253,8 +253,8 @@ print(items[0].block, items[0].data.len())
 **The subscript takes any integer**, as an array's does: `items[i]` with `i` an `int` or an `i8`
 needs no `usize(i)`, and a negative index stops the program at the subscript, as an array's does
 ([arrays](/reference/arrays/#a-type-with-no-elements-of-its-own-is-indexed-through-a-trait)). The
-methods themselves — `at`, `set`, `insert`, `remove` — take a `usize`, as written. An index past the
-count traps, as `at` does — `index 3 out of bounds for length 1`.
+methods themselves — `insert`, `remove` — take a `usize`, as written. An index past the
+count traps, as `b[i]` does — `index 3 out of bounds for length 1`.
 
 **A member that can move the storage is `@relocates`** — `push`, `extend`, `insert`, `pop`,
 `truncate`, `clear`, `remove`, `reserve`, `set_len` and `release` — and is refused on a buffer a live
@@ -561,7 +561,7 @@ Buf[int] has no zero value, so 'b' needs an initial value
 The refusal is about a *declaration*. A program can still lay a `Buf` in memory the language did not
 initialise — a `calloc`ed block, a garbage collector's arena, a struct of an interpreter's objects
 reached through a `*T` — and there the handle names no buffer at all. **That handle is an empty
-buffer**: `len()` is 0, `view()` is empty, `for` visits nothing, `at` reports the index past the end,
+buffer**: `len()` is 0, `view()` is empty, `for` visits nothing, `b[i]` reports the index past the end,
 and assigning into it gives back nothing, so `p.items = buf()` is how it gets storage. What it cannot
 do is grow where it stands: `push`, `extend` and `insert` take the handle by value and have nowhere to
 put a buffer they made, so they panic, naming the fix, rather than adding to nothing.

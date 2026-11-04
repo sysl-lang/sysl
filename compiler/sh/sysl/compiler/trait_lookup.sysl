@@ -229,7 +229,7 @@ member_key(a: &Analysis, t: Type, mname: string) -> (string, Buf[Type])
     val blankets = blanket_owners(a, t)
 
     for i in 0..<blankets.len()
-        if has_member_at(a, blankets.at(i).0, mname) then return blankets.at(i)
+        if has_member_at(a, blankets[i].0, mname) then return blankets[i]
 
     own
 end member_key
@@ -309,10 +309,16 @@ resolve_bound(a: &Analysis, scope: Scope, span: Span, b: BoundRef, subst: Buf[Bi
 
     var positional: Buf[TypeRef] = buf()
     var named: Buf[(string, Type)] = buf()
+    var open: Buf[(string, BoundRef, usize)] = buf()
 
-    for item in b.args
+    for c in 0..<b.args.len()
+        val item = b.args[c]
+
         *item.kind match
             AssocArgType(n, inner) -> named.push((n, resolve_type(a, scope, inner, subst)))
+            AssocBoundArgType(n, bs) ->
+                for one in bs
+                    open.push((n, one, c))
             _ -> positional.push(item)
 
     // A bare arrow's parameters arrive here as a callable bound's arguments, each `@keeps` with them;
@@ -324,12 +330,12 @@ resolve_bound(a: &Analysis, scope: Scope, span: Span, b: BoundRef, subst: Buf[Bi
         var ps: Buf[TypeRef] = buf()
 
         for i in 0..<positional.len() - 1
-            ps.push(positional.at(i))
+            ps.push(positional[i])
 
         val kept = kept_params(a, scope, ps)
         var stripped = kept.0
 
-        stripped.push(positional.at(positional.len() - 1))
+        stripped.push(positional[positional.len() - 1])
         positional = stripped
         marks = kept.1
     end if
@@ -353,7 +359,7 @@ resolve_bound(a: &Analysis, scope: Scope, span: Span, b: BoundRef, subst: Buf[Bi
                    else object_assocs(a, key.unwrap())
 
     if decl.tparams.is_empty() && declared.len() == 1 && named.is_empty() && written.len() == 1
-        named.push((declared.at(0).name, written.at(0)))
+        named.push((declared[0].name, written[0]))
         written = buf()
     end if
 
@@ -363,15 +369,99 @@ resolve_bound(a: &Analysis, scope: Scope, span: Span, b: BoundRef, subst: Buf[Bi
 
     check_trait_arg_bounds(a, scope, span, key.unwrap(), decl, args)
 
+    val bounded = open_assoc_bounds(a, scope, span, key.unwrap(), named, open, subst)
+
     // A refused name has been told, and the bound stands as the trait alone.
     if !named.is_empty() && check_assoc_args(a, scope, span, key.unwrap(), declared, named, "", args)
-        return Bound(key.unwrap(), args, marks)
+        return fixing_bound(key.unwrap(), args, marks)
 
     for item in marks
         named.push(item)
 
-    Bound(key.unwrap(), args, named)
+    Bound(key.unwrap(), args, named, bounded)
 end resolve_bound
+
+// What a bound asks of the associated types it leaves open (`Seq[Item: Render]`), each read with
+// `Self` standing for the associated type rather than for the type the bound is on. The names are held
+// to the trait's declaration as a fixed one's are -- declared by the trait or one it requires, and not
+// both fixed and bounded, since the type a bound fixes is already the whole answer (Rust's E0719).
+// A refused name is told here and dropped.
+private open_assoc_bounds(a: &Analysis, scope: Scope, span: Span, key: string,
+                          named: Buf[(string, Type)], open: Buf[(string, BoundRef, usize)],
+                          subst: Buf[Binding]) -> Buf[(string, Bound)]
+    var out: Buf[(string, Bound)] = buf()
+
+    if open.is_empty() then return out
+
+    val declared = object_assocs(a, key)
+    val shown = qualified_name(key)
+    var told: Buf[string] = buf()
+    var inner: Buf[Binding] = buf()
+
+    for item in subst
+        if item.name != "Self" then inner.push(item)
+
+    inner.push(Binding("Self", Abstract(AssocSelf, buf())))
+
+    for i in 0..<open.len()
+        val n = open[i].0
+
+        if holds_string(told, n) then continue
+
+        var known = false
+
+        for d in declared
+            if d.name == n then known = true
+
+        if !known
+            told.push(n)
+
+            if declared.is_empty()
+                a.fault(scope, span, s"'$shown' declares no associated types, so there is nothing for " +
+                        s"'$n: …' to bound — a trait declares one with 'type $n: …' among its members")
+            else
+                var listed: Buf[string] = buf()
+
+                for d in declared
+                    listed.push(s"'${d.name}'")
+
+                a.fault(scope, span, s"'$shown' declares no associated type '$n' — it declares " +
+                        joined(listed, ", "))
+            end if
+
+            continue
+        end if
+
+        var fixed = false
+
+        for item in named
+            if item.0 == n then fixed = true
+
+        if fixed
+            told.push(n)
+            a.fault(scope, span, s"'$shown' is given '$n = …' and '$n: …' both — the type it fixes is " +
+                    s"the whole answer, so bound '$n' or fix it, not both")
+            continue
+        end if
+
+        // Each name is bounded in one clause, as Rust asks: `Item: A + B` says it once.
+        var again = false
+
+        for j in 0..<open.len()
+            if open[j].0 == n && open[j].2 != open[i].2 then again = true
+
+        if again
+            told.push(n)
+            a.fault(scope, span, s"'$shown' has '$n' bounded in two places — write its bounds " +
+                    s"together, '$n: A + B'")
+            continue
+        end if
+
+        out.push((n, resolve_bound(a, scope, open[i].1.span, open[i].1, inner)))
+    end for
+
+    out
+end open_assoc_bounds
 
 // **A trait's own parameters carry bounds, and everything applying the trait supplies them** -- a
 // bound, an `impl`, an object type. The bounds are read in the trait's own scope, since they are
@@ -527,10 +617,10 @@ trait_args_with_defaults(a: &Analysis, scope: Scope, span: Span, key: string, d:
 
     for i in filled.len()..<d.tparams.len()
         for j in 0..<filled.len()
-            here.push(Binding(d.tparams.at(j), filled.at(j)))
+            here.push(Binding(d.tparams[j], filled[j]))
 
-        val w = binding_named(d.tdefaults, d.tparams.at(i))
-        val declared = binding_named(d.tvalues, d.tparams.at(i))
+        val w = binding_named(d.tdefaults, d.tparams[i])
+        val declared = binding_named(d.tvalues, d.tparams[i])
         val home = scope_of_trait(a, key, scope)
 
         if w.is_none() then filled.push(Unknown)
@@ -538,7 +628,7 @@ trait_args_with_defaults(a: &Analysis, scope: Scope, span: Span, key: string, d:
         else
             // A value parameter's default is the argument it stands in for, read at the type the
             // trait declared for it -- so `impl Hash for Sha` and `impl Hash[32] for Sha` agree.
-            val v = default_value(a, home, w.unwrap().span, d.tparams.at(i), w.unwrap(),
+            val v = default_value(a, home, w.unwrap().span, d.tparams[i], w.unwrap(),
                                   resolve_type(a, home, declared.unwrap(), no_bindings()), here)
 
             filled.push(if v.is_some() then v.unwrap() else Unknown)
@@ -575,7 +665,25 @@ end trait_closure
 
 private walk_supers(a: &Analysis, b: Bound, self_bind: Buf[Binding], seen: *Buf[string],
                     acc: *Buf[Bound])
-    if holds_name(*seen, b.name) then return
+    // A trait reached twice is laid out once, and **what either route asks of its associated types
+    // is kept**: `trait C: A + B[Item: X]`, where `A` requires `B` too, still bounds `Item`.
+    if holds_name(*seen, b.name)
+        if b.bounded.is_empty() then return
+
+        for i in 0..<acc.len()
+            if acc[i].name != b.name then continue
+
+            var held = acc[i]
+            var grown = held.bounded.copy()
+
+            for item in b.bounded
+                grown.push(item)
+
+            acc[i] = Bound(held.name, held.args, held.assocs, grown)
+        end for
+
+        return
+    end if
 
     seen.push(b.name)
 
@@ -594,7 +702,7 @@ private walk_supers(a: &Analysis, b: Bound, self_bind: Buf[Binding], seen: *Buf[
             subst.push(item)
 
         for i in 0..<decl.tparams.len()
-            if i < b.args.len() then subst.push(Binding(decl.tparams.at(i), b.args.at(i)))
+            if i < b.args.len() then subst.push(Binding(decl.tparams[i], b.args[i]))
 
         for s in decl.supers
             walk_supers(a, resolve_bound(a, scope, s.span, s, subst), self_bind, seen, acc)
@@ -625,7 +733,7 @@ trait_members(a: &Analysis, b: Bound, self_bind: Buf[Binding]) -> Buf[(Bound, Me
             val ms = d.unwrap().methods
 
             for j in 0..<ms.len()
-                out.push((sb, ms.at(j)))
+                out.push((sb, ms[j]))
 
     out
 end trait_members
@@ -695,7 +803,35 @@ end has_unslotted_member
 satisfies(a: &Analysis, tr: Bound, t: Type) -> bool = t match
     // A pack's members are each asked the whole bound.
     Pack(_) -> implements_bound(a, tr, t)
-    _ -> implements_bound(a, tr, t) && (tr.assocs.is_empty() || assoc_disagreement(a, tr, t).is_none())
+    _ -> implements_bound(a, tr, t) && (tr.assocs.is_empty() || assoc_disagreement(a, tr, t).is_none()) &&
+         (tr.bounded.is_empty() || open_bound_unmet(a, tr, t).is_none())
+
+// The associated type a bound leaves open and asks a trait of (`Seq[Item: Render]`), where the type's
+// own answer for it does not implement that trait: the name, the type supplied, and the bound it
+// fails, with the supplied type in it for `Self`. Asked of a type implementing the bound's trait; a
+// parameter answers through its own bounds, so `[U: Seq]` handed to one asking `Item: Render` is
+// refused unless something `U` is bounded by asked the same.
+open_bound_unmet(a: &Analysis, tr: Bound, t: Type) -> Option[(string, Type, Bound)]
+    if t == Unknown then return None
+
+    val subject = erased_trait(t).unwrap_or(t)
+
+    for item in tr.bounded
+        val got = assoc_type_opt(a, subject, item.0)
+
+        if got.is_none() then continue
+
+        val supplied = got.unwrap()
+
+        if supplied == Unknown then continue
+
+        val want = assoc_bound_at(a, item.1, supplied)
+
+        if !satisfies(a, want, supplied) then return Some((item.0, supplied, want))
+    end for
+
+    None
+end open_bound_unmet
 
 // The associated type a bound fixes and a type answers otherwise: its name, what the bound wrote, and
 // what the type supplies -- `None` for a type parameter whose own bounds leave it open.
@@ -884,7 +1020,7 @@ private bound_promises(a: &Analysis, bounds: Buf[Bound], tr: Bound, t: Type) -> 
         val closure = trait_closure(a, item, self_binding(t))
 
         for j in 0..<closure.len()
-            if closure.at(j).key() == tr.key() then return true
+            if closure[j].key() == tr.key() then return true
 
     false
 end bound_promises
@@ -902,7 +1038,7 @@ blanket_keys_of_bounds(a: &Analysis, bounds: Buf[Bound], t: Type) -> Buf[string]
             val closure = trait_closure(a, item, self_binding(t))
 
             for j in 0..<closure.len()
-                if closure.at(j).name == bs.at(i) then covered = true
+                if closure[j].name == bs.at(i) then covered = true
 
         if covered then out.push(bs.key_at(i))
 
@@ -925,14 +1061,14 @@ blanket_condition_met(a: &Analysis, ti: TraitImpl, t: Type) -> bool
         Abstract(_, own) ->
             var terms: Buf[Binding] = buf()
 
-            terms.push(Binding(ti.tparams.at(0), t))
+            terms.push(Binding(ti.tparams[0], t))
 
             val wanted = ti.condition()
 
             for nb in wanted
-                if nb.name == ti.tparams.at(0)
+                if nb.name == ti.tparams[0]
                     for j in 0..<nb.bounds.len()
-                        val b = nb.bounds.at(j)
+                        val b = nb.bounds[j]
                         val tr = resolve_bound(a, ti.scope, b.span, b, bound_terms(terms, nb.name, t))
 
                         if !bound_promises(a, own, tr, t) then return false
@@ -942,7 +1078,7 @@ blanket_condition_met(a: &Analysis, ti: TraitImpl, t: Type) -> bool
 
     var subst: Buf[Binding] = buf()
 
-    subst.push(Binding(ti.tparams.at(0), t))
+    subst.push(Binding(ti.tparams[0], t))
     unmet_condition_of(a, ti, subst).is_none()
 end blanket_condition_met
 
@@ -1039,7 +1175,7 @@ impl_key(a: &Analysis, tr: Bound, t: Type) -> Option[(Buf[Type], TraitImpl)]
     val blankets = blanket_owners(a, t)
 
     for i in 0..<blankets.len()
-        val b = blankets.at(i)
+        val b = blankets[i]
         val found = impl_at(a, tr, b.0, t, b.1)
 
         if found.is_some() then return Some((b.1, found.unwrap()))
@@ -1071,7 +1207,7 @@ supplied_bound(a: &Analysis, ti: TraitImpl, name: string, subject: Type, targs: 
     var subst: Buf[Binding] = buf()
 
     for i in 0..<ti.tparams.len()
-        if i < targs.len() then subst.push(Binding(ti.tparams.at(i), targs.at(i)))
+        if i < targs.len() then subst.push(Binding(ti.tparams[i], targs[i]))
 
     var written: Buf[Type] = buf()
 
@@ -1106,7 +1242,7 @@ written_impl_at(a: &Analysis, tr: Bound, subject: Type) -> bool
     val blankets = blanket_owners(a, subject)
 
     for i in 0..<blankets.len()
-        if impl_at(a, tr, blankets.at(i).0, subject, blankets.at(i).1).is_some() then return true
+        if impl_at(a, tr, blankets[i].0, subject, blankets[i].1).is_some() then return true
 
     false
 end written_impl_at
@@ -1133,7 +1269,7 @@ conforms(a: &Analysis, tr: Bound, t: Type) -> bool
     var subst: Buf[Binding] = buf()
 
     for i in 0..<ti.tparams.len()
-        subst.push(Binding(ti.tparams.at(i), targs.at(i)))
+        subst.push(Binding(ti.tparams[i], targs[i]))
 
     // **A condition that needs its own answer is not met**: `impl[T: Integer + X] X for T` gives `int`
     // an `X` only once `int` has one, and nothing in the program starts that off. So a question met
@@ -1179,7 +1315,7 @@ unmet_condition_of(a: &Analysis, ti: TraitImpl, subst: Buf[Binding]) -> Option[(
 
         if arg.is_some()
             for j in 0..<nb.bounds.len()
-                val b = nb.bounds.at(j)
+                val b = nb.bounds[j]
                 val tr = resolve_bound(a, ti.scope, b.span, b, bound_terms(subst, nb.name, arg.unwrap()))
 
                 if !satisfies(a, tr, arg.unwrap()) then return Some((arg.unwrap(), tr))
@@ -1233,15 +1369,15 @@ show_bound(a: &Analysis, tr: Bound, subject: Type) -> string
         var head: Buf[Type] = buf()
 
         for i in 0..<n
-            head.push(tr.args.at(i))
+            head.push(tr.args[i])
 
         val filled = trait_args_with_defaults(a, scope, span_of_nothing(), tr.name, decl, head,
                                               self_binding(subject))
 
         if plain_bound(tr.name, filled).key() == tr.key()
-            if n == 0 && tr.assocs.is_empty() then return module_show(tr.name)
+            if n == 0 && tr.assocs.is_empty() && tr.bounded.is_empty() then return module_show(tr.name)
 
-            return Bound(tr.name, head, tr.assocs).show()
+            return Bound(tr.name, head, tr.assocs, tr.bounded).show()
 
     tr.show()
 end show_bound
@@ -1257,6 +1393,14 @@ private span_of_nothing() -> Span = Span(0, 0)
 // is that block's condition. So the condition is what is worth saying. Nothing where nothing covers
 // the type, leaving the caller's own advice -- write one -- the right advice.
 unmet_bound(a: &Analysis, tr: Bound, t: Type) -> Option[string]
+    // **A type ordered only partially is refused a total order with the way round it**: a float's
+    // own `max`, `min` and `clamp` say what a NaN does, and `total_lt` is a total order to sort by.
+    if library_spelling(tr.name) == Some("Ord")
+        val partial = partial_only(a, t)
+
+        if partial.is_some() then return partial
+    end if
+
     // **`AnyBits` is refused with the part of the type that has a bit pattern no value has**, since
     // that is what the bound was asked for: storage nobody wrote, read as the type.
     if library_spelling(tr.name) == Some("AnyBits")
@@ -1302,7 +1446,7 @@ unmet_bound(a: &Analysis, tr: Bound, t: Type) -> Option[string]
     var subst: Buf[Binding] = buf()
 
     for i in 0..<ti.tparams.len()
-        subst.push(Binding(ti.tparams.at(i), targs.at(i)))
+        subst.push(Binding(ti.tparams[i], targs[i]))
 
     val unmet = unmet_condition_of(a, ti, subst)
 
@@ -1317,6 +1461,26 @@ unmet_bound(a: &Analysis, tr: Bound, t: Type) -> Option[string]
          s"${type_show(first_unmet_part(a, bound, packed))}, which does not implement it")
 end unmet_bound
 
+// Why a type that is `PartialOrd` and not `Ord` is refused a total order, or nothing for one that is
+// not ordered at all.
+private partial_only(a: &Analysis, t: Type) -> Option[string]
+    val key = catalog_key(a, "PartialOrd")
+
+    if key.is_none() || !satisfies(a, plain_bound(key.unwrap(), buf()), t) then return None
+
+    val shown = type_show(t)
+
+    op_subject(t) match
+        Floating(_, _) ->
+            Some(s"$shown is only 'PartialOrd': a NaN is neither less, greater nor equal to any " +
+                 "value, so no total order holds. Use the float's own 'x.max(y)', 'x.min(y)' or " +
+                 "'x.clamp(lo, hi)', which say what a NaN does, and sort with " +
+                 "'sort_by(xs, (a, b) -> a.total_lt(b))'")
+        _ ->
+            Some(s"$shown is only 'PartialOrd', so two of its values may be neither less, greater " +
+                 "nor equal")
+end partial_only
+
 private wrong_arguments(a: &Analysis, tr: Bound, t: Type) -> Option[string]
     var keys: Buf[(string, Buf[Type])] = buf()
 
@@ -1330,7 +1494,7 @@ private wrong_arguments(a: &Analysis, tr: Bound, t: Type) -> Option[string]
     val blankets = blanket_owners(a, t)
 
     for i in 0..<blankets.len()
-        keys.push(blankets.at(i))
+        keys.push(blankets[i])
 
     for item in keys
         val key = item.0
@@ -1341,7 +1505,7 @@ private wrong_arguments(a: &Analysis, tr: Bound, t: Type) -> Option[string]
             var shown: Buf[string] = buf()
 
             for j in 0..<rows.len()
-                shown.push(s"'${show_bound(a, supplied_bound(a, rows.at(j), tr.name, t, targs), t)}'")
+                shown.push(s"'${show_bound(a, supplied_bound(a, rows[j], tr.name, t, targs), t)}'")
 
             return Some(s"it implements ${conjoin(shown)}")
 
@@ -1393,17 +1557,17 @@ receiver_type(t: Type) -> Type = t match
 conjoin(xs: Buf[string]) -> string
     if xs.is_empty() then return ""
 
-    if xs.len() == 1 then return xs.at(0)
+    if xs.len() == 1 then return xs[0]
 
     var b = str_builder()
 
     for i in 0..<(xs.len() - 1)
         if i > 0 then b.push(", ")
 
-        b.push(xs.at(i))
+        b.push(xs[i])
 
     b.push(" and ")
-    b.push(xs.at(xs.len() - 1))
+    b.push(xs[xs.len() - 1])
     b.finish()
 end conjoin
 

@@ -64,7 +64,7 @@ place_entries(e: *Emit, p: TProgram, answers: Map[string, usize])
         for c in cands
             if e.places.has(c.0.name) then continue
 
-            val roots = one_root(c.0.params.at(c.1).0)
+            val roots = one_root(c.0.params[c.1].0)
 
             if place_shape(e, c.0.body.result.unwrap(), roots)
                 e.places.put(c.0.name, c)
@@ -109,7 +109,7 @@ private place_candidate(e: *Emit, f: TFunc, k: usize) -> bool
     for p in f.params
         if underlying(p.1) == VaList then return false
 
-    !zero_sized(f.params.at(k).1)
+    !zero_sized(f.params[k].1)
 end place_candidate
 
 private one_root(name: string) -> Buf[string]
@@ -143,7 +143,7 @@ private shaped(e: *Emit, x: TExpr, roots: Buf[string]) -> bool = *x.kind match
     TDeref(operand, _) -> place_shape(e, operand, roots)
     TBlockExpr(b) -> b.stmts.is_empty() && b.result.is_some() && place_shape(e, b.result.unwrap(), roots)
     TCall(name, args, _, _) -> e.places.get(name) match
-        Some(c) -> others_quiet(args, c.1) && place_shape(e, args.at(c.1), roots)
+        Some(c) -> others_quiet(args, c.1) && place_shape(e, args[c.1], roots)
         None -> false
     TMatch(scrutinee, arms, _) ->
         if !place_shape(e, scrutinee, roots) then return false
@@ -157,7 +157,7 @@ private shaped(e: *Emit, x: TExpr, roots: Buf[string]) -> bool = *x.kind match
 // Whether every argument but the one at `k` can be worked out with no call and no write.
 private others_quiet(args: Buf[TExpr], k: usize) -> bool
     for j in 0..<args.len()
-        if j != k && !changes_nothing(args.at(j)) then return false
+        if j != k && !changes_nothing(args[j]) then return false
 
     true
 end others_quiet
@@ -168,7 +168,7 @@ end others_quiet
 private arm_shape(e: *Emit, arm: TArm, roots: Buf[string]) -> bool
     if arm.guard.is_some() || arm.patterns.len() != 1 then return false
 
-    val pat = arm.patterns.at(0)
+    val pat = arm.patterns[0]
 
     if is_never_type(arm.body.ty) then return !binds_any(pat) && flat_pattern(pat)
     if !arm.body.stmts.is_empty() || arm.body.result.is_none() || !flat_pattern(pat) then return false
@@ -249,9 +249,9 @@ private place_call_at(e: *Emit, name: string, args: Buf[TExpr], span: Span) -> O
     val k = c.1
 
     if k >= args.len() || e.abandoning.has(name) then return None
-    if !nameable(e, args.at(k)) || !others_quiet(args, k) then return None
+    if !nameable(e, args[k]) || !others_quiet(args, k) then return None
 
-    Some(call_place(e, name, args, address(e, args.at(k)), span))
+    Some(call_place(e, name, args, address(e, args[k]), span))
 end place_call_at
 
 // Whether `x` is storage the caller can hand over by address as it stands: a local or module `val`
@@ -287,7 +287,7 @@ private call_place(e: *Emit, name: string, args: Buf[TExpr], at: Val, span: Span
 
     for j in 0..<args.len()
         if j == k then arg_vals.push(ir_arg(LPtr, at))
-        else arg_value(e, args.at(j), &arg_vals, set())
+        else arg_value(e, args[j], &arg_vals, set())
 
     push_caller_arg(e, name, span, &arg_vals)
 
@@ -309,7 +309,7 @@ place_entry_sig(e: *Emit, name: string, target: string) -> IrFuncSig
     var ps: Buf[IrParam] = buf()
 
     for j in 0..<c.0.params.len()
-        val p = c.0.params.at(j)
+        val p = c.0.params[j]
 
         if zero_sized(p.1) then continue
 
@@ -334,7 +334,7 @@ gen_place_entry(e: *Emit, target: string)
     e.in_tracked = e.tracked.has(target)
 
     for j in 0..<f.params.len()
-        val p = f.params.at(j)
+        val p = f.params[j]
 
         if zero_sized(p.1) then continue
 
@@ -357,7 +357,7 @@ gen_place_entry(e: *Emit, target: string)
 
     var env: Buf[(string, Val)] = buf()
 
-    env.push((f.params.at(c.1).0, VReg(s"${f.params.at(c.1).0}.addr")))
+    env.push((f.params[c.1].0, VReg(s"${f.params[c.1].0}.addr")))
 
     val at = place_at(e, f.body.result.unwrap(), env)
 
@@ -370,7 +370,7 @@ private env_get(env: Buf[(string, Val)], name: string) -> Val
     while i > 0
         i -= 1
 
-        if env.at(i).0 == name then return env.at(i).1
+        if env[i].0 == name then return env[i].1
 
     VUndef
 end env_get
@@ -415,7 +415,7 @@ private place_at(e: *Emit, x: TExpr, env: Buf[(string, Val)]) -> Val = *x.kind m
     TCall(name, args, _, _) ->
         val k = e.places.get(name).unwrap().1
 
-        call_place(e, name, args, place_at(e, args.at(k), env), x.span)
+        call_place(e, name, args, place_at(e, args[k], env), x.span)
     TMatch(scrutinee, arms, _) -> match_place(e, scrutinee, arms, env)
     _ -> gap_at(e, "a place entry over a form it does not answer")
 
@@ -433,7 +433,7 @@ private match_place(e: *Emit, scrutinee: TExpr, arms: Buf[TArm], env: Buf[(strin
     val done = fresh_label(e, "place.done")
 
     for arm in arms
-        val pat = arm.patterns.at(0)
+        val pat = arm.patterns[0]
         val taken = fresh_label(e, "place.arm")
         val next = fresh_label(e, "place.next")
 
@@ -475,7 +475,7 @@ private bind_at(e: *Emit, pat: TPattern, base: Val, env: *Buf[(string, Val)])
             val d = enum_decl(enum_ty).unwrap()
 
             for i in 0..<args.len()
-                args.at(i) match
+                args[i] match
                     TBindPattern(name, ty) ->
                         if zero_sized(ty) then continue
 

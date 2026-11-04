@@ -2369,7 +2369,7 @@ main.sysl:7:23
 **What a tracked function reports names the caller too.** A check the compiler laid down in its
 body — an array's index, a slice's range — reports the caller's location, and so does every tracked
 function it calls. This is what the standard library is built on: `Buf`, `Frozen`, `Deque`, `Ring` and
-`InlineRing`'s `at`, `set`, `insert`, `remove` and their `Index` members, `Option` and `Result`'s
+`InlineRing`'s `insert`, `remove` and their `Index` members, `Option` and `Result`'s
 `unwrap` and `expect`, and `assert`, `assert_eq`, `assert_slice_eq` and `panic` are all tracked, so
 `b[5]` on a three-element `Buf` reports `index 5 out of bounds for length 3` with the subscript's
 line and column, exactly as an array would, and a checking function of a program's own reports its caller's line by carrying

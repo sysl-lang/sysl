@@ -239,7 +239,7 @@ private unify_nameless(a: &Analysis, scope: Scope, want: TypeRef, actual: Type, 
                     Struct(d) ->
                         if is_tuple(d) && d.targs.len() == parts.len()
                             for i in 0..<parts.len()
-                                unify(a, scope, parts.at(i), d.targs.at(i), tparams, sub)
+                                unify(a, scope, parts[i], d.targs[i], tparams, sub)
                     _ -> ()
 
         // A bare pack stands where no type does, so nothing here can be matched against it.
@@ -259,9 +259,9 @@ private unify_nameless(a: &Analysis, scope: Scope, want: TypeRef, actual: Type, 
                 val args = callable.unwrap().args
 
                 for i in 0..<params.len()
-                    unify(a, scope, params.at(i), args.at(i), tparams, sub)
+                    unify(a, scope, params[i], args[i], tparams, sub)
 
-                unify(a, scope, ret, args.at(args.len() - 1), tparams, sub)
+                unify(a, scope, ret, args[args.len() - 1], tparams, sub)
 
         // A function pointer's parts bind exactly as a tuple's do -- position by position, and only
         // against another one of the same width, since nothing else has parts to read.
@@ -269,7 +269,7 @@ private unify_nameless(a: &Analysis, scope: Scope, want: TypeRef, actual: Type, 
             CFn(ps2, r2) ->
                 if ps2.len() == ps.len()
                     for i in 0..<ps.len()
-                        unify(a, scope, ps.at(i), ps2.at(i), tparams, sub)
+                        unify(a, scope, ps[i], ps2[i], tparams, sub)
 
                     unify(a, scope, r, *r2, tparams, sub)
             _ -> ()
@@ -283,6 +283,9 @@ private unify_nameless(a: &Analysis, scope: Scope, want: TypeRef, actual: Type, 
         // An object's binding is written rather than solved: it is part of the object *type*, so a
         // parameter named there is fixed by whoever wrote it.
         AssocArgType(_, _) -> ()
+
+        // A bound on an associated type stands only in a bound, which no value has.
+        AssocBoundArgType(_, _) -> ()
 
         // A callable's `@keeps` mark is no part of the type it marks: what is under it binds.
         KeptParamType(inner) -> unify(a, scope, inner, actual, tparams, sub)
@@ -372,8 +375,8 @@ private unify_named(a: &Analysis, scope: Scope, n: string, arg_refs: Buf[TypeRef
 
                     for i in 0..<arg_refs.len()
                         if i < d.tp.names.len()
-                            bound_type(inner, d.tp.names.at(i)) match
-                                Some(t) -> unify(a, scope, arg_refs.at(i), t, tparams, sub)
+                            bound_type(inner, d.tp.names[i]) match
+                                Some(t) -> unify(a, scope, arg_refs[i], t, tparams, sub)
                                 None -> ()
                         end if
 
@@ -389,25 +392,25 @@ private unify_named(a: &Analysis, scope: Scope, n: string, arg_refs: Buf[TypeRef
         Struct(d) ->
             if d.base == key.unwrap() && d.targs.len() == arg_refs.len()
                 for i in 0..<arg_refs.len()
-                    if !binds_object(arg_refs.at(i), d.targs.at(i), tparams, sub) then
-                        unify(a, scope, arg_refs.at(i), d.targs.at(i), tparams, sub)
+                    if !binds_object(arg_refs[i], d.targs[i], tparams, sub) then
+                        unify(a, scope, arg_refs[i], d.targs[i], tparams, sub)
         Enum(d) ->
             if d.base == key.unwrap() && d.targs.len() == arg_refs.len()
                 for i in 0..<arg_refs.len()
-                    if !binds_object(arg_refs.at(i), d.targs.at(i), tparams, sub) then
-                        unify(a, scope, arg_refs.at(i), d.targs.at(i), tparams, sub)
+                    if !binds_object(arg_refs[i], d.targs[i], tparams, sub) then
+                        unify(a, scope, arg_refs[i], d.targs[i], tparams, sub)
         // A `new` type's parameters are read back off the arguments it was applied to, which is
         // all a phantom parameter is there for: `read[T](p: UserPtr[T])` at a `UserPtr[Frame]`.
         Constrained(d) ->
             if d.generic == key.unwrap() && d.targs.len() == arg_refs.len()
                 for i in 0..<arg_refs.len()
-                    unify(a, scope, arg_refs.at(i), d.targs.at(i), tparams, sub)
+                    unify(a, scope, arg_refs[i], d.targs[i], tparams, sub)
         // A trait applied to arguments binds them the way a generic type does -- what a trait cannot
         // do is bind a parameter to *itself*.
         Trait(tn, targs, _) ->
             if tn == key.unwrap() && targs.len() == arg_refs.len()
                 for i in 0..<arg_refs.len()
-                    unify(a, scope, arg_refs.at(i), targs.at(i), tparams, sub)
+                    unify(a, scope, arg_refs[i], targs[i], tparams, sub)
         _ -> ()
 end unify_named
 
@@ -415,7 +418,7 @@ end unify_named
 private sole_pack(parts: Buf[TypeRef]) -> Option[string]
     if parts.len() != 1 then return None
 
-    *parts.at(0).kind match
+    *parts[0].kind match
         PackType(n) -> Some(n)
         _ -> None
 end sole_pack
@@ -464,7 +467,7 @@ solve(a: &Analysis, scope: Scope, site: Scope, span: Span, what: string, tparams
 
     for i in 0..<param_refs.len()
         if i < arg_tys.len() && !is_soft(soft, i) then
-            unify(a, scope, param_refs.at(i), arg_tys.at(i), tparams, &sub)
+            unify(a, scope, param_refs[i], arg_tys[i], tparams, &sub)
 
     // **A bound that fixes an associated type says what that type is**, so `[S: Seq[Item = E], E]`
     // called with a sequence of `int` settles `E = int` from the argument alone -- ahead of the
@@ -488,12 +491,12 @@ solve(a: &Analysis, scope: Scope, site: Scope, span: Span, what: string, tparams
     if sub.len() < tparams.len()
         for i in 0..<param_refs.len()
             if i < arg_tys.len() && is_soft(soft, i) && !is_soft(defaulted, i) then
-                unify(a, scope, param_refs.at(i), arg_tys.at(i), tparams, &sub)
+                unify(a, scope, param_refs[i], arg_tys[i], tparams, &sub)
 
     if sub.len() < tparams.len()
         for i in 0..<param_refs.len()
             if i < arg_tys.len() && is_soft(soft, i) && is_soft(defaulted, i) then
-                unify(a, scope, param_refs.at(i), arg_tys.at(i), tparams, &sub)
+                unify(a, scope, param_refs[i], arg_tys[i], tparams, &sub)
 
     // Asked again for a parameter only a literal or a construction settled, which the passes above
     // have just read.
@@ -518,7 +521,7 @@ solve(a: &Analysis, scope: Scope, site: Scope, span: Span, what: string, tparams
     var written_tys: Buf[Type] = buf()
 
     for i in 0..<arg_tys.len()
-        if !is_soft(defaulted, i) then written_tys.push(arg_tys.at(i))
+        if !is_soft(defaulted, i) then written_tys.push(arg_tys[i])
 
     val poisoned = mentions_unknown_any(written_tys) ||
                    (expected.is_some() && mentions_unknown(expected.unwrap())) ||
@@ -541,7 +544,7 @@ solve(a: &Analysis, scope: Scope, site: Scope, span: Span, what: string, tparams
     out
 end solve
 
-private is_soft(soft: Buf[bool], i: usize) -> bool = if i < soft.len() then soft.at(i) else false
+private is_soft(soft: Buf[bool], i: usize) -> bool = if i < soft.len() then soft[i] else false
 
 // The success half of a declared `Option[T]` or `Result[T, E]` result, unified with what the value
 // unwrapped from it is wanted as. Any other result shape says nothing, and is left alone.
@@ -558,7 +561,7 @@ private unify_payload(a: &Analysis, scope: Scope, result_ref: TypeRef, payload: 
             val k = key.unwrap()
 
             if k == module_qualify("sysl", "Option") || k == module_qualify("sysl", "Result")
-                unify(a, scope, arg_refs.at(0), payload, tparams, sub)
+                unify(a, scope, arg_refs[0], payload, tparams, sub)
         _ -> ()
 end unify_payload
 
@@ -569,14 +572,14 @@ solve_from_callables(a: &Analysis, scope: Scope, tparams: Buf[string],
 
         if t.is_some()
             for j in 0..<nb.bounds.len()
-                val b = nb.bounds.at(j)
+                val b = nb.bounds[j]
 
                 if fn_is_call(b.name)
                     val actual = callable_of(a, t.unwrap())
 
                     if actual.is_some() && b.args.len() == actual.unwrap().args.len()
                         for k in 0..<b.args.len()
-                            unify(a, scope, b.args.at(k), actual.unwrap().args.at(k), tparams, sub)
+                            unify(a, scope, b.args[k], actual.unwrap().args[k], tparams, sub)
 end solve_from_callables
 
 private solve_from_bindings(a: &Analysis, scope: Scope, tparams: Buf[string],
@@ -601,6 +604,8 @@ written_bindings(a: &Analysis, scope: Scope, b: BoundRef) -> Buf[(string, TypeRe
     for arg in b.args
         *arg.kind match
             AssocArgType(n, inner) -> out.push((n, inner))
+            // A bound on an associated type fixes nothing, so there is nothing in it to solve for.
+            AssocBoundArgType(_, _) -> ()
             _ -> bare.push(arg)
 
     if !out.is_empty() || bare.len() != 1 then return out
@@ -615,7 +620,7 @@ written_bindings(a: &Analysis, scope: Scope, b: BoundRef) -> Buf[(string, TypeRe
 
     val declared = object_assocs(a, key.unwrap())
 
-    if declared.len() == 1 then out.push((declared.at(0).name, bare.at(0)))
+    if declared.len() == 1 then out.push((declared[0].name, bare[0]))
 
     out
 end written_bindings
@@ -740,7 +745,7 @@ instantiate_nested(a: &Analysis, base: string, g: &NestedGeneric, solved: Buf[Ty
     var picked: Buf[Type] = buf()
 
     for i in (solved.len() - own)..<solved.len()
-        picked.push(solved.at(i))
+        picked.push(solved[i])
 
     val targs = nameless_all(picked)
     val name = s"${mangled(base, targs)}${tag_of(targs)}"
@@ -754,7 +759,7 @@ instantiate_nested(a: &Analysis, base: string, g: &NestedGeneric, solved: Buf[Ty
     var subst: Buf[Binding] = buf()
 
     for i in 0..<own
-        subst.push(Binding(g.decl.tparams.at(i), targs.at(i)))
+        subst.push(Binding(g.decl.tparams[i], targs[i]))
 
     for b in g.outer
         subst.push(b)
@@ -819,15 +824,15 @@ private self_for(a: &Analysis, home: Scope, f: FuncDecl, targs: Buf[Type]) -> Bu
     var own: Buf[Binding] = buf()
 
     for i in 0..<f.tparams.len()
-        if i < targs.len() then own.push(Binding(f.tparams.at(i), at_declared(a, home, f, f.tparams.at(i),
-                                                                             targs.at(i))))
+        if i < targs.len() then own.push(Binding(f.tparams[i], at_declared(a, home, f, f.tparams[i],
+                                                                             targs[i])))
 
     // **A trait argument the block wrote at one of its own parameters is that parameter here**, at
     // this instantiation's argument: `impl[U] Get[U] for W[U]` binds the trait's `T` to the block's
     // `U`, so an inherited default's `-> T` is a `W[f64]` call's `f64`, not the `U` it stood at.
     if outer.is_some()
         for i in 0..<outer.unwrap().len()
-            val b = fixed_value(outer.unwrap().at(i), opened, f.tparams, targs)
+            val b = fixed_value(outer.unwrap()[i], opened, f.tparams, targs)
 
             subst.push(Binding(b.name, subst_params(a, b.ty, own)))
 
@@ -859,9 +864,9 @@ private fixed_value(b: Binding, opened: Buf[Binding], tparams: Buf[string], targ
     if open.is_none() then return b
 
     for i in 0..<tparams.len()
-        if tparams.at(i) == open.unwrap() && i < targs.len()
-            targs.at(i) match
-                ConstArg(_, _, _) -> return Binding(b.name, targs.at(i))
+        if tparams[i] == open.unwrap() && i < targs.len()
+            targs[i] match
+                ConstArg(_, _, _) -> return Binding(b.name, targs[i])
                 _ -> ()
         end if
 

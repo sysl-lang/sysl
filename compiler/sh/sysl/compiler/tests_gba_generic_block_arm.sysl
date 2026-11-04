@@ -1,0 +1,352 @@
+module sh.sysl.compiler
+@tests
+
+// **A `match` arm written as a block sees the names its pattern binds, in a generic body as anywhere
+// else.** A generic is read once at its definition with its type parameters opaque, and a pattern
+// over a value of a parameter's type -- `v match { Ok(f) -> … }` with `v: V` -- is judged by each
+// instantiation instead. The names it binds are still bound at the definition: a block arm's later
+// statements are each read on their own, so a name the pattern left unbound was reported there as
+// undefined, while an expression arm, read with the pattern, stayed quiet. Each claim is a whole
+// program, built and run.
+
+@test("a block arm over a Result held in a type parameter sees its pattern's names")
+gba_result_block_arm()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        one[V](v: V) -> usize = 1
+
+        two[V](v: V) -> usize
+            v match
+                Ok(f0) ->
+                    val x0 = one(f0)
+                    x0
+                Err(f0) -> one(f0) + 10
+
+        main()
+            val r: Result[int, string] = Ok(3)
+            val e: Result[int, string] = Err("x")
+            print(two(r), two(e))
+        """), "1 11\n")
+end gba_result_block_arm
+
+@test("a block arm whose first statement is a call, not a binding, sees the name too")
+gba_statement_before_value()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        one[V](v: V) -> int = 1
+
+        two[V](v: V) -> int
+            v match
+                Ok(f) ->
+                    one(f)
+                    one(f) + 1
+                Err(_) -> 0
+
+        main()
+            val r: Result[int, string] = Ok(3)
+            print(two(r))
+        """), "2\n")
+end gba_statement_before_value
+
+@test("Some and None block arms over an Option held in a type parameter")
+gba_option_block_arms()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        opt[V](v: V) -> int
+            v match
+                Some(n) ->
+                    val m = n + 1
+                    m * 10
+                None ->
+                    val z = 7
+                    z
+
+        main()
+            print(opt(Some(4)), opt(Option[int].None))
+        """), "50 7\n")
+end gba_option_block_arms
+
+@test("a tuple nested in a variant binds both parts for a block arm")
+gba_nested_tuple()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        nested[V](v: V) -> int
+            v match
+                Some((a, b)) ->
+                    val s = a + b
+                    s
+                None -> 0
+
+        main()
+            print(nested(Some((2, 3))), nested(Option[(int, int)].None))
+        """), "5 0\n")
+end gba_nested_tuple
+
+@test("a variant nested in a variant binds for a block arm, beside a block arm over the other half")
+gba_nested_variant()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        deep[V](v: V) -> int
+            v match
+                Ok(Some(x)) ->
+                    val y = x * 3
+                    y
+                Ok(None) -> -1
+                Err(e) ->
+                    val k = int(e.len)
+                    k
+
+        main()
+            val d1: Result[Option[int], string] = Ok(Some(2))
+            val d2: Result[Option[int], string] = Ok(None)
+            val d3: Result[Option[int], string] = Err("abcd")
+            print(deep(d1), deep(d2), deep(d3))
+        """), "6 -1 4\n")
+end gba_nested_variant
+
+@test("a guarded block arm sees the name in its guard and in its body")
+gba_guarded()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        guarded[V](v: V) -> string
+            v match
+                Some(x) if x > 2 ->
+                    val t = x * 100
+                    s"big $t"
+                Some(x) ->
+                    val t = x
+                    s"small $t"
+                None -> "none"
+
+        main()
+            print(guarded(Some(5)), guarded(Some(1)), guarded(Option[int].None))
+        """), "big 500 small 1 none\n")
+end gba_guarded
+
+@test("an 'is' test over a type parameter's value binds for the block it guards")
+gba_is_block()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        tested[V](v: V) -> int
+            if v is Some(x)
+                val y = x + 5
+                return y
+            0
+
+        main()
+            print(tested(Some(1)), tested(Option[int].None))
+        """), "6 0\n")
+end gba_is_block
+
+@test("a generic method's block arm sees its pattern's names beside self")
+gba_generic_method()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        struct Holder
+            base: int
+
+        impl Holder
+            pick[V](self, v: V) -> int
+                v match
+                    Some(n) ->
+                        val m = n + self.base
+                        m * 2
+                    None -> 0
+
+        main()
+            print(Holder(1).pick(Some(4)), Holder(1).pick(Option[int].None))
+        """), "10 0\n")
+end gba_generic_method
+
+@test("a closure inside a block arm captures the arm's binding")
+gba_closure_captures()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        closed[V](v: V) -> int
+            v match
+                Some(x) ->
+                    val f = (k: int) -> k + x
+                    f(1)
+                None -> 0
+
+        main()
+            print(closed(Some(9)))
+        """), "10\n")
+end gba_closure_captures
+
+@test("a block arm in a generic body over a scrutinee of a concrete type")
+gba_concrete_scrutinee()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        concrete[V](tag: V, o: Option[int]) -> int
+            o match
+                Some(x) ->
+                    val y = x + 1
+                    y
+                None -> 0
+
+        main()
+            print(concrete(1, Some(4)), concrete("t", Option[int].None))
+        """), "5 0\n")
+end gba_concrete_scrutinee
+
+@test("one generic with a block arm, instantiated at two payload types")
+gba_two_instantiations()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        shown[V](v: V) -> string
+            v match
+                Some(x) ->
+                    val t = s"<$x>"
+                    t
+                None -> "-"
+
+        main()
+            print(shown(Some(1)), shown(Some("s")), shown(Option[int].None))
+        """), "<1> <s> -\n")
+end gba_two_instantiations
+
+@test("struct patterns, by name and by position, over a type parameter's value bind for a block arm")
+gba_struct_patterns()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        struct P
+            x: int
+            y: int
+
+        fields[V](v: V) -> int
+            v match
+                P { x, y } ->
+                    val s = x * y
+                    s
+
+        pos[V](v: V) -> int
+            v match
+                P(a, b) ->
+                    val s = a - b
+                    s
+
+        main()
+            print(fields(P(3, 4)), pos(P(9, 2)))
+        """), "12 7\n")
+end gba_struct_patterns
+
+@test("an '@' binding binds both names for a block arm, and a block-armed match over the outer name nests")
+gba_at_binding()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        at_bind[V](v: V) -> int
+            v match
+                w @ Some(x) ->
+                    val y = x + 1
+                    val again = w match
+                        Some(k) ->
+                            val doubled = k * 2
+                            doubled
+                        None -> 0
+                    y + again
+                _ -> 0
+
+        main()
+            print(at_bind(Some(6)), at_bind(Option[int].None))
+        """), "19 0\n")
+end gba_at_binding
+
+@test("val destructuring and a for-loop pattern over a type parameter's value bind for what follows")
+gba_destructure_and_loop()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        destructured[V](v: V) -> int
+            val (a, b) = v
+            val s = a + b
+            s * 2
+
+        looped[V](v: V) -> int
+            var t = 0
+            for (a, b) in v
+                val p = a * b
+                t += p
+            t
+
+        main()
+            val xs = [(2, 3), (4, 5)]
+            print(destructured((3, 4)), looped(xs[..]))
+        """), "14 26\n")
+end gba_destructure_and_loop
+
+@test("a name nothing binds is still undefined in a generic's block arm")
+gba_undefined_still_reported()
+    if !enm_ready() then return
+
+    val said = enm_outcome(raw"""
+        opt[V](v: V) -> int
+            v match
+                Some(n) ->
+                    val m = nope + n
+                    m
+                None -> 0
+
+        main()
+            print(opt(Some(1)))
+        """)
+
+    assert(!said.1, said.0)
+    assert(said.0.contains("undefined name 'nope'"), said.0)
+    assert(!said.0.contains("undefined name 'n'"), said.0)
+end gba_undefined_still_reported
+
+@test("an uninstantiated generic still reports an undefined name in a block arm")
+gba_undefined_uninstantiated()
+    if !enm_ready() then return
+
+    val said = enm_outcome(raw"""
+        opt[V](v: V) -> int
+            v match
+                Some(n) ->
+                    val m = n + 1
+                    val q = nope
+                    m + q
+                None -> 0
+
+        main()
+            print(1)
+        """)
+
+    assert(!said.1, said.0)
+    assert(said.0.contains("undefined name 'nope'"), said.0)
+    assert(!said.0.contains("undefined name 'n'"), said.0)
+end gba_undefined_uninstantiated
+
+@test("a pattern the instantiated type cannot take is refused at the instantiation")
+gba_refused_at_instantiation()
+    if !enm_ready() then return
+
+    val said = enm_outcome(raw"""
+        opt[V](v: V) -> int
+            v match
+                Some(n) ->
+                    val m = n + 1
+                    m
+                _ -> 0
+
+        main()
+            print(opt(5))
+        """)
+
+    assert(!said.1, said.0)
+    assert(said.0.contains("'Some(…)' matches an enum variant or a struct, but the value is int"), said.0)
+end gba_refused_at_instantiation

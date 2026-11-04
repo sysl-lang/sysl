@@ -2322,7 +2322,7 @@ const sorted_gcds(xs: []const int) -> Buf[int]
     sort(out.view())
     out
 
-const LEAST: int = sorted_gcds([12, 18, 27, 36][..]).at(0)
+const LEAST: int = sorted_gcds([12, 18, 27, 36][..])[0]
 
 print(LEAST)
 ```

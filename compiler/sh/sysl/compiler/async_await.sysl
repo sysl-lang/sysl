@@ -37,7 +37,7 @@ end task_type
 
 // The `T` of a `Task[T]`, or nothing where the type is not a task.
 task_result(t: Type) -> Option[Type] = t match
-    Struct(d) -> if d.base == TaskBase && d.targs.len() == 1 then Some(d.targs.at(0)) else None
+    Struct(d) -> if d.base == TaskBase && d.targs.len() == 1 then Some(d.targs[0]) else None
     _ -> None
 
 // `Task[T]` written by a program, where nothing it can see declares a `Task` of its own.
@@ -48,7 +48,7 @@ written_task(a: &Analysis, scope: Scope, span: Span, targs: Buf[Type]) -> Type
         return Unknown
     end if
 
-    task_type(targs.at(0))
+    task_type(targs[0])
 end written_task
 
 // The base a written name is filed under where it names the compiler's `Task` -- the parser's own
@@ -148,7 +148,7 @@ private shadowed_form(cx: &Analyzer, inner: Expr) -> string
 
         if keys.is_empty() then return ""
 
-        val decl = qualified_name(keys.at(0))
+        val decl = qualified_name(keys[0])
         val cut = decl.bytes.len - name.bytes.len
 
         from = if cut > 1 && decl.ends_with(s".$name") then s"'$decl', declared in '${decl[0..<cut - 1]}'"
@@ -200,14 +200,14 @@ task_form_call(cx: &Analyzer, span: Span, name: string, args: Buf[Expr]) -> TExp
         return cx.err(span, s"'block_on' takes one task — the one it runs to its end — but " +
                       supplied(args.len(), "argument"))
 
-    val t = type_expr_bare(cx, args.at(0))
+    val t = type_expr_bare(cx, args[0])
     val ty = texpr_type(t)
 
     if ty == Unknown then return t
 
     task_result(ty) match
         Some(r) -> TExpr(span, TBlockOn(t, r))
-        None -> cx.err(args.at(0).span, s"'block_on' needs a Task, which is what calling an " +
+        None -> cx.err(args[0].span, s"'block_on' needs a Task, which is what calling an " +
                        s"'async' function hands back, but this value is ${type_show(ty)}")
 end task_form_call
 
@@ -217,19 +217,19 @@ private step_call(cx: &Analyzer, span: Span, args: Buf[Expr]) -> TExpr
         return cx.err(span, s"'step' takes the task it resumes and the waker its parks are to call, " +
                       s"but ${supplied(args.len(), "argument")}")
 
-    val t = type_expr_bare(cx, args.at(0))
+    val t = type_expr_bare(cx, args[0])
     val ty = texpr_type(t)
     val wake_ty = waker_type(cx)
-    val w = read_callable(cx, args.at(1), wake_ty)
+    val w = read_callable(cx, args[1], wake_ty)
 
     if ty == Unknown || texpr_type(w) == Unknown then return bad_expr(span)
 
     if task_result(ty).is_none() then
-        return cx.err(args.at(0).span, s"'step' needs a Task, which is what calling an 'async' " +
+        return cx.err(args[0].span, s"'step' needs a Task, which is what calling an 'async' " +
                       s"function hands back, but this value is ${type_show(ty)}")
 
     if !type_eq(texpr_type(w), wake_ty) then
-        return cx.err(args.at(1).span, s"'step' needs the waker as a '&Fn() -> unit', the closure " +
+        return cx.err(args[1].span, s"'step' needs the waker as a '&Fn() -> unit', the closure " +
                       s"a park in the task calls to say the task can run again, but this value is " +
                       type_show(texpr_type(w)))
 
@@ -307,14 +307,14 @@ private park_task(cx: &Analyzer, span: Span, args: Buf[Expr]) -> TExpr
 
     cx.reading_registrar = true
 
-    val r = read_callable(cx, args.at(0), want)
+    val r = read_callable(cx, args[0], want)
 
     cx.reading_registrar = before
 
     if texpr_type(r) == Unknown then return bad_expr(span)
 
     if !type_eq(texpr_type(r), want) then
-        return cx.err(args.at(0).span, s"'park' needs its registrar as a " +
+        return cx.err(args[0].span, s"'park' needs its registrar as a " +
                       s"'${type_show(want)}', which is handed the waker of the task being stepped, " +
                       s"but this value is ${type_show(texpr_type(r))}")
 
@@ -351,10 +351,10 @@ waker_capture_complaint(cx: &Analyzer, inner: Type) -> Option[string]
 
     val p = part.unwrap()
 
-    if p.path.len() != 1 || !holds_waker(cx, p.path.at(0)) then return None
+    if p.path.len() != 1 || !holds_waker(cx, p.path[0]) then return None
 
     Some("a closure shared between two domains may be called from either, so every count it " +
-         s"captures has to be atomic — but the '${p.path.at(0)}' it captures is the waker 'park' " +
+         s"captures has to be atomic — but the '${p.path[0]}' it captures is the waker 'park' " +
          s"handed its registrar, a '${type_show(p.ty)}' belonging to the domain whose executor " +
          "steps the task, and no spelling makes it atomic. Keep the waker in that domain: let the " +
          "other domain — an interrupt, another thread — signal the executor, and have the executor " +

@@ -248,7 +248,7 @@ end join_views
 
 private push_name(into: *Buf[string], name: string)
     for i in 0..<into.len()
-        if into.at(i) == name then return
+        if into[i] == name then return
 
     into.push(name)
 end push_name
@@ -266,7 +266,7 @@ check_escapes(a: &Analysis, p: TProgram) -> Promotions
     var out = no_promotions()
 
     for i in 0..<p.funcs.len()
-        val f = p.funcs.at(i)
+        val f = p.funcs[i]
         val w = walk_body(p, keeps, f.body.stmts, f.body.result, true)
         val home = func_home(a, f.name)
 
@@ -345,7 +345,7 @@ private kept_params(a: &Analysis, p: TProgram) -> &KeptParams
     var index: Map[string, usize] = map_with_capacity(p.funcs.len() * 2)
 
     for i in 0..<p.funcs.len()
-        val name = p.funcs.at(i).name
+        val name = p.funcs[i].name
 
         if !index.has(name) then index.put(name, i)
 
@@ -370,23 +370,23 @@ private settle_summaries(p: TProgram, keeps: &KeptParams)
     var head: usize = 0
 
     while head < queue.len()
-        val fi = queue.at(head)
+        val fi = queue[head]
 
         head += 1
-        queued.set(fi, false)
+        queued[fi] = false
 
-        val f = p.funcs.at(fi)
+        val f = p.funcs[fi]
         var grew = false
 
         keeps.asked.clear()
 
         for j in 0..<f.params.len()
-            if !carries_view(f.params.at(j).1) then continue
+            if !carries_view(f.params[j].1) then continue
             if keeps.pairs.has((fi, j)) then continue
 
             keeps.examined += 1
 
-            if kepts(p, keeps, f, f.params.at(j).0)
+            if kepts(p, keeps, f, f.params[j].0)
                 keeps.pairs.add((fi, j))
                 grew = true
 
@@ -404,8 +404,8 @@ private settle_summaries(p: TProgram, keeps: &KeptParams)
             None -> ()
             Some(list) ->
                 for c in list
-                    if !queued.at(c)
-                        queued.set(c, true)
+                    if !queued[c]
+                        queued[c] = true
                         queue.push(c)
 end settle_summaries
 
@@ -546,8 +546,8 @@ end confined_of
 
 private set_confined(w: &EscapeWalk, name: string, v: EView)
     for i in 0..<w.confined.len()
-        if w.confined.at(i).0 == name
-            w.confined.set(i, (name, v))
+        if w.confined[i].0 == name
+            w.confined[i] = (name, v)
             return
 
     w.confined.push((name, v))
@@ -558,10 +558,10 @@ private view_eq(a: EView, b: EView) -> bool
     if a.named.len() != b.named.len() || a.temps.len() != b.temps.len() then return false
 
     for i in 0..<a.named.len()
-        if a.named.at(i) != b.named.at(i) then return false
+        if a.named[i] != b.named[i] then return false
 
     for i in 0..<a.temps.len()
-        if a.temps.at(i).0 != b.temps.at(i).0 then return false
+        if a.temps[i].0 != b.temps[i].0 then return false
 
     true
 end view_eq
@@ -730,10 +730,10 @@ private escaping_one(p: TProgram, keeps: &KeptParams, w: &EscapeWalk, e: TExpr) 
     // A value placed into a buffer's slot lives as long as the buffer does, which is the store into
     // a place the frame does not own written as a form.
     TSlots(op, args, _, _) ->
-        if op == "slot_place" && args.len() == 3 && views(p, keeps, w, args.at(2)).non_empty()
-            gets_out(p, keeps, w, args.at(2), "is stored somewhere the frame does not own")
-        else if op == "slot_put" && args.len() == 2 && views(p, keeps, w, args.at(1)).non_empty()
-            gets_out(p, keeps, w, args.at(1), "is stored somewhere the frame does not own")
+        if op == "slot_place" && args.len() == 3 && views(p, keeps, w, args[2]).non_empty()
+            gets_out(p, keeps, w, args[2], "is stored somewhere the frame does not own")
+        else if op == "slot_put" && args.len() == 2 && views(p, keeps, w, args[1]).non_empty()
+            gets_out(p, keeps, w, args[1], "is stored somewhere the frame does not own")
 
     // A task driven where its call is written ends before the expression does.
     TAwait(task, _) -> w.driven.push(task.span)
@@ -747,12 +747,12 @@ private escaping_one(p: TProgram, keeps: &KeptParams, w: &EscapeWalk, e: TExpr) 
         val tasked = async_callee(p, keeps, name) && !holds_span(w.driven, e.span)
 
         for i in 0..<args.len()
-            if frames && literal_argument(args.at(i))
-                frame_literal(w, args.at(i), kept_by(p, keeps, name, i) || async_callee(p, keeps, name),
+            if frames && literal_argument(args[i])
+                frame_literal(w, args[i], kept_by(p, keeps, name, i) || async_callee(p, keeps, name),
                               s"is passed to '$name', which holds on to it")
 
-            if views(p, keeps, w, args.at(i)).non_empty() && (kept_by(p, keeps, name, i) || tasked)
-                gets_out(p, keeps, w, args.at(i), s"is passed to '$name', which holds on to it")
+            if views(p, keeps, w, args[i]).non_empty() && (kept_by(p, keeps, name, i) || tasked)
+                gets_out(p, keeps, w, args[i], s"is passed to '$name', which holds on to it")
 
     // Which body a trait object's call reaches is decided at run time, so there is no one summary to
     // consult. **A trait's method borrows its parameters for the call** -- every implementation of one
@@ -768,12 +768,12 @@ private escaping_one(p: TProgram, keeps: &KeptParams, w: &EscapeWalk, e: TExpr) 
         val frames = frames_literals(ty)
 
         for i in 0..<args.len()
-            if frames && literal_argument(args.at(i))
-                frame_literal(w, args.at(i), !borrowed,
+            if frames && literal_argument(args[i])
+                frame_literal(w, args[i], !borrowed,
                               "is passed through a trait object, which may hold on to it")
 
-            if !borrowed && views(p, keeps, w, args.at(i)).non_empty()
-                gets_out(p, keeps, w, args.at(i),
+            if !borrowed && views(p, keeps, w, args[i]).non_empty()
+                gets_out(p, keeps, w, args[i],
                          "is passed through a trait object, which may hold on to it")
 
     // Every literal met is counted, whatever its parent, so that `settled_frames` can tell a span one
@@ -870,7 +870,7 @@ end frame_literal
 // An async function's call makes a task that holds its arguments until it runs, so it keeps them all.
 private async_callee(p: TProgram, keeps: &KeptParams, name: string) -> bool =
     keeps.index.get(name) match
-        Some(id) -> p.funcs.at(id).marks.is_async()
+        Some(id) -> p.funcs[id].marks.is_async()
         None -> false
 
 // Counts every literal under `e` as met, framing none of them.
@@ -1136,10 +1136,10 @@ private container_bytes(p: TProgram, keeps: &KeptParams, w: &EscapeWalk, call: T
             if args.is_empty() || !element_member(name) || !answers_own_bytes(p, keeps, name, 0)
                 return no_view()
 
-            *args.at(0).kind match
+            *args[0].kind match
                 TAddrOf(place, _) -> container_storage(w, place)
                 _ ->
-                    if is_raw_pointer(texpr_type(args.at(0))) then no_view()
+                    if is_raw_pointer(texpr_type(args[0])) then no_view()
                     else unnamed_view(own_bytes_why("a container this body reached"))
         _ -> no_view()
 
@@ -1180,13 +1180,13 @@ private answers_own_bytes(p: TProgram, keeps: &KeptParams, name: string, depth: 
     if depth > 8 then return false
 
     val f = keeps.index.get(name) match
-        Some(id) -> p.funcs.at(id)
+        Some(id) -> p.funcs[id]
         None -> return false
 
     if f.params.is_empty() then return false
 
     f.body.result match
-        Some(last) -> self_answer(p, keeps, f.params.at(0).0, last, depth)
+        Some(last) -> self_answer(p, keeps, f.params[0].0, last, depth)
         None -> false
 end answers_own_bytes
 
@@ -1196,7 +1196,7 @@ private self_answer(p: TProgram, keeps: &KeptParams, me: string, e: TExpr, depth
         TSlice(base, _, _, _, _) ->
             if is_array(texpr_type(base)) then in_self(me, base) else self_answer(p, keeps, me, base, depth)
         TCall(name, args, _, _) ->
-            !args.is_empty() && element_member(name) && passes_self(me, args.at(0)) &&
+            !args.is_empty() && element_member(name) && passes_self(me, args[0]) &&
                 answers_own_bytes(p, keeps, name, depth + 1)
         _ -> false
 
@@ -1539,7 +1539,7 @@ private refuse_borrowed(a: &Analysis, p: TProgram, keeps: &KeptParams)
     var seen: Buf[string] = buf()
 
     for i in 0..<p.vtables.len()
-        val vt = p.vtables.at(i)
+        val vt = p.vtables[i]
 
         if is_call_trait(module_bare(vt.trait_name)) then continue
 
@@ -1548,13 +1548,13 @@ private refuse_borrowed(a: &Analysis, p: TProgram, keeps: &KeptParams)
 
             if id.is_none() then continue
 
-            val f = p.funcs.at(id.unwrap())
+            val f = p.funcs[id.unwrap()]
 
             // The receiver is the object itself, which is a box of its own rather than the caller's.
             for at in 1..<f.params.len()
-                if !carries_view(f.params.at(at).1) || !keeps.holds(slot.target, at) then continue
+                if !carries_view(f.params[at].1) || !keeps.holds(slot.target, at) then continue
 
-                val pname = f.params.at(at).0
+                val pname = f.params[at].0
                 val key = s"${slot.target}|$pname"
 
                 if holds_string(seen, key) then continue

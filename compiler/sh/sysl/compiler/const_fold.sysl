@@ -160,8 +160,8 @@ const_fold(cx: &Analyzer, e: Expr) -> Option[Const] = *e.kind match
     // function's body would.
     Compare(operands, ops) ->
         if operands.len() == 2 && ops.len() == 1 then
-            if reflects(operands.at(0)) || reflects(operands.at(1)) then reflected(cx, e)
-            else const_compare(cx, e, ops.at(0), operands.at(0), operands.at(1))
+            if reflects(operands[0]) || reflects(operands[1]) then reflected(cx, e)
+            else const_compare(cx, e, ops[0], operands[0], operands[1])
         else
             None
 
@@ -399,12 +399,20 @@ private str_binary(op: string, x: string, y: string) -> Option[Const]
     None
 end str_binary
 
-// Floating-point arithmetic is the machine's, done once while compiling.
+// Floating-point arithmetic is the machine's, done once while compiling. **A NaN is unordered**, so
+// every comparison with one is false except `!=`, which is true -- the sign of a difference cannot
+// say so, since "neither less nor greater" reads as equal.
 private float_binary(op: string, x: real, y: real) -> Option[Const]
     if op == "+" then return Some(ConstFloat(x + y))
     if op == "-" then return Some(ConstFloat(x - y))
     if op == "*" then return Some(ConstFloat(x * y))
     if op == "/" then return Some(ConstFloat(x / y))
+
+    if x != x || y != y
+        if op == "!=" then return Some(ConstBool(true))
+
+        return if compared(op, 0).is_some() then Some(ConstBool(false)) else None
+    end if
 
     compared(op, if x < y then -1 else if x > y then 1 else 0)
 end float_binary
@@ -540,7 +548,7 @@ offset_bytes(cx: &Analyzer, span: Span, t: Type, field: string) -> Option[Const]
                 val i = d.field_index(field)
 
                 if i >= 0 && d.c_bit(usize(i)).is_some()
-                    val p = c_bitfield_layout(cx.an.tables.layout, d).places.at(usize(i))
+                    val p = c_bitfield_layout(cx.an.tables.layout, d).places[usize(i)]
 
                     return refuse(cx, span, s"'$shown.$field' is a bitfield — it starts at bit ${p.bit} " +
                         s"of the struct and is ${p.width} bits wide, so it has no byte offset. 'offsetof' " +
@@ -561,7 +569,7 @@ offset_bytes(cx: &Analyzer, span: Span, t: Type, field: string) -> Option[Const]
                 var level = d
 
                 for k in 0..<through.len()
-                    val f = level.fields.at(usize(through.at(k)))
+                    val f = level.fields[usize(through[k])]
                     val here = cx.an.tables.layout.field_offset(level, f.0)
 
                     if here.is_none() then return refuse(cx, span, s"'$shown.$field' occupies no storage, so it has no offset")
@@ -594,7 +602,7 @@ private stored_names(d: &StructType) -> string
 
     for i in 0..<fields.len()
         if i > 0 then out = out + ", "
-        out = out + s"'${fields.at(i)}'"
+        out = out + s"'${fields[i]}'"
 
     out
 end stored_names
@@ -638,7 +646,7 @@ private const_conversion(cx: &Analyzer, e: Expr, callee: Expr, args: Buf[Expr]) 
 
     val written = *callee.kind match
         Ident(n) -> Some(n)
-        Field(receiver, "wrap", _) -> return const_wrap(cx, receiver, args.at(0))
+        Field(receiver, "wrap", _) -> return const_wrap(cx, receiver, args[0])
         _ -> None
 
     if written.is_none() || cx.lookup(written.unwrap()).is_some() then return None
@@ -646,9 +654,9 @@ private const_conversion(cx: &Analyzer, e: Expr, callee: Expr, args: Buf[Expr]) 
     val name = written.unwrap()
     val target = scalar_named(name, word_bits(cx)).or_else(() -> width_of(cx, name))
 
-    if target.is_none() then return made_new_const(cx, callee, args.at(0))
+    if target.is_none() then return made_new_const(cx, callee, args[0])
 
-    val value = const_fold(cx, args.at(0))
+    val value = const_fold(cx, args[0])
 
     if value.is_none() then return None
 
@@ -810,8 +818,8 @@ private compared_note(cx: &Analyzer, cond: Expr) -> string
     *cond.kind match
         Compare(operands, ops) ->
             if operands.len() == 2 && ops.len() == 1
-                left = folded_side(cx, operands.at(0))
-                right = folded_side(cx, operands.at(1))
+                left = folded_side(cx, operands[0])
+                right = folded_side(cx, operands[1])
         _ -> ()
 
     if left.is_some() && right.is_some() then
@@ -928,9 +936,9 @@ private awaits_instantiation(cx: &Analyzer, e: Expr) -> bool = *e.kind match
     Unary(_, operand) -> awaits_instantiation(cx, operand)
     Binary(_, l, r) -> awaits_instantiation(cx, l) || awaits_instantiation(cx, r)
     Compare(operands, _) ->
-        operands.len() == 2 && (awaits_instantiation(cx, operands.at(0)) ||
-                                awaits_instantiation(cx, operands.at(1)))
-    Call(callee, args) -> args.len() == 1 && is_bare_name(callee) && awaits_instantiation(cx, args.at(0))
+        operands.len() == 2 && (awaits_instantiation(cx, operands[0]) ||
+                                awaits_instantiation(cx, operands[1]))
+    Call(callee, args) -> args.len() == 1 && is_bare_name(callee) && awaits_instantiation(cx, args[0])
     // A choice waits where what it tests, or what a branch comes to, does.
     IfExpr(cond, then_body, else_body, _) ->
         awaits_instantiation(cx, cond) || branch_awaits(cx, then_body) ||
@@ -1003,15 +1011,15 @@ const_fold_typed(t: TExpr, m: FoldMachine) -> Option[Const]
             None -> typed_binary(op, l, r, m)
         TLogical(op, l, r) -> typed_binary(op, l, r, m)
         TCompare(operands, cmps) ->
-            if operands.len() == 2 && cmps.len() == 1 && cmps.at(0).dispatch.is_none() then
-                typed_binary(cmps.at(0).op, operands.at(0), operands.at(1), m)
+            if operands.len() == 2 && cmps.len() == 1 && cmps[0].dispatch.is_none() then
+                typed_binary(cmps[0].op, operands[0], operands[1], m)
             else
                 None
         TCast(inner, _) -> typed_conversion(inner, ty.unwrap(), m)
         TIntOp(op, operand, None, width, _) -> typed_byte_order(op, operand, width, m)
         TCall(name, args, _, false) ->
             if float_bits_routine(name) && args.len() == 1 then
-                const_fold_typed(args.at(0), m).and_then(c -> float_bits_folded(name, c))
+                const_fold_typed(args[0], m).and_then(c -> float_bits_folded(name, c))
             else
                 None
         _ -> None
@@ -1144,7 +1152,7 @@ int_op_value(op: string, n: BigInt, bits: int, signed: bool, amount: Option[BigI
             var reversed: Buf[bool] = buf()
 
             for i in 0..<low_first.len()
-                reversed.push(low_first.at(low_first.len() - 1 - i))
+                reversed.push(low_first[low_first.len() - 1 - i])
 
             Some(bits_value(reversed, signed))
         "rotate_left" -> Some(bits_value(rotated(low_first, amount.unwrap_or(zero), true), signed))
@@ -1168,7 +1176,7 @@ private run_of(low_first: Buf[bool], want: bool, from_top: bool) -> usize
     var n: usize = 0
 
     while n < w
-        val b = if from_top then low_first.at(w - 1 - n) else low_first.at(n)
+        val b = if from_top then low_first[w - 1 - n] else low_first[n]
 
         if b != want then break
 
@@ -1191,7 +1199,7 @@ private rotated(low_first: Buf[bool], by: BigInt, left: bool) -> Buf[bool]
         // The bit landing at `i` came from `k` places below it when moving left, above it otherwise.
         val from = if left then (i + w - k) % w else (i + k) % w
 
-        out.push(low_first.at(from))
+        out.push(low_first[from])
 
     out
 end rotated
@@ -1202,7 +1210,7 @@ private bits_value(low_first: Buf[bool], signed: bool) -> BigInt
     val w = low_first.len()
 
     for i in 0..<w
-        out = add(mul(out, from_int(2)), from_int(if low_first.at(w - 1 - i) then 1 else 0))
+        out = add(mul(out, from_int(2)), from_int(if low_first[w - 1 - i] then 1 else 0))
 
     wrap(out, int(w), signed)
 end bits_value
@@ -1662,9 +1670,9 @@ private instantiation_note(cx: &Analyzer) -> string
 
     for i in 0..<sorted.len()
         for item in cx.subst
-            if item.name == sorted.at(i)
+            if item.name == sorted[i]
                 out = out + (if i > 0 then ", " else "") +
-                      s"${sorted.at(i)} = ${type_show(item.ty)}"
+                      s"${sorted[i]} = ${type_show(item.ty)}"
 
     out
 end instantiation_note

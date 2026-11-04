@@ -38,21 +38,36 @@ const MaxCallableParams: usize = 4
 // **What a bound fixes is not part of its key.** The key names the trait a table files an `impl`
 // under, and `Seq[Item = int]` is implemented by exactly the blocks implementing `Seq`; the fixed
 // types narrow which of those types meet the bound, which `satisfies` asks separately.
+//
+// **`bounded` is what the bound asks of an associated type it leaves open** (`[S: Seq[Item: Render]]`),
+// one entry per trait asked, so `Item: Render + Eq` is two. `Self` inside each is the stand-in
+// `AssocSelf`, which `assoc_bound_at` puts the associated type itself in place of -- a bound asks
+// something of what it is written on, and `Item: Add` asks for an `Add` of the item, not of `S`.
+// Like `assocs`, it is not part of the key.
 struct Bound
     name: string
     args: Buf[Type]
     assocs: Buf[(string, Type)]
+    bounded: Buf[(string, Bound)]
 
     // The spelling a table keys on -- the module-qualified name with its arguments.
     key(self) -> string = qualified(self.name, self.args)
 
     // The spelling a diagnostic quotes, which shows a module with dots rather than the separator.
-    show(self) -> string = if self.assocs.is_empty() then qualified(module_show(self.name), self.args)
-                           else bound_text(self.name, self.args, self.assocs)
+    show(self) -> string = if self.assocs.is_empty() && self.bounded.is_empty() then
+                               qualified(module_show(self.name), self.args)
+                           else bound_text_with(self.name, self.args, self.assocs, self.bounded)
 end Bound
 
 // A bound with nothing fixed by name -- what every bound the compiler makes for itself is.
-plain_bound(name: string, args: Buf[Type]) -> Bound = Bound(name, args, buf())
+plain_bound(name: string, args: Buf[Type]) -> Bound = Bound(name, args, buf(), buf())
+
+// A bound with what it fixes by name and nothing it asks of an associated type left open.
+fixing_bound(name: string, args: Buf[Type], assocs: Buf[(string, Type)]) -> Bound =
+    Bound(name, args, assocs, buf())
+
+// The name `Self` stands under in a bound on an associated type until the associated type is known.
+const AssocSelf: string = "$assoc"
 
 // One variant of an enum: its name, the tag it is stored as, what it carries, and whether it
 // carries anything at all.
@@ -123,7 +138,7 @@ struct StructType
     // Where a field sits in the declaration, or -1 where there is no such field.
     field_index(self, field: string) -> int
         for i in 0..<self.fields.len()
-            if self.fields.at(i).0 == field then return int(i)
+            if self.fields[i].0 == field then return int(i)
 
         -1
     end field_index
@@ -175,7 +190,7 @@ struct EnumType
     // becomes a default by accident.
     zero_variant(self) -> Option[usize]
         for i in 0..<self.variants.len()
-            val v = self.variants.at(i)
+            val v = self.variants[i]
 
             if v.written && !v.carries && v.tag.is_zero() then return Some(i)
 
@@ -423,7 +438,7 @@ field_slot(fields: Buf[(string, Type)], i: usize) -> usize
     var n: usize = 0
 
     for j in 0..<i
-        if !zero_sized(fields.at(j).1) then n += 1
+        if !zero_sized(fields[j].1) then n += 1
 
     n
 end field_slot
@@ -555,7 +570,7 @@ types_eq(xs: Buf[Type], ys: Buf[Type]) -> bool
     if xs.len() != ys.len() then return false
 
     for i in 0..<xs.len()
-        if !type_eq(xs.at(i), ys.at(i)) then return false
+        if !type_eq(xs[i], ys[i]) then return false
 
     true
 end types_eq
@@ -564,8 +579,8 @@ private assocs_eq(xs: Buf[(string, Type)], ys: Buf[(string, Type)]) -> bool
     if xs.len() != ys.len() then return false
 
     for i in 0..<xs.len()
-        if xs.at(i).0 != ys.at(i).0 then return false
-        if !type_eq(xs.at(i).1, ys.at(i).1) then return false
+        if xs[i].0 != ys[i].0 then return false
+        if !type_eq(xs[i].1, ys[i].1) then return false
 
     true
 end assocs_eq

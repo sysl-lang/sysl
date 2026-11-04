@@ -186,7 +186,7 @@ gen_cond(e: *Emit, terms: Buf[TCondTerm], success_l: string, fail_l: string) -> 
 
     for i in 0..<terms.len()
         val last = i == terms.len() - 1
-        val term = terms.at(i)
+        val term = terms[i]
 
         // The block a term hands control to when it holds: the branch's own entry for the last term,
         // and otherwise a label named after what happens there -- a binding is established in it, so
@@ -215,10 +215,10 @@ gen_cond(e: *Emit, terms: Buf[TCondTerm], success_l: string, fail_l: string) -> 
             TCondIs(subject, pats, negated) ->
                 val sv = gen_expr(e, subject)
 
-                var held = pattern_test(e, pats.at(0), sv)
+                var held = pattern_test(e, pats[0], sv)
 
                 for k in 1..<pats.len()
-                    held = or_i1(e, held, pattern_test(e, pats.at(k), sv))
+                    held = or_i1(e, held, pattern_test(e, pats[k], sv))
 
                 val ok = if negated then not_i1(e, held) else held
 
@@ -226,10 +226,10 @@ gen_cond(e: *Emit, terms: Buf[TCondTerm], success_l: string, fail_l: string) -> 
                 // before the bindings open a region of their own, which the arms manage separately.
                 pop_owned(e)
 
-                // A negated test binds nothing, and neither does a list of alternatives -- the
-                // analyzer refused a pattern that tried in either position -- so both close their
-                // region here and leave the failure target where it was.
-                if negated || pats.len() != 1 || !binds_any(pats.at(0))
+                // A negated test binds nothing -- the analyzer refused a pattern that tried -- and
+                // neither does a list of alternatives none of which names anything, so both close
+                // their region here and leave the failure target where it was.
+                if !binding_term(term)
                     pop_temps(e)
                     emit_term(e, InCondBr(ok, next_l, target))
                     emit_label(e, next_l)
@@ -251,7 +251,7 @@ gen_cond(e: *Emit, terms: Buf[TCondTerm], success_l: string, fail_l: string) -> 
                     emit_term(e, InCondBr(ok, next_l, on_fail))
                     emit_label(e, next_l)
                     push_owned(e)
-                    pattern_bind(e, pats.at(0), sv)
+                    bind_alternatives(e, pats, sv)
 
                     scopes += 1
 
@@ -272,10 +272,10 @@ gen_cond(e: *Emit, terms: Buf[TCondTerm], success_l: string, fail_l: string) -> 
     CondPaths(scopes, cleanups)
 end gen_cond
 
-// Whether a term is the one shape that establishes a binding: a single pattern, not negated, with a
-// name in it.
+// Whether a term is the one shape that establishes a binding: a test, not negated, with a name in
+// its pattern -- in every alternative, where there are several, the analyzer having seen to that.
 private binding_term(t: TCondTerm) -> bool = t match
-    TCondIs(_, pats, negated) -> !negated && pats.len() == 1 && binds_any(pats.at(0))
+    TCondIs(_, pats, negated) -> !negated && binds_any(pats[0])
     _ -> false
 
 // -- the loops ------------------------------------------------------------------------------------
@@ -830,11 +830,11 @@ gen_stmts_with(e: *Emit, xs: Buf[TStmt], lasts: Buf[Set[string]], dying: Buf[Set
     val none: Set[string] = set()
 
     for i in 0..<xs.len()
-        val item = xs.at(i)
+        val item = xs[i]
 
         nowrap_before(e, item)
-        e.moves.last_uses = if i < lasts.len() then lasts.at(i) else none
-        e.moves.dying = if i < dying.len() then dying_for_stmt(item, dying.at(i)) else none
+        e.moves.last_uses = if i < lasts.len() then lasts[i] else none
+        e.moves.dying = if i < dying.len() then dying_for_stmt(item, dying[i]) else none
         gen_stmt(e, item)
         e.moves.dying = none
         nowrap_after(e, item)

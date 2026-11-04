@@ -35,8 +35,8 @@ pattern_test(e: *Emit, p: TPattern, value: Val) -> Val = p match
         var acc: Val = VBool(true)
 
         for i in 0..<args.len()
-            if refutable(args.at(i))
-                acc = and_i1(e, acc, pattern_test(e, args.at(i), struct_field(e, decl, value, i)))
+            if refutable(args[i])
+                acc = and_i1(e, acc, pattern_test(e, args[i], struct_field(e, decl, value, i)))
 
         acc
 
@@ -69,8 +69,8 @@ private variant_test(e: *Emit, enum_ty: Type, variant: EnumVariant, args: Buf[TP
     var inner: Val = VBool(true)
 
     for i in 0..<args.len()
-        if refutable(args.at(i))
-            inner = and_i1(e, inner, pattern_test(e, args.at(i),
+        if refutable(args[i])
+            inner = and_i1(e, inner, pattern_test(e, args[i],
                                                   payload_field(e, d, variant, payload, i)))
 
     emit(e, InStore(l_i1(), inner, answer, AccPlain, None))
@@ -127,20 +127,20 @@ pattern_bind(e: *Emit, p: TPattern, value: Val) -> unit = p match
                     val payload = enum_payload(e, d, variant, value)
 
                     for i in 0..<args.len()
-                        pattern_bind(e, args.at(i), payload_field(e, d, variant, payload, i))
+                        pattern_bind(e, args[i], payload_field(e, d, variant, payload, i))
                 None -> gap_here(e, "a variant binding on something that is not an enum")
 
     TStructPattern(decl, args) ->
         for i in 0..<args.len()
-            if binds_any(args.at(i))
-                pattern_bind(e, args.at(i), struct_field(e, decl, value, i))
+            if binds_any(args[i])
+                pattern_bind(e, args[i], struct_field(e, decl, value, i))
 
     _ -> ()
 
 // One field of a variant's payload, or nothing where the field is zero-sized -- the same skipping
 // the layout does, seen from the reading side.
 private payload_field(e: *Emit, d: &EnumType, v: EnumVariant, payload: Val, i: usize) -> Val
-    if zero_sized(v.fields.at(i).1) then return VNothing
+    if zero_sized(v.fields[i].1) then return VNothing
 
     val fv = fresh_reg(e)
 
@@ -151,7 +151,7 @@ end payload_field
 // One field of a struct being destructured -- a bit range of the container where the struct is a
 // bitfield struct, and a slot of the aggregate otherwise.
 private struct_field(e: *Emit, d: &StructType, value: Val, i: usize) -> Val
-    if zero_sized(d.fields.at(i).1) then return VNothing
+    if zero_sized(d.fields[i].1) then return VNothing
 
     // A C bitfield is read out of its unit, the value given a slot to read it from. An unnamed one
     // only ever meets the `_` standing in for it, which reads nothing.
@@ -163,12 +163,12 @@ private struct_field(e: *Emit, d: &StructType, value: Val, i: usize) -> Val
             val c = fresh_reg(e)
 
             emit(e, InExtract(c, struct_lty(d), value, index_list(0)))
-            read_bits(e, ranges, ranges.at(d.slot(i)), reordered(e, container_reversal(d, e.target.little_endian()), c))
+            read_bits(e, ranges, ranges[d.slot(i)], reordered(e, container_reversal(d, e.target.little_endian()), c))
         None ->
             val fv = fresh_reg(e)
 
             emit(e, InExtract(fv, struct_lty(d), value, index_list(struct_field_index(e.layout, d, d.slot(i)))))
-            reordered(e, reversed_width(d, d.fields.at(i).1, e.target.little_endian()), fv)
+            reordered(e, reversed_width(d, d.fields[i].1, e.target.little_endian()), fv)
 end struct_field
 
 // Whether a pattern introduces a name.
@@ -282,7 +282,7 @@ private rebuilds(arm: TArm, sty: Type) -> bool
         TEnumNew(enum_ty, variant, args) ->
             if enum_ty != sty then return false
 
-            arm.patterns.at(0) match
+            arm.patterns[0] match
                 // The pattern's enum is the scrutinee's: `Ok(s) -> Ok(s)` between two `Result`s of
                 // different error types builds a value of another layout.
                 TVariantPattern(pt, pv, pargs) ->
@@ -291,11 +291,11 @@ private rebuilds(arm: TArm, sty: Type) -> bool
                         return false
 
                     for i in 0..<args.len()
-                        val bound = pargs.at(i) match
+                        val bound = pargs[i] match
                             TBindPattern(n, _) -> n
                             _ -> return false
 
-                        *args.at(i).kind match
+                        *args[i].kind match
                             TLoad(n, _) -> if n != bound then return false
                             _ -> return false
 
@@ -346,7 +346,7 @@ private tags_only(e: *Emit, arms: Buf[TArm], into: bool) -> bool
     for arm in arms
         if !moves(e, arm, into)
             for j in 0..<arm.patterns.len()
-                if !tag_only(arm.patterns.at(j)) then return false
+                if !tag_only(arm.patterns[j]) then return false
 
     true
 end tags_only
@@ -382,7 +382,7 @@ moved_payload(e: *Emit, arm: TArm) -> Option[Moved]
             _ -> return None
         _ -> return None
 
-    arm.patterns.at(0) match
+    arm.patterns[0] match
         TVariantPattern(enum_ty, variant, args) ->
             val d = enum_decl(enum_ty) match
                 Some(found) -> found
@@ -393,7 +393,7 @@ moved_payload(e: *Emit, arm: TArm) -> Option[Moved]
             var named: Option[usize] = None
 
             for i in 0..<args.len()
-                args.at(i) match
+                args[i] match
                     TBindPattern(n, _) ->
                         if n != x || named.is_some() then return None
 
@@ -405,7 +405,7 @@ moved_payload(e: *Emit, arm: TArm) -> Option[Moved]
 
             val i = named.unwrap()
 
-            if !e.layout.indirect(variant.fields.at(i).1) then return None
+            if !e.layout.indirect(variant.fields[i].1) then return None
 
             Some(Moved(d, variant, i, boxed_as))
         _ -> None
@@ -449,8 +449,8 @@ private tag_switch(arms: Buf[TArm]) -> Option[TagDispatch]
     for item in arms
         if item.guard.is_some() then return None
 
-    val last = arms.at(arms.len() - 1)
-    val catch_all = if last.patterns.len() == 1 && !refutable(last.patterns.at(0)) then Some(last)
+    val last = arms[arms.len() - 1]
+    val catch_all = if last.patterns.len() == 1 && !refutable(last.patterns[0]) then Some(last)
     else None
 
     val tagged_n = if catch_all.is_some() then arms.len() - 1 else arms.len()
@@ -462,7 +462,7 @@ private tag_switch(arms: Buf[TArm]) -> Option[TagDispatch]
     var out: Buf[(TArm, Buf[BigInt])] = buf()
 
     for i in 0..<tagged_n
-        val arm = arms.at(i)
+        val arm = arms[i]
         var tags: Buf[BigInt] = buf()
 
         for item in arm.patterns
@@ -474,7 +474,7 @@ private tag_switch(arms: Buf[TArm]) -> Option[TagDispatch]
             else if en.unwrap() != v.0 then return None
 
             for k in 0..<seen.len()
-                if seen.at(k) == v.1 then return None
+                if seen[k] == v.1 then return None
 
             seen.push(v.1)
             tags.push(v.1)
@@ -515,16 +515,16 @@ private gen_tag_switch(e: *Emit, d: TagDispatch, sv: Val, at: Option[Val], ty: T
     var table: Buf[(BigInt, string)] = buf()
 
     for i in 0..<d.arms.len()
-        val tags = d.arms.at(i).1
+        val tags = d.arms[i].1
 
         for item in tags
-            table.push((item, arm_ls.at(i)))
+            table.push((item, arm_ls[i]))
 
     emit_term(e, InSwitch(enum_tag_lty(d.en, e.word_bits), tag_val, none_l, table))
 
     for i in 0..<d.arms.len()
-        emit_label(e, arm_ls.at(i))
-        gen_arm_body(e, d.arms.at(i).0, sv, at, ty, slot, end_l)
+        emit_label(e, arm_ls[i])
+        gen_arm_body(e, d.arms[i].0, sv, at, ty, slot, end_l)
 
     d.catch_all match
         Some(arm) ->
@@ -566,8 +566,54 @@ private every_variant(d: TagDispatch) -> bool
     true
 end every_variant
 
-// An arm's bindings and body, in the block the branch to it has already opened. Only a single
-// pattern may bind, which is what makes one block serve several tags.
+// The bindings of whichever of an arm's alternatives matched, once the arm has been entered.
+//
+// **Every alternative binds the same locals** (the analyzer refused any that did not), so each one
+// is given a block of its own that writes its part of the value into them, and the blocks meet before
+// the guard and the body. The alternatives are asked again, in order, which is the order the arm's
+// own test asked them in; the last is not asked at all, since the arm was entered. The slots are the
+// same ones, so they are owned once: the first alternative's registration stands for all of them.
+bind_alternatives(e: *Emit, pats: Buf[TPattern], sv: Val)
+    if pats.len() == 1
+        pattern_bind(e, pats[0], sv)
+        return
+
+    var binds = false
+
+    for item in pats
+        if binds_any(item) then binds = true
+
+    if !binds then return
+
+    val join_l = fresh_label(e, "match.bound")
+    var owned_n: usize = 0
+
+    for j in 0..<pats.len()
+        if j + 1 < pats.len()
+            val bind_l = fresh_label(e, "match.alt")
+            val next_l = fresh_label(e, "match.alt")
+
+            emit_term(e, InCondBr(pattern_test(e, pats[j], sv), bind_l, next_l))
+            emit_label(e, bind_l)
+            pattern_bind(e, pats[j], sv)
+            settle_owned(e, j, &owned_n)
+            emit_term(e, InBr(join_l))
+            emit_label(e, next_l)
+        else
+            pattern_bind(e, pats[j], sv)
+            settle_owned(e, j, &owned_n)
+            emit_term(e, InBr(join_l))
+
+    emit_label(e, join_l)
+end bind_alternatives
+
+// Keeps the first alternative's registrations of the slots it owns, and drops a later one's, which
+// name the same slots again.
+private settle_owned(e: *Emit, j: usize, owned_n: *usize)
+    if j == 0 then *owned_n = e.owned_slots.len() else e.owned_slots.truncate(*owned_n)
+
+// An arm's bindings and body, in the block the branch to it has already opened. Its alternatives
+// bind in blocks of their own (`bind_alternatives`), which is what lets one block serve several tags.
 private gen_arm_body(e: *Emit, arm: TArm, sv: Val, at: Option[Val], ty: Type, slot: Merge,
                      end_l: string)
     push_owned(e)
@@ -579,7 +625,7 @@ private gen_arm_body(e: *Emit, arm: TArm, sv: Val, at: Option[Val], ty: Type, sl
     end if
 
     if !payload_move(e, arm, slot, at)
-        if arm.patterns.len() == 1 then pattern_bind(e, arm.patterns.at(0), sv)
+        bind_alternatives(e, arm.patterns, sv)
 
         if no_value(ty) then gen_block_void(e, arm.body)
         else store_merged(e, arm.body, ty, slot)
@@ -602,7 +648,7 @@ private gen_arm_chain(e: *Emit, arms: Buf[TArm], sv: Val, at: Option[Val], ty: T
             gen_string_table(e, arms, i, i + run, sv, at, ty, slot, end_l)
             i += run
         else
-            gen_chain_arm(e, arms.at(i), sv, at, ty, slot, end_l)
+            gen_chain_arm(e, arms[i], sv, at, ty, slot, end_l)
             i += 1
 
     // Fallthrough with no matching arm: a value or enum match is exhaustive, so this point is
@@ -610,17 +656,21 @@ private gen_arm_chain(e: *Emit, arms: Buf[TArm], sv: Val, at: Option[Val], ty: T
     if no_value(ty) then emit_term(e, InBr(end_l)) else emit_term(e, InUnreachable)
 end gen_arm_chain
 
+// Whether any of an arm's alternatives takes the value.
+private arm_test(e: *Emit, pats: Buf[TPattern], sv: Val) -> Val
+    var cond = pattern_test(e, pats[0], sv)
+
+    for j in 1..<pats.len()
+        cond = or_i1(e, cond, pattern_test(e, pats[j], sv))
+
+    cond
+
 // One arm of the chain: its test, its guard where it has one, and its body, ending at the label the
 // next arm is tested under.
 private gen_chain_arm(e: *Emit, arm: TArm, sv: Val, at: Option[Val], ty: Type, slot: Merge,
                       end_l: string)
     val body_l = fresh_label(e, "match.arm")
     val next_l = fresh_label(e, "match.next")
-
-    var pat_cond: Val = pattern_test(e, arm.patterns.at(0), sv)
-
-    for j in 1..<arm.patterns.len()
-        pat_cond = or_i1(e, pat_cond, pattern_test(e, arm.patterns.at(j), sv))
 
     // **An arm's bindings are its own ownership region.** A name bound out of the scrutinee holds a
     // share of what it names, and the arm is where that share goes back -- so the region opens where
@@ -631,36 +681,56 @@ private gen_chain_arm(e: *Emit, arm: TArm, sv: Val, at: Option[Val], ty: Type, s
 
     arm.guard match
         None ->
-            emit_term(e, InCondBr(pat_cond, body_l, next_l))
+            emit_term(e, InCondBr(arm_test(e, arm.patterns, sv), body_l, next_l))
             emit_label(e, body_l)
             push_owned(e)
 
             moved = rebuilt_whole(e, arm, sv, at, ty, slot) || payload_move(e, arm, slot, at)
 
-            if !moved && arm.patterns.len() == 1 then pattern_bind(e, arm.patterns.at(0), sv)
+            if !moved then bind_alternatives(e, arm.patterns, sv)
         Some(g) ->
-            val guard_l = fresh_label(e, "match.guard")
+            // **Where alternatives bind, the guard is asked once for each that matches**, as Rust
+            // asks it: `Rect(w, _) | Rect(_, w) if w > 100` takes `Rect(3, 200)` through its second
+            // alternative after the first one's guard said no. Each attempt binds the arm's one set
+            // of slots, so the first alternative's registration stands for every attempt.
+            val each = arm.patterns.len() > 1 && binds_any(arm.patterns[0])
+            val tries = if each then arm.patterns.len() else 1
+            var owned_n: usize = 0
 
-            emit_term(e, InCondBr(pat_cond, guard_l, next_l))
-            emit_label(e, guard_l)
             push_owned(e)
 
-            if arm.patterns.len() == 1 then pattern_bind(e, arm.patterns.at(0), sv)
+            for j in 0..<tries
+                val guard_l = fresh_label(e, "match.guard")
+                val fail_l = if j + 1 < tries then fresh_label(e, "match.alt") else next_l
+                val test = if each then pattern_test(e, arm.patterns[j], sv)
+                else arm_test(e, arm.patterns, sv)
 
-            push_temps(e)
+                emit_term(e, InCondBr(test, guard_l, fail_l))
+                emit_label(e, guard_l)
 
-            val gv = gen_expr(e, g)
+                if each
+                    pattern_bind(e, arm.patterns[j], sv)
+                    settle_owned(e, j, &owned_n)
+                else
+                    bind_alternatives(e, arm.patterns, sv)
 
-            pop_temps(e)
+                push_temps(e)
 
-            // A guard that fails leaves an arm whose bindings were already made, so they are given
-            // back before falling through to the next one.
-            val unbind_l = fresh_label(e, "match.unbind")
+                val gv = gen_expr(e, g)
 
-            emit_term(e, InCondBr(gv, body_l, unbind_l))
-            emit_label(e, unbind_l)
-            release_owned(e)
-            emit_term(e, InBr(next_l))
+                pop_temps(e)
+
+                // A guard that fails leaves an arm whose bindings were already made, so they are
+                // given back before the next alternative, or the next arm, is tried.
+                val unbind_l = fresh_label(e, "match.unbind")
+
+                emit_term(e, InCondBr(gv, body_l, unbind_l))
+                emit_label(e, unbind_l)
+                release_owned(e)
+                emit_term(e, InBr(fail_l))
+
+                if j + 1 < tries then emit_label(e, fail_l)
+
             emit_label(e, body_l)
 
     if !moved
@@ -702,7 +772,7 @@ pin_string_table_arms(n: Option[usize])
 private string_run(arms: Buf[TArm], from: usize) -> usize
     var n: usize = 0
 
-    while from + n < arms.len() && table_arm(arms.at(from + n))
+    while from + n < arms.len() && table_arm(arms[from + n])
         n += 1
 
     n
@@ -735,7 +805,7 @@ private gen_string_table(e: *Emit, arms: Buf[TArm], from: usize, to: usize, sv: 
     var entries: Buf[(string, usize)] = buf()
 
     for k in from..<to
-        val arm = arms.at(k)
+        val arm = arms[k]
 
         for item in arm.patterns
             entries.push((string_literal(item).unwrap(), k - from))
@@ -771,13 +841,13 @@ private gen_string_table(e: *Emit, arms: Buf[TArm], from: usize, to: usize, sv: 
     var cases: Buf[(BigInt, string)] = buf()
 
     for k in 0..<owners.len()
-        cases.push((from_int(long(k)), arm_ls.at(owners.at(k))))
+        cases.push((from_int(long(k)), arm_ls[owners[k]]))
 
     emit_term(e, InSwitch(word_lty(e), found, next_l, cases))
 
     for k in from..<to
-        emit_label(e, arm_ls.at(k - from))
-        gen_arm_body(e, arms.at(k), sv, at, ty, slot, end_l)
+        emit_label(e, arm_ls[k - from])
+        gen_arm_body(e, arms[k], sv, at, ty, slot, end_l)
 
     emit_label(e, next_l)
 end gen_string_table
@@ -805,7 +875,7 @@ private payload_move(e: *Emit, arm: TArm, slot: Merge, at: Option[Val]) -> bool
         Some(a) -> a
         None -> return false
 
-    val fty = m.variant.fields.at(m.index).1
+    val fty = m.variant.fields[m.index].1
 
     m.boxed_as match
         None ->
@@ -834,7 +904,7 @@ end payload_move
 
 // The moved payload copied from the scrutinee at `src` to `dest`, which takes its own counts.
 private move_payload_into(e: *Emit, m: Moved, src: Val, dest: Val)
-    val fty = m.variant.fields.at(m.index).1
+    val fty = m.variant.fields[m.index].1
     val p = fresh_reg(e)
 
     payload_at(e, m, src, p)

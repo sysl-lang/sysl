@@ -62,7 +62,7 @@ private refuse_library_modules(a: &Analysis, units: Buf[Program])
 
         val at = u.module_name match
             Some(m) -> m.span
-            None -> if u.body.is_empty() then span_zero() else u.body.at(0).span
+            None -> if u.body.is_empty() then span_zero() else u.body[0].span
 
         a.fault(scope, at, s"'$name' is the module every program is compiled against, so " +
                 s"${u.src.name} cannot declare it — its declarations would join the library's " +
@@ -106,9 +106,9 @@ read_decls(a: &Analysis, written: Buf[Program], has_entry_point: bool = true) ->
     refuse_stray_static(a, units, entry)
 
     if entry.is_some()
-        a.tables.entry_src = units.at(entry.unwrap()).src.name
-        a.tables.entry_captures = capturing(units.at(entry.unwrap()).body)
-        refuse_nested_tests(a, units.at(entry.unwrap()), a.tables.entry_captures)
+        a.tables.entry_src = units[entry.unwrap()].src.name
+        a.tables.entry_captures = capturing(units[entry.unwrap()].body)
+        refuse_nested_tests(a, units[entry.unwrap()], a.tables.entry_captures)
 
     hoist_units(a, units)
 
@@ -116,11 +116,11 @@ read_decls(a: &Analysis, written: Buf[Program], has_entry_point: bool = true) ->
 
     for item in units
         scopes.push(scope_of_unit(a, item))
-        note_file_imports(a, item, scopes.at(scopes.len() - 1))
+        note_file_imports(a, item, scopes[scopes.len() - 1])
 
     // Every declaration exists now, so what an `import` claimed a module declares can be looked up.
     for i in 0..<units.len()
-        check_imports(a, scopes.at(i), units.at(i).body)
+        check_imports(a, scopes[i], units[i].body)
 
     // A generic enum's pinned underlying type is refused before any of that, because it is the one
     // mistake in an enum declaration no instantiation would find: a generic enum nothing names is
@@ -131,17 +131,17 @@ read_decls(a: &Analysis, written: Buf[Program], has_entry_point: bool = true) ->
     // applies the declaration: a default on a parameter that is solved is refused, and a written
     // one is read in the order a use would fill it.
     for i in 0..<units.len()
-        check_solved_defaults(a, scopes.at(i), units.at(i).body)
+        check_solved_defaults(a, scopes[i], units[i].body)
 
     // A value parameter's declared type is held to the kinds a type's identity can carry where it
     // is written, so a declaration nothing applies is refused as one that is applied.
     for i in 0..<units.len()
-        check_value_param_types(a, scopes.at(i), units.at(i).body)
+        check_value_param_types(a, scopes[i], units[i].body)
 
     // A trait's `derive` members are held to the signatures of the members they write where the trait
     // is declared, whether or not anything derives it.
     for i in 0..<units.len()
-        check_derive_signatures(a, scopes.at(i), units.at(i).body)
+        check_derive_signatures(a, scopes[i], units[i].body)
 
     check_type_defaults(a)
 
@@ -214,7 +214,7 @@ private check_imports(a: &Analysis, scope: Scope, body: Buf[Stmt])
                 val said = import_refusals(a, scope, item.span, d, &taken)
 
                 for k in 0..<said.len()
-                    a.fault(scope, said.at(k).0, said.at(k).1)
+                    a.fault(scope, said[k].0, said[k].1)
             _ -> ()
 
 // Everything one `import` is refused for, each with the place to point at, and the names it bound
@@ -455,8 +455,8 @@ depends_on_module(a: &Analysis, scope: Scope, to: string, written: Span, importe
     note_capability_ref(a, scope, from, to, span, imported, named)
 
     for i in 0..<a.tables.module_deps.len()
-        if a.tables.module_deps.at(i).0 == from
-            val reached = a.tables.module_deps.at(i).1
+        if a.tables.module_deps[i].0 == from
+            val reached = a.tables.module_deps[i].1
 
             if holds_string(reached, to)
                 if !span.is_empty() then position_edge(a, from, to, scope, span)
@@ -465,7 +465,7 @@ depends_on_module(a: &Analysis, scope: Scope, to: string, written: Span, importe
             var grown = reached
 
             grown.push(to)
-            a.tables.module_deps.set(i, (from, grown))
+            a.tables.module_deps[i] = (from, grown)
             a.tables.module_edges.push(ModuleEdge(from, to, scope, span))
             return
 
@@ -490,9 +490,9 @@ private note_capability_ref(a: &Analysis, scope: Scope, from: string, to: string
 
     a.tables.capability_ref_at.get(terms) match
         Some(i) ->
-            if a.tables.capability_refs.at(i).span.is_empty() && !span.is_empty() then
-                a.tables.capability_refs.set(i, CapabilityRef(from, to, scope, span, needs, scaffolding,
-                                                              imported, named, false))
+            if a.tables.capability_refs[i].span.is_empty() && !span.is_empty() then
+                a.tables.capability_refs[i] = CapabilityRef(from, to, scope, span, needs, scaffolding,
+                                                              imported, named, false)
         None ->
             a.tables.capability_ref_at.put(terms, a.tables.capability_refs.len())
             a.tables.capability_refs.push(CapabilityRef(from, to, scope, span, needs, scaffolding,
@@ -524,10 +524,10 @@ end capability_ref_terms
 // Fills in the position of an edge already recorded, where the first reference to make it had none.
 private position_edge(a: &Analysis, from: string, to: string, scope: Scope, span: Span)
     for i in 0..<a.tables.module_edges.len()
-        val e = a.tables.module_edges.at(i)
+        val e = a.tables.module_edges[i]
 
         if e.from == from && e.to == to
-            if e.span.is_empty() then a.tables.module_edges.set(i, ModuleEdge(from, to, scope, span))
+            if e.span.is_empty() then a.tables.module_edges[i] = ModuleEdge(from, to, scope, span)
             return
 
 // Whether this compilation has any declaration under a key, of any kind.
@@ -668,7 +668,7 @@ ambiguous_offer(name: string, keys: Buf[string]) -> string
     for i in 0..<keys.len()
         if i > 0 then from = from + " and "
 
-        from = from + s"'${module_of(keys.at(i))}.*'"
+        from = from + s"'${module_of(keys[i])}.*'"
 
     s"'$name' is offered by $from — import it selectively, or write the module it comes from"
 end ambiguous_offer
@@ -709,7 +709,7 @@ enums_declaring(a: &Analysis, name: string) -> Buf[string]
                     for item in e.variants
                         index.get(item.name) match
                             Some(keys) ->
-                                if keys.at(keys.len() - 1) != key then keys.push(key)
+                                if keys[keys.len() - 1] != key then keys.push(key)
                             None ->
                                 var keys: Buf[string] = buf()
 
@@ -807,7 +807,7 @@ private read_generic_alias(a: &Analysis, scope: Scope, span: Span, d: TypeDecl)
         val what = if phantom then "a 'new' type, and a 'new' type's" else "an alias, and an alias's"
 
         a.fault(scope, span, s"'${d.name}' is $what parameter stands for one type " +
-                s"— '..${d.tp.packs.at(0)}' would stand for a list of them")
+                s"— '..${d.tp.packs[0]}' would stand for a list of them")
         return
     end if
 
@@ -1124,30 +1124,30 @@ check_crossing_names(a: &Analysis, scope: Scope, span: Span, d: FuncDecl, shown:
     for i in 0..<c.len()
         // A name '@scoped' put here is that annotation's to answer for (`keeps.sysl`'s
         // `check_scoped_names`), so a misspelling is told once, in its own words.
-        if holds_string(d.marks.scoped, c.at(i)) then continue
+        if holds_string(d.marks.scoped, c[i]) then continue
 
         var declared = false
 
         for item in ps
-            if item.name == c.at(i) then declared = true
+            if item.name == c[i] then declared = true
 
         var twice = false
 
         for j in 0..<i
-            if c.at(j) == c.at(i) then twice = true
+            if c[j] == c[i] then twice = true
 
         if !declared
             var listed = ""
 
             for j in 0..<ps.len()
-                listed = if j == 0 then s"'${ps.at(j).name}'" else s"$listed, '${ps.at(j).name}'"
+                listed = if j == 0 then s"'${ps[j].name}'" else s"$listed, '${ps[j].name}'"
 
             val tail = if ps.is_empty() then " — it takes none" else s" — its parameters are $listed"
 
-            a.fault(scope, span, s"'@crossing' names '${c.at(i)}', which is not a parameter of " +
+            a.fault(scope, span, s"'@crossing' names '${c[i]}', which is not a parameter of " +
                     s"'$shown'$tail")
         else if twice
-            a.fault(scope, span, s"'@crossing' names '${c.at(i)}' twice, and a parameter crosses " +
+            a.fault(scope, span, s"'@crossing' names '${c[i]}' twice, and a parameter crosses " +
                     "a boundary once — the second says nothing the first does not")
 end check_crossing_names
 
@@ -1161,21 +1161,21 @@ check_joined_names(a: &Analysis, scope: Scope, span: Span, d: FuncDecl, shown: s
         var declared = false
 
         for item in d.params
-            if item.name == ns.at(i) then declared = true
+            if item.name == ns[i] then declared = true
 
         var twice = false
 
         for j in 0..<i
-            if ns.at(j) == ns.at(i) then twice = true
+            if ns[j] == ns[i] then twice = true
 
         if !declared
-            a.fault(scope, span, s"'@joined' names '${ns.at(i)}', which is not a parameter of '$shown'")
+            a.fault(scope, span, s"'@joined' names '${ns[i]}', which is not a parameter of '$shown'")
         else if twice
-            a.fault(scope, span, s"'@joined' names '${ns.at(i)}' twice — the second says nothing the first does not")
-        else if !holds_string(d.crossing, ns.at(i))
-            a.fault(scope, span, s"'@joined' names '${ns.at(i)}', which '@crossing' does not — a parameter " +
+            a.fault(scope, span, s"'@joined' names '${ns[i]}' twice — the second says nothing the first does not")
+        else if !holds_string(d.crossing, ns[i])
+            a.fault(scope, span, s"'@joined' names '${ns[i]}', which '@crossing' does not — a parameter " +
                     "is held until a join only by the thread it reaches, so one that is joined also crosses: " +
-                    s"'@crossing(${ns.at(i)})'")
+                    s"'@crossing(${ns[i]})'")
     end for
 end check_joined_names
 
@@ -1189,28 +1189,28 @@ private check_keeps_names(a: &Analysis, scope: Scope, span: Span, d: ExternDecl)
         var declared = false
 
         for p in d.params
-            if p.name == k.at(i) then declared = true
+            if p.name == k[i] then declared = true
 
         var twice = false
 
         for j in 0..<i
-            if k.at(j) == k.at(i) then twice = true
+            if k[j] == k[i] then twice = true
 
         if !declared
             var listed = ""
 
             for j in 0..<d.params.len()
-                val p = d.params.at(j).name
+                val p = d.params[j].name
 
                 listed = if j == 0 then s"'$p'" else s"$listed, '$p'"
 
             val tail = if d.params.is_empty() then " — it takes none"
             else s" — its parameters are $listed"
 
-            a.fault(scope, span, s"'@keeps' names '${k.at(i)}', which is not a parameter of " +
+            a.fault(scope, span, s"'@keeps' names '${k[i]}', which is not a parameter of " +
                     s"'${d.name}'$tail")
         else if twice
-            a.fault(scope, span, s"'@keeps' names '${k.at(i)}' twice, and a parameter is kept or it " +
+            a.fault(scope, span, s"'@keeps' names '${k[i]}' twice, and a parameter is kept or it " +
                     "is not — the second says nothing the first does not")
 end check_keeps_names
 
@@ -1233,31 +1233,31 @@ private check_answers_names(a: &Analysis, scope: Scope, span: Span, d: ExternDec
         var declared: Option[Type] = None
 
         for p in resolved
-            if p.0 == k.at(i) then declared = Some(p.1)
+            if p.0 == k[i] then declared = Some(p.1)
 
         var twice = false
 
         for j in 0..<i
-            if k.at(j) == k.at(i) then twice = true
+            if k[j] == k[i] then twice = true
 
         if declared.is_none()
             var listed = ""
 
             for j in 0..<d.params.len()
-                val p = d.params.at(j).name
+                val p = d.params[j].name
 
                 listed = if j == 0 then s"'$p'" else s"$listed, '$p'"
 
             val tail = if d.params.is_empty() then " — it takes none"
             else s" — its parameters are $listed"
 
-            a.fault(scope, span, s"'@answers' names '${k.at(i)}', which is not a parameter of " +
+            a.fault(scope, span, s"'@answers' names '${k[i]}', which is not a parameter of " +
                     s"'${d.name}'$tail")
         else if twice
-            a.fault(scope, span, s"'@answers' names '${k.at(i)}' twice — the second says nothing " +
+            a.fault(scope, span, s"'@answers' names '${k[i]}' twice — the second says nothing " +
                     "the first does not")
         else if !is_pointer_answer(declared.unwrap())
-            a.fault(scope, span, s"'@answers' names '${k.at(i)}', which is " +
+            a.fault(scope, span, s"'@answers' names '${k[i]}', which is " +
                     s"'${type_show(declared.unwrap())}' — an answer points into only what a pointer " +
                     "parameter reaches, so a parameter it names is a pointer")
     end for
@@ -1397,12 +1397,12 @@ private resolve_method(a: &Analysis, scope: Scope, m: MethodDecl, outer: Buf[Bin
         subst.push(item)
 
     for i in 0..<m.tparams.len()
-        val tp = m.tparams.at(i)
+        val tp = m.tparams[i]
 
         if binding_named(m.tvalues, tp).is_some() || holds_string(m.tpacks, tp) then
             subst.push(Binding(tp, stand_in(a, scope, tp, m.tvalues)))
         else
-            val stood = Binding(tp, bounded.at(outer.len() + i).ty)
+            val stood = Binding(tp, bounded[outer.len() + i].ty)
 
             subst.push(stood)
             own.push(stood)
@@ -1458,8 +1458,9 @@ end self_type
 
 // -- what a constant may be --------------------------------------------------------------------
 
-// **A constant is a scalar**, so the three declaration forms that are not one are refused here,
-// which is a step before anything asks how far the type reaches. A transparent subtype is a scalar
+// **A constant is a scalar**, so the declaration forms that are not one are refused here, which is a
+// step before anything asks how far the type reaches. A simple enum is a scalar and passes; a
+// transparent subtype is a scalar
 // and is the one form that goes on to be asked that.
 private check_const_scalars(a: &Analysis)
     for i in 0..<a.tables.consts.len()
@@ -1488,8 +1489,15 @@ private check_const_named(a: &Analysis, v: ValueDecl, span: Span, written: strin
             a.fault(v.scope, span,
                     s"a constant is a scalar, and $written is storage — write '${v.name}' as a " +
                     "'val', which is laid into the object file as constant data")
-        EnumOf(_) -> a.fault(v.scope, span, s"a constant is a scalar, and $written is not — " +
-                             s"'${v.name}'")
+        // **A simple enum is a scalar**: its value is a variant's position, folded as an integer is.
+        // One whose variants carry data is a sum, which is storage.
+        EnumOf(d) ->
+            for variant in d.variants
+                if variant.fields.len() > 0 then
+                    a.fault(v.scope, span, s"a constant is a scalar, and $written carries data in " +
+                            s"'${variant.name}', so it is storage — write '${v.name}' as a 'val', which " +
+                            "is laid into the object file as constant data")
+                    return
         // **A `new` type is a scalar too**: its value is its base's, so `const OUR_IP: Ip =
         // Ip(0x0a00_020f)` is the base constant written through the conversion, folded as the base's
         // would be, and keeps the type at every use.
@@ -1562,7 +1570,7 @@ private check_exposed_types(a: &Analysis)
             EnumOf(d) ->
                 for v in d.variants
                     for k in 0..<v.fields.len()
-                        val f = v.fields.at(k)
+                        val f = v.fields[k]
 
                         check_exposed(a, decl.scope, d.name, d.vis,
                                       s"the '${f.name}' of variant '${v.name}'", f.typ, d.tparams)
@@ -1623,10 +1631,10 @@ private check_exposed_members(a: &Analysis, scope: Scope, owner: string, owner_v
         var skip: Buf[string] = buf()
 
         for j in 0..<tparams.len()
-            skip.push(tparams.at(j))
+            skip.push(tparams[j])
 
         for j in 0..<m.tparams.len()
-            skip.push(m.tparams.at(j))
+            skip.push(m.tparams[j])
 
         check_exposed_signature(a, scope, s"$owner.${m.name}", member_reach(owner_vis, m.vis),
                                 m.params, m.ret_type, m.bounds, skip)
@@ -1648,12 +1656,12 @@ private check_exposed_signature(a: &Analysis, scope: Scope, label: string, vis: 
         val what = s"the bound on '${nb.name}'"
 
         for j in 0..<nb.bounds.len()
-            val b = nb.bounds.at(j)
+            val b = nb.bounds[j]
 
             check_exposed_name(a, scope, label, vis, what, b.name, b.span, skip)
 
             for k in 0..<b.args.len()
-                check_exposed(a, scope, label, vis, what, b.args.at(k), skip)
+                check_exposed(a, scope, label, vis, what, b.args[k], skip)
 end check_exposed_signature
 
 private check_exposed(a: &Analysis, scope: Scope, label: string, vis: Visibility, what: string,
@@ -1830,6 +1838,10 @@ names_in(out: *Buf[(string, Span)], t: TypeRef, skip: Buf[string])
 
             names_in(out, ret, skip)
         AssocArgType(_, inner) -> names_in(out, inner, skip)
+        AssocBoundArgType(_, bounds) ->
+            for b in bounds
+                for arg in b.args
+                    names_in(out, arg, skip)
         KeptParamType(inner) -> names_in(out, inner, skip)
         _ -> ()
 

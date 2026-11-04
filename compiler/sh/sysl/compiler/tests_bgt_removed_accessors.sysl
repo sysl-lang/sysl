@@ -1,0 +1,76 @@
+module sh.sysl.compiler
+@tests
+
+// The sequence containers have no `at` or `set`: an element is `x[i]` and `x[i] = v`, and `get(i)` is
+// the read that answers an `Option`. Asking for a removed member is refused with the replacement named,
+// on each of the five types, and a type of the program's own that has an `at` is not caught by it.
+//
+// Helpers are `tests_aza_rest_param.sysl`'s.
+
+private bgt_read_hint() -> string = "read an element as 'x[i]', or as 'x.get(i)' for an Option"
+
+private bgt_write_hint() -> string = "write an element as 'x[i] = v'"
+
+@test("'at' on a Buf is refused, naming the subscript and 'get'")
+bgt_buf_at()
+    if !aza_ready() then return
+
+    aza_refuses("import sysl.buf.{Buf, buf}\nval b: Buf[int] = buf()\nprint(b.at(0))\n",
+                "type 'Buf' has no method 'at' — " + bgt_read_hint())
+
+@test("'set' on a Buf is refused, naming the subscript assignment")
+bgt_buf_set()
+    if !aza_ready() then return
+
+    aza_refuses("import sysl.buf.{Buf, buf}\nvar b: Buf[int] = buf()\nb.set(0, 1)\n",
+                "type 'Buf' has no method 'set' — " + bgt_write_hint())
+
+@test("'at' and 'set' on a Frozen are refused")
+bgt_frozen()
+    if !aza_ready() then return
+
+    aza_refuses("import sysl.buf.{Buf, buf}\nvar b: Buf[int] = buf()\nb.push(1)\nval f = b.freeze()\nprint(f.at(0))\n",
+                "has no method 'at' — " + bgt_read_hint())
+
+@test("'at' and 'set' on a Deque are refused")
+bgt_deque()
+    if !aza_ready() then return
+
+    aza_refuses("import sysl.container.{Deque, deque}\nvar d: Deque[int] = deque()\nprint(d.at(0))\n",
+                "has no method 'at' — " + bgt_read_hint())
+    aza_refuses("import sysl.container.{Deque, deque}\nvar d: Deque[int] = deque()\nd.set(0, 1)\n",
+                "has no method 'set' — " + bgt_write_hint())
+
+@test("'at' and 'set' on a Ring are refused")
+bgt_ring()
+    if !aza_ready() then return
+
+    aza_refuses("import sysl.container.ring.ring\nvar slots: [4]int = [0; 4]\nvar r = ring(slots[..])\nprint(r.at(0))\n",
+                "has no method 'at' — " + bgt_read_hint())
+    aza_refuses("import sysl.container.ring.ring\nvar slots: [4]int = [0; 4]\nvar r = ring(slots[..])\nr.set(0, 1)\n",
+                "has no method 'set' — " + bgt_write_hint())
+
+@test("'at' and 'set' on an InlineRing are refused")
+bgt_inline_ring()
+    if !aza_ready() then return
+
+    aza_refuses("import sysl.container.ring.inline_ring\nvar r = inline_ring[int, 4]()\nprint(r.at(0))\n",
+                "has no method 'at' — " + bgt_read_hint())
+    aza_refuses("import sysl.container.ring.inline_ring\nvar r = inline_ring[int, 4]()\nr.set(0, 1)\n",
+                "has no method 'set' — " + bgt_write_hint())
+
+@test("a type of the program's own with an 'at' keeps it, and one without keeps the plain complaint")
+bgt_own_types_untouched()
+    if !aza_ready() then return
+
+    twp_prints("struct Grid\n    cells: [2]int\n\n    at(self, i: usize) -> int = self.cells[i]\n\n" +
+               "val g = Grid([7, 8])\nprint(g.at(1))\n", "8\n")
+    aza_refuses("struct Box\n    n: int\n\nval b = Box(1)\nprint(b.at(0))\n", "type 'Box' has no method 'at'")
+
+@test("a subscript on a Buf works where a const is evaluated, read and written")
+bgt_subscript_in_const()
+    if !aza_ready() then return
+
+    twp_prints("import sysl.buf.{Buf, buf}\n\nconst made() -> Buf[int]\n    var b: Buf[int] = buf()\n" +
+               "    b.push(5)\n    b.push(7)\n    b[0] = 6\n    b\n\nconst SECOND: int = made()[1]\n" +
+               "const FIRST: int = made()[0]\n\nprint(FIRST, SECOND)\n", "6 7\n")

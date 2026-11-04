@@ -293,7 +293,7 @@ private flow_jump(w: &FlowWalk, st: &PathState, depth: int, out: bool)
 
     if depth < 0 || usize(depth) >= n then return
 
-    val edges = w.loops.at(n - 1 - usize(depth))
+    val edges = w.loops[n - 1 - usize(depth)]
 
     if out then edges.exits.push(copy_state(st)) else edges.backs.push(copy_state(st))
 end flow_jump
@@ -384,7 +384,7 @@ end flow_piece
 private flow_arm(w: &FlowWalk, subject: TExpr, patterns: Buf[TPattern], matched: bool, st: &PathState)
     if patterns.len() != 1 then return
 
-    for ev in w.arm_events(subject, patterns.at(0), matched)
+    for ev in w.arm_events(subject, patterns[0], matched)
         apply_event(st, ev)
 end flow_arm
 
@@ -392,7 +392,7 @@ end flow_arm
 private flow_if_arms(w: &FlowWalk, cond: Buf[TCondTerm], a: &PathState, b: &PathState)
     if cond.len() != 1 then return
 
-    cond.at(0) match
+    cond[0] match
         TCondIs(subject, patterns, negated) ->
             flow_arm(w, subject, patterns, !negated, a)
             flow_arm(w, subject, patterns, negated, b)
@@ -489,7 +489,7 @@ private in_bounds_clears(w: &FlowWalk, cond: Buf[TCondTerm], block: TBlock, take
                          skipped: &PathState)
     if cond.len() != 1 then return
 
-    val bound = cond.at(0) match
+    val bound = cond[0] match
         TCondTest(e) -> index_bound(w.org, e)
         _ -> None
 
@@ -524,14 +524,14 @@ private index_bound(o: &Origins, e: TExpr) -> Option[(string, BigInt)]
         TCompare(operands, cmps) ->
             if operands.len() != 2 || cmps.len() != 1 then return None
 
-            val op = cmps.at(0).op
+            val op = cmps[0].op
             val below = op == "<" || op == "<="
             val above = op == ">" || op == ">="
 
             if !below && !above then return None
 
-            val index = if below then operands.at(0) else operands.at(1)
-            val limit = constant_of(if below then operands.at(1) else operands.at(0))
+            val index = if below then operands[0] else operands[1]
+            val limit = constant_of(if below then operands[1] else operands[0])
             val key = index_key(o, index)
 
             if key == "?" || limit.is_none() then return None
@@ -747,7 +747,7 @@ private seed_param(o: &Origins, n: string)
     if o.locals.has(n) then return
 
     for j in 0..<o.params.len()
-        if o.params.at(j).0 == n then o.locals.put(n, s"p$j:")
+        if o.params[j].0 == n then o.locals.put(n, s"p$j:")
 end seed_param
 
 // **A local whose address leaves the body's sight points anywhere at all**: whoever holds the
@@ -772,7 +772,7 @@ private handed_address(o: &Origins, benign: &Spans, e: TExpr)
     *e.kind match
         TCall(name, args, _, _) ->
             for k in 0..<args.len()
-                val arg = args.at(k)
+                val arg = args[k]
                 val held = exposed_local(o, arg)
 
                 if held.is_none() then continue
@@ -792,9 +792,9 @@ private loose_address(o: &Origins, benign: &Spans, e: TExpr)
             o.cx.an.closure_refs.get(st.base) match
                 Some(refs) ->
                     for i in 0..<args.len()
-                        if i >= refs.len() || !refs.at(i) then continue
+                        if i >= refs.len() || !refs[i] then continue
 
-                        val held = local_at(o, args.at(i))
+                        val held = local_at(o, args[i])
 
                         if held.is_some() then repoint(o, held.unwrap())
                 None -> ()
@@ -961,7 +961,7 @@ origin_of(o: &Origins, x: TExpr) -> string
                 if item.0 == n then return if ptrish then "" else "-"
 
             for j in 0..<o.params.len()
-                if o.params.at(j).0 == n then return if ptrish then o.locals.get(n).unwrap_or(s"p$j:") else "-"
+                if o.params[j].0 == n then return if ptrish then o.locals.get(n).unwrap_or(s"p$j:") else "-"
 
             o.locals.get(n).unwrap_or(if ptrish then "" else "-")
         TAddrOf(place, _) -> place_loc(o, place)
@@ -977,7 +977,7 @@ origin_of(o: &Origins, x: TExpr) -> string
         TIntLit(_, _) -> "-"
         TNullLit(_) -> "-"
         TCall(name, args, cty, _) -> if ptrish then call_origin(o, name, args, cty) else "-"
-        TSeq(exprs) -> if exprs.is_empty() then "-" else origin_of(o, exprs.at(exprs.len() - 1))
+        TSeq(exprs) -> if exprs.is_empty() then "-" else origin_of(o, exprs[exprs.len() - 1])
         TField(r, _, fty) -> handle_origin(o, r, fty)
         TBlockExpr(b) -> block_origin(o, b)
         TIf(_, then_block, else_block, _) ->
@@ -1047,7 +1047,7 @@ private call_origin(o: &Origins, name: string, args: Buf[TExpr], ty: Type) -> st
     var found = "-"
 
     for k in 0..<args.len()
-        val ak = origin_of(o, args.at(k))
+        val ak = origin_of(o, args[k])
 
         if ak == "-" || !answers_arg(o.cx, name, args, k, ty, true) then continue
 
@@ -1140,14 +1140,14 @@ private index_key(o: &Origins, e: TExpr) -> string
         TIntLit(v, _) -> return s"=$v"
         TLoad(n, _) ->
             for j in 0..<o.params.len()
-                if o.params.at(j).0 == n then return s"#p$j"
+                if o.params[j].0 == n then return s"#p$j"
         TField(r, index, _) ->
             *r.kind match
                 TDeref(x, _) ->
                     *x.kind match
                         TLoad(n, _) ->
                             for j in 0..<o.params.len()
-                                if o.params.at(j).0 == n then return s"#p$j.${field_label(texpr_type(r), index)}"
+                                if o.params[j].0 == n then return s"#p$j.${field_label(texpr_type(r), index)}"
                         _ -> ()
                 _ -> ()
         _ -> ()
@@ -1187,7 +1187,7 @@ private caller_index_keys(o: &Origins, args: Buf[TExpr], loc: string) -> string
         var key = "?"
 
         if k < args.len()
-            val whole = index_key(o, args.at(k))
+            val whole = index_key(o, args[k])
 
             if rest == "" then key = whole
             else if whole.starts_with("#p") && whole.index_of(".").is_none() then key = whole + rest
@@ -1201,7 +1201,7 @@ private caller_index_keys(o: &Origins, args: Buf[TExpr], loc: string) -> string
 end caller_index_keys
 
 private[compiler] field_label(t: Type, index: int) -> string = t match
-    Struct(d) -> if index >= 0 && usize(index) < d.fields.len() then d.fields.at(usize(index)).0 else s"#$index"
+    Struct(d) -> if index >= 0 && usize(index) < d.fields.len() then d.fields[usize(index)].0 else s"#$index"
     _ -> s"#$index"
 
 // The element a buffer's slots are held at (`keeps.sysl`'s `slot_loc`): one nobody can name, and one
@@ -1233,11 +1233,11 @@ translate_loc(o: &Origins, args: Buf[TExpr], callee_loc: string) -> string
         if loc.starts_with(prefix)
             // A buffer read through a pointer (`w.push(v)`, `w: *Buf[T]`) holds its slots where the
             // pointer points: the buffer's place, which the caller names.
-            val slots_through = *args.at(j).kind match
+            val slots_through = *args[j].kind match
                 TDeref(x, _) -> if loc.index_of(SlotsMark).is_some() then Some(x) else None
                 _ -> None
 
-            var base = origin_of(o, slots_through.unwrap_or(args.at(j)))
+            var base = origin_of(o, slots_through.unwrap_or(args[j]))
 
             if base == "-" then return ""
 
@@ -1245,7 +1245,7 @@ translate_loc(o: &Origins, args: Buf[TExpr], callee_loc: string) -> string
             // it handed** -- which it can name again only when that pointer is a local holding one
             // value: one read out of memory may have moved inside the call.
             if base == ""
-                base = *args.at(j).kind match
+                base = *args[j].kind match
                     TLoad(n, _) -> stable_name(o, n)
                     _ -> ""
             end if
@@ -1315,7 +1315,7 @@ answers_arg(cx: &KeepsCx, name: string, args: Buf[TExpr], k: usize, ty: Type, ra
 
         if said.is_some() then return said.unwrap()
 
-        return extern_may_derive(ty, texpr_type(args.at(k)))
+        return extern_may_derive(ty, texpr_type(args[k]))
     end if
 
     if raw then raw_answers_of(cx, name, k) else answers_of(cx, name, k)
@@ -1326,7 +1326,7 @@ end answers_arg
 // can name the parameter of. `None` where `name` is not an `extern`.
 extern_answers(cx: &KeepsCx, name: string, k: usize) -> Option[bool] =
     cx.an.tables.externs.get(name) match
-        Some(d) -> Some(k < d.params.len() && holds_string(d.answers, d.params.at(k).name))
+        Some(d) -> Some(k < d.params.len() && holds_string(d.answers, d.params[k].name))
         None -> None
 
 private extern_may_derive(answer: Type, arg: Type) -> bool

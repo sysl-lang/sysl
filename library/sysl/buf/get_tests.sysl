@@ -1,0 +1,117 @@
+module sysl.buf
+@tests
+
+/** `get` is the read that answers an `Option`: `Some` for an index inside the count, `None` for one
+ * at or past it and for a negative one of a signed type, whatever the width of the index.
+ */
+
+@test("Buf.get answers Some inside the count and None at and past it")
+buf_get_in_and_out_of_range()
+    var b: Buf[int] = buf()
+
+    b.push(10)
+    b.push(20)
+    b.push(30)
+
+    assert_eq(b.get(0), Some(10))
+    assert_eq(b.get(2), Some(30))
+    assert_eq(b.get(3), None)
+    assert_eq(b.get(100), None)
+
+@test("Buf.get on an empty buffer is None")
+buf_get_empty()
+    var b: Buf[int] = buf()
+
+    assert_eq(b.get(0), None)
+
+@test("Buf.get sees the count, not the capacity: a slot past the count is None after a truncate")
+buf_get_respects_count_not_capacity()
+    var b: Buf[int] = buf()
+
+    b.push(1)
+    b.push(2)
+    b.truncate(1)
+
+    assert(b.cap() >= 2)
+    assert_eq(b.get(1), None)
+    assert_eq(b.get(0), Some(1))
+
+@test("Buf.get takes a negative index of any signed width as None")
+buf_get_negative()
+    var b: Buf[int] = buf()
+
+    b.push(7)
+
+    val a: i8 = -1
+    val c: i32 = -1
+    val d: i64 = -9223372036854775807
+    val e: i128 = -1
+
+    assert_eq(b.get(a), None)
+    assert_eq(b.get(c), None)
+    assert_eq(b.get(d), None)
+    assert_eq(b.get(e), None)
+    assert_eq(b.get(i32(0)), Some(7))
+    assert_eq(b.get(i8(0)), Some(7))
+
+@test("Buf.get takes an unsigned index of any width, and one too large for usize is None")
+buf_get_wide_unsigned()
+    var b: Buf[int] = buf()
+
+    b.push(7)
+
+    assert_eq(b.get(u8(0)), Some(7))
+    assert_eq(b.get(u64(0)), Some(7))
+    assert_eq(b.get(u128(0)), Some(7))
+    assert_eq(b.get(u128(1) << 100), None)
+    assert_eq(b.get(u64(18446744073709551615)), None)
+
+@test("Buf.get of an element that is itself a Buf reaches the same buffer")
+buf_get_nested_shares()
+    var outer: Buf[Buf[int]] = buf()
+    var inner: Buf[int] = buf()
+
+    outer.push(inner)
+    outer.get(0).unwrap().push(4)
+
+    assert_eq(inner.len(), 1)
+    assert_eq(inner[0], 4)
+
+@test("a Frozen's get is Some inside the length, None at, past and below it")
+frozen_get()
+    var b: Buf[int] = buf()
+
+    b.push(3)
+    b.push(4)
+
+    val f = b.freeze()
+
+    assert_eq(f.get(0), Some(3))
+    assert_eq(f.get(1), Some(4))
+    assert_eq(f.get(2), None)
+
+    val neg: i64 = -1
+
+    assert_eq(f.get(neg), None)
+
+@test("an empty Frozen's get is None")
+frozen_get_empty()
+    var b: Buf[int] = buf()
+    val f = b.freeze()
+
+    assert_eq(f.get(0), None)
+
+@test("b[i] reads and b[i] = v writes, and a signed index works for both")
+buf_subscript_replaces_at_and_set()
+    var b: Buf[int] = buf()
+
+    b.push(1)
+    b.push(2)
+
+    val i: i32 = 1
+
+    b[i] = 20
+    b[0] += 5
+
+    assert_eq(b[i], 20)
+    assert_eq(b[0], 6)

@@ -152,7 +152,7 @@ private c_alike(pieces: Buf[LType]) -> CShape
     for piece in pieces
         passed.push(ir_param(piece))
 
-    CsRegisters(if pieces.len() == 1 then pieces.at(0) else LStruct(pieces), passed)
+    CsRegisters(if pieces.len() == 1 then pieces[0] else LStruct(pieces), passed)
 end c_alike
 
 private c_one_param(t: LType) -> Buf[IrParam]
@@ -218,13 +218,13 @@ private c_hfa(l: TargetLayout, t: Type, ls: Buf[Type]) -> Option[(LType, int)]
     if ls.is_empty() then return None
 
     for i in 0..<ls.len()
-        if !c_floating(ls.at(i)) then return None
-        if !type_eq(ls.at(i), ls.at(0)) then return None
+        if !c_floating(ls[i]) then return None
+        if !type_eq(ls[i], ls[0]) then return None
 
     var count = int(ls.len())
 
     if c_has_union(t)
-        val each = int(l.size(ls.at(0)))
+        val each = int(l.size(ls[0]))
         val size = int(l.size(t))
 
         if size % each != 0 then return None
@@ -234,10 +234,10 @@ private c_hfa(l: TargetLayout, t: Type, ls: Buf[Type]) -> Option[(LType, int)]
     // **An HFA has no padding**: the members are the whole of it. A zero-width bitfield of a wider
     // type can push the next float to a wider boundary (`{ float f; long long :0; float g; }` is
     // sixteen bytes on AAPCS), and two floats in sixteen bytes travel as integers.
-    if int(l.size(t)) != count * int(l.size(ls.at(0))) then return None
+    if int(l.size(t)) != count * int(l.size(ls[0])) then return None
     if count > 4 then return None
 
-    Some((c_lty(l, ls.at(0)), count))
+    Some((c_lty(l, ls[0]), count))
 end c_hfa
 
 // Whether a union is anywhere in an aggregate's layout -- itself, a field, or an element.
@@ -324,14 +324,14 @@ private c_sysv(l: TargetLayout, t: Type, size: int) -> CShape
     // first piece to a whole register then -- a `float` to a `double`, an integer to an `i64` -- so
     // `{ float f; <padding>; float g; }` is `(double, float)`. Only a padded first eightbyte can be
     // short, which an `@align` or a zero-width bitfield makes.
-    if pieces.len() == 2 && round_up_int(c_piece_bytes(pieces.at(0)), c_piece_bytes(pieces.at(1))) != 8
-        val first = pieces.at(0)
+    if pieces.len() == 2 && round_up_int(c_piece_bytes(pieces[0]), c_piece_bytes(pieces[1])) != 8
+        val first = pieces[0]
         var widened: Buf[LType] = buf()
 
         widened.push(first match
             LFloat(_, _) -> LFloat(64, false)
             _ -> LInt(64))
-        widened.push(pieces.at(1))
+        widened.push(pieces[1])
         return c_alike(widened)
     end if
 
@@ -384,8 +384,8 @@ private c_bits_misaligned(l: TargetLayout, d: &StructType, at: int) -> bool
     for i in 0..<d.fields.len()
         if d.c_bit(i).is_some() then continue
 
-        val f = d.fields.at(i).1
-        val off = at + int(c.places.at(i).unit)
+        val f = d.fields[i].1
+        val off = at + int(c.places[i].unit)
 
         if l.size(f) > 0 && (off % int(l.align(f)) != 0 || c_misaligned(l, f, off)) then return true
 
@@ -417,9 +417,9 @@ private c_floating_chunk(l: TargetLayout, here: Buf[(usize, Type)]) -> LType
 
         if !seen then starts.push(item.0)
 
-    if starts.len() == 1 then return kinds.at(0)
+    if starts.len() == 1 then return kinds[0]
 
-    LVec(int(starts.len()), kinds.at(0))
+    LVec(int(starts.len()), kinds[0])
 end c_floating_chunk
 
 // An integer chunk is named by **the member that starts it**, when that member is all the chunk
@@ -558,10 +558,10 @@ private c_only_scalar(l: TargetLayout, t: Type, size: int) -> Option[Type]
     val ls = c_leaves(l, t, BvDeclared)
 
     if ls.len() != 1 then return None
-    if int(ls.at(0).0) != 0 then return None
-    if int(l.size(ls.at(0).1)) != size then return None
+    if int(ls[0].0) != 0 then return None
+    if int(l.size(ls[0].1)) != size then return None
 
-    Some(ls.at(0).1)
+    Some(ls[0].1)
 end c_only_scalar
 
 // -- the members an aggregate is made of ------------------------------------------------------------
@@ -669,8 +669,8 @@ private c_walk_bits(l: TargetLayout, d: &StructType, at: usize, acc: *Buf[(usize
     val c = c_bitfield_layout(l, d)
 
     for i in 0..<d.fields.len()
-        val p = c.places.at(i)
-        val f = d.fields.at(i)
+        val p = c.places[i]
+        val f = d.fields[i]
 
         d.c_bit(i) match
             None -> if l.size(f.1) > 0 then c_walk(l, f.1, at + p.unit, acc, view)
@@ -705,11 +705,11 @@ private c_bit_reach(l: TargetLayout, t: Type, at: int, acc: *Buf[(int, int)])
             val c = c_bitfield_layout(l, d)
 
             for i in 0..<d.fields.len()
-                val p = c.places.at(i)
+                val p = c.places[i]
 
                 d.c_bit(i) match
                     Some(b) -> acc.push((at + p.bit, at + p.bit + int(l.size(b.storage)) * 8))
-                    None -> c_bit_reach(l, d.fields.at(i).1, at + int(p.unit) * 8, acc)
+                    None -> c_bit_reach(l, d.fields[i].1, at + int(p.unit) * 8, acc)
         Struct(d) ->
             if bitfield_ranges(d).is_some() then return
 
@@ -750,7 +750,7 @@ private c_zero_blocks(l: TargetLayout, t: Type, seen: *int) -> bool
             var zeros = 0
 
             for i in 0..<d.fields.len()
-                val f = d.fields.at(i).1
+                val f = d.fields[i].1
 
                 d.c_bit(i) match
                     Some(b) ->

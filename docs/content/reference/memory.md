@@ -839,7 +839,7 @@ for `get`, and the stored key each probe compares it with, are read and never co
   not asked even that: whatever it, or C calling back, releases on the way out, no frame holding the
   uncounted value ever runs again;
 - a call that may write memory is judged by **the type of what it writes**: a field read through a
-  pointer, `vm.stack` with `vm: *Machine`, is handed to `vm.stack.push(vm.stack.at(i))` with no count
+  pointer, `vm.stack` with `vm: *Machine`, is handed to `vm.stack.push(vm.stack[i])` with no count
   of its own, since growing a `Buf[Value]` writes the buffer's storage and lets go of an array of
   `Value`s, neither of which can hold a `Machine`;
 - an `await` keeps it too, since another task may run there and write the storage;

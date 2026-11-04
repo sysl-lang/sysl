@@ -53,16 +53,16 @@ private shown(text: string, name: string) -> string
     val library = library_trees()
 
     for i in 0..<library.len()
-        units.push(library.at(i))
+        units.push(library[i])
 
     units.push(parsed.program)
 
     val done = analyze_bodies(units, host_target())
 
     for i in 0..<done.funcs.len()
-        if done.funcs.at(i).name == name then return show_typed_func(done.funcs.at(i))
+        if done.funcs[i].name == name then return show_typed_func(done.funcs[i])
 
-    if !done.reported.is_empty() then return done.reported.at(0).diag.message
+    if !done.reported.is_empty() then return done.reported[0].diag.message
 
     s"no function named '$name'"
 end shown
@@ -81,16 +81,16 @@ private complaints(text: string) -> Buf[string]
     val library = library_trees()
 
     for i in 0..<library.len()
-        units.push(library.at(i))
+        units.push(library[i])
 
     units.push(parsed.program)
 
     val done = analyze_bodies(units, host_target())
 
     for i in 0..<done.reported.len()
-        val where = done.reported.at(i).src.name
+        val where = done.reported[i].src.name
 
-        if !where.starts_with("library/") then out.push(done.reported.at(i).diag.message)
+        if !where.starts_with("library/") then out.push(done.reported[i].diag.message)
 
     out
 end complaints
@@ -106,14 +106,14 @@ private emits(text: string, name: string) -> bool
     val library = library_trees()
 
     for i in 0..<library.len()
-        units.push(library.at(i))
+        units.push(library[i])
 
     units.push(parsed.program)
 
     val done = analyze_bodies(units, host_target())
 
     for i in 0..<done.funcs.len()
-        if done.funcs.at(i).name == name then return true
+        if done.funcs[i].name == name then return true
 
     false
 end emits
@@ -123,14 +123,14 @@ private listed(xs: Buf[string]) -> string
     var out = ""
 
     for i in 0..<xs.len()
-        out = s"$out${if i > 0 then " | " else ""}${xs.at(i)}"
+        out = s"$out${if i > 0 then " | " else ""}${xs[i]}"
 
     out
 end listed
 
 private says(xs: Buf[string], message: string) -> bool
     for i in 0..<xs.len()
-        if xs.at(i) == message then return true
+        if xs[i] == message then return true
 
     false
 end says
@@ -163,14 +163,23 @@ greater_is_lt_swapped()
     assert(out.contains("swap: true"), out)
     assert(out.contains("negate: false"), out)
 
-@test("and '<=' is that type's 'lt' negated")
+// No ordering is a negation, which is what keeps a partial order right: `!lt(b, a)` is true of a NaN
+// and a number. An `impl Ord` writing `lt` alone is given `le` as `!rhs.lt(self)`, inside `le`.
+@test("and '<=' is that type's 'le', and '>=' its 'le' with the operands exchanged")
 at_most_is_lt_negated()
     if no_library() then return
 
     val out = shown(point() + "use(a: P, b: P) -> bool = a <= b\n", "use")
 
-    assert(out.contains("name: \"P.lt\""), out)
-    assert(out.contains("negate: true"), out)
+    assert(out.contains("name: \"P.le\""), out)
+    assert(out.contains("swap: false"), out)
+    assert(out.contains("negate: false"), out)
+
+    val ge = shown(point() + "use(a: P, b: P) -> bool = a >= b\n", "use")
+
+    assert(ge.contains("name: \"P.le\""), ge)
+    assert(ge.contains("swap: true"), ge)
+    assert(ge.contains("negate: false"), ge)
 
 @test("a scalar keeps its instruction, so nothing dispatches")
 a_scalar_keeps_its_instruction()
@@ -444,7 +453,7 @@ an_erased_value_of_another_trait_is_not_walked()
 
     assert(says(said, "'for' iterates an integer range, an array, a slice, a type that " +
                       "implements 'Iterate', or a container that implements 'Walk', " +
-                      "and *Display is none of those"), said.at(0))
+                      "and *Display is none of those"), said[0])
 
 // -- three things only a whole program shows -------------------------------------------------------
 
@@ -527,7 +536,7 @@ private closure_body(text: string) -> string
     val library = library_trees()
 
     for i in 0..<library.len()
-        units.push(library.at(i))
+        units.push(library[i])
 
     units.push(parsed.program)
 
@@ -535,11 +544,11 @@ private closure_body(text: string) -> string
     var found = ""
 
     for i in 0..<done.funcs.len()
-        if done.funcs.at(i).name.ends_with(".call") &&
-           done.funcs.at(i).name.starts_with("$closure") then
-            found = show_typed_func(done.funcs.at(i))
+        if done.funcs[i].name.ends_with(".call") &&
+           done.funcs[i].name.starts_with("$closure") then
+            found = show_typed_func(done.funcs[i])
 
-    if found == "" && !done.reported.is_empty() then return done.reported.at(0).diag.message
+    if found == "" && !done.reported.is_empty() then return done.reported[0].diag.message
 
     found
 end closure_body
@@ -1111,13 +1120,13 @@ private module_text(text: string) -> string
     val library = library_trees()
 
     for i in 0..<library.len()
-        units.push(library.at(i))
+        units.push(library[i])
 
     units.push(parsed.program)
 
     val done = analyze_bodies(units, host_target())
 
-    if !done.reported.is_empty() then return done.reported.at(0).diag.message
+    if !done.reported.is_empty() then return done.reported[0].diag.message
 
     val whole = program_of(done, "")
     val promotions = post_analysis_checks(done.an, whole, buf())
@@ -1447,7 +1456,7 @@ an_unranged_subtype_has_no_ends()
 // Where each type stands in the record of what a compilation made real, by the type's own spelling.
 private made_real_at(p: TProgram, shown: string) -> Option[usize]
     for i in 0..<p.enums.len()
-        if type_show(p.enums.at(i)) == shown then return Some(i)
+        if type_show(p.enums[i]) == shown then return Some(i)
 
     None
 end made_real_at
@@ -1458,7 +1467,7 @@ private program_of_text(text: string) -> TProgram
     val library = library_trees()
 
     for i in 0..<library.len()
-        units.push(library.at(i))
+        units.push(library[i])
 
     units.push(parsed.program)
 
@@ -1553,14 +1562,14 @@ private declared_names(text: string) -> Buf[string]
     var out: Buf[string] = buf()
 
     for i in 0..<p.funcs.len()
-        out.push(p.funcs.at(i).name)
+        out.push(p.funcs[i].name)
 
     out
 end declared_names
 
 private names_hold_one(xs: Buf[string], name: string) -> bool
     for i in 0..<xs.len()
-        if xs.at(i) == name then return true
+        if xs[i] == name then return true
 
     false
 end names_hold_one
@@ -1628,7 +1637,7 @@ private two_files(first: string, second: string) -> Buf[string]
     val library = library_trees()
 
     for i in 0..<library.len()
-        units.push(library.at(i))
+        units.push(library[i])
 
     val a = parse(source_of("one.sysl", first))
     val b = parse(source_of("two.sysl", second))
@@ -1646,8 +1655,8 @@ private two_files(first: string, second: string) -> Buf[string]
     var out: Buf[string] = buf()
 
     for i in 0..<done.reported.len()
-        if !done.reported.at(i).src.name.starts_with("library/") then
-            out.push(done.reported.at(i).diag.message)
+        if !done.reported[i].src.name.starts_with("library/") then
+            out.push(done.reported[i].diag.message)
 
     out
 end two_files
@@ -1965,7 +1974,7 @@ private closure_calls(xs: Buf[string]) -> int
     var n = 0
 
     for i in 0..<xs.len()
-        if xs.at(i).starts_with("$closure") && xs.at(i).ends_with(".call") then n += 1
+        if xs[i].starts_with("$closure") && xs[i].ends_with(".call") then n += 1
 
     n
 end closure_calls
@@ -1983,7 +1992,7 @@ a_default_settles_a_type_parameter()
     var applied = false
 
     for i in 0..<names.len()
-        if names.at(i).starts_with("apply.") then applied = true
+        if names[i].starts_with("apply.") then applied = true
 
     assert(applied, "the call took no instantiation of 'apply'")
 
@@ -1996,7 +2005,7 @@ a_default_registers_nothing()
     var shapes = 0
 
     for i in 0..<p.structs.len()
-        if type_show(p.structs.at(i)) == "a closure" then shapes += 1
+        if type_show(p.structs[i]) == "a closure" then shapes += 1
 
     assert(shapes == 0, "the default's own closure was recorded as a shape the program laid out")
 
@@ -2016,7 +2025,7 @@ private laid_out(text: string) -> Buf[string]
     val library = library_trees()
 
     for i in 0..<library.len()
-        units.push(library.at(i))
+        units.push(library[i])
 
     units.push(parsed.program)
 
@@ -2024,17 +2033,17 @@ private laid_out(text: string) -> Buf[string]
     val program = program_of(done, done.main_module)
 
     for i in 0..<program.structs.len()
-        out.push(type_show(program.structs.at(i)))
+        out.push(type_show(program.structs[i]))
 
     for i in 0..<program.enums.len()
-        out.push(type_show(program.enums.at(i)))
+        out.push(type_show(program.enums[i]))
 
     out
 end laid_out
 
 private any_holding(names: Buf[string], text: string) -> Option[string]
     for i in 0..<names.len()
-        if names.at(i).index_of(text).is_some() then return Some(names.at(i))
+        if names[i].index_of(text).is_some() then return Some(names[i])
 
     None
 end any_holding
@@ -2109,7 +2118,7 @@ a_leading_dot_names_a_variant()
     val said = complaints("enum Role\n    Error\n    Ok\n\nname(r: Role) -> int = 1\n\n" +
                           "use() -> int = name(.Error)\n")
 
-    assert_eq(said.len(), 0, if said.is_empty() then "" else said.at(0))
+    assert_eq(said.len(), 0, if said.is_empty() then "" else said[0])
 
 @test("and a position that expects nothing has no type to look the name up in")
 a_leading_dot_with_nothing_expected()

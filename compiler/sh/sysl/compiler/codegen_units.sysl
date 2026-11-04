@@ -196,7 +196,7 @@ private read_module(text: string) -> Option[Module]
     var named: Map[string, usize] = map()
 
     for i in 0..<items.len()
-        val e = items.at(i)
+        val e = items[i]
 
         if e.piece != PieceLine then named.put(e.name, i)
 
@@ -206,7 +206,7 @@ private read_module(text: string) -> Option[Module]
     for i in 0..<items.len()
         ref_start.push(refs.len())
 
-        val e = items.at(i)
+        val e = items[i]
 
         if e.piece == PieceDefine || e.piece == PieceGlobal
             // A global's own name is on its line too, and is not a use of itself.
@@ -271,7 +271,7 @@ private is_local_define(line: string) -> bool =
 // copied into every partition that calls it, as a small local function is, and kept by none that
 // does not.
 private is_copy(m: Module, i: usize) -> bool =
-    m.text[m.items.at(i).start..].starts_with("define available_externally ")
+    m.text[m.items[i].start..].starts_with("define available_externally ")
 
 // **Whether a function one partition defines is copied into another that calls it**, as an
 // `available_externally` definition its calls can inline -- the cut would otherwise be a wall no
@@ -282,7 +282,7 @@ private is_copy(m: Module, i: usize) -> bool =
 // a section, given a calling convention, or written with a linkage of its own (`weak`, `weak_odr`):
 // only the plain external definition the link resolves to one body.
 private importable_define(m: Module, i: usize) -> bool
-    val e = m.items.at(i)
+    val e = m.items[i]
     val head = m.text[e.start..<line_end(m.text.bytes, e.start)]
 
     var rest = head[7..]
@@ -358,7 +358,7 @@ end slot_access
 // (`alwaysinline`). A local one is copied into every partition that calls it whatever its length,
 // as a small one is, so that the mark means the same in a program cut into units as in one module.
 private marked_inline(m: Module, i: usize) -> bool
-    val e = m.items.at(i)
+    val e = m.items[i]
     val head = m.text[e.start..<line_end(m.text.bytes, e.start)]
 
     head.contains(" inlinehint") || head.contains(" alwaysinline")
@@ -483,13 +483,13 @@ split_module(text: string, n: int) -> Option[Buf[string]]
         imported.push(false)
 
     for i in 0..<count
-        val e = m.items.at(i)
+        val e = m.items[i]
 
         if (e.piece == PieceDefine || e.piece == PieceGlobal) && !e.local && !is_copy(m, i)
             val p = usize(name_hash(e.name) % u64(units))
 
-            home.set(i, int(p))
-            member.set(p * count + i, true)
+            home[i] = int(p)
+            member[p * count + i] = true
             work.push((p, i))
 
     var placed: Buf[bool] = buf()
@@ -502,40 +502,40 @@ split_module(text: string, n: int) -> Option[Buf[string]]
 
     loop
         while next < work.len()
-            val (p, e) = work.at(next)
+            val (p, e) = work[next]
             next += 1
-            placed.set(p, true)
+            placed[p] = true
 
-            for k in m.ref_start.at(e)..<m.ref_start.at(e + 1)
-                val r = m.refs.at(k)
-                val it = m.items.at(r)
+            for k in m.ref_start[e]..<m.ref_start[e + 1]
+                val r = m.refs[k]
+                val it = m.items[r]
 
-                if member.at(p * count + r) || imported.at(p * count + r) then continue
+                if member[p * count + r] || imported[p * count + r] then continue
 
                 if it.piece == PieceDefine && is_copy(m, r)
-                    member.set(p * count + r, true)
+                    member[p * count + r] = true
                     work.push((p, r))
                 elif it.piece == PieceDefine && !it.local && importable_define(m, r)
-                    imported.set(p * count + r, true)
+                    imported[p * count + r] = true
                     work.push((p, r))
                 elif it.piece == PieceDeclare || !it.local
-                    needed.set(p * count + r, true)
+                    needed[p * count + r] = true
                 elif it.piece == PieceDefine && (it.cost <= CopyCost || marked_inline(m, r))
-                    member.set(p * count + r, true)
+                    member[p * count + r] = true
                     work.push((p, r))
-                elif home.at(r) < 0
-                    home.set(r, int(p))
-                    member.set(p * count + r, true)
+                elif home[r] < 0
+                    home[r] = int(p)
+                    member[p * count + r] = true
                     work.push((p, r))
                 else
-                    needed.set(p * count + r, true)
-                    promoted.set(r, true)
+                    needed[p * count + r] = true
+                    promoted[r] = true
 
         if swept then break
 
         // What nothing reached -- a local nothing names -- is kept, in the first partition.
         for i in 0..<count
-            val e = m.items.at(i)
+            val e = m.items[i]
 
             if e.piece != PieceDefine && e.piece != PieceGlobal then continue
 
@@ -545,11 +545,11 @@ split_module(text: string, n: int) -> Option[Buf[string]]
             var anywhere = false
 
             for p in 0..<units
-                if member.at(p * count + i) then anywhere = true
+                if member[p * count + i] then anywhere = true
 
             if !anywhere
-                home.set(i, 0)
-                member.set(i, true)
+                home[i] = 0
+                member[i] = true
                 work.push((0, i))
 
         swept = true
@@ -557,14 +557,14 @@ split_module(text: string, n: int) -> Option[Buf[string]]
     var used = 0
 
     for p in 0..<units
-        if placed.at(p) then used += 1
+        if placed[p] then used += 1
 
     if used < 2 then return None
 
     var out: Buf[string] = buf()
 
     for p in 0..<units
-        if placed.at(p) then out.push(render(m, p, count, &member, &needed, &imported, &promoted))
+        if placed[p] then out.push(render(m, p, count, &member, &needed, &imported, &promoted))
 
     Some(out)
 end split_module
@@ -585,13 +585,13 @@ private render(m: Module, p: usize, count: usize, member: *Buf[bool], needed: *B
     var out = str_builder()
 
     for i in 0..<count
-        val e = m.items.at(i)
+        val e = m.items[i]
 
         if e.piece == PieceLine
             out.push(m.text[e.start..<e.end])
-        elif member.at(p * count + i)
+        elif member[p * count + i]
             copy_renamed(m, i, promoted, &out)
-        elif imported.at(p * count + i)
+        elif imported[p * count + i]
             // `define ` as the definition has it, then the copy's linkage.
             var body = str_builder()
 
@@ -601,12 +601,12 @@ private render(m: Module, p: usize, count: usize, member: *Buf[bool], needed: *B
 
             out.push("define available_externally ")
             out.push(text[7..])
-        elif needed.at(p * count + i)
+        elif needed[p * count + i]
             e.piece match
                 PieceDeclare -> out.push(m.text[e.start..<e.end])
                 PieceDefine -> out.push(declaration_of(m.text[e.start..<line_end(m.text.bytes, e.start)],
-                                                       e, promoted.at(i)))
-                PieceGlobal -> out.push(external_global(m.text[e.start..<e.end], e, promoted.at(i)))
+                                                       e, promoted[i]))
+                PieceGlobal -> out.push(external_global(m.text[e.start..<e.end], e, promoted[i]))
                 PieceLine -> ()
 
     out.finish()
@@ -618,11 +618,11 @@ private spelled(name: string) -> string =
 
 // Item `i`'s text with every promoted symbol renamed, and its own linkage made hidden where it is one.
 private copy_renamed(m: Module, i: usize, promoted: *Buf[bool], out: *StrBuilder)
-    val e = m.items.at(i)
-    var touches = promoted.at(i)
+    val e = m.items[i]
+    var touches = promoted[i]
 
-    for k in m.ref_start.at(i)..<m.ref_start.at(i + 1)
-        if promoted.at(m.refs.at(k)) then touches = true
+    for k in m.ref_start[i]..<m.ref_start[i + 1]
+        if promoted[m.refs[k]] then touches = true
 
     if !touches
         out.push(m.text[e.start..<e.end])
@@ -633,7 +633,7 @@ private copy_renamed(m: Module, i: usize, promoted: *Buf[bool], out: *StrBuilder
     var from = e.start
 
     // Its own definition: `define private` / `@x = internal` become hidden.
-    if promoted.at(i)
+    if promoted[i]
         if e.piece == PieceDefine
             val head: usize = if m.text[e.start..].starts_with("define private ") then 15 else 16
 
@@ -674,12 +674,12 @@ end copy_renamed
 
 // Whether `name`, met inside item `i`, is one of the symbols `i` names that was promoted.
 private is_promoted(m: Module, i: usize, name: string, promoted: *Buf[bool]) -> bool
-    if promoted.at(i) && m.items.at(i).name == name then return true
+    if promoted[i] && m.items[i].name == name then return true
 
-    for k in m.ref_start.at(i)..<m.ref_start.at(i + 1)
-        val r = m.refs.at(k)
+    for k in m.ref_start[i]..<m.ref_start[i + 1]
+        val r = m.refs[k]
 
-        if promoted.at(r) && m.items.at(r).name == name then return true
+        if promoted[r] && m.items[r].name == name then return true
 
     false
 end is_promoted
@@ -849,7 +849,7 @@ compile_units(cc: string, parts: Buf[string], base: string, target: Target,
 
         // Keyed over the text clang is handed, not the text before marking, so a kept object made
         // without the function attributes is never taken for one made with them.
-        val text = laid_out(cc, target, in_clang_dialect(cc, for_clang_unit(parts.at(i), target, libcalls, level)))
+        val text = laid_out(cc, target, in_clang_dialect(cc, for_clang_unit(parts[i], target, libcalls, level)))
         val key = unit_object_key(cc, text, args)
 
         keys.push(key)
@@ -877,7 +877,7 @@ compile_units(cc: string, parts: Buf[string], base: string, target: Target,
     var failure = ""
 
     for j in 0..<todo.len()
-        val ran = children.at(j) match
+        val ran = children[j] match
             Ok(child) -> child.wait()
             Err(e) -> Err(e)
 
@@ -890,12 +890,12 @@ compile_units(cc: string, parts: Buf[string], base: string, target: Target,
     if failure != "" then return Err(failure)
 
     for i in todo
-        val obj = objects.at(i)
+        val obj = objects[i]
 
         remove_file(s"$obj.ll").unwrap_or(())
         unit_compiled()
 
-        if keys.at(i) != "" then unit_object_kept(keys.at(i), obj)
+        if keys[i] != "" then unit_object_kept(keys[i], obj)
 
     Ok(objects)
 end compile_units
@@ -936,7 +936,7 @@ compile_object_in_units(cc: string, ir: string, obj: string, target: Target,
     args.push("-r")
 
     for i in 0..<made.len()
-        args.push(made.at(i))
+        args.push(made[i])
 
     args.push("-o")
     args.push(obj)
@@ -944,7 +944,7 @@ compile_object_in_units(cc: string, ir: string, obj: string, target: Target,
     val said = told(cc, args)
 
     for i in 0..<made.len()
-        remove_file(made.at(i)).unwrap_or(())
+        remove_file(made[i]).unwrap_or(())
 
     said match
         Ok(_) -> Ok(())

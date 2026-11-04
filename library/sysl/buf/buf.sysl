@@ -332,7 +332,7 @@ end BufCore
  * **A `Buf` is a reference, the way a collection is in most languages a program will have met.**
  * Assigning one, passing it, capturing it in a closure, keeping it in a struct and reading it back
  * out of another container all hand over a second name for the *same* buffer, so a push through any
- * of them is seen through every other -- `Buf[Buf[int]]` included, where `outer.at(0).push(x)`
+ * of them is seen through every other -- `Buf[Buf[int]]` included, where `outer[0].push(x)`
  * grows the inner buffer the outer one holds. A program that wants a second buffer asks for one with
  * `buf()` and fills it.
  *
@@ -385,13 +385,17 @@ struct Buf[T]
 
     const is_empty(self) -> bool = self.len() == 0
 
-    @track_caller
-    const at(self, i: usize) -> T = self.reading().at(i)
+    /** The element at `i`, or `None` where there is none -- `i` at or past the length, or negative.
+     * The total form of `b[i]`, which traps; `i` may be any integer type.
+     */
+    const get[I: Integer](self, i: I) -> Option[T]
+        val core = self.reading()
 
-    @track_caller
-    const set(self, i: usize, v: T) = self.reading().set(i, v)
+        if i < 0 || u128(i) >= u128(core.count) then return None
 
-    /** `at` and `set` with no bounds check: the element at `i`, read or written where it lives, with
+        Some(core.get_unchecked(usize(i)))
+
+    /** `b[i]` and `b[i] = v` with no bounds check: the element at `i`, read or written where it lives, with
      * nothing comparing `i` to the count. **The caller owes the proof that `i < len()`**, and an index
      * past it reads or writes whatever the storage holds there, or memory that is not the buffer's at
      * all. This is the unchecked tier, and the name is how a reader finds it -- the same access an
@@ -611,15 +615,15 @@ impl[T: Debug] Debug for Buf[T]
     debug(self, out: *Writer, fmt: FormatSpec) = self.view().debug(out, fmt)
 
 /** Subscripting reaches the bounds-checked members rather than the storage, so `b[i]` on a `Buf`
- * means what `b.at(i)` means and cannot read a slot past the count that the backing slice still has.
+ * checks `i` against the count, and cannot read a slot past it that the backing slice still has.
  */
 impl[T] Index[usize, T] for Buf[T]
     @track_caller
-    const index(self, i: usize) -> T = self.at(i)
+    const index(self, i: usize) -> T = self.reading().at(i)
 
 impl[T] IndexSet[usize, T] for Buf[T]
     @track_caller
-    const index_set(self, i: usize, v: T) = self.set(i, v)
+    const index_set(self, i: usize, v: T) = self.reading().set(i, v)
 
 /** `b[i]` is the element where it lives: the address, checked against the count, so `b[i].f` reads
  * one field without copying the element and `ref e = b[i]` names it. Good until a `@relocates`

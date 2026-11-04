@@ -125,13 +125,13 @@ private read_call(cx: &Analyzer, span: Span, args: Buf[Expr]) -> TExpr
         return cx.err(span, "'read_sysreg' takes one argument, the register's name — " +
                       "read_sysreg(\"cntfrq_el0\")")
 
-    val reg = register_name(cx, "read_sysreg", args.at(0))
+    val reg = register_name(cx, "read_sysreg", args[0])
 
     if reg == "" then return bad_expr(span)
 
     val refusal = probe_register(cx, "read", reg, None)
 
-    if refusal.is_some() then return cx.err(args.at(0).span, refusal.unwrap())
+    if refusal.is_some() then return cx.err(args[0].span, refusal.unwrap())
 
     TExpr(span, TSysOp("read_sysreg", reg, buf()))
 end read_call
@@ -142,7 +142,7 @@ private write_call(cx: &Analyzer, span: Span, args: Buf[Expr]) -> TExpr
         return cx.err(span, "'write_sysreg' takes two arguments, the register's name and the u64 " +
                       "to write — write_sysreg(\"vbar_el1\", base)")
 
-    val reg = register_name(cx, "write_sysreg", args.at(0))
+    val reg = register_name(cx, "write_sysreg", args[0])
     val wide = Integer(64, false, false)
 
     if reg == "" then return bad_expr(span)
@@ -153,32 +153,32 @@ private write_call(cx: &Analyzer, span: Span, args: Buf[Expr]) -> TExpr
 
     if field.is_some()
         val limit = field.unwrap()
-        val n = const_fold(cx, args.at(1)) match
+        val n = const_fold(cx, args[1]) match
             Some(ConstInt(v)) -> v
             _ ->
-                return cx.err(args.at(1).span, s"'$reg' is a PSTATE field, which 'msr' writes from " +
+                return cx.err(args[1].span, s"'$reg' is a PSTATE field, which 'msr' writes from " +
                               "an immediate inside the instruction — the value has to be a constant " +
                               s"from 0 to $limit")
 
         if cmp(n, from_int(0)) < 0 || cmp(n, from_int(long(limit))) > 0
-            return cx.err(args.at(1).span, s"'$reg' is a PSTATE field that holds 0 to $limit, " +
+            return cx.err(args[1].span, s"'$reg' is a PSTATE field that holds 0 to $limit, " +
                           s"and this constant does not fit")
 
-        values.push(TExpr(args.at(1).span, TIntLit(n, wide)))
+        values.push(TExpr(args[1].span, TIntLit(n, wide)))
     else
-        val v = widened(type_expr(cx, args.at(1), Some(wide)), Some(wide))
+        val v = widened(type_expr(cx, args[1], Some(wide)), Some(wide))
 
         if texpr_type(v) == Unknown then return bad_expr(span)
 
         if underlying(texpr_type(v)) != wide
-            return cx.err(args.at(1).span, s"'write_sysreg' writes a u64, and this value is " +
+            return cx.err(args[1].span, s"'write_sysreg' writes a u64, and this value is " +
                           s"${a_or_an(type_show(texpr_type(v)))} — convert it with u64(...)")
 
         values.push(v)
 
     val refusal = probe_register(cx, "write", reg, field)
 
-    if refusal.is_some() then return cx.err(args.at(0).span, refusal.unwrap())
+    if refusal.is_some() then return cx.err(args[0].span, refusal.unwrap())
 
     TExpr(span, TSysOp("write_sysreg", reg, values))
 end write_call
@@ -264,16 +264,16 @@ private barrier_call(cx: &Analyzer, span: Span, name: string, args: Buf[Expr], h
         return cx.err(span, s"'$name' takes one option, the domain and the accesses it orders — " +
                       s"$name(sy) for the whole system")
 
-    val word = *args.at(0).kind match
+    val word = *args[0].kind match
         Ident(w) -> w
         _ -> ""
 
     if barrier_option(word).is_none()
-        return cx.err(args.at(0).span, s"'$name' takes one of the architecture's options written " +
+        return cx.err(args[0].span, s"'$name' takes one of the architecture's options written " +
                       s"here — ${barrier_words()} — and this is not one")
 
     if here == "thumb" && word != "sy"
-        return cx.err(args.at(0).span, s"an M-profile core's '$name' has only the option 'sy' — the " +
+        return cx.err(args[0].span, s"an M-profile core's '$name' has only the option 'sy' — the " +
                       s"architecture reserves every other one there — so it is written $name(sy)")
 
     TExpr(span, TSysOp(name, word, buf()))
@@ -310,14 +310,14 @@ private maintenance_call(cx: &Analyzer, span: Span, form: string, args: Buf[Expr
         return cx.err(span, s"'$form' takes the operation and, where the operation reads one, its " +
                       s"register operand — ${maintenance_example(form)}")
 
-    val word = *args.at(0).kind match
+    val word = *args[0].kind match
         Ident(w) -> w
         _ -> ""
 
     val takes = maintenance_operand(form, word)
 
     if takes.is_none()
-        return cx.err(args.at(0).span, s"'$form' takes one of the operations written here — " +
+        return cx.err(args[0].span, s"'$form' takes one of the operations written here — " +
                       s"${maintenance_words(form)} — and this is not one")
 
     if takes.unwrap() && args.len() == 1
@@ -325,13 +325,13 @@ private maintenance_call(cx: &Analyzer, span: Span, form: string, args: Buf[Expr
                       s"$form($word, ${operand_name(form)})")
 
     if !takes.unwrap() && args.len() == 2
-        return cx.err(args.at(1).span, s"'$form($word)' takes no register operand — write $form($word)")
+        return cx.err(args[1].span, s"'$form($word)' takes no register operand — write $form($word)")
 
     var operands: Buf[TExpr] = buf()
 
     if args.len() == 2
         val want64 = Some(Integer(64, false, false))
-        val v = widened(type_expr(cx, args.at(1), want64), want64)
+        val v = widened(type_expr(cx, args[1], want64), want64)
         val ty = texpr_type(v)
 
         if ty == Unknown then return bad_expr(span)
@@ -339,7 +339,7 @@ private maintenance_call(cx: &Analyzer, span: Span, form: string, args: Buf[Expr
         if !operand_fits(form, underlying(ty))
             val wanted = if form == "tlbi" then "a u64" else "an address, a u64 or a raw pointer"
 
-            return cx.err(args.at(1).span, s"'$form($word)' takes $wanted, and this value is " +
+            return cx.err(args[1].span, s"'$form($word)' takes $wanted, and this value is " +
                           s"${a_or_an(type_show(ty))} — convert it with u64(...)")
 
         operands.push(v)
@@ -359,7 +359,7 @@ private maintenance_operand(form: string, word: string) -> Option[bool]
     val ops = maintenance_ops(form)
 
     for i in 0..<ops.len()
-        if ops.at(i).0 == word then return Some(ops.at(i).1)
+        if ops[i].0 == word then return Some(ops[i].1)
 
     None
 end maintenance_operand
@@ -400,7 +400,7 @@ private maintenance_words(form: string) -> string
     var out = ""
 
     for i in 0..<ops.len()
-        out = if i == 0 then ops.at(i).0 else out + ", " + ops.at(i).0
+        out = if i == 0 then ops[i].0 else out + ", " + ops[i].0
 
     out
 end maintenance_words

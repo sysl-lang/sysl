@@ -134,6 +134,24 @@ hoist_impl(a: &Analysis, im: Impl) -> Impl
             if closed.is_some() && core_family_provides(spelling.unwrap(), closed.unwrap()) then
                 provides = true
 
+    // **The `PartialOrd` block an `impl Ord` was filed as** says nothing of its own where the type
+    // already has the comparisons: the `Ord` block it came from is refused for that, or -- for a
+    // float -- below, and once is what the program is told.
+    if written.is_empty() && provides && im.joined && !block.derived && spelling == Some("PartialOrd") then
+        return Impl(block, span, scope, im.joined)
+
+    // **A float cannot be made `Ord`**: its comparisons are the compiler's, and a NaN leaves them
+    // partial whatever a block promises, so the promise would be false of the very `<` it covers.
+    val partial_builtin = core_builtin("PartialOrd", ty) && !core_builtin("Ord", ty)
+
+    if written.is_empty() && spelling == Some("Ord") && partial_builtin
+        a.fault(scope, span, s"'${home.label}' is only 'PartialOrd', and no block can make it 'Ord' " +
+                "— its comparisons are the compiler's, and a NaN leaves them unordered whatever is " +
+                "promised. Sort by its 'total_lt', or wrap it in a type of your own that orders " +
+                "every value")
+        return Impl(block, span, scope, im.joined)
+    end if
+
     if written.is_empty() && provides
         // **The one type reaching this that a program declared is a simple enum**, whose `Eq` the
         // compiler supplies for the reason it supplies the open integer family's: the value *is* its
@@ -182,10 +200,10 @@ hoist_impl(a: &Analysis, im: Impl) -> Impl
     val mine = stand_in_args(a, scope, home)
 
     for i in 0..<already.len()
-        if supplied_bound(a, already.at(i), key.unwrap(), subject, mine).key() == bound.key()
+        if supplied_bound(a, already[i], key.unwrap(), subject, mine).key() == bound.key()
             a.fault(scope, span, s"'${home.label}' already implements " +
                     s"'${show_bound(a, bound, subject)}'" +
-                    second_implementation(key.unwrap(), tr, already.at(i)))
+                    second_implementation(key.unwrap(), tr, already[i]))
             return Impl(block, span, scope, im.joined)
 
     // **A blanket block covering the subject is an implementation the subject already has**, and the
@@ -197,14 +215,14 @@ hoist_impl(a: &Analysis, im: Impl) -> Impl
     val blankets = blanket_owners(a, ty)
 
     for i in 0..<blankets.len()
-        if !block.overrides && impl_at(a, bound, blankets.at(i).0, ty, blankets.at(i).1).is_some()
+        if !block.overrides && impl_at(a, bound, blankets[i].0, ty, blankets[i].1).is_some()
             // The subtype half is said only where there is a subtype: on a built-in written out in
             // full the clause would be about a type that is not there.
             val inherited = if underlying(ty) == ty then ""
             else ", and a subtype has its base's memberships"
 
             a.fault(scope, span, s"'${home.label}' already implements '${show_bound(a, bound, subject)}' — " +
-                    s"${every_shape(blankets.at(i).0)} does, through one block written over the family" +
+                    s"${every_shape(blankets[i].0)} does, through one block written over the family" +
                     inherited)
             return Impl(block, span, scope, im.joined)
 
@@ -223,7 +241,7 @@ hoist_impl(a: &Analysis, im: Impl) -> Impl
     // `Pair`, and the subject itself says the same thing at every instantiation.
     if !home.tparams.is_empty() && defaults_mention_self(tr)
         for i in 0..<written.len()
-            val w = written.at(i)
+            val w = written[i]
 
             if owner_key(w) == home.key && !type_eq(w, subject) then
                 a.fault(scope, span, s"'${type_show(w)}' is ${a_or_an(home.label)}, and a " +
@@ -356,7 +374,7 @@ hoist_impl(a: &Analysis, im: Impl) -> Impl
         val others = traits_declaring(a, ad.name)
 
         for j in 0..<others.len()
-            val other = others.at(j)
+            val other = others[j]
 
             if other == key.unwrap() || impls_of(a, other, home.key).is_empty() then continue
 
@@ -393,7 +411,7 @@ hoist_impl(a: &Analysis, im: Impl) -> Impl
         super_subst.push(item)
 
     for i in 0..<tr.tparams.len()
-        if i < bound.args.len() then super_subst.push(Binding(tr.tparams.at(i), bound.args.at(i)))
+        if i < bound.args.len() then super_subst.push(Binding(tr.tparams[i], bound.args[i]))
 
     // **A requirement is read in the trait's scope, where it was written**: `trait Codec: Encode`
     // in `wire` means `wire.Encode` whatever the implementing file imports, and read in the block's
@@ -404,6 +422,19 @@ hoist_impl(a: &Analysis, im: Impl) -> Impl
         a.tables.super_checks.push(SuperCheck(home.label, module_show(block.trait_name),
                                               resolve_bound(a, tscope, s.span, s, super_subst),
                                               subject, span, scope, ""))
+
+    // **A derived `Ord` asks it of every field**, since it promises the order its derived
+    // `PartialOrd` ladder gives is total, and one field that is only partially ordered -- a float --
+    // breaks that promise for the whole value. Held with the requirements, for their reason: the
+    // field's own `Ord` may be written below. A generic type's parameters carry the bound the clause
+    // gave them, so a field of type `T` asks nothing a use does not already check.
+    if block.derived && spelling.is_some() && spelling.unwrap() == "Ord"
+        val ord = plain_bound(key.unwrap(), buf())
+
+        for f in ordered_fields(subject)
+            a.tables.super_checks.push(SuperCheck(home.label, module_show(block.trait_name), ord, f.1,
+                                                  span, scope, FieldCheck + f.0))
+    end if
 
     // What the trait asked of each associated type is asked of the type this block supplied, with
     // `Self` in the bound standing for **that** type -- a bare `type W: Add` asks for an
@@ -422,7 +453,7 @@ hoist_impl(a: &Analysis, im: Impl) -> Impl
         if !known then continue
 
         for j in 0..<tr.assocs.len()
-            val ad = tr.assocs.at(j)
+            val ad = tr.assocs[j]
 
             if ad.name != bind.name then continue
 
@@ -430,13 +461,13 @@ hoist_impl(a: &Analysis, im: Impl) -> Impl
             val its_self = self_binding(supplied.unwrap())
 
             for k in 0..<its_self.len()
-                assoc_subst.push(its_self.at(k))
+                assoc_subst.push(its_self[k])
 
             for k in 0..<tr.tparams.len()
-                if k < bound.args.len() then assoc_subst.push(Binding(tr.tparams.at(k), bound.args.at(k)))
+                if k < bound.args.len() then assoc_subst.push(Binding(tr.tparams[k], bound.args[k]))
 
             for k in 0..<ad.bounds.len()
-                val b = ad.bounds.at(k)
+                val b = ad.bounds[k]
 
                 a.tables.super_checks.push(SuperCheck(home.label, module_show(block.trait_name),
                                                       resolve_bound(a, tscope, b.span, b, assoc_subst),
@@ -474,7 +505,7 @@ hoist_impl(a: &Analysis, im: Impl) -> Impl
     if places && bound.args.len() == 2
         for item in inherited
             if item.name == "index_view" || item.name == "index_view_unchecked" then
-                note_ownerless_views(a, scope, subject, block, bound.args.at(0), bound.args.at(1),
+                note_ownerless_views(a, scope, subject, block, bound.args[0], bound.args[1],
                                      s"${home.symbol}.${item.name}${home.alt}", item.name)
     end if
 
@@ -506,10 +537,10 @@ hoist_impl(a: &Analysis, im: Impl) -> Impl
     // where that is one expression (`fp_operators.sysl`).
     if arithmetic_operator_trait(key.unwrap())
         for i in 0..<supplied.len()
-            var m = supplied.at(i)
+            var m = supplied[i]
 
             m.marks.operator = true
-            supplied.set(i, m)
+            supplied[i] = m
     end if
 
     // **An implemented trait member makes its module depend on the standard one**, which is a
@@ -529,8 +560,8 @@ hoist_impl(a: &Analysis, im: Impl) -> Impl
     // cannot be read until then, and the block has to be registered before that for the body to be
     // able to name anything at all.
     for i in 0..<opaque_members.len()
-        val (aname, m) = opaque_members.at(i)
-        val func = opaque.at(i).1
+        val (aname, m) = opaque_members[i]
+        val func = opaque[i].1
         val ad = assoc_decl_named(tr, aname)
         var fd: Option[FuncDecl] = None
 
@@ -592,7 +623,7 @@ hoist_inherent(a: &Analysis, im: Impl)
     end if
 
     if !block.assocs.is_empty()
-        a.fault(scope, block.assocs.at(0).span, "an associated type is what a block supplies for a " +
+        a.fault(scope, block.assocs[0].span, "an associated type is what a block supplies for a " +
                 "trait, and this block names no trait")
         return
     end if
@@ -767,10 +798,40 @@ check_impl_supers(a: &Analysis)
     for c in held
         if satisfies(a, c.sup, c.subject) then continue
 
+        if c.assoc.starts_with(FieldCheck)
+            // A field with no order at all is told so by the derived `PartialOrd`'s own body, at
+            // the comparison that cannot be made; saying it here as well would be one mistake twice.
+            val field = c.assoc[FieldCheck.len..]
+            val partial = catalog_key(a, "PartialOrd")
+
+            if partial.is_some() && satisfies(a, plain_bound(partial.unwrap(), buf()), c.subject) then
+                a.fault(c.scope, c.span, s"'${c.label}' cannot derive Ord: its field '$field' is " +
+                        s"${type_show(c.subject)}, which is only 'PartialOrd', so two of its values " +
+                        "may be neither less, greater nor equal. Derive 'PartialOrd' instead, or " +
+                        s"write 'impl Ord for ${c.label}' with an 'lt' that orders every value")
+            continue
+        end if
+
         if c.assoc != ""
             a.fault(c.scope, c.span, s"trait '${c.required}' asks that its associated type " +
                     s"'${c.assoc}' implement '${show_bound(a, c.sup, c.subject)}', and " +
                     s"${type_show(c.subject)} does not")
+            continue
+        end if
+
+        // **The required trait is implemented, and what the requirement asks of one of its associated
+        // types is not met** (`trait Scalar: Element[Real: Width]`) -- held at every `impl`, since a
+        // requirement has no call of its own to refuse at.
+        val open = if c.sup.bounded.is_empty() then None
+                   else if !satisfies(a, fixing_bound(c.sup.name, c.sup.args, c.sup.assocs), c.subject) then None
+                   else open_bound_unmet(a, c.sup, c.subject)
+
+        if open.is_some()
+            val (n, got, want) = open.unwrap()
+
+            a.fault(c.scope, c.span, s"trait '${c.required}' requires '${show_bound(a, c.sup, c.subject)}', " +
+                    s"which asks that its associated type '$n' implement '${show_bound(a, want, got)}', " +
+                    s"and ${type_show(c.subject)} supplies ${type_show(got)} for it, which does not")
             continue
         end if
 
@@ -790,6 +851,28 @@ check_impl_supers(a: &Analysis)
         a.fault(c.scope, c.span, s"'${c.required}' requires '$shown', so '${c.label}' has to " +
                 s"implement that too — $write")
 end check_impl_supers
+
+// What a held check's `assoc` starts with where it asks a derived `Ord`'s field rather than a
+// required trait: the field's name follows. A space opens it, which no associated type's name holds.
+const FieldCheck: string = " field "
+
+// Every field a derived order compares, named as a reader finds it: a struct's own, and each data
+// enum variant's as `Variant.field`. A simple enum has none, being its discriminant.
+private ordered_fields(t: Type) -> Buf[(string, Type)]
+    var out: Buf[(string, Type)] = buf()
+
+    underlying(t) match
+        Struct(d) ->
+            for f in d.fields
+                out.push(f)
+        Enum(d) ->
+            for v in d.variants
+                for f in v.fields
+                    out.push((s"${v.name}.${f.0}", f.1))
+        _ -> ()
+
+    out
+end ordered_fields
 
 // Whether each block marked `override` has something to override (`reference/traits.md § override —
 // when the overlap is deliberate`), once every `impl` is registered.
@@ -865,7 +948,7 @@ private trait_outer(tr: TraitDecl, bound: Bound) -> Buf[Binding]
     var out: Buf[Binding] = buf()
 
     for i in 0..<tr.tparams.len()
-        if i < bound.args.len() then out.push(Binding(tr.tparams.at(i), bound.args.at(i)))
+        if i < bound.args.len() then out.push(Binding(tr.tparams[i], bound.args[i]))
 
     out
 end trait_outer
@@ -878,10 +961,10 @@ private trait_opened(tr: TraitDecl, block: ImplDecl) -> Buf[Binding]
     var out: Buf[Binding] = buf()
 
     for i in 0..<tr.tparams.len()
-        val tp = tr.tparams.at(i)
+        val tp = tr.tparams[i]
 
         if has_binding(tr.tvalues, tp) && i < block.trait_args.len()
-            val own = block_value_named(block, block.trait_args.at(i))
+            val own = block_value_named(block, block.trait_args[i])
 
             if own.is_some() then out.push(Binding(tp, Abstract(own.unwrap(), buf())))
 
@@ -939,7 +1022,7 @@ private holds_assoc(assocs: Buf[(string, Type)], name: string) -> bool
 end holds_assoc
 
 private first_bound_shown(ad: AssocDecl) -> string =
-    if ad.bounds.is_empty() then "Trait" else ad.bounds.at(0).name
+    if ad.bounds.is_empty() then "Trait" else ad.bounds[0].name
 
 // Why a trait implemented twice **at one argument list** is refused, where the arguments might have
 // made a reader think this block asked for something else.
@@ -950,7 +1033,7 @@ second_implementation(trait_key: string, tr: TraitDecl, other: TraitImpl) -> str
         return s" — arguments left out are the ones '${qualified_name(trait_key)}' declares them to " +
                "default to, so the two blocks implement the same trait at the same arguments"
 
-    s" — a trait's members become the type's, so a second '${tr.methods.at(0).name}' at these " +
+    s" — a trait's members become the type's, so a second '${tr.methods[0].name}' at these " +
     "arguments would have a call no way to say which was meant"
 end second_implementation
 
@@ -961,16 +1044,16 @@ private check_result_selector(a: &Analysis, scope: Scope, span: Span, label: str
     val n = bound.args.len()
 
     for i in 0..<already.len()
-        val theirs = supplied_bound(a, already.at(i), bound.name, subject, mine)
+        val theirs = supplied_bound(a, already[i], bound.name, subject, mine)
 
         if theirs.args.len() == n && theirs.key() != bound.key()
             var same = true
             var operands: Buf[string] = buf()
 
             for j in 0..<(n - 1)
-                if !type_eq(theirs.args.at(j), bound.args.at(j)) then same = false
+                if !type_eq(theirs.args[j], bound.args[j]) then same = false
 
-                operands.push(type_show(bound.args.at(j)))
+                operands.push(type_show(bound.args[j]))
 
             if same
                 val op = core_required(library_spelling(bound.name).unwrap()).unwrap().1
@@ -1280,7 +1363,7 @@ closed_bound(a: &Analysis, scope: Scope, span: Span, ty: Type, bounds: Buf[Bound
                 "no type that is in both")
     end if
 
-    Some(closed.at(0))
+    Some(closed[0])
 end closed_bound
 
 // The shape key **this block** is filed under, which the subject as *written* decides rather than the
@@ -1292,7 +1375,7 @@ private impl_shape(a: &Analysis, block: ImplDecl, ty: Type) -> Option[string]
 
     val shapes = shape_owners(ty)
 
-    if shapes.is_empty() then None else Some(shapes.at(0).0)
+    if shapes.is_empty() then None else Some(shapes[0].0)
 end impl_shape
 
 // The block's own **value** parameter standing for an array's length, where the subject is an array
@@ -1329,7 +1412,7 @@ private pack_param(block: ImplDecl) -> Option[string]
         TupleType(parts, _) ->
             if parts.len() != 1 then return None
 
-            *parts.at(0).kind match
+            *parts[0].kind match
                 PackType(n) -> if holds_string(block.tpacks, n) then Some(n) else None
                 _ -> None
         _ -> None
@@ -1417,9 +1500,9 @@ private check_argument_names(a: &Analysis, scope: Scope, span: Span, block: Impl
                              names: Buf[string], written: string)
     for i in 0..<names.len()
         for j in 0..<i
-            if names.at(i) == names.at(j)
+            if names[i] == names[j]
                 a.fault(scope, span, s"each argument of '$written' takes a type parameter of its " +
-                        s"own, and this 'impl' names '${names.at(i)}' twice")
+                        s"own, and this 'impl' names '${names[i]}' twice")
                 return
 
     var missing: Buf[string] = buf()
@@ -1448,7 +1531,7 @@ private shape_args(a: &Analysis, scope: Scope, span: Span, block: ImplDecl, ty: 
         val shapes = shape_owners(ty)
 
         if !shapes.is_empty()
-            val matched = shapes.at(0).1
+            val matched = shapes[0].1
 
             for item in matched
                 item match
@@ -1575,7 +1658,7 @@ private bounds_shown(bs: Buf[BoundRef]) -> string
     for i in 0..<bs.len()
         if i > 0 then b.push(" + ")
 
-        b.push(bs.at(i).name)
+        b.push(bs[i].name)
 
     b.finish()
 end bounds_shown
@@ -1614,7 +1697,7 @@ private with_trait_defaults(tr: TraitDecl, im: MethodDecl) -> MethodDecl
     var any = false
 
     for i in 0..<tm.unwrap().params.len()
-        if tm.unwrap().params.at(i).default.is_some() then any = true
+        if tm.unwrap().params[i].default.is_some() then any = true
 
     if !any then return im
 
@@ -1622,9 +1705,9 @@ private with_trait_defaults(tr: TraitDecl, im: MethodDecl) -> MethodDecl
     var ps: Buf[Param] = buf()
 
     for i in 0..<im.params.len()
-        val p = im.params.at(i)
+        val p = im.params[i]
 
-        ps.push(Param(p.span, p.name, p.typ, p.vis, tm.unwrap().params.at(i).default, p.by_name,
+        ps.push(Param(p.span, p.name, p.typ, p.vis, tm.unwrap().params[i].default, p.by_name,
                       p.rest))
 
     out.params = ps
@@ -1698,7 +1781,7 @@ private declaring_whose(key: string) -> string = whose_module(module_of(key))
 private subject_phrase(homes: Buf[string], label: string, args: bool) -> string
     val what = if args then "this block names" else s"in '$label'"
 
-    if homes.len() == 1 && homes.at(0) == library_whose() then
+    if homes.len() == 1 && homes[0] == library_whose() then
         return s"nothing $what is declared outside the library"
 
     val listed = joined_homes(homes)
@@ -1727,7 +1810,7 @@ private subject_homes(a: &Analysis, scope: Scope, roots: Buf[TypeRef]) -> Buf[st
     var at: usize = 0
 
     while at < work.len()
-        val here = work.at(at)
+        val here = work[at]
 
         at += 1
 
@@ -1791,22 +1874,22 @@ private joined_homes(homes: Buf[string]) -> string
     var sorted: Buf[string] = buf()
 
     for i in 0..<homes.len()
-        sorted.push(homes.at(i))
+        sorted.push(homes[i])
 
     for i in 0..<sorted.len()
         for j in (i + 1)..<sorted.len()
-            if sorted.at(j) < sorted.at(i)
-                val t = sorted.at(i)
+            if sorted[j] < sorted[i]
+                val t = sorted[i]
 
-                sorted.set(i, sorted.at(j))
-                sorted.set(j, t)
+                sorted[i] = sorted[j]
+                sorted[j] = t
 
     var text = ""
 
     for i in 0..<sorted.len()
         if i > 0 then text = s"$text and "
 
-        text = s"$text${sorted.at(i)}"
+        text = s"$text${sorted[i]}"
 
     text
 end joined_homes

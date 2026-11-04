@@ -2911,13 +2911,14 @@ print(n * Point(1, 2))
 | `Neg` | `neg(self) -> Self` | `-` (unary) |
 | `Not` | `not(self) -> Self` | `~` |
 | `Eq` | `eq` | `==`, `!=` |
-| `Ord` | `lt` | `<`, `>`, `<=`, `>=` |
+| `PartialOrd` | `lt`, `le` | `<`, `>` (`lt`); `<=`, `>=` (`le`) |
 | `Index` | `index` | `e[i]` read |
 | `IndexSet` | `index_set` | `e[i] = v` |
 
 The two prefix rows take no result parameter: negation and complement are closed operations on the
-type they are written for. `Eq` and `Ord` stay homogeneous for a different reason: a comparison
-across two types would have no defined promise about reflexivity and transitivity.
+type they are written for. `Eq` and `PartialOrd` stay homogeneous for a different reason: a comparison
+across two types would have no defined promise about reflexivity and transitivity. `Ord`, the total
+order, is no operator's trait: it declares nothing and is the promise a sort or a `max` asks for.
 
 **Two more traits sit beside these and have no operator**: [`Zero`](/library/math/) and `One`, each
 declaring a single member with no receiver — `zero() -> Self` and `one() -> Self`. They are here
@@ -3149,21 +3150,87 @@ the same operands by [one implementation per argument
 list](/reference/traits/#one-implementation-per-argument-list), and one differing only in its result
 by the rule that a result is not a selector.
 
-A type becomes fully comparable by implementing **one** method, `lt`, and fully equatable by
-implementing **one**, `eq` — the compiler derives the rest: `a != b` is `!eq(a, b)`, `a > b` is
-`lt(b, a)`, `a <= b` is `!lt(b, a)`, `a >= b` is `!lt(a, b)`.
+**Ordering is two traits, as in Rust.** `PartialOrd` declares `lt` and `le`, and the four ordering
+operators call them: `a < b` is `lt(a, b)`, `a > b` is `lt(b, a)`, `a <= b` is `le(a, b)` and
+`a >= b` is `le(b, a)`. `Ord: PartialOrd` declares nothing; it is the promise that the order is
+**total** — of `a < b`, `a == b` and `a > b`, exactly one holds — which is what a sort, a binary
+search, a heap and the free `max` need, since each goes wrong on a pair that is not ordered.
 
-Two of those **swap their operands**, and the swap is of the two *values*, applied at the call — so
-`a > b` still evaluates `a` before `b`, and the derivation affects neither evaluation order nor the
-answer.
+A **float is `PartialOrd` and not `Ord`**: a NaN is neither less than, greater than nor equal to any
+value, itself included, so all four orderings against one are false. Every other ordered built-in —
+the integers at every width, fixed point, `char`, `string` — is `Ord`. A tuple, a slice and an array
+are `Ord` when every part is, and `PartialOrd` when one is only that.
 
-`Eq` and `Ord` are **independent** traits, not a hierarchy, matching the scalars: `bool` and the
-pointer modes have `==` and no `<`. There is no four-way `PartialEq`/`Eq`/`PartialOrd`
-/`Ord` tower.
+A type becomes totally ordered by implementing **one** method: an `impl Ord` writing `lt` is the
+type's `PartialOrd` as well, with `le` answered as `!rhs.lt(self)`, which is right for a total order
+and only for one.
 
-The scalars do not go through those derivations — the compiler-provided impls supply all six
-comparisons directly at IEEE semantics, which keeps `NaN <= 1.0` and `NaN >= 1.0` both false where
-negating `lt` would make one of them true.
+```sysl
+struct Version
+    major: int
+    minor: int
+
+impl Ord for Version
+    lt(self, rhs: Self) -> bool =
+        self.major < rhs.major || (self.major == rhs.major && self.minor < rhs.minor)
+
+print(Version(1, 2) <= Version(1, 2), Version(2, 0) > Version(1, 9), Version(1, 0).le(Version(0, 9)))
+```
+
+```output
+true true false
+```
+
+**A partial order states `le` too**, because `!(b < a)` is true of a NaN and a number while `a <= b`
+is not. A block written for `PartialOrd` by hand that leaves `le` out is refused rather than given the
+total order's answer; where the order really is total, the advice is the `impl Ord` above:
+
+```sysl
+struct Reading
+    value: real
+
+impl PartialOrd for Reading
+    lt(self, rhs: Self) -> bool = self.value < rhs.value
+
+print(Reading(1.0) < Reading(2.0))
+```
+
+```error
+'impl PartialOrd for Reading' writes no 'le' — a partial order's '<=' is not '!(b < a)'
+```
+
+Written with both, it is a partial order, and an empty `impl Ord` beside one is the promise alone:
+
+```sysl
+struct Reading
+    value: real
+
+impl PartialOrd for Reading
+    lt(self, rhs: Self) -> bool = self.value < rhs.value
+    le(self, rhs: Self) -> bool = self.value <= rhs.value
+
+val hole = Reading(0.0 / 0.0)
+
+print(Reading(1.0) <= Reading(1.0), hole <= Reading(1.0), hole >= Reading(1.0))
+```
+
+```output
+true false false
+```
+
+`a != b` is `!eq(a, b)`; **no ordering is a negation**, which is what keeps a partial order right.
+Two of the four **swap their operands**, and the swap is of the two *values*, applied at the call —
+so `a > b` still evaluates `a` before `b`, and the derivation affects neither evaluation order nor
+the answer.
+
+`Eq` and the orderings are **independent**, matching the scalars: `bool` and the pointer modes have
+`==` and no `<`, and a type may be ordered without being `Eq`. Equality is not split the way ordering
+is — a float is `Eq`, with `NaN != NaN` — because nothing here asks more of `==` than the operator
+gives.
+
+The scalars do not go through those derivations — the compiler-provided memberships supply all six
+comparisons directly at IEEE semantics, in a generic body bounded by `PartialOrd` as much as in a
+concrete one.
 
 ### A simple enum is `Eq`, and nothing else
 

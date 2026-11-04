@@ -214,13 +214,13 @@ annotation_query(cx: &Analyzer, span: Span, subject: Expr, item: Expr) -> TExpr
             Descriptor(o, v, f) ->
                 if v < 0 && f >= 0
                     owner = declared_key(*o)
-                    target = walked_fields(*o, v).at(usize(f)).0
+                    target = walked_fields(*o, v)[usize(f)].0
                 else if v >= 0 && f < 0
                     owner = declared_key(*o)
                     target = variant_name(*o, v)
                 else if v >= 0 && f >= 0
                     owner = declared_key(*o)
-                    target = variant_name(*o, v) + "." + walked_fields(*o, v).at(usize(f)).0
+                    target = variant_name(*o, v) + "." + walked_fields(*o, v)[usize(f)].0
             _ -> ()
     else
         val ty = if name.is_some() then attr_subject(cx, span, name.unwrap())
@@ -424,7 +424,7 @@ private fields_answer(cx: &Analyzer, span: Span, written: string, ty: Type, memb
     val parts = listed_parts(s, members)
 
     for k in 0..<parts.len()
-        val name = s.fields.at(parts.at(k)).0
+        val name = s.fields[parts[k]].0
         val at = if measured then cx.an.tables.layout.field_offset(s, name).unwrap_or(0) else 0
 
         items.push(part_literal(cx, span, fd, name, k, at, field_public(cx, s, name), members))
@@ -449,7 +449,7 @@ private listed_parts(s: &StructType, members: bool) -> Buf[usize]
     var out: Buf[usize] = buf()
 
     for i in 0..<s.fields.len()
-        val name = s.fields.at(i).0
+        val name = s.fields[i].0
         val unnamed_bit = name == "_" && s.c_bit(i).is_some()
 
         if unnamed_bit && s.c_bit(i).unwrap().width == 0 then continue
@@ -467,7 +467,7 @@ private listed_position(s: &StructType, members: bool, slot: usize) -> usize
     val parts = listed_parts(s, members)
 
     for k in 0..<parts.len()
-        if parts.at(k) == slot then return k
+        if parts[k] == slot then return k
 
     slot
 end listed_position
@@ -546,7 +546,7 @@ private variants_answer(cx: &Analyzer, span: Span, written: string, ty: Type) ->
     var items: Buf[TExpr] = buf()
 
     for i in 0..<d.variants.len()
-        items.push(variant_literal(cx, span, vd, d.variants.at(i).name, i))
+        items.push(variant_literal(cx, span, vd, d.variants[i].name, i))
 
     TExpr(span, TBufLit(items, list_ty))
 end variants_answer
@@ -733,17 +733,17 @@ name_the_part(cx: &Analyzer, before: usize, label: string)
     val found = cx.an.found
 
     for i in before..<found.len()
-        val p = found.at(i)
+        val p = found[i]
         val d = p.diag
 
-        found.set(i, Placed(p.src, Diagnostic(d.severity, d.span, s"${d.message} (in the copy for $label)",
-                                              d.label, d.note), p.at_place))
+        found[i] = Placed(p.src, Diagnostic(d.severity, d.span, s"${d.message} (in the copy for $label)",
+                                              d.label, d.note), p.at_place)
 end name_the_part
 
 // The type of the field a descriptor stands for; `None` for a variant.
 private descriptor_field_type(d: Type) -> Option[Type] = d match
     Descriptor(owner, v, f) ->
-        if f < 0 then None else Some(unqualified(walked_fields(*owner, v).at(usize(f)).1))
+        if f < 0 then None else Some(unqualified(walked_fields(*owner, v)[usize(f)].1))
     _ -> None
 
 // The fields a descriptor's owner holds at the level it walks: a struct's or a tuple's own where `v`
@@ -753,7 +753,7 @@ private walked_fields(owner: Type, v: int) -> Buf[(string, Type)]
 
     if v >= 0
         return underlying(owner) match
-            Enum(d) -> d.variants.at(usize(v)).fields
+            Enum(d) -> d.variants[usize(v)].fields
             _ -> none
 
     underlying(owner) match
@@ -764,7 +764,7 @@ end walked_fields
 
 // The name of the variant `v` of an enum.
 private variant_name(owner: Type, v: int) -> string = underlying(owner) match
-    Enum(d) -> d.variants.at(usize(v)).name
+    Enum(d) -> d.variants[usize(v)].name
     _ -> ""
 
 // What a variant's payload travels as: `unit` with no fields, the field itself with one, and the
@@ -773,7 +773,7 @@ private payload_type(cx: &Analyzer, fields: Buf[(string, Type)]) -> Type = produ
 
 private product_of(a: &Analysis, fields: Buf[(string, Type)]) -> Type
     if fields.is_empty() then return Unit
-    if fields.len() == 1 then return unqualified(fields.at(0).1)
+    if fields.len() == 1 then return unqualified(fields[0].1)
 
     var ts: Buf[Type] = buf()
 
@@ -853,7 +853,7 @@ private partial_refusal(a: &Analysis, scope: Scope, subject: Type, shown: string
                "it is built from exactly one field, by name"
 
     for i in 0..<s.fields.len()
-        val name = s.fields.at(i).0
+        val name = s.fields[i].0
 
         if is_anonymous_field(name) || (name == "_" && s.c_bit(i).is_some()) then
             return s"'$shown' holds storage no field names (an anonymous member or an unnamed " +
@@ -868,7 +868,7 @@ descriptor_text(owner: Type, v: int, f: int) -> string
 
     if v >= 0 then out = out + "." + variant_name(owner, v)
     if f >= 0
-        val name = walked_fields(owner, v).at(usize(f)).0
+        val name = walked_fields(owner, v)[usize(f)].0
 
         // An anonymous member has no name a reader wrote; it is shown as what it is.
         out = out + "." + (if is_anonymous_field(name) then s"(anonymous member $f)" else name)
@@ -898,7 +898,7 @@ descriptor_value(cx: &Analyzer, span: Span, d: Type) -> TExpr = d match
 private descriptor_field_literal(cx: &Analyzer, span: Span, fd: &StructType, owner: Type, v: int,
                                  f: int) -> TExpr
     val fields = walked_fields(owner, v)
-    val name = fields.at(usize(f)).0
+    val name = fields[usize(f)].0
 
     if v >= 0
         val at = underlying(payload_type(cx, fields)) match
@@ -994,7 +994,7 @@ reflected_select(cx: &Analyzer, span: Span, receiver: Expr, selector: string) ->
                               s"a value of '${type_show(wanted)}' holds, and this is a value of " +
                               s"'${type_show(rt)}'")
 
-            val name = fields.at(usize(f)).0
+            val name = fields[usize(f)].0
 
             if v < 0
                 val base = underlying(*owner) match
@@ -1008,13 +1008,13 @@ reflected_select(cx: &Analyzer, span: Span, receiver: Expr, selector: string) ->
             if in_partial
                 if fields.len() == 1 then return tr
 
-                return TExpr(span, TField(tr, f, optional_of(cx.an, unqualified(fields.at(usize(f)).1))))
+                return TExpr(span, TField(tr, f, optional_of(cx.an, unqualified(fields[usize(f)].1))))
             end if
 
             // A payload of one field is that field, so there is nothing to select.
             if v >= 0 && fields.len() == 1 then return tr
 
-            TExpr(span, TField(tr, f, unqualified(fields.at(usize(f)).1)))
+            TExpr(span, TField(tr, f, unqualified(fields[usize(f)].1)))
         _ -> bad_expr(span)
 end reflected_select
 
@@ -1028,7 +1028,7 @@ private payload_of(cx: &Analyzer, span: Span, tr: TExpr, owner: Type, v: int, se
                       s"value of '${type_show(owner)}' holds, and this is a value of '${type_show(rt)}'")
 
     val variant = underlying(owner) match
-        Enum(d) -> d.variants.at(usize(v))
+        Enum(d) -> d.variants[usize(v)]
         _ -> return bad_expr(span)
 
     val pt = payload_type(cx, variant.fields)
@@ -1038,7 +1038,7 @@ private payload_of(cx: &Analyzer, span: Span, tr: TExpr, owner: Type, v: int, se
     cx.enter()
 
     for j in 0..<variant.fields.len()
-        val ft = variant.fields.at(j).1
+        val ft = variant.fields[j].1
         val u = cx.bind_pattern(s"${ModuleSep}payload$j", ft)
 
         pats.push(TBindPattern(u, ft))
@@ -1047,7 +1047,7 @@ private payload_of(cx: &Analyzer, span: Span, tr: TExpr, owner: Type, v: int, se
     cx.leave()
 
     val value = if parts.is_empty() then TExpr(span, TUnitLit)
-    else if parts.len() == 1 then parts.at(0)
+    else if parts.len() == 1 then parts[0]
     else underlying(pt) match
         Struct(s) -> TExpr(span, TStructNew(s, parts))
         _ -> bad_expr(span)
@@ -1088,7 +1088,7 @@ private payload_of(cx: &Analyzer, span: Span, tr: TExpr, owner: Type, v: int, se
     for i in 0..<variants.len()
         if int(i) == v then continue
 
-        val other = variants.at(i)
+        val other = variants[i]
         var wild: Buf[TPattern] = buf()
         var at: Buf[TPattern] = buf()
 
@@ -1107,7 +1107,7 @@ end payload_of
 // Whether each variant's tag is its position, so a tag indexes a table of the variants' names.
 private positional_tags(variants: Buf[EnumVariant]) -> bool
     for i in 0..<variants.len()
-        if variants.at(i).tag != from_int(long(i)) then return false
+        if variants[i].tag != from_int(long(i)) then return false
 
     true
 
@@ -1127,7 +1127,7 @@ descriptor_pattern(cx: &Analyzer, span: Span, name: string, d: Type, ty: Type) -
         end if
 
         val variant = underlying(*owner) match
-            Enum(e) -> e.variants.at(usize(v))
+            Enum(e) -> e.variants[usize(v)]
             _ -> return TWildPattern(ty)
 
         var wild: Buf[TPattern] = buf()
@@ -1140,7 +1140,7 @@ descriptor_pattern(cx: &Analyzer, span: Span, name: string, d: Type, ty: Type) -
 
 // `T::Make(c, payload)` -- the variant `c` stands for, built from the payload `x.(c)` hands back.
 make_variant(cx: &Analyzer, span: Span, written: string, args: Buf[Expr], ty: Type) -> TExpr
-    if args.len() == 1 then return make_from_partial(cx, span, written, args.at(0), ty)
+    if args.len() == 1 then return make_from_partial(cx, span, written, args[0], ty)
 
     if args.len() != 2 then
         return cx.err(span, s"'$written::Make' takes a partial value — '$written::Make(p)', where 'p' " +
@@ -1148,11 +1148,11 @@ make_variant(cx: &Analyzer, span: Span, written: string, args: Buf[Expr], ty: Ty
                       s"'$written::Make(c, (a, b))', where 'c' is the name of a " +
                       s"'for const c in $written::Variants'")
 
-    val named = attr_type_name(args.at(0))
+    val named = attr_type_name(args[0])
     val d = named.and_then(n -> descriptor_bound(cx.subst, n))
 
     if d.is_none() then
-        return cx.err(args.at(0).span, s"'$written::Make' is told the variant by the 'c' of a " +
+        return cx.err(args[0].span, s"'$written::Make' is told the variant by the 'c' of a " +
                       s"'for const c in $written::Variants', and this is not one")
 
     val en = underlying(ty) match
@@ -1163,13 +1163,13 @@ make_variant(cx: &Analyzer, span: Span, written: string, args: Buf[Expr], ty: Ty
     d.unwrap() match
         Descriptor(owner, v, f) ->
             if f >= 0 || disagree(ty, *owner) then
-                return cx.err(args.at(0).span, s"'${named.unwrap()}' is " +
+                return cx.err(args[0].span, s"'${named.unwrap()}' is " +
                               s"'${descriptor_text(*owner, v, f)}', and '$written::Make' builds a " +
                               s"variant of ${type_show(ty)}")
 
-            val variant = en.variants.at(usize(v))
+            val variant = en.variants[usize(v)]
             val pt = payload_type(cx, variant.fields)
-            val tv = type_expr(cx, args.at(1), Some(pt))
+            val tv = type_expr(cx, args[1], Some(pt))
 
             if texpr_type(tv) == Unknown then return bad_expr(span)
 
@@ -1186,7 +1186,7 @@ make_variant(cx: &Analyzer, span: Span, written: string, args: Buf[Expr], ty: Ty
                                                          Enum(en))))
                 end if
 
-                return cx.err(args.at(1).span, s"'${variant.name}' is built from its payload, a value " +
+                return cx.err(args[1].span, s"'${variant.name}' is built from its payload, a value " +
                               s"of '${type_show(pt)}', or its partial value, a value of " +
                               s"'${type_show(partial)}', and this is a value of " +
                               s"'${type_show(texpr_type(tv))}'")
@@ -1266,7 +1266,7 @@ private taken_fields(cx: &Analyzer, span: Span, tv: TExpr, partial: Type, made: 
     stmts.push(TVarDecl(held, partial, tv, None))
 
     for j in 0..<fields.len()
-        val ft = unqualified(fields.at(j).1)
+        val ft = unqualified(fields[j].1)
         val ot = optional_of(cx.an, ft)
         val opt = if fields.len() == 1 then load else TExpr(span, TField(load, int(j), ot))
 
@@ -1328,7 +1328,7 @@ private built_variant(cx: &Analyzer, span: Span, en: Type, variant: EnumVariant,
                 stmts.push(TVarDecl(held, pt, tv, None))
 
                 for j in 0..<variant.fields.len()
-                    fields.push(TExpr(span, TField(load, int(j), unqualified(variant.fields.at(j).1))))
+                    fields.push(TExpr(span, TField(load, int(j), unqualified(variant.fields[j].1))))
     end if
 
     val made = TExpr(span, TEnumNew(en, variant, fields))

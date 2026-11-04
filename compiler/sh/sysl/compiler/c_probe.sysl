@@ -67,7 +67,7 @@ private carries_probe(unit: Program) -> bool
     val body = unit.body
 
     for j in 0..<body.len()
-        *body.at(j).kind match
+        *body[j].kind match
             CConstBlock(_) -> return true
             CTypeBlock(_) -> return true
             _ -> ()
@@ -133,7 +133,7 @@ private unmeasurable(unit: Program, t: Target) -> Option[string]
                 val needed = capability_closure(c.name)
 
                 for j in 0..<needed.len()
-                    val cap = needed.at(j)
+                    val cap = needed[j]
 
                     if (cap == CapOs || cap == CapPosix) && !has(machine, cap) then return Some(c.name)
                     if cap == CapLibc && t.lacks_capability(CapLibc) then return Some(c.name)
@@ -150,10 +150,10 @@ private lower_unit(a: &Analysis, unit: Program, t: Target) -> Program
         *item.kind match
             CConstBlock(cs) ->
                 for j in 0..<cs.len()
-                    consts.push(cs.at(j))
+                    consts.push(cs[j])
             CTypeBlock(ts) ->
                 for j in 0..<ts.len()
-                    types.push(ts.at(j))
+                    types.push(ts[j])
             _ -> ()
 
     if consts.is_empty() && types.is_empty() then return unit
@@ -164,7 +164,7 @@ private lower_unit(a: &Analysis, unit: Program, t: Target) -> Program
     val at = probe_scope(unit)
 
     for i in 0..<consts.len()
-        plan.push(declared_type(a, unit, consts.at(i), types))
+        plan.push(declared_type(a, unit, consts[i], types))
 
     val answers = measure(a, unit, consts, plan, types, t) match
         None -> return unit with { body = buf() }
@@ -177,12 +177,12 @@ private lower_unit(a: &Analysis, unit: Program, t: Target) -> Program
     var folded: Buf[Stmt] = buf()
 
     for i in 0..<consts.len()
-        folded.push(measured_const(a, at, consts.at(i), plan.at(i), answers, i))
+        folded.push(measured_const(a, at, consts[i], plan[i], answers, i))
 
     var aliases: Buf[Stmt] = buf()
 
     for i in 0..<types.len()
-        aliases.push(measured_type(a, at, types.at(i), answers.1.at(i), answers.2))
+        aliases.push(measured_type(a, at, types[i], answers.1[i], answers.2))
 
     var body: Buf[Stmt] = buf()
     var next_const: usize = 0
@@ -192,11 +192,11 @@ private lower_unit(a: &Analysis, unit: Program, t: Target) -> Program
         *s.kind match
             CConstBlock(cs) ->
                 for j in 0..<cs.len()
-                    body.push(folded.at(next_const))
+                    body.push(folded[next_const])
                     next_const += 1
             CTypeBlock(ts) ->
                 for j in 0..<ts.len()
-                    body.push(aliases.at(next_type))
+                    body.push(aliases[next_type])
                     next_type += 1
             _ -> body.push(s)
 
@@ -211,8 +211,8 @@ end lower_unit
 // was being measured so that a reader knows which lines to look at.
 private measure(a: &Analysis, unit: Program, consts: Buf[CConstDecl], plan: Buf[CDeclared],
                 types: Buf[CTypeDecl], t: Target) -> Option[(Buf[CGlobal], Buf[CMeasured], bool)]
-    val where = if !consts.is_empty() then consts.at(0).span
-    else if !types.is_empty() then types.at(0).span
+    val where = if !consts.is_empty() then consts[0].span
+    else if !types.is_empty() then types[0].span
     else span_zero()
 
     val clang = find_clang(t, None) match
@@ -343,7 +343,7 @@ private measure(a: &Analysis, unit: Program, consts: Buf[CConstDecl], plan: Buf[
 
     for i in 0..<consts.len()
         marked(globals, ConstMarker, i) match
-            None -> return silent(a, unit,consts.at(i).span, s"'${consts.at(i).c}'")
+            None -> return silent(a, unit,consts[i].span, s"'${consts[i].c}'")
             Some(g) -> values.push(g)
 
     var measured: Buf[CMeasured] = buf()
@@ -352,7 +352,7 @@ private measure(a: &Analysis, unit: Program, consts: Buf[CConstDecl], plan: Buf[
         val kind = marked(globals, KindMarker, i)
         val size = marked(globals, SizeMarker, i)
 
-        if kind.is_none() || size.is_none() then return silent(a, unit,types.at(i).span, s"'${types.at(i).c}'")
+        if kind.is_none() || size.is_none() then return silent(a, unit,types[i].span, s"'${types[i].c}'")
 
         measured.push(CMeasured(int(decimal_of(kind.unwrap().operand)),
                                 int(decimal_of(size.unwrap().operand))))
@@ -394,7 +394,7 @@ private probe_cflags_for(file: string) -> Buf[string]
                         Err(_) -> ()
                         Ok(answer) ->
                             for j in 0..<answer.cflags.len()
-                                out.push(answer.cflags.at(j))
+                                out.push(answer.cflags[j])
 
                 // **A probe measures what the objects beside it hold, so it is read under their
                 // macros.** The probe's translation unit is synthesized, so there is nothing in the
@@ -418,20 +418,20 @@ private probe_cflags_for(file: string) -> Buf[string]
                             var seen = false
 
                             for k in 0..<out.len()
-                                if out.at(k) == s"-D${macros.at(j)}" then seen = true
+                                if out[k] == s"-D${macros[j]}" then seen = true
 
-                            if !seen then out.push(s"-D${macros.at(j)}")
+                            if !seen then out.push(s"-D${macros[j]}")
 
                 // **And under every vendored library's macros**, for the same reason: a probe that
                 // includes `tusb.h` measures the library the package compiled, configured as it was.
                 val shared = package_c_flags(root, m)
 
                 for j in 0..<shared.1.len()
-                    val flag = s"-D${shared.1.at(j)}"
+                    val flag = s"-D${shared.1[j]}"
                     var seen = false
 
                     for k in 0..<out.len()
-                        if out.at(k) == flag then seen = true
+                        if out[k] == flag then seen = true
 
                     if !seen then out.push(flag)
 
@@ -560,7 +560,7 @@ private probe_text(unit: Program, consts: Buf[CConstDecl], plan: Buf[CDeclared],
         out.push(s"#include ${quoted_header(item.header)}\n")
 
     for i in 0..<consts.len()
-        val carrier = plan.at(i) match
+        val carrier = plan[i] match
             KnownNow(bits, signed, floating, _) ->
                 if floating then (if bits == 128 then "long double" else "double")
                 else if signed then "long long" else "unsigned long long"
@@ -569,10 +569,10 @@ private probe_text(unit: Program, consts: Buf[CConstDecl], plan: Buf[CDeclared],
             // for. Nothing is lost: the IR prints an `i64` bit pattern whichever carrier is written.
             KnownLater(_, _, _) -> "unsigned long long"
 
-        out.push(s"$carrier $ConstMarker$i = ($carrier)(${consts.at(i).c});\n")
+        out.push(s"$carrier $ConstMarker$i = ($carrier)(${consts[i].c});\n")
 
     for i in 0..<types.len()
-        val c = types.at(i).c
+        val c = types[i].c
 
         out.push(s"static $c $ObjMarker$i;\n")
         out.push(s"long long $KindMarker$i = _Generic($ObjMarker$i,${generic_arms()});\n")
@@ -614,12 +614,12 @@ blamed_span(text: string, complaint: string, consts: Buf[CConstDecl], types: Buf
         val written = lines[n - 1]
 
         for i in 0..<consts.len()
-            if written.index_of(s"$ConstMarker$i =").is_some() then return Some(consts.at(i).span)
+            if written.index_of(s"$ConstMarker$i =").is_some() then return Some(consts[i].span)
 
         for i in 0..<types.len()
             if (written.index_of(s"$ObjMarker$i;").is_some() || written.index_of(s"$KindMarker$i =").is_some() ||
                 written.index_of(s"$SizeMarker$i =").is_some())
-                return Some(types.at(i).span)
+                return Some(types[i].span)
 
         return None
 
@@ -667,14 +667,14 @@ private read_globals(ir: string) -> Buf[CGlobal]
         val words = probe_words(item)
 
         if words.len() < 5 then continue
-        if !words.at(0).starts_with("@") then continue
-        if words.at(1) != "=" then continue
+        if !words[0].starts_with("@") then continue
+        if words[1] != "=" then continue
 
         var at: usize = 2
         var found = false
 
         while at + 2 < words.len()
-            if words.at(at) == "global" || words.at(at) == "constant"
+            if words[at] == "global" || words[at] == "constant"
                 found = true
                 break
 
@@ -682,9 +682,9 @@ private read_globals(ir: string) -> Buf[CGlobal]
 
         if !found then continue
 
-        val name = words.at(0)[1..<words.at(0).bytes.len]
-        val ty = words.at(at + 1)
-        val operand = trimmed_comma(words.at(at + 2))
+        val name = words[0][1..<words[0].bytes.len]
+        val ty = words[at + 1]
+        val operand = trimmed_comma(words[at + 2])
 
         if name == CharMarker then out.push(CGlobal(0, "char-signed", operand))
         else
@@ -798,10 +798,10 @@ private declared_type(a: &Analysis, unit: Program, c: CConstDecl,
         var measured: Option[usize] = None
 
         for i in 0..<types.len()
-            if measured.is_none() && types.at(i).name == name then measured = Some(i)
+            if measured.is_none() && types[i].name == name then measured = Some(i)
 
         if measured.is_some()
-            return KnownLater(measured.unwrap(), types.at(measured.unwrap()).c, type_text(c.typ))
+            return KnownLater(measured.unwrap(), types[measured.unwrap()].c, type_text(c.typ))
 
         var base: Option[TypeRef] = None
 
@@ -870,12 +870,12 @@ end plain_width
 
 private measured_const(a: &Analysis, home: Scope, c: CConstDecl, d: CDeclared,
                        answers: (Buf[CGlobal], Buf[CMeasured], bool), at: usize) -> Stmt
-    val raw = answers.0.at(at)
+    val raw = answers.0[at]
 
     val kind = d match
         KnownNow(bits, signed, floating, written) -> (bits, signed, floating, written)
         KnownLater(i, c_type, written) ->
-            integer_kind(answers.1.at(i), answers.2) match
+            integer_kind(answers.1[i], answers.2) match
                 Some(found) -> (found.0, found.1, false, written)
                 None ->
                     a.fault(home, c.span, s"'$written' is what the C compiler calls " +

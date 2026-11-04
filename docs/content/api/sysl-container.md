@@ -241,8 +241,7 @@ on purpose.
 | `len` | `len(self) -> usize` |  |
 | `cap` | `cap(self) -> usize` |  |
 | `is_empty` | `is_empty(self) -> bool` |  |
-| `at` | `at(self, i: usize) -> T` |  |
-| `set` | `set(self, i: usize, v: T)` |  |
+| `get` | `get[I: Integer](self, i: I) -> Option[T]` | The element `i` places from the front, or `None` where there is none -- `i` at or past the length, or negative. |
 | `first` | `first(self) -> Option[T]` |  |
 | `last` | `last(self) -> Option[T]` |  |
 | `push_back` | `push_back(self, v: T)` |  |

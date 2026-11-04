@@ -56,6 +56,8 @@ private dlx_cli(args: []string) -> (int, string)
 end dlx_cli
 
 // The instructions of each of `symbols` in the archive `build-c` wrote for `target`, one list each.
+// The symbols are the exports: a root function behind one is internal to the archive, and the
+// optimiser may fold it into the export and leave no symbol of its own.
 private dlx_disassembled(objdump: string, target: string, symbols: []string, relocs: bool) -> Buf[Buf[string]]
     val root = dlx_project(dlx_program())
     val archive = s"$root/probe.a"
@@ -191,15 +193,15 @@ dlx_riscv64_accesses_are_whole()
         Some(p) -> p
         None -> return
 
-    var symbols: [2]string = ["poke$$sysl", "peek$$sysl"]
+    var symbols: [2]string = ["poke", "peek"]
     val bodies = dlx_disassembled(objdump, "riscv64-freestanding", symbols[..], false)
-    val poke = dlx_mnemonics(bodies.at(0))
-    val peek = dlx_mnemonics(bodies.at(1))
+    val poke = dlx_mnemonics(bodies[0])
+    val peek = dlx_mnemonics(bodies[1])
 
     assert_eq(dlx_count(poke, "sd"), 1)
     assert_eq(dlx_count(poke, "sw"), 0)
     assert_eq(dlx_count(peek, "ld"), 1)
-    assert(dlx_count(peek, "lw") + dlx_count(peek, "lwu") == 0, dlx_text(bodies.at(1)))
+    assert(dlx_count(peek, "lw") + dlx_count(peek, "lwu") == 0, dlx_text(bodies[1]))
 end dlx_riscv64_accesses_are_whole
 
 @test("on wasm32 a 64-bit store and load carry their natural alignment, not four bytes")
@@ -210,10 +212,10 @@ dlx_wasm32_accesses_are_aligned()
         Some(p) -> p
         None -> return
 
-    var symbols: [2]string = ["poke$$sysl", "peek$$sysl"]
+    var symbols: [2]string = ["poke", "peek"]
     val bodies = dlx_disassembled(objdump, "wasm32-freestanding", symbols[..], false)
-    val poke = dlx_text(bodies.at(0))
-    val peek = dlx_text(bodies.at(1))
+    val poke = dlx_text(bodies[0])
+    val peek = dlx_text(bodies[1])
 
     assert(poke.contains("i64.store") && !poke.contains("p2align=2"), poke)
     assert(peek.contains("i64.load") && !peek.contains("p2align=2"), peek)
@@ -229,10 +231,10 @@ dlx_thumbv6m_copy_calls_no_memcpy()
         Some(p) -> p
         None -> return
 
-    var symbols: [1]string = ["copy_table$$sysl"]
+    var symbols: [1]string = ["copy_table"]
     val bodies = dlx_disassembled(objdump, "thumbv6m-freestanding", symbols[..], true)
-    val copy = dlx_text(bodies.at(0))
-    val ops = dlx_mnemonics(bodies.at(0))
+    val copy = dlx_text(bodies[0])
+    val ops = dlx_mnemonics(bodies[0])
 
     assert(!copy.contains("memcpy"), copy)
     assert_eq(dlx_count(ops, "bl"), 0)

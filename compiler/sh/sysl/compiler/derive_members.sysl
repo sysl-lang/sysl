@@ -88,10 +88,10 @@ told_at_derives(a: &Analysis, name: string, reached: string, supplied: bool, bef
     val found = a.found
 
     for i in before..<found.len()
-        val p = found.at(i)
+        val p = found[i]
         val d = p.diag
 
-        found.set(i, Placed(src, Diagnostic(d.severity, at, d.message, d.label, d.note), p.at_place))
+        found[i] = Placed(src, Diagnostic(d.severity, at, d.message, d.label, d.note), p.at_place)
 end told_at_derives
 
 // The scope of the `derives` clause a member was written for, or nothing for any other member.
@@ -156,6 +156,7 @@ private derivable() -> Buf[string]
     var out: Buf[string] = buf()
 
     out.push("Eq")
+    out.push("PartialOrd")
     out.push("Ord")
     out.push("Hash")
     out.push("Display")
@@ -173,14 +174,14 @@ derived_units(a: &Analysis, units: Buf[Program]) -> Buf[Program]
         var grew = false
 
         for j in 0..<unit.body.len()
-            val s = unit.body.at(j)
+            val s = unit.body[j]
 
             body.push(s)
 
             val made = derived_blocks(a, scope, s)
 
             for k in 0..<made.len()
-                body.push(made.at(k))
+                body.push(made[k])
                 grew = true
 
         if !grew then out.push(unit)
@@ -201,7 +202,7 @@ private derived_blocks(a: &Analysis, scope: Scope, s: Stmt) -> Buf[Stmt]
     var seen: Buf[string] = buf()
 
     for i in 0..<clause.len()
-        val entry = clause.at(i)
+        val entry = clause[i]
         val simple = last_dotted(entry.name)
         val wrong = derives_problem(entry, simple, s)
 
@@ -382,7 +383,7 @@ debug_units(units: Buf[Program]) -> Buf[Program]
         var grew = false
 
         for j in 0..<unit.body.len()
-            val s = unit.body.at(j)
+            val s = unit.body[j]
 
             body.push(s)
 
@@ -497,7 +498,7 @@ expand_joined_derives(a: &Analysis)
     val n = a.tables.impls.len()
 
     for i in 0..<n
-        val im = a.tables.impls.at(i)
+        val im = a.tables.impls[i]
 
         if !im.decl.derived || im.joined then continue
 
@@ -525,7 +526,7 @@ expand_joined_derives(a: &Analysis)
 
             if other.is_none() then fresh.push(k)
             else
-                val o = a.tables.impls.at(other.unwrap())
+                val o = a.tables.impls[other.unwrap()]
 
                 if !o.decl.derived then by_hand.push(k)
                 else if !o.joined
@@ -545,6 +546,76 @@ expand_joined_derives(a: &Analysis)
             decl.bounds = joined_bounds(im, k)
             a.tables.impls.push(Impl(decl, im.span, im.scope, true))
 end expand_joined_derives
+
+// -- a total order written as one block ----------------------------------------------------------
+//
+// **`impl Ord for T` with an `lt` in it is `T`'s `PartialOrd` as well**, which is what keeps every
+// total order one method long: `Ord` declares nothing, so the block's members are moved to a
+// `PartialOrd` block beside it -- same subject, same parameters, same bounds -- whose `le` is the
+// trait's default, `!rhs.lt(self)`, the one reading a total order allows. The `Ord` block stays,
+// empty, as the promise. An empty `impl Ord` is that promise alone and is left as it is.
+//
+// **A block written for `PartialOrd` by hand must write `le`**: the default is the total order's,
+// and a partial order answering by it would call a NaN at most a number. So the default is reached
+// only through this expansion and a `derives` clause, and a hand-written block leaving it out is
+// refused, naming the `Ord` block that would have been the way to say "total".
+expand_total_orders(a: &Analysis)
+    val ord_key = catalog_key(a, "Ord")
+    val partial_key = catalog_key(a, "PartialOrd")
+
+    if ord_key.is_none() || partial_key.is_none() then return
+
+    val n = a.tables.impls.len()
+
+    for i in 0..<n
+        val im = a.tables.impls[i]
+
+        if im.decl.derived || im.joined || im.decl.trait_name == "" then continue
+
+        val key = lookup_trait_key(a, im.scope, im.decl.trait_name)
+
+        if key.is_none() then continue
+
+        val subject = type_text(im.decl.for_type)
+
+        if key.unwrap() == partial_key.unwrap()
+            if !writes_member(im.decl, "le") then
+                a.fault(im.scope, im.span, s"'impl ${im.decl.trait_name} for $subject' writes no " +
+                        "'le' — a partial order's '<=' is not '!(b < a)', since two of its values may " +
+                        "be neither less, greater nor equal. Write 'le' too, or, where every two " +
+                        s"values of $subject compare, write 'impl Ord for $subject' with 'lt' alone")
+            continue
+        end if
+
+        if key.unwrap() != ord_key.unwrap() || im.decl.methods.is_empty() then continue
+
+        val named = subject_key(a, im)
+        val beside = if named.is_some() then impl_for(a, partial_key.unwrap(), named.unwrap()) else None
+
+        if beside.is_some()
+            a.fault(im.scope, im.span, s"'impl ${im.decl.trait_name} for $subject' writes " +
+                    s"'${im.decl.methods[0].name}', which makes it $subject's 'PartialOrd' too, and " +
+                    s"$subject already implements 'PartialOrd' — a type has one implementation of a " +
+                    s"trait. Leave 'impl Ord for $subject' empty: with the comparisons written " +
+                    "elsewhere, it is the promise that they are total")
+            continue
+        end if
+
+        var partial = im.decl
+        var total = im.decl
+
+        partial.trait_name = partial_key.unwrap()
+        total.methods = buf()
+        a.tables.impls[i] = Impl(total, im.span, im.scope, im.joined)
+        a.tables.impls.push(Impl(partial, im.span, im.scope, true))
+end expand_total_orders
+
+private writes_member(d: ImplDecl, name: string) -> bool
+    for m in d.methods
+        if m.name == name then return true
+
+    false
+end writes_member
 
 // The bounds of a block written for `key` through a joining trait: the type's own, and each type
 // parameter bound by `key` where `derived_block` bound it by the joining trait -- so a `Box[T]` is
@@ -636,7 +707,7 @@ private subject_key(a: &Analysis, im: Impl) -> Option[string] = *im.decl.for_typ
 // one does.
 private impl_for(a: &Analysis, key: string, subject: string) -> Option[usize]
     for i in 0..<a.tables.impls.len()
-        val o = a.tables.impls.at(i)
+        val o = a.tables.impls[i]
 
         if o.decl.trait_name == "" then continue
 
@@ -657,7 +728,7 @@ private trait_name_of(a: &Analysis, key: string) -> string = trait_decl_at(a, ke
 // What is said where a joining trait would derive a trait the type implements by hand.
 private by_hand_refusal(a: &Analysis, im: Impl, reached: Buf[string], by_hand: Buf[string]) -> string
     val joining = im.decl.trait_name
-    val first = trait_name_of(a, by_hand.at(0))
+    val first = trait_name_of(a, by_hand[0])
     var rest = ""
 
     for k in reached

@@ -20,7 +20,7 @@ were the middle.
 
 ## Index
 
-[`DebugDepth`](#debugdepth) [`esink`](#esink) [`sink`](#sink) [`assert`](#assert) [`assert_eq`](#assert_eq) [`assert_slice_eq`](#assert_slice_eq) [`caller_location`](#caller_location) [`cpu`](#cpu) [`cpu_count`](#cpu_count) [`debug_address`](#debug_address) [`debug_enter`](#debug_enter) [`debug_leave`](#debug_leave) [`debug_padded`](#debug_padded) [`debug_quoted`](#debug_quoted) [`debug_union`](#debug_union) [`display_bf16`](#display_bf16) [`display_bool`](#display_bool) [`display_char`](#display_char) [`display_digits`](#display_digits) [`display_f128`](#display_f128) [`display_f128_shortest`](#display_f128_shortest) [`display_f16`](#display_f16) [`display_f32`](#display_f32) [`display_f32_shortest`](#display_f32_shortest) [`display_fill`](#display_fill) [`display_int`](#display_int) [`display_pad`](#display_pad) [`display_real`](#display_real) [`display_real_shortest`](#display_real_shortest) [`display_str`](#display_str) [`display_uint`](#display_uint) [`encode_utf8`](#encode_utf8) [`eprints`](#eprints) [`eputbytes`](#eputbytes) [`flush`](#flush) [`hash_bool`](#hash_bool) [`hash_str`](#hash_str) [`hash_u128`](#hash_u128) [`hash_u64`](#hash_u64) [`os`](#os) [`panic`](#panic) [`printb`](#printb) [`printbf16`](#printbf16) [`printc`](#printc) [`printf16`](#printf16) [`printf32`](#printf32) [`printi`](#printi) [`printq`](#printq) [`printr`](#printr) [`prints`](#prints) [`printu`](#printu) [`putbytes`](#putbytes) [`stderr`](#stderr) [`stdout`](#stdout) [`trap`](#trap) [`exit`](#exit) [`ByAddress`](#byaddress) [`Counting`](#counting) [`Cpu`](#cpu-1) [`FormatSpec`](#formatspec) [`Kind`](#kind) [`Location`](#location) [`Option`](#option) [`Os`](#os-1) [`Range`](#range) [`Result`](#result) [`Rounding`](#rounding) [`Stderr`](#stderr-1) [`Stdout`](#stdout-1) [`Add`](#add) [`AnyBits`](#anybits) [`BitAnd`](#bitand) [`BitOr`](#bitor) [`BitXor`](#bitxor) [`Checked`](#checked) [`Debug`](#debug) [`Display`](#display) [`Div`](#div) [`Drop`](#drop) [`Eq`](#eq) [`Fallible`](#fallible) [`FloatBits`](#floatbits) [`Fn0`](#fn0) [`Fn1`](#fn1) [`Fn2`](#fn2) [`Fn3`](#fn3) [`Fn4`](#fn4) [`From`](#from) [`Hash`](#hash) [`Index`](#index) [`IndexPlace`](#indexplace) [`IndexSet`](#indexset) [`Integer`](#integer) [`Iterate`](#iterate) [`Mul`](#mul) [`Neg`](#neg) [`Not`](#not) [`One`](#one) [`Ord`](#ord) [`Rem`](#rem) [`Shl`](#shl) [`Shr`](#shr) [`Sub`](#sub) [`Walk`](#walk) [`Writer`](#writer) [`Zero`](#zero) [Debug for (..A)](#debug-for-a) [Debug for []T](#debug-for-t) [Debug for [N]T](#debug-for-nt) [Debug for bf16](#debug-for-bf16) [Debug for bool](#debug-for-bool) [Debug for char](#debug-for-char) [Debug for f128](#debug-for-f128) [Debug for f16](#debug-for-f16) [Debug for f32](#debug-for-f32) [Debug for never](#debug-for-never) [Debug for Option[T]](#debug-for-optiont) [Debug for real](#debug-for-real) [Debug for Result[T, E]](#debug-for-resultt-e) [Debug for string](#debug-for-string) [Debug for T](#debug-for-t-1) [Debug for unit](#debug-for-unit) [Display for (..A)](#display-for-a) [Display for []T](#display-for-t) [Display for [N]T](#display-for-nt) [Display for bf16](#display-for-bf16) [Display for bool](#display-for-bool) [Display for char](#display-for-char) [Display for f128](#display-for-f128) [Display for f16](#display-for-f16) [Display for f32](#display-for-f32) [Display for Location](#display-for-location) [Display for never](#display-for-never) [Display for Option[T]](#display-for-optiont) [Display for real](#display-for-real) [Display for Result[T, E]](#display-for-resultt-e) [Display for string](#display-for-string) [Display for T](#display-for-t-1) [Display for unit](#display-for-unit) [Eq for (..A)](#eq-for-a) [Eq for []T](#eq-for-t) [Eq for [N]T](#eq-for-nt) [Eq for ByAddress[T]](#eq-for-byaddresst) [Eq for never](#eq-for-never) [Eq for Option[T]](#eq-for-optiont) [Eq for Result[T, E]](#eq-for-resultt-e) [Eq for unit](#eq-for-unit) [Fallible for Counting](#fallible-for-counting) [Fallible for Stderr](#fallible-for-stderr) [Fallible for Stdout](#fallible-for-stdout) [FloatBits for bf16](#floatbits-for-bf16) [FloatBits for f128](#floatbits-for-f128) [FloatBits for f16](#floatbits-for-f16) [FloatBits for f32](#floatbits-for-f32) [FloatBits for real](#floatbits-for-real) [Hash for (..A)](#hash-for-a) [Hash for [N]T](#hash-for-nt) [Hash for bool](#hash-for-bool) [Hash for ByAddress[T]](#hash-for-byaddresst) [Hash for char](#hash-for-char) [Hash for never](#hash-for-never) [Hash for string](#hash-for-string) [Hash for T](#hash-for-t) [Hash for unit](#hash-for-unit) [Iterate for Range[T]](#iterate-for-ranget) [One for bf16](#one-for-bf16) [One for f16](#one-for-f16) [One for f32](#one-for-f32) [One for real](#one-for-real) [Ord for (..A)](#ord-for-a) [Ord for []T](#ord-for-t) [Ord for [N]T](#ord-for-nt) [Ord for never](#ord-for-never) [Ord for unit](#ord-for-unit) [Writer for Counting](#writer-for-counting) [Writer for Stderr](#writer-for-stderr) [Writer for Stdout](#writer-for-stdout) [Zero for bf16](#zero-for-bf16) [Zero for f16](#zero-for-f16) [Zero for f32](#zero-for-f32) [Zero for real](#zero-for-real)
+[`DebugDepth`](#debugdepth) [`esink`](#esink) [`sink`](#sink) [`assert`](#assert) [`assert_eq`](#assert_eq) [`assert_slice_eq`](#assert_slice_eq) [`caller_location`](#caller_location) [`cpu`](#cpu) [`cpu_count`](#cpu_count) [`debug_address`](#debug_address) [`debug_enter`](#debug_enter) [`debug_leave`](#debug_leave) [`debug_padded`](#debug_padded) [`debug_quoted`](#debug_quoted) [`debug_union`](#debug_union) [`display_bf16`](#display_bf16) [`display_bool`](#display_bool) [`display_char`](#display_char) [`display_digits`](#display_digits) [`display_f128`](#display_f128) [`display_f128_shortest`](#display_f128_shortest) [`display_f16`](#display_f16) [`display_f32`](#display_f32) [`display_f32_shortest`](#display_f32_shortest) [`display_fill`](#display_fill) [`display_int`](#display_int) [`display_pad`](#display_pad) [`display_real`](#display_real) [`display_real_shortest`](#display_real_shortest) [`display_str`](#display_str) [`display_uint`](#display_uint) [`encode_utf8`](#encode_utf8) [`eprints`](#eprints) [`eputbytes`](#eputbytes) [`flush`](#flush) [`hash_bool`](#hash_bool) [`hash_str`](#hash_str) [`hash_u128`](#hash_u128) [`hash_u64`](#hash_u64) [`os`](#os) [`panic`](#panic) [`printb`](#printb) [`printbf16`](#printbf16) [`printc`](#printc) [`printf16`](#printf16) [`printf32`](#printf32) [`printi`](#printi) [`printq`](#printq) [`printr`](#printr) [`prints`](#prints) [`printu`](#printu) [`putbytes`](#putbytes) [`stderr`](#stderr) [`stdout`](#stdout) [`trap`](#trap) [`exit`](#exit) [`ByAddress`](#byaddress) [`Counting`](#counting) [`Cpu`](#cpu-1) [`FormatSpec`](#formatspec) [`Kind`](#kind) [`Location`](#location) [`Option`](#option) [`Os`](#os-1) [`Range`](#range) [`Result`](#result) [`Rounding`](#rounding) [`Stderr`](#stderr-1) [`Stdout`](#stdout-1) [`Add`](#add) [`AnyBits`](#anybits) [`BitAnd`](#bitand) [`BitOr`](#bitor) [`BitXor`](#bitxor) [`Checked`](#checked) [`Debug`](#debug) [`Display`](#display) [`Div`](#div) [`Drop`](#drop) [`Eq`](#eq) [`Fallible`](#fallible) [`FloatBits`](#floatbits) [`Fn0`](#fn0) [`Fn1`](#fn1) [`Fn2`](#fn2) [`Fn3`](#fn3) [`Fn4`](#fn4) [`From`](#from) [`Hash`](#hash) [`Index`](#index) [`IndexPlace`](#indexplace) [`IndexSet`](#indexset) [`Integer`](#integer) [`Iterate`](#iterate) [`Mul`](#mul) [`Neg`](#neg) [`Not`](#not) [`One`](#one) [`Ord`](#ord) [`PartialOrd`](#partialord) [`Rem`](#rem) [`Shl`](#shl) [`Shr`](#shr) [`Sub`](#sub) [`Walk`](#walk) [`Writer`](#writer) [`Zero`](#zero) [Debug for (..A)](#debug-for-a) [Debug for []T](#debug-for-t) [Debug for [N]T](#debug-for-nt) [Debug for bf16](#debug-for-bf16) [Debug for bool](#debug-for-bool) [Debug for char](#debug-for-char) [Debug for f128](#debug-for-f128) [Debug for f16](#debug-for-f16) [Debug for f32](#debug-for-f32) [Debug for never](#debug-for-never) [Debug for Option[T]](#debug-for-optiont) [Debug for real](#debug-for-real) [Debug for Result[T, E]](#debug-for-resultt-e) [Debug for string](#debug-for-string) [Debug for T](#debug-for-t-1) [Debug for unit](#debug-for-unit) [Display for (..A)](#display-for-a) [Display for []T](#display-for-t) [Display for [N]T](#display-for-nt) [Display for bf16](#display-for-bf16) [Display for bool](#display-for-bool) [Display for char](#display-for-char) [Display for f128](#display-for-f128) [Display for f16](#display-for-f16) [Display for f32](#display-for-f32) [Display for Location](#display-for-location) [Display for never](#display-for-never) [Display for Option[T]](#display-for-optiont) [Display for real](#display-for-real) [Display for Result[T, E]](#display-for-resultt-e) [Display for string](#display-for-string) [Display for T](#display-for-t-1) [Display for unit](#display-for-unit) [Eq for (..A)](#eq-for-a) [Eq for []T](#eq-for-t) [Eq for [N]T](#eq-for-nt) [Eq for ByAddress[T]](#eq-for-byaddresst) [Eq for never](#eq-for-never) [Eq for Option[T]](#eq-for-optiont) [Eq for Result[T, E]](#eq-for-resultt-e) [Eq for unit](#eq-for-unit) [Fallible for Counting](#fallible-for-counting) [Fallible for Stderr](#fallible-for-stderr) [Fallible for Stdout](#fallible-for-stdout) [FloatBits for bf16](#floatbits-for-bf16) [FloatBits for f128](#floatbits-for-f128) [FloatBits for f16](#floatbits-for-f16) [FloatBits for f32](#floatbits-for-f32) [FloatBits for real](#floatbits-for-real) [Hash for (..A)](#hash-for-a) [Hash for [N]T](#hash-for-nt) [Hash for bool](#hash-for-bool) [Hash for ByAddress[T]](#hash-for-byaddresst) [Hash for char](#hash-for-char) [Hash for never](#hash-for-never) [Hash for string](#hash-for-string) [Hash for T](#hash-for-t) [Hash for unit](#hash-for-unit) [Iterate for Range[T]](#iterate-for-ranget) [One for bf16](#one-for-bf16) [One for f16](#one-for-f16) [One for f32](#one-for-f32) [One for real](#one-for-real) [Ord for (..A)](#ord-for-a) [Ord for []T](#ord-for-t) [Ord for [N]T](#ord-for-nt) [Ord for never](#ord-for-never) [Ord for unit](#ord-for-unit) [PartialOrd for (..A)](#partialord-for-a) [PartialOrd for []T](#partialord-for-t) [PartialOrd for [N]T](#partialord-for-nt) [PartialOrd for never](#partialord-for-never) [PartialOrd for unit](#partialord-for-unit) [Writer for Counting](#writer-for-counting) [Writer for Stderr](#writer-for-stderr) [Writer for Stdout](#writer-for-stdout) [Zero for bf16](#zero-for-bf16) [Zero for f16](#zero-for-f16) [Zero for f32](#zero-for-f32) [Zero for real](#zero-for-real)
 
 ## Constants
 
@@ -1481,13 +1481,45 @@ The value `x * one() == x` holds for.
 ### `Ord`
 
 ```sysl
-trait Ord
-    lt(self, rhs: Self) -> bool
+trait Ord: PartialOrd
 ```
+
+A **total** order: every two values compare, so of `a < b`, `a == b` and `a > b` exactly one
+holds, and `a <= b` is `!(b < a)`. It declares nothing of its own -- the comparisons are
+`PartialOrd`'s -- and is the promise a sort, a search, a heap and `sysl.math.max` need, since each
+of those goes wrong on a pair that is not ordered.
+
+**`impl Ord for T` with `lt` in it is the whole implementation**: the compiler files the block's
+`lt` as `T`'s `PartialOrd`, with `le` answered as `!rhs.lt(self)`, which is the one reading a
+total order allows. An empty `impl Ord for T` is the promise alone, for a type whose `PartialOrd`
+is written or derived separately. `derives Ord` derives `PartialOrd` and refuses a field whose
+type is not `Ord` itself -- a float above all -- naming it.
+
+### `PartialOrd`
+
+```sysl
+trait PartialOrd
+    lt(self, rhs: Self) -> bool
+    le(self, rhs: Self) -> bool
+```
+
+An order that may leave two values **unordered**: `<`, `>`, `<=` and `>=` are all false between
+them. A float is the type that needs it, since a NaN is neither less than, greater than nor equal
+to any value, itself included -- so a float is `PartialOrd` and not `Ord`.
+
+`<` and `>` are `lt`, the second with its operands exchanged, and `<=` and `>=` are `le` the same
+way. Both are stated because neither follows from the other once values may be unordered:
+`!(b < a)` is true of a NaN and a number, and `a <= b` is not.
+
+**An `impl Ord` writing `lt` alone is this trait's implementation as well**, with `le` the
+default below -- which is right for a total order and only for one. A block written for this
+trait by hand is held to writing `le` itself, so that no partial order answers with the total
+order's rule by omission.
 
 | Member | Signature | Description |
 |---|---|---|
 | `lt` | `lt(self, rhs: Self) -> bool` |  |
+| `le` | `le(self, rhs: Self) -> bool` |  |
 
 ### `Rem`
 
@@ -2103,35 +2135,17 @@ impl One for real
 impl[A: Ord] Ord for (..A)
 ```
 
-Lexicographic, and written as a ladder rather than as `<` on each part in turn because deciding a
-position takes *two* comparisons: this one is less, or it is greater, or the two agree and the
-next position decides. Every position runs the same ladder and all-tied ends `false` -- a tuple is
-not less than one it agrees with everywhere. Written per arity this needed a last position that
-ended with a bare `<`, having no next position to fall through to; the loop has no such case.
-
 ### Ord for []T
 
 ```sysl
 impl[T: Ord] Ord for []T
 ```
 
-Lexicographic, first element first, and a shorter sequence ordering before a longer one it is a
-prefix of -- which is the rule a string already follows and the one a tuple's `Ord` follows over
-its parts.
-
-The ladder is the tuple's and is written for the same reason: deciding a position takes **two**
-comparisons, since this one is less, or it is greater, or the two agree and the next position
-decides. All-tied then falls through to the lengths, so `[1, 2]` is less than `[1, 2, 3]` and two
-equal sequences are not less than each other.
-
 ### Ord for [N]T
 
 ```sysl
 impl[const N: usize, T: Ord] Ord for [N]T
 ```
-
-Every array of an orderable element, delegating to the slice exactly as `Eq` does. Two arrays of
-one type have one length, so the length test the slice ends on can never decide here.
 
 ### Ord for never
 
@@ -2143,6 +2157,59 @@ impl Ord for never
 
 ```sysl
 impl Ord for unit
+```
+
+### PartialOrd for (..A)
+
+```sysl
+impl[A: PartialOrd] PartialOrd for (..A)
+```
+
+Lexicographic, and written as a ladder rather than as `<` on each part in turn because deciding a
+position takes *two* comparisons: this one is less, or it is not at most the other (greater, or
+unordered with it -- a NaN part) and the answer is decided, or the two agree and the next position
+decides. Every position runs the same ladder; all-tied ends `false` for `lt` and `true` for `le`.
+Written per arity this needed a last position that ended with a bare `<`, having no next position
+to fall through to; the loop has no such case.
+
+A tuple is partially ordered when its parts are, and **totally ordered exactly when every part
+is** -- so `(int, string)` is `Ord` and `(real, int)` is only `PartialOrd`.
+
+### PartialOrd for []T
+
+```sysl
+impl[T: PartialOrd] PartialOrd for []T
+```
+
+Lexicographic, first element first, and a shorter sequence ordering before a longer one it is a
+prefix of -- which is the rule a string already follows and the one a tuple's `Ord` follows over
+its parts.
+
+The ladder is the tuple's and is written for the same reason: deciding a position takes **two**
+comparisons, since this one is less, or it is not at most the other (greater, or unordered with
+it), or the two agree and the next position decides. All-tied then falls through to the lengths,
+so `[1, 2]` is less than `[1, 2, 3]` and two equal sequences are each at most the other. A slice
+is `Ord` exactly when its element is, and `PartialOrd` when its element is only that.
+
+### PartialOrd for [N]T
+
+```sysl
+impl[const N: usize, T: PartialOrd] PartialOrd for [N]T
+```
+
+Every array of an orderable element, delegating to the slice exactly as `Eq` does. Two arrays of
+one type have one length, so the length test the slice ends on can never decide here.
+
+### PartialOrd for never
+
+```sysl
+impl PartialOrd for never
+```
+
+### PartialOrd for unit
+
+```sysl
+impl PartialOrd for unit
 ```
 
 ### Writer for Counting

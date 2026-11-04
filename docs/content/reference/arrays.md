@@ -615,7 +615,7 @@ language supplies both.
 
 **A pointer to something with a subscript of its own is indexed as that thing.** The `*[N]T` above
 is one; a pointer to a container indexed through a trait (the next section) is the other. `p[i]` on a
-`*Buf[int]` is the `i`th element, checked by the `Buf` — exactly what `p.at(i)`, `p.len()` and
+`*Buf[int]` is the `i`th element, checked by the `Buf` — exactly what `p.len()` and
 `(*p)[i]` reach — and a write through it lands in the element, never the `i`th `Buf` along:
 
 ```sysl
