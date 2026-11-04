@@ -849,6 +849,25 @@ hands back a plain `string` rather than something a caller has to validate.
 be `from_utf8_unchecked` with a longer name and none of its greppability. The two shapes look
 interchangeable and are not: a `Writer` is a sink for bytes and a builder is a producer of text.
 
+**For the same reason the buffer behind a builder is not reachable from outside `sysl.text`.** Its
+`bytes` field is private to the module, as the `Vec` inside Rust's `String` is, because a byte pushed
+into it from outside could make `finish` hand back an invalid `string`. What a program may do is read:
+`as_bytes` is a read-only view of what has been gathered so far, as `String::as_bytes` is.
+
+```sysl
+import sysl.text.str_builder
+
+var b = str_builder()
+
+b.push_char('é')
+print(b.as_bytes.len, b.as_bytes[0])
+b.bytes.push(255)
+```
+
+```error
+field 'bytes' of 'StrBuilder' is private to module 'sysl.text'
+```
+
 **`push_int`, `push_uint`, `push_real` and `push_bool` exist so that gathering a number costs no
 allocation.** The spelling without them is `push(n.to_string())`, which builds a whole reference-counted
 `string` — a heap object with a refcount and a deallocation hook — copies its bytes out, and drops

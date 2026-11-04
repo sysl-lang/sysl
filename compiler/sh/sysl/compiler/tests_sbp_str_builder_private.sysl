@@ -1,0 +1,119 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.Search
+
+// A `StrBuilder` hands its bytes to `from_utf8_unchecked` in `finish`, so the buffer behind it must
+// not be writable from outside the library. These hold that, and that everything a program may do
+// with a builder still works.
+
+private sbp_ready() -> bool
+    if xvr_no_library() then return false
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+    end if
+
+    true
+end sbp_ready
+
+private sbp_build_run(text: string) -> Result[(string, bool), string]
+    val root = make_temp_dir("sysl-sbp").unwrap()
+
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return Err(failure_text(why))
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> Err("the program that was built could not be run")
+        Ok(out) -> Ok((out.text, out.status.ok()))
+end sbp_build_run
+
+private sbp_prints(text: string, want: string)
+    sbp_build_run(text) match
+        Err(why) -> assert(false, why)
+        Ok((out, clean)) ->
+            assert_eq(out, want)
+            assert(clean, s"it did not exit cleanly, having printed: $out")
+
+private sbp_refused(text: string, at: string)
+    sbp_build_run(text) match
+        Ok((out, _)) -> assert(false, s"it compiled, and printed: $out")
+        Err(said) ->
+            assert(said.contains("error: field 'bytes' of 'StrBuilder' is private to module 'sysl.text'\n"), said)
+            assert(said.contains(s"/$at\n"), said)
+
+@test("a byte pushed into a builder from outside the library is refused")
+sbp_a_write_is_refused()
+    if !sbp_ready() then return
+
+    sbp_refused(raw"""
+        import sysl.text.str_builder
+
+        var b = str_builder()
+        b.bytes.push(255)
+        print(b.finish().len)
+        """, "main.sysl:4:3")
+end sbp_a_write_is_refused
+
+@test("reading the buffer, replacing it and taking its length are refused too")
+sbp_every_access_is_refused()
+    if !sbp_ready() then return
+
+    sbp_refused(raw"""
+        import sysl.text.str_builder
+
+        val b = str_builder()
+        print(b.bytes.len())
+        """, "main.sysl:4:9")
+    sbp_refused(raw"""
+        import sysl.text.{str_builder, StrBuilder}
+
+        var b = str_builder()
+        var c = str_builder()
+        b.bytes = c.bytes
+        """, "main.sysl:5:3")
+end sbp_every_access_is_refused
+
+@test("every public method works, multi-byte characters and as_bytes included")
+sbp_the_methods_still_work()
+    if !sbp_ready() then return
+
+    sbp_prints(raw"""
+        import sysl.text.{str_builder, str_builder_with_capacity}
+
+        var b = str_builder_with_capacity(4)
+        b.push("h")
+        b.push_char('é')
+        b.push_char('€')
+        b.push_char('😀')
+        b.push_int(-42)
+        b.push_uint(7)
+        b.push_bool(true)
+        b.push_real(1.5)
+        print(b.len, b.is_empty, b.as_bytes.len, b.as_bytes[1], b.finish())
+        b.clear()
+        print(b.len, b.is_empty, b.finish().len)
+        """, "21 false 21 195 hé€😀-427true1.5\n0 true 0\n")
+end sbp_the_methods_still_work
+
+@test("the compiler's HTML escape builds its text through the builder's methods only")
+sbp_hl_escape_keeps_multibyte_text()
+    assert_eq(hl_escape(""), "")
+    assert_eq(hl_escape("plain"), "plain")
+    assert_eq(hl_escape("<é&€>\"😀'"), "&lt;é&amp;€&gt;&quot;😀&#39;")
+    assert_eq(hl_escape("&"), "&amp;")
+end sbp_hl_escape_keeps_multibyte_text
