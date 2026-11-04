@@ -419,7 +419,7 @@ print(sum == null)
 ```
 
 ```error
-'atomic_add' is arithmetic, and what an address plus a number means is the question the raw tier does not answer — use 'atomic_swap' or 'atomic_cas' to change a pointer, or do the arithmetic on a 'usize' beside it
+'add' is arithmetic, and what an address plus a number means is the question the raw tier does not answer — use 'swap' or 'cas' to change a pointer, or do the arithmetic on a 'usize' beside it
 ```
 
 **A `bool` is atomic as the byte it is stored in**, as C's `atomic_bool` and Rust's `AtomicBool`
@@ -450,13 +450,13 @@ print(ready.add(true))
 ```
 
 ```error
-'atomic_add' is arithmetic, and a 'bool' is a flag rather than a number
+'add' is arithmetic, and a 'bool' is a flag rather than a number
 ```
 
 **Read where those diagnostics point.** An element type no instruction exists for is refused at the
-line that names `Atomic[T]`, once. The members refused on a pointer or a flag are refused by the form
-inside the method, so their caret is on a line in `library/sysl/sync/atomic.sysl` — the method is
-ordinary library sysl like everything else here.
+line that names `Atomic[T]`, once. A member refused on a pointer or a flag is refused at the call
+that wrote it (`flag.add(1)`), once, and the method is never instantiated, so no caret lands in
+`library/sysl/sync/atomic.sysl`.
 
 ### The narrowing on `load` and `store` lands at run time
 

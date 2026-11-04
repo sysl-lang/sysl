@@ -336,3 +336,36 @@ check_atomic_element(a: &Analysis, scope: Scope, span: Span, key: string, targs:
 
     false
 end check_atomic_element
+
+// Refuses, at the call a program wrote, a member of `Atomic[T]` that means nothing at a `T` which is
+// otherwise valid, and answers whether the call may go on.
+//
+// A flag takes the bitwise members but not `add` or `sub`; a pointer takes `load`, `store`, `swap`
+// and `cas` and none of the arithmetic or bitwise ones. The raw forms inside the member refuse the
+// same pairs (`atomic_pointee`), but they are read in the library's own body, so a program would be
+// shown a line of `atomic.sysl` for a mistake on its own line. The call is refused instead and the
+// member is never instantiated.
+check_atomic_member(cx: &Analyzer, span: Span, rty: Type, name: string) -> bool
+    repr(rty) match
+        Struct(d) ->
+            if qualified_name(d.base) != "sysl.sync.Atomic" || d.targs.len() != 1 then return true
+
+            underlying(d.targs.at(0)) match
+                Bool ->
+                    if name != "add" && name != "sub" then return true
+
+                    cx.fault(span, s"'$name' is arithmetic, and a 'bool' is a flag rather than a number " +
+                             "— use 'or', 'and' or 'xor' to change one, or count in an integer")
+                    false
+                Ptr(_) ->
+                    if name != "add" && name != "sub" && name != "and" && name != "or" && name != "xor" then
+                        return true
+
+                    cx.fault(span, s"'$name' is arithmetic, and what an address plus a number " +
+                             "means is the question the raw tier does not answer — use " +
+                             "'swap' or 'cas' to change a pointer, or do the " +
+                             "arithmetic on a 'usize' beside it")
+                    false
+                _ -> true
+        _ -> true
+end check_atomic_member
