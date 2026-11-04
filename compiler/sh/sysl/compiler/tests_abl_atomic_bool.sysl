@@ -1,0 +1,264 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.fs.{make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// `Atomic[bool]`: a flag two threads share, lowered as the byte it is stored in, with the bitwise
+// operations and none of the arithmetic. And an element type no atomic instruction exists for is
+// refused where the program names it, once, rather than inside the library's methods.
+
+private abl_ready() -> bool = std_root().is_ok() && clang_available()
+
+// What `text` (as `main.sysl`) prints, or the refusal prefixed with `!`.
+private abl_run(text: string) -> string
+    val root = make_temp_dir("sysl-abl").unwrap()
+
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+    val built = build_native_program(root, None, None, DefaultOptimization, Some(exe))
+
+    built match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return s"!${failure_text(why)}"
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "!could not run"
+        Ok(out) -> out.text.trim()
+end abl_run
+
+private abl_count(text: string, part: string) -> int
+    var n = 0
+    var from = 0
+
+    loop
+        val rest = text[from..]
+
+        rest.index_of(part) match
+            None -> return n
+            Some(i) ->
+                n += 1
+                from += i + part.len
+
+    n
+end abl_count
+
+@test("abl: load, store and swap on a flag")
+abl_load_store_swap()
+    if !abl_ready() then return
+
+    assert_eq(abl_run(raw"""
+        import sysl.sync.*
+
+        var f = Atomic(false)
+
+        print(f.load())
+        f.store(true)
+        print(f.load())
+        print(f.swap(false))
+        print(f.load())
+        """), "false\ntrue\ntrue\nfalse")
+end abl_load_store_swap
+
+@test("abl: compare-exchange answers the value it found, on success and on failure")
+abl_cas()
+    if !abl_ready() then return
+
+    assert_eq(abl_run(raw"""
+        import sysl.sync.*
+
+        var f = Atomic(false)
+
+        print(f.cas(false, true))
+        print(f.load())
+        print(f.cas(false, true))
+        print(f.load())
+        print(f.cas(true, false, Relaxed))
+        print(f.load())
+        """), "false\ntrue\ntrue\ntrue\ntrue\nfalse")
+end abl_cas
+
+@test("abl: and, or and xor answer what was there before and keep the flag a 0 or a 1")
+abl_bitwise()
+    if !abl_ready() then return
+
+    assert_eq(abl_run(raw"""
+        import sysl.sync.*
+
+        var f = Atomic(false)
+
+        print(f.or(true))
+        print(f.load())
+        print(f.and(false))
+        print(f.load())
+        print(f.xor(true))
+        print(f.load())
+        print(f.xor(true))
+        print(f.load())
+        print(f.and(true))
+        print(f.load())
+        if f.load() then print("set") else print("clear")
+        """), "false\ntrue\ntrue\nfalse\nfalse\ntrue\ntrue\nfalse\nfalse\nfalse\nclear")
+end abl_bitwise
+
+@test("abl: every ordering that applies is accepted on a flag")
+abl_orderings()
+    if !abl_ready() then return
+
+    assert_eq(abl_run(raw"""
+        import sysl.sync.*
+
+        var f = Atomic(false)
+
+        f.store(true, Release)
+        print(f.load(Acquire))
+        print(f.swap(false, AcqRel))
+        print(f.load(Relaxed))
+        """), "true\ntrue\nfalse")
+end abl_orderings
+
+@test("abl: the instruction is an i8 atomic, widened and narrowed around it")
+abl_lowering()
+    if !abl_ready() then return
+
+    val ir = abl_ir(raw"""
+        import sysl.sync.*
+
+        var f = Atomic(false)
+
+        f.store(true)
+        print(f.load())
+        """)
+
+    assert(ir.index_of("load atomic i8").is_some(), ir)
+    assert(ir.index_of("store atomic i8").is_some(), ir)
+    assert(ir.index_of("atomic i1").is_none(), ir)
+end abl_lowering
+
+private abl_ir(text: string) -> string
+    val root = make_temp_dir("sysl-abl-ir").unwrap()
+
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val out = emit_llvm_text(s"$root/main.sysl", None) match
+        Err(why) -> s"did not compile: ${why.message}"
+        Ok(made) ->
+            if !made.report.is_empty() then s"did not compile: ${analysis_report(made.report)}"
+            else made.text
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end abl_ir
+
+@test("abl: one thread spins on a flag the other sets, and the program ends")
+abl_two_threads()
+    if !abl_ready() then return
+
+    assert_eq(abl_run(raw"""
+        import sysl.sync.*
+        import sysl.threads.*
+
+        setter(f: *Atomic[bool])
+            f.store(true)
+
+        var flag = Atomic(false)
+        var t = spawn(&setter, &flag).unwrap()
+
+        while !flag.load(Acquire)
+            spin_hint()
+
+        t.join()
+        print("seen")
+        """), "seen")
+end abl_two_threads
+
+@test("abl: a flag as a field of a struct shared with &sync")
+abl_field_in_shared_struct()
+    if !abl_ready() then return
+
+    assert_eq(abl_run(raw"""
+        import sysl.sync.*
+        import sysl.threads.scope
+
+        struct Link
+            quit: Atomic[bool]
+            hits: Atomic[int]
+
+        val link: &sync Link = Link(Atomic(false), Atomic(0))
+
+        scope((s) ->
+            s.spawn(() ->
+                link.hits.add(1)
+                link.quit.store(true))
+
+            while !link.quit.load()
+                spin_hint())
+
+        print(link.hits.load(), link.quit.load())
+        """), "1 true")
+end abl_field_in_shared_struct
+
+@test("abl: a struct element is refused at the line that names it, once")
+abl_struct_refused_at_the_users_line()
+    if !abl_ready() then return
+
+    val out = abl_run("import sysl.sync.*\n\nstruct Point\n    x: i32\n    y: i32\n\n" +
+                      "var here = Atomic(Point(1, 2))\n\nprint(here.load().x)\nprint(here.load().y)\n")
+
+    assert(out.starts_with("!"), out)
+    assert(out.index_of("main.sysl:7").is_some(), out)
+    assert(out.index_of("atomic.sysl").is_none(), out)
+    assert_eq(abl_count(out, "cannot be made"), 1)
+    assert(out.index_of("An aggregate is what a 'SpinLock' or a '&sync Mutex[T]' is for").is_some(), out)
+end abl_struct_refused_at_the_users_line
+
+@test("abl: a float is refused where it is named, in words about floats")
+abl_float_refused()
+    if !abl_ready() then return
+
+    val out = abl_run("import sysl.sync.*\n\nvar f: Atomic[real] = Atomic(1.5)\n\nprint(f.load())\n")
+
+    assert(out.index_of("main.sysl:3").is_some(), out)
+    assert_eq(abl_count(out, "cannot be made"), 1)
+    assert(out.index_of("is a float").is_some(), out)
+    assert(out.index_of("An aggregate").is_none(), out)
+end abl_float_refused
+
+@test("abl: a 128-bit integer is refused where it is named, in words about widths")
+abl_wide_integer_refused()
+    if !abl_ready() then return
+
+    val out = abl_run("import sysl.sync.*\n\nvar w: Atomic[u128] = Atomic(0u128)\n\nprint(w.load())\n")
+
+    assert(out.index_of("main.sysl:3").is_some(), out)
+    assert_eq(abl_count(out, "cannot be made"), 1)
+    assert(out.index_of("u128 is 128").is_some(), out)
+    assert(out.index_of("An aggregate").is_none(), out)
+end abl_wide_integer_refused
+
+@test("abl: arithmetic on a flag is refused with a reason")
+abl_arithmetic_refused()
+    if !abl_ready() then return
+
+    val out = abl_run("import sysl.sync.*\n\nvar f = Atomic(false)\n\nprint(f.add(true))\n")
+
+    assert(out.index_of("'atomic_add' is arithmetic, and a 'bool' is a flag rather than a number").is_some(), out)
+    assert_eq(abl_count(out, "is arithmetic"), 1)
+end abl_arithmetic_refused
+
+@test("abl: subtraction on a flag is refused too")
+abl_subtraction_refused()
+    if !abl_ready() then return
+
+    val out = abl_run("import sysl.sync.*\n\nvar f = Atomic(false)\n\nprint(f.sub(true))\n")
+
+    assert(out.index_of("'atomic_sub' is arithmetic, and a 'bool' is a flag rather than a number").is_some(), out)
+end abl_subtraction_refused
