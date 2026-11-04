@@ -1805,7 +1805,26 @@ into it, because the compiler's cached standard module is not something a C link
 — an archive referring to it would fail at that link naming a `sysl$` symbol its author has no way to
 place. So `--std-lib` is
 refused here and `--no-std-lib` asks for what already happens. The cost, which is accepted: two
-`build-c` archives linked into one program each carry the part of the library they reach. Its members
+`build-c` archives linked into one program each carry the part of the library they reach.
+
+**What an archive offers the link is its C names and nothing else.** Every sysl function is named
+under a spelling no C declaration can use (`sysl$prints`, `helper$$sysl`, `sysl.buf$Buf.push.P`), and
+in an archive every such definition is internal to it: only the `@export` names the header declares,
+and the runtime's own C-named hooks, are global. So two archives — or an archive and a sysl program —
+link into one image without colliding, and neither can reach into the other: a root function
+`helper` in each, or a `Buf[P]` over two different root types `P`, stay two. Merging same-named
+definitions instead would not be safe, since a name does not fix what it names across two
+compilations.
+
+**Which state is shared follows from that.** The heap is one: every archive allocates through the
+program's pair — libc's `malloc` and `free`, or the pair an `allocator` block names — so a string one
+archive builds may be freed by another. Standard output is one: `print` writes through C's `stdout`, so
+lines from both archives and from the C program come out in the order they were written. **The
+library's module storage is one copy per archive** — the `sysl.log` level and sink, the
+`sysl.signal` watchers, the `sysl.tty` mode — so a level one archive sets is not the other's, and each
+archive answers for its own.
+
+An archive's members
 are native objects whatever the manifest's `lto` key says — bitcode would link only under
 `clang -fuse-ld=lld`, never under GNU ld or gcc — unless `--lto thin` or `full` on the `build-c`
 command line asks for a bitcode archive, for a host that links with clang and lld and wants its link
