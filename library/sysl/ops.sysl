@@ -104,6 +104,13 @@ trait Eq
 trait Ord
     lt(self, rhs: Self) -> bool
 
+    /** `a <= b`, which a type that promised a total order never writes: the default is `!lt(b, a)`.
+     * A type with unordered values -- a product holding a float -- replaces it, because `NaN` is
+     * neither less nor greater and negating `lt` would answer `true`. `a >= b` is this with the
+     * operands exchanged.
+     */
+    le(self, rhs: Self) -> bool = !rhs.lt(self)
+
     /** What `derives Ord` writes: lexicographic, first field first, as a ladder -- deciding a
      * position takes two comparisons, this one is less or it is greater or the two agree and the
      * next field decides, and all-tied ends `false`. A data enum orders by variant first, in
@@ -150,9 +157,48 @@ trait Ord
             for const f in T::Fields
                 if self.(f) < rhs.(f) then return true
                 if rhs.(f) < self.(f) then return false
+                if !(self.(f) <= rhs.(f)) then return false
 
             false
     end lt
+
+    /** What `derives Ord` writes for `<=`: the same ladder, ending `true` where `lt` ends `false`,
+     * and a position whose two values are neither less, greater nor equal -- a float `NaN` on
+     * either side -- decides `false`, as it does for a scalar. A field's own `<=` is asked, so a
+     * nested product answers the same way.
+     */
+    derive[T] le(self: T, rhs: T) -> bool
+        if const T::Kind == Kind.SimpleEnum
+            int(self) <= int(rhs)
+        elif const T::Kind == Kind.DataEnum
+            var l: usize = 0
+            var r: usize = 0
+
+            for const c in T::Variants
+                if self is c then l = c.index
+                if rhs is c then r = c.index
+
+            if l != r then return l < r
+
+            for const c in T::Variants
+                if self is c
+                    val a = self.(c)
+                    val b = rhs.(c)
+
+                    for const f in c::Fields
+                        if a.(f) < b.(f) then return true
+                        if b.(f) < a.(f) then return false
+                        if !(a.(f) <= b.(f)) then return false
+
+            true
+        else
+            for const f in T::Fields
+                if self.(f) < rhs.(f) then return true
+                if rhs.(f) < self.(f) then return false
+                if !(self.(f) <= rhs.(f)) then return false
+
+            true
+    end le
 
 // A tuple is comparable, hashable and printable exactly when its parts are, which is what these
 // rows say: the membership is *structural*, so nothing has to be written per tuple type.
@@ -181,9 +227,22 @@ impl[..A: Ord] Ord for (..A)
         for const i in 0..<A.len
             if self.i < rhs.i then return true
             if rhs.i < self.i then return false
+            if !(self.i <= rhs.i) then return false
 
         false
     end lt
+
+    /** `<=` over the parts: the ladder of `lt` ending `true`, a position holding an unordered pair
+     * (a `NaN` part) deciding `false`.
+     */
+    override le(self, rhs: Self) -> bool
+        for const i in 0..<A.len
+            if self.i < rhs.i then return true
+            if rhs.i < self.i then return false
+            if !(self.i <= rhs.i) then return false
+
+        true
+    end le
 
 /** Mixed with the same FNV prime the string hash uses, so that the parts' order matters -- `(1, 2)`
  * and `(2, 1)` are different keys, and a plain XOR would make them the same one. The fold starts at
@@ -355,15 +414,28 @@ impl[T: Ord] Ord for []T
         for i in 0..<n
             if self[i] < rhs[i] then return true
             if rhs[i] < self[i] then return false
+            if !(self[i] <= rhs[i]) then return false
 
         self.len < rhs.len
     end lt
+
+    override le(self, rhs: Self) -> bool
+        val n = if self.len < rhs.len then self.len else rhs.len
+
+        for i in 0..<n
+            if self[i] < rhs[i] then return true
+            if rhs[i] < self[i] then return false
+            if !(self[i] <= rhs[i]) then return false
+
+        self.len <= rhs.len
+    end le
 
 /** Every array of an orderable element, delegating to the slice exactly as `Eq` does. Two arrays of
  * one type have one length, so the length test the slice ends on can never decide here.
  */
 impl[const N: usize, T: Ord] Ord for [N]T
     lt(self, rhs: Self) -> bool = self[..] < rhs[..]
+    override le(self, rhs: Self) -> bool = self[..] <= rhs[..]
 
 /** Mixed with the same FNV prime the tuple's hash uses, so that position matters: `[1, 2]` and
  * `[2, 1]` are different keys, where a plain XOR would make them one.
