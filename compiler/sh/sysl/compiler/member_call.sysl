@@ -2775,8 +2775,21 @@ private no_such_member(cx: &Analyzer, span: Span, rty: Type, name: string) -> TE
     underlying(rty) match
         Struct(_) -> cx.err(span, hinted(cx, rty, s"'${type_show(rty)}' has no field or property '$name'"))
         Enum(_) -> cx.err(span, hinted(cx, rty, s"'${type_show(rty)}' has no property '$name'"))
-        _ -> cx.err(span, s"cannot read field '$name' of ${type_show(rty)}")
+        _ -> cx.err(span, s"cannot read field '$name' of ${type_show(rty)}${data_pointer_hint(rty, name)}")
 end no_such_member
+
+// What a refusal of a data-pointer name (`ptr`, `data`, `as_ptr`) on a slice or an array adds: the
+// capability is the library's `as_ptr` / `as_mut_ptr`, not a member. Nothing for any other type or name.
+private data_pointer_hint(rty: Type, name: string) -> string
+    if name != "ptr" && name != "data" && name != "as_ptr" && name != "as_mut_ptr" then return ""
+
+    underlying(rty) match
+        Slice(_, _) -> data_pointer_sentence
+        Array(_, _) -> data_pointer_sentence
+        _ -> ""
+
+private val data_pointer_sentence: string = " — its data pointer is `as_ptr(xs)` from `sysl.slices` (null when " +
+                                            "empty), or `as_mut_ptr(xs)` for a writable view"
 
 private no_such_method(cx: &Analyzer, span: Span, receiver: TExpr, rty: Type, base: string,
                        name: string, args: Buf[Expr]) -> TExpr
@@ -2802,6 +2815,9 @@ private no_such_method(cx: &Analyzer, span: Span, receiver: TExpr, rty: Type, ba
 
         return cx.err(span, s"type '${member_key(cx.an, bottom, name).0}' has no method '$name'")
     end if
+
+    if data_pointer_hint(rty, name) != "" then
+        return cx.err(span, s"type '${type_show(rty)}' has no method '$name'${data_pointer_hint(rty, name)}")
 
     // A member the compiler provides, written with parentheses it does not take.
     if builtin_member(rty, name) then
