@@ -1,0 +1,165 @@
+module sh.sysl.compiler
+@tests
+
+// **A `const` declared inside a body is compared against in a `match` pattern**, as one at the top of
+// a file is. It is never a fresh name that matches every value. Each claim is a whole program, built
+// and run, and each is checked with a scrutinee that equals the constant and one that does not.
+
+@test("a body const is compared by value: the equal scrutinee takes its arm, the other falls through")
+bkp_compared_by_value()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        sq(x: int) -> int = x * x
+
+        pick(n: int) -> string
+            const L: int = sq(6)
+            n match
+                L -> "L"
+                _ -> "other"
+
+        main()
+            print(pick(36), pick(5))
+        """), "L other\n")
+end bkp_compared_by_value
+
+@test("a body const written with a backtick is compared too")
+bkp_quoted()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        pick(n: int) -> string
+            const L: int = 4
+            n match
+                `L` -> "L"
+                _ -> "other"
+
+        main()
+            print(pick(4), pick(5))
+        """), "L other\n")
+end bkp_quoted
+
+@test("an int body const is read at a u8 scrutinee's type")
+bkp_u8_scrutinee()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        pick(n: u8) -> string
+            const L: int = 200
+            n match
+                L -> "L"
+                _ -> "other"
+
+        main()
+            print(pick(200), pick(7))
+        """), "L other\n")
+end bkp_u8_scrutinee
+
+@test("a body const that does not fit the scrutinee is refused")
+bkp_does_not_fit()
+    if !enm_ready() then return
+
+    val said = enm_ran(raw"""
+        pick(n: u8) -> string
+            const L: int = 300
+            n match
+                L -> "L"
+                _ -> "other"
+
+        main()
+            print(pick(44))
+        """)
+
+    assert(said.contains("pattern is int but the value is byte"), said)
+end bkp_does_not_fit
+
+@test("char, bool and string body consts are compared")
+bkp_other_types()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        c(x: char) -> string
+            const K: char = 'k'
+            x match
+                K -> "K"
+                _ -> "other"
+
+        b(x: bool) -> string
+            const T: bool = true
+            x match
+                T -> "T"
+                _ -> "other"
+
+        s(x: string) -> string
+            const S: string = "a" + "b"
+            x match
+                S -> "S"
+                _ -> "other"
+
+        main()
+            print(c('k'), c('j'), b(true), b(false), s("ab"), s("cd"))
+        """), "K other T other S other\n")
+end bkp_other_types
+
+@test("a body const shadows a module const of the same name")
+bkp_shadows_module_const()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        const L: int = 1
+
+        pick(n: int) -> string
+            const L: int = 2
+            n match
+                L -> "L"
+                _ -> "other"
+
+        main()
+            print(pick(2), pick(1))
+        """), "L other\n")
+end bkp_shadows_module_const
+
+@test("a body const in an or-pattern and nested in Some")
+bkp_or_and_nested()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        either(n: int) -> string
+            const A: int = 1
+            const B: int = 2
+            n match
+                A | B -> "ab"
+                _ -> "other"
+
+        inner(o: Option[int]) -> string
+            const L: int = 9
+            o match
+                Some(L) -> "L"
+                Some(_) -> "some"
+                None -> "none"
+
+        main()
+            print(either(1), either(2), either(3), inner(Some(9)), inner(Some(8)), inner(None))
+        """), "ab ab other L some none\n")
+end bkp_or_and_nested
+
+@test("a body const in a generic function and in a closure body")
+bkp_generic_and_closure()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        pick[T](x: T, n: int) -> string
+            const L: int = 3
+            n match
+                L -> "L"
+                _ -> "other"
+
+        main()
+            val f = (n: int) ->
+                const M: int = 5
+                n match
+                    M -> "M"
+                    _ -> "other"
+            print(pick("x", 3), pick(1.5, 4), f(5), f(6))
+        """), "L other M other\n")
+end bkp_generic_and_closure
