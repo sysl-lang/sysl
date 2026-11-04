@@ -1,0 +1,318 @@
+module sh.sysl.compiler
+@tests
+
+// **A constant in a pattern** (`reference/patterns.md § A dead arm`, `reference/modules.md § const`).
+// One of an enum is the variant it came to, as a const pattern is in Rust, so it counts toward
+// covering the enum and toward making a later arm dead. One of any other type is the literal it came
+// to, compared by value. Neither is ever a wildcard, and a `const` written inside the body is never a
+// fresh name that binds. The helpers are `tests_enm_enum_run.sysl`'s.
+
+private kpt_access() -> string = raw"""
+    enum Access
+        Read
+        Write
+        Both
+
+    const R = Access.Read
+    const W = Access.Write
+    const B: Access = Access.Both
+    """
+
+@test("constants naming every variant cover the enum with no catch-all")
+kpt_enum_consts_alone_are_exhaustive()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(kpt_access() + raw"""
+
+        name(a: Access) -> string = a match
+            R -> "read"
+            W -> "write"
+            B -> "both"
+
+        print(name(Access.Read), name(Access.Write), name(Access.Both))
+        """), "read write both\n")
+end kpt_enum_consts_alone_are_exhaustive
+
+@test("constants naming some variants leave the catch-all alive, and short of one are not exhaustive")
+kpt_partial_consts_and_a_live_catch_all()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(kpt_access() + raw"""
+
+        name(a: Access) -> string = a match
+            R -> "read"
+            W -> "write"
+            _ -> "rest"
+
+        print(name(Access.Read), name(Access.Write), name(Access.Both))
+        """), "read write rest\n")
+
+    val said = enm_err(kpt_access() + raw"""
+
+        name(a: Access) -> int = a match
+            R -> 1
+            W -> 2
+
+        print(name(Access.Read))
+        """)
+
+    assert(said.contains("match on 'Access' is not exhaustive; missing Both"), said)
+end kpt_partial_consts_and_a_live_catch_all
+
+@test("the same constant twice is a dead arm")
+kpt_a_repeated_const_is_dead()
+    if !enm_ready() then return
+
+    val said = enm_err(kpt_access() + raw"""
+
+        f(a: Access) -> int = a match
+            W -> 1
+            W -> 2
+            _ -> 3
+
+        print(f(Access.Read))
+        """)
+
+    assert(said.contains("unreachable pattern 'W': every value it matches is already matched by the arm on line"), said)
+end kpt_a_repeated_const_is_dead
+
+@test("a constant after its own variant is dead, and the variant after the constant is too")
+kpt_a_const_and_its_variant_are_one_pattern()
+    if !enm_ready() then return
+
+    val after_variant = enm_err(kpt_access() + raw"""
+
+        f(a: Access) -> int = a match
+            Write -> 1
+            W -> 2
+            _ -> 3
+
+        print(f(Access.Read))
+        """)
+
+    assert(after_variant.contains("unreachable pattern 'W'"), after_variant)
+
+    val after_const = enm_err(kpt_access() + raw"""
+
+        f(a: Access) -> int = a match
+            W -> 1
+            Write -> 2
+            _ -> 3
+
+        print(f(Access.Read))
+        """)
+
+    assert(after_const.contains("unreachable pattern 'Write'"), after_const)
+
+    // A constant mixed with variants covers the enum between them.
+    assert_eq(enm_ran(kpt_access() + raw"""
+
+        f(a: Access) -> int = a match
+            Read -> 1
+            W -> 2
+            Both -> 3
+
+        print(f(Access.Read), f(Access.Write), f(Access.Both))
+        """), "1 2 3\n")
+end kpt_a_const_and_its_variant_are_one_pattern
+
+@test("a local constant of an enum is its variant too, and one made by a const function")
+kpt_local_and_computed_enum_consts()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(kpt_access() + raw"""
+
+        const pick() -> Access = Access.Both
+        const P = pick()
+
+        f(a: Access) -> string
+            const K = Access.Read
+            a match
+                K -> "k"
+                W -> "w"
+                P -> "p"
+
+        print(f(Access.Read), f(Access.Write), f(Access.Both))
+        """), "k w p\n")
+
+    val said = enm_err(kpt_access() + raw"""
+
+        f(a: Access) -> int
+            const K = Access.Read
+            a match
+                Read -> 1
+                K -> 2
+                _ -> 3
+
+        print(f(Access.Read))
+        """)
+
+    assert(said.contains("unreachable pattern 'K'"), said)
+end kpt_local_and_computed_enum_consts
+
+@test("integer, char and bool constants match by value, and a duplicate is dead")
+kpt_scalar_consts_by_value()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        const N = 3
+        const C = 'x'
+        const T = true
+
+        i(n: int) -> string = n match
+            N -> "three"
+            _ -> "other"
+
+        c(ch: char) -> string = ch match
+            C -> "ex"
+            _ -> "other"
+
+        b(v: bool) -> string = v match
+            T -> "yes"
+            false -> "no"
+
+        print(i(3), i(4), c('x'), c('y'), b(true), b(false))
+        """), "three other ex other yes no\n")
+
+    for (src, part) in [
+        ("const N = 3\nf(n: int) -> int = n match\n    N -> 1\n    3 -> 2\n    _ -> 3\nprint(f(1))\n",
+         "unreachable pattern '3'"),
+        ("const N = 3\nf(n: int) -> int = n match\n    0..9 -> 1\n    N -> 2\n    _ -> 3\nprint(f(1))\n",
+         "unreachable pattern 'N'"),
+        ("const C = 'x'\nf(c: char) -> int = c match\n    'x' -> 1\n    C -> 2\n    _ -> 3\nprint(f('a'))\n",
+         "unreachable pattern 'C'"),
+        ("const T = true\nf(b: bool) -> int = b match\n    T -> 1\n    false -> 2\n    true -> 3\nprint(f(true))\n",
+         "unreachable pattern 'true'"),
+        ("const T = true\nf(b: bool) -> int = b match\n    T -> 1\n    false -> 2\n    _ -> 3\nprint(f(true))\n",
+         "unreachable pattern '_'")]
+        val said = enm_err(src)
+
+        assert(said.contains(part), s"$part\n$said")
+end kpt_scalar_consts_by_value
+
+@test("a constant inside a body is compared against, never bound, and is read at the scrutinee's type")
+kpt_a_local_const_never_binds()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        f(n: int) -> string
+            const L = 36
+            n match
+                L -> "L"
+                _ -> "other"
+
+        g(n: u8) -> string
+            const L = 36
+            n match
+                L -> "L"
+                _ -> "other"
+
+        print(f(5), f(36), g(5), g(36))
+        """), "other L other L\n")
+
+    val dup = enm_err(raw"""
+        f(n: int) -> int
+            const L = 36
+            n match
+                36 -> 1
+                L -> 2
+                _ -> 3
+
+        print(f(1))
+        """)
+
+    assert(dup.contains("unreachable pattern 'L'"), dup)
+
+    // A value the scrutinee's type cannot hold is a mismatch, not a binding.
+    val wide = enm_err(raw"""
+        f(n: u8) -> int
+            const L = 300
+            n match
+                L -> 1
+                _ -> 2
+
+        print(f(1))
+        """)
+
+    assert(wide.contains("pattern is int but the value is"), wide)
+end kpt_a_local_const_never_binds
+
+@test("a constant in an or-pattern counts as its variant, and is dead after its own variant there")
+kpt_const_in_an_or_pattern()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(kpt_access() + raw"""
+
+        f(a: Access) -> int = a match
+            W | Read -> 1
+            Both -> 2
+
+        print(f(Access.Read), f(Access.Write), f(Access.Both))
+        """), "1 1 2\n")
+
+    val said = enm_err(kpt_access() + raw"""
+
+        f(a: Access) -> int = a match
+            Write | W -> 1
+            _ -> 2
+
+        print(f(Access.Read))
+        """)
+
+    assert(said.contains("unreachable pattern 'W'"), said)
+end kpt_const_in_an_or_pattern
+
+@test("a constant inside a nested pattern is its variant there")
+kpt_const_nested()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(kpt_access() + raw"""
+
+        f(o: Option[Access]) -> string = o match
+            Some(R) -> "r"
+            Some(W) -> "w"
+            Some(B) -> "b"
+            None -> "none"
+
+        print(f(Some(Access.Read)), f(Some(Access.Both)), f(None))
+        """), "r b none\n")
+
+    val said = enm_err(kpt_access() + raw"""
+
+        f(o: Option[Access]) -> int = o match
+            Some(R) -> 1
+            Some(Read) -> 2
+            _ -> 3
+
+        print(f(None))
+        """)
+
+    assert(said.contains("unreachable pattern 'Some(Read)'"), said)
+end kpt_const_nested
+
+@test("a constant of an enum in a generic body is its variant in every copy")
+kpt_const_in_a_generic_body()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(kpt_access() + raw"""
+
+        tag[T](x: T, a: Access) -> (T, int) = a match
+            R -> (x, 1)
+            W -> (x, 2)
+            B -> (x, 3)
+
+        print(tag(7, Access.Write).1, tag("s", Access.Both).1)
+        """), "2 3\n")
+
+    val said = enm_err(kpt_access() + raw"""
+
+        tag[T](x: T, a: Access) -> T = a match
+            R -> x
+            R -> x
+            _ -> x
+
+        print(tag(1, Access.Read))
+        """)
+
+    assert(said.contains("unreachable pattern 'R'"), said)
+end kpt_const_in_a_generic_body

@@ -1,0 +1,514 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// A **bound on an associated type** -- `[T: Element[Real: Width]]`, Rust's associated-type bound
+// spelled in brackets. The type is left open and the body may use what the bound asks of it; a
+// requirement list may carry one (`trait Scalar: Element[Real: Width]`), held at every `impl`.
+// Crossed with: a supertrait, a parameter, `where`, a generic type and an `impl` block, a nested bound,
+// several bounds, an equality binding beside it, a `Self` default, a diamond of requirements, a
+// parameter handed on, and the refusals -- at an `impl`, at a call, on an object, for a name the trait
+// does not declare, for a name fixed and bounded, bounded twice, and outside a trait.
+//
+// Skipped: separate compilation, since a built library carries its source and every bound is read
+// again from it; inferring a parameter from inside the bound (`Real: From[E]`), which nothing solves
+// for -- a bound fixes no type.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private atb_ready() -> bool = std_root().is_ok() && clang_available()
+
+private atb_write(main: string) -> string
+    val root = make_temp_dir("sysl-atb").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(root + "/package.hocon", "package {\n  name = \"probe\"\n}\n").unwrap()
+    write_text(root + "/main.sysl", main).unwrap()
+    root
+end atb_write
+
+// What the program PRINTS, or what the build had to say about it.
+private atb_ran(main: string) -> string
+    val root = atb_write(main)
+    val exe = root + "/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            val said = failure_text(why)
+
+            remove_dir_all(root).unwrap_or(())
+            return said
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end atb_ran
+
+// Everything the analysis had to say about the program.
+private atb_report(main: string) -> string
+    val root = atb_write(main)
+
+    val out = emit_llvm_text(root, None) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> if made.report.is_empty() then made.text else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end atb_report
+
+// The program is refused with exactly this message, first, at this line and column of `main.sysl`.
+private atb_refused(main: string, message: string, at: string)
+    val out = atb_report(main)
+
+    assert(out.starts_with(s"error: $message\n "), s"expected 'error: $message' first, got: $out")
+    assert(out.index_of(s"/main.sysl:$at\n").is_some(), s"expected it at main.sysl:$at, got: $out")
+end atb_refused
+
+// A scalar whose real part has a width, as lapack's `Scalar` wants: `D` chose `f64`, which has one,
+// and `F` chose `f32`, which does not. A program added after it starts at line 25.
+private atb_src() -> string = raw"""
+    trait Width
+        nbits(self) -> int
+
+    trait Element
+        type Real
+        real(self) -> Self::Real
+
+    impl Width for f64
+        nbits(self) -> int = 64
+
+    struct D
+        v: f64
+
+    struct F
+        v: f32
+
+    impl Element for D
+        type Real = f64
+        real(self) -> Self::Real = self.v
+
+    impl Element for F
+        type Real = f32
+        real(self) -> Self::Real = self.v
+
+    """
+
+// -- what a body may assume -----------------------------------------------------------------------
+
+@test("a requirement that bounds an associated type lets a default and a generic body call through it")
+atb_supertrait_bound()
+    if !atb_ready() then return
+
+    assert_eq(atb_ran(atb_src() + raw"""
+        trait Scalar: Element[Real: Width]
+            describe(self) -> int = self.real().nbits() + 1
+
+        impl Scalar for D
+
+        width[T: Scalar](x: T) -> int = x.real().nbits()
+
+        print(D(1.5).describe(), width(D(2.5)))
+        """), "65 64\n")
+
+@test("a type parameter's bound on an associated type lets the body call the bound's methods")
+atb_parameter_bound()
+    if !atb_ready() then return
+
+    assert_eq(atb_ran(atb_src() + raw"""
+        width[T: Element[Real: Width]](x: T) -> int = x.real().nbits()
+
+        print(width(D(1.0)))
+        """), "64\n")
+
+@test("a 'where' clause bounds an associated type as the bracketed list does")
+atb_where_clause()
+    if !atb_ready() then return
+
+    assert_eq(atb_ran(atb_src() + raw"""
+        width[T](x: T) -> int where T: Element[Real: Width] = x.real().nbits()
+
+        print(width(D(1.0)))
+        """), "64\n")
+
+@test("the projection written as a type carries the bound into a parameter of its own")
+atb_projection_parameter()
+    if !atb_ready() then return
+
+    assert_eq(atb_ran(atb_src() + raw"""
+        bits_of[T: Element[Real: Width]](r: T::Real) -> int = r.nbits()
+        width[T: Element[Real: Width]](x: T) -> int = bits_of[T](x.real())
+
+        print(width(D(1.0)))
+        """), "64\n")
+
+@test("a generic struct and a generic impl block carry a bound on an associated type")
+atb_generic_type_and_impl()
+    if !atb_ready() then return
+
+    assert_eq(atb_ran(atb_src() + raw"""
+        struct Holder[T: Element[Real: Width]]
+            x: T
+
+        impl[T: Element[Real: Width]] Holder[T]
+            width(self) -> int = self.x.real().nbits()
+
+        trait Sized
+            size(self) -> int
+
+        impl[T: Element[Real: Width]] Sized for Holder[T]
+            size(self) -> int = self.x.real().nbits() * 2
+
+        val h = Holder(D(1.0))
+
+        print(h.width(), h.size())
+        """), "64 128\n")
+
+@test("a generic body instantiated at two types whose associated types differ runs each one's method")
+atb_two_instantiations()
+    if !atb_ready() then return
+
+    assert_eq(atb_ran(atb_src() + raw"""
+        impl Width for int
+            nbits(self) -> int = 32
+
+        struct I
+            v: int
+
+        impl Element for I
+            type Real = int
+            real(self) -> Self::Real = self.v
+
+        width[T: Element[Real: Width]](x: T) -> int = x.real().nbits()
+
+        print(width(D(1.0)), width(I(3)))
+        """), "64 32\n")
+
+@test("a bound nested inside the bound reaches the inner trait's own associated type")
+atb_nested()
+    if !atb_ready() then return
+
+    assert_eq(atb_ran(raw"""
+        trait Part
+            size(self) -> int
+
+        trait Lanes
+            type Lane
+            lane(self) -> Self::Lane
+
+        trait Element
+            type Real
+            real(self) -> Self::Real
+
+        impl Part for int
+            size(self) -> int = self * 10
+
+        impl Lanes for f64
+            type Lane = int
+            lane(self) -> Self::Lane = 4
+
+        struct D
+            v: f64
+
+        impl Element for D
+            type Real = f64
+            real(self) -> Self::Real = self.v
+
+        sized[T: Element[Real: Lanes[Lane: Part]]](x: T) -> int = x.real().lane().size()
+
+        print(sized(D(1.0)))
+        """), "40\n")
+
+@test("several traits asked of one associated type are each callable")
+atb_several_bounds()
+    if !atb_ready() then return
+
+    assert_eq(atb_ran(atb_src() + raw"""
+        trait Named
+            name(self) -> string
+
+        impl Named for f64
+            name(self) -> string = "double"
+
+        both[T: Element[Real: Width + Named]](x: T) -> string = s"${x.real().name()} ${x.real().nbits()}"
+
+        print(both(D(1.0)))
+        """), "double 64\n")
+
+@test("an equality binding and a bound on another associated type stand in one list")
+atb_with_equality()
+    if !atb_ready() then return
+
+    assert_eq(atb_ran(raw"""
+        trait Width
+            nbits(self) -> int
+
+        trait Element
+            type Real
+            type Index
+            real(self) -> Self::Real
+            index(self) -> Self::Index
+
+        impl Width for f64
+            nbits(self) -> int = 64
+
+        struct D
+            v: f64
+
+        impl Element for D
+            type Real = f64
+            type Index = int
+            real(self) -> Self::Real = self.v
+            index(self) -> Self::Index = 2
+
+        sum[T: Element[Index = int, Real: Width]](x: T) -> int = x.index() + x.real().nbits()
+
+        print(sum(D(1.0)))
+        """), "66\n")
+
+@test("'Self' in a bound on an associated type is the associated type, so 'Real: Add' adds two of them")
+atb_self_default()
+    if !atb_ready() then return
+
+    assert_eq(atb_ran(atb_src() + raw"""
+        twice[T: Element[Real: Add]](x: T) -> T::Real = x.real() + x.real()
+
+        print(twice(D(1.25)))
+        """), "2.5\n")
+
+@test("a requirement reached twice keeps what either route asks of the associated type")
+atb_diamond()
+    if !atb_ready() then return
+
+    assert_eq(atb_ran(atb_src() + raw"""
+        trait Plain: Element
+            one(self) -> int = 1
+
+        trait Scalar: Plain + Element[Real: Width]
+            describe(self) -> int = self.real().nbits() + self.one()
+
+        impl Plain for D
+        impl Scalar for D
+
+        width[T: Scalar](x: T) -> int = x.real().nbits()
+
+        print(D(1.0).describe(), width(D(1.0)))
+        """), "65 64\n")
+
+@test("a parameter bounded by the requiring trait meets a bound on the associated type")
+atb_handed_on()
+    if !atb_ready() then return
+
+    assert_eq(atb_ran(atb_src() + raw"""
+        trait Scalar: Element[Real: Width]
+            one(self) -> int = 1
+
+        impl Scalar for D
+
+        width[T: Element[Real: Width]](x: T) -> int = x.real().nbits()
+        outer[U: Scalar](u: U) -> int = width(u) + u.one()
+
+        print(outer(D(1.0)))
+        """), "65\n")
+
+// -- what is refused ------------------------------------------------------------------------------
+
+@test("a body bounded by the bare trait may not call what the associated type was never asked for")
+atb_unbounded_body_refused()
+    if !atb_ready() then return
+
+    val out = atb_report(atb_src() + raw"""
+        width[T: Element](x: T) -> int = x.real().nbits()
+
+        print(width(D(1.0)))
+        """)
+
+    assert(out.starts_with("error: ") && out.contains("bits"), s"expected a refusal naming 'bits', got: $out")
+
+@test("an impl of a trait whose requirement bounds the associated type is refused where the type fails it")
+atb_impl_refused()
+    if !atb_ready() then return
+
+    atb_refused(atb_src() + raw"""
+        trait Scalar: Element[Real: Width]
+            one(self) -> int = 1
+
+        impl Scalar for F
+
+        print(1)
+        """, "trait 'Scalar' requires 'Element[Real: Width]', which asks that its associated type 'Real' " +
+             "implement 'Width', and F supplies f32 for it, which does not", "28:1")
+
+@test("the refusal at the impl waits for every block, so the supplying impl may come below")
+atb_impl_order()
+    if !atb_ready() then return
+
+    assert_eq(atb_ran(raw"""
+        trait Width
+            nbits(self) -> int
+
+        trait Element
+            type Real
+            real(self) -> Self::Real
+
+        trait Scalar: Element[Real: Width]
+            one(self) -> int = self.real().nbits()
+
+        struct D
+            v: f64
+
+        impl Scalar for D
+
+        impl Element for D
+            type Real = f64
+            real(self) -> Self::Real = self.v
+
+        impl Width for f64
+            nbits(self) -> int = 64
+
+        print(D(1.0).one())
+        """), "64\n")
+
+@test("a call whose argument's associated type fails the bound is refused naming both")
+atb_call_refused()
+    if !atb_ready() then return
+
+    atb_refused(atb_src() + raw"""
+        width[T: Element[Real: Width]](x: T) -> int = x.real().nbits()
+
+        print(width(F(1.0)))
+        """, "'width' requires its type parameter 'T' to implement 'Element[Real: Width]', which asks " +
+             "that 'Real' implement 'Width', and F supplies f32 for it, which does not", "27:7")
+
+@test("a parameter bounded by the bare trait is refused where a bound on its associated type is wanted")
+atb_handed_on_refused()
+    if !atb_ready() then return
+
+    val out = atb_report(atb_src() + raw"""
+        width[T: Element[Real: Width]](x: T) -> int = x.real().nbits()
+        outer[U: Element](u: U) -> int = width(u)
+
+        print(outer(D(1.0)))
+        """)
+
+    assert(out.starts_with("error: 'width' requires its type parameter 'T' to implement " +
+                           "'Element[Real: Width]', which asks that 'Real' implement 'Width', and U " +
+                           "supplies U::Real for it, which does not"), s"got: $out")
+
+@test("an object may not bound an associated type, having forgotten which type it is")
+atb_object_refused()
+    if !atb_ready() then return
+
+    atb_refused(atb_src() + raw"""
+        show(x: &Element[Real: Width]) -> int = 0
+
+        print(1)
+        """, "'&Element' bounds its associated type 'Real', which an object cannot do — it has " +
+             "forgotten which type it is, so fix the type instead, '&Element[Real = …]', or bound a " +
+             "type parameter, '[T: Element[Real: …]]'", "25:10")
+
+@test("an object fixing an associated type its requirement bounds is held to that bound")
+atb_object_fix_held()
+    if !atb_ready() then return
+
+    atb_refused(atb_src() + raw"""
+        trait Scalar: Element[Real: Width]
+            one(self) -> int = 1
+
+        show(x: &Scalar[Real = f32]) -> int = x.one()
+
+        print(1)
+        """, "trait 'Scalar' asks that its associated type 'Real' implement 'Width', and f32 does not",
+             "28:10")
+
+@test("a bound fixing an associated type its requirement bounds is held to that bound")
+atb_bound_fix_held()
+    if !atb_ready() then return
+
+    atb_refused(atb_src() + raw"""
+        trait Scalar: Element[Real: Width]
+            one(self) -> int = 1
+
+        f[T: Scalar[Real = f32]](x: T) -> int = x.one()
+
+        print(1)
+        """, "trait 'Scalar' asks that its associated type 'Real' implement 'Width', and f32 does not",
+             "28:6")
+
+@test("an object fixing it to a type that meets the requirement is formed and called")
+atb_object_fix_met()
+    if !atb_ready() then return
+
+    assert_eq(atb_ran(atb_src() + raw"""
+        trait Scalar: Element[Real: Width]
+            one(self) -> int = self.real().nbits()
+
+        impl Scalar for D
+
+        show(x: &Scalar[Real = f64]) -> int = x.one()
+
+        print(show(D(1.0)))
+        """), "64\n")
+
+@test("a name the trait does not declare is refused, with the names it does")
+atb_unknown_name()
+    if !atb_ready() then return
+
+    atb_refused(atb_src() + raw"""
+        width[T: Element[Rael: Width]](x: T) -> int = 0
+
+        print(1)
+        """, "'Element' declares no associated type 'Rael' — it declares 'Real'", "25:10")
+
+@test("a trait with no associated types has nothing to bound")
+atb_no_assocs()
+    if !atb_ready() then return
+
+    atb_refused(atb_src() + raw"""
+        width[T: Width[Real: Width]](x: T) -> int = 0
+
+        print(1)
+        """, "'Width' declares no associated types, so there is nothing for 'Real: …' to bound — a " +
+             "trait declares one with 'type Real: …' among its members", "25:10")
+
+@test("one name fixed and bounded both is refused")
+atb_fixed_and_bounded()
+    if !atb_ready() then return
+
+    atb_refused(atb_src() + raw"""
+        width[T: Element[Real = f64, Real: Width]](x: T) -> int = 0
+
+        print(1)
+        """, "'Element' is given 'Real = …' and 'Real: …' both — the type it fixes is the whole " +
+             "answer, so bound 'Real' or fix it, not both", "25:10")
+
+@test("one name bounded in two places is refused, with the joined spelling")
+atb_bounded_twice()
+    if !atb_ready() then return
+
+    atb_refused(atb_src() + raw"""
+        trait Named
+            name(self) -> string
+
+        width[T: Element[Real: Width, Real: Named]](x: T) -> int = 0
+
+        print(1)
+        """, "'Element' has 'Real' bounded in two places — write its bounds together, 'Real: A + B'",
+             "28:10")
+
+@test("a bound on an associated type outside a trait's argument list is refused")
+atb_outside_a_trait()
+    if !atb_ready() then return
+
+    atb_refused(atb_src() + raw"""
+        val b: Buf[Real: Width] = buf()
+
+        print(1)
+        """, "'Real: Width' bounds an associated type, which only a trait named as a bound has — " +
+             "'[T: Trait[Real: …]]'", "25:12")

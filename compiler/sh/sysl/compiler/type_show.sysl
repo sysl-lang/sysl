@@ -293,6 +293,72 @@ bound_text(n: string, args: Buf[Type], assocs: Buf[(string, Type)]) -> string
     b.finish()
 end bound_text
 
+// A bound with what it asks of the associated types it leaves open as well: `Seq[Item: Render + Eq]`,
+// the traits asked of one name joined by `+` as they were written.
+bound_text_with(n: string, args: Buf[Type], assocs: Buf[(string, Type)],
+                bounded: Buf[(string, Bound)]) -> string
+    if bounded.is_empty() then return bound_text(n, args, assocs)
+
+    var b = str_builder()
+
+    b.push(module_show(n))
+    b.push("[")
+
+    var first = true
+
+    for item in args
+        if !first then b.push(", ")
+
+        b.push(type_show(item))
+        first = false
+
+    for item in assocs
+        if is_keeps_assoc(item.0) then continue
+        if !first then b.push(", ")
+
+        b.push(item.0)
+        b.push(" = ")
+        b.push(type_show(item.1))
+        first = false
+
+    for i in 0..<bounded.len()
+        val name = bounded.at(i).0
+        val joins = i > 0 && bounded.at(i - 1).0 == name
+
+        if joins then b.push(" + ")
+        else
+            if !first then b.push(", ")
+
+            b.push(name)
+            b.push(": ")
+
+        b.push(open_bound_text(bounded.at(i).1))
+        first = false
+
+    b.push("]")
+    b.finish()
+end bound_text_with
+
+// A bound on an associated type as it was written: the trailing arguments that are the associated
+// type itself are what `Item: Add` leaves to the default, so they are left off again.
+private open_bound_text(b: Bound) -> string
+    var keep = b.args.len()
+
+    while keep > 0 && stands_for_assoc(b.args.at(keep - 1))
+        keep -= 1
+
+    var head: Buf[Type] = buf()
+
+    for i in 0..<keep
+        head.push(b.args.at(i))
+
+    bound_text_with(b.name, head, b.assocs, b.bounded)
+end open_bound_text
+
+private stands_for_assoc(t: Type) -> bool = t match
+    Abstract(n, _) -> n == AssocSelf
+    _ -> false
+
 // The greatest number of arguments a callable trait takes.
 const FnMaxArity: usize = 4
 

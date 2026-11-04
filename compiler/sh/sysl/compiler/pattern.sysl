@@ -138,6 +138,12 @@ private ident_pattern(cx: &Analyzer, span: Span, written: string, ty: Type) -> T
 
     if v.is_some() then return nullary_variant(cx, span, ty, v.unwrap(), name)
 
+    // A `const` written in the body is nearer than any at the top of a file, and is compared against
+    // exactly as one is -- never a fresh name that binds whatever is there.
+    val local = if written == name then local_const_pattern(cx, span, name, ty) else None
+
+    if local.is_some() then return local.unwrap()
+
     val ck = visible_value_key(cx, cx.an.tables.consts, written)
 
     if ck.is_some() then return const_pattern(cx, span, ck.unwrap(), ty)
@@ -224,6 +230,10 @@ private eq_pattern(cx: &Analyzer, span: Span, written: string, ty: Type) -> TPat
 
     if v.is_some() then return nullary_variant(cx, span, ty, v.unwrap(), name)
 
+    val local = if written == name then local_const_pattern(cx, span, name, ty) else None
+
+    if local.is_some() then return local.unwrap()
+
     val ck = lookup_value_key(cx, cx.an.tables.consts, written)
 
     if ck.is_some() then return const_pattern(cx, span, ck.unwrap(), ty)
@@ -260,8 +270,63 @@ private const_pattern(cx: &Analyzer, span: Span, key: string, ty: Type) -> TPatt
     if !is_equatable(ty) && ty != Unknown then
         cx.fault(span, s"a ${type_show(ty)} value cannot be matched against a literal")
 
+    if !disagree(texpr_type(t), ty)
+        val v = const_variant(inner, s"'${d.name}'", t, ty)
+
+        if v.is_some() then return TVariantPattern(underlying(ty), v.unwrap(), buf())
+    end if
+
     TLitPattern(t)
 end const_pattern
+
+// A `const` the body declared, matched as the literal it came to; nothing where the name is not one.
+//
+// **An integer is read at the scrutinee's type where it fits there**, as one at the top of a file is
+// (`const_pattern`), so `const L = 3` matches a `u8` exactly as the literal `3` would.
+private local_const_pattern(cx: &Analyzer, span: Span, name: string, ty: Type) -> Option[TPattern]
+    val local = cx.lookup(name)
+
+    if local.is_none() then return None
+
+    val konst = cx.const_local(local.unwrap().unique)
+
+    if konst.is_none() then return None
+
+    val t = at_scrutinee_type(cx, TExpr(span, konst.unwrap().0.kind), ty)
+
+    if disagree(texpr_type(t), ty)
+        cx.fault(span, s"pattern is ${type_show(texpr_type(t))} but the value is ${type_show(ty)}")
+        return Some(TWildPattern(ty))
+    end if
+
+    val v = const_variant(cx, s"'$name'", t, ty)
+
+    if v.is_some() then return Some(TVariantPattern(underlying(ty), v.unwrap(), buf()))
+
+    if !is_equatable(ty) && ty != Unknown then
+        cx.fault(span, s"a ${type_show(ty)} value cannot be matched against a literal")
+
+    Some(TLitPattern(t))
+end local_const_pattern
+
+// An integer literal retyped to the integer type a scrutinee has, where its value is one that type
+// holds; anything else is left as it was, for the comparison of types to judge.
+private at_scrutinee_type(cx: &Analyzer, t: TExpr, ty: Type) -> TExpr = (*t.kind, ty) match
+    (TIntLit(n, _), Integer(bits, signed, wide)) ->
+        if fits(n, if wide then word_bits(cx) else bits, signed) then TExpr(t.span, TIntLit(n, ty)) else t
+    _ -> t
+
+// **A constant of an enum matches as the variant it came to**, as a const pattern does in Rust: it
+// is that variant's shape rather than a test for equality, so the arms it heads count toward
+// covering the enum, and an arm naming the same variant again is dead. Nothing where the value is
+// not an enum or does not fold.
+private const_variant(cx: &Analyzer, subject: string, t: TExpr, ty: Type) -> Option[EnumVariant] =
+    underlying(ty) match
+        Enum(d) -> const_argument(cx, subject, t) match
+            Some(ConstRecord(at, _)) if at >= 0 && usize(at) < d.variants.len() ->
+                Some(d.variants.at(usize(at)))
+            _ -> None
+        _ -> None
 
 // A variant written with a path belongs to the enum the path names. Where that is not the enum the
 // value has, the pattern is of another type and is refused as a mismatch, rather than being read as

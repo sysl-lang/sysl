@@ -52,6 +52,21 @@ print(id[int](7), id[string]("s"))
 7 s
 ```
 
+**The list takes `()` and tuple types as the type grammar does**: `id[()](())` instantiates at
+`unit`, `id[(int, bool)]((1, true))` at a tuple, and either may sit inside an application
+(`Option[()]`, `Result[(), string]`). A subscript holding parentheses still subscripts: `a[(1)]`
+indexes, and `b[()]` and `g[(i, j)]` index a type with an `Index` for `()` or for a tuple.
+
+```sysl
+id[T](x: T) -> T = x
+
+print(id[()](()) == (), id[Result[(), string]](Ok(())).is_ok())
+```
+
+```output
+true true
+```
+
 **The nearest binding wins**, as it does for every call form. A local that shadows a function's
 name makes the brackets an index again, with no diagnostic about type arguments.
 

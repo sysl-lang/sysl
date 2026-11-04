@@ -1458,8 +1458,9 @@ end self_type
 
 // -- what a constant may be --------------------------------------------------------------------
 
-// **A constant is a scalar**, so the three declaration forms that are not one are refused here,
-// which is a step before anything asks how far the type reaches. A transparent subtype is a scalar
+// **A constant is a scalar**, so the declaration forms that are not one are refused here, which is a
+// step before anything asks how far the type reaches. A simple enum is a scalar and passes; a
+// transparent subtype is a scalar
 // and is the one form that goes on to be asked that.
 private check_const_scalars(a: &Analysis)
     for i in 0..<a.tables.consts.len()
@@ -1488,8 +1489,15 @@ private check_const_named(a: &Analysis, v: ValueDecl, span: Span, written: strin
             a.fault(v.scope, span,
                     s"a constant is a scalar, and $written is storage — write '${v.name}' as a " +
                     "'val', which is laid into the object file as constant data")
-        EnumOf(_) -> a.fault(v.scope, span, s"a constant is a scalar, and $written is not — " +
-                             s"'${v.name}'")
+        // **A simple enum is a scalar**: its value is a variant's position, folded as an integer is.
+        // One whose variants carry data is a sum, which is storage.
+        EnumOf(d) ->
+            for variant in d.variants
+                if variant.fields.len() > 0 then
+                    a.fault(v.scope, span, s"a constant is a scalar, and $written carries data in " +
+                            s"'${variant.name}', so it is storage — write '${v.name}' as a 'val', which " +
+                            "is laid into the object file as constant data")
+                    return
         // **A `new` type is a scalar too**: its value is its base's, so `const OUR_IP: Ip =
         // Ip(0x0a00_020f)` is the base constant written through the conversion, folded as the base's
         // would be, and keeps the type at every use.
@@ -1830,6 +1838,10 @@ names_in(out: *Buf[(string, Span)], t: TypeRef, skip: Buf[string])
 
             names_in(out, ret, skip)
         AssocArgType(_, inner) -> names_in(out, inner, skip)
+        AssocBoundArgType(_, bounds) ->
+            for b in bounds
+                for arg in b.args
+                    names_in(out, arg, skip)
         KeptParamType(inner) -> names_in(out, inner, skip)
         _ -> ()
 
