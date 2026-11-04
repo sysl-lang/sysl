@@ -206,8 +206,8 @@ Three things in that loop are the whole design.
 **The `match` is why to prefer this to a query API.** An option nobody handled is a missing arm, and
 [exhaustiveness](/reference/patterns/) makes that a diagnostic — where a `parsed.value("output")`
 spelling would hand back a `None` at run time that reads exactly like an option the user did not
-pass. `Short('o') | Long("output")` is the arm that reads best, and it is legal because an
-alternative may not bind and neither of those two does.
+pass. `Short('o') | Long("output")` is the arm that reads best: alternatives may bind only the
+names every one of them binds, and neither of those two binds any.
 
 **A value is asked for rather than reported.** Whether the next word belongs to the option or stands
 on its own is not something the shape can tell — `-o x` is an option and its value, `-v x` is an

@@ -1,6 +1,6 @@
 ---
 title: Patterns and matching
-summary: Every pattern form, how arms are chosen, what guards do to exhaustiveness, and why alternatives may not bind.
+summary: Every pattern form, how arms are chosen, what guards do to exhaustiveness, and what alternatives may bind.
 weight: 60
 ---
 
@@ -269,30 +269,146 @@ arm it begins an arm of its own, so `1 -> a` followed by `| 2 -> b` is two arms.
 lines are written at the arms' own margin, and a `|` inside brackets is the bitwise operator it
 always was.
 
-### Alternatives may not bind
+### Alternatives bind the same names
 
-`1 | 2 | 3` is one arm matching any of three literals. An arm whose alternatives **bind** is
-rejected, because the body cannot know which alternative matched, and so which part of the value a
-binding refers to:
+`1 | 2 | 3` is one arm matching any of three literals. Alternatives may **bind**, as in Rust, when
+every one of them binds the same names at the same types. The body cannot know which alternative
+matched, so each name it reads has to stand for something whichever one did:
 
 ```sysl
 enum Box
     One(v: int)
     Two(v: int)
+    Pair(a: int, b: int)
 
 get(b: Box) -> int
     b match
-        One(v) | Two(v) -> v
+        One(v) | Two(v) | Pair(_, v) -> v
+
+print(get(One(1)), get(Two(2)), get(Pair(3, 4)))
+```
+
+```output
+1 2 4
+```
+
+The same holds of an `is` test, so `if b is One(v) | Two(v)` names `v` in its branch. A name one
+alternative binds and another does not is refused, and so is a name bound at two types:
+
+```sysl
+enum Box
+    One(v: int)
+    Two(v: int)
+    Empty
+
+get(b: Box) -> int
+    b match
+        One(v) | Empty -> v
+        Two(v) -> v
 
 print(get(One(1)))
 ```
 
 ```error
-alternative patterns joined by '|' cannot bind a name
+'v' is bound by one alternative joined by '|' and not by another
 ```
 
-This is stricter than Rust, which permits `A(x) | B(x)` when every alternative binds the same names
-at the same types. In sysl, an arm with `|` binds nothing.
+```sysl
+enum Cell
+    Num(v: int)
+    Text(v: string)
+
+show(c: Cell) -> string
+    c match
+        Num(v) | Text(v) -> s"$v"
+
+print(show(Num(1)))
+```
+
+```error
+'v' is bound as int by one alternative joined by '|' and as string by another
+```
+
+A pattern binds by copy, so there is no mutability or `ref` mode for the alternatives to disagree
+on.
+
+**A guard is asked once for each alternative that matches**, in order, with that alternative's
+bindings. `Pair(v, _) | Pair(_, v) if v > 10` takes `Pair(3, 40)` through its second alternative
+after the first one's guard said no:
+
+```sysl
+enum Box
+    One(v: int)
+    Pair(a: int, b: int)
+
+big(b: Box) -> string
+    b match
+        Pair(v, _) | Pair(_, v) if v > 10 -> s"big $v"
+        _ -> "small"
+
+print(big(Pair(3, 40)), big(Pair(50, 1)), big(Pair(1, 2)), big(One(99)))
+```
+
+```output
+big 40 big 50 small small
+```
+
+### Alternatives inside a pattern
+
+A `|` may stand at any position inside a pattern, not only between whole ones: in a variant's
+parentheses, in a tuple's part, in a struct field, after an `@` in parentheses. `Some(1 | 2)` is the
+arm `Some(1) | Some(2)`, and coverage counts it that way, so `Some(_)` and `None` still finish the
+match. Parentheses around alternatives group them, and the binding rule above applies to whatever
+alternatives the `|`s make:
+
+```sysl
+enum Shape
+    Circle(r: int)
+    Square(side: int)
+    Dot
+
+classify(o: Option[int]) -> string
+    o match
+        Some(1 | 2) -> "small"
+        Some(_) -> "other"
+        None -> "none"
+
+radius(o: Option[Shape]) -> int
+    o match
+        Some(Circle(r) | Square(r)) -> r
+        Some(Dot) | None -> 0
+
+grid(t: (int, char)) -> string
+    t match
+        (0 | 1, 'a' | 'b') -> "corner"
+        (n @ (5 | 6), _) -> s"edge $n"
+        _ -> "inside"
+
+print(classify(Some(2)), classify(Some(7)), classify(None))
+print(radius(Some(Square(4))), radius(None))
+print(grid((1, 'b')), grid((6, 'z')), grid((3, 'a')))
+```
+
+```output
+small other none
+4 0
+corner edge 6 inside
+```
+
+Each `|` multiplies: `(1 | 2, 3 | 4)` is four alternatives. A pattern that would spread into more
+than 1024 is refused. A `val` or a `for` takes one shape of a value apart, so a `|` in its pattern
+is refused, with no other arm to try:
+
+```sysl
+val o = Some(1)
+val Some(1 | 2) = o
+
+print(o)
+```
+
+```error
+alternatives joined by '|' are written in a 'match' arm or an 'is' test
+```
 
 ### A name may be bound twice in one match, but not in one pattern
 

@@ -443,8 +443,7 @@ private cond_is(cx: &Analyzer, span: Span, subject: Expr, patterns: Buf[Pattern]
 
     cx.pattern_roots = pattern_view_roots(cx, ts)
 
-    for i in 0..<patterns.len()
-        tpats.push(type_pattern(cx, patterns.at(i), texpr_type(ts)))
+    tpats = type_alternatives(cx, patterns, texpr_type(ts))
 
     cx.pattern_roots = held
     cx.bind_site = site
@@ -460,10 +459,6 @@ private cond_is(cx: &Analyzer, span: Span, subject: Expr, patterns: Buf[Pattern]
         else
             cx.fault(span, s"this pattern matches every ${type_show(texpr_type(ts))}, so the test " +
                      "is always true — take the value apart with 'match', or bind it with 'var'")
-
-    if tpats.len() > 1 && any_pattern_binds(tpats) then
-        cx.fault(span, "alternative patterns joined by '|' cannot bind a name — the branch cannot " +
-                 "know which of them matched. Write '_' for the parts you are not naming")
 
     // `x is not Some(n)` would name `n` on the one path where nothing matched it. The binder is
     // what is refused and not the negation: `x is not Some(_)` is the early-exit guard the form is
@@ -826,7 +821,7 @@ private offered_arm(cx: &Analyzer, scrut: Type, arm: MatchArm, want: Option[Type
 end offered_arm
 
 // One arm in its own scope, so pattern bindings are visible to the guard and the body.
-// Alternatives may not bind, since the body cannot know which of them matched.
+// Alternatives bind one set of names between them (`type_alternatives`).
 private analyze_arm(cx: &Analyzer, scrut: Type, arm: MatchArm, expected: Option[Type],
                     discarded: bool) -> TArm
     cx.enter()
@@ -836,13 +831,9 @@ private analyze_arm(cx: &Analyzer, scrut: Type, arm: MatchArm, expected: Option[
 
     cx.bind_site = Some(arm.span)
 
-    for i in 0..<arm.patterns.len()
-        tpats.push(type_pattern(cx, arm.patterns.at(i), scrut))
+    tpats = type_alternatives(cx, arm.patterns, scrut)
 
     cx.bind_site = site
-
-    if tpats.len() > 1 && any_pattern_binds(tpats) then
-        cx.fault(arm.span, "alternative patterns joined by '|' cannot bind a name")
 
     // Only the arm's patterns bind out of the scrutinee; its body's own bindings are its own.
     val roots = cx.pattern_roots
