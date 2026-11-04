@@ -196,6 +196,9 @@ A qualified name can never be a
 *binding*, because no declared name contains a dot, so one that resolves to neither a variant nor a
 constant is a diagnostic rather than a new local.
 
+A `const` declared inside a function body is a constant here too, and is nearer than one at the top
+of a file: it is compared against, not bound.
+
 ### A backticked name references rather than binds
 
 The rule above resolves a bare name against a narrow set — the scrutinee's nullary variants, then the

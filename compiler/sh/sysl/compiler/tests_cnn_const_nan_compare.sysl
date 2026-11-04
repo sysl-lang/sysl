@@ -1,0 +1,145 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// A comparison folded while compiling answers what the same comparison answers at run time. A NaN
+// is unordered, so `<`, `<=`, `>`, `>=` and `==` are false against it and `!=` is true; folding
+// through the sign of a difference said `<=`, `>=` and `==` true and `!=` false.
+
+private cnn_ready() -> bool
+    std_root() match
+        Err(_) ->
+            print("skipped: the standard module's source is not on this machine")
+            return false
+        Ok(_) -> ()
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+
+    true
+end cnn_ready
+
+private cnn_ran(text: string) -> string
+    val root = make_temp_dir("sysl-cnn").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end cnn_ran
+
+private cnn_prints(text: string, expected: string)
+    if !cnn_ready() then return
+
+    assert_eq(cnn_ran(text), expected)
+
+private cnn_ops() -> []string = ["<", "<=", ">", ">=", "==", "!="]
+
+// Operand source text: NaN, one, negative zero, zero, +infinity, -infinity.
+private cnn_operands() -> []string = ["0.0 / 0.0", "1.0", "-0.0", "0.0", "1.0 / 0.0", "-1.0 / 0.0"]
+
+private cnn_holds(op: string, x: f64, y: f64) -> bool
+    if op == "<" then return x < y
+    if op == "<=" then return x <= y
+    if op == ">" then return x > y
+    if op == ">=" then return x >= y
+    if op == "==" then return x == y
+
+    x != y
+end cnn_holds
+
+// Every operator over every pair of operands in type `ty`. Each case is a `const` comparison of
+// `const` operands, and the same comparison of `var` operands, which are read at run time. The program
+// prints both answers; the expectation is the host's answer printed twice.
+private cnn_matrix(ty: string) -> (string, string)
+    var source = ""
+    var body = ""
+    var expected = ""
+    val values: [6]f64 = [0.0 / 0.0, 1.0, -0.0, 0.0, 1.0 / 0.0, -1.0 / 0.0]
+
+    for i in 0..<cnn_operands().len
+        source += s"const k$i: $ty = ${cnn_operands()[i]}\nvar v$i: $ty = ${cnn_operands()[i]}\n"
+
+    var case = 0
+
+    for i in 0..<cnn_operands().len
+        for j in 0..<cnn_operands().len
+            for op in cnn_ops()
+                source += s"const c$case: bool = k$i $op k$j\n"
+                body += s"    var r$case: bool = v$i $op v$j\n    print(c$case, r$case)\n"
+
+                val answer = cnn_holds(op, values[i], values[j])
+
+                expected += s"$answer $answer\n"
+                case += 1
+
+    (source + "\nmain()\n" + body, expected)
+end cnn_matrix
+
+@test("f64: every operator over NaN, zeros and infinities folds to the run-time answer")
+cnn_f64_matrix()
+    val (program, expected) = cnn_matrix("f64")
+
+    cnn_prints(program, expected)
+
+@test("f32: every operator over NaN, zeros and infinities folds to the run-time answer")
+cnn_f32_matrix()
+    val (program, expected) = cnn_matrix("f32")
+
+    cnn_prints(program, expected)
+
+@test("a NaN on the left, the right and both sides: all false but !=")
+cnn_nan_sides()
+    cnn_prints(raw"""
+        const n: f64 = 0.0 / 0.0
+        const one: f64 = 1.0
+        main()
+            print(n < one, n <= one, n > one, n >= one, n == one, n != one)
+            print(one < n, one <= n, one > n, one >= n, one == n, one != n)
+            print(n < n, n <= n, n > n, n >= n, n == n, n != n)
+        """, "false false false false false true\nfalse false false false false true\n" +
+             "false false false false false true\n")
+
+@test("negative zero equals zero and is not less than it, folded")
+cnn_negative_zero()
+    cnn_prints(raw"""
+        const z: f64 = 0.0
+        const nz: f64 = -0.0
+        main()
+            print(nz == z, nz < z, nz <= z, nz != z, z > nz, z >= nz)
+        """, "true false true false false true\n")
+
+@test("a NaN comparison drives an array length and if const")
+cnn_nan_drives_const_contexts()
+    cnn_prints(raw"""
+        const n: f64 = 0.0 / 0.0
+        const L: usize = if n <= n then 5 else 3
+        const M: usize = if n != n then 2 else 4
+        struct Box
+            items: [L]int
+        end Box
+        show[const K: usize]() -> int
+            if const (if n >= n then true else false)
+                return 1
+            0
+        main()
+            val b = Box([1, 2, 3])
+            print(b.items.len, M, show[1]())
+        """, "3 2 0\n")

@@ -533,7 +533,7 @@ private variant_pattern(cx: &Analyzer, span: Span, written: string, args: Buf[Pa
                                 "match the fields it does offer by name, as 'Name{…}'")
             TStructPattern(d, sub_patterns(cx, parts, d.fields))
 
-        Unknown -> unknown_subject(cx, args, ty)
+        Unknown | Abstract(_, _) -> unknown_subject(cx, args, ty)
 
         other ->
             if scalar_subject(other) && args.len() == 1 && written == name && is_scalar_name(name) then
@@ -555,7 +555,7 @@ private tuple_pattern(cx: &Analyzer, span: Span, args: Buf[Pattern], ty: Type) -
     if args.len() == 0 then
         underlying(ty) match
             Unit -> return TWildPattern(ty)
-            Unknown -> ()
+            Unknown | Abstract(_, _) -> ()
             other ->
                 cx.fault(span, s"'()' matches unit, but the value is " +
                          s"${type_show(other)}${held_behind(other)}")
@@ -577,7 +577,7 @@ private tuple_pattern(cx: &Analyzer, span: Span, args: Buf[Pattern], ty: Type) -
 
             TStructPattern(d, sub_patterns(cx, args, d.fields))
 
-        Unknown -> unknown_subject(cx, args, ty)
+        Unknown | Abstract(_, _) -> unknown_subject(cx, args, ty)
 
         other ->
             cx.fault(span, s"'(…)' matches a tuple, but the value is " +
@@ -620,7 +620,7 @@ private struct_pattern(cx: &Analyzer, span: Span, name: string, fields: Buf[Fiel
 
             TStructPattern(d, args)
 
-        Unknown ->
+        Unknown | Abstract(_, _) ->
             var subs: Buf[Pattern] = buf()
 
             for item in fields
@@ -637,6 +637,11 @@ private struct_pattern(cx: &Analyzer, span: Span, name: string, fields: Buf[Fiel
 // whose initializer was refused. That mistake was told where it was made, so the pattern says
 // nothing more and the statement gives up over it; the names inside are still bound, at `?`, so an
 // arm that reads one is as quiet as the pattern.
+//
+// **A value of a type parameter is the same case at a generic's definition**: `v match { Ok(f) -> … }`
+// over a `v: V` is judged by each instantiation, where `V` is a type the pattern can be held to. The
+// names are bound here all the same, so a block arm's later statements -- each read in a region of
+// its own -- find `f` rather than calling it undefined.
 private unknown_subject(cx: &Analyzer, args: Buf[Pattern], ty: Type) -> TPattern
     cx.an.poison_quietly()
 
