@@ -1393,6 +1393,14 @@ private span_of_nothing() -> Span = Span(0, 0)
 // is that block's condition. So the condition is what is worth saying. Nothing where nothing covers
 // the type, leaving the caller's own advice -- write one -- the right advice.
 unmet_bound(a: &Analysis, tr: Bound, t: Type) -> Option[string]
+    // **A type ordered only partially is refused a total order with the way round it**: a float's
+    // own `max`, `min` and `clamp` say what a NaN does, and `total_lt` is a total order to sort by.
+    if library_spelling(tr.name) == Some("Ord")
+        val partial = partial_only(a, t)
+
+        if partial.is_some() then return partial
+    end if
+
     // **`AnyBits` is refused with the part of the type that has a bit pattern no value has**, since
     // that is what the bound was asked for: storage nobody wrote, read as the type.
     if library_spelling(tr.name) == Some("AnyBits")
@@ -1452,6 +1460,26 @@ unmet_bound(a: &Analysis, tr: Bound, t: Type) -> Option[string]
     Some(s"the 'impl' that covers it asks '${bound.show()}' of " +
          s"${type_show(first_unmet_part(a, bound, packed))}, which does not implement it")
 end unmet_bound
+
+// Why a type that is `PartialOrd` and not `Ord` is refused a total order, or nothing for one that is
+// not ordered at all.
+private partial_only(a: &Analysis, t: Type) -> Option[string]
+    val key = catalog_key(a, "PartialOrd")
+
+    if key.is_none() || !satisfies(a, plain_bound(key.unwrap(), buf()), t) then return None
+
+    val shown = type_show(t)
+
+    op_subject(t) match
+        Floating(_, _) ->
+            Some(s"$shown is only 'PartialOrd': a NaN is neither less, greater nor equal to any " +
+                 "value, so no total order holds. Use the float's own 'x.max(y)', 'x.min(y)' or " +
+                 "'x.clamp(lo, hi)', which say what a NaN does, and sort with " +
+                 "'sort_by(xs, (a, b) -> a.total_lt(b))'")
+        _ ->
+            Some(s"$shown is only 'PartialOrd', so two of its values may be neither less, greater " +
+                 "nor equal")
+end partial_only
 
 private wrong_arguments(a: &Analysis, tr: Bound, t: Type) -> Option[string]
     var keys: Buf[(string, Buf[Type])] = buf()

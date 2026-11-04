@@ -1160,6 +1160,38 @@ The clause goes after the name and its type parameters, before the body. It prod
 dispatched and erased exactly as a written one is, and a field that does not support the trait is
 reported in the ordinary way.
 
+**`Ord` is the total order and `PartialOrd` the one it extends** (`reference/expressions.md § Operator
+dispatch`). `derives Ord` derives `PartialOrd` — whose `lt` and `le` the comparisons call — and gives
+`Ord` the empty block that promises the order is total, so it refuses a field whose type is only
+partially ordered, a float above all, naming it. `derives PartialOrd` is the clause for such a type,
+and its comparisons are all false against a NaN field, as Rust's derived `PartialOrd` gives:
+
+```sysl
+struct Reading derives PartialOrd
+    at: int
+    value: real
+
+val hole = Reading(1, 0.0 / 0.0)
+
+print(Reading(1, 2.0) < Reading(1, 3.0), hole <= Reading(1, 2.0), hole >= Reading(1, 2.0))
+```
+
+```output
+true false false
+```
+
+```sysl
+struct Reading derives Ord
+    at: int
+    value: real
+
+print(1)
+```
+
+```error
+'Reading' cannot derive Ord: its field 'value' is real, which is only 'PartialOrd', so two of its values may be neither less, greater nor equal. Derive 'PartialOrd' instead
+```
+
 **Each of the four is written by the library**, as the trait's own
 [`derive` member](#a-trait-says-how-it-is-derived): the same mechanism a program's own trait uses, so
 the compiler treats the four specially only in what the clause refuses up front. The derived
@@ -1660,6 +1692,10 @@ true false Box(x)
 
 A `const` value parameter gains no bound, since it is not a type, and the type's own bounds are kept,
 since `struct Sorted[T: Ord]` is only a valid type where `T` is `Ord`.
+
+`derives Ord` writes two blocks, and each is conditional on its own trait: a `Box[T] derives Ord` is
+`PartialOrd` wherever `T` is and `Ord` wherever `T` is, so a `Box[real]` compares and a sort refuses
+it, exactly as a `(real, int)` does.
 
 ### An enum takes the clause too
 

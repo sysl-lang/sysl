@@ -13,15 +13,14 @@ import sysl.buf.{Buf, buf}
 //
 // Two things here are not simply a member lookup. A comparison chain holds the **link** between two
 // operands rather than a `bool`, because the middle operand of `a < b < c` is one value compared
-// twice and codegen has to read it once. And the catalog declares a method for only two of the six
-// comparisons: `>` is `<` with the operands exchanged and `>=` is `<` negated, so a `TDispatch`
-// carries a swap and a negation and one written `lt` serves all four.
+// twice and codegen has to read it once. And the catalog declares a method for only three of the
+// six comparisons: `>` is `lt` with the operands exchanged, `>=` is `le` exchanged and `!=` is `eq`
+// negated, so a `TDispatch` carries a swap and a negation and `lt` and `le` serve all four orderings.
 
 // `a op b` where the operands are not something the machine has an instruction for.
 //
 // A built-in keeps its instruction and this answers nothing, which leaves the scalar path to type it
-// -- that is what keeps a float comparison on IEEE semantics rather than routing it through a
-// negated `lt`. Nothing, too, for an operand type with no membership either way, so the diagnostic
+// -- that is what keeps a float comparison on the machine's own IEEE instruction. Nothing, too, for an operand type with no membership either way, so the diagnostic
 // stays the one the scalar path already gives.
 //
 // `written` is the right operand as the source wrote it, which is what says whether it is a bare
@@ -268,7 +267,7 @@ private dispatch_for(cx: &Analyzer, span: Span, spelling: string, op: string, ty
 
     if required.is_none() then return None
 
-    val method = required.unwrap().0
+    val method = core_op_method(op, required.unwrap())
 
     if core_builtin(spelling, ty) && !written_impl_at(cx.an, tr, ty) then return None
 
@@ -323,7 +322,7 @@ private check_operand(cx: &Analyzer, op: string, recv_ty: Type, b: TExpr, want: 
 end check_operand
 
 // One link of a comparison chain: the operator, plus the method performing it where the operand type
-// reaches `Eq`/`Ord` through a trait.
+// reaches `Eq`/`PartialOrd` through a trait.
 //
 // What this hands codegen is a **name**, not a call tree, and that is the whole reason it exists. A
 // chain compares each middle operand against both its neighbours from a single evaluation, so a
