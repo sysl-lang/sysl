@@ -116,14 +116,14 @@ closure_expr(cx: &Analyzer, span: Span, written: Buf[LambdaParam], body: Buf[Stm
     var names: Buf[string] = buf()
 
     for i in 0..<params.len()
-        val p = params.at(i)
+        val p = params[i]
 
         names.push(p.name)
 
         if p.typ.is_some()
             ptypes.push(resolve_type(cx.an, cx.scope, p.typ.unwrap(), cx.subst))
         else if want.is_some() && i < want.unwrap().0.len()
-            ptypes.push(want.unwrap().0.at(i))
+            ptypes.push(want.unwrap().0[i])
         // A position whose own type was refused has already said what is wrong, and the closure at
         // it is not a second mistake.
         else if expected.is_some() && expected.unwrap() == Unknown
@@ -171,7 +171,7 @@ private forwarded_by_name(cx: &Analyzer, span: Span, written: Buf[LambdaParam], 
 
     if want.is_none() || !want.unwrap().0.is_empty() then return None
 
-    val name = *body.at(0).kind match
+    val name = *body[0].kind match
         ExprStmt(e) -> *e.kind match
             Ident(n) -> n
             _ -> return None
@@ -221,12 +221,12 @@ call_bound_unmet(a: &Analysis, scope: Scope, span: Span, what: string, tr: Bound
             val w = written.unwrap()
 
             for i in 0..<w.params.len()
-                val p = w.params.at(i)
+                val p = w.params[i]
 
                 if p.typ.is_some() && i < want.len() && i < w.ptypes.len() &&
-                        !mentions_unknown(want.at(i)) && w.ptypes.at(i) != want.at(i)
-                    val message = s"this closure's '${p.name}' is declared ${type_show(w.ptypes.at(i))}, " +
-                                  s"but '$callee' passes it ${type_show(want.at(i))}"
+                        !mentions_unknown(want[i]) && w.ptypes[i] != want[i]
+                    val message = s"this closure's '${p.name}' is declared ${type_show(w.ptypes[i])}, " +
+                                  s"but '$callee' passes it ${type_show(want[i])}"
 
                     if at_definition then a.bound_fault(w.scope, p.span, message)
                     else a.fault(w.scope, p.span, message)
@@ -257,14 +257,14 @@ private arrow_shown(params: Buf[Type], result: Type) -> string
     var b = str_builder()
 
     if params.len() == 1
-        b.push(type_show(params.at(0)))
+        b.push(type_show(params[0]))
     else
         b.push("(")
 
         for i in 0..<params.len()
             if i > 0 then b.push(", ")
 
-            b.push(type_show(params.at(i)))
+            b.push(type_show(params[i]))
 
         b.push(")")
     end if
@@ -325,7 +325,7 @@ private closures_apart_list(gs: Buf[Type], ws: Buf[Type]) -> Option[(Type, Type)
     if gs.len() != ws.len() then return None
 
     for i in 0..<gs.len()
-        val found = closures_apart(gs.at(i), ws.at(i))
+        val found = closures_apart(gs[i], ws[i])
 
         if found.is_some() then return found
 
@@ -350,7 +350,7 @@ private closure_shape(a: &Analysis, t: Type) -> string
     for i in 1..<params.len()
         if i > 1 then b.push(", ")
 
-        b.push(type_show(params.at(i).1))
+        b.push(type_show(params[i].1))
 
     b.push(") -> ")
     b.push(type_show(sig.unwrap().ret))
@@ -435,10 +435,10 @@ private slice_of_something(t: Type) -> bool = t match
 // call-by-name reading a `ref` exists to rule out.
 refuse_ref_captures(cx: &Analyzer, span: Span, captured: Buf[string]) -> bool
     for i in 0..<captured.len()
-        val local = cx.lookup(captured.at(i))
+        val local = cx.lookup(captured[i])
 
         if local.is_some() && local.unwrap().stands_for.is_some()
-            cx.fault(span, s"'${captured.at(i)}' is a 'ref', which names storage for as long as " +
+            cx.fault(span, s"'${captured[i]}' is a 'ref', which names storage for as long as " +
                      "its own block and no longer — so it cannot be captured, since a closure may " +
                      "outlive that block. Capture the place it names, or read the value into a " +
                      "'val' and capture that")
@@ -457,16 +457,16 @@ end refuse_ref_captures
 private refuse_pinned_captures(cx: &Analyzer, span: Span, captured: Buf[string], refs: Buf[bool],
                                base: string) -> bool
     for i in 0..<captured.len()
-        val local = cx.lookup(captured.at(i))
+        val local = cx.lookup(captured[i])
 
         if local.is_none() || !pinned_type(cx.an, local.unwrap().ty) then continue
 
-        val name = captured.at(i)
+        val name = captured[i]
         val held = type_show(local.unwrap().ty)
 
         // A closure that outlives the frame cannot keep a pointer into it either, so the way out is
         // a box the closure counts.
-        if i < refs.len() && refs.at(i)
+        if i < refs.len() && refs[i]
             val head = s"'$held' is '@pinned' — C may hold pointers into a value of it, so a value is " +
                 s"never copied or moved once it is built, and this closure captures '$name' by value"
             val boxed = s". Build it behind a counted reference instead ('val $name: &$held = …'), " +
@@ -596,9 +596,9 @@ private refuse_lost_writes(cx: &Analyzer, span: Span, st: &StructType, captured:
     val scan = scan_copy_writes(cx.an, st, captured.len(), body, span)
 
     for i in 0..<captured.len()
-        if scan.writes.at(i) == 0 then continue
+        if scan.writes[i] == 0 then continue
 
-        val name = captured.at(i)
+        val name = captured[i]
         val outer = cx.lookup(name)
 
         // A `val`'s copy is read-only as the `val` is, and the write was refused at the place in
@@ -607,17 +607,17 @@ private refuse_lost_writes(cx: &Analyzer, span: Span, st: &StructType, captured:
 
         val shown =if outer.is_some() then type_show(outer.unwrap().ty) else "T"
         val via: Buf[(string, usize)] =
-            if scan.direct.at(i) == 0 then scan.via.at(i).copy() else buf()
+            if scan.direct[i] == 0 then scan.via[i].copy() else buf()
 
-        if scan.uses.at(i) == scan.writes.at(i)
-            lost_write_owed(cx, scan.at.at(i), name, scan.form.at(i), shown,
+        if scan.uses[i] == scan.writes[i]
+            lost_write_owed(cx, scan.at[i], name, scan.form[i], shown,
                             "and nothing in the closure reads it back", st.base, i, via)
             continue
         end if
 
         if outer.is_some()
-            cx.copy_writes.push(CopyWrite(outer.unwrap().unique, name, span, scan.at.at(i),
-                                          scan.form.at(i), shown, st.base, i, via))
+            cx.copy_writes.push(CopyWrite(outer.unwrap().unique, name, span, scan.at[i],
+                                          scan.form[i], shown, st.base, i, via))
     end for
 end refuse_lost_writes
 
@@ -671,7 +671,7 @@ read_after_copy_write(cx: &Analyzer, span: Span, unique: string)
     var i: usize = 0
 
     while i < cx.copy_writes.len()
-        val w = cx.copy_writes.at(i)
+        val w = cx.copy_writes[i]
 
         if w.unique != unique || span.start >= w.closure.start && span.end <= w.closure.end
             i += 1
@@ -698,9 +698,9 @@ private hand_up_copy_writes(cx: &Analyzer, inner: &Analyzer, span: Span, capture
 
     for w in inner.copy_writes
         for i in 0..<inner.captured.len()
-            if inner.captured.at(i).0 != w.unique then continue
+            if inner.captured[i].0 != w.unique then continue
 
-            val outer = cx.lookup(captured.at(i))
+            val outer = cx.lookup(captured[i])
 
             if outer.is_some()
                 cx.copy_writes.push(CopyWrite(outer.unwrap().unique, w.name, span, w.write, w.form,
@@ -780,33 +780,33 @@ private note_inner_writes(a: &Analysis, scan: &CopyScan, st: &StructType, args: 
     val seen = scan_copy_writes(a, st, args.len(), inner.unwrap().body, inner.unwrap().span)
 
     for j in 0..<args.len()
-        if seen.writes.at(j) == 0 then continue
+        if seen.writes[j] == 0 then continue
 
-        val slot = copy_root(args.at(j))
+        val slot = copy_root(args[j])
 
         if slot.is_none() then continue
 
         for i in 0..<scan.slots.len()
-            if scan.slots.at(i) != slot.unwrap() then continue
+            if scan.slots[i] != slot.unwrap() then continue
 
-            if scan.writes.at(i) == 0
+            if scan.writes[i] == 0
                 var via: Buf[(string, usize)] = buf()
 
                 via.push((st.base, j))
 
                 // Where the inner closure's own write came through closures inside it, they are on
                 // the way too.
-                if seen.direct.at(j) == 0
-                    for v in seen.via.at(j) do via.push(v)
+                if seen.direct[j] == 0
+                    for v in seen.via[j] do via.push(v)
 
-                scan.at.set(i, seen.at.at(j))
-                scan.form.set(i, seen.form.at(j))
-                scan.via.set(i, via)
+                scan.at[i] = seen.at[j]
+                scan.form[i] = seen.form[j]
+                scan.via[i] = via
             end if
 
-            scan.writes.set(i, scan.writes.at(i) + 1)
+            scan.writes[i] = scan.writes[i] + 1
 
-            if seen.uses.at(j) > seen.writes.at(j) then scan.uses.set(i, scan.uses.at(i) + 1)
+            if seen.uses[j] > seen.writes[j] then scan.uses[i] = scan.uses[i] + 1
         end for
     end for
 end note_inner_writes
@@ -818,7 +818,7 @@ private lowered_closure(a: &Analysis, fname: string) -> Option[TFunc]
     while i > 0
         i -= 1
 
-        if a.closure_funcs.at(i).name == fname then return Some(a.closure_funcs.at(i))
+        if a.closure_funcs[i].name == fname then return Some(a.closure_funcs[i])
     end while
 
     None
@@ -831,16 +831,16 @@ private note_copy_write(scan: &CopyScan, place: TExpr, form: string, at: Span) -
     if slot.is_none() then return false
 
     for i in 0..<scan.slots.len()
-        if scan.slots.at(i) != slot.unwrap() then continue
+        if scan.slots[i] != slot.unwrap() then continue
 
-        if scan.direct.at(i) == 0
-            scan.at.set(i, at)
-            scan.form.set(i, form)
-            scan.via.set(i, buf())
+        if scan.direct[i] == 0
+            scan.at[i] = at
+            scan.form[i] = form
+            scan.via[i] = buf()
         end if
 
-        scan.writes.set(i, scan.writes.at(i) + 1)
-        scan.direct.set(i, scan.direct.at(i) + 1)
+        scan.writes[i] = scan.writes[i] + 1
+        scan.direct[i] = scan.direct[i] + 1
         return true
     end for
 
@@ -855,7 +855,7 @@ private self_receiver(a: &Analysis, e: TExpr) -> Option[TExpr] = *e.kind match
     TCall(_, args, _, _) ->
         if args.is_empty() then return None
 
-        val recv = args.at(0)
+        val recv = args[0]
 
         if recv.span.start != e.span.start || recv.span.end != e.span.end then return None
 
@@ -887,7 +887,7 @@ end self_call_form
 
 private bump_at(counts: Buf[int], slots: Buf[int], slot: int)
     for i in 0..<slots.len()
-        if slots.at(i) == slot then counts.set(i, counts.at(i) + 1)
+        if slots[i] == slot then counts[i] = counts[i] + 1
 
 // The capture a place writes the closure's own copy of: the capture itself, or a field or an
 // element of it reached without passing through anything that refers elsewhere.
@@ -969,7 +969,7 @@ private note_write_keys(cx: &Analyzer, st: &StructType, args: Buf[TExpr], body: 
     val out: &ClosureWrites = ClosureWrites(buf(), buf(), buf())
 
     for i in 0..<args.len()
-        out.captures.push(place_key(cx, args.at(i)).unwrap_or(""))
+        out.captures.push(place_key(cx, args[i]).unwrap_or(""))
 
     for place in places
         val slot = env_capture(place)
@@ -977,14 +977,14 @@ private note_write_keys(cx: &Analyzer, st: &StructType, args: Buf[TExpr], body: 
         if slot.is_none() then continue
 
         for i in 0..<args.len()
-            if int(st.slot(i)) != slot.unwrap() || out.captures.at(i) == "" then continue
+            if int(st.slot(i)) != slot.unwrap() || out.captures[i] == "" then continue
 
             val steps = if copy_root(place).is_some() then copy_steps(place) else ""
-            val key = if steps == "" then out.captures.at(i) else s"${out.captures.at(i)}/$steps"
+            val key = if steps == "" then out.captures[i] else s"${out.captures[i]}/$steps"
 
             if !holds_string(out.keys, key)
                 out.keys.push(key)
-                out.names.push(st.fields.at(i).0)
+                out.names.push(st.fields[i].0)
             end if
         end for
     end for
@@ -1049,7 +1049,7 @@ private env_root_of(seen: *Buf[usize], slots: Buf[int], place: TExpr)
     if slot.is_none() then return
 
     for i in 0..<slots.len()
-        if slots.at(i) == slot.unwrap() && !holds_index(*seen, i) then seen.push(i)
+        if slots[i] == slot.unwrap() && !holds_index(*seen, i) then seen.push(i)
 end env_root_of
 
 // The capture a place writes the closure's own storage of: the capture itself, a field or an element
@@ -1113,31 +1113,31 @@ private closure_body(cx: &Analyzer, span: Span, st: &StructType, fname: string,
     params.push((inner.bind("self", self_ty), self_ty))
 
     for i in 0..<names.len()
-        val unique = inner.bind(names.at(i), ptypes.at(i))
+        val unique = inner.bind(names[i], ptypes[i])
 
-        params.push((unique, ptypes.at(i)))
+        params.push((unique, ptypes[i]))
 
         // The registrar a `park` was handed takes the task's waker as its one parameter.
-        if cx.reading_registrar && names.len() == 1 && type_eq(ptypes.at(i), waker_type(cx))
+        if cx.reading_registrar && names.len() == 1 && type_eq(ptypes[i], waker_type(cx))
             inner.wakers.push(unique)
 
     for i in 0..<captured.len()
-        val stored = st.fields.at(i).1
+        val stored = st.fields[i].1
         val read = TExpr(span, TField(TExpr(span, TDeref(TExpr(span, TLoad("self", self_ty)),
                                                          Struct(st))), int(st.slot(i)), stored))
 
-        val outer = cx.lookup(captured.at(i))
-        val unique = bind_capture(inner, outer, captured.at(i), stored)
+        val outer = cx.lookup(captured[i])
+        val unique = bind_capture(inner, outer, captured[i], stored)
 
         // A capture of a binding whose type its first use fixes is that binding, for the use.
         if outer.is_some() then carry_open(cx, inner, outer.unwrap().unique, unique)
 
         // A by-name parameter captured is still one: the field holds the callable, and a read of
         // the name calls it.
-        if reads_by_name(cx, captured.at(i)) then inner.by_name.push(unique)
+        if reads_by_name(cx, captured[i]) then inner.by_name.push(unique)
 
         // So is a waker: captured, it is still the executor's.
-        if holds_waker(cx, captured.at(i)) then inner.wakers.push(unique)
+        if holds_waker(cx, captured[i]) then inner.wakers.push(unique)
 
         inner.captured.push((unique, read))
 
@@ -1156,7 +1156,7 @@ private closure_body(cx: &Analyzer, span: Span, st: &StructType, fname: string,
     // **What the call's parameter fixes of the result is handed to the value the body gives**, as it
     // is to an argument: `() -> Ok(1)` at `f: &Fn() -> Result[T, E]` is a `Result[int, E]`.
     if cx.yield_seed.is_some() && !rest.is_empty()
-        *rest.at(rest.len() - 1).kind match
+        *rest[rest.len() - 1].kind match
             ExprStmt(last) ->
                 val seed = cx.yield_seed.unwrap()
 
@@ -1306,9 +1306,9 @@ function_as_callable(cx: &Analyzer, span: Span, written: string, ptypes: Buf[Typ
         var rest: Buf[Expr] = buf()
 
         for i in 1..<args.len()
-            rest.push(args.at(i))
+            rest.push(args[i])
 
-        body.push(stmt(span, ExprStmt(expr(span, Call(on_receiver(called, args.at(0)), rest)))))
+        body.push(stmt(span, ExprStmt(expr(span, Call(on_receiver(called, args[0]), rest)))))
     else body.push(stmt(span, ExprStmt(expr(span, Call(called, args)))))
 
     lower_closure(cx, span, names, ptypes, result, body, written, kept)
@@ -1504,13 +1504,13 @@ private read_expr(keep: &Fn(string) -> bool, e: Expr, bound: Buf[string], found:
                 var inner = copied(bound)
 
                 for j in 0..<arm.patterns.len()
-                    pattern_binds_into(arm.patterns.at(j), &inner)
+                    pattern_binds_into(arm.patterns[j], &inner)
 
                 // What the patterns **read**, which is the quoted names: they reference something
                 // already declared rather than binding it, and are resolved against what was bound
                 // before the arm.
                 for j in 0..<arm.patterns.len()
-                    pattern_reads(keep, arm.patterns.at(j), bound, found)
+                    pattern_reads(keep, arm.patterns[j], bound, found)
 
                 read_opt(keep, arm.guard, inner, found)
                 read_block(keep, arm.body, inner, found)
@@ -1690,7 +1690,7 @@ private call_bounds(tparams: Buf[string],
                     var args: Buf[TypeRef] = buf()
 
                     for j in 0..<fparams.len()
-                        args.push(fparams.at(j))
+                        args.push(fparams[j])
 
                     args.push(ret)
                     added.push(tp)

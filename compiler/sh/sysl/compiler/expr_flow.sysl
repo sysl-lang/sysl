@@ -392,7 +392,7 @@ is_value(cx: &Analyzer, span: Span, subject: Expr, patterns: Buf[Pattern], negat
             // `is not` and `|` with a binder were refused by `cond_is` already, with their own reason.
             if (negated || tpats.len() > 1) && any_pattern_binds(tpats) then return bad_expr(span)
 
-            cx.err(patterns.at(0).span, "this pattern binds a name, and an 'is' that binds stands " +
+            cx.err(patterns[0].span, "this pattern binds a name, and an 'is' that binds stands " +
                    "only in the condition of an 'if' or a 'while' — the name is live through the " +
                    "branch that condition guards, and there is no such branch here. Take the value " +
                    "apart with 'if' or 'match', or write '_' for the parts you are not naming")
@@ -444,7 +444,7 @@ private cond_is(cx: &Analyzer, span: Span, subject: Expr, patterns: Buf[Pattern]
     cx.pattern_roots = pattern_view_roots(cx, ts)
 
     for i in 0..<patterns.len()
-        tpats.push(type_pattern(cx, patterns.at(i), texpr_type(ts)))
+        tpats.push(type_pattern(cx, patterns[i], texpr_type(ts)))
 
     cx.pattern_roots = held
     cx.bind_site = site
@@ -478,14 +478,14 @@ end cond_is
 
 private all_refutable(ps: Buf[TPattern]) -> bool
     for i in 0..<ps.len()
-        if !refutable(ps.at(i)) then return false
+        if !refutable(ps[i]) then return false
 
     true
 end all_refutable
 
 private any_pattern_binds(ps: Buf[TPattern]) -> bool
     for i in 0..<ps.len()
-        if pattern_binds(ps.at(i)) then return true
+        if pattern_binds(ps[i]) then return true
 
     false
 end any_pattern_binds
@@ -525,16 +525,16 @@ private arms_yield_payload(arms: Buf[MatchArm]) -> bool
     for arm in arms
         if arm.guard.is_some() || arm.patterns.len() != 1 || arm.body.len() != 1 then continue
 
-        val bound = *arm.patterns.at(0).kind match
+        val bound = *arm.patterns[0].kind match
             VariantPattern(name, args) ->
                 if args.len() != 1 || !success_variant(name) then continue
 
-                *args.at(0).kind match
+                *args[0].kind match
                     IdentPattern(v) -> v
                     _ -> continue
             _ -> continue
 
-        val yielded = *arm.body.at(0).kind match
+        val yielded = *arm.body[0].kind match
             ExprStmt(inner) -> *inner.kind match
                 Ident(n) -> n
                 _ -> continue
@@ -611,7 +611,7 @@ private analyze_arms(cx: &Analyzer, scrut: Type, arms: Buf[MatchArm], expected: 
 
     if expected.is_some()
         for i in 0..<arms.len()
-            out.push(analyze_arm(cx, scrut, arms.at(i), expected, discarded))
+            out.push(analyze_arm(cx, scrut, arms[i], expected, discarded))
 
         return out
     end if
@@ -619,9 +619,9 @@ private analyze_arms(cx: &Analyzer, scrut: Type, arms: Buf[MatchArm], expected: 
     var own: Buf[Option[TArm]] = buf()
 
     for i in 0..<arms.len()
-        val held = guessing(cx, arms.at(i).body) || leaning(cx, arms.at(i).body)
+        val held = guessing(cx, arms[i].body) || leaning(cx, arms[i].body)
 
-        if held then own.push(None) else own.push(attempt_arm(cx, scrut, arms.at(i), None, discarded))
+        if held then own.push(None) else own.push(attempt_arm(cx, scrut, arms[i], None, discarded))
 
     // The first arm that settles anything is what the held-over ones are told. Where the arms that
     // know disagree among themselves this picks one of them, and the coverage check then reports
@@ -638,10 +638,10 @@ private analyze_arms(cx: &Analyzer, scrut: Type, arms: Buf[MatchArm], expected: 
     var read: Buf[Option[TArm]] = buf()
 
     for i in 0..<arms.len()
-        if leaning(cx, arms.at(i).body)
-            read.push(offering(cx, want, () -> offered_arm(cx, scrut, arms.at(i), want, discarded)))
+        if leaning(cx, arms[i].body)
+            read.push(offering(cx, want, () -> offered_arm(cx, scrut, arms[i], want, discarded)))
         else
-            read.push(own.at(i))
+            read.push(own[i])
 
     if want.is_none() then want = first_settled(read)
 
@@ -650,9 +650,9 @@ private analyze_arms(cx: &Analyzer, scrut: Type, arms: Buf[MatchArm], expected: 
     if want.is_none() && any_unread(read) then want = merged_arm_type(cx, scrut, arms, discarded)
 
     for i in 0..<arms.len()
-        read.at(i) match
+        read[i] match
             Some(t) -> out.push(t)
-            None -> out.push(offering(cx, want, () -> analyze_arm(cx, scrut, arms.at(i), want, discarded)))
+            None -> out.push(offering(cx, want, () -> analyze_arm(cx, scrut, arms[i], want, discarded)))
 
     out
 end analyze_arms
@@ -663,17 +663,17 @@ private shared_arm_type(cx: &Analyzer, scrut: Type, arms: Buf[MatchArm], discard
     var shaped: Buf[MatchArm] = buf()
 
     for i in 0..<arms.len()
-        if leaning(cx, arms.at(i).body) && shaped_value(arms.at(i).body) then shaped.push(arms.at(i))
+        if leaning(cx, arms[i].body) && shaped_value(arms[i].body) then shaped.push(arms[i])
 
     if shaped.len() < 2 then return None
 
     common_offer(shaped.len(), (i, want) -> offering(cx, want, () -> trial(cx, () ->
-                     analyze_arm(cx, scrut, shaped.at(i), want, discarded).body)))
+                     analyze_arm(cx, scrut, shaped[i], want, discarded).body)))
 end shared_arm_type
 
 private any_unread(arms: Buf[Option[TArm]]) -> bool
     for i in 0..<arms.len()
-        if arms.at(i).is_none() then return true
+        if arms[i].is_none() then return true
 
     false
 end any_unread
@@ -685,7 +685,7 @@ private merged_arm_type(cx: &Analyzer, scrut: Type, arms: Buf[MatchArm], discard
     var leaves: Buf[Expr] = buf()
 
     for i in 0..<arms.len()
-        leaf_values(&leaves, arms.at(i).body)
+        leaf_values(&leaves, arms[i].body)
 
     if leaves.is_empty() then return None
 
@@ -694,7 +694,7 @@ private merged_arm_type(cx: &Analyzer, scrut: Type, arms: Buf[MatchArm], discard
     cx.merging += 1
 
     for i in 0..<arms.len()
-        val _ = trial(cx, () -> analyze_arm(cx, scrut, arms.at(i), None, discarded).body)
+        val _ = trial(cx, () -> analyze_arm(cx, scrut, arms[i], None, discarded).body)
 
     cx.merging -= 1
     merged_partials(cx, leaves, start)
@@ -751,7 +751,7 @@ end leaf_values
 private merged_partials(cx: &Analyzer, leaves: Buf[Expr], start: usize) -> Option[Type]
     var key = ""
     var targs: Buf[Type] = buf()
-    var at = leaves.at(0).span
+    var at = leaves[0].span
     var mixed = false
 
     for leaf in leaves
@@ -771,8 +771,8 @@ private merged_partials(cx: &Analyzer, leaves: Buf[Expr], start: usize) -> Optio
                 mixed = true
             else
                 for j in 0..<targs.len()
-                    if targs.at(j) == Unknown && j < ts.len() && !mentions_unknown(ts.at(j)) then
-                        targs.set(j, ts.at(j))
+                    if targs[j] == Unknown && j < ts.len() && !mentions_unknown(ts[j]) then
+                        targs[j] = ts[j]
             end if
         end if
 
@@ -795,7 +795,7 @@ private partial_at(cx: &Analyzer, leaf: Expr, start: usize) -> Option[(string, B
     val anchor = anchor_of(leaf)
 
     for i in start..<cx.partials.len()
-        val p = cx.partials.at(i)
+        val p = cx.partials[i]
 
         if p.0 == anchor || p.0 == leaf.span then return Some((p.1, p.2))
 
@@ -805,8 +805,8 @@ end partial_at
 // What the first arm read so far that settles anything settles.
 private first_settled(arms: Buf[Option[TArm]]) -> Option[Type]
     for i in 0..<arms.len()
-        if arms.at(i).is_some()
-            val t = settles(arms.at(i).unwrap().body)
+        if arms[i].is_some()
+            val t = settles(arms[i].unwrap().body)
 
             if t.is_some() then return t
 
@@ -837,7 +837,7 @@ private analyze_arm(cx: &Analyzer, scrut: Type, arm: MatchArm, expected: Option[
     cx.bind_site = Some(arm.span)
 
     for i in 0..<arm.patterns.len()
-        tpats.push(type_pattern(cx, arm.patterns.at(i), scrut))
+        tpats.push(type_pattern(cx, arm.patterns[i], scrut))
 
     cx.bind_site = site
 
@@ -866,7 +866,7 @@ private match_result_type(cx: &Analyzer, span: Span, scrut: Type, arms: Buf[TArm
     var reached: Buf[Type] = buf()
 
     for i in 0..<arms.len()
-        val ty = arms.at(i).body.ty
+        val ty = arms[i].body.ty
 
         // An arm that does not finish constrains nothing, so it is set aside before the others
         // are compared. That is what lets `None -> exit(1)` sit beside `Some(v) -> v`. An arm
@@ -878,7 +878,7 @@ private match_result_type(cx: &Analyzer, span: Span, scrut: Type, arms: Buf[TArm
     var yielded: Buf[Type] = buf()
 
     for i in 0..<reached.len()
-        if reached.at(i) != Unit then yielded.push(reached.at(i))
+        if reached[i] != Unit then yielded.push(reached[i])
 
     // The two views of one slice are the one pair of *known* types with a meeting point, and they
     // meet at the read-only one. Applied only where there were two to reconcile, so a lone `[]T`
@@ -886,18 +886,18 @@ private match_result_type(cx: &Analyzer, span: Span, scrut: Type, arms: Buf[TArm
     var met: Buf[Type] = buf()
 
     for i in 0..<yielded.len()
-        if !holds_type(met, const_view(yielded.at(i))) then met.push(const_view(yielded.at(i)))
+        if !holds_type(met, const_view(yielded[i])) then met.push(const_view(yielded[i]))
 
     val merged = yielded.len() > 1 && met.len() == 1
     var settled: Buf[Type] = buf()
 
     if merged
         for i in 0..<reached.len()
-            if !holds_type(settled, const_view(reached.at(i))) then
-                settled.push(const_view(reached.at(i)))
+            if !holds_type(settled, const_view(reached[i])) then
+                settled.push(const_view(reached[i]))
     else
         for i in 0..<reached.len()
-            settled.push(reached.at(i))
+            settled.push(reached[i])
     end if
 
     val values = if merged then met else yielded
@@ -917,7 +917,7 @@ end match_result_type
 // `never` where none of them finishes at all.
 private met_value_type(settled: Buf[Type]) -> Type
     if settled.is_empty() then return Never
-    if settled.len() == 1 && settled.at(0) != Unit then return settled.at(0)
+    if settled.len() == 1 && settled[0] != Unit then return settled[0]
 
     Unit
 end met_value_type
@@ -956,7 +956,7 @@ private check_coverage(cx: &Analyzer, span: Span, scrut: Type, arms: Buf[TArm])
 
 private holds_type(seen: Buf[Type], t: Type) -> bool
     for i in 0..<seen.len()
-        if type_eq(seen.at(i), t) then return true
+        if type_eq(seen[i], t) then return true
 
     false
 end holds_type
@@ -967,7 +967,7 @@ private joined_types(ts: Buf[Type]) -> string
     for i in 0..<ts.len()
         if i > 0 then out = out + " and "
 
-        out = out + type_show(ts.at(i))
+        out = out + type_show(ts[i])
 
     out
 end joined_types
@@ -1032,8 +1032,8 @@ private sibling_type(cx: &Analyzer, m: LoopMiss, else_body: Option[Buf[Stmt]]) -
     var soft = false
 
     for i in 0..<m.break_tys.len()
-        if m.break_soft.at(i) then soft = true
-        else known.push(m.break_tys.at(i))
+        if m.break_soft[i] then soft = true
+        else known.push(m.break_tys[i])
 
     if m.else_ty.is_some()
         if else_body.is_some() && literal_block(cx, else_body.unwrap()) then soft = true
@@ -1224,8 +1224,8 @@ private counted_for(cx: &Analyzer, span: Span, label: Option[string], name: stri
     ends.push(hi)
 
     val ts = analyze_operands(cx, ends, fixed, true)
-    val tlo = ts.at(0)
-    val thi = ts.at(1)
+    val tlo = ts[0]
+    val thi = ts[1]
 
     if disagree(texpr_type(tlo), texpr_type(thi)) then
         cx.fault(span, s"a 'for' range needs matching bounds, got " +
@@ -1373,7 +1373,7 @@ private walks_through_a_table(cx: &Analyzer, cty: Type, iterate: string) -> bool
                                 self_binding(Abstract("Self", buf())))
 
     for i in 0..<closure.len()
-        if closure.at(i).name == iterate then return true
+        if closure[i].name == iterate then return true
 
     false
 end walks_through_a_table
@@ -1636,8 +1636,8 @@ private counted_quantifier(cx: &Analyzer, span: Span, universal: bool, name: str
     ends.push(hi)
 
     val ts = analyze_operands(cx, ends, fixed, true)
-    val tlo = ts.at(0)
-    val thi = ts.at(1)
+    val tlo = ts[0]
+    val thi = ts[1]
 
     if disagree(texpr_type(tlo), texpr_type(thi)) then
         cx.fault(span, s"a '$word' range needs matching bounds, got " +
@@ -1751,11 +1751,11 @@ private unrolled(cx: &Analyzer, span: Span, name: string, each: Buf[Buf[Binding]
         var subst: Buf[Binding] = buf()
 
         for i in 0..<saved_subst.len()
-            val held = saved_subst.at(i).name
+            val held = saved_subst[i].name
 
-            if held != name && !held.starts_with(projected) then subst.push(saved_subst.at(i))
+            if held != name && !held.starts_with(projected) then subst.push(saved_subst[i])
 
-        for b in each.at(k)
+        for b in each[k]
             subst.push(b)
 
         cx.subst = subst
@@ -1764,7 +1764,7 @@ private unrolled(cx: &Analyzer, span: Span, name: string, each: Buf[Buf[Binding]
 
         copies.push(TExpr(span, TBlockExpr(type_value_block(cx, body, None, true))))
 
-        if k < labels.len() then name_the_part(cx, before, labels.at(k))
+        if k < labels.len() then name_the_part(cx, before, labels[k])
 
     cx.subst = saved_subst
     cx.loops = saved_loops
@@ -1850,7 +1850,7 @@ leaning(cx: &Analyzer, stmts: Buf[Stmt]) -> bool = block_value(stmts) match
 private block_value(stmts: Buf[Stmt]) -> Option[Expr]
     if stmts.is_empty() then return None
 
-    *stmts.at(stmts.len() - 1).kind match
+    *stmts[stmts.len() - 1].kind match
         ExprStmt(e) -> Some(e)
         _ -> None
 end block_value
@@ -2096,7 +2096,7 @@ private leaf_block(out: *Buf[TExpr], b: TBlock) -> bool
 private stops(cx: &Analyzer, stmts: Buf[Stmt]) -> bool
     if stmts.is_empty() then return false
 
-    *stmts.at(stmts.len() - 1).kind match
+    *stmts[stmts.len() - 1].kind match
         Return(_) -> true
         Break(_, _) -> true
         Continue(_) -> true

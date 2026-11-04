@@ -94,9 +94,7 @@ it.
 | `len` | `len(self) -> usize` | How many values are in it. |
 | `is_empty` | `is_empty(self) -> bool` |  |
 | `is_full` | `is_full(self) -> bool` | Whether the next `push_back` will be refused, which is the question a bounded queue is asked that a growing one never is. |
-| `at` | `at(self, i: usize) -> T` | The `i`th value from the front. |
-| `get` | `get(self, i: usize) -> Option[T]` | The `i`th value from the front, or nothing where there is no such value. |
-| `set` | `set(*self, i: usize, v: T)` |  |
+| `get` | `get[I: Integer](self, i: I) -> Option[T]` | The `i`th value from the front, or nothing where there is no such value -- `i` at or past the length, or negative. |
 | `first` | `first(self) -> Option[T]` |  |
 | `last` | `last(self) -> Option[T]` |  |
 | `push_back` | `push_back(*self, v: T) -> bool` | Adds to the back, and answers whether there was room. |

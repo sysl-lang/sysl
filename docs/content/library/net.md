@@ -15,9 +15,9 @@ import sysl.net.{ipv4, resolve}
 val addrs = resolve("127.0.0.1", 8080).unwrap()
 
 print(addrs.len() > 0)
-print(addrs.at(0).text(), addrs.at(0).port(), addrs.at(0).family())
-print(addrs.at(0))
-print(addrs.at(0) == ipv4(127, 0, 0, 1, 8080))
+print(addrs[0].text(), addrs[0].port(), addrs[0].family())
+print(addrs[0])
+print(addrs[0] == ipv4(127, 0, 0, 1, 8080))
 ```
 
 ```output
@@ -63,7 +63,7 @@ import sysl.net.{resolve, socket, Socket}
 
 // A listener of our own, so the page has something to connect to. Port 0 asks the machine for one
 // it has free, and `local` is what says which it gave.
-val here = resolve("127.0.0.1", 0).unwrap().at(0)
+val here = resolve("127.0.0.1", 0).unwrap()[0]
 var server = socket(here).unwrap()
 
 server.reuse_address().unwrap()
@@ -128,7 +128,7 @@ then go on reading the answer. Closing would have said nothing and thrown the an
 ```sysl
 import sysl.net.{resolve, socket, Shutdown}
 
-val here = resolve("127.0.0.1", 0).unwrap().at(0)
+val here = resolve("127.0.0.1", 0).unwrap()[0]
 var server = socket(here).unwrap()
 
 server.bind(here).unwrap()
@@ -174,7 +174,7 @@ it in milliseconds, and zero — where a socket starts — means no limit.
 ```sysl
 import sysl.net.{resolve, socket, timed_out}
 
-val here = resolve("127.0.0.1", 0).unwrap().at(0)
+val here = resolve("127.0.0.1", 0).unwrap()[0]
 var server = socket(here).unwrap()
 
 server.bind(here).unwrap()

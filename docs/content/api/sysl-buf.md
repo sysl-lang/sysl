@@ -83,7 +83,7 @@ A sequence that grows, and the name every holder of it shares.
 **A `Buf` is a reference, the way a collection is in most languages a program will have met.**
 Assigning one, passing it, capturing it in a closure, keeping it in a struct and reading it back
 out of another container all hand over a second name for the *same* buffer, so a push through any
-of them is seen through every other -- `Buf[Buf[int]]` included, where `outer.at(0).push(x)`
+of them is seen through every other -- `Buf[Buf[int]]` included, where `outer[0].push(x)`
 grows the inner buffer the outer one holds. A program that wants a second buffer asks for one with
 `buf()` and fills it.
 
@@ -123,9 +123,8 @@ the caller's line.
 | `len` | `const len(self) -> usize` |  |
 | `cap` | `const cap(self) -> usize` |  |
 | `is_empty` | `const is_empty(self) -> bool` |  |
-| `at` | `const at(self, i: usize) -> T` |  |
-| `set` | `const set(self, i: usize, v: T)` |  |
-| `get_unchecked` | `const get_unchecked(self, i: usize) -> T` | `at` and `set` with no bounds check: the element at `i`, read or written where it lives, with nothing comparing `i` to the count. |
+| `get` | `const get[I: Integer](self, i: I) -> Option[T]` | The element at `i`, or `None` where there is none -- `i` at or past the length, or negative. |
+| `get_unchecked` | `const get_unchecked(self, i: usize) -> T` | `b[i]` and `b[i] = v` with no bounds check: the element at `i`, read or written where it lives, with nothing comparing `i` to the count. |
 | `set_unchecked` | `const set_unchecked(self, i: usize, v: T)` |  |
 | `push` | `const push(self, v: T)` |  |
 | `extend` | `const extend(self, xs: []const T)` |  |
@@ -192,7 +191,7 @@ destructor touches that count, once, run by whichever thread lets go of the box'
 |---|---|---|
 | `len` | `const len(self) -> usize` |  |
 | `is_empty` | `const is_empty(self) -> bool` |  |
-| `at` | `const at(self, i: usize) -> T` | The element at `i`, checked against the length: past it is a trap, as an array's index is. |
+| `get` | `const get[I: Integer](self, i: I) -> Option[T]` | The element at `i`, or `None` where there is none -- `i` at or past the length, or negative. |
 | `view` | `const view(&sync self) -> []const T` | The elements as a read-only slice. |
 
 ### `FrozenWalk`
@@ -313,7 +312,7 @@ impl[T] Index[usize, T] for Buf[T]
 ```
 
 Subscripting reaches the bounds-checked members rather than the storage, so `b[i]` on a `Buf`
-means what `b.at(i)` means and cannot read a slot past the count that the backing slice still has.
+checks `i` against the count, and cannot read a slot past it that the backing slice still has.
 
 ### Index for Frozen[T]
 

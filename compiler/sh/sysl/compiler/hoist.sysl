@@ -149,7 +149,7 @@ joined(parts: Buf[string], sep: string) -> string
     for i in 0..<parts.len()
         if i > 0 then out = s"$out$sep"
 
-        out = s"$out${parts.at(i)}"
+        out = s"$out${parts[i]}"
 
     out
 end joined
@@ -197,8 +197,8 @@ hoist_units(a: &Analysis, units: Buf[Program])
     // and say `binding` -- a `val` there is a local like any other, and saying so twice would answer
     // one mistake from two places.
     for i in 0..<units.len()
-        val body = units.at(i).body
-        val is_entry = a.tables.entry_src != "" && units.at(i).src.name == a.tables.entry_src
+        val body = units[i].body
+        val is_entry = a.tables.entry_src != "" && units[i].src.name == a.tables.entry_src
 
         for item in body
             if is_entry && entry_binding(item) &&
@@ -207,37 +207,37 @@ hoist_units(a: &Analysis, units: Buf[Program])
             val taken = reserved_in(item)
 
             for k in 0..<taken.len()
-                a.fault(scopes.at(i), taken.at(k).2, refuse_reserved(taken.at(k).0, taken.at(k).1))
+                a.fault(scopes[i], taken[k].2, refuse_reserved(taken[k].0, taken[k].1))
 
     // **What each file makes nameable beyond itself is read before anything is registered**, so a
     // file-private declaration hoisted ahead of a public one of its spelling knows to leave the plain
     // key to it (`decl_key`). Asking the tables instead would make where each declaration lands
     // depend on the order the files arrived in.
     for i in 0..<units.len()
-        val body = units.at(i).body
-        val is_entry = a.tables.entry_src != "" && units.at(i).src.name == a.tables.entry_src
+        val body = units[i].body
+        val is_entry = a.tables.entry_src != "" && units[i].src.name == a.tables.entry_src
 
         for item in body
             if is_entry && !belongs_to_module(item, a.tables.entry_captures) then continue
 
-            note_wider(a, scopes.at(i), item)
+            note_wider(a, scopes[i], item)
 
     for i in 0..<units.len()
-        val body = units.at(i).body
-        val is_entry = a.tables.entry_src != "" && units.at(i).src.name == a.tables.entry_src
+        val body = units[i].body
+        val is_entry = a.tables.entry_src != "" && units[i].src.name == a.tables.entry_src
 
         for j in 0..<body.len()
             // The entry file is a body, so what it declares is that body's unless it has no
             // run-time identity. Everything else it carries is registered here as any other file's
             // would be.
-            if is_entry && !belongs_to_module(body.at(j), a.tables.entry_captures) then continue
+            if is_entry && !belongs_to_module(body[j], a.tables.entry_captures) then continue
 
-            hoist_stmt(a, scopes.at(i), body.at(j))
+            hoist_stmt(a, scopes[i], body[j])
 
             // A `where` predicate and a struct's `invariant` clauses are ordinary functions of the
             // values they read, registered beside the declaration that wrote them so that the pass
             // which types every body types these too.
-            register_predicate(a, scopes.at(i), body.at(j))
+            register_predicate(a, scopes[i], body[j])
 end hoist_units
 
 // Whether a statement of the entry file is a binding its body makes rather than a declaration.
@@ -261,13 +261,13 @@ private entry_binding(s: Stmt) -> bool = *s.kind match
 // constant every type shares.
 private check_trait_defaults(a: &Analysis, scope: Scope, d: TraitDecl)
     for i in 0..<d.methods.len()
-        val m = d.methods.at(i)
+        val m = d.methods[i]
 
         // **A trait's members are one per name.** An implementation supplies each by its name and a
         // bound reaches each by its name, so a second declaration of one would replace the first
         // without a word -- a type's own body may overload, a trait's may not.
         for j in 0..<i
-            if d.methods.at(j).name == m.name
+            if d.methods[j].name == m.name
                 a.fault(scope, m.span, s"trait '${d.name}' already declares a member named " +
                         s"'${source_member_name(m.name)}' — an implementation supplies a trait's " +
                         "members by name, so a trait declares each name once; give this one a " +
@@ -390,13 +390,13 @@ private hoist_several(a: &Analysis, scope: Scope, span: Span, names: Buf[string]
                       vis: Visibility, mutable: bool, copies: Copies)
     if values.len() == names.len() && !names_repeated(names)
         for i in 0..<names.len()
-            if names.at(i) != "_" then
-                hoist_named(a, scope, span, names.at(i), vis, values.at(i), mutable, copies)
+            if names[i] != "_" then
+                hoist_named(a, scope, span, names[i], vis, values[i], mutable, copies)
 
         return
     end if
 
-    val from = if values.len() == 1 then held_once(a, scope, span, values.at(0), None, mutable) else values
+    val from = if values.len() == 1 then held_once(a, scope, span, values[0], None, mutable) else values
 
     hoist_parts(a, scope, span, names, vis, MultiDecl(names, false, from, File), mutable, copies)
 end hoist_several
@@ -411,7 +411,7 @@ private hoist_pattern(a: &Analysis, scope: Scope, span: Span, pat: Pattern, valu
 
     val held = held_once(a, scope, span, value, typ, mutable)
 
-    hoist_parts(a, scope, span, names, vis, PatternDecl(pat, false, held.at(0), None, File), mutable,
+    hoist_parts(a, scope, span, names, vis, PatternDecl(pat, false, held[0], None, File), mutable,
                 copies)
 end hoist_pattern
 
@@ -444,18 +444,18 @@ private hoist_parts(a: &Analysis, scope: Scope, span: Span, names: Buf[string], 
     val first = first_namings(names)
 
     for i in 0..<names.len()
-        if first.at(i) || names.at(i) == "_" then continue
+        if first[i] || names[i] == "_" then continue
 
-        a.fault(scope, span, s"'${names.at(i)}' is named twice in one binding")
+        a.fault(scope, span, s"'${names[i]}' is named twice in one binding")
 
     for i in 0..<names.len()
-        if !first.at(i) then continue
+        if !first[i] then continue
 
         var body: Buf[Stmt] = buf()
 
-        body.push(stmt(span, part_binding(binding, names.at(i))))
+        body.push(stmt(span, part_binding(binding, names[i])))
         body.push(stmt(span, ExprStmt(expr(span, Ident(PART_LOCAL)))))
-        hoist_named(a, scope, span, names.at(i), vis, expr(span, Block(body)), mutable, copies)
+        hoist_named(a, scope, span, names[i], vis, expr(span, Block(body)), mutable, copies)
     end for
 end hoist_parts
 
@@ -549,10 +549,10 @@ private first_namings(names: Buf[string]) -> Buf[bool]
     var out: Buf[bool] = buf()
 
     for i in 0..<names.len()
-        var first = names.at(i) != "_"
+        var first = names[i] != "_"
 
         for j in 0..<i
-            if names.at(j) == names.at(i) then first = false
+            if names[j] == names[i] then first = false
 
         out.push(first)
 
@@ -562,7 +562,7 @@ end first_namings
 private names_repeated(names: Buf[string]) -> bool
     for i in 0..<names.len()
         for j in 0..<i
-            if names.at(j) == names.at(i) then return true
+            if names[j] == names[i] then return true
 
     false
 end names_repeated
@@ -906,7 +906,7 @@ private hoist_extern(a: &Analysis, scope: Scope, span: Span, d: ExternDecl)
         val funcs = overload_keys(a, base)
 
         for i in 0..<funcs.len()
-            val other = a.tables.funcs.get(funcs.at(i))
+            val other = a.tables.funcs.get(funcs[i])
 
             if other.is_some() && same_params(d.params, other.unwrap().decl.params) then
                 a.fault(scope, span, s"function '${d.name}' is already declared" +
@@ -1022,7 +1022,7 @@ end check_signature_rules
 private check_rest_position(a: &Analysis, scope: Scope, name: string, params: Buf[Param],
                             variadic: bool, foreign: bool)
     for i in 0..<params.len()
-        val p = params.at(i)
+        val p = params[i]
 
         if !p.rest then continue
 
@@ -1036,7 +1036,7 @@ private check_rest_position(a: &Analysis, scope: Scope, name: string, params: Bu
                     "one tail, so a declaration may write one of them")
         else if i + 1 < params.len()
             a.fault(scope, p.span, s"'${p.name}' collects the rest of the call, so nothing can follow " +
-                    s"it — the arguments that would be '${params.at(params.len() - 1).name}' are " +
+                    s"it — the arguments that would be '${params[params.len() - 1].name}' are " +
                     "already inside it")
 
         return
@@ -1072,7 +1072,7 @@ check_pack_spellings(a: &Analysis, scope: Scope, span: Span, tparams: Buf[string
     var types: Buf[string] = buf()
 
     for i in 0..<values.len()
-        names.push(values.at(i).name)
+        names.push(values[i].name)
 
     for tparam in tparams
         if !has_binding(values, tparam) then types.push(tparam)
@@ -1119,7 +1119,7 @@ private walk_pack_spellings(a: &Analysis, scope: Scope, span: Span, tparams: Buf
             length_not_a_type(a, scope, span, e, lengths.types)
         TupleType(parts, _) ->
             if parts.len() == 1
-                *parts.at(0).kind match
+                *parts[0].kind match
                     PackType(n) ->
                         declared_pack(a, scope, span, tparams, packs, n)
                         return
@@ -1166,7 +1166,7 @@ length_arithmetic(a: &Analysis, scope: Scope, span: Span, len: Expr, names: Buf[
 
     if found.is_empty() then return
 
-    val n = found.at(0)
+    val n = found[0]
     val message = s"this length does arithmetic on '$n', and a type may name a value parameter but " +
                   "not compute with one — deciding that two such lengths are one type is type-level " +
                   s"arithmetic, which is a separate feature. A body may compute with '$n' freely"
@@ -1186,8 +1186,8 @@ private value_params_in(e: Expr, names: Buf[string], out: *Buf[string])
             value_params_in(r, names, out)
         Compare(operands, _) ->
             if operands.len() == 2
-                value_params_in(operands.at(0), names, out)
-                value_params_in(operands.at(1), names, out)
+                value_params_in(operands[0], names, out)
+                value_params_in(operands[1], names, out)
             end if
         Call(_, args) ->
             for arg in args
@@ -1560,7 +1560,7 @@ private same_params(a: Buf[Param], b: Buf[Param]) -> bool
     if a.len() != b.len() then return false
 
     for i in 0..<a.len()
-        if type_text(a.at(i).typ) != type_text(b.at(i).typ) then return false
+        if type_text(a[i].typ) != type_text(b[i].typ) then return false
 
     true
 end same_params
@@ -1583,7 +1583,7 @@ overlapping_lists(ps: Buf[Param], variadic: bool, others: Buf[Param],
     val n = min_usize2(lo, min_usize2(ps.len(), others.len()))
 
     for i in 0..<n
-        if type_text(ps.at(i).typ) != type_text(others.at(i).typ) then return false
+        if type_text(ps[i].typ) != type_text(others[i].typ) then return false
 
     true
 end overlapping_lists

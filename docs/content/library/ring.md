@@ -43,7 +43,7 @@ Some(2) None
 | `r.push_back(v)`, `r.push_front(v)` | add at either end; `false` where the ring is full |
 | `r.pop_front()`, `r.pop_back()` | take from either end, `None` where it is empty |
 | `r.first()`, `r.last()`, `r.get(i)` | look without taking, as an `Option` |
-| `r[i]`, `r.at(i)`, `r.set(i, v)` | the `i`th value **from the front**, trapping past the end as an array's index does |
+| `r[i]`, `r[i] = v` | the `i`th value **from the front**, trapping past the end as an array's index does; `r.get(i)` is the form that answers `None` instead, for any integer `i` (a negative one included) |
 | `r.overwrite(v)` | add at the back, dropping the oldest to make room, and answer what was dropped |
 | `r.clear()`, `r.walk()` | forget every value; walk from the front to the back |
 

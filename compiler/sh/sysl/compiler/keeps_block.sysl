@@ -42,12 +42,12 @@ struct BlockScopes
     ends_within(self, inner: int, outer: int) -> bool
         if inner <= 0 || outer < 0 || inner == outer then return false
 
-        var at = self.blocks.at(usize(inner)).parent
+        var at = self.blocks[usize(inner)].parent
 
         while at >= 0
             if at == outer then return true
 
-            at = self.blocks.at(usize(at)).parent
+            at = self.blocks[usize(at)].parent
 
         false
     end ends_within
@@ -73,13 +73,13 @@ block_scopes_of(f: TFunc) -> &BlockScopes
 end block_scopes_of
 
 private open(sc: &BlockScopes, parent: int, said: string) -> int
-    sc.blocks.push(BodyBlock(parent, sc.blocks.at(usize(parent)).depth + 1, said, false))
+    sc.blocks.push(BodyBlock(parent, sc.blocks[usize(parent)].depth + 1, said, false))
     int(sc.blocks.len()) - 1
 end open
 
 // A block that runs once each turn of a loop.
 private open_turn(sc: &BlockScopes, parent: int, said: string) -> int
-    sc.blocks.push(BodyBlock(parent, sc.blocks.at(usize(parent)).depth + 1, said, true))
+    sc.blocks.push(BodyBlock(parent, sc.blocks[usize(parent)].depth + 1, said, true))
     int(sc.blocks.len()) - 1
 end open_turn
 
@@ -107,8 +107,8 @@ private settle_sites(sc: &BlockScopes)
     for name in sc.sites
         var at = sc.home_of(name)
 
-        while at >= 0 && !sc.blocks.at(usize(at)).repeats
-            at = sc.blocks.at(usize(at)).parent
+        while at >= 0 && !sc.blocks[usize(at)].repeats
+            at = sc.blocks[usize(at)].parent
 
         sc.homes.put(name, at)
     end for
@@ -119,7 +119,7 @@ end settle_sites
 private declare(sc: &BlockScopes, name: string, block: int)
     val was = sc.homes.get(name)
 
-    if was.is_some() && sc.blocks.at(usize(was.unwrap())).depth >= sc.blocks.at(usize(block)).depth then return
+    if was.is_some() && sc.blocks[usize(was.unwrap())].depth >= sc.blocks[usize(block)].depth then return
 
     sc.homes.put(name, block)
 end declare
@@ -370,7 +370,7 @@ private block_expr_event(bt: &BlockTrack, e: TExpr)
                     kept_by_call(bt, args, j, item.loc, s"'${shown_name(bt.cx.an, name)}'")
 
                 // For a probe, what the callee copies out of a pointer or a view into a local.
-                if block_reads_through(bt, args.at(j))
+                if block_reads_through(bt, args[j])
                     for item in through_of(bt.cx, name, j).locs
                         kept_by_call(bt, args, j, item.loc, s"'${shown_name(bt.cx.an, name)}'")
                 end if
@@ -382,7 +382,7 @@ private block_expr_event(bt: &BlockTrack, e: TExpr)
                 for item in vcall_keeps(bt.cx, recv, slot, k)
                     kept_by_call(bt, all, k, item.1.loc, callee_said(bt.cx.an, item.0))
 
-                if block_reads_through(bt, all.at(k))
+                if block_reads_through(bt, all[k])
                     for item in vcall_through(bt.cx, recv, slot, k)
                         kept_by_call(bt, all, k, item.1.loc, callee_said(bt.cx.an, item.0))
                 end if
@@ -392,7 +392,7 @@ private block_expr_event(bt: &BlockTrack, e: TExpr)
                 for item in pointer_keeps(bt.cx, callee, j)
                     kept_by_call(bt, args, j, item.1.loc, "the call")
 
-                if block_reads_through(bt, args.at(j))
+                if block_reads_through(bt, args[j])
                     for item in pointer_through(bt.cx, callee, j)
                         kept_by_call(bt, args, j, item.1.loc, "the call")
                 end if
@@ -448,7 +448,7 @@ end probe_bind_roots
 private block_reads_through(bt: &BlockTrack, arg: TExpr) -> bool = bt.probe && asks_through(bt.cx, texpr_type(arg))
 
 private kept_by_call(bt: &BlockTrack, args: Buf[TExpr], j: usize, callee_loc: string, by: string)
-    val arg = args.at(j)
+    val arg = args[j]
 
     if !may_hold_pointer(bt.cx, texpr_type(arg)) then return
 
@@ -502,7 +502,7 @@ private probe_escaped(bt: &BlockTrack, base: string, holder: string, r: string, 
         for item in bt.turned_out
             if item.0 == base then return
 
-        val block = bt.sc.blocks.at(usize(bt.sc.home_of(root_local(r)))).said
+        val block = bt.sc.blocks[usize(bt.sc.home_of(root_local(r)))].said
 
         bt.turned_out.push((base, s"$keeps '${shown_local(holder)}' ${probe_line(bt.scope, v.span)}, which " +
                                   s"outlives the turn of $block that builds it"))
@@ -547,7 +547,7 @@ end hold
 
 private refuse_kept(bt: &BlockTrack, holder: string, r: string, kept: TExpr, by: string)
     val v = carrier(bt, kept, r)
-    val block = bt.sc.blocks.at(usize(bt.sc.home_of(r))).said
+    val block = bt.sc.blocks[usize(bt.sc.home_of(r))].said
     val local = shown_local(r)
     val direct = *v.kind match
         TAddrOf(place, _) -> frame_root_of(bt.refs, place).is_some()
@@ -580,7 +580,7 @@ private carrier(bt: &BlockTrack, v: TExpr, r: string) -> TExpr
             walk_stmts(body, stmt_walk(false, s -> s match
                 TBreak(value, _) -> if value.is_some() then into.push(value.unwrap())
                 _ -> ()))
-        TSeq(exprs) -> if !exprs.is_empty() then arms.push(exprs.at(exprs.len() - 1))
+        TSeq(exprs) -> if !exprs.is_empty() then arms.push(exprs[exprs.len() - 1])
         _ -> ()
 
     for x in arms
@@ -632,7 +632,7 @@ private roots_of(bt: &BlockTrack, e: TExpr, out: *Buf[string])
         TErase(v, _, _) -> roots_of(bt, v, out)
         TCast(v, ty) -> if may_hold_pointer(bt.cx, ty) then roots_of(bt, v, out)
         TField(r, _, ty) -> if may_hold_pointer(bt.cx, ty) then roots_of(bt, r, out)
-        TSeq(exprs) -> if !exprs.is_empty() then roots_of(bt, exprs.at(exprs.len() - 1), out)
+        TSeq(exprs) -> if !exprs.is_empty() then roots_of(bt, exprs[exprs.len() - 1], out)
         TBlockExpr(b) -> roots_of_block(bt, b, out)
         TIf(_, then_block, else_block, _) ->
             roots_of_block(bt, then_block, out)
@@ -650,14 +650,14 @@ private roots_of(bt: &BlockTrack, e: TExpr, out: *Buf[string])
             if !may_hold_pointer(bt.cx, ty) then return
 
             for i in 0..<args.len()
-                if answers_arg(bt.cx, name, args, i, ty, false) then roots_of(bt, args.at(i), out)
+                if answers_arg(bt.cx, name, args, i, ty, false) then roots_of(bt, args[i], out)
         TVCall(recv, slot, args, ty, _) ->
             if !may_hold_pointer(bt.cx, ty) then return
 
             val all = with_receiver(recv, args)
 
             for k in 0..<all.len()
-                if vcall_answers(bt.cx, recv, slot, all, k, ty) then roots_of(bt, all.at(k), out)
+                if vcall_answers(bt.cx, recv, slot, all, k, ty) then roots_of(bt, all[k], out)
         _ -> ()
 end roots_of
 
@@ -673,9 +673,9 @@ private closure_roots(bt: &BlockTrack, base: string, args: Buf[TExpr], out: *Buf
     if refs.is_none() then return
 
     for i in 0..<args.len()
-        if i >= refs.unwrap().len() || !refs.unwrap().at(i) then continue
+        if i >= refs.unwrap().len() || !refs.unwrap()[i] then continue
 
-        *args.at(i).kind match
+        *args[i].kind match
             TLoad(n, _) -> if bt.sc.home_of(n) >= 0 then add_root(out, closure_marker(base) + n)
             _ -> ()
     end for

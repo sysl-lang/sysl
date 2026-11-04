@@ -82,19 +82,19 @@ gen_export_thunk(e: *Emit, f: TFunc, symbol: string, enters: bool) -> Option[IrF
 
     for group in incoming
         for j in 0..<group.len()
-            named.push(group.at(j))
+            named.push(group[j])
 
     var declared: Buf[IrParam] = buf()
 
     for i in 0..<c_type.params.len()
-        val p = c_type.params.at(i)
+        val p = c_type.params[i]
 
-        declared.push(IrParam(p.ty, p.attrs, Some(named.at(i))))
+        declared.push(IrParam(p.ty, p.attrs, Some(named[i])))
 
     var passed: Buf[IrArg] = buf()
 
     for i in 0..<types.len()
-        passed.push(thunk_argument(e, types.at(i), incoming.at(i)))
+        passed.push(thunk_argument(e, types[i], incoming[i]))
 
     gen_thunk_call(e, f, symbol, passed, sret)
 
@@ -145,7 +145,7 @@ private thunk_names(e: *Emit, params: Buf[Type]) -> Buf[Buf[Val]]
     for i in 0..<params.len()
         var group: Buf[Val] = buf()
 
-        c_param(e.layout, params.at(i), e.target) match
+        c_param(e.layout, params[i], e.target) match
             CpCoerced(pieces) ->
                 if pieces.len() > 1
                     for j in 0..<pieces.len()
@@ -169,30 +169,30 @@ private thunk_argument(e: *Emit, t: Type, incoming: Buf[Val]) -> IrArg
     c_param(e.layout, t, e.target) match
         // A scalar sysl also passes as itself: there is nothing to convert and no slot to make.
         CpPlain ->
-            if !e.layout.indirect(t) then ir_arg(lty(e, t), incoming.at(0))
-            else ir_arg(LPtr, thunk_slot(e, t, incoming.at(0)))
+            if !e.layout.indirect(t) then ir_arg(lty(e, t), incoming[0])
+            else ir_arg(LPtr, thunk_slot(e, t, incoming[0]))
 
         // Already in storage, and it is storage this function may hand on: `byval` is C's promise
         // that the copy is the callee's, and an indirect parameter without it is one the caller made
         // for this call. Sysl's own indirect lowering copies at entry, exactly as the definition's
         // prologue does for any other caller, so nothing here has to copy first.
         CpIndirect(coerced, _, _) ->
-            if e.layout.indirect(t) then ir_arg(LPtr, incoming.at(0))
+            if e.layout.indirect(t) then ir_arg(LPtr, incoming[0])
             else
                 val v = fresh_reg(e)
 
-                emit(e, InLoad(v, coerced, incoming.at(0), AccPlain, None))
+                emit(e, InLoad(v, coerced, incoming[0], AccPlain, None))
                 ir_arg(lty(e, t), v)
 
         CpCoerced(pieces) -> thunk_gather(e, t, pieces, incoming)
 end thunk_argument
 
 private thunk_gather(e: *Emit, t: Type, pieces: Buf[IrParam], incoming: Buf[Val]) -> IrArg
-    val holder = if pieces.len() == 1 then pieces.at(0).ty else LStruct(piece_types(pieces))
+    val holder = if pieces.len() == 1 then pieces[0].ty else LStruct(piece_types(pieces))
     val from = alloca(e, fresh_reg(e), holder)
 
     if pieces.len() == 1
-        emit(e, InStore(holder, incoming.at(0), from, AccPlain, None))
+        emit(e, InStore(holder, incoming[0], from, AccPlain, None))
     else
         for i in 0..<pieces.len()
             val at = fresh_reg(e)
@@ -202,7 +202,7 @@ private thunk_gather(e: *Emit, t: Type, pieces: Buf[IrParam], incoming: Buf[Val]
             idx.push(ir_arg(l_i32(), VInt(from_int(0))))
             idx.push(ir_arg(l_i32(), VInt(from_int(long(i)))))
             emit(e, InGep(at, holder, from, idx))
-            emit(e, InStore(pieces.at(i).ty, incoming.at(i), at, AccPlain, None))
+            emit(e, InStore(pieces[i].ty, incoming[i], at, AccPlain, None))
 
     val slot = alloca(e, fresh_reg(e), lty(e, t))
 

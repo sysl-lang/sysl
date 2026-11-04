@@ -321,7 +321,7 @@ private gen_expr_kind(e: *Emit, x: TExpr) -> Val = *x.kind match
             val r = fresh_reg(e)
 
             emit(e, InInsert(r, lty(e, array_ty), acc,
-                             lty(e, element(array_ty).unwrap_or(int_type())), vals.at(i),
+                             lty(e, element(array_ty).unwrap_or(int_type())), vals[i],
                              index_list(int(i))))
             acc = r
 
@@ -493,7 +493,7 @@ bitfield_field_bits(e: *Emit, receiver: TExpr, index: int, ranges: Buf[BitRange]
         Struct(d) -> d.slot(usize(index))
         _ -> usize(index)
 
-    read_bits(e, ranges, ranges.at(s), c)
+    read_bits(e, ranges, ranges[s], c)
 end bitfield_field_bits
 
 // A field read, as the bytes its storage holds -- a field of a `@byte_order` struct is reversed into
@@ -643,7 +643,7 @@ private gen_buf_lit(e: *Emit, elems: Buf[TExpr], slice_ty: Type) -> Val
     for i in 0..<vals.len()
         if zero_sized(elem) then continue
 
-        retain_value(e, elem, vals.at(i))
+        retain_value(e, elem, vals[i])
 
         val ep = fresh_reg(e)
 
@@ -651,7 +651,7 @@ private gen_buf_lit(e: *Emit, elems: Buf[TExpr], slice_ty: Type) -> Val
 
         idx.push(ir_arg(word_lty(e), VInt(from_int(long(i)))))
         emit(e, InGep(ep, lty(e, elem), made.1, idx))
-        emit(e, InStore(lty(e, elem), vals.at(i), ep, AccPlain, None))
+        emit(e, InStore(lty(e, elem), vals[i], ep, AccPlain, None))
 
     buffer_view(e, slice_ty, made.0, made.1, n)
 end gen_buf_lit
@@ -718,7 +718,7 @@ private gen_binary(e: *Emit, op: string, l: TExpr, r: TExpr, ty: Type, site: Spa
 
         val vs = gen_parts(e, both)
 
-        return own_temp(e, str_concat(e, vs.at(0), vs.at(1)), Str)
+        return own_temp(e, str_concat(e, vs[0], vs[1]), Str)
     end if
 
     val lt = underlying(texpr_type(l))
@@ -974,9 +974,9 @@ private gen_compare(e: *Emit, operands: Buf[TExpr], cmps: Buf[TCmp]) -> Val
     val written = written_by(operands)
 
     if cmps.len() == 1
-        val lv = gen_part(e, operands.at(0), written)
+        val lv = gen_part(e, operands[0], written)
 
-        return comparison(e, cmps.at(0), texpr_type(operands.at(0)), lv, gen_part(e, operands.at(1), written))
+        return comparison(e, cmps[0], texpr_type(operands[0]), lv, gen_part(e, operands[1], written))
 
     val slot = alloca(e, fresh_reg(e), l_i1())
 
@@ -998,18 +998,18 @@ private gen_compare(e: *Emit, operands: Buf[TExpr], cmps: Buf[TCmp]) -> Val
         push_temps(e)
         push_owned(e)
 
-        if k == 0 then left = gen_part(e, operands.at(0), written)
+        if k == 0 then left = gen_part(e, operands[0], written)
 
-        val right = gen_part(e, operands.at(k + 1), written)
-        val c = comparison(e, cmps.at(k), texpr_type(operands.at(k)), left, right)
+        val right = gen_part(e, operands[k + 1], written)
+        val c = comparison(e, cmps[k], texpr_type(operands[k]), left, right)
 
         emit(e, InStore(l_i1(), c, slot, AccPlain, None))
 
-        if k == cmps.len() - 1 then emit_term(e, InBr(exits.at(k)))
+        if k == cmps.len() - 1 then emit_term(e, InBr(exits[k]))
         else
             val next_l = fresh_label(e, "cmp.next")
 
-            emit_term(e, InCondBr(c, next_l, exits.at(k)))
+            emit_term(e, InCondBr(c, next_l, exits[k]))
             emit_label(e, next_l)
 
         left = right
@@ -1017,10 +1017,10 @@ private gen_compare(e: *Emit, operands: Buf[TExpr], cmps: Buf[TCmp]) -> Val
     for j in 0..<cmps.len()
         val k = cmps.len() - 1 - j
 
-        emit_label(e, exits.at(k))
+        emit_label(e, exits[k])
         pop_owned(e)
         pop_temps(e)
-        emit_term(e, InBr(if k == 0 then end_l else exits.at(k - 1)))
+        emit_term(e, InBr(if k == 0 then end_l else exits[k - 1]))
 
     emit_label(e, end_l)
 
@@ -1399,9 +1399,9 @@ private gen_struct_new(e: *Emit, at: Span, decl: &StructType, args: Buf[TExpr]) 
             var vals: Buf[Val] = buf()
 
             for i in 0..<args.len()
-                val v = gen_expr(e, args.at(i))
+                val v = gen_expr(e, args[i])
 
-                if !zero_sized(decl.fields.at(i).1) then vals.push(v)
+                if !zero_sized(decl.fields[i].1) then vals.push(v)
 
             val c = reordered(e, container_reversal(decl, e.target.little_endian()),
                               build_bits(e, ranges, vals))
@@ -1415,17 +1415,17 @@ private gen_struct_new(e: *Emit, at: Span, decl: &StructType, args: Buf[TExpr]) 
     val parts = gen_parts(e, args)
 
     for i in 0..<args.len()
-        vals.push(captured_value(e, decl, i, parts.at(i)))
+        vals.push(captured_value(e, decl, i, parts[i]))
 
     var acc: Val = VUndef
 
     for i in 0..<vals.len()
-        if !zero_sized(decl.fields.at(i).1)
+        if !zero_sized(decl.fields[i].1)
             val r = fresh_reg(e)
-            val stored = reordered(e, reversed_width(decl, decl.fields.at(i).1, e.target.little_endian()),
-                                   vals.at(i))
+            val stored = reordered(e, reversed_width(decl, decl.fields[i].1, e.target.little_endian()),
+                                   vals[i])
 
-            emit(e, InInsert(r, struct_lty(decl), acc, lty(e, decl.fields.at(i).1), stored,
+            emit(e, InInsert(r, struct_lty(decl), acc, lty(e, decl.fields[i].1), stored,
                              index_list(struct_field_index(e.layout, decl, decl.slot(i)))))
             acc = r
 
@@ -1490,18 +1490,18 @@ gen_tail_self_call(e: *Emit, args: Buf[TExpr]) -> Val
     // an argument that is simply a parameter is that parameter's own slot, so writing straight
     // through would have the first argument's landing change what the second one reads.
     for i in 0..<e.tail_params.len()
-        val ty = e.tail_params.at(i).1
+        val ty = e.tail_params[i].1
 
         if zero_sized(ty)
-            gen_expr(e, args.at(i))
+            gen_expr(e, args[i])
             staged.push((StagedNothing, VNothing))
         else if e.layout.indirect(ty)
             val slot = alloca(e, fresh_reg(e), lty(e, ty))
 
-            gen_into(e, slot, args.at(i))
+            gen_into(e, slot, args[i])
             staged.push((StagedSlot, slot))
         else
-            val v = gen_expr(e, args.at(i))
+            val v = gen_expr(e, args[i])
 
             retain_value(e, ty, v)
             staged.push((StagedValue, v))
@@ -1515,8 +1515,8 @@ gen_tail_self_call(e: *Emit, args: Buf[TExpr]) -> Val
     release_all(e)
 
     for i in 0..<e.tail_params.len()
-        val p = e.tail_params.at(i)
-        val s = staged.at(i)
+        val p = e.tail_params[i]
+        val s = staged[i]
 
         // The count came with the bytes and stays with them: what the staging slot took is now the
         // parameter's, so nothing is retained here and nothing released.
@@ -1641,7 +1641,7 @@ staged_args(e: *Emit, args: Buf[TExpr], out: *Buf[IrArg], callee: string) -> Buf
     val written = written_by(args)
 
     for i in 0..<args.len()
-        val a = args.at(i)
+        val a = args[i]
         val aty = texpr_type(a)
 
         // A parameter the callee's body is lent by address (`read_by_address`) crosses as a large
@@ -1726,12 +1726,12 @@ end lends_in_place
 // that writes it -- `f(*p, bump(p))` -- would otherwise reach the callee instead of the snapshot; one
 // that only reads, `vm.stack.push(vm.stack.at(i))`, leaves it where it was.
 private quiet_after(e: *Emit, args: Buf[TExpr], i: usize) -> bool
-    val ty = texpr_type(args.at(i))
+    val ty = texpr_type(args[i])
 
     for j in i + 1..<args.len()
         val v: &Verdict = Verdict(true)
 
-        walk_texpr(args.at(j), expr_walk(true, x -> if !reads_only_for(e, x, ty) then v.refuse()))
+        walk_texpr(args[j], expr_walk(true, x -> if !reads_only_for(e, x, ty) then v.refuse()))
 
         if !v.ok then return false
 
@@ -2084,7 +2084,7 @@ private gen_try(e: *Emit, operand: TExpr, ok: EnumVariant, fail: EnumVariant, re
 
         val only = payload_values(e, en, ok, v)
 
-        return if only.is_empty() then VNothing else only.at(0)
+        return if only.is_empty() then VNothing else only[0]
     end if
 
     // **The conversion happens here and nowhere else**, which is why `?` carries a name rather than
@@ -2109,7 +2109,7 @@ private gen_try(e: *Emit, operand: TExpr, ok: EnumVariant, fail: EnumVariant, re
 
             var made: Buf[Val] = buf()
 
-            made.push(gen_conversion(e, fn, payload.at(0), from_ty, to_ty))
+            made.push(gen_conversion(e, fn, payload[0], from_ty, to_ty))
             enum_value(e, ret_enum, rd.unwrap(), ret_fail, made)
 
     // The hop, recorded in the error return trace once the failure is the function's own -- after
@@ -2137,13 +2137,13 @@ private gen_try(e: *Emit, operand: TExpr, ok: EnumVariant, fail: EnumVariant, re
 
     val got = payload_values(e, en, ok, v)
 
-    if got.is_empty() then VNothing else got.at(0)
+    if got.is_empty() then VNothing else got[0]
 end gen_try
 
 // One type argument of a generic named type, where it has one.
 private type_arg_at(t: Type, i: usize) -> Type = underlying(t) match
-    Enum(d) -> if i < d.targs.len() then d.targs.at(i) else Unknown
-    Struct(d) -> if i < d.targs.len() then d.targs.at(i) else Unknown
+    Enum(d) -> if i < d.targs.len() then d.targs[i] else Unknown
+    Struct(d) -> if i < d.targs.len() then d.targs[i] else Unknown
     _ -> Unknown
 
 // One call to a conversion function whose argument is a value already in hand.
@@ -2271,7 +2271,7 @@ private gen_atomic(e: *Emit, op: string, addr: TExpr, ops: Buf[TExpr], ordering:
         return own_temp(e, r, ty)
     end if
 
-    val v = gen_expr(e, ops.at(0))
+    val v = gen_expr(e, ops[0])
 
     if op == "atomic_store"
         emit(e, InStore(lt, v, p, AccAtomic(ord), Some(align)))
@@ -2283,7 +2283,7 @@ private gen_atomic(e: *Emit, op: string, addr: TExpr, ops: Buf[TExpr], ordering:
     // half is the form's result. The ordering on a failed exchange is the success one weakened,
     // since a failure performs no store and LLVM refuses a release on it.
     if op == "atomic_cas"
-        val d = gen_expr(e, ops.at(1))
+        val d = gen_expr(e, ops[1])
         val pair = fresh_reg(e)
 
         emit(e, InCmpXchg(pair, p, lt, v, d, ord))
@@ -2335,7 +2335,7 @@ private gen_sysop(e: *Emit, op: string, name: string, args: Buf[TExpr]) -> Val
     val wide = LInt(64)
     val meta = LNamed("metadata")
 
-    if op == "prefetch" then return gen_prefetch(e, name, args.at(0))
+    if op == "prefetch" then return gen_prefetch(e, name, args[0])
 
     if op == "read_sysreg"
         var params: Buf[IrParam] = buf()
@@ -2353,7 +2353,7 @@ private gen_sysop(e: *Emit, op: string, name: string, args: Buf[TExpr]) -> Val
         return r
 
     if op == "write_sysreg"
-        val v = gen_expr(e, args.at(0))
+        val v = gen_expr(e, args[0])
 
         var params: Buf[IrParam] = buf()
 
@@ -2444,9 +2444,9 @@ private gen_maintenance(e: *Emit, op: string, name: string, args: Buf[TExpr]) ->
     var ops: Buf[IrArg] = buf()
 
     if !args.is_empty()
-        val v = gen_expr(e, args.at(0))
+        val v = gen_expr(e, args[0])
 
-        ops.push(ir_arg(lty(e, texpr_type(args.at(0))), v))
+        ops.push(ir_arg(lty(e, texpr_type(args[0])), v))
 
     if op == "at"
         val r = fresh_reg(e)

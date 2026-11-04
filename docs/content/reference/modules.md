@@ -2129,7 +2129,7 @@ squares(n: int) -> &sync Frozen[int]
 val PRIMES: []const int = primes_below(100)
 val SQ: &sync Frozen[int] = squares(6)
 
-print(PRIMES.len, PRIMES[24], SQ.at(5))
+print(PRIMES.len, PRIMES[24], SQ[5])
 ```
 
 ```output

@@ -74,7 +74,7 @@ private share_walk(t: Type, path: Buf[string], holder: Option[Type],
     // the destructor of the one atomically counted box touches it, once. So the walk asks the
     // element type in place of the fields, and nothing about the storage.
     Struct(d) ->
-        if d.base == frozen_base() && d.targs.len() == 1 then share_walk(d.targs.at(0), path, Some(t), laid, false)
+        if d.base == frozen_base() && d.targs.len() == 1 then share_walk(d.targs[0], path, Some(t), laid, false)
         else if !laid && !copied && is_lending_closure(d) then lent_walk_fields(d.fields, path, t)
         else share_walk_fields(unguarded(d), path, "", t, laid, copied)
 
@@ -278,7 +278,7 @@ sealed_where(p: Unshareable, holder: Type, whole: Type, captured: bool) -> strin
     var steps: Buf[string] = buf()
 
     for i in 0..<p.path.len() - 1
-        steps.push(p.path.at(i))
+        steps.push(p.path[i])
 
     val shown = type_show(holder)
     val rest = sealed_rest(holder)
@@ -299,7 +299,7 @@ sealed_rest(holder: Type) -> string = holder match
     Struct(d) ->
         if d.base == module_qualify("sysl.buf", "Buf") && d.targs.len() == 1
             s"shared through a count that is not atomic. Hold its elements as a '&sync Frozen[" +
-            s"${type_show(d.targs.at(0))}]', built with '.freeze()' (reference: memory, 'A frozen buffer " +
+            s"${type_show(d.targs[0])}]', built with '.freeze()' (reference: memory, 'A frozen buffer " +
             "crosses'), or guard the buffer in a 'Mutex' ('06')"
         else sealed_guarded()
     _ -> sealed_guarded()
@@ -427,20 +427,20 @@ check_crossings(cx: &Analyzer, crossing: Buf[string], copies: Buf[string], shown
 
     for i in 0..<params.len()
         if i >= args.len() then break
-        if !holds_string(crossing, params.at(i).0) then continue
+        if !holds_string(crossing, params[i].0) then continue
 
-        val pname = params.at(i).0
-        val pty = params.at(i).1
+        val pname = params[i].0
+        val pty = params[i].1
 
         if holds_string(copies, pname) && !is_pointer(pty)
-            if check_copied_crossing(cx, args.at(i), pname, shown, pty) && holds_view(pty)
-                args.set(i, TExpr(args.at(i).span, TCrossCopy(args.at(i), pty,
-                                                              s"'$pname' of ${callee_said(shown)}", true)))
+            if check_copied_crossing(cx, args[i], pname, shown, pty) && holds_view(pty)
+                args[i] = TExpr(args[i].span, TCrossCopy(args[i], pty,
+                                                              s"'$pname' of ${callee_said(shown)}", true))
 
             continue
         end if
 
-        check_crossing(cx, args.at(i), pname, shown, pty)
+        check_crossing(cx, args[i], pname, shown, pty)
 end check_crossings
 
 // The callee as a sentence names it. A free function arrives as its bare name and is quoted here; a
@@ -543,13 +543,13 @@ check_shared_storage(a: &Analysis, p: TProgram)
     var vals: Map[string, usize] = map()
 
     for i in 0..<p.vals.len()
-        vals.put(p.vals.at(i).symbol, i)
+        vals.put(p.vals[i].symbol, i)
 
     for r in roots.list
         for item in storage_reached_in_domain(p, r.funcs)
             vals.get(item.0) match
                 Some(i) ->
-                    val why = storage_complaint(a, r, p.vals.at(i), item.1, roots.parks)
+                    val why = storage_complaint(a, r, p.vals[i], item.1, roots.parks)
 
                     if why.is_some() then a.fault(r.scope, r.span, why.unwrap())
                 None -> ()
@@ -562,10 +562,10 @@ private domain_roots(a: &Analysis, p: TProgram) -> &DomainRoots
     var tables: Map[string, usize] = map()
 
     for i in 0..<p.vtables.len()
-        tables.put(p.vtables.at(i).name, i)
+        tables.put(p.vtables[i].name, i)
 
     for i in 0..<p.funcs.len()
-        val f = p.funcs.at(i)
+        val f = p.funcs[i]
         val home = func_home(a, f.name)
 
         walk_block_stmts(f.body, expr_walk(false, e -> note_sync_erasure(out, p, tables, home, e)))
@@ -615,7 +615,7 @@ private note_sync_erasure(out: &DomainRoots, p: TProgram, tables: Map[string, us
 
             var funcs: Buf[string] = buf()
 
-            for slot in p.vtables.at(at.unwrap()).slots
+            for slot in p.vtables[at.unwrap()].slots
                 funcs.push(slot.target)
 
             val inner = erased_inner(texpr_type(operand))
@@ -640,10 +640,10 @@ bodies_in_other_domains(p: TProgram) -> Set[string]
     var tables: Map[string, usize] = map()
 
     for i in 0..<p.vtables.len()
-        tables.put(p.vtables.at(i).name, i)
+        tables.put(p.vtables[i].name, i)
 
     for i in 0..<p.funcs.len()
-        val f = p.funcs.at(i)
+        val f = p.funcs[i]
 
         walk_block_stmts(f.body, expr_walk(false, e -> note_sync_targets(roots, p, tables, e)))
 
@@ -669,7 +669,7 @@ private note_sync_targets(out: &RootNames, p: TProgram, tables: Map[string, usiz
 
             tables.get(vtable) match
                 Some(k) ->
-                    for slot in p.vtables.at(k).slots
+                    for slot in p.vtables[k].slots
                         out.names.push(slot.target)
                 None -> ()
         _ -> ()
@@ -728,7 +728,7 @@ private storage_sealed(p: Unshareable, holder: Type, whole: Type) -> string
     var steps: Buf[string] = buf()
 
     for i in 0..<p.path.len() - 1
-        steps.push(p.path.at(i))
+        steps.push(p.path[i])
 
     val shown = type_show(holder)
     val rest = sealed_rest(holder)

@@ -32,12 +32,13 @@ struct Frozen[T]
 
     const is_empty(self) -> bool = self.n == 0
 
-    /** The element at `i`, checked against the length: past it is a trap, as an array's index is. */
-    @track_caller
-    const at(self, i: usize) -> T
-        if i >= self.n then index_past(i, self.n)
+    /** The element at `i`, or `None` where there is none -- `i` at or past the length, or negative.
+     * The total form of `f[i]`, which traps as an array's index does; `i` may be any integer type.
+     */
+    const get[I: Integer](self, i: I) -> Option[T]
+        if i < 0 || u128(i) >= u128(self.n) then return None
 
-        self.data[i]
+        Some(self.data[usize(i)])
 
     /** The elements as a read-only slice. It keeps the frozen buffer alive through a box of its own,
      * made here and counted the ordinary way, so the slice is as safe to keep and hand on as any
@@ -79,7 +80,10 @@ private[buf] struct FrozenPin[T]
 
 impl[T] Index[usize, T] for Frozen[T]
     @track_caller
-    const index(self, i: usize) -> T = self.at(i)
+    const index(self, i: usize) -> T
+        if i >= self.n then index_past(i, self.n)
+
+        self.data[i]
 
 /** `for x in f` walks the elements by index through a cursor holding one share of the buffer, so the
  * walk allocates nothing.
@@ -145,7 +149,7 @@ freeze_buf[T](b: Buf[T]) -> &sync Frozen[T]
     var items: []T = slot_storage(n)
 
     for i in 0..<n
-        slot_place(items, i, b.at(i))
+        slot_place(items, i, b[i])
 
     b.clear()
 

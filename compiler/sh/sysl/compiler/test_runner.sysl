@@ -138,8 +138,8 @@ run_selected(exe: string, tests: Buf[TTest], opts: TestOptions, filtered: usize,
     loop
         run.start_up_to(most)
 
-        while reported < run.rows.len() && run.settled.at(reported)
-            run.rows.at(reported) match
+        while reported < run.rows.len() && run.settled[reported]
+            run.rows[reported] match
                 Some(outcome) ->
                     done.push(outcome)
                     show_outcome(outcome, width, &shown, &any_shown, emit)
@@ -199,7 +199,7 @@ private struct Schedule
         var held = false
 
         while g < self.lanes.len()
-            var lane = self.lanes.at(g)
+            var lane = self.lanes[g]
 
             if lane.phase == Begun
                 // A module's `@setup_all` is a run of its own, before anything else in it, and
@@ -229,7 +229,7 @@ private struct Schedule
                 while lane.next < lane.count
                     // An ignored test starts no process — not the test's, and not its `@setup` or
                     // `@teardown` either, since those bracket a run and there is none.
-                    val t = self.groups.at(g).at(lane.next)
+                    val t = self.groups[g][lane.next]
                     val row = lane.first + lane.lead() + lane.next
 
                     if t.ignored.is_some()
@@ -269,7 +269,7 @@ private struct Schedule
                         None -> lane.phase = Over
             end if
 
-            self.lanes.set(g, lane)
+            self.lanes[g] = lane
 
             if held then return
 
@@ -314,12 +314,12 @@ private struct Schedule
 
     // What one process that has ended came to, written into its slot and its lane.
     private take(*self, f: Flight, ran: BoundedRun)
-        var lane = self.lanes.at(f.lane)
+        var lane = self.lanes[f.lane]
         val took = whole_millis(monotonic() - f.began)
 
         f.kind match
             OneTest ->
-                val t = self.groups.at(f.lane).at(f.row - lane.first - lane.lead())
+                val t = self.groups[f.lane][f.row - lane.first - lane.lead()]
                 val outcome = test_landed(self.exe, t, ran, took, f.limit, self.seconds)
 
                 self.settle(f.row, Some(outcome))
@@ -338,7 +338,7 @@ private struct Schedule
                 self.settle(f.row, self.hook_row(h, ran, took))
                 lane.phase = Over
 
-        self.lanes.set(f.lane, lane)
+        self.lanes[f.lane] = lane
     end take
 
     // A module hook's slot: a row where it did not come back, and nothing where it did.
@@ -367,8 +367,8 @@ private struct Schedule
     end launch
 
     private settle(*self, row: usize, outcome: Option[Outcome])
-        self.rows.set(row, outcome)
-        self.settled.set(row, true)
+        self.rows[row] = outcome
+        self.settled[row] = true
 
     private settle_from(*self, from: usize, to: usize, outcome: Option[Outcome])
         for row in from..<to
@@ -385,7 +385,7 @@ private schedule_of(exe: string, groups: Buf[Buf[TTest]], seconds: int, opts: Te
     for group in groups
         // A module whose selected tests are all ignored runs nothing at all, its `_all` hooks
         // included: they bracket the runs, and there are none to bracket.
-        val hooks = if all_ignored(group) then no_hooks() else group.at(0).hooks
+        val hooks = if all_ignored(group) then no_hooks() else group[0].hooks
         val lane = Lane(hooks, rows.len(), group.len(), Begun, 0, 0, true)
 
         for _ in 0..<lane.size()
@@ -484,7 +484,7 @@ private widest_row_name(tests: Buf[TTest]) -> usize
         val hooks = t.hooks.all()
 
         for j in 0..<hooks.len()
-            val name = module_bare(hooks.at(j).func)
+            val name = module_bare(hooks[j].func)
 
             if name.len > width then width = name.len
 
@@ -506,10 +506,10 @@ private by_module_order(tests: Buf[TTest]) -> Buf[Buf[TTest]]
 
         index_of_module(names, name) match
             Some(at) ->
-                var group = groups.at(at)
+                var group = groups[at]
 
                 group.push(item)
-                groups.set(at, group)
+                groups[at] = group
             None ->
                 var group: Buf[TTest] = buf()
 
@@ -522,7 +522,7 @@ end by_module_order
 
 private index_of_module(names: Buf[string], name: string) -> Option[usize]
     for i in 0..<names.len()
-        if names.at(i) == name then return Some(i)
+        if names[i] == name then return Some(i)
 
     None
 end index_of_module
@@ -850,7 +850,7 @@ tests_streamed(outcomes: Buf[Outcome], selected: usize, filtered: usize, emit: s
         val rows = rows_of_file(outcomes, item)
 
         for i in 0..<rows.len()
-            emit(test_row(outcomes.at(rows.at(i)), width))
+            emit(test_row(outcomes[rows[i]], width))
 
     emit(tests_summary(outcomes))
 end tests_streamed
@@ -865,17 +865,17 @@ private files_in_order(outcomes: Buf[Outcome]) -> Buf[string]
         var seen = false
 
         for j in 0..<files.len()
-            if files.at(j) == file then seen = true
+            if files[j] == file then seen = true
 
         if !seen
             files.push(file)
 
             // Moved down into place, so the list stays sorted as it grows.
-            while at > 0 && files.at(at - 1) > file
-                files.set(at, files.at(at - 1))
+            while at > 0 && files[at - 1] > file
+                files[at] = files[at - 1]
                 at -= 1
 
-            files.set(at, file)
+            files[at] = file
         end if
 
     files
@@ -887,16 +887,16 @@ private rows_of_file(outcomes: Buf[Outcome], file: string) -> Buf[usize]
     var rows: Buf[usize] = buf()
 
     for i in 0..<outcomes.len()
-        if outcomes.at(i).test.file == file
+        if outcomes[i].test.file == file
             var at = rows.len()
 
             rows.push(i)
 
-            while at > 0 && outcomes.at(rows.at(at - 1)).test.line > outcomes.at(i).test.line
-                rows.set(at, rows.at(at - 1))
+            while at > 0 && outcomes[rows[at - 1]].test.line > outcomes[i].test.line
+                rows[at] = rows[at - 1]
                 at -= 1
 
-            rows.set(at, i)
+            rows[at] = i
 
     rows
 end rows_of_file
