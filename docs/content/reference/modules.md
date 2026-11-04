@@ -1848,8 +1848,10 @@ print(oldest)
 ```
 
 **A simple enum is a scalar too**: its value is a variant, so `const W = Access.Write` is a constant
-as Rust's `const W: Access = Access::Write` is. It compares with `==`, stands as a pattern, converts
-to its integer, and reaches a bare-metal target as a literal.
+as Rust's `const W: Access = Access::Write` is. It compares with `==`, converts to its integer, and
+reaches a bare-metal target as a literal. **As a pattern it is the variant it came to**, as in Rust:
+it counts toward covering the enum, so constants naming every variant need no `_`, and an arm naming
+the same variant again is dead.
 
 ```sysl
 enum Access
@@ -1867,6 +1869,44 @@ print(f(Access.Write), f(Access.Read), W == Access.Write)
 
 ```output
 write not write true
+```
+
+```sysl
+enum Access
+    Read
+    Write
+
+const R = Access.Read
+const W = Access.Write
+
+name(a: Access) -> string = a match
+    R -> "read"
+    W -> "write"
+
+print(name(Access.Write))
+```
+
+```output
+write
+```
+
+```sysl
+enum Access
+    Read
+    Write
+
+const W = Access.Write
+
+f(a: Access) -> int = a match
+    Write -> 1
+    W -> 2
+    _ -> 3
+
+print(f(Access.Read))
+```
+
+```error
+unreachable pattern 'W': every value it matches is already matched by the arm on line 8
 ```
 
 An enum whose variants carry data is storage, so it is a `val`:

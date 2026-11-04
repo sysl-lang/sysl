@@ -832,7 +832,11 @@ The same question is asked of every pattern:
   dead. So is an `else` after arms that already cover every value.
 - **Literals and ranges are compared as the values they are.** `3` after `0..9` is dead, `TWO`
   after `2` is dead when `const TWO = 2`, and `2..7` after `1..5` and `4..9` is dead, because the two
-  ranges cover it between them. `5` after `1..<5` is alive.
+  ranges cover it between them. `5` after `1..<5` is alive. A `const` written inside the body is
+  compared the same way: it never binds.
+- **A constant of an enum is the variant it came to**, as a const pattern is in Rust. `W` after
+  `Write` is dead when `const W = Access.Write`, and so is `Write` after `W`; constants naming every
+  variant cover the enum with no `_`, and a `_` after only some of them is alive.
 - **Nested patterns, tuples and structs are read position by position.** `Some(Red)` twice is dead,
   and so is `Some(_)` after `Some(Red)`, `Some(Green)` and `Some(Blue)`.
 - **Each `|` alternative is checked on its own.** It is dead if the earlier arms cover it, or the
