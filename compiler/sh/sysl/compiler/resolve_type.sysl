@@ -132,6 +132,12 @@ resolve_type(a: &Analysis, scope: Scope, t: TypeRef, subst: Buf[Binding]) -> Typ
         else if member == "Partial" then partial_projection(a, scope, t.span, resolve_type(a, scope, base, subst))
         else assoc_type(a, scope, t.span, resolve_type(a, scope, base, subst), member)
     AssocArgType(_, inner) -> resolve_type(a, scope, inner, subst)
+    // `Item: Render` asks something of a trait's associated type, so it stands only among the
+    // arguments of a trait named as a bound; anywhere else there is no associated type to ask.
+    AssocBoundArgType(n, bounds) ->
+        a.fault(scope, t.span, s"'$n: ${bound_text(bounds.at(0))}' bounds an associated type, which " +
+                s"only a trait named as a bound has — '[T: Trait[$n: …]]'")
+        Unknown
     // A callable's own parameters are read by `kept_params`, so a `@keeps` reaching here stands
     // somewhere nothing is called with it. The type under it is still read, so the rest is checked.
     KeptParamType(inner) ->
@@ -1146,6 +1152,14 @@ private resolve_named(a: &Analysis, scope: Scope, span: Span, name: string, args
             *item.kind match
                 AssocArgType(bound, inner) ->
                     named.push((bound, resolve_type(a, scope, inner, subst)))
+                // **An object has forgotten its type**, so an associated type it left open has no
+                // answer to hold to a bound -- only one it fixed does, as in Rust's `dyn`.
+                AssocBoundArgType(bound, _) ->
+                    a.fault(scope, span, s"'$sigil$name' bounds its associated type '$bound', which an " +
+                            s"object cannot do — it has forgotten which type it is, so fix the type " +
+                            s"instead, '$sigil$name[$bound = …]', or bound a type parameter, " +
+                            s"'[T: $name[$bound: …]]'")
+                    return Unknown
                 _ -> positional.push(item)
 
         return object_of(a, scope, span, name, key.unwrap(), d.unwrap(),

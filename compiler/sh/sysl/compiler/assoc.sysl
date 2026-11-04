@@ -86,6 +86,42 @@ assoc_bounds_of(a: &Analysis, b: Bound, ad: AssocDecl, assoc_self: Type) -> Buf[
     out
 end assoc_bounds_of
 
+// What the bounds a parameter carries ask of one of its associated types by name -- written on the
+// bound itself (`[S: Seq[Item: Render]]`) or on a trait it requires (`trait Words: Seq[Item: Render]`),
+// with the associated type put in for the `Self` each was read with.
+open_bounds_named(a: &Analysis, subject: Type, bounds: Buf[Bound], member: string,
+                  assoc: Type) -> Buf[Bound]
+    var out: Buf[Bound] = buf()
+
+    for b in bounds
+        for c in trait_closure(a, b, self_binding(subject))
+            for item in c.bounded
+                if item.0 == member then out.push(assoc_bound_at(a, item.1, assoc))
+
+    out
+end open_bounds_named
+
+// A bound on an associated type with the associated type itself put in for the `Self` it was read
+// with. A bound nested in it (`Item: Render[Part: Eq]`) keeps its own stand-in, which is a different
+// associated type's and is filled where that one is projected.
+assoc_bound_at(a: &Analysis, b: Bound, assoc: Type) -> Bound
+    var sub: Buf[Binding] = buf()
+
+    sub.push(Binding(AssocSelf, assoc))
+
+    var args: Buf[Type] = buf()
+
+    for item in b.args
+        args.push(subst_params(a, item, sub))
+
+    var assocs: Buf[(string, Type)] = buf()
+
+    for item in b.assocs
+        assocs.push((item.0, subst_params(a, item.1, sub)))
+
+    Bound(b.name, args, assocs, b.bounded)
+end assoc_bound_at
+
 // The terms a trait's own declaration was written in.
 trait_scope_of(a: &Analysis, key: string) -> Scope
     val decl = a.tables.types.get(key)
@@ -129,9 +165,14 @@ private abstract_assoc(a: &Analysis, subject: Type, name: string, bounds: Buf[Bo
 
                         // The bounds are the projection's own, so `Self` inside them is the
                         // projection -- passed bound-free, which is the stand-in that breaks the
-                        // walk back around.
-                        return Some(Abstract(whole, assoc_bounds_of(a, b, assocs.at(k),
-                                                                    Abstract(whole, buf()))))
+                        // walk back around. What a bound or a requirement asked of it by name
+                        // (`[S: Seq[Item: Render]]`) is added to what the trait declared.
+                        var own = assoc_bounds_of(a, b, assocs.at(k), Abstract(whole, buf()))
+
+                        for extra in open_bounds_named(a, subject, bounds, member, Abstract(whole, buf()))
+                            own.push(extra)
+
+                        return Some(Abstract(whole, own))
 
     val blanket = blanket_assoc(a, subject, name, bounds, member)
 

@@ -2721,6 +2721,120 @@ print(1)
 trait 'Doubles' requires 'Seq' and fixes its 'Item', which a requirement cannot do — bound the type parameter that needs it instead, '[T: Doubles + Seq[Item = …]]'
 ```
 
+### A bound may ask something of the associated type instead
+
+`Seq[Item: Render]` leaves the associated type open and asks a trait of it, with the `:` and `+` a
+type parameter's bound is written with. The body may then use what that trait provides on a
+`S::Item`, as it may use what the trait's own `type Item: …` provides. It is Rust's
+`Seq<Item: Render>`, and it may stand wherever a bound may: a function, a `where` clause, a generic
+type, an `impl`. Several traits are joined with `+` (`Item: Render + Eq`), a fixed associated type and
+a bounded one may share a list (`Pair[Key = int, Value: Render]`), and a bound may hold a bound of its
+own (`Seq[Item: Lanes[Lane: Render]]`).
+
+**A requirement list may carry one too**, which is what a trait that tightens another needs.
+`trait Scalar: Element[Real: Places]` asks every implementation of `Scalar` that the `Real` its
+`Element` chose implement `Places`, so a default body in `Scalar`, and any body bounded by it, may
+call `places` on a `Self::Real`:
+
+```sysl
+trait Places
+    places(self) -> int
+
+trait Element
+    type Real
+    real(self) -> Self::Real
+
+trait Scalar: Element[Real: Places]
+    describe(self) -> string = s"${self.real().places()} places"
+
+impl Places for f64
+    places(self) -> int = 15
+
+struct D
+    v: f64
+
+impl Element for D
+    type Real = f64
+    real(self) -> Self::Real = self.v
+
+impl Scalar for D
+
+total[T: Element[Real: Places]](x: T) -> int = x.real().places() + 1
+
+print(D(1.5).describe(), total(D(2.5)))
+```
+
+```output
+15 places 16
+```
+
+Unlike [fixing it](#a-bound-may-fix-the-associated-type-too), bounding it in a requirement asks nothing a
+call has to check: the type stays the implementation's choice, and the question is put to **every
+`impl` of the requiring trait** instead, once every block in the program is registered:
+
+```sysl
+trait Places
+    places(self) -> int
+
+trait Element
+    type Real
+    real(self) -> Self::Real
+
+trait Scalar: Element[Real: Places]
+    one(self) -> int = 1
+
+struct F
+    v: f32
+
+impl Element for F
+    type Real = f32
+    real(self) -> Self::Real = self.v
+
+impl Scalar for F
+
+print(1)
+```
+
+```error
+trait 'Scalar' requires 'Element[Real: Places]', which asks that its associated type 'Real' implement 'Places', and F supplies f32 for it, which does not
+```
+
+A bound on a parameter is held at the call, as a fixed one is, and a type parameter handed on meets
+it only where its own bounds ask the same — `[U: Scalar]` does, `[U: Element]` does not:
+
+```sysl
+trait Places
+    places(self) -> int
+
+trait Element
+    type Real
+    real(self) -> Self::Real
+
+struct F
+    v: f32
+
+impl Element for F
+    type Real = f32
+    real(self) -> Self::Real = self.v
+
+total[T: Element[Real: Places]](x: T) -> int = x.real().places()
+
+print(total(F(1.0)))
+```
+
+```error
+'total' requires its type parameter 'T' to implement 'Element[Real: Places]', which asks that 'Real' implement 'Places', and F supplies f32 for it, which does not
+```
+
+`Self` inside such a bound is the associated type, as it is in the trait's own `type Item: Add`, so
+`[T: Element[Real: Add]]` may add two `T::Real`s. A name is fixed or bounded, never both — the type it
+fixes is the whole answer — and its bounds are written together, once. **An object cannot bound one**:
+`&Element[Real: Places]` has forgotten its type, so nothing could answer which `Real` to ask, and it is
+refused with the advice to fix the type or bound a parameter instead, as Rust refuses one in a `dyn`.
+An object or a bound that *fixes* an associated type a requirement bounds is held to that bound:
+`&Scalar[Real = f64]` is an object, and `&Scalar[Real = f32]` is refused, since no implementation of
+`Scalar` could have chosen `f32`.
+
 ## A trait may require another trait
 
 `trait Word: Add + BitXor` is written after the name, with the same `:` and `+` a bound uses,
