@@ -3,7 +3,7 @@ module sh.sysl.compiler
 import sh.sysl.parsing.*
 import sysl.buf.{Buf, buf}
 import sysl.math.bigint.{BigInt, from_int}
-import sysl.text.Search
+import sysl.text.{Search, from_utf8_unchecked}
 
 // Control flow **as an expression**, and the block that is one too.
 //
@@ -443,11 +443,17 @@ private cond_is(cx: &Analyzer, span: Span, subject: Expr, patterns: Buf[Pattern]
 
     cx.pattern_roots = pattern_view_roots(cx, ts)
 
+    val said = cx.an.complaints()
+
     for i in 0..<patterns.len()
         tpats.push(type_pattern(cx, patterns.at(i), texpr_type(ts)))
 
     cx.pattern_roots = held
     cx.bind_site = site
+
+    // `x is A | A` -- an alternative the ones before it already match, refused as a `match` arm is.
+    if cx.an.complaints() == said && texpr_type(ts) != Unknown && all_refutable(tpats) then
+        report_dead_alternatives(cx, texpr_type(ts), patterns, tpats)
 
     // A pattern that matches every value of the type asks a question with one answer. Refused
     // rather than folded away, because the two forms it takes are both a mistake worth naming:
@@ -507,9 +513,16 @@ match_expr(cx: &Analyzer, span: Span, scrut: Expr, arms: Buf[MatchArm], expected
 
     cx.pattern_roots = pattern_view_roots(cx, ts)
 
+    val said = cx.an.complaints()
     val tarms = analyze_arms(cx, texpr_type(ts), arms, expected, discarded)
 
     cx.pattern_roots = held
+
+    // A pattern that was refused stands as a wildcard, so the arms are only read for dead ones when
+    // nothing among them was refused: otherwise the stand-in would be blamed for a mistake already
+    // reported.
+    if cx.an.complaints() == said && texpr_type(ts) != Unknown then
+        report_dead_arms(cx, texpr_type(ts), arms, tarms)
 
     // A refusal of the whole `match` -- arms that disagree, a gap in its coverage -- anchors at its
     // SCRUTINEE, as the reference's does: `Colour.Red match` is refused under `Red`, a selection's
@@ -518,6 +531,65 @@ match_expr(cx: &Analyzer, span: Span, scrut: Expr, arms: Buf[MatchArm], expected
 
     TExpr(span, TMatch(ts, met, match_result_type(cx, ts.span, texpr_type(ts), met)))
 end match_expr
+
+// **A pattern no value can reach is refused**, at the pattern, naming the earlier arms that match
+// everything it does -- Rust's `unreachable_patterns`, as an error. An arm that can never run is
+// almost always a mistake about which arm a value reaches: a variant listed twice, a catch-all
+// moved up, a range that swallowed the literal below it.
+private report_dead_arms(cx: &Analyzer, scrut: Type, arms: Buf[MatchArm], tarms: Buf[TArm])
+    if arms.len() != tarms.len() then return
+
+    for d in dead_patterns(scrut, tarms, fold_machine(cx.an.tables))
+        val p = arms.at(d.arm).patterns.at(d.alt)
+        var lines: Buf[usize] = buf()
+        var own = false
+
+        for k in d.by
+            if k == d.arm then own = true
+            else lines.push(cx.scope.src.locate(arms.at(k).span.start).line)
+
+        cx.fault(p.span, dead_message(written_pattern(cx, p), lines, own))
+end report_dead_arms
+
+// The alternatives of an `is` test that the ones before them already match.
+private report_dead_alternatives(cx: &Analyzer, scrut: Type, patterns: Buf[Pattern],
+                                 tpats: Buf[TPattern])
+    if patterns.len() != tpats.len() then return
+
+    for d in dead_alternatives(scrut, tpats, fold_machine(cx.an.tables))
+        val p = patterns.at(d.alt)
+
+        cx.fault(p.span, dead_message(written_pattern(cx, p), buf(), true))
+end report_dead_alternatives
+
+// A pattern as it was written; an `else` arm's stands for itself.
+private written_pattern(cx: &Analyzer, p: Pattern) -> string
+    from_utf8_unchecked(cx.scope.src.text(p.span))
+
+private dead_message(text: string, lines: Buf[usize], own: bool) -> string
+    var who = ""
+
+    // A catch-all after a long list is shadowed by the whole list, and a line number per arm would
+    // bury the sentence, so past a handful the list is given by its ends.
+    if lines.len() == 1 then who = s"the arm on line ${lines.at(0)}"
+    else if lines.len() > 4
+        who = s"the ${lines.len()} arms above it, on lines ${lines.at(0)} to ${lines.at(lines.len() - 1)}"
+    else if lines.len() > 1
+        who = "the arms on lines "
+
+        for i in 0..<lines.len()
+            if i > 0 then who = who + (if i + 1 == lines.len() then " and " else ", ")
+
+            who = who + s"${lines.at(i)}"
+    end if
+
+    if own then who = if who == "" then "an earlier alternative of this arm"
+                      else who + " and an earlier alternative of this arm"
+
+    if text == "else" then return s"this 'else' arm can never run: every value is already matched by $who"
+
+    s"unreachable pattern '$text': every value it matches is already matched by $who"
+end dead_message
 
 // Whether an arm is `Some(v) -> v` or `Ok(v) -> v`: the success variant binding one name, with no
 // guard, whose body is that name alone.
