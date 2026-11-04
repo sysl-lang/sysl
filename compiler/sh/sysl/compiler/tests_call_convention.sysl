@@ -54,11 +54,17 @@ private cc_can_run() -> bool
     true
 end cc_can_run
 
-// The LLVM text of the whole module a source lowers to, or the first thing it was refused with.
-private cc_ir(text: string) -> string
+// The LLVM text of the whole module a source lowers to. A source that is refused stops the test with
+// what it was refused with: handed on as though it were IR, the message would pass every test that
+// asks a body for something to be absent.
+private cc_ir(text: string) -> string = cc_lowered(text) match
+    Ok(ir) -> ir
+    Err(said) -> panic(s"the fixture was refused: $said")
+
+private cc_lowered(text: string) -> Result[string, string]
     val parsed = parse(source_of("t.sysl", text))
 
-    if !parsed.ok() then return parsed.first().message
+    if !parsed.ok() then return Err(parsed.first().message)
 
     var units: Buf[Program] = buf()
     val library = cc_library()
@@ -70,15 +76,19 @@ private cc_ir(text: string) -> string
 
     val done = analyze_bodies(units, host_target())
 
-    if !done.reported.is_empty() then return done.reported[0].diag.message
+    if !done.reported.is_empty() then return Err(done.reported[0].diag.message)
 
     val whole = program_of(done, "")
     val promotions = post_analysis_checks(done.an, whole, buf())
+    val said = errors_of(done.an.diagnostics())
+
+    if !said.is_empty() then return Err(analysis_report(said))
+
     val kept = prune(strip_tests(whole), program_own(units))
     val lowered = codegen_with_gaps(kept, host_target(), promotions)
 
-    ir_print_module(lowered.0)
-end cc_ir
+    Ok(ir_print_module(lowered.0))
+end cc_lowered
 
 // One function's emitted text, from its `define` to the brace that closes it. A function reaching
 // module-level storage is lowered with an environment and carries its name as a suffix
@@ -273,11 +283,12 @@ end cc_a_generic_reader_is_borrowed
 cc_the_buffer_accessor_touches_no_count()
     if cc_no_library() then return
 
-    val out = cc_ir("import sysl.buf.buf\nvar b = buf[int]()\nb.push(3)\nprint(b.at(0))\n")
+    val out = cc_ir("import sysl.buf.buf\nvar b = buf[int]()\nb.push(3)\nprint(b[0])\n")
 
-    // The core is wider than two words and `at` only reads it, so the body is lent it by address and
-    // is emitted under `.owned` (`read_by_address`).
-    val body = cc_body(out, "sysl.buf$BufCore.at.int.owned")
+    // `b[0]` is the element's checked address, `place`. The core is wider than two words and `place`
+    // only reads it, so the body is lent it by address and is emitted under `.owned`
+    // (`read_by_address`).
+    val body = cc_body(out, "sysl.buf$BufCore.place.int.owned")
 
     assert(body.contains("ptr noalias readonly %self.param"), body)
     assert(!body.contains("arc."), body)
