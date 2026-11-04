@@ -1847,6 +1847,44 @@ print(oldest)
 122
 ```
 
+**A simple enum is a scalar too**: its value is a variant, so `const W = Access.Write` is a constant
+as Rust's `const W: Access = Access::Write` is. It compares with `==`, stands as a pattern, converts
+to its integer, and reaches a bare-metal target as a literal.
+
+```sysl
+enum Access
+    Read
+    Write
+
+const W = Access.Write
+
+f(a: Access) -> string = a match
+    W -> "write"
+    _ -> "not write"
+
+print(f(Access.Write), f(Access.Read), W == Access.Write)
+```
+
+```output
+write not write true
+```
+
+An enum whose variants carry data is storage, so it is a `val`:
+
+```sysl
+enum Shape
+    Dot
+    Circle(r: int)
+
+const S: Shape = Shape.Dot
+
+print(1)
+```
+
+```error
+Shape carries data in 'Circle', so it is storage — write 'S' as a 'val'
+```
+
 **The refusal names which of the two halves it is applying.** An aggregate type is storage rather
 than a value, so what is wrong is not that the initializer failed to fold — a `val` one keyword away
 lays exactly that expression into the object file:
