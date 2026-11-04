@@ -845,8 +845,6 @@ n=42 ok=true x=1.5!
 four renderers take a number or a `bool` — UTF-8 is closed under appending any of them, so `finish`
 hands back a plain `string` rather than something a caller has to validate.
 
-**`as_bytes` reads what has been gathered so far**, as a read-only `[]const u8` (Rust's `String::as_bytes`); there is no way to write through it.
-
 **That is why a builder is not a [`Writer`](/library/core/).** A public `write` taking a `[]u8` would
 be `from_utf8_unchecked` with a longer name and none of its greppability. The two shapes look
 interchangeable and are not: a `Writer` is a sink for bytes and a builder is a producer of text.
