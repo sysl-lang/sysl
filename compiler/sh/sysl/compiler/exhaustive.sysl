@@ -2,7 +2,7 @@ module sh.sysl.compiler
 
 import sh.sysl.parsing.*
 import sysl.buf.{Buf, buf}
-import sysl.math.bigint.BigInt
+import sysl.math.bigint.{BigInt, cmp, from_int}
 
 // Whether a set of match arms leaves any value unhandled, and if so what one of those values looks
 // like.
@@ -522,3 +522,315 @@ private lift(name: string, n: usize, w: Buf[Wit]) -> Buf[Wit]
 
     out
 end lift
+
+// -- dead arms -------------------------------------------------------------------------------------
+//
+// **An arm is dead when every value its pattern matches is already matched by the arms above it**,
+// which is Rust's `unreachable_patterns` question, asked of the same matrix the coverage question
+// is: a pattern is *useful* against the rows before it when some value matches it and none of
+// them. Here a useless one is an error rather than a lint.
+//
+// The answer has to agree with coverage, so a match can always be written that is neither dead nor
+// short: a column of an open type -- a number, a string -- is never completed by its literals or
+// ranges, so a wildcard after any number of them is never dead, just as no number of them makes
+// the match exhaustive. Within that column the literals and ranges are compared as the values they
+// are: `3` after `1..5` is dead, and so is `2..7` after `1..4` and `5..9` together.
+//
+// Only what the compiler can see is known. A pattern that compares against storage -- `` `limit` ``
+// naming a `val` -- holds a value nobody knows yet, so it covers nothing below it, and is dead
+// only where something above it matches *every* value.
+
+// How deep the usefulness search descends before it gives up and calls the pattern useful: the
+// direction that refuses nothing. The pattern being asked about drives the descent, so this bounds
+// only a pathological nesting.
+const UsefulDepth: int = 64
+
+// One pattern no value can reach: which arm, which of its `|` alternatives, and the earlier arms
+// that between them match every value it does. An earlier alternative of the same arm counts as the
+// arm itself.
+struct DeadPattern
+    arm: usize
+    alt: usize
+    by: Buf[usize]
+end DeadPattern
+
+// The patterns of a match's arms that can never match, in source order.
+//
+// An alternative is read against every alternative of the unguarded arms above it and the
+// alternatives before it in its own arm. A guarded arm above covers nothing.
+//
+// Within a guarded arm the earlier alternatives cover the later ones only when the arm binds no
+// name. The guard is asked again for each alternative that matches, with that alternative's
+// bindings, so in `Rect(v, _) | Rect(_, v) if v > 10` the second alternative runs whenever the
+// first one's `v` failed the guard -- the reference's `(x, _) | (_, x) if x == 42`. With nothing
+// bound the guard sees the same thing each time, so `Red | Red if b` is still dead at the second.
+dead_patterns(scrut: Type, arms: Buf[TArm], m: FoldMachine) -> Buf[DeadPattern]
+    var out: Buf[DeadPattern] = buf()
+
+    for i in 0..<arms.len()
+        val arm = arms.at(i)
+        var apart = false
+
+        if arm.guard.is_some()
+            for alt in arm.patterns
+                if pattern_binds(alt) then apart = true
+
+        for j in 0..<arm.patterns.len()
+            var owners: Buf[usize] = buf()
+            var pats: Buf[TPattern] = buf()
+
+            for k in 0..<i
+                if arms.at(k).guard.is_none()
+                    for alt in arms.at(k).patterns
+                        owners.push(k)
+                        pats.push(alt)
+
+            if !apart
+                for k in 0..<j
+                    owners.push(i)
+                    pats.push(arm.patterns.at(k))
+
+            if !useful_among(scrut, owners, pats, buf(), arm.patterns.at(j), m) then
+                out.push(DeadPattern(i, j, least_cover(scrut, owners, pats, arm.patterns.at(j), m)))
+
+    out
+end dead_patterns
+
+// The alternatives of one `x is A | B` that the ones before them already match, as arm 0.
+dead_alternatives(scrut: Type, pats: Buf[TPattern], m: FoldMachine) -> Buf[DeadPattern]
+    var out: Buf[DeadPattern] = buf()
+
+    for j in 0..<pats.len()
+        var owners: Buf[usize] = buf()
+        var earlier: Buf[TPattern] = buf()
+
+        for k in 0..<j
+            owners.push(0)
+            earlier.push(pats.at(k))
+
+        if !useful_among(scrut, owners, earlier, buf(), pats.at(j), m)
+            var by: Buf[usize] = buf()
+
+            by.push(0)
+            out.push(DeadPattern(0, j, by))
+
+    out
+end dead_alternatives
+
+// Whether `q` is useful against the patterns whose owning arm is not in `without`.
+private useful_among(scrut: Type, owners: Buf[usize], pats: Buf[TPattern], without: Buf[usize],
+                     q: TPattern, m: FoldMachine) -> bool
+    var rows: Buf[Buf[TPattern]] = buf()
+
+    for i in 0..<pats.len()
+        if !holds_index(without, owners.at(i))
+            var row: Buf[TPattern] = buf()
+
+            row.push(pats.at(i))
+            rows.push(row)
+
+    var qs: Buf[TPattern] = buf()
+    var tys: Buf[Type] = buf()
+
+    qs.push(q)
+    tys.push(scrut)
+    useful(rows, qs, tys, 0, m)
+end useful_among
+
+// The arms a dead pattern needs: every owner, then each one that can be left out while the pattern
+// stays dead is, in order. What is left is a set no member of which is idle -- the arms to point at.
+private least_cover(scrut: Type, owners: Buf[usize], pats: Buf[TPattern], q: TPattern,
+                    m: FoldMachine) -> Buf[usize]
+    var all: Buf[usize] = buf()
+
+    for o in owners
+        if !holds_index(all, o) then all.push(o)
+
+    var dropped: Buf[usize] = buf()
+
+    for o in all
+        dropped.push(o)
+
+        if useful_among(scrut, owners, pats, dropped, q, m)
+            val _ = dropped.pop()
+
+    var out: Buf[usize] = buf()
+
+    for o in all
+        if !holds_index(dropped, o) then out.push(o)
+
+    out
+end least_cover
+
+private holds_index(xs: Buf[usize], x: usize) -> bool
+    for item in xs
+        if item == x then return true
+
+    false
+end holds_index
+
+// What a pattern in a column of an open type stands for, as far as the compiler can tell.
+enum Head
+    // A wildcard or a binding.
+    HeadAny
+
+    // An integer or a `char` from `lo` to `hi`, both included: a literal is a range of one.
+    HeadSpan(lo: BigInt, hi: BigInt)
+
+    HeadText(value: string)
+
+    HeadReal(value: real)
+
+    // A value no one knows while compiling: storage compared against, a float range, an `f128`.
+    HeadOpaque
+end Head
+
+private scalar_val(p: TPattern, m: FoldMachine) -> Head = unbound(p) match
+    TWildPattern(_) -> HeadAny
+    TBindPattern(_, _) -> HeadAny
+    TLitPattern(t) -> const_fold_typed(t, m) match
+        Some(ConstInt(n)) -> HeadSpan(n, n)
+        Some(ConstChar(c)) -> HeadSpan(from_int(long(u32(c))), from_int(long(u32(c))))
+        Some(ConstStr(s)) -> HeadText(s)
+        Some(ConstFloat(r)) -> HeadReal(r)
+        _ -> HeadOpaque
+    TRangePattern(lo, hi, inclusive) -> range_val(lo, hi, inclusive, m)
+    _ -> HeadOpaque
+
+private range_val(lo: TExpr, hi: TExpr, inclusive: bool, m: FoldMachine) -> Head
+    val a = int_of(lo, m)
+    val b = int_of(hi, m)
+
+    if a.is_none() || b.is_none() then return HeadOpaque
+
+    val top = if inclusive then b.unwrap() else b.unwrap() - from_int(1)
+
+    // An empty range matches nothing, so there is no value for it to be dead or alive about.
+    if cmp(a.unwrap(), top) > 0 then HeadOpaque else HeadSpan(a.unwrap(), top)
+end range_val
+
+private int_of(t: TExpr, m: FoldMachine) -> Option[BigInt] = const_fold_typed(t, m) match
+    Some(ConstInt(n)) -> Some(n)
+    Some(ConstChar(c)) -> Some(from_int(long(u32(c))))
+    _ -> None
+
+// Whether some value vector of the types matches `q` and none of the rows: Maranget's usefulness,
+// over the same splits `covers` makes.
+private useful(rows: Buf[Buf[TPattern]], q: Buf[TPattern], tys: Buf[Type], depth: int,
+               m: FoldMachine) -> bool
+    if tys.is_empty() then return rows.is_empty()
+    if rows.is_empty() || depth >= UsefulDepth then return true
+
+    val rest = tail_types(tys)
+    val head = unbound(q.at(0))
+    val qrest = tail_of(q)
+    val cons = space(tys.at(0))
+
+    if cons.is_some() then return useful_closed(cons.unwrap(), rows, head, q, qrest, rest, depth, m)
+
+    scalar_val(head, m) match
+        HeadSpan(lo, hi) -> useful_span(rows, lo, hi, qrest, rest, depth, m)
+        HeadText(s) -> useful(kept_rows(rows, HeadText(s), m), qrest, rest, depth + 1, m)
+        HeadReal(r) -> useful(kept_rows(rows, HeadReal(r), m), qrest, rest, depth + 1, m)
+
+        // A wildcard -- or a value nobody knows, which could be any of them -- is useful where some
+        // value no literal names is: and an open type always has one.
+        _ -> useful(wild_tails(rows), qrest, rest, depth + 1, m)
+end useful
+
+private useful_closed(list: Buf[Ctor], rows: Buf[Buf[TPattern]], head: TPattern, q: Buf[TPattern],
+                      qrest: Buf[TPattern], rest: Buf[Type], depth: int, m: FoldMachine) -> bool
+    val hc = head_con(head)
+
+    if names_con(hc)
+        for c in list
+            if con_eq(c.con, hc.unwrap())
+                val sq = specialize(c.con, c.args, q).unwrap()
+
+                return useful(narrow(c, rows), sq, join_types_list(c.args, rest), depth + 1, m)
+
+        // A variant whose payload holds no value is matched by nothing, and naming one stays legal.
+        return true
+    end if
+
+    // A type with no constructor at all has no value for anything to match; the arm is left alone.
+    if list.is_empty() then return true
+
+    var complete = true
+
+    for c in list
+        if !heads_with(rows, c.con) then complete = false
+
+    if !complete then return useful(wild_tails(rows), qrest, rest, depth + 1, m)
+
+    for c in list
+        val sq = join_rows(wildcards(c.args), qrest)
+
+        if useful(narrow(c, rows), sq, join_types_list(c.args, rest), depth + 1, m) then return true
+
+    false
+end useful_closed
+
+// Whether a pattern's head names one constructor -- not a wildcard, and not a value nobody knows.
+private names_con(hc: Option[Con]) -> bool = hc match
+    Some(ConOpaque) -> false
+    Some(_) -> true
+    None -> false
+
+// A range of integers against the rows: cut where any row's range begins or ends inside it, so
+// each piece is wholly inside or wholly outside every row, and ask each piece in turn.
+private useful_span(rows: Buf[Buf[TPattern]], lo: BigInt, hi: BigInt, qrest: Buf[TPattern],
+                    rest: Buf[Type], depth: int, m: FoldMachine) -> bool
+    var cuts: Buf[BigInt] = buf()
+
+    cuts.push(lo)
+
+    for row in rows
+        scalar_val(row.at(0), m) match
+            HeadSpan(a, b) ->
+                if cmp(a, lo) > 0 && cmp(a, hi) <= 0 && !holds_big(cuts, a) then cuts.push(a)
+
+                val after = b + from_int(1)
+
+                if cmp(after, lo) > 0 && cmp(after, hi) <= 0 && !holds_big(cuts, after) then
+                    cuts.push(after)
+            _ -> ()
+
+    // Each piece starts at a cut, and every row holds all of it or none of it, so its first value
+    // speaks for the whole piece.
+    for start in cuts
+        if useful(kept_rows(rows, HeadSpan(start, start), m), qrest, rest, depth + 1, m) then
+            return true
+
+    false
+end useful_span
+
+private holds_big(xs: Buf[BigInt], x: BigInt) -> bool
+    for item in xs
+        if cmp(item, x) == 0 then return true
+
+    false
+end holds_big
+
+// The tails of the rows that match the value `v` -- one point of a span, a string, a float.
+private kept_rows(rows: Buf[Buf[TPattern]], v: Head, m: FoldMachine) -> Buf[Buf[TPattern]]
+    var out: Buf[Buf[TPattern]] = buf()
+
+    for row in rows
+        if head_holds(scalar_val(row.at(0), m), v) then out.push(tail_of(row))
+
+    out
+end kept_rows
+
+private head_holds(row: Head, v: Head) -> bool = row match
+    HeadAny -> true
+    HeadSpan(a, b) -> v match
+        HeadSpan(x, _) -> cmp(a, x) <= 0 && cmp(x, b) <= 0
+        _ -> false
+    HeadText(s) -> v match
+        HeadText(t) -> s == t
+        _ -> false
+    HeadReal(r) -> v match
+        HeadReal(t) -> r == t
+        _ -> false
+    HeadOpaque -> false

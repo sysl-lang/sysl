@@ -493,6 +493,164 @@ orp_spread_limit()
         print(f((0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)))
         """, "this pattern spreads into more than 1024 alternatives")
 
+// -- nested alternatives meet dead arms -----------------------------------------------------------
+//
+// The spreading feeds the dead-pattern check (`reference/patterns.md § Dead arms`), which sees the
+// alternatives the parser made. What it reports is still what the user wrote: the repeated `1` of
+// `Some(1 | 1)`, never a `Some(1)` nobody typed, and a written alternative only when every row it
+// was spread into is dead.
+
+// What the compiler says about a program, as the command line prints it; empty for a clean one.
+private orp_said(text: string) -> string
+    val root = make_temp_dir("sysl-orp").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    val out = emit_llvm_text(src, None) match
+        Err(why) -> why.message
+        Ok(made) -> if made.report.is_empty() then "" else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end orp_said
+
+// The one complaint a program earns: its whole message, and the `line:col` it is anchored at.
+private orp_dead_at(text: string, shown: string, by: string, at: string)
+    if !orp_ready() then return
+
+    val said = orp_said(text)
+    val head = s"error: unreachable pattern '$shown': every value it matches is already matched by $by\n"
+
+    said.index_of(head) match
+        None -> assert(false, said)
+        Some(i) ->
+            val rest = said[i + head.bytes.len..<said.bytes.len]
+            val place = rest.index_of("\n") match
+                Some(n) -> rest[0..<n]
+                None -> rest
+
+            assert(place.ends_with(s"main.sysl:$at"), said)
+
+    var rest = said
+    var n = 0
+
+    loop
+        rest.index_of("main.sysl:") match
+            None -> break
+            Some(k) ->
+                n += 1
+                rest = rest[k + 10..<rest.bytes.len]
+
+    assert_eq(n, 1, said)
+end orp_dead_at
+
+private orp_clean(text: string)
+    if !orp_ready() then return
+
+    assert_eq(orp_said(text), "")
+
+@test("a value repeated inside a variant's parentheses is dead at the repeat, not a spread arm")
+orp_dead_repeat_in_a_variant()
+    orp_dead_at(raw"""
+        f(o: Option[int]) -> int = o match
+            Some(1 | 1) -> 1
+            _ -> 0
+        """, "1", "an earlier alternative of this arm", "2:14")
+
+@test("a value repeated inside an 'is' test is dead at the repeat")
+orp_dead_repeat_in_is()
+    orp_dead_at("f(o: Option[int]) -> bool = o is Some(1 | 1)\n",
+                "1", "an earlier alternative of this arm", "1:43")
+
+@test("a repeat in one part of a tuple is reported once, however many rows it was spread into")
+orp_dead_repeat_in_a_tuple()
+    orp_dead_at(raw"""
+        f(t: (int, int)) -> int = t match
+            (1 | 2, 3 | 3) -> 1
+            _ -> 0
+        """, "3", "an earlier alternative of this arm", "2:17")
+
+@test("alternatives in two parts with no repeat are not dead, in a match and an 'is' test")
+orp_no_dead_across_parts()
+    val two = "enum E\n    A\n    B\n\n"
+    val three = "enum E\n    A\n    B\n    C\n\n"
+
+    orp_clean(two + "f(t: (E, E)) -> int = t match\n    (A | B, A | B) -> 1\n")
+    orp_clean(three + "f(t: (E, E)) -> bool = t is (A | B, A | B)\n")
+
+@test("a row covered while every written alternative still has a row that runs is not dead")
+orp_no_dead_partial_row()
+    orp_clean(raw"""
+        f(t: (int, int)) -> int = t match
+            (2, 4) -> 0
+            (1 | 2, 3 | 4) -> 1
+            _ -> 2
+        """)
+
+@test("a whole nested pattern an earlier arm covers is reported once, as written")
+orp_dead_whole_nested()
+    orp_dead_at(raw"""
+        f(o: Option[int]) -> int = o match
+            Some(_) -> 0
+            Some(1 | 2) -> 1
+            None -> 2
+        """, "Some(1 | 2)", "the arm on line 2", "3:5")
+
+@test("an arm-level alternative covered by a nested one before it is dead")
+orp_dead_after_nested()
+    orp_dead_at(raw"""
+        f(o: Option[int]) -> int = o match
+            Some(1 | 2) | Some(2) -> 1
+            _ -> 0
+        """, "Some(2)", "an earlier alternative of this arm", "2:19")
+
+@test("a binding alternative an earlier arm covers is dead, at the top level and nested")
+orp_dead_binding_alternative()
+    val e = "enum E\n    A(v: int)\n    B(v: int)\n    C\n\n"
+
+    orp_dead_at(e + "f(e: E) -> int = e match\n    B(_) -> 0\n    A(x) | B(x) -> x\n    C -> 9\n",
+                "B(x)", "the arm on line 7", "8:12")
+    orp_dead_at(e + "f(o: Option[E]) -> int = o match\n    Some(B(_)) -> 0\n    Some(A(x) | B(x)) -> x\n" +
+                "    _ -> 9\n",
+                "B(x)", "the arm on line 7", "8:17")
+
+@test("a guarded arm with nested alternatives covers nothing below it")
+orp_guard_covers_nothing()
+    orp_clean(raw"""
+        f(o: Option[int], c: bool) -> int = o match
+            Some(1 | 2) if c -> 1
+            Some(2) -> 2
+            Some(1) -> 3
+            _ -> 0
+        """)
+
+@test("a guarded arm's binding alternatives are asked apart, so one covering the next is not dead")
+orp_guarded_binding_alternatives_apart()
+    val e = "enum E\n    A(v: int)\n    B(v: int)\n    C\n\n"
+
+    orp_clean(raw"""
+        f(t: (int, int)) -> int = t match
+            (x, _) | (_, x) if x == 42 -> 1
+            _ -> 0
+        """)
+    orp_clean(e + "f(o: Option[E]) -> int = o match\n    Some(A(x) | A(x)) if x > 1 -> x\n    _ -> 0\n")
+
+    // An earlier unguarded arm still covers a guarded arm's alternative.
+    orp_dead_at(e + "f(e: E) -> int = e match\n    B(_) -> 0\n    A(x) | B(x) if x > 1 -> x\n    _ -> 9\n",
+                "B(x)", "the arm on line 7", "8:12")
+
+@test("the guard re-asked for the second alternative is what lets it run")
+orp_guarded_second_alternative_runs()
+    orp_prints(raw"""
+        f(t: (int, int)) -> int = t match
+            (x, _) | (_, x) if x == 42 -> 1
+            _ -> 0
+
+        print(f((1, 42)), f((42, 1)), f((1, 2)))
+        """, "1 1 0\n")
+
 @test("one part in parentheses with no '|' is still not a tuple")
 orp_one_part_still_refused()
     orp_refused(raw"""
