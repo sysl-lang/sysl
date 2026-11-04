@@ -162,24 +162,31 @@ end make_temp_dir
  * there" is asking a question this cannot answer honestly anyway, since somebody else may have made
  * it in between.
  *
- * It climbs with `sysl.path.parent` and recurses, so the work is done from the top down and each
- * level is attempted exactly once. A component that exists and is **not** a directory reports
- * `NotADirectory` from the `make_dir` beneath it rather than being silently accepted.
+ * It tries `make_dir(path)` first and climbs with `sysl.path.parent` only when that answers
+ * `NotFound`, then retries, so each level is attempted once and the error is the one the operating
+ * system gave for the path the caller named. **A file standing where a directory is needed above the
+ * leaf** (`make_dir_all("x/y")` with `x` a regular file) reports `NotADirectory`, since `mkdir`
+ * answers `ENOTDIR`. **A file standing at the leaf itself** (`make_dir_all("x")` with `x` a regular
+ * file) reports `AlreadyExists`. Neither is silently accepted.
  */
 make_dir_all(path: string) -> Result[unit, IoError]
     if path.len == 0 || is_dir(path) then return Ok(())
 
-    parent(path) match
-        Some(up) -> make_dir_all(up)?
-        None -> ()
-
     make_dir(path) match
         Ok(_) -> Ok(())
-        // Somebody else may have made it between the `is_dir` above and this call, and a program
-        // that asked for the directory to exist got what it asked for. Anything else it was is a
-        // real failure and is reported.
-        Err(AlreadyExists) -> if is_dir(path) then Ok(()) else Err(AlreadyExists)
-        Err(e) -> Err(e)
+        Err(NotFound) ->
+            parent(path) match
+                Some(up) -> make_dir_all(up)?
+                None -> return Err(NotFound)
+            make_dir(path) match
+                Ok(_) -> Ok(())
+                // Somebody else may have made it between the first attempt and this one, and a
+                // program that asked for the directory to exist got what it asked for.
+                Err(AlreadyExists) -> if is_dir(path) then Ok(()) else Err(AlreadyExists)
+                Err(e) -> Err(e)
+        // Somebody else may have made it between the `is_dir` above and this call. Anything else
+        // it was is a real failure and is reported.
+        Err(e) -> if is_dir(path) then Ok(()) else Err(e)
 end make_dir_all
 
 // **`remove_dir_all` has to know whether an entry is a symbolic link *without following it***, and
