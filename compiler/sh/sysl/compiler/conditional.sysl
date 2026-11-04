@@ -62,9 +62,10 @@ end Directive
 // own manifest declares that the resolution enabled, and no other package's.
 //
 // `flags` are the extra clang flags the build is compiled under (`extra_cflags`), which decide the
-// instrumentation symbols; a parameter so that a test can ask about a build it is not running in.
+// instrumentation symbols, and `debugging` is whether it is a debug build (`overflow_checks`), which
+// decides `debug`; both are parameters so that a test can ask about a build it is not running in.
 gate(src: Source, target: Target, features: Buf[string] = buf(),
-        flags: Buf[string] = extra_cflags()) -> Result[Source, Diagnostic]
+        flags: Buf[string] = extra_cflags(), debugging: bool = overflow_checks()) -> Result[Source, Diagnostic]
     var on = defined(target)
 
     for item in features
@@ -72,6 +73,8 @@ gate(src: Source, target: Target, features: Buf[string] = buf(),
 
     for item in instrumented(flags)
         on.push(item)
+
+    if debugging then on.push("debug")
 
     val lines = src.line_count()
     var stack: Buf[Frame] = buf()
@@ -407,11 +410,13 @@ directory_symbols() -> Buf[string]
     out
 end directory_symbols
 
-// The two facts about **the build rather than the machine** a source condition may ask:
+// The facts about **the build rather than the machine** a source condition may ask:
 // whether every function is instrumented for AddressSanitizer (`sanitize_address`) or for
-// ThreadSanitizer (`sanitize_thread`). Each is the name of the LLVM attribute that does the marking.
+// ThreadSanitizer (`sanitize_thread`), each the name of the LLVM attribute that does the marking,
+// and whether it is a debug build (`debug`, the build mode of `build_mode.sysl`: true where plain
+// integer overflow is checked, false in a release build).
 //
-// They are read from `sanitizer_attrs`, the list `for_clang` marks every definition with, so a
+// The sanitizer symbols are read from `sanitizer_attrs`, the list `for_clang` marks every definition with, so a
 // condition and the instrumentation cannot disagree: whatever makes the build instrumented makes
 // the condition true, on any target, and nothing else does. A dependency's `if` cannot name them --
 // what a resolution picks must not depend on how one build of it is compiled.
@@ -420,6 +425,7 @@ instrumentation_symbols() -> Buf[string]
 
     out.push("sanitize_address")
     out.push("sanitize_thread")
+    out.push("debug")
     out
 end instrumentation_symbols
 
