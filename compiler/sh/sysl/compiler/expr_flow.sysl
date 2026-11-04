@@ -445,8 +445,7 @@ private cond_is(cx: &Analyzer, span: Span, subject: Expr, patterns: Buf[Pattern]
 
     val said = cx.an.complaints()
 
-    for i in 0..<patterns.len()
-        tpats.push(type_pattern(cx, patterns.at(i), texpr_type(ts)))
+    tpats = type_alternatives(cx, patterns, texpr_type(ts))
 
     cx.pattern_roots = held
     cx.bind_site = site
@@ -466,10 +465,6 @@ private cond_is(cx: &Analyzer, span: Span, subject: Expr, patterns: Buf[Pattern]
         else
             cx.fault(span, s"this pattern matches every ${type_show(texpr_type(ts))}, so the test " +
                      "is always true — take the value apart with 'match', or bind it with 'var'")
-
-    if tpats.len() > 1 && any_pattern_binds(tpats) then
-        cx.fault(span, "alternative patterns joined by '|' cannot bind a name — the branch cannot " +
-                 "know which of them matched. Write '_' for the parts you are not naming")
 
     // `x is not Some(n)` would name `n` on the one path where nothing matched it. The binder is
     // what is refused and not the negation: `x is not Some(_)` is the early-exit guard the form is
@@ -539,16 +534,26 @@ end match_expr
 private report_dead_arms(cx: &Analyzer, scrut: Type, arms: Buf[MatchArm], tarms: Buf[TArm])
     if arms.len() != tarms.len() then return
 
-    for d in dead_patterns(scrut, tarms, fold_machine(cx.an.tables))
-        val p = arms.at(d.arm).patterns.at(d.alt)
-        var lines: Buf[usize] = buf()
-        var own = false
+    val dead = dead_patterns(scrut, tarms, fold_machine(cx.an.tables))
 
-        for k in d.by
-            if k == d.arm then own = true
-            else lines.push(cx.scope.src.locate(arms.at(k).span.start).line)
+    for i in 0..<arms.len()
+        var mine: Buf[DeadPattern] = buf()
 
-        cx.fault(p.span, dead_message(written_pattern(cx, p), lines, own))
+        for d in dead
+            if d.arm == i then mine.push(d)
+
+        if mine.is_empty() then continue
+
+        for spot in written_dead(arms.at(i).patterns, mine)
+            var lines: Buf[usize] = buf()
+            var own = false
+
+            for k in spot.by
+                if k == i then own = true
+                else lines.push(cx.scope.src.locate(arms.at(k).span.start).line)
+
+            cx.fault(spot.at, dead_message(written_text(cx, spot.at), lines, own))
+    end for
 end report_dead_arms
 
 // The alternatives of an `is` test that the ones before them already match.
@@ -556,15 +561,124 @@ private report_dead_alternatives(cx: &Analyzer, scrut: Type, patterns: Buf[Patte
                                  tpats: Buf[TPattern])
     if patterns.len() != tpats.len() then return
 
-    for d in dead_alternatives(scrut, tpats, fold_machine(cx.an.tables))
-        val p = patterns.at(d.alt)
-
-        cx.fault(p.span, dead_message(written_pattern(cx, p), buf(), true))
+    for spot in written_dead(patterns, dead_alternatives(scrut, tpats, fold_machine(cx.an.tables)))
+        cx.fault(spot.at, dead_message(written_text(cx, spot.at), buf(), true))
 end report_dead_alternatives
 
+// One piece of a pattern, as the user wrote it, that no value can reach, and the arms that cover it.
+private struct DeadSpot
+    at: Span
+    by: Buf[usize]
+end DeadSpot
+
+// **A dead pattern is reported at what the user wrote, never at an alternative the parser made.**
+// A `|` inside a pattern is spread into alternatives of the arm (`parse_pattern_alts`), each carrying
+// the span of the whole pattern it came from, so `Some(1 | 1)` reaches here as `Some(1) | Some(1)`
+// with the second dead. What the user wrote that can never match is the second `1`.
+//
+// So the rows one written pattern spread into are read together: a piece of it -- the whole pattern,
+// or any part it holds -- is dead when every row that chose that piece is dead, and it is reported
+// once, unless a piece around it already was. This is Rust's rule: in `(1 | 2, 3 | 4)` after an arm
+// `(2, 4)` each written alternative still has a row that runs, so nothing is reported, while
+// `(1 | 2, 3 | 3)` reports the second `3`.
+private written_dead(patterns: Buf[Pattern], dead: Buf[DeadPattern]) -> Buf[DeadSpot]
+    var out: Buf[DeadSpot] = buf()
+    var i: usize = 0
+
+    while i < patterns.len()
+        var j = i + 1
+
+        while j < patterns.len() && patterns.at(j).span == patterns.at(i).span
+            j += 1
+
+        var rows: Buf[Buf[Span]] = buf()
+        var pieces: Buf[Span] = buf()
+
+        for k in i..<j
+            var spans: Buf[Span] = buf()
+
+            pattern_spans(patterns.at(k), &spans)
+
+            for s in spans
+                if !holds_span(pieces, s) then pieces.push(s)
+
+            rows.push(spans)
+
+        var said: Buf[Span] = buf()
+
+        for s in pieces
+            var inside = false
+
+            for r in said
+                if r.start <= s.start && s.end <= r.end then inside = true
+
+            if inside then continue
+
+            var all_dead = true
+            var by: Buf[usize] = buf()
+
+            for k in i..<j
+                if !holds_span(rows.at(k - i), s) then continue
+
+                var hit = false
+
+                for d in dead
+                    if d.alt == k
+                        hit = true
+
+                        for b in d.by
+                            add_sorted(&by, b)
+
+                if !hit then all_dead = false
+
+            if all_dead
+                said.push(s)
+                out.push(DeadSpot(s, by))
+        end for
+
+        i = j
+    end while
+
+    out
+end written_dead
+
+// Every span in a pattern, outermost first.
+private pattern_spans(p: Pattern, out: *Buf[Span])
+    out.push(p.span)
+
+    *p.kind match
+        BindPattern(_, inner) -> pattern_spans(inner, out)
+        VariantPattern(_, args) ->
+            for arg in args
+                pattern_spans(arg, out)
+        TuplePattern(args) ->
+            for arg in args
+                pattern_spans(arg, out)
+        StructPattern(_, fields) ->
+            for item in fields
+                pattern_spans(item.pat, out)
+        _ -> ()
+end pattern_spans
+
+private holds_span(spans: Buf[Span], s: Span) -> bool
+    for item in spans
+        if item == s then return true
+
+    false
+
+private add_sorted(xs: *Buf[usize], x: usize)
+    var at = xs.len()
+
+    for k in 0..<xs.len()
+        if xs.at(k) == x then return
+        if xs.at(k) > x && at == xs.len() then at = k
+
+    xs.insert(at, x)
+end add_sorted
+
 // A pattern as it was written; an `else` arm's stands for itself.
-private written_pattern(cx: &Analyzer, p: Pattern) -> string
-    from_utf8_unchecked(cx.scope.src.text(p.span))
+private written_text(cx: &Analyzer, at: Span) -> string
+    from_utf8_unchecked(cx.scope.src.text(at))
 
 private dead_message(text: string, lines: Buf[usize], own: bool) -> string
     var who = ""
@@ -898,7 +1012,7 @@ private offered_arm(cx: &Analyzer, scrut: Type, arm: MatchArm, want: Option[Type
 end offered_arm
 
 // One arm in its own scope, so pattern bindings are visible to the guard and the body.
-// Alternatives may not bind, since the body cannot know which of them matched.
+// Alternatives bind one set of names between them (`type_alternatives`).
 private analyze_arm(cx: &Analyzer, scrut: Type, arm: MatchArm, expected: Option[Type],
                     discarded: bool) -> TArm
     cx.enter()
@@ -908,13 +1022,9 @@ private analyze_arm(cx: &Analyzer, scrut: Type, arm: MatchArm, expected: Option[
 
     cx.bind_site = Some(arm.span)
 
-    for i in 0..<arm.patterns.len()
-        tpats.push(type_pattern(cx, arm.patterns.at(i), scrut))
+    tpats = type_alternatives(cx, arm.patterns, scrut)
 
     cx.bind_site = site
-
-    if tpats.len() > 1 && any_pattern_binds(tpats) then
-        cx.fault(arm.span, "alternative patterns joined by '|' cannot bind a name")
 
     // Only the arm's patterns bind out of the scrutinee; its body's own bindings are its own.
     val roots = cx.pattern_roots

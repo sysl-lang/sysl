@@ -32,6 +32,64 @@ type_pattern(cx: &Analyzer, p: Pattern, ty: Type) -> TPattern
     t
 end type_pattern
 
+// An arm's or an `is` test's `|`-alternatives, typed in order against one subject.
+//
+// **Alternatives may bind, as Rust's do, when every one of them binds the same names at the same
+// types.** The body cannot know which alternative matched, so a name it reads has to stand for
+// something in each: the alternatives bind the one local, and the emitter has each write its own part
+// of the value there. A name one alternative binds and another does not is refused from the binding
+// site, which is where the reference reports a fact about the whole pattern.
+type_alternatives(cx: &Analyzer, ps: Buf[Pattern], ty: Type) -> Buf[TPattern]
+    var out: Buf[TPattern] = buf()
+
+    if ps.len() == 1
+        out.push(type_pattern(cx, ps.at(0), ty))
+        return out
+
+    val held_on = cx.alt_on
+    val held_names = cx.alt_names
+
+    cx.alt_on = true
+    cx.alt_names = buf()
+
+    var first: usize = 0
+
+    for i in 0..<ps.len()
+        out.push(type_pattern(cx, ps.at(i), ty))
+
+        if i == 0
+            first = cx.alt_names.len()
+        else
+            for k in 0..<first
+                val n = cx.alt_names.at(k).0
+
+                if !holds_name(cx.bound_in_pattern, n) then
+                    cx.fault(cx.bind_site.unwrap_or(ps.at(i).span), unpaired_binding(n))
+
+            for item in cx.bound_in_pattern
+                var known = false
+
+                for k in 0..<first
+                    if cx.alt_names.at(k).0 == item then known = true
+
+                if !known then cx.fault(cx.bind_site.unwrap_or(ps.at(i).span), unpaired_binding(item))
+        end if
+
+    cx.alt_on = held_on
+    cx.alt_names = held_names
+    out
+end type_alternatives
+
+private unpaired_binding(name: string) -> string =
+    s"'$name' is bound by one alternative joined by '|' and not by another — the arm reads it " +
+    "whichever matched, so every alternative binds the same names. Write '_' where a name is not wanted"
+
+private holds_name(xs: Buf[string], name: string) -> bool
+    for item in xs
+        if item == name then return true
+
+    false
+
 // The name a binding introduces, refused where this pattern has already introduced it.
 //
 // It is written once, which is what a pattern binding is: the arm is handed a copy of the part it
@@ -50,7 +108,21 @@ private bind_once(cx: &Analyzer, span: Span, name: string, ty: Type) -> string
 
     cx.bound_in_pattern.push(name)
 
+    // A later `|`-alternative binds the local an earlier one made, so the arm reads one name however
+    // it was entered -- which only means anything at the one type.
+    if cx.alt_on
+        for item in cx.alt_names
+            if item.0 == name
+                if item.2 != ty && item.2 != Unknown && ty != Unknown then
+                    cx.fault(cx.bind_site.unwrap_or(span), s"'$name' is bound as ${type_show(item.2)} " +
+                             s"by one alternative joined by '|' and as ${type_show(ty)} by another " +
+                             "— the arm reads one name whichever matched, so it has one type")
+
+                return item.1
+
     val unique = cx.bind_pattern(name, ty, written_name(cx, span.start, name))
+
+    if cx.alt_on then cx.alt_names.push((name, unique, ty))
 
     note_pattern_borrow(cx, unique, name, ty)
     unique

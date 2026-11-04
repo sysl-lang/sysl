@@ -1054,17 +1054,22 @@ private led_type_attr(lhs: Expr, colons: Span, p: *Parser) -> Expr
         None -> expr(at, Bad)
 end led_type_attr
 
+// The alternatives one pattern spreads into (`parse_pattern_alts`), added to an arm's or a test's.
+private push_alternatives(pats: *Buf[Pattern], p: *Parser)
+    for item in parse_pattern_alts(p)
+        pats.push(item)
+
 // `subject is Pat` / `subject is not Pat`, with `|`-alternatives that share one answer.
 private led_is(lhs: Expr, p: *Parser) -> Expr
     val negated = p.accept_word("not")
     var pats: Buf[Pattern] = buf()
 
-    pats.push(parse_pattern(p))
+    push_alternatives(&pats, p)
 
     loop
         if !p.accept_kw("|") then break
 
-        pats.push(parse_pattern(p))
+        push_alternatives(&pats, p)
 
     expr(left_start(lhs, p).to(p.just_taken()), IsPattern(lhs, pats, negated))
 end led_is
@@ -1188,7 +1193,7 @@ private parse_match_arm(p: *Parser) -> MatchArm
         return MatchArm(start, pats, None, buf())
     end if
 
-    pats.push(parse_pattern(p))
+    push_alternatives(&pats, p)
 
     // **A line that begins with `|` continues the pattern above it**, as in rustfmt's layout. It is
     // only looked for here, between the alternatives of an arm that has not yet reached its arrow, so
@@ -1199,7 +1204,7 @@ private parse_match_arm(p: *Parser) -> MatchArm
 
         if !p.accept_kw("|") then break
 
-        pats.push(parse_pattern(p))
+        push_alternatives(&pats, p)
 
     // **A guard is read above the level a closure begins at**, so the arrow after `if wide` is the
     // arm's and never the arrow of a closure whose parameter is `wide`. A closure in a guard is

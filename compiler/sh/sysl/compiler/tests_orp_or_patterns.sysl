@@ -1,0 +1,662 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.{Search, replace_all}
+
+// **`|`-alternatives may bind, as Rust's do**: every alternative binds the same names at the same
+// types, and the arm reads each name whichever alternative matched. **A `|` may also stand inside a
+// pattern** -- `Some(1 | 2)`, `(0 | 1, c)`, `Point { x: 0 | 1, y }`, `n @ (1 | 2)` -- and is spread
+// into alternatives of the arm itself (`parse_pattern.sysl`), so coverage, binding and emission meet
+// only the form they already knew.
+//
+// The axes these cross: where the binding sits (top level, nested, at two depths, under `@`); the
+// position of the inner `|` (variant, tuple, struct field, group); a generic payload; a guard (asked
+// once per matching alternative, with that alternative's bindings); a closure capturing the name; a
+// `Drop` payload bound in each alternative (one share each, released once); `is` in an `if` and a
+// `while`; the compile-time evaluator; coverage with nested alternatives; the IR's one slot per name;
+// and every refusal. **Skipped, with the reason:** mutability and `ref` mismatches -- a pattern binds
+// by copy, so there is no mode for two alternatives to disagree on; separate compilation and codegen
+// units -- the spreading is done by the parser and binds locals of one body, so nothing crosses a
+// unit or a library boundary that a single-pattern arm does not already cross.
+
+private orp_ready() -> bool = std_root().is_ok() && clang_available()
+
+private orp_ran(text: string) -> string
+    val root = replace_all(make_temp_dir("sysl-orp").unwrap(), "//", "/")
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            val said = replace_all(failure_text(why), s"$root/", "")
+
+            remove_dir_all(root).unwrap_or(())
+            return said
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end orp_ran
+
+private orp_prints(text: string, want: string)
+    if !orp_ready() then return
+
+    assert_eq(orp_ran(text), want)
+
+private orp_refused(text: string, want: string)
+    if !orp_ready() then return
+
+    val got = orp_ran(text)
+
+    assert(got.index_of(want).is_some(), s"expected '$want' in:\n$got")
+
+private orp_shape() -> string = raw"""
+    enum Shape
+        Circle(r: int)
+        Square(r: int)
+        Rect(w: int, h: int)
+        Dot
+
+    """
+
+private orp_missing(name: string) -> string =
+    s"'$name' is bound by one alternative joined by '|' and not by another — the arm reads it " +
+    "whichever matched, so every alternative binds the same names. Write '_' where a name is not wanted"
+
+// -- binding alternatives -------------------------------------------------------------------------
+
+@test("alternatives that bind one name at one type read it whichever matched")
+orp_top_level_binding()
+    orp_prints(orp_shape() + raw"""
+        size(s: Shape) -> int = s match
+            Circle(r) | Square(r) | Rect(r, _) -> r
+            Dot -> 0
+
+        print(size(Circle(3)), size(Square(4)), size(Rect(5, 6)), size(Dot))
+        """, "3 4 5 0\n")
+
+@test("two names bound by every alternative, in different orders and positions")
+orp_two_names()
+    orp_prints(orp_shape() + raw"""
+        swap(s: Shape) -> int = s match
+            Rect(a, b) | Circle(a @ b) -> a * 10 + b
+            _ -> 0
+
+        print(swap(Rect(1, 2)), swap(Circle(3)), swap(Dot))
+        """, "12 33 0\n")
+
+@test("the same name at different depths of the alternatives")
+orp_different_depths()
+    orp_prints(raw"""
+        enum Inner
+            Val(v: int)
+            Nil
+
+        enum Outer
+            Wrap(i: Inner)
+            Flat(v: int)
+            Pair(t: (int, int))
+
+        get(o: Outer) -> int = o match
+            Wrap(Val(v)) | Flat(v) | Pair((_, v)) -> v
+            Wrap(Nil) -> -1
+
+        print(get(Wrap(Val(1))), get(Flat(2)), get(Pair((3, 4))), get(Wrap(Nil)))
+        """, "1 2 4 -1\n")
+
+@test("a generic payload binds at the type parameter, once per instantiation")
+orp_generic_payload()
+    orp_prints(raw"""
+        either[T](r: Result[T, T]) -> T = r match
+            Ok(v) | Err(v) -> v
+
+        val a: Result[int, int] = Err(9)
+        val b: Result[string, string] = Ok("s")
+
+        print(either(a), either(b))
+        """, "9 s\n")
+
+@test("a guard sees the binding, and is asked again for the next alternative when it says no")
+orp_guard_per_alternative()
+    orp_prints(orp_shape() + raw"""
+        big(s: Shape) -> string = s match
+            Rect(v, _) | Rect(_, v) if v > 100 -> s"big $v"
+            Circle(v) | Square(v) if v > 1 -> s"round $v"
+            _ -> "small"
+
+        print(big(Rect(200, 3)), big(Rect(3, 200)), big(Rect(1, 2)), big(Circle(5)), big(Square(1)))
+        """, "big 200 big 200 small round 5 small\n")
+
+@test("a guard holding a closure is lowered once per alternative it is asked for")
+orp_guard_with_a_closure()
+    orp_prints(orp_shape() + raw"""
+        check(f: &Fn(int) -> bool, n: int) -> bool = f(n)
+
+        pick(s: Shape) -> int = s match
+            Rect(v, _) | Rect(_, v) if check((k: int) -> k > 10, v) -> v
+            _ -> 0
+
+        print(pick(Rect(1, 20)), pick(Rect(30, 1)), pick(Rect(1, 2)))
+        """, "20 30 0\n")
+
+@test("a closure in the body captures the name whichever alternative bound it")
+orp_closure_captures()
+    orp_prints(orp_shape() + raw"""
+        scale(s: Shape) -> &Fn(int) -> int = s match
+            Circle(r) | Square(r) -> (x: int) -> r * x
+            _ -> (x: int) -> x
+
+        print(scale(Circle(3))(2), scale(Square(4))(2), scale(Dot)(2))
+        """, "6 8 2\n")
+
+@test("a Drop payload bound in each alternative is held once and released once")
+orp_drop_payload()
+    orp_prints(raw"""
+        struct Thing
+            name: string
+
+        impl Drop for Thing
+            drop(self)
+                print(s"drop ${self.name}")
+
+        enum Holder
+            One(t: &Thing)
+            Two(n: int, t: &Thing)
+            Zero
+
+        name_of(h: Holder) -> string = h match
+            One(t) | Two(_, t) -> t.name
+            Zero -> "-"
+
+        long(h: Holder) -> string = h match
+            One(t) | Two(_, t) if t.name.len > 2 -> s"long ${t.name}"
+            _ -> "short"
+
+        keep(h: Holder) -> &Thing = h match
+            One(t) | Two(_, t) -> t
+            Zero -> Thing("z")
+
+        main()
+            print(name_of(One(Thing("a"))))
+            print(name_of(Two(1, Thing("b"))))
+            print(long(Two(1, Thing("cc"))))
+            print(long(One(Thing("ddd"))))
+            val k = keep(Two(2, Thing("e")))
+            print(s"kept ${k.name}")
+        """, "a\ndrop a\nb\ndrop b\nshort\ndrop cc\nlong ddd\ndrop ddd\nkept e\ndrop e\n")
+
+@test("'is' in an 'if' and a 'while' binds the name whichever alternative matched")
+orp_is_tests()
+    orp_prints(orp_shape() + raw"""
+        val s = Square(11)
+
+        if s is Circle(r) | Square(r) then print(s"is $r")
+        if s is Rect(_, _) | Dot then print("no") else print("not")
+
+        val xs = [Circle(1), Square(2), Rect(3, 4), Dot]
+        var k = 0
+
+        while xs[k] is Circle(r) | Square(r) | Rect(_, r)
+            print(s"w $r")
+            k += 1
+        """, "is 11\nnot\nw 1\nw 2\nw 4\n")
+
+@test("an '@' in each alternative binds the whole value whichever matched")
+orp_at_in_each()
+    orp_prints(orp_shape() + raw"""
+        val s = Rect(5, 2)
+
+        s match
+            w @ Circle(v) | w @ Rect(_, v) -> print(v, w is Rect(_, _))
+            _ -> print(0)
+        """, "2 true\n")
+
+@test("the compile-time evaluator binds and guards alternatives as the program does")
+orp_const_eval()
+    orp_prints(orp_shape() + raw"""
+        const pick(s: Shape) -> int = s match
+            Rect(v, _) | Rect(_, v) if v > 10 -> v
+            Circle(v) | Square(v) -> v
+            _ -> 0
+
+        const a: int = pick(Rect(1, 20))
+        const b: int = pick(Square(7))
+        const c: int = pick(Rect(1, 2))
+
+        print(a, b, c)
+        """, "20 7 0\n")
+
+// -- alternatives inside a pattern ----------------------------------------------------------------
+
+@test("an alternative inside a variant's parentheses, with coverage counted per alternative")
+orp_nested_in_a_variant()
+    orp_prints(raw"""
+        small(o: Option[int]) -> string = o match
+            Some(1 | 2) -> "one or two"
+            Some(_) -> "other"
+            None -> "none"
+
+        print(small(Some(1)), small(Some(2)), small(Some(3)), small(None))
+        """, "one or two one or two other none\n")
+
+@test("an alternative inside a tuple's part and a parenthesised group under '@'")
+orp_nested_in_a_tuple()
+    orp_prints(raw"""
+        grid(t: (int, char)) -> string = t match
+            (0 | 1, 'a' | 'b') -> "corner"
+            (n @ (5 | 6), _) -> s"edge $n"
+            _ -> "inside"
+
+        print(grid((1, 'b')), grid((0, 'a')), grid((6, 'z')), grid((1, 'c')))
+        """, "corner corner edge 6 inside\n")
+
+@test("an alternative inside a struct field, by name and in the short form beside it")
+orp_nested_in_a_struct()
+    orp_prints(raw"""
+        struct Point
+            x: int
+            y: int
+
+        on_axis(p: Point) -> string = p match
+            Point { x: 0 | 1, y } -> s"near $y"
+            Point { x, y: 0 } | Point { x: 9, y: x } -> s"edge $x"
+            _ -> "off"
+
+        print(on_axis(Point(1, 5)), on_axis(Point(7, 0)), on_axis(Point(9, 6)), on_axis(Point(3, 4)))
+        """, "near 5 edge 7 edge 6 off\n")
+
+@test("binding alternatives nested inside a variant")
+orp_nested_binding()
+    orp_prints(orp_shape() + raw"""
+        radius(o: Option[Shape]) -> int = o match
+            Some(Circle(r) | Square(r)) -> r
+            Some(Rect(_, _) | Dot) | None -> 0
+
+        print(radius(Some(Square(7))), radius(Some(Circle(2))), radius(Some(Dot)), radius(None))
+        """, "7 2 0 0\n")
+
+@test("nested alternatives across lines inside the parentheses")
+orp_nested_across_lines()
+    orp_prints(raw"""
+        f(o: Option[int]) -> int = o match
+            Some(1
+                 | 2
+                 | 3) -> 1
+            _ -> 0
+
+        print(f(Some(3)), f(Some(4)))
+        """, "1 0\n")
+
+@test("alternatives inside an 'is' test")
+orp_nested_in_is()
+    orp_prints(raw"""
+        val o = Some(2)
+
+        if o is Some(1 | 2) then print("yes") else print("no")
+        if o is not Some(3 | 4) then print("outside")
+        """, "yes\noutside\n")
+
+@test("nested alternatives that cover the rest of a payload make the match exhaustive")
+orp_nested_exhaustive()
+    orp_prints(raw"""
+        f(o: Option[bool]) -> int = o match
+            Some(true | false) -> 1
+            None -> 0
+
+        print(f(Some(false)), f(None))
+        """, "1 0\n")
+
+@test("and nested alternatives that leave a payload uncovered are reported as missing")
+orp_nested_not_exhaustive()
+    orp_refused(raw"""
+        f(o: Option[int]) -> int = o match
+            Some(1 | 2) -> 1
+            None -> 0
+
+        print(f(None))
+        """, "match on 'Option[int]' is not exhaustive; missing Some")
+
+// -- the lowering ---------------------------------------------------------------------------------
+
+private orp_ir(text: string) -> string
+    val parsed = parse(source_of("t.sysl", text))
+
+    if !parsed.ok() then return parsed.first().message
+
+    var units: Buf[Program] = buf()
+
+    std_root() match
+        Err(_) -> return ""
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> return ""
+            Ok(lib) ->
+                for item in lib
+                    units.push(item)
+
+    units.push(parsed.program)
+
+    val done = analyze_bodies(units, host_target())
+
+    if !done.reported.is_empty() then return done.reported.at(0).diag.message
+
+    val whole = program_of(done, "")
+    val promotions = post_analysis_checks(done.an, whole, buf())
+    val kept = prune(strip_tests(whole), program_own(units))
+    val lowered = codegen_with_gaps(kept, host_target(), promotions)
+
+    ir_print_module(lowered.0)
+end orp_ir
+
+@test("every alternative writes the arm's one slot for a name")
+orp_one_slot()
+    if !orp_ready() then return
+
+    val ir = orp_ir(orp_shape() + raw"""
+        size(s: Shape) -> int = s match
+            Circle(sz) | Square(sz) | Rect(sz, _) -> sz
+            Dot -> 0
+
+        print(size(Dot))
+        """)
+
+    // One slot, written by three stores -- one in each alternative's block -- and the blocks meeting
+    // at one label before the body.
+    assert_eq(ir.count_of("%sz.addr = alloca"), 1)
+    assert_eq(ir.count_of(", ptr %sz.addr"), 4)
+    assert(ir.count_of("match.bound") >= 1, ir)
+
+// -- the refusals ---------------------------------------------------------------------------------
+
+@test("a name one alternative binds and another does not, in either order")
+orp_missing_name()
+    orp_refused(orp_shape() + raw"""
+        f(s: Shape) -> int = s match
+            Circle(r) | Dot -> r
+            _ -> 0
+
+        print(f(Dot))
+        """, orp_missing("r"))
+    orp_refused(orp_shape() + raw"""
+        f(s: Shape) -> int = s match
+            Dot | Circle(r) -> r
+            _ -> 0
+
+        print(f(Dot))
+        """, orp_missing("r"))
+
+@test("a second name in a later alternative only")
+orp_extra_name()
+    orp_refused(orp_shape() + raw"""
+        f(s: Shape) -> int = s match
+            Circle(a) | Rect(a, b) -> a
+            _ -> 0
+
+        print(f(Dot))
+        """, orp_missing("b"))
+
+@test("a name missing from a nested alternative")
+orp_missing_nested()
+    orp_refused(raw"""
+        f(o: Option[int]) -> int = o match
+            Some(1 | x) -> x
+            _ -> 0
+
+        print(f(None))
+        """, orp_missing("x"))
+
+@test("a name missing from an 'is' test's alternative")
+orp_missing_in_is()
+    orp_refused(orp_shape() + raw"""
+        val s = Dot
+
+        if s is Dot | Circle(r) then print(r)
+        """, orp_missing("r"))
+
+@test("a name bound at two types")
+orp_type_mismatch()
+    orp_refused(raw"""
+        enum Cell
+            Num(v: int)
+            Text(v: string)
+
+        show(c: Cell) -> string = c match
+            Num(v) | Text(v) -> "$v"
+
+        print(show(Num(1)))
+        """, "'v' is bound as int by one alternative joined by '|' and as string by another — the arm " +
+             "reads one name whichever matched, so it has one type")
+
+@test("a name bound at two widths of integer is two types")
+orp_width_mismatch()
+    orp_refused(raw"""
+        enum Cell
+            Small(v: i32)
+            Big(v: i64)
+
+        f(c: Cell) -> i64 = c match
+            Small(v) | Big(v) -> 1
+
+        print(f(Big(1)))
+        """, "'v' is bound as int by one alternative joined by '|' and as long by another")
+
+@test("a name bound twice within one alternative is still refused")
+orp_twice_in_one_alternative()
+    orp_refused(orp_shape() + raw"""
+        f(s: Shape) -> int = s match
+            Rect(v, v) | Circle(v) -> v
+            _ -> 0
+
+        print(f(Dot))
+        """, "'v' is bound twice in one pattern")
+
+@test("a binding under 'is not' is refused with alternatives as without")
+orp_negated()
+    orp_refused(orp_shape() + raw"""
+        val s = Dot
+
+        if s is not Circle(r) | Square(r) then print(0)
+        """, "a pattern under 'is not' cannot bind a name")
+
+@test("a '|' in a 'val' or 'for' pattern is refused, with no other arm to try")
+orp_in_a_binding()
+    orp_refused(raw"""
+        val o = Some(1)
+        val Some(1 | 2) = o
+
+        print(o)
+        """, "alternatives joined by '|' are written in a 'match' arm or an 'is' test — a binding " +
+             "takes one shape of a value apart")
+    orp_refused(raw"""
+        for (1 | 2, b) in [(1, 2)]
+            print(b)
+        """, "alternatives joined by '|' are written in a 'match' arm or an 'is' test")
+
+@test("a pattern that spreads past the limit is refused rather than read")
+orp_spread_limit()
+    orp_refused(raw"""
+        f(t: (int, int, int, int, int, int, int, int, int, int, int)) -> int = t match
+            (1 | 2, 1 | 2, 1 | 2, 1 | 2, 1 | 2, 1 | 2, 1 | 2, 1 | 2, 1 | 2, 1 | 2, 1 | 2) -> 1
+            _ -> 0
+
+        print(f((0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)))
+        """, "this pattern spreads into more than 1024 alternatives")
+
+// -- nested alternatives meet dead arms -----------------------------------------------------------
+//
+// The spreading feeds the dead-pattern check (`reference/patterns.md § Dead arms`), which sees the
+// alternatives the parser made. What it reports is still what the user wrote: the repeated `1` of
+// `Some(1 | 1)`, never a `Some(1)` nobody typed, and a written alternative only when every row it
+// was spread into is dead.
+
+// What the compiler says about a program, as the command line prints it; empty for a clean one.
+private orp_said(text: string) -> string
+    val root = make_temp_dir("sysl-orp").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    val out = emit_llvm_text(src, None) match
+        Err(why) -> why.message
+        Ok(made) -> if made.report.is_empty() then "" else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end orp_said
+
+// The one complaint a program earns: its whole message, and the `line:col` it is anchored at.
+private orp_dead_at(text: string, shown: string, by: string, at: string)
+    if !orp_ready() then return
+
+    val said = orp_said(text)
+    val head = s"error: unreachable pattern '$shown': every value it matches is already matched by $by\n"
+
+    said.index_of(head) match
+        None -> assert(false, said)
+        Some(i) ->
+            val rest = said[i + head.bytes.len..<said.bytes.len]
+            val place = rest.index_of("\n") match
+                Some(n) -> rest[0..<n]
+                None -> rest
+
+            assert(place.ends_with(s"main.sysl:$at"), said)
+
+    var rest = said
+    var n = 0
+
+    loop
+        rest.index_of("main.sysl:") match
+            None -> break
+            Some(k) ->
+                n += 1
+                rest = rest[k + 10..<rest.bytes.len]
+
+    assert_eq(n, 1, said)
+end orp_dead_at
+
+private orp_clean(text: string)
+    if !orp_ready() then return
+
+    assert_eq(orp_said(text), "")
+
+@test("a value repeated inside a variant's parentheses is dead at the repeat, not a spread arm")
+orp_dead_repeat_in_a_variant()
+    orp_dead_at(raw"""
+        f(o: Option[int]) -> int = o match
+            Some(1 | 1) -> 1
+            _ -> 0
+        """, "1", "an earlier alternative of this arm", "2:14")
+
+@test("a value repeated inside an 'is' test is dead at the repeat")
+orp_dead_repeat_in_is()
+    orp_dead_at("f(o: Option[int]) -> bool = o is Some(1 | 1)\n",
+                "1", "an earlier alternative of this arm", "1:43")
+
+@test("a repeat in one part of a tuple is reported once, however many rows it was spread into")
+orp_dead_repeat_in_a_tuple()
+    orp_dead_at(raw"""
+        f(t: (int, int)) -> int = t match
+            (1 | 2, 3 | 3) -> 1
+            _ -> 0
+        """, "3", "an earlier alternative of this arm", "2:17")
+
+@test("alternatives in two parts with no repeat are not dead, in a match and an 'is' test")
+orp_no_dead_across_parts()
+    val two = "enum E\n    A\n    B\n\n"
+    val three = "enum E\n    A\n    B\n    C\n\n"
+
+    orp_clean(two + "f(t: (E, E)) -> int = t match\n    (A | B, A | B) -> 1\n")
+    orp_clean(three + "f(t: (E, E)) -> bool = t is (A | B, A | B)\n")
+
+@test("a row covered while every written alternative still has a row that runs is not dead")
+orp_no_dead_partial_row()
+    orp_clean(raw"""
+        f(t: (int, int)) -> int = t match
+            (2, 4) -> 0
+            (1 | 2, 3 | 4) -> 1
+            _ -> 2
+        """)
+
+@test("a whole nested pattern an earlier arm covers is reported once, as written")
+orp_dead_whole_nested()
+    orp_dead_at(raw"""
+        f(o: Option[int]) -> int = o match
+            Some(_) -> 0
+            Some(1 | 2) -> 1
+            None -> 2
+        """, "Some(1 | 2)", "the arm on line 2", "3:5")
+
+@test("an arm-level alternative covered by a nested one before it is dead")
+orp_dead_after_nested()
+    orp_dead_at(raw"""
+        f(o: Option[int]) -> int = o match
+            Some(1 | 2) | Some(2) -> 1
+            _ -> 0
+        """, "Some(2)", "an earlier alternative of this arm", "2:19")
+
+@test("a binding alternative an earlier arm covers is dead, at the top level and nested")
+orp_dead_binding_alternative()
+    val e = "enum E\n    A(v: int)\n    B(v: int)\n    C\n\n"
+
+    orp_dead_at(e + "f(e: E) -> int = e match\n    B(_) -> 0\n    A(x) | B(x) -> x\n    C -> 9\n",
+                "B(x)", "the arm on line 7", "8:12")
+    orp_dead_at(e + "f(o: Option[E]) -> int = o match\n    Some(B(_)) -> 0\n    Some(A(x) | B(x)) -> x\n" +
+                "    _ -> 9\n",
+                "B(x)", "the arm on line 7", "8:17")
+
+@test("a guarded arm with nested alternatives covers nothing below it")
+orp_guard_covers_nothing()
+    orp_clean(raw"""
+        f(o: Option[int], c: bool) -> int = o match
+            Some(1 | 2) if c -> 1
+            Some(2) -> 2
+            Some(1) -> 3
+            _ -> 0
+        """)
+
+@test("a guarded arm's binding alternatives are asked apart, so one covering the next is not dead")
+orp_guarded_binding_alternatives_apart()
+    val e = "enum E\n    A(v: int)\n    B(v: int)\n    C\n\n"
+
+    orp_clean(raw"""
+        f(t: (int, int)) -> int = t match
+            (x, _) | (_, x) if x == 42 -> 1
+            _ -> 0
+        """)
+    orp_clean(e + "f(o: Option[E]) -> int = o match\n    Some(A(x) | A(x)) if x > 1 -> x\n    _ -> 0\n")
+
+    // An earlier unguarded arm still covers a guarded arm's alternative.
+    orp_dead_at(e + "f(e: E) -> int = e match\n    B(_) -> 0\n    A(x) | B(x) if x > 1 -> x\n    _ -> 9\n",
+                "B(x)", "the arm on line 7", "8:12")
+
+@test("the guard re-asked for the second alternative is what lets it run")
+orp_guarded_second_alternative_runs()
+    orp_prints(raw"""
+        f(t: (int, int)) -> int = t match
+            (x, _) | (_, x) if x == 42 -> 1
+            _ -> 0
+
+        print(f((1, 42)), f((42, 1)), f((1, 2)))
+        """, "1 1 0\n")
+
+@test("one part in parentheses with no '|' is still not a tuple")
+orp_one_part_still_refused()
+    orp_refused(raw"""
+        f(o: Option[int]) -> int = o match
+            Some((1)) -> 1
+            _ -> 0
+
+        print(f(None))
+        """, "a tuple pattern matches two or more parts")

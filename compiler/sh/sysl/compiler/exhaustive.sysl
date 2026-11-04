@@ -557,13 +557,23 @@ end DeadPattern
 // The patterns of a match's arms that can never match, in source order.
 //
 // An alternative is read against every alternative of the unguarded arms above it and the
-// alternatives before it in its own arm -- a guard is tested after the pattern, so it cannot keep
-// one alternative of its own arm from shadowing the next. A guarded arm above covers nothing.
+// alternatives before it in its own arm. A guarded arm above covers nothing.
+//
+// Within a guarded arm the earlier alternatives cover the later ones only when the arm binds no
+// name. The guard is asked again for each alternative that matches, with that alternative's
+// bindings, so in `Rect(v, _) | Rect(_, v) if v > 10` the second alternative runs whenever the
+// first one's `v` failed the guard -- the reference's `(x, _) | (_, x) if x == 42`. With nothing
+// bound the guard sees the same thing each time, so `Red | Red if b` is still dead at the second.
 dead_patterns(scrut: Type, arms: Buf[TArm], m: FoldMachine) -> Buf[DeadPattern]
     var out: Buf[DeadPattern] = buf()
 
     for i in 0..<arms.len()
         val arm = arms.at(i)
+        var apart = false
+
+        if arm.guard.is_some()
+            for alt in arm.patterns
+                if pattern_binds(alt) then apart = true
 
         for j in 0..<arm.patterns.len()
             var owners: Buf[usize] = buf()
@@ -575,9 +585,10 @@ dead_patterns(scrut: Type, arms: Buf[TArm], m: FoldMachine) -> Buf[DeadPattern]
                         owners.push(k)
                         pats.push(alt)
 
-            for k in 0..<j
-                owners.push(i)
-                pats.push(arm.patterns.at(k))
+            if !apart
+                for k in 0..<j
+                    owners.push(i)
+                    pats.push(arm.patterns.at(k))
 
             if !useful_among(scrut, owners, pats, buf(), arm.patterns.at(j), m) then
                 out.push(DeadPattern(i, j, least_cover(scrut, owners, pats, arm.patterns.at(j), m)))
