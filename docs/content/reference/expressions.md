@@ -3151,7 +3151,16 @@ by the rule that a result is not a selector.
 
 A type becomes fully comparable by implementing **one** method, `lt`, and fully equatable by
 implementing **one**, `eq` — the compiler derives the rest: `a != b` is `!eq(a, b)`, `a > b` is
-`lt(b, a)`, `a <= b` is `!lt(b, a)`, `a >= b` is `!lt(a, b)`.
+`lt(b, a)`, `a <= b` is `le(a, b)` and `a >= b` is `le(b, a)`. `Ord` carries `le` with a default of
+`!lt(b, a)`, which is right for any type that promised a total order and is all a hand-written
+`impl Ord` needs.
+
+A type with **unordered** values replaces it. A tuple, a slice, an array and a type that `derives
+Ord` compare lexicographically, and a position whose two values are neither less, greater nor equal
+(a float `NaN` on either side) makes `<`, `<=`, `>` and `>=` all `false`, exactly as for the scalar
+and as in Rust's derived `PartialOrd`; a position that decides before the `NaN` is reached still
+decides. `-0.0` equals `0.0`, so `<=` and `>=` are both `true` between them. A field's own `<=` is
+asked, so the rule holds through nested products.
 
 Two of those **swap their operands**, and the swap is of the two *values*, applied at the call — so
 `a > b` still evaluates `a` before `b`, and the derivation affects neither evaluation order nor the
