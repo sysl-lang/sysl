@@ -2371,11 +2371,11 @@ that looks like ordinary code and leaves a clause quietly false, is refused.
 
 A generic struct carries clauses like any other struct, and they are checked at every place the list
 above names. A clause is a generic body over the struct's own parameters, so what it may do with a
-`T` is what the struct's bounds allow: a comparison needs `Ord`, and is checked once, where the
+`T` is what the struct's bounds allow: a comparison needs `PartialOrd`, and is checked once, where the
 struct is declared, rather than once for every type it is instantiated at:
 
 ```sysl
-struct Span[T: Ord]
+struct Span[T: PartialOrd]
     lo: T
     hi: T
     invariant lo <= hi

@@ -385,7 +385,20 @@ obg_the_reduction_on_a_board()
     val root = replace_all(make_temp_dir("sysl-obg-thumb").unwrap(), "//", "/")
 
     make_dir_all(root).unwrap()
+    // The archive publishes only its exports, so the call through the object is made from one: an
+    // archive whose program exports nothing has nothing the C link can reach, and keeps nothing. The
+    // export sits in a file of its own, since a function beside `main.sysl`'s statements is nested.
     write_text(s"$root/main.sysl", obg_reduction()).unwrap()
+    write_text(s"$root/api.sysl", raw"""
+        @export("queue_put")
+        queue_put() -> u32
+            var q: Queue[2] = Queue([0; 2])
+            var b = Board(40)
+            val o: *Object = &q
+            val port: *Port = &b
+            o.put(port, 1)
+        end queue_put
+        """).unwrap()
     write_text(s"$root/sysl.hocon", "package { name = \"probe\", version = \"0.1.0\" }\n").unwrap()
 
     val got = obg_cli(["sysl", "build-c", root, "--target", "thumb-freestanding-softfp", "-o",
@@ -399,8 +412,10 @@ obg_the_reduction_on_a_board()
 
     capture(tool, [s"$root/app.a"], "", [], true) match
         Ok(out) ->
-            assert(out.text.contains(" T Queue.send.c2.Port\n"), out.text)
-            assert(!out.text.contains(" U Queue.send"), out.text)
+            // The instantiation is the archive's own, internal to it: never left for the link to find.
+            assert(out.text.contains(" T queue_put\n"), out.text)
+            assert(!out.text.contains(" U Queue."), out.text)
+            assert(!out.text.contains(" T Queue.send.c2.Port\n"), out.text)
         Err(_) -> assert(false, "arm-none-eabi-nm could not be run")
 
     remove_dir_all(root).unwrap_or(())

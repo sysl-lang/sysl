@@ -134,6 +134,24 @@ hoist_impl(a: &Analysis, im: Impl) -> Impl
             if closed.is_some() && core_family_provides(spelling.unwrap(), closed.unwrap()) then
                 provides = true
 
+    // **The `PartialOrd` block an `impl Ord` was filed as** says nothing of its own where the type
+    // already has the comparisons: the `Ord` block it came from is refused for that, or -- for a
+    // float -- below, and once is what the program is told.
+    if written.is_empty() && provides && im.joined && !block.derived && spelling == Some("PartialOrd") then
+        return Impl(block, span, scope, im.joined)
+
+    // **A float cannot be made `Ord`**: its comparisons are the compiler's, and a NaN leaves them
+    // partial whatever a block promises, so the promise would be false of the very `<` it covers.
+    val partial_builtin = core_builtin("PartialOrd", ty) && !core_builtin("Ord", ty)
+
+    if written.is_empty() && spelling == Some("Ord") && partial_builtin
+        a.fault(scope, span, s"'${home.label}' is only 'PartialOrd', and no block can make it 'Ord' " +
+                "— its comparisons are the compiler's, and a NaN leaves them unordered whatever is " +
+                "promised. Sort by its 'total_lt', or wrap it in a type of your own that orders " +
+                "every value")
+        return Impl(block, span, scope, im.joined)
+    end if
+
     if written.is_empty() && provides
         // **The one type reaching this that a program declared is a simple enum**, whose `Eq` the
         // compiler supplies for the reason it supplies the open integer family's: the value *is* its
@@ -404,6 +422,19 @@ hoist_impl(a: &Analysis, im: Impl) -> Impl
         a.tables.super_checks.push(SuperCheck(home.label, module_show(block.trait_name),
                                               resolve_bound(a, tscope, s.span, s, super_subst),
                                               subject, span, scope, ""))
+
+    // **A derived `Ord` asks it of every field**, since it promises the order its derived
+    // `PartialOrd` ladder gives is total, and one field that is only partially ordered -- a float --
+    // breaks that promise for the whole value. Held with the requirements, for their reason: the
+    // field's own `Ord` may be written below. A generic type's parameters carry the bound the clause
+    // gave them, so a field of type `T` asks nothing a use does not already check.
+    if block.derived && spelling.is_some() && spelling.unwrap() == "Ord"
+        val ord = plain_bound(key.unwrap(), buf())
+
+        for f in ordered_fields(subject)
+            a.tables.super_checks.push(SuperCheck(home.label, module_show(block.trait_name), ord, f.1,
+                                                  span, scope, FieldCheck + f.0))
+    end if
 
     // What the trait asked of each associated type is asked of the type this block supplied, with
     // `Self` in the bound standing for **that** type -- a bare `type W: Add` asks for an
@@ -767,10 +798,40 @@ check_impl_supers(a: &Analysis)
     for c in held
         if satisfies(a, c.sup, c.subject) then continue
 
+        if c.assoc.starts_with(FieldCheck)
+            // A field with no order at all is told so by the derived `PartialOrd`'s own body, at
+            // the comparison that cannot be made; saying it here as well would be one mistake twice.
+            val field = c.assoc[FieldCheck.len..]
+            val partial = catalog_key(a, "PartialOrd")
+
+            if partial.is_some() && satisfies(a, plain_bound(partial.unwrap(), buf()), c.subject) then
+                a.fault(c.scope, c.span, s"'${c.label}' cannot derive Ord: its field '$field' is " +
+                        s"${type_show(c.subject)}, which is only 'PartialOrd', so two of its values " +
+                        "may be neither less, greater nor equal. Derive 'PartialOrd' instead, or " +
+                        s"write 'impl Ord for ${c.label}' with an 'lt' that orders every value")
+            continue
+        end if
+
         if c.assoc != ""
             a.fault(c.scope, c.span, s"trait '${c.required}' asks that its associated type " +
                     s"'${c.assoc}' implement '${show_bound(a, c.sup, c.subject)}', and " +
                     s"${type_show(c.subject)} does not")
+            continue
+        end if
+
+        // **The required trait is implemented, and what the requirement asks of one of its associated
+        // types is not met** (`trait Scalar: Element[Real: Width]`) -- held at every `impl`, since a
+        // requirement has no call of its own to refuse at.
+        val open = if c.sup.bounded.is_empty() then None
+                   else if !satisfies(a, fixing_bound(c.sup.name, c.sup.args, c.sup.assocs), c.subject) then None
+                   else open_bound_unmet(a, c.sup, c.subject)
+
+        if open.is_some()
+            val (n, got, want) = open.unwrap()
+
+            a.fault(c.scope, c.span, s"trait '${c.required}' requires '${show_bound(a, c.sup, c.subject)}', " +
+                    s"which asks that its associated type '$n' implement '${show_bound(a, want, got)}', " +
+                    s"and ${type_show(c.subject)} supplies ${type_show(got)} for it, which does not")
             continue
         end if
 
@@ -790,6 +851,28 @@ check_impl_supers(a: &Analysis)
         a.fault(c.scope, c.span, s"'${c.required}' requires '$shown', so '${c.label}' has to " +
                 s"implement that too — $write")
 end check_impl_supers
+
+// What a held check's `assoc` starts with where it asks a derived `Ord`'s field rather than a
+// required trait: the field's name follows. A space opens it, which no associated type's name holds.
+const FieldCheck: string = " field "
+
+// Every field a derived order compares, named as a reader finds it: a struct's own, and each data
+// enum variant's as `Variant.field`. A simple enum has none, being its discriminant.
+private ordered_fields(t: Type) -> Buf[(string, Type)]
+    var out: Buf[(string, Type)] = buf()
+
+    underlying(t) match
+        Struct(d) ->
+            for f in d.fields
+                out.push(f)
+        Enum(d) ->
+            for v in d.variants
+                for f in v.fields
+                    out.push((s"${v.name}.${f.0}", f.1))
+        _ -> ()
+
+    out
+end ordered_fields
 
 // Whether each block marked `override` has something to override (`reference/traits.md § override —
 // when the overlap is deliberate`), once every `impl` is registered.

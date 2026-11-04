@@ -8,9 +8,11 @@ module sysl
  * and which built-in types are members. That part cannot be written in sysl at all, because the
  * open `iN` / `uN` families have no finite list of scalars an `impl` could be written for.
  *
- * **Each trait requires exactly one method**, and that is the point. Implementing a comparison
- * means writing `lt` and nothing else, so there is no way for four functions to disagree with each
- * other: `a > b` is `lt(b, a)`, `a <= b` is `!lt(b, a)`, and the compiler derives the rest.
+ * **Each trait requires as little as its meaning allows.** A total order is one method: an
+ * `impl Ord` writes `lt` and nothing else, and `a > b` is `lt(b, a)` while `a <= b` is `le(a, b)`,
+ * which a total order answers as `!lt(b, a)`. A *partial* order -- a float's, where a NaN is
+ * unordered with everything -- cannot be read off `lt` alone, since two values neither less than the
+ * other may still not be equal, so `PartialOrd` written by hand states `le` as well.
  *
  * The ten binary traits take `[Rhs = Self, Out = Self]` so that an implementation may accept an
  * operand of another type and yield a third, while the overwhelmingly common case -- a type closed
@@ -101,15 +103,32 @@ trait Eq
             true
     end eq
 
-trait Ord
+/** An order that may leave two values **unordered**: `<`, `>`, `<=` and `>=` are all false between
+ * them. A float is the type that needs it, since a NaN is neither less than, greater than nor equal
+ * to any value, itself included -- so a float is `PartialOrd` and not `Ord`.
+ *
+ * `<` and `>` are `lt`, the second with its operands exchanged, and `<=` and `>=` are `le` the same
+ * way. Both are stated because neither follows from the other once values may be unordered:
+ * `!(b < a)` is true of a NaN and a number, and `a <= b` is not.
+ *
+ * **An `impl Ord` writing `lt` alone is this trait's implementation as well**, with `le` the
+ * default below -- which is right for a total order and only for one. A block written for this
+ * trait by hand is held to writing `le` itself, so that no partial order answers with the total
+ * order's rule by omission.
+ */
+trait PartialOrd
     lt(self, rhs: Self) -> bool
 
-    /** What `derives Ord` writes: lexicographic, first field first, as a ladder -- deciding a
-     * position takes two comparisons, this one is less or it is greater or the two agree and the
-     * next field decides, and all-tied ends `false`. A data enum orders by variant first, in
-     * declaration order, and then field by field within the variant; a simple enum is its
+    le(self, rhs: Self) -> bool = !rhs.lt(self)
+
+    /** What `derives PartialOrd` writes, and `derives Ord` with it: lexicographic, first field
+     * first, as a ladder -- this field is less, or it is not at most the other (greater, or
+     * unordered with it) and the answer is `false`, or the two are equal and the next field decides.
+     * All-tied ends `false`. Testing "not at most" rather than "greater" is what makes a NaN field
+     * decide the comparison rather than be passed over as a tie. A data enum orders by variant
+     * first, in declaration order, and then field by field within the variant; a simple enum is its
      * discriminant, so its order is the discriminants'. A struct holding an anonymous `struct` or
-     * `union` block is refused at its `derives`: the block has no `Ord`.
+     * `union` block is refused at its `derives`: the block has no order.
      */
     derive[T] lt(self: T, rhs: T) -> bool
         if const T::Kind == Kind.SimpleEnum
@@ -131,7 +150,7 @@ trait Ord
 
                     for const f in c::Fields
                         if a.(f) < b.(f) then return true
-                        if b.(f) < a.(f) then return false
+                        if !(a.(f) <= b.(f)) then return false
                 end if
 
             false
@@ -149,10 +168,58 @@ trait Ord
 
             for const f in T::Fields
                 if self.(f) < rhs.(f) then return true
-                if rhs.(f) < self.(f) then return false
+                if !(self.(f) <= rhs.(f)) then return false
 
             false
     end lt
+
+    /** The same ladder as `lt`, ending `true` when every field ties: two values that agree
+     * everywhere are each at most the other. */
+    derive[T] le(self: T, rhs: T) -> bool
+        if const T::Kind == Kind.SimpleEnum
+            int(self) <= int(rhs)
+        elif const T::Kind == Kind.DataEnum
+            var l: usize = 0
+            var r: usize = 0
+
+            for const c in T::Variants
+                if self is c then l = c.index
+                if rhs is c then r = c.index
+
+            if l != r then return l < r
+
+            for const c in T::Variants
+                if self is c
+                    val a = self.(c)
+                    val b = rhs.(c)
+
+                    for const f in c::Fields
+                        if a.(f) < b.(f) then return true
+                        if !(a.(f) <= b.(f)) then return false
+                end if
+
+            true
+        else
+            for const f in T::Fields
+                if self.(f) < rhs.(f) then return true
+                if !(self.(f) <= rhs.(f)) then return false
+
+            true
+    end le
+
+/** A **total** order: every two values compare, so of `a < b`, `a == b` and `a > b` exactly one
+ * holds, and `a <= b` is `!(b < a)`. It declares nothing of its own -- the comparisons are
+ * `PartialOrd`'s -- and is the promise a sort, a search, a heap and `sysl.math.max` need, since each
+ * of those goes wrong on a pair that is not ordered.
+ *
+ * **`impl Ord for T` with `lt` in it is the whole implementation**: the compiler files the block's
+ * `lt` as `T`'s `PartialOrd`, with `le` answered as `!rhs.lt(self)`, which is the one reading a
+ * total order allows. An empty `impl Ord for T` is the promise alone, for a type whose `PartialOrd`
+ * is written or derived separately. `derives Ord` derives `PartialOrd` and refuses a field whose
+ * type is not `Ord` itself -- a float above all -- naming it.
+ */
+trait Ord: PartialOrd
+end Ord
 
 // A tuple is comparable, hashable and printable exactly when its parts are, which is what these
 // rows say: the membership is *structural*, so nothing has to be written per tuple type.
@@ -171,19 +238,33 @@ impl[..A: Eq] Eq for (..A)
         true
 
 /** Lexicographic, and written as a ladder rather than as `<` on each part in turn because deciding a
- * position takes *two* comparisons: this one is less, or it is greater, or the two agree and the
- * next position decides. Every position runs the same ladder and all-tied ends `false` -- a tuple is
- * not less than one it agrees with everywhere. Written per arity this needed a last position that
- * ended with a bare `<`, having no next position to fall through to; the loop has no such case.
+ * position takes *two* comparisons: this one is less, or it is not at most the other (greater, or
+ * unordered with it -- a NaN part) and the answer is decided, or the two agree and the next position
+ * decides. Every position runs the same ladder; all-tied ends `false` for `lt` and `true` for `le`.
+ * Written per arity this needed a last position that ended with a bare `<`, having no next position
+ * to fall through to; the loop has no such case.
+ *
+ * A tuple is partially ordered when its parts are, and **totally ordered exactly when every part
+ * is** -- so `(int, string)` is `Ord` and `(real, int)` is only `PartialOrd`.
  */
-impl[..A: Ord] Ord for (..A)
+impl[..A: PartialOrd] PartialOrd for (..A)
     lt(self, rhs: Self) -> bool
         for const i in 0..<A.len
             if self.i < rhs.i then return true
-            if rhs.i < self.i then return false
+            if !(self.i <= rhs.i) then return false
 
         false
     end lt
+
+    le(self, rhs: Self) -> bool
+        for const i in 0..<A.len
+            if self.i < rhs.i then return true
+            if !(self.i <= rhs.i) then return false
+
+        true
+    end le
+
+impl[..A: Ord] Ord for (..A)
 
 /** Mixed with the same FNV prime the string hash uses, so that the parts' order matters -- `(1, 2)`
  * and `(2, 1)` are different keys, and a plain XOR would make them the same one. The fold starts at
@@ -209,8 +290,11 @@ impl[..A: Hash] Hash for (..A)
 impl Eq for unit
     eq(self, rhs: Self) -> bool = true
 
-impl Ord for unit
+impl PartialOrd for unit
     lt(self, rhs: Self) -> bool = false
+    le(self, rhs: Self) -> bool = true
+
+impl Ord for unit
 
 impl Hash for unit
     hash(self) -> u64 = hash_u64(0)
@@ -231,8 +315,11 @@ impl Debug for unit
 impl Eq for never
     eq(self, rhs: Self) -> bool = self
 
-impl Ord for never
+impl PartialOrd for never
     lt(self, rhs: Self) -> bool = self
+    le(self, rhs: Self) -> bool = self
+
+impl Ord for never
 
 impl Hash for never
     hash(self) -> u64 = self
@@ -344,26 +431,42 @@ impl[const N: usize, T: Eq] Eq for [N]T
  * its parts.
  *
  * The ladder is the tuple's and is written for the same reason: deciding a position takes **two**
- * comparisons, since this one is less, or it is greater, or the two agree and the next position
- * decides. All-tied then falls through to the lengths, so `[1, 2]` is less than `[1, 2, 3]` and two
- * equal sequences are not less than each other.
+ * comparisons, since this one is less, or it is not at most the other (greater, or unordered with
+ * it), or the two agree and the next position decides. All-tied then falls through to the lengths,
+ * so `[1, 2]` is less than `[1, 2, 3]` and two equal sequences are each at most the other. A slice
+ * is `Ord` exactly when its element is, and `PartialOrd` when its element is only that.
  */
-impl[T: Ord] Ord for []T
+impl[T: PartialOrd] PartialOrd for []T
     lt(self, rhs: Self) -> bool
         val n = if self.len < rhs.len then self.len else rhs.len
 
         for i in 0..<n
             if self[i] < rhs[i] then return true
-            if rhs[i] < self[i] then return false
+            if !(self[i] <= rhs[i]) then return false
 
         self.len < rhs.len
     end lt
 
+    le(self, rhs: Self) -> bool
+        val n = if self.len < rhs.len then self.len else rhs.len
+
+        for i in 0..<n
+            if self[i] < rhs[i] then return true
+            if !(self[i] <= rhs[i]) then return false
+
+        self.len <= rhs.len
+    end le
+
+impl[T: Ord] Ord for []T
+
 /** Every array of an orderable element, delegating to the slice exactly as `Eq` does. Two arrays of
  * one type have one length, so the length test the slice ends on can never decide here.
  */
-impl[const N: usize, T: Ord] Ord for [N]T
+impl[const N: usize, T: PartialOrd] PartialOrd for [N]T
     lt(self, rhs: Self) -> bool = self[..] < rhs[..]
+    le(self, rhs: Self) -> bool = self[..] <= rhs[..]
+
+impl[const N: usize, T: Ord] Ord for [N]T
 
 /** Mixed with the same FNV prime the tuple's hash uses, so that position matters: `[1, 2]` and
  * `[2, 1]` are different keys, where a plain XOR would make them one.

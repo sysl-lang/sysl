@@ -1,0 +1,231 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// `<=`, `>=`, `<` and `>` on a derived product, a tuple, a slice and an array whose parts include a
+// float `NaN` answer what the scalar answers and what Rust's derived `PartialOrd` answers: the first
+// position that is not equal decides, and a position holding an unordered pair makes all four false.
+// A comparison that negated `lt` said `true` for `<=` and `>=` at once.
+
+private nlt_ready() -> bool
+    std_root() match
+        Err(_) ->
+            print("skipped: the standard module's source is not on this machine")
+            return false
+        Ok(_) -> ()
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+
+    true
+end nlt_ready
+
+private nlt_ran(text: string) -> string
+    val root = make_temp_dir("sysl-nan-le").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end nlt_ran
+
+private nlt_prints(text: string, expected: string)
+    if !nlt_ready() then return
+
+    assert_eq(nlt_ran(text), expected)
+
+// Four answers in the order `<=`, `>=`, `<`, `>`, through the generic path and the direct one.
+private nlt_head() -> string = raw"""
+    val n = 0.0 / 0.0
+
+    g4[T: PartialOrd](a: T, b: T)
+        print(a <= b, a >= b, a < b, a > b)
+    """
+
+@test("a NaN in the first, middle or last field of a derived struct makes all four false")
+nlt_nan_in_any_field()
+    nlt_prints(nlt_head() + raw"""
+        struct F3 derives Eq, PartialOrd
+            a: f64
+            b: f64
+            c: f64
+        end F3
+        g4(F3(n, 1.0, 1.0), F3(1.0, 1.0, 1.0))
+        g4(F3(1.0, n, 1.0), F3(1.0, 1.0, 1.0))
+        g4(F3(1.0, 1.0, n), F3(1.0, 1.0, 1.0))
+        g4(F3(1.0, 1.0, 1.0), F3(n, 1.0, 1.0))
+        g4(F3(1.0, 1.0, 1.0), F3(1.0, n, 1.0))
+        g4(F3(1.0, 1.0, 1.0), F3(1.0, 1.0, n))
+        g4(F3(1.0, n, 1.0), F3(1.0, n, 1.0))
+        print(F3(1.0, 1.0, n) <= F3(1.0, 1.0, 1.0), F3(1.0, 1.0, n) >= F3(1.0, 1.0, 1.0))
+        print(F3(n, 1.0, 1.0) < F3(1.0, 1.0, 1.0), F3(n, 1.0, 1.0) > F3(1.0, 1.0, 1.0))
+        """, "false false false false\nfalse false false false\nfalse false false false\n" +
+             "false false false false\nfalse false false false\nfalse false false false\n" +
+             "false false false false\nfalse false\nfalse false\n")
+
+@test("an earlier field that decides wins over a later NaN, and all-equal is <= and >=")
+nlt_earlier_field_decides()
+    nlt_prints(nlt_head() + raw"""
+        struct F3 derives Eq, PartialOrd
+            a: f64
+            b: f64
+            c: f64
+        end F3
+        g4(F3(0.0, n, 1.0), F3(1.0, 1.0, 1.0))
+        g4(F3(2.0, n, 1.0), F3(1.0, 1.0, 1.0))
+        g4(F3(1.0, 2.0, 3.0), F3(1.0, 2.0, 3.0))
+        g4(F3(1.0, 2.0, 3.0), F3(1.0, 2.0, 4.0))
+        """, "true false true false\nfalse true false true\ntrue true false false\ntrue false true false\n")
+
+@test("negative zero equals zero, so <= and >= are both true")
+nlt_negative_zero()
+    nlt_prints(nlt_head() + raw"""
+        struct P derives Eq, PartialOrd
+            x: f64
+        end P
+        g4(P(-0.0), P(0.0))
+        g4(P(0.0), P(-0.0))
+        g4((-0.0, 1), (0.0, 1))
+        """, "true true false false\ntrue true false false\ntrue true false false\n")
+
+@test("a NaN inside a nested derived struct is unordered through every level")
+nlt_nested_derived()
+    nlt_prints(nlt_head() + raw"""
+        struct In derives Eq, PartialOrd
+            x: f64
+        end In
+        struct Out derives Eq, PartialOrd
+            k: int
+            i: In
+            z: int
+        end Out
+        g4(Out(1, In(n), 0), Out(1, In(1.0), 0))
+        g4(Out(1, In(1.0), 0), Out(1, In(n), 0))
+        g4(Out(1, In(0.0), 9), Out(1, In(1.0), 0))
+        g4(Out(1, In(1.0), 0), Out(1, In(1.0), 0))
+        g4(Out(0, In(n), 0), Out(1, In(1.0), 0))
+        """, "false false false false\nfalse false false false\ntrue false true false\n" +
+             "true true false false\ntrue false true false\n")
+
+@test("tuples, and tuples of tuples, are unordered where a part is")
+nlt_tuples()
+    nlt_prints(nlt_head() + raw"""
+        g4((n, 1), (1.0, 1))
+        g4((1.0, 1), (n, 1))
+        g4((1.0, n), (1.0, 2.0))
+        g4((1.0, 2.0), (1.0, 2.0))
+        g4((0.0, n), (1.0, 1.0))
+        g4(((1.0, n), 2), ((1.0, 1.0), 2))
+        g4(((0.0, n), 2), ((1.0, 1.0), 2))
+        g4(((1.0, 1.0), 1), ((1.0, 1.0), 2))
+        print((n, 1) <= (1.0, 1), (n, 1) >= (1.0, 1))
+        """, "false false false false\nfalse false false false\nfalse false false false\n" +
+             "true true false false\ntrue false true false\nfalse false false false\n" +
+             "true false true false\ntrue false true false\nfalse false\n")
+
+@test("an f32 field is unordered the same way")
+nlt_f32()
+    nlt_prints(raw"""
+        struct G derives Eq, PartialOrd
+            x: f32
+            y: f32
+        end G
+        val m: f32 = 0.0 / 0.0
+        print(G(1.0, m) <= G(1.0, 2.0), G(1.0, m) >= G(1.0, 2.0), G(1.0, m) < G(1.0, 2.0), G(1.0, m) > G(1.0, 2.0))
+        print(G(0.0, m) <= G(1.0, 2.0), G(0.0, m) >= G(1.0, 2.0))
+        print(G(m, 1.0) <= G(m, 1.0), G(1.0, 1.0) <= G(1.0, 1.0))
+        """, "false false false false\ntrue false\nfalse true\n")
+
+@test("slices and arrays of floats compare element by element with a NaN unordered")
+nlt_slices_and_arrays()
+    nlt_prints(nlt_head() + raw"""
+        val a = [n, 1.0]
+        val b = [1.0, 1.0]
+        val c = [1.0, 2.0]
+        val d = [1.0, 2.0, 0.0]
+        g4(a, b)
+        g4(b, a)
+        g4(a[..], b[..])
+        g4(b, c)
+        g4(c, c)
+        g4(c[..], d[..])
+        g4(d[..], c[..])
+        """, "false false false false\nfalse false false false\nfalse false false false\n" +
+             "true false true false\ntrue true false false\ntrue false true false\n" +
+             "false true false true\n")
+
+@test("a data enum compares by variant, then fields, with a NaN payload unordered")
+nlt_data_enum()
+    nlt_prints(nlt_head() + raw"""
+        enum E derives Eq, PartialOrd
+            A(x: f64, y: int)
+            B(x: f64)
+        end E
+        g4(A(n, 1), A(1.0, 1))
+        g4(A(1.0, 1), A(1.0, 2))
+        g4(A(1.0, 1), B(n))
+        g4(B(n), A(1.0, 1))
+        g4(B(n), B(n))
+        g4(B(1.0), B(1.0))
+        """, "false false false false\ntrue false true false\ntrue false true false\n" +
+             "false true false true\nfalse false false false\ntrue true false false\n")
+
+@test("derived types without a float, and a hand-written Ord, are unchanged")
+nlt_non_float_unchanged()
+    nlt_prints(nlt_head() + raw"""
+        struct I derives Eq, Ord
+            a: int
+            b: int
+        end I
+        enum Col derives Ord
+            Red
+            Green
+        end Col
+        struct W
+            v: f64
+        end W
+        impl Ord for W
+            lt(self, rhs: Self) -> bool = self.v < rhs.v
+        end W
+        g4(I(1, 2), I(1, 3))
+        g4(I(2, 0), I(1, 3))
+        g4(I(1, 2), I(1, 2))
+        g4(Red, Green)
+        g4(Green, Green)
+        g4("ab", "b")
+        g4(W(n), W(1.0))
+        """, "true false true false\nfalse true false true\ntrue true false false\n" +
+             "true false true false\ntrue true false false\ntrue false true false\n" +
+             "true true false false\n")
+
+@test("sorting derived structs without a float is unchanged")
+nlt_sort_unchanged()
+    nlt_prints(raw"""
+        import sysl.slices.sort
+
+        struct P derives Eq, Ord
+            x: int
+            y: int
+        end P
+        var xs = [P(2, 1), P(1, 9), P(1, 2), P(-3, 0), P(2, 0)]
+        sort(xs[..])
+        for p in xs
+            print(p.x, p.y)
+        """, "-3 0\n1 2\n1 9\n2 0\n2 1\n")

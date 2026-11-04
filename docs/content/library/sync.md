@@ -333,11 +333,10 @@ print(stats.load(Acquire))
 
 ### What `T` may be
 
-**An integer of 8, 16, 32 or 64 bits, or a pointer** — what the machine has an instruction for,
+**An integer of 8, 16, 32 or 64 bits, a `bool`, or a pointer** — what the machine has an instruction for,
 and on a 32-bit board that stops at 32 (below). Nothing in the declaration says so, and there is no bound that could: sysl's integers are an
 [open family](/reference/generics/), so `u12` is a type a program may name and no `impl` list could
-have covered it. What refuses the type is the **form inside**, where the instruction would have had
-to be chosen:
+have covered it. What refuses the type is the **instantiation**, at the line that names it:
 
 ```sysl
 import sysl.sync.*
@@ -348,7 +347,7 @@ print(wide.load())
 ```
 
 ```error
-'atomic_load' is one machine instruction, and a machine has one for 8, 16, 32 and 64 bits — u12 is 12, so there is nothing to emit
+'Atomic[u12]' cannot be made: a machine has one atomic instruction for 8, 16, 32 and 64 bits, and u12 is 12
 ```
 
 An aggregate is refused for a different reason and with a different message, because it is a
@@ -367,7 +366,7 @@ print(here.load().x)
 ```
 
 ```error
-'atomic_load' reaches a word the machine can touch indivisibly — an integer of 8, 16, 32 or 64 bits, or a pointer — and Point is neither
+'Atomic[Point]' cannot be made: an atomic instruction reaches a word the machine can touch indivisibly — an integer of 8, 16, 32 or 64 bits, a 'bool', or a pointer — and Point is none of them. An aggregate is what a 'SpinLock' or a '&sync Mutex[T]' is for
 ```
 
 A float is in the same position, and it is the one people are most surprised by — a `real` is 64
@@ -382,7 +381,7 @@ print(f.load())
 ```
 
 ```error
-'atomic_load' reaches a word the machine can touch indivisibly — an integer of 8, 16, 32 or 64 bits, or a pointer — and real is neither. An aggregate is what a 'SpinLock' or a '&sync Mutex[T]' is for (`06`)
+'Atomic[real]' cannot be made: a machine's atomic instructions work on integers and pointers, and real is a float
 ```
 
 **How wide is the build's, too.** Every 64-bit processor sysl targets, and 32-bit x86 and wasm, has a
@@ -420,14 +419,44 @@ print(sum == null)
 ```
 
 ```error
-'atomic_add' is arithmetic, and what an address plus a number means is the question the raw tier does not answer — use 'atomic_swap' or 'atomic_cas' to change a pointer, or do the arithmetic on a 'usize' beside it
+'add' is arithmetic, and what an address plus a number means is the question the raw tier does not answer — use 'swap' or 'cas' to change a pointer, or do the arithmetic on a 'usize' beside it
 ```
 
-**Read where those four diagnostics point.** The caret is on a line in `library/sysl/sync/atomic.sysl`,
-not on the line the program wrote — because the form that refuses is inside the method, and the
-method is ordinary library sysl like everything else here. It is the honest place for it to land,
-and it is also the clearest demonstration on this page that `Atomic[T]` really is a struct somebody
-wrote rather than a type the compiler knows about.
+**A `bool` is atomic as the byte it is stored in**, as C's `atomic_bool` and Rust's `AtomicBool`
+are. It takes `load`, `store`, `swap`, `cas` and the bitwise `and`, `or` and `xor` — setting, clearing
+and toggling a flag — and the stored byte is only ever 0 or 1. Adding to a flag means nothing, so
+`add` and `sub` are refused:
+
+```sysl
+import sysl.sync.*
+
+var ready = Atomic(false)
+
+ready.store(true)
+
+print(ready.or(false), ready.cas(true, false), ready.xor(true), ready.load())
+```
+
+```output
+true true false true
+```
+
+```sysl
+import sysl.sync.*
+
+var ready = Atomic(false)
+
+print(ready.add(true))
+```
+
+```error
+'add' is arithmetic, and a 'bool' is a flag rather than a number
+```
+
+**Read where those diagnostics point.** An element type no instruction exists for is refused at the
+line that names `Atomic[T]`, once. A member refused on a pointer or a flag is refused at the call
+that wrote it (`flag.add(1)`), once, and the method is never instantiated, so no caret lands in
+`library/sysl/sync/atomic.sysl`.
 
 ### The narrowing on `load` and `store` lands at run time
 

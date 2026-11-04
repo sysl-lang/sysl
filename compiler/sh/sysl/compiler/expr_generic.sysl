@@ -269,6 +269,8 @@ end written_type_args_for
 
 private type_arg_read(cx: &Analyzer, e: Expr, at_address: bool) -> Type = *e.kind match
     Ident(n) -> resolve_type_arg(cx.an, cx.scope, named_type(e.span, n), cx.subst)
+    // `()` is the type `unit`, spelled as its value is.
+    UnitLit -> resolve_type_arg(cx.an, cx.scope, named_type(e.span, "unit"), cx.subst)
     // A **value** argument is written as the number it is, which is the one place the two grammars
     // agree without a conversion. It travels at the width a length does, so a copy the reader named
     // and one a call read off an argument are the same instantiation and not two.
@@ -318,6 +320,14 @@ end not_a_type_arg
 // to a pointer nests without each level being resolved on its own.
 private written_type_ref(cx: &Analyzer, e: Expr, at_address: bool) -> TypeRef = *e.kind match
     Ident(n) -> named_type(e.span, n)
+    UnitLit -> named_type(e.span, "unit")
+    Tuple(parts) ->
+        var written: Buf[TypeRef] = buf()
+
+        for item in parts
+            written.push(written_type_ref(cx, item, at_address))
+
+        type_ref(e.span, TupleType(written, false))
     Unary(op, inner) ->
         if op == "*" then type_ref(e.span, PtrType(written_type_ref(cx, inner, at_address)))
         else if op == "&" then type_ref(e.span, RefType(written_type_ref(cx, inner, at_address), false))
@@ -408,6 +418,10 @@ private applied_type_ref(cx: &Analyzer, span: Span, head: Expr, inner: Buf[Expr]
             Index(_, _, _) -> refs.push(written_type_ref(cx, arg, at_address))
             TypeArgs(_, _, _) -> refs.push(written_type_ref(cx, arg, at_address))
             TypeArg(_) -> refs.push(written_type_ref(cx, arg, at_address))
+            UnitLit -> refs.push(written_type_ref(cx, arg, at_address))
+            Tuple(_) ->
+                if value_param_at(cx, name, refs.len()) then refs.push(type_ref(arg.span, ValueArgType(arg)))
+                else refs.push(written_type_ref(cx, arg, at_address))
             // `f::Type` and `u8::Bits` are spelled alike, so which one a projection is depends on
             // the parameter it fills: a value where the declaration wrote `const`, a type elsewhere.
             TypeAttr(_, _, _, _) ->
@@ -1427,6 +1441,11 @@ ref_mentions(t: TypeRef, names: Buf[string]) -> bool
         CFnType(params, ret) -> any_ref_mentions(params, names) || ref_mentions(ret, names)
         AssocType(base, _) -> ref_mentions(base, names)
         AssocArgType(_, inner) -> ref_mentions(inner, names)
+        AssocBoundArgType(_, bounds) ->
+            for b in bounds
+                if any_ref_mentions(b.args, names) then return true
+
+            false
         KeptParamType(inner) -> ref_mentions(inner, names)
         _ -> false
 end ref_mentions

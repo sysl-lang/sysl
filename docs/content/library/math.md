@@ -65,7 +65,7 @@ around to remember it.
 ## `Float`
 
 ```sysl
-trait Float: Zero + One + Eq + Ord + Neg + Add + Sub + Mul + Div + Display + Debug
+trait Float: Zero + One + Eq + PartialOrd + Neg + Add + Sub + Mul + Div + Display + Debug
 
     // The type's own values, asked without a receiver. The two identities are *required* rather
     // than declared: `Zero` and `One` are core traits, and a required trait's members are reached
@@ -118,6 +118,7 @@ trait Float: Zero + One + Eq + Ord + Neg + Add + Sub + Mul + Div + Display + Deb
     clamp(self, lo: Self, hi: Self) -> Self
     maximum(self, other: Self) -> Self
     minimum(self, other: Self) -> Self
+    total_lt(self, other: Self) -> bool
     to_radians(self) -> Self
     to_degrees(self) -> Self
 
@@ -316,18 +317,17 @@ print(tie.round_even(), neg.nearbyint(), f32(neg).rint())
 ```
 
 **`max_num` and `min_num` let a NaN lose to a number.** These are IEEE 754-2008's maxNum and minNum.
-Whichever side the NaN is on, the number is the answer, and only two NaNs give a NaN. `max` and `min`
-(below) answer whatever their one comparison falls through to, and that depends on which side the NaN
-is on. Two zeros of opposite sign compare equal, and either one may be the answer.
+Whichever side the NaN is on, the number is the answer, and only two NaNs give a NaN. Two zeros of
+opposite sign compare equal, and either one may be the answer.
 
 ```sysl
-import sysl.math.{Float, max}
+import sysl.math.Float
 
 var one = 1.0
 val hole = 0.0 / 0.0
 
 print(hole.max_num(one), one.max_num(hole), one.min_num(-one))
-print(max(hole, one).is_nan(), hole.max_num(hole).is_nan())
+print((hole < one) == (one < hole), hole.max_num(hole).is_nan())
 ```
 
 ```output
@@ -337,8 +337,9 @@ true true
 
 **`max`, `min` and `clamp` are methods on every float.** `a.max(b)` and `a.min(b)` are `max_num` and
 `min_num` under the names Rust uses: a NaN loses to a number on either side. `x.clamp(lo, hi)` holds
-`x` to the closed range; a NaN `x` stays a NaN, and a `lo` above `hi`, or a NaN bound, panics. The
-free `max`, `min` and `clamp` are generic over `Ord` and agree with the methods except at a NaN.
+`x` to the closed range; a NaN `x` stays a NaN, and a `lo` above `hi`, or a NaN bound, panics. They
+are the only `max`, `min` and `clamp` a float has: the free functions are generic over `Ord`, which a
+float is not, and refuse one (below).
 
 ```sysl
 val a: f64 = 1.0
@@ -484,17 +485,17 @@ factor is π over 180 — and 180 is not something a zero and a one can be built
 ### NaN, and what compares to it
 
 ```sysl
-import sysl.math.{Float, infinity, nan, min}
+import sysl.math.{Float, infinity, nan}
 
 var one = 1.0
 
 print(nan().is_nan(), infinity().is_infinite(), one.is_finite())
-print(min(nan(), one).is_nan(), min(one, nan()).is_nan())
+print(nan() < one, nan() >= one, nan().min(one), one.min(nan()))
 ```
 
 ```output
 true true true
-true false
+false false 1 1
 ```
 
 **`is_nan` is `self != self`** — the only value not equal to itself, which is both the definition and
@@ -502,15 +503,35 @@ the test, and the reason an equality check cannot be used to look for one. `is_i
 the magnitude exceeds the largest finite value, a condition only the two infinities meet and which a
 NaN fails the way it fails every comparison.
 
-**That second line is the one to read carefully.** `min(nan(), 1.0)` is a NaN and `min(1.0, nan())` is
-`1.0`, and neither is a bug. A NaN is less than nothing and greater than nothing, so the single
-comparison each of these makes is false whichever way round the operands go, and both fall through to
-the arm holding the **first** argument.
+**A NaN is unordered with every value**, so all four orderings against one are false — `<=` and `>=`
+included, which is why `a <= b` cannot be read as "not `b < a`" for a float. A float is therefore
+[`PartialOrd`](/library/core/) and **not `Ord`**: it is no total order, and everything written over
+one — the free `min`, `max` and `clamp` below, `sort`, `binary_search`, a `Heap` — refuses it, since
+over a NaN each would answer by which argument came first. The float's own `min` and `max` say what a
+NaN does instead (it loses to a number, as Rust's do), and `total_lt` is a total order to sort by.
 
-That is said here rather than worked around. Propagating a NaN from one argument position while
-dropping it from the other is what C's `fmin` was criticised for — and the alternative is a comparison
-per argument on every call, to spare a case a caller can see coming. A program that must reject a NaN
-tests for one.
+### `total_lt` — the order a float sorts by
+
+```sysl
+import sysl.math.{Float, nan}
+import sysl.slices.sort_by
+
+var xs = [3.0, -0.0, nan(), -1.0, 0.0]
+
+sort_by(xs[..], (a, b) -> a.total_lt(b))
+print(xs)
+print((-0.0).total_lt(0.0), 0.0.total_lt(-0.0))
+```
+
+```output
+[-1, -0, 0, 3, NaN]
+true false
+```
+
+`x.total_lt(y)` is IEEE 754's `totalOrder` and Rust's `total_cmp`: negative NaNs, minus infinity, the
+negative numbers, `-0.0`, `0.0`, the positive numbers, infinity, positive NaNs. Every two values compare
+in it, which is what a sort needs and `<` does not give. It reads the bits rather than comparing
+values, so it orders the two zeros that `<` calls equal.
 
 ## `mul_add` — a multiply and an add rounded once
 
@@ -555,7 +576,7 @@ import sysl.math.{min, max, clamp}
 var half = 2.5
 
 print(min(3, 7), max(3, 7), clamp(12, 0, 10))
-print(min("b", "a"), max(half, 1.5))
+print(min("b", "a"), half.max(1.5))
 print(clamp(-5, 0, 10), clamp(5, 0, 10))
 print(min((1, 2), (1, 3)))
 ```
@@ -569,9 +590,21 @@ a 2.5
 
 **They are generic over `Ord`, and that is why they are in a file of their own.** Nothing about
 picking the smaller of two things is arithmetic: `min` over the integers is the same three words as
-`min` over the floats, over a string, over a tuple, and over any type a program has written an
-`lt` for. A version living on `Float` would have been the narrowest useful one and would have left
-every other type asking why.
+`min` over a string, over a tuple, and over any type a program has written an `lt` for.
+
+**A float is refused**, because it is not `Ord` — a NaN is unordered, and the one comparison each of
+these makes would answer by which argument came first. The refusal names the float's own methods,
+which is the second line's `half.max(1.5)`:
+
+```sysl
+import sysl.math.max
+
+print(max(2.5, 1.5))
+```
+
+```error
+real is only 'PartialOrd': a NaN is neither less, greater nor equal to any value, so no total order holds. Use the float's own 'x.max(y)', 'x.min(y)' or 'x.clamp(lo, hi)'
+```
 
 **A tie answers with the first argument.** `min` is written `if b < a then b else a` rather than the
 other way round, and for types whose equality does not mean identity — a record ordered on one field,
@@ -678,7 +711,7 @@ both held
 
 `assert_approx_eq_rel` is the same against the relative test. **They live here rather than beside
 [`assert_eq`](/library/core/) in the core**, and that is forced rather than chosen: `Float` is
-declared in this module and reaches `Eq`, `Ord` and the arithmetic traits in the core, so `sysl.math`
+declared in this module and reaches `Eq`, `PartialOrd` and the arithmetic traits in the core, so `sysl.math`
 depends on `sysl` — and a float assertion written in the core would point an edge back the other way,
 which [the module graph](/reference/modules/) refuses. Anyone writing float assertions imports this
 module already, since it is where the float functions are.
@@ -995,7 +1028,7 @@ members are for a value that is not in such a struct.
 
 ```sysl
 trait Magnitude
-    type Size: Ord
+    type Size: PartialOrd
     magnitude(self) -> Self::Size
 ```
 
@@ -1191,7 +1224,7 @@ What each one actually needs is written in its own bound instead:
 
 | function | bound |
 |---|---|
-| `pow` | `Mul + Ord` |
+| `pow` | `Mul + PartialOrd` |
 | `gcd` | `Rem + Eq + Ord + Sub` |
 | `lcm` | `Rem + Eq + Ord + Sub + Div + Mul` |
 | `divmod` | `Div + Rem` |

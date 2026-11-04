@@ -753,7 +753,9 @@ process umask narrow it: asking for less would override the environment's decisi
 to it. **`make_dir_all` is the one every caller actually wants** — it climbs with
 [`sysl.path.parent`](/library/path/) and makes each level from the topmost missing one down, and a
 directory that is **already there is success rather than `AlreadyExists`**, because the question being
-asked is *make sure this is there*.
+asked is *make sure this is there*. It tries the path first and climbs only on `NotFound`, so a file
+standing above the leaf (`x/y` with `x` a file) is `NotADirectory`, and a file at the leaf itself
+(`x`) is `AlreadyExists`.
 
 **`remove_dir_all` is its opposite and is a post-order walk**, because `rmdir` refuses a directory
 that is not empty. A **symbolic link is unlinked rather than followed**, which is what keeps it from

@@ -477,8 +477,6 @@ private gen_expr_kind(e: *Emit, x: TExpr) -> Val = *x.kind match
     TVecLoad(receiver, index, vec_ty) -> gen_vec_load(e, receiver, index, vec_ty, x.span)
     TVecStore(receiver, index, value) -> gen_vec_store(e, receiver, index, value, x.span)
 
-    _ -> gap_at(e, texpr_kind_name(x))
-
 // One field of a bitfield struct lifted out of its container, and nothing more: an enum field's bits
 // are not held to its variants here. `gen_field` holds them; `E.try(s.field)` answers instead.
 bitfield_field_bits(e: *Emit, receiver: TExpr, index: int, ranges: Buf[BitRange]) -> Val
@@ -2260,18 +2258,24 @@ end fill_array
 private gen_atomic(e: *Emit, op: string, addr: TExpr, ops: Buf[TExpr], ordering: string, at: Type,
                    ty: Type) -> Val
     val ord = atomic_ordering_of(ordering)
-    val lt = lty(e, at)
-    val align = int(e.layout.align(at))
+
+    // **A `bool` is atomic as the byte it is stored in.** Its register type is one bit, which no
+    // atomic instruction accepts, so the value is widened to the byte on the way in and narrowed on
+    // the way out. The stored byte is only ever 0 or 1 -- a store widens a one-bit value, and `and`,
+    // `or` and `xor` of two such bytes stay in range -- so narrowing loses nothing.
+    val is_bool = underlying(at) == Bool
+    val lt = if is_bool then LInt(8) else lty(e, at)
+    val align = if is_bool then 1 else int(e.layout.align(at))
     val p = gen_expr(e, addr)
 
     if op == "atomic_load"
         val r = fresh_reg(e)
 
         emit(e, InLoad(r, lt, p, AccAtomic(ord), Some(align)))
-        return own_temp(e, r, ty)
+        return own_temp(e, narrow_flag(e, is_bool, r), ty)
     end if
 
-    val v = gen_expr(e, ops[0])
+    val v = widen_flag(e, is_bool, gen_expr(e, ops[0]))
 
     if op == "atomic_store"
         emit(e, InStore(lt, v, p, AccAtomic(ord), Some(align)))
@@ -2283,7 +2287,7 @@ private gen_atomic(e: *Emit, op: string, addr: TExpr, ops: Buf[TExpr], ordering:
     // half is the form's result. The ordering on a failed exchange is the success one weakened,
     // since a failure performs no store and LLVM refuses a release on it.
     if op == "atomic_cas"
-        val d = gen_expr(e, ops[1])
+        val d = widen_flag(e, is_bool, gen_expr(e, ops[1]))
         val pair = fresh_reg(e)
 
         emit(e, InCmpXchg(pair, p, lt, v, d, ord))
@@ -2296,14 +2300,34 @@ private gen_atomic(e: *Emit, op: string, addr: TExpr, ops: Buf[TExpr], ordering:
         val r = fresh_reg(e)
 
         emit(e, InExtract(r, LStruct(fields), pair, index_list(0)))
-        return own_temp(e, r, ty)
+        return own_temp(e, narrow_flag(e, is_bool, r), ty)
     end if
 
     val r = fresh_reg(e)
 
     emit(e, InAtomicRmw(r, rmw_of(op), p, lt, v, ord))
-    own_temp(e, r, ty)
+    own_temp(e, narrow_flag(e, is_bool, r), ty)
 end gen_atomic
+
+// A one-bit value as the byte an atomic access works on, or the value itself for any other type.
+private widen_flag(e: *Emit, is_bool: bool, v: Val) -> Val
+    if !is_bool then return v
+
+    val w = fresh_reg(e)
+
+    emit(e, InCast(w, CastZExt, l_i1(), v, LInt(8)))
+    w
+end widen_flag
+
+// The inverse of `widen_flag`.
+private narrow_flag(e: *Emit, is_bool: bool, v: Val) -> Val
+    if !is_bool then return v
+
+    val n = fresh_reg(e)
+
+    emit(e, InCast(n, CastTrunc, LInt(8), v, l_i1()))
+    n
+end narrow_flag
 
 // A barrier with no address, ordering everything around it rather than one access.
 private gen_fence(e: *Emit, ordering: string) -> Val

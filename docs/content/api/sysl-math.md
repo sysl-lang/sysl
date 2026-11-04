@@ -418,7 +418,7 @@ negative value of the width: negating that wraps to itself, so `a - min` would b
 ### `pow`
 
 ```sysl
-const pow[T: Mul + Ord](base: T, exponent: u32) -> T
+const pow[T: Mul + PartialOrd](base: T, exponent: u32) -> T
 ```
 
 A value raised to a whole power, by repeated squaring: `pow(2, 10)` is `1024`.
@@ -544,7 +544,7 @@ is not in a struct, or a struct whose fields disagree.
 ### `Float`
 
 ```sysl
-trait Float: Zero + One + Eq + Ord + Neg + Add + Sub + Mul + Div + Display + Debug
+trait Float: Zero + One + Eq + PartialOrd + Neg + Add + Sub + Mul + Div + Display + Debug
     max_value() -> Self
     epsilon() -> Self
     infinity() -> Self
@@ -588,6 +588,7 @@ trait Float: Zero + One + Eq + Ord + Neg + Add + Sub + Mul + Div + Display + Deb
     clamp(self, lo: Self, hi: Self) -> Self
     maximum(self, other: Self) -> Self
     minimum(self, other: Self) -> Self
+    total_lt(self, other: Self) -> bool
     fmod(self, divisor: Self) -> Self
     abs(self) -> Self
     copysign(self, sign: Self) -> Self
@@ -679,6 +680,7 @@ conversions, whose factor is pi over 180.
 | `clamp` | `clamp(self, lo: Self, hi: Self) -> Self` | The receiver held to `lo ..= hi`, inclusive at both ends. |
 | `maximum` | `maximum(self, other: Self) -> Self` | The larger and the smaller of two, IEEE 754-2019's maximum and minimum: **a NaN wins**, so `nan.maximum(1.0)` and `1.0.maximum(nan)` are both a NaN, and `-0.0` orders below `0.0` -- `(-0.0).maximum(0.0)` is `0.0` and `(-0.0).minimum(0.0)` is `-0.0`, whichever way round. |
 | `minimum` | `minimum(self, other: Self) -> Self` |  |
+| `total_lt` | `total_lt(self, other: Self) -> bool` | Whether the receiver comes before `other` in IEEE 754's **total order** (`totalOrder`), the order Rust's `f64::total_cmp` gives: negative NaNs, minus infinity, the negative numbers, `-0.0`, `0.0`, the positive numbers, infinity, positive NaNs. |
 | `fmod` | `fmod(self, divisor: Self) -> Self` | The remainder of a division that truncates, keeping the sign of the receiver. |
 | `abs` | `abs(self) -> Self` | Sign, taken two ways because the two answer differently at the edges. |
 | `copysign` | `copysign(self, sign: Self) -> Self` |  |
@@ -697,7 +699,7 @@ conversions, whose factor is pi over 180.
 
 ```sysl
 trait Magnitude
-    type Size: Ord
+    type Size: PartialOrd
     magnitude(self) -> Self::Size
 ```
 
@@ -711,8 +713,9 @@ with no floating point in them, and fixing it to `Self` would leave `Complex` ou
 one type the trait exists for. `type Size` lets each implementation answer in its own terms and a
 generic body name the answer without knowing it.
 
-**`Size` is `Ord` and nothing more**, because comparing two sizes is the whole of what a size is
-for here. A body wanting arithmetic on one is a body that knows which type it is holding.
+**`Size` is `PartialOrd` and nothing more**, because comparing two sizes is the whole of what a
+size is for here, and a float's size is a float -- which a NaN leaves only partially ordered. A
+body wanting arithmetic on one is a body that knows which type it is holding.
 
 **It is not `Ord` on the values, and that distinction is the reason it exists.** `Complex` has no
 `Ord` on purpose — no order on the plane respects the arithmetic — and yet `|z|` orders complex

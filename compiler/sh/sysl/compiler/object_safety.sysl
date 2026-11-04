@@ -29,6 +29,7 @@ check_object_written(a: &Analysis, scope: Scope, inner: TypeRef, made: Type, sig
             for arg in args
                 *arg.kind match
                     AssocArgType(_, _) -> ()
+                    AssocBoundArgType(_, _) -> ()
                     _ -> k += 1
 
             k
@@ -149,7 +150,30 @@ check_assoc_args(a: &Analysis, scope: Scope, span: Span, key: string, declared: 
                 if !d.bounds.is_empty() then bounds.push(NamedBounds(d.name, d.bounds))
 
     deferred_bounds(a, scope, span, key, names, bounds, types, "associated type")
-    false
+
+    // **What a requirement asks of an associated type is asked of the type fixed for it** too
+    // (`trait Scalar: Element[Real: Width]` and `&Scalar[Real = f32]`), as every `impl` of the
+    // trait is asked it -- now if every block is in, and with the requirements otherwise.
+    for c in trait_closure(a, plain_bound(key, args), self_binding(Abstract("Self", buf())))
+        for open in c.bounded
+            for item in supplied
+                if item.0 != open.0 || item.1 == Unknown then continue
+
+                val want = assoc_bound_at(a, open.1, item.1)
+
+                if a.tables.members.hoisted
+                    if !satisfies(a, want, item.1)
+                        a.fault(scope, span, s"trait '$shown' asks that its associated type '${item.0}' " +
+                                s"implement '${show_bound(a, want, item.1)}', and ${type_show(item.1)} " +
+                                "does not")
+                        refused = true
+                    end if
+                else
+                    a.tables.super_checks.push(SuperCheck("", shown, want, item.1, span, scope, item.0))
+                end if
+            end for
+
+    refused
 end check_assoc_args
 
 private bound_in(subst: Buf[Binding], name: string) -> bool
@@ -350,7 +374,7 @@ private equality_trait(key: string) -> bool = library_spelling(key) match
 // Whether a library trait is one an operator is written against -- `Eq` and `Ord` included.
 private operator_trait(spelling: string) -> bool = spelling match
     "Add" | "Sub" | "Mul" | "Div" | "Rem" | "BitAnd" | "BitOr" | "BitXor" | "Shl" | "Shr" -> true
-    "Neg" | "Not" | "Eq" | "Ord" -> true
+    "Neg" | "Not" | "Eq" | "PartialOrd" | "Ord" -> true
     _ -> false
 
 private takes_ref_self(m: MethodDecl) -> bool = m.receiver match
@@ -419,9 +443,17 @@ private mentions_any(t: TypeRef, names: Buf[string], settled: Buf[string]) -> bo
             else mentions_any(base, names, settled)
         _ -> mentions_any(base, names, settled)
     AssocArgType(_, inner) -> mentions_any(inner, names, settled)
+    AssocBoundArgType(_, bounds) -> bound_args_mention(bounds, names, settled)
     KeptParamType(inner) -> mentions_any(inner, names, settled)
     SomeType(_) -> false
     InferredResult(_) -> false
+
+private bound_args_mention(bs: Buf[BoundRef], names: Buf[string], settled: Buf[string]) -> bool
+    for b in bs
+        if any_mentions(b.args, names, settled) then return true
+
+    false
+end bound_args_mention
 
 private any_mentions(ts: Buf[TypeRef], names: Buf[string], settled: Buf[string]) -> bool
     for item in ts

@@ -211,6 +211,16 @@ private atomic_pointee(cx: &Analyzer, span: Span, name: string, addr: TExpr) -> 
                              "there is nothing to emit. Hold the value at a width the machine has " +
                              "and narrow it where it is read")
                     Unknown
+                Bool ->
+                    // **A flag is atomic as the byte it is stored in** (`AtomicBool` in Rust, `atomic_bool`
+                    // in C), and the bitwise forms are the ones that mean something at it: setting,
+                    // clearing and toggling. Adding to a flag means nothing.
+                    if name != "atomic_add" && name != "atomic_sub" then return ty
+
+                    cx.fault(span, s"'$name' is arithmetic, and a 'bool' is a flag rather than a number " +
+                             "— use 'atomic_or', 'atomic_and' or 'atomic_xor' to change one, or " +
+                             "count in an integer")
+                    Unknown
                 Ptr(_) ->
                     if !atomic_arithmetic(name) then return ty
 
@@ -221,7 +231,7 @@ private atomic_pointee(cx: &Analyzer, span: Span, name: string, addr: TExpr) -> 
                     Unknown
                 _ ->
                     cx.fault(span, s"'$name' reaches a word the machine can touch indivisibly — " +
-                             "an integer of 8, 16, 32 or 64 bits, or a pointer — and " +
+                             "an integer of 8, 16, 32 or 64 bits, a 'bool', or a pointer — and " +
                              s"${type_show(*inner)} is neither. An aggregate is what a 'SpinLock' " +
                              "or a '&sync Mutex[T]' is for (`06`)")
                     Unknown
@@ -287,3 +297,75 @@ private ordering_key(cx: &Analyzer) -> string
 
     direct
 end ordering_key
+
+// Refuses, at the line that names `Atomic[T]`, an element type no atomic instruction exists for, and
+// answers whether the instantiation may go on.
+//
+// The forms inside the type refuse the same types (`atomic_pointee`), but they are read in the
+// library's own body, so a program would be shown a line of `atomic.sysl` for a mistake it made in its
+// own file, once per method it calls. The instantiation is refused instead, where the element was
+// written, and nothing of it is made.
+check_atomic_element(a: &Analysis, scope: Scope, span: Span, key: string, targs: Buf[Type]) -> bool
+    if qualified_name(key) != "sysl.sync.Atomic" || targs.len() != 1 then return true
+
+    val ty = underlying(targs[0])
+    val shown = type_show(targs[0])
+
+    ty match
+        Integer(bits, _, _) ->
+            if bits == 8 || bits == 16 || bits == 32 || bits == 64 then return true
+
+            a.fault(scope, span, s"'Atomic[$shown]' cannot be made: a machine has one atomic " +
+                    s"instruction for 8, 16, 32 and 64 bits, and $shown is $bits. Hold the value at " +
+                    "a width the machine has and narrow it where it is read")
+        Floating(_, _) ->
+            a.fault(scope, span, s"'Atomic[$shown]' cannot be made: a machine's atomic instructions " +
+                    s"work on integers and pointers, and $shown is a float. Hold its bits in a " +
+                    "'u32' or 'u64' with 'Atomic' and convert where it is read, or guard it with a " +
+                    "'Guarded[SpinLock, T]'")
+        Bool -> return true
+        Ptr(_) -> return true
+        Abstract(_, _) -> return true
+        Unknown -> return true
+        Never -> return true
+        _ ->
+            a.fault(scope, span, s"'Atomic[$shown]' cannot be made: an atomic instruction reaches " +
+                    "a word the machine can touch indivisibly — an integer of 8, 16, 32 or 64 " +
+                    s"bits, a 'bool', or a pointer — and $shown is none of them. An aggregate is " +
+                    "what a 'SpinLock' or a '&sync Mutex[T]' is for (`06`)")
+
+    false
+end check_atomic_element
+
+// Refuses, at the call a program wrote, a member of `Atomic[T]` that means nothing at a `T` which is
+// otherwise valid, and answers whether the call may go on.
+//
+// A flag takes the bitwise members but not `add` or `sub`; a pointer takes `load`, `store`, `swap`
+// and `cas` and none of the arithmetic or bitwise ones. The raw forms inside the member refuse the
+// same pairs (`atomic_pointee`), but they are read in the library's own body, so a program would be
+// shown a line of `atomic.sysl` for a mistake on its own line. The call is refused instead and the
+// member is never instantiated.
+check_atomic_member(cx: &Analyzer, span: Span, rty: Type, name: string) -> bool
+    repr(rty) match
+        Struct(d) ->
+            if qualified_name(d.base) != "sysl.sync.Atomic" || d.targs.len() != 1 then return true
+
+            underlying(d.targs[0]) match
+                Bool ->
+                    if name != "add" && name != "sub" then return true
+
+                    cx.fault(span, s"'$name' is arithmetic, and a 'bool' is a flag rather than a number " +
+                             "— use 'or', 'and' or 'xor' to change one, or count in an integer")
+                    false
+                Ptr(_) ->
+                    if name != "add" && name != "sub" && name != "and" && name != "or" && name != "xor" then
+                        return true
+
+                    cx.fault(span, s"'$name' is arithmetic, and what an address plus a number " +
+                             "means is the question the raw tier does not answer — use " +
+                             "'swap' or 'cas' to change a pointer, or do the " +
+                             "arithmetic on a 'usize' beside it")
+                    false
+                _ -> true
+        _ -> true
+end check_atomic_member

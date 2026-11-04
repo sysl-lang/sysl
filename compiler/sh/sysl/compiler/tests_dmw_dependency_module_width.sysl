@@ -116,9 +116,9 @@ dmw_named_wide_module_is_refused()
     val got = dmw_build_c(program, lib, "thumbv7em-freestanding")
 
     assert(got.0 != 0, got.1)
-    assert(got.1.index_of(s"${dmw_wide("atomic_load")}\n  --> library/sysl/sync/atomic.sysl:49:24")
+    assert(got.1.index_of(s"${dmw_wide("atomic_load")}\n  --> library/sysl/sync/atomic.sysl:50:24")
            .is_some(), got.1)
-    assert(got.1.index_of(s"${dmw_wide("atomic_add")}\n  --> library/sysl/sync/atomic.sysl:93:20")
+    assert(got.1.index_of(s"${dmw_wide("atomic_add")}\n  --> library/sysl/sync/atomic.sysl:94:20")
            .is_some(), got.1)
     assert(got.1.count_of("error: ") == 2, got.1)
 
@@ -180,7 +180,7 @@ dmw_program_chooses_a_dependency_generic()
             assert(got.0 == 0, got.1)
         else
             assert(got.0 != 0, got.1)
-            assert(got.1.index_of(s"${dmw_wide("atomic_load")}\n  --> library/sysl/sync/atomic.sysl:49:24")
+            assert(got.1.index_of(s"${dmw_wide("atomic_load")}\n  --> library/sysl/sync/atomic.sysl:50:24")
                    .is_some(), got.1)
             assert(got.1.count_of("error: ") == 1, got.1)
         end if
@@ -200,7 +200,7 @@ dmw_module_storage_reaches_the_instance()
     val got = dmw_build_c(program, lib, "thumbv7em-freestanding")
 
     assert(got.0 != 0, got.1)
-    assert(got.1.index_of(s"${dmw_wide("atomic_load")}\n  --> library/sysl/sync/atomic.sysl:49:24")
+    assert(got.1.index_of(s"${dmw_wide("atomic_load")}\n  --> library/sysl/sync/atomic.sysl:50:24")
            .is_some(), got.1)
     assert(got.1.count_of(dmw_wide("atomic_load")) == 1, got.1)
 
@@ -237,6 +237,85 @@ dmw_m0_asks_only_named_modules()
     remove_dir_all(lib).unwrap_or(())
 end dmw_m0_asks_only_named_modules
 
+// Each member of `Atomic[i64]` with the statements that call it, the form it reaches in the library,
+// and the library line and column of that form's first arm.
+private dmw_ops() -> Buf[(string, string, string)]
+    var ops: Buf[(string, string, string)] = buf()
+
+    ops.push(("load", "c.load(Relaxed)", "atomic_load"))
+    ops.push(("store", "c.store(1, Relaxed)\n    0", "atomic_store"))
+    ops.push(("swap", "c.swap(1, Relaxed)", "atomic_swap"))
+    ops.push(("cas", "c.cas(0, 1, Relaxed)", "atomic_cas"))
+    ops.push(("add", "c.add(1, Relaxed)", "atomic_add"))
+    ops.push(("sub", "c.sub(1, Relaxed)", "atomic_sub"))
+    ops.push(("and", "c.and(1, Relaxed)", "atomic_and"))
+    ops.push(("or", "c.or(1, Relaxed)", "atomic_or"))
+    ops.push(("xor", "c.xor(1, Relaxed)", "atomic_xor"))
+    ops
+end dmw_ops
+
+private dmw_op_body(stmt: string) -> string =
+    s"import sysl.sync.*\n\nprivate var c: Atomic[i64] = Atomic(0)\n\nprivate go() -> i64\n    $stmt\nend go\n"
+
+@test("every member of an Atomic[i64] is refused once, at the standard module's form, whether the program or a dependency calls it")
+dmw_each_wide_member_is_refused_once()
+    if !lbr_ready() then return
+
+    val ops = dmw_ops()
+
+    for i in 0..<ops.len()
+        val form = ops[i].2
+        val stmt = ops[i].1
+        val lib = lbr_tree(lbr_one(s"sh/dmw/op/op.sysl",
+                                   s"module sh.dmw.op\n\n${dmw_op_body(stmt)}\n\nrun() -> i64 = go()\n"))
+        val direct = dmw_board(dmw_op_body(stmt), "go()")
+        val via = dmw_board("import sh.dmw.op.run", "run()")
+
+        for got in [dmw_build_c(direct, lib, "thumbv7em-freestanding"),
+                    dmw_build_c(via, lib, "thumbv7em-freestanding")]
+            assert(got.0 != 0, form + ": " + got.1)
+            assert(got.1.index_of(dmw_wide(form)).is_some(), form + ": " + got.1)
+            assert(got.1.index_of("library/sysl/sync/atomic.sysl:").is_some(), form + ": " + got.1)
+            assert(got.1.count_of("error: ") == 1, form + ": " + got.1)
+
+        remove_dir_all(direct).unwrap_or(())
+        remove_dir_all(via).unwrap_or(())
+        remove_dir_all(lib).unwrap_or(())
+end dmw_each_wide_member_is_refused_once
+
+@test("an Atomic[bool] builds on a 32-bit core, a dependency's included, and add on it is refused at the call")
+dmw_atomic_bool_on_a_narrow_target()
+    if !lbr_ready() then return
+
+    val flag = "import sysl.sync.*\n\nprivate var f: Atomic[bool] = Atomic(false)\n\n" +
+               "private go() -> int\n    f.store(true, Release)\n    f.or(true, Relaxed)\n" +
+               "    if f.load(Acquire) then 1 else 0\nend go\n"
+    val lib = lbr_tree(lbr_one("sh/dmw/flag/flag.sysl",
+                               s"module sh.dmw.flag\n\n${flag}\nrun() -> int = go()\n"))
+    val direct = dmw_board(flag, "go()")
+    val via = dmw_board("import sh.dmw.flag.run", "run()")
+
+    for program in [direct, via]
+        val ok = dmw_build_c(program, lib, "thumbv7em-freestanding")
+
+        assert(ok.0 == 0, ok.1)
+        assert(ok.1.index_of("error").is_none(), ok.1)
+
+    val bad = dmw_board("import sysl.sync.*\n\nprivate var f: Atomic[bool] = Atomic(false)\n\n" +
+                        "private go() -> int\n    f.add(true, Relaxed)\n    0\nend go\n", "go()")
+    val got = dmw_build_c(bad, lib, "thumbv7em-freestanding")
+
+    assert(got.0 != 0, got.1)
+    assert(got.1.index_of("'add' is arithmetic, and a 'bool' is a flag").is_some(), got.1)
+    assert(got.1.index_of("atomic.sysl").is_none(), got.1)
+    assert(got.1.count_of("error: ") == 1, got.1)
+
+    remove_dir_all(direct).unwrap_or(())
+    remove_dir_all(via).unwrap_or(())
+    remove_dir_all(bad).unwrap_or(())
+    remove_dir_all(lib).unwrap_or(())
+end dmw_atomic_bool_on_a_narrow_target
+
 @test("a library built on its own for an M4 is asked about every module, the wide ones included")
 dmw_a_library_build_asks_every_module()
     if !lbr_ready() then return
@@ -247,9 +326,9 @@ dmw_a_library_build_asks_every_module()
     assert(got.0 != 0, got.1)
     assert(got.1.index_of(s"${dmw_wide("atomic_load")}\n --> $lib/sh/dmw/raw/raw.sysl:7:17")
            .is_some(), got.1)
-    assert(got.1.index_of(s"${dmw_wide("atomic_load")}\n  --> library/sysl/sync/atomic.sysl:49:24")
+    assert(got.1.index_of(s"${dmw_wide("atomic_load")}\n  --> library/sysl/sync/atomic.sysl:50:24")
            .is_some(), got.1)
-    assert(got.1.index_of(s"${dmw_wide("atomic_add")}\n  --> library/sysl/sync/atomic.sysl:93:20")
+    assert(got.1.index_of(s"${dmw_wide("atomic_add")}\n  --> library/sysl/sync/atomic.sysl:94:20")
            .is_some(), got.1)
 
     remove_dir_all(lib).unwrap_or(())

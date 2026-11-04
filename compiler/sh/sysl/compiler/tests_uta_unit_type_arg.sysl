@@ -1,0 +1,100 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.replace_all
+
+// `()` is the type `unit` inside an expression's explicit type-argument list as it is anywhere else
+// a type goes, and a subscript that holds a parenthesised expression still subscripts
+// (`reference/generics.md`, "Explicit type arguments").
+
+private uta_ready() -> bool = std_root().is_ok() && clang_available()
+
+private uta_ran(text: string) -> string
+    val root = replace_all(make_temp_dir("sysl-uta").unwrap(), "//", "/")
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            val said = replace_all(failure_text(why), s"$root/", "")
+
+            remove_dir_all(root).unwrap_or(())
+            return said
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end uta_ran
+
+private uta_prints(text: string, want: string)
+    if !uta_ready() then return
+
+    assert_eq(replace_all(uta_ran(text), "\n", ""), want)
+end uta_prints
+
+private uta_refused(text: string, part: string)
+    if !uta_ready() then return
+
+    val said = uta_ran(text)
+
+    assert(said.starts_with("error:") && said.contains(part), s"expected a report containing\n$part\ngot\n$said")
+end uta_refused
+
+@test("id[()](()) takes unit as an explicit type argument")
+uta_id_unit() =
+    uta_prints("id[T](x: T) -> T = x\n\nmain()\n    val u = id[()](())\n    print(u == ())\n", "true")
+
+@test("Option[()] as an explicit type argument in a call")
+uta_option_unit() =
+    uta_prints("id[T](x: T) -> T = x\n\nmain()\n    val o = id[Option[()]](Some(()))\n    print(o.is_some())\n", "true")
+
+@test("a nested Result[(), E] as an explicit type argument")
+uta_result_unit() =
+    uta_prints("id[T](x: T) -> T = x\n\nmain()\n" +
+               "    val r = id[Result[(), string]](Ok(()))\n    print(r.is_ok())\n", "true")
+
+@test("a tuple type holding () as an explicit type argument")
+uta_tuple_with_unit() =
+    uta_prints("id[T](x: T) -> T = x\n\nmain()\n    val t = id[((), int)](((), 7))\n    print(t.1)\n", "7")
+
+@test("a tuple type as an explicit type argument")
+uta_tuple() =
+    uta_prints("id[T](x: T) -> T = x\n\nmain()\n    val t = id[(int, bool)]((3, true))\n    print(t.0)\n", "3")
+
+@test("Option of a tuple type as an explicit type argument")
+uta_option_tuple() =
+    uta_prints("id[T](x: T) -> T = x\n\nmain()\n    val o = id[Option[(int, bool)]](Some((4, true)))\n    print(o.unwrap().0)\n", "4")
+
+@test("a generic type applied to () in an explicit type-argument list of a type")
+uta_type_applied() =
+    uta_prints("struct Box[T]\n    v: T\n\nmain()\n    val b = Box[()](v = ())\n    print(b.v == ())\n", "true")
+
+@test("subscripts holding parentheses still subscript")
+uta_indexing_unchanged() =
+    uta_prints("main()\n    val a = [10, 20, 30]\n    print(a[(1)])\n    print(a[(1 + 1)])\n", "2030")
+
+@test("a parenthesised tuple subscript still subscripts a type that indexes by a tuple")
+uta_tuple_index() =
+    uta_prints("struct Grid\n    w: int\n\nimpl Index[(int, int), int] for Grid\n" +
+               "    index(self, ij: (int, int)) -> int = ij.0 * self.w + ij.1\n\n" +
+               "main()\n    val g = Grid(w = 10)\n    print(g[(2, 3)])\n", "23")
+
+@test("a subscript of () still subscripts a type that indexes by unit")
+uta_unit_index() =
+    uta_prints("struct One\n    v: int\n\nimpl Index[(), int] for One\n" +
+               "    index(self, u: ()) -> int = self.v\n\n" +
+               "main()\n    val o = One(v = 5)\n    print(o[()])\n", "5")
+
+@test("a malformed explicit type argument is still refused")
+uta_malformed() =
+    uta_refused("id[T](x: T) -> T = x\n\nmain()\n    val u = id[(1 + 2)](3)\n    print(u)\n", "this is not a type")

@@ -69,7 +69,11 @@ private walk_required(a: &Analysis, w: *SuperWalk, name: string, path: Buf[strin
 
         // **A requirement is not a bound**: a bound that fixes an associated type is held to it at
         // every call, and a requirement has no call -- every `impl` of the trait would have to be held
-        // to it instead, which nothing does.
+        // to it instead, and a generic body reading the projection would have to see it as the fixed
+        // type. A requirement that **bounds** one (`Seq[Item: Render]`) is held at every `impl`
+        // (`check_impl_supers`) and only adds to what the projection offers, so it stands.
+        var positional: usize = 0
+
         for arg in s.args
             *arg.kind match
                 AssocArgType(n, _) ->
@@ -77,12 +81,13 @@ private walk_required(a: &Analysis, w: *SuperWalk, name: string, path: Buf[strin
                             s"fixes its '$n', which a requirement cannot do — bound the type parameter " +
                             s"that needs it instead, '[T: ${qualified_name(name)} + ${s.name}[$n = …]]'")
                     return false
-                _ -> ()
+                AssocBoundArgType(_, _) -> ()
+                _ -> positional += 1
 
-        if s.args.len() > sdecl.tparams.len() || s.args.len() < least_trait_args(sdecl)
+        if positional > sdecl.tparams.len() || positional < least_trait_args(sdecl)
             var unknown: Buf[Type] = buf()
 
-            for k in 0..<s.args.len()
+            for k in 0..<positional
                 unknown.push(Unknown)
 
             check_trait_arity_at(a, scope, s.span, s.name, sdecl, unknown)
