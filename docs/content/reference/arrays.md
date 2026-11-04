@@ -1490,8 +1490,9 @@ count — and its **elements** are two different allocations: the storage is mad
 itself, and a box is never made out of a buffer's storage. So a write to an element cannot change the
 count or move the storage, and a write to the header cannot change an element. **The compiler tells
 the optimizer exactly that, and nothing more**: every access the buffer's own members make to its
-header is marked as one side, every access they make to an element as the other, and the optimizer
-may keep the header in registers across a loop that writes elements. A row operation over a matrix
+header is marked as one side, every access they make to an element as the other — and so is the read
+or write of `b[i]` itself, and of a field of it, through the address the subscript checks — and the
+optimizer may keep the header in registers across a loop that writes elements. A row operation over a matrix
 held in a `&Buf[real]` reads the length and the storage pointer once, not once per cell.
 
 A handle kept anywhere else, such as a field of a struct, is marked only as not being that record,
