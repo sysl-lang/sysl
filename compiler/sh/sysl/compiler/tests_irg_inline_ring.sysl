@@ -125,15 +125,35 @@ private irg_main(body: string, printed: string, said: string)
     irg_traps(files[..], printed, said)
 end irg_main
 
-@test("a wrapped InlineRing's subscript, at and set past the count trap with an array's report")
+// The same program, run to a normal exit that prints `printed` and says nothing.
+private irg_prints(body: string, printed: string)
+    if !irg_ready() then return
+
+    var files: [1](string, string) = [("main.sysl", body)]
+
+    for level in ["0", DefaultOptimization]
+        val (state, out, err) = irg_run(files[..], level)
+
+        assert_eq(err, "")
+        assert_eq(out, printed)
+        assert(state == Status.Exited(0), s"-O$level stopped with $state, having printed '$out'")
+end irg_prints
+
+@test("a wrapped InlineRing's subscript past the count traps with an array's report")
 irg_index_past()
     irg_main(IrgRing + "print(r[2])\nprint(r[i])\n", "30\n",
              "index 5 out of bounds for length 3 (main.sysl:13:8)\n")
     irg_main(IrgRing + "r[0] = 1\nprint(r[0])\nr[3] = 1\n", "1\n",
              "index 3 out of bounds for length 3 (main.sysl:14:2)\n")
-    irg_main(IrgRing + "print(r.at(i))\n", "", "index 5 out of bounds for length 3 (main.sysl:12:9)\n")
-    irg_main(IrgRing + "r.set(i, 1)\n", "", "index 5 out of bounds for length 3 (main.sysl:12:3)\n")
+    irg_main(IrgRing + "print(r[i])\n", "", "index 5 out of bounds for length 3 (main.sysl:12:8)\n")
+    irg_main(IrgRing + "r[i] = 1\n", "", "index 5 out of bounds for length 3 (main.sysl:12:2)\n")
 end irg_index_past
+
+@test("a wrapped InlineRing's get answers None past the count rather than trapping")
+irg_get_past()
+    irg_prints(IrgRing + "print(r.get(2).unwrap())\nprint(r.get(i).is_none())\nprint(r.get(3).is_none())\n",
+               "30\ntrue\ntrue\n")
+end irg_get_past
 
 @test("an empty InlineRing traps on index zero, and one in a struct field traps the same")
 irg_index_past_empty()
@@ -152,7 +172,7 @@ private val IrgReport: string =
 
 @test("an exported sysl_bounds_fail is handed an InlineRing's failure, with its location, and the trap follows")
 irg_override()
-    var files: [2](string, string) = [("main.sysl", "import report\n" + IrgRing + "print(r.at(i))\n"),
+    var files: [2](string, string) = [("main.sysl", "import report\n" + IrgRing + "print(r[i])\n"),
                                       ("report/report.sysl", IrgReport)]
 
     irg_traps(files[..], "", "override 0 5 0 3 located\n")

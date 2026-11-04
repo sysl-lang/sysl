@@ -88,6 +88,18 @@ private ctr_both(body: string, printed: string, said: string)
     ctr_traps_at(["0", DefaultOptimization], files[..], printed, said)
 end ctr_both
 
+// A one-file program that runs to a normal exit, printing `printed` and saying nothing.
+private ctr_prints(body: string, printed: string)
+    if !ctr_ready() then return
+
+    var files: [1](string, string) = [("main.sysl", ctr_text(body))]
+    val (state, out, err) = ctr_run(files[..], DefaultOptimization)
+
+    assert_eq(err, "")
+    assert_eq(out, printed)
+    assert(state == Status.Exited(0), s"stopped with $state, having printed '$out'")
+end ctr_prints
+
 // A struct holding `field`, laid in memory `calloc` zeroed, so the container in it was never
 // assigned; the body reads it as `h.items`.
 private ctr_zeroed(field: string, body: string) -> string =
@@ -125,10 +137,10 @@ ctr_buf_write()
 ctr_buf_compound()
     ctr_main(CtrBuf + "b[2] += 1\nprint(b[2])\nb[i] += 1\nprint(b[2])\n", "31\n", ctr_past("12:2"))
 
-@test("a Buf's at and set past the count trap")
-ctr_buf_at_and_set()
-    ctr_main(CtrBuf + "print(b.at(0))\nprint(b.at(i))\n", "10\n", ctr_past("11:9"))
-    ctr_main(CtrBuf + "b.set(0, 1)\nprint(b.at(0))\nb.set(i, 1)\n", "1\n", ctr_past("12:3"))
+@test("a Buf's get answers None past the count where its subscript traps")
+ctr_buf_get()
+    ctr_prints(CtrBuf + "print(b.get(0).unwrap())\nprint(b.get(i).is_none())\nprint(b.get(3).is_none())\n",
+               "10\ntrue\ntrue\n")
 
 @test("a Buf's insert at the count is a push, and past it traps in its own form")
 ctr_buf_insert()
@@ -162,11 +174,12 @@ ctr_buf_negative()
 
 // -- Frozen -----------------------------------------------------------------------------------------
 
-@test("a frozen buffer's subscript and at past the length trap")
+@test("a frozen buffer's subscript past the length traps, and its get answers None")
 ctr_frozen()
     ctr_both(CtrFrozen + "print(f[2])\nprint(f[i])\n", "30\n", ctr_past("12:8"))
-    ctr_main(CtrFrozen + "print(f.at(1))\nprint(f.at(3))\n", "20\n",
-             "index 3 out of bounds for length 3 (main.sysl:12:9)\n")
+    ctr_main(CtrFrozen + "print(f[1])\nprint(f[3])\n", "20\n",
+             "index 3 out of bounds for length 3 (main.sysl:12:8)\n")
+    ctr_prints(CtrFrozen + "print(f.get(1).unwrap())\nprint(f.get(3).is_none())\n", "20\ntrue\n")
 
 @test("an empty frozen buffer traps on index zero")
 ctr_frozen_empty()
@@ -180,17 +193,18 @@ ctr_deque_subscript()
     ctr_both(CtrDeque + "print(d[2])\nprint(d[i])\n", "30\n", ctr_past("11:8"))
     ctr_main(CtrDeque + "d[0] = 1\nprint(d[0])\nd[i] = 1\n", "1\n", ctr_past("12:2"))
 
-@test("a Deque's at and set past the count trap, the count itself included")
-ctr_deque_at_and_set()
-    ctr_main(CtrDeque + "print(d.at(3))\n", "", "index 3 out of bounds for length 3 (main.sysl:10:9)\n")
-    ctr_main(CtrDeque + "d.set(i, 1)\n", "", ctr_past("10:3"))
+@test("a Deque's subscript past the count traps, the count itself included, and its get answers None")
+ctr_deque_get()
+    ctr_main(CtrDeque + "print(d[3])\n", "", "index 3 out of bounds for length 3 (main.sysl:10:8)\n")
+    ctr_main(CtrDeque + "d[i] = 1\n", "", ctr_past("10:2"))
+    ctr_prints(CtrDeque + "print(d.get(2).unwrap())\nprint(d.get(3).is_none())\n", "30\ntrue\n")
 
 @test("an empty Deque and one never given storage trap on index zero")
 ctr_deque_empty()
     ctr_main("var d: Deque[int] = deque()\nprint(d[0])\n", "",
              "index 0 out of bounds for length 0 (main.sysl:6:8)\n")
-    ctr_main(ctr_zeroed("Deque[int]", "h.items.set(2, 1)\n"), "",
-             "index 2 out of bounds for length 0 (main.sysl:13:9)\n")
+    ctr_main(ctr_zeroed("Deque[int]", "h.items[2] = 1\n"), "",
+             "index 2 out of bounds for length 0 (main.sysl:13:8)\n")
 
 // -- Ring -------------------------------------------------------------------------------------------
 
@@ -200,10 +214,11 @@ ctr_ring_subscript()
     ctr_main(CtrRing + "r[0] = 1\nprint(r[0])\nr[3] = 1\n", "1\n",
              "index 3 out of bounds for length 3 (main.sysl:17:2)\n")
 
-@test("a Ring's at and set past the count trap")
-ctr_ring_at_and_set()
-    ctr_main(CtrRing + "print(r.at(i))\n", "", ctr_past("15:9"))
-    ctr_main(CtrRing + "r.set(i, 1)\n", "", ctr_past("15:3"))
+@test("a Ring's subscript past the count traps, and its get answers None")
+ctr_ring_get()
+    ctr_main(CtrRing + "print(r[i])\n", "", ctr_past("15:8"))
+    ctr_main(CtrRing + "r[i] = 1\n", "", ctr_past("15:2"))
+    ctr_prints(CtrRing + "print(r.get(2).unwrap())\nprint(r.get(i).is_none())\n", "30\ntrue\n")
 
 @test("an empty Ring traps on index zero")
 ctr_ring_empty()
@@ -256,7 +271,7 @@ ctr_override()
         (CtrBuf + "b.insert(i, 1)\n", "override 14 5 0 3 located\n"),
         (CtrFrozen + "print(f[i])\n", "override 0 5 0 3 located\n"),
         (CtrDeque + "d[i] = 1\n", "override 0 5 0 3 located\n"),
-        (CtrRing + "print(r.at(i))\n", "override 0 5 0 3 located\n"),
+        (CtrRing + "print(r[i])\n", "override 0 5 0 3 located\n"),
         ("var b: Buf[int] = buf()\nval k = -1\nprint(b[k])\n", "override 269 18446744073709551615 0 0 located\n")]
 
     for c in cases
@@ -377,7 +392,7 @@ ctr_bare_metal()
     write_text(s"$dir/main.sysl",
                "import sysl.container.ring.{Ring, ring}\n\n@export(\"main\")\nentry(n: usize) -> int\n" +
                "    var slots: [4]int = [0; 4]\n    var r = ring(slots[..])\n\n    r.push_back(7)\n" +
-               "    r[n] = 1\n    r.at(n)\n").unwrap()
+               "    r[n] = 1\n    r[n]\n").unwrap()
 
     val text = emit_llvm_text(dir, Some("thumb-freestanding-softfp"), DefaultOptimization, buf(), Some(buf())) match
         Err(why) -> s"did not compile: ${failure_text(why)}"
