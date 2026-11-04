@@ -994,8 +994,8 @@ the reference does not, and the refusal says which:
   ([memory]({{< ref "memory" >}})), and a trait that requires either. A `&T` meets both through its
   referent where the referent has them and by its identity where it does not, so a trait requiring
   either is met through a `&T` like any other;
-- **an operator's trait** — `Ord`, `Add` and the rest — since `a < b` and `a + b` do not see through a
-  reference;
+- **an operator's trait** — `PartialOrd`, `Add` and the rest, and `Ord`, which requires `PartialOrd` —
+  since `a < b` and `a + b` do not see through a reference;
 - **a member naming `Self` away from its receiver**, such as `merge(self, other: Self)`, since `Self`
   would be the reference in the body and the referent in the implementation;
 - **an associated function or a static property**, which is reached through the type, and a
@@ -1018,7 +1018,7 @@ main()
 ```
 
 ```error
-'least' requires its type parameter 'T' to implement 'Ord', but &N does not — N implements it, but 'Ord' is an operator's, and an operator does not see through a reference
+'least' requires its type parameter 'T' to implement 'Ord', but &N does not — N implements it, but 'PartialOrd' is an operator's, and an operator does not see through a reference
 ```
 
 `Display` and `Debug` are reached through, so `v.display(…)` on a `T` at `*P` is `P`'s. What

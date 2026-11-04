@@ -25,8 +25,8 @@ enum OpKind
     // A binary operator yielding the operand type: `Add`, `Shl`, and the rest of the table.
     Arith
 
-    // A comparison yielding `bool`. The trait requires the *one* method the other operators are
-    // derived from, so this is `==` for `Eq` and `<` for `Ord`.
+    // A comparison yielding `bool`, which the other comparisons are built from: `==` for `Eq`, and
+    // `<` for `PartialOrd`, whose `le` is `<=` (`core_member_op`).
     Compare
 
     // A prefix operator on the receiver alone: `Neg`, `Not`.
@@ -35,8 +35,10 @@ end OpKind
 
 // The one method a trait requires, the operator that method *is*, and what it lowers to.
 //
-// There is exactly one method per trait, and that is the point: implementing a comparison means
-// writing `lt`, not four functions that could disagree with each other.
+// There is one method per trait, and that is the point: implementing a comparison means writing
+// `lt`, not four functions that could disagree with each other. `PartialOrd` is the one trait with a
+// second operator member, `le`, since a partial order's `<=` is not `!(b < a)`; `Ord` declares
+// nothing, being the promise that the order is total, and is no operator's trait.
 core_required(trait_name: string) -> Option[(string, string, OpKind)] = trait_name match
     "Add" -> Some(("add", "+", Arith))
     "Sub" -> Some(("sub", "-", Arith))
@@ -51,8 +53,16 @@ core_required(trait_name: string) -> Option[(string, string, OpKind)] = trait_na
     "Neg" -> Some(("neg", "-", Prefix))
     "Not" -> Some(("not", "~", Prefix))
     "Eq" -> Some(("eq", "==", Compare))
-    "Ord" -> Some(("lt", "<", Compare))
+    "PartialOrd" -> Some(("lt", "<", Compare))
     _ -> None
+
+// The method an operator calls on a type that dispatches it, and the token a catalog method lowers
+// to on a built-in: the trait's required one, except that `<=` and `>=` are `PartialOrd`'s `le`.
+core_member_op(method: string, required: (string, string, OpKind)) -> string =
+    if method == "le" then "<=" else required.1
+
+core_op_method(op: string, required: (string, string, OpKind)) -> string =
+    if op == "<=" || op == ">=" then "le" else required.0
 
 // The trait a method name belongs to, which is the direction member lookup needs: a call written
 // `x.add(y)` has to find `Add` before it can ask whether `x`'s type is a member. The method names
@@ -71,7 +81,8 @@ core_declaring(method: string) -> Option[string] = method match
     "neg" -> Some("Neg")
     "not" -> Some("Not")
     "eq" -> Some("Eq")
-    "lt" -> Some("Ord")
+    "lt" -> Some("PartialOrd")
+    "le" -> Some("PartialOrd")
     _ -> None
 
 // Each infix operator token, and the trait its operands must satisfy. The four derived comparisons
@@ -89,10 +100,10 @@ core_infix(op: string) -> Option[string] = op match
     ">>" -> Some("Shr")
     "==" -> Some("Eq")
     "!=" -> Some("Eq")
-    "<" -> Some("Ord")
-    ">" -> Some("Ord")
-    "<=" -> Some("Ord")
-    ">=" -> Some("Ord")
+    "<" -> Some("PartialOrd")
+    ">" -> Some("PartialOrd")
+    "<=" -> Some("PartialOrd")
+    ">=" -> Some("PartialOrd")
     _ -> None
 
 // Each prefix operator token and its trait, kept apart from the infix table because `-` is in both.
@@ -112,20 +123,21 @@ core_selects_by_operand(trait_name: string) -> bool = core_required(trait_name) 
     Some(row) -> row.2 == Arith
     None -> false
 
-// How each comparison is built from the one method its trait requires: whether the operands are
-// swapped, and whether the result is negated.
+// How each comparison is built from the method it calls (`core_op_method`): whether the operands
+// are swapped, and whether the result is negated.
 //
-// `a > b` is `lt(b, a)` and `a <= b` is `!lt(b, a)`, so two of the six **swap**. On a scalar that is
-// invisible -- the memberships below keep the built-ins on their native comparisons, which is also
-// what keeps a float's `NaN` behaviour intact -- but on a type whose `lt` is a real call, the swap
-// is a change in the order the two operand expressions are evaluated.
+// `a > b` is `lt(b, a)` and `a >= b` is `le(b, a)`, so two of the six **swap**; only `!=` negates.
+// **No ordering is a negation**, which is what keeps a partial order right: `!lt(b, a)` is true of a
+// NaN and a number, where `a <= b` is false. On a scalar none of this is seen -- the memberships
+// below keep the built-ins on their native comparisons -- but on a type whose `lt` is a real call,
+// the swap is a change in the order the two operand expressions are evaluated.
 core_derivation(op: string) -> (bool, bool) = op match
     "==" -> (false, false)
     "!=" -> (false, true)
     "<" -> (false, false)
     ">" -> (true, false)
-    "<=" -> (true, true)
-    ">=" -> (false, true)
+    "<=" -> (false, false)
+    ">=" -> (true, false)
     _ -> (false, false)
 
 // The traits whose members a built-in has by rule, but which are **not** operators -- so they are
@@ -288,7 +300,13 @@ core_builtin(trait_name: string, subject: Type) -> bool
             _ -> false
 
         "Eq" -> is_equatable(t)
-        "Ord" -> is_ordered(t)
+
+        // **A float is ordered partially and nothing else**: a NaN is unordered with every value, so
+        // the comparisons a total order promises -- of `a < b`, `a == b`, `a > b` exactly one -- do not
+        // hold of it, and a sort or a `max` over `Ord` would answer by the order its operands came
+        // in. Every other ordered built-in -- the integers, fixed point, `char`, `string` -- is total.
+        "PartialOrd" -> is_ordered(t)
+        "Ord" -> is_ordered(t) && !is_float(t)
 
         // **A reference or a pointer is always a key**: a `&T` hashes as its referent does where the
         // referent has a `Hash`, and by the address it holds where it does not -- which is what its
@@ -344,6 +362,12 @@ end core_builtin
 
 private is_integer(t: Type) -> bool = t match
     Integer(_, _, _) -> true
+    _ -> false
+
+// `t` is already the operator's subject (`op_subject`), so a constrained float and a float vector
+// are asked at their float.
+private is_float(t: Type) -> bool = underlying(t) match
+    Floating(_, _) -> true
     _ -> false
 
 // Whether a type is a counted reference or a raw pointer to something that is not a trait -- the

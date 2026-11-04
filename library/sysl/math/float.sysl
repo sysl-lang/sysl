@@ -34,7 +34,7 @@ import sysl.sys.*
  * What stays per width is what needs a literal that is neither zero nor one -- the two angle
  * conversions, whose factor is pi over 180.
  */
-trait Float: Zero + One + Eq + Ord + Neg + Add + Sub + Mul + Div + Display + Debug
+trait Float: Zero + One + Eq + PartialOrd + Neg + Add + Sub + Mul + Div + Display + Debug
 
     // --- The type's own values, which no receiver is needed to ask for. ---
     //
@@ -158,9 +158,8 @@ trait Float: Zero + One + Eq + Ord + Neg + Add + Sub + Mul + Div + Display + Deb
 
     /** The larger and the smaller of two as a method, with `max_num`'s and `min_num`'s answers:
      * **a NaN loses to a number**, so `nan.max(1.0)` and `1.0.max(nan)` are both `1.0`, and only two
-     * NaNs answer a NaN. This is what Rust's `f64::max` does. It is *not* what the free function
-     * `sysl.math.max` does, which is generic over `Ord` and so cannot tell a NaN from a tie: that one
-     * answers its first argument whenever the comparison is false.
+     * NaNs answer a NaN. This is what Rust's `f64::max` does, and it is the `max` a float has: the
+     * free function `sysl.math.max` is bounded by `Ord`, which a float is not, and refuses one.
      *
      * Two zeros of opposite sign compare equal, and either may be the answer; `maximum` and `minimum`
      * order `-0.0` below `0.0`.
@@ -187,6 +186,18 @@ trait Float: Zero + One + Eq + Ord + Neg + Add + Sub + Mul + Div + Display + Deb
      */
     maximum(self, other: Self) -> Self
     minimum(self, other: Self) -> Self
+
+    /** Whether the receiver comes before `other` in IEEE 754's **total order** (`totalOrder`), the
+     * order Rust's `f64::total_cmp` gives: negative NaNs, minus infinity, the negative numbers,
+     * `-0.0`, `0.0`, the positive numbers, infinity, positive NaNs. Every two values compare in it
+     * -- a NaN equals only a NaN of the same bits, and `-0.0` comes before `0.0` -- so it is the
+     * order to sort floats by, which `<` is not: `sort_by(xs, (a, b) -> a.total_lt(b))`.
+     *
+     * It reads the bits rather than comparing values, which is what lets it order what `<` cannot:
+     * a negative value's bits, read as a signed integer, run the wrong way, so all but the sign bit
+     * are flipped first and the integers then compare in exactly this order.
+     */
+    total_lt(self, other: Self) -> bool
 
     /** The remainder of a division that truncates, keeping the sign of the receiver. This is `%` on
      * the integers and is *not* `%` here: `01` leaves `Rem` to the integer types, since a float
@@ -309,6 +320,7 @@ impl Float for real
     min_num(self, other: real) -> real = sysl_minnum(self, other)
     maximum(self, other: real) -> real = sysl_maximum(self, other)
     minimum(self, other: real) -> real = sysl_minimum(self, other)
+    total_lt(self, other: real) -> bool = total_key64(self.bits()) < total_key64(other.bits())
     fmod(self, divisor: real) -> real = sysl_fmod(self, divisor)
 
     abs(self) -> real = sysl_fabs(self)
@@ -317,6 +329,13 @@ impl Float for real
     to_radians(self) -> real = self * 0.017453292519943295
     to_degrees(self) -> real = self * 57.29577951308232
 end real
+
+// A float's bits as an unsigned integer that orders as `totalOrder` does: a negative value's bits
+// run the wrong way and are all flipped, and a positive value's gain the sign bit, which puts every
+// positive above every negative. One per storage width.
+private total_key64(b: u64) -> u64 = if b >> 63 != 0 then ~b else b | 0x8000000000000000
+private total_key32(b: u32) -> u32 = if b >> 31 != 0 then ~b else b | 0x80000000
+private total_key16(b: u16) -> u16 = if b >> 15 != 0 then ~b else b | 0x8000
 
 /** Binary32. Every body here is its binary64 counterpart with libm's `f`-suffixed entry point and a
  * literal of this width, which is the duplication the trait exists to keep out of programs.
@@ -370,6 +389,7 @@ impl Float for f32
     min_num(self, other: f32) -> f32 = sysl_minnumf(self, other)
     maximum(self, other: f32) -> f32 = sysl_maximumf(self, other)
     minimum(self, other: f32) -> f32 = sysl_minimumf(self, other)
+    total_lt(self, other: f32) -> bool = total_key32(self.bits()) < total_key32(other.bits())
     fmod(self, divisor: f32) -> f32 = sysl_fmodf(self, divisor)
 
     abs(self) -> f32 = sysl_fabsf(self)
@@ -478,6 +498,7 @@ impl Float for f16
     min_num(self, other: f16) -> f16 = f16(sysl_minnumf(f32(self), f32(other)))
     maximum(self, other: f16) -> f16 = f16(sysl_maximumf(f32(self), f32(other)))
     minimum(self, other: f16) -> f16 = f16(sysl_minimumf(f32(self), f32(other)))
+    total_lt(self, other: f16) -> bool = total_key16(self.bits()) < total_key16(other.bits())
     fmod(self, divisor: f16) -> f16 = f16(sysl_fmodf(f32(self), f32(divisor)))
 
     abs(self) -> f16 = f16(sysl_fabsf(f32(self)))
@@ -553,6 +574,7 @@ impl Float for bf16
     min_num(self, other: bf16) -> bf16 = bf16(sysl_minnumf(f32(self), f32(other)))
     maximum(self, other: bf16) -> bf16 = bf16(sysl_maximumf(f32(self), f32(other)))
     minimum(self, other: bf16) -> bf16 = bf16(sysl_minimumf(f32(self), f32(other)))
+    total_lt(self, other: bf16) -> bool = total_key16(self.bits()) < total_key16(other.bits())
     fmod(self, divisor: bf16) -> bf16 = bf16(sysl_fmodf(f32(self), f32(divisor)))
 
     abs(self) -> bf16 = bf16(sysl_fabsf(f32(self)))
