@@ -1,0 +1,409 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.testing.skip
+import sysl.text.{cstring, replace_all, split}
+
+// Two `sysl build-c` archives linked into one C program. Each carries its own copy of the standard
+// library code it reaches, and of the root functions and generic instances of its own package -- and
+// every one of those is named under a spelling C cannot use but the two archives share
+// (`sysl$prints`, `helper$$sysl`, `sysl.buf$Buf.push.P`). Left global they were refused at the C link
+// as duplicate symbols, and merged they would be worse: one archive would run the other's `helper`,
+// or push its `P` with the other's layout. So every name C cannot spell is internal to its archive,
+// and what the C link sees is the exports and the runtime's C-named hooks.
+//
+// What the two archives share is what C's runtime owns: the heap (one allocator pair, here a counting
+// one the C program defines) and stdout (C's one buffer, so their lines and C's own come out in the
+// order they were written). The library's module storage is one copy per archive: a log level one
+// archive sets is not the other's.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private bca_ready() -> bool = std_root().is_ok() && clang_available()
+
+private extern "setenv" bca_c_setenv(name: *u8, value: *u8, overwrite: int) -> int
+private extern "unsetenv" bca_c_unsetenv(name: *u8) -> int
+
+// Every build that follows in `n` codegen units, or, given 0, in as many as the build would choose.
+private bca_units(n: int)
+    val k = cstring("SYSL_CODEGEN_UNITS")
+
+    if n == 0
+        bca_c_unsetenv(k.ptr)
+        return
+
+    val v = cstring(s"$n")
+
+    bca_c_setenv(k.ptr, v.ptr, 1)
+
+// A package `name` in its own directory under `root`, its manifest naming the C program's counting
+// allocator.
+private bca_package(root: string, name: string, text: string) -> string
+    val dir = s"$root/$name"
+
+    make_dir_all(dir).unwrap()
+    write_text(s"$dir/sysl.hocon", s"package {\n  name = \"$name\"\n}\n\n" +
+               "allocator {\n  alloc = \"bca_alloc\"\n  free = \"bca_free\"\n}\n").unwrap()
+    write_text(s"$dir/main.sysl", text).unwrap()
+    dir
+end bca_package
+
+// `sysl build-c` of `dir` into `<dir>.a`, with whatever else is asked; the archive, or what was said.
+private bca_archive(dir: string, more: []const string) -> Result[string, string]
+    val archive = s"$dir.a"
+    var args: Buf[string] = buf()
+
+    for a in ["sysl", "build-c", dir, "-o", archive]
+        args.push(a)
+
+    for a in more
+        args.push(a)
+
+    val (code, out, err) = clx_ran(args.view())
+
+    if code != Fine then return Err(s"build-c failed:\n$out$err")
+
+    Ok(archive)
+end bca_archive
+
+// The C program `main_c` linked against `archives` in that order and run: what it printed, or why
+// it was not.
+private bca_linked_run(root: string, main_c: string, archives: []const string) -> string
+    write_text(s"$root/main.c", main_c).unwrap()
+
+    var args: Buf[string] = buf()
+
+    args.push(s"$root/main.c")
+
+    for a in archives
+        args.push(a)
+
+    for a in ["-lm", "-o", s"$root/app"]
+        args.push(a)
+
+    val linked = capture("clang", args.view(), "", [], true) match
+        Err(_) -> return "clang could not be run"
+        Ok(o) -> o
+
+    if !linked.status.ok() then return s"the link failed:\n${linked.text}${linked.err.unwrap_or("")}"
+
+    capture(s"$root/app", [], "", [], true) match
+        Err(_) -> "the linked program could not be run"
+        Ok(o) -> replace_all(o.text, s"$root/", "")
+end bca_linked_run
+
+// The archive's global definitions, as `nm -g --defined-only` lists them, one name per entry.
+private bca_globals(archive: string) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    val listed = capture("nm", ["-g", "--defined-only", archive], "", [], true) match
+        Err(_) -> return out
+        Ok(o) -> o.text
+
+    for line in split(listed, "\n")
+        val parts = split(line.trim(), " ")
+
+        if parts.len == 3 then out.push(parts[2])
+
+    out
+end bca_globals
+
+// One archive's code: strings, a `Buf`, a `real` and `print`, and the log level.
+private bca_strings(tag: string, real: string) -> string =
+    "import sysl.buf.{Buf, buf}\nimport sysl.log.{set_level, level, Level}\n\n" +
+    s"@export(\"${tag}_run\")\n${tag}_run(n: i32) -> i32\n    var b: Buf[string] = buf()\n\n" +
+    s"    for i in 0..<n\n        b.push(s\"$tag$${i}\")\n\n" +
+    s"    print(s\"from $tag: $${b.len()} $${b[0]} $${$real}\")\n    i32(b.len())\n\n" +
+    s"@export(\"${tag}_quiet\")\n${tag}_quiet() = set_level(Level.Error)\n\n" +
+    s"@export(\"${tag}_level\")\n${tag}_level() = print(s\"$tag sees $${level()}\")\n"
+
+// The C program both string archives link into. It owns the heap, counting what the two archives
+// take and give back, and prints between their calls through the same stdout they print through.
+private val bca_strings_main: string = raw"""
+    #include <stdio.h>
+    #include <stdlib.h>
+
+    static long live = 0, made = 0;
+
+    void *bca_alloc(size_t n) { made++; live++; return malloc(n); }
+    void bca_free(void *p) { if (p) live--; free(p); }
+
+    int a_run(int n); int b_run(int n);
+    void a_quiet(void); void a_level(void); void b_level(void);
+
+    int main(void) {
+        int x = a_run(3);
+        printf("c between\n");
+        int y = b_run(4);
+        int z = a_run(1);
+        a_quiet();
+        a_level();
+        b_level();
+        printf("c: %d %d %d\n", x, y, z);
+        printf("live %ld, made %s\n", live, made > 0 ? "some" : "none");
+        return 0;
+    }
+    """
+
+private val bca_strings_said: string =
+    "from a: 3 a0 2.5\nc between\nfrom b: 4 b0 1.5\nfrom a: 1 a0 2.5\na sees Error\nb sees Info\n" +
+    "c: 3 4 1\nlive 0, made some\n"
+
+// Two archives whose root function `helper` and root struct `P` share their names and nothing else:
+// a different body, and a different layout under the same `Buf[P]` instance names.
+private bca_same_names(tag: string) -> string
+    val (fields, body, made, answer) = if tag == "a" then
+        ("    x: i32\n", "n + 1", "P(helper(n))", "b[0].x")
+    else
+        ("    x: i64\n    y: i64\n", "n * 10", "P(i64(helper(n)), 7)", "i32(b[0].x + b[0].y)")
+
+    "import sysl.buf.{Buf, buf}\n\n" + s"struct P\n$fields\n" + s"helper(n: i32) -> i32 = $body\n\n" +
+    s"@export(\"${tag}_run\")\n${tag}_run(n: i32) -> i32\n    var b: Buf[P] = buf()\n\n" +
+    s"    b.push($made)\n    $answer\n"
+end bca_same_names
+
+private val bca_same_names_main: string = raw"""
+    #include <stdio.h>
+    #include <stdlib.h>
+
+    void *bca_alloc(size_t n) { return malloc(n); }
+    void bca_free(void *p) { free(p); }
+
+    int a_run(int n); int b_run(int n);
+
+    int main(void) {
+        printf("a=%d b=%d\n", a_run(3), b_run(3));
+        return 0;
+    }
+    """
+
+// -- the tests ------------------------------------------------------------------------------------
+
+@test("two build-c archives using strings, a Buf and print link into one C program, in either order")
+bca_two_archives_link_and_run()
+    if !bca_ready() then skip("no clang or no standard library")
+
+    val root = replace_all(make_temp_dir("sysl-bca").unwrap(), "//", "/")
+    val a = bca_archive(bca_package(root, "a", bca_strings("a", "2.5")), []).unwrap()
+    val b = bca_archive(bca_package(root, "b", bca_strings("b", "1.5")), []).unwrap()
+
+    assert_eq(bca_linked_run(root, bca_strings_main, [a, b]), bca_strings_said)
+    assert_eq(bca_linked_run(root, bca_strings_main, [b, a]), bca_strings_said)
+    remove_dir_all(root).unwrap_or(())
+
+@test("two archives each keep their own root function and their own instance over a root type of the same name")
+bca_same_names_stay_apart()
+    if !bca_ready() then skip("no clang or no standard library")
+
+    val root = replace_all(make_temp_dir("sysl-bca").unwrap(), "//", "/")
+    val a = bca_archive(bca_package(root, "a", bca_same_names("a")), []).unwrap()
+    val b = bca_archive(bca_package(root, "b", bca_same_names("b")), []).unwrap()
+
+    // `a_run(3)` is helper 3 + 1 in a P of one i32; `b_run(3)` is helper 3 * 10, plus 7, in a P of two
+    // i64s. Either archive running the other's `helper` or pushing with the other's layout shows here.
+    assert_eq(bca_linked_run(root, bca_same_names_main, [a, b]), "a=4 b=37\n")
+    assert_eq(bca_linked_run(root, bca_same_names_main, [b, a]), "a=4 b=37\n")
+    remove_dir_all(root).unwrap_or(())
+
+@test("the same two archives built as four codegen units still link and keep their own definitions")
+bca_same_names_in_units()
+    if !bca_ready() then skip("no clang or no standard library")
+
+    val root = replace_all(make_temp_dir("sysl-bca").unwrap(), "//", "/")
+
+    bca_units(4)
+
+    val a = bca_archive(bca_package(root, "a", bca_same_names("a")), [])
+    val b = bca_archive(bca_package(root, "b", bca_same_names("b")), [])
+
+    bca_units(0)
+
+    assert_eq(bca_linked_run(root, bca_same_names_main, [a.unwrap(), b.unwrap()]), "a=4 b=37\n")
+    remove_dir_all(root).unwrap_or(())
+
+@test("an archive's global definitions are its exports and C-named hooks, and nothing C cannot spell")
+bca_globals_are_c_names()
+    if !bca_ready() then skip("no clang or no standard library")
+
+    val root = replace_all(make_temp_dir("sysl-bca").unwrap(), "//", "/")
+    val a = bca_archive(bca_package(root, "a", bca_strings("a", "2.5")), []).unwrap()
+    val names = bca_globals(a)
+    var exports = 0
+
+    for name in names
+        // Mach-O prefixes every C name with `_`.
+        val bare = if name.starts_with("_") then name[1..] else name
+
+        assert(c_identifier(bare), s"'$name' is global in the archive")
+
+        if bare == "a_run" || bare == "a_quiet" || bare == "a_level" then exports += 1
+
+    remove_dir_all(root).unwrap_or(())
+    assert_eq(exports, 3, s"${names.len()} globals")
+
+@test("two freestanding ELF archives with a root function of one name link under ld.lld")
+bca_elf_archives_link()
+    if !bca_ready() then skip("no clang or no standard library")
+
+    val lld = capture("ld.lld", ["--version"]) match
+        Ok(c) -> c.status.ok()
+        Err(_) -> false
+
+    if !lld then skip("ld.lld is not installed, so the ELF archives cannot be linked")
+
+    val root = replace_all(make_temp_dir("sysl-bca").unwrap(), "//", "/")
+    var archives: Buf[string] = buf()
+
+    for tag in ["a", "b"]
+        val dir = s"$root/$tag"
+
+        make_dir_all(dir).unwrap()
+        write_text(s"$dir/sysl.hocon", s"package {\n  name = \"$tag\"\n}\n").unwrap()
+        write_text(s"$dir/main.sysl", s"helper(n: int) -> int = n + ${if tag == "a" then 1 else 2}\n\n" +
+                   s"@export(\"${tag}_run\")\n${tag}_run(n: int) -> int\n    print(helper(n))\n" +
+                   "    helper(n)\n").unwrap()
+        archives.push(bca_archive(dir, ["--target", "aarch64-freestanding"]).unwrap())
+
+    val linked = capture("ld.lld", ["-r", "--whole-archive", archives.at(0), archives.at(1), "-o",
+                                    s"$root/both.o"], "", [], true).unwrap()
+
+    remove_dir_all(root).unwrap_or(())
+    assert(linked.status.ok(), linked.err.unwrap_or(""))
+end bca_elf_archives_link
+
+@test("a sysl program links a build-c archive whose root function and root type share the program's names")
+bca_program_links_an_archive()
+    if !bca_ready() then skip("no clang or no standard library")
+
+    val root = replace_all(make_temp_dir("sysl-bca").unwrap(), "//", "/")
+    val dir = s"$root/a"
+
+    make_dir_all(dir).unwrap()
+    make_dir_all(s"$root/libs").unwrap()
+    write_text(s"$dir/sysl.hocon", "package {\n  name = \"a\"\n}\n").unwrap()
+    write_text(s"$dir/main.sysl", bca_same_names("a")).unwrap()
+
+    val built = clx_ran(["sysl", "build-c", dir, "-o", s"$root/libs/libbca.a"])
+
+    assert_eq(built.0, Fine, built.1 + built.2)
+
+    val program = s"$root/p"
+
+    make_dir_all(program).unwrap()
+    write_text(s"$program/sysl.hocon", "package {\n  name = \"p\"\n}\n").unwrap()
+    write_text(s"$program/main.sysl", raw"""
+        @link("bca")
+
+        import sysl.buf.{Buf, buf}
+
+        extern "a_run" a_run(n: i32) -> i32
+
+        struct P
+            label: string
+
+        helper(n: i32) -> i32 = n + 100
+
+        var ps: Buf[P] = buf()
+
+        ps.push(P("own"))
+        print(s"p: ${helper(1)} ${ps[0].label}")
+        print(a_run(3))
+        """).unwrap()
+
+    val linked = clx_ran(["sysl", "build", program, "--link-path", s"$root/libs", "-o", s"$root/app"])
+
+    assert_eq(linked.0, Fine, linked.1 + linked.2)
+
+    val said = capture(s"$root/app", [], "", [], true).unwrap().text
+
+    remove_dir_all(root).unwrap_or(())
+    assert_eq(said, "p: 101 own\n4\n")
+end bca_program_links_an_archive
+
+@test("one archive alone links and runs as before")
+bca_one_archive_alone()
+    if !bca_ready() then skip("no clang or no standard library")
+
+    val root = replace_all(make_temp_dir("sysl-bca").unwrap(), "//", "/")
+    val a = bca_archive(bca_package(root, "a", bca_strings("a", "2.5")), []).unwrap()
+    val main_c = raw"""
+        #include <stdio.h>
+        #include <stdlib.h>
+
+        static long live = 0;
+
+        void *bca_alloc(size_t n) { live++; return malloc(n); }
+        void bca_free(void *p) { if (p) live--; free(p); }
+
+        int a_run(int n); void a_level(void);
+
+        int main(void) {
+            printf("%d\n", a_run(2));
+            a_level();
+            printf("live %ld\n", live);
+            return 0;
+        }
+        """
+
+    assert_eq(bca_linked_run(root, main_c, [a]), "from a: 2 a0 2.5\n2\na sees Info\nlive 0\n")
+    remove_dir_all(root).unwrap_or(())
+
+// Whether the archive built for `target` from `text` defines every one of `wanted` as a global, and
+// nothing global that C cannot spell: what is missing or wrongly global, or "" when it all holds.
+private bca_libcalls_kept(target: string, text: string, wanted: []const string) -> string
+    val root = replace_all(make_temp_dir("sysl-bca").unwrap(), "//", "/")
+    val dir = s"$root/lc"
+
+    make_dir_all(dir).unwrap()
+    write_text(s"$dir/sysl.hocon", "package {\n  name = \"lc\"\n}\n").unwrap()
+    write_text(s"$dir/main.sysl", text).unwrap()
+
+    val made = bca_archive(dir, ["--target", target])
+    var said = ""
+
+    made match
+        Err(why) -> said = why
+        Ok(a) ->
+            val names = bca_globals(a)
+
+            for name in names
+                if !c_identifier(name) then said = said + s"$target: '$name' is global\n"
+
+            for w in wanted
+                var found = false
+
+                for name in names
+                    if name == w then found = true
+
+                if !found then said = said + s"$target: '$w' is not a global definition\n"
+
+    remove_dir_all(root).unwrap_or(())
+    said
+end bca_libcalls_kept
+
+// A libcall is a C name the code generator calls and something outside the archive may resolve,
+// so the routines behind one stay global (weak) while the library code under them is internal.
+@test("the libcalls an archive defines stay global on every target: soft integer, soft float, memory")
+bca_libcalls_stay_global()
+    if !bca_ready() then skip("no clang or no standard library")
+
+    val m0 = bca_libcalls_kept("thumbv6m-freestanding",
+                               "@export(\"mix\")\nmix(a: u64, b: u64, x: f64, y: f64, f: f32) -> f64 =\n" +
+                               "    f64(a / b) + x * y + f64(f * 2.5)\n",
+                               ["mix", "__aeabi_uldivmod", "__aeabi_ldivmod", "__aeabi_lmul",
+                                "__aeabi_dadd", "__aeabi_dmul", "__aeabi_fmul", "__aeabi_f2d",
+                                "__aeabi_ul2d", "__aeabi_memcpy", "__aeabi_memset", "__clzsi2",
+                                "fma"])
+    val quad = "@export(\"quad\")\nquad(a: f128, b: f128) -> f128 = a * b + a\n\n" +
+               "@export(\"wide_div\")\nwide_div(a: u64, b: u64) -> u64 = a / b\n"
+    val rv = bca_libcalls_kept("riscv32-freestanding", quad,
+                               ["quad", "wide_div", "__udivdi3", "__umoddi3", "__divdi3", "__muldf3",
+                                "__addsf3", "__addtf3", "__multf3", "__extenddftf2"])
+    val a64 = bca_libcalls_kept("aarch64-freestanding", quad,
+                                ["quad", "wide_div", "__addtf3", "__multf3", "__divtf3", "__trunctfdf2"])
+
+    assert_eq(m0 + rv + a64, "")
+end bca_libcalls_stay_global
