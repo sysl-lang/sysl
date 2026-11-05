@@ -1,0 +1,275 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// **Two declarations of one generic name are two functions at every instantiation**
+// (`reference/declarations.md § Overloading`). An instantiation is filed under the declaration's own
+// overload slot, so `f[T](v: []T)` and `f[T](v: Buf[T])` made real at one `T` are two bodies with two
+// signatures: neither call is answered by the other's, whichever order the calls come in. A type's
+// own members overload the same way, and a member with type parameters of its own is weighed by
+// reading the call against it, as a generic free function is.
+//
+// Each declaration answers differently, so a call reaching the wrong one prints the wrong thing
+// rather than failing to compile.
+
+private ogs_ready() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+
+    true
+end ogs_ready
+
+// What a program of these files prints, or what stopped it.
+private ogs_ran_files(files: []const (string, string)) -> string
+    val root = make_temp_dir("sysl-ogs").unwrap()
+
+    for i in 0..<files.len
+        val at = s"$root/${files[i].0}"
+
+        make_dir_all(parent_of(at).unwrap()).unwrap()
+        write_text(at, files[i].1).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end ogs_ran_files
+
+private ogs_ran(text: string) -> string = ogs_ran_files([("main.sysl", text)])
+
+// The pair the report was about, and the values each is called with.
+private ogs_pair() -> string =
+    "import sysl.buf.{Buf, buf}\n\n" +
+    "f[T](v: []T) -> usize = v.len\n" +
+    "f[T](v: Buf[T]) -> usize = 9\n\n" +
+    "var arr = [1u8, 2, 3]\n" +
+    "val a: []u8 = arr[..]\n" +
+    "var b: Buf[u8] = buf()\n"
+
+// -- the reproducer ---------------------------------------------------------------------------------
+
+@test("a slice overload and a Buf overload both instantiated at one T are two functions")
+ogs_slice_then_buf()
+    if !ogs_ready() then return
+
+    assert_eq(ogs_ran(ogs_pair() + "print(f(a))\nprint(f(b))\n"), "3\n9\n")
+end ogs_slice_then_buf
+
+@test("and in the other order")
+ogs_buf_then_slice()
+    if !ogs_ready() then return
+
+    assert_eq(ogs_ran(ogs_pair() + "print(f(b))\nprint(f(a))\n"), "9\n3\n")
+end ogs_buf_then_slice
+
+@test("and each alone means its own declaration")
+ogs_each_alone()
+    if !ogs_ready() then return
+
+    assert_eq(ogs_ran(ogs_pair() + "print(f(a))\n"), "3\n")
+    assert_eq(ogs_ran(ogs_pair() + "print(f(b))\n"), "9\n")
+end ogs_each_alone
+
+@test("at two different type arguments, each pair is two functions")
+ogs_two_targs()
+    if !ogs_ready() then return
+
+    assert_eq(ogs_ran(ogs_pair() +
+                      "var ints = [1, 2]\nval ai: []int = ints[..]\nvar bi: Buf[int] = buf()\n" +
+                      "print(f(b), f(a), f(bi), f(ai))\n"), "9 3 9 2\n")
+end ogs_two_targs
+
+@test("a pair differing only in arity, instantiated at one T, runs each body")
+ogs_arity_pair()
+    if !ogs_ready() then return
+
+    // The same collision once printed `1 1`: the second call ran the first body.
+    assert_eq(ogs_ran("g[T](x: T) -> int = 1\ng[T](x: T, y: T) -> int = 2\n\n" +
+                      "print(g(1), g(1, 2), g(\"a\"), g(\"a\", \"b\"))\n"), "1 2 1 2\n")
+end ogs_arity_pair
+
+// -- the neighbouring shapes ------------------------------------------------------------------------
+
+@test("a non-generic slice and Buf pair is chosen by the argument")
+ogs_plain_pair()
+    if !ogs_ready() then return
+
+    assert_eq(ogs_ran("import sysl.buf.{Buf, buf}\n\n" +
+                      "e(v: []u8) -> string = \"slice\"\ne(v: Buf[u8]) -> string = \"buf\"\n\n" +
+                      "var arr = [1u8]\nvar b: Buf[u8] = buf()\nprint(e(arr[..]), e(b))\n"),
+              "slice buf\n")
+end ogs_plain_pair
+
+@test("a read-only view overload and a Buf overload at one T")
+ogs_const_view_and_buf()
+    if !ogs_ready() then return
+
+    assert_eq(ogs_ran("import sysl.buf.{Buf, buf}\n\n" +
+                      "c[T](v: []const T) -> string = \"view\"\nc[T](v: Buf[T]) -> string = \"buf\"\n\n" +
+                      "var arr = [1u8]\nvar b: Buf[u8] = buf()\nprint(c(arr[..]), c(b))\n"),
+              "view buf\n")
+end ogs_const_view_and_buf
+
+@test("a writable view beats a read-only one where the argument is writable, at one T")
+ogs_exact_view_wins()
+    if !ogs_ready() then return
+
+    // A `[]u8` also becomes a `[]const u8`, so both fit; the exact one is chosen, and a read-only
+    // argument reaches the read-only declaration rather than the first one's instantiation.
+    assert_eq(ogs_ran("v[T](x: []T) -> string = \"mut\"\nv[T](x: []const T) -> string = \"const\"\n\n" +
+                      "var arr = [1u8]\nval ro: []const u8 = arr[..]\n" +
+                      "print(v(arr[..]), v(ro))\nprint(v(ro), v(arr[..]))\n"), "mut const\nconst mut\n")
+end ogs_exact_view_wins
+
+@test("an array overload beside a slice one at one T, an array also becoming a slice")
+ogs_array_and_slice()
+    if !ogs_ready() then return
+
+    assert_eq(ogs_ran("s[T](x: []T) -> string = \"slice\"\ns[T](x: [3]T) -> string = \"array\"\n" +
+                      "d[T](x: []const T) -> string = \"view\"\nd[T](x: [3]T) -> string = \"array\"\n\n" +
+                      "var arr = [1, 2, 3]\nval ro: []const int = arr[..]\n" +
+                      "print(s(arr), s(arr[..]))\nprint(s(arr[..]), s(arr))\nprint(d(ro), d(arr))\n"),
+              "array slice\nslice array\nview array\n")
+end ogs_array_and_slice
+
+@test("a frozen buffer overload beside a slice one at one T")
+ogs_frozen_and_slice()
+    if !ogs_ready() then return
+
+    assert_eq(ogs_ran("import sysl.buf.{Buf, buf, Frozen}\n\n" +
+                      "z[T](v: []T) -> string = \"slice\"\n" +
+                      "z[T](v: &sync Frozen[T]) -> string = \"frozen\"\n\n" +
+                      "var arr = [1u8]\nvar b: Buf[u8] = buf()\nb.push(1)\nval fr = b.freeze()\n" +
+                      "print(z(arr[..]), z(fr))\n"), "slice frozen\n")
+end ogs_frozen_and_slice
+
+@test("a function passed where a callable is wanted names the overload the callable's type fits")
+ogs_passed_as_callable()
+    if !ogs_ready() then return
+
+    assert_eq(ogs_ran(ogs_pair() +
+                      "on_slice(g: ([]u8) -> usize, x: []u8) -> usize = g(x)\n" +
+                      "on_buf(g: (Buf[u8]) -> usize, x: Buf[u8]) -> usize = g(x)\n\n" +
+                      "print(on_slice(f, a), on_buf(f, b))\n"), "3 9\n")
+end ogs_passed_as_callable
+
+@test("file-private generic overloads at one T are two functions")
+ogs_private_pair()
+    if !ogs_ready() then return
+
+    assert_eq(ogs_ran("private q[T](x: T) -> string = \"q1\"\n" +
+                      "private q[T](x: T, y: T) -> string = \"q2\"\n\nprint(q(1), q(1, 2))\n"),
+              "q1 q2\n")
+end ogs_private_pair
+
+@test("generic overloads declared in two files of one module at one T are two functions")
+ogs_across_files()
+    if !ogs_ready() then return
+
+    assert_eq(ogs_ran_files([("main.sysl", "import sysl.buf.{Buf, buf}\n\n" +
+                                           "f[T](v: []T) -> usize = v.len\n\n" +
+                                           "var arr = [1u8, 2]\nvar b: Buf[u8] = buf()\n" +
+                                           "print(f(arr[..]), f(b))\n"),
+                             ("other.sysl", "import sysl.buf.Buf\n\nf[T](v: Buf[T]) -> usize = 9\n")]),
+              "2 9\n")
+end ogs_across_files
+
+// -- members ----------------------------------------------------------------------------------------
+
+@test("a method overload with type parameters of its own is chosen by the arguments")
+ogs_member_own_tparams()
+    if !ogs_ready() then return
+
+    assert_eq(ogs_ran("import sysl.buf.{Buf, buf}\n\n" +
+                      "struct P\n    n: int\n\n" +
+                      "    put[U](self, x: []U) -> string = \"slice\"\n" +
+                      "    put[U](self, x: Buf[U]) -> string = \"buf\"\n" +
+                      "    two[U](self, x: U) -> string = \"one\"\n" +
+                      "    two[U](self, x: U, y: U) -> string = \"two\"\n\n" +
+                      "var arr = [1u8]\nvar b: Buf[u8] = buf()\nval p = P(0)\n" +
+                      "print(p.put(arr[..]), p.put(b), p.two(1), p.two(1, 2))\n" +
+                      "print(p.put(b), p.put(arr[..]))\n"), "slice buf one two\nbuf slice\n")
+end ogs_member_own_tparams
+
+@test("and on an impl of a generic type")
+ogs_member_on_generic_impl()
+    if !ogs_ready() then return
+
+    assert_eq(ogs_ran("import sysl.buf.{Buf, buf}\n\n" +
+                      "struct Box[T]\n    v: T\n\n" +
+                      "impl[T] Box[T]\n" +
+                      "    put[U](self, x: []U) -> string = \"slice\"\n" +
+                      "    put[U](self, x: Buf[U]) -> string = \"buf\"\n" +
+                      "    take(self, x: []T) -> string = \"slice\"\n" +
+                      "    take(self, x: Buf[T]) -> string = \"buf\"\n\n" +
+                      "var arr = [1u8]\nvar b: Buf[u8] = buf()\nval bx = Box(1u8)\n" +
+                      "print(bx.put(arr[..]), bx.put(b), bx.take(arr[..]), bx.take(b))\n"),
+              "slice buf slice buf\n")
+end ogs_member_on_generic_impl
+
+@test("and for an associated function with type parameters of its own")
+ogs_associated_own_tparams()
+    if !ogs_ready() then return
+
+    assert_eq(ogs_ran("import sysl.buf.{Buf, buf}\n\n" +
+                      "struct S\n    n: int\n\n" +
+                      "    of[U](x: []U) -> string = \"slice\"\n" +
+                      "    of[U](x: Buf[U]) -> string = \"buf\"\n\n" +
+                      "var arr = [1u8]\nvar b: Buf[u8] = buf()\n" +
+                      "print(S.of(arr[..]), S.of(b))\n"), "slice buf\n")
+end ogs_associated_own_tparams
+
+// -- the error path ---------------------------------------------------------------------------------
+
+@test("a pair a slice argument fits exactly at both is still refused as ambiguous")
+ogs_still_ambiguous()
+    if !ogs_ready() then return
+
+    val said = ogs_ran("w[T](x: T) -> string = \"t\"\nw[T](x: []T) -> string = \"slice\"\n\n" +
+                       "var arr = [1u8]\nprint(w(arr[..]))\n")
+
+    assert(said.contains("'w' is ambiguous here — 2 of its declarations take these arguments:\n" +
+                         "    w(x: T)\n    w(x: []T)\n"), said)
+end ogs_still_ambiguous
+
+@test("and a member pair the same way")
+ogs_member_still_ambiguous()
+    if !ogs_ready() then return
+
+    val said = ogs_ran("struct P\n    n: int\n\n" +
+                       "    w[U](self, x: U) -> string = \"t\"\n" +
+                       "    w[U](self, x: []U) -> string = \"slice\"\n\n" +
+                       "var arr = [1u8]\nprint(P(0).w(arr[..]))\n")
+
+    assert(said.contains("'P.w' is ambiguous here — 2 of its declarations take these arguments:"), said)
+end ogs_member_still_ambiguous
+
+@test("and an argument no overload takes still gets the roster")
+ogs_none_fits()
+    if !ogs_ready() then return
+
+    val said = ogs_ran(ogs_pair() + "print(f(1.5))\n")
+
+    assert(said.contains("no 'f' takes these arguments — the declarations of that name are:\n" +
+                         "    f(v: []T)\n    f(v: Buf[T])\n"), said)
+end ogs_none_fits

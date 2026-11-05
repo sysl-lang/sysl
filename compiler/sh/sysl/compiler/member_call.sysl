@@ -1215,7 +1215,7 @@ private call_declared(cx: &Analyzer, span: Span, receiver: TExpr, rty: Type, nam
     val provided = declaring.is_some() && core_builtin(declaring.unwrap(), rty) && deriving.is_none()
     if refuse_bound_clash(cx, rty, found.0, name, span, via) then return bad_expr(span)
 
-    val chosen = chosen_member(cx, rty, found.0, name, span, args, through, provided)
+    val chosen = chosen_member(cx, rty, found.0, name, span, args, through, provided, Some(receiver))
 
     if chosen.is_none() then return bad_expr(span)
 
@@ -2026,7 +2026,7 @@ end instantiation_scope
 // under it.
 private chosen_member(cx: &Analyzer, rty: Type, base: string, mname: string, span: Span,
                       args: Buf[Expr], via: Buf[string] = no_bound_traits(),
-                      provided: bool = false) -> Option[string]
+                      provided: bool = false, receiver: Option[TExpr] = None) -> Option[string]
     val alts = cx.an.tables.members.alts.get(member_key_of(base, mname))
     val subject = type_show(rty)
 
@@ -2127,7 +2127,7 @@ private chosen_member(cx: &Analyzer, rty: Type, base: string, mname: string, spa
     var generic: Buf[bool] = buf()
 
     for cand in cands
-        val params = member_accepts(cx, rty, base, cand, args, arg_tys)
+        val params = member_accepts(cx, rty, base, cand, args, arg_tys, receiver)
 
         if params.is_some()
             fits.push(cand)
@@ -2297,10 +2297,22 @@ end out_of_scope
 // none, so what it may be told apart by stops where they do. A default widens the same count
 // downwards, and for the same reason -- a call may stop where the defaults begin.
 private member_accepts(cx: &Analyzer, rty: Type, base: string, filed: string,
-                       args: Buf[Expr], arg_tys: Buf[Option[Type]]) -> Option[Buf[Type]]
+                       args: Buf[Expr], arg_tys: Buf[Option[Type]],
+                       receiver: Option[TExpr]) -> Option[Buf[Type]]
     val m = member_at(cx.an, base, filed)
 
     if m.is_none() then return None
+
+    // **A member with type parameters OF ITS OWN is weighed by reading the call against it**, as a
+    // generic free function is: nothing about the receiver says what those parameters are, so it
+    // has no signature to compare until the arguments have solved them. The reading is a trial and
+    // is put back; what it solved is the signature the tie-breaks compare.
+    val found = member_key(cx.an, rty, filed)
+    val generic = cx.an.tables.members.generic.get(member_key_of(found.0, filed))
+
+    if generic.is_some() && generic.unwrap().tparams.len() > found.1.len() &&
+       (receiver.is_some() || m.unwrap().recv_mode().is_none())
+        return generic_member_accepts(cx, rty, found, m.unwrap(), generic.unwrap(), args, receiver)
 
     // **Weighing a generic candidate makes it real, and that is put back**: the candidate may not be
     // the one chosen, and an instantiation left queued is a body analyzed for a call nobody made --
@@ -2346,6 +2358,37 @@ private member_accepts(cx: &Analyzer, rty: Type, base: string, filed: string,
 
     Some(params)
 end member_accepts
+
+// The parameter types a member with type parameters of its own takes a call's arguments at, read
+// off the instantiation a trial call of it arrived at -- or nothing, where that call was refused.
+private generic_member_accepts(cx: &Analyzer, rty: Type, found: (string, Buf[Type]), m: MethodDecl,
+                               fd: FuncDecl, args: Buf[Expr], receiver: Option[TExpr]) -> Option[Buf[Type]]
+    val tried = begin_trial(cx)
+    val trial = call_generic_member(cx, span_zero(), receiver, rty, found.0, m, fd, found.1, args, None,
+                                    source_member_name(m.name), buf())
+    val said = refused_since(cx, tried)
+    val sig = if said then None else called_sig(cx, trial)
+
+    discard_trial(cx, tried)
+
+    if sig.is_none() then return None
+
+    var params: Buf[Type] = buf()
+    val first: usize = if receiver.is_some() then 1 else 0
+
+    for i in first..<sig.unwrap().params.len()
+        params.push(sig.unwrap().params[i].1)
+
+    Some(params)
+end generic_member_accepts
+
+// The signature of the function a member call lowered to, through the re-check or the dereference a
+// call may be wrapped in.
+private called_sig(cx: &Analyzer, t: TExpr) -> Option[FuncSig] = *t.kind match
+    TCall(name, _, _, _) -> cx.an.tables.members.func_insts.get(name)
+    TRecheck(after, _, _, _) -> called_sig(cx, after)
+    TDeref(inner, _) -> called_sig(cx, inner)
+    _ -> None
 
 // An argument that is a closure or a trailing block, which no implementation is chosen by.
 private declines(e: Expr) -> bool = *e.kind match
