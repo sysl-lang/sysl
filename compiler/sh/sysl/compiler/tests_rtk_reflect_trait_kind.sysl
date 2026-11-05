@@ -1,0 +1,190 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.Buf
+import sysl.fs.remove_dir_all
+import sysl.process.capture
+
+// **A trait answers the reflection questions that need no layout** (`reference/reflection.md`):
+// `View::Kind` is `Kind.Trait`, and `View::Name` and `View::BaseName` are its name, as Rust's
+// `type_name::<dyn View>()` is. Every question that reads a layout -- `Fields`, `Members`, `sizeof`
+// -- is refused as a trait written where a type is asked for always was, and so is a trait as a
+// field, a local or a parameter.
+//
+// The axes: the spelling of the trait (bare, generic with its arguments, generic without them,
+// imported from another module), the question (`Kind`, `Name`, `BaseName` against the layout ones),
+// and where it is asked (directly, and through a type parameter a trait object stands in for).
+
+// -- the harness ----------------------------------------------------------------------------------
+
+// What a program of these files prints, then its exit status; what the build said where it refused.
+private rtk_out(files: Buf[(string, string, string)]) -> string
+    val root = im_write(files)
+    val exe = root + "/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            val said = failure_text(why)
+
+            remove_dir_all(root).unwrap_or(())
+            return said
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true, 20000)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.status match
+            Exited(code) -> out.text + "[exit " + code.to_string() + "]"
+            _ -> out.text + "[did not exit]"
+end rtk_out
+
+private rtk_main(body: string) -> Buf[(string, string, string)]
+    var fs = im_files()
+
+    fs.push(("", "main.sysl", rtk_decls() + body))
+    fs
+end rtk_main
+
+private rtk_decls() -> string = raw"""
+    trait View
+        draw(self) -> int
+
+    trait Get[T]
+        get(self) -> T
+
+    struct Btn
+        n: int
+
+    impl View for Btn
+        draw(self) -> int = self.n
+
+    """
+
+private rtk_refused(said: string, message: string, at: string)
+    assert(said.contains("error: " + message + "\n --> ") || said.contains("error: " + message + "\n  --> "),
+           said)
+    assert(said.contains(at + "\n"), said)
+
+private rtk_layout(name: string) -> string =
+    s"'$name' is a trait, so it describes behaviour rather than a layout — write '*$name' or " +
+    s"'&$name' for a trait object, or bound a type parameter with '[T: $name]'"
+
+// -- what a trait answers -------------------------------------------------------------------------
+
+@test("a trait's Kind is Kind.Trait, and its Name and BaseName are the name it was declared under")
+rtk_a_trait_answers_kind_and_names()
+    if im_can_run() then return
+
+    assert_eq(rtk_out(rtk_main("main()\n    print(Kind::Image(View::Kind), View::Name, View::BaseName)\n")),
+              "Trait View View\n[exit 0]")
+
+@test("a trait's Kind folds, so it is a constant condition and compares with Kind.Trait")
+rtk_a_trait_kind_folds()
+    if im_can_run() then return
+
+    assert_eq(rtk_out(rtk_main("val K = View::Kind\n\nmain()\n    print(K == Kind.Trait, K == Kind.Ref)\n")),
+              "true false\n[exit 0]")
+
+@test("a generic trait with its arguments written answers Trait, its arguments in Name and not in BaseName")
+rtk_a_generic_trait_answers()
+    if im_can_run() then return
+
+    assert_eq(rtk_out(rtk_main("main()\n    print(Kind::Image(Get[int]::Kind), Get[int]::Name, " +
+                               "Get[int]::BaseName)\n")),
+              "Trait Get[int] Get\n[exit 0]")
+
+@test("a trait imported from another module answers its Kind, its qualified Name and its BaseName")
+rtk_an_imported_trait_answers()
+    if im_can_run() then return
+
+    var fs = im_files()
+
+    fs.push(("", "main.sysl", "import geo.Shape\n\nmain()\n    print(Kind::Image(Shape::Kind), " +
+                              "Shape::Name, Shape::BaseName)\n"))
+    fs.push(("geo", "geo.sysl", "module geo\n\ntrait Shape\n    area(self) -> int\n"))
+    assert_eq(rtk_out(fs), "Trait geo.Shape Shape\n[exit 0]")
+
+@test("a trait object standing in for a type parameter answers that parameter's Kind, Name and BaseName")
+rtk_a_stand_in_answers()
+    if im_can_run() then return
+
+    assert_eq(rtk_out(rtk_main(raw"""
+        about[T: View]() -> string
+            Kind::Image(T::Kind) + " " + T::Name + " " + T::BaseName
+
+        main()
+            print(about[View](), about[Btn]())
+
+        """)), "Trait View View Struct Btn Btn\n[exit 0]")
+
+@test("if const T::Kind == Kind.Trait keeps its arm for a trait object and discards it for a struct")
+rtk_if_const_on_a_stand_in()
+    if im_can_run() then return
+
+    assert_eq(rtk_out(rtk_main(raw"""
+        which[T: View]() -> string
+            if const T::Kind == Kind.Trait then "object" else "type"
+
+        main()
+            print(which[View](), which[Btn]())
+
+        """)), "object type\n[exit 0]")
+
+@test("a trait behind a mode keeps answering Ref and Pointer")
+rtk_behind_a_mode_is_unchanged()
+    if im_can_run() then return
+
+    assert_eq(rtk_out(rtk_main(raw"""
+        kind_of[T]() -> string
+            Kind::Image(T::Kind)
+
+        main()
+            print(kind_of[&View](), kind_of[*View]())
+
+        """)), "Ref Pointer\n[exit 0]")
+
+// -- what stays refused ---------------------------------------------------------------------------
+
+@test("a trait is refused Fields, Members and sizeof, which read a layout it does not have")
+rtk_layout_questions_are_refused()
+    if im_can_run() then return
+
+    rtk_refused(rtk_out(rtk_main("main()\n    print(View::Fields.len)\n")), rtk_layout("View"), ":14:15")
+    rtk_refused(rtk_out(rtk_main("main()\n    print(View::Members.len)\n")), rtk_layout("View"), ":14:15")
+    rtk_refused(rtk_out(rtk_main("main()\n    print(sizeof(View))\n")), rtk_layout("View"), ":14:18")
+
+@test("a generic trait with its arguments is refused Fields in the words a bare trait is")
+rtk_generic_trait_fields_are_refused()
+    if im_can_run() then return
+
+    rtk_refused(rtk_out(rtk_main("main()\n    print(Get[int]::Fields.len)\n")), rtk_layout("Get[int]"),
+                ":14:19")
+
+@test("a generic trait written without its arguments names no single trait to answer for")
+rtk_bare_generic_trait_is_refused()
+    if im_can_run() then return
+
+    rtk_refused(rtk_out(rtk_main("main()\n    print(Kind::Image(Get::Kind))\n")),
+                "trait 'Get' takes 1 type argument, but 0 type arguments were given", ":14:26")
+
+@test("a trait is still refused as a field, a local and a parameter")
+rtk_a_trait_as_a_layout_is_refused()
+    if im_can_run() then return
+
+    rtk_refused(rtk_out(rtk_main("struct Holder\n    v: View\n\nmain()\n    print(1)\n")),
+                rtk_layout("View"), ":14:8")
+    rtk_refused(rtk_out(rtk_main("main()\n    val v: View = Btn(1)\n    print(1)\n")),
+                rtk_layout("View"), ":14:12")
+    rtk_refused(rtk_out(rtk_main("g(v: View) -> int = 0\n\nmain()\n    print(1)\n")),
+                rtk_layout("View"), ":13:6")
+
+@test("a trait object standing in for a parameter whose Fields the body reads is still refused")
+rtk_a_stand_in_reading_fields_is_refused()
+    if im_can_run() then return
+
+    rtk_refused(rtk_out(rtk_main("f[T: View]() -> usize = T::Fields.len\n\nmain()\n    print(f[View]())\n")),
+                "'f' uses 'T' for its associated item 'T::Fields' at line 13, so a trait object cannot " +
+                "stand in for it — only '*T' and '&T' can be written with one", ":16:12")

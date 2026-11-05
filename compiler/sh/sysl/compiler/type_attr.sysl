@@ -78,7 +78,7 @@ type_attr_call(cx: &Analyzer, span: Span, written: string, attr: string, args: B
                       s"write the arguments, '$shown[…]::$attr'")
     end if
 
-    val subject = attr_subject(cx, span, written)
+    val subject = attr_subject(cx, span, written, names_only(attr))
 
     if subject.is_none() then
         return cx.err(span, s"'$written' has no type attributes")
@@ -91,13 +91,24 @@ end type_attr_call
 // side is not a generic type's name with brackets after it.
 type_attr_on_instance(cx: &Analyzer, span: Span, receiver: Expr, attr: string,
                       args: Buf[Expr]) -> Option[TExpr]
-    val found = written_instance(cx, span, receiver)
+    // A generic trait with its arguments, `Get[int]::Name`, answers the questions that need no layout,
+    // and is refused the others as the bare name `View::Fields` is.
+    val instance = written_instance(cx, span, receiver)
+    val found = if instance.is_some() then instance else written_trait_instance(cx, receiver)
 
     if found.is_none() then return None
 
     val ty = found.unwrap()
 
     if ty == Unknown then return Some(bad_expr(span))
+
+    if instance.is_none() && !names_only(attr)
+        val shown = type_show(ty)
+
+        return Some(cx.err(span, s"'$shown' is a trait, so it describes behaviour rather than a " +
+                           s"layout — write '*$shown' or '&$shown' for a trait object, or bound a " +
+                           s"type parameter with '[T: $shown]'"))
+    end if
 
     Some(attr_of_type(cx, span, type_show(ty), attr, args, ty, false))
 end type_attr_on_instance
@@ -182,12 +193,24 @@ end generic_enum_named
 
 // The type a written name stands for here, in the order a reader's own terms are consulted: a type
 // parameter of the body being read, then a declared type, then a built-in integer.
-attr_subject(cx: &Analyzer, span: Span, written: string) -> Option[Type]
+//
+// `naming` is a question that needs no layout -- `Kind`, `Name`, `BaseName` -- and only then may the
+// name be a trait's, which is asked about as the type '*Name' points at, as Rust's `type_name` takes
+// `dyn View`. A trait asked for its layout is refused where the name is resolved.
+attr_subject(cx: &Analyzer, span: Span, written: string, naming: bool = false) -> Option[Type]
     val stood = bound_type(cx.subst, written)
 
     if stood.is_some() then return stood
 
     val key = lookup_type_key(cx.an, cx.scope, written)
+
+    if naming && key.is_some() && trait_decl_at(cx.an, key.unwrap()).is_some()
+        val behind = type_ref(span, PtrType(named_type(span, written)))
+
+        return resolve_type(cx.an, cx.scope, behind, cx.subst) match
+            Ptr(inner) -> Some(*inner)
+            other -> Some(other)
+    end if
 
     // **An `opaque struct` is asked about outside its module as `*Name` names it**: a `::` question
     // needs no layout, so `H::Kind` answers `Opaque` there and `H::Fields` is refused for having none.
