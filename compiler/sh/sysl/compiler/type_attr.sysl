@@ -195,11 +195,20 @@ attr_type_name(cx: &Analyzer, receiver: Expr) -> Option[string] = *receiver.kind
     _ -> None
 
 // Whether a left side of `::` that is no single name is still written as a type: `X::Target` over
-// anything written as a type, or `&X` / `*X` in parentheses over one. A value anywhere at its root --
+// anything written as a type, `&X` / `*X` in parentheses over one, or `&sync X` / `weak X` in
+// parentheses, which the parser read with the type grammar. A value anywhere at its root --
 // `(&v)::Id` with `v` a local -- is a value, and is left to the value reading.
 private spelled_as_type(cx: &Analyzer, e: Expr) -> bool = *e.kind match
     TypeAttr(inner, a, _, _) -> a == "Target" && names_a_type(cx, inner)
     Unary(op, inner) -> (op == "&" || op == "*") && names_a_type(cx, inner)
+    // `(&sync View)`, `(weak Btn)` -- a mode only the type grammar spells, which the parser read as it.
+    TypeArg(_) -> true
+    _ -> false
+
+// Whether an expression is `X::Target` over something written as a type -- `T::Target`,
+// `(&Btn)::Target::Target` -- and so names a type a call may reach an associated function through.
+target_written(cx: &Analyzer, e: Expr) -> bool = *e.kind match
+    TypeAttr(_, a, _, _) -> a == "Target" && spelled_as_type(cx, e)
     _ -> false
 
 private names_a_type(cx: &Analyzer, e: Expr) -> bool

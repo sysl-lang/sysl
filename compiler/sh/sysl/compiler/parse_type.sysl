@@ -350,7 +350,11 @@ private parse_tuple_type(p: *Parser, start: Span, params: bool) -> TypeRef
     val at = start.to(p.just_taken())
 
     // `()` is the type whose one value is written `()`: `unit`, spelled as its value is.
-    if parts.len() == 0 then return named_type(at, "unit")
+    if parts.len() == 0 then return projections_over(p, start, named_type(at, "unit"))
+
+    // `(&View)::Target` -- the parentheses group a type for the `::` after them, which a mode has to
+    // be grouped to take: `&View::Target` is a reference to `View::Target`.
+    if parts.len() == 1 && p.at_kw("::") then return projections_over(p, start, parts[0])
 
     // A product of one thing is that thing, so `(T)` is a type in parentheses and not a tuple. The
     // reference anchors it at the token after the ')', where the reading learned it had one part.
@@ -363,8 +367,22 @@ private parse_tuple_type(p: *Parser, start: Span, params: bool) -> TypeRef
         return parts[0]
     end if
 
-    type_ref(at, TupleType(parts, false))
+    projections_over(p, start, type_ref(at, TupleType(parts, false)))
 end parse_tuple_type
+
+// The `::` projections written after a type, `T::Target::Kind`, each over the one before.
+private projections_over(p: *Parser, start: Span, base: TypeRef) -> TypeRef
+    var out = base
+
+    loop
+        if !p.accept_kw("::") then break
+
+        p.name() match
+            Some(member) -> out = type_ref(start.to(p.just_taken()), AssocType(out, member))
+            None -> break
+
+    out
+end projections_over
 
 // `Name`, `Name[A, B]`, and the `::` projections written over either.
 private parse_named_type(p: *Parser, start: Span) -> TypeRef
@@ -374,18 +392,9 @@ private parse_named_type(p: *Parser, start: Span) -> TypeRef
 
     val none: Buf[TypeRef] = buf()
     val args = if p.at_kw("[") then parse_type_args(p) else none
-    var out = type_ref(start.to(p.just_taken()), NamedType(name, args))
-
     // The `::` is a suffix on the name rather than a production of its own, so `Buf[int]::Item`
     // reads its arguments as the arguments they are before the projection is applied.
-    loop
-        if !p.accept_kw("::") then break
-
-        p.name() match
-            Some(member) -> out = type_ref(start.to(p.just_taken()), AssocType(out, member))
-            None -> break
-
-    out
+    projections_over(p, start, type_ref(start.to(p.just_taken()), NamedType(name, args)))
 end parse_named_type
 
 // `[A, B]` after a type name.

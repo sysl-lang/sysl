@@ -1,7 +1,8 @@
 module sh.sysl.compiler
 @tests
 
-import sysl.buf.Buf
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
 import sysl.fs.remove_dir_all
 import sysl.process.capture
 
@@ -14,12 +15,16 @@ import sysl.process.capture
 // The axes: the pointer kind (`&`, `&sync`, `*`, `weak`, `[]`, `[]const`), what is pointed at (a
 // trait, a struct, a simple and a data enum, a scalar), how it is spelled (an alias, a parenthesised
 // type, a type parameter, a field's type in a reflection walk), how deep (one projection, a chain),
-// where it stands (a question, `sizeof`, a type argument, a binding's type, a module `val`, an
-// `if const`), and the refusals (no pointer, the end of a chain, a projection used as a value, a
-// value on the left). A trait's own associated type `Target` is the one name that wins over it.
+// where it stands (a question, `sizeof`, a type argument, a binding's type, a parameter's, a module
+// `val`, an `if const`, the receiver of an associated call), the type grammar's parenthesised
+// neighbours (a tuple, `()`, a callable's parameter list, one type alone), and the refusals (no
+// pointer, the end of a chain, a projection used as a value, a value on the left, a referent without
+// the function called). A trait's own associated type `Target` is the one name that wins over it.
 //
-// Not covered: `#if`, whose conditions are target facts (`ptr32`, `os`) and never type queries, and
-// `ref T`, which is a method's result marking a place rather than a type, so no `T` is written of it.
+// Not covered: `#if`, whose conditions are target facts (`ptr32`, `os`) and never type queries;
+// `ref T`, which is a method's result marking a place rather than a type, so no `T` is written of it;
+// and `P::Target.make()` over a type parameter `P`, which a generic body's own reading refuses as it
+// refuses `P.make()` with no bound -- and no bound can be written on `P::Target`.
 
 // -- the harness ----------------------------------------------------------------------------------
 
@@ -319,3 +324,200 @@ rtg_a_value_behind_a_mode_is_a_value()
 
     rtg_refused(rtg_out("main()\n    val b = Btn(1)\n    print(Kind::Image((&b)::Kind))\n"),
                 "'::Kind' is a type attribute, so its left side must be a type name", ":20:27")
+
+// -- a mode in parentheses in the type grammar ----------------------------------------------------
+
+@test("a parenthesised mode takes Target in a binding's type, a parameter's, sizeof and a type argument")
+rtg_a_parenthesised_mode_in_a_type_position()
+    if im_can_run() then return
+
+    assert_eq(rtg_out(raw"""
+        take(b: (&Btn)::Target) -> int = b.n
+
+        main()
+            val x: (&Btn)::Target = Btn(3)
+            val o: Option[(*Btn)::Target] = Some(Btn(4))
+            print(x.n, o.unwrap().n, take(Btn(9)), sizeof((&Btn)::Target) == sizeof(Btn))
+
+        """), "3 4 9 true\n[exit 0]")
+
+@test("a parenthesised mode in the type grammar chains, and asks a question of what it reaches")
+rtg_a_parenthesised_mode_chains_in_a_type()
+    if im_can_run() then return
+
+    assert_eq(rtg_out(raw"""
+        type V = (&View)::Target
+
+        main()
+            val y: (&*Btn)::Target::Target = Btn(5)
+            val o: Option[(**Btn)::Target::Target] = Some(Btn(6))
+            print(y.n, o.unwrap().n, Kind::Image(V::Kind), V::Name)
+
+        """), "5 6 Trait View\n[exit 0]")
+
+@test("an atomic and a weak reference in parentheses are asked in an expression as in a type")
+rtg_sync_and_weak_in_parentheses()
+    if im_can_run() then return
+
+    assert_eq(rtg_out(raw"""
+        main()
+            val b: (&sync Btn)::Target = Btn(2)
+            print(Kind::Image((&sync View)::Kind), Kind::Image((&sync View)::Target::Kind))
+            print((weak Btn)::Target::Name, Kind::Image((weak Btn)::Kind), b.n)
+
+        """), "Ref Trait\nBtn Weak 2\n[exit 0]")
+
+@test("a parenthesised mode over a type parameter answers each instantiation's own type")
+rtg_a_parenthesised_mode_over_a_parameter()
+    if im_can_run() then return
+
+    assert_eq(rtg_out(raw"""
+        same[P](v: (&P)::Target) -> P = v
+        held[P](v: P) -> Option[(*P)::Target] = Some(v)
+
+        main()
+            print(same[int](6), same[bool](true), held(Btn(2)).unwrap().n, held(1.5).unwrap())
+
+        """), "6 true 2 1.5\n[exit 0]")
+
+@test("a tuple type, the unit type and a callable's parameter list in parentheses mean what they did")
+rtg_the_parenthesised_neighbours_are_unchanged()
+    if im_can_run() then return
+
+    assert_eq(rtg_out(raw"""
+        apply(f: (int) -> int, g: () -> int, h: (int, int) -> int) -> int = f(1) + g() + h(2, 3)
+
+        main()
+            val t: (int, bool) = (1, true)
+            val u: () = ()
+            val n: Option[(int, string)] = Some((2, "two"))
+            print(t.0, t.1, n.unwrap().1, apply(n -> n + 1, () -> 2, (a, b) -> a * b))
+
+        """), "1 true two 10\n[exit 0]")
+
+@test("one type in parentheses with no projection after it is still refused as no tuple")
+rtg_one_type_in_parentheses_is_still_refused()
+    if im_can_run() then return
+
+    rtg_refused(rtg_out("main()\n    val x: (int) = 1\n    print(x)\n"),
+                "'(int)' is a type in parentheses, and a tuple has two or more parts — a product of one " +
+                "thing is that thing, so write 'int'", ":19:18")
+    rtg_refused(rtg_out("main()\n    val x: ((&Btn)::Target) = Btn(1)\n    print(x.n)\n"),
+                "'((&Btn)::Target)' is a type in parentheses, and a tuple has two or more parts — a " +
+                "product of one thing is that thing, so write '(&Btn)::Target'", ":19:29")
+
+@test("a parenthesised type that points at nothing is refused Target in the type grammar")
+rtg_no_pointer_in_parentheses_is_refused_as_a_type()
+    if im_can_run() then return
+
+    rtg_refused(rtg_out("main()\n    val x: (int)::Target = 1\n    print(x)\n"),
+                rtg_no_target("int", "an integer"), ":19:12")
+    rtg_refused(rtg_out("main()\n    print(sizeof((int, bool)::Target))\n"),
+                rtg_no_target("(int, bool)", "a tuple"), ":19:18")
+    rtg_refused(rtg_out("main()\n    val u: ()::Target = ()\n"),
+                rtg_no_target("unit", "the unit type"), ":19:12")
+
+@test("sysl doc writes a mode under a projection in the parentheses it was written with")
+rtg_doc_keeps_the_parentheses()
+    val r = parse(source_of("t.sysl", "module m\n\nf(a: (&Btn)::Target, b: T::Target::Item, c: (int, int)::X)\n    print(1)\n"))
+
+    assert(r.ok())
+
+    var shown: Buf[string] = buf()
+
+    for item in r.program.body
+        doc_signature(item) match
+            Some(t) -> shown.push(t)
+            None -> ()
+
+    assert_eq(shown.len(), 1)
+    assert_eq(shown[0], "f(a: (&Btn)::Target, b: T::Target::Item, c: (int, int)::X)")
+
+// -- an associated call through the projection ----------------------------------------------------
+
+@test("an associated function is called through what a reference or a pointer points at")
+rtg_an_associated_call_through_target()
+    if im_can_run() then return
+
+    assert_eq(rtg_out(raw"""
+        struct Thing
+            n: int
+
+        impl Thing
+            make() -> Thing = Thing(7)
+            of(n: int) -> Thing = Thing(n)
+
+        type P = *Thing
+
+        main()
+            print((&Thing)::Target.make().n, (&sync Thing)::Target.of(4).n, P::Target.of(8).n)
+            print((&*Thing)::Target::Target.make().n, (*Btn)::Target::Name)
+
+        """), "7 4 8\n7 Btn\n[exit 0]")
+
+@test("an associated call through a field's Target in a reflection walk answers each copy's referent")
+rtg_an_associated_call_in_a_walk()
+    if im_can_run() then return
+
+    assert_eq(rtg_out(raw"""
+        struct Thing
+            n: int
+
+        impl Thing
+            make() -> Thing = Thing(7)
+
+        struct Other
+            n: int
+
+        impl Other
+            make() -> Other = Other(40)
+
+        struct Holder
+            a: &Thing
+            b: *Other
+
+        struct Pair
+            x: *Other
+            y: weak Other
+
+        made[T]() -> int
+            var sum = 0
+            for const f in T::Fields
+                sum += f::Type::Target.make().n
+            sum
+
+        main()
+            print(made[Holder](), made[Pair]())
+
+        """), "47 80\n[exit 0]")
+
+@test("an associated call through Target is refused where the referent has no such function")
+rtg_an_associated_call_the_target_lacks()
+    if im_can_run() then return
+
+    rtg_refused(rtg_out("main()\n    print((&Btn)::Target.make().n)\n"),
+                "type 'Btn' has no associated function 'make'", ":19:26")
+
+@test("an associated call through Target of no pointer is refused the projection, once")
+rtg_an_associated_call_through_no_pointer()
+    if im_can_run() then return
+
+    val said = rtg_out("main()\n    print(int::Target.make())\n")
+
+    rtg_refused(said, rtg_no_target("int", "an integer"), ":19:11")
+    assert(!said.contains("associated function"), said)
+
+    rtg_refused(rtg_out(raw"""
+        struct H
+            a: int
+
+        made[T]() -> int
+            var sum = 0
+            for const f in T::Fields
+                sum += f::Type::Target.make().n
+            sum
+
+        main()
+            print(made[H]())
+
+        """), rtg_no_target("int", "an integer") + " (in the copy for field 'H.a')", ":24:16")

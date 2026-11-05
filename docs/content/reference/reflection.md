@@ -194,6 +194,49 @@ Ref Trait
 *Button Button
 ```
 
+The type grammar reads the same spelling, so `(&Button)::Target` stands as a binding's type, a
+parameter's, a type argument and `sizeof`'s operand. The parentheses are what group the mode for the
+`::`: `&Button::Target` would be a reference to `Button::Target`. A tuple type `(A, B)` and `()` keep
+their meaning, and one type in parentheses with no `::` after it is still refused as no tuple.
+
+**An associated function is called through the projection** as it is through the type's own name,
+and in a walk over the fields the call reaches each field's own referent:
+
+```sysl
+struct Button
+    width: int
+
+impl Button
+    make() -> Button = Button(4)
+
+struct Panel
+    width: int
+
+impl Panel
+    make() -> Panel = Panel(30)
+
+struct Window
+    button: &Button
+    panel: *Panel
+
+widths[T]() -> int
+    var sum = 0
+    for const f in T::Fields
+        sum += f::Type::Target.make().width
+    sum
+
+wide(b: (&Button)::Target) -> int = b.width * 2
+
+val b: (&Button)::Target = (&Button)::Target.make()
+val o: Option[(**Panel)::Target::Target] = Some(Panel(5))
+
+print(wide(b), o.unwrap().width, sizeof((&Button)::Target) == sizeof(Button), widths[Window]())
+```
+
+```output
+8 5 true 34
+```
+
 A type that points at nothing has no `Target`, as Rust's `<i32 as Deref>::Target` is refused. That
 includes a trait object, which is where a chain ends, and an array, which holds its elements rather
 than pointing at them:
