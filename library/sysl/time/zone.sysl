@@ -1,14 +1,31 @@
 module sysl.time
 
-/** Resolving a wall clock reading against a zone whose clocks move, which is the one conversion here
- * that can fail and the one that can succeed twice.
+/** A zone, a wall clock reading resolved against one, and a reading that carries its zone.
  *
- * **What is still not in this module is the zone itself**, and `quantity.sysl`'s header says why: a
- * table of named zones is a data-distribution problem, either shipped and left to go stale or read
- * from the host and thereby needing a filesystem. Nothing below holds one. What is here is the
- * *arithmetic* of resolution, which needs no table at all -- only something that can be asked what a
- * zone's offset was at a given instant.
+ * **The table of named zones is still not in this module**, and `quantity.sysl`'s header says why: a
+ * table is a data-distribution problem, either shipped and left to go stale or read from the host and
+ * thereby needing a filesystem. `sysl.posix.time.zone("America/Toronto")` reads one on a host and
+ * `sysl.time.tzif` decodes the bytes; what is here is the *arithmetic* of a zone, which needs no table
+ * at all -- only something that can be asked what the zone's offset was at a given instant.
  */
+
+/** A zone: a name, and the offset its clocks were set to at any instant.
+ *
+ * **A fixed zone is a number and a ruled zone is a rule.** `utc` is the first kind, and so is a zone
+ * named by its offset (`+05:30`). A zone whose clocks move holds the rule as a function, which is
+ * what keeps this file free of a capability: a table decoded from a TZif file
+ * (`sysl.posix.time.zone`), the host's own `localtime_r` (`sysl.posix.time.local_zone`), a package
+ * talking to an RTC chip and a rule written out by hand all answer the one question, and all of them
+ * are a `RuledZone`.
+ *
+ *     val eastern = RuledZone("Eastern", t -> if t < switch then Offset(-300) else Offset(-240))
+ */
+enum Zone
+    FixedZone(name: string, offset: Offset)
+    RuledZone(name: string, rule: &Fn(Instant) -> Offset)
+
+/** The one zone that cannot fail to be found, which is why it is a value rather than a call. */
+val utc: Zone = FixedZone("UTC", Offset(0))
 
 /** What a wall clock reading turns out to name, once a zone has been asked.
  *
@@ -21,8 +38,8 @@ module sysl.time
  *
  * `Gap` carries the offsets either side of the transition rather than an instant, because there is no
  * instant to carry. What to do about it is a policy question -- push the reading forward by the size
- * of the gap, clamp it to the transition, or refuse it -- and `from_offset(ldt, before)` is the first
- * of those, which is the one most libraries choose.
+ * of the gap, clamp it to the transition, or refuse it -- and `DateTime.at_earlier` and `at_later`
+ * take the first, which is the one most libraries choose.
  */
 enum Resolution
     Unique(at: Instant)
@@ -43,49 +60,168 @@ impl Display for Resolution
     end display
 end Resolution
 
-/** A wall clock reading resolved against a zone, where a zone is anything able to say what its offset
- * was at a given instant.
+impl Zone
+    /** The zone's name: `UTC`, `America/Toronto`, `+05:30`. */
+    name(self) -> string = self match
+        FixedZone(n, _) -> n
+        RuledZone(n, _) -> n
+
+    /** How far this zone's clocks were set from UTC at that instant. */
+    offset_at(self, t: Instant) -> Offset = self match
+        FixedZone(_, o) -> o
+        RuledZone(_, rule) -> rule(t)
+
+    /** A wall clock reading resolved against this zone: one instant, two, or none.
+     *
+     * ## How it decides, and the one assumption in it
+     *
+     * A reading taken as though the offset were zero is within fourteen hours of the instant it names,
+     * because that is the widest any zone is ever set from UTC. So the offsets a day either side of
+     * that guess bracket every transition that could bear on the answer, and there are at most two of
+     * them to try.
+     *
+     * Each candidate is applied and then **checked against itself**: an offset that is still in force
+     * at the instant it produces is a real answer, and one that is not is the reading being read with
+     * an offset nobody's clock was showing. One survivor is `Unique`, two is `Ambiguous`, and none is
+     * `Gap` -- the reading fell in the hour the clocks skipped, so no offset can produce it.
+     *
+     * **The assumption is that a zone does not change its offset twice inside forty-eight hours.** No
+     * zone in the IANA database ever has. One that did would be resolved against the wrong pair of
+     * offsets rather than diagnosed, which is worth writing down because nothing here could detect it.
+     */
+    resolve(self, dt: DateTime) -> Resolution
+        val guess = wall_us(dt)
+        val before = self.offset_at(Instant(guess - us_per_day))
+        val after = self.offset_at(Instant(guess + us_per_day))
+
+        // The common case, and it is most of the year: no transition anywhere near the reading, so the
+        // two candidates are one candidate and it cannot fail to reproduce itself.
+        if before == after then return Unique(from_offset(dt, before))
+
+        val a = from_offset(dt, before)
+        val b = from_offset(dt, after)
+        val a_ok = self.offset_at(a) == before
+        val b_ok = self.offset_at(b) == after
+
+        if a_ok && b_ok then
+            // Ordered by the timeline rather than by which offset was in force first, so that
+            // `earlier` means what it says whichever way the clocks went.
+            if a < b then Ambiguous(a, b) else Ambiguous(b, a)
+        else if a_ok then Unique(a)
+        else if b_ok then Unique(b)
+        else Gap(before, after)
+    end resolve
+end Zone
+
+/** Two zones are the same zone where they have the same name; a rule cannot be compared. */
+impl Eq for Zone
+    eq(self, rhs: Zone) -> bool = self.name() == rhs.name()
+
+impl Display for Zone
+    display(self, out: *Writer, fmt: FormatSpec) = display_str(self.name(), out, fmt)
+
+/** A wall reading in a zone: the reading, the offset that was in force, and the zone.
  *
- * **The zone arrives as a function rather than as a type**, which is what keeps this file free of a
- * capability. The whole of what resolution needs to know about a zone is that one question, and a
- * host reading `localtime_r`, a package talking to an RTC chip and a table written out by hand can
- * all answer it. `sysl.posix.time.from_local` is the host's answer wired to this.
+ * **The offset is held as well as the zone because the reading alone is not enough.** 01:30 on the
+ * 1st of November in Toronto happens twice, an hour apart, and only the offset says which of the two
+ * this is. So a `Zoned` names one instant always, and `instant()` answers it.
  *
- * ## How it decides, and the one assumption in it
+ * Moving one by a `Duration` moves the timeline and moving it by a `Period` moves the calendar, and
+ * across a change of the zone's clocks the two differ: a day after nine on a Saturday morning is nine
+ * on Sunday morning, and twenty-four hours after it is ten. Both are right, and the program says
+ * which it meant.
  *
- * A reading taken as though the offset were zero is within fourteen hours of the instant it names,
- * because that is the widest any zone is ever set from UTC. So the offsets a day either side of that
- * guess bracket every transition that could bear on the answer, and there are at most two of them to
- * try.
- *
- * Each candidate is applied and then **checked against itself**: an offset that is still in force at
- * the instant it produces is a real answer, and one that is not is the reading being read with an
- * offset nobody's clock was showing. One survivor is `Unique`, two is `Ambiguous`, and none is `Gap`
- * -- the reading fell in the hour the clocks skipped, so no offset can produce it.
- *
- * **The assumption is that a zone does not change its offset twice inside forty-eight hours.** No
- * zone in the IANA database ever has. One that did would be resolved against the wrong pair of
- * offsets rather than diagnosed, which is worth writing down because nothing here could detect it.
+ * **`==` needs the same instant and the same zone, where `<` compares only the instant.** Nine in the
+ * morning in Toronto and ten in the evening in Tokyo are one instant and two readings, so neither is
+ * before the other and they are not equal.
  */
-resolve(ldt: LocalDateTime, offset_at: Instant -> Offset) -> Resolution
-    val guess = wall_us(ldt)
-    val before = offset_at(Instant(guess - us_per_day))
-    val after = offset_at(Instant(guess + us_per_day))
+struct Zoned
+    date_time: DateTime
+    offset: Offset
+    zone: Zone
 
-    // The common case, and it is most of the year: no transition anywhere near the reading, so the
-    // two candidates are one candidate and it cannot fail to reproduce itself.
-    if before == after then return Unique(from_offset(ldt, before))
+impl Zoned
+    /** The point on the timeline this reading names. */
+    instant(self) -> Instant = from_offset(self.date_time, self.offset)
 
-    val a = from_offset(ldt, before)
-    val b = from_offset(ldt, after)
-    val a_ok = offset_at(a) == before
-    val b_ok = offset_at(b) == after
+    /** The same instant, read in another zone. */
+    at(self, z: Zone) -> Zoned = self.instant().at(z)
 
-    if a_ok && b_ok then
-        // Ordered by the timeline rather than by which offset was in force first, so that `earlier`
-        // means what it says whichever way the clocks went.
-        if a < b then Ambiguous(a, b) else Ambiguous(b, a)
-    else if a_ok then Unique(a)
-    else if b_ok then Unique(b)
-    else Gap(before, after)
-end resolve
+impl Instant
+    /** This instant as a wall reading in `z`, which always exists and is always one reading. */
+    at(self, z: Zone) -> Zoned
+        val o = z.offset_at(self)
+
+        Zoned(at_offset(self, o), o, z)
+
+impl DateTime
+    /** This reading in `z`, where the zone shows it exactly once -- and the `Resolution` otherwise,
+     * which is `Ambiguous` in the hour the clocks repeat and `Gap` in the hour they skip. A reading
+     * the zone does not name once is handed back rather than guessed at; `at_earlier` and `at_later`
+     * are the two ways to choose.
+     */
+    at(self, z: Zone) -> Result[Zoned, Resolution] = z.resolve(self) match
+        Unique(t) -> Ok(t.at(z))
+        other -> Err(other)
+
+    /** This reading in `z`, taking the earlier instant where the zone shows it twice and pushing it
+     * forward by the size of the gap where the zone skips it: 02:30 in an hour that never happened is
+     * 03:30 in the hour after.
+     */
+    at_earlier(self, z: Zone) -> Zoned = z.resolve(self) match
+        Unique(t) -> t.at(z)
+        Ambiguous(e, _) -> e.at(z)
+        Gap(before, _) -> from_offset(self, before).at(z)
+
+    /** As `at_earlier`, but taking the later instant where the zone shows the reading twice. */
+    at_later(self, z: Zone) -> Zoned = z.resolve(self) match
+        Unique(t) -> t.at(z)
+        Ambiguous(_, l) -> l.at(z)
+        Gap(before, _) -> from_offset(self, before).at(z)
+
+/** A reading moved along the timeline: so many microseconds later, read in the same zone. */
+impl Add[Duration] for Zoned
+    add(self, rhs: Duration) -> Zoned = (self.instant() + rhs).at(self.zone)
+
+impl Sub[Duration] for Zoned
+    sub(self, rhs: Duration) -> Zoned = (self.instant() - rhs).at(self.zone)
+
+/** A reading moved along the calendar: the wall clock moves by the period and is read in the same zone
+ * again. **The clock face is kept across a change of the zone's clocks**, which is the difference from
+ * adding a `Duration`. Where the new reading happens twice, the offset it already had is kept if it
+ * is one of the two and the earlier taken if not; where it never happens, it is pushed forward by
+ * the size of the gap. Those are `java.time`'s rules, and the reasons for them are the same: a
+ * reading that does not have to change should not.
+ */
+impl Add[Period] for Zoned
+    add(self, rhs: Period) -> Zoned
+        val moved = self.date_time + rhs
+
+        self.zone.resolve(moved) match
+            Unique(t) -> t.at(self.zone)
+            Ambiguous(e, l) ->
+                if from_offset(moved, self.offset) == l then l.at(self.zone) else e.at(self.zone)
+            Gap(before, _) -> from_offset(moved, before).at(self.zone)
+    end add
+end Zoned
+
+impl Sub[Period] for Zoned
+    sub(self, rhs: Period) -> Zoned = self + -rhs
+
+/** How much timeline lies between two readings, whatever zones they were read in. */
+impl Sub[Zoned, Duration] for Zoned
+    sub(self, rhs: Zoned) -> Duration = self.instant() - rhs.instant()
+
+impl Eq for Zoned
+    eq(self, rhs: Zoned) -> bool = self.instant() == rhs.instant() && self.zone == rhs.zone
+
+impl Ord for Zoned
+    lt(self, rhs: Zoned) -> bool = self.instant() < rhs.instant()
+
+/** `2026-03-08T09:00:00-04:00[America/Toronto]`: an RFC 3339 timestamp with the zone's name after it,
+ * the shape `java.time` and the Temporal proposal both write.
+ */
+zoned_text(z: Zoned) -> string = s"${timestamp_text(z.instant(), z.offset)}[${z.zone.name()}]"
+
+impl Display for Zoned
+    display(self, out: *Writer, fmt: FormatSpec) = display_str(zoned_text(self), out, fmt)

@@ -49,7 +49,7 @@ decide.
 
 ## Index
 
-[`default_zoneinfo_root`](#default_zoneinfo_root) [`cpu_time`](#cpu_time) [`from_local`](#from_local) [`local`](#local) [`local_offset`](#local_offset) [`local_text`](#local_text) [`local_zone_data`](#local_zone_data) [`monotonic`](#monotonic) [`nanosleep`](#nanosleep) [`now`](#now) [`sleep`](#sleep) [`supply_monotonic_us`](#supply_monotonic_us) [`supply_sleep_us`](#supply_sleep_us) [`supply_wall_us`](#supply_wall_us) [`thread_cpu_time`](#thread_cpu_time) [`zone_data`](#zone_data) [`zone_data_in`](#zone_data_in) [`zoneinfo_root`](#zoneinfo_root)
+[`default_zoneinfo_root`](#default_zoneinfo_root) [`cpu_time`](#cpu_time) [`from_local`](#from_local) [`local`](#local) [`local_offset`](#local_offset) [`local_text`](#local_text) [`local_zone`](#local_zone) [`local_zone_data`](#local_zone_data) [`monotonic`](#monotonic) [`nanosleep`](#nanosleep) [`now`](#now) [`sleep`](#sleep) [`supply_monotonic_us`](#supply_monotonic_us) [`supply_sleep_us`](#supply_sleep_us) [`supply_wall_us`](#supply_wall_us) [`thread_cpu_time`](#thread_cpu_time) [`zone`](#zone) [`zone_data`](#zone_data) [`zone_data_in`](#zone_data_in) [`zoneinfo_root`](#zoneinfo_root) [`ZoneError`](#zoneerror) [Display for ZoneError](#display-for-zoneerror) [Eq for ZoneError](#eq-for-zoneerror)
 
 ## Constants
 
@@ -89,16 +89,16 @@ no portable seam for it, so a freestanding target does not have it.
 ### `from_local`
 
 ```sysl
-from_local(ldt: LocalDateTime) -> Resolution
+from_local(dt: DateTime) -> Resolution
 ```
 
 A wall clock reading in the host's zone, resolved to the instant or instants it names -- or to
-neither, where the clocks skipped it.
+neither, where the clocks skipped it. `local_zone().resolve(dt)`, under the name it has always had.
 
 ### `local`
 
 ```sysl
-local(t: Instant) -> LocalDateTime
+local(t: Instant) -> DateTime
 ```
 
 An instant as the host's own clocks were showing it.
@@ -128,6 +128,16 @@ rather than a shortcut: an abbreviation is ambiguous across zones -- `CST` is th
 offsets -- so a timestamp carrying one cannot be read back reliably, and `parse_timestamp` reads
 what this writes.
 
+### `local_zone`
+
+```sysl
+local_zone() -> Zone
+```
+
+The zone the host is set to, answered by the C library's `localtime_r` at each instant -- the same
+zone `date` prints in. Its name is `local`, because the host does not portably say which zone of
+the database it is.
+
 ### `local_zone_data`
 
 ```sysl
@@ -138,8 +148,8 @@ The bytes of the zone **this host is set to**, which is what `/etc/localtime` is
 symlink to, one file of the database.
 
 It answers what `local_offset` answers and more -- the whole table rather than one instant's
-offset, so a program can ask this zone for an abbreviation, or hand it to `resolve` without a
-capability crossing the call. What it cannot answer is the zone's **name**: the file does not carry
+offset, so a program can ask this zone for an abbreviation, or wrap it as a `sysl.time.RuledZone`
+without a capability crossing each call. What it cannot answer is the zone's **name**: the file does not carry
 one, and where `/etc/localtime` is a symlink the name is the link's target rather than anything
 inside it.
 
@@ -275,6 +285,19 @@ a reading taken on one thread and subtracted from another's is meaningless. Read
 thread's clock is not offered: Linux does it through `pthread_getcpuclockid`, macOS has no such
 call and needs the Mach `thread_info` interface, so no one spelling is portable.
 
+### `zone`
+
+```sysl
+zone(name: string) -> Result[Zone, ZoneError]
+```
+
+The zone with that name: `"America/Toronto"`, `"Europe/Paris"`, `"UTC"`, or an offset written
+`+05:30`.
+
+`"UTC"` is `sysl.time.utc` and an offset is a `FixedZone`, so neither reads a file. Any other name
+is a path under the database root (`zoneinfo_root()`, which `TZDIR` moves), read and decoded once
+here; the zone holds the bytes from then on, so it outlives nothing it needs.
+
 ### `zone_data`
 
 ```sysl
@@ -311,3 +334,30 @@ The database root this host is using: `TZDIR` where it is set, and the path abov
 worth consulting rather than a nicety: it is how a distribution relocates the database, how a
 container image carries its own copy, and how a test points at one it wrote. A reader that ignored
 it would disagree with `date` and `zdump` on the same machine.
+
+## Types
+
+### `ZoneError`
+
+```sysl
+enum ZoneError
+    UnknownZone(name: string)
+    BadZoneData(name: string, why: TzifError)
+```
+
+Why `zone` found no zone by that name, at the granularity a caller can act on: the name is not in
+the database at all, or the file it names is not one the decoder can read.
+
+## Implementations
+
+### Display for ZoneError
+
+```sysl
+impl Display for ZoneError
+```
+
+### Eq for ZoneError
+
+```sysl
+impl Eq for ZoneError
+```

@@ -1,0 +1,72 @@
+module sysl.posix.time
+@requires(posix, libc)
+@tests
+
+import sysl.time.{Zone, Zoned, Offset, Period, Instant, utc, date_time, hours, from_offset, zoned_text}
+
+// `zone` and `local_zone` against the host's own database: the questions `sysl.time`'s shape tests
+// ask of a rule written by hand, asked here of the real `America/Toronto`. Toronto moved its clocks
+// forward at 02:00 on the 8th of March 2026 and back at 02:00 on the 1st of November.
+
+private pzn_toronto() -> Zone = zone("America/Toronto").unwrap()
+
+@test("pzn: a zone by name answers its offset either side of a change")
+pzn_zone_by_name()
+    val z = pzn_toronto()
+
+    assert_eq(z.name(), "America/Toronto")
+    assert(z.offset_at(from_offset(date_time(2026, 3, 8, 1, 59, 0), Offset(-300))) == Offset(-300))
+    assert(z.offset_at(from_offset(date_time(2026, 3, 8, 3, 0, 0), Offset(-240))) == Offset(-240))
+
+@test("pzn: UTC and an offset are found without the database")
+pzn_fixed_names()
+    assert(zone("UTC").unwrap() == utc)
+    assert(zone("+05:30").unwrap().offset_at(Instant(0)) == Offset(330))
+    assert(zone("-04:00").unwrap().offset_at(Instant(0)) == Offset(-240))
+
+@test("pzn: a name the database does not have is refused, and says which")
+pzn_unknown_zone()
+    assert(zone("Mars/Olympus_Mons").unwrap_err() == UnknownZone("Mars/Olympus_Mons"))
+    assert_eq(s"${zone("Mars/Olympus_Mons").unwrap_err()}", "no zone is named 'Mars/Olympus_Mons'")
+    assert(zone("+5:30").unwrap_err() == UnknownZone("+5:30"))
+
+@test("pzn: a reading across the real gap and the real overlap")
+pzn_real_gap_and_overlap()
+    val z = pzn_toronto()
+
+    assert(date_time(2026, 3, 8, 2, 30, 0).at(z).is_err())
+    assert_eq(zoned_text(date_time(2026, 3, 8, 2, 30, 0).at_earlier(z)),
+              "2026-03-08T03:30:00-04:00[America/Toronto]")
+
+    val twice = date_time(2026, 11, 1, 1, 30, 0)
+
+    assert(twice.at_earlier(z).offset == Offset(-240))
+    assert(twice.at_later(z).offset == Offset(-300))
+    assert(twice.at_later(z) - twice.at_earlier(z) == hours(1))
+
+@test("pzn: a day keeps the wall clock across the real change and twenty-four hours does not")
+pzn_real_zoned_across_gap()
+    val t = date_time(2026, 3, 7, 9, 0, 0).at(pzn_toronto()).unwrap()
+
+    assert_eq(zoned_text(t + Period(0, 1)), "2026-03-08T09:00:00-04:00[America/Toronto]")
+    assert_eq(zoned_text(t + hours(24)), "2026-03-08T10:00:00-04:00[America/Toronto]")
+    assert((t + hours(24)) - (t + Period(0, 1)) == hours(1))
+
+@test("pzn: Toronto and Tokyo at one instant are two readings, neither before the other")
+pzn_two_zones()
+    val a = date_time(2026, 6, 1, 9, 0, 0).at(pzn_toronto()).unwrap()
+    val b = a.at(zone("Asia/Tokyo").unwrap())
+
+    assert(a != b)
+    assert(!(a < b) && !(b < a))
+    assert(a.instant() == b.instant())
+    assert_eq(zoned_text(b), "2026-06-01T22:00:00+09:00[Asia/Tokyo]")
+
+@test("pzn: the host's zone agrees with local_offset at every instant it is asked")
+pzn_local_zone()
+    val z = local_zone()
+    val t = from_offset(date_time(2026, 7, 1, 12, 0, 0), Offset(0))
+
+    assert_eq(z.name(), "local")
+    assert(z.offset_at(t) == local_offset(t))
+    assert(t.at(z).date_time == local(t))

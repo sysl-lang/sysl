@@ -1,0 +1,191 @@
+module sysl.time
+@tests
+
+// The eight types and their makers: `Period` against `Duration`, a `Zone` asked about an instant and
+// about a wall reading, and a `Zoned` moved both ways across a change of the clocks.
+//
+// The zone is Toronto in 2026 written as a rule by hand, so that nothing here needs a host database:
+// the clocks went forward at 02:00 on the 8th of March (07:00 Z) and back at 02:00 on the 1st of
+// November (06:00 Z). `sysl.posix.time`'s tests ask the same questions of the real database. The
+// expected values are slate's (`tests_time.sysl`), which shares this design.
+
+private toronto() -> Zone
+    val spring = from_offset(date_time(2026, 3, 8, 2, 0, 0), Offset(-300))
+    val autumn = from_offset(date_time(2026, 11, 1, 2, 0, 0), Offset(-240))
+
+    RuledZone("America/Toronto", t -> if t >= spring && t < autumn then Offset(-240) else Offset(-300))
+
+// -- the makers ------------------------------------------------------------------------------------
+
+@test("shp: date, time and date_time make what their names say")
+shp_makers()
+    assert_eq(date(2026, 9, 2).day, 20698)
+    assert_eq(date_text(date(2026, 9, 2)), "2026-09-02")
+    assert_eq(time(14, 30, 0).us, 52200 * us_per_second)
+    assert_eq(time_text(time(14, 30, 0)), "14:30")
+    assert(date_time(2026, 9, 2, 14, 30, 0) == DateTime(date(2026, 9, 2), time(14, 30, 0)))
+    assert_eq(s"${date_time(2026, 9, 2, 14, 30, 5)}", "2026-09-02 14:30:05")
+
+@test("shp: the bounds date and time accept are the calendar's and the clock's")
+shp_maker_bounds()
+    assert_eq(date_text(date(2024, 2, 29)), "2024-02-29")
+    assert_eq(date_text(date(2026, 12, 31)), "2026-12-31")
+    assert_eq(date_text(date(2026, 1, 1)), "2026-01-01")
+    assert_eq(time_text(time(23, 59, 59)), "23:59:59")
+    assert_eq(time_text(time(0, 0, 0)), "00:00")
+
+@test("shp: utc is a value, named UTC, at an offset of zero always")
+shp_utc()
+    assert_eq(utc.name(), "UTC")
+    assert(utc.offset_at(Instant(0)) == Offset(0))
+    assert(utc.offset_at(from_offset(date_time(2026, 7, 1, 12, 0, 0), Offset(0))) == Offset(0))
+    assert_eq(s"$utc", "UTC")
+
+@test("shp: monotonic answers a duration and now an instant")
+shp_clocks()
+    val a = monotonic()
+    val b = monotonic()
+
+    assert(b - a >= micros(0))
+    assert(now() > Instant(0))
+
+// -- a period ---------------------------------------------------------------------------------------
+
+@test("shp: months and days are two scales and never convert")
+shp_period_scales()
+    assert(months(1) != Period(0, 30))
+    assert(years(1) == months(12))
+    assert_eq(months(1).days, 0)
+    assert_eq(years(1).months, 12)
+    assert_eq(period_text(years(1) + months(2) + Period(0, 3)), "1y 2mo 3d")
+    assert_eq(period_text(Period(0, 0)), "0d")
+    assert_eq(period_text((months(1) + Period(0, 2)) * 2), "2mo 4d")
+    assert_eq(period_text(-months(14)), "-1y -2mo")
+
+@test("shp: a period added to the 31st of January clamps to the end of February")
+shp_period_from_jan_31()
+    assert_eq(date_text(date(2026, 1, 31) + months(1)), "2026-02-28")
+    assert_eq(date_text(date(2024, 1, 31) + months(1)), "2024-02-29")
+    assert_eq(date_text(date(2026, 1, 31) + Period(0, 1)), "2026-02-01")
+
+    // The months first and the days after: by way of the 28th, not by way of a 31st of February.
+    assert_eq(date_text(date(2026, 1, 31) + Period(1, 1)), "2026-03-01")
+    assert_eq(date_text(date(2026, 1, 31) + months(2)), "2026-03-31")
+
+@test("shp: a period added to the 29th of February")
+shp_period_from_feb_29()
+    assert_eq(date_text(date(2024, 2, 29) + years(1)), "2025-02-28")
+    assert_eq(date_text(date(2024, 2, 29) + years(4)), "2028-02-29")
+    assert_eq(date_text(date(2024, 2, 29) + months(1)), "2024-03-29")
+    assert_eq(date_text(date(2024, 2, 29) + Period(0, 1)), "2024-03-01")
+    assert_eq(date_text(date(2024, 2, 29) - years(1)), "2023-02-28")
+    assert_eq(date_text(date(2024, 3, 31) - months(1)), "2024-02-29")
+
+@test("shp: a period moves a wall reading's date and leaves its clock face")
+shp_period_date_time()
+    assert(date_time(2026, 1, 31, 9, 30, 0) + months(1) == date_time(2026, 2, 28, 9, 30, 0))
+    assert(date_time(2026, 3, 1, 23, 0, 0) - Period(0, 1) == date_time(2026, 2, 28, 23, 0, 0))
+
+// -- a zone ---------------------------------------------------------------------------------------
+
+@test("shp: a zone answers its offset either side of each change")
+shp_zone_offset_at()
+    val z = toronto()
+
+    assert(z.offset_at(from_offset(date_time(2026, 3, 8, 1, 59, 0), Offset(-300))) == Offset(-300))
+    assert(z.offset_at(from_offset(date_time(2026, 3, 8, 3, 0, 0), Offset(-240))) == Offset(-240))
+    assert(z.offset_at(from_offset(date_time(2026, 11, 1, 1, 59, 0), Offset(-240))) == Offset(-240))
+    assert(z.offset_at(from_offset(date_time(2026, 11, 1, 1, 0, 0), Offset(-300))) == Offset(-300))
+
+@test("shp: resolve answers a gap in the hour the clocks skip")
+shp_zone_resolve_gap()
+    toronto().resolve(date_time(2026, 3, 8, 2, 30, 0)) match
+        Gap(before, after) ->
+            assert(before == Offset(-300))
+            assert(after == Offset(-240))
+        _ -> assert(false, "the skipped half hour resolved")
+
+@test("shp: and two instants an hour apart in the hour they repeat")
+shp_zone_resolve_overlap()
+    toronto().resolve(date_time(2026, 11, 1, 1, 30, 0)) match
+        Ambiguous(e, l) ->
+            assert_eq(timestamp_text(e, Offset(-240)), "2026-11-01T01:30:00-04:00")
+            assert_eq(timestamp_text(l, Offset(-300)), "2026-11-01T01:30:00-05:00")
+            assert(l - e == hours(1))
+        _ -> assert(false, "the repeated half hour did not resolve to two instants")
+
+@test("shp: a fixed zone resolves every reading once")
+shp_zone_fixed()
+    val z = FixedZone("+05:45", Offset(345))
+
+    z.resolve(date_time(2026, 3, 8, 2, 30, 0)) match
+        Unique(at) -> assert_eq(timestamp_text(at, Offset(0)), "2026-03-07T20:45:00Z")
+        _ -> assert(false, "a fixed zone did not resolve uniquely")
+
+// -- a reading in a zone -------------------------------------------------------------------------
+
+@test("shp: a reading the zone skips is handed back, and at_earlier pushes it past the gap")
+shp_zoned_gap()
+    val z = toronto()
+    val dt = date_time(2026, 3, 8, 2, 30, 0)
+
+    assert(dt.at(z).is_err())
+    assert_eq(zoned_text(dt.at_earlier(z)), "2026-03-08T03:30:00-04:00[America/Toronto]")
+    assert_eq(zoned_text(dt.at_later(z)), "2026-03-08T03:30:00-04:00[America/Toronto]")
+
+@test("shp: a reading the zone repeats is handed back, and the program picks")
+shp_zoned_overlap()
+    val z = toronto()
+    val dt = date_time(2026, 11, 1, 1, 30, 0)
+
+    assert(dt.at(z).is_err())
+    assert(dt.at_earlier(z).offset == Offset(-240))
+    assert(dt.at_later(z).offset == Offset(-300))
+    assert(dt.at_later(z) - dt.at_earlier(z) == hours(1))
+
+@test("shp: a day across the gap keeps the clock face and twenty-four hours does not")
+shp_zoned_across_gap()
+    val t = date_time(2026, 3, 7, 9, 0, 0).at(toronto()).unwrap()
+
+    assert_eq(zoned_text(t + Period(0, 1)), "2026-03-08T09:00:00-04:00[America/Toronto]")
+    assert_eq(zoned_text(t + hours(24)), "2026-03-08T10:00:00-04:00[America/Toronto]")
+    assert((t + hours(24)) - (t + Period(0, 1)) == hours(1))
+    assert((t + Period(0, 1)) - t == hours(23))
+
+@test("shp: a period landing in the gap is pushed past it, and one landing twice keeps its offset")
+shp_zoned_period_lands_in_a_change()
+    val z = toronto()
+    val before_gap = date_time(2026, 3, 7, 2, 30, 0).at(z).unwrap()
+
+    assert_eq(zoned_text(before_gap + Period(0, 1)), "2026-03-08T03:30:00-04:00[America/Toronto]")
+
+    // The later 01:30 on the 31st of October is at -04:00, so a day on keeps -04:00, which is the
+    // earlier of the two 01:30s on the 1st of November; a day back from the later 01:30 on the 2nd
+    // (at -05:00) keeps -05:00, which is the later one.
+    val oct = date_time(2026, 10, 31, 1, 30, 0).at(z).unwrap()
+    val nov = date_time(2026, 11, 2, 1, 30, 0).at(z).unwrap()
+
+    assert((oct + Period(0, 1)).offset == Offset(-240))
+    assert((nov - Period(0, 1)).offset == Offset(-300))
+
+@test("shp: a zoned reading orders by its instant and is equal only in its own zone")
+shp_zoned_equality()
+    val tokyo = FixedZone("Asia/Tokyo", Offset(540))
+    val a = date_time(2026, 6, 1, 9, 0, 0).at(toronto()).unwrap()
+    val b = a.at(tokyo)
+
+    assert(a != b)
+    assert(!(a < b) && !(b < a))
+    assert(a.instant() == b.instant())
+    assert_eq(hour_of(a.date_time.time), 9)
+    assert_eq(hour_of(b.date_time.time), 22)
+    assert(a == a.at(toronto()))
+
+@test("shp: an instant read in a zone, and a duration moving it")
+shp_instant_at()
+    val i = from_offset(date_time(2026, 7, 1, 12, 0, 0), Offset(0))
+
+    assert_eq(zoned_text(i.at(utc)), "2026-07-01T12:00:00Z[UTC]")
+    assert_eq(zoned_text(i.at(toronto())), "2026-07-01T08:00:00-04:00[America/Toronto]")
+    assert_eq(zoned_text(i.at(toronto()) - hours(1)), "2026-07-01T07:00:00-04:00[America/Toronto]")
+    assert_eq(s"${i.at(utc)}", "2026-07-01T12:00:00Z[UTC]")

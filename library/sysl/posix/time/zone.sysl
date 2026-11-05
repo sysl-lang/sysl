@@ -1,27 +1,18 @@
 module sysl.posix.time
 @requires(posix, libc)
 
-import sysl.time.{Instant, LocalDateTime, Offset, Resolution, at_offset, resolve, timestamp_text}
+import sysl.time.{Instant, DateTime, Offset, Resolution, Zone, FixedZone, RuledZone, utc, at_offset,
+    timestamp_text, parse_offset}
+import sysl.time.tzif
+import sysl.time.tzif.TzifError
 
-// The zone the host is set to, which is the one zone a program can ask about without a table.
+// Zones by name, and the zone the host is set to.
 //
-// **`sysl.time` deliberately holds no zone database and this file does not give it one.** What it
-// gives is the *host's own* zone, which the operating system already knows and keeps up to date --
-// so a program that wants to print the time where it is running no longer has to write an `Offset`
-// into its source and no longer goes wrong when the clocks move.
-//
-// ## What this can answer and what it cannot
-//
-// It can answer for **the host's zone at any instant**, historically: `tm_gmtoff` reports the offset
-// that was in force then, read out of the host's own data, so a date from a year whose rules differed
-// is answered correctly.
-//
-// It cannot answer for **any other zone**. That is a property of POSIX rather than a decision here:
-// `tzalloc`, `localtime_rz` and `mktime_z` -- the calls that would take a zone as an argument -- are a
-// NetBSD extension that neither macOS nor glibc has, so the only portable way to name a different
-// zone is to set `TZ` in the process environment and call `tzset`, which is global state and not
-// thread-safe. A named zone therefore needs the IANA database read and parsed, which is a different
-// piece of work with a filesystem in it.
+// **`sysl.time` deliberately holds no zone database and this file does not give it one.** It reads
+// the host's: a named zone is a file of the IANA database under `zoneinfo_root()`, decoded by
+// `sysl.time.tzif`, and the host's own zone is whatever `localtime_r` answers. Both come back as a
+// `sysl.time.Zone`, so everything above -- `resolve`, `Zoned`, a `Period` across a change of the
+// clocks -- is the same code whichever one a program holds.
 //
 // ## Why the reverse direction has a type and the forward one does not
 //
@@ -36,6 +27,57 @@ import sysl.time.{Instant, LocalDateTime, Offset, Resolution, at_offset, resolve
 
 private[sysl] extern "sysl_posix_time_local_offset_min" c_local_offset_min(us: long) -> int
 
+/** Why `zone` found no zone by that name, at the granularity a caller can act on: the name is not in
+ * the database at all, or the file it names is not one the decoder can read.
+ */
+enum ZoneError
+    UnknownZone(name: string)
+    BadZoneData(name: string, why: TzifError)
+
+impl Display for ZoneError
+    display(self, out: *Writer, fmt: FormatSpec)
+        val text = self match
+            UnknownZone(name) -> s"no zone is named '$name'"
+            BadZoneData(name, why) -> s"the zone '$name' could not be read: $why"
+
+        display_str(text, out, fmt)
+
+impl Eq for ZoneError
+    eq(self, rhs: ZoneError) -> bool = (self, rhs) match
+        (UnknownZone(a), UnknownZone(b)) -> a == b
+        (BadZoneData(a, x), BadZoneData(b, y)) -> a == b && x == y
+        _ -> false
+
+/** The zone with that name: `"America/Toronto"`, `"Europe/Paris"`, `"UTC"`, or an offset written
+ * `+05:30`.
+ *
+ * `"UTC"` is `sysl.time.utc` and an offset is a `FixedZone`, so neither reads a file. Any other name
+ * is a path under the database root (`zoneinfo_root()`, which `TZDIR` moves), read and decoded once
+ * here; the zone holds the bytes from then on, so it outlives nothing it needs.
+ */
+zone(name: string) -> Result[Zone, ZoneError]
+    if name == "UTC" then return Ok(utc)
+
+    if name.starts_with("+") || name.starts_with("-") then
+        return parse_offset(name) match
+            Ok(o) -> Ok(FixedZone(name, o))
+            Err(_) -> Err(UnknownZone(name))
+
+    val data = zone_data(name) match
+        Ok(d) -> d
+        Err(_) -> return Err(UnknownZone(name))
+
+    tzif.parse(data[..]) match
+        Ok(table) -> Ok(RuledZone(name, t -> tzif.offset_at(table, t).unwrap()))
+        Err(why) -> Err(BadZoneData(name, why))
+end zone
+
+/** The zone the host is set to, answered by the C library's `localtime_r` at each instant -- the same
+ * zone `date` prints in. Its name is `local`, because the host does not portably say which zone of
+ * the database it is.
+ */
+local_zone() -> Zone = RuledZone("local", local_offset)
+
 /** How far the host's clocks were set from UTC at that instant.
  *
  * It takes an instant rather than answering "the current offset" because those are different
@@ -45,7 +87,7 @@ private[sysl] extern "sysl_posix_time_local_offset_min" c_local_offset_min(us: l
 local_offset(t: Instant) -> Offset = Offset(c_local_offset_min(t.us))
 
 /** An instant as the host's own clocks were showing it. */
-local(t: Instant) -> LocalDateTime = at_offset(t, local_offset(t))
+local(t: Instant) -> DateTime = at_offset(t, local_offset(t))
 
 /** An instant as a timestamp in the host's zone: `2026-08-22T13:26:04-04:00`.
  *
@@ -57,6 +99,6 @@ local(t: Instant) -> LocalDateTime = at_offset(t, local_offset(t))
 local_text(t: Instant) -> string = timestamp_text(t, local_offset(t))
 
 /** A wall clock reading in the host's zone, resolved to the instant or instants it names -- or to
- * neither, where the clocks skipped it.
+ * neither, where the clocks skipped it. `local_zone().resolve(dt)`, under the name it has always had.
  */
-from_local(ldt: LocalDateTime) -> Resolution = resolve(ldt, local_offset)
+from_local(dt: DateTime) -> Resolution = local_zone().resolve(dt)
