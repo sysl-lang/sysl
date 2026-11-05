@@ -89,6 +89,29 @@ Box[int] Box
 (int, real) int
 ```
 
+**A type is named as it was written**, by the rule a
+[diagnostic](/reference/types/#how-a-diagnostic-names-a-type) follows: `u16` and `ushort` are both
+the type's own names, so each answers as written; an alias answers as its declaration spelled what it
+names, and a field walk's `f::Type` as the struct declared the field. A type parameter is named
+canonically, because one instantiation serves every spelling of its argument:
+
+```sysl
+struct Box[T]
+    v: T
+
+type Meters = u16
+
+name_of[T]() -> string = T::Name
+
+print(u16::Name, ushort::Name, u8::Name, Meters::Name, Box[u8]::Name)
+print(name_of[u16](), name_of[Meters]())
+```
+
+```output
+u16 ushort u8 u16 Box[u8]
+ushort ushort
+```
+
 `T::BaseName` is refused where the type has no declared name, such as a tuple, and `Box::Name` with
 no arguments is refused because `Box` alone is not a single type; both are shown under
 [what it refuses](#what-it-refuses). An anonymous `struct` or `union` block answers with the keyword
