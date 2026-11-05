@@ -461,9 +461,7 @@ print(n.to_string(), true.to_string(), 'é'.to_string(), 2.5.to_string(), "alrea
 42 true é 2.5 already
 ```
 
-`str(x)`, the older spelling of the same conversion, was removed in 0.7.0: a call of it is refused
-with `'str(x)' was removed in 0.7.0: write 'x.to_string()'`. A function, local or member of your own
-named `str` is an ordinary name and is unaffected.
+`str` is an ordinary name: a function, local, type or member of your own may be called `str`.
 
 | type | result |
 |---|---|
@@ -476,7 +474,7 @@ named `str` is an ordinary name and is unaffected.
 **A name you declare wins over a built-in one of the same spelling.** A type that declares its own
 `to_string` (or `debug_string`) member — in its body, an `impl` block, or a trait it implements —
 has that one called; the compiler's is what a call reaches only where nothing else claims the name.
-So do the forms: `str`, `print`, `format`, `str_cast`, `str_alias`, `ptr_cast` and the `va_` forms
+So do the forms: `print`, `str_cast`, `str_alias`, `ptr_cast` and the `va_` forms
 (the casts imported from `sysl.raw` and the `va_` forms from `sysl.c`, the rest in scope everywhere)
 yield to a local, a parameter or a function of the same name, which is ordinary shadowing, and a
 call through it means that name, which is an error at the call if it cannot be called. An
@@ -510,14 +508,14 @@ print(double("ab"), str(21), width("four"))
 abab 42 4
 ```
 
-A call of `str` with no declaration of the name in scope is refused:
+A call of `str` with no declaration of the name in scope is an unknown function:
 
 ```sysl
 print(str(21))
 ```
 
 ```error
-'str(x)' was removed in 0.7.0: write 'x.to_string()'
+undefined function 'str'
 ```
 
 A `string` is returned as it is, and a `bool` renders to one of two immortal literals, so neither
