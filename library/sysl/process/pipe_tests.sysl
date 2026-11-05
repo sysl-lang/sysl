@@ -27,6 +27,43 @@ private pt_drained(f: File) -> string
     text
 end pt_drained
 
+// A pipe whose write end is written to and let go of with neither a flush nor a close; the read end
+// comes back.
+private pt_written_then_dropped() -> File
+    val (r, w) = pipe().unwrap()
+    var g = w
+
+    g.write("over".bytes)
+    r
+end pt_written_then_dropped
+
+// ## A pipe's ends close themselves
+
+@test("a pipe's write end dropped without a close hands over its bytes and ends the stream")
+pt_dropped_end_ends_the_stream()
+    assert_eq(pt_drained(pt_written_then_dropped()), "over")
+
+@test("a child reading a pipe sees its end once this program drops the write end")
+pt_dropped_end_ends_a_child()
+    val (cat, back) = pt_cat_fed_then_dropped()
+
+    assert_eq(pt_drained(back), "fed\n")
+    assert_eq(cat.wait().unwrap(), Status.Exited(0))
+
+// `cat` reading a pipe whose write end is written to and let go of here, and writing into a second
+// pipe whose write end goes here too -- so `cat` sees its input end, and the read end handed back
+// sees `cat`'s.
+private pt_cat_fed_then_dropped() -> (&Spawned, File)
+    val (r, w) = pipe().unwrap()
+    val (back, out) = pipe().unwrap()
+    val cat = spawn("cat", timeout = 5000, stdin = Stdio.FromFile(r),
+                    stdout = Stdio.ToFile(out)).unwrap()
+    var g = w
+
+    g.write("fed\n".bytes)
+    (cat, back)
+end pt_cat_fed_then_dropped
+
 // ## A pipeline
 
 // `echo hi | tr a-z A-Z`, with `tr`'s output read back through a second pipe: two children started

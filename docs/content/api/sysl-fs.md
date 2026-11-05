@@ -21,7 +21,7 @@ handling away from every program with no operating system to ask. Deciding what 
 
 ## Index
 
-[`append`](#append) [`append_bytes`](#append_bytes) [`append_text`](#append_text) [`cache_dir`](#cache_dir) [`canonicalize`](#canonicalize) [`config_dir`](#config_dir) [`copy_dir_all`](#copy_dir_all) [`copy_file`](#copy_file) [`create`](#create) [`create_update`](#create_update) [`current_dir`](#current_dir) [`data_dir`](#data_dir) [`entries`](#entries) [`entry_bytes`](#entry_bytes) [`exists`](#exists) [`from_errno`](#from_errno) [`hard_link`](#hard_link) [`home_dir`](#home_dir) [`is_dir`](#is_dir) [`is_file`](#is_file) [`is_link`](#is_link) [`link_metadata`](#link_metadata) [`make_dir`](#make_dir) [`make_dir_all`](#make_dir_all) [`make_temp_dir`](#make_temp_dir) [`map_file`](#map_file) [`metadata`](#metadata) [`open`](#open) [`open_update`](#open_update) [`page_size`](#page_size) [`pending_name`](#pending_name) [`publish_dir`](#publish_dir) [`publish_file`](#publish_file) [`read_bytes`](#read_bytes) [`read_link`](#read_link) [`read_text`](#read_text) [`readable`](#readable) [`remove_dir`](#remove_dir) [`remove_dir_all`](#remove_dir_all) [`remove_file`](#remove_file) [`rename`](#rename) [`set_current_dir`](#set_current_dir) [`set_modified`](#set_modified) [`set_owner`](#set_owner) [`set_permissions`](#set_permissions) [`size_of`](#size_of) [`symlink`](#symlink) [`truncate`](#truncate) [`walk`](#walk) [`writable`](#writable) [`write_bytes`](#write_bytes) [`write_bytes_atomic`](#write_bytes_atomic) [`write_text`](#write_text) [`write_text_atomic`](#write_text_atomic) [`Advice`](#advice) [`Entry`](#entry) [`File`](#file) [`FileState`](#filestate) [`IoError`](#ioerror) [`Kind`](#kind) [`Mapped`](#mapped) [`Matching`](#matching) [`Meta`](#meta) [`Walk`](#walk-1) [Display for IoError](#display-for-ioerror) [Display for Kind](#display-for-kind) [Drop for Mapped](#drop-for-mapped) [Eq for IoError](#eq-for-ioerror) [Eq for Kind](#eq-for-kind) [Fallible for File](#fallible-for-file) [Iterate for Matching](#iterate-for-matching) [Iterate for Walk](#iterate-for-walk) [Positioned for File](#positioned-for-file) [ReadAt for File](#readat-for-file) [Reader for File](#reader-for-file) [WriteAt for File](#writeat-for-file) [Writer for File](#writer-for-file)
+[`append`](#append) [`append_bytes`](#append_bytes) [`append_text`](#append_text) [`cache_dir`](#cache_dir) [`canonicalize`](#canonicalize) [`config_dir`](#config_dir) [`copy_dir_all`](#copy_dir_all) [`copy_file`](#copy_file) [`create`](#create) [`create_update`](#create_update) [`current_dir`](#current_dir) [`data_dir`](#data_dir) [`entries`](#entries) [`entry_bytes`](#entry_bytes) [`exists`](#exists) [`from_errno`](#from_errno) [`hard_link`](#hard_link) [`home_dir`](#home_dir) [`is_dir`](#is_dir) [`is_file`](#is_file) [`is_link`](#is_link) [`link_metadata`](#link_metadata) [`make_dir`](#make_dir) [`make_dir_all`](#make_dir_all) [`make_temp_dir`](#make_temp_dir) [`map_file`](#map_file) [`metadata`](#metadata) [`open`](#open) [`open_update`](#open_update) [`page_size`](#page_size) [`pending_name`](#pending_name) [`publish_dir`](#publish_dir) [`publish_file`](#publish_file) [`read_bytes`](#read_bytes) [`read_link`](#read_link) [`read_text`](#read_text) [`readable`](#readable) [`remove_dir`](#remove_dir) [`remove_dir_all`](#remove_dir_all) [`remove_file`](#remove_file) [`rename`](#rename) [`set_current_dir`](#set_current_dir) [`set_modified`](#set_modified) [`set_owner`](#set_owner) [`set_permissions`](#set_permissions) [`size_of`](#size_of) [`symlink`](#symlink) [`truncate`](#truncate) [`walk`](#walk) [`writable`](#writable) [`write_bytes`](#write_bytes) [`write_bytes_atomic`](#write_bytes_atomic) [`write_text`](#write_text) [`write_text_atomic`](#write_text_atomic) [`Advice`](#advice) [`Entry`](#entry) [`File`](#file) [`FileState`](#filestate) [`IoError`](#ioerror) [`Kind`](#kind) [`Mapped`](#mapped) [`Matching`](#matching) [`Meta`](#meta) [`Walk`](#walk-1) [Display for IoError](#display-for-ioerror) [Display for Kind](#display-for-kind) [Drop for FileState](#drop-for-filestate) [Drop for Mapped](#drop-for-mapped) [Eq for IoError](#eq-for-ioerror) [Eq for Kind](#eq-for-kind) [Fallible for File](#fallible-for-file) [Iterate for Matching](#iterate-for-matching) [Iterate for Walk](#iterate-for-walk) [Positioned for File](#positioned-for-file) [ReadAt for File](#readat-for-file) [Reader for File](#reader-for-file) [WriteAt for File](#writeat-for-file) [Writer for File](#writer-for-file)
 
 ## Functions
 
@@ -338,9 +338,12 @@ asked is "make sure this is there", and a program that has to distinguish "I mad
 there" is asking a question this cannot answer honestly anyway, since somebody else may have made
 it in between.
 
-It climbs with `sysl.path.parent` and recurses, so the work is done from the top down and each
-level is attempted exactly once. A component that exists and is **not** a directory reports
-`NotADirectory` from the `make_dir` beneath it rather than being silently accepted.
+It tries `make_dir(path)` first and climbs with `sysl.path.parent` only when that answers
+`NotFound`, then retries, so each level is attempted once and the error is the one the operating
+system gave for the path the caller named. **A file standing where a directory is needed above the
+leaf** (`make_dir_all("x/y")` with `x` a regular file) reports `NotADirectory`, since `mkdir`
+answers `ENOTDIR`. **A file standing at the leaf itself** (`make_dir_all("x")` with `x` a regular
+file) reports `AlreadyExists`. Neither is silently accepted.
 
 ### `make_temp_dir`
 
@@ -746,16 +749,21 @@ struct File
 
 A file that is open, or that was.
 
-**Closing is the program's to do**, and `defer f.close()` is how it is written -- the language has
-no destructor, so nothing runs at the end of a scope that the scope did not say. What the shared
-state above buys is that saying it *twice* is harmless rather than a use-after-free, which is the
-mistake a value type would otherwise make easy. Dropping a `File` without closing it leaks the
-descriptor until the program exits, and loses whatever was still buffered.
+**It closes itself**: when the last copy of a `File` goes -- out of scope, out of a `Buf`, with the
+struct that held it -- what is still buffered is handed over and the descriptor is closed, as Rust's
+`File` does. `close` is still there, and is what a program calls when it wants to know the answer:
+a full disk reports when the buffer is handed over, and a destructor has nobody to tell. `defer
+f.close()` remains a correct way to write that, and is no longer needed to stop a leak.
+
+**Every copy shares one open file.** Closing any of them closes it for all, and saying it *twice*
+is harmless rather than a use-after-free, which is the mistake a value type would otherwise make
+easy. While any copy lives the descriptor stays open.
 
 | Member | Signature | Description |
 |---|---|---|
 | `closed` | `closed(*self) -> bool` |  |
 | `fd` | `fd(self) -> Result[int, IoError]` | The descriptor the file reads and writes through, for a call this module does not make. |
+| `into_raw_fd` | `into_raw_fd(*self) -> Result[int, IoError]` | The descriptor, given rather than lent: the file lets go of it, and closing it is from now on the caller's to do -- Rust's `into_raw_fd`. |
 | `map` | `map(*self) -> Result[&Mapped, IoError]` | The file's bytes, mapped read-only into memory rather than read -- `map_file`, for a file that is already open. |
 | `flush` | `flush(*self) -> Result[unit, IoError]` | Hands over what is buffered. |
 | `close` | `close(*self) -> Result[unit, IoError]` | Releases the descriptor, handing over what is still buffered. |
@@ -788,7 +796,8 @@ what `File` has to survive being copied. A struct is a value here, so a `File` h
 is a second `File`, and if it held the descriptor and the buffer directly then closing either would
 leave the other writing into a descriptor that was released, and the two would disagree about what
 was buffered. Every copy sharing **one** `FileState` is what makes `close` answerable at all: it is
-written once, and every copy sees it.
+written once, and every copy sees it. It is also what gives the descriptor one point of death: the
+last copy going is the state's last reference going, and its destructor closes what nobody closed.
 
 The buffer holds one direction at a time. Reading, `held[at..<filled]` is what arrived and has not
 been handed out; writing, `held[0..<pending]` is what was written and has not been handed over.
@@ -982,6 +991,17 @@ impl Display for Kind
 So that a kind prints as the word rather than as a number, and `Special` says what it is carrying:
 a program reporting what it found in a directory has one thing to print, and the alternative is a
 `match` at every such site.
+
+### Drop for FileState
+
+```sysl
+impl Drop for FileState
+```
+
+The descriptor closed when the last `File` sharing it goes, unless `close` or `into_raw_fd` already
+gave it up. What is still buffered is handed over first, and a failure doing either is not
+reported: a destructor has nobody to report it to (`sysl.Drop`), so a program that cares whether
+its output arrived calls `close` and reads the answer.
 
 ### Drop for Mapped
 

@@ -162,9 +162,18 @@ server.close().unwrap()
 1 true
 ```
 
-**A socket is not closed by going out of scope.** `close` is a call, exactly as it is in C, and a
-program that drops one without closing leaks a descriptor until it exits — which is C's own rule
-rather than something this binding introduced. `defer s.close()` is the idiom.
+**A socket closes itself when its last copy goes**, as Rust's `TcpStream` does: out of scope, out of
+a `Buf`, with the struct that held it. A copy of a socket is a second name for one descriptor, not a
+second descriptor, so it stays open while any copy lives, and closing one copy closes them all — a
+second `close` answers `NotOpen` and closes nothing. `close` is still the call for a program that
+wants the descriptor back at a moment of its own, or wants to know whether that worked; the explicit
+closes above are that, and are no longer needed to stop a leak.
+
+**`fd()` lends the descriptor and `into_raw_fd()` gives it away**, for a program handing it to C.
+A lent number is closed with the socket; a given one is the caller's to close, and every copy of the
+socket is closed from then on. `UdpSocket` and `UnixListener` have the same three calls and close
+themselves the same way. **A socket may be handed to another thread**: the count the copies share is
+atomic.
 
 ## The timeout, which a blocking call cannot do without
 
@@ -500,11 +509,12 @@ udp_socket(here) match
 ```
 
 ```error
-this program reaches 'sysl.net', and 'aarch64-freestanding' has no operating system under it for the standard library to answer a network with, so the program answers it: define 'sysl_net_bind', 'sysl_net_socket' with '@export', each taking what its 'extern' in 'sysl.net.sys' declares and answering a descriptor, a count or zero, or the code of an 'IoError' negated
+this program reaches 'sysl.net', and 'aarch64-freestanding' has no operating system under it for the standard library to answer a network with, so the program answers it: define 'sysl_net_bind', 'sysl_net_close', 'sysl_net_socket' with '@export', each taking what its 'extern' in 'sysl.net.sys' declares and answering a descriptor, a count or zero, or the code of an 'IoError' negated
 ```
 
-The question is asked only of what the program reaches, so a freestanding program that builds an
-`Address` and never makes a socket is asked nothing.
+`sysl_net_close` is asked for although the program never calls `close`: a socket closes itself when
+its last copy goes, so making one reaches it. The question is asked only of what the program reaches,
+so a freestanding program that builds an `Address` and never makes a socket is asked nothing.
 
 ## What is deliberately absent
 

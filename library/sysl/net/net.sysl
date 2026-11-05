@@ -99,23 +99,74 @@ private resolved(host: string, port: int, passive: int) -> Result[Buf[Address], 
     Ok(out)
 end resolved
 
+/** The descriptor behind a socket, shared by every copy of it -- `Socket`, `UdpSocket` and
+ * `UnixListener` all hold one.
+ *
+ * **It is what lets a socket stay a value and still close itself.** A copy of a socket is a second
+ * share of this, not a second descriptor, so the descriptor has one point of death: the last share
+ * going. `close` and `into_raw_fd` set `fd` to `-1`, which every copy sees, so a later call through
+ * any of them reaches the operating system as `EBADF` -- `NotOpen` -- rather than as a number that
+ * may by now be somebody else's, and the destructor has nothing left to close.
+ *
+ * **It is a `&sync`**, whose count is atomic, because a socket is the thing a server hands to
+ * another thread; a plain `&` could not cross (`reference/memory.md § Crossing a concurrency
+ * domain`). The count being atomic makes the sharing safe, not a close racing a use on another
+ * thread -- that is the program's to order, as it is in C.
+ */
+private[net] struct SocketState
+    fd: i32
+
+/** The descriptor closed when the last copy of the socket goes, unless it was already given up. A
+ * failure is not reported, there being nobody to report it to (`sysl.Drop`).
+ */
+impl Drop for SocketState
+    drop(self)
+        if self.fd >= 0 then _ = nsys.close(int(self.fd))
+
+/** A socket's descriptor given up: `-1` from now on, and the number it was, or `NotOpen` if it was
+ * already given up. `close` and `into_raw_fd` on every socket type are this.
+ */
+private[net] given_up(s: &sync SocketState) -> Result[int, IoError]
+    if s.fd < 0 then return Err(NotOpen)
+
+    val fd = int(s.fd)
+
+    s.fd = -1
+    Ok(fd)
+end given_up
+
+/** A socket's descriptor closed, at most once whichever copy asks: a second close answers `NotOpen`,
+ * the `EBADF` it always answered, and closes nothing.
+ */
+private[net] shut(s: &sync SocketState) -> Result[unit, IoError] = told(nsys.close(given_up(s)?))
+
+/** A socket's descriptor lent, or `NotOpen` once it has been given up. */
+private[net] lent(s: &sync SocketState) -> Result[int, IoError] =
+    if s.fd < 0 then Err(NotOpen) else Ok(int(s.fd))
+
+/** A new descriptor's state, closed when its last socket goes. */
+private[net] owned(fd: int) -> &sync SocketState = SocketState(i32(fd))
+
 /** A connection, or something listening for one. One type, because the sockets API has one.
  *
- * **A socket is not closed by going out of scope.** `close` is a call, exactly as it is in C, and a
- * program that drops one without closing it leaks a descriptor until it exits. `defer s.close()` is
- * the idiom.
+ * **It closes itself**: when the last copy of a socket goes -- out of scope, out of a `Buf`, with the
+ * struct that held it -- its descriptor is closed, as Rust's `TcpStream` does. `close` is still there
+ * for a program that wants to give it back at a moment of its own, or to read whether that worked,
+ * and `defer s.close()` remains correct without being needed. **Every copy shares one descriptor**:
+ * closing one closes them all, a second `close` answers `NotOpen` and closes nothing, and the
+ * descriptor stays open while any copy lives. `into_raw_fd` takes the descriptor away from the socket altogether.
  */
 struct Socket
-    private[net] fd: i32
+    private[net] inner: &sync SocketState
 
     /** Connect to somewhere. The address must be of the family this socket was made for, which it
      * is whenever the two came from the same `resolve`.
      */
     @blocks
-    connect(*self, to: Address) -> Result[unit, IoError] = told(nsys.connect(int(self.fd), &to.at))
+    connect(*self, to: Address) -> Result[unit, IoError] = told(nsys.connect(int(self.inner.fd), &to.at))
 
     /** Take a local address, which is what a listener does before it listens. */
-    bind(*self, to: Address) -> Result[unit, IoError] = told(nsys.bind(int(self.fd), &to.at))
+    bind(*self, to: Address) -> Result[unit, IoError] = told(nsys.bind(int(self.inner.fd), &to.at))
 
     /** Start accepting connections, with `backlog` of them allowed to queue.
      *
@@ -123,21 +174,21 @@ struct Socket
      * rather than a constant because the number is the caller's business.
      */
     listen(*self, backlog: int = 128) -> Result[unit, IoError] =
-        told(nsys.listen(int(self.fd), backlog))
+        told(nsys.listen(int(self.inner.fd), backlog))
 
     /** Wait for a connection, and answer it together with where it came from. */
     @blocks
     accept(*self) -> Result[(Socket, Address), IoError]
         var peer = unspecified()
-        val s = nsys.accept(int(self.fd), &peer)
+        val s = nsys.accept(int(self.inner.fd), &peer)
 
-        if s < 0 then Err(failure(s)) else Ok((Socket(i32(s)), Address(peer)))
+        if s < 0 then Err(failure(s)) else Ok((Socket(owned(s)), Address(peer)))
     end accept
 
     /** Where this socket is, which is how a listener that asked for port 0 learns which port it
      * got.
      */
-    local(self) -> Result[Address, IoError] = local_of(self.fd)
+    local(self) -> Result[Address, IoError] = local_of(self.inner.fd)
 
     /** Write some of `bytes`, and say how many.
      *
@@ -148,7 +199,7 @@ struct Socket
     send(*self, bytes: []const u8) -> Result[usize, IoError]
         if bytes.len == 0 then return Ok(0)
 
-        moved(nsys.send(int(self.fd), as_ptr(bytes), bytes.len))
+        moved(nsys.send(int(self.inner.fd), as_ptr(bytes), bytes.len))
     end send
 
     /** Every byte of `bytes`, however many calls that takes.
@@ -177,7 +228,7 @@ struct Socket
     recv(*self, into: []u8) -> Result[usize, IoError]
         if into.len == 0 then return Ok(0)
 
-        moved(nsys.recv(int(self.fd), as_mut_ptr(into), into.len))
+        moved(nsys.recv(int(self.inner.fd), as_mut_ptr(into), into.len))
     end recv
 
     /** Stop reading, stop writing, or stop both -- while the descriptor stays open.
@@ -186,31 +237,44 @@ struct Socket
      * program that has finished asking can say so and then go on reading the answer.
      */
     shutdown(*self, how: Shutdown = Both) -> Result[unit, IoError] =
-        told(nsys.shutdown(int(self.fd), how match
+        told(nsys.shutdown(int(self.inner.fd), how match
             Read -> 0
             Write -> 1
             Both -> 2))
 
-    /** Give the descriptor back. A socket closed twice is a descriptor number that may by then belong
-     * to something else, which is C's rule and is not checked here.
+    /** Give the descriptor back now, rather than when the last copy goes, and say whether that
+     * worked. **It closes every copy**, and a second `close` -- through this copy or another --
+     * answers `NotOpen` and closes nothing, so it is never a number that by then belongs to something
+     * else.
      */
-    close(*self) -> Result[unit, IoError] = told(nsys.close(int(self.fd)))
+    close(*self) -> Result[unit, IoError] = shut(self.inner)
+
+    /** The descriptor, lent: the socket still closes it, explicitly or when its last copy goes, so a
+     * number kept past that names nothing. A closed socket answers `NotOpen`.
+     */
+    fd(self) -> Result[int, IoError] = lent(self.inner)
+
+    /** The descriptor, given rather than lent: the socket lets go of it and closing it is from now on
+     * the caller's to do -- Rust's `into_raw_fd`. Every copy is closed afterwards, as `close` would
+     * leave it; a socket already closed answers `NotOpen`.
+     */
+    into_raw_fd(*self) -> Result[int, IoError] = given_up(self.inner)
 
     /** How long a `recv` may wait before giving up, in milliseconds. Zero is no limit, which is
      * where a socket starts.
      */
     read_timeout(*self, ms: int) -> Result[unit, IoError] =
-        told(nsys.option(int(self.fd), nsys.read_timeout, i64(ms)))
+        told(nsys.option(int(self.inner.fd), nsys.read_timeout, i64(ms)))
 
     /** How long a `send` may wait before giving up, in milliseconds. Zero is no limit. */
     write_timeout(*self, ms: int) -> Result[unit, IoError] =
-        told(nsys.option(int(self.fd), nsys.write_timeout, i64(ms)))
+        told(nsys.option(int(self.inner.fd), nsys.write_timeout, i64(ms)))
 
     /** Let a listener take a port that a recently stopped one was using, so that a server just
      * stopped can be started again without waiting out `TIME_WAIT`. Set it **before** `bind`.
      */
     reuse_address(*self, on: bool = true) -> Result[unit, IoError] =
-        told(nsys.option(int(self.fd), nsys.reuse_address, if on then 1 else 0))
+        told(nsys.option(int(self.inner.fd), nsys.reuse_address, if on then 1 else 0))
 
     /** Put this socket in non-blocking mode, or take it out again. An `accept`, `recv` or `send` that
      * would have had to wait then answers an error `would_block` recognises instead of waiting --
@@ -218,7 +282,7 @@ struct Socket
      * turn. A connection `accept` answers is blocking whatever its listener is.
      */
     non_blocking(*self, on: bool = true) -> Result[unit, IoError] =
-        told(nsys.option(int(self.fd), nsys.non_blocking, if on then 1 else 0))
+        told(nsys.option(int(self.inner.fd), nsys.non_blocking, if on then 1 else 0))
 
     /** Ask the kernel for a send buffer of `bytes`. A size that is not positive is `InvalidInput`.
      *
@@ -227,17 +291,17 @@ struct Socket
      * large `send` to a slow reader takes many turns: macOS gives a Unix socket 8 KB.
      */
     set_send_buffer(*self, bytes: int) -> Result[unit, IoError] =
-        told(nsys.option(int(self.fd), nsys.send_buffer, i64(bytes)))
+        told(nsys.option(int(self.inner.fd), nsys.send_buffer, i64(bytes)))
 
     /** Ask the kernel for a receive buffer of `bytes`; see `set_send_buffer`. */
     set_recv_buffer(*self, bytes: int) -> Result[unit, IoError] =
-        told(nsys.option(int(self.fd), nsys.recv_buffer, i64(bytes)))
+        told(nsys.option(int(self.inner.fd), nsys.recv_buffer, i64(bytes)))
 
     /** The send buffer the kernel gave this socket, in bytes. */
-    send_buffer(self) -> Result[int, IoError] = sized(nsys.option(int(self.fd), nsys.send_buffer_size, 0))
+    send_buffer(self) -> Result[int, IoError] = sized(nsys.option(int(self.inner.fd), nsys.send_buffer_size, 0))
 
     /** The receive buffer the kernel gave this socket, in bytes. */
-    recv_buffer(self) -> Result[int, IoError] = sized(nsys.option(int(self.fd), nsys.recv_buffer_size, 0))
+    recv_buffer(self) -> Result[int, IoError] = sized(nsys.option(int(self.inner.fd), nsys.recv_buffer_size, 0))
 end Socket
 
 /** A stream socket of the family an address belongs to, ready to be connected or bound.
@@ -249,7 +313,7 @@ end Socket
 socket(for_address: Address) -> Result[Socket, IoError]
     val s = nsys.socket(int(for_address.at.family), nsys.stream)
 
-    if s < 0 then Err(failure(s)) else Ok(Socket(i32(s)))
+    if s < 0 then Err(failure(s)) else Ok(Socket(owned(s)))
 end socket
 
 /** A datagram socket: UDP. Each `send_to` is one datagram and each `recv_from` takes one whole,
@@ -260,27 +324,27 @@ end socket
  * the exchanges that can live with that -- a query and its answer, a heartbeat, a sample -- and the
  * calls here say nothing more than that.
  *
- * Not closed by going out of scope, for the reason `Socket` is not.
+ * It closes itself when its last copy goes, exactly as `Socket` does.
  */
 struct UdpSocket
-    private fd: i32
+    private inner: &sync SocketState
 
     /** Take a local address: the port this socket receives on. Port 0 asks for any free one, which
      * `local` then names.
      */
-    bind(*self, to: Address) -> Result[unit, IoError] = told(nsys.bind(int(self.fd), &to.at))
+    bind(*self, to: Address) -> Result[unit, IoError] = told(nsys.bind(int(self.inner.fd), &to.at))
 
     /** Fix where this socket talks to: `send` then goes there without naming it, and `recv` takes
      * datagrams from there and from nowhere else.
      */
-    connect(*self, to: Address) -> Result[unit, IoError] = told(nsys.connect(int(self.fd), &to.at))
+    connect(*self, to: Address) -> Result[unit, IoError] = told(nsys.connect(int(self.inner.fd), &to.at))
 
     /** Send `bytes` as one datagram to `to`, and say how many went -- all of them, or an error. An
      * empty datagram is a datagram.
      */
     @blocks
     send_to(*self, bytes: []const u8, to: Address) -> Result[usize, IoError] =
-        moved(nsys.send_to(int(self.fd), as_ptr(bytes), bytes.len, &to.at))
+        moved(nsys.send_to(int(self.inner.fd), as_ptr(bytes), bytes.len, &to.at))
 
     /** Wait for one datagram, read as much of it as `into` holds, and answer how many bytes that
      * was together with who sent it.
@@ -288,7 +352,7 @@ struct UdpSocket
     @blocks
     recv_from(*self, into: []u8) -> Result[(usize, Address), IoError]
         var sender = unspecified()
-        val n = nsys.recv_from(int(self.fd), as_mut_ptr(into), into.len, &sender)
+        val n = nsys.recv_from(int(self.inner.fd), as_mut_ptr(into), into.len, &sender)
 
         if n < 0 then Err(failure(int(n))) else Ok((usize(n), Address(sender)))
     end recv_from
@@ -296,61 +360,69 @@ struct UdpSocket
     /** Send `bytes` as one datagram to where `connect` pointed this socket. */
     @blocks
     send(*self, bytes: []const u8) -> Result[usize, IoError] =
-        moved(nsys.send(int(self.fd), as_ptr(bytes), bytes.len))
+        moved(nsys.send(int(self.inner.fd), as_ptr(bytes), bytes.len))
 
     /** Wait for one datagram from where `connect` pointed this socket, and answer how many of its
      * bytes `into` held.
      */
     @blocks
     recv(*self, into: []u8) -> Result[usize, IoError] =
-        moved(nsys.recv(int(self.fd), as_mut_ptr(into), into.len))
+        moved(nsys.recv(int(self.inner.fd), as_mut_ptr(into), into.len))
 
     /** Where this socket is bound. */
-    local(self) -> Result[Address, IoError] = local_of(self.fd)
+    local(self) -> Result[Address, IoError] = local_of(self.inner.fd)
 
     /** How long a receive may wait before giving up, in milliseconds. Zero is no limit, which is
      * where a socket starts -- and a datagram that was lost is waited for forever without one.
      */
     read_timeout(*self, ms: int) -> Result[unit, IoError] =
-        told(nsys.option(int(self.fd), nsys.read_timeout, i64(ms)))
+        told(nsys.option(int(self.inner.fd), nsys.read_timeout, i64(ms)))
 
     /** How long a send may wait before giving up, in milliseconds. Zero is no limit. */
     write_timeout(*self, ms: int) -> Result[unit, IoError] =
-        told(nsys.option(int(self.fd), nsys.write_timeout, i64(ms)))
+        told(nsys.option(int(self.inner.fd), nsys.write_timeout, i64(ms)))
 
     /** Put this socket in non-blocking mode, or take it out again: a receive with no datagram waiting
      * then answers an error `would_block` recognises instead of waiting.
      */
     non_blocking(*self, on: bool = true) -> Result[unit, IoError] =
-        told(nsys.option(int(self.fd), nsys.non_blocking, if on then 1 else 0))
+        told(nsys.option(int(self.inner.fd), nsys.non_blocking, if on then 1 else 0))
 
     /** Ask the kernel for a send buffer of `bytes`; see `Socket.set_send_buffer`. A datagram longer
      * than the send buffer is refused (`EMSGSIZE`), so this is what raises that limit.
      */
     set_send_buffer(*self, bytes: int) -> Result[unit, IoError] =
-        told(nsys.option(int(self.fd), nsys.send_buffer, i64(bytes)))
+        told(nsys.option(int(self.inner.fd), nsys.send_buffer, i64(bytes)))
 
     /** Ask the kernel for a receive buffer of `bytes`; see `Socket.set_send_buffer`. Datagrams that
      * arrive faster than they are read are dropped once it is full, so a larger one drops fewer.
      */
     set_recv_buffer(*self, bytes: int) -> Result[unit, IoError] =
-        told(nsys.option(int(self.fd), nsys.recv_buffer, i64(bytes)))
+        told(nsys.option(int(self.inner.fd), nsys.recv_buffer, i64(bytes)))
 
     /** The send buffer the kernel gave this socket, in bytes. */
-    send_buffer(self) -> Result[int, IoError] = sized(nsys.option(int(self.fd), nsys.send_buffer_size, 0))
+    send_buffer(self) -> Result[int, IoError] = sized(nsys.option(int(self.inner.fd), nsys.send_buffer_size, 0))
 
     /** The receive buffer the kernel gave this socket, in bytes. */
-    recv_buffer(self) -> Result[int, IoError] = sized(nsys.option(int(self.fd), nsys.recv_buffer_size, 0))
+    recv_buffer(self) -> Result[int, IoError] = sized(nsys.option(int(self.inner.fd), nsys.recv_buffer_size, 0))
 
-    /** Give the descriptor back. */
-    close(*self) -> Result[unit, IoError] = told(nsys.close(int(self.fd)))
+    /** Give the descriptor back now, closing every copy; a second `close` answers `NotOpen` and
+     * closes nothing. See `Socket.close`.
+     */
+    close(*self) -> Result[unit, IoError] = shut(self.inner)
+
+    /** The descriptor, lent; see `Socket.fd`. */
+    fd(self) -> Result[int, IoError] = lent(self.inner)
+
+    /** The descriptor, given rather than lent; see `Socket.into_raw_fd`. */
+    into_raw_fd(*self) -> Result[int, IoError] = given_up(self.inner)
 end UdpSocket
 
 /** A datagram socket of the family an address belongs to, ready to be bound or connected. */
 udp_socket(for_address: Address) -> Result[UdpSocket, IoError]
     val s = nsys.socket(int(for_address.at.family), nsys.datagram)
 
-    if s < 0 then Err(failure(s)) else Ok(UdpSocket(i32(s)))
+    if s < 0 then Err(failure(s)) else Ok(UdpSocket(owned(s)))
 end udp_socket
 
 /** Whether an error is a call that ran out of its timeout rather than one that failed.

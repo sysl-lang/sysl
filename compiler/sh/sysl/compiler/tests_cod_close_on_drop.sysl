@@ -1,0 +1,132 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.replace_all
+
+// A `File` and every socket type closing themselves when their last copy goes, asserted of a real
+// program built on the counted heap: what it prints says the buffered write reached the file, and
+// the heap's own count at exit says the shared state behind each of them was given back. The library's
+// own tests (`library/sysl/fs/drop_tests.sysl`, `library/sysl/net/drop_tests.sysl`) ask the
+// descriptors themselves; this asks the allocations, which only a counted program can.
+
+private struct CodRun
+    ok: bool
+    out: string
+    err: string
+
+private cod_ready() -> bool
+    if std_root().is_err() || !clang_available()
+        print("skipped: the library or the toolchain is not on this machine")
+        return false
+    end if
+
+    true
+end cod_ready
+
+// The program built on the counted heap and run, with `ROOT` in its text replaced by a directory of
+// its own; a build that failed answers `ok` false with the reason in `out`.
+private cod_run(text: string) -> CodRun
+    val root = make_temp_dir("sysl-cod").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", replace_all(text, "ROOT", root)).unwrap()
+
+    force_alloc_counting(true)
+
+    val built = build_native_program(s"$root/main.sysl", None, None, DefaultOptimization,
+                                     Some(s"$root/built"))
+
+    force_alloc_counting(false)
+
+    built match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return CodRun(false, failure_text(why), "")
+        Ok(_) -> ()
+
+    val said = capture(s"$root/built", [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> CodRun(false, "could not be started", "")
+        Ok(o) -> CodRun(o.status.ok(), o.text, o.err.unwrap_or(""))
+end cod_run
+
+@test("cod_ files and sockets never closed, held in structs and Bufs, give back every allocation")
+cod_never_closed_leaks_nothing()
+    if !cod_ready() then return
+
+    val run = cod_run("""
+        import sysl.buf.{Buf, buf}
+        import sysl.fs.{File, create, open, read_text}
+        import sysl.net.{Socket, UdpSocket, ipv4, socket, udp_socket}
+
+        struct Held
+            f: File
+            s: Socket
+            u: UdpSocket
+
+        wrote(path: string)
+            var f = create(path).unwrap()
+
+            f.write("kept".bytes)
+
+        held(path: string) -> usize
+            val here = ipv4(127, 0, 0, 1, 0)
+            var b: Buf[Held] = buf()
+
+            b.push(Held(open(path).unwrap(), socket(here).unwrap(), udp_socket(here).unwrap()))
+            b.len()
+        end held
+
+        val path = "ROOT/out.txt"
+
+        wrote(path)
+
+        var n: usize = 0
+
+        for _ in 0..<1000 do n += held(path)
+
+        var g = open(path).unwrap()
+        val copy = g
+        val raw = g.into_raw_fd().unwrap()
+
+        print(s"${read_text(path).unwrap()} $n ${raw >= 0} ${copy.fd().is_err()}")
+        """)
+
+    assert(run.ok, run.out)
+    assert_eq(run.out, "kept 1000 true true\n")
+    assert(run.err == "", run.err)
+    assert_eq(alloc_count_reported(run.err), 0)
+end cod_never_closed_leaks_nothing
+
+@test("cod_ files and sockets closed explicitly and then dropped give back every allocation")
+cod_closed_then_dropped_leaks_nothing()
+    if !cod_ready() then return
+
+    val run = cod_run("""
+        import sysl.fs.{create, read_text}
+        import sysl.net.{ipv4, socket}
+
+        var f = create("ROOT/out.txt").unwrap()
+
+        f.write("closed".bytes)
+        f.close().unwrap()
+        f.close().unwrap()
+
+        var s = socket(ipv4(127, 0, 0, 1, 0)).unwrap()
+        var t = s
+
+        s.close().unwrap()
+
+        print(s"${read_text("ROOT/out.txt").unwrap()} ${t.close().is_err()}")
+        """)
+
+    assert(run.ok, run.out)
+    assert_eq(run.out, "closed true\n")
+    assert(run.err == "", run.err)
+    assert_eq(alloc_count_reported(run.err), 0)
+end cod_closed_then_dropped_leaks_nothing

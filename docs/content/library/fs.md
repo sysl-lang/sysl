@@ -355,9 +355,33 @@ functions above are named for what they *mean* rather than for the flags each be
 its siblings differ between C libraries, and are translated once, by the hosted answer to the hooks.
 
 **`fd()` lends the descriptor**, for a call this module does not make — to poll it, to `fcntl` it, to
-hand it to C. Lent, not given: the `File` still closes it, bytes written and not yet flushed have not
-reached it, and a closed file answers `NotOpen` rather than a number that may by now be somebody
-else's.
+hand it to C. Lent, not given: the `File` still closes it — explicitly, or when its last copy goes —
+bytes written and not yet flushed have not reached it, and a closed file answers `NotOpen` rather than
+a number that may by now be somebody else's.
+
+**`into_raw_fd()` gives the descriptor away**, as Rust's does, for a program that hands it to C for
+longer than the `File` lives. What is buffered is handed over and what was read ahead is given back
+first, so the number stands where the file did; from then on every copy of the file is closed, and
+closing the number is the caller's to do.
+
+```sysl
+import sysl.fs.{create_update, read_text, remove_file}
+import sysl.process.pid
+
+val path = s"/tmp/sysl-fs-doc-raw-${pid()}.txt"
+var f = create_update(path).unwrap()
+
+f.write("kept".bytes)
+
+val n = f.into_raw_fd().unwrap()
+
+print(n >= 0, f.fd().is_err(), read_text(path).unwrap())
+remove_file(path).unwrap()
+```
+
+```output
+true true kept
+```
 
 ### It is a `Reader` and a `Writer`, whole
 
@@ -546,18 +570,20 @@ the file is not open 9
 
 Four rules are in that output.
 
-**Closing is the program's to do, and `defer f.close()` is how it is written.** Dropping a `File`
-without closing it leaks the handle until the program exits, the same as in C.
+**A `File` closes itself when its last copy goes**, as Rust's does: out of scope, out of a `Buf`, with
+the struct that held it. What is still buffered is handed over first, and then the descriptor is
+closed. The state every copy shares has a [destructor](/reference/memory/), so a file that dies where
+no `defer` could be written — inside a container, inside a struct inside a container — is closed all
+the same.
 
-A [destructor](/reference/memory/) is the other way to arrange it, and `File` deliberately does not
-have one: a destructor runs for a value held behind a `&T`, so giving `File` one would mean a heap
-box per open file and would take the choice away from a program that would rather not have one. What
-a destructor is for is the resource that dies where no `defer` can be written — inside a container,
-inside a struct inside a container — and a handle a function opens and closes is not that.
+**`close` is still the call to make where the answer matters.** Handing over what was buffered is
+where a full disk finally reports, and a destructor has nobody to report to, so a failure there is
+dropped as Rust's `BufWriter` drops it. `defer f.close()` remains a correct way to write it, and is no
+longer needed to stop a leak.
 
 **`close` is idempotent, and the second call is not merely tolerated — it is the case `defer`
 creates.** A function that closes on one path and defers the close for the others reaches the end
-having done both.
+having done both, and the drop that comes after a close does nothing.
 
 **Every other member checks the flag first, and none of them may skip it.** `fclose` releases the
 handle, so the pointer the struct holds afterwards names storage C has freed; reaching it would be a
@@ -577,7 +603,8 @@ A `File` is a struct and therefore a value, so passing one to a function makes a
 holds its state behind a `&FileState` rather than holding the pointer directly, and that is what makes
 `close` answerable at all: **every copy shares one state**, so closing either is closing the file, and
 closing it twice is harmless rather than a use-after-free. A value type holding the pointer would have
-made that mistake easy.
+made that mistake easy. It is also what gives the descriptor one point of death: the file is closed
+when the **last** copy goes, and stays open while any copy lives.
 
 ### Mapping a file instead of reading it
 

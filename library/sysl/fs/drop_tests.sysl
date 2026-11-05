@@ -1,0 +1,357 @@
+module sysl.fs
+@requires(posix)
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.sys as fsys
+import sysl.path.parent
+
+// A `File` closing itself when its last copy goes (`FileState`'s destructor), and `into_raw_fd`
+// taking the descriptor away from it.
+//
+// **Whether a descriptor is open is asked of the operating system**, with an `fstat` of the number:
+// a closed one answers `EBADF`. Each test runs in a process of its own and on one thread, so nothing
+// else can be handed the number between the drop and the question. Each file is let go of by
+// returning from a helper, which is where its last local copy goes.
+
+private fcd_path(name: string) -> string = s"${make_temp_dir("sysl-fs-fcd-").unwrap()}/$name"
+
+private fcd_done(path: string) = fcd_ignore(remove_dir_all(parent(path).unwrap()))
+
+private fcd_ignore(r: Result[unit, IoError]) = ()
+
+// Whether `fd` names an open descriptor.
+private fcd_open(fd: int) -> bool
+    var st = fsys.Stat(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+
+    fsys.fstat(fd, &st) == 0
+end fcd_open
+
+// A file opened and let go of without a close; its descriptor's number is all that comes back.
+private fcd_opened_and_dropped(path: string) -> int = open(path).unwrap().fd().unwrap()
+
+// A file written to and let go of with neither a flush nor a close.
+private fcd_written_and_dropped(path: string, bytes: []const u8, tail: []const u8) -> int
+    var f = create(path).unwrap()
+
+    f.write(bytes)
+    f.write(tail)
+    f.fd().unwrap()
+end fcd_written_and_dropped
+
+// A file opened, closed and let go of, with the next file opened while it is closed and still held.
+private fcd_closed_then_dropped(path: string) -> (File, int)
+    var f = open(path).unwrap()
+    val n = f.fd().unwrap()
+
+    f.close().unwrap()
+
+    (open(path).unwrap(), n)
+end fcd_closed_then_dropped
+
+// Two copies of one file, one of them let go of here and the other handed back.
+private fcd_one_copy_kept(path: string) -> File
+    val f = open(path).unwrap()
+    val g = f
+
+    assert_eq(g.fd().unwrap(), f.fd().unwrap())
+    g
+end fcd_one_copy_kept
+
+private fcd_kept_number(f: File) -> int = f.fd().unwrap()
+
+// Three files in a Buf, let go of with the Buf.
+private fcd_held_in_a_buf(path: string) -> Buf[int]
+    var files: Buf[File] = buf()
+    var fds: Buf[int] = buf()
+
+    for _ in 0..<3 do files.push(open(path).unwrap())
+    for f in files do fds.push(f.fd().unwrap())
+    for n in fds do assert(fcd_open(n))
+
+    fds
+end fcd_held_in_a_buf
+
+private struct FcdHolder
+    file: File
+    name: string
+
+// A file in a struct field, let go of with the struct.
+private fcd_held_in_a_field(path: string) -> int
+    val h = FcdHolder(open(path).unwrap(), "held")
+    val n = h.file.fd().unwrap()
+
+    assert(fcd_open(n))
+    n
+end fcd_held_in_a_field
+
+// A file whose descriptor was taken away from it, let go of along with a copy of it.
+private fcd_given_away(path: string) -> int
+    var f = open(path).unwrap()
+    val g = f
+    val n = f.into_raw_fd().unwrap()
+
+    assert(g.fd().unwrap_err() == NotOpen, "a copy still lends a descriptor given away")
+    assert(f.into_raw_fd().unwrap_err() == NotOpen)
+    n
+end fcd_given_away
+
+@test("fcd_ a file dropped without a close has its descriptor closed")
+fcd_drop_closes()
+    val path = fcd_path("drop")
+
+    write_text(path, "x").unwrap()
+
+    val n = fcd_opened_and_dropped(path)
+
+    assert(n >= 0)
+    assert(!fcd_open(n), "the descriptor outlived its file")
+    fcd_done(path)
+
+@test("fcd_ a write with neither a flush nor a close reaches the file when the file is dropped")
+fcd_drop_flushes()
+    val path = fcd_path("flush")
+    val n = fcd_written_and_dropped(path, "buffered, ".bytes, "never flushed".bytes)
+
+    assert(!fcd_open(n))
+    assert_eq(read_text(path).unwrap(), "buffered, never flushed")
+    fcd_done(path)
+
+@test("fcd_ a write larger than the buffer, then a small one, both arrive at the drop")
+fcd_drop_flushes_after_a_pass_through()
+    val path = fcd_path("large")
+    var big: Buf[u8] = buf()
+
+    for _ in 0..<10000 do big.push(u8('a'))
+
+    _ = fcd_written_and_dropped(path, big.view(), "tail".bytes)
+
+    val back = read_text(path).unwrap()
+
+    assert_eq(back.bytes.len, 10004)
+    assert(back.ends_with("tail"))
+    fcd_done(path)
+end fcd_drop_flushes_after_a_pass_through
+
+@test("fcd_ a file closed and then dropped does not close the descriptor its number went to next")
+fcd_close_then_drop()
+    val path = fcd_path("twice")
+
+    write_text(path, "abc").unwrap()
+
+    var (g, n) = fcd_closed_then_dropped(path)
+
+    // The closed file's number was free again, so the next open was handed it.
+    assert_eq(g.fd().unwrap(), n)
+    assert(fcd_open(n), "the drop of a closed file closed its successor")
+
+    var into: []u8 = [0; 8]
+
+    assert_eq(g.read(into).len, 3)
+    g.close().unwrap()
+    fcd_done(path)
+end fcd_close_then_drop
+
+@test("fcd_ a closed file's second close is still Ok")
+fcd_close_twice()
+    val path = fcd_path("close2")
+
+    write_text(path, "x").unwrap()
+
+    var f = open(path).unwrap()
+
+    f.close().unwrap()
+    f.close().unwrap()
+    fcd_done(path)
+
+@test("fcd_ a copy shares the descriptor, which stays open while any copy lives")
+fcd_copy_shares()
+    val path = fcd_path("copy")
+
+    write_text(path, "abc").unwrap()
+
+    var kept = fcd_one_copy_kept(path)
+    val n = fcd_kept_number(kept)
+
+    assert(fcd_open(n), "a copy going closed the descriptor another copy still holds")
+
+    var into: []u8 = [0; 8]
+
+    assert_eq(kept.read(into).len, 3)
+
+    // The new file is opened before the old one is let go of, so it has a number of its own, and the
+    // last copy of the old one goes with the assignment.
+    kept = open(path).unwrap()
+
+    assert(kept.fd().unwrap() != n)
+    assert(!fcd_open(n), "the last copy going left the descriptor open")
+    kept.close().unwrap()
+    fcd_done(path)
+end fcd_copy_shares
+
+@test("fcd_ closing one copy closes every copy")
+fcd_close_one_copy()
+    val path = fcd_path("closecopy")
+
+    write_text(path, "x").unwrap()
+
+    var f = open(path).unwrap()
+    var g = f
+    val n = f.fd().unwrap()
+
+    g.close().unwrap()
+
+    assert(f.closed())
+    assert(f.fd().unwrap_err() == NotOpen)
+    assert(!fcd_open(n))
+    fcd_done(path)
+end fcd_close_one_copy
+
+@test("fcd_ files in a Buf are closed when the Buf goes")
+fcd_buf_of_files()
+    val path = fcd_path("buf")
+
+    write_text(path, "x").unwrap()
+
+    for n in fcd_held_in_a_buf(path) do assert(!fcd_open(n), s"descriptor $n outlived its Buf")
+
+    fcd_done(path)
+
+@test("fcd_ a file in a struct field is closed when the struct goes")
+fcd_struct_field()
+    val path = fcd_path("field")
+
+    write_text(path, "x").unwrap()
+
+    assert(!fcd_open(fcd_held_in_a_field(path)), "the descriptor outlived the struct holding it")
+    fcd_done(path)
+
+@test("fcd_ into_raw_fd gives the descriptor away: it stays open after every copy goes")
+fcd_into_raw_fd_keeps()
+    val path = fcd_path("raw")
+
+    write_text(path, "abc").unwrap()
+
+    val n = fcd_given_away(path)
+
+    assert(fcd_open(n), "the drop closed a descriptor the file had given away")
+
+    var into: []u8 = [0; 8]
+    var got: usize = 0
+
+    assert_eq(fsys.read(n, &into[0], into.len, &got), 0)
+    assert_eq(got, 3)
+    assert_eq(fsys.close(n), 0)
+    fcd_done(path)
+end fcd_into_raw_fd_keeps
+
+@test("fcd_ into_raw_fd hands over what is buffered, and the number stands where the file did")
+fcd_into_raw_fd_flushes()
+    val path = fcd_path("rawflush")
+    var f = create_update(path).unwrap()
+
+    f.write("hello".bytes)
+
+    val n = f.into_raw_fd().unwrap()
+
+    assert_eq(read_text(path).unwrap(), "hello")
+
+    var at: long = 0
+
+    assert_eq(fsys.seek(n, 0, fsys.seek_current, &at), 0)
+    assert_eq(at, 5)
+    assert_eq(fsys.close(n), 0)
+    fcd_done(path)
+end fcd_into_raw_fd_flushes
+
+@test("fcd_ into_raw_fd gives back what was read ahead, so the number stands where the file did")
+fcd_into_raw_fd_unreads()
+    val path = fcd_path("rawread")
+
+    write_text(path, "abcdef").unwrap()
+
+    var f = open(path).unwrap()
+    var into: []u8 = [0; 2]
+
+    assert_eq(f.read(into).len, 2)
+
+    val n = f.into_raw_fd().unwrap()
+    var at: long = 0
+
+    assert_eq(fsys.seek(n, 0, fsys.seek_current, &at), 0)
+    assert_eq(at, 2)
+    assert_eq(fsys.close(n), 0)
+    fcd_done(path)
+end fcd_into_raw_fd_unreads
+
+@test("fcd_ a closed file's into_raw_fd is NotOpen")
+fcd_into_raw_fd_closed()
+    val path = fcd_path("rawclosed")
+
+    write_text(path, "x").unwrap()
+
+    var f = open(path).unwrap()
+
+    f.close().unwrap()
+    assert(f.into_raw_fd().unwrap_err() == NotOpen)
+    fcd_done(path)
+
+// The process's descriptor limit lowered to 256, so a leak runs out inside a loop of ten thousand:
+// the limit a shell hands a test may be a million.
+private struct FcdLimit
+    cur: u64
+    max: u64
+
+private extern "getrlimit" fcd_getrlimit(which: int, into: *FcdLimit) -> int
+private extern "setrlimit" fcd_setrlimit(which: int, from: *FcdLimit) -> int
+
+#if bsd
+private fcd_nofile() -> int = 8
+#else
+private fcd_nofile() -> int = 7
+#endif
+
+private fcd_few_descriptors()
+    var l = FcdLimit(0, 0)
+
+    assert_eq(fcd_getrlimit(fcd_nofile(), &l), 0)
+    l.cur = 256
+    assert_eq(fcd_setrlimit(fcd_nofile(), &l), 0)
+end fcd_few_descriptors
+
+@test("fcd_ ten thousand files opened and never closed do not run out of descriptors")
+fcd_many_files()
+    val path = fcd_path("many")
+
+    write_text(path, "x").unwrap()
+    fcd_few_descriptors()
+
+    for _ in 0..<10000 do assert(fcd_opened_and_dropped(path) >= 0)
+
+    fcd_done(path)
+
+@test("fcd_ under the same limit, descriptors given away do run out, so the loop above could fail")
+fcd_given_away_runs_out()
+    val path = fcd_path("out")
+
+    write_text(path, "x").unwrap()
+    fcd_few_descriptors()
+
+    var kept: Buf[int] = buf()
+    var refused = false
+
+    for _ in 0..<10000
+        open(path) match
+            Ok(f) ->
+                var g = f
+
+                kept.push(g.into_raw_fd().unwrap())
+            Err(_) ->
+                refused = true
+                break
+
+    for n in kept do _ = fsys.close(n)
+
+    assert(refused, "ten thousand descriptors were kept open under a limit of 256")
+    fcd_done(path)
+end fcd_given_away_runs_out
