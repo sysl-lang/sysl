@@ -1,0 +1,365 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.encoding.json.{quoted as json_quote}
+import sysl.fs.{make_dir_all, make_temp_dir, read_text, remove_dir_all, write_text}
+import sysl.io.{bytes_writer, Reader}
+import sysl.text.{from_utf8_lossy, split, Search}
+
+// `sysl lsp` under a typist: changes that arrive faster than they are analyzed are coalesced, and
+// what is never dropped -- requests, `didClose`, `shutdown`, `exit` -- still is not. And the files a
+// manifest does not place: the standard library's, checked as `--std` checks them, and a source
+// root's, placed by their module's name.
+
+// ---- the input an editor sends, a batch at a time ----
+
+// A reader that hands over one batch of messages per read: what the editor has sent by the time the
+// server looks. Between two batches the input is quiet, which is when the server analyzes.
+private struct LscBatches
+    batches: Buf[string]
+    next: usize
+    at: usize
+end LscBatches
+
+impl Fallible for LscBatches
+
+impl Reader for LscBatches
+    read(*self, into: []u8) -> []const u8
+        if self.next >= self.batches.len() then return into[0..<0]
+
+        val b = self.batches[self.next].bytes
+        var n = b.len - self.at
+
+        if n > into.len then n = into.len
+
+        for i in 0..<n do into[i] = b[self.at + i]
+
+        self.at += n
+
+        if self.at == b.len
+            self.next += 1
+            self.at = 0
+        end if
+
+        into[0..<n]
+    end read
+
+// The messages of one batch, framed.
+private lsc_batch(bodies: []string) -> string
+    var out = ""
+
+    for b in bodies
+        out = out + lsp_frame(b)
+
+    out
+end lsc_batch
+
+// A session served whole off `batches`, with nothing arriving while the server waits: what it wrote,
+// and the status it ended with.
+private lsc_serve(batches: Buf[string]) -> (string, int)
+    var r = LscBatches(batches, 0, 0)
+    var w = bytes_writer()
+    var noted: Buf[string] = buf()
+    val code = lsp_serve(&r, &w, line -> noted.push(line), _ -> false)
+
+    assert_eq(noted.len(), 0)
+    (from_utf8_lossy(w.bytes.view()), code)
+end lsc_serve
+
+private lsc_request(id: int, method: string, params: string) -> string =
+    s"{\"jsonrpc\":\"2.0\",\"id\":$id,\"method\":\"$method\",\"params\":$params}"
+
+private lsc_notify(method: string, params: string) -> string =
+    s"{\"jsonrpc\":\"2.0\",\"method\":\"$method\",\"params\":$params}"
+
+private lsc_open(uri: string, text: string) -> string =
+    lsc_notify("textDocument/didOpen", s"{\"textDocument\":{\"uri\":\"$uri\",\"languageId\":\"sysl\",\"version\":1,\"text\":${json_quote(text)}}}")
+
+private lsc_change(uri: string, version: int, text: string) -> string =
+    lsc_notify("textDocument/didChange",
+               s"{\"textDocument\":{\"uri\":\"$uri\",\"version\":$version},\"contentChanges\":[{\"text\":${json_quote(text)}}]}")
+
+private lsc_close(uri: string) -> string = lsc_notify("textDocument/didClose", s"{\"textDocument\":{\"uri\":\"$uri\"}}")
+
+private lsc_at(uri: string, line: int, character: int) -> string =
+    s"{\"textDocument\":{\"uri\":\"$uri\"},\"position\":{\"line\":$line,\"character\":$character}}"
+
+private lsc_init() -> string = lsc_request(1, "initialize", "{\"capabilities\":{}}")
+
+private lsc_initialized() -> string = lsc_notify("initialized", "{}")
+
+private lsc_shutdown(id: int) -> string = lsc_request(id, "shutdown", "null")
+
+private lsc_exit() -> string = lsc_notify("exit", "{}")
+
+// A program whose one mistake names `name`.
+private lsc_text(name: string) -> string = s"main()\n    val x = 1\n    print(x, $name)\n"
+
+private lsc_undefined(name: string) -> string = s"undefined name '$name'"
+
+// How many times `needle` occurs in `hay`.
+private lsc_count(hay: string, needle: string) -> usize = split(hay, needle).len - 1
+
+// Where `needle` first occurs in `hay`, failing the test where it does not.
+private lsc_where(hay: string, needle: string) -> usize = hay.index_of(needle) match
+    Some(i) -> i
+    None ->
+        assert(false, s"'$needle' is not in: $hay")
+        0
+
+// ---- coalescing ----
+
+@test("lsc: changes queued behind one another are analyzed once, as the last of them says")
+lsc_only_the_last_change_is_analyzed()
+    if std_root().is_err() then return
+
+    val root = make_temp_dir("sysl-lsc").unwrap()
+    val uri = lsp_file_uri(s"$root/t.sysl")
+    var batches: Buf[string] = buf()
+
+    batches.push(lsc_batch([lsc_init(), lsc_initialized(), lsc_open(uri, lsc_text("aa")),
+                            lsc_change(uri, 2, lsc_text("bb")), lsc_change(uri, 3, lsc_text("cc"))]))
+    batches.push(lsc_batch([lsc_change(uri, 4, lsc_text("dd")), lsc_change(uri, 5, lsc_text("x"))]))
+    batches.push(lsc_batch([lsc_shutdown(2), lsc_exit()]))
+
+    val (out, code) = lsc_serve(batches)
+
+    assert_eq(code, 0)
+
+    // One analysis per quiet input, each about the latest text: `cc` after the first batch, and a
+    // clean list after the second.
+    assert_eq(lsc_count(out, "textDocument/publishDiagnostics"), 2)
+    assert(!out.contains(lsc_undefined("aa")), out)
+    assert(!out.contains(lsc_undefined("bb")), out)
+    assert(!out.contains(lsc_undefined("dd")), out)
+    assert(lsc_where(out, lsc_undefined("cc")) < lsc_where(out, s"\"uri\":\"$uri\",\"diagnostics\":[]"), out)
+    assert(out.ends_with(lsp_frame("{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":null}")), out)
+
+    remove_dir_all(root).unwrap_or(())
+end lsc_only_the_last_change_is_analyzed
+
+@test("lsc: a request between queued changes is answered in its place, about the text before it")
+lsc_a_request_between_changes()
+    if std_root().is_err() then return
+
+    val root = make_temp_dir("sysl-lsc").unwrap()
+    val uri = lsp_file_uri(s"$root/t.sysl")
+    var batches: Buf[string] = buf()
+
+    batches.push(lsc_batch([lsc_init(), lsc_initialized(), lsc_open(uri, lsc_text("aa")),
+                            lsc_change(uri, 2, lsc_text("bb")),
+                            lsc_request(7, "textDocument/hover", lsc_at(uri, 2, 10)),
+                            lsc_request(8, "no/such", "{}"),
+                            lsc_change(uri, 3, lsc_text("cc"))]))
+    batches.push(lsc_batch([lsc_shutdown(9), lsc_exit()]))
+
+    val (out, code) = lsc_serve(batches)
+
+    assert_eq(code, 0)
+
+    // The hover reads an analysis, so the text it follows is analyzed first; the unknown method needs
+    // none and is answered without one; the last text is analyzed once the input is quiet.
+    val bb = lsc_where(out, lsc_undefined("bb"))
+    val hover = lsc_where(out, "\"id\":7,\"result\":{\"contents\"")
+    val unknown = lsc_where(out, "\"id\":8,\"error\"")
+    val cc = lsc_where(out, lsc_undefined("cc"))
+
+    assert(bb < hover && hover < unknown && unknown < cc, out)
+    assert(out.contains("x: int"), out)
+    assert(!out.contains(lsc_undefined("aa")), out)
+    assert_eq(lsc_count(out, "textDocument/publishDiagnostics"), 2)
+    assert(out.ends_with(lsp_frame("{\"jsonrpc\":\"2.0\",\"id\":9,\"result\":null}")), out)
+
+    remove_dir_all(root).unwrap_or(())
+end lsc_a_request_between_changes
+
+@test("lsc: a document closed behind its queued changes is never analyzed, and its list is cleared")
+lsc_close_after_queued_changes()
+    if std_root().is_err() then return
+
+    val root = make_temp_dir("sysl-lsc").unwrap()
+    val uri = lsp_file_uri(s"$root/t.sysl")
+    val other = lsp_file_uri(s"$root/u.sysl")
+    var batches: Buf[string] = buf()
+
+    batches.push(lsc_batch([lsc_init(), lsc_initialized(), lsc_open(uri, lsc_text("aa")),
+                            lsc_open(other, lsc_text("oo")), lsc_change(uri, 2, lsc_text("bb")),
+                            lsc_close(uri)]))
+    batches.push(lsc_batch([lsc_shutdown(2), lsc_exit()]))
+
+    val (out, code) = lsc_serve(batches)
+
+    assert_eq(code, 0)
+    assert(!out.contains(lsc_undefined("aa")), out)
+    assert(!out.contains(lsc_undefined("bb")), out)
+
+    // The close's empty list is the closed document's one message; the other document is still
+    // analyzed, after it.
+    assert_eq(lsc_count(out, s"\"uri\":\"$uri\""), 1)
+    assert(lsc_where(out, s"{\"uri\":\"$uri\",\"diagnostics\":[]}") < lsc_where(out, lsc_undefined("oo")), out)
+    assert(editor_text(s"$root/t.sysl").is_none())
+
+    release_editor_text(s"$root/u.sysl")
+    remove_dir_all(root).unwrap_or(())
+end lsc_close_after_queued_changes
+
+@test("lsc: shutdown and exit behind queued changes are taken, and nothing is analyzed after them")
+lsc_shutdown_and_exit_behind_changes()
+    if std_root().is_err() then return
+
+    val root = make_temp_dir("sysl-lsc").unwrap()
+    val uri = lsp_file_uri(s"$root/t.sysl")
+    var batches: Buf[string] = buf()
+
+    batches.push(lsc_batch([lsc_init(), lsc_initialized(), lsc_open(uri, lsc_text("aa")),
+                            lsc_change(uri, 2, lsc_text("bb")), lsc_shutdown(2), lsc_exit()]))
+
+    val (out, code) = lsc_serve(batches)
+
+    assert_eq(code, 0)
+    assert_eq(lsc_count(out, "textDocument/publishDiagnostics"), 0)
+    assert(out.ends_with(lsp_frame("{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":null}")), out)
+
+    // `shutdown` alone, the input quiet after it: what was held is not analyzed then either.
+    var quiet: Buf[string] = buf()
+
+    quiet.push(lsc_batch([lsc_init(), lsc_initialized(), lsc_open(uri, lsc_text("aa")), lsc_shutdown(2)]))
+    quiet.push(lsc_batch([lsc_exit()]))
+
+    val (said, ended) = lsc_serve(quiet)
+
+    assert_eq(ended, 0)
+    assert_eq(lsc_count(said, "textDocument/publishDiagnostics"), 0)
+
+    // `exit` with no `shutdown`, behind a change: taken at once, with status one.
+    var abrupt: Buf[string] = buf()
+
+    abrupt.push(lsc_batch([lsc_init(), lsc_initialized(), lsc_open(uri, lsc_text("aa")),
+                           lsc_change(uri, 2, lsc_text("bb")), lsc_exit()]))
+
+    val (gone, status) = lsc_serve(abrupt)
+
+    assert_eq(status, 1)
+    assert_eq(lsc_count(gone, "textDocument/publishDiagnostics"), 0)
+
+    release_editor_text(s"$root/t.sysl")
+    remove_dir_all(root).unwrap_or(())
+end lsc_shutdown_and_exit_behind_changes
+
+@test("lsc: input that ends behind queued changes ends the server with status one")
+lsc_input_ends_behind_changes()
+    if std_root().is_err() then return
+
+    val root = make_temp_dir("sysl-lsc").unwrap()
+    val uri = lsp_file_uri(s"$root/t.sysl")
+    var batches: Buf[string] = buf()
+
+    batches.push(lsc_batch([lsc_init(), lsc_initialized(), lsc_open(uri, lsc_text("aa"))]))
+
+    val (out, code) = lsc_serve(batches)
+
+    // The input was quiet once, so the open was analyzed before the end was read.
+    assert_eq(code, 1)
+    assert_eq(lsc_count(out, lsc_undefined("aa")), 1)
+
+    release_editor_text(s"$root/t.sysl")
+    remove_dir_all(root).unwrap_or(())
+end lsc_input_ends_behind_changes
+
+// ---- files no manifest places ----
+
+@test("lsc: a standard library file is checked as --std checks it, a mistake reported and its mending clearing it")
+lsc_a_library_file()
+    val lib = std_root() match
+        Ok(dir) -> dir
+        Err(_) -> return
+
+    val file = s"$lib/sysl/text/find.sysl"
+    val original = read_text(file).unwrap()
+    val uri = lsp_file_uri(file)
+    var lines = 0
+
+    for b in original.bytes
+        if b == u8('\n') then lines += 1
+
+    assert_eq(lsp_root(file, "sysl.text"), absolute_path(lib))
+
+    var server = lsp_server()
+
+    lsp_answer(&server, lsc_init())
+    lsp_answer(&server, lsc_initialized())
+
+    // As it is on disk: nothing wrong in it, and no refusal about where it sits.
+    val clean = lsp_answer(&server, lsc_open(uri, original))
+
+    assert(clean.len() >= 1)
+    assert_eq(clean[0], s"{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/publishDiagnostics\",\"params\":{\"uri\":\"$uri\",\"diagnostics\":[]}}")
+
+    // A type error added: reported in the file, and a hover in it reads the library's analysis.
+    val broken = lsp_answer(&server, lsc_change(uri, 2, original + "\nlsc_probe() -> string\n    val n = 3\n    n\n"))
+
+    assert(broken.len() >= 1)
+    assert(broken[0].contains(s"\"uri\":\"$uri\""), broken[0])
+    assert(!broken[0].contains("\"diagnostics\":[]"), broken[0])
+    assert(!broken[0].contains("project root"), broken[0])
+
+    val hover = lsp_answer(&server, lsc_request(5, "textDocument/hover", lsc_at(uri, lines + 3, 4)))
+
+    assert_eq(hover.len(), 1)
+    assert(hover[0].contains("n: int"), hover[0])
+
+    // Mended: the list is cleared.
+    val mended = lsp_answer(&server, lsc_change(uri, 3, original))
+
+    assert_eq(mended[0], clean[0])
+
+    lsp_answer(&server, lsc_close(uri))
+    assert(editor_text(file).is_none())
+end lsc_a_library_file
+
+@test("lsc: a file with no manifest above it is placed by its module's name, or compiled alone")
+lsc_a_source_root()
+    if std_root().is_err() then return
+
+    val root = make_temp_dir("sysl-lsc").unwrap()
+    val tree = absolute_path(s"$root/src")
+
+    make_dir_all(s"$tree/geo/shapes").unwrap()
+
+    val file = s"$tree/geo/shapes/area.sysl"
+
+    write_text(s"$tree/geo/shapes/side.sysl", "module geo.shapes\n\nside() -> int = 3\n").unwrap()
+
+    // Where the name agrees with the directories it sits in, the directory above them; where it does
+    // not, or there is no name, the file alone.
+    assert_eq(lsp_root(file, "geo.shapes"), tree)
+    assert_eq(lsp_root(file, "shapes"), absolute_path(s"$tree/geo"))
+    assert_eq(lsp_root(file, "geo.circles"), file)
+    assert_eq(lsp_root(file, "deep.geo.shapes"), file)
+    assert_eq(lsp_root(file, ""), file)
+
+    // A manifest above wins over the name.
+    write_text(s"$root/package.hocon", "package {\n  name = \"probe\"\n}\n").unwrap()
+    assert_eq(lsp_root(file, "geo.shapes"), absolute_path(root))
+    remove_dir_all(s"$root/package.hocon").unwrap_or(())
+
+    // Analyzed end to end: the sibling's function is in scope, and the mistake is the file's own.
+    val uri = lsp_file_uri(file)
+    var server = lsp_server()
+
+    lsp_answer(&server, lsc_init())
+    lsp_answer(&server, lsc_initialized())
+
+    val opened = lsp_answer(&server, lsc_open(uri, "module geo.shapes\n\narea() -> int = side() * side() + nope\n"))
+
+    assert(opened[0].contains(lsc_undefined("geo.shapes.nope")), opened[0])
+    assert(!opened[0].contains("project root"), opened[0])
+
+    val mended = lsp_answer(&server, lsc_change(uri, 2, "module geo.shapes\n\narea() -> int = side() * side()\n"))
+
+    assert_eq(mended[0], s"{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/publishDiagnostics\",\"params\":{\"uri\":\"$uri\",\"diagnostics\":[]}}")
+
+    lsp_answer(&server, lsc_close(uri))
+    remove_dir_all(root).unwrap_or(())
+end lsc_a_source_root

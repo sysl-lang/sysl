@@ -21,6 +21,14 @@ import sysl.text.{from_utf8, from_utf8_lossy, parse_uint, split, str_builder, to
 // to -- the package whose manifest is above it, or the file alone -- and the references that
 // analysis recorded are kept for hover and definition until the next change.
 //
+// **Changes are coalesced, because an analysis can take longer than a keystroke.** The server reads
+// every message already waiting before it analyzes anything, keeping only each document's latest
+// text, and then waits a moment (`LspSettleMillis`) for a newer one; only a quiet input is analyzed.
+// Nothing else waits: a request is answered in the order it came, and one that reads the analysis
+// (hover, definition) has every held text analyzed first, so no answer is about an older text than
+// the editor has sent. `didClose`, `shutdown` and `exit` are taken as they come, and a text still
+// waiting at `shutdown` is never analyzed -- nothing is published after it.
+//
 // Positions are the protocol's: a line counted from zero and a character counted in UTF-16 code
 // units, converted from the byte offsets the compiler keeps (`lsp_position`, `lsp_offset`).
 
@@ -30,12 +38,19 @@ val LspInvalidRequest: int = -32600
 val LspMethodNotFound: int = -32601
 val LspServerNotInitialized: int = -32002
 
+// How long the input has to be quiet after a change before the change is analyzed: long enough to
+// see the next keystroke of someone typing, short enough not to be noticed after the last one.
+val LspSettleMillis: int = 120
+
 // One document the editor has open: where it is, what it says, and what its last analysis found.
+// `stale` is a text the editor sent that has not been analyzed yet (`lsp_settle`); its `references`
+// are still the previous analysis's until it is.
 struct LspDocument
     uri: string
     file: string
     text: string
     references: Buf[Reference]
+    stale: bool
 end LspDocument
 
 // What the server remembers between messages.
@@ -85,31 +100,70 @@ lsp_command(args: []string, note: string -> unit) -> int
 
     var input = stdin()
 
-    lsp_serve(&input, stdout(), note)
+    lsp_serve(&input, stdout(), note, lsp_stdin_arrives)
 end lsp_command
+
+// One `struct pollfd`: a descriptor, what to wait for on it, and what happened.
+private struct LspPollFd
+    fd: i32
+    events: i16
+    revents: i16
+
+private extern "poll" lsp_c_poll(fds: *LspPollFd, n: usize, timeout: int) -> int
+
+// Whether standard input has something to read -- a message, or its end -- within `ms` milliseconds.
+private lsp_stdin_arrives(ms: int) -> bool
+    var p = LspPollFd(0, 1, 0)
+
+    lsp_c_poll(&p, 1, ms) > 0
+end lsp_stdin_arrives
 
 // Reads messages from `r` and writes the answers to `w` until `exit`, returning the status to end
 // with. Input that ends without an `exit`, or a message whose framing cannot be read, ends the
 // server with status one: past a broken header there is no telling where the next message starts.
-lsp_serve(r: *Reader, w: *Writer, note: string -> unit) -> int
+//
+// `arrives(ms)` says whether `r` will have something to read within `ms` milliseconds, which is how
+// the server takes every message already waiting before it analyzes, and how it lets the input be
+// quiet for `LspSettleMillis` after a change. A reader that cannot tell answers `false`: what is
+// already read off it is still taken whole.
+lsp_serve(r: *Reader, w: *Writer, note: string -> unit, arrives: int -> bool) -> int
     var server = lsp_server()
     var pending: Buf[u8] = buf()
 
     loop
-        val body = lsp_read(r, &pending) match
-            Err(why) ->
-                note(refused(s"lsp: $why"))
-                return Failed
-            Ok(None) -> return Failed
-            Ok(Some(text)) -> text
+        // The first message is waited for; every one after it is taken only while it is already here.
+        var first = true
 
-        for out in lsp_answer(&server, body)
+        while first || lsp_buffered(pending) || arrives(0)
+            first = false
+
+            val body = lsp_read(r, &pending) match
+                Err(why) ->
+                    note(refused(s"lsp: $why"))
+                    return Failed
+                Ok(None) -> return Failed
+                Ok(Some(text)) -> text
+
+            for out in lsp_take(&server, body)
+                lsp_write(w, out)
+
+            server.exit_code match
+                Some(code) -> return code
+                None -> ()
+
+        // A change is analyzed once the input has been quiet; anything arriving meanwhile is read first.
+        if !lsp_any_stale(server) || arrives(LspSettleMillis) then continue
+
+        for out in lsp_settle(&server)
             lsp_write(w, out)
-
-        server.exit_code match
-            Some(code) -> return code
-            None -> ()
 end lsp_serve
+
+// Whether `pending` already holds one whole message, or a header too broken to wait on.
+private lsp_buffered(pending: Buf[u8]) -> bool = lsp_header_end(pending) match
+    None -> false
+    Some(head) -> lsp_content_length(from_utf8_lossy(pending.view()[0..<head])) match
+        Ok(length) -> pending.len() >= head + 4 + length
+        Err(_) -> true
 
 // One message framed as the protocol frames it: a `Content-Length` header, a blank line, the body.
 lsp_frame(body: string) -> string = s"Content-Length: ${body.bytes.len}\r\n\r\n$body"
@@ -184,9 +238,19 @@ private lsp_content_length(headers: string) -> Result[usize, string]
     Err("a message with no Content-Length header")
 end lsp_content_length
 
-// What the server says to one message body: the response to a request, and any notification the
-// message caused -- in the order they are to be written.
+// What the server says to one message body, a change analyzed at once: the response to a request,
+// and any notification the message caused -- in the order they are to be written.
 lsp_answer(server: *LspServer, body: string) -> Buf[string]
+    var out = lsp_take(server, body)
+
+    for m in lsp_settle(server)
+        out.push(m)
+
+    out
+end lsp_answer
+
+// The same with a change only held (`lsp_hold`), to be analyzed by the next `lsp_settle`.
+lsp_take(server: *LspServer, body: string) -> Buf[string]
     var out: Buf[string] = buf()
 
     val msg = parse_json(body) match
@@ -225,6 +289,11 @@ lsp_answer(server: *LspServer, body: string) -> Buf[string]
 
     val params = msg.get("params").unwrap_or(Json.Null)
 
+    // An answer read off an analysis is about the text the editor sent last.
+    if method == "textDocument/hover" || method == "textDocument/definition"
+        for m in lsp_settle(server)
+            out.push(m)
+
     out.push(method match
         "initialize" ->
             server.initialized = true
@@ -237,9 +306,9 @@ lsp_answer(server: *LspServer, body: string) -> Buf[string]
         _ -> lsp_error(asked, LspMethodNotFound, s"'$method' is not a method sysl lsp answers"))
 
     out
-end lsp_answer
+end lsp_take
 
-// A notification: what it changes, and the diagnostics a document's change publishes.
+// A notification: what it changes, and what a document's closing publishes.
 private lsp_notified(server: *LspServer, method: string, msg: Json, out: *Buf[string])
     if method == "exit"
         server.exit_code = Some(if server.shut_down then Fine else Failed)
@@ -255,7 +324,7 @@ private lsp_notified(server: *LspServer, method: string, msg: Json, out: *Buf[st
 
     if method == "textDocument/didOpen"
         json_text_at(params, ["textDocument", "text"]) match
-            Some(text) -> lsp_changed(server, uri, text, out)
+            Some(text) -> lsp_hold(server, uri, text)
             None -> ()
     else if method == "textDocument/didChange"
         // Full synchronization: every change carries the whole text, and the last is what it says now.
@@ -264,7 +333,7 @@ private lsp_notified(server: *LspServer, method: string, msg: Json, out: *Buf[st
                 Json.Arr(items) ->
                     if items.len() > 0
                         json_text_at(items[items.len() - 1], ["text"]) match
-                            Some(text) -> lsp_changed(server, uri, text, out)
+                            Some(text) -> lsp_hold(server, uri, text)
                             None -> ()
                     end if
                 _ -> ()
@@ -361,21 +430,56 @@ json_int_at(j: Json, keys: []const string) -> Option[int]
         None -> None
 end json_int_at
 
-// A document's new text: held in place of the disk, analyzed, remembered, and the diagnostics
-// published -- the document's own first, then every other file the analysis found something wrong
-// in, then an empty list for each file this compilation had published for and no longer finds
-// anything wrong in.
-private lsp_changed(server: *LspServer, uri: string, text: string, out: *Buf[string])
+// A document's new text: held in place of the disk and remembered, to be analyzed by the next
+// `lsp_settle`. A later text for the same document replaces it, so only the last is ever analyzed.
+private lsp_hold(server: *LspServer, uri: string, text: string)
     val file = lsp_uri_file(uri)
 
     hold_editor_text(file, text)
+    lsp_forget(server, uri)
+    server.documents.push(LspDocument(uri, file, text, buf(), true))
+end lsp_hold
 
-    val (found, references, whole) = lsp_analyze(file, text)
+// Whether any document holds a text not yet analyzed.
+private lsp_any_stale(server: LspServer) -> bool
+    for d in server.documents
+        if d.stale then return true
 
-    lsp_forget(server,uri)
-    server.documents.push(LspDocument(uri, file, text, references))
+    false
+end lsp_any_stale
 
-    val root = lsp_root(file)
+// Every held text analyzed, in the order the documents last changed, and what that publishes. After
+// `shutdown` nothing is: the client has stopped listening for diagnostics.
+lsp_settle(server: *LspServer) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    if server.shut_down then return out
+
+    var waiting: Buf[string] = buf()
+
+    for d in server.documents
+        if d.stale then waiting.push(d.uri)
+
+    for uri in waiting
+        lsp_changed(server, uri, &out)
+
+    out
+end lsp_settle
+
+// A held document analyzed, remembered, and the diagnostics published -- the document's own first,
+// then every other file the analysis found something wrong in, then an empty list for each file this
+// compilation had published for and no longer finds anything wrong in.
+private lsp_changed(server: *LspServer, uri: string, out: *Buf[string])
+    val text = lsp_document(*server, uri) match
+        Some(d) -> d.text
+        None -> return
+
+    val file = lsp_uri_file(uri)
+    val (found, references, whole, root) = lsp_analyze(file, text)
+
+    lsp_forget(server, uri)
+    server.documents.push(LspDocument(uri, file, text, references, false))
+
     var now: Buf[LspPublished] = buf()
 
     for f in found
@@ -447,7 +551,7 @@ private lsp_document(server: LspServer, uri: string) -> Option[LspDocument]
     None
 
 // The diagnostics an analysis of `file` found, file by file with `file`'s own first; the references
-// it recorded; and whether it read the whole compilation.
+// it recorded; whether it read the whole compilation; and which compilation that is (`lsp_root`).
 //
 // **A syntax error stops at the parse**, as a build does, and is reported where it is -- the first
 // on each line, as `parse_report` shows them. A file that parses is analyzed with the compilation it
@@ -455,7 +559,7 @@ private lsp_document(server: LspServer, uri: string) -> Option[LspDocument]
 // a sibling in the package, or a library file, named where it is on disk. A compilation that cannot
 // be assembled at all -- no standard library, an unreadable manifest -- is said once, at the top of
 // the file.
-lsp_analyze(file: string, text: string) -> (Buf[LspFound], Buf[Reference], bool)
+lsp_analyze(file: string, text: string) -> (Buf[LspFound], Buf[Reference], bool, string)
     var found: Buf[LspFound] = buf()
     val src = source(file, text.bytes)
     val parsed = parse(src)
@@ -476,13 +580,16 @@ lsp_analyze(file: string, text: string) -> (Buf[LspFound], Buf[Reference], bool)
             last_line = line
             found[0].diagnostics.push(lsp_diagnostic(src, d.span, d.severity, d.message))
 
-        return (found, buf(), false)
+        return (found, buf(), false, lsp_root(file))
     end if
 
-    indexed_file(lsp_root(file)) match
+    val root = lsp_root(file, module_written(parsed.program))
+    val in_std = lsp_std_dir() == Some(root)
+
+    (if in_std then indexed_std(root) else indexed_file(root)) match
         Err(failure) ->
             found[0].diagnostics.push(lsp_diagnostic(src, Span(0, 0), Error, failure.message))
-            (found, buf(), false)
+            (found, buf(), false, root)
         Ok(ix) ->
             for p in ix.problems
                 val there = absolute_path(lsp_on_disk(p.src.name))
@@ -496,11 +603,40 @@ lsp_analyze(file: string, text: string) -> (Buf[LspFound], Buf[Reference], bool)
 
                 found[k].diagnostics.push(lsp_diagnostic(p.src, at, p.diag.severity, p.diag.message))
 
-            (found, ix.references, true)
+            if !in_std then return (found, ix.references, true, root)
+
+            // The library's files are named `library/…` (`StdPrefix`) whatever they were read from;
+            // the document's own references are filed back under the file the editor opened.
+            val whole_file = absolute_path(file)
+            val named = StdPrefix + whole_file[root.bytes.len..<whole_file.bytes.len]
+            var mine: Buf[Reference] = buf()
+
+            for r in ix.references
+                if r.at_file == named then mine.push(r with { at_file = file })
+
+            (found, mine, true, root)
 end lsp_analyze
 
-// What a file is compiled as: the package whose manifest is nearest above it, or the file alone.
-lsp_root(file: string) -> string
+// The standard library's root, absolute, where there is one.
+private lsp_std_dir() -> Option[string] = std_root() match
+    Ok(dir) -> Some(absolute_path(dir))
+    Err(_) -> None
+
+// What a file is compiled as, given the module its header `declared` (`""` for none):
+//
+// - **a file of the standard library is checked as `--std` checks it**, with the library alone, which
+//   is the library's root -- the library has no manifest, and is not a package;
+// - otherwise the package whose manifest is nearest above it;
+// - otherwise, where the file sits where its module's name says, the directory that name is a path
+//   below -- a source root, which a `--lib` hands to a compilation -- read as a project;
+// - otherwise the file alone.
+lsp_root(file: string, declared: string = "") -> string
+    val whole_file = absolute_path(file)
+
+    lsp_std_dir() match
+        Some(dir) -> if whole_file.starts_with(dir + "/") then return dir
+        None -> ()
+
     var here = parent_of(file)
 
     while here.is_some() && here.unwrap() != ""
@@ -514,7 +650,21 @@ lsp_root(file: string) -> string
 
         here = up
 
-    file
+    if declared == "" then return file
+
+    // The directory each segment of the name is, innermost first, back to the root above them.
+    var dir = parent_of(whole_file).unwrap_or("")
+    val segments = split(declared, ".")
+    var k = segments.len
+
+    while k > 0
+        k -= 1
+
+        if dir == "" || basename(dir) != segments[k] then return file
+
+        dir = parent_of(dir).unwrap_or("")
+
+    if dir == "" then file else dir
 end lsp_root
 
 private lsp_diagnostic(src: Source, at: Span, severity: Severity, message: string) -> Json

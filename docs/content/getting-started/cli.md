@@ -1190,8 +1190,13 @@ server on standard input and output, for an editor to start and communicate with
 `--stdio`, which is what an editor's client library passes, and no other option. Standard output
 carries the protocol; anything the server reports about itself goes to standard error.
 
-Every answer comes from the same analysis `sysl build` performs, rerun in full on each change to an
-open file, using the text the editor holds, saved or not:
+Every answer comes from the same analysis `sysl build` performs, rerun in full after a change to an
+open file, using the text the editor holds, saved or not. Changes that arrive faster than they can be
+analysed are coalesced: the server reads every message already waiting, keeps only the latest text
+of each file, and analyses once the input has been quiet for about a tenth of a second, so the
+diagnostics after the last keystroke wait for one analysis, not one per keystroke. Requests are
+answered in the order they came, and a hover or definition is answered after the latest text has
+been analysed.
 
 | request | answer |
 |---|---|
@@ -1199,8 +1204,10 @@ open file, using the text the editor holds, saved or not:
 | `textDocument/hover` | the type of a local or a module `val`/`var`, or a function's signature |
 | `textDocument/definition` | where that name is declared — in the file, another file of the package, or the standard library |
 
-A file is analysed with the package whose `sysl.hocon` is nearest above it, or alone if there is
-none. The standard library is parsed once and kept for the life of the server, except while the
+A file is analysed with the package whose `sysl.hocon` is nearest above it. A file of the standard
+library is analysed with the whole library, as `sysl test --std` checks it. A file with no manifest
+above it, whose directories spell the module its header declares, is analysed with the tree above
+those directories; any other file is analysed alone. The standard library is parsed once and kept for the life of the server, except while the
 editor holds unsaved text for one of the library's own files. A message that is not JSON is answered
 with the JSON-RPC parse error (`-32700`); a request the server does not answer, with `-32601`. The
 server ends at `exit`, with status 0 after `shutdown` and 1 without; input that ends or cannot be
