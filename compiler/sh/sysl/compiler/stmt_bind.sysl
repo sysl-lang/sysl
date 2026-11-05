@@ -393,6 +393,10 @@ end multi_decl
 // then taken apart at the stated type rather than at whatever the value guessed.
 pattern_decl(cx: &Analyzer, span: Span, pat: Pattern, mutable: bool,
                      value: Expr, typ: Option[TypeRef]) -> Buf[TStmt]
+    *pat.kind match
+        OrPattern(alts) -> return alternatives_decl(cx, span, pat.span, alts, mutable, value, typ)
+        _ -> ()
+
     var names: Buf[string] = buf()
 
     pattern_names(&names, pat)
@@ -421,6 +425,74 @@ pattern_decl(cx: &Analyzer, span: Span, pat: Pattern, mutable: bool,
     push_all(&out, bind_pattern(cx, span, pat, TExpr(value.span, TLoad(temp, held)), mutable))
     out
 end pattern_decl
+
+// **`val (Ok(x) | Err(x)) = r` is read as the `match` it stands for**: one arm holding the
+// alternatives, answering the names they bind as a tuple, which is then taken apart into the
+// binding's own names. So everything an arm's alternatives owe, they owe here in the same words --
+// the same names at the same types, no alternative an earlier one already matches -- and the one
+// thing a binding adds is that together they cover every value, since there is no other arm.
+//
+// The value is held once, as a plain binding's is, and the `match` reads the temporary; a stated
+// type is the whole value's.
+private alternatives_decl(cx: &Analyzer, span: Span, at: Span, alts: Buf[Pattern], mutable: bool,
+                          value: Expr, typ: Option[TypeRef]) -> Buf[TStmt]
+    var names: Buf[string] = buf()
+
+    pattern_names(&names, alts[0])
+
+    val declared = typ.map(w -> resolve_type(cx.an, cx.scope, w, cx.subst))
+    val tv = type_expr(cx, value, declared)
+
+    if diverges(cx, tv) then
+        cx.fault(value.span, "cannot bind a name to an expression that never returns")
+
+    val held = stated_whole(cx, span, declared, texpr_type(tv))
+    val temp = cx.bind("$alts", held)
+    var out: Buf[TStmt] = buf()
+
+    note_view_binding(cx, span, "$alts", temp, tv)
+    out.push(TVarDecl(temp, held, tv, None))
+
+    var parts: Buf[Expr] = buf()
+    var binds: Buf[Pattern] = buf()
+
+    for n in names
+        parts.push(expr(at, Ident(n)))
+        binds.push(pattern_of(at, IdentPattern(n)))
+
+    // A tuple has two parts or more, so one name is answered as itself and none as `()`.
+    var answer = expr(at, UnitLit)
+    var target = pattern_of(at, WildcardPattern)
+
+    if names.len() == 1
+        answer = parts[0]
+        target = binds[0]
+    elif names.len() > 1
+        answer = expr(at, Tuple(parts))
+        target = pattern_of(at, TuplePattern(binds))
+
+    var body: Buf[Stmt] = buf()
+
+    body.push(stmt(at, ExprStmt(answer)))
+
+    var arms: Buf[MatchArm] = buf()
+
+    arms.push(MatchArm(at, alts, None, body))
+
+    val before = cx.binding_alts
+
+    cx.binding_alts = true
+
+    val chosen = match_expr(cx, at, expr(at, Ident("$alts")), arms, None, false)
+
+    cx.binding_alts = before
+
+    val picked = cx.bind("$picked", texpr_type(chosen))
+
+    out.push(TVarDecl(picked, texpr_type(chosen), chosen, None))
+    push_all(&out, bind_pattern(cx, span, target, TExpr(at, TLoad(picked, texpr_type(chosen))), mutable))
+    out
+end alternatives_decl
 
 // The type a destructuring binding holds its value at: the stated one, where the value meets it,
 // and the value's own otherwise. A value that does not meet the stated type is refused in the
@@ -465,6 +537,10 @@ pattern_names(out: *Buf[string], p: Pattern)
         VariantPattern(_, args) ->
             for arg in args
                 pattern_names(out, arg)
+
+        // Every alternative binds the same names, which the analyzer checks; the first one's order
+        // is the binding's.
+        OrPattern(alts) -> pattern_names(out, alts[0])
 
         _ -> ()
 
@@ -511,6 +587,9 @@ private bind_pattern(cx: &Analyzer, span: Span, p: Pattern, subject: TExpr,
 
         LitPattern(_) -> cannot_test(cx, span)
         RangePattern(_, _, _) -> cannot_test(cx, span)
+
+        // Alternatives stand only at the top of a binding, where `alternatives_decl` reads them.
+        OrPattern(_) -> cannot_test(cx, span)
 
         // A quoted name is a *reference*, so it tests rather than binds. It earns its own sentence
         // because the fix is not the one the other refusals want: the name here is almost always

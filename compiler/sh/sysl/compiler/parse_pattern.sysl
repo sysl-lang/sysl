@@ -20,15 +20,26 @@ import sysl.buf.{Buf, buf}
 // pattern is refused rather than read, since a table that size is no longer a pattern anybody means.
 const spread_limit: usize = 1024
 
-// A pattern where only one may stand -- a `val`, a `for`. A `|` inside it is refused here, since a
-// binding takes one shape of a value apart and has no other arm to try.
+// A pattern where only one may stand -- a `val`, a `for`. A `|` inside it gives an `OrPattern` of
+// the alternatives it spread into, which the binding accepts only where together they cover every
+// value, as Rust's `let (Ok(x) | Err(x)) = r;` is accepted.
 parse_pattern(p: *Parser) -> Pattern
     val start = p.here()
-    val alts = parse_pattern_alts(p)
+    var alts = parse_pattern_alts(p)
 
-    if alts.len() > 1 then
-        p.fault(start.to(p.just_taken()), "alternatives joined by '|' are written in a 'match' arm or " +
-                "an 'is' test \u{2014} a binding takes one shape of a value apart")
+    // `val Ok(x) | Err(x) = r` -- refused as Rust refuses it: the alternatives of a binding are
+    // written in parentheses, which is where a reader looks for the one pattern standing there. The
+    // rest is read anyway, so the binding still binds its names and nothing else is said about it.
+    if p.at_kw("|")
+        while p.accept_kw("|")
+            for item in parse_pattern_alts(p)
+                alts.push(item)
+
+        p.fault(start.to(p.just_taken()), "alternatives joined by '|' at a binding are written in " +
+                "parentheses \u{2014} '(A(x) | B(x))'")
+    end if
+
+    if alts.len() > 1 then return pattern_of(start.to(p.just_taken()), OrPattern(alts))
 
     alts[0]
 end parse_pattern

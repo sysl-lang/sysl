@@ -1088,7 +1088,7 @@ private match_result_type(cx: &Analyzer, span: Span, scrut: Type, arms: Buf[TArm
         cx.fault(span, s"match arms have different types: ${joined_types(values)}")
 
     val value_ty = met_value_type(settled)
-    val checked = is_enum(scrut) || value_ty != Unit
+    val checked = is_enum(scrut) || value_ty != Unit || cx.binding_alts
 
     if checked && scrut != Unknown then check_coverage(cx, span, scrut, arms)
 
@@ -1114,6 +1114,20 @@ private check_coverage(cx: &Analyzer, span: Span, scrut: Type, arms: Buf[TArm])
     if gap.is_none() then return
 
     val g = gap.unwrap()
+
+    // `val (Ok(x) | Err(x)) = r` is irrefutable because its alternatives cover the type. Where they
+    // do not, there is no `match` to add an arm to, so the refusal is a binding's own.
+    if cx.binding_alts
+        if is_enum(scrut)
+            cx.fault(span, s"a binding cannot choose among variants — these alternatives miss " +
+                     s"${describe_gap(g.names)}, and a binding has no other arm to take when the " +
+                     "value has another")
+        else
+            cx.fault(span, "a binding cannot test a value — these alternatives match only some " +
+                     "values, and a binding has no other arm to take when none of them matches")
+
+        return
+    end if
 
     // `bool` is a closed two-value type, so covering both `true` and `false` with unguarded arms is
     // exhaustive on its own -- and naming the one that is missing tells the reader less than saying

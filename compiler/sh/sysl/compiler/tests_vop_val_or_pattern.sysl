@@ -1,0 +1,258 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.{Search, replace_all}
+
+// **`|`-alternatives at a binding** -- `val (Ok(x) | Err(x)) = r`, as Rust's `let` takes them. The
+// alternatives are irrefutable together when they cover the type, and each name is bound from
+// whichever matched (`stmt_bind.sysl`'s `alternatives_decl`, which reads them as the one-arm
+// `match` they stand for).
+//
+// The axes these cross: the keyword (`val`, `var`, a `for` header); where the binding sits (a body,
+// module level, a closure's capture); the depth of the `|` (the top, a tuple's part); the payload
+// (a scalar, a counted `string`); the names bound (none, one, several); a stated type; and every
+// refusal -- a gap in an enum, a gap in a number, names that differ, types that differ, a dead
+// alternative, a name bound twice, a write through a `val`, and a `|` written without parentheses.
+// **Skipped, with the reason:** `ref` and `&` bindings -- a pattern binds by copy and has no such
+// mode; codegen units and separate compilation -- the binding is a `match` and a local of one body,
+// which crosses nothing a `match` does not.
+
+private vop_ready() -> bool = std_root().is_ok() && clang_available()
+
+private vop_ran(text: string) -> string
+    val root = replace_all(make_temp_dir("sysl-vop").unwrap(), "//", "/")
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            val said = replace_all(failure_text(why), s"$root/", "")
+
+            remove_dir_all(root).unwrap_or(())
+            return said
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end vop_ran
+
+private vop_prints(text: string, want: string)
+    if !vop_ready() then return
+
+    assert_eq(vop_ran(text), want)
+
+private vop_refused(text: string, want: string)
+    if !vop_ready() then return
+
+    val got = vop_ran(text)
+
+    assert(got.index_of(want).is_some(), s"expected '$want' in:\n$got")
+
+// -- what is bound ---------------------------------------------------------------------------------
+
+@test("'val (Ok(x) | Err(x)) = r' binds x from whichever side matched")
+vop_result_either_side()
+    vop_prints(raw"""
+        pick(r: Result[int, int]) -> int
+            val (Ok(x) | Err(x)) = r
+            x
+
+        print(pick(Ok(3)), pick(Err(7)))
+        """, "3 7\n")
+
+@test("a '|' inside a tuple's part spreads, and the other parts are bound from either alternative")
+vop_nested()
+    vop_prints(raw"""
+        nested(t: (int, Result[int, int])) -> int
+            val (a, (Ok(b) | Err(b))) = t
+            a * 10 + b
+
+        print(nested((1, Err(2))), nested((3, Ok(4))))
+        """, "12 34\n")
+
+@test("a 'var' with alternatives binds assignable names")
+vop_var()
+    vop_prints(raw"""
+        enum Shape
+            Circle(r: int)
+            Square(s: int)
+            Tri(t: int)
+
+        side(s: Shape) -> int
+            var (Circle(n) | Square(n) | Tri(n)) = s
+
+            n += 100
+            n
+
+        print(side(Circle(1)), side(Square(2)), side(Tri(3)))
+        """, "101 102 103\n")
+
+@test("an enum whose every variant carries the field is covered by one alternative per variant")
+vop_enum_same_field()
+    vop_prints(raw"""
+        enum Msg
+            Text(s: string)
+            Note(s: string)
+
+        say(m: Msg) -> string
+            val (Text(s) | Note(s)) = m
+            s + "!"
+
+        print(say(Text("a")), say(Note("b")))
+        """, "a! b!\n")
+
+@test("a 'for' header takes alternatives, binding each element from the side it is")
+vop_for()
+    vop_prints(raw"""
+        val rs: [3]Result[int, int] = [Ok(1), Err(2), Ok(3)]
+
+        for (Ok(v) | Err(v)) in rs
+            print(v)
+        """, "1\n2\n3\n")
+
+@test("alternatives that bind nothing, and a stated type for the whole value")
+vop_no_names_and_stated()
+    vop_prints(raw"""
+        whole(r: Result[int, int]) -> int
+            val (Ok(_) | Err(_)) = r
+            1
+
+        typed() -> int
+            val (Ok(x) | Err(x)): Result[int, int] = Err(4)
+            x
+
+        print(whole(Ok(1)), typed())
+        """, "1 4\n")
+
+@test("a module-level binding with alternatives, read from a function, and a closure capturing one")
+vop_module_and_closure()
+    vop_prints(raw"""
+        val r: Result[int, int] = Err(5)
+        val (a, (Ok(x) | Err(x))) = (1, r)
+        var (Ok(w) | Err(w)) = r
+
+        read() -> int = x + a + w
+
+        later(q: Result[int, int]) -> int
+            val (Ok(y) | Err(y)) = q
+            val g = () -> y + 1
+            g()
+
+        w += 1
+        print(read(), w, later(Err(8)))
+        """, "12 6 9\n")
+
+@test("a quoted name inside an alternative tests against what it names")
+vop_quoted_name()
+    vop_prints(raw"""
+        f(t: (int, int)) -> int
+            val k = 1
+            val ((`k`, b) | (_, b)) = t
+            b
+
+        print(f((1, 9)), f((2, 8)))
+        """, "9 8\n")
+
+// -- what is refused -------------------------------------------------------------------------------
+
+@test("alternatives that miss a variant are refused in a binding's words")
+vop_refutable_enum()
+    vop_refused(raw"""
+        enum S
+            A(n: int)
+            B(n: int)
+            C(n: int)
+
+        val s = A(1)
+        val (A(x) | B(x)) = s
+
+        print(x)
+        """, "a binding cannot choose among variants — these alternatives miss C, and a binding " +
+             "has no other arm to take when the value has another")
+
+@test("alternatives that cover only some numbers are refused in a binding's words")
+vop_refutable_number()
+    vop_refused(raw"""
+        val n = 3
+        val (1 | 2) = n
+
+        print(n)
+        """, "a binding cannot test a value — these alternatives match only some values, and a " +
+             "binding has no other arm to take when none of them matches")
+    vop_refused(raw"""
+        for (1 | 2, b) in [(1, 2)]
+            print(b)
+        """, "a binding cannot test a value — these alternatives match only some values")
+
+@test("a repeated alternative is dead, as in a match, and leaves the binding refutable")
+vop_dead_alternative()
+    vop_refused(raw"""
+        val o = Some(1)
+        val (Some(x) | Some(x)) = o
+
+        print(x)
+        """, "unreachable pattern 'Some(x)': every value it matches is already matched by an " +
+             "earlier alternative of this arm")
+    vop_refused(raw"""
+        val r: Result[int, int] = Ok(1)
+        val (Ok(x) | Err(x) | Ok(x)) = r
+
+        print(x)
+        """, "unreachable pattern 'Ok(x)'")
+
+@test("alternatives that bind one name at two types are refused")
+vop_type_mismatch()
+    vop_refused(raw"""
+        val r: Result[int, string] = Ok(1)
+        val (Ok(x) | Err(x)) = r
+
+        print(x)
+        """, "'x' is bound as int by one alternative joined by '|' and as string by another")
+
+@test("alternatives that bind different names are refused")
+vop_name_mismatch()
+    vop_refused(raw"""
+        val r: Result[int, int] = Ok(1)
+        val (Ok(x) | Err(y)) = r
+
+        print(x)
+        """, "'x' is bound by one alternative joined by '|' and not by another")
+
+@test("a name bound twice beside the alternatives is refused")
+vop_named_twice()
+    vop_refused(raw"""
+        val r: Result[int, int] = Ok(1)
+        val (Ok(x) | Err(x), x) = (r, 2)
+
+        print(x)
+        """, "'x' is bound twice in one pattern")
+
+@test("a name a 'val' binds from alternatives is written once")
+vop_val_is_written_once()
+    vop_refused(raw"""
+        val r: Result[int, int] = Ok(1)
+        val (Ok(x) | Err(x)) = r
+
+        x = 2
+        print(x)
+        """, "a 'val' is written once")
+
+@test("alternatives at a binding are written in parentheses")
+vop_unparenthesised()
+    vop_refused(raw"""
+        val r: Result[int, int] = Ok(1)
+        val Ok(x) | Err(x) = r
+
+        print(x)
+        """, "alternatives joined by '|' at a binding are written in parentheses — '(A(x) | B(x))'")
