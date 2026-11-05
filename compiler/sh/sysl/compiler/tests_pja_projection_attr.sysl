@@ -1,0 +1,275 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.fs.remove_dir_all
+import sysl.process.capture
+
+// **A type question asked through an associated type** (`reference/reflection.md`): `M::Item::Name`,
+// `X::Item::Kind`, `X::Item::Fields` and every other `::` attribute answer through a projection
+// exactly as they do through `T::Target`, since both are a left side only the type grammar reads.
+//
+// The axes: the attribute (`Name`, `BaseName`, `Kind`, `Id`, `Max`, `First` / `Last`, an attribute
+// with an operand -- `Val`, `Pos`, `Image` -- `sizeof`, a `for const` walk over `Fields`, a further
+// `Target`), where the subject stands (a declared type, a type parameter bounded by the trait), how
+// deep (one projection, a projection off a projection, `Target` off a projection), how the
+// implementation spelled the type (a width, an alias, an enum, a struct, a reference), and the
+// refusals (a subject with no implementation, a parameter whose bound does not fix the type, a value
+// on the left, an enum constant on the left).
+//
+// `::Name` answers as the implementation wrote `type Item = …`, an alias by its declaration as
+// `Meters::Name` is; off a type parameter it is canonical, as the parameter is.
+//
+// Not covered: a projection off `Self` inside an `impl`, which reads as off a type parameter (the
+// same `rooted_in_parameter` arm), and an implementation filed under a widened or blanket key, which
+// falls back to the canonical name by the same `None` as a missing one.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+// What a program prints, then its exit status; what the build said where it refused.
+private pja_out(src: string) -> string
+    var fs = im_files()
+
+    fs.push(("", "main.sysl", pja_decls() + src))
+
+    val root = im_write(fs)
+    val exe = root + "/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            val said = failure_text(why)
+
+            remove_dir_all(root).unwrap_or(())
+            return said
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true, 20000)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.status match
+            Exited(code) -> out.text + "[exit " + code.to_string() + "]"
+            _ -> out.text + "[did not exit]"
+end pja_out
+
+private pja_decls() -> string = raw"""
+    trait Has
+        type Item
+
+    trait Nest
+        type Inner
+
+    trait Deep
+        type Part: Nest
+
+    type Meters = u16
+
+    enum Light
+        Red
+        Green
+
+    struct Point
+        x: int
+        y: u8
+
+    struct Box
+        n: int
+
+    impl Has for Box
+        type Item = u16
+
+    struct Shelf
+        n: int
+
+    impl Has for Shelf
+        type Item = Meters
+
+    struct Lamp
+        n: int
+
+    impl Has for Lamp
+        type Item = Light
+
+    struct Plot
+        n: int
+
+    impl Has for Plot
+        type Item = Point
+
+    impl Nest for Plot
+        type Inner = Light
+
+    struct Outer
+        n: int
+
+    impl Has for Outer
+        type Item = Plot
+
+    impl Deep for Outer
+        type Part = Plot
+
+    struct Held
+        n: int
+
+    impl Has for Held
+        type Item = &Point
+
+    """
+
+private pja_refused(said: string, message: string, at: string)
+    assert(said.contains("error: " + message + "\n --> ") || said.contains("error: " + message + "\n  --> "),
+           said)
+    assert(said.contains(at + "\n"), said)
+
+// -- each attribute, at a concrete subject --------------------------------------------------------
+
+@test("a projection off a declared type answers Name as the impl wrote it, an alias as declared")
+pja_name_concrete_as_written()
+    if im_can_run() then return
+
+    assert_eq(pja_out(raw"""
+        main()
+            print(Box::Item::Name, Shelf::Item::Name, Lamp::Item::Name, Plot::Item::Name)
+            print(Box::Item::BaseName, Meters::Name, Held::Item::Name)
+
+        """), "u16 u16 Light Point\nushort u16 &Point\n[exit 0]")
+
+@test("a projection off a declared type answers Kind, Id, the integer and enum attributes and sizeof")
+pja_kind_and_values_concrete()
+    if im_can_run() then return
+
+    assert_eq(pja_out(raw"""
+        main()
+            print(Kind::Image(Box::Item::Kind), Kind::Image(Lamp::Item::Kind), Kind::Image(Plot::Item::Kind))
+            print(Kind::Image(Held::Item::Kind), Box::Item::Id == u16::Id, Shelf::Item::Id == Box::Item::Id)
+            print(Box::Item::Max, Box::Item::Min, Lamp::Item::First, Lamp::Item::Last, sizeof(Plot::Item))
+
+        """), "Int SimpleEnum Struct\nRef true true\n65535 0 Light.Red Light.Green 8\n[exit 0]")
+
+@test("an attribute with an operand reaches through a projection and through Target alike")
+pja_attr_with_operand()
+    if im_can_run() then return
+
+    assert_eq(pja_out(raw"""
+        main()
+            print(Lamp::Item::Val(1), Lamp::Item::Pos(Light.Green), Lamp::Item::Image(Light.Red))
+            print((&Light)::Target::Val(0), (&Light)::Target::Pos(Light.Green))
+
+        """), "Light.Green 1 Red\nLight.Red 1\n[exit 0]")
+
+@test("a for const walk reads Fields through a projection, and through Target")
+pja_fields_walk()
+    if im_can_run() then return
+
+    assert_eq(pja_out(raw"""
+        main()
+            for const f in Plot::Item::Fields
+                print(f.name, f.index, f::Type::Name)
+
+            for const f in Held::Item::Target::Fields
+                print(f.name)
+
+            for const c in Lamp::Item::Variants
+                print(c.name)
+
+        """), "x 0 int\ny 1 u8\nx\ny\nRed\nGreen\n[exit 0]")
+
+// -- nesting --------------------------------------------------------------------------------------
+
+@test("a projection off a projection, and Target off a projection, answer every question")
+pja_nested_concrete()
+    if im_can_run() then return
+
+    assert_eq(pja_out(raw"""
+        main()
+            print(Outer::Item::Inner::Name, Kind::Image(Outer::Item::Inner::Kind), Outer::Item::Inner::Last)
+            print(Held::Item::Target::Name, Kind::Image(Held::Item::Target::Kind), sizeof(Held::Item::Target))
+            print(Outer::Part::Inner::Name, Outer::Item::Item::Name)
+
+        """), "Light SimpleEnum Light.Green\nPoint Struct 8\nLight Point\n[exit 0]")
+
+// -- in a generic body ----------------------------------------------------------------------------
+
+@test("in a body bounded by the trait, each question answers per instantiation, Name canonically")
+pja_generic_bounded()
+    if im_can_run() then return
+
+    assert_eq(pja_out(raw"""
+        asked[M: Has]() -> string = s"${M::Item::Name} ${Kind::Image(M::Item::Kind)} ${M::Item::BaseName}"
+
+        same[M: Has]() -> bool = M::Item::Id == u16::Id
+
+        size[M: Has]() -> usize = sizeof(M::Item)
+
+        fields[M: Has]() -> int
+            var n = 0
+
+            for const f in M::Item::Fields
+                n += 1
+
+            n
+
+        kind_of[M: Has]() -> string
+            if const M::Item::Kind == Kind.Ref then "ref to " + M::Item::Target::Name
+            elif const M::Item::Kind == Kind.Struct then "struct " + M::Item::Name
+            else "other " + M::Item::Name
+
+        main()
+            print(asked[Box](), asked[Shelf](), asked[Lamp](), asked[Plot]())
+            print(same[Box](), same[Shelf](), same[Lamp](), size[Plot](), fields[Plot]())
+            print(kind_of[Held](), kind_of[Plot](), kind_of[Box]())
+
+        """), "ushort Int ushort ushort Int ushort Light SimpleEnum Light Point Struct Point\n" +
+              "true true false 8 2\nref to Point struct Point other ushort\n[exit 0]")
+
+@test("a nested projection in a bounded body reads the bound's own associated type")
+pja_generic_nested()
+    if im_can_run() then return
+
+    assert_eq(pja_out(raw"""
+        nested[M: Deep]() -> string = s"${M::Part::Inner::Name} ${Kind::Image(M::Part::Inner::Kind)}"
+
+        main()
+            print(nested[Outer]())
+
+        """), "Light SimpleEnum\n[exit 0]")
+
+// -- refusals -------------------------------------------------------------------------------------
+
+@test("a subject with no implementation is told so by the projection, concrete and unbounded")
+pja_no_implementation_refused()
+    if im_can_run() then return
+
+    val why = "int implements no trait declaring the associated type 'Item' — 2 traits declare one " +
+              "(Iterate, Has), and this type implements none of them"
+
+    pja_refused(pja_out("main()\n    print(int::Item::Name)\n"), why, "main.sysl:63:11")
+    pja_refused(pja_out("named[T]() -> string = T::Item::Name\n\nmain()\n    print(named[int]())\n"), why,
+                "main.sysl:62:24")
+
+@test("a bound that does not fix the type leaves a value attribute to what the bound promises")
+pja_bound_does_not_fix_refused()
+    if im_can_run() then return
+
+    pja_refused(pja_out("widest[M: Has]() -> string = s\"${M::Item::Max}\"\n\nmain()\n    print(widest[Box]())\n"),
+                "'str' needs 'M::Item: Display'", "main.sysl:62:30")
+
+@test("a walk over the fields of what a projection names refuses an enum as the enum's name would")
+pja_walk_of_an_enum_refused()
+    if im_can_run() then return
+
+    pja_refused(pja_out("main()\n    for const f in Lamp::Item::Fields\n        print(f.name)\n"),
+                "'Light::Fields' lists the fields of a struct, a tuple or a union, and 'Light' is an enum",
+                "main.sysl:63:5")
+
+@test("a value on the left of a projection keeps the old refusal, as does an enum constant")
+pja_value_on_the_left_refused()
+    if im_can_run() then return
+
+    pja_refused(pja_out("main()\n    val b = Box(1)\n    print(b::Item::Name)\n"),
+                "'::Name' is a type attribute, so its left side must be a type name", "main.sysl:64:18")
+    pja_refused(pja_out("main()\n    print(Kind::Image(Light::Red::Kind))\n"),
+                "'::Kind' is a type attribute, so its left side must be a type name", "main.sysl:63:33")
