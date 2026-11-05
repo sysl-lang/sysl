@@ -63,11 +63,11 @@ private[net] name_too_long_code() -> int = 63
 private[net] name_too_long_code() -> int = 36
 #endif
 
-/** A Unix domain socket listening for connections. Not closed by going out of scope, for the reason
- * `Socket` is not.
+/** A Unix domain socket listening for connections. It closes itself when its last copy goes, exactly
+ * as `Socket` does; the socket file stays where it is either way.
  */
 struct UnixListener
-    private fd: i32
+    private inner: &sync SocketState
 
     /** Wait for a connection, and answer it.
      *
@@ -78,19 +78,27 @@ struct UnixListener
     @blocks
     accept(*self) -> Result[Socket, IoError]
         var peer = unspecified()
-        val s = nsys.accept(int(self.fd), &peer)
+        val s = nsys.accept(int(self.inner.fd), &peer)
 
-        if s < 0 then Err(failure(s)) else Ok(Socket(i32(s)))
+        if s < 0 then Err(failure(s)) else Ok(Socket(owned(s)))
     end accept
 
     /** Put this listener in non-blocking mode, or take it out again. A non-blocking `accept` with
      * nobody waiting answers an error `would_block` recognises instead of waiting.
      */
     non_blocking(*self, on: bool = true) -> Result[unit, IoError] =
-        told(nsys.option(int(self.fd), nsys.non_blocking, if on then 1 else 0))
+        told(nsys.option(int(self.inner.fd), nsys.non_blocking, if on then 1 else 0))
 
-    /** Give the descriptor back. The socket file stays where it is. */
-    close(*self) -> Result[unit, IoError] = told(nsys.close(int(self.fd)))
+    /** Give the descriptor back now, closing every copy; a second `close` answers `NotOpen` and
+     * closes nothing. The socket file stays where it is.
+     */
+    close(*self) -> Result[unit, IoError] = shut(self.inner)
+
+    /** The descriptor, lent; see `Socket.fd`. */
+    fd(self) -> Result[int, IoError] = lent(self.inner)
+
+    /** The descriptor, given rather than lent; see `Socket.into_raw_fd`. */
+    into_raw_fd(*self) -> Result[int, IoError] = given_up(self.inner)
 end UnixListener
 
 /** Make the socket file at `at` and listen on it, with `backlog` connections allowed to queue.
@@ -111,7 +119,7 @@ unix_listen(at: UnixAddress, backlog: int = 128) -> Result[UnixListener, IoError
         val _ = nsys.close(s)
         return Err(failure(answer))
 
-    Ok(UnixListener(i32(s)))
+    Ok(UnixListener(owned(s)))
 end unix_listen
 
 /** A stream connected to the Unix domain socket at `to`. Nothing listening there is `NotFound` when
@@ -129,5 +137,5 @@ unix_connect(to: UnixAddress) -> Result[Socket, IoError]
         val _ = nsys.close(s)
         return Err(failure(answer))
 
-    Ok(Socket(i32(s)))
+    Ok(Socket(owned(s)))
 end unix_connect

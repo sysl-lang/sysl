@@ -20,7 +20,8 @@ import sysl.slices.{as_ptr, copy}
 //
 // The descriptor is handed out by `fd()`, for a program that has to pass it to a call this module
 // does not make -- to poll it, to `fcntl` it, to hand it to C. The file keeps it: closing it stays the
-// `File`'s to do, and what is still buffered has not reached it until `flush`.
+// `File`'s to do, and what is still buffered has not reached it until `flush`. A program that means to
+// keep the descriptor after the file is gone takes it with `into_raw_fd`.
 
 /** How many bytes a file holds back before handing them over, and asks for at once when a caller
  * asks for fewer.
@@ -49,7 +50,8 @@ private const invalid: int = -22
  * is a second `File`, and if it held the descriptor and the buffer directly then closing either would
  * leave the other writing into a descriptor that was released, and the two would disagree about what
  * was buffered. Every copy sharing **one** `FileState` is what makes `close` answerable at all: it is
- * written once, and every copy sees it.
+ * written once, and every copy sees it. It is also what gives the descriptor one point of death: the
+ * last copy going is the state's last reference going, and its destructor closes what nobody closed.
  *
  * The buffer holds one direction at a time. Reading, `held[at..<filled]` is what arrived and has not
  * been handed out; writing, `held[0..<pending]` is what was written and has not been handed over.
@@ -69,13 +71,29 @@ struct FileState
     filled: usize
     pending: usize
 
+/** The descriptor closed when the last `File` sharing it goes, unless `close` or `into_raw_fd` already
+ * gave it up. What is still buffered is handed over first, and a failure doing either is not
+ * reported: a destructor has nobody to report it to (`sysl.Drop`), so a program that cares whether
+ * its output arrived calls `close` and reads the answer.
+ */
+impl Drop for FileState
+    drop(self)
+        if self.shut then return
+
+        _ = handed(self.fd, self.held, self.pending)
+        _ = fsys.close(self.fd)
+
 /** A file that is open, or that was.
  *
- * **Closing is the program's to do**, and `defer f.close()` is how it is written -- the language has
- * no destructor, so nothing runs at the end of a scope that the scope did not say. What the shared
- * state above buys is that saying it *twice* is harmless rather than a use-after-free, which is the
- * mistake a value type would otherwise make easy. Dropping a `File` without closing it leaks the
- * descriptor until the program exits, and loses whatever was still buffered.
+ * **It closes itself**: when the last copy of a `File` goes -- out of scope, out of a `Buf`, with the
+ * struct that held it -- what is still buffered is handed over and the descriptor is closed, as Rust's
+ * `File` does. `close` is still there, and is what a program calls when it wants to know the answer:
+ * a full disk reports when the buffer is handed over, and a destructor has nobody to tell. `defer
+ * f.close()` remains a correct way to write that, and is no longer needed to stop a leak.
+ *
+ * **Every copy shares one open file.** Closing any of them closes it for all, and saying it *twice*
+ * is harmless rather than a use-after-free, which is the mistake a value type would otherwise make
+ * easy. While any copy lives the descriptor stays open.
  */
 struct File
     inner: &FileState
@@ -84,13 +102,39 @@ struct File
 
     /** The descriptor the file reads and writes through, for a call this module does not make.
      *
-     * **It is lent, not given**: the file still closes it, and a descriptor closed behind the file's
-     * back is one the file goes on using. **Bytes written and not yet flushed are not in it yet**, and
-     * bytes read ahead have already left it, so a program mixing its own calls with the file's flushes
-     * first and reads through one or the other. A closed file answers `NotOpen` rather than a number
-     * that may by now name somebody else's file.
+     * **It is lent, not given**: the file still closes it -- explicitly, or when its last copy goes --
+     * and a descriptor closed behind the file's back is one the file goes on using. A number kept
+     * past the file's life names nothing, so a program handing it to C for longer takes it with
+     * `into_raw_fd` instead. **Bytes written and not yet flushed are not in it yet**, and bytes read
+     * ahead have already left it, so a program mixing its own calls with the file's flushes first and
+     * reads through one or the other. A closed file answers `NotOpen` rather than a number that may by
+     * now name somebody else's file.
      */
     fd(self) -> Result[int, IoError] = if self.inner.shut then Err(NotOpen) else Ok(self.inner.fd)
+
+    /** The descriptor, given rather than lent: the file lets go of it, and closing it is from now on
+     * the caller's to do -- Rust's `into_raw_fd`.
+     *
+     * What is still buffered is handed over first, and bytes read ahead are given back by moving the
+     * descriptor to where the program thinks it is, so the number answered stands exactly where the
+     * file did. A failure doing either answers the error and **keeps** the descriptor the file's, so
+     * nothing is lost and nothing leaks. Every copy of the file is closed afterwards, as `close` would
+     * leave it, and a closed one answers `NotOpen`.
+     */
+    into_raw_fd(*self) -> Result[int, IoError]
+        if self.inner.shut then return Err(NotOpen)
+
+        val written = drain(self.inner)
+
+        if written != 0 then return Err(from_status(written))
+
+        val back = unread(self.inner)
+
+        if back != 0 then return Err(from_status(back))
+
+        self.inner.shut = true
+        Ok(self.inner.fd)
+    end into_raw_fd
 
     /** The file's bytes, mapped read-only into memory rather than read -- `map_file`, for a file that
      * is already open. What is still buffered is handed over first, so the mapping sees every byte
@@ -237,21 +281,30 @@ end File
  * fail again at every later call.
  */
 private drain(s: &FileState) -> int
+    val code = handed(s.fd, s.held, s.pending)
+
+    s.pending = 0
+    code
+end drain
+
+/** The first `pending` bytes of `held` written to `fd`, however many calls that takes: zero, or the
+ * code of what stopped it. `drain` and the destructor are its two callers.
+ */
+private handed(fd: int, held: []u8, pending: usize) -> int
     var done: usize = 0
     var code = 0
 
-    while done < s.pending && code == 0
+    while done < pending && code == 0
         var put: usize = 0
 
-        code = fsys.write(s.fd, &s.held[done], s.pending - done, &put)
+        code = fsys.write(fd, &held[done], pending - done, &put)
 
         if code == 0 && put == 0 then code = stalled
 
         done += put
 
-    s.pending = 0
     code
-end drain
+end handed
 
 /** Gives up what was read ahead and not handed out, moving the descriptor back to where the program
  * thinks it is -- which is what a write has to start from. Zero, or the code of what stopped it.

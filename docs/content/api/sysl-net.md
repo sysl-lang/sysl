@@ -47,7 +47,7 @@ so leaving them out costs a later release nothing.
 
 ## Index
 
-[`max_unix_path`](#max_unix_path) [`ipv4`](#ipv4) [`ipv6`](#ipv6) [`peer_closed`](#peer_closed) [`resolve`](#resolve) [`resolve_passive`](#resolve_passive) [`socket`](#socket) [`timed_out`](#timed_out) [`udp_socket`](#udp_socket) [`unix`](#unix) [`unix_connect`](#unix_connect) [`unix_listen`](#unix_listen) [`would_block`](#would_block) [`Address`](#address) [`Family`](#family) [`Shutdown`](#shutdown) [`Socket`](#socket-1) [`UdpSocket`](#udpsocket) [`UnixAddress`](#unixaddress) [`UnixListener`](#unixlistener) [Display for Address](#display-for-address) [Display for UnixAddress](#display-for-unixaddress)
+[`max_unix_path`](#max_unix_path) [`ipv4`](#ipv4) [`ipv6`](#ipv6) [`peer_closed`](#peer_closed) [`resolve`](#resolve) [`resolve_passive`](#resolve_passive) [`socket`](#socket) [`timed_out`](#timed_out) [`udp_socket`](#udp_socket) [`unix`](#unix) [`unix_connect`](#unix_connect) [`unix_listen`](#unix_listen) [`would_block`](#would_block) [`Address`](#address) [`Family`](#family) [`Shutdown`](#shutdown) [`Socket`](#socket-1) [`UdpSocket`](#udpsocket) [`UnixAddress`](#unixaddress) [`UnixListener`](#unixlistener) [Display for Address](#display-for-address) [Display for UnixAddress](#display-for-unixaddress) [Drop for SocketState](#drop-for-socketstate)
 
 ## Constants
 
@@ -248,14 +248,17 @@ How much of a connection is being given up.
 
 ```sysl
 struct Socket
-    private[net] fd: i32
+    private[net] inner: &sync SocketState
 ```
 
 A connection, or something listening for one. One type, because the sockets API has one.
 
-**A socket is not closed by going out of scope.** `close` is a call, exactly as it is in C, and a
-program that drops one without closing it leaks a descriptor until it exits. `defer s.close()` is
-the idiom.
+**It closes itself**: when the last copy of a socket goes -- out of scope, out of a `Buf`, with the
+struct that held it -- its descriptor is closed, as Rust's `TcpStream` does. `close` is still there
+for a program that wants to give it back at a moment of its own, or to read whether that worked,
+and `defer s.close()` remains correct without being needed. **Every copy shares one descriptor**:
+closing one closes them all, a second `close` answers `NotOpen` and closes nothing, and the
+descriptor stays open while any copy lives. `into_raw_fd` takes the descriptor away from the socket altogether.
 
 | Member | Signature | Description |
 |---|---|---|
@@ -268,7 +271,9 @@ the idiom.
 | `send_all` | `send_all(*self, bytes: []const u8) -> Result[unit, IoError]` | Every byte of `bytes`, however many calls that takes. |
 | `recv` | `recv(*self, into: []u8) -> Result[usize, IoError]` | Read into `into`, and say how many bytes arrived. |
 | `shutdown` | `shutdown(*self, how: Shutdown = Both) -> Result[unit, IoError]` | Stop reading, stop writing, or stop both -- while the descriptor stays open. |
-| `close` | `close(*self) -> Result[unit, IoError]` | Give the descriptor back. |
+| `close` | `close(*self) -> Result[unit, IoError]` | Give the descriptor back now, rather than when the last copy goes, and say whether that worked. |
+| `fd` | `fd(self) -> Result[int, IoError]` | The descriptor, lent: the socket still closes it, explicitly or when its last copy goes, so a number kept past that names nothing. |
+| `into_raw_fd` | `into_raw_fd(*self) -> Result[int, IoError]` | The descriptor, given rather than lent: the socket lets go of it and closing it is from now on the caller's to do -- Rust's `into_raw_fd`. |
 | `read_timeout` | `read_timeout(*self, ms: int) -> Result[unit, IoError]` | How long a `recv` may wait before giving up, in milliseconds. |
 | `write_timeout` | `write_timeout(*self, ms: int) -> Result[unit, IoError]` | How long a `send` may wait before giving up, in milliseconds. |
 | `reuse_address` | `reuse_address(*self, on: bool = true) -> Result[unit, IoError]` | Let a listener take a port that a recently stopped one was using, so that a server just stopped can be started again without waiting out `TIME_WAIT`. |
@@ -282,7 +287,7 @@ the idiom.
 
 ```sysl
 struct UdpSocket
-    private fd: i32
+    private inner: &sync SocketState
 ```
 
 A datagram socket: UDP. Each `send_to` is one datagram and each `recv_from` takes one whole,
@@ -293,7 +298,7 @@ rest, one sent may never arrive, and two may arrive in either order. What UDP is
 the exchanges that can live with that -- a query and its answer, a heartbeat, a sample -- and the
 calls here say nothing more than that.
 
-Not closed by going out of scope, for the reason `Socket` is not.
+It closes itself when its last copy goes, exactly as `Socket` does.
 
 | Member | Signature | Description |
 |---|---|---|
@@ -311,7 +316,9 @@ Not closed by going out of scope, for the reason `Socket` is not.
 | `set_recv_buffer` | `set_recv_buffer(*self, bytes: int) -> Result[unit, IoError]` | Ask the kernel for a receive buffer of `bytes`; see `Socket.set_send_buffer`. |
 | `send_buffer` | `send_buffer(self) -> Result[int, IoError]` | The send buffer the kernel gave this socket, in bytes. |
 | `recv_buffer` | `recv_buffer(self) -> Result[int, IoError]` | The receive buffer the kernel gave this socket, in bytes. |
-| `close` | `close(*self) -> Result[unit, IoError]` | Give the descriptor back. |
+| `close` | `close(*self) -> Result[unit, IoError]` | Give the descriptor back now, closing every copy; a second `close` answers `NotOpen` and closes nothing. |
+| `fd` | `fd(self) -> Result[int, IoError]` | The descriptor, lent; see `Socket.fd`. |
+| `into_raw_fd` | `into_raw_fd(*self) -> Result[int, IoError]` | The descriptor, given rather than lent; see `Socket.into_raw_fd`. |
 
 ### `UnixAddress`
 
@@ -335,17 +342,19 @@ is closed. Who may connect is the file's permission bits, which `sysl.fs.set_per
 
 ```sysl
 struct UnixListener
-    private fd: i32
+    private inner: &sync SocketState
 ```
 
-A Unix domain socket listening for connections. Not closed by going out of scope, for the reason
-`Socket` is not.
+A Unix domain socket listening for connections. It closes itself when its last copy goes, exactly
+as `Socket` does; the socket file stays where it is either way.
 
 | Member | Signature | Description |
 |---|---|---|
 | `accept` | `accept(*self) -> Result[Socket, IoError]` | Wait for a connection, and answer it. |
 | `non_blocking` | `non_blocking(*self, on: bool = true) -> Result[unit, IoError]` | Put this listener in non-blocking mode, or take it out again. |
-| `close` | `close(*self) -> Result[unit, IoError]` | Give the descriptor back. |
+| `close` | `close(*self) -> Result[unit, IoError]` | Give the descriptor back now, closing every copy; a second `close` answers `NotOpen` and closes nothing. |
+| `fd` | `fd(self) -> Result[int, IoError]` | The descriptor, lent; see `Socket.fd`. |
+| `into_raw_fd` | `into_raw_fd(*self) -> Result[int, IoError]` | The descriptor, given rather than lent; see `Socket.into_raw_fd`. |
 
 ## Implementations
 
@@ -366,3 +375,12 @@ impl Display for UnixAddress
 ```
 
 So that printing one prints the path.
+
+### Drop for SocketState
+
+```sysl
+impl Drop for SocketState
+```
+
+The descriptor closed when the last copy of the socket goes, unless it was already given up. A
+failure is not reported, there being nobody to report it to (`sysl.Drop`).

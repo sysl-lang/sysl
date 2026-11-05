@@ -1,0 +1,326 @@
+module sysl.net
+@requires(posix)
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{IoError, exists, make_temp_dir, remove_dir_all}
+import sysl.path.join
+import sysl.process.pid
+
+// A socket closing itself when its last copy goes (`SocketState`'s destructor), on every socket type,
+// and `into_raw_fd` taking the descriptor away from it.
+//
+// **Whether a descriptor is open is asked of the operating system**: `dup` of a closed number answers
+// `-1`. Each test runs in a process of its own and on one thread, so nothing else can be handed the
+// number between the drop and the question. Each socket is let go of by returning from a helper,
+// which is where its last local copy goes.
+
+private extern "dup" ncd_dup(fd: int) -> int
+private extern "close" ncd_close(fd: int) -> int
+
+// Whether `fd` names an open descriptor.
+private ncd_open(fd: int) -> bool
+    val d = ncd_dup(fd)
+
+    if d < 0 then return false
+
+    _ = ncd_close(d)
+    true
+end ncd_open
+
+private ncd_ignore(r: Result[unit, IoError]) = ()
+
+private ncd_loopback() -> Address = ipv4(127, 0, 0, 1, 0)
+
+/** A listener on the loopback and the address it is at. */
+private ncd_listener() -> (Socket, Address)
+    var s = socket(ncd_loopback()).unwrap()
+
+    s.bind(ncd_loopback()).unwrap()
+    s.listen().unwrap()
+    (s, s.local().unwrap())
+end ncd_listener
+
+// A stream socket made and let go of without a close.
+private ncd_made_and_dropped() -> int = socket(ncd_loopback()).unwrap().fd().unwrap()
+
+// A client connected to `to` and let go of without a close.
+private ncd_connected_and_dropped(to: Address) -> int
+    var c = socket(to).unwrap()
+
+    c.connect(to).unwrap()
+    c.send_all("bye".bytes).unwrap()
+    c.fd().unwrap()
+end ncd_connected_and_dropped
+
+// A connection accepted and let go of without a close.
+private ncd_accepted_and_dropped(l: *Socket) -> int
+    val (s, _) = l.accept().unwrap()
+
+    s.fd().unwrap()
+end ncd_accepted_and_dropped
+
+// Two copies of one socket, one let go of here and the other handed back.
+private ncd_one_copy_kept() -> Socket
+    val s = socket(ncd_loopback()).unwrap()
+    val t = s
+
+    assert_eq(t.fd().unwrap(), s.fd().unwrap())
+    t
+end ncd_one_copy_kept
+
+// A socket closed and let go of, with the next one made while it is closed and still held.
+private ncd_closed_then_dropped() -> (Socket, int)
+    var s = socket(ncd_loopback()).unwrap()
+    val n = s.fd().unwrap()
+
+    s.close().unwrap()
+    (socket(ncd_loopback()).unwrap(), n)
+end ncd_closed_then_dropped
+
+private ncd_held_in_a_buf() -> Buf[int]
+    var socks: Buf[Socket] = buf()
+    var fds: Buf[int] = buf()
+
+    for _ in 0..<3 do socks.push(socket(ncd_loopback()).unwrap())
+    for s in socks do fds.push(s.fd().unwrap())
+    for n in fds do assert(ncd_open(n))
+
+    fds
+end ncd_held_in_a_buf
+
+private struct NcdHolder
+    sock: Socket
+    udp: UdpSocket
+
+private ncd_held_in_a_field() -> (int, int)
+    val h = NcdHolder(socket(ncd_loopback()).unwrap(), udp_socket(ncd_loopback()).unwrap())
+    val a = h.sock.fd().unwrap()
+    val b = h.udp.fd().unwrap()
+
+    assert(ncd_open(a) && ncd_open(b))
+    (a, b)
+end ncd_held_in_a_field
+
+private ncd_given_away() -> int
+    var s = socket(ncd_loopback()).unwrap()
+    val t = s
+    val n = s.into_raw_fd().unwrap()
+
+    assert(t.fd().unwrap_err() == IoError.NotOpen, "a copy still lends a descriptor given away")
+    assert(s.into_raw_fd().unwrap_err() == IoError.NotOpen)
+    assert(s.close().unwrap_err() == IoError.NotOpen)
+    n
+end ncd_given_away
+
+private ncd_udp_dropped() -> int = udp_socket(ncd_loopback()).unwrap().fd().unwrap()
+
+private ncd_udp_given_away() -> int
+    var u = udp_socket(ncd_loopback()).unwrap()
+    val n = u.into_raw_fd().unwrap()
+
+    assert(u.fd().unwrap_err() == IoError.NotOpen)
+    n
+end ncd_udp_given_away
+
+private ncd_unix_dropped(at: UnixAddress) -> int = unix_listen(at).unwrap().fd().unwrap()
+
+private ncd_unix_given_away(at: UnixAddress) -> int
+    var l = unix_listen(at).unwrap()
+    val n = l.into_raw_fd().unwrap()
+
+    assert(l.fd().unwrap_err() == IoError.NotOpen)
+    n
+end ncd_unix_given_away
+
+// ## Socket
+
+@test("ncd_ a socket dropped without a close has its descriptor closed")
+ncd_drop_closes()
+    val n = ncd_made_and_dropped()
+
+    assert(n >= 0)
+    assert(!ncd_open(n), "the descriptor outlived its socket")
+
+@test("ncd_ a client dropped without a close ends the stream: the server reads what it sent, then zero")
+ncd_drop_ends_the_stream()
+    var (l, at) = ncd_listener()
+
+    _ = ncd_connected_and_dropped(at)
+
+    var (s, _) = l.accept().unwrap()
+    var into: []u8 = [0; 8]
+    var got: usize = 0
+
+    loop
+        val k = s.recv(into[got..<into.len]).unwrap()
+
+        if k == 0 then break
+        got += k
+
+    assert_eq(got, 3)
+end ncd_drop_ends_the_stream
+
+@test("ncd_ an accepted connection dropped without a close ends the stream for the client")
+ncd_accepted_drop_ends_the_stream()
+    var (l, at) = ncd_listener()
+    var c = socket(at).unwrap()
+
+    c.connect(at).unwrap()
+
+    val n = ncd_accepted_and_dropped(&l)
+
+    assert(!ncd_open(n), "the accepted descriptor outlived its socket")
+
+    var into: []u8 = [0; 8]
+
+    c.read_timeout(5000).unwrap()
+    assert_eq(c.recv(into).unwrap(), 0)
+end ncd_accepted_drop_ends_the_stream
+
+@test("ncd_ a socket closed and then dropped does not close the descriptor its number went to next")
+ncd_close_then_drop()
+    val (s, n) = ncd_closed_then_dropped()
+
+    assert_eq(s.fd().unwrap(), n)
+    assert(ncd_open(n), "the drop of a closed socket closed its successor")
+
+@test("ncd_ a copy shares the descriptor, which stays open while any copy lives")
+ncd_copy_shares()
+    var kept = ncd_one_copy_kept()
+    val n = kept.fd().unwrap()
+
+    assert(ncd_open(n), "a copy going closed the descriptor another copy still holds")
+    kept.reuse_address().unwrap()
+
+    // The new socket is made before the old one is let go of, so it has a number of its own, and the
+    // last copy of the old one goes with the assignment.
+    kept = socket(ncd_loopback()).unwrap()
+
+    assert(kept.fd().unwrap() != n)
+    assert(!ncd_open(n), "the last copy going left the descriptor open")
+end ncd_copy_shares
+
+@test("ncd_ closing one copy closes every copy, and a second close is NotOpen")
+ncd_close_one_copy()
+    var s = socket(ncd_loopback()).unwrap()
+    var t = s
+    val n = s.fd().unwrap()
+
+    t.close().unwrap()
+
+    assert(!ncd_open(n))
+    assert(s.fd().unwrap_err() == IoError.NotOpen)
+    assert(s.close().unwrap_err() == IoError.NotOpen)
+    assert(s.reuse_address().unwrap_err() == IoError.NotOpen, "a closed copy reached a descriptor")
+end ncd_close_one_copy
+
+@test("ncd_ sockets in a Buf are closed when the Buf goes")
+ncd_buf_of_sockets()
+    for n in ncd_held_in_a_buf() do assert(!ncd_open(n), s"descriptor $n outlived its Buf")
+
+@test("ncd_ sockets in struct fields are closed when the struct goes")
+ncd_struct_field()
+    val (a, b) = ncd_held_in_a_field()
+
+    assert(!ncd_open(a), "the stream socket outlived the struct holding it")
+    assert(!ncd_open(b), "the datagram socket outlived the struct holding it")
+
+@test("ncd_ into_raw_fd gives the descriptor away: it stays open after every copy goes")
+ncd_into_raw_fd_keeps()
+    val n = ncd_given_away()
+
+    assert(ncd_open(n), "the drop closed a descriptor the socket had given away")
+    assert_eq(ncd_close(n), 0)
+
+// The process's descriptor limit lowered to 256, so a leak runs out inside a loop of ten thousand:
+// the limit a shell hands a test may be a million.
+private struct NcdLimit
+    cur: u64
+    max: u64
+
+private extern "getrlimit" ncd_getrlimit(which: int, into: *NcdLimit) -> int
+private extern "setrlimit" ncd_setrlimit(which: int, from: *NcdLimit) -> int
+
+#if bsd
+private ncd_nofile() -> int = 8
+#else
+private ncd_nofile() -> int = 7
+#endif
+
+private ncd_few_descriptors()
+    var l = NcdLimit(0, 0)
+
+    assert_eq(ncd_getrlimit(ncd_nofile(), &l), 0)
+    l.cur = 256
+    assert_eq(ncd_setrlimit(ncd_nofile(), &l), 0)
+end ncd_few_descriptors
+
+@test("ncd_ ten thousand sockets made and never closed do not run out of descriptors")
+ncd_many_sockets()
+    ncd_few_descriptors()
+
+    for _ in 0..<10000 do assert(ncd_made_and_dropped() >= 0)
+
+@test("ncd_ under the same limit, descriptors given away do run out, so the loop above could fail")
+ncd_given_away_runs_out()
+    ncd_few_descriptors()
+
+    var kept: Buf[int] = buf()
+    var refused = false
+
+    for _ in 0..<10000
+        socket(ncd_loopback()) match
+            Ok(s) ->
+                var t = s
+
+                kept.push(t.into_raw_fd().unwrap())
+            Err(_) ->
+                refused = true
+                break
+
+    for n in kept do _ = ncd_close(n)
+
+    assert(refused, "ten thousand descriptors were kept open under a limit of 256")
+end ncd_given_away_runs_out
+
+// ## UdpSocket
+
+@test("ncd_ a datagram socket dropped without a close has its descriptor closed")
+ncd_udp_drop_closes()
+    assert(!ncd_open(ncd_udp_dropped()), "the descriptor outlived its socket")
+
+@test("ncd_ a datagram socket's into_raw_fd keeps the descriptor open")
+ncd_udp_into_raw_fd()
+    val n = ncd_udp_given_away()
+
+    assert(ncd_open(n))
+    assert_eq(ncd_close(n), 0)
+
+@test("ncd_ ten thousand datagram sockets made and never closed do not run out of descriptors")
+ncd_many_udp()
+    ncd_few_descriptors()
+
+    for _ in 0..<10000 do assert(ncd_udp_dropped() >= 0)
+
+// ## UnixListener
+
+@test("ncd_ a Unix listener dropped without a close has its descriptor closed, and leaves its file")
+ncd_unix_drop_closes()
+    val dir = make_temp_dir(f"sysl-ncd-${pid()}-").unwrap()
+    val at = unix(join(dir, "s.sock")).unwrap()
+
+    assert(!ncd_open(ncd_unix_dropped(at)), "the descriptor outlived its listener")
+    assert(exists(join(dir, "s.sock")))
+    ncd_ignore(remove_dir_all(dir))
+end ncd_unix_drop_closes
+
+@test("ncd_ a Unix listener's into_raw_fd keeps the descriptor open")
+ncd_unix_into_raw_fd()
+    val dir = make_temp_dir(f"sysl-ncd-${pid()}-").unwrap()
+    val n = ncd_unix_given_away(unix(join(dir, "s.sock")).unwrap())
+
+    assert(ncd_open(n))
+    assert_eq(ncd_close(n), 0)
+    ncd_ignore(remove_dir_all(dir))
+end ncd_unix_into_raw_fd
