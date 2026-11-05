@@ -306,3 +306,45 @@ svw_a_view_over_a_call_is_laid_down_freestanding()
     sdt_laid_down(said, "@Ws = private constant { ptr, ptr, i32 } { ptr null, ptr @.view")
     assert(said.contains("constant [2 x i32] [i32 3, i32 4]"), said)
 end svw_a_view_over_a_call_is_laid_down_freestanding
+
+// A variant carrying a string literal is data on a 32-bit machine as on a host
+// (`tests_ecv_enum_const_val.sysl`): the region's unit is a pointer wide, so the bytes' address
+// fills one unit and the length the next.
+@test("a variant carrying a string literal is laid down for a freestanding archive")
+sdt_a_string_payload_is_laid_down_freestanding()
+    if sdt_no_library(target_named("thumbv6m-freestanding").unwrap()) then return
+
+    val out = sdt_freestanding("enum Zone\n    Fixed(name: string, offset: i32)\n    Ruled(name: string, rule: &Fn(int) -> i32)\n\n" +
+                               "val UTC: Zone = Fixed(\"UTC\", 0)\n\n" +
+                               "@export(\"main\")\nmain_entry() -> int = UTC match\n" +
+                               "    Fixed(n, o) -> int(n.len) + int(o)\n    Ruled(_, _) -> 0\n")
+
+    sdt_laid_down(out, "@UTC = private constant %enum.Zone { i32 0, [5 x i32] [i32 0, i32 ptrtoint (ptr @.str")
+    assert(out.contains(" to i32), i32 3, i32 0, i32 0] }"), out)
+end sdt_a_string_payload_is_laid_down_freestanding
+
+// The library's own: `sysl.time.utc` is the value every program that names a zone may reach, and a
+// board may name it.
+@test("'sysl.time.utc' is laid down for a freestanding archive")
+sdt_the_library_utc_is_laid_down_freestanding()
+    if sdt_no_library(target_named("thumbv6m-freestanding").unwrap()) then return
+
+    val out = sdt_freestanding("import sysl.time.utc\n\n@export(\"main\")\nmain_entry() -> int = int(utc.name().len)\n")
+
+    sdt_laid_down(out, "@sysl.time$utc = private constant %enum.sysl.time$Zone { i32 0, ")
+end sdt_the_library_utc_is_laid_down_freestanding
+
+// Where a field beside the string makes the region's unit wider than a pointer, the address cannot
+// fill a unit of its own, so the value stays code -- and a freestanding archive refuses it by name
+// rather than laying down a word the linker cannot fill.
+@test("a string beside a 64-bit field on a 32-bit machine stays code, and is refused by name")
+sdt_a_string_beside_a_wide_field_is_refused_freestanding()
+    if sdt_no_library(target_named("thumbv6m-freestanding").unwrap()) then return
+
+    val said = sdt_freestanding("enum Stamp\n    None_\n    At(label: string, ns: i64)\n\n" +
+                                "val S: Stamp = At(\"boot\", 5)\n\n" +
+                                "@export(\"main\")\nmain_entry() -> int = S match\n" +
+                                "    At(l, _) -> int(l.len)\n    None_ -> 0\n")
+
+    assert(said.starts_with(sdt_refusal("S")), said)
+end sdt_a_string_beside_a_wide_field_is_refused_freestanding
