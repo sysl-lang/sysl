@@ -230,13 +230,13 @@ private const fbp_matrix_template: string = raw"""
         one: Option[&Fn(int) -> unit]
 
     trait Installer
-        @keeps(p)
-        put(self, p: *S)
+        @keeps(s)
+        put(self, s: S)
     struct I
         n: int
 
     impl Installer for I
-        put(self, p: *S) = kept.push(p.f)
+        put(self, s: S) = kept.push(s.f)
 
     var kept: Buf[&Fn(int) -> unit] = buf()
     var ga: Option[&Fn(int) -> unit] = None
@@ -321,7 +321,7 @@ private const fbp_matrix_template: string = raw"""
         var n = tag
         val i: &Installer = I(0)
         var s = S((e) -> print(CAP + e))
-        i.put(&s)
+        i.put(s)
 
     in_a_loop(tag: int) -> &Fn(int) -> unit
         var n = tag
@@ -410,29 +410,22 @@ fbp_matrix_is_explained()
     assert(said.contains("handed to 'outer' on line 90, which lets what it reads through its parameter 'p' outlive the call (it is passed to 'inner', which lets what it reads through it out)"), said)
     assert(said.contains("handed to 'deep' on line 96, which lets what it reads through its parameter 'w'"), said)
     assert(said.contains("handed to 'rec' on line 101, which lets what it reads through its parameter 'p'"), said)
-    assert(said.contains("handed to a call through '&Installer' on line 107, which lets what it reads through its " +
-                         "parameter 'p' outlive the call (its trait's 'put' declares '@keeps(p)')"), said)
+    assert(said.contains("handed to a call through '&Installer' on line 107, which keeps its parameter 's' (its " +
+                         "trait's 'put' declares '@keeps(s)')"), said)
     assert(said.contains("it is returned from 'in_a_loop' on line 115"), said)
 
 // -- C and an object with no trait to dispatch through --------------------------------------------
 
 // **C borrows what it reads through a pointer for the call, as it borrows the pointer**, unless its
 // declaration says `@keeps`: a closure in a struct whose address goes to an `extern` stays in the
-// frame, and one whose address goes to an `extern` that keeps it is on the heap. A pointer to bytes
-// (`*u8`) reads numbers, so one handed to C as bytes stays in the frame either way.
+// frame, and the address of a frame's struct handed to an `extern` that keeps it is refused at the
+// call. A pointer to bytes (`*u8`) reads numbers, so one handed to C as bytes stays in the frame.
 private const fbp_foreign: string = raw"""
     struct S
         f: &Fn(int) -> unit
 
     extern "fbp_c_take" fbp_take(p: *S)
     extern "fbp_c_bytes" fbp_bytes(p: *u8)
-
-    @keeps(p)
-    extern "fbp_c_keep" fbp_keep(p: *S)
-
-    kept_by_c(tag: int)
-        var s = S((e) -> print(tag + e))
-        fbp_keep(&s)
 
     to_c(tag: int)
         var s = S((e) -> print(tag + e))
@@ -446,10 +439,9 @@ private const fbp_foreign: string = raw"""
     main()
         to_c(10)
         as_bytes(20)
-        kept_by_c(30)
     """
 
-@test("a closure whose holder's address goes to C stays in the frame, unless the extern says '@keeps'")
+@test("a closure whose holder's address goes to C stays in the frame")
 fbp_foreign_is_borrowed()
     if xvr_no_library() then return
 
@@ -457,6 +449,28 @@ fbp_foreign_is_borrowed()
 
     assert(ir.contains("define"), ir)
     assert_eq(fbp_frame_boxes(ir), 2)
+
+@test("and the holder's address handed to an extern that says '@keeps' is refused at the call")
+fbp_foreign_kept_is_refused()
+    if xvr_no_library() then return
+
+    val said = fbp_ir(raw"""
+        struct S
+            f: &Fn(int) -> unit
+
+        @keeps(p)
+        extern "fbp_c_keep" fbp_keep(p: *S)
+
+        kept_by_c(tag: int)
+            var s = S((e) -> print(tag + e))
+            fbp_keep(&s)
+
+        main()
+            kept_by_c(30)
+        """)
+
+    assert(said.contains("'fbp_keep' keeps its parameter 'p' (its declaration says '@keeps(p)'), and '&s' is the " +
+                         "address of a local of 'kept_by_c'"), said)
 
 // -- what stays in the frame ----------------------------------------------------------------------
 

@@ -3,6 +3,7 @@ module sh.sysl.compiler
 
 import sysl.buf.{Buf, buf}
 import sysl.fs.{make_temp_dir, remove_dir_all, write_text}
+import sysl.text.replace_all
 
 // **A call through a trait object hands its receiver over as surely as an argument**, and answers
 // with it as readily: `reactive(() -> …).on_tap(f)` gives the object that holds the closure to a
@@ -65,10 +66,13 @@ private vob_boxed(text: string, want: string, notes: []const string)
 end vob_boxed
 
 // The views of syslUI's `button`: a closure built into a `Reactive`, erased to a `&View`, and handed
-// to `on_tap`, a default method that wraps `self` in a `Tappable` it hands back.
+// to `on_tap`, a default method that wraps `self` in a `Tappable` it hands back. Its answer is made of
+// `f` as well as the receiver, so the trait says `@answers(f)` (an unmarked answer is made of `self`
+// only).
 private const vob_views: string = raw"""
     trait View
         measure(&self) -> int
+        @answers(f)
         on_tap(&self, f: &Fn() -> unit) -> &View = Tappable(self, f)
 
     struct Reactive
@@ -99,12 +103,13 @@ vob_receiver_answered_is_returned()
 
             print(v.measure())
         """, "8\n",
-        ["main.sysl:21:14: a closure erased to '&Fn(int) -> int' is boxed on the heap, because it is returned from 'button' on line 21"])
+        ["main.sysl:22:14: a closure erased to '&Fn(int) -> int' is boxed on the heap, because it is returned from 'button' on line 22"])
 
 @test("one handed as an argument to a method that answers with it is boxed on the heap")
 vob_argument_answered_is_returned()
     vob_boxed(raw"""
         trait Wraps
+            @answers(f)
             wrap(&self, f: &Fn(int) -> int) -> &Holder
 
         struct Holder
@@ -123,14 +128,17 @@ vob_argument_answered_is_returned()
 
             print(make(w, 2).f(1))
         """, "3\n",
-        ["main.sysl:13:45: a closure erased to '&Fn(int) -> int' is boxed on the heap, because it is returned from 'make' on line 13"])
+        ["main.sysl:14:45: a closure erased to '&Fn(int) -> int' is boxed on the heap, because it is returned from 'make' on line 14"])
 
+// **A method that keeps the object a call went through says `@keeps(self)` in its trait**: the
+// object may be made in the caller's frame, and a call through an object sees no body.
 @test("one in an object a default method keeps through 'self' is boxed on the heap, and says so")
 vob_receiver_kept_in_module_storage()
     vob_boxed(raw"""
         trait View
             measure(&self) -> int
 
+            @keeps(self)
             register(&self) -> int
                 kept = Some(self)
                 0
@@ -155,7 +163,75 @@ vob_receiver_kept_in_module_storage()
                 Some(v) -> print(v.measure())
                 None -> print(0)
         """, "3\n",
-        ["main.sysl:19:14: a closure erased to '&Fn(int) -> int' is boxed on the heap, because it is handed to 'register' on line 19, which keeps its parameter 'self' (it is stored in 'kept')"])
+        ["main.sysl:20:14: a closure erased to '&Fn(int) -> int' is boxed on the heap, because it is handed to a call through '&View' on line 20, which keeps its parameter 'self' (its trait's 'register' declares '@keeps(self)')"])
+
+@test("without the trait's '@keeps(self)', a default method keeping the object is refused where it is written")
+vob_receiver_kept_unmarked_is_refused()
+    if !enm_ready() then return
+
+    val said = enm_err(raw"""
+        trait View
+            measure(&self) -> int
+
+            register(&self) -> int
+                kept = Some(self)
+                0
+
+        struct Reactive
+            body: &Fn(int) -> int
+
+        impl View for Reactive
+            measure(&self) -> int = self.body(1)
+
+        var kept: Option[&View] = None
+
+        setup(k: int)
+            val v: &View = Reactive((i) -> i + k)
+
+            v.register()
+
+        main()
+            setup(2)
+        """)
+
+    assert(said.contains("'register' keeps its parameter 'self' (it is stored in 'kept'), but a method of 'View' " +
+                         "borrows its parameters for the call"), said)
+    assert(said.contains("writing '@keeps(self)' above the declaration of 'register' in 'View'"), said)
+
+@test("an implementation keeping the object is refused too, and '@keeps(self)' lets it")
+vob_impl_receiver_kept()
+    if !enm_ready() then return
+
+    val text = raw"""
+        trait Sink
+            MARK
+            put(&self) -> int
+
+        struct Box
+            f: &Fn() -> int
+
+        impl Sink for Box
+            put(&self) -> int
+                held = Some(self)
+                self.f()
+
+        var held: Option[&Box] = None
+
+        setup(k: int) -> int
+            val s: &Sink = Box(() -> k + 3)
+
+            s.put()
+
+        main()
+            print(setup(2))
+            print(held.unwrap().f())
+        """
+
+    val said = enm_err(replace_all(text, "MARK", ""))
+
+    assert(said.contains("'put' keeps its parameter 'self' (it is stored in 'held'), but a method of 'Sink' " +
+                         "borrows its parameters for the call"), said)
+    assert_eq(enm_ran(replace_all(text, "MARK", "@keeps(self)")), "5\n5\n")
 
 @test("one whose object a method answers into an outer local, turn after turn, is boxed on the heap")
 vob_answer_kept_in_an_outer_local()
@@ -173,8 +249,8 @@ vob_answer_kept_in_an_outer_local()
         main()
             print(last())
         """, "21\n",
-        ["main.sysl:25:22: a closure erased to '&Fn(int) -> int' is boxed on the heap, because it is kept in 'v' on line 25, which outlives the turn of the 'for' body that builds it",
-         "main.sysl:25:43: a closure erased to '&Fn() -> unit' is boxed on the heap, because it is kept in 'v' on line 25, which outlives the turn of the 'for' body that builds it"])
+        ["main.sysl:26:22: a closure erased to '&Fn(int) -> int' is boxed on the heap, because it is kept in 'v' on line 26, which outlives the turn of the 'for' body that builds it",
+         "main.sysl:26:43: a closure erased to '&Fn() -> unit' is boxed on the heap, because it is kept in 'v' on line 26, which outlives the turn of the 'for' body that builds it"])
 
 @test("a call through an object whose bodies answer with neither leaves the closure's box in the frame")
 vob_unanswered_stays_in_the_frame()
@@ -192,6 +268,7 @@ vob_local_address_answered_is_refused()
 
     val said = enm_err(raw"""
         trait Picks
+            @answers(p)
             pick(&self, p: *int) -> *int
 
         struct First
@@ -212,3 +289,30 @@ vob_local_address_answered_is_refused()
         """)
 
     assert(said.contains("holds the address of a local of 'bad', whose storage ends when 'bad' returns"), said)
+
+// **An unmarked answer is made of the receiver only**, as Rust elides it: an implementation answering
+// what it is handed as another parameter, where its trait does not say `@answers` of it, is refused
+// where it is written.
+@test("without the trait's '@answers(p)', the implementation answering 'p' is refused where it is written")
+vob_unmarked_answer_is_refused()
+    if !enm_ready() then return
+
+    val said = enm_err(raw"""
+        trait Picks
+            pick(&self, p: *int) -> *int
+
+        struct First
+            n: int
+
+        impl Picks for First
+            pick(&self, p: *int) -> *int = p
+
+        main()
+            val o: &Picks = First(0)
+            var n = 1
+
+            print(*o.pick(&n))
+        """)
+
+    assert(said.contains("'pick' answers with what it is handed as 'p', but a method of 'Picks' answers storage " +
+                         "of its own unless its declaration says '@answers(p)'"), said)

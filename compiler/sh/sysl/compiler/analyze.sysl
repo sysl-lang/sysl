@@ -1187,6 +1187,12 @@ private check_keeps_names(a: &Analysis, scope: Scope, span: Span, d: ExternDecl)
     val k = d.keeps
 
     for i in 0..<k.len()
+        if k[i] == "self"
+            a.fault(scope, span, s"'@keeps' names 'self', and '${d.name}' is an 'extern', which takes no " +
+                    "receiver — '@keeps(self)' marks a trait's own method, whose object a call goes through")
+            continue
+        end if
+
         var declared = false
 
         for p in d.params
@@ -1218,7 +1224,8 @@ end check_keeps_names
 // **`@keeps` and `@answers` above a trait's method name its own parameters, each once**, and only a
 // method a call through an object can reach says them: one with a receiver. A misspelt name would
 // otherwise promise nothing, and every implementation keeping that parameter would be refused for a
-// mark its author believes is written. The receiver is the object itself and is never named.
+// mark its author believes is written. The receiver is named only by `@keeps(self)`: an answer may
+// always be made of it.
 private check_trait_marks(a: &Analysis, scope: Scope, d: TraitDecl)
     for m in d.methods
         if m.marks.keeps.is_empty() && m.marks.answers.is_empty() then continue
@@ -1242,7 +1249,9 @@ end check_trait_marks
 
 private check_member_names(a: &Analysis, scope: Scope, m: MethodDecl, which: string, k: Buf[string])
     for i in 0..<k.len()
-        var declared = false
+        // **`@keeps(self)` names the receiver**: the object a call went through, which an
+        // implementation may hold past the call only where the trait says so.
+        var declared = which == "keeps" && k[i] == "self"
 
         for p in m.params
             if p.name == k[i] then declared = true

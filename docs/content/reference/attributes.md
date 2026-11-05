@@ -631,9 +631,71 @@ leak(o: &Picker) -> *int
 the address of a local of 'leak'
 ```
 
-Both name the method's own parameters, each once, and only a method with a receiver takes them, since
-nothing else is called through an object. An implementation's method never carries them: its trait
-says them for every implementation at once.
+**An unmarked answer may be made of the receiver only**, as Rust elides a method's lifetime: a builder
+that hands back an object holding what it was handed says so once, in the trait, and every
+implementation and every call is held to it.
+
+```sysl
+trait View
+    @answers(f)
+    on_tap(&self, f: &Fn() -> unit) -> &View
+```
+
+Without the mark, an implementation answering `f` is refused where it is written:
+
+```sysl
+trait Picker
+    pick(self, p: *int) -> *int
+
+struct First
+    n: int
+
+impl Picker for First
+    pick(self, p: *int) -> *int = p
+```
+
+```error
+'pick' answers with what it is handed as 'p', but a method of 'Picker' answers storage of its own unless its declaration says '@answers(p)'
+```
+
+**`@keeps(self)` lets an implementation hold the object the call went through** past the call — a
+view registering itself, say. The object may have been made in the caller's frame, so without the
+mark an implementation that keeps `self` is refused where it is written, and with it every call
+through an object hands over an object that may be kept:
+
+```sysl
+trait Widget
+    @keeps(self)
+    register(&self) -> int
+
+struct Label
+    f: &Fn() -> int
+
+impl Widget for Label
+    register(&self) -> int
+        shown = Some(self)
+        self.f()
+
+var shown: Option[&Label] = None
+
+setup(k: int) -> int
+    val w: &Widget = Label(() -> k + 1)
+
+    w.register()
+
+main()
+    print(setup(1))
+    print(shown.unwrap().f())
+```
+
+```output
+2
+2
+```
+
+Both name the method's own parameters, each once — `@keeps` the receiver too, as `self` — and only a
+method with a receiver takes them, since nothing else is called through an object. An
+implementation's method never carries them: its trait says them for every implementation at once.
 
 ```sysl
 trait Sink

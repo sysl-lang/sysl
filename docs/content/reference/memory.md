@@ -5538,15 +5538,16 @@ C programs already live by — **a pointer handed to a call is borrowed for the 
 | what is called | what it keeps |
 |---|---|
 | a sysl function | what its body keeps |
-| a method through a trait object | what the trait's declaration of the method says: nothing, unless it says [`@keeps(p)`](/reference/attributes/#keeps-and-answers-on-a-trait-method). An implementation reached through an object that keeps a parameter the declaration does not name — a pointer, an object, a callback, or what it reads through a pointer — is refused where it is written |
+| a method through a trait object | what the trait's declaration of the method says: nothing, unless it says [`@keeps(p)`](/reference/attributes/#keeps-and-answers-on-a-trait-method), or `@keeps(self)` for the object itself; an `async` method's task holds every argument until it is awaited. An implementation reached through an object that keeps a parameter or its receiver the declaration does not name — a pointer, an object, a callback, or what it reads through a pointer — is refused where it is written |
 | a closure | nothing — a closure that keeps what it is handed is refused where it is written; the variables it captures are judged at the closure literal, where its body is in hand. A parameter its type marks [`@keeps`](#a-callable-that-keeps-what-it-is-handed) is kept, as an `extern`'s is |
 | a function through a pointer | nothing — a function whose address is taken and keeps a parameter, or lets out what it reads through one, is refused where it is written |
 | an `extern` | nothing, and nothing it reads through a pointer, unless its declaration says [`@keeps(p)`](/reference/ffi/#keeps-a-c-function-that-holds-on-to-a-pointer). The declaration is trusted: a C function that holds a pointer past the call without saying so is a wrong declaration |
 
 No table of the program's bodies is consulted for any of these: which body a call through an object or
 a pointer lands in is decided when the program runs, so the signature is the whole answer, and every
-body is held to it where it is written. The answer of a call through an object is storage of the
-implementation's own unless the declaration says `@answers(p)`.
+body is held to it where it is written. The answer of a call through an object may be made of the
+receiver, and of nothing else it was handed unless the declaration says `@answers(p)` — Rust's
+elision rule for a method.
 
 A closure is judged where it is written, capture by capture, by what its body lets out of each — and
 again at every call it is handed to — so it makes no difference whether a call runs it, it is boxed

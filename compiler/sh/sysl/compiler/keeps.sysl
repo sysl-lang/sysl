@@ -1114,52 +1114,67 @@ private slot_method_in(a: &Analysis, b: Bound, self_ty: Type, slot: int) -> Opti
     if slot >= 0 && usize(slot) < members.len() then Some(members[usize(slot)].1) else None
 end slot_method_in
 
+// **Whether the trait method `m` declares its argument at `k` (the receiver first) `@keeps`**, and by
+// what name: `self` for the object the call went through, whose `@keeps(self)` lets an implementation
+// hold it past the call.
+private marked_kept(m: MethodDecl, k: usize) -> Option[string]
+    if k == 0 then return if holds_string(m.marks.keeps, "self") then Some("self") else None
+    if k - 1 < m.params.len() && holds_string(m.marks.keeps, m.params[k - 1].name)
+        return Some(m.params[k - 1].name)
+
+    None
+end marked_kept
+
 // Whether the method in slot `slot` of a table of the trait `trait_name` declares its parameter at `k`
 // (the receiver first) `@keeps`.
-table_declares_kept(a: &Analysis, vt: TVtable, slot: int, k: usize) -> bool
-    if k == 0 then return false
-
+table_declares_kept(a: &Analysis, vt: TVtable, slot: int, k: usize) -> bool =
     slot_method_in(a, plain_bound(vt.trait_name, buf()), vt.for_type, slot) match
-        Some(m) -> k - 1 < m.params.len() && holds_string(m.marks.keeps, m.params[k - 1].name)
+        Some(m) -> marked_kept(m, k).is_some()
         None -> false
-end table_declares_kept
 
 // Whether the trait method a call through an object of type `ty` at `slot` stands for declares its
 // argument at `k` (the receiver first) `@keeps` -- which is what the view analysis
 // (`escape.sysl`) asks before letting a frame's view through the call.
-object_declares_kept(a: &Analysis, ty: Type, slot: int, k: usize) -> bool
-    if k == 0 then return false
-
-    slot_method_of(a, ty, slot) match
-        Some(m) -> k - 1 < m.params.len() && holds_string(m.marks.keeps, m.params[k - 1].name)
-        None -> false
-end object_declares_kept
+object_declares_kept(a: &Analysis, ty: Type, slot: int, k: usize) -> bool = slot_method_of(a, ty, slot) match
+    Some(m) -> marked_kept(m, k).is_some()
+    None -> false
 
 // The name of the parameter at `k` (the receiver first) that the method a call through an object
 // stands for declares `@keeps` -- or nothing, where it borrows it.
-private slot_kept_name(cx: &KeepsCx, recv: TExpr, slot: int, k: usize) -> Option[string]
-    if k == 0 then return None
+private slot_kept_name(cx: &KeepsCx, recv: TExpr, slot: int, k: usize) -> Option[string] =
+    slot_method(cx, recv, slot) match
+        Some(m) -> marked_kept(m, k)
+        None -> None
+
+// The name the trait's declaration gives the argument at `k` of a call through an object (the
+// receiver first, `self`).
+private slot_param_name(cx: &KeepsCx, recv: TExpr, slot: int, k: usize) -> Option[string]
+    if k == 0 then return Some("self")
 
     slot_method(cx, recv, slot) match
-        Some(m) ->
-            if k - 1 < m.params.len() && holds_string(m.marks.keeps, m.params[k - 1].name)
-                return Some(m.params[k - 1].name)
-        None -> ()
-
-    None
-end slot_kept_name
+        Some(m) -> if k - 1 < m.params.len() then Some(m.params[k - 1].name) else None
+        None -> None
+end slot_param_name
 
 // What a call through an object of a trait keeps at `k`, or lets out of what it reads through it at
-// any depth: anywhere, where the declaration says `@keeps`, and nothing otherwise.
+// any depth: anywhere, where the declaration says `@keeps`, and nothing otherwise. **An `async`
+// declaration says more**: the call answers a task that holds every argument until it is awaited, as
+// a direct call of an `async` function does (`task_held`), whatever the implementation's body does.
 private declared_kept(cx: &KeepsCx, recv: TExpr, slot: int, k: usize) -> Buf[(string, KeptAt)]
     var out: Buf[(string, KeptAt)] = buf()
+    val method = slot_method(cx, recv, slot)
 
     slot_kept_name(cx, recv, slot, k) match
         Some(p) ->
-            val m = slot_method(cx, recv, slot).unwrap().name
+            val m = method.unwrap().name
 
             out.push((object_callee(recv), KeptAt("", s"its trait's '$m' declares '@keeps($p)'", span_zero(), 0)))
         None -> ()
+
+    if method.is_some() && method.unwrap().marks.is_async()
+        out.push((method.unwrap().name, KeptAt("j", "the task it answers holds it until that task is awaited",
+                                               span_zero(), 0)))
+    end if
 
     out
 end declared_kept
@@ -1283,10 +1298,12 @@ end closure_licensed
 // **Whether a call through an object may answer with what it is handed at `k`** (the receiver first):
 // where the trait's declaration of the method says `@answers` of it (`declared_answers`), and for a
 // closure's object, wherever a closure made at its type does. A trait the receiver's type does not
-// name is answered yes, since nothing can say otherwise.
+// name is answered yes, since nothing can say otherwise. An answer that can hold no pointer -- `measure`
+// answering an `int` -- is made of nothing it was handed, whatever the declaration says.
 vcall_answers(cx: &KeepsCx, recv: TExpr, slot: int, all: Buf[TExpr], k: usize, ty: Type) -> bool
     val tr = erased_trait(texpr_type(recv))
 
+    if !may_hold_pointer(cx, ty) then return false
     if tr.is_none() || slot < 0 then return true
     if object_marks_kept(recv, k) then return true
     if !through_closure(recv) then return declared_answers(cx, recv, slot, k)
@@ -1519,9 +1536,9 @@ end lent_by_rule
 
 // **Whether the trait method `f` implements declares its parameter `i` `@keeps`** (`keeping`) or
 // `@answers`: the declaration is what a call through an object is answered by (`slot_method`), so it
-// is what the implementation is held to. The receiver is never named.
+// is what the implementation is held to. The receiver is named only by `@keeps(self)`.
 private trait_declares(cx: &KeepsCx, f: TFunc, i: usize, keeping: bool) -> bool
-    if i == 0 || i >= f.params.len() then return false
+    if i >= f.params.len() || (i == 0 && !keeping) then return false
 
     val tr = trait_of(cx, f.name)
 
@@ -1533,10 +1550,11 @@ private trait_declares(cx: &KeepsCx, f: TFunc, i: usize, keeping: bool) -> bool
 
             for m in d.methods
                 if m.name != mname || m.recv_mode().is_none() then continue
+                if keeping then return marked_kept(m, i).is_some()
                 if i - 1 >= m.params.len() then return false
 
                 // By position: an implementation may name its parameters as it likes.
-                return holds_string(if keeping then m.marks.keeps else m.marks.answers, m.params[i - 1].name)
+                return holds_string(m.marks.answers, m.params[i - 1].name)
             end for
         None -> ()
 
@@ -1850,7 +1868,7 @@ private walk_track(t: &Track, i: usize) -> KeptWhy
 
     flow_body(w, f.body)
 
-    val pending = if t.steps > 0 then read_back_locs(t, w.out_pending) else w.out_pending
+    val pending = if t.steps > 0 || t.deep then read_back_locs(t, w.out_pending) else w.out_pending
     var first: Option[KeptAt] = None
 
     for item in pending
@@ -1865,7 +1883,9 @@ end walk_track
 // of what is read some steps in: `val vm = s.vm` then `vm.con = old` is held at `d:@vm.con`, the local's
 // own name, which the caller cannot say -- so it is said as the pointer it was read from
 // (`d:p0:.vm>{*VM}.con`), which the caller can tell is reached through what it handed over
-// (`frame_read_locs`).
+// (`frame_read_locs`). The walk of what is read at any depth (`walk_deep`) says it the same way: a
+// frame whose storage the call itself may make into a cycle -- a callee that puts back what it read
+// -- asks that walk, and must still see the put-back.
 private read_back_locs(t: &Track, locs: Buf[KeptAt]) -> Buf[KeptAt]
     var out: Buf[KeptAt] = buf()
 
@@ -1880,7 +1900,9 @@ private read_back_loc(t: &Track, loc: string, depth: int) -> string
 
     val n = local_of(loc[1..<loc.bytes.len])
 
-    if !bound_step(t, n) then return loc
+    // A walk of what is read at any depth counts no steps, so any local it names (`d:@n` names only one
+    // bound once and never written again) is said as the place it was read from.
+    if !t.deep && !bound_step(t, n) then return loc
 
     for item in t.decls
         if item.0 != n then continue
@@ -4350,6 +4372,8 @@ private call_at(ft: &FrameTrack, evs: &EvBuf, e: TExpr)
                         s"or hand it storage that lasts" else ""
                     val marked = object_marks_kept(recv, k)
                     val declared = if through_closure(recv) then None else slot_kept_name(ft.cx, recv, slot, k)
+                    val named = if through_closure(recv) then param_name(ft.cx, item.0, k)
+                    else slot_param_name(ft.cx, recv, slot, k).unwrap_or(param_name(ft.cx, item.0, k))
                     var said = if read && declared.is_some()
                         s"${item.0} may keep what it reads through its parameter '${declared.unwrap()}' " +
                             s"(${item.1.how}), and what is read through '${value_text(ft.scope, arg)}' holds ${h.3}"
@@ -4360,18 +4384,16 @@ private call_at(ft: &FrameTrack, evs: &EvBuf, e: TExpr)
                         s"${item.0} may keep what it reads through its parameter $k (${item.1.how}), " +
                             s"and what is read through '${value_text(ft.scope, arg)}' holds ${h.3}"
                     else if read
-                        read_said(ft, item.0, param_name(ft.cx, item.0, k), item.1.how, arg, h.3, false) + cure
+                        read_said(ft, item.0, named, item.1.how, arg, h.3, false) + cure
                     else if marked
                         s"${item.0} keeps its parameter $k (${item.1.how}), and " +
                             argument_said(ft, arg, core.unwrap())
                     else
-                        s"'${shown_name(ft.cx.an, item.0)}' keeps its parameter " +
-                            s"'${param_name(ft.cx, item.0, k)}' (${item.1.how}), and " +
+                        s"'${shown_name(ft.cx.an, item.0)}' keeps its parameter '$named' (${item.1.how}), and " +
                             argument_said(ft, arg, core.unwrap()) + cure
 
                     if ft.probe
-                        said = probe_kept(ft, core.unwrap(), arg, item.0,
-                                          declared.unwrap_or(param_name(ft.cx, item.0, k)), item.1.how, h.2)
+                        said = probe_kept(ft, core.unwrap(), arg, item.0, declared.unwrap_or(named), item.1.how, h.2)
                     end if
 
                     if loc == "" || loc.index_of("?").is_some()
@@ -4735,7 +4757,8 @@ private probe_text(ft: &FrameTrack, e: TExpr) -> string = *e.kind match
         var all = ""
 
         for k in 0..<handed.len()
-            val through = asks_through(ft.cx, texpr_type(handed[k])) && vcall_through_answers(ft.cx, recv, slot, k)
+            val through = may_hold_pointer(ft.cx, ty) && asks_through(ft.cx, texpr_type(handed[k])) &&
+                vcall_through_answers(ft.cx, recv, slot, k)
 
             if through || vcall_answers(ft.cx, recv, slot, handed, k, ty) then all = all + probe_text(ft, handed[k])
         end for
@@ -5912,8 +5935,10 @@ private refuse_promised(cx: &KeepsCx, faults: &KeepFaults, f: TFunc)
         // handing over a closure behind a `&Fn` is held to what this body keeps (`lent_by_rule`).
         if closure && (!raw || closure_licensed(cx, f.name, i)) then continue
 
-        // The receiver is the object a call went through, which is its own rather than lent.
-        if !declared && (raw || (reached && i > 0))
+        // **The receiver is held to the declaration too**: the object a call went through may be made in
+        // the caller's frame, so an implementation that keeps it past the call needs the trait's
+        // `@keeps(self)`, which every call through an object then answers to.
+        if !declared && (raw || reached)
             val w = walk_kept(cx, f, i)
 
             if w.kept
@@ -5944,9 +5969,11 @@ end refuse_promised
 // **The way a trait's implementation may keep what it is handed**: the trait's own declaration of the
 // method says so, with `@keeps` naming the parameter.
 private keeps_hint(cx: &KeepsCx, f: TFunc, i: usize, trait_name: Option[string]) -> string
-    if trait_name.is_none() || i == 0 then return ""
+    if trait_name.is_none() then return ""
 
-    s", or let every implementation keep it by writing '@keeps(${f.params[i].0})' above the declaration " +
+    val pname = if i == 0 then "self" else f.params[i].0
+
+    s", or let every implementation keep it by writing '@keeps($pname)' above the declaration " +
         s"of '${shown_name(cx.an, f.name)}' in '${qualified_name(trait_name.unwrap())}'"
 end keeps_hint
 
