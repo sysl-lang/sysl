@@ -1,0 +1,247 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.text.Search
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// **Two blocks over one generic type may name their parameters alike and bound them differently.**
+// `impl[T: Seq] Seq for Wrap[T]` and `impl[T: Seq[Item = int]] Dbl for Wrap[T]` are two `T`s, and
+// each body sees the promises its own block made. A stand-in's instantiations are filed under its
+// name and everything its bounds promise -- what they fix (`Item = int`) and what they ask of an
+// associated type (`Item: Mul`) as well as the traits -- so the second block's `Wrap[T]` is not the
+// first one's, whose field is a `T` that promises nothing about its `Item`.
+
+private snb_ready() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+
+    true
+end snb_ready
+
+// What a program prints, or what stopped it.
+private snb_ran(text: string) -> string
+    val root = make_temp_dir("sysl-snb").unwrap()
+
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end snb_ran
+
+// A trait with an associated type, and one type implementing it at `int`.
+private snb_seq() -> string =
+    "trait Seq\n" +
+    "    type Item\n" +
+    "    head(self) -> Self::Item\n\n" +
+    "trait Dbl\n" +
+    "    doubled(self) -> int\n\n" +
+    "struct Box\n" +
+    "    v: int\n\n" +
+    "impl Seq for Box\n" +
+    "    type Item = int\n" +
+    "    head(self) -> Self::Item = self.v\n\n" +
+    "struct Wrap[T]\n" +
+    "    inner: T\n\n"
+
+private snb_seq_for_wrap() -> string =
+    "impl[T: Seq] Seq for Wrap[T]\n" +
+    "    type Item = T::Item\n" +
+    "    head(self) -> Self::Item = self.inner.head()\n\n"
+
+private snb_dbl_for_wrap() -> string =
+    "impl[T: Seq[Item = int]] Dbl for Wrap[T]\n" +
+    "    doubled(self) -> int = self.inner.head() * 2\n\n"
+
+// -- the reproducer ---------------------------------------------------------------------------------
+
+@test("a second trait block's T keeps the associated type its bound fixes")
+snb_trait_then_trait()
+    if !snb_ready() then return
+
+    assert_eq(snb_ran(snb_seq() + snb_seq_for_wrap() + snb_dbl_for_wrap() +
+                      "print(Wrap(Box(3)).doubled())\n"), "6\n")
+end snb_trait_then_trait
+
+@test("and with the blocks in the other order")
+snb_trait_then_trait_reversed()
+    if !snb_ready() then return
+
+    assert_eq(snb_ran(snb_seq() + snb_dbl_for_wrap() + snb_seq_for_wrap() +
+                      "print(Wrap(Box(3)).doubled())\n" +
+                      "print(Wrap(Box(4)).head())\n"), "6\n4\n")
+end snb_trait_then_trait_reversed
+
+@test("a block with the weaker bound is not lent the stronger block's promise")
+snb_weaker_not_lent()
+    if !snb_ready() then return
+
+    // The first block's `T` fixes `Item = int`; the second's does not, so `* 2` there has nothing
+    // saying the item multiplies. Filed under one key, the second body was read with the first's
+    // `T` and accepted.
+    val out = snb_ran(snb_seq() + snb_dbl_for_wrap() +
+                      "impl[T: Seq] Wrap[T]\n" +
+                      "    bad(self) -> int = self.inner.head() * 2\n\n" +
+                      "print(Wrap(Box(3)).doubled())\n")
+
+    assert(out.contains("'*' needs 'T::Item: Mul'"), out)
+end snb_weaker_not_lent
+
+// -- what else a bound promises ---------------------------------------------------------------------
+
+@test("a bound asking something of an associated type is kept too")
+snb_assoc_asked()
+    if !snb_ready() then return
+
+    assert_eq(snb_ran(snb_seq() + snb_seq_for_wrap() +
+                      "trait Sq\n" +
+                      "    type Out\n" +
+                      "    sq(self) -> Self::Out\n\n" +
+                      "impl[T: Seq[Item: Mul]] Sq for Wrap[T]\n" +
+                      "    type Out = T::Item\n" +
+                      "    sq(self) -> T::Item = self.inner.head() * self.inner.head()\n\n" +
+                      "print(Wrap(Box(3)).sq())\n"), "9\n")
+end snb_assoc_asked
+
+@test("a fixed associated type is still held to at the call")
+snb_fixed_held_at_call()
+    if !snb_ready() then return
+
+    val out = snb_ran(snb_seq() + snb_seq_for_wrap() + snb_dbl_for_wrap() +
+                      "struct Flag\n" +
+                      "    on: bool\n\n" +
+                      "impl Seq for Flag\n" +
+                      "    type Item = bool\n" +
+                      "    head(self) -> Self::Item = self.on\n\n" +
+                      "print(Wrap(Flag(true)).head())\n" +
+                      "print(Wrap(Flag(true)).doubled())\n")
+
+    assert(out.contains("'doubled' is a member the 'impl' of 'Dbl' gives 'Wrap[Flag]' only where its " +
+                        "condition holds, and it asks 'Seq[Item = int]' of Flag"), out)
+    assert(!out.contains("T::Item: Mul"), out)
+end snb_fixed_held_at_call
+
+// -- where else the same name meets different bounds ------------------------------------------------
+
+@test("two inherent blocks")
+snb_inherent_pair()
+    if !snb_ready() then return
+
+    assert_eq(snb_ran(snb_seq() +
+                      "impl[T: Seq] Wrap[T]\n" +
+                      "    first(self) -> T::Item = self.inner.head()\n\n" +
+                      "impl[T: Seq[Item = int]] Wrap[T]\n" +
+                      "    twice(self) -> int = self.inner.head() * 2\n\n" +
+                      "print(Wrap(Box(3)).twice())\n" +
+                      "print(Wrap(Box(5)).first())\n"), "6\n5\n")
+end snb_inherent_pair
+
+@test("a trait block beside an inherent block")
+snb_trait_and_inherent()
+    if !snb_ready() then return
+
+    assert_eq(snb_ran(snb_seq() +
+                      "impl[T: Seq[Item = int]] Wrap[T]\n" +
+                      "    twice(self) -> int = self.inner.head() * 2\n\n" +
+                      snb_seq_for_wrap() +
+                      "print(Wrap(Box(3)).twice())\n"), "6\n")
+end snb_trait_and_inherent
+
+@test("a generic function beside a block")
+snb_function_and_block()
+    if !snb_ready() then return
+
+    assert_eq(snb_ran(snb_seq() + snb_seq_for_wrap() +
+                      "doubled[T: Seq[Item = int]](w: Wrap[T]) -> int = w.inner.head() * 2\n\n" +
+                      "print(doubled(Wrap(Box(3))))\n"), "6\n")
+end snb_function_and_block
+
+@test("an enum's blocks")
+snb_enum_blocks()
+    if !snb_ready() then return
+
+    assert_eq(snb_ran(snb_seq() +
+                      "enum Maybe[T]\n" +
+                      "    Yes(v: T)\n" +
+                      "    No\n\n" +
+                      "impl[T: Seq] Seq for Maybe[T]\n" +
+                      "    type Item = T::Item\n" +
+                      "    head(self) -> Self::Item = self match\n" +
+                      "        Yes(x) -> x.head()\n" +
+                      "        No -> panic(\"none\")\n\n" +
+                      "impl[T: Seq[Item = int]] Dbl for Maybe[T]\n" +
+                      "    doubled(self) -> int = self match\n" +
+                      "        Yes(x) -> x.head() * 2\n" +
+                      "        No -> 0\n\n" +
+                      "print(Maybe.Yes(Box(3)).doubled())\n"), "6\n")
+end snb_enum_blocks
+
+@test("different bounds with no associated type")
+snb_plain_bounds()
+    if !snb_ready() then return
+
+    assert_eq(snb_ran("struct Wrap[T]\n" +
+                      "    inner: T\n\n" +
+                      "trait Same\n" +
+                      "    same(self, o: Self) -> bool\n\n" +
+                      "impl[T: Eq] Same for Wrap[T]\n" +
+                      "    same(self, o: Self) -> bool = self.inner == o.inner\n\n" +
+                      "impl[T: Add] Wrap[T]\n" +
+                      "    plus(self) -> T = self.inner + self.inner\n\n" +
+                      "print(Wrap(3).same(Wrap(3)))\n" +
+                      "print(Wrap(3).plus())\n"), "true\n6\n")
+end snb_plain_bounds
+
+@test("the same name over two different types")
+snb_two_types()
+    if !snb_ready() then return
+
+    assert_eq(snb_ran(snb_seq() + snb_seq_for_wrap() +
+                      "struct Pair[T]\n" +
+                      "    a: T\n\n" +
+                      "impl[T: Seq[Item = int]] Dbl for Pair[T]\n" +
+                      "    doubled(self) -> int = self.a.head() * 2\n\n" +
+                      "print(Pair(Box(3)).doubled())\n" +
+                      "print(Wrap(Box(4)).head())\n"), "6\n4\n")
+end snb_two_types
+
+@test("a member may not take a parameter named like its block's")
+snb_member_own_param()
+    if !snb_ready() then return
+
+    val out = snb_ran(snb_seq() +
+                      "impl[T: Seq] Wrap[T]\n" +
+                      "    pick[T: Seq[Item = int]](self, x: T) -> int = x.head() * 2\n\n" +
+                      "print(Wrap(Box(3)).pick(Box(1)))\n")
+
+    assert(out.contains("'Wrap' already declares a type parameter 'T', so member 'pick' cannot " +
+                        "declare one of that name"), out)
+end snb_member_own_param
+
+@test("a member's own parameter beside a block over T")
+snb_member_other_param()
+    if !snb_ready() then return
+
+    assert_eq(snb_ran(snb_seq() + snb_seq_for_wrap() +
+                      "impl[T: Seq] Wrap[T]\n" +
+                      "    pick[U: Seq[Item = int]](self, x: Wrap[U]) -> int = x.inner.head() * 2\n\n" +
+                      "print(Wrap(Box(3)).pick(Wrap(Box(5))))\n"), "10\n")
+end snb_member_other_param
