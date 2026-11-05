@@ -1120,9 +1120,38 @@ temporary.
 
 **Leap seconds are skipped**, because POSIX time ignores them by definition and `Instant` counts the
 same way — a table of them describes a timeline this library does not have. The version 2 block is
-the one read, its transition times being 8 bytes where version 1's run out in 2038. The footer's
-`TZ` string, which extrapolates past the last transition, is not read: a lookup past the end answers
-with the last type, which is what the table says.
+the one read, its transition times being 8 bytes where version 1's run out in 2038.
+
+**Past the last transition, the footer's rule answers.** A version 2+ file ends with a POSIX `TZ`
+string — `EST5EDT,M3.2.0,M11.1.0` for Toronto — and every instant at or after the table's end, or
+anywhere in a file with no transitions, is read from it, as RFC 8536 says. That is most of the future:
+since tzdata 2020b the database is built "slim" by default, so the table stops at the last change of
+*rules* and every later daylight-saving switch is the footer's, and a "fat" file's table still runs
+out in 2037.
+
+```sysl
+import sysl.posix.time.zone_data
+import sysl.time.tzif.{parse, offset_at, abbrev_at}
+import sysl.time.Instant
+
+val bytes = zone_data("America/Toronto").unwrap()
+val toronto = parse(bytes[..]).unwrap()
+
+// 2040-07-01T12:00Z and 2040-01-15T12:00Z: past every transition either kind of file lists.
+for t in [Instant(2224756800000000), Instant(2210241600000000)]
+    print(offset_at(toronto, t).unwrap(), abbrev_at(toronto, t).unwrap())
+```
+
+```output
+-04:00 EDT
+-05:00 EST
+```
+
+The rule's whole grammar is read — quoted names such as `<+0530>`, offsets to the second, dates as
+`Mm.w.d`, `Jn` or `n`, and RFC 8536's rule times below zero or past 24 hours — and **a footer that is
+not one is refused** by `parse` as `BadFooter`, carrying the byte of the rule where it stopped
+fitting, rather than read as far as it makes sense. An empty footer, or a version 1 file, answers
+past its end with the last type, which is all it says.
 
 **A time before the first transition takes the first type that is not daylight saving**, which is
 RFC 8536's rule and is not the same as "the first type" — a file whose type 0 is the daylight one
