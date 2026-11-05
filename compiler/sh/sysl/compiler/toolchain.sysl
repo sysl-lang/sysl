@@ -1243,6 +1243,127 @@ build_native(cc: string, ir: string, objects: Buf[string], exe: string, target: 
     said
 end build_native
 
+// The dotted number that follows `marker` in `said`: `23.1.5` out of `clang version 23.1.5` and out
+// of `LLD 23.1.3 (compatible with GNU linkers)`, whatever vendor word comes before the marker and
+// whatever suffix (`-1ubuntu1`, `git`) follows the digits. Nothing where no number follows it.
+version_after(said: string, marker: string) -> Option[string]
+    val bytes = said.bytes
+    var at: usize = 0
+
+    while at + marker.bytes.len <= bytes.len
+        if said[at..<at + marker.bytes.len] == marker
+            val start = at + marker.bytes.len
+            var i = start
+
+            while i < bytes.len && ((bytes[i] >= u8('0') && bytes[i] <= u8('9')) || bytes[i] == u8('.'))
+                i += 1
+
+            while i > start && bytes[i - 1] == u8('.')
+                i -= 1
+
+            if i == start || bytes[start] == u8('.') then return None
+
+            return Some(said[start..<i])
+
+        at += 1
+
+    None
+end version_after
+
+// Whether two dotted versions name the same LLVM: their shared components agree. `23.1` and `23.1.5`
+// are the same release line, `23.1.3` and `23.1.5` are not.
+same_llvm(a: string, b: string) -> bool
+    val x = split(a, ".")
+    val y = split(b, ".")
+    val n = if x.len < y.len then x.len else y.len
+
+    for i in 0..<n
+        if x[i] != y[i] then return false
+
+    true
+end same_llvm
+
+// The sentence saying lld runs against an LLVM it was not built with, or nothing where the versions
+// agree or one of them cannot be read. `lld_said` is `ld.lld --version`, `clang_said` is
+// `clang --version`, and `config_said` is `llvm-config --version` where there is one: that is the
+// LLVM library lld loads, and it wins over clang's line. An Apple clang's number is Apple's own and
+// says nothing about the library, so with no `llvm-config` it is not compared.
+lld_mismatch(lld_said: string, clang_said: string, config_said: Option[string]) -> Option[string]
+    val lld = version_after(lld_said, "LLD ") match
+        None -> return None
+        Some(v) -> v
+
+    val llvm = config_said match
+        Some(text) -> version_after(s"v${text.trim()}", "v")
+        None -> if clang_said.contains("Apple clang") then None else version_after(clang_said, "clang version ")
+
+    val have = llvm match
+        None -> return None
+        Some(v) -> v
+
+    if same_llvm(lld, have) then return None
+
+    Some(s"lld $lld is running against LLVM $have — they must match; on Homebrew, 'brew upgrade lld' " +
+         "(or 'brew upgrade llvm' if lld is the newer)")
+end lld_mismatch
+
+private var mismatch_answers: Buf[(string, Option[string])] = buf()
+
+// What `ld.lld`, `llvm-config` and `cc` say about their versions, compared, asked once per `cc`.
+// The tools are looked for beside `cc` first, then by name, then where Homebrew keeps them.
+private linker_mismatch(cc: string) -> Option[string]
+    for row in mismatch_answers
+        if row.0 == cc then return row.1
+
+    val beside = parent_of(cc)
+
+    val answer = lld_mismatch(tool_says(beside, "ld.lld", "/opt/homebrew/bin/ld.lld"),
+                              clang_version_line(cc),
+                              tool_says_opt(beside, "llvm-config", "/opt/homebrew/opt/llvm/bin/llvm-config"))
+
+    mismatch_answers.push((cc, answer))
+    answer
+end linker_mismatch
+
+private tool_says_opt(beside: Option[string], name: string, fallback: string) -> Option[string]
+    var tried: Buf[string] = buf()
+
+    beside match
+        Some(dir) -> tried.push(join_path(dir, name))
+        None -> ()
+
+    tried.push(name)
+    tried.push(fallback)
+
+    for program in tried
+        capture(program, ["--version"], "", [], true) match
+            Ok(out) -> if out.status.ok() then return Some(first_line(out.text))
+            Err(_) -> ()
+
+    None
+
+private tool_says(beside: Option[string], name: string, fallback: string) -> string =
+    tool_says_opt(beside, name, fallback).unwrap_or("")
+
+// How a failed link reads: the tool's own report, and after it -- where the linker was killed by a
+// signal or the link was an LTO link, the two shapes a lld running on a libLLVM of another patch
+// version takes -- the sentence naming the mismatch if there is one.
+link_failure(cc: string, command: Buf[string], f: ToolFault) -> string
+    if f.unrun then return f.said
+
+    val base = tool_failed(command[0], f.code, f.said)
+    var lto = false
+
+    for item in command
+        if item.starts_with("-flto") then lto = true
+
+    if f.code <= 128 && !lto then return base
+
+    linker_mismatch(cc) match
+        Some(why) -> s"$base\n$why"
+        None -> base
+end link_failure
+
 // The link command run over `first` (the text, or the first unit's object) and `objects`.
 private link_objects(cc: string, first: string, objects: Buf[string], exe: string, target: Target,
                      level: string, links: Buf[string], probed: PkgAnswer) -> Result[unit, string]
@@ -1260,13 +1381,16 @@ private link_objects(cc: string, first: string, objects: Buf[string], exe: strin
     // **Every file the link loads is an input of the program** (`linked_inputs`): ld64, GNU ld and lld
     // each list them under `-t`. A Windows or WebAssembly link names its inputs no such way and is
     // never replayed by the run cache, which runs only what this machine can.
-    if target.os != MacOS && target.os != Linux then return as_tool(told(command[0], args), command[0])
+    if target.os != MacOS && target.os != Linux
+        return told(command[0], args) match
+            Ok(_) -> Ok(())
+            Err(f) -> Err(link_failure(cc, command, f))
 
     args.push("-Wl,-t")
 
     val said = told_saying(command[0], args) match
         Ok(text) -> text
-        Err(f) -> return as_tool(Err(f), command[0])
+        Err(f) -> return Err(link_failure(cc, command, f))
 
     var made: Buf[string] = buf()
 

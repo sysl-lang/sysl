@@ -1,0 +1,99 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_temp_dir, write_text}
+import sysl.process.capture
+import sysl.text.Search
+
+// A linker running on a libLLVM of another patch version crashed every LTO link with a bare signal.
+// The versions are compared where a link fails that way, and the failure names both.
+
+private const LlmLld: string = "LLD 23.1.3 (compatible with GNU linkers)"
+private const LlmClang: string = "clang version 23.1.5\nTarget: arm64-apple-darwin"
+
+@test("a version is read after its marker, whatever vendor word or suffix surrounds it")
+llm_version_after()
+    assert_eq(version_after(LlmLld, "LLD "), Some("23.1.3"))
+    assert_eq(version_after("Homebrew LLD 23.1.3\n", "LLD "), Some("23.1.3"))
+    assert_eq(version_after("Debian LLD 14.0.6 (compatible with GNU linkers)", "LLD "), Some("14.0.6"))
+    assert_eq(version_after("Ubuntu clang version 14.0.0-1ubuntu1", "clang version "), Some("14.0.0"))
+    assert_eq(version_after("LLD 23.1.3git", "LLD "), Some("23.1.3"))
+    assert_eq(version_after("LLD x", "LLD "), None)
+    assert_eq(version_after("", "LLD "), None)
+
+@test("matching versions are no mismatch")
+llm_matching()
+    assert(lld_mismatch(LlmLld, "clang version 23.1.3\n", None).is_none(), "clang agrees")
+    assert(lld_mismatch(LlmLld, LlmClang, Some("23.1.3\n")).is_none(), "llvm-config agrees")
+    assert(lld_mismatch("LLD 23.1.3", "clang version 23.1\n", None).is_none(), "a shorter number agrees")
+
+@test("a patch mismatch names both versions and the fix")
+llm_patch_mismatch()
+    assert_eq(lld_mismatch(LlmLld, LlmClang, None).unwrap(),
+              "lld 23.1.3 is running against LLVM 23.1.5 — they must match; on Homebrew, 'brew upgrade lld' " +
+              "(or 'brew upgrade llvm' if lld is the newer)")
+
+@test("a major mismatch is one too")
+llm_major_mismatch()
+    val said = lld_mismatch("LLD 22.1.0", LlmClang, None).unwrap()
+
+    assert(said.starts_with("lld 22.1.0 is running against LLVM 23.1.5"), said)
+
+@test("Apple clang's number is Apple's own and is not compared")
+llm_apple_clang()
+    val apple = "Apple clang version 17.0.0 (clang-1700.0.13)\nTarget: arm64-apple-darwin"
+
+    assert(lld_mismatch(LlmLld, apple, None).is_none(), "17 is not LLVM 23")
+    assert(lld_mismatch(LlmLld, apple, Some("23.1.5")).is_some(), "but llvm-config is LLVM's own number")
+
+@test("a missing llvm-config falls back to clang's line, and nothing readable is no mismatch")
+llm_missing_config()
+    assert(lld_mismatch(LlmLld, LlmClang, None).is_some(), "clang's line is used")
+    assert(lld_mismatch(LlmLld, "gcc 13\n", None).is_none(), "not a clang")
+    assert(lld_mismatch("", LlmClang, Some("23.1.5")).is_none(), "no lld")
+    assert(lld_mismatch(LlmLld, LlmClang, Some("not a number")).is_none(), "an unreadable llvm-config")
+
+// A directory holding a clang that dies of a signal on any link, and an lld and llvm-config saying `lld`
+// and `config`. The clang exits with `code` instead of dying where `code` is not zero.
+private llm_toolbox(lld: string, config: string, code: int) -> string
+    val dir = make_temp_dir("sysl-llm").unwrap()
+    val die = if code == 0 then "kill -SEGV $$" else s"exit $code"
+
+    write_text(s"$dir/clang", "#!/bin/sh\n" +
+               "if [ \"$1\" = --version ]; then echo 'clang version " + config + "'; exit 0; fi\n" +
+               die + "\n").unwrap()
+    write_text(s"$dir/ld.lld", "#!/bin/sh\necho 'LLD " + lld + " (compatible with GNU linkers)'\n").unwrap()
+    write_text(s"$dir/llvm-config", "#!/bin/sh\necho " + config + "\n").unwrap()
+
+    for tool in ["clang", "ld.lld", "llvm-config"]
+        capture("chmod", ["+x", s"$dir/$tool"], "", [], true).unwrap()
+
+    dir
+end llm_toolbox
+
+private llm_link(dir: string) -> Result[unit, string]
+    build_native(s"$dir/clang", "", buf(), s"$dir/out", host_target(), DefaultOptimization, buf(),
+                 PkgAnswer(buf(), buf(), buf()))
+
+@test("a link the linker dies of a signal in reaches the version check")
+llm_signal_killed_link()
+    val said = llm_link(llm_toolbox("23.1.3", "23.1.5", 0)).unwrap_err()
+
+    assert(said.contains("failed (exit 139)"), said)
+    assert(said.contains("lld 23.1.3 is running against LLVM 23.1.5"), said)
+    assert(said.contains("brew upgrade lld"), said)
+
+@test("a signal-killed link with agreeing versions says nothing more than the tool did")
+llm_signal_killed_agreeing()
+    val said = llm_link(llm_toolbox("23.1.5", "23.1.5", 0)).unwrap_err()
+
+    assert(said.contains("failed (exit 139)"), said)
+    assert(!said.contains("running against"), said)
+
+@test("an ordinary failed link does not ask for versions")
+llm_ordinary_failure_not_asked()
+    val said = llm_link(llm_toolbox("23.1.3", "23.1.5", 1)).unwrap_err()
+
+    assert(said.contains("failed (exit 1)"), said)
+    assert(!said.contains("running against"), said)
