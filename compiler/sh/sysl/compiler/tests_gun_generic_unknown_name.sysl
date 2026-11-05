@@ -1,0 +1,461 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.text.Search
+
+// **An undefined name is told at a generic's definition whatever stands beside it.** A generic body
+// is read first with its type parameters opaque, and a pattern over a value of a parameter's type --
+// `v match { Some(m) -> … }` with `v: V` -- binds `m` at no type, since only an instantiation says
+// what `V` holds. Such a name is DEFERRED rather than refused: reading it gives nothing up, so
+// `m + nope` is told `nope` is undefined at the definition, as `val q = nope` is, and so is a
+// generic that is never called. What `m`'s type allows -- `m + 1`, `m.anything()` -- is each
+// instantiation's to judge, and a `?` that comes of a real refusal still keeps its statement quiet.
+
+// What the compiler says about a one-file program, as the command line prints it.
+private gun_err(text: string) -> string
+    val root = make_temp_dir("sysl-generic-unknown-name").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    val out = emit_llvm_text(src, None) match
+        Err(why) -> why.message
+        Ok(made) -> if made.report.is_empty() then "" else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end gun_err
+
+// How many complaints a report holds: each names its place once.
+private gun_complaints(said: string) -> int
+    var rest = said
+    var n = 0
+
+    loop
+        rest.index_of("main.sysl:") match
+            None -> break
+            Some(at) ->
+                n += 1
+                rest = rest[at + 10..<rest.bytes.len]
+
+    n
+end gun_complaints
+
+// The one complaint a program earns: the whole message, at `line:col`.
+private gun_only(said: string, message: string, at: string)
+    val head = s"error: $message\n --> "
+
+    said.index_of(head) match
+        None -> assert(false, said)
+        Some(i) ->
+            val rest = said[i + head.bytes.len..<said.bytes.len]
+            val place = rest.index_of("\n") match
+                Some(n) -> rest[0..<n]
+                None -> rest
+
+            assert(place.ends_with(s"main.sysl:$at"), said)
+
+    assert_eq(gun_complaints(said), 1, said)
+end gun_only
+
+private gun_nope(said: string, at: string) = gun_only(said, "undefined name 'nope'", at)
+
+// -- each place an undefined name can stand beside a deferred one --------------------------------
+
+@test("an undefined operand beside a deferred one is told at an uncalled generic's definition")
+gun_operand()
+    if !enm_ready() then return
+
+    gun_nope(gun_err(raw"""
+        opt[V](v: V) -> int
+            v match
+                Some(m) ->
+                    val q = m + nope
+                    q
+                None -> 0
+
+        main()
+            print(1)
+        """), "4:25")
+end gun_operand
+
+@test("an undefined argument after a deferred one is told")
+gun_argument()
+    if !enm_ready() then return
+
+    gun_nope(gun_err(raw"""
+        two[A, B](a: A, b: B) -> int = 2
+
+        opt[V](v: V) -> int
+            v match
+                Some(m) ->
+                    val q = two(m, nope)
+                    q
+                None -> 0
+
+        main()
+            print(1)
+        """), "6:28")
+end gun_argument
+
+@test("an undefined argument of a method called on a deferred name is told")
+gun_method_argument()
+    if !enm_ready() then return
+
+    gun_nope(gun_err(raw"""
+        opt[V](v: V) -> int
+            v match
+                Some(m) ->
+                    val q = m.method(1, nope)
+                    q
+                None -> 0
+
+        main()
+            print(1)
+        """), "4:33")
+end gun_method_argument
+
+@test("an undefined receiver of a field, as an argument beside a deferred one, is told")
+gun_field_receiver()
+    if !enm_ready() then return
+
+    gun_nope(gun_err(raw"""
+        two[A, B](a: A, b: B) -> int = 2
+
+        opt[V](v: V) -> int
+            v match
+                Some(m) ->
+                    val q = two(m, nope.field)
+                    q
+                None -> 0
+
+        main()
+            print(1)
+        """), "6:28")
+end gun_field_receiver
+
+@test("an undefined index into a deferred name, and an undefined bound of a slice of one, are told")
+gun_index()
+    if !enm_ready() then return
+
+    gun_nope(gun_err(raw"""
+        opt[V](v: V) -> int
+            v match
+                Some(m) ->
+                    val q = m[nope]
+                    q
+                None -> 0
+
+        main()
+            print(1)
+        """), "4:23")
+
+    gun_nope(gun_err(raw"""
+        opt[V](v: V) -> int
+            v match
+                Some(m) ->
+                    val q = m[1..<nope]
+                    q.len
+                None -> 0
+
+        main()
+            print(1)
+        """), "4:27")
+end gun_index
+
+@test("an undefined name compared with a deferred one in an 'if' is told")
+gun_condition()
+    if !enm_ready() then return
+
+    gun_nope(gun_err(raw"""
+        opt[V](v: V) -> int
+            v match
+                Some(m) ->
+                    if m == nope then return 1
+                    0
+                None -> 0
+
+        main()
+            print(1)
+        """), "4:21")
+end gun_condition
+
+@test("a closure capturing a deferred name is told of an undefined one in its body")
+gun_closure()
+    if !enm_ready() then return
+
+    gun_nope(gun_err(raw"""
+        two[A, B](a: A, b: B) -> int = 2
+
+        opt[V](v: V) -> int
+            v match
+                Some(m) ->
+                    val g = () -> two(m, nope)
+                    g()
+                None -> 0
+
+        main()
+            print(1)
+        """), "6:34")
+end gun_closure
+
+@test("a generic call nested in a generic call over a deferred name does not hide an undefined one")
+gun_nested_call()
+    if !enm_ready() then return
+
+    gun_nope(gun_err(raw"""
+        two[A, B](a: A, b: B) -> int = 2
+
+        opt[V](v: V) -> int
+            v match
+                Some(m) ->
+                    val q = two(two(m, 1), nope)
+                    q
+                None -> 0
+
+        main()
+            print(1)
+        """), "6:36")
+end gun_nested_call
+
+@test("an 'is' test over a type parameter's value defers its name for the block it guards")
+gun_is_block()
+    if !enm_ready() then return
+
+    gun_nope(gun_err(raw"""
+        opt[V](v: V) -> int
+            if v is Some(m)
+                val q = m + nope
+                return q
+            0
+
+        main()
+            print(1)
+        """), "3:21")
+end gun_is_block
+
+@test("an expression arm and a guard over a deferred name are told of an undefined one")
+gun_expression_arm()
+    if !enm_ready() then return
+
+    gun_nope(gun_err(raw"""
+        opt[V](v: V) -> int
+            v match
+                Some(m) -> m + nope
+                None -> 0
+
+        main()
+            print(1)
+        """), "3:24")
+
+    gun_nope(gun_err(raw"""
+        opt[V](v: V) -> int
+            v match
+                Some(m) if m == nope -> 1
+                _ -> 0
+
+        main()
+            print(1)
+        """), "3:25")
+end gun_expression_arm
+
+// -- a deferred name passes its deferral on --------------------------------------------------------
+
+@test("a name bound from a deferred one is deferred too, by 'val', by a pattern, and by a tuple")
+gun_bound_from_deferred()
+    if !enm_ready() then return
+
+    gun_nope(gun_err(raw"""
+        opt[V](v: V) -> int
+            v match
+                Some(m) ->
+                    val k = m + 1
+                    val q = k + nope
+                    q
+                None -> 0
+
+        main()
+            print(1)
+        """), "5:25")
+
+    gun_nope(gun_err(raw"""
+        opt[V](v: V) -> int
+            v match
+                Some(m) ->
+                    m match
+                        Some(k) ->
+                            val q = k + nope
+                            q
+                        None -> 0
+                None -> 0
+
+        main()
+            print(1)
+        """), "6:33")
+
+    gun_nope(gun_err(raw"""
+        opt[V](v: V) -> int
+            v match
+                Some(m) ->
+                    val (a, b) = m
+                    a + b + nope
+                None -> 0
+
+        main()
+            print(1)
+        """), "5:21")
+end gun_bound_from_deferred
+
+@test("a generic method of a struct tells an undefined name beside a deferred one")
+gun_generic_method()
+    if !enm_ready() then return
+
+    gun_nope(gun_err(raw"""
+        struct Holder
+            n: int
+
+            pick[V](self, v: V) -> int
+                v match
+                    Some(m) -> m.combine(self.n, nope)
+                    None -> self.n
+        end Holder
+
+        main()
+            print(Holder(1).n)
+        """), "6:42")
+end gun_generic_method
+
+// -- what stays quiet ---------------------------------------------------------------------------
+
+@test("what a deferred name's type allows is not judged at the definition")
+gun_quiet_at_definition()
+    if !enm_ready() then return
+
+    assert_eq(gun_err(raw"""
+        two[A, B](a: A, b: B) -> int = 2
+
+        opt[V](v: V) -> int
+            v match
+                Some(m) ->
+                    val a = m + 1
+                    val b = m.anything(None, x -> x, .Thing)
+                    val c = m[0] + m[1..<2].len
+                    val d = two(m, None)
+                    val g = () -> m.other(a)
+                    if m == 2 then return a
+                    a + b + c + d + g()
+                None -> 0
+
+        main()
+            print(1)
+        """), "")
+end gun_quiet_at_definition
+
+@test("each instantiation judges a deferred name, and a legal one builds and runs")
+gun_judged_per_instantiation()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        struct Box
+            n: int
+
+            anything(self, k: int) -> int = self.n + k
+        end Box
+
+        two[A, B](a: A, b: B) -> int = 2
+
+        opt[V](v: V) -> int
+            v match
+                Some(m) ->
+                    val b = m.anything(4)
+                    val d = two(m, b)
+                    val g = () -> m.anything(1)
+                    b + d + g()
+                None -> 0
+
+        main()
+            print(opt(Some(Box(3))))
+        """), "13\n")
+
+    val said = gun_err(raw"""
+        opt[V](v: V) -> int
+            v match
+                Some(m) -> m + 1
+                None -> 0
+
+        main()
+            print(opt(Some("text")))
+        """)
+
+    assert(said.contains("'+' needs matching types, got string and int"), said)
+end gun_judged_per_instantiation
+
+@test("an undefined name in a called generic is told once, not again per instantiation")
+gun_told_once()
+    if !enm_ready() then return
+
+    gun_nope(gun_err(raw"""
+        opt[V](v: V) -> int
+            v match
+                Some(m) ->
+                    val q = m + nope
+                    q
+                None -> 0
+
+        main()
+            print(opt(Some(1)), opt(Some(2.5)))
+        """), "4:25")
+end gun_told_once
+
+@test("a refused name beside a deferred one still keeps its statement quiet")
+gun_refusal_keeps_its_statement()
+    if !enm_ready() then return
+
+    gun_only(gun_err(raw"""
+        opt[V](v: V) -> int
+            val y = missing
+            v match
+                Some(m) ->
+                    val q = m + y + nope
+                    val r = y.foo(m, nope)
+                    val s = two(m, y, nope)
+                    q + r + s
+                None -> 0
+
+        two[A, B, C](a: A, b: B, c: C) -> int = 2
+
+        main()
+            print(1)
+        """), "undefined name 'missing'", "2:13")
+end gun_refusal_keeps_its_statement
+
+// -- a library's uncalled generic -------------------------------------------------------------------
+
+@test("a library's uncalled generic tells an undefined name beside a deferred one at its definition")
+gun_library_generic()
+    if !enm_ready() then return
+
+    val lib = absolute_path(make_temp_dir("sysl-gun-lib").unwrap())
+
+    make_dir_all(s"$lib/glib").unwrap()
+    write_text(s"$lib/glib/glib.sysl", raw"""
+        module glib
+
+        opt[V](v: V) -> int
+            v match
+                Some(m) ->
+                    val q = m + nope
+                    q
+                None -> 0
+        """).unwrap()
+
+    val said = build_library_of(lib, None) match
+        Err(why) -> failure_text(why)
+        Ok(_) -> "checked"
+
+    remove_dir_all(lib).unwrap_or(())
+    assert(said.contains("undefined name 'glib.nope'"), said)
+    assert(said.contains("glib.sysl:6:25"), said)
+end gun_library_generic

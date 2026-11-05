@@ -78,7 +78,7 @@ array_literal(cx: &Analyzer, span: Span, elems: Buf[Expr], expected: Option[Type
     // literal is a consequence of that mistake rather than a second one: `[y, 1]` over a refused `y`.
     for item in ts
         if texpr_type(item) == Unknown then
-            cx.an.poison_quietly()
+            cx.an.poison_over_unknown()
             return bad_expr(span)
 
     for i in 0..<ts.len()
@@ -344,7 +344,9 @@ index_expr(cx: &Analyzer, span: Span, receiver: Expr, index: Expr,
 
     val raw = type_expr_bare(cx, receiver)
 
-    if texpr_type(raw) == Unknown then return raw
+    if texpr_type(raw) == Unknown
+        read_beside_deferred(cx, index)
+        return raw
 
     // `p[i]` on a raw pointer is C's, unchecked: the pointer is a bare address, so the subscript is
     // the address arithmetic C spells the same way. A pointer to something with a subscript of its
@@ -625,7 +627,10 @@ private slice_expr(cx: &Analyzer, span: Span, receiver: Expr, lo: Option[Expr], 
     val tr = type_expr(cx, viewed_through_storage(cx, receiver).unwrap_or(receiver), hint)
     val rt = texpr_type(tr)
 
-    if rt == Unknown then return tr
+    if rt == Unknown
+        if lo.is_some() then read_beside_deferred(cx, lo.unwrap())
+        if hi.is_some() then read_beside_deferred(cx, hi.unwrap())
+        return tr
 
     val want_const = expected.is_some() && read_only_view(expected.unwrap())
     val elem = slice_elem(cx, span, rt, hi)

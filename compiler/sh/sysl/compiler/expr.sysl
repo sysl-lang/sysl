@@ -546,6 +546,8 @@ name_expr(cx: &Analyzer, span: Span, name: string, expected: Option[Type]) -> TE
         note_local_reference(cx, span, local.unwrap())
         read_after_copy_write(cx, span, local.unwrap().unique)
 
+        if local.unwrap().ty == Unknown then cx.an.read_unknown(local.unwrap().deferred)
+
         // A binding whose type its first use fixes is fixed by a position that expects one.
         if expected.is_some() && !cx.open_vars.is_empty() then
             fixed_by_position(cx, span, local.unwrap().unique, expected.unwrap())
@@ -2147,10 +2149,11 @@ analyze_operands(cx: &Analyzer, operands: Buf[Expr], expected: Option[Type],
 
             // An operand whose type could not be worked out gives up on the statement where it is
             // read, so an operand after it is not told about -- unless one before it was already
-            // refused, whose complaint is made for real below and is the statement's one mistake.
+            // refused, whose complaint is made for real below and is the statement's one mistake. An
+            // operand deferred to each instantiation gives nothing up (`poison_over_unknown`).
             if t.is_none() then refused_before = true
             else if !refused_before && texpr_type(t.unwrap()) == Unknown then
-                cx.an.poison_quietly()
+                cx.an.poison_over_unknown()
 
     // **`compared` marks a comparison and `arithmetic` `+ - * / % & | ^`**, whose operand of a type of
     // its own fixes the open bindings an undecided operand beside it waits on (`var_first_use.sysl`).
@@ -2224,6 +2227,29 @@ analyze_operands(cx: &Analyzer, operands: Buf[Expr], expected: Option[Type],
 
     out
 end analyze_operands
+
+// Reads what stands beside a value deferred to each instantiation and would otherwise go unread --
+// the arguments of a call on it, the index into it -- for the names it uses. **A generic's
+// definition is the one place an uncalled generic is read**, so `m.method(nope)` over a name a
+// pattern over a `V` bound is told `nope` is undefined there, as `val q = nope` is; what the parts'
+// types are is the instantiation's to say, so nothing else the reading said is kept
+// (`Analysis.keep_naming_since`).
+read_beside_deferred(cx: &Analyzer, e: Expr)
+    if !cx.at_definition || !cx.an.defers(Unknown) then return
+
+    val part = *e.kind match
+        NamedArg(_, value) -> value
+        _ -> e
+    val mark = cx.an.complaints()
+
+    type_expr(cx, part, None)
+    cx.an.keep_naming_since(mark)
+end read_beside_deferred
+
+// The same, for each argument of a call.
+read_all_beside_deferred(cx: &Analyzer, parts: Buf[Expr])
+    for e in parts
+        read_beside_deferred(cx, e)
 
 // Whether the operands of a wrapping or saturating operator that have a type of their own agree on
 // it, refusing the pair where they do not: `u8 +| u16` widens to nothing, as Rust's
