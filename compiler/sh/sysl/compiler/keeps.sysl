@@ -160,6 +160,9 @@ struct KeepsCx
     // How deep each parameter's type can hold a pointer (`read_depth`), by `<name>|<position>`.
     depths: Map[string, int]
 
+    // The same, by struct or enum type (`type_show`): a type met along many paths is worked out once.
+    type_depths: Map[string, int]
+
     find(self, name: string) -> Option[TFunc] = self.index.get(name) match
         Some(i) -> Some(self.funcs[i])
         None -> None
@@ -182,7 +185,7 @@ check_keeps(a: &Analysis, funcs: Buf[TFunc], vtables: Buf[TVtable], vals: Buf[TV
     val cx: &KeepsCx = KeepsCx(a, funcs, index, map(), map(), map(), buf(), buf(), false, 0, map(),
                                map(), map(), map(), map(), map(), map(), vtables, cast_graph_new(),
                                map(), buf(), map(), map(), map(), map(), buf(), false, map(), false, map(),
-                               0, false, buf(), map(), map())
+                               0, false, buf(), map(), map(), map())
 
     // Every method an `impl` of a trait brought, by the function it was lowered to, and every slot of
     // every table -- an instance of a generic one among them.
@@ -734,7 +737,7 @@ private reads_past(cx: &KeepsCx, name: string, i: usize, steps: int) -> bool
                     if i < f.params.len()
                         var seen: Buf[string] = buf()
 
-                        n = read_depth(f.params[i].1, &seen, 0)
+                        n = read_depth(cx, f.params[i].1, &seen, 0)
                     end if
                 None -> ()
 
@@ -751,21 +754,31 @@ private val RecursiveSteps = 8
 // view or box on the way, the deepest field deciding -- or -1 where it is unbounded: a struct or an
 // enum reaching itself, an object, a closure's captures. Counted generously, so a walk never steps
 // further than this into a value of the type.
-private read_depth(t: Type, seen: *Buf[string], depth: int) -> int
+//
+// **A struct's or an enum's answer is kept by type** (`type_depths`), since a type met along many
+// paths would otherwise be walked once per path. The answer does not depend on the path: a type that
+// reaches one on the way down (`seen`) is in a cycle with it, so it reaches itself and answers -1 from
+// anywhere. Only the cut at 32 nested steps depends on where the walk starts, and it answers -1,
+// which is the conservative answer.
+private read_depth(cx: &KeepsCx, t: Type, seen: *Buf[string], depth: int) -> int
     if depth > 32 then return -1
 
     t match
-        Ptr(inner) -> if is_opaque_struct(*inner) then 0 else deeper(read_depth(*inner, seen, depth + 1))
-        Slice(elem, _) -> deeper(read_depth(*elem, seen, depth + 1))
-        Ref(inner, _) -> deeper(read_depth(*inner, seen, depth + 1))
-        Weak(inner) -> deeper(read_depth(*inner, seen, depth + 1))
-        Volatile(inner) -> read_depth(*inner, seen, depth + 1)
-        Array(_, elem) -> read_depth(*elem, seen, depth + 1)
+        Ptr(inner) -> if is_opaque_struct(*inner) then 0 else deeper(read_depth(cx, *inner, seen, depth + 1))
+        Slice(elem, _) -> deeper(read_depth(cx, *elem, seen, depth + 1))
+        Ref(inner, _) -> deeper(read_depth(cx, *inner, seen, depth + 1))
+        Weak(inner) -> deeper(read_depth(cx, *inner, seen, depth + 1))
+        Volatile(inner) -> read_depth(cx, *inner, seen, depth + 1)
+        Array(_, elem) -> read_depth(cx, *elem, seen, depth + 1)
         Trait(_, _, _) -> -1
         Struct(d) ->
             if is_closure_literal(t) && !d.fields.is_empty() then return -1
 
             val key = type_show(t)
+
+            cx.type_depths.get(key) match
+                Some(n) -> return n
+                None -> ()
 
             if holds_string(*seen, key) then return -1
 
@@ -774,12 +787,17 @@ private read_depth(t: Type, seen: *Buf[string], depth: int) -> int
             var most = 0
 
             for item in d.fields
-                most = widest(most, read_depth(item.1, seen, depth + 1))
+                if most >= 0 then most = widest(most, read_depth(cx, item.1, seen, depth + 1))
 
             seen.truncate(seen.len() - 1)
+            cx.type_depths.put(key, most)
             most
         Enum(d) ->
             val key = type_show(t)
+
+            cx.type_depths.get(key) match
+                Some(n) -> return n
+                None -> ()
 
             if holds_string(*seen, key) then return -1
 
@@ -789,9 +807,10 @@ private read_depth(t: Type, seen: *Buf[string], depth: int) -> int
 
             for v in d.variants
                 for item in v.fields
-                    most = widest(most, read_depth(item.1, seen, depth + 1))
+                    if most >= 0 then most = widest(most, read_depth(cx, item.1, seen, depth + 1))
 
             seen.truncate(seen.len() - 1)
+            cx.type_depths.put(key, most)
             most
         _ -> 0
 end read_depth
