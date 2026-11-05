@@ -399,19 +399,9 @@ corner edge 6 inside
 ```
 
 Each `|` multiplies: `(1 | 2, 3 | 4)` is four alternatives. A pattern that would spread into more
-than 1024 is refused. A `val` or a `for` takes one shape of a value apart, so a `|` in its pattern
-is refused, with no other arm to try:
-
-```sysl
-val o = Some(1)
-val Some(1 | 2) = o
-
-print(o)
-```
-
-```error
-alternatives joined by '|' are written in a 'match' arm or an 'is' test
-```
+than 1024 is refused. A `val`, a `var` or a `for` may hold alternatives too, as long as together
+they cover every value, which is what makes the pattern
+[irrefutable](#alternatives-at-a-binding).
 
 ### A name may be bound twice in one match, but not in one pattern
 
@@ -591,8 +581,9 @@ show()
 ### Only an irrefutable pattern may stand there
 
 A binding has **no other arm to take**, so the patterns allowed in one are exactly those that cannot
-fail — a tuple pattern, **either struct form**, a name, a wildcard, and any nesting of these — and
-every pattern in the table above that is a *test* is refused, with a diagnostic naming it.
+fail — a tuple pattern, **either struct form**, a name, a wildcard, any nesting of these, and
+[alternatives that together cover the type](#alternatives-at-a-binding) — and every pattern in the
+table above that is a *test* is refused, with a diagnostic naming it.
 
 A `for` header is a binding under this rule just as a `val` is: a loop has nowhere to send an element
 of an unexpected shape, so it accepts the same subset and refuses the same patterns with the same
@@ -687,6 +678,86 @@ a binding cannot choose among variants — this pattern matches one of several s
 ```
 
 Each of these belongs in a `match`, where a value that does not match can go to another arm.
+
+### Alternatives at a binding
+
+**A pattern of `|`-alternatives is irrefutable when the alternatives together cover every value**,
+so a binding takes one, as Rust's `let (Ok(x) | Err(x)) = r;` does. Each name is bound from
+whichever alternative matched. The alternatives are written in parentheses, and a `|` inside a
+part spreads as it does in an arm, so `(a, (Ok(b) | Err(b)))` is the two alternatives
+`(a, Ok(b)) | (a, Err(b))`:
+
+```sysl
+enum Reading
+    Celsius(v: int)
+    Fahrenheit(v: int)
+
+either(r: Result[int, int]) -> int
+    val (Ok(x) | Err(x)) = r
+    x
+
+tagged(t: (string, Result[int, int])) -> string
+    val (name, (Ok(n) | Err(n))) = t
+    s"$name=$n"
+
+raw(r: Reading) -> int
+    var (Celsius(v) | Fahrenheit(v)) = r
+
+    v += 1000
+    v
+
+val rs: [3]Result[int, int] = [Ok(1), Err(2), Ok(3)]
+
+print(either(Ok(3)), either(Err(7)), tagged(("k", Err(9))), raw(Fahrenheit(5)))
+
+for (Ok(v) | Err(v)) in rs
+    print(v)
+```
+
+```output
+3 7 k=9 1005
+1
+2
+3
+```
+
+The alternatives owe everything an arm's alternatives owe: the same names at the
+[same types](#alternatives-bind-the-same-names), and no alternative that an earlier one already
+matches, which is [dead](#dead-arms) here as it is in a `match`. What a binding adds is that there is
+no other arm, so alternatives that leave a value out are refused:
+
+```sysl
+enum Shape
+    Circle(r: int)
+    Square(r: int)
+    Dot
+
+size(s: Shape) -> int
+    val (Circle(r) | Square(r)) = s
+    r
+
+print(size(Dot))
+```
+
+```error
+a binding cannot choose among variants — these alternatives miss Dot, and a binding has no other arm to take when the value has another
+```
+
+Alternatives of a value that is not an enum are refused in a test's words when they do not cover
+it — `val (1 | 2) = n`:
+
+```sysl
+show(n: int)
+    val (1 | 2) = n
+
+    print(n)
+
+show(1)
+```
+
+```error
+a binding cannot test a value — these alternatives match only some values, and a binding has no other arm to take when none of them matches
+```
 
 ### The shape has to line up
 
