@@ -1,0 +1,244 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.source_of
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+
+// **A comparison a type supplies is a call to its implementation, and runs while compiling as a call
+// does**: `<`, `<=`, `>`, `>=`, `==` and `!=` over a type whose `Eq` or `PartialOrd` was written or
+// derived fold in a `const`, in an `if const`, in a module `val` laid down as data, and in a `const`
+// function's body run while compiling. `>` and `>=` are `lt` and `le` with the operands exchanged and
+// `!=` is `eq` negated, exactly as the program computes them; an implementation whose body cannot run
+// while compiling is refused, saying what in it stops it. A chain, `a < b <= c`, folds the same way,
+// at a built-in type too.
+
+private val ccd_money: string = raw"""
+    struct Money
+        cents: int
+
+    impl Eq for Money
+        eq(self, rhs: Money) -> bool = self.cents == rhs.cents
+
+    impl PartialOrd for Money
+        lt(self, rhs: Money) -> bool = self.cents < rhs.cents
+        le(self, rhs: Money) -> bool = self.cents <= rhs.cents
+
+    """
+
+@test("a written implementation's six comparisons fold in a 'const', the mirrored ones exchanged or negated")
+ccd_written_impl()
+    if !azb_ready() then return
+
+    azb_prints(azb_main(ccd_money + raw"""
+        const LT: bool = Money(1) < Money(2)
+        const GT: bool = Money(1) > Money(2)
+        const GE: bool = Money(2) >= Money(2)
+        const LE: bool = Money(3) <= Money(2)
+        const NE: bool = Money(1) != Money(2)
+        const EQ: bool = Money(1) == Money(1)
+        const NOT_NE: bool = Money(4) != Money(4)
+
+        print(LT, GT, GE, LE, NE, EQ, NOT_NE)
+        """), "true false true false true true false\n")
+end ccd_written_impl
+
+// The derived `lt` tests "not at most" for each field, so an unordered field decides the comparison.
+@test("a derived order over a float field folds as the program compares it, NaN unordered at every operator")
+ccd_derived_struct_nan()
+    if !azb_ready() then return
+
+    azb_prints(azb_main(raw"""
+        struct P derives Eq, PartialOrd
+            x: int
+            y: f64
+
+        const LT: bool = P(1, 2.0) < P(1, 3.0)
+        const FIRST: bool = P(2, 0.0) > P(1, 9.0)
+        const NAN_LT: bool = P(1, 0.0 / 0.0) < P(1, 3.0)
+        const NAN_GT: bool = P(1, 0.0 / 0.0) > P(1, 3.0)
+        const NAN_GE: bool = P(1, 0.0 / 0.0) >= P(1, 3.0)
+        const NAN_LE: bool = P(1, 0.0 / 0.0) <= P(1, 3.0)
+        const NAN_EQ: bool = P(1, 0.0 / 0.0) == P(1, 0.0 / 0.0)
+        const NAN_NE: bool = P(1, 0.0 / 0.0) != P(1, 0.0 / 0.0)
+
+        print(LT, FIRST, NAN_LT, NAN_GT, NAN_GE, NAN_LE, NAN_EQ, NAN_NE)
+        """), "true true false false false false false true\n")
+end ccd_derived_struct_nan
+
+@test("a derived data enum orders by variant, then by payload, and its equality folds")
+ccd_derived_enum()
+    if !azb_ready() then return
+
+    azb_prints(azb_main(raw"""
+        enum Tier derives Eq, PartialOrd
+            Low
+            Mid(n: int)
+            High
+
+        const VARIANT: bool = Tier.Low < Tier.Mid(0)
+        const PAYLOAD: bool = Tier.Mid(3) > Tier.Mid(2)
+        const TOP: bool = Tier.High >= Tier.Mid(99)
+        const SAME: bool = Tier.Mid(3) == Tier.Mid(3)
+        const OTHER: bool = Tier.Mid(3) != Tier.Mid(4)
+        const NOT_NE: bool = Tier.High != Tier.High
+
+        print(VARIANT, PAYLOAD, TOP, SAME, OTHER, NOT_NE)
+        """), "true true true true true false\n")
+end ccd_derived_enum
+
+// A chain was not folded at all in a `const`, built-in or not: each link compared in turn, the first
+// false one deciding.
+@test("a comparison chain folds in a 'const', through an implementation and at a built-in type")
+ccd_chain()
+    if !azb_ready() then return
+
+    azb_prints(azb_main(ccd_money + raw"""
+        const HELD: bool = Money(1) < Money(2) <= Money(2)
+        const BROKEN: bool = Money(1) < Money(2) < Money(2)
+        const MIRRORED: bool = Money(3) > Money(2) >= Money(2)
+        const PLAIN: bool = 1 < 2 <= 2
+        const PLAIN_BROKEN: bool = 1 < 3 <= 2
+
+        var n = 3
+        val m = Money(n)
+
+        print(HELD, BROKEN, MIRRORED, PLAIN, PLAIN_BROKEN, Money(1) < m <= Money(3), Money(1) < m < Money(3))
+        """), "true false true true false true false\n")
+end ccd_chain
+
+@test("a 'const' function comparing through an implementation runs while compiling, references compared as their referents")
+ccd_const_function()
+    if !azb_ready() then return
+
+    azb_prints(azb_main(ccd_money + raw"""
+        const cheaper(a: Money, b: Money) -> Money = if a < b then a else b
+        const same(a: &Money, b: &Money) -> bool = a == b
+        const different(a: &Money, b: &Money) -> bool = a != b
+
+        const CHEAP: int = cheaper(Money(5), Money(4)).cents
+        const SAME: bool = same(Money(2), Money(2))
+        const DIFFERENT: bool = different(Money(2), Money(2))
+
+        var n = 7
+        print(CHEAP, SAME, DIFFERENT, cheaper(Money(n), Money(8)).cents)
+        """), "4 true false 7\n")
+end ccd_const_function
+
+@test("an 'if const' over a comparison through an implementation keeps the arm it selects")
+ccd_if_const()
+    if !azb_ready() then return
+
+    azb_prints(azb_main(ccd_money + raw"""
+        pick() -> int
+            if const Money(1) < Money(2)
+                return 10
+            else
+                return 20
+
+        flip() -> int
+            if const Money(1) >= Money(2)
+                return 10
+            else
+                return 20
+
+        print(pick(), flip())
+        """), "10 20\n")
+end ccd_if_const
+
+@test("an implementation that cannot run while compiling is refused, saying what in it stops it")
+ccd_impure_impl_refused()
+    if !azb_ready() then return
+
+    azb_refused(azb_main(raw"""
+        struct P
+            x: int
+
+        impl Eq for P
+            eq(self, rhs: P) -> bool
+                print(1)
+                self.x == rhs.x
+
+        const SAME: bool = P(1) != P(1)
+
+        print(SAME)
+        """), ["'SAME' cannot be computed while compiling: it calls 'P.eq', which prints, which is " +
+               "outside the program"])
+end ccd_impure_impl_refused
+
+// -- a freestanding image ------------------------------------------------------------------------------
+
+private ccd_first_of(said: Buf[Placed]) -> string
+    for item in said
+        if !item.src.name.starts_with("library/") then return item.diag.message
+
+    ""
+end ccd_first_of
+
+// A C archive for the bare-metal target, as `build-c` makes one: the first thing the compilation had
+// to say, or the LLVM text it lowered to.
+private ccd_thumb_archive(text: string) -> string
+    val t = target_named("thumb-freestanding-softfp").unwrap()
+    var units: Buf[Program] = buf()
+
+    std_root() match
+        Err(_) -> return "<no standard module>"
+        Ok(root) -> std_units(root, t) match
+            Err(_) -> return "<no standard module>"
+            Ok(found) -> units = found
+
+    val parsed = parse(source_of("main.sysl", text), t)
+
+    if !parsed.ok() then return parsed.report.at(0).message
+
+    units.push(parsed.program)
+
+    val done = analyze_produced(units, t, buf(), false)
+    val early = ccd_first_of(done.reported)
+
+    if early != "" then return early
+
+    val whole = program_of(done, done.main_module) with { entry_point = false, c_artifact = true }
+    var own: Buf[string] = buf()
+
+    own.push("")
+
+    val pr = post_analysis_checks(done.an, whole, own)
+    val late = ccd_first_of(done.an.diagnostics())
+
+    if late != "" then return late
+
+    ir_print_module(codegen_with_gaps(prune(strip_tests(whole), own), t, pr).0)
+end ccd_thumb_archive
+
+// The fold is what lets a bare-metal archive have these at all: there is no loader to run an
+// initializer, so a `val` worked out by code is refused there.
+@test("a module 'val' over a comparison through an implementation is constant data on a freestanding target")
+ccd_freestanding_val()
+    val out = ccd_thumb_archive(raw"""
+        struct Money derives Eq, PartialOrd
+            cents: int
+
+        enum Tier derives Eq, PartialOrd
+            Low
+            Mid(n: int)
+
+        private val cheap: bool = Money(1) < Money(2)
+        private val same: bool = Money(3) != Money(3)
+        private val ranked: bool = Tier.Low < Tier.Mid(1) <= Tier.Mid(1)
+
+        @export("main")
+        probe() -> i32 = if cheap && !same && ranked then 0 else 1
+        """)
+
+    if out == "<no standard module>"
+        print("skipped: the standard module's source is not on this machine")
+        return
+    end if
+
+    assert(out.contains("@cheap = private constant"), out)
+    assert(out.contains("@same = private constant"), out)
+    assert(out.contains("@ranked = private constant"), out)
+    assert(!out.contains("module_init"), out)
+    assert(!out.contains("llvm.global_ctors"), out)
+end ccd_freestanding_val

@@ -714,6 +714,12 @@ private calls_const_fn(a: &Analysis, t: TExpr) -> bool
     walk_texpr(t, expr_walk(true, x -> *x.kind match
         TCall(name, _, _, _) -> if runs_while_compiling(a, name) then sink.push(true)
         TGlobal(symbol, _, writable) -> if !writable && a.tables.vals.has(symbol) then sink.push(true)
+        // A comparison the type supplies is a call to its implementation.
+        TCompare(_, cmps) ->
+            for c in cmps
+                c.dispatch match
+                    Some(d) -> if runs_while_compiling(a, d.name) then sink.push(true)
+                    None -> ()
         _ -> ()))
 
     !found.is_empty()
@@ -3579,15 +3585,13 @@ private compare_chain(r: &EvRun, at: Span, operands: Buf[TExpr], cmps: Buf[TCmp]
         Err(f) -> return f
 
     for i in 0..<cmps.len()
-        if cmps[i].dispatch.is_some() then
-            return refuse_form(r, at, s"'${cmps[i].op}' through an implementation is not evaluated " +
-                               "while compiling yet")
-
         val right = eval_value(r, operands[i + 1]) match
             Ok(v) -> v
             Err(f) -> return f
 
-        val verdict = operate(r, at, cmps[i].op, texpr_type(operands[i]), left, right, false)
+        val verdict = cmps[i].dispatch match
+            Some(d) -> dispatched_comparison(r, at, cmps[i], d, left, right)
+            None -> operate(r, at, cmps[i].op, texpr_type(operands[i]), left, right, false)
 
         verdict match
             EvGave(ConstBool(false)) -> return verdict
@@ -3598,6 +3602,43 @@ private compare_chain(r: &EvRun, at: Span, operands: Buf[TExpr], cmps: Buf[TCmp]
 
     EvGave(ConstBool(true))
 end compare_chain
+
+// **A comparison the type supplies is a call to the member its `impl` lowered to**, run as any other
+// call is: the operands read through the link's levels of reference, handed over in the order the
+// block declared them, and the answer negated where the operator mirrors the one written -- `>` is
+// `lt` exchanged, `!=` is `eq` negated. A body that cannot run while compiling is refused by the call.
+@noinline
+private dispatched_comparison(r: &EvRun, at: Span, c: TCmp, d: TDispatch, left: Const, right: Const) -> Flow
+    var a = left
+    var b = right
+
+    for _ in 0..<c.through
+        a = referent(r, at, a) match
+            Ok(v) -> v
+            Err(f) -> return f
+        b = referent(r, at, b) match
+            Ok(v) -> v
+            Err(f) -> return f
+    end for
+
+    var vals: Buf[Const] = buf()
+
+    vals.push(if d.swap then b else a)
+    vals.push(if d.swap then a else b)
+
+    val out = call_with(r, at, d.name, vals)
+
+    if !d.negate then return out
+
+    out match
+        EvGave(ConstBool(v)) -> EvGave(ConstBool(!v))
+        _ -> out
+end dispatched_comparison
+
+// The value a reference reaches, for a comparison that compares referents.
+private referent(r: &EvRun, at: Span, v: Const) -> Result[Const, Flow] = v match
+    ConstPtr(xs, i, _) -> Ok(xs[i])
+    other -> Err(through_unowned(r, at, other))
 
 @noinline
 private cast(r: &EvRun, at: Span, operand: TExpr, ty: Type) -> Flow
