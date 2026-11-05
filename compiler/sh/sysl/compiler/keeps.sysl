@@ -2464,9 +2464,17 @@ private gather_steps(t: &Track, e: TExpr, out: *Buf[int], depth: int)
             Array(_, _) -> if path_ok(t, e) then gather_steps(t, r, out, depth + 1)
             _ -> steps_on(t, r, out, depth)
         TCast(v, _) -> gather_steps(t, v, out, depth + 1)
-        TSlice(base, _, _, _, _) -> gather_steps(t, base, out, depth + 1)
-        TConstView(v) -> gather_steps(t, v, out, depth + 1)
-        TViewAs(v, _) -> gather_steps(t, v, out, depth + 1)
+        TSlice(base, _, _, _, _) -> view_steps(t, base, out, depth)
+        TConstView(v) -> view_steps(t, v, out, depth)
+        TViewAs(v, _) -> view_steps(t, v, out, depth)
+
+        // **A literal handed over as a view is the address of storage holding its elements**, as
+        // `&b` is of `b`, and so is a view of an array: `row([v])` and `row(a)`, `a` holding `v`, both
+        // hand `row` a pointer through which it reads `v` one step in.
+        TBufLit(elems, _) ->
+            for v in elems
+                element_steps(t, v, out, depth)
+        TBufFill(v, _, _) -> element_steps(t, v, out, depth)
         TSeq(exprs) -> if !exprs.is_empty() then gather_steps(t, exprs[exprs.len() - 1], out, depth + 1)
         TBlockExpr(b) -> if b.result.is_some() then gather_steps(t, b.result.unwrap(), out, depth + 1)
         TIf(_, then_block, else_block, _) ->
@@ -2482,6 +2490,22 @@ private gather_steps(t: &Track, e: TExpr, out: *Buf[int], depth: int)
         TCallPtr(_, args, _, ty) -> if may_hold_pointer(t.cx, ty) then any_steps(t, args, out, depth)
         _ -> ()
 end gather_steps
+
+// An element of a literal is held one step through it, as a place is through its address.
+private element_steps(t: &Track, v: TExpr, out: *Buf[int], depth: int)
+    var inner: Buf[int] = buf()
+
+    gather_steps(t, v, &inner, depth + 1)
+
+    for s in inner
+        push_step(out, s - 1)
+
+    if carries(t, v) then push_step(out, t.steps - 1)
+end element_steps
+
+// A view of an array is the array's address; a view of a view is the same pointer.
+private view_steps(t: &Track, base: TExpr, out: *Buf[int], depth: int)
+    if is_array_type(texpr_type(base)) then element_steps(t, base, out, depth) else gather_steps(t, base, out, depth + 1)
 
 // One step further through a pointer read some steps in: still a pointer on the way short of `steps`.
 private steps_on(t: &Track, x: TExpr, out: *Buf[int], depth: int)
@@ -3042,10 +3066,11 @@ private carries(t: &Track, e: TExpr) -> bool = *e.kind match
         may_hold_pointer(t.cx, ty) && (steps_in(t, r) || is_array_type(texpr_type(r)) || at_the_value(t, r)) &&
             path_ok(t, e) && carries(t, r)
 
-    // A view cut from, or seen as, what is read through is read through as well.
-    TSlice(base, _, _, _, ty) -> t.through && may_hold_pointer(t.cx, ty) && carries(t, base)
-    TConstView(v) -> t.through && carries(t, v)
-    TViewAs(v, ty) -> t.through && may_hold_pointer(t.cx, ty) && carries(t, v)
+    // A view cut from, or seen as, what is read through is read through as well. A view of an array
+    // holding it is a pointer to it, as the address of a local holding it is.
+    TSlice(base, _, _, _, ty) -> (t.through || is_array_type(texpr_type(base))) && may_hold_pointer(t.cx, ty) && carries(t, base)
+    TConstView(v) -> (t.through || is_array_type(texpr_type(v))) && carries(t, v)
+    TViewAs(v, ty) -> (t.through || is_array_type(texpr_type(v))) && may_hold_pointer(t.cx, ty) && carries(t, v)
     TRecheck(after, _, _, _) -> carries(t, after)
     TSeq(exprs) -> !exprs.is_empty() && carries(t, exprs[exprs.len() - 1])
     TIf(_, then_block, else_block, _) ->
