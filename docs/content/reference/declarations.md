@@ -626,6 +626,41 @@ image in the object file — and that a target with no thread-local storage refu
 emitting something silent. [`reference/attributes.md § @thread_local`](/reference/attributes/) has the
 rule and the refusals.
 
+### Storage nothing reads is not in the program
+
+A module `val` or `var` is kept where something the program runs reads or writes it — a body it
+reaches, its own statements, or the initializer of storage that is itself kept — and **dropped with
+its initializer otherwise**. Its initializer then never runs, and nothing it alone calls is compiled
+in. So a computed table in a library costs a program that imports the module but never reads the
+table neither its bytes nor the time to fill it, and does not keep the module off a machine where
+nothing fills storage at startup. A chain of storage is filled in the order it is declared, each
+link only where something reads the end of it:
+
+```sysl
+noisy(n: int) -> int
+    print(s"filled $n")
+    n
+
+static val a: int = noisy(1)
+static val b: int = a + noisy(2)
+static val c: int = noisy(3)
+
+print(b)
+```
+
+```output
+filled 1
+filled 2
+3
+```
+
+`c` is never read, so `noisy(3)` never runs: an initializer is a value to compute, not a place to put
+work the program depends on. Storage something outside the program names is kept however little the
+program reads it — an `@export`ed binding, which whatever links the program reads by its symbol, and a
+`@section` one, which a linker script places. A library built on its own (`sysl build-lib`) keeps
+every binding it declares, since any of them may be what a program linking it reads; that program
+fills only the ones it reaches.
+
 ### Several at once
 
 `var` and `val` both take a comma list, binding several names to several values. Each part's type is
