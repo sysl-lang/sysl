@@ -526,6 +526,11 @@ A type's name is a type and not a value, so nothing is *read* from it. What it a
 `Color::First` cannot be confused with a variant, an associated function, or a member an `impl`
 added, and no `impl` can shadow one by declaring a member of that name.
 
+**The name may be written in full, through its module**: `geo.Point::Kind`, `a.b.T::Fields` and
+`geo.Pair[int]::Name` answer exactly what `Point::Kind` does after `import geo.Point`, since an
+import only shortens a reference ([modules](/reference/modules/)). A path whose head is a local is a
+member read, not a type, and is refused as any value on the left of `::` is.
+
 Four kinds of type answer them, and each set is **fixed and closed**.
 
 ### A simple enum
