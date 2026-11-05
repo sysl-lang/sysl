@@ -16,6 +16,7 @@ Reflection is built from forms described on other pages, and this page brings th
 | written | answers | covered in |
 |---|---|---|
 | `T::Kind`, `T::Name`, `T::BaseName` | what a type is, and what it is called | [below](#what-a-type-is-and-what-it-is-called) |
+| `T::Target` | what a reference, a pointer or a slice points at | [targets](#what-a-reference-points-at) |
 | `T::Fields`, `T::Members` | the stored parts of a struct, a tuple or a union | [fields](#fields-and-members) |
 | `T::Variants` | the variants of an enum | [variants](#variants) |
 | `v.(f)`, `f::Type` | one field of a value, and its type | [walking fields](#walking-the-fields) |
@@ -96,7 +97,8 @@ that opened it.
 **A trait answers these three questions too**, as Rust's `type_name` answers for `dyn View`: its kind
 is `Trait`, and its names are the ones it was declared under. A trait object standing in for a type
 parameter answers the same, so `if const T::Kind == Kind.Trait` tells an object from a type. Behind
-a mode it is the mode that answers: `&View` is a `Ref` and `*View` a `Pointer`.
+a mode it is the mode that answers: `&View` is a `Ref` and `*View` a `Pointer`, and
+[`T::Target`](#what-a-reference-points-at) is what asks about the trait behind it.
 
 ```sysl
 trait View
@@ -138,6 +140,75 @@ print(View::Fields.len)
 ```error
 'View' is a trait, so it describes behaviour rather than a layout — write '*View' or '&View' for a trait object, or bound a type parameter with '[T: View]'
 ```
+
+## What a reference points at
+
+**`T::Target` is the type a reference or a pointer points at**, named after Rust's `Deref::Target`.
+`&T`, `&sync T`, `*T` and `weak T` answer `T`, and a slice `[]T`, which is a pointer and a count,
+answers its element. It is a type rather than a value, so it is written wherever a type is (`sizeof`,
+a type argument, a binding's type) or asked a question of its own. That is how a body tells a trait
+object from a struct behind the same mode: `T::Kind` is `Ref` for both, and `T::Target::Kind` is
+`Trait` for one and `Struct` for the other.
+
+```sysl
+trait View
+    draw(self) -> int
+
+struct Button
+    width: int
+
+impl View for Button
+    draw(self) -> int = self.width
+
+which[T]() -> string
+    if const T::Target::Kind == Kind.Trait then "object " + T::Target::Name
+    else "type " + T::Target::Name
+
+type Flags = []bool
+
+print(which[&View](), which[*Button](), which[&sync Button]())
+print(Flags::Target::Name, sizeof(Flags::Target))
+```
+
+```output
+object View type Button type Button
+bool 1
+```
+
+A mode can be written in parentheses on the left of `::`, so a question needs no alias or type
+parameter, and **a projection chains**, one level per `Target`:
+
+```sysl
+trait View
+    draw(self) -> int
+
+struct Button
+    width: int
+
+print(Kind::Image((&View)::Kind), Kind::Image((&View)::Target::Kind))
+print((**Button)::Target::Name, (**Button)::Target::Target::Name)
+```
+
+```output
+Ref Trait
+*Button Button
+```
+
+A type that points at nothing has no `Target`, as Rust's `<i32 as Deref>::Target` is refused. That
+includes a trait object, which is where a chain ends, and an array, which holds its elements rather
+than pointing at them:
+
+```sysl
+print(int::Target::Name)
+```
+
+```error
+'int' is an integer, which points at nothing, so 'int::Target' names no type — 'Target' is what a reference, a pointer, a weak reference or a slice points at
+```
+
+**A trait's own associated type named `Target` wins**, as a program's names win over every form the
+compiler supplies, and it is reached through a reference as any associated type is: where
+`impl Holds for Jar` says `type Target = u8`, `Jar::Target` and `(&Jar)::Target` are both `u8`.
 
 ## Fields and members
 

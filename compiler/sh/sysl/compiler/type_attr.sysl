@@ -27,6 +27,16 @@ type_attr_expr(cx: &Analyzer, span: Span, receiver: Expr, attr: string) -> TExpr
         val instance = type_attr_on_instance(cx, span, receiver, attr, buf())
 
         if instance.is_some() then return instance.unwrap()
+
+        // `T::Target::Kind`, `(&View)::Kind` -- a left side only the type grammar reads: what a
+        // reference points at, or a type behind a mode written in parentheses.
+        if spelled_as_type(cx, receiver)
+            val ty = written_as_type(cx, receiver)
+
+            if ty == Unknown then return bad_expr(span)
+
+            return attr_of_type(cx, span, type_show(ty), attr, buf(), ty, false)
+        end if
     end if
 
     // **`::Id` on a value reads the identity an erased value carries**, and that is the case the
@@ -128,6 +138,12 @@ private attr_of_type(cx: &Analyzer, span: Span, written: string, attr: string, a
                                    usize_type(word_bits(cx))))
     end if
 
+    // **`T::Target` is a type**, what a reference or a pointer points at, so it is written where a
+    // type is or asked a question of its own; it has no value to stand where an expression does.
+    if attr == "Target" then
+        return cx.err(span, s"'$written::Target' is a type, what '$written' points at, and not a value " +
+                      s"— ask it a question, '$written::Target::Kind', or write it where a type goes")
+
     // The four that describe a type's make-up are, like `Id`, asked of every type -- and of a type
     // parameter per instantiation, since each one is a fact about the type it was given.
     if reflection_attr(attr) then return reflect_attr(cx, span, written, attr, args, ty)
@@ -177,6 +193,26 @@ attr_type_name(cx: &Analyzer, receiver: Expr) -> Option[string] = *receiver.kind
         Ident(n) -> if a == "Type" || a == "Payload" then Some(s"$n::$a") else None
         _ -> None
     _ -> None
+
+// Whether a left side of `::` that is no single name is still written as a type: `X::Target` over
+// anything written as a type, or `&X` / `*X` in parentheses over one. A value anywhere at its root --
+// `(&v)::Id` with `v` a local -- is a value, and is left to the value reading.
+private spelled_as_type(cx: &Analyzer, e: Expr) -> bool = *e.kind match
+    TypeAttr(inner, a, _, _) -> a == "Target" && names_a_type(cx, inner)
+    Unary(op, inner) -> (op == "&" || op == "*") && names_a_type(cx, inner)
+    _ -> false
+
+private names_a_type(cx: &Analyzer, e: Expr) -> bool
+    if spelled_as_type(cx, e) then return true
+
+    *e.kind match
+        Index(head, _, _) -> names_a_type(cx, head)
+        TypeArgs(head, _, _) -> names_a_type(cx, head)
+        _ ->
+            val name = attr_type_name(cx, e)
+
+            name.is_some() && cx.lookup(name.unwrap()).is_none()
+end names_a_type
 
 // The key of the generic enum a written name declares, where it declares one and no type parameter
 // of the body being read stands in front of it.

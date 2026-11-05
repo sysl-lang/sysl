@@ -1,0 +1,321 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.Buf
+import sysl.fs.remove_dir_all
+import sysl.process.capture
+
+// **`T::Target` is what a reference or a pointer points at** (`reference/reflection.md`), as Rust's
+// `Deref::Target` is: `&T`, `&sync T`, `*T` and `weak T` answer `T`, and a slice `[]T` its element.
+// It is a type, so it is written where a type is or asked a question of its own -- and
+// `(&View)::Target::Kind` is `Kind.Trait` where `(&View)::Kind` is only `Ref`, which is what tells a
+// trait object from a struct behind the same mode.
+//
+// The axes: the pointer kind (`&`, `&sync`, `*`, `weak`, `[]`, `[]const`), what is pointed at (a
+// trait, a struct, a simple and a data enum, a scalar), how it is spelled (an alias, a parenthesised
+// type, a type parameter, a field's type in a reflection walk), how deep (one projection, a chain),
+// where it stands (a question, `sizeof`, a type argument, a binding's type, a module `val`, an
+// `if const`), and the refusals (no pointer, the end of a chain, a projection used as a value, a
+// value on the left). A trait's own associated type `Target` is the one name that wins over it.
+//
+// Not covered: `#if`, whose conditions are target facts (`ptr32`, `os`) and never type queries, and
+// `ref T`, which is a method's result marking a place rather than a type, so no `T` is written of it.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+// What a program of these files prints, then its exit status; what the build said where it refused.
+private rtg_out(src: string) -> string
+    var fs = im_files()
+
+    fs.push(("", "main.sysl", rtg_decls() + src))
+
+    val root = im_write(fs)
+    val exe = root + "/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            val said = failure_text(why)
+
+            remove_dir_all(root).unwrap_or(())
+            return said
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true, 20000)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.status match
+            Exited(code) -> out.text + "[exit " + code.to_string() + "]"
+            _ -> out.text + "[did not exit]"
+end rtg_out
+
+// Seventeen lines, so a program's own first line is line 18.
+private rtg_decls() -> string = raw"""
+    trait View
+        draw(self) -> int
+
+    struct Btn
+        n: int
+
+    impl View for Btn
+        draw(self) -> int = self.n
+
+    enum Light
+        Red
+        Green
+
+    enum Shape
+        Dot
+        Circle(r: int)
+
+    """
+
+private rtg_refused(said: string, message: string, at: string)
+    assert(said.contains("error: " + message + "\n --> ") || said.contains("error: " + message + "\n  --> "),
+           said)
+    assert(said.contains(at + "\n"), said)
+
+private rtg_no_target(shown: string, phrase: string) -> string =
+    s"'$shown' is $phrase, which points at nothing, so '$shown::Target' names no type — 'Target' is " +
+    "what a reference, a pointer, a weak reference or a slice points at"
+
+// -- each pointer kind ----------------------------------------------------------------------------
+
+@test("a reference, an atomic reference, a pointer and a weak reference each answer what they point at")
+rtg_each_mode_answers_its_referent()
+    if im_can_run() then return
+
+    assert_eq(rtg_out(raw"""
+        type R = &Btn
+        type S = &sync Btn
+        type P = *Btn
+        type W = weak Btn
+
+        main()
+            print(R::Target::Name, S::Target::Name, P::Target::Name, W::Target::Name)
+
+        """), "Btn Btn Btn Btn\n[exit 0]")
+
+@test("a slice answers its element, read-only or not")
+rtg_a_slice_answers_its_element()
+    if im_can_run() then return
+
+    assert_eq(rtg_out(raw"""
+        type L = []int
+        type C = []const bool
+        type B = []Btn
+
+        main()
+            print(L::Target::Name, C::Target::Name, B::Target::Name, Kind::Image(B::Target::Kind))
+
+        """), "int bool Btn Struct\n[exit 0]")
+
+@test("a mode written in parentheses is asked as the type it is, Kind and Target alike")
+rtg_a_parenthesised_mode_is_asked()
+    if im_can_run() then return
+
+    assert_eq(rtg_out(raw"""
+        main()
+            print(Kind::Image((&View)::Kind), Kind::Image((*Btn)::Kind))
+            print(Kind::Image((&View)::Target::Kind), (*Btn)::Target::Name, (&Light)::Target::Name)
+
+        """), "Ref Pointer\nTrait Btn Light\n[exit 0]")
+
+// -- what is pointed at ---------------------------------------------------------------------------
+
+@test("a trait object, a struct, a simple enum, a data enum and a scalar behind a mode each answer their own Kind")
+rtg_trait_struct_enum_targets()
+    if im_can_run() then return
+
+    assert_eq(rtg_out(raw"""
+        target_kind[T]() -> string = Kind::Image(T::Target::Kind)
+
+        main()
+            print(target_kind[&View](), target_kind[&Btn](), target_kind[*Light](), target_kind[&Shape]())
+            print(target_kind[*View](), target_kind[*int](), target_kind[&sync Btn]())
+
+        """), "Trait Struct SimpleEnum DataEnum\nTrait Int Struct\n[exit 0]")
+
+@test("a boxed callable answers the callable trait it is reached through, as Rust's dyn Fn")
+rtg_a_callable_target_is_its_trait()
+    if im_can_run() then return
+
+    assert_eq(rtg_out(raw"""
+        type F = &Fn(int) -> int
+
+        main()
+            print(Kind::Image(F::Kind), Kind::Image(F::Target::Kind), F::Target::Name)
+
+        """), "Ref Trait Fn(int) -> int\n[exit 0]")
+
+@test("a trait object behind a mode answers the trait's Name and BaseName")
+rtg_a_trait_target_names()
+    if im_can_run() then return
+
+    assert_eq(rtg_out(raw"""
+        main()
+            print((&View)::Target::Name, (&View)::Target::BaseName, (&Btn)::Target::BaseName)
+
+        """), "View View Btn\n[exit 0]")
+
+// -- chaining -------------------------------------------------------------------------------------
+
+@test("a projection chains: a pointer to a pointer answers one level per Target")
+rtg_targets_chain()
+    if im_can_run() then return
+
+    assert_eq(rtg_out(raw"""
+        type PP = **Btn
+        type PR = *&View
+
+        main()
+            print(PP::Target::Name, PP::Target::Target::Name, Kind::Image(PP::Target::Kind))
+            print(PR::Target::Name, Kind::Image(PR::Target::Target::Kind))
+            print((**Btn)::Target::Name, (**Btn)::Target::Target::Name)
+
+        """), "*Btn Btn Pointer\n&View Trait\n*Btn Btn\n[exit 0]")
+
+@test("a chain inside a generic body answers for each instantiation")
+rtg_a_chain_in_a_generic_body()
+    if im_can_run() then return
+
+    assert_eq(rtg_out(raw"""
+        two_down[T]() -> string = T::Target::Target::Name
+
+        main()
+            print(two_down[**Btn](), two_down[*&View](), two_down[&*int]())
+
+        """), "Btn View int\n[exit 0]")
+
+// -- inside a generic body ------------------------------------------------------------------------
+
+@test("if const T::Target::Kind keeps its arm per instantiation, telling a trait object from a struct")
+rtg_if_const_in_a_generic_body()
+    if im_can_run() then return
+
+    assert_eq(rtg_out(raw"""
+        which[T]() -> string
+            if const T::Target::Kind == Kind.Trait then "object " + T::Target::Name
+            elif const T::Target::Kind == Kind.Struct then "struct " + T::Target::Name
+            else "other " + T::Target::Name
+
+        main()
+            print(which[&View](), which[*View](), which[&Btn](), which[*int](), which[[]char]())
+
+        """), "object View object View struct Btn other int other char\n[exit 0]")
+
+@test("T::Target stands where a type does: sizeof, a type argument, a binding and an Option")
+rtg_target_where_a_type_stands()
+    if im_can_run() then return
+
+    assert_eq(rtg_out(raw"""
+        type RB = &Btn
+
+        name_of[T]() -> string = T::Name
+
+        about[T]() -> string
+            val none: Option[T::Target] = None
+            s"${sizeof(T::Target)} ${name_of[T::Target]()} ${none.is_none()}"
+
+        main()
+            val b: RB::Target = Btn(4)
+            print(about[*bool](), about[&Btn](), about[[]int](), b.n)
+
+        """), "1 bool true 4 Btn true 4 int true 4\n[exit 0]")
+
+@test("a module val holding a Target's Kind folds, and compares as a constant")
+rtg_a_target_kind_folds()
+    if im_can_run() then return
+
+    assert_eq(rtg_out(raw"""
+        val K = (&View)::Target::Kind
+        val L = (&Btn)::Target::Kind
+
+        main()
+            print(K == Kind.Trait, L == Kind.Trait, L == Kind.Struct)
+
+        """), "true false true\n[exit 0]")
+
+@test("a field's type in a reflection walk is asked for its Target, telling trait-object fields apart")
+rtg_a_field_type_target()
+    if im_can_run() then return
+
+    assert_eq(rtg_out(raw"""
+        struct Panel
+            view: &View
+            btn: *Btn
+            n: int
+
+        main()
+            for const f in Panel::Fields
+                if const f::Type::Kind == Kind.Ref || f::Type::Kind == Kind.Pointer
+                    print(f.name, Kind::Image(f::Type::Target::Kind))
+                else
+                    print(f.name, "-")
+
+        """), "view Trait\nbtn Struct\nn -\n[exit 0]")
+
+@test("a trait's own associated type named Target wins over the projection, through a reference too")
+rtg_a_declared_target_wins()
+    if im_can_run() then return
+
+    assert_eq(rtg_out(raw"""
+        trait Holds
+            type Target
+
+        struct Jar
+            n: int
+
+        impl Holds for Jar
+            type Target = bool
+
+        held[T: Holds]() -> string = T::Target::Name
+
+        main()
+            print(held[Jar](), Jar::Target::Name, (&Jar)::Target::Name, (&Btn)::Target::Name)
+
+        """), "bool bool bool Btn\n[exit 0]")
+
+// -- what is refused ------------------------------------------------------------------------------
+
+@test("a type that points at nothing is refused Target, an integer and a struct alike")
+rtg_no_pointer_is_refused()
+    if im_can_run() then return
+
+    rtg_refused(rtg_out("main()\n    print(int::Target::Name)\n"), rtg_no_target("int", "an integer"),
+                ":19:11")
+    rtg_refused(rtg_out("main()\n    print(sizeof(Btn::Target))\n"), rtg_no_target("Btn", "a struct"),
+                ":19:18")
+    rtg_refused(rtg_out("type A = [4]int\n\nmain()\n    print(A::Target::Name)\n"),
+                rtg_no_target("[4]int", "an array"), ":21:11")
+
+@test("a generic body asking Target of a type that is no pointer is refused at that instantiation")
+rtg_no_pointer_in_a_generic_is_refused()
+    if im_can_run() then return
+
+    rtg_refused(rtg_out("down[T]() -> string = T::Target::Name\n\nmain()\n    print(down[&Btn](), down[Light]())\n"),
+                rtg_no_target("Light", "an enum"), ":18:23")
+
+@test("the end of a chain is refused: a trait object behind a mode points at nothing further")
+rtg_the_end_of_a_chain_is_refused()
+    if im_can_run() then return
+
+    rtg_refused(rtg_out("main()\n    print((&View)::Target::Target::Name)\n"),
+                rtg_no_target("View", "a trait object"), ":19:11")
+
+@test("T::Target is a type, so standing alone where a value is wanted is refused")
+rtg_target_as_a_value_is_refused()
+    if im_can_run() then return
+
+    rtg_refused(rtg_out("type P = *Btn\n\nmain()\n    print(P::Target)\n"),
+                "'P::Target' is a type, what 'P' points at, and not a value — ask it a question, " +
+                "'P::Target::Kind', or write it where a type goes", ":21:12")
+
+@test("a value in parentheses behind a mode is still a value, refused a type attribute as before")
+rtg_a_value_behind_a_mode_is_a_value()
+    if im_can_run() then return
+
+    rtg_refused(rtg_out("main()\n    val b = Btn(1)\n    print(Kind::Image((&b)::Kind))\n"),
+                "'::Kind' is a type attribute, so its left side must be a type name", ":20:27")

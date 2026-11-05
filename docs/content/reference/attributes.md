@@ -843,6 +843,7 @@ what the type is made of rather than what a value of it may do, and it is answer
 |---|---|
 | `T::Kind` | a `Kind` variant — `Struct`, `DataEnum`, `Int`, `Opaque`… |
 | `T::Name`, `T::BaseName` | the type as written, with its arguments / the declared name alone |
+| `T::Target` | the type a reference, a pointer or a slice points at (a type, not a value) |
 | `T::Fields`, `T::Members` | the named fields / every stored member of a struct, tuple or union |
 | `T::Variants` | the variants of an enum, simple or data |
 | `T::Make(c, p)` | the variant `c` of a data enum, built from a payload |

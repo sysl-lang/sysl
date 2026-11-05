@@ -291,6 +291,12 @@ written_trait_instance(cx: &Analyzer, receiver: Expr) -> Option[Type]
         other -> Some(other)
 end written_trait_instance
 
+// The type an expression spells as the type grammar would -- `(&View)`, `T::Target::Target` --
+// resolved in this reading's terms. The caller has seen that it is written as a type; a part that is
+// not is refused as a type argument's would be.
+written_as_type(cx: &Analyzer, e: Expr) -> Type =
+    resolve_type(cx.an, cx.scope, written_type_ref(cx, e, false), cx.subst)
+
 private type_arg_read(cx: &Analyzer, e: Expr, at_address: bool) -> Type = *e.kind match
     Ident(n) -> resolve_type_arg(cx.an, cx.scope, named_type(e.span, n), cx.subst)
     // `()` is the type `unit`, spelled as its value is.
@@ -321,11 +327,9 @@ private type_arg_read(cx: &Analyzer, e: Expr, at_address: bool) -> Type = *e.kin
         resolve_type(cx.an, cx.scope, type_ref(e.span, TupleType(written, false)), cx.subst)
     // A dotted path is one name to the type grammar, so `mod.Box` is read as the word it is.
     Field(_, _, _) -> dotted_type_arg(cx, e, at_address)
-    // `T::Item` and `f::Type` -- a projection off a name, which the type grammar spells the same way.
-    TypeAttr(head, member, _, _) -> *head.kind match
-        Ident(n) -> resolve_type(cx.an, cx.scope, type_ref(e.span,
-            AssocType(named_type(head.span, n), member)), cx.subst)
-        _ -> not_a_type_arg(cx, e, at_address)
+    // `T::Item` and `f::Type` -- a projection off a name, which the type grammar spells the same way,
+    // and a projection off a projection, `T::Target::Target`, which nests as the type grammar's does.
+    TypeAttr(_, _, _, _) -> resolve_type(cx.an, cx.scope, written_type_ref(cx, e, at_address), cx.subst)
     _ -> not_a_type_arg(cx, e, at_address)
 
 private not_a_type_arg(cx: &Analyzer, e: Expr, at_address: bool) -> Type
@@ -369,12 +373,12 @@ private written_type_ref(cx: &Analyzer, e: Expr, at_address: bool) -> TypeRef = 
     Index(head, one, _) -> applied_type_ref(cx, anchor_of(e), head, one_arg(one), at_address)
     TypeArgs(head, inner, _) -> applied_type_ref(cx, anchor_of(e), head, inner, at_address)
     TypeArg(written) -> written
-    // `f::Type` or `T::Item` nested in an application -- `Option[f::Type]` -- reads as it does alone.
+    // `f::Type` or `T::Item` nested in an application -- `Option[f::Type]` -- reads as it does alone,
+    // and so does a projection off anything else written as a type: `T::Target::Target`,
+    // `(&View)::Target`.
     TypeAttr(head, member, _, _) -> *head.kind match
         Ident(n) -> type_ref(e.span, AssocType(named_type(head.span, n), member))
-        _ ->
-            not_a_type_arg(cx, e, at_address)
-            named_type(e.span, "")
+        _ -> type_ref(e.span, AssocType(written_type_ref(cx, head, at_address), member))
     _ ->
         not_a_type_arg(cx, e, at_address)
         named_type(e.span, "")

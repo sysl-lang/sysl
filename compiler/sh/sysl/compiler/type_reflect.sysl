@@ -840,6 +840,39 @@ partial_projection(a: &Analysis, scope: Scope, span: Span, subject: Type) -> Typ
         _ -> Unknown
 end partial_projection
 
+// `T::Target` written where a type is, with `T` worked out: **what a reference or a pointer points
+// at**, as Rust's `Deref::Target` is -- `&T`, `&sync T`, `*T` and `weak T` answer `T`, and a slice
+// `[]T`, a pointer and a count, answers its element. A trait object answers the trait, so
+// `T::Target::Kind == Kind.Trait` tells `&View` from `&Button`, which `T::Kind` (both `Ref`) cannot.
+//
+// **An associated type a trait declares under the name wins**, as it does for `T::Partial`. A type
+// parameter read in its own terms answers a stand-in of its own, `T::Target`, which each
+// instantiation replaces with what it was given; anything that points at nothing is refused.
+target_projection(a: &Analysis, scope: Scope, span: Span, subject: Type) -> Type
+    if subject == Unknown then return Unknown
+
+    val declared = assoc_type_opt(a, subject, "Target")
+
+    if declared.is_some() then return declared.unwrap()
+
+    subject match
+        Abstract(n, _) -> return Abstract(s"$n::Target", buf())
+        _ -> ()
+
+    underlying(subject) match
+        Ref(inner, _) -> *inner
+        Ptr(inner) -> *inner
+        Weak(inner) -> *inner
+        Slice(elem, _) -> *elem
+        _ ->
+            val shown = type_show(subject)
+
+            a.fault(scope, span, s"'$shown' is ${kind_phrase(subject)}, which points at nothing, so " +
+                    s"'$shown::Target' names no type — 'Target' is what a reference, a pointer, a weak " +
+                    "reference or a slice points at")
+            Unknown
+end target_projection
+
 // Why `T::Partial` names nothing, or nothing where it names the struct's partial value.
 private partial_refusal(a: &Analysis, scope: Scope, subject: Type, shown: string) -> string
     val s = underlying(subject) match
