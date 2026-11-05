@@ -1094,6 +1094,15 @@ struct Analysis
     // entry, so a name a thrown-away reading used is overwritten by the next closure to take it.
     closure_keeps: Map[string, Buf[usize]]
 
+    // What the region being read has read of a value whose type is `?`: one **deferred to each
+    // instantiation** -- a name a pattern over a type parameter's value bound at a generic's
+    // definition, or one bound from such a name -- and one **refused where it was made**. Only the
+    // second is a mistake whose consequences the region gives up over (`poison_over_unknown`). Each
+    // region starts with neither, and `read_marks` keeps the enclosing regions' answers.
+    deferred_read: bool
+    unknown_read: bool
+    read_marks: Buf[(bool, bool)]
+
     // Records a name as produced. The set is what matters and not the order, but the order is what
     // a walk over it reads, so a name is kept once.
     uses(*self, name: string)
@@ -1198,6 +1207,47 @@ struct Analysis
 
         self.poison = Some((self.found.len(), self.found.len()))
 
+    // The same, where what led here is a value whose type is `?` -- an operand, an element, the
+    // subject of a pattern. **A `?` the region read only from names deferred to each instantiation
+    // is no mistake**: at a generic's definition `m` in `v match { Some(m) -> m + nope }` has no type
+    // until an instantiation gives `V` one, and giving up over it would leave `nope` untold wherever
+    // the generic is never called. So the region carries on, unless it also read a `?` that was
+    // refused where it was made.
+    poison_over_unknown(*self)
+        if self.deferred_read && !self.unknown_read then return
+
+        self.poison_quietly()
+
+    // Notes that the region being read has read a name whose type is `?`, and which kind it was.
+    read_unknown(*self, deferred: bool)
+        if deferred then self.deferred_read = true else self.unknown_read = true
+
+    // Whether a name bound now at `ty` is deferred to each instantiation: a `?` that comes only of
+    // names that are, in a region that has refused nothing.
+    defers(self, ty: Type) -> bool =
+        ty == Unknown && self.deferred_read && !self.unknown_read && self.poison.is_none()
+
+    // Keeps, of everything said since `mark`, only what says a name stands for nothing -- an
+    // undefined name, an undefined function, an unknown type. **What a part beside a value deferred
+    // to each instantiation names is settled at the definition; what its type is may not be**: read
+    // with nothing expected, a `None` or a closure says it cannot tell what it is, which its position
+    // in the instantiated call settles. A name kept is a mistake, so the region gives up over it.
+    keep_naming_since(*self, mark: usize)
+        var kept: Buf[Placed] = buf()
+
+        for i in mark..<self.found.len()
+            if names_nothing(self.found[i].diag.message) then kept.push(self.found[i])
+
+        self.restore_complaints(mark)
+
+        for d in kept
+            val before = self.found.len()
+
+            self.found.push(d)
+
+            if self.regions > 0 && self.poison.is_none() then self.poison = Some((before, self.found.len()))
+    end keep_naming_since
+
     // Takes back a quiet abandonment of the region being read, for the one mistake that is told only
     // after the reading it spoiled: module storage whose value reaches the storage itself
     // (`inferred_storage`). The cycle left a value with no type in the initializer, which gave up on
@@ -1224,6 +1274,9 @@ struct Analysis
 
         self.regions += 1
         self.poison = None
+        self.read_marks.push((self.deferred_read, self.unknown_read))
+        self.deferred_read = false
+        self.unknown_read = false
         outer
     end open_region
 
@@ -1235,6 +1288,12 @@ struct Analysis
 
         self.regions -= 1
         self.poison = outer
+
+        self.read_marks.pop() match
+            Some((deferred, unknown)) ->
+                self.deferred_read = deferred
+                self.unknown_read = unknown
+            None -> ()
     end close_region
 
     // The same, for something that is not a reason to stop.
@@ -1331,7 +1390,12 @@ analysis_producing(t: Target, producing: Buf[string]) -> &Analysis =
              false, buf(), false, None, buf(), buf(), buf(), table(), const_evaluation(), false,
              None, buf(), buf(), "", buf(), buf(), buf(), buf(), buf(), result_sites(), set(), map(), buf(),
              buf(), reach_sites_none(), map(), map(), set(), buf(), map(), map(), set(), set(), buf(), map(),
-             false, map(), map())
+             false, map(), map(), false, false, buf())
+
+// Whether a complaint says that a name stands for nothing.
+private names_nothing(message: string) -> bool =
+    message.starts_with("undefined name '") || message.starts_with("undefined function '") ||
+        message.starts_with("unknown type '")
 
 // -- how far a declaration reaches ---------------------------------------------------------------
 
