@@ -1,0 +1,295 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// An **associated function called through an associated type** -- `M::Item.make()` in a body bounded
+// by a trait declaring `type Item: Make`, and `Box::Item.make()` at a concrete type. The projection
+// stands before the dot the way the type it names does: off the bound in a generic body, so the call
+// reaches what the bound promises and nothing more, and off the implementation once the subject is
+// known. Crossed with: two traits in the bound, a nested projection, two instantiations of one body,
+// a trait's default body, a bound that fixes the type and one that asks a trait of it, a method on a
+// value of the projected type, and the refusals for what no bound promises.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private apc_ready() -> bool = std_root().is_ok() && clang_available()
+
+private apc_write(main: string) -> string
+    val root = make_temp_dir("sysl-apc").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(root + "/package.hocon", "package {\n  name = \"probe\"\n}\n").unwrap()
+    write_text(root + "/main.sysl", main).unwrap()
+    root
+end apc_write
+
+// What the program PRINTS, or what the build had to say about it.
+private apc_ran(main: string) -> string
+    val root = apc_write(main)
+    val exe = root + "/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            val said = failure_text(why)
+
+            remove_dir_all(root).unwrap_or(())
+            return said
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end apc_ran
+
+// The program is refused with exactly this message, first, at this line and column of `main.sysl`.
+private apc_refused(main: string, message: string, at: string)
+    val root = apc_write(main)
+
+    val out = emit_llvm_text(root, None) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> if made.report.is_empty() then made.text else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+
+    assert(out.starts_with(s"error: $message\n "), s"expected 'error: $message' first, got: $out")
+    assert(out.index_of(s"/main.sysl:$at\n").is_some(), s"expected it at main.sysl:$at, got: $out")
+end apc_refused
+
+// Two types that can be made, shown and named, and two makers choosing one each. Fourteen lines
+// above every test's own source.
+private apc_src() -> string = raw"""
+    trait Make
+        make() -> Self
+    trait Show
+        show(self) -> string
+    struct Cell
+        v: int
+    impl Make for Cell
+        make() -> Self = Cell(7)
+    impl Show for Cell
+        show(self) -> string = "cell " + self.v.to_string()
+    struct Tag
+        s: string
+    impl Make for Tag
+        make() -> Self = Tag("t")
+    """
+
+// -- through a bound ------------------------------------------------------------------------------
+
+@test("a generic body calls an associated function through an associated type its trait bounds")
+apc_through_the_bound()
+    if !apc_ready() then return
+
+    assert_eq(apc_ran(apc_src() + raw"""
+        trait Maker
+            type Item: Make
+        struct Box
+            n: int
+        impl Maker for Box
+            type Item = Cell
+
+        build[M: Maker]() -> M::Item = M::Item.make()
+
+        print(build[Box]().v)
+        """), "7\n")
+
+@test("an associated type at a concrete type is the implementation's choice before the dot")
+apc_concrete_subject()
+    if !apc_ready() then return
+
+    assert_eq(apc_ran(apc_src() + raw"""
+        trait Maker
+            type Item: Make
+        struct Box
+            n: int
+        impl Maker for Box
+            type Item = Cell
+
+        val c = Box::Item.make()
+        print(c.v)
+        print(Box::Item.make().show())
+        """), "7\ncell 7\n")
+
+@test("a bound of two traits reaches both, an associated function of one and a method of the other")
+apc_two_traits()
+    if !apc_ready() then return
+
+    assert_eq(apc_ran(apc_src() + raw"""
+        trait Named
+            label() -> string
+        impl Named for Cell
+            label() -> string = "Cell"
+        impl Show for Tag
+            show(self) -> string = "tag " + self.s
+        impl Named for Tag
+            label() -> string = "Tag"
+        trait Maker
+            type Item: Make + Show + Named
+        struct Box
+            n: int
+        impl Maker for Box
+            type Item = Cell
+        struct Bag
+            n: int
+        impl Maker for Bag
+            type Item = Tag
+
+        both[M: Maker]() -> string = M::Item.label() + ": " + M::Item.make().show()
+
+        print(both[Box]())
+        print(both[Bag]())
+        """), "Cell: cell 7\nTag: tag t\n")
+
+@test("a projection off a projection stands before the dot, in a generic body and at a concrete type")
+apc_nested_projection()
+    if !apc_ready() then return
+
+    assert_eq(apc_ran(apc_src() + raw"""
+        trait Maker
+            type Item: Make + Show
+        struct Bag
+            n: int
+        impl Show for Tag
+            show(self) -> string = "tag " + self.s
+        impl Maker for Bag
+            type Item = Tag
+        trait Outer
+            type Inner: Maker
+        struct Crate
+            n: int
+        impl Outer for Crate
+            type Inner = Bag
+
+        nested[O: Outer]() -> string = O::Inner::Item.make().show()
+
+        print(nested[Crate]())
+        print(Crate::Inner::Item.make().s)
+        """), "tag t\nt\n")
+
+@test("a trait's default body calls through Self's associated type, per implementing type")
+apc_trait_default()
+    if !apc_ready() then return
+
+    assert_eq(apc_ran(apc_src() + raw"""
+        impl Show for Tag
+            show(self) -> string = "tag " + self.s
+        trait Maker
+            type Item: Make + Show
+            built(self) -> string = Self::Item.make().show()
+        struct Box
+            n: int
+        impl Maker for Box
+            type Item = Cell
+        struct Bag
+            n: int
+        impl Maker for Bag
+            type Item = Tag
+
+        print(Box(1).built())
+        print(Bag(1).built())
+        """), "cell 7\ntag t\n")
+
+@test("a bound that fixes the associated type, and one that asks a trait of it, both reach the call")
+apc_fixed_and_asked_bounds()
+    if !apc_ready() then return
+
+    assert_eq(apc_ran(apc_src() + raw"""
+        trait Seq
+            type Item
+        struct Box
+            n: int
+        impl Seq for Box
+            type Item = Cell
+
+        fixed[S: Seq[Item = Cell]]() -> int = S::Item.make().v
+        asked[S: Seq[Item: Make]]() -> S::Item = S::Item.make()
+
+        print(fixed[Box]())
+        print(asked[Box]().v)
+        """), "7\n7\n")
+
+@test("a value of the projected type takes the bound's methods, beside a call through the type")
+apc_method_on_a_value()
+    if !apc_ready() then return
+
+    assert_eq(apc_ran(apc_src() + raw"""
+        trait Maker
+            type Item: Make + Show
+        struct Box
+            n: int
+        impl Maker for Box
+            type Item = Cell
+
+        pair[M: Maker](x: M::Item) -> string = x.show() + " / " + M::Item.make().show()
+
+        print(pair[Box](Cell(3)))
+        """), "cell 3 / cell 7\n")
+
+@test("a type attribute on an integer is still a value before the dot")
+apc_integer_attribute_unchanged()
+    if !apc_ready() then return
+
+    assert_eq(apc_ran(raw"""
+        print(i8::Max.to_string())
+        """), "127\n")
+
+// -- what no bound promises -----------------------------------------------------------------------
+
+@test("an associated function the projection's bound does not promise is refused, naming the bound it needs")
+apc_unpromised_function()
+    if !apc_ready() then return
+
+    apc_refused(apc_src() + raw"""
+        trait Other
+            other() -> Self
+        impl Other for Cell
+            other() -> Self = Cell(8)
+        trait Maker
+            type Item: Make
+        struct Box
+            n: int
+        impl Maker for Box
+            type Item = Cell
+
+        bad[M: Maker]() -> M::Item = M::Item.other()
+
+        print(bad[Box]().v)
+        """, "'other' needs 'M::Item: Other'", "26:38")
+
+@test("an associated type with no bound promises no associated function")
+apc_unbounded_projection()
+    if !apc_ready() then return
+
+    apc_refused(apc_src() + raw"""
+        trait Seq
+            type Item
+        struct Box
+            n: int
+        impl Seq for Box
+            type Item = Cell
+
+        open[S: Seq]() -> S::Item = S::Item.make()
+
+        print(open[Box]().v)
+        """, "'make' needs 'S::Item: Make'", "22:37")
+
+@test("a concrete projection is refused a function its type does not have, naming that type")
+apc_concrete_missing()
+    if !apc_ready() then return
+
+    apc_refused(apc_src() + raw"""
+        trait Maker
+            type Item: Make
+        struct Box
+            n: int
+        impl Maker for Box
+            type Item = Cell
+
+        print(Box::Item.missing().v)
+        """, "type 'Cell' has no associated function 'missing'", "22:17")
