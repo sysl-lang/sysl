@@ -1,0 +1,125 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.Span
+import sysl.buf.Buf
+
+// **A tombstone is a name a module no longer declares, kept so that a use of it is told what became
+// of it** (`reference/attributes.md § @renamed and @removed`):
+//
+//     @renamed("Date", "0.10.0") type LocalDate
+//     @renamed("date", "0.10.0") date_at()
+//     @removed("write 'zone.resolve(dt)'", "0.10.0") resolve()
+//
+// **It is the declaration's head and nothing after it.** A type of any kind -- a struct, an enum, an
+// alias -- is `type Name`, since what a use of it reaches is the one table of type names whatever it
+// was; a function is its name and an empty `()`, which is how a reader recognises a function and
+// says no call is checked against it. A body would be code nothing runs and a parameter list a
+// signature nothing calls, so neither is written, and a placeholder of either would read as a
+// declaration that still works. What the analysis does with one is `tombstone.sysl`'s.
+
+// `@renamed("new", "version")` or `@removed("hint", "version")`, the parenthesised pair read after
+// the word. Anything else is refused with the one spelling, at the `@`.
+parse_gone_attr(p: *Parser, at: Span, word: string) -> Option[Attr]
+    val first = if p.accept_kw("(") then string_arg(p) else None
+    val second = if first.is_some() && p.accept_kw(",") then string_arg(p) else None
+
+    if second.is_none() || !p.accept_kw(")") || first.unwrap() == "" || second.unwrap() == ""
+        p.fault(at, gone_usage(word))
+        skip_line(p)
+        return None
+    end if
+
+    if word == "renamed" then Some(Gone(first.unwrap(), "", second.unwrap()))
+    else Some(Gone("", first.unwrap(), second.unwrap()))
+end parse_gone_attr
+
+private string_arg(p: *Parser) -> Option[string] = p.peek() match
+    StrLit(v) ->
+        p.bump()
+        Some(v)
+    _ -> None
+
+private gone_usage(word: string) -> string =
+    if word == "renamed" then
+        "'@renamed' takes the name that replaced the declaration and the release that renamed it, both as non-empty strings — '@renamed(\"Date\", \"0.10.0\") type LocalDate'"
+    else
+        "'@removed' takes what to write instead and the release that removed the declaration, both as non-empty strings — '@removed(\"write 'zone.resolve(dt)'\", \"0.10.0\") resolve()'"
+
+// What `@renamed` or `@removed` above a member is told: a tombstone stands for a top-level name.
+tombstone_off_member(word: string) -> string =
+    s"'@$word' marks a tombstone, which stands at a module's top level for a type ('type Name') or a free function ('name()') the module no longer declares — a member is reached through its type, which says what it has"
+
+// Whether the annotations above a declaration make it a tombstone.
+any_gone(attrs: Buf[Attr]) -> bool
+    for attr in attrs
+        attr match
+            Gone(_, _, _) -> return true
+            _ -> ()
+
+    false
+end any_gone
+
+// The tombstone under `@renamed` or `@removed`: `type Name` or `name()`, alone on its line.
+parse_tombstone(p: *Parser, at: Span, vis: Visibility, attrs: Buf[Attr]) -> Stmt
+    var to = ""
+    var hint = ""
+    var version = ""
+    var word = ""
+
+    for attr in attrs
+        attr match
+            Gone(t, h, v) ->
+                to = t
+                hint = h
+                version = v
+                word = attr_word(attr)
+            _ -> ()
+
+    if attrs.len() > 1
+        p.fault(at, s"a tombstone carries '@$word' and nothing else — it stands for a declaration that is gone, so there is nothing left for another annotation to be about")
+        skip_line(p)
+        return stmt(at.to(p.just_taken()), Bad)
+    end if
+
+    val public = vis match
+        Public -> true
+        _ -> false
+
+    if !public
+        p.fault(at, "a tombstone is public: it is there to tell a program that used the old name what became of it, and a name no other file could see was never used by one")
+        skip_line(p)
+        return stmt(at.to(p.just_taken()), Bad)
+    end if
+
+    var name = ""
+    var is_type = false
+
+    if p.at_kw("type")
+        p.bump()
+        is_type = true
+
+        p.peek() match
+            Ident(n) ->
+                name = n
+                p.bump()
+            _ -> ()
+    else
+        p.peek() match
+            Ident(n) ->
+                if p.kw_at(1, "(") && p.kw_at(2, ")")
+                    name = n
+                    p.bump()
+                    p.bump()
+                    p.bump()
+                end if
+            _ -> ()
+    end if
+
+    if name == "" || !(p.at(Newline) || p.at(Eof))
+        p.fault(at, s"'@$word' stands above a tombstone, which is the head of the declaration that is gone and nothing after it — 'type Name' for a type, a struct or an enum, and 'name()' for a function. What it stood for is gone, so there is no body, field or parameter to write")
+        skip_line(p)
+        return stmt(at.to(p.just_taken()), Bad)
+    end if
+
+    stmt(at.to(p.just_taken()), TombstoneDecl(Tombstone(name, is_type, to, hint, version)))
+end parse_tombstone
