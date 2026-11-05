@@ -814,25 +814,23 @@ end named_call
 
 // -- the forms the compiler answers by name ------------------------------------------------------
 
-// `print`, the two rendering companions, and the primitives no sysl body could implement.
-// **These are resolved by NAME, not by looking a function up, and a local of the same spelling does
-// not take the name back.** `str(x)` means the rendering however many things called `str` are in
-// scope, which is what lets an interpolation hole read a parameter named `str` -- the hole desugars
-// to `str(str)`, and a guard that yielded to the local would leave a call to a value nothing can
-// call. The forms that *do* yield are the atomics, which say so where they are asked (nine names is
-// too much of a program's vocabulary to take outright), and the conversions, which `named_call`
-// asks about only where nothing claims the name.
+// `print`, the interpolation hole's rendering, and the primitives no sysl body could implement.
+// **The hole is resolved by an unspellable NAME, not by looking a function up**, so a program's own
+// `str` never takes it: a hole reads a parameter named `str` and still renders it. The forms that
+// yield to a declaration are the atomics, which say so where they are asked (nine names is too much
+// of a program's vocabulary to take outright), and the conversions, which `named_call` asks about
+// only where nothing claims the name.
 private special_form(cx: &Analyzer, span: Span, written: string, args: Buf[Expr],
                      expected: Option[Type]) -> Option[TExpr]
     // **A name the reader declared wins over the form of its spelling**, a local, a parameter or a
     // function: the form is what a call reaches only where nothing else claims the name. An
     // interpolation hole is the one call that must always reach its form, so the parser writes it
     // under a name no reader can spell (`$str`, `$format`).
-    val name = hole_form(written)
+    val name = written
 
     // A function another file keeps `private` is not the reader's to reach, so it does not claim the
     // name either: the form still answers there.
-    if name == written && special_form_word(name) && (cx.lookup(name).is_some() || names_a_reachable_function(cx, name))
+    if special_form_word(name) && (cx.lookup(name).is_some() || names_a_reachable_function(cx, name))
         return None
 
     // A form behind an import answers only where the file imported it, under whatever name the import
@@ -880,18 +878,15 @@ private special_form(cx: &Analyzer, span: Span, written: string, args: Buf[Expr]
 
         if va.is_some() then return va
 
-    // `str(x)` was removed in 0.7.0; only the interpolation hole's `$str` still reaches `str_of`.
-    if name == "str" then
-        if name == written
-            return Some(cx.err(span, "'str(x)' was removed in 0.7.0: write 'x.to_string()'"))
-
-        if args.len() != 1 then return Some(cx.err(span, "str takes exactly one value"))
+    // Only the interpolation hole's `$str` reaches `str_of`; `str` is an ordinary name.
+    if name == HoleRender then
+        if args.len() != 1 then return Some(cx.err(span, "a hole takes exactly one value"))
 
         val v = through_ref(cx, type_expr_bare(cx, args[0]))
 
         warn_placeholder(cx, args[0].span, args[0], v)
 
-        return Some(str_of(cx, span, v))
+        return Some(str_of(cx, span, v, "interpolation"))
 
     // A count read at run time is a `*` in the specifier with its hole after it, so a call carrying
     // any other number of trailing values is not this form and resolves as an ordinary call.
@@ -1116,15 +1111,10 @@ private special_form_name(cx: &Analyzer, name: string) -> bool =
     embed_form(cx, name) || debug_form(cx, name) || name == DebugPart || name == SubscriptIndex ||
     name == UncheckedBlock
 
-// The form an interpolation hole's call stands for: the parser writes `$str` so that a local of the
-// form's own spelling cannot take the call away from it. A hole under a specifier is written
-// `$format`, which is the only spelling of that form -- there is no `format(...)` to call.
-private hole_form(name: string) -> string = if name == "$str" then "str" else name
-
 // The words the compiler answers itself, the atomics aside: a form belongs to no module, so an import
 // naming one is told so rather than that the module lacks it.
 special_form_word(name: string) -> bool =
-    name == "print" || name == "str" || name == "str_cast" ||
+    name == "print" || name == "str_cast" ||
     name == "str_alias" || name == "va_start" || name == "va_end" || name == "va_arg" ||
     name == "va_copy" || name == "ptr_cast"
 
@@ -2218,22 +2208,23 @@ private one_arg(v: TExpr) -> Buf[TExpr]
     out
 end one_arg
 
-// The string of a value already read -- what `str(x)` and `x.to_string()` both become, so the two
-// spellings lower to the same code.
+// The string of a value already read -- what an interpolation hole and `x.to_string()` both become,
+// so the two spellings lower to the same code. `form` is what a bound's refusal names as the
+// reader's own spelling: `"interpolation"` or `"to_string"`.
 //
-// **`str` splits on whether the value is a scalar.** A float is written as Rust's `{}` writes it, at
+// **A rendering splits on whether the value is a scalar.** A float is written as Rust's `{}` writes it, at
 // its own width: the fewest digits that read back as a value of that type, set out positionally
 // (`sysl.fmt.format_real_plain`). A number, a bool, a character and a `string` each go out directly;
 // everything else writes itself into a buffer through its `Display`, and the bytes that land there
 // become the string.
-str_of(cx: &Analyzer, span: Span, v: TExpr) -> TExpr
+str_of(cx: &Analyzer, span: Span, v: TExpr, form: string) -> TExpr
     val plain = plain_float_call(cx, span, v)
 
     if plain.is_some() then return plain.unwrap()
 
     if scalar_render(texpr_type(v)) then return TExpr(span, TStr(v))
 
-    str_render(cx, span, v)
+    str_render(cx, span, v, form)
 end str_of
 
 // `str` of a float: the library's plain renderer for its width, the value crossing at that width so

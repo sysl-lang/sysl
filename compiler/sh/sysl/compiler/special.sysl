@@ -206,14 +206,14 @@ scalar_render(t: Type) -> bool = t match
     Str -> true
     _ -> false
 
-// `str(x)` on a value that renders itself -- and, since an interpolation's holes are `str` calls,
-// every `s"${value}"` over one too.
+// The rendering of a value that renders itself, for an interpolation hole or an `x.to_string()`
+// (`form` names which, in a bound's refusal).
 //
 // **A scalar is not this**: an integer, a float, a bool, a char and a `string` each have a direct
 // path that does not build a sink, and this is what everything else takes. The value writes itself
 // into a growable buffer through its `Display`, and the bytes that land there become the string.
-str_render(cx: &Analyzer, span: Span, t: TExpr) -> TExpr
-    val found = renderer(cx, span, t, "make a string of", "str")
+str_render(cx: &Analyzer, span: Span, t: TExpr, form: string) -> TExpr
+    val found = renderer(cx, span, t, "make a string of", form)
 
     TExpr(span, TRender(found.0, found.1, format_spec(cx, span), found.2))
 end str_render
@@ -291,8 +291,8 @@ end rule_debug
 // and make that block compile and do nothing.
 //
 // `asked` is what the refusal of a concrete type says the program tried to do, and `form` is the
-// special form a bound's refusal names -- the reference's `'str' needs 'T: Display'`, the form a
-// reader wrote (an interpolation hole is a `str` call) rather than a description of it.
+// form a bound's refusal names -- `'interpolation' needs 'T: Display'` or `'to_string' needs
+// 'T: Display'`, what the reader wrote rather than a description of it.
 private renderer(cx: &Analyzer, span: Span, t: TExpr, asked: string,
                  form: string) -> (TExpr, string, Option[int])
     val vt = texpr_type(t)
@@ -328,17 +328,17 @@ private renderer(cx: &Analyzer, span: Span, t: TExpr, asked: string,
     // asked for here or nowhere.
     here match
         Abstract(_, _) ->
-            // The bound is asked for in the name of the form that was written -- `print` or
-            // `str` -- rather than in the verb a concrete type's refusal reads with.
-            val form = if asked == "print" then "print" else "str"
-
+            // The bound is asked for in the name of the form that was written rather than in the
+            // verb a concrete type's refusal reads with.
             // A parameter bounded by `Debug` alone prints through it, as a concrete type with no
             // `Display` does.
             if !satisfies(cx.an, tr, here) && satisfies(cx.an, debug_bound(), here) then
                 return (t, s"${debug_bound().name}.debug", None)
 
             if !satisfies(cx.an, tr, here) then
-                cx.an.bound_fault(cx.scope, span, s"'$form' needs '${type_show(here)}: ${tr.show()}'")
+                val who = if form == "interpolation" then "interpolation" else s"'$form'"
+
+                cx.an.bound_fault(cx.scope, span, s"$who needs '${type_show(here)}: ${tr.show()}'")
 
             return (t, s"${tr.name}.display", None)
         _ -> ()
@@ -618,7 +618,7 @@ end spec_value
 // reading of a negative count. A specifier written out in full is still a constant.
 spec_render(cx: &Analyzer, span: Span, t: TExpr, spec: string, counts: Buf[TExpr]) -> TExpr
     val found = if spec_conversion(spec) == '?' then debugger(cx, span, t, "make a string of", "debug")
-    else renderer(cx, span, t, "make a string of", "str")
+    else renderer(cx, span, t, "make a string of", "interpolation")
     val parts = spec_parts(spec)
     val fmt = if counts.is_empty() then spec_value(cx, span, parts.0, parts.1, parts.2)
     else counted_spec(cx, span, spec, parts, counts)
@@ -630,6 +630,10 @@ end spec_render
 // can call it by accident: it is the compiler's, written only by the library's `derive` body for
 // `Debug` (`library/sysl/debug.sysl`).
 const DebugPart: string = "debug part"
+
+// The call an interpolation hole stands for. The parser writes it under a name no reader can spell,
+// so a program's own `str` can never take the hole away from the rendering.
+const HoleRender: string = "$str"
 
 // `debug(x)` -- the string `x`'s `Debug` writes, which is `f"${x}%?"` with no width.
 debug_string(cx: &Analyzer, span: Span, args: Buf[Expr]) -> TExpr
