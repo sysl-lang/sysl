@@ -1917,7 +1917,13 @@ build_receiver(cx: &Analyzer, span: Span, mode: RecvMode, tr: TExpr,
                 Ref(_, _) -> auto_deref(cx, tr)
                 _ -> tr
 
-            if !is_place(place) then
+            // **A callable called where it was produced is given a slot**, as Rust gives a temporary
+            // receiver one: `make()(4)`, `fs()[0](3)`. Whatever the call writes into its captures dies
+            // with the slot at the end of the statement, which is what calling a temporary means; the
+            // emission spills a computed value it is asked the address of (`emit_place.address`).
+            // A store into a temporary through any other `*self` member is still refused, because
+            // there the write is the point and would be lost.
+            if !is_place(place) && !(member == "call" && callable_of(cx.an, texpr_type(place)).is_some())
                 cx.fault(span, "'*self' needs a variable, field, or dereference to point at — this " +
                          "receiver has no address")
 
