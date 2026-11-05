@@ -1031,7 +1031,18 @@ provisional_of(cx: &Analyzer, span: Span, scope: Scope, tparams: Buf[string], pa
 
     seeded_readings(cx, span, scope, tparams, params, slots, written, held, known, needs, &tys, &soft)
 
-    if held.is_empty() then return Provisional(tys, soft, kept, expected, read_at)
+    // With no callable to consult, a bare result standing in a `&T` is that `&T` (`box_wanted`).
+    if held.is_empty()
+        var position = expected
+
+        if result.is_some() && expected.is_some()
+            val box = box_wanted(cx, span, scope, tparams, result.unwrap(), bounds, expected.unwrap(),
+                                 no_bindings())
+
+            if box.is_some() then position = box
+
+        return Provisional(tys, soft, kept, position, read_at)
+    end if
 
     // What the first pass settles, in the three tiers `solve` reads: what carries a type of its own
     // first, the expected type next, and a literal's default only where neither reached it. A held
@@ -1175,18 +1186,23 @@ provisional_of(cx: &Analyzer, span: Span, scope: Scope, tparams: Buf[string], pa
     Provisional(tys, soft, kept, position, read_at)
 end provisional_of
 
-// **What a result that is a bare type parameter is settled from where the call stands in a `&T`.**
-// That position reads the call at its `T` and boxes what comes back (`expr_coerce.sysl`), so the `T`
-// is what the call is told it is expected to be -- and a callable still to be read that hands back
-// the `&T` itself would then be told to yield a `T`, which it cannot: `make() -> &Foo = apply(() ->
-// foo(1))` refused its closure for yielding the `&Foo` the function returns. Each such callable is
-// read on trial with its result open, and where one yields a box, the box the position wants is what
-// the parameter is settled at. Anything else leaves the `T`, which is what a callable yielding a value
-// to be boxed (`apply(() -> 5)` at `&u8`) needs.
-private boxed_result(cx: &Analyzer, span: Span, scope: Scope, tparams: Buf[string], params: Buf[Param],
-                     result: TypeRef, bounds: Buf[NamedBounds], slots: Buf[Option[Expr]],
-                     written: Buf[Option[Expr]], held: Buf[usize], expected: Type,
-                     sub: Buf[Binding]) -> Option[Type]
+// **A result that is a bare type parameter, standing in a `&T`, is settled at the `&T`**, as rustc
+// settles it. That position reads the call at its `T` and boxes what comes back (`expr_coerce.sysl`),
+// so the `T` is what the call is told it is expected to be -- and settled there, `bump(pick(m))` with
+// `pick[P](r: &Mark) -> P` would hand `bump` a box of a COPY of `m`, and at a type with a `Drop` it
+// would bind `P` by value and be refused. An argument that already settled the parameter still wins:
+// the box only reaches a parameter nothing else did.
+//
+// The box is this call's only where the payload is what this call was asked for: an expression read
+// inside the boxed one without passing through `type_expr` sees the field too. A trait's payload
+// settles nothing (`unify`), so a callable yielding a box of an implementation already settles the
+// parameter at that, and the position erases it.
+//
+// **A box the parameter's own bounds refuse is not taken**: `make[P: Zero]() -> P` at a `&int` is read
+// at `int` and the position boxes the zero, since no `&int` is a `Zero`. A bound naming another of the
+// parameters cannot be asked yet, so it keeps the `T` too.
+private box_wanted(cx: &Analyzer, span: Span, scope: Scope, tparams: Buf[string], result: TypeRef,
+                   bounds: Buf[NamedBounds], expected: Type, sub: Buf[Binding]) -> Option[Type]
     if cx.boxing.is_none() then return None
 
     val box = cx.boxing.unwrap()
@@ -1196,17 +1212,73 @@ private boxed_result(cx: &Analyzer, span: Span, scope: Scope, tparams: Buf[strin
         Ref(inner, _) -> payload = *inner
         _ -> return None
 
-    // The box is this call's only where the payload is what this call was asked for: an expression
-    // read inside the boxed one without passing through `type_expr` sees the field too. A trait's
-    // payload settles nothing (`unify`), so a callable yielding a box of an implementation already
-    // settles the parameter at that, and the position erases it.
     if !type_eq(payload, expected) || is_trait(payload) then return None
 
-    val bare = *result.kind match
-        NamedType(n, args) -> args.is_empty() && holds_string(unsolved_names(tparams, sub), n)
-        _ -> false
+    var name = ""
 
-    if !bare then return None
+    *result.kind match
+        NamedType(n, args) ->
+            if args.is_empty() && holds_string(unsolved_names(tparams, sub), n) then name = n
+        _ -> ()
+
+    if name == "" then return None
+
+    var own: Buf[NamedBounds] = buf()
+    var others: Buf[string] = buf()
+
+    for tp in tparams
+        if tp != name then others.push(tp)
+
+    for nb in bounds
+        if nb.name == name
+            for b in nb.bounds
+                if any_ref_mentions(b.args, others) then return None
+
+            own.push(nb)
+
+    var only: Buf[string] = buf()
+    var at: Buf[Type] = buf()
+
+    only.push(name)
+    at.push(box)
+
+    if !check_param_bounds(cx.an, scope, span, "", only, own, at, no_bindings(), "type parameter",
+                           scope, true) then return None
+
+    Some(box)
+end box_wanted
+
+// **Where a callable still to be read is what settles the result, it is asked first.** One that hands
+// back the `&T` itself settles the parameter at the box -- `make() -> &Foo = apply(() -> foo(1))`. One
+// that yields a value leaves the `T`, and the position boxes what comes back, which is what a callable
+// yielding a value to be boxed (`apply(() -> 5)` at `&u8`) needs. Each is read on trial with its
+// result open. Where no callable's parameter names the result, the box is taken (`box_wanted`).
+private boxed_result(cx: &Analyzer, span: Span, scope: Scope, tparams: Buf[string], params: Buf[Param],
+                     result: TypeRef, bounds: Buf[NamedBounds], slots: Buf[Option[Expr]],
+                     written: Buf[Option[Expr]], held: Buf[usize], expected: Type,
+                     sub: Buf[Binding]) -> Option[Type]
+    val wanted = box_wanted(cx, span, scope, tparams, result, bounds, expected, sub)
+
+    if wanted.is_none() then return None
+
+    val box = wanted.unwrap()
+    var names: Buf[string] = buf()
+
+    *result.kind match
+        NamedType(n, _) -> names.push(n)
+        _ -> ()
+
+    // A callable bound to a parameter reaches the result through its bound (`F: Fn() -> R`), so a
+    // parameter with any bound is counted as naming it.
+    for nb in bounds
+        if !nb.bounds.is_empty() then names.push(nb.name)
+
+    var consulted = false
+
+    for at in held
+        if ref_mentions(params[at].typ, names) then consulted = true
+
+    if !consulted then return wanted
 
     for at in held
         val want = held_want(cx, scope, params[at].typ, tparams, bounds, sub)
