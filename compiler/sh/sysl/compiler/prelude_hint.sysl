@@ -62,6 +62,9 @@ prelude_hint_key(a: &Analysis, scope: Scope, key: string) -> string
     // wrote the library's path on purpose, and there is nothing to have forgotten.
     if another_in_scope(a.tables, scope, name, key) then return ""
 
+    // Nor could one that imported the library's type itself: `import sysl.buf.Buf` chose it.
+    if imports_key(a, scope.imports, key) then return ""
+
     var found: Buf[string] = buf()
     var notes: Buf[string] = buf()
 
@@ -84,7 +87,11 @@ prelude_hint_key(a: &Analysis, scope: Scope, key: string) -> string
 
             val own = !holds_string(a.tables.supplied_modules, module_of(k))
 
-            if own == (pass == 0) then offer_candidate(a, scope, k, "", found, notes)
+            // A dependency's type is offered only from a module the program draws on: one reached only
+            // through the dependency's own imports (a C binding's raw `opaque struct Buf`) is nothing
+            // the reader could have meant.
+            if own == (pass == 0) && (own || program_imports_module(a, module_of(k))) then
+                offer_candidate(a, scope, k, "", found, notes)
 
     if found.is_empty() then return ""
 
@@ -112,6 +119,34 @@ private offer_candidate(a: &Analysis, scope: Scope, k: string, file: string, fou
 
     found.push(k)
     notes.push(file)
+
+// Whether a file of the program's own imports something of module `m` -- a name of it, the module
+// itself, or all of it. A dependency's files do not count: what they import is their author's.
+private program_imports_module(a: &Analysis, m: string) -> bool
+    for f in a.file_imports
+        if holds_string(a.tables.supplied_modules, f.module_name) then continue
+
+        for pair in f.imports.names
+            if module_of(pair.1) == m then return true
+
+        for pair in f.imports.modules
+            if pair.1 == m then return true
+
+        for w in f.imports.wildcards
+            if w == m then return true
+
+    false
+end program_imports_module
+
+// Whether a file's imports name this key, by its name or by a wildcard it wrote over its module --
+// not the auto-import, which every file has and so chose nothing.
+private imports_key(a: &Analysis, imports: Imports, key: string) -> bool
+    for pair in imports.names
+        if pair.1 == key then return true
+
+    val m = module_of(key)
+
+    m != AutoImportedModule && !holds_string(a.also_auto_imported, m) && holds_string(imports.wildcards, m)
 
 // The last component of a file's name.
 private base_name(file: string) -> string

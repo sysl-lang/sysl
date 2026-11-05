@@ -1,0 +1,140 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.remove_dir_all
+
+// **A refusal about a library type names a namesake only where the reader could have meant it.** A
+// file that imported the library's type itself chose it, so nothing fell through. And a package that
+// binds C keeps its raw types in a submodule only its own files import (`sh.sysl.libuv.c`'s `opaque
+// struct Buf`); a program that uses the package's pleasant layer has never heard of them, so a
+// dependency's type is named only from a module a file of the program imports from. The program's
+// own declarations and its files' imports stay candidates as before.
+
+// A dependency `m` whose root module imports its raw submodule `m.c`, which declares `Buf` and `Cpu`.
+private phi_dep(lib: Buf[(string, string)], m: string)
+    lib.push((s"$m/lib.sysl", s"module $m\nimport $m.c.handle\nstart() -> int = handle()\n"))
+    lib.push((s"$m/c/c.sysl", s"module $m.c\nopaque struct Buf\nopaque struct Cpu\nhandle() -> int = 2\n"))
+
+// What a program of `virt`'s two files `a` and `b`, and the extra files, says beside these
+// dependencies.
+private phi_run(a: string, b: string, extra: Buf[(string, string, string)], deps: []string) -> string
+    var lib: Buf[(string, string)] = buf()
+
+    for m in deps
+        phi_dep(lib, m)
+
+    val dep_root = lbr_tree(lib)
+    var fs = im_files()
+
+    fs.push(("virt", "a.sysl", "module virt\n" + a))
+    fs.push(("virt", "b.sysl", "module virt\n" + b))
+    for f in extra
+        fs.push(f)
+    fs.push(("", "main.sysl", "print(0)\n"))
+
+    val root = im_write(fs)
+    val said = lbr_run(root, [dep_root])
+
+    remove_dir_all(root).unwrap_or(())
+    remove_dir_all(dep_root).unwrap_or(())
+    said
+end phi_run
+
+// A use of the auto-imported `Cpu` that is refused.
+private phi_use() -> string = "read(c: Cpu) -> int = c.id\n"
+
+@test("no hint on a method missing from a library type the file imported by name")
+phi_explicit_import_by_name()
+    if im_can_run() then return
+
+    val said = phi_run("import uvl.start\none() -> int = start()\n",
+                       "import sysl.buf.Buf\nimport uvl.c.handle\n" +
+                       "read(b: Buf[int]) -> int = b.at(0) + handle()\n", buf(), ["uvl"])
+
+    assert(said.contains("has no method 'at'"), said)
+    assert(!said.contains("did you mean"), said)
+end phi_explicit_import_by_name
+
+@test("no hint on a library type the file imported by a wildcard, beside the program's own namesake")
+phi_explicit_import_by_wildcard()
+    if im_can_run() then return
+
+    var extra = im_files()
+
+    extra.push(("chip", "c.sysl", "module chip\nstruct Buf\n    id: int\n"))
+
+    val said = phi_run("one() -> int = 1\n", "import sysl.buf.*\nread(b: Buf[int]) -> int = b.at(0)\n",
+                       extra, ["uvl"])
+
+    assert(said.contains("has no method 'at'"), said)
+    assert(!said.contains("did you mean"), said)
+end phi_explicit_import_by_wildcard
+
+@test("no hint for a dependency's raw type when the program imports only the dependency's root")
+phi_transitive_through_a_sibling()
+    if im_can_run() then return
+
+    val said = phi_run("import uvl.start\none() -> int = start()\n", phi_use(), buf(), ["uvl"])
+
+    assert(said.contains("has no property 'id'"), said)
+    assert(!said.contains("did you mean"), said)
+end phi_transitive_through_a_sibling
+
+@test("no hint for a dependency's type when nothing of the program imports from its module")
+phi_nothing_imported()
+    if im_can_run() then return
+
+    val said = phi_run("one() -> int = 1\n", phi_use(), buf(), ["uvl"])
+
+    assert(said.contains("has no property 'id'"), said)
+    assert(!said.contains("did you mean"), said)
+end phi_nothing_imported
+
+@test("the file's own import from the dependency's module keeps the hint")
+phi_imported_by_this_file()
+    if im_can_run() then return
+
+    val said = phi_run("one() -> int = 1\n",
+                       "import uvl.c.handle\nread(c: Cpu) -> int = c.id + handle()\n", buf(), ["uvl"])
+
+    assert(said.contains("did you mean uvl.c.Cpu? Add 'import uvl.c.Cpu'"), said)
+end phi_imported_by_this_file
+
+@test("another module's wildcard import of the dependency's module keeps the hint")
+phi_imported_by_another_module()
+    if im_can_run() then return
+
+    var extra = im_files()
+
+    extra.push(("aux", "x.sysl", "module aux\nimport uvl.c.*\ntwo() -> int = handle()\n"))
+
+    val said = phi_run("one() -> int = 1\n", phi_use(), extra, ["uvl"])
+
+    assert(said.contains("did you mean uvl.c.Cpu? Add 'import uvl.c.Cpu'"), said)
+    assert(!said.contains("imported in"), said)
+end phi_imported_by_another_module
+
+@test("of two dependencies with a namesake, only the one the program imports from is named")
+phi_two_packages_one_imported()
+    if im_can_run() then return
+
+    val said = phi_run("one() -> int = 1\n",
+                       "import uva.c.handle\nread(c: Cpu) -> int = c.id + handle()\n", buf(),
+                       ["uva", "uvb"])
+
+    assert(said.contains("did you mean uva.c.Cpu? Add 'import uva.c.Cpu'"), said)
+    assert(!said.contains("uvb.c.Cpu"), said)
+end phi_two_packages_one_imported
+
+@test("of two dependencies with a namesake, both are named when the program imports from both")
+phi_two_packages_both_imported()
+    if im_can_run() then return
+
+    val said = phi_run("import uvb.c.handle\none() -> int = handle()\n",
+                       "import uva.c.handle\nread(c: Cpu) -> int = c.id + handle()\n", buf(),
+                       ["uva", "uvb"])
+
+    assert(said.contains("uva.c.Cpu"), said)
+    assert(said.contains("uvb.c.Cpu"), said)
+end phi_two_packages_both_imported
