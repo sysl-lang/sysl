@@ -110,15 +110,16 @@ parse_member_attrs(p: *Parser, in_trait: bool) -> Buf[Attr]
         val at = p.here()
         val word = attr_name(p)
 
-        // **`@keeps` above a member is the free function's case**: the body is right here, or the
-        // member is a trait's, whose parameters are borrowed for the call by rule.
-        if word == "keeps" && !p.at_kw("#")
+        // **`@keeps` above a member is the free function's case**, whose body is right here -- except
+        // above a trait's own declaration, which is all a call through an object sees: there it says
+        // which parameters an implementation may hold past the call, and which its answer is made of.
+        if word == "keeps" && !p.at_kw("#") && !in_trait
             p.fault(at, keeps_off_extern())
             skip_line(p)
             break
         end if
 
-        if word == "answers" && !p.at_kw("#")
+        if word == "answers" && !p.at_kw("#") && !in_trait
             p.fault(at, answers_off_extern())
             skip_line(p)
             break
@@ -132,7 +133,7 @@ parse_member_attrs(p: *Parser, in_trait: bool) -> Buf[Attr]
             break
         end if
 
-        if !member_attr_word(word)
+        if !member_attr_word(word) && !(in_trait && (word == "keeps" || word == "answers"))
             if word == "assert"
                 p.fault(at, "'@assert' stands where a declaration stands, and a type's body holds its members — write it beside the type rather than inside it, where 'sizeof' and 'offsetof' still name what it is about")
             else if word == "align" || word == "packed" || word == "byte_order"
@@ -168,12 +169,12 @@ scoped_on_field() -> string =
 
 // `@keeps(...)` anywhere but above an `extern`: a body the compiler can read says what it keeps.
 keeps_off_extern() -> string =
-    "'@keeps(...)' names the parameters a C function holds on to past the call, so it marks an 'extern' — a function's or a method's body is right here, and the compiler reads what it keeps out of it"
+    "'@keeps(...)' names the parameters a C function holds on to past the call, so it marks an 'extern' — a function's or a method's body is right here, and the compiler reads what it keeps out of it. A trait's own method declaration may carry it too, for the calls through an object, which see no body"
 
 // `@answers(...)` anywhere but above an `extern`: a body the compiler can read says what its answer
 // is made of.
 answers_off_extern() -> string =
-    "'@answers(...)' names the parameters the pointer a C function answers may point into, so it marks an 'extern' — a function's or a method's body is right here, and the compiler reads what its answer is made of out of it"
+    "'@answers(...)' names the parameters the pointer a C function answers may point into, so it marks an 'extern' — a function's or a method's body is right here, and the compiler reads what its answer is made of out of it. A trait's own method declaration may carry it too, for the calls through an object, which see no body"
 
 private member_attr_refusal() -> string =
     "the only annotations a member may carry are the ones about a parameter — '@crossing', '@reads' and '@writes' — and the six about the function it lowers to, '@noinline', '@inline', '@cold', '@no_alloc', '@no_block' and '@blocks', and '@relocates', '@views(self)' and '@consumes' about its receiver's storage, and '@track_caller' about the line what it reports names. What the rest say is about a free function or about a type: what 'sysl test' calls, what recurses, what a symbol names, how fields are laid out. A member is neither, so it goes above a free function instead ('06')"
@@ -1009,6 +1010,8 @@ apply_member_attrs(m: *MethodDecl, attrs: Buf[Attr])
             Relocates -> m.marks.relocates = true
             Views(_) -> m.marks.views = true
             Consumes -> m.marks.consumes = true
+            Keeps(ns) -> m.marks.keeps = ns
+            Answers(ns) -> m.marks.answers = ns
             _ -> ()
 
     // **`@scoped(f)` implies `@crossing(f)`**: what a scoped member runs runs in another domain, so

@@ -5025,9 +5025,11 @@ run()
 
 The callee is followed the same way: a pointer it copies out of its parameter into a local, gets back
 from another call, or hands on by the address of a local holding it is still read through as the
-parameter is. Each step is told apart up to eight steps in; past that, a callee is asked what it lets
-out of anything it reads through the pointer, which cannot tell the steps apart, so it is refused if it
-lets out anything read that deep — conservatively — and accepted if it only reads.
+parameter is. Each step is told apart however deep a chain of distinct types goes. Where the caller's
+storage holds a cycle — a value holding its own address, a ring — or the pointer's type reaches itself
+past eight steps, a callee is asked what it lets out of anything it reads through the pointer, which
+cannot tell the steps apart, so it is refused if it lets out anything read there — conservatively —
+and accepted if it only reads.
 
 **The fields are told apart too.** What the callee lets out is asked of the field the address sits
 in: here `&b` sits in `a.peer`, and `keep_bus` lets out only `c.bus`, so the call is accepted — a
@@ -5536,10 +5538,15 @@ C programs already live by — **a pointer handed to a call is borrowed for the 
 | what is called | what it keeps |
 |---|---|
 | a sysl function | what its body keeps |
-| a method through a trait object | no pointer it is handed — an implementation reached through an object that keeps one is refused where it is written; an object it is handed, a callback among them, is kept wherever any implementation keeps it |
+| a method through a trait object | what the trait's declaration of the method says: nothing, unless it says [`@keeps(p)`](/reference/attributes/#keeps-and-answers-on-a-trait-method). An implementation reached through an object that keeps a parameter the declaration does not name — a pointer, an object, a callback, or what it reads through a pointer — is refused where it is written |
 | a closure | nothing — a closure that keeps what it is handed is refused where it is written; the variables it captures are judged at the closure literal, where its body is in hand. A parameter its type marks [`@keeps`](#a-callable-that-keeps-what-it-is-handed) is kept, as an `extern`'s is |
-| a function through a pointer | what any function whose address is taken at that pointer's type holds in what another of its parameters points at — one that keeps a pointer anywhere else is refused where it is written, and so is every one whose pointer type C can reach |
-| an `extern` | nothing, unless its declaration says [`@keeps(p)`](/reference/ffi/#keeps-a-c-function-that-holds-on-to-a-pointer) |
+| a function through a pointer | nothing — a function whose address is taken and keeps a parameter, or lets out what it reads through one, is refused where it is written |
+| an `extern` | nothing, and nothing it reads through a pointer, unless its declaration says [`@keeps(p)`](/reference/ffi/#keeps-a-c-function-that-holds-on-to-a-pointer). The declaration is trusted: a C function that holds a pointer past the call without saying so is a wrong declaration |
+
+No table of the program's bodies is consulted for any of these: which body a call through an object or
+a pointer lands in is decided when the program runs, so the signature is the whole answer, and every
+body is held to it where it is written. The answer of a call through an object is storage of the
+implementation's own unless the declaration says `@answers(p)`.
 
 A closure is judged where it is written, capture by capture, by what its body lets out of each — and
 again at every call it is handed to — so it makes no difference whether a call runs it, it is boxed
@@ -5727,11 +5734,11 @@ made of what it was handed. A call that sees the body — a closure handed to a 
 which the function calls directly — is held to what that body keeps instead, as any call with a body
 in sight is.
 
-**Every call through a function pointer is in the program, unless C can reach the pointer.** So a
-function whose address is taken may hold what it is handed in what another of its parameters points
-at — an interpreter's primitive writing its stack pointer back into the machine — and each call
-through a pointer of that type is held to it, as a direct call is: the machine it hands over says
-what the stack pointer may point at.
+**A call through a function pointer borrows every argument for the call**, as an `extern` does: which
+function it lands in is decided when the program runs, so its type is the whole answer, and no table of
+the functions whose address is taken is consulted. A function whose address is taken is held to that
+where it is written — even one that only holds what it is handed in what another parameter points
+at, such as an interpreter's primitive writing its stack pointer back into the machine:
 
 ```sysl
 struct M
@@ -5749,42 +5756,14 @@ m.sp = &stack[0]
 val f: Code = &halt
 
 f(&m, m.sp)
-print(usize(m.sp) == usize(&stack[0]))
-```
-
-```output
-true
-```
-
-```sysl
-struct M
-    sp: *isize
-
-type Code = *extern(*M, *isize) -> unit
-
-halt(m: *M, sp: *isize)
-    m.sp = sp
-
-var m: M
-
-run(f: Code)
-    var local: isize = 0
-
-    f(&m, &local)
-
-run(&halt)
 ```
 
 ```error
-a call through '*extern(*M, *isize) -> unit' may reach 'halt', which keeps its parameter 'sp' (it is stored in 'm.sp'), and '&local' is the address of a local of 'run'
+'halt' keeps its parameter 'sp' (it is stored in 'm.sp'), and its address is taken — a call through a function pointer sees no body
 ```
 
-A pointer type handed to C — an argument to an `extern`, a field of a struct one is handed, a
-variable an `extern` declares, or a parameter or answer of an `@export` function — may be called with
-anything, so every function whose address is taken at that type is held to the default. **A cast is
-not handing it to C**: a function pointer turned into an integer and back, or into another pointer
-type, is the raw tier's bargain — it is called through the type its address was taken at, where every
-call is still in sight and held to what the function keeps.
+Such a primitive takes a callable whose type marks the parameter instead — `&Fn(*M, @keeps *isize) ->
+unit` — so every call through it is held to the mark, and each closure made at it may keep it.
 
 **A stored callback keeps what it captured, and nothing else.** A closure is an object, and storing
 one — in a field, module storage, a buffer, a trait's implementation — is refused only where the

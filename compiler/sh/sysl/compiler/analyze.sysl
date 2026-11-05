@@ -1005,6 +1005,7 @@ private resolve_signatures(a: &Analysis)
                 check_bound_names(a, decl.scope, d.name, d.bounds)
                 check_trait_supers(a, key, d)
                 resolve_members(a, decl.scope, key, d.tparams, d.bounds, d.tvalues, d.methods, true)
+                check_trait_marks(a, decl.scope, d)
             _ -> ()
 
     // **An `impl` block's signatures are resolved where its members are lowered**, which is the
@@ -1213,6 +1214,59 @@ private check_keeps_names(a: &Analysis, scope: Scope, span: Span, d: ExternDecl)
             a.fault(scope, span, s"'@keeps' names '${k[i]}' twice, and a parameter is kept or it " +
                     "is not — the second says nothing the first does not")
 end check_keeps_names
+
+// **`@keeps` and `@answers` above a trait's method name its own parameters, each once**, and only a
+// method a call through an object can reach says them: one with a receiver. A misspelt name would
+// otherwise promise nothing, and every implementation keeping that parameter would be refused for a
+// mark its author believes is written. The receiver is the object itself and is never named.
+private check_trait_marks(a: &Analysis, scope: Scope, d: TraitDecl)
+    for m in d.methods
+        if m.marks.keeps.is_empty() && m.marks.answers.is_empty() then continue
+
+        val which = if m.marks.keeps.is_empty() then "answers" else "keeps"
+
+        if m.recv_mode().is_none()
+            a.fault(scope, m.named_at, s"'@$which' says what a call of '${m.name}' through an object may " +
+                    s"find held or answered, and '${m.name}' takes no receiver, so no object can call it — " +
+                    "a call of it names its type, and sees the body it reaches")
+            continue
+        end if
+
+        check_member_names(a, scope, m, "keeps", m.marks.keeps)
+        check_member_names(a, scope, m, "answers", m.marks.answers)
+
+        if !m.marks.answers.is_empty() && m.ret_type.is_none()
+            a.fault(scope, m.named_at, s"'@answers' says what the answer of '${m.name}' may be made of, and " +
+                    s"'${m.name}' answers nothing")
+end check_trait_marks
+
+private check_member_names(a: &Analysis, scope: Scope, m: MethodDecl, which: string, k: Buf[string])
+    for i in 0..<k.len()
+        var declared = false
+
+        for p in m.params
+            if p.name == k[i] then declared = true
+
+        var twice = false
+
+        for j in 0..<i
+            if k[j] == k[i] then twice = true
+
+        if !declared
+            var listed = ""
+
+            for j in 0..<m.params.len()
+                listed = if j == 0 then s"'${m.params[j].name}'" else s"$listed, '${m.params[j].name}'"
+
+            val tail = if m.params.is_empty() then " — it takes none besides its receiver"
+            else s" — its parameters are $listed"
+
+            a.fault(scope, m.named_at, s"'@$which' names '${k[i]}', which is not a parameter of " +
+                    s"'${m.name}'$tail")
+        else if twice
+            a.fault(scope, m.named_at, s"'@$which' names '${k[i]}' twice — the second says nothing the " +
+                    "first does not")
+end check_member_names
 
 // `@answers` names an `extern`'s own pointer parameters, each once, and the `extern` answers a
 // pointer. **A misspelling would otherwise make the answer fresh and say nothing**, and a `strchr`
