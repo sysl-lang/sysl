@@ -267,6 +267,30 @@ written_type_args_for(cx: &Analyzer, key: string, targ_exprs: Buf[Expr]) -> Buf[
     out
 end written_type_args_for
 
+// The trait `Get[int]` names, where the left side of a `::` is a generic trait's name with brackets
+// after it, read as the type `*Get[int]` points at; `None` where it is no such thing. Only the
+// questions that need no layout reach here, so the trait being no layout is no refusal.
+written_trait_instance(cx: &Analyzer, receiver: Expr) -> Option[Type]
+    val head = *receiver.kind match
+        Index(h, _, _) -> h
+        TypeArgs(h, _, _) -> h
+        _ -> return None
+
+    val written = written_name_of(cx, head)
+
+    if written.is_none() || cx.lookup(written.unwrap()).is_some() then return None
+
+    val key = lookup_type_key(cx.an, cx.scope, written.unwrap())
+
+    if key.is_none() || trait_decl_at(cx.an, key.unwrap()).is_none() then return None
+
+    val behind = type_ref(receiver.span, PtrType(written_type_ref(cx, receiver, false)))
+
+    resolve_type(cx.an, cx.scope, behind, cx.subst) match
+        Ptr(inner) -> Some(*inner)
+        other -> Some(other)
+end written_trait_instance
+
 private type_arg_read(cx: &Analyzer, e: Expr, at_address: bool) -> Type = *e.kind match
     Ident(n) -> resolve_type_arg(cx.an, cx.scope, named_type(e.span, n), cx.subst)
     // `()` is the type `unit`, spelled as its value is.

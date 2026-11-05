@@ -93,6 +93,52 @@ no arguments is refused because `Box` alone is not a single type; both are shown
 [what it refuses](#what-it-refuses). An anonymous `struct` or `union` block answers with the keyword
 that opened it.
 
+**A trait answers these three questions too**, as Rust's `type_name` answers for `dyn View`: its kind
+is `Trait`, and its names are the ones it was declared under. A trait object standing in for a type
+parameter answers the same, so `if const T::Kind == Kind.Trait` tells an object from a type. Behind
+a mode it is the mode that answers: `&View` is a `Ref` and `*View` a `Pointer`.
+
+```sysl
+trait View
+    draw(self) -> int
+
+trait Get[T]
+    get(self) -> T
+
+struct Button
+    width: int
+
+impl View for Button
+    draw(self) -> int = self.width
+
+which[T: View]() -> string
+    if const T::Kind == Kind.Trait then "object" else T::Name
+
+print(Kind::Image(View::Kind), View::Name, View::BaseName)
+print(Get[int]::Name, Get[int]::BaseName)
+print(which[View](), which[Button]())
+```
+
+```output
+Trait View View
+Get[int] Get
+object Button
+```
+
+A trait has no layout, so `View::Fields`, `View::Members` and `sizeof(View)` are refused, as a trait
+is as a field, a local or a parameter:
+
+```sysl
+trait View
+    draw(self) -> int
+
+print(View::Fields.len)
+```
+
+```error
+'View' is a trait, so it describes behaviour rather than a layout — write '*View' or '&View' for a trait object, or bound a type parameter with '[T: View]'
+```
+
 ## Fields and members
 
 **`T::Fields` lists the named fields of a struct, a tuple or a union, in declaration order.** Each
