@@ -877,7 +877,7 @@ subject_named(cx: &Analyzer, receiver: Expr) -> Option[Type]
     // associated function `PixelFormat.of(n)` does.
     val written = written_type_name(cx, receiver)
 
-    if written.is_none() then return None
+    if written.is_none() then return projection_subject(cx, receiver)
 
     val n = written.unwrap()
 
@@ -917,6 +917,24 @@ subject_named(cx: &Analyzer, receiver: Expr) -> Option[Type]
     // `Age.make()` reaches the `impl` written for `Age`.
     cx.an.tables.constrained_insts.get(key.unwrap())
 end subject_named
+
+// `M::Item.make()`, `Box::Item.make()`, `M::Item::Inner.make()` -- an associated type stands before
+// the dot the way the type it projects does. The subject is read first (a parameter, `Self`, a
+// declared type, or another projection), and the projection is then what the type grammar makes of
+// `M::Item`: off the bound in a generic body, so the call reaches exactly what the trait's
+// `type Item: Make` promises, and the implementation's choice once the subject is concrete. Nothing
+// where the subject has no associated type of that name, which leaves `int::Max` and the other
+// attributes to their own reading. `Box::Item::Target.make()` reaches what the projected type points
+// at, as `(&Thing)::Target.make()` does, or is refused the projection where it points at nothing.
+private projection_subject(cx: &Analyzer, receiver: Expr) -> Option[Type] = *receiver.kind match
+    TypeAttr(inner, attr, _, _) ->
+        val subject = subject_named(cx, inner)
+
+        if subject.is_none() then None
+        else if attr == "Target" then
+            Some(target_projection(cx.an, cx.scope, receiver.span, subject.unwrap()))
+        else assoc_type_opt(cx.an, subject.unwrap(), attr)
+    _ -> None
 
 // `value.member(args)` -- a call, which is what the parentheses said.
 call_member(cx: &Analyzer, span: Span, receiver: TExpr, name: string, args: Buf[Expr],
