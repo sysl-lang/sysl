@@ -197,6 +197,32 @@ private plc_covered(between: Inst) -> Buf[IrBlock]
     blocks
 end plc_covered
 
+// A `Buf` scope on a load or a store is a plain access with a licence beside it, and the pass reads it
+// as the plain one it is: `b[i]` is read through the element side.
+@test("a share of an element read with a Buf scope gives up its count, as a plain read's does")
+plc_scoped_source()
+    for acc in [AccBufElement, AccBufHeader, AccBufBox, AccBufHandle]
+        val after = plc_pass(plc_read(buf(), acc))
+
+        assert_eq(after.contains("@arc.retain(ptr %t1)"), false, after)
+        assert_eq(after.contains("@arc.release"), false, after)
+
+@test("a scoped field read may sit in an element's window; a scoped load through the reference may not")
+plc_scoped_inside()
+    var read: Buf[Inst] = buf()
+
+    for inst in plc_element("t5", "j", AccBufElement)
+        read.push(inst)
+
+    val blind = plc_pass(plc_read(read, AccBufElement))
+
+    assert_eq(blind.contains("@arc.retain(ptr %t1)"), false, blind)
+
+    val through = plc_with(InLoad(VReg("n"), LInt(64), VReg("t1"), AccBufElement, None))
+
+    assert_eq(plc_count(through, "@arc.retain(ptr %t1)"), 1, through)
+    assert_eq(plc_count(through, "@arc.release(ptr %t9)"), 1, through)
+
 @test("a reference read by a volatile load keeps its share")
 plc_volatile_source()
     val after = plc_pass(plc_read(buf(), AccVolatile))
@@ -373,6 +399,27 @@ private plc_source() -> string = raw"""
         val k = bs[i].kids
         k.a.v + k.b.v
 
+    one_key(m: Map[&Node, int], xs: Buf[&Node], i: usize) -> bool = m.get(xs[i]) is Some(_)
+
+    unchecked_key(m: Map[(&Node, &Node), int], xs: Buf[&Node], i: usize) -> bool
+        @unchecked
+            m.get((xs[i], xs[i + 1])) is Some(_)
+
+    nested_key(m: Map[(&Node, &Node), int], rows: Buf[Buf[&Node]], i: usize, j: usize) -> bool =
+        m.get((rows[i][j], rows[i][j + 1])) is Some(_)
+
+    field_key(m: Map[(&Node, &Node), int], bs: Buf[&Bag], i: usize) -> bool =
+        m.get((bs[i].kids.a, bs[i].kids.b)) is Some(_)
+
+    struct Two
+        a: &Node
+        b: &Node
+
+    impl IndexPlace[usize, &Node] for Two
+        index_place(*self, i: usize) -> *&Node = if i == 0 then &self.a else &self.b
+
+    own_key(m: Map[(&Node, &Node), int], t: *Two) -> bool = m.get((t[0usize], t[1usize])) is Some(_)
+
     returned(n: &Bag) -> (&Node, &Node) = (n.kids.a, n.kids.b)
 
     captured(n: &Bag) -> &Fn() -> int
@@ -408,6 +455,14 @@ private plc_source() -> string = raw"""
 
         bs.push(b)
         put_kids(m, b)
+
+        var m1: Map[&Node, int] = map()
+        var rows: Buf[Buf[&Node]] = buf()
+        var t = Two(xs[0], xs[1])
+
+        rows.push(xs)
+        print(one_key(m1, xs, 0), unchecked_key(m, xs, 0), nested_key(m, rows, 0, 0), field_key(m, bs, 0),
+              own_key(m, &t))
         print(find_pairs(cells, (xs[0], xs[1])), use_generic(cells, (xs[1], xs[0])), get_kids(m, b),
               get_synced(sm, ss), hits(m, xs), sum_elem(bs, 0), returned(b).0.v, captured(b)(), swapped(b),
               kept(b, b))
@@ -491,6 +546,62 @@ plc_emitted_lookups()
             assert_eq(plc_traffic(item.1), 0, item.1)
 
     assert(lookups >= 4, s"$lookups")
+
+// A `Buf` subscript reads its element with the element scope (`emit_place.sysl`'s `buf_side`), and
+// every shape of one is still a place the key's count is elided for.
+@test("a key of one Buf subscript costs no count")
+plc_emitted_one_key()
+    val fs = plc_funcs()
+
+    if fs.is_empty() then return
+
+    val ir = plc_ir(fs, "one_key")
+
+    assert(ir.contains("!alias.scope"), ir)
+    assert_eq(plc_traffic(ir), 0, ir)
+
+@test("a key built of @unchecked Buf subscripts costs no count")
+plc_emitted_unchecked_key()
+    val fs = plc_funcs()
+
+    if fs.is_empty() then return
+
+    val ir = plc_ir(fs, "unchecked_key")
+
+    assert(ir.contains("index_place_unchecked"), ir)
+    assert_eq(plc_traffic(ir), 0, ir)
+
+@test("a key built of subscripts of a Buf's element Buf costs no count")
+plc_emitted_nested_key()
+    val fs = plc_funcs()
+
+    if fs.is_empty() then return
+
+    val ir = plc_ir(fs, "nested_key")
+
+    assert_eq(plc_traffic(ir), 0, ir)
+
+@test("a key built of fields of a Buf's elements costs no count")
+plc_emitted_field_key()
+    val fs = plc_funcs()
+
+    if fs.is_empty() then return
+
+    val ir = plc_ir(fs, "field_key")
+
+    assert_eq(plc_traffic(ir), 0, ir)
+
+@test("a key built of a program's own IndexPlace subscripts reads them unscoped, and costs no count")
+plc_emitted_own_key()
+    val fs = plc_funcs()
+
+    if fs.is_empty() then return
+
+    val ir = plc_ir(fs, "own_key")
+
+    assert(ir.contains("Two.index_place"), ir)
+    assert(!ir.contains("!alias.scope"), ir)
+    assert_eq(plc_traffic(ir), 0, ir)
 
 @test("a key built of places handed to a map that keeps it is copied once, and never given back")
 plc_emitted_put_once()
