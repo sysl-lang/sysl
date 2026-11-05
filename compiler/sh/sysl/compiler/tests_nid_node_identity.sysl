@@ -1,0 +1,268 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// **A site is told by its node, never by where it was written** (`tast.sysl`'s `node_id`). Many nodes
+// are written at one place: every call taking a default holds its own reading of the callee's text,
+// a `for const` body is copied once per turn, a generic body is read once per instantiation, a
+// `defer` body runs at every way out. The keeps-analysis keys what it holds by node -- a keep
+// (`keeps_flow.sysl`'s `has_site`), storage made in place (`made_point`), a cast's call site, a thread
+// held for good -- and a closure written at a `@scoped` parameter is decided at every reading of its
+// call, not once for all of them (`member_call.sysl`'s `note_scoped_args`).
+//
+// The cells are the places one span holds many nodes: two calls taking the same default, a body read
+// for two instantiations (in either order), two closures on one line, a `for const` body's copies, and
+// a `defer` body reached from two ways out. Each prints what every closure captured, read after the
+// frame that made it has returned. A default closure kept at two calls is `tests_dak_default_arg_keeps`;
+// a derived member is a `for const` body read in the trait's file, so the unrolled cell stands for it.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private nid_outcome(text: string) -> (string, int)
+    val root = make_temp_dir("sysl-nid").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (failure_text(why), -1)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> ("the program that was built could not be run", -1)
+        Ok(out) -> (out.text + out.err.unwrap_or(""), shell_status(out.status))
+end nid_outcome
+
+private nid_prints(text: string, want: string)
+    if xvr_no_library() then return
+
+    val out = nid_outcome(text)
+
+    assert_eq(out.0, want)
+    assert_eq(out.1, 0)
+
+private nid_refused(text: string, part: string)
+    if xvr_no_library() then return
+
+    val out = nid_outcome(text)
+
+    assert_eq(out.1, -1, out.0)
+    assert(out.0.index_of(part).is_some(), out.0)
+
+// -- storage made in place by a default ------------------------------------------------------------
+
+// Two calls taking the default `&Cell(&target)` make two temporaries at the default's one span. Named
+// by the span, they were one storage, so the second -- holding only `&target` -- was read as holding
+// the first's `&x`, and storing its answer in module storage was refused.
+@test("two temporaries a default makes at two calls are two storages, not one")
+nid_default_temps_apart()
+    if xvr_no_library() then return
+
+    val out = nid_outcome(raw"""
+        var held: *int = null
+        var target = 7
+
+        struct Cell
+            p: *int
+
+        step(q: *int, c: *Cell = &Cell(&target)) -> *int
+            c.p = q
+            c.p
+
+        run()
+            var x = 1
+            val a = step(&x)
+            val b = step(&target)
+
+            held = b
+            print(*a + *held)
+
+        main()
+            run()
+        """)
+
+    assert(out.0.index_of("'b' holds the address").is_none(), out.0)
+
+// -- one argument, read once per instantiation -----------------------------------------------------
+
+private nid_runs(body: string) -> string = raw"""
+    import sysl.buf.{Buf, buf}
+
+    var parked: Buf[&sync Fn() -> unit] = buf()
+
+    trait Runs
+        go(*self, f: &sync Fn() -> unit)
+        finish(*self)
+
+    struct Scoped
+        jobs: Buf[&sync Fn() -> unit]
+
+    impl Runs for Scoped
+        @scoped(f)
+        go(*self, f: &sync Fn() -> unit) = self.jobs.push(f)
+
+        finish(*self)
+            for j in self.jobs do j()
+
+    struct Parker
+        n: int
+
+    impl Runs for Parker
+        go(*self, f: &sync Fn() -> unit) = parked.push(f)
+
+        finish(*self) = ()
+
+    total[S: Runs](s: *S, v: []int)
+        s.go(() -> print(v[0] + v[1]))
+        s.finish()
+
+    """ + body
+
+private nid_shared_view() -> string = "the 'v' it captures reaches a '[]int'"
+
+// The closure written at `s.go` lends its view to a `@scoped` `go` and is kept by `Parker`'s. Decided
+// once by where it was written, the `Scoped` reading's answer stood for the `Parker` reading too: the
+// parked closure held the buffer's elements with no count, and read them after the buffer was freed
+// (AddressSanitizer: heap-use-after-free).
+@test("a closure lent at one instantiation's @scoped call is not lent at another's keeping call")
+nid_scoped_reading_per_instance()
+    nid_refused(nid_runs(raw"""
+        lend()
+            var b: Buf[int] = buf()
+
+            b.push(1)
+            b.push(2)
+
+            var sc = Scoped(buf())
+
+            total(&sc, b.view())
+
+            var pk = Parker(0)
+
+            total(&pk, b.view())
+
+        main()
+            lend()
+
+            for j in parked do j()
+        """), nid_shared_view())
+
+@test("the keeping instantiation read first is refused, and the @scoped one after it still lends")
+nid_scoped_reading_keeper_first()
+    nid_refused(nid_runs(raw"""
+        main()
+            var b: Buf[int] = buf()
+
+            b.push(1)
+            b.push(2)
+
+            var pk = Parker(0)
+
+            total(&pk, b.view())
+
+            var sc = Scoped(buf())
+
+            total(&sc, b.view())
+        """), nid_shared_view())
+
+@test("an instantiation reaching only the @scoped member lends its view and runs")
+nid_scoped_reading_scoped_only()
+    nid_prints(nid_runs(raw"""
+        main()
+            var b: Buf[int] = buf()
+
+            b.push(1)
+            b.push(2)
+
+            var sc = Scoped(buf())
+
+            total(&sc, b.view())
+            total(&sc, b.view())
+        """), "3\n3\n3\n")
+
+// -- closures sharing a line, a copied body, or a `defer` ------------------------------------------
+
+@test("two closures on one line, one kept and one called, each capture their own frame's values")
+nid_two_closures_one_line()
+    nid_prints(raw"""
+        import sysl.buf.{Buf, buf}
+
+        var parked: Buf[&Fn() -> int] = buf()
+
+        both(keep: &Fn() -> int, now: &Fn() -> int) -> int
+            parked.push(keep)
+            now()
+
+        work(n: int) -> int
+            var a = n * 10
+            var b = n * 100
+            both(() -> a + 1, () -> b + 2) + both(() -> b + 3, () -> a + 4)
+
+        main()
+            print(work(1))
+            print(work(2))
+
+            for f in parked do print(f())
+        """, "116\n226\n11\n103\n21\n203\n")
+
+@test("the copies of a for const body keep or borrow their closures each on its own")
+nid_unrolled_closures()
+    nid_prints(raw"""
+        import sysl.buf.{Buf, buf}
+
+        var parked: Buf[&Fn() -> int] = buf()
+
+        park(f: &Fn() -> int, keep: bool) -> int
+            if keep then parked.push(f)
+            f()
+
+        work(n: int) -> int
+            var a = n * 10
+            var sum = 0
+
+            for const i in 0..<3
+                sum += park(() -> a + int(i), i != 1)
+
+            sum
+
+        main()
+            print(work(1))
+            print(work(2))
+
+            for f in parked do print(f())
+        """, "33\n63\n10\n12\n20\n22\n")
+
+@test("a deferred closure kept at every way out is kept from each of them")
+nid_defer_closures()
+    nid_prints(raw"""
+        import sysl.buf.{Buf, buf}
+
+        var parked: Buf[&Fn() -> int] = buf()
+
+        park(f: &Fn() -> int) = parked.push(f)
+
+        work(n: int) -> int
+            var a = n * 10
+            defer park(() -> a + 1)
+
+            if n > 1 then return n
+
+            defer park(() -> a + 2)
+            a + 3
+
+        main()
+            print(work(1))
+            print(work(2))
+
+            for f in parked do print(f())
+        """, "13\n2\n12\n11\n21\n")
