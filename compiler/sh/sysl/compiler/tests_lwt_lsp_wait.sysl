@@ -1,0 +1,123 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{File, open}
+import sysl.io.{bytes_writer, fd_reader}
+import sysl.process.{pipe, spawn, Spawned, Status, Stdio}
+import sysl.text.{from_utf8_lossy, Search}
+import sysl.time.{millis, monotonic, whole_millis}
+
+// How `sysl lsp` waits on its input (`lsp_arrives`): "not yet" only once the time is up, "ready" as
+// soon as a message lands, and "ready" for an input that has ended or cannot be waited on, so the
+// read after it reports the end instead of the server waiting on it for ever. A character device is
+// the case Darwin's `poll` answers POLLNVAL for, which a terminal on standard input is.
+
+private lwt_fd(f: File) -> int = f.fd().unwrap()
+
+private lwt_put(w: *File, text: string)
+    w.write(text.bytes)
+    w.flush().unwrap()
+
+// A writer in another process that sleeps a tenth of a second and then writes `text` into `w`: input
+// that arrives while the server is already waiting.
+private lwt_write_later(w: File, text: string) -> &Spawned =
+    spawn("sh", ["-c", "sleep 0.1; printf %s \"$1\"", "sh", text], stdout = Stdio.ToFile(w)).unwrap()
+
+@test("lwt: an empty input is not ready, and the answer comes only once the time has passed")
+lwt_times_out_with_no_input()
+    val (r, w) = pipe().unwrap()
+    val began = monotonic()
+
+    assert(!lsp_arrives(fd_reader(lwt_fd(r)), 50))
+    assert(whole_millis(monotonic() - began) >= 49, s"${whole_millis(monotonic() - began)} ms")
+
+    // A timeout of zero asks once and does not wait.
+    val again = monotonic()
+
+    assert(!lsp_arrives(fd_reader(lwt_fd(r)), 0))
+    assert(whole_millis(monotonic() - again) < 1000)
+    assert(lwt_fd(w) >= 0)
+
+@test("lwt: input waiting already is ready at once")
+lwt_waiting_input_is_ready()
+    val (r, w) = pipe().unwrap()
+    var g = w
+
+    lwt_put(&g, lsp_frame("{}"))
+
+    val began = monotonic()
+
+    assert(lsp_arrives(fd_reader(lwt_fd(r)), 5000))
+    assert(lsp_arrives(fd_reader(lwt_fd(r)), 0))
+    assert(whole_millis(monotonic() - began) < 1000)
+
+@test("lwt: input arriving during the wait makes it ready before the time is up")
+lwt_input_arriving_within_the_timeout()
+    val (r, w) = pipe().unwrap()
+    val writer = lwt_write_later(w, lsp_frame("{}"))
+    val began = monotonic()
+    val got = lsp_arrives(fd_reader(lwt_fd(r)), 10000)
+    val took = whole_millis(monotonic() - began)
+
+    assert_eq(writer.wait().unwrap(), Status.Exited(0))
+    assert(got)
+    assert(took >= 90 && took < 5000, s"$took ms")
+
+@test("lwt: an input whose writer has gone is ready, and the read answers its end")
+lwt_ended_input_is_ready()
+    val (r, w) = pipe().unwrap()
+    var g = w
+
+    g.close().unwrap()
+
+    val began = monotonic()
+    var input = fd_reader(lwt_fd(r))
+
+    assert(lsp_arrives(input, 5000))
+    assert(whole_millis(monotonic() - began) < 1000)
+
+    var into: [4]u8 = [0; 4]
+
+    assert_eq(input.read(into[..]).len, 0)
+
+@test("lwt: a character device is ready, as a terminal on standard input has to be")
+lwt_character_device_is_ready()
+    val dev = open("/dev/null").unwrap()
+    val began = monotonic()
+
+    assert(lsp_arrives(fd_reader(lwt_fd(dev)), 5000))
+    assert(whole_millis(monotonic() - began) < 1000)
+
+@test("lwt: a descriptor that is not open counts as ready, so the read reports it")
+lwt_unopened_descriptor_is_ready()
+    val began = monotonic()
+
+    assert(lsp_arrives(fd_reader(-1), 5000))
+    assert(lsp_arrives(fd_reader(1 << 20), 5000))
+    assert(whole_millis(monotonic() - began) < 1000)
+
+@test("lwt: a session served over a real pipe, waited on with lsp_arrives, ends with its exit")
+lwt_a_session_over_a_pipe()
+    val (r, w) = pipe().unwrap()
+    val init = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"capabilities\":{}}}"
+    val shutdown = "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"shutdown\",\"params\":null}"
+    val exit = "{\"jsonrpc\":\"2.0\",\"method\":\"exit\",\"params\":{}}"
+
+    var g = w
+
+    lwt_put(&g, lsp_frame(init))
+
+    // The rest arrives while the server waits on the pipe.
+    val writer = lwt_write_later(w, lsp_frame(shutdown) + lsp_frame(exit))
+    var input = fd_reader(lwt_fd(r))
+    var out = bytes_writer()
+    var noted: Buf[string] = buf()
+    val code = lsp_serve(&input, &out, line -> noted.push(line), ms -> lsp_arrives(input, ms))
+    val said = from_utf8_lossy(out.bytes.view())
+
+    assert_eq(writer.wait().unwrap(), Status.Exited(0))
+    assert_eq(noted.len(), 0)
+    assert_eq(code, 0)
+    assert(said.contains("\"id\":1"), said)
+    assert(said.contains("\"id\":2"), said)

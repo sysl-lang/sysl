@@ -4,8 +4,10 @@ import sh.sysl.parsing.*
 import sysl.buf.{Buf, buf}
 import sysl.encoding.json.{Json, Member as JsonMember, parse as parse_json, quoted as json_quote}
 import sysl.fs.{is_file, read_bytes}
-import sysl.io.{Reader, stdin}
+import sysl.io.{FdReader, Reader, stdin}
+import sysl.io.wait.Wait
 import sysl.text.{from_utf8, from_utf8_lossy, parse_uint, split, str_builder, to_lower, Search}
+import sysl.time.millis
 
 // `sysl lsp`: the Language Server Protocol over standard input and output, answered by the compiler
 // itself.
@@ -100,23 +102,13 @@ lsp_command(args: []string, note: string -> unit) -> int
 
     var input = stdin()
 
-    lsp_serve(&input, stdout(), note, lsp_stdin_arrives)
+    lsp_serve(&input, stdout(), note, ms -> lsp_arrives(input, ms))
 end lsp_command
 
-// One `struct pollfd`: a descriptor, what to wait for on it, and what happened.
-private struct LspPollFd
-    fd: i32
-    events: i16
-    revents: i16
-
-private extern "poll" lsp_c_poll(fds: *LspPollFd, n: usize, timeout: int) -> int
-
-// Whether standard input has something to read -- a message, or its end -- within `ms` milliseconds.
-private lsp_stdin_arrives(ms: int) -> bool
-    var p = LspPollFd(0, 1, 0)
-
-    lsp_c_poll(&p, 1, ms) > 0
-end lsp_stdin_arrives
+// Whether `r` has something to read -- a message, or its end -- within `ms` milliseconds. A
+// descriptor that cannot be waited on counts as ready, so the read that follows reports what is
+// wrong with it instead of the server waiting on it for ever.
+lsp_arrives(r: FdReader, ms: int) -> bool = r.readable(millis(ms)).unwrap_or(true)
 
 // Reads messages from `r` and writes the answers to `w` until `exit`, returning the status to end
 // with. Input that ends without an `exit`, or a message whose framing cannot be read, ends the
