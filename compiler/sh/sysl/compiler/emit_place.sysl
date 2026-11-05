@@ -550,8 +550,10 @@ store_into(e: *Emit, ty: Type, p: Val, v: Val, acc: IrAccess)
 
     // A large aggregate gives its old contents back at the address rather than out of a value read
     // for the purpose: there is nothing to load one into that would not be the whole-aggregate load
-    // lowering it through memory exists to avoid.
-    if e.layout.indirect(ty) && is_plain(acc)
+    // lowering it through memory exists to avoid. Only a plain access may be written at an address --
+    // volatile and atomic are per-instruction, and there is no one instruction here; a `Buf` scope is
+    // a licence the back end may decline, so the aggregate written at its address goes without it.
+    if e.layout.indirect(ty) && is_plain_access(acc)
         retain_value(e, ty, v)
         release_at(e, ty, p)
         emit(e, InStore(lty(e, ty), v, p, AccPlain, None))
@@ -564,14 +566,6 @@ store_into(e: *Emit, ty: Type, p: Val, v: Val, acc: IrAccess)
     emit(e, InStore(lty(e, ty), v, p, acc, None))
     release_value(e, ty, old)
 end store_into
-
-// Whether an access says nothing beyond "read it" -- which is the only one an aggregate written at
-// its address may be, since the other two are per-instruction and there is no one instruction here.
-// A `Buf` access is a plain one with a scope beside it, and the scope is only ever a licence the
-// back end may decline, so the aggregate written at its address simply goes without.
-private is_plain(acc: IrAccess) -> bool = acc match
-    AccPlain | AccBufHeader | AccBufBox | AccBufElement | AccBufHandle -> true
-    _ -> false
 
 // -- the bit ranges of a bitfield struct's container --------------------------------------------------
 
