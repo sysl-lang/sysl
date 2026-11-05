@@ -1,6 +1,6 @@
 ---
 title: The io module
-summary: "`sysl.io` — `Reader`, the one trait input travels through; `FdReader` and `stdin()`; `lines()`, the cursor that borrows what it reads from; and `ReadAt`/`WriteAt`, reading and writing at an offset."
+summary: "`sysl.io` — `Reader`, the one trait input travels through; `FdReader` and `stdin()`; `lines()`, the cursor that borrows what it reads from; `ReadAt`/`WriteAt`, reading and writing at an offset; and `sysl.io.wait`, waiting for a descriptor with a time limit."
 weight: 40
 ---
 
@@ -663,6 +663,96 @@ reaches and leaves unanswered is refused when it is compiled**, naming every suc
 it reaches, rather than surfacing at the link as a symbol nobody wrote. Everything above the hooks is
 unchanged: every renderer, every `Display`, the whole of `lines`, and every `impl Reader` a program
 wrote for itself.
+
+## Waiting with a time limit — `sysl.io.wait`
+
+A `read` waits for as long as it takes. A program that reads one stream **and also keeps time** — a
+server that gathers edits arriving close together, a terminal program telling a lone `Escape` from the
+start of a key sequence, a loop with work of its own to do between inputs — needs to ask first whether
+a read would wait, and for how long it is prepared to hear "not yet". That is `sysl.io.wait`:
+
+```sysl
+enum Interest
+    Readable
+    Writable
+
+ready(fd: int, interest: Interest, timeout: Duration) -> Result[bool, IoError]
+
+trait Wait
+    readable(self, timeout: Duration) -> Result[bool, IoError]
+    writable(self, timeout: Duration) -> Result[bool, IoError]
+
+impl Wait for FdReader
+impl Wait for File
+```
+
+`ready` answers `true` as soon as the descriptor is ready, and `false` once `timeout` has passed and
+it is not. `Wait` asks the same of what a program already holds — standard input's reader, or an open
+[`File`](/library/fs/) such as a pipe's end:
+
+```sysl
+import sysl.io.wait.Wait
+import sysl.process.pipe
+import sysl.time.millis
+
+val (r, w) = pipe().unwrap()
+var g = w
+
+print(r.readable(millis(20)))
+
+g.write("hello".bytes)
+g.flush().unwrap()
+
+print(r.readable(millis(20)))
+print(g.writable(millis(0)))
+```
+
+```output
+Ok(false)
+Ok(true)
+Ok(true)
+```
+
+- **It never answers `false` early.** The time is rounded up to the system's unit, and a signal that
+  arrives during the wait does not cut it short: the wait is asked for again with whatever of the
+  timeout is still owed. A timeout of zero, or less, asks once and does not wait.
+- **The end of the input is readable.** A pipe whose every writer has gone is ready, and the `read`
+  that follows answers nothing — which is what tells a program its input has ended, rather than that
+  it has nothing yet. A pipe whose reader has gone is writable, and the write is what reports it.
+- **A descriptor that is not open is `Err(NotOpen)`**, a closed `File` included. A terminal or another
+  character device is waited on like a pipe, although Darwin's `poll` cannot do that itself.
+- **One descriptor, one direction.** It is `poll(2)` on a single descriptor — the `Interest` that mio
+  registers, with no set to manage. A program waiting on many descriptors at once wants an event loop.
+
+**A module of its own, because of what it fails with.** The error is
+[`sysl.fs.IoError`](/library/fs/), and `sysl.fs` is built on `sysl.io`, so the reading surface
+cannot name the filesystem's error without the two modules depending on each other. `ready` is
+`@needs(os)`, and a `@no_os` module that reaches it is refused at the call:
+
+```sysl
+@no_os
+
+import sysl.io.wait.{Readable, ready}
+import sysl.time.millis
+
+print(ready(0, Readable, millis(0)).is_ok())
+```
+
+```error
+this reaches 'sysl.io.wait.ready', which needs 'os', and this module declared '@no_os'
+```
+
+On a hosted target the library answers its hook, `sysl_io_wait` in `sysl.io.sys`, over `poll`. A
+freestanding program reaching it answers it with an `@export` of its own, or is refused by name when
+it is compiled, as with the other two hooks:
+
+```sysl
+@export("sysl_io_wait")
+console_wait(fd: int, writable: int, micros: long) -> int = 1
+```
+
+It answers one when the descriptor is ready within `micros` microseconds, zero when the time ran out
+first, or the code of what went wrong, negated.
 
 ---
 

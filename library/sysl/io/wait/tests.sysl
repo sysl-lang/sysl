@@ -1,0 +1,154 @@
+module sysl.io.wait
+@requires(posix)
+@tests
+
+import sysl.fs.{File, NotOpen, open}
+import sysl.io.{Reader, fd_reader}
+import sysl.io.sys.fd_write
+import sysl.process.pipe
+import sysl.threads.spawn
+import sysl.time.{millis, monotonic, sleep, whole_millis}
+
+// What `ready` answers over a real pipe: at once where there is something, after the time where there
+// is not, as soon as a write from elsewhere lands, and an error for a descriptor that is not open.
+
+private fd_of(f: File) -> int = f.fd().unwrap()
+
+private put(fd: int, text: string) = assert_eq(fd_write(fd, &text.bytes[0], text.bytes.len), isize(text.bytes.len))
+
+@test("iow a pipe with bytes in it is readable at once")
+iow_pipe_with_data_is_ready()
+    val (r, w) = pipe().unwrap()
+
+    put(fd_of(w), "x")
+
+    val began = monotonic()
+
+    assert_eq(ready(fd_of(r), Readable, millis(5000)), Ok(true))
+    assert(whole_millis(monotonic() - began) < 1000)
+
+@test("iow an empty pipe is not readable, and the answer comes only once the time has passed")
+iow_empty_pipe_times_out()
+    val (r, w) = pipe().unwrap()
+    val began = monotonic()
+
+    assert_eq(ready(fd_of(r), Readable, millis(50)), Ok(false))
+    assert(whole_millis(monotonic() - began) >= 49, s"${whole_millis(monotonic() - began)} ms")
+    assert(fd_of(w) >= 0)
+
+private struct Later
+    fd: int
+    after: long
+
+private write_later(l: *Later) -> unit
+    sleep(millis(l.after))
+    put(l.fd, "late")
+
+@test("iow bytes written from another thread during the wait make it ready before the time is up")
+iow_write_from_a_thread_wakes_the_wait()
+    val (r, w) = pipe().unwrap()
+    var l = Later(fd_of(w), 100)
+    val t = spawn(&write_later, &l).unwrap()
+    val began = monotonic()
+    val got = ready(fd_of(r), Readable, millis(10000))
+    val took = whole_millis(monotonic() - began)
+
+    assert(t.join())
+    assert_eq(got, Ok(true))
+    assert(took >= 90 && took < 5000, s"$took ms")
+
+@test("iow a timeout of zero asks once: false over an empty pipe, true over a full one, and no wait")
+iow_zero_timeout_polls_once()
+    val (r, w) = pipe().unwrap()
+    val began = monotonic()
+
+    assert_eq(ready(fd_of(r), Readable, millis(0)), Ok(false))
+    put(fd_of(w), "y")
+    assert_eq(ready(fd_of(r), Readable, millis(0)), Ok(true))
+    assert(whole_millis(monotonic() - began) < 1000)
+
+@test("iow a negative timeout is a timeout of zero")
+iow_negative_timeout_is_zero()
+    val (r, w) = pipe().unwrap()
+    val began = monotonic()
+
+    assert_eq(ready(fd_of(r), Readable, millis(-500)), Ok(false))
+    assert(whole_millis(monotonic() - began) < 400)
+    assert(fd_of(w) >= 0)
+
+@test("iow a pipe whose writer has gone is readable, and the read answers its end")
+iow_hung_up_pipe_is_readable()
+    val (r, w) = pipe().unwrap()
+    var g = w
+
+    g.close().unwrap()
+
+    assert_eq(ready(fd_of(r), Readable, millis(5000)), Ok(true))
+
+    var into: [4]u8 = [0; 4]
+    var input = fd_reader(fd_of(r))
+
+    assert_eq(input.read(into[..]).len, 0)
+    assert(!input.failed())
+
+@test("iow a descriptor that was never opened, or a negative one, is NotOpen")
+iow_bad_descriptor_is_an_error()
+    assert_eq(ready(-1, Readable, millis(10)), Err(NotOpen))
+    assert_eq(ready(-1, Writable, millis(0)), Err(NotOpen))
+    assert_eq(ready(1000000, Readable, millis(10)), Err(NotOpen))
+
+@test("iow the write end of an empty pipe is writable, and its read end is not readable")
+iow_write_end_is_writable()
+    val (r, w) = pipe().unwrap()
+
+    assert_eq(ready(fd_of(w), Writable, millis(1000)), Ok(true))
+    assert_eq(ready(fd_of(r), Readable, millis(0)), Ok(false))
+
+@test("iow FdReader.readable asks the reader's own descriptor")
+iow_reader_readable_is_ready_of_its_fd()
+    val (r, w) = pipe().unwrap()
+    val input = fd_reader(fd_of(r))
+
+    assert_eq(input.readable(millis(0)), Ok(false))
+    put(fd_of(w), "z")
+    assert_eq(input.readable(millis(1000)), Ok(true))
+
+@test("iow a File answers for its own descriptor, both ways, and a closed one is NotOpen")
+iow_file_waits_on_its_descriptor()
+    val (r, w) = pipe().unwrap()
+    var g = w
+
+    assert_eq(r.readable(millis(0)), Ok(false))
+    assert_eq(g.writable(millis(1000)), Ok(true))
+
+    g.write("f".bytes)
+    g.flush().unwrap()
+
+    assert_eq(r.readable(millis(1000)), Ok(true))
+
+    g.close().unwrap()
+
+    assert_eq(g.writable(millis(0)), Err(NotOpen))
+    assert_eq(g.readable(millis(0)), Err(NotOpen))
+
+// Darwin's `poll` answers "not open" for every character device, terminals included; the wait has to
+// see through that to the device being open.
+@test("iow a character device is waited on like a pipe: /dev/null is readable and writable")
+iow_device_is_not_mistaken_for_closed()
+    val dev = open("/dev/null").unwrap()
+
+    assert_eq(dev.readable(millis(1000)), Ok(true))
+    assert_eq(dev.writable(millis(1000)), Ok(true))
+    assert_eq(ready(dev.fd().unwrap(), Readable, millis(0)), Ok(true))
+
+@test("iow a wait longer than the time it takes still answers as soon as the bytes are there")
+iow_long_timeout_answers_early()
+    val (r, w) = pipe().unwrap()
+
+    put(fd_of(w), "now")
+
+    val began = monotonic()
+
+    // Longer than `poll` can be asked for at once in milliseconds, so it is asked for in pieces.
+    assert_eq(ready(fd_of(r), Readable, millis(3_000_000_000)), Ok(true))
+    assert(whole_millis(monotonic() - began) < 1000)
