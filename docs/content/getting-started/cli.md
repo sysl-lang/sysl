@@ -1242,6 +1242,7 @@ grammars.
 | `--no-error-traces` | record no [error return trace](/reference/errors/#where-a-failure-came-from) — the [`error_traces` key](/reference/packages/#leaving-the-error-return-trace-out) for one build |
 | `--general-regs-only` | keep the code out of the floating-point and SIMD registers — the [`codegen` block](/reference/packages/#what-the-generated-code-may-use-of-the-machine) for one build |
 | `--strict-align` | make every access aligned — the [`codegen` block](/reference/packages/#what-the-generated-code-may-use-of-the-machine) for one build |
+| `--error-limit <n>` | how many [errors a failed compilation shows](#how-many-errors-are-shown); defaults to 20, and `0` shows every one |
 | `-p <member>`, `--package <member>` | in a [workspace](/reference/packages/#workspaces), the member to build, test or run |
 | `-v`, `--verbose` | report what the build decided: the files read, the standard module and how it was reached, the search paths, the allocator, and the clang and linker command lines |
 | `--explain-escapes` | report every local array promoted to the heap |
@@ -1268,6 +1269,21 @@ The standard-module flags and `-O` are covered in
 [`lto` manifest key](/reference/packages/#link-time-optimization), `--link` of the
 [`link` key](/reference/packages/#linking-a-library-statically), and the two profile flags are the
 first and last steps of the workflow below.
+
+### How many errors are shown
+
+A compilation that fails shows its first **20** errors, in source order (by file, then line, then
+column), and closes with a line saying how many more there were:
+
+```text
+10 more errors not shown; '--error-limit 0' shows all
+```
+
+`--error-limit <n>` shows `n` instead, and `--error-limit 0` shows every one, as clang's
+`-ferror-limit` does. Every command that compiles takes it, `sysl test` included; a value that is
+not a whole number is refused before anything is built. **Only errors count**: a compilation that
+succeeds prints each of its warnings however many there are, and one that fails prints its errors
+alone. The [language server](#lsp) is handed every diagnostic whatever the limit.
 
 ### Debug and release
 

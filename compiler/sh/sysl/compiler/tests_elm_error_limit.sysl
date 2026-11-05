@@ -1,0 +1,285 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_temp_dir, remove_dir_all, write_text}
+import sysl.text.{join, str_builder, Search}
+
+// **How many errors a failed compilation shows** (`getting-started/cli.md § Flags every subcommand
+// takes`): twenty unless `--error-limit <n>` says otherwise, `0` for every one, with a closing line
+// saying how many were left out. Every command that compiles takes the flag, `sysl test` included; a
+// warning takes no place an error could have had; and the language server, which reads diagnostics
+// as data, is handed every one of them whatever the flag said.
+
+private elm_ready() -> bool = std_root().is_ok() && clang_available()
+
+// A package of one `main.sysl`, in a directory of its own.
+private elm_project(main: string) -> string
+    val dir = absolute_path(make_temp_dir("sysl-elm").unwrap())
+
+    write_text(s"$dir/package.hocon", "").unwrap()
+    write_text(s"$dir/main.sysl", main).unwrap()
+    dir
+end elm_project
+
+// A program with `n` mistakes, each an undefined name in a function of its own.
+private elm_broken(n: int) -> string
+    var b = str_builder()
+
+    for i in 1..n
+        b.push(s"f$i() -> int = nope$i\n\n")
+
+    b.push("main()\n    print(1)\n")
+    b.finish()
+end elm_broken
+
+// A command line run in process: its status, and what it said on standard error.
+private elm_cli(args: []string) -> (int, string)
+    var notes: Buf[string] = buf()
+    val noted = &notes
+    val code = run_cli_noted(args, (line) -> (), (line) -> noted.push(line))
+
+    reset_search_paths()
+    (code, join(notes.view(), "\n"))
+end elm_cli
+
+// `sysl <command> <root> <flags…>` over a program with `n` mistakes.
+private elm_run(command: string, n: int, flags: []const string) -> (int, string)
+    val root = elm_project(elm_broken(n))
+    var args: Buf[string] = buf()
+
+    args.push("sysl")
+    args.push(command)
+    args.push(root)
+
+    for flag in flags
+        args.push(flag)
+
+    val got = elm_cli(args.view())
+
+    remove_dir_all(root).unwrap_or(())
+    got
+end elm_run
+
+private elm_trailer(n: int) -> string = s"$n more errors not shown; '--error-limit 0' shows all"
+
+// -- the default -------------------------------------------------------------------------------
+
+@test("thirty errors show the first twenty, and a line says ten more were not shown")
+elm_default_is_twenty()
+    if !elm_ready() then return
+
+    val got = elm_run("build", 30, [])
+
+    assert(got.0 != 0, got.1)
+    assert_eq(got.1.count_of("error: "), 20)
+    assert(got.1.contains("undefined name 'nope20'"), got.1)
+    assert(!got.1.contains("undefined name 'nope21'"), got.1)
+    assert(got.1.ends_with("\n\n" + elm_trailer(10)), got.1)
+
+@test("errors under the limit are all shown, with no closing line")
+elm_under_the_limit_no_trailer()
+    if !elm_ready() then return
+
+    val got = elm_run("build", 5, [])
+
+    assert(got.0 != 0, got.1)
+    assert_eq(got.1.count_of("error: "), 5)
+    assert(!got.1.contains("not shown"), got.1)
+
+// -- the flag -----------------------------------------------------------------------------------
+
+@test("--error-limit 0 shows every error")
+elm_zero_shows_all()
+    if !elm_ready() then return
+
+    val got = elm_run("build", 30, ["--error-limit", "0"])
+
+    assert(got.0 != 0, got.1)
+    assert_eq(got.1.count_of("error: "), 30)
+    assert(got.1.contains("undefined name 'nope30'"), got.1)
+    assert(!got.1.contains("not shown"), got.1)
+
+@test("--error-limit 3 shows three, and says how many more there were")
+elm_three_shows_three()
+    if !elm_ready() then return
+
+    val got = elm_run("build", 30, ["--error-limit", "3"])
+
+    assert_eq(got.1.count_of("error: "), 3)
+    assert(got.1.contains("undefined name 'nope3'"), got.1)
+    assert(!got.1.contains("undefined name 'nope4'"), got.1)
+    assert(got.1.ends_with("\n\n" + elm_trailer(27)), got.1)
+
+@test("a limit exactly at the count shows them all and no closing line; one past it says 'error'")
+elm_at_the_limit_and_one_past()
+    if !elm_ready() then return
+
+    val at = elm_run("build", 3, ["--error-limit", "3"])
+
+    assert_eq(at.1.count_of("error: "), 3)
+    assert(!at.1.contains("not shown"), at.1)
+
+    val past = elm_run("build", 4, ["--error-limit", "3"])
+
+    assert_eq(past.1.count_of("error: "), 3)
+    assert(past.1.ends_with("\n\n1 more error not shown; '--error-limit 0' shows all"), past.1)
+
+@test("sysl test honours --error-limit as a build does, and its default is the same")
+elm_test_honours_the_flag()
+    if !elm_ready() then return
+
+    val two = elm_run("test", 30, ["--error-limit", "2"])
+
+    assert(two.0 != 0, two.1)
+    assert_eq(two.1.count_of("error: "), 2)
+    assert(two.1.ends_with("\n\n" + elm_trailer(28)), two.1)
+
+    val plain = elm_run("test", 30, [])
+
+    assert_eq(plain.1.count_of("error: "), 20)
+    assert(plain.1.ends_with("\n\n" + elm_trailer(10)), plain.1)
+
+@test("a limit given twice is the last one written")
+elm_last_flag_wins()
+    if !elm_ready() then return
+
+    val got = elm_run("build", 30, ["--error-limit", "0", "--error-limit", "4"])
+
+    assert_eq(got.1.count_of("error: "), 4)
+    assert(got.1.ends_with("\n\n" + elm_trailer(26)), got.1)
+
+// -- a bad value --------------------------------------------------------------------------------
+
+@test("--error-limit takes a whole number, and refuses anything else by name")
+elm_bad_values_refused()
+    for bad in ["x", "", "-1", "3.5", "1e3", "+2"]
+        var args: [2]string = ["--error-limit", bad]
+
+        assert_eq(link_flag_refusal(args[..]),
+                  Some(s"'--error-limit' takes how many errors to show, a whole number with '0' for " +
+                       s"all of them, and '$bad' is not one"))
+        assert_eq(took_search_flag(args[..], 0), 0)
+
+    reset_search_paths()
+
+@test("a refused --error-limit stops the command before it builds, with status 2")
+elm_bad_value_stops_the_command()
+    if !elm_ready() then return
+
+    val got = elm_run("build", 30, ["--error-limit", "lots"])
+
+    assert_eq(got.0, 2, got.1)
+    assert(got.1.contains("'--error-limit' takes how many errors to show"), got.1)
+    assert(!got.1.contains("undefined name"), got.1)
+
+@test("--error-limit with nothing after it is a missing value")
+elm_missing_value()
+    if !elm_ready() then return
+
+    val got = elm_run("build", 3, ["--error-limit"])
+
+    assert_eq(got.0, 2, got.1)
+    assert(got.1.contains("Missing value after --error-limit"), got.1)
+    assert(!got.1.contains("undefined name"), got.1)
+
+// -- warnings, and the language server ----------------------------------------------------------
+
+private elm_place(src: Source, at: usize, message: string, error: bool) -> Placed =
+    if error then placed_error(src, Span(at, at + 1), message) else placed_warning(src, Span(at, at + 1), message)
+
+@test("a warning in a report takes no place an error could have had, and is not counted as one")
+elm_warnings_do_not_count()
+    var lines = str_builder()
+
+    for _i in 0..<10
+        lines.push("a\n")
+
+    val src = source_of("mixed.sysl", lines.finish())
+    var all: Buf[Placed] = buf()
+
+    // Warnings first and between: three errors, four warnings, a limit of two.
+    all.push(elm_place(src, 0, "careful 1", false))
+    all.push(elm_place(src, 2, "careful 2", false))
+    all.push(elm_place(src, 4, "wrong 1", true))
+    all.push(elm_place(src, 6, "careful 3", false))
+    all.push(elm_place(src, 8, "wrong 2", true))
+    all.push(elm_place(src, 10, "wrong 3", true))
+    all.push(elm_place(src, 12, "careful 4", false))
+
+    var two: [2]string = ["--error-limit", "2"]
+
+    assert_eq(took_search_flag(two[..], 0), 2)
+
+    val text = analysis_report(all)
+
+    reset_search_paths()
+    assert_eq(text.count_of("warning: "), 4)
+    assert_eq(text.count_of("error: "), 2)
+    assert(text.contains("error: wrong 2"), text)
+    assert(!text.contains("wrong 3"), text)
+    assert(text.ends_with("\n\n1 more error not shown; '--error-limit 0' shows all"), text)
+
+@test("a build that succeeds says every warning, however many, whatever --error-limit says")
+elm_warnings_of_a_success_are_all_said()
+    if !elm_ready() then return
+
+    var b = str_builder()
+
+    b.push("fallible() -> Result[int, string] = Ok(1)\n\nmain()\n")
+
+    for _i in 0..<25
+        b.push("    fallible()\n")
+
+    val root = elm_project(b.finish())
+    val got = elm_cli(["sysl", "build", root, "-o", s"$root/built", "--error-limit", "1"])
+
+    remove_dir_all(root).unwrap_or(())
+    assert_eq(got.0, 0, got.1)
+    assert_eq(got.1.count_of("warning: "), 25)
+    assert(!got.1.contains("not shown"), got.1)
+
+@test("a build that fails says no warning, so warnings never stand in for errors")
+elm_warnings_of_a_failure_are_not_said()
+    if !elm_ready() then return
+
+    var b = str_builder()
+
+    b.push("fallible() -> Result[int, string] = Ok(1)\n\nmain()\n")
+
+    for _i in 0..<5
+        b.push("    fallible()\n")
+
+    b.push("    print(nope)\n")
+
+    val root = elm_project(b.finish())
+    val got = elm_cli(["sysl", "build", root, "--error-limit", "1"])
+
+    remove_dir_all(root).unwrap_or(())
+    assert(got.0 != 0, got.1)
+    assert_eq(got.1.count_of("error: "), 1)
+    assert_eq(got.1.count_of("warning: "), 0)
+    assert(!got.1.contains("not shown"), got.1)
+
+@test("the language server is handed every diagnostic, whatever --error-limit said")
+elm_language_server_gets_all()
+    if !elm_ready() then return
+
+    val root = elm_project(elm_broken(30))
+    val file = s"$root/main.sysl"
+    var three: [2]string = ["--error-limit", "3"]
+
+    assert_eq(took_search_flag(three[..], 0), 2)
+
+    val found = lsp_analyze(file, elm_broken(30))
+
+    reset_search_paths()
+    remove_dir_all(root).unwrap_or(())
+
+    var n: usize = 0
+
+    for item in found.0
+        n += item.diagnostics.len()
+
+    assert_eq(n, 30)

@@ -71,16 +71,22 @@ unplaced_error(src: Source, span: Span, message: string) -> Placed =
 placed_warning(src: Source, span: Span, message: string) -> Placed =
     Placed(src, Diagnostic(Warning, span, readable_keys(message), "", ""), true)
 
-// How many errors one compilation reports.
+// How many errors one compilation reports where `--error-limit` did not say: twenty, as clang's
+// `-ferror-limit` defaults to.
 //
-// Five is already more than anyone fixes before compiling again, and the further down a broken file
-// a diagnostic is, the likelier it is to be a consequence of one further up rather than a mistake of
-// its own. A wall of them is not more information.
+// The further down a broken file a diagnostic is, the likelier it is to be a consequence of one
+// further up, so a report is bounded; but a project broken in several directories at once is mended
+// by several hands, each of whom needs to see their own errors, so the bound is generous and the
+// flag lifts it (`0` shows every one).
 //
 // **It is the renderer's rule and not the list's.** A caller reading diagnostics as data wants all
-// of them -- an editor underlines every mistake in the file, and five would leave the rest unmarked
-// -- so nothing truncates until the report does.
-const DiagnosticLimit: usize = 5
+// of them -- an editor underlines every mistake in the file, and a limit would leave the rest
+// unmarked -- so nothing truncates until the report does. **Only errors count**: a warning handed to
+// a report is shown and takes no place an error could have had.
+const DefaultErrorLimit: usize = 20
+
+// The limit this command reports to, `0` for none.
+error_limit() -> usize = error_limit_flag().unwrap_or(DefaultErrorLimit)
 
 // The order a reader reads a compilation in: by file, then by line, then by column.
 //
@@ -131,21 +137,34 @@ private ended(where: Placed) -> string = ended_text(where.render())
 
 private ended_text(text: string) -> string = if text.ends_with("\n") then text[0..<text.bytes.len - 1] else text
 
-// A compilation's diagnostics, assembled: at most the limit of them, separated by a blank line, with
-// a closing count where there were more. The ones kept are the **first** -- the list arrives in
-// source order, and an error early in a file is the one worth reading.
+// A compilation's diagnostics, assembled: at most the limit of its errors, separated by a blank line,
+// with a closing line saying how many more there were. The ones kept are the **first** -- the list
+// arrives in source order, and an error early in a file is the one worth reading.
 analysis_report(all: Buf[Placed]) -> string
     val ordered = in_source_order(all)
+    val limit = error_limit()
     var b = str_builder()
-    val shown = if ordered.len() < DiagnosticLimit then ordered.len() else DiagnosticLimit
+    var errors: usize = 0
+    var hidden: usize = 0
+    var any = false
 
-    for i in 0..<shown
-        if i > 0 then b.push("\n\n")
+    for item in ordered
+        if item.is_error()
+            errors += 1
 
-        b.push(ended(ordered[i]))
+            if limit != 0 && errors > limit
+                hidden += 1
+                continue
+        end if
 
-    if ordered.len() > DiagnosticLimit then
-        b.push(s"\n\nshowing the first ${DiagnosticLimit} of ${ordered.len()} errors")
+        if any then b.push("\n\n")
+
+        b.push(ended(item))
+        any = true
+
+    if hidden > 0 then
+        b.push(s"\n\n$hidden more ${if hidden == 1 then "error" else "errors"} not shown; " +
+               "'--error-limit 0' shows all")
 
     b.finish()
 end analysis_report
