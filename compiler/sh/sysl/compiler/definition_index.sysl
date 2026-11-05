@@ -85,6 +85,35 @@ struct Indexing
     end is_clean
 end Indexing
 
+// What an editor's check asks of the analysis beyond the index: an answer before the whole of it,
+// and a way to be told to stop.
+//
+// **The check comes in two tiers.** The first is what the program's own text says -- the parse, the
+// declarations, every body the package wrote -- and `first_tier` is told its diagnostics as soon as
+// it is done. The second is everything the whole program decides -- the instantiations, the library
+// bodies reached, module storage evaluated, the whole-program checks such as `check_keeps` -- and its
+// diagnostics are the analysis's own at the end, exactly what a build says.
+//
+// **`superseded` is asked at every step's boundary**, and once it answers true the analysis stops
+// where it is and `abandoned` says so: the text it was reading has changed, so nothing it would go on
+// to find is about the text the editor now holds.
+struct EditorCheck
+    first_tier: &Fn(Buf[Placed]) -> unit
+    superseded: &Fn() -> bool
+    abandoned: bool
+end EditorCheck
+
+editor_check(first_tier: &Fn(Buf[Placed]) -> unit, superseded: &Fn() -> bool) -> &EditorCheck =
+    EditorCheck(first_tier, superseded, false)
+
+// Whether the editor's check this analysis is has been told to stop -- asked of the text the editor
+// holds now, once per boundary, and remembered. A build is never told to.
+editor_gave_up(a: &Analysis) -> bool = a.editor match
+    None -> false
+    Some(e) ->
+        if !e.abandoned && e.superseded() then e.abandoned = true
+        e.abandoned
+
 // A reference from a name written at `at` in the file `cx` is reading, where the analysis is
 // recording any.
 note_reference(cx: &Analyzer, at: Span, home: Source, declared: Span, name: string, detail: string = "")
@@ -198,11 +227,14 @@ private declared_name(home: Scope, name: string) -> string =
 
 // One file analyzed the way an editor asks for it: the compilation `emit-typed` reads, with an index
 // to fill. The reference's `Analyzer.indexed`.
-indexed_file(path: string) -> Result[Indexing, Failure]
+//
+// An editor's check hands `editor` (`EditorCheck`); where it was told to stop, what comes back is
+// whatever had been found by then, and `editor.abandoned` says it is not the whole.
+indexed_file(path: string, editor: Option[&EditorCheck] = None) -> Result[Indexing, Failure]
     val t = target_for(path, None)?
     val program = packaged_compilation_of(path, t)?
     val ix = definition_index()
-    val done = analyze_produced(program.units, program.target, buf(), true, Some(ix))
+    val done = analyze_produced(program.units, program.target, buf(), true, Some(ix), editor = editor)
 
     Ok(Indexing(ix.references, done.reported))
 end indexed_file
@@ -211,11 +243,12 @@ end indexed_file
 // tree alone, analyzed with no entry point to look for. Every file is one the compilation produces
 // rather than one the standard module supplies, so every body is read and every mistake reported, as
 // in `std_test_build_of`.
-indexed_std(root: string) -> Result[Indexing, Failure]
+indexed_std(root: string, editor: Option[&EditorCheck] = None) -> Result[Indexing, Failure]
     val t = target_for(root, None)?
     val program = std_compilation_of(root, t)?
     val ix = definition_index()
-    val done = analyze_produced(program.units, program.target, file_names(program.units), false, Some(ix))
+    val done = analyze_produced(program.units, program.target, file_names(program.units), false, Some(ix),
+                                editor = editor)
 
     Ok(Indexing(ix.references, done.reported))
 end indexed_std

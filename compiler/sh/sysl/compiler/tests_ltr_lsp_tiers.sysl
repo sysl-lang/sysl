@@ -1,0 +1,444 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.encoding.json.{quoted as json_quote}
+import sysl.fs.{make_temp_dir, remove_dir_all, write_text}
+import sysl.io.{bytes_writer, Reader}
+import sysl.text.{from_utf8_lossy, split, Search}
+
+// `sysl lsp` publishing in two tiers: what the program's own text says first, what the whole program
+// decides -- a keeps refusal, module storage evaluated -- merged in after it, and a check whose text
+// has changed under it stopped before it publishes anything about the old text. The oracle for what
+// a check ends with is a whole analysis of the same text, as a build makes it.
+
+// ---- the fixtures ----
+
+// A program whose `run` hands `store` the address of its local `local`, which `store` keeps -- a
+// refusal only the whole-program `check_keeps` makes -- and, where `name` is not empty, a function
+// whose body names `name`, which nothing declares: a mistake typing the body finds.
+private ltr_text(local: string, name: string) -> string =
+    "static var spare = 0\nstatic var held: *int = &spare\n\nstore(p: *int)\n    held = p\n\n" +
+    s"run()\n    var $local = 1\n    store(&$local)\n\n" +
+    (if name == "" then "" else s"broken() -> int = $name\n\n") + "run()\n"
+
+// The same program with nothing kept: `run` stores nothing.
+private ltr_mended(name: string) -> string =
+    "static var spare = 0\nstatic var held: *int = &spare\n\nstore(p: *int)\n    held = p\n\n" +
+    "run()\n    var n = 1\n    print(n)\n\n" +
+    (if name == "" then "" else s"broken() -> int = $name\n\n") + "run()\n"
+
+private ltr_kept(local: string) -> string = s"'&$local' is the address of a local of 'run'"
+
+private ltr_undefined(name: string) -> string = s"undefined name '$name'"
+
+// Module storage whose evaluation traps: refused only once the storage is laid down, which an
+// editor's check does in its second tier.
+private ltr_trapping() -> string =
+    "const per(n: int, k: int) -> int = n / k\n\nstatic val Z: [2]int = [1, per(1, 0)]\n\nprint(Z[0])\n"
+
+private ltr_trap() -> string = "'Z' traps while it is being compiled: integer division by zero"
+
+// ---- the messages an editor sends ----
+
+private ltr_request(id: int, method: string, params: string) -> string =
+    s"{\"jsonrpc\":\"2.0\",\"id\":$id,\"method\":\"$method\",\"params\":$params}"
+
+private ltr_notify(method: string, params: string) -> string =
+    s"{\"jsonrpc\":\"2.0\",\"method\":\"$method\",\"params\":$params}"
+
+private ltr_open(uri: string, text: string) -> string =
+    ltr_notify("textDocument/didOpen", s"{\"textDocument\":{\"uri\":\"$uri\",\"languageId\":\"sysl\",\"version\":1,\"text\":${json_quote(text)}}}")
+
+private ltr_change(uri: string, version: int, text: string) -> string =
+    ltr_notify("textDocument/didChange",
+               s"{\"textDocument\":{\"uri\":\"$uri\",\"version\":$version},\"contentChanges\":[{\"text\":${json_quote(text)}}]}")
+
+private ltr_ready() -> LspServer
+    var server = lsp_server()
+
+    lsp_answer(&server, ltr_request(1, "initialize", "{\"capabilities\":{}}"))
+    lsp_answer(&server, ltr_notify("initialized", "{}"))
+    server
+end ltr_ready
+
+private ltr_count(hay: string, needle: string) -> usize = split(hay, needle).len - 1
+
+private ltr_where(hay: string, needle: string) -> usize = hay.index_of(needle) match
+    Some(i) -> i
+    None ->
+        assert(false, s"'$needle' is not in: $hay")
+        0
+
+// Every message of `out`, a line each, which is what a failing count shows.
+private ltr_joined(out: Buf[string]) -> string
+    var all = ""
+
+    for m in out
+        all = all + m + "\n"
+
+    all
+end ltr_joined
+
+// The publication for `uri` among `out`, the last of them.
+private ltr_last_for(out: Buf[string], uri: string) -> string
+    var last = ""
+
+    for m in out
+        if m.contains(s"\"uri\":\"$uri\"") then last = m
+
+    last
+end ltr_last_for
+
+// ---- an editor whose next message arrives only once the server has said enough ----
+
+// Input handed over a batch per read, where each batch after the first ARRIVES -- `ltr_arrives`
+// says so -- only once the server has written `gates[i]` publications: a message sent while the
+// server is part-way through a check, at exactly the point the test names. The position is held in a
+// buffer so the copy a closure takes moves with the server's.
+private struct LtrInput
+    batches: Buf[string]
+    gates: Buf[usize]
+    // The next batch, and how far into it the reads have come.
+    at: Buf[usize]
+end LtrInput
+
+impl Fallible for LtrInput
+
+impl Reader for LtrInput
+    read(*self, into: []u8) -> []const u8
+        val next = self.at[0]
+
+        if next >= self.batches.len() then return into[0..<0]
+
+        val b = self.batches[next].bytes
+        var n = b.len - self.at[1]
+
+        if n > into.len then n = into.len
+
+        for i in 0..<n do into[i] = b[self.at[1] + i]
+
+        self.at[1] += n
+
+        if self.at[1] == b.len
+            self.at[0] = next + 1
+            self.at[1] = 0
+        end if
+
+        into[0..<n]
+    end read
+
+private ltr_input() -> LtrInput
+    var at: Buf[usize] = buf()
+
+    at.push(0)
+    at.push(0)
+    LtrInput(buf(), buf(), at)
+end ltr_input
+
+// A batch of messages, framed, arriving once `gate` publications have been written.
+private ltr_batch(r: *LtrInput, gate: usize, bodies: []string)
+    var out = ""
+
+    for b in bodies
+        out = out + lsp_frame(b)
+
+    r.batches.push(out)
+    r.gates.push(gate)
+end ltr_batch
+
+// Whether the next batch has arrived, given what the server has written.
+private ltr_arrives(r: LtrInput, written: string) -> bool =
+    r.at[0] < r.batches.len() && ltr_count(written, "textDocument/publishDiagnostics") >= r.gates[r.at[0]]
+
+// The session served: what the server wrote, and the status it ended with.
+private ltr_serve(input: LtrInput) -> (string, int)
+    var r = input
+    var w = bytes_writer()
+    var noted: Buf[string] = buf()
+    val code = lsp_serve(&r, &w, line -> noted.push(line), _ -> ltr_arrives(r, from_utf8_lossy(w.bytes.view())))
+
+    assert_eq(noted.len(), 0)
+    (from_utf8_lossy(w.bytes.view()), code)
+end ltr_serve
+
+private ltr_begin(r: *LtrInput, uri: string, text: string) =
+    ltr_batch(r, 0, [ltr_request(1, "initialize", "{\"capabilities\":{}}"), ltr_notify("initialized", "{}"),
+                     ltr_open(uri, text)])
+
+private ltr_end(r: *LtrInput, gate: usize) =
+    ltr_batch(r, gate, [ltr_request(9, "shutdown", "null"), ltr_notify("exit", "{}")])
+
+// ---- the two tiers ----
+
+@test("ltr: the first tier's diagnostics are published before the second tier's")
+ltr_first_tier_comes_first()
+    if std_root().is_err() then return
+
+    val root = make_temp_dir("sysl-ltr").unwrap()
+    val uri = lsp_file_uri(s"$root/t.sysl")
+    var server = ltr_ready()
+    val out = lsp_answer(&server, ltr_open(uri, ltr_text("n", "nope")))
+
+    // Two publications: the body's mistake alone, then the body's mistake with the keeps refusal.
+    assert_eq(out.len(), 2)
+    assert(out[0].contains(ltr_undefined("nope")), out[0])
+    assert(!out[0].contains(ltr_kept("n")), out[0])
+    assert(out[1].contains(ltr_undefined("nope")), out[1])
+    assert(out[1].contains(ltr_kept("n")), out[1])
+
+    remove_dir_all(root).unwrap_or(())
+end ltr_first_tier_comes_first
+
+@test("ltr: an error only the second tier finds appears after the first tier's publication, alone")
+ltr_a_keeps_refusal_arrives_second()
+    if std_root().is_err() then return
+
+    val root = make_temp_dir("sysl-ltr").unwrap()
+    val uri = lsp_file_uri(s"$root/t.sysl")
+    var server = ltr_ready()
+    val out = lsp_answer(&server, ltr_open(uri, ltr_text("n", "")))
+
+    assert_eq(out.len(), 2)
+    assert_eq(out[0], ltr_empty(uri))
+    assert_eq(ltr_count(out[1], "\"message\""), 1)
+    assert(out[1].contains(ltr_kept("n")), out[1])
+
+    // And module storage that traps while it is laid down: the second tier's too.
+    val trapped = lsp_answer(&server, ltr_change(uri, 2, ltr_trapping()))
+
+    assert_eq(trapped.len(), 2)
+    assert_eq(trapped[0], ltr_empty(uri))
+    assert(trapped[1].contains(ltr_trap()), trapped[1])
+
+    remove_dir_all(root).unwrap_or(())
+end ltr_a_keeps_refusal_arrives_second
+
+// What an empty list for `uri` is published as.
+private ltr_empty(uri: string) -> string =
+    s"{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/publishDiagnostics\",\"params\":{\"uri\":\"$uri\",\"diagnostics\":[]}}"
+
+@test("ltr: once the second tier is done, the published list is a whole analysis's, every tier's error in it")
+ltr_the_last_publication_is_a_whole_analysis()
+    if std_root().is_err() then return
+
+    val root = make_temp_dir("sysl-ltr").unwrap()
+    val file = s"$root/t.sysl"
+    val uri = lsp_file_uri(file)
+    // A body's mistake, a keeps refusal, and storage that traps when it is laid down.
+    val text = ltr_text("n", "nope") + "\nconst per(n: int, k: int) -> int = n / k\n\n" +
+               "static val Z: [2]int = [1, per(1, 0)]\n"
+
+    write_text(file, text).unwrap()
+
+    var server = ltr_ready()
+    val last = ltr_last_for(lsp_answer(&server, ltr_open(uri, text)), uri)
+
+    // The oracle: the analysis a build makes of the same text, which lays storage down as it types it.
+    val whole = indexed_file(file).unwrap()
+
+    assert_eq(whole.problems.len(), 3)
+    assert_eq(ltr_count(last, "\"message\""), whole.problems.len())
+
+    for p in whole.problems
+        val quoted = json_quote(p.diag.message)
+
+        assert(last.contains(quoted[1..<(quoted.bytes.len - 1)]), s"${p.diag.message} is not in: $last")
+
+    remove_dir_all(root).unwrap_or(())
+end ltr_the_last_publication_is_a_whole_analysis
+
+@test("ltr: a fix clears a second-tier error, and its old list is not kept up over the changed text")
+ltr_a_fix_clears_the_second_tier()
+    if std_root().is_err() then return
+
+    val root = make_temp_dir("sysl-ltr").unwrap()
+    val uri = lsp_file_uri(s"$root/t.sysl")
+    var server = ltr_ready()
+
+    assert(lsp_answer(&server, ltr_open(uri, ltr_text("n", "")))[1].contains(ltr_kept("n")))
+
+    // The document's own text changed, so the refusal found in the old text is not shown with the
+    // first tier's list; the second tier finds nothing to add, and says nothing more.
+    val mended = lsp_answer(&server, ltr_change(uri, 2, ltr_mended("")))
+
+    assert_eq(mended.len(), 1)
+    assert_eq(mended[0], ltr_empty(uri))
+    assert_eq(server.held.len(), 0)
+
+    remove_dir_all(root).unwrap_or(())
+end ltr_a_fix_clears_the_second_tier
+
+@test("ltr: another file's second-tier error stays up while this one is edited, and goes when it is fixed")
+ltr_a_held_error_stays_up_across_an_edit()
+    if std_root().is_err() then return
+
+    val root = make_temp_dir("sysl-ltr").unwrap()
+
+    write_text(s"$root/package.hocon", "package {\n  name = \"probe\"\n}\n").unwrap()
+    write_text(s"$root/keep.sysl", "var spare = 0\nvar held: *int = &spare\n\n" +
+                                   "store(p: *int)\n    held = p\n\nrun()\n    var n = 1\n    store(&n)\n").unwrap()
+
+    val uri = lsp_file_uri(s"$root/main.sysl")
+    val keep = lsp_file_uri(absolute_path(s"$root/keep.sysl"))
+    var server = ltr_ready()
+    val opened = lsp_answer(&server, ltr_open(uri, "main()\n    run()\n"))
+
+    assert_eq(opened.len(), 2, ltr_joined(opened))
+    assert_eq(opened[0], ltr_empty(uri))
+    assert(opened[1].contains(s"\"uri\":\"$keep\"") && opened[1].contains(ltr_kept("n")), opened[1])
+
+    // The edit is to `main.sysl`: the first tier's publication keeps `keep.sysl`'s refusal up, and the
+    // second, finding it again, sends nothing it has not sent.
+    val edited = lsp_answer(&server, ltr_change(uri, 2, "main()\n    run()\n    print(nah)\n"))
+
+    assert_eq(edited.len(), 2)
+    assert(edited[0].contains(ltr_undefined("nah")), edited[0])
+    assert(edited[1].contains(s"\"uri\":\"$keep\"") && edited[1].contains(ltr_kept("n")), edited[1])
+    assert(!edited[1].contains("\"diagnostics\":[]"), edited[1])
+
+    // Fixed on the disk: the first tier still shows it -- its text is unchanged as far as the server
+    // knows -- and the second tier, finding nothing, clears it.
+    write_text(s"$root/keep.sysl", "var spare = 0\nvar held: *int = &spare\n\n" +
+                                   "store(p: *int)\n    held = p\n\nrun()\n    var n = 1\n    print(n)\n").unwrap()
+
+    val fixed = lsp_answer(&server, ltr_change(uri, 3, "main()\n    run()\n"))
+
+    assert_eq(fixed.len(), 3)
+    assert(fixed[1].contains(ltr_kept("n")), fixed[1])
+    assert_eq(fixed[2], ltr_empty(keep))
+    assert_eq(server.held.len(), 0)
+
+    remove_dir_all(root).unwrap_or(())
+end ltr_a_held_error_stays_up_across_an_edit
+
+// ---- a check stopped by a newer text ----
+
+@test("ltr: an edit arriving during the second tier stops it, and nothing about the old text is published after")
+ltr_an_edit_during_the_second_tier_stops_it()
+    if std_root().is_err() then return
+
+    val root = make_temp_dir("sysl-ltr").unwrap()
+    val uri = lsp_file_uri(s"$root/t.sysl")
+    var r = ltr_input()
+
+    ltr_begin(&r, uri, ltr_text("n", "aa"))
+    // Sent once the first tier of the first text has been published: the second tier is running.
+    ltr_batch(&r, 1, [ltr_change(uri, 2, ltr_text("m", "bb"))])
+    // Sent once the second text's check has published both tiers.
+    ltr_end(&r, 3)
+
+    val (out, code) = ltr_serve(r)
+
+    assert_eq(code, 0)
+
+    // The first text's first tier, then the second text's two: the first text's second tier -- the
+    // keeps refusal of `&n` -- was never published.
+    assert_eq(ltr_count(out, "textDocument/publishDiagnostics"), 3)
+    assert_eq(ltr_count(out, ltr_undefined("aa")), 1)
+    assert(!out.contains(ltr_kept("n")), out)
+    assert(ltr_where(out, ltr_undefined("aa")) < ltr_where(out, ltr_undefined("bb")), out)
+    assert(ltr_where(out, ltr_undefined("bb")) < ltr_where(out, ltr_kept("m")), out)
+
+    remove_dir_all(root).unwrap_or(())
+end ltr_an_edit_during_the_second_tier_stops_it
+
+@test("ltr: a fix arriving during the second tier stops it, and the error it would have found is never shown")
+ltr_a_fix_during_the_second_tier()
+    if std_root().is_err() then return
+
+    val root = make_temp_dir("sysl-ltr").unwrap()
+    val uri = lsp_file_uri(s"$root/t.sysl")
+    var r = ltr_input()
+
+    ltr_begin(&r, uri, ltr_text("n", ""))
+    ltr_batch(&r, 1, [ltr_change(uri, 2, ltr_mended(""))])
+    // The mended text's check publishes once: its second tier adds nothing.
+    ltr_end(&r, 2)
+
+    val (out, code) = ltr_serve(r)
+
+    assert_eq(code, 0)
+    assert_eq(ltr_count(out, "textDocument/publishDiagnostics"), 2)
+    assert(!out.contains(ltr_kept("n")), out)
+    assert_eq(ltr_count(out, ltr_empty(uri)), 2)
+
+    remove_dir_all(root).unwrap_or(())
+end ltr_a_fix_during_the_second_tier
+
+@test("ltr: an edit arriving before the first tier is published stops the check unpublished")
+ltr_an_edit_during_the_first_tier()
+    if std_root().is_err() then return
+
+    val root = make_temp_dir("sysl-ltr").unwrap()
+    val uri = lsp_file_uri(s"$root/t.sysl")
+    var r = ltr_input()
+
+    ltr_begin(&r, uri, ltr_text("n", "aa"))
+    // Arrives at once -- after the settle, so while the first text is being checked.
+    ltr_batch(&r, 0, [ltr_change(uri, 2, ltr_text("m", "bb"))])
+    ltr_end(&r, 2)
+
+    // The settle's own wait sees the change first, so the server is told it is there only once the
+    // check has begun: `arrives` answers false to the settle's wait and true afterwards.
+    var w = bytes_writer()
+    var noted: Buf[string] = buf()
+    var asked: Buf[int] = buf()
+    var rr = r
+    val code = lsp_serve(&rr, &w, line -> noted.push(line), ms ->
+        if ms > 0 then asked.push(ms)
+        ms == 0 && asked.len() > 0 && ltr_arrives(rr, from_utf8_lossy(w.bytes.view())))
+    val out = from_utf8_lossy(w.bytes.view())
+
+    assert_eq(code, 0)
+    assert(!out.contains(ltr_undefined("aa")), out)
+    assert(out.contains(ltr_undefined("bb")), out)
+    assert(out.contains(ltr_kept("m")), out)
+
+    remove_dir_all(root).unwrap_or(())
+end ltr_an_edit_during_the_first_tier
+
+@test("ltr: a hover or any other request arriving during a check does not stop it")
+ltr_a_request_does_not_stop_a_check()
+    if std_root().is_err() then return
+
+    val root = make_temp_dir("sysl-ltr").unwrap()
+    val uri = lsp_file_uri(s"$root/t.sysl")
+    var r = ltr_input()
+
+    ltr_begin(&r, uri, ltr_text("n", "aa"))
+    ltr_batch(&r, 1, [ltr_request(5, "no/such", "{}")])
+    ltr_end(&r, 2)
+
+    val (out, code) = ltr_serve(r)
+
+    assert_eq(code, 0)
+    assert_eq(ltr_count(out, "textDocument/publishDiagnostics"), 2)
+    assert(out.contains(ltr_kept("n")), out)
+    // The request waited for the check, and was answered after its second tier.
+    assert(ltr_where(out, ltr_kept("n")) < ltr_where(out, "\"id\":5,\"error\""), out)
+
+    remove_dir_all(root).unwrap_or(())
+end ltr_a_request_does_not_stop_a_check
+
+@test("ltr: only a change, a shutdown or an exit among the waiting messages supersedes a check")
+ltr_what_supersedes()
+    val change = lsp_frame(ltr_change("file:///x.sysl", 2, "a"))
+    val hover = lsp_frame(ltr_request(3, "textDocument/hover", "{}"))
+
+    assert(!lsp_supersedes_any(ltr_bytes("")))
+    assert(!lsp_supersedes_any(ltr_bytes(hover)))
+    assert(lsp_supersedes_any(ltr_bytes(hover + change)))
+    assert(lsp_supersedes_any(ltr_bytes(lsp_frame(ltr_request(4, "shutdown", "null")))))
+    assert(lsp_supersedes_any(ltr_bytes(lsp_frame(ltr_notify("exit", "{}")))))
+    // A change not yet whole is not read as one.
+    assert(!lsp_supersedes_any(ltr_bytes(hover + change[0..<(change.bytes.len - 3)])))
+end ltr_what_supersedes
+
+private ltr_bytes(s: string) -> Buf[u8]
+    var b: Buf[u8] = buf()
+
+    for c in s.bytes do b.push(c)
+
+    b
+end ltr_bytes
