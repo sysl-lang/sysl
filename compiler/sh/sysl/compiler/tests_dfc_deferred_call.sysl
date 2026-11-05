@@ -1,0 +1,299 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.text.Search
+
+// **A name deferred to each instantiation may be called.** At a generic's definition a pattern over a
+// value of a parameter's type -- `v match { Some(m) -> m(x) }` with `v: V` -- binds `m` at no type,
+// and calling it is judged where an instantiation says what `m` is, as every other use of it is: a
+// closure or a function there builds and runs, an `int` is refused as calling one always is. What the
+// call's arguments name is settled at the definition, so `m(nope)` is told `nope` is undefined there
+// even when nothing calls the generic.
+
+// What the compiler says about a one-file program, as the command line prints it.
+private dfc_err(text: string) -> string
+    val root = make_temp_dir("sysl-deferred-call").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, text).unwrap()
+
+    val out = emit_llvm_text(src, None) match
+        Err(why) -> why.message
+        Ok(made) -> if made.report.is_empty() then "" else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end dfc_err
+
+// How many complaints a report holds: each names its place once.
+private dfc_complaints(said: string) -> int
+    var rest = said
+    var n = 0
+
+    loop
+        rest.index_of("main.sysl:") match
+            None -> break
+            Some(at) ->
+                n += 1
+                rest = rest[at + 10..<rest.bytes.len]
+
+    n
+end dfc_complaints
+
+// The one complaint a program earns: `undefined name 'nope'`, at `line:col`.
+private dfc_nope(said: string, at: string)
+    val head = "error: undefined name 'nope'\n --> "
+
+    said.index_of(head) match
+        None -> assert(false, said)
+        Some(i) ->
+            val rest = said[i + head.bytes.len..<said.bytes.len]
+            val place = rest.index_of("\n") match
+                Some(n) -> rest[0..<n]
+                None -> rest
+
+            assert(place.ends_with(s"main.sysl:$at"), said)
+
+    assert_eq(dfc_complaints(said), 1, said)
+end dfc_nope
+
+// -- the definition says nothing about what a deferred name is called as ---------------------------
+
+@test("calling a deferred name is not refused at an uncalled generic's definition")
+dfc_quiet_at_definition()
+    if !enm_ready() then return
+
+    assert_eq(dfc_err(raw"""
+        opt[V](v: V) -> int
+            v match
+                Some(m) ->
+                    val a = m()
+                    val b = m(1) + 1
+                    val c = m(a, b, None, x -> x)
+                    val d = m[0](1) + m.0(2) + m.f(3)
+                    a + b + c + d
+                None -> 0
+
+        main()
+            print(1)
+        """), "")
+end dfc_quiet_at_definition
+
+// -- an undefined argument is told at the definition -----------------------------------------------
+
+@test("an undefined argument of a call of a deferred name is told at the definition")
+dfc_undefined_argument()
+    if !enm_ready() then return
+
+    dfc_nope(dfc_err(raw"""
+        opt[V](v: V) -> int
+            v match
+                Some(m) -> m(nope)
+                None -> 0
+
+        main()
+            print(1)
+        """), "3:22")
+
+    dfc_nope(dfc_err(raw"""
+        opt[V](v: V) -> int
+            v match
+                Some(m) ->
+                    val r = m(1, nope) + 1
+                    r
+                None -> 0
+
+        main()
+            print(1)
+        """), "4:26")
+end dfc_undefined_argument
+
+@test("a call of a deferred name in a closure and in an 'is' block tells an undefined argument")
+dfc_closure_and_is()
+    if !enm_ready() then return
+
+    dfc_nope(dfc_err(raw"""
+        opt[V](v: V) -> int
+            v match
+                Some(m) ->
+                    val g = () -> m(nope)
+                    g()
+                None -> 0
+
+        main()
+            print(1)
+        """), "4:29")
+
+    dfc_nope(dfc_err(raw"""
+        opt[V](v: V) -> int
+            if v is Some(m)
+                return m(nope)
+            0
+
+        main()
+            print(1)
+        """), "3:18")
+end dfc_closure_and_is
+
+@test("a call through an element, a tuple part or a field of a deferred name tells an undefined argument")
+dfc_through_a_part()
+    if !enm_ready() then return
+
+    dfc_nope(dfc_err(raw"""
+        opt[V](v: V) -> int
+            v match
+                Some(m) -> m[0](nope)
+                None -> 0
+
+        main()
+            print(1)
+        """), "3:25")
+
+    dfc_nope(dfc_err(raw"""
+        opt[V](v: V) -> int
+            v match
+                Some(m) -> m.0(nope)
+                None -> 0
+
+        main()
+            print(1)
+        """), "3:24")
+
+    dfc_nope(dfc_err(raw"""
+        opt[V](v: V) -> int
+            v match
+                Some(m) -> m.f(nope)
+                None -> 0
+
+        main()
+            print(1)
+        """), "3:24")
+end dfc_through_a_part
+
+@test("a deferred name passed on to a nested generic and called there tells an undefined argument")
+dfc_nested_generic()
+    if !enm_ready() then return
+
+    dfc_nope(dfc_err(raw"""
+        opt[V](v: V) -> int
+            inner[W](w: W) -> int
+                w match
+                    Some(k) -> k(nope)
+                    None -> 0
+
+            v match
+                Some(m) -> inner(Some(m))
+                None -> 0
+
+        main()
+            print(1)
+        """), "4:26")
+end dfc_nested_generic
+
+// -- each instantiation judges the call -------------------------------------------------------------
+
+@test("a call of a deferred name builds and runs at a closure, a function and a callable field")
+dfc_legal_runs()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        struct H
+            f: &Fn(int) -> int
+
+        inc(x: int) -> int = x + 1
+
+        call[V](v: V) -> int
+            v match
+                Some(m) -> m(2)
+                None -> 0
+
+        used[V](v: V) -> int
+            v match
+                Some(m) ->
+                    val r = m(10) * 2
+                    r
+                None -> 0
+
+        none[V](v: V) -> int
+            v match
+                Some(m) -> m()
+                None -> 0
+
+        boxed[V](v: V) -> int
+            if v is Some(m)
+                val g = () -> m.1.f(m.0)
+                return g()
+            0
+
+        part[V](v: V) -> int
+            v match
+                Some(m) -> m[1](5)
+                None -> 0
+
+        main()
+            val k = (x: int) -> x * 3
+            val fs = [k, k]
+            val f: &Fn(int) -> int = inc
+            val p = &inc
+
+            print(call(Some(k)), call(Some(f)), used(Some(f)), none(Some(() -> 7)), call(Some(p)))
+            print(boxed(Some((4, H(inc)))), part(Some(fs)))
+        """), "6 3 22 7 3\n5 15\n")
+end dfc_legal_runs
+
+@test("a deferred name passed on to a nested generic is called there at each instantiation")
+dfc_nested_generic_runs()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        apply[F](f: Option[F], x: int) -> int
+            f match
+                Some(g) -> g(x)
+                None -> -1
+
+        opt[V](v: V) -> int
+            inner[W](w: W) -> int
+                w match
+                    Some(k) -> k(1)
+                    None -> 0
+
+            v match
+                Some(m) -> inner(Some(m)) + apply(Some(m), 20)
+                None -> 0
+
+        main()
+            print(opt(Some((x: int) -> x + 100)))
+        """), "221\n")
+end dfc_nested_generic_runs
+
+@test("a call of a deferred name is refused at an instantiation that cannot be called")
+dfc_illegal_refused()
+    if !enm_ready() then return
+
+    val said = dfc_err(raw"""
+        opt[V](v: V) -> int
+            v match
+                Some(m) -> m(2)
+                None -> 0
+
+        main()
+            print(opt(Some(5)))
+        """)
+
+    assert(said.contains("'m' is int and is not callable"), said)
+
+    val element = dfc_err(raw"""
+        opt[V](v: V) -> int
+            v match
+                Some(m) -> m[0](2)
+                None -> 0
+
+        main()
+            print(opt(Some([1, 2])))
+        """)
+
+    assert(element.contains("the thing being called must be a name, or something whose type says " +
+                            "it is callable"), element)
+end dfc_illegal_refused
