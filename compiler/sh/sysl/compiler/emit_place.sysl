@@ -59,11 +59,12 @@ place_access(e: *Emit, x: TExpr) -> IrAccess = *x.kind match
 // a program may lay handles out in a `Buf[usize]` of its own, so an element write is told nothing
 // about a handle and must be read again after one.
 //
-// **An element** is what `core.elems[i]` reaches for a `BufCore` `core`, and anything inside that
-// element. Indexing any other view, or reading through a pointer an element holds, is neither, and
-// keeps the plain access that says nothing.
+// **An element** is what `core.elems[i]` reaches for a `BufCore` `core`, and what a program's own
+// `b[i]` reaches -- the subscript is `*b.index_place(i)`, and the address `Buf`'s `index_place` hands
+// back is always into its storage -- and anything inside that element. Indexing any other view, or
+// reading through a pointer an element holds, is neither, and keeps the plain access that says nothing.
 buf_side(x: TExpr) -> IrAccess = *x.kind match
-    TDeref(operand, _) -> pointer_side(texpr_type(operand))
+    TDeref(operand, _) -> if is_buf_element_address(operand) then AccBufElement else pointer_side(texpr_type(operand))
     TField(receiver, _, ft) ->
         if is_buf_core(texpr_type(receiver)) then AccBufHeader
         else
@@ -88,6 +89,19 @@ pointer_side(t: Type) -> IrAccess = underlying(t) match
     _ -> AccPlain
 
 private is_buf_core(t: Type) -> bool = struct_base_is(t, "BufCore")
+
+// Whether an address is the one a `Buf`'s subscript reads through: a call of its `index_place`, or
+// of the `index_place_unchecked` an `@unchecked` block's subscript calls, on a `Buf` receiver.
+private is_buf_element_address(x: TExpr) -> bool = *x.kind match
+    TCall(name, args, _, _) ->
+        !args.is_empty() && struct_base_is(receiver_type(texpr_type(args[0])), "Buf") &&
+            (calls_member(name, "index_place") || calls_member(name, "index_place_unchecked"))
+    _ -> false
+
+// A receiver's type with the pointer an implicit borrow added taken off.
+private receiver_type(t: Type) -> Type = underlying(t) match
+    Ptr(inner) -> *inner
+    _ -> t
 
 // Whether a type is the named struct of `sysl.buf`, at any element type.
 private struct_base_is(t: Type, name: string) -> bool = underlying(t) match

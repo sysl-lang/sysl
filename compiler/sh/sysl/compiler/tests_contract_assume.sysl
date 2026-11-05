@@ -46,11 +46,17 @@ private ca_no_library() -> bool
     false
 end ca_no_library
 
-// The LLVM text of the whole module a source lowers to, or the first thing it was refused with.
-private ca_ir(text: string) -> string
+// The LLVM text of the whole module a source lowers to. A source that is refused stops the test with
+// what it was refused with: handed on as though it were IR, the message would pass every test that
+// asks the IR for something to be absent.
+private ca_ir(text: string) -> string = ca_lowered(text) match
+    Ok(ir) -> ir
+    Err(said) -> panic(s"the fixture was refused: $said")
+
+private ca_lowered(text: string) -> Result[string, string]
     val parsed = parse(source_of("t.sysl", text))
 
-    if !parsed.ok() then return parsed.first().message
+    if !parsed.ok() then return Err(parsed.first().message)
 
     var units: Buf[Program] = buf()
     val library = ca_library()
@@ -62,19 +68,19 @@ private ca_ir(text: string) -> string
 
     val done = analyze_bodies(units, host_target())
 
-    if !done.reported.is_empty() then return done.reported[0].diag.message
+    if !done.reported.is_empty() then return Err(done.reported[0].diag.message)
 
     val whole = program_of(done, "")
     val promotions = post_analysis_checks(done.an, whole, buf())
     val said = errors_of(done.an.diagnostics())
 
-    if !said.is_empty() then return analysis_report(said)
+    if !said.is_empty() then return Err(analysis_report(said))
 
     val kept = prune(strip_tests(whole), program_own(units))
     val lowered = codegen_with_gaps(kept, host_target(), promotions)
 
-    ir_print_module(lowered.0)
-end ca_ir
+    Ok(ir_print_module(lowered.0))
+end ca_lowered
 
 // What clang's `-O2` leaves of a program, or `None` where there is no clang to ask.
 private ca_optimized(text: string) -> Option[string]
@@ -383,12 +389,12 @@ ca_and_through_a_pointer_receiver()
 
             assert(ca_compares(body) == 1, body)
 
-// The library's own: `Buf.at` is the member the whole feature was for.
-@test("Buf.at is one compare")
-ca_buf_at_is_one_compare()
+// The library's own: a `Buf`'s checked element read is the member the whole feature was for.
+@test("a Buf's subscript is one compare")
+ca_buf_subscript_is_one_compare()
     if ca_no_library() then return
 
-    ca_optimized("import sysl.buf.{Buf, buf}\n\n@noinline\nread(b: Buf[int], i: usize) -> int = b.at(i)\n\n" +
+    ca_optimized("import sysl.buf.{Buf, buf}\n\n@noinline\nread(b: Buf[int], i: usize) -> int = b[i]\n\n" +
                  "var b: Buf[int] = buf()\nb.push(1)\nprint(read(b, 0usize))\n") match
         None -> ()
         Some(out) ->

@@ -38,11 +38,16 @@ private bfa_no_library() -> bool
     false
 end bfa_no_library
 
-// The LLVM text of the whole module a source lowers to, or the first thing it was refused with.
-private bfa_ir(text: string) -> string
+// The LLVM text of the whole module a source lowers to. A source that is refused stops the test with
+// what it was refused with, rather than handing the message on as though it were IR.
+private bfa_ir(text: string) -> string = bfa_lowered(text) match
+    Ok(ir) -> ir
+    Err(said) -> panic(s"the fixture was refused: $said")
+
+private bfa_lowered(text: string) -> Result[string, string]
     val parsed = parse(source_of("t.sysl", forms_imported(text)))
 
-    if !parsed.ok() then return parsed.first().message
+    if !parsed.ok() then return Err(parsed.first().message)
 
     var units: Buf[Program] = buf()
 
@@ -53,19 +58,19 @@ private bfa_ir(text: string) -> string
 
     val done = analyze_bodies(units, host_target())
 
-    if !done.reported.is_empty() then return done.reported[0].diag.message
+    if !done.reported.is_empty() then return Err(done.reported[0].diag.message)
 
     val whole = program_of(done, "")
     val promotions = post_analysis_checks(done.an, whole, buf())
     val said = errors_of(done.an.diagnostics())
 
-    if !said.is_empty() then return analysis_report(said)
+    if !said.is_empty() then return Err(analysis_report(said))
 
     val kept = prune(strip_tests(whole), program_own(units))
     val lowered = codegen_with_gaps(kept, host_target(), promotions)
 
-    ir_print_module(lowered.0)
-end bfa_ir
+    Ok(ir_print_module(lowered.0))
+end bfa_lowered
 
 // What clang's `-O2` leaves of a program, or `None` where there is no clang to ask.
 private bfa_optimized(text: string) -> Option[string]
@@ -136,9 +141,9 @@ private bfa_matrix() -> string = raw"""
         n: int
         cells: &Buf[real]
 
-        at(self, i: int, j: int) -> real = self.cells.at(usize(i * self.n + j))
+        at(self, i: int, j: int) -> real = self.cells[usize(i * self.n + j)]
 
-        set(*self, i: int, j: int, v: real) = self.cells.set(usize(i * self.n + j), v)
+        set(*self, i: int, j: int, v: real) = self.cells[usize(i * self.n + j)] = v
     end M
 
     @noinline
@@ -162,31 +167,100 @@ private bfa_matrix() -> string = raw"""
         print(first(c.view()), held(&c))
     """
 
-@test("a Buf's own members mark an element access and a header access apart")
-bfa_members_mark_both_sides()
+// `b[i]` is `*b.index_place(i)`: the member reads the header to check the index and hands back the
+// element's address, and the read or write through that address -- in the program's own body -- is
+// the element side.
+@test("a Buf's subscript marks its element access, and the member it calls marks the header")
+bfa_subscript_marks_both_sides()
     if bfa_no_library() then return
 
     val out = bfa_ir(bfa_matrix())
-    val set = bfa_body(out, "@sysl.buf$BufCore.set.real(")
+    val set = bfa_body(out, "$M.set(")
 
     assert(!bfa_lines(set, ["store double", element_mark()]).is_empty(), set)
-    assert(!bfa_lines(set, ["load %struct.sysl.buf$BufCore.real, ptr", header_mark()]).is_empty(), set)
     assert(bfa_lines(set, ["store double", header_mark()]).is_empty(), set)
 
-    // `at` only reads its receiver, so the body is the one that reads it where its caller lent it, and
-    // the fields it reads there are the header all the same.
-    val at = bfa_body(out, "@sysl.buf$BufCore.at.real.owned(")
+    val at = bfa_body(out, "$M.at(")
 
     assert(!bfa_lines(at, ["load double", element_mark()]).is_empty(), at)
-    assert(!bfa_lines(at, ["load i64", header_mark()]).is_empty(), at)
-    assert(bfa_lines(at, ["load i64", element_mark()]).is_empty(), at)
 
-    val outer = bfa_body(out, "@sysl.buf$Buf.at.real(")
+    // `place` only reads its receiver, so the body is the one that reads it where its caller lent it,
+    // and the fields it reads there are the header all the same.
+    val place = bfa_body(out, "@sysl.buf$BufCore.place.real.owned(")
 
-    // The handle's `at` hands the core's address to the core's own `at`, which reads the header (above),
-    // so it reads none itself.
-    assert(outer.contains("call double @sysl.buf$BufCore.at.real.owned(ptr "), outer)
+    assert(!bfa_lines(place, ["load i64", header_mark()]).is_empty(), place)
+    assert(bfa_lines(place, ["load i64", element_mark()]).is_empty(), place)
+
+    val outer = bfa_body(out, "@sysl.buf$Buf.index_place.real(")
+
+    // The handle's `index_place` hands the core's address to the core's own `place`, which reads the
+    // header (above), so it reads none itself.
+    assert(outer.contains("call ptr @sysl.buf$BufCore.place.real.owned(ptr "), outer)
     assert(!outer.contains("load %struct.sysl.buf$BufCore.real"), outer)
+
+private bfa_subscripts() -> string = raw"""
+    module demo
+
+    import sysl.buf.{Buf, buf}
+
+    struct P
+        x: int
+        y: real
+
+    struct Grid
+        cells: []real
+
+    impl IndexPlace[usize, real] for Grid
+        index_place(*self, i: usize) -> *real = &self.cells[i]
+
+    @noinline
+    field(ps: Buf[P], i: usize) -> real = ps[i].y
+
+    @noinline
+    unchecked(ps: Buf[P], i: usize) -> int
+        @unchecked
+            ps[i].x
+
+    @noinline
+    nested(bs: Buf[Buf[int]], i: usize) -> usize = bs[i].len()
+
+    @noinline
+    grid(g: *Grid) -> real = g[0usize]
+
+    main()
+        var ps: Buf[P] = buf()
+
+        ps.push(P(1, 2.0))
+
+        var bs: Buf[Buf[int]] = buf()
+
+        bs.push(buf())
+
+        var g = Grid([1.5, 2.5])
+
+        print(field(ps, 0usize), unchecked(ps, 0usize), nested(bs, 0usize), grid(&g))
+    """
+
+// The element side reaches into the element: a field of it, the `@unchecked` subscript's address, and
+// a handle that is itself an element -- which is told it is no header, and nothing about handles.
+// A subscript of a type the program wrote is nobody's header, and stays unmarked.
+@test("a Buf's subscript marks a field of its element, the unchecked form and an element that is a handle; another container's does not")
+bfa_subscript_marks_reach_into_the_element()
+    if bfa_no_library() then return
+
+    val out = bfa_ir(bfa_subscripts())
+    val field = bfa_body(out, "@demo$field(")
+    val unchecked = bfa_body(out, "@demo$unchecked(")
+    val nested = bfa_body(out, "@demo$nested(")
+    val grid = bfa_body(out, "@demo$grid(")
+
+    assert(!bfa_lines(field, ["load %struct.demo$P, ptr", element_mark()]).is_empty(), field)
+    assert(unchecked.contains("index_place_unchecked"), unchecked)
+    assert(!bfa_lines(unchecked, ["load %struct.demo$P, ptr", element_mark()]).is_empty(), unchecked)
+    assert(!bfa_lines(nested, ["load %struct.sysl.buf$Buf.int, ptr", element_mark()]).is_empty(), nested)
+    assert(bfa_lines(nested, [handle_mark()]).is_empty(), nested)
+    assert(grid.contains("load double"), grid)
+    assert(!grid.contains("sysl.buf"), grid)
 
 @test("a program's read of a Buf through a counted reference is a read of its box")
 bfa_counted_reference_is_box()
@@ -207,11 +281,11 @@ private bfa_stack_machine() -> string = raw"""
 
     @noinline
     popped_twice(vm: *Machine) -> int
-        val a = vm.stack.at(vm.stack.len() - 1)
+        val a = vm.stack[vm.stack.len() - 1]
 
         vm.stack.truncate(vm.stack.len() - 1)
 
-        val b = vm.stack.at(vm.stack.len() - 1)
+        val b = vm.stack[vm.stack.len() - 1]
 
         vm.stack.truncate(vm.stack.len() - 1)
         a + b
@@ -351,15 +425,15 @@ bfa_growing_while_reading()
             a[0] = 1
 
             for i in 0..<100
-                b.push((b.at(usize(i)) + b.at(usize(i / 2))) % 1000003)
+                b.push((b[usize(i)] + b[usize(i / 2)]) % 1000003)
                 a[i + 1] = (a[i] + a[i / 2]) % 1000003
 
             var same = b.len() == 101 && b.cap() == 128
 
             for i in 0..<101
-                if b.at(usize(i)) != a[i] then same = false
+                if b[usize(i)] != a[i] then same = false
 
-            exit(if same && b.at(1) == 2 && b.at(2) == 3 then 42 else 1)
+            exit(if same && b[1] == 2 && b[2] == 3 then 42 else 1)
         """), 42)
 
 // A buffer of buffers keeps the inner handles among the outer one's elements -- the one place a
@@ -377,16 +451,16 @@ bfa_buffer_of_buffers()
             for i in 0..<4 do outer.push(buf())
 
             for k in 0..<40
-                val inner = outer.at(usize(k % 4))
+                val inner = outer[usize(k % 4)]
 
                 inner.push(k + int(inner.len()))
 
             var sum = 0
 
             for i in 0..<outer.len()
-                for x in outer.at(i).view() do sum += x
+                for x in outer[i].view() do sum += x
 
-            exit(if sum == 780 + 4 * 45 && outer.at(3).at(9) == 48 then 42 else 1)
+            exit(if sum == 780 + 4 * 45 && outer[3][9] == 48 then 42 else 1)
         """), 42)
 
 // A handle reached through a pointer among another buffer's elements is replaced by an element write,
@@ -413,7 +487,7 @@ bfa_handle_among_elements_replaced()
                 p.push(k)
                 seen += p.len()
 
-            exit(if seen == 10 && outer.at(0).len() == 1 && outer.at(0).at(0) == 9 then 42 else 1)
+            exit(if seen == 10 && outer[0].len() == 1 && outer[0][0] == 9 then 42 else 1)
         """), 42)
 
 // A handle among the elements of a buffer of structs, read through a `*Machine` while the element is
@@ -445,7 +519,7 @@ bfa_struct_handle_among_elements_replaced()
                 vm.stack.push(k)
                 seen += vm.stack.len()
 
-            exit(if seen == 10 && parked.at(0).stack.at(0) == 9 then 42 else 1)
+            exit(if seen == 10 && parked[0].stack[0] == 9 then 42 else 1)
         """), 42)
 
 // Storage a program lays out itself: a handle written as bytes into a `Buf[usize]` and cleared by an
@@ -548,7 +622,7 @@ bfa_kept_handle_sees_growth()
             var m = Machine(buf(), 0)
             val got = churn(&m)
 
-            exit(if got == 10000 && m.stack.len() == 0 && made().stack.at(0) == 5 then 42 else 1)
+            exit(if got == 10000 && m.stack.len() == 0 && made().stack[0] == 5 then 42 else 1)
         """), 42)
 
 // A handle in a struct, assigned a new buffer between pushes and pops and released to naming nothing:
@@ -606,7 +680,7 @@ bfa_reinterpreted_storage()
 
                 v[i] = v[i] + 100
                 p[0] = p[0] + 1
-                total += b.at(usize(i))
+                total += b[usize(i)]
 
-            exit(if total == 28 + 800 + 8 && b.at(7) == 108 then 42 else 1)
+            exit(if total == 28 + 800 + 8 && b[7] == 108 then 42 else 1)
         """), 42)

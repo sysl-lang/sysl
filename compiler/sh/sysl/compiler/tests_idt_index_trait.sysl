@@ -72,21 +72,22 @@ private idt_refused(text: string, part: string)
 // A trait with an index type and an element type, and a struct that keeps two of it.
 private idt_get() -> string = raw"""
     trait Get[I, E]
-        get(self, i: I) -> E
+        fetch(self, i: I) -> E
     struct Row
         a: int
     impl Get[usize, int] for Row
-        get(self, i: usize) -> int = self.a + int(i)
+        fetch(self, i: usize) -> int = self.a + int(i)
     impl Get[bool, string] for Row
-        get(self, f: bool) -> string = if f then "yes" else "no"
+        fetch(self, f: bool) -> string = if f then "yes" else "no"
     """
 
-// The same trait, implemented once for every `Buf` at the element type the `Buf` holds.
+// The same trait, implemented once for every `Buf` at the element type the `Buf` holds. Its member
+// is not `get`, which `Buf` already has as an inherent member.
 private idt_buf_get() -> string = raw"""
     trait Get[I, E]
-        get(self, i: I) -> E
+        fetch(self, i: I) -> E
     impl[T] Get[usize, T] for Buf[T]
-        get(self, i: usize) -> T = self.at(i)
+        fetch(self, i: usize) -> T = self[i]
     """
 
 private idt_env() -> string = raw"""
@@ -102,7 +103,7 @@ private idt_env() -> string = raw"""
 idt_two_argument_lists()
     if !idt_can_run() then return
 
-    assert_eq(idt_ran(idt_get() + "print(Row(3).get(1usize))\nprint(Row(3).get(true))\n"), "4\nyes\n")
+    assert_eq(idt_ran(idt_get() + "print(Row(3).fetch(1usize))\nprint(Row(3).fetch(true))\n"), "4\nyes\n")
 
 // Nothing at the call site wrote the element type; the index selected the implementation.
 @test("the element type comes from the implementation the index selected")
@@ -110,8 +111,8 @@ idt_element_type_from_the_index()
     if !idt_can_run() then return
 
     assert_eq(idt_ran(idt_get() + raw"""
-        var s: string = Row(3).get(false)
-        var n: int = Row(3).get(0usize)
+        var s: string = Row(3).fetch(false)
+        var n: int = Row(3).fetch(0usize)
         print(s, n)
         """), "no 3\n")
 
@@ -122,7 +123,7 @@ idt_generic_subject_settles_the_argument()
     assert_eq(idt_ran(idt_buf_get() + raw"""
         var b: Buf[string] = buf()
         b.push("hi")
-        print(b.get(0usize))
+        print(b.fetch(0usize))
         """), "hi\n")
 
 // The diagnostic names `Get[usize, string]` for a `Buf[string]`, not the `T` the block wrote.
@@ -131,7 +132,7 @@ idt_bound_reported_at_the_subject_argument()
     if !idt_can_run() then return
 
     idt_refused(idt_buf_get() + raw"""
-        firstOf[C: Get[usize, int]](c: C) -> int = c.get(0usize)
+        firstOf[C: Get[usize, int]](c: C) -> int = c.fetch(0usize)
         var s: Buf[string] = buf()
         s.push("x")
         print(firstOf(s))
@@ -143,7 +144,7 @@ idt_bound_met_by_the_instantiation()
     if !idt_can_run() then return
 
     assert_eq(idt_ran(idt_buf_get() + raw"""
-        firstOf[C: Get[usize, int]](c: C) -> int = c.get(0usize)
+        firstOf[C: Get[usize, int]](c: C) -> int = c.fetch(0usize)
         var a: Buf[int] = buf()
         a.push(5)
         print(firstOf(a))
@@ -250,9 +251,9 @@ idt_parameter_the_subject_does_not_name()
 
     idt_refused(raw"""
         trait Get[I, E]
-            get(self, i: I) -> E
+            fetch(self, i: I) -> E
         impl[T, U] Get[U, T] for Buf[T]
-            get(self, i: U) -> T = self.at(0usize)
+            fetch(self, i: U) -> T = self[0usize]
         """, "'U' is declared by this 'impl' but does not appear in 'Buf[T]', so nothing would ever fix it")
 
 @test("two blocks that differ only in the letter of the parameter are one implementation twice")
@@ -261,7 +262,7 @@ idt_same_block_another_letter()
 
     idt_refused(idt_buf_get() + raw"""
         impl[U] Get[usize, U] for Buf[U]
-            get(self, i: usize) -> U = self.at(i)
+            fetch(self, i: usize) -> U = self[i]
         """, "already implements 'Get[usize, U]'")
 
 @test("two that differ in the argument are two implementations")
@@ -270,11 +271,11 @@ idt_two_arguments_two_implementations()
 
     assert_eq(idt_ran(idt_buf_get() + raw"""
         impl[T] Get[bool, usize] for Buf[T]
-            get(self, f: bool) -> usize = if f then self.len() else 0usize
+            fetch(self, f: bool) -> usize = if f then self.len() else 0usize
         var b: Buf[int] = buf()
         b.push(3)
         b.push(4)
-        print(b.get(1usize), b.get(true))
+        print(b.fetch(1usize), b.fetch(true))
         """), "4 2\n")
 
 // -- what the edge cases do -----------------------------------------------------------------------
@@ -286,14 +287,14 @@ idt_composed_argument_substituted()
 
     assert_eq(idt_ran(raw"""
         trait Get[I, E]
-            get(self, i: I) -> E
+            fetch(self, i: I) -> E
         impl[T] Get[bool, []T] for Buf[T]
-            get(self, f: bool) -> []T = if f then self.view() else self.view()[0..<0usize]
+            fetch(self, f: bool) -> []T = if f then self.view() else self.view()[0..<0usize]
         var b: Buf[int] = buf()
         b.push(3)
         b.push(4)
-        var all: []int = b.get(true)
-        print(all.len, b.get(false).len)
+        var all: []int = b.fetch(true)
+        print(all.len, b.fetch(false).len)
         """), "2 0\n")
 
 @test("the element type is not inferred from a bound, and the annotation supplies it")
@@ -302,12 +303,12 @@ idt_element_type_not_inferred_from_a_bound()
 
     val decls = raw"""
         trait Get[I, E]
-            get(self, i: I) -> E
+            fetch(self, i: I) -> E
         struct Row
             a: int
         impl Get[usize, int] for Row
-            get(self, i: usize) -> int = self.a
-        first[E, C: Get[usize, E]](c: C) -> E = c.get(0usize)
+            fetch(self, i: usize) -> int = self.a
+        first[E, C: Get[usize, E]](c: C) -> E = c.fetch(0usize)
         """
 
     idt_refused(decls + "print(first(Row(3)))\n", "cannot infer the type argument 'E' of 'first'")
