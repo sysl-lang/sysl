@@ -802,10 +802,20 @@ esc_promoted_an_element_of_an_array_of_arrays() =
         print(v.len, char(v[0usize]).to_string())
         """, "4 C\n")
 
-// A body nothing can see is assumed to keep what it is handed.
-@test("is handed to an extern, whose body nothing can see")
-esc_promoted_to_an_extern() =
+// **An `extern` borrows what it is handed unless its declaration says `@keeps`**, so a view handed to
+// one stays in the frame, and one handed to an `extern` that keeps it is moved.
+@test("is not moved for being handed to an extern, which borrows it; one that says '@keeps' moves it")
+esc_promoted_to_an_extern()
+    esc_stays(raw"""
+        extern take(s: []u8)
+        use()
+            var buf: [4]u8
+            take(buf[0..<2])
+        end use
+        use()
+        """)
     esc_promotes(raw"""
+        @keeps(s)
         extern take(s: []u8)
         use()
             var buf: [4]u8
@@ -816,9 +826,18 @@ esc_promoted_to_an_extern() =
 
 // The tail of a variadic call is passed beside the declared parameters, so the declared one is
 // still analyzed.
-@test("is the declared parameter of a variadic extern")
-esc_promoted_to_a_variadic_extern() =
+@test("is the declared parameter of a variadic extern, borrowed unless it says '@keeps'")
+esc_promoted_to_a_variadic_extern()
+    esc_stays(raw"""
+        extern take(s: []u8, ...)
+        use()
+            var buf: [4]u8
+            take(buf[0..<2], 1)
+        end use
+        use()
+        """)
     esc_promotes(raw"""
+        @keeps(s)
         extern take(s: []u8, ...)
         use()
             var buf: [4]u8
@@ -841,6 +860,27 @@ end esc_stays
 esc_promoted_into_a_trait_object() =
     esc_stays(raw"""
         trait Sink
+            put(self, s: []u8)
+        struct Keep
+            tag: int
+        impl Sink for Keep
+            put(self, s: []u8)
+                print(s.len)
+        use()
+            var buf: [4]u8
+            var k: &Sink = Keep(1)
+            k.put(buf[..])
+        end use
+        use()
+        """)
+
+// The trait's declaration is the whole answer: one that says `@keeps(s)` lets every implementation
+// keep the view, so a frame's array handed through it is moved.
+@test("is moved for being handed through a trait object whose method's declaration says '@keeps'")
+esc_promoted_into_a_keeping_trait_object() =
+    esc_promotes(raw"""
+        trait Sink
+            @keeps(s)
             put(self, s: []u8)
         struct Keep
             tag: int

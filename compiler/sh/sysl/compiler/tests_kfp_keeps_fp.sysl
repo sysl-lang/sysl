@@ -5,9 +5,9 @@ import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
 import sysl.process.capture
 
 // What the keeps-analysis (`keeps.sysl`) accepts because the storage a pointer is held in is still
-// nameable: a function reached through a pointer whose every call is in sight, an address stored as
-// an integer, and a place reached through a pointer the body does not change -- each beside the
-// near miss that is still refused. `reference/memory.md § A borrowed pointer cannot escape` is the
+// nameable -- an address stored as an integer, and a place reached through a pointer the body does
+// not change -- each beside the near miss that is still refused; and a function reached through a
+// pointer, which is held to its type's promise to borrow however every call through it looks. `reference/memory.md § A borrowed pointer cannot escape` is the
 // specification.
 
 // -- the harness ----------------------------------------------------------------------------------
@@ -66,19 +66,20 @@ private kfp_machine() -> string = raw"""
 
     """
 
-private kfp_through() -> string =
-    "a call through '*extern(*M, *isize) -> unit' may reach 'halt', which keeps its parameter 'sp' " +
-        "(it is stored in 'm.sp'), and '&local' is the address of a local of 'run'"
-
 private kfp_promise() -> string =
     "'halt' keeps its parameter 'sp' (it is stored in 'm.sp'), and its address is taken — a call " +
         "through a function pointer sees no body"
 
 // -- a function reached through a pointer ---------------------------------------------------------
+//
+// **A call through a function pointer is answered by its type, which borrows every argument**: no
+// table of the functions whose address is taken at the type is consulted, so a primitive that holds
+// what it is handed even in what another of its parameters points at is refused where it is written,
+// however every call through the pointer looks.
 
-@test("a primitive whose address is taken may write its stack pointer back into the machine")
-kfp_writeback_accepted()
-    kfp_prints(kfp_machine() + raw"""
+@test("a primitive whose address is taken may not write its stack pointer back into the machine")
+kfp_writeback_refused()
+    kfp_refused(kfp_machine() + raw"""
         var stack: [8]isize
         var m: M
 
@@ -88,11 +89,11 @@ kfp_writeback_accepted()
 
             f(&m, m.sp)
             print(usize(m.sp) == usize(&stack[0]))
-        """, "true\n")
+        """, kfp_promise())
 
-@test("lent through a pointer and taken back, a frame's own machine, and a primitive relaying its own stack pointer")
-kfp_relayed_accepted()
-    kfp_prints(kfp_machine() + raw"""
+@test("lent through a pointer and taken back, a frame's own machine, and a primitive relaying its own stack pointer: still the primitive is refused")
+kfp_relayed_refused()
+    kfp_refused(kfp_machine() + raw"""
         step(m: *M, sp: *isize)
             val f: Code = &halt
 
@@ -115,9 +116,9 @@ kfp_relayed_accepted()
             print(run(&step))
             print(run(&halt))
             print(usize(m.sp) == usize(&stack[0]))
-        """, "true\ntrue\ntrue\n")
+        """, kfp_promise())
 
-@test("a call through the pointer handing a local to be held in a module machine is refused")
+@test("a call through the pointer handing a local to be held in a module machine: the primitive is refused")
 kfp_local_through_pointer_refused()
     kfp_refused(kfp_machine() + raw"""
         var stack: [8]isize
@@ -131,9 +132,9 @@ kfp_local_through_pointer_refused()
         main()
             m.sp = &stack[0]
             run(&halt)
-        """, kfp_through())
+        """, kfp_promise())
 
-@test("taken back on one way out only is refused")
+@test("taken back on one way out only: the primitive is refused")
 kfp_early_return_refused()
     kfp_refused(kfp_machine() + raw"""
         var stack: [8]isize
@@ -151,9 +152,9 @@ kfp_early_return_refused()
         main()
             m.sp = &stack[0]
             run(&halt, false)
-        """, kfp_through())
+        """, kfp_promise())
 
-@test("a primitive relaying its parameter through a pointer is held to what the callee keeps")
+@test("a primitive relaying its parameter through a pointer: the primitive at the end is refused")
 kfp_relay_chain_refused()
     kfp_refused(kfp_machine() + raw"""
         step(m: *M, sp: *isize)
@@ -170,9 +171,11 @@ kfp_relay_chain_refused()
 
         main()
             run(&step)
-        """, kfp_through())
+        """, kfp_promise())
 
-@test("the function whose address is taken, called directly, is held to its body")
+// Whose address is NOT taken, the same primitive called directly is held to its body, as every
+// direct call is: what it keeps is refused at the call, not where it is written.
+@test("the function called directly is held to its body")
 kfp_direct_call_refused()
     kfp_refused(kfp_machine() + raw"""
         var m: M
@@ -183,10 +186,7 @@ kfp_direct_call_refused()
             halt(&m, &local)
 
         main()
-            val f: Code = &halt
-
             run()
-            f(&m, m.sp)
         """, "'halt' keeps its parameter 'sp' (it is stored in 'm.sp'), and '&local' is the address of a local of 'run'")
 
 @test("a pointer type handed to C reaches bodies held to the default")

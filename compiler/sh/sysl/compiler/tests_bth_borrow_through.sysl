@@ -334,7 +334,10 @@ bth_self_method()
             f()
         """, "'keep' " + bth_pushed("self", "h", "f"))
 
-@test("a call through a trait object whose implementation pushes what it reads")
+// **A call through an object or a pointer is answered by its signature**, which borrows what is read
+// through an argument as it borrows the argument: the body that pushes what it reads is refused where
+// it is written, and with the trait's `@keeps(h)` the call handing it the frame's storage is.
+@test("a trait object's implementation that pushes what it reads is refused where it is written")
 bth_trait_object()
     bth_refused(raw"""
         trait Keeper
@@ -353,9 +356,30 @@ bth_trait_object()
 
         main()
             f(K(1))
-        """, "'take' " + bth_pushed("h", "&h", "f"))
+        """, "'take' lets what it reads through its parameter 'h' outlive the call (it is passed to 'push', " +
+             "which keeps it), but a method of 'Keeper' borrows its parameters for the call")
+    bth_refused(raw"""
+        trait Keeper
+            @keeps(h)
+            take(self, h: *H)
 
-@test("a call through a function pointer that may reach a body pushing what it reads")
+        struct K
+            n: int
+
+        impl Keeper for K
+            take(self, h: *H) = kept.push(h.p)
+
+        f(k: &Keeper)
+            var x = 1
+            var h = H(&x)
+            k.take(&h)
+
+        main()
+            f(K(1))
+        """, "a call through '&Keeper' keeps its parameter 'h' (its trait's 'take' declares '@keeps(h)'), " +
+             "and '&h' is the address of a local of 'f'")
+
+@test("a function whose address is taken that pushes what it reads is refused where it is written")
 bth_function_pointer()
     bth_refused(raw"""
         f(g: *extern(*H) -> unit)
@@ -365,7 +389,8 @@ bth_function_pointer()
 
         main()
             f(&stash)
-        """, "a call through '*extern(*H) -> unit' may reach 'stash', which " + bth_pushed("h", "&h", "f"))
+        """, "'stash' lets what it reads through its parameter 'h' outlive the call (it is passed to 'push', " +
+             "which keeps it), but its address is taken — a call through a function pointer sees no body")
 
 @test("the address of a struct made in place around the address")
 bth_made_in_place()
@@ -1009,13 +1034,40 @@ bth_deep_steps_accepted()
     bth_prints(bth_chain(7, false, "\n    kept.push(", ".p)"), "1\n")
     bth_prints(bth_chain(5, true, "\n    if *", ".p > 0 then kept.push(&spare)"), "1\n")
 
-// Past `MaxReadSteps` the callee is asked what it lets out of anything it reads through the pointer,
-// which cannot tell the module address at the bottom from the frame's addresses on the way down: a
-// callee that lets out anything read that deep is refused, conservatively; one that only reads is not.
-@test("a chain deeper than the summaries tell apart is accepted where only read, refused where anything read is let out")
-bth_past_the_steps_conservative()
+// **A chain of distinct types is told apart step by step however long it is** (`reads_past`): no step
+// count stands in for the type, so the module address at the bottom of a twelve-deep chain is told
+// from the frame's addresses on the way down, and pushing it is accepted.
+@test("a chain deeper than eight steps is told apart exactly: only read, or a module address pushed, is accepted")
+bth_past_the_steps_exact()
     bth_prints(bth_chain(11, true, " -> int = *", ".p"), "1\n")
-    bth_refused(bth_chain(11, false, "\n    kept.push(", ".p)"), bth_chain_pushed(11))
+    bth_prints(bth_chain(11, false, "\n    kept.push(", ".p)"), "1\n")
+
+// A list of `depth + 1` nodes of ONE type that reaches itself, the last holding a module address and
+// the rest `&x`, and a callee pushing the address in the last node.
+private bth_list(depth: int) -> string
+    var text = "struct N\n    p: *int\n    n: Option[*N]\n\ngo(c: *N)\n    kept.push(c"
+
+    for i in 0..<depth
+        text = text + ".n.unwrap()"
+
+    text = text + ".p)\n\nf()\n    var x = 1\n    var l0 = N(&spare, None)\n"
+
+    for i in 1..depth
+        text = text + s"    var l$i = N(&x, Some(&l${i - 1}))\n"
+
+    text + s"    go(&l$depth)\n    print(x)\n\nmain()\n    f()\n"
+end bth_list
+
+// **A type that reaches itself has no depth to bound the questions by**, so past `RecursiveSteps` (8)
+// a read question is asked as what the body lets out of anything it reads through the parameter: the
+// module address at the bottom of a twelve-node list cannot be told from the frame's addresses on the
+// way down, and pushing it is refused, conservatively. Within the steps it is told apart.
+@test("a list of one self-reaching type: a module address pushed four steps in is accepted, twelve steps in refused")
+bth_self_reaching_past_the_steps_conservative()
+    bth_prints(bth_list(3), "1\n")
+    bth_refused(bth_list(11), "'go' lets what it reads through its parameter 'c' outlive the call (it is " +
+                "passed to 'push', which keeps it), and what is read through '&l11' holds the address of a " +
+                "local of 'f'")
 
 @test("a ring of the frame's own nodes, walked and read, stays accepted; one pushing what it reads is refused")
 bth_ring()

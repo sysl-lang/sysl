@@ -336,6 +336,11 @@ struct KeptParams
     asked: Buf[usize]
     examined: usize
 
+    // The positions each `extern` declares `@keeps`, by name, and the analysis, which answers what a
+    // trait's own declaration of a method says (`object_declares_kept`).
+    c_kept: Map[string, Buf[usize]]
+    an: &Analysis
+
     holds(self, name: string, i: usize) -> bool = self.index.get(name) match
         Some(id) -> self.pairs.has((id, i))
         None -> false
@@ -349,7 +354,19 @@ private kept_params(a: &Analysis, p: TProgram) -> &KeptParams
 
         if !index.has(name) then index.put(name, i)
 
-    KeptParams(index, set(), buf(), 0)
+    var c_kept: Map[string, Buf[usize]] = map()
+
+    for i in 0..<a.tables.externs.len()
+        val d = a.tables.externs.at(i)
+        var at: Buf[usize] = buf()
+
+        for j in 0..<d.params.len()
+            if holds_string(d.keeps, d.params[j].name) then at.push(j)
+
+        c_kept.put(a.tables.externs.key_at(i), at)
+    end for
+
+    KeptParams(index, set(), buf(), 0, c_kept, a)
 end kept_params
 
 // The pairs grow until nothing changes, and a function is looked at again only when something it
@@ -429,11 +446,18 @@ private kepts(p: TProgram, keeps: &KeptParams, f: TFunc, param: string) -> bool
     w.got_out
 end kepts
 
-// A function whose body is not here keeps everything, since nothing can tell whether the foreign
-// side holds on to what it was handed.
+// **An `extern` borrows what it is handed for the call unless its declaration says `@keeps`**, which
+// is C's own convention: a view handed to C stays where it is. Any other function whose body is not
+// here -- a form the compiler supplies -- keeps everything, since nothing can tell.
 private kept_by(p: TProgram, keeps: &KeptParams, name: string, i: usize) -> bool
     keeps.index.get(name) match
-        None -> true
+        None -> keeps.c_kept.get(name) match
+            Some(at) ->
+                for j in at
+                    if j == i then return true
+
+                false
+            None -> true
         Some(id) ->
             keeps.asked.push(id)
             keeps.pairs.has((id, i))
@@ -760,14 +784,17 @@ private escaping_one(p: TProgram, keeps: &KeptParams, w: &EscapeWalk, e: TExpr) 
     // a view handed through one stays put. A call trait's object is the exception: a closure behind a
     // `&Fn` may keep what it is handed, and the conservative answer is the only sound one there,
     // exactly as it is for a function whose body this program does not have.
-    TVCall(recv, _, args, ty, _) ->
+    TVCall(recv, slot, args, ty, _) ->
         // A method whose call answers a task holds its arguments until the task runs, whatever the
-        // trait promises -- unless it is driven right here.
-        val borrowed = borrowed_through(texpr_type(recv)) &&
+        // trait promises -- unless it is driven right here. One the trait declares `@keeps(p)` keeps
+        // `p`, which every implementation may hold.
+        val all_borrowed = borrowed_through(texpr_type(recv)) &&
             (task_result(ty).is_none() || holds_span(w.driven, e.span))
         val frames = frames_literals(ty)
 
         for i in 0..<args.len()
+            val borrowed = all_borrowed && !object_declares_kept(keeps.an, texpr_type(recv), slot, i + 1)
+
             if frames && literal_argument(args[i])
                 frame_literal(w, args[i], !borrowed,
                               "is passed through a trait object, which may hold on to it")
@@ -1543,16 +1570,19 @@ private refuse_borrowed(a: &Analysis, p: TProgram, keeps: &KeptParams)
 
         if is_call_trait(module_bare(vt.trait_name)) then continue
 
-        for slot in vt.slots
+        for s in 0..<vt.slots.len()
+            val slot = vt.slots[s]
             val id = keeps.index.get(slot.target)
 
             if id.is_none() then continue
 
             val f = p.funcs[id.unwrap()]
 
-            // The receiver is the object itself, which is a box of its own rather than the caller's.
+            // The receiver is the object itself, which is a box of its own rather than the caller's. A
+            // parameter the trait declares `@keeps` may be kept: every call is held to that instead.
             for at in 1..<f.params.len()
                 if !carries_view(f.params[at].1) || !keeps.holds(slot.target, at) then continue
+                if table_declares_kept(a, vt, int(s), at) then continue
 
                 val pname = f.params[at].0
                 val key = s"${slot.target}|$pname"
