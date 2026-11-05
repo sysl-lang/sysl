@@ -1,0 +1,268 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.is_file
+import sysl.process.capture
+import sysl.testing.skip
+
+// **`sysl.io.wait.ready` over the `sysl_io_wait` hook, on a target with an operating system and on one
+// without.**
+//
+// On a hosted target the library's `sysl.io.hosted` answers the hook over `poll`, through `wait.c`,
+// under a `weak` export; on a freestanding one the program answers it with an `@export`, and one it
+// leaves unanswered is refused when it is compiled (`emit_checks.sysl`'s `check_library_hooks`),
+// beside the other descriptor hooks. The function is `@needs(os)`, so a `@no_os` module is refused at
+// the call. What the wait answers at run time is `library/sysl/io/wait/tests.sysl`'s.
+
+private val iow_target: string = "aarch64-freestanding"
+private val iow_nm: string = "/opt/homebrew/opt/llvm/bin/llvm-nm"
+
+private val iow_script: string =
+    "ENTRY(kstart)\nSECTIONS\n{\n    . = 0x40080000;\n    .text : { KEEP(*(.text.boot)) *(.text .text.*) }\n" +
+    "    .rodata : { *(.rodata .rodata.*) }\n    .data : { *(.data .data.*) }\n" +
+    "    .bss (NOLOAD) : { *(.bss .bss.*) *(COMMON) }\n}\n"
+
+private val iow_manifest: string =
+    "package { name = \"img\", version = \"0.0.1\" }\n" +
+    "allocator {\n  alloc = \"img_alloc\"\n  free  = \"img_free\"\n}\n" +
+    s"targets {\n  $iow_target {\n    linker_script = \"link.ld\"\n    entry = \"kstart\"\n  }\n}\n"
+
+// A bare image's start, its heap, the four memory functions LLVM calls on a target with no C library,
+// and the `putchar` and `exit` a failure path reaches.
+private val iow_runtime: string = raw"""
+    @export("kstart")
+    kstart() -> never
+        var n = 0
+        val d: *volatile int = ptr_cast(&n)
+
+        d[0] = run()
+
+        loop
+            ()
+
+    @export("img_alloc")
+    img_alloc(n: usize) -> *u8 = null
+
+    @export("img_free")
+    img_free(p: *u8) = ()
+
+    @export("memset")
+    mem_set(dst: *u8, c: int, n: usize) -> *u8
+        val d: *volatile u8 = ptr_cast(dst)
+
+        for i in 0..<n do d[i] = u8(c)
+
+        dst
+
+    @export("memcpy")
+    mem_copy(dst: *u8, src: *u8, n: usize) -> *u8
+        val d: *volatile u8 = ptr_cast(dst)
+
+        for i in 0..<n do d[i] = src[i]
+
+        dst
+
+    @export("memmove")
+    mem_move(dst: *u8, src: *u8, n: usize) -> *u8 = mem_copy(dst, src, n)
+
+    @export("memcmp")
+    mem_compare(a: *u8, b: *u8, n: usize) -> int = 0
+
+    @export("putchar")
+    k_putchar(c: int) -> int = c
+
+    @export("exit")
+    k_exit(code: int) -> never
+        loop
+            ()
+    """
+
+// A program asking whether standard input is readable, and nothing else of `sysl.io.sys`.
+private val iow_waits: string = raw"""
+    import sysl.io.wait.{Readable, ready}
+    import sysl.time.millis
+
+    run() -> int
+        ready(0, Readable, millis(10)) match
+            Ok(yes) -> if yes then 1 else 0
+            Err(_) -> -1
+    """
+
+private iow_tree(program: string) -> string
+    var files = lbr_two("main.sysl", program, "package.hocon", iow_manifest)
+
+    files.push(("link.ld", iow_script))
+    lbr_tree(files)
+end iow_tree
+
+private iow_build(p: string) -> ((int, string), string)
+    val out = lbr_temp("sysl-iow-elf")
+
+    // Unoptimized, so the hook stays a call the image's symbols show.
+    (lbr_cli(["sysl", "build", "-O0", "--target", iow_target, "-o", s"$out/img.elf", p]), out)
+end iow_build
+
+@test("iow a freestanding program waiting on stdin with no hook is refused, naming the wait hook alone")
+iow_unanswered_wait_is_refused()
+    if !lbr_ready() then return
+
+    val p = iow_tree(iow_waits + iow_runtime)
+    val (said, out) = iow_build(p)
+
+    assert(said.0 != 0, "built with the wait hook unanswered")
+    assert(said.1.contains(s"this program reads, waits on or flushes a descriptor, and '$iow_target' has " +
+        "no operating system under it for the standard library to answer one with, so the program " +
+        "answers it: define 'sysl_io_wait' with '@export', each taking what its 'extern' in " +
+        "'sysl.io.sys' declares and answering a count, one or zero, or the code of an 'IoError' negated"),
+        said.1)
+
+    // Only what is reached is asked for, and it is told before the link.
+    assert(!said.1.contains("sysl_io_read"), said.1)
+    assert(!said.1.contains("undefined symbol"), said.1)
+
+    lbr_drop([p, out])
+end iow_unanswered_wait_is_refused
+
+@test("iow a freestanding program answering the wait hook links, with no poll in the image")
+iow_answered_wait_links()
+    if !lbr_ready() then return
+
+    val lld = capture("ld.lld", ["--version"], "", [], true) match
+        Ok(o) -> o.status.ok()
+        Err(_) -> false
+
+    if !lld then skip("ld.lld is not installed, so no image can be linked")
+    if !is_file(iow_nm) then skip(s"there is no llvm-nm at $iow_nm to read the image")
+
+    val p = iow_tree(iow_waits + iow_runtime + raw"""
+        @export("sysl_io_wait")
+        k_wait(fd: int, writable: int, micros: long) -> int = 1
+        """)
+    val (said, out) = iow_build(p)
+
+    assert(said.0 == 0, said.1)
+
+    val listing = capture(iow_nm, [s"$out/img.elf"], "", [], true) match
+        Ok(o) -> o.text
+        Err(_) -> "llvm-nm could not be run"
+
+    assert(listing.contains(" T sysl_io_wait"), listing)
+    assert(!listing.contains(" poll"), listing)
+    assert(!listing.contains("sysl_io_posix_wait"), listing)
+
+    lbr_drop([p, out])
+end iow_answered_wait_links
+
+@test("iow a @no_os module calling ready is refused at the call, which needs 'os'")
+iow_no_os_refuses_ready()
+    if !lbr_ready() then return
+
+    val p = lbr_program(raw"""
+        @no_os
+
+        import sysl.io.wait.{Readable, ready}
+        import sysl.time.millis
+
+        print(ready(0, Readable, millis(0)).is_ok())
+        """)
+    val said = lbr_run(p, [])
+
+    lbr_drop([p])
+    assert(said.contains("this reaches 'sysl.io.wait.ready', which needs 'os', and this module declared '@no_os'"),
+        said)
+end iow_no_os_refuses_ready
+
+// `Wait` is implemented for `File` too, which is `sysl.fs`'s, so the module itself needs `os` and the
+// refusal is the module's -- with the call's beside it.
+@test("iow a @no_os module calling FdReader.readable is refused, the module needing 'os' and the call too")
+iow_no_os_refuses_readable()
+    if !lbr_ready() then return
+
+    val p = lbr_program(raw"""
+        @no_os
+
+        import sysl.io.stdin
+        import sysl.io.wait.Wait
+        import sysl.time.millis
+
+        val input = stdin()
+
+        print(input.readable(millis(0)).is_ok())
+        """)
+    val said = lbr_run(p, [])
+
+    lbr_drop([p])
+    assert(said.contains("this reaches 'sysl.io.wait', which requires 'os'"), said)
+    assert(said.contains("which needs 'os' through 'sysl.io.sys.fd_wait', and this module declared '@no_os'"),
+        said)
+end iow_no_os_refuses_readable
+
+@test("iow a @no_os module that reads stdin and never waits builds as it did")
+iow_no_os_reading_is_unchanged()
+    if !lbr_ready() then return
+
+    val p = lbr_program(raw"""
+        @no_os
+
+        import sysl.io.{read_all, stdin}
+
+        var input = stdin()
+
+        print(read_all(&input).len())
+        """)
+    val said = lbr_run(p, [])
+
+    lbr_drop([p])
+    assert(!said.starts_with("refused"), said)
+end iow_no_os_reading_is_unchanged
+
+@test("iow on a hosted target the library answers the wait hook under a weak export, through wait.c")
+iow_hosted_answers_weakly()
+    if !lbr_ready() then return
+
+    val p = lbr_program(iow_waits + "\nprint(run())\n")
+    val said = lbr_cli(["sysl", "emit-llvm", "--no-std-lib", "--target", "x86_64-linux", p])
+
+    lbr_drop([p])
+    assert(said.0 == 0, said.1)
+
+    var wait_line = ""
+
+    for line in lines_of(said.1)
+        if line.starts_with("define ") && line.contains(" @sysl_io_wait(") then wait_line = line
+
+    assert(wait_line.starts_with("define weak "), wait_line)
+    assert(said.1.contains("@sysl_io_posix_wait("), "the hosted answer does not call wait.c")
+end iow_hosted_answers_weakly
+
+@test("iow a hosted program waiting on its own piped stdin sees it ready, and its end")
+iow_hosted_piped_stdin_is_ready()
+    if !lbr_ready() then return
+
+    val p = lbr_program(raw"""
+        import sysl.io.{read_all, stdin}
+        import sysl.io.wait.Wait
+        import sysl.time.millis
+
+        var input = stdin()
+
+        print(input.readable(millis(2000)).unwrap())
+        print(read_all(&input).len())
+        print(input.readable(millis(0)).unwrap())
+        """)
+    val out_dir = lbr_temp("sysl-iow-exe")
+
+    lbr_hand([])
+
+    val made = build_native_program(p, None, None, DefaultOptimization, Some(s"$out_dir/program"))
+
+    lbr_hand([])
+    assert(made.is_ok(), "the program did not build")
+
+    val ran = capture("sh", ["-c", s"printf 'abc' | '${made.unwrap()}'"], "", [], true)
+
+    assert(ran.is_ok(), "the program could not be run")
+    assert_eq(ran.unwrap().text, "true\n3\ntrue\n")
+
+    lbr_drop([p, out_dir])
+end iow_hosted_piped_stdin_is_ready

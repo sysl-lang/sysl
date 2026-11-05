@@ -39,6 +39,7 @@ These pages are generated from the library's own doc comments: every declaration
 | [`sysl.io`](sysl-io/) | The byte surface a program reads through, and the line cursor over it. |
 | [`sysl.io.hosted`](sysl-io-hosted/) |  |
 | [`sysl.io.sys`](sysl-io-sys/) |  |
+| [`sysl.io.wait`](sysl-io-wait/) | Waiting for a descriptor with a time limit: whether a read, or a write, would go ahead without waiting, asked of the system and answered before the time runs out. |
 | [`sysl.log`](sysl-log/) | Structured logging: a level, a message, a few named fields, and somewhere for them to go. |
 | [`sysl.math`](sysl-math/) | Mathematics on the numeric types: the float functions, the integer ones, and the traits that let a program write both at whichever width it is already using. |
 | [`sysl.math.bigint`](sysl-math-bigint/) | Integers with no width: sign and magnitude, the magnitude a run of machine-word limbs. |

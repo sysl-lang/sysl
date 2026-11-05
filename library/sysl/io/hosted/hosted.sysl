@@ -1,7 +1,7 @@
 module sysl.io.hosted
 @requires(libc)
 
-import sysl.sys.host_status
+import sysl.sys.{UNSUPPORTED, host_status}
 
 // `sysl.io.sys`'s hooks answered over the platform's C library, which is what every hosted target
 // links. **Call `sysl.io` and `sysl.flush` instead** -- nothing here is meant to be called: each
@@ -59,4 +59,17 @@ io_write(fd: int, from: *u8, len: usize) -> isize
 
 @export("sysl_io_flush")
 io_flush(fd: int) -> int = if c_fflush(null) == 0 then 0 else int(failure())
+
+// **The wait is answered by `wait.c` beside this file**, which alone can spell `struct pollfd` and
+// `nfds_t` the way each POSIX platform declares them, and which retries an interrupted `poll` for the
+// time still owed. A hosted system without `poll` answers `UNSUPPORTED`.
+#if posix
+private extern "sysl_io_posix_wait" c_wait(fd: int, writable: int, micros: long) -> int
+
+@export("sysl_io_wait")
+io_wait(fd: int, writable: int, micros: long) -> int = c_wait(fd, writable, micros)
+#else
+@export("sysl_io_wait")
+io_wait(fd: int, writable: int, micros: long) -> int = UNSUPPORTED
+#endif
 #endif
