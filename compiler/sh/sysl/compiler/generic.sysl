@@ -667,9 +667,16 @@ instantiate_func(a: &Analysis, home: Scope, f: FuncDecl, solved: Buf[Type], cons
     // scaffolding and stripped from every build but `sysl test`.
     // A declaration that is not file-private has no claim in its file to find, and keeps the plain
     // key -- a file declaring the spelling twice is a duplicate refused where it was hoisted.
-    val base = if module_of(plain) == "" && last_dot_in(plain).is_none() then
-        file_private_key(a, home.src.name, module_qualify(home.module_name, plain))
-    else plain
+    //
+    // **AN OVERLOADED generic is filed under its SLOT** (`app$f.2`), as the declaration is: two
+    // declarations of `f[T]` made real at one `T` -- `f[T](v: []T)` and `f[T](v: Buf[T])` at `u8` --
+    // would otherwise be one name, and the second instantiation would be answered by the first's
+    // signature and body.
+    var base = plain
+
+    if module_of(plain) == "" && last_dot_in(plain).is_none()
+        base = overload_key_of(a, home, f, file_private_key(a, home.src.name,
+                                                            module_qualify(home.module_name, plain)))
     val name = s"${mangled(base, targs)}${tag_of(targs)}"
 
     if !f.tparams.is_empty()
@@ -781,6 +788,23 @@ end instantiate_nested
 private const_receiver(t: Type) -> Type = t match
     Ptr(inner) -> Ptr(const_receiver(*inner))
     other -> const_view(other)
+
+// The key of the overload set filed under `base` that holds `f` itself -- the declaration written
+// at `f`'s own place in `home`'s file -- or `base` where the name is not overloaded.
+private overload_key_of(a: &Analysis, home: Scope, f: FuncDecl, base: string) -> string
+    val set = overload_keys(a, base)
+
+    if set.len() < 2 then return base
+
+    for k in set
+        val g = a.tables.funcs.get(k)
+
+        if g.is_some() && g.unwrap().decl.at.start == f.at.start && g.unwrap().decl.at.end == f.at.end &&
+           g.unwrap().scope.src.name == home.src.name
+            return k
+
+    base
+end overload_key_of
 
 // The tag every stand-in instantiation carries, and nothing at all for the real ones.
 private tag_of(targs: Buf[Type]) -> string
