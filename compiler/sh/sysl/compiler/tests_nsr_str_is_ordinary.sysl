@@ -1,0 +1,84 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// `str` is an ordinary name: a program may declare it, and an undeclared `str(x)` is an unknown
+// function. An interpolation hole reaches the rendering through a name no reader can spell, so a
+// program's own `str` never captures it.
+
+private nsr_ready() -> bool
+    std_root() match
+        Err(_) ->
+            print("skipped: the standard module's source is not on this machine")
+            return false
+        Ok(_) -> ()
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+
+    true
+end nsr_ready
+
+private nsr_ran(text: string) -> string
+    val root = make_temp_dir("sysl-nsr").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text + out.err.unwrap_or("")
+end nsr_ran
+
+private nsr_told(text: string) -> string
+    val ds = expr_diagnostics(text)
+
+    if ds.is_empty() then return ""
+
+    ds[0]
+end nsr_told
+
+@test("a function named str returning a string is callable")
+nsr_a_user_function_str()
+    if !nsr_ready() then return
+
+    assert_eq(nsr_ran("str(x: int) -> string = \"<\" + x.to_string() + \">\"\n\nprint(str(7))\n"), "<7>\n")
+
+@test("a local named str is rendered by a hole that reads it")
+nsr_a_hole_reads_a_local_str()
+    if !nsr_ready() then return
+
+    assert_eq(nsr_ran("val str = \"hi\"\nprint(s\"${str}!\")\n"), "hi!\n")
+    assert_eq(nsr_ran("val str = 5\nprint(s\"${str}!\" + f\"${str}%03d\")\n"), "5!005\n")
+
+@test("a declared str does not capture a hole over another value")
+nsr_a_declared_str_does_not_capture_a_hole()
+    if !nsr_ready() then return
+
+    assert_eq(nsr_ran("str(x: int) -> string = \"WRONG\"\n\nval x = 3\nprint(s\"$x\" + s\"${x + 1}\")\n"), "34\n")
+
+@test("a type named str is an ordinary type")
+nsr_a_type_named_str()
+    if !nsr_ready() then return
+
+    assert_eq(nsr_ran("struct str\n    n: int\nend str\n\nval s = str(4)\nprint(s.n)\n"), "4\n")
+
+@test("an undeclared str call is the ordinary refusal")
+nsr_undeclared_str_is_unknown()
+    assert_eq(nsr_told("print(str(1))\n"), "undefined function 'str'")

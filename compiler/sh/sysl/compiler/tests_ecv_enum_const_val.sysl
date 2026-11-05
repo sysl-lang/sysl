@@ -83,3 +83,91 @@ ecv_a_payload_variant()
 
     assert(enm_says(enm_ir(src), "@S = private constant %enum.Shape { i32 1, [1 x i32] [i32 5] }"), enm_ir(src))
     assert_eq(enm_ran(src), "5\n")
+
+// **A string literal in a payload is data too**: a null owner, the address of its bytes, and its
+// length -- the three words a literal is anywhere. It was code, filled in `main` before the program's
+// statements, which put `sysl.time.utc` (`FixedZone("UTC", Offset(0))`) into every program's entry.
+private ecv_zone() -> string =
+    "enum Zone\n    Fixed(name: string, offset: i32)\n    Ruled(name: string, rule: &Fn(int) -> i32)\n\n"
+
+private ecv_zone_name() -> string =
+    "name(z: Zone) -> string = z match\n    Fixed(n, _) -> n\n    Ruled(n, _) -> n\n\n"
+
+@test("a variant carrying a string literal is laid down, the bytes' address in the region")
+ecv_a_string_payload_is_laid_down()
+    if !enm_ready() then return
+
+    val src = ecv_zone() + ecv_zone_name() + "val UTC: Zone = Fixed(\"UTC\", 0)\n\nmain()\n" +
+        "    print(name(UTC), UTC match\n        Fixed(_, o) -> o\n        Ruled(_, _) -> -1)\n"
+    val ir = enm_ir(src)
+
+    // The owner, the bytes, the length, and the region's two words the other variant's closure needs.
+    assert(enm_says(ir, "@UTC = private constant %enum.Zone { i32 0, [5 x i64] [i64 0, i64 ptrtoint (ptr @.str"), ir)
+    assert(enm_says(ir, " to i64), i64 3, i64 0, i64 0] }"), ir)
+    assert(!enm_says(ir, "store %enum.Zone %t1, ptr @UTC"), ir)
+    assert_eq(enm_ran(src), "UTC 0\n")
+
+// The variant after the first, an empty string, and a string beside another field: each offset and
+// length lands where a construction would have stored it, which is what reading them back proves.
+@test("an array of them, an empty string among them, reads back each name and number")
+ecv_an_array_of_string_payloads()
+    if !enm_ready() then return
+
+    val src = "enum Tag\n    Plain\n    Named(n: i8, label: string, k: i16)\n\n" +
+        "val TAGS: [3]Tag = [Named(1i8, \"one\", 100i16), Plain, Named(2i8, \"\", -5i16)]\n\n" +
+        "main()\n    for t in TAGS\n        t match\n            Named(n, l, k) -> print(n, s\"[$l]\", k)\n" +
+        "            Plain -> print(\"plain\")\n"
+    val ir = enm_ir(src)
+
+    assert(enm_says(ir, "@TAGS = private constant [3 x %enum.Tag]"), ir)
+    assert_eq(enm_ran(src), "1 [one] 100\nplain\n2 [] -5\n")
+
+@test("a string inside a struct inside the payload is laid down as well")
+ecv_a_string_in_a_struct_in_a_payload()
+    if !enm_ready() then return
+
+    val src = "struct Label\n    text: string\n    width: int\n\n" +
+        "enum Cell\n    Empty\n    Text(l: Label, more: string)\n\n" +
+        "val C: Cell = Text(Label(\"hello\", 7), \"tail\")\n\nmain()\n    C match\n" +
+        "        Text(l, m) -> print(l.text, l.width, m)\n        Empty -> print(\"empty\")\n"
+
+    assert(enm_says(enm_ir(src), "@C = private constant %enum.Cell"), enm_ir(src))
+    assert_eq(enm_ran(src), "hello 7 tail\n")
+
+// A `var` holds the literal as data too, and assigning it gives back a share nobody counted: the
+// owner is null, so the release is no release.
+@test("a var holding one is laid down, and reassigning it lets go of nothing it does not own")
+ecv_a_var_holding_a_string_payload()
+    if !enm_ready() then return
+
+    val src = ecv_zone() + ecv_zone_name() + "var current: Zone = Fixed(\"UTC\", 0)\n\nmain()\n" +
+        "    print(name(current))\n    current = Fixed(s\"E${5}T\", -300)\n    print(name(current))\n" +
+        "    current = Fixed(\"UTC\", 0)\n    print(name(current))\n"
+
+    assert(enm_says(enm_ir(src), "@current = private global %enum.Zone { i32 0, "), enm_ir(src))
+    assert_eq(enm_ran(src), "UTC\nE5T\nUTC\n")
+
+// The other three-word value whose bytes are laid down while compiling: an embedded file.
+@test("a variant carrying an embedded file is laid down over the file's bytes")
+ecv_an_embedded_file_payload()
+    if !enm_ready() then return
+
+    val src = "enum Blob\n    None_\n    Bytes(b: []const u8)\n\nval B: Blob = Bytes(embed(\"main.sysl\"))\n\n" +
+        "main()\n    B match\n        Bytes(b) -> print(b[b.len - 1] == u8('\\n'), b.len > 10)\n" +
+        "        None_ -> print(\"none\")\n"
+    val ir = enm_ir(src)
+
+    assert(enm_says(ir, "@B = private constant %enum.Blob"), ir)
+    assert(enm_says(ir, "ptrtoint (ptr @.embed."), ir)
+    assert_eq(enm_ran(src), "true true\n")
+
+// A string that is computed is not a literal, so the value stays code and is filled at startup.
+@test("a string the program computes keeps the value code")
+ecv_a_computed_string_payload_stays_code()
+    if !enm_ready() then return
+
+    val src = ecv_zone() + ecv_zone_name() + "var count = 1\n\nval Z: Zone = Fixed(s\"U${count}C\", 0)\n\n" +
+        "main()\n    print(name(Z))\n"
+
+    assert(enm_says(enm_ir(src), "store %enum.Zone"), enm_ir(src))
+    assert_eq(enm_ran(src), "U1C\n")

@@ -474,6 +474,7 @@ constant_value(e: *Emit, t: TExpr) -> Val = *t.kind match
                         UnitTable(symbol) -> VPtrToInt(area.0, VGlobal(symbol))
                         UnitFn(entry) -> VPtrToInt(area.0, VGlobal(entry_of(e, entry)))
                         UnitBox(value) -> VPtrToInt(area.0, box_const(e, value))
+                        UnitText(text) -> VPtrToInt(area.0, text_address(e, text))
 
                     cells.push(ir_arg(area.0, cell))
 
@@ -629,6 +630,16 @@ end view_const
 // instantiated three times, or two functions embedding one image, would otherwise carry the image
 // three times. The global's name is made from the path, so a second use finds the first.
 embed_const(e: *Emit, file: string, bytes: []u8, align: int) -> Val
+    var fields: Buf[IrArg] = buf()
+
+    fields.push(ir_arg(LPtr, VNull))
+    fields.push(ir_arg(LPtr, embed_global(e, file, bytes, align)))
+    fields.push(ir_arg(word_lty(e), VInt(from_int(long(bytes.len)))))
+    VAgg(fields)
+end embed_const
+
+// The global an embedded file's bytes are laid down in, once per file and boundary.
+private embed_global(e: *Emit, file: string, bytes: []u8, align: int) -> Val
     val name = s".embed.${bytes_fingerprint(file.bytes)}.$align"
 
     if !has_global(e, name)
@@ -642,13 +653,14 @@ embed_const(e: *Emit, file: string, bytes: []u8, align: int) -> Val
         e.globals.push(IrGlobal(name, true, LArr(int(data.len()), LInt(8)), Some(image), LinkPrivate,
                                 None, Some(align), false, false, false))
 
-    var fields: Buf[IrArg] = buf()
+    VGlobal(name)
+end embed_global
 
-    fields.push(ir_arg(LPtr, VNull))
-    fields.push(ir_arg(LPtr, VGlobal(name)))
-    fields.push(ir_arg(word_lty(e), VInt(from_int(long(bytes.len)))))
-    VAgg(fields)
-end embed_const
+// The address of the bytes a string literal or an embedded file in a payload names.
+private text_address(e: *Emit, text: TExpr) -> Val = *text.kind match
+    TEmbed(file, bytes, align) -> embed_global(e, file, bytes, align)
+    TStrLit(s) -> string_global(e, s)
+    _ -> gap_at(e, "a payload address of something that is not text")
 
 private has_global(e: *Emit, name: string) -> bool
     for g in e.globals

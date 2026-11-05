@@ -1066,7 +1066,7 @@ main()
 ```
 
 `Display` and `Debug` are reached through, so `v.display(…)` on a `T` at `*P` is `P`'s. What
-`str(v)`, `v.to_string()` and `s"${v}"` render is decided by the rule for showing a value, and a raw
+`v.to_string()` and `s"${v}"` render is decided by the rule for showing a value, and a raw
 pointer is shown as its address there ([traits]({{< ref "traits" >}})), at `T = *P` as on a `*P`
 local.
 

@@ -25,7 +25,8 @@ slate's `slate:time` has:
 
 `Offset`, `Weekday`, `Resolution` and `YearMonthDay` (a date's three fields) sit beside them.
 `LocalDate`, `LocalTime`, `LocalDateTime`, `Civil`, `date_at`, `time_at` and `datetime_at` are not
-names in the module, and a program using one is refused:
+names in the module, and neither is the free `resolve(dt, fn)`: a program using one is refused with
+the name that replaced it, or with `zone.resolve(dt)` for `resolve`:
 
 ```sysl
 import sysl.time.*
@@ -34,7 +35,7 @@ show(d: LocalDate) = print(d)
 ```
 
 ```error
-unknown type 'LocalDate'
+'LocalDate' was renamed to 'Date' in 0.10.0
 ```
 
 It requires no capability: every name below is reachable on a target with no operating system.

@@ -56,6 +56,19 @@ name_as_written(cx: &Analyzer, scope: Scope, w: TypeRef, ty: Type, tparams: Buf[
     // `(&u16)::Target` is spelled by what it points at as written, `u16` -- where `w` can be read in
     // this body's terms, which a generic struct's field cannot.
     val wr = if own_terms then written_referent(cx, scope, w) else w
+
+    // `Shelf::Item` is spelled as the implementation wrote `type Item = …`, as an alias is by its
+    // declaration; off a type parameter it is named canonically, as the parameter is.
+    if own_terms && depth < 32
+        val projected = projection_written(cx, scope, wr, tparams)
+
+        if projected.is_some()
+            val (pscope, pw, ptparams) = projected.unwrap()
+
+            return name_as_written(cx, pscope, pw, ty, ptparams, depth + 1)
+        end if
+    end if
+
     val sp = spelling_of(wr, ty, tparams)
 
     if sp.is_none() then return type_show(ty)
@@ -80,6 +93,28 @@ name_as_written(cx: &Analyzer, scope: Scope, w: TypeRef, ty: Type, tparams: Buf[
 
     type_show(ty)
 end name_as_written
+
+// The implementation's own spelling of a projection `X::Item` written off a concrete subject -- a
+// declared type, an instance, a reference's `Target`, another such projection -- and `None` where the
+// projection is rooted in a type parameter or `Self`, or no block filed under the subject wrote it.
+private projection_written(cx: &Analyzer, scope: Scope, w: TypeRef,
+                           tparams: Buf[string]) -> Option[(Scope, TypeRef, Buf[string])] = *w.kind match
+    AssocType(inner, member) ->
+        if rooted_in_parameter(inner, tparams) then None
+        else assoc_written(cx.an, resolve_type(cx.an, scope, inner, cx.subst), member)
+    _ -> None
+
+// Whether a written type names a type parameter, or `Self`, at the root of its projections.
+private rooted_in_parameter(w: TypeRef, tparams: Buf[string]) -> bool = *w.kind match
+    NamedType(n, _) ->
+        if n == "Self" then return true
+
+        for p in tparams
+            if p == n then return true
+
+        false
+    AssocType(inner, _) -> rooted_in_parameter(inner, tparams)
+    _ -> false
 
 // `f::Type::Name` in a copy of a walk over a struct's fields: the field's type as the struct's
 // declaration wrote it. A variant's payload field, and a field written as one of the struct's type
@@ -718,12 +753,19 @@ reflected_walk(cx: &Analyzer, span: Span, iter: Expr) -> Option[Result[Buf[Type]
 end reflected_walk
 
 // The type a walk's `T::Fields` or `T::Variants` asks about: a type's name, a type parameter, or a
-// generic type with its arguments written. `None` where the left side is a value, a generic type
-// written bare, or nothing at all, each of which the attribute's ordinary reading refuses.
+// generic type with its arguments written, or a left side only the type grammar reads (`M::Item`,
+// `T::Target`). `None` where the left side is a value, a generic type written bare, or nothing at
+// all, each of which the attribute's ordinary reading refuses.
 private reflected_subject(cx: &Analyzer, span: Span, receiver: Expr) -> Option[Type]
     val name = attr_type_name(cx, receiver)
 
-    if name.is_none() then return written_instance(cx, span, receiver)
+    if name.is_none()
+        val instance = written_instance(cx, span, receiver)
+
+        if instance.is_some() || !spelled_as_type(cx, receiver) then return instance
+
+        return Some(written_as_type(cx, receiver))
+    end if
     if cx.lookup(name.unwrap()).is_some() then return None
     if generic_struct_named(cx, name.unwrap()).is_some() then return None
     if generic_enum_named(cx, name.unwrap()).is_some() then return None

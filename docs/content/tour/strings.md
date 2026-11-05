@@ -120,7 +120,7 @@ true é 2.5
 
 `to_string` allocates a new buffer for everything except a string, which it returns as is, and a
 `bool`, which renders to one of two literals. A struct or an enum renders through its `Display`
-implementation. (`str(x)` is the older spelling of the same thing, and still works.)
+implementation.
 
 A list of strings is joined with a separator between the pieces by `join`:
 

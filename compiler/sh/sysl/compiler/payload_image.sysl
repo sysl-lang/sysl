@@ -17,8 +17,13 @@ import sysl.math.bigint.{BigInt, from_int, pow, sub}
 // and a trait object made from such an address, which is the table's address and the object's. The linker fills an
 // address in, so it has to fill a whole unit: one is written where it starts a unit exactly as wide
 // as a pointer, and anywhere else -- a unit wider than a pointer, which a 64-bit field beside it on a
-// 32-bit target makes -- the image is `None`. So is a payload holding anything else -- a string, a
-// bitfield struct -- and the analysis keeps the value as code.
+// 32-bit target makes -- the image is `None`. So is a payload holding anything else -- a bitfield
+// struct, a computed string -- and the analysis keeps the value as code.
+//
+// **A string literal is three words, and only its middle one is an address**: the owner is null, as
+// every literal's is, the bytes are a read-only global the linker places, and the length is a number.
+// So `FixedZone("UTC", Offset(0))` is data exactly as the same fields in a struct are, and an
+// embedded file -- the same three words over the file's bytes -- is too.
 
 // One unit of a payload region: its bits, or an address the linker fills in -- of module storage, or
 // of a trait's table.
@@ -30,6 +35,8 @@ enum PayloadUnit
     UnitFn(entry: string)
     // The address of a box laid down whole, its payload `value`.
     UnitBox(value: TExpr)
+    // The address of a string literal's bytes, or of an embedded file's.
+    UnitText(text: TExpr)
 
 // The units of a carrying variant's payload region, in order, each at the region's unit width.
 payload_units(l: TargetLayout, d: &EnumType, v: EnumVariant, args: Buf[TExpr]) -> Option[Buf[PayloadUnit]]
@@ -194,9 +201,25 @@ private byte_image(l: TargetLayout, t: TExpr, ty: Type, out: Buf[u8], refs: Buf[
 
         refs.push((at, UnitBox(value)))
         true
+    // A string literal or an embedded file: a null owner, which the region's zero bits already are,
+    // the bytes' address in the word after it, and the length in the word after that.
+    TStrLit(s) -> text_bytes(l, t, ty, long(s.bytes.len), refs, out, at)
+    TEmbed(_, bytes, _) -> text_bytes(l, t, ty, long(bytes.len), refs, out, at)
     // A null pointer, thin or fat, is all zero bits, which the region already is.
     TNullLit(_) -> true
     _ -> false
+
+// The three words of a string with no owner: null, the address of the bytes `text` lays down, and
+// `len`.
+private text_bytes(l: TargetLayout, text: TExpr, ty: Type, len: long, refs: Buf[(usize, PayloadUnit)],
+                   out: Buf[u8], at: usize) -> bool
+    val word = l.pointer_bytes()
+
+    if l.size(ty) != 3 * word then return false
+
+    refs.push((at + word, UnitText(text)))
+    put_word(l, out, at + 2 * word, word, len)
+end text_bytes
 
 // A plain struct's stored fields at the offsets the layout gives them. A bitfield struct packs its
 // fields into one container, and a `@byte_order` one reverses them, so neither is written here.
