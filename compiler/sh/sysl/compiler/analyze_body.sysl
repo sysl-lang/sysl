@@ -675,6 +675,9 @@ analyze_body(a: &Analysis, scope: Scope, span: Span, d: FuncDecl, key: string = 
     // one written for effect, and every `if` and `match` that ends it inherits that.
     val body = typed_body(cx, d, rest, ret)
 
+    // A write to a by-value parameter nothing reads afterwards (`lost_writes.sysl`).
+    check_lost_writes(cx, params, body, contract.1)
+
     // **Anchored at the declaration, not at the statement that yields**, as the reference anchors it:
     // the mistake is the signature and the body disagreeing, and the signature is where it is read --
     // unless the body is an `if` of literals one of which disagrees with the rest (`misfit_literal`).
@@ -920,9 +923,13 @@ private check_abstract_body(a: &Analysis, scope: Scope, d: FuncDecl, keep: bool 
     cx.at_definition = true
     remember_bounds(cx, d)
 
+    var bound: Buf[(string, Type)] = buf()
+
     for p in d.params
         val pty = resolve_type(a, scope, p.typ, subst)
         val unique = cx.bind(p.name, pty, written_name(cx, p.span.start, p.name))
+
+        bound.push((unique, pty))
 
         cx.spell_binding(unique, spelling_of(p.typ, pty, d.tparams))
 
@@ -946,9 +953,13 @@ private check_abstract_body(a: &Analysis, scope: Scope, d: FuncDecl, keep: bool 
 
     val split = contract_length(d.body)
 
-    analyze_contract(cx, decl_anchor(d), d.body, split, ret)
-
+    val contract = analyze_contract(cx, decl_anchor(d), d.body, split, ret)
     val body = body_block(cx, statements_from(d.body, split), ret)
+
+    // A generic body's lost writes are told here, once, as its dropped `Result`s are
+    // (`lost_writes.sysl`).
+    check_lost_writes(cx, bound, body, contract.1)
+
     var params: Buf[(string, Type)] = buf()
 
     for param in d.params
@@ -1227,6 +1238,8 @@ analyze_instance_in(a: &Analysis, cx: &Analyzer, name: string, d: FuncDecl) -> T
     val rest = statements_from(d.body, split)
     val body = typed_body(cx, d, rest, ret)
     val span = body_span(rest, span_zero())
+
+    check_lost_writes(cx, params, body, contract.1)
 
     if ret != Unit && body.result.is_some() && disagree(body.ty, ret) then
         cx.fault(misfit_literal(body.result.unwrap(), ret).map(l -> l.span).unwrap_or(span),
