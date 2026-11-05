@@ -83,8 +83,28 @@ type_attr_call(cx: &Analyzer, span: Span, written: string, attr: string, args: B
     if subject.is_none() then
         return cx.err(span, s"'$written' has no type attributes")
 
-    attr_of_type(cx, span, written, attr, args, subject.unwrap(), true)
+    val ty = subject.unwrap()
+
+    attr_of_type(cx, span, written, attr, args, ty, true,
+                 if attr == "Name" then name_answer(cx, span, written, ty) else "")
 end type_attr_call
+
+// What `written::Name` answers (`name_as_written`): a type parameter by the type it stands for, a
+// field walk's `f::Type` by the struct's declaration of the field, and any other name as written.
+private name_answer(cx: &Analyzer, span: Span, written: string, ty: Type) -> string
+    if bound_type(cx.subst, written).is_none() then
+        return name_as_written(cx, cx.scope, named_type(span, written), ty, subst_names(cx))
+
+    val n = written.bytes.len
+
+    if n > 6 && written.ends_with("::Type")
+        val d = descriptor_bound(cx.subst, written[0..<n - 6])
+
+        if d.is_some() then return field_name_as_written(cx, d.unwrap(), ty)
+    end if
+
+    type_show(ty)
+end name_answer
 
 // `Pair[u8]::Bits(n)` -- an attribute asked of a generic type at the arguments written on it, which
 // is the type an alias of `Pair[u8]` would name, and answers as that alias does. `None` where the left
@@ -110,13 +130,18 @@ type_attr_on_instance(cx: &Analyzer, span: Span, receiver: Expr, attr: string,
                            s"type parameter with '[T: $shown]'"))
     end if
 
-    Some(attr_of_type(cx, span, type_show(ty), attr, args, ty, false))
+    // The instance is quoted as it was written, by `::Name` and by a refusal alike.
+    val name = if instance.is_some() then
+        name_as_written(cx, cx.scope, written_type_ref(cx, receiver, false), ty, subst_names(cx))
+    else type_show(ty)
+
+    Some(attr_of_type(cx, span, name, attr, args, ty, false, name))
 end type_attr_on_instance
 
 // What the type `written` stands for answers to `::attr`. `named` is a left side written as a name,
-// which may be one of the body's type parameters.
+// which may be one of the body's type parameters, and `name` is what `::Name` answers.
 private attr_of_type(cx: &Analyzer, span: Span, written: string, attr: string, args: Buf[Expr],
-                     ty: Type, named: bool) -> TExpr
+                     ty: Type, named: bool, name: string) -> TExpr
     // **`Id` is answered before the dispatch, because it is the one attribute EVERY type has.** The
     // arms below reach an enum, a constrained subtype and a built-in integer, and everything else
     // is told it has no type attributes -- which is right for `Max` and wrong for an identity.
@@ -130,7 +155,7 @@ private attr_of_type(cx: &Analyzer, span: Span, written: string, attr: string, a
 
     // The four that describe a type's make-up are, like `Id`, asked of every type -- and of a type
     // parameter per instantiation, since each one is a fact about the type it was given.
-    if reflection_attr(attr) then return reflect_attr(cx, span, written, attr, args, ty)
+    if reflection_attr(attr) then return reflect_attr(cx, span, written, attr, args, ty, name)
 
     // `T::Make(c, payload)` builds the variant a walk over `T::Variants` stands at.
     if attr == "Make" then return make_variant(cx, span, written, args, ty)

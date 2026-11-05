@@ -1,0 +1,115 @@
+module sh.sysl.compiler
+@tests
+
+// **`T::Name` names a type as the program spelled it** (`type_reflect.sysl`'s `name_as_written`), by
+// the rule a diagnostic follows: `u16` and `ushort` are both the type's own names, so each answers as
+// written and neither displaces the other. An alias answers as its declaration spelled what it names.
+// A type parameter is named canonically, since one instantiation serves every spelling of its
+// argument -- and the canonical name of a width with a built-in alias is that alias.
+
+private tnw_types() -> string = raw"""
+    type Meters = u16
+    type Span = Meters
+    type Bytes = []u8
+    type Pair = (u16, byte)
+    type Small = u16 within 0..10
+
+    struct Box[T]
+        item: T
+
+    struct S[T]
+        a: u16
+        b: ushort
+        c: Meters
+        d: T
+        e: []u8
+
+    name_of[T]() -> string = T::Name
+    in_option[T]() -> string = Option[T]::Name
+
+    """
+
+@test("every built-in width answers the name it was written with")
+tnw_every_width_by_its_written_name()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        print(i8::Name, i16::Name, i32::Name, i64::Name, i128::Name)
+        print(u8::Name, u16::Name, u32::Name, u64::Name, u12::Name)
+        print(int::Name, short::Name, long::Name, byte::Name)
+        print(ushort::Name, uint::Name, ulong::Name)
+        """), "i8 i16 i32 i64 i128\n" +
+              "u8 u16 u32 u64 u12\n" +
+              "int short long byte\n" +
+              "ushort uint ulong\n")
+end tnw_every_width_by_its_written_name
+
+@test("the other scalars answer their own names, 'f64' and 'real' each as written")
+tnw_the_other_scalars()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(raw"""
+        print(bool::Name, char::Name, string::Name, unit::Name)
+        print(f32::Name, f64::Name, real::Name, usize::Name, isize::Name, q15::Name)
+        """), "bool char string unit\n" +
+              "f32 f64 real usize isize q15\n")
+end tnw_the_other_scalars
+
+@test("an alias answers as its declaration spelled what it names, through a chain of aliases")
+tnw_an_alias_answers_its_declaration()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(tnw_types() + raw"""
+        print(Meters::Name, Span::Name, Bytes::Name, Pair::Name, Small::Name)
+        """), "u16 u16 []u8 (u16, byte) Small\n")
+end tnw_an_alias_answers_its_declaration
+
+@test("a generic type written with its arguments keeps the arguments' spelling")
+tnw_an_instance_keeps_its_arguments()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(tnw_types() + raw"""
+        print(Box[u16]::Name, Box[ushort]::Name, Box[u8]::Name, Box[Meters]::Name)
+        """), "Box[u16] Box[ushort] Box[u8] Box[ushort]\n")
+end tnw_an_instance_keeps_its_arguments
+
+@test("a type parameter is named canonically, whatever spelling instantiated it")
+tnw_a_type_parameter_is_canonical()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(tnw_types() + raw"""
+        print(name_of[u16](), name_of[ushort](), name_of[Meters](), name_of[u8](), name_of[i32]())
+        print(name_of[f64](), name_of[u12](), in_option[u16](), name_of[Box[u16]]())
+        """), "ushort ushort ushort byte int\n" +
+              "real u12 sysl.Option[ushort] Box[ushort]\n")
+end tnw_a_type_parameter_is_canonical
+
+@test("a field walk's 'f::Type::Name' is the field's type as the struct declared it")
+tnw_a_field_walk_names_the_declared_field()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(tnw_types() + raw"""
+        for const f in S[u16]::Fields
+            print(f.name, f::Type::Name)
+        """), "a u16\nb ushort\nc u16\nd ushort\ne []u8\n")
+end tnw_a_field_walk_names_the_declared_field
+
+@test("a refusal of an instance's attribute quotes the instance as it was written")
+tnw_a_refusal_quotes_the_written_instance()
+    if !enm_ready() then return
+
+    val said = enm_err(tnw_types() + "@packed\nstruct Two[T]\n    lo: T\n    hi: T\n\n" +
+                       "print(Two[u16]::Nope(1).lo)\n")
+
+    assert(said.contains("'Two[u16]' has no attribute 'Nope' — its one attribute is " +
+                         "'Two[u16]::Bits'"), said)
+end tnw_a_refusal_quotes_the_written_instance
+
+@test("'Box::Name' with no arguments is still refused")
+tnw_a_bare_generic_is_still_refused()
+    if !enm_ready() then return
+
+    val said = enm_err(tnw_types() + "print(Box::Name)\n")
+
+    assert(said.contains("'Box' is generic, so 'Box::Name' has no single type to read"), said)
+end tnw_a_bare_generic_is_still_refused
