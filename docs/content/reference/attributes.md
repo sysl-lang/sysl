@@ -652,6 +652,12 @@ struct First
 
 impl Picker for First
     pick(self, p: *int) -> *int = p
+
+main()
+    val o: &Picker = First(0)
+    var n = 1
+
+    print(*o.pick(&n))
 ```
 
 ```error
@@ -686,6 +692,8 @@ setup(k: int) -> int
 main()
     print(setup(1))
     print(shown.unwrap().f())
+
+    shown = None
 ```
 
 ```output
