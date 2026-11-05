@@ -1,0 +1,80 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.Span
+
+// **What a use of a tombstone is told** (`reference/attributes.md § @renamed and @removed`; the
+// grammar is `parse_tombstone.sysl`'s).
+//
+// **A tombstone declares nothing.** It is filed in `Tables.tombstones` under the key its name would
+// have had, apart from every declaration, so no lookup, completion, page of `sysl doc`, trait or
+// `impl` search and no collision ever sees it. It is asked at exactly one moment: when a name has
+// already been found to stand for nothing, just before that is said -- an unknown type, an undefined
+// function or name, an import of something the module does not declare. **That is what makes a
+// program's own declaration of the old name win without a clash**: it is found first, and the
+// question that would reach the tombstone is never asked.
+
+// Files one tombstone under its module.
+hoist_tombstone(a: &Analysis, scope: Scope, span: Span, t: Tombstone)
+    val key = module_qualify(scope.module_name, t.name)
+
+    if a.tables.tombstones.has(key)
+        a.fault(scope, span, s"'${t.name}' has a tombstone already in '${scope.module_name}' — a name goes once, so one '@renamed' or '@removed' says what became of it")
+        return
+    end if
+
+    a.tables.tombstones.put(key, t)
+end hoist_tombstone
+
+// What a use of the tombstone is refused with.
+tombstone_refusal(t: Tombstone) -> string =
+    if t.renamed_to != "" then s"'${t.name}' was renamed to '${t.renamed_to}' in ${t.version}"
+    else s"'${t.name}' was removed in ${t.version}: ${t.hint}"
+
+// The tombstone a name written in this scope would reach, where nothing it could name was found:
+// the scope's own module, then a name imported by name, then each wildcard -- the order a declaration
+// is found in. `types_only` is a type position, which a function's tombstone does not answer.
+tombstone_here(a: &Analysis, scope: Scope, name: string, types_only: bool) -> Option[Tombstone]
+    if a.tables.tombstones.len() == 0 then return None
+
+    val cut = last_dot_in(name)
+
+    if cut.is_some()
+        val head = name[0..<cut.unwrap()]
+        val last = name[cut.unwrap() + 1..<name.bytes.len]
+        val aliased = scope.imports.module_as(head)
+
+        if aliased.is_some()
+            val t = tombstone_at(a, module_qualify(aliased.unwrap(), last), types_only)
+
+            if t.is_some() then return t
+        end if
+
+        return tombstone_at(a, module_qualify(module_in_package(a, scope.pkg, head, last), last), types_only)
+    end if
+
+    val own = tombstone_at(a, module_qualify(scope.module_name, name), types_only)
+
+    if own.is_some() then return own
+
+    val im = answering_imports(a, scope, name, k -> a.tables.tombstones.has(k))
+    val bound = im.name_key(name)
+
+    if bound.is_some()
+        val t = tombstone_at(a, bound.unwrap(), types_only)
+
+        if t.is_some() then return t
+    end if
+
+    for at in im.wildcards
+        val t = tombstone_at(a, module_qualify(at, name), types_only)
+
+        if t.is_some() then return t
+
+    None
+end tombstone_here
+
+// The tombstone filed under a key, where it answers the kind of position asking.
+tombstone_at(a: &Analysis, key: string, types_only: bool) -> Option[Tombstone] =
+    a.tables.tombstones.get(key) match
+        Some(t) -> if t.is_type || !types_only then Some(t) else None
+        None -> None

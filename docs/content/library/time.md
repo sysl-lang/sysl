@@ -1,23 +1,50 @@
 ---
 title: The time module
-summary: "`sysl.time` — `Instant` and `Duration` kept apart, the proleptic Gregorian calendar, `LocalDate`/`LocalTime`/`LocalDateTime`, the ISO 8601 renderers and the parsers that read them back."
+summary: "`sysl.time` — `Instant` and `Duration` kept apart, the proleptic Gregorian calendar, `Date`/`Time`/`DateTime`, `Period`, `Zone` and `Zoned`, the ISO 8601 renderers and the parsers that read them back."
 weight: 65
 ---
 
 **Every declaration in `sysl.time`, with its signature:** [the generated API page](/api/sysl-time/#index). This page is the argument — what the module is for, and how its pieces fit; that one is the list.
 
-`sysl.time` is arithmetic on dates and lengths of time. It is three files and seven types, and almost
-everything worth saying about it is a **distinction the type system holds for you** — a point on the
-timeline is not a length of one, and a reading on a wall clock is neither. Every library that blurs
-those has the same class of bug in it, and the blur is what the types here refuse.
+`sysl.time` is arithmetic on dates and lengths of time, and almost everything worth saying about it
+is a **distinction the type system holds for you** — a point on the timeline is not a length of
+one, and a reading on a wall clock is neither. Every library that blurs those has the same class of
+bug in it, and the blur is what the types here refuse. There are eight of them, the same eight
+slate's `slate:time` has:
+
+| type | what it is | made with |
+|---|---|---|
+| `Instant` | a point on the timeline, with no calendar | `now()` |
+| `Duration` | an exact length — microseconds to days | `5.ms`, `hours(2)`; `monotonic()` answers one |
+| `Date` | a calendar date, with no time of day | `date(2026, 9, 2)` |
+| `Time` | a time of day, with no date | `time(14, 30, 0)` |
+| `DateTime` | a wall reading, with no zone | `date_time(2026, 9, 2, 14, 30, 0)` |
+| `Zone` | a zone: a name, and the offset its clocks show at any instant | `utc`; `zone("America/Toronto")` and `local_zone()` in `sysl.posix.time` |
+| `Zoned` | a wall reading in a zone | `instant.at(zone)`, `date_time.at(zone)` |
+| `Period` | months and days | `months(3)`, `years(1)`, `Period(0, 1)` |
+
+`Offset`, `Weekday`, `Resolution` and `YearMonthDay` (a date's three fields) sit beside them.
+`LocalDate`, `LocalTime`, `LocalDateTime`, `Civil`, `date_at`, `time_at` and `datetime_at` are not
+names in the module, and neither is the free `resolve(dt, fn)`: a program using one is refused with
+the name that replaced it, or with `zone.resolve(dt)` for `resolve`:
+
+```sysl
+import sysl.time.*
+
+show(d: LocalDate) = print(d)
+```
+
+```error
+'LocalDate' was renamed to 'Date' in 0.10.0
+```
 
 It requires no capability: every name below is reachable on a target with no operating system.
 
 ```sysl
 import sysl.time.*
 
-var launch = date_at(2026, 3, 8)
-var meeting = datetime_at(2026, 3, 8, 9, 30, 0)
+var launch = date(2026, 3, 8)
+var meeting = date_time(2026, 3, 8, 9, 30, 0)
 
 print(date_text(launch), weekday_name(weekday(launch)))
 print(datetime_text(meeting))
@@ -319,22 +346,22 @@ what, from when? — so naming one still means saying which epoch it is counted 
 ```sysl
 // Proleptic Gregorian — the Gregorian rules run backwards through the years before anybody
 // agreed to them.
-struct Civil
+struct YearMonthDay
     year: int
     month: int
     day: int
 
 // Days since 1970-01-01, signed.
-struct LocalDate
+struct Date
     day: int
 
 // Microseconds since midnight.
-struct LocalTime
+struct Time
     us: long
 
-struct LocalDateTime
-    date: LocalDate
-    time: LocalTime
+struct DateTime
+    date: Date
+    time: Time
 ```
 
 **A day number, not packed civil fields.** Year, month, day, hour and minute as bit fields inside one
@@ -351,14 +378,14 @@ ten-day hole in it whose position depends on which country you ask.
 ```sysl
 import sysl.time.*
 
-var d = date_at(2026, 3, 8)
+var d = date(2026, 3, 8)
 
 print(year_of(d), month_of(d), day_of(d), month_name(month_of(d)))
 print(day_of_year(d), weekday_name(weekday(d)))
 print(days_in_month(2026, 2), days_in_month(2024, 2))
 print(leap_year(2000), leap_year(1900), leap_year(2024))
-print(date_at(1970, 1, 1).day, date_at(1969, 12, 31).day)
-print(weekday_name(weekday(date_at(1970, 1, 1))))
+print(date(1970, 1, 1).day, date(1969, 12, 31).day)
+print(weekday_name(weekday(date(1970, 1, 1))))
 ```
 
 ```output
@@ -382,13 +409,25 @@ at zero. Nothing here needs to know which day a week starts on.
 
 ### A date the calendar does not have
 
-`date_at` is `days_from_civil` under another name, so it answers for any three numbers at all. The
-thirtieth of February is a day count like any other and comes back as the second of March:
+**Three numbers the program wrote are a fault; text from outside is a result.** `date` is the
+program's own words, so a thirtieth of February written into a program is a defect in it, and it
+stops the program at the line that wrote it rather than rolling over into March:
+
+```
+print(date(2026, 2, 30))
+```
+
+```
+panic: there is no such date: 2026-2-30 (main.sysl:3)
+```
+
+`time` is the same about an hour past 23 or a minute past 59, and `date_time` about either. Numbers
+a program has *read* go through `checked_date`, which answers an `Option`, and text goes through
+`parse_date`, which answers a `Result` (below):
 
 ```sysl
 import sysl.time.*
 
-print(date_text(date_at(2026, 2, 30)))
 print(checked_date(2026, 2, 30).is_none(), checked_date(2026, 2, 28).is_some())
 
 val text = checked_date(2026, 2, 29) match
@@ -396,23 +435,20 @@ val text = checked_date(2026, 2, 29) match
     None -> "no such date"
 
 print(text)
+print(days_from_civil(YearMonthDay(2026, 2, 30)))
 ```
 
 ```output
-2026-03-02
 true true
 no such date
+2026-03-02
 ```
 
-**Two constructors rather than one that checks.** A calendar walk — `plus_months`, a loop over the
-days of a month, `on_or_after` — has already established that its dates are real, and a range test
-per step would be paid for by every one of them to catch nothing. `date_at` is that walk's
-arithmetic and stays exactly as it is.
-
-What asks the other question is a **reader**: text names three numbers that a person wrote, and a
-format saying a date must exist has to be able to refuse them. `parse_date` already answers
-`Err(OutOfRange(…))`, so the checking was there; what was missing was reaching it without going
-through text, which a reader that has already scanned the digits itself has no way to do.
+**A walk that already knows its dates are real uses `days_from_civil`.** A calendar walk —
+`plus_months`, a loop over the days of a month, `on_or_after` — has already established that its
+dates are real, and a range test per step would be paid for by every one of them to catch nothing.
+`days_from_civil` is that walk's arithmetic: pure, total, and the thirtieth of February is a day
+count like any other.
 
 The year is unbounded on purpose. The proleptic Gregorian calendar has no first or last one, and
 `days_from_civil` is its own inverse over the whole `int` range — so `checked_date` checks the month
@@ -423,42 +459,55 @@ and the day and nothing else.
 ```sysl
 import sysl.time.*
 
-print(date_text(plus_months(date_at(2026, 1, 31), 1)))
-print(date_text(plus_months(date_at(2024, 1, 31), 1)))
-print(date_text(plus_years(date_at(2024, 2, 29), 1)))
-print(date_text(on_or_after(date_at(2026, 3, 8), Tuesday)))
-print(datetime_text(plus_days(datetime_at(2026, 3, 8, 9, 30, 0), 7)))
+print(date(2026, 1, 31) + months(1))
+print(date(2024, 1, 31) + months(1))
+print(date(2024, 2, 29) + years(1), date(2024, 2, 29) + Period(0, 1))
+print(date(2026, 1, 31) + Period(1, 1))
+print(on_or_after(date(2026, 3, 8), Tuesday))
+print(date_time(2026, 3, 8, 9, 30, 0) + Period(0, 7))
+print(years(1) + months(2) + Period(0, 3), months(1) == Period(0, 30))
 ```
 
 ```output
 2026-02-28
 2024-02-29
-2025-02-28
+2025-02-28 2024-03-01
+2026-03-01
 2026-03-10
 2026-03-15 09:30
+1y 2mo 3d false
 ```
+
+**A `Period` is a length of calendar — so many months and so many days — and it is the other length
+beside `Duration`.** A duration is exact timeline and a period is a step on the calendar, whose
+length on the timeline depends on where it is taken: a month is 28 to 31 days, and a day is 23 to 25
+hours across a change of a zone's clocks. **Months and days never convert** — `months(1)` holds no
+days and is not `Period(0, 30)` — and a year is twelve months, which is exact, so `years` makes
+months. Adding one applies the months first and the days after, which is why the 31st of January
+plus a month and a day is the 1st of March by way of the 28th of February.
 
 **Months are added by the calendar rather than by counting days, and the day is clamped where the
 target month is shorter.** The 31st of January plus one month is the 28th or the 29th of February,
 whichever that year has. Every library that offers this makes the choice, and clamping is the one
-that keeps "the last day of the month" landing on a last day. `plus_years` is `plus_months` by
-twelve, which is what makes the 29th of February behave on a non-leap year without a rule of its own.
+that keeps "the last day of the month" landing on a last day. `years(1)` is twelve months, which is
+what makes the 29th of February behave on a non-leap year without a rule of its own. `plus_months`,
+`plus_years` and `plus_days` are the same steps as functions.
 
-**`plus_days` on a wall clock reading is not adding a length of time to it.** Seven days later is the
+**A period on a wall clock reading is not adding a length of time to it.** Seven days later is the
 same clock face seven rows down the calendar, whatever the timeline did in between; across a change
-of a zone's clocks the two answers differ by an hour. Both are right — they answer different
-questions, which is why they are spelled differently. And why this is refused:
+of a zone's clocks the two answers differ by an hour ([below](#a-reading-in-a-zone)). Both are right —
+they answer different questions, which is why they are spelled differently. And why this is refused:
 
 ```sysl
 import sysl.time.*
 
-var d = date_at(2026, 3, 8)
+var d = date(2026, 3, 8)
 
-print(date_text(d + days(1i64)))
+print(d + days(1))
 ```
 
 ```error
-'+' needs matching types, got LocalDate and Duration
+'+' between Date and Duration needs 'Add[Duration]' — it implements 'Add[Period]'
 ```
 
 `on_or_after` is the first date on or after a given one falling on a given weekday, which is what
@@ -466,14 +515,14 @@ print(date_text(d + days(1i64)))
 
 ### Reading a time of day apart
 
-A `LocalTime` is one number of microseconds since midnight, and the four `*_of` functions read its
+A `Time` is one number of microseconds since midnight, and the four `*_of` functions read its
 parts out of it — which is what a renderer, a comparison against a schedule, and anything printing a
 clock face all want:
 
 ```sysl
 import sysl.time.*
 
-var t = time_at(13, 45, 30)
+var t = time(13, 45, 30)
 
 print(hour_of(t), minute_of(t), second_of(t), us_of(t))
 ```
@@ -484,18 +533,18 @@ print(hour_of(t), minute_of(t), second_of(t), us_of(t))
 
 They are the `odd_` family's counterpart on the civil side, and they truncate nothing: a time of day
 is already within one day, so each part is simply read. `us_of` is the sub-second remainder, and it
-is zero here because `time_at` names whole seconds — a time parsed from `13:45:30.25` carries one.
+is zero here because `time` names whole seconds — a time parsed from `13:45:30.25` carries one.
 
 ### Rendering
 
 ```sysl
 import sysl.time.*
 
-var t = time_at(9, 30, 7)
+var t = time(9, 30, 7)
 
-print(date_at(2026, 3, 8))
-print(time_text(t), time_text(time_at(9, 30, 0)), time_text(LocalTime(500000i64)))
-print(datetime_at(2026, 3, 8, 9, 30, 0))
+print(date(2026, 3, 8))
+print(time_text(t), time_text(time(9, 30, 0)), time_text(Time(500000)))
+print(date_time(2026, 3, 8, 9, 30, 0))
 print(offset_text(Offset(330)), offset_text(Offset(-480)), offset_text(Offset(0)))
 ```
 
@@ -506,7 +555,7 @@ print(offset_text(Offset(330)), offset_text(Offset(-480)), offset_text(Offset(0)
 +05:30 -08:00 Z
 ```
 
-All five types implement [`Display`](/library/core/), so a value goes straight into a `print` or an
+Every type here implements [`Display`](/library/core/), so a value goes straight into a `print` or an
 interpolation; the `*_text` functions are the same renderers reached by name, for a caller that wants
 the string.
 
@@ -750,7 +799,10 @@ place — converting a wall clock reading *into* an instant. Against a fixed off
 total, which is why `from_offset` above is an ordinary function. Against a zone whose clocks move it
 is not: the hour a zone skips never happened, and the hour it repeats happened twice.
 
-`resolve` is what says which of the three occurred, and the return type is the point of it:
+A `Zone` is a name and the offset its clocks show at any instant. **A fixed zone is a number and a
+ruled zone is a rule**: `utc` is a `FixedZone`, and a zone whose clocks move is a `RuledZone` holding
+its rule as a function. `zone.offset_at(instant)` asks it about a moment, and `zone.resolve(reading)`
+says which of the three cases a wall reading is — and the return type is the point of it:
 
 ```sysl
 import sysl.time.*
@@ -758,35 +810,37 @@ import sysl.time.*
 // US Eastern in 2023: -04:00 between the two moments its clocks moved, -05:00 outside them. The
 // transitions are named in UTC because that is the only reading of them that is not itself
 // ambiguous.
-eastern(t: Instant) -> Offset =
+eastern_2023(t: Instant) -> Offset =
     if t.us >= 1678604400000000 && t.us < 1699164000000000 then Offset(-240) else Offset(-300)
 
-print(resolve(datetime_at(2023, 6, 15, 12, 0, 0), eastern))
-print(resolve(datetime_at(2023, 11, 5, 1, 30, 0), eastern))
-print(resolve(datetime_at(2023, 3, 12, 2, 30, 0), eastern))
+val eastern = RuledZone("Eastern", eastern_2023)
+
+print(eastern, eastern.offset_at(Instant(0)), utc.offset_at(Instant(0)))
+print(eastern.resolve(date_time(2023, 6, 15, 12, 0, 0)))
+print(eastern.resolve(date_time(2023, 11, 5, 1, 30, 0)))
+print(eastern.resolve(date_time(2023, 3, 12, 2, 30, 0)))
 ```
 
 ```output
+Eastern -05:00 Z
 2023-06-15 16:00 Z
 2023-11-05 05:30 Z or 2023-11-05 06:30 Z
 no such time: the clocks went from -05:00 to -04:00
 ```
 
-**The zone arrives as a function rather than as a type**, and that is what keeps this in
-capability-free `sysl.time`: the whole of what resolution needs to know about a zone is what its
-offset was at a given instant. A host reading its own zone, a package talking to an RTC chip and a
-table written out by hand can all answer that one question, and none of them has to be a type this
-module knows about.
-
-A function is anything callable, so a **closure** answers as well as a declaration does — which is
-what a zone that is one fixed offset, or one read out of a table the closure captured, is written as:
+**The rule is a function rather than a table**, and that is what keeps `Zone` in capability-free
+`sysl.time`: the whole of what resolution needs to know about a zone is what its offset was at a
+given instant. A table decoded from a TZif file, the host's own `localtime_r`, a package talking to an
+RTC chip and a rule written out by hand all answer that one question — `zone("America/Toronto")` in
+`sysl.posix.time` is the first of those, wrapped ([below](#a-zone-by-name)). A **closure** answers as
+well as a declaration does:
 
 ```sysl
-import sysl.time.{Instant, Offset, datetime_at, resolve}
+import sysl.time.{Offset, RuledZone, date_time}
 
 val mins = -300
 
-print(resolve(datetime_at(2023, 11, 5, 1, 30, 0), t -> Offset(mins)))
+print(RuledZone("fixed", t -> Offset(mins)).resolve(date_time(2023, 11, 5, 1, 30, 0)))
 ```
 
 ```output
@@ -798,11 +852,65 @@ A zone whose offset never varies has no transition to fall either side of, so th
 
 `Gap` carries the offsets either side of the transition rather than an instant, because there is no
 instant to carry. What to do about a reading that never happened is a policy question — push it
-forward by the size of the gap, clamp it to the transition, or refuse it — and `from_offset(ldt,
-before)` is the first of those, which is the one most libraries choose.
+forward by the size of the gap, clamp it to the transition, or refuse it — and `at_earlier` and
+`at_later` below take the first, which is the one most libraries choose.
 
-**Nothing above holds a zone database, and `resolve` is not one.** It is the arithmetic that a zone
+**Nothing above holds a zone database, and `Zone` is not one.** It is the arithmetic that a zone
 database would be consulted *by*.
+
+### A reading in a zone
+
+A `Zoned` is a `DateTime`, the `Offset` that was in force, and the `Zone`. The offset is held because
+the reading alone is not enough: 01:30 on the 1st of November in Toronto happens twice, an hour apart,
+and only the offset says which. `instant.at(zone)` always answers one; `date_time.at(zone)` answers a
+`Result`, handing back the `Resolution` where the zone skips or repeats the reading rather than
+guessing, and `at_earlier` and `at_later` make the choice explicitly:
+
+```sysl
+import sysl.time.*
+
+// Toronto in 2026: the clocks went forward at 02:00 on the 8th of March and back at 02:00 on the
+// 1st of November.
+val spring = from_offset(date_time(2026, 3, 8, 2, 0, 0), Offset(-300))
+val autumn = from_offset(date_time(2026, 11, 1, 2, 0, 0), Offset(-240))
+val toronto = RuledZone("America/Toronto",
+    t -> if t >= spring && t < autumn then Offset(-240) else Offset(-300))
+
+val t = date_time(2026, 3, 7, 9, 0, 0).at(toronto).unwrap()
+
+print(t + Period(0, 1))
+print(t + 24.hours)
+print((t + 24.hours) - (t + Period(0, 1)))
+
+val skipped = date_time(2026, 3, 8, 2, 30, 0)
+
+print(skipped.at(toronto).is_err(), skipped.at_earlier(toronto))
+
+val twice = date_time(2026, 11, 1, 1, 30, 0)
+
+print(twice.at_earlier(toronto).offset, twice.at_later(toronto).offset)
+print(t.instant(), t.at(utc))
+```
+
+```output
+2026-03-08T09:00:00-04:00[America/Toronto]
+2026-03-08T10:00:00-04:00[America/Toronto]
+3600s
+true 2026-03-08T03:30:00-04:00[America/Toronto]
+-04:00 -05:00
+2026-03-07 14:00 Z 2026-03-07T14:00:00Z[UTC]
+```
+
+**A `Duration` moves the timeline and a `Period` moves the calendar**, and across a change of the
+clocks the two differ: a day after nine on Saturday morning is nine on Sunday morning, 23 hours of
+timeline later, and twenty-four hours after it is ten. Both are right, and the program says which. A
+period landing in the hour the clocks skip is pushed past it; one landing in the hour they repeat
+keeps the offset it had where that is one of the two, and takes the earlier where not — `java.time`'s
+rules. An `Instant` takes only a `Duration`, having no calendar to move by.
+
+**`==` on a zoned reading needs the same instant and the same zone, where `<` compares only the
+instant.** Nine in the morning in Toronto and ten at night in Tokyo are one instant and two readings,
+so they are not equal and neither is before the other.
 
 ## Reading a clock — `sysl.posix.time`
 
@@ -994,7 +1102,8 @@ answered from the host's own data, so a date from a year whose rules differed is
 `2005-11-01` is `-05:00` in New York under the rules of the day, where today's rules would say
 `-04:00`, and Kathmandu is `+05:30` before 1986 and `+05:45` after.
 
-`from_local` is the reverse and answers a `Resolution`, for the reason the section above gives.
+`from_local` is the reverse and answers a `Resolution`, for the reason the section above gives; it
+is `local_zone().resolve(reading)`, and `local_zone()` is the same host zone as a `Zone`.
 **The host will not tell you which of the three happened** — `mktime` answers the second occurrence
 of a repeated reading and says nothing, and for one that never happened it rewrites its caller's
 fields and answers a time nobody asked for — so the decision is made in sysl out of the offset
@@ -1074,28 +1183,53 @@ state. So the database is read instead, and **the reading splits in two**:
 | [`sysl.time.tzif`](#decoding-a-zone) | decoding a TZif file (RFC 8536) | **none** |
 | `sysl.posix.time.zone_data` | fetching the bytes off the host | `os` |
 
+`sysl.posix.time.zone` does both and answers a `sysl.time.Zone`, so a named zone is used exactly as
+the hand-written rules above are. `"UTC"` is `utc` and an offset such as `"+05:30"` is a `FixedZone`,
+neither reading a file; a name the database does not have is a `ZoneError`. `local_zone()` is the
+host's own zone, answered by `localtime_r`:
+
+```sysl
+import sysl.posix.time.{zone, local_zone, local_offset}
+import sysl.time.{date_time, Period, now}
+
+val toronto = zone("America/Toronto").unwrap()
+val t = date_time(2026, 3, 7, 9, 0, 0).at(toronto).unwrap()
+
+print(t + Period(0, 1))
+print(toronto.resolve(date_time(2026, 11, 1, 1, 30, 0)))
+print(t.at(zone("Asia/Tokyo").unwrap()), zone("+05:30").unwrap())
+print(zone("Mars/Olympus_Mons").unwrap_err())
+print(local_zone().offset_at(now()) == local_offset(now()))
+```
+
+```output
+2026-03-08T09:00:00-04:00[America/Toronto]
+2026-11-01 05:30 Z or 2026-11-01 06:30 Z
+2026-03-07T23:00:00+09:00[Asia/Tokyo] +05:30
+no zone is named 'Mars/Olympus_Mons'
+true
+```
+
 **The split is what makes a zone reachable on a bare machine.** A board with a real-time clock carries
 one zone's bytes in flash — the zone it was deployed in — and resolves local time with no filesystem
-anywhere. Weld the decoder to the file reading and a freestanding target gets none of it.
+anywhere. Weld the decoder to the file reading and a freestanding target gets none of it. The two
+halves by hand, which is also the way to the rest of what the file carries — the abbreviation and the
+daylight flag:
 
 ```sysl
 import sysl.posix.time.zone_data
 import sysl.time.tzif.{parse, offset_at, abbrev_at, is_dst_at}
-import sysl.time.{Instant, Offset, datetime_at, resolve, Resolution}
-import sysl.time.tzif.Zone
+import sysl.time.{Instant, RuledZone, date_time}
 
-// Module storage, so that the function below is a top-level one rather than nested in this file's
-// body — only a top-level function may be passed as a callable.
-static val bytes: []u8 = zone_data("America/Toronto").unwrap()
-static val toronto: Zone = parse(bytes[..]).unwrap()
-
-toronto_offset(t: Instant) -> Offset = offset_at(toronto, t).unwrap()
+val bytes = zone_data("America/Toronto").unwrap()
+val table = parse(bytes[..]).unwrap()
+val toronto = RuledZone("America/Toronto", t -> offset_at(table, t).unwrap())
 
 val summer = Instant(1686844800000000)
 
-print(offset_at(toronto, summer).unwrap(), abbrev_at(toronto, summer).unwrap(), is_dst_at(toronto, summer).unwrap())
-print(resolve(datetime_at(2023, 11, 5, 1, 30, 0), toronto_offset))
-print(resolve(datetime_at(2023, 3, 12, 2, 30, 0), toronto_offset))
+print(offset_at(table, summer).unwrap(), abbrev_at(table, summer).unwrap(), is_dst_at(table, summer).unwrap())
+print(toronto.resolve(date_time(2023, 11, 5, 1, 30, 0)))
+print(toronto.resolve(date_time(2023, 3, 12, 2, 30, 0)))
 ```
 
 ```output
@@ -1135,15 +1269,14 @@ to date; the library carries no table of its own, because one changes several ti
 standard library that shipped it would either go stale or need a release each time a legislature
 moved a clock.
 
-`wall_us` and `wall_of` are the seam all of this starts from: they read a `LocalDateTime` as a single
+`wall_us` and `wall_of` are the seam all of this starts from: they read a `DateTime` as a single
 count measured from the same origin as an `Instant`, which is what the count would be if the offset
 happened to be zero.
 
-**The clock**, in *this* module. There is no `sysl.time.now()`, because reading one is a capability
-rather than arithmetic — `clock_gettime` is a call into the environment, and this module has no
-`requires` line. An `Instant` is a value a freestanding target can compute with; where it comes from
-is the caller's to say, and on a host the answer is [`sysl.posix.time`](#reading-a-clock-sysl-posix-time)
-above.
+**A clock of this module's own.** `sysl.time.now()` and `monotonic()` read symbols this module
+declares and something else defines ([above](#the-portable-spelling-sysl-time-now)), because reading
+a clock is a capability rather than arithmetic and this module has no `requires` line. On a host
+the answer is [`sysl.posix.time`](#reading-a-clock-sysl-posix-time).
 
 ---
 

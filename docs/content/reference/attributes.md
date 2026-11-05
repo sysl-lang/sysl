@@ -18,6 +18,7 @@ has a name and a spelling of its own:
 | `@packed`, `@align(n)`, `@section("...")` | an **annotation** — where the declaration under it is laid out, or where it lands | the grammar |
 | `@export("...", weak)`, `@export(weak)` on a function | an **annotation** — the export is a default a strong definition of the symbol replaces at the link; see [a weak export](/reference/ffi/#a-weak-export) | the grammar |
 | `@export("...")` on a `struct` | an **annotation** — the name the type carries in a generated C header | the grammar |
+| `@renamed("...", "...")`, `@removed("...", "...")` | an **annotation** — the declaration under it is a tombstone, a name that is gone; see [`@renamed` and `@removed`](#renamed-and-removed-a-name-that-is-gone-and-what-became-of-it) | the grammar |
 | `@export("...")` on a module `var` or `val` | an **annotation** — the C symbol the storage is published under | the grammar |
 | `@no_alloc`, `@requires`, `@link`, `@include`, `@tests` | an **annotation** — a fact about the whole file, in its header | the grammar |
 | `@assert` | an **annotation** that describes nothing but itself — a condition settled while compiling | the analyzer, once |
@@ -2644,6 +2645,81 @@ print(count())
 `main`, a `@test` or a hook, an interrupt handler, an `async` function (whose body runs when its task
 is resumed) and a variadic function are refused the same way, and so is an `extern`, whose body is
 compiled elsewhere. It takes no arguments.
+
+## `@renamed` and `@removed` — a name that is gone, and what became of it
+
+A module that renames or removes a declaration leaves a **tombstone** where it was, so a program
+still using the old name is told what to write instead rather than that the name stands for nothing:
+
+```sysl
+struct Point
+    x: int
+
+@renamed("Point", "2.0") type Pt
+
+val p = Pt(1)
+```
+
+```error
+'Pt' was renamed to 'Point' in 2.0
+```
+
+`@renamed` takes the name that replaced the declaration and the release that renamed it;
+`@removed` takes what to write instead and the release that removed it:
+
+```sysl
+struct Point
+    x: int
+
+@removed("read the field: write 'p.x'", "2.0") point_x()
+
+print(point_x())
+```
+
+```error
+'point_x' was removed in 2.0: read the field: write 'p.x'
+```
+
+**A tombstone is the head of the declaration and nothing after it**: `type Name` for a type of any
+kind — a struct, an enum, an alias — and `name()` for a function. A use reaches every type through
+one table of type names whatever it was, so one spelling covers them all; and a function's empty
+`()` says what it was without a signature, since no call is checked against it. A body, a field or a
+parameter list would be code nothing runs, and is refused. Both arguments are non-empty strings, a
+tombstone carries no other annotation and no `private`, and it stands at a module's top level — not
+in a body, and not above a member.
+
+The refusal is the same wherever the name is written: as a type annotation, a constructor, a generic
+argument, an `impl` subject, a call, a function named as a value, a qualified `module.Name`, and in an
+import list, where the line of the `import` is the one told. It points at the use, never at the
+tombstone. A function's tombstone does not answer for a type: `f(p: point_x)` is still an unknown
+type.
+
+**A tombstone declares nothing.** It is not a name in its module: completion, `sysl doc` and the API
+pages leave it out, no trait or `impl` lookup reaches it, and it collides with nothing. It is asked
+only once a name has been found to stand for nothing else, so a program's own declaration of the old
+name — or another module's, through a wildcard — is the one meant, with no clash:
+
+```sysl
+struct Point
+    x: int
+
+@renamed("Point", "2.0") type Pt
+
+struct Pt
+    y: int
+
+print(Pt(3).y)
+```
+
+```output
+3
+```
+
+The standard library's own renames are tombstones: [`sysl.time`](/library/time/)'s `LocalDate`,
+`LocalTime`, `LocalDateTime`, `Civil`, `date_at`, `time_at` and `datetime_at`, and its free
+`resolve`. `str(x)`, removed in 0.7.0, keeps its own refusal — `'str(x)' was removed in 0.7.0: write
+'x.to_string()'` — because `str` is still a form the compiler supplies to an interpolation, so no
+declaration can stand in its place.
 
 ## `@tailrec` — an assertion that the frame is reused
 

@@ -28,15 +28,7 @@ type_attr_expr(cx: &Analyzer, span: Span, receiver: Expr, attr: string) -> TExpr
 
         if instance.is_some() then return instance.unwrap()
 
-        // `T::Target::Kind`, `(&View)::Kind` -- a left side only the type grammar reads: what a
-        // reference points at, or a type behind a mode written in parentheses.
-        if spelled_as_type(cx, receiver)
-            val ty = written_as_type(cx, receiver)
-
-            if ty == Unknown then return bad_expr(span)
-
-            return attr_of_type(cx, span, type_show(ty), attr, buf(), ty, false)
-        end if
+        if spelled_as_type(cx, receiver) then return attr_of_written_type(cx, span, receiver, attr, buf())
     end if
 
     // **`::Id` on a value reads the identity an erased value carries**, and that is the case the
@@ -60,6 +52,20 @@ type_attr_expr(cx: &Analyzer, span: Span, receiver: Expr, attr: string) -> TExpr
 
     type_attr_call(cx, span, name.unwrap(), attr, buf())
 end type_attr_expr
+
+// `T::Target::Kind`, `M::Item::Name`, `(&View)::Kind`, `M::Item::Bits(n)` -- an attribute asked of a
+// left side only the type grammar reads: what a reference points at, an associated type, or a type
+// behind a mode written in parentheses. The caller has seen `spelled_as_type`.
+attr_of_written_type(cx: &Analyzer, span: Span, receiver: Expr, attr: string,
+                     args: Buf[Expr]) -> TExpr
+    val ty = written_as_type(cx, receiver)
+
+    if ty == Unknown then return bad_expr(span)
+
+    val name = name_as_written(cx, cx.scope, written_type_ref(cx, receiver, false), ty, subst_names(cx))
+
+    attr_of_type(cx, span, type_show(ty), attr, args, ty, false, name)
+end attr_of_written_type
 
 // `T::Attr(x)` -- the attributes that carry an operand, and the ones that do not, refused by name.
 type_attr_call(cx: &Analyzer, span: Span, written: string, attr: string, args: Buf[Expr]) -> TExpr
@@ -93,8 +99,28 @@ type_attr_call(cx: &Analyzer, span: Span, written: string, attr: string, args: B
     if subject.is_none() then
         return cx.err(span, s"'$written' has no type attributes")
 
-    attr_of_type(cx, span, written, attr, args, subject.unwrap(), true)
+    val ty = subject.unwrap()
+
+    attr_of_type(cx, span, written, attr, args, ty, true,
+                 if attr == "Name" then name_answer(cx, span, written, ty) else "")
 end type_attr_call
+
+// What `written::Name` answers (`name_as_written`): a type parameter by the type it stands for, a
+// field walk's `f::Type` by the struct's declaration of the field, and any other name as written.
+private name_answer(cx: &Analyzer, span: Span, written: string, ty: Type) -> string
+    if bound_type(cx.subst, written).is_none() then
+        return name_as_written(cx, cx.scope, named_type(span, written), ty, subst_names(cx))
+
+    val n = written.bytes.len
+
+    if n > 6 && written.ends_with("::Type")
+        val d = descriptor_bound(cx.subst, written[0..<n - 6])
+
+        if d.is_some() then return field_name_as_written(cx, d.unwrap(), ty)
+    end if
+
+    type_show(ty)
+end name_answer
 
 // `Pair[u8]::Bits(n)` -- an attribute asked of a generic type at the arguments written on it, which
 // is the type an alias of `Pair[u8]` would name, and answers as that alias does. `None` where the left
@@ -120,13 +146,18 @@ type_attr_on_instance(cx: &Analyzer, span: Span, receiver: Expr, attr: string,
                            s"type parameter with '[T: $shown]'"))
     end if
 
-    Some(attr_of_type(cx, span, type_show(ty), attr, args, ty, false))
+    // The instance is quoted as it was written, by `::Name` and by a refusal alike.
+    val name = if instance.is_some() then
+        name_as_written(cx, cx.scope, written_type_ref(cx, receiver, false), ty, subst_names(cx))
+    else type_show(ty)
+
+    Some(attr_of_type(cx, span, name, attr, args, ty, false, name))
 end type_attr_on_instance
 
 // What the type `written` stands for answers to `::attr`. `named` is a left side written as a name,
-// which may be one of the body's type parameters.
+// which may be one of the body's type parameters, and `name` is what `::Name` answers.
 private attr_of_type(cx: &Analyzer, span: Span, written: string, attr: string, args: Buf[Expr],
-                     ty: Type, named: bool) -> TExpr
+                     ty: Type, named: bool, name: string) -> TExpr
     // **`Id` is answered before the dispatch, because it is the one attribute EVERY type has.** The
     // arms below reach an enum, a constrained subtype and a built-in integer, and everything else
     // is told it has no type attributes -- which is right for `Max` and wrong for an identity.
@@ -146,7 +177,7 @@ private attr_of_type(cx: &Analyzer, span: Span, written: string, attr: string, a
 
     // The four that describe a type's make-up are, like `Id`, asked of every type -- and of a type
     // parameter per instantiation, since each one is a fact about the type it was given.
-    if reflection_attr(attr) then return reflect_attr(cx, span, written, attr, args, ty)
+    if reflection_attr(attr) then return reflect_attr(cx, span, written, attr, args, ty, name)
 
     // `T::Make(c, payload)` builds the variant a walk over `T::Variants` stands at.
     if attr == "Make" then return make_variant(cx, span, written, args, ty)
@@ -195,15 +226,62 @@ attr_type_name(cx: &Analyzer, receiver: Expr) -> Option[string] = *receiver.kind
     _ -> None
 
 // Whether a left side of `::` that is no single name is still written as a type: `X::Target` over
-// anything written as a type, `&X` / `*X` in parentheses over one, or `&sync X` / `weak X` in
-// parentheses, which the parser read with the type grammar. A value anywhere at its root --
-// `(&v)::Id` with `v` a local -- is a value, and is left to the value reading.
-private spelled_as_type(cx: &Analyzer, e: Expr) -> bool = *e.kind match
-    TypeAttr(inner, a, _, _) -> a == "Target" && names_a_type(cx, inner)
+// anything written as a type, an associated type `X::Item` over one, `&X` / `*X` in parentheses over
+// one, or `&sync X` / `weak X` in parentheses, which the parser read with the type grammar. A value
+// anywhere at its root -- `(&v)::Id` with `v` a local -- is a value, and is left to the value reading.
+//
+// **`X::Item` is a projection wherever some trait declares `type Item`**, as the type grammar reads
+// it: so a subject without one is told so by the projection's own refusal (`'T' is not bounded by a
+// trait declaring…`), rather than that its left side is not a type. A member name no trait declares
+// as an associated type -- `Colour::First`, `int::Max` -- is a value, as it always was.
+spelled_as_type(cx: &Analyzer, e: Expr) -> bool = *e.kind match
+    TypeAttr(inner, a, _, _) ->
+        if a == "Target" then names_a_type(cx, inner)
+        else !traits_declaring(cx.an, a).is_empty() && names_a_type(cx, inner)
     Unary(op, inner) -> (op == "&" || op == "*") && names_a_type(cx, inner)
     // `(&sync View)`, `(weak Btn)` -- a mode only the type grammar spells, which the parser read as it.
     TypeArg(_) -> true
     _ -> false
+
+// `(&u16)::Target` as the type it was written as, `u16`, so its `::Name` answers as written. A trait's
+// own `type Target` wins over the referent, and is then named as any projection is -- as its
+// implementation wrote it, or canonically off a type parameter; so does anything else `w` is, a type
+// parameter's `T::Target` among them.
+written_referent(cx: &Analyzer, scope: Scope, w: TypeRef) -> TypeRef = target_peeled(cx, scope, w) match
+    Some(peeled) -> peeled
+    None -> w
+
+// The referent under a written reference, pointer, weak reference or slice, through each `::Target`
+// -- where every step is the referent, and not a `type Target` the subject's trait declares.
+private target_peeled(cx: &Analyzer, scope: Scope, w: TypeRef) -> Option[TypeRef]
+    val subject = *w.kind match
+        AssocType(i, member) -> if member == "Target" then Some(i) else None
+        _ -> None
+
+    if subject.is_none() then return None
+
+    val inner = subject.unwrap()
+
+    val base = *inner.kind match
+        AssocType(_, _) -> target_peeled(cx, scope, inner)
+        _ -> Some(inner)
+
+    val referent = if base.is_none() then None else referent_written(base.unwrap())
+
+    if referent.is_none() then return None
+
+    // The written subject resolved once already, as the whole projection did.
+    if assoc_type_opt(cx.an, resolve_type(cx.an, scope, inner, cx.subst), "Target").is_some() then None
+    else referent
+end target_peeled
+
+// What a written reference, pointer, weak reference or slice points at.
+private referent_written(w: TypeRef) -> Option[TypeRef] = *w.kind match
+    RefType(wi, _) -> Some(wi)
+    PtrType(wi) -> Some(wi)
+    WeakType(wi) -> Some(wi)
+    ArrayType(length, we, _) -> if length.is_none() then Some(we) else None
+    _ -> None
 
 // Whether an expression is `X::Target` over something written as a type -- `T::Target`,
 // `(&Btn)::Target::Target` -- and so names a type a call may reach an associated function through.

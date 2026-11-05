@@ -89,6 +89,29 @@ Box[int] Box
 (int, real) int
 ```
 
+**A type is named as it was written**, by the rule a
+[diagnostic](/reference/types/#how-a-diagnostic-names-a-type) follows: `u16` and `ushort` are both
+the type's own names, so each answers as written; an alias answers as its declaration spelled what it
+names, and a field walk's `f::Type` as the struct declared the field. A type parameter is named
+canonically, because one instantiation serves every spelling of its argument:
+
+```sysl
+struct Box[T]
+    v: T
+
+type Meters = u16
+
+name_of[T]() -> string = T::Name
+
+print(u16::Name, ushort::Name, u8::Name, Meters::Name, Box[u8]::Name)
+print(name_of[u16](), name_of[Meters]())
+```
+
+```output
+u16 ushort u8 u16 Box[u8]
+ushort ushort
+```
+
 `T::BaseName` is refused where the type has no declared name, such as a tuple, and `Box::Name` with
 no arguments is refused because `Box` alone is not a single type; both are shown under
 [what it refuses](#what-it-refuses). An anonymous `struct` or `union` block answers with the keyword
@@ -252,6 +275,53 @@ print(int::Target::Name)
 **A trait's own associated type named `Target` wins**, as a program's names win over every form the
 compiler supplies, and it is reached through a reference as any associated type is: where
 `impl Holds for Jar` says `type Target = u8`, `Jar::Target` and `(&Jar)::Target` are both `u8`.
+
+**Every question is asked through an associated type as it is through `Target`**: `M::Item::Name`,
+`M::Item::Kind`, `M::Item::Fields`, `sizeof(M::Item)`, an attribute with an operand and a further
+`::Target` all read the type the projection names. Off a declared type, `::Name` answers as the
+implementation wrote `type Item = …`, an alias by its declaration as the alias's own name does; off a
+type parameter it is canonical, as the parameter is:
+
+```sysl
+trait Has
+    type Item
+
+type Meters = u16
+
+struct Point
+    x: int
+    y: u8
+
+struct Shelf
+    n: int
+
+impl Has for Shelf
+    type Item = Meters
+
+struct Plot
+    n: int
+
+impl Has for Plot
+    type Item = &Point
+
+asked[M: Has]() -> string = s"${M::Item::Name} ${Kind::Image(M::Item::Kind)}"
+
+print(Shelf::Item::Name, Shelf::Item::Max, Plot::Item::Target::Name, sizeof(Plot::Item::Target))
+print(asked[Shelf](), asked[Plot]())
+
+for const f in Plot::Item::Target::Fields
+    print(f.name, f::Type::Name)
+```
+
+```output
+u16 65535 Point 8
+ushort Int &Point Ref
+x int
+y u8
+```
+
+A left side that is a value keeps the refusal it always had, and a subject with no implementation is
+told so by the projection: `int::Item::Name` says that `int` implements no trait declaring `Item`.
 
 ## Fields and members
 

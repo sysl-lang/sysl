@@ -5,10 +5,10 @@ import sysl.math.{div_floor, mod_floor}
 /** The calendar: a date and a time of day with no zone attached, and the arithmetic that turns one
  * into the other.
  *
- * A **local** date-time is a reading on a wall clock. It is not a point on the timeline and it does
- * not become one until somebody says where the wall is. Kept apart from `Instant` it is an ordinary,
- * boring value: a day number and a count of microseconds since midnight, both plain integers with no
- * calendar hidden inside.
+ * A `DateTime` is a reading on a wall clock. It is not a point on the timeline and it does not become
+ * one until somebody says where the wall is -- that is what a `Zone` is for, and what a `Zoned` holds.
+ * Kept apart from `Instant` it is an ordinary, boring value: a day number and a count of microseconds
+ * since midnight, both plain integers with no calendar hidden inside.
  *
  * **A day number, not packed civil fields.** The alternative — year, month, day, hour and minute as
  * bit fields inside one word — is the design most people reach for, and the arithmetic says no.
@@ -26,7 +26,7 @@ import sysl.math.{div_floor, mod_floor}
  * anybody agreed to them. That is a decision and not an oversight: the alternative is a calendar
  * with a ten-day hole in it whose position depends on which country you ask.
  */
-struct Civil
+struct YearMonthDay
     year: int
     month: int
     day: int
@@ -34,19 +34,19 @@ struct Civil
 /** Days since 1970-01-01. Signed, so dates before the epoch are ordinary values rather than a special
  * case — the algorithm below never branches on the sign.
  */
-struct LocalDate
+struct Date
     day: int
 
 /** Microseconds since midnight, from zero up to but not including a whole day. */
-struct LocalTime
+struct Time
     us: long
 
 /** A wall clock reading. Two independent counts rather than one, because they are added to and
  * compared far more often than they are combined.
  */
-struct LocalDateTime
-    date: LocalDate
-    time: LocalTime
+struct DateTime
+    date: Date
+    time: Time
 
 enum Weekday
     Sunday
@@ -69,7 +69,7 @@ end Weekday
  * `days_from_civil` is its own inverse over the whole `int` range, which is the property to assert
  * rather than any particular date.
  */
-days_from_civil(c: Civil) -> LocalDate
+days_from_civil(c: YearMonthDay) -> Date
     var y = if c.month <= 2 then c.year - 1 else c.year
     var era = div_floor(long(y), 400)
     var yoe = long(y) - era * 400
@@ -77,10 +77,10 @@ days_from_civil(c: Civil) -> LocalDate
     var doy = long(153 * mp + 2) / 5 + long(c.day) - 1
     var doe = yoe * 365 + yoe / 4 - yoe / 100 + doy
 
-    LocalDate(int(era * 146097 + doe - 719468))
+    Date(int(era * 146097 + doe - 719468))
 end days_from_civil
 
-civil_from_days(d: LocalDate) -> Civil
+civil_from_days(d: Date) -> YearMonthDay
     var z = long(d.day) + 719468
     var era = div_floor(z, 146097)
     var doe = z - era * 146097
@@ -91,7 +91,7 @@ civil_from_days(d: LocalDate) -> Civil
     var month = if mp < 10 then mp + 3 else mp - 9
     var year = yoe + era * 400 + (if month <= 2 then 1i64 else 0i64)
 
-    Civil(int(year), int(month), int(day))
+    YearMonthDay(int(year), int(month), int(day))
 end civil_from_days
 
 /** Whether a year has a 29th of February, by the rule the proleptic Gregorian calendar states: every
@@ -107,10 +107,10 @@ days_in_month(y: int, m: int) -> int
 /** The day of the year, from 1 on the first of January. It is a subtraction rather than a sum over
  * the months, because the day numbers are already what the subtraction needs.
  */
-day_of_year(d: LocalDate) -> int
+day_of_year(d: Date) -> int
     var c = civil_from_days(d)
 
-    d.day - date_at(c.year, 1, 1).day + 1
+    d.day - days_from_civil(YearMonthDay(c.year, 1, 1)).day + 1
 
 /** 1970-01-01 was a Thursday, so shifting by four puts Sunday at zero. Nothing here needs to know
  * which day a week starts on; it only needs the seven in the order the world uses them.
@@ -120,7 +120,7 @@ day_of_year(d: LocalDate) -> int
  * remainder is in range by construction, which is what makes the conversion back total rather than
  * something that has to be checked.
  */
-weekday(d: LocalDate) -> Weekday = Weekday(int(mod_floor(long(d.day) + 4, 7)))
+weekday(d: Date) -> Weekday = Weekday(int(mod_floor(long(d.day) + 4, 7)))
 
 /** The day's name, which is the variant's own name and so is not written twice. `Weekday::Image`
  * answers a simple enum's variant with the word it is spelled with (`reference/attributes.md § A
@@ -149,71 +149,86 @@ month_name(m: int) -> string = m match
 /** The first date on or after `d` falling on the given weekday, which is what "every Tuesday" means
  * once a rule has been given a starting point.
  */
-on_or_after(d: LocalDate, w: Weekday) -> LocalDate =
-    LocalDate(d.day + int(mod_floor(long(int(w) - int(weekday(d))), 7)))
+on_or_after(d: Date, w: Weekday) -> Date =
+    Date(d.day + int(mod_floor(long(int(w) - int(weekday(d))), 7)))
 
-date_at(y: int, m: int, d: int) -> LocalDate = days_from_civil(Civil(y, m, d))
+/** The date with that year, month and day -- **and a fault where the calendar has no such date.**
+ *
+ * Three numbers written into a program are the program's own words, so a thirtieth of February
+ * here is a defect in it, reported at the line that wrote it (`date` is `@track_caller`) rather than
+ * quietly rolled over into March. Text arriving from outside is the other channel: `parse_date`
+ * answers a `Result`, and `checked_date` answers an `Option` for three numbers a program has read
+ * rather than written.
+ *
+ * The walk that has already established its dates are real -- a loop over the months, a calendar
+ * grid -- uses `days_from_civil`, which is pure arithmetic and pays for no range test per step.
+ */
+@track_caller
+date(y: int, m: int, d: int) -> Date = checked_date(y, m, d) match
+    Some(day) -> day
+    None -> panic(s"there is no such date: $y-$m-$d")
 
-/** A date only if the calendar has one, which is the question `date_at` deliberately does not ask.
+/** A date only if the calendar has one: `None` for a thirtieth of February or a thirteenth month.
  *
- * `date_at` is `days_from_civil` under another name, and that conversion is pure arithmetic: a
- * thirtieth of February is a day count like any other, and it comes back as the second of March.
- * That is what a calendar walk wants -- `plus_days`, a loop over the months -- because such a walk
- * has already established that its dates are real and would be paying for a range test per step. So
- * the check is a **second constructor** rather than a change to the first, and the two answer
- * different questions.
- *
- * What asks this one is a reader: text names three numbers that a person wrote, and a format that
- * says a date must exist has to be able to refuse `2026-02-30`. `parse_date` already answers
- * `Err(OutOfRange(...))` for exactly that, so the checking existed and could not be reached without
- * going through text -- which a reader that has already scanned the digits itself has no way to do.
+ * What asks this one is a reader: three numbers that a person wrote, scanned out of text by
+ * something that is not `parse_date`, and a format that says a date must exist has to be able to
+ * refuse `2026-02-30` without a fault.
  *
  * The year is unbounded on purpose: the proleptic Gregorian calendar is, and `days_from_civil` is
  * its own inverse over the whole `int` range.
  */
-checked_date(y: int, m: int, d: int) -> Option[LocalDate]
+checked_date(y: int, m: int, d: int) -> Option[Date]
     if m < 1 || m > 12 then return None
     if d < 1 || d > days_in_month(y, m) then return None
 
-    Some(date_at(y, m, d))
+    Some(days_from_civil(YearMonthDay(y, m, d)))
 
-time_at(h: int, m: int, s: int) -> LocalTime =
-    LocalTime(long(h) * us_per_hour + long(m) * us_per_minute + long(s) * us_per_second)
+/** The time of day with that hour, minute and second, and a fault where a clock never shows it --
+ * an hour past 23, a minute or a second past 59. The same two channels as `date`: a reader of text
+ * uses `parse_time`, which answers a `Result`.
+ */
+@track_caller
+time(h: int, m: int, s: int) -> Time
+    if h < 0 || h > 23 || m < 0 || m > 59 || s < 0 || s > 59 then
+        panic(s"there is no such time: $h:$m:$s")
 
-datetime_at(y: int, mo: int, d: int, h: int, mi: int, s: int) -> LocalDateTime =
-    LocalDateTime(date_at(y, mo, d), time_at(h, mi, s))
+    Time(long(h) * us_per_hour + long(m) * us_per_minute + long(s) * us_per_second)
 
-year_of(d: LocalDate) -> int = civil_from_days(d).year
-month_of(d: LocalDate) -> int = civil_from_days(d).month
-day_of(d: LocalDate) -> int = civil_from_days(d).day
+/** A wall clock reading, made of a `date` and a `time` and refused where either would be. */
+@track_caller
+date_time(y: int, mo: int, d: int, h: int, mi: int, s: int) -> DateTime =
+    DateTime(date(y, mo, d), time(h, mi, s))
 
-hour_of(t: LocalTime) -> int = int(t.us / us_per_hour)
-minute_of(t: LocalTime) -> int = int(t.us % us_per_hour / us_per_minute)
-second_of(t: LocalTime) -> int = int(t.us % us_per_minute / us_per_second)
-us_of(t: LocalTime) -> long = t.us % us_per_second
+year_of(d: Date) -> int = civil_from_days(d).year
+month_of(d: Date) -> int = civil_from_days(d).month
+day_of(d: Date) -> int = civil_from_days(d).day
+
+hour_of(t: Time) -> int = int(t.us / us_per_hour)
+minute_of(t: Time) -> int = int(t.us % us_per_hour / us_per_minute)
+second_of(t: Time) -> int = int(t.us % us_per_minute / us_per_second)
+us_of(t: Time) -> long = t.us % us_per_second
 
 /** A wall clock reading as a single count, measured from the same origin as an `Instant` but **not**
  * an instant: it is what the count would be if the zone's offset happened to be zero. A conversion
  * through a zone starts here and then asks what the offset actually is.
  */
-wall_us(ldt: LocalDateTime) -> long = long(ldt.date.day) * us_per_day + ldt.time.us
+wall_us(ldt: DateTime) -> long = long(ldt.date.day) * us_per_day + ldt.time.us
 
-wall_of(us: long) -> LocalDateTime =
-    LocalDateTime(LocalDate(int(div_floor(us, us_per_day))), LocalTime(mod_floor(us, us_per_day)))
+wall_of(us: long) -> DateTime =
+    DateTime(Date(int(div_floor(us, us_per_day))), Time(mod_floor(us, us_per_day)))
 
 /** An instant read against a wall set a fixed distance from UTC, and back. **Both directions are
  * total**, which is what separates a fixed offset from a zone: a zone whose clocks move answers the
  * second question with none or two, and this pair never does, because an offset is a number rather
  * than a rule with a history.
  *
- * That is also why they are here and a zone is not. A timestamp on a wire, in a log or in a database
- * column carries the offset that was in force when it was written — the sender resolved the zone
- * already, and what arrived is the record of that decision. Reading one back needs no table, no
- * update cadence and no filesystem, which is the whole of what makes it the library's business.
+ * A timestamp on a wire, in a log or in a database column carries the offset that was in force when
+ * it was written — the sender resolved the zone already, and what arrived is the record of that
+ * decision. Reading one back needs no table, no update cadence and no filesystem.
  */
-at_offset(t: Instant, o: Offset) -> LocalDateTime = wall_of(t.us + long(o.minutes) * us_per_minute)
+at_offset(t: Instant, o: Offset) -> DateTime = wall_of(t.us + long(o.minutes) * us_per_minute)
 
-from_offset(ldt: LocalDateTime, o: Offset) -> Instant =
+from_offset(ldt: DateTime, o: Offset) -> Instant =
     Instant(wall_us(ldt) - long(o.minutes) * us_per_minute)
 
 /** Adding days to a wall clock reading is **not** adding a length of time to it. Seven days later is
@@ -221,46 +236,46 @@ from_offset(ldt: LocalDateTime, o: Offset) -> Instant =
  * across a change of a zone's clocks the two answers differ by an hour. Both are right; they answer
  * different questions, which is why they are spelled differently.
  */
-plus_days(ldt: LocalDateTime, n: int) -> LocalDateTime =
-    LocalDateTime(LocalDate(ldt.date.day + n), ldt.time)
+plus_days(ldt: DateTime, n: int) -> DateTime =
+    DateTime(Date(ldt.date.day + n), ldt.time)
 
 /** Months are added by the calendar rather than by counting days, so the day of the month is clamped
  * where the target month is shorter: the 31st of January plus one month is the 28th or 29th of
  * February. Every library that offers this makes that choice, and clamping is the one that keeps
  * "the last day of the month" landing on a last day.
  */
-plus_months(d: LocalDate, n: int) -> LocalDate
+plus_months(d: Date, n: int) -> Date
     var c = civil_from_days(d)
     var total = c.year * 12 + (c.month - 1) + n
     var y = int(div_floor(long(total), 12))
     var m = int(mod_floor(long(total), 12)) + 1
     var last = days_in_month(y, m)
 
-    date_at(y, m, if c.day < last then c.day else last)
+    days_from_civil(YearMonthDay(y, m, if c.day < last then c.day else last))
 end plus_months
 
-plus_years(d: LocalDate, n: int) -> LocalDate = plus_months(d, n * 12)
+plus_years(d: Date, n: int) -> Date = plus_months(d, n * 12)
 
-impl Eq for LocalDate
-    eq(self, rhs: LocalDate) -> bool = self.day == rhs.day
+impl Eq for Date
+    eq(self, rhs: Date) -> bool = self.day == rhs.day
 
-impl Ord for LocalDate
-    lt(self, rhs: LocalDate) -> bool = self.day < rhs.day
+impl Ord for Date
+    lt(self, rhs: Date) -> bool = self.day < rhs.day
 
-impl Eq for LocalTime
-    eq(self, rhs: LocalTime) -> bool = self.us == rhs.us
+impl Eq for Time
+    eq(self, rhs: Time) -> bool = self.us == rhs.us
 
-impl Ord for LocalTime
-    lt(self, rhs: LocalTime) -> bool = self.us < rhs.us
+impl Ord for Time
+    lt(self, rhs: Time) -> bool = self.us < rhs.us
 
-impl Eq for LocalDateTime
-    eq(self, rhs: LocalDateTime) -> bool = self.date == rhs.date && self.time == rhs.time
+impl Eq for DateTime
+    eq(self, rhs: DateTime) -> bool = self.date == rhs.date && self.time == rhs.time
 
-impl Ord for LocalDateTime
-    lt(self, rhs: LocalDateTime) -> bool =
+impl Ord for DateTime
+    lt(self, rhs: DateTime) -> bool =
         self.date < rhs.date || (self.date == rhs.date && self.time < rhs.time)
 
-date_text(d: LocalDate) -> string
+date_text(d: Date) -> string
     var c = civil_from_days(d)
 
     f"${c.year}%04d-${c.month}%02d-${c.day}%02d"
@@ -271,7 +286,7 @@ date_text(d: LocalDate) -> string
  * renderer that shows a value to the second and drops what is below it is reporting something the
  * value does not say.
  */
-time_text(t: LocalTime) -> string
+time_text(t: Time) -> string
     var base = f"${hour_of(t)}%02d:${minute_of(t)}%02d"
 
     if t.us % us_per_minute == 0 then return base
@@ -281,15 +296,15 @@ time_text(t: LocalTime) -> string
     if t.us % us_per_second == 0 then withsec else f"${withsec}.${us_of(t)}%06d"
 end time_text
 
-datetime_text(ldt: LocalDateTime) -> string = s"${date_text(ldt.date)} ${time_text(ldt.time)}"
+datetime_text(ldt: DateTime) -> string = s"${date_text(ldt.date)} ${time_text(ldt.time)}"
 
-impl Display for LocalDate
+impl Display for Date
     display(self, out: *Writer, fmt: FormatSpec) = display_str(date_text(self), out, fmt)
 
-impl Display for LocalTime
+impl Display for Time
     display(self, out: *Writer, fmt: FormatSpec) = display_str(time_text(self), out, fmt)
 
-impl Display for LocalDateTime
+impl Display for DateTime
     display(self, out: *Writer, fmt: FormatSpec) = display_str(datetime_text(self), out, fmt)
 
 /** An instant written down, which is the one rendering here that needs no zone: an offset of zero is

@@ -137,6 +137,10 @@ enum StmtKind
     // `type Name = Base`, and the constrained forms that add a range or a predicate.
     TypeDecl(decl: TypeDecl)
 
+    // `@renamed("Date", "0.10.0") type LocalDate` or `@removed("why", "0.10.0") resolve()`: a name the
+    // module no longer declares, kept so that a use of it is told what became of it (`tombstone.sysl`).
+    TombstoneDecl(decl: Tombstone)
+
     // A statement that would not parse.
     //
     // **Recovery keeps the shape and drops the line**, so a file with one bad statement still hands
@@ -577,7 +581,22 @@ enum Attr
     AnnotationMark
     // `@rename("id")` above a type: an annotation the program declared, not one of the language's.
     User(use: AnnotUse)
+    // `@renamed("Date", "0.10.0")` or `@removed("write 'zone.resolve(dt)'", "0.10.0")`: the
+    // declaration under it is a tombstone. `renamed_to` is empty for `@removed`, whose text is `hint`.
+    Gone(renamed_to: string, hint: string, version: string)
 end Attr
+
+// A name a module no longer declares: what it was, whether it named a type (`type LocalDate`) or a
+// function (`date_at()`), and what became of it. **It declares nothing**: it is filed apart from every
+// declaration, and asked only where a name has already been found to stand for nothing.
+struct Tombstone
+    name: string
+    is_type: bool
+    // The name it was renamed to; empty where it was removed, and `hint` says what to write instead.
+    renamed_to: string
+    hint: string
+    version: string
+end Tombstone
 
 // One use of an annotation a program declared -- `@rename("id")` or `@marker` -- on a field, a variant
 // or a type. `call` is the construction it stands for, `rename("id")`, and a bare `@marker` is the
@@ -645,6 +664,7 @@ attr_word(a: Attr) -> string = a match
     Disjoint(_) -> "disjoint"
     AnnotationMark -> "annotation"
     User(u) -> annot_written(u)
+    Gone(to, _, _) -> if to == "" then "removed" else "renamed"
 
 // A foreign function's declaration.
 struct ExternDecl

@@ -140,6 +140,8 @@ parse_member_attrs(p: *Parser, in_trait: bool) -> Buf[Attr]
                 p.fault(at, layout_attr_on_member(word))
             else if word == "unchecked"
                 p.fault(at, unchecked_not_a_block())
+            else if word == "renamed" || word == "removed"
+                p.fault(at, tombstone_off_member(word))
             else
                 p.fault(at, member_attr_refusal())
 
@@ -249,7 +251,7 @@ builtin_attr_word(w: string) -> bool
                  "section", "crossing", "domain", "keeps", "answers", "disjoint", "guards", "needs",
                  "noinline", "inline", "cold", "thread_local", "abandons", "per_cpu", "main_thread",
                  "pinned", "pins", "relocates", "views", "consumes", "blocks", "scoped", "joined",
-                 "strict_fp", "track_caller", "returns_twice"]
+                 "strict_fp", "track_caller", "returns_twice", "renamed", "removed"]
         if word == w then return true
 
     false
@@ -427,6 +429,7 @@ parse_attribute(p: *Parser) -> Option[Attr]
     // declaration could name.
     if word == "track_caller" then return no_inlining_args(p, TrackCaller, "the location it hands on is the line of each call, which the call supplies")
     if word == "annotation" then return no_inlining_args(p, AnnotationMark, "what a use of the annotation says is written where it is used, as the values of the struct's fields")
+    if word == "renamed" || word == "removed" then return parse_gone_attr(p, at, word)
 
     // `@ignore` is the spelling other test frameworks use, answered with this one's: ignoring is
     // something a test is, so it is an argument to `@test` rather than an annotation of its own.
@@ -1065,6 +1068,10 @@ private parse_attributed_decl(p: *Parser, start: Span) -> Stmt
 
     val vis = parse_visibility(p)
     val at = p.here()
+
+    // A tombstone is settled before anything asks which declaration is coming: it is none of them.
+    if any_gone(attrs) then return from_first(start, parse_tombstone(p, start, vis, attrs))
+
     val storage = p.at_kw("val") || p.at_kw("var") || p.at_kw("static")
 
     refuse_layout_beside_function(p, attrs, storage)

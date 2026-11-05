@@ -2194,6 +2194,68 @@ no way to write it; `Nums::Item` is a way to write it, so concealing it would ad
 rather than an abstraction. A generic caller still sees only the bound, which is where the
 abstraction matters, and the projection being abstract there provides it.
 
+**A projection stands before `.` the way the type it names does**, so an associated function is
+called through it. In a generic body the call reaches what the bound promises: `type Item: Make`
+promises `make`, so `M::Item.make()` is checked once against `Make`, and each instantiation calls
+the implementation's own. At a concrete type, `Box::Item.make()` is `Cell.make()`:
+
+```sysl
+trait Make
+    make() -> Self
+
+struct Cell
+    v: int
+
+impl Make for Cell
+    make() -> Self = Cell(7)
+
+trait Maker
+    type Item: Make
+
+struct Box
+    n: int
+
+impl Maker for Box
+    type Item = Cell
+
+build[M: Maker]() -> M::Item = M::Item.make()
+
+print(build[Box]().v, Box::Item.make().v)
+```
+
+```output
+7 7
+```
+
+A function the bound does not promise is refused in the generic body, with the bound it would need,
+even where every type that will fill the projection happens to have one:
+
+```sysl
+trait Make
+    make() -> Self
+
+trait Spare
+    spare() -> Self
+
+struct Cell
+    v: int
+
+impl Make for Cell
+    make() -> Self = Cell(7)
+
+impl Spare for Cell
+    spare() -> Self = Cell(8)
+
+trait Maker
+    type Item: Make
+
+spare_of[M: Maker]() -> M::Item = M::Item.spare()
+```
+
+```error
+'spare' needs 'M::Item: Spare'
+```
+
 ### A generic block answers with one type per instantiation
 
 The block's own parameters may appear in the associated type, exactly as they may in a trait

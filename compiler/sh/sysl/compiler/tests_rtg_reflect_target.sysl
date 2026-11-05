@@ -20,6 +20,9 @@ import sysl.process.capture
 // neighbours (a tuple, `()`, a callable's parameter list, one type alone), and the refusals (no
 // pointer, the end of a chain, a projection used as a value, a value on the left, a referent without
 // the function called). A trait's own associated type `Target` is the one name that wins over it.
+// Where it meets the two neighbours it grew beside: `::Name` answers the referent as written
+// (`(&u16)::Target::Name` is `u16`), and an associated type is projected on either side of it
+// (`Box::Item::Target.make()`, `(&M)::Target::Item.make()`, nested).
 //
 // Not covered: `#if`, whose conditions are target facts (`ptr32`, `os`) and never type queries;
 // `ref T`, which is a method's result marking a place rather than a type, so no `T` is written of it;
@@ -521,3 +524,166 @@ rtg_an_associated_call_through_no_pointer()
             print(made[H]())
 
         """), rtg_no_target("int", "an integer") + " (in the copy for field 'H.a')", ":24:16")
+
+// -- with Name as written, and with associated types ----------------------------------------------
+
+@test("Name through Target answers the referent as written: a width, an alias, an instance, a chain")
+rtg_name_through_target_as_written()
+    if im_can_run() then return
+
+    assert_eq(rtg_out(raw"""
+        type Meters = u16
+        type A = (&u16)::Target
+
+        struct Pair[T]
+            a: T
+
+        main()
+            print((&u16)::Target::Name, (*u8)::Target::Name, (&sync u16)::Target::Name)
+            print((&Meters)::Target::Name, (&Pair[u8])::Target::Name, A::Name)
+            print((&*u16)::Target::Target::Name, (**Meters)::Target::Target::Name)
+
+        """), "u16 u8 u16\nu16 Pair[u8] u16\nu16 u16\n[exit 0]")
+
+@test("Name through Target is canonical for a type parameter, and as the impl wrote a trait's own Target")
+rtg_name_through_target_canonical()
+    if im_can_run() then return
+
+    assert_eq(rtg_out(raw"""
+        trait Holds
+            type Target
+
+        struct Jar
+            n: int
+
+        impl Holds for Jar
+            type Target = u16
+
+        impl Holds for u8
+            type Target = bool
+
+        named[T]() -> string = T::Target::Name
+
+        main()
+            print(named[&u16](), Jar::Target::Name, (&Jar)::Target::Name, (&u8)::Target::Name)
+
+        """), "ushort u16 u16 bool\n[exit 0]")
+
+@test("an associated call and a type reach through Target off an associated type, concrete and generic")
+rtg_target_off_an_associated_type()
+    if im_can_run() then return
+
+    assert_eq(rtg_out(raw"""
+        trait Has
+            type Item
+
+        struct Thing
+            n: int
+
+        impl Thing
+            make() -> Thing = Thing(7)
+
+        struct Box
+            n: int
+
+        impl Has for Box
+            type Item = &Thing
+
+        struct Ptrs
+            n: int
+
+        impl Has for Ptrs
+            type Item = *Thing
+
+        sized[P: Has]() -> usize = sizeof(P::Item::Target)
+
+        main()
+            val t: Box::Item::Target = Thing(3)
+            print(Box::Item::Target.make().n, Ptrs::Item::Target.make().n, t.n)
+            print(sized[Box](), sized[Ptrs](), sizeof(Ptrs::Item::Target))
+
+        """), "7 7 3\n4 4 4\n[exit 0]")
+
+@test("an associated type is projected off Target, through a bound in a generic body and concretely")
+rtg_an_associated_type_off_target()
+    if im_can_run() then return
+
+    assert_eq(rtg_out(raw"""
+        trait Make
+            make() -> Self
+
+        trait Has
+            type Item: Make
+
+        struct Cell
+            v: int
+
+        impl Make for Cell
+            make() -> Self = Cell(5)
+
+        struct Box
+            n: int
+
+        impl Has for Box
+            type Item = Cell
+
+        made[M: Has]() -> M::Item = (&M)::Target::Item.make()
+
+        main()
+            print((&Box)::Target::Item.make().v, (*Box)::Target::Item.make().v, made[Box]().v)
+
+        """), "5 5 5\n[exit 0]")
+
+@test("projections nest through Target in both orders, in a call and in a type")
+rtg_projections_nest_through_target()
+    if im_can_run() then return
+
+    assert_eq(rtg_out(raw"""
+        trait Has
+            type Item
+
+        struct Cell
+            v: int
+
+        impl Cell
+            make() -> Cell = Cell(9)
+
+        struct Inner
+            n: int
+
+        impl Has for Inner
+            type Item = Cell
+
+        struct Box
+            n: int
+
+        impl Has for Box
+            type Item = &Inner
+
+        main()
+            val c: Box::Item::Target::Item = Cell(2)
+            print(Box::Item::Target::Item.make().v, (&Box)::Target::Item::Target::Item.make().v, c.v)
+
+        """), "9 9 2\n[exit 0]")
+
+@test("an associated call through Target off an associated type that points at nothing is refused once")
+rtg_target_off_an_associated_type_refused()
+    if im_can_run() then return
+
+    val said = rtg_out(raw"""
+        trait Has
+            type Item
+
+        struct Box
+            n: int
+
+        impl Has for Box
+            type Item = int
+
+        main()
+            print(Box::Item::Target.make())
+
+        """)
+
+    rtg_refused(said, rtg_no_target("int", "an integer"), ":28:11")
+    assert(!said.contains("associated function"), said)
