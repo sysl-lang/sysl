@@ -1,0 +1,397 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.text.Search
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// A **requirement that fixes an associated type** -- `trait Doubles: Seq[Item = int]`, as Rust's
+// `trait Doubles: Iterator<Item = i32>`. A generic body bounded by the requiring trait reads the
+// projection AS the fixed type, and every `impl` of the requiring trait is held to it, since a
+// requirement has no call of its own. Crossed with: a wrong type in the body, an impl whose choice
+// differs, a generic impl that leaves it open, two requirements, a requirement reached through
+// another trait, a diamond that agrees and one that does not, a trait parameter in the binding, and
+// handing the parameter on to a bound that fixes the same type.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private rqf_ready() -> bool = std_root().is_ok() && clang_available()
+
+private rqf_write(main: string) -> string
+    val root = make_temp_dir("sysl-rqf").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(root + "/package.hocon", "package {\n  name = \"probe\"\n}\n").unwrap()
+    write_text(root + "/main.sysl", main).unwrap()
+    root
+end rqf_write
+
+// What the program PRINTS, or what the build had to say about it.
+private rqf_ran(main: string) -> string
+    val root = rqf_write(main)
+    val exe = root + "/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            val said = failure_text(why)
+
+            remove_dir_all(root).unwrap_or(())
+            return said
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end rqf_ran
+
+private rqf_report(main: string) -> string
+    val root = rqf_write(main)
+
+    val out = emit_llvm_text(root, None) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> if made.report.is_empty() then made.text else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end rqf_report
+
+// The program is refused with exactly this message, first, at this line and column of `main.sysl`.
+private rqf_refused(main: string, message: string, at: string)
+    val out = rqf_report(main)
+
+    assert(out.starts_with(s"error: $message\n "), s"expected 'error: $message' first, got: $out")
+    assert(out.index_of(s"/main.sysl:$at\n").is_some(), s"expected it at main.sysl:$at, got: $out")
+end rqf_refused
+
+// A sequence trait, a requirement fixing its item to int, and a box implementing both.
+private rqf_src() -> string = raw"""
+    trait Seq
+        type Item
+        head(self) -> Self::Item
+
+    trait Doubles: Seq[Item = int]
+        doubled(self) -> int
+
+    struct Box
+        v: int
+
+    impl Seq for Box
+        type Item = int
+        head(self) -> Self::Item = self.v
+
+    impl Doubles for Box
+        doubled(self) -> int = self.v * 2
+
+    """
+
+// -- the generic body -----------------------------------------------------------------------------
+
+@test("a body bounded by a trait whose requirement fixes 'Item' reads 'T::Item' as int")
+rqf_body_reads_fixed()
+    if !rqf_ready() then return
+
+    assert_eq(rqf_ran(rqf_src() + raw"""
+        twice[T: Doubles](t: T) -> int = t.head() + t.doubled()
+
+        named[T: Doubles](t: T) -> int
+            val n: T::Item = t.head()
+            val m: int = n
+            m + 1
+
+        print(twice(Box(5)), named(Box(5)))
+        """), "15 6\n")
+
+@test("a body that takes the fixed 'Item' for another type is refused")
+rqf_body_wrong_type()
+    if !rqf_ready() then return
+
+    val out = rqf_report(rqf_src() + raw"""
+        bad[T: Doubles](t: T) -> string = t.head()
+
+        print(bad(Box(5)))
+        """)
+
+    assert(out.starts_with("error: "), s"expected a refusal, got: $out")
+    assert(out.index_of("/main.sysl:18:").is_some(), s"expected it on line 18, got: $out")
+
+@test("a parameter bounded by the requiring trait meets a bound that fixes the same type")
+rqf_handed_on()
+    if !rqf_ready() then return
+
+    assert_eq(rqf_ran(rqf_src() + raw"""
+        first[S: Seq[Item = int]](s: S) -> int = s.head()
+
+        via[T: Doubles](t: T) -> int = first(t) * 10
+
+        print(via(Box(4)))
+        """), "40\n")
+
+@test("a parameter bounded by the requiring trait is refused by a bound fixing another type")
+rqf_handed_on_wrong()
+    if !rqf_ready() then return
+
+    val out = rqf_report(rqf_src() + raw"""
+        first[S: Seq[Item = string]](s: S) -> string = s.head()
+
+        via[T: Doubles](t: T) -> string = first(t)
+
+        print(via(Box(4)))
+        """)
+
+    assert(out.index_of("'Item' is string").is_some(), s"expected the fixed type named, got: $out")
+
+// -- every implementation is held to it ------------------------------------------------------------
+
+@test("an impl of the requiring trait for a type whose 'Item' differs is refused at the impl")
+rqf_impl_differs()
+    if !rqf_ready() then return
+
+    rqf_refused(raw"""
+        trait Seq
+            type Item
+            head(self) -> Self::Item
+
+        trait Doubles: Seq[Item = int]
+            doubled(self) -> int
+
+        struct Words
+            v: string
+
+        impl Seq for Words
+            type Item = string
+            head(self) -> Self::Item = self.v
+
+        impl Doubles for Words
+            doubled(self) -> int = 2
+
+        print(1)
+        """, "trait 'Doubles' requires 'Seq[Item = int]', which says 'Item' is int, and Words supplies " +
+        "string for it — every implementation of 'Doubles' has to choose the same one", "15:1")
+
+@test("a requirement fixing 'Item' as string is refused against an impl that chose int")
+rqf_requirement_string_impl_int()
+    if !rqf_ready() then return
+
+    rqf_refused(raw"""
+        trait Seq
+            type Item
+            head(self) -> Self::Item
+
+        trait Named: Seq[Item = string]
+            name(self) -> string
+
+        struct Box
+            v: int
+
+        impl Seq for Box
+            type Item = int
+            head(self) -> Self::Item = self.v
+
+        impl Named for Box
+            name(self) -> string = "box"
+
+        print(1)
+        """, "trait 'Named' requires 'Seq[Item = string]', which says 'Item' is string, and Box " +
+        "supplies int for it — every implementation of 'Named' has to choose the same one", "15:1")
+
+@test("a generic impl whose own bound leaves 'Item' open is refused")
+rqf_generic_impl_open()
+    if !rqf_ready() then return
+
+    val out = rqf_report(rqf_src() + raw"""
+        struct Wrap[T]
+            inner: T
+
+        impl[T: Seq] Seq for Wrap[T]
+            type Item = T::Item
+            head(self) -> Self::Item = self.inner.head()
+
+        impl[T: Seq] Doubles for Wrap[T]
+            doubled(self) -> int = 0
+
+        print(1)
+        """)
+
+    assert(out.index_of("which says 'Item' is int, and nothing says what").is_some(),
+           s"expected the open choice refused, got: $out")
+
+@test("a generic impl whose own bound fixes 'Item' meets the requirement")
+rqf_generic_impl_fixed()
+    if !rqf_ready() then return
+
+    assert_eq(rqf_ran(rqf_src() + raw"""
+        struct Wrap[T]
+            inner: T
+
+        impl[T: Seq] Seq for Wrap[T]
+            type Item = T::Item
+            head(self) -> Self::Item = self.inner.head()
+
+        impl[U: Seq[Item = int]] Doubles for Wrap[U]
+            doubled(self) -> int = self.inner.head() * 2
+
+        twice[T: Doubles](t: T) -> int = t.head() + t.doubled()
+
+        print(twice(Wrap(Box(3))))
+        """), "9\n")
+
+// -- requirements that combine --------------------------------------------------------------------
+
+@test("two requirements each fixing an associated type are both read in the body")
+rqf_two_requirements()
+    if !rqf_ready() then return
+
+    assert_eq(rqf_ran(raw"""
+        trait Seq
+            type Item
+            head(self) -> Self::Item
+
+        trait Keyed
+            type Key
+            key(self) -> Self::Key
+
+        trait Entry: Seq[Item = int] + Keyed[Key = string]
+            weight(self) -> int
+
+        struct Row
+            v: int
+            k: string
+
+        impl Seq for Row
+            type Item = int
+            head(self) -> Self::Item = self.v
+
+        impl Keyed for Row
+            type Key = string
+            key(self) -> Self::Key = self.k
+
+        impl Entry for Row
+            weight(self) -> int = 1
+
+        show[T: Entry](t: T) -> string
+            val n: int = t.head() + t.weight()
+            val k: string = t.key()
+            s"$k=$n"
+
+        print(show(Row(41, "a")))
+        """), "a=42\n")
+
+@test("a requirement reached through another trait fixes 'Item' in the body")
+rqf_through_another()
+    if !rqf_ready() then return
+
+    assert_eq(rqf_ran(rqf_src() + raw"""
+        trait Quads: Doubles
+            quad(self) -> int
+
+        impl Quads for Box
+            quad(self) -> int = self.doubled() * 2
+
+        sum[T: Quads](t: T) -> int = t.head() + t.quad()
+
+        print(sum(Box(3)))
+        """), "15\n")
+
+@test("a diamond that fixes 'Item' on one route and leaves it open on the other still fixes it")
+rqf_diamond_agrees()
+    if !rqf_ready() then return
+
+    assert_eq(rqf_ran(rqf_src() + raw"""
+        trait Plain: Seq
+            plain(self) -> int
+
+        impl Plain for Box
+            plain(self) -> int = 1
+
+        trait Both: Plain + Doubles
+            both(self) -> int
+
+        impl Both for Box
+            both(self) -> int = 100
+
+        sum[T: Both](t: T) -> int = t.head() + t.both()
+
+        print(sum(Box(3)))
+        """), "103\n")
+
+@test("a diamond that fixes 'Item' as two different types is refused at the trait")
+rqf_diamond_clash()
+    if !rqf_ready() then return
+
+    rqf_refused(raw"""
+        trait Seq
+            type Item
+            head(self) -> Self::Item
+
+        trait Ints: Seq[Item = int]
+            ints(self) -> int
+
+        trait Strs: Seq[Item = string]
+            strs(self) -> int
+
+        trait Both: Ints + Strs
+            both(self) -> int
+
+        print(1)
+        """, "'Both' requires 'Seq' with its 'Item' fixed both as int and as string, and a type " +
+        "chooses one type for it — so no type could satisfy both", "11:20")
+
+@test("a requirement may fix 'Item' to the requiring trait's own parameter")
+rqf_trait_parameter()
+    if !rqf_ready() then return
+
+    assert_eq(rqf_ran(rqf_src() + raw"""
+        trait Holds[E]: Seq[Item = E]
+            again(self) -> E
+
+        impl Holds[int] for Box
+            again(self) -> int = self.v
+
+        pair[T: Holds[int]](t: T) -> int = t.head() + t.again()
+
+        print(pair(Box(8)))
+        """), "16\n")
+
+@test("a diamond whose routes fix 'Item' through a trait parameter and as int agree at int")
+rqf_diamond_parameter()
+    if !rqf_ready() then return
+
+    assert_eq(rqf_ran(rqf_src() + raw"""
+        trait Holds[E]: Seq[Item = E]
+            again(self) -> E
+
+        impl Holds[int] for Box
+            again(self) -> int = self.v
+
+        trait Both: Holds[int] + Doubles
+            both(self) -> int
+
+        impl Both for Box
+            both(self) -> int = self.again() + self.doubled()
+
+        sum[T: Both](t: T) -> int = t.head() + t.both()
+
+        print(sum(Box(2)))
+        """), "8\n")
+
+@test("a requirement that fixes an associated type the trait does not declare is refused")
+rqf_unknown_name()
+    if !rqf_ready() then return
+
+    val out = rqf_report(raw"""
+        trait Seq
+            type Item
+            head(self) -> Self::Item
+
+        trait Doubles: Seq[Elem = int]
+            doubled(self) -> int
+
+        print(1)
+        """)
+
+    assert(out.starts_with("error: ") && out.index_of("'Elem'").is_some(),
+           s"expected the unknown name refused, got: $out")
