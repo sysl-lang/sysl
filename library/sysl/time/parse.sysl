@@ -81,7 +81,7 @@ private expect(b: []const u8, at: usize, c: u8) -> Result[unit, TimeParseError]
 /** `YYYY-MM-DD`. The year is four digits, which is what ISO 8601 says and what `date_text` writes;
  * a year outside 0..9999 has no ISO spelling without a sign prefix, and that extension is not here.
  */
-parse_date(s: string) -> Result[LocalDate, TimeParseError]
+parse_date(s: string) -> Result[Date, TimeParseError]
     var b = s.bytes
     var d = date_from(b, 0)?
 
@@ -91,7 +91,7 @@ parse_date(s: string) -> Result[LocalDate, TimeParseError]
 end parse_date
 
 /** The date, and where reading it stopped — which is what lets a date-time reuse it. */
-private date_from(b: []const u8, at: usize) -> Result[(LocalDate, usize), TimeParseError]
+private date_from(b: []const u8, at: usize) -> Result[(Date, usize), TimeParseError]
     var y = digits(b, at, 4)?
     expect(b, at + 4, 45)?
     var m = digits(b, at + 5, 2)?
@@ -101,13 +101,13 @@ private date_from(b: []const u8, at: usize) -> Result[(LocalDate, usize), TimePa
     if m < 1 || m > 12 then return Err(OutOfRange("month"))
     if d < 1 || d > days_in_month(y, m) then return Err(OutOfRange("day"))
 
-    Ok((date_at(y, m, d), at + 10))
+    Ok((days_from_civil(YearMonthDay(y, m, d)), at + 10))
 end date_from
 
 /** `HH:MM`, `HH:MM:SS`, or `HH:MM:SS.ffffff` — the seconds and the fraction each optional, on the
  * same terms `time_text` writes them.
  */
-parse_time(s: string) -> Result[LocalTime, TimeParseError]
+parse_time(s: string) -> Result[Time, TimeParseError]
     var b = s.bytes
     var t = time_from(b, 0)?
 
@@ -116,7 +116,7 @@ parse_time(s: string) -> Result[LocalTime, TimeParseError]
     Ok(t.0)
 end parse_time
 
-private time_from(b: []const u8, at: usize) -> Result[(LocalTime, usize), TimeParseError]
+private time_from(b: []const u8, at: usize) -> Result[(Time, usize), TimeParseError]
     var h = digits(b, at, 2)?
     expect(b, at + 2, 58)?
     var mi = digits(b, at + 3, 2)?
@@ -130,7 +130,7 @@ private time_from(b: []const u8, at: usize) -> Result[(LocalTime, usize), TimePa
     // A seconds field is present only where a colon follows, and a fraction only where a dot
     // follows that. Anything else ends the time, which is what lets a date-time read an offset off
     // the tail without this having to know one is coming.
-    if next >= b.len || b[next] != 58 then return Ok((LocalTime(us), next))
+    if next >= b.len || b[next] != 58 then return Ok((Time(us), next))
 
     var sec = digits(b, next + 3 - 2, 2)?
 
@@ -139,7 +139,7 @@ private time_from(b: []const u8, at: usize) -> Result[(LocalTime, usize), TimePa
     us = us + long(sec) * us_per_second
     next = next + 3
 
-    if next >= b.len || b[next] != 46 then return Ok((LocalTime(us), next))
+    if next >= b.len || b[next] != 46 then return Ok((Time(us), next))
 
     // Up to six digits of fraction, each worth ten times less than the last. Fewer than six is legal
     // and means what it says: `.5` is half a second, not five microseconds.
@@ -155,13 +155,13 @@ private time_from(b: []const u8, at: usize) -> Result[(LocalTime, usize), TimePa
 
     if seen == 0 then return Err(BadShape(next + 1))
 
-    Ok((LocalTime(us), i))
+    Ok((Time(us), i))
 end time_from
 
 /** A date and a time, joined by a space or a `T`. Both spellings are read because both are written:
  * ISO 8601 says `T`, and `datetime_text` writes a space because that is what a person reads.
  */
-parse_datetime(s: string) -> Result[LocalDateTime, TimeParseError]
+parse_datetime(s: string) -> Result[DateTime, TimeParseError]
     var b = s.bytes
     var d = date_from(b, 0)?
 
@@ -172,7 +172,7 @@ parse_datetime(s: string) -> Result[LocalDateTime, TimeParseError]
 
     if t.1 != b.len then return Err(Trailing(t.1))
 
-    Ok(LocalDateTime(d.0, t.0))
+    Ok(DateTime(d.0, t.0))
 end parse_datetime
 
 /** `Z`, `+05:30`, `-08:00`. The `Z` is zero, which is the spelling `offset_text` writes it back as. */
@@ -223,5 +223,5 @@ parse_timestamp(s: string) -> Result[Instant, TimeParseError]
 
     if o.1 != b.len then return Err(Trailing(o.1))
 
-    Ok(from_offset(LocalDateTime(d.0, t.0), o.0))
+    Ok(from_offset(DateTime(d.0, t.0), o.0))
 end parse_timestamp

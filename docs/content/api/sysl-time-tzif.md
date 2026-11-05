@@ -77,7 +77,7 @@ offset_at(z: Zone, t: Instant) -> Result[Offset, TzifError]
 
 How far this zone's clocks were set from UTC at that instant.
 
-**This is the shape `sysl.time.resolve` takes**, which is the whole point of it: a zone read from a
+**This is the rule a `sysl.time.RuledZone` holds**, which is the whole point of it: a zone read from a
 file, a zone talking to a chip and a zone written out by hand are one thing to everything above.
 
 ### `parse`

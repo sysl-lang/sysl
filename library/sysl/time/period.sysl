@@ -1,0 +1,76 @@
+module sysl.time
+
+/** A length of calendar: so many months and so many days.
+ *
+ * **This is the other length, and it is why there are two.** A `Duration` is exact timeline -- so
+ * many microseconds, whatever the calendar says -- and a `Period` is a step on the calendar, whose
+ * length on the timeline depends on where it is taken. A month is 28 to 31 days and a day is 23 to 25
+ * hours across a change of a zone's clocks, so neither converts to the other, and a `Period` is added
+ * only to something that has a calendar: a `Date`, a `DateTime` or a `Zoned`, never an `Instant`.
+ *
+ * **Months and days are two scales and never convert.** `months(1)` holds no days and
+ * `Period(0, 30)` no months, and the two are not equal. A year is twelve months, which is exact, so
+ * `years` is a maker of months rather than a third field.
+ *
+ * Adding one applies the months first and the days after, which is the order every calendar library
+ * uses: the 31st of January plus one month and one day is the 1st of March, by way of the 28th of
+ * February. The months clamp to the end of a shorter month (`plus_months`).
+ */
+struct Period
+    months: int
+    days: int
+
+/** A period of so many months. */
+months(n: int) -> Period = Period(n, 0)
+
+/** A period of so many years, which is twelve months each. */
+years(n: int) -> Period = Period(n * 12, 0)
+
+impl Add for Period
+    add(self, rhs: Period) -> Period = Period(self.months + rhs.months, self.days + rhs.days)
+
+impl Sub for Period
+    sub(self, rhs: Period) -> Period = Period(self.months - rhs.months, self.days - rhs.days)
+
+impl Neg for Period
+    neg(self) -> Period = Period(-self.months, -self.days)
+
+impl Mul[int] for Period
+    mul(self, rhs: int) -> Period = Period(self.months * rhs, self.days * rhs)
+
+impl Eq for Period
+    eq(self, rhs: Period) -> bool = self.months == rhs.months && self.days == rhs.days
+
+/** `1y 2mo 3d`, leaving out what is zero, and `0d` for a period of nothing. A year is shown wherever
+ * twelve months make one, which is a rendering choice and not a conversion: the value holds months.
+ */
+period_text(p: Period) -> string
+    var out = ""
+    var y = p.months / 12
+    var m = p.months % 12
+
+    if y != 0 then out = s"${y}y"
+    if m != 0 then out = if out.len == 0 then s"${m}mo" else s"$out ${m}mo"
+    if p.days != 0 then out = if out.len == 0 then s"${p.days}d" else s"$out ${p.days}d"
+
+    if out.len == 0 then "0d" else out
+end period_text
+
+impl Display for Period
+    display(self, out: *Writer, fmt: FormatSpec) = display_str(period_text(self), out, fmt)
+
+/** A date moved along the calendar: the months first, clamped to the end of a shorter month, then the
+ * days. The 31st of January plus a month is the last day of February, in a leap year or not.
+ */
+impl Add[Period] for Date
+    add(self, rhs: Period) -> Date = Date(plus_months(self, rhs.months).day + rhs.days)
+
+impl Sub[Period] for Date
+    sub(self, rhs: Period) -> Date = self + -rhs
+
+/** A wall reading moved along the calendar: the date moves and the clock face stays where it was. */
+impl Add[Period] for DateTime
+    add(self, rhs: Period) -> DateTime = DateTime(self.date + rhs, self.time)
+
+impl Sub[Period] for DateTime
+    sub(self, rhs: Period) -> DateTime = self + -rhs
