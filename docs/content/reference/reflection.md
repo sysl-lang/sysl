@@ -276,6 +276,53 @@ print(int::Target::Name)
 compiler supplies, and it is reached through a reference as any associated type is: where
 `impl Holds for Jar` says `type Target = u8`, `Jar::Target` and `(&Jar)::Target` are both `u8`.
 
+**Every question is asked through an associated type as it is through `Target`**: `M::Item::Name`,
+`M::Item::Kind`, `M::Item::Fields`, `sizeof(M::Item)`, an attribute with an operand and a further
+`::Target` all read the type the projection names. Off a declared type, `::Name` answers as the
+implementation wrote `type Item = …`, an alias by its declaration as the alias's own name does; off a
+type parameter it is canonical, as the parameter is:
+
+```sysl
+trait Has
+    type Item
+
+type Meters = u16
+
+struct Point
+    x: int
+    y: u8
+
+struct Shelf
+    n: int
+
+impl Has for Shelf
+    type Item = Meters
+
+struct Plot
+    n: int
+
+impl Has for Plot
+    type Item = &Point
+
+asked[M: Has]() -> string = s"${M::Item::Name} ${Kind::Image(M::Item::Kind)}"
+
+print(Shelf::Item::Name, Shelf::Item::Max, Plot::Item::Target::Name, sizeof(Plot::Item::Target))
+print(asked[Shelf](), asked[Plot]())
+
+for const f in Plot::Item::Target::Fields
+    print(f.name, f::Type::Name)
+```
+
+```output
+u16 65535 Point 8
+ushort Int &Point Ref
+x int
+y u8
+```
+
+A left side that is a value keeps the refusal it always had, and a subject with no implementation is
+told so by the projection: `int::Item::Name` says that `int` implements no trait declaring `Item`.
+
 ## Fields and members
 
 **`T::Fields` lists the named fields of a struct, a tuple or a union, in declaration order.** Each
