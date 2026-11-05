@@ -28,19 +28,34 @@ import sysl.math.bigint.{BigInt, add, cmp, from_int}
 // clears one, or leaves the function; a branch is walked once per arm and the arms are joined; a loop
 // is walked until what it holds at its head stops changing.
 
-// One location something tracked was stored at, why, and where the body did it.
+// One location something tracked was stored at, why, and where the body did it: `at` is where to
+// point a reader, and `site` which node did it (`tast.sysl`'s `node_id`), or 0 for a keep no one
+// expression made -- an assumption, a signature's answer, a thread's handle.
 struct KeptAt
     loc: string
     how: string
     at: Span
+    site: usize
+end KeptAt
 
 // One thing a statement does to what is held: stores what is tracked at a location, or overwrites a
-// location with something else.
+// location with something else. `site` is as `KeptAt` holds it.
 struct FlowEv
     clear: bool
     loc: string
     how: string
     at: Span
+    site: usize
+end FlowEv
+
+// A store of what is tracked at `loc`, by the expression `by`.
+kept_ev(loc: string, how: string, by: TExpr) -> FlowEv = FlowEv(false, loc, how, by.span, node_id(by))
+
+// An overwrite of `loc`. What is cleared is a location, so where it was done identifies nothing.
+cleared_ev(loc: string, at: Span) -> FlowEv = FlowEv(true, loc, "", at, 0)
+
+// The keep an event makes, at the location `loc`.
+kept_at(ev: FlowEv, loc: string) -> KeptAt = KeptAt(loc, ev.how, ev.at, ev.site)
 
 // What is held along one way through a body, and which locations have been overwritten on it.
 struct PathState
@@ -145,19 +160,24 @@ has_loc(xs: Buf[KeptAt], loc: string) -> bool
     false
 end has_loc
 
-// Whether `xs` holds the same location kept at the same place in the source, for the same reason.
+// Whether `xs` holds the same location kept by the same node, for the same reason.
 //
-// **The place is not enough to say two keeps are one**: an argument the compiler supplies -- a
+// **Where the source says it is not which node did it**: an argument the compiler supplies -- a
 // default -- is spanned at the callee's declaration, so every call that takes the default keeps at
-// that one span. A probe's reason names the closure it follows (`«base»`), and two calls handing
-// `close()`'s default `cb` to the same field are two closures, each of which escapes; read as one,
-// every one after the first is laid in its frame and released after the frame has gone.
+// that one span, and two calls handing `close()`'s default `cb` to the same field are two closures,
+// each of which escapes; read as one, every one after the first is laid in its frame and released
+// after the frame has gone. A chain's calls all start where its receiver does, and two closures on
+// one line differ by a column at most. So a keep is told by its node (`same_site`).
 private has_site(xs: Buf[KeptAt], k: KeptAt) -> bool
     for x in xs
-        if x.loc == k.loc && x.at == k.at && x.how == k.how then return true
+        if x.loc == k.loc && same_site(x, k) && x.how == k.how then return true
 
     false
 end has_site
+
+// Whether two keeps were made by one node. A keep no node made -- one a fan-out's handle is hooked
+// at, or an assumption -- is told by where it points, which is all it has.
+same_site(a: KeptAt, b: KeptAt) -> bool = if a.site != 0 && b.site != 0 then a.site == b.site else a.at == b.at
 
 // **Each place a pointer is let go is held on its own**, so that two stores of the frame's storage at
 // one location -- a call that hands a local to a function storing it in a global, and a store of
@@ -211,7 +231,7 @@ private apply_event(st: &PathState, ev: FlowEv)
     // A second thread started into a handle whose first is still unjoined leaves the first with nobody
     // to join it.
     if !ev.clear && ev.loc.starts_with("j:") && has_loc(st.pending, ev.loc)
-        add_kept(&st.pending, KeptAt("", ev.how, ev.at))
+        add_kept(&st.pending, kept_at(ev, ""))
         return
     end if
 
@@ -225,7 +245,7 @@ private apply_event(st: &PathState, ev: FlowEv)
 
         if !holds_string(st.cleared, ev.loc) then st.cleared.push(ev.loc)
     else
-        add_kept(&st.pending, KeptAt(ev.loc, ev.how, ev.at))
+        add_kept(&st.pending, kept_at(ev, ev.loc))
     end if
 end apply_event
 
@@ -239,7 +259,7 @@ private moved_pointer(st: &PathState, what: string)
     var cleared: Buf[string] = buf()
 
     for p in st.pending
-        pending.push(if moves(p.loc, what) then KeptAt(p.loc + "?", p.how, p.at) else p)
+        pending.push(if moves(p.loc, what) then KeptAt(p.loc + "?", p.how, p.at, p.site) else p)
 
     for c in st.cleared
         if !moves(c, what) then cleared.push(c)
@@ -350,7 +370,7 @@ private flow_stmt(w: &FlowWalk, s: TStmt, st: &PathState, top: bool)
                         if every && top && !holds_string(w.deferred_clears, ev.loc)
                             w.deferred_clears.push(ev.loc)
                     else
-                        add_kept(&w.deferred_keeps, KeptAt(ev.loc, ev.how, ev.at))
+                        add_kept(&w.deferred_keeps, kept_at(ev, ev.loc))
                     end if
         _ -> flow_piece(w, w.stmt_events(s), st, stmt_jumps(s))
 end flow_stmt
@@ -513,7 +533,7 @@ private in_bounds_clears(w: &FlowWalk, cond: Buf[TCondTerm], block: TBlock, take
 
     for c in taken.cleared
         if c.ends_with(s"[$key]") && !holds_string(skipped.cleared, c)
-            apply_event(skipped, FlowEv(true, c, "", span_zero()))
+            apply_event(skipped, cleared_ev(c, span_zero()))
         end if
 end in_bounds_clears
 

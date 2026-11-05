@@ -64,7 +64,7 @@ private not_kept() -> KeptWhy = KeptWhy(false, "", span_zero(), buf())
 private clears_all() -> KeptWhy
     var locs: Buf[KeptAt] = buf()
 
-    locs.push(KeptAt("*", "", span_zero()))
+    locs.push(KeptAt("*", "", span_zero(), 0))
     KeptWhy(false, "", span_zero(), locs)
 end clears_all
 
@@ -1122,7 +1122,7 @@ end object_marks_kept
 private object_kept(recv: TExpr) -> Buf[(string, KeptAt)]
     var out: Buf[(string, KeptAt)] = buf()
 
-    out.push((object_callee(recv), KeptAt("", "its type says '@keeps'", span_zero())))
+    out.push((object_callee(recv), KeptAt("", "its type says '@keeps'", span_zero(), 0)))
     out
 end object_kept
 
@@ -1213,7 +1213,7 @@ vcall_through(cx: &KeepsCx, recv: TExpr, slot: int, k: usize) -> Buf[(string, Ke
     val tr = erased_trait(texpr_type(recv))
 
     if tr.is_none() || slot < 0
-        out.push(("a call through an object", KeptAt("", "no body says what it does with it", span_zero())))
+        out.push(("a call through an object", KeptAt("", "no body says what it does with it", span_zero(), 0)))
         return out
     end if
 
@@ -1314,7 +1314,7 @@ pointer_through(cx: &KeepsCx, callee: TExpr, j: usize) -> Buf[(string, KeptAt)]
     val key = fn_key(texpr_type(callee))
 
     if key == "" || cx.escaped.has(key)
-        out.push(("a call through a function pointer", KeptAt("", "no body says what it does with it", span_zero())))
+        out.push(("a call through a function pointer", KeptAt("", "no body says what it does with it", span_zero(), 0)))
         return out
     end if
 
@@ -1466,7 +1466,7 @@ private crossing_kept(f: TFunc, i: usize) -> Option[KeptWhy]
         val how = "the thread it starts holds it until that thread is joined"
         var locs: Buf[KeptAt] = buf()
 
-        locs.push(KeptAt("j", how, span_zero()))
+        locs.push(KeptAt("j", how, span_zero(), 0))
         return Some(KeptWhy(true, how, span_zero(), locs))
     end if
 
@@ -1490,7 +1490,7 @@ private task_held(w: KeptWhy) -> KeptWhy
     for item in w.locs
         locs.push(item)
 
-    locs.push(KeptAt("j", how, span_zero()))
+    locs.push(KeptAt("j", how, span_zero(), 0))
 
     if w.kept then KeptWhy(true, w.how, w.at, locs) else KeptWhy(true, how, span_zero(), locs)
 end task_held
@@ -1499,7 +1499,7 @@ end task_held
 private anywhere(how: string, at: Span) -> KeptWhy
     var locs: Buf[KeptAt] = buf()
 
-    locs.push(KeptAt("", how, at))
+    locs.push(KeptAt("", how, at, 0))
     KeptWhy(true, how, at, locs)
 end anywhere
 
@@ -1860,7 +1860,7 @@ private read_back_locs(t: &Track, locs: Buf[KeptAt]) -> Buf[KeptAt]
     var out: Buf[KeptAt] = buf()
 
     for item in locs
-        out.push(KeptAt(read_back_loc(t, item.loc, 0), item.how, item.at))
+        out.push(KeptAt(read_back_loc(t, item.loc, 0), item.how, item.at, item.site))
 
     out
 end read_back_locs
@@ -1901,10 +1901,10 @@ private walk_clears(cx: &KeepsCx, f: TFunc) -> KeptWhy
 
     if w.exited
         for c in w.out_cleared
-            locs.push(KeptAt(c, "", span_zero()))
+            locs.push(KeptAt(c, "", span_zero(), 0))
     else
         // A body that never comes back overwrites everything by the time it does.
-        locs.push(KeptAt("*", "", span_zero()))
+        locs.push(KeptAt("*", "", span_zero(), 0))
     end if
 
     KeptWhy(false, "", span_zero(), locs)
@@ -1996,7 +1996,7 @@ private moved(evs: &EvBuf, what: string)
     for ev in evs.items
         if ev.clear && ev.loc == loc then return
 
-    evs.items.push(FlowEv(true, loc, "", span_zero()))
+    evs.items.push(cleared_ev(loc, span_zero()))
 end moved
 
 private top_clears(t: &Track, evs: &EvBuf, e: TExpr)
@@ -2006,7 +2006,7 @@ private top_clears(t: &Track, evs: &EvBuf, e: TExpr)
             for c in clears_of(t.cx, name).locs
                 val loc = translate_loc(t.org, args, c.loc)
 
-                if loc != "" && !loc.starts_with("l:") then evs.items.push(FlowEv(true, loc, "", e.span))
+                if loc != "" && !loc.starts_with("l:") then evs.items.push(cleared_ev(loc, e.span))
         _ -> ()
 end top_clears
 
@@ -2016,7 +2016,7 @@ private clear_store(t: &Track, evs: &EvBuf, place: TExpr, v: TExpr)
 
     val loc = place_loc(t.org, place)
 
-    if loc != "" && !loc.starts_with("l:") then evs.items.push(FlowEv(true, loc, "", v.span))
+    if loc != "" && !loc.starts_with("l:") then evs.items.push(cleared_ev(loc, v.span))
 end clear_store
 
 // Whether what `f` answers can be made of its parameter at `i`.
@@ -2036,7 +2036,7 @@ end answered
 private keep(t: &Track, how: string, at: Span)
     if !t.why.kept then t.why = KeptWhy(true, how, at, buf())
 
-private kept_hard(evs: &EvBuf, how: string, at: Span) = evs.items.push(FlowEv(false, "", how, at))
+private kept_hard(evs: &EvBuf, how: string, by: TExpr) = evs.items.push(kept_ev("", how, by))
 
 // **A buffer's slots are held as long as the buffer that owns them**, so a value placed in the
 // storage of a slice held in what a parameter points at (`slot_place(self.elems, n, v)`) is held
@@ -2065,7 +2065,7 @@ private image_kept(t: &Track, evs: &EvBuf, call: TExpr, name: string, j: usize, 
         Some(turned) ->
             kept_hard(evs, s"it is passed as an integer to '${shown_name(t.cx.an, name)}', which may store " +
                 s"it where '${shown_name(t.cx.an, turned)}' turns it back into a pointer with 'ptr_cast'",
-                arg.span)
+                arg)
         None -> ()
 
     true
@@ -2083,19 +2083,19 @@ private kept_at(t: &Track, evs: &EvBuf, e: TExpr)
             if t.promised then return
 
             if op == "slot_place" && args.len() == 3 && carries(t, args[2])
-                evs.items.push(FlowEv(false, slot_loc(t.org, args[0]), "it is stored in a buffer's slot", args[2].span))
+                evs.items.push(kept_ev(slot_loc(t.org, args[0]), "it is stored in a buffer's slot", args[2]))
             else if op == "slot_put" && args.len() == 2 && carries(t, args[1])
-                kept_hard(evs, "it is stored in a buffer's slot", args[1].span)
+                kept_hard(evs, "it is stored in a buffer's slot", args[1])
         TAtomic(_, _, ops, _, _, _) ->
             if t.promised then return
 
             for op in ops
-                if carries(t, op) then kept_hard(evs, "it is stored through a pointer by an atomic", op.span)
+                if carries(t, op) then kept_hard(evs, "it is stored through a pointer by an atomic", op)
         TAwait(task, _) -> await_clear(t.hs, evs, task, e.span)
         TBlockOn(task, _) -> await_clear(t.hs, evs, task, e.span)
         TStep(_, wake) ->
             if !t.promised && hands_on(t, wake)
-                kept_hard(evs, "it is the waker handed to 'step', which the task keeps for its parks", wake.span)
+                kept_hard(evs, "it is the waker handed to 'step', which the task keeps for its parks", wake)
         TCall(name, args, _, _) ->
             join_clear(t.hs, evs, name, args, e.span)
             handed_closures_kept(t, evs, args)
@@ -2123,8 +2123,8 @@ private kept_at(t: &Track, evs: &EvBuf, e: TExpr)
 
                     val loc = if item.loc == "j" then joined_loc(t.hs, true) else track_loc(t, args, item.loc)
 
-                    if loc.starts_with("j:") && said_already(evs, loc, args[j].span) then continue
-                    if !loc.starts_with("l:") then evs.items.push(FlowEv(false, loc, how, args[j].span))
+                    if loc.starts_with("j:") && said_already(evs, loc, args[j]) then continue
+                    if !loc.starts_with("l:") then evs.items.push(kept_ev(loc, how, args[j]))
 
                 // **A buffer holding what is tracked, lent by address, lets out whatever the callee
                 // lets out of what it reads through the pointer** -- the handle copied somewhere, an
@@ -2135,12 +2135,12 @@ private kept_at(t: &Track, evs: &EvBuf, e: TExpr)
                     for item in through_of(t.cx, name, j).locs
                         val loc = track_loc(t, args, item.loc)
 
-                        if !loc.starts_with("l:") then evs.items.push(FlowEv(false, loc, how, args[j].span))
+                        if !loc.starts_with("l:") then evs.items.push(kept_ev(loc, how, args[j]))
 
                     for item in vessel_of(t.cx, name, j).locs
                         val loc = track_loc(t, args, item.loc)
 
-                        if !loc.starts_with("l:") then evs.items.push(FlowEv(false, loc, how, args[j].span))
+                        if !loc.starts_with("l:") then evs.items.push(kept_ev(loc, how, args[j]))
                 end if
         TVCall(recv, slot, args, _, _) ->
             val all = with_receiver(recv, args)
@@ -2160,12 +2160,12 @@ private kept_at(t: &Track, evs: &EvBuf, e: TExpr)
 
                     val loc = if item.1.loc == "j" then joined_loc(t.hs, true) else translate_loc(t.org, all, item.1.loc)
 
-                    if loc.starts_with("j:") && said_already(evs, loc, all[k].span) then continue
+                    if loc.starts_with("j:") && said_already(evs, loc, all[k]) then continue
 
                     val how = s"it is passed to ${callee_said(t.cx.an, item.0)}, which " +
                         (if at < kept_n then "keeps it" else "lets what it reads through it out")
 
-                    if !loc.starts_with("l:") then evs.items.push(FlowEv(false, loc, how, all[k].span))
+                    if !loc.starts_with("l:") then evs.items.push(kept_ev(loc, how, all[k]))
         TCallPtr(callee, args, _, _) ->
             for j in 0..<args.len()
                 if !hands_on(t, args[j]) then continue
@@ -2179,7 +2179,7 @@ private kept_at(t: &Track, evs: &EvBuf, e: TExpr)
                     val how = s"it is passed through a function pointer to '${shown_name(t.cx.an, item.0)}', " +
                         (if at < kept_n then "which keeps it" else "which lets what it reads through it out")
 
-                    if !loc.starts_with("l:") then evs.items.push(FlowEv(false, loc, how, args[j].span))
+                    if !loc.starts_with("l:") then evs.items.push(kept_ev(loc, how, args[j]))
         _ -> ()
 end kept_at
 
@@ -2342,8 +2342,7 @@ private captures_kept(t: &Track, evs: &EvBuf, st: &StructType, args: Buf[TExpr])
             val loc = outlasting_loc(item.loc)
 
             if loc.is_some()
-                evs.items.push(FlowEv(false, loc.unwrap(), s"it is captured by a closure, which lets it out (${item.how})",
-                                      arg.span))
+                evs.items.push(kept_ev(loc.unwrap(), s"it is captured by a closure, which lets it out (${item.how})", arg))
         end for
     end for
 end captures_kept
@@ -2666,8 +2665,7 @@ private stored(t: &Track, evs: &EvBuf, place: TExpr, v: TExpr)
     // it is a callback somebody else runs, when the body cannot say.
     if t.promised
         if carries(t, v) && is_object(texpr_type(v))
-            evs.items.push(FlowEv(false, loc, s"it is captured by what is stored in '${place_said(t.scope, place)}'",
-                                  v.span))
+            evs.items.push(kept_ev(loc, s"it is captured by what is stored in '${place_said(t.scope, place)}'", v))
         end if
 
         return
@@ -2692,7 +2690,7 @@ private stored(t: &Track, evs: &EvBuf, place: TExpr, v: TExpr)
         back = s", which '${shown_name(t.cx.an, turned)}' turns back into a pointer with 'ptr_cast'"
     end if
 
-    evs.items.push(FlowEv(false, loc, s"it is stored in '${place_said(t.scope, place)}'$back", v.span))
+    evs.items.push(kept_ev(loc, s"it is stored in '${place_said(t.scope, place)}'$back", v))
 end stored
 
 // A place as the reader wrote it, rebuilt from the tree: module storage by its name, a field after
@@ -3816,7 +3814,7 @@ private frame_top_clears(ft: &FrameTrack, evs: &EvBuf, e: TExpr)
             for c in clears_of(ft.cx, name).locs
                 val loc = translate_loc(ft.org, args, c.loc)
 
-                if loc != "" && !loc.starts_with("l:") then evs.items.push(FlowEv(true, loc, "", e.span))
+                if loc != "" && !loc.starts_with("l:") then evs.items.push(cleared_ev(loc, e.span))
         _ -> ()
 end frame_top_clears
 
@@ -3825,7 +3823,7 @@ private frame_clear_store(ft: &FrameTrack, evs: &EvBuf, place: TExpr, v: TExpr)
 
     val loc = place_loc(ft.org, place)
 
-    if loc != "" && !loc.starts_with("l:") then evs.items.push(FlowEv(true, loc, "", v.span))
+    if loc != "" && !loc.starts_with("l:") then evs.items.push(cleared_ev(loc, v.span))
 end frame_clear_store
 
 private frame_event_at(ft: &FrameTrack, evs: &EvBuf, e: TExpr)
@@ -3924,7 +3922,7 @@ private captures_let_out(ft: &FrameTrack, evs: &EvBuf, st: &StructType, args: Bu
                     break
                 end if
 
-                evs.items.push(FlowEv(false, loc.unwrap(), said, arg.span))
+                evs.items.push(kept_ev(loc.unwrap(), said, arg))
             end for
         end for
     end for
@@ -4011,7 +4009,7 @@ private frame_stored(ft: &FrameTrack, evs: &EvBuf, place: TExpr, v: TExpr)
     end if
 
     if loc.index_of("?").is_some() then ft.faults.items.push((ft.scope, v.span, said))
-    else evs.items.push(FlowEv(false, loc, said, v.span))
+    else evs.items.push(kept_ev(loc, said, v))
 end frame_stored
 
 // **For a probe, a closure stored anywhere but this frame's own storage outlives the frame**: through
@@ -4276,7 +4274,7 @@ private call_at(ft: &FrameTrack, evs: &EvBuf, e: TExpr)
                     // function returns**: one that never does (`-> never`, a kernel's loop) leaves its
                     // frame to every thread it started. So it is held along the ways as a location no
                     // clear can name (`?`), one per argument, and refused at a way out.
-                    if item.loc == "j" && loc == "" then loc = s"j?${arg.span.start}"
+                    if item.loc == "j" && loc == "" then loc = s"j?${node_id(arg)}"
 
                     // A thread holds it until it is joined, so the cure is a join on every way out; a
                     // task, until it is awaited.
@@ -4299,9 +4297,9 @@ private call_at(ft: &FrameTrack, evs: &EvBuf, e: TExpr)
 
                     // A statement that writes its value walks that value twice -- as an expression
                     // and as what it writes -- and one call starts one thread.
-                    if loc.starts_with("j:") && said_already(evs, loc, arg.span) then continue
+                    if loc.starts_with("j:") && said_already(evs, loc, arg) then continue
 
-                    evs.items.push(FlowEv(false, loc, said, arg.span))
+                    evs.items.push(kept_ev(loc, said, arg))
         TVCall(recv, slot, args, _, _) ->
             val all = with_receiver(recv, args)
 
@@ -4335,7 +4333,7 @@ private call_at(ft: &FrameTrack, evs: &EvBuf, e: TExpr)
                     val loc = if item.1.loc == "j" then joined_loc(ft.hs, false) else translate_loc(ft.org, all, item.1.loc)
 
                     if loc.starts_with("l:") then continue
-                    if loc.starts_with("j:") && said_already(evs, loc, arg.span) then continue
+                    if loc.starts_with("j:") && said_already(evs, loc, arg) then continue
 
                     // An async method's task holds it until that task is awaited.
                     val cure = if item.1.loc == "j" then s" — await that task on every way out of '${ft.owner}', " +
@@ -4364,7 +4362,7 @@ private call_at(ft: &FrameTrack, evs: &EvBuf, e: TExpr)
                         break
                     end if
 
-                    evs.items.push(FlowEv(false, loc, said, arg.span))
+                    evs.items.push(kept_ev(loc, said, arg))
         TCallPtr(callee, args, _, _) ->
             for j in 0..<args.len()
                 val arg = args[j]
@@ -4409,7 +4407,7 @@ private call_at(ft: &FrameTrack, evs: &EvBuf, e: TExpr)
                         break
                     end if
 
-                    evs.items.push(FlowEv(false, loc, said, arg.span))
+                    evs.items.push(kept_ev(loc, said, arg))
         _ -> ()
 end call_at
 
@@ -5075,8 +5073,9 @@ private note_pattern(ft: &FrameTrack, p: TPattern, subject: TExpr, element: bool
         ft.binds.push((n, subject, element))
 end note_pattern
 
-// The name of storage made in place where `e` is written.
-private made_point(kind: string, e: TExpr) -> string = s"$kind${e.span.start}"
+// The name of storage made in place by `e`: by its node, since the calls of a chain all start where
+// its receiver does, and the temporaries they take the address of with them.
+private made_point(kind: string, e: TExpr) -> string = s"$kind${node_id(e)}"
 
 // Whether an expression names storage -- a local, a field or element of one, what a pointer points at
 // -- rather than making a value.
