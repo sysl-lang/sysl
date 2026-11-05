@@ -2739,8 +2739,12 @@ A type parameter handed on meets it only where its own bound fixed the same type
 bare trait leaves the type open, and is refused rather than assumed. A binding is held to the trait's
 declaration as an object's is — each name declared, each named once, each type meeting what the trait
 requires of it (`type Item: Display`) — and it applies wherever a bound is written: a function, a
-`where` clause, a generic type, an `impl`, a trait's own member. A trait's *requirement* list cannot
-fix one, since every implementation would then be held to it with no call to refuse at:
+`where` clause, a generic type, an `impl`, a trait's own member.
+
+### A requirement may fix the associated type
+
+A trait's *requirement* list fixes one the same way, and then **a body bounded by the requiring trait
+reads the projection as the fixed type**, through however many requirements it is reached:
 
 ```sysl
 trait Seq
@@ -2750,12 +2754,56 @@ trait Seq
 trait Doubles: Seq[Item = int]
     doubled(self) -> int
 
+struct Box
+    v: int
+
+impl Seq for Box
+    type Item = int
+    head(self) -> Self::Item = self.v
+
+impl Doubles for Box
+    doubled(self) -> int = self.v * 2
+
+twice[T: Doubles](t: T) -> int = t.head() + t.doubled()
+
+print(twice(Box(5)))
+```
+
+```output
+15
+```
+
+A requirement has no call to refuse at, so **every implementation of the requiring trait is held to
+it**, at the `impl`:
+
+```sysl
+trait Seq
+    type Item
+    head(self) -> Self::Item
+
+trait Doubles: Seq[Item = int]
+    doubled(self) -> int
+
+struct Words
+    v: string
+
+impl Seq for Words
+    type Item = string
+    head(self) -> Self::Item = self.v
+
+impl Doubles for Words
+    doubled(self) -> int = 2
+
 print(1)
 ```
 
 ```error
-trait 'Doubles' requires 'Seq' and fixes its 'Item', which a requirement cannot do — bound the type parameter that needs it instead, '[T: Doubles + Seq[Item = …]]'
+trait 'Doubles' requires 'Seq[Item = int]', which says 'Item' is int, and Words supplies string for it — every implementation of 'Doubles' has to choose the same one
 ```
+
+A generic `impl` meets it only where its own bound fixes the same type. Two routes to one trait that
+fix its associated type differently (`trait Both: Ints + Strs`, with `Ints: Seq[Item = int]` and
+`Strs: Seq[Item = string]`) are refused at the declaration, since no type could choose both.
 
 ### A bound may ask something of the associated type instead
 

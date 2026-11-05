@@ -819,6 +819,28 @@ check_impl_supers(a: &Analysis)
             continue
         end if
 
+        // **The required trait is implemented, and an associated type the requirement fixes is not the
+        // one chosen** (`trait Doubles: Seq[Item = int]`) -- held at every `impl`, since a generic
+        // body bounded by the requiring trait reads the projection as the fixed type.
+        val gap = if c.sup.assocs.is_empty() || !satisfies(a, plain_bound(c.sup.name, c.sup.args), c.subject) then None
+                  else assoc_disagreement(a, c.sup, c.subject)
+
+        if gap.is_some()
+            val (n, want, got) = gap.unwrap()
+            val head = s"trait '${c.required}' requires '${show_bound(a, c.sup, c.subject)}', which says " +
+                       s"'$n' is ${type_show(want)}"
+
+            var said = s"$head, and nothing says what ${type_show(c.subject)} chose for it — the block's " +
+                       s"own bound has to fix '$n' too"
+
+            if got.is_some()
+                said = s"$head, and ${type_show(c.subject)} supplies ${type_show(got.unwrap())} for it — " +
+                       s"every implementation of '${c.required}' has to choose the same one"
+
+            a.fault(c.scope, c.span, said)
+            continue
+        end if
+
         // **The required trait is implemented, and what the requirement asks of one of its associated
         // types is not met** (`trait Scalar: Element[Real: Width]`) -- held at every `impl`, since a
         // requirement has no call of its own to refuse at.

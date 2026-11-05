@@ -666,9 +666,10 @@ end trait_closure
 private walk_supers(a: &Analysis, b: Bound, self_bind: Buf[Binding], seen: *Buf[string],
                     acc: *Buf[Bound])
     // A trait reached twice is laid out once, and **what either route asks of its associated types
-    // is kept**: `trait C: A + B[Item: X]`, where `A` requires `B` too, still bounds `Item`.
+    // is kept**: `trait C: A + B[Item: X]`, where `A` requires `B` too, still bounds `Item`, and
+    // `trait C: A + B[Item = int]` still fixes it.
     if holds_name(*seen, b.name)
-        if b.bounded.is_empty() then return
+        if b.bounded.is_empty() && b.assocs.is_empty() then return
 
         for i in 0..<acc.len()
             if acc[i].name != b.name then continue
@@ -679,7 +680,12 @@ private walk_supers(a: &Analysis, b: Bound, self_bind: Buf[Binding], seen: *Buf[
             for item in b.bounded
                 grown.push(item)
 
-            acc[i] = Bound(held.name, held.args, held.assocs, grown)
+            var fixed = held.assocs.copy()
+
+            for item in b.assocs
+                if !holds_assoc(fixed, item.0) then fixed.push(item)
+
+            acc[i] = Bound(held.name, held.args, fixed, grown)
         end for
 
         return
@@ -709,6 +715,13 @@ private walk_supers(a: &Analysis, b: Bound, self_bind: Buf[Binding], seen: *Buf[
 
     acc.push(b)
 end walk_supers
+
+private holds_assoc(xs: Buf[(string, Type)], name: string) -> bool
+    for item in xs
+        if item.0 == name then return true
+
+    false
+end holds_assoc
 
 private holds_name(xs: Buf[string], name: string) -> bool
     for item in xs

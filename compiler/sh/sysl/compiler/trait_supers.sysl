@@ -32,12 +32,14 @@ check_trait_supers(a: &Analysis, key: string, d: TraitDecl)
     var path: Buf[string] = buf()
 
     path.push(key)
-    walk_required(a, &w, key, path)
+    walk_required(a, &w, key, path, None)
 end check_trait_supers
 
 // The requirements `name` writes, each read in the terms of the trait that WROTE it: which trait a
-// short name reaches is what that trait's own file imported. False once something was said.
-private walk_required(a: &Analysis, w: *SuperWalk, name: string, path: Buf[string]) -> bool
+// short name reaches is what that trait's own file imported. False once something was said. `top` is
+// the root's own requirement the walk went down through, where a clash between two routes is told.
+private walk_required(a: &Analysis, w: *SuperWalk, name: string, path: Buf[string],
+                      top: Option[(Scope, Span)]) -> bool
     val found = trait_decl_at(a, name)
 
     if found.is_none() then return true
@@ -67,20 +69,15 @@ private walk_required(a: &Analysis, w: *SuperWalk, name: string, path: Buf[strin
         val sk = skey.unwrap()
         val sdecl = trait_decl_at(a, sk).unwrap()
 
-        // **A requirement is not a bound**: a bound that fixes an associated type is held to it at
-        // every call, and a requirement has no call -- every `impl` of the trait would have to be held
-        // to it instead, and a generic body reading the projection would have to see it as the fixed
-        // type. A requirement that **bounds** one (`Seq[Item: Render]`) is held at every `impl`
-        // (`check_impl_supers`) and only adds to what the projection offers, so it stands.
+        // A requirement that **fixes** an associated type (`Seq[Item = int]`) is held at every `impl`
+        // of the requiring trait (`check_impl_supers`), and a generic body bounded by the requiring
+        // trait reads the projection as the fixed type (`abstract_assoc`). One that **bounds** one
+        // (`Seq[Item: Render]`) is held at every `impl` too and only adds to what the projection offers.
         var positional: usize = 0
 
         for arg in s.args
             *arg.kind match
-                AssocArgType(n, _) ->
-                    a.fault(scope, s.span, s"trait '${qualified_name(name)}' requires '${s.name}' and " +
-                            s"fixes its '$n', which a requirement cannot do — bound the type parameter " +
-                            s"that needs it instead, '[T: ${qualified_name(name)} + ${s.name}[$n = …]]'")
-                    return false
+                AssocArgType(_, _) -> ()
                 AssocBoundArgType(_, _) -> ()
                 _ -> positional += 1
 
@@ -121,6 +118,22 @@ private walk_required(a: &Analysis, w: *SuperWalk, name: string, path: Buf[strin
                         "trait once — so no type could satisfy both")
                 return false
             end if
+
+            // Two routes to one trait that fix one of its associated types differently ask a type
+            // to choose two answers for it.
+            val clash = fixed_clash(first.unwrap(), bound)
+
+            if clash.is_some()
+                val (n, x, y) = clash.unwrap()
+                val (at_scope, at_span) = top.unwrap_or((scope, s.span))
+
+                a.fault(at_scope, at_span, s"'${qualified_name(w.root)}' requires '${qualified_name(sk)}' " +
+                        s"with its '$n' fixed both as ${type_show(x)} and as ${type_show(y)}, and a type " +
+                        "chooses one type for it — so no type could satisfy both")
+                return false
+            end if
+
+            w.visited[visited_at(*w, sk)] = (sk, merged_fixes(first.unwrap(), bound))
         else
             w.visited.push((sk, bound))
 
@@ -144,7 +157,7 @@ private walk_required(a: &Analysis, w: *SuperWalk, name: string, path: Buf[strin
 
             deeper.push(sk)
 
-            if !walk_required(a, w, sk, deeper) then return false
+            if !walk_required(a, w, sk, deeper, Some(top.unwrap_or((scope, s.span)))) then return false
 
     true
 end walk_required
@@ -155,6 +168,43 @@ private index_of_name(xs: Buf[string], name: string) -> Option[usize]
 
     None
 end index_of_name
+
+private visited_at(w: SuperWalk, key: string) -> usize
+    for i in 0..<w.visited.len()
+        if w.visited[i].0 == key then return i
+
+    0
+end visited_at
+
+// The first associated type two bounds on one trait both fix, to types that differ. A type that
+// mentions a trait's own parameter is read with the parameter standing for itself, which says nothing
+// about the type a use will give it, so only types with none are compared.
+private fixed_clash(x: Bound, y: Bound) -> Option[(string, Type, Type)]
+    for p in x.assocs
+        for q in y.assocs
+            if p.0 != q.0 || p.1 == Unknown || q.1 == Unknown then continue
+            if mentions_abstract(p.1) || mentions_abstract(q.1) then continue
+
+            if !type_eq(p.1, q.1)
+                return Some((p.0, p.1, q.1))
+
+    None
+end fixed_clash
+
+// One bound on a trait carrying what either of two routes to it fixed.
+private merged_fixes(x: Bound, y: Bound) -> Bound
+    var assocs = x.assocs.copy()
+
+    for q in y.assocs
+        var held = false
+
+        for p in assocs
+            if p.0 == q.0 then held = true
+
+        if !held then assocs.push(q)
+
+    Bound(x.name, x.args, assocs, x.bounded)
+end merged_fixes
 
 private visited_bound(w: SuperWalk, key: string) -> Option[Bound]
     for item in w.visited
