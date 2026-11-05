@@ -3,35 +3,40 @@ module sh.sysl.compiler
 
 import sh.sysl.parsing.*
 import sysl.buf.{Buf, buf}
-import sysl.text.Search
+import sysl.text.{str_builder, Search}
 
 // What a compilation's worth of diagnostics looks like, and the undo log a speculative walk rewinds
 // through.
 //
 // **The shape of a report is a specification.** A build log, an editor and a test all read it, and
-// the reference compiler's is what they read today -- five at a time, separated by a blank line,
-// with a count of what was left out.
+// it is twenty at a time unless `--error-limit` says otherwise, separated by a blank line, with a
+// count of what was left out.
 
 private a_source(name: string, text: string) -> Source = source_of(name, text)
 
 private complaint(src: Source, at: usize, message: string) -> Placed =
     placed_error(src, Span(at, at + 1), message)
 
-@test("a report shows the first five, separated by a blank line, and says how many there were")
-a_report_shows_the_first_five()
-    val src = a_source("many.sysl", "a\nb\nc\nd\ne\nf\ng\n")
+@test("a report shows the first twenty, separated by a blank line, and says how many more there were")
+a_report_shows_the_first_twenty()
+    var lines = str_builder()
+
+    for _i in 0..<25
+        lines.push("a\n")
+
+    val src = a_source("many.sysl", lines.finish())
     var all: Buf[Placed] = buf()
 
-    for i in 0..<usize(7)
-        all.push(complaint(src, i * 2, s"wrong ${i + 1}"))
+    for i in 0..<usize(25)
+        all.push(complaint(src, i * 2, s"wrong ${i + 1};"))
 
     val text = analysis_report(all)
 
-    assert(text.contains("error: wrong 1"))
-    assert(text.contains("error: wrong 5"))
-    assert(!text.contains("error: wrong 6"))
-    assert(text.contains("\n\nerror: wrong 2"))
-    assert(text.ends_with("showing the first 5 of 7 errors"))
+    assert(text.contains("error: wrong 1;"))
+    assert(text.contains("error: wrong 20;"))
+    assert(!text.contains("error: wrong 21;"))
+    assert(text.contains("\n\nerror: wrong 2;"))
+    assert(text.ends_with("\n\n5 more errors not shown; '--error-limit 0' shows all"), text)
 
 @test("and says nothing about a count where there was nothing left out")
 a_short_report_says_no_count()
@@ -43,7 +48,7 @@ a_short_report_says_no_count()
 
     val text = analysis_report(all)
 
-    assert(!text.contains("showing the first"))
+    assert(!text.contains("not shown"))
     assert(text.contains("error: first"))
     assert(text.contains("error: second"))
 

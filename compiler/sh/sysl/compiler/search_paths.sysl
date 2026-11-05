@@ -64,6 +64,7 @@ reset_search_paths()
     sp_no_error_traces = false
     sp_build_mode = None
     sp_const_steps = None
+    sp_error_limit = None
     sp_general_regs_only = false
     sp_strict_align = false
     forget_link_notes()
@@ -111,6 +112,25 @@ private const_steps_operand(text: string) -> Option[long]
     if digits == 0 || n == 0 then None else Some(n)
 end const_steps_operand
 
+// What `--error-limit <n>` gave: how many errors a failed compilation reports (`diag.sysl`), `0` for
+// every one of them.
+private var sp_error_limit: Option[usize] = None
+
+error_limit_flag() -> Option[usize] = sp_error_limit
+
+// The operand of `--error-limit`: a count of errors in decimal, `0` included. Anything else is the
+// command line's usage error.
+private error_limit_operand(text: string) -> Option[usize]
+    var n: usize = 0
+
+    for b in text.bytes
+        if b < u8('0') || b > u8('9') || n > 100000000 then return None
+
+        n = n * 10 + usize(b - u8('0'))
+
+    if text.is_empty() then None else Some(n)
+end error_limit_operand
+
 // Whether `--general-regs-only` and `--strict-align` were given. Each turns its setting on whatever
 // the root manifest's `codegen` block says (`codegen_features.sysl`); there is no flag to turn one off.
 private var sp_general_regs_only: bool = false
@@ -126,8 +146,8 @@ private var sp_link_mode: Option[LinkMode] = None
 
 link_flag() -> Option[LinkMode] = sp_link_mode
 
-// The refusal for a `--link` whose operand names an empty library, or a `--const-steps` whose operand
-// is not a count, said before any command reads its own flags -- every command takes the flag, so every command refuses it the same way. Arguments
+// The refusal for a `--link` whose operand names an empty library, or a `--const-steps` or
+// `--error-limit` whose operand is not a count, said before any command reads its own flags -- every command takes the flag, so every command refuses it the same way. Arguments
 // after a `--` are the program's and are not looked at.
 link_flag_refusal(args: []string) -> Option[string]
     for i in 0..<args.len
@@ -142,6 +162,11 @@ link_flag_refusal(args: []string) -> Option[string]
         if args[i] == "--const-steps" && i + 1 < args.len && const_steps_operand(args[i + 1]).is_none()
             return Some(s"'--const-steps' takes how many steps a compile-time evaluation may run, a " +
                         s"whole number above zero, and '${args[i + 1]}' is not one")
+        end if
+
+        if args[i] == "--error-limit" && i + 1 < args.len && error_limit_operand(args[i + 1]).is_none()
+            return Some(s"'--error-limit' takes how many errors to show, a whole number with '0' for " +
+                        s"all of them, and '${args[i + 1]}' is not one")
         end if
 
     None
@@ -477,6 +502,16 @@ took_search_flag(args: []string, i: usize) -> int
 
         const_steps_operand(args[i + 1]) match
             Some(n) -> sp_const_steps = Some(n)
+            None -> return 0
+
+        return 2
+    end if
+
+    if arg == "--error-limit"
+        if i + 1 >= args.len then return 0
+
+        error_limit_operand(args[i + 1]) match
+            Some(n) -> sp_error_limit = Some(n)
             None -> return 0
 
         return 2
