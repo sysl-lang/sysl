@@ -428,6 +428,35 @@ e match
 none
 ```
 
+**A bare result standing where a `&T` is wanted is the `&T`**, whether the position is a `&T`
+parameter or a binding declared `&T`, so the call hands back the reference it was given rather than
+a box of a copy. An argument that settles the parameter first still wins, and where the parameter's
+own bounds refuse the `&T` (`make[P: Zero]() -> P` at a `&int`), it is read at the `T` and the
+position boxes what comes back:
+
+```sysl
+struct Mark
+    n: int
+
+pick[P](r: &Mark) -> P
+    if const P::Kind == Kind.Ref
+        r
+    else
+        *r
+
+bump(t: &Mark)
+    t.n += 1
+
+val m: &Mark = Mark(9)
+bump(pick(m))
+val same: &Mark = pick(m)
+print(m.n, same === m)
+```
+
+```output
+10 true
+```
+
 **The expected type reaches through a form that unwraps.** What `?`, `.unwrap()`, `.expect(msg)`,
 `.unwrap_or(d)` and `.unwrap_or_else(f)` yield is the success half of an `Option` or `Result`, so
 what their position wants is what that half is solved as. A `match` whose arm is `Some(v) -> v` or

@@ -1,0 +1,209 @@
+module sh.sysl.compiler
+@tests
+
+// A generic call whose result is a bare type parameter, standing where a `&T` is wanted, settles the
+// parameter at the `&T`, as rustc does. The position reads what stands there at its `T` and boxes what
+// comes back, and the parameter used to be settled at that `T`: `bump(pick(m))` with `pick[P](r:
+// &Mark) -> P` handed `bump` a box of a COPY of `m`, so the mutation was lost, and at a type with a
+// `Drop` the call was refused for binding `P` by value. An argument that settles the parameter still
+// wins, and a box the parameter's own bounds refuse leaves the `T` to be boxed.
+
+// What a refused program said, or nothing where it built.
+private rbi_refusal(text: string) -> string
+    rng_ran(text) match
+        Err(why) -> why
+        Ok(_) -> ""
+
+// How many complaints a report holds.
+private rbi_count(said: string) -> usize
+    var n: usize = 0
+    var rest = said
+
+    loop
+        rest.index_of("error: ") match
+            Some(at) ->
+                n += 1
+                rest = rest[at + 7..<rest.bytes.len]
+            None -> return n
+end rbi_count
+
+// `text` is refused with exactly one complaint, `message`.
+private rbi_refused(text: string, message: string)
+    if !rng_ready() then return
+
+    val said = rbi_refusal(text)
+
+    assert_eq(rbi_count(said), 1)
+    assert(said.contains(s"error: $message\n"), s"no '$message' in:\n$said")
+end rbi_refused
+
+private val rbi_decls = raw"""
+    struct Mark
+        n: i64
+
+    struct Bar
+        k: i64
+
+    struct Tally
+        n: i64
+
+    impl Drop for Tally
+        drop(self) = print("drop", self.n)
+
+    pick[P](r: &Mark) -> P
+        if const P::Kind == Kind.Ref
+            r
+        elif const P::Kind == Kind.Pointer
+            &*r
+        else
+            *r
+
+    pick_tally[P](r: &Tally) -> P
+        if const P::Kind == Kind.Ref
+            r
+        elif const P::Kind == Kind.Pointer
+            &*r
+        else
+            *r
+
+    same[P](x: P) -> P = x
+
+    bump(t: &Mark)
+        t.n += 1
+
+    """
+
+@test("a &T parameter settles a bare P at the &T, so the callee mutates the caller's object")
+rbi_a_ref_parameter_reaches_the_original() =
+    if !rng_ready() then return
+
+    rng_prints(rbi_decls + raw"""
+        val m: &Mark = Mark(9)
+        bump(pick(m))
+        print("original is", m.n)
+        """, "original is 10\n")
+
+@test("a type with a Drop at a &T or *T parameter settles P at the box rather than being refused")
+rbi_a_drop_type_is_not_refused() =
+    if !rng_ready() then return
+
+    rng_prints(rbi_decls + raw"""
+        by_ref(t: &Tally) -> i64 = t.n
+        by_ptr(t: *Tally) -> i64 = t.n
+
+        val t: &Tally = Tally(5)
+        print(by_ref(pick_tally(t)), by_ptr(pick_tally(t)))
+        val again: &Tally = pick_tally(t)
+        print(again === t)
+        """, "5 5\ntrue\ndrop 5\n")
+
+@test("val x: &T = pick(m) is the same object, and a *T parameter reaches it too")
+rbi_a_binding_and_a_pointer() =
+    if !rng_ready() then return
+
+    rng_prints(rbi_decls + raw"""
+        bump_ptr(t: *Mark)
+            t.n += 100
+
+        val m: &Mark = Mark(1)
+        val x: &Mark = pick(m)
+        x.n += 1
+        print(x === m, m.n)
+        bump_ptr(pick(m))
+        print(m.n)
+        """, "true 2\n102\n")
+
+@test("a &sync T parameter settles P at the &sync T")
+rbi_a_sync_reference() =
+    if !rng_ready() then return
+
+    rng_prints(rbi_decls + raw"""
+        pick_sync[P](r: &sync Mark) -> P
+            if const P::Kind == Kind.Ref
+                r
+            else
+                *r
+
+        same_object(t: &sync Mark, s: &sync Mark) -> bool = t === s
+
+        val s: &sync Mark = Mark(3)
+        print(same_object(pick_sync(s), s))
+        """, "true\n")
+
+@test("a plain T still settles P by value, and Option[&T] settles it at the &T")
+rbi_a_value_and_an_option() =
+    if !rng_ready() then return
+
+    rng_prints(rbi_decls + raw"""
+        pick_opt[P](r: &Mark) -> Option[P]
+            if const P::Kind == Kind.Ref
+                Some(r)
+            else
+                Some(*r)
+
+        val m: &Mark = Mark(5)
+        var v: Mark = pick(m)
+        v.n = 0
+        print(m.n, v.n)
+        val o: Option[&Mark] = pick_opt(m)
+        o.unwrap().n += 1
+        print(m.n)
+        """, "5 0\n6\n")
+
+@test("a generic method and a nested generic call settle P at the &T")
+rbi_a_method_and_a_nested_call() =
+    if !rng_ready() then return
+
+    rng_prints(rbi_decls + raw"""
+        struct Holder
+            m: &Mark
+
+        impl Holder
+            get[P](self) -> P
+                if const P::Kind == Kind.Ref
+                    self.m
+                else
+                    *self.m
+
+        val m: &Mark = Mark(0)
+        bump(Holder(m).get())
+        print(m.n)
+        bump(same(pick(m)))
+        print(m.n)
+        """, "1\n2\n")
+
+@test("an argument that settles P wins over the &T: a value is copied and then boxed")
+rbi_an_argument_wins() =
+    if !rng_ready() then return
+
+    rng_prints(rbi_decls + raw"""
+        var v = Mark(1)
+        bump(same(v))
+        print(v.n)
+        """, "1\n")
+
+@test("an argument settling P at another reference is still refused at the &T parameter")
+rbi_an_argument_that_disagrees() =
+    rbi_refused(rbi_decls + raw"""
+        val b: &Bar = Bar(1)
+        bump(same(b))
+        """, "'t' of 'bump' is &Mark, but &Bar was given")
+
+@test("a literal that cannot be the &T the position settled P at is refused at the argument")
+rbi_a_literal_that_cannot_be_the_box() =
+    rbi_refused(rbi_decls + raw"""
+        bump(same(5))
+        """, "'x' of 'same' is &Mark, but int was given")
+
+@test("a box P's bounds refuse leaves P at the T, and a callable yielding a value still boxes it")
+rbi_a_bound_the_box_does_not_meet() =
+    if !rng_ready() then return
+
+    rng_prints(rbi_decls + raw"""
+        make[P: Zero]() -> P = P.zero()
+        apply[T](f: () -> T) -> T = f()
+
+        val z: &int = make()
+        val w: &u8 = apply(() -> 5)
+        print(*z, *w)
+        """, "0 5\n")
