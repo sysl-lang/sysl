@@ -1,0 +1,300 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.Buf
+import sysl.fs.remove_dir_all
+import sysl.process.capture
+
+// **A module-qualified type name answers every type attribute its bare spelling does**
+// (`reference/modules.md`: a member is always reachable by its full path, and an import only
+// shortens it). `geo.Point::Kind` is `Point::Kind` after `import geo.Point`, as Rust's
+// `size_of::<geo::Point>()` is. A path whose head a value binds is a member read, and stays refused
+// as a value's left side.
+//
+// The axes: the kind of type (struct, simple and data enum, trait, ranged subtype, integer alias,
+// generic with its arguments), the attribute (every one `reference/reflection.md` and the enum and
+// subtype pages list), the depth of the path (`geo.T`, `a.b.T`), where it is asked (an expression,
+// a call, an `if const`, a `for const`, a `for` over `::Range`, a type position), and what the path
+// names when it is no type (a function, a module, nothing, a private type, a local's field).
+
+// -- the harness ----------------------------------------------------------------------------------
+
+// What a program of these files prints, then its exit status; what the build said where it refused.
+private qat_out(main: string) -> string
+    var files = im_files()
+
+    files.push(("", "main.sysl", main))
+    files.push(("geo", "geo.sysl", qat_geo()))
+    files.push(("a.b", "b.sysl", "module a.b\n\nstruct T\n    v: int\n"))
+
+    val root = im_write(files)
+    val exe = root + "/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            val said = failure_text(why)
+
+            remove_dir_all(root).unwrap_or(())
+            return said
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true, 20000)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.status match
+            Exited(code) -> out.text + "[exit " + code.to_string() + "]"
+            _ -> out.text + "[did not exit]"
+end qat_out
+
+private qat_geo() -> string = raw"""
+    module geo
+
+    struct Point
+        x: int
+        y: int
+
+    impl Point
+        sum(self) -> int = self.x + self.y
+
+    enum Light
+        Red
+        Green
+        Blue
+
+    enum Shape
+        Dot
+        Circle(r: int)
+
+    trait Area
+        area(self) -> int
+
+    struct Pair[T]
+        a: T
+        b: T
+
+    type Small = int within 1..3
+
+    type Byte = u8
+
+    @annotation
+    struct label
+        text: string
+
+    @label("a user")
+    struct User
+        id: int
+
+    private struct Secret
+        k: int
+
+    area(p: Point) -> int = p.x * p.y
+
+    """
+
+private qat_refused(said: string, message: string, at: string)
+    assert(said.contains("error: " + message + "\n --> ") || said.contains("error: " + message + "\n  --> "),
+           said)
+    assert(said.contains(at + "\n"), said)
+
+// -- what a qualified name answers ----------------------------------------------------------------
+
+@test("a qualified struct answers Kind, Name, BaseName and Id as its imported spelling does")
+qat_a_struct_names_itself()
+    if im_can_run() then return
+
+    assert_eq(qat_out(raw"""
+        import geo
+        import geo.Point
+
+        main()
+            print(Kind::Image(geo.Point::Kind), geo.Point::Name, geo.Point::BaseName)
+            print(Kind::Image(Point::Kind), Point::Name, Point::BaseName)
+            print(geo.Point::Id == Point::Id, geo.Point::Id != geo.Light::Id)
+
+        """), "Struct geo.Point Point\nStruct geo.Point Point\ntrue true\n[exit 0]")
+
+@test("a qualified struct walks its Fields and Members, and builds from its Partial with Make")
+qat_a_struct_reflects()
+    if im_can_run() then return
+
+    assert_eq(qat_out(raw"""
+        import geo
+
+        main()
+            for const f in geo.Point::Fields
+                print(f.name, f::Type::Name)
+            for const m in geo.Point::Members
+                print(m.name)
+            var p: geo.Point::Partial
+            p.0 = Some(3)
+            p.1 = Some(4)
+            print(geo.Point::Make(p).sum())
+
+        """), "x int\ny int\nx\ny\n7\n[exit 0]")
+
+@test("a qualified enum answers its Kind, ends, positions, images and Variants, and Make builds one")
+qat_an_enum_answers()
+    if im_can_run() then return
+
+    assert_eq(qat_out(raw"""
+        import geo
+
+        main()
+            print(Kind::Image(geo.Light::Kind), Kind::Image(geo.Shape::Kind), geo.Light::Name)
+            print(geo.Light::First, geo.Light::Last, geo.Light::Pos(geo.Light.Green))
+            print(geo.Light::Image(geo.Light::Val(2)), geo.Light::Value("Red"))
+            for const c in geo.Shape::Variants
+                if const c::Fields.len == 1
+                    print(c.name, geo.Shape::Make(c, 7))
+                else
+                    print(c.name)
+
+        """), "SimpleEnum DataEnum geo.Light\nLight.Red Light.Blue 1\nBlue Light.Red\nDot\n" +
+              "Circle Shape.Circle(r: 7)\n[exit 0]")
+
+@test("a qualified trait answers Trait, its qualified Name and its BaseName")
+qat_a_trait_answers()
+    if im_can_run() then return
+
+    assert_eq(qat_out("import geo\n\nmain()\n    print(Kind::Image(geo.Area::Kind), geo.Area::Name, " +
+                      "geo.Area::BaseName)\n"),
+              "Trait geo.Area Area\n[exit 0]")
+
+@test("a qualified ranged subtype answers its ends, Valid and Succ, and a for walks its Range")
+qat_a_subtype_answers()
+    if im_can_run() then return
+
+    assert_eq(qat_out(raw"""
+        import geo
+
+        main()
+            print(geo.Small::First, geo.Small::Last, geo.Small::Valid(5), geo.Small::Succ(geo.Small(1)))
+            for s in geo.Small::Range
+                print(s)
+
+        """), "1 3 false 2\n1\n2\n3\n[exit 0]")
+
+@test("a qualified alias of an integer answers the extremes the integer holds")
+qat_an_integer_alias_answers()
+    if im_can_run() then return
+
+    assert_eq(qat_out("import geo\n\nmain()\n    print(geo.Byte::Min, geo.Byte::Max)\n"), "0 255\n[exit 0]")
+
+@test("a qualified type answers its Annotation")
+qat_an_annotation_answers()
+    if im_can_run() then return
+
+    assert_eq(qat_out("import geo\n\nmain()\n    print(geo.User::Annotation[geo.label].map(l -> l.text)" +
+                      ".unwrap_or(\"-\"), geo.Point::Annotation[geo.label].is_some())\n"),
+              "a user false\n[exit 0]")
+
+@test("a type two modules deep answers through its whole path")
+qat_a_nested_path_answers()
+    if im_can_run() then return
+
+    assert_eq(qat_out(raw"""
+        import a.b
+
+        main()
+            print(Kind::Image(a.b.T::Kind), a.b.T::Name, a.b.T::BaseName)
+            for const f in a.b.T::Fields
+                print(f.name)
+
+        """), "Struct a.b.T T\nv\n[exit 0]")
+
+@test("a qualified generic type with its arguments answers, its arguments in Name and not in BaseName")
+qat_a_generic_instance_answers()
+    if im_can_run() then return
+
+    assert_eq(qat_out(raw"""
+        import geo
+
+        main()
+            print(Kind::Image(geo.Pair[int]::Kind), geo.Pair[int]::Name, geo.Pair[int]::BaseName)
+            for const f in geo.Pair[bool]::Fields
+                print(f.name, f::Type::Name)
+
+        """), "Struct geo.Pair[int] Pair\na bool\nb bool\n[exit 0]")
+
+@test("an if const over a qualified name keeps its arm, and a qualified type argument answers in the body")
+qat_if_const_over_a_qualified_name()
+    if im_can_run() then return
+
+    assert_eq(qat_out(raw"""
+        import geo
+
+        which[T]() -> string
+            if const T::Kind == Kind.Struct then "struct" else "other"
+
+        main()
+            if const geo.Point::Kind == Kind.Struct
+                print("kept")
+            else
+                print("discarded")
+            if const geo.Light::Kind == Kind.Struct
+                print("kept")
+            else
+                print("discarded")
+            print(which[geo.Point](), which[geo.Light]())
+
+        """), "kept\ndiscarded\nstruct other\n[exit 0]")
+
+// -- what a qualified name is refused -------------------------------------------------------------
+
+@test("a qualified function, a module and a missing name have no type attributes, as their bare spellings")
+qat_not_a_type_is_refused()
+    val said = qat_out(raw"""
+        import geo
+        import geo.area
+
+        main()
+            print(geo.area::Kind)
+            print(area::Kind)
+            print(geo::Kind)
+            print(geo.Nope::Kind)
+
+        """)
+
+    qat_refused(said, "'geo.area' has no type attributes", "print(geo.area::Kind)")
+    qat_refused(said, "'area' has no type attributes", "print(area::Kind)")
+    qat_refused(said, "'geo' has no type attributes", "print(geo::Kind)")
+    qat_refused(said, "'geo.Nope' has no type attributes", "print(geo.Nope::Kind)")
+
+@test("a private type reached through a qualified path is refused for its privacy")
+qat_a_private_type_is_refused()
+    val said = qat_out("import geo\n\nmain()\n    print(geo.Secret::Kind)\n")
+
+    assert(said.contains("error: 'geo.Secret' is private to '"), said)
+    assert(said.contains("geo.sysl', the file that declares it\n"), said)
+    assert(said.contains("print(geo.Secret::Kind)\n"), said)
+
+@test("a qualified generic type without its arguments, and a qualified trait's Fields, are refused")
+qat_generic_bare_and_trait_layout_refused()
+    val said = qat_out("import geo\n\nmain()\n    print(geo.Pair::Kind)\n    print(geo.Area::Fields)\n")
+
+    qat_refused(said, "'geo.Pair' is generic, so 'geo.Pair::Kind' has no single type to read — write " +
+                "the arguments, 'geo.Pair[…]::Kind'", "print(geo.Pair::Kind)")
+    qat_refused(said, "'geo.Area' is a trait, so it describes behaviour rather than a layout — write " +
+                "'*geo.Area' or '&geo.Area' for a trait object, or bound a type parameter with " +
+                "'[T: geo.Area]'", "print(geo.Area::Fields)")
+
+@test("a path whose head is a local is a member read, so it is refused as a value's left side")
+qat_a_local_head_is_a_value()
+    val said = qat_out(raw"""
+        import geo
+
+        main()
+            val p = geo.Point(1, 2)
+            print(p.x::Kind)
+            val geo = geo.Point(3, 4)
+            print(geo.Point::Kind)
+
+        """)
+
+    qat_refused(said, "'::Kind' is a type attribute, so its left side must be a type name",
+                "print(p.x::Kind)")
+    qat_refused(said, "'::Kind' is a type attribute, so its left side must be a type name",
+                "print(geo.Point::Kind)")

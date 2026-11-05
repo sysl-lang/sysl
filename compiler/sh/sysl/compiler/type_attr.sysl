@@ -19,7 +19,7 @@ import sysl.math.decimal.{Decimal, rescale, Rounding}
 
 // `T::Attr`, with no arguments.
 type_attr_expr(cx: &Analyzer, span: Span, receiver: Expr, attr: string) -> TExpr
-    val name = attr_type_name(receiver)
+    val name = attr_type_name(cx, receiver)
 
     // `Box[int]::Fields`, `Pair[u8]::Id` -- an attribute asked of an instance written out in place,
     // as a selection after `Box[int]` already is.
@@ -164,8 +164,13 @@ private attr_of_type(cx: &Analyzer, span: Span, written: string, attr: string, a
 end attr_of_type
 
 // The written name a type attribute is asked of, where the left side is one.
-attr_type_name(receiver: Expr) -> Option[string] = *receiver.kind match
+//
+// **A dotted path is one name to the type grammar**, so `geo.Point::Kind` asks what `geo.Point`
+// names exactly as `Point::Kind` does after `import geo.Point`; a path whose head a value binds is a
+// member read, and is left to the value reading.
+attr_type_name(cx: &Analyzer, receiver: Expr) -> Option[string] = *receiver.kind match
     Ident(n) -> Some(n)
+    Field(_, _, _) -> dotted_name_written(cx, receiver)
     // `f::Type::Kind`, `c::Payload::Fields` -- a descriptor's projection is a type a copy bound under
     // that spelling (`descriptor_bindings`), so it is asked as the name it was bound to.
     TypeAttr(inner, a, _, _) -> *inner.kind match
@@ -235,7 +240,7 @@ end attr_subject
 // constrained subtype walks that subtype's range. An `Err` is the refusal.
 range_subject(cx: &Analyzer, span: Span, iter: Expr) -> Option[Result[(Type, BigInt, BigInt), TExpr]]
     val written = *iter.kind match
-        TypeAttr(receiver, attr, _, _) -> if attr == "Range" then attr_type_name(receiver) else None
+        TypeAttr(receiver, attr, _, _) -> if attr == "Range" then attr_type_name(cx, receiver) else None
         _ -> None
 
     if written.is_none() || cx.lookup(written.unwrap()).is_some() then return None
