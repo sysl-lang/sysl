@@ -1,0 +1,156 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// **The result of a call may itself be called** (`reference/types.md § Function types`). A closure's
+// own type is a struct whose `call` takes `*self`, and a call's result has no address, so the call
+// is given a slot to be made through, as Rust gives a temporary receiver one. A `&Fn` result was
+// already a dereference, which is a place; the cells below cover both, so a change to either path
+// shows here.
+//
+// Axes: what produces the callable (a closure's call, a call of that, an element of a returned
+// array, a function, a method, a named function taken as a value); what it captures (nothing, a
+// scalar, an owned string, a handle written through); how often the temporary is made (once,
+// twice in one statement). Every program runs on the counted heap, so a capture the slot fails to
+// give back is a line on stderr and a failed test. The other `*self` members keep their refusal on
+// a temporary, since there the write is the point. Cells skipped, with the reason: generic callables
+// (a generic function cannot hand back a closure's own type, only `&Fn`, which is the place path).
+
+// The program built with the counted heap and run: everything it said, and whether it exited zero.
+private crc_counted(text: string) -> (string, bool)
+    val root = make_temp_dir("sysl-crc").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", forms_imported(text)).unwrap()
+    force_alloc_counting(true)
+
+    val built = build_native_program(s"$root/main.sysl", None, None, DefaultOptimization,
+                                     Some(s"$root/built"))
+
+    force_alloc_counting(false)
+
+    built match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (failure_text(why), false)
+        Ok(_) -> ()
+
+    val said = capture(s"$root/built", [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> ("could not be started", false)
+        Ok(o) -> (o.text + o.err.unwrap_or(""), o.status.ok())
+end crc_counted
+
+@test("a closure handed back by a closure is called where it is produced")
+crc_closure_result_called()
+    if !enm_ready() then return
+
+    val out = crc_counted(raw"""
+        val k = (x: int) -> x + 1
+        val m = () -> k
+
+        print(m()(4))
+        """)
+
+    assert(out.1, out.0)
+    assert_eq(out.0, "5\n")
+
+@test("a chain of calls of call results reaches the innermost closure")
+crc_chain_called()
+    if !enm_ready() then return
+
+    val out = crc_counted(raw"""
+        val chain = () -> () -> (x: int) -> x + 100
+        val deeper = () -> () -> () -> (x: int) -> x * 2
+
+        print(chain()()(1), deeper()()()(21))
+        """)
+
+    assert(out.1, out.0)
+    assert_eq(out.0, "101 42\n")
+
+@test("an element of a returned array of closures is called")
+crc_array_element_called()
+    if !enm_ready() then return
+
+    val out = crc_counted(raw"""
+        val k = (x: int) -> x + 1
+        val arr = () -> [k, k]
+
+        print(arr()[0](3), arr()[1](4))
+        """)
+
+    assert(out.1, out.0)
+    assert_eq(out.0, "4 5\n")
+
+@test("a capturing closure called twice through a temporary: right values, nothing left on the heap")
+crc_capturing_twice()
+    if !enm_ready() then return
+
+    val out = crc_counted(raw"""
+        import sysl.buf.{Buf, buf}
+
+        val n = 7
+        val mm = () -> (x: int) -> x + n
+        val s = "ab"
+        val ms = () -> (x: string) -> s + x
+        val seen: Buf[int] = buf()
+        val counter = () -> (x: int) ->
+            seen.push(x)
+            seen.len()
+
+        print(mm()(1), mm()(2))
+        print(ms()("c"), ms()("d"))
+        print(counter()(1), counter()(2), seen.len())
+        """)
+
+    assert(out.1, out.0)
+    assert_eq(out.0, "8 9\nabc abd\n1 2 2\n")
+
+@test("a '&Fn' from a function, a method, a named function and an array is called where it is produced")
+crc_fn_results_called()
+    if !enm_ready() then return
+
+    val out = crc_counted(raw"""
+        struct Holder
+            n: int
+
+        impl Holder
+            get(self) -> &Fn(int) -> int = (x: int) -> x + self.n
+
+        inc(x: int) -> int = x + 1
+        make() -> &Fn(int) -> int = (x: int) -> x * 10
+        pick() -> &Fn(int) -> int = inc
+        fs() -> [2]&Fn(int) -> int = [make(), inc]
+
+        print(make()(4), Holder(5).get()(2), pick()(6), fs()[0](3), fs()[1](3))
+        """)
+
+    assert(out.1, out.0)
+    assert_eq(out.0, "40 7 7 30 4\n")
+
+@test("a '*self' member other than the call is still refused on a call's result")
+crc_other_ptr_member_refused()
+    if !enm_ready() then return
+
+    val out = crc_counted(raw"""
+        struct Cell
+            v: int
+
+        impl Cell
+            bump(*self)
+                self.v += 1
+
+        mk() -> Cell = Cell(1)
+
+        mk().bump()
+        """)
+
+    assert(!out.1, s"it built and ran: ${out.0}")
+    assert(out.0.contains("'*self' needs a variable, field, or dereference to point at — this " +
+                          "receiver has no address"), out.0)
