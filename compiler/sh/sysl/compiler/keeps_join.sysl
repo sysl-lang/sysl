@@ -231,14 +231,14 @@ join_clear(hs: &Handles, evs: &EvBuf, name: string, args: Buf[TExpr], at: Span)
 
     val k = handle_key(hs, args[0])
 
-    if k != "" then evs.items.push(FlowEv(true, s"j:$k", "", at))
+    if k != "" then evs.items.push(cleared_ev(s"j:$k", at))
 end join_clear
 
 // An `await` or a `block_on` runs its task to its end, which lets go of what the task held.
 await_clear(hs: &Handles, evs: &EvBuf, task: TExpr, at: Span)
     val k = handle_key(hs, task)
 
-    if k != "" then evs.items.push(FlowEv(true, s"j:$k", "", at))
+    if k != "" then evs.items.push(cleared_ev(s"j:$k", at))
 end await_clear
 
 // A way on which a handle is known to be `None` holds no thread: the arm `None` matches, or the way
@@ -253,7 +253,7 @@ arm_clears(hs: &Handles, subject: TExpr, p: TPattern, matched: bool) -> Buf[Flow
         TVariantPattern(_, v, _) -> v.name
         _ -> ""
 
-    if (matched && word == "None") || (!matched && word == "Some") then out.push(FlowEv(true, s"j:$k", "", subject.span))
+    if (matched && word == "None") || (!matched && word == "Some") then out.push(cleared_ev(s"j:$k", subject.span))
 
     out
 end arm_clears
@@ -272,9 +272,9 @@ end calls_member
 private unwraps(name: string) -> bool = calls_member(name, "unwrap") || calls_member(name, "expect")
 
 // Whether a statement's events already hold this keep, at this argument.
-said_already(evs: &EvBuf, loc: string, at: Span) -> bool
+said_already(evs: &EvBuf, loc: string, by: TExpr) -> bool
     for ev in evs.items
-        if !ev.clear && ev.loc == loc && ev.at == at then return true
+        if !ev.clear && ev.loc == loc && same_site(kept_at(ev, loc), KeptAt(loc, "", by.span, node_id(by))) then return true
 
     false
 end said_already
@@ -577,7 +577,7 @@ private fan_element(sc: &FanScan, hs: &Handles, coll: string, index: TExpr, suff
     val loc = s"$coll[]$suffix"
 
     fan_named(sc, loc, coll, suffix).ranges.push(cx.range)
-    hs.fan_hooks.push((cx.hook, FlowEv(false, s"j:$loc", FAN_ROUND, cx.hook)))
+    hs.fan_hooks.push((cx.hook, FlowEv(false, s"j:$loc", FAN_ROUND, cx.hook, 0)))
     hs.fan_at.push((at, loc, ""))
 end fan_element
 
@@ -650,7 +650,7 @@ private fan_settle(sc: &FanScan, hs: &Handles)
 
             if l.fault == "" && holds_string(l.suffixes, f.suffix) && fan_covers(l, f)
                 released = true
-                hs.fan_hooks.push((l.hook, FlowEv(true, s"j:${f.loc}", "", l.hook)))
+                hs.fan_hooks.push((l.hook, cleared_ev(s"j:${f.loc}", l.hook)))
             else if why == ""
                 why = loop_why(l, f)
             end if
@@ -663,7 +663,7 @@ private fan_settle(sc: &FanScan, hs: &Handles)
 
         for w in sc.writes
             if w.1 == f.coll || f.coll.starts_with(w.1 + ".")
-                hs.fan_hooks.push((w.0, FlowEv(false, s"j:${f.loc}", FAN_ROUND, w.0)))
+                hs.fan_hooks.push((w.0, FlowEv(false, s"j:${f.loc}", FAN_ROUND, w.0, 0)))
             end if
 
         // **An element stored over loses the handle it held**: anything stored into an element of the
@@ -673,9 +673,9 @@ private fan_settle(sc: &FanScan, hs: &Handles)
             if e.1 == f.coll
                 if e.2 || fan_turn(hs, f, e.3) then continue
 
-                hs.fan_hooks.push((e.0, FlowEv(false, s"j:${f.loc}", FAN_ROUND, e.0)))
+                hs.fan_hooks.push((e.0, FlowEv(false, s"j:${f.loc}", FAN_ROUND, e.0, 0)))
             else if fan_shared(sc, e.1, f.coll)
-                hs.fan_hooks.push((e.0, FlowEv(false, s"j:${f.loc}", s"$FAN_ROUND|${e.1}", e.0)))
+                hs.fan_hooks.push((e.0, FlowEv(false, s"j:${f.loc}", s"$FAN_ROUND|${e.1}", e.0, 0)))
             end if
 
     // A loop joining every element itself releases whatever the collection holds -- a call that answered
@@ -688,7 +688,7 @@ private fan_settle(sc: &FanScan, hs: &Handles)
         for f in sc.fans
             if f.coll == l.coll && f.suffix != "" then fields = true
 
-        if !fields then hs.fan_hooks.push((l.hook, FlowEv(true, s"j:${l.coll}", "", l.hook)))
+        if !fields then hs.fan_hooks.push((l.hook, cleared_ev(s"j:${l.coll}", l.hook)))
 end fan_settle
 
 // Whether the counting loop whose head is at `hook` is one that stores the fan-out's handles, so that
@@ -763,21 +763,21 @@ fan_event(pending: *Buf[KeptAt], ev: FlowEv) -> bool
         val why = fan_round_why(coll, through)
 
         for p in *pending
-            out.push(if p.loc == ev.loc then KeptAt("", p.how + why, p.at) else p)
+            out.push(if p.loc == ev.loc then KeptAt("", p.how + why, p.at, p.site) else p)
 
         *pending = out
         return true
     end if
 
     if ev.loc.index_of("[+]").is_some()
-        add_kept(pending, KeptAt(ev.loc, ev.how, ev.at))
+        add_kept(pending, kept_at(ev, ev.loc))
         return true
     end if
 
     if ev.loc.index_of("[]").is_none() then return false
 
     for p in *pending
-        if p.loc == ev.loc then return p.at == ev.at
+        if p.loc == ev.loc then return same_site(p, kept_at(ev, ev.loc))
 
     false
 end fan_event
