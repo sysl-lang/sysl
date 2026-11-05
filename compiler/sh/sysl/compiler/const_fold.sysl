@@ -157,13 +157,13 @@ const_fold(cx: &Analyzer, e: Expr) -> Option[Const] = *e.kind match
     //
     // Two values the fold holds but cannot compare itself -- two variants, `Op.Add == Op.Sub`, or a
     // value parameter of an enum against one -- are compared by running the comparison, as a `const`
-    // function's body would.
+    // function's body would. A chain, `a < b <= c`, is typed and run whole the same way.
     Compare(operands, ops) ->
         if operands.len() == 2 && ops.len() == 1 then
             if reflects(operands[0]) || reflects(operands[1]) then reflected(cx, e)
             else const_compare(cx, e, ops[0], operands[0], operands[1])
-        else
-            None
+        else if reflects(e) then reflected(cx, e)
+        else const_chain(cx, e, operands)
 
     // `T::Fields[1]` and `primes_below(10)[0]` -- an element of what a call or a type's make-up
     // answers, run with it.
@@ -252,6 +252,15 @@ private const_compare(cx: &Analyzer, e: Expr, op: string, l: Expr, r: Expr) -> O
 
     if is_record(const_fold(cx, l)) || is_record(const_fold(cx, r)) then const_run(cx, e, true) else None
 end const_compare
+
+// A chain, `a < b <= c`, over operands that each fold: typed and run whole, each link compared in
+// turn as the program compares it. One operand that does not fold leaves the chain unfolded.
+private const_chain(cx: &Analyzer, e: Expr, operands: Buf[Expr]) -> Option[Const]
+    for item in operands
+        if const_fold(cx, item).is_none() then return None
+
+    const_run(cx, e, true)
+end const_chain
 
 private is_record(v: Option[Const]) -> bool = v match
     Some(ConstRecord(_, _)) -> true
