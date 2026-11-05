@@ -12,7 +12,7 @@ import sysl.text.Search
 // (`borrowing.sysl`'s `sealed_callees`).
 //
 // What this pins down is slate's `peek_on(vm: *Machine, back: usize) -> Value =
-// vm.stack.at(vm.stack.len() - 1 - back)`. `Buf.at` reaches the bounds failure through `index_past`,
+// vm.stack[vm.stack.len() - 1 - back]`. A `Buf` subscript reaches the bounds failure through `index_past`,
 // which a program with an `@export` that releases used to distrust -- and then `Buf.at` copied its
 // `BufCore` (a count taken and given back on the storage, and a call to the reaper) around the read.
 // That put `peek_on` at an inline cost of 250, one call argument over the line once `@track_caller`
@@ -135,14 +135,14 @@ private sea_program(extra: string) -> string = raw"""
 
     var The: Machine = Machine(buf(), 0)
 
-    peek_on(vm: *Machine, back: usize) -> Value = vm.stack.at(vm.stack.len() - 1 - back)
+    peek_on(vm: *Machine, back: usize) -> Value = vm.stack[vm.stack.len() - 1 - back]
 
     @noinline
     run(vm: *Machine, code: Buf[int]) -> long
         var s: long = 0
 
         for pc in 0..<code.len()
-            val k = usize(code.at(pc))
+            val k = usize(code[pc])
 
             peek_on(vm, k) match
                 Int(v) -> s += v
@@ -159,7 +159,7 @@ private sea_program(extra: string) -> string = raw"""
     third(vm: *Machine) -> Value = vm.stack[2]
 
     poke(vm: *Machine, v: Value)
-        vm.stack.set(0, v)
+        vm.stack[0] = v
         vm.stack.insert(1, v)
         _ = vm.stack.remove(2)
 
@@ -193,8 +193,8 @@ private sea_releasing() -> string = raw"""
 // Each member a read or a write of a `Buf[Value]` goes through, and `at` on the `Buf[int]` of codes,
 // takes no count on the storage it reads: no copy of its `BufCore`, no dispose.
 private sea_no_snapshots(ir: string)
-    for name in ["sysl.buf$Buf.at.Value", "sysl.buf$Buf.at.int", "sysl.buf$Buf.index_place.Value",
-                 "sysl.buf$Buf.set.Value", "sysl.buf$Buf.insert.Value", "sysl.buf$Buf.remove.Value"]
+    for name in ["sysl.buf$Buf.index_place.Value", "sysl.buf$Buf.index_place.int",
+                 "sysl.buf$Buf.insert.Value", "sysl.buf$Buf.remove.Value"]
         val body = sea_func(ir, name)
 
         assert(body.starts_with("define"), body)
@@ -207,8 +207,8 @@ sea_no_storage_snapshot()
 
     if ir == "skipped" then return
 
-    // `at`, `b[i]`, `set`, `insert` and `remove` all reach `index_past` and nothing else that could
-    // release. `at` used to copy its `BufCore` around the read here.
+    // `b[i]`, `b[i] = v`, `insert` and `remove` all reach `index_past` and nothing else that could
+    // release.
     sea_no_snapshots(ir)
 
 @test("with no export, the same program copies no storage either")
@@ -287,7 +287,7 @@ sea_past_the_end_names_the_line()
 
         var The: Machine = Machine(buf())
 
-        peek_on(vm: *Machine, back: usize) -> int = vm.stack.at(back)
+        peek_on(vm: *Machine, back: usize) -> int = vm.stack[back]
 
         @export("sea_reset")
         reset()

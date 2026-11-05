@@ -9,7 +9,7 @@ import sysl.process.capture
 // A counted field read through a pointer -- `vm.stack` with `vm: *Machine` -- is handed to a call with
 // no count of the caller's own wherever the callee cannot write the place or let go of what holds it
 // (`borrowing.sysl`'s `untouched_by`, `emit_expr.sysl`'s `lends_in_place`). Slate's dispatch loop is
-// the shape: `vm.stack.push(vm.stack.at(base + i))` took and gave back a count of the stack's buffer
+// the shape: `vm.stack.push(vm.stack[base + i])` took and gave back a count of the stack's buffer
 // for the push, and another for the read, on every instruction.
 //
 // What lets it go now, each judged by the callee's body:
@@ -205,17 +205,17 @@ private pfz_machine() -> string = raw"""
 
     dup(vm: *Machine, n: usize)
         for i in 0..<n
-            vm.stack.push(vm.stack.at(i))
+            vm.stack.push(vm.stack[i])
 
     cross(vm: *Machine, n: usize)
         for i in 0..<n
-            vm.other.push(vm.stack.at(i))
+            vm.other.push(vm.stack[i])
 
     total(vm: *Machine) -> int
         var t = 0
 
         for i in 0..<vm.stack.len()
-            t += value_of(vm.stack.at(i))
+            t += value_of(vm.stack[i])
 
         t
 
@@ -258,7 +258,7 @@ private pfz_same_field() -> string = raw"""
         items: Buf[int]
 
     swap_out(s: *S) -> int
-        val first = s.items.at(0)
+        val first = s.items[0]
 
         s.items = buf()
         first
@@ -294,7 +294,7 @@ private pfz_loop_write() -> string = raw"""
         var t = 0
 
         for i in 0..<3
-            t += s.items.at(0)
+            t += s.items[0]
             s.items = buf()
             s.items.push(i + 10)
 
@@ -303,7 +303,7 @@ private pfz_loop_write() -> string = raw"""
     var s = S(buf())
 
     s.items.push(5)
-    print(churn(&s), s.items.at(0))
+    print(churn(&s), s.items[0])
     """
 
 @test("a write to the field in the loop leaves each read lent the buffer it then sees")
@@ -338,7 +338,7 @@ private pfz_aliasing() -> string = raw"""
         s.items.push(i)
 
     both(&s, &s)
-    print(s.items.len(), s.items.at(0))
+    print(s.items.len(), s.items[0])
     """
 
 @test("two pointers that may alias keep the count where a later argument writes through the other")
@@ -370,7 +370,7 @@ private pfz_closure() -> string = raw"""
 
     feed(p, () -> reset_to(p, 4))
     feed(p, () -> int(p.items.len()))
-    print(s.items.len(), s.items.at(0))
+    print(s.items.len(), s.items[0])
     """
 
 @test("a closure called as a later argument keeps the count, whatever it captured")
@@ -475,18 +475,18 @@ private pfz_places() -> string = raw"""
         e: E
 
     first(e: E) -> int = e match
-        Has(b) -> b.at(0)
+        Has(b) -> b[0]
         Nothing -> -1
 
     nested(p: *Outer)
         for i in 0..<3
-            p.mid.inner.b.push(p.mid.inner.b.at(i))
+            p.mid.inner.b.push(p.mid.inner.b[i])
 
     referenced(p: *Outer) -> int
         var t = 0
 
         for i in 0..<p.r.b.len()
-            t += p.r.b.at(i)
+            t += p.r.b[i]
 
         t
 
@@ -537,7 +537,7 @@ private pfz_generic() -> string = raw"""
 
     again[T](h: *Holder[T], n: usize)
         for i in 0..<n
-            h.b.push(h.b.at(i))
+            h.b.push(h.b[i])
 
     var hi: Holder[int] = Holder(buf())
     var hr: Holder[&Item] = Holder(buf())
@@ -586,7 +586,7 @@ private pfz_frozen() -> string = raw"""
         var s = 0
 
         for i in 0..<3
-            s += v.t.rows.at(i)
+            s += v.t.rows[i]
 
         s
 
@@ -614,7 +614,7 @@ pfz_a_sync_buffer_is_refused()
         struct H
             items: Buf[int]
 
-        look(h: &sync H, i: usize) -> int = h.items.at(i)
+        look(h: &sync H, i: usize) -> int = h.items[i]
         """)
 
     assert(out.contains("'&sync H' may be reached from two domains at once, so every count inside it " +
@@ -637,7 +637,7 @@ private pfz_exported() -> string = raw"""
     reset()
         G = S(buf())
 
-    read(s: *S, i: usize) -> int = s.items.at(i)
+    read(s: *S, i: usize) -> int = s.items[i]
 
     main()
         G.items.push(5)
@@ -662,7 +662,7 @@ private pfz_contracts() -> string = raw"""
     look(b: Buf[int], i: usize) -> int
         require i < b.len()
 
-        b.at(i)
+        b[i]
 
     poke(s: *S) -> bool
         s.items = buf()
