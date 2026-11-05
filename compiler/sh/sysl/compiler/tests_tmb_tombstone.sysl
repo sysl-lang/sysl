@@ -1,0 +1,273 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.encoding.json.{quoted as json_quote}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.Search
+
+// `@renamed` and `@removed` (`reference/attributes.md § @renamed and @removed`): a tombstone declares
+// nothing, and a use of the name it stands for is told what became of it -- in every position a type
+// or a function is named, through every way of reaching a module, and never where something the
+// program can see answers to the name first.
+//
+// The cells: a type tombstone named as an annotation, a constructor, a generic argument, an `impl`
+// subject, an import list and a qualified name; a function tombstone called, named as a value and
+// qualified; `@removed`; a declaration of the old name winning (the program's own, and another
+// wildcard's, which is not ambiguous); a function tombstone in a type position; a tombstone in a
+// dependency package; the grammar's refusals; `str(x)` beside it; and the range an editor shows.
+// Skipped: a tombstone inside a `--lib` root, which is reached by the same import machinery as a
+// dependency's.
+
+// The module every case below imports: a struct and its maker, the tombstones of their old names,
+// and one removed function.
+private tmb_old() -> string =
+    "module old\n\nstruct Point\n    x: int\n\nnew_point(x: int) -> Point = Point(x)\n\n" +
+    "@renamed(\"Point\", \"2.0\") type Pt\n@renamed(\"new_point\", \"2.0\") make_point()\n" +
+    "@removed(\"write 'p.x' instead\", \"2.0\") point_x()\n"
+
+private tmb_renamed_pt() -> string = "'Pt' was renamed to 'Point' in 2.0"
+
+private tmb_renamed_maker() -> string = "'make_point' was renamed to 'new_point' in 2.0"
+
+// What a project of `main.sysl` beside the module `old` prints, or what its build said instead.
+private tmb_out(main: string) -> string = tmb_files_out(tmb_with(main, buf()))
+
+private tmb_with(main: string, more: Buf[(string, string, string)]) -> Buf[(string, string, string)]
+    var fs = im_files()
+
+    fs.push(("", "main.sysl", main))
+    fs.push(("old", "old.sysl", tmb_old()))
+
+    for f in more
+        fs.push(f)
+
+    fs
+end tmb_with
+
+private tmb_files_out(files: Buf[(string, string, string)]) -> string
+    val root = im_write(files)
+    val said = tmb_built(root)
+
+    remove_dir_all(root).unwrap_or(())
+    said
+end tmb_files_out
+
+// What a build of `root` prints when run, or what it said instead.
+private tmb_built(root: string) -> string
+    val exe = root + "/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) -> return failure_text(why)
+        Ok(_) -> ()
+
+    capture(exe, [], "", [], true) match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end tmb_built
+
+// -- a renamed type, wherever a type is named ----------------------------------------------------
+
+@test("tmb: a renamed type is refused with its new name as an annotation, a constructor and a generic argument")
+tmb_type_positions()
+    if im_can_run() then return
+
+    assert(tmb_out("import old.*\n\nf(p: Pt) -> int = 0\n\nprint(f(new_point(1)))\n").contains(tmb_renamed_pt()))
+    assert(tmb_out("import old.*\n\nprint(Pt(1).x)\n").contains(tmb_renamed_pt()))
+    assert(tmb_out("import old.*\n\nf(p: Option[Pt]) -> int = 0\n\nprint(f(None))\n").contains(tmb_renamed_pt()))
+    assert(tmb_out("import old.*\n\nval ps: []Pt = []\n\nprint(ps.len)\n").contains(tmb_renamed_pt()))
+end tmb_type_positions
+
+@test("tmb: as an impl subject, in an import list, and written qualified")
+tmb_type_impl_import_qualified()
+    if im_can_run() then return
+
+    assert(tmb_out("import old.*\n\ntrait Show\n    show(self) -> int\n\nimpl Show for Pt\n    show(self) -> int = 1\n\nprint(1)\n")
+               .contains(tmb_renamed_pt()))
+    assert(tmb_out("import old.{Pt}\n\nprint(1)\n").contains(tmb_renamed_pt()))
+    assert(tmb_out("f(p: old.Pt) -> int = 0\n\nprint(f(old.new_point(1)))\n").contains(tmb_renamed_pt()))
+end tmb_type_impl_import_qualified
+
+// -- a renamed function --------------------------------------------------------------------------
+
+@test("tmb: a renamed function is refused with its new name as a call, as a value and qualified")
+tmb_function_positions()
+    if im_can_run() then return
+
+    assert(tmb_out("import old.*\n\nprint(make_point(1).x)\n").contains(tmb_renamed_maker()))
+    assert(tmb_out("import old.*\n\nval f = make_point\n\nprint(1)\n").contains(tmb_renamed_maker()))
+    assert(tmb_out("print(old.make_point(1).x)\n").contains(tmb_renamed_maker()))
+    assert(tmb_out("import old.{make_point}\n\nprint(1)\n").contains(tmb_renamed_maker()))
+end tmb_function_positions
+
+@test("tmb: a function's tombstone does not answer for a type, which stays unknown")
+tmb_function_tombstone_is_no_type()
+    if im_can_run() then return
+
+    val said = tmb_out("import old.*\n\nf(p: make_point) -> int = 0\n\nprint(1)\n")
+
+    assert(said.contains("unknown type 'make_point'"), said)
+    assert(!said.contains("renamed"), said)
+end tmb_function_tombstone_is_no_type
+
+@test("tmb: a removed function is refused with what to write instead")
+tmb_removed()
+    if im_can_run() then return
+
+    assert(tmb_out("import old.*\n\nprint(point_x())\n").contains("'point_x' was removed in 2.0: write 'p.x' instead"))
+    assert(tmb_out("import old.{point_x}\n\nprint(1)\n").contains("'point_x' was removed in 2.0: write 'p.x' instead"))
+end tmb_removed
+
+// -- what a tombstone never does -----------------------------------------------------------------
+
+@test("tmb: the program's own declaration of the old name wins, with no clash")
+tmb_own_declaration_shadows()
+    if im_can_run() then return
+
+    assert_eq(tmb_out("import old.*\n\nstruct Pt\n    y: int\n\nprint(Pt(3).y)\n"), "3\n")
+    assert_eq(tmb_out("import old.*\n\nmake_point() -> int = 7\n\nprint(make_point())\n"), "7\n")
+    assert_eq(tmb_out("import old.*\n\nmain()\n    val point_x = 4\n    print(point_x)\n"), "4\n")
+end tmb_own_declaration_shadows
+
+@test("tmb: another wildcard's declaration of the old name is the one meant, not an ambiguity")
+tmb_other_wildcard_wins()
+    if im_can_run() then return
+
+    var more: Buf[(string, string, string)] = buf()
+
+    more.push(("other", "other.sysl", "module other\n\nstruct Pt\n    z: int\n"))
+    assert_eq(tmb_files_out(tmb_with("import old.*\nimport other.*\n\nprint(Pt(5).z)\n", more)), "5\n")
+end tmb_other_wildcard_wins
+
+@test("tmb: a module that declares a live name beside a tombstone of it answers with the live one")
+tmb_live_beside_tombstone()
+    if im_can_run() then return
+
+    var more: Buf[(string, string, string)] = buf()
+
+    more.push(("both", "both.sysl", "module both\n\n@renamed(\"Q\", \"2.0\") type P\n\nstruct P\n    v: int\n"))
+    assert_eq(tmb_files_out(tmb_with("import both.*\n\nprint(P(6).v)\n", more)), "6\n")
+end tmb_live_beside_tombstone
+
+@test("tmb: a module with only tombstones builds, and a program not naming them is untouched")
+tmb_unused_is_silent()
+    if im_can_run() then return
+
+    assert_eq(tmb_out("import old.*\n\nprint(new_point(2).x)\n"), "2\n")
+end tmb_unused_is_silent
+
+// -- a tombstone in a dependency -----------------------------------------------------------------
+
+@test("tmb: a tombstone in a dependency package reaches the program that depends on it")
+tmb_in_a_dependency()
+    if im_can_run() then return
+
+    val dep = absolute_path(make_temp_dir("sysl-tmb-dep").unwrap())
+    val app = absolute_path(make_temp_dir("sysl-tmb-app").unwrap())
+
+    write_text(s"$dep/package.hocon", "package { name = \"lib\", version = \"0.1.0\" }\n").unwrap()
+    make_dir_all(s"$dep/sh/x/lib").unwrap()
+    write_text(s"$dep/sh/x/lib/a.sysl",
+               "module sh.x.lib\n\nfresh() -> int = 3\n\n@renamed(\"fresh\", \"0.2.0\") stale()\n").unwrap()
+    write_text(s"$app/package.hocon",
+               s"package { name = \"app\", version = \"0.1.0\" }\ndependencies { lib { path = \"$dep\" } }\n").unwrap()
+    write_text(s"$app/main.sysl", "import sh.x.lib.*\n\nprint(stale())\n").unwrap()
+
+    val said = tmb_built(app)
+
+    assert(said.contains("'stale' was renamed to 'fresh' in 0.2.0"), said)
+
+    write_text(s"$app/main.sysl", "import sh.x.lib.*\n\nprint(fresh())\n").unwrap()
+    assert_eq(tmb_built(app), "3\n")
+
+    remove_dir_all(dep).unwrap_or(())
+    remove_dir_all(app).unwrap_or(())
+end tmb_in_a_dependency
+
+// -- the grammar ---------------------------------------------------------------------------------
+
+@test("tmb: a tombstone is the head of a type or a function and nothing after it")
+tmb_grammar()
+    assert_eq(pf("@renamed(\"Date\", \"0.10.0\") type LocalDate\n"), "(renamed type LocalDate \"Date\" \"0.10.0\")")
+    assert_eq(pf("@renamed(\"date\", \"0.10.0\")\ndate_at()\n"), "(renamed fn date_at \"date\" \"0.10.0\")")
+    assert_eq(pf("@removed(\"write 'x'\", \"1.0\") gone()\n"), "(removed fn gone \"write 'x'\" \"1.0\")")
+end tmb_grammar
+
+@test("tmb: the annotation's arguments are two non-empty strings")
+tmb_malformed_arguments()
+    val renamed = "'@renamed' takes the name that replaced the declaration and the release that renamed it, both as non-empty strings"
+    val removed = "'@removed' takes what to write instead and the release that removed the declaration, both as non-empty strings"
+
+    assert(pf_err("@renamed type A\n").contains(renamed))
+    assert(pf_err("@renamed(\"B\") type A\n").contains(renamed))
+    assert(pf_err("@renamed(\"B\", \"1\", \"2\") type A\n").contains(renamed))
+    assert(pf_err("@renamed(B, \"1\") type A\n").contains(renamed))
+    assert(pf_err("@renamed(\"B\", 1) type A\n").contains(renamed))
+    assert(pf_err("@renamed(\"\", \"1\") type A\n").contains(renamed))
+    assert(pf_err("@removed(\"why\") f()\n").contains(removed))
+    assert(pf_err("@removed(\"why\", \"\") f()\n").contains(removed))
+end tmb_malformed_arguments
+
+@test("tmb: above anything but a bare head, the annotation is refused")
+tmb_not_a_tombstone()
+    val shape = "stands above a tombstone, which is the head of the declaration that is gone and nothing after it"
+
+    assert(pf_err("@renamed(\"B\", \"1\") type A = int\n").contains(shape))
+    assert(pf_err("@renamed(\"B\", \"1\") struct A\n    x: int\n").contains(shape))
+    assert(pf_err("@renamed(\"b\", \"1\") a() = 1\n").contains(shape))
+    assert(pf_err("@renamed(\"b\", \"1\") a(x: int)\n").contains(shape))
+    assert(pf_err("@renamed(\"b\", \"1\") val a = 1\n").contains(shape))
+    assert(pf_err("@removed(\"why\", \"1\") extern f()\n").contains(shape))
+    assert(pf_err("@renamed(\"b\", \"1\") @pure a()\n").contains("a tombstone carries '@renamed' and nothing else"))
+    assert(pf_err("@renamed(\"b\", \"1\") @removed(\"c\", \"1\") a()\n").contains("a tombstone carries"))
+    assert(pf_err("@renamed(\"b\", \"1\") private a()\n").contains("a tombstone is public"))
+    assert(pf_err("struct S\n    x: int\n\n    @renamed(\"b\", \"1\")\n    a(self) -> int = 1\n")
+               .contains("'@renamed' marks a tombstone, which stands at a module's top level"))
+end tmb_not_a_tombstone
+
+@test("tmb: a tombstone in a body, and one name given two, are refused")
+tmb_misplaced()
+    if !enm_ready() then return
+
+    assert(enm_err("main()\n    @renamed(\"b\", \"1\") a()\n    print(1)\n").contains("a tombstone stands at a module's top level"))
+
+    var more: Buf[(string, string, string)] = buf()
+
+    more.push(("twice", "twice.sysl", "module twice\n\n@renamed(\"b\", \"1\") a()\n@removed(\"c\", \"1\") a()\n"))
+    assert(tmb_files_out(tmb_with("import twice.*\n\nprint(1)\n", more)).contains("'a' has a tombstone already in 'twice'"))
+end tmb_misplaced
+
+// -- beside it -----------------------------------------------------------------------------------
+
+@test("tmb: 'str(x)' is still refused with the words it always was")
+tmb_str_unchanged()
+    if !enm_ready() then return
+
+    assert(enm_err("print(str(1))\n").contains("'str(x)' was removed in 0.7.0: write 'x.to_string()'"))
+end tmb_str_unchanged
+
+// The range an editor shows is the use's -- line 2, from the column `LocalDate` starts at to the one
+// it ends at -- and not the tombstone's line in the library.
+@test("tmb: the diagnostic an editor shows covers the use, not the tombstone")
+tmb_editor_range()
+    if std_root().is_err() then return
+
+    val root = make_temp_dir("sysl-tmb-lsp").unwrap()
+    val uri = lsp_file_uri(s"$root/t.sysl")
+    var server = lsp_server()
+
+    lsp_answer(&server, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"capabilities\":{}}}")
+    lsp_answer(&server, "{\"jsonrpc\":\"2.0\",\"method\":\"initialized\",\"params\":{}}")
+
+    val text = "import sysl.time.*\n\nshow(d: LocalDate) -> int = 0\n"
+    val out = lsp_answer(&server, "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":" +
+                                  s"{\"textDocument\":{\"uri\":\"$uri\",\"languageId\":\"sysl\",\"version\":1,\"text\":${json_quote(text)}}}}")
+
+    assert_eq(out.len(), 1)
+    assert(out[0].contains("{\"range\":{\"start\":{\"line\":2,\"character\":8},\"end\":{\"line\":2,\"character\":17}}," +
+                           "\"severity\":1,\"source\":\"sysl\",\"message\":\"'LocalDate' was renamed to 'Date' in 0.10.0\"}"), out[0])
+    assert(!out[0].contains("renamed.sysl"), out[0])
+
+    remove_dir_all(root).unwrap_or(())
+end tmb_editor_range
