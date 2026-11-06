@@ -322,6 +322,10 @@ y u8
 
 A left side that is a value keeps the refusal it always had, and a subject with no implementation is
 told so by the projection: `int::Item::Name` says that `int` implements no trait declaring `Item`.
+A type parameter bounded by two traits that each declare `Item` is refused, since an associated type
+is named without its trait: `M::Item` says it is ambiguous and names both traits. A trait both bounds
+require is one trait, and is not ambiguous. A trait asked for its layout (`Has::Max`) is told that it
+describes behaviour rather than a layout.
 
 ## Fields and members
 
