@@ -59,7 +59,7 @@ check_const_fns(a: &Analysis, funcs: Buf[TFunc], vals: Buf[TVal])
         bodies.put(funcs[i].name, i)
 
     val cx: &ConstSeen = ConstSeen(ghosts, vals, outside_storage(a), Skipped(buf()), funcs, bodies, map(),
-                                   false, buf())
+                                   false, buf(), false)
 
     for i in 0..<funcs.len()
         val f = funcs[i]
@@ -98,6 +98,9 @@ private struct ConstSeen
     // reason found is kept in `found` instead of being reported.
     collecting: bool
     found: Buf[string]
+    // Where the walk judges one frame an evaluation has reached: its calls are passed over, each to be
+    // judged in turn if the evaluation reaches it.
+    lazy: bool
 end ConstSeen
 
 // The variables the `extern` declarations name: storage outside the program.
@@ -136,7 +139,7 @@ private unmarked_refusal(a: &Analysis, cx: &ConstSeen, name: string) -> Option[s
     end if
 
     val inner: &ConstSeen = ConstSeen(cx.ghosts, cx.vals, cx.outside, Skipped(buf()), cx.funcs, cx.bodies,
-                                      cx.unmarked, true, buf())
+                                      cx.unmarked, true, buf(), cx.lazy)
 
     const_body(a, inner, body.unwrap())
 
@@ -147,16 +150,46 @@ private unmarked_refusal(a: &Analysis, cx: &ConstSeen, name: string) -> Option[s
     if why == "" then None else Some(why)
 end unmarked_refusal
 
-// The same question asked by the evaluator, about a callee it is about to run. What the walk finds is
-// kept for the rest of the compilation.
+// The same question asked of everything a function reaches: its body, and the body of every function
+// it calls, down the whole chain. What explains why a piece of storage stayed code asks it, and
+// so does the advice a `const` initializer that is not a constant expression is given. What the
+// walk finds is kept for the rest of the compilation.
 evaluable_refusal(a: &Analysis, name: string) -> Option[string]
     if a.tables.const_fns.has(name) then return None
 
     val cx: &ConstSeen = ConstSeen(buf(), buf(), outside_storage(a), Skipped(buf()), buf(), map(),
-                                   a.evaluation.unmarked, true, buf())
+                                   a.evaluation.unmarked, true, buf(), false)
 
     unmarked_refusal(a, cx, name)
 end evaluable_refusal
+
+// **A callee is judged as the evaluation reaches it**, the way C++ `constexpr` evaluation and Zig's
+// `comptime` judge one: this frame's own body -- an address, module storage the program fills, the
+// processor, an `asm` block -- and not the functions it calls. Each of those is judged in turn, if
+// the run reaches it, so a function that cannot run, called on a branch the run does not take, keeps
+// no constant from being computed, and a refusal names the frame that was actually reached. A
+// printer is refused by name, before its body: what it does is write to the terminal. What each
+// frame was found to hold is kept for the rest of the compilation (`reached`), one entry per function
+// judged.
+reached_refusal(a: &Analysis, name: string) -> Option[string]
+    if a.tables.const_fns.has(name) then return None
+
+    if printer_name(qualified_name(a.tables.members.func_origin.get(name).unwrap_or(name))) then
+        return Some(printing())
+
+    val cx: &ConstSeen = ConstSeen(buf(), buf(), outside_storage(a), Skipped(buf()), buf(), map(),
+                                   a.evaluation.reached, true, buf(), true)
+
+    unmarked_refusal(a, cx, name)
+end reached_refusal
+
+// Whether a function is one of the library's printers, or the terminal's streams.
+printer_name(shown: string) -> bool =
+    shown.starts_with("sysl.print") || shown.starts_with("sysl.eprint") || shown == "sysl.stdout" ||
+        shown == "sysl.stderr"
+
+// Why printing cannot happen while compiling.
+private printing() -> string = s"it prints, which is outside the program — ${const_outside()}"
 
 // A reason as the clause after a callee's name: "it prints, …" becomes "which prints, …", so a chain
 // of calls reads as one sentence.
@@ -322,6 +355,8 @@ private variadic_walk() -> string =
 
 // What is wrong with calling this from a `const` function, or nothing.
 private const_call_refusal(a: &Analysis, cx: &ConstSeen, name: string) -> Option[string]
+    // A frame the evaluation reached leaves its calls to be judged where they are reached.
+    if cx.lazy then return None
     if a.tables.const_fns.has(name) || holds_string(cx.ghosts, name) then return None
     // Through a type parameter's bound: settled by whichever type fills the parameter.
     if names_a_bound_member(a, name) then return None
@@ -336,10 +371,7 @@ private const_call_refusal(a: &Analysis, cx: &ConstSeen, name: string) -> Option
     val shown = qualified_name(origin)
 
     // `print` reaches the library's printers, and what they do is write to the terminal.
-    val printer = shown.starts_with("sysl.print") || shown.starts_with("sysl.eprint")
-
-    if printer || shown == "sysl.stdout" || shown == "sysl.stderr" then
-        return Some(s"it prints, which is outside the program — ${const_outside()}")
+    if printer_name(shown) then return Some(printing())
 
     // An `f"…"` specifier's renderers are run by the compiler itself (`const_eval.sysl`).
     if const_renderer(shown) || writer_routine(shown) || float_bits_routine(name) || frozen_routine(shown) then

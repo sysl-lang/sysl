@@ -109,6 +109,10 @@ struct ConstEvaluation
     // while compiling, or empty where it can (`const_check.sysl`'s `evaluable_refusal`).
     unmarked: Map[string, string]
 
+    // What each frame a run reached was found to hold, its calls left to be judged where they are
+    // reached (`const_check.sysl`'s `reached_refusal`): one entry per function judged.
+    reached: Map[string, string]
+
     // How many folds are under way that only ask whether a value can be had -- a module `val` read
     // from inside a run -- so a call that cannot run says nothing: the run asking is what reports.
     asking: usize
@@ -143,7 +147,7 @@ end ConstEvaluation
 
 // An evaluator that has evaluated nothing.
 const_evaluation() -> &ConstEvaluation =
-    ConstEvaluation(false, map(), map(), map(), map(), buf(), buf(), "", map(), map(), 0, map(), 0,
+    ConstEvaluation(false, map(), map(), map(), map(), buf(), buf(), "", map(), map(), map(), 0, map(), 0,
                     decl_answers(), false, buf(), buf(), false, buf())
 
 // -- the seams ---------------------------------------------------------------------------------------
@@ -1639,7 +1643,7 @@ private ev_operator(r: &EvRun, at: Span, name: string) -> Option[TFunc]
 
     if !marked || holds_string(r.a.evaluation.typing, name) then return None
 
-    if r.a.evaluation.bodies.get(name).is_none() && evaluable_refusal(r.a, name).is_some() then return None
+    if r.a.evaluation.bodies.get(name).is_none() && reached_refusal(r.a, name).is_some() then return None
 
     callee(r, at, name).map(b -> *b)
 end ev_operator
@@ -4127,17 +4131,22 @@ private callee(r: &EvRun, at: Span, name: string) -> Option[&TFunc]
 
     if kept.is_some() then return kept
 
-    val caller = if r.frames.len() > 1 then s"'${qualified_name(running(r).func)}'" else "it"
+    // An instance is named as the declaration it was made from, which is what a reader wrote.
+    val caller = if r.frames.len() > 1 then s"'${qualified_name(callee_origin(r.a, running(r).func))}'" else "it"
 
-    // A function nobody marked runs where its body can. A struct's `invariant` clauses are a
-    // function the compiler made from them, and run wherever a value of the struct is made -- so they
-    // run here too.
+    // A function nobody marked runs where its body can -- judged here, as the run reaches it, and its
+    // own callees each where the run reaches them (`reached_refusal`). A struct's `invariant` clauses
+    // are a function the compiler made from them, and run wherever a value of the struct is made -- so
+    // they run here too.
     if !name.ends_with(s"${ModuleSep}inv")
-        val why = evaluable_refusal(r.a, name)
+        val why = reached_refusal(r.a, name)
 
         if why.is_some()
-            refuse_form(r, at, s"$caller calls '${qualified_name(callee_origin(r.a, name))}', " +
-                        chained_reason(why.unwrap()))
+            val shown = qualified_name(callee_origin(r.a, name))
+            val said = if printer_name(shown) then s"$caller ${why.unwrap()[3..]}"
+            else s"$caller calls '$shown', ${chained_reason(why.unwrap())}"
+
+            refuse_form(r, at, said)
             return None
         end if
     end if

@@ -1,0 +1,476 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.source_of
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+
+// **A callee is judged as the evaluation reaches it** (`const_check.sysl`'s `reached_refusal`), the
+// way C++ `constexpr` evaluation and Zig's `comptime` judge one. A function that cannot run while
+// compiling, called on a branch the run does not take, keeps no constant from being computed; on
+// the branch the run takes, the refusal names the frame the run reached, with the calls it was
+// inside. Each way a call is reached is crossed with both: a plain call, a deep chain, recursion,
+// mutual recursion, a trait default, a generic's instance, a closure, a `match` arm, an `extern`,
+// a module `var`, a declaration's length, and storage on a bare machine.
+
+// A function that cannot run while compiling, and the routes a constant reaches it by, each taking
+// the call only where its flag says.
+private val clz_routes: string = raw"""
+    extern getpid() -> i32
+
+    var seed = 3
+
+    noisy(x: int) -> int
+        print("hi")
+        x
+
+    reads_seed() -> int = seed
+
+    pick(flag: bool) -> int = if flag then noisy(3) else 7
+
+    outer(flag: bool) -> int = pick(flag) + 1
+
+    trait Go
+        go(self, flag: bool) -> int = if flag then noisy(1) else 11
+
+    struct S
+        a: int
+
+    impl Go for S
+
+    gen[T](x: T, flag: bool, alt: T) -> T
+        if flag then noisy(0)
+        if flag then alt else x
+
+    apply(f: int -> int, x: int) -> int = f(x)
+
+    arm(k: int) -> int = k match
+        0 -> noisy(0)
+        _ -> k * 2
+
+    ext(flag: bool) -> int = if flag then int(getpid()) else 4
+
+    via(flag: bool) -> int = if flag then reads_seed() else 6
+
+    same(flag: bool) -> int = if flag then seed else 6
+
+    fact(n: int) -> int = if n < 0 then noisy(n) else if n == 0 then 1 else n * fact(n - 1)
+
+    is_even(n: int) -> bool = if n < 0 then noisy(n) == 0 else if n == 0 then true else is_odd(n - 1)
+    is_odd(n: int) -> bool = if n < 0 then noisy(n) == 0 else if n == 0 then false else is_even(n - 1)
+
+    """
+
+// What a program over the routes says, refused: the first thing its compilation said.
+private clz_refused(text: string) -> string
+    val out = enm_outcome(clz_routes + text)
+
+    assert(!out.1, s"compiled: ${out.0}")
+    out.0
+end clz_refused
+
+private clz_prints() -> string =
+    "'noisy' prints, which is outside the program — nothing outside the program exists while compiling"
+
+@test("a function that cannot run, called on a branch the run does not take, keeps no constant from folding")
+clz_a_branch_not_taken_folds()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(clz_routes + raw"""
+        const K: int = outer(false)
+
+        main()
+            var a: [K]u8
+            print(K, a.len)
+        """), "8 8\n")
+end clz_a_branch_not_taken_folds
+
+@test("the same call on the branch the run takes is refused at the frame it reached, inside its callers")
+clz_the_branch_taken_names_the_frame()
+    if !enm_ready() then return
+
+    val said = clz_refused(raw"""
+        const K: int = outer(true)
+
+        main()
+            print(K)
+        """)
+
+    assert(said.contains(s"'K' cannot be computed while compiling: ${clz_prints()}"), said)
+    assert(said.contains("— inside 'noisy(3)', called at "), said)
+    assert(said.contains("; inside 'pick(true)', called at "), said)
+    assert(said.contains("; inside 'outer(true)', called at "), said)
+    assert(!said.contains("it calls 'outer'"), said)
+end clz_the_branch_taken_names_the_frame
+
+// Fifty frames deep, the bottom one calls the function that cannot run only where the flag says.
+private clz_chain(depth: int) -> string
+    var out = "deep0(flag: bool) -> int = if flag then noisy(0) else 0\n\n"
+
+    for i in 1..<depth
+        out = out + s"deep$i(flag: bool) -> int = deep${i - 1}(flag) + 1\n\n"
+
+    out
+end clz_chain
+
+@test("a deep chain folds where its last call is not taken, and is told by its innermost calls where it is")
+clz_a_deep_chain()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(clz_routes + clz_chain(50) + raw"""
+        const K: int = deep49(false)
+
+        main()
+            var a: [K]u8
+            print(K, a.len)
+        """), "49 49\n")
+
+    val said = clz_refused(clz_chain(50) + raw"""
+        const K: int = deep49(true)
+
+        main()
+            print(K)
+        """)
+
+    assert(said.contains(clz_prints()), said)
+    assert(said.contains("— inside 'noisy(0)'"), said)
+    assert(said.contains("; inside 'deep0(true)'"), said)
+    assert(said.contains("more calls; inside 'deep49(true)'"), said)
+end clz_a_deep_chain
+
+@test("recursion and mutual recursion fold where the call that cannot run is never reached")
+clz_recursion()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(clz_routes + raw"""
+        const F: int = fact(5)
+        const E: bool = is_even(10)
+        const O: bool = is_odd(7)
+
+        main()
+            var a: [F]u8
+            print(F, E, O, a.len)
+        """), "120 true true 120\n")
+
+    val fact = clz_refused("const F: int = fact(-2)\n\nmain()\n    print(F)\n")
+
+    assert(fact.contains(s"'F' cannot be computed while compiling: ${clz_prints()}"), fact)
+    assert(fact.contains("; inside 'fact(-2)'"), fact)
+
+    val mutual = clz_refused("const E: bool = is_even(-1)\n\nmain()\n    print(E)\n")
+
+    assert(mutual.contains(s"'E' cannot be computed while compiling: ${clz_prints()}"), mutual)
+    assert(mutual.contains("; inside 'is_even(-1)'"), mutual)
+end clz_recursion
+
+@test("a trait default, a generic's instance, a closure and a match arm each fold where the call is not taken")
+clz_every_route_not_taken()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(clz_routes + raw"""
+        const A: int = S(0).go(false)
+        const B: int = gen(5, false, 9)
+        const C: int = apply(x -> if x > 100 then noisy(x) else x + 1, 3)
+        const D: int = arm(4)
+
+        main()
+            var a: [A + B + C + D]u8
+            print(A, B, C, D, a.len)
+        """), "11 5 4 8 28\n")
+end clz_every_route_not_taken
+
+@test("a trait default, a generic's instance, a closure and a match arm each refuse at the frame reached")
+clz_every_route_taken()
+    if !enm_ready() then return
+
+    val go = clz_refused("const A: int = S(0).go(true)\n\nmain()\n    print(A)\n")
+
+    assert(go.contains(s"'A' cannot be computed while compiling: ${clz_prints()}"), go)
+    assert(go.contains("; inside 'S.go(S(0), true)'"), go)
+
+    val instance = clz_refused("const B: int = gen(5, true, 9)\n\nmain()\n    print(B)\n")
+
+    assert(instance.contains(s"'B' cannot be computed while compiling: ${clz_prints()}"), instance)
+    assert(instance.contains("; inside 'gen.int(5, true, 9)'"), instance)
+
+    val closure = clz_refused("const C: int = apply(x -> if x > 100 then noisy(x) else x + 1, 300)\n\n" +
+                              "main()\n    print(C)\n")
+
+    assert(closure.contains(s"'C' cannot be computed while compiling: ${clz_prints()}"), closure)
+    assert(closure.contains("— inside 'noisy(300)'"), closure)
+
+    val matched = clz_refused("const D: int = arm(0)\n\nmain()\n    print(D)\n")
+
+    assert(matched.contains(s"'D' cannot be computed while compiling: ${clz_prints()}"), matched)
+    assert(matched.contains("; inside 'arm(0)'"), matched)
+end clz_every_route_taken
+
+@test("a loop folds until the iteration that takes the call, and a body's own constant is judged the same")
+clz_a_loop_and_a_body_const()
+    if !enm_ready() then return
+
+    val loopy = raw"""
+        loopy(n: int) -> int
+            var s = 0
+            for i in 0..<n
+                s += if i == 7 then noisy(i) else i
+            s
+
+        """
+
+    assert_eq(enm_ran(clz_routes + loopy + raw"""
+        const K: int = loopy(7)
+
+        main()
+            const L: int = outer(false)
+            var a: [K]u8
+            print(K, L, a.len)
+        """), "21 8 21\n")
+
+    val looped = clz_refused(loopy + "const K: int = loopy(8)\n\nmain()\n    print(K)\n")
+
+    assert(looped.contains(s"'K' cannot be computed while compiling: ${clz_prints()}"), looped)
+    assert(looped.contains("— inside 'noisy(7)'"), looped)
+    assert(looped.contains("; inside 'loopy(8)'"), looped)
+
+    val body = clz_refused("main()\n    const L: int = outer(true)\n    print(L)\n")
+
+    assert(body.contains(s"'L' cannot be computed while compiling: ${clz_prints()}"), body)
+    assert(body.contains("; inside 'outer(true)'"), body)
+end clz_a_loop_and_a_body_const
+
+@test("a module val on the host runs its refused call when the program starts, and folds the one it skips")
+clz_a_module_val_on_the_host()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(clz_routes + raw"""
+        val V: int = outer(false)
+        val W: int = outer(true)
+
+        main()
+            print(V, W)
+        """), "hi\n8 4\n")
+end clz_a_module_val_on_the_host
+
+// What a frame holds itself is judged as the run enters it, whichever of its branches would reach it:
+// only its calls wait to be reached.
+@test("a frame that converts a pointer is refused on entry, even on a branch the run does not take")
+clz_a_frames_own_body_is_judged_on_entry()
+    if !enm_ready() then return
+
+    val said = clz_refused(raw"""
+        guarded(flag: bool) -> int
+            if flag
+                val p: *int = null
+                return int(usize(p))
+            3
+
+        const G: int = guarded(false)
+
+        main()
+            print(G)
+        """)
+
+    assert(said.contains("'G' cannot be computed while compiling: it calls 'guarded', which converts a pointer"),
+           said)
+
+    // One frame further down, the frame is only entered where the branch is taken.
+    assert_eq(enm_ran(clz_routes + raw"""
+        guarded(flag: bool) -> int
+            if flag
+                val p: *int = null
+                return int(usize(p))
+            3
+
+        shielded(flag: bool) -> int = if flag then guarded(true) else 2
+
+        const G: int = shielded(false)
+
+        main()
+            print(G)
+        """), "2\n")
+end clz_a_frames_own_body_is_judged_on_entry
+
+@test("an extern and a module var a callee reaches stop the run only where it reaches them")
+clz_outside_and_storage()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(clz_routes + raw"""
+        const E: int = ext(false)
+        const V: int = via(false)
+        const W: int = same(false)
+
+        main()
+            print(E, V, W)
+        """), "4 6 6\n")
+
+    val outside = clz_refused("const E: int = ext(true)\n\nmain()\n    print(E)\n")
+
+    assert(outside.contains("'E' cannot be computed while compiling: 'ext' calls 'getpid', which is outside " +
+                            "the program — nothing outside the program exists while compiling"), outside)
+    assert(outside.contains("— inside 'ext(true)'"), outside)
+
+    val storage = clz_refused("const V: int = via(true)\n\nmain()\n    print(V)\n")
+
+    assert(storage.contains("'V' cannot be computed while compiling: 'seed' is filled when the program runs"),
+           storage)
+    assert(storage.contains("— inside 'reads_seed()'"), storage)
+end clz_outside_and_storage
+
+@test("a length a declaration is read with is computed past a call it does not take")
+clz_a_declaration_length()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(clz_routes + raw"""
+        struct Sized
+            b: [ext(false)]u8
+
+        main()
+            val s = Sized([0; 4])
+            print(s.b.len)
+        """), "4\n")
+
+    val said = clz_refused("struct Sized\n    b: [ext(true)]u8\n\nmain()\n    print(Sized([0; 4]).b.len)\n")
+
+    assert(said.contains("'ext' calls 'getpid', which is outside the program"), said)
+end clz_a_declaration_length
+
+@test("the step budget still stops a run that never ends, before the call it would not take")
+clz_the_step_budget()
+    if !enm_ready() then return
+
+    val said = clz_refused(raw"""
+        spin(flag: bool) -> int
+            var i = 0
+            while i >= 0
+                i = (i + 1) % 10
+            if flag then noisy(i) else i
+
+        const J: int = spin(false)
+
+        main()
+            print(J)
+        """)
+
+    assert(said.contains("'J' did not finish within 16,000,000 steps while compiling — the loop at "), said)
+    assert(said.contains("'--const-steps <n>' allows a longer run"), said)
+end clz_the_step_budget
+
+@test("two constants read in terms of each other are still a loop, whatever their callees avoid")
+clz_a_cycle_is_caught()
+    if !enm_ready() then return
+
+    val consts = clz_refused(raw"""
+        f(x: int, flag: bool) -> int = if flag then noisy(x) else x + 1
+
+        const P: int = f(Q, false)
+        const Q: int = f(P, false)
+
+        main()
+            print(P, Q)
+        """)
+
+    assert(consts.contains("constant 'P' is defined in terms of itself: P → Q → P"), consts)
+
+    val vals = enm_outcome(clz_routes + raw"""
+        f(x: int, flag: bool) -> int = if flag then noisy(x) else x + 1
+
+        val P: int = f(Q, false)
+        val Q: int = f(P, false)
+
+        main()
+            print(P, Q)
+        """)
+
+    assert(!vals.1, vals.0)
+    assert(vals.0.contains("'P'") && vals.0.contains("'Q'"), vals.0)
+end clz_a_cycle_is_caught
+
+private val clz_board: string = raw"""
+    var seed: u32 = 3
+
+    reader() -> u32 = seed
+
+    pick(flag: bool) -> u32 = if flag then reader() else 4
+
+    """
+
+@test("on a bare machine a val past a var read it does not take is laid down, and one taking it is refused")
+clz_a_bare_machine()
+    if cfv_skip() then return
+
+    cfv_laid_down(cfv_built(clz_board + "val R: u32 = pick(false)\n\nvar t: u32 = R\n\n@export(\"main\")\n" +
+                            "main_entry() -> int = int(t)\n"),
+                  "@t = private global i32 4")
+
+    cfv_refused(cfv_built(clz_board + "val S: u32 = pick(true)\n\nvar u: u32 = S\n\n@export(\"main\")\n" +
+                          "main_entry() -> int = int(u)\n"),
+                "u")
+end clz_a_bare_machine
+
+// **The scaling guard.** A constant whose one call reaches two thousand functions, on a branch the
+// run does not take: the run judges the frames it enters and nothing below them. Judging everything
+// the call reaches -- what the constant cost before callees were judged as they were reached -- walks
+// every one of the two thousand, as asking the whole question of the entry still does.
+@test("a constant judges the frames it reaches, not every function its calls could reach")
+clz_judging_follows_the_run()
+    if cfv_skip() then return
+
+    val t = target_named("thumbv7em-freestanding").unwrap()
+    var units = clz_library(t)
+    // Forty functions of fifty calls each, under one: wide rather than deep, so the walk of the whole
+    // question stays shallow. The last of the two thousand prints.
+    var tree = "noisy(x: int) -> int\n    print(x)\n    x\n\n"
+    var top = "all(n: int) -> int = 0"
+
+    for m in 0..<40
+        var calls = "0"
+
+        for j in 0..<50
+            val leaf = m * 50 + j
+
+            tree = tree + (if leaf == 1999 then s"c$leaf(n: int) -> int = noisy(n)\n\n"
+                           else s"c$leaf(n: int) -> int = n + $leaf\n\n")
+            calls = calls + s" + c$leaf(n)"
+
+        tree = tree + s"m$m(n: int) -> int = $calls\n\n"
+        top = top + s" + m$m(n)"
+
+    val text = tree + top + "\n\nentry(flag: bool) -> int = if flag then all(1) else 5\n\n" +
+               "val E: int = entry(false)\n\nvar words: [2]int = [E, E]\n"
+
+    units.push(parse(source_of("main.sysl", text), t).program)
+
+    val a = analyze_produced(units, t, buf(), false).an
+
+    assert(a.diagnostics().is_empty(), "the program compiles")
+
+    var entry = ""
+
+    for (k, _) in a.evaluation.reached
+        if qualified_name(k) == "entry" then entry = k
+
+    assert(entry != "", "the run judged 'entry'")
+    assert_eq(a.evaluation.reached.len(), 1)
+    assert(a.evaluation.unmarked.len() < 10, s"${a.evaluation.unmarked.len()}")
+
+    // The whole question, asked of the same function, walks the whole chain and finds what the run
+    // never reached.
+    val whole = evaluable_refusal(a, entry)
+
+    assert(whole.is_some(), "the chain ends in a print")
+    assert(a.evaluation.unmarked.len() >= 2042, s"${a.evaluation.unmarked.len()}")
+    print(s"judged: run ${a.evaluation.reached.len()}, whole question ${a.evaluation.unmarked.len()}")
+end clz_judging_follows_the_run
+
+private clz_library(t: Target) -> Buf[Program]
+    var out: Buf[Program] = buf()
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, t) match
+            Err(_) -> ()
+            Ok(units) -> out = units
+
+    out
+end clz_library
