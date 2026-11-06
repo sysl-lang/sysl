@@ -239,7 +239,7 @@ stack is the thread's, and the thread may end.
 
 ```sysl
 import sysl.fiber.{Context, Stack, switch}
-import sysl.threads.{current, spawn}
+import sysl.threads.{ScopeSlot, scope_in}
 
 @thread_local
 var carrier: int = 0
@@ -271,9 +271,10 @@ main()
     h.fiber = Context.start(stack, &hop, &h)
     switch(&h.home, &h.fiber)
 
-    val t = spawn(&elsewhere, &h).unwrap()
+    val ph = &h
+    var slots: [1]ScopeSlot = [ScopeSlot.new(); 1]
 
-    t.join()
+    scope_in(slots[..], (s) -> s.start(&elsewhere, ph))
     print(s"main on carrier ${which()}")
 ```
 

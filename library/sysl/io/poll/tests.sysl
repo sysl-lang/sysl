@@ -8,7 +8,7 @@ import sysl.io.sys.{fd_read, fd_write}
 import sysl.io.wait.{Readable, Writable}
 import sysl.net.{Address, Socket, resolve, socket, would_block}
 import sysl.process.pipe
-import sysl.threads.spawn
+import sysl.threads.{ScopeSlot, scope_in}
 import sysl.time.{millis, monotonic, sleep, whole_millis}
 
 // The poller over real pipes and loopback sockets: each direction, a hang-up, the three modes, a
@@ -218,12 +218,17 @@ iop_waker_from_a_thread()
     p.register(fd_of(r), [Readable], 1).unwrap()
 
     var l = Later(p, 0, 100)
-    val t = spawn(&wake_later, &l).unwrap()
-    val began = monotonic()
-    val n = p.wait(got[..], None).unwrap()
-    val took = whole_millis(monotonic() - began)
+    val pl = &l
+    var slots: [1]ScopeSlot = [ScopeSlot.new(); 1]
+    var n = 0
+    var took: long = 0
 
-    assert(t.join())
+    scope_in(slots[..], (s) ->
+        s.start(&wake_later, pl)
+        val began = monotonic()
+        n = p.wait(got[..], None).unwrap()
+        took = whole_millis(monotonic() - began))
+
     assert_eq(n, 0)
     assert(took >= 90 && took < 10000, s"$took ms")
     assert(fd_of(w) >= 0)
@@ -271,10 +276,14 @@ iop_register_during_wait()
     val (r, w) = pipe().unwrap()
     var got = [Event.none; 4]
     var l = Later(p, fd_of(w), 100)
-    val t = spawn(&register_later, &l).unwrap()
-    val n = waited(p, got[..], 10000)
+    val pl = &l
+    var slots: [1]ScopeSlot = [ScopeSlot.new(); 1]
+    var n = 0
 
-    assert(t.join())
+    scope_in(slots[..], (s) ->
+        s.start(&register_later, pl)
+        n = waited(p, got[..], 10000))
+
     assert_eq(n, 1)
     assert_eq(got[0].token, 77)
     assert(got[0].writable)
@@ -289,10 +298,14 @@ iop_modify_during_wait()
     p.register(fd_of(w), [Readable], 3).unwrap()
 
     var l = Later(p, fd_of(w), 100)
-    val t = spawn(&modify_later, &l).unwrap()
-    val n = waited(p, got[..], 10000)
+    val pl = &l
+    var slots: [1]ScopeSlot = [ScopeSlot.new(); 1]
+    var n = 0
 
-    assert(t.join())
+    scope_in(slots[..], (s) ->
+        s.start(&modify_later, pl)
+        n = waited(p, got[..], 10000))
+
     assert_eq(n, 1)
     assert_eq(got[0].token, 78)
     assert(got[0].writable)
