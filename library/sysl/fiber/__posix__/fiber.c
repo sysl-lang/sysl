@@ -31,10 +31,12 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
-/* Only a hosted macOS or Linux build gets the switch. A freestanding build of the library still
- * compiles every shim, and there the target may have no floating-point registers to save (aarch64
- * with general registers only), so the file is empty rather than wrong. */
-#if (defined(__APPLE__) || defined(__linux__)) && (defined(__aarch64__) || defined(__x86_64__))
+/* Only a hosted macOS or Linux build with floating-point registers gets the switch. A freestanding
+ * build of the library still compiles every shim, and an aarch64 one is built with general
+ * registers only (no `__ARM_FP`), where saving d8-d15 and FPCR cannot even be assembled; the file is
+ * empty there rather than wrong. */
+#if (defined(__APPLE__) || defined(__linux__)) && \
+    ((defined(__aarch64__) && defined(__ARM_FP)) || (defined(__x86_64__) && defined(__SSE__)))
 
 #ifndef __has_feature
 #define __has_feature(x) 0
