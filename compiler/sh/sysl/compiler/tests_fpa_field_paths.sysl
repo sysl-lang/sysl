@@ -189,6 +189,101 @@ fpa_array_element()
 
     assert_eq(fpa_kept_text(fx, "first", 0), "[]")
 
+// -- a path stops at a &T box (M28) ----------------------------------------------------------------
+
+private val fpa_boxes: string = "struct Bx\n    v: *int\n    w: *int\n\n" +
+    "struct Outer\n    inner: &Bx\n\n" +
+    "struct Pl\n    tag: *int\n    bx: &Bx\n\n"
+
+@test("a field read out of a &T box is kept as the box's whole interior, not as the one field")
+fpa_box_interior()
+    val fx = fpa_of(fpa_boxes + "keep_v(b: &Bx)\n    held = b.v\n\nmain()\n    keep_v(Bx(&spare, &spare))\n")
+
+    assert_eq(fpa_kept_text(fx, "keep_v", 0), "*")
+    assert(!fpa_keeps(fx, "keep_v", 0))
+    assert(fpa_lets_out(fx, "keep_v", 0))
+
+@test("a box inside a box is the outer box's interior: the path stops at the first box")
+fpa_box_in_box()
+    val fx = fpa_of(fpa_boxes + "keep_w(o: &Outer)\n    held = o.inner.w\n\n" +
+                    "main()\n    keep_w(Outer(Bx(&spare, &spare)))\n")
+
+    assert_eq(fpa_kept_text(fx, "keep_w", 0), "*")
+
+@test("a box held in place is reached by its field, and stops there: the tag beside it is not kept")
+fpa_box_held_in_place()
+    val fx = fpa_of(fpa_boxes + "keep_bw(s: Pl)\n    held = s.bx.w\n\n" +
+                    "main()\n    keep_bw(Pl(&spare, Bx(&spare, &spare)))\n")
+
+    assert_eq(fpa_kept_text(fx, "keep_bw", 0), ".1*")
+
+@test("a raw pointer is followed past, where a box would stop the path")
+fpa_box_versus_pointer()
+    val fx = fpa_of(fpa_boxes + "struct Rp\n    to: *Bx\n\nkeep_rw(r: Rp)\n    held = r.to.w\n\n" +
+                    "main()\n    var b = Bx(&spare, &spare)\n    keep_rw(Rp(&b))\n")
+
+    assert_eq(fpa_kept_text(fx, "keep_rw", 0), ".0*.1")
+
+@test("a list of boxes walked to its end is the first box's interior, at every depth")
+fpa_box_list()
+    val fx = fpa_of("struct Cell\n    next: Option[&Cell]\n    v: *int\n\n" +
+                    "last(c: &Cell)\n    var m = c\n    loop\n        m.next match\n            Some(n) -> m = n\n" +
+                    "            None -> break\n    held = m.v\n\nmain()\n    last(Cell(None, &spare))\n")
+
+    assert_eq(fpa_kept_text(fx, "last", 0), "*")
+    assert_eq(fpa_local_text(fx, "last", "m"), "p0 p0*")
+
+@test("a box answered back from inside a box is answered as the interior, one '*' in")
+fpa_box_answer()
+    val fx = fpa_of(fpa_boxes + "inner_of(o: &Outer) -> &Bx = o.inner\n\n" +
+                    "main()\n    held = inner_of(Outer(Bx(&spare, &spare))).v\n")
+
+    assert_eq(fpa_answers_text(fx, "inner_of", 0), "*@ε")
+
+// -- variants are told apart by name ---------------------------------------------------------------
+
+private val fpa_variants: string = "enum Two\n    A(x: *int, y: *int)\n    B(x: *int, y: *int)\n\n" +
+    "keep_ay(e: Two)\n    e match\n        A(_, y) -> held = y\n        B(_, _) -> spare = 0\n\n"
+
+@test("a variant's field is kept by variant and position: A's second field, nothing of B's")
+fpa_variant_named()
+    val fx = fpa_of(fpa_variants + "main()\n    keep_ay(A(&spare, &spare))\n")
+
+    assert_eq(fpa_kept_text(fx, "keep_ay", 0), ".A:1")
+
+@test("a value built as the other variant keeps nothing at the same position")
+fpa_variant_other()
+    val fx = fpa_of(fpa_variants + "build_b(p: *int, q: *int)\n    keep_ay(B(p, q))\n\n" +
+                    "build_a(p: *int, q: *int)\n    keep_ay(A(p, q))\n\n" +
+                    "main()\n    build_b(&spare, &spare)\n    build_a(&spare, &spare)\n")
+
+    assert_eq(fpa_kept_text(fx, "build_b", 1), "")
+    assert_eq(fpa_kept_text(fx, "build_a", 0), "")
+    assert_eq(fpa_kept_text(fx, "build_a", 1), "ε")
+
+@test("a variant answered back says where its field sits by variant name")
+fpa_variant_answer()
+    val fx = fpa_of(fpa_variants + "mk(p: *int, q: *int) -> Two = B(q, p)\n\n" +
+                    "main()\n    keep_ay(mk(&spare, &spare))\n")
+
+    assert_eq(fpa_answers_text(fx, "mk", 0), "ε@.B:1")
+
+// -- a destructuring pattern looks through a pointer at every depth --------------------------------
+
+@test("a struct pattern nested in a variant pattern looks through the box it matches")
+fpa_pattern_through_box()
+    val fx = fpa_of(fpa_boxes + "take(o: Option[&Bx])\n    o match\n        Some(Bx(v, _)) -> held = v\n        None -> ()\n\n" +
+                    "main()\n    take(Some(Bx(&spare, &spare)))\n")
+
+    assert_eq(fpa_kept_text(fx, "take", 0), ".Some:0*")
+
+@test("a struct pattern matched against a box at the top looks through it too")
+fpa_pattern_top_box()
+    val fx = fpa_of(fpa_boxes + "take(b: &Bx)\n    b match\n        Bx(_, w) -> held = w\n\n" +
+                    "main()\n    take(Bx(&spare, &spare))\n")
+
+    assert_eq(fpa_kept_text(fx, "take", 0), "*")
+
 // -- agreement with the keeps analysis, and the error paths -----------------------------------------
 
 @test("where there is nothing to tell apart, the two analyses agree on keeping and answering")
