@@ -1,0 +1,144 @@
+// Building a program in each mode, running it, and the oracles that compare the runs:
+//
+//   3. the counted heap (`SYSL_COUNT_ALLOCS=1`) nets zero at exit;
+//   4. AddressSanitizer, with `detect_stack_use_after_return=1`, reports nothing;
+//   5. the output is the same at `-O0`, under ASan, and at `-O2` or with thin LTO (seeds alternate).
+//
+// The builds of a batch are started together and waited for together, so one run of the harness keeps
+// several compilers busy.
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, write_text}
+import sysl.process.{Child, Exited, Output, Signalled, Status, TimedOut, Var, capture, start}
+import sysl.text.{Join, Search, Text}
+
+struct Config
+    compiler: string
+    lib: string
+    work: string
+
+/** One way to build a program: its flags, its build environment, and its run environment. */
+struct Mode
+    name: string
+    flags: []const string
+    env: []const Var
+    run_env: []const Var
+
+modes(seed: u64) -> []const Mode
+    val counted = Mode("O0-counted", ["-O0"], [Var("SYSL_COUNT_ALLOCS", "1")], [])
+    val asan = Mode("asan", [], [Var("SYSL_EXTRA_CFLAGS", "-fsanitize=address -g")],
+                    [Var("ASAN_OPTIONS", "detect_stack_use_after_return=1")])
+    val third = if seed % 2 == 0 then Mode("O2", ["-O2"], [], []) else Mode("lto", ["--lto", "thin"], [], [])
+
+    [counted, asan, third]
+
+/** A program whose builds are under way. */
+struct Pending
+    dir: string
+    want: Want
+    modes: []const Mode
+    builds: Buf[Option[&Child]]
+
+status_text(s: Status) -> string = s match
+    Exited(c) -> s"exit $c"
+    Signalled(n) -> s"signal $n"
+    TimedOut -> "timed out"
+
+/** The first few lines of a message, enough to say what went wrong in one report line. */
+head(text: string, n: usize = 6) -> string
+    val lines = text.lines()
+    var out: Buf[string] = buf()
+
+    for i in 0..<lines.len
+        if i >= n then break
+        out.push(lines[i])
+
+    out.join(" | ")
+
+/** Writes the program and starts its builds in every mode. */
+begin(cfg: Config, p: Prog, slot: int) -> Pending
+    val (q, want) = repair(p)
+
+    begin_text(cfg, emit(q), want, p.seed, slot)
+
+/** The same for a program given as text, which is how the harness's own tests plant a failure. */
+begin_text(cfg: Config, text: string, want: Want, seed: u64, slot: int) -> Pending
+    val dir = s"${cfg.work}/w$slot"
+
+    make_dir_all(dir).unwrap_or(())
+    write_text(s"$dir/main.sysl", text).unwrap_or(())
+
+    val ms = modes(seed)
+    var builds: Buf[Option[&Child]] = buf()
+
+    for m in ms
+        var args: Buf[string] = buf()
+
+        args.push("build")
+        for f in m.flags do args.push(f)
+        args.push(s"$dir/main.sysl")
+        args.push("-o")
+        args.push(s"$dir/${m.name}")
+
+        var env: Buf[Var] = buf()
+
+        env.push(Var("SYSL_LIB", cfg.lib))
+        for v in m.env do env.push(v)
+
+        builds.push(start(cfg.compiler, args.view(), "", env.view(), true, 300000).ok())
+
+    Pending(dir, want, ms, builds)
+
+/** Waits for the builds, runs what was built, and answers every oracle the runs break. */
+finish(p: Pending) -> Buf[string]
+    var fails: Buf[string] = buf()
+    var outs: Buf[string] = buf()
+
+    for k in 0..<p.modes.len
+        val m = p.modes[k]
+        val built: Result[Output, string] = p.builds[k] match
+            Some(c) -> c.wait().map_err((e) -> "wait failed")
+            None -> Err("the compiler could not be started")
+
+        built match
+            Err(why) ->
+                fails.push(s"build[${m.name}]: $why")
+                outs.push("")
+                continue
+            Ok(o) ->
+                if !o.status.ok()
+                    fails.push(s"build[${m.name}]: ${status_text(o.status)}: ${head(o.err.unwrap_or(""))}")
+                    outs.push("")
+                    continue
+
+        capture(s"${p.dir}/${m.name}", [], "", m.run_env, true, 30000) match
+            Err(_) ->
+                fails.push(s"crash[${m.name}]: could not be run")
+                outs.push("")
+            Ok(o) ->
+                val err = o.err.unwrap_or("")
+
+                if err.contains("AddressSanitizer") then fails.push(s"asan[${m.name}]: ${head(err)}")
+                else if !o.status.ok() then fails.push(s"crash[${m.name}]: ${status_text(o.status)}: ${head(err)}")
+                else if err != "" then fails.push(s"leak[${m.name}]: ${head(err)}")
+
+                outs.push(o.text)
+
+    for k in 1..<outs.len()
+        if outs[0] != "" && outs[k] != "" && outs[k] != outs[0]
+            fails.push(s"differ[${p.modes[k].name}]: its output is not the -O0 build's")
+
+    if outs[0] != ""
+        for f in check_log(outs[0], p.want) do fails.push(f)
+
+    fails
+
+/** The oracles one program breaks, built and run on its own. */
+check_one(cfg: Config, p: Prog, slot: int = 0) -> Buf[string] = finish(begin(cfg, p, slot))
+
+/** What kind of failure a report line is: the part before its colon. The reducer keeps a candidate
+ * only while it still fails in the same kind.
+ */
+class_of(fail: string) -> string = fail.index_of(":") match
+    Some(i) -> fail[..<i]
+    None -> fail

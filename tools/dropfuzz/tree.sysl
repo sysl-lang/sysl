@@ -1,0 +1,135 @@
+// The generator's tree: a program is a list of functions, a function a list of statements, and a
+// statement one ownership event. The reducer works on this tree, never on the program's text, so every
+// candidate it tries is printed by the same emitter as the original and is well typed by the same
+// rules (`walk.sysl` repairs what a deletion left dangling).
+
+import sysl.buf.{Buf, buf}
+
+/** The name of the growable buffer type, and of the function that makes an empty one. */
+val buf_type = "Buf"
+val buf_make = "buf"
+
+/** One ownership event. `n` is the local a statement declares, or the one it acts on; `a`, `b` and `c`
+ * are its other operands, each described beside its variant. A site is the number a `mk` call is
+ * written with, unique in the program, which is what the order oracle names an object by.
+ */
+enum Op
+    Make            // var vN = mk(a)
+    Remake          // vN = mk(a)
+    Use             // use(vN)
+    TempUse         // use(mk(a)): a temporary, let go of at the end of its statement
+    Alias           // val vN = vA
+    MakePair        // var vN = Pair(mk(a), mk(b))
+    PairOf          // var vN = Pair(vA, vB)
+    Look            // vN.look(): a `(self)` receiver, a copy of the pair
+    Poke            // vN.poke(): a `*self` receiver, which swaps the fields
+    SetField        // vN.x = mk(a)
+    ProbeOf         // val vN: &Probe = vA: a trait object boxing a copy of a pair
+    ProbeCall       // vN.probe()
+    NewBuf          // var vN: Buf[&Tracked] = buf()
+    PushNew         // vN.push(mk(a))
+    PushVar         // vN.push(vA)
+    Each            // for t in vN do use(t)
+    Pop             // vN.pop()
+    Replace         // if vN.len() > 0 then vN[0] = mk(a)
+    NewMap          // var vN: Map[int, &Tracked] = map()
+    Put             // vN.put(b, mk(a))
+    PutVar          // vN.put(b, vA)
+    Remove          // vN.remove(b)
+    Lookup          // vN.get(b) match ...
+    Weak            // val vN: weak Tracked = vA
+    Upgrade         // vN.get() match ...
+    Closure         // val vN = () -> use(each of args)
+    BoxFn           // val vN: &Fn() -> unit = () -> use(each of args)
+    CallFn          // vN()
+    SlotNew         // val vN = Slot.Full(mk(a))
+    SlotOf          // val vN = Slot.Full(vA)
+    SlotEmpty       // val vN = Slot.Empty
+    SlotMatch       // vN match Full(t) -> use(t); Empty -> print("empty")
+    SlotTake        // val vN = vB match Full(t) -> t; Empty -> mk(a)
+    DeferMark       // defer print("D a")
+    DeferUse        // defer use(vA)
+    If              // if flip(a [+ the innermost loop's index]) then yes else no
+    Loop            // for iN in 0..<a do yes
+    Break           // if flip(a + i) then break
+    Continue        // if flip(a + i) then continue
+    Return          // if flip(a) then return (Err in a fallible function)
+    Call            // hA(args): a unit helper
+    CallR           // a fallible helper: `use_n(rA(args)?)` inside a fallible body, else unwrap_or
+    Spawn           // val vN = mk_sync(a); scope((sc) -> sc.spawn(() -> use_sync(vN)))
+    AsyncRun        // print(block_on(task1(vA)))
+    AsyncHold       // val vN = task1(vA)
+    AsyncAwait      // print(block_on(vA))
+    Mark            // print("E a"): the end of a block, where the order oracle looks
+
+/** One statement. Fields an op does not use are zero and empty. */
+struct Stmt
+    op: Op
+    n: int
+    a: int
+    b: int
+    args: Buf[int]
+    yes: Buf[Stmt]
+    no: Buf[Stmt]
+
+/** A statement with no operands beyond the three numbers. */
+st(op: Op, n: int, a: int = 0, b: int = 0) -> Stmt = Stmt(op, n, a, b, buf(), buf(), buf())
+
+/** A function: `run` is function 0; a helper may call only functions after it, so nothing recurses. */
+struct Func
+    params: int
+    fallible: bool
+    dead: bool
+    body: Buf[Stmt]
+
+/** A whole program: the bits `flip` reads, and its functions. */
+struct Prog
+    seed: u64
+    bits: u64
+    funcs: Buf[Func]
+
+/** A copy of a body that shares no buffer with it, so a candidate may be cut without touching the
+ * program it came from.
+ */
+clone_body(body: Buf[Stmt]) -> Buf[Stmt]
+    var out: Buf[Stmt] = buf()
+
+    for s in body
+        var args: Buf[int] = buf()
+
+        for x in s.args do args.push(x)
+        out.push(Stmt(s.op, s.n, s.a, s.b, args, clone_body(s.yes), clone_body(s.no)))
+
+    out
+
+clone_prog(p: Prog) -> Prog
+    var funcs: Buf[Func] = buf()
+
+    for f in p.funcs do funcs.push(Func(f.params, f.fallible, f.dead, clone_body(f.body)))
+    Prog(p.seed, p.bits, funcs)
+
+/** How many statements a body holds, nested ones included: the reducer's measure of size. */
+size_of(body: Buf[Stmt]) -> int
+    var n = 0
+
+    for s in body do n += 1 + size_of(s.yes) + size_of(s.no)
+    n
+
+/** How much a body does: its statements, plus each loop's extra trips. */
+weight_of(body: Buf[Stmt]) -> int
+    var n = 0
+
+    for s in body
+        n += 1 + weight_of(s.yes) + weight_of(s.no)
+        if s.op == Loop then n += s.a - 1
+
+    n
+
+/** The reducer's measure: a candidate is kept only where this goes down. */
+prog_size(p: Prog) -> int
+    var n = 0
+
+    for f in p.funcs
+        if !f.dead then n += 1 + weight_of(f.body)
+
+    n

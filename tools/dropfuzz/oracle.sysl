@@ -1,0 +1,131 @@
+// The oracles that read a program's output. The build-mode oracles -- the counted heap, AddressSanitizer
+// and the modes agreeing -- are `run.sysl`'s, since they compare runs rather than read one.
+//
+//   1. every Tracked made is dropped exactly once, and nothing is dropped that was not made;
+//   2. nothing is read after it was dropped: by the log's order, and by the program's own `live` flag;
+//   6. each block's end shows the drops and defers the walk promised (`walk.sysl`), in that order, and
+//      a temporary is dropped at the end of the statement that made it.
+
+import sysl.buf.{Buf, buf}
+import sysl.text.{Search, Text, parse_int}
+
+/** One line of a program's output, read as an event. `kind` is `+`, `-`, `u`, `D`, `E`, `!` or ` `
+ * (anything else), and `site` is -1 where the line names none.
+ */
+struct Event
+    kind: u8
+    id: int
+    site: int
+
+num(s: string) -> int = parse_int(s).unwrap_or(-1)
+
+event(line: string) -> Event
+    if line.len == 0 then return Event(u8(' '), -1, -1)
+
+    val words = line.split(" ")
+    val c = line.bytes[0]
+
+    if (c == u8('+') || c == u8('-')) && words.len == 2 && words[1].starts_with("s")
+        return Event(c, num(words[0][1..]), num(words[1][1..]))
+
+    if c == u8('u') && words.len == 3 && words[2].starts_with("s")
+        return Event(c, num(words[1]), num(words[2][1..]))
+
+    if (c == u8('D') || c == u8('E')) && words.len == 1 then return Event(c, num(line[1..]), -1)
+
+    if line.starts_with("! uaf") then return Event(u8('!'), num(words[2]), -1)
+
+    Event(u8(' '), -1, -1)
+
+/** The token the order oracle compares: what `walk.sysl`'s `block_end` writes for the same event. */
+token(e: Event) -> string =
+    if e.kind == u8('-') then s"-${e.site}"
+    else if e.kind == u8('u') then s"u${e.site}"
+    else if e.kind == u8('D') then s"D${e.id}"
+    else ""
+
+contains(xs: Buf[string], x: string) -> bool
+    for y in xs
+        if y == x then return true
+
+    false
+
+/** Every way the output breaks oracles 1, 2 and 6, each a line starting with the oracle's name. An
+ * empty answer is a pass.
+ */
+check_log(text: string, want: Want) -> Buf[string]
+    var fails: Buf[string] = buf()
+    val lines = text.lines()
+    var evs: Buf[Event] = buf()
+
+    for l in lines do evs.push(event(l))
+
+    if lines.len == 0 || lines[lines.len - 1] != "done"
+        fails.push("incomplete: the program did not reach its end")
+
+    var made: Buf[int] = buf()
+    var dropped: Buf[int] = buf()
+
+    for _ in 0..<8192
+        made.push(0)
+        dropped.push(0)
+
+    for ev in evs
+        if ev.id < 0 || ev.id >= 8192 then continue
+
+        val at = usize(ev.id)
+
+        if ev.kind == u8('+')
+            made[at] += 1
+        else if ev.kind == u8('-')
+            if made[at] == 0 then fails.push(s"drops: ${ev.id} dropped before it was made")
+            dropped[at] += 1
+        else if ev.kind == u8('u')
+            if dropped[at] > 0 then fails.push(s"uaf: ${ev.id} read after its drop")
+        else if ev.kind == u8('!')
+            fails.push(s"uaf: ${ev.id} read while its live flag was down")
+
+    for id in 0..<8192
+        if made[id] > 0 && dropped[id] != 1
+            fails.push(s"drops: ${id} (made ${made[id]} times) dropped ${dropped[id]} times")
+
+    // Oracle 6: after each block's end mark, the events the walk names come in the walk's order.
+    for k in 0..<evs.len()
+        val ev = evs[k]
+
+        if ev.kind != u8('E') then continue
+
+        for m in want.marks
+            if m.mark != ev.id || m.want.len() == 0 then continue
+
+            var got: Buf[string] = buf()
+            var j = k + 1
+
+            while j < evs.len() && got.len() < m.want.len()
+                val t = token(evs[j])
+
+                if t != "" && contains(m.want, t) then got.push(t)
+                j += 1
+
+            val a = got.join(" ")
+            val b = m.want.join(" ")
+
+            if a != b then fails.push(s"order: block E${m.mark} ended with [$a], the walk promised [$b]")
+
+    // A temporary's drop is the next event after its read.
+    for k in 0..<evs.len()
+        val ev = evs[k]
+
+        if ev.kind != u8('u') then continue
+
+        var temp = false
+
+        for t in want.temps
+            if t == ev.site then temp = true
+
+        if !temp then continue
+
+        if k + 1 >= evs.len() || evs[k + 1].kind != u8('-') || evs[k + 1].id != ev.id
+            fails.push(s"temp: the temporary ${ev.id} (site ${ev.site}) was not dropped at the end of its statement")
+
+    fails
