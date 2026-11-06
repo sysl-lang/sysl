@@ -1,0 +1,237 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+import sysl.container.{Set, set}
+
+// `sysl.fiber.switch`, which the compiler knows (`docs/content/library/fiber.md`).
+//
+// **A switch may come back on another thread, and LLVM does not know that.** It takes a
+// thread-local's address -- `llvm.threadlocal.address`, or a thread-local global named directly -- to
+// be fixed for the length of a function, so it computes it once and reuses it: before and after a
+// switch, out of a loop around one, across a helper inlined beside one. A body resumed on another
+// carrier then reads and writes the old carrier's copy. Two things follow, and both are here.
+//
+// **Every call of the switch is emitted in place**, as assembly that saves the stack, frame and base
+// pointers, where to resume and the floating-point control into `from`, takes up `to`'s and jumps
+// to it, and declares every other register clobbered. A call to a function would make the callee
+// save every callee-saved register on every switch; clobbered, they are saved by the code around
+// the switch, and only the ones holding something live across it. The frame and base pointers are
+// carried rather than clobbered because a function may have reserved them, and a reserved register
+// in a clobber list is neither saved nor restored. The assembly sits between calls of the C half's
+// `sysl_fiber_leaving` and `sysl_fiber_back` (a thread's first switch gives it a signal stack;
+// AddressSanitizer is told of the stacks), and the C half carries the same instructions for a call
+// through a function pointer. The layout of a context is the C half's `sysl_fiber_context`.
+//
+// **Every thread-local address is asked of an accessor**, in a program that switches: a `private`
+// function per thread-local, `noinline`, declared to read memory nothing else can reach. Two asks
+// with nothing between them that might write such memory are one, so a loop with no switch in it
+// still asks once; the switch's assembly writes all memory, so nothing asked before it is reused
+// after it. The accessor's body holds an empty block of assembly so that LLVM, inferring what the
+// body does, cannot narrow the declaration to "reads nothing" and make every ask one again.
+//
+// Only a hosted aarch64 or x86_64 POSIX machine has the switch; everywhere else a call of it is the
+// ordinary call to the library's definition, as it was.
+
+// The switch's key in this program, or nothing: where the machine has the switch and some body calls
+// it or takes its address. An address taken (`&switch`, a `*extern` value) is called through out of
+// line, and LLVM would still reuse a thread-local's address across that call; a `&Fn` value made of
+// the switch is a body of its own that calls it, so it is seen as a call.
+//
+// The standard module's precompiled bodies are emitted once for every program (`std_artifact.sysl`),
+// so they never ask an accessor: none of them switches, and `fiber.md` says what that leaves.
+fiber_switch_key(p: TProgram, t: Target) -> string
+    if !os_posix(t.os) || (t.cpu != Aarch64 && t.cpu != X86_64) then return ""
+
+    var key = ""
+
+    for f in p.funcs
+        if qualified_name(f.name) == "sysl.fiber.switch"
+            key = f.name
+            break
+
+    if key == "" then return ""
+
+    var found: Buf[string] = buf()
+    val names = expr_walk(false, x -> *x.kind match
+        TCall(name, _, _, _) -> if name == key then found.push(name)
+        TFuncAddr(name, _, _) -> if name == key then found.push(name)
+        _ -> ())
+
+    for v in p.vals
+        v.init match
+            Some(init) -> walk_texpr(init, names)
+            None -> ()
+
+    if !found.is_empty() then return key
+
+    for f in p.funcs
+        if f.name == key then continue
+
+        walk_block_stmts(f.body, names)
+
+        if !found.is_empty() then return key
+
+    ""
+end fiber_switch_key
+
+// The switch, in place: `from` and `to` are the two `*Context` arguments.
+gen_fiber_switch(e: *Emit, args: Buf[TExpr]) -> Val
+    val from = gen_expr(e, args[0])
+    val to = gen_expr(e, args[1])
+
+    var two: Buf[IrArg] = buf()
+
+    two.push(ir_arg(LPtr, from))
+    two.push(ir_arg(LPtr, to))
+    emit(e, ir_call(None, LVoid, VGlobal(fiber_hook(e, "sysl_fiber_leaving", 2)), two))
+
+    var shape: Buf[LType] = buf()
+
+    shape.push(LPtr)
+    shape.push(LPtr)
+
+    var ops: Buf[IrArg] = buf()
+
+    ops.push(ir_arg(LPtr, from))
+    ops.push(ir_arg(LPtr, to))
+    emit(e, InAsm(Some(fresh_reg(e)), LStruct(shape), fiber_switch_text(e.target),
+                  fiber_switch_constraints(e.target), ops))
+
+    var one: Buf[IrArg] = buf()
+
+    one.push(ir_arg(LPtr, from))
+    emit(e, ir_call(None, LVoid, VGlobal(fiber_hook(e, "sysl_fiber_back", 1)), one))
+    VNothing
+end gen_fiber_switch
+
+// Declares one of the C half's hooks, taking `n` pointers and answering nothing.
+private fiber_hook(e: *Emit, name: string, n: int) -> string
+    var params: Buf[IrParam] = buf()
+
+    for _ in 0..<n do params.push(ir_param(LPtr))
+
+    request_intrinsic(e, ir_sig(name, ir_fn_type(LVoid, params)))
+    name
+end fiber_hook
+
+// The instructions, `from` in the first argument register and `to` in the second. The offsets are
+// `sysl_fiber_context`'s: the stack pointer at 0, where to resume at 8, the frame pointer at 16, the
+// base pointer at 24, the control word at 32.
+fiber_switch_text(t: Target) -> string
+    var lines: Buf[string] = buf()
+
+    if t.cpu == Aarch64
+        lines.push("mov x9, sp")
+        lines.push("adr x10, 1f")
+        lines.push("mrs x11, fpcr")
+        lines.push("stp x9, x10, [x0]")
+        lines.push("stp x29, x19, [x0, #16]")
+        lines.push("str x11, [x0, #32]")
+        lines.push("ldp x9, x10, [x1]")
+        lines.push("ldp x29, x19, [x1, #16]")
+        lines.push("ldr x11, [x1, #32]")
+        lines.push("mov sp, x9")
+
+        // `msr fpcr` is slow on some cores, so the rounding mode is written only where it differs.
+        lines.push("mrs x12, fpcr")
+        lines.push("cmp x11, x12")
+        lines.push("b.eq 2f")
+        lines.push("msr fpcr, x11")
+        lines.push("2:")
+        lines.push("br x10")
+    else
+        lines.push("leaq 1f(%rip), %rax")
+        lines.push("movq %rsp, (%rdi)")
+        lines.push("movq %rax, 8(%rdi)")
+        lines.push("movq %rbp, 16(%rdi)")
+        lines.push("movq %rbx, 24(%rdi)")
+        lines.push("stmxcsr 32(%rdi)")
+        lines.push("fnstcw 36(%rdi)")
+        lines.push("movq (%rsi), %rsp")
+        lines.push("movq 16(%rsi), %rbp")
+        lines.push("movq 24(%rsi), %rbx")
+        lines.push("ldmxcsr 32(%rsi)")
+        lines.push("fldcw 36(%rsi)")
+        lines.push("jmpq *8(%rsi)")
+    end if
+
+    lines.push("1:")
+
+    var out = ""
+
+    for i in 0..<lines.len()
+        if i > 0 then out += "\\0A"
+        out += lines[i]
+
+    out
+end fiber_switch_text
+
+// The two pointers pinned to the argument registers, and every register but the stack, frame and
+// base pointers clobbered -- the vector registers whole, since only the low halves of some are ever
+// callee-saved, and on x86_64 the AVX-512 ones and the mask registers too, which a program built for
+// such a core may hold values in. aarch64's x18 is a scratch register on Linux alone; Apple's systems
+// and Android reserve it.
+fiber_switch_constraints(t: Target) -> string
+    var parts: Buf[string] = buf()
+
+    if t.cpu == Aarch64
+        parts.push("={x0},={x1},0,1")
+
+        for i in 2..<29
+            if i == 19 then continue
+            if i == 18 && t.os != Linux then continue
+
+            parts.push(s"~{x$i}")
+
+        parts.push("~{lr}")
+
+        for i in 0..<32 do parts.push(s"~{v$i}")
+    else
+        parts.push("={di},={si},0,1")
+
+        for r in ["rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15"]
+            parts.push(s"~{$r}")
+
+        for i in 0..<32 do parts.push(s"~{xmm$i}")
+        for i in 0..<8 do parts.push(s"~{k$i}")
+
+        parts.push("~{st}")
+
+        for i in 1..<8 do parts.push(s"~{st($i)}")
+
+        parts.push("~{fpsr}")
+        parts.push("~{dirflag}")
+        parts.push("~{flags}")
+    end if
+
+    parts.push("~{cc}")
+    parts.push("~{memory}")
+
+    var out = ""
+
+    for i in 0..<parts.len()
+        if i > 0 then out += ","
+        out += parts[i]
+
+    out
+end fiber_switch_constraints
+
+// This thread's copy of the thread-local whose LLVM name is `global`, asked of its accessor where
+// the program switches stacks.
+tls_address(e: *Emit, global: string) -> Val
+    val accessor = s"sysl.tls.$global"
+
+    request_intrinsic(e, ir_sig(trace_address_intrinsic(), trace_address_type()))
+    request_text(e, accessor,
+        s"define private ptr ${v_render(VGlobal(accessor))}() noinline nounwind memory(inaccessiblemem: read) {\n" +
+        "entry:\n" +
+        "  call void asm sideeffect \"\", \"\"()\n" +
+        s"  %p = call ptr @${trace_address_intrinsic()}(ptr ${v_render(VGlobal(global))})\n" +
+        "  ret ptr %p\n" +
+        "}\n")
+
+    val r = fresh_reg(e)
+
+    emit(e, ir_call(Some(r), LPtr, VGlobal(accessor), no_ir_args()))
+    r
+end tls_address

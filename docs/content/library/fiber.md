@@ -71,16 +71,24 @@ around, as `Pair` does above, rather than a copy taken before the switch.
 
 ## What a switch costs
 
-Everything the platform's calling convention says a callee keeps is pushed onto the stack being left,
-and the context is the pointer to it:
+**A call of `switch` is the compiler's own.** It is emitted in place, not called: a few instructions
+that write where to resume into `from` — the stack pointer, the instruction after the switch, the
+frame and base pointers and the floating-point control — take up `to`'s, and jump. Every other
+register is declared clobbered, so the function around the switch saves only the values it has live
+across it, wherever it chose to keep them, rather than a fixed set on every switch:
 
-| machine | integer | floating point | control |
-|---|---|---|---|
-| aarch64 | x19–x30, the stack pointer | d8–d15 | FPCR |
-| x86_64 | rbx, rbp, r12–r15, the stack pointer | — (System V keeps none) | MXCSR's control bits, the x87 control word |
+| machine | carried in the context | control |
+|---|---|---|
+| aarch64 | sp, the resume address, x29 (frame), x19 (base) | FPCR |
+| x86_64 | rsp, the resume address, rbp (frame), rbx (base) | MXCSR's control bits, the x87 control word |
 
-There is **no system call and no signal mask** in it, which is what makes it about ten nanoseconds
-where `swapcontext` takes a microsecond. A fiber runs with whatever signal mask its carrier has.
+Everything the platform's calling convention says a callee keeps — on aarch64 x19–x30 and d8–d15, on
+x86_64 rbx, rbp and r12–r15 — still holds across the switch, as it does across any call. A call
+through a function value (`val go: &Fn(*Context, *Context) -> unit = switch`) reaches the library's
+definition, which does the same out of line.
+
+There is **no system call and no signal mask** in it, which is what makes it a few nanoseconds where
+`swapcontext` takes a microsecond. A fiber runs with whatever signal mask its carrier has.
 
 Because the floating-point control register is saved, **the rounding mode is each fiber's own**. A
 fiber starts with the mode of the code that called `Context.start`:
@@ -218,13 +226,16 @@ A context saved on one thread may be resumed on another — that is what lets a 
 over its carriers. The stack and every register move with it. **What does not move is anything kept
 per thread, which belongs to the carrier**:
 
-- **`@thread_local` storage is the carrier's.** A fiber resumed on another thread reads that thread's
-  copy.
-- **A function that calls `switch` must not use a thread-local's address across the call.** The
-  optimizer takes the address of a thread-local to be fixed for the length of a function, so it may
-  reuse the one it worked out before the switch after it — the old carrier's copy. Read and write
-  thread-locals in functions that do not switch (and that are not inlined into one, `@noinline`), or
-  keep a fiber on the thread it started on.
+- **`@thread_local` storage is the carrier's.** A fiber resumed on another thread reads and writes
+  that thread's copy — in the very function that called `switch`, in a helper inlined into it, and in
+  a loop around the switch. The compiler works a thread-local's address out again after every
+  `switch`, at every optimization level, rather than letting the optimizer reuse the one from before
+  it, which would be the old carrier's. That holds wherever the program names `switch` — a call, its
+  address in a `*extern` value, a `&Fn` made of it — in any of its own modules or its packages'.
+  (An address taken with `&` and kept in a variable across a switch is an ordinary pointer, and still
+  names the copy it was taken from.) The standard library's own functions are compiled once for
+  every program, without this: none of them switches, but one that calls back into code that does
+  may go on, for the rest of that call, counting into the error trace of the carrier it began on.
 - **[`sysl.threads.current()`](/library/threads/) answers the carrier** — the thread running now.
 - **The [error return trace](/library/sys/) is the carrier's.** The sites it records are constants,
   never addresses in a frame, so a fiber that moves leaves nothing dangling, but a failure a fiber
@@ -244,18 +255,15 @@ import sysl.threads.{ScopeSlot, scope_in}
 @thread_local
 var carrier: int = 0
 
-@noinline
-which() -> int = carrier
-
 struct Hop
     home: Context
     away: Context
     fiber: Context
 
 hop(h: *Hop)
-    print(s"first on carrier ${which()}")
+    print(s"first on carrier $carrier")
     switch(&h.fiber, &h.home)
-    print(s"then on carrier ${which()}")
+    print(s"then on carrier $carrier")
     switch(&h.fiber, &h.away)
 
 elsewhere(h: *Hop)
@@ -275,7 +283,7 @@ main()
     var slots: [1]ScopeSlot = [ScopeSlot.new(); 1]
 
     scope_in(slots[..], (s) -> s.start(&elsewhere, ph))
-    print(s"main on carrier ${which()}")
+    print(s"main on carrier $carrier")
 ```
 
 ```output
@@ -290,7 +298,7 @@ The frame a fiber's entry is called from has a **zero frame pointer**, and its r
 marked undefined in the unwind tables, so `backtrace()`, a sampler, a crash report or a debugger walks
 a fiber's stack from where it is down to its entry and stops there, rather than wandering off the top
 of the mapping. In lldb a fiber's `bt` ends at the entry, with `sysl_fiber_boot` — the library's
-three instructions that call it — as the last frame.
+few instructions that call it — as the last frame.
 
 Under AddressSanitizer (`SYSL_EXTRA_CFLAGS="-fsanitize=address -g"`) every switch tells the sanitizer
 which stack it is moving to, with `__sanitizer_start_switch_fiber` and
