@@ -10,7 +10,8 @@
 // that nothing but it holds what it holds: made in its own declaration, never aliased, captured,
 // stored, boxed or handed to a task, and never changed from a nested block (where the walk cannot say
 // which arm ran). At a block's end the language promises its locals and deferred statements are undone
-// in reverse of where they were written, and a struct's fields come apart in declaration order; so for
+// in reverse of where they were written, a struct's fields come apart in declaration order and a
+// buffer's elements in index order; so for
 // the sole locals and the defers of the block the oracle knows the exact sequence, and checks it.
 // Anything not sole is left out of the check -- its drop is still counted by the other oracles.
 
@@ -21,7 +22,8 @@ enum Kind
     KTr         // val vN: &Tracked
     KTrVar      // var vN: &Tracked
     KSync       // val vN: &sync Tracked
-    KPair       // var vN: Pair
+    KPair       // var vN: Pair, on the frame
+    KHeap       // val vN: &Pair, on the heap
     KBuf
     KMap
     KWeak
@@ -39,6 +41,7 @@ struct Local
     b: int      // a pair's second field's site
     depth: int
     spent: bool // a task already awaited
+    elems: Buf[int] // a sole buffer's elements' sites, in index order
 
 /** Something a block's end undoes: a local it declared, or a statement it deferred. */
 enum ItemKind
@@ -123,8 +126,29 @@ change(e: *Env, id: int, a: int, b: int)
 
     e.locals[usize(i)] = l
 
+/** A sole buffer gains an element made for it: still exact where it is declared, unknown from deeper.
+ * The sites go in a fresh list, so a copy of the local taken before this still says what it said.
+ */
+push_elem(e: *Env, id: int, site: int)
+    val i = find(e, id)
+
+    if i < 0 then return
+
+    var l = e.locals[usize(i)]
+
+    if !l.sole || l.depth != depth(e)
+        l.sole = false
+    else
+        var elems: Buf[int] = buf()
+
+        for x in l.elems do elems.push(x)
+        elems.push(site)
+        l.elems = elems
+
+    e.locals[usize(i)] = l
+
 declare(e: *Env, id: int, kind: Kind, sole: bool, a: int = -1, b: int = -1)
-    e.locals.push(Local(id, kind, sole, a, b, depth(e), false))
+    e.locals.push(Local(id, kind, sole, a, b, depth(e), false, buf()))
     e.frames[e.frames.len() - 1].items.push(Item(ILocal, id))
 
 defer_item(e: *Env, kind: ItemKind, id: int) = e.frames[e.frames.len() - 1].items.push(Item(kind, id))
@@ -152,12 +176,13 @@ call_ok(e: *Env, f: int, s: Stmt, fallible: bool) -> bool
 
 /** Whether the statement stands here. `last` says whether it ends its body, which a `Mark` must. */
 valid(e: *Env, s: Stmt, last: bool) -> bool = s.op match
-    Make | TempUse | MakePair | NewBuf | NewMap | SlotNew | SlotEmpty | DeferMark | If | Loop | Spawn -> true
+    Make | TempUse | MakePair | HeapPair | NewBuf | NewMap | SlotNew | SlotEmpty | DeferMark | If | Loop | Spawn -> true
     Remake -> kind_is(e, s.n, KTrVar)
     Use -> tr_ok(e, s.n) || kind_is(e, s.n, KSync)
     Alias | Weak | SlotOf | AsyncRun | AsyncHold -> tr_ok(e, s.a)
     PairOf -> tr_ok(e, s.a) && tr_ok(e, s.b)
-    Look | Poke | SetField -> kind_is(e, s.n, KPair)
+    Look | SetField -> kind_is(e, s.n, KPair) || kind_is(e, s.n, KHeap)
+    Poke -> kind_is(e, s.n, KPair)
     ProbeOf -> kind_is(e, s.a, KPair)
     ProbeCall -> kind_is(e, s.n, KProbe)
     PushNew | Each | Pop | Replace -> kind_is(e, s.n, KBuf)
@@ -192,6 +217,7 @@ step(e: *Env, s: Stmt)
             share(e, s.a)
             declare(e, s.n, KTr, false)
         MakePair -> declare(e, s.n, KPair, true, s.a, s.b)
+        HeapPair -> declare(e, s.n, KHeap, true, s.a, s.b)
         PairOf ->
             share(e, s.a)
             share(e, s.b)
@@ -209,8 +235,13 @@ step(e: *Env, s: Stmt)
         ProbeOf ->
             share(e, s.a)
             declare(e, s.n, KProbe, false)
-        NewBuf -> declare(e, s.n, KBuf, false)
-        PushVar | PutVar -> share(e, s.a)
+        NewBuf -> declare(e, s.n, KBuf, true)
+        PushNew -> push_elem(e, s.n, s.a)
+        Pop | Replace -> share(e, s.n)
+        PushVar ->
+            share(e, s.a)
+            share(e, s.n)
+        PutVar -> share(e, s.a)
         NewMap -> declare(e, s.n, KMap, false)
         Weak -> declare(e, s.n, KWeak, false)
         Closure | BoxFn ->
@@ -265,7 +296,9 @@ block_end(e: *Env) -> Buf[string]
                     val l = e.locals[usize(j)]
 
                     if l.a >= 0 then want.push(s"-${l.a}")
-                    if l.kind == KPair && l.b >= 0 then want.push(s"-${l.b}")
+                    if (l.kind == KPair || l.kind == KHeap) && l.b >= 0 then want.push(s"-${l.b}")
+                    if l.kind == KBuf
+                        for x in l.elems do want.push(s"-$x")
         i -= 1
 
     want

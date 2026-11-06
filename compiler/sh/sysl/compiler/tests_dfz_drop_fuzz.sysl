@@ -1,0 +1,394 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.{cstring, Search}
+
+// The order teardown gives work back in (`arc_runtime.sysl`'s `arc.reap`), and the failures the
+// drop-count fuzz harness (`tools/dropfuzz`) found, each reduced to the program that shows it.
+//
+// **Teardown is a worklist, and what one teardown pushes is turned around before the next is
+// popped.** A release that reaches zero inside a drain pushes the object rather than recursing; the
+// list is last-in first-out, so without the turn every sibling came back last first: the fields of a
+// heap object, the elements of a slice or a `Buf`, and -- worst -- a destructor's own local after the
+// fields of the value it was tearing down, as if the local outlived the function. With it, the order is
+// Rust's: a destructor's locals at the end of its body, then the fields in declaration order and the
+// elements in index order, each torn down whole before the next sibling starts.
+//
+// The cells: a heap object's fields; nesting (depth first); a slice's and a `Buf`'s elements, after a
+// pop and an insert too; a tuple held on the heap; a closure's captures; a trait object's box; an enum
+// payload in a `Buf`; a destructor's own local; a `&sync` object (the atomic release reaches the same
+// drain); an object a `weak` still names; a frame struct, which never went through the list and must
+// not change; a chain long enough that recursion would overflow the stack, torn down head first; and
+// every cell again on a counted heap and under AddressSanitizer.
+//
+// Cells skipped, with the reason: `-O2` and LTO -- the turn is emitted IR the optimizer may not
+// reorder against the calls it sits between, and the fuzz harness builds every program at both; a
+// `Map`'s values -- its slots are in hash order, which says nothing about release order; a task's
+// frame -- its captured arguments are released by the frame's own hook, which the long-chain and
+// closure cells already pin.
+
+private extern "setenv" dfz_c_setenv(name: *u8, value: *u8, overwrite: int) -> int
+private extern "unsetenv" dfz_c_unsetenv(name: *u8) -> int
+
+private struct DfzRun
+    out: string
+    err: string
+    code: int
+    hooks: usize
+
+// What a program prints and exits with, built on a counted heap or with extra C flags where asked,
+// and how many ASan report hooks it calls. A build that failed is its message and `-1`.
+private dfz_run(program: string, counted: bool, flags: string) -> DfzRun
+    val root = make_temp_dir("sysl-dfz").unwrap()
+
+    write_text(s"$root/main.sysl", program).unwrap()
+
+    val exe = s"$root/built"
+
+    if flags != ""
+        val n = cstring("SYSL_EXTRA_CFLAGS")
+        val v = cstring(flags)
+
+        dfz_c_setenv(n.ptr, v.ptr, 1)
+
+    force_alloc_counting(counted)
+
+    val made = build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe))
+
+    force_alloc_counting(false)
+
+    if flags != ""
+        val n = cstring("SYSL_EXTRA_CFLAGS")
+
+        dfz_c_unsetenv(n.ptr)
+
+    made match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return DfzRun(failure_text(why), "", -1, 0)
+        Ok(_) -> ()
+
+    val hooks = capture("nm", ["-u", exe], "", [], true) match
+        Ok(o) -> o.text.count_of("__asan_report")
+        Err(_) -> 0
+
+    val ran = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    ran match
+        Err(_) -> DfzRun("the program that was built could not be run", "", -1, hooks)
+        Ok(o) -> DfzRun(o.text, o.err.unwrap_or(""), shell_status(o.status), hooks)
+end dfz_run
+
+// The program runs to the end, prints exactly this and says nothing on standard error.
+private dfz_prints(program: string, want: string)
+    if xvr_no_library() then return
+
+    val got = dfz_run(dfz_res() + program, false, "")
+
+    assert_eq(got.out, want)
+    assert_eq(got.err, "")
+    assert_eq(got.code, 0)
+
+// A value whose destructor prints its name, so the order of teardown is the program's output.
+private dfz_res() -> string = raw"""
+    import sysl.buf.{Buf, buf}
+
+    struct Res
+        name: string
+
+    impl Drop for Res
+        drop(self) = print("drop " + self.name)
+
+    struct Two
+        x: &Res
+        y: &Res
+
+    """
+
+// -- the fields and elements of something on the heap ------------------------------------------------
+
+@test("the fields of a heap object are torn down in declaration order")
+dfz_heap_fields_in_order()
+    dfz_prints(raw"""
+        run()
+            val t: &Two = Two(Res("x"), Res("y"))
+            print("made")
+
+        run()
+        """, "made\ndrop x\ndrop y\n")
+
+@test("nested heap objects come apart depth first: each field whole before the next")
+dfz_nested_depth_first()
+    dfz_prints(raw"""
+        struct Outer
+            a: &Two
+            b: &Res
+            c: &Two
+
+        run()
+            val o: &Outer = Outer(Two(Res("a.x"), Res("a.y")), Res("b"), Two(Res("c.x"), Res("c.y")))
+            print("made")
+
+        run()
+        """, "made\ndrop a.x\ndrop a.y\ndrop b\ndrop c.x\ndrop c.y\n")
+
+@test("a slice's elements are torn down in index order")
+dfz_slice_elements_in_order()
+    dfz_prints(raw"""
+        run()
+            var xs: []&Res = [Res("0"), Res("1"), Res("2")]
+            print("holding", xs.len)
+
+        run()
+        """, "holding 3\ndrop 0\ndrop 1\ndrop 2\n")
+
+@test("a Buf's elements are torn down in index order, after a pop and an insert as well")
+dfz_buf_elements_in_order()
+    dfz_prints(raw"""
+        run()
+            var b: Buf[&Res] = buf()
+
+            b.push(Res("a"))
+            b.push(Res("b"))
+            b.push(Res("c"))
+            b.pop()
+            b.insert(0, Res("first"))
+            print("holding", b.len())
+
+        run()
+        """, "drop c\nholding 3\ndrop first\ndrop a\ndrop b\n")
+
+@test("a Buf of tuples and a Buf of enum payloads: every element whole, in index order")
+dfz_buf_of_aggregates()
+    dfz_prints(raw"""
+        enum Slot
+            Full(r: &Res)
+            Empty
+
+        run()
+            var pairs: Buf[(&Res, &Res)] = buf()
+            var slots: Buf[Slot] = buf()
+
+            pairs.push((Res("p0.0"), Res("p0.1")))
+            pairs.push((Res("p1.0"), Res("p1.1")))
+            slots.push(Full(Res("s0")))
+            slots.push(Empty)
+            slots.push(Full(Res("s2")))
+            print("made")
+
+        run()
+        """, "made\ndrop s0\ndrop s2\ndrop p0.0\ndrop p0.1\ndrop p1.0\ndrop p1.1\n")
+
+@test("a closure's captures are torn down in the order the body first names them")
+dfz_closure_captures()
+    dfz_prints(raw"""
+        make() -> &Fn() -> unit
+            val a = Res("a")
+            val b = Res("b")
+
+            () -> print(a.name + b.name)
+
+        run()
+            val f = make()
+
+            f()
+
+        run()
+        """, "ab\ndrop a\ndrop b\n")
+
+@test("a trait object's box tears down the struct it holds field by field, in order")
+dfz_trait_object_box()
+    dfz_prints(raw"""
+        trait Named
+            name(self) -> string
+
+        impl Named for Two
+            name(self) -> string = self.x.name + self.y.name
+
+        run()
+            val n: &Named = Two(Res("x"), Res("y"))
+
+            print(n.name())
+
+        run()
+        """, "xy\ndrop x\ndrop y\n")
+
+// -- what runs inside a teardown ---------------------------------------------------------------------
+
+@test("a destructor's own local is let go of at the end of its body, before the fields")
+dfz_destructor_local_before_fields()
+    dfz_prints(raw"""
+        struct Node
+            leaf: &Res
+
+        impl Drop for Node
+            drop(self)
+                val tmp = Res("local of drop")
+
+                print("drop node, " + self.leaf.name + " still here")
+
+        run()
+            val n = Node(Res("field"))
+
+            print("holding")
+
+        run()
+        """, "holding\ndrop node, field still here\ndrop local of drop\ndrop field\n")
+
+@test("a struct a destructor builds on its frame comes apart in field order there too")
+dfz_destructor_frame_struct()
+    dfz_prints(raw"""
+        struct Node
+            n: int
+
+        impl Drop for Node
+            drop(self)
+                val t = Two(Res("x"), Res("y"))
+
+                print("drop node", self.n)
+
+        run()
+            val n = Node(1)
+
+        run()
+        print("done")
+        """, "drop node 1\ndrop x\ndrop y\ndone\n")
+
+@test("an atomically counted object is torn down in the same order")
+dfz_sync_fields_in_order()
+    dfz_prints(raw"""
+        struct Num
+            n: int
+
+        impl Drop for Num
+            drop(self) = print("drop", self.n)
+
+        struct SyncTwo
+            x: &sync Num
+            y: &sync Num
+
+        run()
+            val t: &sync SyncTwo = SyncTwo(Num(1), Num(2))
+
+            print("made")
+
+        run()
+        """, "made\ndrop 1\ndrop 2\n")
+
+@test("an object a weak reference still names is torn down in order, and the weak reads as gone")
+dfz_weak_outstanding()
+    dfz_prints(raw"""
+        run() -> weak Two
+            val t: &Two = Two(Res("x"), Res("y"))
+            val w: weak Two = t
+
+            print("made")
+            w
+
+        val w = run()
+
+        print(if w.get() == None then "gone" else "alive")
+        """, "made\ndrop x\ndrop y\ngone\n")
+
+@test("a struct held on the frame keeps its field order: it never went through the worklist")
+dfz_frame_struct_unchanged()
+    dfz_prints(raw"""
+        run()
+            val t = Two(Res("x"), Res("y"))
+            val u = Two(Res("u.x"), Res("u.y"))
+
+            print("made")
+
+        run()
+        """, "made\ndrop u.x\ndrop u.y\ndrop x\ndrop y\n")
+
+// -- the turn keeps teardown iterative ---------------------------------------------------------------
+
+private dfz_chain() -> string = raw"""
+    struct Link
+        n: int
+        next: Option[&Link]
+
+    struct Loud
+        n: int
+        next: Option[&Loud]
+
+    impl Drop for Loud
+        drop(self) = if self.n % 100000 == 0 || self.n < 3 then print("drop", self.n)
+
+    run()
+        var head: Option[&Link] = None
+
+        for i in 0..<1000000 do head = Some(Link(i, head))
+
+        var loud: Option[&Loud] = None
+
+        for i in 0..<300001 do loud = Some(Loud(i, loud))
+
+        print("built")
+
+    run()
+    print("done")
+    """
+
+@test("a chain of a million links is torn down without a stack overflow, head first")
+dfz_long_chain()
+    dfz_prints(dfz_chain(),
+               "built\ndrop 300000\ndrop 200000\ndrop 100000\ndrop 2\ndrop 1\ndrop 0\ndone\n")
+
+// -- every cell on a counted heap and under AddressSanitizer -----------------------------------------
+
+private dfz_all() -> string = dfz_res() + raw"""
+    struct Outer
+        a: &Two
+        b: &Res
+
+    struct Node
+        leaf: &Res
+
+    impl Drop for Node
+        drop(self)
+            val tmp = Res("tmp")
+
+    run()
+        val o: &Outer = Outer(Two(Res("a.x"), Res("a.y")), Res("b"))
+        var xs: []&Res = [Res("0"), Res("1")]
+        var b: Buf[&Res] = buf()
+
+        b.push(Res("b0"))
+        b.push(Res("b1"))
+
+        val n = Node(Res("leaf"))
+
+        print("made")
+
+    run()
+    """
+
+private dfz_all_output() -> string =
+    "made\ndrop tmp\ndrop leaf\ndrop b0\ndrop b1\ndrop 0\ndrop 1\ndrop a.x\ndrop a.y\ndrop b\n"
+
+@test("every teardown cell on a counted heap: the order, and nothing left at exit")
+dfz_counted_heap()
+    if xvr_no_library() then return
+
+    val got = dfz_run(dfz_all(), true, "")
+
+    assert_eq(got.out, dfz_all_output())
+    assert_eq(got.err, "")
+    assert_eq(got.code, 0)
+
+@test("every teardown cell under AddressSanitizer: instrumented, and nothing read after it was freed")
+dfz_asan()
+    if xvr_no_library() then return
+
+    val got = dfz_run(dfz_all(), false, "-fsanitize=address -g")
+
+    assert(got.hooks > 0, s"not instrumented: ${got.out}")
+    assert_eq(got.out, dfz_all_output())
+    assert_eq(got.err, "")
+    assert_eq(got.code, 0)

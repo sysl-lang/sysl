@@ -149,6 +149,24 @@ arc_core(t: Target, reaper_exported: bool) -> string
     "  store ptr %next, ptr %head\n" +
     s"  store $word 0, ptr %q\n" +
     "  call void @arc.destroy(ptr %q)\n" +
+    "  %h0 = load ptr, ptr %head\n" +
+    "  br label %turn\n" +
+    // **What one teardown pushed is turned around before the next is popped**, so the list gives
+    // work back in the order it was released: a destructor's own locals before the fields of the
+    // value it tears down, the fields in declaration order, the elements in index order, and each
+    // one torn down whole before its next sibling starts (Rust's order). The pushes sit between the
+    // head and `%next`, last first; reversing that run in place costs one pass over it.
+    "turn:\n" +
+    "  %prev = phi ptr [ %next, %step ], [ %cur, %turned ]\n" +
+    "  %cur = phi ptr [ %h0, %step ], [ %after, %turned ]\n" +
+    "  %end = icmp eq ptr %cur, %next\n" +
+    "  br i1 %end, label %spliced, label %turned\n" +
+    "turned:\n" +
+    "  %after = load ptr, ptr %cur\n" +
+    "  store ptr %prev, ptr %cur\n" +
+    "  br label %turn\n" +
+    "spliced:\n" +
+    "  store ptr %prev, ptr %head\n" +
     "  br label %loop\n" +
     "finish:\n" +
     "  store i8 0, ptr %flag\n" +
