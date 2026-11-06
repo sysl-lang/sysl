@@ -151,11 +151,13 @@ cte_atomics_run_while_compiling()
         """), "2500490 1\ntrue true\n")
 end cte_atomics_run_while_compiling
 
-@test("a spin lock is refused while compiling, for the processor hint it spins with")
+// A callee is judged where the run reaches it: a free lock is taken without spinning, and only a held
+// one reaches the processor hint.
+@test("a spin lock that has to spin is refused while compiling, for the processor hint it spins with")
 cte_a_spin_lock_is_refused()
     if !enm_ready() then return
 
-    val said = enm_outcome(raw"""
+    assert_eq(enm_ran(raw"""
         import sysl.sync.SpinLock
 
         locked() -> int
@@ -168,9 +170,24 @@ cte_a_spin_lock_is_refused()
         const K: int = locked()
 
         print(K)
+        """), "1\n")
+
+    val said = enm_outcome(raw"""
+        import sysl.sync.SpinLock
+
+        locked() -> int
+            var l = SpinLock(0)
+
+            l.lock()
+            l.lock()
+            1
+
+        const K: int = locked()
+
+        print(K)
         """).0
 
-    assert(said.contains("'K' cannot be computed while compiling: it calls 'locked', which calls " +
-                         "'sysl.sync.SpinLock.lock', which calls 'sysl.sync.spin_hint', which holds an 'asm' " +
-                         "block, which is outside the program"), said)
+    assert(said.contains("'K' cannot be computed while compiling: 'sysl.sync.SpinLock.lock' calls " +
+                         "'sysl.sync.spin_hint', which holds an 'asm' block, which is outside the program"), said)
+    assert(said.contains("; inside 'locked()', called at "), said)
 end cte_a_spin_lock_is_refused

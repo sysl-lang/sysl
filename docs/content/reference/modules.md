@@ -1999,8 +1999,8 @@ arithmetic, bitwise, shift, or comparison operator applied to constant expressio
 a function whose body can run while compiling**, with arguments that are constant expressions. No
 mark is needed for that: a
 [`const` function](/reference/declarations/#a-const-function-runs-while-compiling) is one that
-*promises* it, and any other function is run where its body turns out to hold only what exists
-while compiling. Integers, floats, `bool` and `char` fold, and a `string` constant is a **literal**
+*promises* it, and any other function is run where the part of it the run reaches holds only what
+exists while compiling. Integers, floats, `bool` and `char` fold, and a `string` constant is a **literal**
 or such a call — `const LABEL: string = label(3)` — which builds the string the same call builds
 when the program runs.
 
@@ -2046,22 +2046,47 @@ print(width, share, sizeof(Block))
 32 0 16
 ```
 
-**A call whose body reaches something that exists only when the program runs is refused**, and
-the refusal follows the calls down to it:
+**A call is judged as the run reaches it**, as C++ judges a `constexpr` evaluation and Zig a
+`comptime` one. A function that cannot run while compiling stops the constant only where the run
+actually calls it, so one called on a branch the run does not take costs nothing:
 
 ```sysl
-size() -> int
-    print("asked")
+size(loud: bool) -> int
+    if loud then print("asked")
     4
 
-const called: int = size()
+measured(loud: bool) -> int = size(loud) + 1
+
+const quiet: int = measured(false)
+
+print(quiet)
+```
+
+```output
+5
+```
+
+**A call that reaches something that exists only when the program runs is refused** at the frame
+that reached it, followed by the calls it was inside, innermost first:
+
+```sysl
+size(loud: bool) -> int
+    if loud then print("asked")
+    4
+
+measured(loud: bool) -> int = size(loud) + 1
+
+const called: int = measured(true)
 
 print(called)
 ```
 
 ```error
-'called' cannot be computed while compiling: it calls 'size', which prints, which is outside the program — nothing outside the program exists while compiling
+'called' cannot be computed while compiling: 'size' prints, which is outside the program — nothing outside the program exists while compiling (main.sysl:2:18) — inside 'size(true)', called at main.sysl:5:31; inside 'measured(true)', called at main.sysl:7:21
 ```
+
+What the frame itself holds is judged when the run enters it: one that converts a pointer, runs an
+`asm` block or asks the processor is refused there, whichever branch would have done it.
 
 **The call is run, not guessed at.** The compiler runs the function's body over the arguments, at
 the target's widths — a `usize` wraps at 32 bits when the target's `usize` is 32 bits — with every
