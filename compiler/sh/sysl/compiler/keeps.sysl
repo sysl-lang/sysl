@@ -2,7 +2,7 @@ module sh.sysl.compiler
 
 import sh.sysl.parsing.Span
 import sysl.buf.{Buf, buf}
-import sysl.container.{Map, map}
+import sysl.container.{Map, map, Set, set}
 import sysl.text.from_utf8_unchecked
 // **A borrowed pointer cannot escape** (`reference/memory.md § A borrowed pointer cannot escape`).
 //
@@ -225,6 +225,7 @@ check_keeps(a: &Analysis, funcs: Buf[TFunc], vtables: Buf[TVtable], vals: Buf[TV
 
     // The answers a call may read through a place entry (`place_entry.sysl`), handed to the lowering.
     note_places(cx)
+    note_outliving(cx)
 
     // Each closure literal's capture mode is the same question asked about the literal
     // (`closure_mode.sysl`).
@@ -255,6 +256,18 @@ check_keeps(a: &Analysis, funcs: Buf[TFunc], vtables: Buf[TVtable], vals: Buf[TV
         said.push(item.1)
         a.fault(item.0, item.1, item.2)
 end check_keeps
+
+// The settled answers, handed to the promotion of frame storage (`escape.sysl`), which asks the same
+// question of a view and so reads this one answer rather than working out its own.
+private note_outliving(cx: &KeepsCx)
+    var out: Set[string] = set()
+
+    for f in cx.funcs
+        for i in 0..<f.params.len()
+            if keeps_of(cx, f.name, i).kept then out.add(s"${f.name}|$i")
+
+    cx.an.outlive_kept = out
+end note_outliving
 
 private note_addressed(cx: &KeepsCx, e: TExpr)
     *e.kind match
