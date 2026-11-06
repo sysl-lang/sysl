@@ -2,7 +2,7 @@ module sh.sysl.compiler
 
 import sh.sysl.parsing.*
 import sysl.buf.{Buf, buf}
-import sysl.math.bigint.{BigInt, cmp, from_int}
+import sysl.math.bigint.{BigInt, cmp, from_int, to_string, to_string_radix}
 
 // Whether a set of match arms leaves any value unhandled, and if so what one of those values looks
 // like.
@@ -16,9 +16,18 @@ import sysl.math.bigint.{BigInt, cmp, from_int}
 // arm's alternatives are separate rows, since either may match), one column per value still being
 // discriminated. A column whose type has a **known, finite** set of constructors -- an enum's
 // variants, a struct's single shape, `bool`'s two values -- is split constructor by constructor,
-// each split narrowing the matrix and widening the row by that constructor's fields. A column of
-// any other type has no set to complete, so only a wildcard covers it and the rows headed by
-// literals or ranges drop out.
+// each split narrowing the matrix and widening the row by that constructor's fields.
+//
+// A column of a fixed-width integer or of `char` has a finite set too, too large to list but known
+// exactly as intervals: `u12` is `0..4095`, `char` is the scalar values either side of the
+// surrogates. Its literals and ranges cut the interval wherever one of them begins or ends, so each
+// piece is wholly inside or wholly outside every row, and the pieces are split on as constructors
+// are -- a handful per arm, whatever the width, so a `u256` costs what a `u8` does. `usize` and
+// `isize` are left out, as rustc leaves them out: their width is the target's, so a match that
+// covered one target's would silently stop covering another's.
+//
+// A column of any other type has no set to complete, so only a wildcard covers it and the rows
+// headed by literals or ranges drop out.
 //
 // The recursion answers with **witnesses**: values the matrix does not match, written the way a
 // pattern is, so the diagnostic can name what is missing rather than say only that something is.
@@ -75,7 +84,7 @@ end Gap
 //
 // A guarded arm is left out: a guard cannot discharge anything, since the compiler cannot prove it
 // holds.
-coverage_gap(scrut: Type, arms: Buf[TArm]) -> Option[Gap]
+coverage_gap(scrut: Type, arms: Buf[TArm], m: FoldMachine) -> Option[Gap]
     var rows: Buf[Buf[TPattern]] = buf()
 
     for arm in arms
@@ -90,9 +99,9 @@ coverage_gap(scrut: Type, arms: Buf[TArm]) -> Option[Gap]
 
     tys.push(scrut)
 
-    if covers(rows, tys, 0) then return None
+    if covers(rows, tys, 0, m) then return None
 
-    val ws = witnesses(rows, tys, 0, WitnessLimit + 1)
+    val ws = witnesses(rows, tys, 0, WitnessLimit + 1, m)
 
     if ws.is_empty() then return None
 
@@ -140,7 +149,7 @@ private wit_show(w: Wit) -> string = w match
     WitAny -> "_"
     WitUnknown -> "_"
     WitCtor(name, args) ->
-        if all_anonymous(args) then name
+        if all_anonymous(args) then (if name == "" then "_" else name)
         else
             var out = name + "("
 
@@ -197,7 +206,10 @@ private space(t: Type) -> Option[Buf[Ctor]] = repr(t) match
     Struct(d) ->
         var out: Buf[Ctor] = buf()
 
-        out.push(Ctor(ConWhole, last_segment(module_show(d.base)), field_types(d.fields)))
+        // A tuple has no name to write, so its witness is its parts in parentheses.
+        val name = if is_tuple(d) then "" else last_segment(module_show(d.base))
+
+        out.push(Ctor(ConWhole, name, field_types(d.fields)))
         Some(out)
 
     Bool ->
@@ -332,7 +344,7 @@ end join_types_list
 // one question -- the wildcard rows' tails, read at the deepest point any of those constructors
 // reaches. That is the default matrix, and it is what keeps a column nobody narrowed from
 // multiplying the work by every value of its type.
-private covers(rows: Buf[Buf[TPattern]], tys: Buf[Type], depth: int) -> bool
+private covers(rows: Buf[Buf[TPattern]], tys: Buf[Type], depth: int, m: FoldMachine) -> bool
     if tys.is_empty() then return !rows.is_empty()
 
     if rows.is_empty() then return false
@@ -340,7 +352,16 @@ private covers(rows: Buf[Buf[TPattern]], tys: Buf[Type], depth: int) -> bool
     val rest = tail_types(tys)
     val cons = if depth < MaxSplitDepth then space(tys[0]) else None
 
-    if cons.is_none() then return covers(wild_tails(rows), rest, depth + 1)
+    if cons.is_none()
+        val cut = if depth < MaxSplitDepth then pieces(tys[0], rows, m) else None
+
+        if cut.is_none() then return covers(wild_tails(rows), rest, depth + 1, m)
+
+        for p in cut.unwrap()
+            if !covers(kept_rows(rows, HeadSpan(p.0, p.0), m), rest, depth + 1, m) then return false
+
+        return true
+    end if
 
     val list = cons.unwrap()
     var absent = false
@@ -348,7 +369,7 @@ private covers(rows: Buf[Buf[TPattern]], tys: Buf[Type], depth: int) -> bool
 
     for c in list
         if heads_with(rows, c.con)
-            if !covers(narrow(c, rows), join_types_list(c.args, rest), depth + 1) then return false
+            if !covers(narrow(c, rows), join_types_list(c.args, rest), depth + 1, m) then return false
         else
             absent = true
 
@@ -367,7 +388,7 @@ private covers(rows: Buf[Buf[TPattern]], tys: Buf[Type], depth: int) -> bool
     // constructor has a field with no value at all, a wildcard row is never tested against anything.
     if rest.is_empty() || reach < 0 then return true
 
-    covers(wild, rest, reach)
+    covers(wild, rest, reach, m)
 end covers
 
 // The depth the column after one of type `t` is read at, when `t`'s column holds only wildcards and
@@ -440,7 +461,8 @@ end wild_tails
 //
 // A constructor whose narrowed matrix `covers` is passed over without descending into it, so the
 // search only walks the branches that answer something, and stops once it has `room` answers.
-private witnesses(rows: Buf[Buf[TPattern]], tys: Buf[Type], depth: int, room: usize) -> Buf[Buf[Wit]]
+private witnesses(rows: Buf[Buf[TPattern]], tys: Buf[Type], depth: int, room: usize,
+                  m: FoldMachine) -> Buf[Buf[Wit]]
     var out: Buf[Buf[Wit]] = buf()
 
     if tys.is_empty()
@@ -472,12 +494,33 @@ private witnesses(rows: Buf[Buf[TPattern]], tys: Buf[Type], depth: int, room: us
             val narrowed = narrow(c, rows)
             val wider = join_types_list(c.args, rest)
 
-            if covers(narrowed, wider, depth + 1) then continue
+            if covers(narrowed, wider, depth + 1, m) then continue
 
-            val deeper = witnesses(narrowed, wider, depth + 1, room - out.len())
+            val deeper = witnesses(narrowed, wider, depth + 1, room - out.len(), m)
 
             for j in 0..<deeper.len()
                 if out.len() < room then out.push(lift(c.name, c.args.len(), deeper[j]))
+
+        return out
+    end if
+
+    // An integer or a `char` with literals in its column: each piece the literals leave is named by
+    // the range it spans, which is the whole truth about it.
+    val cut = if depth < MaxSplitDepth then pieces(tys[0], rows, m) else None
+
+    if cut.is_some()
+        for p in cut.unwrap()
+            if out.len() >= room then break
+
+            val kept = kept_rows(rows, HeadSpan(p.0, p.0), m)
+
+            if covers(kept, rest, depth + 1, m) then continue
+
+            val deeper = witnesses(kept, rest, depth + 1, room - out.len(), m)
+
+            for j in 0..<deeper.len()
+                if out.len() < room then
+                    out.push(lift(span_show(tys[0], p.0, p.1), 0, deeper[j]))
 
         return out
     end if
@@ -490,7 +533,7 @@ private witnesses(rows: Buf[Buf[TPattern]], tys: Buf[Type], depth: int, room: us
     for item in rows
         if head_con(item[0]).is_some() then gap = WitUnknown
 
-    val deeper = witnesses(wild_tails(rows), rest, depth + 1, room)
+    val deeper = witnesses(wild_tails(rows), rest, depth + 1, room, m)
 
     for item in deeper
         var row: Buf[Wit] = buf()
@@ -531,10 +574,12 @@ end lift
 // them. Here a useless one is an error rather than a lint.
 //
 // The answer has to agree with coverage, so a match can always be written that is neither dead nor
-// short: a column of an open type -- a number, a string -- is never completed by its literals or
-// ranges, so a wildcard after any number of them is never dead, just as no number of them makes
-// the match exhaustive. Within that column the literals and ranges are compared as the values they
-// are: `3` after `1..5` is dead, and so is `2..7` after `1..4` and `5..9` together.
+// short: a column of a fixed-width integer or a `char` is completed by literals and ranges that
+// fill its domain, so a wildcard after `0..127` and `128..255` on a `u8` is dead, just as those two
+// make the match exhaustive. A column of an open type -- a float, a string, a `usize` -- is never
+// completed by them, so a wildcard after any number of them is never dead. Within either column
+// the literals and ranges are compared as the values they are: `3` after `1..5` is dead, and so is
+// `2..7` after `1..4` and `5..9` together.
 //
 // Only what the compiler can see is known. A pattern that compares against storage -- `` `limit` ``
 // naming a `val` -- holds a value nobody knows yet, so it covers nothing below it, and is dead
@@ -714,6 +759,132 @@ private int_of(t: TExpr, m: FoldMachine) -> Option[BigInt] = const_fold_typed(t,
     Some(ConstChar(c)) -> Some(from_int(long(u32(c))))
     _ -> None
 
+// -- integer domains -------------------------------------------------------------------------------
+
+// Every value a type holds, as the intervals it fills in order, both ends included -- or none for a
+// type whose values are not a known set of integers.
+//
+// `usize` and `isize` are none, as they are in rustc, where a match on one needs a wildcard however
+// many ranges it lists: the type's width is the target's, so ranges that cover it on a 64-bit
+// machine leave a gap on a 32-bit one, and a program checked on the first would stop compiling --
+// or worse, stop covering -- on the second. A `char` is a Unicode scalar value, so its domain is
+// the two runs either side of the surrogates, `'\0'..'\u{D7FF}'` and `'\u{E000}'..'\u{10FFFF}'`,
+// which is rustc's too.
+private int_domain(t: Type) -> Option[Buf[(BigInt, BigInt)]] = repr(t) match
+    Integer(bits, signed, wide) ->
+        if wide || bits < 1 then None
+        else
+            var out: Buf[(BigInt, BigInt)] = buf()
+
+            if signed
+                val half = from_int(1) << usize(bits - 1)
+
+                out.push((-half, half - from_int(1)))
+            else
+                out.push((from_int(0), (from_int(1) << usize(bits)) - from_int(1)))
+
+            Some(out)
+    Char ->
+        var out: Buf[(BigInt, BigInt)] = buf()
+
+        out.push((from_int(0), from_int(0xD7FF)))
+        out.push((from_int(0xE000), from_int(0x10FFFF)))
+        Some(out)
+    _ -> None
+
+// The pieces a column's literals and ranges cut the type's domain into, in order, each wholly
+// inside or wholly outside every row -- or none where the type has no domain, or no row names a
+// value and there is nothing to cut. A row's span begins a piece, and so does the value after its
+// end, so there are at most two cuts per row whatever the width.
+private pieces(t: Type, rows: Buf[Buf[TPattern]], m: FoldMachine) -> Option[Buf[(BigInt, BigInt)]]
+    val dom = int_domain(t)
+
+    if dom.is_none() then return None
+
+    var starts: Buf[BigInt] = buf()
+
+    for row in rows
+        scalar_val(row[0], m) match
+            HeadSpan(a, b) ->
+                for x in [a, b + from_int(1)]
+                    val i = sorted_slot(starts, x)
+
+                    if i < starts.len() && cmp(starts[i], x) == 0 then continue
+
+                    starts.insert(i, x)
+            _ -> ()
+
+    if starts.is_empty() then return None
+
+    var out: Buf[(BigInt, BigInt)] = buf()
+
+    for item in dom.unwrap()
+        var at = item.0
+
+        for s in starts
+            if cmp(s, at) > 0 && cmp(s, item.1) <= 0
+                out.push((at, s - from_int(1)))
+                at = s
+
+        out.push((at, item.1))
+
+    Some(out)
+end pieces
+
+// Where `x` goes in an ascending list: the first place holding a value no smaller.
+private sorted_slot(xs: Buf[BigInt], x: BigInt) -> usize
+    var lo: usize = 0
+    var hi = xs.len()
+
+    while lo < hi
+        val mid = lo + (hi - lo) / 2
+
+        if cmp(xs[mid], x) < 0 then lo = mid + 1 else hi = mid
+
+    lo
+end sorted_slot
+
+// A piece of a domain the way a pattern writes it: one value alone, two as a range. An end at the
+// edge of a signed type is that type's `Min`/`Max`, and an end at the top of an unsigned one its
+// `Max`, so a gap reads `256..u16::Max` rather than as a number nobody can check at a glance.
+private span_show(t: Type, lo: BigInt, hi: BigInt) -> string
+    if cmp(lo, hi) == 0 then return point_show(t, lo)
+
+    point_show(t, lo) + ".." + point_show(t, hi)
+end span_show
+
+private point_show(t: Type, v: BigInt) -> string = repr(t) match
+    Char -> char_show(v)
+    Integer(bits, signed, _) ->
+        val name = type_show(t)
+
+        if signed
+            val half = from_int(1) << usize(bits - 1)
+
+            if cmp(v, -half) == 0 then name + "::Min"
+            elif cmp(v, half - from_int(1)) == 0 then name + "::Max"
+            else to_string(v)
+        elif cmp(v, from_int(0)) > 0 && cmp(v, (from_int(1) << usize(bits)) - from_int(1)) == 0 then
+            name + "::Max"
+        else to_string(v)
+    _ -> to_string(v)
+
+// A `char` as its literal: printable ASCII as itself, the escapes the lexer reads as those, and
+// every other scalar as `\u{…}`.
+private char_show(v: BigInt) -> string
+    val n = v.to_long().unwrap()
+
+    if n == 0 then return "'\\0'"
+    if n == 9 then return "'\\t'"
+    if n == 10 then return "'\\n'"
+    if n == 13 then return "'\\r'"
+    if n == 39 then return "'\\''"
+    if n == 92 then return "'\\\\'"
+    if n >= 32 && n < 127 then return s"'${char(u32(n))}'"
+
+    s"'\\u{${to_string_radix(v, 16)}}'"
+end char_show
+
 // Whether some value vector of the types matches `q` and none of the rows: Maranget's usefulness,
 // over the same splits `covers` makes.
 private useful(rows: Buf[Buf[TPattern]], q: Buf[TPattern], tys: Buf[Type], depth: int,
@@ -728,15 +899,39 @@ private useful(rows: Buf[Buf[TPattern]], q: Buf[TPattern], tys: Buf[Type], depth
 
     if cons.is_some() then return useful_closed(cons.unwrap(), rows, head, q, qrest, rest, depth, m)
 
+    val dom = int_domain(tys[0])
+
     scalar_val(head, m) match
-        HeadSpan(lo, hi) -> useful_span(rows, lo, hi, qrest, rest, depth, m)
+        HeadSpan(lo, hi) ->
+            if dom.is_none() then useful_span(rows, lo, hi, qrest, rest, depth, m)
+            else useful_within(dom.unwrap(), lo, hi, rows, qrest, rest, depth, m)
         HeadText(s) -> useful(kept_rows(rows, HeadText(s), m), qrest, rest, depth + 1, m)
         HeadReal(r) -> useful(kept_rows(rows, HeadReal(r), m), qrest, rest, depth + 1, m)
 
         // A wildcard -- or a value nobody knows, which could be any of them -- is useful where some
-        // value no literal names is: and an open type always has one.
-        _ -> useful(wild_tails(rows), qrest, rest, depth + 1, m)
+        // value no literal names is. An open type always has one; an integer has one only where
+        // the rows above leave a piece of its domain unmatched.
+        _ ->
+            if dom.is_none() then useful(wild_tails(rows), qrest, rest, depth + 1, m)
+            else
+                for item in dom.unwrap()
+                    if useful_span(rows, item.0, item.1, qrest, rest, depth, m) then return true
+
+                false
 end useful
+
+// A span against the rows, asked only over the part of it the type can hold: `char`'s surrogates
+// are not values, so no arm owes them anything.
+private useful_within(dom: Buf[(BigInt, BigInt)], lo: BigInt, hi: BigInt, rows: Buf[Buf[TPattern]],
+                      qrest: Buf[TPattern], rest: Buf[Type], depth: int, m: FoldMachine) -> bool
+    for item in dom
+        val a = if cmp(lo, item.0) > 0 then lo else item.0
+        val b = if cmp(hi, item.1) < 0 then hi else item.1
+
+        if cmp(a, b) <= 0 && useful_span(rows, a, b, qrest, rest, depth, m) then return true
+
+    false
+end useful_within
 
 private useful_closed(list: Buf[Ctor], rows: Buf[Buf[TPattern]], head: TPattern, q: Buf[TPattern],
                       qrest: Buf[TPattern], rest: Buf[Type], depth: int, m: FoldMachine) -> bool

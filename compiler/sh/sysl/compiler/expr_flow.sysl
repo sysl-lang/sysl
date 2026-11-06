@@ -1108,8 +1108,12 @@ private is_enum(t: Type) -> bool = repr(t) match
     Enum(_) -> true
     _ -> false
 
+private is_pointer_width(t: Type) -> bool = repr(t) match
+    Integer(_, _, wide) -> wide
+    _ -> false
+
 private check_coverage(cx: &Analyzer, span: Span, scrut: Type, arms: Buf[TArm])
-    val gap = coverage_gap(scrut, arms)
+    val gap = coverage_gap(scrut, arms, fold_machine(cx.an.tables))
 
     if gap.is_none() then return
 
@@ -1143,6 +1147,15 @@ private check_coverage(cx: &Analyzer, span: Span, scrut: Type, arms: Buf[TArm])
     if is_enum(scrut) || g.exact
         cx.fault(span, s"match on '${type_show(scrut)}' is not exhaustive; missing " +
                  s"${describe_gap(g.names)} (add an 'else' arm)")
+        return
+    end if
+
+    // `usize` and `isize` have a width only once the target is known, so no list of ranges is
+    // treated as completing one -- rustc's rule, and its note, since ranges reaching `usize::Max`
+    // look as though they ought to.
+    if is_pointer_width(scrut)
+        cx.fault(span, s"a 'match' on '${type_show(scrut)}' that yields a value needs an 'else' " +
+                 "arm — its width is the target's, so no ranges are treated as covering it")
         return
     end if
 

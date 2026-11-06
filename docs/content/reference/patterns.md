@@ -60,7 +60,7 @@ Two evaluation guarantees:
 | `else` arm | `else …` | anything; the catch-all spelling in tail position |
 | literal | `0`, `'a'`, `"hi"`, `true` | a value equal to the literal |
 | literal, converted | `u8(';')`, `i32(-1)`, `u16(0x41)` | a value equal to the literal, converted as the expression `u8(';')` would be |
-| range | `3..7`, `0..<10`, `'a'..'z'`, `u8('a')..u8('z')` | a value in the range |
+| range | `3..7`, `0..<10`, `'a'..'z'`, `u8('a')..u8('z')`, `i8::Min..-1` | a value in the range |
 | bind | `r`, `other` | anything, and binds it to the name |
 | variant | `Circle(r)`, `Empty`, `Shape.Empty` | that variant, binding each sub-pattern to a field |
 | nested | `Wrap(Val(v))` | a variant whose payload itself matches a sub-pattern |
@@ -977,8 +977,62 @@ as `missing Some(Push)` rather than `missing Some`, and a position no arm narrow
 `_` standing for all its values, rather than as one line per combination.
 
 **A type is covered by listing its values only when it has a finite, known set of them** — an enum's
-variants, a struct's single shape, `bool`'s two values. Every other type is covered only by a
-wildcard or a binding, so `1 -> …` and `2 -> …` on an `int` still need an `else`.
+variants, a struct's single shape, `bool`'s two values, and **every value of a fixed-width integer
+or a `char`**. Literals and ranges complete an integer the way variants complete an enum, as they do
+in Rust: `0..127` and `128..255` cover a `u8`, and so do `i8::Min..-1`, `0` and `1..i8::Max` an
+`i8`, at any width from `u1` to `u256`. A type's `Min` and `Max` may stand in a pattern as values.
+
+```sysl
+half(b: u8) -> string = b match
+    0..127   -> "low"
+    128..255 -> "high"
+
+sign(n: i8) -> int = n match
+    i8::Min..-1 -> -1
+    0           -> 0
+    1..i8::Max  -> 1
+
+print(half(0), half(255), sign(-128), sign(0), sign(127))
+```
+
+```output
+low high -1 0 1
+```
+
+A gap is named as the ranges that are missing, a type's own bound written as its `Min` or `Max`:
+
+```sysl
+code(b: u16) -> string = b match
+    0..9    -> "digit"
+    20..255 -> "byte"
+
+print(code(3))
+```
+
+```error
+match on 'ushort' is not exhaustive; missing 10..19, 256..ushort::Max (add an 'else' arm)
+```
+
+A `char` is a Unicode scalar value, so it is covered by `'\0'..'\u{D7FF}'` and
+`'\u{E000}'..'\u{10FFFF}'`; the surrogates between them are no value of it. **`usize` and `isize`
+are never completed by ranges**, as in Rust: their width is the target's, so ranges that cover one
+on a 64-bit machine would leave a gap on a 32-bit one, and a match on one that yields a value needs
+an `else`:
+
+```sysl
+slot(n: usize) -> int = n match
+    0..9           -> 0
+    10..usize::Max -> 1
+
+print(slot(3))
+```
+
+```error
+a 'match' on 'usize' that yields a value needs an 'else' arm — its width is the target's, so no ranges are treated as covering it
+```
+
+Every other type — a float, a `string` — is covered only by a wildcard or a binding, so `1.0 -> …`
+on a `real` still needs an `else`.
 
 **A scalar match must be exhaustive only when it is used for a value.** In statement position a
 non-exhaustive scalar match is allowed, and an unmatched value does nothing. An **enum** match is
@@ -1054,8 +1108,26 @@ unreachable pattern 'Some(_)': every value it matches is already matched by the 
 ```
 
 **The answer agrees with exhaustiveness, so a match can always be written that is neither short nor
-dead.** Literals and ranges never complete an integer, a float or a string, so a wildcard after them
-is never dead. That holds even after `0..255` on a `u8`, where the wildcard is still required.
+dead.** Literals and ranges that fill a fixed-width integer or a `char` complete it, so a wildcard
+after them is dead; ones that leave a value out, or that range over a float, a string, a `usize` or
+an `isize`, never complete it, so a wildcard after them is never dead:
+
+```sysl
+half(b: u8) -> string = b match
+    0..127   -> "low"
+    128..255 -> "high"
+    _        -> "neither"
+
+print(half(3))
+```
+
+```error
+unreachable pattern '_': every value it matches is already matched by the arms on lines 2 and 3
+```
+
+Two ranges that overlap are not refused unless one of them is dead: the reference's guarded `1..10`
+arms overlap on purpose, and with no warning tier an overlap Rust would lint has nowhere to go but
+an error.
 Matching against storage, such as `` `limit` `` naming a `val`, compares with a value the compiler
 does not know. Such an arm covers nothing below it, and it is dead only after an arm that matches
 everything.

@@ -284,6 +284,23 @@ private parse_named_pattern(p: *Parser, start: Span) -> Buf[Pattern]
         return out
     end if
 
+    // `i8::Min..-1` -- a type's bound as a value, alone or opening a range. Nothing else a pattern
+    // writes has `::` after a name.
+    if !dotted && !quoted && p.at_kw("::")
+        val lo = type_attr_lit(p, name, start)
+
+        return parse_range_op(p) match
+            None -> one(pattern_of(start.to(p.just_taken()), LitPattern(lo)))
+            Some(inclusive) ->
+                val hi = parse_pattern_lit(p) match
+                    Some(e) -> e
+                    None ->
+                        p.want("expression")
+                        expr(p.here(), Bad)
+
+                one(pattern_of(start.to(p.just_taken()), RangePattern(lo, hi, inclusive)))
+    end if
+
     if p.at_kw("{")
         p.bump()
 
@@ -397,6 +414,22 @@ conversion_of(name: string, lit: Expr, at: Span) -> Expr
     expr(at, Call(expr(at, Ident(name)), args))
 end conversion_of
 
+// `T::Max` after the type's name has been taken, standing at the `::`: the expression it is, which
+// the analyzer folds to the number like any other bound and refuses where it names no constant.
+private type_attr_lit(p: *Parser, name: string, start: Span) -> Expr
+    val colons = p.here()
+
+    p.bump()
+
+    val at = p.here()
+
+    p.name() match
+        Some(attr) -> expr(start.to(at), TypeAttr(expr(start, Ident(name)), attr, colons, at))
+        None ->
+            p.want("a name")
+            expr(at, Bad)
+end type_attr_lit
+
 // The literals a pattern may hold, and the negative form of a number.
 private parse_pattern_lit(p: *Parser) -> Option[Expr]
     val start = p.here()
@@ -417,6 +450,12 @@ private parse_pattern_lit(p: *Parser) -> Option[Expr]
 
                 p.expect_kw(")")
                 return Some(conversion_of(n, inner.unwrap(), start.to(p.just_taken())))
+            end if
+
+            // `u8::Max` -- a type's bound, as the far end of a range.
+            if p.kw_at(1, "::")
+                p.bump()
+                return Some(type_attr_lit(p, n, start))
             end if
         _ -> ()
 
