@@ -881,6 +881,54 @@ copy_out(n: int) = val _ = print(n)
 A call whose result is not wanted needs no `val _ =` to discard it: `copy_out(n: int) = print(n)` is
 already a body, and a block's statement line may be a bare call.
 
+### A write to a by-value parameter nothing reads is lost
+
+**A parameter written `p: P` is the function's own copy of what the caller passed**, so writing it —
+or a field or an element of it — changes the copy and nothing else. When no read in the body can see
+the write afterwards, the write does nothing, and the compiler refuses it:
+
+```sysl
+struct Counter
+    n: int
+
+bump(c: Counter) = c.n += 1
+
+var c = Counter(1)
+
+bump(c)
+print(c.n)
+```
+
+```error
+this '+=' changes 'c', a copy of what the caller passed, and nothing reads 'c' afterwards, so the change is lost — take 'c: *Counter' to change the caller's value, or return the value
+```
+
+The two ways to say what was meant are the ones the error names: `bump(c: *Counter)`, called as
+`bump(&c)`, writes the caller's value; `bump(c: Counter) -> Counter`, ending with `c`, hands the new
+value back. A write the body goes on to read is the copy doing its job, and is not refused:
+
+```sysl
+struct Counter
+    n: int
+
+next(c: Counter) -> int
+    c.n += 1
+    c.n
+
+print(next(Counter(1)))
+```
+
+```output
+2
+```
+
+A `*self` method called on the copy (`c.reset()`) is a write in the same sense, and so is a whole
+assignment (`c = Counter(0)`). A write through what the copy refers to — a `*T` or `&T` field, a
+slice's element, a `Buf` — reaches storage the caller shares, and is never lost. A parameter that is
+itself a `*T`, `&T` or `&sync T` is not a copy. Where the parameter may be reached under another name —
+a closure or a nested function captures it, its address is taken, a `ref` stands for it — the body
+is not followed, and nothing is said.
+
 ### The result type
 
 **A body written `= value` with no `-> T` takes the value's type**, exactly as a `val` written with

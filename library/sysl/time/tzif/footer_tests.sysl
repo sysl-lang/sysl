@@ -1,0 +1,300 @@
+module sysl.time.tzif
+@tests
+
+import sysl.time.{Instant, date_time, Resolution, RuledZone}
+import sysl.buf.{Buf, buf}
+
+// The footer's POSIX `TZ` rule, which answers every instant at or after a file's last transition.
+//
+// **Every expected value here comes from a reader nobody here wrote.** The slim Toronto file is
+// `zic -b slim` output, and its answers agree with Python's `zoneinfo` reading the same file and with
+// the host's `TZ=America/Toronto date -r <secs>`. The rules written out as strings were checked with
+// `TZ='<rule>' date -r <secs>`, which hands the string to the host's own tzcode -- except the negative
+// rule time, which macOS's tzcode does not read, and which was checked with `zoneinfo` over a
+// `zic`-written file whose footer is that rule.
+
+// `zic -b slim` of a Toronto-shaped zone: EST/EDT, the 2006 rules, then the current ones from 2007.
+// The table stops at the 2007 spring change, the last one the rules did not predict, and everything
+// after it is the footer's -- which is what the database has shipped by default since 2020b.
+val toronto_slim_tzif: [166]u8 = [
+    84, 90, 105, 102, 50, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0,
+    0, 0, 0, 84, 90, 105, 102, 50, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 2, 0, 0, 0, 8, 0,
+    0, 0, 0, 68, 47, 118, 112, 0, 0, 0, 0, 69, 68, 67, 96, 0,
+    0, 0, 0, 69, 243, 168, 240, 1, 0, 1, 255, 255, 185, 176, 0, 4,
+    255, 255, 199, 192, 1, 0, 69, 68, 84, 0, 69, 83, 84, 0, 10, 69,
+    83, 84, 53, 69, 68, 84, 44, 77, 51, 46, 50, 46, 48, 44, 77, 49,
+    49, 46, 49, 46, 48, 10
+]
+
+// A version 2 file with no transitions and one type -- `LMT`, at UTC -- and no footer yet. A rule
+// appended to it answers every instant, so these bytes are the stage each rule below is read on; a
+// lookup that fell back to the table would answer `LMT`, which no rule here names.
+val bare_tzif: [108]u8 = [
+    84, 90, 105, 102, 50, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 4, 0, 0, 0, 0,
+    0, 0, 76, 77, 84, 0,
+    84, 90, 105, 102, 50, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 4, 0, 0, 0, 0,
+    0, 0, 76, 77, 84, 0
+]
+
+// Where `eastern_tzif`'s footer starts, so its table can be given a different one.
+private const eastern_head: usize = 164
+
+private second(secs: long) -> Instant = Instant(secs * 1000000)
+
+/** The bytes `head` and then `rule` as a footer, newline on each side as the format writes it. */
+private with_footer(head: []const u8, rule: string) -> Buf[u8]
+    var b: Buf[u8] = buf()
+
+    b.extend(head)
+    b.push(u8('\n'))
+    b.extend(rule.bytes)
+    b.push(u8('\n'))
+    b
+
+/** Asserts all three things a lookup answers at one instant, since they come from one place and a
+ * footer read wrongly can get the offset right and the name wrong.
+ */
+private reads(z: Zone, secs: long, minutes: int, name: string, dst: bool)
+    assert_eq(offset_at(z, second(secs)).unwrap().minutes, minutes)
+    assert_eq(abbrev_at(z, second(secs)).unwrap(), name)
+    assert_eq(is_dst_at(z, second(secs)).unwrap(), dst)
+
+/** Asserts the change at `secs`: the second before reads one way and the change itself the other. */
+private changes(z: Zone, secs: long, before: int, before_name: string, after: int, after_name: string)
+    reads(z, secs - 1, before, before_name, before > after)
+    reads(z, secs, after, after_name, after > before)
+    reads(z, secs + 1, after, after_name, after > before)
+
+private refusal(bytes: []const u8) -> Option[TzifError] = parse(bytes) match
+    Err(e) -> Some(e)
+    Ok(_) -> None
+
+private footer_error(rule: string) -> Option[TzifError]
+    val bytes = with_footer(bare_tzif[..], rule)
+
+    refusal(bytes.view())
+
+@test("tzf: a slim file answers a future summer and winter from its footer")
+tzf_toronto_slim_seasons()
+    val z = parse(toronto_slim_tzif[..]).unwrap()
+
+    // 2040-07-01T12:00Z and 2040-01-15T12:00Z. The table's last type is EDT, so a reader that ignored
+    // the footer answered the January one an hour out.
+    reads(z, 2224756800, -240, "EDT", true)
+    reads(z, 2210241600, -300, "EST", false)
+end tzf_toronto_slim_seasons
+
+@test("tzf: the 2040 changes land on their exact second")
+tzf_toronto_slim_changes()
+    val z = parse(toronto_slim_tzif[..]).unwrap()
+
+    // 2040-03-11T07:00Z, the second Sunday of March at 02:00 EST.
+    changes(z, 2215062000, -300, "EST", -240, "EDT")
+    // 2040-11-04T06:00Z, the first Sunday of November at 02:00 EDT.
+    changes(z, 2235621600, -240, "EDT", -300, "EST")
+end tzf_toronto_slim_changes
+
+@test("tzf: before its last transition a slim file still answers from its table")
+tzf_toronto_slim_table()
+    val z = parse(toronto_slim_tzif[..]).unwrap()
+
+    // 2006-07-01T12:00Z, under the 2006 rules the footer does not state.
+    reads(z, 1151755200, -240, "EDT", true)
+    // 2007-01-15T12:00Z, after the 2006 autumn change.
+    reads(z, 1168862400, -300, "EST", false)
+    // And the last transition itself, 2007-03-11T07:00Z, where the footer takes over.
+    changes(z, 1173596400, -300, "EST", -240, "EDT")
+end tzf_toronto_slim_table
+
+@test("tzf: a repeated hour past the table resolves to both instants")
+tzf_toronto_slim_resolves()
+    val z = parse(toronto_slim_tzif[..]).unwrap()
+
+    val zone = RuledZone("Toronto", t -> offset_at(z, t).unwrap())
+
+    zone.resolve(date_time(2040, 11, 4, 1, 30, 0)) match
+        Ambiguous(earlier, later) ->
+            assert_eq(earlier.us, 2235619800 * 1000000)
+            assert_eq(later.us, 2235623400 * 1000000)
+        _ -> assert(false, "the repeated hour of 2040 did not resolve to two instants")
+
+    zone.resolve(date_time(2040, 3, 11, 2, 30, 0)) match
+        Gap(before, after) ->
+            assert_eq(before.minutes, -300)
+            assert_eq(after.minutes, -240)
+        _ -> assert(false, "the skipped hour of 2040 resolved to an instant")
+end tzf_toronto_slim_resolves
+
+@test("tzf: daylight saving that spans the new year is in force outside the interval")
+tzf_southern_hemisphere()
+    val bytes = with_footer(bare_tzif[..], "AEST-10AEDT,M10.1.0,M4.1.0/3")
+    val z = parse(bytes.view()).unwrap()
+
+    reads(z, 2210198400, 660, "AEDT", true)
+    reads(z, 2225923200, 600, "AEST", false)
+
+    // Either side of midnight on New Year's Eve, which is where working in the wrong year shows.
+    reads(z, 2208951000, 660, "AEDT", true)
+    reads(z, 2208988800, 660, "AEDT", true)
+
+    // 2040-03-31T16:00Z is 03:00 AEDT on the first Sunday of April; 2040-10-06T16:00Z is 02:00 AEST
+    // on the first Sunday of October.
+    changes(z, 2216822400, 660, "AEDT", 600, "AEST")
+    changes(z, 2233152000, 600, "AEST", 660, "AEDT")
+end tzf_southern_hemisphere
+
+@test("tzf: Jn never counts the 29th of February and n always does")
+tzf_julian_forms()
+    // J60 is the 1st of March in every year, 2040's leap day included.
+    val j = with_footer(bare_tzif[..], "XST3XDT,J60,J300")
+    val zj = parse(j.view()).unwrap()
+
+    changes(zj, 2214190800, -180, "XST", -120, "XDT")
+    // J300 is the 27th of October, at 02:00 XDT.
+    changes(zj, 2234923200, -120, "XDT", -180, "XST")
+
+    // Day 59 counted from zero is the 29th of February in 2040 and the 1st of March in 2039.
+    val n = with_footer(bare_tzif[..], "XST3XDT,59,299")
+    val zn = parse(n.view()).unwrap()
+
+    changes(zn, 2214104400, -180, "XST", -120, "XDT")
+    changes(zn, 2182568400, -180, "XST", -120, "XDT")
+end tzf_julian_forms
+
+@test("tzf: a rule time may be negative, and may run past 24 hours")
+tzf_rule_times()
+    // Nuuk's: the change is at -1:00 on the last Sunday of March, which is 23:00 on the Saturday.
+    val nuuk = with_footer(bare_tzif[..], "<-02>2<-01>,M3.5.0/-1,M10.5.0/0")
+    val zn = parse(nuuk.view()).unwrap()
+
+    changes(zn, 2216250000, -120, "-02", -60, "-01")
+    changes(zn, 2234998800, -60, "-01", -120, "-02")
+
+    // Jerusalem's: 26:00 on the Thursday before the last Sunday of March is 02:00 on the Friday.
+    val jerusalem = with_footer(bare_tzif[..], "IST-2IDT,M3.4.4/26,M10.5.0")
+    val zi = parse(jerusalem.view()).unwrap()
+
+    changes(zi, 2216073600, 120, "IST", 180, "IDT")
+    changes(zi, 2234991600, 180, "IDT", 120, "IST")
+
+    // RFC 8536's own example of daylight saving all year: the end is 25:00 on the 31st of December
+    // in daylight time, which is the moment the next year's start begins again.
+    val always = with_footer(bare_tzif[..], "EST5EDT,0/0,J365/25")
+    val za = parse(always.view()).unwrap()
+
+    reads(za, 2209006800, -240, "EDT", true)
+    reads(za, 2240568000, -240, "EDT", true)
+end tzf_rule_times
+
+@test("tzf: a footer with no daylight saving is one offset everywhere")
+tzf_no_dst()
+    val utc = with_footer(bare_tzif[..], "UTC0")
+    val zu = parse(utc.view()).unwrap()
+
+    reads(zu, 2224713600, 0, "UTC", false)
+    reads(zu, 0, 0, "UTC", false)
+
+    // The quoted form, with minutes, and a sign meaning east.
+    val india = with_footer(bare_tzif[..], "<+0530>-5:30")
+    val zi = parse(india.view()).unwrap()
+
+    reads(zi, 2224713600, 330, "+0530", false)
+
+    // Seconds too, as local mean time carries; the `Offset` keeps the whole minutes.
+    val lmt = with_footer(bare_tzif[..], "XXX-1:30:45")
+    val zl = parse(lmt.view()).unwrap()
+
+    reads(zl, 2224713600, 90, "XXX", false)
+end tzf_no_dst
+
+@test("tzf: the table answers up to its last transition and the footer from it on")
+tzf_table_then_footer()
+    // US Eastern's 2023 table with a footer that disagrees with it, so which one answered is visible.
+    val bytes = with_footer(eastern_tzif[0..<eastern_head], "UTC0")
+    val z = parse(bytes.view()).unwrap()
+
+    reads(z, 1686830400, -240, "EDT", true)
+    reads(z, 0, -300, "EST", false)
+
+    // The last transition, 2023-11-05T06:00Z, is the footer's own first second.
+    reads(z, 1699163999, -240, "EDT", true)
+    reads(z, 1699164000, 0, "UTC", false)
+end tzf_table_then_footer
+
+@test("tzf: a fat file reads as it did inside its table, and by its rule after it")
+tzf_fat_unchanged()
+    val z = parse(eastern_tzif[..]).unwrap()
+
+    reads(z, 1686844800, -240, "EDT", true)
+    reads(z, 1673798400, -300, "EST", false)
+    reads(z, 1699163940, -240, "EDT", true)
+    reads(z, 1699164000, -300, "EST", false)
+
+    // 2024-07-01T12:00Z, past the table: the last type is EST, and the footer says EDT.
+    reads(z, 1719835200, -240, "EDT", true)
+end tzf_fat_unchanged
+
+@test("tzf: an empty footer leaves the last type answering past the table")
+tzf_empty_footer()
+    val bytes = with_footer(eastern_tzif[0..<eastern_head], "")
+    val z = parse(bytes.view()).unwrap()
+
+    reads(z, 1719835200, -300, "EST", false)
+
+    // And the bytes stopping where the block does is the same as an empty footer.
+    val cut = parse(eastern_tzif[0..<eastern_head]).unwrap()
+
+    reads(cut, 1719835200, -300, "EST", false)
+end tzf_empty_footer
+
+@test("tzf: a malformed rule is refused at the byte where it stops fitting")
+tzf_malformed()
+    assert_eq(footer_error("EST5EDT"), Some(BadFooter(7)))
+    assert_eq(footer_error("EST"), Some(BadFooter(3)))
+    assert_eq(footer_error("ES5"), Some(BadFooter(2)))
+    assert_eq(footer_error("<+05-5"), Some(BadFooter(6)))
+    assert_eq(footer_error("<+5>-5"), Some(BadFooter(3)))
+    assert_eq(footer_error("EST25"), Some(BadFooter(4)))
+    assert_eq(footer_error("EST5:60"), Some(BadFooter(6)))
+    assert_eq(footer_error("EST5EDT,M13.1.0,M11.1.0"), Some(BadFooter(10)))
+    assert_eq(footer_error("EST5EDT,M3.0.0,M11.1.0"), Some(BadFooter(11)))
+    assert_eq(footer_error("EST5EDT,M3.2.7,M11.1.0"), Some(BadFooter(13)))
+    assert_eq(footer_error("EST5EDT,J0,J300"), Some(BadFooter(9)))
+    assert_eq(footer_error("EST5EDT,366,J300"), Some(BadFooter(10)))
+    assert_eq(footer_error("EST5EDT,M3.2.0/168,M11.1.0"), Some(BadFooter(17)))
+    assert_eq(footer_error("EST5EDT,M3.2.0"), Some(BadFooter(14)))
+    assert_eq(footer_error("EST5EDT,M3.2.0,M11.1.0x"), Some(BadFooter(22)))
+
+    // The good rules above, so the refusals are not a decoder that refuses everything.
+    assert_eq(footer_error("EST5EDT,M3.2.0,M11.1.0"), None)
+    assert_eq(footer_error("<+0530>-5:30"), None)
+end tzf_malformed
+
+@test("tzf: a footer that is not framed by newlines is refused")
+tzf_unframed()
+    var b: Buf[u8] = buf()
+
+    b.extend(bare_tzif[..])
+    b.extend("UTC0\n".bytes)
+
+    assert_eq(refusal(b.view()), Some(BadFooter(0)))
+
+    var c: Buf[u8] = buf()
+
+    c.extend(bare_tzif[..])
+    c.extend("\nUTC0".bytes)
+
+    assert_eq(refusal(c.view()), Some(BadFooter(4)))
+end tzf_unframed
+
+@test("tzf: the refusal says where, in words")
+tzf_refusal_text()
+    assert_eq(s"${BadFooter(7)}", "the footer's TZ rule is malformed at byte 7 of the rule")

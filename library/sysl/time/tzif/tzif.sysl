@@ -1,6 +1,8 @@
 module sysl.time.tzif
 
-import sysl.time.{Instant, Offset, us_per_second}
+import sysl.time.{Instant, Offset, us_per_second, Date, YearMonthDay, Weekday}
+import sysl.time.{days_from_civil, civil_from_days, days_in_month, leap_year, on_or_after}
+import sysl.math.div_floor
 import sysl.encoding.get_u32_be
 import sysl.text.from_utf8
 
@@ -38,9 +40,19 @@ import sysl.text.from_utf8
  *
  * **The version 2+ block is the one read**, where the file has one -- its transition times are 8
  * bytes, and a 4-byte time runs out in 2038. A version 1 file is still read, from its only block.
- * The footer's `TZ` string, which extrapolates past the last transition, is **not** read: a lookup
- * past the end answers with the last type, which is what the table says and is right until a zone
- * changes its rules again.
+ *
+ * ## Past the end of the table, the footer's rule
+ *
+ * A version 2+ file ends with a POSIX `TZ` string -- `EST5EDT,M3.2.0,M11.1.0` -- and **every instant
+ * at or after the last transition is answered by that rule**, as is every instant of a file with no
+ * transitions at all (RFC 8536 §3.3). This is not a refinement: since tzdata 2020b `zic` writes
+ * "slim" files by default, which stop the table at the last change of *rules* and leave every later
+ * daylight-saving switch to the footer, so a reader that answered with the last type would put a
+ * whole season of every future year an hour out. A "fat" file runs out the same way in 2037.
+ *
+ * The rule is checked once, by `parse`, and a footer that is not one is refused as `BadFooter` rather
+ * than read as far as it makes sense. A file whose footer is empty, or a version 1 file, which has
+ * none, answers past its end with the last type, which is all it says.
  */
 
 /** A zone, as a view of the bytes it was decoded from. */
@@ -54,6 +66,9 @@ struct Zone
     typecnt: usize
     // Whether a transition time is 8 bytes. False only for a version 1 file.
     wide: bool
+    // The footer's rule, between its two newlines; empty where the file has no rule.
+    footer_at: usize
+    footer_end: usize
 
 /** Why a decode refused, at the granularity a caller can act on.
  *
@@ -61,13 +76,15 @@ struct Zone
  * caller would **do** about each. `BadMagic` is a file that is not one of these at all -- the usual
  * cause being a path that named something else. `Truncated` carries the length that would have been
  * enough, so a caller reading in pieces knows how much more to get rather than doubling until it
- * fits.
+ * fits. `BadFooter` carries where in the footer's rule the reading stopped, counted in bytes from
+ * the rule's first character -- `EST5EDT` with no dates after it is `BadFooter(7)`.
  */
 enum TzifError derives Eq
     BadMagic
     BadVersion(saw: u8)
     Truncated(needed: usize)
     NoTypes
+    BadFooter(at: usize)
 
 impl Display for TzifError
     display(self, out: *Writer, fmt: FormatSpec)
@@ -76,6 +93,7 @@ impl Display for TzifError
             BadVersion(saw) -> s"TZif version $saw is not one this reads"
             Truncated(needed) -> s"the file is shorter than its header says: $needed bytes needed"
             NoTypes -> "the file declares no local time types, so no time in it has an offset"
+            BadFooter(at) -> s"the footer's TZ rule is malformed at byte $at of the rule"
 
         display_str(text, out, fmt)
     end display
@@ -195,8 +213,263 @@ parse(data: []const u8) -> Result[Zone, TzifError]
 
     if desig_at + charcnt > data.len then return Err(Truncated(desig_at + charcnt))
 
-    Ok(Zone(data, trans_at, types_at, ttinfo_at, desig_at, timecnt, typecnt, time_size == 8))
+    var footer_at: usize = 0
+    var footer_end: usize = 0
+
+    // The footer is a newline, the rule, and a newline, straight after the wide block. A buffer that
+    // stops where the block does has no footer to read, which answers as an empty one would.
+    if version != 0
+        val block_end = at + header_len + block_len(data, at, 8)?
+
+        if data.len > block_end
+            if data[block_end] != u8('\n') then return Err(BadFooter(0))
+
+            footer_at = block_end + 1
+            footer_end = footer_at
+
+            while footer_end < data.len && data[footer_end] != u8('\n')
+                footer_end += 1
+
+            if footer_end == data.len then return Err(BadFooter(footer_end - footer_at))
+
+            if footer_end > footer_at then rule(data, footer_at, footer_end)?
+
+    Ok(Zone(data, trans_at, types_at, ttinfo_at, desig_at, timecnt, typecnt, time_size == 8,
+        footer_at, footer_end))
 end parse
+
+// -- the footer's rule --------------------------------------------------------------------------------
+
+/** Where a name sits in the zone's bytes. */
+private struct Span
+    at: usize
+    len: usize
+
+/** One of the rule's two dates: `Jn` (`kind` 'J'), `n` ('n'), or `Mm.w.d` ('M'), each with the time
+ * of day the change happens at, in seconds of local time, which RFC 8536 lets run from -167 to 167
+ * hours so that a change can be stated on a day other than the one it lands on.
+ */
+private struct DateRule
+    kind: u8
+    // The day for `J` and `n`, the month for `M`.
+    n: int
+    week: int
+    day: int
+    time: int
+
+/** A footer's rule, decoded. The offsets are seconds EAST of UTC, which is the opposite sign from the
+ * one POSIX writes: `EST5` is five hours west.
+ */
+private struct TzRule
+    std_name: Span
+    std_off: int
+    has_dst: bool
+    dst_name: Span
+    dst_off: int
+    start: DateRule
+    stop: DateRule
+
+/** A cursor over the rule; `from` is where it starts, so a refusal can say how far in it got. */
+private struct Footer
+    b: []const u8
+    from: usize
+    at: usize
+    end: usize
+
+private bad(f: *Footer) -> TzifError = BadFooter(f.at - f.from)
+
+private peek(f: *Footer) -> u8 = if f.at < f.end then f.b[f.at] else 0
+
+private is_digit(c: u8) -> bool = c >= u8('0') && c <= u8('9')
+
+private is_alpha(c: u8) -> bool = (c >= u8('a') && c <= u8('z')) || (c >= u8('A') && c <= u8('Z'))
+
+private expect(f: *Footer, c: u8) -> Result[(), TzifError]
+    if peek(f) != c then return Err(bad(f))
+
+    f.at += 1
+    Ok(())
+
+/** A name of three or more letters, or the quoted form `<+0530>` that lets a name hold digits and a
+ * sign -- which is what the database writes for every zone with no abbreviation of its own.
+ */
+private zone_name(f: *Footer) -> Result[Span, TzifError]
+    if peek(f) == u8('<')
+        f.at += 1
+        val start = f.at
+
+        while is_alpha(peek(f)) || is_digit(peek(f)) || peek(f) == u8('+') || peek(f) == u8('-')
+            f.at += 1
+
+        if f.at - start < 3 || peek(f) != u8('>') then return Err(bad(f))
+
+        f.at += 1
+        return Ok(Span(start, f.at - 1 - start))
+
+    val start = f.at
+
+    while is_alpha(peek(f))
+        f.at += 1
+
+    if f.at - start < 3 then return Err(bad(f))
+
+    Ok(Span(start, f.at - start))
+end zone_name
+
+/** An unsigned decimal no greater than `max`. */
+private number(f: *Footer, max: int) -> Result[int, TzifError]
+    if !is_digit(peek(f)) then return Err(bad(f))
+
+    var n = 0
+
+    while is_digit(peek(f))
+        n = n * 10 + int(peek(f) - u8('0'))
+
+        if n > max then return Err(bad(f))
+
+        f.at += 1
+
+    Ok(n)
+end number
+
+/** A number from 1 to `max`, refused where it starts if it is 0. */
+private counted(f: *Footer, max: int) -> Result[int, TzifError]
+    val start = f.at
+    val n = number(f, max)?
+
+    if n == 0 then return Err(BadFooter(start - f.from))
+
+    Ok(n)
+
+/** `[+-]hh[:mm[:ss]]` as seconds -- an offset, where `max_hours` is 24, or a rule's time of day,
+ * where it is 167.
+ */
+private clock(f: *Footer, max_hours: int) -> Result[int, TzifError]
+    var sign = 1
+
+    if peek(f) == u8('+')
+        f.at += 1
+    else if peek(f) == u8('-')
+        sign = -1
+        f.at += 1
+
+    var secs = number(f, max_hours)? * 3600
+
+    if peek(f) == u8(':')
+        f.at += 1
+        secs += number(f, 59)? * 60
+
+        if peek(f) == u8(':')
+            f.at += 1
+            secs += number(f, 59)?
+
+    Ok(sign * secs)
+end clock
+
+/** One date of the rule, with its time; a time left out is 02:00, as POSIX says. */
+private date_rule(f: *Footer) -> Result[DateRule, TzifError]
+    var r = DateRule(u8('n'), 0, 0, 0, 7200)
+
+    if peek(f) == u8('J')
+        f.at += 1
+        r.kind = u8('J')
+        // Day 0 does not exist in the form that skips the 29th of February.
+        r.n = counted(f, 365)?
+    else if peek(f) == u8('M')
+        f.at += 1
+        r.kind = u8('M')
+        r.n = counted(f, 12)?
+        expect(f, u8('.'))?
+        r.week = counted(f, 5)?
+        expect(f, u8('.'))?
+        r.day = number(f, 6)?
+    else
+        r.n = number(f, 365)?
+
+    if peek(f) == u8('/')
+        f.at += 1
+        r.time = clock(f, 167)?
+
+    Ok(r)
+end date_rule
+
+/** The rule between `from` and `end` in `b`, refused at the first byte that does not fit the grammar.
+ *
+ * **A daylight name with no dates after it is refused**, though POSIX lets an implementation supply
+ * its own default: the default is the implementation's, so a file relying on one would mean different
+ * things to different readers, and `zic` never writes one.
+ */
+private rule(b: []const u8, from: usize, end: usize) -> Result[TzRule, TzifError]
+    var f = Footer(b, from, from, end)
+    val unused = DateRule(u8('n'), 0, 0, 0, 0)
+    val std_name = zone_name(&f)?
+    val std_off = -(clock(&f, 24)?)
+
+    if f.at == f.end
+        return Ok(TzRule(std_name, std_off, false, Span(0, 0), std_off, unused, unused))
+
+    val dst_name = zone_name(&f)?
+    var dst_off = std_off + 3600
+
+    if peek(&f) != u8(',') then dst_off = -(clock(&f, 24)?)
+
+    expect(&f, u8(','))?
+    val start = date_rule(&f)?
+    expect(&f, u8(','))?
+    val stop = date_rule(&f)?
+
+    if f.at != f.end then return Err(bad(&f))
+
+    Ok(TzRule(std_name, std_off, true, dst_name, dst_off, start, stop))
+end rule
+
+/** The day, counted from 1970, on which a date of the rule falls in year `y`. */
+private rule_day(r: DateRule, y: int) -> int
+    val jan1 = days_from_civil(YearMonthDay(y, 1, 1)).day
+
+    if r.kind == u8('n') then return jan1 + r.n
+
+    if r.kind == u8('J') then return jan1 + r.n - 1 + (if leap_year(y) && r.n >= 60 then 1 else 0)
+
+    // The w-th d-day of the month, where the fifth means the last, which some months have only four of.
+    var day = on_or_after(days_from_civil(YearMonthDay(y, r.n, 1)), Weekday(r.day)).day + (r.week - 1) * 7
+    val last = days_from_civil(YearMonthDay(y, r.n, days_in_month(y, r.n))).day
+
+    while day > last
+        day -= 7
+
+    day
+end rule_day
+
+/** What the zone's clocks read at `secs` by the footer's rule.
+ *
+ * **The year is the one standard time is in**, and both changes are worked out in it: the start is
+ * stated in standard time and the end in daylight time, so each is taken back to UTC by its own
+ * offset. Where the start comes after the end in the year, daylight saving spans the new year -- the
+ * southern hemisphere's case -- and is in force outside the interval rather than inside it.
+ */
+private by_rule(r: TzRule, secs: long) -> Local
+    val standard = Local(r.std_off, false, r.std_name)
+
+    if !r.has_dst then return standard
+
+    val y = civil_from_days(Date(int(div_floor(secs + long(r.std_off), 86400)))).year
+    val start = long(rule_day(r.start, y)) * 86400 + long(r.start.time) - long(r.std_off)
+    val stop = long(rule_day(r.stop, y)) * 86400 + long(r.stop.time) - long(r.dst_off)
+    val dst = if start < stop then secs >= start && secs < stop else secs < stop || secs >= start
+
+    if dst then Local(r.dst_off, true, r.dst_name) else standard
+end by_rule
+
+// -- lookup -------------------------------------------------------------------------------------------
+
+/** What a zone's clocks read at one instant: seconds east of UTC, whether that is daylight saving, and
+ * where the abbreviation is.
+ */
+private struct Local
+    off: int
+    dst: bool
+    name: Span
 
 private transition(z: Zone, i: usize) -> Result[long, TzifError]
     if z.wide then return i64_at(z.data, z.trans_at + i * 8)
@@ -237,22 +510,44 @@ private type_index(z: Zone, secs: long) -> Result[usize, TzifError]
     Ok(0)
 end type_index
 
+/** What the clocks read at `secs`: from the footer's rule at or after the last transition, or
+ * anywhere in a file that has none, and from the table everywhere else.
+ */
+private local_at(z: Zone, secs: long) -> Result[Local, TzifError]
+    if z.footer_end > z.footer_at && (z.timecnt == 0 || secs >= transition(z, z.timecnt - 1)?)
+        return Ok(by_rule(rule(z.data, z.footer_at, z.footer_end)?, secs))
+
+    val k = type_index(z, secs)?
+    val at = z.ttinfo_at + k * ttinfo_len
+    val off = i32_at(z.data, at)?
+    // The designations are one NUL-separated run, and a type names its own by where it starts.
+    val start = z.desig_at + usize(z.data[at + 5])
+
+    if start > z.data.len then return Err(Truncated(start))
+
+    var end = start
+
+    while end < z.data.len && z.data[end] != 0
+        end += 1
+
+    Ok(Local(off, z.data[at + 4] != 0, Span(start, end - start)))
+end local_at
+
 /** How far this zone's clocks were set from UTC at that instant.
  *
  * **This is the rule a `sysl.time.RuledZone` holds**, which is the whole point of it: a zone read from a
  * file, a zone talking to a chip and a zone written out by hand are one thing to everything above.
  */
 offset_at(z: Zone, t: Instant) -> Result[Offset, TzifError]
-    val k = type_index(z, seconds_of(t))?
-    val secs = i32_at(z.data, z.ttinfo_at + k * ttinfo_len)?
+    val local = local_at(z, seconds_of(t))?
 
-    Ok(Offset(secs / 60))
+    Ok(Offset(local.off / 60))
 
 /** Whether daylight saving was in force at that instant, as the file records it. */
 is_dst_at(z: Zone, t: Instant) -> Result[bool, TzifError]
-    val k = type_index(z, seconds_of(t))?
+    val local = local_at(z, seconds_of(t))?
 
-    Ok(z.data[z.ttinfo_at + k * ttinfo_len + 4] != 0)
+    Ok(local.dst)
 
 /** The abbreviation the zone used at that instant -- `EST`, `EDT`, `+0545`.
  *
@@ -262,17 +557,9 @@ is_dst_at(z: Zone, t: Instant) -> Result[bool, TzifError]
  * number instead, which is what `timestamp_text` writes.
  */
 abbrev_at(z: Zone, t: Instant) -> Result[string, TzifError]
-    val k = type_index(z, seconds_of(t))?
-    val start = z.desig_at + usize(z.data[z.ttinfo_at + k * ttinfo_len + 5])
+    val span = local_at(z, seconds_of(t))?.name
 
-    if start > z.data.len then return Err(Truncated(start))
-
-    var end = start
-
-    while end < z.data.len && z.data[end] != 0
-        end += 1
-
-    from_utf8(z.data[start..<end]) match
+    from_utf8(z.data[span.at..<span.at + span.len]) match
         Ok(s) -> Ok(s)
         /** The designations are ASCII in every file the database ships, so this is a corrupt one
          * rather than a language question -- and it is reported as the truncation it will look like

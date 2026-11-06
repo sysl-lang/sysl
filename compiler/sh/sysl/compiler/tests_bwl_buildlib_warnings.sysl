@@ -1,0 +1,139 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.text.{join, str_builder, Search}
+
+// **Every command that compiles says the warnings of a compilation that succeeded**, as `build`
+// does: here, two `Result`s dropped unread. `build-lib` said neither. A warning never counts toward
+// `--error-limit`, and a failed compilation says only its errors.
+
+private bwl_ready() -> bool = std_root().is_ok() && clang_available()
+
+private bwl_body() -> string = raw"""
+    fallible() -> Result[int, string] = Ok(1)
+
+    use_it()
+        fallible()
+
+    use_it_again()
+        fallible()
+
+    """
+
+private bwl_dropped() -> string = "is dropped unread"
+
+private bwl_cli(args: []string) -> (int, string)
+    var notes: Buf[string] = buf()
+    val noted = &notes
+    val code = run_cli_noted(args, (line) -> (), (line) -> noted.push(line))
+
+    reset_search_paths()
+    (code, join(notes.view(), "\n"))
+end bwl_cli
+
+// A library root holding the module `demo`.
+private bwl_library(extra: string) -> string
+    val root = absolute_path(make_temp_dir("sysl-bwl-").unwrap())
+
+    make_dir_all(s"$root/demo").unwrap()
+    write_text(s"$root/demo/demo.sysl", "module demo\n\n" + bwl_body() + extra).unwrap()
+    root
+end bwl_library
+
+// A package of one `main.sysl`.
+private bwl_program(extra: string) -> string
+    val root = absolute_path(make_temp_dir("sysl-bwl-").unwrap())
+
+    write_text(s"$root/package.hocon", "").unwrap()
+    write_text(s"$root/main.sysl", bwl_body() + "main()\n    print(1)\n" + extra).unwrap()
+    root
+end bwl_program
+
+private bwl_says_both(got: (int, string))
+    assert_eq(got.0, 0, got.1)
+    assert_eq(got.1.count_of(bwl_dropped()), 2, got.1)
+end bwl_says_both
+
+@test("build-lib says the dropped-Result warnings, and still succeeds")
+bwl_build_lib()
+    if !bwl_ready() then return
+
+    val root = bwl_library("")
+    val got = bwl_cli(["sysl", "build-lib", root])
+
+    remove_dir_all(root).unwrap_or(())
+    bwl_says_both(got)
+    assert(got.1.contains("checked "), got.1)
+end bwl_build_lib
+
+@test("build-lib says each warning once per occurrence, however --error-limit is set")
+bwl_build_lib_error_limit()
+    if !bwl_ready() then return
+
+    val root = bwl_library("")
+    val got = bwl_cli(["sysl", "build-lib", root, "--error-limit", "1"])
+
+    remove_dir_all(root).unwrap_or(())
+    bwl_says_both(got)
+    assert_eq(got.1.count_of("warning: "), 2, got.1)
+    assert(!got.1.contains("not shown"), got.1)
+end bwl_build_lib_error_limit
+
+@test("build-lib of a library that fails says its errors and no warning")
+bwl_build_lib_failure()
+    if !bwl_ready() then return
+
+    val root = bwl_library("broken() -> int = nope\n")
+    val got = bwl_cli(["sysl", "build-lib", root])
+
+    remove_dir_all(root).unwrap_or(())
+    assert(got.0 != 0, got.1)
+    assert(got.1.contains("nope"), got.1)
+    assert(!got.1.contains("warning: "), got.1)
+end bwl_build_lib_failure
+
+@test("build says the warnings")
+bwl_build()
+    if !bwl_ready() then return
+
+    val root = bwl_program("")
+    val got = bwl_cli(["sysl", "build", root, "-o", s"$root/built"])
+
+    remove_dir_all(root).unwrap_or(())
+    bwl_says_both(got)
+end bwl_build
+
+@test("emit-llvm says the warnings")
+bwl_emit_llvm()
+    if !bwl_ready() then return
+
+    val root = bwl_program("")
+    val got = bwl_cli(["sysl", "emit-llvm", root])
+
+    remove_dir_all(root).unwrap_or(())
+    bwl_says_both(got)
+end bwl_emit_llvm
+
+@test("build-c says the warnings")
+bwl_build_c()
+    if !bwl_ready() then return
+
+    val root = bwl_program("")
+    val got = bwl_cli(["sysl", "build-c", root])
+
+    remove_dir_all(root).unwrap_or(())
+    bwl_says_both(got)
+end bwl_build_c
+
+@test("test says the warnings")
+bwl_test()
+    if !bwl_ready() then return
+
+    val root = bwl_program("")
+    val got = bwl_cli(["sysl", "test", root])
+
+    remove_dir_all(root).unwrap_or(())
+    bwl_says_both(got)
+end bwl_test

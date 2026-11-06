@@ -36,6 +36,7 @@ enum DocsClaim
     PagePrints
     PageRefuses
     PageShows
+    PageWarns
 
 // A fenced block as the markdown holds it: the word after the backticks, whatever else was on that
 // line, and the body.
@@ -144,8 +145,8 @@ private docs_fences(text: string) -> Buf[DocsFence]
     out
 end docs_fences
 
-// What the fences after a `sysl` block say about it: the first `output` or `error` block to appear
-// before the next `sysl` block.
+// What the fences after a `sysl` block say about it: the first `output`, `error` or `warning` block to
+// appear before the next `sysl` block.
 //
 // Not simply the very next fence, because a page reads *program, how to run it, what it prints* --
 // with a `bash` block in the middle. What the rule does refuse is an `output` block belonging to a
@@ -163,6 +164,7 @@ private docs_claim_after(fences: Buf[DocsFence], from: usize) -> (DocsClaim, str
         if f.lang == "sysl" then break
         if f.lang == "output" then return (DocsClaim.PagePrints, f.body, docs_has_word(f.info, "trap"))
         if f.lang == "error" then return (DocsClaim.PageRefuses, f.body, false)
+        if f.lang == "warning" then return (DocsClaim.PageWarns, f.body, false)
 
         i += 1
 
@@ -364,6 +366,32 @@ rgp_the_fence_word_is_read()
     assert_eq(rgp_block(program, "```output trap\nhi\n```\n").claim, DocsClaim.PagePrints)
     assert_eq(rgp_block(program, "```output trap\nhi\n```\n").expected, "hi\n")
 
+private rgp_lost() -> string = "fallible() -> Result[int, string] = Ok(1)\n\nfallible()\n"
+
+@test("a 'warning' fence claims the block builds and warns, in words that may wrap across lines")
+rgp_a_warning_block()
+    assert_eq(rgp_block(rgp_lost(), "```warning\nlost\n```\n").claim, DocsClaim.PageWarns)
+
+    if !rgp_ready() then return
+
+    val wrapped = "```warning\nthis 'Result[int, string]' is dropped unread, so a failure\nit carries goes unseen\n```\n"
+
+    assert_eq(rgp_checked(rgp_lost(), wrapped), None)
+
+    val other = rgp_checked(rgp_lost(), "```warning\nsomething else entirely\n```\n")
+
+    assert(other.is_some() && other.unwrap().contains("did not warn in the words the page quotes"),
+           other.unwrap_or(""))
+
+    val quiet = rgp_checked("print(1)\n", "```warning\nlost\n```\n")
+
+    assert(quiet.is_some() && quiet.unwrap().contains("did not warn"), quiet.unwrap_or(""))
+
+    val broken = rgp_checked("print(nope)\n", "```warning\nlost\n```\n")
+
+    assert(broken.is_some() && broken.unwrap().contains("it did not build"), broken.unwrap_or(""))
+end rgp_a_warning_block
+
 @test("a block under 'output trap' that prints what the page says and then traps passes")
 rgp_a_trap_that_prints_the_page_passes()
     if !rgp_ready() then return
@@ -427,6 +455,41 @@ private docs_refuses(src: string, archive_at: string, b: DocsBlock, where: strin
                  docs_indent(b.expected) + "compiler:\n" + docs_indent(said))
 end docs_refuses
 
+// A block the page says is warned about: `sysl build` succeeds on it, and what it says on standard
+// error CONTAINS the `warning` block's text -- a warning is no refusal, so the build has to come back
+// with a program.
+private docs_warns(src: string, exe: string, b: DocsBlock, where: string) -> Option[string]
+    var notes: Buf[string] = buf()
+    val noted = &notes
+    var args: Buf[string] = buf()
+
+    for a in ["sysl", "build", src, "-o", exe]
+        args.push(a)
+
+    val code = run_cli_noted(args.view(), (line) -> (), (line) -> noted.push(line))
+
+    reset_search_paths()
+
+    var said = str_builder()
+
+    for line in notes
+        said.push(line)
+        said.push_char('\n')
+
+    val text = said.finish()
+
+    if code != 0 then
+        return Some(s"$where: the page says this builds with a warning, and it did not build:\n" +
+                    docs_indent(text))
+
+    // A page wraps a long warning to its width, so lines are compared as one run of words.
+    if replace_all(text, "\n", " ").contains(replace_all(docs_normalize(b.expected), "\n", " ")) then
+        return None
+
+    Some(s"$where: the build did not warn in the words the page quotes.\npage:\n" + docs_indent(b.expected) +
+         "compiler:\n" + docs_indent(text))
+end docs_warns
+
 // One block checked, answering the complaint it has or nothing.
 //
 // **Every block answers rather than stopping the sweep**, so one run reports every page that has
@@ -457,6 +520,7 @@ private docs_check(src: string, exe: string, archive_at: string, b: DocsBlock) -
 
     if b.claim == DocsClaim.PageShows then return None
     if b.claim == DocsClaim.PagePrints then return docs_prints(src, exe, b, where)
+    if b.claim == DocsClaim.PageWarns then return docs_warns(src, exe, b, where)
 
     docs_refuses(src, archive_at, b, where)
 end docs_check

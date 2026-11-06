@@ -38,9 +38,19 @@ here does that.
 
 **The version 2+ block is the one read**, where the file has one -- its transition times are 8
 bytes, and a 4-byte time runs out in 2038. A version 1 file is still read, from its only block.
-The footer's `TZ` string, which extrapolates past the last transition, is **not** read: a lookup
-past the end answers with the last type, which is what the table says and is right until a zone
-changes its rules again.
+
+## Past the end of the table, the footer's rule
+
+A version 2+ file ends with a POSIX `TZ` string -- `EST5EDT,M3.2.0,M11.1.0` -- and **every instant
+at or after the last transition is answered by that rule**, as is every instant of a file with no
+transitions at all (RFC 8536 §3.3). This is not a refinement: since tzdata 2020b `zic` writes
+"slim" files by default, which stop the table at the last change of *rules* and leave every later
+daylight-saving switch to the footer, so a reader that answered with the last type would put a
+whole season of every future year an hour out. A "fat" file runs out the same way in 2037.
+
+The rule is checked once, by `parse`, and a footer that is not one is refused as `BadFooter` rather
+than read as far as it makes sense. A file whose footer is empty, or a version 1 file, which has
+none, answers past its end with the last type, which is all it says.
 
 ## Index
 
@@ -105,6 +115,7 @@ enum TzifError
     BadVersion(saw: u8)
     Truncated(needed: usize)
     NoTypes
+    BadFooter(at: usize)
 ```
 
 Why a decode refused, at the granularity a caller can act on.
@@ -113,7 +124,8 @@ The shape is `sysl.encoding.DecodeError`'s and for its reason: the variants are 
 caller would **do** about each. `BadMagic` is a file that is not one of these at all -- the usual
 cause being a path that named something else. `Truncated` carries the length that would have been
 enough, so a caller reading in pieces knows how much more to get rather than doubling until it
-fits.
+fits. `BadFooter` carries where in the footer's rule the reading stopped, counted in bytes from
+the rule's first character -- `EST5EDT` with no dates after it is `BadFooter(7)`.
 
 ### `Zone`
 
@@ -127,6 +139,8 @@ struct Zone
     timecnt: usize
     typecnt: usize
     wide: bool
+    footer_at: usize
+    footer_end: usize
 ```
 
 A zone, as a view of the bytes it was decoded from.

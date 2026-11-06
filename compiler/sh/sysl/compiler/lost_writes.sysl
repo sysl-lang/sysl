@@ -1,0 +1,591 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.Span
+import sysl.buf.{Buf, buf}
+
+// A write to a by-value parameter that nothing reads afterwards: an error, at the write.
+//
+// **A parameter written `p: P` is the function's own copy of what the caller passed**, so a write to
+// it -- or to a field or an element of it held in place -- changes that copy and nothing else. When
+// no read in the body can see the write afterwards, the write did nothing at all: `bump(p: P) =
+// p.n += 1` compiles and the caller's `n` is what it was. That is never what the line meant, so it is
+// told, at the write, with the two ways to say what was: `p: *P`, or returning the value.
+//
+// **What counts as a write** is what a closure's copy-write counts (`closure.sysl`): a store, a
+// compound assignment, an increment or a lane store whose place is the parameter or a part of it
+// reached without passing through anything that refers elsewhere -- a field of a struct, an element
+// of an array or a vector -- and a `*self` method answering nothing called on such a place. One
+// answering a value is a read: what it did is in its answer. A write through a `*T`, a
+// `&T`, a slice's element or a `Buf` reaches storage the copy shares with the caller, and is not
+// lost. A parameter that is itself a `*T`, `&T` or `&sync T` is never followed.
+//
+// **What counts as a read** is any other mention of the parameter: a read of it or of any part, an
+// argument, a `return`, the body's result, a `*self` call answering a value -- a cursor's `next()`, an
+// accessor taking `*self` only to avoid a copy. A compound assignment's
+// own reading of its place does not count, since nothing it reads leaves the place.
+//
+// **The check follows every path, and keeps quiet wherever it cannot**: a body is walked in the order
+// it runs, carrying the writes no read has seen yet, and a write is told only where no path from it
+// reaches a read. A loop is walked until what reaches its head stops changing, so a read on the next
+// turn sees a write on this one; a `defer` is walked where it runs, at the end of its block and at
+// every way out. A parameter that may be reached under another name is not followed at all: one a
+// closure or a nested function captures, one whose address is taken other than as a `*self` call's
+// receiver, one a `ref` stands for, one an array view is taken of, one inline assembly names, and one
+// an `ensures` clause reads.
+//
+// **A generic body is told at its definition**, where its own parameters are what it writes; an
+// instantiation is the same body over the caller's choice of type.
+
+// One write to a parameter: where it is, the parameter's unique name, and how the error names it.
+private struct LostSite
+    span: Span
+    unique: string
+    form: string
+end LostSite
+
+// What may be true at one point of a body: whether the point is reached at all, and the writes that
+// may not have been read yet on some path to it, as indexes into the walk's sites. **A state is never
+// changed once made** -- every step answers a new one.
+private struct LostFlow
+    dead: bool
+    pending: Buf[usize]
+end LostFlow
+
+private struct LostLoop
+    breaks: LostFlow
+    conts: LostFlow
+end LostLoop
+
+private struct LostWalk
+    params: Buf[string]
+    sites: Buf[LostSite]
+    seen: Buf[bool]
+    loops: Buf[&LostLoop]
+    defers: Buf[Buf[TStmt]]
+    cx: &Analyzer
+end LostWalk
+
+// Every write to a by-value parameter of one body that no later read can see, reported once each.
+check_lost_writes(cx: &Analyzer, params: Buf[(string, Type)], body: TBlock, ensures: Buf[TClause])
+    if cx.an.reading_instance then return
+
+    var followed: Buf[string] = buf()
+
+    for p in params
+        if followed_type(p.1) then followed.push(p.0)
+
+    if followed.is_empty() then return
+
+    val shared = shared_params(cx, followed, body, ensures)
+    var tracked: Buf[string] = buf()
+
+    for p in followed
+        if !holds_string(shared, p) then tracked.push(p)
+
+    if tracked.is_empty() then return
+
+    val w: &LostWalk = LostWalk(tracked, buf(), buf(), buf(), buf(), cx)
+
+    lost_seq(w, body.stmts, body.result, lost_live())
+
+    for i in 0..<w.sites.len()
+        if !w.seen[i] then warn_lost(w, params, w.sites[i])
+end check_lost_writes
+
+// Whether a parameter of this type is a copy the body could write: everything but an address.
+private followed_type(t: Type) -> bool = t match
+    Ptr(_) -> false
+    Ref(_, _) -> false
+    Volatile(_) -> false
+    VaList -> false
+    Unknown -> false
+    Never -> false
+    Unit -> false
+    _ -> true
+
+private warn_lost(w: &LostWalk, params: Buf[(string, Type)], site: LostSite)
+    var name = site.unique
+    var ty = Unknown
+
+    for item in w.cx.locals
+        if item.unique == site.unique then name = item.name
+
+    for p in params
+        if p.0 == site.unique then ty = p.1
+
+    val take = if name == "self" then "'*self'" else s"'$name: *${type_show(ty)}'"
+
+    val message = s"this ${site.form} changes '$name', a copy of what the caller passed, and nothing " +
+                  s"reads '$name' afterwards, so the change is lost — take $take to change the " +
+                  "caller's value, or return the value"
+
+    // No type argument could repair it, so a generic's definition keeps it as the instantiations never will.
+    if w.cx.at_definition then w.cx.an.bound_fault(w.cx.scope, site.span, message)
+
+    w.cx.fault(site.span, message)
+end warn_lost
+
+// -- parameters reached under another name ----------------------------------------------------------
+
+// The parameters some other name may reach, which are not followed: what a closure or a nested
+// function captures, what an address or an array view is taken of, what a `ref` stands for, what
+// inline assembly names, and what an `ensures` clause reads at the exit.
+private shared_params(cx: &Analyzer, params: Buf[string], body: TBlock, ensures: Buf[TClause]) -> Buf[string]
+    var out: Buf[string] = buf()
+    val found = &out
+    var receivers: Buf[Span] = buf()
+    val calls = &receivers
+
+    // A `*self` call's receiver is an address the call took for itself, with the call's own span.
+    walk_block_stmts(body, expr_walk(true, e -> if self_receiver(cx.an, e).is_some() then calls.push(e.span)))
+    walk_block_stmts(body, TWalk(true, e -> shared_by_expr(params, found, *calls, e), wr -> (),
+                                 s -> shared_by_stmt(params, found, s)))
+
+    for clause in ensures
+        walk_texpr(clause.cond, expr_walk(true, e -> note_root(params, found, e)))
+
+    out
+end shared_params
+
+private shared_by_expr(params: Buf[string], found: *Buf[string], calls: Buf[Span], e: TExpr) = *e.kind match
+    TAddrOf(place, _) -> if !span_listed(calls, e.span) then note_root(params, found, place)
+    TStructNew(st, args) ->
+        if is_closure_literal(Struct(st))
+            for item in args
+                note_root(params, found, unaddressed(item))
+    TSlice(base, _, _, _, _) -> if in_place_type(texpr_type(base)) then note_root(params, found, base)
+    TConstView(arg) -> if in_place_type(texpr_type(arg)) then note_root(params, found, arg)
+    _ -> ()
+
+private shared_by_stmt(params: Buf[string], found: *Buf[string], s: TStmt) = s match
+    TRefDecl(_, _, place) -> note_root(params, found, unaddressed(place))
+    TAsm(_, operands, _, _) ->
+        for item in operands
+            if holds_string(params, item.slot) && !holds_string(*found, item.slot) then found.push(item.slot)
+    _ -> ()
+
+private span_listed(spans: Buf[Span], at: Span) -> bool
+    for s in spans
+        if s.start == at.start && s.end == at.end then return true
+
+    false
+end span_listed
+
+private unaddressed(e: TExpr) -> TExpr = *e.kind match
+    TAddrOf(place, _) -> place
+    _ -> e
+
+private note_root(params: Buf[string], found: *Buf[string], place: TExpr)
+    val root = root_in(params, place)
+
+    if root.is_some() && !holds_string(*found, root.unwrap()) then found.push(root.unwrap())
+end note_root
+
+// The parameter a place is part of, held in place: the parameter itself, or a field or an element of
+// it reached without passing through anything that refers elsewhere.
+private root_in(params: Buf[string], place: TExpr) -> Option[string] = *place.kind match
+    TLoad(name, _) -> if holds_string(params, name) then Some(name) else None
+    TField(recv, _, _) -> if in_place_type(texpr_type(recv)) then root_in(params, recv) else None
+    TIndex(recv, _, _) -> texpr_type(recv) match
+        Array(_, _) -> root_in(params, recv)
+        _ -> None
+    _ -> None
+
+private in_place_type(t: Type) -> bool = t match
+    Struct(_) -> true
+    Array(_, _) -> true
+    Vector(_, _) -> true
+    _ -> false
+
+// -- states -----------------------------------------------------------------------------------------
+
+private lost_live() -> LostFlow = LostFlow(false, buf())
+
+private lost_dead() -> LostFlow = LostFlow(true, buf())
+
+private holds_index(xs: Buf[usize], i: usize) -> bool
+    for x in xs
+        if x == i then return true
+
+    false
+end holds_index
+
+// Where two paths meet: a write unread on either may be unread after.
+private lost_join(a: LostFlow, b: LostFlow) -> LostFlow
+    if a.dead then return b
+    if b.dead then return a
+
+    var out = a.pending.copy()
+
+    for i in b.pending
+        if !holds_index(out, i) then out.push(i)
+
+    LostFlow(false, out)
+end lost_join
+
+private lost_same(a: LostFlow, b: LostFlow) -> bool
+    if a.dead != b.dead || a.pending.len() != b.pending.len() then return false
+
+    for i in a.pending
+        if !holds_index(b.pending, i) then return false
+
+    true
+end lost_same
+
+// A read of a parameter: every write to it still unread is seen.
+private lost_read(w: &LostWalk, unique: string, f: LostFlow)
+    if f.dead then return
+
+    for i in f.pending
+        if w.sites[i].unique == unique then w.seen[i] = true
+end lost_read
+
+// A write: noted as a site once, and unread from here. `whole` says it replaces the parameter
+// outright, so the writes before it that nothing read are never read.
+private lost_write(w: &LostWalk, unique: string, at: Span, form: string, whole: bool,
+                   f: LostFlow) -> LostFlow
+    if f.dead then return f
+
+    var site = w.sites.len()
+
+    for i in 0..<w.sites.len()
+        val s = w.sites[i]
+
+        if s.unique == unique && s.span.start == at.start && s.span.end == at.end then site = i
+
+    if site == w.sites.len()
+        w.sites.push(LostSite(at, unique, form))
+        w.seen.push(false)
+    end if
+
+    var out: Buf[usize] = buf()
+
+    for i in f.pending
+        if !(whole && w.sites[i].unique == unique) then out.push(i)
+
+    if !holds_index(out, site) then out.push(site)
+
+    LostFlow(false, out)
+end lost_write
+
+// -- statements -------------------------------------------------------------------------------------
+
+// A run of statements and what it comes to, with every `defer` among them run after both, last
+// first -- and, while the run is walked, run at every way out of it too.
+private lost_seq(w: &LostWalk, stmts: Buf[TStmt], result: Option[TExpr], entry: LostFlow) -> LostFlow
+    var f = entry
+    val depth = w.defers.len()
+
+    for s in stmts
+        s match
+            TDefer(body, _) -> w.defers.push(body)
+            _ -> f = lost_stmt(w, s, f)
+
+    if result.is_some() then f = lost_expr(w, result.unwrap(), f)
+
+    while w.defers.len() > depth
+        val body = w.defers.pop().unwrap()
+
+        f = lost_seq(w, body, None, f)
+    end while
+
+    f
+end lost_seq
+
+// A way out of the function: every `defer` still waiting runs on it, so what they read is read.
+private lost_exit(w: &LostWalk, f: LostFlow)
+    if f.dead then return
+
+    val held = w.defers.copy()
+    var g = f
+    var i = held.len()
+
+    w.defers = buf()
+
+    while i > 0
+        i -= 1
+        g = lost_seq(w, held[i], None, g)
+
+    w.defers = held
+end lost_exit
+
+private lost_block(w: &LostWalk, b: TBlock, f: LostFlow) -> LostFlow = lost_seq(w, b.stmts, b.result, f)
+
+private lost_opt_block(w: &LostWalk, b: Option[TBlock], f: LostFlow) -> LostFlow =
+    if b.is_some() then lost_block(w, b.unwrap(), f) else f
+
+private lost_stmt(w: &LostWalk, s: TStmt, f: LostFlow) -> LostFlow = s match
+    TVarDecl(_, _, init, _) -> lost_expr(w, init, f)
+    TExprStmt(e) -> lost_expr(w, e, f)
+    TInvariant(cond, _) -> lost_expr(w, cond, f)
+    TVariantCheck(_, _, e) -> lost_expr(w, e, f)
+    TRefDecl(_, _, place) -> lost_expr(w, place, f)
+    TWriteStmt(write) -> lost_store(w, write.place, write.op, write.value, f)
+    TMultiAssign(writes) ->
+        var g = f
+
+        for item in writes
+            g = lost_expr(w, item.value, g)
+
+        for item in writes
+            g = lost_place(w, item.place, if item.op == "=" then "assignment" else s"'${item.op}'",
+                           item.op == "=", item.place.span, g)
+        g
+    TReturn(value) ->
+        val g = if value.is_some() then lost_expr(w, value.unwrap(), f) else f
+
+        lost_exit(w, g)
+        lost_dead()
+    TBecome(call) ->
+        lost_exit(w, lost_expr(w, call, f))
+        lost_dead()
+    TBreak(value, depth) ->
+        val g = if value.is_some() then lost_expr(w, value.unwrap(), f) else f
+        val frame = loop_frame(w, depth)
+
+        // The `defer`s a `break` leaves run on it; running every waiting one reads no less.
+        lost_exit(w, g)
+
+        if frame.is_some() then frame.unwrap().breaks = lost_join(frame.unwrap().breaks, g)
+
+        lost_dead()
+    TContinue(depth) ->
+        val frame = loop_frame(w, depth)
+
+        lost_exit(w, f)
+
+        if frame.is_some() then frame.unwrap().conts = lost_join(frame.unwrap().conts, f)
+
+        lost_dead()
+    _ -> f
+
+private loop_frame(w: &LostWalk, depth: int) -> Option[&LostLoop]
+    if depth < 0 || usize(depth) >= w.loops.len() then return None
+
+    Some(w.loops[w.loops.len() - 1 - usize(depth)])
+end loop_frame
+
+// One assignment: the value is read before the place is written.
+private lost_store(w: &LostWalk, place: TExpr, op: string, value: TExpr, f: LostFlow) -> LostFlow =
+    lost_place(w, place, if op == "=" then "assignment" else s"'$op'", op == "=", place.span,
+               lost_expr(w, value, f))
+
+// A place written: a write of the parameter it is part of, with what the place computes on the way
+// (an element's index) read; or, where it is no part of a followed parameter, an ordinary expression
+// whose every mention of one is a read.
+private lost_place(w: &LostWalk, place: TExpr, form: string, plain: bool, at: Span, f: LostFlow) -> LostFlow
+    val root = root_in(w.params, place)
+
+    if root.is_none() then return lost_expr(w, place, f)
+
+    val whole = plain && is_load(place)
+
+    lost_write(w, root.unwrap(), at, form, whole, lost_steps(w, place, f))
+end lost_place
+
+private is_load(e: TExpr) -> bool = *e.kind match
+    TLoad(_, _) -> true
+    _ -> false
+
+// What a place rooted at a parameter reads on the way to it: the indexes of its elements.
+private lost_steps(w: &LostWalk, place: TExpr, f: LostFlow) -> LostFlow = *place.kind match
+    TField(recv, _, _) -> lost_steps(w, recv, f)
+    TIndex(recv, index, _) -> lost_steps(w, recv, lost_expr(w, index, f))
+    _ -> f
+
+// -- expressions ------------------------------------------------------------------------------------
+
+private lost_expr(w: &LostWalk, e: TExpr, f: LostFlow) -> LostFlow
+    val out = *e.kind match
+        TLoad(name, _) ->
+            lost_read(w, name, f)
+            f
+        TStore(place, value, _, _) -> lost_store(w, place, "=", value, f)
+        TUpdate(place, op, value, _, _, _, _) ->
+            lost_place(w, place, s"'$op'", false, e.span, lost_expr(w, value, f))
+        TIncDec(place, op, _, _, _) -> lost_place(w, place, s"'$op'", false, e.span, f)
+        TVecStore(recv, index, value) ->
+            lost_place(w, recv, "assignment", false, e.span, lost_expr(w, value, lost_expr(w, index, f)))
+        TCall(name, args, ty, _) -> lost_call(w, e, name, args, ty, f)
+        TRecheck(after, _, _, _) -> lost_expr(w, after, f)
+        TLogical(_, left, right) ->
+            val l = lost_expr(w, left, f)
+
+            lost_join(l, lost_expr(w, right, l))
+        TIf(cond, then_block, else_block, _) -> lost_if(w, cond, then_block, else_block, f)
+        TMatch(scrutinee, arms, _) -> lost_match(w, scrutinee, arms, f)
+        TBlockExpr(block) -> lost_block(w, block, f)
+        TWhile(_, _, _, _) -> lost_loop(w, e, f)
+        TDoWhile(_, _, _, _) -> lost_loop(w, e, f)
+        TLoop(_, _) -> lost_loop(w, e, f)
+        TFor(_, _, _, _, _, _, _, _) -> lost_loop(w, e, f)
+        TCFor(_, _, _, _, _, _) -> lost_loop(w, e, f)
+        TForEach(_, _, _, _, _, _) -> lost_loop(w, e, f)
+        TIterate(_, _, _, _, _, _, _, _) -> lost_loop(w, e, f)
+        TCheckedLoop(_, _, loop_expr) -> lost_expr(w, loop_expr, f)
+        TQuantifier(_, _, _, _, _, _, _) -> f
+        _ -> lost_all(w, texpr_children(e), f)
+
+    if texpr_type(e) == Never then return lost_dead()
+
+    out
+end lost_expr
+
+// A call, which is a write where it is a `*self` method on a part of a followed parameter. Its other
+// arguments are read first; one answering a value hands back what it read of the copy, so the
+// parameter is read too. Calling a callable writes only its own captures, which is no write here.
+private lost_call(w: &LostWalk, e: TExpr, name: string, args: Buf[TExpr], ty: Type, f: LostFlow) -> LostFlow
+    val place = self_receiver(w.cx.an, e)
+
+    if place.is_none() then return lost_all(w, args, f)
+
+    val root = root_in(w.params, place.unwrap())
+
+    if root.is_none() || callable_of(w.cx.an, texpr_type(place.unwrap())).is_some() then
+        return lost_all(w, args, f)
+
+    var g = f
+
+    for i in 1..<args.len()
+        g = lost_expr(w, args[i], g)
+
+    g = lost_steps(w, place.unwrap(), g)
+
+    // One answering a value hands back what it did with the copy, so the call is itself the read: a
+    // `*self` accessor (`self.word(i)`) or a cursor's `next()` writes nothing that is lost.
+    if answers_a_value(ty)
+        lost_read(w, root.unwrap(), g)
+        return g
+    end if
+
+    lost_write(w, root.unwrap(), e.span, s"call to '${member_word(w.cx.an, name)}'", false, g)
+end lost_call
+
+// The member a lowered call name was filed under, as the program wrote it.
+private member_word(a: &Analysis, name: string) -> string
+    val stem = a.tables.members.func_origin.get(name).unwrap_or(name)
+
+    stem.last_index_of(".") match
+        Some(i) -> stem[i + 1..<stem.bytes.len]
+        None -> stem
+end member_word
+
+private lost_all(w: &LostWalk, es: Buf[TExpr], f: LostFlow) -> LostFlow
+    var g = f
+
+    for item in es
+        g = lost_expr(w, item, g)
+
+    g
+end lost_all
+
+private lost_term(w: &LostWalk, term: TCondTerm, f: LostFlow) -> LostFlow = term match
+    TCondTest(c) -> lost_expr(w, c, f)
+    TCondIs(subject, _, _) -> lost_expr(w, subject, f)
+
+private lost_if(w: &LostWalk, cond: Buf[TCondTerm], then_block: TBlock, else_block: Option[TBlock],
+                f: LostFlow) -> LostFlow
+    var g = f
+    var failed = lost_dead()
+
+    for term in cond
+        g = lost_term(w, term, g)
+        failed = lost_join(failed, g)
+
+    lost_join(lost_block(w, then_block, g), lost_opt_block(w, else_block, failed))
+end lost_if
+
+private lost_match(w: &LostWalk, scrutinee: TExpr, arms: Buf[TArm], f: LostFlow) -> LostFlow
+    var into = lost_expr(w, scrutinee, f)
+    var out = lost_dead()
+
+    for arm in arms
+        var a = into
+
+        if arm.guard.is_some()
+            a = lost_expr(w, arm.guard.unwrap(), a)
+            into = lost_join(into, a)
+        end if
+
+        out = lost_join(out, lost_block(w, arm.body, a))
+
+    out
+end lost_match
+
+// -- loops ------------------------------------------------------------------------------------------
+
+// A loop, walked turn by turn until the state reaching its head stops growing, so a read on a later
+// turn sees a write on an earlier one. What leaves it is every `break` and the way it ends on its own.
+private lost_loop(w: &LostWalk, e: TExpr, f: LostFlow) -> LostFlow
+    val entry = lost_loop_entry(w, e, f)
+    var head = entry
+    var exits = lost_dead()
+    var turns = 0
+
+    loop
+        val frame: &LostLoop = LostLoop(lost_dead(), lost_dead())
+
+        w.loops.push(frame)
+
+        val turn = lost_turn(w, e, head, frame)
+
+        w.loops.pop()
+        exits = lost_join(frame.breaks, lost_opt_block(w, lost_loop_else(e), turn.1))
+
+        val next = lost_join(entry, turn.0)
+
+        turns += 1
+
+        if lost_same(next, head) || turns > 32 then break
+
+        head = next
+
+    exits
+end lost_loop
+
+private lost_loop_entry(w: &LostWalk, e: TExpr, f: LostFlow) -> LostFlow = *e.kind match
+    TFor(_, _, lo, hi, _, _, _, _) -> lost_expr(w, hi, lost_expr(w, lo, f))
+    TCFor(init, _, _, _, _, _) -> lost_seq(w, init, None, f)
+    TForEach(_, _, seq, _, _, _) -> lost_expr(w, seq, f)
+    TIterate(_, _, init, _, _, _, _, _) -> lost_expr(w, init, f)
+    _ -> f
+
+private lost_loop_else(e: TExpr) -> Option[TBlock] = *e.kind match
+    TWhile(_, _, else_block, _) -> else_block
+    TDoWhile(_, _, else_block, _) -> else_block
+    TFor(_, _, _, _, _, _, else_block, _) -> else_block
+    TCFor(_, _, _, _, else_block, _) -> else_block
+    TForEach(_, _, _, _, else_block, _) -> else_block
+    TIterate(_, _, _, _, _, _, else_block, _) -> else_block
+    _ -> None
+
+// One turn from the head: the state it comes back to the head with, and the one it leaves with when
+// it ends on its own.
+private lost_turn(w: &LostWalk, e: TExpr, head: LostFlow, frame: &LostLoop) -> (LostFlow, LostFlow) =
+    *e.kind match
+        TWhile(cond, body, _, _) ->
+            var g = head
+            var failed = lost_dead()
+
+            for term in cond
+                g = lost_term(w, term, g)
+                failed = lost_join(failed, g)
+
+            (lost_join(lost_seq(w, body, None, g), frame.conts), failed)
+        TDoWhile(body, cond, _, _) ->
+            val c = lost_expr(w, cond, lost_join(lost_seq(w, body, None, head), frame.conts))
+
+            (c, c)
+        TLoop(body, _) -> (lost_join(lost_seq(w, body, None, head), frame.conts), lost_dead())
+        TFor(_, _, _, _, _, body, _, _) -> (lost_join(lost_seq(w, body, None, head), frame.conts), head)
+        TCFor(_, cond, step, body, _, _) ->
+            val c = if cond.is_some() then lost_expr(w, cond.unwrap(), head) else head
+            val stepped = lost_seq(w, step, None, lost_join(lost_seq(w, body, None, c), frame.conts))
+
+            (stepped, if cond.is_some() then c else lost_dead())
+        TForEach(_, _, _, body, _, _) -> (lost_join(lost_seq(w, body, None, head), frame.conts), head)
+        TIterate(_, _, _, next, _, body, _, _) ->
+            val n = lost_expr(w, next, head)
+
+            (lost_join(lost_seq(w, body, None, n), frame.conts), n)
+        _ -> (head, head)

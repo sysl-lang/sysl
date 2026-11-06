@@ -1,0 +1,338 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_temp_dir, remove_dir_all, write_text}
+import sysl.text.{join, split, str_builder, Search}
+
+// A write to a by-value parameter that nothing reads afterwards is an error, at the write
+// (`reference/declarations.md § A write to a by-value parameter nothing reads is lost`). The errors
+// are read off an in-process analysis.
+
+private lwp_prelude() -> string = raw"""
+    import sysl.buf.Buf
+
+    struct P
+        n: int
+
+        bump(*self) = self.n += 1
+
+        next(*self) -> int
+            self.n += 1
+            self.n
+
+        get(self) -> int = self.n
+
+    struct Holder
+        ptr: *P
+        items: Buf[int]
+        arr: [4]int
+        inner: P
+
+    """
+
+// The warnings the program's own file is given, as `line: message`, the line counted from the first
+// line after the prelude.
+private lwp_warnings(text: string) -> Buf[string]
+    var units: Buf[Program] = buf()
+
+    for item in lwp_library()
+        units.push(item)
+
+    units.push(parse(source_of("main.sysl", forms_imported(lwp_prelude() + text))).program)
+
+    val done = analyze_bodies(units, host_target())
+    var out: Buf[string] = buf()
+
+    for item in errors_of(done.an.diagnostics())
+        assert(item.diag.message.contains("so the change is lost"), analysis_report(errors_of(done.an.diagnostics())))
+
+        if item.src.name == "main.sysl" && item.diag.message.contains("so the change is lost") then
+            out.push(s"${item.src.locate(item.diag.span.start).line - lwp_first() + 1}: ${item.diag.message}")
+
+    out
+end lwp_warnings
+
+private var lwp_library_cache: Buf[Program] = buf()
+private var lwp_library_read: bool = false
+
+private lwp_library() -> Buf[Program]
+    if lwp_library_read then return lwp_library_cache
+
+    lwp_library_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> lwp_library_cache = units
+
+    lwp_library_cache
+end lwp_library
+
+// The first line of the program after the prelude.
+private lwp_first() -> usize
+    var n: usize = 1
+
+    for b in lwp_prelude().bytes
+        if b == u8('\n') then n += 1
+
+    n
+
+// The lines warned about, in order, each followed by a space.
+private lwp_lines(text: string) -> string
+    var out = ""
+
+    for w in lwp_warnings(text)
+        val colon = w.index_of(":").unwrap()
+
+        out = out + w[0..<colon] + " "
+
+    out
+
+private lwp_message(form: string, name: string, take: string) -> string =
+    s"this $form changes '$name', a copy of what the caller passed, and nothing reads '$name' " +
+    s"afterwards, so the change is lost — take $take to change the caller's value, or return the value"
+
+// -- warned -----------------------------------------------------------------------------------------
+
+@test("a compound assignment to a field of a by-value parameter is warned about, in the page's words")
+lwp_field_compound()
+    if xvr_no_library() then return
+
+    val got = lwp_warnings("bump(p: P) = p.n += 1\n")
+
+    assert_eq(got.len(), 1)
+    assert_eq(got[0], s"1: ${lwp_message("'+='", "p", "'p: *P'")}")
+
+@test("a plain assignment, an increment and a whole reassignment are each warned about")
+lwp_each_write_form()
+    if xvr_no_library() then return
+
+    assert_eq(lwp_lines("a(p: P)\n    p.n = 3\n"), "2 ")
+    assert_eq(lwp_lines("b(n: int)\n    n++\n"), "2 ")
+    assert_eq(lwp_lines("c(p: P)\n    p = P(4)\n"), "2 ")
+    assert_eq(lwp_warnings("d(s: string)\n    s = s + \"x\"\n")[0],
+              s"2: ${lwp_message("assignment", "s", "'s: *string'")}")
+
+@test("a write to an element of an array parameter, or to a struct held inside one, is lost")
+lwp_array_and_nested()
+    if xvr_no_library() then return
+
+    assert_eq(lwp_lines("a(xs: [4]int)\n    xs[1] = 2\n"), "2 ")
+    assert_eq(lwp_lines("b(h: Holder)\n    h.inner.n = 2\n"), "2 ")
+    assert_eq(lwp_lines("c(h: Holder, i: int)\n    h.arr[i] = 2\n    print(i)\n"), "2 ")
+
+@test("a '*self' call on a by-value parameter is a write, and one answering nothing is lost")
+lwp_self_call()
+    if xvr_no_library() then return
+
+    val got = lwp_warnings("a(p: P)\n    p.bump()\n")
+
+    assert_eq(got.len(), 1)
+    assert_eq(got[0], s"2: ${lwp_message("call to 'bump'", "p", "'p: *P'")}")
+
+@test("a by-value 'self' is a parameter too, and the warning suggests '*self'")
+lwp_self_by_value()
+    if xvr_no_library() then return
+
+    val got = lwp_warnings("struct Q\n    n: int\n\n    reset(self) = self.n = 0\n")
+
+    assert_eq(got.len(), 1)
+    assert_eq(got[0], s"4: ${lwp_message("assignment", "self", "'*self'")}")
+
+@test("a write that a later write replaces whole, unread, is lost, and the last one read is not")
+lwp_overwritten()
+    if xvr_no_library() then return
+
+    assert_eq(lwp_lines("a(p: P) -> int\n    p.n = 1\n    p = P(2)\n    p.n\n"), "2 ")
+
+@test("a write on one branch is lost when only the other branch reads")
+lwp_branches()
+    if xvr_no_library() then return
+
+    val text = "a(p: P, c: bool) -> int\n    if c\n        p.n = 1\n        0\n    else\n        p.n\n"
+
+    assert_eq(lwp_lines(text), "3 ")
+
+@test("a generic parameter written and never read is told at the definition, once")
+lwp_generic()
+    if xvr_no_library() then return
+
+    val text = "reset[T](x: T, y: T)\n    x = y\n\nreset(1, 2)\nreset(\"a\", \"b\")\n"
+
+    val got = lwp_warnings(text)
+
+    assert_eq(got.len(), 1)
+    assert_eq(got[0], s"2: ${lwp_message("assignment", "x", "'x: *T'")}")
+
+@test("a write inside a loop that nothing reads, on that turn or the next, is lost")
+lwp_loop_unread()
+    if xvr_no_library() then return
+
+    assert_eq(lwp_lines("a(p: P)\n    for i in 0..<3\n        p.n += i\n"), "3 ")
+
+@test("a write held back by 'defer' that nothing reads after it runs is lost")
+lwp_defer_write()
+    if xvr_no_library() then return
+
+    assert_eq(lwp_lines("a(p: P)\n    defer p.n = 0\n    print(p.n)\n"), "2 ")
+
+@test("a nested function's own by-value parameter is followed as a top-level one's is")
+lwp_nested()
+    if xvr_no_library() then return
+
+    assert_eq(lwp_lines("outer()\n    inner(p: P) = p.n = 1\n\n    inner(P(0))\n"), "2 ")
+
+// -- not warned -------------------------------------------------------------------------------------
+
+@test("a parameter that is an address is never followed: '*T', '&T' and '&sync T'")
+lwp_addresses()
+    if xvr_no_library() then return
+
+    assert_eq(lwp_lines("a(p: *P) = p.n += 1\n"), "")
+    assert_eq(lwp_lines("b(p: &P) = p.n += 1\n"), "")
+    assert_eq(lwp_lines("c(p: *P)\n    p.bump()\n"), "")
+
+@test("a write through a pointer field, or a push into a Buf field, reaches shared storage")
+lwp_through_a_handle()
+    if xvr_no_library() then return
+
+    assert_eq(lwp_lines("a(h: Holder)\n    h.ptr.n = 1\n"), "")
+    assert_eq(lwp_lines("b(h: Holder)\n    h.items.push(3)\n"), "")
+    assert_eq(lwp_lines("c(h: Holder)\n    h.items[0] = 3\n"), "")
+    assert_eq(lwp_lines("d(xs: []int)\n    xs[0] = 3\n"), "")
+    assert_eq(lwp_lines("e(b: Buf[int])\n    b.push(3)\n"), "")
+
+@test("a struct holding a raw pointer: a write through it is shared, and one to the pointer itself is not")
+lwp_raw_pointer_field()
+    if xvr_no_library() then return
+
+    assert_eq(lwp_lines("a(h: Holder, q: *P)\n    h.ptr.bump()\n"), "")
+    assert_eq(lwp_lines("b(h: Holder, q: *P)\n    h.ptr = q\n"), "2 ")
+
+@test("a write read afterwards is not lost: a return, the body's result, an argument, a value call")
+lwp_read_after()
+    if xvr_no_library() then return
+
+    assert_eq(lwp_lines("a(p: P) -> int\n    p.n += 1\n    return p.n\n"), "")
+    assert_eq(lwp_lines("b(p: P) -> P\n    p.n += 1\n    p\n"), "")
+    assert_eq(lwp_lines("c(p: P)\n    p.n += 1\n    print(p.get())\n"), "")
+    assert_eq(lwp_lines("d(p: P) -> int\n    p.next()\n"), "")
+    assert_eq(lwp_lines("e(p: P)\n    p.n += 1\n    take(p)\n\ntake(p: P) = print(p.n)\n"), "")
+
+@test("a '*self' accessor answering a value, called on a by-value 'self' and read no further, is a read")
+lwp_self_accessor()
+    if xvr_no_library() then return
+
+    val text = "struct R\n    words: [4]u32\n\n    word(*self, i: usize) -> u32 = self.words[i]\n\n" +
+               "    on(self) -> bool = self.word(1) != 0\n"
+
+    assert_eq(lwp_lines(text), "")
+    assert_eq(lwp_lines("a(p: P) -> int\n    p.n = 4\n    p.next()\n"), "")
+
+@test("a parameter reassigned whole and then read is not lost")
+lwp_reassigned_then_read()
+    if xvr_no_library() then return
+
+    assert_eq(lwp_lines("a(p: P) -> int\n    p = P(3)\n    p.n\n"), "")
+    assert_eq(lwp_lines("b(n: int) -> int\n    n = n * 2\n    n\n"), "")
+
+@test("a write in a loop read on the next turn, or after the loop, is not lost")
+lwp_loop_read()
+    if xvr_no_library() then return
+
+    assert_eq(lwp_lines("a(n: int) -> int\n    var s = 0\n    while n > 0\n        s += n\n        n -= 1\n    s\n"), "")
+    assert_eq(lwp_lines("b(p: P) -> int\n    for i in 0..<3\n        p.n += i\n    p.n\n"), "")
+    assert_eq(lwp_lines("c(a: int, b: int) -> int\n    loop\n        if b == 0 then return a\n" +
+                        "        val t = b\n        b = a % b\n        a = t\n"), "")
+
+@test("a write on one branch read on the path after the join is not lost")
+lwp_branch_then_read()
+    if xvr_no_library() then return
+
+    assert_eq(lwp_lines("a(p: P, c: bool) -> int\n    if c then p.n = 1\n    p.n\n"), "")
+
+@test("a parameter a closure captures is not followed, written inside the closure or outside it")
+lwp_closure()
+    if xvr_no_library() then return
+
+    assert_eq(lwp_lines("a(p: P) -> int\n    val f = () -> p.n += 1\n    f()\n    p.n\n"), "")
+    assert_eq(lwp_lines("b(p: P)\n    val f = () -> print(p.n)\n    p.n = 2\n    f()\n"), "")
+
+@test("a parameter a nested function reaches is not followed")
+lwp_nested_capture()
+    if xvr_no_library() then return
+
+    assert_eq(lwp_lines("a(p: P)\n    show() = print(p.n)\n\n    p.n = 2\n    show()\n"), "")
+
+@test("a 'defer' that reads the parameter sees a write made before any way out")
+lwp_defer_reads()
+    if xvr_no_library() then return
+
+    assert_eq(lwp_lines("a(p: P)\n    defer print(p.n)\n    p.n = 1\n"), "")
+    assert_eq(lwp_lines("b(p: P, c: bool)\n    defer print(p.n)\n    p.n = 1\n    if c then return\n" +
+                        "    print(0)\n"), "")
+
+@test("a 'ref' standing for the parameter, or an address taken of it, stops the check")
+lwp_aliases()
+    if xvr_no_library() then return
+
+    assert_eq(lwp_lines("a(p: P) -> int\n    ref q = p\n    q.n = 5\n    p.n\n"), "")
+    assert_eq(lwp_lines("b(p: P) -> int\n    val q = &p\n    p.n = 5\n    q.n\n"), "")
+
+@test("an 'ensures' clause reading the parameter reads it at the exit")
+lwp_ensures()
+    if xvr_no_library() then return
+
+    assert_eq(lwp_lines("a(n: int) -> int\n    ensure n >= 0\n    n = 1\n    0\n"), "")
+
+@test("errors count toward '--error-limit': three of them, a limit of one, and the build fails showing one")
+lwp_counts_toward_the_limit()
+    if xvr_no_library() || !clang_available() then return
+
+    val dir = absolute_path(make_temp_dir("sysl-lwp").unwrap())
+    var b = str_builder()
+
+    b.push(lwp_prelude())
+
+    for i in 1..3
+        b.push(s"f$i(p: P) = p.n += $i\n\n")
+
+    b.push("main()\n    f1(P(0))\n    f2(P(0))\n    f3(P(0))\n")
+    write_text(s"$dir/package.hocon", "").unwrap()
+    write_text(s"$dir/main.sysl", b.finish()).unwrap()
+
+    var notes: Buf[string] = buf()
+    val noted = &notes
+    var args: Buf[string] = buf()
+
+    for a in ["sysl", "build", dir, "-o", s"$dir/out", "--error-limit", "1"]
+        args.push(a)
+
+    val code = run_cli_noted(args.view(), (line) -> (), (line) -> noted.push(line))
+
+    reset_search_paths()
+
+    val said = join(notes.view(), "\n")
+
+    remove_dir_all(dir).unwrap_or(())
+    assert(code != 0, said)
+    assert_eq(split(said, "so the change is lost").len, 2)
+    assert(said.ends_with("\n\n2 more errors not shown; '--error-limit 0' shows all"), said)
+end lwp_counts_toward_the_limit
+
+@test("the standard library, every body of it typed as its own build types it, loses no write")
+lwp_std_loses_none()
+    if xvr_no_library() then return
+
+    val units = lwp_library()
+    val done = analyze_produced(units, host_target(), file_names(units), false)
+    var said = ""
+
+    for item in errors_of(done.an.diagnostics())
+        if item.diag.message.contains("so the change is lost") then
+            said = said + s"${item.src.name}:${item.src.locate(item.diag.span.start).line}\n"
+
+    assert_eq(said, "")
