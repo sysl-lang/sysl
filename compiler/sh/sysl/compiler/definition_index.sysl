@@ -97,14 +97,19 @@ end Indexing
 // **`superseded` is asked at every step's boundary**, and once it answers true the analysis stops
 // where it is and `abandoned` says so: the text it was reading has changed, so nothing it would go on
 // to find is about the text the editor now holds.
+//
+// **`first_tier_only` ends the analysis once its first tier is told** -- the check of a package's own
+// code without its `@tests` files, which a second analysis with them follows (`indexed_file`).
 struct EditorCheck
     first_tier: &Fn(Buf[Placed]) -> unit
     superseded: &Fn() -> bool
     abandoned: bool
+    first_tier_only: bool
 end EditorCheck
 
-editor_check(first_tier: &Fn(Buf[Placed]) -> unit, superseded: &Fn() -> bool) -> &EditorCheck =
-    EditorCheck(first_tier, superseded, false)
+editor_check(first_tier: &Fn(Buf[Placed]) -> unit, superseded: &Fn() -> bool,
+             first_tier_only: bool = false) -> &EditorCheck =
+    EditorCheck(first_tier, superseded, false, first_tier_only)
 
 // Whether the editor's check this analysis is has been told to stop -- asked of the text the editor
 // holds now, once per boundary, and remembered. A build is never told to.
@@ -230,14 +235,57 @@ private declared_name(home: Scope, name: string) -> string =
 //
 // An editor's check hands `editor` (`EditorCheck`); where it was told to stop, what comes back is
 // whatever had been found by then, and `editor.abandoned` says it is not the whole.
-indexed_file(path: string, editor: Option[&EditorCheck] = None) -> Result[Indexing, Failure]
+//
+// **An editor's first tier is the program's own code, without its `@tests` files** -- in the compiler's
+// own tree four lines in five are tests, and none of them can change what the program's code means,
+// since nothing outside a test file may name what one declares. So where the package has test files,
+// a first analysis without them (but with `editing`, the document being typed into, if it is one, so
+// its own mistakes come first) tells the first tier and stops; the whole compilation, tests and all,
+// is then analyzed for the second, and what that says is the check's answer, exactly a build's.
+indexed_file(path: string, editor: Option[&EditorCheck] = None, editing: string = "") -> Result[Indexing, Failure]
     val t = target_for(path, None)?
     val program = packaged_compilation_of(path, t)?
     val ix = definition_index()
+
+    editor match
+        None -> ()
+        Some(e) ->
+            val own = without_test_files(program.units, editing)
+
+            if own.len() < program.units.len()
+                val first = editor_check(e.first_tier, e.superseded, true)
+
+                analyze_produced(own, program.target, buf(), true, None, editor = Some(first))
+
+                if first.abandoned
+                    e.abandoned = true
+                    return Ok(Indexing(buf(), buf()))
+                end if
+
+                val rest = editor_check(_ -> (), e.superseded)
+                val done = analyze_produced(program.units, program.target, buf(), true, Some(ix), editor = Some(rest))
+
+                if rest.abandoned then e.abandoned = true
+
+                return Ok(Indexing(ix.references, done.reported))
+            end if
+
     val done = analyze_produced(program.units, program.target, buf(), true, Some(ix), editor = editor)
 
     Ok(Indexing(ix.references, done.reported))
 end indexed_file
+
+// A compilation's files without its `@tests` files, except `editing`'s.
+private without_test_files(units: Buf[Program], editing: string) -> Buf[Program]
+    val kept_file = if editing == "" then "" else absolute_path(editing)
+    var out: Buf[Program] = buf()
+
+    for unit in units
+        if !unit.test_only then out.push(unit)
+        else if kept_file != "" && absolute_path(unit.src.name) == kept_file then out.push(unit)
+
+    out
+end without_test_files
 
 // The same for a file of the standard library: the compilation `--std` reads, which is the library's
 // tree alone, analyzed with no entry point to look for. Every file is one the compilation produces

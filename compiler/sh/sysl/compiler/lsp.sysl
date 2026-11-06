@@ -21,7 +21,8 @@ import sysl.time.millis
 // **A change is answered by analyzing again, whole.** The document is parsed first, so a syntax
 // error is reported with its place; a file that parses is analyzed with the compilation it belongs
 // to -- the package whose manifest is above it, or the file alone -- and the references that
-// analysis recorded are kept for hover and definition until the next change.
+// analysis recorded are kept for hover and definition until the next change. Whole is not the same as
+// from nothing: a file whose text and gating are what they were is not parsed again (`parse_kept`).
 //
 // **Changes are coalesced, because an analysis can take longer than a keystroke.** The server reads
 // every message already waiting before it analyzes anything, keeping only each document's latest
@@ -35,7 +36,9 @@ import sysl.time.millis
 // says -- the parse, the declarations, every body it wrote -- is published as soon as it is known, and
 // what the whole program decides -- instantiations, module storage evaluated, the whole-program checks
 // such as `check_keeps` -- is merged in when it is (`EditorCheck`, `lsp_changed`); the second
-// publication is exactly what a whole analysis says. A `didChange` arriving meanwhile stops the
+// publication is exactly what a whole analysis says. The first tier leaves a package's `@tests` files
+// out unless the document is one (`indexed_file`), so a test file's mistakes arrive with the second
+// tier, and until then the last second tier's stay up. A `didChange` arriving meanwhile stops the
 // analysis at its next step, unpublished, and the newer text is analyzed instead.
 //
 // Positions are the protocol's: a line counted from zero and a character counted in UTF-16 code
@@ -107,8 +110,10 @@ lsp_command(args: []string, note: string -> unit) -> int
         return Misused
     end if
 
-    // The process analyzes on every change, and the standard module is the same each time.
+    // The process analyzes on every change, and the standard module is the same each time -- as is
+    // every file of the package the change was not to (`parse_kept`).
     keep_std_units(true)
+    keep_parses(true)
 
     var input = stdin()
 
@@ -797,7 +802,11 @@ lsp_analyze_in_tiers(file: string, text: string, first: (Buf[LspFound], string) 
     val in_std = lsp_std_dir() == Some(root)
     val editor = editor_check(ds -> first(lsp_found_in(file, ds), root), () -> superseded())
 
-    (if in_std then indexed_std(root, Some(editor)) else indexed_file(root, Some(editor))) match
+    // A file deleted or renamed since the last check is let go of, so a long session keeps no more
+    // parses than there are files.
+    prune_kept_parses()
+
+    (if in_std then indexed_std(root, Some(editor)) else indexed_file(root, Some(editor), file)) match
         Err(failure) ->
             found[0].diagnostics.push(lsp_diagnostic(src, Span(0, 0), Error, failure.message))
             LspChecked(found, buf(), false, root, false)

@@ -319,7 +319,7 @@ kfp_integer_forms_accepted()
             print(held == 0)
         """, "true\ntrue\ntrue\n")
 
-// -- a parameter's address as an integer: a number until a `ptr_cast` -----------------------------
+// -- a parameter's address as an integer: a number, and a `ptr_cast` of it unchecked ----------------
 
 // A local of `hold` lent to `point`, whose `body` stores its address as an integer somewhere that
 // outlives the call, and `rest`: the rest of the program, whose `after()` runs once `hold` has
@@ -329,8 +329,6 @@ private kcb_program(decls: string, body: string, rest: string) -> string =
     s"point(m: *M)\n$body\n\nhold() -> bool\n    var m: M\n\n    point(&m)\n    src != 0\n\n$rest\n\n" +
     "main()\n    print(hold())\n    after()\n"
 
-private kcb_said(how: string) -> string = s"'point' keeps its parameter 'm' ($how), and '&m' is the address of a local of 'hold'"
-
 @test("a parameter's address as an integer stored in module storage and never turned back is a number")
 kcb_global_accepted()
     kfp_prints(kcb_program("", "    src = usize(&m.buf[0])", kcb_counted), "true\ntrue\n")
@@ -339,38 +337,35 @@ kcb_global_accepted()
 private val kcb_counted = "after()\n    print(src + 1 > 1)"
 private val kcb_peeked = "peek() -> *u8 = ptr_cast(src)\n\nafter()\n    print(usize(peek()) == src)"
 
-@test("a parameter's address as an integer stored in module storage that another function turns back is refused")
-kcb_global_cast_back_refused()
-    kfp_refused(kcb_program("", "    src = usize(&m.buf[0])", kcb_peeked),
-                kcb_said("it is stored in 'src', which 'peek' turns back into a pointer with 'ptr_cast'"))
+@test("a parameter's address as an integer stored in module storage that another function turns back is unchecked")
+kcb_global_cast_back_unchecked()
+    kfp_prints(kcb_program("", "    src = usize(&m.buf[0])", kcb_peeked), "true\ntrue\n")
 
-@test("a parameter's address as an integer turned back by the function that stored it is still refused")
-kcb_stored_and_cast_here_refused()
-    kfp_refused(kcb_program("", "    src = usize(&m.buf[0])\n    val p: *u8 = ptr_cast(src)\n\n    *p = 1", kcb_counted),
-                kcb_said("it is stored in 'src', which 'point' turns back into a pointer with 'ptr_cast'"))
+@test("a parameter's address as an integer turned back by the function that stored it is unchecked")
+kcb_stored_and_cast_here_unchecked()
+    kfp_prints(kcb_program("", "    src = usize(&m.buf[0])\n    val p: *u8 = ptr_cast(src)\n\n    *p = 1", kcb_counted),
+               "true\ntrue\n")
 
 @test("a parameter's address as an integer put in a local first is a number, even where it is turned back")
 kcb_laundered_accepted()
     kfp_prints(kcb_program("", "    val at = usize(&m.buf[0])\n\n    src = at", kcb_peeked), "true\ntrue\n")
 
-@test("a parameter's address as an integer in a struct's field is a number until the field is turned back")
+@test("a parameter's address as an integer in a struct's field is a number, turned back or not")
 kcb_field()
     val decls = "struct Note\n    at: usize\n\nvar note = Note(0)"
     val body = "    note.at = usize(&m.buf[0])\n    src = 1"
 
     kfp_prints(kcb_program(decls, body, "after()\n    print(note.at + 1 > 1)"), "true\ntrue\n")
-    kfp_refused(kcb_program(decls, body, "peek(n: Note) -> *u8 = ptr_cast(n.at)\n\nafter()\n    print(usize(peek(note)) == note.at)"),
-                kcb_said("it is stored in 'note.at', which 'peek' turns back into a pointer with 'ptr_cast'"))
+    kfp_prints(kcb_program(decls, body, "peek(n: Note) -> *u8 = ptr_cast(n.at)\n\nafter()\n    print(usize(peek(note)) == note.at)"),
+               "true\ntrue\n")
 
-@test("a parameter's address as an integer handed to a callee that stores it is a number until it is turned back")
+@test("a parameter's address as an integer handed to a callee that stores it is a number, turned back or not")
 kcb_callee_stores()
     val decls = "remember(a: usize)\n    src = a"
     val body = "    remember(usize(&m.buf[0]))"
 
     kfp_prints(kcb_program(decls, body, kcb_counted), "true\ntrue\n")
-    kfp_refused(kcb_program(decls, body, kcb_peeked),
-                kcb_said("it is passed as an integer to 'remember', which may store it where 'peek' turns it back " +
-                         "into a pointer with 'ptr_cast'"))
+    kfp_prints(kcb_program(decls, body, kcb_peeked), "true\ntrue\n")
 
 @test("a parameter's address as an integer that a callee turns back only while it runs is a number")
 kcb_callee_casts_while_running_accepted()
@@ -400,25 +395,24 @@ kcb_generic()
         """
 
     kfp_prints(program + "main()\n    print(hold())\n", "true\n")
-    kfp_refused(program + "peek() -> *u8 = ptr_cast(src)\n\nmain()\n    print(hold())\n    print(usize(peek()) == src)\n",
-                "(it is stored in 'src', which 'peek' turns back into a pointer with 'ptr_cast'), and '&m' is the " +
-                "address of a local of 'hold'")
+    kfp_prints(program + "peek() -> *u8 = ptr_cast(src)\n\nmain()\n    print(hold())\n    print(usize(peek()) == src)\n",
+               "true\ntrue\n")
 
-@test("a parameter's address as an integer stored in a loop is turned back in a loop")
+@test("a parameter's address as an integer stored in a loop and turned back in a loop is unchecked")
 kcb_loop()
     val body = "    for i in 0..<4\n        src = usize(&m.buf[i])"
 
     kfp_prints(kcb_program("", body, kcb_counted), "true\ntrue\n")
-    kfp_refused(kcb_program("", body, "after()\n    var n = 0\n\n    for _ in 0..<2\n" +
-                                      "        val p: *u8 = ptr_cast(src)\n\n        n += usize(p)\n\n    print(n > 0)"),
-                kcb_said("it is stored in 'src', which 'after' turns back into a pointer with 'ptr_cast'"))
+    kfp_prints(kcb_program("", body, "after()\n    var n = 0\n\n    for _ in 0..<2\n" +
+                                     "        val p: *u8 = ptr_cast(src)\n\n        n += usize(p)\n\n    print(n > 0)"),
+               "true\ntrue\n")
 
-@test("a parameter's address as an integer turned back on one branch only is refused")
-kcb_one_branch_refused()
-    kfp_refused(kcb_program("", "    src = usize(&m.buf[0])",
-                            "peek(flag: bool) -> usize\n    if flag\n        val p: *u8 = ptr_cast(src)\n\n" +
-                            "        usize(p)\n    else\n        src\n\nafter()\n    print(peek(src > 4) > 0)"),
-                kcb_said("it is stored in 'src', which 'peek' turns back into a pointer with 'ptr_cast'"))
+@test("a parameter's address as an integer turned back on one branch only is unchecked")
+kcb_one_branch_unchecked()
+    kfp_prints(kcb_program("", "    src = usize(&m.buf[0])",
+                           "peek(flag: bool) -> usize\n    if flag\n        val p: *u8 = ptr_cast(src)\n\n" +
+                           "        usize(p)\n    else\n        src\n\nafter()\n    print(peek(src > 4) > 0)"),
+               "true\ntrue\n")
 
 // -- a place reached through a pointer the body does not change -----------------------------------
 

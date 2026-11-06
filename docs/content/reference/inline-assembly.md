@@ -402,12 +402,11 @@ The one exception is an output bound to the same machine register as an input, a
 `in n : "eax"` and `out v : "eax"`, which states that the two share it.
 
 **An output is a fresh value, made of none of the inputs.** For the same reason — the compiler does
-not read the instructions — it does not guess that an output is an input copied through, and so the
-check that keeps a frame's address from being turned back into a pointer after the frame has ended
-([memory](/reference/memory/#where-no-body-is-in-sight-the-call-borrows)) takes a system call's
-answer as the kernel's own number, not as the arguments handed in. An arm that does copy an address
-from an input to an output takes that address out of the check's sight, as `ptr_cast` arithmetic
-does.
+not read the instructions — it does not guess that an output is an input copied through. An arm that
+does copy an address from an input to an output takes that address out of the
+[borrow check's](/reference/memory/#a-borrowed-pointer-cannot-escape) sight, as an
+[address carried as an integer](/reference/memory/#an-address-as-an-integer-leaves-the-analysis)
+is out of it.
 
 ## The words this construct uses
 

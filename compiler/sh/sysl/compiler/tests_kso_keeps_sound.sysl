@@ -4,21 +4,17 @@ module sh.sysl.compiler
 import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
 import sysl.process.capture
 
-// What the keeps-analysis (`keeps.sysl`, `keeps_cast.sysl`, `keeps_join.sysl`) decides about an
-// address as an integer, a store through a pointer read out of a parameter, a cast of a function
-// pointer, and a fan-out's collection reached by two names -- each accepted cell beside the near miss
-// that is refused, with its text. `reference/memory.md § A borrowed pointer cannot escape` is the
-// specification.
+// What the keeps-analysis (`keeps.sysl`, `keeps_join.sysl`) decides about an address as an integer,
+// a store through a pointer read out of a parameter, a cast of a function pointer, and a fan-out's
+// collection reached by two names -- each accepted cell beside the near miss that is refused, with
+// its text. **An address as an integer is a number**, and a pointer `ptr_cast` makes of one is
+// unchecked: those cells are built and never run, since what a dead frame reads is undefined.
+// `reference/memory.md § A borrowed pointer cannot escape` is the specification.
 //
 // Skipped cells, and why: an integer handed through a function pointer, a call through an object or
-// an enum's payload is not followed by the cast graph (the raw tier, said on the page), nor is a
-// parameter's address as an integer once it is in a local or handed to an integer parameter -- the
-// one shape pinned below is that these are accepted; a frame's address as an integer
-// handed to a callee that stores it and is then restored by the caller is refused at the call, since
-// the call is where it is seen (no restore is matched across a call for an integer); a fan-out's
-// collection emptied by a method (`clear`, `pop`) rather than a store is not seen as a store; a
-// nested function and a build-lib split change nothing these rules read, which are per body and per
-// program.
+// an enum's payload is a number like any other, so no cell of its own; a fan-out's collection emptied
+// by a method (`clear`, `pop`) rather than a store is not seen as a store; a nested function and a
+// build-lib split change nothing these rules read, which are per body and per program.
 
 // -- the harness ----------------------------------------------------------------------------------
 
@@ -63,6 +59,25 @@ private kso_refused(text: string, part: string)
     assert(out.0.index_of(part).is_some(), out.0)
 end kso_refused
 
+// **Accepted, and never run**: a pointer `ptr_cast` makes of a dead frame's address is the program's
+// own responsibility, so what reading it prints is no part of the test.
+private kso_builds(text: string)
+    if xvr_no_library() then return
+
+    val root = make_temp_dir("sysl-kso").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val built = build_native_program(root, None, None, DefaultOptimization, Some(s"$root/built"))
+
+    remove_dir_all(root).unwrap_or(())
+
+    built match
+        Err(why) -> assert(false, failure_text(why))
+        Ok(_) -> ()
+end kso_builds
+
 // -- the address as an integer is the address, handed back -----------------------------------------
 
 @test("an address handed back as an integer, by a function, a generic and a method, is the address")
@@ -99,9 +114,9 @@ kso_image_answer_accepted()
             print(run())
         """, "31\n")
 
-@test("an address answered as an integer and stored in module storage is kept where it is turned back; one done anything more with is not")
+@test("an address answered as an integer and stored in module storage is a number, turned back or not")
 kso_image_answer_kept()
-    kso_refused(raw"""
+    kso_builds(raw"""
         import sysl.raw.ptr_cast
 
         address(p: *int) -> usize = usize(p)
@@ -121,8 +136,7 @@ kso_image_answer_kept()
         main()
             run()
             print(usize(peek()) == held)
-        """, "'stash' keeps its parameter 'p' (it is stored in 'held', which 'peek' turns back into a pointer " +
-             "with 'ptr_cast'), and '&n' is the address of a local of 'run'")
+        """)
     kso_prints(raw"""
         address(p: *int) -> usize = usize(p)
 
@@ -194,7 +208,7 @@ kso_image_in_pointerless_struct()
             print(last.at > 0)
         """, "true\n")
 
-// -- a frame's address as an integer: a number until a `ptr_cast` -----------------------------------
+// -- a frame's address as an integer: a number, and a `ptr_cast` of it unchecked --------------------
 
 private kso_stack() -> string = raw"""
     import sysl.raw.ptr_cast
@@ -211,10 +225,6 @@ private kso_peek() -> string = raw"""
         *p
 
     """
-
-private kso_stored(owner: string, place: string) -> string =
-    s"holds the address of a local of '$owner', and it is stored in '$place', which outlives '$owner' and " +
-        "'peek' turns back into a pointer with 'ptr_cast' — store the value itself, or storage that lasts"
 
 @test("a stack's top remembered and a frame's address handed back, as numbers, are accepted")
 kso_stack_depth_accepted()
@@ -241,9 +251,9 @@ kso_stack_depth_accepted()
             print(depth() < 1000000)
         """, "true\n")
 
-@test("a frame's address stored as an integer and turned back into a pointer in another function is refused")
-kso_stored_then_cast_refused()
-    kso_refused(kso_stack() + raw"""
+@test("a frame's address stored as an integer and turned back into a pointer in another function is unchecked")
+kso_stored_then_cast_unchecked()
+    kso_builds(kso_stack() + raw"""
         mark()
             var marker = 7
 
@@ -252,11 +262,11 @@ kso_stored_then_cast_refused()
         main()
             mark()
             print(peek())
-        """, s"'usize(&marker)' ${kso_stored("mark", "top")}")
+        """)
 
-@test("a frame's address handed back as an integer and turned back into a pointer by the caller is refused")
-kso_returned_then_cast_refused()
-    kso_refused(raw"""
+@test("a frame's address handed back as an integer and turned back into a pointer by the caller is unchecked")
+kso_returned_then_cast_unchecked()
+    kso_builds(raw"""
         import sysl.raw.ptr_cast
 
         here() -> usize
@@ -271,12 +281,11 @@ kso_returned_then_cast_refused()
 
         main()
             print(back())
-        """, "'usize(&marker)' is returned, but it holds the address of a local of 'here' as an integer, which " +
-             "'back' turns back into a pointer with 'ptr_cast' after the storage has ended with 'here'")
+        """)
 
-@test("held in a local, answered by a call, chosen by an 'if', and returned by a second function")
-kso_returned_shapes_refused()
-    kso_refused(raw"""
+@test("held in a local, answered by a call, chosen by an 'if', and made a pointer before it is returned")
+kso_returned_shapes_unchecked()
+    kso_builds(raw"""
         import sysl.raw.ptr_cast
 
         here() -> usize
@@ -292,8 +301,8 @@ kso_returned_shapes_refused()
 
         main()
             print(back())
-        """, "'at' is returned, but it holds the address of a local of 'here' as an integer")
-    kso_refused(raw"""
+        """)
+    kso_builds(raw"""
         import sysl.raw.ptr_cast
 
         address(p: *int) -> usize = usize(p)
@@ -310,8 +319,8 @@ kso_returned_shapes_refused()
 
         main()
             print(back())
-        """, "'address(&marker)' is returned, but it holds the address of a local of 'here' as an integer")
-    kso_refused(raw"""
+        """)
+    kso_builds(raw"""
         import sysl.raw.ptr_cast
 
         here() -> *int
@@ -321,12 +330,11 @@ kso_returned_shapes_refused()
 
         main()
             print(*here())
-        """, "'ptr_cast(usize(&marker))' is returned, but it holds the address of a local of 'here', whose storage " +
-             "ends when 'here' returns")
+        """)
 
-@test("a frame's address handed to a callee that stores it where a 'ptr_cast' reads it is refused")
-kso_passed_then_cast_refused()
-    kso_refused(kso_stack() + raw"""
+@test("a frame's address handed to a callee that stores it where a 'ptr_cast' reads it is unchecked")
+kso_passed_then_cast_unchecked()
+    kso_builds(kso_stack() + raw"""
         record(n: usize)
             top = n
 
@@ -338,8 +346,7 @@ kso_passed_then_cast_refused()
         main()
             mark()
             print(peek())
-        """, "'record' may store its parameter 'n' where it outlives the call, and 'usize(&marker)' holds the " +
-             "address of a local of 'mark' as an integer, which 'peek' turns back into a pointer with 'ptr_cast'")
+        """)
 
 @test("a frame's address handed to a callee that turns it back while the frame is there is accepted")
 kso_passed_cast_in_call_accepted()
@@ -389,9 +396,9 @@ kso_stored_restored_accepted()
             print(top == 0)
         """, "8\n8\ntrue\n")
 
-@test("taken back on one way out only -- an early return, a '?', a loop's turn -- is refused")
-kso_stored_escapes_refused()
-    kso_refused(kso_stack() + raw"""
+@test("taken back on one way out only -- an early return, a '?', a loop's turn -- is unchecked")
+kso_stored_escapes_unchecked()
+    kso_builds(kso_stack() + raw"""
         mark(early: bool)
             var marker = 7
 
@@ -404,8 +411,8 @@ kso_stored_escapes_refused()
         main()
             mark(true)
             print(peek())
-        """, s"'usize(&marker)' ${kso_stored("mark", "top")}")
-    kso_refused(kso_stack() + raw"""
+        """)
+    kso_builds(kso_stack() + raw"""
         maybe(n: int) -> Option[int] = if n > 0 then Some(n) else None
 
         mark(n: int) -> Option[int]
@@ -421,8 +428,8 @@ kso_stored_escapes_refused()
         main()
             print(mark(0).is_none())
             print(peek())
-        """, s"'usize(&marker)' ${kso_stored("mark", "top")}")
-    kso_refused(kso_stack() + raw"""
+        """)
+    kso_builds(kso_stack() + raw"""
         mark()
             for i in 0..<3
                 var marker = i
@@ -432,11 +439,11 @@ kso_stored_escapes_refused()
         main()
             mark()
             print(peek())
-        """, s"'usize(&marker)' ${kso_stored("mark", "top")}")
+        """)
 
 @test("stored through a parameter, from a method and from a generic, where a 'ptr_cast' reads the field")
-kso_stored_in_field_refused()
-    kso_refused(raw"""
+kso_stored_in_field_unchecked()
+    kso_builds(raw"""
         import sysl.raw.ptr_cast
 
         struct Ctx
@@ -457,9 +464,8 @@ kso_stored_in_field_refused()
         main()
             ctx.mark()
             print(peek(&ctx))
-        """, "'usize(&marker)' holds the address of a local of 'mark', and it is stored in 'self.top', which " +
-             "outlives 'mark' and 'peek' turns back into a pointer with 'ptr_cast'")
-    kso_refused(raw"""
+        """)
+    kso_builds(raw"""
         import sysl.raw.ptr_cast
 
         struct Ctx
@@ -480,8 +486,7 @@ kso_stored_in_field_refused()
         main()
             mark(&ctx, 7)
             print(peek(&ctx))
-        """, "'usize(&marker)' holds the address of a local of 'mark', and it is stored in 'c.top', which " +
-             "outlives 'mark' and 'peek' turns back into a pointer with 'ptr_cast'")
+        """)
     kso_prints(raw"""
         struct Ctx
             top: usize

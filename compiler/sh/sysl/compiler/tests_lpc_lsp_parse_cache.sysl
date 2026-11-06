@@ -1,0 +1,405 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.encoding.json.{quoted as json_quote}
+import sysl.fs.{make_temp_dir, remove_dir_all, remove_file, rename, write_text}
+import sysl.text.{split, Search}
+
+// `sysl lsp` keeping each file's parse across checks (`parse_kept`), and leaving a package's `@tests`
+// files out of a check's first tier unless the document being edited is one. The oracle for every
+// check's end is a whole analysis of the same texts from nothing, as a build makes it, and for every
+// publication a server that keeps no parse at all.
+
+// ---- the fixtures ----
+
+private lpc_manifest() -> string = "package {\n  name = \"probe\"\n}\n"
+
+// A package of three files: `main.sysl`, the document the editor opens; `lib.sysl`, a sibling it
+// calls; and `tests_d.sysl`, a test file, whose body is `test_body`.
+private lpc_package(test_body: string) -> string
+    val root = make_temp_dir("sysl-lpc").unwrap()
+
+    write_text(s"$root/package.hocon", lpc_manifest()).unwrap()
+    write_text(s"$root/main.sysl", lpc_main()).unwrap()
+    write_text(s"$root/lib.sysl", "double(n: int) -> int = n * 2\n").unwrap()
+    write_text(s"$root/tests_d.sysl", s"@tests\n\n@test(\"d\")\nd()\n$test_body").unwrap()
+    root
+end lpc_package
+
+private lpc_main() -> string = "main()\n    print(double(1))\n"
+
+private lpc_passing() -> string = "    assert(double(2) == 4, \"d\")\n"
+
+private lpc_undefined(name: string) -> string = s"undefined name '$name'"
+
+private lpc_no_function(name: string) -> string = s"undefined function '$name'"
+
+// ---- the messages an editor sends ----
+
+private lpc_notify(method: string, params: string) -> string =
+    s"{\"jsonrpc\":\"2.0\",\"method\":\"$method\",\"params\":$params}"
+
+private lpc_open(uri: string, text: string) -> string =
+    lpc_notify("textDocument/didOpen", s"{\"textDocument\":{\"uri\":\"$uri\",\"languageId\":\"sysl\",\"version\":1,\"text\":${json_quote(text)}}}")
+
+private lpc_change(uri: string, version: int, text: string) -> string =
+    lpc_notify("textDocument/didChange",
+               s"{\"textDocument\":{\"uri\":\"$uri\",\"version\":$version},\"contentChanges\":[{\"text\":${json_quote(text)}}]}")
+
+private lpc_ready() -> LspServer
+    var server = lsp_server()
+
+    lsp_answer(&server, s"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"capabilities\":{}}}")
+    lsp_answer(&server, lpc_notify("initialized", "{}"))
+    server
+end lpc_ready
+
+private lpc_uri(root: string, name: string) -> string = lsp_file_uri(absolute_path(s"$root/$name"))
+
+// Every message of `out`, a line each.
+private lpc_joined(out: Buf[string]) -> string
+    var all = ""
+
+    for m in out
+        all = all + m + "\n"
+
+    all
+end lpc_joined
+
+// The publication for `uri` among `out`, the last of them; empty where there is none.
+private lpc_last_for(out: Buf[string], uri: string) -> string
+    var last = ""
+
+    for m in out
+        if m.contains(s"\"uri\":\"$uri\"") then last = m
+
+    last
+end lpc_last_for
+
+private lpc_count(hay: string, needle: string) -> usize = split(hay, needle).len - 1
+
+// ---- the parse kept ----
+
+@test("lpc: a second check reads the kept parses, an edit parses only the edited file, and every publication is a fresh server's")
+lpc_an_edit_parses_only_the_edited_file()
+    if std_root().is_err() then return
+
+    val root = lpc_package(lpc_passing())
+    val uri = lpc_uri(root, "main.sysl")
+
+    // The same session twice: once keeping no parse -- the oracle -- and once keeping them.
+    var said: Buf[string] = buf()
+
+    for keeping in [false, true]
+        keep_parses(keeping)
+
+        var server = lpc_ready()
+        var out = lsp_answer(&server, lpc_open(uri, lpc_main()))
+
+        // Opened: each of the three files parsed once, the check's two analyses sharing them.
+        if keeping
+            assert_eq(kept_parse_miss_count(), 3)
+            assert_eq(kept_parse_hit_count(), 0)
+            assert_eq(kept_parse_count(), 3)
+        end if
+
+        for m in lsp_answer(&server, lpc_change(uri, 2, "main()\n    print(double(nope))\n")) do out.push(m)
+
+        // An edit to `main.sysl`: it alone is parsed again, the other two are read from what was kept.
+        if keeping
+            assert_eq(kept_parse_miss_count(), 4)
+            assert_eq(kept_parse_hit_count(), 2)
+        end if
+
+        for m in lsp_answer(&server, lpc_change(uri, 3, lpc_main())) do out.push(m)
+
+        // Back to the first text, which is a changed text all the same: parsed again, not mistaken
+        // for the one kept before the last edit.
+        if keeping
+            assert_eq(kept_parse_miss_count(), 5)
+            assert_eq(kept_parse_hit_count(), 4)
+            assert_eq(kept_parse_count(), 3)
+        end if
+
+        said.push(lpc_joined(out))
+    end for
+
+    keep_parses(false)
+
+    assert(said[0].contains(lpc_undefined("nope")), said[0])
+    assert_eq(said[1], said[0])
+
+    remove_dir_all(root).unwrap_or(())
+end lpc_an_edit_parses_only_the_edited_file
+
+@test("lpc: a file changed on the disk while the editor has it closed is parsed again, and what it says now is published")
+lpc_a_closed_file_changed_on_disk()
+    if std_root().is_err() then return
+
+    val root = lpc_package(lpc_passing())
+    val uri = lpc_uri(root, "main.sysl")
+
+    keep_parses(true)
+
+    var server = lpc_ready()
+
+    lsp_answer(&server, lpc_open(uri, lpc_main()))
+    write_text(s"$root/lib.sysl", "double(n: int) -> int = nah\n").unwrap()
+
+    val broke = lsp_answer(&server, lpc_change(uri, 2, lpc_main() + "\n"))
+
+    // `main.sysl` and `lib.sysl` parsed again; the test file read from what was kept.
+    assert_eq(kept_parse_miss_count(), 5)
+    assert_eq(kept_parse_hit_count(), 1)
+    assert(lpc_last_for(broke, lpc_uri(root, "lib.sysl")).contains(lpc_undefined("nah")), lpc_joined(broke))
+
+    // And mended on the disk: parsed again, and the file's list cleared.
+    write_text(s"$root/lib.sysl", "double(n: int) -> int = n * 2\n").unwrap()
+
+    val mended = lsp_answer(&server, lpc_change(uri, 3, lpc_main()))
+
+    assert_eq(kept_parse_miss_count(), 7)
+    assert_eq(lpc_count(lpc_last_for(mended, lpc_uri(root, "lib.sysl")), "\"message\""), 0)
+
+    keep_parses(false)
+    remove_dir_all(root).unwrap_or(())
+end lpc_a_closed_file_changed_on_disk
+
+@test("lpc: a deleted file's diagnostics and its kept parse go, and a renamed one is read under its new name")
+lpc_a_deleted_file_disappears()
+    if std_root().is_err() then return
+
+    val root = lpc_package(lpc_passing())
+    val uri = lpc_uri(root, "main.sysl")
+    val gone = lpc_uri(root, "gone.sysl")
+
+    write_text(s"$root/gone.sysl", "spare() -> int = nope\n").unwrap()
+    keep_parses(true)
+
+    var server = lpc_ready()
+    val opened = lsp_answer(&server, lpc_open(uri, lpc_main()))
+
+    assert(lpc_last_for(opened, gone).contains(lpc_undefined("nope")), lpc_joined(opened))
+    assert_eq(kept_parse_count(), 4)
+
+    remove_file(s"$root/gone.sysl").unwrap()
+
+    val after = lsp_answer(&server, lpc_change(uri, 2, lpc_main() + "\n"))
+
+    // Its list is cleared, nothing about it is said again, and its parse is let go of.
+    assert_eq(lpc_count(lpc_last_for(after, gone), "\"message\""), 0)
+    assert(lpc_last_for(after, gone) != "", lpc_joined(after))
+    assert_eq(kept_parse_count(), 3)
+
+    // Renamed: the function is still there under the new name, and the old name's parse goes.
+    rename(s"$root/lib.sysl", s"$root/lib2.sysl").unwrap()
+
+    val renamed = lsp_answer(&server, lpc_change(uri, 3, lpc_main()))
+
+    assert_eq(lpc_count(lpc_joined(renamed), "\"message\""), 0)
+    assert_eq(kept_parse_count(), 3)
+
+    // And the old name's text gone from the disk is not served: the function is undefined once its
+    // only file is gone too.
+    remove_file(s"$root/lib2.sysl").unwrap()
+
+    val missing = lsp_answer(&server, lpc_change(uri, 4, lpc_main() + "\n"))
+
+    assert(lpc_last_for(missing, uri).contains(lpc_no_function("double")), lpc_joined(missing))
+
+    keep_parses(false)
+    remove_dir_all(root).unwrap_or(())
+end lpc_a_deleted_file_disappears
+
+@test("lpc: the same text gated by a different feature set is parsed again")
+lpc_a_feature_change_is_parsed_again()
+    if std_root().is_err() then return
+
+    val root = lpc_package(lpc_passing())
+    val uri = lpc_uri(root, "main.sysl")
+    val manifest = lpc_manifest()
+    val gated = "#if feature_fancy\nfancy() -> int = nope\n#else\nfancy() -> int = 1\n#endif\n"
+
+    write_text(s"$root/package.hocon", manifest + "features { fancy { default = true } }\n").unwrap()
+    write_text(s"$root/gated.sysl", gated).unwrap()
+    keep_parses(true)
+
+    var server = lpc_ready()
+    val on = lsp_answer(&server, lpc_open(uri, lpc_main()))
+
+    assert(lpc_last_for(on, lpc_uri(root, "gated.sysl")).contains(lpc_undefined("nope")), lpc_joined(on))
+
+    // No source changed; the manifest turns the feature off. Every file is gated afresh.
+    write_text(s"$root/package.hocon", manifest + "features { fancy = [] }\n").unwrap()
+
+    val misses = kept_parse_miss_count()
+    val off = lsp_answer(&server, lpc_change(uri, 2, lpc_main()))
+
+    assert_eq(kept_parse_miss_count(), misses + 4)
+    assert_eq(lpc_count(lpc_last_for(off, lpc_uri(root, "gated.sysl")), "\"message\""), 0)
+
+    keep_parses(false)
+    remove_dir_all(root).unwrap_or(())
+end lpc_a_feature_change_is_parsed_again
+
+@test("lpc: a file's parse is kept only while a server asks for it; a build keeps nothing")
+lpc_a_build_keeps_nothing()
+    if std_root().is_err() then return
+
+    val root = lpc_package(lpc_passing())
+
+    keep_parses(false)
+    indexed_file(root).unwrap()
+    indexed_file(root).unwrap()
+
+    assert_eq(kept_parse_count(), 0)
+    assert_eq(kept_parse_miss_count(), 0)
+    assert_eq(kept_parse_hit_count(), 0)
+
+    remove_dir_all(root).unwrap_or(())
+end lpc_a_build_keeps_nothing
+
+// ---- the test files, in the second tier ----
+
+@test("lpc: a test file's error is left out of the first tier and arrives with the second, then stays up across an edit")
+lpc_a_test_error_arrives_second()
+    if std_root().is_err() then return
+
+    val root = lpc_package("    assert(double(nope) == 4, \"d\")\n")
+    val uri = lpc_uri(root, "main.sysl")
+    val tests = lpc_uri(root, "tests_d.sysl")
+    var server = lpc_ready()
+    val out = lsp_answer(&server, lpc_open(uri, lpc_main()))
+
+    // The first publication is the document's own, clean, and nothing about the test file; the
+    // second says the test file's mistake.
+    assert_eq(out.len(), 2, lpc_joined(out))
+    assert(!out[0].contains(tests), out[0])
+    assert(out[1].contains(tests) && out[1].contains(lpc_undefined("nope")), out[1])
+
+    // An edit to `main.sysl`: the first tier keeps the test file's mistake up rather than clearing it,
+    // and the second, finding it again, sends nothing it has not sent.
+    val edited = lsp_answer(&server, lpc_change(uri, 2, "main()\n    print(double(nah))\n"))
+
+    assert(edited[0].contains(lpc_undefined("nah")), edited[0])
+    assert(!lpc_joined(edited).contains(s"\"uri\":\"$tests\",\"diagnostics\":[]"), lpc_joined(edited))
+    assert(lpc_last_for(edited, tests).contains(lpc_undefined("nope")), lpc_joined(edited))
+
+    remove_dir_all(root).unwrap_or(())
+end lpc_a_test_error_arrives_second
+
+// Each diagnostic's message onto `into`, which is shared with the caller's buffer.
+private lpc_messages(into: Buf[string], ds: Buf[Placed])
+    var out = into
+
+    for d in ds
+        out.push(d.diag.message)
+end lpc_messages
+
+@test("lpc: an editor's first tier is told nothing about a test file unless it is the one being edited; the answer is the whole")
+lpc_the_first_tier_leaves_tests_out()
+    if std_root().is_err() then return
+
+    val root = lpc_package("    assert(double(nope) == 4, \"d\")\n")
+
+    for editing in ["main.sysl", "tests_d.sysl"]
+        var first: Buf[string] = buf()
+        val check = editor_check(ds -> lpc_messages(first, ds), () -> false)
+        val done = indexed_file(root, Some(check), s"$root/$editing").unwrap()
+        var told = false
+        var answered = false
+
+        for m in first
+            if m == lpc_undefined("nope") then told = true
+
+        for p in done.problems
+            if p.diag.message == lpc_undefined("nope") then answered = true
+
+        assert(!check.abandoned)
+        assert_eq(told, editing == "tests_d.sysl")
+        assert(answered, editing)
+    end for
+
+    remove_dir_all(root).unwrap_or(())
+end lpc_the_first_tier_leaves_tests_out
+
+@test("lpc: a test file broken by an edit to the code it tests is told so in the second tier")
+lpc_a_test_broken_by_a_non_test_edit()
+    if std_root().is_err() then return
+
+    val root = lpc_package(lpc_passing())
+    val lib = lpc_uri(root, "lib.sysl")
+    val tests = lpc_uri(root, "tests_d.sysl")
+    var server = lpc_ready()
+
+    lsp_answer(&server, lpc_open(lib, "double(n: int) -> int = n * 2\n"))
+
+    // `double` renamed: the test that calls it is broken, and says so once the whole check is done.
+    val renamed = lsp_answer(&server, lpc_change(lib, 2, "twice(n: int) -> int = n * 2\n"))
+
+    assert(renamed.len() >= 2, lpc_joined(renamed))
+    assert(!renamed[0].contains(tests), renamed[0])
+    assert(lpc_last_for(renamed, tests).contains(lpc_no_function("double")), lpc_joined(renamed))
+
+    remove_dir_all(root).unwrap_or(())
+end lpc_a_test_broken_by_a_non_test_edit
+
+@test("lpc: an edited test file's own mistake comes in the first tier; another test file's waits for the second")
+lpc_an_edited_test_file_comes_first()
+    if std_root().is_err() then return
+
+    val root = lpc_package(lpc_passing())
+    val tests = lpc_uri(root, "tests_d.sysl")
+    val other = lpc_uri(root, "tests_e.sysl")
+
+    write_text(s"$root/tests_e.sysl", "@tests\n\n@test(\"e\")\ne()\n    assert(double(nah) == 4, \"e\")\n").unwrap()
+
+    var server = lpc_ready()
+    val out = lsp_answer(&server, lpc_open(tests, "@tests\n\n@test(\"d\")\nd()\n    assert(double(nope) == 4, \"d\")\n"))
+
+    assert(out.len() >= 2, lpc_joined(out))
+    assert(out[0].contains(tests) && out[0].contains(lpc_undefined("nope")), out[0])
+    assert(!out[0].contains(lpc_undefined("nah")), out[0])
+    assert(lpc_last_for(out, other).contains(lpc_undefined("nah")), lpc_joined(out))
+
+    remove_dir_all(root).unwrap_or(())
+end lpc_an_edited_test_file_comes_first
+
+@test("lpc: once the second tier is done, every file's last list is a whole analysis's of the same texts")
+lpc_the_last_lists_are_a_whole_analysis()
+    if std_root().is_err() then return
+
+    val root = lpc_package("    assert(double(nope) == 4, \"d\")\n")
+    val text = "var spare = 0\nvar held: *int = &spare\n\nstore(p: *int)\n    held = p\n\n" +
+               "main()\n    var n = 1\n    store(&n)\n\nbroken() -> int = double(nah)\n"
+
+    write_text(s"$root/main.sysl", text).unwrap()
+    keep_parses(true)
+
+    var server = lpc_ready()
+    val uri = lpc_uri(root, "main.sysl")
+    var out = lsp_answer(&server, lpc_open(uri, lpc_main()))
+
+    for m in lsp_answer(&server, lpc_change(uri, 2, text)) do out.push(m)
+
+    // The oracle: a fresh analysis of the same files -- a body's mistake, a keeps refusal, and a test
+    // file's mistake.
+    keep_parses(false)
+
+    val whole = indexed_file(root).unwrap()
+    var listed: usize = 0
+
+    for name in ["main.sysl", "lib.sysl", "tests_d.sysl"]
+        listed += lpc_count(lpc_last_for(out, lpc_uri(root, name)), "\"message\"")
+
+    assert_eq(whole.problems.len(), 3)
+    assert_eq(listed, whole.problems.len())
+
+    for p in whole.problems
+        val quoted = json_quote(p.diag.message)
+
+        assert(lpc_joined(out).contains(quoted[1..<(quoted.bytes.len - 1)]), s"${p.diag.message} is not in: ${lpc_joined(out)}")
+
+    remove_dir_all(root).unwrap_or(())
+end lpc_the_last_lists_are_a_whole_analysis

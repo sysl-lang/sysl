@@ -1,0 +1,271 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// **An address as an integer leaves the keeps-analysis** (`reference/memory.md § An address as an
+// integer leaves the analysis`): `usize(&x)` is a number wherever it goes, and a pointer `ptr_cast`
+// makes of an integer is unchecked, so a frame's address round-tripped through an integer is
+// accepted in every shape it can leave the frame by. The same address kept as a pointer is still
+// refused, and a `ptr_cast` of a pointer still carries what it points at.
+//
+// Cells: the round trip read while the frame is live (run, with its output); the round trip read
+// after the frame has ended -- through module storage, an answer, a callee's store, an out-parameter,
+// a field through a parameter, arithmetic and a generic (built, never run: what a dead frame reads is
+// undefined); each pointer shape beside it refused; a `ptr_cast` of a pointer refused where it is
+// stored. Skipped: a function pointer through an integer, pinned in `tests_kso_keeps_sound.sysl`
+// (`kso_cast_function_pointer`); a nested function and a build-lib split, which change nothing a
+// rule that follows no integer reads.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private irt_outcome(text: string, run: bool) -> (string, int)
+    val root = make_temp_dir("sysl-irt").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (failure_text(why), -1)
+        Ok(_) -> ()
+
+    if !run
+        remove_dir_all(root).unwrap_or(())
+        return ("", 0)
+    end if
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> ("the program that was built could not be run", -1)
+        Ok(out) -> (out.text + out.err.unwrap_or(""), shell_status(out.status))
+end irt_outcome
+
+private irt_prints(text: string, want: string)
+    if xvr_no_library() then return
+
+    val out = irt_outcome(text, true)
+
+    assert_eq(out.0, want)
+    assert_eq(out.1, 0)
+end irt_prints
+
+// Accepted, and never run.
+private irt_builds(text: string)
+    if xvr_no_library() then return
+
+    val out = irt_outcome(text, false)
+
+    assert_eq(out.1, 0, out.0)
+end irt_builds
+
+private irt_refused(text: string, part: string)
+    if xvr_no_library() then return
+
+    val out = irt_outcome(text, false)
+
+    assert_eq(out.1, -1, out.0)
+    assert(out.0.index_of(part).is_some(), out.0)
+end irt_refused
+
+// Module storage an integer is kept in, and the `ptr_cast` that turns it back.
+private irt_stack() -> string = raw"""
+    import sysl.raw.ptr_cast
+
+    var top: usize = 0
+
+    peek() -> int
+        val p: *int = ptr_cast(top)
+
+        *p
+
+    """
+
+// -- the round trip, read while the frame is live -------------------------------------------------
+
+@test("a frame's address round-tripped through an integer and read while the frame is live runs")
+irt_live_round_trip_runs()
+    irt_prints(irt_stack() + raw"""
+        mark() -> int
+            var marker = 7
+
+            top = usize(&marker)
+            peek()
+
+        bump(n: usize)
+            val p: *int = ptr_cast(n)
+
+            *p += 1
+
+        run() -> int
+            var v = 41
+
+            bump(usize(&v))
+            v
+
+        main()
+            print(mark())
+            print(run())
+        """, "7\n42\n")
+
+// -- the round trip, read after the frame has ended: unchecked -------------------------------------
+
+@test("stored in module storage as an integer and turned back after the frame ends is accepted")
+irt_module_storage_accepted()
+    irt_builds(irt_stack() + raw"""
+        mark()
+            var marker = 7
+
+            top = usize(&marker)
+
+        main()
+            mark()
+            print(peek())
+        """)
+
+@test("handed back as an integer, directly, through a local and through a call, is accepted")
+irt_answer_accepted()
+    irt_builds(raw"""
+        import sysl.raw.ptr_cast
+
+        address(p: *int) -> usize = usize(p)
+
+        here(which: int) -> usize
+            var marker = 9
+            val at = usize(&marker)
+
+            if which == 0 then usize(&marker) else if which == 1 then at else address(&marker)
+
+        gone() -> *int
+            var marker = 9
+
+            ptr_cast(usize(&marker))
+
+        main()
+            val p: *int = ptr_cast(here(2))
+
+            print(*p + *gone())
+        """)
+
+@test("handed to a callee that stores the integer, and the callee's answer stored, is accepted")
+irt_callee_accepted()
+    irt_builds(irt_stack() + raw"""
+        record(n: usize)
+            top = n
+
+        pass(n: usize) -> usize = n
+
+        mark()
+            var marker = 7
+
+            record(usize(&marker))
+            top = pass(usize(&marker)) + 0
+
+        main()
+            mark()
+            print(peek())
+        """)
+
+@test("written through an integer out-parameter, a field through a parameter, and from a generic, is accepted")
+irt_out_param_field_generic_accepted()
+    irt_builds(raw"""
+        import sysl.raw.ptr_cast
+
+        struct Ctx
+            top: usize
+
+        open(dir: *usize)
+            var c: [2]u8 = [u8('.'), 0]
+
+            *dir = usize(&c[0])
+
+        mark(c: *Ctx)
+            var marker = 7
+
+            c.top = usize(&marker)
+
+        note_at[T](c: *Ctx, v: T)
+            var held = v
+
+            c.top = usize(&held)
+
+        var ctx = Ctx(0)
+
+        main()
+            var h: usize = 0
+
+            open(&h)
+            mark(&ctx)
+            note_at(&ctx, 3)
+
+            val p: *u8 = ptr_cast(h)
+            val q: *int = ptr_cast(ctx.top)
+
+            print(int(p[0]) + *q)
+        """)
+
+// -- the same address as a pointer: still refused --------------------------------------------------
+
+@test("a frame's address stored in module storage as a pointer is refused")
+irt_pointer_stored_refused()
+    irt_refused(raw"""
+        var top: *int = null
+
+        mark()
+            var marker = 7
+
+            top = &marker
+
+        mark()
+        """, "'&marker' is the address of a local of 'mark', and it is stored in 'top', which outlives 'mark'")
+
+@test("a frame's address handed back as a pointer through a local is refused")
+irt_pointer_returned_refused()
+    irt_refused(raw"""
+        here() -> *int
+            var marker = 9
+            val p = &marker
+
+            p
+
+        print(*here())
+        """, "'p' is returned, but it holds the address of a local of 'here', whose storage ends when 'here' returns")
+
+@test("a frame's address handed as a pointer to a callee that keeps it is refused")
+irt_pointer_passed_refused()
+    irt_refused(raw"""
+        var top: *int = null
+
+        record(p: *int)
+            top = p
+
+        mark()
+            var marker = 7
+
+            record(&marker)
+
+        mark()
+        """, "'record' keeps its parameter 'p' (it is stored in 'top'), and '&marker' is the address of a local of 'mark'")
+
+@test("a 'ptr_cast' of a pointer still carries the frame's address it was made of")
+irt_pointer_cast_keeps_provenance()
+    irt_refused(raw"""
+        import sysl.raw.ptr_cast
+
+        var top: *u8 = null
+
+        mark()
+            var marker = 7
+            val q: *u8 = ptr_cast(&marker)
+
+            top = q
+
+        mark()
+        """, "a local of 'mark', and it is stored in 'top', which outlives 'mark'")
