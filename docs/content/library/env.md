@@ -157,6 +157,8 @@ import sysl.env.{get, vars}
 
 val home = get("HOME")
 val all = vars()
+
+assert(home.is_some() || all.is_empty())
 ```
 
 ```error
@@ -164,7 +166,9 @@ this program reads its environment, and 'aarch64-freestanding' has no operating 
 ```
 
 The question is asked only of what the program reaches, so one that calls `get` and never `vars` is
-asked for `sysl_env_get` alone.
+asked for `sysl_env_get` alone. Without the `assert` the two bindings would be [storage nothing
+reads](/reference/declarations/#storage-nothing-reads-is-not-in-the-program), dropped with their
+initializers, and a program that never runs `get` or `vars` is asked for no hook at all.
 
 ## Who asks
 
