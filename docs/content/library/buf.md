@@ -415,6 +415,41 @@ with no `*T` in it cannot fault, so the old storage stays until the last view of
 What `v` does *not* do is grow with the buffer. It is a view of some elements and it has the length it
 was made with. Take it again to see more.
 
+### `view_mut` writes, `into_view` hands over
+
+**`view_mut()`** is the same storage as `view()`, writable: a write through it is seen through the
+buffer and through every other name for it. It is tied to the buffer it was taken from — a function
+may not return it, as it may not return a view of any local it was taken from — and it is taken
+through `*self`, so a `val` buffer is refused.
+
+**`into_view()`** is for the function that builds a local buffer and returns what it holds. It gives
+the buffer up and answers an owned slice; the slice keeps the storage alive, so returning it is
+accepted, and each element is let go of once, when the slice goes. A local it is called on may not be
+read again until it is assigned a new value.
+
+```sysl
+import sysl.buf.{Buf, buf}
+
+squares(n: int) -> []int
+    var out: Buf[int] = buf()
+
+    for i in 0..<n do out.push(i * i)
+
+    out.into_view()
+
+var b: Buf[int] = buf()
+
+b.push(1)
+b.push(2)
+b.view_mut()[1] = 20
+
+print(b.view(), squares(4))
+```
+
+```output
+[1, 20] [0, 1, 4, 9]
+```
+
 ## It compares and renders as the sequence it holds
 
 A `Buf[T]` is the growable form of a `[]T`, so it answers `==` and `print` the way one does — both
