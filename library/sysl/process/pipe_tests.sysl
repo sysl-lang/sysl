@@ -264,6 +264,73 @@ pt_detached_child_survives()
     assert(pt_signal(i32(pid), 0) != 0, "the child was not reaped")
 end pt_detached_child_survives
 
+private pt_detached_with(program: string, args: []const string) -> int
+    val s = spawn(program, args).unwrap()
+
+    s.detach()
+end pt_detached_with
+
+@test("wait_pid reaps a detached child and answers its exit code")
+pt_wait_pid_exit_code()
+    val pid = pt_detached_with("sh", ["-c", "exit 7"])
+
+    assert_eq(wait_pid(pid).unwrap(), Status.Exited(7))
+    assert(pt_signal(i32(pid), 0) != 0, "the child was not reaped")
+end pt_wait_pid_exit_code
+
+@test("wait_pid answers a signal-killed child as Spawned.wait does")
+pt_wait_pid_signalled()
+    val pid = pt_detached_with("sleep", ["30"])
+
+    pt_signal(i32(pid), 9)
+    assert_eq(wait_pid(pid).unwrap(), Status.Signalled(9))
+
+    val s = spawn("sleep", ["30"]).unwrap()
+
+    pt_signal(i32(s.pid()), 9)
+    assert_eq(s.wait().unwrap(), Status.Signalled(9))
+end pt_wait_pid_signalled
+
+@test("try_wait_pid is None while the child runs and Some once it has ended")
+pt_try_wait_pid_before_and_after()
+    val pid = pt_detached_with("sleep", ["30"])
+
+    assert_eq(try_wait_pid(pid).unwrap().is_none(), true)
+    pt_signal(i32(pid), 9)
+    assert_eq(wait_pid(pid).unwrap(), Status.Signalled(9))
+
+    val q = pt_detached_with("true", [])
+    val t0 = monotonic()
+    var got: Option[Status] = None
+
+    while got.is_none() && whole_millis(monotonic() - t0) < 5000
+        got = try_wait_pid(q).unwrap()
+    end while
+
+    assert_eq(got.unwrap(), Status.Exited(0))
+    assert(pt_signal(i32(q), 0) != 0, "try_wait_pid did not reap")
+end pt_try_wait_pid_before_and_after
+
+@test("a second wait_pid, and a try_wait_pid after it, on a reaped pid are errors")
+pt_wait_pid_twice()
+    val pid = pt_detached_with("true", [])
+
+    wait_pid(pid).unwrap()
+    assert_eq(wait_pid(pid).is_err(), true)
+    assert_eq(try_wait_pid(pid).is_err(), true)
+    assert(wait_pid(pid).unwrap_err() == IoError.Other(10))
+end pt_wait_pid_twice
+
+@test("a pid that is not this program's child is an error, and so are pid 0 and -1")
+pt_wait_pid_refused()
+    assert(wait_pid(1).unwrap_err() == IoError.Other(10))
+    assert_eq(try_wait_pid(1).is_err(), true)
+    assert(wait_pid(0).unwrap_err() == IoError.Other(22))
+    assert(wait_pid(-1).unwrap_err() == IoError.Other(22))
+    assert(try_wait_pid(0).unwrap_err() == IoError.Other(22))
+    assert(try_wait_pid(-1).unwrap_err() == IoError.Other(22))
+end pt_wait_pid_refused
+
 @test("detaching a child that has already ended answers its pid and drops quietly")
 pt_detach_after_exit()
     val s = spawn("true").unwrap()
