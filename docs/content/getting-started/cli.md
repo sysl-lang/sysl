@@ -1200,7 +1200,8 @@ been analysed.
 
 An analysis is published in two steps. What the program's own text says — a syntax error, a type
 error in a body, anything the declarations and the package's own bodies reveal — is published as
-soon as it is known. What only the whole program decides — the generic instances it uses, its module
+soon as it is known. The package's `@tests` files are left out of this first step, unless the file
+being edited is one, so their mistakes arrive with the second. What only the whole program decides — the generic instances it uses, its module
 storage evaluated, and the whole-program checks such as whether a function keeps a pointer it was handed — follows,
 and when it does the published lists are exactly what `sysl build` would report. A whole-program
 diagnostic in a file whose text has not changed stays up in between, so it does not flicker while
@@ -1217,7 +1218,9 @@ A file is analysed with the package whose `sysl.hocon` is nearest above it. A fi
 library is analysed with the whole library, as `sysl test --std` checks it. A file with no manifest
 above it, whose directories spell the module its header declares, is analysed with the tree above
 those directories; any other file is analysed alone. The standard library is parsed once and kept for the life of the server, except while the
-editor holds unsaved text for one of the library's own files. A message that is not JSON is answered
+editor holds unsaved text for one of the library's own files. Each package file's parse is kept as well,
+and a file is parsed again only when its text, or the features and options its package gates it
+with, has changed — whether the editor changed it or something changed it on disk. A message that is not JSON is answered
 with the JSON-RPC parse error (`-32700`); a request the server does not answer, with `-32601`. The
 server ends at `exit`, with status 0 after `shutdown` and 1 without; input that ends or cannot be
 framed ends it with status 1.
