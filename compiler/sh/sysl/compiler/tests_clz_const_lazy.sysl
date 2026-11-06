@@ -205,6 +205,92 @@ clz_every_route_taken()
     assert(matched.contains("; inside 'arm(0)'"), matched)
 end clz_every_route_taken
 
+@test("a loop folds until the iteration that takes the call, and a body's own constant is judged the same")
+clz_a_loop_and_a_body_const()
+    if !enm_ready() then return
+
+    val loopy = raw"""
+        loopy(n: int) -> int
+            var s = 0
+            for i in 0..<n
+                s += if i == 7 then noisy(i) else i
+            s
+
+        """
+
+    assert_eq(enm_ran(clz_routes + loopy + raw"""
+        const K: int = loopy(7)
+
+        main()
+            const L: int = outer(false)
+            var a: [K]u8
+            print(K, L, a.len)
+        """), "21 8 21\n")
+
+    val looped = clz_refused(loopy + "const K: int = loopy(8)\n\nmain()\n    print(K)\n")
+
+    assert(looped.contains(s"'K' cannot be computed while compiling: ${clz_prints()}"), looped)
+    assert(looped.contains("— inside 'noisy(7)'"), looped)
+    assert(looped.contains("; inside 'loopy(8)'"), looped)
+
+    val body = clz_refused("main()\n    const L: int = outer(true)\n    print(L)\n")
+
+    assert(body.contains(s"'L' cannot be computed while compiling: ${clz_prints()}"), body)
+    assert(body.contains("; inside 'outer(true)'"), body)
+end clz_a_loop_and_a_body_const
+
+@test("a module val on the host runs its refused call when the program starts, and folds the one it skips")
+clz_a_module_val_on_the_host()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(clz_routes + raw"""
+        val V: int = outer(false)
+        val W: int = outer(true)
+
+        main()
+            print(V, W)
+        """), "hi\n8 4\n")
+end clz_a_module_val_on_the_host
+
+// What a frame holds itself is judged as the run enters it, whichever of its branches would reach it:
+// only its calls wait to be reached.
+@test("a frame that converts a pointer is refused on entry, even on a branch the run does not take")
+clz_a_frames_own_body_is_judged_on_entry()
+    if !enm_ready() then return
+
+    val said = clz_refused(raw"""
+        guarded(flag: bool) -> int
+            if flag
+                val p: *int = null
+                return int(usize(p))
+            3
+
+        const G: int = guarded(false)
+
+        main()
+            print(G)
+        """)
+
+    assert(said.contains("'G' cannot be computed while compiling: it calls 'guarded', which converts a pointer"),
+           said)
+
+    // One frame further down, the frame is only entered where the branch is taken.
+    assert_eq(enm_ran(clz_routes + raw"""
+        guarded(flag: bool) -> int
+            if flag
+                val p: *int = null
+                return int(usize(p))
+            3
+
+        shielded(flag: bool) -> int = if flag then guarded(true) else 2
+
+        const G: int = shielded(false)
+
+        main()
+            print(G)
+        """), "2\n")
+end clz_a_frames_own_body_is_judged_on_entry
+
 @test("an extern and a module var a callee reaches stop the run only where it reaches them")
 clz_outside_and_storage()
     if !enm_ready() then return
