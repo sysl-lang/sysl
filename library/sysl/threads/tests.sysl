@@ -112,9 +112,9 @@ private feeder(f: *Feed) -> unit
 // type is for.
 @test("a value put in on one thread comes out on another")
 channel_crosses_threads() -> unit
-    var slots: [2]int = [0; 2]
-    var f = Feed(channel(slots[..]))
-    var running = spawn(&feeder, &f) match
+    val held: &sync Feed = Feed(channel([0; 2]))
+    val f = &*held
+    var running = spawn(&feeder, f) match
         Some(t) -> t
         None -> return
 
@@ -205,8 +205,9 @@ private returner(r: *Rally) -> unit
 // test rather than slipping past it.
 @test("two threads take turns through a Condvar")
 condvar_ping_pong() -> unit
-    var r = Rally(Mutex.new(0), Condvar.new(), 20000)
-    var other = spawn(&returner, &r) match
+    val held: &sync Rally = Rally(Mutex.new(0), Condvar.new(), 20000)
+    val r = &*held
+    var other = spawn(&returner, r) match
         Some(t) -> t
         None -> return
 
@@ -249,8 +250,8 @@ private look(s: *Seen) -> unit
 
 @test("a thread is not the one that started it, and its id is the one spawn answered")
 thread_ids() -> unit
-    var s = Seen(0, 0)
-    val t = spawn(&look, &s).unwrap()
+    val s: &sync Seen = Seen(0, 0)
+    val t = spawn(&look, &*s).unwrap()
 
     assert(t.join())
     assert(s.id == t.id)
@@ -262,9 +263,9 @@ thread_ids() -> unit
 thread_local_starts_fresh() -> unit
     per_thread = 99
 
-    var s = Seen(0, 0)
+    val s: &sync Seen = Seen(0, 0)
 
-    assert(spawn(&look, &s).unwrap().join())
+    assert(spawn(&look, &*s).unwrap().join())
     assert_eq(s.value, 41)
     assert_eq(per_thread, 99)
     per_thread = 41
@@ -321,8 +322,8 @@ private deep_sum(n: int) -> u64
 
 @test("a thread asked for 8 MiB recurses deeper than the 512 KiB default allows")
 spawn_big_stack_recurses() -> unit
-    var d = Deep(1500, 0, 0)
-    val t = spawn(&run_deep, &d, 8 * 1024 * 1024).unwrap()
+    val d: &sync Deep = Deep(1500, 0, 0)
+    val t = spawn(&run_deep, &*d, 8 * 1024 * 1024).unwrap()
 
     assert(t.join())
     assert_eq(d.answer, deep_sum(1500))
@@ -330,31 +331,31 @@ spawn_big_stack_recurses() -> unit
 
 @test("the default stack still starts a thread")
 spawn_default_stack_runs() -> unit
-    var d = Deep(100, 0, 0)
+    val d: &sync Deep = Deep(100, 0, 0)
 
-    assert(spawn(&run_deep, &d).unwrap().join())
+    assert(spawn(&run_deep, &*d).unwrap().join())
     assert_eq(d.answer, deep_sum(100))
 
 @test("a request below the system's default gets at least the default")
 spawn_small_stack_gets_the_default() -> unit
-    var d = Deep(50, 0, 0)
+    val d: &sync Deep = Deep(50, 0, 0)
 
-    assert(spawn(&run_deep, &d, 4096).unwrap().join())
+    assert(spawn(&run_deep, &*d, 4096).unwrap().join())
     assert_eq(d.answer, deep_sum(50))
     assert(d.stack >= 512 * 1024)
 
 @test("a request that is not a whole page is rounded up")
 spawn_odd_stack_is_rounded() -> unit
-    var d = Deep(1500, 0, 0)
+    val d: &sync Deep = Deep(1500, 0, 0)
 
-    assert(spawn(&run_deep, &d, 8 * 1024 * 1024 + 1).unwrap().join())
+    assert(spawn(&run_deep, &*d, 8 * 1024 * 1024 + 1).unwrap().join())
     assert_eq(d.answer, deep_sum(1500))
 
 @test("spawn_on runs a thread on storage the program owns")
 spawn_on_a_given_stack() -> unit
     var room: [262144]u8 = [0; 262144]
-    var s = Seen(0, 0)
-    val t = spawn_on(room[..], &look, &s).unwrap()
+    val s: &sync Seen = Seen(0, 0)
+    val t = spawn_on(room[..], &look, &*s).unwrap()
 
     assert(t.join())
     assert_eq(s.value, 41)
@@ -363,9 +364,9 @@ spawn_on_a_given_stack() -> unit
 @test("spawn_on refuses storage with no room for a stack")
 spawn_on_too_small() -> unit
     var room: [8]u8 = [0; 8]
-    var s = Seen(0, 0)
+    val s: &sync Seen = Seen(0, 0)
 
-    spawn_on(room[..], &look, &s) match
+    spawn_on(room[..], &look, &*s) match
         Some(t) ->
             assert(t.join())
             assert(false, "a thread was started on eight bytes")
@@ -985,10 +986,10 @@ private chs_late_send(l: *ChsLate) -> unit
 
 @test("chs_ a receiver that outwaits its watch sleeps, and the late send wakes it")
 chs_late_sender() -> unit
-    var slots = [0; 1]
-    var l = ChsLate(channel(slots[..]), 50)
+    val held: &sync ChsLate = ChsLate(channel([0; 1]), 50)
+    val l = &*held
     val t0 = monotonic()
-    var t = spawn(&chs_late_send, &l) match
+    var t = spawn(&chs_late_send, l) match
         Some(t) -> t
         None -> return
 
@@ -1003,10 +1004,10 @@ private chs_late_receive(l: *ChsLate) -> unit
 
 @test("chs_ a sender at a full channel sleeps, and the late receive makes room and wakes it")
 chs_late_receiver() -> unit
-    var slots = [0; 1]
-    var l = ChsLate(channel(slots[..]), 50)
+    val held: &sync ChsLate = ChsLate(channel([0; 1]), 50)
+    val l = &*held
     val t0 = monotonic()
-    var t = spawn(&chs_late_receive, &l) match
+    var t = spawn(&chs_late_receive, l) match
         Some(t) -> t
         None -> return
 
@@ -1055,10 +1056,9 @@ private chs_return(v: *ChsVolley) -> unit
 @test("chs_ a volley through two one-slot channels, watched and slept through by turns, drops nothing")
 chs_volley() -> unit
     for pause_every in [0, 97]
-        var a = [0; 1]
-        var b = [0; 1]
-        var v = ChsVolley(channel(a[..]), channel(b[..]), 20000, pause_every)
-        var t = spawn(&chs_return, &v) match
+        val held: &sync ChsVolley = ChsVolley(channel([0; 1]), channel([0; 1]), 20000, pause_every)
+        val v = &*held
+        var t = spawn(&chs_return, v) match
             Some(t) -> t
             None -> return
 
@@ -1100,15 +1100,16 @@ private chs_return_turn(r: *ChsRally) -> unit
 @test("chs_ two threads take turns through a Condvar with notify_one, plain and timed, and no wake is lost")
 chs_condvar_notify_one() -> unit
     for timed in [false, true]
-        var r = ChsRally(Mutex.new(0), Condvar.new(), 20000, timed)
-        var other = spawn(&chs_return_turn, &r) match
+        val held: &sync ChsRally = ChsRally(Mutex.new(0), Condvar.new(), 20000, timed)
+        val r = &*held
+        var other = spawn(&chs_return_turn, r) match
             Some(t) -> t
             None -> return
 
         for _ in 0..<r.rounds
             val n = r.m.lock_raw()
 
-            chs_wait_turn(&r, n, 1)
+            chs_wait_turn(r, n, 1)
             *n += 1
             r.m.unlock_raw()
             r.turn.notify_one()

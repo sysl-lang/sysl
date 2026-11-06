@@ -5875,7 +5875,7 @@ count(workers: int) -> int
 
     t.n.load()
 
-sum_halves(v: []int) -> int
+sum_halves(v: []const int) -> int
     scope((s) ->
         val a = s.spawn(() -> v[0] + v[1])
         val b = s.spawn(() -> v[2] + v[3])
