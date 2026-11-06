@@ -83,17 +83,21 @@ require_place(cx: &Analyzer, t: TExpr, target: Expr, what: string, writes: bool,
                          "'[]u8' first")
                 return t
             end if
-
-            if writes && read_only_view(texpr_type(recv)) && texpr_type(recv) != Str
-                cx.fault(at, s"this element belongs to a " +
-                         s"'${type_show(texpr_type(recv))}', which views elements it may not " +
-                         "write, so there is nothing to assign through. Elements you may write " +
-                         "are elements of your own: copy them into a " +
-                         s"'[]${type_show(element(texpr_type(recv)).unwrap_or(Unknown))}' first" +
-                         const_self_note(cx))
-                return t
-            end if
         _ -> ()
+
+    // The element of a read-only view, or any part of one -- a field of it, an element of an array it
+    // holds, the place a `ref` was bound to -- is storage this view may not write.
+    val view = if writes then const_view_of(cx, t) else None
+
+    if view.is_some()
+        cx.fault(at, s"this element belongs to a " +
+                 s"'${type_show(view.unwrap())}', which views elements it may not " +
+                 "write, so there is nothing to assign through. Elements you may write " +
+                 "are elements of your own: copy them into a " +
+                 s"'[]${type_show(element(view.unwrap()).unwrap_or(Unknown))}' first" +
+                 const_self_note(cx))
+        return t
+    end if
 
     if !writable_place(t)
         cx.fault(at, s"$what needs a variable, a field, an element, or a dereference — " +
@@ -198,8 +202,14 @@ refuse_written_once_receiver(cx: &Analyzer, span: Span, place: TExpr, member: st
     var head = s"$writes, and a 'val' is written once"
     var lead = " — this closure captures by value, since "
     var tail = var_fix(place)
+    val view = const_view_of(cx, place)
 
-    if root.is_some() && root.unwrap().read_only
+    if view.is_some()
+        head = s"$writes, and this element belongs to a '${type_show(view.unwrap())}', which views " +
+            "elements it may not write"
+        tail = " — elements you may write are elements of your own: copy them into a " +
+            s"'[]${type_show(element(view.unwrap()).unwrap_or(Unknown))}' first" + const_self_note(cx)
+    else if root.is_some() && root.unwrap().read_only
         if root.unwrap().from_pattern
             head = writes
             lead = ", and this closure captures by value, since "
@@ -304,6 +314,28 @@ private root_local_step(cx: &Analyzer, t: TExpr) -> Option[Local] = *t.kind matc
     TIndex(recv, _, _) -> if owns_its_elements(texpr_type(recv)) then root_local(cx, recv) else None
     TDeref(_, _) -> ref_call_place(cx, t) match
         Some(v) -> root_local(cx, v)
+        None -> None
+    _ -> None
+
+// The read-only view a place is part of an element of, where it is one: `xs[0]`, `xs[0].f`,
+// `xs[0].arr[1]` over a `[]const T`, and a `ref` name bound to any of those, which is a second name
+// for the same storage. **The walk is the one `root_local` makes** -- through a field of a value and
+// an array's or vector's own elements, and through the place a `ref` stands for -- and it stops where
+// a step reaches storage held by address: a `[]T` field of a read-only element is a view of elements
+// somebody else keeps, so writing through it writes nothing the read-only view holds.
+const_view_of(cx: &Analyzer, t: TExpr) -> Option[Type] = *t.kind match
+    TIndex(recv, _, _) ->
+        val rt = texpr_type(recv)
+
+        if rt != Str && read_only_view(rt) then Some(rt)
+        else if owns_its_elements(rt) then const_view_of(cx, recv)
+        else None
+    TField(recv, _, _) -> if holds_an_address(texpr_type(recv)) then None else const_view_of(cx, recv)
+    TLoad(name, _) -> ref_place(cx, name) match
+        Some(p) -> const_view_of(cx, p)
+        None -> None
+    TDeref(_, _) -> ref_call_place(cx, t) match
+        Some(v) -> const_view_of(cx, v)
         None -> None
     _ -> None
 
