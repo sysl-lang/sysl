@@ -18,8 +18,15 @@ Run it through a build slot, because every program is built three times and seve
 once:
 
 ```
-caffeinate -dimsu zsh ~/dev/sysl-lang/sysl/.claude/scripts/take-slot.zsh . ./dropfuzz --compiler <stage1> --lib <repo>/library --seed 1 --count 1000 --workers 4 --out failures
+SLOT_TIMEOUT=30 caffeinate -dimsu zsh ~/dev/sysl-lang/sysl/.claude/scripts/take-slot.zsh . ./dropfuzz --compiler <stage1> --lib <repo>/library --seed 1 --count 1000 --workers 4 --out failures
 ```
+
+**The slot kills a run at its deadline, so set `SLOT_TIMEOUT` (in minutes) to fit the count.** With
+four workers, 1,000 programs take about 8 minutes and 10,000 about 75, with another slot busy beside
+it. Allow 10 minutes per 1,000 programs and 15 more, plus time for reductions if failures are
+expected: 30 for 1,000 programs, 120 for 10,000. A run that reaches its deadline is hanging (a
+generated program that never ends is killed by its own 30-second timeout), so read the slot's sample
+rather than re-running.
 
 | option | meaning |
 |---|---|
