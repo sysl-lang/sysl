@@ -531,13 +531,15 @@ Four builtins form the entire interface between a task and whatever schedules it
 |---|---|
 | `block_on(t)` | runs `t` on this thread until it ends; its value is the result |
 | `step(t, wake: &Fn() -> unit) -> bool` | resumes `t` once; `true` once `t` has ended |
-| `await park(register: &Fn(&Fn() -> unit) -> unit)` | hands `register` a **waker** and suspends until the waker is called |
+| `await park(register: &Fn(@keeps &Fn() -> unit) -> unit)` | hands `register` a **waker** and suspends until the waker is called |
 | `await yield_now()` | wakes the task being stepped and suspends once |
 
 **A waker is a `&Fn() -> unit`.** An executor passes `step` the waker it wants called when the task
 can run again. A task's `park` passes its registrar a waker of its own, which the registrar stores
 wherever the awaited event will find it: a timer, an interrupt, a completion queue. Calling that
-waker calls the executor's.
+waker calls the executor's. Keeping the waker is the registrar's whole job, so its type marks the
+parameter [`@keeps`](/reference/types/#a-parameter-the-callable-may-keep-keeps); a registrar held in a
+variable or a field is written at that type.
 
 An executor is therefore a run queue and a loop over `step`. Here is a complete one, with a timer as
 the event source:

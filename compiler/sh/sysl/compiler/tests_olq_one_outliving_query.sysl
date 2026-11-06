@@ -1,0 +1,243 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// **A call through `&Fn` is answered by its type** (`reference/memory.md § A callable that keeps what it
+// is handed`, L7; `keeps.sysl`'s `vcall_keeps`, `vcall_answers`, `refuse_promised`).
+//
+// No table of the closures made at a callable type is consulted: a parameter the type marks `@keeps`
+// may be kept anywhere, every other one is borrowed for the call, and a closure a call through `&Fn`
+// may land in that keeps an unmarked parameter -- a pointer, an object, or what it reads through a
+// pointer -- is refused where it is written. A closure taken only as a bare arrow is called where its
+// body is in sight, and its body answers. A callable type cannot say `@answers`, so a call through one
+// may answer with anything it was handed. `park`'s registrar keeps the waker, so its type marks it.
+//
+// The axes: what the closure is handed (a pointer, an object, a pointer read through, a view); the type
+// it is made at (unmarked, marked, a bare arrow, a generic instantiated at a pointer and at an int); what
+// the caller does with the answer (stores it); `park` (a literal registrar, one held at the unmarked
+// type). Skipped: a view handed through an unmarked callable, which the promotion still answers
+// conservatively by moving the array (`tests_esc_escape.sysl`), so nothing changed there; a trait
+// object, already answered by its declaration (`tests_lsg_signature_answers.sysl`); separate
+// compilation, which reads the same typed tree; threads, whose `scope` closures are bare arrows or
+// `@scoped` (`tests_scn_scoped.sysl`).
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private olq_outcome(text: string) -> (string, int)
+    val root = make_temp_dir("sysl-olq").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (failure_text(why), -1)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> ("the program that was built could not be run", -1)
+        Ok(out) -> (out.text + out.err.unwrap_or(""), shell_status(out.status))
+end olq_outcome
+
+private olq_prints(text: string, want: string)
+    if xvr_no_library() then return
+
+    val out = olq_outcome(text)
+
+    assert_eq(out.0, want)
+    assert_eq(out.1, 0)
+end olq_prints
+
+private olq_refused(text: string, part: string)
+    if xvr_no_library() then return
+
+    val out = olq_outcome(text)
+
+    assert_eq(out.1, -1, out.0)
+    assert(out.0.index_of(part).is_some(), out.0)
+end olq_refused
+
+// -- a call through `&Fn` is answered by its type ---------------------------------------------------
+
+@test("a closure at an unmarked callable type keeping the object it is handed is refused, naming the mark that would let it")
+olq_unmarked_object_kept_refused()
+    olq_refused(raw"""
+        var last: Option[&Fn(int) -> unit] = None
+
+        ask(f: &Fn(&Fn(int) -> unit) -> unit) = f(n -> print(n))
+
+        ask(a -> last = Some(a))
+        """, "a closure borrows what it is handed for the call, and this one keeps its parameter 'a' (it is " +
+            "stored in 'last') — whoever calls it may hand it the address of their own storage. Copy what " +
+            "this needs into storage of its own, or let it keep it by marking the parameter '@keeps' in the " +
+            "type it is made at: 'Fn(@keeps &Fn(int) -> unit) -> unit'")
+
+@test("marked '@keeps', the same closure keeps the object, and the literal handed to it moves to the heap")
+olq_marked_object_kept()
+    olq_prints(raw"""
+        var last: Option[&Fn(int) -> unit] = None
+
+        ask(n: int, f: &Fn(@keeps &Fn(int) -> unit) -> unit) = f(r -> print(n + r))
+
+        ask(40, a -> last = Some(a))
+        last.unwrap()(2)
+        """, "42\n")
+
+@test("a closure at an unmarked type letting out what it reads through its pointer is refused where it is written")
+olq_unmarked_read_through_refused()
+    olq_refused(raw"""
+        struct Cell
+            p: *int
+
+        var the = 1
+        var kept: *int = &the
+
+        poke(f: &Fn(*Cell) -> unit)
+            var x = 5
+            var c = Cell(&x)
+            f(&c)
+
+        poke((c) -> kept = c.p)
+        """, "a closure borrows what it is handed for the call, and this one lets what it reads through its " +
+            "parameter 'c' outlive the call (it is stored in 'kept')")
+
+@test("a closure that only uses what it is handed is accepted, and a local's address goes through")
+olq_unmarked_borrowing_accepted()
+    olq_prints(raw"""
+        bump(f: &Fn(*int) -> unit) -> int
+            var x = 41
+            f(&x)
+            x
+
+        print(bump((p) -> *p += 1))
+        """, "42\n")
+
+@test("a closure taken only as a bare arrow is called where its body is in sight, and may keep an object")
+olq_bare_arrow_object_kept()
+    olq_prints(raw"""
+        var last: Option[&Fn(int) -> unit] = None
+
+        ask(n: int, f: (&Fn(int) -> unit) -> unit) = f(r -> print(n + r))
+
+        main()
+            ask(40, a -> last = Some(a))
+            last.unwrap()(2)
+        """, "42\n")
+
+// The same written as the entry file's statements: the literal handed to the kept callable is left in
+// `ask`'s frame, and the call reads that frame after it ended.
+@test(ignore: "the entry file's statements do not move a literal a bare-arrow callee keeps (prints 3)")
+olq_bare_arrow_object_kept_at_entry()
+    olq_prints(raw"""
+        var last: Option[&Fn(int) -> unit] = None
+
+        ask(n: int, f: (&Fn(int) -> unit) -> unit) = f(r -> print(n + r))
+
+        ask(40, a -> last = Some(a))
+        last.unwrap()(2)
+        """, "42\n")
+
+@test("a generic callable at a pointer keeps it only with the mark, and at an int keeps nothing")
+olq_generic_two_instantiations()
+    olq_refused(raw"""
+        import sysl.buf.{Buf, buf}
+
+        var ints: Buf[int] = buf()
+        var the = 1
+        var held: *int = &the
+
+        apply[T](f: &Fn(T) -> unit, v: T) = f(v)
+
+        apply((n: int) -> ints.push(n), 3)
+        apply((p: *int) -> held = p, &the)
+        """, "a closure borrows what it is handed for the call, and this one keeps its parameter 'p' (it is " +
+            "stored in 'held')")
+
+    olq_prints(raw"""
+        import sysl.buf.{Buf, buf}
+
+        var ints: Buf[int] = buf()
+
+        apply[T](f: &Fn(T) -> unit, v: T) = f(v)
+
+        apply((n: int) -> ints.push(n), 3)
+        print(ints[0])
+        """, "3\n")
+
+@test("a callable's answer is read off its type, which cannot say '@answers': a local's address handed in may come back")
+olq_callable_answer_by_type()
+    olq_refused(raw"""
+        var the = 5
+        var kept: *int = &the
+
+        pick(f: &Fn(*int) -> *int) -> int
+            var mine = 3
+            kept = f(&mine)
+            *kept
+
+        print(pick((p) -> &the))
+        """, "'f' holds the address of a local of 'pick', and it is stored in 'kept'")
+
+@test("a callable's answer stored nowhere past the frame is accepted, the local's address and all")
+olq_callable_answer_lent()
+    olq_prints(raw"""
+        pick(f: &Fn(*int) -> *int) -> int
+            var mine = 3
+            val q = f(&mine)
+            *q + 1
+
+        print(pick((p) -> p))
+        """, "4\n")
+
+// -- park's registrar keeps the waker ---------------------------------------------------------------
+
+@test("a registrar literal keeping the waker it is handed is accepted: park's type marks it '@keeps'")
+olq_park_literal_registrar()
+    olq_prints(raw"""
+        var waker: Option[&Fn() -> unit] = None
+
+        async wait() -> int
+            await park((w) -> waker = Some(w))
+            7
+
+        val t = wait()
+        print(step(t, () -> ()))
+        waker.unwrap()()
+        print(step(t, () -> ()))
+        """, "false\ntrue\n")
+
+@test("a registrar held at the unmarked type is not the type park takes")
+olq_park_unmarked_registrar_refused()
+    olq_refused(raw"""
+        async wait()
+            val r: &Fn(&Fn() -> unit) -> unit = (w) -> ()
+            await park(r)
+
+        print(1)
+        """, "'park' needs its registrar as a '&Fn(@keeps &Fn() -> unit) -> unit', which is handed the waker of " +
+            "the task being stepped, but this value is &Fn(&Fn() -> unit) -> unit")
+
+@test("a registrar held at the marked type is the type park takes")
+olq_park_marked_registrar()
+    olq_prints(raw"""
+        var waker: Option[&Fn() -> unit] = None
+
+        async wait() -> int
+            val r: &Fn(@keeps &Fn() -> unit) -> unit = (w) -> waker = Some(w)
+            await park(r)
+            7
+
+        val t = wait()
+        print(step(t, () -> ()))
+        waker.unwrap()()
+        print(step(t, () -> ()))
+        """, "false\ntrue\n")

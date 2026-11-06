@@ -5,11 +5,10 @@ import sysl.fs.{make_temp_dir, remove_dir_all, write_text}
 import sysl.process.capture
 import sysl.text.{cstring}
 
-// A closure literal handed to an unknown `&Fn` callee is laid in the caller's frame only where no body
-// that call may reach keeps it. **A closure's body stores an object it is handed as surely as a
-// function's does**: its parameter of an object type is no address anyone lent (`keeps.sysl`'s
-// `lent_by_rule`), so a call through a `&Fn` is held to what the body keeps, and the closure handed
-// over moves to the heap and holds its captures by value.
+// A closure literal handed to an unknown `&Fn` callee is laid in the caller's frame unless the
+// callee's type marks that parameter `@keeps` (L7: a call through `&Fn` is answered by its type, and
+// every closure made at an unmarked type is held to borrowing where it is written). Where the type
+// marks it, the closure handed over moves to the heap and holds its captures by value.
 //
 // Every cell keeps the closure past the frame that built it, tramples the stack, and only then calls
 // it, so a closure left in a dead frame faults or prints garbage.
@@ -137,8 +136,8 @@ private ffk_framed(ir: string, n: int) -> bool = ir.contains(s"= alloca %arc.$$c
 private const ffk_field: string = raw"""
 struct W
     n: int
-    ask: &Fn(&Fn(int) -> unit) -> unit
-    show(&self, ask: &Fn(&Fn(int) -> unit) -> unit) = ask(r -> print(self.n + r))
+    ask: &Fn(@keeps &Fn(int) -> unit) -> unit
+    show(&self, ask: &Fn(@keeps &Fn(int) -> unit) -> unit) = ask(r -> print(self.n + r))
     go(&self) = self.show(self.ask)
 main()
     val h: &Held = Held(None)
@@ -158,7 +157,7 @@ ffk_param_callee()
     ffk_prints(raw"""
 struct W
     n: int
-    show(&self, ask: &Fn(&Fn(int) -> unit) -> unit) = ask(r -> print(self.n + r))
+    show(&self, ask: &Fn(@keeps &Fn(int) -> unit) -> unit) = ask(r -> print(self.n + r))
 main()
     val h: &Held = Held(None)
     val w: &W = W(40)
@@ -170,7 +169,7 @@ end main
 @test("a literal handed to a local val holding the &Fn outlives the frame")
 ffk_local_callee()
     ffk_prints(raw"""
-show(n: int, ask: &Fn(&Fn(int) -> unit) -> unit)
+show(n: int, ask: &Fn(@keeps &Fn(int) -> unit) -> unit)
     val k = ask
 
     k(r -> print(n + r))
@@ -187,7 +186,7 @@ end main
 @test("a closure bound to a val before the call moves as a literal does")
 ffk_val_bound()
     ffk_prints(raw"""
-show(n: int, ask: &Fn(&Fn(int) -> unit) -> unit)
+show(n: int, ask: &Fn(@keeps &Fn(int) -> unit) -> unit)
     val c: &Fn(int) -> unit = r -> print(n + r)
 
     ask(c)
@@ -202,7 +201,7 @@ end main
 @test("a callee forwarded through several levels is held to what its body stores")
 ffk_forwarded_levels()
     ffk_prints(raw"""
-type Ask = &Fn(&Fn(int) -> unit) -> unit
+type Ask = &Fn(@keeps &Fn(int) -> unit) -> unit
 one(n: int, ask: Ask) = ask(r -> print(n + r))
 two(n: int, ask: Ask) = one(n, ask)
 three(n: int, ask: Ask)
@@ -220,8 +219,8 @@ ffk_second_reduction()
     ffk_prints(raw"""
 struct W
     n: int
-show(ask: &Fn(&Fn(int) -> unit) -> unit, answer: &Fn(int) -> unit) = ask(r -> answer(r))
-go(w: &W, ask: &Fn(&Fn(int) -> unit) -> unit) = show(ask, r -> print(w.n + r))
+show(ask: &Fn(@keeps &Fn(int) -> unit) -> unit, answer: &Fn(int) -> unit) = ask(r -> answer(r))
+go(w: &W, ask: &Fn(@keeps &Fn(int) -> unit) -> unit) = show(ask, r -> print(w.n + r))
 main()
     val h: &Held = Held(None)
     go(W(40), a -> h.f = Some(a))
@@ -236,7 +235,7 @@ ffk_named_keep_helper()
     ffk_prints(raw"""
 keep(h: &Held, a: &Fn(int) -> unit)
     h.f = Some(a)
-show(n: int, ask: &Fn(&Fn(int) -> unit) -> unit) = ask(r -> print(n + r))
+show(n: int, ask: &Fn(@keeps &Fn(int) -> unit) -> unit) = ask(r -> print(n + r))
 main()
     val h: &Held = Held(None)
     show(40, a -> keep(h, a))
@@ -250,7 +249,7 @@ ffk_store_in_a_buf()
 import sysl.buf.{Buf, buf}
 struct Many
     all: Buf[&Fn(int) -> unit]
-show(n: int, ask: &Fn(&Fn(int) -> unit) -> unit) = ask(r -> print(n + r))
+show(n: int, ask: &Fn(@keeps &Fn(int) -> unit) -> unit) = ask(r -> print(n + r))
 main()
     val m: &Many = Many(buf())
     show(40, a -> m.all.push(a))
@@ -263,7 +262,7 @@ end main
 @test("a body storing it in a struct it stores keeps it")
 ffk_store_in_a_struct()
     ffk_prints(raw"""
-show(n: int, ask: &Fn(&Fn(int) -> unit) -> unit) = ask(r -> print(n + r))
+show(n: int, ask: &Fn(@keeps &Fn(int) -> unit) -> unit) = ask(r -> print(n + r))
 main()
     val h: &Boxed = Boxed(None)
     show(40, a -> h.b = Some(Box(a)))
@@ -300,7 +299,7 @@ end main
 @test("a generic callee answers as the plain one does")
 ffk_generic_callee()
     ffk_prints(raw"""
-show[T](v: T, n: int, ask: &Fn(T, &Fn(int) -> unit) -> unit) = ask(v, r -> print(n + r))
+show[T](v: T, n: int, ask: &Fn(T, @keeps &Fn(int) -> unit) -> unit) = ask(v, r -> print(n + r))
 main()
     val h: &Held = Held(None)
     show(h, 40, (x, a) -> x.f = Some(a))
@@ -334,7 +333,7 @@ ffk_function_as_callee()
 var the: Option[&Fn(int) -> unit] = None
 stash(a: &Fn(int) -> unit)
     the = Some(a)
-show(n: int, ask: &Fn(&Fn(int) -> unit) -> unit) = ask(r -> print(n + r))
+show(n: int, ask: &Fn(@keeps &Fn(int) -> unit) -> unit) = ask(r -> print(n + r))
 main()
     show(40, stash)
     print(scribble(50))
@@ -351,7 +350,7 @@ ffk_captures_self()
     ffk_prints(raw"""
 struct W
     n: int
-    show(&self, ask: &Fn(&Fn(int) -> unit) -> unit) = ask(r -> print(self.n + r))
+    show(&self, ask: &Fn(@keeps &Fn(int) -> unit) -> unit) = ask(r -> print(self.n + r))
 run(h: &Held)
     val w: &W = W(40)
     w.show(a -> h.f = Some(a))
@@ -366,7 +365,7 @@ end main
 @test("a captured var is held by value once the closure is kept, and its own writes last between calls")
 ffk_captures_var()
     ffk_prints(raw"""
-show(ask: &Fn(&Fn(int) -> unit) -> unit)
+show(ask: &Fn(@keeps &Fn(int) -> unit) -> unit)
     var c = 40
 
     ask(r ->
@@ -386,7 +385,7 @@ ffk_write_seen_outside_is_refused()
     if !enm_ready() then return
 
     val got = ffk_ir(raw"""
-show(ask: &Fn(&Fn(int) -> unit) -> unit) -> int
+show(ask: &Fn(@keeps &Fn(int) -> unit) -> unit) -> int
     var c = 40
 
     ask(r -> c += r)
@@ -434,7 +433,7 @@ ffk_other_signature_stays_framed()
 
     val ir = ffk_ir(raw"""
 tell(n: int, ask: &Fn(&Fn(string) -> unit) -> unit) = ask(s -> print(s"$n$s"))
-show(n: int, ask: &Fn(&Fn(int) -> unit) -> unit) = ask(r -> print(n + r))
+show(n: int, ask: &Fn(@keeps &Fn(int) -> unit) -> unit) = ask(r -> print(n + r))
 main()
     val h: &Held = Held(None)
     show(40, a -> h.f = Some(a))
@@ -458,7 +457,7 @@ edit(change: &Fn(*St) -> unit) -> int
     change(&st)
     st.n
 end edit
-show(n: int, ask: &Fn(&Fn(int) -> unit) -> unit) = ask(r -> print(n + r))
+show(n: int, ask: &Fn(@keeps &Fn(int) -> unit) -> unit) = ask(r -> print(n + r))
 main()
     val h: &Held = Held(None)
     show(40, a -> h.f = Some(a))
@@ -470,7 +469,7 @@ end main
 @test("a store elsewhere of the same signature moves this literal too, and it still runs in place")
 ffk_same_signature_elsewhere()
     ffk_prints(raw"""
-show(n: int, ask: &Fn(&Fn(int) -> unit) -> unit) = ask(r -> print(n + r))
+show(n: int, ask: &Fn(@keeps &Fn(int) -> unit) -> unit) = ask(r -> print(n + r))
 main()
     val h: &Held = Held(None)
     show(40, a -> h.f = Some(a))
