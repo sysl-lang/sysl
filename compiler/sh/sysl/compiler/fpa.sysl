@@ -44,20 +44,27 @@ import sysl.time.monotonic
 
 // One step of a path: a field (`.3`, or `.Some:0` for a variant's), the pointee or the element a view
 // reaches (`*`), an element of an array held in place (`[]`), or somewhere at or below here (`~`); with
-// the struct or enum the step lands on, which is what a path is cut at.
+// the struct or enum the step lands on, which is what a path is cut at. `id` names the pair `s`, `n`
+// in the analysis's step table (`step`), so a path is compared and looked up by integers.
 struct FStep
     s: string
     n: string
+    id: u32
 
 // What a value may be made of: `root` along `path`, sitting at `off` within the value. A root is a
 // parameter's value (`p<i>`), the address of a local's storage (`l:<name>`), a heap object made in
 // the body (`h:<site>`), or module storage (`g`). For an address, `path` is where in the storage it
-// points.
+// points. `rid`, `pid` and `oid` name the root, the path and the offset in the analysis's tables,
+// and `key` the three together: two atoms are one exactly when their keys are equal.
 struct FAtom
     off: Buf[FStep]
     root: string
     path: Buf[FStep]
-    key: string
+    rid: u32
+    pid: u32
+    oid: u32
+    key: u64
+end FAtom
 
 // One function's summary: per parameter, the paths kept and the paths answered with where in the
 // answer they sit; what is written through one parameter out of another; and where in the answer a
@@ -67,11 +74,12 @@ struct FpaSum
     answers: Buf[Buf[(Buf[FStep], Buf[FStep])]]
     writes: Buf[(usize, usize, Buf[FStep])]
     fresh: Buf[Buf[FStep]]
-    seen: Map[string, bool]
+    seen: Map[u64, bool]
     size: int
 end FpaSum
 
-// The analysis of a whole program.
+// The analysis of a whole program, with the tables that name steps, paths, roots and pairs of them by
+// integers: a path is a walk down `paths` from the empty path (0), one step id at a time.
 struct Fpa
     an: &Analysis
     funcs: Buf[TFunc]
@@ -82,18 +90,32 @@ struct Fpa
     walks: int
     tracing: bool
     bodies: Map[usize, &FBody]
+    steps: Map[string, u32]
+    paths: Map[u64, u32]
+    roots: Map[string, u32]
+    pairs: Map[u64, u32]
 end Fpa
+
+// What one cell may hold, with the atoms already in it by key, the parameter paths already in it
+// somewhere inside (by root and path), and the walk that last read it.
+struct FCell
+    atoms: Buf[FAtom]
+    has: Map[u64, bool]
+    under: Map[u64, bool]
+    read: int
+end FCell
 
 // One walk of one body: what every cell may hold -- a local (`l:<name>`), a heap object (`h:<site>`),
 // the answer (`$ret`), what a loop breaks with (`$brk`), what is kept (`$kept`) and what is stored
 // through a parameter (`$thr<i>`) -- with which cells were read in the walk under way, since a cell
-// that grows after it was read sends the body round again.
+// that grows after it was read sends the body round again. `kept` and `thru` are the parameter paths
+// already kept, and already stored through another parameter.
 struct FBody
     fx: &Fpa
     f: TFunc
-    cells: Map[string, Buf[FAtom]]
-    members: Map[string, bool]
-    read: Map[string, bool]
+    cells: Map[string, &FCell]
+    kept: Map[u64, bool]
+    thru: Map[u64, bool]
     refs: Map[string, TExpr]
     changed: bool
     count: int
@@ -110,7 +132,12 @@ fpa_analyze(a: &Analysis, funcs: Buf[TFunc]) -> &Fpa
     for i in 0..<funcs.len()
         if !index.has(funcs[i].name) then index.put(funcs[i].name, i)
 
-    val fx: &Fpa = Fpa(a, funcs, index, buf(), map(), map(), 0, fpa_tracing(), map())
+    val fx = Fpa(a, funcs, index, buf(), map(), map(), 0, fpa_tracing(), map(), map(), map(), map(), map())
+
+    // The steps every walk takes, first, so the constants below name them.
+    step_in(fx, "~", "")
+    step_in(fx, "*", "")
+    step_in(fx, "[]", "")
     var callees: Buf[Buf[usize]] = buf()
     var callers: Buf[Buf[usize]] = buf()
 
@@ -330,25 +357,21 @@ end walk_func
 
 private settle_body(fx: &Fpa, f: TFunc) -> &FBody = settle(FBody(fx, f, map(), map(), map(), map(), false, 0, buf()))
 
+// Walks a body until no cell it read grows. A cell counts as read in this walk when its `read` is this
+// walk's number, `fx.walks`.
 private settle(fb: &FBody) -> &FBody
     val fx = fb.fx
     val f = fb.f
 
     loop
         fb.changed = false
-        fb.read = map()
         fb.refs = map()
         fx.walks += 1
 
         val t0 = monotonic().us
 
         for i in 0..<f.params.len()
-            if fpa_holds(fx, f.params[i].1)
-                var one: Buf[FAtom] = buf()
-
-                one.push(atom(buf(), s"p$i", buf()))
-                add_to(fb, s"l:${f.params[i].0}", one)
-            end if
+            if fpa_holds(fx, f.params[i].1) then add_to(fb, s"l:${f.params[i].0}", single(atom(fb, buf(), s"p$i", buf())))
 
         add_to(fb, "$ret", eval_block(fb, f.body))
 
@@ -357,10 +380,10 @@ private settle(fb: &FBody) -> &FBody
 
             if fb.count > 3000
                 for n in fb.names
-                    val c = fb.cells.get(n).unwrap()
+                    val c = fb.cells.get(n).unwrap().atoms
 
                     if c.len() > 300
-                        eprints(s"FPA-CELL ${f.name} $n ${c.len()} ${c[0].key} ${c[c.len() / 2].key} ${c[c.len() - 1].key}\n")
+                        eprints(s"FPA-CELL ${f.name} $n ${c.len()} ${atom_text(c[0])} ${atom_text(c[c.len() / 2])} ${atom_text(c[c.len() - 1])}\n")
             end if
         end if
 
@@ -378,7 +401,7 @@ private summarize(fb: &FBody) -> &FpaSum
 
     for i in 0..<f.params.len()
         if is_ptr_type(f.params[i].1) && holds_string(f.marks.copies, f.params[i].0)
-            sum_kept(sum, i, buf())
+            sum_kept(fb.fx, sum,i, buf())
 
     var visited: Map[string, bool] = map()
     var work: Buf[FAtom] = buf()
@@ -389,7 +412,7 @@ private summarize(fb: &FBody) -> &FpaSum
     for i in 0..<f.params.len()
         for a in cell(fb, s"$$thr$i")
             if a.root.starts_with("p")
-                sum_write(sum, i, param_of(a.root), a.path)
+                sum_write(fb.fx, sum, i, param_of(a.root), a.path)
             else
                 work.push(a)
 
@@ -401,7 +424,7 @@ private summarize(fb: &FBody) -> &FpaSum
         at += 1
 
         if a.root.starts_with("p")
-            sum_kept(sum, param_of(a.root), a.path)
+            sum_kept(fb.fx, sum,param_of(a.root), a.path)
         else if (a.root.starts_with("h:") || a.root.starts_with("l:")) && !visited.has(a.root)
             visited.put(a.root, true)
 
@@ -425,47 +448,54 @@ private answer_from(fb: &FBody, sum: &FpaSum, atoms: Buf[FAtom], prefix: Buf[FSt
         val o = if inside then prefix else concat(prefix, a.off)
 
         if a.root.starts_with("p")
-            sum_answer(sum, param_of(a.root), a.path, o)
+            sum_answer(fb.fx, sum, param_of(a.root), a.pid, a.path, o)
         else if a.root.starts_with("h:")
-            sum_fresh(sum, o)
+            sum_fresh(fb.fx, sum, o)
 
             if !seen.has(a.root)
                 seen.put(a.root, true)
 
-                val deeper = if inside then o else concat(o, one_step("*", ""))
+                val deeper = if inside then o else concat(o, one_step(star_step()))
 
                 answer_from(fb, sum, cell(fb, a.root), deeper, seen)
             end if
         end if
 end answer_from
 
-private sum_kept(sum: &FpaSum, i: usize, path: Buf[FStep])
-    if covered(&sum.seen, s"k$i|", without_tilde(path)) then return
+// The tag of each kind of entry in a summary's `seen`, in its top bits.
+private val SEEN_KEPT: u64 = 1 << 60
+private val SEEN_ANSWER: u64 = 2 << 60
+private val SEEN_WRITE: u64 = 3 << 60
+private val SEEN_FRESH: u64 = 4 << 60
+
+private sum_kept(fx: &Fpa, sum: &FpaSum, i: usize, path: Buf[FStep])
+    if covered(fx, &sum.seen, SEEN_KEPT | (u64(i) << 32), without_tilde(path)) then return
 
     sum.kept[i].push(path)
     sum.size += 1
 end sum_kept
 
 // **Whether a path, or one it extends, is already in a set**, since a path stands for everything below
-// it: a kept `*.0` holds every `*.0.…` there is. A path that is not is added.
-private covered(seen: *Map[string, bool], tag: string, path: Buf[FStep]) -> bool
-    var k = tag
+// it: a kept `*.0` holds every `*.0.…` there is. A path that is not is added. An entry is the path's
+// id under `tag`, which says what the set is of.
+private covered(fx: &Fpa, seen: *Map[u64, bool], tag: u64, path: Buf[FStep]) -> bool
+    var id: u32 = 0
 
-    if seen.has(k) then return true
+    if seen.has(tag) then return true
 
     for st in path
-        k = k + st.s + "@" + st.n
+        id = path_child(fx, id, st)
 
-        if seen.has(k) then return true
+        if seen.has(tag | u64(id)) then return true
 
-    seen.put(k, true)
+    seen.put(tag | u64(id), true)
     false
 end covered
 
-private sum_answer(sum: &FpaSum, i: usize, path: Buf[FStep], off: Buf[FStep])
+private sum_answer(fx: &Fpa, sum: &FpaSum, i: usize, pid: u32, path: Buf[FStep], off: Buf[FStep])
     if i >= sum.answers.len() then return
 
-    val k = s"a$i|${path_key(path)}|${path_key(off)}"
+    val k = SEEN_ANSWER | (u64(i) << 32) | u64(pair_id(fx, pid, path_id(fx, off)))
 
     if sum.seen.has(k) then return
 
@@ -474,8 +504,8 @@ private sum_answer(sum: &FpaSum, i: usize, path: Buf[FStep], off: Buf[FStep])
     sum.size += 1
 end sum_answer
 
-private sum_write(sum: &FpaSum, dest: usize, src: usize, path: Buf[FStep])
-    val k = s"w$dest|$src|${path_key(path)}"
+private sum_write(fx: &Fpa, sum: &FpaSum, dest: usize, src: usize, path: Buf[FStep])
+    val k = SEEN_WRITE | (u64(pair_id(fx, u32(dest), u32(src))) << 32) | u64(path_id(fx, path))
 
     if sum.seen.has(k) then return
 
@@ -484,8 +514,8 @@ private sum_write(sum: &FpaSum, dest: usize, src: usize, path: Buf[FStep])
     sum.size += 1
 end sum_write
 
-private sum_fresh(sum: &FpaSum, off: Buf[FStep])
-    val k = s"f|${path_key(off)}"
+private sum_fresh(fx: &Fpa, sum: &FpaSum, off: Buf[FStep])
+    val k = SEEN_FRESH | u64(path_id(fx, off))
 
     if sum.seen.has(k) then return
 
@@ -496,46 +526,48 @@ end sum_fresh
 
 // -- cells ----------------------------------------------------------------------------------------
 
+// A cell, made empty the first time it is asked for.
+private cell_of(fb: &FBody, name: string) -> &FCell
+    fb.cells.get(name) match
+        Some(c) -> return c
+        None -> ()
+
+    val c = FCell(buf(), map(), map(), 0)
+
+    fb.cells.put(name, c)
+    fb.names.push(name)
+    c
+end cell_of
+
 // What a cell holds, which counts as reading it.
 private cell(fb: &FBody, name: string) -> Buf[FAtom]
-    fb.read.put(name, true)
+    val c = cell_of(fb, name)
 
-    fb.cells.get(name) match
-        Some(v) -> v
-        None -> buf()
+    c.read = fb.fx.walks
+    c.atoms
 end cell
 
 // Adds what a cell may hold. A cell the walk under way already read sends the body round again.
 private add_to(fb: &FBody, name: string, atoms: Buf[FAtom])
     if atoms.is_empty() then return
 
-    var held = fb.cells.get(name) match
-        Some(v) -> v
-        None ->
-            val fresh: Buf[FAtom] = buf()
-
-            fb.cells.put(name, fresh)
-            fb.names.push(name)
-            fresh
-
+    val c = cell_of(fb, name)
     var grew = false
 
     for a in atoms
-        val k = s"$name|${a.key}"
-
-        if fb.members.has(k) then continue
+        if c.has.has(a.key) then continue
 
         // A parameter's path somewhere inside a value stands for every path it begins.
-        if !a.off.is_empty() && a.off[0].s == "~" && a.root.starts_with("p") &&
-           covered(&fb.members, s"~$name|${a.root}|", without_tilde(a.path))
+        if !a.off.is_empty() && a.off[0].id == TILDE && a.root.starts_with("p") &&
+           covered(fb.fx, &c.under, u64(a.rid) << 32, without_tilde(a.path))
             continue
 
-        fb.members.put(k, true)
-        held.push(a)
+        c.has.put(a.key, true)
+        c.atoms.push(a)
         fb.count += 1
         grew = true
 
-    if grew && fb.read.has(name) then fb.changed = true
+    if grew && c.read == fb.fx.walks then fb.changed = true
 end add_to
 
 // Notes what is kept: let out of the call, through anything that holds it.
@@ -547,20 +579,103 @@ private keep(fb: &FBody, atoms: Buf[FAtom])
 
     for a in atoms
         if a.root.starts_with("p")
-            if !covered(&fb.members, s"K${a.root}|", without_tilde(a.path)) then out.push(atom(buf(), a.root, a.path))
+            if !covered(fb.fx, &fb.kept, u64(a.rid) << 32, without_tilde(a.path)) then out.push(at_place(fb, buf(), a, a.path))
         else
-            out.push(atom(buf(), a.root, a.path))
+            out.push(at_place(fb, buf(), a, a.path))
 
     add_to(fb, "$kept", out)
 end keep
 
 // -- atoms and paths ------------------------------------------------------------------------------
 
-private atom(off: Buf[FStep], root: string, path: Buf[FStep]) -> FAtom
-    val o = if off.len() > 1 then cut_offset(off) else off
+// The step ids every walk takes, entered first (`fpa_analyze`).
+private val TILDE: u32 = 1
+private val STAR: u32 = 2
+private val ELEM: u32 = 3
 
-    FAtom(o, root, path, s"$root|${path_key(path)}|${path_key(o)}")
-end atom
+private tilde_step() -> FStep = FStep("~", "", TILDE)
+private star_step() -> FStep = FStep("*", "", STAR)
+private elem_step() -> FStep = FStep("[]", "", ELEM)
+
+// The step `s` landing on `n`, by its id in the step table.
+private step_in(fx: &Fpa, s: string, n: string) -> FStep
+    val k = s + "@" + n
+
+    fx.steps.get(k) match
+        Some(id) -> FStep(s, n, id)
+        None ->
+            val id = u32(fx.steps.len() + 1)
+
+            fx.steps.put(k, id)
+            FStep(s, n, id)
+end step_in
+
+private step(fb: &FBody, s: string, n: string) -> FStep = step_in(fb.fx, s, n)
+
+// The path one step below the path `parent`, by id.
+private path_child(fx: &Fpa, parent: u32, st: FStep) -> u32
+    val k = (u64(parent) << 32) | u64(st.id)
+
+    fx.paths.get(k) match
+        Some(id) -> id
+        None ->
+            val id = u32(fx.paths.len() + 1)
+
+            fx.paths.put(k, id)
+            id
+end path_child
+
+private path_id(fx: &Fpa, p: Buf[FStep]) -> u32
+    var id: u32 = 0
+
+    for st in p
+        id = path_child(fx, id, st)
+
+    id
+end path_id
+
+// One id for two.
+private pair_id(fx: &Fpa, a: u32, b: u32) -> u32
+    val k = (u64(a) << 32) | u64(b)
+
+    fx.pairs.get(k) match
+        Some(id) -> id
+        None ->
+            val id = u32(fx.pairs.len() + 1)
+
+            fx.pairs.put(k, id)
+            id
+end pair_id
+
+private root_id(fx: &Fpa, root: string) -> u32
+    fx.roots.get(root) match
+        Some(id) -> id
+        None ->
+            val id = u32(fx.roots.len() + 1)
+
+            fx.roots.put(root, id)
+            id
+end root_id
+
+private atom(fb: &FBody, off: Buf[FStep], root: string, path: Buf[FStep]) -> FAtom =
+    made_atom(fb.fx, off, root, root_id(fb.fx, root), path, path_id(fb.fx, path))
+
+// `a`'s root along `path`, sitting at `off`.
+private at_place(fb: &FBody, off: Buf[FStep], a: FAtom, path: Buf[FStep]) -> FAtom =
+    made_atom(fb.fx, off, a.root, a.rid, path, path_id(fb.fx, path))
+
+// `a` itself, sitting at `off`.
+private moved(fb: &FBody, off: Buf[FStep], a: FAtom) -> FAtom = made_atom(fb.fx, off, a.root, a.rid, a.path, a.pid)
+
+private made_atom(fx: &Fpa, off: Buf[FStep], root: string, rid: u32, path: Buf[FStep], pid: u32) -> FAtom
+    val o = if off.len() > 1 then cut_offset(off) else off
+    val oid = path_id(fx, o)
+
+    FAtom(o, root, path, rid, pid, oid, (u64(pair_id(fx, rid, pid)) << 32) | u64(oid))
+end made_atom
+
+// An atom as the trace prints it.
+private atom_text(a: FAtom) -> string = s"${a.root}|${fpa_path_text(a.path)}|${fpa_path_text(a.off)}"
 
 // **Where a part sits in a value is cut the way a path is** (M25): at the second step landing on a
 // type the offset already went through, it becomes "somewhere at or below the first" (`~`). A `~`
@@ -583,24 +698,13 @@ private cut_offset(off: Buf[FStep]) -> Buf[FStep]
                     for k in 0..<j + 1
                         cut.push(off[k])
 
-                    cut.push(FStep("~", ""))
+                    cut.push(tilde_step())
                     return cut
                 end if
         end if
 
     out
 end cut_offset
-
-private path_key(p: Buf[FStep]) -> string
-    var out = ""
-
-    for st in p
-        out = out + st.s
-
-        if st.n != "" then out = out + "@" + st.n
-
-    out
-end path_key
 
 // A path as a summary says it: the steps alone.
 fpa_path_text(p: Buf[FStep]) -> string
@@ -612,10 +716,10 @@ fpa_path_text(p: Buf[FStep]) -> string
     out
 end fpa_path_text
 
-private one_step(s: string, n: string) -> Buf[FStep]
+private one_step(st: FStep) -> Buf[FStep]
     var out: Buf[FStep] = buf()
 
-    out.push(FStep(s, n))
+    out.push(st)
     out
 end one_step
 
@@ -702,6 +806,8 @@ end param_of
 
 // The value one step into each atom: the field, element or pointee `st` names.
 private project(fb: &FBody, v: Buf[FAtom], st: FStep) -> Buf[FAtom]
+    if v.is_empty() then return v
+
     var out: Buf[FAtom] = buf()
 
     for a in v
@@ -715,8 +821,24 @@ end project
 private distinct(v: Buf[FAtom]) -> Buf[FAtom]
     if v.len() < 2 then return v
 
-    var seen: Map[string, bool] = map()
     var out: Buf[FAtom] = buf()
+
+    // A short value is checked atom against atom, which allocates nothing.
+    if v.len() <= 16
+        for a in v
+            var dup = false
+
+            for b in out
+                if b.key == a.key
+                    dup = true
+                    break
+
+            if !dup then out.push(a)
+
+        return out
+    end if
+
+    var seen: Map[u64, bool] = map()
 
     for a in v
         if !seen.has(a.key)
@@ -735,10 +857,10 @@ private project_one(fb: &FBody, a: FAtom, st: FStep, out: *Buf[FAtom])
             out.push(a)
 
             // A parameter's value is not followed into: what is there is anything at or below it.
-            if a.root.starts_with("p") then out.push(atom(buf(), a.root, extend(a.path, FStep("~", ""))))
-            else project_one(fb, atom(buf(), a.root, a.path), st, out)
+            if a.root.starts_with("p") then out.push(at_place(fb, buf(), a, extend(a.path, tilde_step())))
+            else project_one(fb, moved(fb, buf(), a), st, out)
         else if h.s == st.s
-            out.push(atom(tail(a.off), a.root, a.path))
+            out.push(moved(fb, tail(a.off), a))
         else if !is_field_step(h.s) || !is_field_step(st.s)
             out.push(a)
         end if
@@ -747,7 +869,7 @@ private project_one(fb: &FBody, a: FAtom, st: FStep, out: *Buf[FAtom])
     end if
 
     if a.root.starts_with("p")
-        out.push(atom(buf(), a.root, extend(a.path, st)))
+        out.push(at_place(fb, buf(), a, extend(a.path, st)))
     else if a.root == "g"
         out.push(a)
     else
@@ -774,42 +896,44 @@ private along(fb: &FBody, v: Buf[FAtom], p: Buf[FStep]) -> Buf[FAtom]
 end along
 
 // `along`, with the value at every beginning of the path kept for the next path to start from.
-private along_shared(fb: &FBody, v: Buf[FAtom], p: Buf[FStep], memo: *Map[string, Buf[FAtom]]) -> Buf[FAtom]
+private along_shared(fb: &FBody, v: Buf[FAtom], p: Buf[FStep], memo: *Map[u32, Buf[FAtom]]) -> Buf[FAtom]
     var cur = v
-    var key = ""
+    var at: u32 = 0
 
     for st in p
-        key = key + st.s + "@" + st.n
+        at = path_child(fb.fx, at, st)
 
-        memo.get(key) match
+        memo.get(at) match
             Some(got) -> cur = got
             None ->
                 cur = project(fb, cur, st)
-                memo.put(key, cur)
+                memo.put(at, cur)
 
     cur
 end along_shared
 
 // The same atoms, sitting further into a value.
-private placed(v: Buf[FAtom], at: Buf[FStep]) -> Buf[FAtom]
+private placed(fb: &FBody, v: Buf[FAtom], at: Buf[FStep]) -> Buf[FAtom]
     if at.is_empty() then return v
 
     var out: Buf[FAtom] = buf()
 
     for a in v
-        out.push(atom(concat(at, a.off), a.root, a.path))
+        out.push(moved(fb, concat(at, a.off), a))
 
     out
 end placed
 
-private placed_step(v: Buf[FAtom], s: string, n: string) -> Buf[FAtom] = placed(v, one_step(s, n))
+private placed_step(fb: &FBody, v: Buf[FAtom], s: string, n: string) -> Buf[FAtom] =
+    if v.is_empty() then v else placed(fb, v, one_step(step(fb, s, n)))
 
 // Somewhere inside a value: what a call no body answers for may hand back.
-private anywhere_in(v: Buf[FAtom]) -> Buf[FAtom]
+private anywhere_in(fb: &FBody, v: Buf[FAtom]) -> Buf[FAtom]
     var out: Buf[FAtom] = buf()
+    val here = one_step(tilde_step())
 
     for a in v
-        out.push(atom(one_step("~", ""), a.root, a.path))
+        out.push(moved(fb, here, a))
 
     out
 end anywhere_in
@@ -821,12 +945,12 @@ end join_into
 
 // An address one step further into the storage it points at. A parameter's value stands for every
 // address inside what it points at.
-private addr_step(v: Buf[FAtom], st: FStep) -> Buf[FAtom]
+private addr_step(fb: &FBody, v: Buf[FAtom], st: FStep) -> Buf[FAtom]
     var out: Buf[FAtom] = buf()
 
     for a in v
         if a.off.is_empty() && (a.root.starts_with("l:") || a.root.starts_with("h:"))
-            out.push(atom(buf(), a.root, extend(a.path, st)))
+            out.push(at_place(fb, buf(), a, extend(a.path, st)))
         else
             out.push(a)
 
@@ -880,12 +1004,12 @@ private is_array_t(t: Type) -> bool = t match
     Array(_, _) -> true
     _ -> false
 
-private deref_step(t: Type) -> FStep = t match
-    Ref(inner, _) -> FStep("*", "&" + nominal(*inner))
-    Weak(inner) -> FStep("*", "&" + nominal(*inner))
+private deref_step(fb: &FBody, t: Type) -> FStep = t match
+    Ref(inner, _) -> step(fb, "*", "&" + nominal(*inner))
+    Weak(inner) -> step(fb, "*", "&" + nominal(*inner))
     _ -> pointee_of(t) match
-        Some(inner) -> FStep("*", nominal(inner))
-        None -> FStep("*", "")
+        Some(inner) -> step(fb, "*", nominal(inner))
+        None -> step(fb, "*", "")
 
 // Whether a value of this type can hold an address: what a body passes around that is followed at all.
 // A string is not followed -- it outlives every frame -- nor is an integer, whatever it was made from.
@@ -994,41 +1118,41 @@ private eval_kind(fb: &FBody, e: TExpr) -> Buf[FAtom] = *e.kind match
     TLoad(name, _) -> fb.refs.get(name) match
         Some(place) -> eval(fb, place)
         None -> copy_of(cell(fb, s"l:$name"))
-    TGlobal(_, ty, _) -> if fpa_holds(fb.fx, ty) then single(atom(buf(), "g", buf())) else buf()
+    TGlobal(_, ty, _) -> if fpa_holds(fb.fx, ty) then single(atom(fb, buf(), "g", buf())) else buf()
     TAddrOf(place, _) -> addr(fb, place)
     TTempAddr(value, _) ->
         val name = s"l:$$t${node_id(e)}"
 
         add_to(fb, name, eval(fb, value))
-        single(atom(buf(), name, buf()))
-    TDeref(op, _) -> project(fb, eval(fb, op), deref_step(texpr_type(op)))
+        single(atom(fb, buf(), name, buf()))
+    TDeref(op, _) -> project(fb, eval(fb, op), deref_step(fb, texpr_type(op)))
     TField(recv, index, ty) ->
         val rt = texpr_type(recv)
         var v = eval(fb, recv)
 
-        if pointee_of(rt).is_some() && !is_slice_t(rt) then v = project(fb, v, deref_step(rt))
+        if pointee_of(rt).is_some() && !is_slice_t(rt) then v = project(fb, v, deref_step(fb, rt))
 
-        project(fb, v, FStep(s".$index", nominal(ty)))
+        project(fb, v, step(fb, s".$index", nominal(ty)))
     TIndex(recv, index, ty) ->
         eval(fb, index)
 
         val rt = texpr_type(recv)
         val v = eval(fb, recv)
 
-        if is_array_t(rt) then project(fb, v, FStep("[]", nominal(ty)))
-        else project(fb, v, FStep("*", nominal(ty)))
+        if is_array_t(rt) then project(fb, v, step(fb, "[]", nominal(ty)))
+        else project(fb, v, step(fb, "*", nominal(ty)))
     TSlice(base, lo, hi, _, _) ->
         if lo.is_some() then eval(fb, lo.unwrap())
         if hi.is_some() then eval(fb, hi.unwrap())
 
         val bt = texpr_type(base)
 
-        if is_array_t(bt) then addr_step(addr(fb, base), FStep("[]", "")) else eval(fb, base)
+        if is_array_t(bt) then addr_step(fb, addr(fb, base), elem_step()) else eval(fb, base)
     TBox(value, _) ->
         val name = heap_site(e)
 
         add_to(fb, name, eval(fb, value))
-        single(atom(buf(), name, buf()))
+        single(atom(fb, buf(), name, buf()))
     TBufLit(elems, _) -> fresh_of(fb, e, eval_all(fb, elems))
     TBufFill(value, count, _) ->
         eval(fb, count)
@@ -1037,18 +1161,18 @@ private eval_kind(fb: &FBody, e: TExpr) -> Buf[FAtom] = *e.kind match
         var out: Buf[FAtom] = buf()
 
         for k in 0..<args.len()
-            join_into(&out, placed_step(eval(fb, args[k]), s".$k", nominal(texpr_type(args[k]))))
+            join_into(&out, placed_step(fb, eval(fb, args[k]), s".$k", nominal(texpr_type(args[k]))))
 
         made(fb, e, out)
     TEnumNew(_, variant, args) ->
         var out: Buf[FAtom] = buf()
 
         for k in 0..<args.len()
-            join_into(&out, placed_step(eval(fb, args[k]), variant_step(variant, k), nominal(texpr_type(args[k]))))
+            join_into(&out, placed_step(fb, eval(fb, args[k]), variant_step(variant, k), nominal(texpr_type(args[k]))))
 
         made(fb, e, out)
-    TArrayLit(elems, _) -> placed_step(eval_all(fb, elems), "[]", "")
-    TArrayFill(value, _) -> placed_step(eval(fb, value), "[]", "")
+    TArrayLit(elems, _) -> placed_step(fb, eval_all(fb, elems), "[]", "")
+    TArrayFill(value, _) -> placed_step(fb, eval(fb, value), "[]", "")
     TStore(place, value, _, yields) ->
         val v = eval(fb, value)
 
@@ -1078,7 +1202,7 @@ private eval_kind(fb: &FBody, e: TExpr) -> Buf[FAtom] = *e.kind match
 
         store_at(fb, at, vals)
 
-        var out = project(fb, at, deref_step(texpr_type(address)))
+        var out = project(fb, at, deref_step(fb, texpr_type(address)))
 
         join_into(&out, vals)
         out
@@ -1086,7 +1210,7 @@ private eval_kind(fb: &FBody, e: TExpr) -> Buf[FAtom] = *e.kind match
     TVCall(recv, slot, args, ty, _) -> vcall(fb, recv, slot, eval_each(fb, args), ty)
     TCallPtr(callee, args, _, _) ->
         eval(fb, callee)
-        anywhere_in(eval_all(fb, args))
+        anywhere_in(fb, eval_all(fb, args))
     TStep(task, wake) ->
         eval(fb, task)
         keep(fb, eval(fb, wake))
@@ -1097,8 +1221,8 @@ private eval_kind(fb: &FBody, e: TExpr) -> Buf[FAtom] = *e.kind match
     TTry(operand, ok, _, _, _, ty, _) ->
         val v = eval(fb, operand)
 
-        add_to(fb, "$ret", anywhere_in(v))
-        project(fb, v, FStep(variant_step(ok, 0), nominal(ty)))
+        add_to(fb, "$ret", anywhere_in(fb, v))
+        project(fb, v, step(fb, variant_step(ok, 0), nominal(ty)))
     TSeq(exprs) ->
         var last: Buf[FAtom] = buf()
 
@@ -1155,8 +1279,8 @@ private eval_kind(fb: &FBody, e: TExpr) -> Buf[FAtom] = *e.kind match
         val v = eval(fb, seq)
 
         if fpa_holds(fb.fx, elem_ty)
-            val elems = if is_array_t(st) then project(fb, v, FStep("[]", nominal(elem_ty)))
-            else if pointee_of(st).is_some() then project(fb, v, FStep("*", nominal(elem_ty)))
+            val elems = if is_array_t(st) then project(fb, v, step(fb, "[]", nominal(elem_ty)))
+            else if pointee_of(st).is_some() then project(fb, v, step(fb, "*", nominal(elem_ty)))
             else reachable(fb, v)
 
             add_to(fb, s"l:$name", elems)
@@ -1237,7 +1361,7 @@ private fresh_of(fb: &FBody, e: TExpr, held: Buf[FAtom]) -> Buf[FAtom]
     val name = heap_site(e)
 
     add_to(fb, name, held)
-    single(atom(buf(), name, buf()))
+    single(atom(fb, buf(), name, buf()))
 end fresh_of
 
 // **A heap object is named by the node that makes it** (`node_id`), never by where it was written: a
@@ -1268,7 +1392,7 @@ end eval_conds
 // Everything a value may reach: itself anywhere inside, and what any address it holds points at.
 private reachable(fb: &FBody, v: Buf[FAtom]) -> Buf[FAtom]
     var out: Buf[FAtom] = buf()
-    var seen: Map[string, bool] = map()
+    var seen: Map[u64, bool] = map()
     var work = copy_of(v)
     var at: usize = 0
 
@@ -1282,9 +1406,9 @@ private reachable(fb: &FBody, v: Buf[FAtom]) -> Buf[FAtom]
         seen.put(a.key, true)
 
         if a.root.starts_with("p")
-            out.push(atom(buf(), a.root, extend(a.path, FStep("~", ""))))
+            out.push(at_place(fb, buf(), a, extend(a.path, tilde_step())))
         else if a.root.starts_with("l:") || a.root.starts_with("h:")
-            out.push(atom(buf(), a.root, a.path))
+            out.push(moved(fb, buf(), a))
 
             for b in cell(fb, a.root)
                 work.push(b)
@@ -1308,20 +1432,20 @@ private bind(fb: &FBody, p: TPattern, v: Buf[FAtom], vt: Type)
             for k in 0..<args.len()
                 val ft = field_type(variant.fields, k, tpattern_type(args[k]))
 
-                bind(fb, args[k], project(fb, sv, FStep(variant_step(variant, k), nominal(ft))), ft)
+                bind(fb, args[k], project(fb, sv, step(fb, variant_step(variant, k), nominal(ft))), ft)
         TStructPattern(decl, args) ->
             val sv = through_pointer(fb, v, vt)
 
             for k in 0..<args.len()
                 val ft = field_type(decl.fields, k, tpattern_type(args[k]))
 
-                bind(fb, args[k], project(fb, sv, FStep(s".$k", nominal(ft))), ft)
+                bind(fb, args[k], project(fb, sv, step(fb, s".$k", nominal(ft))), ft)
         _ -> ()
 end bind
 
 // A value matched by a destructuring pattern: what it points at, where it is a pointer.
 private through_pointer(fb: &FBody, v: Buf[FAtom], vt: Type) -> Buf[FAtom] =
-    if pointee_of(vt).is_some() && !is_slice_t(vt) then project(fb, v, deref_step(vt)) else v
+    if pointee_of(vt).is_some() && !is_slice_t(vt) then project(fb, v, deref_step(fb, vt)) else v
 
 private field_type(fields: Buf[(string, Type)], k: usize, otherwise: Type) -> Type =
     if k < fields.len() then fields[k].1 else otherwise
@@ -1332,18 +1456,18 @@ private field_type(fields: Buf[(string, Type)], k: usize, otherwise: Type) -> Ty
 private addr(fb: &FBody, place: TExpr) -> Buf[FAtom] = *place.kind match
     TLoad(name, _) -> fb.refs.get(name) match
         Some(p) -> addr(fb, p)
-        None -> single(atom(buf(), s"l:$name", buf()))
-    TGlobal(_, _, _) -> single(atom(buf(), "g", buf()))
+        None -> single(atom(fb, buf(), s"l:$name", buf()))
+    TGlobal(_, _, _) -> single(atom(fb, buf(), "g", buf()))
     TField(recv, index, ty) ->
         val rt = texpr_type(recv)
-        val st = FStep(s".$index", nominal(ty))
+        val st = step(fb, s".$index", nominal(ty))
 
-        if pointee_of(rt).is_some() && !is_slice_t(rt) then addr_step(eval(fb, recv), st)
-        else addr_step(addr(fb, recv), st)
+        if pointee_of(rt).is_some() && !is_slice_t(rt) then addr_step(fb, eval(fb, recv), st)
+        else addr_step(fb, addr(fb, recv), st)
     TIndex(recv, index, ty) ->
         eval(fb, index)
 
-        if is_array_t(texpr_type(recv)) then addr_step(addr(fb, recv), FStep("[]", nominal(ty)))
+        if is_array_t(texpr_type(recv)) then addr_step(fb, addr(fb, recv), step(fb, "[]", nominal(ty)))
         else eval(fb, recv)
     TDeref(op, _) -> eval(fb, op)
     _ -> eval(fb, place)
@@ -1369,16 +1493,16 @@ private store_at(fb: &FBody, at: Buf[FAtom], v: Buf[FAtom])
         if !a.off.is_empty() && !inside
             keep(fb, v)
         else if a.root.starts_with("l:") || a.root.starts_with("h:")
-            add_to(fb, a.root, if inside then anywhere_in(v) else placed(v, a.path))
+            add_to(fb, a.root, if inside then anywhere_in(fb, v) else placed(fb, v, a.path))
         else if a.root.starts_with("p")
             // Stored through a parameter, which is the caller's to place; a value of the parameter
             // stored back into what it points at is not kept by that.
             var out: Buf[FAtom] = buf()
 
             for b in v
-                if b.root != a.root
-                    if !b.root.starts_with("p") || !covered(&fb.members, s"T${a.root}|${b.root}|", without_tilde(b.path))
-                        out.push(atom(buf(), b.root, b.path))
+                if b.rid != a.rid
+                    if !b.root.starts_with("p") || !covered(fb.fx, &fb.thru, u64(pair_id(fb.fx, a.rid, b.rid)) << 32, without_tilde(b.path))
+                        out.push(moved(fb, buf(), b))
 
             add_to(fb, s"$$thr${param_of(a.root)}", out)
         else
@@ -1399,7 +1523,7 @@ private call(fb: &FBody, e: TExpr, name: string, argv: Buf[Buf[FAtom]]) -> Buf[F
 
             for k in 0..<argv.len()
                 if k < d.params.len() && holds_string(d.keeps, d.params[k].name) then keep(fb, argv[k])
-                if k < d.params.len() && holds_string(d.answers, d.params[k].name) then join_into(&out, anywhere_in(argv[k]))
+                if k < d.params.len() && holds_string(d.answers, d.params[k].name) then join_into(&out, anywhere_in(fb, argv[k]))
 
             return out
         None -> ()
@@ -1407,7 +1531,7 @@ private call(fb: &FBody, e: TExpr, name: string, argv: Buf[Buf[FAtom]]) -> Buf[F
     var out: Buf[FAtom] = buf()
 
     for v in argv
-        join_into(&out, anywhere_in(v))
+        join_into(&out, anywhere_in(fb, v))
 
     out
 end call
@@ -1442,7 +1566,7 @@ private apply_inner(fb: &FBody, e: TExpr, sum: &FpaSum, argv: Buf[Buf[FAtom]]) -
 
     for k in 0..<n
         // The paths of one parameter share their beginnings, so each is followed once.
-        var memo: Map[string, Buf[FAtom]] = map()
+        var memo: Map[u32, Buf[FAtom]] = map()
 
         for p in sum.kept[k]
             keep(fb, summary_along(fb, argv[k], p, &memo))
@@ -1450,19 +1574,19 @@ private apply_inner(fb: &FBody, e: TExpr, sum: &FpaSum, argv: Buf[Buf[FAtom]]) -
         for item in sum.answers[k]
             val got = summary_along(fb, argv[k], item.0, &memo)
 
-            if has_deref(item.1) then add_to(fb, blob, anywhere_in(got)) else join_into(&out, placed(got, item.1))
+            if has_deref(item.1) then add_to(fb, blob, anywhere_in(fb, got)) else join_into(&out, placed(fb, got, item.1))
 
     for w in sum.writes
         if w.0 < argv.len() && w.1 < argv.len()
-            var memo: Map[string, Buf[FAtom]] = map()
+            var memo: Map[u32, Buf[FAtom]] = map()
 
-            store_at(fb, argv[w.0], anywhere_in(summary_along(fb, argv[w.1], w.2, &memo)))
+            store_at(fb, argv[w.0], anywhere_in(fb, summary_along(fb, argv[w.1], w.2, &memo)))
 
     for o in sum.fresh
         if has_deref(o)
-            add_to(fb, blob, single(atom(one_step("~", ""), blob, buf())))
+            add_to(fb, blob, single(atom(fb, one_step(tilde_step()), blob, buf())))
         else
-            out.push(atom(o, blob, buf()))
+            out.push(atom(fb, o, blob, buf()))
 
     out
 end apply_inner
@@ -1471,10 +1595,10 @@ end apply_inner
 // whole interior at every depth, so in the caller it is what the interior holds, each part sitting
 // anywhere -- never at its own place, which the callee did not tell apart. What those parts reach
 // further in is followed from them where it is read (`project_one`), and kept with them where kept.
-private summary_along(fb: &FBody, v: Buf[FAtom], p: Buf[FStep], memo: *Map[string, Buf[FAtom]]) -> Buf[FAtom]
+private summary_along(fb: &FBody, v: Buf[FAtom], p: Buf[FStep], memo: *Map[u32, Buf[FAtom]]) -> Buf[FAtom]
     val got = along_shared(fb, v, p, memo)
 
-    if ends_whole(p) then anywhere_in(got) else got
+    if ends_whole(p) then anywhere_in(fb, got) else got
 end summary_along
 
 private has_deref(p: Buf[FStep]) -> bool
@@ -1500,14 +1624,14 @@ private vcall(fb: &FBody, recv: TExpr, slot: int, argv: Buf[Buf[FAtom]], ty: Typ
         _ -> ()
 
     val task = task_result(ty).is_some()
-    var out = anywhere_in(reachable(fb, rv))
+    var out = anywhere_in(fb, reachable(fb, rv))
 
     for k in 0..<argv.len()
         val kept = if callable then marks_kept(assocs, k) else task || object_declares_kept(fb.fx.an, rt, slot, k + 1)
 
         if kept then keep(fb, argv[k])
 
-        join_into(&out, anywhere_in(argv[k]))
+        join_into(&out, anywhere_in(fb, argv[k]))
 
     out
 end vcall
@@ -1719,7 +1843,8 @@ fpa_compare(cx: &KeepsCx, fx: &Fpa) -> Buf[string]
             if !may_hold_pointer(cx, f.params[i].1) then continue
 
             val at = s"${f.name}|$i"
-            val ok = keeps_of(cx, f.name, i).kept
+            val old = keeps_of(cx, f.name, i)
+            val ok = old.kept
             val nk = fpa_keeps(fx, f.name, i)
 
             if ok && !nk
@@ -1727,13 +1852,13 @@ fpa_compare(cx: &KeepsCx, fx: &Fpa) -> Buf[string]
                 else if is_closure_body(f) then "closure"
                 else "other"
 
-                out.push(s"keeps-old-only:$why $at")
+                out.push(s"keeps-old-only:$why $at -- old: ${old.how}")
             else if nk && !ok
                 val why = if fpa_writes(fx, f.name, i) then "through-param"
                 else if is_closure_body(f) then "closure"
                 else "other"
 
-                out.push(s"keeps-new-only:$why $at")
+                out.push(s"keeps-new-only:$why $at -- new keeps ${fpa_kept_text(fx, f.name, i)}")
             else if ok && field_narrowed(fx, f.name, i)
                 out.push(s"agree:field-narrowed $at")
             end if
