@@ -260,6 +260,14 @@ struct MemberTables
     // under: what the instantiation limit counts along a chain of `asked_from`
     // (`instantiation_limit.sysl`).
     inst_origin: &Table[string]
+    // Where each member of `lowered` stands in it, by its name -- the first of that name, as a walk
+    // from the front finds it. **The evaluator asks it of every call it runs** (`const_eval.sysl`'s
+    // `ev_operator`), so a scan of `lowered` there made a constant cost in proportion to how many
+    // members the whole program has (`lowered_member`).
+    lowered_at: &Table[usize]
+    // How many entries of `lowered` the lookups by name have examined -- one a lookup, however many
+    // members the program has. What a test holds the evaluator's cost per call to.
+    lowered_examined: usize
 end MemberTables
 
 // What a member written from a `derive` body needs beyond an inherited default: the name its body
@@ -339,9 +347,27 @@ member_tables() -> &MemberTables =
     MemberTables(table(), table(), table(), table(), table(), table(), table(), table(), table(),
                  table(), table(), table(), table(), table(), table(), table(), table(), buf(),
                  buf(), table(), false, buf(), buf(), table(), table(), table(), buf(), table(), buf(),
-                 table(), table(), table(), table(), table(), table(), table(), table(), table())
+                 table(), table(), table(), table(), table(), table(), table(), table(), table(), table(), 0)
 
 // -- reading the tables --------------------------------------------------------------------------
+
+// Files a member lowered eagerly, at the end of `lowered`, where `lowered_member` finds it by name.
+file_lowered(a: &Analysis, fd: FuncDecl)
+    if !a.tables.members.lowered_at.has(fd.name) then
+        a.tables.members.lowered_at.put(fd.name, a.tables.members.lowered.len())
+
+    a.tables.members.lowered.push(fd)
+end file_lowered
+
+// The member lowered eagerly under `name`, the first of that name, or `None` where none was. Looked up
+// rather than scanned, since the evaluator asks it of every call it runs. `file_lowered` is the one
+// writer of `lowered` and its index, and nothing takes a member back out, so the two cannot disagree.
+lowered_member(a: &Analysis, name: string) -> Option[FuncDecl]
+    val m = a.tables.members
+
+    m.lowered_examined += 1
+    m.lowered_at.get(name).map(i -> m.lowered[i])
+end lowered_member
 
 // Whether a member of that name is filed for an owner.
 has_member_at(a: &Analysis, owner: string, mname: string) -> bool =

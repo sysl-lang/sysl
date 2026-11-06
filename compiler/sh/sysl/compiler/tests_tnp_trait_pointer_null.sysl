@@ -1,0 +1,243 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// A raw pointer to a trait compares like every other raw pointer: with `null` and with another
+// pointer of its own type, by the address it holds (`reference/memory.md § A pointer compares by
+// address`). The method table beside the address is not part of the answer. A reference to a trait
+// still has no `==`, and an ordering is still refused.
+
+private tnp_ready() -> bool
+    std_root() match
+        Err(_) ->
+            print("skipped: the standard module's source is not on this machine")
+            return false
+        Ok(_) -> ()
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+
+    true
+end tnp_ready
+
+private tnp_shapes() -> string = raw"""
+    trait Shape
+        area(self) -> int
+    struct Rect
+        w: int
+        h: int
+    struct Sq
+        s: int
+    impl Shape for Rect
+        area(self) -> int = self.w * self.h
+    impl Shape for Sq
+        area(self) -> int = self.s * self.s
+    """
+
+private tnp_prints(text: string, expected: string)
+    if !tnp_ready() then return
+
+    val root = make_temp_dir("sysl-trait-pointer-null").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", tnp_shapes() + text).unwrap()
+
+    val exe = s"$root/built"
+    val built = build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe))
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    built match
+        Err(why) -> assert(false, failure_text(why))
+        Ok(_) -> ()
+
+    said match
+        Err(_) -> assert(false, "the program that was built could not be run")
+        Ok(out) ->
+            assert_eq(out.text, expected)
+            out.status match
+                Exited(code) -> assert_eq(code, 0)
+                _ -> assert(false, "the program did not exit normally")
+end tnp_prints
+
+private tnp_refused(text: string, message: string)
+    if !tnp_ready() then return
+
+    val root = make_temp_dir("sysl-trait-pointer-null").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, tnp_shapes() + text).unwrap()
+
+    val said = emit_llvm_text(src, None) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+
+    assert(said.contains(message), said)
+end tnp_refused
+
+@test("a trait pointer compares equal to null only when it is null")
+tnp_null_and_non_null()
+    tnp_prints(raw"""
+        var r = Rect(3, 4)
+        var p: *Shape = &r
+        var n: *Shape = null
+        print(p == null, p != null, n == null, n != null)
+        """, "false true true false\n")
+
+@test("null on the left of a trait pointer comparison")
+tnp_null_on_the_left()
+    tnp_prints(raw"""
+        var r = Rect(3, 4)
+        var p: *Shape = &r
+        var n: *Shape = null
+        print(null == p, null != p, null == n, null != n)
+        """, "false true true false\n")
+
+@test("two trait pointers to one object are equal, to two objects are not")
+tnp_same_object_and_different_objects()
+    tnp_prints(raw"""
+        var r = Rect(3, 4)
+        var s = Rect(3, 4)
+        var p: *Shape = &r
+        var q: *Shape = &r
+        var t: *Shape = &s
+        print(p == q, p != q, p == t, p != t)
+        """, "true false false true\n")
+
+@test("trait pointers to objects of two types are unequal")
+tnp_objects_of_two_types()
+    tnp_prints(raw"""
+        var r = Rect(3, 4)
+        var q = Sq(5)
+        var p: *Shape = &r
+        var o: *Shape = &q
+        print(p == o, p != o)
+        """, "false true\n")
+
+@test("a null trait pointer equals another null one")
+tnp_two_nulls()
+    tnp_prints(raw"""
+        var a: *Shape = null
+        var b: *Shape = null
+        print(a == b, a != b)
+        """, "true false\n")
+
+@test("a comparison is a condition")
+tnp_in_a_condition()
+    tnp_prints(raw"""
+        var r = Rect(3, 4)
+        var p: *Shape = &r
+        var n: *Shape = null
+        if p != null then print(p.area())
+        if n == null then print("none")
+        """, "12\nnone\n")
+
+@test("a trait pointer array walks until null")
+tnp_array_until_null()
+    tnp_prints(raw"""
+        var r = Rect(3, 4)
+        var q = Sq(5)
+        var all: [3]*Shape = [&r, &q, null]
+        var total = 0
+        for i in 0..<3
+            if all[i] != null then total += all[i].area()
+        print(total)
+        """, "37\n")
+
+@test("a trait pointer compares with a pointer to a type that implements the trait")
+tnp_against_a_concrete_pointer()
+    tnp_prints(raw"""
+        var r = Rect(3, 4)
+        var s = Rect(3, 4)
+        var p: *Shape = &r
+        var c: *Rect = &r
+        var d: *Rect = &s
+        print(p == c, p != c, p == d, p != d)
+        """, "true false false true\n")
+
+// The pair meets at the trait pointer whichever side the concrete pointer is on.
+@test("a concrete pointer on the left of a trait pointer compares by address")
+tnp_concrete_pointer_on_the_left()
+    tnp_prints(raw"""
+        var r = Rect(3, 4)
+        var s = Rect(3, 4)
+        var p: *Shape = &r
+        var c: *Rect = &r
+        var d: *Rect = &s
+        print(c == p, c != p, d == p, d != p)
+        """, "true false false true\n")
+
+@test("a concrete pointer compares with null on either side")
+tnp_concrete_pointer_and_null()
+    tnp_prints(raw"""
+        var r = Rect(3, 4)
+        var c: *Rect = &r
+        var n: *Rect = null
+        var p: *Shape = null
+        print(c == p, p == c, n == p, p == n, null == p)
+        """, "false false true true true\n")
+
+@test("a chain of comparisons meets at the trait pointer")
+tnp_concrete_pointer_in_a_chain()
+    tnp_prints(raw"""
+        var r = Rect(3, 4)
+        var c: *Rect = &r
+        var p: *Shape = &r
+        print(c == p && p == c)
+        """, "true\n")
+
+// Two concrete types meet at neither pointer, as Rust refuses `*const A == *const B`: the trait
+// pointer is a type to convert to, not a common supertype the pair is lifted into.
+@test("pointers to two different implementing types are refused")
+tnp_two_concrete_types_refused()
+    tnp_refused(raw"""
+        var r = Rect(3, 4)
+        var q = Sq(5)
+        var a: *Rect = &r
+        var b: *Sq = &q
+        print(a == b)
+        """, "cannot compare *Rect with *Sq")
+
+@test("a pointer to a type that does not implement the trait is refused on either side")
+tnp_non_implementing_pointer_refused()
+    tnp_refused(raw"""
+        struct Point
+            x: int
+        var pt = Point(1)
+        var r = Rect(3, 4)
+        var a: *Point = &pt
+        var p: *Shape = &r
+        print(a == p)
+        """, "cannot compare *Point with *Shape")
+    tnp_refused(raw"""
+        struct Point
+            x: int
+        var pt = Point(1)
+        var r = Rect(3, 4)
+        var a: *Point = &pt
+        var p: *Shape = &r
+        print(p != a)
+        """, "cannot compare *Shape with *Point")
+
+@test("a trait pointer has no ordering")
+tnp_no_ordering()
+    tnp_refused(raw"""
+        var r = Rect(3, 4)
+        var p: *Shape = &r
+        var q: *Shape = &r
+        print(p < q)
+        """, "'<' is not defined for *Shape")
+
+@test("a reference to a trait still has no equality")
+tnp_reference_has_no_equality()
+    tnp_refused(raw"""
+        f(a: &Shape, b: &Shape) -> bool = a == b
+        """, "'==' is not defined for &Shape")

@@ -1,0 +1,214 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.source_of
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+
+// **A constant costs what its calls cost, whatever else the program holds.** A table built by calling
+// a predicate on every byte -- `parsing`'s `byte_set_where` -- runs a few hundred calls while compiling,
+// and the evaluator asks of each call whether it names an arithmetic operator's method. That question
+// is a lookup by name (`members.sysl`'s `lowered_member`), not a walk of every member the program
+// lowered, so a large program pays for the table what a small one does. The tables come out as the
+// program would compute them, through a method, a generic helper, a closure, a recursive helper and an
+// operator method, and a predicate that cannot run still leaves its table to the program's start.
+
+private val ces_set: string = raw"""
+    struct Set
+        w: [4]u64
+
+    impl Set
+        with(self, b: u8) -> Set
+            var w = self.w
+            val i = usize(b) / 64
+
+            w[i] = w[i] | (u64(1) << u64(b % 64))
+            Set(w)
+
+    empty() -> Set = Set([0; 4])
+
+    set_where(p: u8 -> bool) -> Set
+        var s = empty()
+
+        for i in 0..<256
+            if p(u8(i)) then s = s.with(u8(i))
+
+        s
+
+    is_ident_start(c: u8) -> bool = c.is_alpha() || c == u8('_')
+
+    """
+
+private val ces_main: string = "\n\n@export(\"main\")\nmain_entry() -> int = "
+
+// A program holding the set and `extra` unrelated types, each with a member of its own -- every one a
+// function the program lowers -- built for a bare machine. The analysis, for its tables.
+private ces_analysis(extra: int, text: string) -> &Analysis
+    val t = target_named("thumbv7em-freestanding").unwrap()
+    var units = ces_library(t)
+    var filler = ""
+
+    for i in 0..<extra
+        filler = filler + s"struct Unrelated$i\n    a: int\n\nimpl Unrelated$i\n    get(self) -> int = self.a + $i\n\n"
+
+    val parsed = parse(source_of("main.sysl", ces_set + filler + text), t)
+
+    units.push(parsed.program)
+    analyze_produced(units, t, buf(), false).an
+end ces_analysis
+
+private ces_library(t: Target) -> Buf[Program]
+    var out: Buf[Program] = buf()
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, t) match
+            Err(_) -> ()
+            Ok(units) -> out = units
+
+    out
+end ces_library
+
+@test("a byte table built by a predicate is laid down as the words the program would compute")
+ces_a_predicate_table_is_constant_data()
+    if cfv_skip() then return
+
+    val out = cfv_built(ces_set + "val IDENT: Set = set_where(is_ident_start)\n\nvar words: [4]u64 = IDENT.w" +
+                        ces_main + "int(words[1] & 1)\n")
+
+    cfv_laid_down(out, "[4 x i64] [i64 0, i64 576460745995190270, i64 0, i64 0]")
+end ces_a_predicate_table_is_constant_data
+
+@test("a table built through a generic helper, a closure and a recursive helper is each one's value")
+ces_generic_closure_and_recursive_helpers()
+    if cfv_skip() then return
+
+    val out = cfv_built(ces_set + raw"""
+        pick[T](a: T, b: T, first: bool) -> T = if first then a else b
+
+        set_where_picked(p: u8 -> bool) -> Set
+            var s = empty()
+
+            for i in 0..<256
+                s = pick(s.with(u8(i)), s, p(u8(i)))
+
+            s
+
+        ones(n: int) -> u64 = if n == 0 then 0 else (ones(n - 1) << 1) | 1
+
+        is_digit(c: u8) -> bool = c >= u8('0') && c <= u8('9')
+
+        val DIGITS: Set = set_where_picked(is_digit)
+        val LOWER: Set = set_where(c -> c >= u8('a') && c <= u8('z'))
+        val LOW: Set = Set([ones(10), 0, 0, 0])
+
+        var d: [4]u64 = DIGITS.w
+        var l: [4]u64 = LOWER.w
+        var o: [4]u64 = LOW.w
+        """ + ces_main + "int(d[0] & l[1] & o[0] & 1)\n")
+
+    cfv_laid_down(out, "@d = private global [4 x i64] [i64 287948901175001088, i64 0, i64 0, i64 0]")
+    cfv_laid_down(out, "@l = private global [4 x i64] [i64 0, i64 576460743713488896, i64 0, i64 0]")
+    cfv_laid_down(out, "@o = private global [4 x i64] [i64 1023, i64 0, i64 0, i64 0]")
+end ces_generic_closure_and_recursive_helpers
+
+@test("a constant built through a type's arithmetic operators is the value the operators give")
+ces_an_operator_method_runs()
+    if cfv_skip() then return
+
+    val out = cfv_built(raw"""
+        struct V
+            x: real
+
+        impl Add for V
+            add(self, rhs: V) -> V = V(self.x + rhs.x)
+
+        impl Mul[real] for V
+            mul(self, k: real) -> V = V(self.x * k)
+
+        val VS: V = V(1.5) * 2.0 + V(0.25)
+
+        var xs: [2]real = [VS.x, 0.0]
+        """ + ces_main + "int(xs[0])\n")
+
+    // 3.25 is 0x400A000000000000 as an IEEE double.
+    cfv_laid_down(out, "@xs = private global [2 x double] [double 0x400A000000000000, double 0x0000000000000000]")
+end ces_an_operator_method_runs
+
+@test("a table whose predicate prints is left to the program's start, and storage reading it is refused")
+ces_a_predicate_that_cannot_run()
+    if cfv_skip() then return
+
+    cfv_refused(cfv_built(ces_set + raw"""
+        noisy(c: u8) -> bool
+            print(c)
+            c == 0
+
+        val N: Set = set_where(noisy)
+
+        var t: [4]u64 = N.w
+        """ + ces_main + "int(t[0] & 1)\n"),
+                "t")
+end ces_a_predicate_that_cannot_run
+
+@test("the tables agree with the same calls made where the program runs")
+ces_the_tables_agree_with_the_program()
+    if !enm_ready() then return
+
+    assert_eq(enm_ran(ces_set + raw"""
+        val IDENT: Set = set_where(is_ident_start)
+        val LOWER: Set = set_where(c -> c >= u8('a') && c <= u8('z'))
+
+        at_run_time(k: int) -> Set = if k > 0 then set_where(is_ident_start) else empty()
+
+        var k = 1
+        val run = at_run_time(k)
+
+        print(IDENT.w[1], IDENT.w == run.w, LOWER.w[1])
+        """), "576460745995190270 true 576460743713488896\n")
+end ces_the_tables_agree_with_the_program
+
+// **The scaling guard.** The same constant in a program with no other members and in one with three
+// hundred: the evaluator looks members up the same number of times and keeps the same bodies, so its
+// cost per call does not grow with the program. Before the lookup was by name, each of those looks
+// walked every member the program lowered.
+@test("evaluating a constant looks members up as often whatever else the program declares")
+ces_the_cost_per_call_does_not_grow_with_the_program()
+    if cfv_skip() then return
+
+    val text = "val IDENT: Set = set_where(is_ident_start)\n\nvar words: [4]u64 = IDENT.w\n"
+    val small = ces_analysis(0, text)
+    val large = ces_analysis(300, text)
+
+    assert(small.diagnostics().is_empty(), "the small program compiles")
+    assert(large.diagnostics().is_empty(), "the large program compiles")
+    assert(small.tables.members.lowered.len() + 300 <= large.tables.members.lowered.len(),
+           s"${small.tables.members.lowered.len()} and ${large.tables.members.lowered.len()}")
+
+    // Every call the run made asked, so the count is the calls' and not nothing.
+    assert(small.tables.members.lowered_examined >= 256, s"${small.tables.members.lowered_examined}")
+    assert_eq(large.tables.members.lowered_examined, small.tables.members.lowered_examined)
+    assert_eq(large.evaluation.bodies.len(), small.evaluation.bodies.len())
+end ces_the_cost_per_call_does_not_grow_with_the_program
+
+@test("every member lowered is found by its name, at the first place it was filed")
+ces_every_lowered_member_is_found()
+    if cfv_skip() then return
+
+    val a = ces_analysis(20, "val IDENT: Set = set_where(is_ident_start)\n")
+    val lowered = a.tables.members.lowered
+
+    assert(lowered.len() >= 21, s"${lowered.len()}")
+
+    for i in 0..<lowered.len()
+        val name = lowered[i].name
+        var first = i
+
+        for j in 0..<i
+            if first == i && lowered[j].name == name then first = j
+
+        assert(lowered_member(a, name).is_some(), name)
+        assert_eq(a.tables.members.lowered_at.get(name).unwrap(), first)
+
+    assert(lowered_member(a, "no.such.member").is_none(), "a name nothing lowered")
+end ces_every_lowered_member_is_found
