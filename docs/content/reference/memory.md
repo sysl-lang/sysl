@@ -4756,12 +4756,10 @@ each pointer it is handed, so it works that out, and nothing is written for it.
   ends ([a task holds its arguments](/reference/async/#a-task-holds-its-arguments-until-it-ends)) —
   the rule a [thread's handle](#a-thread-holds-what-it-is-handed-until-it-is-joined) is held to.
 
-**The address as an integer is the address**: `usize(p)` handed back directly, and a call's answer
-that is one, is followed as `p` would be. `usize(p)` stored somewhere the call does not own, or
-handed to an integer parameter that may store it so, is a number **until a `ptr_cast` may turn it
-back into a pointer** — the rule a frame's own address as an integer is held to (below), and the
-refusal names the function holding that `ptr_cast`. An integer anything more is done with — put in a
-local, converted again, `usize(p) + 8` — is a number, and keeps nothing.
+**An address as an integer is a number**: `usize(p)` stored, handed on or handed back keeps nothing,
+and the compiler follows no address through an integer. A pointer `ptr_cast` makes of one again is
+unchecked — [the program's responsibility](#an-address-as-an-integer-leaves-the-analysis), as an
+`as usize` round trip is in Rust.
 
 The answer is read out of the body, followed into every callee, and settled over recursion: a
 recursive function keeps a parameter when one of its paths does. Then **one rule, at the call**:
@@ -4841,8 +4839,7 @@ run()
 
 **Where it is stored decides, not only that it is.** A pointer stored into what it points at — a node
 linked to itself, a struct whose field points into its own buffer — ends exactly when that storage
-does, so it is not kept — and so is the address stored as an integer, `m.src = usize(&m.buf[0])`,
-which is held exactly where the pointer would be. One stored into what *another* parameter points at is the caller's to judge:
+does, so it is not kept. One stored into what *another* parameter points at is the caller's to judge:
 if that argument points into the caller's own frame, the pointer stays in the frame too. That is what
 makes an out-parameter, a pair of linked nodes or a list built in a local array work as written:
 
@@ -5393,14 +5390,13 @@ C function filled `&n` is an ordinary value. A C function's pointer answer is ta
 pointer arguments that could hold what it points at — one to the same type or to a struct holding
 it, and bytes from bytes, as `strchr`'s is — and not of an out-parameter of another type, so a handle
 a C library allocated is not made of the `*i32` it reported an error code through, nor of a context
-it was handed as bytes. **An integer that is the address is made of it**: `address(p: *int) -> usize
-= usize(p)` answers its argument as an integer, and `ptr_cast(usize(p))` is still `p`. An integer
-computed from one (`ptr_cast(usize(p) + 8)`) is not followed: that is the raw tier, and writing it
-takes a `ptr_cast`.
+it was handed as bytes. **An integer is made of no address**: `address(p: *int) -> usize = usize(p)`
+answers a number, and a pointer `ptr_cast` makes of a number is made of nothing the compiler follows.
 
-**A frame's own address as an integer is a number until it is turned back into a pointer.**
-`usize(&marker)` remembered in module storage, or handed back, is how a program measures its stack,
-and as a number it outlives nothing:
+### An address as an integer leaves the analysis
+
+**A frame's own address as an integer is a number.** `usize(&marker)` remembered in module storage,
+or handed back, is how a program measures its stack, and as a number it outlives nothing:
 
 ```sysl
 var top: usize = 0
@@ -5424,81 +5420,56 @@ main()
 true
 ```
 
-What would reach a frame that has ended is that number made a pointer again. So every integer the
-program moves is followed through the places it is stored — a module variable, a field of a struct of
-its type, what a pointer to its type points at, a local, a parameter, an answer — to every `ptr_cast`
-of an integer, and the frame's address leaving it is refused where a `ptr_cast` may turn it back.
-The refusal names that `ptr_cast`'s function; a store taken back on every way out is not kept, as
-for a pointer:
+**Turning that number back into a pointer is the program's responsibility.** `ptr_cast` of an
+integer is unchecked, the way an `as usize` round trip is in Rust: the compiler tracks no address
+through the integer — not through module storage, a field, a parameter, an answer or arithmetic —
+and refuses nothing. Here `peek` reads `marker` while `mark` is still running, which is sound; the
+same `peek` called after `mark` has returned compiles just the same, and reads whatever that stack
+slot holds by then:
 
 ```sysl
 import sysl.raw.ptr_cast
 
 var top: usize = 0
 
-mark()
+peek() -> int
+    val p: *int = ptr_cast(top)
+
+    *p
+
+mark() -> int
     var marker = 7
 
     top = usize(&marker)
-
-peek() -> int
-    val p: *int = ptr_cast(top)
-
-    *p
+    peek()
 
 main()
-    mark()
-    print(peek())
-```
-
-```error
-'usize(&marker)' holds the address of a local of 'mark', and it is stored in 'top', which outlives 'mark' and 'peek' turns back into a pointer with 'ptr_cast' — store the value itself, or storage that lasts
-```
-
-**What a call answers is made of the integers its body answers, and of nothing else it was handed.**
-`pass(n: usize) -> usize = n` answers its argument, so the caller's address comes back out of the
-call and is followed on from there — to that caller, not to every caller of `pass`. A parameter the
-body never answers stays inside the call, and arithmetic makes a number: `n + 8` is not the address,
-as `usize(&marker) + 8` is not. Recursion is followed to where it settles. An `extern`'s answer is
-made of only what its `@answers` names, and an inline-assembly output of
-[nothing it was handed](/reference/inline-assembly/#what-the-compiler-owns) — so a system call's
-answer is the kernel's number, even where another call to the same wrapper was handed a local's
-address:
-
-```sysl
-import sysl.raw.ptr_cast
-
-var store = 41
-var top: usize = 0
-
-pass(n: usize) -> usize = n
-
-mark()
-    var marker = 7
-    val here = pass(usize(&marker))
-
-    print(here > 0)
-
-peek() -> int
-    val p: *int = ptr_cast(top)
-
-    *p
-
-main()
-    mark()
-    top = pass(usize(&store))
-    print(peek())
+    print(mark())
 ```
 
 ```output
-true
-41
+7
 ```
 
-Followed this far and no further: a field, a pointee or an element is one place for every value of
-its type, which says more than most programs do, and the refusal names the `ptr_cast` it found. An
-integer handed through a function pointer, a call through an object, or an enum's payload is not
-followed.
+No `unsafe` block is asked for, and `@unchecked` (which skips a subscript's bounds test) has nothing to
+do with it: the cast is the raw tier's, and the `import sysl.raw.ptr_cast` a file must write is where
+a reader finds every such round trip. The address kept **as a pointer** is still the analysis's, and
+still refused:
+
+```sysl
+var top: *int = null
+
+mark()
+    var marker = 7
+
+    top = &marker
+
+mark()
+```
+
+```error
+'&marker' is the address of a local of 'mark', and it is stored in 'top', which outlives 'mark'
+```
 
 A pointer the callee **read out of** what it was handed is somebody else's address, and is the
 caller's to keep:

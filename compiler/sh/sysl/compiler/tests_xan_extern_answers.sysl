@@ -12,14 +12,15 @@ import sysl.text.Search
 // Where no body is in sight, the call borrows` are the specification.
 //
 // Cells: the reduction that found it (an `opendir` handle carried as an integer) accepted, and the
-// same shape through an `@answers` extern refused; a fresh answer stored where it outlives the frame;
+// same shape through an `@answers` extern refused as a pointer -- as an integer it is a number, and
+// its `ptr_cast` unchecked; a fresh answer stored where it outlives the frame;
 // `@answers` on two parameters, each of them reached; an unnamed parameter of an `@answers` extern;
 // a generic wrapper, a method wrapper and a wrapper in another module, each carrying the summary
 // through; `@keeps` and `@answers` on one extern, the same parameter and different ones; every
 // misuse of the annotation.
 //
-// Skipped: an `@answers` extern called through a function pointer -- a call through a pointer is not
-// followed by the analysis at all (`keeps_cast.sysl`'s note), so there is no summary to carry; a
+// Skipped: an `@answers` extern called through a function pointer -- a call through a pointer is
+// answered by its type, so there is no summary to carry; a
 // variadic argument past the named ones -- no name can reach it, so it is fresh by construction.
 
 // -- the harness ----------------------------------------------------------------------------------
@@ -77,6 +78,25 @@ private xan_refused_with(lib: string, text: string, part: string)
     assert(out.0.index_of(part).is_some(), out.0)
 end xan_refused_with
 
+// **Accepted, and never run**: a pointer `ptr_cast` makes of a dead frame's address is the program's
+// own responsibility, so what reading it prints is no part of the test.
+private xan_builds(text: string)
+    if xvr_no_library() then return
+
+    val root = make_temp_dir("sysl-xan").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val built = build_native_program(root, None, None, DefaultOptimization, Some(s"$root/built"))
+
+    remove_dir_all(root).unwrap_or(())
+
+    built match
+        Err(why) -> assert(false, failure_text(why))
+        Ok(_) -> ()
+end xan_builds
+
 // Module storage to store an answer in, so that it outlives the frame that made it.
 private xan_held() -> string = raw"""
     static var spare: u8 = 0
@@ -113,9 +133,26 @@ xan_reduction_accepted()
             printi(c_closedir(ptr_cast(h)))
         """, "70")
 
-@test("and the same shape through an '@answers' extern carries the local's image out")
+@test("and the same shape through an '@answers' extern carries the local's address out")
 xan_reduction_answered_refused()
     xan_refused(raw"""
+        @answers(s)
+        private extern "strchr" c_strchr(s: *u8, c: int) -> *u8
+
+        open(dir: **u8) -> int
+            var c: [3]u8 = [u8('.'), u8('x'), 0]
+            val d = c_strchr(&c[0], 120)
+
+            *dir = d
+            0
+
+        main()
+            var h: *u8 = null
+            if open(&h) != 0 then return
+            printi(long(*h))
+        """, "'d' holds the address of a field of 'c', a local of 'open', and it is stored in '*dir', which " +
+             "outlives 'open'")
+    xan_builds(raw"""
         import sysl.raw.ptr_cast
 
         @answers(s)
@@ -134,14 +171,13 @@ xan_reduction_answered_refused()
             var h: usize = 0
             if open(&h) != 0 then return
             printi(long(*word(h)))
-        """, "'usize(d)' holds the address of a field of 'c', a local of 'open', and it is stored in " +
-             "'*dir', which outlives 'open' and 'word' turns back into a pointer with 'ptr_cast'")
+        """)
 
-// -- an out-parameter integer is the local it was handed ------------------------------------------
+// -- an out-parameter integer is a number ---------------------------------------------------------
 
-@test("an image written through an integer out-parameter reaches the caller's local and its cast")
+@test("an address written through an integer out-parameter and cast back by the caller is unchecked")
 xan_out_param_local()
-    xan_refused(raw"""
+    xan_builds(raw"""
         import sysl.raw.ptr_cast
 
         id(s: *u8) -> *u8 = s
@@ -157,10 +193,9 @@ xan_out_param_local()
             if open(&h) != 0 then return
             val p: *u8 = ptr_cast(h)
             printi(long(p[0]))
-        """, "and it is stored in '*dir', which outlives 'open' and 'main' turns back into a pointer " +
-             "with 'ptr_cast'")
+        """)
 
-@test("and so does one written through a field's address or an array element's")
+@test("and so is one written through a field's address or an array element's")
 xan_out_param_field()
     val open = raw"""
         import sysl.raw.ptr_cast
@@ -172,7 +207,7 @@ xan_out_param_field()
 
         """
 
-    xan_refused(open + raw"""
+    xan_builds(open + raw"""
         struct Handle
             at: usize
 
@@ -181,14 +216,14 @@ xan_out_param_field()
             open(&h.at)
             val p: *u8 = ptr_cast(h.at)
             printi(long(p[0]))
-        """, "and it is stored in '*dir', which outlives 'open' and 'main' turns back into a pointer")
-    xan_refused(open + raw"""
+        """)
+    xan_builds(open + raw"""
         main()
             var hs: [2]usize = [0, 0]
             open(&hs[1])
             val p: *u8 = ptr_cast(hs[1])
             printi(long(p[0]))
-        """, "and it is stored in '*dir', which outlives 'open' and 'main' turns back into a pointer")
+        """)
 
 @test("a number written through an out-parameter and cast back is not an image")
 xan_out_param_number()
