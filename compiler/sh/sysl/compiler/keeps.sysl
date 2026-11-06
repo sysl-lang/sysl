@@ -4774,8 +4774,11 @@ private rule_core(ft: &FrameTrack, e: TExpr) -> Option[string] = *e.kind match
     TErase(v, _, _) -> frame_core(ft, v)
 
     // The address as an integer is still the address (`returned_image`); one computed from it is a
-    // number.
-    TCast(v, ty) -> if may_hold_pointer(ft.cx, ty) || is_integer_type(ty) then frame_core(ft, v) else None
+    // number. An integer made a pointer again is followed only where it is that address outright.
+    TCast(v, ty) ->
+        if may_hold_pointer(ft.cx, ty) && is_integer_type(texpr_type(v)) then return pointer_image_core(ft, v)
+
+        if may_hold_pointer(ft.cx, ty) || is_integer_type(ty) then frame_core(ft, v) else None
     TFloorCast(v, ty) -> if is_integer_type(ty) then frame_core(ft, v) else None
     TField(r, _, ty) -> if may_hold_pointer(ft.cx, ty) then frame_core(ft, r) else None
     TSeq(exprs) -> if exprs.is_empty() then None else frame_core(ft, exprs[exprs.len() - 1])
@@ -4806,6 +4809,15 @@ private rule_core(ft: &FrameTrack, e: TExpr) -> Option[string] = *e.kind match
             if c.is_some() && vcall_answers(ft.cx, recv, slot, handed, k, ty) then return c
 
         None
+    _ -> None
+
+// The frame storage a pointer made from an integer is, by `ptr_cast`. **`ptr_cast(usize(p))` is still
+// `p`, and so is a call's answer that is `p` as an integer** -- but an integer held anywhere first (a
+// local, a field, a parameter) or converted again is a number, and the pointer made from it is
+// unchecked. Where that number goes once it has left the frame is `keeps_cast.sysl`'s question.
+private pointer_image_core(ft: &FrameTrack, v: TExpr) -> Option[string] = *v.kind match
+    TCast(inner, _) -> if is_integer_type(texpr_type(inner)) then None else frame_core(ft, inner)
+    TCall(_, _, _, _) -> frame_core(ft, v)
     _ -> None
 
 // The frame storage a call's answer may be made of: an argument's, where the callee answers with it,

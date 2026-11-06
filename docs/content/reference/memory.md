@@ -5394,7 +5394,45 @@ a C library allocated is not made of the `*i32` it reported an error code throug
 it was handed as bytes. **An integer that is the address is made of it**: `address(p: *int) -> usize
 = usize(p)` answers its argument as an integer, and `ptr_cast(usize(p))` is still `p`. An integer
 computed from one (`ptr_cast(usize(p) + 8)`) is not followed: that is the raw tier, and writing it
-takes a `ptr_cast`.
+takes a `ptr_cast`. Neither is one held anywhere first — a local, a field, a parameter: the pointer
+made back from it is unchecked, and may go where the address itself could not:
+
+```sysl
+import sysl.raw.ptr_cast
+
+struct Node
+    next: *Node
+    n: int
+
+struct Queue
+    head: *Node
+    tail: *Node
+
+enqueue(q: *Queue, w: *Node)
+    if q.tail == null then q.head = w else q.tail.next = w
+    q.tail = w
+
+run(q: *Queue) -> int
+    var node = Node(null, 5)
+    val at = usize(&node)
+    val w: *Node = ptr_cast(at)
+
+    enqueue(q, w)
+
+    val n = q.head.n
+
+    q.head = null
+    q.tail = null
+    n
+
+main()
+    var q = Queue(null, null)
+    print(run(&q))
+```
+
+```output
+5
+```
 
 **A frame's own address as an integer is a number until it is turned back into a pointer.**
 `usize(&marker)` remembered in module storage, or handed back, is how a program measures its stack,
