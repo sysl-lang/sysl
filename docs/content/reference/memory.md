@@ -6031,6 +6031,34 @@ val f: &Fn(*Handle) -> unit = (h) -> seen.push(h)
 a closure borrows what it is handed for the call, and this one keeps its parameter 'h' (it is passed to 'push', which keeps it) — whoever calls it may hand it the address of their own storage. Copy what this needs into storage of its own, or let it keep it by marking the parameter '@keeps' in the type it is made at: 'Fn(@keeps *Handle) -> unit'
 ```
 
+**An unmarked parameter is answered by the type too, never by the closures made at it**: the call
+borrows the argument and everything read through it, so a closure that keeps an object it is handed,
+or lets out what it reads through a pointer, is refused where it is written, whatever any caller
+hands it:
+
+```sysl
+struct Cell
+    p: *int
+
+var the = 1
+var kept: *int = &the
+
+poke(f: &Fn(*Cell) -> unit)
+    var x = 5
+    var c = Cell(&x)
+    f(&c)
+
+poke((c) -> kept = c.p)
+```
+
+```error
+a closure borrows what it is handed for the call, and this one lets what it reads through its parameter 'c' outlive the call (it is stored in 'kept')
+```
+
+A callable's type has no way to say `@answers`, so a call through one may answer with anything it was
+handed: `kept = f(&mine)` stores a local's address as far as the caller can tell, whatever the closure
+answers.
+
 Every question a call through the object is asked about a marked parameter is answered as for an
 `extern`: what it reads through the pointer may be kept too, at any depth, and what it answers may be
 made of what it was handed. A call that sees the body — a closure handed to a bare-arrow parameter,

@@ -166,7 +166,7 @@ end shadowed_form
 // next suspension, and a way for a task to wait on something outside it and say when to run again:
 //
 //     step(t: Task[T], wake: &Fn() -> unit) -> bool      // resume once; true where `t` is finished
-//     await park(register: &Fn(&Fn() -> unit) -> unit)   // hand `register` a waker, then wait on it
+//     await park(register: &Fn(@keeps &Fn() -> unit) -> unit)   // hand `register` a waker, then wait
 //
 // A WAKER IS A `&Fn() -> unit`, so there is no type to learn: an executor hands `step` a closure that
 // queues the task it is stepping, and a library leaf hands `park` a closure that keeps the waker it
@@ -247,22 +247,26 @@ waker_type_in(an: &Analysis) -> Type
     Ref(Trait(catalog_key(an, "Fn0").unwrap_or("Fn0"), args, buf()), false)
 end waker_type_in
 
-// `&Fn(&Fn() -> unit) -> unit`: what `park` hands its waker to.
+// `&Fn(@keeps &Fn() -> unit) -> unit`: what `park` hands its waker to. **The registrar keeps the
+// waker** -- that is what it is for: it files it where whatever ends the wait will call it -- so its
+// type says so, and a call through it is answered by that mark like any other callable's.
 private registrar_type(cx: &Analyzer) -> Type
     var takes: Buf[Type] = buf()
+    var marks: Buf[(string, Type)] = buf()
 
     takes.push(waker_type(cx))
-    callable_type(cx, "Fn1", takes)
+    marks.push(fn_keeps_assoc(0))
+    callable_type(cx, "Fn1", takes, marks)
 end registrar_type
 
-private callable_type(cx: &Analyzer, spelling: string, takes: Buf[Type]) -> Type
+private callable_type(cx: &Analyzer, spelling: string, takes: Buf[Type], marks: Buf[(string, Type)]) -> Type
     var args: Buf[Type] = buf()
 
     for item in takes
         args.push(item)
 
     args.push(Unit)
-    Ref(Trait(catalog_key(cx.an, spelling).unwrap_or(spelling), args, buf()), false)
+    Ref(Trait(catalog_key(cx.an, spelling).unwrap_or(spelling), args, marks), false)
 end callable_type
 
 // An argument read at a callable type, a closure written there boxed and erased into it.
