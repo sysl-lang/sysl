@@ -503,6 +503,7 @@ lower_closure(cx: &Analyzer, span: Span, names: Buf[string], ptypes: Buf[Type],
 
     cx.an.closure_count += 1
     cx.an.closure_keeps.put(base, kept)
+    forget_closure(cx.an, base)
 
     // **A scoped child holds its captures by value** whatever else is true of it, so it is no
     // candidate; any other closure may hold each `var` it captures by reference, decided once every
@@ -544,6 +545,31 @@ lower_closure(cx: &Analyzer, span: Span, names: Buf[string], ptypes: Buf[Type],
 
     TExpr(span, TStructNew(st, args))
 end lower_closure
+
+// **A closure's name may already have been given to one a thrown-away reading lowered**: a body read
+// to learn its result type (`main() =`), or an operand read to choose an operator, numbers its
+// closures and then gives the numbers back, and the next closure lowered anywhere takes them. What
+// that reading noted against the name -- which captures it could hold by reference, and the writes
+// owed until its mode is known -- is about code the program never had, so it is dropped before this
+// closure notes its own; otherwise the closure that took the name would be refused for a write it
+// never makes, or held to captures it does not have.
+private forget_closure(a: &Analysis, base: string)
+    a.closure_refs.remove(base)
+
+    var stale = false
+
+    for item in a.lost_writes
+        if item.base == base then stale = true
+
+    if !stale then return
+
+    var kept: Buf[OwedWrite] = buf()
+
+    for item in a.lost_writes
+        if item.base != base then kept.push(item)
+
+    a.lost_writes = kept
+end forget_closure
 
 // Which captures a closure may hold by reference: a binding a write may reach -- not a `val`, a
 // pattern's binding or a by-name parameter -- of a type that has storage. A `val` is copied whatever

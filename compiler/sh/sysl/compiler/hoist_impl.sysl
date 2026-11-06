@@ -48,6 +48,8 @@ hoist_impl(a: &Analysis, im: Impl) -> Impl
         return im
     end if
 
+    block.for_type = through_generic_alias(a, scope, block.for_type, block.tparams)
+
     // `Self` is what a block is *for*, so it cannot be what the block names; it ends here, told
     // once, since reading on would resolve `Self` again and complain about the same word.
     if type_text(block.for_type) == "Self"
@@ -1159,6 +1161,66 @@ impl_bound(a: &Analysis, scope: Scope, span: Span, block: ImplDecl, tr: TraitDec
     check_trait_arg_bounds_all(a, scope, span, block.trait_name, tr, args)
     (plain_bound(block.trait_name, args), written)
 end impl_bound
+
+// A generic alias is a second spelling of the type it stands for, so an `impl` written for
+// `Buffer[T]` is an `impl` for `Buf[T]`: the subject is rewritten to the declaration the alias names,
+// applied to the arguments the block wrote. Only a plain alias whose own arguments are its
+// parameters or fixed types is read this way, and only where the block applies it to its own
+// parameters -- `impl Show for Bx[int]` names one instance and stays as written. Anything else is
+// left as written and met by the checks that follow. The target is named by its key, which is its own answer wherever it is read.
+private through_generic_alias(a: &Analysis, scope: Scope, subject: TypeRef, tparams: Buf[string]) -> TypeRef
+    *subject.kind match
+        NamedType(written, args) ->
+            val key = lookup_type_key(a, scope, written)
+
+            if key.is_none() then return subject
+
+            for arg in args
+                *arg.kind match
+                    NamedType(n, inner) -> if !inner.is_empty() || !holds_string(tparams, n) then return subject
+                    _ -> return subject
+
+            val decl = a.tables.types.get(key.unwrap())
+
+            if decl.is_none() then return subject
+
+            decl.unwrap().kind match
+                TypeOf(d) ->
+                    if d.derived || d.range.is_some() || d.pred.is_some() || d.tp.names.is_empty() ||
+                       d.tp.names.len() != args.len() then return subject
+
+                    *d.base.kind match
+                        NamedType(target, targs) ->
+                            val tkey = lookup_type_key(a, decl.unwrap().scope, target)
+
+                            if tkey.is_none() then return subject
+
+                            var out: Buf[TypeRef] = buf()
+
+                            for t in targs
+                                out.push(substituted(t, d.tp.names, args))
+
+                            type_ref(subject.span, NamedType(tkey.unwrap(), out))
+                        _ -> subject
+                _ -> subject
+        _ -> subject
+end through_generic_alias
+
+// A written type with each of an alias's parameters replaced by the argument it was applied to.
+private substituted(t: TypeRef, names: Buf[string], args: Buf[TypeRef]) -> TypeRef
+    *t.kind match
+        NamedType(n, inner) ->
+            for i in 0..<names.len()
+                if inner.is_empty() && n == names[i] then return args[i]
+
+            var out: Buf[TypeRef] = buf()
+
+            for x in inner
+                out.push(substituted(x, names, args))
+
+            type_ref(t.span, NamedType(n, out))
+        _ -> t
+end substituted
 
 // The type an `impl` is for, and where its members belong.
 impl_target(a: &Analysis, scope: Scope, span: Span, block: ImplDecl) -> (Type, MemberHome)

@@ -1,0 +1,603 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.cstring
+
+// A closure literal handed to a callee that keeps it by writing it into a variable the callee's own
+// closure captured. The keeping closure holds that variable by reference, so its body's write lands
+// in the frame that built the keeping closure -- the entry file's body, or `main` -- which outlives
+// the callee's. The keeps summaries read the by-value form, where the write is a store into the
+// environment reached through `self`, and named it as the caller's own argument: the kept literal
+// looked confined to the callee's frame, held its captures by reference into that frame, and was read
+// after the frame was gone (`keeps_flow.sysl`'s `by_reference_capture`).
+//
+// Every cell runs twice: as statements of the entry file, whose `var`s are locals of its body, and
+// inside `main` with the binding its local. Both print 42. Before the kept closure runs, the callee is
+// called again with 1000, which lays a frame of the same shape over the dead one: a closure still
+// reading that frame prints 1002 rather than a lucky 42. The cells: a bare-arrow keeper; a keeper
+// that hands the closure, and the address of its capture, to a named function that stores it; a
+// keeper held in a named binding; a keeper staging it in a local `var` first; a callee reached
+// through a `&Fn` field -- the holder built at the call, bound to a `val`, handed as a `&Holder`, generic,
+// or its keeper writing through a pointer it captured; a generic callee; a captured `var` changed after the
+// closure is kept; the closure handed through a second call; the keeping statement inside an `if` and
+// a `for`. Then a closure nobody keeps on the counted heap (net zero), and the repro under
+// AddressSanitizer.
+//
+// Skipped cells, and why: a module `static var` and a `main` writing module storage already printed
+// 42 (the store is to `g:`, which every summary keeps); a `&Fn` callee goes through a trait object,
+// which keeps whatever it is handed; a thread or `@scoped` callee takes a `&sync Fn`, whose captures
+// are copied whatever the probe says.
+
+private extern "setenv" eck_c_setenv(name: *u8, value: *u8, overwrite: int) -> int
+private extern "unsetenv" eck_c_unsetenv(name: *u8) -> int
+
+private struct EckRun
+    out: string
+    err: string
+    hooks: usize
+end EckRun
+
+// The program built and run: on the counted heap, or with `flags` handed to clang.
+private eck_run(text: string, counted: bool, flags: string) -> EckRun
+    val root = make_temp_dir("sysl-eck").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", forms_imported(text)).unwrap()
+
+    val exe = s"$root/built"
+
+    if flags != ""
+        val n = cstring("SYSL_EXTRA_CFLAGS")
+        val v = cstring(flags)
+
+        eck_c_setenv(n.ptr, v.ptr, 1)
+    end if
+
+    force_alloc_counting(counted)
+
+    val made = build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe))
+
+    force_alloc_counting(false)
+
+    if flags != ""
+        val n = cstring("SYSL_EXTRA_CFLAGS")
+
+        eck_c_unsetenv(n.ptr)
+    end if
+
+    made match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return EckRun(failure_text(why), "", 0)
+        Ok(_) -> ()
+
+    val hooks = capture("nm", ["-u", exe], "", [], true) match
+        Ok(o) -> o.text.count_of("__asan_report")
+        Err(_) -> 0
+
+    val ran = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    ran match
+        Err(_) -> EckRun("could not be started", "", hooks)
+        Ok(o) -> EckRun(o.text, o.err.unwrap_or(""), hooks)
+end eck_run
+
+// The program printed `want`.
+private eck_prints(text: string, want: string)
+    if !enm_ready() then return
+
+    val got = eck_run(text, false, "")
+
+    assert_eq(got.out, want)
+end eck_prints
+
+// -- the bare-arrow keeper ------------------------------------------------------------------------
+
+@test("entry: a closure kept by a bare-arrow callee reads its captures from a live frame")
+eck_bare_arrow_entry()
+    eck_prints(raw"""
+        var last: Option[&Fn(int) -> unit] = None
+        ask(n: int, f: (&Fn(int) -> unit) -> unit) = f(r -> print(n + r))
+        ask(40, a -> last = Some(a))
+        ask(1000, a -> ())
+        last.unwrap()(2)
+        """, "42\n")
+
+@test("main: a closure kept by a bare-arrow callee into main's local reads its captures from a live frame")
+eck_bare_arrow_main()
+    eck_prints(raw"""
+        ask(n: int, f: (&Fn(int) -> unit) -> unit) = f(r -> print(n + r))
+
+        main() =
+            var last: Option[&Fn(int) -> unit] = None
+            ask(40, a -> last = Some(a))
+            ask(1000, a -> ())
+            last.unwrap()(2)
+        """, "42\n")
+
+// -- kept through a named function ----------------------------------------------------------------
+
+@test("entry: a closure the keeper hands to a function that stores it in a local it was given")
+eck_named_entry()
+    eck_prints(raw"""
+        keep(into: *Option[&Fn(int) -> unit], a: &Fn(int) -> unit) = *into = Some(a)
+        ask(n: int, f: (&Fn(int) -> unit) -> unit) = f(r -> print(n + r))
+        var last: Option[&Fn(int) -> unit] = None
+        ask(40, a -> keep(&last, a))
+        ask(1000, a -> ())
+        last.unwrap()(2)
+        """, "42\n")
+
+@test("main: a closure the keeper hands to a function that stores it in a local it was given")
+eck_named_main()
+    eck_prints(raw"""
+        keep(into: *Option[&Fn(int) -> unit], a: &Fn(int) -> unit) = *into = Some(a)
+        ask(n: int, f: (&Fn(int) -> unit) -> unit) = f(r -> print(n + r))
+
+        main() =
+            var last: Option[&Fn(int) -> unit] = None
+            ask(40, a -> keep(&last, a))
+            ask(1000, a -> ())
+            last.unwrap()(2)
+        """, "42\n")
+
+@test("entry: a keeper held in a named binding rather than written at the call")
+eck_bound_entry()
+    eck_prints(raw"""
+        ask(n: int, f: (&Fn(int) -> unit) -> unit) = f(r -> print(n + r))
+        var last: Option[&Fn(int) -> unit] = None
+        val keeper = (a: &Fn(int) -> unit) -> last = Some(a)
+        ask(40, keeper)
+        ask(1000, a -> ())
+        last.unwrap()(2)
+        """, "42\n")
+
+@test("main: a keeper held in a named binding rather than written at the call")
+eck_bound_main()
+    eck_prints(raw"""
+        ask(n: int, f: (&Fn(int) -> unit) -> unit) = f(r -> print(n + r))
+
+        main() =
+            var last: Option[&Fn(int) -> unit] = None
+            val keeper = (a: &Fn(int) -> unit) -> last = Some(a)
+            ask(40, keeper)
+            ask(1000, a -> ())
+            last.unwrap()(2)
+        """, "42\n")
+
+// -- staged in a local first ----------------------------------------------------------------------
+
+@test("entry: a closure the keeper stages in its own local before storing it")
+eck_staged_entry()
+    eck_prints(raw"""
+        var last: Option[&Fn(int) -> unit] = None
+        ask(n: int, f: (&Fn(int) -> unit) -> unit) = f(r -> print(n + r))
+        ask(40, a ->
+            var t: Option[&Fn(int) -> unit] = Some(a)
+            last = t
+        )
+        ask(1000, a -> ())
+        last.unwrap()(2)
+        """, "42\n")
+
+@test("main: a closure the keeper stages in its own local before storing it")
+eck_staged_main()
+    eck_prints(raw"""
+        ask(n: int, f: (&Fn(int) -> unit) -> unit) = f(r -> print(n + r))
+
+        main() =
+            var last: Option[&Fn(int) -> unit] = None
+            ask(40, a ->
+                var t: Option[&Fn(int) -> unit] = Some(a)
+                last = t
+            )
+            ask(1000, a -> ())
+            last.unwrap()(2)
+        """, "42\n")
+
+// -- a `&Fn` field as the callee ------------------------------------------------------------------
+//
+// A call through a `&Fn` is answered by its type, so the field's type marks the parameter its keeper
+// stores `@keeps`; without it the keeper is refused where it is written, which `tests_olq` pins.
+
+@test("entry: a closure handed to a keeper reached through a field")
+eck_field_entry()
+    eck_prints(raw"""
+        struct Holder
+            f: &Fn(@keeps &Fn(int) -> unit) -> unit
+
+        var last: Option[&Fn(int) -> unit] = None
+        ask(n: int, h: Holder) = h.f(r -> print(n + r))
+        ask(40, Holder(a -> last = Some(a)))
+        ask(1000, Holder(a -> ()))
+        last.unwrap()(2)
+        """, "42\n")
+
+@test("entry: a closure handed to a keeper reached through a field, which writes through a pointer it holds")
+eck_field_pointer_entry()
+    eck_prints(raw"""
+        struct Holder
+            f: &Fn(@keeps &Fn(int) -> unit) -> unit
+
+        var last: Option[&Fn(int) -> unit] = None
+        val slot = &last
+        ask(n: int, h: Holder) = h.f(r -> print(n + r))
+        ask(40, Holder(a -> *slot = Some(a)))
+        ask(1000, Holder(a -> ()))
+        last.unwrap()(2)
+        """, "42\n")
+
+@test("main: a closure handed to a keeper reached through a field, which writes through a pointer it holds")
+eck_field_main()
+    eck_prints(raw"""
+        struct Holder
+            f: &Fn(@keeps &Fn(int) -> unit) -> unit
+
+        ask(n: int, h: Holder) = h.f(r -> print(n + r))
+
+        main() =
+            var last: Option[&Fn(int) -> unit] = None
+            val slot = &last
+            ask(40, Holder(a -> *slot = Some(a)))
+            ask(1000, Holder(a -> ()))
+            last.unwrap()(2)
+        """, "42\n")
+
+// **A body read to learn its result type numbers its closures and gives the numbers back**, and the
+// next closure lowered -- here the one inside `ask` -- takes the number `main`'s keeper had in that
+// reading. What the thrown-away reading owed under that number (a write to `last` reaching only a
+// copy) was said of `main`'s real keeper, with the reason `ask`'s closure escapes: `main` was refused
+// for a program the entry file accepted (`closure.sysl`'s `forget_closure`).
+@test("main: a keeper that assigns its capture, reached through a field")
+eck_field_assign_main()
+    eck_prints(raw"""
+        struct Holder
+            f: &Fn(@keeps &Fn(int) -> unit) -> unit
+
+        ask(n: int, h: Holder) = h.f(r -> print(n + r))
+
+        main() =
+            var last: Option[&Fn(int) -> unit] = None
+            ask(40, Holder(a -> last = Some(a)))
+            ask(1000, Holder(a -> ()))
+            last.unwrap()(2)
+        """, "42\n")
+
+@test("main: the field keeper assigning its capture, in a function other than main whose result is inferred")
+eck_field_assign_other()
+    eck_prints(raw"""
+        struct Holder
+            f: &Fn(@keeps &Fn(int) -> unit) -> unit
+
+        ask(n: int, h: Holder) = h.f(r -> print(n + r))
+
+        run() =
+            var last: Option[&Fn(int) -> unit] = None
+            ask(40, Holder(a -> last = Some(a)))
+            ask(1000, Holder(a -> ()))
+            last.unwrap()(2)
+
+        main() = run()
+        """, "42\n")
+
+@test("entry and main: a holder bound to a val before it is handed to the field keeper")
+eck_field_bound()
+    eck_prints(raw"""
+        struct Holder
+            f: &Fn(@keeps &Fn(int) -> unit) -> unit
+
+        var last: Option[&Fn(int) -> unit] = None
+        ask(n: int, h: Holder) = h.f(r -> print(n + r))
+        val h = Holder(a -> last = Some(a))
+        ask(40, h)
+        ask(1000, Holder(a -> ()))
+        last.unwrap()(2)
+        """, "42\n")
+    eck_prints(raw"""
+        struct Holder
+            f: &Fn(@keeps &Fn(int) -> unit) -> unit
+
+        ask(n: int, h: Holder) = h.f(r -> print(n + r))
+
+        main() =
+            var last: Option[&Fn(int) -> unit] = None
+            val h = Holder(a -> last = Some(a))
+            ask(40, h)
+            ask(1000, Holder(a -> ()))
+            last.unwrap()(2)
+        """, "42\n")
+
+@test("entry and main: the field keeper reached through a &Holder")
+eck_field_counted()
+    eck_prints(raw"""
+        struct Holder
+            f: &Fn(@keeps &Fn(int) -> unit) -> unit
+
+        var last: Option[&Fn(int) -> unit] = None
+        ask(n: int, h: &Holder) = h.f(r -> print(n + r))
+        ask(40, Holder(a -> last = Some(a)))
+        ask(1000, Holder(a -> ()))
+        last.unwrap()(2)
+        """, "42\n")
+    eck_prints(raw"""
+        struct Holder
+            f: &Fn(@keeps &Fn(int) -> unit) -> unit
+
+        ask(n: int, h: &Holder) = h.f(r -> print(n + r))
+
+        main() =
+            var last: Option[&Fn(int) -> unit] = None
+            ask(40, Holder(a -> last = Some(a)))
+            ask(1000, Holder(a -> ()))
+            last.unwrap()(2)
+        """, "42\n")
+
+@test("entry and main: the field keeper in a generic holder")
+eck_field_generic()
+    eck_prints(raw"""
+        struct Holder[T]
+            f: &Fn(@keeps &Fn(T) -> unit) -> unit
+
+        var last: Option[&Fn(int) -> unit] = None
+        ask[T: Display](n: T, h: Holder[T]) = h.f(r -> print(n))
+        ask(42, Holder(a -> last = Some(a)))
+        ask(1000, Holder(a -> ()))
+        last.unwrap()(2)
+        """, "42\n")
+    eck_prints(raw"""
+        struct Holder[T]
+            f: &Fn(@keeps &Fn(T) -> unit) -> unit
+
+        ask[T: Display](n: T, h: Holder[T]) = h.f(r -> print(n))
+
+        main() =
+            var last: Option[&Fn(int) -> unit] = None
+            ask(42, Holder(a -> last = Some(a)))
+            ask(1000, Holder(a -> ()))
+            last.unwrap()(2)
+        """, "42\n")
+
+// The closure that took the thrown-away number captures nothing, so what that reading noted about
+// which captures it could hold by reference was about fields it does not have.
+@test("main: the field keeper writes two captures, and the closure that took its old number captures nothing")
+eck_field_two_writes()
+    eck_prints(raw"""
+        struct Holder
+            f: &Fn(@keeps &Fn(int) -> unit) -> unit
+
+        ask(n: int, h: Holder) = h.f(r -> print(r))
+
+        main() =
+            var last: Option[&Fn(int) -> unit] = None
+            var hits = 0
+            ask(40, Holder(a ->
+                hits += 1
+                last = Some(a)))
+            print(hits)
+            last.unwrap()(2)
+        """, "1\n2\n")
+
+@test("main: a holder whose keeper is itself kept is refused, naming the callee that keeps it")
+eck_field_kept_refused()
+    if !enm_ready() then return
+
+    val got = eck_run(raw"""
+        struct Holder
+            f: &Fn(@keeps &Fn(int) -> unit) -> unit
+
+        var kept: Option[Holder] = None
+        stash(h: Holder) = kept = Some(h)
+
+        main() =
+            var hits = 0
+            stash(Holder(a -> hits += 1))
+            print(hits)
+        """, false, "")
+
+    assert(got.out.contains("this closure captures by value, since it is handed to 'stash' on line 9, " +
+                            "which keeps its parameter 'h' (it is stored in 'kept'), so it holds a copy " +
+                            "of 'hits' — so '+=' would reach that copy rather than the variable it came " +
+                            "from"), got.out)
+
+@test("main: the field keeper under AddressSanitizer: instrumented, and nothing read from a dead frame")
+eck_field_asan()
+    if !enm_ready() then return
+
+    val got = eck_run(raw"""
+        struct Holder
+            f: &Fn(@keeps &Fn(int) -> unit) -> unit
+
+        ask(n: int, h: Holder) = h.f(r -> print(n + r))
+
+        main() =
+            var last: Option[&Fn(int) -> unit] = None
+            ask(40, Holder(a -> last = Some(a)))
+            ask(1000, Holder(a -> ()))
+            last.unwrap()(2)
+        """, false, "-fsanitize=address -g")
+
+    assert(got.hooks > 0, s"not instrumented: ${got.out}")
+    assert_eq(got.out, "42\n")
+    assert(got.err.index_of("AddressSanitizer").is_none(), got.err)
+
+// -- a generic callee -----------------------------------------------------------------------------
+
+@test("entry: a closure kept by a generic callee")
+eck_generic_entry()
+    eck_prints(raw"""
+        var last: Option[&Fn(int) -> unit] = None
+        ask[T: Integer](n: T, f: (&Fn(int) -> unit) -> unit) = f(r -> print(int(n) + r))
+        ask(40u8, a -> last = Some(a))
+        ask(40, a -> last = Some(a))
+        ask(1000, a -> ())
+        last.unwrap()(2)
+        """, "42\n")
+
+@test("main: a closure kept by a generic callee")
+eck_generic_main()
+    eck_prints(raw"""
+        ask[T: Integer](n: T, f: (&Fn(int) -> unit) -> unit) = f(r -> print(int(n) + r))
+
+        main() =
+            var last: Option[&Fn(int) -> unit] = None
+            ask(40u8, a -> last = Some(a))
+            ask(40, a -> last = Some(a))
+            ask(1000, a -> ())
+            last.unwrap()(2)
+        """, "42\n")
+
+// -- a captured `var` changed after the closure is kept -------------------------------------------
+
+@test("entry: the kept closure holds a copy of a var the callee changes after keeping it")
+eck_changed_entry()
+    eck_prints(raw"""
+        var last: Option[&Fn(int) -> unit] = None
+        var k = 40
+
+        ask(n: int, f: (&Fn(int) -> unit) -> unit)
+            var m = n
+            f(r -> print(m + r))
+            m = 0
+
+        ask(k, a -> last = Some(a))
+        k = 0
+        ask(1000, a -> ())
+        last.unwrap()(2)
+        """, "42\n")
+
+@test("main: the kept closure holds a copy of a var the callee changes after keeping it")
+eck_changed_main()
+    eck_prints(raw"""
+        ask(n: int, f: (&Fn(int) -> unit) -> unit)
+            var m = n
+            f(r -> print(m + r))
+            m = 0
+
+        main() =
+            var last: Option[&Fn(int) -> unit] = None
+            var k = 40
+            ask(k, a -> last = Some(a))
+            k = 0
+            ask(1000, a -> ())
+            last.unwrap()(2)
+        """, "42\n")
+
+// -- nested calls ---------------------------------------------------------------------------------
+
+@test("entry: the keeper handed on through a second bare-arrow call")
+eck_nested_entry()
+    eck_prints(raw"""
+        var last: Option[&Fn(int) -> unit] = None
+        ask(n: int, f: (&Fn(int) -> unit) -> unit) = f(r -> print(n + r))
+        relay(n: int, f: (&Fn(int) -> unit) -> unit) = ask(n + 1, g -> f(g))
+        relay(39, a -> last = Some(a))
+        ask(1000, a -> ())
+        last.unwrap()(2)
+        """, "42\n")
+
+@test("main: the keeper handed on through a second bare-arrow call")
+eck_nested_main()
+    eck_prints(raw"""
+        ask(n: int, f: (&Fn(int) -> unit) -> unit) = f(r -> print(n + r))
+        relay(n: int, f: (&Fn(int) -> unit) -> unit) = ask(n + 1, g -> f(g))
+
+        main() =
+            var last: Option[&Fn(int) -> unit] = None
+            relay(39, a -> last = Some(a))
+            ask(1000, a -> ())
+            last.unwrap()(2)
+        """, "42\n")
+
+// -- inside `if` and `for` ------------------------------------------------------------------------
+
+@test("entry: the keeping statement inside an if and a for")
+eck_blocks_entry()
+    eck_prints(raw"""
+        var last: Option[&Fn(int) -> unit] = None
+        var first: Option[&Fn(int) -> unit] = None
+        ask(n: int, f: (&Fn(int) -> unit) -> unit) = f(r -> print(n + r))
+
+        if last.is_none()
+            ask(40, a -> first = Some(a))
+
+        for i in 0..<3
+            ask(38 + i, a -> last = Some(a))
+
+        ask(1000, a -> ())
+        first.unwrap()(2)
+        ask(1000, a -> ())
+        last.unwrap()(2)
+        """, "42\n42\n")
+
+@test("main: the keeping statement inside an if and a for")
+eck_blocks_main()
+    eck_prints(raw"""
+        ask(n: int, f: (&Fn(int) -> unit) -> unit) = f(r -> print(n + r))
+
+        main() =
+            var last: Option[&Fn(int) -> unit] = None
+            var first: Option[&Fn(int) -> unit] = None
+
+            if last.is_none()
+                ask(40, a -> first = Some(a))
+
+            for i in 0..<3
+                ask(38 + i, a -> last = Some(a))
+
+            ask(1000, a -> ())
+            first.unwrap()(2)
+            ask(1000, a -> ())
+            last.unwrap()(2)
+        """, "42\n42\n")
+
+// -- a closure nobody keeps -----------------------------------------------------------------------
+
+@test("a closure the callee only runs gives back everything it took, from the entry file and from main")
+eck_unkept_counted()
+    if !enm_ready() then return
+
+    val entry = eck_run(raw"""
+        var seen = 0
+        ask(n: int, f: (&Fn(int) -> unit) -> unit) = f(r -> print(n + r))
+        ask(40, a -> a(2))
+        ask(40, a -> seen += 1)
+        print(seen)
+        """, true, "")
+
+    assert_eq(entry.out, "42\n1\n")
+    assert_eq(entry.err, "")
+
+    val in_main = eck_run(raw"""
+        ask(n: int, f: (&Fn(int) -> unit) -> unit) = f(r -> print(n + r))
+
+        main() =
+            var seen = 0
+            ask(40, a -> a(2))
+            ask(40, a -> seen += 1)
+            print(seen)
+        """, true, "")
+
+    assert_eq(in_main.out, "42\n1\n")
+    assert_eq(in_main.err, "")
+
+// -- AddressSanitizer -----------------------------------------------------------------------------
+
+@test("the entry-file repro under AddressSanitizer: instrumented, and nothing read from a dead frame")
+eck_repro_asan()
+    if !enm_ready() then return
+
+    val got = eck_run(raw"""
+        var last: Option[&Fn(int) -> unit] = None
+        ask(n: int, f: (&Fn(int) -> unit) -> unit) = f(r -> print(n + r))
+        ask(40, a -> last = Some(a))
+        ask(1000, a -> ())
+        last.unwrap()(2)
+        """, false, "-fsanitize=address -g")
+
+    assert(got.hooks > 0, s"not instrumented: ${got.out}")
+    assert_eq(got.out, "42\n")
+    assert(got.err.index_of("AddressSanitizer").is_none(), got.err)
