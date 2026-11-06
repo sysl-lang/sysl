@@ -73,13 +73,15 @@ analyze_produced(written: Buf[Program], t: Target, producing: Buf[string],
                  has_entry_point: bool = true,
                  index: Option[&DefinitionIndex] = None,
                  also_auto_imported: Buf[string] = buf(),
-                 image_entry: string = "") -> TypedBodies
+                 image_entry: string = "",
+                 editor: Option[&EditorCheck] = None) -> TypedBodies
     // **The declarations may be read more than once**, where a type is written in terms of a call that
     // can only run once they all have been (`const_decl.sysl`); each reading starts from nothing.
     val fresh = () ->
         val made = analysis_producing(t, producing)
 
         made.index = index
+        made.editor = editor
         made.also_auto_imported = also_auto_imported
         made.image_entry = image_entry
         made
@@ -95,6 +97,8 @@ analyze_produced(written: Buf[Program], t: Target, producing: Buf[string],
     // refusal that explains all of them.
     if c_probe_refused()
         return TypedBodies(buf(), a.diagnostics(), 0, 0, 0, buf(), a, units, None, buf(), ModuleRoot)
+
+    if editor_gave_up(a) then return given_up_bodies(a, units)
 
     // Every declaration is read, so a body can be typed: a `const` call may run from here on.
     a.evaluation.ready = true
@@ -128,10 +132,14 @@ analyze_produced(written: Buf[Program], t: Target, producing: Buf[string],
 
     check_generic_bodies(a, units)
 
+    if editor_gave_up(a) then return given_up_bodies(a, units)
+
     // **A module's storage is analyzed before any body is**, because its initializer is code like
     // any other and what it reaches is reached by the program: a `val` whose value is a call brings
-    // that call's body in exactly as a function's would.
-    val storage = module_storage(a)
+    // that call's body in exactly as a function's would. An editor's check types it here and
+    // evaluates it in its second tier (`storage_typed`).
+    val (storage_now, storage_later) = module_storage(a)
+    var storage = storage_now
 
     // And every parameter's default, for the reason the storage above is read here: a default is a
     // declaration's expression too, filled at a call but written where the declaration is, so it is
@@ -159,6 +167,8 @@ analyze_produced(written: Buf[Program], t: Target, producing: Buf[string],
     var supply = seam_supply()
 
     for unit in units
+        if editor_gave_up(a) then return given_up_bodies(a, units)
+
         val scope = scope_of_unit(a, unit)
         val library = from_library(a, scope)
         val is_entry = a.tables.entry_src != "" && unit.src.name == a.tables.entry_src
@@ -260,6 +270,25 @@ analyze_produced(written: Buf[Program], t: Target, producing: Buf[string],
     // And the reporter of each `@test` that answers with a `Result`, on the same terms.
     declared_test_reporters(a)
 
+    // **An editor's first tier ends here**: every body the program wrote has been typed, and what
+    // follows is what the whole program decides. Its diagnostics are told now, unless the text has
+    // already changed -- then nothing is, since all of it is about a text the editor no longer holds.
+    a.editor match
+        Some(e) ->
+            if editor_gave_up(a) then return given_up_bodies(a, units)
+
+            e.first_tier(a.diagnostics())
+        None -> ()
+
+    // The storage an editor's check only typed above is evaluated now, before the drain: what an
+    // evaluation instantiates is drained with everything else.
+    for later in storage_later
+        if editor_gave_up(a) then return given_up_bodies(a, units)
+
+        storage.push(laid_storage(analyzer_for(a, later.decl.scope), later))
+
+    if editor_gave_up(a) then return given_up_bodies(a, units)
+
     // Then the instantiations, drained until nothing more is asked for: typing one body may reach a
     // call that asks for another.
     drain_pending(a, &funcs)
@@ -270,6 +299,8 @@ analyze_produced(written: Buf[Program], t: Target, producing: Buf[string],
     var reached = true
 
     while reached
+        if editor_gave_up(a) then return given_up_bodies(a, units)
+
         reached = false
 
         val before = a.funcs_used().len()
@@ -325,13 +356,22 @@ analyze_produced(written: Buf[Program], t: Target, producing: Buf[string],
 
     val checked = with_entry_body(funcs, started)
 
+    if editor_gave_up(a) then return given_up_bodies(a, units)
+
     whole_program_checks(a, units, checked, ordered, typed)
+
+    if editor_gave_up(a) then return given_up_bodies(a, units)
 
     // The closures held by reference take that form once every check has read the by-value one.
     apply_closure_modes(a, checked, ordered)
 
     typed with { reported = a.diagnostics() }
 end analyze_produced
+
+// What an editor's check that was told to stop comes back with: nothing to build, and nothing to say
+// -- what it had found is about a text that has since changed.
+private given_up_bodies(a: &Analysis, units: Buf[Program]) -> TypedBodies =
+    TypedBodies(buf(), buf(), 0, 0, 0, buf(), a, units, None, buf(), ModuleRoot)
 
 // The statements the file the program starts in carries, typed in that file's own terms.
 //
@@ -1829,8 +1869,14 @@ private pattern_binds_name(p: TPattern, name: string) -> Option[Type] = p match
 // **The two are one thing under two declarations** -- storage that belongs to a module rather than
 // to a call -- and they are kept apart here only because a `var` may be written to and starts at its
 // type's zero where nothing was written, which a `val` may not and does not.
-private module_storage(a: &Analysis) -> Buf[TVal]
+//
+// **An editor's check only types it here**, and hands each piece back as `StorageTyped` to be laid
+// down -- its `const` calls run -- in the check's second tier (`laid_storage`): evaluation is the
+// whole program's business, and can take far longer than typing. Every other analysis lays each piece
+// down as soon as it is typed, and hands nothing back.
+private module_storage(a: &Analysis) -> (Buf[TVal], Buf[StorageTyped])
     var out: Buf[TVal] = buf()
+    var later: Buf[StorageTyped] = buf()
     // The names a refused `is` bound in a module binding, with the module it was written in.
     var refused: Buf[(string, string)] = buf()
 
@@ -1934,69 +1980,91 @@ private module_storage(a: &Analysis) -> Buf[TVal]
                         "a statement instead")
                 end if
 
-                // An initializer that is constant data but not yet written as literals is written as
-                // them, so the object file carries it and nothing runs to fill it in.
-                //
-                // **A call to a `const` function is run here**, and its value laid down on every
-                // target: what would have trapped at startup is refused now (`const_eval.sysl`).
-                //
-                // **An address is constant data too, but not a literal**: `&files[1]` is a relocation
-                // the linker fills in, so it is laid down as it stands rather than folded, and it is
-                // the image succeeding -- not the shape of what came back -- that says so.
-                //
-                // **A `val` over a slice literal is constant data too**: the elements are laid down as
-                // a static array and the view over it has no owner, as a string literal's has none.
-                // A `var` keeps building its view at startup, being storage the program reassigns.
-                var imaged = init.is_none() || (laid_down(init.unwrap()) &&
-                                                !(writable && builds_view(init.unwrap())))
+                val typed = StorageTyped(key, d, stored, ty, init, writable)
 
-                if !imaged
-                    cx.an.evaluation.last_stop = ""
+                if a.editor.is_some() then later.push(typed)
+                else out.push(laid_storage(cx, typed))
 
-                    // A whole initializer that trapped is refused already; its parts are not run again.
-                    val image = const_val_run(cx, d.name, init.unwrap()) match
-                        Ok(Some(whole)) -> Some(whole)
-                        Ok(None) -> static_image(cx, d.name, init.unwrap())
-                        Err(_) -> None
-
-                    val boxes = image.is_some() && writable && builds_box(image.unwrap())
-
-                    if image.is_some() && !(writable && builds_view(image.unwrap())) && !boxes
-                        init = image
-                        imaged = true
-                    else if boxes
-                        cx.an.evaluation.val_stops.put(key, s"'${d.name}' holds a reference, and a 'var' " +
-                                                       "gives its share back when it is assigned, so its box " +
-                                                       "is made when the program starts — a module 'val' " +
-                                                       "holds one laid down")
-                    else if cx.an.evaluation.last_stop != ""
-                        // Why a `const` call in it was not run: what a target that cannot run the
-                        // initializer either tells its reader (`emit_checks.sysl`).
-                        cx.an.evaluation.val_stops.put(key, cx.an.evaluation.last_stop)
-                    end if
-                end if
-
-                val computed = !imaged
-
-                // **Why it stayed code is said for every piece of storage that did**, not only one a
-                // `const` call stopped in: a freestanding artifact's refusal and a hosted build's
-                // warning (`emit_checks.sysl`'s `check_bare_metal_storage`) both read it from here,
-                // so the two are one decision told twice.
-                if computed && !cx.an.evaluation.val_stops.has(key) then
-                    cx.an.evaluation.val_stops.put(key, fold_stop(cx, key, d, init.unwrap(), writable))
-
-                if d.thread_local then check_per_thread(cx, d.span, key, ty, computed, init)
-                if d.per_cpu then check_per_core(cx, d.span, key, ty, computed, init)
-                if d.main_thread then check_main_thread(cx, d.span, key)
-
-                if d.export.is_some() then check_exported_storage(cx, d, key, ty, computed)
-
-                out.push(TVal(key, stored, init, computed, writable, storage_align(cx, d), d.section,
-                              d.thread_local, d.per_cpu, d.main_thread, exported_storage_symbol(d),
-                              storage_hidden(d), false))
-
-    out
+    (out, later)
 end module_storage
+
+// One piece of module storage typed and not yet laid down: what `laid_storage` needs to finish it.
+private struct StorageTyped
+    key: string
+    decl: ValueDecl
+    stored: Type
+    ty: Type
+    init: Option[TExpr]
+    writable: bool
+end StorageTyped
+
+// A piece of module storage laid down: its initializer run where it can be, and the questions that
+// depend on whether it stayed code asked.
+private laid_storage(cx: &Analyzer, typed: StorageTyped) -> TVal
+    val key = typed.key
+    val d = typed.decl
+    val stored = typed.stored
+    val ty = typed.ty
+    val writable = typed.writable
+    var init = typed.init
+
+    // An initializer that is constant data but not yet written as literals is written as them, so
+    // the object file carries it and nothing runs to fill it in.
+    //
+    // **A call to a `const` function is run here**, and its value laid down on every target: what
+    // would have trapped at startup is refused now (`const_eval.sysl`).
+    //
+    // **An address is constant data too, but not a literal**: `&files[1]` is a relocation the linker
+    // fills in, so it is laid down as it stands rather than folded, and it is the image succeeding --
+    // not the shape of what came back -- that says so.
+    //
+    // **A `val` over a slice literal is constant data too**: the elements are laid down as a static
+    // array and the view over it has no owner, as a string literal's has none. A `var` keeps building
+    // its view at startup, being storage the program reassigns.
+    var imaged = init.is_none() || (laid_down(init.unwrap()) && !(writable && builds_view(init.unwrap())))
+
+    if !imaged
+        cx.an.evaluation.last_stop = ""
+
+        // A whole initializer that trapped is refused already; its parts are not run again.
+        val image = const_val_run(cx, d.name, init.unwrap()) match
+            Ok(Some(whole)) -> Some(whole)
+            Ok(None) -> static_image(cx, d.name, init.unwrap())
+            Err(_) -> None
+
+        val boxes = image.is_some() && writable && builds_box(image.unwrap())
+
+        if image.is_some() && !(writable && builds_view(image.unwrap())) && !boxes
+            init = image
+            imaged = true
+        else if boxes
+            cx.an.evaluation.val_stops.put(key, s"'${d.name}' holds a reference, and a 'var' gives its " +
+                                           "share back when it is assigned, so its box is made when the " +
+                                           "program starts — a module 'val' holds one laid down")
+        else if cx.an.evaluation.last_stop != ""
+            // Why a `const` call in it was not run: what a target that cannot run the initializer
+            // either tells its reader (`emit_checks.sysl`).
+            cx.an.evaluation.val_stops.put(key, cx.an.evaluation.last_stop)
+        end if
+    end if
+
+    val computed = !imaged
+
+    // **Why it stayed code is said for every piece of storage that did**, not only one a `const` call
+    // stopped in: a freestanding artifact's refusal and a hosted build's warning (`emit_checks.sysl`'s
+    // `check_bare_metal_storage`) both read it from here, so the two are one decision told twice.
+    if computed && !cx.an.evaluation.val_stops.has(key) then
+        cx.an.evaluation.val_stops.put(key, fold_stop(cx, key, d, init.unwrap(), writable))
+
+    if d.thread_local then check_per_thread(cx, d.span, key, ty, computed, init)
+    if d.per_cpu then check_per_core(cx, d.span, key, ty, computed, init)
+    if d.main_thread then check_main_thread(cx, d.span, key)
+
+    if d.export.is_some() then check_exported_storage(cx, d, key, ty, computed)
+
+    TVal(key, stored, init, computed, writable, storage_align(cx, d), d.section, d.thread_local, d.per_cpu,
+         d.main_thread, exported_storage_symbol(d), storage_hidden(d), false)
+end laid_storage
 
 // The type a `val` or `var` written with none is stored at, which is its initializer's -- refused
 // where the initializer reaches the storage itself, so there is no type for it to take, and where it

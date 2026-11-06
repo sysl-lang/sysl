@@ -1198,6 +1198,15 @@ diagnostics after the last keystroke wait for one analysis, not one per keystrok
 answered in the order they came, and a hover or definition is answered after the latest text has
 been analysed.
 
+An analysis is published in two steps. What the program's own text says — a syntax error, a type
+error in a body, anything the declarations and the package's own bodies reveal — is published as
+soon as it is known. What only the whole program decides — the generic instances it uses, its module
+storage evaluated, and the whole-program checks such as whether a function keeps a pointer it was handed — follows,
+and when it does the published lists are exactly what `sysl build` would report. A whole-program
+diagnostic in a file whose text has not changed stays up in between, so it does not flicker while
+another file is edited. A change that arrives while an analysis is running stops it, and the newer
+text is analysed instead; nothing is ever published about a text the editor has since replaced.
+
 | request | answer |
 |---|---|
 | `textDocument/didOpen`, `didChange` (full text) | `textDocument/publishDiagnostics`: the file's syntax error, or every diagnostic the analysis reports, ranged in UTF-16 columns as the protocol counts them — for the file itself and for every other file the analysis found a mistake in, open or not; a file whose mistakes are gone gets an empty list |

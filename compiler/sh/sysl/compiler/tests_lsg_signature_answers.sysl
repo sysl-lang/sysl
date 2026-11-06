@@ -1,0 +1,433 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// **With no body in sight, the signature answers** (`reference/memory.md`, the keeps-analysis in
+// `keeps.sysl`): a call through a trait object, through a function pointer or to an `extern` borrows
+// every parameter for the call unless the declaration says `@keeps(p)`, and its answer is storage of
+// its own unless the declaration says `@answers(p)`. No table of the program's bodies is consulted;
+// each body reached that way is held to the declaration where it is written.
+//
+// The axes: the call (through `*Trait`, through `&Trait`, through a generic that sees the body,
+// through a function pointer, through a `&Fn`, to an `extern`); the declaration (unmarked, `@keeps`,
+// `@answers`); what is handed (a local's address, module storage, a closure); what the body does with
+// it (uses it, keeps it, lets out what it reads through it, answers it). Skipped: an async trait
+// method, whose task holds every parameter until it is awaited whatever the declaration says
+// (`tests_atk_async_task_keeps.sysl`); a call trait's own `@keeps` marks (`tests_ftk_*`).
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private lsg_outcome(text: string) -> (string, int)
+    val root = make_temp_dir("sysl-lsg").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (failure_text(why), -1)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> ("the program that was built could not be run", -1)
+        Ok(out) -> (out.text + out.err.unwrap_or(""), shell_status(out.status))
+end lsg_outcome
+
+private lsg_prints(text: string, want: string)
+    if xvr_no_library() then return
+
+    val out = lsg_outcome(text)
+
+    assert_eq(out.0, want)
+    assert_eq(out.1, 0)
+end lsg_prints
+
+private lsg_refused(text: string, part: string)
+    if xvr_no_library() then return
+
+    val out = lsg_outcome(text)
+
+    assert_eq(out.1, -1, out.0)
+    assert(out.0.index_of(part).is_some(), out.0)
+end lsg_refused
+
+// A trait whose method is handed a pointer, with `mark` written above its declaration, and an
+// implementation that keeps it in module storage when `keeps`, and only reads it otherwise.
+private lsg_sink(mark: string, keeps: bool) -> string
+    val body = if keeps then "held = p" else "self.sum += *p"
+
+    raw"""
+        static var spare = 7
+        static var held: *int = &spare
+
+        trait Sink
+        """ + (if mark == "" then "" else s"    $mark\n") + raw"""
+            put(*self, p: *int)
+
+        struct Tally
+            sum: int
+
+        impl Sink for Tally
+            put(*self, p: *int)
+        """ + s"        $body\n\n"
+end lsg_sink
+
+// -- a trait method, with and without '@keeps' ----------------------------------------------------
+
+@test("an unmarked trait method borrows: a local's address goes through '*Trait', '&Trait' and a generic")
+lsg_unmarked_borrows()
+    lsg_prints(lsg_sink("", false) + raw"""
+        through_pointer(s: *Sink)
+            var n = 2
+            s.put(&n)
+
+        through_object(s: &Sink)
+            var n = 3
+            s.put(&n)
+
+        through_generic[S: Sink](s: *S)
+            var n = 4
+            s.put(&n)
+
+        var t = Tally(0)
+
+        through_pointer(&t)
+        through_generic(&t)
+        through_object(Tally(0))
+        print(t.sum)
+        """, "6\n")
+
+@test("an unmarked trait method's implementation that keeps the pointer is refused where it is written")
+lsg_unmarked_keeper_refused()
+    lsg_refused(lsg_sink("", true) + raw"""
+        var t = Tally(0)
+        var s: *Sink = &t
+
+        s.put(&spare)
+        """, "'put' keeps its parameter 'p' (it is stored in 'held'), but a method of 'Sink' borrows its " +
+             "parameters for the call")
+
+@test("one the trait declares '@keeps(p)' may keep it, and a call through the object handing a local's address is refused")
+lsg_marked_keeps()
+    lsg_prints(lsg_sink("@keeps(p)", true) + raw"""
+        var t = Tally(0)
+        var s: *Sink = &t
+
+        s.put(&spare)
+        print(*held)
+        """, "7\n")
+    lsg_refused(lsg_sink("@keeps(p)", true) + raw"""
+        run(s: *Sink)
+            var n = 1
+            s.put(&n)
+
+        var t = Tally(0)
+
+        run(&t)
+        """, "its trait's 'put' declares '@keeps(p)'")
+    lsg_refused(lsg_sink("@keeps(p)", true) + raw"""
+        run(s: &Sink)
+            var n = 1
+            s.put(&n)
+
+        run(Tally(0))
+        """, "its trait's 'put' declares '@keeps(p)'")
+
+@test("through a generic the marked method's body is in sight, and is held to what it keeps")
+lsg_marked_through_generic()
+    lsg_refused(lsg_sink("@keeps(p)", true) + raw"""
+        run[S: Sink](s: *S)
+            var n = 1
+            s.put(&n)
+
+        var t = Tally(0)
+
+        run(&t)
+        """, "'put' keeps its parameter 'p' (it is stored in 'held'), and '&n' is the address of a local of 'run'")
+    lsg_prints(lsg_sink("@keeps(p)", false) + raw"""
+        run[S: Sink](s: *S)
+            var n = 5
+            s.put(&n)
+
+        var t = Tally(0)
+
+        run(&t)
+        print(t.sum)
+        """, "5\n")
+
+// -- an object kept, what is read let out, an answer ------------------------------------------------
+
+private lsg_board(mark: string) -> string = raw"""
+    trait Registers
+    """ + (if mark == "" then "" else s"    $mark\n") + raw"""
+        register(*self, f: &Fn() -> int)
+
+    struct Board
+        f: Option[&Fn() -> int]
+
+    impl Registers for Board
+        register(*self, f: &Fn() -> int)
+            self.f = Some(f)
+
+    """
+
+@test("an implementation reached through a table that keeps an object it is handed is refused, naming '@keeps'")
+lsg_object_kept_refused()
+    lsg_refused(lsg_board("") + raw"""
+        var b = Board(None)
+        var r: *Registers = &b
+
+        r.register(() -> 1)
+        """, "'register' keeps its parameter 'f' (it is stored in 'self.f'), but a method of 'Registers' " +
+             "borrows its parameters for the call — a call through an object sees no body, so it may hand " +
+             "this the address of the caller's own storage. Copy what this needs into storage of its own, or " +
+             "let every implementation keep it by writing '@keeps(f)' above the declaration of 'register' in " +
+             "'Registers'")
+
+@test("declared '@keeps(f)', a closure capturing a scalar is kept, and one capturing a local's address is refused")
+lsg_object_kept_declared()
+    lsg_prints(lsg_board("@keeps(f)") + raw"""
+        main()
+            var b = Board(None)
+            val r: *Registers = &b
+            val k = 2
+
+            r.register(() -> k)
+
+            val g = b.f.unwrap()
+
+            print(g())
+        """, "2\n")
+    lsg_refused(lsg_board("@keeps(f)") + raw"""
+        main()
+            var b = Board(None)
+            val r: *Registers = &b
+            var n = 7
+            val p = &n
+
+            r.register(() -> *p)
+        """, "its trait's 'register' declares '@keeps(f)'")
+
+@test("an implementation reached through a table that lets out what it reads through a pointer is refused")
+lsg_through_refused()
+    lsg_refused(raw"""
+        struct H
+            p: *int
+
+        var kept: *int = null
+
+        trait Keeper
+            take(self, h: *H)
+
+        struct K
+            n: int
+
+        impl Keeper for K
+            take(self, h: *H) = kept = h.p
+
+        main()
+            var x = 1
+            var h = H(&x)
+            val k: &Keeper = K(1)
+            k.take(&h)
+        """, "'take' lets what it reads through its parameter 'h' outlive the call (it is stored in 'kept'), " +
+             "but a method of 'Keeper' borrows its parameters for the call")
+
+private lsg_picker(mark: string) -> string = raw"""
+    trait Picker
+    """ + (if mark == "" then "" else s"    $mark\n") + raw"""
+        pick(self, p: *int) -> *int
+
+    struct First
+        n: int
+
+    impl Picker for First
+        pick(self, p: *int) -> *int = p
+
+    """
+
+@test("an implementation reached through a table answering with its parameter is refused unless the trait says '@answers'")
+lsg_answers_refused()
+    lsg_refused(lsg_picker("") + raw"""
+        static var spare = 3
+
+        val o: &Picker = First(0)
+
+        print(*o.pick(&spare))
+        """, "'pick' answers with what it is handed as 'p', but a method of 'Picker' answers storage of its own " +
+             "unless its declaration says '@answers(p)'")
+
+@test("'@answers(p)' threads the borrow through the call: module storage answered is fine, a local's address returned is refused")
+lsg_answers_threaded()
+    lsg_prints(lsg_picker("@answers(p)") + raw"""
+        static var spare = 3
+
+        val o: &Picker = First(0)
+
+        print(*o.pick(&spare))
+        """, "3\n")
+    lsg_refused(lsg_picker("@answers(p)") + raw"""
+        leak(o: &Picker) -> *int
+            var n = 4
+            o.pick(&n)
+
+        print(*leak(First(0)))
+        """, "the address of a local of 'leak'")
+
+// -- a function pointer, a callable parameter, an extern ---------------------------------------------
+
+@test("a function whose address is taken borrows: one that keeps a parameter is refused where it is written")
+lsg_function_pointer_refused()
+    lsg_refused(raw"""
+        var held: *int = null
+
+        keep(p: *int)
+            held = p
+
+        main()
+            val f: *extern(*int) -> unit = &keep
+            var n = 1
+            f(&n)
+        """, "'keep' keeps its parameter 'p' (it is stored in 'held'), and its address is taken — a call " +
+             "through a function pointer sees no body")
+
+@test("a callable parameter marked '@keeps' may keep what it is handed, and a call handing it a local's address is refused")
+lsg_callable_parameter_keeps()
+    lsg_prints(raw"""
+        static var spare = 9
+        static var held: *int = &spare
+
+        run(f: &Fn(@keeps *int) -> unit)
+            f(&spare)
+
+        run(p -> held = p)
+        print(*held)
+        """, "9\n")
+    lsg_refused(raw"""
+        static var held: *int = null
+
+        run(f: &Fn(@keeps *int) -> unit)
+            var n = 1
+            f(&n)
+
+        run(p -> held = p)
+        """, "its type says '@keeps'")
+
+// **An `extern` borrows unless it says `@keeps`, and the declaration is trusted**: the compiler cannot
+// see C's body, so a C function that holds a pointer past the call without `@keeps(p)` on its
+// declaration is a wrong declaration -- `reference/attributes.md § @keeps` promises nothing more.
+// Here the "C" side is a sysl function exported under the symbol, so the program builds: the borrow
+// is assumed, and only the declaration could have said otherwise.
+@test("an extern without '@keeps' is taken to borrow, even where its definition stores the pointer")
+lsg_extern_borrow_assumed()
+    lsg_prints(raw"""
+        var spare = 5
+        var held: *int = &spare
+
+        @export("sysl_lsg_store")
+        store(p: *int)
+            held = p
+
+        extern "sysl_lsg_store" c_store(p: *int)
+
+        main()
+            var n = 1
+            c_store(&n)
+            print("built")
+        """, "built\n")
+    lsg_refused(raw"""
+        @keeps(p)
+        extern "sysl_lsg_store" c_store(p: *int)
+
+        @export("sysl_lsg_store")
+        store(p: *int) = ()
+
+        main()
+            var n = 1
+            c_store(&n)
+        """, "'c_store' keeps its parameter 'p' (its declaration says '@keeps(p)')")
+
+// A struct holding the address of a local, handed to C, which borrows what it reads through it too.
+@test("C borrows what it reads through a pointer, so a closure's holder handed to C stays in the frame")
+lsg_extern_reads_borrowed()
+    lsg_prints(raw"""
+        struct A
+            z: u8
+            f: &Fn() -> int
+
+        extern "strlen" c_len(a: *A) -> usize
+
+        main()
+            val k = 3
+            var a = A(0, () -> k)
+            print(c_len(&a), a.f())
+        """, "0 3\n")
+
+// -- step's waker --------------------------------------------------------------------------------------
+
+@test("'step' keeps its waker: a waker holding a local's address is refused")
+lsg_step_waker()
+    lsg_refused(raw"""
+        async job() -> int = 1
+
+        main()
+            var count = 0
+            val p = &count
+            val t = job()
+
+            step(t, () -> *p += 1)
+        """, "'step' keeps its waker for the task's parks")
+
+// -- the error paths -----------------------------------------------------------------------------------
+
+@test("'@keeps' and '@answers' above a trait method name its own parameters, each once")
+lsg_trait_mark_names()
+    lsg_refused("trait T\n    @keeps(q)\n    put(*self, p: *int)\n\nprint(1)\n",
+                "'@keeps' names 'q', which is not a parameter of 'put' — its parameters are 'p'")
+    lsg_refused("trait T\n    @keeps(p, p)\n    put(*self, p: *int)\n\nprint(1)\n",
+                "'@keeps' names 'p' twice — the second says nothing the first does not")
+    lsg_refused("trait T\n    @answers(q)\n    get(*self, p: *int) -> *int\n\nprint(1)\n",
+                "'@answers' names 'q', which is not a parameter of 'get' — its parameters are 'p'")
+    lsg_refused("trait T\n    @answers(self)\n    get(*self) -> *int\n\nprint(1)\n",
+                "'@answers' names parameters, and 'self' is the receiver, which it does not name")
+    lsg_refused("trait T\n    @keeps(self, self)\n    put(*self)\n\nprint(1)\n",
+                "'@keeps' names 'self' twice — the second says nothing the first does not")
+    lsg_refused("@keeps(self)\nextern put(p: *int)\n\nprint(1)\n",
+                "'@keeps' names 'self', and 'put' is an 'extern', which takes no receiver")
+    lsg_refused("trait T\n    @keeps(q)\n    put(*self)\n\nprint(1)\n",
+                "'@keeps' names 'q', which is not a parameter of 'put' — it takes none besides its receiver")
+
+@test("'@answers' above a trait method answering nothing, and either above one with no receiver, are refused")
+lsg_trait_mark_misplaced()
+    lsg_refused("trait T\n    @answers(p)\n    put(*self, p: *int)\n\nprint(1)\n",
+                "'@answers' says what the answer of 'put' may be made of, and 'put' answers nothing")
+    lsg_refused("trait T\n    @keeps(p)\n    make(p: *int) -> int\n\nprint(1)\n",
+                "'@keeps' says what a call of 'make' through an object may find held or answered, and 'make' " +
+                "takes no receiver, so no object can call it")
+
+@test("'@keeps' above an implementation's method is refused: the trait's declaration says it")
+lsg_impl_mark_refused()
+    lsg_refused(raw"""
+        trait T
+            put(*self, p: *int)
+
+        struct S
+            n: int
+
+        impl T for S
+            @keeps(p)
+            put(*self, p: *int) = ()
+
+        print(1)
+        """, "'@keeps(...)' names the parameters a C function holds on to past the call, so it marks an " +
+             "'extern' — a function's or a method's body is right here, and the compiler reads what it keeps " +
+             "out of it. A trait's own method declaration may carry it too")

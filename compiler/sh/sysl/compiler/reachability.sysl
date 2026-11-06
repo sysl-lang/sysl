@@ -66,8 +66,21 @@ prune(p: TProgram, own: Buf[string]) -> TProgram
 
         if whole then vtables.push(t)
 
-    with_declarations(p, externs, funcs) with { vtables = vtables }
+    with_declarations(p, externs, funcs) with { vtables = vtables, vals = storage_kept(p, live) }
 end prune
+
+// The module storage a walk read, in the order the program declared it. **A `val` nothing reached
+// reads goes with its initializer**, which is what keeps a computed value somewhere in a library from
+// costing every program that imports the module a startup fill and its bytes -- and keeps it from
+// shutting the module out of a bare machine, where nothing runs that fill.
+private storage_kept(p: TProgram, live: &Live) -> Buf[TVal]
+    var vals: Buf[TVal] = buf()
+
+    for i in 0..<p.vals.len()
+        if live.val_set.has(p.vals[i].symbol) then vals.push(p.vals[i])
+
+    vals
+end storage_kept
 
 // The whole walk, including the one root kind that cannot be decided before it has run.
 //
@@ -83,12 +96,13 @@ private walk_program(p: TProgram, own: Buf[string]) -> &Live
     val reached = reached_modules(p, own)
 
     var extra: Buf[TFunc] = buf()
+    var inits: Set[string] = set()
     var live = no_reached()
     var more = true
     val scan = type_scan()
 
     while more
-        live = reached_from(p, index, roots_of(p, entries, extra, reached))
+        live = reached_from(p, index, roots_of(p, entries, extra, reached, &inits))
 
         for entrie in entries
             add_call(live, entrie.name)
@@ -99,9 +113,22 @@ private walk_program(p: TProgram, own: Buf[string]) -> &Live
         more = destructors_reached(p, index, live, scan, &extra)
 
         if suppliers_reached(p, live, exports, &extra) then more = true
+        if storage_reached(live, &inits) then more = true
 
     live
 end walk_program
+
+// Adds every module `val` the walk read to `inits`, the storage whose initializers the next round
+// walks as roots; true where one was new. **An initializer is reached through its storage**: what it
+// calls and reads is kept where something reached reads the `val`, and dropped with it otherwise.
+private storage_reached(live: &Live, inits: *Set[string]) -> bool
+    var more = false
+
+    for v in live.vals
+        if inits.add(v) then more = true
+
+    more
+end storage_reached
 
 // Every function the program's roots arrive at: what `prune` keeps, and in a build that runs tests,
 // what `tests_only` keeps as well -- each `@test` and hook is a root there. The question a check asks
@@ -333,8 +360,13 @@ private holds_func(fs: Buf[TFunc], name: string) -> bool
     false
 end holds_func
 
-// The trees a walk starts from: the program's own statements, the storage it lays down, the tables
-// it built, the entry point, and every function nothing in the program names.
+// The trees a walk starts from: the program's own statements, the initializers of the storage an
+// earlier round read (`inits`), the tables it built, the entry point, and every function nothing in
+// the program names.
+//
+// **Storage something outside the program can name is a root of its own**, as a function is: an
+// `@export`ed `val` is read by whatever links the program, and a `@section` one is found by a linker
+// script, so neither waits for a reader here.
 //
 // **A table counts only where the program reaches the module its slots were written in** (`reached`,
 // from `reached_modules`; nothing means every module counts). Every closure a dependency's module
@@ -345,13 +377,20 @@ end holds_func
 // standard-library slot never makes a table a root, and the walk keeps the table instead once a
 // reached body erases a value into it.
 private roots_of(p: TProgram, entries: Buf[TFunc], extra: Buf[TFunc],
-                 reached: Option[Set[string]]) -> &Live
+                 reached: Option[Set[string]], inits: *Set[string]) -> &Live
     val out = no_reached()
 
     walk_stmts(p.main, expr_walk(false, e -> take_node(out, e)))
 
     for i in 0..<p.vals.len()
-        p.vals[i].init match
+        val v = p.vals[i]
+        val seen_outside = v.exported.is_some() || v.section.is_some()
+
+        if seen_outside then add_val(out, v.symbol)
+
+        if !seen_outside && !inits.has(v.symbol) then continue
+
+        v.init match
             Some(x) -> walk_texpr(x, expr_walk(false, e -> take_node(out, e)))
             None -> ()
 
@@ -897,11 +936,12 @@ end add_named
 // rounds reach it.
 private struct TypeScan
     funcs: Set[string]
+    vals: Set[string]
     keys: Set[string]
     fixed: bool
 end TypeScan
 
-private type_scan() -> &TypeScan = TypeScan(set(), set(), false)
+private type_scan() -> &TypeScan = TypeScan(set(), set(), set(), false)
 
 // Adds to `extra` the destructor of every type the walk has reached whose destructor it has not,
 // answering whether there was one -- which is another round, since a destructor's body reaches
@@ -914,16 +954,19 @@ private destructors_reached(p: TProgram, index: FuncIndex, live: &Live, scan: &T
         scan.fixed = true
         walk_stmts(p.main, types_walk(scan))
 
-        for v in p.vals
-            take_type(scan, v.ty)
-
-            v.init match
-                Some(x) -> walk_texpr(x, types_walk(scan))
-                None -> ()
-
         for t in p.vtables
             take_type(scan, t.for_type)
-    end if
+
+    // Storage counts where the walk read it, as a function counts where the walk reached it: a `val`
+    // nothing reads is dropped, and what its type holds is no reason to keep a destructor.
+    for v in p.vals
+        if !live.val_set.has(v.symbol) || !scan.vals.add(v.symbol) then continue
+
+        take_type(scan, v.ty)
+
+        v.init match
+            Some(x) -> walk_texpr(x, types_walk(scan))
+            None -> ()
 
     val none = p.funcs.len()
 
@@ -1164,11 +1207,12 @@ tests_only(p: TProgram, own: Buf[string]) -> TProgram
     val exports = exports_of(kept)
 
     var extra: Buf[TFunc] = buf()
+    var inits: Set[string] = set()
     var live = no_reached()
     var more = true
 
     while more
-        val root = roots_of(kept, entries, extra, None)
+        val root = roots_of(kept, entries, extra, None, &inits)
 
         for item in kept.tests
             add_call(root, item.func)
@@ -1192,6 +1236,7 @@ tests_only(p: TProgram, own: Buf[string]) -> TProgram
         more = destructors_reached(kept, index, live, scan, &extra)
 
         if suppliers_reached(kept, live, exports, &extra) then more = true
+        if storage_reached(live, &inits) then more = true
 
     var externs: Buf[TExtern] = buf()
 
@@ -1203,12 +1248,12 @@ tests_only(p: TProgram, own: Buf[string]) -> TProgram
     for i in 0..<kept.funcs.len()
         if live.call_set.has(kept.funcs[i].name) then funcs.push(kept.funcs[i])
 
-    with_declarations(kept, externs, funcs)
+    with_declarations(kept, externs, funcs) with { vals = storage_kept(kept, live) }
 end tests_only
 
-// The same program with nothing left of what it does when it is run. The module-level `val`s stay:
-// they are storage the program reads rather than work it performs, and a test that reads one would
-// otherwise find it empty.
+// The same program with nothing left of what it does when it is run. The module-level `val`s stay
+// here: they are storage the program reads rather than work it performs, and the walk that follows
+// keeps each one a test, a hook or anything they call reads.
 private without_program_entry(p: TProgram) -> TProgram =
     TProgram(p.structs, p.enums, p.vtables, p.externs, p.vals, p.funcs, buf(), None, p.precompiled,
              p.entry_point, p.c_artifact, p.no_alloc_modules, p.no_alloc_test_modules,

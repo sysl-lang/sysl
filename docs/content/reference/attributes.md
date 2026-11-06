@@ -12,7 +12,7 @@ has a name and a spelling of its own:
 | `T::Attr` | an **attribute** — a question a type's own name answers | the analyzer, at the use |
 | `@test`, `@tailrec`, `@pure`, `@ghost`, `@export`, `@reads`, `@writes`, `@crossing`, `@joined`, `@domain`, `@noinline`, `@inline`, `@cold`, `@disjoint`, `@no_alloc`, `@no_block`, `@blocks`, `@abandons`, `@track_caller` | an **annotation** — a fact about the free function under it | the grammar |
 | `@setup`, `@teardown`, `@setup_all`, `@teardown_all` | an **annotation** — a hook `sysl test` runs around a module's tests | the grammar |
-| `@keeps(...)` | an **annotation** on an `extern` — the parameters the C function holds on to past the call; see [`@keeps`](/reference/ffi/#keeps-a-c-function-that-holds-on-to-a-pointer) | the grammar |
+| `@keeps(...)` | an **annotation** on an `extern` — the parameters the C function holds on to past the call; see [`@keeps`](/reference/ffi/#keeps-a-c-function-that-holds-on-to-a-pointer). On a trait's own method declaration, with `@answers(...)`, what a call through an object is told; see [below](#keeps-and-answers-on-a-trait-method) | the grammar |
 | `@returns_twice` | an **annotation** on an `extern` — the C function can return a second time, as `setjmp` does; see [`@returns_twice`](/reference/ffi/#returns-twice-a-c-function-that-returns-a-second-time) | the grammar |
 | `@needs(...)` | an **annotation** — the capabilities reaching the declaration under it requires; with `@abandons` and `@keeps`, one of the three an `extern` takes | the grammar |
 | `@packed`, `@align(n)`, `@section("...")` | an **annotation** — where the declaration under it is laid out, or where it lands | the grammar |
@@ -518,6 +518,202 @@ f(p: *int) = ()
 
 ```error
 '@joined' names 'p', which '@crossing' does not
+```
+
+## `@keeps` and `@answers` on a trait method
+
+**A call through a trait object sees no body**: which implementation it reaches is decided when the
+program runs. So the trait's own declaration of the method is the whole answer to what the call
+keeps, and it says what an `extern`'s does — every parameter is borrowed for the call, and nothing
+read through one is held past it, unless the declaration says `@keeps(p)`; the answer is storage of the
+implementation's own unless it says `@answers(p)`. Every implementation is held to the declaration
+where it is written, so an implementation that keeps more than its trait says is refused, and told
+the mark that would let it:
+
+```sysl
+trait Registry
+    add(*self, f: &Fn() -> int)
+
+struct Board
+    f: Option[&Fn() -> int]
+
+impl Registry for Board
+    add(*self, f: &Fn() -> int)
+        self.f = Some(f)
+
+var b = Board(None)
+val r: *Registry = &b
+
+r.add(() -> 1)
+```
+
+```error
+'add' keeps its parameter 'f' (it is stored in 'self.f'), but a method of 'Registry' borrows its parameters for the call
+```
+
+With the mark, every implementation may keep the parameter, and every call through an object hands
+it only what may be kept — a closure that captures a number, here:
+
+```sysl
+trait Registry
+    @keeps(f)
+    add(*self, f: &Fn() -> int)
+
+struct Board
+    f: Option[&Fn() -> int]
+
+impl Registry for Board
+    add(*self, f: &Fn() -> int)
+        self.f = Some(f)
+
+main()
+    var b = Board(None)
+    val r: *Registry = &b
+    val k = 41
+
+    r.add(() -> k + 1)
+
+    val g = b.f.unwrap()
+
+    print(g())
+```
+
+```output
+42
+```
+
+and one capturing the address of a local is refused at the call:
+
+```sysl
+trait Registry
+    @keeps(f)
+    add(*self, f: &Fn() -> int)
+
+struct Board
+    f: Option[&Fn() -> int]
+
+impl Registry for Board
+    add(*self, f: &Fn() -> int)
+        self.f = Some(f)
+
+main()
+    var b = Board(None)
+    val r: *Registry = &b
+    var n = 7
+    val p = &n
+
+    r.add(() -> *p)
+```
+
+```error
+its trait's 'add' declares '@keeps(f)'
+```
+
+`@answers(p)` lets the answer be made of what `p` was handed, and a caller then holds the answer to
+how long `p` lives, as it does a sysl function's:
+
+```sysl
+trait Picker
+    @answers(p)
+    pick(self, p: *int) -> *int
+
+struct First
+    n: int
+
+impl Picker for First
+    pick(self, p: *int) -> *int = p
+
+leak(o: &Picker) -> *int
+    var n = 4
+    o.pick(&n)
+```
+
+```error
+the address of a local of 'leak'
+```
+
+**An unmarked answer may be made of the receiver only**, as Rust elides a method's lifetime: a builder
+that hands back an object holding what it was handed says so once, in the trait, and every
+implementation and every call is held to it.
+
+```sysl
+trait View
+    @answers(f)
+    on_tap(&self, f: &Fn() -> unit) -> &View
+```
+
+Without the mark, an implementation answering `f` is refused where it is written:
+
+```sysl
+trait Picker
+    pick(self, p: *int) -> *int
+
+struct First
+    n: int
+
+impl Picker for First
+    pick(self, p: *int) -> *int = p
+
+main()
+    val o: &Picker = First(0)
+    var n = 1
+
+    print(*o.pick(&n))
+```
+
+```error
+'pick' answers with what it is handed as 'p', but a method of 'Picker' answers storage of its own unless its declaration says '@answers(p)'
+```
+
+**`@keeps(self)` lets an implementation hold the object the call went through** past the call — a
+view registering itself, say. The object may have been made in the caller's frame, so without the
+mark an implementation that keeps `self` is refused where it is written, and with it every call
+through an object hands over an object that may be kept:
+
+```sysl
+trait Widget
+    @keeps(self)
+    register(&self) -> int
+
+struct Label
+    f: &Fn() -> int
+
+impl Widget for Label
+    register(&self) -> int
+        shown = Some(self)
+        self.f()
+
+var shown: Option[&Label] = None
+
+setup(k: int) -> int
+    val w: &Widget = Label(() -> k + 1)
+
+    w.register()
+
+main()
+    print(setup(1))
+    print(shown.unwrap().f())
+
+    shown = None
+```
+
+```output
+2
+2
+```
+
+Both name the method's own parameters, each once — `@keeps` the receiver too, as `self` — and only a
+method with a receiver takes them, since nothing else is called through an object. An
+implementation's method never carries them: its trait says them for every implementation at once.
+
+```sysl
+trait Sink
+    @keeps(q)
+    put(*self, p: *int)
+```
+
+```error
+'@keeps' names 'q', which is not a parameter of 'put' — its parameters are 'p'
 ```
 
 ## `::` — what a type's own name answers

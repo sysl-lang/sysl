@@ -1,0 +1,349 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.source_of
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// **Module storage nothing reached reads is dropped, and its initializer with it**
+// (`reachability.sysl`'s `storage_reached`). A `val` is reached where a reached body, the program's
+// own statements or a reached `val`'s initializer reads it; only then is its initializer a root, so
+// what the initializer calls and reads is kept with it and dropped without it. Storage something
+// outside the program can name -- an `@export`, a `@section` -- is a root of its own. A library
+// artifact prunes nothing: every public declaration is a possible entry, and the program that links
+// it fills only the storage it reaches.
+//
+// The axes: how the storage is read (a body, another `val`, a closure, a test, a generic body
+// instantiated or not, nothing), what kind it is (computed, constant data, `var`, exported,
+// sectioned), and what is built (a program, a test build, a C archive, a library artifact). A
+// thread-local or per-core `val` is not a cell of its own: its initializer must be constant, and the
+// walk does not ask what kind of storage it reached.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private var pmv_library_cache: Buf[Program] = buf()
+private var pmv_library_read: bool = false
+
+private pmv_library() -> Buf[Program]
+    if pmv_library_read then return pmv_library_cache
+
+    pmv_library_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> pmv_library_cache = units
+
+    pmv_library_cache
+end pmv_library
+
+private pmv_skip() -> bool
+    if pmv_library().is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return true
+
+    false
+end pmv_skip
+
+private pmv_first_of(said: Buf[Placed]) -> string
+    for item in said
+        if !item.src.name.starts_with("library/") then return item.diag.message
+
+    ""
+end pmv_first_of
+
+// How one compilation is lowered: as a program, as the build that runs its tests, or as a C archive.
+private enum PmvBuild
+    Program
+    Tests
+    Archive
+
+// The LLVM text `demo`'s source lowers to, or the first thing the compilation said instead.
+private pmv_ir(text: string, kind: PmvBuild) -> string
+    var units: Buf[Program] = buf()
+
+    for item in pmv_library()
+        units.push(item)
+
+    val parsed = parse(source_of("demo.sysl", text), host_target())
+
+    if !parsed.ok() then return parsed.report.at(0).message
+
+    units.push(parsed.program)
+
+    val done = analyze_produced(units, host_target(), buf(), kind != PmvBuild.Archive)
+    val early = pmv_first_of(done.reported)
+
+    if early != "" then return early
+
+    val read = program_of(done, done.main_module)
+    val whole = if kind == PmvBuild.Archive then read with { entry_point = false, c_artifact = true } else read
+    var own: Buf[string] = buf()
+
+    own.push("")
+    own.push("demo")
+
+    val pr = if kind == PmvBuild.Tests then post_analysis_checks_of_tests(done.an, whole, own)
+    else post_analysis_checks(done.an, whole, own)
+
+    val late = pmv_first_of(done.an.diagnostics())
+
+    if late != "" then return late
+
+    val kept = if kind == PmvBuild.Tests then tests_only(whole, own) else prune(strip_tests(whole), own)
+
+    ir_print_module(codegen_with_gaps(kept, host_target(), pr).0)
+end pmv_ir
+
+// Whether the text lays down (or declares) storage whose symbol holds `name`.
+private pmv_stores(ir: string, name: string) -> bool
+    for line in lines_of(ir)
+        if !line.starts_with("@") then continue
+
+        line.index_of(" = ") match
+            Some(at) -> if line[0..<at].contains(name) then return true
+            None -> ()
+
+    false
+end pmv_stores
+
+// Whether the text defines a function whose symbol holds `name`.
+private pmv_defines(ir: string, name: string) -> bool
+    for line in lines_of(ir)
+        if !line.starts_with("define") then continue
+
+        line.index_of("(") match
+            Some(at) -> if line[0..<at].contains(name) then return true
+            None -> ()
+
+    false
+end pmv_defines
+
+// A computed `val`: its initializer calls a function reading a `var`, so it cannot fold and is filled
+// at startup -- the storage whose fill and bytes every program used to pay for.
+private val pmv_storage: string =
+    "module demo\n\nprivate var pmv_seed: int = 3\n\npmv_twice() -> int = pmv_seed * 2\n\n" +
+    "val pmv_doubled: int = pmv_twice()\n\n"
+
+private val pmv_entry: string = "@export(\"main\")\nmain_entry() -> int"
+
+// -- what a program keeps -------------------------------------------------------------------------
+
+@test("a computed val nothing reads is not in the program, nor what its initializer calls and reads")
+pmv_unread_computed_val_dropped()
+    if pmv_skip() then return
+
+    val out = pmv_ir(pmv_storage + pmv_entry + " = 0\n", PmvBuild.Program)
+
+    assert(pmv_defines(out, "main_entry"), out)
+    assert(!pmv_stores(out, "pmv_doubled"), out)
+    assert(!pmv_defines(out, "pmv_twice"), out)
+    assert(!pmv_stores(out, "pmv_seed"), s"the var only the dropped initializer read goes too: $out")
+
+@test("and one a reached body reads is kept with everything its initializer reaches, var included")
+pmv_read_computed_val_kept()
+    if pmv_skip() then return
+
+    val out = pmv_ir(pmv_storage + pmv_entry + " = pmv_doubled\n", PmvBuild.Program)
+
+    assert(pmv_stores(out, "pmv_doubled"), out)
+    assert(pmv_defines(out, "pmv_twice"), out)
+    assert(pmv_stores(out, "pmv_seed"), out)
+
+@test("a val read only through another val's initializer is kept, while its unread sibling is not")
+pmv_read_through_another_val()
+    if pmv_skip() then return
+
+    val out = pmv_ir(pmv_storage + "val pmv_plus: int = pmv_doubled + 1\n\n" +
+                     "val pmv_unused: int = pmv_twice() + 9\n\n" + pmv_entry + " = pmv_plus\n",
+                     PmvBuild.Program)
+
+    assert(pmv_stores(out, "pmv_plus"), out)
+    assert(pmv_stores(out, "pmv_doubled"), out)
+    assert(pmv_defines(out, "pmv_twice"), out)
+    assert(!pmv_stores(out, "pmv_unused"), out)
+
+@test("of a binding naming several parts of one call, a part nothing reads goes and the call stays")
+pmv_one_part_of_several()
+    if pmv_skip() then return
+
+    val out = pmv_ir(pmv_storage + "pmv_pair() -> (int, int) = (pmv_seed, 2)\n\nval pmv_q, pmv_r = pmv_pair()\n\n" +
+                     pmv_entry + " = pmv_q\n", PmvBuild.Program)
+
+    assert(pmv_stores(out, "pmv_q"), out)
+    assert(!pmv_stores(out, "pmv_r"), out)
+    assert(pmv_defines(out, "pmv_pair"), out)
+
+@test("a val read only inside a closure is kept")
+pmv_read_in_a_closure()
+    if pmv_skip() then return
+
+    val out = pmv_ir(pmv_storage + pmv_entry + "\n    val f = () -> pmv_doubled + 1\n\n    f()\n",
+                     PmvBuild.Program)
+
+    assert(pmv_stores(out, "pmv_doubled"), out)
+    assert(pmv_defines(out, "pmv_twice"), out)
+
+@test("a val read only by a generic function is dropped while nothing instantiates it")
+pmv_generic_not_instantiated()
+    if pmv_skip() then return
+
+    val out = pmv_ir(pmv_storage + "pmv_read[T](x: T) -> int = pmv_doubled\n\n" + pmv_entry + " = 0\n",
+                     PmvBuild.Program)
+
+    assert(!pmv_stores(out, "pmv_doubled"), out)
+
+@test("and kept once a reached body instantiates it")
+pmv_generic_instantiated()
+    if pmv_skip() then return
+
+    val out = pmv_ir(pmv_storage + "pmv_read[T](x: T) -> int = pmv_doubled\n\n" + pmv_entry +
+                     " = pmv_read(true)\n", PmvBuild.Program)
+
+    assert(pmv_stores(out, "pmv_doubled"), out)
+
+@test("constant storage nothing reads is not laid down either")
+pmv_unread_constant_dropped()
+    if pmv_skip() then return
+
+    val out = pmv_ir("module demo\n\nval pmv_table: [4]u32 = [1, 2, 3, 4]\n\nval pmv_kept: [2]u32 = [5, 6]\n\n" +
+                     pmv_entry + " = int(pmv_kept[1])\n", PmvBuild.Program)
+
+    assert(!pmv_stores(out, "pmv_table"), out)
+    assert(pmv_stores(out, "pmv_kept"), out)
+
+@test("a var nothing reads or writes is dropped, and one only written is kept")
+pmv_vars()
+    if pmv_skip() then return
+
+    val out = pmv_ir("module demo\n\nvar pmv_idle: int = 1\n\nvar pmv_sink: int = 0\n\n" + pmv_entry +
+                     "\n    pmv_sink = 4\n    0\n", PmvBuild.Program)
+
+    assert(!pmv_stores(out, "pmv_idle"), out)
+    assert(pmv_stores(out, "pmv_sink"), out)
+
+@test("an exported val and a sectioned one are kept although nothing in the program reads them")
+pmv_seen_outside_kept()
+    if pmv_skip() then return
+
+    val out = pmv_ir("module demo\n\n@export(\"pmv_answer\")\nval answer: int = 42\n\n" +
+                     "@section(\".data.pmv\")\nval pmv_tagged: u32 = 7\n\n" + pmv_entry + " = 0\n",
+                     PmvBuild.Program)
+
+    assert(pmv_stores(out, "pmv_answer"), out)
+    assert(pmv_stores(out, "pmv_tagged"), out)
+
+// -- the other builds -----------------------------------------------------------------------------
+
+@test("a test build keeps the storage a test reads, and drops what nothing reads")
+pmv_test_build()
+    if pmv_skip() then return
+
+    val out = pmv_ir(pmv_storage + "val pmv_unused: int = pmv_twice() + 9\n\n" +
+                     "@test(\"reads it\")\npmv_reads() = assert(pmv_doubled == 6, \"six\")\n", PmvBuild.Tests)
+
+    assert(pmv_defines(out, "pmv_reads"), out)
+    assert(pmv_stores(out, "pmv_doubled"), out)
+    assert(pmv_defines(out, "pmv_twice"), out)
+    assert(!pmv_stores(out, "pmv_unused"), out)
+
+@test("a C archive keeps the storage its exports reach, and nothing else")
+pmv_archive()
+    if pmv_skip() then return
+
+    val out = pmv_ir(pmv_storage + "val pmv_unused: int = pmv_twice() + 9\n\n" +
+                     "@export(\"pmv_get\")\npmv_get() -> int = pmv_doubled\n", PmvBuild.Archive)
+
+    assert(pmv_stores(out, "pmv_doubled"), out)
+    assert(!pmv_stores(out, "pmv_unused"), out)
+    assert(out.contains("llvm.global_ctors"), s"the archive still fills what it keeps: $out")
+
+@test("and an archive whose computed storage nothing reads gets no constructor to fill it")
+pmv_archive_without_constructor()
+    if pmv_skip() then return
+
+    val out = pmv_ir(pmv_storage + "@export(\"pmv_get\")\npmv_get() -> int = 1\n", PmvBuild.Archive)
+
+    assert(!pmv_stores(out, "pmv_doubled"), out)
+    assert(!out.contains("llvm.global_ctors"), out)
+
+@test("a library artifact keeps every public val, read or not: the program linking it decides")
+pmv_library_keeps_everything()
+    if pmv_skip() then return
+
+    val parsed = parse(source_of("lib.sysl", pmv_storage), host_target())
+
+    assert(parsed.ok(), "the library source parses")
+
+    var units: Buf[Program] = buf()
+
+    for item in pmv_library()
+        units.push(item)
+
+    units.push(parsed.program)
+
+    var own: Buf[string] = buf()
+
+    own.push("demo")
+
+    val built = library_build(units, own, host_target())
+    val out = ir_print_module(codegen_with_gaps(built.program, host_target(), built.promotions).0)
+
+    assert(pmv_stores(out, "pmv_doubled"), out)
+    assert(pmv_defines(out, "pmv_twice"), out)
+
+// -- what runs ------------------------------------------------------------------------------------
+
+// What a one-file program prints; a build that failed answers what it said.
+private pmv_run(main: string) -> string
+    if !clang_available() then return "skipped"
+
+    val root = make_temp_dir("sysl-pmv").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(root + "/sysl.hocon", "package {\n  name = \"probe\"\n}\n").unwrap()
+    write_text(root + "/main.sysl", main).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return s"did not build: ${failure_text(why)}"
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end pmv_run
+
+private val pmv_noisy: string = "noisy(n: int) -> int\n    print(s\"filled $n\")\n    n\n\n" +
+                                "static val pmv_a: int = noisy(1)\nstatic val pmv_b: int = pmv_a + noisy(2)\n" +
+                                "static val pmv_c: int = noisy(3)\n\n"
+
+@test("an initializer runs only where its storage is read: a chain is filled in order, the unread val never")
+pmv_runs_only_what_is_read()
+    if pmv_skip() then return
+
+    val out = pmv_run(pmv_noisy + "print(pmv_b)\n")
+
+    if out == "skipped" then return
+
+    assert(out == "filled 1\nfilled 2\n3\n", out)
+
+@test("and a program reading none of them runs none of them")
+pmv_runs_none()
+    if pmv_skip() then return
+
+    val out = pmv_run(pmv_noisy + "print(\"ran\")\n")
+
+    if out == "skipped" then return
+
+    assert(out == "ran\n", out)
