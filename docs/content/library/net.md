@@ -47,7 +47,8 @@ a `TcpStream` and a `TcpListener`: the sockets API has one type for both, and so
 
 Every call here returns when its work is done, unless the socket was put in non-blocking mode (the
 section on polling, below). There is no event loop and no readiness
-notification.
+notification in this module; readiness over many sockets at once is
+[`sysl.io.poll`](/library/poll/), which takes each socket's `fd()`.
 
 **That is the line Rust draws too**, and for the same reason: `std::net` is blocking and every async
 runtime, tokio included, is a package outside the standard library. `sysl-lang/libuv` is where the
