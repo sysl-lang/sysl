@@ -4443,6 +4443,7 @@ main()
 
         watch = Some(n)
 
+    watch = None
     print("end")
 ```
 
