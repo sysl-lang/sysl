@@ -4,16 +4,16 @@ module sh.sysl.compiler
 import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
 import sysl.process.capture
 
-// What the keeps-analysis (`keeps.sysl`, `keeps_join.sysl`) decides about an address as an integer,
-// a store through a pointer read out of a parameter, a cast of a function pointer, and a fan-out's
-// collection reached by two names -- each accepted cell beside the near miss that is refused, with
-// its text. **An address as an integer is a number**, and a pointer `ptr_cast` makes of one is
-// unchecked: those cells are built and never run, since what a dead frame reads is undefined.
+// What the keeps-analysis (`keeps.sysl`) decides about an address as an integer, a store through a
+// pointer read out of a parameter and a cast of a function pointer -- each accepted cell beside the
+// near miss that is refused, with its text -- and a fan-out's collection reached by two names, which
+// on a scope always runs. **An address as an integer is a number**, and a pointer `ptr_cast` makes of
+// one is unchecked: those cells are built and never run, since what a dead frame reads is undefined.
 // `reference/memory.md § A borrowed pointer cannot escape` is the specification.
 //
 // Skipped cells, and why: an integer handed through a function pointer, a call through an object or
 // an enum's payload is a number like any other, so no cell of its own; a fan-out's collection emptied
-// by a method (`clear`, `pop`) rather than a store is not seen as a store; a nested function and a
+// by a method (`clear`, `pop`) changes no more than a store does, on a scope; a nested function and a
 // build-lib split change nothing these rules read, which are per body and per program.
 
 // -- the harness ----------------------------------------------------------------------------------
@@ -671,188 +671,230 @@ kso_cast_function_pointer()
 
 // -- a fan-out's collection reached by two names -------------------------------------------------------
 
+// A fan-out is started on a scope, which joins every thread it started before it returns: a handle
+// stored over through a second name, or never joined at all, leaves no thread running past the frame.
+// So each cell that was refused while a plain spawn's handles were matched to their joins now runs, and
+// prints a count made of every thread the scope started.
 private kso_threads() -> string =
-    "import sysl.threads.*\nimport sysl.buf.*\n\nstruct S\n    n: int\n\nwork(s: *S)\n    s.n = s.n + 1\n\n"
+    "import sysl.threads.*\nimport sysl.sync.*\n\nstruct S\n    n: int\n\nwork(s: *S)\n    atomic_add(&s.n, 1, SeqCst)\n\n"
 
-private kso_fan_refused(body: string, why: string)
+private kso_fan_runs(body: string, want: string)
     if !azd_ready() then return
 
-    val said = azd_err(kso_threads() + body)
+    twp_prints(kso_threads() + body, want)
 
-    assert(said.contains("error: 'spawn' keeps its parameter 'arg' (the thread it starts holds it until that " +
-                         "thread is joined), and '&s' is the address of a local of 'go' — join that thread " +
-                         s"on every way out of 'go', or hand it storage that lasts$why"), said)
-end kso_fan_refused
-
-@test("two slices of one array: handles stored through one and stored over through the other are refused")
+@test("two slices of one array: handles stored through one and stored over through the other all run")
 kso_fan_two_slices()
-    kso_fan_refused(raw"""
+    kso_fan_runs(raw"""
         go()
             var s = S(0)
-            var store: [4]Option[Thread] = [None; 4]
-            var a: []Option[Thread] = store[0..<4]
-            var b: []Option[Thread] = store[0..<4]
+            val p = &s
 
-            for i in 0..<4
-                a[i] = spawn(&work, &s)
+            scope((sc) ->
+                var store: [4]Option[ScopedThread[unit]] = [None; 4]
+                var a: []Option[ScopedThread[unit]] = store[0..<4]
+                var b: []Option[ScopedThread[unit]] = store[0..<4]
 
-            for i in 0..<4
-                b[i] = spawn(&work, &s)
+                for i in 0..<4
+                    a[i] = Some(sc.spawn(() -> work(p)))
 
-            for t in a
-                if t is Some(h) then h.join()
+                for i in 0..<4
+                    b[i] = Some(sc.spawn(() -> work(p)))
 
-            for t in b
-                if t is Some(h) then h.join()
+                for t in a
+                    if t is Some(h) then h.join()
+
+                for t in b
+                    if t is Some(h) then h.join())
+
+            print(s.n)
 
         go()
-        """, "; 'a' is stored into again through 'b', which shares its storage, before the handles it holds are joined")
+        """, "8\n")
 
-@test("an element stored over before the join, at a constant index or by 'None', is refused")
+@test("an element stored over before the join, at a constant index or by 'None', still has its thread joined")
 kso_fan_element_over()
-    kso_fan_refused(raw"""
+    kso_fan_runs(raw"""
         go()
             var s = S(0)
-            var pool: [4]Option[Thread] = [None; 4]
+            val p = &s
 
-            for i in 0..<4
-                pool[i] = spawn(&work, &s)
+            scope((sc) ->
+                var pool: [4]Option[ScopedThread[unit]] = [None; 4]
 
-            pool[0] = None
+                for i in 0..<4
+                    pool[i] = Some(sc.spawn(() -> work(p)))
 
-            for t in pool
-                if t is Some(h) then h.join()
+                pool[0] = None
+
+                for t in pool
+                    if t is Some(h) then h.join())
+
+            print(s.n)
 
         go()
-        """, "; 'pool' is stored into again before the handles it holds are joined")
-    kso_fan_refused(raw"""
+        """, "4\n")
+    kso_fan_runs(raw"""
         go()
             var s = S(0)
-            var pool: [4]Option[Thread] = [None; 4]
+            val p = &s
 
-            for i in 0..<4
-                pool[i] = spawn(&work, &s)
+            scope((sc) ->
+                var pool: [4]Option[ScopedThread[unit]] = [None; 4]
 
-            pool[1] = spawn(&work, &s)
+                for i in 0..<4
+                    pool[i] = Some(sc.spawn(() -> work(p)))
 
-            for t in pool
-                if t is Some(h) then h.join()
+                pool[1] = Some(sc.spawn(() -> work(p)))
+
+                for t in pool
+                    if t is Some(h) then h.join())
+
+            print(s.n)
 
         go()
-        """, "; 'pool' is stored into again before the handles it holds are joined")
+        """, "5\n")
 
-@test("handles stored through a slice and joined through the array it views are not matched")
+@test("handles stored through a slice and joined through the array it views")
 kso_fan_joined_through_alias()
-    kso_fan_refused(raw"""
+    kso_fan_runs(raw"""
         go()
             var s = S(0)
-            var store: [4]Option[Thread] = [None; 4]
-            var a: []Option[Thread] = store[0..<4]
+            val p = &s
 
-            for i in 0..<4
-                a[i] = spawn(&work, &s)
+            scope((sc) ->
+                var store: [4]Option[ScopedThread[unit]] = [None; 4]
+                var a: []Option[ScopedThread[unit]] = store[0..<4]
 
-            for t in store
-                if t is Some(h) then h.join()
+                for i in 0..<4
+                    a[i] = Some(sc.spawn(() -> work(p)))
+
+                for t in store
+                    if t is Some(h) then h.join())
+
+            print(s.n)
 
         go()
-        """, "; no loop over 'a' joins each of its elements")
+        """, "4\n")
 
 @test("a second slice parameter, a slice field read into a local, a re-slice and a pointer to the array")
 kso_fan_alias_shapes()
-    kso_fan_refused(raw"""
-        go(a: []Option[Thread], b: []Option[Thread])
-            var s = S(0)
-
+    kso_fan_runs(raw"""
+        fill(sc: *Scope, p: *S, a: []Option[ScopedThread[unit]], b: []Option[ScopedThread[unit]])
             for i in 0..<a.len
-                a[i] = spawn(&work, &s)
+                a[i] = Some(sc.spawn(() -> work(p)))
 
             b[0] = None
 
             for t in a
                 if t is Some(h) then h.join()
 
-        var x: [2]Option[Thread] = [None; 2]
+        go()
+            var s = S(0)
+            val p = &s
 
-        go(x[..], x[..])
-        """, "; 'a' is stored into again through 'b', which shares its storage, before the handles it holds are joined")
-    kso_fan_refused(raw"""
+            scope((sc) ->
+                var x: [2]Option[ScopedThread[unit]] = [None; 2]
+
+                fill(sc, p, x[..], x[..]))
+
+            print(s.n)
+
+        go()
+        """, "2\n")
+    kso_fan_runs(raw"""
         struct W
-            pool: []Option[Thread]
+            pool: []Option[ScopedThread[unit]]
 
         go()
             var s = S(0)
-            var w = W([None; 4])
-            val a = w.pool
+            val p = &s
 
-            for i in 0..<4
-                w.pool[i] = spawn(&work, &s)
+            scope((sc) ->
+                var w = W([None; 4])
+                val a = w.pool
 
-            a[0] = None
+                for i in 0..<4
+                    w.pool[i] = Some(sc.spawn(() -> work(p)))
 
-            for t in w.pool
-                if t is Some(h) then h.join()
+                a[0] = None
 
-        go()
-        """, "; 'w.pool' is stored into again through 'a', which shares its storage, before the handles it holds are joined")
-    kso_fan_refused(raw"""
-        go()
-            var s = S(0)
-            var store: [4]Option[Thread] = [None; 4]
-            var a: []Option[Thread] = store[0..<4]
-            var b: []Option[Thread] = a[0..<2]
+                for t in w.pool
+                    if t is Some(h) then h.join())
 
-            for i in 0..<4
-                a[i] = spawn(&work, &s)
-
-            b[0] = None
-
-            for t in a
-                if t is Some(h) then h.join()
+            print(s.n)
 
         go()
-        """, "; 'a' is stored into again through 'b', which shares its storage, before the handles it holds are joined")
-    kso_fan_refused(raw"""
+        """, "4\n")
+    kso_fan_runs(raw"""
         go()
             var s = S(0)
-            var store: [4]Option[Thread] = [None; 4]
-            val p = &store
+            val p = &s
 
-            for i in 0..<4
-                store[i] = spawn(&work, &s)
+            scope((sc) ->
+                var store: [4]Option[ScopedThread[unit]] = [None; 4]
+                var a: []Option[ScopedThread[unit]] = store[0..<4]
+                var b: []Option[ScopedThread[unit]] = a[0..<2]
 
-            p[0] = None
+                for i in 0..<4
+                    a[i] = Some(sc.spawn(() -> work(p)))
 
-            for t in store
-                if t is Some(h) then h.join()
+                b[0] = None
+
+                for t in a
+                    if t is Some(h) then h.join())
+
+            print(s.n)
 
         go()
-        """, "; 'store' is stored into again through 'p', which shares its storage, before the handles it holds are joined")
+        """, "4\n")
+    kso_fan_runs(raw"""
+        go()
+            var s = S(0)
+            val p = &s
+
+            scope((sc) ->
+                var store: [4]Option[ScopedThread[unit]] = [None; 4]
+                val q = &store
+
+                for i in 0..<4
+                    store[i] = Some(sc.spawn(() -> work(p)))
+
+                q[0] = None
+
+                for t in store
+                    if t is Some(h) then h.join())
+
+            print(s.n)
+
+        go()
+        """, "4\n")
 
 @test("a fresh element set before its handle, one set after its join, and two collections of their own")
 kso_fan_own_storage_accepted()
-    if !azd_ready() then return
-
-    twp_prints(kso_threads() + raw"""
+    kso_fan_runs(raw"""
         go() -> int
             var cells: [6]S = [S(0); 6]
-            var pool: [4]Option[Thread] = [None; 4]
-            var other: []Option[Thread] = [None; 2]
+            val all = cells[..]
 
-            for i in 0..<4
-                pool[i] = None
-                pool[i] = spawn(&work, &cells[i])
+            scope((sc) ->
+                var pool: [4]Option[ScopedThread[unit]] = [None; 4]
+                var other: []Option[ScopedThread[unit]] = [None; 2]
 
-            for i in 0..<2
-                other[i] = spawn(&work, &cells[4 + i])
+                for i in 0..<4
+                    pool[i] = None
+                    pool[i] = Some(sc.spawn(() -> work(&all[i])))
 
-            for i in 0..<4
-                if pool[i] is Some(h) then h.join()
+                for i in 0..<2
+                    other[i] = Some(sc.spawn(() -> work(&all[4 + i])))
 
-                pool[i] = None
+                for i in 0..<4
+                    if pool[i] is Some(h) then h.join()
 
-            for h in other
-                if h is Some(th) then th.join()
+                    pool[i] = None
+
+                for h in other
+                    if h is Some(th) then th.join())
 
             var total = 0
             for c in cells

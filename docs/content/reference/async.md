@@ -87,8 +87,7 @@ tick
 
 Since the body runs after the call has returned, **the task holds every argument the call was
 handed until it ends**. An async function therefore [keeps](/reference/memory/#a-borrowed-pointer-cannot-escape)
-every parameter for as long as its task lives, and the task is followed as a
-[thread's handle](/reference/memory/#a-thread-holds-what-it-is-handed-until-it-is-joined) is: the
+every parameter for as long as its task lives, and the task is followed from the call to its end: the
 address of a local, or a closure holding one, may go to an async call only where the task is
 awaited or `block_on`'d before the frame that lent it ends — where the call is written, or from a
 local the task was kept in.

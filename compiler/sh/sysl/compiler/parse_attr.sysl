@@ -169,6 +169,10 @@ scoped_on_free_function() -> string =
 scoped_on_field() -> string =
     "'@scoped' names the parameters a function lets go of before its caller's scope ends — a callable it runs and finishes, or a '*T' it holds only while its caller waits — so it stands above a function or a method; a field and a variant are never called, and have no parameter to run"
 
+// `@joined` anywhere: the annotation is gone, and a thread that borrows a frame starts on a scope.
+joined_gone() -> string =
+    "'@joined' is not an annotation — a thread that borrows its caller's frame is started on 'sysl.threads.scope', whose 'spawn' is '@scoped' and is joined before the scope returns, and a function that hands a thread a pointer otherwise keeps it, which '@crossing' already says"
+
 // `@keeps(...)` anywhere but above an `extern`: a body the compiler can read says what it keeps.
 keeps_off_extern() -> string =
     "'@keeps(...)' names the parameters a C function holds on to past the call, so it marks an 'extern' — a function's or a method's body is right here, and the compiler reads what it keeps out of it. A trait's own method declaration may carry it too, for the calls through an object, which see no body"
@@ -390,7 +394,6 @@ parse_attribute(p: *Parser) -> Option[Attr]
     if word == "keeps" then return Some(Keeps(parse_named_list(p, "keeps")))
     if word == "answers" then return Some(Answers(parse_named_list(p, "answers")))
     if word == "scoped" then return Some(Scoped(parse_named_list(p, "scoped")))
-    if word == "joined" then return Some(Joined(parse_named_list(p, "joined")))
     if word == "disjoint" then return Some(Disjoint(parse_named_list(p, "disjoint")))
     if word == "guards" then return Some(Guards(parse_named_list(p, "guards")))
     if word == "needs" then return Some(Needs(parse_named_list(p, "needs")))
@@ -435,6 +438,15 @@ parse_attribute(p: *Parser) -> Option[Attr]
     // something a test is, so it is an argument to `@test` rather than an annotation of its own.
     if word == "ignore"
         p.fault(p.here(), "an ignored test is written '@test(ignore: \"why it is not run\")' — ignoring is something a test is, so it goes inside '@test' beside the description and 'should_trap', and a function that is not a test has no run to withhold")
+        skip_line(p)
+        return None
+    end if
+
+    // `@joined` said a thread held a pointer until its handle was joined, which the analysis matched
+    // path by path. A thread that borrows a frame is now started on a scope, which joins it before the
+    // scope returns, so the annotation has nothing left to say.
+    if word == "joined"
+        p.fault(at, joined_gone())
         skip_line(p)
         return None
     end if
@@ -707,8 +719,6 @@ private named_list_refusal(word: string) -> string
     if word == "answers" then return "'@answers' names the parameters the pointer a C function answers may point into, in parentheses — '@answers(s)' for 'strchr'. There is no empty form: an 'extern' whose answer is fresh storage says so by not writing the annotation"
 
     if word == "scoped" then return "'@scoped' names the parameters a function lets go of before its caller's scope ends — a callable a member runs in another concurrency domain, or a '*T' it holds while its caller waits — in parentheses: '@scoped(f)'. There is no empty form: a function that holds nothing past its call says so by not writing the annotation"
-
-    if word == "joined" then return "'@joined' names the '*T' parameters a call hands to the thread it starts, which holds each until the handle the call answers is joined, in parentheses — '@joined(arg)'. There is no empty form: a function whose thread holds nothing it was handed says so by not writing the annotation"
 
     if word == "guards" then return "'@guards' names the fields a struct's own members are the only way into, in parentheses — '@guards(value)'. There is no empty form: a struct that guards nothing says so by not writing the annotation"
 
@@ -994,7 +1004,6 @@ apply_func_attrs(f: *FuncDecl, attrs: Buf[Attr])
             StrictFp -> f.marks.strict_fp = true
             TrackCaller -> f.marks.track_caller = true
             Scoped(ns) -> f.marks.scoped = ns
-            Joined(ns) -> f.marks.joined = ns
             _ -> ()
 end apply_func_attrs
 
@@ -1005,7 +1014,6 @@ apply_member_attrs(m: *MethodDecl, attrs: Buf[Attr])
                 m.crossing = ns
                 m.marks.copies = ns
             Scoped(ns) -> m.marks.scoped = ns
-            Joined(ns) -> m.marks.joined = ns
             Disjoint(ns) -> m.marks.disjoint = ns
             Reads(ns) -> m.reads = Some(ns)
             Writes(ns) -> m.writes = Some(ns)
@@ -1296,9 +1304,6 @@ private attributed_refusal(attrs: Buf[Attr]) -> string
     // holds past the call is what `@keeps(...)` says.
     if any_is(attrs, "scoped")
         return "'@scoped' promises that a body lets go of a parameter before its caller's scope ends, so it marks a function or a method, whose body is sysl — an 'extern' borrows what it is handed for the call, and one that holds a pointer past it says '@keeps(...)'"
-
-    if any_is(attrs, "joined")
-        return "'@joined' says how long the thread a sysl function starts holds a pointer, so it marks a function or a method, whose body is sysl — an 'extern' that holds a pointer past the call says '@keeps(...)', and a sysl wrapper around it says '@joined'"
 
     if any_is(attrs, "guards")
         return "'@guards(...)' names the fields a struct's own members are the only way into, so it can only mark a struct — and this declares none"

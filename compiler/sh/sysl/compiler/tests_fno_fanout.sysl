@@ -1,20 +1,16 @@
 module sh.sysl.compiler
 @tests
 
-// A fan-out is joined by a loop that joins every element (`reference/memory.md § A thread holds what
-// it is handed until it is joined`): handles kept in a local array, a slice local, a `Buf` or a field
-// of a local -- at the counter of a counting loop, or pushed -- are let go of by a loop over the same
-// collection that joins each element on every turn (`keeps_join.sysl § a fan-out`). Each accepted cell
-// runs and prints what the threads did; each refused one is told at the argument why the loop it has
-// does not count.
+// A fan-out -- one thread per element of a collection -- is started on a scope (`reference/memory.md
+// § A thread borrows a frame only inside a scope`): every thread started on it is joined before
+// `scope` returns, so the threads may share a pointer to the caller's frame however the handles are
+// kept and whether or not a loop joins them. Each cell below was once a shape the fan-out matching
+// accepted or refused; on a scope each one runs and prints what the threads did, and the plain
+// `spawn` it used to be is refused at the argument.
 //
-// Skipped cells, and why: a join of the element inside the same turn of the loop that stored it is
-// refused (the loop that stores is not one that releases), not pinned as accepted; a two-dimensional
-// `grid[r][c]` names its element through an element, which is no frame place, so it is refused like
-// any other handle at a place the body cannot name again; a callee answering a collection whose
-// elements carry their handles in a field is released only by a join of the elements themselves, so
-// that shape is held for good; a trait object or a closure that starts threads into a collection sees
-// no `@joined` (`tests_jnd_*`).
+// Skipped cells, and why: a two-dimensional `grid[r][c]` of handles is any collection to a scope, so
+// it adds nothing to the cells below; a closure or a trait object that starts threads on a scope it
+// is handed is `tests_jnd_*`'s wrapper cell.
 
 // The threads of one fan-out run at once and all count into the same `S`, so the count is an atomic
 // add: a plain `s.n = s.n + 1` loses an update whenever two threads read before either writes, and
@@ -28,59 +24,75 @@ private fno_prints(body: string, want: string)
 
     twp_prints(fno_prelude() + body, want)
 
-// Refused at the argument `at` (`line:col` of `main.sysl`), the refusal ending in `why`.
-private fno_refused(body: string, owner: string, why: string, at: string)
+// Refused at the argument `at` (`line:col` of `main.sysl`): a plain `spawn` of the local's address.
+private fno_refused(body: string, owner: string, at: string)
     if !azd_ready() then return
 
     val said = azd_err(fno_prelude() + body)
 
-    assert(said.contains(s"error: 'spawn' keeps its parameter 'arg' (the thread it starts holds it until that " +
-                         s"thread is joined), and '&s' is the address of a local of '$owner' — join that thread " +
-                         s"on every way out of '$owner', or hand it storage that lasts$why\n"), said)
+    assert(said.contains(jnd_spawn_refusal("spawn", "arg", "s", owner)), said)
     assert(said.contains(s"main.sysl:$at"), said)
 end fno_refused
 
-// -- joined by a loop over every element: accepted -------------------------------------------------
+// Four threads started into `pool` on a scope, then `joins` -- a loop written as the old refused cells
+// wrote it, indented for the scope's body -- and the count printed once the scope has joined them all.
+private fno_scoped(ret: string, joins: string, last: string) -> string =
+    s"go()$ret\n    var s = S(0)\n    val p = &s\n\n    val r = scope((sc) ->\n" +
+    "        var pool: [4]Option[ScopedThread[unit]] = [None; 4]\n\n        for i in 0..<4\n" +
+    "            pool[i] = Some(sc.spawn(() -> work(p)))\n\n" + joins + s"        $last)\n\n    print(s.n)\n    r\n\ngo()\n"
 
-@test("raytrace's pool: a slice of Option handles filled by a counting loop and joined by a walk with a 'None' arm")
+// The plain `spawn` the cells below were written with: its `&s` is at 16:32.
+private fno_filled(owner: string, ret: string) -> string =
+    s"$owner()$ret\n    var s = S(0)\n    var pool: [4]Option[Thread] = [None; 4]\n\n    for i in 0..<4\n" +
+    "        pool[i] = spawn(&work, &s)\n\n"
+
+// -- joined by a loop over every element ----------------------------------------------------------
+
+@test("raytrace's pool: a slice of handles filled by a counting loop and joined by a walk with a 'None' arm")
 fno_raytrace_shape()
     fno_prints(raw"""
         render(threads: int) -> int
             var s = S(0)
+            val p = &s
 
             if threads <= 1
-                work(&s)
+                work(p)
                 return s.n
 
-            var pool: []Option[Thread] = [None; threads]
+            scope((sc) ->
+                var pool: []Option[ScopedThread[unit]] = [None; threads]
 
-            for i in 0..<threads
-                pool[i] = spawn(&work, &s)
+                for i in 0..<threads
+                    pool[i] = Some(sc.spawn(() -> work(p)))
 
-            for t in pool
-                t match
-                    Some(th) -> th.join()
-                    None -> ()
+                for t in pool
+                    t match
+                        Some(th) -> th.join()
+                        None -> ())
 
-            work(&s)
+            work(p)
             s.n
 
         print(render(4))
         print(render(1))
         """, "5\n1\n")
+    fno_refused(fno_filled("go", "") + "    for t in pool\n        if t is Some(h) then h.join()\n\ngo()\n", "go", "16:32")
 
 @test("an array filled and joined by counting loops over its length")
 fno_counted_by_length()
     fno_prints(raw"""
         go()
             var s = S(0)
-            var pool: [3]Option[Thread] = [None; 3]
+            val p = &s
 
-            for i in 0..<pool.len
-                pool[i] = spawn(&work, &s)
+            scope((sc) ->
+                var pool: [3]Option[ScopedThread[unit]] = [None; 3]
 
-            for i in 0..<pool.len
-                pool[i].unwrap().join()
+                for i in 0..<pool.len
+                    pool[i] = Some(sc.spawn(() -> work(p)))
+
+                for i in 0..<pool.len
+                    pool[i].unwrap().join())
 
             print(s.n)
 
@@ -92,15 +104,18 @@ fno_same_bound()
     fno_prints(raw"""
         go(n: int)
             var s = S(0)
-            var pool: []Option[Thread] = [None; n]
+            val p = &s
 
-            for i in 0..<n
-                pool[i] = spawn(&work, &s)
+            scope((sc) ->
+                var pool: []Option[ScopedThread[unit]] = [None; n]
 
-            for i in 0..<n
-                pool[i] match
-                    Some(h) -> h.join()
-                    None -> ()
+                for i in 0..<n
+                    pool[i] = Some(sc.spawn(() -> work(p)))
+
+                for i in 0..<n
+                    pool[i] match
+                        Some(h) -> h.join()
+                        None -> ())
 
             print(s.n)
 
@@ -108,63 +123,90 @@ fno_same_bound()
         go(0)
         """, "3\n0\n")
 
-@test("handles pushed into a Buf, in a loop and once more, joined by index and by a walk")
+@test("handles pushed into a Buf, in a loop and once more, joined by index, by a walk, or by the scope alone")
 fno_buf_pushed()
     fno_prints(raw"""
         by_index()
             var s = S(0)
-            var b: Buf[Thread] = buf()
+            val p = &s
 
-            for _ in 0..<3
-                b.push(spawn(&work, &s).unwrap())
+            scope((sc) ->
+                var b: Buf[ScopedThread[unit]] = buf()
 
-            b.push(spawn(&work, &s).unwrap())
+                for _ in 0..<3
+                    b.push(sc.spawn(() -> work(p)))
 
-            for i in 0..<b.len()
-                b[i].join()
+                b.push(sc.spawn(() -> work(p)))
+
+                for i in 0..<b.len()
+                    b[i].join())
 
             print(s.n)
 
         walked()
             var s = S(0)
-            var b: Buf[Thread] = buf()
+            val p = &s
 
-            for _ in 0..<2
-                b.push(spawn(&work, &s).unwrap())
+            scope((sc) ->
+                var b: Buf[ScopedThread[unit]] = buf()
 
-            for h in b
-                assert(h.join())
+                for _ in 0..<2
+                    b.push(sc.spawn(() -> work(p)))
+
+                for h in b
+                    h.join())
+
+            print(s.n)
+
+        unjoined()
+            var s = S(0)
+            val p = &s
+
+            scope((sc) ->
+                var b: Buf[ScopedThread[unit]] = buf()
+
+                for _ in 0..<3
+                    b.push(sc.spawn(() -> work(p)))
+
+                b.len())
 
             print(s.n)
 
         by_index()
         walked()
-        """, "4\n2\n")
+        unjoined()
+        """, "4\n2\n3\n")
 
 @test("only some elements given a thread, the rest 'None', joined through an 'is' test")
 fno_some_elements()
     fno_prints(raw"""
         evens()
             var s = S(0)
-            var pool: [4]Option[Thread] = [None; 4]
+            val p = &s
 
-            for i in 0..<4
-                if i % 2 == 0 then pool[i] = spawn(&work, &s)
+            scope((sc) ->
+                var pool: [4]Option[ScopedThread[unit]] = [None; 4]
 
-            for t in pool
-                if t is Some(h) then assert(h.join())
+                for i in 0..<4
+                    if i % 2 == 0 then pool[i] = Some(sc.spawn(() -> work(p)))
+
+                for t in pool
+                    if t is Some(h) then h.join())
 
             print(s.n)
 
         chosen()
             var s = S(0)
-            var pool: [4]Option[Thread] = [None; 4]
+            val p = &s
 
-            for i in 0..<4
-                pool[i] = if i == 1 then None else spawn(&work, &s)
+            scope((sc) ->
+                var pool: [4]Option[ScopedThread[unit]] = [None; 4]
 
-            for t in pool
-                if t is Some(h) then h.join()
+                for i in 0..<4
+                    pool[i] = if i == 1 then None else Some(sc.spawn(() -> work(p)))
+
+                for t in pool
+                    if t is Some(h) then h.join())
 
             print(s.n)
 
@@ -176,69 +218,73 @@ fno_some_elements()
 fno_handle_in_a_field()
     fno_prints(raw"""
         struct W
-            t: Option[Thread]
+            t: Option[ScopedThread[unit]]
             k: int
 
         go()
             var s = S(0)
-            var ws: [3]W = [W(None, 0); 3]
+            val p = &s
 
-            for i in 0..<3
-                ws[i].t = spawn(&work, &s)
-                ws[i].k = i
+            val k = scope((sc) ->
+                var ws: [3]W = [W(None, 0); 3]
 
-            for w in ws
-                w.t match
-                    Some(h) -> h.join()
-                    None -> ()
+                for i in 0..<3
+                    ws[i].t = Some(sc.spawn(() -> work(p)))
+                    ws[i].k = i
 
-            print(s.n + ws[2].k)
+                for w in ws
+                    w.t match
+                        Some(h) -> h.join()
+                        None -> ()
+
+                ws[2].k)
+
+            print(s.n + k)
 
         go()
         """, "5\n")
 
-@test("nested fan-outs: one per turn of an outer loop, a collection declared inside it, and two in one loop")
+@test("nested fan-outs: one scope per turn of an outer loop, a scope inside a scoped thread, and two in one loop")
 fno_nested()
     fno_prints(raw"""
         rounds()
             var s = S(0)
-            var pool: [2]Option[Thread] = [None; 2]
+            val p = &s
 
             for _ in 0..<3
-                for i in 0..<2
-                    pool[i] = spawn(&work, &s)
-
-                for t in pool
-                    if t is Some(h) then h.join()
+                scope((sc) ->
+                    for _ in 0..<2
+                        sc.spawn(() -> work(p)))
 
             print(s.n)
 
         groups()
             var s = S(0)
+            val p = &s
 
-            for _ in 0..<2
-                var pool: [2]Option[Thread] = [None; 2]
-
-                for i in 0..<2
-                    pool[i] = spawn(&work, &s)
-
-                for i in 0..<2
-                    pool[i].unwrap().join()
+            scope((outer) ->
+                for _ in 0..<2
+                    outer.spawn(() -> scope((inner) ->
+                        for _ in 0..<2
+                            inner.spawn(() -> work(p)))))
 
             print(s.n)
 
         pairs()
             var s = S(0)
-            var a: [2]Option[Thread] = [None; 2]
-            var b: [2]Option[Thread] = [None; 2]
+            val p = &s
 
-            for i in 0..<2
-                a[i] = spawn(&work, &s)
-                b[i] = spawn(&work, &s)
+            scope((sc) ->
+                var a: [2]Option[ScopedThread[unit]] = [None; 2]
+                var b: [2]Option[ScopedThread[unit]] = [None; 2]
 
-            for i in 0..<2
-                a[i].unwrap().join()
-                b[i].unwrap().join()
+                for i in 0..<2
+                    a[i] = Some(sc.spawn(() -> work(p)))
+                    b[i] = Some(sc.spawn(() -> work(p)))
+
+                for i in 0..<2
+                    a[i].unwrap().join()
+                    b[i].unwrap().join())
 
             print(s.n)
 
@@ -247,23 +293,26 @@ fno_nested()
         pairs()
         """, "6\n4\n4\n")
 
-@test("a function that answers its fan-out passes the joins on to its caller, which joins every element")
+@test("a function handed the scope starts its fan-out on it, and its caller's scope joins every element")
 fno_answered()
     fno_prints(raw"""
-        start_all(p: *S) -> [2]Option[Thread]
-            var pool: [2]Option[Thread] = [None; 2]
+        start_all(sc: *Scope, p: *S) -> [2]Option[ScopedThread[unit]]
+            var pool: [2]Option[ScopedThread[unit]] = [None; 2]
 
             for i in 0..<2
-                pool[i] = spawn(&work, p)
+                pool[i] = Some(sc.spawn(() -> work(p)))
 
             pool
 
         go()
             var s = S(0)
-            val pool = start_all(&s)
+            val p = &s
 
-            for t in pool
-                if t is Some(h) then h.join()
+            scope((sc) ->
+                val pool = start_all(sc, p)
+
+                for t in pool
+                    if t is Some(h) then h.join())
 
             print(s.n)
 
@@ -273,160 +322,158 @@ fno_answered()
 @test("a wrapper that answers one handle, stored into each element")
 fno_through_a_wrapper()
     fno_prints(raw"""
-        start(p: *S) -> Option[Thread] = spawn(&work, p)
+        start(sc: *Scope, p: *S) -> Option[ScopedThread[unit]] = Some(sc.spawn(() -> work(p)))
 
         go()
             var s = S(0)
-            var pool: [3]Option[Thread] = [None; 3]
+            val p = &s
 
-            for i in 0..<3
-                pool[i] = start(&s)
+            scope((sc) ->
+                var pool: [3]Option[ScopedThread[unit]] = [None; 3]
 
-            for t in pool
-                if t is Some(h) then h.join()
+                for i in 0..<3
+                    pool[i] = start(sc, p)
+
+                for t in pool
+                    if t is Some(h) then h.join())
 
             print(s.n)
 
         go()
         """, "3\n")
 
-// -- a loop that may skip an element: refused ------------------------------------------------------
-
-private val FnoLeaves = "; the loop over 'pool' that joins its elements may leave before it has joined them all"
-private val FnoSkips = "; the loop over 'pool' does not join each of its elements on every turn"
-private val FnoAgain = "; 'pool' is stored into again before the handles it holds are joined"
-
-// The storing loop every refused cell below opens with: its `&s` is at 15:32.
-private fno_filled(owner: string, ret: string) -> string =
-    s"$owner()$ret\n    var s = S(0)\n    var pool: [4]Option[Thread] = [None; 4]\n\n    for i in 0..<4\n" +
-    "        pool[i] = spawn(&work, &s)\n\n"
+// -- a loop that may skip an element: the scope joins what it skipped ------------------------------
+//
+// Each of these was refused while the analysis matched a fan-out to the loop that joined it. On a
+// scope the loop is the program's own business: whatever it leaves unjoined the scope joins, so every
+// cell prints all four.
 
 @test("a 'break' in the joining loop")
 fno_break()
+    fno_prints(fno_scoped("", "        for t in pool\n            if t.is_some() then break\n\n            t.unwrap().join()\n\n", "()"),
+               "4\n")
     fno_refused(fno_filled("go", "") + "    for t in pool\n        if t.is_none() then break\n\n" +
-                "        t.unwrap().join()\n\ngo()\n", "go", FnoLeaves, "16:32")
+                "        t.unwrap().join()\n\ngo()\n", "go", "16:32")
 
 @test("a 'continue' before the join")
 fno_continue()
-    fno_refused(fno_filled("go", "") + "    for i in 0..<4\n        if i == 0 then continue\n\n" +
-                "        pool[i].unwrap().join()\n\ngo()\n", "go", FnoLeaves, "16:32")
+    fno_prints(fno_scoped("", "        for i in 0..<4\n            if i == 0 then continue\n\n            pool[i].unwrap().join()\n\n", "()"),
+               "4\n")
 
-@test("a '?' in the joining loop")
+@test("a '?' in the joining loop", ignore: "a closure whose answer is inferred cannot use '?'")
 fno_question()
-    fno_refused(fno_filled("go", " -> Option[int]") + "    for t in pool\n        t?.join()\n\n    Some(1)\n\n" +
-                "print(go().is_some())\n", "go", FnoLeaves, "16:32")
+    fno_prints(fno_scoped(" -> Option[int]", "        for t in pool\n            t?.join()\n\n", "Some(1)"), "4\n")
 
 @test("a 'return' or a panic inside the joining loop")
 fno_return_or_panic()
-    fno_refused(fno_filled("go", "") + "    for t in pool\n        if t.is_none() then return\n\n" +
-                "        t.unwrap().join()\n\ngo()\n", "go", FnoLeaves, "16:32")
-    fno_refused(fno_filled("go", "") + "    for t in pool\n        if t.is_none() then panic(\"none\")\n\n" +
-                "        t.unwrap().join()\n\ngo()\n", "go", FnoLeaves, "16:32")
+    fno_prints(fno_scoped("", "        for t in pool\n            if t.is_some() then return\n\n            t.unwrap().join()\n\n", "()"),
+               "4\n")
+    fno_prints(fno_scoped("", "        for t in pool\n            if t.is_none() then panic(\"none\")\n\n            t.unwrap().join()\n\n", "()"),
+               "4\n")
 
 @test("a join under a condition, a guarded arm, and a 'Some' arm that does not join")
 fno_conditional_join()
-    fno_refused(fno_filled("go", "") + "    for i in 0..<4\n        if i > 0 then pool[i].unwrap().join()\n\ngo()\n",
-                "go", FnoSkips, "16:32")
-    fno_refused(fno_filled("go", "") + "    for t in pool\n        t match\n            Some(h) if s.n > 0 -> h.join()\n" +
-                "            _ -> ()\n\ngo()\n", "go", FnoSkips, "16:32")
-    fno_refused(fno_filled("go", "") + "    for t in pool\n        t match\n            Some(h) -> print(\"on\")\n" +
-                "            None -> ()\n\ngo()\n", "go", "; no loop over 'pool' joins each of its elements", "16:32")
+    fno_prints(fno_scoped("", "        for i in 0..<4\n            if i > 0 then pool[i].unwrap().join()\n\n", "()"), "4\n")
+    fno_prints(fno_scoped("", "        for t in pool\n            t match\n                Some(h) if p.n > 9 -> h.join()\n" +
+                          "                _ -> ()\n\n", "()"), "4\n")
+    fno_prints(fno_scoped("", "        for t in pool\n            t match\n                Some(_) -> ()\n" +
+                          "                None -> ()\n\n", "()"), "4\n")
 
 @test("a joining loop over a narrower range")
 fno_narrower_range()
-    fno_refused(fno_filled("go", "") + "    for i in 0..<3\n        pool[i].unwrap().join()\n\ngo()\n", "go",
-                "; the loop over 'pool' that joins its elements does not reach every element they were stored in", "16:32")
-    fno_refused(fno_filled("go", "") + "    for i in 1..<4\n        pool[i].unwrap().join()\n\ngo()\n", "go",
-                "; the loop over 'pool' that joins its elements does not reach every element they were stored in", "16:32")
+    fno_prints(fno_scoped("", "        for i in 0..<3\n            pool[i].unwrap().join()\n\n", "()"), "4\n")
+    fno_prints(fno_scoped("", "        for i in 1..<4\n            pool[i].unwrap().join()\n\n", "()"), "4\n")
 
 @test("no loop joins the elements, or one joins a different collection")
 fno_no_joining_loop()
-    fno_refused(fno_filled("go", "") + "    print(s.n)\n\ngo()\n", "go", "; no loop over 'pool' joins each of its elements",
-                "16:32")
-    fno_refused(fno_filled("go", "") + "    var spare: [4]Option[Thread] = [None; 4]\n\n    for t in spare\n" +
-                "        if t is Some(h) then h.join()\n\ngo()\n", "go", "; no loop over 'pool' joins each of its elements",
-                "16:32")
+    fno_prints(fno_scoped("", "", "()"), "4\n")
+    fno_prints(fno_scoped("", "        var spare: [4]Option[ScopedThread[unit]] = [None; 4]\n\n        for t in spare\n" +
+                          "            if t is Some(h) then h.join()\n\n", "()"), "4\n")
+    fno_refused(fno_filled("go", "") + "    print(s.n)\n\ngo()\n", "go", "16:32")
 
 @test("a handle stored at an index other than its loop's counter")
 fno_computed_index()
-    fno_refused(raw"""
+    fno_prints(raw"""
         go()
             var s = S(0)
-            var pool: [5]Option[Thread] = [None; 5]
+            val p = &s
 
-            for i in 0..<4
-                pool[i + 1] = spawn(&work, &s)
+            scope((sc) ->
+                var pool: [5]Option[ScopedThread[unit]] = [None; 5]
 
-            for t in pool
-                if t is Some(h) then h.join()
+                for i in 0..<4
+                    pool[i + 1] = Some(sc.spawn(() -> work(p)))
+
+                for t in pool
+                    if t is Some(h) then h.join())
+
+            print(s.n)
 
         go()
-        """, "go", "; a handle kept in an element of 'pool' is matched to a loop that joins them only where it is " +
-        "stored at the counter of the counting loop it is in, or pushed", "16:36")
-    fno_refused(raw"""
+        """, "4\n")
+    fno_prints(raw"""
         go()
             var s = S(0)
-            var pool: [2]Option[Thread] = [None; 2]
+            val p = &s
 
-            for i in 0..<2
-                for _ in 0..<2
-                    pool[i] = spawn(&work, &s)
+            scope((sc) ->
+                var pool: [2]Option[ScopedThread[unit]] = [None; 2]
 
-            for t in pool
-                if t is Some(h) then h.join()
+                for i in 0..<2
+                    for _ in 0..<2
+                        pool[i] = Some(sc.spawn(() -> work(p)))
+
+                for t in pool
+                    if t is Some(h) then h.join())
+
+            print(s.n)
 
         go()
-        """, "go", "; a handle kept in an element of 'pool' is matched to a loop that joins them only where it is " +
-        "stored at the counter of the counting loop it is in, or pushed", "17:36")
+        """, "4\n")
 
 @test("the collection stored into again, by a second round or as a whole, before its handles are joined")
 fno_stored_again()
-    fno_refused(raw"""
-        go()
-            var s = S(0)
-            var pool: [4]Option[Thread] = [None; 4]
-
-            for _ in 0..<2
-                for i in 0..<4
-                    pool[i] = spawn(&work, &s)
-
-            for t in pool
-                if t is Some(h) then h.join()
-
-        go()
-        """, "go", FnoAgain, "17:36")
-    fno_refused(fno_filled("go", "") + "    pool = [None; 4]\n\n    for t in pool\n        if t is Some(h) then h.join()\n\n" +
-                "go()\n", "go", FnoAgain, "16:32")
-    fno_refused(fno_filled("go", "") + "    for i in 0..<4\n        pool[i] = spawn(&work, &s)\n\n    for t in pool\n" +
-                "        if t is Some(h) then h.join()\n\ngo()\n", "go", FnoAgain, "16:32")
+    fno_prints(fno_scoped("", "        for i in 0..<4\n            pool[i] = Some(sc.spawn(() -> work(p)))\n\n" +
+                          "        for t in pool\n            if t is Some(h) then h.join()\n\n", "()"), "8\n")
+    fno_prints(fno_scoped("", "        pool = [None; 4]\n\n        for t in pool\n            if t is Some(h) then h.join()\n\n", "()"),
+               "4\n")
 
 @test("handles thrown away in a loop, and a pushed handle set over by index")
 fno_discarded_and_set_over()
-    fno_refused(raw"""
+    fno_prints(raw"""
         go()
             var s = S(0)
+            val p = &s
 
-            for _ in 0..<2
-                spawn(&work, &s)
+            scope((sc) ->
+                for _ in 0..<2
+                    sc.spawn(() -> work(p)))
+
+            print(s.n)
 
         go()
-        """, "go", "", "15:22")
-    fno_refused(raw"""
+        """, "2\n")
+    fno_prints(raw"""
         go()
             var s = S(0)
-            var b: Buf[Thread] = buf()
+            val p = &s
 
-            b.push(spawn(&work, &s).unwrap())
-            b.index_set(0, spawn(&work, &s).unwrap())
+            scope((sc) ->
+                var b: Buf[ScopedThread[unit]] = buf()
 
-            for h in b
-                h.join()
+                b.push(sc.spawn(() -> work(p)))
+                b.index_set(0, sc.spawn(() -> work(p)))
+
+                for h in b
+                    h.join())
+
+            print(s.n)
 
         go()
-        """, "go", "; a handle kept in an element of 'b' is matched to a loop that joins them only where it is " +
-        "stored at the counter of the counting loop it is in, or pushed", "16:33")
+        """, "2\n")
+    fno_refused("go()\n    var s = S(0)\n\n    for _ in 0..<2\n        spawn(&work, &s)\n\ngo()\n", "go", "15:22")
 
-@test("a function answering its fan-out may not hand it a local, and a caller that does not join is refused")
+@test("a function answering a fan-out of its own local is refused; one opening its own scope is not")
 fno_answered_refused()
     fno_refused(raw"""
         start_all() -> [2]Option[Thread]
@@ -439,7 +486,20 @@ fno_answered_refused()
             pool
 
         start_all()
-        """, "start_all", "", "16:32")
+        """, "start_all", "16:32")
+    fno_prints(raw"""
+        count_all() -> int
+            var s = S(0)
+            val p = &s
+
+            scope((sc) ->
+                for _ in 0..<2
+                    sc.spawn(() -> work(p)))
+
+            s.n
+
+        print(count_all())
+        """, "2\n")
 
     if !azd_ready() then return
 
@@ -456,15 +516,13 @@ fno_answered_refused()
             var s = S(0)
             val pool = start_all(&s)
 
-            for i in 0..<1
-                pool[i].unwrap().join()
+            for t in pool
+                t.unwrap().join()
 
         go()
         """)
 
-    assert(said.contains("error: 'start_all' keeps its parameter 'p' (it is passed to 'spawn', which keeps it), and " +
-                         "'&s' is the address of a local of 'go' — join that thread on every way out of 'go', " +
-                         "or hand it storage that lasts"), said)
+    assert(said.contains(jnd_wrapper_refusal("start_all", "p", "spawn", "s", "go")), said)
 end fno_answered_refused
 
 // -- the threads of a fan-out count into one S at once ---------------------------------------------
@@ -483,20 +541,23 @@ fnr_buf_counts_every_turn()
 
         go()
             var s = S(0)
-            var b: Buf[Thread] = buf()
+            val p = &s
 
-            for _ in 0..<4
-                b.push(spawn(&many, &s).unwrap())
+            scope((sc) ->
+                var b: Buf[ScopedThread[unit]] = buf()
 
-            for h in b
-                assert(h.join())
+                for _ in 0..<4
+                    b.push(sc.spawn(() -> many(p)))
+
+                for h in b
+                    h.join())
 
             print(s.n)
 
         go()
         """, "80000\n")
 
-@test("four threads kept at a counting loop's counter and joined by index count every turn")
+@test("four threads kept at a counting loop's counter and joined by the scope count every turn")
 fnr_array_counts_every_turn()
     fno_prints(raw"""
         many(s: *S)
@@ -506,13 +567,15 @@ fnr_array_counts_every_turn()
 
         go()
             var s = S(0)
-            var pool: [4]Option[Thread] = [None; 4]
+            val p = &s
 
-            for i in 0..<pool.len
-                pool[i] = spawn(&many, &s)
+            scope((sc) ->
+                var pool: [4]Option[ScopedThread[unit]] = [None; 4]
 
-            for i in 0..<pool.len
-                pool[i].unwrap().join()
+                for i in 0..<pool.len
+                    pool[i] = Some(sc.spawn(() -> many(p)))
+
+                pool.len)
 
             print(s.n)
 

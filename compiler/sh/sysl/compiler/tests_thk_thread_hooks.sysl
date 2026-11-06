@@ -22,9 +22,11 @@ import sysl.testing.skip
 private val thk_target: string = "aarch64-freestanding"
 private val thk_nm: string = "/opt/homebrew/opt/llvm/bin/llvm-nm"
 
-// A lock, a condition variable, a channel and a thread: every hook reached.
+// A lock, a condition variable, a channel and a thread: every hook reached. The thread borrows the
+// frame, so it is started on a scope -- `scope_in`, whose records and stack are the program's own,
+// since a kernel has no heap to give a thread.
 private val thk_program: string = raw"""
-    import sysl.threads.{Condvar, Mutex, channel, current, spawn, yield_now}
+    import sysl.threads.{Condvar, Mutex, ScopeSlot, channel, current, scope_in, yield_now}
 
     private struct State
         m: Mutex[int]
@@ -34,13 +36,15 @@ private val thk_program: string = raw"""
         s.m.with((n) -> *n += 1)
         s.cv.notify_all()
 
+    var stack: [65536]u8 = [0; 65536]
+
     @export("probe_threads")
     probe_threads() -> int
         var s = State(Mutex.new(0), Condvar.new())
+        val p = &s
+        var jobs: [1]ScopeSlot = [ScopeSlot.on(stack[..]); 1]
 
-        spawn(&work, &s) match
-            Some(t) -> t.join()
-            None -> return -1
+        scope_in(jobs[..], (sc) -> sc.start(&work, p))
 
         var slots: [2]int = [0; 2]
         var ch = channel(slots[..])
@@ -279,6 +283,16 @@ private val thk_image_runtime: string = raw"""
 
     @export("memcmp")
     mem_compare(a: *u8, b: *u8, n: usize) -> int = 0
+
+    // What a panic's report writes to and ends with -- a scope stops the program when it runs out of
+    // slots -- answered as a kernel's console and halt would be.
+    @export("putchar")
+    put_char(c: int) -> int = c
+
+    @export("exit")
+    halt(code: int) -> never
+        loop
+            ()
     """
 
 // An 8-byte initialized thread-local and 32 zeroed bytes, 16-aligned, read by a spawned thread.
@@ -300,18 +314,23 @@ private val thk_image_module: string = raw"""
         *n = spare[usize(tick) % 4]
     """
 
+// The thread borrows `kstart`'s local, so it is started on a scope in the image's own storage.
 private val thk_image_program: string = raw"""
-    import sysl.threads.spawn
+    import sysl.threads.{ScopeSlot, scope_in}
     import tl.bump
+
+    var stack: [16384]u8 = [0; 16384]
 
     @export("kstart")
     kstart() -> never
         var n: u64 = 1
+        val p = &n
+        var jobs: [1]ScopeSlot = [ScopeSlot.on(stack[..]); 1]
 
         // Called here too: the spawn stub never calls its entry, and a body nothing calls would
         // take its storage out of the image with it.
-        bump(&n)
-        spawn(&bump, &n)
+        bump(p)
+        scope_in(jobs[..], (s) -> s.start(&bump, p))
 
         loop
             ()
@@ -381,16 +400,20 @@ thk_image_without_tls()
     if !is_file("/opt/homebrew/bin/ld.lld") then skip("ld.lld is not installed, so no image can be linked")
 
     val (code, said, listing) = thk_image(raw"""
-        import sysl.threads.spawn
+        import sysl.threads.{ScopeSlot, scope_in}
 
         private bump(n: *u64) -> unit
             *n += 1
 
+        var stack: [16384]u8 = [0; 16384]
+
         @export("kstart")
         kstart() -> never
             var n: u64 = 1
+            val p = &n
+            var jobs: [1]ScopeSlot = [ScopeSlot.on(stack[..]); 1]
 
-            spawn(&bump, &n)
+            scope_in(jobs[..], (s) -> s.start(&bump, p))
 
             loop
                 ()

@@ -1,0 +1,348 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.cstring
+
+// A thread borrows a frame only inside a scope (`reference/memory.md § A thread borrows a frame only
+// inside a scope`): `sysl.threads.scope`'s `spawn` is `@scoped(f)`, so a closure started there may
+// hold a view of the caller's array or a pointer to its local, and every such thread is joined before
+// `scope` returns, whichever way the body leaves. A plain `spawn` is `@crossing(arg)` and keeps what
+// it is handed, so a frame address there is refused, and the refusal names the scope; heap storage
+// shared as `&sync` is not the frame's and is accepted.
+//
+// Axes: what is borrowed (a local array's view, a local's address, a scoped thread's own local), how
+// the body leaves (its end, an early `return`), what comes out (nothing, the body's answer, a handle's
+// answer), nesting (a scope inside a scoped thread), and the build (plain, AddressSanitizer). Skipped:
+// a trap in the body ends the program, as every trap does, so no thread outlives the frame on that
+// path and there is nothing to observe; the ThreadSanitizer run is `tests_tsp_*`'s.
+
+private extern "setenv" sbt_c_setenv(name: *u8, value: *u8, overwrite: int) -> int
+private extern "unsetenv" sbt_c_unsetenv(name: *u8) -> int
+
+// What building `text` said, or what running it printed, its status, and the symbols the binary
+// leaves undefined (where a sanitizer's runtime shows itself).
+private sbt_outcome(text: string, flags: string) -> (string, int, string)
+    val root = make_temp_dir("sysl-sbt").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+    val name = cstring("SYSL_EXTRA_CFLAGS")
+    val value = cstring(flags)
+
+    if flags != "" then sbt_c_setenv(name.ptr, value.ptr, 1)
+
+    val made = build_native_program(root, None, None, DefaultOptimization, Some(exe))
+
+    if flags != "" then sbt_c_unsetenv(name.ptr)
+
+    made match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (failure_text(why), -1, "")
+        Ok(_) -> ()
+
+    val undefined = capture("nm", ["-u", exe], "", [], true) match
+        Ok(out) -> out.text
+        Err(_) -> ""
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> ("the program that was built could not be run", -1, undefined)
+        Ok(out) -> (out.text + out.err.unwrap_or(""), shell_status(out.status), undefined)
+end sbt_outcome
+
+private sbt_prints(text: string, want: string)
+    if xvr_no_library() then return
+
+    val out = sbt_outcome(text, "")
+
+    assert_eq(out.0, want)
+    assert_eq(out.1, 0)
+
+private sbt_refused(text: string, part: string)
+    if xvr_no_library() then return
+
+    val out = sbt_outcome(text, "")
+
+    assert_eq(out.1, -1, out.0)
+    assert(out.0.index_of(part).is_some(), out.0)
+
+// Two threads write the two halves of a local array through one view, a nested scope in a scoped
+// thread borrows that thread's own local, an early return leaves a thread still running, and the
+// scope answers what two handles answered.
+private sbt_program() -> string = raw"""
+    import sysl.sync.*
+    import sysl.threads.*
+
+    halves() -> int
+        var v = [0; 8]
+        val all = v[..]
+        val half = all.len / 2
+
+        scope((s) ->
+            s.spawn(() -> for i in 0..<half do all[i] = 1)
+            s.spawn(() -> for i in half..<all.len do all[i] = 2))
+
+        var sum = 0
+
+        for x in v do sum += x
+
+        sum
+
+    nested() -> int
+        var total = 0
+        val p = &total
+
+        scope((outer) ->
+            for k in 1..<3
+                outer.spawn(() ->
+                    var mine = [0; 2]
+                    val m = mine[..]
+
+                    scope((inner) ->
+                        inner.spawn(() -> m[0] = k)
+                        inner.spawn(() -> m[1] = k * 10))
+
+                    atomic_add(p, m[0] + m[1], SeqCst)))
+
+        total
+
+    early(stop: bool) -> int
+        var n = 0
+        val p = &n
+
+        scope((s) ->
+            s.spawn(() ->
+                for _ in 0..<1000 do yield_now()
+
+                atomic_add(p, 5, SeqCst))
+
+            if stop then return
+
+            atomic_add(p, 1, SeqCst)
+            ())
+
+        n
+
+    sum_of(v: []const int) -> int
+        var t = 0
+
+        for x in v do t += x
+
+        t
+
+    answered() -> int
+        val xs = [1, 2, 3, 4, 5, 6]
+        val v = xs[..]
+
+        scope((s) ->
+            val a = s.spawn(() -> sum_of(v[0..<3]))
+            val b = s.spawn(() -> sum_of(v[3..<6]))
+
+            a.join() * 100 + b.join())
+
+    print(halves())
+    print(nested())
+    print(early(true))
+    print(early(false))
+    print(answered())
+    """
+
+private val SbtWant = "12\n33\n5\n6\n615\n"
+
+// -- borrowing the frame on a scope ---------------------------------------------------------------
+
+@test("a scope lends a local array's view to two threads, each writing its half")
+sbt_local_array_two_threads()
+    sbt_prints(sbt_program(), SbtWant)
+
+@test("a scope inside a scoped thread borrows that thread's own local, and the outer one's")
+sbt_nested_scope()
+    sbt_prints(raw"""
+        import sysl.sync.*
+        import sysl.threads.*
+
+        go() -> int
+            var total = 0
+            val p = &total
+
+            scope((outer) ->
+                outer.spawn(() ->
+                    var mine = [0; 2]
+                    val m = mine[..]
+
+                    scope((inner) ->
+                        inner.spawn(() -> m[0] = 3)
+                        inner.spawn(() -> m[1] = 4))
+
+                    atomic_add(p, m[0] + m[1], SeqCst)))
+
+            total
+
+        print(go())
+        """, "7\n")
+
+@test("an early return out of a scope's body waits for the thread still running")
+sbt_early_return()
+    sbt_prints(raw"""
+        import sysl.sync.*
+        import sysl.threads.*
+
+        go(stop: bool) -> int
+            var n = 0
+            val p = &n
+
+            scope((s) ->
+                s.spawn(() ->
+                    for _ in 0..<1000 do yield_now()
+
+                    atomic_add(p, 5, SeqCst))
+
+                if stop then return
+
+                atomic_add(p, 1, SeqCst)
+                ())
+
+            n
+
+        print(go(true))
+        print(go(false))
+        """, "5\n6\n")
+
+@test("a scope answers its body's value, made of what its threads answered")
+sbt_result_value()
+    sbt_prints(raw"""
+        import sysl.threads.scope
+
+        sum_of(v: []const int) -> int
+            var t = 0
+
+            for x in v do t += x
+
+            t
+
+        go() -> int
+            val xs = [1, 2, 3, 4, 5, 6]
+            val v = xs[..]
+
+            scope((s) ->
+                val a = s.spawn(() -> sum_of(v[0..<3]))
+                val b = s.spawn(() -> sum_of(v[3..<6]))
+
+                a.join() * 100 + b.join())
+
+        print(go())
+        print(scope((s) -> s.spawn(() -> 41).join() + 1))
+        """, "615\n42\n")
+
+// -- a plain spawn ----------------------------------------------------------------------------------
+
+@test("a plain spawn of a local's address is refused, and the refusal names the scope")
+sbt_plain_spawn_refused()
+    val prelude = "import sysl.threads.spawn\n\nstruct S\n    n: int\n\nwork(s: *S) = ()\n\n"
+
+    sbt_refused(prelude + "go()\n    var s = S(0)\n\n    spawn(&work, &s)\n\ngo()\n",
+                "error: 'spawn' keeps its parameter 'arg' (it reaches another concurrency domain), " +
+                "and '&s' is the address of a local of 'go' — a thread that borrows the frame of 'go' is started " +
+                "on 'sysl.threads.scope', which joins it before the scope returns; anything else is handed storage " +
+                "that lasts")
+
+    // Joined at once, on the very statement that started it: still refused, since nothing a caller
+    // writes after the call takes a plain spawn's keep back.
+    sbt_refused(prelude + "go()\n    var s = S(0)\n\n    spawn(&work, &s).unwrap().join()\n\ngo()\n",
+                "'&s' is the address of a local of 'go' — a thread that borrows the frame of 'go' is started on " +
+                "'sysl.threads.scope'")
+
+    // A local array's element, reached through a pointer the function made.
+    sbt_refused("import sysl.threads.spawn\n\nwork(p: *int) = ()\n\ngo()\n    var a = [1, 2]\n    val p = &a[1]\n\n" +
+                "    spawn(&work, p)\n\ngo()\n",
+                "a thread that borrows the frame of 'go' is started on 'sysl.threads.scope'")
+
+// **Through a wrapper the refusal is the same**: a function that hands its parameter to `spawn` keeps
+// it the way `spawn` does, so the frame address handed to the wrapper is told the scope cure too --
+// through `sysl.posix.threads`' forwarders, a wrapper of a wrapper, and a method.
+@test("a frame address handed to spawn through a wrapper is refused, and the refusal names the scope")
+sbt_wrapper_spawn_refused()
+    val prelude = "struct S\n    n: int\n\nwork(s: *S) = ()\n\n"
+    val cure = "where it reaches another concurrency domain), and '&s' is the address of a local of 'go' — a " +
+        "thread that borrows the frame of 'go' is started on 'sysl.threads.scope', which joins it before the " +
+        "scope returns; anything else is handed storage that lasts"
+
+    sbt_refused("import sysl.posix.threads.spawn\n\n" + prelude + "go()\n    var s = S(0)\n\n    spawn(&work, &s)\n\ngo()\n",
+                cure)
+    sbt_refused("import sysl.posix.threads.spawn_on\n\n" + prelude + "static var stack: [65536]u8 = [0; 65536]\n\n" +
+                "go()\n    var s = S(0)\n\n    spawn_on(stack[..], &work, &s)\n\ngo()\n", cure)
+    sbt_refused("import sysl.threads.{spawn, Thread}\n\n" + prelude +
+                "hand(p: *S) -> Option[Thread] = spawn(&work, p)\n\nouter(q: *S) -> Option[Thread] = hand(q)\n\n" +
+                "go()\n    var s = S(0)\n\n    outer(&s)\n\ngo()\n",
+                "error: 'outer' keeps its parameter 'q' (it is passed to 'hand', " + cure)
+    sbt_refused("import sysl.threads.{spawn, Thread}\n\n" + prelude +
+                "struct Pool\n    k: int\n\n    start(self, p: *S) -> Option[Thread] = spawn(&work, p)\n\n" +
+                "go()\n    var s = S(0)\n\n    Pool(0).start(&s)\n\ngo()\n", cure)
+
+    // The forwarder handed heap storage shared as '&sync' is accepted, as 'spawn' is.
+    sbt_prints(raw"""
+        import sysl.sync.*
+        import sysl.posix.threads.spawn
+
+        struct S
+            n: int
+
+        work(s: *S)
+            atomic_add(&s.n, 1, SeqCst)
+
+        val b: &sync S = S(0)
+
+        spawn(&work, &*b).unwrap().join()
+        print(b.n)
+        """, "1\n")
+end sbt_wrapper_spawn_refused
+
+@test("a plain spawn of heap storage shared as '&sync', or of a module's storage, is still accepted")
+sbt_heap_capture_plain_spawn()
+    sbt_prints(raw"""
+        import sysl.sync.*
+        import sysl.threads.spawn
+
+        struct S
+            n: int
+
+        work(s: *S)
+            atomic_add(&s.n, 1, SeqCst)
+
+        static var kept = S(0)
+
+        go()
+            val b: &sync S = S(0)
+
+            spawn(&work, &*b).unwrap().join()
+            spawn(&work, &kept).unwrap().join()
+            print(b.n + kept.n)
+
+        go()
+        """, "2\n")
+
+// -- under AddressSanitizer -----------------------------------------------------------------------
+
+// Every cell of `sbt_program` again, built with AddressSanitizer: a thread that outlived the frame it
+// borrows would read or write a stack that is gone, which ASan reports as a use after return.
+@test("borrowing the frame on a scope is a clean AddressSanitizer run")
+sbt_asan_is_clean()
+    if xvr_no_library() then return
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return
+    end if
+
+    val out = sbt_outcome(sbt_program(), "-fsanitize=address -g")
+
+    assert(out.2.contains("__asan_report"), out.2)
+    assert_eq(out.0, SbtWant)
+    assert_eq(out.1, 0)

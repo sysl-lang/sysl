@@ -74,7 +74,7 @@ struct LoopEdges
 //
 // `arm_events` says what a way through a pattern does: given a subject, a pattern and whether the way
 // is the one where the subject matched it, the locations that way overwrites -- an `Option` handle
-// found to be `None` holds no thread (`keeps.sysl`'s `arm_clears`).
+// found to be `None` holds no task (`keeps_task.sysl`'s `arm_clears`).
 struct FlowWalk
     stmt_events: &Fn(TStmt) -> Buf[FlowEv]
     expr_events: &Fn(TExpr) -> Buf[FlowEv]
@@ -175,8 +175,8 @@ private has_site(xs: Buf[KeptAt], k: KeptAt) -> bool
     false
 end has_site
 
-// Whether two keeps were made by one node. A keep no node made -- one a fan-out's handle is hooked
-// at, or an assumption -- is told by where it points, which is all it has.
+// Whether two keeps were made by one node. A keep no node made -- an assumption -- is told by where it
+// points, which is all it has.
 same_site(a: KeptAt, b: KeptAt) -> bool = if a.site != 0 && b.site != 0 then a.site == b.site else a.at == b.at
 
 // **Each place a pointer is let go is held on its own**, so that two stores of the frame's storage at
@@ -221,15 +221,14 @@ end clears_loc
 
 private apply_event(st: &PathState, ev: FlowEv)
     if st.dead then return
-    if fan_event(&st.pending, ev) then return
 
     if ev.clear && ev.loc.starts_with(">")
         moved_pointer(st, ev.loc[1..<ev.loc.bytes.len])
         return
     end if
 
-    // A second thread started into a handle whose first is still unjoined leaves the first with nobody
-    // to join it.
+    // A second task started into a handle whose first is still unawaited leaves the first with nobody
+    // to await it.
     if !ev.clear && ev.loc.starts_with("j:") && has_loc(st.pending, ev.loc)
         add_kept(&st.pending, kept_at(ev, ""))
         return
@@ -376,9 +375,9 @@ private flow_stmt(w: &FlowWalk, s: TStmt, st: &PathState, top: bool)
 end flow_stmt
 
 // A piece with no control flow followed: what it stores, then a way out if one is inside it, then
-// what it overwrites -- an exit inside it may come before its clear. A thread's handle (`j:`) is held
+// what it overwrites -- an exit inside it may come before its clear. A task's handle (`j:`) is held
 // only once the piece has finished and stored it, so a way out inside the piece -- `?`, or a `None`
-// arm's `return` -- leaves before there is a thread to hold anything.
+// arm's `return` -- leaves before there is a task to hold anything.
 private flow_piece(w: &FlowWalk, evs: Buf[FlowEv], st: &PathState, jumps: &Jumps)
     if !jumps.exits && !jumps.loops
         for ev in evs

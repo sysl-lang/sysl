@@ -10,7 +10,7 @@ has a name and a spelling of its own:
 | written | is | read by |
 |---|---|---|
 | `T::Attr` | an **attribute** — a question a type's own name answers | the analyzer, at the use |
-| `@test`, `@tailrec`, `@pure`, `@ghost`, `@export`, `@reads`, `@writes`, `@crossing`, `@joined`, `@domain`, `@noinline`, `@inline`, `@cold`, `@disjoint`, `@no_alloc`, `@no_block`, `@blocks`, `@abandons`, `@track_caller` | an **annotation** — a fact about the free function under it | the grammar |
+| `@test`, `@tailrec`, `@pure`, `@ghost`, `@export`, `@reads`, `@writes`, `@crossing`, `@domain`, `@noinline`, `@inline`, `@cold`, `@disjoint`, `@no_alloc`, `@no_block`, `@blocks`, `@abandons`, `@track_caller` | an **annotation** — a fact about the free function under it | the grammar |
 | `@setup`, `@teardown`, `@setup_all`, `@teardown_all` | an **annotation** — a hook `sysl test` runs around a module's tests | the grammar |
 | `@keeps(...)` | an **annotation** on an `extern` — the parameters the C function holds on to past the call; see [`@keeps`](/reference/ffi/#keeps-a-c-function-that-holds-on-to-a-pointer). On a trait's own method declaration, with `@answers(...)`, what a call through an object is told; see [below](#keeps-and-answers-on-a-trait-method) | the grammar |
 | `@returns_twice` | an **annotation** on an `extern` — the C function can return a second time, as `setjmp` does; see [`@returns_twice`](/reference/ffi/#returns-twice-a-c-function-that-returns-a-second-time) | the grammar |
@@ -76,8 +76,8 @@ covered under [modules](/reference/modules/) and [FFI](/reference/ffi/), where w
 only itself. It attaches to nothing, declares no name, and nothing can refer to one — two saying the
 same thing are two checks rather than a duplicate. It is below.
 
-**On a member, five: the ones that are about a PARAMETER.** `@crossing`, `@scoped`, `@joined`,
-`@reads` and `@writes` each name parameters, and a method, a property or an associated function has parameters
+**On a member, four: the ones that are about a PARAMETER.** `@crossing`, `@scoped`, `@reads` and
+`@writes` each name parameters, and a method, a property or an associated function has parameters
 exactly as a free function does — so there was never anything for a blanket refusal to be about in
 their case:
 
@@ -474,50 +474,22 @@ It takes a `*T` or a call, and nothing else; it does not stand above an `extern`
 holds what `@keeps(...)` says, nor above a trait's requirement, which has no body to keep it — each
 `impl` writes it above its own method.
 
-### `@joined(p)` — a pointer held until the handle is joined
+### There is no `@joined`
 
-**`@joined(p)` naming a `*T` parameter that the function also says is `@crossing` promises that the
-thread the call starts holds the pointer until the handle the call answers is joined**, and no
-longer. `sysl.threads.spawn` and `spawn_on` say it of `arg`, which is what lets a function hand a
-thread the address of its own local where it joins the thread on every way out
-([memory § A thread holds what it is handed until it is joined](/reference/memory/#a-thread-holds-what-it-is-handed-until-it-is-joined)).
-The join is the call of the handle's member named `join`. Like `@scoped`, it is a library author's
-promise, written once on the primitive; nothing that calls it writes anything.
+**A `*T` a written `@crossing` names is kept for good**: the thread it reaches may read it after the
+call returns, and no join the caller writes later takes it back. A thread that borrows the caller's
+frame is started on `sysl.threads.scope`, whose `spawn` is `@scoped(f)` above
+([memory § A thread borrows a frame only inside a scope](/reference/memory/#a-thread-borrows-a-frame-only-inside-a-scope)),
+so there is no annotation for a pointer held until a handle is joined, and the word is refused:
 
 ```sysl
-struct Handle
-    k: int
-
-    join(self) -> bool = true
-
 @crossing(p)
 @joined(p)
-begin(p: *int) -> Handle = Handle(*p)
-
-run() -> int
-    var n = 5
-    val h = begin(&n)
-
-    h.join()
-    n
-
-print(run())
-```
-
-```output
-5
-```
-
-It names a parameter `@crossing` names too, since a pointer is held until a join only by the thread
-it reached:
-
-```sysl
-@joined(p)
-f(p: *int) = ()
+begin(p: *int) = ()
 ```
 
 ```error
-'@joined' names 'p', which '@crossing' does not
+'@joined' is not an annotation — a thread that borrows its caller's frame is started on 'sysl.threads.scope'
 ```
 
 ## `@keeps` and `@answers` on a trait method

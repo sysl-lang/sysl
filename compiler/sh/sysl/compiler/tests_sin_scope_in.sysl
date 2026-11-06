@@ -1,0 +1,365 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{is_file, make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.testing.skip
+import sysl.text.cstring
+
+// `sysl.threads.scope_in`: a scope whose thread records are the caller's `ScopeSlot`s, so starting a
+// thread on it allocates nothing. Its `start` is `@scoped(arg)` and `@crossing(arg)` -- the caller may
+// hand it the address of its own local, and what that address reaches is held to the crossing rule --
+// and every thread it started is joined before `scope_in` returns, on every way the body leaves.
+// Starting a thread past the last slot stops the program with a message naming the scope.
+//
+// Axes: how many starts against how many slots (fewer, exactly as many, one more, none given), how the
+// body leaves (its end, an early `return`), nesting (a `scope_in` inside a started thread, and one
+// inside a closure started on `scope`), what may be handed over (a local's address, a pointee with a
+// plain `&int`, which is refused), where the thread runs (the system's stack, the slot's own), and the
+// build (plain, AddressSanitizer, `@no_alloc` on a host and on a bare target). Skipped: a trap in the
+// body ends the program, as every trap does, so no thread outlives the frame there; the hook-level
+// link of a bare image is `tests_thk_*`'s, which starts its threads on `scope_in` too.
+
+private extern "setenv" sin_c_setenv(name: *u8, value: *u8, overwrite: int) -> int
+private extern "unsetenv" sin_c_unsetenv(name: *u8) -> int
+
+// What building `text` said, or what running it printed and its status, and the symbols the binary
+// leaves undefined (where a sanitizer's runtime shows itself).
+private sin_outcome(text: string, flags: string) -> (string, int, string)
+    val root = make_temp_dir("sysl-sin").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+    val name = cstring("SYSL_EXTRA_CFLAGS")
+    val value = cstring(flags)
+
+    if flags != "" then sin_c_setenv(name.ptr, value.ptr, 1)
+
+    val made = build_native_program(root, None, None, DefaultOptimization, Some(exe))
+
+    if flags != "" then sin_c_unsetenv(name.ptr)
+
+    made match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (failure_text(why), -1, "")
+        Ok(_) -> ()
+
+    val undefined = capture("nm", ["-u", exe], "", [], true) match
+        Ok(out) -> out.text
+        Err(_) -> ""
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> ("the program that was built could not be run", -1, undefined)
+        Ok(out) -> (out.text + out.err.unwrap_or(""), shell_status(out.status), undefined)
+end sin_outcome
+
+private sin_prints(text: string, want: string)
+    if xvr_no_library() then return
+
+    val out = sin_outcome(text, "")
+
+    assert_eq(out.0, want)
+    assert_eq(out.1, 0)
+
+private sin_refused(text: string, part: string)
+    if xvr_no_library() then return
+
+    val out = sin_outcome(text, "")
+
+    assert_eq(out.1, -1, out.0)
+    assert(out.0.contains(part), out.0)
+
+private val SinFull = "sysl.threads: a 'scope_in' has started a thread in every slot it was given"
+
+// Two threads write two locals through their addresses, a started thread opens a scope of its own on
+// slots in its own frame, a closure started on `scope` opens one too, and an early return leaves a
+// thread still running.
+private val sin_program: string = raw"""
+    import sysl.sync.*
+    import sysl.threads.*
+
+    struct Pair
+        a: *int
+        b: *int
+
+    put_one(p: *int)
+        *p = 1
+
+    put_two(p: *int)
+        *p = 2
+
+    // A started thread's own scope, on slots and locals in the thread's frame.
+    both(pr: *Pair)
+        var x = 0
+        var y = 0
+        val px = &x
+        val py = &y
+        var slots: [2]ScopeSlot = [ScopeSlot.new(); 2]
+
+        scope_in(slots[..], (s) ->
+            s.start(&put_one, px)
+            s.start(&put_two, py))
+
+        *pr.a = x
+        *pr.b = y
+
+    halves() -> int
+        var x = 0
+        var y = 0
+        val px = &x
+        val py = &y
+        var slots: [2]ScopeSlot = [ScopeSlot.new(); 2]
+
+        scope_in(slots[..], (s) ->
+            s.start(&put_one, px)
+            s.start(&put_two, py))
+
+        x * 10 + y
+
+    nested() -> int
+        var x = 0
+        var y = 0
+        var pair = Pair(&x, &y)
+        val pp = &pair
+        var slots: [1]ScopeSlot = [ScopeSlot.new(); 1]
+
+        scope_in(slots[..], (s) -> s.start(&both, pp))
+
+        x * 10 + y
+
+    in_a_scope() -> int
+        var x = 0
+        val px = &x
+
+        scope((s) ->
+            s.spawn(() ->
+                var slots: [1]ScopeSlot = [ScopeSlot.new(); 1]
+
+                scope_in(slots[..], (t) -> t.start(&put_two, px))))
+
+        x
+
+    slow(p: *int)
+        for _ in 0..<1000 do yield_now()
+
+        atomic_add(p, 5, SeqCst)
+
+    early(stop: bool) -> int
+        var n = 0
+        val p = &n
+        var slots: [1]ScopeSlot = [ScopeSlot.new(); 1]
+
+        scope_in(slots[..], (s) ->
+            s.start(&slow, p)
+
+            if stop then return
+
+            atomic_add(p, 1, SeqCst)
+            ())
+
+        n
+
+    // The thread on the slot's own stack.
+    static var stack: [65536]u8 = [0; 65536]
+
+    on_its_stack() -> int
+        var x = 0
+        val px = &x
+        var slots: [1]ScopeSlot = [ScopeSlot.on(stack[..]); 1]
+
+        scope_in(slots[..], (s) -> s.start(&put_two, px))
+
+        x
+
+    print(halves())
+    print(nested())
+    print(in_a_scope())
+    print(early(true))
+    print(early(false))
+    print(on_its_stack())
+    """
+
+private val SinWant = "12\n12\n2\n5\n6\n2\n"
+
+@test("threads started on caller slots borrow the frame, nest, and are joined on every way out")
+sin_runs()
+    sin_prints(sin_program, SinWant)
+
+@test("borrowing the frame on caller slots is a clean AddressSanitizer run")
+sin_asan_is_clean()
+    if xvr_no_library() then return
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return
+    end if
+
+    val out = sin_outcome(sin_program, "-fsanitize=address -g")
+
+    assert(out.2.contains("__asan_report"), out.2)
+    assert_eq(out.0, SinWant)
+    assert_eq(out.1, 0)
+
+// -- capacity ---------------------------------------------------------------------------------------
+
+// `starts` threads started on the first `slots` of four: the capacity is the length of the slice the
+// scope is handed, not of the array behind it.
+private sin_starts(slots: int, starts: int) -> string =
+    "import sysl.sync.*\nimport sysl.threads.*\n\nbump(p: *int)\n    atomic_add(p, 1, SeqCst)\n\n" +
+    "go() -> int\n    var n = 0\n    val p = &n\n    var slots: [4]ScopeSlot = [ScopeSlot.new(); 4]\n\n" +
+    s"    scope_in(slots[0..<$slots], (s) ->\n        for _ in 0..<$starts do s.start(&bump, p))\n\n    n\n\nprint(go())\n"
+
+@test("as many starts as slots run, and one more stops the program naming the scope")
+sin_capacity()
+    if xvr_no_library() then return
+
+    sin_prints(sin_starts(3, 3), "3\n")
+    sin_prints(sin_starts(3, 1), "1\n")
+
+    val over = sin_outcome(sin_starts(2, 3), "")
+
+    assert(over.1 != 0, over.0)
+    assert(over.0.contains(SinFull), over.0)
+
+@test("a scope given no slots stops at its first start, and one never started on returns at once")
+sin_no_slots()
+    if xvr_no_library() then return
+
+    val none = sin_outcome(sin_starts(0, 1), "")
+
+    assert(none.1 != 0, none.0)
+    assert(none.0.contains(SinFull), none.0)
+
+    sin_prints(sin_starts(0, 0), "0\n")
+
+// -- what may be handed over -------------------------------------------------------------------------
+
+@test("a pointee holding a plain reference is refused at 'start', as at any crossing")
+sin_crossing_rule_holds()
+    sin_refused(raw"""
+        import sysl.threads.*
+
+        struct Bad
+            r: &int
+
+        look(b: *Bad) = ()
+
+        go()
+            var b = Bad(1)
+            val p = &b
+            var slots: [1]ScopeSlot = [ScopeSlot.new(); 1]
+
+            scope_in(slots[..], (s) -> s.start(&look, p))
+
+        go()
+        """, "reaches another concurrency domain, so every count inside it has to be atomic — but its 'r' " +
+             "reaches a '&int', whose count is not")
+
+// -- no allocation -----------------------------------------------------------------------------------
+
+// Two threads started by a function, `promise` above it, on the slots `first` and `second` make --
+// or, where `first` is empty, on `scope`. The stacks are module storage: `static` in a file with a body
+// of its own, plain where the file is declarations alone.
+private sin_no_alloc(store: string, promise: string, first: string, second: string) -> string
+    val start = if first == "" then "    scope((s) ->\n        s.spawn(() -> bump(p))\n        s.spawn(() -> bump(p)))\n\n"
+    else
+        s"    var slots: [2]ScopeSlot = [$first, $second]\n\n" +
+            "    scope_in(slots[..], (s) ->\n        s.start(&bump, p)\n        s.start(&bump, p))\n\n"
+
+    "import sysl.sync.*\nimport sysl.threads.*\n\nbump(p: *int)\n    atomic_add(p, 1, SeqCst)\n\n" +
+        s"$store stack: [65536]u8 = [0; 65536]\n$store other: [65536]u8 = [0; 65536]\n\n" +
+        s"$promise@export(\"counted\")\ncounted() -> int\n    var n = 0\n    val p = &n\n" + start + "    n\n\n"
+end sin_no_alloc
+
+@test("a '@no_alloc' function starts threads on caller slots, and the same on 'scope' is refused")
+sin_no_alloc_host()
+    sin_prints(sin_no_alloc("static var", "@no_alloc\n", "ScopeSlot.new()", "ScopeSlot.on(stack[..])") +
+               "print(counted())\n", "2\n")
+
+    // The control: the check can fail here, since a closure started on 'scope' is boxed on the heap.
+    sin_refused(raw"""
+        import sysl.threads.*
+
+        @no_alloc
+        counted() -> int
+            var n = 0
+            val p = &n
+
+            scope((s) -> s.spawn(() -> *p += 1))
+            n
+
+        print(counted())
+        """, "'counted' declared '@no_alloc'")
+
+// The hooks a kernel answers, as stubs: enough to link, nothing to run.
+private val sin_hooks: string = raw"""
+    @export("sysl_thread_spawn")
+    k_spawn(entry: *extern(*u8) -> unit, arg: *u8, stack: *u8, stack_len: usize, tls: *u8,
+            tid: *u64) -> int
+        *tid = 2
+        0
+    end k_spawn
+
+    @export("sysl_thread_join")
+    k_join(tid: *u64) -> int = 0
+
+    @export("sysl_thread_self")
+    k_self() -> u64 = 1
+
+    @export("sysl_thread_yield")
+    k_yield() -> int = 0
+
+    @export("sysl_futex_wait")
+    k_wait(addr: *u32, expected: u32, timeout_ns: i64) -> int = 0
+
+    @export("sysl_futex_wake")
+    k_wake(addr: *u32, n: int) -> int = 0
+    """
+
+// What `llvm-nm -u` lists for the bare archive of `text`, or why it was not built.
+private sin_bare_undefined(text: string) -> (bool, string)
+    val p = lbr_tree(lbr_two("main.sysl", text + sin_hooks, "sysl.hocon",
+                             "package { name = \"probe\", version = \"0.1.0\" }\n"))
+    val said = lbr_cli(["sysl", "build-c", "--target", "aarch64-freestanding", "-o", s"$p/probe.a", p])
+
+    if said.0 != 0
+        remove_dir_all(p).unwrap_or(())
+        return (false, said.1)
+    end if
+
+    val listed = capture("/opt/homebrew/opt/llvm/bin/llvm-nm", ["-u", s"$p/probe.a"], "", [], true) match
+        Ok(out) -> out.text
+        Err(_) -> ""
+
+    remove_dir_all(p).unwrap_or(())
+    (true, listed)
+end sin_bare_undefined
+
+private sin_names(listing: string, symbol: string) -> bool
+    for line in lines_of(listing)
+        if line.trim() == s"U $symbol" then return true
+
+    false
+
+@test("on a bare target the same '@no_alloc' function builds, and its archive names no allocator")
+sin_no_alloc_bare()
+    if xvr_no_library() then return
+    if !is_file("/opt/homebrew/opt/llvm/bin/llvm-nm") then skip("llvm-nm is not installed")
+
+    val slots = sin_bare_undefined(sin_no_alloc("var", "@no_alloc\n", "ScopeSlot.on(stack[..])", "ScopeSlot.on(other[..])"))
+
+    assert(slots.0, slots.1)
+    assert(!sin_names(slots.1, "malloc"), slots.1)
+    assert(!sin_names(slots.1, "free"), slots.1)
+
+    // The control: the listing can name the allocator, and does for the same threads on 'scope'.
+    val heap = sin_bare_undefined(sin_no_alloc("var", "", "", ""))
+
+    assert(heap.0, heap.1)
+    assert(sin_names(heap.1, "malloc"), heap.1)
