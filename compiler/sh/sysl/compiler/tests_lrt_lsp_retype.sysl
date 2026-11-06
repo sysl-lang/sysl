@@ -1,0 +1,341 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_temp_dir, remove_dir_all, write_text}
+
+// `sysl lsp`'s first tier typing only the files an edit can have changed what is said about
+// (`retype_kept.sysl`). Every chain of edits is run twice: once keeping parses and typings, as a
+// server does, and once from nothing at every step, as a build reads it -- and at every step the first
+// tier and the whole check must say exactly what the cold one says. The files a first tier typed are
+// asserted by name: `*` where the plan typed every file.
+
+// ---- the harness ----
+
+// One file written: its name below the package root, and its text.
+private struct LrtWrite
+    name: string
+    text: string
+end LrtWrite
+
+// One edit of a chain: the files it writes, and the files its first tier should type.
+private struct LrtStep
+    writes: Buf[LrtWrite]
+    retyped: string
+end LrtStep
+
+// What one check said: its first tier and its whole answer, every diagnostic rendered, and the
+// files its first tier typed.
+private struct LrtSaid
+    first: string
+    whole: string
+    retyped: string
+end LrtSaid
+
+private lrt_files(main: string, lib: string, other: string) -> Buf[LrtWrite]
+    var out: Buf[LrtWrite] = buf()
+
+    out.push(LrtWrite("main.sysl", main))
+    out.push(LrtWrite("lib.sysl", lib))
+    out.push(LrtWrite("other.sysl", other))
+    out
+end lrt_files
+
+// An edit writing one file.
+private lrt_edit(name: string, text: string, retyped: string) -> LrtStep
+    var writes: Buf[LrtWrite] = buf()
+
+    writes.push(LrtWrite(name, text))
+    LrtStep(writes, retyped)
+end lrt_edit
+
+private lrt_write(root: string, files: Buf[LrtWrite])
+    for f in files
+        write_text(s"$root/${f.name}", f.text).unwrap()
+
+private lrt_rendered(into: Buf[string], ds: Buf[Placed])
+    var out = into
+
+    for d in ds
+        out.push(d.render())
+end lrt_rendered
+
+private lrt_joined(lines: Buf[string]) -> string
+    var all = ""
+
+    for l in lines
+        all = all + l + "\n"
+
+    all
+end lrt_joined
+
+// The files the last first tier typed, by name and in the order of the alphabet.
+private lrt_retyped() -> string
+    if retype_whole_reason() != "" then return "*"
+
+    var out = ""
+
+    for name in ["lib.sysl", "main.sysl", "other.sysl", "tests_t.sysl"]
+        for f in retyped_files()
+            if f.ends_with(s"/$name")
+                out = if out == "" then name else s"$out,$name"
+                break
+            end if
+
+    out
+end lrt_retyped
+
+private lrt_check(root: string, editing: string) -> LrtSaid
+    var first: Buf[string] = buf()
+    val check = editor_check(ds -> lrt_rendered(first, ds), () -> false)
+    val done = indexed_file(root, Some(check), s"$root/$editing").unwrap()
+    var whole: Buf[string] = buf()
+
+    lrt_rendered(whole, done.problems)
+    assert(!check.abandoned)
+    LrtSaid(lrt_joined(first), lrt_joined(whole), lrt_retyped())
+end lrt_check
+
+// `steps` applied in order to the package `files` make, `editing` the document: every step's first
+// tier typing the files it names, and saying -- first tier and whole -- what a cold check says.
+// Answers the files each step typed, joined, so a second run can be compared with the first.
+private lrt_chain(files: Buf[LrtWrite], extra: Buf[LrtWrite], editing: string, steps: Buf[LrtStep]) -> string
+    if std_root().is_err() then return ""
+
+    val root = make_temp_dir("sysl-lrt").unwrap()
+
+    write_text(s"$root/package.hocon", "package {\n  name = \"probe\"\n}\n").unwrap()
+
+    // Kept: a server's session.
+    keep_parses(true)
+    lrt_write(root, files)
+    lrt_write(root, extra)
+
+    var kept: Buf[LrtSaid] = buf()
+    var typed = ""
+
+    kept.push(lrt_check(root, editing))
+    assert(kept[0].retyped == "*", kept[0].retyped)
+
+    for st in steps
+        lrt_write(root, st.writes)
+
+        val said = lrt_check(root, editing)
+
+        assert(said.retyped == st.retyped,
+               s"typed ${said.retyped} (${retype_whole_reason()}), not ${st.retyped}, after ${st.writes[0].text}")
+        typed = s"$typed${said.retyped};"
+        kept.push(said)
+    end for
+
+    // Cold: every step read from nothing.
+    keep_parses(false)
+    lrt_write(root, files)
+    lrt_write(root, extra)
+
+    for i in 0..<kept.len()
+        if i > 0 then lrt_write(root, steps[i - 1].writes)
+
+        val cold = lrt_check(root, editing)
+
+        assert(kept[i].first == cold.first, s"step $i first tier:\n${kept[i].first}\ncold:\n${cold.first}")
+        assert(kept[i].whole == cold.whole, s"step $i whole:\n${kept[i].whole}\ncold:\n${cold.whole}")
+    end for
+
+    remove_dir_all(root).unwrap_or(())
+    typed
+end lrt_chain
+
+private lrt_main(body: string) -> string = s"main()\n$body"
+
+private lrt_double() -> string = "double(n: int) -> int = n * 2\n"
+
+// ---- what an edit re-types ----
+
+@test("lrt: a body-only edit types the edited file alone, the others told what they were, and the count is the same every run")
+lrt_a_body_edit_types_one_file()
+    val files = lrt_files(lrt_main("    print(double(1))\n"), lrt_double(), "triple(n: int) -> int = n * nope\n")
+    var steps: Buf[LrtStep] = buf()
+
+    steps.push(lrt_edit("lib.sysl", "double(n: int) -> int = n * 3\n", "lib.sysl"))
+    steps.push(lrt_edit("lib.sysl", "double(n: int) -> int = n * nah\n", "lib.sysl"))
+    steps.push(lrt_edit("lib.sysl", lrt_double(), "lib.sysl"))
+    steps.push(lrt_edit("main.sysl", lrt_main("    print(double(nah))\n"), "main.sysl"))
+    steps.push(lrt_edit("lib.sysl", "// twice n\n\ndouble(n: int) -> int = n * 2\n", "lib.sysl"))
+
+    val once = lrt_chain(files, buf(), "main.sysl", steps)
+    val again = lrt_chain(files, buf(), "main.sysl", steps)
+
+    assert_eq(again, once)
+end lrt_a_body_edit_types_one_file
+
+@test("lrt: a signature edit types the file and the files that call it, and nothing else; undone, the same")
+lrt_a_signature_edit_types_its_dependents()
+    val files = lrt_files(lrt_main("    print(double(1))\n"), lrt_double(), "triple(n: int) -> int = n * nope\n")
+    var steps: Buf[LrtStep] = buf()
+
+    steps.push(lrt_edit("lib.sysl", "double(n: string) -> int = 2\n", "lib.sysl,main.sysl"))
+    steps.push(lrt_edit("lib.sysl", "double(n: string) -> int = 3\n", "lib.sysl"))
+    steps.push(lrt_edit("lib.sysl", lrt_double(), "lib.sysl,main.sysl"))
+    steps.push(lrt_edit("lib.sysl", "private double(n: int) -> int = n * 2\n", "lib.sysl,main.sysl"))
+    steps.push(lrt_edit("lib.sysl", lrt_double(), "lib.sysl,main.sysl"))
+
+    lrt_chain(files, buf(), "main.sysl", steps)
+end lrt_a_signature_edit_types_its_dependents
+
+// ---- the hard cases ----
+
+@test("lrt: an overload added in one file changes what another's call resolves to; removed, back again")
+lrt_an_overload_added()
+    val files = lrt_files(lrt_main("    print(double(1))\n    print(double(\"x\"))\n"), lrt_double(),
+                          "quad(n: int) -> int = double(double(n))\n")
+    var steps: Buf[LrtStep] = buf()
+
+    steps.push(lrt_edit("lib.sysl", lrt_double() + "\ndouble(s: string) -> string = s + s\n",
+                        "lib.sysl,main.sysl,other.sysl"))
+    steps.push(lrt_edit("lib.sysl", lrt_double(), "lib.sysl,main.sysl,other.sysl"))
+
+    lrt_chain(files, buf(), "main.sysl", steps)
+end lrt_an_overload_added
+
+@test("lrt: a trait impl written, changed or removed types every file; a body edit inside it types its file")
+lrt_a_trait_impl_added()
+    val lib = "struct P\n    x: int\n\n" + lrt_double()
+    val adding = "\nimpl Add for P\n    add(self, rhs: P) -> P = P(self.x + rhs.x)\n"
+    val files = lrt_files(lrt_main("    print(sum(P(1), P(2)).x)\n"), lib, "sum(a: P, b: P) -> P = a + b\n")
+    var steps: Buf[LrtStep] = buf()
+
+    steps.push(lrt_edit("lib.sysl", lib + adding, "*"))
+    steps.push(lrt_edit("lib.sysl", lib + "\nimpl Add for P\n    add(self, rhs: P) -> P = P(self.x - rhs.x)\n", "lib.sysl"))
+    steps.push(lrt_edit("lib.sysl", lib + "\nimpl Add for P\n    add(self, rhs: int) -> P = P(self.x - rhs)\n", "*"))
+    steps.push(lrt_edit("lib.sysl", lib, "*"))
+
+    lrt_chain(files, buf(), "main.sysl", steps)
+end lrt_a_trait_impl_added
+
+@test("lrt: an import added or removed types every file")
+lrt_an_import_added()
+    val body = "    var b: Buf[int] = buf()\n    b.push(1)\n    print(b.len())\n"
+    val files = lrt_files(lrt_main(body), lrt_double(), "triple(n: int) -> int = n * 3\n")
+    var steps: Buf[LrtStep] = buf()
+
+    steps.push(lrt_edit("main.sysl", "import sysl.buf.{Buf, buf}\n\n" + lrt_main(body), "*"))
+    steps.push(lrt_edit("main.sysl", lrt_main(body), "*"))
+
+    lrt_chain(files, buf(), "main.sysl", steps)
+end lrt_an_import_added
+
+@test("lrt: a declaration renamed types the files that spell either name; renamed back, the same")
+lrt_a_rename()
+    val files = lrt_files(lrt_main("    print(double(1))\n"), lrt_double(), "quad(n: int) -> int = double(double(n))\n")
+    var steps: Buf[LrtStep] = buf()
+
+    steps.push(lrt_edit("lib.sysl", "twice(n: int) -> int = n * 2\n", "lib.sysl,main.sysl,other.sysl"))
+    steps.push(lrt_edit("lib.sysl", lrt_double(), "lib.sysl,main.sysl,other.sysl"))
+
+    lrt_chain(files, buf(), "main.sysl", steps)
+end lrt_a_rename
+
+@test("lrt: a type alias edited types the files that spell it, and the callers of every signature written with it")
+lrt_an_alias_edited()
+    val files = lrt_files(lrt_main("    print(half(4))\n"), "type Count = int\n", "half(c: Count) -> int = c / 2\n")
+    var steps: Buf[LrtStep] = buf()
+
+    steps.push(lrt_edit("lib.sysl", "type Count = string\n", "lib.sysl,main.sysl,other.sysl"))
+    steps.push(lrt_edit("lib.sysl", "type Count = int\n", "lib.sysl,main.sysl,other.sysl"))
+    steps.push(lrt_edit("lib.sysl", "type Count = int within 0..9\n", "lib.sysl,main.sysl,other.sysl"))
+
+    lrt_chain(files, buf(), "main.sysl", steps)
+end lrt_an_alias_edited
+
+@test("lrt: a generic's bound edited types its callers; its body edited types its own file")
+lrt_a_bound_edited()
+    val files = lrt_files(lrt_main("    print(big(1, 2))\n"), "big[T: Ord](a: T, b: T) -> T = if a > b then a else b\n",
+                          "triple(n: int) -> int = n * 3\n")
+    var steps: Buf[LrtStep] = buf()
+
+    steps.push(lrt_edit("lib.sysl", "big[T: Eq](a: T, b: T) -> T = if a > b then a else b\n", "lib.sysl,main.sysl"))
+    steps.push(lrt_edit("lib.sysl", "big[T: Ord](a: T, b: T) -> T = if a > b then a else b\n", "lib.sysl,main.sysl"))
+    steps.push(lrt_edit("lib.sysl", "big[T: Ord](a: T, b: T) -> T = if a < b then a else b\n", "lib.sysl"))
+
+    lrt_chain(files, buf(), "main.sysl", steps)
+end lrt_a_bound_edited
+
+// A module `val`'s initializer is its surface: its type may be read off it, and its value folded into
+// a constant anywhere. So an initializer edited types every file that spells the `val` -- and, through
+// a `val` written in terms of it, every file that spells that one.
+@test("lrt: a module val's initializer and an inferred result are surface, followed through the vals written with them")
+lrt_an_inferred_val_edited()
+    val files = lrt_files(lrt_main("    print(TWICE)\n    print(size() + 1)\n"), "val LIMIT = 10\n\nsize() = 4\n",
+                          "val TWICE = LIMIT * 2\n")
+    var steps: Buf[LrtStep] = buf()
+
+    steps.push(lrt_edit("lib.sysl", "val LIMIT = 11\n\nsize() = 4\n", "lib.sysl,main.sysl,other.sysl"))
+    steps.push(lrt_edit("lib.sysl", "val LIMIT = \"ten\"\n\nsize() = 4\n", "lib.sysl,main.sysl,other.sysl"))
+    steps.push(lrt_edit("lib.sysl", "val LIMIT = 10\n\nsize() = \"four\"\n", "lib.sysl,main.sysl,other.sysl"))
+    steps.push(lrt_edit("lib.sysl", "val LIMIT = 10\n\nsize() = 4\n", "lib.sysl,main.sysl"))
+
+    lrt_chain(files, buf(), "main.sysl", steps)
+end lrt_an_inferred_val_edited
+
+@test("lrt: a body a constant ran, edited, types every file; a body no constant ran types its own")
+lrt_a_body_a_constant_ran()
+    val lib = "sq(n: int) -> int = n * n\n\none() -> int = 1\n"
+    val files = lrt_files(lrt_main("    print(one())\n"), lib, "@assert(sq(3) == 9, \"the square of three\")\n")
+    var steps: Buf[LrtStep] = buf()
+
+    steps.push(lrt_edit("lib.sysl", "sq(n: int) -> int = n + n\n\none() -> int = 1\n", "*"))
+    steps.push(lrt_edit("lib.sysl", "sq(n: int) -> int = n + n\n\none() -> int = 2\n", "lib.sysl"))
+    steps.push(lrt_edit("lib.sysl", "sq(n: int) -> int = n * n\n\none() -> int = 2\n", "*"))
+
+    lrt_chain(files, buf(), "main.sysl", steps)
+end lrt_a_body_a_constant_ran
+
+@test("lrt: a struct's field edited types the files that spell it; a member added, edited in its body or signature, by its name")
+lrt_a_struct_edited()
+    val files = lrt_files(lrt_main("    print(mk().x)\n"), "struct P\n    x: int\n", "mk() -> P = P(1)\n")
+    var steps: Buf[LrtStep] = buf()
+
+    steps.push(lrt_edit("lib.sysl", "struct P\n    y: int\n", "lib.sysl,main.sysl,other.sysl"))
+    steps.push(lrt_edit("lib.sysl", "struct P\n    x: int\n", "lib.sysl,main.sysl,other.sysl"))
+    steps.push(lrt_edit("lib.sysl", "struct P\n    x: int\n\n    get(self) -> int = self.x\n", "lib.sysl"))
+    steps.push(lrt_edit("main.sysl", lrt_main("    print(mk().get())\n"), "main.sysl"))
+    steps.push(lrt_edit("lib.sysl", "struct P\n    x: int\n\n    get(self) -> int = self.x + 1\n", "lib.sysl"))
+    steps.push(lrt_edit("lib.sysl", "struct P\n    x: int\n\n    get(self) -> string = \"x\"\n", "lib.sysl,main.sysl"))
+
+    lrt_chain(files, buf(), "main.sysl", steps)
+end lrt_a_struct_edited
+
+@test("lrt: with test files left to the second tier, an edit types only the package's own files it reaches")
+lrt_with_test_files()
+    val files = lrt_files(lrt_main("    print(double(1))\n"), lrt_double(), "triple(n: int) -> int = n * 3\n")
+    var extra: Buf[LrtWrite] = buf()
+
+    extra.push(LrtWrite("tests_t.sysl", "@tests\n\n@test(\"t\")\nt()\n    assert(double(2) == 4, \"t\")\n"))
+
+    var steps: Buf[LrtStep] = buf()
+
+    steps.push(lrt_edit("lib.sysl", "double(n: int) -> int = n + n\n", "lib.sysl"))
+    steps.push(lrt_edit("lib.sysl", "double(n: string) -> int = 2\n", "lib.sysl,main.sysl"))
+    steps.push(lrt_edit("lib.sysl", lrt_double(), "lib.sysl,main.sysl"))
+
+    lrt_chain(files, extra, "main.sysl", steps)
+end lrt_with_test_files
+
+@test("lrt: a long chain of edits in several files, undone step by step, says at every step what a cold check says")
+lrt_a_chain_undone()
+    val main0 = lrt_main("    print(quad(1))\n")
+    val lib0 = lrt_double()
+    val other0 = "quad(n: int) -> int = double(double(n))\n"
+    val files = lrt_files(main0, lib0, other0)
+    var steps: Buf[LrtStep] = buf()
+
+    steps.push(lrt_edit("lib.sysl", "double(n: int) -> int = n * 2 + oops\n", "lib.sysl"))
+    steps.push(lrt_edit("other.sysl", "quad(n: int) -> string = \"q\"\n", "main.sysl,other.sysl"))
+    steps.push(lrt_edit("main.sysl", lrt_main("    print(quad(1) + 1)\n"), "main.sysl"))
+    steps.push(lrt_edit("main.sysl", main0, "main.sysl"))
+    steps.push(lrt_edit("other.sysl", other0, "main.sysl,other.sysl"))
+    steps.push(lrt_edit("lib.sysl", lib0, "lib.sysl"))
+
+    lrt_chain(files, buf(), "main.sysl", steps)
+end lrt_a_chain_undone

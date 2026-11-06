@@ -173,6 +173,10 @@ analyze_produced(written: Buf[Program], t: Target, producing: Buf[string],
         val library = from_library(a, scope)
         val is_entry = a.tables.entry_src != "" && unit.src.name == a.tables.entry_src
 
+        // An editor's first tier that is not re-typing this file stops before anything below it
+        // matters (`EditorCheck.retype_only`), so the file is passed over whole.
+        if !library && skips_bodies_of(a, unit.src.name) then continue
+
         for j in 0..<unit.body.len()
             val s = unit.body[j]
 
@@ -255,13 +259,16 @@ analyze_produced(written: Buf[Program], t: Target, producing: Buf[string],
         // struct and enum has one.
         // A member written from a `derive` body belongs to the type that asked for it, wherever the
         // trait was written, so it is held only where that type is the library's.
-        if from_library(a, derived_home(a, m.name).unwrap_or(home)) || supplied_debug(m.params) then
+        val owner = derived_home(a, m.name).unwrap_or(home)
+
+        if from_library(a, owner) || supplied_debug(m.params) then
             held.hold(m.name, HeldBody(m.name, home, span_zero(), m, Some(m)))
-        else funcs.push(analyze_instance(a, m.name, m))
+        else if !skips_bodies_of(a, home.src.name) || !skips_bodies_of(a, owner.src.name) then
+            funcs.push(analyze_instance(a, m.name, m))
 
     // The statements the program starts with, typed after every declaration's body and before the
     // queue is drained: what they reach is reached by the program.
-    val started = entry_body(a, units)
+    val started = if skips_bodies_of(a, a.tables.entry_src) then (buf(), ModuleRoot) else entry_body(a, units)
 
     // The entry point, before the queue is drained, since what it reaches has to be analyzed with
     // everything else a program reaches.
@@ -773,6 +780,9 @@ private check_generic_bodies(a: &Analysis, units: Buf[Program])
         // program does not pay to read them again. A library module being produced is read here.
         if from_library(a, scope) then continue
 
+        // A file an editor's first tier is not re-typing has what its bodies said already.
+        if skips_bodies_of(a, unit.src.name) then continue
+
         val is_entry = a.tables.entry_src != "" && unit.src.name == a.tables.entry_src
 
         for j in 0..<unit.body.len()
@@ -821,7 +831,7 @@ private check_generic_bodies(a: &Analysis, units: Buf[Program])
         if !a.tables.members.default_origin.has(fd.name)
             val scope = a.tables.members.decl_scope.get(fd.name).unwrap_or(empty_scope())
 
-            if from_library(a, scope) then continue
+            if from_library(a, scope) || skips_bodies_of(a, scope.src.name) then continue
 
             val said = a.kept.len()
 

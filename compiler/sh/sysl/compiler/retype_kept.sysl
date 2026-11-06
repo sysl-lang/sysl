@@ -1,0 +1,715 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+import sysl.container.{Map, map, Set, set}
+import sysl.text.{from_utf8_unchecked, str_builder}
+
+// An editor's first tier typing only the files an edit can have changed what is said about -- the
+// edited file, and every file that names a declaration whose surface the edit changed -- and taking
+// every other file's first-tier diagnostics from the check before, in `sysl lsp`, which analyzes the
+// whole compilation on every keystroke.
+//
+// **A declaration's SURFACE is what another file can see of it: its text, without the bodies of its
+// functions and members.** It is compared as text -- the declaration's own, with the attributes and
+// the lines above it that are not comments -- so whatever the text decides, from a parameter's type
+// to a `pub` or an `@needs`, is in it, and nothing has to be resolved to compare it. Three kinds of
+// body are surface all the same, because another file sees what they say: a function whose result is
+// read off its body (`f() = ...`, `-> some T`), and module storage (`val`, `var`, `const`), whose type
+// may be its initializer's and whose value may be folded into a type anywhere.
+//
+// **What an edit changes is found by NAME.** A changed declaration puts its own name in question --
+// a struct's, with its fields' (and a member its own) -- and a declaration whose surface spells a name
+// in question changes with it, to a fixed point, so a type alias edited changes every signature
+// written with it, and the callers of those. A file is re-typed where it spells a name in question
+// anywhere in its text. Spelling is a superset of referring: every way a file reaches a declaration
+// goes through a name some surface spells, the alias it is imported under included.
+//
+// **A body is surface where a constant ran it.** Any function may run while compiling where a constant
+// wants it (`declarations.md`), so every function the evaluator entered during the last first tier is
+// noted (`note_evaluated`), and a body edit to one of them re-types everything.
+//
+// **What cannot be found by name re-types every file**: a trait, or an `impl`, written, removed or
+// changed -- an operator, a conversion or a bound reaches one with no name written; an import or a
+// file's header changed; a file added to the compilation or gone from it; a library file the editor
+// holds unsaved text for; and the first check of a session.
+//
+// The answer is exactly a check's from nothing, because a file that is not re-typed is one whose text
+// and every surface it names are what they were: its diagnostics are the ones last told for it.
+
+// One piece of a file another file can see: a declaration, or one member of a type's.
+private struct SurfacePart
+    // The declaration as the file holds it: its kind, its name, and which of that name it is.
+    key: string
+
+    // The names a change to it puts in question.
+    names: Buf[string]
+
+    // Its text without the bodies; and with them, to tell a body edit.
+    surface: string
+    whole: string
+
+    // Every word its surface spells, once each.
+    spelled: Buf[string]
+
+    // A trait or an `impl`: what it decides is reached without a name, so a change to it re-types
+    // every file.
+    by_no_name: bool
+
+    // A `c const` or `c type` block, read out of C headers that change where no editor sees: its
+    // names are in question at every check.
+    volatile: bool
+end SurfacePart
+
+// What one file shows the rest of the compilation, for the parse kept at `generation`.
+private struct FileSurface
+    generation: u64
+
+    // The text before its first declaration (the module line, the clauses) and every import.
+    header: string
+
+    parts: Buf[SurfacePart]
+
+    // Every word the file spells.
+    spelled: Set[string]
+
+    // A file that reads another file while it compiles (`embed`): re-typed at every check.
+    always: bool
+end FileSurface
+
+// The last first tier told for one compilation, and what it was told about.
+private struct KeptTyping
+    key: string
+    files: Map[string, FileSurface]
+    diagnostics: Map[string, Buf[Placed]]
+    evaluated: Set[string]
+end KeptTyping
+
+// What the plan of the check now being read found, for `retype_commit` to keep once it is told.
+private struct PendingTyping
+    key: string
+    files: Map[string, FileSurface]
+    only: Option[Set[string]]
+end PendingTyping
+
+private var kept_typings: Buf[KeptTyping] = buf()
+private var pending_typing: Option[PendingTyping] = None
+private var evaluating_noted: bool = false
+private var evaluated_now: Set[string] = set()
+private var last_retyped: Buf[string] = buf()
+private var last_whole_reason: string = ""
+
+// Everything kept let go of (`keep_parses`, which this is told apart through).
+forget_kept_typing()
+    kept_typings = buf()
+    pending_typing = None
+    evaluating_noted = false
+    evaluated_now = set()
+    last_retyped = buf()
+    last_whole_reason = ""
+end forget_kept_typing
+
+// The files the last plan re-typed, in the compilation's order -- every file where it re-typed them
+// all. The tests' evidence of what an edit cost, which a clock cannot give on a loaded machine.
+retyped_files() -> Buf[string] = last_retyped
+
+retyped_file_count() -> usize = last_retyped.len()
+
+// Why the last plan re-typed every file; empty where it chose.
+retype_whole_reason() -> string = last_whole_reason
+
+// Whether the evaluator's entries are noted. Switched on, the notes start again; switched off, they
+// are kept for `retype_commit`.
+note_evaluations(on: bool)
+    evaluating_noted = on
+
+    if on then evaluated_now = set()
+end note_evaluations
+
+// A function the evaluator is about to run, by its key: each word of the key is noted, which is the
+// declaration's own name among the words of its module and type.
+note_evaluated(key: string)
+    if !evaluating_noted then return
+
+    val b = key.bytes
+    var i: usize = 0
+
+    while i < b.len
+        if !lsp_word_byte(b[i])
+            i += 1
+            continue
+        end if
+
+        val start = i
+
+        while i < b.len && lsp_word_byte(b[i])
+            i += 1
+
+        evaluated_now.add(from_utf8_unchecked(b[start..<i]))
+end note_evaluated
+
+// ---- the plan ----
+
+// The files of `units` an editor's first tier has to type afresh, where the compilation `key` names
+// was told a first tier before; nothing where every file is to be typed.
+retype_plan(key: string, all: Buf[Program]) -> Option[Set[string]]
+    pending_typing = None
+    last_retyped = buf()
+
+    // The library's files are the same in every check of a session (`std_prepared`), and their bodies
+    // are typed only as something reaches them, in the second tier: only the package's are planned.
+    var units: Buf[Program] = buf()
+
+    for unit in all
+        if !unit.src.name.starts_with(s"$StdPrefix/") then units.push(unit)
+
+    for unit in units
+        last_retyped.push(unit.src.name)
+
+    val kept = kept_typing(key)
+    var files: Map[string, FileSurface] = map()
+
+    for unit in units
+        val generation = kept_parse_generation(unit.src.name)
+
+        if generation.is_none()
+            last_whole_reason = "a file was not read through the kept parses"
+            return None
+        end if
+
+        val reused = kept.and_then(k -> k.files.get(unit.src.name))
+
+        if reused.is_some() && reused.unwrap().generation == generation.unwrap()
+            files.put(unit.src.name, reused.unwrap())
+        else files.put(unit.src.name, file_surface(unit, generation.unwrap()))
+
+    pending_typing = Some(PendingTyping(key, files, None))
+
+    val plan = planned(kept, units, files)
+
+    pending_typing = Some(PendingTyping(key, files, plan))
+
+    if plan.is_some()
+        last_retyped = buf()
+        last_whole_reason = ""
+
+        for unit in units
+            if plan.unwrap().has(unit.src.name) then last_retyped.push(unit.src.name)
+    end if
+
+    plan
+end retype_plan
+
+// The plan proper, `last_whole_reason` set where it is every file.
+private planned(kept: Option[KeptTyping], units: Buf[Program], files: Map[string, FileSurface]) -> Option[Set[string]]
+    if kept.is_none() then return whole("no earlier check to compare with")
+
+    val was = kept.unwrap()
+
+    // A library file the editor holds is the one way the library changes under a session.
+    std_root() match
+        Ok(root) -> if editor_holds_under(root) then return whole("the editor holds a library file")
+        Err(_) -> ()
+
+    if was.files.len() != files.len() then return whole("a file was added or removed")
+
+    var changed: Set[string] = set()
+    var frontier: Buf[string] = buf()
+    var edited: Set[string] = set()
+
+    for unit in units
+        val name = unit.src.name
+        val now = files.get(name).unwrap()
+        val before = was.files.get(name)
+
+        if before.is_none() then return whole("a file was added or removed")
+
+        val last = before.unwrap()
+
+        if last.generation == now.generation then continue
+
+        edited.add(name)
+
+        if last.header != now.header then return whole("an import or a file's header changed")
+
+        var old_parts: Map[string, SurfacePart] = map()
+
+        for p in last.parts
+            old_parts.put(p.key, p)
+
+        for p in now.parts
+            old_parts.get(p.key) match
+                None ->
+                    if p.by_no_name then return whole("a trait or an impl was written")
+                    put_in_question(p.names, &changed, &frontier)
+                Some(o) ->
+                    old_parts.remove(p.key)
+
+                    if o.surface != p.surface
+                        if p.by_no_name then return whole("a trait or an impl changed")
+                        put_in_question(o.names, &changed, &frontier)
+                        put_in_question(p.names, &changed, &frontier)
+                    else if o.whole != p.whole
+                        for n in p.names
+                            if was.evaluated.has(n) then return whole("a body a constant ran changed")
+                    end if
+
+        for (_, o) in old_parts
+            if o.by_no_name then return whole("a trait or an impl was removed")
+            put_in_question(o.names, &changed, &frontier)
+    end for
+
+    for unit in units
+        for p in files.get(unit.src.name).unwrap().parts
+            if p.volatile then put_in_question(p.names, &changed, &frontier)
+
+    // Every declaration whose surface spells a name in question is in question itself.
+    var moved: Set[string] = set()
+
+    while !frontier.is_empty()
+        var asked: Set[string] = set()
+
+        for n in frontier
+            asked.add(n)
+
+        frontier = buf()
+
+        for unit in units
+            val f = files.get(unit.src.name).unwrap()
+
+            for p in f.parts
+                val id = s"${unit.src.name}\u{1}${p.key}"
+
+                if moved.has(id) then continue
+
+                if spells_any(p.spelled, asked)
+                    moved.add(id)
+                    put_in_question(p.names, &changed, &frontier)
+                end if
+    end while
+
+    var only: Set[string] = set()
+
+    for unit in units
+        val name = unit.src.name
+        val f = files.get(name).unwrap()
+
+        if edited.has(name) || f.always || spells_one_of(f.spelled, changed) then only.add(name)
+
+    Some(only)
+end planned
+
+private whole(why: string) -> Option[Set[string]]
+    last_whole_reason = why
+    None
+end whole
+
+private put_in_question(names: Buf[string], changed: *Set[string], frontier: *Buf[string])
+    for n in names
+        if changed.add(n) then frontier.push(n)
+
+private spells_any(words: Buf[string], asked: Set[string]) -> bool
+    for w in words
+        if asked.has(w) then return true
+
+    false
+end spells_any
+
+private spells_one_of(spelled: Set[string], changed: Set[string]) -> bool
+    for n in changed
+        if spelled.has(n) then return true
+
+    false
+end spells_one_of
+
+private kept_typing(key: string) -> Option[KeptTyping]
+    for k in kept_typings
+        if k.key == key then return Some(k)
+
+    None
+end kept_typing
+
+// ---- telling and keeping ----
+
+// What a first tier tells: `fresh`, the analysis's diagnostics, for every file it typed, and for
+// every other file of the plan the diagnostics last told for it. A diagnostic the analysis placed in
+// a file it did not type, and that was not told for it before, is told as well.
+retype_merged(fresh: Buf[Placed]) -> Buf[Placed]
+    if pending_typing.is_none() then return fresh
+
+    val p = pending_typing.unwrap()
+
+    if p.only.is_none() then return fresh
+
+    val only = p.only.unwrap()
+    val was = kept_typing(p.key).unwrap()
+    var all: Buf[Placed] = buf()
+
+    for d in fresh
+        if only.has(d.src.name) || p.files.get(d.src.name).is_none() then all.push(d)
+
+    for (name, _) in p.files
+        if only.has(name) then continue
+
+        val told = was.diagnostics.get(name).unwrap_or(buf())
+
+        for d in told
+            all.push(d)
+
+        for d in fresh
+            if d.src.name == name && !told_already(told, d) then all.push(d)
+
+    in_source_order(all)
+end retype_merged
+
+private told_already(told: Buf[Placed], d: Placed) -> bool
+    for t in told
+        if t.diag.span.start == d.diag.span.start && t.diag.span.end == d.diag.span.end &&
+                t.diag.message == d.diag.message then
+            return true
+
+    false
+end told_already
+
+// The first tier `told` kept as what the plan's compilation was told, to compare the next check with.
+retype_commit(told: Buf[Placed])
+    if pending_typing.is_none() then return
+
+    val p = pending_typing.unwrap()
+    var diagnostics: Map[string, Buf[Placed]] = map()
+
+    for (name, _) in p.files
+        diagnostics.put(name, buf())
+
+    for d in told
+        diagnostics.get(d.src.name) match
+            Some(was) ->
+                var into = was
+
+                into.push(d)
+                diagnostics.put(d.src.name, into)
+            None -> ()
+
+    // A plan that typed some files only adds what its own evaluations entered to what was noted
+    // before: the files it left alone ran what they ran last time.
+    var evaluated = evaluated_now
+
+    if p.only.is_some()
+        kept_typing(p.key) match
+            Some(was) ->
+                for n in was.evaluated
+                    evaluated.add(n)
+            None -> ()
+    end if
+
+    var kept: Buf[KeptTyping] = buf()
+
+    for k in kept_typings
+        if k.key != p.key then kept.push(k)
+
+    kept.push(KeptTyping(p.key, p.files, diagnostics, evaluated))
+    kept_typings = kept
+    pending_typing = None
+end retype_commit
+
+// ---- a file's surface ----
+
+private file_surface(unit: Program, generation: u64) -> FileSurface
+    val b = unit.src.bytes
+    var parts: Buf[SurfacePart] = buf()
+    var seen: Map[string, usize] = map()
+    var header = str_builder()
+    val first = if unit.body.is_empty() then b.len else min_usize(unit.body[0].span.start, b.len)
+
+    header.push(gap_text(b, 0, first))
+
+    var prev_end = first
+
+    for s in unit.body
+        val start = min_usize(s.span.start, b.len)
+        val end_ = max_usize(min_usize(s.span.end, b.len), start)
+        val from = if start >= prev_end then prev_end else start
+        val gap = gap_text(b, from, start)
+
+        if end_ > prev_end then prev_end = end_
+
+        *s.kind match
+            ImportDecl(_) ->
+                header.push("\u{1}")
+                header.push(gap)
+                header.push(text_of(b, start, end_))
+            _ -> parts_of(b, s, gap, start, end_, &seen, &parts)
+
+    var spelled: Set[string] = set()
+
+    words_into(b, 0, b.len, &spelled)
+
+    FileSurface(generation, header.finish(), parts, spelled, spelled.has("embed"))
+end file_surface
+
+// The parts one top-level statement shows, its leading lines `gap`.
+private parts_of(b: []const u8, s: Stmt, gap: string, start: usize, end_: usize, seen: *Map[string, usize],
+                 parts: *Buf[SurfacePart])
+    val text = text_of(b, start, end_)
+
+    *s.kind match
+        FuncDecl(d) ->
+            val keep_body = is_inferred_result(d.ret_type)
+            parts.push(member_part(b, keyed(seen, s"f:${d.name}"), d.name, gap, start, end_, d.body, keep_body, false))
+        ExternDecl(d) -> parts.push(part(b, keyed(seen, s"x:${d.name}"), one(d.name), gap, start, end_, false))
+        ExternVarDecl(name, _, _, _, _) -> parts.push(part(b, keyed(seen, s"x:$name"), one(name), gap, start, end_, false))
+        VarDecl(name, _, _, _, _, _, _, _) -> parts.push(part(b, keyed(seen, s"v:$name"), one(name), gap, start, end_, false))
+        ValDecl(name, _, _, _, _, _, _, _) -> parts.push(part(b, keyed(seen, s"v:$name"), one(name), gap, start, end_, false))
+        ConstDecl(name, _, _, _) -> parts.push(part(b, keyed(seen, s"v:$name"), one(name), gap, start, end_, false))
+        MultiDecl(names, _, _, _) -> parts.push(part(b, keyed(seen, "v:"), names, gap, start, end_, false))
+        TombstoneDecl(d) -> parts.push(part(b, keyed(seen, s"t:${d.name}"), one(d.name), gap, start, end_, false))
+        StructDecl(d) ->
+            var names = one(d.name)
+
+            for f in d.fields
+                names.push(f.name)
+
+            type_parts(b, keyed(seen, s"s:${d.name}"), names, gap, start, end_, d.members, false, parts)
+        EnumDecl(d) ->
+            var names = one(d.name)
+
+            for v in d.variants
+                names.push(v.name)
+
+            type_parts(b, keyed(seen, s"e:${d.name}"), names, gap, start, end_, d.members, false, parts)
+        TypeDecl(d) -> type_parts(b, keyed(seen, s"y:${d.name}"), one(d.name), gap, start, end_, d.members, false, parts)
+        ImplDecl(d) ->
+            var names: Buf[string] = buf()
+
+            for m in d.methods
+                names.push(m.name)
+
+            type_parts(b, keyed(seen, s"i:${d.trait_name}"), names, gap, start, end_, d.methods, true, parts)
+        TraitDecl(d) ->
+            var names = one(d.name)
+
+            for m in d.methods
+                names.push(m.name)
+
+            var p = part(b, keyed(seen, s"r:${d.name}"), names, gap, start, end_, false)
+
+            p.by_no_name = true
+            parts.push(p)
+        CConstBlock(consts) ->
+            var names: Buf[string] = buf()
+
+            for c in consts
+                names.push(c.name)
+
+            parts.push(part(b, keyed(seen, "c:"), names, gap, start, end_, true))
+        CTypeBlock(types) ->
+            var names: Buf[string] = buf()
+
+            for c in types
+                names.push(c.name)
+
+            parts.push(part(b, keyed(seen, "c:"), names, gap, start, end_, true))
+        // `static` or `@thread_local` in front: the parts of the binding it is in front of.
+        StaticDecl(inner) -> parts_of(b, inner, gap, start, end_, seen, parts)
+        CopiedDecl(_, inner) -> parts_of(b, inner, gap, start, end_, seen, parts)
+        // A statement of the entry file's body, an assert, an `asm` block: nothing another file names.
+        ExprStmt(_) | Return(_) | Become(_) | Break(_, _) | Continue(_) | Defer(_, _) | MultiAssign(_, _, _) |
+                AssertDecl(_, _) | ModuleAsm(_, _, _) | AsmStmt(_) | Require(_, _) | Ensure(_, _) |
+                Invariant(_, _) | Variant(_) ->
+            parts.push(part(b, keyed(seen, "b:"), buf(), gap, start, end_, false))
+        // Anything else names whatever it spells.
+        _ -> parts.push(part(b, keyed(seen, "o:"), words_of(text), gap, start, end_, false))
+end parts_of
+
+// A type's parts: its heading -- everything but its members -- under `key`, and each member its own.
+private type_parts(b: []const u8, key: string, names: Buf[string], gap: string, start: usize, end_: usize,
+                   members: Buf[MethodDecl], by_no_name: bool, parts: *Buf[SurfacePart])
+    var heading = str_builder()
+    var at = start
+    var member_seen: Map[string, usize] = map()
+    var made: Buf[SurfacePart] = buf()
+
+    heading.push(gap)
+
+    for m in members
+        val ms = min_usize(max_usize(m.span.start, at), end_)
+        val me = max_usize(min_usize(m.span.end, end_), ms)
+
+        if me <= ms then continue
+
+        // The blanks before a member belong to no one: a member written or taken away is the member's
+        // change, not the heading's.
+        heading.push(text_of(b, at, trimmed_end(b, at, ms)))
+        at = me
+
+        var p = member_part(b, keyed(&member_seen, s"$key.${m.name}"), m.name, "", ms, me, m.body,
+                            is_inferred_result(m.ret_type), by_no_name)
+
+        made.push(p)
+
+    heading.push(text_of(b, at, trimmed_end(b, at, end_)))
+
+    val surface = heading.finish()
+    var spelled: Set[string] = set()
+    var words: Buf[string] = buf()
+
+    words_of_text(surface, &spelled, &words)
+    parts.push(SurfacePart(key, names, surface, surface, words, by_no_name, false))
+
+    for p in made
+        parts.push(p)
+end type_parts
+
+// A function's part, or a member's: its surface is its text with the body cut out, unless what the
+// body says is part of what the function shows (`keep_body`, or a result written `some`).
+private member_part(b: []const u8, key: string, name: string, gap: string, start: usize, end_: usize,
+                    body: Buf[Stmt], keep_body: bool, by_no_name: bool) -> SurfacePart
+    val whole = gap + text_of(b, start, end_)
+    var surface = whole
+
+    if !body.is_empty()
+        val bs = min_usize(max_usize(body[0].span.start, start), end_)
+        val be = max_usize(min_usize(body[body.len() - 1].span.end, end_), bs)
+        val cut = gap + text_of(b, start, bs) + "\u{1}" + text_of(b, be, end_)
+
+        var cut_spelled: Set[string] = set()
+        var cut_words: Buf[string] = buf()
+
+        words_of_text(cut, &cut_spelled, &cut_words)
+
+        if !keep_body && !cut_spelled.has("some") then surface = cut
+    end if
+
+    var spelled: Set[string] = set()
+    var words: Buf[string] = buf()
+
+    words_of_text(surface, &spelled, &words)
+    SurfacePart(key, one(name), surface, whole, words, by_no_name, false)
+end member_part
+
+private part(b: []const u8, key: string, names: Buf[string], gap: string, start: usize, end_: usize,
+             volatile: bool) -> SurfacePart
+    val surface = gap + text_of(b, start, end_)
+    var spelled: Set[string] = set()
+    var words: Buf[string] = buf()
+
+    words_of_text(surface, &spelled, &words)
+    SurfacePart(key, names, surface, surface, words, false, volatile)
+end part
+
+// `key` with which of that key it is, counted from zero in the order the file writes them.
+private keyed(seen: *Map[string, usize], key: string) -> string
+    val n = seen.get(key).unwrap_or(0)
+
+    seen.put(key, n + 1)
+    s"$key#$n"
+end keyed
+
+private one(name: string) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    out.push(name)
+    out
+end one
+
+// The lines between two statements that say something: an attribute, a doc comment's text. A blank
+// line and a `//` line say nothing to another file, so typing one in is not a change to the surface.
+private gap_text(b: []const u8, from: usize, to: usize) -> string
+    var out = str_builder()
+    var i = from
+
+    while i < to
+        var j = i
+
+        while j < to && b[j] != u8('\n')
+            j += 1
+
+        var k = i
+
+        while k < j && (b[k] == u8(' ') || b[k] == u8('\t') || b[k] == u8('\r'))
+            k += 1
+
+        val says = k < j && !(k + 1 < j && b[k] == u8('/') && b[k + 1] == u8('/'))
+
+        if says
+            out.push(text_of(b, i, j))
+            out.push("\n")
+        end if
+
+        i = j + 1
+    end while
+
+    out.finish()
+end gap_text
+
+// Where the text from `from` to `to` ends without its trailing blanks.
+private trimmed_end(b: []const u8, from: usize, to: usize) -> usize
+    var e = to
+
+    while e > from && (b[e - 1] == u8(' ') || b[e - 1] == u8('\t') || b[e - 1] == u8('\r') || b[e - 1] == u8('\n'))
+        e -= 1
+
+    e
+end trimmed_end
+
+private text_of(b: []const u8, from: usize, to: usize) -> string =
+    if to <= from then "" else from_utf8_unchecked(b[from..<to])
+
+private words_of(text: string) -> Buf[string]
+    var spelled: Set[string] = set()
+    var words: Buf[string] = buf()
+
+    words_of_text(text, &spelled, &words)
+    words
+end words_of
+
+private words_of_text(text: string, spelled: *Set[string], words: *Buf[string])
+    val b = text.bytes
+    var i: usize = 0
+
+    while i < b.len
+        if !lsp_word_byte(b[i])
+            i += 1
+            continue
+        end if
+
+        val start = i
+
+        while i < b.len && lsp_word_byte(b[i])
+            i += 1
+
+        if b[start] >= u8('0') && b[start] <= u8('9') then continue
+
+        val w = from_utf8_unchecked(b[start..<i])
+
+        if spelled.add(w) then words.push(w)
+end words_of_text
+
+private words_into(b: []const u8, from: usize, to: usize, spelled: *Set[string])
+    var i = from
+
+    while i < to
+        if !lsp_word_byte(b[i])
+            i += 1
+            continue
+        end if
+
+        val start = i
+
+        while i < to && lsp_word_byte(b[i])
+            i += 1
+
+        if b[start] >= u8('0') && b[start] <= u8('9') then continue
+
+        spelled.add(from_utf8_unchecked(b[start..<i]))
+end words_into
+
+private min_usize(a: usize, b: usize) -> usize = if a < b then a else b
+
+private max_usize(a: usize, b: usize) -> usize = if a > b then a else b
+
+// Whether an editor's first tier leaves the bodies of `file` to the diagnostics last told for it.
+skips_bodies_of(a: &Analysis, file: string) -> bool = a.editor match
+    None -> false
+    Some(e) -> e.retype_only match
+        None -> false
+        Some(only) -> !only.has(file)

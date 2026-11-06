@@ -100,16 +100,20 @@ end Indexing
 //
 // **`first_tier_only` ends the analysis once its first tier is told** -- the check of a package's own
 // code without its `@tests` files, which a second analysis with them follows (`indexed_file`).
+//
+// **`retype_only` names the files whose bodies a first tier types** (`retype_kept.sysl`); every other
+// file's are left to the diagnostics last told for it. It is set only with `first_tier_only`.
 struct EditorCheck
     first_tier: &Fn(Buf[Placed]) -> unit
     superseded: &Fn() -> bool
     abandoned: bool
     first_tier_only: bool
+    retype_only: Option[Set[string]]
 end EditorCheck
 
 editor_check(first_tier: &Fn(Buf[Placed]) -> unit, superseded: &Fn() -> bool,
-             first_tier_only: bool = false) -> &EditorCheck =
-    EditorCheck(first_tier, superseded, false, first_tier_only)
+             first_tier_only: bool = false, retype_only: Option[Set[string]] = None) -> &EditorCheck =
+    EditorCheck(first_tier, superseded, false, first_tier_only, retype_only)
 
 // Whether the editor's check this analysis is has been told to stop -- asked of the text the editor
 // holds now, once per boundary, and remembered. A build is never told to.
@@ -247,33 +251,67 @@ indexed_file(path: string, editor: Option[&EditorCheck] = None, editing: string 
     val program = packaged_compilation_of(path, t)?
     val ix = definition_index()
 
-    editor match
-        None -> ()
-        Some(e) ->
-            val own = without_test_files(program.units, editing)
+    if editor.is_none()
+        val done = analyze_produced(program.units, program.target, buf(), true, Some(ix))
 
-            if own.len() < program.units.len()
-                val first = editor_check(e.first_tier, e.superseded, true)
+        return Ok(Indexing(ix.references, done.reported))
+    end if
 
-                analyze_produced(own, program.target, buf(), true, None, editor = Some(first))
+    val e = editor.unwrap()
+    val own = without_test_files(program.units, editing)
 
-                if first.abandoned
-                    e.abandoned = true
-                    return Ok(Indexing(buf(), buf()))
-                end if
+    // **Where an earlier check told a first tier, only what an edit can have changed is typed**
+    // (`retype_kept.sysl`): the plan names those files, and the rest are told what was told for
+    // them last time. What the first tier tells, whichever way it was made, is kept for the next.
+    val plan = retype_plan(s"${absolute_path(path)}\u{1}${program.target.name}", own)
+    val caught: &FirstTold = FirstTold(false, buf())
+    val tell: &Fn(Buf[Placed]) -> unit = ds ->
+        val merged = retype_merged(ds)
 
-                val rest = editor_check(_ -> (), e.superseded)
-                val done = analyze_produced(program.units, program.target, buf(), true, Some(ix), editor = Some(rest))
+        caught.told = true
+        caught.said = merged
+        e.first_tier(merged)
 
-                if rest.abandoned then e.abandoned = true
+    note_evaluations(true)
 
-                return Ok(Indexing(ix.references, done.reported))
-            end if
+    if own.len() < program.units.len() || plan.is_some()
+        val first = editor_check(tell, e.superseded, true, plan)
 
-    val done = analyze_produced(program.units, program.target, buf(), true, Some(ix), editor = editor)
+        analyze_produced(own, program.target, buf(), true, None, editor = Some(first))
+        note_evaluations(false)
+
+        if first.abandoned
+            e.abandoned = true
+            return Ok(Indexing(buf(), buf()))
+        end if
+
+        if caught.told then retype_commit(caught.said)
+
+        val rest = editor_check(_ -> (), e.superseded)
+        val done = analyze_produced(program.units, program.target, buf(), true, Some(ix), editor = Some(rest))
+
+        if rest.abandoned then e.abandoned = true
+
+        return Ok(Indexing(ix.references, done.reported))
+    end if
+
+    val whole = editor_check(tell, e.superseded)
+    val done = analyze_produced(program.units, program.target, buf(), true, Some(ix), editor = Some(whole))
+
+    note_evaluations(false)
+
+    if caught.told then retype_commit(caught.said)
+
+    if whole.abandoned then e.abandoned = true
 
     Ok(Indexing(ix.references, done.reported))
 end indexed_file
+
+// What an editor's first tier told, caught on its way to the editor so it can be kept.
+private struct FirstTold
+    told: bool
+    said: Buf[Placed]
+end FirstTold
 
 // A compilation's files without its `@tests` files, except `editing`'s.
 private without_test_files(units: Buf[Program], editing: string) -> Buf[Program]

@@ -28,20 +28,27 @@ private struct KeptParse
     gate: string
     text: string
     parsed: Parsed
+
+    // Which parse of the process this is, counted from one: a file whose kept parse has the
+    // generation an earlier compilation saw is the very parse that compilation read (`retype_kept`).
+    generation: u64
 end KeptParse
 
 private var keeping_parses: bool = false
 private var kept_parses: Map[string, KeptParse] = map()
 private var kept_parse_hits: usize = 0
 private var kept_parse_misses: usize = 0
+private var parse_generations: u64 = 0
 
 // Whether `parse_kept` keeps what it parses. Either way the parses kept so far are let go of and the
-// counts start again.
+// counts start again -- and so is what the last checks typed (`retype_kept`), which is told apart
+// file by file through the parses kept here.
 keep_parses(on: bool)
     keeping_parses = on
     kept_parses = map()
     kept_parse_hits = 0
     kept_parse_misses = 0
+    forget_kept_typing()
 end keep_parses
 
 // `src` parsed for `t` with its package's `#if` symbols and option lines, as `parse` parses it --
@@ -63,9 +70,18 @@ parse_kept(src: Source, t: Target, features: Buf[string], options: Buf[string]) 
     val parsed = parse(src, t, features, options)
 
     kept_parse_misses += 1
-    kept_parses.put(src.name, KeptParse(gate, text, parsed))
+    parse_generations += 1
+    kept_parses.put(src.name, KeptParse(gate, text, parsed, parse_generations))
     parsed
 end parse_kept
+
+// The generation of the parse kept for the file named `name` -- what the compilation now being read
+// was handed for it -- or nothing where parses are not being kept or none is kept for it.
+kept_parse_generation(name: string) -> Option[u64]
+    if !keeping_parses then return None
+
+    kept_parses.get(name).map(k -> k.generation)
+end kept_parse_generation
 
 // What a parse is gated by besides its text, as one string: the target's name, then each symbol and
 // each option line, each closed by a byte no name or line holds.
