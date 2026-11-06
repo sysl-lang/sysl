@@ -3,7 +3,7 @@ module sh.sysl.compiler
 
 import sh.sysl.parsing.*
 import sysl.buf.{Buf, buf}
-import sysl.fs.{make_temp_dir, remove_dir_all, write_text}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
 import sysl.process.capture
 
 // `sysl.fiber.switch`, which the compiler emits in place (`fiber_switch.sysl`). What the switch does
@@ -508,6 +508,126 @@ fsw_runs_hop_at_o2()
     if !fsw_ready() then return
 
     assert_eq(fsw_runs_at_o2(fsw_hop), 0)
+
+// The fiber of `fsw_hop`, in a program that never calls `switch` by name: every switch is `go`
+// followed by its two arguments and `)`, through what `head` declares or `field`/`init` give `Hop` --
+// an address taken, a `&Fn` value, a module `val`, an argument, a generic's answer. `imports` is
+// the import lines main needs besides.
+private fsw_hop_through(imports: string, head: string, field: string, init: string, go: string) -> string =
+    "import sysl.fiber.{Context, Stack}\n" +
+        "import sysl.threads.{ScopeSlot, scope_in}\n" + imports + "\n" +
+        "@thread_local\nvar tag: int = 0\n\n" +
+        "@inline\ntag_inline() -> int = tag\n\n" +
+        head + "\n\n" +
+        "struct Hop\n    back: Context\n    me: Context\n    direct: [3]int\n    inlined: [3]int\n" +
+        s"    next: int\n    $field\n\n" +
+        "hop(h: *Hop)\n    for i in 0..<3\n        h.direct[i] = tag\n        h.inlined[i] = tag_inline()\n" +
+        s"        tag += 10\n        $go&h.me, &h.back)\n\n    loop\n        $go&h.me, &h.back)\n\n" +
+        s"on_carrier(h: *Hop)\n    tag = h.next\n    $go&h.back, &h.me)\n" +
+        "    print(s\"carrier ${h.next}: ${tag - h.next}\")\n\n" +
+        "main()\n    tag = 1\n\n    val s = Stack.reserve(64 * 1024).unwrap()\n" +
+        s"    var h = Hop(Context.new(), Context.new(), [0; 3], [0; 3], 1, $init)\n\n" +
+        s"    h.me = Context.start(s, &hop, &h)\n    $go&h.back, &h.me)\n\n    val ph = &h\n\n" +
+        "    for k in 2..<4\n        h.next = k\n\n        var slots: [1]ScopeSlot = [ScopeSlot.new(); 1]\n\n" +
+        "        scope_in(slots[..], (sc) -> sc.start(&on_carrier, ph))\n\n" +
+        "    for i in 0..<3\n        print(s\"round $i: ${h.direct[i]} ${h.inlined[i]}\")\n"
+
+// What every `fsw_hop_through` program prints when each carrier's copy is the one read.
+private val fsw_hop_said: string = "carrier 2: 10\ncarrier 3: 10\nround 0: 1 1\nround 1: 2 2\nround 2: 3 3\n"
+
+// A project run at `-O2`, `main.sysl` beside a module `extra` of the given text where there is one:
+// what it printed, after the exit status where that is not 0.
+private fsw_prints_at_o2(text: string, extra: Option[(string, string)] = None) -> string
+    val root = runner_project("main.sysl", text)
+    val cache = make_temp_dir("sysl-fsw-cache").unwrap()
+
+    extra match
+        Some((dir, body)) ->
+            make_dir_all(s"$root/$dir").unwrap()
+            write_text(s"$root/$dir/$dir.sysl", body).unwrap()
+        None -> ()
+
+    use_run_cache_dir(Some(cache))
+
+    var said: Buf[string] = buf()
+    val sink = &said
+    val exe = s"$root/hop"
+    val code = run_cli(["sysl", "build", root, "-O2", "-o", exe], piece -> sink.push(piece))
+
+    use_run_cache_dir(None)
+
+    var out = ""
+
+    if code == 0
+        val got = capture(exe, [], "", [], true).unwrap()
+
+        out = got.text
+        if !got.status.ok() then out += "the program failed\n"
+    else
+        for piece in said
+            out += piece
+
+    remove_dir_all(root).unwrap_or(())
+    remove_dir_all(cache).unwrap_or(())
+    out
+end fsw_prints_at_o2
+
+private val fsw_ptr: string = "*extern(*Context, *Context) -> unit"
+private val fsw_import: string = "import sysl.fiber.switch\n"
+
+@test("at -O2 a switch reached only through its address reads and writes each carrier's thread-local")
+fsw_runs_address_only()
+    if !fsw_ready() then return
+
+    val text = fsw_hop_through(fsw_import, "", s"go: $fsw_ptr", "&switch", "h.go(")
+
+    assert_eq(fsw_prints_at_o2(text), fsw_hop_said)
+    fsw_has(fsw_ir(text, "aarch64-macos"), "@sysl.tls.tag()")
+
+@test("and through a '&sync Fn' value of it, held in a field")
+fsw_runs_fn_value_only()
+    if !fsw_ready() then return
+
+    val field = "go: &sync Fn(*Context, *Context) -> unit"
+
+    assert_eq(fsw_prints_at_o2(fsw_hop_through(fsw_import, "", field, "switch", "h.go(")), fsw_hop_said)
+
+@test("and through a module 'val' holding its address")
+fsw_runs_module_val_only()
+    if !fsw_ready() then return
+
+    val text = fsw_hop_through(fsw_import, s"val go: $fsw_ptr = &switch", "unused: int", "0", "go(")
+
+    assert_eq(fsw_prints_at_o2(text), fsw_hop_said)
+    fsw_has(fsw_ir(text, "aarch64-macos"), "@sysl.tls.tag()")
+
+@test("and through its address passed as an argument")
+fsw_runs_address_argument()
+    if !fsw_ready() then return
+
+    val head = s"via(go: $fsw_ptr, from: *Context, to: *Context) = go(from, to)"
+
+    assert_eq(fsw_prints_at_o2(fsw_hop_through(fsw_import, head, "unused: int", "0", "via(&switch, ")),
+              fsw_hop_said)
+
+@test("and through an address only a generic takes")
+fsw_runs_address_in_generic()
+    if !fsw_ready() then return
+
+    val head = s"address_of[T]() -> $fsw_ptr = &switch"
+    val text = fsw_hop_through(fsw_import, head, s"go: $fsw_ptr", "address_of[int]()", "h.go(")
+
+    assert_eq(fsw_prints_at_o2(text), fsw_hop_said)
+
+@test("and through an address only another module of the project takes")
+fsw_runs_address_in_module()
+    if !fsw_ready() then return
+
+    val text = fsw_hop_through("import hopper.switch_address\n", "", s"go: $fsw_ptr", "switch_address()",
+                               "h.go(")
+    val hopper = s"module hopper\n\nimport sysl.fiber.{Context, switch}\n\nswitch_address() -> $fsw_ptr = &switch\n"
+
+    assert_eq(fsw_prints_at_o2(text, Some(("hopper", hopper))), fsw_hop_said)
 
 @test("at -O2 integers and floats live across a switch survive what the other side does")
 fsw_runs_regs_at_o2()

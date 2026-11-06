@@ -33,7 +33,12 @@ import sysl.container.{Set, set}
 // ordinary call to the library's definition, as it was.
 
 // The switch's key in this program, or nothing: where the machine has the switch and some body calls
-// it.
+// it or takes its address. An address taken (`&switch`, a `*extern` value) is called through out of
+// line, and LLVM would still reuse a thread-local's address across that call; a `&Fn` value made of
+// the switch is a body of its own that calls it, so it is seen as a call.
+//
+// The standard module's precompiled bodies are emitted once for every program (`std_artifact.sysl`),
+// so they never ask an accessor: none of them switches, and `fiber.md` says what that leaves.
 fiber_switch_key(p: TProgram, t: Target) -> string
     if !os_posix(t.os) || (t.cpu != Aarch64 && t.cpu != X86_64) then return ""
 
@@ -47,13 +52,22 @@ fiber_switch_key(p: TProgram, t: Target) -> string
     if key == "" then return ""
 
     var found: Buf[string] = buf()
+    val names = expr_walk(false, x -> *x.kind match
+        TCall(name, _, _, _) -> if name == key then found.push(name)
+        TFuncAddr(name, _, _) -> if name == key then found.push(name)
+        _ -> ())
+
+    for v in p.vals
+        v.init match
+            Some(init) -> walk_texpr(init, names)
+            None -> ()
+
+    if !found.is_empty() then return key
 
     for f in p.funcs
         if f.name == key then continue
 
-        walk_block_stmts(f.body, expr_walk(false, x -> *x.kind match
-            TCall(name, _, _, _) -> if name == key then found.push(name)
-            _ -> ()))
+        walk_block_stmts(f.body, names)
 
         if !found.is_empty() then return key
 

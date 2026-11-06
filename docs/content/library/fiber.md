@@ -230,8 +230,12 @@ per thread, which belongs to the carrier**:
   that thread's copy — in the very function that called `switch`, in a helper inlined into it, and in
   a loop around the switch. The compiler works a thread-local's address out again after every
   `switch`, at every optimization level, rather than letting the optimizer reuse the one from before
-  it, which would be the old carrier's. (An address taken with `&` and kept in a variable across a
-  switch is an ordinary pointer, and still names the copy it was taken from.)
+  it, which would be the old carrier's. That holds wherever the program names `switch` — a call, its
+  address in a `*extern` value, a `&Fn` made of it — in any of its own modules or its packages'.
+  (An address taken with `&` and kept in a variable across a switch is an ordinary pointer, and still
+  names the copy it was taken from.) The standard library's own functions are compiled once for
+  every program, without this: none of them switches, but one that calls back into code that does
+  may go on, for the rest of that call, counting into the error trace of the carrier it began on.
 - **[`sysl.threads.current()`](/library/threads/) answers the carrier** — the thread running now.
 - **The [error return trace](/library/sys/) is the carrier's.** The sites it records are constants,
   never addresses in a frame, so a fiber that moves leaves nothing dangling, but a failure a fiber
