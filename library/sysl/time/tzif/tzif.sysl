@@ -1,7 +1,7 @@
 module sysl.time.tzif
 
-import sysl.time.{Instant, Offset, us_per_second, LocalDate, Weekday}
-import sysl.time.{date_at, civil_from_days, days_in_month, leap_year, on_or_after}
+import sysl.time.{Instant, Offset, us_per_second, Date, YearMonthDay, Weekday}
+import sysl.time.{days_from_civil, civil_from_days, days_in_month, leap_year, on_or_after}
 import sysl.math.div_floor
 import sysl.encoding.get_u32_be
 import sysl.text.from_utf8
@@ -425,15 +425,15 @@ end rule
 
 /** The day, counted from 1970, on which a date of the rule falls in year `y`. */
 private rule_day(r: DateRule, y: int) -> int
-    val jan1 = date_at(y, 1, 1).day
+    val jan1 = days_from_civil(YearMonthDay(y, 1, 1)).day
 
     if r.kind == u8('n') then return jan1 + r.n
 
     if r.kind == u8('J') then return jan1 + r.n - 1 + (if leap_year(y) && r.n >= 60 then 1 else 0)
 
     // The w-th d-day of the month, where the fifth means the last, which some months have only four of.
-    var day = on_or_after(date_at(y, r.n, 1), Weekday(r.day)).day + (r.week - 1) * 7
-    val last = date_at(y, r.n, days_in_month(y, r.n)).day
+    var day = on_or_after(days_from_civil(YearMonthDay(y, r.n, 1)), Weekday(r.day)).day + (r.week - 1) * 7
+    val last = days_from_civil(YearMonthDay(y, r.n, days_in_month(y, r.n))).day
 
     while day > last
         day -= 7
@@ -453,7 +453,7 @@ private by_rule(r: TzRule, secs: long) -> Local
 
     if !r.has_dst then return standard
 
-    val y = civil_from_days(LocalDate(int(div_floor(secs + long(r.std_off), 86400)))).year
+    val y = civil_from_days(Date(int(div_floor(secs + long(r.std_off), 86400)))).year
     val start = long(rule_day(r.start, y)) * 86400 + long(r.start.time) - long(r.std_off)
     val stop = long(rule_day(r.stop, y)) * 86400 + long(r.stop.time) - long(r.dst_off)
     val dst = if start < stop then secs >= start && secs < stop else secs < stop || secs >= start
