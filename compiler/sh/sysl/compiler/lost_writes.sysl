@@ -17,7 +17,8 @@ import sysl.buf.{Buf, buf}
 // of an array or a vector -- and a `*self` method answering nothing called on such a place. One
 // answering a value is a read: what it did is in its answer. A write through a `*T`, a
 // `&T`, a slice's element or a `Buf` reaches storage the copy shares with the caller, and is not
-// lost. A parameter that is itself a `*T`, `&T` or `&sync T` is never followed.
+// lost -- and a run stored into a slice (`out.store(i, v)`) is a write of its elements like any other,
+// so only one stored into an array is a write of the parameter. A parameter that is itself a `*T`, `&T` or `&sync T` is never followed.
 //
 // **What counts as a read** is any other mention of the parameter: a read of it or of any part, an
 // argument, a `return`, the body's result, a `*self` call answering a value -- a cursor's `next()`, an
@@ -182,10 +183,15 @@ end note_root
 private root_in(params: Buf[string], place: TExpr) -> Option[string] = *place.kind match
     TLoad(name, _) -> if holds_string(params, name) then Some(name) else None
     TField(recv, _, _) -> if in_place_type(texpr_type(recv)) then root_in(params, recv) else None
-    TIndex(recv, _, _) -> texpr_type(recv) match
-        Array(_, _) -> root_in(params, recv)
-        _ -> None
+    TIndex(recv, _, _) -> if run_in_place(recv) then root_in(params, recv) else None
     _ -> None
+
+// Whether the elements of what is indexed or stored into (`xs[i]`, `xs.store(i, v)`) are held in it:
+// an array's are, so a write to one writes the array; a slice's are what it views, so a write to one
+// goes through to storage the slice shares with whoever handed it over, and the slice is only read.
+private[compiler] run_in_place(recv: TExpr) -> bool = texpr_type(recv) match
+    Array(_, _) -> true
+    _ -> false
 
 private in_place_type(t: Type) -> bool = t match
     Struct(_) -> true
@@ -401,7 +407,10 @@ private lost_expr(w: &LostWalk, e: TExpr, f: LostFlow) -> LostFlow
             lost_place(w, place, s"'$op'", false, e.span, lost_expr(w, value, f))
         TIncDec(place, op, _, _, _) -> lost_place(w, place, s"'$op'", false, e.span, f)
         TVecStore(recv, index, value) ->
-            lost_place(w, recv, "assignment", false, e.span, lost_expr(w, value, lost_expr(w, index, f)))
+            val g = lost_expr(w, value, lost_expr(w, index, f))
+
+            if run_in_place(recv) then lost_place(w, recv, "assignment", false, e.span, g)
+            else lost_expr(w, recv, g)
         TCall(name, args, ty, _) -> lost_call(w, e, name, args, ty, f)
         TRecheck(after, _, _, _) -> lost_expr(w, after, f)
         TLogical(_, left, right) ->
