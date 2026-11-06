@@ -722,7 +722,8 @@ Ok(true)
 - **A descriptor that is not open is `Err(NotOpen)`**, a closed `File` included. A terminal or another
   character device is waited on like a pipe, although Darwin's `poll` cannot do that itself.
 - **One descriptor, one direction.** It is `poll(2)` on a single descriptor — the `Interest` that mio
-  registers, with no set to manage. A program waiting on many descriptors at once wants an event loop.
+  registers, with no set to manage. A program waiting on many descriptors at once wants
+  [`sysl.io.poll`](/library/poll/), the kernel's readiness set.
 
 **A module of its own, because of what it fails with.** The error is
 [`sysl.fs.IoError`](/library/fs/), and `sysl.fs` is built on `sysl.io`, so the reading surface

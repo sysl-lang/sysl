@@ -15,8 +15,8 @@ reading.
 
 **One descriptor and one direction, deliberately.** It is `poll(2)` on a single `pollfd`, the shape
 mio's `Interest` gives a registration, without a set to manage: a program waiting on many
-descriptors at once wants an event loop, and that is a different thing to build than a time limit
-on one read.
+descriptors at once wants `sysl.io.poll`, the kernel's readiness set, which takes the same
+`Interest`.
 
 **A module of its own rather than part of `sysl.io`**, because what a wait fails with is
 `sysl.fs.IoError`, and `sysl.fs` is built on `sysl.io`: the reading surface cannot name the

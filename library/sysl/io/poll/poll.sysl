@@ -1,0 +1,214 @@
+module sysl.io.poll
+
+/** Waiting on many descriptors at once: a set of them registered with the kernel -- kqueue on Darwin
+ * and the BSDs, epoll on Linux -- and one call that answers which are ready.
+ *
+ * It is the readiness primitive under a server that holds thousands of connections on a few threads:
+ * register each socket with a token of the program's choosing, `wait`, and act on the tokens that come
+ * back. **It is not an event loop.** Nothing here reads, writes, schedules or calls back; `wait`
+ * answers which descriptors would not block, and the program does the rest, as `sysl.io.wait.ready`
+ * answers it for one.
+ *
+ *     val p = Poller.open()?
+ *     var got = [Event.none; 64]
+ *
+ *     p.register(listener.fd()?, [Readable], 0)?
+ *
+ *     loop
+ *         for e in got[0..<p.wait(got[..], None)?]
+ *             serve(e.token)
+ *
+ * **A wait allocates nothing**: the events are written into the slice the caller hands it, which the
+ * kernel also uses as its scratch, so a server's loop runs without the heap.
+ *
+ * **One poller is shared between threads.** Every copy of a `Poller` is a share of one set, held as a
+ * `&sync`, and `register`, `modify` and `deregister` may be called from any thread while another sits
+ * in `wait` -- both kernels allow it,
+ * and a registration made during a wait is seen by that wait. A `Waker` ends a wait from anywhere.
+ * Two threads waiting on one poller at once is allowed and each gets some of the events, but which is
+ * the kernel's choice.
+ *
+ * A target with neither kqueue nor epoll answers every call with the error `sysl.fs.unsupported()`
+ * stands for, as `sysl.io.wait` does for a system without `poll`. It needs an operating system: a
+ * freestanding program reaching it answers the `sysl_io_poll_*` hooks itself (`sysl.io.sys`).
+ */
+
+import sysl.fs.{IoError, from_status}
+import sysl.io.sys.{poll_close, poll_control, poll_open, poll_wait, poll_wake}
+import sysl.io.wait.{Interest, Readable, Writable}
+import sysl.raw.ptr_cast
+import sysl.slices.as_mut_ptr
+import sysl.time.{Duration, whole_micros}
+
+/** How a registration reports readiness. */
+enum Mode
+    /** For as long as the descriptor is ready: every `wait` reports it again until it is read, written
+     * or drained. The default, and the one that cannot lose an event.
+     */
+    Level
+
+    /** Once, and then not again until `modify` re-arms it (`EV_DISPATCH`, `EPOLLONESHOT`). The
+     * registration stays, so `modify` and `deregister` still work on it. The form for handing a ready
+     * descriptor to exactly one of several waiting threads.
+     */
+    OneShot
+
+    /** On each change from not ready to ready (`EV_CLEAR`, `EPOLLET`): reported once, and not again
+     * until new data arrives or new room opens -- so the program reads, or writes, until the call
+     * answers `would_block`.
+     */
+    Edge
+
+/** One descriptor found ready by `wait`: the token it was registered with, and how it is ready.
+ *
+ * **A descriptor ready both ways may come back as one event or as two** -- epoll reports a descriptor
+ * once with both, kqueue reports each direction on its own -- so a program acts on each flag rather
+ * than on the count. `hangup` is the peer having gone (the read then answers the end of the input),
+ * and `error` a failure pending on the descriptor, which the next call on it reports.
+ *
+ * It is 32 bytes laid out for the hook that fills it (`sysl.io.sys`); `Event.none` is the value a
+ * buffer of them starts as.
+ */
+struct Event
+    token: u64
+    readable: bool
+    writable: bool
+    hangup: bool
+    error: bool
+    private spare: [20]u8
+
+    /** An event with no token and no readiness: what a buffer is filled with before a `wait`. */
+    static none -> Event = Event(0, false, false, false, false, [0; 20])
+
+/** The two descriptors behind a poller, shared by every copy of it and by its wakers, and closed when
+ * the last share goes.
+ *
+ * **It is a `&sync`**, whose count is atomic, because a poller is the thing a server hands to its
+ * threads (`reference/memory.md § Crossing a concurrency domain`). Nothing in it changes after it is
+ * opened -- every change is the kernel's -- so sharing it needs no lock.
+ */
+private[poll] struct PollerState
+    fd: int
+    wake_fd: int
+
+/** Both descriptors closed. A failure is not reported, there being nobody to report it to
+ * (`sysl.Drop`).
+ */
+impl Drop for PollerState
+    drop(self)
+        _ = poll_close(self.fd, self.wake_fd)
+
+/** A kernel readiness set.
+ *
+ * **It closes itself**: every copy shares one set, which is closed when the last copy -- and the last
+ * `Waker` -- goes. A copy is what another thread is handed; `register`, `modify` and `deregister` may
+ * be called through one while another thread waits through another.
+ */
+struct Poller
+    private[poll] state: &sync PollerState
+
+    /** A new, empty set. Fails only as the system's descriptors run out, or where the target has no
+     * readiness set at all.
+     */
+    open() -> Result[Poller, IoError]
+        var wake: i32 = -1
+        val fd = poll_open(&wake)
+
+        if fd < 0 then return Err(from_status(fd))
+
+        val state: &sync PollerState = PollerState(fd, int(wake))
+
+        Ok(Poller(state))
+    end open
+
+    /** Watch `fd` for each of `interest`, reporting it with `token`.
+     *
+     *     p.register(s.fd()?, [Readable, Writable], 7, Edge)?
+     *
+     * `u64::Max` is the poller's own token for a wake and is refused, as is an empty `interest`, with
+     * the error of an invalid argument. A descriptor that is not open is `NotOpen`. **A descriptor is
+     * registered once**: a second `register` of it is `AlreadyExists` under epoll and replaces the
+     * first under kqueue, so a program that means to change one calls `modify`. A descriptor closed
+     * while registered leaves the set by itself.
+     */
+    register(self, fd: int, interest: []const Interest, token: u64, mode: Mode = Level) -> Result[unit, IoError] =
+        self.control(fd, 0, interest, token, mode)
+
+    /** Replace what `fd` is watched for, its token and its mode -- and re-arm a `OneShot` that has
+     * fired. A descriptor that is not registered is `NotFound`.
+     */
+    modify(self, fd: int, interest: []const Interest, token: u64, mode: Mode = Level) -> Result[unit, IoError] =
+        self.control(fd, 1, interest, token, mode)
+
+    /** Stop watching `fd`; no event for it is reported by a `wait` that begins afterwards. A descriptor
+     * that is not registered is `NotFound`.
+     */
+    deregister(self, fd: int) -> Result[unit, IoError]
+        val got = poll_control(self.state.fd, fd, 2, 0, 0, 0)
+
+        if got < 0 then Err(from_status(got)) else Ok(())
+
+    /** Wait at most `timeout` -- for ever where it is `None` -- for something registered to be ready,
+     * writing what is into `events` and answering how many.
+     *
+     * **It allocates nothing**; at most `events.len` are written, and the rest stay ready for the next
+     * wait. Zero is the time running out, or a `Waker` ending the wait: **a wake is never itself an
+     * event**, so a program that wakes its poller to say "look at your queue" looks at its queue
+     * whatever the count. A signal arriving during the wait does not end it; the wait is asked for
+     * again with whatever of `timeout` is still owed. A zero timeout asks once and does not wait, and
+     * an empty `events` answers zero at once, there being nowhere to report anything.
+     */
+    @blocks
+    @no_alloc
+    wait(self, events: []Event, timeout: Option[Duration]) -> Result[usize, IoError]
+        val micros = timeout match
+            Some(d) -> if whole_micros(d) < 0 then 0 else whole_micros(d)
+            None -> -1
+
+        if events.len == 0 then return Ok(0)
+
+        val got = poll_wait(self.state.fd, self.state.wake_fd, ptr_cast(as_mut_ptr(events)), events.len, micros)
+
+        if got < 0 then Err(from_status(int(got))) else Ok(usize(got))
+    end wait
+
+    /** Something that ends this poller's `wait` from any thread: a share of the poller, which stays
+     * open while a waker lives.
+     */
+    waker(self) -> Waker = Waker(self.state)
+
+    private control(self, fd: int, op: int, interest: []const Interest, token: u64,
+                    mode: Mode) -> Result[unit, IoError]
+        var bits = 0
+
+        for i in interest
+            bits |= i match
+                Readable -> 1
+                Writable -> 2
+
+        if bits == 0 || token == u64::Max then return Err(from_status(-22))
+
+        val how = mode match
+            Level -> 0
+            OneShot -> 1
+            Edge -> 2
+
+        val got = poll_control(self.state.fd, fd, op, bits, how, token)
+
+        if got < 0 then Err(from_status(got)) else Ok(())
+    end control
+
+/** Ends a `wait` on its poller, from any thread.
+ *
+ * **Wakes do not queue.** Several before a wait begins end that one wait, and a wake with nobody
+ * waiting ends the next one at once -- so a program checks its own state after every wait rather than
+ * counting wakes.
+ */
+struct Waker
+    private[poll] state: &sync PollerState
+
+    /** End the poller's current or next `wait`. */
+    wake(self) -> Result[unit, IoError]
+        val got = poll_wake(self.state.fd, self.state.wake_fd)
+
+        if got < 0 then Err(from_status(got)) else Ok(())
