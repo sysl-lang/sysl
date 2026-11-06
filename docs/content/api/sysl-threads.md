@@ -43,7 +43,7 @@ compiler says so at the call (`reference/memory.md § @crossing`).
 
 ## Index
 
-[`DEFAULT_STACK`](#default_stack) [`barrier`](#barrier) [`channel`](#channel) [`current`](#current) [`scope`](#scope) [`spawn`](#spawn) [`spawn_on`](#spawn_on) [`tls_place`](#tls_place) [`tls_room`](#tls_room) [`yield_now`](#yield_now) [`Barrier`](#barrier-1) [`Channel`](#channel-1) [`Condvar`](#condvar) [`Mutex`](#mutex) [`Scope`](#scope-1) [`ScopedThread`](#scopedthread) [`SleepLock`](#sleeplock) [`Thread`](#thread) [Lock for SleepLock](#lock-for-sleeplock)
+[`DEFAULT_STACK`](#default_stack) [`barrier`](#barrier) [`channel`](#channel) [`current`](#current) [`scope`](#scope) [`scope_in`](#scope_in) [`spawn`](#spawn) [`spawn_on`](#spawn_on) [`tls_place`](#tls_place) [`tls_room`](#tls_room) [`yield_now`](#yield_now) [`Barrier`](#barrier-1) [`Channel`](#channel-1) [`Condvar`](#condvar) [`Mutex`](#mutex) [`Scope`](#scope-1) [`ScopedThread`](#scopedthread) [`ScopeSlot`](#scopeslot) [`SleepLock`](#sleeplock) [`SlotScope`](#slotscope) [`Thread`](#thread) [Lock for SleepLock](#lock-for-sleeplock)
 
 ## Constants
 
@@ -107,6 +107,27 @@ scope((s) ->
     s.spawn(() -> for i in half..<v.len do v[i] = 2))
 ```
 
+Each thread's record, closure and answer are on the heap. A program with no heap starts its
+threads with `scope_in`, on records it lays out itself.
+
+### `scope_in`
+
+```sysl
+scope_in[R](slots: []ScopeSlot, body: *SlotScope -> R) -> R
+```
+
+Runs `body` with a scope whose thread records are `slots`, joins every thread started on it, and
+answers what `body` answered. **It allocates nothing**: `slots` is the caller's storage, usually an
+array in its own frame, and its length is how many threads the scope may start.
+
+```
+var slots: [2]ScopeSlot = [ScopeSlot.new(); 2]
+
+scope_in(slots[..], (s) ->
+    s.start(&work, &left)
+    s.start(&work, &right))
+```
+
 ### `spawn`
 
 ```sysl
@@ -117,8 +138,10 @@ Starts `body` on a new thread, with `arg` as the address it is handed.
 
 **On a bare target the library makes the thread's storage**: one allocation of `stack` bytes plus
 the thread's id word and its block of `@thread_local` storage, given back by `join`. On a hosted
-target nothing is allocated and `stack` is not used: pthreads makes the thread's stack, and the C
-library its thread-local storage.
+target nothing is allocated: pthreads makes the thread's stack, with its guard page, and the C
+library its thread-local storage. **`stack` is a request there**: the thread's stack is `stack`
+rounded up to a page or the system's default, whichever is larger, so the default argument changes
+nothing and a deep recursion asks for the room it needs (as Rust's `Builder::stack_size` does).
 
 **The body is a `*extern`, not a callable** (`reference/ffi.md § A function's address`): it is
 what every system's thread start takes, and a closure would have to be boxed for the new thread to
@@ -208,25 +231,31 @@ processor straight back.
 ```sysl
 struct Barrier
     private n: usize
-    private gate: Mutex[Gate]
-    private turn: Condvar
+    private arrived: Atomic[usize]
+    private phase: Atomic[u32]
+    private sleepers: Atomic[u32]
 ```
 
-A meeting point for a fixed number of threads: each `wait` sleeps until that many have arrived,
-then all of them go on together.
+A meeting point for a fixed number of threads: each `wait` holds its caller until that many have
+arrived, then all of them go on together.
 
 It can be met again at once -- the threads that leave one phase may arrive at the next before the
-slowest has woken from the last -- because a wait sleeps on the phase it arrived in, not on the
-count. **Exactly one of each phase's waiters is told it is the leader**: the one whose arrival
-completed the phase, and the one a program has do the work between phases that only one thread
-should do.
+slowest has woken from the last -- because a wait watches the phase it arrived in, not the count.
+**Exactly one of each phase's waiters is told it is the leader**: the one whose arrival completed
+the phase, and the one a program has do the work between phases that only one thread should do.
+
+**An early arrival spins first and sleeps only after that.** It watches the phase word for about
+as long as going to sleep and being woken would have cost -- where the others are close behind,
+which is what a barrier between rounds of evenly divided work usually sees, they arrive while it
+is still watching and nobody makes a system call -- and then sleeps on that same word, so a long
+wait, or more threads than cores, does not burn a core waiting.
 
 It is shared as a `&sync Barrier`, which is what `barrier` answers, so a scoped thread captures it
 as it would any other atomically counted object.
 
 | Member | Signature | Description |
 |---|---|---|
-| `wait` | `wait(*self) -> bool` | Sleeps until `n` threads, this one included, have called `wait` in this phase, and answers whether this caller is the phase's leader: `true` for exactly one of them. |
+| `wait` | `wait(*self) -> bool` | Holds the caller until `n` threads, this one included, have called `wait` in this phase, and answers whether this caller is the phase's leader: `true` for exactly one of them. |
 
 ### `Channel`
 
@@ -265,8 +294,12 @@ loop
         None -> break
 ```
 
-**A waiter sleeps**: a full `send` waits on one `Condvar` and an empty `receive` on the other, each
-woken by the transfer that makes room or brings a value, and both woken by `close`.
+**A waiter spins first and sleeps only after that**: a full `send` waits on one `Condvar` and an
+empty `receive` on the other, each woken by the transfer that makes room or brings a value, and both
+woken by `close`. It watches for that transfer for about as long as a sleep and a wake would cost --
+where the other side is running, which is what a pipeline of busy threads sees, the hand-over
+happens while it watches and nobody makes a system call -- and then sleeps, so a long wait, or more
+threads than cores, does not burn a core waiting.
 
 **A view goes in as a copy.** `send` and `try_send` are `@crossing(value)`, and a value crossing by
 value is a copy, so a `[]u8`, a
@@ -291,6 +324,7 @@ sent. The copy allocates, so a module that gave the allocator up sends values wi
 ```sysl
 struct Condvar
     private seq: Atomic[u32]
+    private sleepers: Atomic[u32]
 ```
 
 A place for threads to sleep until another says something has changed: a condition variable.
@@ -300,6 +334,15 @@ while it still holds the lock, lets the lock go, and sleeps in `sysl_futex_wait`
 number is still the one it read -- so a notification sent between the release and the sleep changes
 the number, the futex finds it changed, and the waiter does not sleep through it. That is the whole
 of what makes a condition variable correct, and it needs no queue of its own.
+
+**A notification with nobody asleep makes no system call.** A waiter counts itself before it lets
+the lock go, and a notifier calls `sysl_futex_wake` only where the count is not zero, so a producer
+that notifies on every item costs one atomic add while its consumer is busy.
+
+**A waiter sleeps at once; it does not spin.** It has just let the lock go, and what it waits for
+is the work of a thread that has to take that lock first -- of no length the condition variable can
+know. A spinning waiter would also see every notification, so `notify_one` would rouse every
+spinner to fight over the lock.
 
 **A wait can end with nothing having changed** -- a spurious wake, a notification meant for another
 waiter -- so the condition is always re-checked in a loop, as with every condition variable:
@@ -399,20 +442,42 @@ may be handed it and start threads of its own on it; those are joined by the sam
 
 ```sysl
 struct ScopedThread[R]
-    private job: &sync Job
+    private joiner: &sync Joiner
     private out: &sync Out[R]
 ```
 
 A thread started by `Scope.spawn`, and the value its closure answers.
 
-Copying one copies the handle, and it may be handed to another scoped thread; joining any copy
-waits for the one thread. Joining **is** checked here, unlike `Thread.join`: a second join answers
-the same value without waiting again, and the scope does not join a thread that is already joined.
+It holds the thread's joiner and the slot its answer is left in, and nothing of the closure, which
+stays in the scope's own list -- so a handle is as plain to keep as the value it carries back. Copying
+one copies the handle, and it may be handed to another scoped thread; joining any copy waits for the
+one thread. Joining **is** checked here, unlike `Thread.join`: a second join answers the same value
+without waiting again, and the scope does not join a thread that is already joined.
 
 | Member | Signature | Description |
 |---|---|---|
 | `join` | `join(self) -> R` | Waits for the thread to finish, and answers what its closure answered. |
 | `is_finished` | `is_finished(self) -> bool` | Whether the thread's closure has answered, without waiting for it. |
+
+### `ScopeSlot`
+
+```sysl
+struct ScopeSlot
+    private joiner: Joiner
+    private room: []u8
+```
+
+One thread's record for `scope_in`, in storage the caller lays out: an array of them is the
+scope's whole capacity.
+
+```
+var slots: [4]ScopeSlot = [ScopeSlot.new(); 4]
+```
+
+| Member | Signature | Description |
+|---|---|---|
+| `new` | `new() -> ScopeSlot` | A free slot, whose thread runs on the stack the system makes for it: what a hosted program writes. |
+| `on` | `on(stack: []u8) -> ScopeSlot` | A free slot whose thread runs on `stack`: its id word, its block of `@thread_local` storage and, in what is left, its stack, as `spawn_on` lays them out. |
 
 ### `SleepLock`
 
@@ -427,6 +492,8 @@ A lock that sleeps, and guards nothing of its own: the classic three-state futex
 uncontended `lock` and `unlock` are one atomic operation each and never reach the system, and only
 an `unlock` that may have a sleeper to wake calls `sysl_futex_wake`. A waiter sleeps in
 `sysl_futex_wait` rather than spinning or yielding, so a contended lock costs nothing while it waits.
+Spinning first loses for this lock: with short sections the holder takes it again while the others
+sleep, and waiters watching the word would fight the holder for it instead.
 
 It is what `Mutex[T]` and `Channel[T]` are built on, and it is public for the hold neither of them
 expresses: a lock beside data the program names itself, as `SpinLock` is, for code that may sleep.
@@ -439,6 +506,24 @@ own.
 | `lock` | `lock(*self)` | Takes the lock, sleeping until it is free. |
 | `try_lock` | `try_lock(*self) -> bool` | Takes the lock if it is free, and answers whether it did. |
 | `unlock` | `unlock(*self)` | Releases the lock, waking one sleeper where there may be one. |
+
+### `SlotScope`
+
+```sysl
+struct SlotScope
+    private slots: []ScopeSlot
+    private used: Atomic[usize]
+```
+
+The handle `scope_in` lends its body: a scope whose records are the caller's slots, so that starting
+a thread on it allocates nothing.
+
+Every thread started through it is joined before `scope_in` returns, on every way the body leaves,
+exactly as for `Scope`.
+
+| Member | Signature | Description |
+|---|---|---|
+| `start` | `start[T](*self, body: *extern(*T) -> unit, arg: *T)` | Starts `body` on a thread of its own in the next free slot, handing it `arg`, which may be the address of the caller's local: the thread is joined before the `scope_in` call that lent `self` returns, which is the promise `@scoped(arg)` writes. |
 
 ### `Thread`
 

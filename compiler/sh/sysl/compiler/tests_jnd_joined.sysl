@@ -43,6 +43,14 @@ jnd_spawn_refusal(callee: string, param: string, local: string, owner: string) -
         "'sysl.threads.scope', which joins it before the scope returns; anything else is handed storage " +
         "that lasts"
 
+// The same refusal where the address goes through a wrapper that hands it to `inner`: the wrapper keeps
+// it the way the crossing callee does, and the cure still names the scope.
+jnd_wrapper_refusal(wrapper: string, param: string, inner: string, local: string, owner: string) -> string =
+    s"error: '$wrapper' keeps its parameter '$param' (it is passed to '$inner', where it reaches another " +
+        s"concurrency domain), and '&$local' is the address of a local of '$owner' — a thread that borrows " +
+        s"the frame of '$owner' is started on 'sysl.threads.scope', which joins it before the scope returns; " +
+        "anything else is handed storage that lasts"
+
 // -- on a scope: accepted --------------------------------------------------------------------------
 
 @test("a thread started on a scope may have the address of a local, read once the scope returns")
@@ -445,8 +453,7 @@ jnd_wrapper_not_joined()
     val said = azd_err(jnd_prelude() + "start(p: *S) -> Option[Thread] = spawn(&work, p)\n\n" +
                        "go()\n    var s = S(0)\n\n    start(&s).unwrap().join()\n\ngo()\n")
 
-    assert(said.contains("error: 'start' keeps its parameter 'p' (it is passed to 'spawn', which keeps it), and " +
-                         "'&s' is the address of a local of 'go'"), said)
+    assert(said.contains(jnd_wrapper_refusal("start", "p", "spawn", "s", "go")), said)
 
 @test("a function that starts a thread and does not join it keeps its parameter for good")
 jnd_wrapper_never_joins()
@@ -455,8 +462,7 @@ jnd_wrapper_never_joins()
     val said = azd_err(jnd_prelude() + "fire(p: *S)\n    val t = spawn(&work, p)\n\n" +
                        "go()\n    var s = S(0)\n\n    fire(&s)\n\ngo()\n")
 
-    assert(said.contains("error: 'fire' keeps its parameter 'p' (it is passed to 'spawn', which keeps it), and " +
-                         "'&s' is the address of a local of 'go'\n"), said)
+    assert(said.contains(jnd_wrapper_refusal("fire", "p", "spawn", "s", "go") + "\n"), said)
 
 // -- the annotation is gone ------------------------------------------------------------------------
 

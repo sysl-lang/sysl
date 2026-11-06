@@ -1487,10 +1487,22 @@ end crossing_kept
 // (`crossing_cure`).
 val CROSSING_HOW = "it reaches another concurrency domain"
 
-// The cure for a frame address handed to a parameter that crosses: a thread that borrows the frame is
-// started on a scope, which joins it before the scope returns.
+// Why a body keeps what it hands a callee: the callee keeps it, or lets what it reads through it out.
+// **A callee that keeps it because it crosses passes the crossing on**, so a wrapper of `spawn` -- the
+// forwarders of `sysl.posix.threads`, say -- is said to keep its parameter the way `spawn` does, and a
+// frame address handed to the wrapper gets the scope cure as one handed to `spawn` would.
+private passed_how(callee: string, kept: bool, inner: string) -> string
+    if !kept then return s"it is passed to $callee, which lets what it reads through it out"
+    if inner.ends_with(CROSSING_HOW) then return s"it is passed to $callee, where $CROSSING_HOW"
+
+    s"it is passed to $callee, which keeps it"
+end passed_how
+
+// The cure for a frame address handed to a parameter that crosses -- directly, or through a wrapper
+// (`passed_how`): a thread that borrows the frame is started on a scope, which joins it before the scope
+// returns.
 crossing_cure(how: string, owner: string) -> string
-    if how != CROSSING_HOW then return ""
+    if !how.ends_with(CROSSING_HOW) then return ""
 
     s" — a thread that borrows the frame of '$owner' is started on 'sysl.threads.scope', which joins it " +
         "before the scope returns; anything else is handed storage that lasts"
@@ -2136,8 +2148,7 @@ private kept_at(t: &Track, evs: &EvBuf, e: TExpr)
 
                 for at in 0..<held.len()
                     val item = held[at]
-                    val how = s"it is passed to ${callee_said(t.cx.an, name)}, which " +
-                        (if at < kept_n then "keeps it" else "lets what it reads through it out")
+                    val how = passed_how(callee_said(t.cx.an, name), at < kept_n, item.how)
 
                     if item.loc == "j" && has_span(t.hs.chained, e.span) then continue
 
@@ -2189,8 +2200,7 @@ private kept_at(t: &Track, evs: &EvBuf, e: TExpr)
 
                     if loc.starts_with("j:") && said_already(evs, loc, all[k]) then continue
 
-                    val how = s"it is passed to ${callee_said(t.cx.an, item.0)}, which " +
-                        (if at < kept_n then "keeps it" else "lets what it reads through it out")
+                    val how = passed_how(callee_said(t.cx.an, item.0), at < kept_n, item.1.how)
 
                     if !loc.starts_with("l:") then evs.items.push(kept_ev(loc, how, all[k]))
         TCallPtr(callee, args, _, _) ->

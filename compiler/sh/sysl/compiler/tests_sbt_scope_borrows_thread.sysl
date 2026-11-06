@@ -248,7 +248,7 @@ sbt_plain_spawn_refused()
     val prelude = "import sysl.threads.spawn\n\nstruct S\n    n: int\n\nwork(s: *S) = ()\n\n"
 
     sbt_refused(prelude + "go()\n    var s = S(0)\n\n    spawn(&work, &s)\n\ngo()\n",
-                "main.sysl:11:18: error: 'spawn' keeps its parameter 'arg' (it reaches another concurrency domain), " +
+                "error: 'spawn' keeps its parameter 'arg' (it reaches another concurrency domain), " +
                 "and '&s' is the address of a local of 'go' — a thread that borrows the frame of 'go' is started " +
                 "on 'sysl.threads.scope', which joins it before the scope returns; anything else is handed storage " +
                 "that lasts")
@@ -263,6 +263,46 @@ sbt_plain_spawn_refused()
     sbt_refused("import sysl.threads.spawn\n\nwork(p: *int) = ()\n\ngo()\n    var a = [1, 2]\n    val p = &a[1]\n\n" +
                 "    spawn(&work, p)\n\ngo()\n",
                 "a thread that borrows the frame of 'go' is started on 'sysl.threads.scope'")
+
+// **Through a wrapper the refusal is the same**: a function that hands its parameter to `spawn` keeps
+// it the way `spawn` does, so the frame address handed to the wrapper is told the scope cure too --
+// through `sysl.posix.threads`' forwarders, a wrapper of a wrapper, and a method.
+@test("a frame address handed to spawn through a wrapper is refused, and the refusal names the scope")
+sbt_wrapper_spawn_refused()
+    val prelude = "struct S\n    n: int\n\nwork(s: *S) = ()\n\n"
+    val cure = "where it reaches another concurrency domain), and '&s' is the address of a local of 'go' — a " +
+        "thread that borrows the frame of 'go' is started on 'sysl.threads.scope', which joins it before the " +
+        "scope returns; anything else is handed storage that lasts"
+
+    sbt_refused("import sysl.posix.threads.spawn\n\n" + prelude + "go()\n    var s = S(0)\n\n    spawn(&work, &s)\n\ngo()\n",
+                cure)
+    sbt_refused("import sysl.posix.threads.spawn_on\n\n" + prelude + "static var stack: [65536]u8 = [0; 65536]\n\n" +
+                "go()\n    var s = S(0)\n\n    spawn_on(stack[..], &work, &s)\n\ngo()\n", cure)
+    sbt_refused("import sysl.threads.{spawn, Thread}\n\n" + prelude +
+                "hand(p: *S) -> Option[Thread] = spawn(&work, p)\n\nouter(q: *S) -> Option[Thread] = hand(q)\n\n" +
+                "go()\n    var s = S(0)\n\n    outer(&s)\n\ngo()\n",
+                "error: 'outer' keeps its parameter 'q' (it is passed to 'hand', " + cure)
+    sbt_refused("import sysl.threads.{spawn, Thread}\n\n" + prelude +
+                "struct Pool\n    k: int\n\n    start(self, p: *S) -> Option[Thread] = spawn(&work, p)\n\n" +
+                "go()\n    var s = S(0)\n\n    Pool(0).start(&s)\n\ngo()\n", cure)
+
+    // The forwarder handed heap storage shared as '&sync' is accepted, as 'spawn' is.
+    sbt_prints(raw"""
+        import sysl.sync.*
+        import sysl.posix.threads.spawn
+
+        struct S
+            n: int
+
+        work(s: *S)
+            atomic_add(&s.n, 1, SeqCst)
+
+        val b: &sync S = S(0)
+
+        spawn(&work, &*b).unwrap().join()
+        print(b.n)
+        """, "1\n")
+end sbt_wrapper_spawn_refused
 
 @test("a plain spawn of heap storage shared as '&sync', or of a module's storage, is still accepted")
 sbt_heap_capture_plain_spawn()

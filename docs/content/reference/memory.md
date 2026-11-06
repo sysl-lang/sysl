@@ -5895,7 +5895,39 @@ print(sum_halves(xs[..]))
 
 A function handed the `*Scope` may start threads on it with its own caller's storage, and those are
 joined by the same `scope` call; one that opens a scope of its own keeps nothing it is handed. A scope
-may be opened inside a scoped thread, and its threads may borrow that thread's locals.
+may be opened inside a scoped thread, and its threads may borrow that thread's locals. A program with
+no heap opens [`scope_in`](/library/threads/#scoped-threads) instead, whose thread
+records are slots the caller lays out, and starts its threads with `start(&body, arg)`, which may be
+handed the address of a local on the same terms.
+
+**A wrapper keeps what it hands `spawn`, and is told the same way.** A function that passes its
+parameter on to a crossing one keeps it as that callee does, so a frame address handed to the wrapper
+— one of `sysl.posix.threads`' forwarders, or a function of the program's own — is refused at the
+wrapper's call, and the refusal still names the scope:
+
+```sysl
+import sysl.threads.{spawn, Thread}
+
+struct Tally
+    n: int
+
+add(t: *Tally)
+    t.n = t.n + 1
+
+start(t: *Tally) -> Option[Thread] = spawn(&add, t)
+
+count() -> int
+    var t = Tally(0)
+
+    start(&t).unwrap().join()
+    t.n
+
+print(count())
+```
+
+```error
+'start' keeps its parameter 't' (it is passed to 'spawn', where it reaches another concurrency domain), and '&t' is the address of a local of 'count' — a thread that borrows the frame of 'count' is started on 'sysl.threads.scope'
+```
 
 **A plain `spawn` is for storage that lasts**: a box shared as `&sync` (`&*b`) or module storage,
 which no frame owns, so the thread may outlive the call that started it and never be joined at all.

@@ -51,6 +51,7 @@ had when it was pthreads by symbol, kept for the programs that import it.
 | `Thread.join` | waits for one, answering whether it waited |
 | `scope(body)`, `Scope.spawn(f)` | threads that borrow the caller's frame, all joined before `scope` returns |
 | `ScopedThread[R].join` | waits for a scoped thread, answering what its closure answered |
+| `scope_in(slots, body)`, `SlotScope.start(&body, arg)` | the same, on `ScopeSlot` records the caller lays out, allocating nothing |
 | `barrier(n)`, `Barrier.wait` | `n` threads meeting phase by phase, one leader each phase |
 | `current()` | the calling thread's own handle |
 | `yield_now()` | offers the processor away — a hint, not a wait |
@@ -918,6 +919,81 @@ it borrows on that path either. A scoped thread may be handed `s` and start thre
 the scope joins those too, and a handle may be joined from a sibling. Where the system will not start
 another thread, `spawn` stops the program with a message rather than answer `None`: running a child
 inline instead could leave its siblings waiting at a barrier for ever.
+
+**A handle holds the thread's joiner and the slot its answer is left in, and nothing of the closure**,
+which stays in the scope's own list. So a handle is kept wherever the body likes — a slice made with
+`[None; n]`, a `Buf` — and a pool sized at run time is written as it reads:
+
+```sysl
+import sysl.sync.*
+import sysl.threads.*
+
+count(threads: int) -> int
+    var n = 0
+    val p = &n
+
+    scope((s) ->
+        var pool: []Option[ScopedThread[int]] = [None; threads]
+
+        for i in 0..<threads
+            pool[i] = Some(s.spawn(() -> atomic_add(p, 1, SeqCst)))
+
+        for t in pool
+            if t is Some(h) then h.join())
+
+    n
+
+print(count(4))
+```
+
+```output
+4
+```
+
+### On the caller's slots: `scope_in`
+
+**`scope_in(slots, body)` is a scope whose thread records are the caller's**, an array of
+`ScopeSlot`s laid out where the caller likes, so starting a thread on it allocates nothing — the form
+for a kernel, a bare target with no heap, or an `@no_alloc` function. Its body is lent a
+`SlotScope`, whose `start(&body, arg)` takes a function's address and a pointer, as `spawn` does, and
+may be handed the address of the caller's local: `start` is `@scoped(arg)`, and every thread it
+started is joined before `scope_in` returns, on every way out of the body. The pointer is still held to
+the [crossing rule](/reference/memory/), since `start` is `@crossing(arg)` as well.
+
+```sysl
+import sysl.threads.{ScopeSlot, scope_in}
+
+put(p: *int)
+    *p += 1
+
+@no_alloc
+twice() -> int
+    var n = 0
+    var m = 10
+    val pn = &n
+    val pm = &m
+    var slots: [2]ScopeSlot = [ScopeSlot.new(); 2]
+
+    scope_in(slots[..], (s) ->
+        s.start(&put, pn)
+        s.start(&put, pm))
+
+    n + m
+
+print(twice())
+```
+
+```output
+12
+```
+
+**The slice's length is the capacity, and a start past it stops the program**, naming the scope: the
+capacity is the caller's own choice, written where the array is, so running out is a mistake in the
+program — as an index past an array's end is — and a refusal would leave the caller nothing to do but
+stop. `ScopeSlot.new()` runs its thread on the stack the system makes; a bare target has none to give,
+so there a slot is made with `ScopeSlot.on(stack)`, a slice of the program's own storage that the
+thread's id word, thread-local block and stack are laid out in, as `spawn_on` lays them. A `start`'d
+thread has no handle: the scope joins it, and a body with something to say writes it through `arg`.
 
 ## `Barrier`
 

@@ -2,6 +2,7 @@ module sysl.threads
 @requires(os)
 @tests
 
+import sysl.buf.{Buf, buf}
 import sysl.raw.ptr_cast
 import sysl.slices.as_mut_ptr
 import sysl.sync.*
@@ -605,6 +606,66 @@ scope_handle_joined_by_a_sibling() -> unit
         h.join() + k.join())
 
     assert_eq(got, 41)
+
+// A handle holds its joiner and its answer, not the closure, so it is kept in a slice made at run time
+// and set over in a `Buf` by index like any value.
+@test("scoped handles kept in a slice made with [None; n] and set into a Buf by index are joined")
+scope_handles_in_heap_storage() -> unit
+    val n = 3
+
+    val got = scope((s) ->
+        var pool: []Option[ScopedThread[int]] = [None; n]
+
+        for i in 0..<n
+            pool[i] = Some(s.spawn(() -> i))
+
+        var kept: Buf[ScopedThread[int]] = buf()
+
+        kept.push(s.spawn(() -> 10))
+        kept[0] = s.spawn(() -> 20)
+
+        var total = 0
+
+        for t in pool
+            if t is Some(h) then total += h.join()
+
+        total + kept[0].join())
+
+    assert_eq(got, 23)
+
+private slot_add(p: *Atomic[int])
+    p.add(1)
+
+private slot_set(p: *int)
+    *p = 5
+
+@test("scope_in starts a thread in every slot it is given and joins them all before it returns")
+scope_in_joins_every_slot() -> unit
+    var count = Atomic(0)
+    val p = &count
+    var slots: [3]ScopeSlot = [ScopeSlot.new(); 3]
+
+    scope_in(slots[..], (s) ->
+        for _ in 0..<3 do s.start(&slot_add, p))
+
+    assert_eq(count.load(), 3)
+
+@test("scope_in answers its body's value, and an early return still joins")
+scope_in_answers() -> unit
+    var x = 0
+    val px = &x
+    val stop = true
+    var slots: [1]ScopeSlot = [ScopeSlot.new(); 1]
+
+    val r = scope_in(slots[..], (s) ->
+        s.start(&slot_set, px)
+
+        if stop then return 7
+
+        8)
+
+    assert_eq(r, 7)
+    assert_eq(x, 5)
 
 private scope_leaves_early(stop: bool, v: []int) -> int =
     scope((s) ->

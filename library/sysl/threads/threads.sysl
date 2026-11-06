@@ -172,6 +172,23 @@ end spawn
 spawn_on[T](stack: []u8, body: *extern(*T) -> unit, arg: *T) -> Option[Thread] =
     start_on(stack, ptr_cast(body), ptr_cast(arg))
 
+// A thread started with nothing allocated: on `room`, the caller's storage, where it is not empty, and
+// otherwise on the stack pthreads makes. A bare target has no stack of its own to give a thread, so there
+// an empty `room` starts nothing. Nothing here keeps `arg` or asks what it reaches: it is `scope_in`'s,
+// whose `start` makes both promises (`scope.sysl`).
+private[threads] start_lent(body: *extern(*u8) -> unit, arg: *u8, room: []u8) -> Option[Thread]
+    if room.len > 0 then return start_on(room, body, arg)
+#if freestanding
+    None
+#else
+    var id: u64 = 0
+
+    if tsys.spawn(body, arg, null, DEFAULT_STACK, null, &id) != 0 then return None
+
+    Some(Thread(id, null, null))
+#endif
+end start_lent
+
 // The thread's word, thread-local block and stack laid out of `room`, and the thread started on them.
 private start_on(room: []u8, body: *extern(*u8) -> unit, arg: *u8) -> Option[Thread]
     val base = usize(as_mut_ptr(room))

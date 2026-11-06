@@ -2,6 +2,8 @@ module sysl.threads
 @requires(os)
 
 import sysl.buf.{Buf, buf}
+import sysl.raw.ptr_cast
+import sysl.sync.Atomic
 
 /** The handle `scope` lends its body, through which the body starts threads that may borrow the
  * caller's frame.
@@ -17,7 +19,8 @@ import sysl.buf.{Buf, buf}
  */
 struct Scope
 
-    // One record per thread started on this scope, in the order they were started. Behind a lock
+    // One record per thread started on this scope, in the order they were started: what the thread
+    // runs, which only the thread and this list hold, and the joiner its handles share. Behind a lock
     // because a scoped thread may start threads on the scope too.
     private jobs: Mutex[Buf[&sync Job]]
 
@@ -30,6 +33,10 @@ struct Scope
      * it borrows from the caller's frame rather than sharing (`reference/attributes.md § @scoped(f)`).
      * A `string`, a `&T` or a `Buf` is refused, as for any `&sync Fn`.
      *
+     * The closure stays in the scope's list, not in the handle, so a handle may be kept anywhere the
+     * body can see -- a local array, a slice made with `[None; n]`, a `Buf` -- and copied to another
+     * scoped thread.
+     *
      * Where the system will not start another thread the program stops with a message, since a
      * scope's children are the work the caller is waiting on and running one of them inline could
      * leave its siblings waiting at a barrier for ever.
@@ -37,14 +44,15 @@ struct Scope
     @scoped(f)
     spawn[R](*self, f: &sync Fn() -> R) -> ScopedThread[R]
         val out: &sync Out[R] = Out(Mutex.new(None))
-        val job: &sync Job = Job(() -> out.value.with((v) -> *v = Some(f())), Mutex.new(Joint(None, false)))
+        val joiner: &sync Joiner = Joiner(Mutex.new(Joint(None, false)))
+        val job: &sync Job = Job(() -> out.value.with((v) -> *v = Some(f())), joiner)
         val started = spawn(&run_job, &*job)
 
         if started.is_none() then panic("sysl.threads: the system would not start another thread")
 
-        job.joint.with((j) -> j.thread = started)
+        joiner.joint.with((j) -> j.thread = started)
         self.jobs.with((b) -> b.push(job))
-        ScopedThread(job, out)
+        ScopedThread(joiner, out)
     end spawn
 
     // Joins every thread not joined yet, in the order they were started -- and any a scoped thread
@@ -53,7 +61,7 @@ struct Scope
         var i: usize = 0
 
         loop
-            val next = self.jobs.with((b) -> if i < b.len() then Some(b[i]) else None)
+            val next = self.jobs.with((b) -> if i < b.len() then Some(b[i].joiner) else None)
 
             next match
                 Some(j) -> j.join()
@@ -66,19 +74,21 @@ end Scope
 
 /** A thread started by `Scope.spawn`, and the value its closure answers.
  *
- * Copying one copies the handle, and it may be handed to another scoped thread; joining any copy
- * waits for the one thread. Joining **is** checked here, unlike `Thread.join`: a second join answers
- * the same value without waiting again, and the scope does not join a thread that is already joined.
+ * It holds the thread's joiner and the slot its answer is left in, and nothing of the closure, which
+ * stays in the scope's own list -- so a handle is as plain to keep as the value it carries back. Copying
+ * one copies the handle, and it may be handed to another scoped thread; joining any copy waits for the
+ * one thread. Joining **is** checked here, unlike `Thread.join`: a second join answers the same value
+ * without waiting again, and the scope does not join a thread that is already joined.
  */
 struct ScopedThread[R]
 
-    private job: &sync Job
+    private joiner: &sync Joiner
     private out: &sync Out[R]
 
     /** Waits for the thread to finish, and answers what its closure answered. */
     @blocks
     join(self) -> R
-        self.job.join()
+        self.joiner.join()
         self.out.value.with((v) -> v.unwrap())
 
     /** Whether the thread's closure has answered, without waiting for it. */
@@ -96,6 +106,9 @@ end ScopedThread
  *     s.spawn(() -> for i in 0..<half do v[i] = 1)
  *     s.spawn(() -> for i in half..<v.len do v[i] = 2))
  * ```
+ *
+ * Each thread's record, closure and answer are on the heap. A program with no heap starts its
+ * threads with `scope_in`, on records it lays out itself.
  */
 @blocks
 scope[R](body: *Scope -> R) -> R
@@ -106,11 +119,119 @@ scope[R](body: *Scope -> R) -> R
     r
 end scope
 
-// One scoped thread: what it runs, which is all the thread itself reads, and the system's handle for
-// it with whether it has been joined, behind a lock so that two joiners -- the scope and a handle, or
-// two handles on two threads -- join it once between them.
-private struct Job
-    run: &sync Fn() -> unit
+// -- in the caller's storage ------------------------------------------------------------------------
+
+/** One thread's record for `scope_in`, in storage the caller lays out: an array of them is the
+ * scope's whole capacity.
+ *
+ * ```
+ * var slots: [4]ScopeSlot = [ScopeSlot.new(); 4]
+ * ```
+ */
+struct ScopeSlot
+
+    // Who joins the thread started in this slot, and whether it has been.
+    private joiner: Joiner
+
+    // The storage the thread runs on, or empty for the stack the system makes.
+    private room: []u8
+
+    /** A free slot, whose thread runs on the stack the system makes for it: what a hosted program
+     * writes. A bare target has no stack of its own to give a thread, so there a slot is made with
+     * `on`.
+     */
+    new() -> ScopeSlot = ScopeSlot(Joiner(Mutex.new(Joint(None, false))), [])
+
+    /** A free slot whose thread runs on `stack`: its id word, its block of `@thread_local` storage and,
+     * in what is left, its stack, as `spawn_on` lays them out. `stack` has to outlive the `scope_in`
+     * call the slot is handed to.
+     */
+    on(stack: []u8) -> ScopeSlot = ScopeSlot(Joiner(Mutex.new(Joint(None, false))), stack)
+
+end ScopeSlot
+
+/** The handle `scope_in` lends its body: a scope whose records are the caller's slots, so that starting
+ * a thread on it allocates nothing.
+ *
+ * Every thread started through it is joined before `scope_in` returns, on every way the body leaves,
+ * exactly as for `Scope`.
+ */
+struct SlotScope
+
+    private slots: []ScopeSlot
+
+    // How many slots have been handed out; a scoped thread may start threads on the scope too, so a
+    // slot is claimed with an atomic ticket.
+    private used: Atomic[usize]
+
+    /** Starts `body` on a thread of its own in the next free slot, handing it `arg`, which may be the
+     * address of the caller's local: the thread is joined before the `scope_in` call that lent `self`
+     * returns, which is the promise `@scoped(arg)` writes.
+     *
+     * It allocates nothing -- the record is the slot, and the thread runs on the slot's stack or the
+     * system's -- so it is what an `@no_alloc` function or a program with no heap writes. The thread
+     * is joined by the scope; there is no handle, and a body that has something to say writes it
+     * through `arg`.
+     *
+     * **Running out of slots stops the program**, with a message naming the scope: the capacity is
+     * the caller's own choice, written where the array is, so a start past it is a mistake in the
+     * program rather than a condition to recover from -- as an index past an array's end is -- and
+     * there is nothing a caller could do with a refusal but stop. Where the system will not start the
+     * thread the program stops too, as `Scope.spawn` does.
+     */
+    @scoped(arg)
+    @crossing(arg)
+    start[T](*self, body: *extern(*T) -> unit, arg: *T)
+        val i = self.used.add(1)
+
+        if i >= self.slots.len then panic("sysl.threads: a 'scope_in' has started a thread in every slot it was given")
+
+        val slot = &self.slots[i]
+        val started = start_lent(ptr_cast(body), ptr_cast(arg), slot.room)
+
+        if started.is_none() then panic("sysl.threads: the system would not start another thread")
+
+        slot.joiner.joint.with((j) -> j.thread = started)
+    end start
+
+    // Joins every slot's thread in the order they were started, reading the count again after every
+    // join, since a scoped thread may have started more.
+    private join_all(*self)
+        var i: usize = 0
+
+        while i < self.slots.len && i < self.used.load()
+            self.slots[i].joiner.join()
+            i += 1
+
+end SlotScope
+
+/** Runs `body` with a scope whose thread records are `slots`, joins every thread started on it, and
+ * answers what `body` answered. **It allocates nothing**: `slots` is the caller's storage, usually an
+ * array in its own frame, and its length is how many threads the scope may start.
+ *
+ * ```
+ * var slots: [2]ScopeSlot = [ScopeSlot.new(); 2]
+ *
+ * scope_in(slots[..], (s) ->
+ *     s.start(&work, &left)
+ *     s.start(&work, &right))
+ * ```
+ */
+@blocks
+scope_in[R](slots: []ScopeSlot, body: *SlotScope -> R) -> R
+    var s = SlotScope(slots, Atomic(0))
+    val r = body(&s)
+
+    s.join_all()
+    r
+end scope_in
+
+// -- shared by both ----------------------------------------------------------------------------------
+
+// Who joins one scoped thread: the system's handle for it and whether it has been joined, behind a lock
+// so that two joiners -- the scope and a handle, or two handles on two threads -- join it once between
+// them.
+private struct Joiner
     joint: Mutex[Joint]
 
     @blocks
@@ -123,6 +244,12 @@ private struct Job
 private struct Joint
     thread: Option[Thread]
     joined: bool
+
+// One thread `Scope.spawn` started: what it runs, which the scope holds until the thread is joined, and
+// its joiner.
+private struct Job
+    run: &sync Fn() -> unit
+    joiner: &sync Joiner
 
 private run_job(j: *Job) -> unit = j.run()
 
