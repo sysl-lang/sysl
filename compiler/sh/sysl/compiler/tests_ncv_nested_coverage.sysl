@@ -115,13 +115,17 @@ ncv_nested_arms_cover_between_them()
                "var some: Option[Op] = Some(Push)\nvar halt: Option[Op] = Some(Halt)\n" +
                "var gone: Option[Op] = None\nprint(read(some), read(halt), read(gone))", "1 0 -1\n")
 
-// The complement of one literal has no name to write, so the report names the variant.
+// The complement of one string has no name to write, so the report names the variant; an integer's
+// is named as the ranges either side of it.
 @test("a literal sub-pattern still does not discharge its variant")
 ncv_literal_does_not_discharge()
     if ncv_skip() then return
 
+    ncv_refused("read(o: Option[string]) -> int\n    o match\n        Some(\"a\") -> 0\n        None -> -1",
+                "match on 'Option[string]' is not exhaustive; missing Some (add an 'else' arm)", "2:5")
     ncv_refused("read(o: Option[int]) -> int\n    o match\n        Some(0) -> 0\n        None -> -1",
-                "match on 'Option[int]' is not exhaustive; missing Some (add an 'else' arm)", "2:5")
+                "match on 'Option[int]' is not exhaustive; missing Some(int::Min..-1), Some(1..int::Max) " +
+                "(add an 'else' arm)", "2:5")
 
 @test("a gap inside a payload is named at the depth it is missing")
 ncv_gap_named_at_its_depth()
@@ -173,13 +177,15 @@ ncv_bool_payload_covered()
                "yes no ?\n")
 
 // A type with no set of values to complete is covered only by a catch-all, and the complaint says
-// just that -- no witness list.
+// just that -- no witness list. An integer's is named as ranges.
 @test("a scalar match still needs an else")
 ncv_scalar_match_needs_else()
     if ncv_skip() then return
 
-    ncv_refused("var x = 1 match\n    1 -> 10\n    2 -> 20",
+    ncv_refused("var x = 1.0 match\n    1.0 -> 10\n    2.0 -> 20",
                 "a 'match' that yields a value must be exhaustive — add an 'else' arm", "1:9")
+    ncv_refused("var x = 1 match\n    1 -> 10\n    2 -> 20",
+                "match on 'int' is not exhaustive; missing int::Min..0, 3..int::Max (add an 'else' arm)", "1:9")
 
 @test("an enum match for effect is covered by nested arms as well")
 ncv_effect_match_covered()
@@ -300,13 +306,14 @@ ncv_struct_scrutinee_destructured()
     ncv_prints(ncv_point() + "sum(p: Point) -> int\n    p match\n        Point(x, y) -> x + y\n" +
                "print(sum(Point(3, 4)))", "7\n")
 
-// The gap is a number's complement, which has no pattern to name it.
+// The gap is an integer's complement, named as the ranges either side of each literal.
 @test("a refutable struct scrutinee still needs an else")
 ncv_refutable_struct_needs_else()
     if ncv_skip() then return
 
     ncv_refused(ncv_point() + "var r = Point(1, 2) match\n    Point(0, 0) -> 1",
-                "a 'match' that yields a value must be exhaustive — add an 'else' arm", "5:9")
+                "match on 'Point' is not exhaustive; missing Point(int::Min..-1, _), Point(0, int::Min..-1), " +
+                "Point(0, 1..int::Max), Point(1..int::Max, _) (add an 'else' arm)", "5:9")
 
 @test("a bool covering one value keeps its own diagnostic")
 ncv_bool_one_value()
@@ -431,7 +438,8 @@ ncv_const_narrows_without_discharging()
     if ncv_skip() then return
 
     ncv_refused("const Z: int = 0\nread(o: Option[int]) -> int\n    o match\n        Some(Z) -> 0\n        None -> -1",
-                "match on 'Option[int]' is not exhaustive; missing Some (add an 'else' arm)", "3:5")
+                "match on 'Option[int]' is not exhaustive; missing Some(int::Min..-1), Some(1..int::Max) " +
+                "(add an 'else' arm)", "3:5")
 
 @test("a zero-sized payload is covered by binding it")
 ncv_zero_sized_payload()
