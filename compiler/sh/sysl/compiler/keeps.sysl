@@ -159,6 +159,10 @@ struct KeepsCx
     // The same, by struct or enum type (`type_show`): a type met along many paths is worked out once.
     type_depths: Map[string, int]
 
+    // The closure bodies a call through a `&Fn` may land in: every slot of a call trait's table. A call
+    // there sees no body, so each is held to its callable type where it is written (`refuse_promised`).
+    erased: Map[string, bool]
+
     find(self, name: string) -> Option[TFunc] = self.index.get(name) match
         Some(i) -> Some(self.funcs[i])
         None -> None
@@ -181,7 +185,7 @@ check_keeps(a: &Analysis, funcs: Buf[TFunc], vtables: Buf[TVtable], vals: Buf[TV
     val cx: &KeepsCx = KeepsCx(a, funcs, index, map(), map(), map(), buf(), buf(), false, 0, map(),
                                map(), map(), map(), map(), map(), map(), vtables,
                                map(), buf(), map(), map(), map(), map(), buf(), false, map(), false, map(),
-                               0, false, buf(), map(), map(), map())
+                               0, false, buf(), map(), map(), map(), map())
 
     // Every method an `impl` of a trait brought, by the function it was lowered to, and every slot of
     // every table -- an instance of a generic one among them.
@@ -197,7 +201,12 @@ check_keeps(a: &Analysis, funcs: Buf[TFunc], vtables: Buf[TVtable], vals: Buf[TV
             None -> ()
 
     for vt in vtables
-        if is_call_trait(module_bare(vt.trait_name)) then continue
+        if is_call_trait(module_bare(vt.trait_name))
+            for slot in vt.slots
+                cx.erased.put(slot.target, true)
+
+            continue
+        end if
 
         for slot in vt.slots
             if !cx.dispatched.has(slot.target) then cx.dispatched.put(slot.target, vt.trait_name)
@@ -1080,15 +1089,16 @@ end logged_since
 // unless the declaration says `@keeps(p)` -- then `p` may be held anywhere, to every depth, as an
 // `extern`'s may. Which body the call lands in is decided when the program runs, so no body is asked:
 // each one is held to the declaration where it is written (`refuse_promised`). `k` numbers the
-// parameter as the body does, the receiver first (`with_receiver`). A call trait's object -- a closure
-// behind a `&Fn` -- is answered by the marks its type carries and, for the rest, by the closures made
-// at that type (`closure_kept`).
+// parameter as the body does, the receiver first (`with_receiver`). **A call trait's object -- a
+// closure behind a `&Fn` -- is answered by its type alone** (L7): a parameter the type marks `@keeps`
+// may be kept anywhere, and every other one is borrowed for the call, which each closure made at the
+// type is held to where it is written.
 vcall_keeps(cx: &KeepsCx, recv: TExpr, slot: int, k: usize) -> Buf[(string, KeptAt)]
     if erased_trait(texpr_type(recv)).is_none() || slot < 0 then return buf()
     if object_marks_kept(recv, k) then return object_kept(recv)
-    if !through_closure(recv) then return declared_kept(cx, recv, slot, k)
+    if through_closure(recv) then return buf()
 
-    closure_kept(cx, recv, slot, k, (t, j) -> keeps_of(cx, t, j))
+    declared_kept(cx, recv, slot, k)
 end vcall_keeps
 
 // Whether a call through an object is a call of a closure, through a call trait's table.
@@ -1212,30 +1222,6 @@ private declared_answers(cx: &KeepsCx, recv: TExpr, slot: int, k: usize) -> bool
         None -> true
 end declared_answers
 
-// What a call through a closure's object keeps, or lets out of what it reads, at `k`: whatever a
-// closure made at its type may (`ask`), each location with the body that holds it there. A closure
-// made at a type that marks the parameter is never reached through one that does not
-// (`licensed_elsewhere`).
-private closure_kept(cx: &KeepsCx, recv: TExpr, slot: int, k: usize,
-                     ask: &Fn(string, usize) -> KeptWhy) -> Buf[(string, KeptAt)]
-    var out: Buf[(string, KeptAt)] = buf()
-    val name = erased_trait(texpr_type(recv)).unwrap() match
-        Trait(n, _, _) -> n
-        _ -> ""
-
-    for vt in cx.vtables
-        if vt.trait_name != name || usize(slot) >= vt.slots.len() then continue
-
-        val target = vt.slots[usize(slot)].target
-
-        if licensed_elsewhere(cx, recv, target, k) then continue
-
-        for item in ask(target, k).locs
-            out.push((target, item))
-
-    out
-end closure_kept
-
 // **A call through a callable object is held to its type's `@keeps` marks, as a call of an `extern` is
 // to its `@keeps(p)`**: a parameter the type marks may be kept anywhere by whatever closure the object
 // holds, so nothing the call hands it there may be storage that ends. Every question -- what is kept,
@@ -1269,40 +1255,8 @@ callee_said(a: &Analysis, name: string) -> string =
     else if name.ends_with(".call") && mentions_closure(name) then "a closure"
     else s"'${shown_name(a, name)}'"
 
-// **A closure licensed to keep a parameter is never reached through a callable type that borrows it**:
-// a value of the marked type does not stand where the unmarked one is asked for (`callable_within`).
-// So a call through a type that does not mark the parameter asks no such body -- every one sharing the
-// call trait's tables would otherwise be taken to keep what the call hands over.
-private licensed_elsewhere(cx: &KeepsCx, recv: TExpr, target: string, k: usize) -> bool
-    if k == 0 then return false
-
-    erased_trait(texpr_type(recv)) match
-        Some(Trait(n, args, _)) ->
-            if !fn_is_call(n) then return false
-            if closure_of_another_signature(cx, target, k, args) then return true
-        _ -> return false
-
-    closure_licensed(cx, target, k)
-end licensed_elsewhere
-
-// **The call traits are named by arity alone, so a table is told apart by its arguments**: a closure
-// taking something else at `k` is never reached through this type, whatever it keeps of what it takes.
-// Compared as the tables are named, which is blind to `@keeps` marks: a marked type and its unmarked
-// form share one table. `args` holds the parameters, then the result.
-private closure_of_another_signature(cx: &KeepsCx, target: string, k: usize, args: Buf[Type]) -> bool
-    val found = cx.find(target)
-
-    if found.is_none() then return false
-
-    val f = found.unwrap()
-
-    if !is_closure_body(f) || k >= f.params.len() || k > args.len() then return false
-
-    mangle(f.params[k].1) != mangle(args[k - 1])
-end closure_of_another_signature
-
-// Whether a closure's body is licensed to keep its parameter `i` (its environment is parameter 0): the
-// callable type it was made at marks the parameter `@keeps` (`Analysis.closure_keeps`).
+// Whether a closure's body may keep its parameter `i` (its environment is parameter 0): the callable
+// type it was made at marks the parameter `@keeps` (`Analysis.closure_keeps`).
 private closure_licensed(cx: &KeepsCx, name: string, i: usize) -> bool
     if i == 0 || !name.ends_with(".call") then return false
 
@@ -1318,34 +1272,26 @@ private closure_licensed(cx: &KeepsCx, name: string, i: usize) -> bool
 end closure_licensed
 
 // **Whether a call through an object may answer with what it is handed at `k`** (the receiver first):
-// where the trait's declaration of the method says `@answers` of it (`declared_answers`), and for a
-// closure's object, wherever a closure made at its type does. A trait the receiver's type does not
-// name is answered yes, since nothing can say otherwise. An answer that can hold no pointer -- `measure`
-// answering an `int` -- is made of nothing it was handed, whatever the declaration says.
-vcall_answers(cx: &KeepsCx, recv: TExpr, slot: int, all: Buf[TExpr], k: usize, ty: Type) -> bool
+// where the trait's declaration of the method says `@answers` of it (`declared_answers`). **A callable
+// type has no way to say `@answers`, so a call through a closure's object may answer with anything it
+// is handed** -- read off the type, as the rest of the call is, never off the closures made at it. A
+// trait the receiver's type does not name is answered yes, since nothing can say otherwise. An answer
+// that can hold no pointer -- `measure` answering an `int` -- is made of nothing it was handed,
+// whatever the declaration says.
+vcall_answers(cx: &KeepsCx, recv: TExpr, slot: int, k: usize, ty: Type) -> bool
     val tr = erased_trait(texpr_type(recv))
 
     if !may_hold_pointer(cx, ty) then return false
     if tr.is_none() || slot < 0 then return true
-    if object_marks_kept(recv, k) then return true
-    if !through_closure(recv) then return declared_answers(cx, recv, slot, k)
+    if object_marks_kept(recv, k) || through_closure(recv) then return true
 
-    val name = tr.unwrap() match
-        Trait(n, _, _) -> n
-        _ -> ""
-
-    for vt in cx.vtables
-        if vt.trait_name != name || usize(slot) >= vt.slots.len() then continue
-        if licensed_elsewhere(cx, recv, vt.slots[usize(slot)].target, k) then continue
-        if answers_arg(cx, vt.slots[usize(slot)].target, all, k, ty, false) then return true
-
-    false
+    declared_answers(cx, recv, slot, k)
 end vcall_answers
 
 // **What a call through an object lets out of what it reads through its argument at `k`** (the
 // receiver first), as `vcall_keeps` says of keeping: what the trait's declaration says, or for a
-// closure's object, each location with the closure body that holds it there. A receiver whose type
-// names no trait is answered with a location nothing can name.
+// closure's object, what its type marks. A receiver whose type names no trait is answered with a
+// location nothing can name.
 vcall_through(cx: &KeepsCx, recv: TExpr, slot: int, k: usize) -> Buf[(string, KeptAt)]
     var out: Buf[(string, KeptAt)] = buf()
 
@@ -1354,29 +1300,32 @@ vcall_through(cx: &KeepsCx, recv: TExpr, slot: int, k: usize) -> Buf[(string, Ke
         return out
     end if
 
-    if object_marks_kept(recv, k) then return object_kept(recv)
-    if !through_closure(recv) then return declared_kept(cx, recv, slot, k)
-
-    closure_kept(cx, recv, slot, k, (t, j) -> through_of(cx, t, j))
+    by_signature(cx, recv, slot, k)
 end vcall_through
 
-// The same as the borrow rule asks it (`deep_of`): nothing where the receiver's type names no trait.
-private vcall_deep(cx: &KeepsCx, recv: TExpr, slot: int, k: usize, path: string) -> Buf[(string, KeptAt)]
-    if erased_trait(texpr_type(recv)).is_none() || slot < 0 then return buf()
+// What a call through an object keeps of what it reads through its argument at `k`, by its type: all of
+// it where the type marks the parameter `@keeps`, nothing for an unmarked parameter of a callable, and
+// for a trait's object what the method's declaration says.
+private by_signature(cx: &KeepsCx, recv: TExpr, slot: int, k: usize) -> Buf[(string, KeptAt)]
     if object_marks_kept(recv, k) then return object_kept(recv)
-    if !through_closure(recv) then return declared_kept(cx, recv, slot, k)
+    if through_closure(recv) then return buf()
 
-    closure_kept(cx, recv, slot, k, (t, j) -> deep_path_of(cx, t, j, path))
+    declared_kept(cx, recv, slot, k)
+end by_signature
+
+// The same as the borrow rule asks it (`deep_of`): nothing where the receiver's type names no trait.
+private vcall_deep(cx: &KeepsCx, recv: TExpr, slot: int, k: usize) -> Buf[(string, KeptAt)]
+    if erased_trait(texpr_type(recv)).is_none() || slot < 0 then return buf()
+
+    by_signature(cx, recv, slot, k)
 end vcall_deep
 
 // What a call through an object lets out of what it reads `steps` steps through its argument at `k`
 // (`read_of`): nothing where the receiver's type names no trait, which the rule holds to the default.
-vcall_reads(cx: &KeepsCx, recv: TExpr, slot: int, k: usize, steps: int, path: string) -> Buf[(string, KeptAt)]
+vcall_reads(cx: &KeepsCx, recv: TExpr, slot: int, k: usize) -> Buf[(string, KeptAt)]
     if erased_trait(texpr_type(recv)).is_none() || slot < 0 then return buf()
-    if object_marks_kept(recv, k) then return object_kept(recv)
-    if !through_closure(recv) then return declared_kept(cx, recv, slot, k)
 
-    closure_kept(cx, recv, slot, k, (t, j) -> read_path_of(cx, t, j, steps, path))
+    by_signature(cx, recv, slot, k)
 end vcall_reads
 
 // Whether a call through an object may answer with a value it read through its argument at `k`.
@@ -1384,19 +1333,9 @@ vcall_through_answers(cx: &KeepsCx, recv: TExpr, slot: int, k: usize) -> bool
     val tr = erased_trait(texpr_type(recv))
 
     if tr.is_none() || slot < 0 then return true
-    if object_marks_kept(recv, k) then return true
-    if !through_closure(recv) then return declared_answers(cx, recv, slot, k)
+    if object_marks_kept(recv, k) || through_closure(recv) then return true
 
-    val name = tr.unwrap() match
-        Trait(n, _, _) -> n
-        _ -> ""
-
-    for vt in cx.vtables
-        if vt.trait_name != name || usize(slot) >= vt.slots.len() then continue
-        if licensed_elsewhere(cx, recv, vt.slots[usize(slot)].target, k) then continue
-        if through_answers_of(cx, vt.slots[usize(slot)].target, k) then return true
-
-    false
+    declared_answers(cx, recv, slot, k)
 end vcall_through_answers
 
 // What a call through a function pointer lets out of what it reads through its argument at `j`, at
@@ -1549,6 +1488,7 @@ end anywhere
 // (`refuse_promised`).
 private lent_by_rule(cx: &KeepsCx, f: TFunc, i: usize) -> bool
     if scoped_at(f, i) then return true
+
     // A closure made at a callable type that marks the parameter `@keeps` was promised nothing about
     // it, so a call that sees its body is held to what the body keeps.
     if is_closure_body(f) && (i == 0 || closure_licensed(cx, f.name, i)) then return false
@@ -2417,9 +2357,9 @@ private track_vcall_locs(t: &Track, recv: TExpr, slot: int, k: usize, arg: TExpr
         for item in kept
             out.push(item)
 
-        for left in reads
-            for item in vcall_reads(t.cx, recv, slot, k, left, "")
-                if !in_place_of(item.1.loc, k) then out.push(item)
+        // A call through an object is answered by its type, which says the same at every step.
+        for item in vcall_reads(t.cx, recv, slot, k)
+            if !in_place_of(item.1.loc, k) then out.push(item)
 
         return out
     end if
@@ -2432,13 +2372,14 @@ private track_vcall_locs(t: &Track, recv: TExpr, slot: int, k: usize, arg: TExpr
         out.push(item)
 
     if t.steps == 0
-        for item in (if t.deep then vcall_deep(t.cx, recv, slot, k, hand_path(t, arg, 0)) else vcall_through(t.cx, recv, slot, k))
+        for item in (if t.deep then vcall_deep(t.cx, recv, slot, k) else vcall_through(t.cx, recv, slot, k))
             out.push(item)
     end if
 
-    for left in steps_left(t, arg)
-        for item in vcall_reads(t.cx, recv, slot, k, left, hand_path(t, arg, left))
+    if !steps_left(t, arg).is_empty()
+        for item in vcall_reads(t.cx, recv, slot, k)
             out.push(item)
+    end if
 
     out
 end track_vcall_locs
@@ -4669,7 +4610,7 @@ private frame_vread_locs(ft: &FrameTrack, recv: TExpr, slot: int, k: usize, arg:
     val closed = frame_closed(ft, arg)
 
     for r in read_cores_along(ft, arg)
-        for item in vcall_reads(ft.cx, recv, slot, k, r.0, r.2)
+        for item in vcall_reads(ft.cx, recv, slot, k)
             if !(closed && put_back(item.1.loc, k)) then out.push((item.0, item.1, r.1))
 
     out
@@ -4695,6 +4636,16 @@ private put_back(loc: string, j: usize) -> bool = loc.starts_with(s"p$j:") || lo
 // Whether a callee's location is the storage its parameter at `j` points at, in place -- not storage
 // reached through a pointer read out of it, which may be anybody's.
 private in_place_of(loc: string, j: usize) -> bool = loc.starts_with(s"p$j:")
+
+// Whether every location is one held through the pointee of the parameter at `j` itself.
+private all_in_place(locs: Buf[KeptAt], j: usize) -> bool
+    if locs.is_empty() then return false
+
+    for item in locs
+        if !in_place_of(item.loc, j) then return false
+
+    true
+end all_in_place
 
 // **Whether everything a pointer argument reaches is this frame's own storage**: the locals it points
 // at, and everything their storage holds the address of, at any depth, with no address in any of it
@@ -4823,7 +4774,7 @@ private probe_text(ft: &FrameTrack, e: TExpr) -> string = *e.kind match
             val through = may_hold_pointer(ft.cx, ty) && asks_through(ft.cx, texpr_type(handed[k])) &&
                 vcall_through_answers(ft.cx, recv, slot, k)
 
-            if through || vcall_answers(ft.cx, recv, slot, handed, k, ty) then all = all + probe_text(ft, handed[k])
+            if through || vcall_answers(ft.cx, recv, slot, k, ty) then all = all + probe_text(ft, handed[k])
         end for
 
         all
@@ -4906,7 +4857,7 @@ private rule_core(ft: &FrameTrack, e: TExpr) -> Option[string] = *e.kind match
         for k in 0..<handed.len()
             val c = frame_core(ft, handed[k])
 
-            if c.is_some() && vcall_answers(ft.cx, recv, slot, handed, k, ty) then return c
+            if c.is_some() && vcall_answers(ft.cx, recv, slot, k, ty) then return c
 
         None
     _ -> None
@@ -5714,7 +5665,7 @@ private call_locs(ft: &FrameTrack, c: TExpr, j: usize, steps: int, path: string)
             for item in (if steps == 0 then keeps_of(ft.cx, name, j) else read_path_of(ft.cx, name, j, steps, path)).locs
                 out.push(item.loc)
         TVCall(recv, slot, _, _, _) ->
-            for item in (if steps == 0 then vcall_keeps(ft.cx, recv, slot, j) else vcall_reads(ft.cx, recv, slot, j, steps, path))
+            for item in (if steps == 0 then vcall_keeps(ft.cx, recv, slot, j) else vcall_reads(ft.cx, recv, slot, j))
                 out.push(item.1.loc)
         TCallPtr(callee, _, _, _) ->
             for item in (if steps == 0 then pointer_keeps(ft.cx, callee, j) else pointer_reads(ft.cx, callee, j, steps, path))
@@ -5978,7 +5929,13 @@ private refuse_promised(cx: &KeepsCx, faults: &KeepFaults, f: TFunc)
     // out of what it reads through a pointer, and what its answer is made of are all broken promises
     // unless the declaration says them. A trait's method no table holds is reached only by calls that
     // see its body, and is held to the raw pointers alone.
-    val reached = !closure && !f.marks.is_async() && (cx.slotted.has(f.name) || addressed)
+    //
+    // **A closure's body a call through `&Fn` may land in is held to its callable type the same way**
+    // (L7): such a call asks no body, so a closure that keeps what it is handed, or lets out what it
+    // reads through it, broke the type's promise unless the type marks that parameter `@keeps`. One
+    // taken only as a bare arrow is called where its body is in sight, which answers for it.
+    val reached = (closure && cx.erased.has(f.name)) ||
+        (!closure && !f.marks.is_async() && (cx.slotted.has(f.name) || addressed))
 
     for i in first..<f.params.len()
         if !may_hold_pointer(cx, f.params[i].1) || scoped_at(f, i) then continue
@@ -5990,9 +5947,8 @@ private refuse_promised(cx: &KeepsCx, faults: &KeepFaults, f: TFunc)
 
         // **A closure made at a callable type that marks the parameter `@keeps` may keep it**: every
         // call through that type is held to the mark instead (`object_marks_kept`), and a call that
-        // sees the body, to what the body keeps. An object it stores is no broken promise: a call
-        // handing over a closure behind a `&Fn` is held to what this body keeps (`lent_by_rule`).
-        if closure && (!raw || closure_licensed(cx, f.name, i)) then continue
+        // sees the body, to what the body keeps.
+        if closure && closure_licensed(cx, f.name, i) then continue
 
         // **The receiver is held to the declaration too**: the object a call went through may be made in
         // the caller's frame, so an implementation that keeps it past the call needs the trait's
@@ -6012,9 +5968,11 @@ private refuse_promised(cx: &KeepsCx, faults: &KeepFaults, f: TFunc)
         if !declared && asks_through(cx, f.params[i].1)
             val d = deep_of(cx, f.name, i)
 
-            if d.kept
-                faults.items.push((scope, d.at, through_broken(cx, f, f.params[i].0, d.how, trait_name) +
-                                   keeps_hint(cx, f, i, trait_name)))
+            // What a closure reads through a parameter and puts back into the same pointee -- a scope's
+            // own spawn list -- stays in the caller's storage, which is the caller's to answer for.
+            if d.kept && (!closure || !all_in_place(d.locs, i))
+                faults.items.push((scope, d.at, through_broken(cx, f, f.params[i].0, d.how, closure, trait_name) +
+                                   (if closure then marked_hint(f, i) else keeps_hint(cx, f, i, trait_name))))
                 continue
             end if
         end if
@@ -6037,7 +5995,14 @@ private keeps_hint(cx: &KeepsCx, f: TFunc, i: usize, trait_name: Option[string])
 end keeps_hint
 
 // A body reached with no body in sight that lets out what it reads through a parameter.
-private through_broken(cx: &KeepsCx, f: TFunc, pname: string, how: string, trait_name: Option[string]) -> string
+private through_broken(cx: &KeepsCx, f: TFunc, pname: string, how: string, closure: bool,
+                       trait_name: Option[string]) -> string
+    if closure
+        return s"a closure borrows what it is handed for the call, and this one lets what it reads through " +
+            s"its parameter '$pname' outlive the call ($how) — what it reads there may be the address of the " +
+            "caller's own storage. Copy what this needs into storage of its own"
+    end if
+
     val shown = shown_name(cx.an, f.name)
     val why = if trait_name.is_some()
         s"a method of '${qualified_name(trait_name.unwrap())}' borrows its parameters for the call — a call " +
