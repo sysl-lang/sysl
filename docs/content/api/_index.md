@@ -29,6 +29,7 @@ These pages are generated from the library's own doc comments: every declaration
 | [`sysl.env.hosted`](sysl-env-hosted/) |  |
 | [`sysl.env.sys`](sysl-env-sys/) |  |
 | [`sysl.fenv`](sysl-fenv/) | The floating-point environment: the rounding mode, the five exception flags, and on Arm the flush-to-zero and default-NaN controls. |
+| [`sysl.fiber`](sysl-fiber/) | Stacks of a program's own, and the switch from one to another: what a runtime builds lightweight threads on, over the operating system's threads that carry them. |
 | [`sysl.fmt`](sysl-fmt/) | What an `f"…"` hole's computed width or precision comes to — `${x}%.${n}f`, `${s}%${w}s` — and what an integer under a specifier renders as — `${n}%08x`. |
 | [`sysl.fs`](sysl-fs/) | What is at the end of a path: reading and writing whole files, metadata, directories, links, and the errors any of it can answer with. |
 | [`sysl.fs.errtext`](sysl-fs-errtext/) |  |
@@ -38,6 +39,7 @@ These pages are generated from the library's own doc comments: every declaration
 | [`sysl.hint`](sysl-hint/) | Hints to the optimizer that change what it may assume, never what a program computes. |
 | [`sysl.io`](sysl-io/) | The byte surface a program reads through, and the line cursor over it. |
 | [`sysl.io.hosted`](sysl-io-hosted/) |  |
+| [`sysl.io.poll`](sysl-io-poll/) | Waiting on many descriptors at once: a set of them registered with the kernel -- kqueue on Darwin and the BSDs, epoll on Linux -- and one call that answers which are ready. |
 | [`sysl.io.sys`](sysl-io-sys/) |  |
 | [`sysl.io.wait`](sysl-io-wait/) | Waiting for a descriptor with a time limit: whether a read, or a write, would go ahead without waiting, asked of the system and answered before the time runs out. |
 | [`sysl.log`](sysl-log/) | Structured logging: a level, a message, a few named fields, and somewhere for them to go. |

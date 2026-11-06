@@ -22,8 +22,10 @@ written in it, and a reader who knows it should not have to translate.
 ## Blocking, unless asked
 
 Every call here returns when its work is done. There is no event loop and no readiness
-notification, and that is the line Rust draws too -- `std::net` is blocking and every async runtime
-is a package outside it. `sysl-lang/libuv` is where the event-loop story lives.
+notification in this module, and that is the line Rust draws too -- `std::net` is blocking and every async runtime
+is a package outside it. `sysl-lang/libuv` is where the event-loop story lives. **Readiness over
+many sockets at once is `sysl.io.poll`**: register each socket's `fd()`, set non-blocking, and one
+thread learns which of thousands would not block.
 
 **A timeout is the one thing a blocking call cannot do without**, because otherwise "returns when
 the work is done" can mean never. `read_timeout` and `write_timeout` are what bound it, and a call

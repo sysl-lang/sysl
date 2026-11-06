@@ -119,17 +119,66 @@ private[sysl] extern "atanhf" sysl_atanhf(x: f32) -> f32
 // Rounding to an integral value, all four of which answer in the float's own type: a `floor` that
 // returned an integer would be undefined for the operands that do not fit one, and the caller who
 // wants an integer is the one who knows the range.
-// All four roundings are instructions. `llvm.round` is C's `round` and goes away from zero at a
-// half, which is **not** `llvm.roundeven`'s rule — the two differ at exactly the inputs a rounding
-// is chosen for, so the one adopted here is pinned by a test rather than assumed from the name.
+// All four roundings are instructions where the machine has one, and C's function of the same name
+// where it does not. `llvm.round` is C's `round` and goes away from zero at a half, which is **not**
+// `llvm.roundeven`'s rule — the two differ at exactly the inputs a rounding is chosen for, so the one
+// adopted here is pinned by a test rather than assumed from the name.
 private[sysl] extern "llvm.floor" sysl_floor(x: f64) -> f64
 private[sysl] extern "llvm.floor" sysl_floorf(x: f32) -> f32
 private[sysl] extern "llvm.ceil" sysl_ceil(x: f64) -> f64
 private[sysl] extern "llvm.ceil" sysl_ceilf(x: f32) -> f32
 private[sysl] extern "llvm.round" sysl_round(x: f64) -> f64
 private[sysl] extern "llvm.round" sysl_roundf(x: f32) -> f32
+// Ties to even has no instruction on a board's core, and the function LLVM calls in its place,
+// C23's `roundeven`, is one newlib does not have. So a freestanding machine without the instruction
+// rounds on the encoding instead: integers only, the same answer in every rounding mode, and no
+// flag raised. AArch64 (`frintn`), WebAssembly (`nearest`) and an Arm unit holding doubles (`vrintn`)
+// have the instruction and keep it.
+#if freestanding && !aarch64 && !wasm32 && !(thumb && fpu_dp)
+private[sysl] sysl_roundeven(x: f64) -> f64 = sysl_roundeven_encoded(x)
+private[sysl] sysl_roundevenf(x: f32) -> f32 = sysl_roundevenf_encoded(x)
+#else
 private[sysl] extern "llvm.roundeven" sysl_roundeven(x: f64) -> f64
 private[sysl] extern "llvm.roundeven" sysl_roundevenf(x: f32) -> f32
+#endif
+
+// Ties to even on the encoding. A value whose exponent leaves no fraction bits is already integral,
+// and so is an infinity or a NaN; one below a half is a zero of its own sign; one in [0.5, 1) is
+// that zero at exactly a half and one above it. Otherwise the bits below the units place are cut
+// away and the units place is raised by one past a half, or at exactly a half when it is odd: a
+// carry out of the fraction lands in the exponent, which is the next power of two.
+private[sysl] sysl_roundeven_encoded(x: f64) -> f64
+    val b = x.bits()
+    val e = (b >> 52) & 0x7ff
+    if e >= 1075 then return x
+
+    val sign = b & 0x8000000000000000
+    if e < 1022 then return f64.from_bits(sign)
+    if e == 1022 then return f64.from_bits(if b & 0xfffffffffffff == 0 then sign else sign | 0x3ff0000000000000)
+
+    val unit = u64(1) << (1075 - e)
+    val rem = b & (unit - 1)
+    val base = b - rem
+    val half = unit >> 1
+    f64.from_bits(if rem > half || (rem == half && base & unit != 0) then base + unit else base)
+end sysl_roundeven_encoded
+
+private[sysl] sysl_roundevenf_encoded(x: f32) -> f32
+    val b = x.bits()
+    val e = (b >> 23) & 0xff
+    if e >= 150 then return x
+
+    val sign = b & 0x80000000
+    if e < 126 then return f32.from_bits(sign)
+    if e == 126 then return f32.from_bits(if b & 0x7fffff == 0 then sign else sign | 0x3f800000)
+
+    val unit = u32(1) << (150 - e)
+    val rem = b & (unit - 1)
+    val base = b - rem
+    val half = unit >> 1
+    f32.from_bits(if rem > half || (rem == half && base & unit != 0) then base + unit else base)
+end sysl_roundevenf_encoded
+
 private[sysl] extern "llvm.trunc" sysl_trunc(x: f64) -> f64
 private[sysl] extern "llvm.trunc" sysl_truncf(x: f32) -> f32
 // The two roundings that read the mode in force rather than naming one: C's `nearbyint`, which raises
@@ -161,9 +210,10 @@ private[sysl] extern "llvm.minnum" sysl_minnumf(x: f32, y: f32) -> f32
 
 // IEEE 754-2019's maximum and minimum: a NaN operand wins, and `-0` orders below `+0`. AArch64's
 // `fmax` and `fmin` are exactly these. On Arm's thumb machines LLVM cannot select `llvm.maximum` for
-// a float the unit does not hold (a double on a single-precision unit), so there the same answer is
-// written as comparisons: the NaN first, then two equal values told apart by the sign of the first.
-#if thumb
+// a float the unit does not hold (a double on a single-precision unit), and on a freestanding RISC-V
+// it calls C23's `fmaximum`, which newlib does not have; so there the same answer is written as
+// comparisons: the NaN first, then two equal values told apart by the sign of the first.
+#if thumb || (freestanding && (riscv32 || riscv64))
 private[sysl] sysl_maximum(x: f64, y: f64) -> f64 =
     if x != x then x else if y != y then y else if x == y then (if sysl_copysign(1.0, x) < 0.0 then y else x) else if x > y then x else y
 private[sysl] sysl_maximumf(x: f32, y: f32) -> f32 =

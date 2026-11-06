@@ -1,0 +1,116 @@
+module sysl.math
+@tests
+@requires(heap)
+
+import sysl.hint.black_box
+import sysl.sys.*
+
+// `round_even` on a freestanding board without the instruction is rounded on the encoding rather
+// than by C's `roundeven`, which newlib does not have (`sysl.sys`'s `sysl_roundeven_encoded`). The
+// encoding form is ordinary code, so it runs here too, and every answer it gives is held against the
+// machine's own `round_even` -- the instruction or the host's libm -- bit for bit, so a zero keeps
+// its sign and a NaN stays a NaN.
+
+private ref64(x: real) -> real = black_box(x).round_even()
+private ref32(x: f32) -> f32 = black_box(x).round_even()
+
+private same64(x: real)
+    val got = sysl_roundeven_encoded(black_box(x))
+    val want = ref64(x)
+
+    if want != want
+        assert(got != got, s"round_even($x) on the encoding is $got, and the machine says NaN")
+    else
+        assert_eq(got.bits(), want.bits(), s"round_even($x): the encoding gives $got, the machine $want")
+    end if
+end same64
+
+private same32(x: f32)
+    val got = sysl_roundevenf_encoded(black_box(x))
+    val want = ref32(x)
+
+    if want != want
+        assert(got != got, s"round_even($x) on the encoding is $got, and the machine says NaN")
+    else
+        assert_eq(got.bits(), want.bits(), s"round_even($x): the encoding gives $got, the machine $want")
+    end if
+end same32
+
+@test("rfe: a tie goes to the even neighbour on the encoding, at f64 and f32")
+rfe_ties()
+    for (x, want) in [(0.5, 0.0), (1.5, 2.0), (2.5, 2.0), (3.5, 4.0), (-0.5, -0.0), (-1.5, -2.0), (-2.5, -2.0),
+                      (4503599627370495.5, 4503599627370496.0), (4503599627370494.5, 4503599627370494.0)]
+        assert_eq(sysl_roundeven_encoded(black_box(x)).bits(), want.bits(), s"round_even($x)")
+        same64(x)
+    end for
+
+    for (x, want) in [(0.5f32, 0.0f32), (1.5f32, 2.0f32), (2.5f32, 2.0f32), (3.5f32, 4.0f32), (-0.5f32, -0.0f32),
+                      (-1.5f32, -2.0f32), (-2.5f32, -2.0f32), (8388607.5f32, 8388608.0f32), (8388606.5f32, 8388606.0f32)]
+        assert_eq(sysl_roundevenf_encoded(black_box(x)).bits(), want.bits(), s"round_even($x)")
+        same32(x)
+    end for
+end rfe_ties
+
+@test("rfe: off a tie the encoding rounds to the nearer neighbour, across the carry into the exponent")
+rfe_nearest()
+    for x in [0.49999999999999994, 0.5000000000000001, 0.75, 0.9999999999999999, 1.0, 1.25, 1.75, 1.9999999999999998,
+              2.4999999999999996, 2.5000000000000004, 7.5, 1023.5, 1024.5, -0.75, -1.25, -1023.5, 123456.789]
+        same64(x)
+
+    for x in [0.49999997f32, 0.50000006f32, 0.75f32, 0.99999994f32, 1.0f32, 1.25f32, 1.75f32, 1.9999999f32,
+              7.5f32, 1023.5f32, 1024.5f32, -0.75f32, -1.25f32, -1023.5f32, 1234.567f32]
+        same32(x)
+end rfe_nearest
+
+@test("rfe: the largest exact integers, the infinities, NaN and the zeros come back as they went in")
+rfe_edges()
+    val inf = real.infinity()
+    val inf32 = f32.infinity()
+
+    for x in [9007199254740991.0, -9007199254740991.0, 9007199254740992.0, 4503599627370496.0, 1.0e300, -1.0e300,
+              inf, -inf, real.nan(), 0.0, -0.0]
+        same64(x)
+
+    for x in [16777215.0f32, -16777215.0f32, 16777216.0f32, 8388608.0f32, 3.0e38f32, -3.0e38f32,
+              inf32, -inf32, f32.nan(), 0.0f32, -0.0f32]
+        same32(x)
+
+    assert_eq(sysl_roundeven_encoded(black_box(-0.0)).bits(), 0x8000000000000000)
+    assert_eq(sysl_roundevenf_encoded(black_box(-0.0f32)).bits(), 0x80000000)
+    assert(sysl_roundeven_encoded(black_box(real.nan())).is_nan())
+    assert(sysl_roundevenf_encoded(black_box(f32.nan())).is_nan())
+    assert_eq(sysl_roundeven_encoded(black_box(-inf)), -inf)
+    assert_eq(sysl_roundevenf_encoded(black_box(inf32)), inf32)
+end rfe_edges
+
+@test("rfe: a denormal rounds to a zero of its own sign")
+rfe_denormals()
+    for b in [u64(1), 0x000fffffffffffff, 0x0008000000000000]
+        same64(real.from_bits(b))
+        same64(real.from_bits(b | 0x8000000000000000))
+        assert_eq(sysl_roundeven_encoded(real.from_bits(b | 0x8000000000000000)).bits(), 0x8000000000000000)
+    end for
+
+    for b in [u32(1), 0x007fffff, 0x00400000]
+        same32(f32.from_bits(b))
+        same32(f32.from_bits(b | 0x80000000))
+        assert_eq(sysl_roundevenf_encoded(f32.from_bits(b | 0x80000000)).bits(), 0x80000000)
+    end for
+end rfe_denormals
+
+@test("rfe: every quarter in a range and a spread of bit patterns agree with the machine")
+rfe_sweep()
+    for k in -4096..4096
+        same64(real(k) * 0.25)
+        same32(f32(k) * 0.25f32)
+    end for
+
+    // Bit patterns from a linear congruential sequence, so every exponent and fraction is reached.
+    var s: u64 = 0x9e3779b97f4a7c15
+
+    for _ in 0..<20000
+        s = s *% 6364136223846793005 +% 1442695040888963407
+        same64(real.from_bits(s))
+        same32(f32.from_bits(u32(s >> 32)))
+    end for
+end rfe_sweep

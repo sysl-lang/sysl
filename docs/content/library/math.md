@@ -300,6 +300,11 @@ nothing. The mode is read only in a
 [`@strict_fp`](/reference/attributes/#strict-fp-floating-point-that-follows-the-environment-it-runs-in)
 body; anywhere else it is the default mode, and both give what `round_even` gives.
 
+`round_even` is one instruction where the machine has one (AArch64, WebAssembly, an Arm unit that
+holds doubles). On any other freestanding target it is computed from the float's encoding in
+integers rather than called from the C library, because newlib, the C library of the Arm and RISC-V
+toolchains, has no C23 `roundeven`. The answer is the same, and no flag is raised in either case.
+
 ```sysl
 import sysl.math.Float
 

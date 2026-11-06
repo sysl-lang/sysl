@@ -1,0 +1,157 @@
+module sysl.fiber
+@requires(posix)
+
+import sysl.fs.{IoError, from_status}
+import sysl.raw.ptr_cast
+
+/** Stacks of a program's own, and the switch from one to another: what a runtime builds lightweight
+ * threads on, over the operating system's threads that carry them.
+ *
+ * A `Stack` is a mapping committed only as it is touched, with an inaccessible guard below it. A
+ * `Context` is a place to come back to: either a stack prepared to begin at an entry function
+ * (`Context.start`), or one that `switch` saved while leaving it. `switch(&here, &there)` saves the
+ * running stack in `here` and resumes `there` -- an ordinary call that returns when something
+ * switches back to `here`, a few nanoseconds later or on another thread.
+ *
+ * Nothing here schedules: which context runs next, and on which thread, is the runtime's choice.
+ *
+ * ## What is saved
+ *
+ * Everything the platform's calling convention promises a callee keeps: on aarch64 x19--x30, the
+ * stack pointer, d8--d15 and the floating-point control register (FPCR, so the rounding mode is the
+ * fiber's own); on x86_64 rbx, rbp, r12--r15, the stack pointer, MXCSR's control bits and the x87
+ * control word. There is no system call and no signal mask in a switch: a fiber runs with whatever
+ * mask its carrier thread has. The supported machines are aarch64 (macOS and Linux) and x86_64 (Linux
+ * and macOS).
+ *
+ * ## A fiber may move between threads, and what is the carrier's
+ *
+ * A context saved on one thread may be resumed on another. The stack and every register move with it;
+ * what does not is anything kept **per thread**, which is the carrier's, not the fiber's:
+ *
+ * - **`@thread_local` storage is the carrier's.** A fiber reading one after it was resumed elsewhere
+ *   reads the new carrier's copy. And **a function that calls `switch` must not hold a thread-local's
+ *   address across the call**: the optimizer takes a thread-local's address to be fixed for the length
+ *   of a function, so it may reuse the one it computed before the switch after it, on the old
+ *   carrier's copy. Keep thread-local reads and writes out of the function that switches (and out of
+ *   anything inlined into it), or keep fibers on the thread they started on.
+ * - **The error return trace is the carrier's** (`sysl.debug`). The sites it records are constants,
+ *   never addresses in a frame, so a fiber that moves leaves nothing dangling -- but a failure a fiber
+ *   records lands in whichever carrier's trace is current, interleaved with whatever else ran there. A
+ *   runtime that wants each fiber's trace whole gives each an `ErrorTraceStore` and makes it current
+ *   around the switch to the fiber, on the carrier that is about to run it:
+ *   `use_error_trace(&f.trace)` before `switch`, `use_error_trace(null)` once it is back.
+ * - **`sysl.threads.current()` answers the carrier**, which is what it is: the thread running now.
+ * - **The stack-overflow report needs nothing per thread.** A stack's guard is registered with the
+ *   process when it is reserved, and the first `switch` on a thread gives that thread the signal
+ *   stack the report is written from, so an overflow is reported on whichever carrier it happens.
+ *
+ * A context for a thread's **own** stack -- a `Context.new()` that `switch` saved -- is resumed only
+ * on that thread: the stack is the thread's, and the thread may end.
+ *
+ * ## Backtraces and debuggers
+ *
+ * The frame a fiber's entry is called from has a zero frame pointer, and its return address is marked
+ * undefined in the unwind tables, so a debugger, a sampler or a crash report walks a fiber's stack from
+ * where it stopped down to its entry and no further.
+ */
+
+/** A stack for a fiber, reserved but not yet committed: the operating system backs a page the first
+ * time it is touched, so reserving a megabyte for each of ten thousand fibers costs address space,
+ * not memory.
+ *
+ * Below it is a guard of at least 64 KiB that nothing may touch. A fiber that recurses into it is
+ * reported exactly as a thread's overflow is -- "this program has overflowed its stack" -- rather than
+ * as a bare segmentation fault.
+ *
+ * **Dropping the last reference unmaps it**, so it is held as a `&Stack`. It must outlive every
+ * context started on it, and must not be dropped while a fiber is running on it.
+ */
+struct Stack
+    private at: *u8
+    private n: usize
+    private guard: usize
+
+    /** Reserves a stack of at least `size` bytes, in a mapping of whole pages, with its guard below.
+     * A size of zero is refused as `Other(22)` (`EINVAL`); a reservation the system refuses answers
+     * its own error (`ENOMEM` past the address space or the map count).
+     */
+    reserve(size: usize) -> Result[&Stack, IoError]
+        if size == 0 then return Err(from_status(-22))
+
+        val page = c_page()
+        val guard = c_guard()
+        val n = (size + node_room + page - 1) / page * page + guard
+        var at: *u8 = null
+        val code = c_map(n, guard, &at)
+
+        if code != 0 then Err(from_status(code)) else Ok(Stack(at, n, guard))
+    end reserve
+
+    /** How many bytes the stack holds: at least what was asked for, since the mapping is whole
+     * pages. */
+    len(self) -> usize = self.n - self.guard - node_room
+
+    /** How many of the stack's bytes are resident: the pages a fiber has touched so far, which is
+     * what the stack costs in memory. */
+    committed(self) -> usize = c_resident(&self.at[self.guard], self.n - self.guard)
+end Stack
+
+impl Drop for Stack
+    drop(self)
+        c_unmap(self.at, self.n)
+
+/** Where `switch` goes, or comes back to: a stack pointer with everything callee-saved stored below
+ * it. Make one with `new()` for the stack running now -- `switch` fills it in when it leaves -- or with
+ * `start` for a new fiber.
+ *
+ * A context is a value, and the one `switch` saved into is the one to resume: hand its address
+ * around, not a copy taken before the switch.
+ */
+struct Context
+    private sp: *u8
+    private lo: *u8
+    private len: usize
+
+    /** A context for the running stack, which holds nothing until `switch` leaves through it. */
+    new() -> Context = Context(null, null, 0)
+
+    /** A context that begins at `entry(arg)` on `stack` the first time something switches to it.
+     *
+     * **`entry` never returns**: there is no caller on a fiber's stack to return to, so a fiber ends by
+     * switching away for the last time. An entry that does return traps, saying so. `stack` must
+     * outlive the fiber, and one stack runs one fiber at a time.
+     */
+    start[T](stack: &Stack, entry: *extern(*T) -> unit, arg: *T) -> Context
+        var c = Context.new()
+        val lo = &stack.at[stack.guard]
+
+        c_start(&c, c_top(stack.at, stack.n), lo, stack.n - stack.guard, ptr_cast(entry),
+                ptr_cast(arg))
+        c
+    end start
+
+    /** Whether a context has somewhere to go: `false` for a `new()` that has not been left yet. */
+    is_ready(self) -> bool = self.sp != null
+end Context
+
+/** Saves the running stack in `from` and resumes `to`, which must hold a stack that is not running:
+ * one `start` prepared, or one a `switch` saved. Comes back when something switches to `from`.
+ *
+ * It is a few nanoseconds: callee-saved registers, the stack pointer and the floating-point control
+ * word, with no system call and no signal mask.
+ */
+switch(from: *Context, to: *Context) = c_switch(from, to)
+
+// The bytes kept at the top of every mapping for its guard's registry entry (`stackguard.c`).
+private const node_room: usize = 64
+
+private extern "sysl_fiber_page" c_page() -> usize
+private extern "sysl_fiber_guard_len" c_guard() -> usize
+private extern "sysl_fiber_map" c_map(len: usize, guard: usize, at: **u8) -> int
+private extern "sysl_fiber_unmap" c_unmap(at: *u8, len: usize)
+private extern "sysl_fiber_top" c_top(at: *u8, len: usize) -> *u8
+private extern "sysl_fiber_resident" c_resident(at: *u8, len: usize) -> usize
+private extern "sysl_fiber_start" c_start(c: *Context, top: *u8, lo: *u8, len: usize,
+                                          entry: *extern(*u8) -> unit, arg: *u8)
+private extern "sysl_fiber_switch" c_switch(from: *Context, to: *Context)
