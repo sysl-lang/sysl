@@ -2171,8 +2171,8 @@ analyze_operands(cx: &Analyzer, operands: Buf[Expr], expected: Option[Type],
     // Where neither a typed operand nor the position settles the pair, the readings of the operands
     // in the literal's tier do, as they did before they had a tier: `(1 << usize(d)) + 1` with
     // nothing around it is the `usize` its shift was read at.
-    val settled = firmest(operands, unless_soft(own, soft), widen, rescales).or_else(() -> expected)
-                      .or_else(() -> firmest(operands, own, widen, rescales))
+    val settled = firmest(cx, operands, unless_soft(own, soft), widen, rescales).or_else(() -> expected)
+                      .or_else(() -> firmest(cx, operands, own, widen, rescales))
     var told: Buf[Option[TExpr]] = buf()
 
     for i in 0..<operands.len()
@@ -2191,10 +2191,10 @@ analyze_operands(cx: &Analyzer, operands: Buf[Expr], expected: Option[Type],
         return bad
 
     val firm = unless_soft(told, soft)
-    val ty = literal_widened(cx, operands, firm, told, firmest(operands, firm, widen, rescales).or_else(() -> expected),
+    val ty = literal_widened(cx, operands, firm, told, firmest(cx, operands, firm, widen, rescales).or_else(() -> expected),
                              expected, widen && held == "", rescales)
                  .or_else(() -> if widen then float_among(operands) else None)
-                 .or_else(() -> firmest(operands, told, widen, rescales))
+                 .or_else(() -> firmest(cx, operands, told, widen, rescales))
     var out: Buf[TExpr] = buf()
 
     for i in 0..<operands.len()
@@ -2368,14 +2368,14 @@ private literal_widened(cx: &Analyzer, operands: Buf[Expr], firm: Buf[Option[TEx
             if own.is_some() && own.unwrap() == int_type() && integer_operand(ty) then ()
             else if own.is_some() && !type_eq(own.unwrap(), ty) && reaches_position(own.unwrap(), expected) &&
                     !literal_fits(cx, e, ty) && literal_fits(cx, e, own.unwrap()) &&
-                    holds_every_operand(operands, firm, own.unwrap(), rescales) then
+                    holds_every_operand(cx, operands, firm, own.unwrap(), rescales) then
                 ty = own.unwrap()
         else if firm[i].is_none() && told[i].is_some()
             val own = repr(texpr_type(told[i].unwrap()))
 
             if own == int_type() && integer_operand(ty) then ()
             else if own != Unknown && !type_eq(own, ty) && reaches_position(own, expected) &&
-                    !reads_at(cx, e, ty) && holds_every_operand(operands, firm, own, rescales) then
+                    !reads_at(cx, e, ty) && holds_every_operand(cx, operands, firm, own, rescales) then
                 ty = own
 
     Some(ty)
@@ -2529,7 +2529,7 @@ end reread
 //
 // **An adaptable operand is passed over rather than dropped**, which is the whole of the difference
 // between this and taking the head.
-private firmest(operands: Buf[Expr], read: Buf[Option[TExpr]], widen: bool,
+private firmest(cx: &Analyzer, operands: Buf[Expr], read: Buf[Option[TExpr]], widen: bool,
                 rescales: bool) -> Option[Type]
     var taken: Option[Type] = None
     var any: Option[Type] = None
@@ -2547,7 +2547,7 @@ private firmest(operands: Buf[Expr], read: Buf[Option[TExpr]], widen: bool,
 
     if chosen.is_none() then return None
 
-    val met = if widen then widest_operand(operands, read, chosen.unwrap(), rescales) else chosen.unwrap()
+    val met = if widen then widest_operand(cx, operands, read, chosen.unwrap(), rescales) else chosen.unwrap()
 
     Some(meet_views(met, read))
 end firmest
@@ -2561,7 +2561,7 @@ end firmest
 // **A `char` operand never widens**: `c + n` is a character used as a number, which is a mistake far
 // more often than it is arithmetic, so it is written `int(c) + n`. A character still widens to an
 // integer everywhere a position asks for one -- an initializer, an argument, a return.
-private widest_operand(operands: Buf[Expr], read: Buf[Option[TExpr]], chosen: Type,
+private widest_operand(cx: &Analyzer, operands: Buf[Expr], read: Buf[Option[TExpr]], chosen: Type,
                        rescales: bool) -> Type
     for i in 0..<operands.len()
         read[i] match
@@ -2569,13 +2569,13 @@ private widest_operand(operands: Buf[Expr], read: Buf[Option[TExpr]], chosen: Ty
                 val ty = repr(texpr_type(t))
 
                 if !adaptable(operands[i], t) && !type_eq(ty, chosen) &&
-                        holds_every_operand(operands, read, ty, rescales) then return ty
+                        holds_every_operand(cx, operands, read, ty, rescales) then return ty
             None -> ()
 
     chosen
 end widest_operand
 
-private holds_every_operand(operands: Buf[Expr], read: Buf[Option[TExpr]], ty: Type,
+private holds_every_operand(cx: &Analyzer, operands: Buf[Expr], read: Buf[Option[TExpr]], ty: Type,
                             rescales: bool) -> bool
     for i in 0..<operands.len()
         read[i] match
@@ -2585,11 +2585,25 @@ private holds_every_operand(operands: Buf[Expr], read: Buf[Option[TExpr]], ty: T
                 if other == Unknown then return false
                 if rescales && is_fixed(other) && is_fixed(ty) && !type_eq(other, ty) then return false
                 if !adaptable(operands[i], t) && !type_eq(other, ty) &&
-                        (other == Char || !implicitly_widens(other, ty)) then return false
+                        (other == Char || !implicitly_widens(other, ty)) &&
+                        !points_at_conformer(cx, other, ty) then return false
             None -> ()
 
     true
 end holds_every_operand
+
+// Whether a pointer to a concrete type meets a pointer to a trait it implements: the pair is read at
+// the trait pointer, to which the concrete one converts, so `rect_ptr == shape_ptr` and
+// `shape_ptr == rect_ptr` are one comparison. Two concrete types meet at neither.
+private points_at_conformer(cx: &Analyzer, from: Type, to: Type) -> bool
+    val tr = erased_trait(to)
+
+    if tr.is_none() then return false
+
+    (from, to) match
+        (Ptr(inner), Ptr(_)) -> !is_trait(*inner) && conforms(cx.an, trait_bound_of(tr.unwrap()), *inner)
+        _ -> false
+end points_at_conformer
 
 // The two views of one slice, met at the read-only one -- the only place a pair of operands has a
 // type to settle on that neither of them wrote.
