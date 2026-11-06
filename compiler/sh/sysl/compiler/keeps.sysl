@@ -114,7 +114,7 @@ struct KeepsCx
     // round under way.
     origins: Map[string, &Origins]
 
-    // Where each body binds its thread handles (`keeps_join.sysl`'s `handles_of`), by function, for
+    // Where each body binds its tasks (`keeps_task.sysl`'s `handles_of`), by function, for
     // the round under way, with whether gathering them leaned on this round's answers -- only those
     // every later gathering in the round would find again (`round_handles`).
     handles: Map[string, (&Handles, bool)]
@@ -1471,32 +1471,34 @@ end extern_kept
 
 // **A `*T` a written `@crossing` names is kept: it reaches another concurrency domain, which may go on
 // reading it after the call returns.** A body is no evidence here, since a written `@crossing` is a
-// boundary the body does not show -- `spawn` hands its argument to C. `@joined` says how long: the
-// thread the call starts holds the pointer until the handle the call answers is joined, the location
-// `j` (`joined_loc`), which a join of that handle takes back. A crossing a body was found to make
-// (`crossing.sysl`) is the body's own to answer for, through the call that makes it.
+// boundary the body does not show -- `spawn` hands its argument to C. Nothing a caller writes later
+// takes it back: a thread that borrows the caller's frame is started on `sysl.threads.scope`, whose
+// `spawn` is `@scoped` and so keeps nothing. A crossing a body was found to make (`crossing.sysl`) is
+// the body's own to answer for, through the call that makes it.
 private crossing_kept(f: TFunc, i: usize) -> Option[KeptWhy]
-    val name = f.params[i].0
-
     if !is_raw_pointer(f.params[i].1) then return None
 
-    if holds_string(f.marks.joined, name)
-        val how = "the thread it starts holds it until that thread is joined"
-        var locs: Buf[KeptAt] = buf()
-
-        locs.push(KeptAt("j", how, span_zero(), 0))
-        return Some(KeptWhy(true, how, span_zero(), locs))
-    end if
-
-    if holds_string(f.marks.copies, name) then return Some(anywhere("it reaches another concurrency domain", span_zero()))
+    if holds_string(f.marks.copies, f.params[i].0) then return Some(anywhere(CROSSING_HOW, span_zero()))
 
     None
 end crossing_kept
 
+// Why a written `@crossing` keeps a pointer, which a refusal at a call follows with the scope cure
+// (`crossing_cure`).
+val CROSSING_HOW = "it reaches another concurrency domain"
+
+// The cure for a frame address handed to a parameter that crosses: a thread that borrows the frame is
+// started on a scope, which joins it before the scope returns.
+crossing_cure(how: string, owner: string) -> string
+    if how != CROSSING_HOW then return ""
+
+    s" — a thread that borrows the frame of '$owner' is started on 'sysl.threads.scope', which joins it " +
+        "before the scope returns; anything else is handed storage that lasts"
+
 // **A task holds its arguments until it ends.** Calling an `async` function runs none of its body: the
 // call answers a task that holds every parameter, and the body reads them when the task is driven --
 // after the call has returned. So an async function keeps every parameter at `j`, the location a
-// thread's pointer is held at (`keeps_join.sysl`): the task is the handle, and an `await` or a
+// task's pointer is held at (`keeps_task.sysl`): the task is the handle, and an `await` or a
 // `block_on` of it -- of the call itself, or of a local or field it was kept in -- ends it and takes
 // the pointer back. A task answered keeps it on for the caller; one stored where no place names it,
 // or still held at a way out, holds it past the frame. Whatever the body itself keeps it in -- module
@@ -1737,7 +1739,7 @@ private track_along(cx: &KeepsCx, f: TFunc, i: usize, raw: bool, through: bool, 
     t
 end track_along
 
-// Where `f` binds its thread handles, gathered once a round rather than once a question.
+// Where `f` binds its tasks, gathered once a round rather than once a question.
 //
 // **A gathering is kept only if it read no answer whose question was still being worked out.** Every
 // other answer it read is in the memo for the rest of the round -- settled, this round's, or worked
@@ -1748,7 +1750,7 @@ end track_along
 // serves as leaning, as gathering it afresh would have.
 //
 // Each walk gets a `Handles` of its own around what was gathered, since a walk marks on it the
-// statement it is saying (`at`, `why`), and a walk of a recursive body asks its own questions in the
+// statement it is saying (`at`), and a walk of a recursive body asks its own questions in the
 // middle of one of its statements.
 private round_handles(cx: &KeepsCx, org: &Origins, f: TFunc) -> &Handles
     cx.handles.get(f.name) match
@@ -1786,9 +1788,7 @@ private round_handles(cx: &KeepsCx, org: &Origins, f: TFunc) -> &Handles
     hs
 end round_handles
 
-private handles_copy(hs: &Handles) -> &Handles =
-    Handles(hs.org, hs.sources, hs.chained, hs.answers, hs.scrutinized, hs.at, hs.why, hs.fan_at,
-            hs.fan_whys, hs.fan_hooks)
+private handles_copy(hs: &Handles) -> &Handles = Handles(hs.org, hs.sources, hs.chained, hs.answers, hs.scrutinized, hs.at)
 
 // Whether `f` lets its parameter at `i` outlive the call, where, and every location it may still be
 // held at when the call returns.
@@ -1975,7 +1975,6 @@ private track_stmt_events(t: &Track, s: TStmt) -> Buf[FlowEv]
         _ -> ()
 
     walk_stmt(s, TWalk(false, e -> kept_at(t, evs, e), w -> stored(t, evs, w.place, w.value), x -> ()))
-    fan_stmt_events(t.hs, evs, s)
     t.hs.at = ""
     evs.items
 end track_stmt_events
@@ -1987,7 +1986,6 @@ private track_expr_events(t: &Track, e: TExpr) -> Buf[FlowEv]
     t.hs.at = expr_handle(t.hs, e)
     top_clears(t, evs, e)
     walk_texpr(e, TWalk(false, x -> kept_at(t, evs, x), w -> stored(t, evs, w.place, w.value), s -> ()))
-    fan_events(t.hs, evs, e.span)
     t.hs.at = ""
     evs.items
 end track_expr_events
@@ -2128,7 +2126,6 @@ private kept_at(t: &Track, evs: &EvBuf, e: TExpr)
             if !t.promised && hands_on(t, wake)
                 kept_hard(evs, "it is the waker handed to 'step', which the task keeps for its parks", wake)
         TCall(name, args, _, _) ->
-            join_clear(t.hs, evs, name, args, e.span)
             handed_closures_kept(t, evs, args)
 
             for j in 0..<args.len()
@@ -2151,7 +2148,7 @@ private kept_at(t: &Track, evs: &EvBuf, e: TExpr)
                     // pointer read out of memory, could not name that storage again.
                     if at < kept_n && in_place_of(item.loc, j) && value_read_in(t, args[j]) then continue
 
-                    val loc = if item.loc == "j" then joined_loc(t.hs, true) else track_loc(t, args, item.loc)
+                    val loc = if item.loc == "j" then task_loc(t.hs, true) else track_loc(t, args, item.loc)
 
                     if loc.starts_with("j:") && said_already(evs, loc, args[j]) then continue
                     if !loc.starts_with("l:") then evs.items.push(kept_ev(loc, how, args[j]))
@@ -2188,7 +2185,7 @@ private kept_at(t: &Track, evs: &EvBuf, e: TExpr)
 
                     if item.1.loc == "j" && has_span(t.hs.chained, e.span) then continue
 
-                    val loc = if item.1.loc == "j" then joined_loc(t.hs, true) else translate_loc(t.org, all, item.1.loc)
+                    val loc = if item.1.loc == "j" then task_loc(t.hs, true) else translate_loc(t.org, all, item.1.loc)
 
                     if loc.starts_with("j:") && said_already(evs, loc, all[k]) then continue
 
@@ -3778,7 +3775,6 @@ private frame_stmt_events(ft: &FrameTrack, s: TStmt) -> Buf[FlowEv]
 
     walk_stmt(s, TWalk(false, e -> frame_event_at(ft, evs, e), w -> frame_stored(ft, evs, w.place, w.value),
                        x -> ()))
-    fan_stmt_events(ft.hs, evs, s)
     ft.hs.at = ""
     evs.items
 end frame_stmt_events
@@ -3791,7 +3787,6 @@ private frame_expr_events(ft: &FrameTrack, e: TExpr) -> Buf[FlowEv]
     frame_top_clears(ft, evs, e)
     walk_texpr(e, TWalk(false, x -> frame_event_at(ft, evs, x), w -> frame_stored(ft, evs, w.place, w.value),
                         s -> ()))
-    fan_events(ft.hs, evs, e.span)
     ft.hs.at = ""
     evs.items
 end frame_expr_events
@@ -4195,8 +4190,6 @@ end frame_hold
 private call_at(ft: &FrameTrack, evs: &EvBuf, e: TExpr)
     *e.kind match
         TCall(name, args, _, _) ->
-            join_clear(ft.hs, evs, name, args, e.span)
-
             for j in 0..<args.len()
                 val arg = args[j]
 
@@ -4236,21 +4229,20 @@ private call_at(ft: &FrameTrack, evs: &EvBuf, e: TExpr)
 
                     if item.loc == "j" && has_span(ft.hs.chained, e.span) then continue
 
-                    var loc = if item.loc == "j" then joined_loc(ft.hs, false) else translate_loc(ft.org, args, item.loc)
+                    var loc = if item.loc == "j" then task_loc(ft.hs, false) else translate_loc(ft.org, args, item.loc)
 
                     if loc.starts_with("l:") then continue
 
-                    // **A thread whose handle no place names is held for good -- but only once the
+                    // **A task whose handle no place names is held for good -- but only once the
                     // function returns**: one that never does (`-> never`, a kernel's loop) leaves its
-                    // frame to every thread it started. So it is held along the ways as a location no
+                    // frame to every task it started. So it is held along the ways as a location no
                     // clear can name (`?`), one per argument, and refused at a way out.
                     if item.loc == "j" && loc == "" then loc = s"j?${node_id(arg)}"
 
-                    // A thread holds it until it is joined, so the cure is a join on every way out; a
-                    // task, until it is awaited.
-                    val ending = if task_result(texpr_type(e)).is_some() then "await that task" else "join that thread"
-                    val cure = if item.loc == "j" then s" — $ending on every way out of '${ft.owner}', " +
-                        s"or hand it storage that lasts${ft.hs.why}" else ""
+                    // A task holds it until it is awaited, so the cure is an await on every way out; a
+                    // thread that crosses holds it for good, and borrowing the frame needs a scope.
+                    val cure = if item.loc == "j" then s" — await that task on every way out of '${ft.owner}', " +
+                        "or hand it storage that lasts" else crossing_cure(item.how, ft.owner)
                     var said = if read
                         read_said(ft, name, param_name(ft.cx, name, j), item.how, arg, h.2, false) + cure
                     else
@@ -4300,7 +4292,7 @@ private call_at(ft: &FrameTrack, evs: &EvBuf, e: TExpr)
 
                     if item.1.loc == "j" && has_span(ft.hs.chained, e.span) then continue
 
-                    val loc = if item.1.loc == "j" then joined_loc(ft.hs, false) else translate_loc(ft.org, all, item.1.loc)
+                    val loc = if item.1.loc == "j" then task_loc(ft.hs, false) else translate_loc(ft.org, all, item.1.loc)
 
                     if loc.starts_with("l:") then continue
                     if loc.starts_with("j:") && said_already(evs, loc, arg) then continue
@@ -4408,7 +4400,6 @@ private probe_held_apart(ft: &FrameTrack, call: TExpr, name: string, j: usize) -
             val how =
                 if scoped_at(f, j) then "'@scoped', so another domain may run it before the scope ends"
                 else if holds_string(f.marks.copies, p) then "'@crossing', so another domain may run it"
-                else if holds_string(f.marks.joined, p) then "'@joined', so a thread of its own runs it"
                 else ""
 
             if how != "" then return Some(s"whose parameter '$p' is $how")

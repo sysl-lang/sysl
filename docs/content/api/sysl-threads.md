@@ -136,11 +136,10 @@ the far end -- and the object at the far end is what the new thread gets. The an
 asks the compiler to look through it, so a state holding a plain `&T` is refused here rather than
 racing later.
 
-**`@joined(arg)` says how long the new thread holds `arg`: until the handle answered here is
-joined.** So the address of a caller's local may be handed over only where the caller joins that
-handle on every way out before it returns -- a way that skips the join would leave the thread
-reading storage that is gone, and is refused (`reference/memory.md § A thread holds what it is
-handed until it is joined`).
+**So `spawn` keeps `arg`**: the new thread may go on reading it after the call returns, and
+nothing the caller writes later takes it back. The address of a caller's local is refused here; a
+thread that borrows the caller's frame is started on `scope`, which joins it before the scope
+returns (`reference/memory.md § A thread borrows a frame only inside a scope`).
 
 ### `spawn_on`
 

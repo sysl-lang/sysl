@@ -11,6 +11,7 @@ import sysl.raw.str_cast
 import sysl.slices.{as_mut_ptr, as_ptr, sort}
 import sysl.sync.Atomic
 import sysl.text.{cstring, from_cstring, str_builder, Search}
+import sysl.threads.scope
 
 // **`sysl run` keeps what it built, and what a cache has to be right about is the MISS, not the hit**
 // (the reference's `RunCacheTests`). A hit that should have been a miss is a stale binary, a program
@@ -685,15 +686,21 @@ rcp_a_reader_sees_one_whole_version()
     write_text_atomic(target, short).unwrap()
 
     var race = RcpRace(as_ptr(target.bytes), target.bytes.len, Atomic(1))
-    var writer = spawn(&rcp_writer, &race).unwrap()
-    var seen: Buf[string] = buf()
+    val p = &race
 
-    while race.writing.load() == 1
-        read_text(target) match
-            Ok(text) -> if text != short && text != long then seen.push(s"${text.bytes.len} bytes")
-            Err(_) -> seen.push("no file")
+    // The writer borrows `race` from this frame, so it is started on a scope, which joins it.
+    val seen = scope((s) ->
+        s.spawn(() -> rcp_writer(p))
 
-    assert(writer.join(), "the writer did not join")
+        var found: Buf[string] = buf()
+
+        while p.writing.load() == 1
+            read_text(target) match
+                Ok(text) -> if text != short && text != long then found.push(s"${text.bytes.len} bytes")
+                Err(_) -> found.push("no file")
+
+        found)
+
     remove_dir_all(dir).unwrap_or(())
     assert_eq(seen.len(), 0, if seen.len() > 0 then seen[0] else "")
 end rcp_a_reader_sees_one_whole_version

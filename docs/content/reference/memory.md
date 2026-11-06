@@ -4753,8 +4753,9 @@ each pointer it is handed, so it works that out, and nothing is written for it.
 - it passes it to another function's parameter that keeps it;
 - it is `async`: the task its call answers holds every parameter until that task ends, so a call
   is accepted only where the task is awaited or `block_on`'d before the frame that lent the address
-  ends ([a task holds its arguments](/reference/async/#a-task-holds-its-arguments-until-it-ends)) —
-  the rule a [thread's handle](#a-thread-holds-what-it-is-handed-until-it-is-joined) is held to.
+  ends ([a task holds its arguments](/reference/async/#a-task-holds-its-arguments-until-it-ends)).
+  A thread is held to a stricter rule: one that borrows the frame is started on a
+  [scope](#a-thread-borrows-a-frame-only-inside-a-scope).
 
 **An address as an integer is a number**: `usize(p)` stored, handed on or handed back keeps nothing,
 and the compiler follows no address through an integer. A pointer `ptr_cast` makes of one again is
@@ -5791,13 +5792,12 @@ on the pointer parameter**, and the compiler trusts it: a call of it keeps nothi
 is the primitive's own — handing `p` on to a callee that keeps it is refused unless that callee says
 `@scoped` too.
 
-### A thread holds what it is handed until it is joined
+### A thread borrows a frame only inside a scope
 
 **A `*T` that crosses into another domain is kept**: the thread may go on reading it after the call
-that started it has returned. `spawn(&work, &local)` therefore holds `&local` — but only until the
-handle `spawn` answers is joined, and `spawn` says so once, with `@joined(arg)`. So a function may
-hand a thread the address of its own local **when it joins that thread on every way out**, and nothing
-at the call is written:
+that started it has returned, and nothing the caller writes later takes that back. So
+`spawn(&work, &local)` is refused, whether or not the handle is joined afterwards — `spawn`'s `arg` is
+`@crossing`, and the refusal names the way that does work:
 
 ```sysl
 import sysl.threads.*
@@ -5811,53 +5811,50 @@ add(t: *Tally)
 count() -> int
     var t = Tally(0)
 
-    spawn(&add, &t) match
-        Some(h) -> h.join()
-        None -> return 0
-
+    spawn(&add, &t).unwrap().join()
     t.n
 
 print(count())
 ```
 
-```output
-1
+```error
+'spawn' keeps its parameter 'arg' (it reaches another concurrency domain), and '&t' is the address of a local of 'count' — a thread that borrows the frame of 'count' is started on 'sysl.threads.scope', which joins it before the scope returns; anything else is handed storage that lasts
 ```
 
-The join may be written on the call (`spawn(&add, &t).unwrap().join()`), on a local bound to the
-handle, in a `defer`, or in the `Some` arm of a `match` or an `is` test — the `None` way holds no
-thread. A function that hands its own parameter to `spawn` and answers the handle passes the join on
-to its caller, and one that joins inside keeps nothing at all. **A way out that skips the join is
-refused**: an early `return`, a `?`, a `break`, a `panic`, a `match` arm, or a handle thrown away:
+**[`scope`](/library/threads/#scoped-threads) joins every thread started on it before it returns**,
+whichever way its body leaves — by running off its end or by an early `return` — and its `spawn` is
+[`@scoped(f)`](/reference/attributes/#scoped-f-a-member-that-finishes-what-it-starts-before-its-scope-closes),
+so a closure started there may hold a view of the caller's array or the address of its local. As in
+Rust's `std::thread::scope`, the borrow is safe because no thread outlives the call:
 
 ```sysl
-import sysl.threads.*
+import sysl.threads.scope
 
-struct Tally
-    n: int
+halves() -> int
+    var v = [0; 8]
+    val all = v[..]
+    val half = all.len / 2
 
-add(t: *Tally)
-    t.n = t.n + 1
+    scope((s) ->
+        s.spawn(() -> for i in 0..<half do all[i] = 1)
+        s.spawn(() -> for i in half..<all.len do all[i] = 2))
 
-count(stop: bool) -> int
-    var t = Tally(0)
-    val h = spawn(&add, &t).unwrap()
+    var sum = 0
 
-    if stop then return 0
+    for x in v do sum += x
 
-    h.join()
-    t.n
+    sum
 
-print(count(false))
+print(halves())
 ```
 
-```error
-'spawn' keeps its parameter 'arg' (the thread it starts holds it until that thread is joined), and '&t' is the address of a local of 'count' — join that thread on every way out of 'count', or hand it storage that lasts
+```output
+12
 ```
 
-**A fan-out is joined by a loop that joins every element.** Handles kept in a local array, a slice
-local, a `Buf`, or a field of a local — one at the counter of each turn of a counting loop, or pushed
-— are let go of together by a loop over the same collection that joins each element:
+**A fan-out needs no joining loop.** Handles may be kept in an array or a `Buf`, joined in any order,
+joined only in part or not at all: whatever the body leaves unjoined, the scope joins. A handle's
+`join` answers what its closure answered, and `scope` answers what its body answered:
 
 ```sysl
 import sysl.threads.*
@@ -5866,73 +5863,44 @@ import sysl.sync.Atomic
 struct Tally
     n: Atomic[int]
 
-add(t: *Tally)
-    t.n.add(1)
-
 count(workers: int) -> int
     var t = Tally(Atomic(0))
-    var pool: []Option[Thread] = [None; workers]
+    val p = &t
 
-    for i in 0..<workers
-        pool[i] = spawn(&add, &t)
+    scope((s) ->
+        for _ in 0..<workers
+            s.spawn(() -> p.n.add(1))
 
-    for h in pool
-        if h is Some(th) then th.join()
+        if workers > 2 then return)
 
     t.n.load()
 
+sum_halves(v: []int) -> int
+    scope((s) ->
+        val a = s.spawn(() -> v[0] + v[1])
+        val b = s.spawn(() -> v[2] + v[3])
+
+        a.join() * 10 + b.join())
+
+val xs = [1, 2, 3, 4]
+
 print(count(4))
+print(sum_halves(xs[..]))
 ```
 
 ```output
 4
+37
 ```
 
-The joining loop walks the whole collection (`for h in pool`, `for i in 0..<pool.len`) or the same
-range as the loop that stored the handles, and joins the element — or the same field of it — on
-every turn: directly, or through a `match` or an `is` test whose `None` way holds no thread. A
-function that answers the collection passes the joins on to its caller, as it does for one handle.
-**A loop that may skip an element is not a release**, and the refusal says why: a `break`, a
-`continue`, a `return`, a `?` or a `panic` inside it, a join under a condition, a narrower range, no
-such loop at all, a handle stored at an index other than the counter of the loop it is in, or the
-collection stored into again before its handles are joined. **A store into an element loses the
-handle it held**, and so does one through another name for the same storage — a slice of the
-collection, a slice of that, `&pool`, a reference copied, or a second slice parameter that may be the
-first — so a join is matched only to the collection the handles were stored through:
+A function handed the `*Scope` may start threads on it with its own caller's storage, and those are
+joined by the same `scope` call; one that opens a scope of its own keeps nothing it is handed. A scope
+may be opened inside a scoped thread, and its threads may borrow that thread's locals.
 
-```sysl
-import sysl.threads.*
-
-struct Tally
-    n: int
-
-add(t: *Tally)
-    t.n = t.n + 1
-
-count() -> int
-    var t = Tally(0)
-    var pool: [4]Option[Thread] = [None; 4]
-
-    for i in 0..<4
-        pool[i] = spawn(&add, &t)
-
-    for i in 0..<3
-        pool[i].unwrap().join()
-
-    t.n
-
-print(count())
-```
-
-```error
-join that thread on every way out of 'count', or hand it storage that lasts; the loop over 'pool' that joins its elements does not reach every element they were stored in
-```
-
-A handle the body cannot name again — one built into a struct literal, one stored through a pointer
-or into a heap object — is never matched to its join, so the address of a local handed to it is
-refused however the handles are joined later; hand those threads storage that lasts, such as a box
-(`&*b`) or module storage. The program's own statements are exempt, as they are from every rule
-here: their frame outlives every thread.
+**A plain `spawn` is for storage that lasts**: a box shared as `&sync` (`&*b`) or module storage,
+which no frame owns, so the thread may outlive the call that started it and never be joined at all.
+The program's own statements are exempt, as they are from every rule here: their frame outlives every
+thread.
 
 ## Hazard summary
 

@@ -214,11 +214,50 @@ another concurrency domain ([memory](/reference/memory/)). It is why the state a
 **checked** rather than taken on trust: a raw pointer carries no refcount of its own, and the
 annotation is what asks the compiler to look through it at the object that actually crossed.
 
-It is declared `@joined(arg)` as well: the thread holds `arg` until the handle `spawn` answers is
-joined. So a function may hand a thread the address of one of its own locals only where it joins that
-thread on every way out — an early `return` that skips the join is refused at the argument
-([memory § A thread holds what it is handed until it is joined](/reference/memory/#a-thread-holds-what-it-is-handed-until-it-is-joined)).
-The examples on this page are a program's own statements, whose frame outlives every thread.
+A crossing `*T` is also **kept**: the thread may read it after `spawn` has returned, and joining the
+handle later does not take that back. So a function may not hand a plain `spawn` the address of one
+of its own locals, joined or not; a thread that borrows the caller's frame is started on a
+[scope](#scoped-threads), which joins it before the scope returns
+([memory § A thread borrows a frame only inside a scope](/reference/memory/#a-thread-borrows-a-frame-only-inside-a-scope)).
+The examples here are a program's own statements, whose frame outlives every thread.
+
+```sysl
+import sysl.threads.*
+
+double(n: *int)
+    *n *= 2
+
+twice() -> int
+    var n = 21
+
+    spawn(&double, &n).unwrap().join()
+    n
+
+print(twice())
+```
+
+```error
+'spawn' keeps its parameter 'arg' (it reaches another concurrency domain), and '&n' is the address of a local of 'twice' — a thread that borrows the frame of 'twice' is started on 'sysl.threads.scope'
+```
+
+The same function on a scope is accepted, and needs no `*extern` body:
+
+```sysl
+import sysl.threads.scope
+
+twice() -> int
+    var n = 21
+    val p = &n
+
+    scope((s) -> s.spawn(() -> *p *= 2))
+    n
+
+print(twice())
+```
+
+```output
+42
+```
 
 ```sysl
 import sysl.threads.*
@@ -775,8 +814,8 @@ and sends values that hold no view.
 
 **`scope(body)` lends `body` a `Scope`, and every thread started on it with `s.spawn(f)` is joined
 before `scope` returns.** Because none of them outlives the call, a closure written at `spawn` may
-borrow the caller's frame — a view of its array, a struct of views and the scalars that read them —
-where `spawn(body, arg)` would need an address and a join on every way out. It is the shape of a
+borrow the caller's frame — a view of its array, a struct of views and the scalars that read them,
+the address of a local — which a plain `spawn(body, arg)` keeps and so is refused. It is the shape of a
 threaded loop over one array: split the work, let each thread write its own part, and read the whole
 once `scope` has answered.
 

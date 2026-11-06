@@ -5,11 +5,10 @@ import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
 import sysl.process.capture
 import sysl.text.Search
 
-// 0.6.0's spellings of `@scoped` and `@joined`, accepted on the 0.5 line so a program written for
-// 0.6.0 builds here too: `@scoped(p)` naming a `*T` parameter, above any function, and `@joined(arg)`
-// naming a `*T` parameter the function also says is `@crossing`. Here only their names are checked
-// (`lends.sysl`'s `check_scoped_names` and `check_joined_names`, `parse_attr.sysl`'s
-// `pointer_names`); what they promise is checked from 0.6.0.
+// `@scoped(p)` naming a `*T` parameter, above any function, has its names checked here
+// (`lends.sysl`'s `check_scoped_names`, `parse_attr.sysl`'s `pointer_names`). `@joined` is gone: a
+// thread that borrows its caller's frame is started on `sysl.threads.scope`, and the annotation is
+// refused wherever it is written, with a message naming the scope.
 
 private sjn_outcome(text: string) -> (string, int)
     val root = make_temp_dir("sysl-sjn").unwrap()
@@ -115,39 +114,44 @@ sjn_scoped_call_free_function()
                 "Above a free function '@scoped' names '*T' parameters only, the pointers it lets go " +
                 "of before its caller's scope ends")
 
-@test("@scoped and @joined above an extern are refused")
+@test("@scoped above an extern is refused, and @joined is refused there as everywhere")
 sjn_on_an_extern()
     sjn_refused("@scoped(p)\nextern \"free\" c_free(p: *u8)\n\nprint(1)\n",
                 "'@scoped' promises that a body lets go of a parameter before its caller's scope ends, so " +
                 "it marks a function or a method, whose body is sysl")
-    sjn_refused("@crossing(p)\n@joined(p)\nextern \"free\" c_free(p: *u8)\n\nprint(1)\n",
-                "'@joined' says how long the thread a sysl function starts holds a pointer")
+    sjn_refused("@crossing(p)\n@joined(p)\nextern \"free\" c_free(p: *u8)\n\nprint(1)\n", SjnGone)
 
-// -- @joined --------------------------------------------------------------------------------------
+// -- @joined is gone --------------------------------------------------------------------------------
+
+private val SjnGone = "'@joined' is not an annotation — a thread that borrows its caller's frame is started on " +
+    "'sysl.threads.scope', whose 'spawn' is '@scoped' and is joined before the scope returns"
 
 private val sjn_handle: string = "struct Handle\n    k: int\n\n    join(self) -> bool = true\n\n"
 
-@test("@joined naming a @crossing *T parameter is accepted, above a function and a method")
+@test("a @crossing *T handed a local is kept for good, above a function and a method; the scope form runs")
 sjn_joined_accepted()
-    sjn_prints(sjn_handle + "@crossing(p)\n@joined(p)\nbegin(p: *int) -> Handle = Handle(*p)\n\n" +
-               "struct Pool\n    n: int\n\n    @crossing(p)\n    @joined(p)\n    start(*self, p: *int) -> Handle = Handle(*p + self.n)\n\n" +
-               "run() -> int\n    var n = 5\n    var pool = Pool(1)\n    val h = begin(&n)\n    val g = pool.start(&n)\n\n" +
-               "    h.join()\n    g.join()\n    n + g.k\nend run\n\nprint(run())\n", "11\n")
+    sjn_refused(sjn_handle + "@crossing(p)\nbegin(p: *int) -> Handle = Handle(*p)\n\n" +
+                "run() -> int\n    var n = 5\n    val h = begin(&n)\n\n    h.join()\n    n\n\nprint(run())\n",
+                "'begin' keeps its parameter 'p' (it reaches another concurrency domain), and '&n' is the " +
+                "address of a local of 'run' — a thread that borrows the frame of 'run' is started on " +
+                "'sysl.threads.scope'")
+    sjn_refused(sjn_handle + "struct Pool\n    n: int\n\n    @crossing(p)\n    start(*self, p: *int) -> Handle = Handle(*p + self.n)\n\n" +
+                "run() -> int\n    var n = 5\n    var pool = Pool(1)\n    val g = pool.start(&n)\n\n    g.join()\n    g.k\n" +
+                "\nprint(run())\n", "keeps its parameter 'p' (it reaches another concurrency domain)")
+    sjn_prints("import sysl.threads.scope\n\nrun() -> int\n    var n = 5\n    val p = &n\n\n" +
+               "    scope((s) -> s.spawn(() -> *p + 6).join())\n\nprint(run())\n", "11\n")
 
-@test("@joined naming something that is not a parameter is refused")
+@test("@joined naming something that is not a parameter is refused as the annotation it no longer is")
 sjn_joined_bad_name()
-    sjn_refused(sjn_handle + "@crossing(p)\n@joined(q)\nbegin(p: *int) -> Handle = Handle(*p)\n\nprint(1)\n",
-                "'@joined' names 'q', which is not a parameter of 'begin'")
+    sjn_refused(sjn_handle + "@crossing(p)\n@joined(q)\nbegin(p: *int) -> Handle = Handle(*p)\n\nprint(1)\n", SjnGone)
 
-@test("@joined naming a parameter @crossing does not name is refused")
+@test("@joined without @crossing, and above a method, is refused the same way")
 sjn_joined_not_crossing()
-    sjn_refused("@joined(p)\nf(p: *int) = ()\n\nprint(1)\n",
-                "'@joined' names 'p', which '@crossing' does not — a parameter is held until a join only " +
-                "by the thread it reaches, so one that is joined also crosses: '@crossing(p)'")
+    sjn_refused("@joined(p)\nf(p: *int) = ()\n\nprint(1)\n", SjnGone)
+    sjn_refused("struct Pool\n    n: int\n\n    @crossing(p)\n    @joined(p)\n    start(*self, p: *int) = ()\n\nprint(1)\n",
+                SjnGone)
 
-@test("@joined naming a parameter twice is refused, and it takes at least one name")
+@test("@joined with a name twice, or with none, is refused the same way")
 sjn_joined_twice_and_empty()
-    sjn_refused("@crossing(p)\n@joined(p, p)\nf(p: *int) = ()\n\nprint(1)\n",
-                "'@joined' names 'p' twice — the second says nothing the first does not")
-    sjn_refused("@joined()\nf(p: *int) = ()\n\nprint(1)\n",
-                "'@joined' names the '*T' parameters a call hands to the thread it starts")
+    sjn_refused("@crossing(p)\n@joined(p, p)\nf(p: *int) = ()\n\nprint(1)\n", SjnGone)
+    sjn_refused("@joined()\nf(p: *int) = ()\n\nprint(1)\n", SjnGone)
