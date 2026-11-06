@@ -1,0 +1,84 @@
+module sysl.process
+@requires(posix)
+@tests
+
+import sysl.fs.{create, make_temp_dir, open, read_text, remove_dir_all, write_text}
+import sysl.path.join
+
+// A child is started with every descriptor of its parent that is not marked close-on-exec, so a
+// descriptor sysl opens must be marked, or every program started while it is open holds it too: a
+// job holds the server's listening socket after the server has died. The probe is a shell that
+// reports each descriptor from 3 to 63 it can duplicate, and each test compares what a child sees
+// with what it saw before the descriptor was opened, so a descriptor the test runner itself leaves
+// open does not count.
+
+private ih_open_in_child() -> string
+    val probe = "i=3; while [ $i -lt 64 ]; do if (exec 9<&$i) 2>/dev/null; then echo $i; fi; i=$((i+1)); done"
+
+    capture("sh", ["-c", probe]).unwrap().text
+end ih_open_in_child
+
+private ih_scratch(name: string) -> string = make_temp_dir(f"sysl-inherit-${name}").unwrap()
+
+@test("a file opened with open is not inherited by a child")
+ih_open_file()
+    val before = ih_open_in_child()
+    val dir = ih_scratch("open")
+    val f = create(join(dir, "a")).unwrap()
+
+    assert_eq(ih_open_in_child(), before)
+    assert(f.fd().unwrap() >= 0)
+    remove_dir_all(dir).unwrap()
+
+@test("a file opened for reading is not inherited by a child")
+ih_open_file_for_reading()
+    val before = ih_open_in_child()
+    val dir = ih_scratch("read")
+
+    write_text(join(dir, "a"), "x").unwrap()
+
+    val f = open(join(dir, "a")).unwrap()
+
+    assert_eq(ih_open_in_child(), before)
+    assert(f.fd().unwrap() >= 0)
+    remove_dir_all(dir).unwrap()
+
+@test("the whole-file calls leave nothing open for a child")
+ih_whole_file_calls()
+    val before = ih_open_in_child()
+    val dir = ih_scratch("whole")
+
+    write_text(join(dir, "a"), "text").unwrap()
+    assert_eq(read_text(join(dir, "a")).unwrap(), "text")
+    assert_eq(ih_open_in_child(), before)
+    remove_dir_all(dir).unwrap()
+
+@test("a child started while another runs with a captured output holds nothing of the first")
+ih_concurrent_capture()
+    val before = ih_open_in_child()
+    val first = start("sleep", ["1"], timeout = 10000).unwrap()
+
+    assert_eq(ih_open_in_child(), before)
+    assert_eq(first.wait().unwrap().status, Status.Exited(0))
+
+@test("a pipe handed over as the child's input is still its input, and a file as its output")
+ih_placed_streams_still_arrive()
+    val dir = ih_scratch("placed")
+    val (r, w) = pipe().unwrap()
+    val out = create(join(dir, "out")).unwrap()
+    val cat = spawn("cat", timeout = 5000, stdin = Stdio.FromFile(r),
+                    stdout = Stdio.ToFile(out)).unwrap()
+    var g = w
+
+    g.write("fed\n".bytes)
+    g.close().unwrap()
+    assert_eq(cat.wait().unwrap(), Status.Exited(0))
+    assert_eq(read_text(join(dir, "out")).unwrap(), "fed\n")
+    remove_dir_all(dir).unwrap()
+
+@test("a child with its three streams left alone still has them")
+ih_inherited_streams_still_work()
+    val out = capture("sh", ["-c", "echo out; echo err >&2"], stderr = true).unwrap()
+
+    assert_eq(out.text, "out\n")
+    assert_eq(out.err, Some("err\n"))

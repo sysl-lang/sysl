@@ -19,6 +19,11 @@
  * `errno`, and `sysl.net.hosted` negates it into the hook's answer.
  */
 
+/* `accept4` is declared by glibc only under this. */
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+
 #include <errno.h>
 #include <fcntl.h>
 #include <netdb.h>
@@ -178,18 +183,37 @@ static void quiet_pipe(int s) {
 #endif
 }
 
+/* Close-on-exec, so a child started by `sysl.process` does not inherit the descriptor. A platform
+ * with `SOCK_CLOEXEC` sets it atomically; one without (Darwin) sets it right after. */
+#ifdef SOCK_CLOEXEC
+#define SYSL_SOCK_CLOEXEC SOCK_CLOEXEC
+#else
+#define SYSL_SOCK_CLOEXEC 0
+#endif
+
+static void close_on_exec(int s) {
+#ifndef SOCK_CLOEXEC
+    fcntl(s, F_SETFD, FD_CLOEXEC);
+#else
+    (void) s;
+#endif
+}
+
 int sysl_net_posix_socket(int family, int kind, int *fd) {
     int s;
 
     if (family == 1)
-        s = socket(AF_UNIX, kind == 1 ? SOCK_DGRAM : SOCK_STREAM, 0);
+        s = socket(AF_UNIX, (kind == 1 ? SOCK_DGRAM : SOCK_STREAM) | SYSL_SOCK_CLOEXEC, 0);
     else {
         int f = family == 6 ? AF_INET6 : AF_INET;
 
-        s = kind == 1 ? socket(f, SOCK_DGRAM, IPPROTO_UDP) : socket(f, SOCK_STREAM, IPPROTO_TCP);
+        s = kind == 1 ? socket(f, SOCK_DGRAM | SYSL_SOCK_CLOEXEC, IPPROTO_UDP)
+                      : socket(f, SOCK_STREAM | SYSL_SOCK_CLOEXEC, IPPROTO_TCP);
     }
 
     if (s < 0) return failed(-1);
+
+    close_on_exec(s);
 
     quiet_pipe(s);
     *fd = s;
@@ -251,9 +275,15 @@ int sysl_net_posix_accept(int fd, struct sysl_endpoint *peer, int *out_fd) {
     struct sockaddr_storage from;
     socklen_t n = sizeof from;
 
+#ifdef SOCK_CLOEXEC
+    int s = accept4(fd, (struct sockaddr *) &from, &n, SOCK_CLOEXEC);
+#else
     int s = accept(fd, (struct sockaddr *) &from, &n);
+#endif
 
     if (s < 0) return failed(fd);
+
+    close_on_exec(s);
 
     int flags = fcntl(s, F_GETFL);
 
