@@ -116,9 +116,57 @@ require_place(cx: &Analyzer, t: TExpr, target: Expr, what: string, writes: bool,
     // `ref` found is exactly where it was.
     if writes && !check_view_guards(cx, at, t) then check_ref_guards(cx, at, t)
     if writes then note_pointer_move(cx, t.span, t, 2, "")
+    if writes then measure_sync_write(cx, t)
 
     t
 end require_place
+
+// Measurement: a write to a field reached through a `&sync` reference, other than an atomic field
+// or one a `@guards` names.
+private measure_sync_write(cx: &Analyzer, t: TExpr)
+    var through = false
+    var exempt = false
+    var cur = t
+
+    loop
+        *cur.kind match
+            TField(recv, idx, fty) ->
+                val rt = texpr_type(recv)
+                val own = underlying(pointee(rt).unwrap_or(rt))
+
+                underlying(fty) match
+                    Struct(d) -> if d.base == "Atomic" then exempt = true
+                    _ -> ()
+
+                own match
+                    Struct(d) -> if idx >= 0 && usize(idx) < d.fields.len()
+                        for g in d.guarded
+                            if g == d.fields[usize(idx)].0 then exempt = true
+                    _ -> ()
+
+                repr(rt) match
+                    Ref(_, sync) -> if sync then through = true
+                    _ -> ()
+
+                *recv.kind match
+                    TDeref(op, _) ->
+                        repr(texpr_type(op)) match
+                            Ref(_, sync) -> if sync then through = true
+                            _ -> ()
+                    _ -> ()
+
+                cur = recv
+            TIndex(recv, _, _) -> cur = recv
+            TDeref(op, _) ->
+                repr(texpr_type(op)) match
+                    Ref(_, sync) -> if sync then through = true
+                    _ -> ()
+                cur = op
+            _ -> break
+
+    if through && !exempt
+        cx.an.caution(cx.scope, t.span, "sync-field-write: a field is written through a '&sync' reference")
+end measure_sync_write
 
 private is_bytes(t: TExpr) -> bool = *t.kind match
     TBytes(_) -> true
