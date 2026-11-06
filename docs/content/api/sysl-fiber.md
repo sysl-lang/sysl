@@ -21,9 +21,11 @@ Nothing here schedules: which context runs next, and on which thread, is the run
 Everything the platform's calling convention promises a callee keeps: on aarch64 x19--x30, the
 stack pointer, d8--d15 and the floating-point control register (FPCR, so the rounding mode is the
 fiber's own); on x86_64 rbx, rbp, r12--r15, the stack pointer, MXCSR's control bits and the x87
-control word. There is no system call and no signal mask in a switch: a fiber runs with whatever
-mask its carrier thread has. The supported machines are aarch64 (macOS and Linux) and x86_64 (Linux
-and macOS).
+control word. The switch itself stores only the stack, frame and base pointers, where to resume
+and the control word; the other registers are declared clobbered, so the code around the switch
+saves the ones it has live and no more. There is no system call and no signal mask in a switch: a
+fiber runs with whatever mask its carrier thread has. The supported machines are aarch64 (macOS
+and Linux) and x86_64 (Linux and macOS).
 
 ## A fiber may move between threads, and what is the carrier's
 
@@ -31,11 +33,11 @@ A context saved on one thread may be resumed on another. The stack and every reg
 what does not is anything kept **per thread**, which is the carrier's, not the fiber's:
 
 - **`@thread_local` storage is the carrier's.** A fiber reading one after it was resumed elsewhere
-  reads the new carrier's copy. And **a function that calls `switch` must not hold a thread-local's
-  address across the call**: the optimizer takes a thread-local's address to be fixed for the length
-  of a function, so it may reuse the one it computed before the switch after it, on the old
-  carrier's copy. Keep thread-local reads and writes out of the function that switches (and out of
-  anything inlined into it), or keep fibers on the thread they started on.
+  reads the new carrier's copy -- in the very function that switched, in anything inlined into it,
+  and in a loop around the switch: the compiler computes a thread-local's address again after
+  every `switch`, rather than letting the optimizer keep the one from before it. An address taken
+  with `&` and held in a variable across a switch is a pointer like any other, and still names the
+  copy it was taken from.
 - **The error return trace is the carrier's** (`sysl.debug`). The sites it records are constants,
   never addresses in a frame, so a fiber that moves leaves nothing dangling -- but a failure a fiber
   records lands in whichever carrier's trace is current, interleaved with whatever else ran there. A
@@ -71,8 +73,12 @@ switch(from: *Context, to: *Context)
 Saves the running stack in `from` and resumes `to`, which must hold a stack that is not running:
 one `start` prepared, or one a `switch` saved. Comes back when something switches to `from`.
 
-It is a few nanoseconds: callee-saved registers, the stack pointer and the floating-point control
-word, with no system call and no signal mask.
+It is a few nanoseconds, with no system call and no signal mask. **A call of it is the compiler's
+own**: it is emitted in place, as assembly that saves the stack, frame and base pointers and the
+floating-point control, and declares every other register clobbered -- so the function calling it
+keeps only the values live across the switch, wherever it chose to -- and every thread-local
+address the function uses afterwards is computed again, on whichever thread it came back on. A
+call through a function pointer reaches this definition, which does the same out of line.
 
 ## Types
 
@@ -81,13 +87,18 @@ word, with no system call and no signal mask.
 ```sysl
 struct Context
     private sp: *u8
+    private pc: *u8
+    private fp: *u8
+    private bp: *u8
+    private ctl: u64
     private lo: *u8
     private len: usize
+    private fake: *u8
 ```
 
-Where `switch` goes, or comes back to: a stack pointer with everything callee-saved stored below
-it. Make one with `new()` for the stack running now -- `switch` fills it in when it leaves -- or with
-`start` for a new fiber.
+Where `switch` goes, or comes back to: the stack, instruction, frame and base pointers to resume
+at, and the floating-point control. Make one with `new()` for the stack running now -- `switch`
+fills it in when it leaves -- or with `start` for a new fiber.
 
 A context is a value, and the one `switch` saved into is the one to resume: hand its address
 around, not a copy taken before the switch.

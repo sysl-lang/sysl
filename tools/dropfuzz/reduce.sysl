@@ -1,0 +1,145 @@
+// The reducer: a failing program made as small as it will go while it still fails the same way.
+//
+// It cuts the tree, never the text. Each candidate removes one helper, one statement (with what it
+// nests), or replaces an `if` or a loop by one of its bodies, or runs a loop once; `repair` then takes
+// out whatever the cut left dangling, so every candidate is a program the generator could have written.
+// A candidate is kept when it is smaller and still fails in the same class; the passes repeat until a
+// whole pass keeps nothing.
+
+import sysl.buf.{Buf, buf}
+
+/** The preorder number the next statement gets. */
+struct Counter
+    n: int
+
+/** How a candidate changes the statement it is aimed at. */
+enum Cut
+    Delete
+    SpliceYes
+    SpliceNo
+    Once
+
+/** A body's statements, the last `Mark` left out: what a splice puts in its parent's place. */
+without_mark(body: Buf[Stmt]) -> Buf[Stmt]
+    var out: Buf[Stmt] = buf()
+
+    for s in body
+        if s.op != Mark then out.push(s)
+
+    out
+
+/** The body with its statement numbered `target` (in preorder from `c`) changed by `how`. */
+cut_body(body: Buf[Stmt], target: int, how: Cut, c: *Counter) -> Buf[Stmt]
+    var out: Buf[Stmt] = buf()
+
+    for s in body
+        val me = c.n
+
+        c.n += 1
+
+        if me == target
+            how match
+                Delete -> ()
+                SpliceYes -> for x in without_mark(s.yes) do out.push(x)
+                SpliceNo -> for x in without_mark(s.no) do out.push(x)
+                Once -> out.push(Stmt(s.op, s.n, 1, s.b, s.args, s.yes, s.no))
+            continue
+
+        val yes = cut_body(s.yes, target, how, c)
+        val no = cut_body(s.no, target, how, c)
+
+        out.push(Stmt(s.op, s.n, s.a, s.b, s.args, yes, no))
+
+    out
+
+/** The statement numbered `target` in preorder, for asking what it is. */
+op_at(body: Buf[Stmt], target: int, c: *Counter) -> Option[Stmt]
+    for s in body
+        if c.n == target then return Some(s)
+
+        c.n += 1
+
+        op_at(s.yes, target, c) match
+            Some(x) -> return Some(x)
+            None -> ()
+
+        op_at(s.no, target, c) match
+            Some(x) -> return Some(x)
+            None -> ()
+
+    None
+
+/** Every candidate one cut away from `p`, the cuts most likely to remove the most first. */
+candidates(p: Prog) -> Buf[Prog]
+    var out: Buf[Prog] = buf()
+
+    for k in 1..<p.funcs.len()
+        if p.funcs[k].dead then continue
+
+        var q = clone_prog(p)
+        val f = q.funcs[k]
+
+        q.funcs[k] = Func(f.params, f.fallible, true, f.body)
+        out.push(q)
+
+    for k in 0..<p.funcs.len()
+        val f = p.funcs[k]
+
+        if f.dead then continue
+
+        var i = size_of(f.body) - 1
+
+        while i >= 0
+            var c = Counter(0)
+            val s = op_at(f.body, i, &c)
+            var cuts: Buf[Cut] = buf()
+
+            s match
+                Some(x) ->
+                    if x.op == If
+                        cuts.push(SpliceYes)
+                        cuts.push(SpliceNo)
+                    if x.op == Loop
+                        cuts.push(SpliceYes)
+                        if x.a > 1 then cuts.push(Once)
+                    if x.op != Mark then cuts.push(Delete)
+                None -> ()
+
+            for how in cuts
+                var q = clone_prog(p)
+                var c2 = Counter(0)
+                val body = cut_body(q.funcs[k].body, i, how, &c2)
+
+                q.funcs[k] = Func(f.params, f.fallible, false, body)
+                out.push(q)
+
+            i -= 1
+
+    out
+
+/** Whether any of the failures is of the class being reduced. */
+has_class(fails: Buf[string], class: string) -> bool
+    for f in fails
+        if class_of(f) == class then return true
+
+    false
+
+/** `p` reduced while it keeps failing in `class`. `say` is told each step. */
+reduce(cfg: Config, p: Prog, class: string, say: string -> unit) -> Prog
+    var cur = repair(p).0
+
+    loop
+        var kept = false
+
+        for q0 in candidates(cur)
+            val q = repair(q0).0
+
+            if prog_size(q) >= prog_size(cur) then continue
+
+            if has_class(check_one(cfg, q), class)
+                cur = q
+                kept = true
+                say(s"reduced to ${prog_size(cur)}")
+                break
+
+        if !kept then return cur

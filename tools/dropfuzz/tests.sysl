@@ -1,0 +1,277 @@
+@tests
+
+// The harness's own checks: a seed names one program, the walk agrees with the generator, every
+// log oracle can fail, and the reducer's cuts leave a program that still stands.
+
+import sysl.buf.{Buf, buf}
+import sysl.env.get
+import sysl.fs.{make_temp_dir, remove_dir_all}
+import sysl.testing.skip
+import sysl.text.{Join, Search}
+
+no_want() -> Want = Want(buf(), buf())
+
+want_mark(mark: int, tokens: []const string) -> Want
+    var w: Buf[string] = buf()
+
+    for t in tokens do w.push(t)
+
+    var marks: Buf[MarkWant] = buf()
+
+    marks.push(MarkWant(mark, w))
+    Want(marks, buf())
+
+classes(fails: Buf[string]) -> string
+    var out = ""
+
+    for f in fails do out = out + class_of(f) + ";"
+    out
+
+@test("a seed names one program: two generations of it print the same text")
+same_seed_same_program()
+    for seed in 1..<40
+        assert_eq(emit(generate(u64(seed))), emit(generate(u64(seed))))
+
+@test("different seeds give different programs")
+different_seeds()
+    assert(emit(generate(1)) != emit(generate(2)))
+
+@test("the walk keeps every statement the generator wrote: repairing a fresh program changes nothing")
+repair_is_identity_on_generated()
+    for seed in 1..<200
+        val p = generate(u64(seed))
+
+        assert_eq(emit(repair(p).0), emit(p))
+
+@test("a clean log passes every log oracle")
+clean_log_passes()
+    val log = "+1 s1\n+2 s2\nu 1 s1\nE1\n-2 s2\n-1 s1\ndone\n"
+
+    assert_eq(check_log(log, want_mark(1, ["-2", "-1"])).len(), 0)
+
+@test("a value never dropped breaks oracle 1")
+missing_drop_fails()
+    assert_eq(classes(check_log("+1 s1\ndone\n", no_want())), "drops;")
+
+@test("a value dropped twice breaks oracle 1")
+double_drop_fails()
+    assert_eq(classes(check_log("+1 s1\n-1 s1\n-1 s1\ndone\n", no_want())), "drops;")
+
+@test("a drop of something never made breaks oracle 1")
+drop_unmade_fails()
+    assert(classes(check_log("-3 s1\ndone\n", no_want())).contains("drops;"))
+
+@test("a read after the drop breaks oracle 2, by the log and by the live flag")
+use_after_drop_fails()
+    assert_eq(classes(check_log("+1 s1\n-1 s1\nu 1 s1\ndone\n", no_want())), "uaf;")
+    assert_eq(classes(check_log("+1 s1\n! uaf 1\n-1 s1\ndone\n", no_want())), "uaf;")
+
+@test("locals released in the order they were written, not reversed, break oracle 6")
+order_inversion_fails()
+    val log = "+1 s1\n+2 s2\nE1\n-1 s1\n-2 s2\ndone\n"
+
+    assert_eq(classes(check_log(log, want_mark(1, ["-2", "-1"]))), "order;")
+
+@test("a defer run on the wrong side of a local breaks oracle 6")
+defer_misplaced_fails()
+    val log = "+1 s1\nE1\nD1\n-1 s1\ndone\n"
+
+    assert_eq(classes(check_log(log, want_mark(1, ["-1", "D1"]))), "order;")
+
+@test("drops the walk says nothing about may interleave with the ones it promised")
+order_ignores_unpromised()
+    val log = "+1 s1\n+2 s2\n+3 s9\nE1\n-2 s2\n-3 s9\n-1 s1\ndone\n"
+
+    assert_eq(check_log(log, want_mark(1, ["-2", "-1"])).len(), 0)
+
+@test("a temporary dropped after the next event breaks the temporary check")
+late_temporary_fails()
+    var temps: Buf[int] = buf()
+
+    temps.push(4)
+
+    val log = "+1 s4\nu 1 s4\nn 3\n-1 s4\ndone\n"
+
+    assert_eq(classes(check_log(log, Want(buf(), temps))), "temp;")
+    assert_eq(check_log("+1 s4\nu 1 s4\n-1 s4\ndone\n", Want(buf(), temps)).len(), 0)
+
+@test("a program that stops before 'done' is reported")
+incomplete_fails()
+    assert_eq(classes(check_log("+1 s1\n-1 s1\n", no_want())), "incomplete;")
+
+@test("the walk promises reverse declaration order, a pair's fields in order, and a defer in its place")
+walk_promises()
+    var body: Buf[Stmt] = buf()
+
+    body.push(st(Make, 1, 10))
+    body.push(st(DeferMark, 0, 7))
+    body.push(st(MakePair, 2, 11, 12))
+    body.push(st(Make, 3, 13))
+    body.push(st(Mark, 0, 1))
+
+    var funcs: Buf[Func] = buf()
+
+    funcs.push(Func(0, false, false, body))
+
+    val want = repair(Prog(1, 0, funcs)).1
+
+    assert_eq(want.marks.len(), 1)
+    assert_eq(want.marks[0].want.join(" "), "-13 -11 -12 D7 -10")
+
+@test("a heap pair promises its fields in order, a buffer of fresh values its elements in index order")
+walk_promises_heap_and_elements()
+    var body: Buf[Stmt] = buf()
+
+    body.push(st(HeapPair, 1, 10, 11))
+    body.push(st(NewBuf, 2))
+    body.push(st(PushNew, 2, 12))
+    body.push(st(PushNew, 2, 13))
+    body.push(st(NewBuf, 3))
+    body.push(st(PushNew, 3, 14))
+    body.push(st(Pop, 3))
+    body.push(st(Mark, 0, 1))
+
+    var funcs: Buf[Func] = buf()
+
+    funcs.push(Func(0, false, false, body))
+
+    val want = repair(Prog(1, 0, funcs)).1
+
+    assert_eq(want.marks[0].want.join(" "), "-12 -13 -10 -11")
+
+@test("a shared local, and one changed from a nested block, are left out of the promise")
+walk_drops_unknowns()
+    var body: Buf[Stmt] = buf()
+    var inner: Buf[Stmt] = buf()
+
+    inner.push(st(Remake, 2, 20))
+    inner.push(st(Mark, 0, 2))
+
+    var branch = st(If, 0, 3)
+
+    branch.yes = inner
+    body.push(st(Make, 1, 10))
+    body.push(st(Make, 2, 11, 1))
+    body.push(st(Alias, 3, 1))
+    body.push(branch)
+    body.push(st(Make, 4, 12))
+    body.push(st(Mark, 0, 1))
+
+    var funcs: Buf[Func] = buf()
+
+    funcs.push(Func(0, false, false, body))
+
+    val want = repair(Prog(1, 0, funcs)).1
+
+    assert_eq(want.marks[1].want.join(" "), "-12")
+
+@test("deleting a local's declaration takes its uses with it, and the rest still stands")
+cut_then_repair()
+    var body: Buf[Stmt] = buf()
+
+    body.push(st(Make, 1, 10))
+    body.push(st(Use, 1))
+    body.push(st(Make, 2, 11))
+    body.push(st(Use, 2))
+    body.push(st(Mark, 0, 1))
+
+    var c = Counter(0)
+    val cut = cut_body(body, 0, Delete, &c)
+    var funcs: Buf[Func] = buf()
+
+    funcs.push(Func(0, false, false, cut))
+
+    val q = repair(Prog(1, 0, funcs)).0
+
+    assert_eq(size_of(q.funcs[0].body), 3)
+    assert(!emit(q).contains("v1"))
+
+@test("splicing a loop's body puts its statements in the loop's place without its end mark")
+splice_loop()
+    var inner: Buf[Stmt] = buf()
+
+    inner.push(st(Make, 1, 10))
+    inner.push(st(Mark, 0, 2))
+
+    var lp = st(Loop, 1, 3)
+
+    lp.yes = inner
+
+    var body: Buf[Stmt] = buf()
+
+    body.push(lp)
+    body.push(st(Mark, 0, 1))
+
+    var c = Counter(0)
+    val cut = cut_body(body, 0, SpliceYes, &c)
+
+    assert_eq(cut.len(), 2)
+    assert(cut[0].op == Make)
+    assert(cut[1].op == Mark)
+
+// -- the build-mode oracles, end to end: they need a compiler, named by DROPFUZZ_COMPILER and
+// DROPFUZZ_LIB, and skip without one -------------------------------------------------------------
+
+e2e_config() -> Option[Config]
+    val compiler = get("DROPFUZZ_COMPILER").unwrap_or("")
+    val lib = get("DROPFUZZ_LIB").unwrap_or("")
+
+    if compiler == "" || lib == "" then return None
+
+    Some(Config(compiler, lib, make_temp_dir("dropfuzz-test").unwrap()))
+
+@test("a generated program passes every oracle in every mode")
+e2e_clean()
+    val cfg = e2e_config() match
+        Some(c) -> c
+        None -> skip("DROPFUZZ_COMPILER is not set")
+
+    assert_eq(check_one(cfg, generate(3)).len(), 0)
+    assert_eq(check_one(cfg, generate(4)).len(), 0)
+    remove_dir_all(cfg.work).unwrap_or(())
+
+@test("a cycle that never comes apart breaks the counted-heap oracle")
+e2e_leak_fails()
+    val cfg = e2e_config() match
+        Some(c) -> c
+        None -> skip("DROPFUZZ_COMPILER is not set")
+    val text = raw"""
+        struct N
+            next: Option[&N]
+
+        main()
+            val a: &N = N(None)
+
+            a.next = Some(a)
+            print("done")
+        """
+
+    assert(classes(finish(begin_text(cfg, text, no_want(), 1, 0))).contains("leak[O0-counted];"))
+    remove_dir_all(cfg.work).unwrap_or(())
+
+@test("a read of freed memory breaks the AddressSanitizer oracle")
+e2e_asan_fails()
+    val cfg = e2e_config() match
+        Some(c) -> c
+        None -> skip("DROPFUZZ_COMPILER is not set")
+    val text = raw"""
+        extern "malloc" c_malloc(n: usize) -> *u8
+        extern "free" c_free(p: *u8)
+
+        main()
+            val p = c_malloc(8)
+
+            c_free(p)
+            print(p[0])
+            print("done")
+        """
+
+    assert(classes(finish(begin_text(cfg, text, no_want(), 1, 0))).contains("asan[asan];"))
+    remove_dir_all(cfg.work).unwrap_or(())
+
+@test("a candidate is smaller than the program it was cut from")
+candidates_shrink()
+    val p = repair(generate(5)).0
+
+    for q in candidates(p)
+        assert(prog_size(repair(q).0) < prog_size(p))

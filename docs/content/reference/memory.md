@@ -3911,8 +3911,8 @@ print("done")
 
 ```output
 holding 2
-closing 2
 closing 1
+closing 2
 done
 ```
 
@@ -3974,8 +3974,8 @@ print("done")
 
 ```output
 holding 1 2 2
-drop 4
 drop 3
+drop 4
 drop 2
 drop 1
 done
@@ -4118,9 +4118,339 @@ process exiting is what returns what it held, and running destructors at exit is
 spent decades regretting, because the order two statics come apart in has no good answer. What it
 costs is that a buffered writer held in a static is not flushed at exit; the program flushes it.
 
-**No order is promised among siblings.** Two values that die together — the elements of a slice, the
-fields of a struct — come apart in an order that follows the teardown worklist, which today makes it
-last-to-first. A program that needs one before another has to say so.
+### When a value is dropped
+
+**A value is dropped when the last reference to it goes, and a reference goes at the end of the block
+that holds it.** A function body, an `if` arm and a loop's body are each a block, so a local declared
+in a loop is dropped at the end of every trip, and a `continue` or a `break` drops it as the trip's end
+would:
+
+```sysl
+struct Res
+    name: string
+
+impl Drop for Res
+    drop(self) = print(s"drop ${self.name}")
+
+for i in 0..<3
+    val r = Res(s"trip $i")
+
+    if i == 1 then continue
+    if i == 2 then break
+    print(s"body $i")
+
+print("after")
+```
+
+```output
+body 0
+drop trip 0
+drop trip 1
+drop trip 2
+after
+```
+
+**A temporary is dropped at the end of its statement**, before the next one starts. A value made only
+to be handed to a call is a temporary of the statement the call is in:
+
+```sysl
+struct Res
+    name: string
+
+impl Drop for Res
+    drop(self) = print(s"drop ${self.name}")
+
+show(r: &Res) = print(s"use ${r.name}")
+
+show(Res("t"))
+print("next statement")
+```
+
+```output
+use t
+drop t
+next statement
+```
+
+**Assigning to a variable drops what it held, at the assignment**:
+
+```sysl
+struct Res
+    name: string
+
+impl Drop for Res
+    drop(self) = print(s"drop ${self.name}")
+
+var r = Res("old")
+
+r = Res("new")
+print("assigned")
+```
+
+```output
+drop old
+assigned
+drop new
+```
+
+**Taking a value out of an enum, or binding it in a `match`, shares it rather than moving it.** There
+is no use-after-move: the enum still holds its payload, the new name holds another share, and the
+value is dropped once, when the later of the two goes. A closure is the same — it holds what it
+captured until the closure itself is dropped:
+
+```sysl
+struct Res
+    name: string
+
+impl Drop for Res
+    drop(self) = print(s"drop ${self.name}")
+
+enum Slot
+    Full(r: &Res)
+    Empty
+
+taken() -> &Res
+    val s = Slot.Full(Res("payload"))
+    val r = s match
+        Full(x) -> x
+        Empty -> Res("none")
+
+    print(s"took ${r.name}")
+    r
+
+captured() -> &Fn() -> unit
+    val r = Res("captured")
+
+    () -> print(s"use ${r.name}")
+
+val t = taken()
+
+print("the enum is gone; the payload is not")
+
+val f = captured()
+
+f()
+print("end")
+```
+
+```output
+took payload
+the enum is gone; the payload is not
+use captured
+end
+drop captured
+drop payload
+```
+
+**Every way out of a block drops what the block holds**: running off its end, a `return`, a `?`, a
+`break` and a `continue`. Leaving several blocks at once undoes the innermost first — a `return` from
+inside an `if` drops the arm's locals, then the function's:
+
+```sysl
+struct Res
+    name: string
+
+impl Drop for Res
+    drop(self) = print(s"drop ${self.name}")
+
+check(n: int) -> Result[int, string]
+    val a = Res("a")
+
+    if n > 0
+        val b = Res("b")
+
+        return Err("out")
+
+    Ok(0)
+
+print(check(1).is_err())
+```
+
+```output
+drop b
+drop a
+true
+```
+
+A trap is the exception: [it runs nothing](#where-defer-sits), no destructor and no `defer`.
+
+### In what order
+
+**Locals are dropped in the reverse of the order they were declared in, each deferred statement in
+its written place among them** — [`Where defer sits`](#where-defer-sits) shows the interleaving. Within
+one value the order is the declaration's: **a struct's fields in the order they are declared, a
+tuple's in position order, and the elements of a slice or a `Buf` in index order**. Teardown is depth
+first, so each field comes apart whole — everything it holds included — before the next starts:
+
+```sysl
+import sysl.buf.{Buf, buf}
+
+struct Res
+    name: string
+
+impl Drop for Res
+    drop(self) = print(s"drop ${self.name}")
+
+struct Inner
+    x: &Res
+    y: &Res
+
+struct Outer
+    a: &Inner
+    b: &Res
+    c: (&Res, &Res)
+
+hold()
+    val o: &Outer = Outer(Inner(Res("a.x"), Res("a.y")), Res("b"), (Res("c.0"), Res("c.1")))
+    var all: Buf[&Res] = buf()
+
+    all.push(Res("e0"))
+    all.push(Res("e1"))
+    print("made")
+
+hold()
+```
+
+```output
+made
+drop e0
+drop e1
+drop a.x
+drop a.y
+drop b
+drop c.0
+drop c.1
+```
+
+`all` is declared after `o`, so it goes first; inside each, the order is the one they were written in.
+This is the order Rust gives, and it holds however deep the structure is: teardown runs from a
+worklist rather than by recursion, so a linked list of a million nodes comes apart head first without
+using a frame per node.
+
+**A destructor runs before the fields of the value it tears down, and its own locals are dropped at the
+end of its body — still before those fields:**
+
+```sysl
+struct Res
+    name: string
+
+impl Drop for Res
+    drop(self) = print(s"drop ${self.name}")
+
+struct Node
+    leaf: &Res
+
+impl Drop for Node
+    drop(self)
+        val note = Res("a local of drop")
+
+        print(s"drop node, ${self.leaf.name} still here")
+
+hold()
+    val n = Node(Res("field"))
+
+    print("holding")
+
+hold()
+```
+
+```output
+holding
+drop node, field still here
+drop a local of drop
+drop field
+```
+
+### What a destructor may do
+
+**It may read every field**, which is intact, call any function, and build and drop values of its own,
+as above. **It may keep a share of a field**: the field is then not dropped with the value, but when
+the last share of it goes:
+
+```sysl
+struct Res
+    name: string
+
+impl Drop for Res
+    drop(self) = print(s"drop ${self.name}")
+
+struct Node
+    leaf: &Res
+
+var kept: Option[&Res] = None
+
+impl Drop for Node
+    drop(self)
+        print("drop node")
+        kept = Some(self.leaf)
+
+main()
+    if true
+        val n = Node(Res("leaf"))
+
+    print("the node is gone")
+    kept = None
+    print("end")
+```
+
+```output
+drop node
+the node is gone
+drop leaf
+end
+```
+
+**It may not keep the value itself.** `self` is a copy handed to the destructor borrowed, and making a
+`&T` of it would be a second owner of what is already being torn down — so it is refused, as any copy
+boxed into a second owner is:
+
+```sysl
+struct Node
+    n: int
+
+var saved: Option[&Node] = None
+
+impl Drop for Node
+    drop(self)
+        saved = Some(self)
+
+main()
+    print("ready")
+```
+
+```error
+this makes a '&Node' out of a copy of a 'Node' value, and 'Node' has a 'Drop' — the copy would be a second owner of the resource, and its destructor would run once for each
+```
+
+**A `weak` reference to the value already reads as gone while its destructor runs.** The count is zero
+before the destructor is called, so nothing can take a new share of the value from inside its own
+teardown:
+
+```sysl
+struct Node
+    name: string
+
+var watch: Option[weak Node] = None
+
+impl Drop for Node
+    drop(self) = watch match
+        Some(w) -> print(s"${self.name}: the weak reads ${if w.get() == None then "gone" else "alive"}")
+        None -> ()
+
+main()
+    if true
+        val n = Node("node")
+
+        watch = Some(n)
+
+    watch = None
+    print("end")
+```
+
+```output
+node: the weak reads gone
+end
+```
 
 ## Crossing a concurrency domain
 

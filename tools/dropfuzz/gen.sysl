@@ -1,0 +1,243 @@
+// The generator: a random program over the ownership events of `tree.sysl`, well typed by
+// construction. Every statement is drawn, asked `valid` in the environment the walk keeps, and redrawn
+// until it stands, so a generated program and a reduced one obey the same rules.
+
+import sysl.buf.{Buf, buf}
+import sysl.rand.{Rng, rng}
+
+/** How often each event is drawn, relative to the others. */
+val weights: []const (Op, int) = [
+    (Make, 10), (Remake, 3), (Use, 6), (TempUse, 2), (Alias, 3), (MakePair, 3), (HeapPair, 3), (PairOf, 2),
+    (Look, 2), (Poke, 2), (SetField, 2), (ProbeOf, 1), (ProbeCall, 1), (NewBuf, 2), (PushNew, 3),
+    (PushVar, 2), (Each, 1), (Pop, 1), (Replace, 1), (NewMap, 1), (Put, 2), (PutVar, 1), (Remove, 1),
+    (Lookup, 1), (Weak, 2), (Upgrade, 2), (Closure, 2), (BoxFn, 2), (CallFn, 2), (SlotNew, 2),
+    (SlotOf, 1), (SlotEmpty, 1), (SlotMatch, 2), (SlotTake, 1), (DeferMark, 2), (DeferUse, 2),
+    (If, 3), (Loop, 2), (Break, 2), (Continue, 2), (Return, 1), (Call, 2), (CallR, 2), (Spawn, 1),
+    (AsyncRun, 1), (AsyncHold, 1), (AsyncAwait, 1)]
+
+struct Gen
+    r: Rng
+    next_local: int
+    next_site: int
+    next_mark: int
+    next_loop: int
+    budget: int
+
+/** The settings a run of the generator is made with. */
+struct Shape
+    funcs: int      // at most this many functions, `run` included
+    budget: int     // statements in the whole program, nested ones included
+    depth: int      // how deep `if` and `for` may nest
+
+val default_shape = Shape(4, 60, 3)
+
+below(g: *Gen, n: int) -> int = if n <= 0 then 0 else int(g.r.below(u64(n)))
+
+site(g: *Gen) -> int
+    g.next_site += 1
+    g.next_site
+
+local(g: *Gen) -> int
+    g.next_local += 1
+    g.next_local
+
+/** A random local in scope that `ok` accepts, or `none` where there is none. */
+val none = -1_000_000
+
+pick_local(g: *Gen, e: *Env, ok: Kind -> bool) -> int
+    var ids: Buf[int] = buf()
+
+    for l in e.locals
+        if ok(l.kind) then ids.push(l.id)
+
+    if ids.len() == 0 then none else ids[usize(below(g, int(ids.len())))]
+
+pick_tr(g: *Gen, e: *Env) -> int = pick_local(g, e, is_tr)
+pick_kind(g: *Gen, e: *Env, k: Kind) -> int = pick_local(g, e, (x) -> x == k)
+
+draw_op(g: *Gen) -> Op
+    var total = 0
+
+    for w in weights do total += w.1
+
+    var at = below(g, total)
+
+    for w in weights
+        if at < w.1 then return w.0
+        at -= w.1
+
+    Make
+
+/** A call to a function after this one, with arguments drawn from the locals in scope. */
+draw_call(g: *Gen, e: *Env, fallible: bool) -> Stmt
+    var s = st(if fallible then CallR else Call, 0)
+    val n = int(e.funcs.len()) - e.here - 1
+
+    if n <= 0 then return s
+
+    val f = e.here + 1 + below(g, n)
+
+    s.a = f
+
+    for _ in 0..<e.funcs[usize(f)].params do s.args.push(pick_tr(g, e))
+    s
+
+/** One statement drawn with its operands, not yet asked whether it stands. */
+draw(g: *Gen, e: *Env, room: int) -> Stmt
+    val op = draw_op(g)
+
+    op match
+        Make -> st(Make, local(g), site(g), below(g, 2))
+        Remake -> st(Remake, pick_kind(g, e, KTrVar), site(g))
+        Use -> st(Use, pick_local(g, e, (k) -> is_tr(k) || k == KSync))
+        TempUse -> st(TempUse, 0, site(g))
+        Alias -> st(Alias, local(g), pick_tr(g, e))
+        MakePair -> st(MakePair, local(g), site(g), site(g))
+        PairOf -> st(PairOf, local(g), pick_tr(g, e), pick_tr(g, e))
+        HeapPair -> st(HeapPair, local(g), site(g), site(g))
+        Look -> st(Look, pick_local(g, e, (k) -> k == KPair || k == KHeap))
+        Poke -> st(Poke, pick_kind(g, e, KPair))
+        SetField -> st(SetField, pick_local(g, e, (k) -> k == KPair || k == KHeap), site(g))
+        ProbeOf -> st(ProbeOf, local(g), pick_kind(g, e, KPair))
+        ProbeCall -> st(ProbeCall, pick_kind(g, e, KProbe))
+        NewBuf | NewMap | SlotEmpty -> st(op, local(g))
+        PushNew | Replace -> st(op, pick_kind(g, e, KBuf), site(g))
+        PushVar -> st(PushVar, pick_kind(g, e, KBuf), pick_tr(g, e))
+        Each | Pop -> st(op, pick_kind(g, e, KBuf))
+        Put -> st(Put, pick_kind(g, e, KMap), site(g), below(g, 3))
+        PutVar -> st(PutVar, pick_kind(g, e, KMap), pick_tr(g, e), below(g, 3))
+        Remove | Lookup -> st(op, pick_kind(g, e, KMap), 0, below(g, 3))
+        Weak -> st(Weak, local(g), pick_tr(g, e))
+        Upgrade -> st(Upgrade, pick_kind(g, e, KWeak))
+        Closure | BoxFn ->
+            var s = st(op, local(g))
+
+            for _ in 0..<below(g, 3)
+                val x = pick_tr(g, e)
+
+                if x != none then s.args.push(x)
+            s
+        CallFn -> st(CallFn, pick_local(g, e, (k) -> k == KFn || k == KBox))
+        SlotNew -> st(SlotNew, local(g), site(g))
+        SlotOf -> st(SlotOf, local(g), pick_tr(g, e))
+        SlotMatch -> st(SlotMatch, pick_kind(g, e, KSlot))
+        SlotTake -> st(SlotTake, local(g), site(g), pick_kind(g, e, KSlot))
+        DeferMark -> st(DeferMark, 0, mark(g))
+        DeferUse -> st(DeferUse, 0, pick_local(g, e, (k) -> is_tr(k) || k == KSync))
+        If -> if room > 0 then st(If, 0, below(g, 64)) else st(Make, local(g), site(g))
+        Loop ->
+            if room > 0
+                g.next_loop += 1
+                st(Loop, g.next_loop, 1 + below(g, 3))
+            else
+                st(Make, local(g), site(g))
+        Break | Continue | Return -> st(op, 0, below(g, 64))
+        Call -> draw_call(g, e, false)
+        CallR -> draw_call(g, e, true)
+        Spawn -> st(Spawn, local(g), site(g))
+        AsyncRun -> st(AsyncRun, 0, pick_tr(g, e))
+        AsyncHold -> st(AsyncHold, local(g), pick_tr(g, e))
+        AsyncAwait -> st(AsyncAwait, 0, pick_kind(g, e, KTask))
+        Mark -> st(Make, local(g), site(g))
+
+mark(g: *Gen) -> int
+    g.next_mark += 1
+    g.next_mark
+
+/** A body of up to `len` statements, each standing where it is written, ended by its `Mark`. */
+gen_body(g: *Gen, e: *Env, len: int, room: int) -> Buf[Stmt]
+    var out: Buf[Stmt] = buf()
+
+    for _ in 0..<len
+        if g.budget <= 0 then break
+
+        var s = draw(g, e, room)
+        var tries = 0
+
+        while !valid(e, s, false) && tries < 20
+            s = draw(g, e, room)
+            tries += 1
+
+        if !valid(e, s, false) then s = st(Make, local(g), site(g))
+
+        g.budget -= 1
+
+        if s.op == If
+            enter(e)
+            s.yes = gen_body(g, e, 1 + below(g, 4), room - 1)
+            leave(e)
+            enter(e)
+            s.no = if below(g, 2) == 0 then gen_body(g, e, 1 + below(g, 3), room - 1) else buf()
+            leave(e)
+        else if s.op == Loop
+            e.loops.push(s.n)
+            enter(e)
+            s.yes = gen_body(g, e, 1 + below(g, 5), room - 1)
+            leave(e)
+            e.loops.truncate(e.loops.len() - 1)
+
+        step(e, s)
+        out.push(s)
+
+    val m = st(Mark, 0, mark(g))
+
+    step(e, m)
+    out.push(m)
+    out
+
+/** The program a seed names: the same seed always gives the same program. */
+generate(seed: u64, shape: Shape = default_shape) -> Prog
+    var g = Gen(rng(seed, 7), 0, 0, 0, 0, shape.budget)
+    val bits = g.r.next_u64()
+    var funcs: Buf[Func] = buf()
+
+    funcs.push(Func(0, false, false, buf()))
+
+    for _ in 1..<(1 + below(&g, shape.funcs))
+        funcs.push(Func(below(&g, 3), below(&g, 2) == 0, false, buf()))
+
+    var e = new_env(funcs)
+
+    // `run` is written first, while the budget is fullest, and is given the most room.
+    for k in 0..<funcs.len()
+        val f = funcs[k]
+
+        e.here = int(k)
+        e.fallible = f.fallible
+        enter(&e)
+
+        for j in 0..<f.params do declare(&e, -1 - j, KTr, false)
+
+        val len = if k == 0 then 8 + below(&g, 10) else 2 + below(&g, 6)
+
+        funcs[k] = Func(f.params, f.fallible, false, gen_body(&g, &e, len, shape.depth))
+        leave(&e)
+
+    // A helper nothing calls is code no oracle sees, so `run` ends by calling each one it did not
+    // already, with arguments made for the call.
+    val run = funcs[0]
+    var body = without_mark(run.body)
+
+    for k in 1..<funcs.len()
+        if calls(run.body, int(k)) then continue
+
+        var call = st(if funcs[k].fallible then CallR else Call, 0, int(k))
+
+        for _ in 0..<funcs[k].params
+            val v = local(&g)
+
+            body.push(st(Make, v, site(&g)))
+            call.args.push(v)
+        body.push(call)
+
+    body.push(run.body[run.body.len() - 1])
+    funcs[0] = Func(0, false, false, body)
+    Prog(seed, bits, funcs)
+
+/** Whether a body calls function `k` anywhere in it. */
+calls(body: Buf[Stmt], k: int) -> bool
+    for s in body
+        if (s.op == Call || s.op == CallR) && s.a == k then return true
+        if calls(s.yes, k) || calls(s.no, k) then return true
+
+    false

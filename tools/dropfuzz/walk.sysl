@@ -1,0 +1,374 @@
+// The walk: which statements are well typed where they stand, and what order the language promises
+// at the end of each block.
+//
+// **One walk serves three callers.** The generator asks `valid` before it writes a statement and
+// `step` after; `repair` runs the same pair over a whole program and drops whatever no longer stands
+// (the reducer's deletions leave uses of locals that are gone, a `break` outside its loop, a call to a
+// function it cut); and the same walk records, at every `Mark`, the drops the block's end must show.
+//
+// **What the order oracle may claim, and what it may not.** A local is *sole* while the walk can say
+// that nothing but it holds what it holds: made in its own declaration, never aliased, captured,
+// stored, boxed or handed to a task, and never changed from a nested block (where the walk cannot say
+// which arm ran). At a block's end the language promises its locals and deferred statements are undone
+// in reverse of where they were written, a struct's fields come apart in declaration order and a
+// buffer's elements in index order; so for
+// the sole locals and the defers of the block the oracle knows the exact sequence, and checks it.
+// Anything not sole is left out of the check -- its drop is still counted by the other oracles.
+
+import sysl.buf.{Buf, buf}
+
+/** What a local holds, which decides what may be done with it. */
+enum Kind
+    KTr         // val vN: &Tracked
+    KTrVar      // var vN: &Tracked
+    KSync       // val vN: &sync Tracked
+    KPair       // var vN: Pair, on the frame
+    KHeap       // val vN: &Pair, on the heap
+    KBuf
+    KMap
+    KWeak
+    KFn         // a closure, by value
+    KBox        // an &Fn box
+    KSlot
+    KProbe
+    KTask
+
+struct Local
+    id: int
+    kind: Kind
+    sole: bool
+    a: int      // the site it holds, or a pair's first field's; -1 where it holds none
+    b: int      // a pair's second field's site
+    depth: int
+    spent: bool // a task already awaited
+    elems: Buf[int] // a sole buffer's elements' sites, in index order
+
+/** Something a block's end undoes: a local it declared, or a statement it deferred. */
+enum ItemKind
+    ILocal
+    IDefer
+    IDeferUse
+
+struct Item
+    kind: ItemKind
+    id: int     // the local (ILocal, IDeferUse), or the defer's mark number (IDefer)
+
+struct Frame
+    start: usize
+    items: Buf[Item]
+
+/** The sequence the end of one block must show, as normalized events (`oracle.sysl`'s tokens). */
+struct MarkWant
+    mark: int
+    want: Buf[string]
+
+struct Env
+    locals: Buf[Local]
+    frames: Buf[Frame]
+    loops: Buf[int]
+    funcs: Buf[Func]
+    here: int
+    fallible: bool
+    marks: Buf[MarkWant]
+    temps: Buf[int]
+
+new_env(funcs: Buf[Func]) -> Env = Env(buf(), buf(), buf(), funcs, 0, false, buf(), buf())
+
+is_tr(k: Kind) -> bool = k == KTr || k == KTrVar
+
+/** Where a local is in the environment, or -1 where it is not in scope. */
+find(e: *Env, id: int) -> int
+    var i = int(e.locals.len()) - 1
+
+    while i >= 0
+        if e.locals[usize(i)].id == id then return i
+        i -= 1
+
+    -1
+
+kind_is(e: *Env, id: int, k: Kind) -> bool
+    val i = find(e, id)
+
+    i >= 0 && e.locals[usize(i)].kind == k
+
+tr_ok(e: *Env, id: int) -> bool
+    val i = find(e, id)
+
+    i >= 0 && is_tr(e.locals[usize(i)].kind)
+
+depth(e: *Env) -> int = int(e.frames.len())
+
+/** The local is held by something else from now on. */
+share(e: *Env, id: int)
+    val i = find(e, id)
+
+    if i < 0 then return
+
+    var l = e.locals[usize(i)]
+
+    l.sole = false
+    e.locals[usize(i)] = l
+
+/** The local's value is replaced or rearranged: exact where it is declared, unknown from deeper. */
+change(e: *Env, id: int, a: int, b: int)
+    val i = find(e, id)
+
+    if i < 0 then return
+
+    var l = e.locals[usize(i)]
+
+    if l.depth == depth(e)
+        l.sole = true
+        l.a = a
+        l.b = b
+    else
+        l.sole = false
+
+    e.locals[usize(i)] = l
+
+/** A sole buffer gains an element made for it: still exact where it is declared, unknown from deeper.
+ * The sites go in a fresh list, so a copy of the local taken before this still says what it said.
+ */
+push_elem(e: *Env, id: int, site: int)
+    val i = find(e, id)
+
+    if i < 0 then return
+
+    var l = e.locals[usize(i)]
+
+    if !l.sole || l.depth != depth(e)
+        l.sole = false
+    else
+        var elems: Buf[int] = buf()
+
+        for x in l.elems do elems.push(x)
+        elems.push(site)
+        l.elems = elems
+
+    e.locals[usize(i)] = l
+
+declare(e: *Env, id: int, kind: Kind, sole: bool, a: int = -1, b: int = -1)
+    e.locals.push(Local(id, kind, sole, a, b, depth(e), false, buf()))
+    e.frames[e.frames.len() - 1].items.push(Item(ILocal, id))
+
+defer_item(e: *Env, kind: ItemKind, id: int) = e.frames[e.frames.len() - 1].items.push(Item(kind, id))
+
+enter(e: *Env) = e.frames.push(Frame(e.locals.len(), buf()))
+
+leave(e: *Env)
+    val f = e.frames[e.frames.len() - 1]
+
+    e.locals.truncate(f.start)
+    e.frames.truncate(e.frames.len() - 1)
+
+/** A call's arguments all name locals holding a `&Tracked`, as many as the callee takes. */
+call_ok(e: *Env, f: int, s: Stmt, fallible: bool) -> bool
+    if f <= e.here || f >= int(e.funcs.len()) then return false
+
+    val g = e.funcs[usize(f)]
+
+    if g.dead || g.fallible != fallible || int(s.args.len()) != g.params then return false
+
+    for x in s.args
+        if !tr_ok(e, x) then return false
+
+    true
+
+/** Whether the statement stands here. `last` says whether it ends its body, which a `Mark` must. */
+valid(e: *Env, s: Stmt, last: bool) -> bool = s.op match
+    Make | TempUse | MakePair | HeapPair | NewBuf | NewMap | SlotNew | SlotEmpty | DeferMark | If | Loop | Spawn -> true
+    Remake -> kind_is(e, s.n, KTrVar)
+    Use -> tr_ok(e, s.n) || kind_is(e, s.n, KSync)
+    Alias | Weak | SlotOf | AsyncRun | AsyncHold -> tr_ok(e, s.a)
+    PairOf -> tr_ok(e, s.a) && tr_ok(e, s.b)
+    Look | SetField -> kind_is(e, s.n, KPair) || kind_is(e, s.n, KHeap)
+    Poke -> kind_is(e, s.n, KPair)
+    ProbeOf -> kind_is(e, s.a, KPair)
+    ProbeCall -> kind_is(e, s.n, KProbe)
+    PushNew | Each | Pop | Replace -> kind_is(e, s.n, KBuf)
+    PushVar -> kind_is(e, s.n, KBuf) && tr_ok(e, s.a)
+    Put | Remove | Lookup -> kind_is(e, s.n, KMap)
+    PutVar -> kind_is(e, s.n, KMap) && tr_ok(e, s.a)
+    Upgrade -> kind_is(e, s.n, KWeak)
+    Closure | BoxFn -> true
+    CallFn -> kind_is(e, s.n, KFn) || kind_is(e, s.n, KBox)
+    SlotMatch -> kind_is(e, s.n, KSlot)
+    SlotTake -> kind_is(e, s.b, KSlot)
+    DeferUse -> tr_ok(e, s.a) || kind_is(e, s.a, KSync)
+    Break | Continue -> e.loops.len() > 0
+    Return -> true
+    Call -> call_ok(e, s.a, s, false)
+    CallR -> call_ok(e, s.a, s, true)
+    AsyncAwait ->
+        val i = find(e, s.a)
+
+        i >= 0 && e.locals[usize(i)].kind == KTask && !e.locals[usize(i)].spent &&
+            e.locals[usize(i)].depth == depth(e)
+    Mark -> last
+
+/** What the statement does to the environment, once it is known to stand. Nested bodies are walked by
+ * `walk_body` through `step_nested`, which the generator replaces with its own writer.
+ */
+step(e: *Env, s: Stmt)
+    s.op match
+        Make -> declare(e, s.n, if s.b == 1 then KTrVar else KTr, true, s.a)
+        Remake -> change(e, s.n, s.a, -1)
+        Alias ->
+            share(e, s.a)
+            declare(e, s.n, KTr, false)
+        MakePair -> declare(e, s.n, KPair, true, s.a, s.b)
+        HeapPair -> declare(e, s.n, KHeap, true, s.a, s.b)
+        PairOf ->
+            share(e, s.a)
+            share(e, s.b)
+            declare(e, s.n, KPair, false)
+        Poke ->
+            val i = find(e, s.n)
+            val l = e.locals[usize(i)]
+
+            if l.sole then change(e, s.n, l.b, l.a) else share(e, s.n)
+        SetField ->
+            val i = find(e, s.n)
+            val l = e.locals[usize(i)]
+
+            if l.sole then change(e, s.n, s.a, l.b) else share(e, s.n)
+        ProbeOf ->
+            share(e, s.a)
+            declare(e, s.n, KProbe, false)
+        NewBuf -> declare(e, s.n, KBuf, true)
+        PushNew -> push_elem(e, s.n, s.a)
+        Pop | Replace -> share(e, s.n)
+        PushVar ->
+            share(e, s.a)
+            share(e, s.n)
+        PutVar -> share(e, s.a)
+        NewMap -> declare(e, s.n, KMap, false)
+        Weak -> declare(e, s.n, KWeak, false)
+        Closure | BoxFn ->
+            for x in s.args do share(e, x)
+            declare(e, s.n, if s.op == Closure then KFn else KBox, false)
+        SlotNew -> declare(e, s.n, KSlot, true, s.a)
+        SlotOf ->
+            share(e, s.a)
+            declare(e, s.n, KSlot, false)
+        SlotEmpty -> declare(e, s.n, KSlot, true)
+        SlotTake ->
+            share(e, s.b)
+            declare(e, s.n, KTr, false)
+        TempUse -> e.temps.push(s.a)
+        DeferMark -> defer_item(e, IDefer, s.a)
+        DeferUse -> defer_item(e, IDeferUse, s.a)
+        Spawn -> declare(e, s.n, KSync, true, s.a)
+        AsyncHold ->
+            share(e, s.a)
+            declare(e, s.n, KTask, false)
+        AsyncAwait ->
+            val i = find(e, s.a)
+            var l = e.locals[usize(i)]
+
+            l.spent = true
+            e.locals[usize(i)] = l
+        Mark -> e.marks.push(MarkWant(s.a, block_end(e)))
+        _ -> ()
+
+/** The events the current block's end must show, in order: its items last-written first, a sole
+ * local as the drops of what it holds (a pair's fields in declaration order), a defer as its mark.
+ */
+block_end(e: *Env) -> Buf[string]
+    var want: Buf[string] = buf()
+    val f = e.frames[e.frames.len() - 1]
+    var i = int(f.items.len()) - 1
+
+    while i >= 0
+        val it = f.items[usize(i)]
+
+        it.kind match
+            IDefer -> want.push(s"D${it.id}")
+            IDeferUse ->
+                val j = find(e, it.id)
+
+                if j >= 0 && e.locals[usize(j)].sole && e.locals[usize(j)].a >= 0
+                    want.push(s"u${e.locals[usize(j)].a}")
+            ILocal ->
+                val j = find(e, it.id)
+
+                if j >= 0 && e.locals[usize(j)].sole
+                    val l = e.locals[usize(j)]
+
+                    if l.a >= 0 then want.push(s"-${l.a}")
+                    if (l.kind == KPair || l.kind == KHeap) && l.b >= 0 then want.push(s"-${l.b}")
+                    if l.kind == KBuf
+                        for x in l.elems do want.push(s"-$x")
+        i -= 1
+
+    want
+
+/** A body with every statement that no longer stands taken out, walked into `e`. A closure's
+ * captures that are gone are dropped from it rather than taking the closure with them.
+ */
+repair_body(e: *Env, body: Buf[Stmt]) -> Buf[Stmt]
+    var out: Buf[Stmt] = buf()
+
+    for i in 0..<body.len()
+        var s = body[i]
+
+        if s.op == Closure || s.op == BoxFn
+            var kept: Buf[int] = buf()
+
+            for x in s.args
+                if tr_ok(e, x) then kept.push(x)
+            s = Stmt(s.op, s.n, s.a, s.b, kept, s.yes, s.no)
+
+        if !valid(e, s, i + 1 == body.len()) then continue
+
+        if s.op == If
+            enter(e)
+            val yes = repair_body(e, s.yes)
+            leave(e)
+            enter(e)
+            val no = repair_body(e, s.no)
+            leave(e)
+            s = Stmt(s.op, s.n, s.a, s.b, s.args, yes, no)
+        else if s.op == Loop
+            e.loops.push(s.n)
+            enter(e)
+            val yes = repair_body(e, s.yes)
+            leave(e)
+            e.loops.truncate(e.loops.len() - 1)
+            s = Stmt(s.op, s.n, s.a, s.b, s.args, yes, s.no)
+
+        step(e, s)
+        out.push(s)
+
+    out
+
+/** What the oracles need to know about a program, beyond its output. */
+struct Want
+    marks: Buf[MarkWant]
+    temps: Buf[int]
+
+/** The program with everything that no longer stands taken out, and what its oracles expect. */
+repair(p: Prog) -> (Prog, Want)
+    var funcs: Buf[Func] = buf()
+
+    for f in p.funcs do funcs.push(f)
+
+    var e = new_env(funcs)
+
+    for k in 0..<funcs.len()
+        val f = funcs[k]
+
+        if f.dead then continue
+
+        e.here = int(k)
+        e.fallible = f.fallible
+        enter(&e)
+
+        for j in 0..<f.params do declare(&e, -1 - j, KTr, false)
+
+        val body = repair_body(&e, f.body)
+
+        leave(&e)
+        funcs[k] = Func(f.params, f.fallible, false, body)
+
+    (Prog(p.seed, p.bits, funcs), Want(e.marks, e.temps))

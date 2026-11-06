@@ -1,0 +1,133 @@
+// dropfuzz: generates programs over the ownership events of `tree.sysl`, builds each with the compiler
+// under test in three modes, runs them, and checks the six oracles. A failing program is reduced on
+// its tree and written out for a person to turn into a `dfz_` test. README.md says how to run it.
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.{Join, Search, parse_long}
+
+val usage = """
+    dropfuzz --compiler <sysl> --lib <library dir> [--seed <n>] [--count <n>] [--workers <n>]
+             [--out <dir>] [--no-reduce]
+    dropfuzz --show <seed>
+    """
+
+struct Opts
+    compiler: string
+    lib: string
+    seed: u64
+    count: int
+    workers: int
+    out: string
+    reduce: bool
+    show: Option[u64]
+
+parse_opts(args: []string) -> Result[Opts, string]
+    var o = Opts("", "", 1, 100, 3, "dropfuzz-failures", true, None)
+    var i = 1
+
+    while i < args.len
+        val a = args[i]
+
+        if a == "--no-reduce"
+            o.reduce = false
+            i += 1
+            continue
+
+        if i + 1 >= args.len then return Err(s"'$a' needs a value\n$usage")
+
+        val v = args[i + 1]
+
+        if a == "--compiler" then o.compiler = v
+        else if a == "--lib" then o.lib = v
+        else if a == "--seed" then o.seed = u64(parse_long(v).map_err((e) -> s"--seed: $v")?)
+        else if a == "--count" then o.count = int(parse_long(v).map_err((e) -> s"--count: $v")?)
+        else if a == "--workers" then o.workers = int(parse_long(v).map_err((e) -> s"--workers: $v")?)
+        else if a == "--out" then o.out = v
+        else if a == "--show" then o.show = Some(u64(parse_long(v).map_err((e) -> s"--show: $v")?))
+        else return Err(s"unknown option '$a'\n$usage")
+
+        i += 2
+
+    if o.show == None && (o.compiler == "" || o.lib == "") then return Err(usage)
+
+    Ok(o)
+
+/** A failing program reduced (or not) and written out with its failures as a header comment. */
+report(cfg: Config, o: Opts, p: Prog, fails: Buf[string])
+    var lines: Buf[string] = buf()
+
+    for f in fails do lines.push(s"// $f")
+
+    var q = repair(p).0
+
+    if o.reduce
+        val class = class_of(fails[0])
+
+        print(s"  reducing seed ${p.seed} in class $class")
+        q = reduce(cfg, p, class, (line) -> print(s"    $line"))
+
+        val after = check_one(cfg, q)
+
+        lines.push("// after reduction:")
+        for f in after do lines.push(s"// $f")
+
+    make_dir_all(o.out).unwrap_or(())
+
+    val file = s"${o.out}/fail-${p.seed}.sysl"
+
+    write_text(file, lines.join("\n") + "\n" + emit(q)).unwrap_or(())
+    print(s"  wrote $file")
+
+/** A clean ASan run says nothing unless the program was instrumented, so the first one is asked. */
+instrumented(exe: string) -> Result[unit, string] = capture("nm", ["-u", exe]) match
+    Ok(o) -> if o.text.contains("__asan_report") then Ok(()) else Err(s"$exe has no ASan instrumentation")
+    Err(_) -> Err("nm could not be run")
+
+main(args: []string) -> Result[unit, string]
+    val o = parse_opts(args)?
+
+    o.show match
+        Some(seed) ->
+            print(emit(repair(generate(seed)).0))
+            return Ok(())
+        None -> ()
+
+    val work = make_temp_dir("dropfuzz").map_err((e) -> "no scratch directory")?
+    val cfg = Config(o.compiler, o.lib, work)
+    var failed = 0
+    var ran = 0
+    var seed = o.seed
+    val end = o.seed + u64(o.count)
+
+    while seed < end
+        var batch: Buf[Prog] = buf()
+        var pending: Buf[Pending] = buf()
+
+        while seed < end && int(batch.len()) < o.workers
+            val p = generate(seed)
+
+            pending.push(begin(cfg, p, int(batch.len())))
+            batch.push(p)
+            seed += 1
+
+        for k in 0..<batch.len()
+            val fails = finish(pending[k])
+
+            if ran == 0 then instrumented(s"$work/w0/asan")?
+
+            ran += 1
+
+            if fails.len() > 0
+                failed += 1
+                print(s"FAIL seed ${batch[k].seed}: ${fails.len()} oracle(s) broken")
+                for f in fails do print(s"  $f")
+                report(cfg, o, batch[k], fails)
+
+        if ran % 100 < o.workers then print(s"ran $ran programs, $failed failed")
+
+    remove_dir_all(work).unwrap_or(())
+    print(s"dropfuzz: $ran programs from seed ${o.seed}, $failed failed")
+
+    if failed > 0 then Err(s"$failed program(s) failed") else Ok(())

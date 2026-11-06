@@ -163,6 +163,57 @@ fbr_migrates_between_threads()
     assert_eq(h.deep, dug(64))
     assert_eq(tag_now(), 1)
 
+// The same, read in the function that switches -- directly, through a helper inlined into it, and in
+// a loop around the switch -- and written there, each round on a carrier of its own.
+@inline
+private tag_inline() -> int = carrier_tag
+
+private struct Rounds
+    back: Context
+    me: Context
+    direct: [3]int
+    inlined: [3]int
+    next: int
+
+private rounds(r: *Rounds)
+    for i in 0..<3
+        r.direct[i] = carrier_tag
+        r.inlined[i] = tag_inline()
+        carrier_tag += 10
+        switch(&r.me, &r.back)
+
+    loop
+        switch(&r.me, &r.back)
+
+private round_on_carrier(r: *Rounds)
+    carrier_tag = r.next
+    switch(&r.back, &r.me)
+    assert_eq(carrier_tag, r.next + 10)
+
+@test("a function that switches reads and writes the thread-locals of whichever carrier resumed it")
+fbr_thread_locals_follow_the_carrier()
+    carrier_tag = 1
+
+    val s = Stack.reserve(64 * 1024).unwrap()
+    var r = Rounds(Context.new(), Context.new(), [0; 3], [0; 3], 1)
+
+    r.me = Context.start(s, &rounds, &r)
+    switch(&r.back, &r.me)
+    assert_eq(carrier_tag, 11)
+
+    val pr = &r
+
+    for k in 2..<4
+        r.next = k
+
+        var slots: [1]ScopeSlot = [ScopeSlot.new(); 1]
+
+        scope_in(slots[..], (sc) -> sc.start(&round_on_carrier, pr))
+
+    assert_eq(carrier_tag, 11)
+    assert_eq(r.direct, [1, 2, 3])
+    assert_eq(r.inlined, [1, 2, 3])
+
 // -- a stack is committed as it is touched -----------------------------------------------------------
 
 // Each frame holds a KiB that it writes all of, so `n` frames touch about `n` KiB of stack.
@@ -326,66 +377,107 @@ private trample(f: *Floats)
     end loop
 end trample
 
-@test("d8 to d15 hold the same bits after a switch away and back, whatever the other side put there")
-fbr_callee_saved_floats_survive()
+// Floats live across a switch whose other side writes d8--d15: the values survive wherever the code
+// around the switch chose to keep them.
+@test("floats live across a switch survive the other side writing d8 to d15")
+fbr_live_floats_survive()
     val s = Stack.reserve(32 * 1024).unwrap()
     var f = Floats(Context.new(), Context.new())
 
     f.me = Context.start(s, &trample, &f)
 
-    var a: u64 = 0x200
-    var b: u64 = 0x201
-    var c: u64 = 0x202
-    var d: u64 = 0x203
-    var e: u64 = 0x204
-    var g: u64 = 0x205
-    var h: u64 = 0x206
-    var k: u64 = 0x207
+    val x0 = black_box(0.25)
+    val x1 = black_box(1.25)
+    val x2 = black_box(2.25)
+    val x3 = black_box(3.25)
+    val x4 = black_box(4.25)
+    val x5 = black_box(5.25)
+    val x6 = black_box(6.25)
+    val x7 = black_box(7.25)
+    val x8 = black_box(8.25)
+    val x9 = black_box(9.25)
 
-    asm
-        [aarch64]
-            "fmov d8, {a}"
-            "fmov d9, {b}"
-            "fmov d10, {c}"
-            "fmov d11, {d}"
-            "fmov d12, {e}"
-            "fmov d13, {g}"
-            "fmov d14, {h}"
-            "fmov d15, {k}"
-            in a : reg
-            in b : reg
-            in c : reg
-            in d : reg
-            in e : reg
-            in g : reg
-            in h : reg
-            in k : reg
-            clobbers "d8", "d9", "d10", "d11", "d12", "d13", "d14", "d15"
-        [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "d8--d15 are aarch64's"
     switch(&f.home, &f.me)
-
-    asm
-        [aarch64]
-            "fmov {a}, d8"
-            "fmov {b}, d9"
-            "fmov {c}, d10"
-            "fmov {d}, d11"
-            "fmov {e}, d12"
-            "fmov {g}, d13"
-            "fmov {h}, d14"
-            "fmov {k}, d15"
-            out a : reg
-            out b : reg
-            out c : reg
-            out d : reg
-            out e : reg
-            out g : reg
-            out h : reg
-            out k : reg
-        [x86_64, thumb, riscv64, riscv32, craft, wasm32] unavailable "d8--d15 are aarch64's"
-    assert_eq([a, b, c, d, e, g, h, k], [0x200, 0x201, 0x202, 0x203, 0x204, 0x205, 0x206, 0x207])
-end fbr_callee_saved_floats_survive
+    switch(&f.home, &f.me)
+    assert_eq(x0 + x1 + x2 + x3 + x4 + x5 + x6 + x7 + x8 + x9, 47.5)
+    assert_eq(x0 * x9 + x1 * x8 + x2 * x7 + x3 * x6 + x4 * x5,
+              0.25 * 9.25 + 1.25 * 8.25 + 2.25 * 7.25 + 3.25 * 6.25 + 4.25 * 5.25)
+end fbr_live_floats_survive
 #endif
+
+// -- what the compiler's switch keeps --------------------------------------------------------------
+
+// Fills as many registers as it can with values of its own, integer and float, and goes home with
+// them live.
+private struct Busy
+    home: Context
+    me: Context
+    rounds: int
+
+private busy(b: *Busy)
+    loop
+        val k = black_box(i64(b.rounds) * 1000)
+        val i0 = black_box(k + 1)
+        val i1 = black_box(k + 2)
+        val i2 = black_box(k + 3)
+        val i3 = black_box(k + 4)
+        val i4 = black_box(k + 5)
+        val i5 = black_box(k + 6)
+        val i6 = black_box(k + 7)
+        val i7 = black_box(k + 8)
+        val g0 = black_box(f64(k) + 0.5)
+        val g1 = black_box(f64(k) + 1.5)
+        val g2 = black_box(f64(k) + 2.5)
+        val g3 = black_box(f64(k) + 3.5)
+
+        switch(&b.me, &b.home)
+        assert_eq(i0 + i1 + i2 + i3 + i4 + i5 + i6 + i7, 8 * k + 36)
+        assert_eq(g0 + g1 + g2 + g3, 4.0 * f64(k) + 8.0)
+        b.rounds += 1
+    end loop
+end busy
+
+@test("integers and floats live across a switch survive, on both sides of it, round after round")
+fbr_live_values_survive()
+    val s = Stack.reserve(32 * 1024).unwrap()
+    var b = Busy(Context.new(), Context.new(), 0)
+
+    b.me = Context.start(s, &busy, &b)
+
+    val a0 = black_box(11i64)
+    val a1 = black_box(22i64)
+    val a2 = black_box(33i64)
+    val a3 = black_box(44i64)
+    val a4 = black_box(55i64)
+    val a5 = black_box(66i64)
+    val a6 = black_box(77i64)
+    val a7 = black_box(88i64)
+    val a8 = black_box(99i64)
+    val h0 = black_box(0.5)
+    val h1 = black_box(1.5)
+    val h2 = black_box(2.5)
+    val h3 = black_box(3.5)
+    val h4 = black_box(4.5)
+
+    for _ in 0..<5
+        switch(&b.home, &b.me)
+        assert_eq(a0 + a1 + a2 + a3 + a4 + a5 + a6 + a7 + a8, 495)
+        assert_eq(a0 * a8 - a1 * a7 + a2 * a6, 11 * 99 - 22 * 88 + 33 * 77)
+        assert_eq(h0 + h1 + h2 + h3 + h4, 12.5)
+
+    assert_eq(b.rounds, 4)
+
+@test("a switch called through a function value goes out of line, and lands where the inline one does")
+fbr_switch_through_a_function_value()
+    val s = Stack.reserve(32 * 1024).unwrap()
+    var p = Pong(Context.new(), Context.new(), 0)
+    val go: &Fn(*Context, *Context) -> unit = switch
+
+    p.me = Context.start(s, &pong, &p)
+    go(&p.home, &p.me)
+    switch(&p.home, &p.me)
+    go(&p.home, &p.me)
+    assert_eq(p.n, 3)
 
 // -- the frame chain ends at the entry ---------------------------------------------------------------
 

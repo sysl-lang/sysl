@@ -1,0 +1,236 @@
+// The emitter: a program's text, from its tree.
+//
+// Every line a generated program prints is an event the oracles read (`oracle.sysl`):
+//
+//     +<id> s<site>   a Tracked was made          -<id> s<site>   it was dropped
+//     u <id> s<site>  it was read                 ! uaf <id>      it was read while not live
+//     D<k>            a deferred mark ran         E<k>            a block reached its end
+//
+// and anything else (`a 3`, `n 1`, `w none`) is output the modes must agree on and nothing more.
+
+import sysl.buf.{Buf, buf}
+import sysl.text.Join
+
+/** The part every program shares: the counted value, its liveness flags, and the types and helpers
+ * the events are written against.
+ */
+prelude(bits: u64) -> string = s"""
+import sysl.buf.{$buf_type, $buf_make}
+import sysl.container.{Map, map}
+import sysl.threads.scope
+
+var next_id = 0
+var live = [false; 8192]
+val bits: u64 = $bits
+
+flip(k: int) -> bool = (bits >> u64(k % 64)) & 1 == 1
+
+struct Tracked
+    id: int
+    site: int
+
+impl Drop for Tracked
+    drop(self)
+        live[self.id] = false
+        print(s"-$${self.id} s$${self.site}")
+
+mk(site: int) -> &Tracked
+    next_id += 1
+    live[next_id] = true
+    print(s"+$$next_id s$$site")
+    Tracked(next_id, site)
+
+mk_sync(site: int) -> &sync Tracked
+    next_id += 1
+    live[next_id] = true
+    print(s"+$$next_id s$$site")
+    Tracked(next_id, site)
+
+use(t: &Tracked)
+    if !live[t.id] then print(s"! uaf $${t.id}")
+    print(s"u $${t.id} s$${t.site}")
+
+use(t: &sync Tracked)
+    if !live[t.id] then print(s"! uaf $${t.id}")
+    print(s"u $${t.id} s$${t.site}")
+
+use_n(n: int) = print(s"n $$n")
+
+struct Pair
+    x: &Tracked
+    y: &Tracked
+
+impl Pair
+    look(self)
+        use(self.x)
+        use(self.y)
+
+    poke(*self)
+        val t = self.x
+
+        self.x = self.y
+        self.y = t
+
+trait Probe
+    probe(self)
+
+impl Probe for Pair
+    probe(self) = use(self.x)
+
+enum Slot
+    Full(t: &Tracked)
+    Empty
+
+async task1(t: &Tracked) -> int
+    use(t)
+    t.id
+"""
+
+name(id: int) -> string = if id >= 0 then s"v$id" else s"p${-id - 1}"
+
+/** Where the emitter is: how far in, the loops around it, and whether `?` and `Err` may be written. */
+struct At
+    indent: string
+    loops: Buf[int]
+    fallible: bool
+
+/** `flip(k)`, varied by the innermost loop's index where there is one. */
+cond(at: At, k: int) -> string =
+    if at.loops.len() == 0 then s"flip($k)" else s"flip($k + i${at.loops[at.loops.len() - 1]})"
+
+args_of(s: Stmt) -> string
+    var parts: Buf[string] = buf()
+
+    for x in s.args do parts.push(name(x))
+    parts.join(", ")
+
+/** A closure's body: one use per capture, on its line or as a block. */
+lambda(out: *Buf[string], head: string, s: Stmt, at: At)
+    if s.args.len() == 0
+        out.push(s"$head() -> print(\"f\")")
+    else if s.args.len() == 1
+        out.push(s"$head() -> use(${name(s.args[0])})")
+    else
+        out.push(s"$head() ->")
+
+        for x in s.args do out.push(s"${at.indent}    use(${name(x)})")
+
+emit_stmt(out: *Buf[string], s: Stmt, at: At)
+    val i = at.indent
+    val v = name(s.n)
+
+    s.op match
+        Make -> out.push(s"$i${if s.b == 1 then "var" else "val"} $v = mk(${s.a})")
+        Remake -> out.push(s"$i$v = mk(${s.a})")
+        Use -> out.push(s"${i}use($v)")
+        TempUse -> out.push(s"${i}use(mk(${s.a}))")
+        Alias -> out.push(s"${i}val $v = ${name(s.a)}")
+        MakePair -> out.push(s"${i}var $v = Pair(mk(${s.a}), mk(${s.b}))")
+        HeapPair -> out.push(s"${i}val $v: &Pair = Pair(mk(${s.a}), mk(${s.b}))")
+        PairOf -> out.push(s"${i}var $v = Pair(${name(s.a)}, ${name(s.b)})")
+        Look -> out.push(s"$i$v.look()")
+        Poke -> out.push(s"$i$v.poke()")
+        SetField -> out.push(s"$i$v.x = mk(${s.a})")
+        ProbeOf -> out.push(s"${i}val $v: &Probe = ${name(s.a)}")
+        ProbeCall -> out.push(s"$i$v.probe()")
+        NewBuf -> out.push(s"${i}var $v: $buf_type[&Tracked] = $buf_make()")
+        PushNew -> out.push(s"$i$v.push(mk(${s.a}))")
+        PushVar -> out.push(s"$i$v.push(${name(s.a)})")
+        Each -> out.push(s"${i}for t in $v do use(t)")
+        Pop -> out.push(s"$i$v.pop()")
+        Replace -> out.push(s"${i}if $v.len() > 0 then $v[0] = mk(${s.a})")
+        NewMap -> out.push(s"${i}var $v: Map[int, &Tracked] = map()")
+        Put -> out.push(s"$i$v.put(${s.b}, mk(${s.a}))")
+        PutVar -> out.push(s"$i$v.put(${s.b}, ${name(s.a)})")
+        Remove -> out.push(s"$i$v.remove(${s.b})")
+        Lookup ->
+            out.push(s"$i$v.get(${s.b}) match")
+            out.push(s"$i    Some(t) -> use(t)")
+            out.push(s"$i    None -> print(\"m none\")")
+        Weak -> out.push(s"${i}val $v: weak Tracked = ${name(s.a)}")
+        Upgrade ->
+            out.push(s"$i$v.get() match")
+            out.push(s"$i    Some(t) -> use(t)")
+            out.push(s"$i    None -> print(\"w none\")")
+        Closure -> lambda(out, s"${i}val $v = ", s, at)
+        BoxFn -> lambda(out, s"${i}val $v: &Fn() -> unit = ", s, at)
+        CallFn -> out.push(s"$i$v()")
+        SlotNew -> out.push(s"${i}val $v = Slot.Full(mk(${s.a}))")
+        SlotOf -> out.push(s"${i}val $v = Slot.Full(${name(s.a)})")
+        SlotEmpty -> out.push(s"${i}val $v = Slot.Empty")
+        SlotMatch ->
+            out.push(s"$i$v match")
+            out.push(s"$i    Full(t) -> use(t)")
+            out.push(s"$i    Empty -> print(\"empty\")")
+        SlotTake ->
+            out.push(s"${i}val $v = ${name(s.b)} match")
+            out.push(s"$i    Full(t) -> t")
+            out.push(s"$i    Empty -> mk(${s.a})")
+        DeferMark -> out.push(s"${i}defer print(\"D${s.a}\")")
+        DeferUse -> out.push(s"${i}defer use(${name(s.a)})")
+        If ->
+            out.push(s"${i}if ${cond(at, s.a)}")
+            emit_body(out, s.yes, At(i + "    ", at.loops, at.fallible))
+
+            if s.no.len() > 0
+                out.push(s"${i}else")
+                emit_body(out, s.no, At(i + "    ", at.loops, at.fallible))
+        Loop ->
+            var loops: Buf[int] = buf()
+
+            for l in at.loops do loops.push(l)
+            loops.push(s.n)
+            out.push(s"${i}for i${s.n} in 0..<${s.a}")
+            emit_body(out, s.yes, At(i + "    ", loops, at.fallible))
+        Break -> out.push(s"${i}if ${cond(at, s.a)} then break")
+        Continue -> out.push(s"${i}if ${cond(at, s.a)} then continue")
+        Return ->
+            out.push(s"${i}if ${cond(at, s.a)} then return${if at.fallible then " Err(\"e\")" else ""}")
+        Call -> out.push(s"${i}h${s.a}(${args_of(s)})")
+        CallR ->
+            if at.fallible
+                out.push(s"${i}use_n(r${s.a}(${args_of(s)})?)")
+            else
+                out.push(s"${i}use_n(r${s.a}(${args_of(s)}).unwrap_or(-1))")
+        Spawn ->
+            out.push(s"${i}val $v = mk_sync(${s.a})")
+            out.push(s"${i}scope((sc) -> sc.spawn(() -> use($v)))")
+        AsyncRun -> out.push(s"${i}print(s\"a $${block_on(task1(${name(s.a)}))}\")")
+        AsyncHold -> out.push(s"${i}val $v = task1(${name(s.a)})")
+        AsyncAwait -> out.push(s"${i}print(s\"a $${block_on(${name(s.a)})}\")")
+        Mark -> out.push(s"${i}print(\"E${s.a}\")")
+
+emit_body(out: *Buf[string], body: Buf[Stmt], at: At)
+    if body.len() == 0 then out.push(s"${at.indent}()")
+
+    for s in body do emit_stmt(out, s, at)
+
+func_name(k: int, f: Func) -> string = if k == 0 then "run" else if f.fallible then s"r$k" else s"h$k"
+
+/** The whole program's text. */
+emit(p: Prog) -> string
+    var out: Buf[string] = buf()
+
+    out.push(prelude(p.bits))
+
+    for k in 0..<p.funcs.len()
+        val f = p.funcs[k]
+
+        if f.dead then continue
+
+        var params: Buf[string] = buf()
+
+        for j in 0..<f.params do params.push(s"p$j: &Tracked")
+
+        val result = if f.fallible then " -> Result[int, string]" else ""
+
+        out.push(s"${func_name(int(k), f)}(${params.join(", ")})$result")
+        emit_body(&out, f.body, At("    ", buf(), f.fallible))
+
+        if f.fallible then out.push("    Ok(0)")
+        out.push("")
+
+    out.push("main()")
+    out.push("    run()")
+    out.push("    print(\"done\")")
+    out.join("\n") + "\n"
