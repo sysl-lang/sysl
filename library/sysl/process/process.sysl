@@ -648,6 +648,7 @@ struct Spawned
     private timeout: int
     private answer: Option[Result[Status, IoError]]
     private pgid: i64
+    private released: bool
 
     /** The process group the child was started in, as `Child.group` answers it: what a later stage of
      * a pipeline `Join`s, and what `set_foreground_group` hands the terminal to.
@@ -709,11 +710,24 @@ struct Spawned
 
         if e != 0 then Err(failure(i64(e))) else Ok(())
     end kill
+
+    /** Lets go of the child without ending it: dropping this handle afterwards sends no signal and
+     * waits for nothing, so the child outlives it -- a daemon a command line program starts and
+     * leaves running. Answers the child's pid, so the caller can still signal or wait for it.
+     *
+     * **Reaping becomes the caller's business.** A detached child that ends while this program lives
+     * is a zombie until someone waits for it by its pid; once this program has exited, init adopts
+     * and reaps it. A child already waited for is not touched either way.
+     */
+    detach(*self) -> int
+        self.released = true
+        int(self.id)
+    end detach
 end Spawned
 
 impl Drop for Spawned
     drop(self)
-        if self.answer.is_none() then stop(self.id)
+        if self.answer.is_none() && !self.released then stop(self.id)
 
 /** Start a program with its three streams where the caller says, and answer it without waiting for it
  * or collecting anything.
@@ -752,7 +766,7 @@ spawn(program: string, args: []const string = [], dir: string = "", env: []const
     val (pid, at) = begun_to(program, args, env, inherit_env, dir, stdin, stdout, stderr, pgid,
                              foreground)?
 
-    Ok(Spawned(pid, at, timeout, None, pgid))
+    Ok(Spawned(pid, at, timeout, None, pgid, false))
 end spawn
 
 /** A file nothing else holds, made empty, for a child to write one of its streams into. */

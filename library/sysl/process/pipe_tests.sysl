@@ -14,6 +14,7 @@ import sysl.time.whole_millis
 
 // Whether a pid still names a process -- a running child or a zombie -- asked of the kernel itself.
 private extern "kill" pt_signal(pid: i32, sig: int) -> int
+private extern "waitpid" pt_waitpid(pid: i32, state: *i32, options: int) -> i32
 
 // A directory of this test's own, for the files a child reads.
 private pt_scratch() -> string = make_temp_dir("sysl-proc-pipes").unwrap()
@@ -240,6 +241,51 @@ pt_dropped_spawn_is_reaped()
     assert(pt_signal(pid, 0) != 0, s"pid $pid survived its handle")
     assert(whole_millis(monotonic() - t0) < 3000, "dropping waited the child out")
 end pt_dropped_spawn_is_reaped
+
+private pt_detached() -> int
+    val s = spawn("sleep", ["30"]).unwrap()
+
+    s.detach()
+end pt_detached
+
+private pt_reap(pid: int)
+    var state: i32 = 0
+
+    pt_waitpid(i32(pid), &state, 0)
+end pt_reap
+
+@test("a detached child outlives its handle and is the caller's to end and reap")
+pt_detached_child_survives()
+    val pid = pt_detached()
+
+    assert(pt_signal(i32(pid), 0) == 0, s"pid $pid died with its handle")
+    pt_signal(i32(pid), 9)
+    pt_reap(pid)
+    assert(pt_signal(i32(pid), 0) != 0, "the child was not reaped")
+end pt_detached_child_survives
+
+@test("detaching a child that has already ended answers its pid and drops quietly")
+pt_detach_after_exit()
+    val s = spawn("true").unwrap()
+    val pid = s.pid()
+
+    s.wait().unwrap()
+    assert(s.detach() == pid)
+end pt_detach_after_exit
+
+@test("a detached child's stdin pipe is the caller's: closing it ends the child's input")
+pt_detached_reader_sees_eof()
+    var (r, w) = pipe().unwrap()
+    val s = spawn("cat", stdin = FromFile(r), stdout = ToPath("/dev/null")).unwrap()
+
+    r.close()
+
+    val pid = s.detach()
+
+    w.close()
+    pt_reap(pid)
+    assert(pt_signal(i32(pid), 0) != 0, "cat did not see end of input")
+end pt_detached_reader_sees_eof
 
 // ## What is refused
 

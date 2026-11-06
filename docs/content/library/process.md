@@ -508,6 +508,11 @@ Like a `Child`, a `Spawned` dropped without being waited for is ended and reaped
 pipeline abandoned halfway leaves no stage running and no zombie; `spawn` takes `dir`, `env`,
 `timeout` and `inherit_env` meaning what they mean for `run`, the `timeout` kept by `wait`.
 
+**`detach` lets a child outlive its handle.** `s.detach()` answers the child's pid, and dropping `s`
+afterwards signals and waits for nothing, so a daemon a command line program starts keeps running.
+Reaping is then the caller's business: a detached child that ends while the program lives is a
+zombie until someone waits for it by its pid, and init adopts it once the program has exited.
+
 ## Who the program is
 
 **`user()` and `group()` answer the ids the program acts as**, as `u32`s — the type
