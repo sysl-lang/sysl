@@ -31,7 +31,10 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
-#if defined(__aarch64__) || defined(__x86_64__)
+/* Only a hosted macOS or Linux build gets the switch. A freestanding build of the library still
+ * compiles every shim, and there the target may have no floating-point registers to save (aarch64
+ * with general registers only), so the file is empty rather than wrong. */
+#if (defined(__APPLE__) || defined(__linux__)) && (defined(__aarch64__) || defined(__x86_64__))
 
 #ifndef __has_feature
 #define __has_feature(x) 0
