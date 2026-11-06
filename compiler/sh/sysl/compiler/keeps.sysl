@@ -159,6 +159,9 @@ struct KeepsCx
     // The same, by struct or enum type (`type_show`): a type met along many paths is worked out once.
     type_depths: Map[string, int]
 
+    // Whether the question under way is asked about views (`ViewsQ`), which a view is an address to.
+    views: bool
+
     find(self, name: string) -> Option[TFunc] = self.index.get(name) match
         Some(i) -> Some(self.funcs[i])
         None -> None
@@ -181,7 +184,7 @@ check_keeps(a: &Analysis, funcs: Buf[TFunc], vtables: Buf[TVtable], vals: Buf[TV
     val cx: &KeepsCx = KeepsCx(a, funcs, index, map(), map(), map(), buf(), buf(), false, 0, map(),
                                map(), map(), map(), map(), map(), map(), vtables,
                                map(), buf(), map(), map(), map(), map(), buf(), false, map(), false, map(),
-                               0, false, buf(), map(), map(), map())
+                               0, false, buf(), map(), map(), map(), false)
 
     // Every method an `impl` of a trait brought, by the function it was lowered to, and every slot of
     // every table -- an instance of a generic one among them.
@@ -225,7 +228,7 @@ check_keeps(a: &Analysis, funcs: Buf[TFunc], vtables: Buf[TVtable], vals: Buf[TV
 
     // The answers a call may read through a place entry (`place_entry.sysl`), handed to the lowering.
     note_places(cx)
-    note_outliving(cx)
+    if outlive_auditing() then note_outliving(cx)
 
     // Each closure literal's capture mode is the same question asked about the literal
     // (`closure_mode.sysl`).
@@ -257,16 +260,43 @@ check_keeps(a: &Analysis, funcs: Buf[TFunc], vtables: Buf[TVtable], vals: Buf[TV
         a.fault(item.0, item.1, item.2)
 end check_keeps
 
-// The settled answers, handed to the promotion of frame storage (`escape.sysl`), which asks the same
-// question of a view and so reads this one answer rather than working out its own.
+// The outliving answers about views, set beside the promotion's own (`escape.sysl`) under
+// `SYSL_OUTLIVE_AUDIT=1`, which prints every parameter the two judge differently. The promotion does
+// not read them yet: the two disagree on a view put into a fresh heap object that is answered.
 private note_outliving(cx: &KeepsCx)
     var out: Set[string] = set()
 
     for f in cx.funcs
         for i in 0..<f.params.len()
-            if keeps_of(cx, f.name, i).kept then out.add(s"${f.name}|$i")
+            if carries_view(f.params[i].1) && outliving_of(cx, f.name, i).kept then out.add(s"${f.name}|$i")
 
     cx.an.outlive_kept = out
+
+    // Measures what answering a call through `&Fn` by its signature alone would refuse: each closure
+    // body that keeps a parameter its callable type does not mark, which today the closures made at
+    // the type answer for instead (`closure_kept`).
+    if outlive_auditing()
+        var bodies = 0
+        var params = 0
+
+        for f in cx.funcs
+            if is_closure_body(f)
+                bodies += 1
+                params += f.params.len() - 1
+
+        eprints(s"M15-COUNT closure bodies=$bodies parameters=$params\n")
+
+        for f in cx.funcs
+            if !is_closure_body(f) then continue
+
+            for i in 1..<f.params.len()
+                if closure_licensed(cx, f.name, i) then continue
+
+                val raw = holds_raw_pointer(f.params[i].1, 0)
+                val k = keeps_of(cx, f.name, i)
+
+                if k.kept then eprints(s"M15-AUDIT ${f.name}|$i raw=$raw ${type_show(f.params[i].1)} ${k.how}\n")
+    end if
 end note_outliving
 
 private note_addressed(cx: &KeepsCx, e: TExpr)
@@ -615,7 +645,8 @@ end note_callee
 
 // What a question is answered with before any round has worked it out: nothing kept, nothing an
 // answer is made of -- and everything overwritten, which is the one that narrows.
-private assumed_answer(key: string) -> KeptWhy = if key.starts_with("!") then clears_all() else not_kept()
+private assumed_answer(key: string) -> KeptWhy =
+    if key.starts_with(ClearsQ) || key.starts_with(ViewsQ + ClearsQ) then clears_all() else not_kept()
 
 // -- the summaries --------------------------------------------------------------------------------
 
@@ -635,6 +666,14 @@ private val DeepQ = "@"
 private val VesselQ = "$"
 private val WritesQ = "*"
 
+// **The mode every question above may be asked in about views** (`outliving_of`): the same walk, with
+// a view counted as an address (L6), which is what the promotion of frame storage asks
+// (`escape.sysl`). Filed apart, since its answers differ from the pointer-only ones the refusals read.
+private val ViewsQ = "V"
+
+// What a gathering about a body is filed under, in the mode under way: views counted or not.
+filed_as(cx: &KeepsCx, name: string) -> string = if cx.views then ViewsQ + name else name
+
 // **Whether `name` may store an address in what the pointer at `i` points at** -- `redirect(pp) = *pp =
 // &slot` -- which a caller handing `&p` must take to leave `p` pointing anywhere (`keeps_flow.sysl`'s
 // `repoint_exposed`). A store through the parameter, or through a pointer nobody can name, writes; so
@@ -644,6 +683,10 @@ writes_of(cx: &KeepsCx, name: string, i: usize) -> bool = summary(cx, name, i, W
 
 // Whether `name` keeps the argument at position `i`, why, and every location it may be held at.
 keeps_of(cx: &KeepsCx, name: string, i: usize) -> KeptWhy = summary(cx, name, i, KeepsQ)
+
+// **Whether `name` lets the argument at position `i` outlive the call, a view counted as an address**
+// (L3, L4, L6): the one outliving answer, which the promotion of frame storage reads (`escape.sysl`).
+outliving_of(cx: &KeepsCx, name: string, i: usize) -> KeptWhy = summary(cx, name, i, ViewsQ + KeepsQ)
 
 // Whether what `name` answers can be made of the argument at position `i`.
 answers_of(cx: &KeepsCx, name: string, i: usize) -> bool = summary(cx, name, i, AnswersQ).kept
@@ -871,7 +914,10 @@ private path_of(q: string) -> string
     q[at.unwrap() + 1..<q.bytes.len - 1]
 end path_of
 
-private summary(cx: &KeepsCx, name: string, i: usize, q: string) -> KeptWhy
+private summary(cx: &KeepsCx, name: string, i: usize, asked: string) -> KeptWhy
+    // Asked under a question about views, a question is about views too.
+    val q = if cx.views && !asked.starts_with(ViewsQ) then ViewsQ + asked else asked
+
     if cx.busy.len() > 0 then return answer(cx, name, i, q)
 
     val cuts = cx.cuts
@@ -926,13 +972,28 @@ private answer_from_the_top(cx: &KeepsCx, name: string, i: usize, q: string) -> 
         end if
 end answer_from_the_top
 
+// A question asked about views (`ViewsQ`) is walked with views counted as addresses, and so is every
+// question its walk asks in turn.
 private answer(cx: &KeepsCx, name: string, i: usize, q: string) -> KeptWhy
+    val viewing = q.starts_with(ViewsQ)
+    val was = cx.views
+
+    cx.views = viewing
+
+    val out = answer_as(cx, name, i, q, if viewing then q[ViewsQ.bytes.len..<q.bytes.len] else q)
+
+    cx.views = was
+    out
+end answer
+
+// `q` is the question as it is filed, with its mode; `bare` is what it asks.
+private answer_as(cx: &KeepsCx, name: string, i: usize, q: string, bare: string) -> KeptWhy
     val key = s"$q$name|$i"
-    val keeping = q == KeepsQ
-    val reading = q.starts_with(ReadQ)
-    val read_answering = q.starts_with(ReadAnswersQ)
-    val deep = q.starts_with(DeepQ)
-    val through = q == ThroughQ || q == ThroughAnswersQ || reading || read_answering || deep
+    val keeping = bare == KeepsQ
+    val reading = bare.starts_with(ReadQ)
+    val read_answering = bare.starts_with(ReadAnswersQ)
+    val deep = bare.starts_with(DeepQ)
+    val through = bare == ThroughQ || bare == ThroughAnswersQ || reading || read_answering || deep
 
     cx.settled.get(key) match
         Some(v) -> return v
@@ -955,10 +1016,10 @@ private answer(cx: &KeepsCx, name: string, i: usize, q: string) -> KeptWhy
     val found = cx.find(name)
 
     if found.is_none()
-        if keeping || q == ThroughQ || reading || deep then return extern_kept(cx, name, i)
-        if q == ClearsQ then return not_kept()
-        if q == WritesQ then return unseen_answer()
-        if q == BorrowQ then return KeptWhy(false, s"'$name' has no body in sight", span_zero(), buf())
+        if keeping || bare == ThroughQ || reading || deep then return extern_kept(cx, name, i)
+        if bare == ClearsQ then return not_kept()
+        if bare == WritesQ then return unseen_answer()
+        if bare == BorrowQ then return KeptWhy(false, s"'$name' has no body in sight", span_zero(), buf())
 
         val said = extern_answers(cx, name, i)
 
@@ -977,7 +1038,7 @@ private answer(cx: &KeepsCx, name: string, i: usize, q: string) -> KeptWhy
     // told, as they are around any call.
     if cx.mistaken.has(name) then return not_kept()
 
-    if q != ClearsQ && i >= f.params.len() then return not_kept()
+    if bare != ClearsQ && i >= f.params.len() then return not_kept()
 
     if keeping
         val lent = scope_held(f, i)
@@ -988,7 +1049,7 @@ private answer(cx: &KeepsCx, name: string, i: usize, q: string) -> KeptWhy
     if keeping && lent_by_rule(cx, f, i) then return not_kept()
     if through && !read_through(f.params[i].1, 0) then return not_kept()
 
-    if q == KeepsQ || q == ThroughQ || reading || deep
+    if bare == KeepsQ || bare == ThroughQ || reading || deep
         val crossed = crossing_kept(f, i)
 
         if crossed.is_some() then return crossed.unwrap()
@@ -1019,18 +1080,18 @@ private answer(cx: &KeepsCx, name: string, i: usize, q: string) -> KeptWhy
     cx.taint = false
 
     val walked = if keeping then walk_kept(cx, f, i)
-    else if q == ClearsQ then walk_clears(cx, f)
-    else if q == BorrowQ then walk_borrow(cx, f, i)
-    else if q == VesselQ then walk_vessel(cx, f, i)
-    else if q == WritesQ then walk_writes(cx, f, i)
-    else if q == ThroughQ then walk_through(cx, f, i)
-    else if deep then walk_deep(cx, f, i, path_of(q))
-    else if q == ThroughAnswersQ then walk_answers_through(cx, f, i)
-    else if reading then walk_track(read_track(cx, f, i, q), i)
-    else if read_answering then answered(track_as(cx, f, i, false, true, steps_of(q)), f)
-    else walk_answers(cx, f, i, q == RawAnswersQ)
+    else if bare == ClearsQ then walk_clears(cx, f)
+    else if bare == BorrowQ then walk_borrow(cx, f, i)
+    else if bare == VesselQ then walk_vessel(cx, f, i)
+    else if bare == WritesQ then walk_writes(cx, f, i)
+    else if bare == ThroughQ then walk_through(cx, f, i)
+    else if deep then walk_deep(cx, f, i, path_of(bare))
+    else if bare == ThroughAnswersQ then walk_answers_through(cx, f, i)
+    else if reading then walk_track(read_track(cx, f, i, bare), i)
+    else if read_answering then answered(track_as(cx, f, i, false, true, steps_of(bare)), f)
+    else walk_answers(cx, f, i, bare == RawAnswersQ)
 
-    val held_on = keeping || q == ThroughQ || q == VesselQ || reading || deep
+    val held_on = keeping || bare == ThroughQ || bare == VesselQ || reading || deep
     val out = if held_on && f.marks.is_async() then task_held(walked) else walked
 
     val leaned = cx.taint
@@ -1062,7 +1123,7 @@ private answer(cx: &KeepsCx, name: string, i: usize, q: string) -> KeptWhy
 
     cx.taint = outer || leaned
     out
-end answer
+end answer_as
 
 // A read of an answer still open, logged against every walk under way: what each one leaned on is
 // what the log gained while it ran.
@@ -1911,11 +1972,11 @@ end track_along
 // statement it is saying (`at`), and a walk of a recursive body asks its own questions in the
 // middle of one of its statements.
 private round_handles(cx: &KeepsCx, org: &Origins, f: TFunc) -> &Handles
-    cx.handles.get(f.name) match
+    cx.handles.get(filed_as(cx, f.name)) match
         Some(kept) ->
             if kept.1 then cx.taint = true
 
-            for key in cx.handle_deps.get(f.name).unwrap_or(buf())
+            for key in cx.handle_deps.get(filed_as(cx, f.name)).unwrap_or(buf())
                 leaned_on(cx, key)
 
             return handles_copy(kept.0)
@@ -1932,13 +1993,13 @@ private round_handles(cx: &KeepsCx, org: &Origins, f: TFunc) -> &Handles
     val leaned = cx.taint
 
     if cx.busy_reads == reads && cx.cuts == cuts
-        cx.handles.put(f.name, (handles_copy(hs), leaned))
+        cx.handles.put(filed_as(cx, f.name), (handles_copy(hs), leaned))
 
         val deps = logged_since(cx, logged)
 
         if !deps.is_empty()
-            cx.handle_deps.put(f.name, deps)
-            cx.leaning.push(f.name)
+            cx.handle_deps.put(filed_as(cx, f.name), deps)
+            cx.leaning.push(filed_as(cx, f.name))
         end if
     end if
 
@@ -3403,39 +3464,41 @@ may_hold_pointer(cx: &KeepsCx, t: Type) -> bool = t match
     Weak(inner) -> may_hold_pointer(cx, *inner)
     Volatile(inner) -> may_hold_pointer(cx, *inner)
     Array(_, elem) -> may_hold_pointer(cx, *elem)
-    Slice(elem, _) -> may_hold_pointer(cx, *elem)
+    Slice(elem, _) -> cx.views || may_hold_pointer(cx, *elem)
     Struct(d) -> aggregate_holds(cx, t, if d.targs.is_empty() then d.base else type_show(t))
     Enum(d) -> aggregate_holds(cx, t, if d.targs.is_empty() then d.base else type_show(t))
     _ -> false
 
 private aggregate_holds(cx: &KeepsCx, t: Type, key: string) -> bool
-    cx.pointerish.get(key) match
+    val filed = if cx.views then ViewsQ + key else key
+
+    cx.pointerish.get(filed) match
         Some(v) -> return v
         None -> ()
 
     var seen: Buf[string] = buf()
-    val out = holds_pointer_within(t, &seen)
+    val out = holds_pointer_within(t, &seen, cx.views) || (cx.views && carries_view(t))
 
-    cx.pointerish.put(key, out)
+    cx.pointerish.put(filed, out)
     out
 end aggregate_holds
 
 // The same, with the structs and enums already being asked about, which a type reaching itself
 // through a box answers nothing new for.
-private holds_pointer_within(t: Type, seen: *Buf[string]) -> bool = t match
+private holds_pointer_within(t: Type, seen: *Buf[string], views: bool) -> bool = t match
     Ptr(inner) -> !is_opaque_struct(*inner)
     Trait(_, _, _) -> true
-    Ref(inner, _) -> holds_pointer_within(*inner, seen)
-    Weak(inner) -> holds_pointer_within(*inner, seen)
-    Volatile(inner) -> holds_pointer_within(*inner, seen)
-    Array(_, elem) -> holds_pointer_within(*elem, seen)
-    Slice(elem, _) -> holds_pointer_within(*elem, seen)
+    Ref(inner, _) -> holds_pointer_within(*inner, seen, views)
+    Weak(inner) -> holds_pointer_within(*inner, seen, views)
+    Volatile(inner) -> holds_pointer_within(*inner, seen, views)
+    Array(_, elem) -> holds_pointer_within(*elem, seen, views)
+    Slice(elem, _) -> holds_pointer_within(*elem, seen, views)
     // **A closure literal with captures may hold the address of each `var` it captures** (`closure_mode.sysl`),
     // and whether it does is what this analysis is asked to decide -- so its value is followed
     // wherever it goes, whatever its fields say before the decision.
     Struct(d) -> (is_closure_literal(t) && !d.fields.is_empty()) ||
-        (first_visit(t, seen) && fields_hold_pointer(d.fields, seen))
-    Enum(d) -> first_visit(t, seen) && variants_hold_pointer(d.variants, seen)
+        (first_visit(t, seen) && fields_hold_pointer(d.fields, seen, views))
+    Enum(d) -> first_visit(t, seen) && variants_hold_pointer(d.variants, seen, views)
     _ -> false
 
 private is_opaque_struct(t: Type) -> bool = t match
@@ -3478,16 +3541,16 @@ private first_visit(t: Type, seen: *Buf[string]) -> bool
     true
 end first_visit
 
-private fields_hold_pointer(fields: Buf[(string, Type)], seen: *Buf[string]) -> bool
+private fields_hold_pointer(fields: Buf[(string, Type)], seen: *Buf[string], views: bool) -> bool
     for item in fields
-        if holds_pointer_within(item.1, seen) then return true
+        if holds_pointer_within(item.1, seen, views) then return true
 
     false
 end fields_hold_pointer
 
-private variants_hold_pointer(vs: Buf[EnumVariant], seen: *Buf[string]) -> bool
+private variants_hold_pointer(vs: Buf[EnumVariant], seen: *Buf[string], views: bool) -> bool
     for v in vs
-        if fields_hold_pointer(v.fields, seen) then return true
+        if fields_hold_pointer(v.fields, seen, views) then return true
 
     false
 end variants_hold_pointer
