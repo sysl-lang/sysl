@@ -1,23 +1,24 @@
 /* The machine half of `sysl.fiber`: a stack the library maps, and the switch from one stack to another.
  *
- * **The switch is a naked function in C rather than a block of sysl's module-level `asm`**, for three
- * reasons this file has and the sysl beside it does not: the C compiler spells the symbol for the
- * object format (Mach-O's leading underscore, ELF's `.type`/`.size`) and emits its unwind entry, which
- * a top-level block would need a copy of per operating system; the same file needs AddressSanitizer's
- * fiber hooks, which only `__has_feature(address_sanitizer)` can switch on; and mapping, guarding and
- * `mincore` are POSIX calls already written in C here, as `stackguard.c` writes its own.
+ * **A direct call of `sysl.fiber.switch` is the compiler's**: it emits the switch inline, between
+ * calls of `sysl_fiber_leaving` and `sysl_fiber_back` here, as one block of assembly that declares
+ * every register but the stack, frame and base pointers clobbered -- so the code around it keeps
+ * only what is live across it, and keeps it where the optimizer chose -- and it re-derives every
+ * thread-local address after it, since the switch may come back on another thread. The copy in this
+ * file is the same instructions, for a call through a function pointer.
  *
- * **A context is one saved stack pointer.** Everything a callee-saved convention promises survives a
- * call is pushed onto the stack being left, and the pointer to it is the context: the switch is a
- * call that returns on another stack. What is saved:
+ * **A context is where to resume**, written into the context being left: the stack pointer, the
+ * instruction after the switch, the frame and base pointers, and the floating-point control:
  *
- * | machine | integer | floating point | control |
- * |---|---|---|---|
- * | aarch64 | x19--x28, x29 (frame), x30 (return) | d8--d15 | FPCR |
- * | x86_64 | rbx, rbp, r12--r15 (and the return address) | -- (System V saves none) | MXCSR, x87 control word |
+ * | machine | pointers | control |
+ * |---|---|---|
+ * | aarch64 | sp, pc, x29 (frame), x19 (base) | FPCR |
+ * | x86_64 | rsp, rip, rbp (frame), rbx (base) | MXCSR, x87 control word |
  *
  * No system call and no signal mask, which is what makes it some nanoseconds rather than
- * `swapcontext`'s microsecond.
+ * `swapcontext`'s microsecond. Mapping, guarding and `mincore` are POSIX calls written in C here,
+ * as `stackguard.c` writes its own; AddressSanitizer's fiber hooks are switched on by
+ * `__has_feature(address_sanitizer)`, which only C can ask.
  */
 
 #define _GNU_SOURCE
@@ -55,12 +56,22 @@
 #define SYSL_SYM(name) #name
 #endif
 
-/* `sysl.fiber.Context`, laid out the same. `lo` and `len` are the stack's bounds, which only
- * AddressSanitizer reads; a context for a thread's own stack learns them the first time it is left. */
+/* `sysl.fiber.Context`, laid out the same, and the layout the compiler's own switch writes and reads
+ * at the offsets it names (`fiber_switch.sysl` in the compiler): where to resume -- the stack
+ * pointer, the instruction, the frame pointer and the base pointer (x29 and x19, or rbp and rbx,
+ * which the code around a switch may have reserved and so cannot hand over as clobbered) -- and the
+ * floating-point control word. `lo` and `len` are the stack's bounds and `fake` AddressSanitizer's
+ * saved fake stack, which only AddressSanitizer reads; a context for a thread's own stack learns its
+ * bounds the first time it is left. */
 typedef struct sysl_fiber_context {
   void *sp;
+  void *pc;
+  void *fp;
+  void *bp;
+  uint64_t ctl;
   void *lo;
   size_t len;
+  void *fake;
 } sysl_fiber_context;
 
 /* The guard registry and the per-thread signal stack are `stackguard.c`'s. */
@@ -176,63 +187,73 @@ __attribute__((noinline)) static sysl_fiber_context **sysl_fiber_from_slot(void)
   return &sysl_fiber_from;
 }
 
-__attribute__((used)) static void sysl_fiber_first_entered(void) {
-  sysl_fiber_context *from = *sysl_fiber_from_slot();
+/* What AddressSanitizer is told on arriving: the fake stack the arriving side saved when it left
+ * (none for a fiber's first arrival), and, in return, the bounds of the stack just left, which the
+ * context that was left keeps for the next switch to it. */
+static void sysl_fiber_arrived(void *fake) {
+  sysl_fiber_context *left = *sysl_fiber_from_slot();
   const void *lo = 0;
   size_t len = 0;
 
-  __sanitizer_finish_switch_fiber(0, &lo, &len);
-  if (from) {
-    from->lo = (void *)lo;
-    from->len = len;
+  __sanitizer_finish_switch_fiber(fake, &lo, &len);
+  if (left) {
+    left->lo = (void *)lo;
+    left->len = len;
   }
 }
+
+__attribute__((used)) static void sysl_fiber_first_entered(void) { sysl_fiber_arrived(0); }
 #endif
 
 #if defined(__aarch64__)
 
-/* `sysl_fiber_swap(&from->sp, &to->sp)`: 176 bytes pushed, the pointer to them saved, the other
- * stack's taken, and the same 176 popped from it. */
-__attribute__((naked)) static void sysl_fiber_swap(void **from, void **to) {
-  __asm__ volatile(
-      "sub sp, sp, #176\n"
-      "stp x19, x20, [sp, #0]\n"
-      "stp x21, x22, [sp, #16]\n"
-      "stp x23, x24, [sp, #32]\n"
-      "stp x25, x26, [sp, #48]\n"
-      "stp x27, x28, [sp, #64]\n"
-      "stp x29, x30, [sp, #80]\n"
-      "stp d8, d9, [sp, #96]\n"
-      "stp d10, d11, [sp, #112]\n"
-      "stp d12, d13, [sp, #128]\n"
-      "stp d14, d15, [sp, #144]\n"
-      "mrs x9, fpcr\n"
-      "str x9, [sp, #160]\n"
-      "mov x9, sp\n"
-      "str x9, [x0]\n"
-      "ldr x9, [x1]\n"
-      "mov sp, x9\n"
-      "ldr x9, [sp, #160]\n"
-      "mrs x10, fpcr\n"
-      "cmp x9, x10\n"
-      "b.eq 1f\n"
-      "msr fpcr, x9\n"
-      "1:\n"
-      "ldp x19, x20, [sp, #0]\n"
-      "ldp x21, x22, [sp, #16]\n"
-      "ldp x23, x24, [sp, #32]\n"
-      "ldp x25, x26, [sp, #48]\n"
-      "ldp x27, x28, [sp, #64]\n"
-      "ldp x29, x30, [sp, #80]\n"
-      "ldp d8, d9, [sp, #96]\n"
-      "ldp d10, d11, [sp, #112]\n"
-      "ldp d12, d13, [sp, #128]\n"
-      "ldp d14, d15, [sp, #144]\n"
-      "add sp, sp, #176\n"
-      "ret\n");
+/* The switch itself, `from` in x0 and `to` in x1: where this side resumes is written into `from`,
+ * and `to`'s is taken up -- its stack, frame and base pointers, its rounding mode (written only where
+ * it differs, since `msr fpcr` is slow on some cores) -- and jumped to. Every other register is
+ * declared clobbered rather than saved, so the code around a switch keeps only what is live across
+ * it. The compiler emits the same instructions where a program calls `sysl.fiber.switch`; this copy
+ * is the one a call through a function pointer reaches. */
+#define SYSL_FIBER_SWITCH                                                                          \
+  "mov x9, sp\n"                                                                                   \
+  "adr x10, 1f\n"                                                                                  \
+  "mrs x11, fpcr\n"                                                                                \
+  "stp x9, x10, [x0]\n"                                                                            \
+  "stp x29, x19, [x0, #16]\n"                                                                      \
+  "str x11, [x0, #32]\n"                                                                           \
+  "ldp x9, x10, [x1]\n"                                                                            \
+  "ldp x29, x19, [x1, #16]\n"                                                                      \
+  "ldr x11, [x1, #32]\n"                                                                           \
+  "mov sp, x9\n"                                                                                   \
+  "mrs x12, fpcr\n"                                                                                \
+  "cmp x11, x12\n"                                                                                 \
+  "b.eq 2f\n"                                                                                      \
+  "msr fpcr, x11\n"                                                                                \
+  "2:\n"                                                                                           \
+  "br x10\n"                                                                                       \
+  "1:\n"
+
+/* x18 is the platform's on Apple systems and Android, and a scratch register on Linux. */
+#if defined(__APPLE__) || defined(__ANDROID__)
+#define SYSL_FIBER_X18
+#else
+#define SYSL_FIBER_X18 "x18",
+#endif
+
+#define SYSL_FIBER_CLOBBERS                                                                        \
+  "x2", "x3", "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16",  \
+      "x17", SYSL_FIBER_X18 "x20", "x21", "x22", "x23", "x24", "x25", "x26", "x27", "x28", "x30",  \
+      "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13", "v14",  \
+      "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27",     \
+      "v28", "v29", "v30", "v31", "cc", "memory"
+
+static inline void sysl_fiber_swap(sysl_fiber_context *from, sysl_fiber_context *to) {
+  register sysl_fiber_context *x0 __asm__("x0") = from;
+  register sysl_fiber_context *x1 __asm__("x1") = to;
+
+  __asm__ volatile(SYSL_FIBER_SWITCH : "+r"(x0), "+r"(x1) : : SYSL_FIBER_CLOBBERS);
 }
 
-/* Where a new fiber's first switch returns to: the entry in x19, its argument in x20, and a zero
+/* Where a new fiber's first switch lands: its entry and argument on top of its stack, and a zero
  * frame pointer in x29, so the frame chain a debugger or a sampler walks ends here. The return
  * address is marked undefined for an unwinder that reads the tables instead. */
 __attribute__((naked, used)) static void sysl_fiber_boot(void) {
@@ -241,6 +262,7 @@ __attribute__((naked, used)) static void sysl_fiber_boot(void) {
 #if SYSL_FIBER_ASAN
       "bl " SYSL_SYM(sysl_fiber_first_entered) "\n"
 #endif
+      "ldp x19, x20, [sp], #16\n"
       "mov x0, x20\n"
       "blr x19\n"
       "bl " SYSL_SYM(sysl_fiber_returned) "\n"
@@ -249,58 +271,69 @@ __attribute__((naked, used)) static void sysl_fiber_boot(void) {
 
 void sysl_fiber_start(sysl_fiber_context *c, char *top, char *lo, size_t len, void (*entry)(void *),
                       void *arg) {
-  uint64_t *f = (uint64_t *)(top - 176);
+  uint64_t *f = (uint64_t *)(top - 16);
   uint64_t fpcr;
 
-  memset(f, 0, 176);
-  f[0] = (uint64_t)entry;      /* x19 */
-  f[1] = (uint64_t)arg;        /* x20 */
-  f[10] = 0;                   /* x29: the end of the frame chain */
-  f[11] = (uint64_t)&sysl_fiber_boot; /* x30 */
+  f[0] = (uint64_t)entry;
+  f[1] = (uint64_t)arg;
   __asm__ volatile("mrs %0, fpcr" : "=r"(fpcr));
-  f[20] = fpcr;
   c->sp = f;
+  c->pc = (void *)&sysl_fiber_boot;
+  c->fp = 0; /* the end of the frame chain */
+  c->bp = 0;
+  c->ctl = fpcr;
   c->lo = lo;
   c->len = len;
+  c->fake = 0;
 }
 
 #else /* x86_64 */
 
-/* `sysl_fiber_swap(&from->sp, &to->sp)`: six registers and the two control words pushed, the pointer
- * saved, the other stack's taken, and the same popped from it. */
-__attribute__((naked)) static void sysl_fiber_swap(void **from, void **to) {
-  __asm__ volatile(
-      "pushq %rbp\n"
-      "pushq %rbx\n"
-      "pushq %r12\n"
-      "pushq %r13\n"
-      "pushq %r14\n"
-      "pushq %r15\n"
-      "subq $8, %rsp\n"
-      "stmxcsr (%rsp)\n"
-      "fnstcw 4(%rsp)\n"
-      "movq %rsp, (%rdi)\n"
-      "movq (%rsi), %rsp\n"
-      "ldmxcsr (%rsp)\n"
-      "fldcw 4(%rsp)\n"
-      "addq $8, %rsp\n"
-      "popq %r15\n"
-      "popq %r14\n"
-      "popq %r13\n"
-      "popq %r12\n"
-      "popq %rbx\n"
-      "popq %rbp\n"
-      "retq\n");
+/* The switch itself, `from` in rdi and `to` in rsi, as aarch64's is: the resume point written into
+ * `from` -- stack, instruction, rbp and rbx, MXCSR and the x87 control word -- and `to`'s taken up
+ * and jumped to, with every other register declared clobbered. Nothing is pushed, so the red zone
+ * below the stack pointer is never written. */
+#define SYSL_FIBER_SWITCH                                                                          \
+  "leaq 1f(%%rip), %%rax\n"                                                                        \
+  "movq %%rsp, (%%rdi)\n"                                                                          \
+  "movq %%rax, 8(%%rdi)\n"                                                                         \
+  "movq %%rbp, 16(%%rdi)\n"                                                                        \
+  "movq %%rbx, 24(%%rdi)\n"                                                                        \
+  "stmxcsr 32(%%rdi)\n"                                                                            \
+  "fnstcw 36(%%rdi)\n"                                                                             \
+  "movq (%%rsi), %%rsp\n"                                                                          \
+  "movq 16(%%rsi), %%rbp\n"                                                                        \
+  "movq 24(%%rsi), %%rbx\n"                                                                        \
+  "ldmxcsr 32(%%rsi)\n"                                                                            \
+  "fldcw 36(%%rsi)\n"                                                                              \
+  "jmpq *8(%%rsi)\n"                                                                               \
+  "1:\n"
+
+#define SYSL_FIBER_CLOBBERS                                                                        \
+  "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15", "xmm0", "xmm1",       \
+      "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7", "xmm8", "xmm9", "xmm10", "xmm11", "xmm12",      \
+      "xmm13", "xmm14", "xmm15", "xmm16", "xmm17", "xmm18", "xmm19", "xmm20", "xmm21", "xmm22",      \
+      "xmm23", "xmm24", "xmm25", "xmm26", "xmm27", "xmm28", "xmm29", "xmm30", "xmm31", "k0", "k1",   \
+      "k2", "k3", "k4", "k5", "k6", "k7", "st", "st(1)", "st(2)", "st(3)", "st(4)", "st(5)",         \
+      "st(6)", "st(7)", "fpsr", "dirflag", "cc", "memory"
+
+static inline void sysl_fiber_swap(sysl_fiber_context *from, sysl_fiber_context *to) {
+  sysl_fiber_context *rdi = from;
+  sysl_fiber_context *rsi = to;
+
+  __asm__ volatile(SYSL_FIBER_SWITCH : "+D"(rdi), "+S"(rsi) : : SYSL_FIBER_CLOBBERS);
 }
 
-/* Where a new fiber's first switch returns to: the entry in r12, its argument in r13, rbp zero so
- * the frame chain ends here, and the stack 16-byte aligned at the call. */
+/* Where a new fiber's first switch lands: its entry and argument on top of its stack, rbp zero so the
+ * frame chain ends here, and the stack 16-byte aligned at each call. */
 __attribute__((naked, used)) static void sysl_fiber_boot(void) {
   __asm__ volatile(
       ".cfi_undefined %rip\n"
 #if SYSL_FIBER_ASAN
       "call " SYSL_SYM(sysl_fiber_first_entered) "\n"
 #endif
+      "popq %r12\n"
+      "popq %r13\n"
       "movq %r13, %rdi\n"
       "callq *%r12\n"
       "call " SYSL_SYM(sysl_fiber_returned) "\n"
@@ -309,60 +342,60 @@ __attribute__((naked, used)) static void sysl_fiber_boot(void) {
 
 void sysl_fiber_start(sysl_fiber_context *c, char *top, char *lo, size_t len, void (*entry)(void *),
                       void *arg) {
-  /* From low to high: the control words, r15, r14, r13, r12, rbx, rbp, and the return address, which
-   * sits just below `top` so the boot code starts with the stack 16-byte aligned. */
-  uint64_t *f = (uint64_t *)(top - 64);
+  uint64_t *f = (uint64_t *)(top - 16);
   uint32_t mxcsr;
   uint16_t cw;
 
-  memset(f, 0, 64);
+  f[0] = (uint64_t)entry;
+  f[1] = (uint64_t)arg;
   __asm__ volatile("stmxcsr %0" : "=m"(mxcsr));
   __asm__ volatile("fnstcw %0" : "=m"(cw));
-  f[0] = (uint64_t)mxcsr | ((uint64_t)cw << 32);
-  f[3] = (uint64_t)arg;   /* r13 */
-  f[4] = (uint64_t)entry; /* r12 */
-  f[6] = 0;               /* rbp: the end of the frame chain */
-  f[7] = (uint64_t)&sysl_fiber_boot;
   c->sp = f;
+  c->pc = (void *)&sysl_fiber_boot;
+  c->fp = 0; /* the end of the frame chain */
+  c->bp = 0;
+  c->ctl = (uint64_t)mxcsr | ((uint64_t)cw << 32);
   c->lo = lo;
   c->len = len;
+  c->fake = 0;
 }
 
 #endif
 
-/* The switch a program calls. Its first switch on a thread gives that thread a signal stack, so an
- * overflow on any fiber it runs is reported rather than silent. */
+/* What every switch does before it leaves, the compiler's inline one included: the first switch on a
+ * thread gives that thread a signal stack, so an overflow on any fiber it runs is reported rather than
+ * silent; and AddressSanitizer is told which stack is about to run. */
 static _Thread_local int sysl_fiber_carrier_ready;
 
-void sysl_fiber_switch(sysl_fiber_context *from, sysl_fiber_context *to) {
+void sysl_fiber_leaving(sysl_fiber_context *from, sysl_fiber_context *to) {
   if (!sysl_fiber_carrier_ready) {
     sysl_stack_guard_thread();
     sysl_fiber_carrier_ready = 1;
   }
 
 #if SYSL_FIBER_ASAN
-  {
-    void *fake = 0;
-    const void *lo = 0;
-    size_t len = 0;
-
-    *sysl_fiber_from_slot() = from;
-    __sanitizer_start_switch_fiber(&fake, to->lo, to->len);
-    sysl_fiber_swap(&from->sp, &to->sp);
-    __sanitizer_finish_switch_fiber(fake, &lo, &len);
-
-    {
-      sysl_fiber_context *left = *sysl_fiber_from_slot();
-
-      if (left) {
-        left->lo = (void *)lo;
-        left->len = len;
-      }
-    }
-  }
+  *sysl_fiber_from_slot() = from;
+  __sanitizer_start_switch_fiber(&from->fake, to->lo, to->len);
 #else
-  sysl_fiber_swap(&from->sp, &to->sp);
+  (void)from;
+  (void)to;
 #endif
+}
+
+/* What every switch does once it is back, on whichever thread resumed it. */
+void sysl_fiber_back(sysl_fiber_context *from) {
+#if SYSL_FIBER_ASAN
+  sysl_fiber_arrived(from->fake);
+#else
+  (void)from;
+#endif
+}
+
+/* The switch a call through a function pointer reaches; a direct call is the compiler's inline copy. */
+void sysl_fiber_switch(sysl_fiber_context *from, sysl_fiber_context *to) {
+  sysl_fiber_leaving(from, to);
+  sysl_fiber_swap(from, to);
+  sysl_fiber_back(from);
 }
 
 #endif

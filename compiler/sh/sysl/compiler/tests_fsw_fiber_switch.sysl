@@ -1,0 +1,516 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// `sysl.fiber.switch`, which the compiler emits in place (`fiber_switch.sysl`). What the switch does
+// at run time on this machine is `library/sysl/fiber/tests.sysl`'s; this file holds what the claims
+// are about: the emitted text, what clang's `-O2` leaves of it, and programs run at `-O2`, where the
+// optimizer has the freedom to keep a thread-local's address across a switch.
+//
+// The axes: the machine (aarch64 on macOS, Linux and Android, x86_64 on macOS and Linux, a POSIX
+// machine with no switch, a freestanding one); a program that switches against one that imports the
+// module and never does; the thread-local read directly, through an inlined helper, in a loop
+// around the switch, and written; and the registers live across a switch, integer and float. Not
+// here: codegen units above one (the accessor is a small private function, which a partition copies
+// as it copies every other helper), and AddressSanitizer (the C half's hooks, run by the library's
+// suite under `SYSL_EXTRA_CFLAGS`).
+
+private var fsw_library_names: Buf[string] = buf()
+private var fsw_library_units: Buf[Buf[Program]] = buf()
+
+private fsw_library(t: Target) -> Buf[Program]
+    for i in 0..<fsw_library_names.len()
+        if fsw_library_names[i] == t.name then return fsw_library_units[i]
+
+    var out: Buf[Program] = buf()
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, t) match
+            Err(_) -> ()
+            Ok(units) -> out = units
+
+    fsw_library_names.push(t.name)
+    fsw_library_units.push(out)
+    out
+end fsw_library
+
+private fsw_ready() -> bool
+    if std_root().is_err() || !clang_available()
+        print("skipped: the standard module's source or clang is not on this machine")
+        return false
+
+    true
+end fsw_ready
+
+// The LLVM text a program lowers to on `machine`.
+private fsw_ir(text: string, machine: string) -> string
+    val t = target_named(machine).unwrap()
+    var units: Buf[Program] = buf()
+
+    for item in fsw_library(t)
+        units.push(item)
+
+    val parsed = parse(source_of("main.sysl", text), t)
+
+    if !parsed.ok() then assert(false, parsed.first().message)
+
+    units.push(parsed.program)
+
+    val done = analyze_bodies(units, t)
+
+    assert(done.reported.is_empty(), s"refused on $machine")
+
+    val whole = program_of(done, "")
+    val promotions = post_analysis_checks(done.an, whole, buf())
+
+    assert(errors_of(done.an.diagnostics()).is_empty(), s"refused on $machine")
+    ir_print_module(codegen_with_gaps(prune(strip_tests(whole), program_own(units)), t, promotions).0)
+end fsw_ir
+
+// What clang does with the text for the machine's triple: `-O2` to IR, or to an object, answering
+// clang's output or its refusal.
+private fsw_clang(ir: string, machine: string, args: []string) -> string
+    val dir = make_temp_dir("sysl-fsw").unwrap()
+    val file = s"$dir/t.ll"
+
+    write_text(file, ir).unwrap()
+
+    var all: Buf[string] = buf()
+
+    all.push("--target=" + target_named(machine).unwrap().triple)
+
+    for a in args
+        all.push(a)
+
+    all.push(file)
+
+    val got = capture("clang", all.view(), "", [], true).unwrap()
+
+    remove_dir_all(dir).unwrap_or(())
+    assert(got.status.ok(), s"clang refused the emitted IR for $machine:\n${got.err.unwrap_or("")}")
+    got.text
+end fsw_clang
+
+// The lines of the first definition whose `define` line names `name`.
+private fsw_body(out: string, name: string) -> string
+    var body = ""
+    var inside = false
+
+    for l in lines_of(out)
+        if !inside && l.starts_with("define") && l.contains(name) then inside = true
+
+        if inside
+            if l == "}" then return body
+
+            body = body + l + "\n"
+        end if
+
+    body
+end fsw_body
+
+private fsw_count(text: string, what: string) -> int
+    var n = 0
+
+    for l in lines_of(text)
+        if l.contains(what) then n += 1
+
+    n
+end fsw_count
+
+private fsw_has(text: string, part: string) = assert(text.contains(part), s"expected '$part' in:\n$text")
+private fsw_lacks(text: string, part: string) = assert(!text.contains(part), s"did not expect '$part' in:\n$text")
+
+// The switch's own line of the emitted text.
+private fsw_asm_line(ir: string) -> string
+    for l in lines_of(ir)
+        if l.contains("asm sideeffect") && l.contains("1:") then return l
+
+    ""
+end fsw_asm_line
+
+// A fiber that reads a thread-local directly, through an inlined helper, and in a loop around the
+// switch -- and writes it -- resumed on a different carrier each round.
+private val fsw_hop: string = raw"""
+    import sysl.fiber.{Context, Stack, switch}
+    import sysl.threads.{ScopeSlot, scope_in}
+
+    @thread_local
+    var tag: int = 0
+
+    @inline
+    tag_inline() -> int = tag
+
+    struct Hop
+        back: Context
+        me: Context
+        direct: [3]int
+        inlined: [3]int
+        next: int
+
+    hop(h: *Hop)
+        for i in 0..<3
+            h.direct[i] = tag
+            h.inlined[i] = tag_inline()
+            tag += 10
+            switch(&h.me, &h.back)
+
+        loop
+            switch(&h.me, &h.back)
+
+    on_carrier(h: *Hop)
+        tag = h.next
+        switch(&h.back, &h.me)
+        assert(tag == h.next + 10)
+
+    main()
+        tag = 1
+
+        val s = Stack.reserve(64 * 1024).unwrap()
+        var h = Hop(Context.new(), Context.new(), [0; 3], [0; 3], 1)
+
+        h.me = Context.start(s, &hop, &h)
+        switch(&h.back, &h.me)
+        assert(tag == 11)
+
+        val ph = &h
+
+        for k in 2..<4
+            h.next = k
+
+            var slots: [1]ScopeSlot = [ScopeSlot.new(); 1]
+
+            scope_in(slots[..], (sc) -> sc.start(&on_carrier, ph))
+
+        assert(tag == 11)
+
+        for i in 0..<3
+            assert(h.direct[i] == i + 1)
+            assert(h.inlined[i] == i + 1)
+    """
+
+// Many integers and floats live across a switch, on both sides of it.
+private val fsw_regs: string = raw"""
+    import sysl.fiber.{Context, Stack, switch}
+    import sysl.hint.black_box
+
+    struct Pair
+        home: Context
+        me: Context
+        sum: i64
+        fsum: f64
+
+    churn(p: *Pair)
+        loop
+            val a = black_box(p.sum)
+            var xs: [12]i64 = [0; 12]
+            var fs: [12]f64 = [0.0; 12]
+
+            for i in 0..<12
+                xs[i] = black_box(a + i64(i) * 7919)
+                fs[i] = black_box(f64(i) * 2.5 + 1.0)
+
+            switch(&p.me, &p.home)
+
+            var t: i64 = 0
+            var u = 0.0
+
+            for i in 0..<12
+                t += xs[i]
+                u += fs[i]
+
+            p.sum = black_box(t)
+            p.fsum = black_box(u)
+
+    main()
+        val s = Stack.reserve(64 * 1024).unwrap()
+        var p = Pair(Context.new(), Context.new(), 3, 0.0)
+
+        p.me = Context.start(s, &churn, &p)
+
+        val a0 = black_box(101i64)
+        val a1 = black_box(202i64)
+        val a2 = black_box(303i64)
+        val a3 = black_box(404i64)
+        val a4 = black_box(505i64)
+        val a5 = black_box(606i64)
+        val a6 = black_box(707i64)
+        val a7 = black_box(808i64)
+        val a8 = black_box(909i64)
+        val a9 = black_box(1010i64)
+        val f0 = black_box(0.5)
+        val f1 = black_box(1.5)
+        val f2 = black_box(2.5)
+        val f3 = black_box(3.5)
+        val f4 = black_box(4.5)
+        val f5 = black_box(5.5)
+        val f6 = black_box(6.5)
+        val f7 = black_box(7.5)
+        val f8 = black_box(8.5)
+        val f9 = black_box(9.5)
+
+        switch(&p.home, &p.me)
+        switch(&p.home, &p.me)
+        switch(&p.home, &p.me)
+
+        assert(a0 + a1 + a2 + a3 + a4 + a5 + a6 + a7 + a8 + a9 == 5555)
+        assert(f0 + f1 + f2 + f3 + f4 + f5 + f6 + f7 + f8 + f9 == 50.0)
+        assert(a0 * a9 - a1 * a8 + a2 * a7 - a3 * a6 + a4 * a5 == 101 * 1010 - 202 * 909 + 303 * 808 - 404 * 707 + 505 * 606)
+        assert(f0 * f9 + f1 * f8 + f2 * f7 + f3 * f6 + f4 * f5 == 0.5 * 9.5 + 1.5 * 8.5 + 2.5 * 7.5 + 3.5 * 6.5 + 4.5 * 5.5)
+        assert(p.fsum == 177.0)
+        assert(p.sum == 6794934)
+    """
+
+// A program that imports the module and never switches.
+private val fsw_no_switch: string = raw"""
+    import sysl.fiber.Stack
+
+    @thread_local
+    var tag: int = 0
+
+    main()
+        tag = 4
+
+        val s = Stack.reserve(4096).unwrap()
+
+        assert(s.len() >= 4096 && tag == 4)
+    """
+
+// A program run at `-O2` ends normally.
+private fsw_runs_at_o2(text: string) -> int
+    val root = runner_project("main.sysl", text)
+    val cache = make_temp_dir("sysl-fsw-cache").unwrap()
+
+    use_run_cache_dir(Some(cache))
+
+    var said: Buf[string] = buf()
+    val sink = &said
+    val code = run_cli(["sysl", "run", s"$root/main.sysl", "-O2"], piece -> sink.push(piece))
+
+    use_run_cache_dir(None)
+    remove_dir_all(root).unwrap_or(())
+    remove_dir_all(cache).unwrap_or(())
+
+    if code != 0
+        for piece in said
+            eprints(piece)
+
+    code
+end fsw_runs_at_o2
+
+// -- the emitted switch, per machine -------------------------------------------------------------------
+
+@test("aarch64 on macOS: the switch is in place, clobbering everything but sp, x29, x19 and x18")
+fsw_aarch64_macos()
+    if !fsw_ready() then return
+
+    val ir = fsw_ir(fsw_hop, "aarch64-macos")
+    val line = fsw_asm_line(ir)
+
+    fsw_has(line, "={x0},={x1},0,1,~{x2},")
+    fsw_has(line, "~{x17},~{x20},")
+    fsw_has(line, "~{x28},~{lr},~{v0},")
+    fsw_has(line, "~{v31},~{cc},~{memory}")
+    fsw_lacks(line, "~{x18}")
+    fsw_lacks(line, "~{x19}")
+    fsw_lacks(line, "~{x29}")
+    fsw_has(line, "stp x29, x19, [x0, #16]")
+    fsw_has(ir, "call void @sysl_fiber_leaving(")
+    fsw_has(ir, "call void @sysl_fiber_back(")
+    // The library's definition, which reaches the C half's copy, is called by nothing here.
+    val hop = fsw_body(ir, "@hop$$sysl(")
+
+    fsw_has(hop, "call void @sysl_fiber_leaving(")
+    fsw_lacks(hop, "@sysl_fiber_switch(")
+    fsw_lacks(ir, "call void @sysl.fiber$switch(")
+
+    // The program's thread-local and the error return trace's count are both asked of accessors.
+    fsw_has(ir, "call ptr @sysl.tls.tag()")
+    fsw_has(ir, "call ptr @sysl.tls.sysl_error_trace_live()")
+
+    // The C half's copy and the inline one land on the same context, so they must agree on it:
+    // the object has to assemble.
+    fsw_clang(ir, "aarch64-macos", ["-O2", "-c", "-o", "/dev/null"])
+end fsw_aarch64_macos
+
+@test("aarch64 on Linux clobbers x18, which is a scratch register there; Android reserves it")
+fsw_aarch64_linux_and_android()
+    if !fsw_ready() then return
+
+    val linux = fsw_asm_line(fsw_ir(fsw_hop, "aarch64-linux"))
+
+    fsw_has(linux, "~{x17},~{x18},~{x20},")
+    fsw_clang(fsw_ir(fsw_hop, "aarch64-linux"), "aarch64-linux", ["-O2", "-c", "-o", "/dev/null"])
+
+    val android = fsw_asm_line(fsw_ir(fsw_hop, "aarch64-android"))
+
+    fsw_has(android, "~{x17},~{x20},")
+    fsw_lacks(android, "~{x18}")
+end fsw_aarch64_linux_and_android
+
+@test("x86_64: rbx and rbp are carried, everything else clobbered, on Linux and macOS")
+fsw_x86_64()
+    if !fsw_ready() then return
+
+    for machine in ["x86_64-linux", "x86_64-macos"]
+        val ir = fsw_ir(fsw_hop, machine)
+        val line = fsw_asm_line(ir)
+
+        fsw_has(line, "={di},={si},0,1,~{rax},~{rcx},~{rdx},~{r8},")
+        fsw_has(line, "~{r15},~{xmm0},")
+        fsw_has(line, "~{xmm31},~{k0},")
+        fsw_has(line, "~{st},~{st(1)},")
+        fsw_has(line, "~{st(7)},~{fpsr},~{dirflag},~{flags},~{cc},~{memory}")
+        fsw_lacks(line, "~{rbx}")
+        fsw_lacks(line, "~{rbp}")
+        fsw_has(line, "movq %rbx, 24(%rdi)")
+        fsw_has(line, "jmpq *8(%rsi)")
+        fsw_clang(ir, machine, ["-O2", "-c", "-o", "/dev/null"])
+end fsw_x86_64
+
+@test("a POSIX machine with no switch of its own calls the library's, and keeps its thread-locals plain")
+fsw_other_machine_calls()
+    if !fsw_ready() then return
+
+    val ir = fsw_ir(fsw_hop, "riscv64-linux")
+
+    fsw_lacks(ir, "@sysl_fiber_leaving")
+    fsw_lacks(ir, "sysl.tls.")
+    fsw_has(ir, "call void @sysl.fiber$switch(")
+end fsw_other_machine_calls
+
+@test("a program that never switches keeps its thread-locals plain")
+fsw_no_switch_no_accessor()
+    if !fsw_ready() then return
+
+    val ir = fsw_ir(fsw_no_switch, "aarch64-macos")
+
+    fsw_lacks(ir, "sysl.tls.")
+    fsw_lacks(ir, "@sysl_fiber_leaving")
+    fsw_has(ir, "store i32 4, ptr @tag")
+end fsw_no_switch_no_accessor
+
+// -- what clang's -O2 leaves -------------------------------------------------------------------------
+
+@test("at -O2 every switch is followed by a fresh ask for the thread-local, in the loop and inlined")
+fsw_optimized_asks_again()
+    if !fsw_ready() then return
+
+    val ir = fsw_ir(fsw_hop, "aarch64-macos")
+    val accessor = fsw_body(ir, "@sysl.tls.tag(")
+
+    fsw_has(accessor, "noinline nounwind memory(inaccessiblemem: read)")
+
+    val out = fsw_clang(ir, "aarch64-macos", ["-O2", "-S", "-emit-llvm", "-o", "-"])
+
+    // The accessor stayed out of line and its declaration was not narrowed to reading nothing.
+    fsw_has(out, "@sysl.tls.tag()")
+    fsw_lacks(fsw_body(out, "@sysl.tls.tag("), "memory(none)")
+
+    // clang unrolls the fiber's three rounds. Each round's direct read, inlined read and write share
+    // ONE ask -- nothing between them can move the thread, and merging them shows the optimizer was
+    // free to merge -- and the switch ending the round makes the next round ask again: one ask
+    // before each of the three switches, none merged across one.
+    val hop = fsw_body(out, "@\"hop$")
+    var asks = 0
+    var rounds: Buf[int] = buf()
+
+    for l in lines_of(hop)
+        if l.contains("@sysl.tls.tag()") then asks += 1
+
+        if l.contains("asm sideeffect") && l.contains("1:")
+            rounds.push(asks)
+            asks = 0
+        end if
+
+    assert(rounds.len() >= 3, s"expected the three rounds unrolled in:\n$hop")
+    assert_eq(rounds[0], 1)
+    assert_eq(rounds[1], 1)
+    assert_eq(rounds[2], 1)
+end fsw_optimized_asks_again
+
+// A loop whose count the optimizer cannot know, so it stays a loop.
+private val fsw_loop: string = raw"""
+    import sysl.fiber.{Context, Stack, switch}
+    import sysl.hint.black_box
+
+    @thread_local
+    var tag: int = 0
+
+    struct Spin
+        back: Context
+        me: Context
+        n: int
+        sum: int
+
+    spin(s: *Spin)
+        for _ in 0..<black_box(s.n)
+            s.sum += tag
+            switch(&s.me, &s.back)
+
+        loop
+            switch(&s.me, &s.back)
+
+    main()
+        val st = Stack.reserve(64 * 1024).unwrap()
+        var s = Spin(Context.new(), Context.new(), 3, 0)
+
+        s.me = Context.start(st, &spin, &s)
+        switch(&s.back, &s.me)
+    """
+
+// The blocks of a definition, each as its lines.
+private fsw_blocks(body: string) -> Buf[string]
+    var out: Buf[string] = buf()
+    var block = ""
+
+    for l in lines_of(body)
+        if !l.starts_with(" ") && l.contains(":") && !l.starts_with("define")
+            out.push(block)
+            block = ""
+        end if
+
+        block = block + l + "\n"
+
+    out.push(block)
+    out
+end fsw_blocks
+
+@test("at -O2 the ask stays inside a loop around a switch, in the block with the switch")
+fsw_optimized_loop_not_hoisted()
+    if !fsw_ready() then return
+
+    val out = fsw_clang(fsw_ir(fsw_loop, "aarch64-macos"), "aarch64-macos", ["-O2", "-S", "-emit-llvm", "-o", "-"])
+    val body = fsw_body(out, "@\"spin$")
+    var checked = 0
+
+    for b in fsw_blocks(body)
+        // The loop's block: it holds the switch and branches back to itself or onward.
+        if b.contains("asm sideeffect") && b.contains("1:") && b.contains("@sysl.tls.tag()")
+            checked += 1
+    end for
+
+    assert(checked >= 1, s"no block holds both the switch and an ask in:\n$body")
+
+    // Hoisted, the ask would sit in the entry block.
+    for b in fsw_blocks(body)
+        if b.starts_with("entry:") then fsw_lacks(b, "@sysl.tls.tag()")
+end fsw_optimized_loop_not_hoisted
+
+// -- run at -O2 --------------------------------------------------------------------------------------
+
+@test("at -O2 a fiber resumed on another carrier reads and writes that carrier's thread-local")
+fsw_runs_hop_at_o2()
+    if !fsw_ready() then return
+
+    assert_eq(fsw_runs_at_o2(fsw_hop), 0)
+
+@test("at -O2 integers and floats live across a switch survive what the other side does")
+fsw_runs_regs_at_o2()
+    if !fsw_ready() then return
+
+    assert_eq(fsw_runs_at_o2(fsw_regs), 0)
