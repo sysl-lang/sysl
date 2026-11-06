@@ -729,6 +729,33 @@ impl Drop for Spawned
     drop(self)
         if self.answer.is_none() && !self.released then stop(self.id)
 
+/** Waits for the child numbered `pid` to end and says how it ended, exactly as `Spawned.wait` does --
+ * for a child nobody holds a `Spawned` for: one `detach` let go of, or one a previous image of this
+ * program started before it became this one.
+ *
+ * There is no `timeout`: it waits for as long as it takes. **The child is reaped**, so a second wait
+ * on the same pid is an error -- the pid is no longer this program's child, and `Other(10)` (`ECHILD`)
+ * is what says so, as it is for any pid that never was. `pid` of zero or less is `Other(22)` rather
+ * than waitpid's process-group meanings, which are not offered.
+ */
+@blocks
+wait_pid(pid: int) -> Result[Status, IoError]
+    if pid <= 0 then return Err(IoError.Other(misdirected))
+
+    ended(i32(pid), 0, 0)
+end wait_pid
+
+/** Whether the child numbered `pid` has ended, **without waiting for it**, as `Spawned.try_wait` asks:
+ * `Ok(None)` while it runs and `Some` of how it ended once it has, the child reaped at that moment.
+ * The errors are `wait_pid`'s: a pid that is not this program's child, or already reaped, is `Other(10)`,
+ * and `pid` of zero or less is `Other(22)`.
+ */
+try_wait_pid(pid: int) -> Result[Option[Status], IoError]
+    if pid <= 0 then return Err(IoError.Other(misdirected))
+
+    polled(i32(pid))
+end try_wait_pid
+
 /** Start a program with its three streams where the caller says, and answer it without waiting for it
  * or collecting anything.
  *
