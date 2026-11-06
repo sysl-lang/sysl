@@ -120,7 +120,7 @@ val n = 1 + (k match
 ```
 
 ```error
-a 'match' that yields a value must be exhaustive
+match on 'int' is not exhaustive; missing int::Min..0, 3..int::Max (add an 'else' arm)
 ```
 
 ### Two deliberate corrections to C
